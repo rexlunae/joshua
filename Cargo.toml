@@ -1,0 +1,45 @@
+[package]
+name = "joshua"
+version = "0.1.0"
+edition = "2021"
+description = "An mmap-based LLM inference engine for the Rust ecosystem — a Rust clone of Cactus"
+license = "MIT"
+repository = "https://github.com/rexlunae/joshua"
+keywords = ["llm", "inference", "ai", "openai", "gguf"]
+categories = ["science", "api-bindings"]
+
+[[bin]]
+name = "joshua"
+path = "src/main.rs"
+
+[lib]
+name = "joshua"
+path = "src/lib.rs"
+
+[dependencies]
+# Pure Rust ML inference (no C/C++ dependencies required for CPU)
+candle-core = "0.8"
+candle-transformers = "0.8"
+
+# Tokenization (pure Rust BPE/WordPiece — loads tokenizer.json from HuggingFace)
+# fancy-regex is the pure Rust regex backend (replaces the default Oniguruma C backend).
+# esaxx_fast is omitted to avoid the C++ suffix-array helper.
+tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
+
+# Sampling
+rand = "0.8"
+
+# HTTP server & utilities
+axum = { version = "0.8", features = ["json", "macros"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive", "env"] }
+tower-http = { version = "0.6", features = ["cors"] }
+uuid = { version = "1", features = ["v4"] }
+futures-util = "0.3"
+tokio-stream = "0.1"
