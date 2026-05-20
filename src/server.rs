@@ -142,7 +142,7 @@ async fn chat_completions(
         // (`stream_options.include_usage`). We always include them so that clients
         // that inspect this chunk get accurate token counts.
         let stop_payload = {
-            let mut chunk =
+            let chunk =
                 ChatCompletionChunk::new(id.clone(), model.clone(), DeltaContent::default(), Some("stop".to_string()));
             // Attach usage as an extra field via serde_json (ChatCompletionChunk
             // doesn't have a `usage` field to keep streaming chunks lean, so we

@@ -1,22 +1,37 @@
 //! Core LLM inference engine for Joshua.
 //!
-//! The engine loads a GGUF model file via memory-mapped I/O (delegated to
-//! llama.cpp), keeping resident RAM usage low even for large models.  A fresh
-//! [`llama_cpp_2::context::LlamaContext`] is created for every call so that
-//! multiple requests can run concurrently without sharing mutable state.
+//! The engine loads a GGUF model file and tokenises input using a
+//! `tokenizer.json` file placed alongside the model.  Both the GGUF weights
+//! and the tokenizer are loaded entirely in pure Rust — no C or C++ runtime
+//! is required.
+//!
+//! A fresh [`ModelWeights`](candle_transformers::models::quantized_llama::ModelWeights)
+//! is created for every inference call so that each request has an isolated
+//! KV cache.  After the initial cold start the operating system's page cache
+//! keeps the GGUF file hot in RAM, making subsequent loads fast.
+//!
+//! # Model directory layout
+//!
+//! ```text
+//! my-model/
+//! ├── model.gguf          ← quantised weights (any GGUF-compatible architecture)
+//! └── tokenizer.json      ← HuggingFace tokenizer (download from the model card)
+//! ```
+//!
+//! You can also point directly at a `.gguf` file; `tokenizer.json` is then
+//! looked up in the same directory.
 
-use std::num::NonZeroU32;
+use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
-use llama_cpp_2::{
-    context::params::LlamaContextParams,
-    llama_backend::LlamaBackend,
-    llama_batch::LlamaBatch,
-    model::{params::LlamaModelParams, AddBos, LlamaModel},
-    sampling::LlamaSampler,
-    token::LlamaToken,
-};
+use candle_core::quantized::gguf_file;
+use candle_core::{Device, Tensor};
+use candle_transformers::models::quantized_llama::ModelWeights;
+use rand::distributions::{Distribution, WeightedIndex};
+use rand::thread_rng;
+use tokenizers::Tokenizer;
 
 use crate::error::{JoshuaError, Result};
 use crate::types::{ChatMessage, GenerationOptions, UsageInfo};
@@ -25,66 +40,100 @@ use crate::types::{ChatMessage, GenerationOptions, UsageInfo};
 
 /// The Joshua inference engine.
 ///
-/// Thread-safe: multiple threads may call [`Engine::complete`] and
-/// [`Engine::embed`] concurrently because each call allocates its own
-/// llama.cpp context.
+/// Instances are cheaply clonable (the tokenizer is `Arc`-wrapped) and are
+/// `Send + Sync`, so a single `Arc<Engine>` can be shared across threads.
 pub struct Engine {
-    // `model` must be listed before `backend` so it is dropped first.
-    model: LlamaModel,
-    _backend: LlamaBackend,
+    /// Path to the `.gguf` file.
     model_path: PathBuf,
+    /// Stateless tokenizer, shared across all inference calls.
+    tokenizer: Arc<Tokenizer>,
+    /// EOS token IDs derived from the GGUF metadata and common special tokens.
+    eos_token_ids: Vec<u32>,
+    /// Stem of the model file (used as the model identifier in API responses).
     model_name: String,
-    /// Context-window size passed to every newly created [`LlamaContext`].
+    /// Context-window size in tokens.
     n_ctx: u32,
 }
 
-// Safety: LlamaModel explicitly implements Send + Sync upstream.
-// LlamaBackend is a zero-sized sentinel struct that is also Send + Sync.
-unsafe impl Send for Engine {}
-unsafe impl Sync for Engine {}
+// `PathBuf`, `Arc<Tokenizer>`, `Vec<u32>`, `String`, and `u32` are all
+// `Send + Sync`, so Engine is automatically `Send + Sync`.
 
 impl Engine {
-    /// Load a GGUF model from `model_path` using a 4 096-token context window.
+    /// Load a GGUF model using a 4 096-token context window.
+    ///
+    /// `model_path` can be either the path to a `.gguf` file or a directory
+    /// that contains one.  A `tokenizer.json` must exist in the same directory
+    /// as the `.gguf` file.
     pub fn new(model_path: impl AsRef<Path>) -> Result<Self> {
         Self::with_n_ctx(model_path, 4096)
     }
 
     /// Load a GGUF model with a custom context-window size.
     pub fn with_n_ctx(model_path: impl AsRef<Path>, n_ctx: u32) -> Result<Self> {
-        let model_path = model_path.as_ref().to_path_buf();
+        let raw_path = model_path.as_ref().to_path_buf();
 
-        tracing::info!("Initialising llama.cpp backend");
-        let backend = LlamaBackend::init()
-            .map_err(|e| JoshuaError::ModelLoad(e.to_string()))?;
+        // Resolve the actual .gguf file path.
+        let gguf_path = if raw_path.is_dir() {
+            find_gguf_in_dir(&raw_path)?
+        } else {
+            raw_path
+        };
 
-        tracing::info!("Loading model from {:?}", model_path);
-        let model_params = LlamaModelParams::default();
-        let model = LlamaModel::load_from_file(&backend, &model_path, &model_params)
-            .map_err(|e| JoshuaError::ModelLoad(format!("{}: {e}", model_path.display())))?;
-
-        let model_name = model_path
+        let model_name = gguf_path
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("unknown")
             .to_string();
 
-        tracing::info!("Model '{}' loaded (ctx={})", model_name, n_ctx);
+        tracing::info!("Loading model from {:?}", gguf_path);
+
+        // Locate tokenizer.json in the same directory as the GGUF file.
+        let model_dir = gguf_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+        let tokenizer_path = model_dir.join("tokenizer.json");
+        if !tokenizer_path.exists() {
+            return Err(JoshuaError::ModelLoad(format!(
+                "tokenizer.json not found at {:?}.\n\
+                 Place it alongside the .gguf file \
+                 (download from the model's HuggingFace repository).",
+                tokenizer_path
+            )));
+        }
+
+        let tokenizer = Tokenizer::from_file(&tokenizer_path)
+            .map_err(|e| JoshuaError::ModelLoad(format!("tokenizer load failed: {e}")))?;
+
+        // Read GGUF metadata once to extract EOS token IDs.
+        let mut file = File::open(&gguf_path)?;
+        let gguf = gguf_file::Content::read(&mut file)
+            .map_err(|e| JoshuaError::ModelLoad(format!("GGUF read failed: {e}")))?;
+
+        let eos_token_ids = extract_eos_ids(&gguf, &tokenizer);
+
+        tracing::info!(
+            "Model '{}' ready (ctx={}, eos_ids={:?})",
+            model_name,
+            n_ctx,
+            eos_token_ids
+        );
 
         Ok(Self {
-            model,
-            _backend: backend,
-            model_path,
+            model_path: gguf_path,
+            tokenizer: Arc::new(tokenizer),
+            eos_token_ids,
             model_name,
             n_ctx,
         })
     }
 
-    /// The stem of the loaded model's file name (e.g. `"gemma-3-270m-it-q4_k_m"`).
+    /// The stem of the loaded model file name.
     pub fn model_name(&self) -> &str {
         &self.model_name
     }
 
-    /// Absolute path of the loaded model file.
+    /// Absolute path of the loaded `.gguf` file.
     pub fn model_path(&self) -> &Path {
         &self.model_path
     }
@@ -94,18 +143,9 @@ impl Engine {
         self.n_ctx
     }
 
-    // ─── Prompt formatting ───────────────────────────────────────────────────
+    // ─── Prompt formatting ────────────────────────────────────────────────────
 
-    /// Format messages as a ChatML prompt and append the assistant turn opener.
-    ///
-    /// Example output:
-    /// ```text
-    /// <|im_start|>system
-    /// You are a helpful assistant.<|im_end|>
-    /// <|im_start|>user
-    /// Hello!<|im_end|>
-    /// <|im_start|>assistant
-    /// ```
+    /// Format messages as a ChatML prompt and append the assistant turn header.
     fn format_chatml_prompt(messages: &[ChatMessage]) -> String {
         let mut prompt = String::new();
         for msg in messages {
@@ -133,57 +173,63 @@ impl Engine {
         self.complete_raw(&prompt, options)
     }
 
-    /// Run completion starting from an arbitrary raw prompt string.
+    /// Run completion from an arbitrary raw prompt string.
     pub fn complete_raw(
         &self,
         prompt: &str,
         options: &GenerationOptions,
     ) -> Result<(String, UsageInfo, f64, f64)> {
-        // ── Context ───────────────────────────────────────────────────────────
-        let ctx_params = LlamaContextParams::default()
-            .with_n_ctx(NonZeroU32::new(self.n_ctx));
-
-        let mut ctx = self
-            .model
-            .new_context(&self._backend, ctx_params)
-            .map_err(|e| JoshuaError::ContextCreation(e.to_string()))?;
+        // Load model weights from the GGUF file.  After the first call the OS
+        // page cache keeps the file data hot, so this is I/O-free in practice.
+        let mut model = self.load_model()?;
 
         // ── Tokenise ─────────────────────────────────────────────────────────
-        #[allow(deprecated)]
-        let tokens = self
-            .model
-            .str_to_token(prompt, AddBos::Always)
+        let encoding = self
+            .tokenizer
+            .encode(prompt, true)
             .map_err(|e| JoshuaError::Tokenization(e.to_string()))?;
+        let prompt_tokens: Vec<u32> = encoding.get_ids().to_vec();
+        let n_prompt = prompt_tokens.len();
 
-        let max_ctx = self.n_ctx as usize;
-        if tokens.len() >= max_ctx {
-            return Err(JoshuaError::PromptTooLong(tokens.len(), max_ctx));
+        if n_prompt >= self.n_ctx as usize {
+            return Err(JoshuaError::PromptTooLong(n_prompt, self.n_ctx as usize));
         }
 
-        let n_prompt_tokens = tokens.len() as u32;
-
         // ── Prefill ───────────────────────────────────────────────────────────
-        let mut batch = LlamaBatch::new(max_ctx, 1);
-        batch
-            .add_sequence(&tokens, 0, false)
+        // Process all prompt tokens in a single forward pass.
+        // Input shape: [1, n_prompt].
+        let input = Tensor::new(prompt_tokens.as_slice(), &Device::Cpu)
+            .and_then(|t| t.unsqueeze(0))
             .map_err(|e| JoshuaError::Inference(e.to_string()))?;
 
         let prefill_start = Instant::now();
-        ctx.decode(&mut batch)
+        // index_pos = 0: the KV cache is empty; start building from position 0.
+        // forward() internally selects the last-token logits; output: [1, vocab_size].
+        let logits = model
+            .forward(&input, 0)
             .map_err(|e| JoshuaError::Inference(e.to_string()))?;
         let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
 
-        // ── Sampler ───────────────────────────────────────────────────────────
-        let mut sampler = Self::build_sampler(options);
+        let mut logits_vec = squeeze_batch_logits(&logits)?;
 
-        // Accept all prompt tokens so the sampler's repetition history is warm.
-        sampler.accept_many(tokens.iter().copied());
+        // ── Repetition-penalty history ────────────────────────────────────────
+        // Seed the recent-token window with the tail of the prompt (up to 64 tokens).
+        const REP_WINDOW: usize = 64;
+        let mut recent_tokens: Vec<u32> = prompt_tokens
+            .iter()
+            .rev()
+            .take(REP_WINDOW)
+            .copied()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
 
         // ── Decode loop ───────────────────────────────────────────────────────
-        let eos = self.model.token_eos();
+        let mut rng = thread_rng();
         let mut response = String::new();
-        let mut n_cur = n_prompt_tokens as usize;
         let mut n_decoded: u32 = 0;
+        let mut n_cur = n_prompt;
         let decode_start = Instant::now();
 
         loop {
@@ -191,40 +237,47 @@ impl Engine {
                 break;
             }
 
-            // Sample the next token from the last logits row.
-            let next_token = sampler.sample(&ctx, batch.n_tokens() - 1);
-            sampler.accept(next_token);
+            let next_token = sample_token(&logits_vec, options, &mut rng, &recent_tokens)?;
 
-            // End-of-generation: EOS or any other end-of-generation token.
-            if next_token == eos || self.model.is_eog_token(next_token) {
+            if self.eos_token_ids.contains(&next_token) {
                 break;
             }
 
-            // Decode token → text.
-            let piece = token_to_str(&self.model, next_token)?;
+            // Decode the new token to text.
+            let piece = self
+                .tokenizer
+                .decode(&[next_token], false)
+                .map_err(|e| JoshuaError::Inference(e.to_string()))?;
             response.push_str(&piece);
             n_decoded += 1;
 
-            // Check stop sequences.
+            // Maintain sliding-window token history for repetition penalty.
+            if recent_tokens.len() >= REP_WINDOW {
+                recent_tokens.remove(0);
+            }
+            recent_tokens.push(next_token);
+
             if Self::check_stop_sequences(&mut response, &options.stop_sequences) {
                 break;
             }
 
-            // Prepare single-token batch for the next step.
-            batch.clear();
-            batch
-                .add(next_token, n_cur as i32, &[0], true)
+            // Single-token step: input [1, 1], output [1, vocab_size].
+            let step_input = Tensor::new(&[next_token], &Device::Cpu)
+                .and_then(|t| t.unsqueeze(0))
                 .map_err(|e| JoshuaError::Inference(e.to_string()))?;
-            n_cur += 1;
 
-            ctx.decode(&mut batch)
+            let step_logits = model
+                .forward(&step_input, n_cur)
                 .map_err(|e| JoshuaError::Inference(e.to_string()))?;
+
+            logits_vec = squeeze_batch_logits(&step_logits)?;
+            n_cur += 1;
         }
 
         let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
 
         let prefill_tps = if prefill_ms > 0.0 {
-            n_prompt_tokens as f64 / (prefill_ms / 1000.0)
+            n_prompt as f64 / (prefill_ms / 1000.0)
         } else {
             0.0
         };
@@ -235,7 +288,7 @@ impl Engine {
         };
 
         tracing::debug!(
-            prefill_tokens = n_prompt_tokens,
+            prefill_tokens = n_prompt,
             prefill_tps,
             decode_tokens = n_decoded,
             decode_tps,
@@ -243,9 +296,9 @@ impl Engine {
         );
 
         let usage = UsageInfo {
-            prompt_tokens: n_prompt_tokens,
+            prompt_tokens: n_prompt as u32,
             completion_tokens: n_decoded,
-            total_tokens: n_prompt_tokens + n_decoded,
+            total_tokens: n_prompt as u32 + n_decoded,
         };
 
         Ok((response, usage, prefill_tps, decode_tps))
@@ -254,76 +307,36 @@ impl Engine {
     // ─── Embeddings ───────────────────────────────────────────────────────────
 
     /// Compute dense embeddings for one or more texts.
+    ///
+    /// Standard causal language models do not expose sentence-level embeddings
+    /// without a pooling head.  Use a dedicated embedding model
+    /// (e.g. nomic-embed-text, BGE, E5) whose GGUF variant is built with
+    /// embedding support.
     pub fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        let ctx_params = LlamaContextParams::default()
-            .with_n_ctx(NonZeroU32::new(self.n_ctx))
-            .with_embeddings(true);
-
-        let mut ctx = self
-            .model
-            .new_context(&self._backend, ctx_params)
-            .map_err(|e| JoshuaError::ContextCreation(e.to_string()))?;
-
-        let mut results = Vec::with_capacity(texts.len());
-
-        for text in texts {
-            #[allow(deprecated)]
-            let tokens = self
-                .model
-                .str_to_token(text, AddBos::Always)
-                .map_err(|e| JoshuaError::Tokenization(e.to_string()))?;
-
-            let n = tokens.len();
-            if n == 0 {
-                results.push(vec![]);
-                continue;
-            }
-
-            let mut batch = LlamaBatch::new(n, 1);
-            batch
-                .add_sequence(&tokens, 0, false)
-                .map_err(|e| JoshuaError::Inference(e.to_string()))?;
-
-            ctx.decode(&mut batch)
-                .map_err(|e| JoshuaError::Inference(e.to_string()))?;
-
-            let embedding = ctx
-                .embeddings_seq_ith(0)
-                .map_err(|e| JoshuaError::Inference(e.to_string()))?
-                .to_vec();
-
-            results.push(embedding);
-        }
-
-        Ok(results)
+        Err(JoshuaError::InvalidRequest(format!(
+            "Dense embedding extraction requires a model built with pooling support \
+             (e.g. nomic-embed-text-v2, BGE-M3). \
+             Standard language models cannot produce sentence embeddings via this API. \
+             ({} input text(s) provided)",
+            texts.len()
+        )))
     }
 
-    // ─── Helpers ─────────────────────────────────────────────────────────────
+    // ─── Private helpers ─────────────────────────────────────────────────────
 
-    /// Build a [`LlamaSampler`] chain from generation options.
-    fn build_sampler(options: &GenerationOptions) -> LlamaSampler {
-        // Repetition penalty (last 64 tokens, no frequency/presence penalty)
-        let penalty = LlamaSampler::penalties(64, options.repetition_penalty, 0.0, 0.0);
-
-        if options.temperature <= 0.0 {
-            // Greedy decoding.
-            return LlamaSampler::chain_simple([penalty, LlamaSampler::greedy()]);
-        }
-
-        // Temperature → top-k → min-p → top-p → distribution sampler.
-        let samplers: Vec<LlamaSampler> = vec![
-            penalty,
-            LlamaSampler::temp(options.temperature),
-            LlamaSampler::top_k(options.top_k),
-            LlamaSampler::min_p(options.min_p, 1),
-            LlamaSampler::top_p(options.top_p, 1),
-            LlamaSampler::dist(0xDEAD_BEEF),
-        ];
-        LlamaSampler::chain_simple(samplers)
+    /// Load `ModelWeights` from the GGUF file.
+    ///
+    /// Each call re-opens the file so the KV cache starts empty — the OS page
+    /// cache ensures subsequent opens are fast.
+    fn load_model(&self) -> Result<ModelWeights> {
+        let mut file = File::open(&self.model_path)?;
+        let gguf = gguf_file::Content::read(&mut file)
+            .map_err(|e| JoshuaError::ModelLoad(format!("GGUF read failed: {e}")))?;
+        ModelWeights::from_gguf(gguf, &mut file, &Device::Cpu)
+            .map_err(|e| JoshuaError::ModelLoad(format!("model init failed: {e}")))
     }
 
-    /// Scan the generated text for any stop sequence.  If one is found, trim it
-    /// from the end of `response` and return `true`.
+    /// Scan `response` for any configured stop sequence and truncate it.
     fn check_stop_sequences(response: &mut String, stops: &[String]) -> bool {
         for stop in stops {
             if stop.is_empty() {
@@ -338,18 +351,190 @@ impl Engine {
     }
 }
 
-// ─── Token decoding helper ────────────────────────────────────────────────────
+// ─── GGUF / tokenizer helpers ─────────────────────────────────────────────────
 
-/// Convert a single token to its string representation.
+/// Walk `dir` and return the first `.gguf` file found.
+fn find_gguf_in_dir(dir: &Path) -> Result<PathBuf> {
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("gguf") {
+            return Ok(path);
+        }
+    }
+    Err(JoshuaError::ModelLoad(format!(
+        "No .gguf file found in {:?}",
+        dir
+    )))
+}
+
+/// Derive EOS token IDs from GGUF metadata and well-known special token strings.
+fn extract_eos_ids(gguf: &gguf_file::Content, tokenizer: &Tokenizer) -> Vec<u32> {
+    let mut ids: Vec<u32> = Vec::new();
+
+    // Primary: explicit EOS from GGUF metadata.
+    let eos_key = "tokenizer.ggml.eos_token_id";
+    match gguf.metadata.get(eos_key) {
+        Some(gguf_file::Value::U32(id)) => ids.push(*id),
+        Some(gguf_file::Value::I32(id)) => ids.push(*id as u32),
+        Some(gguf_file::Value::U64(id)) => ids.push(*id as u32),
+        _ => {}
+    }
+
+    // Fallback: common EOS token strings for popular model families.
+    for token_str in &[
+        "</s>",
+        "<|endoftext|>",
+        "<|im_end|>",
+        "<end_of_turn>",
+        "<eos>",
+        "<|eot_id|>",
+        "<|end|>",
+    ] {
+        if let Some(id) = tokenizer.token_to_id(token_str) {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+    }
+
+    ids
+}
+
+// ─── Tensor helpers ───────────────────────────────────────────────────────────
+
+/// Convert a `[1, vocab_size]` logits tensor to a flat `Vec<f32>`.
 ///
-/// Uses `token_to_str` (which is `#[deprecated]` upstream but still the
-/// simplest way to get a UTF-8 string for a token).  The deprecation warning
-/// is suppressed here so callers remain clean.
-fn token_to_str(model: &LlamaModel, token: LlamaToken) -> Result<String> {
-    #[allow(deprecated)]
-    use llama_cpp_2::model::Special;
-    #[allow(deprecated)]
-    model
-        .token_to_str(token, Special::Tokenize)
+/// `ModelWeights::forward()` always returns shape `[batch, vocab_size]`
+/// because it selects the last sequence position internally.
+fn squeeze_batch_logits(logits: &Tensor) -> Result<Vec<f32>> {
+    // Remove the batch dimension (index 0) to get [vocab_size].
+    logits
+        .squeeze(0)
+        .and_then(|t| t.to_vec1::<f32>())
         .map_err(|e| JoshuaError::Inference(e.to_string()))
 }
+
+// ─── Sampling ────────────────────────────────────────────────────────────────
+
+/// Sample the next token from a raw logit vector.
+///
+/// Implements repetition penalty, temperature scaling, top-k filtering,
+/// min-p filtering, top-p (nucleus) filtering, and weighted random sampling,
+/// all in pure Rust.
+fn sample_token(
+    logits: &[f32],
+    opts: &GenerationOptions,
+    rng: &mut impl rand::Rng,
+    recent_tokens: &[u32],
+) -> Result<u32> {
+    if logits.is_empty() {
+        return Ok(0);
+    }
+
+    // ── Repetition penalty ────────────────────────────────────────────────────
+    // For tokens present in the recent window, divide positive logits and
+    // multiply negative logits by `repetition_penalty` (> 1.0 discourages
+    // repetition; 1.0 is a no-op).  Applied before temperature so the penalty
+    // is independent of the temperature scale.
+    let logits: Vec<f32> = if opts.repetition_penalty != 1.0 {
+        let mut v = logits.to_vec();
+        for &token in recent_tokens {
+            if let Some(l) = v.get_mut(token as usize) {
+                if *l > 0.0 {
+                    *l /= opts.repetition_penalty;
+                } else {
+                    *l *= opts.repetition_penalty;
+                }
+            }
+        }
+        v
+    } else {
+        logits.to_vec()
+    };
+
+    // ── Greedy ────────────────────────────────────────────────────────────────
+    if opts.temperature <= 0.0 {
+        return Ok(logits
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(i, _)| i as u32)
+            .unwrap_or(0));
+    }
+
+    // ── Temperature scaling ───────────────────────────────────────────────────
+    let inv_temp = 1.0_f32 / opts.temperature;
+    // Subtract max for numerical stability before exp.
+    let max_logit = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let mut probs: Vec<f32> = logits
+        .iter()
+        .map(|&l| ((l - max_logit) * inv_temp).exp())
+        .collect();
+
+    // ── Top-k ─────────────────────────────────────────────────────────────────
+    let k = opts.top_k as usize;
+    if k > 0 && k < probs.len() {
+        let mut indexed: Vec<(usize, f32)> = probs.iter().copied().enumerate().collect();
+        indexed.sort_unstable_by(|(_, a), (_, b)| {
+            b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        for &(idx, _) in indexed.iter().skip(k) {
+            probs[idx] = 0.0;
+        }
+    }
+
+    // ── Min-p ─────────────────────────────────────────────────────────────────
+    if opts.min_p > 0.0 {
+        let max_p = probs.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let threshold = max_p * opts.min_p;
+        for p in &mut probs {
+            if *p < threshold {
+                *p = 0.0;
+            }
+        }
+    }
+
+    // ── Top-p (nucleus) ───────────────────────────────────────────────────────
+    if opts.top_p < 1.0 && opts.top_p > 0.0 {
+        let sum: f32 = probs.iter().sum();
+        if sum > 0.0 {
+            let mut sorted_idx: Vec<usize> = (0..probs.len()).collect();
+            sorted_idx.sort_unstable_by(|&a, &b| {
+                probs[b].partial_cmp(&probs[a]).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let mut cumsum = 0.0_f32;
+            let mut cut_from = probs.len();
+            for (rank, &idx) in sorted_idx.iter().enumerate() {
+                cumsum += probs[idx] / sum;
+                if cumsum > opts.top_p {
+                    cut_from = rank + 1;
+                    break;
+                }
+            }
+            for &idx in sorted_idx.iter().skip(cut_from) {
+                probs[idx] = 0.0;
+            }
+        }
+    }
+
+    // ── Normalise & sample ────────────────────────────────────────────────────
+    let total: f32 = probs.iter().sum();
+    if total <= 0.0 {
+        // Fallback: greedy from original (penalty-adjusted) logits.
+        return Ok(logits
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(i, _)| i as u32)
+            .unwrap_or(0));
+    }
+
+    for p in &mut probs {
+        *p /= total;
+    }
+
+    let dist =
+        WeightedIndex::new(&probs).map_err(|e| JoshuaError::Inference(e.to_string()))?;
+    Ok(dist.sample(rng) as u32)
+}
+

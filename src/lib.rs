@@ -1,9 +1,9 @@
-//! Joshua — an mmap-based LLM inference engine for the Rust ecosystem.
+//! Joshua — a pure-Rust LLM inference engine.
 //!
-//! Joshua provides a pure-Rust API layer over
-//! [llama.cpp](https://github.com/ggerganov/llama.cpp) (via
-//! [`llama_cpp_2`]) plus an OpenAI-compatible HTTP server built on
-//! [`axum`].
+//! Joshua provides a pure-Rust inference layer built on
+//! [candle](https://github.com/huggingface/candle) (HuggingFace's native Rust
+//! ML framework) plus an OpenAI-compatible HTTP server built on [`axum`].
+//! No C or C++ runtime dependencies are required for CPU inference.
 //!
 //! # Quick start
 //!
@@ -22,6 +22,9 @@
 //! let (text, usage, _, _) = engine.complete(&messages, &GenerationOptions::default()).unwrap();
 //! println!("{text}");
 //! ```
+//!
+//! A `tokenizer.json` from the model's HuggingFace repository must be placed
+//! alongside the `.gguf` file so the engine can tokenise prompts.
 
 pub mod engine;
 pub mod error;

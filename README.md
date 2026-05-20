@@ -1,6 +1,10 @@
 # joshua
 
-An mmap-based high-speed LLM executor for the Rust ecosystem — a Rust clone of [Cactus](https://github.com/cactus-compute/cactus).
+A pure-Rust LLM inference engine — a Rust clone of [Cactus](https://github.com/cactus-compute/cactus).
+
+No C or C++ dependencies.  CPU inference runs entirely in safe Rust via
+[candle](https://github.com/huggingface/candle) (HuggingFace's native Rust ML
+framework) and [tokenizers](https://github.com/huggingface/tokenizers).
 
 ---
 
@@ -8,12 +12,11 @@ An mmap-based high-speed LLM executor for the Rust ecosystem — a Rust clone of
 
 | Feature | Details |
 |---|---|
-| **Fast** | Delegates to llama.cpp — the fastest CPU inference engine on the market |
-| **Low RAM** | Model weights are memory-mapped (mmap) so only the pages you touch live in RAM |
+| **Pure Rust** | Zero C/C++ dependencies — `cargo build` requires only a Rust toolchain |
 | **OpenAI-compatible** | Drop-in replacement for `/v1/chat/completions`, `/v1/embeddings`, `/v1/models` |
 | **Streaming** | Server-Sent Events (SSE) for token-by-token streaming |
-| **Pure Rust API** | Idiomatic `Engine` type — no C/C++ in your call stack |
-| **GGUF support** | Any GGUF model that llama.cpp supports (Llama, Gemma, Qwen, Mistral, …) |
+| **GGUF support** | Llama, Gemma, Qwen, Mistral, and any other Llama-architecture GGUF model |
+| **Sampling** | Temperature, top-k, min-p, top-p (nucleus), greedy — all in Rust |
 
 ---
 
@@ -21,16 +24,16 @@ An mmap-based high-speed LLM executor for the Rust ecosystem — a Rust clone of
 
 ```
 ┌──────────────────────────┐
-│  Joshua  (Rust crate)    │  ← OpenAI-compatible REST API
-└──────────────────────────┘    Chat, embeddings, streaming, tool stubs
+│  Joshua  (Rust crate)    │  ← OpenAI-compatible REST API (axum)
+└──────────────────────────┘    Chat completions, embeddings, streaming
            │
 ┌──────────────────────────┐
-│  llama-cpp-2  (FFI)      │  ← Safe Rust wrapper over llama.cpp
-└──────────────────────────┘    GGUF model loading, KV-cache, batching
+│  candle  (pure Rust)     │  ← Tensor operations + quantized GGUF inference
+└──────────────────────────┘    quantized_llama: Llama / Mistral / Gemma / Qwen
            │
 ┌──────────────────────────┐
-│  llama.cpp  (C++)        │  ← Compiled natively during `cargo build`
-└──────────────────────────┘    ARM NEON / AVX2 / Metal / CUDA kernels
+│  tokenizers (pure Rust)  │  ← BPE tokenisation from tokenizer.json
+└──────────────────────────┘    HuggingFace tokenizers library
 ```
 
 ---
@@ -40,8 +43,8 @@ An mmap-based high-speed LLM executor for the Rust ecosystem — a Rust clone of
 | Tool | Minimum version |
 |---|---|
 | Rust toolchain | 1.75 |
-| CMake | 3.14 |
-| C++17 compiler | GCC 10 / Clang 12 / MSVC 2019 |
+
+No CMake, no C++ compiler, no CUDA toolkit required.
 
 ---
 
@@ -56,15 +59,32 @@ joshua = { git = "https://github.com/rexlunae/joshua" }
 
 ### 2 — Download a model
 
-Any GGUF file works.  A tiny starting point:
+Any GGUF model that follows the Llama architecture works.  You also need the
+`tokenizer.json` from the same HuggingFace repository — place it alongside the
+`.gguf` file.
 
 ```bash
 # Using the Hugging Face CLI
 pip install huggingface-hub
+
+# Download GGUF weights + tokenizer into ./weights/
 huggingface-cli download \
     bartowski/google_gemma-3-1b-it-GGUF \
     gemma-3-1b-it-Q4_K_M.gguf \
     --local-dir ./weights
+
+huggingface-cli download \
+    google/gemma-3-1b-it \
+    tokenizer.json \
+    --local-dir ./weights
+```
+
+The layout Joshua expects:
+
+```
+weights/
+├── gemma-3-1b-it-Q4_K_M.gguf   ← quantised weights
+└── tokenizer.json               ← HuggingFace tokenizer
 ```
 
 ### 3 — Library usage
@@ -99,7 +119,7 @@ fn main() -> anyhow::Result<()> {
 ### 4 — CLI
 
 ```bash
-# Build
+# Build (no C++ compiler needed)
 cargo build --release
 
 # One-shot completion
@@ -111,11 +131,6 @@ cargo build --release
 ./target/release/joshua serve \
     --model ./weights/gemma-3-1b-it-Q4_K_M.gguf \
     --addr 0.0.0.0:8080
-
-# Embed text
-./target/release/joshua embed \
-    --model ./weights/nomic-embed-text-v2.gguf \
-    "Hello, world"
 ```
 
 ---
@@ -153,6 +168,9 @@ curl http://localhost:8080/v1/embeddings \
   -d '{"model":"nomic-embed","input":["Hello","World"]}'
 ```
 
+> **Note:** Embeddings require a dedicated pooling model.  Standard language
+> models return a descriptive error explaining what is needed.
+
 ### `GET /v1/models`
 
 ```bash
@@ -186,21 +204,20 @@ curl http://localhost:8080/health
 | `top_p` | `f32` | `0.9` | Nucleus sampling threshold |
 | `top_k` | `i32` | `40` | Top-k sampling (0 = disabled) |
 | `min_p` | `f32` | `0.05` | Min-p filter relative to top token |
-| `repetition_penalty` | `f32` | `1.1` | Penalise recent tokens (1.0 = off) |
+| `repetition_penalty` | `f32` | `1.1` | Penalise tokens seen in the last 64-token window (1.0 = disabled) |
 | `stop_sequences` | `Vec<String>` | `[]` | Stop on these strings |
 
 ---
 
 ## Supported models
 
-Any GGUF model supported by llama.cpp works.  Tested models include:
+Any GGUF model with a Llama-compatible architecture.  Tested models include:
 
 - `google/gemma-3-270m-it` / `1b-it` / `4b-it`
 - `Qwen/Qwen3-0.6B` / `1.7B`
 - `LiquidAI/LFM2.5-1.2B-Instruct`
 - `microsoft/Phi-3-mini-4k-instruct`
 - `mistralai/Mistral-7B-Instruct-v0.3`
-- Embedding models: `nomic-ai/nomic-embed-text-v2-moe`
 
 ---
 
@@ -209,13 +226,13 @@ Any GGUF model supported by llama.cpp works.  Tested models include:
 - [x] Chat completions (non-streaming)
 - [x] Chat completions (SSE streaming)
 - [x] Legacy text completions
-- [x] Dense embeddings
 - [x] OpenAI-compatible model list
+- [ ] Dense embeddings (requires pooling model)
 - [ ] Vision / multimodal support
 - [ ] Speech-to-text (Whisper)
 - [ ] Tool / function calling
-- [ ] Cloud fallback (auto-handoff when confidence is low)
-- [ ] KV-cache quantisation
+- [ ] GPU acceleration (via candle CUDA/Metal features)
+- [ ] KV-cache sharing across requests
 - [ ] NPU support (Apple Neural Engine, Snapdragon HTP)
 
 ---

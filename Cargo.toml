@@ -17,7 +17,19 @@ name = "joshua"
 path = "src/lib.rs"
 
 [dependencies]
-llama-cpp-2 = "0.1"
+# Pure Rust ML inference (no C/C++ dependencies required for CPU)
+candle-core = "0.8"
+candle-transformers = "0.8"
+
+# Tokenization (pure Rust BPE/WordPiece — loads tokenizer.json from HuggingFace)
+# fancy-regex is the pure Rust regex backend (replaces the default Oniguruma C backend).
+# esaxx_fast is omitted to avoid the C++ suffix-array helper.
+tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
+
+# Sampling
+rand = "0.8"
+
+# HTTP server & utilities
 axum = { version = "0.8", features = ["json", "macros"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
