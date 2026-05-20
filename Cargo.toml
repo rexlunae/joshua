@@ -1,0 +1,33 @@
+[package]
+name = "joshua"
+version = "0.1.0"
+edition = "2021"
+description = "An mmap-based LLM inference engine for the Rust ecosystem — a Rust clone of Cactus"
+license = "MIT"
+repository = "https://github.com/rexlunae/joshua"
+keywords = ["llm", "inference", "ai", "openai", "gguf"]
+categories = ["science", "api-bindings"]
+
+[[bin]]
+name = "joshua"
+path = "src/main.rs"
+
+[lib]
+name = "joshua"
+path = "src/lib.rs"
+
+[dependencies]
+llama-cpp-2 = "0.1"
+axum = { version = "0.8", features = ["json", "macros"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive", "env"] }
+tower-http = { version = "0.6", features = ["cors"] }
+uuid = { version = "1", features = ["v4"] }
+futures-util = "0.3"
+tokio-stream = "0.1"
