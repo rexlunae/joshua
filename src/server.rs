@@ -116,28 +116,55 @@ async fn chat_completions(
 
         let id2 = id.clone();
         let model2 = model.clone();
-        let sse_stream = stream::iter(chunks.into_iter().enumerate().map(move |(i, chunk)| {
-            let delta = if i == 0 {
-                DeltaContent {
-                    role: Some("assistant".to_string()),
-                    content: Some(chunk),
-                }
-            } else {
-                DeltaContent {
-                    role: None,
-                    content: Some(chunk),
-                }
-            };
-            let payload =
-                ChatCompletionChunk::new(id2.clone(), model2.clone(), delta, None);
-            let data = serde_json::to_string(&payload).unwrap_or_default();
-            Ok::<Event, Infallible>(Event::default().data(data))
-        }))
-        .chain(stream::once(async {
-            Ok::<Event, Infallible>(Event::default().data("[DONE]"))
-        }));
+        let n_chunks = chunks.len();
 
-        let _ = usage; // usage is sent in the final chunk in a real implementation
+        // Content chunks — include the role header on the very first chunk.
+        let content_events =
+            stream::iter(chunks.into_iter().enumerate().map(move |(i, chunk)| {
+                let delta = if i == 0 {
+                    DeltaContent {
+                        role: Some("assistant".to_string()),
+                        content: Some(chunk),
+                    }
+                } else {
+                    DeltaContent {
+                        role: None,
+                        content: Some(chunk),
+                    }
+                };
+                let payload =
+                    ChatCompletionChunk::new(id2.clone(), model2.clone(), delta, None);
+                let data = serde_json::to_string(&payload).unwrap_or_default();
+                Ok::<Event, Infallible>(Event::default().data(data))
+            }));
+
+        // Final "stop" chunk — includes usage statistics as per the OpenAI spec
+        // (`stream_options.include_usage`). We always include them so that clients
+        // that inspect this chunk get accurate token counts.
+        let stop_payload = {
+            let mut chunk =
+                ChatCompletionChunk::new(id.clone(), model.clone(), DeltaContent::default(), Some("stop".to_string()));
+            // Attach usage as an extra field via serde_json (ChatCompletionChunk
+            // doesn't have a `usage` field to keep streaming chunks lean, so we
+            // serialise it manually here and embed it).
+            let mut value = serde_json::to_value(&chunk).unwrap_or_default();
+            value["usage"] = serde_json::json!({
+                "prompt_tokens":     usage.prompt_tokens,
+                "completion_tokens": usage.completion_tokens,
+                "total_tokens":      usage.total_tokens,
+            });
+            serde_json::to_string(&value).unwrap_or_default()
+        };
+
+        let sse_stream = content_events
+            .chain(stream::once(async move {
+                Ok::<Event, Infallible>(Event::default().data(stop_payload))
+            }))
+            .chain(stream::once(async {
+                Ok::<Event, Infallible>(Event::default().data("[DONE]"))
+            }));
+
+        let _ = n_chunks; // consumed above
 
         return Ok(Sse::new(sse_stream).into_response());
     }
@@ -264,7 +291,11 @@ async fn embeddings(
         data,
         model,
         usage: UsageInfo {
-            // Approximation: 4 chars ≈ 1 token.
+            // Token count approximation: the OpenAI spec requires returning usage
+            // for embeddings, but we do not re-tokenise the input here to keep the
+            // hot path fast.  The rule-of-thumb "4 UTF-8 bytes ≈ 1 token" works
+            // reasonably for English/Latin text; non-Latin scripts may differ.
+            // Use the actual llama-cpp-2 tokeniser for production-accuracy needs.
             prompt_tokens: (total_chars / 4) as u32,
             completion_tokens: 0,
             total_tokens: (total_chars / 4) as u32,
