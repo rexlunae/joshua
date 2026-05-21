@@ -5,10 +5,21 @@
 //! and the tokenizer are loaded entirely in pure Rust — no C or C++ runtime
 //! is required.
 //!
-//! A fresh [`ModelWeights`](candle_transformers::models::quantized_llama::ModelWeights)
-//! is created for every inference call so that each request has an isolated
-//! KV cache.  After the initial cold start the operating system's page cache
-//! keeps the GGUF file hot in RAM, making subsequent loads fast.
+//! A fresh [`QuantizedModel`] is created for every inference call so that
+//! each request has an isolated KV cache.  After the initial cold start the
+//! operating system's page cache keeps the GGUF file hot in RAM, making
+//! subsequent loads fast.
+//!
+//! The engine auto-detects the model architecture from the GGUF
+//! `general.architecture` metadata and dispatches to the correct candle
+//! quantized loader.  Supported architectures:
+//!
+//! | `general.architecture` | Model family
+//! |------------------------|-------------
+//! | `llama`                | Llama 2/3, Mistral, Gemma, Mixtral, StarCoder2, Yi
+//! | `phi` / `phi2`        | Phi-1, Phi-2
+//! | `phi3`                 | Phi-3
+//! | `qwen2`                | Qwen2
 //!
 //! # Model directory layout
 //!
@@ -28,10 +39,11 @@ use std::time::Instant;
 
 use candle_core::quantized::gguf_file;
 use candle_core::{Device, Tensor};
-use candle_transformers::models::quantized_llama::ModelWeights;
 use rand::distributions::{Distribution, WeightedIndex};
 use rand::thread_rng;
 use tokenizers::Tokenizer;
+
+use crate::model::QuantizedModel;
 
 use crate::error::{JoshuaError, Result};
 use crate::types::{ChatMessage, GenerationOptions, UsageInfo};
@@ -324,15 +336,16 @@ impl Engine {
 
     // ─── Private helpers ─────────────────────────────────────────────────────
 
-    /// Load `ModelWeights` from the GGUF file.
+    /// Load a [`QuantizedModel`] from the GGUF file — architecture is
+    /// auto-detected from the GGUF metadata.
     ///
     /// Each call re-opens the file so the KV cache starts empty — the OS page
     /// cache ensures subsequent opens are fast.
-    fn load_model(&self) -> Result<ModelWeights> {
+    fn load_model(&self) -> Result<QuantizedModel> {
         let mut file = File::open(&self.model_path)?;
         let gguf = gguf_file::Content::read(&mut file)
             .map_err(|e| JoshuaError::ModelLoad(format!("GGUF read failed: {e}")))?;
-        ModelWeights::from_gguf(gguf, &mut file, &Device::Cpu)
+        QuantizedModel::from_gguf(gguf, &mut file, &Device::Cpu)
             .map_err(|e| JoshuaError::ModelLoad(format!("model init failed: {e}")))
     }
 
