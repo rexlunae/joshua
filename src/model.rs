@@ -312,6 +312,34 @@ impl QuantizedModel {
         }
     }
 
+    /// Clear the KV cache so the instance can serve an unrelated prompt,
+    /// where the underlying candle model supports it.
+    ///
+    /// Returns `false` when the architecture has no reset hook — the caller
+    /// must build a fresh instance instead.
+    pub fn clear_kv_cache(&mut self) -> bool {
+        match self {
+            Self::Llama(m) => {
+                m.clear_kv_cache();
+                true
+            }
+            Self::Qwen2(m) => {
+                m.clear_kv_cache();
+                true
+            }
+            Self::Qwen3(m) => {
+                m.clear_kv_cache();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether [`QuantizedModel::clear_kv_cache`] can reset this instance.
+    pub fn supports_kv_clear(&self) -> bool {
+        matches!(self, Self::Llama(_) | Self::Qwen2(_) | Self::Qwen3(_))
+    }
+
     /// Unified forward pass.
     ///
     /// `input` has shape `[1, seq_len]` for the initial prefill, or `[1, 1]`

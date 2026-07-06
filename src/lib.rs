@@ -12,12 +12,7 @@
 //!
 //! let engine = Engine::new("path/to/model.gguf").unwrap();
 //!
-//! let messages = vec![joshua::ChatMessage {
-//!     role: "user".to_string(),
-//!     content: "Hello!".to_string(),
-//!     images: None,
-//!     name: None,
-//! }];
+//! let messages = vec![joshua::ChatMessage::text("user", "Hello!")];
 //!
 //! let (text, usage, _, _) = engine.complete(&messages, &GenerationOptions::default()).unwrap();
 //! println!("{text}");
@@ -26,11 +21,13 @@
 //! A `tokenizer.json` from the model's HuggingFace repository must be placed
 //! alongside the `.gguf` file so the engine can tokenise prompts.
 
+pub mod embedding;
 pub mod engine;
 pub mod error;
 pub mod model;
 pub mod server;
 pub mod template;
+pub mod tools;
 pub mod types;
 
 pub use engine::Engine;

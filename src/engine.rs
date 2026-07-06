@@ -13,10 +13,17 @@
 //! so it is shared between engine clones and across requests, and never
 //! copied through a `read()` syscall path.
 //!
-//! A fresh [`QuantizedModel`] is created for every inference call so that
-//! each request has an isolated KV cache; because the weights come straight
-//! out of the mapping, re-creating a model after the first load costs no
-//! disk I/O.
+//! # KV-cache sharing
+//!
+//! Finished requests park their model instance — including its populated KV
+//! cache — in a small pool.  A follow-up request whose prompt extends a
+//! parked instance's token history (the normal multi-turn chat pattern)
+//! reuses it and prefills only the new suffix, skipping recomputation of the
+//! shared prefix entirely.  Unrelated prompts reuse a pooled instance with a
+//! cleared cache where the architecture supports it, or build a fresh
+//! instance from the mapping (no disk I/O after first load).  Requests never
+//! observe each other's cache contents: an instance is owned by exactly one
+//! request at a time, and reuse requires an exact token-prefix match.
 //!
 //! The engine auto-detects the model architecture from the GGUF
 //! `general.architecture` metadata and dispatches to the correct candle
@@ -51,7 +58,8 @@
 use std::fs::File;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use candle_core::quantized::gguf_file;
@@ -61,11 +69,12 @@ use rand::distributions::{Distribution, WeightedIndex};
 use rand::thread_rng;
 use tokenizers::Tokenizer;
 
+use crate::embedding::EmbeddingModel;
 use crate::model::{Architecture, QuantizedModel};
 use crate::template::ChatTemplate;
 
 use crate::error::{JoshuaError, Result};
-use crate::types::{ChatMessage, GenerationOptions, UsageInfo};
+use crate::types::{ChatMessage, GenerationOptions, Tool, UsageInfo};
 
 // ─── Engine ───────────────────────────────────────────────────────────────────
 
@@ -88,14 +97,42 @@ pub struct Engine {
     eos_token_ids: Vec<u32>,
     /// The model's chat template from GGUF metadata, if it ships one.
     chat_template: Option<ChatTemplate>,
+    /// Lazily built embedding model (stateless, shared by all embed calls).
+    embed_model: Mutex<Option<Arc<EmbeddingModel>>>,
+    /// Pool of loaded model instances with warm KV caches.
+    ///
+    /// A finished request parks its model here together with the exact token
+    /// sequence its KV cache holds.  A later request whose prompt extends
+    /// that sequence (the normal multi-turn chat pattern) picks the instance
+    /// up and prefills only the new suffix.
+    model_cache: Mutex<Vec<CachedModel>>,
+    /// Number of requests that continued from a cached KV prefix.
+    kv_reuses: AtomicU64,
     /// Stem of the model file (used as the model identifier in API responses).
     model_name: String,
     /// Context-window size in tokens.
     n_ctx: u32,
+    /// Compute device: CUDA or Metal when built with the matching feature
+    /// (falling back to CPU if unavailable at runtime), CPU otherwise.
+    device: Device,
 }
 
-// `PathBuf`, `Arc<Mmap>`, `Arc<Tokenizer>`, `Vec<u32>`, `String`, and `u32`
-// are all `Send + Sync`, so Engine is automatically `Send + Sync`.
+// `PathBuf`, `Arc<Mmap>`, `Arc<Tokenizer>`, `Vec<u32>`, `String`, `u32`,
+// `Mutex<…>`, and `AtomicU64` are all `Send + Sync`, so Engine is
+// automatically `Send + Sync`.
+
+/// Maximum number of idle model instances kept warm in the pool.
+///
+/// Each instance holds the (quantized) weights plus its KV cache, so this
+/// bounds memory: two instances cover the common "one active conversation
+/// plus one concurrent request" pattern without tripling residency.
+const MAX_CACHED_MODELS: usize = 2;
+
+/// A parked model instance whose KV cache holds exactly `tokens`.
+struct CachedModel {
+    model: QuantizedModel,
+    tokens: Vec<u32>,
+}
 
 impl Engine {
     /// Load a GGUF model using a 4 096-token context window.
@@ -168,9 +205,10 @@ impl Engine {
 
         let eos_token_ids = extract_eos_ids(&gguf, &tokenizer);
         let chat_template = extract_chat_template(&gguf, &tokenizer);
+        let device = Self::default_device();
 
         tracing::info!(
-            "Model '{}' ready (arch={}, ctx={}, eos_ids={:?}, chat_template={})",
+            "Model '{}' ready (arch={}, ctx={}, eos_ids={:?}, chat_template={}, device={:?})",
             model_name,
             arch.display_name(),
             n_ctx,
@@ -179,7 +217,8 @@ impl Engine {
                 "from GGUF"
             } else {
                 "ChatML fallback"
-            }
+            },
+            device
         );
 
         Ok(Self {
@@ -188,9 +227,36 @@ impl Engine {
             tokenizer: Arc::new(tokenizer),
             eos_token_ids,
             chat_template,
+            embed_model: Mutex::new(None),
+            model_cache: Mutex::new(Vec::new()),
+            kv_reuses: AtomicU64::new(0),
             model_name,
             n_ctx,
+            device,
         })
+    }
+
+    /// Pick the compute device.
+    ///
+    /// With the `cuda` or `metal` cargo feature enabled this tries the GPU
+    /// first and falls back to CPU (with a warning) when no usable device is
+    /// present at runtime.  Without those features it is always CPU.
+    fn default_device() -> Device {
+        #[cfg(feature = "cuda")]
+        {
+            match Device::new_cuda(0) {
+                Ok(device) => return device,
+                Err(e) => tracing::warn!("CUDA unavailable, falling back to CPU: {e}"),
+            }
+        }
+        #[cfg(feature = "metal")]
+        {
+            match Device::new_metal(0) {
+                Ok(device) => return device,
+                Err(e) => tracing::warn!("Metal unavailable, falling back to CPU: {e}"),
+            }
+        }
+        Device::Cpu
     }
 
     /// The stem of the loaded model file name.
@@ -216,8 +282,34 @@ impl Engine {
     }
 
     /// Format messages as a ChatML prompt and append the assistant turn header.
-    fn format_chatml_prompt(messages: &[ChatMessage]) -> String {
+    ///
+    /// When tools are supplied, a Hermes-style system block advertising them
+    /// is prepended — the same convention our tool-call parser understands.
+    fn format_chatml_prompt(messages: &[ChatMessage], tools: Option<&[Tool]>) -> String {
         let mut prompt = String::new();
+        if let Some(tools) = tools.filter(|t| !t.is_empty()) {
+            prompt.push_str(
+                "<|im_start|>system\n\
+                 # Tools\n\n\
+                 You may call one or more functions to assist with the user query.\n\n\
+                 You are provided with function signatures within <tools></tools> XML tags:\n\
+                 <tools>\n",
+            );
+            for tool in tools {
+                if let Ok(json) = serde_json::to_string(tool) {
+                    prompt.push_str(&json);
+                    prompt.push('\n');
+                }
+            }
+            prompt.push_str(
+                "</tools>\n\n\
+                 For each function call, return a json object with function name and arguments \
+                 within <tool_call></tool_call> XML tags:\n\
+                 <tool_call>\n\
+                 {\"name\": <function-name>, \"arguments\": <args-json-object>}\n\
+                 </tool_call><|im_end|>\n",
+            );
+        }
         for msg in messages {
             prompt.push_str("<|im_start|>");
             prompt.push_str(&msg.role);
@@ -236,16 +328,16 @@ impl Engine {
     /// whether the tokenizer should still add special tokens: a rendered chat
     /// template already contains every special token (including BOS), so
     /// adding them again would duplicate BOS.
-    fn format_prompt(&self, messages: &[ChatMessage]) -> (String, bool) {
+    fn format_prompt(&self, messages: &[ChatMessage], tools: Option<&[Tool]>) -> (String, bool) {
         if let Some(template) = &self.chat_template {
-            match template.render(messages) {
+            match template.render(messages, tools) {
                 Ok(prompt) => return (prompt, false),
                 Err(e) => {
                     tracing::warn!("GGUF chat template unusable, falling back to ChatML: {e}");
                 }
             }
         }
-        (Self::format_chatml_prompt(messages), true)
+        (Self::format_chatml_prompt(messages, tools), true)
     }
 
     // ─── Completion ───────────────────────────────────────────────────────────
@@ -260,7 +352,22 @@ impl Engine {
         messages: &[ChatMessage],
         options: &GenerationOptions,
     ) -> Result<(String, UsageInfo, f64, f64)> {
-        let (prompt, add_special_tokens) = self.format_prompt(messages);
+        self.complete_chat(messages, None, options)
+    }
+
+    /// Run a chat completion with optional tool definitions.
+    ///
+    /// Tools are exposed to the chat template as the standard `tools`
+    /// variable so the model is instructed how to emit calls; parse the
+    /// generated text with [`crate::tools::parse_tool_calls`] to extract
+    /// them.
+    pub fn complete_chat(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        options: &GenerationOptions,
+    ) -> Result<(String, UsageInfo, f64, f64)> {
+        let (prompt, add_special_tokens) = self.format_prompt(messages, tools);
         self.complete_with(&prompt, add_special_tokens, options)
     }
 
@@ -282,10 +389,6 @@ impl Engine {
         add_special_tokens: bool,
         options: &GenerationOptions,
     ) -> Result<(String, UsageInfo, f64, f64)> {
-        // Load model weights from the GGUF file.  After the first call the OS
-        // page cache keeps the file data hot, so this is I/O-free in practice.
-        let mut model = self.load_model()?;
-
         // ── Tokenise ─────────────────────────────────────────────────────────
         let encoding = self
             .tokenizer
@@ -298,18 +401,28 @@ impl Engine {
             return Err(JoshuaError::PromptTooLong(n_prompt, self.n_ctx as usize));
         }
 
+        // ── Acquire a model ──────────────────────────────────────────────────
+        // Prefer a pooled instance whose KV cache already covers a prefix of
+        // this prompt; fall back to a reset instance or a fresh load.
+        let (mut model, n_reused) = self.acquire_model(&prompt_tokens)?;
+        let new_tokens = &prompt_tokens[n_reused..];
+
+        // Every token fed to the model so far — i.e. the exact contents of
+        // its KV cache.  Returned to the pool with the model afterwards.
+        let mut kv_tokens = prompt_tokens.clone();
+
         // ── Prefill ───────────────────────────────────────────────────────────
-        // Process all prompt tokens in a single forward pass.
-        // Input shape: [1, n_prompt].
-        let input = Tensor::new(prompt_tokens.as_slice(), &Device::Cpu)
+        // Process the not-yet-cached prompt tokens in a single forward pass.
+        // Input shape: [1, len(new_tokens)].
+        let input = Tensor::new(new_tokens, &self.device)
             .and_then(|t| t.unsqueeze(0))
             .map_err(|e| JoshuaError::Inference(e.to_string()))?;
 
         let prefill_start = Instant::now();
-        // index_pos = 0: the KV cache is empty; start building from position 0.
+        // index_pos = n_reused: append right after the reused KV prefix.
         // forward() internally selects the last-token logits; output: [1, vocab_size].
         let logits = model
-            .forward(&input, 0)
+            .forward(&input, n_reused)
             .map_err(|e| JoshuaError::Inference(e.to_string()))?;
         let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -365,19 +478,23 @@ impl Engine {
             }
 
             // Single-token step: input [1, 1], output [1, vocab_size].
-            let step_input = Tensor::new(&[next_token], &Device::Cpu)
+            let step_input = Tensor::new(&[next_token], &self.device)
                 .and_then(|t| t.unsqueeze(0))
                 .map_err(|e| JoshuaError::Inference(e.to_string()))?;
 
             let step_logits = model
                 .forward(&step_input, n_cur)
                 .map_err(|e| JoshuaError::Inference(e.to_string()))?;
+            kv_tokens.push(next_token);
 
             logits_vec = squeeze_batch_logits(&step_logits)?;
             n_cur += 1;
         }
 
         let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
+
+        // Park the instance for reuse by a follow-up request.
+        self.release_model(model, kv_tokens);
 
         let prefill_tps = if prefill_ms > 0.0 {
             n_prompt as f64 / (prefill_ms / 1000.0)
@@ -411,33 +528,128 @@ impl Engine {
 
     /// Compute dense embeddings for one or more texts.
     ///
-    /// Standard causal language models do not expose sentence-level embeddings
-    /// without a pooling head.  Use a dedicated embedding model
-    /// (e.g. nomic-embed-text, BGE, E5) whose GGUF variant is built with
-    /// embedding support.
+    /// Runs a single hidden-state forward pass per text and pools according
+    /// to the model's GGUF `pooling_type` metadata (mean by default, or
+    /// CLS / last-token for models converted with an explicit pooling head,
+    /// e.g. Qwen3-Embedding).  Vectors are L2-normalised.
+    ///
+    /// Supported architectures: llama (e5-mistral, SFR-Embedding, …), qwen2
+    /// (gte-Qwen2), and qwen3 (Qwen3-Embedding).
     pub fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        Err(JoshuaError::InvalidRequest(format!(
-            "Dense embedding extraction requires a model built with pooling support \
-             (e.g. nomic-embed-text-v2, BGE-M3). \
-             Standard language models cannot produce sentence embeddings via this API. \
-             ({} input text(s) provided)",
-            texts.len()
-        )))
+        Ok(self.embed_with_usage(texts)?.0)
+    }
+
+    /// Like [`Engine::embed`], additionally returning the total number of
+    /// input tokens processed.
+    pub fn embed_with_usage(&self, texts: &[String]) -> Result<(Vec<Vec<f32>>, u32)> {
+        let model = self.embedding_model()?;
+        let mut vectors = Vec::with_capacity(texts.len());
+        let mut total_tokens: u32 = 0;
+        for text in texts {
+            let encoding = self
+                .tokenizer
+                .encode(text.as_str(), true)
+                .map_err(|e| JoshuaError::Tokenization(e.to_string()))?;
+            let tokens = encoding.get_ids();
+            if tokens.len() >= self.n_ctx as usize {
+                return Err(JoshuaError::PromptTooLong(tokens.len(), self.n_ctx as usize));
+            }
+            total_tokens += tokens.len() as u32;
+            let vector = model
+                .embed_tokens(tokens)
+                .map_err(|e| JoshuaError::Inference(e.to_string()))?;
+            vectors.push(vector);
+        }
+        Ok((vectors, total_tokens))
+    }
+
+    /// Get (building on first use) the shared embedding model.
+    fn embedding_model(&self) -> Result<Arc<EmbeddingModel>> {
+        let mut slot = self
+            .embed_model
+            .lock()
+            .map_err(|e| JoshuaError::Inference(format!("embed model lock poisoned: {e}")))?;
+        if let Some(model) = slot.as_ref() {
+            return Ok(Arc::clone(model));
+        }
+        let mut cursor = Cursor::new(&self.mmap[..]);
+        let gguf = gguf_file::Content::read(&mut cursor)
+            .map_err(|e| JoshuaError::ModelLoad(format!("GGUF read failed: {e}")))?;
+        let model = EmbeddingModel::from_gguf(gguf, &mut cursor, &self.device)
+            .map_err(|e| JoshuaError::InvalidRequest(e.to_string()))?;
+        let model = Arc::new(model);
+        *slot = Some(Arc::clone(&model));
+        Ok(model)
     }
 
     // ─── Private helpers ─────────────────────────────────────────────────────
 
+    /// Number of requests so far that continued from a cached KV prefix.
+    pub fn kv_reuse_count(&self) -> u64 {
+        self.kv_reuses.load(Ordering::Relaxed)
+    }
+
+    /// Get a model ready to prefill `prompt_tokens`.
+    ///
+    /// Returns the instance and how many leading prompt tokens its KV cache
+    /// already covers.  Preference order:
+    ///
+    /// 1. a pooled instance whose fed-token history is a strict prefix of
+    ///    the prompt (longest match wins) — only the suffix needs prefill;
+    /// 2. a pooled instance whose KV cache can be cleared — skips re-reading
+    ///    the weights;
+    /// 3. a fresh instance from the mmap.
+    fn acquire_model(&self, prompt_tokens: &[u32]) -> Result<(QuantizedModel, usize)> {
+        if let Ok(mut pool) = self.model_cache.lock() {
+            let best = pool
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| {
+                    c.tokens.len() < prompt_tokens.len() && prompt_tokens.starts_with(&c.tokens)
+                })
+                .max_by_key(|(_, c)| c.tokens.len())
+                .map(|(i, _)| i);
+            if let Some(i) = best {
+                let cached = pool.swap_remove(i);
+                self.kv_reuses.fetch_add(1, Ordering::Relaxed);
+                tracing::debug!(
+                    reused_tokens = cached.tokens.len(),
+                    prompt_tokens = prompt_tokens.len(),
+                    "Continuing from cached KV prefix"
+                );
+                return Ok((cached.model, cached.tokens.len()));
+            }
+            if let Some(i) = pool.iter().position(|c| c.model.supports_kv_clear()) {
+                let mut cached = pool.swap_remove(i);
+                cached.model.clear_kv_cache();
+                tracing::debug!("Reusing pooled model with cleared KV cache");
+                return Ok((cached.model, 0));
+            }
+        }
+        Ok((self.load_model()?, 0))
+    }
+
+    /// Return a finished instance (KV cache = `tokens`) to the pool.
+    fn release_model(&self, model: QuantizedModel, tokens: Vec<u32>) {
+        if let Ok(mut pool) = self.model_cache.lock() {
+            pool.push(CachedModel { model, tokens });
+            // Evict oldest beyond the cap.
+            while pool.len() > MAX_CACHED_MODELS {
+                pool.remove(0);
+            }
+        }
+    }
+
     /// Load a [`QuantizedModel`] from the memory-mapped GGUF file —
     /// architecture is auto-detected from the GGUF metadata.
     ///
-    /// Each call builds a fresh model so the KV cache starts empty.  Weights
-    /// are read straight out of the shared mmap, so after the first load
-    /// this involves no disk I/O.
+    /// The instance starts with an empty KV cache.  Weights are read straight
+    /// out of the shared mmap, so reloads involve no disk I/O.
     fn load_model(&self) -> Result<QuantizedModel> {
         let mut cursor = Cursor::new(&self.mmap[..]);
         let gguf = gguf_file::Content::read(&mut cursor)
             .map_err(|e| JoshuaError::ModelLoad(format!("GGUF read failed: {e}")))?;
-        QuantizedModel::from_gguf(gguf, &mut cursor, &Device::Cpu)
+        QuantizedModel::from_gguf(gguf, &mut cursor, &self.device)
             .map_err(|e| JoshuaError::ModelLoad(format!("model init failed: {e}")))
     }
 
