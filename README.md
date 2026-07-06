@@ -13,9 +13,10 @@ framework) and [tokenizers](https://github.com/huggingface/tokenizers).
 | Feature | Details |
 |---|---|
 | **Pure Rust** | Zero C/C++ dependencies — `cargo build` requires only a Rust toolchain |
+| **mmap loading** | The GGUF file is memory-mapped like llama.cpp: weights page in lazily and stay in the OS page cache |
 | **OpenAI-compatible** | Drop-in replacement for `/v1/chat/completions`, `/v1/embeddings`, `/v1/models` |
 | **Streaming** | Server-Sent Events (SSE) for token-by-token streaming |
-| **GGUF support** | Llama, Gemma, Qwen, Mistral, and any other Llama-architecture GGUF model |
+| **GGUF support** | Llama/Mistral/Mixtral, Gemma 1–3, GLM-4, LFM2, Phi-2, Phi-3, Qwen2, Qwen3, Qwen3-MoE |
 | **Sampling** | Temperature, top-k, min-p, top-p (nucleus), greedy — all in Rust |
 
 ---
@@ -29,7 +30,7 @@ framework) and [tokenizers](https://github.com/huggingface/tokenizers).
            │
 ┌──────────────────────────┐
 │  candle  (pure Rust)     │  ← Tensor operations + quantized GGUF inference
-└──────────────────────────┘    quantized_llama: Llama / Mistral / Gemma / Qwen
+└──────────────────────────┘    Llama / Gemma / GLM-4 / LFM2 / Phi / Qwen loaders
            │
 ┌──────────────────────────┐
 │  tokenizers (pure Rust)  │  ← BPE tokenisation from tokenizer.json
@@ -59,7 +60,8 @@ joshua = { git = "https://github.com/rexlunae/joshua" }
 
 ### 2 — Download a model
 
-Any GGUF model that follows the Llama architecture works.  You also need the
+Any GGUF model with a supported architecture works (see
+[Supported models](#supported-models) below).  You also need the
 `tokenizer.json` from the same HuggingFace repository — place it alongside the
 `.gguf` file.
 
@@ -211,13 +213,36 @@ curl http://localhost:8080/health
 
 ## Supported models
 
-Any GGUF model with a Llama-compatible architecture.  Tested models include:
+Joshua reads `general.architecture` from the GGUF metadata and dispatches to
+the matching pure-Rust candle loader.  Currently supported architectures:
+
+| `general.architecture` | Model families |
+|---|---|
+| `llama` | Llama 1/2/3, Mistral, Mixtral, TinyLlama, SmolLM, Vicuna, Zephyr, Yi, and anything else llama.cpp's converters emit as `llama` |
+| `gemma` / `gemma2` / `gemma3` / `gemma-embedding` | Gemma 1, Gemma 2, Gemma 3 |
+| `glm4` | GLM-4 (dense) |
+| `lfm2` | Liquid LFM2 |
+| `phi2` | Phi-1, Phi-1.5, Phi-2 |
+| `phi3` | Phi-3, Phi-3.5 |
+| `qwen2` | Qwen1.5, Qwen2, Qwen2.5 |
+| `qwen3` | Qwen3 (dense) |
+| `qwen3moe` | Qwen3 mixture-of-experts |
+
+Example models:
 
 - `google/gemma-3-270m-it` / `1b-it` / `4b-it`
 - `Qwen/Qwen3-0.6B` / `1.7B`
-- `LiquidAI/LFM2.5-1.2B-Instruct`
+- `LiquidAI/LFM2-1.2B`
 - `microsoft/Phi-3-mini-4k-instruct`
 - `mistralai/Mistral-7B-Instruct-v0.3`
+- `THUDM/GLM-4-9B-0414`
+
+Every other architecture name in llama.cpp's registry (Mamba, RWKV, GPT-2,
+DeepSeek, Granite, OLMo, StarCoder2, and ~70 more) is recognised at load time
+and rejected with an error that names the architecture and lists what is
+supported — so an unsupported model fails fast with a clear message instead
+of a cryptic missing-tensor error.  Coverage grows as candle gains loaders;
+adding one is a small patch to `src/model.rs`.
 
 ---
 
@@ -227,6 +252,8 @@ Any GGUF model with a Llama-compatible architecture.  Tested models include:
 - [x] Chat completions (SSE streaming)
 - [x] Legacy text completions
 - [x] OpenAI-compatible model list
+- [x] mmap-based model loading
+- [x] Multi-architecture GGUF dispatch (all candle quantized loaders)
 - [ ] Dense embeddings (requires pooling model)
 - [ ] Vision / multimodal support
 - [ ] Speech-to-text (Whisper)

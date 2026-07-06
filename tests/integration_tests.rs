@@ -218,6 +218,180 @@ fn test_embed_returns_correct_count() {
     }
 }
 
+// ─── Synthetic-model tests (always run) ──────────────────────────────────────
+//
+// These tests synthesise a tiny but structurally valid llama-architecture
+// GGUF file plus a matching `tokenizer.json`, then run the full engine
+// pipeline against it: mmap → architecture dispatch → prefill → decode.
+// No network access or real model download is needed.
+
+mod synthetic {
+    use candle_core::quantized::{gguf_file, GgmlDType, QTensor};
+    use candle_core::{Device, Tensor};
+    use std::fs::File;
+    use std::path::{Path, PathBuf};
+
+    /// Deterministic pseudo-random weights in roughly [-0.1, 0.1].
+    fn weights(n: usize, seed: u32) -> Vec<f32> {
+        let mut state = seed | 1;
+        (0..n)
+            .map(|_| {
+                // xorshift32
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                ((state % 2000) as f32 / 1000.0 - 1.0) * 0.1
+            })
+            .collect()
+    }
+
+    fn qtensor(data: Vec<f32>, shape: &[usize]) -> QTensor {
+        let t = Tensor::from_vec(data, shape, &Device::Cpu).unwrap();
+        QTensor::quantize(&t, GgmlDType::F32).unwrap()
+    }
+
+    /// A minimal WordLevel tokenizer with a 16-token vocabulary.
+    const TOKENIZER_JSON: &str = r#"{
+        "version": "1.0",
+        "truncation": null,
+        "padding": null,
+        "added_tokens": [
+            {"id": 3, "content": "</s>", "single_word": false, "lstrip": false,
+             "rstrip": false, "normalized": false, "special": true}
+        ],
+        "normalizer": null,
+        "pre_tokenizer": {"type": "Whitespace"},
+        "post_processor": null,
+        "decoder": null,
+        "model": {
+            "type": "WordLevel",
+            "vocab": {"<unk>": 0, "hello": 1, "world": 2, "</s>": 3,
+                      "a": 4, "b": 5, "c": 6, "d": 7, "e": 8, "f": 9,
+                      "g": 10, "h": 11, "i": 12, "j": 13, "k": 14, "l": 15},
+            "unk_token": "<unk>"
+        }
+    }"#;
+
+    /// Write a tiny llama-architecture GGUF: 16-token vocab, 8-dim embedding,
+    /// 2 heads, 1 transformer block, tied output head.
+    fn write_tiny_llama_gguf(path: &Path) {
+        const VOCAB: usize = 16;
+        const EMB: usize = 8;
+        const FFN: usize = 16;
+
+        let metadata: Vec<(&str, gguf_file::Value)> = vec![
+            (
+                "general.architecture",
+                gguf_file::Value::String("llama".to_string()),
+            ),
+            ("llama.attention.head_count", gguf_file::Value::U32(2)),
+            ("llama.attention.head_count_kv", gguf_file::Value::U32(2)),
+            ("llama.block_count", gguf_file::Value::U32(1)),
+            ("llama.embedding_length", gguf_file::Value::U32(EMB as u32)),
+            ("llama.rope.dimension_count", gguf_file::Value::U32(4)),
+            (
+                "llama.attention.layer_norm_rms_epsilon",
+                gguf_file::Value::F32(1e-5),
+            ),
+            ("tokenizer.ggml.eos_token_id", gguf_file::Value::U32(3)),
+        ];
+
+        let ones = |n: usize| vec![1.0f32; n];
+        let tensors: Vec<(&str, QTensor)> = vec![
+            ("token_embd.weight", qtensor(weights(VOCAB * EMB, 1), &[VOCAB, EMB])),
+            ("output_norm.weight", qtensor(ones(EMB), &[EMB])),
+            ("blk.0.attn_norm.weight", qtensor(ones(EMB), &[EMB])),
+            ("blk.0.ffn_norm.weight", qtensor(ones(EMB), &[EMB])),
+            ("blk.0.attn_q.weight", qtensor(weights(EMB * EMB, 2), &[EMB, EMB])),
+            ("blk.0.attn_k.weight", qtensor(weights(EMB * EMB, 3), &[EMB, EMB])),
+            ("blk.0.attn_v.weight", qtensor(weights(EMB * EMB, 4), &[EMB, EMB])),
+            ("blk.0.attn_output.weight", qtensor(weights(EMB * EMB, 5), &[EMB, EMB])),
+            ("blk.0.ffn_gate.weight", qtensor(weights(FFN * EMB, 6), &[FFN, EMB])),
+            ("blk.0.ffn_down.weight", qtensor(weights(EMB * FFN, 7), &[EMB, FFN])),
+            ("blk.0.ffn_up.weight", qtensor(weights(FFN * EMB, 8), &[FFN, EMB])),
+        ];
+
+        let metadata_refs: Vec<(&str, &gguf_file::Value)> =
+            metadata.iter().map(|(k, v)| (*k, v)).collect();
+        let tensor_refs: Vec<(&str, &QTensor)> =
+            tensors.iter().map(|(k, v)| (*k, v)).collect();
+
+        let mut file = File::create(path).unwrap();
+        gguf_file::write(&mut file, &metadata_refs, &tensor_refs).unwrap();
+    }
+
+    /// Write a GGUF with a known-to-llama.cpp but unimplemented architecture.
+    fn write_unsupported_gguf(path: &Path) {
+        let arch = gguf_file::Value::String("mamba".to_string());
+        let metadata: Vec<(&str, &gguf_file::Value)> = vec![("general.architecture", &arch)];
+        let mut file = File::create(path).unwrap();
+        gguf_file::write(&mut file, &metadata, &[]).unwrap();
+    }
+
+    /// Create a fresh model directory under the target tmp area.
+    fn model_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir()
+            .join("joshua-tests")
+            .join(format!("{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("tokenizer.json"), TOKENIZER_JSON).unwrap();
+        dir
+    }
+
+    #[test]
+    fn tiny_llama_end_to_end() {
+        use joshua::{types::GenerationOptions, Engine};
+
+        let dir = model_dir("tiny-llama");
+        write_tiny_llama_gguf(&dir.join("model.gguf"));
+
+        let engine = Engine::with_n_ctx(&dir, 64).expect("engine should load tiny model");
+        assert_eq!(engine.model_name(), "model");
+
+        let options = GenerationOptions {
+            max_tokens: 4,
+            temperature: 0.0,
+            ..Default::default()
+        };
+
+        // Run twice: the second call re-instantiates the model from the same
+        // mmap, verifying weights stay readable across loads.
+        for _ in 0..2 {
+            let (_, usage, _, _) = engine
+                .complete_raw("hello world", &options)
+                .expect("completion should succeed");
+            assert_eq!(usage.prompt_tokens, 2);
+            assert!(usage.completion_tokens <= 4);
+            assert_eq!(
+                usage.total_tokens,
+                usage.prompt_tokens + usage.completion_tokens
+            );
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn unsupported_architecture_fails_at_load_with_clear_error() {
+        use joshua::Engine;
+
+        let dir = model_dir("unsupported-arch");
+        write_unsupported_gguf(&dir.join("model.gguf"));
+
+        let msg = match Engine::with_n_ctx(&dir, 64) {
+            Ok(_) => panic!("mamba arch must be rejected"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains("known llama.cpp architecture"),
+            "unexpected error message: {msg}"
+        );
+        assert!(msg.contains("mamba"), "unexpected error message: {msg}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
 // ─── Type tests (always run) ──────────────────────────────────────────────────
 
 #[test]

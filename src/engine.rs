@@ -5,10 +5,18 @@
 //! and the tokenizer are loaded entirely in pure Rust — no C or C++ runtime
 //! is required.
 //!
+//! # Memory mapping
+//!
+//! The GGUF file is memory-mapped (`mmap`) once when the engine is created,
+//! exactly like llama.cpp's default loading strategy.  Weight data is paged
+//! in lazily by the OS on first touch and stays resident in the page cache,
+//! so it is shared between engine clones and across requests, and never
+//! copied through a `read()` syscall path.
+//!
 //! A fresh [`QuantizedModel`] is created for every inference call so that
-//! each request has an isolated KV cache.  After the initial cold start the
-//! operating system's page cache keeps the GGUF file hot in RAM, making
-//! subsequent loads fast.
+//! each request has an isolated KV cache; because the weights come straight
+//! out of the mapping, re-creating a model after the first load costs no
+//! disk I/O.
 //!
 //! The engine auto-detects the model architecture from the GGUF
 //! `general.architecture` metadata and dispatches to the correct candle
@@ -16,10 +24,18 @@
 //!
 //! | `general.architecture` | Model family
 //! |------------------------|-------------
-//! | `llama`                | Llama 2/3, Mistral, Gemma, Mixtral, StarCoder2, Yi
-//! | `phi` / `phi2`        | Phi-1, Phi-2
-//! | `phi3`                 | Phi-3
-//! | `qwen2`                | Qwen2
+//! | `llama`                | Llama 1/2/3, Mistral, Mixtral, TinyLlama, SmolLM, Yi, …
+//! | `gemma` / `gemma2` / `gemma3` / `gemma-embedding` | Gemma 1/2/3
+//! | `glm4`                 | GLM-4
+//! | `lfm2`                 | LFM2
+//! | `phi2`                 | Phi-1, Phi-1.5, Phi-2
+//! | `phi3`                 | Phi-3 / Phi-3.5
+//! | `qwen2`                | Qwen1.5 / Qwen2 / Qwen2.5
+//! | `qwen3`                | Qwen3
+//! | `qwen3moe`             | Qwen3 MoE
+//!
+//! Any other architecture in llama.cpp's registry is recognised by name and
+//! rejected with an error explaining that no pure-Rust loader exists yet.
 //!
 //! # Model directory layout
 //!
@@ -33,17 +49,19 @@
 //! looked up in the same directory.
 
 use std::fs::File;
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
 use candle_core::quantized::gguf_file;
 use candle_core::{Device, Tensor};
+use memmap2::Mmap;
 use rand::distributions::{Distribution, WeightedIndex};
 use rand::thread_rng;
 use tokenizers::Tokenizer;
 
-use crate::model::QuantizedModel;
+use crate::model::{Architecture, QuantizedModel};
 
 use crate::error::{JoshuaError, Result};
 use crate::types::{ChatMessage, GenerationOptions, UsageInfo};
@@ -57,6 +75,12 @@ use crate::types::{ChatMessage, GenerationOptions, UsageInfo};
 pub struct Engine {
     /// Path to the `.gguf` file.
     model_path: PathBuf,
+    /// The GGUF file memory-mapped into the process address space.
+    ///
+    /// All model loads read weights directly out of this mapping, so the OS
+    /// page cache backs every request and engine clones share the same
+    /// physical pages.
+    mmap: Arc<Mmap>,
     /// Stateless tokenizer, shared across all inference calls.
     tokenizer: Arc<Tokenizer>,
     /// EOS token IDs derived from the GGUF metadata and common special tokens.
@@ -67,8 +91,8 @@ pub struct Engine {
     n_ctx: u32,
 }
 
-// `PathBuf`, `Arc<Tokenizer>`, `Vec<u32>`, `String`, and `u32` are all
-// `Send + Sync`, so Engine is automatically `Send + Sync`.
+// `PathBuf`, `Arc<Mmap>`, `Arc<Tokenizer>`, `Vec<u32>`, `String`, and `u32`
+// are all `Send + Sync`, so Engine is automatically `Send + Sync`.
 
 impl Engine {
     /// Load a GGUF model using a 4 096-token context window.
@@ -117,22 +141,41 @@ impl Engine {
         let tokenizer = Tokenizer::from_file(&tokenizer_path)
             .map_err(|e| JoshuaError::ModelLoad(format!("tokenizer load failed: {e}")))?;
 
-        // Read GGUF metadata once to extract EOS token IDs.
-        let mut file = File::open(&gguf_path)?;
-        let gguf = gguf_file::Content::read(&mut file)
+        // Map the GGUF file into memory.  Weights are paged in lazily by the
+        // OS and shared across all requests and engine clones.
+        //
+        // SAFETY: the mapping is only undefined behaviour if the file is
+        // truncated or rewritten while mapped.  Model files are treated as
+        // immutable once downloaded, matching llama.cpp's own mmap usage.
+        let file = File::open(&gguf_path)?;
+        let mmap = unsafe { Mmap::map(&file) }
+            .map_err(|e| JoshuaError::ModelLoad(format!("mmap of GGUF file failed: {e}")))?;
+
+        // Weight tensors are consumed in file order during a load, so tell
+        // the kernel to read ahead aggressively.  Best effort only.
+        #[cfg(unix)]
+        let _ = mmap.advise(memmap2::Advice::Sequential);
+
+        // Read GGUF metadata once to validate the architecture up front and
+        // extract EOS token IDs.
+        let gguf = gguf_file::Content::read(&mut Cursor::new(&mmap[..]))
             .map_err(|e| JoshuaError::ModelLoad(format!("GGUF read failed: {e}")))?;
+
+        let arch = Architecture::detect(&gguf.metadata).map_err(JoshuaError::ModelLoad)?;
 
         let eos_token_ids = extract_eos_ids(&gguf, &tokenizer);
 
         tracing::info!(
-            "Model '{}' ready (ctx={}, eos_ids={:?})",
+            "Model '{}' ready (arch={}, ctx={}, eos_ids={:?})",
             model_name,
+            arch.display_name(),
             n_ctx,
             eos_token_ids
         );
 
         Ok(Self {
             model_path: gguf_path,
+            mmap: Arc::new(mmap),
             tokenizer: Arc::new(tokenizer),
             eos_token_ids,
             model_name,
@@ -336,16 +379,17 @@ impl Engine {
 
     // ─── Private helpers ─────────────────────────────────────────────────────
 
-    /// Load a [`QuantizedModel`] from the GGUF file — architecture is
-    /// auto-detected from the GGUF metadata.
+    /// Load a [`QuantizedModel`] from the memory-mapped GGUF file —
+    /// architecture is auto-detected from the GGUF metadata.
     ///
-    /// Each call re-opens the file so the KV cache starts empty — the OS page
-    /// cache ensures subsequent opens are fast.
+    /// Each call builds a fresh model so the KV cache starts empty.  Weights
+    /// are read straight out of the shared mmap, so after the first load
+    /// this involves no disk I/O.
     fn load_model(&self) -> Result<QuantizedModel> {
-        let mut file = File::open(&self.model_path)?;
-        let gguf = gguf_file::Content::read(&mut file)
+        let mut cursor = Cursor::new(&self.mmap[..]);
+        let gguf = gguf_file::Content::read(&mut cursor)
             .map_err(|e| JoshuaError::ModelLoad(format!("GGUF read failed: {e}")))?;
-        QuantizedModel::from_gguf(gguf, &mut file, &Device::Cpu)
+        QuantizedModel::from_gguf(gguf, &mut cursor, &Device::Cpu)
             .map_err(|e| JoshuaError::ModelLoad(format!("model init failed: {e}")))
     }
 
