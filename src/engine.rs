@@ -58,7 +58,7 @@
 use std::fs::File;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -71,6 +71,7 @@ use tokenizers::Tokenizer;
 
 use crate::embedding::EmbeddingModel;
 use crate::model::{Architecture, QuantizedModel};
+use crate::npu::{NpuBackend, NpuSession};
 use crate::template::ChatTemplate;
 
 use crate::error::{JoshuaError, Result};
@@ -108,6 +109,8 @@ pub struct Engine {
     model_cache: Mutex<Vec<CachedModel>>,
     /// Number of requests that continued from a cached KV prefix.
     kv_reuses: AtomicU64,
+    /// Optional NPU backend with its circuit breaker.
+    npu: Option<NpuState>,
     /// Stem of the model file (used as the model identifier in API responses).
     model_name: String,
     /// Context-window size in tokens.
@@ -128,10 +131,81 @@ pub struct Engine {
 /// plus one concurrent request" pattern without tripling residency.
 const MAX_CACHED_MODELS: usize = 2;
 
-/// A parked model instance whose KV cache holds exactly `tokens`.
+/// Consecutive NPU failures before the backend is disabled for the rest of
+/// the engine's lifetime (all requests then run on the candle path).
+const NPU_MAX_FAILURES: u32 = 3;
+
+/// A parked generation session whose state holds exactly `tokens`.
 struct CachedModel {
-    model: QuantizedModel,
+    session: GenSession,
     tokens: Vec<u32>,
+}
+
+/// A generation session: either a candle model on CPU/GPU or a vendor NPU
+/// session behind the [`crate::npu`] plugin interface.  Both follow the same
+/// contract: feed tokens at an absolute position, get last-token logits.
+enum GenSession {
+    Candle(Box<QuantizedModel>),
+    Npu(Box<dyn NpuSession>),
+}
+
+impl GenSession {
+    /// Feed `tokens` at absolute position `pos`, returning last-token logits.
+    fn forward_tokens(&mut self, tokens: &[u32], pos: usize, device: &Device) -> Result<Vec<f32>> {
+        match self {
+            Self::Candle(model) => {
+                let input = Tensor::new(tokens, device)
+                    .and_then(|t| t.unsqueeze(0))
+                    .map_err(|e| JoshuaError::Inference(e.to_string()))?;
+                let logits = model
+                    .forward(&input, pos)
+                    .map_err(|e| JoshuaError::Inference(e.to_string()))?;
+                squeeze_batch_logits(&logits)
+            }
+            Self::Npu(session) => session
+                .forward(tokens, pos)
+                .map_err(JoshuaError::Inference),
+        }
+    }
+
+    /// Clear internal state for reuse with an unrelated prompt.
+    ///
+    /// Returns `false` when the session cannot be reset and must be dropped.
+    fn clear_state(&mut self) -> bool {
+        match self {
+            Self::Candle(model) => model.clear_kv_cache(),
+            Self::Npu(session) => session.reset(),
+        }
+    }
+
+    fn is_npu(&self) -> bool {
+        matches!(self, Self::Npu(_))
+    }
+}
+
+/// NPU backend state: the backend plus its circuit breaker.
+struct NpuState {
+    backend: Arc<dyn NpuBackend>,
+    failures: AtomicU32,
+    disabled: AtomicBool,
+}
+
+impl NpuState {
+    /// Record a failure; disable the backend once the limit is reached.
+    fn record_failure(&self, backend_name: &str, error: &str) {
+        let failures = self.failures.fetch_add(1, Ordering::Relaxed) + 1;
+        tracing::warn!("NPU backend {backend_name} failure {failures}/{NPU_MAX_FAILURES}: {error}");
+        if failures >= NPU_MAX_FAILURES && !self.disabled.swap(true, Ordering::Relaxed) {
+            tracing::error!(
+                "NPU backend {backend_name} disabled after {failures} failures; \
+                 all requests will use the candle CPU/GPU path"
+            );
+        }
+    }
+
+    fn usable(&self) -> bool {
+        !self.disabled.load(Ordering::Relaxed)
+    }
 }
 
 impl Engine {
@@ -230,6 +304,7 @@ impl Engine {
             embed_model: Mutex::new(None),
             model_cache: Mutex::new(Vec::new()),
             kv_reuses: AtomicU64::new(0),
+            npu: None,
             model_name,
             n_ctx,
             device,
@@ -401,36 +476,63 @@ impl Engine {
             return Err(JoshuaError::PromptTooLong(n_prompt, self.n_ctx as usize));
         }
 
-        // ── Acquire a model ──────────────────────────────────────────────────
-        // Prefer a pooled instance whose KV cache already covers a prefix of
+        // ── Acquire a session, generate, retry on CPU if the NPU fails ──────
+        // Prefer a pooled instance whose state already covers a prefix of
         // this prompt; fall back to a reset instance or a fresh load.
-        let (mut model, n_reused) = self.acquire_model(&prompt_tokens)?;
+        let (mut session, n_reused) = self.acquire_session(&prompt_tokens, true)?;
+        let was_npu = session.is_npu();
 
-        match self.run_generation(&mut model, &prompt_tokens, n_reused, options) {
+        let result = self.run_generation(&mut session, &prompt_tokens, n_reused, options);
+        match result {
             Ok((response, usage, prefill_tps, decode_tps, kv_tokens)) => {
                 // Park the instance for reuse by a follow-up request.
-                self.release_model(model, kv_tokens);
+                self.release_model(session, kv_tokens);
                 Ok((response, usage, prefill_tps, decode_tps))
+            }
+            Err(e) if was_npu => {
+                // Count the failure (possibly disabling the backend), drop
+                // the session unless it can prove a clean reset, and retry
+                // the whole request once on the candle path.
+                if let Some(npu) = &self.npu {
+                    npu.record_failure(&npu.backend.name(), &e.to_string());
+                }
+                if session.clear_state() {
+                    self.release_model(session, Vec::new());
+                }
+                tracing::warn!("Retrying request on the candle path after NPU failure: {e}");
+                let (mut session, n_reused) = self.acquire_session(&prompt_tokens, false)?;
+                match self.run_generation(&mut session, &prompt_tokens, n_reused, options) {
+                    Ok((response, usage, prefill_tps, decode_tps, kv_tokens)) => {
+                        self.release_model(session, kv_tokens);
+                        Ok((response, usage, prefill_tps, decode_tps))
+                    }
+                    Err(e) => {
+                        if session.clear_state() {
+                            self.release_model(session, Vec::new());
+                        }
+                        Err(e)
+                    }
+                }
             }
             Err(e) => {
                 // The KV cache may be partially updated at the failure point;
                 // a cleared cache is fully consistent, so keep the (expensive
                 // to reload) weights warm where the architecture allows it.
-                if model.clear_kv_cache() {
-                    self.release_model(model, Vec::new());
+                if session.clear_state() {
+                    self.release_model(session, Vec::new());
                 }
                 Err(e)
             }
         }
     }
 
-    /// Prefill + decode on an acquired model.
+    /// Prefill + decode on an acquired session.
     ///
     /// Returns the generated text, usage, throughput figures, and the exact
-    /// token sequence now held in the model's KV cache.
+    /// token sequence now held in the session's state.
     fn run_generation(
         &self,
-        model: &mut QuantizedModel,
+        model: &mut GenSession,
         prompt_tokens: &[u32],
         n_reused: usize,
         options: &GenerationOptions,
@@ -443,21 +545,11 @@ impl Engine {
         let mut kv_tokens = prompt_tokens.to_vec();
 
         // ── Prefill ───────────────────────────────────────────────────────────
-        // Process the not-yet-cached prompt tokens in a single forward pass.
-        // Input shape: [1, len(new_tokens)].
-        let input = Tensor::new(new_tokens, &self.device)
-            .and_then(|t| t.unsqueeze(0))
-            .map_err(|e| JoshuaError::Inference(e.to_string()))?;
-
+        // Process the not-yet-cached prompt tokens in a single forward pass,
+        // starting right after the reused KV prefix.
         let prefill_start = Instant::now();
-        // index_pos = n_reused: append right after the reused KV prefix.
-        // forward() internally selects the last-token logits; output: [1, vocab_size].
-        let logits = model
-            .forward(&input, n_reused)
-            .map_err(|e| JoshuaError::Inference(e.to_string()))?;
+        let mut logits_vec = model.forward_tokens(new_tokens, n_reused, &self.device)?;
         let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
-
-        let mut logits_vec = squeeze_batch_logits(&logits)?;
 
         // ── Repetition-penalty history ────────────────────────────────────────
         // Seed the recent-token window with the tail of the prompt (up to 64 tokens).
@@ -508,17 +600,9 @@ impl Engine {
                 break;
             }
 
-            // Single-token step: input [1, 1], output [1, vocab_size].
-            let step_input = Tensor::new(&[next_token], &self.device)
-                .and_then(|t| t.unsqueeze(0))
-                .map_err(|e| JoshuaError::Inference(e.to_string()))?;
-
-            let step_logits = model
-                .forward(&step_input, n_cur)
-                .map_err(|e| JoshuaError::Inference(e.to_string()))?;
+            // Single-token decode step.
+            logits_vec = model.forward_tokens(&[next_token], n_cur, &self.device)?;
             kv_tokens.push(next_token);
-
-            logits_vec = squeeze_batch_logits(&step_logits)?;
             n_cur += 1;
         }
 
@@ -622,23 +706,61 @@ impl Engine {
         self.kv_reuses.load(Ordering::Relaxed)
     }
 
-    /// Get a model ready to prefill `prompt_tokens`.
+    /// Route generation through an NPU backend (see [`crate::npu`]).
     ///
-    /// Returns the instance and how many leading prompt tokens its KV cache
-    /// already covers.  Preference order:
+    /// Generation requests try the backend first and transparently fall back
+    /// to the candle CPU/GPU path when session creation or a forward pass
+    /// fails; after [`NPU_MAX_FAILURES`] failures the backend is disabled
+    /// for the engine's lifetime.  Embeddings always run on candle.
+    pub fn with_npu_backend(mut self, backend: Arc<dyn NpuBackend>) -> Self {
+        tracing::info!("NPU backend configured: {}", backend.name());
+        self.npu = Some(NpuState {
+            backend,
+            failures: AtomicU32::new(0),
+            disabled: AtomicBool::new(false),
+        });
+        self
+    }
+
+    /// Whether an NPU backend is configured and not (yet) disabled by the
+    /// circuit breaker.
+    pub fn npu_active(&self) -> bool {
+        self.npu.as_ref().is_some_and(|n| n.usable())
+    }
+
+    /// Get a generation session ready to prefill `prompt_tokens`.
+    ///
+    /// When an NPU backend is configured, usable, and `allow_npu` is set,
+    /// the session runs there; otherwise on the candle CPU/GPU path.  A
+    /// failed NPU session creation counts against the circuit breaker and
+    /// falls back to candle.
+    ///
+    /// Returns the session and how many leading prompt tokens its state
+    /// already covers.  Preference order within the chosen kind:
     ///
     /// 1. a pooled instance whose fed-token history is a strict prefix of
     ///    the prompt (longest match wins) — only the suffix needs prefill;
-    /// 2. a pooled instance whose KV cache can be cleared — skips re-reading
-    ///    the weights;
-    /// 3. a fresh instance from the mmap.
-    fn acquire_model(&self, prompt_tokens: &[u32]) -> Result<(QuantizedModel, usize)> {
+    /// 2. a pooled instance whose state can be cleared — skips re-creating
+    ///    the session;
+    /// 3. a fresh session (NPU) or a fresh instance from the mmap (candle).
+    fn acquire_session(
+        &self,
+        prompt_tokens: &[u32],
+        allow_npu: bool,
+    ) -> Result<(GenSession, usize)> {
+        let want_npu = allow_npu && self.npu.as_ref().is_some_and(|n| n.usable());
+
         if let Ok(mut pool) = self.model_cache.lock() {
+            // Only reuse sessions of the kind this request will run on —
+            // mixing kinds mid-conversation would splice numerically
+            // different logits into one generation.
             let best = pool
                 .iter()
                 .enumerate()
                 .filter(|(_, c)| {
-                    c.tokens.len() < prompt_tokens.len() && prompt_tokens.starts_with(&c.tokens)
+                    c.session.is_npu() == want_npu
+                        && c.tokens.len() < prompt_tokens.len()
+                        && prompt_tokens.starts_with(&c.tokens)
                 })
                 .max_by_key(|(_, c)| c.tokens.len())
                 .map(|(i, _)| i);
@@ -648,24 +770,40 @@ impl Engine {
                 tracing::debug!(
                     reused_tokens = cached.tokens.len(),
                     prompt_tokens = prompt_tokens.len(),
+                    npu = want_npu,
                     "Continuing from cached KV prefix"
                 );
-                return Ok((cached.model, cached.tokens.len()));
+                return Ok((cached.session, cached.tokens.len()));
             }
-            if let Some(i) = pool.iter().position(|c| c.model.supports_kv_clear()) {
+            let resettable = pool.iter().position(|c| c.session.is_npu() == want_npu);
+            if let Some(i) = resettable {
                 let mut cached = pool.swap_remove(i);
-                cached.model.clear_kv_cache();
-                tracing::debug!("Reusing pooled model with cleared KV cache");
-                return Ok((cached.model, 0));
+                if cached.session.clear_state() {
+                    tracing::debug!(npu = want_npu, "Reusing pooled session with cleared state");
+                    return Ok((cached.session, 0));
+                }
+                // Reset failed (e.g. dead shim): drop it and fall through.
             }
         }
-        Ok((self.load_model()?, 0))
+
+        if want_npu {
+            let npu = self.npu.as_ref().expect("checked above");
+            match npu.backend.create_session(&self.model_path, self.n_ctx) {
+                Ok(session) => return Ok((GenSession::Npu(session), 0)),
+                Err(e) => {
+                    npu.record_failure(&npu.backend.name(), &e);
+                    tracing::warn!("NPU session creation failed, using candle path: {e}");
+                }
+            }
+        }
+
+        Ok((GenSession::Candle(Box::new(self.load_model()?)), 0))
     }
 
-    /// Return a finished instance (KV cache = `tokens`) to the pool.
-    fn release_model(&self, model: QuantizedModel, tokens: Vec<u32>) {
+    /// Return a finished session (state = `tokens`) to the pool.
+    fn release_model(&self, session: GenSession, tokens: Vec<u32>) {
         if let Ok(mut pool) = self.model_cache.lock() {
-            pool.push(CachedModel { model, tokens });
+            pool.push(CachedModel { session, tokens });
             // Evict oldest beyond the cap.
             while pool.len() > MAX_CACHED_MODELS {
                 pool.remove(0);

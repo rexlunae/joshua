@@ -1,3 +1,9 @@
+[workspace]
+members = [".", "crates/joshua-mock-npu", "crates/joshua-llamacpp-npu"]
+# The llama.cpp adapter compiles C++ (llama.cpp itself) and is therefore not
+# part of the default build: `cargo build`/`cargo test` stay pure Rust.
+default-members = [".", "crates/joshua-mock-npu"]
+
 [package]
 name = "joshua"
 version = "0.1.0"
@@ -37,6 +43,9 @@ tokenizers = { version = "0.21", default-features = false, features = ["fancy-re
 
 # Memory-mapped model loading (pure Rust wrapper over mmap(2))
 memmap2 = "0.9"
+
+# Runtime loading of NPU vendor plugins (thin safe wrapper over dlopen)
+libloading = "0.8"
 
 # Chat-template rendering (pure Rust Jinja2 engine).
 # pycompat adds Python string/dict methods (.strip(), .title(), …) that

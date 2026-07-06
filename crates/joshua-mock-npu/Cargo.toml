@@ -1,0 +1,10 @@
+[package]
+name = "joshua-mock-npu"
+version = "0.1.0"
+edition = "2021"
+description = "Mock NPU vendor library implementing Joshua's joshua_npu_* plugin ABI (test fixture)"
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]

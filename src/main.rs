@@ -42,6 +42,13 @@ enum Commands {
         /// Context window size in tokens.
         #[arg(long, default_value_t = 4096)]
         n_ctx: u32,
+        /// NPU vendor plugin (a cdylib exporting the joshua_npu_* ABI).
+        #[arg(long, env = "JOSHUA_NPU_PLUGIN")]
+        npu_plugin: Option<PathBuf>,
+        /// Load the NPU plugin in-process instead of the isolated shim
+        /// (lower overhead; a plugin crash takes the server down).
+        #[arg(long, default_value_t = false)]
+        npu_in_process: bool,
     },
     /// Run a single chat completion and print the response.
     Run {
@@ -59,6 +66,13 @@ enum Commands {
         /// Context window size in tokens.
         #[arg(long, default_value_t = 4096)]
         n_ctx: u32,
+        /// NPU vendor plugin (a cdylib exporting the joshua_npu_* ABI).
+        #[arg(long, env = "JOSHUA_NPU_PLUGIN")]
+        npu_plugin: Option<PathBuf>,
+        /// Load the NPU plugin in-process instead of the isolated shim
+        /// (lower overhead; a plugin crash takes the server down).
+        #[arg(long, default_value_t = false)]
+        npu_in_process: bool,
     },
     /// Embed one or more texts and print their vector representations.
     Embed {
@@ -80,9 +94,18 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Serve { model, addr, n_ctx } => {
-            let engine = Arc::new(Engine::with_n_ctx(&model, n_ctx)?);
-            server::serve(engine, &addr).await?;
+        Commands::Serve {
+            model,
+            addr,
+            n_ctx,
+            npu_plugin,
+            npu_in_process,
+        } => {
+            let mut engine = Engine::with_n_ctx(&model, n_ctx)?;
+            if let Some(plugin) = npu_plugin {
+                engine = engine.with_npu_backend(npu_backend(&plugin, npu_in_process)?);
+            }
+            server::serve(Arc::new(engine), &addr).await?;
         }
 
         Commands::Run {
@@ -91,8 +114,13 @@ async fn main() -> anyhow::Result<()> {
             max_tokens,
             temperature,
             n_ctx,
+            npu_plugin,
+            npu_in_process,
         } => {
-            let engine = Engine::with_n_ctx(&model, n_ctx)?;
+            let mut engine = Engine::with_n_ctx(&model, n_ctx)?;
+            if let Some(plugin) = npu_plugin {
+                engine = engine.with_npu_backend(npu_backend(&plugin, npu_in_process)?);
+            }
             let messages = vec![ChatMessage::text("user".to_string(), prompt)];
             let options = GenerationOptions {
                 max_tokens,
@@ -125,4 +153,21 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Build the NPU backend for a vendor plugin: process-isolated shim by
+/// default, in-process when explicitly requested.
+fn npu_backend(
+    plugin: &std::path::Path,
+    in_process: bool,
+) -> anyhow::Result<Arc<dyn joshua::npu::NpuBackend>> {
+    if in_process {
+        Ok(Arc::new(
+            joshua::npu::InProcessBackend::load(plugin).map_err(anyhow::Error::msg)?,
+        ))
+    } else {
+        Ok(Arc::new(
+            joshua::npu::ShimBackend::locate(plugin).map_err(anyhow::Error::msg)?,
+        ))
+    }
 }

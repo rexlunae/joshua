@@ -22,6 +22,7 @@ framework) and [tokenizers](https://github.com/huggingface/tokenizers).
 | **Embeddings** | Dense sentence embeddings for llama / qwen2 / qwen3 embedding models, with GGUF pooling metadata |
 | **KV-cache reuse** | Multi-turn requests continue from a warm model pool and prefill only the new suffix |
 | **GPU (optional)** | `--features cuda` or `metal` route inference through candle's GPU backends |
+| **NPU / llama.cpp interop (optional)** | Vendor plugins run in a crash-isolated shim process; a llama.cpp adapter brings every ggml backend (Hexagon NPU, CANN, CUDA, Vulkan, …) |
 | **Sampling** | Temperature, top-k, min-p, top-p (nucleus), greedy — all in Rust |
 
 ---
@@ -248,6 +249,59 @@ adding one is a small patch to `src/model.rs`.
 
 ---
 
+## NPU & llama.cpp backend interop (experimental)
+
+Vendor NPU runtimes are proprietary C/C++ stacks, so Joshua contains them
+behind three safety layers instead of linking them into the pure-Rust core:
+
+1. **Trait boundary** — generation transparently falls back to the candle
+   CPU/GPU path when a backend is missing or failing; a circuit breaker
+   disables a backend after repeated failures.
+2. **Plugin ABI, loaded at runtime** — a backend is any shared library
+   exporting the four-function `joshua_npu_*` C ABI (`init` / `forward` /
+   `reset` / `free`, documented in `joshua::npu`).  Nothing is linked at
+   build time; the default build stays pure Rust.
+3. **Process isolation** — by default the plugin runs inside the small
+   `joshua-npu-shim` subprocess: control over pipes, tensors over shared
+   memory, timeouts enforced, child killed on any violation.  A crashing or
+   hanging vendor runtime costs one request, never the server.
+
+```bash
+# Isolated by default:
+joshua serve --model m.gguf --npu-plugin /path/to/libvendor.so
+# Opt into in-process loading (faster, but a plugin crash is fatal):
+joshua serve --model m.gguf --npu-plugin /path/to/libvendor.so --npu-in-process
+```
+
+### The llama.cpp adapter
+
+No vendor ships Joshua plugins — they ship **llama.cpp/ggml backends**.  The
+`joshua-llamacpp-npu` crate bridges that: it implements the plugin ABI by
+driving llama.cpp itself, so every backend llama.cpp supports (Qualcomm
+Hexagon NPU, Huawei CANN, CUDA, Vulkan, OpenCL, Metal, …) works through the
+same isolated shim, against the same GGUF file, with no model conversion:
+
+```bash
+# Compiles llama.cpp — needs CMake + a C++ toolchain, which is exactly why
+# it is NOT part of the default build; the C++ only ever runs in the shim.
+cargo build --release -p joshua-llamacpp-npu
+
+joshua serve --model m.gguf \
+    --npu-plugin target/release/libjoshua_llamacpp_npu.so
+```
+
+Layer offload is controlled with `JOSHUA_LLAMA_N_GPU_LAYERS` (default: all).
+NPU backends are enabled the same way as in llama.cpp itself — build it with
+the vendor SDK (see llama.cpp's Snapdragon/CANN backend docs).
+
+The test suite proves the stack end to end without real hardware: a mock
+vendor plugin exercises determinism, crash containment (the plugin aborts —
+the server survives), hang timeouts, and engine fallback; the llama.cpp
+adapter is verified to produce byte-identical greedy output to Joshua's own
+candle path on the same weights.
+
+---
+
 ## Roadmap
 
 - [x] Chat completions (non-streaming)
@@ -263,7 +317,7 @@ adding one is a small patch to `src/model.rs`.
 - [x] KV-cache sharing across requests (warm model pool with prefix reuse)
 - [ ] Vision / multimodal support (needs a quantized vision encoder + projector pipeline)
 - [ ] Speech-to-text (Whisper — candle has the model; needs an audio ingest + mel pipeline)
-- [ ] NPU support (blocked upstream: no pure-Rust ANE/Snapdragon-HTP backend exists yet)
+- [x] NPU backend architecture (isolated vendor-plugin shim + llama.cpp adapter for Hexagon/CANN/…)
 
 ---
 
