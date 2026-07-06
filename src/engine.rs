@@ -62,6 +62,7 @@ use rand::thread_rng;
 use tokenizers::Tokenizer;
 
 use crate::model::{Architecture, QuantizedModel};
+use crate::template::ChatTemplate;
 
 use crate::error::{JoshuaError, Result};
 use crate::types::{ChatMessage, GenerationOptions, UsageInfo};
@@ -85,6 +86,8 @@ pub struct Engine {
     tokenizer: Arc<Tokenizer>,
     /// EOS token IDs derived from the GGUF metadata and common special tokens.
     eos_token_ids: Vec<u32>,
+    /// The model's chat template from GGUF metadata, if it ships one.
+    chat_template: Option<ChatTemplate>,
     /// Stem of the model file (used as the model identifier in API responses).
     model_name: String,
     /// Context-window size in tokens.
@@ -164,13 +167,19 @@ impl Engine {
         let arch = Architecture::detect(&gguf.metadata).map_err(JoshuaError::ModelLoad)?;
 
         let eos_token_ids = extract_eos_ids(&gguf, &tokenizer);
+        let chat_template = extract_chat_template(&gguf, &tokenizer);
 
         tracing::info!(
-            "Model '{}' ready (arch={}, ctx={}, eos_ids={:?})",
+            "Model '{}' ready (arch={}, ctx={}, eos_ids={:?}, chat_template={})",
             model_name,
             arch.display_name(),
             n_ctx,
-            eos_token_ids
+            eos_token_ids,
+            if chat_template.is_some() {
+                "from GGUF"
+            } else {
+                "ChatML fallback"
+            }
         );
 
         Ok(Self {
@@ -178,6 +187,7 @@ impl Engine {
             mmap: Arc::new(mmap),
             tokenizer: Arc::new(tokenizer),
             eos_token_ids,
+            chat_template,
             model_name,
             n_ctx,
         })
@@ -200,6 +210,11 @@ impl Engine {
 
     // ─── Prompt formatting ────────────────────────────────────────────────────
 
+    /// Whether the loaded GGUF ships its own chat template.
+    pub fn has_chat_template(&self) -> bool {
+        self.chat_template.is_some()
+    }
+
     /// Format messages as a ChatML prompt and append the assistant turn header.
     fn format_chatml_prompt(messages: &[ChatMessage]) -> String {
         let mut prompt = String::new();
@@ -214,24 +229,57 @@ impl Engine {
         prompt
     }
 
+    /// Format messages into the prompt the model was trained on.
+    ///
+    /// Uses the GGUF-embedded chat template when present; otherwise (or if the
+    /// template fails to render) falls back to ChatML.  Returns the prompt and
+    /// whether the tokenizer should still add special tokens: a rendered chat
+    /// template already contains every special token (including BOS), so
+    /// adding them again would duplicate BOS.
+    fn format_prompt(&self, messages: &[ChatMessage]) -> (String, bool) {
+        if let Some(template) = &self.chat_template {
+            match template.render(messages) {
+                Ok(prompt) => return (prompt, false),
+                Err(e) => {
+                    tracing::warn!("GGUF chat template unusable, falling back to ChatML: {e}");
+                }
+            }
+        }
+        (Self::format_chatml_prompt(messages), true)
+    }
+
     // ─── Completion ───────────────────────────────────────────────────────────
 
     /// Run a chat completion.
     ///
-    /// Returns `(generated_text, usage, prefill_tps, decode_tps)`.
+    /// Messages are formatted with the model's own chat template when the
+    /// GGUF provides one (`tokenizer.chat_template` metadata), with ChatML as
+    /// the fallback.  Returns `(generated_text, usage, prefill_tps, decode_tps)`.
     pub fn complete(
         &self,
         messages: &[ChatMessage],
         options: &GenerationOptions,
     ) -> Result<(String, UsageInfo, f64, f64)> {
-        let prompt = Self::format_chatml_prompt(messages);
-        self.complete_raw(&prompt, options)
+        let (prompt, add_special_tokens) = self.format_prompt(messages);
+        self.complete_with(&prompt, add_special_tokens, options)
     }
 
     /// Run completion from an arbitrary raw prompt string.
     pub fn complete_raw(
         &self,
         prompt: &str,
+        options: &GenerationOptions,
+    ) -> Result<(String, UsageInfo, f64, f64)> {
+        self.complete_with(prompt, true, options)
+    }
+
+    /// Shared completion path.  `add_special_tokens` controls whether the
+    /// tokenizer wraps the prompt with its special tokens (disabled for
+    /// template-rendered prompts, which already include them).
+    fn complete_with(
+        &self,
+        prompt: &str,
+        add_special_tokens: bool,
         options: &GenerationOptions,
     ) -> Result<(String, UsageInfo, f64, f64)> {
         // Load model weights from the GGUF file.  After the first call the OS
@@ -241,7 +289,7 @@ impl Engine {
         // ── Tokenise ─────────────────────────────────────────────────────────
         let encoding = self
             .tokenizer
-            .encode(prompt, true)
+            .encode(prompt, add_special_tokens)
             .map_err(|e| JoshuaError::Tokenization(e.to_string()))?;
         let prompt_tokens: Vec<u32> = encoding.get_ids().to_vec();
         let n_prompt = prompt_tokens.len();
@@ -422,6 +470,43 @@ fn find_gguf_in_dir(dir: &Path) -> Result<PathBuf> {
         "No .gguf file found in {:?}",
         dir
     )))
+}
+
+/// Read a token ID from GGUF metadata and decode it to its string form.
+fn token_str_from_metadata(
+    gguf: &gguf_file::Content,
+    key: &str,
+    tokenizer: &Tokenizer,
+) -> Option<String> {
+    let id = match gguf.metadata.get(key)? {
+        gguf_file::Value::U32(id) => *id,
+        gguf_file::Value::I32(id) => *id as u32,
+        gguf_file::Value::U64(id) => *id as u32,
+        _ => return None,
+    };
+    tokenizer.id_to_token(id)
+}
+
+/// Extract the model's chat template from GGUF metadata, if present.
+///
+/// llama.cpp's converters store the HuggingFace chat template verbatim under
+/// `tokenizer.chat_template`.  BOS/EOS strings are resolved from their token
+/// IDs so the template can interpolate them.
+fn extract_chat_template(gguf: &gguf_file::Content, tokenizer: &Tokenizer) -> Option<ChatTemplate> {
+    let source = gguf
+        .metadata
+        .get("tokenizer.chat_template")?
+        .to_string()
+        .ok()?
+        .clone();
+    if source.trim().is_empty() {
+        return None;
+    }
+    let bos = token_str_from_metadata(gguf, "tokenizer.ggml.bos_token_id", tokenizer)
+        .unwrap_or_default();
+    let eos = token_str_from_metadata(gguf, "tokenizer.ggml.eos_token_id", tokenizer)
+        .unwrap_or_default();
+    Some(ChatTemplate::new(source, bos, eos))
 }
 
 /// Derive EOS token IDs from GGUF metadata and well-known special token strings.
