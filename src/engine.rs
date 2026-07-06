@@ -112,6 +112,9 @@ pub struct Engine {
     model_name: String,
     /// Context-window size in tokens.
     n_ctx: u32,
+    /// Compute device: CUDA or Metal when built with the matching feature
+    /// (falling back to CPU if unavailable at runtime), CPU otherwise.
+    device: Device,
 }
 
 // `PathBuf`, `Arc<Mmap>`, `Arc<Tokenizer>`, `Vec<u32>`, `String`, `u32`,
@@ -202,9 +205,10 @@ impl Engine {
 
         let eos_token_ids = extract_eos_ids(&gguf, &tokenizer);
         let chat_template = extract_chat_template(&gguf, &tokenizer);
+        let device = Self::default_device();
 
         tracing::info!(
-            "Model '{}' ready (arch={}, ctx={}, eos_ids={:?}, chat_template={})",
+            "Model '{}' ready (arch={}, ctx={}, eos_ids={:?}, chat_template={}, device={:?})",
             model_name,
             arch.display_name(),
             n_ctx,
@@ -213,7 +217,8 @@ impl Engine {
                 "from GGUF"
             } else {
                 "ChatML fallback"
-            }
+            },
+            device
         );
 
         Ok(Self {
@@ -227,7 +232,31 @@ impl Engine {
             kv_reuses: AtomicU64::new(0),
             model_name,
             n_ctx,
+            device,
         })
+    }
+
+    /// Pick the compute device.
+    ///
+    /// With the `cuda` or `metal` cargo feature enabled this tries the GPU
+    /// first and falls back to CPU (with a warning) when no usable device is
+    /// present at runtime.  Without those features it is always CPU.
+    fn default_device() -> Device {
+        #[cfg(feature = "cuda")]
+        {
+            match Device::new_cuda(0) {
+                Ok(device) => return device,
+                Err(e) => tracing::warn!("CUDA unavailable, falling back to CPU: {e}"),
+            }
+        }
+        #[cfg(feature = "metal")]
+        {
+            match Device::new_metal(0) {
+                Ok(device) => return device,
+                Err(e) => tracing::warn!("Metal unavailable, falling back to CPU: {e}"),
+            }
+        }
+        Device::Cpu
     }
 
     /// The stem of the loaded model file name.
@@ -385,7 +414,7 @@ impl Engine {
         // ── Prefill ───────────────────────────────────────────────────────────
         // Process the not-yet-cached prompt tokens in a single forward pass.
         // Input shape: [1, len(new_tokens)].
-        let input = Tensor::new(new_tokens, &Device::Cpu)
+        let input = Tensor::new(new_tokens, &self.device)
             .and_then(|t| t.unsqueeze(0))
             .map_err(|e| JoshuaError::Inference(e.to_string()))?;
 
@@ -449,7 +478,7 @@ impl Engine {
             }
 
             // Single-token step: input [1, 1], output [1, vocab_size].
-            let step_input = Tensor::new(&[next_token], &Device::Cpu)
+            let step_input = Tensor::new(&[next_token], &self.device)
                 .and_then(|t| t.unsqueeze(0))
                 .map_err(|e| JoshuaError::Inference(e.to_string()))?;
 
@@ -546,7 +575,7 @@ impl Engine {
         let mut cursor = Cursor::new(&self.mmap[..]);
         let gguf = gguf_file::Content::read(&mut cursor)
             .map_err(|e| JoshuaError::ModelLoad(format!("GGUF read failed: {e}")))?;
-        let model = EmbeddingModel::from_gguf(gguf, &mut cursor, &Device::Cpu)
+        let model = EmbeddingModel::from_gguf(gguf, &mut cursor, &self.device)
             .map_err(|e| JoshuaError::InvalidRequest(e.to_string()))?;
         let model = Arc::new(model);
         *slot = Some(Arc::clone(&model));
@@ -620,7 +649,7 @@ impl Engine {
         let mut cursor = Cursor::new(&self.mmap[..]);
         let gguf = gguf_file::Content::read(&mut cursor)
             .map_err(|e| JoshuaError::ModelLoad(format!("GGUF read failed: {e}")))?;
-        QuantizedModel::from_gguf(gguf, &mut cursor, &Device::Cpu)
+        QuantizedModel::from_gguf(gguf, &mut cursor, &self.device)
             .map_err(|e| JoshuaError::ModelLoad(format!("model init failed: {e}")))
     }
 
