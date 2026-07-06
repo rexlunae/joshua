@@ -405,11 +405,42 @@ impl Engine {
         // Prefer a pooled instance whose KV cache already covers a prefix of
         // this prompt; fall back to a reset instance or a fresh load.
         let (mut model, n_reused) = self.acquire_model(&prompt_tokens)?;
+
+        match self.run_generation(&mut model, &prompt_tokens, n_reused, options) {
+            Ok((response, usage, prefill_tps, decode_tps, kv_tokens)) => {
+                // Park the instance for reuse by a follow-up request.
+                self.release_model(model, kv_tokens);
+                Ok((response, usage, prefill_tps, decode_tps))
+            }
+            Err(e) => {
+                // The KV cache may be partially updated at the failure point;
+                // a cleared cache is fully consistent, so keep the (expensive
+                // to reload) weights warm where the architecture allows it.
+                if model.clear_kv_cache() {
+                    self.release_model(model, Vec::new());
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Prefill + decode on an acquired model.
+    ///
+    /// Returns the generated text, usage, throughput figures, and the exact
+    /// token sequence now held in the model's KV cache.
+    fn run_generation(
+        &self,
+        model: &mut QuantizedModel,
+        prompt_tokens: &[u32],
+        n_reused: usize,
+        options: &GenerationOptions,
+    ) -> Result<(String, UsageInfo, f64, f64, Vec<u32>)> {
+        let n_prompt = prompt_tokens.len();
         let new_tokens = &prompt_tokens[n_reused..];
 
         // Every token fed to the model so far — i.e. the exact contents of
         // its KV cache.  Returned to the pool with the model afterwards.
-        let mut kv_tokens = prompt_tokens.clone();
+        let mut kv_tokens = prompt_tokens.to_vec();
 
         // ── Prefill ───────────────────────────────────────────────────────────
         // Process the not-yet-cached prompt tokens in a single forward pass.
@@ -493,11 +524,11 @@ impl Engine {
 
         let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
 
-        // Park the instance for reuse by a follow-up request.
-        self.release_model(model, kv_tokens);
-
+        // Throughput reflects the tokens actually processed in the prefill
+        // window: with a reused KV prefix that is only the new suffix.
+        let n_prefilled = new_tokens.len();
         let prefill_tps = if prefill_ms > 0.0 {
-            n_prompt as f64 / (prefill_ms / 1000.0)
+            n_prefilled as f64 / (prefill_ms / 1000.0)
         } else {
             0.0
         };
@@ -508,7 +539,9 @@ impl Engine {
         };
 
         tracing::debug!(
-            prefill_tokens = n_prompt,
+            prompt_tokens = n_prompt,
+            prefill_tokens = n_prefilled,
+            reused_tokens = n_reused,
             prefill_tps,
             decode_tokens = n_decoded,
             decode_tps,
@@ -521,7 +554,7 @@ impl Engine {
             total_tokens: n_prompt as u32 + n_decoded,
         };
 
-        Ok((response, usage, prefill_tps, decode_tps))
+        Ok((response, usage, prefill_tps, decode_tps, kv_tokens))
     }
 
     // ─── Embeddings ───────────────────────────────────────────────────────────
