@@ -294,6 +294,17 @@ mod synthetic {
                 gguf_file::Value::F32(1e-5),
             ),
             ("tokenizer.ggml.eos_token_id", gguf_file::Value::U32(3)),
+            // A minimal chat template so complete() renders through the
+            // GGUF-template path.  "hello" stands in for a turn delimiter so
+            // the tiny WordLevel vocab can tokenise the rendered prompt.
+            (
+                "tokenizer.chat_template",
+                gguf_file::Value::String(
+                    "{% for message in messages %}hello {{ message.content }} \
+                     {% endfor %}{% if add_generation_prompt %}world{% endif %}"
+                        .to_string(),
+                ),
+            ),
         ];
 
         let ones = |n: usize| vec![1.0f32; n];
@@ -367,6 +378,40 @@ mod synthetic {
                 usage.prompt_tokens + usage.completion_tokens
             );
         }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn chat_template_from_gguf_is_used_by_complete() {
+        use joshua::{types::GenerationOptions, ChatMessage, Engine};
+
+        let dir = model_dir("tiny-llama-template");
+        write_tiny_llama_gguf(&dir.join("model.gguf"));
+
+        let engine = Engine::with_n_ctx(&dir, 64).expect("engine should load tiny model");
+        assert!(engine.has_chat_template());
+
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "a b".to_string(),
+            images: None,
+            name: None,
+        }];
+        let options = GenerationOptions {
+            max_tokens: 2,
+            temperature: 0.0,
+            ..Default::default()
+        };
+
+        // The template renders "hello a b world" → exactly 4 known tokens,
+        // proving the prompt came from the GGUF template rather than the
+        // ChatML fallback (whose <|im_start|> markers would tokenise to a
+        // different count).
+        let (_, usage, _, _) = engine
+            .complete(&messages, &options)
+            .expect("completion should succeed");
+        assert_eq!(usage.prompt_tokens, 4);
 
         std::fs::remove_dir_all(&dir).ok();
     }

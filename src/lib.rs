@@ -30,6 +30,7 @@ pub mod engine;
 pub mod error;
 pub mod model;
 pub mod server;
+pub mod template;
 pub mod types;
 
 pub use engine::Engine;

@@ -17,6 +17,7 @@ framework) and [tokenizers](https://github.com/huggingface/tokenizers).
 | **OpenAI-compatible** | Drop-in replacement for `/v1/chat/completions`, `/v1/embeddings`, `/v1/models` |
 | **Streaming** | Server-Sent Events (SSE) for token-by-token streaming |
 | **GGUF support** | Llama/Mistral/Mixtral, Gemma 1–3, GLM-4, LFM2, Phi-2, Phi-3, Qwen2, Qwen3, Qwen3-MoE |
+| **Chat templates** | Renders the model's own `tokenizer.chat_template` from the GGUF (Jinja via pure-Rust minijinja); ChatML fallback |
 | **Sampling** | Temperature, top-k, min-p, top-p (nucleus), greedy — all in Rust |
 
 ---
@@ -254,6 +255,7 @@ adding one is a small patch to `src/model.rs`.
 - [x] OpenAI-compatible model list
 - [x] mmap-based model loading
 - [x] Multi-architecture GGUF dispatch (all candle quantized loaders)
+- [x] Per-model chat templates from GGUF metadata
 - [ ] Dense embeddings (requires pooling model)
 - [ ] Vision / multimodal support
 - [ ] Speech-to-text (Whisper)

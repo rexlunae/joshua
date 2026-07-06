@@ -29,6 +29,12 @@ tokenizers = { version = "0.21", default-features = false, features = ["fancy-re
 # Memory-mapped model loading (pure Rust wrapper over mmap(2))
 memmap2 = "0.9"
 
+# Chat-template rendering (pure Rust Jinja2 engine).
+# pycompat adds Python string/dict methods (.strip(), .title(), …) that
+# HuggingFace chat templates rely on.
+minijinja = { version = "2", features = ["json"] }
+minijinja-contrib = { version = "2", features = ["pycompat"] }
+
 # Sampling
 rand = "0.8"
 
