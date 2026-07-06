@@ -6,6 +6,8 @@
 //! - `POST /v1/chat/completions`      — chat completion (stream or non-stream)
 //! - `POST /v1/completions`           — legacy text completion
 //! - `POST /v1/embeddings`            — dense text embeddings
+//! - `POST /v1/audio/transcriptions`  — Whisper speech-to-text (when a
+//!   whisper model is configured)
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -29,6 +31,7 @@ use uuid::Uuid;
 
 use crate::engine::Engine;
 use crate::error::JoshuaError;
+use crate::whisper::WhisperEngine;
 use crate::tools::parse_tool_calls;
 use crate::types::{
     AssistantMessage, ChatChoice, ChatCompletionChunk, ChatCompletionRequest,
@@ -37,26 +40,48 @@ use crate::types::{
     ModelListResponse, ToolCall, UsageInfo,
 };
 
-/// Shared application state (the loaded engine).
-pub type AppState = Arc<Engine>;
+/// Shared application state.
+pub struct ServerState {
+    /// The chat/embedding engine.
+    pub engine: Arc<Engine>,
+    /// Optional Whisper model for `/v1/audio/transcriptions`.
+    pub whisper: Option<Arc<WhisperEngine>>,
+}
+
+/// Shared application state handle.
+pub type AppState = Arc<ServerState>;
 
 // ─── Router ───────────────────────────────────────────────────────────────────
 
 /// Build the Axum router with all API routes mounted.
-pub fn create_router(engine: AppState) -> Router {
+pub fn create_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(completions))
         .route("/v1/embeddings", post(embeddings))
+        .route("/v1/audio/transcriptions", post(transcriptions))
         .layer(CorsLayer::permissive())
-        .with_state(engine)
+        .with_state(state)
 }
 
-/// Start the server on `addr` (e.g. `"0.0.0.0:8080"`).
-pub async fn serve(engine: AppState, addr: &str) -> std::io::Result<()> {
-    let app = create_router(engine);
+/// Start the server on `addr` (e.g. `"0.0.0.0:8080"`) with just a chat
+/// engine.  Use [`serve_with_state`] to also mount a Whisper model.
+pub async fn serve(engine: Arc<Engine>, addr: &str) -> std::io::Result<()> {
+    serve_with_state(
+        Arc::new(ServerState {
+            engine,
+            whisper: None,
+        }),
+        addr,
+    )
+    .await
+}
+
+/// Start the server with a fully configured [`ServerState`].
+pub async fn serve_with_state(state: AppState, addr: &str) -> std::io::Result<()> {
+    let app = create_router(state);
     let listener = TcpListener::bind(addr).await?;
     tracing::info!("Joshua server listening on {}", addr);
     axum::serve(listener, app).await
@@ -70,27 +95,37 @@ async fn health() -> Json<serde_json::Value> {
 }
 
 /// `GET /v1/models` — returns the single loaded model.
-async fn list_models(State(engine): State<AppState>) -> Json<ModelListResponse> {
+async fn list_models(State(state): State<AppState>) -> Json<ModelListResponse> {
     let created = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    Json(ModelListResponse {
-        object: "list".to_string(),
-        data: vec![ModelInfo {
-            id: engine.model_name().to_string(),
+    let mut data = vec![ModelInfo {
+        id: state.engine.model_name().to_string(),
+        object: "model".to_string(),
+        created,
+        owned_by: "joshua".to_string(),
+    }];
+    if let Some(whisper) = &state.whisper {
+        data.push(ModelInfo {
+            id: whisper.model_name().to_string(),
             object: "model".to_string(),
             created,
             owned_by: "joshua".to_string(),
-        }],
+        });
+    }
+    Json(ModelListResponse {
+        object: "list".to_string(),
+        data,
     })
 }
 
 /// `POST /v1/chat/completions` — OpenAI chat completions.
 async fn chat_completions(
-    State(engine): State<AppState>,
+    State(state): State<AppState>,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Result<Response, ApiError> {
+    let engine = Arc::clone(&state.engine);
     let stream = req.stream.unwrap_or(false);
     let options = req.to_generation_options();
     let messages = req.messages.clone();
@@ -279,9 +314,10 @@ fn tool_call_deltas(calls: &[crate::tools::ParsedToolCall]) -> serde_json::Value
 
 /// `POST /v1/completions` — legacy (non-chat) text completion.
 async fn completions(
-    State(engine): State<AppState>,
+    State(state): State<AppState>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let engine = Arc::clone(&state.engine);
     let prompt = body
         .get("prompt")
         .and_then(|v| v.as_str())
@@ -337,9 +373,10 @@ async fn completions(
 
 /// `POST /v1/embeddings` — dense text embeddings.
 async fn embeddings(
-    State(engine): State<AppState>,
+    State(state): State<AppState>,
     Json(req): Json<EmbeddingRequest>,
 ) -> Result<Json<EmbeddingResponse>, ApiError> {
+    let engine = Arc::clone(&state.engine);
     let texts: Vec<String> = req.input.into_vec();
     let model = engine.model_name().to_string();
 
@@ -371,6 +408,70 @@ async fn embeddings(
             total_tokens: prompt_tokens,
         },
     }))
+}
+
+/// `POST /v1/audio/transcriptions` — OpenAI-compatible Whisper STT.
+///
+/// Multipart form fields: `file` (required, WAV), `language` (optional
+/// two-letter code), `response_format` (`json` default, or `text`), and
+/// `model` (accepted and ignored — the loaded whisper model is used).
+async fn transcriptions(
+    State(state): State<AppState>,
+    mut multipart: axum::extract::Multipart,
+) -> Result<Response, ApiError> {
+    let Some(whisper) = state.whisper.clone() else {
+        return Err(ApiError::bad_request(
+            "no whisper model is loaded — start the server with --whisper-model",
+        ));
+    };
+
+    let mut file: Option<Vec<u8>> = None;
+    let mut language: Option<String> = None;
+    let mut response_format = "json".to_string();
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| ApiError::bad_request(format!("invalid multipart body: {e}")))?
+    {
+        match field.name().unwrap_or_default() {
+            "file" => {
+                let bytes = field
+                    .bytes()
+                    .await
+                    .map_err(|e| ApiError::bad_request(format!("file upload failed: {e}")))?;
+                file = Some(bytes.to_vec());
+            }
+            "language" => {
+                language = Some(field.text().await.unwrap_or_default());
+            }
+            "response_format" => {
+                response_format = field.text().await.unwrap_or_default();
+            }
+            // `model`, `prompt`, `temperature`, … accepted and ignored.
+            _ => {
+                let _ = field.bytes().await;
+            }
+        }
+    }
+    let file = file.ok_or_else(|| ApiError::bad_request("missing required field 'file'"))?;
+
+    let transcription = tokio::task::spawn_blocking({
+        let language = language.clone();
+        move || whisper.transcribe_wav(&file, language.as_deref(), false)
+    })
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?
+    .map_err(ApiError::from)?;
+
+    if response_format == "text" {
+        return Ok(transcription.text.into_response());
+    }
+    Ok(Json(json!({
+        "text": transcription.text,
+        "duration": transcription.duration,
+        "language": transcription.language,
+    }))
+    .into_response())
 }
 
 // ─── API error type ───────────────────────────────────────────────────────────

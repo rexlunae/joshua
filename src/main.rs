@@ -49,6 +49,9 @@ enum Commands {
         /// (lower overhead; a plugin crash takes the server down).
         #[arg(long, default_value_t = false)]
         npu_in_process: bool,
+        /// Whisper model directory to mount at /v1/audio/transcriptions.
+        #[arg(long, env = "JOSHUA_WHISPER_MODEL")]
+        whisper_model: Option<PathBuf>,
     },
     /// Run a single chat completion and print the response.
     Run {
@@ -73,6 +76,20 @@ enum Commands {
         /// (lower overhead; a plugin crash takes the server down).
         #[arg(long, default_value_t = false)]
         npu_in_process: bool,
+    },
+    /// Transcribe a WAV file with a Whisper model.
+    Transcribe {
+        /// Whisper model directory (model.safetensors + config.json + tokenizer.json).
+        #[arg(short, long, env = "JOSHUA_WHISPER_MODEL")]
+        model: PathBuf,
+        /// Path to the WAV file.
+        audio: PathBuf,
+        /// Spoken language as a two-letter code (default: auto/en).
+        #[arg(long)]
+        language: Option<String>,
+        /// Translate to English instead of transcribing.
+        #[arg(long, default_value_t = false)]
+        translate: bool,
     },
     /// Embed one or more texts and print their vector representations.
     Embed {
@@ -100,12 +117,34 @@ async fn main() -> anyhow::Result<()> {
             n_ctx,
             npu_plugin,
             npu_in_process,
+            whisper_model,
         } => {
             let mut engine = Engine::with_n_ctx(&model, n_ctx)?;
             if let Some(plugin) = npu_plugin {
                 engine = engine.with_npu_backend(npu_backend(&plugin, npu_in_process)?);
             }
-            server::serve(Arc::new(engine), &addr).await?;
+            let whisper = whisper_model
+                .map(joshua::whisper::WhisperEngine::new)
+                .transpose()?
+                .map(Arc::new);
+            let state = Arc::new(server::ServerState {
+                engine: Arc::new(engine),
+                whisper,
+            });
+            server::serve_with_state(state, &addr).await?;
+        }
+
+        Commands::Transcribe {
+            model,
+            audio,
+            language,
+            translate,
+        } => {
+            let whisper = joshua::whisper::WhisperEngine::new(&model)?;
+            let bytes = std::fs::read(&audio)?;
+            let result = whisper.transcribe_wav(&bytes, language.as_deref(), translate)?;
+            println!("{}", result.text);
+            eprintln!("\n[duration: {:.1}s]", result.duration);
         }
 
         Commands::Run {
