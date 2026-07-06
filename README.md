@@ -18,6 +18,10 @@ framework) and [tokenizers](https://github.com/huggingface/tokenizers).
 | **Streaming** | Server-Sent Events (SSE) for token-by-token streaming |
 | **GGUF support** | Llama/Mistral/Mixtral, Gemma 1–3, GLM-4, LFM2, Phi-2, Phi-3, Qwen2, Qwen3, Qwen3-MoE |
 | **Chat templates** | Renders the model's own `tokenizer.chat_template` from the GGUF (Jinja via pure-Rust minijinja); ChatML fallback |
+| **Tool calling** | OpenAI-compatible `tools` / `tool_calls`, parsing Hermes/Qwen, Mistral, and Llama-3 call formats |
+| **Embeddings** | Dense sentence embeddings for llama / qwen2 / qwen3 embedding models, with GGUF pooling metadata |
+| **KV-cache reuse** | Multi-turn requests continue from a warm model pool and prefill only the new suffix |
+| **GPU (optional)** | `--features cuda` or `metal` route inference through candle's GPU backends |
 | **Sampling** | Temperature, top-k, min-p, top-p (nucleus), greedy — all in Rust |
 
 ---
@@ -98,12 +102,7 @@ use joshua::{Engine, GenerationOptions, ChatMessage};
 fn main() -> anyhow::Result<()> {
     let engine = Engine::new("./weights/gemma-3-1b-it-Q4_K_M.gguf")?;
 
-    let messages = vec![ChatMessage {
-        role:    "user".to_string(),
-        content: "What is Rust?".to_string(),
-        images:  None,
-        name:    None,
-    }];
+    let messages = vec![ChatMessage::text("user", "What is Rust?")];
 
     let opts = GenerationOptions {
         max_tokens:  128,
@@ -171,8 +170,10 @@ curl http://localhost:8080/v1/embeddings \
   -d '{"model":"nomic-embed","input":["Hello","World"]}'
 ```
 
-> **Note:** Embeddings require a dedicated pooling model.  Standard language
-> models return a descriptive error explaining what is needed.
+> **Note:** Embeddings run a hidden-state forward pass with the pooling
+> strategy from the GGUF metadata (mean / CLS / last-token).  Supported
+> architectures: `llama` (e5-mistral, SFR-Embedding), `qwen2` (gte-Qwen2),
+> and `qwen3` (Qwen3-Embedding).
 
 ### `GET /v1/models`
 
@@ -256,13 +257,13 @@ adding one is a small patch to `src/model.rs`.
 - [x] mmap-based model loading
 - [x] Multi-architecture GGUF dispatch (all candle quantized loaders)
 - [x] Per-model chat templates from GGUF metadata
-- [ ] Dense embeddings (requires pooling model)
-- [ ] Vision / multimodal support
-- [ ] Speech-to-text (Whisper)
-- [ ] Tool / function calling
-- [ ] GPU acceleration (via candle CUDA/Metal features)
-- [ ] KV-cache sharing across requests
-- [ ] NPU support (Apple Neural Engine, Snapdragon HTP)
+- [x] Dense embeddings (llama / qwen2 / qwen3 embedding models, GGUF pooling metadata)
+- [x] Tool / function calling (OpenAI-compatible, Hermes/Mistral/Llama-3 formats)
+- [x] GPU acceleration (`cuda` / `metal` cargo features)
+- [x] KV-cache sharing across requests (warm model pool with prefix reuse)
+- [ ] Vision / multimodal support (needs a quantized vision encoder + projector pipeline)
+- [ ] Speech-to-text (Whisper — candle has the model; needs an audio ingest + mel pipeline)
+- [ ] NPU support (blocked upstream: no pure-Rust ANE/Snapdragon-HTP backend exists yet)
 
 ---
 
