@@ -93,12 +93,7 @@ async fn main() -> anyhow::Result<()> {
             n_ctx,
         } => {
             let engine = Engine::with_n_ctx(&model, n_ctx)?;
-            let messages = vec![ChatMessage {
-                role: "user".to_string(),
-                content: prompt,
-                images: None,
-                name: None,
-            }];
+            let messages = vec![ChatMessage::text("user".to_string(), prompt)];
             let options = GenerationOptions {
                 max_tokens,
                 temperature,

@@ -65,7 +65,7 @@ use crate::model::{Architecture, QuantizedModel};
 use crate::template::ChatTemplate;
 
 use crate::error::{JoshuaError, Result};
-use crate::types::{ChatMessage, GenerationOptions, UsageInfo};
+use crate::types::{ChatMessage, GenerationOptions, Tool, UsageInfo};
 
 // ─── Engine ───────────────────────────────────────────────────────────────────
 
@@ -216,8 +216,34 @@ impl Engine {
     }
 
     /// Format messages as a ChatML prompt and append the assistant turn header.
-    fn format_chatml_prompt(messages: &[ChatMessage]) -> String {
+    ///
+    /// When tools are supplied, a Hermes-style system block advertising them
+    /// is prepended — the same convention our tool-call parser understands.
+    fn format_chatml_prompt(messages: &[ChatMessage], tools: Option<&[Tool]>) -> String {
         let mut prompt = String::new();
+        if let Some(tools) = tools.filter(|t| !t.is_empty()) {
+            prompt.push_str(
+                "<|im_start|>system\n\
+                 # Tools\n\n\
+                 You may call one or more functions to assist with the user query.\n\n\
+                 You are provided with function signatures within <tools></tools> XML tags:\n\
+                 <tools>\n",
+            );
+            for tool in tools {
+                if let Ok(json) = serde_json::to_string(tool) {
+                    prompt.push_str(&json);
+                    prompt.push('\n');
+                }
+            }
+            prompt.push_str(
+                "</tools>\n\n\
+                 For each function call, return a json object with function name and arguments \
+                 within <tool_call></tool_call> XML tags:\n\
+                 <tool_call>\n\
+                 {\"name\": <function-name>, \"arguments\": <args-json-object>}\n\
+                 </tool_call><|im_end|>\n",
+            );
+        }
         for msg in messages {
             prompt.push_str("<|im_start|>");
             prompt.push_str(&msg.role);
@@ -236,16 +262,16 @@ impl Engine {
     /// whether the tokenizer should still add special tokens: a rendered chat
     /// template already contains every special token (including BOS), so
     /// adding them again would duplicate BOS.
-    fn format_prompt(&self, messages: &[ChatMessage]) -> (String, bool) {
+    fn format_prompt(&self, messages: &[ChatMessage], tools: Option<&[Tool]>) -> (String, bool) {
         if let Some(template) = &self.chat_template {
-            match template.render(messages) {
+            match template.render(messages, tools) {
                 Ok(prompt) => return (prompt, false),
                 Err(e) => {
                     tracing::warn!("GGUF chat template unusable, falling back to ChatML: {e}");
                 }
             }
         }
-        (Self::format_chatml_prompt(messages), true)
+        (Self::format_chatml_prompt(messages, tools), true)
     }
 
     // ─── Completion ───────────────────────────────────────────────────────────
@@ -260,7 +286,22 @@ impl Engine {
         messages: &[ChatMessage],
         options: &GenerationOptions,
     ) -> Result<(String, UsageInfo, f64, f64)> {
-        let (prompt, add_special_tokens) = self.format_prompt(messages);
+        self.complete_chat(messages, None, options)
+    }
+
+    /// Run a chat completion with optional tool definitions.
+    ///
+    /// Tools are exposed to the chat template as the standard `tools`
+    /// variable so the model is instructed how to emit calls; parse the
+    /// generated text with [`crate::tools::parse_tool_calls`] to extract
+    /// them.
+    pub fn complete_chat(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        options: &GenerationOptions,
+    ) -> Result<(String, UsageInfo, f64, f64)> {
+        let (prompt, add_special_tokens) = self.format_prompt(messages, tools);
         self.complete_with(&prompt, add_special_tokens, options)
     }
 

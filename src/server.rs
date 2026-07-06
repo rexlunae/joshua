@@ -29,10 +29,12 @@ use uuid::Uuid;
 
 use crate::engine::Engine;
 use crate::error::JoshuaError;
+use crate::tools::parse_tool_calls;
 use crate::types::{
     AssistantMessage, ChatChoice, ChatCompletionChunk, ChatCompletionRequest,
     ChatCompletionResponse, ChatMessage, DeltaContent, EmbeddingData, EmbeddingRequest,
-    EmbeddingResponse, ErrorResponse, GenerationOptions, ModelInfo, ModelListResponse, UsageInfo,
+    EmbeddingResponse, ErrorResponse, FunctionCallResult, GenerationOptions, ModelInfo,
+    ModelListResponse, ToolCall, UsageInfo,
 };
 
 /// Shared application state (the loaded engine).
@@ -92,6 +94,7 @@ async fn chat_completions(
     let stream = req.stream.unwrap_or(false);
     let options = req.to_generation_options();
     let messages = req.messages.clone();
+    let tools = req.tools.clone();
     let model = engine.model_name().to_string();
 
     if stream {
@@ -101,11 +104,41 @@ async fn chat_completions(
         // Run inference in a blocking thread to avoid stalling the async runtime.
         let (text, usage, _, _) = tokio::task::spawn_blocking({
             let engine = Arc::clone(&engine);
-            move || engine.complete(&messages, &options)
+            let tools = tools.clone();
+            move || engine.complete_chat(&messages, tools.as_deref(), &options)
         })
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?
         .map_err(ApiError::from)?;
+
+        // When tools were requested and the model emitted calls, send them as
+        // a single delta chunk (OpenAI wire format) instead of char-streaming
+        // the raw markup.
+        if tools.is_some() {
+            let (prose, calls) = parse_tool_calls(&text);
+            if !calls.is_empty() {
+                let delta = DeltaContent {
+                    role: Some("assistant".to_string()),
+                    content: if prose.is_empty() { None } else { Some(prose) },
+                    tool_calls: Some(tool_call_deltas(&calls)),
+                };
+                let first = ChatCompletionChunk::new(id.clone(), model.clone(), delta, None);
+                let stop = ChatCompletionChunk::new(
+                    id.clone(),
+                    model.clone(),
+                    DeltaContent::default(),
+                    Some("tool_calls".to_string()),
+                );
+                let events = stream::iter([first, stop].into_iter().map(|chunk| {
+                    let data = serde_json::to_string(&chunk).unwrap_or_default();
+                    Ok::<Event, Infallible>(Event::default().data(data))
+                }))
+                .chain(stream::once(async {
+                    Ok::<Event, Infallible>(Event::default().data("[DONE]"))
+                }));
+                return Ok(Sse::new(events).into_response());
+            }
+        }
 
         // Stream the response character-by-character (word-level chunks are
         // possible too, but char chunks give the smoothest streaming experience).
@@ -125,11 +158,13 @@ async fn chat_completions(
                     DeltaContent {
                         role: Some("assistant".to_string()),
                         content: Some(chunk),
+                        tool_calls: None,
                     }
                 } else {
                     DeltaContent {
                         role: None,
                         content: Some(chunk),
+                        tool_calls: None,
                     }
                 };
                 let payload =
@@ -172,11 +207,39 @@ async fn chat_completions(
     // ── Non-streaming path ────────────────────────────────────────────────────
     let (text, usage, _, _) = tokio::task::spawn_blocking({
         let engine = Arc::clone(&engine);
-        move || engine.complete(&messages, &options)
+        let tools = tools.clone();
+        move || engine.complete_chat(&messages, tools.as_deref(), &options)
     })
     .await
     .map_err(|e| ApiError::internal(e.to_string()))?
     .map_err(ApiError::from)?;
+
+    // Extract tool calls from the output when the request offered tools.
+    let (content, tool_calls, finish_reason) = if tools.is_some() {
+        let (prose, calls) = parse_tool_calls(&text);
+        if calls.is_empty() {
+            (Some(text), None, "stop")
+        } else {
+            let calls: Vec<ToolCall> = calls
+                .into_iter()
+                .map(|c| ToolCall {
+                    id: format!("call_{}", Uuid::new_v4().simple()),
+                    call_type: "function".to_string(),
+                    function: FunctionCallResult {
+                        name: c.name,
+                        arguments: c.arguments,
+                    },
+                })
+                .collect();
+            (
+                if prose.is_empty() { None } else { Some(prose) },
+                Some(calls),
+                "tool_calls",
+            )
+        }
+    } else {
+        (Some(text), None, "stop")
+    };
 
     let id = format!("chatcmpl-{}", Uuid::new_v4().simple());
     let response = ChatCompletionResponse::new(
@@ -186,14 +249,32 @@ async fn chat_completions(
             index: 0,
             message: AssistantMessage {
                 role: "assistant".to_string(),
-                content: Some(text),
-                tool_calls: None,
+                content,
+                tool_calls,
             },
-            finish_reason: "stop".to_string(),
+            finish_reason: finish_reason.to_string(),
         }],
         usage,
     );
     Ok(Json(response).into_response())
+}
+
+/// Build the OpenAI streaming `delta.tool_calls` payload (index per entry).
+fn tool_call_deltas(calls: &[crate::tools::ParsedToolCall]) -> serde_json::Value {
+    serde_json::Value::Array(
+        calls
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                json!({
+                    "index": i,
+                    "id": format!("call_{}", Uuid::new_v4().simple()),
+                    "type": "function",
+                    "function": {"name": c.name, "arguments": c.arguments},
+                })
+            })
+            .collect(),
+    )
 }
 
 /// `POST /v1/completions` — legacy (non-chat) text completion.
@@ -221,12 +302,7 @@ async fn completions(
         ..GenerationOptions::default()
     };
 
-    let messages = vec![ChatMessage {
-        role: "user".to_string(),
-        content: prompt,
-        images: None,
-        name: None,
-    }];
+    let messages = vec![ChatMessage::text("user".to_string(), prompt)];
 
     let (text, usage, _, _) = tokio::task::spawn_blocking({
         let engine = Arc::clone(&engine);

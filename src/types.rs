@@ -11,6 +11,10 @@ pub struct ChatMessage {
     /// The role of the author (`"system"`, `"user"`, `"assistant"`, `"tool"`).
     pub role: String,
     /// The text content of the message.
+    ///
+    /// OpenAI clients send `content: null` on assistant messages that carry
+    /// only tool calls; that deserialises to an empty string here.
+    #[serde(default, deserialize_with = "null_to_empty_string")]
     pub content: String,
     /// Optional image paths for vision models.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -18,6 +22,36 @@ pub struct ChatMessage {
     /// Optional author name.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Tool calls previously emitted by the assistant, passed back verbatim
+    /// by clients during multi-turn tool use so chat templates can render
+    /// the earlier assistant turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<serde_json::Value>,
+    /// For `role: "tool"` messages: the ID of the call being answered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+}
+
+impl ChatMessage {
+    /// Construct a plain text message.
+    pub fn text(role: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: role.into(),
+            content: content.into(),
+            images: None,
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
+}
+
+/// Deserialise a JSON string, mapping `null` (and a missing field) to `""`.
+fn null_to_empty_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 // ─── Generation options ───────────────────────────────────────────────────────
@@ -321,6 +355,9 @@ pub struct DeltaContent {
     /// The new token(s) generated in this step.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    /// Tool-call deltas (OpenAI wire format, including `index` per entry).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<serde_json::Value>,
 }
 
 // ─── Embeddings ───────────────────────────────────────────────────────────────

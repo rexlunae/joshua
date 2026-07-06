@@ -58,12 +58,7 @@ fn test_engine_model_path_exists() {
 fn test_completion_returns_nonempty_text() {
     require_engine!(engine);
 
-    let messages = vec![ChatMessage {
-        role: "user".to_string(),
-        content: "Say hello in one word.".to_string(),
-        images: None,
-        name: None,
-    }];
+    let messages = vec![ChatMessage::text("user".to_string(), "Say hello in one word.".to_string())];
 
     let options = GenerationOptions {
         max_tokens: 8,
@@ -88,12 +83,7 @@ fn test_completion_returns_nonempty_text() {
 fn test_completion_respects_max_tokens() {
     require_engine!(engine);
 
-    let messages = vec![ChatMessage {
-        role: "user".to_string(),
-        content: "Count from 1 to 100.".to_string(),
-        images: None,
-        name: None,
-    }];
+    let messages = vec![ChatMessage::text("user".to_string(), "Count from 1 to 100.".to_string())];
 
     let max = 5u32;
     let options = GenerationOptions {
@@ -118,12 +108,7 @@ fn test_completion_respects_max_tokens() {
 fn test_completion_stop_sequence() {
     require_engine!(engine);
 
-    let messages = vec![ChatMessage {
-        role: "user".to_string(),
-        content: "Repeat the word STOP ten times.".to_string(),
-        images: None,
-        name: None,
-    }];
+    let messages = vec![ChatMessage::text("user".to_string(), "Repeat the word STOP ten times.".to_string())];
 
     let options = GenerationOptions {
         max_tokens: 64,
@@ -148,18 +133,8 @@ fn test_system_prompt_is_respected() {
     require_engine!(engine);
 
     let messages = vec![
-        ChatMessage {
-            role: "system".to_string(),
-            content: "Always respond with only the word 'PINEAPPLE'.".to_string(),
-            images: None,
-            name: None,
-        },
-        ChatMessage {
-            role: "user".to_string(),
-            content: "What fruit should I eat?".to_string(),
-            images: None,
-            name: None,
-        },
+        ChatMessage::text("system".to_string(), "Always respond with only the word 'PINEAPPLE'.".to_string()),
+        ChatMessage::text("user".to_string(), "What fruit should I eat?".to_string()),
     ];
 
     let options = GenerationOptions {
@@ -392,12 +367,7 @@ mod synthetic {
         let engine = Engine::with_n_ctx(&dir, 64).expect("engine should load tiny model");
         assert!(engine.has_chat_template());
 
-        let messages = vec![ChatMessage {
-            role: "user".to_string(),
-            content: "a b".to_string(),
-            images: None,
-            name: None,
-        }];
+        let messages = vec![ChatMessage::text("user".to_string(), "a b".to_string())];
         let options = GenerationOptions {
             max_tokens: 2,
             temperature: 0.0,
