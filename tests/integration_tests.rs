@@ -247,33 +247,53 @@ mod synthetic {
         }
     }"#;
 
-    /// Write a tiny llama-architecture GGUF: 16-token vocab, 8-dim embedding,
-    /// 2 heads, 1 transformer block, tied output head.
-    fn write_tiny_llama_gguf(path: &Path) {
+    /// Write a tiny but structurally valid GGUF for the given architecture:
+    /// 16-token vocab, 8-dim embedding, 2 heads, 1 transformer block, tied
+    /// output head.  Per-arch quirks are exercised deliberately: qwen2 uses
+    /// grouped-query attention plus QKV biases, qwen3 uses GQA, a head_dim
+    /// decoupled from the embedding width, Q/K norms, and last-token pooling.
+    fn write_tiny_gguf(path: &Path, arch: &str) {
         const VOCAB: usize = 16;
         const EMB: usize = 8;
         const FFN: usize = 16;
+        let (heads, kv_heads, head_dim) = match arch {
+            "llama" => (2usize, 2usize, 4usize),
+            "qwen2" => (2, 1, 4),
+            "qwen3" => (2, 1, 6),
+            other => panic!("unsupported synthetic arch {other}"),
+        };
 
-        let metadata: Vec<(&str, gguf_file::Value)> = vec![
+        let key = |suffix: &str| format!("{arch}.{suffix}");
+        let mut metadata: Vec<(String, gguf_file::Value)> = vec![
             (
-                "general.architecture",
-                gguf_file::Value::String("llama".to_string()),
+                "general.architecture".to_string(),
+                gguf_file::Value::String(arch.to_string()),
             ),
-            ("llama.attention.head_count", gguf_file::Value::U32(2)),
-            ("llama.attention.head_count_kv", gguf_file::Value::U32(2)),
-            ("llama.block_count", gguf_file::Value::U32(1)),
-            ("llama.embedding_length", gguf_file::Value::U32(EMB as u32)),
-            ("llama.rope.dimension_count", gguf_file::Value::U32(4)),
             (
-                "llama.attention.layer_norm_rms_epsilon",
+                key("attention.head_count"),
+                gguf_file::Value::U32(heads as u32),
+            ),
+            (
+                key("attention.head_count_kv"),
+                gguf_file::Value::U32(kv_heads as u32),
+            ),
+            (key("block_count"), gguf_file::Value::U32(1)),
+            (key("embedding_length"), gguf_file::Value::U32(EMB as u32)),
+            (key("context_length"), gguf_file::Value::U32(64)),
+            (
+                key("attention.layer_norm_rms_epsilon"),
                 gguf_file::Value::F32(1e-5),
             ),
-            ("tokenizer.ggml.eos_token_id", gguf_file::Value::U32(3)),
+            (key("rope.freq_base"), gguf_file::Value::F32(10_000.0)),
+            (
+                "tokenizer.ggml.eos_token_id".to_string(),
+                gguf_file::Value::U32(3),
+            ),
             // A minimal chat template so complete() renders through the
             // GGUF-template path.  "hello" stands in for a turn delimiter so
             // the tiny WordLevel vocab can tokenise the rendered prompt.
             (
-                "tokenizer.chat_template",
+                "tokenizer.chat_template".to_string(),
                 gguf_file::Value::String(
                     "{% for message in messages %}hello {{ message.content }} \
                      {% endfor %}{% if add_generation_prompt %}world{% endif %}"
@@ -281,29 +301,109 @@ mod synthetic {
                 ),
             ),
         ];
+        match arch {
+            "llama" => {
+                metadata.push((
+                    key("rope.dimension_count"),
+                    gguf_file::Value::U32(head_dim as u32),
+                ));
+            }
+            "qwen3" => {
+                metadata.push((
+                    key("attention.key_length"),
+                    gguf_file::Value::U32(head_dim as u32),
+                ));
+                // F32 activations so parity with the F32 test weights is exact.
+                metadata.push(("general.dtype".to_string(), gguf_file::Value::U32(0)));
+                // Qwen3-Embedding style last-token pooling.
+                metadata.push((key("pooling_type"), gguf_file::Value::U32(3)));
+            }
+            _ => {}
+        }
 
+        let q_dim = heads * head_dim;
+        let kv_dim = kv_heads * head_dim;
         let ones = |n: usize| vec![1.0f32; n];
-        let tensors: Vec<(&str, QTensor)> = vec![
-            ("token_embd.weight", qtensor(weights(VOCAB * EMB, 1), &[VOCAB, EMB])),
-            ("output_norm.weight", qtensor(ones(EMB), &[EMB])),
-            ("blk.0.attn_norm.weight", qtensor(ones(EMB), &[EMB])),
-            ("blk.0.ffn_norm.weight", qtensor(ones(EMB), &[EMB])),
-            ("blk.0.attn_q.weight", qtensor(weights(EMB * EMB, 2), &[EMB, EMB])),
-            ("blk.0.attn_k.weight", qtensor(weights(EMB * EMB, 3), &[EMB, EMB])),
-            ("blk.0.attn_v.weight", qtensor(weights(EMB * EMB, 4), &[EMB, EMB])),
-            ("blk.0.attn_output.weight", qtensor(weights(EMB * EMB, 5), &[EMB, EMB])),
-            ("blk.0.ffn_gate.weight", qtensor(weights(FFN * EMB, 6), &[FFN, EMB])),
-            ("blk.0.ffn_down.weight", qtensor(weights(EMB * FFN, 7), &[EMB, FFN])),
-            ("blk.0.ffn_up.weight", qtensor(weights(FFN * EMB, 8), &[FFN, EMB])),
+        let mut tensors: Vec<(String, QTensor)> = vec![
+            (
+                "token_embd.weight".to_string(),
+                qtensor(weights(VOCAB * EMB, 1), &[VOCAB, EMB]),
+            ),
+            ("output_norm.weight".to_string(), qtensor(ones(EMB), &[EMB])),
+            (
+                "blk.0.attn_norm.weight".to_string(),
+                qtensor(ones(EMB), &[EMB]),
+            ),
+            (
+                "blk.0.ffn_norm.weight".to_string(),
+                qtensor(ones(EMB), &[EMB]),
+            ),
+            (
+                "blk.0.attn_q.weight".to_string(),
+                qtensor(weights(q_dim * EMB, 2), &[q_dim, EMB]),
+            ),
+            (
+                "blk.0.attn_k.weight".to_string(),
+                qtensor(weights(kv_dim * EMB, 3), &[kv_dim, EMB]),
+            ),
+            (
+                "blk.0.attn_v.weight".to_string(),
+                qtensor(weights(kv_dim * EMB, 4), &[kv_dim, EMB]),
+            ),
+            (
+                "blk.0.attn_output.weight".to_string(),
+                qtensor(weights(EMB * q_dim, 5), &[EMB, q_dim]),
+            ),
+            (
+                "blk.0.ffn_gate.weight".to_string(),
+                qtensor(weights(FFN * EMB, 6), &[FFN, EMB]),
+            ),
+            (
+                "blk.0.ffn_down.weight".to_string(),
+                qtensor(weights(EMB * FFN, 7), &[EMB, FFN]),
+            ),
+            (
+                "blk.0.ffn_up.weight".to_string(),
+                qtensor(weights(FFN * EMB, 8), &[FFN, EMB]),
+            ),
         ];
+        if arch == "qwen2" {
+            tensors.push((
+                "blk.0.attn_q.bias".to_string(),
+                qtensor(weights(q_dim, 9), &[q_dim]),
+            ));
+            tensors.push((
+                "blk.0.attn_k.bias".to_string(),
+                qtensor(weights(kv_dim, 10), &[kv_dim]),
+            ));
+            tensors.push((
+                "blk.0.attn_v.bias".to_string(),
+                qtensor(weights(kv_dim, 11), &[kv_dim]),
+            ));
+        }
+        if arch == "qwen3" {
+            tensors.push((
+                "blk.0.attn_q_norm.weight".to_string(),
+                qtensor(weights(head_dim, 12), &[head_dim]),
+            ));
+            tensors.push((
+                "blk.0.attn_k_norm.weight".to_string(),
+                qtensor(weights(head_dim, 13), &[head_dim]),
+            ));
+        }
 
         let metadata_refs: Vec<(&str, &gguf_file::Value)> =
-            metadata.iter().map(|(k, v)| (*k, v)).collect();
+            metadata.iter().map(|(k, v)| (k.as_str(), v)).collect();
         let tensor_refs: Vec<(&str, &QTensor)> =
-            tensors.iter().map(|(k, v)| (*k, v)).collect();
+            tensors.iter().map(|(k, v)| (k.as_str(), v)).collect();
 
         let mut file = File::create(path).unwrap();
         gguf_file::write(&mut file, &metadata_refs, &tensor_refs).unwrap();
+    }
+
+    /// Back-compat wrapper: the original llama-arch test model.
+    fn write_tiny_llama_gguf(path: &Path) {
+        write_tiny_gguf(path, "llama");
     }
 
     /// Write a GGUF with a known-to-llama.cpp but unimplemented architecture.
@@ -450,6 +550,96 @@ mod synthetic {
         assert_eq!(warm_text, fresh_text, "KV clear must fully reset the cache");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The embedding forward pass must reproduce candle's generation-model
+    /// logits exactly (same weights, same input): if the hidden states going
+    /// into the LM head match, the hidden states used for pooling are right.
+    fn assert_embedding_logits_match_candle(arch: &str) {
+        use joshua::embedding::EmbeddingModel;
+        use joshua::model::QuantizedModel;
+
+        let dir = model_dir(&format!("parity-{arch}"));
+        let path = dir.join("model.gguf");
+        write_tiny_gguf(&path, arch);
+        let bytes = std::fs::read(&path).unwrap();
+        let tokens: Vec<u32> = vec![1, 4, 2, 7, 5];
+
+        // Reference: candle's quantized generation model.
+        let mut cursor = std::io::Cursor::new(&bytes[..]);
+        let content = gguf_file::Content::read(&mut cursor).unwrap();
+        let mut reference =
+            QuantizedModel::from_gguf(content, &mut cursor, &Device::Cpu).unwrap();
+        let input = Tensor::new(tokens.as_slice(), &Device::Cpu)
+            .unwrap()
+            .unsqueeze(0)
+            .unwrap();
+        let ref_logits: Vec<f32> = reference
+            .forward(&input, 0)
+            .unwrap()
+            .squeeze(0)
+            .unwrap()
+            .to_dtype(candle_core::DType::F32)
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+
+        // Joshua's embedding forward + LM head.
+        let mut cursor = std::io::Cursor::new(&bytes[..]);
+        let content = gguf_file::Content::read(&mut cursor).unwrap();
+        let embedder = EmbeddingModel::from_gguf(content, &mut cursor, &Device::Cpu).unwrap();
+        let logits = embedder.logits(&tokens).unwrap();
+
+        assert_eq!(ref_logits.len(), logits.len(), "arch {arch}: vocab size");
+        for (i, (a, b)) in ref_logits.iter().zip(&logits).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-3,
+                "arch {arch}: logit {i} diverges: candle={a} joshua={b}"
+            );
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn embedding_forward_matches_candle_llama() {
+        assert_embedding_logits_match_candle("llama");
+    }
+
+    #[test]
+    fn embedding_forward_matches_candle_qwen2() {
+        assert_embedding_logits_match_candle("qwen2");
+    }
+
+    #[test]
+    fn embedding_forward_matches_candle_qwen3() {
+        assert_embedding_logits_match_candle("qwen3");
+    }
+
+    #[test]
+    fn engine_embeddings_are_normalised_and_distinct() {
+        use joshua::Engine;
+
+        // llama exercises mean pooling (default), qwen3 last-token pooling.
+        for arch in ["llama", "qwen3"] {
+            let dir = model_dir(&format!("embed-{arch}"));
+            write_tiny_gguf(&dir.join("model.gguf"), arch);
+
+            let engine = Engine::with_n_ctx(&dir, 64).expect("engine should load");
+            let texts = vec!["hello world".to_string(), "a b c".to_string()];
+            let (vectors, tokens) = engine.embed_with_usage(&texts).expect("embed failed");
+
+            assert_eq!(vectors.len(), 2, "arch {arch}");
+            assert_eq!(tokens, 5, "arch {arch}: 2 + 3 input tokens");
+            for v in &vectors {
+                assert_eq!(v.len(), 8, "arch {arch}: hidden size");
+                let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+                assert!((norm - 1.0).abs() < 1e-4, "arch {arch}: L2 norm {norm}");
+            }
+            assert_ne!(vectors[0], vectors[1], "arch {arch}: distinct inputs");
+
+            std::fs::remove_dir_all(&dir).ok();
+        }
     }
 
     #[test]

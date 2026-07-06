@@ -20,6 +20,7 @@ path = "src/lib.rs"
 # Pure Rust ML inference (no C/C++ dependencies required for CPU)
 candle-core = "0.11"
 candle-transformers = "0.11"
+candle-nn = "0.11"
 
 # Tokenization (pure Rust BPE/WordPiece — loads tokenizer.json from HuggingFace)
 # fancy-regex is the pure Rust regex backend (replaces the default Oniguruma C backend).

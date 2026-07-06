@@ -69,6 +69,7 @@ use rand::distributions::{Distribution, WeightedIndex};
 use rand::thread_rng;
 use tokenizers::Tokenizer;
 
+use crate::embedding::EmbeddingModel;
 use crate::model::{Architecture, QuantizedModel};
 use crate::template::ChatTemplate;
 
@@ -96,6 +97,8 @@ pub struct Engine {
     eos_token_ids: Vec<u32>,
     /// The model's chat template from GGUF metadata, if it ships one.
     chat_template: Option<ChatTemplate>,
+    /// Lazily built embedding model (stateless, shared by all embed calls).
+    embed_model: Mutex<Option<Arc<EmbeddingModel>>>,
     /// Pool of loaded model instances with warm KV caches.
     ///
     /// A finished request parks its model here together with the exact token
@@ -219,6 +222,7 @@ impl Engine {
             tokenizer: Arc::new(tokenizer),
             eos_token_ids,
             chat_template,
+            embed_model: Mutex::new(None),
             model_cache: Mutex::new(Vec::new()),
             kv_reuses: AtomicU64::new(0),
             model_name,
@@ -495,18 +499,58 @@ impl Engine {
 
     /// Compute dense embeddings for one or more texts.
     ///
-    /// Standard causal language models do not expose sentence-level embeddings
-    /// without a pooling head.  Use a dedicated embedding model
-    /// (e.g. nomic-embed-text, BGE, E5) whose GGUF variant is built with
-    /// embedding support.
+    /// Runs a single hidden-state forward pass per text and pools according
+    /// to the model's GGUF `pooling_type` metadata (mean by default, or
+    /// CLS / last-token for models converted with an explicit pooling head,
+    /// e.g. Qwen3-Embedding).  Vectors are L2-normalised.
+    ///
+    /// Supported architectures: llama (e5-mistral, SFR-Embedding, …), qwen2
+    /// (gte-Qwen2), and qwen3 (Qwen3-Embedding).
     pub fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        Err(JoshuaError::InvalidRequest(format!(
-            "Dense embedding extraction requires a model built with pooling support \
-             (e.g. nomic-embed-text-v2, BGE-M3). \
-             Standard language models cannot produce sentence embeddings via this API. \
-             ({} input text(s) provided)",
-            texts.len()
-        )))
+        Ok(self.embed_with_usage(texts)?.0)
+    }
+
+    /// Like [`Engine::embed`], additionally returning the total number of
+    /// input tokens processed.
+    pub fn embed_with_usage(&self, texts: &[String]) -> Result<(Vec<Vec<f32>>, u32)> {
+        let model = self.embedding_model()?;
+        let mut vectors = Vec::with_capacity(texts.len());
+        let mut total_tokens: u32 = 0;
+        for text in texts {
+            let encoding = self
+                .tokenizer
+                .encode(text.as_str(), true)
+                .map_err(|e| JoshuaError::Tokenization(e.to_string()))?;
+            let tokens = encoding.get_ids();
+            if tokens.len() >= self.n_ctx as usize {
+                return Err(JoshuaError::PromptTooLong(tokens.len(), self.n_ctx as usize));
+            }
+            total_tokens += tokens.len() as u32;
+            let vector = model
+                .embed_tokens(tokens)
+                .map_err(|e| JoshuaError::Inference(e.to_string()))?;
+            vectors.push(vector);
+        }
+        Ok((vectors, total_tokens))
+    }
+
+    /// Get (building on first use) the shared embedding model.
+    fn embedding_model(&self) -> Result<Arc<EmbeddingModel>> {
+        let mut slot = self
+            .embed_model
+            .lock()
+            .map_err(|e| JoshuaError::Inference(format!("embed model lock poisoned: {e}")))?;
+        if let Some(model) = slot.as_ref() {
+            return Ok(Arc::clone(model));
+        }
+        let mut cursor = Cursor::new(&self.mmap[..]);
+        let gguf = gguf_file::Content::read(&mut cursor)
+            .map_err(|e| JoshuaError::ModelLoad(format!("GGUF read failed: {e}")))?;
+        let model = EmbeddingModel::from_gguf(gguf, &mut cursor, &Device::Cpu)
+            .map_err(|e| JoshuaError::InvalidRequest(e.to_string()))?;
+        let model = Arc::new(model);
+        *slot = Some(Arc::clone(&model));
+        Ok(model)
     }
 
     // ─── Private helpers ─────────────────────────────────────────────────────

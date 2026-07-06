@@ -21,6 +21,7 @@
 //! A `tokenizer.json` from the model's HuggingFace repository must be placed
 //! alongside the `.gguf` file so the engine can tokenise prompts.
 
+pub mod embedding;
 pub mod engine;
 pub mod error;
 pub mod model;

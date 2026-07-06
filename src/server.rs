@@ -342,11 +342,10 @@ async fn embeddings(
 ) -> Result<Json<EmbeddingResponse>, ApiError> {
     let texts: Vec<String> = req.input.into_vec();
     let model = engine.model_name().to_string();
-    let total_chars: usize = texts.iter().map(|t| t.len()).sum();
 
-    let vectors = tokio::task::spawn_blocking({
+    let (vectors, prompt_tokens) = tokio::task::spawn_blocking({
         let engine = Arc::clone(&engine);
-        move || engine.embed(&texts)
+        move || engine.embed_with_usage(&texts)
     })
     .await
     .map_err(|e| ApiError::internal(e.to_string()))?
@@ -367,14 +366,9 @@ async fn embeddings(
         data,
         model,
         usage: UsageInfo {
-            // Token count approximation: the OpenAI spec requires returning usage
-            // for embeddings, but we do not re-tokenise the input here to keep the
-            // hot path fast.  The rule-of-thumb "4 UTF-8 bytes ≈ 1 token" works
-            // reasonably for English/Latin text; non-Latin scripts may differ.
-            // Use the actual llama-cpp-2 tokeniser for production-accuracy needs.
-            prompt_tokens: (total_chars / 4) as u32,
+            prompt_tokens,
             completion_tokens: 0,
-            total_tokens: (total_chars / 4) as u32,
+            total_tokens: prompt_tokens,
         },
     }))
 }
