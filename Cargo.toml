@@ -18,13 +18,16 @@ path = "src/lib.rs"
 
 [dependencies]
 # Pure Rust ML inference (no C/C++ dependencies required for CPU)
-candle-core = "0.8"
-candle-transformers = "0.8"
+candle-core = "0.11"
+candle-transformers = "0.11"
 
 # Tokenization (pure Rust BPE/WordPiece — loads tokenizer.json from HuggingFace)
 # fancy-regex is the pure Rust regex backend (replaces the default Oniguruma C backend).
 # esaxx_fast is omitted to avoid the C++ suffix-array helper.
 tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
+
+# Memory-mapped model loading (pure Rust wrapper over mmap(2))
+memmap2 = "0.9"
 
 # Sampling
 rand = "0.8"
@@ -43,3 +46,7 @@ tower-http = { version = "0.6", features = ["cors"] }
 uuid = { version = "1", features = ["v4"] }
 futures-util = "0.3"
 tokio-stream = "0.1"
+
+[dev-dependencies]
+# Used by integration tests to synthesise tiny GGUF model files.
+candle-core = "0.11"
