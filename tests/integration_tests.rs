@@ -387,6 +387,72 @@ mod synthetic {
     }
 
     #[test]
+    fn kv_prefix_reuse_matches_fresh_engine() {
+        use joshua::{types::GenerationOptions, Engine};
+
+        let dir = model_dir("tiny-llama-kv");
+        write_tiny_llama_gguf(&dir.join("model.gguf"));
+
+        let greedy = |max_tokens| GenerationOptions {
+            max_tokens,
+            temperature: 0.0,
+            repetition_penalty: 1.0,
+            ..Default::default()
+        };
+
+        // Warm engine: first request seeds the pool with KV for "hello a",
+        // second request extends that prompt and must take the prefix-reuse
+        // path (max_tokens: 0 keeps the cached history equal to the prompt).
+        let warm = Engine::with_n_ctx(&dir, 64).expect("engine should load");
+        warm.complete_raw("hello a", &greedy(0)).unwrap();
+        assert_eq!(warm.kv_reuse_count(), 0);
+        let (warm_text, warm_usage, _, _) =
+            warm.complete_raw("hello a b c", &greedy(4)).unwrap();
+        assert_eq!(warm.kv_reuse_count(), 1, "second call must reuse the KV prefix");
+
+        // Fresh engine: same extended prompt with an empty cache.
+        let fresh = Engine::with_n_ctx(&dir, 64).expect("engine should load");
+        let (fresh_text, fresh_usage, _, _) =
+            fresh.complete_raw("hello a b c", &greedy(4)).unwrap();
+
+        assert_eq!(warm_text, fresh_text, "prefix reuse must not change output");
+        assert_eq!(warm_usage.prompt_tokens, fresh_usage.prompt_tokens);
+        assert_eq!(warm_usage.completion_tokens, fresh_usage.completion_tokens);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn kv_clear_reuse_matches_fresh_engine() {
+        use joshua::{types::GenerationOptions, Engine};
+
+        let dir = model_dir("tiny-llama-kvclear");
+        write_tiny_llama_gguf(&dir.join("model.gguf"));
+
+        let greedy = GenerationOptions {
+            max_tokens: 4,
+            temperature: 0.0,
+            repetition_penalty: 1.0,
+            ..Default::default()
+        };
+
+        // Two unrelated prompts: the second reuses the pooled llama instance
+        // after a KV clear (no prefix in common) — output must match a fresh
+        // engine exactly.
+        let warm = Engine::with_n_ctx(&dir, 64).expect("engine should load");
+        warm.complete_raw("hello a", &greedy).unwrap();
+        let (warm_text, _, _, _) = warm.complete_raw("world k l", &greedy).unwrap();
+        assert_eq!(warm.kv_reuse_count(), 0, "unrelated prompt must not prefix-reuse");
+
+        let fresh = Engine::with_n_ctx(&dir, 64).expect("engine should load");
+        let (fresh_text, _, _, _) = fresh.complete_raw("world k l", &greedy).unwrap();
+
+        assert_eq!(warm_text, fresh_text, "KV clear must fully reset the cache");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn unsupported_architecture_fails_at_load_with_clear_error() {
         use joshua::Engine;
 

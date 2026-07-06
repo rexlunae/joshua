@@ -13,10 +13,17 @@
 //! so it is shared between engine clones and across requests, and never
 //! copied through a `read()` syscall path.
 //!
-//! A fresh [`QuantizedModel`] is created for every inference call so that
-//! each request has an isolated KV cache; because the weights come straight
-//! out of the mapping, re-creating a model after the first load costs no
-//! disk I/O.
+//! # KV-cache sharing
+//!
+//! Finished requests park their model instance — including its populated KV
+//! cache — in a small pool.  A follow-up request whose prompt extends a
+//! parked instance's token history (the normal multi-turn chat pattern)
+//! reuses it and prefills only the new suffix, skipping recomputation of the
+//! shared prefix entirely.  Unrelated prompts reuse a pooled instance with a
+//! cleared cache where the architecture supports it, or build a fresh
+//! instance from the mapping (no disk I/O after first load).  Requests never
+//! observe each other's cache contents: an instance is owned by exactly one
+//! request at a time, and reuse requires an exact token-prefix match.
 //!
 //! The engine auto-detects the model architecture from the GGUF
 //! `general.architecture` metadata and dispatches to the correct candle
@@ -51,7 +58,8 @@
 use std::fs::File;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use candle_core::quantized::gguf_file;
@@ -88,14 +96,37 @@ pub struct Engine {
     eos_token_ids: Vec<u32>,
     /// The model's chat template from GGUF metadata, if it ships one.
     chat_template: Option<ChatTemplate>,
+    /// Pool of loaded model instances with warm KV caches.
+    ///
+    /// A finished request parks its model here together with the exact token
+    /// sequence its KV cache holds.  A later request whose prompt extends
+    /// that sequence (the normal multi-turn chat pattern) picks the instance
+    /// up and prefills only the new suffix.
+    model_cache: Mutex<Vec<CachedModel>>,
+    /// Number of requests that continued from a cached KV prefix.
+    kv_reuses: AtomicU64,
     /// Stem of the model file (used as the model identifier in API responses).
     model_name: String,
     /// Context-window size in tokens.
     n_ctx: u32,
 }
 
-// `PathBuf`, `Arc<Mmap>`, `Arc<Tokenizer>`, `Vec<u32>`, `String`, and `u32`
-// are all `Send + Sync`, so Engine is automatically `Send + Sync`.
+// `PathBuf`, `Arc<Mmap>`, `Arc<Tokenizer>`, `Vec<u32>`, `String`, `u32`,
+// `Mutex<…>`, and `AtomicU64` are all `Send + Sync`, so Engine is
+// automatically `Send + Sync`.
+
+/// Maximum number of idle model instances kept warm in the pool.
+///
+/// Each instance holds the (quantized) weights plus its KV cache, so this
+/// bounds memory: two instances cover the common "one active conversation
+/// plus one concurrent request" pattern without tripling residency.
+const MAX_CACHED_MODELS: usize = 2;
+
+/// A parked model instance whose KV cache holds exactly `tokens`.
+struct CachedModel {
+    model: QuantizedModel,
+    tokens: Vec<u32>,
+}
 
 impl Engine {
     /// Load a GGUF model using a 4 096-token context window.
@@ -188,6 +219,8 @@ impl Engine {
             tokenizer: Arc::new(tokenizer),
             eos_token_ids,
             chat_template,
+            model_cache: Mutex::new(Vec::new()),
+            kv_reuses: AtomicU64::new(0),
             model_name,
             n_ctx,
         })
@@ -323,10 +356,6 @@ impl Engine {
         add_special_tokens: bool,
         options: &GenerationOptions,
     ) -> Result<(String, UsageInfo, f64, f64)> {
-        // Load model weights from the GGUF file.  After the first call the OS
-        // page cache keeps the file data hot, so this is I/O-free in practice.
-        let mut model = self.load_model()?;
-
         // ── Tokenise ─────────────────────────────────────────────────────────
         let encoding = self
             .tokenizer
@@ -339,18 +368,28 @@ impl Engine {
             return Err(JoshuaError::PromptTooLong(n_prompt, self.n_ctx as usize));
         }
 
+        // ── Acquire a model ──────────────────────────────────────────────────
+        // Prefer a pooled instance whose KV cache already covers a prefix of
+        // this prompt; fall back to a reset instance or a fresh load.
+        let (mut model, n_reused) = self.acquire_model(&prompt_tokens)?;
+        let new_tokens = &prompt_tokens[n_reused..];
+
+        // Every token fed to the model so far — i.e. the exact contents of
+        // its KV cache.  Returned to the pool with the model afterwards.
+        let mut kv_tokens = prompt_tokens.clone();
+
         // ── Prefill ───────────────────────────────────────────────────────────
-        // Process all prompt tokens in a single forward pass.
-        // Input shape: [1, n_prompt].
-        let input = Tensor::new(prompt_tokens.as_slice(), &Device::Cpu)
+        // Process the not-yet-cached prompt tokens in a single forward pass.
+        // Input shape: [1, len(new_tokens)].
+        let input = Tensor::new(new_tokens, &Device::Cpu)
             .and_then(|t| t.unsqueeze(0))
             .map_err(|e| JoshuaError::Inference(e.to_string()))?;
 
         let prefill_start = Instant::now();
-        // index_pos = 0: the KV cache is empty; start building from position 0.
+        // index_pos = n_reused: append right after the reused KV prefix.
         // forward() internally selects the last-token logits; output: [1, vocab_size].
         let logits = model
-            .forward(&input, 0)
+            .forward(&input, n_reused)
             .map_err(|e| JoshuaError::Inference(e.to_string()))?;
         let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -413,12 +452,16 @@ impl Engine {
             let step_logits = model
                 .forward(&step_input, n_cur)
                 .map_err(|e| JoshuaError::Inference(e.to_string()))?;
+            kv_tokens.push(next_token);
 
             logits_vec = squeeze_batch_logits(&step_logits)?;
             n_cur += 1;
         }
 
         let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
+
+        // Park the instance for reuse by a follow-up request.
+        self.release_model(model, kv_tokens);
 
         let prefill_tps = if prefill_ms > 0.0 {
             n_prompt as f64 / (prefill_ms / 1000.0)
@@ -468,12 +511,67 @@ impl Engine {
 
     // ─── Private helpers ─────────────────────────────────────────────────────
 
+    /// Number of requests so far that continued from a cached KV prefix.
+    pub fn kv_reuse_count(&self) -> u64 {
+        self.kv_reuses.load(Ordering::Relaxed)
+    }
+
+    /// Get a model ready to prefill `prompt_tokens`.
+    ///
+    /// Returns the instance and how many leading prompt tokens its KV cache
+    /// already covers.  Preference order:
+    ///
+    /// 1. a pooled instance whose fed-token history is a strict prefix of
+    ///    the prompt (longest match wins) — only the suffix needs prefill;
+    /// 2. a pooled instance whose KV cache can be cleared — skips re-reading
+    ///    the weights;
+    /// 3. a fresh instance from the mmap.
+    fn acquire_model(&self, prompt_tokens: &[u32]) -> Result<(QuantizedModel, usize)> {
+        if let Ok(mut pool) = self.model_cache.lock() {
+            let best = pool
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| {
+                    c.tokens.len() < prompt_tokens.len() && prompt_tokens.starts_with(&c.tokens)
+                })
+                .max_by_key(|(_, c)| c.tokens.len())
+                .map(|(i, _)| i);
+            if let Some(i) = best {
+                let cached = pool.swap_remove(i);
+                self.kv_reuses.fetch_add(1, Ordering::Relaxed);
+                tracing::debug!(
+                    reused_tokens = cached.tokens.len(),
+                    prompt_tokens = prompt_tokens.len(),
+                    "Continuing from cached KV prefix"
+                );
+                return Ok((cached.model, cached.tokens.len()));
+            }
+            if let Some(i) = pool.iter().position(|c| c.model.supports_kv_clear()) {
+                let mut cached = pool.swap_remove(i);
+                cached.model.clear_kv_cache();
+                tracing::debug!("Reusing pooled model with cleared KV cache");
+                return Ok((cached.model, 0));
+            }
+        }
+        Ok((self.load_model()?, 0))
+    }
+
+    /// Return a finished instance (KV cache = `tokens`) to the pool.
+    fn release_model(&self, model: QuantizedModel, tokens: Vec<u32>) {
+        if let Ok(mut pool) = self.model_cache.lock() {
+            pool.push(CachedModel { model, tokens });
+            // Evict oldest beyond the cap.
+            while pool.len() > MAX_CACHED_MODELS {
+                pool.remove(0);
+            }
+        }
+    }
+
     /// Load a [`QuantizedModel`] from the memory-mapped GGUF file —
     /// architecture is auto-detected from the GGUF metadata.
     ///
-    /// Each call builds a fresh model so the KV cache starts empty.  Weights
-    /// are read straight out of the shared mmap, so after the first load
-    /// this involves no disk I/O.
+    /// The instance starts with an empty KV cache.  Weights are read straight
+    /// out of the shared mmap, so reloads involve no disk I/O.
     fn load_model(&self) -> Result<QuantizedModel> {
         let mut cursor = Cursor::new(&self.mmap[..]);
         let gguf = gguf_file::Content::read(&mut cursor)
