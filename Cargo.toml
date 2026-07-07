@@ -29,6 +29,10 @@ default = []
 # at build time, Metal is macOS-only).
 cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
 metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
+# HTTPS termination via rustls. Opt-in because the ring crypto provider
+# compiles C/assembly, which would break the default build's
+# "only a Rust toolchain required" guarantee.
+tls = ["dep:axum-server", "dep:rustls"]
 
 [dependencies]
 # Pure Rust ML inference (no C/C++ dependencies required for CPU)
@@ -77,6 +81,12 @@ uuid = { version = "1", features = ["v4"] }
 futures-util = "0.3"
 tokio-stream = "0.1"
 
+# HTTPS support (the optional `tls` feature). axum-server is built without
+# a crypto provider so we can pick ring (needs only a C compiler) over the
+# default aws-lc-rs (needs CMake).
+axum-server = { version = "0.7", default-features = false, features = ["tls-rustls-no-provider"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"], optional = true }
+
 [dev-dependencies]
 # Used by integration tests to synthesise tiny GGUF model files and
 # whisper checkpoints, and to generate WAV fixtures.
@@ -84,3 +94,8 @@ candle-core = "0.11"
 candle-nn = "0.11"
 candle-transformers = "0.11"
 hound = "3.5"
+# Used by the server tests to drive the router in-process and decode the
+# embedded self-signed test certificate (all pure Rust).
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tower = { version = "0.5", features = ["util"] }
+base64 = "0.22"
