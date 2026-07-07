@@ -16,10 +16,43 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use tracing_subscriber::EnvFilter;
 
-use joshua::{engine::Engine, server, types::GenerationOptions, ChatMessage};
+use joshua::{
+    engine::Engine, server, types::GenerationOptions, ChatMessage, EngineOptions, HugePages,
+    PageSize,
+};
+
+/// Physical-memory backing for the model mapping (CLI form of [`HugePages`]).
+#[derive(Debug, Clone, Copy, ValueEnum, Default)]
+enum HugePagesArg {
+    /// Normal pages; file-backed mmap shared via the page cache (default).
+    #[default]
+    Off,
+    /// Transparent huge pages (MADV_HUGEPAGE) on the file-backed mmap.
+    Transparent,
+    /// Explicit huge pages at the system default size (anonymous copy).
+    Huge,
+    /// Explicit 2 MiB "large" pages (anonymous copy).
+    #[value(name = "2mb")]
+    TwoMb,
+    /// Explicit 1 GiB "huge" pages (anonymous copy).
+    #[value(name = "1gb")]
+    OneGb,
+}
+
+impl From<HugePagesArg> for HugePages {
+    fn from(arg: HugePagesArg) -> Self {
+        match arg {
+            HugePagesArg::Off => HugePages::Off,
+            HugePagesArg::Transparent => HugePages::Transparent,
+            HugePagesArg::Huge => HugePages::Explicit(PageSize::Default),
+            HugePagesArg::TwoMb => HugePages::Explicit(PageSize::TwoMiB),
+            HugePagesArg::OneGb => HugePages::Explicit(PageSize::OneGiB),
+        }
+    }
+}
 
 /// An mmap-based LLM inference engine — a Rust clone of Cactus.
 #[derive(Parser)]
@@ -44,6 +77,10 @@ enum Commands {
         /// Context window size in tokens.
         #[arg(long, default_value_t = 4096)]
         n_ctx: u32,
+        /// Physical-memory backing for the model: off, transparent, huge,
+        /// 2mb, or 1gb (Linux only for the huge-page modes).
+        #[arg(long, value_enum, default_value_t = HugePagesArg::Off)]
+        huge_pages: HugePagesArg,
         /// NPU vendor plugin (a cdylib exporting the joshua_npu_* ABI).
         #[arg(long, env = "JOSHUA_NPU_PLUGIN")]
         npu_plugin: Option<PathBuf>,
@@ -90,6 +127,10 @@ enum Commands {
         /// Context window size in tokens.
         #[arg(long, default_value_t = 4096)]
         n_ctx: u32,
+        /// Physical-memory backing for the model: off, transparent, huge,
+        /// 2mb, or 1gb (Linux only for the huge-page modes).
+        #[arg(long, value_enum, default_value_t = HugePagesArg::Off)]
+        huge_pages: HugePagesArg,
         /// NPU vendor plugin (a cdylib exporting the joshua_npu_* ABI).
         #[arg(long, env = "JOSHUA_NPU_PLUGIN")]
         npu_plugin: Option<PathBuf>,
@@ -136,6 +177,7 @@ async fn main() -> anyhow::Result<()> {
             model,
             addr,
             n_ctx,
+            huge_pages,
             npu_plugin,
             npu_in_process,
             whisper_model,
@@ -154,7 +196,8 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
 
-            let mut engine = Engine::with_n_ctx(&model, n_ctx)?;
+            let opts = EngineOptions::with_n_ctx(n_ctx).huge_pages(huge_pages.into());
+            let mut engine = Engine::with_options(&model, opts)?;
             if let Some(plugin) = npu_plugin {
                 engine = engine.with_npu_backend(npu_backend(&plugin, npu_in_process)?);
             }
@@ -207,10 +250,12 @@ async fn main() -> anyhow::Result<()> {
             max_tokens,
             temperature,
             n_ctx,
+            huge_pages,
             npu_plugin,
             npu_in_process,
         } => {
-            let mut engine = Engine::with_n_ctx(&model, n_ctx)?;
+            let opts = EngineOptions::with_n_ctx(n_ctx).huge_pages(huge_pages.into());
+            let mut engine = Engine::with_options(&model, opts)?;
             if let Some(plugin) = npu_plugin {
                 engine = engine.with_npu_backend(npu_backend(&plugin, npu_in_process)?);
             }

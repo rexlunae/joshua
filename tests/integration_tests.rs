@@ -521,6 +521,57 @@ mod synthetic {
     }
 
     #[test]
+    fn huge_page_strategies_load_and_match_normal_pages() {
+        use joshua::{types::GenerationOptions, EngineOptions, HugePages, PageSize};
+
+        let dir = model_dir("huge-pages");
+        write_tiny_gguf(&dir.join("model.gguf"), "llama");
+
+        let greedy = GenerationOptions {
+            max_tokens: 4,
+            temperature: 0.0,
+            repetition_penalty: 1.0,
+            ..Default::default()
+        };
+        let load = |huge| {
+            joshua::Engine::with_options(&dir, EngineOptions::with_n_ctx(64).huge_pages(huge))
+        };
+
+        // Baseline: normal file-backed pages.
+        let (baseline, _, _, _) = load(HugePages::Off)
+            .expect("normal mmap")
+            .complete_raw("hello a b", &greedy)
+            .unwrap();
+
+        // The transparent-huge-page hint is best-effort and must always load
+        // (the madvise is advisory), producing byte-identical output.
+        let (thp_text, _, _, _) = load(HugePages::Transparent)
+            .expect("transparent huge pages should still load")
+            .complete_raw("hello a b", &greedy)
+            .unwrap();
+        assert_eq!(thp_text, baseline, "THP output must match normal pages");
+
+        // Explicit huge pages need a preallocated pool that CI usually lacks,
+        // so this must degrade gracefully: either it loads (and matches) or it
+        // returns a clear error — never a panic.
+        match load(HugePages::Explicit(PageSize::TwoMiB)) {
+            Ok(engine) => {
+                let (text, _, _, _) = engine.complete_raw("hello a b", &greedy).unwrap();
+                assert_eq!(text, baseline, "huge-page output must match normal pages");
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("huge pages") || msg.contains("pool"),
+                    "expected a huge-page allocation error, got: {msg}"
+                );
+            }
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn image_path_sources_are_rejected_without_reading_files() {
         use joshua::{types::GenerationOptions, ChatMessage, Engine};
 
