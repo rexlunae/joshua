@@ -11,7 +11,6 @@
 mod common;
 
 use std::io::Cursor;
-use std::path::PathBuf;
 
 use candle_core::{DType, Device};
 use candle_nn::{VarBuilder, VarMap};
@@ -53,7 +52,7 @@ const WHISPER_TOKENIZER_JSON: &str = r#"{
 }"#;
 
 /// Synthesise a tiny whisper model directory.
-fn write_tiny_whisper(dir: &PathBuf) {
+fn write_tiny_whisper(dir: &std::path::Path) {
     let config = Config {
         num_mel_bins: 80,
         max_source_positions: 1500,

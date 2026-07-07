@@ -129,3 +129,64 @@ pub unsafe extern "C" fn joshua_npu_free(handle: *mut c_void) {
         drop(Box::from_raw(handle as *mut MockState));
     }
 }
+
+/// Optional multimodal entry point (see `joshua::npu`).
+///
+/// The mock "tokenises" the prompt as whitespace-word count and charges 3
+/// positions per image; each consumed position appends a deterministic
+/// pseudo-token to the history, so logits (and the greedy argmax formula)
+/// stay a pure function of everything fed so far.
+///
+/// # Safety
+/// `handle` must come from `joshua_npu_init`; `prompt` must be a valid
+/// NUL-terminated string; `images`/`image_sizes` must be valid for
+/// `n_images` reads; `out_logits` must be valid for `VOCAB` writes.
+#[no_mangle]
+pub unsafe extern "C" fn joshua_npu_media_prefill(
+    handle: *mut c_void,
+    prompt: *const c_char,
+    images: *const *const u8,
+    image_sizes: *const u64,
+    n_images: u32,
+    out_n_past: *mut u32,
+    out_logits: *mut f32,
+) -> i32 {
+    if handle.is_null() || prompt.is_null() || out_n_past.is_null() || out_logits.is_null() {
+        return -1;
+    }
+    let state = &mut *(handle as *mut MockState);
+    let Ok(prompt) = CStr::from_ptr(prompt).to_str() else {
+        return -2;
+    };
+
+    // Media prefill starts a fresh sequence.
+    state.history.clear();
+
+    // Text positions: one pseudo-token per whitespace-separated word.
+    for word in prompt.split_whitespace() {
+        let tok = word.bytes().map(|b| b as u32).sum::<u32>() % 1000;
+        state.history.push(tok);
+    }
+    // Media positions: three per image, derived from the image bytes.
+    for i in 0..n_images as usize {
+        let data = std::slice::from_raw_parts(*images.add(i), *image_sizes.add(i) as usize);
+        let sum = data.iter().map(|&b| b as u64).sum::<u64>();
+        for k in 0..3u64 {
+            state.history.push(((sum + k) % 1000) as u32);
+        }
+    }
+    if state.history.is_empty() || state.history.len() > state.n_ctx as usize {
+        return -4;
+    }
+    *out_n_past = state.history.len() as u32;
+
+    // Same logits formula as `joshua_npu_forward`.
+    let sum: u64 = state.history.iter().map(|&t| t as u64).sum();
+    let argmax = ((sum % 12) + 4) as usize;
+    let logits = std::slice::from_raw_parts_mut(out_logits, VOCAB as usize);
+    for (i, l) in logits.iter_mut().enumerate() {
+        *l = ((sum.wrapping_mul(31).wrapping_add(i as u64) % 97) as f32) / 100.0;
+    }
+    logits[argmax] = 10.0;
+    0
+}

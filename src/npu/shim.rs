@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use memmap2::MmapMut;
 
-use super::proto::{Request, Response, SHM_LOGITS_CAPACITY};
+use super::proto::{b64_encode, Request, Response, SHM_LOGITS_CAPACITY};
 use super::{NpuBackend, NpuSession};
 
 /// Runs vendor plugins in an isolated subprocess per session.
@@ -148,6 +148,7 @@ impl NpuBackend for ShimBackend {
             shm_path,
             n_ctx,
             vocab: 0,
+            media: false,
             dead: false,
             forward_timeout: self.forward_timeout,
         };
@@ -168,6 +169,7 @@ impl NpuBackend for ShimBackend {
             return Err(format!("vocab {vocab} exceeds the shared logit region"));
         }
         session.vocab = vocab as usize;
+        session.media = response.media.unwrap_or(false);
         Ok(Box::new(session))
     }
 }
@@ -181,6 +183,7 @@ struct ShimSession {
     shm_path: PathBuf,
     n_ctx: u32,
     vocab: usize,
+    media: bool,
     dead: bool,
     forward_timeout: Duration,
 }
@@ -229,6 +232,17 @@ impl ShimSession {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+
+    /// Read the logit region back out of shared memory.
+    fn read_logits(&self) -> Vec<f32> {
+        let base = self.n_ctx as usize * 4;
+        let mut logits = vec![0f32; self.vocab];
+        for (i, logit) in logits.iter_mut().enumerate() {
+            let at = base + i * 4;
+            *logit = f32::from_le_bytes(self.shm[at..at + 4].try_into().expect("4 bytes"));
+        }
+        logits
+    }
 }
 
 impl NpuSession for ShimSession {
@@ -258,18 +272,36 @@ impl NpuSession for ShimSession {
             },
             self.forward_timeout,
         )?;
-        // Read logits back out of the shared logit region.
-        let base = self.n_ctx as usize * 4;
-        let mut logits = vec![0f32; self.vocab];
-        for (i, logit) in logits.iter_mut().enumerate() {
-            let at = base + i * 4;
-            *logit = f32::from_le_bytes(self.shm[at..at + 4].try_into().expect("4 bytes"));
-        }
-        Ok(logits)
+        Ok(self.read_logits())
     }
 
     fn reset(&mut self) -> bool {
         self.request(&Request::Reset, self.forward_timeout).is_ok()
+    }
+
+    fn supports_media(&self) -> bool {
+        self.media
+    }
+
+    fn media_prefill(
+        &mut self,
+        prompt: &str,
+        images: &[Vec<u8>],
+    ) -> std::result::Result<(usize, Vec<f32>), String> {
+        if !self.media {
+            return Err("plugin does not support multimodal input".to_string());
+        }
+        let response = self.request(
+            &Request::MediaPrefill {
+                prompt: prompt.to_string(),
+                images: images.iter().map(|i| b64_encode(i)).collect(),
+            },
+            self.forward_timeout,
+        )?;
+        let n_past = response
+            .n_past
+            .ok_or_else(|| "media_prefill reply is missing n_past".to_string())?;
+        Ok((n_past as usize, self.read_logits()))
     }
 }
 

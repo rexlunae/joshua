@@ -181,6 +181,35 @@ impl GenSession {
     fn is_npu(&self) -> bool {
         matches!(self, Self::Npu(_))
     }
+
+    /// Whether this session can prefill multimodal prompts.
+    fn supports_media(&self) -> bool {
+        match self {
+            Self::Candle(_) => false,
+            Self::Npu(session) => session.supports_media(),
+        }
+    }
+
+    /// Tokenise-and-prefill a multimodal prompt (NPU sessions only).
+    fn media_prefill(&mut self, prompt: &str, images: &[Vec<u8>]) -> Result<(usize, Vec<f32>)> {
+        match self {
+            Self::Candle(_) => Err(JoshuaError::InvalidRequest(
+                "the candle path does not support multimodal input".to_string(),
+            )),
+            Self::Npu(session) => session
+                .media_prefill(prompt, images)
+                .map_err(JoshuaError::Inference),
+        }
+    }
+}
+
+/// Result of a decode loop.
+struct DecodeOutcome {
+    response: String,
+    n_decoded: u32,
+    /// Tokens actually fed to the model during decode (KV-state delta).
+    fed_tokens: Vec<u32>,
+    decode_tps: f64,
 }
 
 /// NPU backend state: the backend plus its circuit breaker.
@@ -442,8 +471,78 @@ impl Engine {
         tools: Option<&[Tool]>,
         options: &GenerationOptions,
     ) -> Result<(String, UsageInfo, f64, f64)> {
+        // Multimodal branch: messages carrying images go through a
+        // media-capable NPU/llama.cpp plugin session.
+        if messages.iter().any(|m| m.images.as_ref().is_some_and(|i| !i.is_empty())) {
+            let (marked_messages, images) = resolve_message_media(messages)?;
+            let (prompt, _) = self.format_prompt(&marked_messages, tools);
+            return self.complete_media(&prompt, &images, options);
+        }
         let (prompt, add_special_tokens) = self.format_prompt(messages, tools);
         self.complete_with(&prompt, add_special_tokens, options)
+    }
+
+    /// Run a multimodal completion: the plugin tokenises and prefills the
+    /// marked prompt together with the media, then decode proceeds normally.
+    fn complete_media(
+        &self,
+        prompt: &str,
+        images: &[Vec<u8>],
+        options: &GenerationOptions,
+    ) -> Result<(String, UsageInfo, f64, f64)> {
+        // Acquire an NPU session (never by token prefix — the plugin owns
+        // tokenisation here, so no history to match).
+        let (mut session, _) = self.acquire_session(&[], true)?;
+        if !session.supports_media() {
+            // Repool the (text-capable) session before failing.
+            if session.clear_state() {
+                self.release_model(session, Vec::new());
+            }
+            return Err(JoshuaError::InvalidRequest(
+                "this request contains images, which require a multimodal NPU plugin — \
+                 run with --npu-plugin pointing at the llama.cpp adapter built with an \
+                 mmproj (JOSHUA_LLAMA_MMPROJ) or another media-capable plugin"
+                    .to_string(),
+            ));
+        }
+
+        let prefill_start = Instant::now();
+        let result = session
+            .media_prefill(prompt, images)
+            .and_then(|(n_past, logits)| {
+                let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
+                let outcome = self.decode_loop(&mut session, logits, n_past, &[], options)?;
+                Ok((n_past, prefill_ms, outcome))
+            });
+
+        match result {
+            Ok((n_past, prefill_ms, outcome)) => {
+                // The session's token history is plugin-internal; repool only
+                // after a clean reset.
+                if session.clear_state() {
+                    self.release_model(session, Vec::new());
+                }
+                let prefill_tps = if prefill_ms > 0.0 {
+                    n_past as f64 / (prefill_ms / 1000.0)
+                } else {
+                    0.0
+                };
+                let usage = UsageInfo {
+                    // Positions consumed by text tokens + media embeddings.
+                    prompt_tokens: n_past as u32,
+                    completion_tokens: outcome.n_decoded,
+                    total_tokens: n_past as u32 + outcome.n_decoded,
+                };
+                Ok((outcome.response, usage, prefill_tps, outcome.decode_tps))
+            }
+            Err(e) => {
+                if let Some(npu) = &self.npu {
+                    npu.record_failure(&npu.backend.name(), &e.to_string());
+                }
+                // No candle fallback exists for vision — propagate.
+                Err(e)
+            }
+        }
     }
 
     /// Run completion from an arbitrary raw prompt string.
@@ -548,13 +647,64 @@ impl Engine {
         // Process the not-yet-cached prompt tokens in a single forward pass,
         // starting right after the reused KV prefix.
         let prefill_start = Instant::now();
-        let mut logits_vec = model.forward_tokens(new_tokens, n_reused, &self.device)?;
+        let logits_vec = model.forward_tokens(new_tokens, n_reused, &self.device)?;
         let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
 
         // ── Repetition-penalty history ────────────────────────────────────────
+        let outcome = self.decode_loop(model, logits_vec, n_prompt, prompt_tokens, options)?;
+        kv_tokens.extend_from_slice(&outcome.fed_tokens);
+
+        // Throughput reflects the tokens actually processed in the prefill
+        // window: with a reused KV prefix that is only the new suffix.
+        let n_prefilled = new_tokens.len();
+        let prefill_tps = if prefill_ms > 0.0 {
+            n_prefilled as f64 / (prefill_ms / 1000.0)
+        } else {
+            0.0
+        };
+
+        tracing::debug!(
+            prompt_tokens = n_prompt,
+            prefill_tokens = n_prefilled,
+            reused_tokens = n_reused,
+            prefill_tps,
+            decode_tokens = outcome.n_decoded,
+            decode_tps = outcome.decode_tps,
+            "Completion finished"
+        );
+
+        let usage = UsageInfo {
+            prompt_tokens: n_prompt as u32,
+            completion_tokens: outcome.n_decoded,
+            total_tokens: n_prompt as u32 + outcome.n_decoded,
+        };
+
+        Ok((
+            outcome.response,
+            usage,
+            prefill_tps,
+            outcome.decode_tps,
+            kv_tokens,
+        ))
+    }
+
+    /// Greedy/sampled token generation from an initial logit vector.
+    ///
+    /// `start_pos` is the absolute position of the next token to feed
+    /// (`prompt length` for text prompts, `n_past` after a multimodal
+    /// prefill).  `penalty_seed` primes the repetition-penalty window
+    /// (empty when prompt tokens are unknown, e.g. multimodal prefill).
+    fn decode_loop(
+        &self,
+        model: &mut GenSession,
+        mut logits_vec: Vec<f32>,
+        start_pos: usize,
+        penalty_seed: &[u32],
+        options: &GenerationOptions,
+    ) -> Result<DecodeOutcome> {
         // Seed the recent-token window with the tail of the prompt (up to 64 tokens).
         const REP_WINDOW: usize = 64;
-        let mut recent_tokens: Vec<u32> = prompt_tokens
+        let mut recent_tokens: Vec<u32> = penalty_seed
             .iter()
             .rev()
             .take(REP_WINDOW)
@@ -564,11 +714,11 @@ impl Engine {
             .rev()
             .collect();
 
-        // ── Decode loop ───────────────────────────────────────────────────────
         let mut rng = thread_rng();
         let mut response = String::new();
+        let mut fed_tokens: Vec<u32> = Vec::new();
         let mut n_decoded: u32 = 0;
-        let mut n_cur = n_prompt;
+        let mut n_cur = start_pos;
         let decode_start = Instant::now();
 
         loop {
@@ -602,43 +752,23 @@ impl Engine {
 
             // Single-token decode step.
             logits_vec = model.forward_tokens(&[next_token], n_cur, &self.device)?;
-            kv_tokens.push(next_token);
+            fed_tokens.push(next_token);
             n_cur += 1;
         }
 
         let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
-
-        // Throughput reflects the tokens actually processed in the prefill
-        // window: with a reused KV prefix that is only the new suffix.
-        let n_prefilled = new_tokens.len();
-        let prefill_tps = if prefill_ms > 0.0 {
-            n_prefilled as f64 / (prefill_ms / 1000.0)
-        } else {
-            0.0
-        };
         let decode_tps = if decode_ms > 0.0 && n_decoded > 0 {
             n_decoded as f64 / (decode_ms / 1000.0)
         } else {
             0.0
         };
 
-        tracing::debug!(
-            prompt_tokens = n_prompt,
-            prefill_tokens = n_prefilled,
-            reused_tokens = n_reused,
-            prefill_tps,
-            decode_tokens = n_decoded,
+        Ok(DecodeOutcome {
+            response,
+            n_decoded,
+            fed_tokens,
             decode_tps,
-            "Completion finished"
-        );
-
-        let usage = UsageInfo {
-            prompt_tokens: n_prompt as u32,
-            completion_tokens: n_decoded,
-            total_tokens: n_prompt as u32 + n_decoded,
-        };
-
-        Ok((response, usage, prefill_tps, decode_tps, kv_tokens))
+        })
     }
 
     // ─── Embeddings ───────────────────────────────────────────────────────────
@@ -837,6 +967,49 @@ impl Engine {
         }
         false
     }
+}
+
+// ─── Media helpers ────────────────────────────────────────────────────────────
+
+/// Resolve message-attached images to raw bytes and inject one media marker
+/// per image into the owning message's content (marker order == byte order),
+/// following llama.cpp's `mtmd` prompt convention.
+fn resolve_message_media(messages: &[ChatMessage]) -> Result<(Vec<ChatMessage>, Vec<Vec<u8>>)> {
+    let mut marked = messages.to_vec();
+    let mut images = Vec::new();
+    for msg in &mut marked {
+        let Some(attached) = msg.images.take() else {
+            continue;
+        };
+        let mut markers = String::new();
+        for source in &attached {
+            images.push(load_image_bytes(source)?);
+            markers.push_str(crate::npu::MEDIA_MARKER);
+            markers.push('\n');
+        }
+        msg.content = format!("{markers}{}", msg.content);
+    }
+    Ok((marked, images))
+}
+
+/// Load image bytes from a `data:` URL or a local file path.
+fn load_image_bytes(source: &str) -> Result<Vec<u8>> {
+    if let Some(rest) = source.strip_prefix("data:") {
+        let b64 = rest.split_once("base64,").map(|(_, b)| b).ok_or_else(|| {
+            JoshuaError::InvalidRequest("only base64 data: URLs are supported".to_string())
+        })?;
+        use base64::Engine as _;
+        return base64::engine::general_purpose::STANDARD
+            .decode(b64.trim())
+            .map_err(|e| JoshuaError::InvalidRequest(format!("invalid base64 image data: {e}")));
+    }
+    if source.starts_with("http://") || source.starts_with("https://") {
+        return Err(JoshuaError::InvalidRequest(
+            "remote image URLs are not fetched — send a data: URL or a local path".to_string(),
+        ));
+    }
+    std::fs::read(source)
+        .map_err(|e| JoshuaError::InvalidRequest(format!("cannot read image {source:?}: {e}")))
 }
 
 // ─── GGUF / tokenizer helpers ─────────────────────────────────────────────────

@@ -20,6 +20,7 @@
 
 use std::path::PathBuf;
 
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
 /// Fixed capacity reserved for the logit region (supports vocabularies up to
@@ -44,6 +45,13 @@ pub enum Request {
     /// Feed `n_tokens` tokens (already written to the token region) at
     /// absolute position `pos`; write last-token logits to the logit region.
     Forward { pos: u32, n_tokens: u32 },
+    /// Tokenise-and-prefill a multimodal prompt (optional plugin capability).
+    ///
+    /// `images` are base64-encoded media items in `<__media__>` marker
+    /// order.  They ride the control pipe rather than the shared region
+    /// because they are one-shot per request and unbounded in size.  Logits
+    /// land in the logit region as usual.
+    MediaPrefill { prompt: String, images: Vec<String> },
     /// Clear the vendor session state.
     Reset,
     /// Clean shutdown.
@@ -61,6 +69,12 @@ pub struct Response {
     /// Vocabulary size, present on a successful `init` reply.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vocab: Option<u32>,
+    /// Whether the plugin supports multimodal prefill (`init` reply).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media: Option<bool>,
+    /// Positions consumed, present on a successful `media_prefill` reply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub n_past: Option<u32>,
 }
 
 impl Response {
@@ -70,6 +84,8 @@ impl Response {
             ok: true,
             error: None,
             vocab: None,
+            media: None,
+            n_past: None,
         }
     }
 
@@ -79,6 +95,20 @@ impl Response {
             ok: false,
             error: Some(message.into()),
             vocab: None,
+            media: None,
+            n_past: None,
         }
     }
+}
+
+/// Base64-encode media bytes for the control pipe.
+pub fn b64_encode(data: &[u8]) -> String {
+    base64::engine::general_purpose::STANDARD.encode(data)
+}
+
+/// Decode base64 media bytes from the control pipe.
+pub fn b64_decode(s: &str) -> std::result::Result<Vec<u8>, String> {
+    base64::engine::general_purpose::STANDARD
+        .decode(s)
+        .map_err(|e| e.to_string())
 }

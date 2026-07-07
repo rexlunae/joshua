@@ -234,6 +234,119 @@ fn engine_generates_through_the_shim_backend() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+// ─── Multimodal (media prefill) ─────────────────────────────────────────────
+
+/// Replicate the mock's media tokenisation: one pseudo-token per prompt
+/// word, three per image (see joshua-mock-npu docs).
+fn mock_media_history(prompt: &str, images: &[&[u8]]) -> Vec<u32> {
+    let mut history: Vec<u32> = prompt
+        .split_whitespace()
+        .map(|w| w.bytes().map(|b| b as u32).sum::<u32>() % 1000)
+        .collect();
+    for data in images {
+        let sum = data.iter().map(|&b| b as u64).sum::<u64>();
+        for k in 0..3u64 {
+            history.push(((sum + k) % 1000) as u32);
+        }
+    }
+    history
+}
+
+#[test]
+fn media_prefill_matches_between_inprocess_and_shim() {
+    let dir = tiny_model_dir("npu-media-parity");
+    let model = dir.join("model.gguf");
+    let image: Vec<u8> = vec![9, 8, 7, 6, 5];
+
+    let inproc = InProcessBackend::load(&mock_plugin()).unwrap();
+    let mut a = inproc.create_session(&model, 64).unwrap();
+    let mut b = shim_backend().create_session(&model, 64).expect("shim session");
+    assert!(a.supports_media(), "mock plugin must advertise media");
+    assert!(b.supports_media(), "shim must relay the media capability");
+
+    let prompt = "describe <__media__> please";
+    let (n_a, logits_a) = a.media_prefill(prompt, std::slice::from_ref(&image)).unwrap();
+    let (n_b, logits_b) = b.media_prefill(prompt, std::slice::from_ref(&image)).unwrap();
+    assert_eq!(n_a, n_b);
+    assert_eq!(logits_a, logits_b, "base64 pipe transport must be lossless");
+
+    // 3 words + 3 image positions.
+    let history = mock_media_history(prompt, &[&image]);
+    assert_eq!(n_a, history.len());
+
+    // Decode continues with plain forward at the returned position.
+    let after = a.forward(&[4], n_a).expect("decode after media prefill");
+    assert_eq!(after.len(), 16);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn engine_generates_from_an_image_message() {
+    let dir = tiny_model_dir("npu-media-engine");
+    let engine = Engine::with_n_ctx(&dir, 64)
+        .expect("engine should load")
+        .with_npu_backend(Arc::new(shim_backend()));
+
+    let image: Vec<u8> = vec![1, 2, 3, 4];
+    let mut message = joshua::ChatMessage::text("user", "look");
+    // A base64 data URL, as an OpenAI vision client would send.
+    message.images = Some(vec![format!(
+        "data:image/png;base64,{}",
+        {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode(&image)
+        }
+    )]);
+
+    let options = GenerationOptions {
+        max_tokens: 3,
+        temperature: 0.0,
+        repetition_penalty: 1.0,
+        ..Default::default()
+    };
+    let (text, usage, _, _) = engine
+        .complete(&[message], &options)
+        .expect("multimodal completion");
+
+    // The GGUF chat template renders "hello <marker>\nlook world"; replicate
+    // the mock's tokenisation and greedy chain to predict the exact output.
+    let prompt = "hello <__media__>\nlook world";
+    let mut history = mock_media_history(prompt, &[&image]);
+    assert_eq!(usage.prompt_tokens as usize, history.len());
+    let mut expected = String::new();
+    for _ in 0..3 {
+        let next = ((history.iter().map(|&t| t as u64).sum::<u64>() % 12) + 4) as u32;
+        expected.push((b'a' + (next as u8 - 4)) as char);
+        history.push(next);
+    }
+    assert_eq!(text, expected, "greedy decode after media prefill");
+    assert_eq!(usage.completion_tokens, 3);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn images_without_a_media_backend_are_rejected_clearly() {
+    let dir = tiny_model_dir("npu-media-none");
+    // Pure candle engine: no NPU backend at all.
+    let engine = Engine::with_n_ctx(&dir, 64).expect("engine should load");
+
+    let mut message = joshua::ChatMessage::text("user", "look");
+    message.images = Some(vec!["data:image/png;base64,AQID".to_string()]);
+
+    let err = engine
+        .complete(&[message], &GenerationOptions::default())
+        .map(|_| ())
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("multimodal"),
+        "expected a multimodal-capability error, got: {err}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn engine_falls_back_to_cpu_and_trips_the_circuit_breaker() {
     let dir = tiny_model_dir("npu-engine-fallback");

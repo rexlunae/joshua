@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use memmap2::MmapMut;
 
-use joshua::npu::internal::{Request, Response, VendorLibrary};
+use joshua::npu::internal::{b64_decode, Request, Response, VendorLibrary};
 
 fn main() {
     let stdin = std::io::stdin();
@@ -67,6 +67,7 @@ fn main() {
     }
     reply(Response {
         vocab: Some(vocab as u32),
+        media: Some(session.has_media()),
         ..Response::ok()
     });
 
@@ -93,6 +94,31 @@ fn main() {
                             Response::ok()
                         }
                         Err(e) => Response::err(e),
+                    }
+                }
+            }
+            Ok(Request::MediaPrefill { prompt, images }) => {
+                let decoded: Result<Vec<Vec<u8>>, String> = images
+                    .iter()
+                    .map(|b64| b64_decode(b64).map_err(|e| format!("bad image data: {e}")))
+                    .collect();
+                match decoded {
+                    Err(e) => Response::err(e),
+                    Ok(images) => {
+                        let mut logits = vec![0f32; vocab];
+                        match session.media_prefill_into(&prompt, &images, &mut logits) {
+                            Ok(n_past) => {
+                                for (i, logit) in logits.iter().enumerate() {
+                                    let at = logits_base + i * 4;
+                                    shm[at..at + 4].copy_from_slice(&logit.to_le_bytes());
+                                }
+                                Response {
+                                    n_past: Some(n_past as u32),
+                                    ..Response::ok()
+                                }
+                            }
+                            Err(e) => Response::err(e),
+                        }
                     }
                 }
             }
