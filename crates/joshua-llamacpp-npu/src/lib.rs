@@ -25,8 +25,33 @@
 //! joshua serve --model m.gguf --npu-plugin target/release/libjoshua_llamacpp_npu.so
 //! ```
 //!
-//! NPU backends (Hexagon, CANN) are enabled by building llama.cpp with the
-//! vendor SDK; see llama.cpp's backend docs for the required toolchains.
+//! # Automatic backend loading
+//!
+//! llama.cpp can register ggml backends at runtime from separate
+//! `libggml-<name>` shared modules — the mechanism vendors use to ship NPU
+//! backends (Hexagon, CANN) and GPU/CPU variants.  Build this crate with the
+//! `dynamic-backends` feature and llama.cpp is compiled with `GGML_BACKEND_DL`;
+//! [`load_dynamic_backends`] then discovers and registers those modules on
+//! startup, before backend init:
+//!
+//! ```bash
+//! cargo build --release -p joshua-llamacpp-npu --features dynamic-backends
+//! # Cross-compile the NPU backend module (needs the vendor SDK) and drop it
+//! # where it will be found:
+//! JOSHUA_LLAMA_BACKENDS_DIR=/opt/ggml-backends \
+//!   joshua serve --model m.gguf --npu-plugin .../libjoshua_llamacpp_npu.so
+//! ```
+//!
+//! So an NPU backend built for the target device is picked up with no code
+//! change.  Without the feature only the statically-linked backends (CPU plus
+//! any `cuda`/`vulkan`/`metal` feature) are available.
+//!
+//! Under `dynamic-backends`, ggml itself becomes a set of versioned shared
+//! objects (`libggml-base.so.0`, `libggml.so.0`, `libllama.so.0`) that the
+//! plugin links against.  The build script bakes an rpath into the plugin so
+//! the loader finds them: `$ORIGIN` and `$ORIGIN/../lib` for deployment (ship
+//! the libraries next to the plugin, or in a sibling `lib/`), plus the build
+//! tree's own lib directory so local builds and tests load with no setup.
 
 use std::ffi::CStr;
 use std::num::NonZeroU32;
@@ -45,7 +70,45 @@ use llama_cpp_2::token::LlamaToken;
 /// Process-wide llama.cpp runtime (loads ggml backends once).
 fn backend() -> Option<&'static LlamaBackend> {
     static BACKEND: OnceLock<Option<LlamaBackend>> = OnceLock::new();
-    BACKEND.get_or_init(|| LlamaBackend::init().ok()).as_ref()
+    BACKEND
+        .get_or_init(|| {
+            // Discover dynamically-linked ggml backend modules (including NPU
+            // backends) before initialising, so they register with ggml.
+            load_dynamic_backends();
+            LlamaBackend::init().ok()
+        })
+        .as_ref()
+}
+
+/// Auto-load dynamically-linked ggml backend modules.
+///
+/// llama.cpp's backend registry can be populated at runtime from separate
+/// `libggml-<name>` shared modules — the mechanism vendors use to ship NPU
+/// backends (Qualcomm Hexagon, Huawei CANN) and GPU/CPU variants without a
+/// monolithic build.  With the `dynamic-backends` feature, llama.cpp is built
+/// with `GGML_BACKEND_DL` and this scans for those modules and registers them:
+///
+/// - `JOSHUA_LLAMA_BACKENDS_DIR`, if set, points at the directory to scan
+///   (e.g. where a cross-compiled `libggml-hexagon.so` was placed);
+/// - otherwise the compile-time default directory is used.
+///
+/// So an NPU backend built for the target device is picked up with no code
+/// change — drop the module in the directory and it registers on startup.
+/// Without the `dynamic-backends` feature this is a no-op and only the
+/// statically-linked backends (CPU, plus any `cuda`/`vulkan`/`metal` feature)
+/// are available.
+fn load_dynamic_backends() {
+    #[cfg(feature = "dynamic-backends")]
+    {
+        use llama_cpp_2::llama_backend;
+        match std::env::var("JOSHUA_LLAMA_BACKENDS_DIR") {
+            Ok(dir) if !dir.is_empty() => {
+                eprintln!("joshua-llamacpp-npu: loading ggml backend modules from {dir}");
+                llama_backend::load_backends_from_path(std::path::Path::new(&dir));
+            }
+            _ => llama_backend::load_backends(),
+        }
+    }
 }
 
 /// One generation session: an owned model plus its context.
