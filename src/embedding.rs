@@ -171,6 +171,13 @@ impl EmbeddingModel {
         let n_kv_head = get_u32("attention.head_count_kv")? as usize;
         let block_count = get_u32("block_count")? as usize;
         let embedding_length = get_u32("embedding_length")? as usize;
+
+        // Guard the divisions below (head_dim, GQA grouping) against
+        // zero-valued metadata in a malformed GGUF, which would otherwise
+        // panic instead of erroring cleanly.
+        if n_head == 0 || n_kv_head == 0 {
+            candle_core::bail!("invalid GGUF: attention head counts must be non-zero");
+        }
         let rms_eps = get_f32("attention.layer_norm_rms_epsilon", 1e-5) as f64;
         let rope_freq_base = get_f32("rope.freq_base", 10_000.0);
 

@@ -36,8 +36,10 @@ enum Commands {
         /// Path to the GGUF model file.
         #[arg(short, long, env = "JOSHUA_MODEL_PATH")]
         model: PathBuf,
-        /// Address to listen on.
-        #[arg(short, long, default_value = "0.0.0.0:8080")]
+        /// Address to listen on.  Defaults to localhost; bind `0.0.0.0` only
+        /// after enabling `--api-key` and/or TLS, since the API is otherwise
+        /// unauthenticated.
+        #[arg(short, long, default_value = "127.0.0.1:8080")]
         addr: String,
         /// Context window size in tokens.
         #[arg(long, default_value_t = 4096)]
@@ -52,6 +54,15 @@ enum Commands {
         /// Whisper model directory to mount at /v1/audio/transcriptions.
         #[arg(long, env = "JOSHUA_WHISPER_MODEL")]
         whisper_model: Option<PathBuf>,
+        /// Maximum concurrent generations/embeddings; excess requests get a
+        /// 503.  Bounds peak memory from concurrent model instances.
+        /// Defaults to the machine's parallelism.
+        #[arg(long, env = "JOSHUA_MAX_CONCURRENCY")]
+        max_concurrency: Option<usize>,
+        /// Hard ceiling on tokens generated per request, capping the
+        /// client-supplied max_tokens.
+        #[arg(long, env = "JOSHUA_MAX_OUTPUT_TOKENS")]
+        max_output_tokens: Option<u32>,
         /// Require this API key on /v1 routes (Authorization: Bearer <key>).
         #[arg(long, env = "JOSHUA_API_KEY")]
         api_key: Option<String>,
@@ -128,6 +139,8 @@ async fn main() -> anyhow::Result<()> {
             npu_plugin,
             npu_in_process,
             whisper_model,
+            max_concurrency,
+            max_output_tokens,
             api_key,
             tls_cert,
             tls_key,
@@ -144,6 +157,12 @@ async fn main() -> anyhow::Result<()> {
             let mut engine = Engine::with_n_ctx(&model, n_ctx)?;
             if let Some(plugin) = npu_plugin {
                 engine = engine.with_npu_backend(npu_backend(&plugin, npu_in_process)?);
+            }
+            if let Some(max) = max_concurrency {
+                engine = engine.with_max_concurrency(max);
+            }
+            if let Some(max) = max_output_tokens {
+                engine = engine.with_max_output_tokens(max);
             }
             let whisper = whisper_model
                 .map(joshua::whisper::WhisperEngine::new)

@@ -32,6 +32,20 @@ use tokenizers::Tokenizer;
 
 use crate::error::{JoshuaError, Result};
 
+/// Lowest WAV sample rate accepted (Hz).  A crafted low rate would otherwise
+/// amplify a small upload into a huge one during upsampling to 16 kHz; this
+/// floor caps that factor to 4× (and 0 would divide by zero).
+const MIN_SAMPLE_RATE: u32 = 4_000;
+
+/// Highest WAV sample rate accepted (Hz).  Above pro-audio rates; rejects
+/// clearly bogus headers.
+const MAX_SAMPLE_RATE: u32 = 384_000;
+
+/// Maximum number of 16 kHz samples processed per request — ~30 minutes of
+/// audio.  Caps both the resampler output and the mel-spectrogram tensor so
+/// a long or amplified upload cannot exhaust memory.
+const MAX_OUTPUT_SAMPLES: usize = wm::SAMPLE_RATE * 60 * 30;
+
 /// A transcription result.
 #[derive(Debug, Clone)]
 pub struct Transcription {
@@ -149,6 +163,12 @@ impl WhisperEngine {
         if pcm.is_empty() {
             return Err(JoshuaError::InvalidRequest("empty audio".to_string()));
         }
+        if pcm.len() > MAX_OUTPUT_SAMPLES {
+            return Err(JoshuaError::InvalidRequest(format!(
+                "audio is too long ({} samples > {MAX_OUTPUT_SAMPLES} at 16 kHz)",
+                pcm.len()
+            )));
+        }
         let duration = pcm.len() as f64 / wm::SAMPLE_RATE as f64;
 
         let mel = audio::pcm_to_mel(&self.config, pcm, &self.mel_filters);
@@ -164,10 +184,13 @@ impl WhisperEngine {
             None => self.tokenizer.token_to_id("<|en|>"),
         };
 
+        // Recover from poisoning rather than failing permanently: the KV
+        // cache is flushed per segment below, so a prior panic leaves no
+        // state that would corrupt this transcription.
         let mut model = self
             .model
             .lock()
-            .map_err(|e| JoshuaError::Inference(format!("whisper model lock poisoned: {e}")))?;
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         let mut text = String::new();
         let mut seek = 0;
@@ -294,12 +317,30 @@ pub fn wav_to_pcm16k(bytes: &[u8]) -> Result<Vec<f32>> {
     let spec = reader.spec();
     let channels = spec.channels.max(1) as usize;
 
+    // Reject header values that would drive pathological allocation or
+    // arithmetic on attacker-controlled uploads.  The floor also bounds the
+    // upsampling amplification (16 kHz / rate) to a small factor, on top of
+    // the absolute `MAX_OUTPUT_SAMPLES` cap applied below.
+    if spec.sample_rate < MIN_SAMPLE_RATE || spec.sample_rate > MAX_SAMPLE_RATE {
+        return Err(JoshuaError::InvalidRequest(format!(
+            "unsupported WAV sample rate {} (must be {MIN_SAMPLE_RATE}..={MAX_SAMPLE_RATE})",
+            spec.sample_rate
+        )));
+    }
+    if !matches!(spec.bits_per_sample, 8 | 16 | 24 | 32) {
+        return Err(JoshuaError::InvalidRequest(format!(
+            "unsupported WAV bit depth {} (must be 8, 16, 24, or 32)",
+            spec.bits_per_sample
+        )));
+    }
+
     let interleaved: Vec<f32> = match spec.sample_format {
         hound::SampleFormat::Float => reader
             .samples::<f32>()
             .collect::<std::result::Result<_, _>>()
             .map_err(|e| JoshuaError::InvalidRequest(format!("WAV read: {e}")))?,
         hound::SampleFormat::Int => {
+            // Safe now that bits_per_sample is validated to 8/16/24/32.
             let max = (1i64 << (spec.bits_per_sample - 1)) as f32;
             reader
                 .samples::<i32>()
@@ -321,7 +362,14 @@ pub fn wav_to_pcm16k(bytes: &[u8]) -> Result<Vec<f32>> {
         return Ok(mono);
     }
     let ratio = src_rate as f64 / wm::SAMPLE_RATE as f64;
-    let out_len = (mono.len() as f64 / ratio) as usize;
+    // Cap the resampled length: a low declared sample rate would otherwise
+    // amplify a small upload into a huge allocation (e.g. sample_rate=1 →
+    // 16000× blow-up).  MAX_SAMPLE_RATE bounds ratio away from zero, and this
+    // caps the absolute output so the audio-duration limit is respected.
+    let out_len = ((mono.len() as f64 / ratio) as usize).min(MAX_OUTPUT_SAMPLES);
+    if mono.is_empty() {
+        return Ok(Vec::new());
+    }
     let resampled = (0..out_len)
         .map(|i| {
             let pos = i as f64 * ratio;

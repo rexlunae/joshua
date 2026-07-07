@@ -98,11 +98,21 @@ impl NpuBackend for ShimBackend {
             std::process::id(),
             SHM_COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
-        let shm_len = n_ctx as usize * 4 + SHM_LOGITS_CAPACITY;
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
+        let shm_len = (n_ctx as usize)
+            .checked_mul(4)
+            .and_then(|t| t.checked_add(SHM_LOGITS_CAPACITY))
+            .ok_or_else(|| format!("n_ctx {n_ctx} is too large for the shared buffer"))?;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true).write(true).create_new(true);
+        // The shm holds the request's prompt tokens and the model's logits;
+        // restrict it to the server's own user so other local accounts can't
+        // read it. (create_new is O_EXCL, so this is not a symlink race.)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let file = opts
             .open(&shm_path)
             .map_err(|e| format!("cannot create shm file {shm_path:?}: {e}"))?;
         file.set_len(shm_len as u64)
