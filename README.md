@@ -26,6 +26,8 @@ framework) and [tokenizers](https://github.com/huggingface/tokenizers).
 | **Vision (optional)** | OpenAI-style image messages routed through llama.cpp's `mtmd` (Qwen2.5-VL, Gemma 3, LLaVA, …) via the same isolated plugin |
 | **Speech-to-text** | Whisper transcription in pure Rust: `/v1/audio/transcriptions` + `joshua transcribe` |
 | **Sampling** | Temperature, top-k, min-p, top-p (nucleus), greedy — all in Rust |
+| **HTTPS (optional)** | `--features tls` terminates TLS in-process via rustls — no reverse proxy needed |
+| **API-key auth** | Optional `--api-key` guards the `/v1` routes with OpenAI-style bearer authentication |
 
 ---
 
@@ -205,11 +207,58 @@ curl http://localhost:8080/health
 
 ---
 
+## Securing the server
+
+By default the server speaks plaintext HTTP with no authentication, which is
+fine on a trusted network or behind a reverse proxy.  To expose it directly,
+turn on one or both of the following.
+
+### API-key authentication
+
+Pass `--api-key` (or set `JOSHUA_API_KEY`) and every `/v1` route requires the
+key as an OpenAI-style bearer token; `GET /health` stays open for liveness
+probes.  Requests without the key get a `401` with an OpenAI-format error
+body, so standard clients report it cleanly.
+
+```bash
+joshua serve --model m.gguf --api-key sk-my-secret
+
+curl http://localhost:8080/v1/models \
+  -H "Authorization: Bearer sk-my-secret"
+```
+
+### TLS (HTTPS)
+
+TLS termination is built in via [rustls](https://github.com/rustls/rustls),
+behind an opt-in cargo feature — rustls' ring crypto provider compiles
+C/assembly, so it is excluded from the default build to keep the
+"only a Rust toolchain required" guarantee (same policy as the `cuda`/`metal`
+features).  Building with `--features tls` requires a C compiler.
+
+```bash
+cargo build --release --features tls
+
+joshua serve --model m.gguf \
+    --tls-cert ./cert.pem \
+    --tls-key  ./key.pem
+
+curl https://localhost:8080/v1/models
+```
+
+`--tls-cert` takes a PEM certificate chain and `--tls-key` the matching
+PKCS#8/RSA/SEC1 private key (both flags required together).  Library users
+can call `server::serve_with_state_tls` directly.
+
+---
+
 ## Environment variables
 
 | Variable | Description |
 |---|---|
 | `JOSHUA_MODEL_PATH` | Default model path (overrides `--model` flag) |
+| `JOSHUA_API_KEY` | API key required on `/v1` routes (same as `--api-key`) |
+| `JOSHUA_TLS_CERT` | PEM certificate chain for HTTPS (same as `--tls-cert`; needs `--features tls`) |
+| `JOSHUA_TLS_KEY` | PEM private key for HTTPS (same as `--tls-key`) |
 | `RUST_LOG` | Log filter (e.g. `info`, `joshua=debug`) |
 
 ---

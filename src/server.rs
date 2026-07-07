@@ -14,8 +14,9 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
-    extract::State,
-    http::StatusCode,
+    extract::{Request, State},
+    http::{header, StatusCode},
+    middleware::{self, Next},
     response::{
         sse::{Event, Sse},
         IntoResponse, Response,
@@ -46,6 +47,9 @@ pub struct ServerState {
     pub engine: Arc<Engine>,
     /// Optional Whisper model for `/v1/audio/transcriptions`.
     pub whisper: Option<Arc<WhisperEngine>>,
+    /// When set, every `/v1` request must carry this key as
+    /// `Authorization: Bearer <key>`.  `/health` stays open for probes.
+    pub api_key: Option<String>,
 }
 
 /// Shared application state handle.
@@ -55,15 +59,48 @@ pub type AppState = Arc<ServerState>;
 
 /// Build the Axum router with all API routes mounted.
 pub fn create_router(state: AppState) -> Router {
-    Router::new()
-        .route("/health", get(health))
+    let api = Router::new()
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(completions))
         .route("/v1/embeddings", post(embeddings))
         .route("/v1/audio/transcriptions", post(transcriptions))
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            require_api_key,
+        ));
+    Router::new()
+        .route("/health", get(health))
+        .merge(api)
         .layer(CorsLayer::permissive())
         .with_state(state)
+}
+
+/// Reject `/v1` requests that lack the configured bearer API key.
+///
+/// A no-op when no key is configured.  Comparison is constant-time so the
+/// key can't be recovered byte-by-byte through response timing.
+async fn require_api_key(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    if let Some(expected) = &state.api_key {
+        let provided = req
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "));
+        if !provided.is_some_and(|key| constant_time_eq(key.as_bytes(), expected.as_bytes())) {
+            let body = ErrorResponse::new(
+                "invalid or missing API key — pass the key as 'Authorization: Bearer <key>'",
+                "invalid_request_error",
+            );
+            return (StatusCode::UNAUTHORIZED, Json(body)).into_response();
+        }
+    }
+    next.run(req).await
+}
+
+/// Byte-wise equality whose runtime depends only on the input lengths.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 /// Start the server on `addr` (e.g. `"0.0.0.0:8080"`) with just a chat
@@ -73,6 +110,7 @@ pub async fn serve(engine: Arc<Engine>, addr: &str) -> std::io::Result<()> {
         Arc::new(ServerState {
             engine,
             whisper: None,
+            api_key: None,
         }),
         addr,
     )
@@ -83,8 +121,37 @@ pub async fn serve(engine: Arc<Engine>, addr: &str) -> std::io::Result<()> {
 pub async fn serve_with_state(state: AppState, addr: &str) -> std::io::Result<()> {
     let app = create_router(state);
     let listener = TcpListener::bind(addr).await?;
-    tracing::info!("Joshua server listening on {}", addr);
+    tracing::info!("Joshua server listening on http://{}", addr);
     axum::serve(listener, app).await
+}
+
+/// Start the server over HTTPS (the `tls` cargo feature).
+///
+/// `cert` and `key` are paths to a PEM-encoded certificate chain and
+/// PKCS#8/RSA/SEC1 private key.  TLS is terminated in-process by rustls —
+/// no reverse proxy needed.
+#[cfg(feature = "tls")]
+pub async fn serve_with_state_tls(
+    state: AppState,
+    addr: &str,
+    cert: &std::path::Path,
+    key: &std::path::Path,
+) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+
+    // axum-server is built without a default crypto provider; install ring
+    // process-wide.  Err means a provider is already installed — fine.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let addr: std::net::SocketAddr = addr
+        .parse()
+        .map_err(|e| Error::new(ErrorKind::InvalidInput, format!("invalid address: {e}")))?;
+    let config = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key).await?;
+    let app = create_router(state);
+    tracing::info!("Joshua server listening on https://{}", addr);
+    axum_server::bind_rustls(addr, config)
+        .serve(app.into_make_service())
+        .await
 }
 
 // ─── Handlers ────────────────────────────────────────────────────────────────

@@ -32,6 +32,12 @@ pub mod whisper;
 pub mod tools;
 pub mod types;
 
+/// Re-exported so consumers of the `tls` feature can configure rustls
+/// (e.g. install a different [`rustls::crypto::CryptoProvider`]) without
+/// adding their own dependency on a matching rustls version.
+#[cfg(feature = "tls")]
+pub use rustls;
+
 pub use engine::Engine;
 pub use error::{JoshuaError, Result};
 pub use types::{

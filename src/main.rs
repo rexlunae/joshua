@@ -52,6 +52,16 @@ enum Commands {
         /// Whisper model directory to mount at /v1/audio/transcriptions.
         #[arg(long, env = "JOSHUA_WHISPER_MODEL")]
         whisper_model: Option<PathBuf>,
+        /// Require this API key on /v1 routes (Authorization: Bearer <key>).
+        #[arg(long, env = "JOSHUA_API_KEY")]
+        api_key: Option<String>,
+        /// Serve HTTPS with this PEM certificate chain (needs --tls-key and
+        /// a build with the `tls` cargo feature).
+        #[arg(long, env = "JOSHUA_TLS_CERT", requires = "tls_key")]
+        tls_cert: Option<PathBuf>,
+        /// PEM private key for --tls-cert.
+        #[arg(long, env = "JOSHUA_TLS_KEY", requires = "tls_cert")]
+        tls_key: Option<PathBuf>,
     },
     /// Run a single chat completion and print the response.
     Run {
@@ -118,7 +128,19 @@ async fn main() -> anyhow::Result<()> {
             npu_plugin,
             npu_in_process,
             whisper_model,
+            api_key,
+            tls_cert,
+            tls_key,
         } => {
+            // Fail fast, before the (potentially slow) model load, when TLS
+            // flags are passed to a build compiled without TLS support.
+            #[cfg(not(feature = "tls"))]
+            if tls_cert.is_some() || tls_key.is_some() {
+                anyhow::bail!(
+                    "this build has no TLS support — rebuild with `cargo build --features tls`"
+                );
+            }
+
             let mut engine = Engine::with_n_ctx(&model, n_ctx)?;
             if let Some(plugin) = npu_plugin {
                 engine = engine.with_npu_backend(npu_backend(&plugin, npu_in_process)?);
@@ -130,8 +152,21 @@ async fn main() -> anyhow::Result<()> {
             let state = Arc::new(server::ServerState {
                 engine: Arc::new(engine),
                 whisper,
+                api_key,
             });
-            server::serve_with_state(state, &addr).await?;
+            match (tls_cert, tls_key) {
+                (Some(cert), Some(key)) => {
+                    #[cfg(feature = "tls")]
+                    server::serve_with_state_tls(state, &addr, &cert, &key).await?;
+                    #[cfg(not(feature = "tls"))]
+                    {
+                        let _ = (cert, key, state);
+                        unreachable!("rejected above before the model load");
+                    }
+                }
+                // clap's `requires` rejects one flag without the other.
+                _ => server::serve_with_state(state, &addr).await?,
+            }
         }
 
         Commands::Transcribe {
