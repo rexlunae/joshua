@@ -13,6 +13,13 @@
 //! so it is shared between engine clones and across requests, and never
 //! copied through a `read()` syscall path.
 //!
+//! The page size is selectable via [`EngineOptions::huge_pages`]: the default
+//! keeps this file-backed mapping on normal pages; [`HugePages::Transparent`]
+//! adds a `MADV_HUGEPAGE` hint while preserving the shared page cache; and
+//! [`HugePages::Explicit`] copies the weights into an anonymous `MAP_HUGETLB`
+//! mapping of a chosen size (2 MiB / 1 GiB) for guaranteed huge pages at the
+//! cost of private RAM.
+//!
 //! # KV-cache sharing
 //!
 //! Finished requests park their model instance — including its populated KV
@@ -56,7 +63,7 @@
 //! looked up in the same directory.
 
 use std::fs::File;
-use std::io::Cursor;
+use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -76,6 +83,90 @@ use crate::template::ChatTemplate;
 
 use crate::error::{JoshuaError, Result};
 use crate::types::{ChatMessage, GenerationOptions, Tool, UsageInfo};
+
+// ─── Mmap configuration ─────────────────────────────────────────────────────
+
+/// Explicit huge-page size for [`HugePages::Explicit`].
+///
+/// The page-bits values match `MAP_HUGE_*` in `mmap(2)`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PageSize {
+    /// The system's default huge-page size (from `/proc/meminfo`, usually
+    /// 2 MiB).  Corresponds to `MAP_HUGETLB` without a size selector.
+    #[default]
+    Default,
+    /// 2 MiB "large" pages (`MAP_HUGE_2MB`).
+    TwoMiB,
+    /// 1 GiB "huge" pages (`MAP_HUGE_1GB`); needs 1 GiB pages preallocated.
+    OneGiB,
+}
+
+impl PageSize {
+    /// `(page-bits for MmapOptions::huge, page size in bytes)`.
+    fn params(self) -> (Option<u8>, usize) {
+        match self {
+            Self::Default => (None, default_hugepage_bytes()),
+            Self::TwoMiB => (Some(21), 2 * 1024 * 1024),
+            Self::OneGiB => (Some(30), 1024 * 1024 * 1024),
+        }
+    }
+}
+
+/// How the model file is backed by physical memory.
+///
+/// The default keeps the file-backed mmap Joshua has always used; the other
+/// variants trade that for huge pages, which cut TLB misses on large models.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum HugePages {
+    /// Normal page size; the model stays file-backed via `mmap` and is
+    /// shared through the OS page cache (default).
+    #[default]
+    Off,
+    /// Keep the file-backed mmap but ask the kernel to promote it to
+    /// transparent huge pages (`MADV_HUGEPAGE`).
+    ///
+    /// Best-effort and portable — it preserves the shared-page-cache model
+    /// and silently does nothing if the kernel can't honour it (no size
+    /// control; the kernel picks the THP size, normally 2 MiB).  Linux only.
+    Transparent,
+    /// Load the model into an **anonymous** mapping backed by explicit
+    /// huge pages of the given size (`MAP_HUGETLB`).
+    ///
+    /// This guarantees the page size but copies the weights into private
+    /// RAM: the shared page cache is given up, load touches the whole file
+    /// once, and the hugepage pool must be preallocated (e.g.
+    /// `sysctl vm.nr_hugepages=…` or `hugeadm`).  Linux only; on other
+    /// platforms it falls back to a normal file mapping with a warning.
+    Explicit(PageSize),
+}
+
+/// Construction options for [`Engine`].
+///
+/// Use [`Engine::with_options`] for full control; [`Engine::new`] and
+/// [`Engine::with_n_ctx`] are convenience wrappers over the defaults.
+#[derive(Debug, Clone, Default)]
+pub struct EngineOptions {
+    /// Context-window size in tokens (0 selects the 4096 default).
+    pub n_ctx: u32,
+    /// Physical-memory backing strategy for the model mapping.
+    pub huge_pages: HugePages,
+}
+
+impl EngineOptions {
+    /// Default options with an explicit context-window size.
+    pub fn with_n_ctx(n_ctx: u32) -> Self {
+        Self {
+            n_ctx,
+            ..Self::default()
+        }
+    }
+
+    /// Select the huge-page strategy.
+    pub fn huge_pages(mut self, huge_pages: HugePages) -> Self {
+        self.huge_pages = huge_pages;
+        self
+    }
+}
 
 // ─── Engine ───────────────────────────────────────────────────────────────────
 
@@ -289,11 +380,18 @@ impl Engine {
     /// that contains one.  A `tokenizer.json` must exist in the same directory
     /// as the `.gguf` file.
     pub fn new(model_path: impl AsRef<Path>) -> Result<Self> {
-        Self::with_n_ctx(model_path, 4096)
+        Self::with_options(model_path, EngineOptions::default())
     }
 
     /// Load a GGUF model with a custom context-window size.
     pub fn with_n_ctx(model_path: impl AsRef<Path>, n_ctx: u32) -> Result<Self> {
+        Self::with_options(model_path, EngineOptions::with_n_ctx(n_ctx))
+    }
+
+    /// Load a GGUF model with full [`EngineOptions`] (context size and the
+    /// huge-page backing strategy).
+    pub fn with_options(model_path: impl AsRef<Path>, options: EngineOptions) -> Result<Self> {
+        let n_ctx = if options.n_ctx == 0 { 4096 } else { options.n_ctx };
         let raw_path = model_path.as_ref().to_path_buf();
 
         // Resolve the actual .gguf file path.
@@ -329,20 +427,8 @@ impl Engine {
         let tokenizer = Tokenizer::from_file(&tokenizer_path)
             .map_err(|e| JoshuaError::ModelLoad(format!("tokenizer load failed: {e}")))?;
 
-        // Map the GGUF file into memory.  Weights are paged in lazily by the
-        // OS and shared across all requests and engine clones.
-        //
-        // SAFETY: the mapping is only undefined behaviour if the file is
-        // truncated or rewritten while mapped.  Model files are treated as
-        // immutable once downloaded, matching llama.cpp's own mmap usage.
-        let file = File::open(&gguf_path)?;
-        let mmap = unsafe { Mmap::map(&file) }
-            .map_err(|e| JoshuaError::ModelLoad(format!("mmap of GGUF file failed: {e}")))?;
-
-        // Weight tensors are consumed in file order during a load, so tell
-        // the kernel to read ahead aggressively.  Best effort only.
-        #[cfg(unix)]
-        let _ = mmap.advise(memmap2::Advice::Sequential);
+        // Map the GGUF file into memory using the configured backing.
+        let mmap = map_model(&gguf_path, options.huge_pages)?;
 
         // Read GGUF metadata once to validate the architecture up front and
         // extract EOS token IDs.
@@ -1155,6 +1241,116 @@ fn load_image_bytes(source: &str) -> Result<Vec<u8>> {
 
 // ─── GGUF / tokenizer helpers ─────────────────────────────────────────────────
 
+// ─── Model mapping ────────────────────────────────────────────────────────────
+
+/// Map the model file into memory according to the huge-page strategy.
+///
+/// SAFETY (file-backed variants): the mapping is only undefined behaviour if
+/// the file is truncated or rewritten while mapped.  Model files are treated
+/// as immutable once downloaded, matching llama.cpp's own mmap usage.
+fn map_model(path: &Path, huge: HugePages) -> Result<Mmap> {
+    let file = File::open(path)?;
+
+    // Explicit huge pages use an anonymous copy; handle separately.
+    if let HugePages::Explicit(size) = huge {
+        return map_model_hugetlb(path, &file, size);
+    }
+
+    let mmap = unsafe { Mmap::map(&file) }
+        .map_err(|e| JoshuaError::ModelLoad(format!("mmap of GGUF file failed: {e}")))?;
+
+    // Weight tensors are consumed in file order during a load, so tell the
+    // kernel to read ahead aggressively.  Best effort only.
+    #[cfg(unix)]
+    let _ = mmap.advise(memmap2::Advice::Sequential);
+
+    if huge == HugePages::Transparent {
+        #[cfg(target_os = "linux")]
+        match mmap.advise(memmap2::Advice::HugePage) {
+            Ok(()) => tracing::info!("requested transparent huge pages for the model mapping"),
+            Err(e) => {
+                tracing::warn!("transparent huge pages unavailable; using normal pages: {e}")
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        tracing::warn!("transparent huge pages are Linux-only; using normal pages");
+    }
+
+    Ok(mmap)
+}
+
+/// Load the model into an anonymous mapping backed by explicit huge pages.
+#[cfg(target_os = "linux")]
+fn map_model_hugetlb(path: &Path, file: &File, size: PageSize) -> Result<Mmap> {
+    let len = file.metadata()?.len() as usize;
+    let (page_bits, page_len) = size.params();
+    // MAP_HUGETLB requires the mapping length to be a multiple of the page
+    // size; round up (the tail is zero-filled and unused).
+    let mapped_len = len
+        .div_ceil(page_len)
+        .checked_mul(page_len)
+        .ok_or_else(|| JoshuaError::ModelLoad("model too large for huge-page mapping".into()))?;
+
+    let mut anon = memmap2::MmapOptions::new()
+        .len(mapped_len)
+        .huge(page_bits)
+        .map_anon()
+        .map_err(|e| {
+            JoshuaError::ModelLoad(format!(
+                "could not allocate {} MiB of {}-byte huge pages — is the pool configured \
+                 (e.g. `sysctl vm.nr_hugepages`)?: {e}",
+                mapped_len / (1024 * 1024),
+                page_len
+            ))
+        })?;
+
+    // Copy the model bytes into the huge-page-backed region.
+    File::open(path)?
+        .read_exact(&mut anon[..len])
+        .map_err(|e| JoshuaError::ModelLoad(format!("reading model into huge pages failed: {e}")))?;
+
+    let mmap = anon
+        .make_read_only()
+        .map_err(|e| JoshuaError::ModelLoad(format!("freezing huge-page mapping failed: {e}")))?;
+    tracing::info!(
+        "loaded model into {} MiB of explicit huge pages ({}-byte pages, anonymous — \
+         not shared through the page cache)",
+        mapped_len / (1024 * 1024),
+        page_len
+    );
+    Ok(mmap)
+}
+
+/// Non-Linux fallback: explicit huge pages are unsupported, so map the file
+/// normally with a warning.
+#[cfg(not(target_os = "linux"))]
+fn map_model_hugetlb(_path: &Path, file: &File, _size: PageSize) -> Result<Mmap> {
+    tracing::warn!("explicit huge pages are Linux-only; using a normal file mapping");
+    unsafe { Mmap::map(file) }
+        .map_err(|e| JoshuaError::ModelLoad(format!("mmap of GGUF file failed: {e}")))
+}
+
+/// The system's default huge-page size in bytes, read from `/proc/meminfo`
+/// (`Hugepagesize:`), falling back to 2 MiB.
+fn default_hugepage_bytes() -> usize {
+    const FALLBACK: usize = 2 * 1024 * 1024;
+    let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") else {
+        return FALLBACK;
+    };
+    for line in meminfo.lines() {
+        if let Some(rest) = line.strip_prefix("Hugepagesize:") {
+            // Format: "Hugepagesize:    2048 kB".
+            let mut it = rest.split_whitespace();
+            if let (Some(kb), Some(_unit)) = (it.next(), it.next()) {
+                if let Ok(kb) = kb.parse::<usize>() {
+                    return kb * 1024;
+                }
+            }
+        }
+    }
+    FALLBACK
+}
+
 /// Walk `dir` and return the first `.gguf` file found.
 fn find_gguf_in_dir(dir: &Path) -> Result<PathBuf> {
     for entry in std::fs::read_dir(dir)? {
@@ -1380,6 +1576,30 @@ fn sample_token(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn page_size_params_are_correct() {
+        assert_eq!(PageSize::TwoMiB.params(), (Some(21), 2 * 1024 * 1024));
+        assert_eq!(PageSize::OneGiB.params(), (Some(30), 1024 * 1024 * 1024));
+        // System default: no size selector, and a sane power-of-two byte size.
+        let (bits, bytes) = PageSize::Default.params();
+        assert_eq!(bits, None);
+        assert!(bytes >= 4096 && bytes.is_power_of_two(), "got {bytes}");
+    }
+
+    #[test]
+    fn default_hugepage_bytes_is_sane() {
+        let bytes = default_hugepage_bytes();
+        assert!(bytes >= 2 * 1024 * 1024 && bytes.is_power_of_two(), "got {bytes}");
+    }
+
+    #[test]
+    fn engine_options_builder() {
+        let o = EngineOptions::with_n_ctx(2048).huge_pages(HugePages::Transparent);
+        assert_eq!(o.n_ctx, 2048);
+        assert_eq!(o.huge_pages, HugePages::Transparent);
+        assert_eq!(EngineOptions::default().huge_pages, HugePages::Off);
+    }
 
     #[test]
     fn in_flight_guard_caps_and_releases() {

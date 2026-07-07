@@ -14,6 +14,7 @@ framework) and [tokenizers](https://github.com/huggingface/tokenizers).
 |---|---|
 | **Pure Rust** | Zero C/C++ dependencies — `cargo build` requires only a Rust toolchain |
 | **mmap loading** | The GGUF file is memory-mapped like llama.cpp: weights page in lazily and stay in the OS page cache |
+| **Huge pages** | Optional transparent (`MADV_HUGEPAGE`) or explicit 2 MiB / 1 GiB (`MAP_HUGETLB`) backing to cut TLB misses on large models |
 | **OpenAI-compatible** | Drop-in replacement for `/v1/chat/completions`, `/v1/embeddings`, `/v1/models` |
 | **Streaming** | Server-Sent Events (SSE) for token-by-token streaming |
 | **GGUF support** | Llama/Mistral/Mixtral, Gemma 1–3, GLM-4, LFM2, Phi-2, Phi-3, Qwen2, Qwen3, Qwen3-MoE |
@@ -264,6 +265,35 @@ curl https://localhost:8080/v1/models
 `--tls-cert` takes a PEM certificate chain and `--tls-key` the matching
 PKCS#8/RSA/SEC1 private key (both flags required together).  Library users
 can call `server::serve_with_state_tls` directly.
+
+---
+
+## Huge pages
+
+Large models thrash the TLB: a 7B Q4 model is ~4 GB, which is two million
+4 KiB pages.  Backing the mapping with huge pages cuts TLB misses.  Select a
+strategy with `--huge-pages` (or `EngineOptions::huge_pages` in the library);
+the huge-page modes are Linux-only and fall back to normal pages elsewhere.
+
+| Mode | Mechanism | Trade-off |
+|---|---|---|
+| `off` (default) | file-backed `mmap`, normal pages | shared via the page cache; no setup |
+| `transparent` | file-backed `mmap` + `MADV_HUGEPAGE` | keeps the shared page cache; best-effort, kernel picks the size (usually 2 MiB); no setup |
+| `2mb` / `1gb` / `huge` | model copied into an anonymous `MAP_HUGETLB` mapping | guarantees the page size, but uses **private** RAM (no shared page cache) and needs a preallocated pool |
+
+```bash
+# Best-effort transparent huge pages — safe to enable anywhere:
+joshua serve --model m.gguf --huge-pages transparent
+
+# Explicit 1 GiB pages (reserve the pool first):
+sudo sysctl vm.nr_hugepages=$(( 5 * 1024 / 2 ))   # ~5 GiB of 2 MiB pages
+joshua serve --model m.gguf --huge-pages 2mb
+```
+
+`transparent` is the safe default to try: it preserves Joshua's shared-page-cache
+model and simply does nothing if the kernel can't honour it.  The explicit
+modes give you a guaranteed page size at the cost of a private in-RAM copy and
+a preconfigured hugepage pool (`vm.nr_hugepages`, or `hugeadm` for 1 GiB pages).
 
 ---
 
