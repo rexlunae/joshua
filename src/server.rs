@@ -87,7 +87,7 @@ async fn require_api_key(State(state): State<AppState>, req: Request, next: Next
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Bearer "));
-        if !provided.is_some_and(|key| constant_time_eq(key.as_bytes(), expected.as_bytes())) {
+        if !provided.is_some_and(|key| api_keys_match(key.as_bytes(), expected.as_bytes())) {
             let body = ErrorResponse::new(
                 "invalid or missing API key — pass the key as 'Authorization: Bearer <key>'",
                 "invalid_request_error",
@@ -98,9 +98,19 @@ async fn require_api_key(State(state): State<AppState>, req: Request, next: Next
     next.run(req).await
 }
 
-/// Byte-wise equality whose runtime depends only on the input lengths.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+/// Byte-wise equality whose runtime depends only on the length of the
+/// caller-supplied `provided` key, revealing nothing about `expected` —
+/// not even its length.  On a mismatch the whole loop still runs, cycling
+/// through `expected` so no early exit correlates with the secret.
+fn api_keys_match(provided: &[u8], expected: &[u8]) -> bool {
+    if expected.is_empty() {
+        return provided.is_empty();
+    }
+    let mut diff = provided.len() ^ expected.len();
+    for (i, &byte) in provided.iter().enumerate() {
+        diff |= usize::from(byte ^ expected[i % expected.len()]);
+    }
+    diff == 0
 }
 
 /// Start the server on `addr` (e.g. `"0.0.0.0:8080"`) with just a chat
@@ -583,5 +593,28 @@ impl From<JoshuaError> for ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         (self.status, Json(self.body)).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::api_keys_match;
+
+    #[test]
+    fn api_keys_match_accepts_only_the_exact_key() {
+        assert!(api_keys_match(b"sekret", b"sekret"));
+        assert!(!api_keys_match(b"Sekret", b"sekret"));
+        // Shorter, longer, and cyclic-repeat inputs all fail: a provided key
+        // that is `expected` repeated would zero every byte XOR, so the
+        // length term must reject it.
+        assert!(!api_keys_match(b"sek", b"sekret"));
+        assert!(!api_keys_match(b"sekretsekret", b"sekret"));
+        assert!(!api_keys_match(b"", b"sekret"));
+    }
+
+    #[test]
+    fn api_keys_match_handles_an_empty_expected_key() {
+        assert!(api_keys_match(b"", b""));
+        assert!(!api_keys_match(b"a", b""));
     }
 }
