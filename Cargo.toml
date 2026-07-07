@@ -66,6 +66,10 @@ minijinja-contrib = { version = "2", features = ["pycompat"] }
 # Sampling
 rand = "0.8"
 
+# API-key comparison (pure Rust SHA-256): keys are hashed before comparing
+# so the check is fixed-length and leaks nothing through timing.
+sha2 = "0.10"
+
 # HTTP server & utilities
 axum = { version = "0.8", features = ["json", "macros", "multipart"] }
 tokio = { version = "1", features = ["full"] }
