@@ -98,19 +98,23 @@ async fn require_api_key(State(state): State<AppState>, req: Request, next: Next
     next.run(req).await
 }
 
-/// Byte-wise equality whose runtime depends only on the length of the
-/// caller-supplied `provided` key, revealing nothing about `expected` —
-/// not even its length.  On a mismatch the whole loop still runs, cycling
-/// through `expected` so no early exit correlates with the secret.
+/// Key equality that leaks nothing about the configured key through timing.
+///
+/// Both keys are hashed first, so the comparison always runs over two
+/// fixed-size digests regardless of either key's length or contents; the
+/// digests are then compared with a branch-free fold.  Timing can therefore
+/// only reveal information about SHA-256 digests, which is useless without
+/// inverting the hash.
 fn api_keys_match(provided: &[u8], expected: &[u8]) -> bool {
-    if expected.is_empty() {
-        return provided.is_empty();
-    }
-    let mut diff = provided.len() ^ expected.len();
-    for (i, &byte) in provided.iter().enumerate() {
-        diff |= usize::from(byte ^ expected[i % expected.len()]);
-    }
-    diff == 0
+    use sha2::{Digest, Sha256};
+
+    let provided = Sha256::digest(provided);
+    let expected = Sha256::digest(expected);
+    provided
+        .iter()
+        .zip(expected.iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
 }
 
 /// Start the server on `addr` (e.g. `"0.0.0.0:8080"`) with just a chat
@@ -604,9 +608,6 @@ mod tests {
     fn api_keys_match_accepts_only_the_exact_key() {
         assert!(api_keys_match(b"sekret", b"sekret"));
         assert!(!api_keys_match(b"Sekret", b"sekret"));
-        // Shorter, longer, and cyclic-repeat inputs all fail: a provided key
-        // that is `expected` repeated would zero every byte XOR, so the
-        // length term must reject it.
         assert!(!api_keys_match(b"sek", b"sekret"));
         assert!(!api_keys_match(b"sekretsekret", b"sekret"));
         assert!(!api_keys_match(b"", b"sekret"));
