@@ -58,7 +58,7 @@
 use std::fs::File;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -111,6 +111,18 @@ pub struct Engine {
     kv_reuses: AtomicU64,
     /// Optional NPU backend with its circuit breaker.
     npu: Option<NpuState>,
+    /// Number of generations/embeddings currently executing.
+    ///
+    /// Each in-flight request holds a full model instance (weights + KV
+    /// cache), so this is capped at `max_concurrency` to bound peak memory;
+    /// requests over the cap are rejected rather than piling up unbounded
+    /// heavyweight model loads.
+    in_flight: AtomicUsize,
+    /// Maximum concurrent generations/embeddings.
+    max_concurrency: usize,
+    /// Upper bound on tokens generated per request, regardless of the
+    /// client-supplied `max_tokens`.
+    max_output_tokens: u32,
     /// Stem of the model file (used as the model identifier in API responses).
     model_name: String,
     /// Context-window size in tokens.
@@ -134,6 +146,39 @@ const MAX_CACHED_MODELS: usize = 2;
 /// Consecutive NPU failures before the backend is disabled for the rest of
 /// the engine's lifetime (all requests then run on the candle path).
 const NPU_MAX_FAILURES: u32 = 3;
+
+/// Default ceiling on tokens generated per request (independent of the
+/// client-supplied `max_tokens`), bounding single-request CPU/time cost.
+const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 4096;
+
+/// RAII permit for one in-flight generation/embedding.
+///
+/// Increments the engine's in-flight counter on acquisition (rejecting once
+/// `max_concurrency` is reached) and decrements it on drop, so the count is
+/// released even if generation errors or panics.
+struct InFlightGuard<'a> {
+    counter: &'a AtomicUsize,
+}
+
+impl<'a> InFlightGuard<'a> {
+    fn acquire(counter: &'a AtomicUsize, max: usize) -> Result<Self> {
+        // Reserve a slot optimistically, then bail out if we blew the cap.
+        let prev = counter.fetch_add(1, Ordering::AcqRel);
+        if prev >= max {
+            counter.fetch_sub(1, Ordering::AcqRel);
+            return Err(JoshuaError::Overloaded(format!(
+                "at capacity ({max} concurrent requests); retry shortly"
+            )));
+        }
+        Ok(Self { counter })
+    }
+}
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 /// A parked generation session whose state holds exactly `tokens`.
 struct CachedModel {
@@ -324,6 +369,14 @@ impl Engine {
             device
         );
 
+        // Default the concurrency cap to the machine's parallelism: running
+        // more heavyweight generations at once than the CPU can serve gains
+        // no throughput and only multiplies peak memory.  Operators tune it
+        // with `with_max_concurrency`.
+        let max_concurrency = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+
         Ok(Self {
             model_path: gguf_path,
             mmap: Arc::new(mmap),
@@ -334,10 +387,30 @@ impl Engine {
             model_cache: Mutex::new(Vec::new()),
             kv_reuses: AtomicU64::new(0),
             npu: None,
+            in_flight: AtomicUsize::new(0),
+            max_concurrency,
+            max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             model_name,
             n_ctx,
             device,
         })
+    }
+
+    /// Set the maximum number of concurrent generations/embeddings.
+    ///
+    /// Requests beyond this cap are rejected with [`JoshuaError::Overloaded`]
+    /// (HTTP 503) rather than queued, bounding peak memory from concurrent
+    /// model instances.  Values below 1 are treated as 1.
+    pub fn with_max_concurrency(mut self, max: usize) -> Self {
+        self.max_concurrency = max.max(1);
+        self
+    }
+
+    /// Set the hard ceiling on tokens generated per request, applied on top
+    /// of the client-supplied `max_tokens`.  Values below 1 are treated as 1.
+    pub fn with_max_output_tokens(mut self, max: u32) -> Self {
+        self.max_output_tokens = max.max(1);
+        self
     }
 
     /// Pick the compute device.
@@ -490,6 +563,13 @@ impl Engine {
         images: &[Vec<u8>],
         options: &GenerationOptions,
     ) -> Result<(String, UsageInfo, f64, f64)> {
+        // Bound concurrent heavyweight generations before doing any work.
+        let _permit = InFlightGuard::acquire(&self.in_flight, self.max_concurrency)?;
+        // The plugin owns tokenisation, so the prompt length is unknown here;
+        // clamp only to the server ceiling. The decode loop's in-context
+        // guard bounds the total length.
+        let options = &self.clamp_options(options, None);
+
         // Acquire an NPU session (never by token prefix — the plugin owns
         // tokenisation here, so no history to match).
         let (mut session, _) = self.acquire_session(&[], true)?;
@@ -557,12 +637,29 @@ impl Engine {
     /// Shared completion path.  `add_special_tokens` controls whether the
     /// tokenizer wraps the prompt with its special tokens (disabled for
     /// template-rendered prompts, which already include them).
+    /// Clamp a request's generation length to the server's `max_output_tokens`
+    /// ceiling and, when the prompt length is known, the remaining context
+    /// window — so a client-supplied `max_tokens` can't force unbounded work.
+    fn clamp_options(&self, options: &GenerationOptions, prompt_len: Option<usize>) -> GenerationOptions {
+        let mut clamped = options.clone();
+        let mut cap = clamped.max_tokens.min(self.max_output_tokens);
+        if let Some(n_prompt) = prompt_len {
+            let remaining = (self.n_ctx as usize).saturating_sub(n_prompt).max(1) as u32;
+            cap = cap.min(remaining);
+        }
+        clamped.max_tokens = cap;
+        clamped
+    }
+
     fn complete_with(
         &self,
         prompt: &str,
         add_special_tokens: bool,
         options: &GenerationOptions,
     ) -> Result<(String, UsageInfo, f64, f64)> {
+        // Bound concurrent heavyweight generations before doing any work.
+        let _permit = InFlightGuard::acquire(&self.in_flight, self.max_concurrency)?;
+
         // ── Tokenise ─────────────────────────────────────────────────────────
         let encoding = self
             .tokenizer
@@ -574,6 +671,10 @@ impl Engine {
         if n_prompt >= self.n_ctx as usize {
             return Err(JoshuaError::PromptTooLong(n_prompt, self.n_ctx as usize));
         }
+
+        // Clamp the client-supplied generation length to the server ceiling
+        // and the remaining context window.
+        let options = &self.clamp_options(options, Some(n_prompt));
 
         // ── Acquire a session, generate, retry on CPU if the NPU fails ──────
         // Prefer a pooled instance whose state already covers a prefix of
@@ -725,6 +826,11 @@ impl Engine {
             if n_decoded >= options.max_tokens {
                 break;
             }
+            // Never generate past the context window, regardless of
+            // max_tokens — bounds KV-cache growth and matches the RoPE tables.
+            if n_cur >= self.n_ctx as usize {
+                break;
+            }
 
             let next_token = sample_token(&logits_vec, options, &mut rng, &recent_tokens)?;
 
@@ -789,6 +895,8 @@ impl Engine {
     /// Like [`Engine::embed`], additionally returning the total number of
     /// input tokens processed.
     pub fn embed_with_usage(&self, texts: &[String]) -> Result<(Vec<Vec<f32>>, u32)> {
+        // Embeddings also load/hold a model instance — bound concurrency.
+        let _permit = InFlightGuard::acquire(&self.in_flight, self.max_concurrency)?;
         let model = self.embedding_model()?;
         let mut vectors = Vec::with_capacity(texts.len());
         let mut total_tokens: u32 = 0;
@@ -812,10 +920,13 @@ impl Engine {
 
     /// Get (building on first use) the shared embedding model.
     fn embedding_model(&self) -> Result<Arc<EmbeddingModel>> {
+        // Recover from poisoning: the slot holds an `Arc<EmbeddingModel>`
+        // (immutable once built), so a prior panic can't have left it
+        // inconsistent, and failing permanently would break all embeddings.
         let mut slot = self
             .embed_model
             .lock()
-            .map_err(|e| JoshuaError::Inference(format!("embed model lock poisoned: {e}")))?;
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(model) = slot.as_ref() {
             return Ok(Arc::clone(model));
         }
@@ -880,7 +991,8 @@ impl Engine {
     ) -> Result<(GenSession, usize)> {
         let want_npu = allow_npu && self.npu.as_ref().is_some_and(|n| n.usable());
 
-        if let Ok(mut pool) = self.model_cache.lock() {
+        {
+            let mut pool = self.model_pool();
             // Only reuse sessions of the kind this request will run on —
             // mixing kinds mid-conversation would splice numerically
             // different logits into one generation.
@@ -930,9 +1042,21 @@ impl Engine {
         Ok((GenSession::Candle(Box::new(self.load_model()?)), 0))
     }
 
+    /// Lock the warm-model pool, recovering the guard if a previous holder
+    /// panicked.  A poisoned lock must not permanently disable reuse: the
+    /// cached instances are plain data, and silently treating poison as
+    /// "no pool" would force a fresh full model load on every subsequent
+    /// request (a memory-amplifying, silent degradation).
+    fn model_pool(&self) -> std::sync::MutexGuard<'_, Vec<CachedModel>> {
+        self.model_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// Return a finished session (state = `tokens`) to the pool.
     fn release_model(&self, session: GenSession, tokens: Vec<u32>) {
-        if let Ok(mut pool) = self.model_cache.lock() {
+        {
+            let mut pool = self.model_pool();
             pool.push(CachedModel { session, tokens });
             // Evict oldest beyond the cap.
             while pool.len() > MAX_CACHED_MODELS {
@@ -992,24 +1116,41 @@ fn resolve_message_media(messages: &[ChatMessage]) -> Result<(Vec<ChatMessage>, 
     Ok((marked, images))
 }
 
-/// Load image bytes from a `data:` URL or a local file path.
+/// Maximum size of a decoded inline image, as a defence-in-depth cap on
+/// top of the HTTP body limit.  16 MiB comfortably covers any real photo.
+const MAX_IMAGE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Decode image bytes from a base64 `data:` URL.
+///
+/// Only `data:` URLs are accepted.  Filesystem paths are deliberately **not**
+/// read: the image field of a chat message is attacker-controlled over the
+/// HTTP API, so honouring a path there would let an unauthenticated client
+/// make the server open arbitrary local files (information disclosure, plus
+/// denial of service via `/dev/zero`, FIFOs, or huge files).  Remote URLs are
+/// not fetched either (SSRF); callers must inline the image as a data URL,
+/// which is exactly what OpenAI-compatible vision clients already send.
 fn load_image_bytes(source: &str) -> Result<Vec<u8>> {
-    if let Some(rest) = source.strip_prefix("data:") {
-        let b64 = rest.split_once("base64,").map(|(_, b)| b).ok_or_else(|| {
-            JoshuaError::InvalidRequest("only base64 data: URLs are supported".to_string())
-        })?;
-        use base64::Engine as _;
-        return base64::engine::general_purpose::STANDARD
-            .decode(b64.trim())
-            .map_err(|e| JoshuaError::InvalidRequest(format!("invalid base64 image data: {e}")));
-    }
-    if source.starts_with("http://") || source.starts_with("https://") {
+    let Some(rest) = source.strip_prefix("data:") else {
         return Err(JoshuaError::InvalidRequest(
-            "remote image URLs are not fetched — send a data: URL or a local path".to_string(),
+            "image sources must be inline base64 `data:` URLs; \
+             filesystem paths and remote URLs are not accepted"
+                .to_string(),
         ));
+    };
+    let b64 = rest.split_once("base64,").map(|(_, b)| b).ok_or_else(|| {
+        JoshuaError::InvalidRequest("only base64 data: URLs are supported".to_string())
+    })?;
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64.trim())
+        .map_err(|e| JoshuaError::InvalidRequest(format!("invalid base64 image data: {e}")))?;
+    if bytes.len() > MAX_IMAGE_BYTES {
+        return Err(JoshuaError::InvalidRequest(format!(
+            "image is {} bytes, exceeding the {MAX_IMAGE_BYTES}-byte limit",
+            bytes.len()
+        )));
     }
-    std::fs::read(source)
-        .map_err(|e| JoshuaError::InvalidRequest(format!("cannot read image {source:?}: {e}")))
+    Ok(bytes)
 }
 
 // ─── GGUF / tokenizer helpers ─────────────────────────────────────────────────
@@ -1234,5 +1375,49 @@ fn sample_token(
     let dist =
         WeightedIndex::new(&probs).map_err(|e| JoshuaError::Inference(e.to_string()))?;
     Ok(dist.sample(rng) as u32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn in_flight_guard_caps_and_releases() {
+        let counter = AtomicUsize::new(0);
+        // Fill to the cap of 2.
+        let a = InFlightGuard::acquire(&counter, 2).expect("first permit");
+        let b = InFlightGuard::acquire(&counter, 2).expect("second permit");
+        // Third is rejected as Overloaded, and the counter is not left inflated.
+        match InFlightGuard::acquire(&counter, 2) {
+            Err(JoshuaError::Overloaded(_)) => {}
+            Err(e) => panic!("expected Overloaded, got {e:?}"),
+            Ok(_) => panic!("expected Overloaded, got a permit"),
+        }
+        assert_eq!(counter.load(Ordering::Acquire), 2);
+        // Dropping a permit frees a slot for the next request.
+        drop(a);
+        let _c = InFlightGuard::acquire(&counter, 2).expect("permit after release");
+        drop(b);
+        drop(_c);
+        assert_eq!(counter.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn image_sources_must_be_data_urls() {
+        // A valid base64 data URL decodes.
+        let ok = load_image_bytes("data:image/png;base64,AQID").expect("data url");
+        assert_eq!(ok, vec![1, 2, 3]);
+
+        // Filesystem paths are refused without any read attempt — a real
+        // local file (this source tree) must not be opened.
+        let err = load_image_bytes("/etc/passwd").unwrap_err();
+        assert!(matches!(err, JoshuaError::InvalidRequest(_)));
+        assert!(err.to_string().contains("data:"), "got: {err}");
+        assert!(load_image_bytes("src/engine.rs").is_err());
+
+        // Remote URLs are not fetched (no SSRF).
+        assert!(load_image_bytes("http://169.254.169.254/").is_err());
+        assert!(load_image_bytes("https://example.com/x.png").is_err());
+    }
 }
 

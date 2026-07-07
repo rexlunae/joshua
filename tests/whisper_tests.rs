@@ -165,6 +165,42 @@ fn whisper_rejects_unknown_language_and_empty_audio() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// Build a WAV with an arbitrary declared sample rate and bit depth without
+/// writing samples — just enough header to reach the validation checks.
+fn wav_header(sample_rate: u32, bits_per_sample: u16) -> Vec<u8> {
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate,
+        bits_per_sample,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut buf = Cursor::new(Vec::new());
+    {
+        let mut writer = hound::WavWriter::new(&mut buf, spec).unwrap();
+        for _ in 0..64 {
+            writer.write_sample(0i32).unwrap();
+        }
+        writer.finalize().unwrap();
+    }
+    buf.into_inner()
+}
+
+#[test]
+fn wav_rejects_pathological_sample_rate() {
+    // sample_rate = 1 would amplify the resample output ~16000x; rejected by
+    // the minimum-rate floor rather than allocating.
+    let err = wav_to_pcm16k(&wav_header(1, 16)).unwrap_err();
+    assert!(err.to_string().contains("sample rate"), "got: {err}");
+
+    // An absurdly high rate is refused too.
+    let err = wav_to_pcm16k(&wav_header(2_000_000, 16)).unwrap_err();
+    assert!(err.to_string().contains("sample rate"), "got: {err}");
+
+    // Normal speech/audio rates still work.
+    assert!(wav_to_pcm16k(&wav_header(8_000, 16)).is_ok());
+    assert!(wav_to_pcm16k(&wav_header(44_100, 16)).is_ok());
+}
+
 #[test]
 fn wav_ingest_handles_stereo_and_other_rates() {
     // 0.5 s of 24 kHz stereo f32 WAV.

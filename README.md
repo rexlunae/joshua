@@ -209,9 +209,25 @@ curl http://localhost:8080/health
 
 ## Securing the server
 
-By default the server speaks plaintext HTTP with no authentication, which is
-fine on a trusted network or behind a reverse proxy.  To expose it directly,
-turn on one or both of the following.
+The server binds `127.0.0.1` by default and speaks plaintext HTTP with no
+authentication — fine for local use or behind a reverse proxy.  Before
+binding a public interface (`--addr 0.0.0.0:8080`), enable authentication
+and/or TLS below.
+
+### Request limits
+
+Two limits bound how much work a single client can demand, both tunable:
+
+- `--max-concurrency` (default: CPU count) caps simultaneous
+  generations/embeddings; requests over the cap get `503 Service Unavailable`
+  instead of piling up model instances and exhausting memory.  Lower it for
+  large models on small boxes.
+- `--max-output-tokens` (default: 4096) caps generated tokens per request
+  regardless of the client's `max_tokens`, bounding single-request CPU time.
+
+Uploaded audio is limited to ~30 minutes of 16 kHz-equivalent samples, and
+inline image data must be a base64 `data:` URL (filesystem paths and remote
+URLs in image fields are rejected).
 
 ### API-key authentication
 

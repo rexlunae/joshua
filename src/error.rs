@@ -29,6 +29,10 @@ pub enum JoshuaError {
     #[error("Invalid request: {0}")]
     InvalidRequest(String),
 
+    /// The engine is at its concurrency limit and cannot start more work.
+    #[error("Server overloaded: {0}")]
+    Overloaded(String),
+
     /// An I/O error occurred.
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),

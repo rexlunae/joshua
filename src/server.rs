@@ -567,10 +567,13 @@ impl ApiError {
         }
     }
 
+    /// Internal failure: the detail is logged server-side, and the client
+    /// receives only a generic message (no internal strings / panic text).
     fn internal(msg: impl Into<String>) -> Self {
+        tracing::error!("internal error serving request: {}", msg.into());
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
-            body: ErrorResponse::server_error(msg),
+            body: ErrorResponse::server_error("internal error"),
         }
     }
 }
@@ -578,14 +581,25 @@ impl ApiError {
 impl From<JoshuaError> for ApiError {
     fn from(err: JoshuaError) -> Self {
         match &err {
+            // Client errors carry a caller-actionable message and are safe
+            // to echo verbatim.
             JoshuaError::InvalidRequest(_) | JoshuaError::PromptTooLong(_, _) => Self {
                 status: StatusCode::BAD_REQUEST,
                 body: ErrorResponse::invalid_request(err.to_string()),
             },
-            _ => Self {
-                status: StatusCode::INTERNAL_SERVER_ERROR,
-                body: ErrorResponse::server_error(err.to_string()),
+            JoshuaError::Overloaded(_) => Self {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                body: ErrorResponse::new(err.to_string(), "overloaded"),
             },
+            // Everything else may embed internal detail (tokenizer/candle
+            // messages, io errors). Log it server-side; return a generic body.
+            _ => {
+                tracing::error!("internal error serving request: {err}");
+                Self {
+                    status: StatusCode::INTERNAL_SERVER_ERROR,
+                    body: ErrorResponse::server_error("internal error"),
+                }
+            }
         }
     }
 }

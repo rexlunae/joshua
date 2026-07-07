@@ -444,6 +444,109 @@ mod synthetic {
 
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    #[test]
+    fn max_output_tokens_caps_generation() {
+        use joshua::{types::GenerationOptions, Engine};
+
+        let dir = model_dir("max-output-cap");
+        write_tiny_gguf(&dir.join("model.gguf"), "llama");
+
+        // Server ceiling of 2 tokens must override a large per-request value.
+        let engine = Engine::with_n_ctx(&dir, 64)
+            .expect("engine should load")
+            .with_max_output_tokens(2);
+        let options = GenerationOptions {
+            max_tokens: 1000,
+            temperature: 0.0,
+            repetition_penalty: 1.0,
+            ..Default::default()
+        };
+        let (_, usage, _, _) = engine.complete_raw("hello a", &options).unwrap();
+        assert!(
+            usage.completion_tokens <= 2,
+            "generated {} tokens, expected <= 2",
+            usage.completion_tokens
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn concurrency_cap_rejects_when_full() {
+        use joshua::{types::GenerationOptions, ChatMessage, Engine};
+        use std::sync::Arc;
+
+        let dir = model_dir("concurrency-cap");
+        write_tiny_gguf(&dir.join("model.gguf"), "llama");
+
+        // Cap at 1 concurrent generation, then fire two at once; at least one
+        // must be rejected with an overload error rather than both loading.
+        let engine = Arc::new(
+            Engine::with_n_ctx(&dir, 64)
+                .expect("engine should load")
+                .with_max_concurrency(1),
+        );
+        let options = GenerationOptions {
+            max_tokens: 32,
+            temperature: 0.0,
+            repetition_penalty: 1.0,
+            ..Default::default()
+        };
+        let messages = vec![ChatMessage::text("user", "hello a b c d")];
+
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let engine = Arc::clone(&engine);
+                let options = options.clone();
+                let messages = messages.clone();
+                std::thread::spawn(move || engine.complete(&messages, &options))
+            })
+            .collect();
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        let overloaded = results
+            .iter()
+            .any(|r| matches!(r, Err(joshua::JoshuaError::Overloaded(_))));
+        assert!(overloaded, "expected at least one Overloaded rejection");
+        // Every non-rejected result must be a clean success (no corruption).
+        for r in &results {
+            assert!(
+                r.is_ok() || matches!(r, Err(joshua::JoshuaError::Overloaded(_))),
+                "unexpected error: {r:?}"
+            );
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn image_path_sources_are_rejected_without_reading_files() {
+        use joshua::{types::GenerationOptions, ChatMessage, Engine};
+
+        let dir = model_dir("image-path-reject");
+        write_tiny_gguf(&dir.join("model.gguf"), "llama");
+        let engine = Engine::with_n_ctx(&dir, 64).expect("engine should load");
+
+        let mut message = ChatMessage::text("user", "describe this");
+        // A filesystem path in the image field must be refused with the
+        // data:-URL error — NOT read, and NOT the "needs a plugin" error that
+        // would only appear after a file read.
+        message.images = Some(vec!["/etc/passwd".to_string()]);
+
+        let err = engine
+            .complete(&[message], &GenerationOptions::default())
+            .map(|_| ())
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("data:"), "expected data-URL rejection, got: {msg}");
+        assert!(
+            !msg.contains("multimodal"),
+            "file was read before rejection: {msg}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
 
 // ─── Type tests (always run) ──────────────────────────────────────────────────
