@@ -500,6 +500,30 @@ fn test_embedding_input_multiple_to_vec() {
 }
 
 #[test]
+fn test_chat_message_accepts_openai_content_parts() {
+    // Vision clients send content as an array of typed parts.
+    let json = r#"{"role":"user","content":[
+        {"type":"text","text":"What is this?"},
+        {"type":"image_url","image_url":{"url":"data:image/png;base64,AQID"}},
+        {"type":"text","text":"Be specific."}
+    ]}"#;
+    let msg: ChatMessage = serde_json::from_str(json).unwrap();
+    assert_eq!(msg.content, "What is this?\nBe specific.");
+    assert_eq!(
+        msg.images.as_deref(),
+        Some(&["data:image/png;base64,AQID".to_string()][..])
+    );
+
+    // Assistant tool-call turns carry content: null.
+    let json = r#"{"role":"assistant","content":null,
+                   "tool_calls":[{"id":"call_1","type":"function",
+                                  "function":{"name":"f","arguments":"{}"}}]}"#;
+    let msg: ChatMessage = serde_json::from_str(json).unwrap();
+    assert_eq!(msg.content, "");
+    assert!(msg.tool_calls.is_some());
+}
+
+#[test]
 fn test_error_response_variants() {
     use joshua::types::ErrorResponse;
     let e = ErrorResponse::invalid_request("bad param");

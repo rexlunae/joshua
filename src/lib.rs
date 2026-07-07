@@ -28,6 +28,7 @@ pub mod model;
 pub mod npu;
 pub mod server;
 pub mod template;
+pub mod whisper;
 pub mod tools;
 pub mod types;
 

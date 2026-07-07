@@ -13,7 +13,7 @@ crate-type = ["cdylib"]
 # Bindings that vendor and build llama.cpp (requires a C++ toolchain + CMake;
 # this crate is deliberately excluded from the workspace default build so the
 # pure-Rust core never compiles C++).
-llama-cpp-2 = "0.1.151"
+llama-cpp-2 = { version = "0.1.151", features = ["mtmd"] }
 
 [features]
 default = []

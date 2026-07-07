@@ -23,6 +23,8 @@ framework) and [tokenizers](https://github.com/huggingface/tokenizers).
 | **KV-cache reuse** | Multi-turn requests continue from a warm model pool and prefill only the new suffix |
 | **GPU (optional)** | `--features cuda` or `metal` route inference through candle's GPU backends |
 | **NPU / llama.cpp interop (optional)** | Vendor plugins run in a crash-isolated shim process; a llama.cpp adapter brings every ggml backend (Hexagon NPU, CANN, CUDA, Vulkan, …) |
+| **Vision (optional)** | OpenAI-style image messages routed through llama.cpp's `mtmd` (Qwen2.5-VL, Gemma 3, LLaVA, …) via the same isolated plugin |
+| **Speech-to-text** | Whisper transcription in pure Rust: `/v1/audio/transcriptions` + `joshua transcribe` |
 | **Sampling** | Temperature, top-k, min-p, top-p (nucleus), greedy — all in Rust |
 
 ---
@@ -176,6 +178,18 @@ curl http://localhost:8080/v1/embeddings \
 > architectures: `llama` (e5-mistral, SFR-Embedding), `qwen2` (gte-Qwen2),
 > and `qwen3` (Qwen3-Embedding).
 
+### `POST /v1/audio/transcriptions`
+
+Mounted when the server is started with `--whisper-model <dir>` (a directory
+holding `model.safetensors` + `config.json` + `tokenizer.json`, e.g. from
+`openai/whisper-tiny`).  Pure-Rust pipeline: WAV in any sample rate/channel
+count → mel spectrogram → greedy decode.
+
+```bash
+curl http://localhost:8080/v1/audio/transcriptions \
+  -F file=@speech.wav -F language=en
+```
+
 ### `GET /v1/models`
 
 ```bash
@@ -273,6 +287,27 @@ joshua serve --model m.gguf --npu-plugin /path/to/libvendor.so
 joshua serve --model m.gguf --npu-plugin /path/to/libvendor.so --npu-in-process
 ```
 
+### Vision / multimodal
+
+Vision rides the same plugin mechanism: an optional fifth ABI symbol,
+`joshua_npu_media_prefill`, lets a plugin tokenise-and-prefill a prompt whose
+`<__media__>` markers correspond to attached images.  The llama.cpp adapter
+implements it with llama.cpp's `mtmd` — covering Qwen2.5-VL, Gemma 3 vision,
+LLaVA, and the rest of its multimodal zoo:
+
+```bash
+# Point the adapter at the model's multimodal projector:
+JOSHUA_LLAMA_MMPROJ=./weights/mmproj.gguf \
+joshua serve --model ./weights/qwen2.5-vl.gguf \
+    --npu-plugin target/release/libjoshua_llamacpp_npu.so
+```
+
+Clients send standard OpenAI vision messages (content parts with
+`image_url` data URLs) or `ChatMessage.images` paths; decoding, sampling,
+streaming, and tool calling work unchanged after the multimodal prefill.
+Requests with images and no media-capable plugin fail fast with a clear
+error.
+
 ### The llama.cpp adapter
 
 No vendor ships Joshua plugins — they ship **llama.cpp/ggml backends**.  The
@@ -315,8 +350,8 @@ candle path on the same weights.
 - [x] Tool / function calling (OpenAI-compatible, Hermes/Mistral/Llama-3 formats)
 - [x] GPU acceleration (`cuda` / `metal` cargo features)
 - [x] KV-cache sharing across requests (warm model pool with prefix reuse)
-- [ ] Vision / multimodal support (needs a quantized vision encoder + projector pipeline)
-- [ ] Speech-to-text (Whisper — candle has the model; needs an audio ingest + mel pipeline)
+- [x] Vision / multimodal support (OpenAI image messages via llama.cpp `mtmd` through the plugin shim)
+- [x] Speech-to-text (Whisper — pure-Rust pipeline, `/v1/audio/transcriptions`)
 - [x] NPU backend architecture (isolated vendor-plugin shim + llama.cpp adapter for Hexagon/CANN/…)
 
 ---

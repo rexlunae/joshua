@@ -39,6 +39,7 @@ use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::LlamaModel;
+use llama_cpp_2::mtmd::{MtmdBitmap, MtmdContext, MtmdContextParams, MtmdInputText};
 use llama_cpp_2::token::LlamaToken;
 
 /// Process-wide llama.cpp runtime (loads ggml backends once).
@@ -54,6 +55,9 @@ fn backend() -> Option<&'static LlamaBackend> {
 /// address) and `context` is declared first so it drops before the model.
 struct LlamaSession {
     context: LlamaContext<'static>,
+    /// Multimodal projector context, when `JOSHUA_LLAMA_MMPROJ` points at an
+    /// mmproj GGUF for this model (enables vision/audio prompts).
+    mtmd: Option<MtmdContext>,
     #[allow(dead_code)]
     model: Box<LlamaModel>,
     n_ctx: u32,
@@ -87,13 +91,72 @@ impl LlamaSession {
             std::mem::transmute::<LlamaContext<'_>, LlamaContext<'static>>(context)
         };
 
+        // Optional multimodal projector (vision/audio) via llama.cpp's mtmd.
+        let mtmd = match std::env::var("JOSHUA_LLAMA_MMPROJ") {
+            Ok(mmproj) if !mmproj.is_empty() => {
+                let params = MtmdContextParams {
+                    media_marker: std::ffi::CString::new(
+                        llama_cpp_2::mtmd::mtmd_default_marker(),
+                    )
+                    .expect("marker has no NUL"),
+                    ..MtmdContextParams::default()
+                };
+                let ctx = MtmdContext::init_from_file(&mmproj, &model, &params)
+                    .map_err(|e| format!("mtmd projector load failed for {mmproj}: {e}"))?;
+                Some(ctx)
+            }
+            _ => None,
+        };
+
         let vocab = model.n_vocab().max(0) as u32;
         Ok(Self {
             context,
+            mtmd,
             model,
             n_ctx,
             vocab,
         })
+    }
+
+    /// Tokenise-and-prefill a multimodal prompt via mtmd; returns positions
+    /// consumed and last-position logits.
+    fn media_prefill(&mut self, prompt: &str, images: &[&[u8]]) -> Result<(u32, Vec<f32>), String> {
+        let Some(mtmd) = &self.mtmd else {
+            return Err(
+                "no multimodal projector loaded — set JOSHUA_LLAMA_MMPROJ to the mmproj GGUF"
+                    .to_string(),
+            );
+        };
+
+        // Fresh sequence: multimodal prefill always starts at position 0.
+        self.context.clear_kv_cache();
+
+        let bitmaps: Vec<MtmdBitmap> = images
+            .iter()
+            .map(|data| {
+                MtmdBitmap::from_buffer(mtmd, data, false)
+                    .map_err(|e| format!("image decode failed: {e}"))
+            })
+            .collect::<Result<_, _>>()?;
+        let bitmap_refs: Vec<&MtmdBitmap> = bitmaps.iter().collect();
+
+        let chunks = mtmd
+            .tokenize(
+                MtmdInputText {
+                    text: prompt.to_string(),
+                    add_special: true,
+                    parse_special: true,
+                },
+                &bitmap_refs,
+            )
+            .map_err(|e| format!("mtmd tokenize failed: {e}"))?;
+
+        let n_past = chunks
+            .eval_chunks(mtmd, &self.context, 0, 0, self.n_ctx.max(1) as i32, true)
+            .map_err(|e| format!("mtmd eval failed: {e}"))?;
+
+        let logits = self.context.get_logits_ith(-1).to_vec();
+        Ok((n_past.max(0) as u32, logits))
     }
 
     fn forward(&mut self, tokens: &[u32], pos: u32) -> Result<Vec<f32>, String> {
@@ -192,6 +255,58 @@ pub unsafe extern "C" fn joshua_npu_forward(
         }
         Err(_) => {
             eprintln!("joshua-llamacpp-npu: panic during forward");
+            -4
+        }
+    }
+}
+
+/// Optional multimodal entry point: tokenise-and-prefill a prompt whose
+/// `<__media__>` markers correspond to `images` (raw encoded bytes), via
+/// llama.cpp's `mtmd`.  Requires `JOSHUA_LLAMA_MMPROJ`.
+///
+/// # Safety
+/// `handle` must come from `joshua_npu_init`; `prompt` must be a valid
+/// NUL-terminated string; `images`/`image_sizes` must be valid for
+/// `n_images` reads; `out_n_past` and `out_logits` must be valid for writes
+/// (`out_logits` for vocab-size floats).
+#[no_mangle]
+pub unsafe extern "C" fn joshua_npu_media_prefill(
+    handle: *mut c_void,
+    prompt: *const c_char,
+    images: *const *const u8,
+    image_sizes: *const u64,
+    n_images: u32,
+    out_n_past: *mut u32,
+    out_logits: *mut f32,
+) -> i32 {
+    if handle.is_null() || prompt.is_null() || out_n_past.is_null() || out_logits.is_null() {
+        return -1;
+    }
+    let session = &mut *(handle as *mut LlamaSession);
+    let Ok(prompt) = CStr::from_ptr(prompt).to_str() else {
+        return -2;
+    };
+    let images: Vec<&[u8]> = (0..n_images as usize)
+        .map(|i| std::slice::from_raw_parts(*images.add(i), *image_sizes.add(i) as usize))
+        .collect();
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        session.media_prefill(prompt, &images)
+    }));
+    match result {
+        Ok(Ok((n_past, logits))) => {
+            *out_n_past = n_past;
+            let out = std::slice::from_raw_parts_mut(out_logits, session.vocab as usize);
+            let n = logits.len().min(out.len());
+            out[..n].copy_from_slice(&logits[..n]);
+            0
+        }
+        Ok(Err(e)) => {
+            eprintln!("joshua-llamacpp-npu: {e}");
+            -3
+        }
+        Err(_) => {
+            eprintln!("joshua-llamacpp-npu: panic during media_prefill");
             -4
         }
     }

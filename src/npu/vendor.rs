@@ -18,6 +18,15 @@ type InitFn = unsafe extern "C" fn(*const c_char, u32, *mut u32, *mut *mut c_voi
 type ForwardFn = unsafe extern "C" fn(*mut c_void, *const u32, u32, u32, *mut f32) -> i32;
 type ResetFn = unsafe extern "C" fn(*mut c_void) -> i32;
 type FreeFn = unsafe extern "C" fn(*mut c_void);
+type MediaPrefillFn = unsafe extern "C" fn(
+    *mut c_void,
+    *const c_char,
+    *const *const u8,
+    *const u64,
+    u32,
+    *mut u32,
+    *mut f32,
+) -> i32;
 
 /// A dynamically loaded vendor plugin.
 pub struct VendorLibrary {
@@ -105,10 +114,16 @@ impl VendorLibrary {
             return Err(format!("NPU plugin {:?} reported a zero vocab", self.path));
         }
         Ok(VendorSession {
+            has_media: self.has_media(),
             lib: Arc::clone(self),
             handle,
             vocab: vocab as usize,
         })
+    }
+
+    /// Whether the plugin exports the optional multimodal entry point.
+    pub fn has_media(&self) -> bool {
+        self.get_raw("joshua_npu_media_prefill").is_ok()
     }
 }
 
@@ -117,6 +132,7 @@ pub struct VendorSession {
     lib: Arc<VendorLibrary>,
     handle: *mut c_void,
     vocab: usize,
+    has_media: bool,
 }
 
 // SAFETY: the raw handle is only ever used through `&mut self`, so it moves
@@ -163,6 +179,54 @@ impl VendorSession {
     /// Vocabulary size.
     pub fn vocab(&self) -> usize {
         self.vocab
+    }
+
+    /// Whether the plugin exports `joshua_npu_media_prefill`.
+    pub fn has_media(&self) -> bool {
+        self.has_media
+    }
+
+    /// Tokenise-and-prefill a multimodal prompt via the optional plugin
+    /// entry point, writing last-position logits into `out`.
+    pub fn media_prefill_into(
+        &mut self,
+        prompt: &str,
+        images: &[Vec<u8>],
+        out: &mut [f32],
+    ) -> std::result::Result<usize, String> {
+        if !self.has_media {
+            return Err("plugin does not export joshua_npu_media_prefill".to_string());
+        }
+        if out.len() != self.vocab {
+            return Err(format!(
+                "logit buffer has {} slots, vocab is {}",
+                out.len(),
+                self.vocab
+            ));
+        }
+        let media_prefill: MediaPrefillFn = self.lib.sym("joshua_npu_media_prefill")?;
+        let cprompt = CString::new(prompt.as_bytes())
+            .map_err(|_| "prompt contains a NUL byte".to_string())?;
+        let ptrs: Vec<*const u8> = images.iter().map(|i| i.as_ptr()).collect();
+        let lens: Vec<u64> = images.iter().map(|i| i.len() as u64).collect();
+        let mut n_past: u32 = 0;
+        // SAFETY: all pointers are valid for the call; image slices outlive
+        // it; `out` has exactly `vocab` slots (checked above).
+        let rc = unsafe {
+            media_prefill(
+                self.handle,
+                cprompt.as_ptr(),
+                ptrs.as_ptr(),
+                lens.as_ptr(),
+                images.len() as u32,
+                &mut n_past,
+                out.as_mut_ptr(),
+            )
+        };
+        if rc != 0 {
+            return Err(format!("NPU plugin media_prefill failed (code {rc})"));
+        }
+        Ok(n_past as usize)
     }
 
     /// Clear the plugin's internal state.
@@ -233,5 +297,19 @@ impl NpuSession for VendorSession {
 
     fn reset(&mut self) -> bool {
         VendorSession::reset(self).is_ok()
+    }
+
+    fn supports_media(&self) -> bool {
+        self.has_media
+    }
+
+    fn media_prefill(
+        &mut self,
+        prompt: &str,
+        images: &[Vec<u8>],
+    ) -> std::result::Result<(usize, Vec<f32>), String> {
+        let mut out = vec![0f32; self.vocab];
+        let n_past = self.media_prefill_into(prompt, images, &mut out)?;
+        Ok((n_past, out))
     }
 }

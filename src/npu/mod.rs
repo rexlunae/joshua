@@ -62,7 +62,7 @@ pub use vendor::InProcessBackend;
 // Internals shared with the `joshua-npu-shim` binary.
 #[doc(hidden)]
 pub mod internal {
-    pub use super::proto::{Request, Response, SHM_LOGITS_CAPACITY};
+    pub use super::proto::{b64_decode, b64_encode, Request, Response, SHM_LOGITS_CAPACITY};
     pub use super::vendor::VendorLibrary;
 }
 
@@ -105,4 +105,37 @@ pub trait NpuSession: Send {
     /// Returns `false` if the session cannot be safely reset (e.g. its shim
     /// process died) — the caller must discard it.
     fn reset(&mut self) -> bool;
+
+    /// Whether this session can prefill multimodal prompts (vision/audio)
+    /// via [`NpuSession::media_prefill`].
+    ///
+    /// Backed by the optional `joshua_npu_media_prefill` plugin symbol; the
+    /// default is text-only.
+    fn supports_media(&self) -> bool {
+        false
+    }
+
+    /// Tokenise-and-prefill a multimodal prompt.
+    ///
+    /// `prompt` is the rendered chat prompt containing one `<__media__>`
+    /// marker per attached media item; `images` are the raw encoded media
+    /// bytes in marker order.  The plugin tokenises the text with its own
+    /// vocabulary (which must match the engine's `tokenizer.json`), embeds
+    /// the media, and evaluates everything into its state starting at
+    /// position 0.
+    ///
+    /// Returns `(n_past, logits)`: the number of positions consumed (text
+    /// tokens plus media embedding positions — pass as `pos` to the next
+    /// [`NpuSession::forward`]) and the last-position logits.
+    fn media_prefill(
+        &mut self,
+        _prompt: &str,
+        _images: &[Vec<u8>],
+    ) -> std::result::Result<(usize, Vec<f32>), String> {
+        Err("this NPU session does not support multimodal input".to_string())
+    }
 }
+
+/// The media marker plugins must recognise in multimodal prompts (matches
+/// llama.cpp's `mtmd` default marker).
+pub const MEDIA_MARKER: &str = "<__media__>";

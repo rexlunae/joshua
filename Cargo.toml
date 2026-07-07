@@ -47,6 +47,12 @@ memmap2 = "0.9"
 # Runtime loading of NPU vendor plugins (thin safe wrapper over dlopen)
 libloading = "0.8"
 
+# WAV decoding for Whisper speech-to-text (pure Rust)
+hound = "3.5"
+
+# Media payload encoding on the NPU shim control pipe (pure Rust)
+base64 = "0.22"
+
 # Chat-template rendering (pure Rust Jinja2 engine).
 # pycompat adds Python string/dict methods (.strip(), .title(), …) that
 # HuggingFace chat templates rely on.
@@ -57,7 +63,7 @@ minijinja-contrib = { version = "2", features = ["pycompat"] }
 rand = "0.8"
 
 # HTTP server & utilities
-axum = { version = "0.8", features = ["json", "macros"] }
+axum = { version = "0.8", features = ["json", "macros", "multipart"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -72,5 +78,9 @@ futures-util = "0.3"
 tokio-stream = "0.1"
 
 [dev-dependencies]
-# Used by integration tests to synthesise tiny GGUF model files.
+# Used by integration tests to synthesise tiny GGUF model files and
+# whisper checkpoints, and to generate WAV fixtures.
 candle-core = "0.11"
+candle-nn = "0.11"
+candle-transformers = "0.11"
+hound = "3.5"

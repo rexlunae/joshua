@@ -6,17 +6,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 // ─── Chat messages ───────────────────────────────────────────────────────────
 
 /// A single message in a chat conversation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Deserialisation accepts both plain-string `content` and OpenAI content
+/// parts (`[{"type":"text",…},{"type":"image_url",…}]`): text parts are
+/// joined and image URLs land in `images`, so multimodal clients work
+/// unchanged.  `content: null` (assistant tool-call turns) becomes `""`.
+#[derive(Debug, Clone, Serialize)]
 pub struct ChatMessage {
     /// The role of the author (`"system"`, `"user"`, `"assistant"`, `"tool"`).
     pub role: String,
     /// The text content of the message.
-    ///
-    /// OpenAI clients send `content: null` on assistant messages that carry
-    /// only tool calls; that deserialises to an empty string here.
-    #[serde(default, deserialize_with = "null_to_empty_string")]
     pub content: String,
-    /// Optional image paths for vision models.
+    /// Attached images: `data:` URLs or local file paths.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub images: Option<Vec<String>>,
     /// Optional author name.
@@ -25,11 +26,81 @@ pub struct ChatMessage {
     /// Tool calls previously emitted by the assistant, passed back verbatim
     /// by clients during multi-turn tool use so chat templates can render
     /// the earlier assistant turn.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<serde_json::Value>,
     /// For `role: "tool"` messages: the ID of the call being answered.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for ChatMessage {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Raw {
+            role: String,
+            #[serde(default)]
+            content: Option<serde_json::Value>,
+            #[serde(default)]
+            images: Option<Vec<String>>,
+            #[serde(default)]
+            name: Option<String>,
+            #[serde(default)]
+            tool_calls: Option<serde_json::Value>,
+            #[serde(default)]
+            tool_call_id: Option<String>,
+        }
+
+        let raw = Raw::deserialize(deserializer)?;
+        let mut images = raw.images.unwrap_or_default();
+        let content = match raw.content {
+            None | Some(serde_json::Value::Null) => String::new(),
+            Some(serde_json::Value::String(s)) => s,
+            Some(serde_json::Value::Array(parts)) => {
+                let mut text = String::new();
+                for part in parts {
+                    match part.get("type").and_then(|t| t.as_str()) {
+                        Some("text") => {
+                            if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
+                                if !text.is_empty() {
+                                    text.push('\n');
+                                }
+                                text.push_str(t);
+                            }
+                        }
+                        Some("image_url") => {
+                            if let Some(url) = part
+                                .get("image_url")
+                                .and_then(|i| i.get("url"))
+                                .and_then(|u| u.as_str())
+                            {
+                                images.push(url.to_string());
+                            }
+                        }
+                        // Unknown part types are ignored rather than rejected.
+                        _ => {}
+                    }
+                }
+                text
+            }
+            Some(other) => {
+                return Err(serde::de::Error::custom(format!(
+                    "message content must be a string or an array of parts, got: {other}"
+                )))
+            }
+        };
+
+        Ok(ChatMessage {
+            role: raw.role,
+            content,
+            images: if images.is_empty() { None } else { Some(images) },
+            name: raw.name,
+            tool_calls: raw.tool_calls,
+            tool_call_id: raw.tool_call_id,
+        })
+    }
 }
 
 impl ChatMessage {
@@ -46,13 +117,6 @@ impl ChatMessage {
     }
 }
 
-/// Deserialise a JSON string, mapping `null` (and a missing field) to `""`.
-fn null_to_empty_string<'de, D>(deserializer: D) -> Result<String, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
-}
 
 // ─── Generation options ───────────────────────────────────────────────────────
 
