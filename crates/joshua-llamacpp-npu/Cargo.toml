@@ -22,3 +22,8 @@ default = []
 cuda = ["llama-cpp-2/cuda"]
 vulkan = ["llama-cpp-2/vulkan"]
 metal = ["llama-cpp-2/metal"]
+# Build llama.cpp with GGML_BACKEND_DL so ggml backends ship as separate
+# `libggml-<name>` modules, and auto-load them at startup. This is the path
+# for NPU backends (Hexagon, CANN): build the backend module for the target
+# device, then let it be discovered at runtime (see load_dynamic_backends).
+dynamic-backends = ["llama-cpp-2/dynamic-backends"]
