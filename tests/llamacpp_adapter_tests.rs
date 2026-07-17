@@ -158,3 +158,66 @@ fn engine_generates_through_llamacpp_plugin() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Numeric oracle for the pure-Rust `deepseek2` (DeepSeek-V2/V3, Kimi-K2)
+/// loader: llama.cpp and Joshua must agree on the logits for the same tiny
+/// GGUF — the MLA attention, sigmoid+bias group-limited MoE routing, and
+/// shared-expert math all cross-checked against the reference implementation.
+#[test]
+fn deepseek2_native_matches_llamacpp() {
+    require_adapter!(plugin);
+
+    let dir = common::model_dir("deepseek2-adapter");
+    let model = dir.join("model.gguf");
+    common::write_tiny_deepseek2_gguf(&model);
+
+    // llama.cpp logits through the isolated shim.
+    let backend = ShimBackend::new(env!("CARGO_BIN_EXE_joshua-npu-shim"), plugin)
+        .init_timeout(Duration::from_secs(120))
+        .forward_timeout(Duration::from_secs(60));
+    let mut session = backend
+        .create_session(&model, 64)
+        .expect("llama.cpp should load the deepseek2 GGUF");
+    let tokens: Vec<u32> = vec![1, 4, 2, 7, 5];
+    let llama_logits = session.forward(&tokens, 0).expect("llama.cpp forward");
+
+    // Joshua's native quantized deepseek2 loader on the same file.
+    let bytes = std::fs::read(&model).unwrap();
+    let mut cursor = std::io::Cursor::new(&bytes[..]);
+    let content = candle_core::quantized::gguf_file::Content::read(&mut cursor).unwrap();
+    let mut native =
+        joshua::model::QuantizedModel::from_gguf(content, &mut cursor, &candle_core::Device::Cpu)
+            .unwrap();
+    let input = candle_core::Tensor::new(tokens.as_slice(), &candle_core::Device::Cpu)
+        .unwrap()
+        .unsqueeze(0)
+        .unwrap();
+    let native_logits: Vec<f32> = native
+        .forward(&input, 0)
+        .unwrap()
+        .squeeze(0)
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+
+    let argmax = |v: &[f32]| {
+        v.iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .unwrap()
+            .0
+    };
+    assert_eq!(
+        argmax(&llama_logits),
+        argmax(&native_logits),
+        "deepseek2 argmax disagrees:\n  llama.cpp: {llama_logits:?}\n  joshua:    {native_logits:?}"
+    );
+    for (i, (a, b)) in llama_logits.iter().zip(&native_logits).enumerate() {
+        assert!(
+            (a - b).abs() < 5e-2,
+            "deepseek2 logit {i} diverges: llama.cpp={a} joshua={b}"
+        );
+    }
+
+    std::fs::remove_dir_all(&dir).ok();
+}

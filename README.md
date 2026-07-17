@@ -17,7 +17,7 @@ framework) and [tokenizers](https://github.com/huggingface/tokenizers).
 | **Huge pages** | Optional transparent (`MADV_HUGEPAGE`) or explicit 2 MiB / 1 GiB (`MAP_HUGETLB`) backing to cut TLB misses on large models |
 | **OpenAI-compatible** | Drop-in replacement for `/v1/chat/completions`, `/v1/embeddings`, `/v1/models` |
 | **Streaming** | Server-Sent Events (SSE) for token-by-token streaming |
-| **GGUF support** | Llama/Mistral/Mixtral, Gemma 1–3, GLM-4, LFM2, Phi-2, Phi-3, Qwen2, Qwen3, Qwen3-MoE |
+| **GGUF support** | Llama/Mistral/Mixtral, Gemma 1–3, GLM-4, LFM2, Phi-2, Phi-3, Qwen2, Qwen3, Qwen3-MoE, DeepSeek-V2/V3, Kimi-K2 |
 | **Chat templates** | Renders the model's own `tokenizer.chat_template` from the GGUF (Jinja via pure-Rust minijinja); ChatML fallback |
 | **Tool calling** | OpenAI-compatible `tools` / `tool_calls`, parsing Hermes/Qwen, Mistral, and Llama-3 call formats |
 | **Embeddings** | Dense sentence embeddings for llama / qwen2 / qwen3 embedding models, with GGUF pooling metadata |
@@ -339,6 +339,15 @@ the matching pure-Rust candle loader.  Currently supported architectures:
 | `qwen2` | Qwen1.5, Qwen2, Qwen2.5 |
 | `qwen3` | Qwen3 (dense) |
 | `qwen3moe` | Qwen3 mixture-of-experts |
+| `deepseek2` | DeepSeek-V2, DeepSeek-V3, **Kimi-K2** (MLA attention + fine-grained MoE) |
+
+The `deepseek2` loader is Joshua's own (candle has no quantized DeepSeek
+path). It implements Multi-head Latent Attention with Q/KV LoRA, DeepSeek-V3 /
+Kimi-K2 sigmoid-with-bias group-limited expert routing, shared experts, and
+YaRN RoPE — and keeps the experts **quantized** (a 1 T-parameter MoE keeps its
+on-disk footprint instead of exploding to f32 in RAM). Both the legacy
+combined (`attn_kv_b`) and modern MLA-split (`attn_k_b`/`attn_v_b`) GGUF
+encodings load, and its logits are cross-checked against llama.cpp.
 
 Example models:
 
@@ -348,9 +357,10 @@ Example models:
 - `microsoft/Phi-3-mini-4k-instruct`
 - `mistralai/Mistral-7B-Instruct-v0.3`
 - `THUDM/GLM-4-9B-0414`
+- `deepseek-ai/DeepSeek-V2-Lite`, `moonshotai/Kimi-K2-Instruct` (as GGUF)
 
 Every other architecture name in llama.cpp's registry (Mamba, RWKV, GPT-2,
-DeepSeek, Granite, OLMo, StarCoder2, and ~70 more) is recognised at load time
+DeepSeek-V1, Granite, OLMo, StarCoder2, and ~70 more) is recognised at load time
 and rejected with an error that names the architecture and lists what is
 supported — so an unsupported model fails fast with a clear message instead
 of a cryptic missing-tensor error.  Coverage grows as candle gains loaders;

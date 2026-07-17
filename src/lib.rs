@@ -25,6 +25,7 @@ pub mod embedding;
 pub mod engine;
 pub mod error;
 pub mod model;
+pub mod quantized_deepseek2;
 pub mod npu;
 pub mod server;
 pub mod template;

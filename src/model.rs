@@ -15,6 +15,7 @@
 //! | `qwen2`                                         | `quantized_qwen2`
 //! | `qwen3`                                         | `quantized_qwen3`
 //! | `qwen3moe`                                      | `quantized_qwen3_moe`
+//! | `deepseek2` (DeepSeek-V2/V3, Kimi-K2)            | `quantized_deepseek2` (Joshua)
 //!
 //! Every other architecture name in llama.cpp's registry is recognised and
 //! reported with a clear "known but not yet loadable in pure Rust" error, so
@@ -55,6 +56,8 @@ pub enum Architecture {
     Qwen3,
     /// `qwen3moe` — Qwen3 mixture-of-experts models.
     Qwen3Moe,
+    /// `deepseek2` — DeepSeek-V2/V3 and Kimi-K2 (MLA + fine-grained MoE).
+    DeepSeek2,
 }
 
 /// Architecture names understood by llama.cpp but without a pure-Rust
@@ -82,7 +85,6 @@ const KNOWN_UNSUPPORTED_ARCHS: &[&str] = &[
     "dbrx",
     "deci",
     "deepseek",
-    "deepseek2",
     "dots1",
     "dream",
     "ernie4_5",
@@ -168,6 +170,7 @@ impl Architecture {
             "qwen2" => Self::Qwen2,
             "qwen3" => Self::Qwen3,
             "qwen3moe" => Self::Qwen3Moe,
+            "deepseek2" => Self::DeepSeek2,
             _ => return None,
         })
     }
@@ -235,13 +238,14 @@ impl Architecture {
             Self::Qwen2 => "Qwen2 / Qwen2.5",
             Self::Qwen3 => "Qwen3",
             Self::Qwen3Moe => "Qwen3-MoE",
+            Self::DeepSeek2 => "DeepSeek-V2 / DeepSeek-V3 / Kimi-K2",
         }
     }
 
     /// Comma-separated list of supported architecture names for error messages.
     pub fn list_known() -> &'static str {
         "llama (incl. Mistral/Mixtral), gemma, gemma2, gemma3, gemma-embedding, \
-         glm4, lfm2, phi2, phi3, qwen2, qwen3, qwen3moe"
+         glm4, lfm2, phi2, phi3, qwen2, qwen3, qwen3moe, deepseek2"
     }
 }
 
@@ -262,6 +266,7 @@ pub enum QuantizedModel {
     Qwen2(quantized_qwen2::ModelWeights),
     Qwen3(quantized_qwen3::ModelWeights),
     Qwen3Moe(quantized_qwen3_moe::GGUFQWenMoE),
+    DeepSeek2(crate::quantized_deepseek2::ModelWeights),
 }
 
 impl QuantizedModel {
@@ -309,6 +314,10 @@ impl QuantizedModel {
                 quantized_qwen3_moe::GGUFQWenMoE::from_gguf(gguf, reader, device, DType::F32)
                     .map(Self::Qwen3Moe)
             }
+            Architecture::DeepSeek2 => {
+                crate::quantized_deepseek2::ModelWeights::from_gguf(gguf, reader, device)
+                    .map(Self::DeepSeek2)
+            }
         }
     }
 
@@ -331,13 +340,20 @@ impl QuantizedModel {
                 m.clear_kv_cache();
                 true
             }
+            Self::DeepSeek2(m) => {
+                m.clear_kv_cache();
+                true
+            }
             _ => false,
         }
     }
 
     /// Whether [`QuantizedModel::clear_kv_cache`] can reset this instance.
     pub fn supports_kv_clear(&self) -> bool {
-        matches!(self, Self::Llama(_) | Self::Qwen2(_) | Self::Qwen3(_))
+        matches!(
+            self,
+            Self::Llama(_) | Self::Qwen2(_) | Self::Qwen3(_) | Self::DeepSeek2(_)
+        )
     }
 
     /// Unified forward pass.
@@ -356,6 +372,7 @@ impl QuantizedModel {
             Self::Qwen2(m) => m.forward(input, index_pos),
             Self::Qwen3(m) => m.forward(input, index_pos),
             Self::Qwen3Moe(m) => m.forward(input, index_pos),
+            Self::DeepSeek2(m) => m.forward(input, index_pos),
         }
     }
 }
@@ -390,6 +407,7 @@ mod tests {
             ("qwen2", Architecture::Qwen2),
             ("qwen3", Architecture::Qwen3),
             ("qwen3moe", Architecture::Qwen3Moe),
+            ("deepseek2", Architecture::DeepSeek2),
         ] {
             assert_eq!(Architecture::from_name(name), Some(expected), "arch {name}");
             assert_eq!(
@@ -403,7 +421,7 @@ mod tests {
 
     #[test]
     fn known_unsupported_architectures_give_specific_error() {
-        for name in ["mamba", "gpt2", "deepseek2", "rwkv7", "starcoder2"] {
+        for name in ["mamba", "gpt2", "deepseek", "rwkv7", "starcoder2"] {
             assert_eq!(Architecture::from_name(name), None);
             assert!(Architecture::is_known_llama_cpp_arch(name), "arch {name}");
             let err = Architecture::detect(&metadata_with_arch(name)).unwrap_err();
