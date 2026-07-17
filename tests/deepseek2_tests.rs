@@ -116,6 +116,38 @@ fn deepseek2_mla_split_matches_legacy_form() {
 }
 
 #[test]
+fn deepseek2_v2_softmax_group_routing_loads_and_is_consistent() {
+    // DeepSeek-V2 variant: softmax gating, no selection bias, and
+    // group_limited_greedy routing (group score = best single expert). This
+    // exercises the V2 branch of group_limit; llama.cpp can't serve as an
+    // oracle here (it applies the V3 sum-of-top-2 rule to V2 too), so we check
+    // the loader runs and is prefill-vs-incremental consistent.
+    let dir = common::model_dir("deepseek2-v2");
+    let model = dir.join("model.gguf");
+    common::write_tiny_deepseek2_v2_gguf(&model);
+    let tokens = [1u32, 4, 2, 7, 5];
+
+    let mut prefill_model = load(&model);
+    let prefill = logits(&mut prefill_model, &tokens, 0);
+    assert_eq!(prefill.len(), 16);
+    assert!(prefill.iter().all(|v| v.is_finite()), "logits not finite: {prefill:?}");
+
+    let mut step_model = load(&model);
+    let mut last = Vec::new();
+    for (pos, &tok) in tokens.iter().enumerate() {
+        last = logits(&mut step_model, &[tok], pos);
+    }
+    for (i, (a, b)) in prefill.iter().zip(&last).enumerate() {
+        assert!(
+            (a - b).abs() < 1e-3,
+            "v2 prefill vs incremental logit {i} diverges: {a} vs {b}"
+        );
+    }
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn deepseek2_kv_cache_clear_allows_reuse() {
     let dir = common::model_dir("deepseek2-reset");
     let model = dir.join("model.gguf");
