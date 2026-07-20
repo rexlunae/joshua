@@ -539,9 +539,19 @@ impl Moe {
         let n_expert = selection.dim(D::Minus1)?;
         let per = n_expert / self.n_group;
         let grouped = selection.reshape((n_tokens, self.n_group, per))?;
-        // Sum of top-2 experts within each group → group score.
-        let top2 = topk_values(&grouped, 2)?; // [n_tokens, n_group, 2]
-        let group_score = top2.sum(D::Minus1)?; // [n_tokens, n_group]
+        // Score each group, then keep the best `topk_group` groups. The scoring
+        // rule differs by model variant (both give [n_tokens, n_group]):
+        //   * DeepSeek-V3 / Kimi-K2 (sigmoid, "noaux_tc"): sum of the group's
+        //     top-2 experts — matches llama.cpp's build_moe_ffn.
+        //   * DeepSeek-V2 (softmax, "group_limited_greedy"): the single best
+        //     expert in the group — matches HF modeling_deepseek.py and
+        //     candle's reference. (llama.cpp applies the V3 sum rule here too,
+        //     so this path intentionally follows the model definition, not
+        //     llama.cpp.)
+        let group_score = match self.gating {
+            Gating::Sigmoid => topk_values(&grouped, 2)?.sum(D::Minus1)?,
+            Gating::Softmax => grouped.max(D::Minus1)?,
+        };
         let group_idx = topk_indices(&group_score, self.topk_group)?; // [n_tokens, topk_group]
         // Mask: 1.0 for selected groups.
         let ones = group_idx.ones_like()?.to_dtype(DType::F32)?;

@@ -252,9 +252,10 @@ pub fn write_tiny_llama_gguf(path: &Path) {
 
 /// Write a tiny `deepseek2` GGUF with the KV up-projection in the legacy
 /// combined `attn_kv_b` form (both Joshua and llama.cpp take the unabsorbed
-/// attention path). See [`write_deepseek2_gguf`].
+/// attention path). DeepSeek-V3 / Kimi-K2 style (sigmoid gating + selection
+/// bias). See [`write_deepseek2_gguf`].
 pub fn write_tiny_deepseek2_gguf(path: &Path) {
-    write_deepseek2_gguf(path, false);
+    write_deepseek2_gguf(path, false, false);
 }
 
 /// Write a tiny `deepseek2` GGUF in the modern MLA-split form (`attn_k_b` /
@@ -263,7 +264,14 @@ pub fn write_tiny_deepseek2_gguf(path: &Path) {
 /// the split tensors; llama.cpp uses its absorbed MLA path — the two are
 /// algebraically identical, so their logits must still agree.
 pub fn write_tiny_deepseek2_mla_gguf(path: &Path) {
-    write_deepseek2_gguf(path, true);
+    write_deepseek2_gguf(path, true, false);
+}
+
+/// Write a tiny DeepSeek-V2-style `deepseek2` GGUF: softmax gating with no
+/// selection bias and `group_limited_greedy` routing (group score = the best
+/// single expert), exercising the V2 branch of the group router.
+pub fn write_tiny_deepseek2_v2_gguf(path: &Path) {
+    write_deepseek2_gguf(path, false, true);
 }
 
 /// Write a tiny but structurally valid `deepseek2` GGUF exercising the full
@@ -271,8 +279,10 @@ pub fn write_tiny_deepseek2_mla_gguf(path: &Path) {
 /// dense layer plus a fine-grained MoE layer, sigmoid gating with a selection
 /// bias, group-limited routing, and a shared expert.  `split_mla` chooses
 /// between the pre-split (`attn_k_b`/`attn_v_b`) and legacy combined
-/// (`attn_kv_b`) KV up-projection encodings.
-pub fn write_deepseek2_gguf(path: &Path, split_mla: bool) {
+/// (`attn_kv_b`) KV up-projection encodings.  `softmax_v2` selects DeepSeek-V2
+/// style routing (softmax gating, no `exp_probs_b` selection bias) instead of
+/// the DeepSeek-V3 / Kimi-K2 default (sigmoid gating with a bias).
+pub fn write_deepseek2_gguf(path: &Path, split_mla: bool, softmax_v2: bool) {
     const VOCAB: usize = 16;
     const EMB: usize = 8;
     const H: usize = 2; // heads
@@ -315,7 +325,8 @@ pub fn write_deepseek2_gguf(path: &Path, split_mla: bool) {
         (key("expert_shared_count"), u32v(1)),
         (key("expert_weights_scale"), f32v(2.5)),
         (key("expert_weights_norm"), gguf_file::Value::Bool(true)),
-        (key("expert_gating_func"), u32v(2)), // sigmoid
+        // 1 = softmax (DeepSeek-V2), 2 = sigmoid (DeepSeek-V3 / Kimi-K2).
+        (key("expert_gating_func"), u32v(if softmax_v2 { 1 } else { 2 })),
         (key("expert_group_count"), u32v(2)),
         (key("expert_group_used_count"), u32v(1)),
         (
@@ -453,9 +464,11 @@ pub fn write_deepseek2_gguf(path: &Path, split_mla: bool) {
             tensors.push((format!("{p}.ffn_up.weight"), qtensor(next(NFF * EMB), &[NFF, EMB])));
             tensors.push((format!("{p}.ffn_down.weight"), qtensor(next(EMB * NFF), &[EMB, NFF])));
         } else {
-            // MoE layer: router (+ bias), routed experts, shared expert.
+            // MoE layer: router (+ bias for V3/Kimi), routed experts, shared expert.
             tensors.push((format!("{p}.ffn_gate_inp.weight"), qtensor(next(NE * EMB), &[NE, EMB])));
-            tensors.push((format!("{p}.exp_probs_b.bias"), qtensor(next(NE), &[NE])));
+            if !softmax_v2 {
+                tensors.push((format!("{p}.exp_probs_b.bias"), qtensor(next(NE), &[NE])));
+            }
             tensors.push((
                 format!("{p}.ffn_gate_exps.weight"),
                 qtensor(next(NE * NFE * EMB), &[NE, NFE, EMB]),
