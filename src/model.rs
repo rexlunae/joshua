@@ -109,6 +109,12 @@ const KNOWN_UNSUPPORTED_ARCHS: &[&str] = &[
     "jais",
     "jamba",
     "jina-bert-v2",
+    // Kimi K3. The architecture primitives (KDA, attention residuals, the
+    // latent MoE) live in `crate::kimi_k3`, but the end-to-end loader is not
+    // finished, so the model is still reported as unsupported rather than
+    // half-loading.
+    "kimi-k3",
+    "kimi-linear",
     "llada",
     "llada-moe",
     "llama4",
