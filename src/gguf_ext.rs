@@ -82,12 +82,22 @@ impl GgufHeader {
             .tensors
             .values()
             .map(|t| t.dtype)
-            .filter(|d| !matches!(d, 0..=15 | 30))
+            .filter(|d| !matches!(d, 0..=3 | 6..=15 | 30))
             .collect();
         out.sort_unstable();
         out.dedup();
         out
     }
+}
+
+/// Reserve for a claimed element count without trusting it.
+///
+/// A header can claim millions of entries in a handful of bytes, so cap the
+/// up-front reservation and let the container grow against data that has
+/// actually been read.
+fn prealloc(claimed: u64) -> usize {
+    const MAX_PREALLOC: u64 = 1024;
+    claimed.min(MAX_PREALLOC) as usize
 }
 
 fn bad(msg: impl std::fmt::Display) -> JoshuaError {
@@ -153,7 +163,7 @@ impl<R: Read + Seek> Rdr<'_, R> {
                 if n > MAX_COUNT {
                     return Err(bad(format!("array of {n} elements is implausible")));
                 }
-                let mut items = Vec::with_capacity(n as usize);
+                let mut items = Vec::with_capacity(prealloc(n));
                 for _ in 0..n {
                     items.push(self.value(elem_ty)?);
                 }
@@ -187,14 +197,18 @@ pub fn read_header<R: Read + Seek>(r: &mut R) -> Result<GgufHeader> {
         return Err(bad("implausible tensor/metadata count"));
     }
 
-    let mut metadata = HashMap::with_capacity(kv_count as usize);
+    // Capacity is deliberately not taken from the header: the count is
+    // attacker-controlled, and reserving for it would let a few-byte file
+    // trigger a gigabyte of allocation before a single entry is read. The
+    // maps grow as real entries arrive.
+    let mut metadata = HashMap::with_capacity(prealloc(kv_count));
     for _ in 0..kv_count {
         let key = rd.string()?;
         let ty = rd.u32()?;
         metadata.insert(key, rd.value(ty)?);
     }
 
-    let mut tensors = HashMap::with_capacity(tensor_count as usize);
+    let mut tensors = HashMap::with_capacity(prealloc(tensor_count));
     for _ in 0..tensor_count {
         let name = rd.string()?;
         let n_dims = rd.u32()?;
@@ -319,6 +333,36 @@ mod tests {
         let bytes = header_bytes(0); // F32
         let h = read_header(&mut Cursor::new(&bytes[..])).unwrap();
         assert!(h.unsupported_by_candle().is_empty());
+    }
+
+    #[test]
+    fn removed_q4_2_q4_3_ids_count_as_unsupported() {
+        // candle's table maps 0..=3, 6..=15 and 30. Ids 4 and 5 are the
+        // withdrawn Q4_2/Q4_3 and hard-fail there, so reporting them as
+        // supported would defeat the point of the diagnostic.
+        for dtype in [4u32, 5] {
+            let bytes = header_bytes(dtype);
+            let h = read_header(&mut Cursor::new(&bytes[..])).unwrap();
+            assert_eq!(
+                h.unsupported_by_candle(),
+                vec![dtype],
+                "dtype {dtype} is rejected by candle and must be reported"
+            );
+            let mut c = Cursor::new(&bytes[..]);
+            assert!(
+                candle_core::quantized::gguf_file::Content::read(&mut c).is_err(),
+                "candle is expected to reject dtype {dtype}"
+            );
+        }
+    }
+
+    #[test]
+    fn implausible_counts_do_not_drive_allocation() {
+        // A tiny header claiming millions of entries must not reserve for them.
+        assert_eq!(prealloc(1 << 24), 1024);
+        assert_eq!(prealloc(u64::MAX), 1024);
+        // Realistic counts are still reserved exactly.
+        assert_eq!(prealloc(37), 37);
     }
 
     #[test]
