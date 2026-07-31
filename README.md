@@ -54,7 +54,11 @@ framework) and [tokenizers](https://github.com/huggingface/tokenizers).
 
 | Tool | Minimum version |
 |---|---|
-| Rust toolchain | 1.75 |
+| Rust toolchain | 1.87 |
+
+The minimum is set by `candle-core` 0.11, which uses `{integer}::is_multiple_of`
+(stabilised in Rust 1.87); the table previously claimed 1.75, which no build
+with this dependency has satisfied.
 
 No CMake, no C++ compiler, no CUDA toolkit required.
 

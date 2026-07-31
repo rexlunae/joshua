@@ -150,6 +150,26 @@ pub struct EngineOptions {
     pub n_ctx: u32,
     /// Physical-memory backing strategy for the model mapping.
     pub huge_pages: HugePages,
+    /// Optimise the mapping for models far larger than RAM.
+    ///
+    /// Normally the loader walks every tensor in file order, so the kernel is
+    /// told to read ahead aggressively.  For a sparse mixture-of-experts model
+    /// that is counter-productive: a given token touches a handful of experts,
+    /// and readahead drags in hundreds of megabytes that are immediately
+    /// evicted.  Setting this swaps the hint to "random access", so pages
+    /// fault in only as weights are genuinely touched.
+    ///
+    /// Only meaningful for architectures whose loaders borrow from the mapping
+    /// (see [`crate::mmap_tensor`]); the readahead hint never affects
+    /// correctness.
+    ///
+    /// This does conflict with [`HugePages::Explicit`], which copies the whole
+    /// model into an anonymous huge-page region up front — the opposite of
+    /// paging in on demand, and impossible for a model larger than RAM.  When
+    /// both are requested this one wins and the huge-page request is ignored
+    /// with a warning; [`HugePages::Transparent`] has no such conflict, since
+    /// it keeps the mapping file-backed.
+    pub lazy_weights: bool,
 }
 
 impl EngineOptions {
@@ -164,6 +184,12 @@ impl EngineOptions {
     /// Select the huge-page strategy.
     pub fn huge_pages(mut self, huge_pages: HugePages) -> Self {
         self.huge_pages = huge_pages;
+        self
+    }
+
+    /// Optimise the mapping for a model much larger than RAM.
+    pub fn lazy_weights(mut self, lazy: bool) -> Self {
+        self.lazy_weights = lazy;
         self
     }
 }
@@ -428,7 +454,7 @@ impl Engine {
             .map_err(|e| JoshuaError::ModelLoad(format!("tokenizer load failed: {e}")))?;
 
         // Map the GGUF file into memory using the configured backing.
-        let mmap = map_model(&gguf_path, options.huge_pages)?;
+        let mmap = map_model(&gguf_path, options.huge_pages, options.lazy_weights)?;
 
         // Read GGUF metadata once to validate the architecture up front and
         // extract EOS token IDs.
@@ -1160,8 +1186,15 @@ impl Engine {
         let mut cursor = Cursor::new(&self.mmap[..]);
         let gguf = gguf_file::Content::read(&mut cursor)
             .map_err(|e| JoshuaError::ModelLoad(format!("GGUF read failed: {e}")))?;
-        QuantizedModel::from_gguf(gguf, &mut cursor, &self.device)
-            .map_err(|e| JoshuaError::ModelLoad(format!("model init failed: {e}")))
+        // Hand the loader the mapping so architectures Joshua implements
+        // itself can borrow weights in place rather than copying them.
+        QuantizedModel::from_gguf_mmap(
+            gguf,
+            &mut cursor,
+            &self.device,
+            Some(Arc::clone(&self.mmap)),
+        )
+        .map_err(|e| JoshuaError::ModelLoad(format!("model init failed: {e}")))
     }
 
     /// Scan `response` for any configured stop sequence and truncate it.
@@ -1248,21 +1281,43 @@ fn load_image_bytes(source: &str) -> Result<Vec<u8>> {
 /// SAFETY (file-backed variants): the mapping is only undefined behaviour if
 /// the file is truncated or rewritten while mapped.  Model files are treated
 /// as immutable once downloaded, matching llama.cpp's own mmap usage.
-fn map_model(path: &Path, huge: HugePages) -> Result<Mmap> {
+fn map_model(path: &Path, huge: HugePages, lazy: bool) -> Result<Mmap> {
     let file = File::open(path)?;
 
     // Explicit huge pages use an anonymous copy; handle separately.
+    //
+    // That copy is read in full up front, which is exactly what `lazy_weights`
+    // exists to avoid — and a caller sets it precisely because the model does
+    // not fit in memory, where an eager copy cannot succeed at all.  Laziness
+    // therefore wins, loudly: silently honouring the huge-page request would
+    // turn "page this in on demand" into an out-of-memory failure.
     if let HugePages::Explicit(size) = huge {
-        return map_model_hugetlb(path, &file, size);
+        if lazy {
+            tracing::warn!(
+                "ignoring the explicit huge-page request: it copies the whole model into \
+                 anonymous memory, which cannot work for a model flagged larger than RAM. \
+                 Using the file-backed mapping so weights page in on demand. Use \
+                 --huge-pages transparent for huge pages that keep the mapping file-backed."
+            );
+        } else {
+            return map_model_hugetlb(path, &file, size);
+        }
     }
 
     let mmap = unsafe { Mmap::map(&file) }
         .map_err(|e| JoshuaError::ModelLoad(format!("mmap of GGUF file failed: {e}")))?;
 
-    // Weight tensors are consumed in file order during a load, so tell the
-    // kernel to read ahead aggressively.  Best effort only.
+    // Weight tensors are normally consumed in file order during a load, so
+    // ask the kernel to read ahead aggressively.  When the caller has flagged
+    // the model as far larger than RAM the access pattern is sparse instead —
+    // a token touches a few experts — and readahead would evict more than it
+    // saves, so ask for random access.  Best effort either way.
     #[cfg(unix)]
-    let _ = mmap.advise(memmap2::Advice::Sequential);
+    let _ = mmap.advise(if lazy {
+        memmap2::Advice::Random
+    } else {
+        memmap2::Advice::Sequential
+    });
 
     if huge == HugePages::Transparent {
         #[cfg(target_os = "linux")]

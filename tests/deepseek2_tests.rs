@@ -148,6 +148,40 @@ fn deepseek2_v2_softmax_group_routing_loads_and_is_consistent() {
 }
 
 #[test]
+fn deepseek2_mmap_borrowed_load_matches_copied_load() {
+    // Loading with a mapping borrows weights (and every MoE expert) in place
+    // instead of copying them onto the heap. It is the same bytes fed to the
+    // same kernels, so the logits must agree exactly — any drift would mean
+    // the borrow is pointing at the wrong offset.
+    let dir = common::model_dir("deepseek2-mmap");
+    let model = dir.join("model.gguf");
+    common::write_tiny_deepseek2_gguf(&model);
+    let tokens = [1u32, 4, 2, 7, 5];
+
+    let copied = logits(&mut load(&model), &tokens, 0);
+
+    let file = std::fs::File::open(&model).unwrap();
+    let mmap = std::sync::Arc::new(unsafe { memmap2::Mmap::map(&file) }.unwrap());
+    let mut cursor = std::io::Cursor::new(&mmap[..]);
+    let content = candle_core::quantized::gguf_file::Content::read(&mut cursor).unwrap();
+    let mut borrowed_model = QuantizedModel::from_gguf_mmap(
+        content,
+        &mut cursor,
+        &Device::Cpu,
+        Some(std::sync::Arc::clone(&mmap)),
+    )
+    .unwrap();
+    let borrowed = logits(&mut borrowed_model, &tokens, 0);
+
+    assert_eq!(copied.len(), borrowed.len());
+    for (i, (a, b)) in copied.iter().zip(&borrowed).enumerate() {
+        assert_eq!(a, b, "mmap-borrowed logit {i} differs from copied: {a} vs {b}");
+    }
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn deepseek2_kv_cache_clear_allows_reuse() {
     let dir = common::model_dir("deepseek2-reset");
     let model = dir.join("model.gguf");
