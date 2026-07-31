@@ -961,7 +961,11 @@ fn split_experts<R: Read + Seek>(
     // and a length — so a layer with hundreds of experts costs almost no
     // memory until tokens actually route to them, at which point the kernel
     // faults in just those pages and can evict them again later.
-    if let Some(mmap) = rd.mmap.clone() {
+    // Borrowed storage is always CPU-resident, so this is only valid when the
+    // model itself runs on the CPU — otherwise the experts would sit in host
+    // memory while activations live on the accelerator. `qtensor_from_mmap`
+    // applies the same guard for ordinary tensors.
+    if let Some(mmap) = rd.mmap.clone().filter(|_| rd.device.is_cpu()) {
         if let Some(info) = rd.ct.tensor_infos.get(name) {
             let block_size = dtype.block_size();
             let per_elems = out * inn;

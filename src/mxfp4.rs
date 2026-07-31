@@ -144,7 +144,12 @@ pub fn matmul_t(
         )));
     }
 
+    // Each weight row is summed a block at a time, so the destination has to
+    // start from zero. Clear it rather than requiring callers to — candle's
+    // own `k_quants::matmul` assigns, and silently accumulating into a reused
+    // buffer would corrupt results with no error.
     let mut decoded = [0f32; QK_MXFP4];
+    dst.fill(0.0);
     for row in 0..n {
         let row_blocks = &rhs[row * blocks_per_row..(row + 1) * blocks_per_row];
         for (b, block) in row_blocks.iter().enumerate() {
@@ -293,6 +298,34 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn matmul_assigns_rather_than_accumulating_into_a_dirty_buffer() {
+        // Reusing an output buffer must give the same answer as a fresh one:
+        // the routine is documented as assigning the product, and candle's
+        // matmul does the same, so a caller following that convention must
+        // not silently get sums of unrelated results.
+        let (m, k, n) = (1usize, 32usize, 2usize);
+        let rhs = vec![
+            BlockMxfp4 {
+                e: 127,
+                qs: [0x21; 16],
+            },
+            BlockMxfp4 {
+                e: 128,
+                qs: [0x34; 16],
+            },
+        ];
+        let lhs: Vec<f32> = (0..k).map(|i| (i % 5) as f32 - 2.0).collect();
+
+        let mut fresh = vec![0f32; m * n];
+        matmul_t((m, k, n), &lhs, &rhs, &mut fresh).unwrap();
+
+        let mut dirty = vec![123.75f32; m * n];
+        matmul_t((m, k, n), &lhs, &rhs, &mut dirty).unwrap();
+
+        assert_eq!(fresh, dirty, "a pre-filled destination must be overwritten");
     }
 
     #[test]
