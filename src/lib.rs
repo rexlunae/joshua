@@ -24,6 +24,9 @@
 pub mod embedding;
 pub mod engine;
 pub mod error;
+pub mod gguf_ext;
+pub mod mmap_tensor;
+pub mod mxfp4;
 pub mod model;
 pub mod quantized_deepseek2;
 pub mod npu;

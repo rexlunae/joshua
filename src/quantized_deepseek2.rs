@@ -660,10 +660,24 @@ struct Reader<R: Read + Seek> {
     ct: gguf_file::Content,
     reader: R,
     device: Device,
+    /// When present, tensors are borrowed in place from this mapping instead
+    /// of being copied onto the heap (see [`crate::mmap_tensor`]).  This is
+    /// what makes a model far larger than RAM loadable: pages fault in only
+    /// as weights are actually touched.
+    mmap: Option<std::sync::Arc<memmap2::Mmap>>,
 }
 
 impl<R: Read + Seek> Reader<R> {
     fn qtensor(&mut self, name: &str) -> Result<QTensor> {
+        if let Some(mmap) = &self.mmap {
+            return crate::mmap_tensor::qtensor_from_mmap(
+                &self.ct,
+                mmap,
+                &mut self.reader,
+                name,
+                &self.device,
+            );
+        }
         self.ct.tensor(&mut self.reader, name, &self.device)
     }
     fn qmatmul(&mut self, name: &str) -> Result<QMatMul> {
@@ -701,6 +715,21 @@ impl ModelWeights {
         reader: &mut R,
         device: &Device,
     ) -> Result<Self> {
+        Self::from_gguf_mmap(ct, reader, device, None)
+    }
+
+    /// Load with weights borrowed in place from `mmap` where possible.
+    ///
+    /// Without a mapping every tensor is copied onto the heap and the whole
+    /// model must fit in RAM.  With one, weights are referenced directly in
+    /// the page cache and fault in on demand — the difference between a
+    /// trillion-parameter MoE being unloadable and merely slow.
+    pub fn from_gguf_mmap<R: Read + Seek>(
+        ct: gguf_file::Content,
+        reader: &mut R,
+        device: &Device,
+        mmap: Option<std::sync::Arc<memmap2::Mmap>>,
+    ) -> Result<Self> {
         let cfg = Config::from_metadata(&ct.metadata)?;
         // The Content owns metadata; move it into our reader together with the
         // underlying file handle (borrowed for the lifetime of the load).
@@ -708,6 +737,7 @@ impl ModelWeights {
             ct,
             reader,
             device: device.clone(),
+            mmap,
         };
 
         let tok_embeddings = rd.f32_tensor("token_embd.weight")?;
@@ -925,6 +955,44 @@ fn split_experts<R: Read + Seek>(
     }
     let (out, inn) = (dims[1], dims[2]);
     let dtype: GgmlDType = qt.dtype();
+
+    // Preferred path: point each expert straight at its own slice of the
+    // mapping.  Building all of them reads nothing — an expert is a pointer
+    // and a length — so a layer with hundreds of experts costs almost no
+    // memory until tokens actually route to them, at which point the kernel
+    // faults in just those pages and can evict them again later.
+    if let Some(mmap) = rd.mmap.clone() {
+        if let Some(info) = rd.ct.tensor_infos.get(name) {
+            let block_size = dtype.block_size();
+            let per_elems = out * inn;
+            if block_size > 0 && per_elems.is_multiple_of(block_size) {
+                let per_bytes = per_elems / block_size * dtype.type_size();
+                let base = rd.ct.tensor_data_offset.saturating_add(info.offset) as usize;
+                let mut borrowed = Vec::with_capacity(n_expert);
+                for e in 0..n_expert {
+                    match crate::mmap_tensor::borrowed_range(
+                        &mmap,
+                        dtype,
+                        base + e * per_bytes,
+                        (out, inn).into(),
+                    )? {
+                        Some(t) => borrowed.push(QMatMul::from_qtensor(t)?),
+                        // Any expert that cannot be borrowed (misalignment,
+                        // truncated file) drops the whole layer to the copying
+                        // path rather than mixing the two.
+                        None => {
+                            borrowed.clear();
+                            break;
+                        }
+                    }
+                }
+                if borrowed.len() == n_expert {
+                    return Ok(borrowed);
+                }
+            }
+        }
+    }
+
     let bytes = qt.data()?;
     if bytes.len() % n_expert != 0 {
         candle_core::bail!(

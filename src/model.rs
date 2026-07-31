@@ -277,6 +277,22 @@ impl QuantizedModel {
         reader: &mut R,
         device: &Device,
     ) -> Result<Self> {
+        Self::from_gguf_mmap(gguf, reader, device, None)
+    }
+
+    /// Load, borrowing weights in place from `mmap` for the architectures
+    /// whose loaders Joshua owns.
+    ///
+    /// candle's own quantized loaders read through the `reader` and copy, so
+    /// for those architectures the mapping is ignored — they are small enough
+    /// that it does not matter.  Joshua's own loaders (currently `deepseek2`)
+    /// borrow, which is what makes the very large MoE models tractable.
+    pub fn from_gguf_mmap<R: Read + Seek>(
+        gguf: gguf_file::Content,
+        reader: &mut R,
+        device: &Device,
+        mmap: Option<std::sync::Arc<memmap2::Mmap>>,
+    ) -> Result<Self> {
         let arch = Architecture::detect(&gguf.metadata).map_err(candle_core::Error::Msg)?;
 
         tracing::info!("Detected model architecture: {}", arch.display_name());
@@ -315,8 +331,10 @@ impl QuantizedModel {
                     .map(Self::Qwen3Moe)
             }
             Architecture::DeepSeek2 => {
-                crate::quantized_deepseek2::ModelWeights::from_gguf(gguf, reader, device)
-                    .map(Self::DeepSeek2)
+                crate::quantized_deepseek2::ModelWeights::from_gguf_mmap(
+                    gguf, reader, device, mmap,
+                )
+                .map(Self::DeepSeek2)
             }
         }
     }
