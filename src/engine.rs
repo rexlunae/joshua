@@ -160,8 +160,15 @@ pub struct EngineOptions {
     /// fault in only as weights are genuinely touched.
     ///
     /// Only meaningful for architectures whose loaders borrow from the mapping
-    /// (see [`crate::mmap_tensor`]); it is a hint either way and never affects
+    /// (see [`crate::mmap_tensor`]); the readahead hint never affects
     /// correctness.
+    ///
+    /// This does conflict with [`HugePages::Explicit`], which copies the whole
+    /// model into an anonymous huge-page region up front — the opposite of
+    /// paging in on demand, and impossible for a model larger than RAM.  When
+    /// both are requested this one wins and the huge-page request is ignored
+    /// with a warning; [`HugePages::Transparent`] has no such conflict, since
+    /// it keeps the mapping file-backed.
     pub lazy_weights: bool,
 }
 
@@ -1278,8 +1285,23 @@ fn map_model(path: &Path, huge: HugePages, lazy: bool) -> Result<Mmap> {
     let file = File::open(path)?;
 
     // Explicit huge pages use an anonymous copy; handle separately.
+    //
+    // That copy is read in full up front, which is exactly what `lazy_weights`
+    // exists to avoid — and a caller sets it precisely because the model does
+    // not fit in memory, where an eager copy cannot succeed at all.  Laziness
+    // therefore wins, loudly: silently honouring the huge-page request would
+    // turn "page this in on demand" into an out-of-memory failure.
     if let HugePages::Explicit(size) = huge {
-        return map_model_hugetlb(path, &file, size);
+        if lazy {
+            tracing::warn!(
+                "ignoring the explicit huge-page request: it copies the whole model into \
+                 anonymous memory, which cannot work for a model flagged larger than RAM. \
+                 Using the file-backed mapping so weights page in on demand. Use \
+                 --huge-pages transparent for huge pages that keep the mapping file-backed."
+            );
+        } else {
+            return map_model_hugetlb(path, &file, size);
+        }
     }
 
     let mmap = unsafe { Mmap::map(&file) }
