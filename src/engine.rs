@@ -247,6 +247,14 @@ pub struct Engine {
     /// Compute device: CUDA or Metal when built with the matching feature
     /// (falling back to CPU if unavailable at runtime), CPU otherwise.
     device: Device,
+    /// Why the candle path cannot load this model, if it cannot.
+    ///
+    /// `Engine` construction succeeds even for architectures candle has no
+    /// loader for (e.g. `deepseek4`) so an NPU backend configured afterwards
+    /// via [`Engine::with_npu_backend`] can still serve the model.  The error
+    /// is surfaced only when the candle path is actually needed — see
+    /// [`Engine::load_model`].
+    arch_error: Option<String>,
 }
 
 // `PathBuf`, `Arc<Mmap>`, `Arc<Tokenizer>`, `Vec<u32>`, `String`, `u32`,
@@ -461,7 +469,17 @@ impl Engine {
         let gguf = gguf_file::Content::read(&mut Cursor::new(&mmap[..]))
             .map_err(|e| JoshuaError::ModelLoad(format!("GGUF read failed: {e}")))?;
 
-        let arch = Architecture::detect(&gguf.metadata).map_err(JoshuaError::ModelLoad)?;
+        // Defer architectures candle cannot load (e.g. `deepseek4`) instead of
+        // failing construction: an NPU backend may still serve them.  The
+        // reason is remembered and returned by `load_model` when the candle
+        // path is actually needed.
+        let (arch, arch_error) = match Architecture::detect(&gguf.metadata) {
+            Ok(arch) => (Some(arch), None),
+            Err(e) => {
+                tracing::warn!("{e} (continuing; an NPU backend may still serve this model)");
+                (None, Some(e))
+            }
+        };
 
         let eos_token_ids = extract_eos_ids(&gguf, &tokenizer);
         let chat_template = extract_chat_template(&gguf, &tokenizer);
@@ -470,7 +488,7 @@ impl Engine {
         tracing::info!(
             "Model '{}' ready (arch={}, ctx={}, eos_ids={:?}, chat_template={}, device={:?})",
             model_name,
-            arch.display_name(),
+            arch.as_ref().map(|a| a.display_name()).unwrap_or("unknown (NPU-only)"),
             n_ctx,
             eos_token_ids,
             if chat_template.is_some() {
@@ -505,6 +523,7 @@ impl Engine {
             model_name,
             n_ctx,
             device,
+            arch_error,
         })
     }
 
@@ -810,6 +829,12 @@ impl Engine {
                 }
                 if session.clear_state() {
                     self.release_model(session, Vec::new());
+                }
+                if self.arch_error.is_some() {
+                    // No candle loader exists for this architecture, so the
+                    // retry could only report "unsupported model" and hide
+                    // the accelerator failure the caller needs to see.
+                    return Err(e);
                 }
                 tracing::warn!("Retrying request on the candle path after NPU failure: {e}");
                 let (mut session, n_reused) = self.acquire_session(&prompt_tokens, false)?;
@@ -1146,6 +1171,15 @@ impl Engine {
                 Ok(session) => return Ok((GenSession::Npu(session), 0)),
                 Err(e) => {
                     npu.record_failure(&npu.backend.name(), &e);
+                    if self.arch_error.is_some() {
+                        // Without a candle loader for this architecture the
+                        // fallback can only report "unsupported model", which
+                        // would mask the real accelerator failure.
+                        return Err(JoshuaError::ModelLoad(format!(
+                            "{} session creation failed: {e}",
+                            npu.backend.name()
+                        )));
+                    }
                     tracing::warn!("NPU session creation failed, using candle path: {e}");
                 }
             }
@@ -1183,6 +1217,20 @@ impl Engine {
     /// The instance starts with an empty KV cache.  Weights are read straight
     /// out of the shared mmap, so reloads involve no disk I/O.
     fn load_model(&self) -> Result<QuantizedModel> {
+        // Unknown-architecture models (e.g. `deepseek4`) can only be served
+        // by an NPU backend; surface the stored detection error when the
+        // candle path is needed instead of half-loading.
+        if let Some(err) = &self.arch_error {
+            let msg = match &self.npu {
+                Some(npu) if !npu.usable() => format!(
+                    "{err}; the {} backend serving this model was disabled after \
+                     {NPU_MAX_FAILURES} failures",
+                    npu.backend.name()
+                ),
+                _ => err.clone(),
+            };
+            return Err(JoshuaError::ModelLoad(msg));
+        }
         let mut cursor = Cursor::new(&self.mmap[..]);
         let gguf = gguf_file::Content::read(&mut cursor)
             .map_err(|e| JoshuaError::ModelLoad(format!("GGUF read failed: {e}")))?;

@@ -426,13 +426,16 @@ mod synthetic {
     }
 
     #[test]
-    fn unsupported_architecture_fails_at_load_with_clear_error() {
-        use joshua::Engine;
+    fn unsupported_architecture_fails_at_request_with_clear_error() {
+        use joshua::{types::GenerationOptions, Engine};
 
         let dir = model_dir("unsupported-arch");
         write_unsupported_gguf(&dir.join("model.gguf"));
 
-        let msg = match Engine::with_n_ctx(&dir, 64) {
+        // Construction succeeds so an NPU backend can still be attached; the
+        // architecture error surfaces when the candle path is needed.
+        let engine = Engine::with_n_ctx(&dir, 64).expect("construction defers the arch error");
+        let msg = match engine.complete_raw("hello", &GenerationOptions::default()) {
             Ok(_) => panic!("mamba arch must be rejected"),
             Err(e) => e.to_string(),
         };

@@ -85,6 +85,10 @@ const KNOWN_UNSUPPORTED_ARCHS: &[&str] = &[
     "dbrx",
     "deci",
     "deepseek",
+    // DeepSeek-V4 (hyper-connections + sliding-window/compressed sparse
+    // attention).  No pure-Rust loader yet — the engine defers it to an NPU
+    // backend until `quantized_deepseek4` lands.
+    "deepseek4",
     "dots1",
     "dream",
     "ernie4_5",
@@ -445,7 +449,7 @@ mod tests {
 
     #[test]
     fn known_unsupported_architectures_give_specific_error() {
-        for name in ["mamba", "gpt2", "deepseek", "rwkv7", "starcoder2"] {
+        for name in ["mamba", "gpt2", "deepseek", "deepseek4", "rwkv7", "starcoder2"] {
             assert_eq!(Architecture::from_name(name), None);
             assert!(Architecture::is_known_llama_cpp_arch(name), "arch {name}");
             let err = Architecture::detect(&metadata_with_arch(name)).unwrap_err();
