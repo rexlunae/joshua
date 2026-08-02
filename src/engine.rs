@@ -830,6 +830,12 @@ impl Engine {
                 if session.clear_state() {
                     self.release_model(session, Vec::new());
                 }
+                if self.arch_error.is_some() {
+                    // No candle loader exists for this architecture, so the
+                    // retry could only report "unsupported model" and hide
+                    // the accelerator failure the caller needs to see.
+                    return Err(e);
+                }
                 tracing::warn!("Retrying request on the candle path after NPU failure: {e}");
                 let (mut session, n_reused) = self.acquire_session(&prompt_tokens, false)?;
                 match self.run_generation(&mut session, &prompt_tokens, n_reused, options) {
@@ -1165,6 +1171,15 @@ impl Engine {
                 Ok(session) => return Ok((GenSession::Npu(session), 0)),
                 Err(e) => {
                     npu.record_failure(&npu.backend.name(), &e);
+                    if self.arch_error.is_some() {
+                        // Without a candle loader for this architecture the
+                        // fallback can only report "unsupported model", which
+                        // would mask the real accelerator failure.
+                        return Err(JoshuaError::ModelLoad(format!(
+                            "{} session creation failed: {e}",
+                            npu.backend.name()
+                        )));
+                    }
                     tracing::warn!("NPU session creation failed, using candle path: {e}");
                 }
             }
@@ -1206,7 +1221,15 @@ impl Engine {
         // by an NPU backend; surface the stored detection error when the
         // candle path is needed instead of half-loading.
         if let Some(err) = &self.arch_error {
-            return Err(JoshuaError::ModelLoad(err.clone()));
+            let msg = match &self.npu {
+                Some(npu) if !npu.usable() => format!(
+                    "{err}; the {} backend serving this model was disabled after \
+                     {NPU_MAX_FAILURES} failures",
+                    npu.backend.name()
+                ),
+                _ => err.clone(),
+            };
+            return Err(JoshuaError::ModelLoad(msg));
         }
         let mut cursor = Cursor::new(&self.mmap[..]);
         let gguf = gguf_file::Content::read(&mut cursor)
