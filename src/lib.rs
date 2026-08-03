@@ -30,6 +30,7 @@ pub mod mmap_tensor;
 pub mod mxfp4;
 pub mod model;
 pub mod quantized_deepseek2;
+pub mod quantized_deepseek4;
 pub mod npu;
 pub mod server;
 pub mod template;

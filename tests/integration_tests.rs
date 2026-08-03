@@ -432,8 +432,12 @@ mod synthetic {
         let dir = model_dir("unsupported-arch");
         write_unsupported_gguf(&dir.join("model.gguf"));
 
-        let msg = match Engine::with_n_ctx(&dir, 64) {
-            Ok(_) => panic!("mamba arch must be rejected"),
+        // PR #17: engine construction defers unknown architectures to a
+        // potential NPU backend instead of failing; the stored detection error
+        // surfaces once the candle path is actually needed (generation).
+        let engine = Engine::with_n_ctx(&dir, 64).expect("construction defers unknown archs");
+        let msg = match engine.complete(&[], &Default::default()) {
+            Ok(_) => panic!("mamba arch must be rejected at generation time"),
             Err(e) => e.to_string(),
         };
         assert!(
