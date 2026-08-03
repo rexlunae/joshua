@@ -539,7 +539,7 @@ fn fast_hadamard(data: &mut [f32]) {
 /// Hadamard rotation applied to the trailing dim of a `[n, d]` tensor.
 fn hadamard_rows(x: &Tensor) -> Result<Tensor> {
     let (n, d) = x.dims2()?;
-    let data: Vec<f32> = x.to_vec1()?;
+    let data: Vec<f32> = x.flatten_all()?.to_vec1()?;
     let mut out = vec![0f32; data.len()];
     let scale = 1.0 / (d as f32).sqrt();
     for (row, chunk) in data.chunks_exact(d).enumerate() {
