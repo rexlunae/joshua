@@ -631,7 +631,8 @@ impl Compressor {
     /// the streaming state.  Returns the newly produced compressed rows
     /// `[n, head_dim]` and their block positions `[n]` (u32), or `None` when no
     /// block boundary was crossed.  Follows the official modeling code: prefill
-    /// compresses whole blocks at once, decode accumulates per token.
+    /// compresses whole blocks at once, decode accumulates per token; both
+    /// branches push `[n, head_dim]` chunks so the tail can concatenate them.
     #[allow(clippy::too_many_arguments)]
     fn forward(
         &self,
@@ -730,7 +731,7 @@ impl Compressor {
                             0,
                         )?;
                         let w = softmax(&sc_state, 0)?;
-                        rows.push((kv_state * w)?.sum(0)?); // [hd]
+                        rows.push((kv_state * w)?.sum_keepdim(0)?); // [1, hd]
                         poss.push((pos / ratio) as u32);
                         // slide the window: current block becomes the previous one
                         state.kv = state.kv.slice_scatter(
@@ -751,7 +752,7 @@ impl Compressor {
                         .slice_scatter(&s.unsqueeze(0)?, 0, pos % ratio)?;
                     if (pos + 1).is_multiple_of(ratio) {
                         let w = softmax(&state.score, 0)?;
-                        rows.push(state.kv.mul(&w)?.sum(0)?); // [hd]
+                        rows.push(state.kv.mul(&w)?.sum_keepdim(0)?); // [1, hd]
                         poss.push((pos / ratio) as u32);
                     }
                 }
@@ -761,7 +762,7 @@ impl Compressor {
         if rows.is_empty() {
             return Ok(None);
         }
-        let mut comp = Tensor::stack(&rows, 0)?; // [n, hd]
+        let mut comp = Tensor::cat(&rows, 0)?; // [n, hd]
         comp = self.norm.forward(&comp)?;
         // RoPE on the trailing rope dims at the compressed positions.
         let rd = self.rope_head_dim;

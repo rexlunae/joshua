@@ -89,10 +89,6 @@ const KNOWN_UNSUPPORTED_ARCHS: &[&str] = &[
     "dbrx",
     "deci",
     "deepseek",
-    // DeepSeek-V4 (hyper-connections + sliding-window/compressed sparse
-    // attention).  No pure-Rust loader yet — the engine defers it to an NPU
-    // backend until `quantized_deepseek4` lands.
-    "deepseek4",
     "dots1",
     "dream",
     "ernie4_5",
