@@ -16,6 +16,7 @@
 //! | `qwen3`                                         | `quantized_qwen3`
 //! | `qwen3moe`                                      | `quantized_qwen3_moe`
 //! | `deepseek2` (DeepSeek-V2/V3, Kimi-K2)            | `quantized_deepseek2` (Joshua)
+//! | `deepseek4` (DeepSeek-V4)                        | `quantized_deepseek4` (Joshua)
 //!
 //! Every other architecture name in llama.cpp's registry is recognised and
 //! reported with a clear "known but not yet loadable in pure Rust" error, so
@@ -58,6 +59,9 @@ pub enum Architecture {
     Qwen3Moe,
     /// `deepseek2` — DeepSeek-V2/V3 and Kimi-K2 (MLA + fine-grained MoE).
     DeepSeek2,
+    /// `deepseek4` — DeepSeek-V4 (sliding-window MLA + KV compression +
+    /// indexer-selected sparse attention + Hyper-Connections).
+    DeepSeek4,
 }
 
 /// Architecture names understood by llama.cpp but without a pure-Rust
@@ -85,10 +89,6 @@ const KNOWN_UNSUPPORTED_ARCHS: &[&str] = &[
     "dbrx",
     "deci",
     "deepseek",
-    // DeepSeek-V4 (hyper-connections + sliding-window/compressed sparse
-    // attention).  No pure-Rust loader yet — the engine defers it to an NPU
-    // backend until `quantized_deepseek4` lands.
-    "deepseek4",
     "dots1",
     "dream",
     "ernie4_5",
@@ -181,6 +181,7 @@ impl Architecture {
             "qwen3" => Self::Qwen3,
             "qwen3moe" => Self::Qwen3Moe,
             "deepseek2" => Self::DeepSeek2,
+            "deepseek4" => Self::DeepSeek4,
             _ => return None,
         })
     }
@@ -249,13 +250,14 @@ impl Architecture {
             Self::Qwen3 => "Qwen3",
             Self::Qwen3Moe => "Qwen3-MoE",
             Self::DeepSeek2 => "DeepSeek-V2 / DeepSeek-V3 / Kimi-K2",
+            Self::DeepSeek4 => "DeepSeek-V4",
         }
     }
 
     /// Comma-separated list of supported architecture names for error messages.
     pub fn list_known() -> &'static str {
         "llama (incl. Mistral/Mixtral), gemma, gemma2, gemma3, gemma-embedding, \
-         glm4, lfm2, phi2, phi3, qwen2, qwen3, qwen3moe, deepseek2"
+         glm4, lfm2, phi2, phi3, qwen2, qwen3, qwen3moe, deepseek2, deepseek4"
     }
 }
 
@@ -277,6 +279,7 @@ pub enum QuantizedModel {
     Qwen3(quantized_qwen3::ModelWeights),
     Qwen3Moe(quantized_qwen3_moe::GGUFQWenMoE),
     DeepSeek2(crate::quantized_deepseek2::ModelWeights),
+    DeepSeek4(crate::quantized_deepseek4::ModelWeights),
 }
 
 impl QuantizedModel {
@@ -346,6 +349,12 @@ impl QuantizedModel {
                 )
                 .map(Self::DeepSeek2)
             }
+            Architecture::DeepSeek4 => {
+                crate::quantized_deepseek4::ModelWeights::from_gguf_mmap(
+                    gguf, reader, device, mmap,
+                )
+                .map(Self::DeepSeek4)
+            }
         }
     }
 
@@ -372,6 +381,10 @@ impl QuantizedModel {
                 m.clear_kv_cache();
                 true
             }
+            Self::DeepSeek4(m) => {
+                m.clear_kv_cache();
+                true
+            }
             _ => false,
         }
     }
@@ -381,6 +394,7 @@ impl QuantizedModel {
         matches!(
             self,
             Self::Llama(_) | Self::Qwen2(_) | Self::Qwen3(_) | Self::DeepSeek2(_)
+                | Self::DeepSeek4(_)
         )
     }
 
@@ -401,6 +415,7 @@ impl QuantizedModel {
             Self::Qwen3(m) => m.forward(input, index_pos),
             Self::Qwen3Moe(m) => m.forward(input, index_pos),
             Self::DeepSeek2(m) => m.forward(input, index_pos),
+            Self::DeepSeek4(m) => m.forward(input, index_pos),
         }
     }
 }
@@ -436,6 +451,7 @@ mod tests {
             ("qwen3", Architecture::Qwen3),
             ("qwen3moe", Architecture::Qwen3Moe),
             ("deepseek2", Architecture::DeepSeek2),
+            ("deepseek4", Architecture::DeepSeek4),
         ] {
             assert_eq!(Architecture::from_name(name), Some(expected), "arch {name}");
             assert_eq!(
@@ -449,7 +465,7 @@ mod tests {
 
     #[test]
     fn known_unsupported_architectures_give_specific_error() {
-        for name in ["mamba", "gpt2", "deepseek", "deepseek4", "rwkv7", "starcoder2"] {
+        for name in ["mamba", "gpt2", "deepseek", "rwkv7", "starcoder2"] {
             assert_eq!(Architecture::from_name(name), None);
             assert!(Architecture::is_known_llama_cpp_arch(name), "arch {name}");
             let err = Architecture::detect(&metadata_with_arch(name)).unwrap_err();
