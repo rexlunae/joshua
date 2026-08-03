@@ -1100,7 +1100,9 @@ impl Attention {
             kv_raw.index_select(&Tensor::from_vec(rows, (win,), dev)?, 0)?
         } else {
             let ring: Vec<u32> = (offset..offset + seq).map(|p| (p % win) as u32).collect();
-            let ridx = Tensor::from_vec(ring, (seq, 1), dev)?.broadcast_as((seq, self.head_dim))?;
+            let ridx = Tensor::from_vec(ring, (seq, 1), dev)?
+                .broadcast_as((seq, self.head_dim))?
+                .contiguous()?;
             swa_prev.scatter(&ridx, &kv_raw, 0)?
         });
 
@@ -1121,7 +1123,8 @@ impl Attention {
                 let comp = kv.comp.as_ref().unwrap();
                 let pidx = poss
                     .unsqueeze(1)?
-                    .broadcast_as((rows.dim(0)?, self.head_dim))?;
+                    .broadcast_as((rows.dim(0)?, self.head_dim))?
+                    .contiguous()?;
                 kv.comp = Some(comp.scatter(&pidx, rows, 0)?);
             }
         }
@@ -1144,7 +1147,8 @@ impl Attention {
                 let lid = kv.lid.as_ref().unwrap();
                 let pidx = poss
                     .unsqueeze(1)?
-                    .broadcast_as((rows.dim(0)?, ix.head_dim))?;
+                    .broadcast_as((rows.dim(0)?, ix.head_dim))?
+                    .contiguous()?;
                 kv.lid = Some(lid.scatter(&pidx, rows, 0)?);
             }
             Some(ix.score(x, &qr, offset, seq, kv.lid.as_ref().unwrap(), &self.rotary)?)
@@ -1162,8 +1166,11 @@ impl Attention {
         let den = e
             .sum_keepdim(D::Minus1)?
             .add(&sink.broadcast_sub(&max)?.exp()?)?; // [seq, h, 1]
-        let num = e.unsqueeze(2)?.broadcast_matmul(&k_all.unsqueeze(1)?)?; // [seq, h, 1, n_kv] @ [seq, 1, n_kv, d] → [seq, h, 1, d]
-        let o = num.broadcast_div(&den.unsqueeze(D::Minus1)?)?.squeeze(2)?; // [seq, h, d]
+
+        // Batched over `seq`; a broadcast_matmul here would materialize the
+        // whole key block once per head.
+        let num = e.contiguous()?.matmul(&k_all)?; // [seq, h, n_kv] @ [seq, n_kv, d] → [seq, h, d]
+        let o = num.broadcast_div(&den)?; // [seq, h, d]
 
         // Derope the output's trailing slice.
         let o4 = o.unsqueeze(0)?.transpose(1, 2)?; // [1, h, seq, d]
