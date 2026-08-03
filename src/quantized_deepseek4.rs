@@ -37,7 +37,7 @@ use std::io::{Read, Seek};
 use std::sync::Arc;
 
 use candle_core::quantized::{gguf_file, GgmlDType, QMatMul, QStorage, QTensor};
-use candle_core::{DType, Device, IndexOp, Module, Result, Tensor, D};
+use candle_core::{DType, Device, Module, Result, Tensor, D};
 use candle_nn::ops::{sigmoid, silu, softmax, softmax_last_dim};
 use candle_transformers::quantized_nn::RmsNorm;
 
@@ -440,16 +440,29 @@ fn hc_split_sinkhorn(
     let n = shape[..shape.len() - 1].iter().product::<usize>();
     let m = mixes.reshape((n, (2 + hc) * hc))?;
 
-    let pre = sigmoid(&((&m.narrow(D::Minus1, 0, hc)? * scale.i(0)?)? + base.narrow(0, 0, hc)?)?)?
-        .affine(1.0, eps)?;
-    let post =
-        (sigmoid(&((&m.narrow(D::Minus1, hc, hc)? * scale.i(1)?)? + base.narrow(0, hc, hc)?)?)?
-            * 2.0)?;
-    let comb0 = (&m.narrow(D::Minus1, 2 * hc, hc * hc)? * scale.i(2)?)?.add(&base.narrow(
-        0,
-        2 * hc,
-        hc * hc,
-    )?)?;
+    let s: Vec<f32> = scale.flatten_all()?.to_vec1()?;
+    if s.len() < 3 {
+        candle_core::bail!(
+            "deepseek4: hc scale tensor has {} entries, expected 3",
+            s.len()
+        );
+    }
+
+    let pre = sigmoid(
+        &m.narrow(D::Minus1, 0, hc)?
+            .affine(s[0] as f64, 0.0)?
+            .broadcast_add(&base.narrow(0, 0, hc)?)?,
+    )?
+    .affine(1.0, eps)?;
+    let post = (sigmoid(
+        &m.narrow(D::Minus1, hc, hc)?
+            .affine(s[1] as f64, 0.0)?
+            .broadcast_add(&base.narrow(0, hc, hc)?)?,
+    )? * 2.0)?;
+    let comb0 = m
+        .narrow(D::Minus1, 2 * hc, hc * hc)?
+        .affine(s[2] as f64, 0.0)?
+        .broadcast_add(&base.narrow(0, 2 * hc, hc * hc)?)?;
     let comb0 = comb0.reshape((n, hc, hc))?;
 
     let mut comb = softmax_last_dim(&comb0)?.affine(1.0, eps)?;
@@ -491,7 +504,7 @@ fn hc_pre(
         .mean_keepdim(D::Minus1)?
         .affine(1.0, eps)?
         .powf(-0.5)?;
-    let mixes = hc_fn.forward(&flat)?.mul(&rsqrt)?; // [b*s, (2+hc)*hc]
+    let mixes = hc_fn.forward(&flat)?.broadcast_mul(&rsqrt)?; // [b*s, (2+hc)*hc]
     let mixes = mixes.reshape((b, s, (2 + hc) * hc))?;
     let mix = hc_split_sinkhorn(&mixes, hc_scale, hc_base, hc, sinkhorn_iters, eps)?;
     // y = sum over hc of pre[..., h] * x[..., h, :]
@@ -536,9 +549,18 @@ fn fast_hadamard(data: &mut [f32]) {
     }
 }
 
-/// Hadamard rotation applied to the trailing dim of a `[n, d]` tensor.
+/// Hadamard rotation applied to the trailing dim of a tensor of any rank; the
+/// input shape is preserved.  The trailing dim must be a power of two, which is
+/// what the fast Walsh–Hadamard transform requires.
 fn hadamard_rows(x: &Tensor) -> Result<Tensor> {
-    let (n, d) = x.dims2()?;
+    let shape = x.shape().dims().to_vec();
+    let d = *shape
+        .last()
+        .ok_or_else(|| candle_core::Error::Msg("deepseek4: hadamard on a rank-0 tensor".into()))?;
+    if !d.is_power_of_two() {
+        candle_core::bail!("deepseek4: Hadamard rotation needs a power-of-two head dim, got {d}");
+    }
+    let n = shape[..shape.len() - 1].iter().product::<usize>();
     let data: Vec<f32> = x.flatten_all()?.to_vec1()?;
     let mut out = vec![0f32; data.len()];
     let scale = 1.0 / (d as f32).sqrt();
@@ -549,7 +571,7 @@ fn hadamard_rows(x: &Tensor) -> Result<Tensor> {
             *o = v * scale;
         }
     }
-    Tensor::from_vec(out, (n, d), x.device())
+    Tensor::from_vec(out, (n, d), x.device())?.reshape(shape)
 }
 
 struct Compressor {
@@ -647,15 +669,16 @@ impl Compressor {
             }
             if nb > 0 {
                 let bkv = kv.narrow(0, 0, cutoff)?.reshape((nb, ratio, coff * hd))?;
-                let bsc = (score
+                let bsc = score
                     .narrow(0, 0, cutoff)?
                     .reshape((nb, ratio, coff * hd))?
-                    + self.ape.unsqueeze(0)?)?;
+                    .broadcast_add(&self.ape.unsqueeze(0)?)?;
                 let (bkv, bsc) = if coff == 2 {
-                    // Overlap transform: rows [0, ratio) come from the previous
-                    // block's first half, rows [ratio, 2*ratio) from this block's
-                    // second half.  Block 0 has no previous window (zero kv / -inf
-                    // scores, so the zero row contributes nothing).
+                    // Overlap transform: the pooled window of block b spans
+                    // `2*ratio` tokens — block b-1 seen through its
+                    // previous-window half, then block b through its own half.
+                    // Block 0 has no previous window (zero kv / -inf scores, so
+                    // those rows contribute nothing).
                     let own = bkv.narrow(2, hd, hd)?;
                     let own_s = bsc.narrow(2, hd, hd)?;
                     let prev = bkv.narrow(2, 0, hd)?;
@@ -665,8 +688,8 @@ impl Compressor {
                     let prev = Tensor::cat(&[zero, prev.narrow(0, 0, nb - 1)?], 0)?;
                     let prev_s = Tensor::cat(&[zero_s, prev_s.narrow(0, 0, nb - 1)?], 0)?;
                     (
-                        Tensor::cat(&[prev, own], 2)?,
-                        Tensor::cat(&[prev_s, own_s], 2)?,
+                        Tensor::cat(&[prev, own], 1)?, // [nb, 2*ratio, hd]
+                        Tensor::cat(&[prev_s, own_s], 1)?,
                     )
                 } else {
                     (bkv, bsc)
@@ -690,19 +713,21 @@ impl Compressor {
                             .score
                             .slice_scatter(&s.unsqueeze(0)?, 0, ratio + pos % ratio)?;
                     if (pos + 1).is_multiple_of(ratio) {
+                        // [2*ratio, hd]: the previous block through its
+                        // previous-window half, then this block through its own.
                         let kv_state = Tensor::cat(
                             &[
                                 state.kv.narrow(0, 0, ratio)?.narrow(1, 0, hd)?,
                                 state.kv.narrow(0, ratio, ratio)?.narrow(1, hd, hd)?,
                             ],
-                            1,
+                            0,
                         )?;
                         let sc_state = Tensor::cat(
                             &[
                                 state.score.narrow(0, 0, ratio)?.narrow(1, 0, hd)?,
                                 state.score.narrow(0, ratio, ratio)?.narrow(1, hd, hd)?,
                             ],
-                            1,
+                            0,
                         )?;
                         let w = softmax(&sc_state, 0)?;
                         rows.push((kv_state * w)?.sum(0)?); // [hd]
@@ -848,7 +873,7 @@ impl Indexer {
         let sc = sc.relu()?;
         let w = self.proj.forward(x)?.squeeze(0)?; // [seq, ih]
         let w = ((w * self.softmax_scale)? * (self.n_head as f64).powf(-0.5))?;
-        let sc = (sc * w.unsqueeze(D::Minus1)?)?.sum(1)?; // [seq, n_lid]
+        let sc = sc.broadcast_mul(&w.unsqueeze(D::Minus1)?)?.sum(1)?; // [seq, n_lid]
 
         // Causal mask: block b is visible to the query at absolute pos p iff
         // b < (p+1)/ratio.
@@ -909,9 +934,17 @@ impl Attention {
     /// for every query and return `(k_all, mask)` with shapes
     /// `[seq, n_kv, head_dim]` and `[seq, n_kv]` (0 for valid rows, -inf for
     /// masked-out padding).
+    ///
+    /// `swa_prev` is the ring cache *before* this chunk was written and
+    /// `kv_raw` the keys of the chunk itself: the two are concatenated into a
+    /// dense, position-ordered buffer covering tokens
+    /// `[offset - window_size, offset + seq)` so that a prompt longer than the
+    /// window cannot alias its own history through the ring.
     fn build_kv(
         &self,
         kv: &KvState,
+        swa_prev: &Tensor,
+        kv_raw: &Tensor,
         offset: usize,
         seq: usize,
         lid_idx: Option<&Tensor>,
@@ -919,10 +952,20 @@ impl Attention {
         let win = self.window_size;
         let ratio = self.ratio;
         let d = self.head_dim;
-        let dev = kv.swa.as_ref().unwrap().device();
+        let dev = kv_raw.device();
+
+        // Dense window source: row j holds token `base + j`, with the first
+        // `win` rows read out of the ring in absolute-position order.  Rows for
+        // tokens before position 0 hold stale data but are always masked out.
+        let base = offset as i64 - win as i64;
+        let ring_rows: Vec<u32> = (0..win)
+            .map(|j| (base + j as i64).rem_euclid(win as i64) as u32)
+            .collect();
+        let hist = swa_prev.index_select(&Tensor::from_vec(ring_rows, (win,), dev)?, 0)?;
+        let k_src = Tensor::cat(&[hist, kv_raw.clone()], 0)?; // [win + seq, d]
 
         // Window rows: token t of query p is valid iff
-        // max(0, p+1-win) <= t <= p; the cache is a ring of size `win`.
+        // max(0, p+1-win) <= t <= p.
         let mut w_rows = vec![0u32; seq * win];
         let mut w_mask = vec![f32::NEG_INFINITY; seq * win];
         for r in 0..seq {
@@ -930,7 +973,7 @@ impl Attention {
             let lo = (p + 1).saturating_sub(win);
             let cnt = p + 1 - lo;
             for j in 0..cnt {
-                w_rows[r * win + j] = ((lo + j) % win) as u32;
+                w_rows[r * win + j] = ((lo + j) as i64 - base) as u32;
                 w_mask[r * win + j] = 0.0;
             }
         }
@@ -977,8 +1020,7 @@ impl Attention {
             }
         }
 
-        let swa = kv.swa.as_ref().unwrap();
-        let k_win = swa
+        let k_win = k_src
             .index_select(&Tensor::from_vec(w_rows, (seq * win,), dev)?, 0)?
             .reshape((seq, win, d))?;
         let k_comp = match (kv.comp.as_ref(), n_comp) {
@@ -1038,13 +1080,27 @@ impl Attention {
         )?;
         let kv_raw = kv4.squeeze(0)?.squeeze(0)?.contiguous()?; // [seq, d]
 
-        // Write into the sliding-window ring.
-        let ring: Vec<u32> = (offset..offset + seq)
-            .map(|p| (p % self.window_size) as u32)
-            .collect();
-        let ridx = Tensor::from_vec(ring, (seq, 1), dev)?.broadcast_as((seq, self.head_dim))?;
-        let swa = kv.swa.as_ref().unwrap();
-        kv.swa = Some(swa.scatter(&ridx, &kv_raw, 0)?);
+        // Write into the sliding-window ring, keeping the pre-chunk contents so
+        // the window rows of this chunk can be read from dense positions.  A
+        // chunk at least as long as the window overwrites the ring completely,
+        // in which case it is rebuilt from the last `window_size` keys (a
+        // scatter with repeated ring slots would leave an arbitrary winner).
+        let win = self.window_size;
+        let swa_prev = kv.swa.as_ref().unwrap().clone();
+        kv.swa = Some(if seq >= win {
+            let start = offset + seq - win;
+            let rows: Vec<u32> = (0..win)
+                .map(|slot| {
+                    let t = start + (slot + win - start % win) % win;
+                    (t - offset) as u32
+                })
+                .collect();
+            kv_raw.index_select(&Tensor::from_vec(rows, (win,), dev)?, 0)?
+        } else {
+            let ring: Vec<u32> = (offset..offset + seq).map(|p| (p % win) as u32).collect();
+            let ridx = Tensor::from_vec(ring, (seq, 1), dev)?.broadcast_as((seq, self.head_dim))?;
+            swa_prev.scatter(&ridx, &kv_raw, 0)?
+        });
 
         // Main compressor (CSA / HCA).
         if let Some(c) = &self.compressor {
@@ -1095,13 +1151,15 @@ impl Attention {
         };
 
         // Sparse attention with per-head sink.
-        let (k_all, mask) = self.build_kv(kv, offset, seq, lid_idx.as_ref())?;
+        let (k_all, mask) = self.build_kv(kv, &swa_prev, &kv_raw, offset, seq, lid_idx.as_ref())?;
         let scores = q.matmul(&k_all.transpose(1, 2)?)?; // [seq, h, n_kv]
-        let scores = (scores * self.softmax_scale)?.add(&mask.unsqueeze(1)?)?;
+        let scores = (scores * self.softmax_scale)?.broadcast_add(&mask.unsqueeze(1)?)?;
         let max = scores.max_keepdim(D::Minus1)?;
-        let e = (scores - &max)?.exp()?;
+        let e = scores.broadcast_sub(&max)?.exp()?;
         let sink = self.attn_sinks.unsqueeze(0)?.unsqueeze(2)?; // [1, h, 1]
-        let den = e.sum_keepdim(D::Minus1)?.add(&(sink - &max)?.exp()?)?; // [seq, h, 1]
+        let den = e
+            .sum_keepdim(D::Minus1)?
+            .add(&sink.broadcast_sub(&max)?.exp()?)?; // [seq, h, 1]
         let num = e.unsqueeze(2)?.broadcast_matmul(&k_all.unsqueeze(1)?)?; // [seq, h, 1, n_kv] @ [seq, 1, n_kv, d] → [seq, h, 1, d]
         let o = num.broadcast_div(&den.unsqueeze(D::Minus1)?)?.squeeze(2)?; // [seq, h, d]
 
@@ -1220,13 +1278,14 @@ impl Moe {
             // (official `Gate.forward` gathers `original_scores` at the hash ids).
             let ids = input_ids.flatten_all()?.to_vec1::<u32>()?;
             let tid = Tensor::from_vec(ids, n_tokens, xs.device())?;
+            // tid2eid is [n_vocab, n_expert_used]: select the token-id rows.
             let idx = self
                 .tid2eid
                 .as_ref()
                 .unwrap()
-                .index_select(&tid, 1)?
+                .index_select(&tid, 0)?
                 .to_dtype(DType::U32)?; // [n_tokens, k]
-            let mut weights = probs.gather(&idx.to_dtype(DType::F32)?, D::Minus1)?;
+            let mut weights = probs.gather(&idx, D::Minus1)?;
             weights = weights.broadcast_div(
                 &weights
                     .sum_keepdim(D::Minus1)?
@@ -1464,15 +1523,15 @@ impl ModelWeights {
             let q_a = rd.qmatmul(&format!("{p}.attn_q_a.weight"))?;
             // q_lora_rank is implied by the weight shapes; validate it so a
             // mismatched GGUF fails early instead of misbehaving later.
-            let qa_shape = rd
-                .qtensor(&format!("{p}.attn_q_a.weight"))?
+            let qb_shape = rd
+                .qtensor(&format!("{p}.attn_q_b.weight"))?
                 .shape()
                 .dims()
                 .to_vec();
             debug_assert_eq!(
                 vec![cfg.n_head * cfg.head_dim, cfg.q_lora_rank],
-                qa_shape,
-                "blk.{i}.attn_q_a"
+                qb_shape,
+                "blk.{i}.attn_q_b"
             );
             let q_norm = rd.rms_norm(&format!("{p}.attn_q_a_norm.weight"), cfg.rms_eps)?;
             let q_b = rd.qmatmul(&format!("{p}.attn_q_b.weight"))?;
@@ -1655,7 +1714,7 @@ impl ModelWeights {
             .mean_keepdim(D::Minus1)?
             .affine(1.0, self.hc_eps)?
             .powf(-0.5)?;
-        let mixes = self.hc_head_fn.forward(&flat)?.mul(&rsqrt)?; // [s, hc]
+        let mixes = self.hc_head_fn.forward(&flat)?.broadcast_mul(&rsqrt)?; // [s, hc]
         let pre = sigmoid(
             &mixes
                 .broadcast_mul(&self.hc_head_scale)?
@@ -1667,8 +1726,12 @@ impl ModelWeights {
             .broadcast_as((seq_len, hc, d))?
             .mul(&xs.squeeze(0)?)?
             .sum(D::Minus2)?; // [s, d]
+
+        // Only the last position's logits are needed, and the engine's
+        // `squeeze_batch_logits` requires a single row.
+        let y = y.narrow(0, seq_len - 1, 1)?;
         let y = self.norm.forward(&y)?;
-        let logits = self.output.forward(&y)?; // [s, n_vocab]
+        let logits = self.output.forward(&y)?; // [1, n_vocab]
         logits.to_dtype(DType::F32)
     }
 
@@ -1706,6 +1769,16 @@ fn load_moe<R: Read + Seek>(
     } else {
         None
     };
+    if let Some(t) = &tid2eid {
+        // `dispatch` unflattens the routed ids assuming `n_expert_used` per token.
+        let dims = t.shape().dims().to_vec();
+        if dims.len() != 2 || dims[1] != cfg.n_expert_used {
+            candle_core::bail!(
+                "deepseek4: `{p}.ffn_gate_tid2eid.weight` should be [n_vocab, {}], got {dims:?}",
+                cfg.n_expert_used
+            );
+        }
+    }
 
     let gate_exps = split_experts(rd, &format!("{p}.ffn_gate_exps.weight"), cfg.n_expert)?;
     let up_exps = split_experts(rd, &format!("{p}.ffn_up_exps.weight"), cfg.n_expert)?;
