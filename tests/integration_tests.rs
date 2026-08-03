@@ -426,18 +426,17 @@ mod synthetic {
     }
 
     #[test]
-    fn unsupported_architecture_fails_at_load_with_clear_error() {
-        use joshua::Engine;
+    fn unsupported_architecture_fails_at_request_with_clear_error() {
+        use joshua::{types::GenerationOptions, Engine};
 
         let dir = model_dir("unsupported-arch");
         write_unsupported_gguf(&dir.join("model.gguf"));
 
-        // PR #17: engine construction defers unknown architectures to a
-        // potential NPU backend instead of failing; the stored detection error
-        // surfaces once the candle path is actually needed (generation).
-        let engine = Engine::with_n_ctx(&dir, 64).expect("construction defers unknown archs");
-        let msg = match engine.complete(&[], &Default::default()) {
-            Ok(_) => panic!("mamba arch must be rejected at generation time"),
+        // Construction succeeds so an NPU backend can still be attached; the
+        // architecture error surfaces when the candle path is needed.
+        let engine = Engine::with_n_ctx(&dir, 64).expect("construction defers the arch error");
+        let msg = match engine.complete_raw("hello", &GenerationOptions::default()) {
+            Ok(_) => panic!("mamba arch must be rejected"),
             Err(e) => e.to_string(),
         };
         assert!(

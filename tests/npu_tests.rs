@@ -348,6 +348,51 @@ fn images_without_a_media_backend_are_rejected_clearly() {
 }
 
 #[test]
+fn accelerator_only_models_report_the_backend_failure() {
+    // A model candle cannot load (`mamba`): the engine only exists because an
+    // NPU backend may serve it, so backend failures must not be reported as
+    // "unsupported architecture".
+    let dir = common::model_dir("npu-arch-only");
+    common::write_unsupported_gguf(&dir.join("model.gguf"));
+    let backend = ShimBackend::new(shim_path(), "/nonexistent/libnpu.so");
+    let engine = Engine::with_n_ctx(&dir, 64)
+        .expect("construction defers the arch error")
+        .with_npu_backend(Arc::new(backend));
+
+    let options = GenerationOptions {
+        max_tokens: 2,
+        temperature: 0.0,
+        ..Default::default()
+    };
+    for _ in 0..3 {
+        let err = engine
+            .complete_raw("hello a", &options)
+            .map(|_| ())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            !err.contains("known llama.cpp architecture"),
+            "backend failure masked by the architecture error: {err}"
+        );
+    }
+
+    // Once the breaker disables the backend the architecture error is the
+    // right answer, but it must say the accelerator is gone.
+    assert!(!engine.npu_active(), "circuit breaker should have tripped");
+    let err = engine
+        .complete_raw("hello a", &options)
+        .map(|_| ())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("known llama.cpp architecture") && err.contains("disabled"),
+        "unexpected post-breaker error: {err}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn engine_falls_back_to_cpu_and_trips_the_circuit_breaker() {
     let dir = tiny_model_dir("npu-engine-fallback");
     // A backend whose plugin path is bogus: every session creation fails.
