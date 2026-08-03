@@ -222,11 +222,13 @@ impl Config {
                 .filter(|s| s == "yarn")
                 .map(|_| YarnConfig {
                     factor: m.f32_or(&format!("{a}.rope.scaling.factor"), 16.0),
-                    orig_context_length: m.u32_or(
-                        &format!("{a}.rope.scaling.original_max_position_embeddings"),
-                        65536,
-                    ) as usize,
-                    mscale_all_dim: m.f32_or(&format!("{a}.rope.scaling.yarn_log_multiplier"), 1.0),
+                    orig_context_length: m
+                        .u32_or(&format!("{a}.rope.scaling.original_context_length"), 65536)
+                        as usize,
+                    // llama.cpp stores 0.1 * mscale_all_dim and divides it back out.
+                    mscale_all_dim: m
+                        .f32_or(&format!("{a}.rope.scaling.yarn_log_multiplier"), 0.0)
+                        / 0.1,
                 });
 
         Ok(Self {
@@ -1222,12 +1224,14 @@ impl KvState {
         let ihd = cfg.index_head_dim;
         let win = cfg.window_size;
         let ratio = *cfg.compress_ratios.get(layer).unwrap_or(&0);
+        // The indexer always compresses at the CSA ratio; the main compressor
+        // uses this layer's own ratio, so an HCA layer needs 32x fewer rows.
         let max_blocks = max_seq / CSA_RATIO + 1;
         let swa = Tensor::zeros((win, hd), DType::F32, dev)?;
         let (comp, comp_state) = if ratio != 0 {
             let coff = if ratio == CSA_RATIO { 2 } else { 1 };
             (
-                Some(Tensor::zeros((max_blocks, hd), DType::F32, dev)?),
+                Some(Tensor::zeros((max_seq / ratio + 1, hd), DType::F32, dev)?),
                 Some(CompressorState::new(ratio, coff, hd, dev)?),
             )
         } else {
@@ -1763,10 +1767,10 @@ fn load_moe<R: Read + Seek>(
             .then(|| rd.f32_tensor(&format!("{p}.exp_probs_b.bias")))
             .transpose()?
     };
+    // A hash layer routes through the table on every token, so a missing one is
+    // a load error rather than something to discover on the first forward pass.
     let tid2eid = if hash {
-        rd.has(&format!("{p}.ffn_gate_tid2eid.weight"))
-            .then(|| rd.f32_tensor(&format!("{p}.ffn_gate_tid2eid.weight")))
-            .transpose()?
+        Some(rd.f32_tensor(&format!("{p}.ffn_gate_tid2eid.weight"))?)
     } else {
         None
     };
