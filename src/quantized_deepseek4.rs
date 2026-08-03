@@ -226,8 +226,7 @@ impl Config {
                         .u32_or(&format!("{a}.rope.scaling.original_context_length"), 65536)
                         as usize,
                     // llama.cpp stores 0.1 * mscale_all_dim and divides it back out.
-                    mscale_all_dim: m
-                        .f32_or(&format!("{a}.rope.scaling.yarn_log_multiplier"), 0.0)
+                    mscale_all_dim: m.f32_or(&format!("{a}.rope.scaling.yarn_log_multiplier"), 0.0)
                         / 0.1,
                 });
 
