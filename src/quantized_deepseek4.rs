@@ -1139,7 +1139,7 @@ impl Attention {
         let y = oa
             .gather(&idx, D::Minus1)?
             .reshape((seq, self.o_groups * self.o_lora_rank))?;
-        self.wo_b.forward(&y)
+        self.wo_b.forward(&y)?.reshape((1, seq, ()))
     }
 }
 
