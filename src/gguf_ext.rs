@@ -206,7 +206,16 @@ impl<R: Read + Seek> Rdr<'_, R> {
         }
         let mut buf = vec![0u8; n as usize];
         self.r.read_exact(&mut buf).map_err(bad)?;
-        String::from_utf8(buf).map_err(|e| bad(format!("non-UTF-8 string: {e}")))
+        // Real GGUFs in the wild NUL-terminate strings despite the spec, and
+        // occasionally carry invalid UTF-8.  candle's own `read_string` is
+        // deliberately lenient about both (pops trailing NULs, decodes
+        // lossily) precisely because of this — and this reader is now on the
+        // main load path, so a file the library reader accepts must not be
+        // rejected here.  Match its behaviour exactly.
+        while let Some(0) = buf.last() {
+            buf.pop();
+        }
+        Ok(String::from_utf8_lossy(&buf).into_owned())
     }
 
     fn value(&mut self, ty: u32) -> Result<Value> {
@@ -450,6 +459,62 @@ mod tests {
         let mut bytes = header_bytes(0);
         bytes[0] ^= 0xFF;
         assert!(read_header(&mut Cursor::new(&bytes[..])).is_err());
+    }
+
+    #[test]
+    fn lenient_strings_nul_terminated_and_invalid_utf8() {
+        // Real GGUFs NUL-terminate strings despite the spec, and sometimes
+        // carry invalid UTF-8; candle's reader tolerates both, so the
+        // tolerant header must too (it is on the main load path).
+        let mut b = Vec::new();
+        b.extend_from_slice(&MAGIC.to_le_bytes());
+        b.extend_from_slice(&3u32.to_le_bytes()); // version
+        b.extend_from_slice(&1u64.to_le_bytes()); // tensor count
+        b.extend_from_slice(&2u64.to_le_bytes()); // kv count
+
+        // general.name = "DeepSeek-V4\0" (NUL-terminated despite the spec).
+        let k = b"general.name";
+        b.extend_from_slice(&(k.len() as u64).to_le_bytes());
+        b.extend_from_slice(k);
+        b.extend_from_slice(&8u32.to_le_bytes()); // string
+        let v = b"DeepSeek-V4\0";
+        b.extend_from_slice(&(v.len() as u64).to_le_bytes());
+        b.extend_from_slice(v);
+
+        // general.architecture = "kimi-k3\xff" (invalid UTF-8 tail).
+        let k = b"general.architecture";
+        b.extend_from_slice(&(k.len() as u64).to_le_bytes());
+        b.extend_from_slice(k);
+        b.extend_from_slice(&8u32.to_le_bytes()); // string
+        let v = b"kimi-k3\xff";
+        b.extend_from_slice(&(v.len() as u64).to_le_bytes());
+        b.extend_from_slice(v);
+
+        // tensor "w", dims [64, 8]
+        let n = b"w";
+        b.extend_from_slice(&(n.len() as u64).to_le_bytes());
+        b.extend_from_slice(n);
+        b.extend_from_slice(&2u32.to_le_bytes()); // n_dims
+        b.extend_from_slice(&64u64.to_le_bytes());
+        b.extend_from_slice(&8u64.to_le_bytes());
+        b.extend_from_slice(&0u32.to_le_bytes()); // dtype F32
+        b.extend_from_slice(&0u64.to_le_bytes()); // offset
+
+        let h = read_header(&mut Cursor::new(&b[..]))
+            .expect("NUL-terminated and invalid-UTF-8 strings must not fail the load");
+        assert_eq!(
+            h.metadata
+                .get("general.name")
+                .and_then(|v| v.to_string().ok())
+                .map(String::as_str),
+            Some("DeepSeek-V4")
+        );
+        assert_eq!(
+            h.architecture().as_deref(),
+            Some("kimi-k3\u{FFFD}"),
+            "invalid UTF-8 decodes lossily, like candle"
+        );
+        assert_eq!(h.tensors.get("w").unwrap().dtype, 0);
     }
 
     #[test]
