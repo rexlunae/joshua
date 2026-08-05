@@ -88,6 +88,32 @@ pub fn ggml_dtype_from_id(dtype: u32) -> Option<GgmlDType> {
     })
 }
 
+/// The reverse of [`ggml_dtype_from_id`]: a candle dtype's raw GGUF id.
+///
+/// `GgmlDType`'s own discriminant is *not* the GGUF id (candle inserts BF16
+/// at index 2, shifting every later type), so the on-disk id must be mapped
+/// explicitly when talking to the file format.
+pub fn ggml_id_from_dtype(dtype: GgmlDType) -> u32 {
+    match dtype {
+        GgmlDType::F32 => 0,
+        GgmlDType::F16 => 1,
+        GgmlDType::BF16 => 30,
+        GgmlDType::Q4_0 => 2,
+        GgmlDType::Q4_1 => 3,
+        GgmlDType::Q5_0 => 6,
+        GgmlDType::Q5_1 => 7,
+        GgmlDType::Q8_0 => 8,
+        GgmlDType::Q8_1 => 9,
+        GgmlDType::Q2K => 10,
+        GgmlDType::Q3K => 11,
+        GgmlDType::Q4K => 12,
+        GgmlDType::Q5K => 13,
+        GgmlDType::Q6K => 14,
+        GgmlDType::Q8K => 15,
+        // `GgmlDType` has no non_exhaustive marker; add new candle types here.
+    }
+}
+
 /// A tensor's location and type, with the dtype left as its raw GGUF id.
 #[derive(Debug, Clone)]
 pub struct RawTensorInfo {

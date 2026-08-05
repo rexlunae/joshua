@@ -105,7 +105,7 @@ impl<T: GgmlType + Send + Sync> QuantizedType for MmapBlocks<T> {
     }
 
     fn matmul_t(&self, mkn: (usize, usize, usize), lhs: &[f32], dst: &mut [f32]) -> Result<()> {
-        k_quants::matmul(mkn, lhs, self.blocks(), dst)
+        crate::quant_matmul::matmul_kquant(mkn, lhs, self.blocks(), dst)
     }
 
     fn matmul_t_f16(&self, mkn: (usize, usize, usize), lhs: &[f16], dst: &mut [f16]) -> Result<()> {

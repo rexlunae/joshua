@@ -55,6 +55,10 @@ memmap2 = "0.9"
 # Runtime loading of NPU vendor plugins (thin safe wrapper over dlopen)
 libloading = "0.8"
 
+# Row-parallel quantized matmul kernels (already in the dependency tree via
+# candle-transformers; made a direct dependency for the SIMD/threading work).
+rayon = "1"
+
 # WAV decoding for Whisper speech-to-text (pure Rust)
 hound = "3.5"
 
