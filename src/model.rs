@@ -310,30 +310,44 @@ impl QuantizedModel {
 
         tracing::info!("Detected model architecture: {}", arch.display_name());
 
-        // Re-read the header the way `gguf_ext` does: with each tensor's dtype
-        // kept as its raw GGUF id.  Candle's `Content` cannot name IQ2_XXS or
-        // I32, so the deepseek4 loader needs this to decode those tensors.
-        // The reader is rewound to where candle's header parse left it
-        // (the aligned data start) afterwards, so nothing downstream shifts.
+        // Re-read the header the way `gguf_ext` does — with each tensor's
+        // dtype kept as its raw GGUF id — but only for deepseek4, the one
+        // loader that consumes the raw table (candle's `Content` cannot name
+        // IQ2_XXS or I32, so the deepseek4 loader needs this to decode those
+        // tensors).  The reader is rewound to where candle's header parse
+        // left it (the aligned data start) afterwards, so nothing downstream
+        // shifts.
+        //
+        // The re-read must not run for other architectures: none of them
+        // consume the raw table, so the second parse would be pure cost (a
+        // full re-parse and clone of the metadata + tensor maps for every
+        // warm-pool instance) and any difference between the two parsers
+        // could reject a file candle accepts.  `read_header` is kept a
+        // superset of candle's parser, but other architectures should stay on
+        // exactly the behaviour candle gave them.
         //
         // A failed re-read is a real header problem (truncated/corrupt file,
         // implausible counts, non-UTF-8 key) — surface it as the load error
         // rather than silently treating the file as having no raw table, which
         // would surface much later as a misleading "cannot find tensor".
-        let data_pos = reader.stream_position()?;
-        let raw = (|| -> std::result::Result<_, crate::JoshuaError> {
-            reader.seek(SeekFrom::Start(0))?;
-            let h = crate::gguf_ext::read_header(reader)?;
-            reader.seek(SeekFrom::Start(data_pos))?;
-            Ok(h)
-        })()
-        .map_err(|e| {
-            // Restore the reader even on failure so callers see a
-            // deterministic position, then report the actual problem.
-            let _ = reader.seek(SeekFrom::Start(data_pos));
-            candle_core::Error::Msg(format!("GGUF header re-read failed: {e}"))
-        })?;
-        let raw = Some(raw);
+        let raw = if arch == Architecture::DeepSeek4 {
+            let data_pos = reader.stream_position()?;
+            let h = (|| -> std::result::Result<_, crate::JoshuaError> {
+                reader.seek(SeekFrom::Start(0))?;
+                let h = crate::gguf_ext::read_header(reader)?;
+                reader.seek(SeekFrom::Start(data_pos))?;
+                Ok(h)
+            })()
+            .map_err(|e| {
+                // Restore the reader even on failure so callers see a
+                // deterministic position, then report the actual problem.
+                let _ = reader.seek(SeekFrom::Start(data_pos));
+                candle_core::Error::Msg(format!("GGUF header re-read failed: {e}"))
+            })?;
+            Some(h)
+        } else {
+            None
+        };
         let raw = raw.as_ref();
 
         match arch {
