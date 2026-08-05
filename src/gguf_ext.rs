@@ -37,14 +37,25 @@ const DEFAULT_ALIGNMENT: u64 = 32;
 /// making us attempt a huge allocation before any real data is read.
 const MAX_COUNT: u64 = 1 << 24;
 
-/// Candle's own caps, mirrored so the tolerant reader accepts everything the
-/// library reader accepts (candle-core `gguf_file` mirrors llama.cpp:
-/// GGUF_MAX_STRING_LENGTH, GGUF_MAX_ARRAY_ELEMENTS, GGUF_MAX_VALUE_DEPTH).
-/// `MAX_COUNT` above remains a separate, tighter guard on tensor/metadata
-/// *entry counts*, which candle does not cap; no real GGUF has more than a few
-/// thousand entries.
-const MAX_STRING_LENGTH: u64 = 1 << 30;
-const MAX_ARRAY_ELEMENTS: u64 = 1 << 30;
+/// Per-string cap.  Real GGUF metadata strings are small — tokenizer entries,
+/// templates, names — at most a few MiB even for huge vocabs, and an embedded
+/// vocab is an *array* of short strings, not one long one.  Candle mirrors
+/// llama.cpp's theoretical `GGUF_MAX_STRING_LENGTH` of 1 GiB, but that cap is
+/// a DoS liability, not a feature: candle eagerly `vec![0u8; len]`s the claim
+/// before reading a single byte, so a hostile header inside an otherwise-real
+/// model file (where the "bytes remaining" check trivially passes) can force a
+/// ~1 GiB transient allocation per metadata string.  A 1 GiB string would need
+/// a 1 GiB buffer to materialize anyway, so accepting it and bounding the
+/// allocation are mutually exclusive.  We keep everything candle accepts that
+/// can actually load (nested arrays, depth cap, lenient strings) and cap
+/// strings at 16 MiB — three orders of magnitude above any real value.
+const MAX_STRING_LENGTH: u64 = 1 << 24;
+
+/// Per-array element-count cap, same rationale: real tokenizer arrays
+/// (`tokenizer.ggml.tokens` / `.merges` / `.scores`) top out around a million
+/// elements; candle's 1 GiB would let a hostile claim drive the element loop
+/// into reading and buffering gigabytes of tensor data.
+const MAX_ARRAY_ELEMENTS: u64 = 1 << 24;
 const MAX_VALUE_DEPTH: usize = 64;
 
 /// GGUF dtype ids candle's `GgmlDType` table can represent.
@@ -570,22 +581,56 @@ mod tests {
     }
 
     #[test]
-    fn string_claim_beyond_stream_is_rejected_without_allocating() {
-        // A tiny file must not be able to claim a huge metadata string and
-        // force a giant allocation before any bytes are read.  The claim is
-        // checked against the bytes actually remaining in the stream.
+    fn string_claim_beyond_cap_is_rejected_without_allocating() {
+        // A hostile header must not be able to force a large allocation by
+        // claiming a huge metadata string: the per-string cap (16 MiB) rejects
+        // the claim before any buffer is allocated.  This matters for real
+        // model files too — there the "bytes remaining" check trivially
+        // passes, so without the cap a claim just under 1 GiB would be
+        // eagerly allocated and then fail as a desynced parse.
         let mut b = Vec::new();
         b.extend_from_slice(&MAGIC.to_le_bytes());
         b.extend_from_slice(&3u32.to_le_bytes()); // version
         b.extend_from_slice(&1u64.to_le_bytes()); // tensor count
         b.extend_from_slice(&1u64.to_le_bytes()); // kv count
-                                                  // Key with a plausible length, value claims 100 MiB while the whole
-                                                  // file is ~100 bytes.
         let k = b"general.name";
         b.extend_from_slice(&(k.len() as u64).to_le_bytes());
         b.extend_from_slice(k);
         b.extend_from_slice(&8u32.to_le_bytes()); // value type: string
-        b.extend_from_slice(&(100u64 << 20).to_le_bytes()); // claimed length
+        b.extend_from_slice(&(32u64 << 20).to_le_bytes()); // claimed 32 MiB
+        let n = b"w";
+        b.extend_from_slice(&(n.len() as u64).to_le_bytes());
+        b.extend_from_slice(n);
+        b.extend_from_slice(&2u32.to_le_bytes()); // n_dims
+        b.extend_from_slice(&64u64.to_le_bytes());
+        b.extend_from_slice(&8u64.to_le_bytes());
+        b.extend_from_slice(&0u32.to_le_bytes()); // dtype F32
+        b.extend_from_slice(&0u64.to_le_bytes()); // offset
+
+        let msg = read_header(&mut Cursor::new(&b[..]))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("exceeds max"),
+            "oversized string claim must be rejected by the cap, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn string_claim_beyond_stream_is_rejected_without_allocating() {
+        // A claim within the cap but beyond the bytes actually remaining in
+        // the stream must also be rejected without allocating — a tiny file
+        // must not force an 8 MiB (or any) allocation.
+        let mut b = Vec::new();
+        b.extend_from_slice(&MAGIC.to_le_bytes());
+        b.extend_from_slice(&3u32.to_le_bytes()); // version
+        b.extend_from_slice(&1u64.to_le_bytes()); // tensor count
+        b.extend_from_slice(&1u64.to_le_bytes()); // kv count
+        let k = b"general.name";
+        b.extend_from_slice(&(k.len() as u64).to_le_bytes());
+        b.extend_from_slice(k);
+        b.extend_from_slice(&8u32.to_le_bytes()); // value type: string
+        b.extend_from_slice(&(8u64 << 20).to_le_bytes()); // claimed 8 MiB
         let n = b"w";
         b.extend_from_slice(&(n.len() as u64).to_le_bytes());
         b.extend_from_slice(n);
@@ -601,6 +646,41 @@ mod tests {
         assert!(
             msg.contains("bytes remaining"),
             "oversized string claim must be rejected, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn array_element_count_beyond_cap_is_rejected() {
+        // Same class as the string cap: a hostile array element-count claim
+        // (e.g. `tokenizer.ggml.tokens` with a billion elements) must be
+        // rejected up front, not looped over — in a real file the loop would
+        // read tensor data as elements and buffer gigabytes.
+        let mut b = Vec::new();
+        b.extend_from_slice(&MAGIC.to_le_bytes());
+        b.extend_from_slice(&3u32.to_le_bytes()); // version
+        b.extend_from_slice(&1u64.to_le_bytes()); // tensor count
+        b.extend_from_slice(&1u64.to_le_bytes()); // kv count
+        let k = b"tokenizer.ggml.tokens";
+        b.extend_from_slice(&(k.len() as u64).to_le_bytes());
+        b.extend_from_slice(k);
+        b.extend_from_slice(&9u32.to_le_bytes()); // value type: array
+        b.extend_from_slice(&8u32.to_le_bytes()); // element type: string
+        b.extend_from_slice(&(32u64 << 20).to_le_bytes()); // claimed 32 MiB elements
+        let n = b"w";
+        b.extend_from_slice(&(n.len() as u64).to_le_bytes());
+        b.extend_from_slice(n);
+        b.extend_from_slice(&2u32.to_le_bytes()); // n_dims
+        b.extend_from_slice(&64u64.to_le_bytes());
+        b.extend_from_slice(&8u64.to_le_bytes());
+        b.extend_from_slice(&0u32.to_le_bytes()); // dtype F32
+        b.extend_from_slice(&0u64.to_le_bytes()); // offset
+
+        let msg = read_header(&mut Cursor::new(&b[..]))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("exceeds max"),
+            "oversized array claim must be rejected by the cap, got: {msg}"
         );
     }
 

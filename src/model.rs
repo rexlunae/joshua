@@ -322,9 +322,13 @@ impl QuantizedModel {
         // consume the raw table, so the second parse would be pure cost (a
         // full re-parse and clone of the metadata + tensor maps for every
         // warm-pool instance) and any difference between the two parsers
-        // could reject a file candle accepts.  `read_header` is kept a
-        // superset of candle's parser, but other architectures should stay on
-        // exactly the behaviour candle gave them.
+        // could reject a file candle accepts.  `read_header` is a superset of
+        // candle's parser for every file that can actually load (nested
+        // arrays, depth cap, lenient strings; its per-string/array resource
+        // caps are deliberately tighter than candle's theoretical 1 GiB, on
+        // which candle itself eagerly allocates and fails), but other
+        // architectures should stay on exactly the behaviour candle gave
+        // them.
         //
         // A failed re-read is a real header problem (truncated/corrupt file,
         // implausible counts, non-UTF-8 key) — surface it as the load error
