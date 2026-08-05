@@ -148,6 +148,39 @@ impl<R: std::io::Seek> std::io::Seek for FailAllReads<R> {
     }
 }
 
+/// A CSA layer (`compress_ratios[0] = 4`) writes its compressor and indexer
+/// caches with a scatter whose index is a broadcast view of the block
+/// positions.  candle's `scatter` rejects non-contiguous index tensors, so
+/// both writes must materialize a dense index first — otherwise generation
+/// aborts the moment the first compressed block completes.
+#[test]
+fn deepseek4_compressed_layers_write_their_caches() {
+    let dir = common::model_dir("deepseek4-compress");
+    let model = dir.join("model.gguf");
+    common::write_tiny_deepseek4_gguf_compress(&model);
+
+    // 5 tokens = one full compressed block at ratio 4 (plus a remainder):
+    // the prefill branch completes a block and scatters into `comp` and
+    // `lid` — this is where the non-contiguous index used to abort.
+    let tokens = [1u32, 4, 2, 7, 5];
+    let mut m = load(&model, true);
+    let out = logits(&mut m, &tokens, 0);
+    assert!(out.iter().all(|l| l.is_finite()));
+
+    // Incremental decode crosses the block boundary mid-stream (position 3
+    // completes the first block) — the other scatter call site.
+    let mut m = load(&model, true);
+    for (i, &t) in tokens.iter().enumerate() {
+        let l = logits(&mut m, &[t], i);
+        assert!(
+            l.iter().all(|v| v.is_finite()),
+            "decode step {i} must produce finite logits"
+        );
+    }
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// An `output.weight` shipped in a dtype candle cannot name (IQ2_XXS) must be
 /// picked up via the raw header and used, not reported absent — which would
 /// silently tie the output head to the input embeddings.

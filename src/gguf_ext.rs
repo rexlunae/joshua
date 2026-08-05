@@ -23,7 +23,7 @@
 //! keeps a model far larger than RAM loadable.
 
 use std::collections::HashMap;
-use std::io::{Read, Seek};
+use std::io::{Read, Seek, SeekFrom};
 
 use candle_core::quantized::gguf_file::{self, Value, VersionedMagic};
 use candle_core::quantized::GgmlDType;
@@ -232,6 +232,21 @@ impl<R: Read + Seek> Rdr<'_, R> {
         if n > MAX_STRING_LENGTH {
             return Err(bad(format!(
                 "string of {n} bytes exceeds max {MAX_STRING_LENGTH}"
+            )));
+        }
+        // The claimed length is attacker-controlled: a few-byte file could
+        // claim a ~1 GiB string and make us allocate it before a single byte
+        // is read.  The stream is seekable, so verify the claim against the
+        // bytes actually remaining, then allocate only what can be satisfied.
+        // (A legitimate file that genuinely carries a huge metadata string
+        // still loads — up to the 1 GiB cap, exactly like candle.)
+        let pos = self.r.stream_position().map_err(bad)?;
+        let end = self.r.seek(SeekFrom::End(0)).map_err(bad)?;
+        self.r.seek(SeekFrom::Start(pos)).map_err(bad)?;
+        if n > end - pos {
+            return Err(bad(format!(
+                "string of {n} bytes exceeds the {} bytes remaining in the stream",
+                end - pos
             )));
         }
         let mut buf = vec![0u8; n as usize];
@@ -552,6 +567,41 @@ mod tests {
             "invalid UTF-8 decodes lossily, like candle"
         );
         assert_eq!(h.tensors.get("w").unwrap().dtype, 0);
+    }
+
+    #[test]
+    fn string_claim_beyond_stream_is_rejected_without_allocating() {
+        // A tiny file must not be able to claim a huge metadata string and
+        // force a giant allocation before any bytes are read.  The claim is
+        // checked against the bytes actually remaining in the stream.
+        let mut b = Vec::new();
+        b.extend_from_slice(&MAGIC.to_le_bytes());
+        b.extend_from_slice(&3u32.to_le_bytes()); // version
+        b.extend_from_slice(&1u64.to_le_bytes()); // tensor count
+        b.extend_from_slice(&1u64.to_le_bytes()); // kv count
+                                                  // Key with a plausible length, value claims 100 MiB while the whole
+                                                  // file is ~100 bytes.
+        let k = b"general.name";
+        b.extend_from_slice(&(k.len() as u64).to_le_bytes());
+        b.extend_from_slice(k);
+        b.extend_from_slice(&8u32.to_le_bytes()); // value type: string
+        b.extend_from_slice(&(100u64 << 20).to_le_bytes()); // claimed length
+        let n = b"w";
+        b.extend_from_slice(&(n.len() as u64).to_le_bytes());
+        b.extend_from_slice(n);
+        b.extend_from_slice(&2u32.to_le_bytes()); // n_dims
+        b.extend_from_slice(&64u64.to_le_bytes());
+        b.extend_from_slice(&8u64.to_le_bytes());
+        b.extend_from_slice(&0u32.to_le_bytes()); // dtype F32
+        b.extend_from_slice(&0u64.to_le_bytes()); // offset
+
+        let msg = read_header(&mut Cursor::new(&b[..]))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("bytes remaining"),
+            "oversized string claim must be rejected, got: {msg}"
+        );
     }
 
     #[test]

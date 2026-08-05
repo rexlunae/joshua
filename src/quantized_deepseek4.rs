@@ -1137,9 +1137,13 @@ impl Attention {
             )?;
             if let Some((rows, poss)) = &out {
                 let comp = kv.comp.as_ref().unwrap();
+                // Broadcast index views are not contiguous; scatter requires
+                // a dense index tensor (same as the sliding-window ring
+                // above), so materialize it before writing the cache.
                 let pidx = poss
                     .unsqueeze(1)?
-                    .broadcast_as((rows.dim(0)?, self.head_dim))?;
+                    .broadcast_as((rows.dim(0)?, self.head_dim))?
+                    .contiguous()?;
                 kv.comp = Some(comp.scatter(&pidx, rows, 0)?);
             }
         }
@@ -1160,9 +1164,13 @@ impl Attention {
             )?;
             if let Some((rows, poss)) = &lout {
                 let lid = kv.lid.as_ref().unwrap();
+                // Same contiguous-index requirement as the compressor cache:
+                // a broadcast view of the position list is not a valid
+                // scatter index.
                 let pidx = poss
                     .unsqueeze(1)?
-                    .broadcast_as((rows.dim(0)?, ix.head_dim))?;
+                    .broadcast_as((rows.dim(0)?, ix.head_dim))?
+                    .contiguous()?;
                 kv.lid = Some(lid.scatter(&pidx, rows, 0)?);
             }
             Some(ix.score(x, &qr, offset, seq, kv.lid.as_ref().unwrap(), &self.rotary)?)

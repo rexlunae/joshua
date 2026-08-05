@@ -797,7 +797,7 @@ pub fn write_raw_gguf(path: &Path, metadata: &[(String, gguf_file::Value)], tens
 /// dtypes candle cannot represent: IQ2_XXS routed experts and an I32
 /// tid2eid table in the hash layer.
 pub fn write_tiny_deepseek4_gguf(path: &Path) {
-    write_tiny_deepseek4_gguf_opts(path, false);
+    write_tiny_deepseek4_gguf_opts(path, false, false);
 }
 
 /// Like [`write_tiny_deepseek4_gguf`], but also emits `output.weight` as an
@@ -805,10 +805,18 @@ pub fn write_tiny_deepseek4_gguf(path: &Path) {
 /// loader's raw-header-aware presence check picks it up instead of silently
 /// tying the output head to the input embeddings.
 pub fn write_tiny_deepseek4_gguf_iq2xxs_output(path: &Path) {
-    write_tiny_deepseek4_gguf_opts(path, true);
+    write_tiny_deepseek4_gguf_opts(path, true, false);
 }
 
-fn write_tiny_deepseek4_gguf_opts(path: &Path, iq2xxs_output: bool) {
+/// Like [`write_tiny_deepseek4_gguf`], but layer 0 is a CSA layer
+/// (`compress_ratios = [4, 0]`): emits the main compressor + lightning
+/// indexer tensors so the compressed-KV cache write path (scatter into
+/// `comp`/`lid`) is exercised by forward passes that span a full block.
+pub fn write_tiny_deepseek4_gguf_compress(path: &Path) {
+    write_tiny_deepseek4_gguf_opts(path, false, true);
+}
+
+fn write_tiny_deepseek4_gguf_opts(path: &Path, iq2xxs_output: bool, compress: bool) {
     const VOCAB: usize = 16;
     // EMB must be a multiple of the IQ2_XXS block size (256): each expert's
     // in-dimension is EMB, and candle requires the innermost dim of a QTensor
@@ -828,11 +836,14 @@ fn write_tiny_deepseek4_gguf_opts(path: &Path, iq2xxs_output: bool) {
     const N_SHARED: usize = 1;
     const HC: usize = 2;
     const N_HASH: usize = 1;
+    // Lightning indexer (CSA layers only).
+    const INDEX_NHEAD: usize = 4;
+    const INDEX_HD: usize = 16;
 
     let u32v = |v: u32| gguf_file::Value::U32(v);
     let f32v = |v: f32| gguf_file::Value::F32(v);
     let key = |s: &str| format!("deepseek4.{s}");
-    let metadata: Vec<(String, gguf_file::Value)> = vec![
+    let mut metadata: Vec<(String, gguf_file::Value)> = vec![
         (
             "general.architecture".to_string(),
             gguf_file::Value::String("deepseek4".to_string()),
@@ -850,7 +861,7 @@ fn write_tiny_deepseek4_gguf_opts(path: &Path, iq2xxs_output: bool) {
         (key("rope.dimension_count"), u32v(ROPE_DIM as u32)),
         (
             key("attention.compress_ratios"),
-            gguf_file::Value::Array(vec![u32v(0), u32v(0)]),
+            gguf_file::Value::Array(vec![u32v(if compress { 4 } else { 0 }), u32v(0)]),
         ),
         (key("attention.sliding_window"), u32v(8)),
         (key("attention.output_group_count"), u32v(O_GROUPS as u32)),
@@ -903,6 +914,16 @@ fn write_tiny_deepseek4_gguf_opts(path: &Path, iq2xxs_output: bool) {
             ),
         ),
     ];
+    if compress {
+        metadata.extend([
+            (
+                key("attention.indexer.head_count"),
+                u32v(INDEX_NHEAD as u32),
+            ),
+            (key("attention.indexer.key_length"), u32v(INDEX_HD as u32)),
+            (key("attention.indexer.top_k"), u32v(2)),
+        ]);
+    }
 
     let ones = |n: usize| vec![1.0f32; n];
     let mut seed = 10u32;
@@ -975,6 +996,64 @@ fn write_tiny_deepseek4_gguf_opts(path: &Path, iq2xxs_output: bool) {
             ones(NHEAD),
             &[NHEAD],
         ));
+
+        // CSA layer 0: main compressor + lightning indexer (and its own
+        // ratio-4 compressor).  Both write their caches with a scatter whose
+        // index is a broadcast view — see `deepseek4_compressed_layers_write_their_caches`.
+        if compress && i == 0 {
+            let cdim = 2 * HEAD_DIM; // coff=2 for CSA
+            tensors.push(RawTensor::f16(
+                &format!("{p}.attn_compressor_kv.weight"),
+                next(cdim * EMB),
+                &[cdim, EMB],
+            ));
+            tensors.push(RawTensor::f16(
+                &format!("{p}.attn_compressor_gate.weight"),
+                next(cdim * EMB),
+                &[cdim, EMB],
+            ));
+            tensors.push(RawTensor::f32(
+                &format!("{p}.attn_compressor_ape.weight"),
+                next(4 * cdim),
+                &[4, cdim],
+            ));
+            tensors.push(RawTensor::f32(
+                &format!("{p}.attn_compressor_norm.weight"),
+                ones(HEAD_DIM),
+                &[HEAD_DIM],
+            ));
+            tensors.push(RawTensor::f16(
+                &format!("{p}.indexer.proj.weight"),
+                next(INDEX_NHEAD * EMB),
+                &[INDEX_NHEAD, EMB],
+            ));
+            tensors.push(RawTensor::f16(
+                &format!("{p}.indexer.attn_q_b.weight"),
+                next(INDEX_NHEAD * INDEX_HD * Q_LORA),
+                &[INDEX_NHEAD * INDEX_HD, Q_LORA],
+            ));
+            let icdim = 2 * INDEX_HD;
+            tensors.push(RawTensor::f16(
+                &format!("{p}.indexer_compressor_kv.weight"),
+                next(icdim * EMB),
+                &[icdim, EMB],
+            ));
+            tensors.push(RawTensor::f16(
+                &format!("{p}.indexer_compressor_gate.weight"),
+                next(icdim * EMB),
+                &[icdim, EMB],
+            ));
+            tensors.push(RawTensor::f32(
+                &format!("{p}.indexer_compressor_ape.weight"),
+                next(4 * icdim),
+                &[4, icdim],
+            ));
+            tensors.push(RawTensor::f32(
+                &format!("{p}.indexer_compressor_norm.weight"),
+                ones(INDEX_HD),
+                &[INDEX_HD],
+            ));
+        }
 
         // MoE: routed experts (IQ2_XXS gate/up, Q8_0 down) + shared expert.
         tensors.push(RawTensor::f32(
