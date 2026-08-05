@@ -25,6 +25,17 @@
 //! exotic `general.alignment`, a dtype with no block type here — the borrow is
 //! declined and the caller falls back to candle's copying reader, so a
 //! pathological file degrades in performance rather than in correctness.
+//!
+//! One residual risk cannot be checked away: if the file is truncated or
+//! rewritten *while* the mapping lives, a later access can fault (SIGBUS on
+//! Unix) or observe torn data.  That is inherent to memory-mapped I/O and is
+//! the price of zero-copy weight loading — the same tradeoff llama.cpp makes.
+//! The contract is that no party modifies the model file after mapping; a
+//! well-formed loader never does (the mapping is read-only), and a hostile
+//! actor with write access to the file can already corrupt the process in
+//! more direct ways.  Within the checked range, reads are in-bounds and every
+//! byte pattern is a valid block, so there is no out-of-bounds access
+//! *unless* the file changes under the mapping.
 
 use std::marker::PhantomData;
 use std::sync::Arc;

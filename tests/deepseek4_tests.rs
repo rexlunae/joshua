@@ -212,7 +212,9 @@ fn deepseek4_engine_accepts_unknown_dtypes() {
     common::write_tiny_deepseek4_gguf(&model);
 
     let engine = joshua::Engine::new(&model).expect("engine must load IQ2_XXS GGUFs");
-    assert_eq!(engine.model_name(), "DeepSeek-V4");
+    // The API identifier is the file stem (documented contract); the
+    // file's `general.name` ("DeepSeek-V4") is log-only.
+    assert_eq!(engine.model_name(), "model");
 
     std::fs::remove_dir_all(&dir).ok();
 }

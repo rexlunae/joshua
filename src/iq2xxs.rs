@@ -163,6 +163,12 @@ pub fn matmul_t_f16(
 
 /// Reinterpret `bytes` as IQ2_XXS blocks.  The packed layout is byte-aligned,
 /// so this only has to check the length is a whole number of blocks.
+///
+/// Safety: the caller must keep `bytes` alive for the returned slice's
+/// lifetime and must not mutate it — i.e. the source must be an immutable
+/// buffer or a read-only mapping of a file that no party modifies (see
+/// `mmap_tensor`'s safety model).  Every byte pattern is a valid block, so
+/// within the checked length the conversion cannot create invalid data.
 pub fn blocks_from_bytes(bytes: &[u8]) -> Result<&[BlockIq2Xxs]> {
     if !bytes.len().is_multiple_of(BLOCK_BYTES) {
         bail!(

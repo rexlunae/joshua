@@ -467,23 +467,22 @@ impl Engine {
         let gguf = read_gguf_header(&mmap)
             .map_err(|e| JoshuaError::ModelLoad(format!("GGUF read failed: {e}")))?;
 
-        // Prefer the model's own name from metadata; fall back to the file
-        // stem for files that do not carry one.  The metadata value is
-        // model-supplied (attacker-controlled by whoever ships the file), so
-        // it is sanitized before it can reach operator logs or the API's
-        // `model` field.
-        let model_name = gguf
+        // The API identifier is the file stem — the documented contract on
+        // `model_name` (see the field and accessor docs) — so clients keyed
+        // on it see no change.  The model's own `general.name` is sanitized
+        // (model-supplied metadata is attacker-controlled) and used only for
+        // the operator log line below.
+        let model_name = gguf_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let display_name = gguf
             .metadata
             .get("general.name")
             .and_then(|v| v.to_string().ok().cloned())
             .and_then(|s| sanitize_model_name(&s))
-            .unwrap_or_else(|| {
-                gguf_path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("unknown")
-                    .to_string()
-            });
+            .unwrap_or_else(|| model_name.clone());
 
         // Defer architectures candle cannot load (e.g. `deepseek4`) instead of
         // failing construction: an NPU backend may still serve them.  The
@@ -503,7 +502,7 @@ impl Engine {
 
         tracing::info!(
             "Model '{}' ready (arch={}, ctx={}, eos_ids={:?}, chat_template={}, device={:?})",
-            model_name,
+            display_name,
             arch.as_ref()
                 .map(|a| a.display_name())
                 .unwrap_or("unknown (NPU-only)"),

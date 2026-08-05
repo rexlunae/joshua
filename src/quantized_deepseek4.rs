@@ -179,14 +179,20 @@ impl Config {
         let q_lora_rank = m.u32(&format!("{a}.attention.q_lora_rank"))? as usize;
         let head_dim = m.u32_or(&format!("{a}.attention.key_length"), 0).max(1) as usize;
         // llama.cpp stores this at `{a}.rope.dimension_count`; older files used
-        // `{a}.attention.rope.dimension_count`.  Accept both so either loads.
+        // `{a}.attention.rope.dimension_count`.  Prefer the current key and
+        // fall back to the legacy one.  A file with neither is malformed for
+        // this architecture (every real model ships it), so refuse to load —
+        // a silent 1-wide rotary would only fail on the first generated token.
         let rope_head_dim = m
-            .u32_or(&format!("{a}.rope.dimension_count"), 0)
-            .max(1)
-            .max(
-                m.u32_or(&format!("{a}.attention.rope.dimension_count"), 0)
-                    .max(1),
-            ) as usize;
+            .u32(&format!("{a}.rope.dimension_count"))
+            .or_else(|_| m.u32(&format!("{a}.attention.rope.dimension_count")))
+            .map(|v| v as usize)
+            .map_err(|_| {
+                candle_core::Error::Msg(format!(
+                    "deepseek4: missing rotary-dimension metadata (`{a}.rope.dimension_count` \
+                     or legacy `{a}.attention.rope.dimension_count`)"
+                ))
+            })?;
         let nope_head_dim = head_dim.saturating_sub(rope_head_dim);
 
         let compress_ratios = m.array_u32(&format!("{a}.attention.compress_ratios"), n_layer);
@@ -1453,9 +1459,7 @@ impl<R: Read + Seek> Reader<R> {
                     .map(|r| r.tensor_data_offset)
                     .unwrap_or(self.ct.tensor_data_offset);
                 // Borrowing yields CPU-backed `QStorage`, so it is only sound
-                // when the model itself lives on the CPU.  On accelerator
-                // devices fall through to the f32 decode + copy below, which
-                // already honours `self.device`.
+                // when the model itself lives on the CPU.
                 if let Some(mmap) = self.mmap.as_ref().filter(|_| self.device.is_cpu()) {
                     if let Some(qt) = crate::mmap_tensor::borrowed_qtensor_raw(
                         mmap,
@@ -1467,8 +1471,19 @@ impl<R: Read + Seek> Reader<R> {
                         return Ok(qt);
                     }
                 }
-                // No mapping: decode to f32 and re-quantize as F32 so the
-                // QMatMul machinery downstream keeps working unchanged.
+                // Accelerator devices cannot borrow (the blocks are CPU
+                // storage), and decoding a real IQ2_XXS tensor to f32 is an
+                // order-of-magnitude memory blow-up (the expert tensors alone
+                // are ~40 GB of 2-bit data, ~640 GB as f32).  Fail fast with
+                // an explicit limitation instead of an allocation abort.
+                if !self.device.is_cpu() {
+                    candle_core::bail!(
+                        "deepseek4: tensor `{name}` has GGUF dtype {} which is only supported on the CPU device",
+                        info.dtype
+                    );
+                }
+                // No mapping (CPU): decode to f32 and re-quantize as F32 so
+                // the QMatMul machinery downstream keeps working unchanged.
                 let bytes = self.raw_bytes_from(name)?;
                 if info.dtype == crate::iq2xxs::GGML_TYPE_IQ2_XXS {
                     let blocks = crate::iq2xxs::blocks_from_bytes(&bytes)?;
@@ -1933,6 +1948,16 @@ fn split_iq2xxs_experts<R: Read + Seek>(
         tracing::warn!("deepseek4: could not borrow `{name}` from the mapping, decoding to f32");
     }
 
+    // The fallback below materializes the whole stacked tensor as f32 — an
+    // order-of-magnitude blow-up for real model footprints (~40 GB of 2-bit
+    // data becomes ~640 GB) — and accelerator devices cannot borrow the
+    // blocks (they are CPU storage).  Refuse loudly rather than OOM.
+    if !rd.device.is_cpu() {
+        candle_core::bail!(
+            "deepseek4: IQ2_XXS expert tensor `{name}` is only supported on the CPU device"
+        );
+    }
+
     // No mapping (or borrow declined): decode the whole tensor to f32 and hand
     // each expert over as an f32 QMatMul.  Only reachable in tests for the
     // production footprint of these tensors.
@@ -2151,16 +2176,19 @@ mod tests {
         assert_eq!(cfg.nope_head_dim, 512 - 64);
     }
 
-    /// Missing rope metadata must not collapse to a 1-wide rotary (which
-    /// produces an unreadable `[b, h, t, 1]` rope slice at runtime).
+    /// Missing rope metadata must be a load-time error, not a silent collapse
+    /// to a degenerate 1-wide rotary (which would produce an unreadable
+    /// `[b, h, t, 1]` rope slice mid-generation).
     #[test]
-    fn missing_rope_dim_still_yields_sane_default() {
-        let cfg = Config::from_metadata(&md()).unwrap();
-        assert!(cfg.rope_head_dim >= 1);
-        assert!(cfg.nope_head_dim <= cfg.head_dim);
+    fn missing_rope_dim_is_a_load_error() {
+        let err = match Config::from_metadata(&md()) {
+            Err(e) => e,
+            Ok(_) => panic!("from_metadata must reject a file with no rotary-dimension metadata"),
+        };
+        let msg = err.to_string();
         assert!(
-            cfg.rope_head_dim < cfg.head_dim,
-            "rope must not cover the whole head"
+            msg.contains("rope"),
+            "error should name the rotary-dimension metadata, got: {msg}"
         );
     }
 }
