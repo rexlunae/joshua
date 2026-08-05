@@ -835,7 +835,7 @@ pub fn write_tiny_deepseek4_gguf(path: &Path) {
         (key("attention.layer_norm_rms_epsilon"), f32v(1e-5)),
         (key("attention.q_lora_rank"), u32v(Q_LORA as u32)),
         (key("attention.key_length"), u32v(HEAD_DIM as u32)),
-        (key("attention.rope.dimension_count"), u32v(ROPE_DIM as u32)),
+        (key("rope.dimension_count"), u32v(ROPE_DIM as u32)),
         (
             key("attention.compress_ratios"),
             gguf_file::Value::Array(vec![u32v(0), u32v(0)]),

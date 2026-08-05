@@ -178,9 +178,15 @@ impl Config {
 
         let q_lora_rank = m.u32(&format!("{a}.attention.q_lora_rank"))? as usize;
         let head_dim = m.u32_or(&format!("{a}.attention.key_length"), 0).max(1) as usize;
+        // llama.cpp stores this at `{a}.rope.dimension_count`; older files used
+        // `{a}.attention.rope.dimension_count`.  Accept both so either loads.
         let rope_head_dim = m
-            .u32_or(&format!("{a}.attention.rope.dimension_count"), 0)
-            .max(1) as usize;
+            .u32_or(&format!("{a}.rope.dimension_count"), 0)
+            .max(1)
+            .max(
+                m.u32_or(&format!("{a}.attention.rope.dimension_count"), 0)
+                    .max(1),
+            ) as usize;
         let nope_head_dim = head_dim.saturating_sub(rope_head_dim);
 
         let compress_ratios = m.array_u32(&format!("{a}.attention.compress_ratios"), n_layer);
@@ -2077,4 +2083,65 @@ fn split_experts<R: Read + Seek>(
         experts.push(QMatMul::from_qtensor(qt)?);
     }
     Ok(experts)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn md() -> HashMap<String, gguf_file::Value> {
+        let mut m = HashMap::new();
+        let u32v = |v: u32| gguf_file::Value::U32(v);
+        let f32v = |v: f32| gguf_file::Value::F32(v);
+        m.insert("deepseek4.block_count".into(), u32v(43));
+        m.insert("deepseek4.attention.head_count".into(), u32v(64));
+        m.insert("deepseek4.embedding_length".into(), u32v(4096));
+        m.insert(
+            "deepseek4.attention.layer_norm_rms_epsilon".into(),
+            f32v(1e-6),
+        );
+        m.insert("deepseek4.attention.q_lora_rank".into(), u32v(1024));
+        m.insert("deepseek4.attention.key_length".into(), u32v(512));
+        m.insert("deepseek4.expert_count".into(), u32v(256));
+        m.insert("deepseek4.expert_used_count".into(), u32v(6));
+        m
+    }
+
+    /// The real DeepSeek-V4-Flash GGUFs store the rope dim at
+    /// `deepseek4.rope.dimension_count`; older files used the
+    /// `attention.`-prefixed key.  Both must parse to the same config.
+    #[test]
+    fn rope_dim_reads_both_metadata_keys() {
+        let mut m = md();
+        m.insert(
+            "deepseek4.rope.dimension_count".into(),
+            gguf_file::Value::U32(64),
+        );
+        let cfg = Config::from_metadata(&m).unwrap();
+        assert_eq!(cfg.rope_head_dim, 64);
+        assert_eq!(cfg.nope_head_dim, 512 - 64);
+
+        let mut m = md();
+        m.insert(
+            "deepseek4.attention.rope.dimension_count".into(),
+            gguf_file::Value::U32(64),
+        );
+        let cfg = Config::from_metadata(&m).unwrap();
+        assert_eq!(cfg.rope_head_dim, 64);
+        assert_eq!(cfg.nope_head_dim, 512 - 64);
+    }
+
+    /// Missing rope metadata must not collapse to a 1-wide rotary (which
+    /// produces an unreadable `[b, h, t, 1]` rope slice at runtime).
+    #[test]
+    fn missing_rope_dim_still_yields_sane_default() {
+        let cfg = Config::from_metadata(&md()).unwrap();
+        assert!(cfg.rope_head_dim >= 1);
+        assert!(cfg.nope_head_dim <= cfg.head_dim);
+        assert!(
+            cfg.rope_head_dim < cfg.head_dim,
+            "rope must not cover the whole head"
+        );
+    }
 }
