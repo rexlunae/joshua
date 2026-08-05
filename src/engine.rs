@@ -1517,6 +1517,36 @@ fn token_str_from_metadata(
 /// Those tensors are decoded by Joshua's own loaders via the raw header.
 fn read_gguf_header(mmap: &[u8]) -> Result<gguf_file::Content> {
     let header = crate::gguf_ext::read_header(&mut Cursor::new(mmap))?;
+    // The deepseek4 loader is the only one that reads tensors by their raw
+    // GGUF dtype id (IQ2_XXS, I32, …).  For every other architecture the
+    // candle loaders only ever see the projected `Content`, so an
+    // unsupported-dtype tensor would be dropped here and surface much later
+    // as a misleading "cannot find tensor" for a required weight — or, worse,
+    // silently treated as absent by a loader probing an optional tensor,
+    // changing the model without an error.  Refuse the load with the precise
+    // cause instead.  (An undetectable architecture is left alone: the load
+    // already fails with an accurate architecture error downstream.)
+    if let Ok(arch) = Architecture::detect(&header.metadata) {
+        if arch != Architecture::DeepSeek4 {
+            let unsupported = header.unsupported_tensors();
+            if !unsupported.is_empty() {
+                let names = unsupported
+                    .iter()
+                    .map(|(n, d)| format!("`{n}` (GGUF dtype id {d})"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(crate::JoshuaError::ModelLoad(format!(
+                    "GGUF header: model architecture '{}' contains {} tensor(s) in a GGUF \
+                     dtype the engine cannot decode: {}. Only the deepseek4 loader reads \
+                     tensors by raw dtype id; re-quantize this model to a candle-supported \
+                     format (F32/F16/Q8_0/Q4_K, …) or use a loader that decodes these dtypes.",
+                    arch.display_name(),
+                    unsupported.len(),
+                    names
+                )));
+            }
+        }
+    }
     header.to_candle_content()
 }
 

@@ -120,6 +120,24 @@ impl GgufHeader {
         out
     }
 
+    /// `(name, raw dtype id)` pairs for the tensors candle cannot represent,
+    /// sorted by name for deterministic error messages.
+    ///
+    /// These are exactly the tensors [`Self::to_candle_content`] drops, so a
+    /// caller that does not consult the raw header (any loader other than
+    /// deepseek4) must treat a non-empty result as "this file needs a decoder
+    /// that is not attached" rather than silently proceeding.
+    pub fn unsupported_tensors(&self) -> Vec<(String, u32)> {
+        let mut out: Vec<(String, u32)> = self
+            .tensors
+            .iter()
+            .filter(|(_, t)| !is_candle_supported(t.dtype))
+            .map(|(n, t)| (n.clone(), t.dtype))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
     /// Build a candle [`gguf_file::Content`] covering only the tensors candle
     /// can represent.
     ///
