@@ -442,6 +442,14 @@ pub fn type_size_bytes(dtype: u32, elems: usize) -> Option<usize> {
         7 => (32, 24), // Q5_1
         8 => (32, 34), // Q8_0
         9 => (32, 36), // Q8_1
+        // K-quants: QK_K = 256 elements per block.  Sizes mirror candle's
+        // block structs (k_quants.rs `const _: () = assert!(...)`).
+        10 => (256, 84),  // Q2_K
+        11 => (256, 110), // Q3_K
+        12 => (256, 144), // Q4_K
+        13 => (256, 176), // Q5_K
+        14 => (256, 210), // Q6_K
+        15 => (256, 292), // Q8_K
         26 => (1, 4),  // I32 (routed-expert id tables)
         crate::iq2xxs::GGML_TYPE_IQ2_XXS => (crate::iq2xxs::QK_IQ2_XXS, crate::iq2xxs::BLOCK_BYTES),
         crate::mxfp4::GGML_TYPE_MXFP4 => (crate::mxfp4::QK_MXFP4, 17),
@@ -817,5 +825,26 @@ mod tests {
         // Not a whole number of blocks.
         assert_eq!(type_size_bytes(crate::mxfp4::GGML_TYPE_MXFP4, 40), None);
         assert_eq!(type_size_bytes(0, 10), Some(40));
+    }
+
+    #[test]
+    fn k_quant_sizes_match_candle_block_layouts() {
+        // QK_K = 256 elements per block; bytes mirror candle's BlockQ*K
+        // structs (Q2K: 16+64+4, Q3K: 32+64+12+2, Q4K: 128+12+4,
+        // Q5K: 32+128+12+4, Q6K: 192+16+2, Q8K: 4+256+32).
+        for (dtype, bytes_per_block) in [(10, 84), (11, 110), (12, 144), (13, 176), (14, 210), (15, 292)] {
+            assert_eq!(
+                type_size_bytes(dtype, 256),
+                Some(bytes_per_block),
+                "dtype {dtype}: one block"
+            );
+            assert_eq!(
+                type_size_bytes(dtype, 512),
+                Some(2 * bytes_per_block),
+                "dtype {dtype}: two blocks"
+            );
+            // Not a whole number of blocks.
+            assert_eq!(type_size_bytes(dtype, 128), None, "dtype {dtype}: half block");
+        }
     }
 }

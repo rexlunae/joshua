@@ -164,41 +164,74 @@ fn matmul_t_impl(
     if n == 0 || m == 0 {
         return Ok(());
     }
-    if crate::simd::avx2_fma_available() {
-        // The AVX2 kernel writes every dst element exactly once, so no
-        // zero-fill is needed up front.
-        let dst_ptr = crate::simd::DstPtr::new(dst);
-        let worker = |row: usize| {
-            // SAFETY: avx2_fma_available() was checked above, so the
-            // target_feature kernel may run on this CPU; row `row` writes
-            // exactly dst[i*n + row] for i in 0..m, disjoint from every
-            // other row (see `crate::simd`'s safety model).
-            unsafe { matmul_row_avx2(m, k, n, lhs, rhs, blocks_per_row, row, &dst_ptr) }
-        };
-        if parallel {
-            crate::simd::for_each_row(n, worker);
-        } else {
-            for row in 0..n {
-                worker(row);
-            }
-        }
+    if try_avx2_matmul(mkn, blocks_per_row, lhs, rhs, dst, parallel) {
+        return Ok(());
+    }
+    // Scalar path: dst must start at zero because each block's partial
+    // dot is accumulated into it (matching the original implementation).
+    dst.fill(0.0);
+    let dst_ptr = crate::simd::DstPtr::new(dst);
+    let worker = |row: usize| {
+        matmul_row_scalar(m, k, n, lhs, rhs, blocks_per_row, row, &dst_ptr);
+    };
+    if parallel {
+        crate::simd::for_each_row(n, worker);
     } else {
-        // Scalar path: dst must start at zero because each block's partial
-        // dot is accumulated into it (matching the original implementation).
-        dst.fill(0.0);
-        let dst_ptr = crate::simd::DstPtr::new(dst);
-        let worker = |row: usize| {
-            matmul_row_scalar(m, k, n, lhs, rhs, blocks_per_row, row, &dst_ptr);
-        };
-        if parallel {
-            crate::simd::for_each_row(n, worker);
-        } else {
-            for row in 0..n {
-                worker(row);
-            }
+        for row in 0..n {
+            worker(row);
         }
     }
     Ok(())
+}
+
+/// AVX2/FMA fast path for [`matmul_t_impl`]: fused IQ2_XXS dequant+dot for
+/// every row.  Returns `true` if it ran.  The kernel (and its const f32
+/// tables) are `#[cfg(target_arch = "x86_64")]`, so the whole branch lives
+/// behind the same cfg here — on other targets this stub returns `false` and
+/// callers use the portable scalar path.
+#[cfg(target_arch = "x86_64")]
+fn try_avx2_matmul(
+    mkn: (usize, usize, usize),
+    blocks_per_row: usize,
+    lhs: &[f32],
+    rhs: &[BlockIq2Xxs],
+    dst: &mut [f32],
+    parallel: bool,
+) -> bool {
+    let (m, k, n) = mkn;
+    if !crate::simd::avx2_fma_available() {
+        return false;
+    }
+    // The AVX2 kernel writes every dst element exactly once, so no
+    // zero-fill is needed up front.
+    let dst_ptr = crate::simd::DstPtr::new(dst);
+    let worker = |row: usize| {
+        // SAFETY: avx2_fma_available() was checked above, so the
+        // target_feature kernel may run on this CPU; row `row` writes
+        // exactly dst[i*n + row] for i in 0..m, disjoint from every
+        // other row (see `crate::simd`'s safety model).
+        unsafe { matmul_row_avx2(m, k, n, lhs, rhs, blocks_per_row, row, &dst_ptr) }
+    };
+    if parallel {
+        crate::simd::for_each_row(n, worker);
+    } else {
+        for row in 0..n {
+            worker(row);
+        }
+    }
+    true
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn try_avx2_matmul(
+    _mkn: (usize, usize, usize),
+    _blocks_per_row: usize,
+    _lhs: &[f32],
+    _rhs: &[BlockIq2Xxs],
+    _dst: &mut [f32],
+    _parallel: bool,
+) -> bool {
+    false
 }
 
 /// Scalar per-row worker: decode each block and accumulate `lhs · block`
