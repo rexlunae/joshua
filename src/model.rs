@@ -24,7 +24,7 @@
 //! or mislabelled file.
 
 use std::collections::HashMap;
-use std::io::{Read, Seek};
+use std::io::{Read, Seek, SeekFrom};
 
 use candle_core::quantized::gguf_file;
 use candle_core::{DType, Device, Result, Tensor};
@@ -310,6 +310,22 @@ impl QuantizedModel {
 
         tracing::info!("Detected model architecture: {}", arch.display_name());
 
+        // Re-read the header the way `gguf_ext` does: with each tensor's dtype
+        // kept as its raw GGUF id.  Candle's `Content` cannot name IQ2_XXS or
+        // I32, so the deepseek4 loader needs this to decode those tensors.
+        // The reader is rewound to where candle's header parse left it
+        // (the aligned data start) afterwards, so nothing downstream shifts.
+        let data_pos = reader.stream_position()?;
+        let raw =
+            (|| -> std::result::Result<Option<crate::gguf_ext::GgufHeader>, crate::JoshuaError> {
+                reader.seek(SeekFrom::Start(0))?;
+                let h = crate::gguf_ext::read_header(reader)?;
+                reader.seek(SeekFrom::Start(data_pos))?;
+                Ok(Some(h))
+            })()
+            .unwrap_or(None);
+        let raw = raw.as_ref();
+
         match arch {
             Architecture::Llama => {
                 quantized_llama::ModelWeights::from_gguf(gguf, reader, device).map(Self::Llama)
@@ -330,8 +346,7 @@ impl QuantizedModel {
             }
             Architecture::Phi3 => {
                 // CPU-only: flash attention not available.
-                quantized_phi3::ModelWeights::from_gguf(false, gguf, reader, device)
-                    .map(Self::Phi3)
+                quantized_phi3::ModelWeights::from_gguf(false, gguf, reader, device).map(Self::Phi3)
             }
             Architecture::Qwen2 => {
                 quantized_qwen2::ModelWeights::from_gguf(gguf, reader, device).map(Self::Qwen2)
@@ -344,17 +359,13 @@ impl QuantizedModel {
                     .map(Self::Qwen3Moe)
             }
             Architecture::DeepSeek2 => {
-                crate::quantized_deepseek2::ModelWeights::from_gguf_mmap(
-                    gguf, reader, device, mmap,
-                )
-                .map(Self::DeepSeek2)
+                crate::quantized_deepseek2::ModelWeights::from_gguf_mmap(gguf, reader, device, mmap)
+                    .map(Self::DeepSeek2)
             }
-            Architecture::DeepSeek4 => {
-                crate::quantized_deepseek4::ModelWeights::from_gguf_mmap(
-                    gguf, reader, device, mmap,
-                )
-                .map(Self::DeepSeek4)
-            }
+            Architecture::DeepSeek4 => crate::quantized_deepseek4::ModelWeights::from_gguf_mmap(
+                gguf, raw, reader, device, mmap,
+            )
+            .map(Self::DeepSeek4),
         }
     }
 
@@ -393,7 +404,10 @@ impl QuantizedModel {
     pub fn supports_kv_clear(&self) -> bool {
         matches!(
             self,
-            Self::Llama(_) | Self::Qwen2(_) | Self::Qwen3(_) | Self::DeepSeek2(_)
+            Self::Llama(_)
+                | Self::Qwen2(_)
+                | Self::Qwen3(_)
+                | Self::DeepSeek2(_)
                 | Self::DeepSeek4(_)
         )
     }

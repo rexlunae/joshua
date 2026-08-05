@@ -13,10 +13,10 @@
 //! touched, and regardless of whether the caller intended to decode it.
 //!
 //! This reader parses the same header but keeps each tensor's dtype as its raw
-//! `u32`, so unknown types survive to be handled by [`crate::mxfp4`] (or
-//! reported precisely).  Metadata is decoded into candle's own
-//! [`gguf_file::Value`] so existing hyper-parameter code keeps working
-//! unchanged.
+//! `u32`, so unknown types survive to be handled by [`crate::mxfp4`],
+//! [`crate::iq2xxs`] (or reported precisely).  Metadata is decoded into
+//! candle's own [`gguf_file::Value`] so existing hyper-parameter code keeps
+//! working unchanged.
 //!
 //! Only the header is read.  Tensor *data* is never touched here — callers
 //! borrow it from the memory mapping via [`crate::mmap_tensor`], which is what
@@ -25,7 +25,8 @@
 use std::collections::HashMap;
 use std::io::{Read, Seek};
 
-use candle_core::quantized::gguf_file::Value;
+use candle_core::quantized::gguf_file::{self, Value, VersionedMagic};
+use candle_core::quantized::GgmlDType;
 
 use crate::{JoshuaError, Result};
 
@@ -35,6 +36,36 @@ const DEFAULT_ALIGNMENT: u64 = 32;
 /// Guards against a corrupt or hostile header claiming an absurd count and
 /// making us attempt a huge allocation before any real data is read.
 const MAX_COUNT: u64 = 1 << 24;
+
+/// GGUF dtype ids candle's `GgmlDType` table can represent.
+///
+/// Candle maps only 0,1,2,3,6..15,30 (see `GgmlDType::from_u32`, which is
+/// crate-private, so the set is mirrored here).
+pub fn is_candle_supported(dtype: u32) -> bool {
+    matches!(dtype, 0..=3 | 6..=15 | 30)
+}
+
+/// Mirror of candle's (crate-private) `GgmlDType::from_u32`.
+pub fn ggml_dtype_from_id(dtype: u32) -> Option<GgmlDType> {
+    Some(match dtype {
+        0 => GgmlDType::F32,
+        1 => GgmlDType::F16,
+        2 => GgmlDType::Q4_0,
+        3 => GgmlDType::Q4_1,
+        6 => GgmlDType::Q5_0,
+        7 => GgmlDType::Q5_1,
+        8 => GgmlDType::Q8_0,
+        9 => GgmlDType::Q8_1,
+        10 => GgmlDType::Q2K,
+        11 => GgmlDType::Q3K,
+        12 => GgmlDType::Q4K,
+        13 => GgmlDType::Q5K,
+        14 => GgmlDType::Q6K,
+        15 => GgmlDType::Q8K,
+        30 => GgmlDType::BF16,
+        _ => return None,
+    })
+}
 
 /// A tensor's location and type, with the dtype left as its raw GGUF id.
 #[derive(Debug, Clone)]
@@ -56,7 +87,7 @@ impl RawTensorInfo {
 }
 
 /// A parsed GGUF header.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct GgufHeader {
     pub version: u32,
     pub metadata: HashMap<String, Value>,
@@ -82,11 +113,51 @@ impl GgufHeader {
             .tensors
             .values()
             .map(|t| t.dtype)
-            .filter(|d| !matches!(d, 0..=3 | 6..=15 | 30))
+            .filter(|d| !is_candle_supported(*d))
             .collect();
         out.sort_unstable();
         out.dedup();
         out
+    }
+
+    /// Build a candle [`gguf_file::Content`] covering only the tensors candle
+    /// can represent.
+    ///
+    /// Tensors whose dtype is outside candle's table (IQ2_XXS, I32, MXFP4,
+    /// …) are dropped: the header reader in candle hard-fails on the first
+    /// one, and their data is decoded by Joshua's own loaders, which consult
+    /// this raw header instead.
+    pub fn to_candle_content(&self) -> Result<gguf_file::Content> {
+        let magic = match self.version {
+            1 => VersionedMagic::GgufV1,
+            2 => VersionedMagic::GgufV2,
+            3 => VersionedMagic::GgufV3,
+            other => {
+                return Err(crate::JoshuaError::ModelLoad(format!(
+                    "GGUF header: unsupported version {other}"
+                )))
+            }
+        };
+        let mut tensor_infos = HashMap::with_capacity(self.tensors.len());
+        for (name, info) in &self.tensors {
+            let Some(dtype) = ggml_dtype_from_id(info.dtype) else {
+                continue;
+            };
+            tensor_infos.insert(
+                name.clone(),
+                gguf_file::TensorInfo {
+                    ggml_dtype: dtype,
+                    shape: info.dims.clone().into(),
+                    offset: info.offset,
+                },
+            );
+        }
+        Ok(gguf_file::Content {
+            magic,
+            metadata: self.metadata.clone(),
+            tensor_infos,
+            tensor_data_offset: self.tensor_data_offset,
+        })
     }
 }
 
@@ -224,7 +295,14 @@ pub fn read_header<R: Read + Seek>(r: &mut R) -> Result<GgufHeader> {
         dims.reverse();
         let dtype = rd.u32()?;
         let offset = rd.u64()?;
-        tensors.insert(name, RawTensorInfo { dtype, dims, offset });
+        tensors.insert(
+            name,
+            RawTensorInfo {
+                dtype,
+                dims,
+                offset,
+            },
+        );
     }
 
     let alignment = match metadata.get("general.alignment") {
@@ -252,8 +330,8 @@ pub fn read_header<R: Read + Seek>(r: &mut R) -> Result<GgufHeader> {
 
 /// Byte size of a tensor of `elems` elements in ggml type `dtype`.
 ///
-/// Covers the types Joshua can decode, including MXFP4, which candle cannot
-/// describe at all.
+/// Covers the types Joshua can decode, including MXFP4 and IQ2_XXS, which
+/// candle cannot describe at all.
 pub fn type_size_bytes(dtype: u32, elems: usize) -> Option<usize> {
     // (block size in elements, bytes per block)
     let (blck, bytes) = match dtype {
@@ -266,6 +344,8 @@ pub fn type_size_bytes(dtype: u32, elems: usize) -> Option<usize> {
         7 => (32, 24), // Q5_1
         8 => (32, 34), // Q8_0
         9 => (32, 36), // Q8_1
+        26 => (1, 4),  // I32 (routed-expert id tables)
+        crate::iq2xxs::GGML_TYPE_IQ2_XXS => (crate::iq2xxs::QK_IQ2_XXS, crate::iq2xxs::BLOCK_BYTES),
         crate::mxfp4::GGML_TYPE_MXFP4 => (crate::mxfp4::QK_MXFP4, 17),
         _ => return None,
     };
@@ -287,7 +367,7 @@ mod tests {
         b.extend_from_slice(&3u32.to_le_bytes()); // version
         b.extend_from_slice(&1u64.to_le_bytes()); // tensor count
         b.extend_from_slice(&1u64.to_le_bytes()); // kv count
-        // general.architecture = "kimi-k3"
+                                                  // general.architecture = "kimi-k3"
         let k = b"general.architecture";
         b.extend_from_slice(&(k.len() as u64).to_le_bytes());
         b.extend_from_slice(k);
@@ -374,10 +454,7 @@ mod tests {
 
     #[test]
     fn mxfp4_size_is_seventeen_bytes_per_thirty_two_elements() {
-        assert_eq!(
-            type_size_bytes(crate::mxfp4::GGML_TYPE_MXFP4, 64),
-            Some(34)
-        );
+        assert_eq!(type_size_bytes(crate::mxfp4::GGML_TYPE_MXFP4, 64), Some(34));
         // Not a whole number of blocks.
         assert_eq!(type_size_bytes(crate::mxfp4::GGML_TYPE_MXFP4, 40), None);
         assert_eq!(type_size_bytes(0, 10), Some(40));

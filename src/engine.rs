@@ -332,9 +332,7 @@ impl GenSession {
                     .map_err(|e| JoshuaError::Inference(e.to_string()))?;
                 squeeze_batch_logits(&logits)
             }
-            Self::Npu(session) => session
-                .forward(tokens, pos)
-                .map_err(JoshuaError::Inference),
+            Self::Npu(session) => session.forward(tokens, pos).map_err(JoshuaError::Inference),
         }
     }
 
@@ -425,7 +423,11 @@ impl Engine {
     /// Load a GGUF model with full [`EngineOptions`] (context size and the
     /// huge-page backing strategy).
     pub fn with_options(model_path: impl AsRef<Path>, options: EngineOptions) -> Result<Self> {
-        let n_ctx = if options.n_ctx == 0 { 4096 } else { options.n_ctx };
+        let n_ctx = if options.n_ctx == 0 {
+            4096
+        } else {
+            options.n_ctx
+        };
         let raw_path = model_path.as_ref().to_path_buf();
 
         // Resolve the actual .gguf file path.
@@ -434,12 +436,6 @@ impl Engine {
         } else {
             raw_path
         };
-
-        let model_name = gguf_path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("unknown")
-            .to_string();
 
         tracing::info!("Loading model from {:?}", gguf_path);
 
@@ -465,9 +461,25 @@ impl Engine {
         let mmap = map_model(&gguf_path, options.huge_pages, options.lazy_weights)?;
 
         // Read GGUF metadata once to validate the architecture up front and
-        // extract EOS token IDs.
-        let gguf = gguf_file::Content::read(&mut Cursor::new(&mmap[..]))
+        // extract EOS token IDs.  The tolerant reader keeps dtypes candle
+        // cannot represent (IQ2_XXS, I32, MXFP4), so files using them reach
+        // arch detection instead of dying on the first unknown dtype.
+        let gguf = read_gguf_header(&mmap)
             .map_err(|e| JoshuaError::ModelLoad(format!("GGUF read failed: {e}")))?;
+
+        // Prefer the model's own name from metadata; fall back to the file
+        // stem for files that do not carry one.
+        let model_name = gguf
+            .metadata
+            .get("general.name")
+            .and_then(|v| v.to_string().ok().cloned())
+            .unwrap_or_else(|| {
+                gguf_path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("unknown")
+                    .to_string()
+            });
 
         // Defer architectures candle cannot load (e.g. `deepseek4`) instead of
         // failing construction: an NPU backend may still serve them.  The
@@ -488,7 +500,9 @@ impl Engine {
         tracing::info!(
             "Model '{}' ready (arch={}, ctx={}, eos_ids={:?}, chat_template={}, device={:?})",
             model_name,
-            arch.as_ref().map(|a| a.display_name()).unwrap_or("unknown (NPU-only)"),
+            arch.as_ref()
+                .map(|a| a.display_name())
+                .unwrap_or("unknown (NPU-only)"),
             n_ctx,
             eos_token_ids,
             if chat_template.is_some() {
@@ -677,7 +691,10 @@ impl Engine {
     ) -> Result<(String, UsageInfo, f64, f64)> {
         // Multimodal branch: messages carrying images go through a
         // media-capable NPU/llama.cpp plugin session.
-        if messages.iter().any(|m| m.images.as_ref().is_some_and(|i| !i.is_empty())) {
+        if messages
+            .iter()
+            .any(|m| m.images.as_ref().is_some_and(|i| !i.is_empty()))
+        {
             let (marked_messages, images) = resolve_message_media(messages)?;
             let (prompt, _) = self.format_prompt(&marked_messages, tools);
             return self.complete_media(&prompt, &images, options);
@@ -771,7 +788,11 @@ impl Engine {
     /// Clamp a request's generation length to the server's `max_output_tokens`
     /// ceiling and, when the prompt length is known, the remaining context
     /// window — so a client-supplied `max_tokens` can't force unbounded work.
-    fn clamp_options(&self, options: &GenerationOptions, prompt_len: Option<usize>) -> GenerationOptions {
+    fn clamp_options(
+        &self,
+        options: &GenerationOptions,
+        prompt_len: Option<usize>,
+    ) -> GenerationOptions {
         let mut clamped = options.clone();
         let mut cap = clamped.max_tokens.min(self.max_output_tokens);
         if let Some(n_prompt) = prompt_len {
@@ -1044,7 +1065,10 @@ impl Engine {
                 .map_err(|e| JoshuaError::Tokenization(e.to_string()))?;
             let tokens = encoding.get_ids();
             if tokens.len() >= self.n_ctx as usize {
-                return Err(JoshuaError::PromptTooLong(tokens.len(), self.n_ctx as usize));
+                return Err(JoshuaError::PromptTooLong(
+                    tokens.len(),
+                    self.n_ctx as usize,
+                ));
             }
             total_tokens += tokens.len() as u32;
             let vector = model
@@ -1232,7 +1256,7 @@ impl Engine {
             return Err(JoshuaError::ModelLoad(msg));
         }
         let mut cursor = Cursor::new(&self.mmap[..]);
-        let gguf = gguf_file::Content::read(&mut cursor)
+        let gguf = read_gguf_header(&self.mmap)
             .map_err(|e| JoshuaError::ModelLoad(format!("GGUF read failed: {e}")))?;
         // Hand the loader the mapping so architectures Joshua implements
         // itself can borrow weights in place rather than copying them.
@@ -1410,7 +1434,9 @@ fn map_model_hugetlb(path: &Path, file: &File, size: PageSize) -> Result<Mmap> {
     // Copy the model bytes into the huge-page-backed region.
     File::open(path)?
         .read_exact(&mut anon[..len])
-        .map_err(|e| JoshuaError::ModelLoad(format!("reading model into huge pages failed: {e}")))?;
+        .map_err(|e| {
+            JoshuaError::ModelLoad(format!("reading model into huge pages failed: {e}"))
+        })?;
 
     let mmap = anon
         .make_read_only()
@@ -1488,6 +1514,14 @@ fn token_str_from_metadata(
 /// llama.cpp's converters store the HuggingFace chat template verbatim under
 /// `tokenizer.chat_template`.  BOS/EOS strings are resolved from their token
 /// IDs so the template can interpolate them.
+/// Parse the GGUF header tolerantly (raw dtype ids) and project it onto
+/// candle's `Content`, dropping tensors whose dtype candle cannot name.
+/// Those tensors are decoded by Joshua's own loaders via the raw header.
+fn read_gguf_header(mmap: &[u8]) -> Result<gguf_file::Content> {
+    let header = crate::gguf_ext::read_header(&mut Cursor::new(mmap))?;
+    header.to_candle_content()
+}
+
 fn extract_chat_template(gguf: &gguf_file::Content, tokenizer: &Tokenizer) -> Option<ChatTemplate> {
     let source = gguf
         .metadata
@@ -1498,10 +1532,10 @@ fn extract_chat_template(gguf: &gguf_file::Content, tokenizer: &Tokenizer) -> Op
     if source.trim().is_empty() {
         return None;
     }
-    let bos = token_str_from_metadata(gguf, "tokenizer.ggml.bos_token_id", tokenizer)
-        .unwrap_or_default();
-    let eos = token_str_from_metadata(gguf, "tokenizer.ggml.eos_token_id", tokenizer)
-        .unwrap_or_default();
+    let bos =
+        token_str_from_metadata(gguf, "tokenizer.ggml.bos_token_id", tokenizer).unwrap_or_default();
+    let eos =
+        token_str_from_metadata(gguf, "tokenizer.ggml.eos_token_id", tokenizer).unwrap_or_default();
     Some(ChatTemplate::new(source, bos, eos))
 }
 
@@ -1638,7 +1672,9 @@ fn sample_token(
         if sum > 0.0 {
             let mut sorted_idx: Vec<usize> = (0..probs.len()).collect();
             sorted_idx.sort_unstable_by(|&a, &b| {
-                probs[b].partial_cmp(&probs[a]).unwrap_or(std::cmp::Ordering::Equal)
+                probs[b]
+                    .partial_cmp(&probs[a])
+                    .unwrap_or(std::cmp::Ordering::Equal)
             });
             let mut cumsum = 0.0_f32;
             let mut cut_from = probs.len();
@@ -1671,8 +1707,7 @@ fn sample_token(
         *p /= total;
     }
 
-    let dist =
-        WeightedIndex::new(&probs).map_err(|e| JoshuaError::Inference(e.to_string()))?;
+    let dist = WeightedIndex::new(&probs).map_err(|e| JoshuaError::Inference(e.to_string()))?;
     Ok(dist.sample(rng) as u32)
 }
 
@@ -1693,7 +1728,10 @@ mod tests {
     #[test]
     fn default_hugepage_bytes_is_sane() {
         let bytes = default_hugepage_bytes();
-        assert!(bytes >= 2 * 1024 * 1024 && bytes.is_power_of_two(), "got {bytes}");
+        assert!(
+            bytes >= 2 * 1024 * 1024 && bytes.is_power_of_two(),
+            "got {bytes}"
+        );
     }
 
     #[test]
@@ -1743,4 +1781,3 @@ mod tests {
         assert!(load_image_bytes("https://example.com/x.png").is_err());
     }
 }
-

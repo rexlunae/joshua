@@ -33,13 +33,15 @@
 //! `llama_model_deepseek4` (`/tmp/deepseek4.cpp`, `/tmp/kv-dsv4.cpp`).
 
 use std::borrow::Cow;
-use std::io::{Read, Seek};
+use std::io::{Read, Seek, SeekFrom};
 use std::sync::Arc;
 
 use candle_core::quantized::{gguf_file, GgmlDType, QMatMul, QStorage, QTensor};
 use candle_core::{DType, Device, Module, Result, Tensor, D};
 use candle_nn::ops::{sigmoid, silu, softmax, softmax_last_dim};
 use candle_transformers::quantized_nn::RmsNorm;
+
+use crate::gguf_ext::GgufHeader;
 
 /// Numerically stable `log(1 + exp(x))`.
 fn softplus(x: &Tensor) -> Result<Tensor> {
@@ -1100,7 +1102,11 @@ impl Attention {
             kv_raw.index_select(&Tensor::from_vec(rows, (win,), dev)?, 0)?
         } else {
             let ring: Vec<u32> = (offset..offset + seq).map(|p| (p % win) as u32).collect();
-            let ridx = Tensor::from_vec(ring, (seq, 1), dev)?.broadcast_as((seq, self.head_dim))?;
+            // Broadcast index views are not contiguous; scatter requires a
+            // dense index tensor (short prompts land here).
+            let ridx = Tensor::from_vec(ring, (seq, 1), dev)?
+                .broadcast_as((seq, self.head_dim))?
+                .contiguous()?;
             swa_prev.scatter(&ridx, &kv_raw, 0)?
         });
 
@@ -1420,6 +1426,9 @@ pub struct ModelWeights {
 /// Small GGUF reader over the memory-mapped file.
 struct Reader<R: Read + Seek> {
     ct: gguf_file::Content,
+    /// Raw header with every tensor's dtype as its GGUF id, including types
+    /// candle cannot represent (IQ2_XXS experts, I32 id tables).
+    raw: Option<GgufHeader>,
     reader: R,
     device: Device,
     mmap: Option<std::sync::Arc<memmap2::Mmap>>,
@@ -1427,6 +1436,43 @@ struct Reader<R: Read + Seek> {
 
 impl<R: Read + Seek> Reader<R> {
     fn qtensor(&mut self, name: &str) -> Result<QTensor> {
+        // Tensors candle cannot represent never make it into `ct`; borrow them
+        // from the mapping (or read + decode) using the raw header instead.
+        let raw_info = self.raw.as_ref().and_then(|r| r.tensors.get(name)).cloned();
+        if let Some(info) = raw_info {
+            if !crate::gguf_ext::is_candle_supported(info.dtype) {
+                let tensor_data_offset = self
+                    .raw
+                    .as_ref()
+                    .map(|r| r.tensor_data_offset)
+                    .unwrap_or(self.ct.tensor_data_offset);
+                if let Some(mmap) = &self.mmap {
+                    if let Some(qt) = crate::mmap_tensor::borrowed_qtensor_raw(
+                        mmap,
+                        info.dtype,
+                        info.offset,
+                        tensor_data_offset,
+                        info.dims.clone().into(),
+                    )? {
+                        return Ok(qt);
+                    }
+                }
+                // No mapping: decode to f32 and re-quantize as F32 so the
+                // QMatMul machinery downstream keeps working unchanged.
+                let bytes = self.raw_bytes_from(name)?;
+                if info.dtype == crate::iq2xxs::GGML_TYPE_IQ2_XXS {
+                    let blocks = crate::iq2xxs::blocks_from_bytes(&bytes)?;
+                    let mut f32s = vec![0f32; info.elem_count()];
+                    crate::iq2xxs::dequantize(blocks, &mut f32s)?;
+                    let t = Tensor::from_vec(f32s, info.dims.clone(), &self.device)?;
+                    return QTensor::quantize(&t, GgmlDType::F32);
+                }
+                candle_core::bail!(
+                    "deepseek4: tensor `{name}` has GGUF dtype {} which has no decoder here",
+                    info.dtype
+                );
+            }
+        }
         if let Some(mmap) = &self.mmap {
             return crate::mmap_tensor::qtensor_from_mmap(
                 &self.ct,
@@ -1437,6 +1483,59 @@ impl<R: Read + Seek> Reader<R> {
             );
         }
         self.ct.tensor(&mut self.reader, name, &self.device)
+    }
+
+    /// Read a tensor's raw bytes from the underlying reader using the raw
+    /// header (works for dtypes candle cannot describe).
+    fn raw_bytes_from(&mut self, name: &str) -> Result<Vec<u8>> {
+        let (offset, tensor_data_offset, size) =
+            {
+                let raw = self.raw.as_ref().ok_or_else(|| {
+                    candle_core::Error::Msg(format!("no raw header for `{name}`"))
+                })?;
+                let info = raw.tensors.get(name).ok_or_else(|| {
+                    candle_core::Error::Msg(format!("deepseek4: tensor `{name}` not in raw header"))
+                })?;
+                let size = crate::gguf_ext::type_size_bytes(info.dtype, info.elem_count())
+                    .ok_or_else(|| {
+                        candle_core::Error::Msg(format!(
+                            "deepseek4: no size known for GGUF dtype {}",
+                            info.dtype
+                        ))
+                    })?;
+                (info.offset, raw.tensor_data_offset, size)
+            };
+        self.reader
+            .seek(SeekFrom::Start(tensor_data_offset + offset))?;
+        let mut buf = vec![0u8; size];
+        self.reader.read_exact(&mut buf)?;
+        Ok(buf)
+    }
+
+    /// Load an I32 tensor (GGUF dtype 26) as f32.  Used for the routed-expert
+    /// id tables in hash layers, which candle's dtype table cannot name.
+    fn i32_to_f32_tensor(&mut self, name: &str) -> Result<Tensor> {
+        let is_i32 = self
+            .raw
+            .as_ref()
+            .and_then(|r| r.tensors.get(name))
+            .map(|info| info.dtype == 26)
+            .unwrap_or(false);
+        if !is_i32 {
+            return self.f32_tensor(name);
+        }
+        let dims = self
+            .raw
+            .as_ref()
+            .and_then(|r| r.tensors.get(name))
+            .map(|info| info.dims.clone())
+            .unwrap_or_default();
+        let bytes = self.raw_bytes_from(name)?;
+        let mut vals = Vec::with_capacity(bytes.len() / 4);
+        for chunk in bytes.chunks_exact(4) {
+            vals.push(i32::from_le_bytes(chunk.try_into().unwrap()) as f32);
+        }
+        Tensor::from_vec(vals, dims, &self.device)
     }
     fn qmatmul(&mut self, name: &str) -> Result<QMatMul> {
         QMatMul::from_qtensor(self.qtensor(name)?)
@@ -1468,12 +1567,17 @@ impl ModelWeights {
         reader: &mut R,
         device: &Device,
     ) -> Result<Self> {
-        Self::from_gguf_mmap(ct, reader, device, None)
+        Self::from_gguf_mmap(ct, None, reader, device, None)
     }
 
     /// Load with weights borrowed in place from `mmap` where possible.
+    ///
+    /// `raw` is the GGUF header with raw dtype ids (see [`crate::gguf_ext`]);
+    /// it carries the IQ2_XXS and I32 tensors that candle's [`GgmlDType`]
+    /// cannot represent and that are therefore absent from `ct`.
     pub fn from_gguf_mmap<R: Read + Seek>(
         ct: gguf_file::Content,
+        raw: Option<&GgufHeader>,
         reader: &mut R,
         device: &Device,
         mmap: Option<std::sync::Arc<memmap2::Mmap>>,
@@ -1481,6 +1585,7 @@ impl ModelWeights {
         let cfg = Config::from_metadata(&ct.metadata)?;
         let mut rd = Reader {
             ct,
+            raw: raw.cloned(),
             reader,
             device: device.clone(),
             mmap,
@@ -1751,6 +1856,80 @@ impl ModelWeights {
     }
 }
 
+/// Slice an IQ2_XXS expert tensor (`[n_expert, out, in]`, GGUF dims reversed)
+/// into per-expert [`QMatMul`]s whose blocks stay in the mapping.
+fn split_iq2xxs_experts<R: Read + Seek>(
+    rd: &mut Reader<R>,
+    name: &str,
+    info: &crate::gguf_ext::RawTensorInfo,
+    n_expert: usize,
+) -> Result<Vec<QMatMul>> {
+    let dims = info.dims.clone();
+    if dims.len() != 3 || dims[0] != n_expert {
+        candle_core::bail!(
+            "deepseek4: expected expert tensor `{name}` shaped [n_expert, out, in], got {dims:?}"
+        );
+    }
+    let (out, inn) = (dims[1], dims[2]);
+    let per_elems = out * inn;
+    if !per_elems.is_multiple_of(crate::iq2xxs::QK_IQ2_XXS) {
+        candle_core::bail!(
+            "deepseek4: IQ2_XXS expert `{name}` rows {out}x{inn} are not a multiple of {}",
+            crate::iq2xxs::QK_IQ2_XXS
+        );
+    }
+    let per_bytes = per_elems / crate::iq2xxs::QK_IQ2_XXS * crate::iq2xxs::BLOCK_BYTES;
+    let tensor_data_offset = rd
+        .raw
+        .as_ref()
+        .map(|r| r.tensor_data_offset)
+        .unwrap_or(rd.ct.tensor_data_offset);
+
+    // Zero-copy: one borrowed QTensor per expert, pointing into the mapping.
+    if let Some(mmap) = &rd.mmap {
+        let base = tensor_data_offset.saturating_add(info.offset) as usize;
+        let mut experts = Vec::with_capacity(n_expert);
+        for e in 0..n_expert {
+            match crate::mmap_tensor::borrowed_range_iq2xxs(
+                mmap,
+                base + e * per_bytes,
+                (out, inn).into(),
+            )? {
+                Some(qt) => experts.push(QMatMul::from_qtensor(qt)?),
+                None => {
+                    experts.clear();
+                    break;
+                }
+            }
+        }
+        if experts.len() == n_expert {
+            return Ok(experts);
+        }
+        tracing::warn!("deepseek4: could not borrow `{name}` from the mapping, decoding to f32");
+    }
+
+    // No mapping (or borrow declined): decode the whole tensor to f32 and hand
+    // each expert over as an f32 QMatMul.  Only reachable in tests for the
+    // production footprint of these tensors.
+    let bytes = rd.raw_bytes_from(name)?;
+    let blocks = crate::iq2xxs::blocks_from_bytes(&bytes)?;
+    let mut all = vec![0f32; info.elem_count()];
+    crate::iq2xxs::dequantize(blocks, &mut all)?;
+    let mut experts = Vec::with_capacity(n_expert);
+    for e in 0..n_expert {
+        let t = Tensor::from_vec(
+            all[e * per_elems..(e + 1) * per_elems].to_vec(),
+            (out, inn),
+            &rd.device,
+        )?;
+        experts.push(QMatMul::from_qtensor(QTensor::quantize(
+            &t,
+            GgmlDType::F32,
+        )?)?);
+    }
+    Ok(experts)
+}
+
 fn load_moe<R: Read + Seek>(
     rd: &mut Reader<R>,
     p: &str,
@@ -1769,7 +1948,9 @@ fn load_moe<R: Read + Seek>(
     // A hash layer routes through the table on every token, so a missing one is
     // a load error rather than something to discover on the first forward pass.
     let tid2eid = if hash {
-        Some(rd.f32_tensor(&format!("{p}.ffn_gate_tid2eid.weight"))?)
+        // The id table ships as I32 in every DeepSeek-V4-Flash GGUF; candle
+        // cannot name that dtype, so the raw header is used.
+        Some(rd.i32_to_f32_tensor(&format!("{p}.ffn_gate_tid2eid.weight"))?)
     } else {
         None
     };
@@ -1830,6 +2011,17 @@ fn split_experts<R: Read + Seek>(
     name: &str,
     n_expert: usize,
 ) -> Result<Vec<QMatMul>> {
+    // IQ2_XXS expert tensors (how DeepSeek-V4-Flash GGUFs store gate/up):
+    // candle cannot represent the dtype, so slice per-expert block ranges
+    // straight out of the mapping and let `crate::iq2xxs` decode at matmul
+    // time.  Only falls back to a full f32 decode when there is no mapping
+    // (tests).
+    let raw_info = rd.raw.as_ref().and_then(|r| r.tensors.get(name)).cloned();
+    if let Some(info) = raw_info {
+        if info.dtype == crate::iq2xxs::GGML_TYPE_IQ2_XXS {
+            return split_iq2xxs_experts(rd, name, &info, n_expert);
+        }
+    }
     let qt = rd.qtensor(name)?;
     let dims = qt.shape().dims().to_vec();
     if dims.len() != 3 || dims[0] != n_expert {
