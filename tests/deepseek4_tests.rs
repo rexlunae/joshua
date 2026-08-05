@@ -128,6 +128,57 @@ fn deepseek4_prefill_matches_incremental_decode() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// Wraps a `Cursor` whose reads always fail — simulates a header that
+/// disappears between candle's parse and Joshua's raw re-read (truncation,
+/// failing backend), so the re-read error path is exercised deterministically.
+struct FailAllReads<R>(R);
+
+impl<R: std::io::Read> std::io::Read for FailAllReads<R> {
+    fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "simulated truncated header",
+        ))
+    }
+}
+
+impl<R: std::io::Seek> std::io::Seek for FailAllReads<R> {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.0.seek(pos)
+    }
+}
+
+/// A failure to re-read the raw header must surface as the load error, not be
+/// swallowed into "no raw table" (which would later become a misleading
+/// "cannot find tensor blk.N.ffn_gate_exps.weight").
+#[test]
+fn deepseek4_header_reread_failure_is_reported() {
+    let dir = common::model_dir("deepseek4-bad-header");
+    let model = dir.join("model.gguf");
+    common::write_tiny_deepseek4_gguf(&model);
+
+    let bytes = std::fs::read(&model).unwrap();
+    let content = {
+        let mut cursor = std::io::Cursor::new(&bytes[..]);
+        let header = joshua::gguf_ext::read_header(&mut cursor).unwrap();
+        header.to_candle_content().unwrap()
+    };
+
+    // The reader passes candle's parse but fails every read afterwards.
+    let mut failing = FailAllReads(std::io::Cursor::new(bytes));
+    let err = match QuantizedModel::from_gguf_mmap(content, &mut failing, &Device::Cpu, None) {
+        Err(e) => e,
+        Ok(_) => panic!("from_gguf_mmap must fail when the raw header re-read fails"),
+    };
+    let msg = err.to_string();
+    assert!(
+        msg.contains("GGUF header"),
+        "error should name the header re-read, got: {msg}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// The engine must accept a GGUF whose dtypes candle cannot name — the
 /// tolerant header is what makes the whole file reachable at all.
 #[test]

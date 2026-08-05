@@ -636,7 +636,7 @@ impl RawTensor {
     /// the scale index in bits 28..31.
     pub fn iq2xxs(name: &str, data: Vec<f32>, dims: &[usize]) -> Self {
         assert!(
-            data.len() % 256 == 0,
+            data.len().is_multiple_of(256),
             "iq2xxs test writer needs a multiple of 256 elements"
         );
         let mut out = Vec::with_capacity(data.len() / 256 * 66);
@@ -656,8 +656,8 @@ impl RawTensor {
                 for l in 0..4usize {
                     let group = &chunk[base + l * 8..base + l * 8 + 8];
                     let mut sbits: u8 = 0;
-                    for j in 0..7usize {
-                        if group[j] < 0.0 {
+                    for (j, &v) in group.iter().enumerate().take(7) {
+                        if v < 0.0 {
                             sbits |= 1 << j;
                         }
                     }
@@ -778,7 +778,7 @@ pub fn write_raw_gguf(path: &Path, metadata: &[(String, gguf_file::Value)], tens
     }
     // Header padded to 32 bytes before the data region.
     let padding = 31 - (31 + w.len()) % 32;
-    w.extend(std::iter::repeat(0u8).take(padding));
+    w.resize(w.len() + padding, 0u8);
     let data_start = w.len();
     for (t, &off) in tensors.iter().zip(data_offsets.iter()) {
         assert_eq!(
@@ -788,7 +788,7 @@ pub fn write_raw_gguf(path: &Path, metadata: &[(String, gguf_file::Value)], tens
         );
         w.extend_from_slice(&t.data);
         let padding = 31 - (31 + t.data.len()) % 32;
-        w.extend(std::iter::repeat(0u8).take(padding));
+        w.resize(w.len() + padding, 0u8);
     }
     std::fs::write(path, w).unwrap();
 }
@@ -1012,9 +1012,7 @@ pub fn write_tiny_deepseek4_gguf(path: &Path) {
         ));
         if i < N_HASH {
             // Routed-id table: I32, [vocab, n_expert_used], ids in [0, NE).
-            let ids: Vec<i32> = (0..VOCAB)
-                .map(|t| ((t * 3 + 1) % (NE as usize)) as i32)
-                .collect();
+            let ids: Vec<i32> = (0..VOCAB).map(|t| ((t * 3 + 1) % NE) as i32).collect();
             let ids = [ids.clone(), ids.clone()].concat();
             tensors.push(RawTensor::i32(
                 &format!("{p}.ffn_gate_tid2eid.weight"),

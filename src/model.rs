@@ -315,15 +315,25 @@ impl QuantizedModel {
         // I32, so the deepseek4 loader needs this to decode those tensors.
         // The reader is rewound to where candle's header parse left it
         // (the aligned data start) afterwards, so nothing downstream shifts.
+        //
+        // A failed re-read is a real header problem (truncated/corrupt file,
+        // implausible counts, non-UTF-8 key) — surface it as the load error
+        // rather than silently treating the file as having no raw table, which
+        // would surface much later as a misleading "cannot find tensor".
         let data_pos = reader.stream_position()?;
-        let raw =
-            (|| -> std::result::Result<Option<crate::gguf_ext::GgufHeader>, crate::JoshuaError> {
-                reader.seek(SeekFrom::Start(0))?;
-                let h = crate::gguf_ext::read_header(reader)?;
-                reader.seek(SeekFrom::Start(data_pos))?;
-                Ok(Some(h))
-            })()
-            .unwrap_or(None);
+        let raw = (|| -> std::result::Result<_, crate::JoshuaError> {
+            reader.seek(SeekFrom::Start(0))?;
+            let h = crate::gguf_ext::read_header(reader)?;
+            reader.seek(SeekFrom::Start(data_pos))?;
+            Ok(h)
+        })()
+        .map_err(|e| {
+            // Restore the reader even on failure so callers see a
+            // deterministic position, then report the actual problem.
+            let _ = reader.seek(SeekFrom::Start(data_pos));
+            candle_core::Error::Msg(format!("GGUF header re-read failed: {e}"))
+        })?;
+        let raw = Some(raw);
         let raw = raw.as_ref();
 
         match arch {

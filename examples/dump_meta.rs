@@ -7,7 +7,9 @@
 use std::io::{Cursor, Read};
 
 fn main() {
-    let path = std::env::args().nth(1).expect("usage: dump_meta <model.gguf>");
+    let path = std::env::args()
+        .nth(1)
+        .expect("usage: dump_meta <model.gguf>");
     let mut f = std::fs::File::open(&path).unwrap();
     let mut header_bytes = vec![0u8; 16 * 1024 * 1024];
     let n = f.read(&mut header_bytes).unwrap();
@@ -27,6 +29,9 @@ fn main() {
     names.sort();
     for n in names.iter().take(80) {
         let t = &h.tensors[*n];
-        println!("{n} dtype={} dims={:?} offset={}", t.dtype, t.dims, t.offset);
+        println!(
+            "{n} dtype={} dims={:?} offset={}",
+            t.dtype, t.dims, t.offset
+        );
     }
 }

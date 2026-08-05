@@ -1452,7 +1452,11 @@ impl<R: Read + Seek> Reader<R> {
                     .as_ref()
                     .map(|r| r.tensor_data_offset)
                     .unwrap_or(self.ct.tensor_data_offset);
-                if let Some(mmap) = &self.mmap {
+                // Borrowing yields CPU-backed `QStorage`, so it is only sound
+                // when the model itself lives on the CPU.  On accelerator
+                // devices fall through to the f32 decode + copy below, which
+                // already honours `self.device`.
+                if let Some(mmap) = self.mmap.as_ref().filter(|_| self.device.is_cpu()) {
                     if let Some(qt) = crate::mmap_tensor::borrowed_qtensor_raw(
                         mmap,
                         info.dtype,
@@ -1892,7 +1896,10 @@ fn split_iq2xxs_experts<R: Read + Seek>(
         .unwrap_or(rd.ct.tensor_data_offset);
 
     // Zero-copy: one borrowed QTensor per expert, pointing into the mapping.
-    if let Some(mmap) = &rd.mmap {
+    // Only sound on CPU — borrowed blocks are `QStorage::Cpu`, so on
+    // accelerator devices decode to f32 and copy below (which uses
+    // `rd.device`) instead.
+    if let Some(mmap) = rd.mmap.as_ref().filter(|_| rd.device.is_cpu()) {
         let base = tensor_data_offset.saturating_add(info.offset) as usize;
         let mut experts = Vec::with_capacity(n_expert);
         for e in 0..n_expert {
