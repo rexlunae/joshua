@@ -1490,13 +1490,22 @@ impl<R: Read + Seek> Reader<R> {
                         info.dtype
                     );
                 }
-                // No mapping (CPU): decode to f32 and re-quantize as F32 so
-                // the QMatMul machinery downstream keeps working unchanged.
+                // No mapping (CPU): decode the weights to f32 and re-quantize
+                // as F32 so the QMatMul machinery downstream keeps working
+                // unchanged.  This is also what makes the streamed path agree
+                // with the mmap path: both end up with f32-activation matmul
+                // semantics (candle's own `k_quants::matmul` quantizes
+                // activations to Q8_0, which would diverge by ~1% per layer).
+                // Note the memory cost: a real IQ2_XXS expert tensor (~40 GB
+                // across the model) becomes ~640 GB as f32, so the streamed
+                // path is only practical for small models — the mmap path is
+                // the production one.
                 let bytes = self.raw_bytes_from(name)?;
-                if info.dtype == crate::iq2xxs::GGML_TYPE_IQ2_XXS {
-                    let blocks = crate::iq2xxs::blocks_from_bytes(&bytes)?;
-                    let mut f32s = vec![0f32; info.elem_count()];
-                    crate::iq2xxs::dequantize(blocks, &mut f32s)?;
+                if let Some(f32s) = crate::quant_matmul::decode_raw_to_f32(
+                    info.dtype,
+                    &bytes,
+                    info.elem_count(),
+                )? {
                     let t = Tensor::from_vec(f32s, info.dims.clone(), &self.device)?;
                     return QTensor::quantize(&t, GgmlDType::F32);
                 }
@@ -1514,6 +1523,25 @@ impl<R: Read + Seek> Reader<R> {
                 name,
                 &self.device,
             );
+        }
+        // No mapping (CPU): quantized/f16 tensors are decoded to f32 so the
+        // streamed path shares the mmap path's f32-activation matmul
+        // semantics (same rationale as above).  F32 tensors keep candle's
+        // reader, which is exact for them.
+        let decode = self
+            .ct
+            .tensor_infos
+            .get(name)
+            .map(|info| (crate::gguf_ext::ggml_id_from_dtype(info.ggml_dtype), info.shape.clone()));
+        if let Some((dtype, shape)) = decode {
+            if let Some(f32s) = crate::quant_matmul::decode_raw_to_f32(
+                dtype,
+                &self.raw_bytes_from(name)?,
+                shape.elem_count(),
+            )? {
+                let t = Tensor::from_vec(f32s, shape, &self.device)?;
+                return QTensor::quantize(&t, GgmlDType::F32);
+            }
         }
         self.ct.tensor(&mut self.reader, name, &self.device)
     }

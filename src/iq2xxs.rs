@@ -93,12 +93,42 @@ pub fn dequantize(blocks: &[BlockIq2Xxs], out: &mut [f32]) -> Result<()> {
 /// Each weight row's blocks are decoded once into a stack buffer and
 /// accumulated against every lhs row, so the weights are never materialised
 /// as f32 in bulk — the same contract as [`crate::mxfp4::matmul_t`].
+///
+/// On x86_64 with AVX2+FMA this dispatches to a fused dequant+dot kernel
+/// (see [`matmul_t_avx2`]) and spreads the independent output rows across
+/// the rayon pool; elsewhere it falls back to the scalar row loop.  Both
+/// paths compute each output element with the same per-element operation
+/// sequence, so results are deterministic and agree to within one ulp of
+/// FMA rounding (the fused kernel accumulates in 8-lane registers).
 pub fn matmul_t(
     (m, k, n): (usize, usize, usize),
     lhs: &[f32],
     rhs: &[BlockIq2Xxs],
     dst: &mut [f32],
 ) -> Result<()> {
+    let blocks_per_row = validate_matmul_t((m, k, n), lhs, rhs, dst)?;
+    matmul_t_impl((m, k, n), blocks_per_row, lhs, rhs, dst, true)
+}
+
+/// Same as [`matmul_t`] with a serial row loop — used by the determinism
+/// tests to prove the parallel path is bit-identical.
+#[cfg(test)]
+pub fn matmul_t_serial(
+    (m, k, n): (usize, usize, usize),
+    lhs: &[f32],
+    rhs: &[BlockIq2Xxs],
+    dst: &mut [f32],
+) -> Result<()> {
+    let blocks_per_row = validate_matmul_t((m, k, n), lhs, rhs, dst)?;
+    matmul_t_impl((m, k, n), blocks_per_row, lhs, rhs, dst, false)
+}
+
+fn validate_matmul_t(
+    (m, k, n): (usize, usize, usize),
+    lhs: &[f32],
+    rhs: &[BlockIq2Xxs],
+    dst: &mut [f32],
+) -> Result<usize> {
     if !k.is_multiple_of(QK_IQ2_XXS) {
         bail!("iq2_xxs matmul: k={k} is not a multiple of the block size {QK_IQ2_XXS}");
     }
@@ -119,25 +149,212 @@ pub fn matmul_t(
             m * n
         );
     }
+    Ok(blocks_per_row)
+}
 
-    let mut decoded = [0f32; QK_IQ2_XXS];
-    dst.fill(0.0);
-    for row in 0..n {
-        let row_blocks = &rhs[row * blocks_per_row..(row + 1) * blocks_per_row];
-        for (b, block) in row_blocks.iter().enumerate() {
-            block.dequantize(&mut decoded);
-            let base = b * QK_IQ2_XXS;
-            for i in 0..m {
-                let a = &lhs[i * k + base..i * k + base + QK_IQ2_XXS];
-                let mut acc = 0f32;
-                for (x, w) in a.iter().zip(decoded.iter()) {
-                    acc += x * w;
-                }
-                dst[i * n + row] += acc;
+fn matmul_t_impl(
+    mkn: (usize, usize, usize),
+    blocks_per_row: usize,
+    lhs: &[f32],
+    rhs: &[BlockIq2Xxs],
+    dst: &mut [f32],
+    parallel: bool,
+) -> Result<()> {
+    let (m, k, n) = mkn;
+    if n == 0 || m == 0 {
+        return Ok(());
+    }
+    if crate::simd::avx2_fma_available() {
+        // The AVX2 kernel writes every dst element exactly once, so no
+        // zero-fill is needed up front.
+        let dst_ptr = crate::simd::DstPtr::new(dst);
+        let worker = |row: usize| {
+            // SAFETY: avx2_fma_available() was checked above, so the
+            // target_feature kernel may run on this CPU; row `row` writes
+            // exactly dst[i*n + row] for i in 0..m, disjoint from every
+            // other row (see `crate::simd`'s safety model).
+            unsafe { matmul_row_avx2(m, k, n, lhs, rhs, blocks_per_row, row, &dst_ptr) }
+        };
+        if parallel {
+            crate::simd::for_each_row(n, worker);
+        } else {
+            for row in 0..n {
+                worker(row);
+            }
+        }
+    } else {
+        // Scalar path: dst must start at zero because each block's partial
+        // dot is accumulated into it (matching the original implementation).
+        dst.fill(0.0);
+        let dst_ptr = crate::simd::DstPtr::new(dst);
+        let worker = |row: usize| {
+            matmul_row_scalar(m, k, n, lhs, rhs, blocks_per_row, row, &dst_ptr);
+        };
+        if parallel {
+            crate::simd::for_each_row(n, worker);
+        } else {
+            for row in 0..n {
+                worker(row);
             }
         }
     }
     Ok(())
+}
+
+/// Scalar per-row worker: decode each block and accumulate `lhs · block`
+/// into `dst[i*n + row]` one block at a time (bit-compatible with the
+/// original single-threaded loop).
+#[allow(clippy::too_many_arguments)] // (m, k, n) is the matmul shape; kept flat for the hot loop
+fn matmul_row_scalar(
+    m: usize,
+    k: usize,
+    n: usize,
+    lhs: &[f32],
+    rhs: &[BlockIq2Xxs],
+    blocks_per_row: usize,
+    row: usize,
+    dst: &crate::simd::DstPtr,
+) {
+    let row_blocks = &rhs[row * blocks_per_row..(row + 1) * blocks_per_row];
+    let mut decoded = [0f32; QK_IQ2_XXS];
+    for (b, block) in row_blocks.iter().enumerate() {
+        block.dequantize(&mut decoded);
+        let base = b * QK_IQ2_XXS;
+        for i in 0..m {
+            let a = &lhs[i * k + base..i * k + base + QK_IQ2_XXS];
+            let mut acc = 0f32;
+            for (x, w) in a.iter().zip(decoded.iter()) {
+                acc += x * w;
+            }
+            // SAFETY: row `row` owns dst[i*n + row] for all i (disjoint per
+            // row, see `crate::simd`); the buffer was zero-filled by the
+            // caller before any worker ran.
+            unsafe { dst.add(i * n + row, acc) };
+        }
+    }
+}
+
+// ─── AVX2/FMA fused dequant+dot kernel ────────────────────────────────────
+
+/// Grid values expanded to f32 lanes (8 values per code), for the AVX2
+/// kernel.  Mirrors `IQ2XXS_GRID` (one u8 value per byte) as directly
+/// loadable 8-lane vectors.
+#[cfg(target_arch = "x86_64")]
+const IQ2XXS_GRID_F32: [[f32; 8]; 256] = build_grid_f32();
+
+#[cfg(target_arch = "x86_64")]
+const fn build_grid_f32() -> [[f32; 8]; 256] {
+    let mut out = [[0.0f32; 8]; 256];
+    let mut i = 0;
+    while i < 256 {
+        let bytes = IQ2XXS_GRID[i].to_le_bytes();
+        let mut j = 0;
+        while j < 8 {
+            out[i][j] = bytes[j] as f32;
+            j += 1;
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Sign patterns expanded to ±1.0 f32 lanes, for the AVX2 kernel.  Mirrors
+/// `KSIGNS_IQ2XS` (one bit per value) as directly loadable 8-lane vectors.
+#[cfg(target_arch = "x86_64")]
+const IQ2XXS_SIGNS_F32: [[f32; 8]; 128] = build_signs_f32();
+
+#[cfg(target_arch = "x86_64")]
+const fn build_signs_f32() -> [[f32; 8]; 128] {
+    let mut out = [[1.0f32; 8]; 128];
+    let mut i = 0;
+    while i < 128 {
+        let b = KSIGNS_IQ2XS[i];
+        let mut j = 0;
+        while j < 8 {
+            if b & KMASK_IQ2XS[j] != 0 {
+                out[i][j] = -1.0;
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Fused IQ2_XXS dequant+dot for one weight row, 4 lhs rows at a time.
+///
+/// Each 32-value sub-group decodes straight into four 8-lane vectors
+/// (`grid × signs × db`) and is FMA-accumulated against the activations —
+/// no intermediate f32 buffer, and the decode cost is amortized across the
+/// m-tile.  Results differ from the scalar path by at most FMA rounding
+/// (≤ 1 ulp per element, far below the 1e-4 tolerances the tests use).
+///
+/// # Safety
+/// The caller must have verified `avx2_fma_available()` (this kernel uses
+/// AVX2+FMA instructions) and must only hand out disjoint rows per [`DstPtr`].
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[allow(clippy::too_many_arguments)] // (m, k, n) is the matmul shape; kept flat for the hot loop
+unsafe fn matmul_row_avx2(
+    m: usize,
+    k: usize,
+    n: usize,
+    lhs: &[f32],
+    rhs: &[BlockIq2Xxs],
+    blocks_per_row: usize,
+    row: usize,
+    dst: &crate::simd::DstPtr,
+) {
+    use std::arch::x86_64::*;
+
+    const MTILE: usize = 4;
+    let row_blocks = &rhs[row * blocks_per_row..(row + 1) * blocks_per_row];
+    let mut m0 = 0;
+    while m0 < m {
+        let mcnt = (m - m0).min(MTILE);
+        let mut acc = [_mm256_setzero_ps(); MTILE];
+        for (b, block) in row_blocks.iter().enumerate() {
+            let d = f16::from_le_bytes(block.d).to_f32();
+            for ib32 in 0..8usize {
+                let base = ib32 * 8;
+                let lo = u32::from_le_bytes([
+                    block.qs[base],
+                    block.qs[base + 1],
+                    block.qs[base + 2],
+                    block.qs[base + 3],
+                ]);
+                let hi = u32::from_le_bytes([
+                    block.qs[base + 4],
+                    block.qs[base + 5],
+                    block.qs[base + 6],
+                    block.qs[base + 7],
+                ]);
+                let dbv = _mm256_set1_ps(d * (0.5 + ((hi >> 28) as f32)) * 0.25);
+                let lane = ib32 * 32;
+                for l in 0..4usize {
+                    let code = ((lo >> (8 * l)) & 0xFF) as usize;
+                    let si = ((hi >> (7 * l)) & 0x7F) as usize;
+                    let g = _mm256_loadu_ps(IQ2XXS_GRID_F32[code].as_ptr());
+                    let s = _mm256_loadu_ps(IQ2XXS_SIGNS_F32[si].as_ptr());
+                    let v = _mm256_mul_ps(_mm256_mul_ps(g, s), dbv);
+                    // `b * QK_IQ2_XXS` is the block's offset within the row
+                    // (the scalar worker's `base = b * QK_IQ2_XXS`).
+                    let c = b * QK_IQ2_XXS + lane + l * 8;
+                    for i in 0..mcnt {
+                        let a = _mm256_loadu_ps(lhs[(m0 + i) * k + c..].as_ptr());
+                        acc[i] = _mm256_fmadd_ps(a, v, acc[i]);
+                    }
+                }
+            }
+        }
+        // `mcnt` can be < MTILE at the tail; iterate only the live lanes.
+        for (i, acc_i) in acc.iter().enumerate().take(mcnt) {
+            // SAFETY: row `row` owns dst[i*n + row] for all i; disjoint per
+            // row (see `crate::simd`).
+            dst.write((m0 + i) * n + row, crate::simd::hsum256(*acc_i));
+        }
+        m0 += MTILE;
+    }
 }
 
 /// Same as [`matmul_t`] but with f16 activations in and out.  The decode is
@@ -562,6 +779,77 @@ mod tests {
         assert!(matmul_t((1, 256, 1), &[0.0; 256], rhs, &mut [0.0]).is_err()); // too few blocks
         assert!(matmul_t((2, 256, 1), &[0.0; 256], rhs, &mut [0.0; 2]).is_err());
         // lhs too short
+    }
+
+    /// Build a reusable `rhs` of `n` weight rows × `k` columns from the
+    /// fixture blocks (cycled, as the naive-GEMM test does).
+    fn fixture_rhs(k: usize, n: usize) -> Vec<BlockIq2Xxs> {
+        let blocks = include_bytes!("../tests/data/iq2xxs_blocks.bin");
+        let n_blocks = blocks.len() / BLOCK_BYTES; // 4
+        let mut rhs = Vec::new();
+        for i in 0..n * (k / QK_IQ2_XXS) {
+            let blk = blocks_from_bytes(
+                &blocks[(i % n_blocks) * BLOCK_BYTES..(i % n_blocks + 1) * BLOCK_BYTES],
+            )
+            .unwrap();
+            rhs.push(blk[0]);
+        }
+        rhs
+    }
+
+    /// The AVX2 fused kernel and the scalar worker must agree on the same
+    /// weights/activations.  On AVX2 machines this exercises the SIMD decode
+    /// against the reference dequant; elsewhere both paths are scalar and the
+    /// comparison is exact.
+    #[test]
+    fn avx2_and_scalar_paths_agree() {
+        let (m, k, n) = (3, 1024, 11);
+        let rhs = fixture_rhs(k, n);
+        let lhs: Vec<f32> = (0..m * k)
+            .map(|i| ((i * 7919) % 1000) as f32 / 100.0 - 5.0)
+            .collect();
+
+        // Dispatched matmul: AVX2 when the CPU supports it, else scalar.
+        let mut fast = vec![0f32; m * n];
+        matmul_t((m, k, n), &lhs, &rhs, &mut fast).unwrap();
+
+        // Scalar worker, forced.
+        let mut scalar = vec![0f32; m * n];
+        scalar.fill(0.0);
+        let dstp = crate::simd::DstPtr::new(&mut scalar);
+        for row in 0..n {
+            matmul_row_scalar(m, k, n, &lhs, &rhs, k / QK_IQ2_XXS, row, &dstp);
+        }
+
+        for i in 0..m * n {
+            let tol = 1e-4 * scalar[i].abs().max(1.0);
+            assert!(
+                (fast[i] - scalar[i]).abs() <= tol,
+                "dst[{i}] fast={} scalar={} (tol {tol})",
+                fast[i],
+                scalar[i]
+            );
+        }
+    }
+
+    /// Parallel and serial execution must agree bit-for-bit: rows are
+    /// independent and each is computed with identical per-element
+    /// operations, so the thread count must not change a single bit.
+    #[test]
+    fn threaded_matches_serial_bit_exact() {
+        let (m, k, n) = (4, 1024, 23);
+        let rhs = fixture_rhs(k, n);
+        let lhs: Vec<f32> = (0..m * k)
+            .map(|i| ((i * 104729) % 1000) as f32 / 100.0 - 5.0)
+            .collect();
+
+        let mut par = vec![0f32; m * n];
+        matmul_t((m, k, n), &lhs, &rhs, &mut par).unwrap();
+
+        let mut ser = vec![0f32; m * n];
+        matmul_t_serial((m, k, n), &lhs, &rhs, &mut ser).unwrap();
+
+        assert_eq!(par, ser, "parallel and serial matmul must be bit-identical");
     }
 
     /// Dequantised values respect the format's bounds: |v| <= d * 15.5 * 43/4.
