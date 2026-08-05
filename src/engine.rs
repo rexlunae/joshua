@@ -332,9 +332,7 @@ impl GenSession {
                     .map_err(|e| JoshuaError::Inference(e.to_string()))?;
                 squeeze_batch_logits(&logits)
             }
-            Self::Npu(session) => session
-                .forward(tokens, pos)
-                .map_err(JoshuaError::Inference),
+            Self::Npu(session) => session.forward(tokens, pos).map_err(JoshuaError::Inference),
         }
     }
 
@@ -425,7 +423,11 @@ impl Engine {
     /// Load a GGUF model with full [`EngineOptions`] (context size and the
     /// huge-page backing strategy).
     pub fn with_options(model_path: impl AsRef<Path>, options: EngineOptions) -> Result<Self> {
-        let n_ctx = if options.n_ctx == 0 { 4096 } else { options.n_ctx };
+        let n_ctx = if options.n_ctx == 0 {
+            4096
+        } else {
+            options.n_ctx
+        };
         let raw_path = model_path.as_ref().to_path_buf();
 
         // Resolve the actual .gguf file path.
@@ -434,12 +436,6 @@ impl Engine {
         } else {
             raw_path
         };
-
-        let model_name = gguf_path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("unknown")
-            .to_string();
 
         tracing::info!("Loading model from {:?}", gguf_path);
 
@@ -465,9 +461,28 @@ impl Engine {
         let mmap = map_model(&gguf_path, options.huge_pages, options.lazy_weights)?;
 
         // Read GGUF metadata once to validate the architecture up front and
-        // extract EOS token IDs.
-        let gguf = gguf_file::Content::read(&mut Cursor::new(&mmap[..]))
+        // extract EOS token IDs.  The tolerant reader keeps dtypes candle
+        // cannot represent (IQ2_XXS, I32, MXFP4), so files using them reach
+        // arch detection instead of dying on the first unknown dtype.
+        let gguf = read_gguf_header(&mmap)
             .map_err(|e| JoshuaError::ModelLoad(format!("GGUF read failed: {e}")))?;
+
+        // The API identifier is the file stem — the documented contract on
+        // `model_name` (see the field and accessor docs) — so clients keyed
+        // on it see no change.  The model's own `general.name` is sanitized
+        // (model-supplied metadata is attacker-controlled) and used only for
+        // the operator log line below.
+        let model_name = gguf_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let display_name = gguf
+            .metadata
+            .get("general.name")
+            .and_then(|v| v.to_string().ok().cloned())
+            .and_then(|s| sanitize_model_name(&s))
+            .unwrap_or_else(|| model_name.clone());
 
         // Defer architectures candle cannot load (e.g. `deepseek4`) instead of
         // failing construction: an NPU backend may still serve them.  The
@@ -487,8 +502,10 @@ impl Engine {
 
         tracing::info!(
             "Model '{}' ready (arch={}, ctx={}, eos_ids={:?}, chat_template={}, device={:?})",
-            model_name,
-            arch.as_ref().map(|a| a.display_name()).unwrap_or("unknown (NPU-only)"),
+            display_name,
+            arch.as_ref()
+                .map(|a| a.display_name())
+                .unwrap_or("unknown (NPU-only)"),
             n_ctx,
             eos_token_ids,
             if chat_template.is_some() {
@@ -677,7 +694,10 @@ impl Engine {
     ) -> Result<(String, UsageInfo, f64, f64)> {
         // Multimodal branch: messages carrying images go through a
         // media-capable NPU/llama.cpp plugin session.
-        if messages.iter().any(|m| m.images.as_ref().is_some_and(|i| !i.is_empty())) {
+        if messages
+            .iter()
+            .any(|m| m.images.as_ref().is_some_and(|i| !i.is_empty()))
+        {
             let (marked_messages, images) = resolve_message_media(messages)?;
             let (prompt, _) = self.format_prompt(&marked_messages, tools);
             return self.complete_media(&prompt, &images, options);
@@ -771,7 +791,11 @@ impl Engine {
     /// Clamp a request's generation length to the server's `max_output_tokens`
     /// ceiling and, when the prompt length is known, the remaining context
     /// window — so a client-supplied `max_tokens` can't force unbounded work.
-    fn clamp_options(&self, options: &GenerationOptions, prompt_len: Option<usize>) -> GenerationOptions {
+    fn clamp_options(
+        &self,
+        options: &GenerationOptions,
+        prompt_len: Option<usize>,
+    ) -> GenerationOptions {
         let mut clamped = options.clone();
         let mut cap = clamped.max_tokens.min(self.max_output_tokens);
         if let Some(n_prompt) = prompt_len {
@@ -1044,7 +1068,10 @@ impl Engine {
                 .map_err(|e| JoshuaError::Tokenization(e.to_string()))?;
             let tokens = encoding.get_ids();
             if tokens.len() >= self.n_ctx as usize {
-                return Err(JoshuaError::PromptTooLong(tokens.len(), self.n_ctx as usize));
+                return Err(JoshuaError::PromptTooLong(
+                    tokens.len(),
+                    self.n_ctx as usize,
+                ));
             }
             total_tokens += tokens.len() as u32;
             let vector = model
@@ -1232,7 +1259,7 @@ impl Engine {
             return Err(JoshuaError::ModelLoad(msg));
         }
         let mut cursor = Cursor::new(&self.mmap[..]);
-        let gguf = gguf_file::Content::read(&mut cursor)
+        let gguf = read_gguf_header(&self.mmap)
             .map_err(|e| JoshuaError::ModelLoad(format!("GGUF read failed: {e}")))?;
         // Hand the loader the mapping so architectures Joshua implements
         // itself can borrow weights in place rather than copying them.
@@ -1410,7 +1437,9 @@ fn map_model_hugetlb(path: &Path, file: &File, size: PageSize) -> Result<Mmap> {
     // Copy the model bytes into the huge-page-backed region.
     File::open(path)?
         .read_exact(&mut anon[..len])
-        .map_err(|e| JoshuaError::ModelLoad(format!("reading model into huge pages failed: {e}")))?;
+        .map_err(|e| {
+            JoshuaError::ModelLoad(format!("reading model into huge pages failed: {e}"))
+        })?;
 
     let mmap = anon
         .make_read_only()
@@ -1483,6 +1512,83 @@ fn token_str_from_metadata(
     tokenizer.id_to_token(id)
 }
 
+/// Parse the GGUF header tolerantly (raw dtype ids) and project it onto
+/// candle's `Content`, dropping tensors whose dtype candle cannot name.
+/// Those tensors are decoded by Joshua's own loaders via the raw header.
+fn read_gguf_header(mmap: &[u8]) -> Result<gguf_file::Content> {
+    let header = crate::gguf_ext::read_header(&mut Cursor::new(mmap))?;
+    // The deepseek4 loader is the only one that reads tensors by their raw
+    // GGUF dtype id (IQ2_XXS, I32, …).  For every other architecture the
+    // candle loaders only ever see the projected `Content`, so an
+    // unsupported-dtype tensor would be dropped here and surface much later
+    // as a misleading "cannot find tensor" for a required weight — or, worse,
+    // silently treated as absent by a loader probing an optional tensor,
+    // changing the model without an error.  Refuse the load with the precise
+    // cause instead.  (An undetectable architecture is left alone: the load
+    // already fails with an accurate architecture error downstream.)
+    if let Ok(arch) = Architecture::detect(&header.metadata) {
+        if arch != Architecture::DeepSeek4 {
+            let unsupported = header.unsupported_tensors();
+            if !unsupported.is_empty() {
+                let names = unsupported
+                    .iter()
+                    .map(|(n, d)| format!("`{n}` (GGUF dtype id {d})"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(crate::JoshuaError::ModelLoad(format!(
+                    "GGUF header: model architecture '{}' contains {} tensor(s) in a GGUF \
+                     dtype the engine cannot decode: {}. Only the deepseek4 loader reads \
+                     tensors by raw dtype id; re-quantize this model to a candle-supported \
+                     format (F32/F16/Q8_0/Q4_K, …) or use a loader that decodes these dtypes.",
+                    arch.display_name(),
+                    unsupported.len(),
+                    names
+                )));
+            }
+        }
+    }
+    header.to_candle_content()
+}
+
+/// Sanitize a model-supplied `general.name` into a safe display identifier.
+///
+/// The GGUF metadata is fully controlled by whoever ships the model file, and
+/// `Engine::model_name` is echoed into operator logs and OpenAI-compatible API
+/// responses (`model` field).  This strips control characters (newlines, ANSI
+/// escapes, NUL, ...), collapses and trims whitespace, and caps the length so
+/// the value cannot inject log lines, escape sequences, or unbounded strings.
+/// Returns `None` when nothing usable remains — the caller falls back to the
+/// file stem.
+fn sanitize_model_name(raw: &str) -> Option<String> {
+    const MAX_BYTES: usize = 128;
+    let mut out = String::with_capacity(raw.len().min(MAX_BYTES));
+    let mut seen_non_space = false;
+    let mut pending_space = false;
+    for c in raw.chars() {
+        if out.len() >= MAX_BYTES {
+            break;
+        }
+        if c.is_control() {
+            continue;
+        }
+        if c.is_whitespace() {
+            pending_space = seen_non_space;
+            continue;
+        }
+        if pending_space {
+            out.push(' ');
+            pending_space = false;
+        }
+        out.push(c);
+        seen_non_space = true;
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
 /// Extract the model's chat template from GGUF metadata, if present.
 ///
 /// llama.cpp's converters store the HuggingFace chat template verbatim under
@@ -1498,10 +1604,10 @@ fn extract_chat_template(gguf: &gguf_file::Content, tokenizer: &Tokenizer) -> Op
     if source.trim().is_empty() {
         return None;
     }
-    let bos = token_str_from_metadata(gguf, "tokenizer.ggml.bos_token_id", tokenizer)
-        .unwrap_or_default();
-    let eos = token_str_from_metadata(gguf, "tokenizer.ggml.eos_token_id", tokenizer)
-        .unwrap_or_default();
+    let bos =
+        token_str_from_metadata(gguf, "tokenizer.ggml.bos_token_id", tokenizer).unwrap_or_default();
+    let eos =
+        token_str_from_metadata(gguf, "tokenizer.ggml.eos_token_id", tokenizer).unwrap_or_default();
     Some(ChatTemplate::new(source, bos, eos))
 }
 
@@ -1638,7 +1744,9 @@ fn sample_token(
         if sum > 0.0 {
             let mut sorted_idx: Vec<usize> = (0..probs.len()).collect();
             sorted_idx.sort_unstable_by(|&a, &b| {
-                probs[b].partial_cmp(&probs[a]).unwrap_or(std::cmp::Ordering::Equal)
+                probs[b]
+                    .partial_cmp(&probs[a])
+                    .unwrap_or(std::cmp::Ordering::Equal)
             });
             let mut cumsum = 0.0_f32;
             let mut cut_from = probs.len();
@@ -1671,14 +1779,44 @@ fn sample_token(
         *p /= total;
     }
 
-    let dist =
-        WeightedIndex::new(&probs).map_err(|e| JoshuaError::Inference(e.to_string()))?;
+    let dist = WeightedIndex::new(&probs).map_err(|e| JoshuaError::Inference(e.to_string()))?;
     Ok(dist.sample(rng) as u32)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sanitize_model_name_keeps_plain_names() {
+        assert_eq!(
+            sanitize_model_name("DeepSeek-V4-Flash"),
+            Some("DeepSeek-V4-Flash".into())
+        );
+        assert_eq!(
+            sanitize_model_name("  Llama 3.1  8B  "),
+            Some("Llama 3.1 8B".into())
+        );
+    }
+
+    #[test]
+    fn sanitize_model_name_strips_control_chars_and_newlines() {
+        // Newline + ANSI ESC injection must not survive into logs/API; the
+        // ESC byte is stripped (the trailing `[31m` is inert text without it).
+        assert_eq!(
+            sanitize_model_name("evil\n[2Jname"),
+            Some("evil[2Jname".into())
+        );
+        assert_eq!(sanitize_model_name("a\u{1b}[31mb"), Some("a[31mb".into()));
+        assert_eq!(sanitize_model_name("\u{0}"), None);
+        assert_eq!(sanitize_model_name("   "), None);
+    }
+
+    #[test]
+    fn sanitize_model_name_caps_length() {
+        let long = "x".repeat(1000);
+        assert_eq!(sanitize_model_name(&long), Some("x".repeat(128)));
+    }
 
     #[test]
     fn page_size_params_are_correct() {
@@ -1693,7 +1831,10 @@ mod tests {
     #[test]
     fn default_hugepage_bytes_is_sane() {
         let bytes = default_hugepage_bytes();
-        assert!(bytes >= 2 * 1024 * 1024 && bytes.is_power_of_two(), "got {bytes}");
+        assert!(
+            bytes >= 2 * 1024 * 1024 && bytes.is_power_of_two(),
+            "got {bytes}"
+        );
     }
 
     #[test]
@@ -1743,4 +1884,3 @@ mod tests {
         assert!(load_image_bytes("https://example.com/x.png").is_err());
     }
 }
-

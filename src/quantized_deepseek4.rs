@@ -33,13 +33,15 @@
 //! `llama_model_deepseek4` (`/tmp/deepseek4.cpp`, `/tmp/kv-dsv4.cpp`).
 
 use std::borrow::Cow;
-use std::io::{Read, Seek};
+use std::io::{Read, Seek, SeekFrom};
 use std::sync::Arc;
 
 use candle_core::quantized::{gguf_file, GgmlDType, QMatMul, QStorage, QTensor};
 use candle_core::{DType, Device, Module, Result, Tensor, D};
 use candle_nn::ops::{sigmoid, silu, softmax, softmax_last_dim};
 use candle_transformers::quantized_nn::RmsNorm;
+
+use crate::gguf_ext::GgufHeader;
 
 /// Numerically stable `log(1 + exp(x))`.
 fn softplus(x: &Tensor) -> Result<Tensor> {
@@ -176,9 +178,21 @@ impl Config {
 
         let q_lora_rank = m.u32(&format!("{a}.attention.q_lora_rank"))? as usize;
         let head_dim = m.u32_or(&format!("{a}.attention.key_length"), 0).max(1) as usize;
+        // llama.cpp stores this at `{a}.rope.dimension_count`; older files used
+        // `{a}.attention.rope.dimension_count`.  Prefer the current key and
+        // fall back to the legacy one.  A file with neither is malformed for
+        // this architecture (every real model ships it), so refuse to load —
+        // a silent 1-wide rotary would only fail on the first generated token.
         let rope_head_dim = m
-            .u32_or(&format!("{a}.attention.rope.dimension_count"), 0)
-            .max(1) as usize;
+            .u32(&format!("{a}.rope.dimension_count"))
+            .or_else(|_| m.u32(&format!("{a}.attention.rope.dimension_count")))
+            .map(|v| v as usize)
+            .map_err(|_| {
+                candle_core::Error::Msg(format!(
+                    "deepseek4: missing rotary-dimension metadata (`{a}.rope.dimension_count` \
+                     or legacy `{a}.attention.rope.dimension_count`)"
+                ))
+            })?;
         let nope_head_dim = head_dim.saturating_sub(rope_head_dim);
 
         let compress_ratios = m.array_u32(&format!("{a}.attention.compress_ratios"), n_layer);
@@ -1100,7 +1114,11 @@ impl Attention {
             kv_raw.index_select(&Tensor::from_vec(rows, (win,), dev)?, 0)?
         } else {
             let ring: Vec<u32> = (offset..offset + seq).map(|p| (p % win) as u32).collect();
-            let ridx = Tensor::from_vec(ring, (seq, 1), dev)?.broadcast_as((seq, self.head_dim))?;
+            // Broadcast index views are not contiguous; scatter requires a
+            // dense index tensor (short prompts land here).
+            let ridx = Tensor::from_vec(ring, (seq, 1), dev)?
+                .broadcast_as((seq, self.head_dim))?
+                .contiguous()?;
             swa_prev.scatter(&ridx, &kv_raw, 0)?
         });
 
@@ -1119,9 +1137,13 @@ impl Attention {
             )?;
             if let Some((rows, poss)) = &out {
                 let comp = kv.comp.as_ref().unwrap();
+                // Broadcast index views are not contiguous; scatter requires
+                // a dense index tensor (same as the sliding-window ring
+                // above), so materialize it before writing the cache.
                 let pidx = poss
                     .unsqueeze(1)?
-                    .broadcast_as((rows.dim(0)?, self.head_dim))?;
+                    .broadcast_as((rows.dim(0)?, self.head_dim))?
+                    .contiguous()?;
                 kv.comp = Some(comp.scatter(&pidx, rows, 0)?);
             }
         }
@@ -1142,9 +1164,13 @@ impl Attention {
             )?;
             if let Some((rows, poss)) = &lout {
                 let lid = kv.lid.as_ref().unwrap();
+                // Same contiguous-index requirement as the compressor cache:
+                // a broadcast view of the position list is not a valid
+                // scatter index.
                 let pidx = poss
                     .unsqueeze(1)?
-                    .broadcast_as((rows.dim(0)?, ix.head_dim))?;
+                    .broadcast_as((rows.dim(0)?, ix.head_dim))?
+                    .contiguous()?;
                 kv.lid = Some(lid.scatter(&pidx, rows, 0)?);
             }
             Some(ix.score(x, &qr, offset, seq, kv.lid.as_ref().unwrap(), &self.rotary)?)
@@ -1420,6 +1446,9 @@ pub struct ModelWeights {
 /// Small GGUF reader over the memory-mapped file.
 struct Reader<R: Read + Seek> {
     ct: gguf_file::Content,
+    /// Raw header with every tensor's dtype as its GGUF id, including types
+    /// candle cannot represent (IQ2_XXS experts, I32 id tables).
+    raw: Option<GgufHeader>,
     reader: R,
     device: Device,
     mmap: Option<std::sync::Arc<memmap2::Mmap>>,
@@ -1427,6 +1456,56 @@ struct Reader<R: Read + Seek> {
 
 impl<R: Read + Seek> Reader<R> {
     fn qtensor(&mut self, name: &str) -> Result<QTensor> {
+        // Tensors candle cannot represent never make it into `ct`; borrow them
+        // from the mapping (or read + decode) using the raw header instead.
+        let raw_info = self.raw.as_ref().and_then(|r| r.tensors.get(name)).cloned();
+        if let Some(info) = raw_info {
+            if !crate::gguf_ext::is_candle_supported(info.dtype) {
+                let tensor_data_offset = self
+                    .raw
+                    .as_ref()
+                    .map(|r| r.tensor_data_offset)
+                    .unwrap_or(self.ct.tensor_data_offset);
+                // Borrowing yields CPU-backed `QStorage`, so it is only sound
+                // when the model itself lives on the CPU.
+                if let Some(mmap) = self.mmap.as_ref().filter(|_| self.device.is_cpu()) {
+                    if let Some(qt) = crate::mmap_tensor::borrowed_qtensor_raw(
+                        mmap,
+                        info.dtype,
+                        info.offset,
+                        tensor_data_offset,
+                        info.dims.clone().into(),
+                    )? {
+                        return Ok(qt);
+                    }
+                }
+                // Accelerator devices cannot borrow (the blocks are CPU
+                // storage), and decoding a real IQ2_XXS tensor to f32 is an
+                // order-of-magnitude memory blow-up (the expert tensors alone
+                // are ~40 GB of 2-bit data, ~640 GB as f32).  Fail fast with
+                // an explicit limitation instead of an allocation abort.
+                if !self.device.is_cpu() {
+                    candle_core::bail!(
+                        "deepseek4: tensor `{name}` has GGUF dtype {} which is only supported on the CPU device",
+                        info.dtype
+                    );
+                }
+                // No mapping (CPU): decode to f32 and re-quantize as F32 so
+                // the QMatMul machinery downstream keeps working unchanged.
+                let bytes = self.raw_bytes_from(name)?;
+                if info.dtype == crate::iq2xxs::GGML_TYPE_IQ2_XXS {
+                    let blocks = crate::iq2xxs::blocks_from_bytes(&bytes)?;
+                    let mut f32s = vec![0f32; info.elem_count()];
+                    crate::iq2xxs::dequantize(blocks, &mut f32s)?;
+                    let t = Tensor::from_vec(f32s, info.dims.clone(), &self.device)?;
+                    return QTensor::quantize(&t, GgmlDType::F32);
+                }
+                candle_core::bail!(
+                    "deepseek4: tensor `{name}` has GGUF dtype {} which has no decoder here",
+                    info.dtype
+                );
+            }
+        }
         if let Some(mmap) = &self.mmap {
             return crate::mmap_tensor::qtensor_from_mmap(
                 &self.ct,
@@ -1438,14 +1517,70 @@ impl<R: Read + Seek> Reader<R> {
         }
         self.ct.tensor(&mut self.reader, name, &self.device)
     }
+
+    /// Read a tensor's raw bytes from the underlying reader using the raw
+    /// header (works for dtypes candle cannot describe).
+    fn raw_bytes_from(&mut self, name: &str) -> Result<Vec<u8>> {
+        let (offset, tensor_data_offset, size) =
+            {
+                let raw = self.raw.as_ref().ok_or_else(|| {
+                    candle_core::Error::Msg(format!("no raw header for `{name}`"))
+                })?;
+                let info = raw.tensors.get(name).ok_or_else(|| {
+                    candle_core::Error::Msg(format!("deepseek4: tensor `{name}` not in raw header"))
+                })?;
+                let size = crate::gguf_ext::type_size_bytes(info.dtype, info.elem_count())
+                    .ok_or_else(|| {
+                        candle_core::Error::Msg(format!(
+                            "deepseek4: no size known for GGUF dtype {}",
+                            info.dtype
+                        ))
+                    })?;
+                (info.offset, raw.tensor_data_offset, size)
+            };
+        self.reader
+            .seek(SeekFrom::Start(tensor_data_offset + offset))?;
+        let mut buf = vec![0u8; size];
+        self.reader.read_exact(&mut buf)?;
+        Ok(buf)
+    }
+
+    /// Load an I32 tensor (GGUF dtype 26) as f32.  Used for the routed-expert
+    /// id tables in hash layers, which candle's dtype table cannot name.
+    fn i32_to_f32_tensor(&mut self, name: &str) -> Result<Tensor> {
+        let is_i32 = self
+            .raw
+            .as_ref()
+            .and_then(|r| r.tensors.get(name))
+            .map(|info| info.dtype == 26)
+            .unwrap_or(false);
+        if !is_i32 {
+            return self.f32_tensor(name);
+        }
+        let dims = self
+            .raw
+            .as_ref()
+            .and_then(|r| r.tensors.get(name))
+            .map(|info| info.dims.clone())
+            .unwrap_or_default();
+        let bytes = self.raw_bytes_from(name)?;
+        let mut vals = Vec::with_capacity(bytes.len() / 4);
+        for chunk in bytes.chunks_exact(4) {
+            vals.push(i32::from_le_bytes(chunk.try_into().unwrap()) as f32);
+        }
+        Tensor::from_vec(vals, dims, &self.device)
+    }
     fn qmatmul(&mut self, name: &str) -> Result<QMatMul> {
         QMatMul::from_qtensor(self.qtensor(name)?)
     }
-    fn qmatmul_opt(&mut self, name: &str) -> Option<QMatMul> {
+    fn qmatmul_opt(&mut self, name: &str) -> Result<Option<QMatMul>> {
+        // Distinguish "absent" from "present but failed to load": a tensor
+        // that exists but cannot be decoded must error, not silently fall
+        // back to a different weight (e.g. tied embeddings for the head).
         if self.has(name) {
-            self.qmatmul(name).ok()
+            Ok(Some(self.qmatmul(name)?))
         } else {
-            None
+            Ok(None)
         }
     }
     fn rms_norm(&mut self, name: &str, eps: f64) -> Result<RmsNorm> {
@@ -1457,7 +1592,16 @@ impl<R: Read + Seek> Reader<R> {
             .to_dtype(DType::F32)
     }
     fn has(&self, name: &str) -> bool {
+        // `ct` only carries tensors whose dtype candle can name; the raw
+        // header is the source of truth for the rest (IQ2_XXS, I32, ...),
+        // which `to_candle_content` drops.  Without this a real tensor in
+        // such a format would be reported absent and silently swapped for
+        // a different weight.
         self.ct.tensor_infos.contains_key(name)
+            || self
+                .raw
+                .as_ref()
+                .is_some_and(|r| r.tensors.contains_key(name))
     }
 }
 
@@ -1468,12 +1612,17 @@ impl ModelWeights {
         reader: &mut R,
         device: &Device,
     ) -> Result<Self> {
-        Self::from_gguf_mmap(ct, reader, device, None)
+        Self::from_gguf_mmap(ct, None, reader, device, None)
     }
 
     /// Load with weights borrowed in place from `mmap` where possible.
+    ///
+    /// `raw` is the GGUF header with raw dtype ids (see [`crate::gguf_ext`]);
+    /// it carries the IQ2_XXS and I32 tensors that candle's [`GgmlDType`]
+    /// cannot represent and that are therefore absent from `ct`.
     pub fn from_gguf_mmap<R: Read + Seek>(
         ct: gguf_file::Content,
+        raw: Option<&GgufHeader>,
         reader: &mut R,
         device: &Device,
         mmap: Option<std::sync::Arc<memmap2::Mmap>>,
@@ -1481,6 +1630,7 @@ impl ModelWeights {
         let cfg = Config::from_metadata(&ct.metadata)?;
         let mut rd = Reader {
             ct,
+            raw: raw.cloned(),
             reader,
             device: device.clone(),
             mmap,
@@ -1488,7 +1638,7 @@ impl ModelWeights {
 
         let tok_embeddings = rd.f32_tensor("token_embd.weight")?;
         let norm = rd.rms_norm("output_norm.weight", cfg.rms_eps)?;
-        let output = match rd.qmatmul_opt("output.weight") {
+        let output = match rd.qmatmul_opt("output.weight")? {
             Some(o) => o,
             None => rd.qmatmul("token_embd.weight")?,
         };
@@ -1751,6 +1901,93 @@ impl ModelWeights {
     }
 }
 
+/// Slice an IQ2_XXS expert tensor (`[n_expert, out, in]`, GGUF dims reversed)
+/// into per-expert [`QMatMul`]s whose blocks stay in the mapping.
+fn split_iq2xxs_experts<R: Read + Seek>(
+    rd: &mut Reader<R>,
+    name: &str,
+    info: &crate::gguf_ext::RawTensorInfo,
+    n_expert: usize,
+) -> Result<Vec<QMatMul>> {
+    let dims = info.dims.clone();
+    if dims.len() != 3 || dims[0] != n_expert {
+        candle_core::bail!(
+            "deepseek4: expected expert tensor `{name}` shaped [n_expert, out, in], got {dims:?}"
+        );
+    }
+    let (out, inn) = (dims[1], dims[2]);
+    let per_elems = out * inn;
+    if !per_elems.is_multiple_of(crate::iq2xxs::QK_IQ2_XXS) {
+        candle_core::bail!(
+            "deepseek4: IQ2_XXS expert `{name}` rows {out}x{inn} are not a multiple of {}",
+            crate::iq2xxs::QK_IQ2_XXS
+        );
+    }
+    let per_bytes = per_elems / crate::iq2xxs::QK_IQ2_XXS * crate::iq2xxs::BLOCK_BYTES;
+    let tensor_data_offset = rd
+        .raw
+        .as_ref()
+        .map(|r| r.tensor_data_offset)
+        .unwrap_or(rd.ct.tensor_data_offset);
+
+    // Zero-copy: one borrowed QTensor per expert, pointing into the mapping.
+    // Only sound on CPU — borrowed blocks are `QStorage::Cpu`, so on
+    // accelerator devices decode to f32 and copy below (which uses
+    // `rd.device`) instead.
+    if let Some(mmap) = rd.mmap.as_ref().filter(|_| rd.device.is_cpu()) {
+        let base = tensor_data_offset.saturating_add(info.offset) as usize;
+        let mut experts = Vec::with_capacity(n_expert);
+        for e in 0..n_expert {
+            match crate::mmap_tensor::borrowed_range_iq2xxs(
+                mmap,
+                base + e * per_bytes,
+                (out, inn).into(),
+            )? {
+                Some(qt) => experts.push(QMatMul::from_qtensor(qt)?),
+                None => {
+                    experts.clear();
+                    break;
+                }
+            }
+        }
+        if experts.len() == n_expert {
+            return Ok(experts);
+        }
+        tracing::warn!("deepseek4: could not borrow `{name}` from the mapping, decoding to f32");
+    }
+
+    // The fallback below materializes the whole stacked tensor as f32 — an
+    // order-of-magnitude blow-up for real model footprints (~40 GB of 2-bit
+    // data becomes ~640 GB) — and accelerator devices cannot borrow the
+    // blocks (they are CPU storage).  Refuse loudly rather than OOM.
+    if !rd.device.is_cpu() {
+        candle_core::bail!(
+            "deepseek4: IQ2_XXS expert tensor `{name}` is only supported on the CPU device"
+        );
+    }
+
+    // No mapping (or borrow declined): decode the whole tensor to f32 and hand
+    // each expert over as an f32 QMatMul.  Only reachable in tests for the
+    // production footprint of these tensors.
+    let bytes = rd.raw_bytes_from(name)?;
+    let blocks = crate::iq2xxs::blocks_from_bytes(&bytes)?;
+    let mut all = vec![0f32; info.elem_count()];
+    crate::iq2xxs::dequantize(blocks, &mut all)?;
+    let mut experts = Vec::with_capacity(n_expert);
+    for e in 0..n_expert {
+        let t = Tensor::from_vec(
+            all[e * per_elems..(e + 1) * per_elems].to_vec(),
+            (out, inn),
+            &rd.device,
+        )?;
+        experts.push(QMatMul::from_qtensor(QTensor::quantize(
+            &t,
+            GgmlDType::F32,
+        )?)?);
+    }
+    Ok(experts)
+}
+
 fn load_moe<R: Read + Seek>(
     rd: &mut Reader<R>,
     p: &str,
@@ -1769,7 +2006,9 @@ fn load_moe<R: Read + Seek>(
     // A hash layer routes through the table on every token, so a missing one is
     // a load error rather than something to discover on the first forward pass.
     let tid2eid = if hash {
-        Some(rd.f32_tensor(&format!("{p}.ffn_gate_tid2eid.weight"))?)
+        // The id table ships as I32 in every DeepSeek-V4-Flash GGUF; candle
+        // cannot name that dtype, so the raw header is used.
+        Some(rd.i32_to_f32_tensor(&format!("{p}.ffn_gate_tid2eid.weight"))?)
     } else {
         None
     };
@@ -1830,6 +2069,17 @@ fn split_experts<R: Read + Seek>(
     name: &str,
     n_expert: usize,
 ) -> Result<Vec<QMatMul>> {
+    // IQ2_XXS expert tensors (how DeepSeek-V4-Flash GGUFs store gate/up):
+    // candle cannot represent the dtype, so slice per-expert block ranges
+    // straight out of the mapping and let `crate::iq2xxs` decode at matmul
+    // time.  Only falls back to a full f32 decode when there is no mapping
+    // (tests).
+    let raw_info = rd.raw.as_ref().and_then(|r| r.tensors.get(name)).cloned();
+    if let Some(info) = raw_info {
+        if info.dtype == crate::iq2xxs::GGML_TYPE_IQ2_XXS {
+            return split_iq2xxs_experts(rd, name, &info, n_expert);
+        }
+    }
     let qt = rd.qtensor(name)?;
     let dims = qt.shape().dims().to_vec();
     if dims.len() != 3 || dims[0] != n_expert {
@@ -1885,4 +2135,68 @@ fn split_experts<R: Read + Seek>(
         experts.push(QMatMul::from_qtensor(qt)?);
     }
     Ok(experts)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn md() -> HashMap<String, gguf_file::Value> {
+        let mut m = HashMap::new();
+        let u32v = |v: u32| gguf_file::Value::U32(v);
+        let f32v = |v: f32| gguf_file::Value::F32(v);
+        m.insert("deepseek4.block_count".into(), u32v(43));
+        m.insert("deepseek4.attention.head_count".into(), u32v(64));
+        m.insert("deepseek4.embedding_length".into(), u32v(4096));
+        m.insert(
+            "deepseek4.attention.layer_norm_rms_epsilon".into(),
+            f32v(1e-6),
+        );
+        m.insert("deepseek4.attention.q_lora_rank".into(), u32v(1024));
+        m.insert("deepseek4.attention.key_length".into(), u32v(512));
+        m.insert("deepseek4.expert_count".into(), u32v(256));
+        m.insert("deepseek4.expert_used_count".into(), u32v(6));
+        m
+    }
+
+    /// The real DeepSeek-V4-Flash GGUFs store the rope dim at
+    /// `deepseek4.rope.dimension_count`; older files used the
+    /// `attention.`-prefixed key.  Both must parse to the same config.
+    #[test]
+    fn rope_dim_reads_both_metadata_keys() {
+        let mut m = md();
+        m.insert(
+            "deepseek4.rope.dimension_count".into(),
+            gguf_file::Value::U32(64),
+        );
+        let cfg = Config::from_metadata(&m).unwrap();
+        assert_eq!(cfg.rope_head_dim, 64);
+        assert_eq!(cfg.nope_head_dim, 512 - 64);
+
+        let mut m = md();
+        m.insert(
+            "deepseek4.attention.rope.dimension_count".into(),
+            gguf_file::Value::U32(64),
+        );
+        let cfg = Config::from_metadata(&m).unwrap();
+        assert_eq!(cfg.rope_head_dim, 64);
+        assert_eq!(cfg.nope_head_dim, 512 - 64);
+    }
+
+    /// Missing rope metadata must be a load-time error, not a silent collapse
+    /// to a degenerate 1-wide rotary (which would produce an unreadable
+    /// `[b, h, t, 1]` rope slice mid-generation).
+    #[test]
+    fn missing_rope_dim_is_a_load_error() {
+        let err = match Config::from_metadata(&md()) {
+            Err(e) => e,
+            Ok(_) => panic!("from_metadata must reject a file with no rotary-dimension metadata"),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("rope"),
+            "error should name the rotary-dimension metadata, got: {msg}"
+        );
+    }
 }

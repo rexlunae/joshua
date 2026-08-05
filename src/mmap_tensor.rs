@@ -25,12 +25,23 @@
 //! exotic `general.alignment`, a dtype with no block type here — the borrow is
 //! declined and the caller falls back to candle's copying reader, so a
 //! pathological file degrades in performance rather than in correctness.
+//!
+//! One residual risk cannot be checked away: if the file is truncated or
+//! rewritten *while* the mapping lives, a later access can fault (SIGBUS on
+//! Unix) or observe torn data.  That is inherent to memory-mapped I/O and is
+//! the price of zero-copy weight loading — the same tradeoff llama.cpp makes.
+//! The contract is that no party modifies the model file after mapping; a
+//! well-formed loader never does (the mapping is read-only), and a hostile
+//! actor with write access to the file can already corrupt the process in
+//! more direct ways.  Within the checked range, reads are in-bounds and every
+//! byte pattern is a valid block, so there is no out-of-bounds access
+//! *unless* the file changes under the mapping.
 
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use candle_core::quantized::{gguf_file, k_quants, GgmlDType, GgmlType, QStorage, QTensor};
 use candle_core::quantized::QuantizedType;
+use candle_core::quantized::{gguf_file, k_quants, GgmlDType, GgmlType, QStorage, QTensor};
 use candle_core::{CpuStorage, Result};
 use half::{bf16, f16};
 use memmap2::Mmap;
@@ -164,6 +175,171 @@ impl<T: GgmlType + Send + Sync> QuantizedType for MmapBlocks<T> {
     fn from_float_imatrix(&mut self, _xs: &[f32], _imatrix_weights: &[f32], _n_per_row: usize) {
         panic!("cannot quantize into a read-only memory-mapped tensor")
     }
+}
+
+/// IQ2_XXS blocks borrowed from the mapping.
+///
+/// Candle's `GgmlDType` has no IQ2_XXS variant, so this cannot be expressed
+/// as `MmapBlocks<T: GgmlType>`.  `dtype()` returns a placeholder: the only
+/// consumer comparing it is `QMatMul::from_qtensor`, which distinguishes
+/// f32/f16/bf16 (dequantise eagerly) from everything else (keep as QTensor),
+/// and the aarch64 Q4K repack path that this deliberately is not.  The real
+/// dtype travels alongside the raw header instead.
+pub struct MmapBlocksIq2Xxs {
+    /// Keeps the mapping alive; never dereferenced directly.
+    _mmap: Arc<Mmap>,
+    ptr: *const crate::iq2xxs::BlockIq2Xxs,
+    len: usize,
+}
+
+// SAFETY: same argument as `MmapBlocks`: read-only mapping kept alive by
+// `_mmap`, blocks never mutated or moved.
+unsafe impl Send for MmapBlocksIq2Xxs {}
+unsafe impl Sync for MmapBlocksIq2Xxs {}
+
+impl MmapBlocksIq2Xxs {
+    fn blocks(&self) -> &[crate::iq2xxs::BlockIq2Xxs] {
+        // SAFETY: bounds- and alignment-checked in `borrow` (alignment is 1
+        // for the packed block type, so only bounds matter) against a mapping
+        // that `_mmap` keeps alive and that is never mutated.
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+
+    fn borrow(mmap: &Arc<Mmap>, byte_offset: usize, n_blocks: usize) -> Option<Self> {
+        let size = n_blocks.checked_mul(crate::iq2xxs::BLOCK_BYTES)?;
+        let end = byte_offset.checked_add(size)?;
+        if end > mmap.len() {
+            return None;
+        }
+        // SAFETY: `byte_offset <= end <= mmap.len()`.
+        let ptr = unsafe { mmap.as_ptr().add(byte_offset) };
+        // The block type is packed (align 1), so any offset is aligned.
+        Some(Self {
+            _mmap: Arc::clone(mmap),
+            ptr: ptr as *const crate::iq2xxs::BlockIq2Xxs,
+            len: n_blocks,
+        })
+    }
+}
+
+impl QuantizedType for MmapBlocksIq2Xxs {
+    fn dtype(&self) -> GgmlDType {
+        GgmlDType::Q2K // placeholder; see struct docs
+    }
+
+    fn matmul_t(&self, mkn: (usize, usize, usize), lhs: &[f32], dst: &mut [f32]) -> Result<()> {
+        crate::iq2xxs::matmul_t(mkn, lhs, self.blocks(), dst)
+    }
+
+    fn matmul_t_f16(&self, mkn: (usize, usize, usize), lhs: &[f16], dst: &mut [f16]) -> Result<()> {
+        crate::iq2xxs::matmul_t_f16(mkn, lhs, self.blocks(), dst)
+    }
+
+    fn embedding(&self, ids: &[u32], rows: usize, hidden: usize) -> Result<CpuStorage> {
+        if !hidden.is_multiple_of(crate::iq2xxs::QK_IQ2_XXS) {
+            candle_core::bail!(
+                "quantized embedding hidden size {hidden} is not divisible by block size {}",
+                crate::iq2xxs::QK_IQ2_XXS
+            )
+        }
+        let blocks = self.blocks();
+        let row_blocks = hidden / crate::iq2xxs::QK_IQ2_XXS;
+        if blocks.len() != rows * row_blocks {
+            candle_core::bail!(
+                "quantized tensor has {} blocks, expected {}",
+                blocks.len(),
+                rows * row_blocks
+            )
+        }
+        let mut out = vec![0f32; ids.len() * hidden];
+        for (out_row, &row_id) in ids.iter().enumerate() {
+            let row = row_id as usize;
+            if row >= rows {
+                candle_core::bail!("embedding id {row} is out of range for {rows} rows")
+            }
+            let src = &blocks[row * row_blocks..(row + 1) * row_blocks];
+            let dst = &mut out[out_row * hidden..(out_row + 1) * hidden];
+            crate::iq2xxs::dequantize(src, dst)?;
+        }
+        Ok(CpuStorage::F32(out))
+    }
+
+    fn dequantize(&self, elem_count: usize) -> Result<CpuStorage> {
+        let mut ys = vec![0.0f32; elem_count];
+        crate::iq2xxs::dequantize(self.blocks(), &mut ys)?;
+        Ok(CpuStorage::F32(ys))
+    }
+
+    fn storage_size_in_bytes(&self) -> usize {
+        self.len * crate::iq2xxs::BLOCK_BYTES
+    }
+
+    fn as_ptr(&self) -> *const u8 {
+        self.ptr as *const u8
+    }
+
+    fn block_size(&self) -> usize {
+        crate::iq2xxs::QK_IQ2_XXS
+    }
+
+    fn size(&self) -> usize {
+        self.len * crate::iq2xxs::BLOCK_BYTES
+    }
+
+    fn from_float(&mut self, _xs: &[f32]) {
+        panic!("cannot quantize into a read-only memory-mapped tensor")
+    }
+
+    fn from_float_imatrix(&mut self, _xs: &[f32], _imatrix_weights: &[f32], _n_per_row: usize) {
+        panic!("cannot quantize into a read-only memory-mapped tensor")
+    }
+}
+
+/// Borrow a tensor by raw GGUF dtype id, falling back to candle's table.
+///
+/// `dtype` is the raw header id, so IQ2_XXS (16) — which candle cannot name —
+/// can still be borrowed.  Returns `Ok(None)` when the dtype is unknown or the
+/// range cannot be borrowed safely.
+pub fn borrowed_qtensor_raw(
+    mmap: &Arc<Mmap>,
+    dtype: u32,
+    offset: u64,
+    tensor_data_offset: u64,
+    shape: candle_core::Shape,
+) -> Result<Option<QTensor>> {
+    if dtype == crate::iq2xxs::GGML_TYPE_IQ2_XXS {
+        let Ok(off) = usize::try_from(tensor_data_offset.saturating_add(offset)) else {
+            return Ok(None);
+        };
+        return borrowed_range_iq2xxs(mmap, off, shape);
+    }
+    let Some(ggml_dtype) = crate::gguf_ext::ggml_dtype_from_id(dtype) else {
+        return Ok(None);
+    };
+    let info = gguf_file::TensorInfo {
+        ggml_dtype,
+        shape,
+        offset,
+    };
+    borrowed_qtensor(mmap, &info, tensor_data_offset)
+}
+
+/// Borrow an IQ2_XXS tensor (or per-expert slice of one) from the mapping.
+pub fn borrowed_range_iq2xxs(
+    mmap: &Arc<Mmap>,
+    offset: usize,
+    shape: candle_core::Shape,
+) -> Result<Option<QTensor>> {
+    let elem_count = shape.elem_count();
+    if !elem_count.is_multiple_of(crate::iq2xxs::QK_IQ2_XXS) {
+        return Ok(None);
+    }
+    let n_blocks = elem_count / crate::iq2xxs::QK_IQ2_XXS;
+    let Some(blocks) = MmapBlocksIq2Xxs::borrow(mmap, offset, n_blocks) else {
+        return Ok(None);
+    };
+    let storage: Box<dyn QuantizedType> = Box::new(blocks);
+    QTensor::new(QStorage::Cpu(storage), shape).map(Some)
 }
 
 /// Build a [`QTensor`] that borrows `info`'s bytes from the mapping.
