@@ -797,6 +797,18 @@ pub fn write_raw_gguf(path: &Path, metadata: &[(String, gguf_file::Value)], tens
 /// dtypes candle cannot represent: IQ2_XXS routed experts and an I32
 /// tid2eid table in the hash layer.
 pub fn write_tiny_deepseek4_gguf(path: &Path) {
+    write_tiny_deepseek4_gguf_opts(path, false);
+}
+
+/// Like [`write_tiny_deepseek4_gguf`], but also emits `output.weight` as an
+/// IQ2_XXS tensor (a dtype candle cannot name) so callers can verify the
+/// loader's raw-header-aware presence check picks it up instead of silently
+/// tying the output head to the input embeddings.
+pub fn write_tiny_deepseek4_gguf_iq2xxs_output(path: &Path) {
+    write_tiny_deepseek4_gguf_opts(path, true);
+}
+
+fn write_tiny_deepseek4_gguf_opts(path: &Path, iq2xxs_output: bool) {
     const VOCAB: usize = 16;
     // EMB must be a multiple of the IQ2_XXS block size (256): each expert's
     // in-dimension is EMB, and candle requires the innermost dim of a QTensor
@@ -1052,6 +1064,16 @@ pub fn write_tiny_deepseek4_gguf(path: &Path) {
             &format!("{p}.hc_ffn_scale.weight"),
             vec![1.0, 1.0, 1.0],
             &[3],
+        ));
+    }
+
+    if iq2xxs_output {
+        // Distinct from token_embd (seed 1) so the test can tell which head
+        // was actually used.
+        tensors.push(RawTensor::iq2xxs(
+            "output.weight",
+            weights(VOCAB * EMB, 999),
+            &[VOCAB, EMB],
         ));
     }
 

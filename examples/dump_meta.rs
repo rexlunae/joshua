@@ -11,9 +11,13 @@ fn main() {
         .nth(1)
         .expect("usage: dump_meta <model.gguf>");
     let mut f = std::fs::File::open(&path).unwrap();
-    let mut header_bytes = vec![0u8; 16 * 1024 * 1024];
-    let n = f.read(&mut header_bytes).unwrap();
-    header_bytes.truncate(n);
+    // A single `read` may return fewer bytes than requested (signals, pipe
+    // semantics), so drain up to the header cap with `read_to_end`.
+    let mut header_bytes = Vec::with_capacity(16 * 1024 * 1024);
+    f.by_ref()
+        .take(16 * 1024 * 1024)
+        .read_to_end(&mut header_bytes)
+        .unwrap();
     let mut c = Cursor::new(&header_bytes[..]);
     let h = joshua::gguf_ext::read_header(&mut c).unwrap();
 

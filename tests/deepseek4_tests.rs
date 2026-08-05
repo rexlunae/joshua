@@ -148,6 +148,30 @@ impl<R: std::io::Seek> std::io::Seek for FailAllReads<R> {
     }
 }
 
+/// An `output.weight` shipped in a dtype candle cannot name (IQ2_XXS) must be
+/// picked up via the raw header and used, not reported absent — which would
+/// silently tie the output head to the input embeddings.
+#[test]
+fn deepseek4_iq2xxs_output_weight_is_used_not_tied() {
+    let dir = common::model_dir("deepseek4-iq2xxs-output");
+    let tied = dir.join("tied.gguf");
+    let own = dir.join("own.gguf");
+    common::write_tiny_deepseek4_gguf(&tied);
+    common::write_tiny_deepseek4_gguf_iq2xxs_output(&own);
+
+    let mut a = load(&tied, true);
+    let mut b = load(&own, true);
+    let tokens = [1u32, 4, 2, 7, 5];
+    let la = logits(&mut a, &tokens, 0);
+    let lb = logits(&mut b, &tokens, 0);
+    assert!(
+        la.iter().zip(&lb).any(|(x, y)| (x - y).abs() > 1e-3),
+        "IQ2_XXS output.weight must change the logits (tied model: {la:?}, own head: {lb:?})"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// A failure to re-read the raw header must surface as the load error, not be
 /// swallowed into "no raw table" (which would later become a misleading
 /// "cannot find tensor blk.N.ffn_gate_exps.weight").

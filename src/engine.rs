@@ -468,11 +468,15 @@ impl Engine {
             .map_err(|e| JoshuaError::ModelLoad(format!("GGUF read failed: {e}")))?;
 
         // Prefer the model's own name from metadata; fall back to the file
-        // stem for files that do not carry one.
+        // stem for files that do not carry one.  The metadata value is
+        // model-supplied (attacker-controlled by whoever ships the file), so
+        // it is sanitized before it can reach operator logs or the API's
+        // `model` field.
         let model_name = gguf
             .metadata
             .get("general.name")
             .and_then(|v| v.to_string().ok().cloned())
+            .and_then(|s| sanitize_model_name(&s))
             .unwrap_or_else(|| {
                 gguf_path
                     .file_stem()
@@ -1509,11 +1513,6 @@ fn token_str_from_metadata(
     tokenizer.id_to_token(id)
 }
 
-/// Extract the model's chat template from GGUF metadata, if present.
-///
-/// llama.cpp's converters store the HuggingFace chat template verbatim under
-/// `tokenizer.chat_template`.  BOS/EOS strings are resolved from their token
-/// IDs so the template can interpolate them.
 /// Parse the GGUF header tolerantly (raw dtype ids) and project it onto
 /// candle's `Content`, dropping tensors whose dtype candle cannot name.
 /// Those tensors are decoded by Joshua's own loaders via the raw header.
@@ -1522,6 +1521,50 @@ fn read_gguf_header(mmap: &[u8]) -> Result<gguf_file::Content> {
     header.to_candle_content()
 }
 
+/// Sanitize a model-supplied `general.name` into a safe display identifier.
+///
+/// The GGUF metadata is fully controlled by whoever ships the model file, and
+/// `Engine::model_name` is echoed into operator logs and OpenAI-compatible API
+/// responses (`model` field).  This strips control characters (newlines, ANSI
+/// escapes, NUL, ...), collapses and trims whitespace, and caps the length so
+/// the value cannot inject log lines, escape sequences, or unbounded strings.
+/// Returns `None` when nothing usable remains — the caller falls back to the
+/// file stem.
+fn sanitize_model_name(raw: &str) -> Option<String> {
+    const MAX_BYTES: usize = 128;
+    let mut out = String::with_capacity(raw.len().min(MAX_BYTES));
+    let mut seen_non_space = false;
+    let mut pending_space = false;
+    for c in raw.chars() {
+        if out.len() >= MAX_BYTES {
+            break;
+        }
+        if c.is_control() {
+            continue;
+        }
+        if c.is_whitespace() {
+            pending_space = seen_non_space;
+            continue;
+        }
+        if pending_space {
+            out.push(' ');
+            pending_space = false;
+        }
+        out.push(c);
+        seen_non_space = true;
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+/// Extract the model's chat template from GGUF metadata, if present.
+///
+/// llama.cpp's converters store the HuggingFace chat template verbatim under
+/// `tokenizer.chat_template`.  BOS/EOS strings are resolved from their token
+/// IDs so the template can interpolate them.
 fn extract_chat_template(gguf: &gguf_file::Content, tokenizer: &Tokenizer) -> Option<ChatTemplate> {
     let source = gguf
         .metadata
@@ -1714,6 +1757,37 @@ fn sample_token(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sanitize_model_name_keeps_plain_names() {
+        assert_eq!(
+            sanitize_model_name("DeepSeek-V4-Flash"),
+            Some("DeepSeek-V4-Flash".into())
+        );
+        assert_eq!(
+            sanitize_model_name("  Llama 3.1  8B  "),
+            Some("Llama 3.1 8B".into())
+        );
+    }
+
+    #[test]
+    fn sanitize_model_name_strips_control_chars_and_newlines() {
+        // Newline + ANSI ESC injection must not survive into logs/API; the
+        // ESC byte is stripped (the trailing `[31m` is inert text without it).
+        assert_eq!(
+            sanitize_model_name("evil\n[2Jname"),
+            Some("evil[2Jname".into())
+        );
+        assert_eq!(sanitize_model_name("a\u{1b}[31mb"), Some("a[31mb".into()));
+        assert_eq!(sanitize_model_name("\u{0}"), None);
+        assert_eq!(sanitize_model_name("   "), None);
+    }
+
+    #[test]
+    fn sanitize_model_name_caps_length() {
+        let long = "x".repeat(1000);
+        assert_eq!(sanitize_model_name(&long), Some("x".repeat(128)));
+    }
 
     #[test]
     fn page_size_params_are_correct() {

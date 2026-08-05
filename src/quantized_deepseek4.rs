@@ -1550,11 +1550,14 @@ impl<R: Read + Seek> Reader<R> {
     fn qmatmul(&mut self, name: &str) -> Result<QMatMul> {
         QMatMul::from_qtensor(self.qtensor(name)?)
     }
-    fn qmatmul_opt(&mut self, name: &str) -> Option<QMatMul> {
+    fn qmatmul_opt(&mut self, name: &str) -> Result<Option<QMatMul>> {
+        // Distinguish "absent" from "present but failed to load": a tensor
+        // that exists but cannot be decoded must error, not silently fall
+        // back to a different weight (e.g. tied embeddings for the head).
         if self.has(name) {
-            self.qmatmul(name).ok()
+            Ok(Some(self.qmatmul(name)?))
         } else {
-            None
+            Ok(None)
         }
     }
     fn rms_norm(&mut self, name: &str, eps: f64) -> Result<RmsNorm> {
@@ -1566,7 +1569,16 @@ impl<R: Read + Seek> Reader<R> {
             .to_dtype(DType::F32)
     }
     fn has(&self, name: &str) -> bool {
+        // `ct` only carries tensors whose dtype candle can name; the raw
+        // header is the source of truth for the rest (IQ2_XXS, I32, ...),
+        // which `to_candle_content` drops.  Without this a real tensor in
+        // such a format would be reported absent and silently swapped for
+        // a different weight.
         self.ct.tensor_infos.contains_key(name)
+            || self
+                .raw
+                .as_ref()
+                .is_some_and(|r| r.tensors.contains_key(name))
     }
 }
 
@@ -1603,7 +1615,7 @@ impl ModelWeights {
 
         let tok_embeddings = rd.f32_tensor("token_embd.weight")?;
         let norm = rd.rms_norm("output_norm.weight", cfg.rms_eps)?;
-        let output = match rd.qmatmul_opt("output.weight") {
+        let output = match rd.qmatmul_opt("output.weight")? {
             Some(o) => o,
             None => rd.qmatmul("token_embd.weight")?,
         };
