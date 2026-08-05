@@ -1527,20 +1527,25 @@ impl<R: Read + Seek> Reader<R> {
         // No mapping (CPU): quantized/f16 tensors are decoded to f32 so the
         // streamed path shares the mmap path's f32-activation matmul
         // semantics (same rationale as above).  F32 tensors keep candle's
-        // reader, which is exact for them.
-        let decode = self
-            .ct
-            .tensor_infos
-            .get(name)
-            .map(|info| (crate::gguf_ext::ggml_id_from_dtype(info.ggml_dtype), info.shape.clone()));
-        if let Some((dtype, shape)) = decode {
-            if let Some(f32s) = crate::quant_matmul::decode_raw_to_f32(
-                dtype,
-                &self.raw_bytes_from(name)?,
-                shape.elem_count(),
-            )? {
-                let t = Tensor::from_vec(f32s, shape, &self.device)?;
-                return QTensor::quantize(&t, GgmlDType::F32);
+        // reader, which is exact for them.  This requires the raw header to
+        // locate + size the tensor's bytes (candle's `TensorInfo` has no
+        // on-disk offset); `ModelWeights::from_gguf` (raw = None) falls
+        // through to candle's own reader instead.
+        if self.raw.is_some() {
+            let decode = self
+                .ct
+                .tensor_infos
+                .get(name)
+                .map(|info| (crate::gguf_ext::ggml_id_from_dtype(info.ggml_dtype), info.shape.clone()));
+            if let Some((dtype, shape)) = decode {
+                if let Some(f32s) = crate::quant_matmul::decode_raw_to_f32(
+                    dtype,
+                    &self.raw_bytes_from(name)?,
+                    shape.elem_count(),
+                )? {
+                    let t = Tensor::from_vec(f32s, shape, &self.device)?;
+                    return QTensor::quantize(&t, GgmlDType::F32);
+                }
             }
         }
         self.ct.tensor(&mut self.reader, name, &self.device)

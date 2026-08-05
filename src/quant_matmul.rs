@@ -35,7 +35,7 @@ use half::f16;
 pub fn decode_raw_to_f32(dtype: u32, bytes: &[u8], elems: usize) -> Result<Option<Vec<f32>>> {
     use candle_core::quantized::k_quants::{
         BlockQ2K, BlockQ3K, BlockQ4K, BlockQ4_0, BlockQ4_1, BlockQ5K, BlockQ5_0, BlockQ5_1, BlockQ6K,
-        BlockQ8_0, BlockQ8_1,
+        BlockQ8_0, BlockQ8_1, BlockQ8K,
     };
 
     macro_rules! kquant {
@@ -89,6 +89,7 @@ pub fn decode_raw_to_f32(dtype: u32, bytes: &[u8], elems: usize) -> Result<Optio
         12 => kquant!(BlockQ4K),
         13 => kquant!(BlockQ5K),
         14 => kquant!(BlockQ6K),
+        15 => kquant!(BlockQ8K),
         _ => return Ok(None),
     };
     Ok(Some(out))
@@ -168,32 +169,65 @@ fn matmul_kquant_impl<T: GgmlType>(
     if m == 0 || n == 0 {
         return Ok(());
     }
-    if crate::simd::avx2_fma_available() && k.is_multiple_of(8) {
-        let dst_ptr = crate::simd::DstPtr::new(dst);
-        let worker = move |rows: &[usize]| {
-            // One dequantization scratch per task, reused across the task's
-            // rows (the weight row is fully dequantized before the SIMD dot).
-            let mut wrow = vec![0f32; k];
-            for &row in rows {
-                T::to_float(&blocks[row * blocks_per_row..(row + 1) * blocks_per_row], &mut wrow);
-                // SAFETY: avx2_fma_available() was checked above, so the
-                // target_feature kernel may run on this CPU; row `row`
-                // writes exactly dst[i*n + row] for i in 0..m, disjoint
-                // from every other row (see `crate::simd`).
-                unsafe { dot_row_avx2(m, k, n, lhs, &wrow, row, &dst_ptr) }
-            }
-        };
-        if parallel {
-            crate::simd::for_each_row_chunks(n, worker);
-        } else {
-            let rows: Vec<usize> = (0..n).collect();
-            worker(&rows);
-        }
+    if try_avx2_kquant(mkn, blocks_per_row, lhs, blocks, dst, parallel) {
         return Ok(());
     }
     // Scalar fallback: candle's own kernel, exactly as before (bit-identical
     // to joshua's prior behavior on non-AVX2 CPUs and unusual shapes).
     k_quants::matmul((m, k, n), lhs, blocks, dst)
+}
+
+/// AVX2/FMA fast path for [`matmul_kquant_impl`]: dequantize each weight row
+/// once, then dot it against every activation row with 8-lane FMA.  Returns
+/// `true` if it ran.  The kernel is `#[cfg(target_arch = "x86_64")]`, so the
+/// whole branch lives behind the same cfg here — on other targets (aarch64,
+/// wasm, ...) this stub returns `false` and callers use the portable path.
+#[cfg(target_arch = "x86_64")]
+fn try_avx2_kquant<T: GgmlType>(
+    mkn: (usize, usize, usize),
+    blocks_per_row: usize,
+    lhs: &[f32],
+    blocks: &[T],
+    dst: &mut [f32],
+    parallel: bool,
+) -> bool {
+    let (m, k, n) = mkn;
+    if !(crate::simd::avx2_fma_available() && k.is_multiple_of(8)) {
+        return false;
+    }
+    let dst_ptr = crate::simd::DstPtr::new(dst);
+    let worker = move |rows: &[usize]| {
+        // One dequantization scratch per task, reused across the task's
+        // rows (the weight row is fully dequantized before the SIMD dot).
+        let mut wrow = vec![0f32; k];
+        for &row in rows {
+            T::to_float(&blocks[row * blocks_per_row..(row + 1) * blocks_per_row], &mut wrow);
+            // SAFETY: avx2_fma_available() was checked above, so the
+            // target_feature kernel may run on this CPU; row `row`
+            // writes exactly dst[i*n + row] for i in 0..m, disjoint
+            // from every other row (see `crate::simd`).
+            unsafe { dot_row_avx2(m, k, n, lhs, &wrow, row, &dst_ptr) }
+        }
+    };
+    if parallel {
+        crate::simd::for_each_row_chunks(n, worker);
+    } else {
+        let rows: Vec<usize> = (0..n).collect();
+        worker(&rows);
+    }
+    true
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn try_avx2_kquant<T: GgmlType>(
+    _mkn: (usize, usize, usize),
+    _blocks_per_row: usize,
+    _lhs: &[f32],
+    _blocks: &[T],
+    _dst: &mut [f32],
+    _parallel: bool,
+) -> bool {
+    false
 }
 
 /// AVX2/FMA dot of one dequantized weight row against all m activation rows,
@@ -352,6 +386,52 @@ mod tests {
     fn q4k_matches_candle_scalar() {
         run_case::<BlockQ4K>(GgmlDType::Q4K, 3, 512, 13);
         run_case::<BlockQ4K>(GgmlDType::Q4K, 4, 768, 25);
+    }
+
+    /// `decode_raw_to_f32` must decode every K-quant GGUF id (10..=15) from
+    /// raw file bytes: the streamed loader sizes reads through
+    /// `gguf_ext::type_size_bytes`, and this decoder must agree with candle's
+    /// block layouts element-for-element.
+    #[test]
+    fn decode_raw_to_f32_handles_all_k_quants() {
+        use candle_core::quantized::k_quants::{
+            BlockQ2K, BlockQ3K, BlockQ4K, BlockQ5K, BlockQ6K, BlockQ8K,
+        };
+        macro_rules! check {
+            ($id:expr, $ty:ty) => {{
+                let n = 3usize;
+                let k = 256usize; // QK_K
+                let blocks = quantized_blocks::<$ty>(n, k, <$ty as GgmlType>::DTYPE);
+                let elems = n * k;
+                let block_bytes = std::mem::size_of::<$ty>();
+                let mut bytes = Vec::with_capacity(blocks.len() * block_bytes);
+                for b in &blocks {
+                    let ptr = b as *const $ty as *const u8;
+                    bytes.extend_from_slice(unsafe {
+                        std::slice::from_raw_parts(ptr, block_bytes)
+                    });
+                }
+                let decoded = decode_raw_to_f32($id, &bytes, elems)
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("dtype {} must decode", $id));
+                let mut w = vec![0f32; elems];
+                <$ty as GgmlType>::to_float(&blocks, &mut w);
+                for (i, (x, y)) in decoded.iter().zip(w.iter()).enumerate() {
+                    let tol = 1e-6 * y.abs().max(1.0);
+                    assert!(
+                        (x - y).abs() <= tol,
+                        "dtype {} elem {i}: decoded={x} to_float={y} (tol {tol})",
+                        $id
+                    );
+                }
+            }};
+        }
+        check!(10, BlockQ2K);
+        check!(11, BlockQ3K);
+        check!(12, BlockQ4K);
+        check!(13, BlockQ5K);
+        check!(14, BlockQ6K);
+        check!(15, BlockQ8K);
     }
 
     /// Parallel and serial execution must agree bit-for-bit (rows are

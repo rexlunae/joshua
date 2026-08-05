@@ -563,6 +563,7 @@ pub fn write_unsupported_gguf(path: &Path) {
 const DTYPE_F32: u32 = 0;
 const DTYPE_F16: u32 = 1;
 const DTYPE_Q8_0: u32 = 8;
+const DTYPE_Q4_K: u32 = 12;
 const DTYPE_IQ2_XXS: u32 = 16;
 const DTYPE_I32: u32 = 26;
 
@@ -616,6 +617,23 @@ impl RawTensor {
         Self {
             name: name.into(),
             dtype: DTYPE_Q8_0,
+            dims: qt.shape().dims().to_vec(),
+            data: qt.data().unwrap().to_vec(),
+        }
+    }
+
+    /// Quantize f32 data to Q4_K via candle.
+    ///
+    /// The total element count must be a multiple of QK_K = 256 (candle's
+    /// `QTensor::quantize` requires it), and the innermost dim must be
+    /// block-aligned too for the matmul contract — the deepseek4 tiny-model
+    /// weights chosen for this (attn_kv, shared-expert gate/up) satisfy both.
+    pub fn q4k(name: &str, data: Vec<f32>, dims: &[usize]) -> Self {
+        let t = Tensor::from_vec(data, dims, &Device::Cpu).unwrap();
+        let qt = QTensor::quantize(&t, GgmlDType::Q4K).unwrap();
+        Self {
+            name: name.into(),
+            dtype: DTYPE_Q4_K,
             dims: qt.shape().dims().to_vec(),
             data: qt.data().unwrap().to_vec(),
         }
@@ -796,8 +814,25 @@ pub fn write_raw_gguf(path: &Path, metadata: &[(String, gguf_file::Value)], tens
 /// Write a tiny but structurally valid `deepseek4` GGUF exercising the
 /// dtypes candle cannot represent: IQ2_XXS routed experts and an I32
 /// tid2eid table in the hash layer.
+/// Options controlling which tensors the tiny `deepseek4` writer emits.
+#[derive(Default, Clone, Copy)]
+pub struct TinyDeepseek4Opts {
+    /// Also emit `output.weight` as IQ2_XXS (a dtype candle cannot name).
+    pub iq2xxs_output: bool,
+    /// Layer 0 is a CSA layer (compressor + lightning indexer tensors).
+    pub compress: bool,
+    /// Emit K-quant (Q4_K) weights for the attention-KV and shared-expert
+    /// projections instead of F16 — exercises the K-quant decode path on
+    /// both the mmap and streamed loaders.
+    pub kquant_weights: bool,
+    /// Use only dtypes candle can name (Q8_0 experts, F32 id table instead of
+    /// I32) so the model loads through `ModelWeights::from_gguf`, whose
+    /// streamed entry point has no raw header.
+    pub candle_only: bool,
+}
+
 pub fn write_tiny_deepseek4_gguf(path: &Path) {
-    write_tiny_deepseek4_gguf_opts(path, false, false);
+    write_tiny_deepseek4_gguf_opts(path, TinyDeepseek4Opts::default());
 }
 
 /// Like [`write_tiny_deepseek4_gguf`], but also emits `output.weight` as an
@@ -805,7 +840,13 @@ pub fn write_tiny_deepseek4_gguf(path: &Path) {
 /// loader's raw-header-aware presence check picks it up instead of silently
 /// tying the output head to the input embeddings.
 pub fn write_tiny_deepseek4_gguf_iq2xxs_output(path: &Path) {
-    write_tiny_deepseek4_gguf_opts(path, true, false);
+    write_tiny_deepseek4_gguf_opts(
+        path,
+        TinyDeepseek4Opts {
+            iq2xxs_output: true,
+            ..Default::default()
+        },
+    );
 }
 
 /// Like [`write_tiny_deepseek4_gguf`], but layer 0 is a CSA layer
@@ -813,10 +854,48 @@ pub fn write_tiny_deepseek4_gguf_iq2xxs_output(path: &Path) {
 /// indexer tensors so the compressed-KV cache write path (scatter into
 /// `comp`/`lid`) is exercised by forward passes that span a full block.
 pub fn write_tiny_deepseek4_gguf_compress(path: &Path) {
-    write_tiny_deepseek4_gguf_opts(path, false, true);
+    write_tiny_deepseek4_gguf_opts(
+        path,
+        TinyDeepseek4Opts {
+            compress: true,
+            ..Default::default()
+        },
+    );
 }
 
-fn write_tiny_deepseek4_gguf_opts(path: &Path, iq2xxs_output: bool, compress: bool) {
+/// Like [`write_tiny_deepseek4_gguf`], but the attention-KV projection and
+/// the shared-expert gate/up projections are Q4_K instead of F16.
+pub fn write_tiny_deepseek4_gguf_kquant(path: &Path) {
+    write_tiny_deepseek4_gguf_opts(
+        path,
+        TinyDeepseek4Opts {
+            kquant_weights: true,
+            ..Default::default()
+        },
+    );
+}
+
+/// Like [`write_tiny_deepseek4_gguf`], but every tensor uses a dtype candle's
+/// `GgmlDType` can name (routed experts Q8_0 instead of IQ2_XXS, id table F32
+/// instead of I32) so the file also loads through `ModelWeights::from_gguf`
+/// (no raw header).
+pub fn write_tiny_deepseek4_gguf_candle_only(path: &Path) {
+    write_tiny_deepseek4_gguf_opts(
+        path,
+        TinyDeepseek4Opts {
+            candle_only: true,
+            ..Default::default()
+        },
+    );
+}
+
+fn write_tiny_deepseek4_gguf_opts(path: &Path, opts: TinyDeepseek4Opts) {
+    let TinyDeepseek4Opts {
+        iq2xxs_output,
+        compress,
+        kquant_weights,
+        candle_only,
+    } = opts;
     const VOCAB: usize = 16;
     // EMB must be a multiple of the IQ2_XXS block size (256): each expert's
     // in-dimension is EMB, and candle requires the innermost dim of a QTensor
@@ -971,11 +1050,14 @@ fn write_tiny_deepseek4_gguf_opts(path: &Path, iq2xxs_output: bool, compress: bo
             next(NHEAD * HEAD_DIM * Q_LORA),
             &[NHEAD * HEAD_DIM, Q_LORA],
         ));
-        tensors.push(RawTensor::f16(
-            &format!("{p}.attn_kv.weight"),
-            next(HEAD_DIM * EMB),
-            &[HEAD_DIM, EMB],
-        ));
+        // Q4_K needs the innermost dim (the matmul contraction dim) to be a
+        // multiple of QK_K = 256; EMB = 256 satisfies it.
+        let kv_data = next(HEAD_DIM * EMB);
+        tensors.push(if kquant_weights {
+            RawTensor::q4k(&format!("{p}.attn_kv.weight"), kv_data, &[HEAD_DIM, EMB])
+        } else {
+            RawTensor::f16(&format!("{p}.attn_kv.weight"), kv_data, &[HEAD_DIM, EMB])
+        });
         tensors.push(RawTensor::f32(
             &format!("{p}.attn_kv_a_norm.weight"),
             ones(HEAD_DIM),
@@ -1071,30 +1153,38 @@ fn write_tiny_deepseek4_gguf_opts(path: &Path, iq2xxs_output: bool, compress: bo
         let gate_up = next(NE * NFE * EMB);
         let up = next(NE * NFE * EMB);
         let down = next(NE * NFE * EMB);
-        tensors.push(RawTensor::iq2xxs(
-            &format!("{p}.ffn_gate_exps.weight"),
-            gate_up,
-            &[NE, NFE, EMB],
-        ));
-        tensors.push(RawTensor::iq2xxs(
-            &format!("{p}.ffn_up_exps.weight"),
-            up,
-            &[NE, NFE, EMB],
-        ));
+        // `candle_only` uses Q8_0 for the routed experts so the whole file
+        // stays loadable without the raw header (IQ2_XXS is not a dtype
+        // candle's `Content` can carry).
+        let exps = if candle_only {
+            |name: &str, data: Vec<f32>| RawTensor::q8_0(name, data, &[NE, NFE, EMB])
+        } else {
+            |name: &str, data: Vec<f32>| RawTensor::iq2xxs(name, data, &[NE, NFE, EMB])
+        };
+        tensors.push(exps(&format!("{p}.ffn_gate_exps.weight"), gate_up));
+        tensors.push(exps(&format!("{p}.ffn_up_exps.weight"), up));
         tensors.push(RawTensor::q8_0(
             &format!("{p}.ffn_down_exps.weight"),
             down,
             &[NE, EMB, NFE],
         ));
-        tensors.push(RawTensor::f16(
+        // Shared expert: F16 normally, Q4_K in the k-quant variant (gate/up
+        // have EMB = 256 as their contraction dim; down's is NFE = 128, so it
+        // stays F16).
+        let shexp = |name: &str, data: Vec<f32>| {
+            if kquant_weights {
+                RawTensor::q4k(name, data, &[NFE, EMB])
+            } else {
+                RawTensor::f16(name, data, &[NFE, EMB])
+            }
+        };
+        tensors.push(shexp(
             &format!("{p}.ffn_gate_shexp.weight"),
             next(NFE * EMB),
-            &[NFE, EMB],
         ));
-        tensors.push(RawTensor::f16(
+        tensors.push(shexp(
             &format!("{p}.ffn_up_shexp.weight"),
             next(NFE * EMB),
-            &[NFE, EMB],
         ));
         tensors.push(RawTensor::f16(
             &format!("{p}.ffn_down_shexp.weight"),
@@ -1105,11 +1195,22 @@ fn write_tiny_deepseek4_gguf_opts(path: &Path, iq2xxs_output: bool, compress: bo
             // Routed-id table: I32, [vocab, n_expert_used], ids in [0, NE).
             let ids: Vec<i32> = (0..VOCAB).map(|t| ((t * 3 + 1) % NE) as i32).collect();
             let ids = [ids.clone(), ids.clone()].concat();
-            tensors.push(RawTensor::i32(
-                &format!("{p}.ffn_gate_tid2eid.weight"),
-                ids,
-                &[VOCAB, NUSED],
-            ));
+            // `candle_only` writes the same values as F32 — the loader reads
+            // either (I32 goes through the raw header, F32 through candle).
+            if candle_only {
+                let f32ids: Vec<f32> = ids.iter().map(|&v| v as f32).collect();
+                tensors.push(RawTensor::f32(
+                    &format!("{p}.ffn_gate_tid2eid.weight"),
+                    f32ids,
+                    &[VOCAB, NUSED],
+                ));
+            } else {
+                tensors.push(RawTensor::i32(
+                    &format!("{p}.ffn_gate_tid2eid.weight"),
+                    ids,
+                    &[VOCAB, NUSED],
+                ));
+            }
         }
 
         // Hyper-connection mixing: [hc*d] → [(2+hc)*hc], plus scale/base.

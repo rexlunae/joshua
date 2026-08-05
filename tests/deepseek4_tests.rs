@@ -251,3 +251,96 @@ fn deepseek4_engine_accepts_unknown_dtypes() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Streamed (no mmap) loads must work for K-quant weights: the byte-size
+/// lookup used to re-read the tensor data covers Q2_K..Q8_K, not just the
+/// Q4_0..Q8_1 family.  Before the fix this aborted with "no size known for
+/// GGUF dtype 12".
+#[test]
+fn deepseek4_streamed_load_handles_k_quant_weights() {
+    let dir = common::model_dir("deepseek4-kquant-streamed");
+    let model = dir.join("model.gguf");
+    common::write_tiny_deepseek4_gguf_kquant(&model);
+
+    let mut m = load(&model, false);
+    let out = logits(&mut m, &[1, 4, 2, 7, 5], 0);
+    assert_eq!(out.len(), 16);
+    assert!(
+        out.iter().all(|v| v.is_finite()),
+        "all logits must be finite: {out:?}"
+    );
+    let first = out[0];
+    assert!(
+        out.iter().any(|v| (v - first).abs() > 1e-6),
+        "logits are degenerate"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The mmap path (Q4_K blocks borrowed and matmul'd in place) and the
+/// streamed path (Q4_K decoded to f32 at load) must agree for K-quant
+/// weights, like they do for the IQ2_XXS experts.
+#[test]
+fn deepseek4_kquant_mmap_matches_streamed_path() {
+    let dir = common::model_dir("deepseek4-kquant-parity");
+    let model = dir.join("model.gguf");
+    common::write_tiny_deepseek4_gguf_kquant(&model);
+
+    let mut mmapped = load(&model, true);
+    let mut streamed = load(&model, false);
+    let tokens = [1, 4, 2, 7, 5, 3, 8];
+    let a = logits(&mut mmapped, &tokens, 0);
+    let b = logits(&mut streamed, &tokens, 0);
+    for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+        let tol = 1e-3 * y.abs().max(1.0);
+        assert!(
+            (x - y).abs() <= tol,
+            "logit {i}: mmap={x} streamed={y} (tol {tol})"
+        );
+    }
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// `ModelWeights::from_gguf` is the public streamed entry point without a raw
+/// header; it must fall back to candle's reader instead of erroring with "no
+/// raw header for `token_embd.weight`".  The model is written with only
+/// candle-nameable dtypes so every tensor is reachable that way.
+#[test]
+fn deepseek4_from_gguf_without_raw_header_loads() {
+    let dir = common::model_dir("deepseek4-fromgguf");
+    let model = dir.join("model.gguf");
+    common::write_tiny_deepseek4_gguf_candle_only(&model);
+
+    let bytes = std::fs::read(&model).unwrap();
+    let mut cursor = std::io::Cursor::new(&bytes[..]);
+    let header = joshua::gguf_ext::read_header(&mut cursor).unwrap();
+    let content = header.to_candle_content().unwrap();
+    let mut cursor = std::io::Cursor::new(&bytes[..]);
+    let mut m = joshua::quantized_deepseek4::ModelWeights::from_gguf(
+        content,
+        &mut cursor,
+        &Device::Cpu,
+    )
+    .expect("from_gguf (no raw header) must load candle-nameable models");
+
+    let input = Tensor::new(&[1u32, 4, 2, 7, 5][..], &Device::Cpu)
+        .unwrap()
+        .unsqueeze(0)
+        .unwrap();
+    let out: Vec<f32> = m
+        .forward(&input, 0)
+        .unwrap()
+        .squeeze(0)
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert_eq!(out.len(), 16);
+    assert!(
+        out.iter().all(|v| v.is_finite()),
+        "all logits must be finite: {out:?}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
