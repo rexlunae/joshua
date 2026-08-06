@@ -52,6 +52,9 @@ tokenizers = { version = "0.21", default-features = false, features = ["fancy-re
 # Memory-mapped model loading (pure Rust wrapper over mmap(2))
 memmap2 = "0.9"
 
+# mlock(2) for pinning the hot weight set in RAM (unix)
+libc = "0.2"
+
 # Runtime loading of NPU vendor plugins (thin safe wrapper over dlopen)
 libloading = "0.8"
 

@@ -20,6 +20,15 @@
 //! mapping of a chosen size (2 MiB / 1 GiB) for guaranteed huge pages at the
 //! cost of private RAM.
 //!
+//! For a sparse mixture-of-experts model far larger than RAM, the access
+//! pattern is bimodal and the blanket hints above are wrong for one of the
+//! two halves: the dense weights are touched on every token, while routed
+//! experts are touched sparsely.  [`EngineOptions::pin_hot_weights`] prefetches
+//! the dense ranges (`MADV_WILLNEED`) at load and advises `MADV_RANDOM` on the
+//! expert ranges so they page in on demand without evicting the hot set;
+//! [`EngineOptions::mlock_hot_weights`] additionally locks the dense ranges
+//! into RAM for a hard residency guarantee.
+//!
 //! Because that mapping is the whole loading strategy, the file is checked
 //! before it is mapped: a model that is really a gzip/zstd/… stream, or one
 //! the filesystem stores compressed, cannot be paged in usefully (see
@@ -201,6 +210,43 @@ pub struct EngineOptions {
     /// [`MmapMode::Required`] turns "this file cannot usefully be mapped" from
     /// a warning into a load error.
     pub mmap: MmapMode,
+    /// Prefetch the always-touched weights at load and advise random access
+    /// on routed-expert weights.
+    ///
+    /// A mixture-of-experts model far larger than RAM has two very different
+    /// access patterns.  A small "dense" set — embeddings, norms, attention,
+    /// routers, shared experts, indexer/compressor, output — is touched on
+    /// every token, while the routed experts are touched sparsely (a token
+    /// routes through a handful of the 256 per layer).  Plain mmap leaves both
+    /// to the page cache: the dense set faults in on first use, and the
+    /// readahead hint normally given to the mapping (see
+    /// [`EngineOptions::lazy_weights`]) drags in expert pages that are
+    /// immediately evicted.
+    ///
+    /// With this set, the dense ranges are prefetched (`MADV_WILLNEED`) so the
+    /// per-token working set is resident before the first request, and the
+    /// expert ranges get `MADV_RANDOM` so sparse access does not evict it.  The
+    /// blanket sequential/random hint is skipped in favour of these per-range
+    /// hints.  The prefetch is best-effort (the kernel decides); combine with
+    /// [`EngineOptions::mlock_hot_weights`] for a hard guarantee.
+    ///
+    /// Meaningless for [`HugePages::Explicit`], which copies the whole model
+    /// into anonymous RAM up front; the request is then ignored with a warning.
+    pub pin_hot_weights: bool,
+    /// Lock the always-touched weight ranges into RAM with `mlock(2)`.
+    ///
+    /// Same dense/expert split as [`EngineOptions::pin_hot_weights`]: the dense
+    /// ranges are locked (which both faults them in and keeps them resident no
+    /// matter what the page cache does), and expert ranges still get
+    /// `MADV_RANDOM`.  Implies the pinning advice split even when
+    /// `pin_hot_weights` is unset.
+    ///
+    /// Requires the process memlock limit to cover the dense set — a few GiB on
+    /// typical MoE models — so raise it with `LimitMEMLOCK=infinity` (systemd)
+    /// or `ulimit -l unlimited`.  Ranges that fail to lock are reported with a
+    /// warning and the load continues, so a limit that is too low degrades to
+    /// the advisory behaviour of `pin_hot_weights` rather than failing.
+    pub mlock_hot_weights: bool,
 }
 
 impl EngineOptions {
@@ -228,6 +274,20 @@ impl EngineOptions {
     /// error instead of a warning.
     pub fn mmap(mut self, mmap: MmapMode) -> Self {
         self.mmap = mmap;
+        self
+    }
+
+    /// Prefetch the always-touched weights at load and advise random access on
+    /// routed experts.  See [`EngineOptions::pin_hot_weights`].
+    pub fn pin_hot_weights(mut self, pin: bool) -> Self {
+        self.pin_hot_weights = pin;
+        self
+    }
+
+    /// Lock the always-touched weight ranges into RAM.  See
+    /// [`EngineOptions::mlock_hot_weights`].
+    pub fn mlock_hot_weights(mut self, lock: bool) -> Self {
+        self.mlock_hot_weights = lock;
         self
     }
 }
@@ -496,11 +556,18 @@ impl Engine {
             .map_err(|e| JoshuaError::ModelLoad(format!("tokenizer load failed: {e}")))?;
 
         // Map the GGUF file into memory using the configured backing.
+        //
+        // Hot-weight pinning applies per-range advice after the header is
+        // parsed below, so it asks map_model to skip the blanket
+        // sequential/random hint (which would otherwise keep "free after use"
+        // semantics on the very ranges we want to keep resident).
+        let hot_pinning = options.pin_hot_weights || options.mlock_hot_weights;
         let mmap = map_model(
             &gguf_path,
             options.huge_pages,
             options.lazy_weights,
             options.mmap,
+            hot_pinning,
         )?;
 
         // Read GGUF metadata once to validate the architecture up front and
@@ -509,6 +576,29 @@ impl Engine {
         // arch detection instead of dying on the first unknown dtype.
         let gguf = read_gguf_header(&mmap)
             .map_err(|e| JoshuaError::ModelLoad(format!("GGUF read failed: {e}")))?;
+
+        // Prefetch and/or lock the always-touched weights, and advise random
+        // access on routed experts, when requested.  The raw header is used so
+        // tensors in dtypes candle cannot name (IQ2_XXS, I32, MXFP4) are still
+        // classified; the projected `Content` above drops them.
+        if hot_pinning {
+            if matches!(options.huge_pages, HugePages::Explicit(_)) {
+                tracing::warn!(
+                    "ignoring hot-weight pinning: explicit huge pages already copy the whole \
+                     model into anonymous RAM, so every range is resident. Use --huge-pages \
+                     transparent (or none) for pinning to matter."
+                );
+            } else {
+                let raw = crate::gguf_ext::read_header(&mut Cursor::new(&mmap[..]))
+                    .map_err(|e| JoshuaError::ModelLoad(format!("GGUF header re-read failed: {e}")))?;
+                apply_hot_weight_pinning(
+                    &mmap,
+                    &raw,
+                    options.pin_hot_weights,
+                    options.mlock_hot_weights,
+                )?;
+            }
+        }
 
         // The API identifier is the file stem — the documented contract on
         // `model_name` (see the field and accessor docs) — so clients keyed
@@ -1399,7 +1489,16 @@ fn load_image_bytes(source: &str) -> Result<Vec<u8>> {
 /// SAFETY (file-backed variants): the mapping is only undefined behaviour if
 /// the file is truncated or rewritten while mapped.  Model files are treated
 /// as immutable once downloaded, matching llama.cpp's own mmap usage.
-fn map_model(path: &Path, huge: HugePages, lazy: bool, mmap_mode: MmapMode) -> Result<Mmap> {
+///
+/// `per_range_advice` skips the blanket sequential/random hint: the caller
+/// (hot-weight pinning) applies per-range advice after parsing the header.
+fn map_model(
+    path: &Path,
+    huge: HugePages,
+    lazy: bool,
+    mmap_mode: MmapMode,
+    per_range_advice: bool,
+) -> Result<Mmap> {
     let file = File::open(path)?;
 
     // Explicit huge pages use an anonymous copy; handle separately.
@@ -1432,13 +1531,18 @@ fn map_model(path: &Path, huge: HugePages, lazy: bool, mmap_mode: MmapMode) -> R
     // ask the kernel to read ahead aggressively.  When the caller has flagged
     // the model as far larger than RAM the access pattern is sparse instead —
     // a token touches a few experts — and readahead would evict more than it
-    // saves, so ask for random access.  Best effort either way.
+    // saves, so ask for random access.  Hot-weight pinning skips the blanket
+    // hint entirely: the dense ranges get a targeted prefetch and the expert
+    // ranges get the random-access hint, applied per range after the header
+    // is parsed.  Best effort either way.
     #[cfg(unix)]
-    let _ = mmap.advise(if lazy {
-        memmap2::Advice::Random
-    } else {
-        memmap2::Advice::Sequential
-    });
+    if !per_range_advice {
+        let _ = mmap.advise(if lazy {
+            memmap2::Advice::Random
+        } else {
+            memmap2::Advice::Sequential
+        });
+    }
 
     if huge == HugePages::Transparent {
         #[cfg(target_os = "linux")]
@@ -1453,6 +1557,205 @@ fn map_model(path: &Path, huge: HugePages, lazy: bool, mmap_mode: MmapMode) -> R
     }
 
     Ok(mmap)
+}
+
+// ─── Hot-weight pinning ────────────────────────────────────────────────────────
+
+/// A byte range in the model mapping: `(offset, len)`.
+type ByteRange = (usize, usize);
+
+/// Whether a tensor name belongs to the routed-expert set.
+///
+/// These are the only weights touched sparsely: a token routes through a
+/// handful of the model's experts per layer, so readahead/prefetch drags in
+/// far more than a token will use.  Everything else — embeddings, norms,
+/// attention, routers, shared experts, indexer/compressor, output — is dense
+/// and touched on every token.
+fn is_routed_expert(name: &str) -> bool {
+    name.contains(".ffn_gate_exps")
+        || name.contains(".ffn_down_exps")
+        || name.contains(".ffn_up_exps")
+}
+
+/// Byte ranges of the model file holding dense vs routed-expert weights.
+///
+/// Tensor data is laid out back-to-back (aligned to `general.alignment`,
+/// normally 32 bytes), so each tensor's size is the gap to the next tensor's
+/// offset and the last tensor ends at the file size.  Offsets are absolute
+/// (the header's `tensor_data_offset` is added).  Ranges separated by at most
+/// one page are merged — `madvise`/`mlock` work in pages, so a sub-page gap
+/// costs nothing and merging cuts the syscall count.
+///
+/// Returns `(dense, routed_experts)`, each a sorted list of [`ByteRange`]s.
+fn weight_ranges(
+    header: &crate::gguf_ext::GgufHeader,
+    file_size: u64,
+) -> (Vec<ByteRange>, Vec<ByteRange>) {
+    let mut all: Vec<(u64, &str)> = header
+        .tensors
+        .iter()
+        .map(|(n, t)| (header.tensor_data_offset + t.offset, n.as_str()))
+        .collect();
+    all.sort_by_key(|(o, _)| *o);
+
+    let mut dense: Vec<ByteRange> = Vec::new();
+    let mut experts: Vec<ByteRange> = Vec::new();
+    for i in 0..all.len() {
+        let (off, name) = all[i];
+        let end = if i + 1 < all.len() {
+            all[i + 1].0
+        } else {
+            file_size
+        };
+        if end <= off {
+            continue; // zero-size tensor (or a malformed trailing one)
+        }
+        let range = (off as usize, (end - off) as usize);
+        if is_routed_expert(name) {
+            experts.push(range);
+        } else {
+            dense.push(range);
+        }
+    }
+
+    fn merge(mut ranges: Vec<ByteRange>) -> Vec<ByteRange> {
+        ranges.sort_by_key(|(o, _)| *o);
+        let mut out: Vec<ByteRange> = Vec::new();
+        for (off, len) in ranges {
+            if let Some(last) = out.last_mut() {
+                if off <= last.0 + last.1 + 4096 {
+                    let end = (off + len).max(last.0 + last.1);
+                    last.1 = end - last.0;
+                    continue;
+                }
+            }
+            out.push((off, len));
+        }
+        out
+    }
+
+    (merge(dense), merge(experts))
+}
+
+/// Apply hot-weight pinning to the model mapping: prefetch (`MADV_WILLNEED`)
+/// and/or `mlock(2)` the dense ranges, and advise `MADV_RANDOM` on the routed
+/// experts so sparse access does not evict the resident hot set.
+///
+/// Best effort: advice failures are warnings (the kernel may ignore them
+/// anyway), and mlock failures are warnings too, degrading to the advisory
+/// behaviour when the process memlock limit is too low.  Never affects
+/// correctness.
+#[cfg(unix)]
+fn apply_hot_weight_pinning(
+    mmap: &Mmap,
+    header: &crate::gguf_ext::GgufHeader,
+    prefetch: bool,
+    lock: bool,
+) -> Result<()> {
+    let (dense, experts) = weight_ranges(header, mmap.len() as u64);
+    let gib = |r: &[ByteRange]| r.iter().map(|(_, l)| *l as u64).sum::<u64>() as f64 / 2f64.powi(30);
+    tracing::info!(
+        "hot-weight pinning: {} dense range(s) ({:.2} GiB) to keep resident, {} expert range(s) ({:.2} GiB) on demand",
+        dense.len(),
+        gib(&dense),
+        experts.len(),
+        gib(&experts),
+    );
+
+    if prefetch {
+        let mut failed = 0usize;
+        for &(off, len) in &dense {
+            if mmap.advise_range(memmap2::Advice::WillNeed, off, len).is_err() {
+                failed += 1;
+            }
+        }
+        if failed > 0 {
+            tracing::warn!("{failed}/{} dense ranges ignored the WILLNEED prefetch hint", dense.len());
+        }
+    }
+
+    {
+        let mut failed = 0usize;
+        for &(off, len) in &experts {
+            if mmap.advise_range(memmap2::Advice::Random, off, len).is_err() {
+                failed += 1;
+            }
+        }
+        if failed > 0 {
+            tracing::warn!("{failed}/{} expert ranges ignored the RANDOM access hint", experts.len());
+        }
+    }
+
+    if lock {
+        mlock_ranges(mmap, &dense);
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn apply_hot_weight_pinning(
+    _mmap: &Mmap,
+    _header: &crate::gguf_ext::GgufHeader,
+    _prefetch: bool,
+    _lock: bool,
+) -> Result<()> {
+    tracing::warn!("hot-weight pinning is unix-only; ignoring the request");
+    Ok(())
+}
+
+/// `mlock(2)` the given ranges, page-aligned and clamped to the mapping.
+///
+/// Failures are reported with the remediation hint and otherwise ignored:
+/// a memlock limit that is too low degrades to advisory pinning instead of
+/// failing the load.
+#[cfg(unix)]
+fn mlock_ranges(mmap: &Mmap, ranges: &[ByteRange]) {
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+    if page == 0 || !page.is_power_of_two() {
+        tracing::warn!("mlock skipped: could not determine the system page size");
+        return;
+    }
+    let total: u64 = ranges.iter().map(|(_, l)| *l as u64).sum();
+    let mut locked: u64 = 0;
+    let mut failed = 0usize;
+    for &(off, len) in ranges {
+        let start = off & !(page - 1);
+        let end = ((off + len).saturating_add(page - 1)) & !(page - 1);
+        let end = end.min(mmap.len());
+        if end <= start {
+            continue;
+        }
+        // SAFETY: `start..end` lies within the mapping (clamped above) and
+        // mlock does not modify memory.  The mapping lives until the engine
+        // is dropped; mlock is released automatically on munmap.
+        let rc = unsafe {
+            libc::mlock(
+                mmap.as_ptr().add(start).cast::<libc::c_void>(),
+                end - start,
+            )
+        };
+        if rc == 0 {
+            locked += (end - start) as u64;
+        } else {
+            failed += 1;
+            if failed <= 3 {
+                tracing::warn!(
+                    "mlock of hot weight range at offset {off:#x} failed: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+    }
+    if failed > 0 {
+        tracing::warn!(
+            "mlock failed for {failed}/{} hot ranges ({:.2} of {:.2} GiB locked). \
+             Raise the process memlock limit to pin them: systemd \
+             LimitMEMLOCK=infinity, or `ulimit -l unlimited` before starting the server.",
+            ranges.len(),
+            locked as f64 / 2f64.powi(30),
+            total as f64 / 2f64.powi(30),
+        );
+    }
 }
 
 /// Refuse — or at least complain about — a model file that `mmap` cannot serve
@@ -1570,7 +1873,8 @@ fn default_hugepage_bytes() -> usize {
 }
 
 /// Walk `dir` and return the first `.gguf` file found.
-fn find_gguf_in_dir(dir: &Path) -> Result<PathBuf> {
+/// Find the single `.gguf` file in a model directory.
+pub fn find_gguf_in_dir(dir: &Path) -> Result<PathBuf> {
     for entry in std::fs::read_dir(dir)? {
         let path = entry?.path();
         if path.extension().and_then(|e| e.to_str()) == Some("gguf") {
@@ -1935,6 +2239,165 @@ mod tests {
             EngineOptions::default().mmap(MmapMode::Required).mmap,
             MmapMode::Required
         );
+        // Pinning is off by default and settable through the builders.
+        assert!(!EngineOptions::default().pin_hot_weights);
+        assert!(!EngineOptions::default().mlock_hot_weights);
+        let o = EngineOptions::default()
+            .pin_hot_weights(true)
+            .mlock_hot_weights(true);
+        assert!(o.pin_hot_weights && o.mlock_hot_weights);
+    }
+
+    // ─── Hot-weight pinning ────────────────────────────────────────────────
+
+    fn header_with_tensors(
+        tensor_data_offset: u64,
+        tensors: &[(&str, u64)],
+    ) -> crate::gguf_ext::GgufHeader {
+        use std::collections::HashMap;
+        crate::gguf_ext::GgufHeader {
+            version: 3,
+            metadata: HashMap::new(),
+            tensors: tensors
+                .iter()
+                .map(|(n, off)| {
+                    (
+                        (*n).to_string(),
+                        crate::gguf_ext::RawTensorInfo {
+                            dtype: 0,
+                            dims: vec![1],
+                            offset: *off,
+                        },
+                    )
+                })
+                .collect(),
+            tensor_data_offset,
+        }
+    }
+
+    #[test]
+    fn is_routed_expert_matches_moe_names() {
+        for dense in [
+            "token_embd.weight",
+            "output.weight",
+            "blk.0.attn_q.weight",
+            "blk.0.attn_output.weight",
+            "blk.0.ffn_norm.weight",
+            "blk.0.ffn_gate_inp.weight",
+            "blk.0.ffn_gate_shexp.weight",
+            "blk.0.ffn_up_shexp.weight",
+            "blk.0.indexer.proj.weight",
+            "blk.0.indexer_compressor_gate.weight",
+            "blk.0.hc_attn_fn.weight",
+        ] {
+            assert!(!is_routed_expert(dense), "{dense} should be dense");
+        }
+        for expert in [
+            "blk.0.ffn_gate_exps.weight",
+            "blk.0.ffn_down_exps.weight",
+            "blk.0.ffn_up_exps.weight",
+            "blk.42.ffn_gate_exps.weight",
+        ] {
+            assert!(is_routed_expert(expert), "{expert} should be an expert");
+        }
+    }
+
+    #[test]
+    fn weight_ranges_classifies_and_sizes_interleaved_tensors() {
+        // Tensor data offset 4096; the file interleaves dense and expert
+        // tensors per layer, so sizes come from offsets of the *next* tensor.
+        // The expert is realistically large (5 MiB) so the dense ranges on
+        // either side stay separate.
+        let header = header_with_tensors(
+            4096,
+            &[
+                ("blk.0.attn_q.weight", 0),
+                ("blk.0.ffn_gate_exps.weight", 100),
+                ("blk.0.ffn_norm.weight", 5 * 1024 * 1024 + 100),
+                ("blk.0.ffn_up_exps.weight", 5 * 1024 * 1024 + 200),
+            ],
+        );
+        let (dense, experts) = weight_ranges(&header, 4096 + 5 * 1024 * 1024 + 300);
+        // attn_q 0..100; ffn_norm (5MiB+100)..(5MiB+200)
+        assert_eq!(dense, vec![(4096, 100), (4096 + 5 * 1024 * 1024 + 100, 100)]);
+        // gate_exps 100..(5MiB+100) and up_exps (5MiB+200)..(5MiB+300) are
+        // separated by only the 100-byte norm tensor — a sub-page gap, so the
+        // two expert ranges merge into one.
+        assert_eq!(experts, vec![(4196, 5243080)]);
+    }
+
+    #[test]
+    fn weight_ranges_merges_dense_ranges_across_small_expert_gaps() {
+        // A tiny expert between two dense tensors leaves a sub-page gap, which
+        // madvise/mlock would round over anyway — merge into one range.
+        let header = header_with_tensors(
+            0,
+            &[
+                ("blk.0.attn_q.weight", 0),
+                ("blk.0.ffn_gate_exps.weight", 100), // 1000-byte expert
+                ("blk.0.ffn_norm.weight", 1100),
+            ],
+        );
+        let (dense, experts) = weight_ranges(&header, 1200);
+        assert_eq!(dense, vec![(0, 1200)]);
+        assert_eq!(experts, vec![(100, 1000)]);
+
+        // A big expert (5 MiB) keeps the dense ranges apart.
+        let header = header_with_tensors(
+            0,
+            &[
+                ("blk.0.attn_q.weight", 0),
+                ("blk.0.ffn_gate_exps.weight", 100),
+                ("blk.0.ffn_norm.weight", 5 * 1024 * 1024 + 100),
+            ],
+        );
+        let (dense, _) = weight_ranges(&header, 5 * 1024 * 1024 + 200);
+        assert_eq!(dense, vec![(0, 100), (5 * 1024 * 1024 + 100, 100)]);
+    }
+
+    #[test]
+    fn weight_ranges_adds_tensor_data_offset() {
+        let header = header_with_tensors(
+            0x1_0000,
+            &[
+                ("token_embd.weight", 0),
+                ("blk.0.ffn_down_exps.weight", 64),
+            ],
+        );
+        let (dense, experts) = weight_ranges(&header, 0x1_0000 + 128);
+        assert_eq!(dense, vec![(0x1_0000, 64)]);
+        assert_eq!(experts, vec![(0x1_0000 + 64, 64)]);
+    }
+
+    /// The advice/mlock path must never fail the load, even when the mapping
+    /// or the memlock limit is small (warnings only).
+    #[cfg(unix)]
+    #[test]
+    fn apply_hot_weight_pinning_is_best_effort_on_a_real_mapping() {
+        let (path, _) = model_fixture("pin.gguf", &vec![0u8; 16 * 4096]);
+        let file = File::open(&path).expect("reopen fixture");
+        let mmap = unsafe { Mmap::map(&file) }.expect("mmap fixture");
+
+        // Empty tensor table: nothing to do, still Ok.
+        let empty = crate::gguf_ext::GgufHeader {
+            version: 3,
+            metadata: std::collections::HashMap::new(),
+            tensors: std::collections::HashMap::new(),
+            tensor_data_offset: 0,
+        };
+        apply_hot_weight_pinning(&mmap, &empty, true, true).expect("no tensors is fine");
+
+        // Real split: prefetch + lock, plus the random hint on experts.
+        let header = header_with_tensors(
+            0,
+            &[
+                ("token_embd.weight", 0),
+                ("blk.0.ffn_gate_exps.weight", 4096),
+            ],
+        );
+        apply_hot_weight_pinning(&mmap, &header, true, true).expect("advice/mlock is best effort");
+
+        let _ = std::fs::remove_file(&path);
     }
 
     /// Write `bytes` to a temp file, returning its path and an open handle.
