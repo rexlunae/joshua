@@ -342,6 +342,53 @@ anonymous memory in one pass and pay for the decompression only once.
 
 ---
 
+## Models larger than RAM
+
+A sparse mixture-of-experts model (DeepSeek-V4-Flash, Qwen3-MoE, …) far larger
+than RAM has a bimodal access pattern that plain mmap serves poorly.  A small
+*dense* set — embeddings, norms, attention, routers, shared experts,
+indexer/compressor, output — is touched on **every** token, while the routed
+experts are touched sparsely (a token routes through a handful of the 256 per
+layer).  The default readahead hint (`MADV_SEQUENTIAL`) sets "free after use"
+on the whole mapping, so the dense set gets evicted between requests; a blanket
+random hint kills readahead for everything.
+
+Joshua splits the model into dense and expert ranges and treats them
+differently:
+
+| Flag | Effect |
+|---|---|
+| `--pin-hot-weights` | Prefetches the dense ranges (`MADV_WILLNEED`) at load and advises `MADV_RANDOM` on expert ranges, so the per-token working set is resident before the first request.  **Auto-on when the model file is larger than RAM**; `--pin-hot-weights=false` forces it off. |
+| `--mlock-hot-weights` | Additionally `mlock(2)`s the dense ranges for a hard residency guarantee.  `=required` fails the load when the memlock limit is too low; the default (`on`) warns once and degrades to advisory pinning. |
+| `--lazy-weights` | The blanket random-access hint for the whole mapping — no readahead at all.  Mostly superseded by `--pin-hot-weights`, kept for the truly-RAM-starved case. |
+
+The memlock limit is checked against the hot-set size **before** any `mlock`
+call, with one warning naming limit vs required size (on DeepSeek-V4-Flash Q2_K
+the dense set is ~8.2 GiB).  Raise it with:
+
+```bash
+# systemd services
+LimitMEMLOCK=infinity
+
+# login session / PAM
+# /etc/security/limits.conf:
+#   tserica - memlock unlimited
+
+# live, without re-login (systemd user session)
+sudo prlimit --pid <user manager pid> --memlock=-1:-1
+```
+
+> **systemd *user* session trap:** the unit's `LimitMEMLOCK=infinity` is capped
+> by the user manager's own hard limit, which is inherited from the login
+> session — so on a headless box the unit setting alone does nothing.  Add the
+> PAM line and apply the `prlimit` live fix (or re-login) for it to take effect.
+
+On DeepSeek-V4-Flash Q2_K the whole file collapses to 2 dense + 1 expert
+ranges, so pinning costs two `madvise` calls and one `mlock`.  `examples/tensor_sizes.rs`
+prints the dense/expert split of any GGUF to sanity-check a new model.
+
+---
+
 ## Environment variables
 
 | Variable | Description |
@@ -350,6 +397,9 @@ anonymous memory in one pass and pay for the decompression only once.
 | `JOSHUA_API_KEY` | API key required on `/v1` routes (same as `--api-key`) |
 | `JOSHUA_TLS_CERT` | PEM certificate chain for HTTPS (same as `--tls-cert`; needs `--features tls`) |
 | `JOSHUA_TLS_KEY` | PEM private key for HTTPS (same as `--tls-key`) |
+| `JOSHUA_LAZY_WEIGHTS` | Same as `--lazy-weights` |
+| `JOSHUA_PIN_HOT_WEIGHTS` | Same as `--pin-hot-weights` (`true`/`false`, or the flag with no value) |
+| `JOSHUA_MLOCK_HOT_WEIGHTS` | Same as `--mlock-hot-weights` (`on`, `required`, or `off`) |
 | `RUST_LOG` | Log filter (e.g. `info`, `joshua=debug`) |
 
 ---

@@ -174,6 +174,20 @@ pub enum MmapMode {
     Required,
 }
 
+/// How strictly [`EngineOptions::mlock_hot_weights`] must pin the hot set.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MlockMode {
+    /// No `mlock(2)`; the hot set is only prefetched (advisory).
+    #[default]
+    Off,
+    /// Lock the hot set; if `RLIMIT_MEMLOCK` is too small, warn once up front
+    /// and degrade to advisory pinning (the load still succeeds).
+    On,
+    /// Lock the hot set; if `RLIMIT_MEMLOCK` is too small, fail the load so a
+    /// deployment that must guarantee residency cannot silently lose it.
+    Required,
+}
+
 /// Construction options for [`Engine`].
 ///
 /// Use [`Engine::with_options`] for full control; [`Engine::new`] and
@@ -242,11 +256,15 @@ pub struct EngineOptions {
     /// `pin_hot_weights` is unset.
     ///
     /// Requires the process memlock limit to cover the dense set — a few GiB on
-    /// typical MoE models — so raise it with `LimitMEMLOCK=infinity` (systemd)
-    /// or `ulimit -l unlimited`.  Ranges that fail to lock are reported with a
-    /// warning and the load continues, so a limit that is too low degrades to
-    /// the advisory behaviour of `pin_hot_weights` rather than failing.
-    pub mlock_hot_weights: bool,
+    /// typical MoE models.  The limit is checked against the hot-set size
+    /// before any `mlock` call: [`MlockMode::On`] warns once and degrades to
+    /// advisory pinning when it is too low, [`MlockMode::Required`] fails the
+    /// load.  Raise it with `LimitMEMLOCK=infinity` (systemd) or
+    /// `ulimit -l unlimited`; on a systemd **user** session the hard limit is
+    /// inherited from the login session, so a unit's `LimitMEMLOCK` alone is
+    /// silently capped — apply `sudo prlimit --pid <user manager> --memlock=-1:-1`
+    /// for a live fix, or re-login.
+    pub mlock_hot_weights: MlockMode,
 }
 
 impl EngineOptions {
@@ -285,9 +303,9 @@ impl EngineOptions {
     }
 
     /// Lock the always-touched weight ranges into RAM.  See
-    /// [`EngineOptions::mlock_hot_weights`].
-    pub fn mlock_hot_weights(mut self, lock: bool) -> Self {
-        self.mlock_hot_weights = lock;
+    /// [`EngineOptions::mlock_hot_weights`] and [`MlockMode`].
+    pub fn mlock_hot_weights(mut self, mode: MlockMode) -> Self {
+        self.mlock_hot_weights = mode;
         self
     }
 }
@@ -561,7 +579,7 @@ impl Engine {
         // parsed below, so it asks map_model to skip the blanket
         // sequential/random hint (which would otherwise keep "free after use"
         // semantics on the very ranges we want to keep resident).
-        let hot_pinning = options.pin_hot_weights || options.mlock_hot_weights;
+        let hot_pinning = options.pin_hot_weights || options.mlock_hot_weights != MlockMode::Off;
         let mmap = map_model(
             &gguf_path,
             options.huge_pages,
@@ -596,8 +614,7 @@ impl Engine {
                     &raw,
                     options.pin_hot_weights,
                     options.mlock_hot_weights,
-                )?;
-            }
+                )?;            }
         }
 
         // The API identifier is the file stem — the documented contract on
@@ -1642,15 +1659,16 @@ fn weight_ranges(
 /// experts so sparse access does not evict the resident hot set.
 ///
 /// Best effort: advice failures are warnings (the kernel may ignore them
-/// anyway), and mlock failures are warnings too, degrading to the advisory
-/// behaviour when the process memlock limit is too low.  Never affects
-/// correctness.
+/// anyway).  The memlock limit is checked against the hot-set size before any
+/// `mlock` call: [`MlockMode::On`] warns once and degrades to advisory when
+/// the limit is too low, [`MlockMode::Required`] fails the load.  Never
+/// affects correctness.
 #[cfg(unix)]
 fn apply_hot_weight_pinning(
     mmap: &Mmap,
     header: &crate::gguf_ext::GgufHeader,
     prefetch: bool,
-    lock: bool,
+    mlock: MlockMode,
 ) -> Result<()> {
     let (dense, experts) = weight_ranges(header, mmap.len() as u64);
     let gib = |r: &[ByteRange]| r.iter().map(|(_, l)| *l as u64).sum::<u64>() as f64 / 2f64.powi(30);
@@ -1686,8 +1704,49 @@ fn apply_hot_weight_pinning(
         }
     }
 
-    if lock {
-        mlock_ranges(mmap, &dense);
+    if mlock != MlockMode::Off {
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        if page == 0 || !page.is_power_of_two() {
+            tracing::warn!("mlock skipped: could not determine the system page size");
+        } else {
+            let required = aligned_range_bytes(&dense, page, mmap.len());
+            let limit = memlock_limit_bytes();
+            match mlock_decision(mlock, limit, required) {
+                MlockDecision::Proceed => {
+                    let failed = mlock_ranges(mmap, &dense, page);
+                    if failed > 0 && mlock == MlockMode::Required {
+                        return Err(JoshuaError::ModelLoad(format!(
+                            "mlock of the hot weight set failed ({failed}/{} ranges) despite \
+                             RLIMIT_MEMLOCK appearing sufficient — see the warnings above",
+                            dense.len()
+                        )));
+                    }
+                }
+                MlockDecision::Degrade => tracing::warn!(
+                    "RLIMIT_MEMLOCK is {limit}, below the {:.2} GiB hot set — skipping the lock \
+                     and degrading to advisory pinning. Raise it with /etc/security/limits.conf \
+                     (`{user} - memlock unlimited`), `LimitMEMLOCK=infinity` (systemd), or \
+                     `ulimit -l unlimited`; for a live systemd user session apply it without \
+                     re-login: `sudo prlimit --pid <user manager pid> --memlock=-1:-1`.",
+                    required as f64 / 2f64.powi(30),
+                    limit = display_memlock_limit(limit),
+                    user = whoami(),
+                ),
+                MlockDecision::Fail => {
+                    return Err(JoshuaError::ModelLoad(format!(
+                        "RLIMIT_MEMLOCK is {limit}, below the {:.2} GiB hot set that \
+                         --mlock-hot-weights=required demands be locked. Raise it with \
+                         /etc/security/limits.conf (`{user} - memlock unlimited`), \
+                         `LimitMEMLOCK=infinity` (systemd), or `ulimit -l unlimited`; for a \
+                         live systemd user session: `sudo prlimit --pid <user manager pid> \
+                         --memlock=-1:-1`.",
+                        required as f64 / 2f64.powi(30),
+                        limit = display_memlock_limit(limit),
+                        user = whoami(),
+                    )))
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -1697,31 +1756,123 @@ fn apply_hot_weight_pinning(
     _mmap: &Mmap,
     _header: &crate::gguf_ext::GgufHeader,
     _prefetch: bool,
-    _lock: bool,
+    _mlock: MlockMode,
 ) -> Result<()> {
     tracing::warn!("hot-weight pinning is unix-only; ignoring the request");
     Ok(())
 }
 
+/// What to do about `mlock` given the limit and what the hot set needs.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MlockDecision {
+    /// The limit is unknown/unlimited or large enough — attempt the lock.
+    Proceed,
+    /// [`MlockMode::On`] with a too-small limit: warn once, skip the lock.
+    Degrade,
+    /// [`MlockMode::Required`] with a too-small limit: fail the load.
+    Fail,
+}
+
+#[cfg(unix)]
+fn mlock_decision(mode: MlockMode, limit: Option<u64>, required: u64) -> MlockDecision {
+    match mode {
+        MlockMode::Off => MlockDecision::Proceed, // caller never invokes with Off
+        MlockMode::On => match limit {
+            Some(l) if l < required => MlockDecision::Degrade,
+            _ => MlockDecision::Proceed,
+        },
+        MlockMode::Required => match limit {
+            Some(l) if l < required => MlockDecision::Fail,
+            _ => MlockDecision::Proceed,
+        },
+    }
+}
+
+/// Current `RLIMIT_MEMLOCK` in bytes; `None` when unlimited or unreadable.
+#[cfg(unix)]
+fn memlock_limit_bytes() -> Option<u64> {
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `lim` is a valid out-pointer for getrlimit; no other memory is
+    // touched.
+    if unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut lim) } != 0 {
+        return None;
+    }
+    if lim.rlim_cur == libc::RLIM_INFINITY {
+        return None; // unlimited
+    }
+    Some(lim.rlim_cur)
+}
+
+/// Human-readable form of a memlock limit for warnings.
+#[cfg(unix)]
+fn display_memlock_limit(limit: Option<u64>) -> String {
+    match limit {
+        None => "unlimited".to_string(),
+        Some(b) if b >= 1024 * 1024 && b % (1024 * 1024) == 0 => {
+            format!("{} MiB", b / (1024 * 1024))
+        }
+        Some(b) => format!("{b} bytes"),
+    }
+}
+
+/// Best-effort current login name, for the limits.conf remediation hint.
+#[cfg(unix)]
+fn whoami() -> String {
+    std::env::var("USER").unwrap_or_else(|_| "USER".to_string())
+}
+
+/// Total bytes the ranges occupy once page-aligned and clamped to the
+/// mapping — exactly what `mlock` will lock.  Ranges are expected sorted by
+/// offset; page-space overlaps between neighbouring ranges are coalesced so
+/// a page shared by two ranges is counted once (the kernel counts locked
+/// pages once too).
+#[cfg(unix)]
+fn aligned_range_bytes(ranges: &[ByteRange], page: usize, map_len: usize) -> u64 {
+    // The kernel locks every page intersecting the requested range, so the
+    // clamp is to the mapping's last *page* (a tail that ends mid-page still
+    // locks that page).
+    let map_end = map_len.saturating_add(page - 1) & !(page - 1);
+    let mut total: u64 = 0;
+    let mut covered_end: usize = 0; // exclusive page-space end of previous extent
+    for &(off, len) in ranges {
+        let start = off & !(page - 1);
+        let end = ((off + len).saturating_add(page - 1)) & !(page - 1);
+        let end = end.min(map_end);
+        if end <= start {
+            continue;
+        }
+        if start >= covered_end {
+            total += (end - start) as u64;
+        } else if end > covered_end {
+            total += (end - covered_end) as u64;
+        }
+        covered_end = covered_end.max(end);
+    }
+    total
+}
+
 /// `mlock(2)` the given ranges, page-aligned and clamped to the mapping.
 ///
-/// Failures are reported with the remediation hint and otherwise ignored:
-/// a memlock limit that is too low degrades to advisory pinning instead of
-/// failing the load.
+/// Returns the number of ranges that failed to lock.  Failures are reported
+/// with the remediation hint; the caller decides whether they are fatal
+/// ([`MlockMode::Required`] fails the load, [`MlockMode::On`] degrades to
+/// advisory pinning).
 #[cfg(unix)]
-fn mlock_ranges(mmap: &Mmap, ranges: &[ByteRange]) {
-    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
-    if page == 0 || !page.is_power_of_two() {
-        tracing::warn!("mlock skipped: could not determine the system page size");
-        return;
-    }
+fn mlock_ranges(mmap: &Mmap, ranges: &[ByteRange], page: usize) -> usize {
     let total: u64 = ranges.iter().map(|(_, l)| *l as u64).sum();
     let mut locked: u64 = 0;
     let mut failed = 0usize;
     for &(off, len) in ranges {
         let start = off & !(page - 1);
         let end = ((off + len).saturating_add(page - 1)) & !(page - 1);
-        let end = end.min(mmap.len());
+        // The kernel locks every page intersecting the range, so clamp to the
+        // mapping's last page, not its raw length (a tail ending mid-page
+        // still locks that page).
+        let end = end.min(mmap.len().saturating_add(page - 1) & !(page - 1));
         if end <= start {
             continue;
         }
@@ -1749,13 +1900,17 @@ fn mlock_ranges(mmap: &Mmap, ranges: &[ByteRange]) {
     if failed > 0 {
         tracing::warn!(
             "mlock failed for {failed}/{} hot ranges ({:.2} of {:.2} GiB locked). \
-             Raise the process memlock limit to pin them: systemd \
-             LimitMEMLOCK=infinity, or `ulimit -l unlimited` before starting the server.",
+             Raise the process memlock limit to pin them: /etc/security/limits.conf \
+             (`{user} - memlock unlimited`), `LimitMEMLOCK=infinity` (systemd), or \
+             `ulimit -l unlimited`; for a live systemd user session: \
+             `sudo prlimit --pid <user manager pid> --memlock=-1:-1`.",
             ranges.len(),
             locked as f64 / 2f64.powi(30),
             total as f64 / 2f64.powi(30),
+            user = whoami(),
         );
     }
+    failed
 }
 
 /// Refuse — or at least complain about — a model file that `mmap` cannot serve
@@ -2241,11 +2396,18 @@ mod tests {
         );
         // Pinning is off by default and settable through the builders.
         assert!(!EngineOptions::default().pin_hot_weights);
-        assert!(!EngineOptions::default().mlock_hot_weights);
+        assert_eq!(EngineOptions::default().mlock_hot_weights, MlockMode::Off);
         let o = EngineOptions::default()
             .pin_hot_weights(true)
-            .mlock_hot_weights(true);
-        assert!(o.pin_hot_weights && o.mlock_hot_weights);
+            .mlock_hot_weights(MlockMode::On);
+        assert!(o.pin_hot_weights);
+        assert_eq!(o.mlock_hot_weights, MlockMode::On);
+        assert_eq!(
+            EngineOptions::default()
+                .mlock_hot_weights(MlockMode::Required)
+                .mlock_hot_weights,
+            MlockMode::Required
+        );
     }
 
     // ─── Hot-weight pinning ────────────────────────────────────────────────
@@ -2385,7 +2547,7 @@ mod tests {
             tensors: std::collections::HashMap::new(),
             tensor_data_offset: 0,
         };
-        apply_hot_weight_pinning(&mmap, &empty, true, true).expect("no tensors is fine");
+        apply_hot_weight_pinning(&mmap, &empty, true, MlockMode::On).expect("no tensors is fine");
 
         // Real split: prefetch + lock, plus the random hint on experts.
         let header = header_with_tensors(
@@ -2395,9 +2557,82 @@ mod tests {
                 ("blk.0.ffn_gate_exps.weight", 4096),
             ],
         );
-        apply_hot_weight_pinning(&mmap, &header, true, true).expect("advice/mlock is best effort");
+        apply_hot_weight_pinning(&mmap, &header, true, MlockMode::On)
+            .expect("advice/mlock is best effort");
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mlock_decision_degrades_or_fails_on_short_limit() {
+        let required = 8 * 1024 * 1024 * 1024; // 8 GiB hot set
+        // On: too-small limit degrades; sufficient or unknown limit proceeds.
+        assert_eq!(
+            mlock_decision(MlockMode::On, Some(8 * 1024 * 1024), required),
+            MlockDecision::Degrade
+        );
+        assert_eq!(
+            mlock_decision(MlockMode::On, Some(required), required),
+            MlockDecision::Proceed
+        );
+        assert_eq!(
+            mlock_decision(MlockMode::On, Some(required + 1), required),
+            MlockDecision::Proceed
+        );
+        assert_eq!(
+            mlock_decision(MlockMode::On, None, required),
+            MlockDecision::Proceed
+        );
+        // Required: too-small limit fails the load; sufficient or unknown
+        // limit proceeds (an unreadable limit is not fatal — runtime mlock
+        // failures still get reported).
+        assert_eq!(
+            mlock_decision(MlockMode::Required, Some(8 * 1024 * 1024), required),
+            MlockDecision::Fail
+        );
+        assert_eq!(
+            mlock_decision(MlockMode::Required, Some(required), required),
+            MlockDecision::Proceed
+        );
+        assert_eq!(
+            mlock_decision(MlockMode::Required, None, required),
+            MlockDecision::Proceed
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn memlock_limit_bytes_reads_without_panicking() {
+        // The value is environment-dependent; this only pins down that the
+        // syscall path works (returns Some for a finite limit, None for
+        // unlimited — never a panic).
+        if let Some(bytes) = memlock_limit_bytes() {
+            assert!(bytes > 0, "a finite memlock limit must be positive");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn aligned_range_bytes_rounds_to_pages_and_clamps() {
+        let page = 4096;
+        // Exact page already aligned.
+        assert_eq!(aligned_range_bytes(&[(0, 4096)], page, 1 << 20), 4096);
+        // Sub-page range still locks the whole page.
+        assert_eq!(aligned_range_bytes(&[(100, 100)], page, 1 << 20), 4096);
+        // Two disjoint ranges lock two pages each... on distinct pages.
+        assert_eq!(
+            aligned_range_bytes(&[(0, 100), (8192, 100)], page, 1 << 20),
+            2 * 4096
+        );
+        // Ranges on the same page merge into one page of locked memory.
+        assert_eq!(
+            aligned_range_bytes(&[(0, 100), (100, 100)], page, 1 << 20),
+            4096
+        );
+        // Clamped to the mapping: a range running past the end locks only
+        // what exists (and the partial tail page still counts).
+        assert_eq!(aligned_range_bytes(&[(0, 1 << 20)], page, 4096 + 10), 8192);
     }
 
     /// Write `bytes` to a temp file, returning its path and an open handle.
