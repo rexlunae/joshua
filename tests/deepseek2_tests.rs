@@ -32,7 +32,10 @@ fn logits(model: &mut QuantizedModel, tokens: &[u32], offset: usize) -> Vec<f32>
 #[test]
 fn deepseek2_is_a_supported_architecture() {
     // No longer reported as "known but unimplemented".
-    assert_eq!(Architecture::from_name("deepseek2"), Some(Architecture::DeepSeek2));
+    assert_eq!(
+        Architecture::from_name("deepseek2"),
+        Some(Architecture::DeepSeek2)
+    );
 }
 
 #[test]
@@ -50,7 +53,10 @@ fn deepseek2_loads_and_produces_finite_logits() {
     );
     // Not all equal — the model actually did something.
     let first = out[0];
-    assert!(out.iter().any(|v| (v - first).abs() > 1e-6), "logits are degenerate");
+    assert!(
+        out.iter().any(|v| (v - first).abs() > 1e-6),
+        "logits are degenerate"
+    );
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -130,7 +136,10 @@ fn deepseek2_v2_softmax_group_routing_loads_and_is_consistent() {
     let mut prefill_model = load(&model);
     let prefill = logits(&mut prefill_model, &tokens, 0);
     assert_eq!(prefill.len(), 16);
-    assert!(prefill.iter().all(|v| v.is_finite()), "logits not finite: {prefill:?}");
+    assert!(
+        prefill.iter().all(|v| v.is_finite()),
+        "logits not finite: {prefill:?}"
+    );
 
     let mut step_model = load(&model);
     let mut last = Vec::new();
@@ -143,6 +152,53 @@ fn deepseek2_v2_softmax_group_routing_loads_and_is_consistent() {
             "v2 prefill vs incremental logit {i} diverges: {a} vs {b}"
         );
     }
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A reader that refuses to rewind to offset 0, so a caller attempting to
+/// re-parse the header from the start is detected.
+struct NoRewind<R>(R);
+
+impl<R: std::io::Read> std::io::Read for NoRewind<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.0.read(buf)
+    }
+}
+
+impl<R: std::io::Seek> std::io::Seek for NoRewind<R> {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        if matches!(pos, std::io::SeekFrom::Start(0)) {
+            return Err(std::io::Error::other("header re-read attempted"));
+        }
+        self.0.seek(pos)
+    }
+}
+
+#[test]
+fn deepseek2_skips_the_raw_header_rereread() {
+    // The raw header re-read exists for the deepseek4 loader, which reads
+    // tensors by their raw GGUF dtype id.  deepseek2 never consumes it, so
+    // running it here would be pure cost — and, because `read_header` is
+    // stricter than candle's parser in places, could reject a file candle
+    // accepts.  Only deepseek4 may rewind and re-parse; every other
+    // architecture must keep loading exactly as candle parsed it.
+    let dir = common::model_dir("deepseek2-no-reread");
+    let model = dir.join("model.gguf");
+    common::write_tiny_deepseek2_gguf(&model);
+
+    let bytes = std::fs::read(&model).unwrap();
+    let mut cursor = std::io::Cursor::new(&bytes[..]);
+    let content = candle_core::quantized::gguf_file::Content::read(&mut cursor).unwrap();
+
+    // If from_gguf_mmap tried to re-read the header it would rewind to 0 and
+    // fail here.  It must not.
+    let mut no_rewind = NoRewind(std::io::Cursor::new(bytes));
+    let mut m = QuantizedModel::from_gguf_mmap(content, &mut no_rewind, &Device::Cpu, None)
+        .expect("deepseek2 must not re-read the raw header");
+    // And the loaded model must actually work.
+    let logits = logits(&mut m, &[1u32, 4, 2, 7, 5], 0);
+    assert!(logits.iter().all(|l| l.is_finite()));
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -175,7 +231,10 @@ fn deepseek2_mmap_borrowed_load_matches_copied_load() {
 
     assert_eq!(copied.len(), borrowed.len());
     for (i, (a, b)) in copied.iter().zip(&borrowed).enumerate() {
-        assert_eq!(a, b, "mmap-borrowed logit {i} differs from copied: {a} vs {b}");
+        assert_eq!(
+            a, b,
+            "mmap-borrowed logit {i} differs from copied: {a} vs {b}"
+        );
     }
 
     std::fs::remove_dir_all(&dir).ok();

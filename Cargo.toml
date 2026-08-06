@@ -52,8 +52,15 @@ tokenizers = { version = "0.21", default-features = false, features = ["fancy-re
 # Memory-mapped model loading (pure Rust wrapper over mmap(2))
 memmap2 = "0.9"
 
+# mlock(2) for pinning the hot weight set in RAM (unix)
+libc = "0.2"
+
 # Runtime loading of NPU vendor plugins (thin safe wrapper over dlopen)
 libloading = "0.8"
+
+# Row-parallel quantized matmul kernels (already in the dependency tree via
+# candle-transformers; made a direct dependency for the SIMD/threading work).
+rayon = "1"
 
 # WAV decoding for Whisper speech-to-text (pure Rust)
 hound = "3.5"

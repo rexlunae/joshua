@@ -449,6 +449,45 @@ mod synthetic {
     }
 
     #[test]
+    fn unsupported_dtype_fails_at_load_with_precise_message() {
+        use joshua::Engine;
+
+        let dir = model_dir("unsupported-dtype-llama");
+        let model = dir.join("model.gguf");
+        // A llama GGUF whose embedding table is IQ2_XXS (dtype id 16): candle
+        // cannot name the dtype, so the tolerant header would drop the tensor
+        // and the llama loader would later fail with a misleading "cannot
+        // find tensor".  The engine must instead reject the file at load time
+        // with the precise cause.
+        let metadata = vec![(
+            "general.architecture".to_string(),
+            gguf_file::Value::String("llama".to_string()),
+        )];
+        let tensors = vec![RawTensor::iq2xxs(
+            "token_embd.weight",
+            vec![0.0f32; 256],
+            &[256],
+        )];
+        write_raw_gguf(&model, &metadata, &tensors);
+
+        let msg = match Engine::new(&model) {
+            Ok(_) => panic!("unsupported dtype must fail at construction"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains("token_embd.weight"),
+            "error should name the tensor, got: {msg}"
+        );
+        assert!(msg.contains("dtype id 16"), "error should give the dtype, got: {msg}");
+        assert!(
+            !msg.contains("cannot find tensor"),
+            "error must not be the misleading missing-weight message, got: {msg}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn max_output_tokens_caps_generation() {
         use joshua::{types::GenerationOptions, Engine};
 
@@ -570,6 +609,43 @@ mod synthetic {
                 );
             }
         }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn compressed_model_file_is_refused_when_mmap_is_explicit() {
+        use joshua::{EngineOptions, MmapMode};
+
+        let dir = model_dir("compressed-model");
+        let model = dir.join("model.gguf");
+        // A `.gguf` that is really a gzip stream: the bytes that would be
+        // mapped are the compressed ones, so no tensor can be read in place.
+        std::fs::write(&model, b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03junk").unwrap();
+
+        // Explicitly asking for mmap turns that into a load error naming the
+        // format and the fix, rather than a header-parse failure.
+        let err = joshua::Engine::with_options(
+            &dir,
+            EngineOptions::with_n_ctx(64).mmap(MmapMode::Required),
+        )
+        .map(|_| ())
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("gzip"), "unexpected error message: {msg}");
+        assert!(msg.contains("gunzip"), "unexpected error message: {msg}");
+
+        // Without the explicit request the check only warns, so the load gets
+        // as far as the GGUF header and fails there instead.
+        let err = joshua::Engine::with_n_ctx(&dir, 64).map(|_| ()).unwrap_err();
+        let msg = err.to_string();
+        assert!(!msg.contains("gunzip"), "unexpected error message: {msg}");
+        assert!(msg.contains("GGUF"), "unexpected error message: {msg}");
+
+        // A real model file passes the same check untouched.
+        write_tiny_gguf(&model, "llama");
+        joshua::Engine::with_options(&dir, EngineOptions::with_n_ctx(64).mmap(MmapMode::Required))
+            .expect("an uncompressed model loads with mmap required");
 
         std::fs::remove_dir_all(&dir).ok();
     }

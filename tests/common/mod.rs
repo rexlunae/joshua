@@ -87,7 +87,10 @@ pub fn write_tiny_gguf(path: &Path, arch: &str) {
             gguf_file::Value::F32(1e-5),
         ),
         (key("rope.freq_base"), gguf_file::Value::F32(10_000.0)),
-        (key("feed_forward_length"), gguf_file::Value::U32(FFN as u32)),
+        (
+            key("feed_forward_length"),
+            gguf_file::Value::U32(FFN as u32),
+        ),
         (
             "tokenizer.ggml.eos_token_id".to_string(),
             gguf_file::Value::U32(3),
@@ -111,8 +114,8 @@ pub fn write_tiny_gguf(path: &Path, arch: &str) {
             "tokenizer.ggml.tokens".to_string(),
             gguf_file::Value::Array(
                 [
-                    "<unk>", "hello", "world", "</s>", "a", "b", "c", "d", "e", "f", "g", "h",
-                    "i", "j", "k", "l",
+                    "<unk>", "hello", "world", "</s>", "a", "b", "c", "d", "e", "f", "g", "h", "i",
+                    "j", "k", "l",
                 ]
                 .iter()
                 .map(|s| gguf_file::Value::String(s.to_string()))
@@ -121,7 +124,11 @@ pub fn write_tiny_gguf(path: &Path, arch: &str) {
         ),
         (
             "tokenizer.ggml.scores".to_string(),
-            gguf_file::Value::Array((0..16).map(|i| gguf_file::Value::F32(-(i as f32))).collect()),
+            gguf_file::Value::Array(
+                (0..16)
+                    .map(|i| gguf_file::Value::F32(-(i as f32)))
+                    .collect(),
+            ),
         ),
         (
             "tokenizer.ggml.token_type".to_string(),
@@ -238,8 +245,7 @@ pub fn write_tiny_gguf(path: &Path, arch: &str) {
 
     let metadata_refs: Vec<(&str, &gguf_file::Value)> =
         metadata.iter().map(|(k, v)| (k.as_str(), v)).collect();
-    let tensor_refs: Vec<(&str, &QTensor)> =
-        tensors.iter().map(|(k, v)| (k.as_str(), v)).collect();
+    let tensor_refs: Vec<(&str, &QTensor)> = tensors.iter().map(|(k, v)| (k.as_str(), v)).collect();
 
     let mut file = File::create(path).unwrap();
     gguf_file::write(&mut file, &metadata_refs, &tensor_refs).unwrap();
@@ -326,7 +332,10 @@ pub fn write_deepseek2_gguf(path: &Path, split_mla: bool, softmax_v2: bool) {
         (key("expert_weights_scale"), f32v(2.5)),
         (key("expert_weights_norm"), gguf_file::Value::Bool(true)),
         // 1 = softmax (DeepSeek-V2), 2 = sigmoid (DeepSeek-V3 / Kimi-K2).
-        (key("expert_gating_func"), u32v(if softmax_v2 { 1 } else { 2 })),
+        (
+            key("expert_gating_func"),
+            u32v(if softmax_v2 { 1 } else { 2 }),
+        ),
         (key("expert_group_count"), u32v(2)),
         (key("expert_group_used_count"), u32v(1)),
         (
@@ -359,7 +368,11 @@ pub fn write_deepseek2_gguf(path: &Path, split_mla: bool, softmax_v2: bool) {
         ),
         (
             "tokenizer.ggml.scores".to_string(),
-            gguf_file::Value::Array((0..16).map(|i| gguf_file::Value::F32(-(i as f32))).collect()),
+            gguf_file::Value::Array(
+                (0..16)
+                    .map(|i| gguf_file::Value::F32(-(i as f32)))
+                    .collect(),
+            ),
         ),
         (
             "tokenizer.ggml.token_type".to_string(),
@@ -405,8 +418,14 @@ pub fn write_deepseek2_gguf(path: &Path, split_mla: bool, softmax_v2: bool) {
         tensors.push((format!("{p}.attn_norm.weight"), qtensor(ones(EMB), &[EMB])));
         tensors.push((format!("{p}.ffn_norm.weight"), qtensor(ones(EMB), &[EMB])));
         // MLA attention (Q-LoRA + combined KV-B).
-        tensors.push((format!("{p}.attn_q_a.weight"), qtensor(next(LQ * EMB), &[LQ, EMB])));
-        tensors.push((format!("{p}.attn_q_a_norm.weight"), qtensor(ones(LQ), &[LQ])));
+        tensors.push((
+            format!("{p}.attn_q_a.weight"),
+            qtensor(next(LQ * EMB), &[LQ, EMB]),
+        ));
+        tensors.push((
+            format!("{p}.attn_q_a_norm.weight"),
+            qtensor(ones(LQ), &[LQ]),
+        ));
         tensors.push((
             format!("{p}.attn_q_b.weight"),
             qtensor(next(H * KH * LQ), &[H * KH, LQ]),
@@ -415,7 +434,10 @@ pub fn write_deepseek2_gguf(path: &Path, split_mla: bool, softmax_v2: bool) {
             format!("{p}.attn_kv_a_mqa.weight"),
             qtensor(next((LKV + R) * EMB), &[LKV + R, EMB]),
         ));
-        tensors.push((format!("{p}.attn_kv_a_norm.weight"), qtensor(ones(LKV), &[LKV])));
+        tensors.push((
+            format!("{p}.attn_kv_a_norm.weight"),
+            qtensor(ones(LKV), &[LKV]),
+        ));
         // Draw the KV up-projection from a single source (per head: A = [NP,LKV]
         // mapping the latent to k_nope, B = [VH,LKV] mapping it to v) regardless
         // of encoding, so the legacy and split forms are the *same* model — the
@@ -434,7 +456,10 @@ pub fn write_deepseek2_gguf(path: &Path, split_mla: bool, softmax_v2: bool) {
             }
             tensors.push((format!("{p}.attn_k_b.weight"), qtensor(kb, &[H, LKV, NP])));
             // attn_v_b: ggml {LKV, VH, H} → candle [H, VH, LKV] = B directly.
-            tensors.push((format!("{p}.attn_v_b.weight"), qtensor(bmat.clone(), &[H, VH, LKV])));
+            tensors.push((
+                format!("{p}.attn_v_b.weight"),
+                qtensor(bmat.clone(), &[H, VH, LKV]),
+            ));
         } else {
             // Combined kv_b: per head, rows [A (NP×LKV); B (VH×LKV)].
             let mut kv = vec![0f32; H * (NP + VH) * LKV];
@@ -451,7 +476,10 @@ pub fn write_deepseek2_gguf(path: &Path, split_mla: bool, softmax_v2: bool) {
                     }
                 }
             }
-            tensors.push((format!("{p}.attn_kv_b.weight"), qtensor(kv, &[H * (NP + VH), LKV])));
+            tensors.push((
+                format!("{p}.attn_kv_b.weight"),
+                qtensor(kv, &[H * (NP + VH), LKV]),
+            ));
         }
         tensors.push((
             format!("{p}.attn_output.weight"),
@@ -460,12 +488,24 @@ pub fn write_deepseek2_gguf(path: &Path, split_mla: bool, softmax_v2: bool) {
 
         if i == 0 {
             // Dense SwiGLU layer.
-            tensors.push((format!("{p}.ffn_gate.weight"), qtensor(next(NFF * EMB), &[NFF, EMB])));
-            tensors.push((format!("{p}.ffn_up.weight"), qtensor(next(NFF * EMB), &[NFF, EMB])));
-            tensors.push((format!("{p}.ffn_down.weight"), qtensor(next(EMB * NFF), &[EMB, NFF])));
+            tensors.push((
+                format!("{p}.ffn_gate.weight"),
+                qtensor(next(NFF * EMB), &[NFF, EMB]),
+            ));
+            tensors.push((
+                format!("{p}.ffn_up.weight"),
+                qtensor(next(NFF * EMB), &[NFF, EMB]),
+            ));
+            tensors.push((
+                format!("{p}.ffn_down.weight"),
+                qtensor(next(EMB * NFF), &[EMB, NFF]),
+            ));
         } else {
             // MoE layer: router (+ bias for V3/Kimi), routed experts, shared expert.
-            tensors.push((format!("{p}.ffn_gate_inp.weight"), qtensor(next(NE * EMB), &[NE, EMB])));
+            tensors.push((
+                format!("{p}.ffn_gate_inp.weight"),
+                qtensor(next(NE * EMB), &[NE, EMB]),
+            ));
             if !softmax_v2 {
                 tensors.push((format!("{p}.exp_probs_b.bias"), qtensor(next(NE), &[NE])));
             }
@@ -498,8 +538,7 @@ pub fn write_deepseek2_gguf(path: &Path, split_mla: bool, softmax_v2: bool) {
 
     let metadata_refs: Vec<(&str, &gguf_file::Value)> =
         metadata.iter().map(|(k, v)| (k.as_str(), v)).collect();
-    let tensor_refs: Vec<(&str, &QTensor)> =
-        tensors.iter().map(|(k, v)| (k.as_str(), v)).collect();
+    let tensor_refs: Vec<(&str, &QTensor)> = tensors.iter().map(|(k, v)| (k.as_str(), v)).collect();
     let mut file = File::create(path).unwrap();
     gguf_file::write(&mut file, &metadata_refs, &tensor_refs).unwrap();
 }
@@ -510,6 +549,715 @@ pub fn write_unsupported_gguf(path: &Path) {
     let metadata: Vec<(&str, &gguf_file::Value)> = vec![("general.architecture", &arch)];
     let mut file = File::create(path).unwrap();
     gguf_file::write(&mut file, &metadata, &[]).unwrap();
+}
+
+// ─── DeepSeek-V4 test writer ──────────────────────────────────────────────────
+//
+// The deepseek4 loader reads tensors candle cannot *name* (IQ2_XXS experts,
+// I32 routed-id tables), so the tiny model is written by hand rather than via
+// candle's `gguf_file::write`.  The layout below mirrors candle's writer
+// exactly (version 2, 32-byte alignment, per-tensor data padding) so the
+// same file parses identically through candle's reader and Joshua's.
+
+/// GGUF dtype ids used by the hand-rolled writer.
+const DTYPE_F32: u32 = 0;
+const DTYPE_F16: u32 = 1;
+const DTYPE_Q8_0: u32 = 8;
+const DTYPE_Q4_K: u32 = 12;
+const DTYPE_IQ2_XXS: u32 = 16;
+const DTYPE_I32: u32 = 26;
+
+/// A raw tensor for the hand-rolled writer: dtype id + candle-order dims +
+/// exact file bytes (block layout included).
+pub struct RawTensor {
+    pub name: String,
+    pub dtype: u32,
+    pub dims: Vec<usize>,
+    pub data: Vec<u8>,
+}
+
+impl RawTensor {
+    pub fn f32(name: &str, data: Vec<f32>, dims: &[usize]) -> Self {
+        let data = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+        Self {
+            name: name.into(),
+            dtype: DTYPE_F32,
+            dims: dims.to_vec(),
+            data,
+        }
+    }
+
+    pub fn f16(name: &str, data: Vec<f32>, dims: &[usize]) -> Self {
+        let data = data
+            .iter()
+            .flat_map(|v| half::f16::from_f32(*v).to_le_bytes())
+            .collect();
+        Self {
+            name: name.into(),
+            dtype: DTYPE_F16,
+            dims: dims.to_vec(),
+            data,
+        }
+    }
+
+    pub fn i32(name: &str, data: Vec<i32>, dims: &[usize]) -> Self {
+        let data = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+        Self {
+            name: name.into(),
+            dtype: DTYPE_I32,
+            dims: dims.to_vec(),
+            data,
+        }
+    }
+
+    /// Quantize f32 data to Q8_0 via candle (matches the other writers).
+    pub fn q8_0(name: &str, data: Vec<f32>, dims: &[usize]) -> Self {
+        let t = Tensor::from_vec(data, dims, &Device::Cpu).unwrap();
+        let qt = QTensor::quantize(&t, GgmlDType::Q8_0).unwrap();
+        Self {
+            name: name.into(),
+            dtype: DTYPE_Q8_0,
+            dims: qt.shape().dims().to_vec(),
+            data: qt.data().unwrap().to_vec(),
+        }
+    }
+
+    /// Quantize f32 data to Q4_K via candle.
+    ///
+    /// The total element count must be a multiple of QK_K = 256 (candle's
+    /// `QTensor::quantize` requires it), and the innermost dim must be
+    /// block-aligned too for the matmul contract — the deepseek4 tiny-model
+    /// weights chosen for this (attn_kv, shared-expert gate/up) satisfy both.
+    pub fn q4k(name: &str, data: Vec<f32>, dims: &[usize]) -> Self {
+        let t = Tensor::from_vec(data, dims, &Device::Cpu).unwrap();
+        let qt = QTensor::quantize(&t, GgmlDType::Q4K).unwrap();
+        Self {
+            name: name.into(),
+            dtype: DTYPE_Q4_K,
+            dims: qt.shape().dims().to_vec(),
+            data: qt.data().unwrap().to_vec(),
+        }
+    }
+
+    /// Encode f32 data as IQ2_XXS blocks.
+    ///
+    /// The test model does not need *accurate* quantisation — it needs valid
+    /// blocks that exercise the decode path with varied, deterministic data.
+    /// Values must stay *realistic*, though: candle's Q8_0 matmul quantizes
+    /// the activation side to f16, so if the synthetic IQ2_XXS weights decode
+    /// to huge magnitudes the MoE products overflow to inf.  The codebook's
+    /// largest byte is 43, so a block scale of 2^-10 caps decoded weights at
+    /// 43 * 3.875 / 1024 ≈ 0.16 (real weights are ~±0.1), which keeps every
+    /// intermediate under f16/f32 range.
+    /// Layout matches llama.cpp: 2-byte fp16 scale, then 8 groups of 32
+    /// values: 4 code bytes + one u32 of sign bits (7 per 8-value group) with
+    /// the scale index in bits 28..31.
+    pub fn iq2xxs(name: &str, data: Vec<f32>, dims: &[usize]) -> Self {
+        assert!(
+            data.len().is_multiple_of(256),
+            "iq2xxs test writer needs a multiple of 256 elements"
+        );
+        let mut out = Vec::with_capacity(data.len() / 256 * 66);
+        for (b, chunk) in data.chunks_exact(256).enumerate() {
+            // fp16 scale 2^-10 keeps decoded values ~±0.16.
+            out.extend_from_slice(&half::f16::from_f32(1.0 / 1024.0).to_le_bytes());
+            for ib32 in 0..8usize {
+                let base = ib32 * 32;
+                let mut lo = [0u8; 4];
+                for l in 0..4usize {
+                    let group = &chunk[base + l * 8..base + l * 8 + 8];
+                    let sum: u32 = group.iter().map(|x| x.abs() as u32).sum::<u32>();
+                    let code = ((ib32 * 53 + l * 97 + b * 13) as u32 + sum) % 256;
+                    lo[l] = code as u8;
+                }
+                let mut hi: u32 = 0;
+                for l in 0..4usize {
+                    let group = &chunk[base + l * 8..base + l * 8 + 8];
+                    let mut sbits: u8 = 0;
+                    for (j, &v) in group.iter().enumerate().take(7) {
+                        if v < 0.0 {
+                            sbits |= 1 << j;
+                        }
+                    }
+                    hi |= (sbits as u32) << (7 * l);
+                }
+                hi |= ((b % 16) as u32) << 28;
+                out.extend_from_slice(&lo);
+                out.extend_from_slice(&hi.to_le_bytes());
+            }
+        }
+        Self {
+            name: name.into(),
+            dtype: DTYPE_IQ2_XXS,
+            dims: dims.to_vec(),
+            data: out,
+        }
+    }
+}
+
+fn value_type_id(v: &gguf_file::Value) -> u32 {
+    match v {
+        gguf_file::Value::U8(_) => 0,
+        gguf_file::Value::I8(_) => 1,
+        gguf_file::Value::U16(_) => 2,
+        gguf_file::Value::I16(_) => 3,
+        gguf_file::Value::U32(_) => 4,
+        gguf_file::Value::I32(_) => 5,
+        gguf_file::Value::F32(_) => 6,
+        gguf_file::Value::Bool(_) => 7,
+        gguf_file::Value::String(_) => 8,
+        gguf_file::Value::Array(_) => 9,
+        gguf_file::Value::U64(_) => 10,
+        gguf_file::Value::I64(_) => 11,
+        gguf_file::Value::F64(_) => 12,
+    }
+}
+
+fn write_value(w: &mut impl std::io::Write, v: &gguf_file::Value) {
+    let write_string = |w: &mut dyn std::io::Write, s: &str| {
+        let b = s.as_bytes();
+        w.write_all(&(b.len() as u64).to_le_bytes()).unwrap();
+        w.write_all(b).unwrap();
+    };
+    match v {
+        gguf_file::Value::U8(x) => w.write_all(&[*x]).unwrap(),
+        gguf_file::Value::I8(x) => w.write_all(&[*x as u8]).unwrap(),
+        gguf_file::Value::U16(x) => w.write_all(&x.to_le_bytes()).unwrap(),
+        gguf_file::Value::I16(x) => w.write_all(&x.to_le_bytes()).unwrap(),
+        gguf_file::Value::U32(x) => w.write_all(&x.to_le_bytes()).unwrap(),
+        gguf_file::Value::I32(x) => w.write_all(&x.to_le_bytes()).unwrap(),
+        gguf_file::Value::U64(x) => w.write_all(&x.to_le_bytes()).unwrap(),
+        gguf_file::Value::I64(x) => w.write_all(&x.to_le_bytes()).unwrap(),
+        gguf_file::Value::F32(x) => w.write_all(&x.to_le_bytes()).unwrap(),
+        gguf_file::Value::F64(x) => w.write_all(&x.to_le_bytes()).unwrap(),
+        gguf_file::Value::Bool(x) => w.write_all(&[u8::from(*x)]).unwrap(),
+        gguf_file::Value::String(s) => write_string(w, s),
+        gguf_file::Value::Array(a) => {
+            let vt: u32 = if a.is_empty() {
+                4
+            } else {
+                match a[0] {
+                    gguf_file::Value::U8(_) => 0,
+                    gguf_file::Value::I8(_) => 1,
+                    gguf_file::Value::U16(_) => 2,
+                    gguf_file::Value::I16(_) => 3,
+                    gguf_file::Value::U32(_) => 4,
+                    gguf_file::Value::I32(_) => 5,
+                    gguf_file::Value::F32(_) => 6,
+                    gguf_file::Value::Bool(_) => 7,
+                    gguf_file::Value::String(_) => 8,
+                    gguf_file::Value::U64(_) => 10,
+                    gguf_file::Value::I64(_) => 11,
+                    gguf_file::Value::F64(_) => 12,
+                    _ => panic!("nested arrays unsupported"),
+                }
+            };
+            w.write_all(&vt.to_le_bytes()).unwrap();
+            w.write_all(&(a.len() as u64).to_le_bytes()).unwrap();
+            for e in a {
+                write_value(w, e);
+            }
+        }
+    }
+}
+
+/// Write a GGUF in candle's exact on-disk layout, but for arbitrary dtypes.
+pub fn write_raw_gguf(path: &Path, metadata: &[(String, gguf_file::Value)], tensors: &[RawTensor]) {
+    let mut w = Vec::new();
+    w.extend_from_slice(&0x4655_4747u32.to_le_bytes()); // "GGUF"
+    w.extend_from_slice(&2u32.to_le_bytes()); // version 2
+    w.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
+    w.extend_from_slice(&(metadata.len() as u64).to_le_bytes());
+    let write_string = |w: &mut Vec<u8>, s: &str| {
+        let b = s.as_bytes();
+        w.extend_from_slice(&(b.len() as u64).to_le_bytes());
+        w.extend_from_slice(b);
+    };
+    for (k, v) in metadata {
+        write_string(&mut w, k);
+        w.extend_from_slice(&value_type_id(v).to_le_bytes());
+        write_value(&mut w, v);
+    }
+    // Tensor infos: dims reversed (GGUF order), 32-byte-aligned offsets.
+    let mut offset = 0usize;
+    let mut data_offsets = Vec::with_capacity(tensors.len());
+    for t in tensors {
+        write_string(&mut w, &t.name);
+        w.extend_from_slice(&(t.dims.len() as u32).to_le_bytes());
+        for d in t.dims.iter().rev() {
+            w.extend_from_slice(&(*d as u64).to_le_bytes());
+        }
+        w.extend_from_slice(&t.dtype.to_le_bytes());
+        w.extend_from_slice(&(offset as u64).to_le_bytes());
+        let size = t.data.len();
+        let padding = 31 - (31 + size) % 32;
+        data_offsets.push(offset);
+        offset += size + padding;
+    }
+    // Header padded to 32 bytes before the data region.
+    let padding = 31 - (31 + w.len()) % 32;
+    w.resize(w.len() + padding, 0u8);
+    let data_start = w.len();
+    for (t, &off) in tensors.iter().zip(data_offsets.iter()) {
+        assert_eq!(
+            w.len() - data_start,
+            off,
+            "data offsets must be relative to the aligned data start"
+        );
+        w.extend_from_slice(&t.data);
+        let padding = 31 - (31 + t.data.len()) % 32;
+        w.resize(w.len() + padding, 0u8);
+    }
+    std::fs::write(path, w).unwrap();
+}
+
+/// Write a tiny but structurally valid `deepseek4` GGUF exercising the
+/// dtypes candle cannot represent: IQ2_XXS routed experts and an I32
+/// tid2eid table in the hash layer.
+/// Options controlling which tensors the tiny `deepseek4` writer emits.
+#[derive(Default, Clone, Copy)]
+pub struct TinyDeepseek4Opts {
+    /// Also emit `output.weight` as IQ2_XXS (a dtype candle cannot name).
+    pub iq2xxs_output: bool,
+    /// Layer 0 is a CSA layer (compressor + lightning indexer tensors).
+    pub compress: bool,
+    /// Emit K-quant (Q4_K) weights for the attention-KV and shared-expert
+    /// projections instead of F16 — exercises the K-quant decode path on
+    /// both the mmap and streamed loaders.
+    pub kquant_weights: bool,
+    /// Use only dtypes candle can name (Q8_0 experts, F32 id table instead of
+    /// I32) so the model loads through `ModelWeights::from_gguf`, whose
+    /// streamed entry point has no raw header.
+    pub candle_only: bool,
+}
+
+pub fn write_tiny_deepseek4_gguf(path: &Path) {
+    write_tiny_deepseek4_gguf_opts(path, TinyDeepseek4Opts::default());
+}
+
+/// Like [`write_tiny_deepseek4_gguf`], but also emits `output.weight` as an
+/// IQ2_XXS tensor (a dtype candle cannot name) so callers can verify the
+/// loader's raw-header-aware presence check picks it up instead of silently
+/// tying the output head to the input embeddings.
+pub fn write_tiny_deepseek4_gguf_iq2xxs_output(path: &Path) {
+    write_tiny_deepseek4_gguf_opts(
+        path,
+        TinyDeepseek4Opts {
+            iq2xxs_output: true,
+            ..Default::default()
+        },
+    );
+}
+
+/// Like [`write_tiny_deepseek4_gguf`], but layer 0 is a CSA layer
+/// (`compress_ratios = [4, 0]`): emits the main compressor + lightning
+/// indexer tensors so the compressed-KV cache write path (scatter into
+/// `comp`/`lid`) is exercised by forward passes that span a full block.
+pub fn write_tiny_deepseek4_gguf_compress(path: &Path) {
+    write_tiny_deepseek4_gguf_opts(
+        path,
+        TinyDeepseek4Opts {
+            compress: true,
+            ..Default::default()
+        },
+    );
+}
+
+/// Like [`write_tiny_deepseek4_gguf`], but the attention-KV projection and
+/// the shared-expert gate/up projections are Q4_K instead of F16.
+pub fn write_tiny_deepseek4_gguf_kquant(path: &Path) {
+    write_tiny_deepseek4_gguf_opts(
+        path,
+        TinyDeepseek4Opts {
+            kquant_weights: true,
+            ..Default::default()
+        },
+    );
+}
+
+/// Like [`write_tiny_deepseek4_gguf`], but every tensor uses a dtype candle's
+/// `GgmlDType` can name (routed experts Q8_0 instead of IQ2_XXS, id table F32
+/// instead of I32) so the file also loads through `ModelWeights::from_gguf`
+/// (no raw header).
+pub fn write_tiny_deepseek4_gguf_candle_only(path: &Path) {
+    write_tiny_deepseek4_gguf_opts(
+        path,
+        TinyDeepseek4Opts {
+            candle_only: true,
+            ..Default::default()
+        },
+    );
+}
+
+fn write_tiny_deepseek4_gguf_opts(path: &Path, opts: TinyDeepseek4Opts) {
+    let TinyDeepseek4Opts {
+        iq2xxs_output,
+        compress,
+        kquant_weights,
+        candle_only,
+    } = opts;
+    const VOCAB: usize = 16;
+    // EMB must be a multiple of the IQ2_XXS block size (256): each expert's
+    // in-dimension is EMB, and candle requires the innermost dim of a QTensor
+    // to be block-aligned.  The real DeepSeek-V4-Flash files satisfy this
+    // with EMB = 4096.
+    const EMB: usize = 256;
+    const NLAYER: usize = 2;
+    const NHEAD: usize = 4;
+    const HEAD_DIM: usize = 16;
+    const ROPE_DIM: usize = 8;
+    const Q_LORA: usize = 8;
+    const O_GROUPS: usize = 2;
+    const O_LORA: usize = 4;
+    const NE: usize = 8;
+    const NFE: usize = 128; // expert ffn width (out of gate/up, in of down)
+    const NUSED: usize = 2;
+    const N_SHARED: usize = 1;
+    const HC: usize = 2;
+    const N_HASH: usize = 1;
+    // Lightning indexer (CSA layers only).
+    const INDEX_NHEAD: usize = 4;
+    const INDEX_HD: usize = 16;
+
+    let u32v = |v: u32| gguf_file::Value::U32(v);
+    let f32v = |v: f32| gguf_file::Value::F32(v);
+    let key = |s: &str| format!("deepseek4.{s}");
+    let mut metadata: Vec<(String, gguf_file::Value)> = vec![
+        (
+            "general.architecture".to_string(),
+            gguf_file::Value::String("deepseek4".to_string()),
+        ),
+        (
+            "general.name".to_string(),
+            gguf_file::Value::String("DeepSeek-V4".to_string()),
+        ),
+        (key("block_count"), u32v(NLAYER as u32)),
+        (key("attention.head_count"), u32v(NHEAD as u32)),
+        (key("embedding_length"), u32v(EMB as u32)),
+        (key("attention.layer_norm_rms_epsilon"), f32v(1e-5)),
+        (key("attention.q_lora_rank"), u32v(Q_LORA as u32)),
+        (key("attention.key_length"), u32v(HEAD_DIM as u32)),
+        (key("rope.dimension_count"), u32v(ROPE_DIM as u32)),
+        (
+            key("attention.compress_ratios"),
+            gguf_file::Value::Array(vec![u32v(if compress { 4 } else { 0 }), u32v(0)]),
+        ),
+        (key("attention.sliding_window"), u32v(8)),
+        (key("attention.output_group_count"), u32v(O_GROUPS as u32)),
+        (key("attention.output_lora_rank"), u32v(O_LORA as u32)),
+        (key("hyper_connection.count"), u32v(HC as u32)),
+        (key("hyper_connection.sinkhorn_iterations"), u32v(2)),
+        (key("hyper_connection.epsilon"), f32v(1e-6)),
+        (key("expert_count"), u32v(NE as u32)),
+        (key("expert_used_count"), u32v(NUSED as u32)),
+        (key("expert_shared_count"), u32v(N_SHARED as u32)),
+        (key("hash_layer_count"), u32v(N_HASH as u32)),
+        (key("expert_weights_scale"), f32v(1.0)),
+        (key("expert_gating_func"), u32v(2)),
+        (key("rope.freq_base"), f32v(10_000.0)),
+        (key("context_length"), u32v(32)),
+        ("tokenizer.ggml.eos_token_id".to_string(), u32v(3)),
+        ("tokenizer.ggml.bos_token_id".to_string(), u32v(3)),
+        ("tokenizer.ggml.unknown_token_id".to_string(), u32v(0)),
+        (
+            "tokenizer.ggml.model".to_string(),
+            gguf_file::Value::String("llama".to_string()),
+        ),
+        (
+            "tokenizer.ggml.tokens".to_string(),
+            gguf_file::Value::Array(
+                [
+                    "<unk>", "hello", "world", "</s>", "a", "b", "c", "d", "e", "f", "g", "h", "i",
+                    "j", "k", "l",
+                ]
+                .iter()
+                .map(|s| gguf_file::Value::String(s.to_string()))
+                .collect(),
+            ),
+        ),
+        (
+            "tokenizer.ggml.scores".to_string(),
+            gguf_file::Value::Array(
+                (0..16)
+                    .map(|i| gguf_file::Value::F32(-(i as f32)))
+                    .collect(),
+            ),
+        ),
+        (
+            "tokenizer.ggml.token_type".to_string(),
+            gguf_file::Value::Array(
+                [2, 1, 1, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+                    .iter()
+                    .map(|&t| gguf_file::Value::I32(t))
+                    .collect(),
+            ),
+        ),
+    ];
+    if compress {
+        metadata.extend([
+            (
+                key("attention.indexer.head_count"),
+                u32v(INDEX_NHEAD as u32),
+            ),
+            (key("attention.indexer.key_length"), u32v(INDEX_HD as u32)),
+            (key("attention.indexer.top_k"), u32v(2)),
+        ]);
+    }
+
+    let ones = |n: usize| vec![1.0f32; n];
+    let mut seed = 10u32;
+    let mut next = |n: usize| {
+        seed = seed.wrapping_add(7).wrapping_mul(2_654_435_761) | 1;
+        weights(n, seed)
+    };
+
+    let mut tensors: Vec<RawTensor> = vec![
+        RawTensor::f16("token_embd.weight", weights(VOCAB * EMB, 1), &[VOCAB, EMB]),
+        RawTensor::f32("output_norm.weight", ones(EMB), &[EMB]),
+        RawTensor::f16(
+            "output_hc_fn.weight",
+            next(HC * (HC * EMB)),
+            &[HC, HC * EMB],
+        ),
+        RawTensor::f32("output_hc_base.weight", ones(HC), &[HC]),
+        RawTensor::f32("output_hc_scale.weight", ones(HC), &[HC]),
+    ];
+    let o_group_dim = (NHEAD / O_GROUPS) * HEAD_DIM;
+    for i in 0..NLAYER {
+        let p = format!("blk.{i}");
+        tensors.push(RawTensor::f32(
+            &format!("{p}.attn_norm.weight"),
+            ones(EMB),
+            &[EMB],
+        ));
+        tensors.push(RawTensor::f32(
+            &format!("{p}.ffn_norm.weight"),
+            ones(EMB),
+            &[EMB],
+        ));
+        tensors.push(RawTensor::f16(
+            &format!("{p}.attn_q_a.weight"),
+            next(Q_LORA * EMB),
+            &[Q_LORA, EMB],
+        ));
+        tensors.push(RawTensor::f32(
+            &format!("{p}.attn_q_a_norm.weight"),
+            ones(Q_LORA),
+            &[Q_LORA],
+        ));
+        tensors.push(RawTensor::f16(
+            &format!("{p}.attn_q_b.weight"),
+            next(NHEAD * HEAD_DIM * Q_LORA),
+            &[NHEAD * HEAD_DIM, Q_LORA],
+        ));
+        // Q4_K needs the innermost dim (the matmul contraction dim) to be a
+        // multiple of QK_K = 256; EMB = 256 satisfies it.
+        let kv_data = next(HEAD_DIM * EMB);
+        tensors.push(if kquant_weights {
+            RawTensor::q4k(&format!("{p}.attn_kv.weight"), kv_data, &[HEAD_DIM, EMB])
+        } else {
+            RawTensor::f16(&format!("{p}.attn_kv.weight"), kv_data, &[HEAD_DIM, EMB])
+        });
+        tensors.push(RawTensor::f32(
+            &format!("{p}.attn_kv_a_norm.weight"),
+            ones(HEAD_DIM),
+            &[HEAD_DIM],
+        ));
+        tensors.push(RawTensor::f16(
+            &format!("{p}.attn_output_a.weight"),
+            next(O_GROUPS * O_LORA * o_group_dim),
+            &[O_GROUPS * O_LORA, o_group_dim],
+        ));
+        tensors.push(RawTensor::f16(
+            &format!("{p}.attn_output_b.weight"),
+            next(EMB * O_GROUPS * O_LORA),
+            &[EMB, O_GROUPS * O_LORA],
+        ));
+        tensors.push(RawTensor::f32(
+            &format!("{p}.attn_sinks.weight"),
+            ones(NHEAD),
+            &[NHEAD],
+        ));
+
+        // CSA layer 0: main compressor + lightning indexer (and its own
+        // ratio-4 compressor).  Both write their caches with a scatter whose
+        // index is a broadcast view — see `deepseek4_compressed_layers_write_their_caches`.
+        if compress && i == 0 {
+            let cdim = 2 * HEAD_DIM; // coff=2 for CSA
+            tensors.push(RawTensor::f16(
+                &format!("{p}.attn_compressor_kv.weight"),
+                next(cdim * EMB),
+                &[cdim, EMB],
+            ));
+            tensors.push(RawTensor::f16(
+                &format!("{p}.attn_compressor_gate.weight"),
+                next(cdim * EMB),
+                &[cdim, EMB],
+            ));
+            tensors.push(RawTensor::f32(
+                &format!("{p}.attn_compressor_ape.weight"),
+                next(4 * cdim),
+                &[4, cdim],
+            ));
+            tensors.push(RawTensor::f32(
+                &format!("{p}.attn_compressor_norm.weight"),
+                ones(HEAD_DIM),
+                &[HEAD_DIM],
+            ));
+            tensors.push(RawTensor::f16(
+                &format!("{p}.indexer.proj.weight"),
+                next(INDEX_NHEAD * EMB),
+                &[INDEX_NHEAD, EMB],
+            ));
+            tensors.push(RawTensor::f16(
+                &format!("{p}.indexer.attn_q_b.weight"),
+                next(INDEX_NHEAD * INDEX_HD * Q_LORA),
+                &[INDEX_NHEAD * INDEX_HD, Q_LORA],
+            ));
+            let icdim = 2 * INDEX_HD;
+            tensors.push(RawTensor::f16(
+                &format!("{p}.indexer_compressor_kv.weight"),
+                next(icdim * EMB),
+                &[icdim, EMB],
+            ));
+            tensors.push(RawTensor::f16(
+                &format!("{p}.indexer_compressor_gate.weight"),
+                next(icdim * EMB),
+                &[icdim, EMB],
+            ));
+            tensors.push(RawTensor::f32(
+                &format!("{p}.indexer_compressor_ape.weight"),
+                next(4 * icdim),
+                &[4, icdim],
+            ));
+            tensors.push(RawTensor::f32(
+                &format!("{p}.indexer_compressor_norm.weight"),
+                ones(INDEX_HD),
+                &[INDEX_HD],
+            ));
+        }
+
+        // MoE: routed experts (IQ2_XXS gate/up, Q8_0 down) + shared expert.
+        tensors.push(RawTensor::f32(
+            &format!("{p}.ffn_gate_inp.weight"),
+            next(NE * EMB),
+            &[NE, EMB],
+        ));
+        if i >= N_HASH {
+            tensors.push(RawTensor::f32(
+                &format!("{p}.exp_probs_b.bias"),
+                next(NE),
+                &[NE],
+            ));
+        }
+        let gate_up = next(NE * NFE * EMB);
+        let up = next(NE * NFE * EMB);
+        let down = next(NE * NFE * EMB);
+        // `candle_only` uses Q8_0 for the routed experts so the whole file
+        // stays loadable without the raw header (IQ2_XXS is not a dtype
+        // candle's `Content` can carry).
+        let exps = if candle_only {
+            |name: &str, data: Vec<f32>| RawTensor::q8_0(name, data, &[NE, NFE, EMB])
+        } else {
+            |name: &str, data: Vec<f32>| RawTensor::iq2xxs(name, data, &[NE, NFE, EMB])
+        };
+        tensors.push(exps(&format!("{p}.ffn_gate_exps.weight"), gate_up));
+        tensors.push(exps(&format!("{p}.ffn_up_exps.weight"), up));
+        tensors.push(RawTensor::q8_0(
+            &format!("{p}.ffn_down_exps.weight"),
+            down,
+            &[NE, EMB, NFE],
+        ));
+        // Shared expert: F16 normally, Q4_K in the k-quant variant (gate/up
+        // have EMB = 256 as their contraction dim; down's is NFE = 128, so it
+        // stays F16).
+        let shexp = |name: &str, data: Vec<f32>| {
+            if kquant_weights {
+                RawTensor::q4k(name, data, &[NFE, EMB])
+            } else {
+                RawTensor::f16(name, data, &[NFE, EMB])
+            }
+        };
+        tensors.push(shexp(
+            &format!("{p}.ffn_gate_shexp.weight"),
+            next(NFE * EMB),
+        ));
+        tensors.push(shexp(
+            &format!("{p}.ffn_up_shexp.weight"),
+            next(NFE * EMB),
+        ));
+        tensors.push(RawTensor::f16(
+            &format!("{p}.ffn_down_shexp.weight"),
+            next(EMB * NFE),
+            &[EMB, NFE],
+        ));
+        if i < N_HASH {
+            // Routed-id table: I32, [vocab, n_expert_used], ids in [0, NE).
+            let ids: Vec<i32> = (0..VOCAB).map(|t| ((t * 3 + 1) % NE) as i32).collect();
+            let ids = [ids.clone(), ids.clone()].concat();
+            // `candle_only` writes the same values as F32 — the loader reads
+            // either (I32 goes through the raw header, F32 through candle).
+            if candle_only {
+                let f32ids: Vec<f32> = ids.iter().map(|&v| v as f32).collect();
+                tensors.push(RawTensor::f32(
+                    &format!("{p}.ffn_gate_tid2eid.weight"),
+                    f32ids,
+                    &[VOCAB, NUSED],
+                ));
+            } else {
+                tensors.push(RawTensor::i32(
+                    &format!("{p}.ffn_gate_tid2eid.weight"),
+                    ids,
+                    &[VOCAB, NUSED],
+                ));
+            }
+        }
+
+        // Hyper-connection mixing: [hc*d] → [(2+hc)*hc], plus scale/base.
+        let hc_out = (2 + HC) * HC;
+        tensors.push(RawTensor::f16(
+            &format!("{p}.hc_attn_fn.weight"),
+            next(hc_out * HC * EMB),
+            &[hc_out, HC * EMB],
+        ));
+        tensors.push(RawTensor::f32(
+            &format!("{p}.hc_attn_base.weight"),
+            next(hc_out),
+            &[hc_out],
+        ));
+        tensors.push(RawTensor::f32(
+            &format!("{p}.hc_attn_scale.weight"),
+            vec![1.0, 1.0, 1.0],
+            &[3],
+        ));
+        tensors.push(RawTensor::f16(
+            &format!("{p}.hc_ffn_fn.weight"),
+            next(hc_out * HC * EMB),
+            &[hc_out, HC * EMB],
+        ));
+        tensors.push(RawTensor::f32(
+            &format!("{p}.hc_ffn_base.weight"),
+            next(hc_out),
+            &[hc_out],
+        ));
+        tensors.push(RawTensor::f32(
+            &format!("{p}.hc_ffn_scale.weight"),
+            vec![1.0, 1.0, 1.0],
+            &[3],
+        ));
+    }
+
+    if iq2xxs_output {
+        // Distinct from token_embd (seed 1) so the test can tell which head
+        // was actually used.
+        tensors.push(RawTensor::iq2xxs(
+            "output.weight",
+            weights(VOCAB * EMB, 999),
+            &[VOCAB, EMB],
+        ));
+    }
+
+    write_raw_gguf(path, &metadata, &tensors);
 }
 
 /// Create a fresh model directory under the target tmp area.

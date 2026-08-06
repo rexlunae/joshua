@@ -13,7 +13,7 @@
 //! joshua embed --model ./weights/nomic-embed.gguf "Hello world"
 //! ```
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -21,7 +21,7 @@ use tracing_subscriber::EnvFilter;
 
 use joshua::{
     engine::Engine, server, types::GenerationOptions, ChatMessage, EngineOptions, HugePages,
-    PageSize,
+    MmapMode, PageSize,
 };
 
 /// Physical-memory backing for the model mapping (CLI form of [`HugePages`]).
@@ -81,6 +81,27 @@ enum Commands {
         /// 2mb, or 1gb (Linux only for the huge-page modes).
         #[arg(long, value_enum, default_value_t = HugePagesArg::Off)]
         huge_pages: HugePagesArg,
+        /// Require the model to be memory-mappable: a compressed model file
+        /// (a gzip/zstd/... stream, or one the filesystem stores compressed)
+        /// becomes a load error instead of a warning.
+        #[arg(long, default_value_t = false)]
+        mmap: bool,
+        /// Optimise the mapping for a model far larger than RAM: no readahead,
+        /// so pages fault in only as weights are genuinely touched.
+        #[arg(long, env = "JOSHUA_LAZY_WEIGHTS", default_value_t = false)]
+        lazy_weights: bool,
+        /// Prefetch the always-touched weights (embeddings, norms, attention,
+        /// routers, shared experts, output) at load and advise random access
+        /// on routed experts, so the per-token working set stays resident.
+        /// Defaults to on when the model file is larger than RAM; pass
+        /// `--pin-hot-weights=false` to force it off.
+        #[arg(long, env = "JOSHUA_PIN_HOT_WEIGHTS", num_args = 0..=1, default_missing_value = "true")]
+        pin_hot_weights: Option<bool>,
+        /// Lock the always-touched weights into RAM (mlock).  Needs the
+        /// process memlock limit raised: systemd `LimitMEMLOCK=infinity`, or
+        /// `ulimit -l unlimited` before starting the server.
+        #[arg(long, env = "JOSHUA_MLOCK_HOT_WEIGHTS", default_value_t = false)]
+        mlock_hot_weights: bool,
         /// NPU vendor plugin (a cdylib exporting the joshua_npu_* ABI).
         #[arg(long, env = "JOSHUA_NPU_PLUGIN")]
         npu_plugin: Option<PathBuf>,
@@ -131,6 +152,24 @@ enum Commands {
         /// 2mb, or 1gb (Linux only for the huge-page modes).
         #[arg(long, value_enum, default_value_t = HugePagesArg::Off)]
         huge_pages: HugePagesArg,
+        /// Require the model to be memory-mappable: a compressed model file
+        /// (a gzip/zstd/... stream, or one the filesystem stores compressed)
+        /// becomes a load error instead of a warning.
+        #[arg(long, default_value_t = false)]
+        mmap: bool,
+        /// Optimise the mapping for a model far larger than RAM: no readahead,
+        /// so pages fault in only as weights are genuinely touched.
+        #[arg(long, env = "JOSHUA_LAZY_WEIGHTS", default_value_t = false)]
+        lazy_weights: bool,
+        /// Prefetch the always-touched weights at load and advise random
+        /// access on routed experts.  Defaults to on when the model file is
+        /// larger than RAM; pass `--pin-hot-weights=false` to force it off.
+        #[arg(long, env = "JOSHUA_PIN_HOT_WEIGHTS", num_args = 0..=1, default_missing_value = "true")]
+        pin_hot_weights: Option<bool>,
+        /// Lock the always-touched weights into RAM (mlock).  Needs the
+        /// process memlock limit raised: `ulimit -l unlimited`.
+        #[arg(long, env = "JOSHUA_MLOCK_HOT_WEIGHTS", default_value_t = false)]
+        mlock_hot_weights: bool,
         /// NPU vendor plugin (a cdylib exporting the joshua_npu_* ABI).
         #[arg(long, env = "JOSHUA_NPU_PLUGIN")]
         npu_plugin: Option<PathBuf>,
@@ -178,6 +217,10 @@ async fn main() -> anyhow::Result<()> {
             addr,
             n_ctx,
             huge_pages,
+            mmap,
+            lazy_weights,
+            pin_hot_weights,
+            mlock_hot_weights,
             npu_plugin,
             npu_in_process,
             whisper_model,
@@ -196,7 +239,13 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
 
-            let opts = EngineOptions::with_n_ctx(n_ctx).huge_pages(huge_pages.into());
+            let pin_hot = pin_hot_weights.unwrap_or_else(|| model_larger_than_ram(&model));
+            let opts = EngineOptions::with_n_ctx(n_ctx)
+                .huge_pages(huge_pages.into())
+                .mmap(mmap_mode(mmap))
+                .lazy_weights(lazy_weights)
+                .pin_hot_weights(pin_hot)
+                .mlock_hot_weights(mlock_hot_weights);
             let mut engine = Engine::with_options(&model, opts)?;
             if let Some(plugin) = npu_plugin {
                 engine = engine.with_npu_backend(npu_backend(&plugin, npu_in_process)?);
@@ -251,10 +300,20 @@ async fn main() -> anyhow::Result<()> {
             temperature,
             n_ctx,
             huge_pages,
+            mmap,
+            lazy_weights,
+            pin_hot_weights,
+            mlock_hot_weights,
             npu_plugin,
             npu_in_process,
         } => {
-            let opts = EngineOptions::with_n_ctx(n_ctx).huge_pages(huge_pages.into());
+            let pin_hot = pin_hot_weights.unwrap_or_else(|| model_larger_than_ram(&model));
+            let opts = EngineOptions::with_n_ctx(n_ctx)
+                .huge_pages(huge_pages.into())
+                .mmap(mmap_mode(mmap))
+                .lazy_weights(lazy_weights)
+                .pin_hot_weights(pin_hot)
+                .mlock_hot_weights(mlock_hot_weights);
             let mut engine = Engine::with_options(&model, opts)?;
             if let Some(plugin) = npu_plugin {
                 engine = engine.with_npu_backend(npu_backend(&plugin, npu_in_process)?);
@@ -291,6 +350,59 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Translate the `--mmap` flag: passing it makes memory mapping an explicit
+/// request, so a model file that cannot be mapped usefully fails the load
+/// instead of merely warning.
+fn mmap_mode(explicit: bool) -> MmapMode {
+    if explicit {
+        MmapMode::Required
+    } else {
+        MmapMode::Auto
+    }
+}
+
+/// Total physical RAM in bytes (Linux `/proc/meminfo`; `None` elsewhere or
+/// when unreadable).
+fn total_ram_bytes() -> Option<u64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let line = meminfo.lines().find(|l| l.starts_with("MemTotal:"))?;
+    let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kb * 1024)
+}
+
+/// Size in bytes of the model file (a directory argument is resolved to the
+/// `.gguf` inside it).
+fn model_file_size(model: &Path) -> Option<u64> {
+    if model.is_file() {
+        return model.metadata().ok().map(|m| m.len());
+    }
+    joshua::find_gguf_in_dir(model)
+        .ok()
+        .and_then(|p| p.metadata().ok())
+        .map(|m| m.len())
+}
+
+/// Auto decision for `--pin-hot-weights`: a model file larger than RAM is
+/// exactly the case where a sparse MoE working set makes the prefetch
+/// worthwhile.  Models that fit in RAM warm up fine on their own.
+fn model_larger_than_ram(model: &Path) -> bool {
+    match (model_file_size(model), total_ram_bytes()) {
+        (Some(file), Some(ram)) => {
+            tracing::info!(
+                "pin-hot-weights auto: model {:.1} GiB vs RAM {:.1} GiB — {}",
+                file as f64 / 2f64.powi(30),
+                ram as f64 / 2f64.powi(30),
+                if file > ram { "pinning on" } else { "pinning off (model fits in RAM)" }
+            );
+            file > ram
+        }
+        _ => {
+            tracing::info!("pin-hot-weights auto: cannot size model/RAM, leaving pinning off");
+            false
+        }
+    }
 }
 
 /// Build the NPU backend for a vendor plugin: process-isolated shim by
