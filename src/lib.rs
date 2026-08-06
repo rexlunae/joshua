@@ -48,7 +48,9 @@ pub mod types;
 #[cfg(feature = "tls")]
 pub use rustls;
 
-pub use engine::{find_gguf_in_dir, Engine, EngineOptions, HugePages, MmapMode, PageSize};
+pub use engine::{
+    find_gguf_in_dir, Engine, EngineOptions, HugePages, MlockMode, MmapMode, PageSize,
+};
 pub use error::{JoshuaError, Result};
 pub use types::{
     ChatMessage, EmbeddingRequest, EmbeddingResponse, GenerationOptions, UsageInfo,

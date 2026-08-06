@@ -21,7 +21,7 @@ use tracing_subscriber::EnvFilter;
 
 use joshua::{
     engine::Engine, server, types::GenerationOptions, ChatMessage, EngineOptions, HugePages,
-    MmapMode, PageSize,
+    MlockMode, MmapMode, PageSize,
 };
 
 /// Physical-memory backing for the model mapping (CLI form of [`HugePages`]).
@@ -50,6 +50,31 @@ impl From<HugePagesArg> for HugePages {
             HugePagesArg::Huge => HugePages::Explicit(PageSize::Default),
             HugePagesArg::TwoMb => HugePages::Explicit(PageSize::TwoMiB),
             HugePagesArg::OneGb => HugePages::Explicit(PageSize::OneGiB),
+        }
+    }
+}
+
+/// Values for `--mlock-hot-weights` (CLI form of [`MlockMode`]).
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum MlockArg {
+    /// Lock the hot set; degrade to advisory pinning (with a warning) when
+    /// the memlock limit is too low.
+    #[value(alias = "true")]
+    On,
+    /// Lock the hot set; fail the load when the memlock limit is too low.
+    #[value(alias = "strict")]
+    Required,
+    /// Do not lock (explicitly disable, overriding an env var).
+    #[value(alias = "false")]
+    Off,
+}
+
+impl From<MlockArg> for MlockMode {
+    fn from(arg: MlockArg) -> Self {
+        match arg {
+            MlockArg::On => MlockMode::On,
+            MlockArg::Required => MlockMode::Required,
+            MlockArg::Off => MlockMode::Off,
         }
     }
 }
@@ -98,10 +123,16 @@ enum Commands {
         #[arg(long, env = "JOSHUA_PIN_HOT_WEIGHTS", num_args = 0..=1, default_missing_value = "true")]
         pin_hot_weights: Option<bool>,
         /// Lock the always-touched weights into RAM (mlock).  Needs the
-        /// process memlock limit raised: systemd `LimitMEMLOCK=infinity`, or
-        /// `ulimit -l unlimited` before starting the server.
-        #[arg(long, env = "JOSHUA_MLOCK_HOT_WEIGHTS", default_value_t = false)]
-        mlock_hot_weights: bool,
+        /// process memlock limit to cover the hot set: `LimitMEMLOCK=infinity`
+        /// (systemd), `ulimit -l unlimited`, or /etc/security/limits.conf.
+        /// On a systemd *user* session the hard limit is inherited from the
+        /// login session, so a unit's LimitMEMLOCK alone is silently capped —
+        /// apply `sudo prlimit --pid <user manager pid> --memlock=-1:-1` for a
+        /// live fix, or re-login.  `=required` fails the load instead of
+        /// degrading when the limit is too low; the limit is checked before
+        /// any mlock attempt, with one warning naming limit vs required size.
+        #[arg(long, env = "JOSHUA_MLOCK_HOT_WEIGHTS", num_args = 0..=1, default_missing_value = "on", value_enum)]
+        mlock_hot_weights: Option<MlockArg>,
         /// NPU vendor plugin (a cdylib exporting the joshua_npu_* ABI).
         #[arg(long, env = "JOSHUA_NPU_PLUGIN")]
         npu_plugin: Option<PathBuf>,
@@ -167,9 +198,16 @@ enum Commands {
         #[arg(long, env = "JOSHUA_PIN_HOT_WEIGHTS", num_args = 0..=1, default_missing_value = "true")]
         pin_hot_weights: Option<bool>,
         /// Lock the always-touched weights into RAM (mlock).  Needs the
-        /// process memlock limit raised: `ulimit -l unlimited`.
-        #[arg(long, env = "JOSHUA_MLOCK_HOT_WEIGHTS", default_value_t = false)]
-        mlock_hot_weights: bool,
+        /// process memlock limit to cover the hot set: `LimitMEMLOCK=infinity`
+        /// (systemd), `ulimit -l unlimited`, or /etc/security/limits.conf.
+        /// On a systemd *user* session the hard limit is inherited from the
+        /// login session, so a unit's LimitMEMLOCK alone is silently capped —
+        /// apply `sudo prlimit --pid <user manager pid> --memlock=-1:-1` for a
+        /// live fix, or re-login.  `=required` fails the load instead of
+        /// degrading when the limit is too low; the limit is checked before
+        /// any mlock attempt, with one warning naming limit vs required size.
+        #[arg(long, env = "JOSHUA_MLOCK_HOT_WEIGHTS", num_args = 0..=1, default_missing_value = "on", value_enum)]
+        mlock_hot_weights: Option<MlockArg>,
         /// NPU vendor plugin (a cdylib exporting the joshua_npu_* ABI).
         #[arg(long, env = "JOSHUA_NPU_PLUGIN")]
         npu_plugin: Option<PathBuf>,
@@ -245,7 +283,7 @@ async fn main() -> anyhow::Result<()> {
                 .mmap(mmap_mode(mmap))
                 .lazy_weights(lazy_weights)
                 .pin_hot_weights(pin_hot)
-                .mlock_hot_weights(mlock_hot_weights);
+                .mlock_hot_weights(mlock_hot_weights.map(MlockMode::from).unwrap_or(MlockMode::Off));
             let mut engine = Engine::with_options(&model, opts)?;
             if let Some(plugin) = npu_plugin {
                 engine = engine.with_npu_backend(npu_backend(&plugin, npu_in_process)?);
@@ -313,7 +351,7 @@ async fn main() -> anyhow::Result<()> {
                 .mmap(mmap_mode(mmap))
                 .lazy_weights(lazy_weights)
                 .pin_hot_weights(pin_hot)
-                .mlock_hot_weights(mlock_hot_weights);
+                .mlock_hot_weights(mlock_hot_weights.map(MlockMode::from).unwrap_or(MlockMode::Off));
             let mut engine = Engine::with_options(&model, opts)?;
             if let Some(plugin) = npu_plugin {
                 engine = engine.with_npu_backend(npu_backend(&plugin, npu_in_process)?);
