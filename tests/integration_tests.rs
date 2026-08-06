@@ -614,6 +614,43 @@ mod synthetic {
     }
 
     #[test]
+    fn compressed_model_file_is_refused_when_mmap_is_explicit() {
+        use joshua::{EngineOptions, MmapMode};
+
+        let dir = model_dir("compressed-model");
+        let model = dir.join("model.gguf");
+        // A `.gguf` that is really a gzip stream: the bytes that would be
+        // mapped are the compressed ones, so no tensor can be read in place.
+        std::fs::write(&model, b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03junk").unwrap();
+
+        // Explicitly asking for mmap turns that into a load error naming the
+        // format and the fix, rather than a header-parse failure.
+        let err = joshua::Engine::with_options(
+            &dir,
+            EngineOptions::with_n_ctx(64).mmap(MmapMode::Required),
+        )
+        .map(|_| ())
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("gzip"), "unexpected error message: {msg}");
+        assert!(msg.contains("gunzip"), "unexpected error message: {msg}");
+
+        // Without the explicit request the check only warns, so the load gets
+        // as far as the GGUF header and fails there instead.
+        let err = joshua::Engine::with_n_ctx(&dir, 64).map(|_| ()).unwrap_err();
+        let msg = err.to_string();
+        assert!(!msg.contains("gunzip"), "unexpected error message: {msg}");
+        assert!(msg.contains("GGUF"), "unexpected error message: {msg}");
+
+        // A real model file passes the same check untouched.
+        write_tiny_gguf(&model, "llama");
+        joshua::Engine::with_options(&dir, EngineOptions::with_n_ctx(64).mmap(MmapMode::Required))
+            .expect("an uncompressed model loads with mmap required");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn image_path_sources_are_rejected_without_reading_files() {
         use joshua::{types::GenerationOptions, ChatMessage, Engine};
 

@@ -21,6 +21,7 @@
 //! A `tokenizer.json` from the model's HuggingFace repository must be placed
 //! alongside the `.gguf` file so the engine can tokenise prompts.
 
+pub mod compression;
 pub mod embedding;
 pub mod engine;
 pub mod error;
@@ -47,7 +48,7 @@ pub mod types;
 #[cfg(feature = "tls")]
 pub use rustls;
 
-pub use engine::{Engine, EngineOptions, HugePages, PageSize};
+pub use engine::{Engine, EngineOptions, HugePages, MmapMode, PageSize};
 pub use error::{JoshuaError, Result};
 pub use types::{
     ChatMessage, EmbeddingRequest, EmbeddingResponse, GenerationOptions, UsageInfo,

@@ -91,6 +91,15 @@ impl WhisperEngine {
             .map_err(|e| JoshuaError::ModelLoad(format!("whisper tokenizer load: {e}")))?;
 
         let weights = find_safetensors(dir)?;
+        // The weights are mapped, so the same compression traps apply as for a
+        // GGUF (see `crate::compression`).  There is no explicit mmap request
+        // to honour on this path, so an unmappable file is only ever a warning
+        // — candle's loader reports the resulting failure itself.
+        if let Ok(file) = std::fs::File::open(&weights) {
+            if let Some(found) = crate::compression::detect(&file, None) {
+                tracing::warn!("{weights:?} cannot be memory-mapped usefully: {found}.");
+            }
+        }
         let device = Device::Cpu;
         // SAFETY: same contract as the GGUF mmap — weight files are treated
         // as immutable once downloaded.

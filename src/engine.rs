@@ -20,6 +20,13 @@
 //! mapping of a chosen size (2 MiB / 1 GiB) for guaranteed huge pages at the
 //! cost of private RAM.
 //!
+//! Because that mapping is the whole loading strategy, the file is checked
+//! before it is mapped: a model that is really a gzip/zstd/… stream, or one
+//! the filesystem stores compressed, cannot be paged in usefully (see
+//! [`crate::compression`]).  It is reported as a warning by default and as a
+//! load error when the caller asked for mapping explicitly via
+//! [`EngineOptions::mmap`].
+//!
 //! # KV-cache sharing
 //!
 //! Finished requests park their model instance — including its populated KV
@@ -140,6 +147,24 @@ pub enum HugePages {
     Explicit(PageSize),
 }
 
+/// How firmly the caller is asking for the model to be memory-mapped.
+///
+/// Joshua always maps the model file; this only decides how loudly it
+/// complains when the file cannot usefully be mapped — because it is a
+/// compression container rather than raw GGUF, or because the filesystem
+/// stores it compressed (see [`crate::compression`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MmapMode {
+    /// Mapping is the implicit default, so a file that maps badly is reported
+    /// as a warning and the load continues (default).
+    #[default]
+    Auto,
+    /// The caller explicitly asked for `mmap`, so a file that cannot be mapped
+    /// usefully is an error: silently giving them a mapping that decompresses
+    /// on every page fault would defeat the point of asking.
+    Required,
+}
+
 /// Construction options for [`Engine`].
 ///
 /// Use [`Engine::with_options`] for full control; [`Engine::new`] and
@@ -170,6 +195,12 @@ pub struct EngineOptions {
     /// with a warning; [`HugePages::Transparent`] has no such conflict, since
     /// it keeps the mapping file-backed.
     pub lazy_weights: bool,
+    /// Whether memory mapping was explicitly requested.
+    ///
+    /// The mapping itself is unconditional either way; setting this to
+    /// [`MmapMode::Required`] turns "this file cannot usefully be mapped" from
+    /// a warning into a load error.
+    pub mmap: MmapMode,
 }
 
 impl EngineOptions {
@@ -190,6 +221,13 @@ impl EngineOptions {
     /// Optimise the mapping for a model much larger than RAM.
     pub fn lazy_weights(mut self, lazy: bool) -> Self {
         self.lazy_weights = lazy;
+        self
+    }
+
+    /// Ask for memory mapping explicitly, making an unmappable model file an
+    /// error instead of a warning.
+    pub fn mmap(mut self, mmap: MmapMode) -> Self {
+        self.mmap = mmap;
         self
     }
 }
@@ -458,7 +496,12 @@ impl Engine {
             .map_err(|e| JoshuaError::ModelLoad(format!("tokenizer load failed: {e}")))?;
 
         // Map the GGUF file into memory using the configured backing.
-        let mmap = map_model(&gguf_path, options.huge_pages, options.lazy_weights)?;
+        let mmap = map_model(
+            &gguf_path,
+            options.huge_pages,
+            options.lazy_weights,
+            options.mmap,
+        )?;
 
         // Read GGUF metadata once to validate the architecture up front and
         // extract EOS token IDs.  The tolerant reader keeps dtypes candle
@@ -1356,7 +1399,7 @@ fn load_image_bytes(source: &str) -> Result<Vec<u8>> {
 /// SAFETY (file-backed variants): the mapping is only undefined behaviour if
 /// the file is truncated or rewritten while mapped.  Model files are treated
 /// as immutable once downloaded, matching llama.cpp's own mmap usage.
-fn map_model(path: &Path, huge: HugePages, lazy: bool) -> Result<Mmap> {
+fn map_model(path: &Path, huge: HugePages, lazy: bool, mmap_mode: MmapMode) -> Result<Mmap> {
     let file = File::open(path)?;
 
     // Explicit huge pages use an anonymous copy; handle separately.
@@ -1375,9 +1418,12 @@ fn map_model(path: &Path, huge: HugePages, lazy: bool) -> Result<Mmap> {
                  --huge-pages transparent for huge pages that keep the mapping file-backed."
             );
         } else {
+            check_mappable(path, &file, mmap_mode, false)?;
             return map_model_hugetlb(path, &file, size);
         }
     }
+
+    check_mappable(path, &file, mmap_mode, true)?;
 
     let mmap = unsafe { Mmap::map(&file) }
         .map_err(|e| JoshuaError::ModelLoad(format!("mmap of GGUF file failed: {e}")))?;
@@ -1407,6 +1453,46 @@ fn map_model(path: &Path, huge: HugePages, lazy: bool) -> Result<Mmap> {
     }
 
     Ok(mmap)
+}
+
+/// Refuse — or at least complain about — a model file that `mmap` cannot serve
+/// usefully.
+///
+/// Compressed model files are the recurring trap: a `.gguf` that is really a
+/// gzip stream maps to compressed bytes and fails to parse at all, and a
+/// `.gguf` stored on a transparently compressing filesystem maps fine but
+/// decompresses a block on every page fault, which quietly costs most of what
+/// mmap-based loading buys.  Neither is visible from the filename.
+///
+/// `file_backed` says whether the mapping about to be created actually reads
+/// through the file: the explicit huge-page path copies the model into
+/// anonymous memory with one sequential pass, so filesystem compression costs
+/// it a single decompression rather than a per-fault one and is not worth
+/// reporting — a compression *container* is still fatal there, since the bytes
+/// copied in are not the model.
+///
+/// Under [`MmapMode::Required`] the caller asked for mapping explicitly, so
+/// this is an error; otherwise mapping is just the implicit default and the
+/// load continues with a warning.
+fn check_mappable(path: &Path, file: &File, mode: MmapMode, file_backed: bool) -> Result<()> {
+    let Some(found) = crate::compression::detect_gguf(file) else {
+        return Ok(());
+    };
+    if !file_backed && matches!(found, crate::compression::Compression::Filesystem { .. }) {
+        return Ok(());
+    }
+
+    let what = format!("{path:?} cannot be memory-mapped usefully: {found}");
+    match mode {
+        MmapMode::Required => Err(JoshuaError::ModelLoad(format!(
+            "{what}. Memory mapping was requested explicitly, so this is an error; \
+             drop the explicit mmap request to load the model anyway."
+        ))),
+        MmapMode::Auto => {
+            tracing::warn!("{what}.");
+            Ok(())
+        }
+    }
 }
 
 /// Load the model into an anonymous mapping backed by explicit huge pages.
@@ -1843,6 +1929,87 @@ mod tests {
         assert_eq!(o.n_ctx, 2048);
         assert_eq!(o.huge_pages, HugePages::Transparent);
         assert_eq!(EngineOptions::default().huge_pages, HugePages::Off);
+        // Mapping is implicit unless the caller asks for it by name.
+        assert_eq!(EngineOptions::default().mmap, MmapMode::Auto);
+        assert_eq!(
+            EngineOptions::default().mmap(MmapMode::Required).mmap,
+            MmapMode::Required
+        );
+    }
+
+    /// Write `bytes` to a temp file, returning its path and an open handle.
+    fn model_fixture(name: &str, bytes: &[u8]) -> (PathBuf, File) {
+        use std::io::Write;
+        let path =
+            std::env::temp_dir().join(format!("joshua-mapcheck-{}-{name}", std::process::id()));
+        let mut f = File::create(&path).expect("create fixture");
+        f.write_all(bytes).expect("write fixture");
+        drop(f);
+        let opened = File::open(&path).expect("open fixture");
+        (path, opened)
+    }
+
+    #[test]
+    fn compressed_model_warns_by_default_and_errors_when_mmap_is_explicit() {
+        // A gzip stream that happens to be named `.gguf`.
+        let (path, file) = model_fixture("gz.gguf", b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03");
+
+        // Implicit mapping: complain in the log, but let the load proceed and
+        // fail (or not) on its own terms.
+        check_mappable(&path, &file, MmapMode::Auto, true).expect("warn, not fail");
+
+        // Explicit request: refuse, naming the format and the way out.
+        let err = check_mappable(&path, &file, MmapMode::Required, true).unwrap_err();
+        assert!(matches!(err, JoshuaError::ModelLoad(_)));
+        let msg = err.to_string();
+        assert!(msg.contains("gzip"), "got: {msg}");
+        assert!(msg.contains("gunzip"), "got: {msg}");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn plain_model_file_passes_the_mappability_check() {
+        let (path, file) = model_fixture("plain.gguf", b"GGUF\x03\x00\x00\x00");
+        check_mappable(&path, &file, MmapMode::Auto, true).expect("plain GGUF is fine");
+        check_mappable(&path, &file, MmapMode::Required, true).expect("plain GGUF is fine");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Filesystem-level compression only matters for a mapping that faults
+    /// through the file; the huge-page path copies the model in one pass.
+    #[cfg(unix)]
+    #[test]
+    fn filesystem_compression_is_ignored_for_the_anonymous_copy() {
+        let path = std::env::temp_dir().join(format!(
+            "joshua-mapcheck-{}-sparse.gguf",
+            std::process::id()
+        ));
+        let mut f = File::create(&path).expect("create sparse fixture");
+        // A written prefix plus a hole for the rest: allocation-poor in the
+        // same way a transparently compressed file is, and creatable anywhere.
+        std::io::Write::write_all(&mut f, &[0x5Au8; 64 * 1024]).expect("write prefix");
+        f.set_len(64 * 1024 * 1024).expect("set_len");
+        drop(f);
+        let file = File::open(&path).expect("open sparse fixture");
+
+        // Not every filesystem reports a sparse allocation; skip where the
+        // condition under test cannot be created.
+        if !matches!(
+            crate::compression::detect_gguf(&file),
+            Some(crate::compression::Compression::Filesystem { .. })
+        ) {
+            let _ = std::fs::remove_file(&path);
+            return;
+        }
+
+        // Anonymous copy: not this check's problem, even when mmap is required.
+        check_mappable(&path, &file, MmapMode::Required, false).expect("copy path is unaffected");
+        // File-backed mapping: warn by default, refuse when asked explicitly.
+        check_mappable(&path, &file, MmapMode::Auto, true).expect("warn, not fail");
+        assert!(check_mappable(&path, &file, MmapMode::Required, true).is_err());
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

@@ -21,7 +21,7 @@ use tracing_subscriber::EnvFilter;
 
 use joshua::{
     engine::Engine, server, types::GenerationOptions, ChatMessage, EngineOptions, HugePages,
-    PageSize,
+    MmapMode, PageSize,
 };
 
 /// Physical-memory backing for the model mapping (CLI form of [`HugePages`]).
@@ -81,6 +81,11 @@ enum Commands {
         /// 2mb, or 1gb (Linux only for the huge-page modes).
         #[arg(long, value_enum, default_value_t = HugePagesArg::Off)]
         huge_pages: HugePagesArg,
+        /// Require the model to be memory-mappable: a compressed model file
+        /// (a gzip/zstd/... stream, or one the filesystem stores compressed)
+        /// becomes a load error instead of a warning.
+        #[arg(long, default_value_t = false)]
+        mmap: bool,
         /// NPU vendor plugin (a cdylib exporting the joshua_npu_* ABI).
         #[arg(long, env = "JOSHUA_NPU_PLUGIN")]
         npu_plugin: Option<PathBuf>,
@@ -131,6 +136,11 @@ enum Commands {
         /// 2mb, or 1gb (Linux only for the huge-page modes).
         #[arg(long, value_enum, default_value_t = HugePagesArg::Off)]
         huge_pages: HugePagesArg,
+        /// Require the model to be memory-mappable: a compressed model file
+        /// (a gzip/zstd/... stream, or one the filesystem stores compressed)
+        /// becomes a load error instead of a warning.
+        #[arg(long, default_value_t = false)]
+        mmap: bool,
         /// NPU vendor plugin (a cdylib exporting the joshua_npu_* ABI).
         #[arg(long, env = "JOSHUA_NPU_PLUGIN")]
         npu_plugin: Option<PathBuf>,
@@ -178,6 +188,7 @@ async fn main() -> anyhow::Result<()> {
             addr,
             n_ctx,
             huge_pages,
+            mmap,
             npu_plugin,
             npu_in_process,
             whisper_model,
@@ -196,7 +207,9 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
 
-            let opts = EngineOptions::with_n_ctx(n_ctx).huge_pages(huge_pages.into());
+            let opts = EngineOptions::with_n_ctx(n_ctx)
+                .huge_pages(huge_pages.into())
+                .mmap(mmap_mode(mmap));
             let mut engine = Engine::with_options(&model, opts)?;
             if let Some(plugin) = npu_plugin {
                 engine = engine.with_npu_backend(npu_backend(&plugin, npu_in_process)?);
@@ -251,10 +264,13 @@ async fn main() -> anyhow::Result<()> {
             temperature,
             n_ctx,
             huge_pages,
+            mmap,
             npu_plugin,
             npu_in_process,
         } => {
-            let opts = EngineOptions::with_n_ctx(n_ctx).huge_pages(huge_pages.into());
+            let opts = EngineOptions::with_n_ctx(n_ctx)
+                .huge_pages(huge_pages.into())
+                .mmap(mmap_mode(mmap));
             let mut engine = Engine::with_options(&model, opts)?;
             if let Some(plugin) = npu_plugin {
                 engine = engine.with_npu_backend(npu_backend(&plugin, npu_in_process)?);
@@ -291,6 +307,17 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Translate the `--mmap` flag: passing it makes memory mapping an explicit
+/// request, so a model file that cannot be mapped usefully fails the load
+/// instead of merely warning.
+fn mmap_mode(explicit: bool) -> MmapMode {
+    if explicit {
+        MmapMode::Required
+    } else {
+        MmapMode::Auto
+    }
 }
 
 /// Build the NPU backend for a vendor plugin: process-isolated shim by
