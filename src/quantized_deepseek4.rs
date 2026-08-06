@@ -415,6 +415,23 @@ struct Mlp {
     up: QMatMul,
     down: QMatMul,
     clamp: f64,
+    /// When the weights are borrowed from the model mapping, handles that
+    /// can `MADV_WILLNEED` the gate/up/down byte ranges ahead of a matmul.
+    /// `None` for streamed/fallback loads (weights are plain memory then).
+    prefetch: Option<MlpPrefetch>,
+}
+
+struct MlpPrefetch {
+    gate: Arc<dyn crate::mmap_tensor::MmapPrefetch>,
+    up: Arc<dyn crate::mmap_tensor::MmapPrefetch>,
+    down: Arc<dyn crate::mmap_tensor::MmapPrefetch>,
+}
+
+/// One expert's weight tensor: the [`QMatMul`] plus an optional handle for
+/// prefetching its byte range from the mapping.
+struct ExpertTensor {
+    qmatmul: QMatMul,
+    prefetch: Option<Arc<dyn crate::mmap_tensor::MmapPrefetch>>,
 }
 
 impl Mlp {
@@ -427,6 +444,16 @@ impl Mlp {
         }
         let h = (silu(&gate)? * up)?;
         self.down.forward(&h)
+    }
+
+    /// Ask the kernel to prefetch this expert's weight pages (best effort;
+    /// no-op when the weights are not mmap-backed).
+    fn prefetch(&self) {
+        if let Some(p) = &self.prefetch {
+            p.gate.prefetch();
+            p.up.prefetch();
+            p.down.prefetch();
+        }
     }
 }
 
@@ -1366,6 +1393,18 @@ impl Moe {
         let ids: Vec<u32> = indices.flatten_all()?.to_vec1()?;
         let wts: Vec<f32> = weights.flatten_all()?.to_vec1()?;
 
+        // The gate has just told us which experts this token needs.  Each
+        // expert's weights are a contiguous run inside the model mapping, so
+        // `MADV_WILLNEED` turns the scattered page faults that would otherwise
+        // stall the expert matmuls into sequential background reads — the
+        // kernel streams the selected experts while the first matmul runs.
+        // Idempotent and best-effort (a no-op for non-mmap loads).
+        for e in &ids {
+            if let Some(exp) = self.experts.get(*e as usize) {
+                exp.prefetch();
+            }
+        }
+
         let mut per_expert: Vec<Vec<(u32, f32)>> = vec![Vec::new(); self.experts.len()];
         for t in 0..n_tokens {
             for s in 0..k {
@@ -1925,6 +1964,23 @@ impl ModelWeights {
         logits.to_dtype(DType::F32)
     }
 
+    /// Number of routed experts whose weights are mmap-backed (and therefore
+    /// prefetchable) vs the total, for diagnostics.
+    pub fn mmap_backed_experts(&self) -> (usize, usize) {
+        let (mut backed, mut total) = (0, 0);
+        for layer in &self.layers {
+            if let FeedForward::Moe(moe) = &layer.ffn {
+                for e in &moe.experts {
+                    total += 1;
+                    if e.prefetch.is_some() {
+                        backed += 1;
+                    }
+                }
+            }
+        }
+        (backed, total)
+    }
+
     /// Reset the KV caches so this instance can serve an unrelated prompt.
     pub fn clear_kv_cache(&mut self) {
         let dev = self.device.clone();
@@ -1944,7 +2000,7 @@ fn split_iq2xxs_experts<R: Read + Seek>(
     name: &str,
     info: &crate::gguf_ext::RawTensorInfo,
     n_expert: usize,
-) -> Result<Vec<QMatMul>> {
+) -> Result<Vec<ExpertTensor>> {
     let dims = info.dims.clone();
     if dims.len() != 3 || dims[0] != n_expert {
         candle_core::bail!(
@@ -1979,7 +2035,14 @@ fn split_iq2xxs_experts<R: Read + Seek>(
                 base + e * per_bytes,
                 (out, inn).into(),
             )? {
-                Some(qt) => experts.push(QMatMul::from_qtensor(qt)?),
+                Some(qt) => experts.push(ExpertTensor {
+                    qmatmul: QMatMul::from_qtensor(qt)?,
+                    prefetch: crate::mmap_tensor::prefetch_handle_iq2xxs(
+                        mmap,
+                        base + e * per_bytes,
+                        per_elems / crate::iq2xxs::QK_IQ2_XXS,
+                    ),
+                }),
                 None => {
                     experts.clear();
                     break;
@@ -2016,10 +2079,13 @@ fn split_iq2xxs_experts<R: Read + Seek>(
             (out, inn),
             &rd.device,
         )?;
-        experts.push(QMatMul::from_qtensor(QTensor::quantize(
-            &t,
-            GgmlDType::F32,
-        )?)?);
+        experts.push(ExpertTensor {
+            qmatmul: QMatMul::from_qtensor(QTensor::quantize(
+                &t,
+                GgmlDType::F32,
+            )?)?,
+            prefetch: None,
+        });
     }
     Ok(experts)
 }
@@ -2067,11 +2133,22 @@ fn load_moe<R: Read + Seek>(
         .into_iter()
         .zip(up_exps)
         .zip(down_exps)
-        .map(|((gate, up), down)| Mlp {
-            gate,
-            up,
-            down,
-            clamp,
+        .map(|((gate, up), down)| {
+            let prefetch = match (&gate.prefetch, &up.prefetch, &down.prefetch) {
+                (Some(g), Some(u), Some(d)) => Some(MlpPrefetch {
+                    gate: g.clone(),
+                    up: u.clone(),
+                    down: d.clone(),
+                }),
+                _ => None,
+            };
+            Mlp {
+                gate: gate.qmatmul,
+                up: up.qmatmul,
+                down: down.qmatmul,
+                clamp,
+                prefetch,
+            }
         })
         .collect();
 
@@ -2081,6 +2158,7 @@ fn load_moe<R: Read + Seek>(
             up: rd.qmatmul(&format!("{p}.ffn_up_shexp.weight"))?,
             down: rd.qmatmul(&format!("{p}.ffn_down_shexp.weight"))?,
             clamp: cfg.swiglu_clamp_shexp.get(layer).copied().unwrap_or(0.0),
+            prefetch: None,
         })
     } else {
         None
@@ -2104,7 +2182,7 @@ fn split_experts<R: Read + Seek>(
     rd: &mut Reader<R>,
     name: &str,
     n_expert: usize,
-) -> Result<Vec<QMatMul>> {
+) -> Result<Vec<ExpertTensor>> {
     // IQ2_XXS expert tensors (how DeepSeek-V4-Flash GGUFs store gate/up):
     // candle cannot represent the dtype, so slice per-expert block ranges
     // straight out of the mapping and let `crate::iq2xxs` decode at matmul
@@ -2141,7 +2219,15 @@ fn split_experts<R: Read + Seek>(
                         base + e * per_bytes,
                         (out, inn).into(),
                     )? {
-                        Some(t) => borrowed.push(QMatMul::from_qtensor(t)?),
+                        Some(t) => borrowed.push(ExpertTensor {
+                            qmatmul: QMatMul::from_qtensor(t)?,
+                            prefetch: crate::mmap_tensor::prefetch_handle(
+                                &mmap,
+                                dtype,
+                                base + e * per_bytes,
+                                per_elems / block_size,
+                            ),
+                        }),
                         None => {
                             borrowed.clear();
                             break;
@@ -2168,7 +2254,10 @@ fn split_experts<R: Read + Seek>(
         let slice = &bytes[e * per..(e + 1) * per];
         let storage = QStorage::from_data(Cow::Borrowed(slice), &rd.device, dtype)?;
         let qt = QTensor::new(storage, (out, inn))?;
-        experts.push(QMatMul::from_qtensor(qt)?);
+        experts.push(ExpertTensor {
+            qmatmul: QMatMul::from_qtensor(qt)?,
+            prefetch: None,
+        });
     }
     Ok(experts)
 }

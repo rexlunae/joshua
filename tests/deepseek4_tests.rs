@@ -43,6 +43,35 @@ fn logits(model: &mut QuantizedModel, tokens: &[u32], offset: usize) -> Vec<f32>
         .unwrap()
 }
 
+/// The mmap load path must wire up prefetch handles for every routed expert
+/// (their weights live in the mapping), and the streamed path must not.
+#[test]
+fn deepseek4_mmap_path_wires_expert_prefetch_handles() {
+    let dir = common::model_dir("deepseek4-prefetch");
+    let model = dir.join("model.gguf");
+    common::write_tiny_deepseek4_gguf(&model);
+
+    let mmapped = load(&model, true);
+    let (backed, total) = match &mmapped {
+        QuantizedModel::DeepSeek4(w) => w.mmap_backed_experts(),
+        _ => panic!("expected DeepSeek4 model"),
+    };
+    assert!(total > 0, "tiny model must have routed experts");
+    assert_eq!(
+        backed, total,
+        "mmap path should borrow every routed expert ({backed}/{total})"
+    );
+
+    let streamed = load(&model, false);
+    let (backed, total) = match &streamed {
+        QuantizedModel::DeepSeek4(w) => w.mmap_backed_experts(),
+        _ => panic!("expected DeepSeek4 model"),
+    };
+    assert_eq!(backed, 0, "streamed path has no mapping ({backed}/{total})");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn deepseek4_is_a_supported_architecture() {
     assert_eq!(
