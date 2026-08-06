@@ -58,6 +58,30 @@ pub struct MmapBlocks<T: GgmlType> {
     _marker: PhantomData<T>,
 }
 
+/// A handle that can ask the kernel to prefetch a borrowed block range into
+/// the page cache.
+///
+/// The routed experts of a MoE are contiguous runs inside the model mapping,
+/// so once the gate has picked the experts a token needs, `MADV_WILLNEED` on
+/// each selected run turns the scattered page faults that would otherwise
+/// stall the expert matmuls (each 4 KiB fault is an independent random read)
+/// into sequential background streams the kernel reads ahead at full device
+/// bandwidth.
+pub trait MmapPrefetch: Send + Sync + 'static {
+    /// Issue a best-effort `MADV_WILLNEED` for this block range.  Never
+    /// blocks and never fails the caller.
+    fn prefetch(&self);
+}
+
+impl<T: GgmlType + 'static> MmapPrefetch for MmapBlocks<T> {
+    fn prefetch(&self) {
+        let base = self._mmap.as_ptr() as usize;
+        let off = self.ptr as usize - base;
+        let len = self.len * std::mem::size_of::<T>();
+        let _ = self._mmap.advise_range(memmap2::Advice::WillNeed, off, len);
+    }
+}
+
 // SAFETY: the mapping is read-only and the file is immutable for the lifetime
 // of the process, so the pointed-to blocks are never mutated or moved.  `_mmap`
 // keeps the mapping alive for at least as long as `ptr` is valid, and `T` is
@@ -197,6 +221,15 @@ pub struct MmapBlocksIq2Xxs {
 unsafe impl Send for MmapBlocksIq2Xxs {}
 unsafe impl Sync for MmapBlocksIq2Xxs {}
 
+impl MmapPrefetch for MmapBlocksIq2Xxs {
+    fn prefetch(&self) {
+        let base = self._mmap.as_ptr() as usize;
+        let off = self.ptr as usize - base;
+        let len = self.len * crate::iq2xxs::BLOCK_BYTES;
+        let _ = self._mmap.advise_range(memmap2::Advice::WillNeed, off, len);
+    }
+}
+
 impl MmapBlocksIq2Xxs {
     fn blocks(&self) -> &[crate::iq2xxs::BlockIq2Xxs] {
         // SAFETY: bounds- and alignment-checked in `borrow` (alignment is 1
@@ -220,6 +253,53 @@ impl MmapBlocksIq2Xxs {
             len: n_blocks,
         })
     }
+}
+
+/// Prefetch handle for `n_blocks` k-quant blocks at `byte_offset` in `mmap`.
+///
+/// Re-borrows the range with the same bounds/alignment checks as
+/// [`MmapBlocks::borrow`]; returns `None` exactly when a borrow would be
+/// declined, so callers can pair it with the borrow they already performed.
+/// The `dtype` picks the block type, mirroring [`borrowed_range`].
+pub fn prefetch_handle(
+    mmap: &Arc<Mmap>,
+    dtype: GgmlDType,
+    byte_offset: usize,
+    n_blocks: usize,
+) -> Option<Arc<dyn MmapPrefetch>> {
+    macro_rules! handle {
+        ($ty:ty) => {
+            MmapBlocks::<$ty>::borrow(mmap, byte_offset, n_blocks)
+                .map(|b| Arc::new(b) as Arc<dyn MmapPrefetch>)
+        };
+    }
+    match dtype {
+        GgmlDType::F32 => handle!(f32),
+        GgmlDType::F16 => handle!(f16),
+        GgmlDType::BF16 => handle!(bf16),
+        GgmlDType::Q4_0 => handle!(k_quants::BlockQ4_0),
+        GgmlDType::Q4_1 => handle!(k_quants::BlockQ4_1),
+        GgmlDType::Q5_0 => handle!(k_quants::BlockQ5_0),
+        GgmlDType::Q5_1 => handle!(k_quants::BlockQ5_1),
+        GgmlDType::Q8_0 => handle!(k_quants::BlockQ8_0),
+        GgmlDType::Q8_1 => handle!(k_quants::BlockQ8_1),
+        GgmlDType::Q2K => handle!(k_quants::BlockQ2K),
+        GgmlDType::Q3K => handle!(k_quants::BlockQ3K),
+        GgmlDType::Q4K => handle!(k_quants::BlockQ4K),
+        GgmlDType::Q5K => handle!(k_quants::BlockQ5K),
+        GgmlDType::Q6K => handle!(k_quants::BlockQ6K),
+        GgmlDType::Q8K => handle!(k_quants::BlockQ8K),
+    }
+}
+
+/// Prefetch handle for `n_blocks` IQ2_XXS blocks; see [`prefetch_handle`].
+pub fn prefetch_handle_iq2xxs(
+    mmap: &Arc<Mmap>,
+    byte_offset: usize,
+    n_blocks: usize,
+) -> Option<Arc<dyn MmapPrefetch>> {
+    MmapBlocksIq2Xxs::borrow(mmap, byte_offset, n_blocks)
+        .map(|b| Arc::new(b) as Arc<dyn MmapPrefetch>)
 }
 
 impl QuantizedType for MmapBlocksIq2Xxs {
