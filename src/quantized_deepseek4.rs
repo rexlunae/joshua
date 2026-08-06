@@ -1188,8 +1188,11 @@ impl Attention {
         let den = e
             .sum_keepdim(D::Minus1)?
             .add(&sink.broadcast_sub(&max)?.exp()?)?; // [seq, h, 1]
-        let num = e.unsqueeze(2)?.broadcast_matmul(&k_all.unsqueeze(1)?)?; // [seq, h, 1, n_kv] @ [seq, 1, n_kv, d] → [seq, h, 1, d]
-        let o = num.broadcast_div(&den.unsqueeze(D::Minus1)?)?.squeeze(2)?; // [seq, h, d]
+
+        // Batched over `seq`; a broadcast_matmul here would materialize the
+        // whole key block once per head.
+        let num = e.contiguous()?.matmul(&k_all)?; // [seq, h, n_kv] @ [seq, n_kv, d] → [seq, h, d]
+        let o = num.broadcast_div(&den)?; // [seq, h, d]
 
         // Derope the output's trailing slice.
         let o4 = o.unsqueeze(0)?.transpose(1, 2)?; // [1, h, seq, d]
