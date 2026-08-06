@@ -177,11 +177,14 @@ fn matmul_kquant_impl<T: GgmlType>(
     k_quants::matmul((m, k, n), lhs, blocks, dst)
 }
 
-/// AVX2/FMA fast path for [`matmul_kquant_impl`]: dequantize each weight row
-/// once, then dot it against every activation row with 8-lane FMA.  Returns
-/// `true` if it ran.  The kernel is `#[cfg(target_arch = "x86_64")]`, so the
-/// whole branch lives behind the same cfg here — on other targets (aarch64,
-/// wasm, ...) this stub returns `false` and callers use the portable path.
+/// AVX2/FMA fast path for [`matmul_kquant_impl`]: for the block types the
+/// model actually uses (Q8_0, Q2_K, Q4_K) this delegates to the *fused*
+/// kernels in [`crate::kquant_dot`] — the quantized blocks are decoded
+/// inside the dot in 8-lane registers, so no f32 weight row is ever
+/// materialized (the same design as the IQ2_XXS path).  Other k-quant types
+/// fall back to the generic path below: dequantize each weight row once
+/// into an f32 scratch, then dot it against every activation row with
+/// 8-lane FMA.  Returns `true` if a kernel ran.
 #[cfg(target_arch = "x86_64")]
 fn try_avx2_kquant<T: GgmlType>(
     mkn: (usize, usize, usize),
@@ -194,6 +197,18 @@ fn try_avx2_kquant<T: GgmlType>(
     let (m, k, n) = mkn;
     if !(crate::simd::avx2_fma_available() && k.is_multiple_of(8)) {
         return false;
+    }
+    // SAFETY: `blocks` is `n * blocks_per_row` T-blocks; reinterpreting it
+    // as bytes is always sound (the fused kernels re-cast to their own
+    // packed block structs, whose sizes are asserted to match candle's).
+    let block_bytes = unsafe {
+        std::slice::from_raw_parts(
+            blocks.as_ptr() as *const u8,
+            std::mem::size_of_val(blocks),
+        )
+    };
+    if crate::kquant_dot::try_matmul_fused_avx2(T::DTYPE, mkn, lhs, block_bytes, dst, parallel) {
+        return true;
     }
     let dst_ptr = crate::simd::DstPtr::new(dst);
     let worker = move |rows: &[usize]| {
