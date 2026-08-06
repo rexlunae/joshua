@@ -301,6 +301,47 @@ a preconfigured hugepage pool (`vm.nr_hugepages`, or `hugeadm` for 1 GiB pages).
 
 ---
 
+## Compressed model files
+
+Mapping only works when the bytes on disk *are* the model, and there are two
+common ways for that to stop being true — neither of them visible from the
+filename:
+
+* the `.gguf` is really a **gzip/zstd/xz/… stream** (a download that was never
+  unpacked).  Mapping it maps the compressed bytes, so nothing in the mapping
+  is a tensor and the load fails — historically with a baffling magic-mismatch
+  error from the header parser;
+* the `.gguf` sits on a **transparently compressing filesystem** (btrfs/ZFS
+  `compress=…`, NTFS compression).  The mapping works, which is why this one
+  goes unnoticed, but every page fault has to decompress a block instead of
+  handing back a shared page-cache page, and loading and inference get
+  dramatically slower.
+
+Joshua checks for both before mapping and reports what it found, naming the
+format and the way out:
+
+```text
+WARN "./weights/model.gguf" cannot be memory-mapped usefully: the file is a
+     gzip stream, not raw GGUF — mapping it maps the compressed bytes, so no
+     tensor can be read in place. Decompress it first (gunzip).
+```
+
+By default that is a warning and the load continues.  Pass `--mmap` (or
+`EngineOptions::mmap(MmapMode::Required)`) to say that mapping is the point of
+the run: the same finding then fails the load instead, rather than silently
+handing you a mapping that decompresses on every page fault.
+
+```bash
+joshua serve --model ./weights/model.gguf --mmap
+```
+
+Filesystem compression is detected from the file's on-disk allocation, so a
+model stored sparsely reports the same way — equally bad news for a mapping.
+It is not reported for `--huge-pages 2mb/1gb/huge`, which copy the model into
+anonymous memory in one pass and pay for the decompression only once.
+
+---
+
 ## Environment variables
 
 | Variable | Description |
