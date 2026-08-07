@@ -54,6 +54,11 @@ const HCA_RATIO: usize = 128;
 const CSA_RATIO: usize = 4;
 /// Hard cap on the KV context (and rope tables) per model instance.
 const KV_CAP: usize = 262_144;
+/// Minimum prompt length for the layer-ahead expert prefetch to engage
+/// (shorter prompts don't justify streaming whole layers).
+const PREFETCH_AHEAD_MIN: usize = 8;
+/// How many layers ahead to prefetch at each layer start.
+const PREFETCH_AHEAD_DEPTH: usize = 3;
 
 /// Parsed `deepseek4` hyper-parameters.
 struct Config {
@@ -435,15 +440,39 @@ struct ExpertTensor {
 }
 
 impl Mlp {
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let mut gate = self.gate.forward(xs)?;
-        let mut up = self.up.forward(xs)?;
+    /// Gate projection + optional clamp.  Split out of [`Mlp::forward`] so
+    /// the MoE dispatch can run all experts' gates (then all ups, then all
+    /// downs) — reading each weight tensor as one sequential stream instead
+    /// of jumping between gate/up/down on every expert.
+    fn gate_forward(&self, xs: &Tensor) -> Result<Tensor> {
+        let gate = self.gate.forward(xs)?;
         if self.clamp > 0.0 {
-            gate = gate.clamp(f64::NEG_INFINITY, self.clamp)?;
-            up = up.clamp(-self.clamp, self.clamp)?;
+            gate.clamp(f64::NEG_INFINITY, self.clamp)
+        } else {
+            Ok(gate)
         }
+    }
+
+    /// Up projection + optional clamp (see [`Mlp::gate_forward`]).
+    fn up_forward(&self, xs: &Tensor) -> Result<Tensor> {
+        let up = self.up.forward(xs)?;
+        if self.clamp > 0.0 {
+            up.clamp(-self.clamp, self.clamp)
+        } else {
+            Ok(up)
+        }
+    }
+
+    /// Combine `silu(gate) * up` and run the down projection.
+    fn combine_and_down(&self, gate: Tensor, up: Tensor) -> Result<Tensor> {
         let h = (silu(&gate)? * up)?;
         self.down.forward(&h)
+    }
+
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        let gate = self.gate_forward(xs)?;
+        let up = self.up_forward(xs)?;
+        self.combine_and_down(gate, up)
     }
 
     /// Ask the kernel to prefetch this expert's weight pages (best effort;
@@ -1417,18 +1446,49 @@ impl Moe {
 
         let dev = x2.device();
         let mut y = Tensor::zeros((n_tokens, h), DType::F32, dev)?;
+        // Select each expert's input rows once; all three phases reuse them.
+        let mut sel: Vec<Option<(Vec<u32>, Tensor)>> = Vec::with_capacity(self.experts.len());
         for (e, bucket) in per_expert.iter().enumerate() {
             if bucket.is_empty() {
+                sel.push(None);
                 continue;
             }
             let token_idx: Vec<u32> = bucket.iter().map(|(t, _)| *t).collect();
-            let w: Vec<f32> = bucket.iter().map(|(_, w)| *w).collect();
             let count = token_idx.len();
-            let idx = Tensor::from_vec(token_idx, count, dev)?;
-            let x_sel = x2.index_select(&idx, 0)?;
-            let out = self.experts[e].forward(&x_sel)?;
-            let w = Tensor::from_vec(w, (count, 1), dev)?;
-            y = y.index_add(&idx, &out.broadcast_mul(&w)?, 0)?;
+            let idx = Tensor::from_vec(token_idx.clone(), count, dev)?;
+            sel.push(Some((token_idx, x2.index_select(&idx, 0)?)));
+        }
+
+        // Tensor-major MoE: run every expert's gate, then every expert's up,
+        // then every expert's down.  Reads of a weight tensor are one
+        // sequential pass over the selected experts instead of jumping
+        // between gate/up/down regions on each expert — the kernel's
+        // readahead streams each tensor at full device bandwidth, which is
+        // what the disk-bound prefill path needs.  Gate/up outputs for the
+        // whole batch are a few hundred KiB.
+        let mut gates: Vec<Option<Tensor>> = vec![None; self.experts.len()];
+        for (e, s) in sel.iter().enumerate() {
+            if let Some((_, x_sel)) = s {
+                gates[e] = Some(self.experts[e].gate_forward(x_sel)?);
+            }
+        }
+        let mut ups: Vec<Option<Tensor>> = vec![None; self.experts.len()];
+        for (e, s) in sel.iter().enumerate() {
+            if let Some((_, x_sel)) = s {
+                ups[e] = Some(self.experts[e].up_forward(x_sel)?);
+            }
+        }
+        for (e, s) in sel.iter().enumerate() {
+            if let Some((token_idx, _)) = s {
+                let out = self.experts[e].combine_and_down(
+                    gates[e].take().expect("gate ran"),
+                    ups[e].take().expect("up ran"),
+                )?;
+                let idx = Tensor::from_vec(token_idx.clone(), token_idx.len(), dev)?;
+                let w: Vec<f32> = per_expert[e].iter().map(|(_, w)| *w).collect();
+                let w = Tensor::from_vec(w, (token_idx.len(), 1), dev)?;
+                y = y.index_add(&idx, &out.broadcast_mul(&w)?, 0)?;
+            }
         }
         Ok(y)
     }
@@ -1483,6 +1543,11 @@ pub struct ModelWeights {
     hc_eps: f64,
     max_seq: usize,
     device: Device,
+    /// The model mapping, retained so prefill can prefetch whole layers.
+    mmap: Option<std::sync::Arc<memmap2::Mmap>>,
+    /// Per-layer expert byte ranges in the mapping (see
+    /// [`crate::gguf_ext::GgufHeader::layer_expert_ranges`]).
+    layer_expert_ranges: Vec<Option<(usize, usize)>>,
 }
 
 /// Small GGUF reader over the memory-mapped file.
@@ -1873,6 +1938,13 @@ impl ModelWeights {
         let hc_mult = cfg.hc_mult;
         let hc_eps = cfg.hc_eps;
 
+        let layer_expert_ranges = rd
+            .raw
+            .as_ref()
+            .map(|r| r.layer_expert_ranges(cfg.n_layer))
+            .unwrap_or_default();
+        let mmap = rd.mmap.clone();
+
         Ok(Self {
             tok_embeddings,
             layers,
@@ -1887,6 +1959,8 @@ impl ModelWeights {
             hc_eps,
             max_seq: kv_cap,
             device: device.clone(),
+            mmap,
+            layer_expert_ranges,
         })
     }
 
@@ -1904,7 +1978,49 @@ impl ModelWeights {
         // Expand to hc copies.
         let mut xs = tok.unsqueeze(2)?.broadcast_as((1, seq_len, hc, d))?;
 
+        let profile = std::env::var_os("JOSHUA_PROFILE_LAYERS").is_some();
+        let mut prof = if profile {
+            Some((Vec::with_capacity(self.layers.len()), Vec::with_capacity(self.layers.len()), Vec::with_capacity(self.layers.len())))
+        } else {
+            None
+        };
+
+        // Prefill reads ~1.35 GB of routed-expert weights per layer.  The
+        // dispatch-level prefetch covers the current layer's *selected*
+        // experts but fires right before the expert loop — no head start, so
+        // the matmuls still stall on page faults.  For real prefill
+        // (seq_len ≥ PREFETCH_AHEAD_MIN), kick off the WILLNEED streams for
+        // this and the next two layers up front: the kernel reads them
+        // sequentially while the layer computes, and by the time the next
+        // layers' MoE runs their pages are resident.
+        let prefetch_layers = seq_len >= PREFETCH_AHEAD_MIN
+            && !self.layer_expert_ranges.is_empty()
+            && self.mmap.is_some();
+
         for (i, layer) in self.layers.iter_mut().enumerate() {
+            let t_layer = std::time::Instant::now();
+            if i == 0 && prefetch_layers {
+                if let Some(mmap) = &self.mmap {
+                    // The lazy-weights path advises MADV_RANDOM over the
+                    // whole mapping, which disables kernel readahead: every
+                    // demand fault is a single 4 KiB page read (~175 MB/s
+                    // effective).  Prefill walks the expert ranges in file
+                    // order, so switch the whole expert span to SEQUENTIAL —
+                    // one call — and the kernel's sequential detector streams
+                    // it at full device bandwidth (1.9 GB/s here) while the
+                    // layer loop computes.  The tensor-major MoE dispatch
+                    // below then reads each expert tensor as one clean pass.
+                    if let (Some(Some((b0, _))), Some(Some((_, eN)))) = (
+                        self.layer_expert_ranges.first(),
+                        self.layer_expert_ranges.last(),
+                    ) {
+                        let span = eN.saturating_sub(*b0);
+                        if span > 0 && *eN <= mmap.len() {
+                            let _ = mmap.advise_range(memmap2::Advice::Sequential, *b0, span);
+                        }
+                    }
+                }
+            }
             // hc_pre with attention weights
             let (x, post, comb) = hc_pre(
                 &xs,
@@ -1920,6 +2036,10 @@ impl ModelWeights {
                 .attn
                 .forward(&mut self.kv[i], &h, offset, self.max_seq)?;
             xs = hc_post(&h, &residual, &post, &comb)?;
+            if let Some((a, _, _)) = prof.as_mut() {
+                a.push(t_layer.elapsed().as_secs_f64());
+            }
+            let t_moe = std::time::Instant::now();
 
             let (x, post, comb) = hc_pre(
                 &xs,
@@ -1933,6 +2053,50 @@ impl ModelWeights {
             let h = layer.ffn_norm.forward(&x)?;
             let h = layer.ffn.forward(&h, input)?;
             xs = hc_post(&h, &residual, &post, &comb)?;
+            if let Some((_, m, _)) = prof.as_mut() {
+                m.push(t_moe.elapsed().as_secs_f64());
+            }
+            if let Some((_, _, t)) = prof.as_mut() {
+                t.push(t_layer.elapsed().as_secs_f64());
+            }
+        }
+
+        if let Some((a, m, t)) = prof {
+            let (sa, sm, st): (f64, f64, f64) = (
+                a.iter().sum(),
+                m.iter().sum(),
+                t.iter().sum(),
+            );
+            let (ma, mm) = (a.iter().copied().fold(0.0, f64::max), m.iter().copied().fold(0.0, f64::max));
+            eprintln!(
+                "[prof] attn: total {sa:.1}s avg {:.3}s max {ma:.3}s | moe: total {sm:.1}s avg {:.3}s max {mm:.3}s | layer: total {st:.1}s",
+                sa / a.len() as f64,
+                sm / m.len() as f64
+            );
+            // print the 6 slowest layers' breakdown
+            let mut idx: Vec<usize> = (0..t.len()).collect();
+            idx.sort_by(|x, y| t[*y].total_cmp(&t[*x]));
+            eprintln!("[prof] slowest layers (layer: attn/moe/total):");
+            for i in idx.iter().take(6) {
+                eprintln!("  blk.{i}: {:.3}s / {:.3}s / {:.3}s", a[*i], m[*i], t[*i]);
+            }
+        }
+
+        // Restore the sparse-access hint after a prefill pass: decode reads a
+        // handful of experts per layer, so SEQUENTIAL's aggressive readahead
+        // would waste bandwidth pulling the wrong pages.
+        if prefetch_layers {
+            if let Some(mmap) = &self.mmap {
+                if let (Some(Some((b0, _))), Some(Some((_, eN)))) = (
+                    self.layer_expert_ranges.first(),
+                    self.layer_expert_ranges.last(),
+                ) {
+                    let span = eN.saturating_sub(*b0);
+                    if span > 0 && *eN <= mmap.len() {
+                        let _ = mmap.advise_range(memmap2::Advice::Random, *b0, span);
+                    }
+                }
+            }
         }
 
         // Parallel head: collapse hc copies, RMS, output matmul.
@@ -1969,12 +2133,11 @@ impl ModelWeights {
     pub fn mmap_backed_experts(&self) -> (usize, usize) {
         let (mut backed, mut total) = (0, 0);
         for layer in &self.layers {
-            if let FeedForward::Moe(moe) = &layer.ffn {
-                for e in &moe.experts {
-                    total += 1;
-                    if e.prefetch.is_some() {
-                        backed += 1;
-                    }
+            let FeedForward::Moe(moe) = &layer.ffn;
+            for e in &moe.experts {
+                total += 1;
+                if e.prefetch.is_some() {
+                    backed += 1;
                 }
             }
         }
