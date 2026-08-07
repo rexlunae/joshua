@@ -151,6 +151,56 @@ impl GgufHeader {
             .and_then(|v| v.to_string().ok().cloned())
     }
 
+    /// Per-layer merged byte ranges covering the routed-expert tensors
+    /// (`blk.{i}.ffn_gate_exps`, `ffn_down_exps`, `ffn_up_exps`) — the
+    /// weights a MoE layer reads when it runs.  Tensors are stored
+    /// layer-major and the three expert tensors of a layer are adjacent, so
+    /// each layer collapses to one contiguous `[begin, end)` range (including
+    /// the small inter-tensor alignment gaps).  Offsets are absolute file
+    /// offsets (relative to `tensor_data_offset`).
+    ///
+    /// Returns `None` for layers missing any expert tensor; callers keep the
+    /// index alignment to `n_layer`.
+    pub fn layer_expert_ranges(&self, n_layer: usize) -> Vec<Option<(usize, usize)>> {
+        let mut starts: Vec<u64> = self.tensors.values().map(|t| t.offset).collect();
+        starts.sort_unstable();
+        // Byte size of the tensor at `offset` = distance to the next tensor
+        // in file order (the GGUF data section is one packed run).
+        let end_of = |offset: u64| -> u64 {
+            match starts.binary_search(&offset) {
+                Ok(i) => starts.get(i + 1).copied().unwrap_or(u64::MAX),
+                Err(_) => u64::MAX,
+            }
+        };
+        let base = self.tensor_data_offset;
+        (0..n_layer)
+            .map(|i| {
+                let p = format!("blk.{i}");
+                let names = [
+                    format!("{p}.ffn_gate_exps.weight"),
+                    format!("{p}.ffn_down_exps.weight"),
+                    format!("{p}.ffn_up_exps.weight"),
+                ];
+                let mut begin = u64::MAX;
+                let mut end = 0u64;
+                for n in &names {
+                    if let Some(t) = self.tensors.get(n) {
+                        begin = begin.min(t.offset);
+                        end = end.max(end_of(t.offset));
+                    }
+                }
+                if begin == u64::MAX || end <= begin {
+                    None
+                } else {
+                    Some((
+                        base.saturating_add(begin) as usize,
+                        base.saturating_add(end) as usize,
+                    ))
+                }
+            })
+            .collect()
+    }
+
     /// Tensor dtype ids present in the file that candle cannot represent.
     ///
     /// Useful for explaining *why* a model needs Joshua's own decoders rather
@@ -512,6 +562,55 @@ mod tests {
             candle_core::quantized::gguf_file::Content::read(&mut c).is_err(),
             "candle is expected to reject MXFP4; if it stops doing so this shim can go"
         );
+    }
+
+    /// Two layers, each with the three expert tensors, plus a trailing dense
+    /// tensor: layer ranges must merge gate/down/up into one `[begin, end)`
+    /// per layer, spanning the inter-tensor alignment gaps but not the next
+    /// layer's start or the trailing tensor.
+    #[test]
+    fn layer_expert_ranges_merge_per_layer() {
+        let base = 4096u64; // tensor_data_offset (arbitrary, must be added)
+        let mut h = GgufHeader {
+            version: 3,
+            metadata: Default::default(),
+            tensors: Default::default(),
+            tensor_data_offset: base,
+        };
+        let mut off = 0u64;
+        for l in 0..2 {
+            for name in [
+                format!("blk.{l}.ffn_gate_exps.weight"),
+                format!("blk.{l}.ffn_down_exps.weight"),
+                format!("blk.{l}.ffn_up_exps.weight"),
+            ] {
+                h.tensors.insert(
+                    name,
+                    RawTensorInfo {
+                        dtype: 10,
+                        dims: vec![256, 32], // 8192 elems; sizes come from deltas anyway
+                        offset: off,
+                    },
+                );
+                off += 4096; // simulated tensor size + alignment gap
+            }
+        }
+        h.tensors.insert(
+            "output.weight".into(),
+            RawTensorInfo {
+                dtype: 10,
+                dims: vec![256, 8],
+                offset: off,
+            },
+        );
+
+        let ranges = h.layer_expert_ranges(2);
+        assert_eq!(ranges.len(), 2);
+        for (i, r) in ranges.iter().enumerate() {
+            let (begin, end) = r.expect("layer must have expert tensors");
+            assert_eq!(begin, base as usize + i * 3 * 4096);
+            assert_eq!(end, base as usize + (i + 1) * 3 * 4096);
+        }
     }
 
     #[test]

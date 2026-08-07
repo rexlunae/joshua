@@ -268,6 +268,9 @@ impl Architecture {
 ///
 /// This hides the concrete model type behind a uniform `forward()` API so the
 /// engine can handle multiple architectures without code duplication.
+// Model structs are built once per model load and matched by reference; the
+// size difference between variants is irrelevant.
+#[allow(clippy::large_enum_variant)]
 pub enum QuantizedModel {
     Llama(quantized_llama::ModelWeights),
     Gemma(quantized_gemma3::ModelWeights),
