@@ -57,8 +57,6 @@ const KV_CAP: usize = 262_144;
 /// Minimum prompt length for the layer-ahead expert prefetch to engage
 /// (shorter prompts don't justify streaming whole layers).
 const PREFETCH_AHEAD_MIN: usize = 8;
-/// How many layers ahead to prefetch at each layer start.
-const PREFETCH_AHEAD_DEPTH: usize = 3;
 
 /// Parsed `deepseek4` hyper-parameters.
 struct Config {
@@ -1448,7 +1446,7 @@ impl Moe {
         let mut y = Tensor::zeros((n_tokens, h), DType::F32, dev)?;
         // Select each expert's input rows once; all three phases reuse them.
         let mut sel: Vec<Option<(Vec<u32>, Tensor)>> = Vec::with_capacity(self.experts.len());
-        for (e, bucket) in per_expert.iter().enumerate() {
+        for bucket in per_expert.iter() {
             if bucket.is_empty() {
                 sel.push(None);
                 continue;
@@ -2010,12 +2008,12 @@ impl ModelWeights {
                     // it at full device bandwidth (1.9 GB/s here) while the
                     // layer loop computes.  The tensor-major MoE dispatch
                     // below then reads each expert tensor as one clean pass.
-                    if let (Some(Some((b0, _))), Some(Some((_, eN)))) = (
+                    if let (Some(Some((b0, _))), Some(Some((_, e_n)))) = (
                         self.layer_expert_ranges.first(),
                         self.layer_expert_ranges.last(),
                     ) {
-                        let span = eN.saturating_sub(*b0);
-                        if span > 0 && *eN <= mmap.len() {
+                        let span = e_n.saturating_sub(*b0);
+                        if span > 0 && *e_n <= mmap.len() {
                             let _ = mmap.advise_range(memmap2::Advice::Sequential, *b0, span);
                         }
                     }
@@ -2087,12 +2085,12 @@ impl ModelWeights {
         // would waste bandwidth pulling the wrong pages.
         if prefetch_layers {
             if let Some(mmap) = &self.mmap {
-                if let (Some(Some((b0, _))), Some(Some((_, eN)))) = (
+                if let (Some(Some((b0, _))), Some(Some((_, e_n)))) = (
                     self.layer_expert_ranges.first(),
                     self.layer_expert_ranges.last(),
                 ) {
-                    let span = eN.saturating_sub(*b0);
-                    if span > 0 && *eN <= mmap.len() {
+                    let span = e_n.saturating_sub(*b0);
+                    if span > 0 && *e_n <= mmap.len() {
                         let _ = mmap.advise_range(memmap2::Advice::Random, *b0, span);
                     }
                 }
