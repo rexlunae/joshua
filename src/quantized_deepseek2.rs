@@ -386,6 +386,15 @@ struct Attention {
     v_head_dim: usize,
     q_head_dim: usize,
     softmax_scale: f64,
+    /// MLA latent cache: `(c_kv [b, seq, kv_lora_rank], k_pe [b, 1, seq, qk_rope])`.
+    ///
+    /// MLA stores the compressed latent (plus the single-head RoPE'd key)
+    /// rather than the reconstructed per-head K/V: for real models the latent
+    /// is `kv_lora_rank + qk_rope` ≈ 576 elems/token vs
+    /// `n_head·(qk_nope + v_head_dim)` ≈ 40,960 for the full K/V — a ~70x
+    /// memory reduction.  The full K/V is rebuilt once per forward from the
+    /// latent (a linear map), which is what DeepSeek's reference, llama.cpp
+    /// and vLLM all do.
     kv_cache: Option<(Tensor, Tensor)>,
 }
 
@@ -430,30 +439,36 @@ impl Attention {
             .reshape((b, seq_len, 1, self.qk_rope))?
             .transpose(1, 2)?;
 
-        // Decompress KV → per-head [k_nope ‖ v].
+        // RoPE the *_pe slices, then reassemble Q (nope ‖ rope).  The single-head
+        // key is RoPE'd here too; the cached copy below is already post-RoPE.
+        let (q_pe, k_pe) = self.rotary.apply(&q_pe, &k_pe, offset)?;
+        let q = Tensor::cat(&[&q_nope.contiguous()?, &q_pe.contiguous()?], D::Minus1)?;
+
+        // MLA latent cache: append this step's compressed latent and RoPE'd key.
+        // The full per-head K/V is reconstructed once, below, from the latent —
+        // ~70x less cache memory than storing the reconstructed K/V.
+        let (kv_cmpr, k_pe) = match &self.kv_cache {
+            None => (kv_cmpr, k_pe),
+            Some((pc, pk)) => (
+                Tensor::cat(&[pc, &kv_cmpr], 1)?.contiguous()?,
+                Tensor::cat(&[pk, &k_pe], 2)?.contiguous()?,
+            ),
+        };
+        self.kv_cache = Some((kv_cmpr.clone(), k_pe.clone()));
+
+        // Reconstruct the full per-head [k_nope ‖ v] for every cached position.
+        // kv_a_norm is a per-row norm and kv_b a linear map, so applying them to
+        // the concatenated latent is bit-identical to the per-step application.
+        let (b, s_total, _) = kv_cmpr.dims3()?;
         let kv = self
             .kv_b
             .forward(&self.kv_a_norm.forward(&kv_cmpr)?)?
-            .reshape((b, seq_len, self.n_head, self.qk_nope + self.v_head_dim))?
+            .reshape((b, s_total, self.n_head, self.qk_nope + self.v_head_dim))?
             .transpose(1, 2)?;
         let k_nope = kv.narrow(D::Minus1, 0, self.qk_nope)?;
         let v = kv.narrow(D::Minus1, self.qk_nope, self.v_head_dim)?.contiguous()?;
-
-        // RoPE the *_pe slices, then reassemble full Q/K (nope ‖ rope).
-        let (q_pe, k_pe) = self.rotary.apply(&q_pe, &k_pe, offset)?;
-        let q = Tensor::cat(&[&q_nope.contiguous()?, &q_pe.contiguous()?], D::Minus1)?;
-        let k_pe = k_pe.broadcast_as((b, self.n_head, seq_len, self.qk_rope))?;
+        let k_pe = k_pe.broadcast_as((b, self.n_head, s_total, self.qk_rope))?;
         let k = Tensor::cat(&[&k_nope.contiguous()?, &k_pe.contiguous()?], D::Minus1)?;
-
-        // KV cache (stores reconstructed full K/V across steps).
-        let (k, v) = match &self.kv_cache {
-            None => (k, v),
-            Some((pk, pv)) => (
-                Tensor::cat(&[pk, &k], 2)?.contiguous()?,
-                Tensor::cat(&[pv, &v], 2)?.contiguous()?,
-            ),
-        };
-        self.kv_cache = Some((k.clone(), v.clone()));
 
         // Scaled dot-product attention.
         let scores = (q.contiguous()?.matmul(&k.transpose(2, 3)?.contiguous()?)? * self.softmax_scale)?;
@@ -1013,4 +1028,175 @@ fn split_experts<R: Read + Seek>(
         experts.push(QMatMul::from_qtensor(qt)?);
     }
     Ok(experts)
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Shared random weights for a tiny `Attention` (`n_head=2`,
+    /// `kv_lora_rank=6`, `qk_nope=4`, `qk_rope=4`, `v_head_dim=4`, `n_embd=8`).
+    /// Built once and shared so two instances can be compared exactly.
+    struct TinyW {
+        q: Tensor, // [n_head*q_head_dim, n_embd]
+        kv_a: Tensor, // [kv_lora_rank + qk_rope, n_embd]
+        norm_w: Vec<f32>, // [kv_lora_rank]
+        kv_b: Tensor, // [n_head*(qk_nope+v_head_dim), kv_lora_rank]
+        o: Tensor, // [n_embd, n_head*v_head_dim]
+        nh: usize,
+        lkv: usize,
+        np: usize,
+        r: usize,
+        vh: usize,
+        qd: usize,
+        h: usize,
+    }
+
+    fn tiny_weights(dev: &Device) -> Result<TinyW> {
+        let h = 8usize; // n_embd
+        let nh = 2usize; // n_head
+        let lkv = 6usize; // kv_lora_rank
+        let np = 4usize; // qk_nope
+        let r = 4usize; // qk_rope
+        let vh = 4usize; // v_head_dim
+        let qd = np + r;
+        let norm_w: Vec<f32> = Tensor::randn(0f32, 1f32, (lkv,), dev)?.to_vec1()?;
+        Ok(TinyW {
+            q: Tensor::randn(0f32, 1f32, (nh * qd, h), dev)?,
+            kv_a: Tensor::randn(0f32, 1f32, (lkv + r, h), dev)?,
+            norm_w,
+            kv_b: Tensor::randn(0f32, 1f32, (nh * (np + vh), lkv), dev)?,
+            o: Tensor::randn(0f32, 1f32, (h, nh * vh), dev)?,
+            nh,
+            lkv,
+            np,
+            r,
+            vh,
+            qd,
+            h,
+        })
+    }
+
+    fn tiny_attention(dev: &Device, w: &TinyW) -> Result<Attention> {
+        use candle_core::quantized::{QStorage, QTensor};
+        use std::borrow::Cow;
+
+        let lin = |_rows: usize, _cols: usize, t: &Tensor| -> QMatMul {
+            QMatMul::Tensor(t.clone())
+        };
+        // RMS norm weight as an f32 QTensor (candle-transformers' RmsNorm only
+        // builds from a QTensor).
+        let bytes: Vec<u8> = w.norm_w.iter().flat_map(|x| x.to_le_bytes()).collect();
+        let storage = QStorage::from_data(Cow::Owned(bytes), dev, GgmlDType::F32)?;
+        let norm = RmsNorm::from_qtensor(QTensor::new(storage, w.lkv)?, 1e-5)?;
+        let cfg = Config {
+            n_layer: 1,
+            n_head: w.nh,
+            rms_eps: 1e-5,
+            q_lora_rank: None,
+            kv_lora_rank: w.lkv,
+            qk_nope_head_dim: w.np,
+            qk_rope_head_dim: w.r,
+            v_head_dim: w.vh,
+            softmax_scale: 1.0 / (w.qd as f64).sqrt(),
+            rope_theta: 10_000.0,
+            context_length: 4096,
+            yarn: None,
+            leading_dense: 0,
+            n_expert: 0,
+            n_expert_used: 0,
+            n_expert_shared: 0,
+            expert_weights_scale: 1.0,
+            expert_weights_norm: false,
+            gating: Gating::Sigmoid,
+            n_group: 1,
+            topk_group: 1,
+        };
+        Ok(Attention {
+            q: QProj::Plain(lin(w.nh * w.qd, w.h, &w.q)),
+            kv_a_mqa: lin(w.lkv + w.r, w.h, &w.kv_a),
+            kv_a_norm: norm,
+            kv_b: KvB::Dense(w.kv_b.clone()),
+            o_proj: lin(w.h, w.nh * w.vh, &w.o),
+            rotary: Arc::new(RotaryEmbedding::new(&cfg, dev)?),
+            n_head: w.nh,
+            kv_lora_rank: w.lkv,
+            qk_nope: w.np,
+            qk_rope: w.r,
+            v_head_dim: w.vh,
+            q_head_dim: w.qd,
+            softmax_scale: cfg.softmax_scale,
+            kv_cache: None,
+        })
+    }
+
+    /// The cache must hold the compressed latent `(c_kv, k_pe)`, not the
+    /// reconstructed per-head K/V — that is the ~70x memory win of MLA.
+    #[test]
+    fn mla_cache_stores_compressed_latent_not_full_kv() -> Result<()> {
+        let dev = Device::Cpu;
+        let w = tiny_weights(&dev)?;
+        let mut attn = tiny_attention(&dev, &w)?;
+
+        // Prefill: 3 tokens at once.
+        let xs = Tensor::randn(0f32, 1f32, (1, 3, 8), &dev)?;
+        attn.forward(&xs, None, 0)?;
+        let (c, k) = attn.kv_cache.as_ref().expect("cache populated after prefill");
+        assert_eq!(c.dims(), &[1, 3, 6], "latent cache must be [b, seq, kv_lora_rank]");
+        assert_eq!(k.dims(), &[1, 1, 3, 4], "k_pe cache must be [b, 1, seq, qk_rope]");
+
+        // Decode: one more token appends along seq.
+        let xs2 = Tensor::randn(0f32, 1f32, (1, 1, 8), &dev)?;
+        attn.forward(&xs2, None, 3)?;
+        let (c, k) = attn.kv_cache.as_ref().expect("cache after decode");
+        assert_eq!(c.dims(), &[1, 4, 6]);
+        assert_eq!(k.dims(), &[1, 1, 4, 4]);
+        Ok(())
+    }
+
+    /// The reconstructed K/V must agree whether the cache was filled by one
+    /// prefill call or by repeated single-token calls (regression guard for the
+    /// latent-cache concat/decompress ordering).
+    #[test]
+    fn mla_latent_cache_prefill_matches_incremental_reconstruction() -> Result<()> {
+        let dev = Device::Cpu;
+
+        // Prefill path: 3 tokens in one forward (causal mask, as the engine does).
+        let w = tiny_weights(&dev)?;
+        let mut a = tiny_attention(&dev, &w)?;
+        let xs = Tensor::randn(0f32, 1f32, (1, 3, 8), &dev)?;
+        let mask: Vec<f32> = (0..3)
+            .flat_map(|i| (0..3).map(move |j| if j > i { f32::NEG_INFINITY } else { 0.0 }))
+            .collect();
+        let mask = Tensor::from_slice(&mask, (1, 1, 3, 3), &dev)?;
+        let out_prefill = a.forward(&xs, Some(&mask), 0)?;
+        let (c_pre, k_pre) = a.kv_cache.as_ref().unwrap();
+
+        // Incremental path: 1 + 1 + 1 tokens with growing offset.
+        let mut b = tiny_attention(&dev, &w)?;
+        let mut out_inc = Vec::new();
+        for off in 0..3 {
+            let t = xs.narrow(1, off, 1)?;
+            out_inc.push(b.forward(&t, None, off)?);
+        }
+        let out_inc = Tensor::cat(&out_inc, 1)?;
+        let (c_inc, k_inc) = b.kv_cache.as_ref().unwrap();
+
+        assert_eq!(c_pre.dims(), c_inc.dims());
+        assert_eq!(k_pre.dims(), k_inc.dims());
+        let diff = (c_pre.to_dtype(DType::F32)? - c_inc.to_dtype(DType::F32)?)?
+            .abs()?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let max = diff.into_iter().fold(0.0f32, f32::max);
+        assert!(max < 1e-6, "latent caches diverge: max diff {max}");
+        let out_diff = (out_prefill.to_dtype(DType::F32)? - out_inc.to_dtype(DType::F32)?)?
+            .abs()?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let max = out_diff.into_iter().fold(0.0f32, f32::max);
+        assert!(max < 1e-5, "attention outputs diverge: max diff {max}");
+        Ok(())
+    }
 }
