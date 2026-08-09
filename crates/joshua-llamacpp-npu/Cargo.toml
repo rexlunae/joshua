@@ -4,7 +4,20 @@ version = "0.1.0"
 edition = "2021"
 description = "llama.cpp compatibility plugin for Joshua's joshua_npu_* ABI — brings every ggml backend (Hexagon NPU, CANN, CUDA, Vulkan, OpenCL, …) to Joshua"
 license = "MIT"
-publish = false
+repository = "https://github.com/rexlunae/joshua"
+homepage = "https://github.com/rexlunae/joshua"
+documentation = "https://docs.rs/joshua-llamacpp-npu"
+readme = "README.md"
+rust-version = "1.88"
+keywords = ["llama-cpp", "npu", "llm", "ggml", "joshua"]
+categories = ["api-bindings"]
+
+# docs.rs builds with `--all-features` by default, which would try to compile
+# the CUDA/Vulkan/Metal llama.cpp backends and fail the docs build.  Build
+# docs for the default feature set instead (llama.cpp CPU is still compiled —
+# docs.rs has cmake + a C++ toolchain).
+[package.metadata.docs.rs]
+all-features = false
 
 [lib]
 crate-type = ["cdylib"]

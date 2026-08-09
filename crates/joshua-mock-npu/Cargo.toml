@@ -2,9 +2,15 @@
 name = "joshua-mock-npu"
 version = "0.1.0"
 edition = "2021"
-description = "Mock NPU vendor library implementing Joshua's joshua_npu_* plugin ABI (test fixture)"
+description = "Reference implementation of the joshua_npu_* plugin ABI — a pure-Rust mock NPU backend for testing the Joshua inference engine"
 license = "MIT"
-publish = false
+repository = "https://github.com/rexlunae/joshua"
+homepage = "https://github.com/rexlunae/joshua"
+documentation = "https://docs.rs/joshua-mock-npu"
+readme = "README.md"
+rust-version = "1.88"
+keywords = ["npu", "llm", "plugin", "mock", "joshua"]
+categories = ["development-tools::testing"]
 
 [lib]
 crate-type = ["cdylib"]
