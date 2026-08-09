@@ -2,7 +2,11 @@
 members = [".", "crates/joshua-mock-npu", "crates/joshua-llamacpp-npu"]
 # The llama.cpp adapter compiles C++ (llama.cpp itself) and is therefore not
 # part of the default build: `cargo build`/`cargo test` stay pure Rust.
-default-members = [".", "crates/joshua-mock-npu"]
+# The mock NPU plugin is excluded from the default members too, so a plain
+# `cargo publish` from the workspace root publishes only the `joshua` crate —
+# the mock is `publish = false` and the NPU integration tests build it on
+# demand with `cargo build -p joshua-mock-npu`.
+default-members = ["."]
 
 [package]
 name = "joshua"
