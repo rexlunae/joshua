@@ -11,8 +11,18 @@ edition = "2021"
 description = "An mmap-based LLM inference engine for the Rust ecosystem — a Rust clone of Cactus"
 license = "MIT"
 repository = "https://github.com/rexlunae/joshua"
+homepage = "https://github.com/rexlunae/joshua"
+documentation = "https://docs.rs/joshua"
+readme = "README.md"
+rust-version = "1.88"
 keywords = ["llm", "inference", "ai", "openai", "gguf"]
 categories = ["science", "api-bindings"]
+
+# docs.rs builds with `--all-features` by default, which would try to compile
+# the CUDA backend (needs the NVIDIA toolkit) and fail the docs build.  Build
+# docs for the default pure-Rust feature set instead.
+[package.metadata.docs.rs]
+all-features = false
 
 [[bin]]
 name = "joshua"

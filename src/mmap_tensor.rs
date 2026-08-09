@@ -258,7 +258,7 @@ impl MmapBlocksIq2Xxs {
 /// Prefetch handle for `n_blocks` k-quant blocks at `byte_offset` in `mmap`.
 ///
 /// Re-borrows the range with the same bounds/alignment checks as
-/// [`MmapBlocks::borrow`]; returns `None` exactly when a borrow would be
+/// `MmapBlocks::borrow`; returns `None` exactly when a borrow would be
 /// declined, so callers can pair it with the borrow they already performed.
 /// The `dtype` picks the block type, mirroring [`borrowed_range`].
 pub fn prefetch_handle(

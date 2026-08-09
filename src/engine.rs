@@ -1265,7 +1265,7 @@ impl Engine {
     ///
     /// Generation requests try the backend first and transparently fall back
     /// to the candle CPU/GPU path when session creation or a forward pass
-    /// fails; after [`NPU_MAX_FAILURES`] failures the backend is disabled
+    /// fails; after `NPU_MAX_FAILURES` failures the backend is disabled
     /// for the engine's lifetime.  Embeddings always run on candle.
     pub fn with_npu_backend(mut self, backend: Arc<dyn NpuBackend>) -> Self {
         tracing::info!("NPU backend configured: {}", backend.name());
