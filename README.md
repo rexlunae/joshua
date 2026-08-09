@@ -17,11 +17,13 @@ framework) and [tokenizers](https://github.com/huggingface/tokenizers).
 | **Huge pages** | Optional transparent (`MADV_HUGEPAGE`) or explicit 2 MiB / 1 GiB (`MAP_HUGETLB`) backing to cut TLB misses on large models |
 | **OpenAI-compatible** | Drop-in replacement for `/v1/chat/completions`, `/v1/embeddings`, `/v1/models` |
 | **Streaming** | Server-Sent Events (SSE) for token-by-token streaming |
-| **GGUF support** | Llama/Mistral/Mixtral, Gemma 1–3, GLM-4, LFM2, Phi-2, Phi-3, Qwen2, Qwen3, Qwen3-MoE, DeepSeek-V2/V3, Kimi-K2 |
+| **GGUF support** | Llama/Mistral/Mixtral, Gemma 1–3, GLM-4, LFM2, Phi-2, Phi-3, Qwen2, Qwen3, Qwen3-MoE, DeepSeek-V2/V3, DeepSeek-V4, Kimi-K2 |
+| **Exotic quant dtypes** | In-mapping decoders for IQ2_XXS (DeepSeek-V4's 2.0625-bit expert weights) and MXFP4 (Kimi-K3-class), with matmuls that keep the blocks in the mmap instead of materialising f32 |
+| **Fused SIMD kernels** | AVX2 dequant+dot fusion for Q8_0/Q2_K/Q4_K and parallel SIMD quantized matmuls on x86-64 |
 | **Chat templates** | Renders the model's own `tokenizer.chat_template` from the GGUF (Jinja via pure-Rust minijinja); ChatML fallback |
 | **Tool calling** | OpenAI-compatible `tools` / `tool_calls`, parsing Hermes/Qwen, Mistral, and Llama-3 call formats |
 | **Embeddings** | Dense sentence embeddings for llama / qwen2 / qwen3 embedding models, with GGUF pooling metadata |
-| **KV-cache reuse** | Multi-turn requests continue from a warm model pool and prefill only the new suffix |
+| **KV-cache reuse** | Multi-turn requests continue from a warm model pool and prefill only the new suffix; DeepSeek-V2/V3 MLA caches the compressed latent (`c_kv` + `k_pe`) instead of the reconstructed per-head K/V, cutting KV memory ~70× |
 | **GPU (optional)** | `--features cuda` or `metal` route inference through candle's GPU backends |
 | **NPU / llama.cpp interop (optional)** | Vendor plugins run in a crash-isolated shim process; a llama.cpp adapter brings every ggml backend (Hexagon NPU, CANN, CUDA, Vulkan, …) |
 | **Vision (optional)** | OpenAI-style image messages routed through llama.cpp's `mtmd` (Qwen2.5-VL, Gemma 3, LLaVA, …) via the same isolated plugin |
@@ -138,6 +140,16 @@ cargo build --release
 ./target/release/joshua run \
     --model ./weights/gemma-3-1b-it-Q4_K_M.gguf \
     "Explain memory-mapped I/O in one paragraph"
+
+# Embed texts (dense vectors, llama/qwen2/qwen3 embedding models)
+./target/release/joshua embed \
+    --model ./weights/nomic-embed-text-v1.5.Q8_0.gguf \
+    "first text" "second text"
+
+# Transcribe speech (Whisper model directory, pure Rust)
+./target/release/joshua transcribe \
+    --model ./weights/whisper-tiny \
+    --language en speech.wav
 
 # Start the API server
 ./target/release/joshua serve \
@@ -378,6 +390,13 @@ LimitMEMLOCK=infinity
 sudo prlimit --pid <user manager pid> --memlock=-1:-1
 ```
 
+Prefill on the sparse MoE loaders streams the experts instead of faulting them
+in one 4 KiB page at a time: the layer loop advises `MADV_SEQUENTIAL` over the
+whole expert span for the duration of the pass and dispatches the routed
+experts in tensor-major (file) order, so each expert tensor is read as one
+clean sequential pass while the layer computes (measured ~1.9 GB/s vs
+~175 MB/s for per-page demand faults).
+
 > **systemd *user* session trap:** the unit's `LimitMEMLOCK=infinity` is capped
 > by the user manager's own hard limit, which is inherited from the login
 > session — so on a headless box the unit setting alone does nothing.  Add the
@@ -400,6 +419,13 @@ prints the dense/expert split of any GGUF to sanity-check a new model.
 | `JOSHUA_LAZY_WEIGHTS` | Same as `--lazy-weights` |
 | `JOSHUA_PIN_HOT_WEIGHTS` | Same as `--pin-hot-weights` (`true`/`false`, or the flag with no value) |
 | `JOSHUA_MLOCK_HOT_WEIGHTS` | Same as `--mlock-hot-weights` (`on`, `required`, or `off`) |
+| `JOSHUA_MAX_CONCURRENCY` | Cap on simultaneous generations/embeddings (same as `--max-concurrency`) |
+| `JOSHUA_MAX_OUTPUT_TOKENS` | Hard ceiling on generated tokens per request (same as `--max-output-tokens`) |
+| `JOSHUA_WHISPER_MODEL` | Whisper model directory mounted at `/v1/audio/transcriptions` (same as `--whisper-model`) |
+| `JOSHUA_NPU_PLUGIN` | NPU vendor plugin path (same as `--npu-plugin`) |
+| `JOSHUA_LLAMA_N_GPU_LAYERS` | llama.cpp adapter layer offload count (default: all) |
+| `JOSHUA_LLAMA_MMPROJ` | Multimodal projector GGUF for vision via llama.cpp's `mtmd` |
+| `JOSHUA_LLAMA_BACKENDS_DIR` | Directory of `libggml-<name>` modules to register at adapter startup (llama.cpp `dynamic-backends` builds) |
 | `RUST_LOG` | Log filter (e.g. `info`, `joshua=debug`) |
 
 ---
@@ -435,14 +461,35 @@ the matching pure-Rust candle loader.  Currently supported architectures:
 | `qwen3` | Qwen3 (dense) |
 | `qwen3moe` | Qwen3 mixture-of-experts |
 | `deepseek2` | DeepSeek-V2, DeepSeek-V3, **Kimi-K2** (MLA attention + fine-grained MoE) |
+| `deepseek4` | DeepSeek-V4 (Hyper-Connections residual mixing, alternating sliding-window / learned KV-compressor attention, Lightning-Indexer sparse attention, fine-grained MoE with IQ2_XXS experts) |
 
 The `deepseek2` loader is Joshua's own (candle has no quantized DeepSeek
 path). It implements Multi-head Latent Attention with Q/KV LoRA, DeepSeek-V3 /
 Kimi-K2 sigmoid-with-bias group-limited expert routing, shared experts, and
 YaRN RoPE — and keeps the experts **quantized** (a 1 T-parameter MoE keeps its
-on-disk footprint instead of exploding to f32 in RAM). Both the legacy
-combined (`attn_kv_b`) and modern MLA-split (`attn_k_b`/`attn_v_b`) GGUF
-encodings load, and its logits are cross-checked against llama.cpp.
+on-disk footprint instead of exploding to f32 in RAM). Since PR #30, MLA
+attention caches the *compressed latent* (`c_kv` + `k_pe`) rather than the
+reconstructed per-head K/V — numerically identical to llama.cpp and ~70× less
+KV memory for V3-class models; the full K/V is rebuilt once per forward from
+the latent. Both the legacy combined (`attn_kv_b`) and modern MLA-split
+(`attn_k_b`/`attn_v_b`) GGUF encodings load, and its logits are cross-checked
+against llama.cpp.
+
+The `deepseek4` loader handles the architecture's three additions over V3:
+Hyper-Connections mix the residual stream to `hc_mult` parallel copies with
+Sinkhorn-normalised per-token weights, CSA/HCA compressor layers pool blocks of
+4 / 128 tokens into a compressed KV, and the Lightning Indexer picks the
+`index_topk` compressed positions each query attends to. The routed experts
+stay quantized as IQ2_XXS trellis blocks decoded in-mapping during the matmul,
+so a 162 B model keeps its on-disk footprint. Activations run in f32 on CPU.
+
+**Kimi-K3 (in progress).** The correctness-critical primitives — Kimi Delta
+Attention (per-channel decay gates), attention residuals, the `situ`
+activation, and an MXFP4 decoder — are implemented in `kimi_k3.rs` and
+unit-tested against the reference formulations, but a full forward pass is not
+wired up yet: no released llama.cpp runs K3, and no weights were available to
+check end-to-end logits against. It is not yet dispatchable from GGUF
+metadata.
 
 Example models:
 
@@ -453,6 +500,7 @@ Example models:
 - `mistralai/Mistral-7B-Instruct-v0.3`
 - `THUDM/GLM-4-9B-0414`
 - `deepseek-ai/DeepSeek-V2-Lite`, `moonshotai/Kimi-K2-Instruct` (as GGUF)
+- `deepseek-ai/DeepSeek-V4-Flash-162B` (as GGUF)
 
 Every other architecture name in llama.cpp's registry (Mamba, RWKV, GPT-2,
 DeepSeek-V1, Granite, OLMo, StarCoder2, and ~70 more) is recognised at load time
@@ -527,7 +575,11 @@ joshua serve --model m.gguf \
 
 Layer offload is controlled with `JOSHUA_LLAMA_N_GPU_LAYERS` (default: all).
 NPU backends are enabled the same way as in llama.cpp itself — build it with
-the vendor SDK (see llama.cpp's Snapdragon/CANN backend docs).
+the vendor SDK (see llama.cpp's Snapdragon/CANN backend docs).  With
+llama.cpp's `dynamic-backends` feature, ready-built `libggml-<name>` modules
+are picked up at startup from `JOSHUA_LLAMA_BACKENDS_DIR` (when unset, the
+compile-time default directory is scanned), so a cross-compiled Hexagon/CANN
+backend drops in with no code change.
 
 The test suite proves the stack end to end without real hardware: a mock
 vendor plugin exercises determinism, crash containment (the plugin aborts —
@@ -550,9 +602,14 @@ candle path on the same weights.
 - [x] Tool / function calling (OpenAI-compatible, Hermes/Mistral/Llama-3 formats)
 - [x] GPU acceleration (`cuda` / `metal` cargo features)
 - [x] KV-cache sharing across requests (warm model pool with prefix reuse)
+- [x] DeepSeek-V4 sparse-attention MoE loader (Hyper-Connections, CSA/HCA KV compression, Lightning Indexer, IQ2_XXS experts)
+- [x] DeepSeek-V2/V3 MLA latent cache (~70× smaller KV cache, prefill == incremental)
+- [x] Fused AVX2 k-quant kernels and SIMD quantized matmuls (CPU prefill/decode speed-ups)
+- [x] Sparse-MoE weight management (hot-weight pinning, mlock with memlock-limit check, prefill streaming)
 - [x] Vision / multimodal support (OpenAI image messages via llama.cpp `mtmd` through the plugin shim)
 - [x] Speech-to-text (Whisper — pure-Rust pipeline, `/v1/audio/transcriptions`)
 - [x] NPU backend architecture (isolated vendor-plugin shim + llama.cpp adapter for Hexagon/CANN/…)
+- [ ] Kimi-K3 full forward pass (primitives done: Kimi Delta Attention, attention residuals, `situ`, MXFP4 — see Supported models)
 
 ---
 
