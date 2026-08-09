@@ -11,10 +11,10 @@
 //!    or starts erroring (a circuit breaker disables it after repeated
 //!    failures).
 //!
-//! 2. **Plugin ABI, loaded at runtime** ([`vendor`]): vendor support ships as
+//! 2. **Plugin ABI, loaded at runtime** ([`InProcessBackend`]): vendor support ships as
 //!    a shared library exporting the tiny `joshua_npu_*` C ABI below.  Joshua
 //!    `dlopen`s it with `libloading` — nothing is linked at build time, the
-//!    `unsafe` surface is confined to [`vendor`], and a missing library is a
+//!    `unsafe` surface is confined to the `vendor` module, and a missing library is a
 //!    clean fallback, not a build or startup failure.
 //!    [`InProcessBackend`] runs a plugin this way for minimum overhead —
 //!    accepting that a buggy vendor runtime shares the process.

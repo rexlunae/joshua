@@ -95,7 +95,7 @@ pub fn dequantize(blocks: &[BlockIq2Xxs], out: &mut [f32]) -> Result<()> {
 /// as f32 in bulk — the same contract as [`crate::mxfp4::matmul_t`].
 ///
 /// On x86_64 with AVX2+FMA this dispatches to a fused dequant+dot kernel
-/// (see [`matmul_t_avx2`]) and spreads the independent output rows across
+/// (see `try_avx2_matmul`) and spreads the independent output rows across
 /// the rayon pool; elsewhere it falls back to the scalar row loop.  Both
 /// paths compute each output element with the same per-element operation
 /// sequence, so results are deterministic and agree to within one ulp of
