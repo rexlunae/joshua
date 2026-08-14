@@ -1,4 +1,4 @@
-//! Threaded + AVX2-accelerated matmuls for candle's k-quant block types
+//! Threaded + SIMD-accelerated matmuls for candle's k-quant block types
 //! (Q8_0, Q2_K, Q4_K, …).
 //!
 //! Candle's own `k_quants::matmul` is a scalar, single-threaded kernel, and
@@ -8,13 +8,14 @@
 //! backend adds over a naive loop:
 //!
 //!   * the dequantized weight row is dot-producted against the activations
-//!     with 8-lane AVX2/FMA instructions instead of scalar multiply-adds,
+//!     with SIMD FMA instructions instead of scalar multiply-adds (8-lane
+//!     AVX2/FMA on x86_64, 4-lane NEON on aarch64),
 //!   * independent output rows are spread across the rayon pool.
 //!
 //! `T::to_float` (dequant) is reused untouched, so the numerics differ from
 //! candle's scalar path only by FMA rounding (≤ 1 ulp), which the engine's
-//! tolerance-based parity tests absorb.  On CPUs without AVX2, or for shapes
-//! the SIMD path does not accept, the call is forwarded to
+//! tolerance-based parity tests absorb.  On CPUs without a SIMD path, or for
+//! shapes the SIMD path does not accept, the call is forwarded to
 //! `k_quants::matmul` unchanged — bit-identical to joshua's previous
 //! behavior.
 
@@ -169,24 +170,26 @@ fn matmul_kquant_impl<T: GgmlType>(
     if m == 0 || n == 0 {
         return Ok(());
     }
-    if try_avx2_kquant(mkn, blocks_per_row, lhs, blocks, dst, parallel) {
+    if try_simd_kquant(mkn, blocks_per_row, lhs, blocks, dst, parallel) {
         return Ok(());
     }
     // Scalar fallback: candle's own kernel, exactly as before (bit-identical
-    // to joshua's prior behavior on non-AVX2 CPUs and unusual shapes).
+    // to joshua's prior behavior on non-SIMD CPUs and unusual shapes).
     k_quants::matmul((m, k, n), lhs, blocks, dst)
 }
 
-/// AVX2/FMA fast path for [`matmul_kquant_impl`]: for the block types the
+/// SIMD fast path for [`matmul_kquant_impl`]: for the block types the
 /// model actually uses (Q8_0, Q2_K, Q4_K) this delegates to the *fused*
 /// kernels in [`crate::kquant_dot`] — the quantized blocks are decoded
-/// inside the dot in 8-lane registers, so no f32 weight row is ever
+/// inside the dot in SIMD registers, so no f32 weight row is ever
 /// materialized (the same design as the IQ2_XXS path).  Other k-quant types
 /// fall back to the generic path below: dequantize each weight row once
 /// into an f32 scratch, then dot it against every activation row with
-/// 8-lane FMA.  Returns `true` if a kernel ran.
-#[cfg(target_arch = "x86_64")]
-fn try_avx2_kquant<T: GgmlType>(
+/// SIMD FMA.  Returns `true` if a kernel ran.
+///
+/// On x86_64 this uses AVX2/FMA when available; on aarch64 it uses NEON
+/// (always available).  On other targets it declines.
+fn try_simd_kquant<T: GgmlType>(
     mkn: (usize, usize, usize),
     blocks_per_row: usize,
     lhs: &[f32],
@@ -195,7 +198,13 @@ fn try_avx2_kquant<T: GgmlType>(
     parallel: bool,
 ) -> bool {
     let (m, k, n) = mkn;
-    if !(crate::simd::avx2_fma_available() && k.is_multiple_of(8)) {
+    #[cfg(target_arch = "x86_64")]
+    let fused = crate::simd::avx2_fma_available();
+    #[cfg(target_arch = "aarch64")]
+    let fused = crate::simd::neon_available();
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let fused = false;
+    if !(fused && k.is_multiple_of(8)) {
         return false;
     }
     // SAFETY: `blocks` is `n * blocks_per_row` T-blocks; reinterpreting it
@@ -207,7 +216,7 @@ fn try_avx2_kquant<T: GgmlType>(
             std::mem::size_of_val(blocks),
         )
     };
-    if crate::kquant_dot::try_matmul_fused_avx2(T::DTYPE, mkn, lhs, block_bytes, dst, parallel) {
+    if crate::kquant_dot::try_matmul_fused(T::DTYPE, mkn, lhs, block_bytes, dst, parallel) {
         return true;
     }
     let dst_ptr = crate::simd::DstPtr::new(dst);
@@ -217,11 +226,11 @@ fn try_avx2_kquant<T: GgmlType>(
         let mut wrow = vec![0f32; k];
         for &row in rows {
             T::to_float(&blocks[row * blocks_per_row..(row + 1) * blocks_per_row], &mut wrow);
-            // SAFETY: avx2_fma_available() was checked above, so the
-            // target_feature kernel may run on this CPU; row `row`
-            // writes exactly dst[i*n + row] for i in 0..m, disjoint
-            // from every other row (see `crate::simd`).
-            unsafe { dot_row_avx2(m, k, n, lhs, &wrow, row, &dst_ptr) }
+            // SAFETY: `fused` (the matching SIMD availability check) was
+            // verified above, so the target_feature kernel may run on this
+            // CPU; row `row` writes exactly dst[i*n + row] for i in 0..m,
+            // disjoint from every other row (see `crate::simd`).
+            unsafe { dot_row_simd(m, k, n, lhs, &wrow, row, &dst_ptr) }
         }
     };
     if parallel {
@@ -233,16 +242,35 @@ fn try_avx2_kquant<T: GgmlType>(
     true
 }
 
-#[cfg(not(target_arch = "x86_64"))]
-fn try_avx2_kquant<T: GgmlType>(
-    _mkn: (usize, usize, usize),
-    _blocks_per_row: usize,
-    _lhs: &[f32],
-    _blocks: &[T],
-    _dst: &mut [f32],
-    _parallel: bool,
-) -> bool {
-    false
+/// SIMD dot of one dequantized weight row against all m activation rows,
+/// 4 lhs rows at a time.  Dispatches to the CPU's SIMD ISA.
+///
+/// # Safety
+/// The caller must have verified the matching SIMD availability check and
+/// `k % 8 == 0` (the loop consumes `k` in 8-lane chunks with no tail), and
+/// must only hand out disjoint rows per [`crate::simd::DstPtr`].
+unsafe fn dot_row_simd(
+    m: usize,
+    k: usize,
+    n: usize,
+    lhs: &[f32],
+    wrow: &[f32],
+    row: usize,
+    dst: &crate::simd::DstPtr,
+) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        dot_row_avx2(m, k, n, lhs, wrow, row, dst)
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        dot_row_neon(m, k, n, lhs, wrow, row, dst)
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        let _ = (m, k, n, lhs, wrow, row, dst);
+        unreachable!("dot_row_simd is only called after a SIMD availability check")
+    }
 }
 
 /// AVX2/FMA dot of one dequantized weight row against all m activation rows,
@@ -290,6 +318,52 @@ unsafe fn dot_row_avx2(
     }
 }
 
+/// NEON dot of one dequantized weight row against all m activation rows,
+/// 4 lhs rows at a time.
+///
+/// # Safety
+/// The caller must have verified `neon_available()` and `k % 8 == 0`
+/// (the loop consumes `k` in 4-lane chunks with no tail), and must only
+/// hand out disjoint rows per [`crate::simd::DstPtr`].
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments)] // (m, k, n) is the matmul shape; kept flat for the hot loop
+unsafe fn dot_row_neon(
+    m: usize,
+    k: usize,
+    n: usize,
+    lhs: &[f32],
+    wrow: &[f32],
+    row: usize,
+    dst: &crate::simd::DstPtr,
+) {
+    use std::arch::aarch64::*;
+
+    const MTILE: usize = 4;
+    let mut m0 = 0;
+    while m0 < m {
+        let mcnt = (m - m0).min(MTILE);
+        let mut acc = [vdupq_n_f32(0.0); MTILE];
+        let mut c = 0;
+        while c + 8 <= k {
+            let w0 = vld1q_f32(wrow[c..c + 4].as_ptr());
+            let w1 = vld1q_f32(wrow[c + 4..c + 8].as_ptr());
+            for i in 0..mcnt {
+                let a = lhs[(m0 + i) * k + c..].as_ptr();
+                acc[i] = vfmaq_f32(acc[i], vld1q_f32(a), w0);
+                acc[i] = vfmaq_f32(acc[i], vld1q_f32(a.add(4)), w1);
+            }
+            c += 8;
+        }
+        // `mcnt` can be < MTILE at the tail; iterate only the live lanes.
+        for (i, acc_i) in acc.iter().enumerate().take(mcnt) {
+            // SAFETY: row `row` owns dst[i*n + row] for all i; disjoint per
+            // row (see `crate::simd`).
+            dst.write((m0 + i) * n + row, crate::simd::hsum128(*acc_i));
+        }
+        m0 += MTILE;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -330,13 +404,42 @@ mod tests {
         // own `k_quants::matmul` quantises the activations to Q8_0 before the
         // dot, so it is NOT the right reference for this kernel — joshua dots
         // f32 activations, the same semantics as its IQ2_XXS path.)
+        //
+        // Accumulation order: when a SIMD fused kernel is active, replicate
+        // its exact lane order with `mul_add` (single rounding) so the
+        // comparison is pinned at FMA-rounding level.  AVX2 kernels are
+        // 8-lane; the NEON kernels accumulate in a float32x4_t (4 lanes) for
+        // every dtype.  Without SIMD the scalar kernel accumulates
+        // sequentially with two roundings per term.
         let mut w = vec![0f32; n * k];
         T::to_float(&blocks, &mut w);
+        let lanes: usize = if crate::simd::avx2_fma_available() || crate::simd::neon_available()
+        {
+            if cfg!(target_arch = "aarch64") {
+                4
+            } else {
+                8
+            }
+        } else {
+            1
+        };
         for (i, fastv) in fast.iter().enumerate() {
-            let mut acc = 0f32;
             let (ii, jj) = (i / n, i % n);
-            for (kk, wv) in w[jj * k..(jj + 1) * k].iter().enumerate() {
-                acc += lhs[ii * k + kk] * wv;
+            let mut acc = 0f32;
+            if lanes == 1 {
+                for (kk, wv) in w[jj * k..(jj + 1) * k].iter().enumerate() {
+                    acc += lhs[ii * k + kk] * wv;
+                }
+            } else {
+                let mut accv = [0f32; 8];
+                let mut c = 0;
+                while c + lanes <= k {
+                    for l in 0..lanes {
+                        accv[l] = lhs[ii * k + c + l].mul_add(w[jj * k + c + l], accv[l]);
+                    }
+                    c += lanes;
+                }
+                acc = accv[..lanes].iter().sum::<f32>();
             }
             let tol = 1e-4 * acc.abs().max(1.0);
             assert!(
@@ -385,6 +488,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn q8_0_matches_candle_scalar() {
         run_case::<BlockQ8_0>(GgmlDType::Q8_0, 3, 512, 17);
         run_case::<BlockQ8_0>(GgmlDType::Q8_0, 1, 256, 64);
@@ -392,15 +496,34 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn q2k_matches_candle_scalar() {
         run_case::<BlockQ2K>(GgmlDType::Q2K, 3, 512, 11);
         run_case::<BlockQ2K>(GgmlDType::Q2K, 1, 256, 40);
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn q4k_matches_candle_scalar() {
         run_case::<BlockQ4K>(GgmlDType::Q4K, 3, 512, 13);
         run_case::<BlockQ4K>(GgmlDType::Q4K, 4, 768, 25);
+    }
+
+    /// The same correctness checks through the NEON path (aarch64).
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn neon_matches_candle_scalar() {
+        run_case::<BlockQ8_0>(GgmlDType::Q8_0, 3, 512, 17);
+        run_case::<BlockQ8_0>(GgmlDType::Q8_0, 1, 256, 64);
+        run_case::<BlockQ8_0>(GgmlDType::Q8_0, 5, 128, 9);
+        run_case::<BlockQ2K>(GgmlDType::Q2K, 3, 512, 11);
+        run_case::<BlockQ2K>(GgmlDType::Q2K, 1, 256, 40);
+        run_case::<BlockQ4K>(GgmlDType::Q4K, 3, 512, 13);
+        run_case::<BlockQ4K>(GgmlDType::Q4K, 4, 768, 25);
+        // The real model's shapes.
+        run_case::<BlockQ2K>(GgmlDType::Q2K, 1, 7680, 2048);
+        run_case::<BlockQ4K>(GgmlDType::Q4K, 1, 2048, 7680);
+        run_case::<BlockQ8_0>(GgmlDType::Q8_0, 32, 4096, 4096);
     }
 
     /// `decode_raw_to_f32` must decode every K-quant GGUF id (10..=15) from

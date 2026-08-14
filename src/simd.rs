@@ -1,14 +1,17 @@
-//! SIMD-accelerated f32 dot kernels (x86_64 AVX2/FMA) with runtime dispatch.
+//! SIMD-accelerated f32 dot kernels (x86_64 AVX2/FMA, aarch64 NEON) with
+//! runtime dispatch.
 //!
 //! llama.cpp reaches ~10x the throughput of joshua's original scalar matmuls
 //! on the same CPU; the two levers this module pulls are the same ones
 //! llama.cpp's `ggml-cpu` backend uses:
 //!
-//!   1. **AVX2/FMA vectorization** — the inner dot product runs 8 f32 lanes
-//!      per instruction (`vfmadd231ps`), so one FMA replaces 16 scalar
-//!      multiply-adds.  Runtime detection via `is_x86_feature_detected!`
-//!      keeps the crate portable: the kernels are only called when the CPU
-//!      actually has AVX2+FMA, and every path has a scalar fallback.
+//!   1. **SIMD vectorization** — the inner dot product runs 8 f32 lanes per
+//!      instruction on x86_64 (`vfmadd231ps`), or 4 f32 lanes on aarch64
+//!      (`fmla`), so one FMA replaces 16 (8) scalar multiply-adds.  On x86_64
+//!      runtime detection via `is_x86_feature_detected!` keeps the crate
+//!      portable: the kernels are only called when the CPU actually has
+//!      AVX2+FMA, and every path has a scalar fallback.  On aarch64 NEON is
+//!      part of the base architecture, so the kernels are always eligible.
 //!   2. **Row-parallelism** — the output rows of a quantized matmul are
 //!      independent, so the work is spread across the rayon global pool
 //!      (which CachyOS-sized machines get from `available_parallelism`).
@@ -44,6 +47,23 @@ pub fn avx2_fma_available() -> bool {
         std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
     }
     #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+/// Whether the NEON kernels should be used on this CPU.
+///
+/// NEON (AArch64 SIMD) is part of the base ARMv8 architecture, so on aarch64
+/// this is always true and no runtime detection is needed.  Kept as a
+/// function so the dispatch in `kquant_dot`/`quant_matmul` reads the same on
+/// both architectures.
+pub fn neon_available() -> bool {
+    #[cfg(target_arch = "aarch64")]
+    {
+        true
+    }
+    #[cfg(not(target_arch = "aarch64"))]
     {
         false
     }
@@ -172,7 +192,7 @@ impl<'a> DstPtr<'a> {
     }
 }
 
-/// Horizontal sum of an 8-lane f32 vector.
+/// Horizontal sum of an 8-lane f32 vector (x86_64).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 pub(crate) unsafe fn hsum256(v: std::arch::x86_64::__m256) -> f32 {
@@ -183,6 +203,15 @@ pub(crate) unsafe fn hsum256(v: std::arch::x86_64::__m256) -> f32 {
     let s = _mm_add_ps(s, _mm_movehl_ps(s, s));
     let s = _mm_add_ps(s, _mm_shuffle_ps(s, s, 1));
     _mm_cvtss_f32(s)
+}
+
+/// Horizontal sum of a 4-lane f32 vector (aarch64 NEON).
+///
+/// `vaddvq_f32` is a single A64 instruction (ADDV), so this needs no
+/// shuffle chain like the AVX2 version.
+#[cfg(target_arch = "aarch64")]
+pub(crate) unsafe fn hsum128(v: std::arch::aarch64::float32x4_t) -> f32 {
+    std::arch::aarch64::vaddvq_f32(v)
 }
 
 #[cfg(test)]
