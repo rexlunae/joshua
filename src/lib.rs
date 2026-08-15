@@ -50,7 +50,8 @@ pub mod types;
 pub use rustls;
 
 pub use engine::{
-    find_gguf_in_dir, Engine, EngineOptions, HugePages, MlockMode, MmapMode, PageSize,
+    find_gguf_in_dir, ComputeBackend, Engine, EngineOptions, HugePages, MlockMode, MmapMode,
+    PageSize,
 };
 pub use error::{JoshuaError, Result};
 pub use types::{

@@ -677,6 +677,40 @@ mod synthetic {
 
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    /// An explicit `--device metal` request on a build without the `metal`
+    /// feature is a load error — never a silent CPU fallback.  `Auto` keeps
+    /// degrading gracefully.
+    #[cfg(not(feature = "metal"))]
+    #[test]
+    fn explicit_metal_request_fails_without_feature() {
+        use joshua::{ComputeBackend, Engine, EngineOptions};
+
+        let dir = model_dir("metal-strict");
+        write_tiny_gguf(&dir.join("model.gguf"), "llama");
+
+        let err = Engine::with_options(
+            &dir,
+            EngineOptions::with_n_ctx(64).backend(ComputeBackend::Metal),
+        )
+        .err()
+        .expect("explicit Metal on a non-metal build must fail");
+        assert!(
+            format!("{err}").contains("no `metal` feature"),
+            "unexpected error: {err}"
+        );
+
+        // Auto on the same build loads fine on CPU.
+        let engine = Engine::with_options(&dir, EngineOptions::with_n_ctx(64))
+            .expect("auto backend must load the tiny model");
+        assert!(
+            engine.device().is_cpu(),
+            "auto on a non-metal build must pick CPU, got {:?}",
+            engine.device()
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
 
 // ─── Type tests (always run) ──────────────────────────────────────────────────
