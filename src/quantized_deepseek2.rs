@@ -386,15 +386,19 @@ struct Attention {
     v_head_dim: usize,
     q_head_dim: usize,
     softmax_scale: f64,
-    /// MLA latent cache: `(c_kv [b, seq, kv_lora_rank], k_pe [b, 1, seq, qk_rope])`.
+    /// MLA cache: reconstructed per-head K/V kept transposed —
+    /// `(k [b, n_head, q_head_dim, seq], v [b, n_head, v_head_dim, seq])` —
+    /// and appended incrementally.
     ///
-    /// MLA stores the compressed latent (plus the single-head RoPE'd key)
-    /// rather than the reconstructed per-head K/V: for real models the latent
-    /// is `kv_lora_rank + qk_rope` ≈ 576 elems/token vs
-    /// `n_head·(qk_nope + v_head_dim)` ≈ 40,960 for the full K/V — a ~70x
-    /// memory reduction.  The full K/V is rebuilt once per forward from the
-    /// latent (a linear map), which is what DeepSeek's reference, llama.cpp
-    /// and vLLM all do.
+    /// The compressed latent is only `kv_lora_rank + qk_rope` ≈ 576 elems/token
+    /// vs `n_head·(qk_nope + v_head_dim)` ≈ 40,960 for the full per-head K/V, so
+    /// caching the latent saves ~70x memory — but reconstructing the full K/V
+    /// from it every forward is O(seq) work per step, which makes decode
+    /// degrade linearly with context length.  Instead we reconstruct K/V for
+    /// the *new* tokens only (a linear map over the latent) and append the
+    /// per-head result to the cache: decode stays O(1) in reconstruction, at
+    /// the cost of caching the ~8x larger per-head form (still far below a
+    /// plain MHA model, since MLA keeps Q and the latent low-rank).
     kv_cache: Option<(Tensor, Tensor)>,
 }
 
@@ -444,42 +448,51 @@ impl Attention {
         let (q_pe, k_pe) = self.rotary.apply(&q_pe, &k_pe, offset)?;
         let q = Tensor::cat(&[&q_nope.contiguous()?, &q_pe.contiguous()?], D::Minus1)?;
 
-        // MLA latent cache: append this step's compressed latent and RoPE'd key.
-        // The full per-head K/V is reconstructed once, below, from the latent —
-        // ~70x less cache memory than storing the reconstructed K/V.
-        let (kv_cmpr, k_pe) = match &self.kv_cache {
-            None => (kv_cmpr, k_pe),
-            Some((pc, pk)) => (
-                Tensor::cat(&[pc, &kv_cmpr], 1)?.contiguous()?,
-                Tensor::cat(&[pk, &k_pe], 2)?.contiguous()?,
-            ),
-        };
-        self.kv_cache = Some((kv_cmpr.clone(), k_pe.clone()));
-
-        // Reconstruct the full per-head [k_nope ‖ v] for every cached position.
-        // kv_a_norm is a per-row norm and kv_b a linear map, so applying them to
-        // the concatenated latent is bit-identical to the per-step application.
-        let (b, s_total, _) = kv_cmpr.dims3()?;
+        // Reconstruct per-head K/V for the *new* tokens only and append it to
+        // the cache.  kv_a_norm is a per-row norm and kv_b a linear map, so
+        // applying them to this step's latent is bit-identical to the old
+        // whole-cache reconstruction — just O(seq_len) instead of O(seq_total)
+        // per step, which is what made decode slow down with context length.
         let kv = self
             .kv_b
             .forward(&self.kv_a_norm.forward(&kv_cmpr)?)?
-            .reshape((b, s_total, self.n_head, self.qk_nope + self.v_head_dim))?
-            .transpose(1, 2)?;
-        let k_nope = kv.narrow(D::Minus1, 0, self.qk_nope)?;
-        let v = kv.narrow(D::Minus1, self.qk_nope, self.v_head_dim)?.contiguous()?;
-        let k_pe = k_pe.broadcast_as((b, self.n_head, s_total, self.qk_rope))?;
-        let k = Tensor::cat(&[&k_nope.contiguous()?, &k_pe.contiguous()?], D::Minus1)?;
+            .reshape((b, seq_len, self.n_head, self.qk_nope + self.v_head_dim))?
+            .transpose(1, 2)?; // [b, n_head, seq_len, qk_nope + v_head_dim]
+        let k_nope = kv.narrow(D::Minus1, 0, self.qk_nope)?; // [b, n_head, seq_len, qk_nope]
+        let v = kv
+            .narrow(D::Minus1, self.qk_nope, self.v_head_dim)?
+            .contiguous()?; // [b, n_head, seq_len, v_head_dim]
+        // The single-head RoPE'd key is shared (MQA-style) across query heads.
+        let k_pe = k_pe.broadcast_as((b, self.n_head, seq_len, self.qk_rope))?;
+        let k_new = Tensor::cat(&[&k_nope.contiguous()?, &k_pe], D::Minus1)?; // [b, n_head, seq_len, q_head_dim]
 
-        // Scaled dot-product attention.
-        let scores = (q.contiguous()?.matmul(&k.transpose(2, 3)?.contiguous()?)? * self.softmax_scale)?;
+        // The cache lives transposed — [b, n_head, dim, seq] — so the attention
+        // matmuls below run directly on it: `q · kᵀ` becomes `q · k_cache` and
+        // `probs · v` becomes `v_cache · probsᵀ`.  A decode step then copies
+        // only the two append cats (the accumulated context), never an extra
+        // transpose of it.
+        let k_new = k_new.transpose(2, 3)?.contiguous()?; // [b, n_head, q_head_dim, seq_len]
+        let v_new = v.transpose(2, 3)?.contiguous()?; // [b, n_head, v_head_dim, seq_len]
+        let (k_cache, v_cache) = match &self.kv_cache {
+            None => (k_new, v_new),
+            Some((kc, vc)) => (
+                Tensor::cat(&[kc, &k_new], 3)?.contiguous()?,
+                Tensor::cat(&[vc, &v_new], 3)?.contiguous()?,
+            ),
+        };
+        self.kv_cache = Some((k_cache.clone(), v_cache.clone()));
+
+        // Scaled dot-product attention over the whole cached context.
+        let scores = (q.contiguous()?.matmul(&k_cache)? * self.softmax_scale)?; // [b, n_head, seq_len, seq_total]
         let scores = match mask {
             Some(m) => scores.broadcast_add(m)?,
             None => scores,
         };
         let probs = softmax_last_dim(&scores)?;
-        let ctx = probs.matmul(&v)?; // [b, n_head, seq, v_head_dim]
+        let ctx = v_cache.matmul(&probs.transpose(2, 3)?.contiguous()?)?; // [b, n_head, v_head_dim, seq_len]
         let ctx = ctx
-            .transpose(1, 2)?
+            .transpose(1, 3)?
+            .transpose(2, 3)?
             .contiguous()?
             .reshape((b, seq_len, self.n_head * self.v_head_dim))?;
         self.o_proj.forward(&ctx)
@@ -493,7 +506,7 @@ impl Attention {
 // ─── Mixture of experts (DeepSeek routing + shared experts) ──────────────────
 
 struct Moe {
-    gate: Tensor,          // router weight [n_expert, n_embd] (f32)
+    gate_t: Tensor,        // router weight transposed to [n_embd, n_expert], contiguous (cached)
     gate_bias: Option<Tensor>, // exp_probs_b [n_expert] (f32), V3/K2 only
     experts: Vec<Mlp>,     // per-expert quantized SwiGLU
     shared: Option<Mlp>,
@@ -512,7 +525,7 @@ impl Moe {
         let x2 = xs.reshape((n_tokens, h))?;
 
         // Router logits → per-expert scores.
-        let logits = x2.matmul(&self.gate.t()?.contiguous()?)?; // [n_tokens, n_expert]
+        let logits = x2.matmul(&self.gate_t)?; // [n_tokens, n_expert]
         let probs = match self.gating {
             Gating::Softmax => softmax_last_dim(&logits)?,
             Gating::Sigmoid => sigmoid(&logits)?,
@@ -585,6 +598,14 @@ impl Moe {
 
     /// Run each selected expert over its routed tokens and accumulate the
     /// weighted outputs. Experts stay quantized.
+    ///
+    /// Prefill (`n_tokens > 1`) buckets tokens per expert and runs one batched
+    /// matmul per expert.  Decode (`n_tokens == 1`) takes a separate path that
+    /// avoids every per-expert host round-trip: no `to_vec1` drain on the
+    /// weights, no `Tensor::from_vec` uploads, no `index_select`/`index_add`.
+    /// Each single-token layer forward then costs one host drain (the expert
+    /// ids, needed to pick weights) plus `n_expert_used ×` the expert MLPs and
+    /// a stack–scale–sum, instead of per-expert uploads and gathers.
     fn dispatch(
         &self,
         x2: &Tensor,
@@ -592,6 +613,9 @@ impl Moe {
         weights: &Tensor,
         n_tokens: usize,
     ) -> Result<Tensor> {
+        if n_tokens == 1 {
+            return self.dispatch_decode(x2, topk_idx, weights);
+        }
         let k = self.n_expert_used;
         let h = x2.dim(1)?;
         let ids: Vec<u32> = topk_idx.flatten_all()?.to_vec1()?;
@@ -621,6 +645,28 @@ impl Moe {
             let w = Tensor::from_vec(w, (count, 1), dev)?;
             y = y.index_add(&idx, &out.broadcast_mul(&w)?, 0)?;
         }
+        Ok(y)
+    }
+
+    /// Single-token decode dispatch.  With one token every selected expert
+    /// consumes the same input row, so there is nothing to gather: run the
+    /// `k` expert MLPs over `x2`, stack their outputs, scale by the routing
+    /// weights (still on the device — no copy back) and sum.
+    fn dispatch_decode(
+        &self,
+        x2: &Tensor,
+        topk_idx: &Tensor,
+        weights: &Tensor,
+    ) -> Result<Tensor> {
+        let k = self.n_expert_used;
+        let ids: Vec<u32> = topk_idx.flatten_all()?.to_vec1()?; // [k] — the one host sync
+        let mut outs = Vec::with_capacity(k);
+        for &e in ids.iter() {
+            outs.push(self.experts[e as usize].forward(x2)?); // [1, h] each
+        }
+        let out = Tensor::stack(&outs, 0)?; // [k, 1, h]
+        let w = weights.reshape((k, 1, 1))?; // GPU view [k, 1, 1]
+        let y = out.broadcast_mul(&w)?.sum(0)?; // [1, h]
         Ok(y)
     }
 }
@@ -940,7 +986,7 @@ fn load_moe<R: Read + Seek>(rd: &mut Reader<R>, p: &str, cfg: &Config) -> Result
     };
 
     Ok(Moe {
-        gate,
+        gate_t: gate.t()?.contiguous()?,
         gate_bias,
         experts,
         shared,
@@ -1131,10 +1177,11 @@ mod tests {
         })
     }
 
-    /// The cache must hold the compressed latent `(c_kv, k_pe)`, not the
-    /// reconstructed per-head K/V — that is the ~70x memory win of MLA.
+    /// The cache must hold the reconstructed per-head K/V (appended
+    /// incrementally), not the compressed latent — decode then costs O(1)
+    /// reconstruction per step instead of the O(seq) full rebuild.
     #[test]
-    fn mla_cache_stores_compressed_latent_not_full_kv() -> Result<()> {
+    fn mla_cache_stores_reconstructed_per_head_kv() -> Result<()> {
         let dev = Device::Cpu;
         let w = tiny_weights(&dev)?;
         let mut attn = tiny_attention(&dev, &w)?;
@@ -1142,16 +1189,20 @@ mod tests {
         // Prefill: 3 tokens at once.
         let xs = Tensor::randn(0f32, 1f32, (1, 3, 8), &dev)?;
         attn.forward(&xs, None, 0)?;
-        let (c, k) = attn.kv_cache.as_ref().expect("cache populated after prefill");
-        assert_eq!(c.dims(), &[1, 3, 6], "latent cache must be [b, seq, kv_lora_rank]");
-        assert_eq!(k.dims(), &[1, 1, 3, 4], "k_pe cache must be [b, 1, seq, qk_rope]");
+        let (k, v) = attn.kv_cache.as_ref().expect("cache populated after prefill");
+        assert_eq!(
+            k.dims(),
+            &[1, 2, 8, 3],
+            "k cache must be [b, n_head, qk_nope + qk_rope, seq]"
+        );
+        assert_eq!(v.dims(), &[1, 2, 4, 3], "v cache must be [b, n_head, v_head_dim, seq]");
 
         // Decode: one more token appends along seq.
         let xs2 = Tensor::randn(0f32, 1f32, (1, 1, 8), &dev)?;
         attn.forward(&xs2, None, 3)?;
-        let (c, k) = attn.kv_cache.as_ref().expect("cache after decode");
-        assert_eq!(c.dims(), &[1, 4, 6]);
-        assert_eq!(k.dims(), &[1, 1, 4, 4]);
+        let (k, v) = attn.kv_cache.as_ref().expect("cache after decode");
+        assert_eq!(k.dims(), &[1, 2, 8, 4]);
+        assert_eq!(v.dims(), &[1, 2, 4, 4]);
         Ok(())
     }
 
@@ -1197,6 +1248,64 @@ mod tests {
             .to_vec1::<f32>()?;
         let max = out_diff.into_iter().fold(0.0f32, f32::max);
         assert!(max < 1e-5, "attention outputs diverge: max diff {max}");
+        Ok(())
+    }
+
+    /// The single-token decode dispatch path must agree exactly with the
+    /// batched prefill path: each token is routed to the same experts and the
+    /// per-expert MLPs are applied to the same input, just gathered/stacked
+    /// differently.
+    #[test]
+    fn moe_decode_dispatch_matches_batched_dispatch() -> Result<()> {
+        use candle_core::quantized::QMatMul;
+
+        let dev = Device::Cpu;
+        let h = 6usize; // n_embd
+        let n_expert = 8usize;
+        let k = 2usize; // n_expert_used
+        let ffn = 10usize; // intermediate size
+
+        let lin = |rows: usize, cols: usize| -> QMatMul {
+            QMatMul::Tensor(Tensor::randn(0f32, 1f32, (rows, cols), &dev).unwrap())
+        };
+        let gate = Tensor::randn(0f32, 1f32, (n_expert, h), &dev)?;
+        let experts = (0..n_expert)
+            .map(|_| Mlp {
+                gate: lin(ffn, h),
+                up: lin(ffn, h),
+                down: lin(h, ffn),
+            })
+            .collect();
+        let moe = Moe {
+            gate_t: gate.t()?.contiguous()?,
+            gate_bias: None,
+            experts,
+            shared: None,
+            gating: Gating::Softmax,
+            n_expert_used: k,
+            n_group: 1,
+            topk_group: 1,
+            weights_norm: false,
+            weights_scale: 0.0,
+        };
+
+        // Batched path: 3 tokens in one forward (softmax routing per token).
+        let xs = Tensor::randn(0f32, 1f32, (1, 3, h), &dev)?;
+        let out_batch = moe.forward(&xs)?; // [1, 3, h]
+
+        // Decode path: same 3 tokens one at a time, concatenated.
+        let mut out_inc = Vec::new();
+        for t in 0..3 {
+            out_inc.push(moe.forward(&xs.narrow(1, t, 1)?)?); // [1, 1, h]
+        }
+        let out_inc = Tensor::cat(&out_inc, 1)?; // [1, 3, h]
+
+        let diff = (out_batch - out_inc)?
+            .abs()?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let max = diff.into_iter().fold(0.0f32, f32::max);
+        assert!(max < 1e-5, "decode vs batched dispatch diverge: max diff {max}");
         Ok(())
     }
 }
