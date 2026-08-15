@@ -20,9 +20,34 @@ use clap::{Parser, Subcommand, ValueEnum};
 use tracing_subscriber::EnvFilter;
 
 use joshua::{
-    engine::Engine, server, types::GenerationOptions, ChatMessage, EngineOptions, HugePages,
-    MlockMode, MmapMode, PageSize,
+    engine::Engine, server, types::GenerationOptions, ChatMessage, ComputeBackend, EngineOptions,
+    HugePages, MlockMode, MmapMode, PageSize,
 };
+
+/// Values for `--device` (CLI form of [`ComputeBackend`]).
+#[derive(Debug, Clone, Copy, ValueEnum, Default)]
+enum DeviceArg {
+    /// Best backend this build supports: CUDA, then Metal, then CPU.
+    #[default]
+    Auto,
+    /// CPU inference.
+    Cpu,
+    /// Apple Metal (build with `--features metal`).
+    Metal,
+    /// NVIDIA CUDA (build with `--features cuda`).
+    Cuda,
+}
+
+impl From<DeviceArg> for ComputeBackend {
+    fn from(arg: DeviceArg) -> Self {
+        match arg {
+            DeviceArg::Auto => ComputeBackend::Auto,
+            DeviceArg::Cpu => ComputeBackend::Cpu,
+            DeviceArg::Metal => ComputeBackend::Metal,
+            DeviceArg::Cuda => ComputeBackend::Cuda,
+        }
+    }
+}
 
 /// Physical-memory backing for the model mapping (CLI form of [`HugePages`]).
 #[derive(Debug, Clone, Copy, ValueEnum, Default)]
@@ -102,6 +127,11 @@ enum Commands {
         /// Context window size in tokens.
         #[arg(long, default_value_t = 4096)]
         n_ctx: u32,
+        /// Compute backend: auto, cpu, metal, or cuda.  An explicit GPU
+        /// request fails the load when the backend is not built in or is
+        /// unavailable at runtime.
+        #[arg(long, env = "JOSHUA_DEVICE", value_enum, default_value_t = DeviceArg::Auto)]
+        device: DeviceArg,
         /// Physical-memory backing for the model: off, transparent, huge,
         /// 2mb, or 1gb (Linux only for the huge-page modes).
         #[arg(long, value_enum, default_value_t = HugePagesArg::Off)]
@@ -179,6 +209,11 @@ enum Commands {
         /// Context window size in tokens.
         #[arg(long, default_value_t = 4096)]
         n_ctx: u32,
+        /// Compute backend: auto, cpu, metal, or cuda.  An explicit GPU
+        /// request fails the load when the backend is not built in or is
+        /// unavailable at runtime.
+        #[arg(long, env = "JOSHUA_DEVICE", value_enum, default_value_t = DeviceArg::Auto)]
+        device: DeviceArg,
         /// Physical-memory backing for the model: off, transparent, huge,
         /// 2mb, or 1gb (Linux only for the huge-page modes).
         #[arg(long, value_enum, default_value_t = HugePagesArg::Off)]
@@ -235,6 +270,9 @@ enum Commands {
         /// Path to the GGUF embedding model file.
         #[arg(short, long, env = "JOSHUA_MODEL_PATH")]
         model: PathBuf,
+        /// Compute backend: auto, cpu, metal, or cuda.
+        #[arg(long, env = "JOSHUA_DEVICE", value_enum, default_value_t = DeviceArg::Auto)]
+        device: DeviceArg,
         /// Texts to embed.
         texts: Vec<String>,
     },
@@ -254,6 +292,7 @@ async fn main() -> anyhow::Result<()> {
             model,
             addr,
             n_ctx,
+            device,
             huge_pages,
             mmap,
             lazy_weights,
@@ -279,6 +318,7 @@ async fn main() -> anyhow::Result<()> {
 
             let pin_hot = pin_hot_weights.unwrap_or_else(|| model_larger_than_ram(&model));
             let opts = EngineOptions::with_n_ctx(n_ctx)
+                .backend(device.into())
                 .huge_pages(huge_pages.into())
                 .mmap(mmap_mode(mmap))
                 .lazy_weights(lazy_weights)
@@ -337,6 +377,7 @@ async fn main() -> anyhow::Result<()> {
             max_tokens,
             temperature,
             n_ctx,
+            device,
             huge_pages,
             mmap,
             lazy_weights,
@@ -347,6 +388,7 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let pin_hot = pin_hot_weights.unwrap_or_else(|| model_larger_than_ram(&model));
             let opts = EngineOptions::with_n_ctx(n_ctx)
+                .backend(device.into())
                 .huge_pages(huge_pages.into())
                 .mmap(mmap_mode(mmap))
                 .lazy_weights(lazy_weights)
@@ -370,11 +412,12 @@ async fn main() -> anyhow::Result<()> {
             );
         }
 
-        Commands::Embed { model, texts } => {
+        Commands::Embed { model, device, texts } => {
             if texts.is_empty() {
                 anyhow::bail!("At least one text is required");
             }
-            let engine = Engine::new(&model)?;
+            let opts = EngineOptions::default().backend(device.into());
+            let engine = Engine::with_options(&model, opts)?;
             let embeddings = engine.embed(&texts)?;
             for (i, emb) in embeddings.iter().enumerate() {
                 let preview: Vec<String> = emb.iter().take(8).map(|v| format!("{v:.4}")).collect();

@@ -157,6 +157,61 @@ cargo build --release
     --addr 0.0.0.0:8080
 ```
 
+### 5 — GPU acceleration (Metal / CUDA)
+
+Joshua runs inference on the CPU by default, but a single build can also run
+on a GPU, chosen per invocation.  Add the backend feature **at build time**
+(candle compiles the kernels in):
+
+```bash
+# Apple Silicon Mac: Metal
+cargo build --release --features metal
+
+# NVIDIA GPU: CUDA (needs a CUDA toolkit; Linux/Windows)
+cargo build --release --features cuda
+```
+
+Then pick the device at runtime — `auto` (the default) uses the best backend
+this build was compiled with and degrades to CPU with a warning; an explicit
+request is strict and fails the load if the device is missing:
+
+```bash
+./target/release/joshua serve --model m.gguf --device metal      # force Metal
+./target/release/joshua serve --model m.gguf --device cpu        # force CPU
+./target/release/joshua serve --model m.gguf --device auto       # default
+```
+
+`--device` also accepts `cuda`, and the same selection is available as
+`JOSHUA_DEVICE` for the server.  The resolved device is logged at startup;
+library callers use [`EngineOptions::backend`]:
+
+```rust
+use joshua::{Engine, EngineOptions, ComputeBackend};
+
+let engine = Engine::with_options("m.gguf",
+    EngineOptions::with_n_ctx(4096).backend(ComputeBackend::Metal))?;
+```
+
+**What runs on Metal.** Candle's Metal kernels cover every standard GGUF
+quantisation (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q8_1 and the k-quants Q2_K…Q8_K), so
+the dense architectures, **Qwen3-MoE**, and Joshua's own **DeepSeek-V2/V3 /
+Kimi-K2** loader all run quantized on the GPU — experts stay in their
+on-disk quantisation rather than being dequantised to f32.  A model that
+fits in unified memory (e.g. DeepSeek-V2-Lite Q4_K_M or Qwen3-30B-A3B on a
+16 GB Mac) works end to end; weights are copied into Metal buffers at load,
+so the file is still mmap'd but the zero-copy borrowing and huge-page tricks
+are CPU-only by design.
+
+One kernel constraint: candle's Metal backend routes single-token *decode*
+through its fused attention kernel, which supports head dims ≥ 32 — every
+real model (llama 64/128, Qwen 128, Gemma 256, DeepSeek MLA 64/128)
+qualifies; only toy embeddings with head dim 4 need the CPU.
+
+**What stays on CPU.** `deepseek4` (DeepSeek-V4-Flash) refuses a GPU device
+at load: its IQ2_XXS expert weights have no Metal/CUDA kernel and the
+loader degrades to a clear error rather than materialising ~16× f32.
+Whisper transcription is CPU-only.
+
 ---
 
 ## HTTP API

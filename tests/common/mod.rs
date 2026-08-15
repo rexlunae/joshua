@@ -256,6 +256,173 @@ pub fn write_tiny_llama_gguf(path: &Path) {
     write_tiny_gguf(path, "llama");
 }
 
+/// Like [`write_tiny_llama_gguf`] but with `EMB = 64` (2 heads → head_dim 32)
+/// and small-integer weights.
+///
+/// Two reasons this variant exists:
+/// - candle's Metal backend routes single-token decode through its SDPA kernel,
+///   which only supports head dims ≥ 32 (real llama/qwen/gemma models all
+///   qualify; the EMB=8 toy does not).
+/// - small-integer weights quantise almost exactly in Q8_0, so the logits are
+///   well-separated and greedy argmax is identical on CPU and Metal despite
+///   different accumulation orders.
+pub fn write_tiny_llama_gguf_hd32(path: &Path) {
+    const VOCAB: usize = 16;
+    const EMB: usize = 64;
+    const FFN: usize = 16;
+    const HEADS: usize = 2;
+    const HEAD_DIM: usize = EMB / HEADS; // 32 — Metal SDPA's minimum
+    const Q_DIM: usize = HEADS * HEAD_DIM;
+
+    let key = |suffix: &str| format!("llama.{suffix}");
+    let metadata: Vec<(String, gguf_file::Value)> = vec![
+        (
+            "general.architecture".to_string(),
+            gguf_file::Value::String("llama".to_string()),
+        ),
+        (
+            key("attention.head_count"),
+            gguf_file::Value::U32(HEADS as u32),
+        ),
+        (
+            key("attention.head_count_kv"),
+            gguf_file::Value::U32(HEADS as u32),
+        ),
+        (key("block_count"), gguf_file::Value::U32(2)),
+        (key("embedding_length"), gguf_file::Value::U32(EMB as u32)),
+        (key("context_length"), gguf_file::Value::U32(64)),
+        (
+            key("attention.layer_norm_rms_epsilon"),
+            gguf_file::Value::F32(1e-5),
+        ),
+        (key("rope.freq_base"), gguf_file::Value::F32(10_000.0)),
+        (
+            key("rope.dimension_count"),
+            gguf_file::Value::U32(HEAD_DIM as u32),
+        ),
+        (
+            key("feed_forward_length"),
+            gguf_file::Value::U32(FFN as u32),
+        ),
+        (
+            "tokenizer.ggml.eos_token_id".to_string(),
+            gguf_file::Value::U32(3),
+        ),
+        (
+            "tokenizer.ggml.bos_token_id".to_string(),
+            gguf_file::Value::U32(3),
+        ),
+        (
+            "tokenizer.ggml.unknown_token_id".to_string(),
+            gguf_file::Value::U32(0),
+        ),
+        (
+            "tokenizer.ggml.model".to_string(),
+            gguf_file::Value::String("llama".to_string()),
+        ),
+        (
+            "tokenizer.ggml.tokens".to_string(),
+            gguf_file::Value::Array(
+                [
+                    "<unk>", "hello", "world", "</s>", "a", "b", "c", "d", "e", "f", "g", "h", "i",
+                    "j", "k", "l",
+                ]
+                .iter()
+                .map(|s| gguf_file::Value::String(s.to_string()))
+                .collect(),
+            ),
+        ),
+        (
+            "tokenizer.ggml.scores".to_string(),
+            gguf_file::Value::Array(
+                (0..16)
+                    .map(|i| gguf_file::Value::F32(-(i as f32)))
+                    .collect(),
+            ),
+        ),
+        (
+            "tokenizer.ggml.token_type".to_string(),
+            gguf_file::Value::Array(
+                [2, 1, 1, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+                    .iter()
+                    .map(|&t| gguf_file::Value::I32(t))
+                    .collect(),
+            ),
+        ),
+    ];
+
+    // Deterministic small integers in [-8, 8]: quantise almost exactly in Q8_0
+    // (scale = 8/127) and keep logits well-separated, so greedy decoding is
+    // stable across CPU/Metal accumulation-order differences.
+    let w = |n: usize, seed: usize| {
+        (0..n)
+            .map(|i| ((((seed + 1) * 37 + i * 13) % 17) as i32 - 8) as f32)
+            .collect::<Vec<f32>>()
+    };
+    let ones = |n: usize| vec![1.0f32; n];
+
+    let mut tensors: Vec<(String, QTensor)> = vec![
+        (
+            "token_embd.weight".to_string(),
+            qtensor(w(VOCAB * EMB, 1), &[VOCAB, EMB]),
+        ),
+        ("output_norm.weight".to_string(), qtensor(ones(EMB), &[EMB])),
+        (
+            "blk.0.attn_norm.weight".to_string(),
+            qtensor(ones(EMB), &[EMB]),
+        ),
+        (
+            "blk.0.ffn_norm.weight".to_string(),
+            qtensor(ones(EMB), &[EMB]),
+        ),
+        (
+            "blk.1.attn_norm.weight".to_string(),
+            qtensor(ones(EMB), &[EMB]),
+        ),
+        (
+            "blk.1.ffn_norm.weight".to_string(),
+            qtensor(ones(EMB), &[EMB]),
+        ),
+    ];
+    for (layer, seed) in [(0usize, 2usize), (1, 10)] {
+        tensors.push((
+            format!("blk.{layer}.attn_q.weight"),
+            qtensor(w(Q_DIM * EMB, seed), &[Q_DIM, EMB]),
+        ));
+        tensors.push((
+            format!("blk.{layer}.attn_k.weight"),
+            qtensor(w(Q_DIM * EMB, seed + 1), &[Q_DIM, EMB]),
+        ));
+        tensors.push((
+            format!("blk.{layer}.attn_v.weight"),
+            qtensor(w(Q_DIM * EMB, seed + 2), &[Q_DIM, EMB]),
+        ));
+        tensors.push((
+            format!("blk.{layer}.attn_output.weight"),
+            qtensor(w(EMB * Q_DIM, seed + 3), &[EMB, Q_DIM]),
+        ));
+        tensors.push((
+            format!("blk.{layer}.ffn_gate.weight"),
+            qtensor(w(FFN * EMB, seed + 4), &[FFN, EMB]),
+        ));
+        tensors.push((
+            format!("blk.{layer}.ffn_down.weight"),
+            qtensor(w(EMB * FFN, seed + 5), &[EMB, FFN]),
+        ));
+        tensors.push((
+            format!("blk.{layer}.ffn_up.weight"),
+            qtensor(w(FFN * EMB, seed + 6), &[FFN, EMB]),
+        ));
+    }
+
+    let metadata_refs: Vec<(&str, &gguf_file::Value)> =
+        metadata.iter().map(|(k, v)| (k.as_str(), v)).collect();
+    let tensor_refs: Vec<(&str, &QTensor)> = tensors.iter().map(|(k, v)| (k.as_str(), v)).collect();
+
+    let mut file = File::create(path).unwrap();
+    gguf_file::write(&mut file, &metadata_refs, &tensor_refs).unwrap();
+}
+
 /// Write a tiny `deepseek2` GGUF with the KV up-projection in the legacy
 /// combined `attn_kv_b` form (both Joshua and llama.cpp take the unabsorbed
 /// attention path). DeepSeek-V3 / Kimi-K2 style (sigmoid gating + selection

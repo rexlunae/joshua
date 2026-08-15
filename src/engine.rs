@@ -188,6 +188,29 @@ pub enum MlockMode {
     Required,
 }
 
+/// Compute backend for the engine.
+///
+/// [`ComputeBackend::Auto`] (the default) picks the best backend this build
+/// was compiled with — CUDA first when the `cuda` feature is on, then Metal
+/// when the `metal` feature is on, else CPU — and falls back to CPU with a
+/// warning when the compiled-in backend is unavailable at runtime.  An
+/// explicit [`ComputeBackend::Metal`] or [`ComputeBackend::Cuda`] request
+/// instead fails the load when the backend is not compiled in or cannot be
+/// initialised, so a wrong `--device` flag is never silently ignored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ComputeBackend {
+    /// Best backend compiled in (CUDA > Metal > CPU), falling back to CPU.
+    #[default]
+    Auto,
+    /// CPU inference (always available).
+    Cpu,
+    /// Apple Metal.  Requires the `metal` cargo feature and a Metal-capable
+    /// macOS machine.
+    Metal,
+    /// NVIDIA CUDA.  Requires the `cuda` cargo feature and a CUDA toolkit.
+    Cuda,
+}
+
 /// Construction options for [`Engine`].
 ///
 /// Use [`Engine::with_options`] for full control; [`Engine::new`] and
@@ -196,6 +219,8 @@ pub enum MlockMode {
 pub struct EngineOptions {
     /// Context-window size in tokens (0 selects the 4096 default).
     pub n_ctx: u32,
+    /// Compute backend to run inference on.  See [`ComputeBackend`].
+    pub backend: ComputeBackend,
     /// Physical-memory backing strategy for the model mapping.
     pub huge_pages: HugePages,
     /// Optimise the mapping for models far larger than RAM.
@@ -274,6 +299,12 @@ impl EngineOptions {
             n_ctx,
             ..Self::default()
         }
+    }
+
+    /// Select the compute backend.  See [`ComputeBackend`].
+    pub fn backend(mut self, backend: ComputeBackend) -> Self {
+        self.backend = backend;
+        self
     }
 
     /// Select the huge-page strategy.
@@ -648,7 +679,7 @@ impl Engine {
 
         let eos_token_ids = extract_eos_ids(&gguf, &tokenizer);
         let chat_template = extract_chat_template(&gguf, &tokenizer);
-        let device = Self::default_device();
+        let device = Self::resolve_device(options.backend)?;
 
         tracing::info!(
             "Model '{}' ready (arch={}, ctx={}, eos_ids={:?}, chat_template={}, device={:?})",
@@ -711,7 +742,7 @@ impl Engine {
         self
     }
 
-    /// Pick the compute device.
+    /// Pick the compute device for [`ComputeBackend::Auto`].
     ///
     /// With the `cuda` or `metal` cargo feature enabled this tries the GPU
     /// first and falls back to CPU (with a warning) when no usable device is
@@ -734,6 +765,60 @@ impl Engine {
         Device::Cpu
     }
 
+    /// Resolve the [`ComputeBackend`] requested in [`EngineOptions`] to a
+    /// concrete candle [`Device`].
+    ///
+    /// [`ComputeBackend::Auto`] follows [`Self::default_device`], degrading to
+    /// CPU with a warning.  An explicit GPU request is strict: failing to
+    /// initialise the device — or a build without the matching cargo feature —
+    /// is a load error, never a silent CPU fallback.
+    fn resolve_device(backend: ComputeBackend) -> Result<Device> {
+        match backend {
+            ComputeBackend::Auto => Ok(Self::default_device()),
+            ComputeBackend::Cpu => Ok(Device::Cpu),
+            ComputeBackend::Metal => {
+                #[cfg(feature = "metal")]
+                {
+                    Device::new_metal(0).map_err(|e| {
+                        JoshuaError::ModelLoad(format!(
+                            "Metal device requested but unavailable: {e}. \
+                             Build with `--features metal` and run on a Metal-capable Mac, \
+                             or pass --device cpu / auto."
+                        ))
+                    })
+                }
+                #[cfg(not(feature = "metal"))]
+                {
+                    Err(JoshuaError::ModelLoad(
+                        "Metal device requested but this build has no `metal` feature. \
+                         Rebuild with `cargo build --features metal`, or pass --device cpu / auto."
+                            .to_string(),
+                    ))
+                }
+            }
+            ComputeBackend::Cuda => {
+                #[cfg(feature = "cuda")]
+                {
+                    Device::new_cuda(0).map_err(|e| {
+                        JoshuaError::ModelLoad(format!(
+                            "CUDA device requested but unavailable: {e}. \
+                             Build with `--features cuda` and a CUDA toolkit, \
+                             or pass --device cpu / auto."
+                        ))
+                    })
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    Err(JoshuaError::ModelLoad(
+                        "CUDA device requested but this build has no `cuda` feature. \
+                         Rebuild with `cargo build --features cuda`, or pass --device cpu / auto."
+                            .to_string(),
+                    ))
+                }
+            }
+        }
+    }
+
     /// The stem of the loaded model file name.
     pub fn model_name(&self) -> &str {
         &self.model_name
@@ -747,6 +832,12 @@ impl Engine {
     /// Context-window size in tokens.
     pub fn n_ctx(&self) -> u32 {
         self.n_ctx
+    }
+
+    /// The compute device inference runs on (CPU, or Metal/CUDA when the
+    /// matching feature is enabled and a device is available).
+    pub fn device(&self) -> &Device {
+        &self.device
     }
 
     // ─── Prompt formatting ────────────────────────────────────────────────────
