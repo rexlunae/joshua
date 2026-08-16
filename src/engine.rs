@@ -1632,8 +1632,7 @@ fn map_model(
 
     check_mappable(path, &file, mmap_mode, true)?;
 
-    let mmap = unsafe { Mmap::map(&file) }
-        .map_err(|e| JoshuaError::ModelLoad(format!("mmap of GGUF file failed: {e}")))?;
+    let mmap = map_model_file_padded(&file)?;
 
     // Weight tensors are normally consumed in file order during a load, so
     // ask the kernel to read ahead aggressively.  When the caller has flagged
@@ -2093,7 +2092,28 @@ fn map_model_hugetlb(path: &Path, file: &File, size: PageSize) -> Result<Mmap> {
 #[cfg(not(target_os = "linux"))]
 fn map_model_hugetlb(_path: &Path, file: &File, _size: PageSize) -> Result<Mmap> {
     tracing::warn!("explicit huge pages are Linux-only; using a normal file mapping");
-    unsafe { Mmap::map(file) }
+    map_model_file_padded(file)
+}
+
+/// Map `file` with its length rounded up to a whole page.
+///
+/// `mmap(2)` maps whole pages anyway, so the rounded-up region is valid
+/// address space (the tail past EOF is zero-filled).  The page-multiple
+/// length matters to the zero-copy Metal weight path:
+/// `newBufferWithBytesNoCopy` requires the wrapped region's length to be a
+/// multiple of the page size.
+fn map_model_file_padded(file: &File) -> Result<Mmap> {
+    let len = file
+        .metadata()
+        .map_err(|e| JoshuaError::ModelLoad(format!("stat of GGUF file failed: {e}")))?
+        .len() as usize;
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+    let map_len = if page > 0 && page.is_power_of_two() {
+        len.next_multiple_of(page)
+    } else {
+        len
+    };
+    unsafe { memmap2::MmapOptions::new().len(map_len).map(file) }
         .map_err(|e| JoshuaError::ModelLoad(format!("mmap of GGUF file failed: {e}")))
 }
 

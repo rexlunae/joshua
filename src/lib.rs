@@ -41,6 +41,7 @@ pub mod server;
 pub mod simd;
 pub mod template;
 pub mod whisper;
+pub mod zero_copy_metal;
 pub mod tools;
 pub mod types;
 

@@ -38,17 +38,36 @@ default = []
 # pulls in the corresponding candle backend (CUDA needs the NVIDIA toolkit
 # at build time, Metal is macOS-only).
 cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
-metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
+metal = [
+    "candle-core/metal",
+    "candle-nn/metal",
+    "candle-transformers/metal",
+    "dep:candle-metal-kernels",
+    "dep:objc2-metal",
+]
 # HTTPS termination via rustls. Opt-in because the ring crypto provider
 # compiles C/assembly, which would break the default build's
 # "only a Rust toolchain required" guarantee.
 tls = ["dep:axum-server", "dep:rustls"]
+
+# Zero-copy Metal weights (mmap-backed GPU buffers) use the vendored
+# candle-metal-kernels, patched with offset-aware quantized entry points.
+# Always applied so the vendored crate is the one candle-core links against.
+[patch.crates-io]
+candle-metal-kernels = { path = "vendor/candle-metal-kernels" }
 
 [dependencies]
 # Pure Rust ML inference (no C/C++ dependencies required for CPU)
 candle-core = "0.11"
 candle-transformers = "0.11"
 candle-nn = "0.11"
+
+# Metal quantized kernels (the vendored copy, patched with offset-aware
+# entry points for zero-copy weights) and the objc2 binding needed to create
+# a no-copy buffer over the model mapping.  Both only under the `metal`
+# feature.
+candle-metal-kernels = { version = "0.11", optional = true }
+objc2-metal = { version = "0.3.2", optional = true }
 
 # f16/bf16 block element types, for reinterpreting memory-mapped GGUF tensors
 # in place.  Kept in lockstep with the version candle already resolves to.
