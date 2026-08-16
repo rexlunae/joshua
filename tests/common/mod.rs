@@ -27,6 +27,13 @@ pub fn qtensor(data: Vec<f32>, shape: &[usize]) -> QTensor {
     QTensor::quantize(&t, GgmlDType::F32).unwrap()
 }
 
+/// Q4_K quantized tensor — used by writers that exercise the K-quant matmul
+/// paths (Metal needs dims that are multiples of 256 for Q4_K blocks).
+pub fn qtensor_q4k(data: Vec<f32>, shape: &[usize]) -> QTensor {
+    let t = Tensor::from_vec(data, shape, &Device::Cpu).unwrap();
+    QTensor::quantize(&t, GgmlDType::Q4K).unwrap()
+}
+
 /// A minimal WordLevel tokenizer with a 16-token vocabulary.
 pub const TOKENIZER_JSON: &str = r#"{
     "version": "1.0",
@@ -727,7 +734,7 @@ pub fn write_tiny_qwen3moe_gguf(path: &Path) {
     let u32v = |v: u32| gguf_file::Value::U32(v);
     let f32v = |v: f32| gguf_file::Value::F32(v);
     let key = |s: &str| format!("qwen3moe.{s}");
-    let mut metadata: Vec<(String, gguf_file::Value)> = vec![
+    let metadata: Vec<(String, gguf_file::Value)> = vec![
         (
             "general.architecture".to_string(),
             gguf_file::Value::String("qwen3moe".to_string()),
@@ -867,7 +874,168 @@ pub fn write_tiny_qwen3moe_gguf(path: &Path) {
     gguf_file::write(&mut file, &metadata_refs, &tensor_refs).unwrap();
 }
 
-/// Write a GGUF with a known-to-llama.cpp but unimplemented architecture.
+/// Tiny `qwen3moe` GGUF scaled up enough to run on Metal.
+///
+/// The CPU writer above uses head_dim=4, which Metal rejects (head dims must
+/// be >= 32).  This variant uses the real model's head_dim=128 and enough
+/// width for Q4_K block alignment (last dim a multiple of 256), plus 128
+/// experts with top-8 routing like the real Qwen3-30B-A3B.  Norms are F32
+/// (they are not multiples of 256, so they cannot be Q4_K).
+pub fn write_tiny_qwen3moe_metal_gguf(path: &Path) {
+    const VOCAB: usize = 16;
+    const EMB: usize = 256;
+    const H: usize = 2; // heads (H*HD = 256)
+    const KV: usize = 1; // kv heads
+    const HD: usize = 128; // head_dim: real Qwen3-30B-A3B uses 128
+    const NFE: usize = 256; // expert ffn (mult of 256 for Q4K)
+    const NE: usize = 128; // experts — match real Qwen3-30B-A3B
+    const NLAYER: usize = 2;
+
+    let u32v = |v: u32| gguf_file::Value::U32(v);
+    let f32v = |v: f32| gguf_file::Value::F32(v);
+    let key = |s: &str| format!("qwen3moe.{s}");
+    let metadata: Vec<(String, gguf_file::Value)> = vec![
+        (
+            "general.architecture".to_string(),
+            gguf_file::Value::String("qwen3moe".to_string()),
+        ),
+        (key("attention.head_count"), u32v(H as u32)),
+        (key("attention.head_count_kv"), u32v(KV as u32)),
+        (key("block_count"), u32v(NLAYER as u32)),
+        (key("embedding_length"), u32v(EMB as u32)),
+        (key("context_length"), u32v(64)),
+        (key("attention.layer_norm_rms_epsilon"), f32v(1e-5)),
+        (key("attention.key_length"), u32v(HD as u32)),
+        (key("rope.freq_base"), f32v(10_000.0)),
+        (key("expert_count"), u32v(NE as u32)),
+        (key("expert_used_count"), u32v(8)),
+        (key("expert_feed_forward_length"), u32v(NFE as u32)),
+        (key("expert_shared_feed_forward_length"), u32v(0)),
+        (key("attention.norm_topk_prob"), gguf_file::Value::Bool(true)),
+        (
+            "tokenizer.ggml.eos_token_id".to_string(),
+            gguf_file::Value::U32(3),
+        ),
+        (
+            "tokenizer.ggml.bos_token_id".to_string(),
+            gguf_file::Value::U32(3),
+        ),
+        (
+            "tokenizer.ggml.unknown_token_id".to_string(),
+            gguf_file::Value::U32(0),
+        ),
+        (
+            "tokenizer.ggml.model".to_string(),
+            gguf_file::Value::String("llama".to_string()),
+        ),
+        (
+            "tokenizer.ggml.tokens".to_string(),
+            gguf_file::Value::Array(
+                [
+                    "<unk>", "hello", "world", "</s>", "a", "b", "c", "d", "e", "f", "g", "h", "i",
+                    "j", "k", "l",
+                ]
+                .iter()
+                .map(|s| gguf_file::Value::String(s.to_string()))
+                .collect(),
+            ),
+        ),
+        (
+            "tokenizer.ggml.scores".to_string(),
+            gguf_file::Value::Array(
+                (0..16)
+                    .map(|i| gguf_file::Value::F32(-(i as f32)))
+                    .collect(),
+            ),
+        ),
+        (
+            "tokenizer.ggml.token_type".to_string(),
+            gguf_file::Value::Array(
+                [2, 1, 1, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+                    .iter()
+                    .map(|&t| gguf_file::Value::I32(t))
+                    .collect(),
+            ),
+        ),
+        (
+            "tokenizer.chat_template".to_string(),
+            gguf_file::Value::String(
+                "{% for message in messages %}hello {{ message.content }} \
+                 {% endfor %}{% if add_generation_prompt %}world{% endif %}"
+                    .to_string(),
+            ),
+        ),
+    ];
+
+    let ones = |n: usize| vec![1.0f32; n];
+    let mut tensors: Vec<(String, QTensor)> = vec![
+        (
+            "token_embd.weight".to_string(),
+            qtensor_q4k(weights(VOCAB * EMB, 1), &[VOCAB, EMB]),
+        ),
+        (
+            "output_norm.weight".to_string(),
+            qtensor(ones(EMB), &[EMB]),
+        ),
+    ];
+
+    let mut seed = 10u32;
+    let mut next = |n: usize| {
+        seed = seed.wrapping_add(7).wrapping_mul(2_654_435_761) | 1;
+        weights(n, seed)
+    };
+    for i in 0..NLAYER {
+        let p = format!("blk.{i}");
+        tensors.push((format!("{p}.attn_norm.weight"), qtensor(ones(EMB), &[EMB])));
+        tensors.push((format!("{p}.ffn_norm.weight"), qtensor(ones(EMB), &[EMB])));
+        tensors.push((
+            format!("{p}.attn_q.weight"),
+            qtensor_q4k(next(H * HD * EMB), &[H * HD, EMB]),
+        ));
+        tensors.push((
+            format!("{p}.attn_k.weight"),
+            qtensor_q4k(next(KV * HD * EMB), &[KV * HD, EMB]),
+        ));
+        tensors.push((
+            format!("{p}.attn_v.weight"),
+            qtensor_q4k(next(KV * HD * EMB), &[KV * HD, EMB]),
+        ));
+        tensors.push((
+            format!("{p}.attn_output.weight"),
+            qtensor_q4k(next(EMB * H * HD), &[EMB, H * HD]),
+        ));
+        tensors.push((
+            format!("{p}.attn_q_norm.weight"),
+            qtensor(ones(HD), &[HD]),
+        ));
+        tensors.push((
+            format!("{p}.attn_k_norm.weight"),
+            qtensor(ones(HD), &[HD]),
+        ));
+        tensors.push((
+            format!("{p}.ffn_gate_inp.weight"),
+            qtensor(next(NE * EMB), &[NE, EMB]),
+        ));
+        tensors.push((
+            format!("{p}.ffn_gate_exps.weight"),
+            qtensor_q4k(next(NE * NFE * EMB), &[NE, NFE, EMB]),
+        ));
+        tensors.push((
+            format!("{p}.ffn_up_exps.weight"),
+            qtensor_q4k(next(NE * NFE * EMB), &[NE, NFE, EMB]),
+        ));
+        tensors.push((
+            format!("{p}.ffn_down_exps.weight"),
+            qtensor_q4k(next(NE * EMB * NFE), &[NE, EMB, NFE]),
+        ));
+    }
+
+    let metadata_refs: Vec<(&str, &gguf_file::Value)> =
+        metadata.iter().map(|(k, v)| (k.as_str(), v)).collect();
+    let tensor_refs: Vec<(&str, &QTensor)> = tensors.iter().map(|(k, v)| (k.as_str(), v)).collect();
+    let mut file = File::create(path).unwrap();
+    gguf_file::write(&mut file, &metadata_refs, &tensor_refs).unwrap();
+}
 pub fn write_unsupported_gguf(path: &Path) {
     let arch = gguf_file::Value::String("mamba".to_string());
     let metadata: Vec<(&str, &gguf_file::Value)> = vec![("general.architecture", &arch)];
