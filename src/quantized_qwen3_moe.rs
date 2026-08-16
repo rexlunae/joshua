@@ -40,6 +40,8 @@ use candle_core::{DType, Device, Module, Result, Tensor, D};
 use candle_nn::ops::{silu, softmax_last_dim};
 use candle_transformers::quantized_nn::RmsNorm;
 
+use crate::zero_copy_metal::{ZcContext, ZcWeight};
+
 // ─── Configuration ───────────────────────────────────────────────────────────
 
 struct Config {
@@ -154,6 +156,11 @@ struct Reader<R: Read + Seek> {
     /// When present, tensors are borrowed in place from this mapping instead
     /// of being copied onto the heap (see [`crate::mmap_tensor`]).
     mmap: Option<Arc<memmap2::Mmap>>,
+    /// When present, quantized weights are bound straight into the mapping
+    /// via a no-copy Metal buffer (see [`crate::zero_copy_metal`]) instead of
+    /// being uploaded.  `None` on CPU, without a mapping, or when the
+    /// no-copy buffer could not be created (the loader then copies).
+    zc: Option<Arc<ZcContext>>,
 }
 
 impl<R: Read + Seek> Reader<R> {
@@ -169,10 +176,15 @@ impl<R: Read + Seek> Reader<R> {
         }
         self.ct.tensor(&mut self.reader, name, &self.device)
     }
-    fn qmatmul(&mut self, name: &str) -> Result<QMatMul> {
-        QMatMul::from_qtensor(self.qtensor(name)?)
+    fn qmatmul(&mut self, name: &str) -> Result<Weight> {
+        if let Some(zc) = &self.zc {
+            if let Some(w) = zc.weight(&self.ct, name)? {
+                return Ok(Weight::Zc(Arc::new(w)));
+            }
+        }
+        Ok(Weight::Candle(QMatMul::from_qtensor(self.qtensor(name)?)?))
     }
-    fn qmatmul_opt(&mut self, name: &str) -> Option<QMatMul> {
+    fn qmatmul_opt(&mut self, name: &str) -> Option<Weight> {
         if self.has(name) {
             self.qmatmul(name).ok()
         } else {
@@ -187,6 +199,30 @@ impl<R: Read + Seek> Reader<R> {
     }
     fn has(&self, name: &str) -> bool {
         self.ct.tensor_infos.contains_key(name)
+    }
+}
+
+// ─── Weight carrier (candle upload vs zero-copy mmap binding) ───────────────
+
+/// A quantized linear weight in one of two homes:
+///
+/// * [`Weight::Candle`] — candle's own `QMatMul` (copied onto the device).
+///   Used on CPU, without a mapping, and for the tensors the zero-copy path
+///   does not serve.
+/// * [`Weight::Zc`] — a [`ZcWeight`] bound at its file offset inside a
+///   no-copy Metal buffer.  The GPU reads the mapped pages directly; nothing
+///   is copied or uploaded.
+enum Weight {
+    Candle(QMatMul),
+    Zc(Arc<ZcWeight>),
+}
+
+impl Weight {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        match self {
+            Weight::Candle(q) => q.forward(xs),
+            Weight::Zc(z) => z.forward(xs),
+        }
     }
 }
 
@@ -244,10 +280,10 @@ fn repeat_kv(x: Tensor, n_rep: usize) -> Result<Tensor> {
 // ─── Attention (GQA + per-head Q/K RMSNorm) ─────────────────────────────────
 
 struct Attention {
-    q: QMatMul,
-    k: QMatMul,
-    v: QMatMul,
-    o: QMatMul,
+    q: Weight,
+    k: Weight,
+    v: Weight,
+    o: Weight,
     q_norm: RmsNorm, // [head_dim] per-head query norm
     k_norm: RmsNorm, // [head_dim] per-head key norm
     rotary: Arc<RotaryEmbedding>,
@@ -352,9 +388,9 @@ impl Attention {
 // ─── Mixture of experts (Qwen3MoE routing) ──────────────────────────────────
 
 struct Mlp {
-    gate: QMatMul,
-    up: QMatMul,
-    down: QMatMul,
+    gate: Weight,
+    up: Weight,
+    down: Weight,
 }
 
 impl Mlp {
@@ -491,37 +527,67 @@ pub struct GGUFQWenMoE {
     tok_embeddings: Tensor,
     layers: Vec<Layer>,
     norm: RmsNorm,
-    output: QMatMul,
+    output: Weight,
     device: Device,
 }
 
-/// Slice a 3-D expert tensor `[n_expert, out, in]` into per-expert quantized
-/// [`QMatMul`]s, borrowing each expert's bytes in place from the mmap where
-/// possible (so an expert costs a pointer until tokens actually route to it).
+/// Slice a 3-D expert tensor `[n_expert, out, in]` into per-expert [`Weight`]s.
+///
+/// Preferred paths point each expert at its own bytes **without reading or
+/// copying anything**: on Metal via a no-copy buffer at the expert's file
+/// offset, on CPU via a borrowed slice of the mapping.  Either way an expert
+/// costs a pointer and a length until tokens actually route to it.  The
+/// fallback (no mapping, or a tensor that cannot be borrowed) reads the whole
+/// tensor and copies per-expert slices onto the device.
 fn split_experts<R: Read + Seek>(
     rd: &mut Reader<R>,
     name: &str,
     n_expert: usize,
-) -> Result<Vec<QMatMul>> {
-    let qt = rd.qtensor(name)?;
-    let dims = qt.shape().dims().to_vec();
+) -> Result<Vec<Weight>> {
+    let dims = {
+        let Some(info) = rd.ct.tensor_infos.get(name) else {
+            candle_core::bail!("qwen3moe: missing tensor `{name}`");
+        };
+        info.shape.dims().to_vec()
+    };
     if dims.len() != 3 || dims[0] != n_expert {
         candle_core::bail!(
             "qwen3moe: expected expert tensor `{name}` shaped [n_expert, out, in], got {dims:?}"
         );
     }
     let (out, inn) = (dims[1], dims[2]);
-    let dtype: GgmlDType = qt.dtype();
+    let per_elems = out * inn;
 
-    // Preferred path: point each expert straight at its own slice of the
-    // mapping.  Building all of them reads nothing — an expert is a pointer
-    // and a length — so a layer with 128 experts costs almost no memory until
-    // tokens actually route to them.  Borrowed storage is always CPU-resident,
-    // so this is only valid when the model itself runs on the CPU.
+    // Zero-copy Metal path: each expert is a byte range inside the shared
+    // no-copy buffer.  No reads, no uploads.
+    if let (Some(zc), Some(info)) = (&rd.zc, rd.ct.tensor_infos.get(name)) {
+        let dtype = info.ggml_dtype;
+        let block_size = dtype.block_size();
+        if block_size > 0 && per_elems.is_multiple_of(block_size) {
+            let per_bytes = per_elems / block_size * dtype.type_size();
+            let mut experts = Vec::with_capacity(n_expert);
+            for e in 0..n_expert {
+                experts.push(Weight::Zc(Arc::new(ZcWeight::expert(
+                    zc,
+                    info,
+                    rd.ct.tensor_data_offset,
+                    [out, inn],
+                    e * per_bytes,
+                )?)));
+            }
+            return Ok(experts);
+        }
+    }
+
+    // CPU-mmap path: borrow each expert's slice of the mapping.  Building all
+    // of them reads nothing — an expert is a pointer and a length — so a
+    // layer with 128 experts costs almost no memory until tokens actually
+    // route to them.  Borrowed storage is always CPU-resident, so this is
+    // only valid when the model itself runs on the CPU.
     if let Some(mmap) = rd.mmap.clone().filter(|_| rd.device.is_cpu()) {
         if let Some(info) = rd.ct.tensor_infos.get(name) {
+            let dtype = info.ggml_dtype;
             let block_size = dtype.block_size();
-            let per_elems = out * inn;
             if block_size > 0 && per_elems.is_multiple_of(block_size) {
                 let per_bytes = per_elems / block_size * dtype.type_size();
                 let base = rd.ct.tensor_data_offset.saturating_add(info.offset) as usize;
@@ -533,7 +599,7 @@ fn split_experts<R: Read + Seek>(
                         base + e * per_bytes,
                         (out, inn).into(),
                     )? {
-                        Some(t) => borrowed.push(QMatMul::from_qtensor(t)?),
+                        Some(t) => borrowed.push(Weight::Candle(QMatMul::from_qtensor(t)?)),
                         // Any expert that cannot be borrowed (misalignment,
                         // truncated file) drops the whole layer to the copying
                         // path rather than mixing the two.
@@ -550,6 +616,8 @@ fn split_experts<R: Read + Seek>(
         }
     }
 
+    let qt = rd.qtensor(name)?;
+    let dtype: GgmlDType = qt.dtype();
     let bytes = qt.data()?;
     if bytes.len() % n_expert != 0 {
         candle_core::bail!(
@@ -563,7 +631,7 @@ fn split_experts<R: Read + Seek>(
         let slice = &bytes[e * per..(e + 1) * per];
         let storage = QStorage::from_data(Cow::Borrowed(slice), &rd.device, dtype)?;
         let qt = QTensor::new(storage, (out, inn))?;
-        experts.push(QMatMul::from_qtensor(qt)?);
+        experts.push(Weight::Candle(QMatMul::from_qtensor(qt)?));
     }
     Ok(experts)
 }
@@ -614,6 +682,29 @@ impl GGUFQWenMoE {
         mmap: Option<Arc<memmap2::Mmap>>,
     ) -> Result<Self> {
         let cfg = Config::from_metadata(&ct.metadata)?;
+        // Zero-copy Metal: bind the whole mapping into one no-copy GPU buffer
+        // so quantized weights are never uploaded.  Best effort — if the
+        // mapping is not page-aligned or the device refuses the buffer, fall
+        // back to candle's copying path.
+        let zc = match (&device, &mmap) {
+            (Device::Metal(md), Some(mmap)) => match ZcContext::new(md, mmap.clone()) {
+                Ok(zc) => {
+                    tracing::info!(
+                        "zero-copy Metal: binding {} bytes of weights into the GPU without copying",
+                        zc.len()
+                    );
+                    Some(Arc::new(zc))
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "zero-copy Metal unavailable ({}); copying weights onto the GPU",
+                        e
+                    );
+                    None
+                }
+            },
+            _ => None,
+        };
         // The Content owns metadata; move it into our reader together with the
         // underlying file handle (borrowed for the lifetime of the load).
         let mut rd = Reader {
@@ -621,6 +712,7 @@ impl GGUFQWenMoE {
             reader,
             device: device.clone(),
             mmap,
+            zc,
         };
 
         let tok_embeddings = rd.f32_tensor("token_embd.weight")?;
@@ -721,8 +813,8 @@ impl GGUFQWenMoE {
 mod tests {
     use super::*;
 
-    fn lin(_rows: usize, _cols: usize, t: &Tensor) -> QMatMul {
-        QMatMul::Tensor(t.clone())
+    fn lin(_rows: usize, _cols: usize, t: &Tensor) -> Weight {
+        Weight::Candle(QMatMul::Tensor(t.clone()))
     }
 
     fn rms_from_f32(weights: &[f32], dim: usize, dev: &Device) -> Result<RmsNorm> {

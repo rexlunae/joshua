@@ -58,8 +58,19 @@ fn qwen3moe_metal_routing_stays_in_range() {
     }
 
     // ── Same model through the mmap loader (the path the CLI uses) ──
+    // The mapping is padded to a whole page so the zero-copy Metal path can
+    // wrap it in a no-copy buffer; without the padding it falls back to
+    // uploading the weights (still correct, just not exercising the path).
     let file = std::fs::File::open(&model).unwrap();
-    let mmap = unsafe { memmap2::Mmap::map(&file).unwrap() };
+    let len = file.metadata().unwrap().len() as usize;
+    let page = joshua::zero_copy_metal::page_size();
+    let map_len = len.next_multiple_of(page);
+    let mmap = unsafe {
+        memmap2::MmapOptions::new()
+            .len(map_len)
+            .map(&file)
+            .unwrap()
+    };
     let mmap_arc = std::sync::Arc::new(mmap);
     let mut cursor = Cursor::new(&mmap_arc[..]);
     let content = gguf_file::Content::read(&mut cursor).unwrap();
@@ -86,6 +97,72 @@ fn qwen3moe_metal_routing_stays_in_range() {
             "Metal mmap decode logits must be finite: {logits:?}"
         );
     }
+
+    // ── The zero-copy path must agree with the copy path exactly ──
+    // Same weights, same kernels, same dispatch order — a load through the
+    // no-copy mmap buffer has to produce the same logits as a load that
+    // uploads the weights.  Any mismatch means an offset or shape is wrong.
+    // (Fresh models: the KV cache appends, so models already used for decode
+    // cannot be re-run at offset 0.)
+    let mut cursor = Cursor::new(&bytes[..]);
+    let content = gguf_file::Content::read(&mut cursor).unwrap();
+    let mut cref = QuantizedModel::from_gguf(content, &mut cursor, &dev).unwrap();
+    let mut cursor = Cursor::new(&mmap_arc[..]);
+    let content = gguf_file::Content::read(&mut cursor).unwrap();
+    let mut mref = QuantizedModel::from_gguf_mmap(
+        content,
+        &mut cursor,
+        &dev,
+        Some(std::sync::Arc::clone(&mmap_arc)),
+    )
+    .unwrap();
+    let ref_prefill: Vec<f32> = cref
+        .forward(&input, 0)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    let mm_prefill: Vec<f32> = mref
+        .forward(&input, 0)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    let prefill_diff = ref_prefill
+        .iter()
+        .zip(&mm_prefill)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        prefill_diff < 1e-4,
+        "zero-copy vs copy prefill logits diverge (max diff {prefill_diff})"
+    );
+    let t = Tensor::new(vec![2u32], &dev).unwrap().reshape((1, 1)).unwrap();
+    let ref_decode: Vec<f32> = cref
+        .forward(&t, 5)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    let mm_decode: Vec<f32> = mref
+        .forward(&t, 5)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    let decode_diff = ref_decode
+        .iter()
+        .zip(&mm_decode)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        decode_diff < 1e-4,
+        "zero-copy vs copy decode logits diverge (max diff {decode_diff})"
+    );
 
     std::fs::remove_dir_all(&dir).ok();
 }
