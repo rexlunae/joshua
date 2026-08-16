@@ -68,11 +68,15 @@ The canonical working copy lives at `/home/tserica/repos/candle-mxfp4-upstream`
 
 ### Notes for the upstream PR
 
-- Opening PR against https://github.com/huggingface/candle, branch
-  `main` (0.12.0-dev). Worth checking `gh search prs "mxfp4"` first — if
-  upstream already has an MXFP4 PR, reconcile instead of duplicating.
+- **Opened: https://github.com/huggingface/candle/pull/3899** (branch
+  `rexlunae:mxfp4-core`, two commits, applied on current `main`). Cross-
+  linked to the pre-existing open PR **#3391** ("Mxfp4 gpt oss
+  implementation", infosechoudini, open since March 2026, zero reviews),
+  which adds Metal/CUDA kernels + the gpt-oss model on top of an
+  equivalent core dtype implementation. Our PR is the smaller core layer
+  (dtype plumbing + bit-exactness tests); the two compose.
 - Metal/CUDA matmul support intentionally out of scope: candle-metal-kernels
   and candle-kernels have no MXFP4 kernels; `TryFrom`/existing `_` arms give
   explicit errors rather than silent miscompute.
 - The `GgmlDType::Mxfp4` name follows candle's `BF16` casing; llama.cpp calls
-  it `GGML_TYPE_MXFP4`.
+  it `GGML_TYPE_MXFP4`; #3391 uses `MXFP4`. Cosmetic, reconcile on review.
