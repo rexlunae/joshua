@@ -1,0 +1,378 @@
+From 956c1e2c62cdf475a48ec35753dcbf7add4f1ef9 Mon Sep 17 00:00:00 2001
+From: Erskin Semaj <erskin@localhost>
+Date: Sun, 16 Aug 2026 15:46:40 -0700
+Subject: [PATCH 1/2] Add MXFP4 (GGML_TYPE_MXFP4 = 39) support to the quantized
+ backend
+
+Microscaling FP4 (OCP MX spec) as a first-class GgmlDType: a block of 32
+elements stored as one E8M0 exponent byte plus 16 bytes of packed 4-bit
+E2M1 codes (17 bytes per block, 4.25 bits per element).
+
+- k_quants: BlockMxfp4 (#[repr(C)], size-checked to 17 bytes), with
+  from_float / to_float / vec_dot ported verbatim from llama.cpp:
+  * quantize_row_mxfp4_ref (ggml-quants.c) - exponent from floor(log2(amax)),
+    nibble-packed nearest-kvalue codes using the doubled kvalues table
+    [0,1,2,3,4,6,8,12,0,-1,-2,-3,-4,-6,-8,-12]
+  * dequantize_row_mxfp4 (ggml-quants.c)
+  * ggml_vec_dot_mxfp4_q8_0_generic (ggml-cpu/quants.c) - VecDotType is
+    BlockQ8_0, matching llama.cpp's pairing of MXFP4 weights with Q8_0
+    activations
+- mod.rs: GgmlDType::Mxfp4 wired through from_u32/to_u32 (39), cpu_zeros,
+  from_data, type_size (17), block_size (32), and QStorage::from_data for
+  all three backends
+- ggml_file.rs: load MXFP4 tensors from legacy GGML files
+- metal.rs: MXFP4 dequantize arm; the From<GgmlDType> impl for the metal
+  kernels dtype becomes a TryFrom that errors clearly for MXFP4, since
+  candle-metal-kernels has no MXFP4 kernels (CPU-only for now)
+
+Bit-exactness against llama.cpp is pinned by tests/mxfp4_tests.rs.
+---
+ src/quantized/ggml_file.rs |   3 +
+ src/quantized/k_quants.rs  | 138 ++++++++++++++++++++++++++++++++++++-
+ src/quantized/metal.rs     |  47 +++++++------
+ src/quantized/mod.rs       |  12 ++++
+ 4 files changed, 179 insertions(+), 21 deletions(-)
+
+diff --git a/src/quantized/ggml_file.rs b/src/quantized/ggml_file.rs
+index ea5ec02..8609370 100644
+--- a/src/quantized/ggml_file.rs
++++ b/src/quantized/ggml_file.rs
+@@ -184,6 +184,9 @@ pub fn qtensor_from_ggml(
+         GgmlDType::Q6K => {
+             from_raw_data::<k_quants::BlockQ6K>(raw_data, size_in_bytes, dims, device)
+         }
++        GgmlDType::Mxfp4 => {
++            from_raw_data::<k_quants::BlockMxfp4>(raw_data, size_in_bytes, dims, device)
++        }
+         _ => crate::bail!("quantized type {ggml_dtype:?} is not supported yet"),
+     }
+ }
+diff --git a/src/quantized/k_quants.rs b/src/quantized/k_quants.rs
+index b5dd582..3ac73ea 100644
+--- a/src/quantized/k_quants.rs
++++ b/src/quantized/k_quants.rs
+@@ -18,6 +18,7 @@ pub const QK5_0: usize = 32;
+ pub const QK5_1: usize = 32;
+ pub const QK8_0: usize = 32;
+ pub const QK8_1: usize = 32;
++pub const QK_MXFP4: usize = 32;
+ 
+ pub trait GgmlType: Sized + Clone + Send + Sync {
+     const DTYPE: GgmlDType;
+@@ -631,11 +632,146 @@ impl GgmlType for BlockQ5_1 {
+     }
+ }
+ 
++// MXFP4 (microscaling FP4, OCP MX spec): a block of 32 elements stored as one
++// E8M0 exponent byte plus 16 bytes of packed 4-bit E2M1 codes.
++// See https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf
++// and ggml's block_mxfp4 (ggml-common.h).
++#[derive(Debug, Clone, PartialEq)]
++#[repr(C)]
++pub struct BlockMxfp4 {
++    pub(crate) e: u8,
++    pub(crate) qs: [u8; QK_MXFP4 / 2],
++}
++const _: () = assert!(std::mem::size_of::<BlockMxfp4>() == 17);
++
++// E2M1 values doubled, shared by MXFP4 and NVFP4 (ggml-common.h kvalues_fp4).
++const KVALUES_MXFP4: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
++
++// ggml_e8m0_to_fp32_half: 0.5 * 2^(e - 127) = 2^(e - 128), used with the doubled
++// kvalues above so that kvalues[d] * d gives the exact E2M1 * E8M0 product.
++fn e8m0_to_f32_half(e: u8) -> f32 {
++    let bits = if e < 2 {
++        0x0020_0000u32 << e
++    } else {
++        ((e - 1) as u32) << 23
++    };
++    f32::from_bits(bits)
++}
++
++// best_index_mxfp4 from ggml-quants.c: nearest kvalues[i] * e to x.
++fn best_index_mxfp4(x: f32, e: f32) -> u8 {
++    let mut best_index = 0u8;
++    let mut best_err = (KVALUES_MXFP4[0] as f32 * e - x).abs();
++    for (i, &k) in KVALUES_MXFP4.iter().enumerate().skip(1) {
++        let err = (k as f32 * e - x).abs();
++        if err < best_err {
++            best_index = i as u8;
++            best_err = err;
++        }
++    }
++    best_index
++}
++
++impl GgmlType for BlockMxfp4 {
++    const DTYPE: GgmlDType = GgmlDType::Mxfp4;
++    const BLCK_SIZE: usize = QK_MXFP4;
++    // llama.cpp pairs MXFP4 weights with Q8_0-quantized activations
++    // (ggml_vec_dot_mxfp4_q8_0).
++    type VecDotType = BlockQ8_0;
++
++    // dequantize_row_mxfp4 from ggml-quants.c
++    fn to_float(xs: &[Self], ys: &mut [f32]) {
++        let k = ys.len();
++        debug_assert!(
++            k.is_multiple_of(QK_MXFP4),
++            "dequantize_row_mxfp4: {k} is not divisible by {QK_MXFP4}"
++        );
++
++        let nb = k / QK_MXFP4;
++
++        for i in 0..nb {
++            let d = e8m0_to_f32_half(xs[i].e);
++
++            for j in 0..QK_MXFP4 / 2 {
++                ys[i * QK_MXFP4 + j] = KVALUES_MXFP4[(xs[i].qs[j] & 0x0F) as usize] as f32 * d;
++                ys[i * QK_MXFP4 + j + QK_MXFP4 / 2] =
++                    KVALUES_MXFP4[(xs[i].qs[j] >> 4) as usize] as f32 * d;
++            }
++        }
++    }
++
++    // quantize_row_mxfp4_ref from ggml-quants.c
++    fn from_float(xs: &[f32], ys: &mut [Self]) {
++        let k = xs.len();
++        debug_assert!(
++            k.is_multiple_of(Self::BLCK_SIZE),
++            "{k} is not divisible by {}",
++            Self::BLCK_SIZE
++        );
++        debug_assert_eq!(
++            ys.len(),
++            k / Self::BLCK_SIZE,
++            "size mismatch {} {} {}",
++            xs.len(),
++            ys.len(),
++            Self::BLCK_SIZE
++        );
++        for (i, y) in ys.iter_mut().enumerate() {
++            let xs = &xs[i * Self::BLCK_SIZE..(i + 1) * Self::BLCK_SIZE];
++
++            let mut amax = 0f32;
++            for &x in xs.iter() {
++                amax = amax.max(x.abs());
++            }
++
++            let e = if amax > 0.0 {
++                (amax.log2().floor() - 2.0 + 127.0) as u8
++            } else {
++                0
++            };
++            y.e = e;
++
++            let d = e8m0_to_f32_half(e);
++            for j in 0..Self::BLCK_SIZE / 2 {
++                let x0 = best_index_mxfp4(xs[j], d);
++                let x1 = best_index_mxfp4(xs[j + Self::BLCK_SIZE / 2], d);
++                y.qs[j] = x0 | (x1 << 4);
++            }
++        }
++    }
++
++    fn vec_dot(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> f32 {
++        Self::vec_dot_unopt(n, xs, ys)
++    }
++
++    // ggml_vec_dot_mxfp4_q8_0_generic from ggml-cpu/quants.c
++    fn vec_dot_unopt(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> f32 {
++        debug_assert!(
++            n.is_multiple_of(QK_MXFP4),
++            "vec_dot_mxfp4_q8_0: {n} is not divisible by {QK_MXFP4}"
++        );
++
++        let mut sumf = 0f32;
++        for (xs, ys) in xs.iter().zip(ys.iter()) {
++            let d = f16::to_f32(ys.d) * e8m0_to_f32_half(xs.e);
++
++            let mut sumi1 = 0i32;
++            let mut sumi2 = 0i32;
++            for j in 0..QK_MXFP4 / 2 {
++                sumi1 += ys.qs[j] as i32 * KVALUES_MXFP4[(xs.qs[j] & 0x0F) as usize] as i32;
++                sumi2 +=
++                    ys.qs[j + QK_MXFP4 / 2] as i32 * KVALUES_MXFP4[(xs.qs[j] >> 4) as usize] as i32;
++            }
++            sumf += d * (sumi1 + sumi2) as f32;
++        }
++        sumf
++    }
++}
++
+ impl GgmlType for BlockQ8_0 {
+     const DTYPE: GgmlDType = GgmlDType::Q8_0;
+     const BLCK_SIZE: usize = QK8_0;
+     type VecDotType = BlockQ8_0;
+-
+     // https://github.com/ggerganov/llama.cpp/blob/468ea24fb4633a0d681f7ac84089566c1c6190cb/ggml.c#L1619
+     fn to_float(xs: &[Self], ys: &mut [f32]) {
+         let k = ys.len();
+diff --git a/src/quantized/metal.rs b/src/quantized/metal.rs
+index 4011d43..306b90f 100644
+--- a/src/quantized/metal.rs
++++ b/src/quantized/metal.rs
+@@ -115,6 +115,10 @@ impl QMetalStorage {
+                 let vec: Vec<crate::quantized::BlockQ8K> = read_to_vec(&buffer, block_len);
+                 crate::quantized::BlockQ8K::to_float(&vec, &mut out);
+             }
++            GgmlDType::Mxfp4 => {
++                let vec: Vec<crate::quantized::BlockMxfp4> = read_to_vec(&buffer, block_len);
++                crate::quantized::BlockMxfp4::to_float(&vec, &mut out);
++            }
+         }
+ 
+         let buffer = self
+@@ -261,7 +265,7 @@ impl QMetalStorage {
+             device.device(),
+             &encoder,
+             device.kernels(),
+-            self.dtype.into(),
++            candle_metal_kernels::GgmlDType::try_from(self.dtype)?,
+             hidden,
+             hidden * self.dtype.type_size() / self.dtype.block_size(),
+             ids_len,
+@@ -326,7 +330,7 @@ impl QMetalStorage {
+                 device.device(),
+                 &encoder,
+                 device.kernels(),
+-                self.dtype.into(),
++                candle_metal_kernels::GgmlDType::try_from(self.dtype)?,
+                 (1, 1, n, k),
+                 storage.buffer(),
+                 (layout.start_offset() + batch_id * k) * storage.dtype().size_in_bytes(),
+@@ -415,7 +419,7 @@ impl QMetalStorage {
+             device.device(),
+             &encoder,
+             device.kernels(),
+-            self.dtype.into(),
++            candle_metal_kernels::GgmlDType::try_from(self.dtype)?,
+             src0_l.dims(),
+             &src0_stride,
+             &self.buffer,
+@@ -479,24 +483,27 @@ fn read_to_vec<T: Clone>(buffer: &Buffer, n: usize) -> Vec<T> {
+     slice.to_vec()
+ }
+ 
+-impl From<GgmlDType> for candle_metal_kernels::GgmlDType {
+-    fn from(value: GgmlDType) -> Self {
++impl TryFrom<GgmlDType> for candle_metal_kernels::GgmlDType {
++    type Error = crate::Error;
++
++    fn try_from(value: GgmlDType) -> Result<Self> {
+         match value {
+-            GgmlDType::Q4_0 => candle_metal_kernels::GgmlDType::Q4_0,
+-            GgmlDType::Q4_1 => candle_metal_kernels::GgmlDType::Q4_1,
+-            GgmlDType::Q5_0 => candle_metal_kernels::GgmlDType::Q5_0,
+-            GgmlDType::Q5_1 => candle_metal_kernels::GgmlDType::Q5_1,
+-            GgmlDType::Q8_0 => candle_metal_kernels::GgmlDType::Q8_0,
+-            GgmlDType::Q8_1 => candle_metal_kernels::GgmlDType::Q8_1,
+-            GgmlDType::Q2K => candle_metal_kernels::GgmlDType::Q2K,
+-            GgmlDType::Q3K => candle_metal_kernels::GgmlDType::Q3K,
+-            GgmlDType::Q4K => candle_metal_kernels::GgmlDType::Q4K,
+-            GgmlDType::Q5K => candle_metal_kernels::GgmlDType::Q5K,
+-            GgmlDType::Q6K => candle_metal_kernels::GgmlDType::Q6K,
+-            GgmlDType::Q8K => candle_metal_kernels::GgmlDType::Q8K,
+-            GgmlDType::F16 => candle_metal_kernels::GgmlDType::F16,
+-            GgmlDType::F32 => candle_metal_kernels::GgmlDType::F32,
+-            GgmlDType::BF16 => candle_metal_kernels::GgmlDType::BF16,
++            GgmlDType::Q4_0 => Ok(candle_metal_kernels::GgmlDType::Q4_0),
++            GgmlDType::Q4_1 => Ok(candle_metal_kernels::GgmlDType::Q4_1),
++            GgmlDType::Q5_0 => Ok(candle_metal_kernels::GgmlDType::Q5_0),
++            GgmlDType::Q5_1 => Ok(candle_metal_kernels::GgmlDType::Q5_1),
++            GgmlDType::Q8_0 => Ok(candle_metal_kernels::GgmlDType::Q8_0),
++            GgmlDType::Q8_1 => Ok(candle_metal_kernels::GgmlDType::Q8_1),
++            GgmlDType::Q2K => Ok(candle_metal_kernels::GgmlDType::Q2K),
++            GgmlDType::Q3K => Ok(candle_metal_kernels::GgmlDType::Q3K),
++            GgmlDType::Q4K => Ok(candle_metal_kernels::GgmlDType::Q4K),
++            GgmlDType::Q5K => Ok(candle_metal_kernels::GgmlDType::Q5K),
++            GgmlDType::Q6K => Ok(candle_metal_kernels::GgmlDType::Q6K),
++            GgmlDType::Q8K => Ok(candle_metal_kernels::GgmlDType::Q8K),
++            GgmlDType::F16 => Ok(candle_metal_kernels::GgmlDType::F16),
++            GgmlDType::F32 => Ok(candle_metal_kernels::GgmlDType::F32),
++            GgmlDType::BF16 => Ok(candle_metal_kernels::GgmlDType::BF16),
++            GgmlDType::Mxfp4 => crate::bail!("MXFP4 is not supported on Metal"),
+         }
+     }
+ }
+diff --git a/src/quantized/mod.rs b/src/quantized/mod.rs
+index dc1cea8..434f3e5 100644
+--- a/src/quantized/mod.rs
++++ b/src/quantized/mod.rs
+@@ -111,6 +111,7 @@ impl QStorage {
+                 GgmlDType::Q6K => metal::load_quantized(d, as_t_slice::<BlockQ6K>(data)),
+                 GgmlDType::Q8K => metal::load_quantized(d, as_t_slice::<BlockQ8K>(data)),
+                 GgmlDType::BF16 => metal::load_quantized(d, as_t_slice::<bf16>(data)),
++                GgmlDType::Mxfp4 => metal::load_quantized(d, as_t_slice::<BlockMxfp4>(data)),
+             },
+             Device::Cuda(d) => match dtype {
+                 GgmlDType::F32 => cuda::load_quantized(d, as_t_slice::<f32>(data)),
+@@ -128,6 +129,7 @@ impl QStorage {
+                 GgmlDType::Q6K => cuda::load_quantized(d, as_t_slice::<BlockQ6K>(data)),
+                 GgmlDType::Q8K => cuda::load_quantized(d, as_t_slice::<BlockQ8K>(data)),
+                 GgmlDType::BF16 => cuda::load_quantized(d, as_t_slice::<bf16>(data)),
++                GgmlDType::Mxfp4 => cuda::load_quantized(d, as_t_slice::<BlockMxfp4>(data)),
+             },
+         }
+     }
+@@ -294,6 +296,7 @@ pub enum GgmlDType {
+     Q5K,
+     Q6K,
+     Q8K,
++    Mxfp4,
+ }
+ 
+ impl GgmlDType {
+@@ -315,6 +318,7 @@ impl GgmlDType {
+             15 => Self::Q8K,
+             // https://github.com/ggerganov/ggml/blob/29d87fc6676e7ed0cdfdec0804b06001d9c2bb44/include/ggml.h#L389
+             30 => Self::BF16,
++            39 => Self::Mxfp4,
+             _ => crate::bail!("unknown dtype for tensor {u}"),
+         };
+         Ok(dtype)
+@@ -338,6 +342,7 @@ impl GgmlDType {
+             Self::Q8K => 15,
+             // https://github.com/ggerganov/ggml/blob/29d87fc6676e7ed0cdfdec0804b06001d9c2bb44/include/ggml.h#L389
+             Self::BF16 => 30,
++            Self::Mxfp4 => 39,
+         }
+     }
+ 
+@@ -359,6 +364,10 @@ impl GgmlDType {
+             Self::Q6K => Box::new(vec![BlockQ6K::zeros(); elem_count / BlockQ6K::BLCK_SIZE]),
+             Self::Q8K => Box::new(vec![BlockQ8K::zeros(); elem_count / BlockQ8K::BLCK_SIZE]),
+             Self::BF16 => Box::new(vec![bf16::zeros(); elem_count]),
++            Self::Mxfp4 => Box::new(vec![
++                BlockMxfp4::zeros();
++                elem_count / BlockMxfp4::BLCK_SIZE
++            ]),
+         }
+     }
+ 
+@@ -380,6 +389,7 @@ impl GgmlDType {
+             Self::Q6K => Box::new(as_t_slice::<BlockQ6K>(data).to_vec()),
+             Self::Q8K => Box::new(as_t_slice::<BlockQ8K>(data).to_vec()),
+             Self::BF16 => Box::new(as_t_slice::<bf16>(data).to_vec()),
++            Self::Mxfp4 => Box::new(as_t_slice::<BlockMxfp4>(data).to_vec()),
+         }
+     }
+ 
+@@ -402,6 +412,7 @@ impl GgmlDType {
+             Self::Q5K => std::mem::size_of::<BlockQ5K>(),
+             Self::Q6K => std::mem::size_of::<BlockQ6K>(),
+             Self::Q8K => std::mem::size_of::<BlockQ8K>(),
++            Self::Mxfp4 => std::mem::size_of::<BlockMxfp4>(),
+         }
+     }
+ 
+@@ -417,6 +428,7 @@ impl GgmlDType {
+             Self::Q8_0 => k_quants::QK8_0,
+             Self::Q8_1 => k_quants::QK8_1,
+             Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K | Self::Q8K => k_quants::QK_K,
++            Self::Mxfp4 => k_quants::QK_MXFP4,
+         }
+     }
+ }
+-- 
+2.55.0
+
