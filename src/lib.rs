@@ -34,6 +34,7 @@ pub mod mxfp4;
 pub mod model;
 pub mod quantized_deepseek2;
 pub mod quantized_deepseek4;
+pub mod quantized_qwen3_moe;
 pub mod quant_matmul;
 pub mod npu;
 pub mod server;
