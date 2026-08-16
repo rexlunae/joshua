@@ -838,8 +838,9 @@ impl LayerPrefetcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle_core::quantized::QMatMul;
     use candle_core::quantized::QTensor as QT;
-    use candle_core::{Device, Tensor};
+    use candle_core::{Device, Module, Tensor};
 
     /// Write a one-tensor GGUF and map it.
     fn gguf_with_tensor(dir: &std::path::Path, data: &[f32], shape: &[usize]) -> Arc<Mmap> {
@@ -851,6 +852,103 @@ mod tests {
         drop(f);
         let f = std::fs::File::open(&path).unwrap();
         Arc::new(unsafe { Mmap::map(&f) }.unwrap())
+    }
+
+    /// Map a raw byte blob as if it were a (synthetic) model file.
+    fn mmap_bytes(dir: &std::path::Path, bytes: &[u8]) -> Arc<Mmap> {
+        let path = dir.join("t.bin");
+        std::fs::write(&path, bytes).unwrap();
+        let f = std::fs::File::open(&path).unwrap();
+        Arc::new(unsafe { Mmap::map(&f) }.unwrap())
+    }
+
+    /// Build `n_rows` MXFP4 weight rows of `k` elements with deterministic
+    /// data, returning (blocks, dequantized weights).
+    fn mxfp4_rows(n_rows: usize, k: usize) -> (Vec<crate::mxfp4::BlockMxfp4>, Vec<f32>) {
+        use crate::mxfp4::{BlockMxfp4, QK_MXFP4};
+        let blocks_per_row = k / QK_MXFP4;
+        let mut blocks = Vec::new();
+        for r in 0..n_rows {
+            for b in 0..blocks_per_row {
+                let mut qs = [0u8; 16];
+                for (j, q) in qs.iter_mut().enumerate() {
+                    *q = (((j + r * 3 + b * 5) % 16) as u8) | ((((j + r) % 16) as u8) << 4);
+                }
+                blocks.push(BlockMxfp4 {
+                    e: 120 + (r as u8 % 7), // scales 2^-7 .. 2^-1
+                    qs,
+                });
+            }
+        }
+        let mut weights = vec![0f32; n_rows * k];
+        crate::mxfp4::dequantize(&blocks, &mut weights).unwrap();
+        (blocks, weights)
+    }
+
+    #[test]
+    fn borrowed_mxfp4_qtensor_matmul_matches_reference() {
+        let dir = std::env::temp_dir().join(format!("joshua-mxfp4-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let (n_rows, k) = (6usize, 64usize); // 2 blocks per row
+        let (blocks, weights) = mxfp4_rows(n_rows, k);
+        let bytes: Vec<u8> = blocks
+            .iter()
+            .flat_map(|b| {
+                let mut v = Vec::with_capacity(17);
+                v.push(b.e);
+                v.extend_from_slice(&b.qs);
+                v
+            })
+            .collect();
+        let mmap = mmap_bytes(&dir, &bytes);
+
+        let qt = borrowed_range_mxfp4(&mmap, 0, (n_rows, k).into())
+            .unwrap()
+            .expect("MXFP4 range should borrow");
+        let qmm = QMatMul::from_qtensor(qt).unwrap();
+
+        let lhs: Vec<f32> = (0..2 * k).map(|i| (i as f32 % 7.0) - 3.0).collect();
+        let xs = Tensor::from_vec(lhs.clone(), (2, k), &Device::Cpu).unwrap();
+        let got = qmm.forward(&xs).unwrap();
+        let got: Vec<f32> = got.flatten_all().unwrap().to_vec1().unwrap();
+
+        // Reference: dequantized weights, plain dot products.
+        let mut expect = vec![0f32; 2 * n_rows];
+        for i in 0..2 {
+            for r in 0..n_rows {
+                expect[i * n_rows + r] =
+                    (0..k).map(|j| lhs[i * k + j] * weights[r * k + j]).sum();
+            }
+        }
+        assert!(
+            got.iter().zip(&expect).all(|(g, e)| (g - e).abs() < 1e-3),
+            "got {got:?}, expected {expect:?}"
+        );
+
+        // A per-expert slice (3 rows at a 3-row offset) must also borrow and
+        // agree with the same reference rows.
+        let qt2 = borrowed_range_mxfp4(&mmap, 3 * 2 * 17, (3, k).into())
+            .unwrap()
+            .expect("sliced MXFP4 range should borrow");
+        let qmm2 = QMatMul::from_qtensor(qt2).unwrap();
+        let got2 = qmm2.forward(&xs).unwrap();
+        let got2: Vec<f32> = got2.flatten_all().unwrap().to_vec1().unwrap();
+        for i in 0..2 {
+            for r in 0..3 {
+                assert!(
+                    (got2[i * 3 + r] - expect[i * 6 + (3 + r)]).abs() < 1e-3,
+                    "slice mismatch at [{i},{r}]"
+                );
+            }
+        }
+
+        // Out-of-bounds borrows decline.
+        assert!(borrowed_range_mxfp4(&mmap, bytes.len(), (n_rows, k).into())
+            .unwrap()
+            .is_none());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
