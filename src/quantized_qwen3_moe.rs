@@ -721,7 +721,7 @@ impl GGUFQWenMoE {
 mod tests {
     use super::*;
 
-    fn lin(rows: usize, cols: usize, t: &Tensor) -> QMatMul {
+    fn lin(_rows: usize, _cols: usize, t: &Tensor) -> QMatMul {
         QMatMul::Tensor(t.clone())
     }
 
