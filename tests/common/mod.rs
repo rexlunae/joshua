@@ -710,6 +710,163 @@ pub fn write_deepseek2_gguf(path: &Path, split_mla: bool, softmax_v2: bool) {
     gguf_file::write(&mut file, &metadata_refs, &tensor_refs).unwrap();
 }
 
+/// Write a tiny but structurally valid `qwen3moe` GGUF exercising the full
+/// Qwen3-MoE feature set: GQA attention with per-head Q/K norms and a
+/// half-split RoPE over a head_dim decoupled from the embedding width, plus a
+/// fine-grained MoE (softmax router, `norm_topk_prob`, no shared experts).
+pub fn write_tiny_qwen3moe_gguf(path: &Path) {
+    const VOCAB: usize = 16;
+    const EMB: usize = 8;
+    const H: usize = 2; // heads
+    const KV: usize = 1; // kv heads
+    const HD: usize = 4; // head_dim (attention.key_length)
+    const NFE: usize = 8; // expert ffn
+    const NE: usize = 4; // experts
+    const NLAYER: usize = 1;
+
+    let u32v = |v: u32| gguf_file::Value::U32(v);
+    let f32v = |v: f32| gguf_file::Value::F32(v);
+    let key = |s: &str| format!("qwen3moe.{s}");
+    let mut metadata: Vec<(String, gguf_file::Value)> = vec![
+        (
+            "general.architecture".to_string(),
+            gguf_file::Value::String("qwen3moe".to_string()),
+        ),
+        (key("attention.head_count"), u32v(H as u32)),
+        (key("attention.head_count_kv"), u32v(KV as u32)),
+        (key("block_count"), u32v(NLAYER as u32)),
+        (key("embedding_length"), u32v(EMB as u32)),
+        (key("context_length"), u32v(64)),
+        (key("attention.layer_norm_rms_epsilon"), f32v(1e-5)),
+        (key("attention.key_length"), u32v(HD as u32)),
+        (key("rope.freq_base"), f32v(10_000.0)),
+        (key("expert_count"), u32v(NE as u32)),
+        (key("expert_used_count"), u32v(2)),
+        (key("expert_feed_forward_length"), u32v(NFE as u32)),
+        (key("expert_shared_feed_forward_length"), u32v(0)),
+        (key("attention.norm_topk_prob"), gguf_file::Value::Bool(true)),
+        (
+            "tokenizer.ggml.eos_token_id".to_string(),
+            gguf_file::Value::U32(3),
+        ),
+        (
+            "tokenizer.ggml.bos_token_id".to_string(),
+            gguf_file::Value::U32(3),
+        ),
+        (
+            "tokenizer.ggml.unknown_token_id".to_string(),
+            gguf_file::Value::U32(0),
+        ),
+        (
+            "tokenizer.ggml.model".to_string(),
+            gguf_file::Value::String("llama".to_string()),
+        ),
+        (
+            "tokenizer.ggml.tokens".to_string(),
+            gguf_file::Value::Array(
+                [
+                    "<unk>", "hello", "world", "</s>", "a", "b", "c", "d", "e", "f", "g", "h", "i",
+                    "j", "k", "l",
+                ]
+                .iter()
+                .map(|s| gguf_file::Value::String(s.to_string()))
+                .collect(),
+            ),
+        ),
+        (
+            "tokenizer.ggml.scores".to_string(),
+            gguf_file::Value::Array(
+                (0..16)
+                    .map(|i| gguf_file::Value::F32(-(i as f32)))
+                    .collect(),
+            ),
+        ),
+        (
+            "tokenizer.ggml.token_type".to_string(),
+            gguf_file::Value::Array(
+                [2, 1, 1, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+                    .iter()
+                    .map(|&t| gguf_file::Value::I32(t))
+                    .collect(),
+            ),
+        ),
+        (
+            "tokenizer.chat_template".to_string(),
+            gguf_file::Value::String(
+                "{% for message in messages %}hello {{ message.content }} \
+                 {% endfor %}{% if add_generation_prompt %}world{% endif %}"
+                    .to_string(),
+            ),
+        ),
+    ];
+
+    let ones = |n: usize| vec![1.0f32; n];
+    let mut tensors: Vec<(String, QTensor)> = vec![
+        (
+            "token_embd.weight".to_string(),
+            qtensor(weights(VOCAB * EMB, 1), &[VOCAB, EMB]),
+        ),
+        ("output_norm.weight".to_string(), qtensor(ones(EMB), &[EMB])),
+    ];
+
+    let mut seed = 10u32;
+    let mut next = |n: usize| {
+        seed = seed.wrapping_add(7).wrapping_mul(2_654_435_761) | 1;
+        weights(n, seed)
+    };
+    for i in 0..NLAYER {
+        let p = format!("blk.{i}");
+        tensors.push((format!("{p}.attn_norm.weight"), qtensor(ones(EMB), &[EMB])));
+        tensors.push((format!("{p}.ffn_norm.weight"), qtensor(ones(EMB), &[EMB])));
+        tensors.push((
+            format!("{p}.attn_q.weight"),
+            qtensor(next(H * HD * EMB), &[H * HD, EMB]),
+        ));
+        tensors.push((
+            format!("{p}.attn_k.weight"),
+            qtensor(next(KV * HD * EMB), &[KV * HD, EMB]),
+        ));
+        tensors.push((
+            format!("{p}.attn_v.weight"),
+            qtensor(next(KV * HD * EMB), &[KV * HD, EMB]),
+        ));
+        tensors.push((
+            format!("{p}.attn_output.weight"),
+            qtensor(next(EMB * H * HD), &[EMB, H * HD]),
+        ));
+        tensors.push((
+            format!("{p}.attn_q_norm.weight"),
+            qtensor(ones(HD), &[HD]),
+        ));
+        tensors.push((
+            format!("{p}.attn_k_norm.weight"),
+            qtensor(ones(HD), &[HD]),
+        ));
+        tensors.push((
+            format!("{p}.ffn_gate_inp.weight"),
+            qtensor(next(NE * EMB), &[NE, EMB]),
+        ));
+        tensors.push((
+            format!("{p}.ffn_gate_exps.weight"),
+            qtensor(next(NE * NFE * EMB), &[NE, NFE, EMB]),
+        ));
+        tensors.push((
+            format!("{p}.ffn_up_exps.weight"),
+            qtensor(next(NE * NFE * EMB), &[NE, NFE, EMB]),
+        ));
+        tensors.push((
+            format!("{p}.ffn_down_exps.weight"),
+            qtensor(next(NE * EMB * NFE), &[NE, EMB, NFE]),
+        ));
+    }
+
+    let metadata_refs: Vec<(&str, &gguf_file::Value)> =
+        metadata.iter().map(|(k, v)| (k.as_str(), v)).collect();
+    let tensor_refs: Vec<(&str, &QTensor)> = tensors.iter().map(|(k, v)| (k.as_str(), v)).collect();
+    let mut file = File::create(path).unwrap();
+    gguf_file::write(&mut file, &metadata_refs, &tensor_refs).unwrap();
+}
+
 /// Write a GGUF with a known-to-llama.cpp but unimplemented architecture.
 pub fn write_unsupported_gguf(path: &Path) {
     let arch = gguf_file::Value::String("mamba".to_string());

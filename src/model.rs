@@ -30,7 +30,7 @@ use candle_core::quantized::gguf_file;
 use candle_core::{DType, Device, Result, Tensor};
 use candle_transformers::models::{
     quantized_gemma3, quantized_glm4, quantized_lfm2, quantized_llama, quantized_phi,
-    quantized_phi3, quantized_qwen2, quantized_qwen3, quantized_qwen3_moe,
+    quantized_phi3, quantized_qwen2, quantized_qwen3,
 };
 
 // ─── Architecture enum ──────────────────────────────────────────────────────
@@ -280,7 +280,7 @@ pub enum QuantizedModel {
     Phi3(quantized_phi3::ModelWeights),
     Qwen2(quantized_qwen2::ModelWeights),
     Qwen3(quantized_qwen3::ModelWeights),
-    Qwen3Moe(quantized_qwen3_moe::GGUFQWenMoE),
+    Qwen3Moe(crate::quantized_qwen3_moe::GGUFQWenMoE),
     DeepSeek2(crate::quantized_deepseek2::ModelWeights),
     DeepSeek4(crate::quantized_deepseek4::ModelWeights),
 }
@@ -386,7 +386,7 @@ impl QuantizedModel {
                 quantized_qwen3::ModelWeights::from_gguf(gguf, reader, device).map(Self::Qwen3)
             }
             Architecture::Qwen3Moe => {
-                quantized_qwen3_moe::GGUFQWenMoE::from_gguf(gguf, reader, device, DType::F32)
+                crate::quantized_qwen3_moe::GGUFQWenMoE::from_gguf_mmap(gguf, reader, device, mmap)
                     .map(Self::Qwen3Moe)
             }
             Architecture::DeepSeek2 => {
@@ -419,6 +419,10 @@ impl QuantizedModel {
                 m.clear_kv_cache();
                 true
             }
+            Self::Qwen3Moe(m) => {
+                m.clear_kv_cache();
+                true
+            }
             Self::DeepSeek2(m) => {
                 m.clear_kv_cache();
                 true
@@ -438,6 +442,7 @@ impl QuantizedModel {
             Self::Llama(_)
                 | Self::Qwen2(_)
                 | Self::Qwen3(_)
+                | Self::Qwen3Moe(_)
                 | Self::DeepSeek2(_)
                 | Self::DeepSeek4(_)
         )
