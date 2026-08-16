@@ -461,6 +461,20 @@ impl Moe {
         for t in 0..n_tokens {
             for s in 0..k {
                 let e = ids[t * k + s] as usize;
+                if e >= self.experts.len() {
+                    // Defensive: a corrupt router output must fail loudly with
+                    // context instead of panicking on the slice index below.
+                    let start = t * k;
+                    let row: Vec<u32> = ids[start..start + k].to_vec();
+                    eprintln!(
+                        "ROUTER OOB: token {t} slot {s} expert id {e} ({} experts); ids row {row:?}",
+                        self.experts.len()
+                    );
+                    candle_core::bail!(
+                        "qwen3moe: router selected expert {e} out of {} (token {t}, slot {s})",
+                        self.experts.len()
+                    );
+                }
                 per_expert[e].push((t as u32, wts[t * k + s]));
             }
         }
@@ -682,27 +696,32 @@ impl GGUFQWenMoE {
         mmap: Option<Arc<memmap2::Mmap>>,
     ) -> Result<Self> {
         let cfg = Config::from_metadata(&ct.metadata)?;
-        // Zero-copy Metal: bind the whole mapping into one no-copy GPU buffer
+        // Zero-copy Metal: bind the mapped weights into no-copy GPU buffers
         // so quantized weights are never uploaded.  Best effort — if the
-        // mapping is not page-aligned or the device refuses the buffer, fall
-        // back to candle's copying path.
+        // mapping is not page-aligned or the device refuses the buffers, fall
+        // back to candle's copying path.  Chunk boundaries follow tensor
+        // boundaries so no weight straddles two buffers.
         let zc = match (&device, &mmap) {
-            (Device::Metal(md), Some(mmap)) => match ZcContext::new(md, mmap.clone()) {
-                Ok(zc) => {
-                    tracing::info!(
-                        "zero-copy Metal: binding {} bytes of weights into the GPU without copying",
-                        zc.len()
-                    );
-                    Some(Arc::new(zc))
+            (Device::Metal(md), Some(mmap)) => {
+                match ZcContext::new_for_tensors(md, mmap.clone(), &ct.tensor_infos, ct.tensor_data_offset)
+                {
+                    Ok(zc) => {
+                        tracing::info!(
+                            "zero-copy Metal: binding {} bytes of weights into {} no-copy GPU buffers",
+                            zc.len(),
+                            zc.num_chunks()
+                        );
+                        Some(Arc::new(zc))
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "zero-copy Metal unavailable ({}); copying weights onto the GPU",
+                            e
+                        );
+                        None
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        "zero-copy Metal unavailable ({}); copying weights onto the GPU",
-                        e
-                    );
-                    None
-                }
-            },
+            }
             _ => None,
         };
         // The Content owns metadata; move it into our reader together with the

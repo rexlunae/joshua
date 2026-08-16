@@ -49,27 +49,109 @@ mod imp {
         }
     }
 
-/// The single no-copy Metal buffer backing a whole model mapping.
+/// No-copy Metal buffers backing a model mapping, in chunks.
 ///
 /// One instance per model load.  Keeps the `Arc<Mmap>` alive for as long as
 /// any weight built from it exists, so the pointer handed to Metal never
 /// dangles.
+///
+/// Metal's driver refuses a single shared no-copy buffer above a device- and
+/// memory-dependent cap (measured ≈13.3 GiB on a 24 GB Mac), so the mapping
+/// is split into chunks of at most [`CHUNK_MAX`] bytes, each its own no-copy
+/// buffer.  Chunk boundaries are placed at tensor boundaries when the tensor
+/// layout is known ([`Self::new_for_tensors`]), guaranteeing no single
+/// tensor — and therefore no [`ZcWeight`] — ever straddles two buffers.
 pub struct ZcContext {
     device: MetalDevice,
-    buffer: Arc<Buffer>,
+    buffers: Vec<Arc<Buffer>>,
+    /// File offset where each chunk starts; chunk `i` covers
+    /// `chunk_offsets[i] .. chunk_offsets[i] + buffers[i].length()`.
+    chunk_offsets: Vec<usize>,
     /// Mapping lifetime guard: must outlive every GPU command reading the
-    /// buffer.
+    /// buffers.
     _mmap: Arc<memmap2::Mmap>,
+    len: usize,
 }
 
+/// Maximum bytes per no-copy buffer.  4 GiB leaves 3× headroom under the
+/// measured ~13.3 GiB single-buffer cap while keeping the buffer count
+/// single-digit for an 18.5 GB model.
+const CHUNK_MAX: usize = 4 << 30;
+
 impl ZcContext {
-    /// Wrap `mmap` in a shared-mode no-copy Metal buffer.
+    /// Wrap `mmap` in shared-mode no-copy Metal buffers, chunked in fixed
+    /// [`CHUNK_MAX`] slices.
     ///
     /// The mapping must start on a page boundary (guaranteed by `mmap`) and
     /// its length must be a whole number of pages — map the file with padded
     /// length (see [`crate::engine`]).  Any violation returns `Err`, letting
     /// the caller fall back to candle's copying path.
     pub fn new(device: &MetalDevice, mmap: Arc<memmap2::Mmap>) -> Result<Self> {
+        let options = objc2_metal::MTLResourceOptions(
+            MTLResourceOptions::StorageModeShared.0
+                | MTLResourceOptions::HazardTrackingModeUntracked.0,
+        );
+        Self::new_chunked(device, mmap, options, None)
+    }
+
+    /// Like [`Self::new`], but chunk boundaries are aligned to tensor
+    /// boundaries: each tensor's data lives entirely inside one chunk, so any
+    /// [`ZcWeight`] resolves to a single buffer.  `tensor_data_offset` is the
+    /// file offset where tensor data begins (GGUF `tensor_data_offset`);
+    /// `ti.offset` values are relative to it.
+    pub fn new_for_tensors(
+        device: &MetalDevice,
+        mmap: Arc<memmap2::Mmap>,
+        tensors: &std::collections::HashMap<String, gguf_file::TensorInfo>,
+        tensor_data_offset: u64,
+    ) -> Result<Self> {
+        let options = objc2_metal::MTLResourceOptions(
+            MTLResourceOptions::StorageModeShared.0
+                | MTLResourceOptions::HazardTrackingModeUntracked.0,
+        );
+        // Tensor byte ranges in file coordinates, sorted by start.
+        let mut ranges: Vec<(usize, usize)> = tensors
+            .values()
+            .filter_map(|ti| {
+                let n: usize = ti.shape.dims().iter().product();
+                let bytes = n / ti.ggml_dtype.block_size().max(1) * ti.ggml_dtype.type_size();
+                let start = usize::try_from(tensor_data_offset.saturating_add(ti.offset)).ok()?;
+                Some((start, start.saturating_add(bytes)))
+            })
+            .collect();
+        ranges.sort_unstable();
+        // Coalesce into chunks ≤ CHUNK_MAX, starting a new chunk at a tensor
+        // start whenever the running chunk would overflow.
+        let mut chunks: Vec<(usize, usize)> = Vec::new();
+        let mut cur_start = 0usize;
+        let mut cur_end = 0usize;
+        for (start, end) in ranges {
+            if cur_end == 0 {
+                cur_start = start;
+                cur_end = end;
+                continue;
+            }
+            if end <= cur_end {
+                continue; // contained in the running chunk
+            }
+            if end - cur_start > CHUNK_MAX {
+                chunks.push((cur_start, cur_end));
+                cur_start = start;
+            }
+            cur_end = end;
+        }
+        if cur_end > 0 {
+            chunks.push((cur_start, cur_end));
+        }
+        Self::new_chunked(device, mmap, options, Some(chunks))
+    }
+
+    fn new_chunked(
+        device: &MetalDevice,
+        mmap: Arc<memmap2::Mmap>,
+        options: objc2_metal::MTLResourceOptions,
+        chunks: Option<Vec<(usize, usize)>>,
+    ) -> Result<Self> {
         let page = page_size();
         let base = mmap.as_ptr() as usize;
         if !base.is_multiple_of(page) {
@@ -84,36 +166,61 @@ impl ZcContext {
                  {page}-byte page size; map the model file with padded length"
             );
         }
-        // Match candle's shared/untracked options so the buffer behaves like
-        // its other shared buffers (no hazard tracking: weights are
-        // read-only once mapped).
-        let options = objc2_metal::MTLResourceOptions(
-            MTLResourceOptions::StorageModeShared.0
-                | MTLResourceOptions::HazardTrackingModeUntracked.0,
-        );
-        // SAFETY: `base..base+len` is a valid mapping held alive by `_mmap`;
-        // the deallocator is None because we never free it ourselves.
-        let raw = unsafe {
-            device
-                .metal_device()
-                .as_ref()
-                .newBufferWithBytesNoCopy_length_options_deallocator(
-                    NonNull::new(base as *mut c_void).expect("mmap base is never null"),
-                    len,
-                    options,
-                    None,
-                )
+        // Chunk ranges: caller tensor-aligned ranges, else fixed CHUNK_MAX
+        // slices.  Ends are clamped to the mapping; the final chunk always
+        // runs to `len` so the whole mapping is covered.
+        let ranges: Vec<(usize, usize)> = match chunks {
+            Some(c) => c,
+            None => (0..len)
+                .step_by(CHUNK_MAX)
+                .map(|s| (s, s.saturating_add(CHUNK_MAX).min(len)))
+                .collect(),
+        };
+        let mut buffers = Vec::with_capacity(ranges.len());
+        let mut chunk_offsets = Vec::with_capacity(ranges.len());
+        for (start, mut end) in ranges {
+            // Round the chunk down/up to page boundaries (tensor starts are
+            // only 32-byte aligned).  Chunks must be page-aligned, page-sized
+            // slices of the mapping for newBufferWithBytesNoCopy.
+            let lo = start / page * page;
+            end = end.min(len);
+            end = (end + page - 1) / page * page;
+            if end <= lo {
+                continue;
+            }
+            // SAFETY: `base+lo .. base+end` is inside the mapping, held alive
+            // by `_mmap`; the deallocator is None because we never free it.
+            let raw = unsafe {
+                device
+                    .metal_device()
+                    .as_ref()
+                    .newBufferWithBytesNoCopy_length_options_deallocator(
+                        NonNull::new((base + lo) as *mut c_void).expect("mmap base is never null"),
+                        end - lo,
+                        options,
+                        None,
+                    )
+            }
+            .ok_or_else(|| {
+                candle_core::Error::Msg(format!(
+                    "zero-copy Metal: newBufferWithBytesNoCopy failed for a {}-byte chunk \
+                     at file offset {lo}",
+                    end - lo
+                ))
+            })?;
+            buffers.push(Arc::new(Buffer::new(raw)));
+            chunk_offsets.push(lo);
         }
-        .ok_or_else(|| {
-            candle_core::Error::Msg(format!(
-                "zero-copy Metal: newBufferWithBytesNoCopy failed for a {len}-byte mapping"
-            ))
-        })?;
-        let buffer = Arc::new(Buffer::new(raw));
+        if buffers.is_empty() {
+            candle_core::bail!("zero-copy Metal: empty mapping has no chunks");
+        }
+        debug_assert_eq!(buffers.len(), chunk_offsets.len());
         Ok(Self {
             device: device.clone(),
-            buffer,
+            buffers,
+            chunk_offsets,
             _mmap: mmap,
+            len,
         })
     }
 
@@ -121,17 +228,48 @@ impl ZcContext {
         &self.device
     }
 
-    pub fn buffer(&self) -> &Buffer {
-        &self.buffer
+    /// The no-copy buffer for chunk `i`.
+    pub fn buffer(&self, chunk: usize) -> &Buffer {
+        &self.buffers[chunk]
     }
 
+    pub fn num_chunks(&self) -> usize {
+        self.buffers.len()
+    }
+
+    /// Total mapped (and therefore bufferable) length, in bytes.
     pub fn len(&self) -> usize {
-        self.buffer.length()
+        self.len
     }
 
     /// A zero-copy mapping is never empty; present for API symmetry.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Resolve a `[offset, offset+bytes)` file range to a chunk index and the
+    /// offset of `offset` within that chunk's buffer.  Errors when the range
+    /// straddles a chunk boundary.
+    pub(crate) fn locate(&self, offset: usize, bytes: usize) -> Result<(usize, usize)> {
+        if offset.saturating_add(bytes) > self.len {
+            candle_core::bail!(
+                "zero-copy Metal: range {offset}..{} exceeds mapping length {}",
+                offset.saturating_add(bytes),
+                self.len
+            );
+        }
+        for (i, &start) in self.chunk_offsets.iter().enumerate() {
+            let end = start + self.buffers[i].length();
+            if offset >= start && offset.saturating_add(bytes) <= end {
+                return Ok((i, offset - start));
+            }
+        }
+        candle_core::bail!(
+            "zero-copy Metal: range {offset}..{} straddles a chunk boundary \
+             ({} chunks)",
+            offset.saturating_add(bytes),
+            self.chunk_offsets.len()
+        );
     }
 
     /// Build a zero-copy weight for `name`, or `None` when the tensor is not
@@ -158,7 +296,7 @@ impl ZcContext {
     }
 }
 
-/// A quantized weight living at `offset` inside a [`ZcContext`] buffer.
+/// A quantized weight living at `offset` inside a [`ZcContext`] chunk.
 ///
 /// Drop-in for candle's `QMatMul` on the shapes the qwen3moe loader uses
 /// (2-D weights, f32 activations on Metal).  `forward` mirrors candle's
@@ -170,7 +308,9 @@ pub struct ZcWeight {
     dtype: GgmlDType,
     /// Candle-order dims `[n, k]`: output width then contraction width.
     dims: [usize; 2],
-    /// Byte offset of the tensor data inside the mapping.
+    /// Which chunk buffer the weight lives in.
+    chunk: usize,
+    /// Byte offset of the tensor data inside that chunk's buffer.
     offset: usize,
 }
 
@@ -216,18 +356,13 @@ impl ZcWeight {
             .map_err(|_| candle_core::Error::Msg("zero-copy Metal: tensor offset overflow".into()))?
             .saturating_add(byte_offset);
         let bytes = dims[0] * dims[1] * ti.ggml_dtype.type_size() / ti.ggml_dtype.block_size();
-        if offset.saturating_add(bytes) > ctx.len() {
-            candle_core::bail!(
-                "zero-copy Metal: tensor range {offset}..{} exceeds mapping length {}",
-                offset.saturating_add(bytes),
-                ctx.len()
-            );
-        }
+        let (chunk, offset_in_chunk) = ctx.locate(offset, bytes)?;
         Ok(Self {
             ctx: ctx.clone(),
             dtype: ti.ggml_dtype,
             dims,
-            offset,
+            chunk,
+            offset: offset_in_chunk,
         })
     }
 
@@ -307,7 +442,7 @@ impl ZcWeight {
                 (1, 1, n, k),
                 storage.buffer(),
                 (layout.start_offset() + batch_id * k) * DType::F32.size_in_bytes(),
-                self.ctx.buffer(),
+                self.ctx.buffer(self.chunk),
                 self.offset,
                 batch_id * n * DType::F32.size_in_bytes(),
                 &dst,
@@ -366,7 +501,7 @@ impl ZcWeight {
             self.dtype.into(),
             src0_l.dims(),
             &src0_stride,
-            self.ctx.buffer(),
+            self.ctx.buffer(self.chunk),
             self.offset,
             src1_l.dims(),
             &src1_l
@@ -403,6 +538,7 @@ pub struct ZcEmbedding {
     dtype: GgmlDType,
     rows: usize,
     hidden: usize,
+    chunk: usize,
     offset: usize,
     bytes: usize,
 }
@@ -426,12 +562,14 @@ impl ZcEmbedding {
                 candle_core::Error::Msg("zero-copy Metal: embedding offset overflow".into())
             })?;
         let bytes = dims[0] * dims[1] * ti.ggml_dtype.type_size() / ti.ggml_dtype.block_size();
+        let (chunk, offset_in_chunk) = ctx.locate(offset, bytes)?;
         Ok(Self {
             ctx: ctx.clone(),
             dtype: ti.ggml_dtype,
             rows: dims[0],
             hidden: dims[1],
-            offset,
+            chunk,
+            offset: offset_in_chunk,
             bytes,
         })
     }
@@ -466,7 +604,7 @@ impl ZcEmbedding {
             self.hidden,
             row_stride,
             ids_len,
-            self.ctx.buffer(),
+            self.ctx.buffer(self.chunk),
             self.offset,
             ids_storage.buffer(),
             ids_layout.start_offset() * DType::U32.size_in_bytes(),
@@ -533,6 +671,19 @@ mod imp {
             _mmap: Arc<memmap2::Mmap>,
         ) -> candle_core::Result<Self> {
             candle_core::bail!("zero-copy Metal requires the `metal` feature")
+        }
+
+        pub fn new_for_tensors(
+            _device: &candle_core::MetalDevice,
+            _mmap: Arc<memmap2::Mmap>,
+            _tensors: &std::collections::HashMap<String, gguf_file::TensorInfo>,
+            _tensor_data_offset: u64,
+        ) -> candle_core::Result<Self> {
+            candle_core::bail!("zero-copy Metal requires the `metal` feature")
+        }
+
+        pub fn num_chunks(&self) -> usize {
+            0
         }
 
         pub fn len(&self) -> usize {
