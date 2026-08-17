@@ -792,13 +792,13 @@ fn run_prefetch(
         let cur = current.load(Ordering::Acquire);
         let target = cur.saturating_add(depth).min(ranges.len());
         let mut advanced = false;
-        while next < target {
+        while next < target && !stop.load(Ordering::Acquire) {
             if let Some((b0, e1)) = ranges[next] {
                 if b0 < e1 && e1 <= file_len {
                     let mut off = b0;
                     // Best effort: on error, skip the rest of this range.
                     let mut ok = true;
-                    while ok && off < e1 {
+                    while ok && off < e1 && !stop.load(Ordering::Acquire) {
                         let n = (e1 - off).min(buf.len());
                         match file.read_at(&mut buf[..n], off as u64) {
                             Ok(0) => break,
