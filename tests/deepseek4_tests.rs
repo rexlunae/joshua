@@ -26,7 +26,7 @@ fn load(model: &std::path::Path, mmap: bool) -> QuantizedModel {
         None
     };
     let mut cursor = std::io::Cursor::new(&bytes[..]);
-    QuantizedModel::from_gguf_mmap(content, &mut cursor, &Device::Cpu, mmap).unwrap()
+    QuantizedModel::from_gguf_mmap(content, &mut cursor, &Device::Cpu, mmap, None).unwrap()
 }
 
 fn logits(model: &mut QuantizedModel, tokens: &[u32], offset: usize) -> Vec<f32> {
@@ -252,7 +252,7 @@ fn deepseek4_header_reread_failure_is_reported() {
 
     // The reader passes candle's parse but fails every read afterwards.
     let mut failing = FailAllReads(std::io::Cursor::new(bytes));
-    let err = match QuantizedModel::from_gguf_mmap(content, &mut failing, &Device::Cpu, None) {
+    let err = match QuantizedModel::from_gguf_mmap(content, &mut failing, &Device::Cpu, None, None) {
         Err(e) => e,
         Ok(_) => panic!("from_gguf_mmap must fail when the raw header re-read fails"),
     };
@@ -322,16 +322,7 @@ fn deepseek4_kquant_mmap_matches_streamed_path() {
     let a = logits(&mut mmapped, &tokens, 0);
     let b = logits(&mut streamed, &tokens, 0);
     for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
-        // The two paths are genuinely different computations — Q4_K blocks
-        // dequantised block-by-block inside the fused matmul vs a plain f32
-        // matmul over fully-dequantised weights — so they accumulate in
-        // different orders.  On aarch64 the NEON fused kernel measures up to
-        // ~0.016 absolute apart from the f32 path on this model (logits in
-        // ±1.2).  A bound of `0.02 + 1%` admits that with margin while still
-        // catching a real regression (transposed weight, dropped expert,
-        // wrong kernel), which shifts logits by O(0.1–1.0) — 5–60× the noise
-        // floor.
-        let tol = 0.02 + 1e-2 * y.abs();
+        let tol = 1e-3 * y.abs().max(1.0);
         assert!(
             (x - y).abs() <= tol,
             "logit {i}: mmap={x} streamed={y} (tol {tol})"

@@ -356,6 +356,10 @@ pub struct Engine {
     /// page cache backs every request and engine clones share the same
     /// physical pages.
     mmap: Arc<Mmap>,
+    /// The model file itself, kept so the deepseek4 prefill can run a
+    /// layer-ahead `pread` prefetch thread against it.  `None` when the model
+    /// was loaded into anonymous huge pages (nothing to prefetch).
+    model_file: Option<Arc<File>>,
     /// Stateless tokenizer, shared across all inference calls.
     tokenizer: Arc<Tokenizer>,
     /// EOS token IDs derived from the GGUF metadata and common special tokens.
@@ -611,13 +615,20 @@ impl Engine {
         // sequential/random hint (which would otherwise keep "free after use"
         // semantics on the very ranges we want to keep resident).
         let hot_pinning = options.pin_hot_weights || options.mlock_hot_weights != MlockMode::Off;
-        let mmap = map_model(
+        let (mmap, model_file) = map_model(
             &gguf_path,
             options.huge_pages,
             options.lazy_weights,
             options.mmap,
             hot_pinning,
         )?;
+        // Explicit huge pages copy the model into anonymous RAM — there is no
+        // file to prefetch from, so drop the handle.
+        let model_file = if matches!(options.huge_pages, HugePages::Explicit(_)) {
+            None
+        } else {
+            Some(Arc::new(model_file))
+        };
 
         // Read GGUF metadata once to validate the architecture up front and
         // extract EOS token IDs.  The tolerant reader keeps dtypes candle
@@ -708,6 +719,7 @@ impl Engine {
         Ok(Self {
             model_path: gguf_path,
             mmap: Arc::new(mmap),
+            model_file,
             tokenizer: Arc::new(tokenizer),
             eos_token_ids,
             chat_template,
@@ -1509,6 +1521,7 @@ impl Engine {
             &mut cursor,
             &self.device,
             Some(Arc::clone(&self.mmap)),
+            self.model_file.clone(),
         )
         .map_err(|e| JoshuaError::ModelLoad(format!("model init failed: {e}")))
     }
@@ -1606,7 +1619,7 @@ fn map_model(
     lazy: bool,
     mmap_mode: MmapMode,
     per_range_advice: bool,
-) -> Result<Mmap> {
+) -> Result<(Mmap, File)> {
     let file = File::open(path)?;
 
     // Explicit huge pages use an anonymous copy; handle separately.
@@ -1626,7 +1639,7 @@ fn map_model(
             );
         } else {
             check_mappable(path, &file, mmap_mode, false)?;
-            return map_model_hugetlb(path, &file, size);
+            return map_model_hugetlb(path, &file, size).map(|m| (m, file));
         }
     }
 
@@ -1663,7 +1676,7 @@ fn map_model(
         tracing::warn!("transparent huge pages are Linux-only; using normal pages");
     }
 
-    Ok(mmap)
+    Ok((mmap, file))
 }
 
 // ─── Hot-weight pinning ────────────────────────────────────────────────────────

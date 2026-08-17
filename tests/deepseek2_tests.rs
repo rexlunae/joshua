@@ -194,7 +194,7 @@ fn deepseek2_skips_the_raw_header_rereread() {
     // If from_gguf_mmap tried to re-read the header it would rewind to 0 and
     // fail here.  It must not.
     let mut no_rewind = NoRewind(std::io::Cursor::new(bytes));
-    let mut m = QuantizedModel::from_gguf_mmap(content, &mut no_rewind, &Device::Cpu, None)
+    let mut m = QuantizedModel::from_gguf_mmap(content, &mut no_rewind, &Device::Cpu, None, None)
         .expect("deepseek2 must not re-read the raw header");
     // And the loaded model must actually work.
     let logits = logits(&mut m, &[1u32, 4, 2, 7, 5], 0);
@@ -225,6 +225,7 @@ fn deepseek2_mmap_borrowed_load_matches_copied_load() {
         &mut cursor,
         &Device::Cpu,
         Some(std::sync::Arc::clone(&mmap)),
+        None,
     )
     .unwrap();
     let borrowed = logits(&mut borrowed_model, &tokens, 0);

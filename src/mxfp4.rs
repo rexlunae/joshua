@@ -29,6 +29,9 @@
 //! Blocks are `align_of == 1`, so unlike the k-quants they are always
 //! borrowable straight out of a memory mapping regardless of file alignment.
 
+use candle_core::Result;
+use half::f16;
+
 /// Elements per MXFP4 block.
 pub const QK_MXFP4: usize = 32;
 
@@ -93,9 +96,9 @@ impl BlockMxfp4 {
 
 /// Decode a run of blocks into `out`, which must hold `blocks.len() * 32`
 /// values.
-pub fn dequantize(blocks: &[BlockMxfp4], out: &mut [f32]) -> crate::Result<()> {
+pub fn dequantize(blocks: &[BlockMxfp4], out: &mut [f32]) -> Result<()> {
     if out.len() != blocks.len() * QK_MXFP4 {
-        return Err(crate::JoshuaError::Inference(format!(
+        return Err(candle_core::Error::Msg(format!(
             "mxfp4: output holds {} values, expected {}",
             out.len(),
             blocks.len() * QK_MXFP4
@@ -119,8 +122,8 @@ pub fn matmul_t(
     lhs: &[f32],
     rhs: &[BlockMxfp4],
     dst: &mut [f32],
-) -> crate::Result<()> {
-    let err = |msg: String| crate::JoshuaError::Inference(msg);
+) -> Result<()> {
+    let err = |msg: String| candle_core::Error::Msg(msg);
     if !k.is_multiple_of(QK_MXFP4) {
         return Err(err(format!(
             "mxfp4 matmul: k={k} is not a multiple of the block size {QK_MXFP4}"
@@ -170,15 +173,38 @@ pub fn matmul_t(
     Ok(())
 }
 
+/// f16 variant of [`matmul_t`], for candle's `QuantizedType` contract.
+///
+/// Converts through f32: the weights are decoded exactly the same way and the
+/// products accumulate in f32, so the result is the f16-rounded f32 answer —
+/// matching what the IQ2_XXS and k-quant kernels do.
+pub fn matmul_t_f16(
+    (m, k, n): (usize, usize, usize),
+    lhs: &[f16],
+    rhs: &[BlockMxfp4],
+    dst: &mut [f16],
+) -> Result<()> {
+    let mut lhs_f32 = vec![0f32; lhs.len()];
+    for (o, v) in lhs_f32.iter_mut().zip(lhs.iter()) {
+        *o = v.to_f32();
+    }
+    let mut dst_f32 = vec![0f32; m * n];
+    matmul_t((m, k, n), &lhs_f32, rhs, &mut dst_f32)?;
+    for (o, v) in dst.iter_mut().zip(dst_f32.iter()) {
+        *o = f16::from_f32(*v);
+    }
+    Ok(())
+}
+
 /// Reinterpret `bytes` as MXFP4 blocks.
 ///
 /// Blocks are byte-aligned, so this only has to check that the length is a
 /// whole number of blocks — which makes MXFP4 weights borrowable directly from
 /// a memory mapping.
-pub fn blocks_from_bytes(bytes: &[u8]) -> crate::Result<&[BlockMxfp4]> {
+pub fn blocks_from_bytes(bytes: &[u8]) -> Result<&[BlockMxfp4]> {
     let sz = std::mem::size_of::<BlockMxfp4>();
     if !bytes.len().is_multiple_of(sz) {
-        return Err(crate::JoshuaError::Inference(format!(
+        return Err(candle_core::Error::Msg(format!(
             "mxfp4: {} bytes is not a whole number of {sz}-byte blocks",
             bytes.len()
         )));

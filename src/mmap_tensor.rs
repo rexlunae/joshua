@@ -37,6 +37,7 @@
 //! byte pattern is a valid block, so there is no out-of-bounds access
 //! *unless* the file changes under the mapping.
 
+use std::fs::File;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
@@ -302,6 +303,142 @@ pub fn prefetch_handle_iq2xxs(
         .map(|b| Arc::new(b) as Arc<dyn MmapPrefetch>)
 }
 
+/// MXFP4 blocks borrowed from the mapping.
+///
+/// Same shape as [`MmapBlocksIq2Xxs`]: candle's `GgmlDType` has no MXFP4
+/// variant either, so this is a bespoke `QuantizedType` with a placeholder
+/// `dtype()` (only `QMatMul::from_qtensor` compares it, and only to tell
+/// eager-dequantise f32/f16/bf16 apart from everything else).
+pub struct MmapBlocksMxfp4 {
+    /// Keeps the mapping alive; never dereferenced directly.
+    _mmap: Arc<Mmap>,
+    ptr: *const crate::mxfp4::BlockMxfp4,
+    len: usize,
+}
+
+// SAFETY: same argument as `MmapBlocks`: read-only mapping kept alive by
+// `_mmap`, blocks never mutated or moved.
+unsafe impl Send for MmapBlocksMxfp4 {}
+unsafe impl Sync for MmapBlocksMxfp4 {}
+
+impl MmapPrefetch for MmapBlocksMxfp4 {
+    fn prefetch(&self) {
+        let base = self._mmap.as_ptr() as usize;
+        let off = self.ptr as usize - base;
+        let len = self.len * std::mem::size_of::<crate::mxfp4::BlockMxfp4>();
+        let _ = self._mmap.advise_range(memmap2::Advice::WillNeed, off, len);
+    }
+}
+
+impl MmapBlocksMxfp4 {
+    fn blocks(&self) -> &[crate::mxfp4::BlockMxfp4] {
+        // SAFETY: bounds- and alignment-checked in `borrow` (alignment is 1
+        // for the packed block type, so only bounds matter) against a mapping
+        // that `_mmap` keeps alive and that is never mutated.
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+
+    fn borrow(mmap: &Arc<Mmap>, byte_offset: usize, n_blocks: usize) -> Option<Self> {
+        let block_bytes = std::mem::size_of::<crate::mxfp4::BlockMxfp4>();
+        let size = n_blocks.checked_mul(block_bytes)?;
+        let end = byte_offset.checked_add(size)?;
+        if end > mmap.len() {
+            return None;
+        }
+        // SAFETY: `byte_offset <= end <= mmap.len()`.
+        let ptr = unsafe { mmap.as_ptr().add(byte_offset) };
+        // The block type is packed (align 1), so any offset is aligned.
+        Some(Self {
+            _mmap: Arc::clone(mmap),
+            ptr: ptr as *const crate::mxfp4::BlockMxfp4,
+            len: n_blocks,
+        })
+    }
+}
+
+/// Prefetch handle for `n_blocks` MXFP4 blocks; see [`prefetch_handle`].
+pub fn prefetch_handle_mxfp4(
+    mmap: &Arc<Mmap>,
+    byte_offset: usize,
+    n_blocks: usize,
+) -> Option<Arc<dyn MmapPrefetch>> {
+    MmapBlocksMxfp4::borrow(mmap, byte_offset, n_blocks)
+        .map(|b| Arc::new(b) as Arc<dyn MmapPrefetch>)
+}
+
+impl QuantizedType for MmapBlocksMxfp4 {
+    fn dtype(&self) -> GgmlDType {
+        GgmlDType::Q2K // placeholder; see struct docs
+    }
+
+    fn matmul_t(&self, mkn: (usize, usize, usize), lhs: &[f32], dst: &mut [f32]) -> Result<()> {
+        crate::mxfp4::matmul_t(mkn, lhs, self.blocks(), dst)
+    }
+
+    fn matmul_t_f16(&self, mkn: (usize, usize, usize), lhs: &[f16], dst: &mut [f16]) -> Result<()> {
+        crate::mxfp4::matmul_t_f16(mkn, lhs, self.blocks(), dst)
+    }
+
+    fn embedding(&self, ids: &[u32], rows: usize, hidden: usize) -> Result<CpuStorage> {
+        if !hidden.is_multiple_of(crate::mxfp4::QK_MXFP4) {
+            candle_core::bail!(
+                "quantized embedding hidden size {hidden} is not divisible by block size {}",
+                crate::mxfp4::QK_MXFP4
+            )
+        }
+        let blocks = self.blocks();
+        let row_blocks = hidden / crate::mxfp4::QK_MXFP4;
+        if blocks.len() != rows * row_blocks {
+            candle_core::bail!(
+                "quantized tensor has {} blocks, expected {}",
+                blocks.len(),
+                rows * row_blocks
+            )
+        }
+        let mut out = vec![0f32; ids.len() * hidden];
+        for (out_row, &row_id) in ids.iter().enumerate() {
+            let row = row_id as usize;
+            if row >= rows {
+                candle_core::bail!("embedding id {row} is out of range for {rows} rows")
+            }
+            let src = &blocks[row * row_blocks..(row + 1) * row_blocks];
+            let dst = &mut out[out_row * hidden..(out_row + 1) * hidden];
+            crate::mxfp4::dequantize(src, dst)?;
+        }
+        Ok(CpuStorage::F32(out))
+    }
+
+    fn dequantize(&self, elem_count: usize) -> Result<CpuStorage> {
+        let mut ys = vec![0.0f32; elem_count];
+        crate::mxfp4::dequantize(self.blocks(), &mut ys)?;
+        Ok(CpuStorage::F32(ys))
+    }
+
+    fn storage_size_in_bytes(&self) -> usize {
+        self.len * std::mem::size_of::<crate::mxfp4::BlockMxfp4>()
+    }
+
+    fn as_ptr(&self) -> *const u8 {
+        self.ptr as *const u8
+    }
+
+    fn block_size(&self) -> usize {
+        crate::mxfp4::QK_MXFP4
+    }
+
+    fn size(&self) -> usize {
+        self.len * std::mem::size_of::<crate::mxfp4::BlockMxfp4>()
+    }
+
+    fn from_float(&mut self, _xs: &[f32]) {
+        panic!("cannot quantize into a read-only memory-mapped tensor")
+    }
+
+    fn from_float_imatrix(&mut self, _xs: &[f32], _imatrix_weights: &[f32], _n_per_row: usize) {
+        panic!("cannot quantize into a read-only memory-mapped tensor")
+    }
+}
+
 impl QuantizedType for MmapBlocksIq2Xxs {
     fn dtype(&self) -> GgmlDType {
         GgmlDType::Q2K // placeholder; see struct docs
@@ -393,6 +530,12 @@ pub fn borrowed_qtensor_raw(
         };
         return borrowed_range_iq2xxs(mmap, off, shape);
     }
+    if dtype == crate::mxfp4::GGML_TYPE_MXFP4 {
+        let Ok(off) = usize::try_from(tensor_data_offset.saturating_add(offset)) else {
+            return Ok(None);
+        };
+        return borrowed_range_mxfp4(mmap, off, shape);
+    }
     let Some(ggml_dtype) = crate::gguf_ext::ggml_dtype_from_id(dtype) else {
         return Ok(None);
     };
@@ -416,6 +559,24 @@ pub fn borrowed_range_iq2xxs(
     }
     let n_blocks = elem_count / crate::iq2xxs::QK_IQ2_XXS;
     let Some(blocks) = MmapBlocksIq2Xxs::borrow(mmap, offset, n_blocks) else {
+        return Ok(None);
+    };
+    let storage: Box<dyn QuantizedType> = Box::new(blocks);
+    QTensor::new(QStorage::Cpu(storage), shape).map(Some)
+}
+
+/// Borrow an MXFP4 tensor (or per-expert slice of one) from the mapping.
+pub fn borrowed_range_mxfp4(
+    mmap: &Arc<Mmap>,
+    offset: usize,
+    shape: candle_core::Shape,
+) -> Result<Option<QTensor>> {
+    let elem_count = shape.elem_count();
+    if !elem_count.is_multiple_of(crate::mxfp4::QK_MXFP4) {
+        return Ok(None);
+    }
+    let n_blocks = elem_count / crate::mxfp4::QK_MXFP4;
+    let Some(blocks) = MmapBlocksMxfp4::borrow(mmap, offset, n_blocks) else {
         return Ok(None);
     };
     let storage: Box<dyn QuantizedType> = Box::new(blocks);
@@ -517,6 +678,163 @@ pub fn qtensor_from_mmap<R: std::io::Read + std::io::Seek>(
     content.tensor(reader, name, device)
 }
 
+// ─── Layer-ahead pread prefetch thread ───────────────────────────────────────
+
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::thread::JoinHandle;
+
+/// How many layers ahead of the compute thread the prefetcher keeps streamed.
+///
+/// One layer of routed-expert weights is ~0.75 GB here; at ~1.9 GB/s device
+/// bandwidth a layer takes ~0.4 s to read, about the same as the layer loop's
+/// compute time, so staying 2–3 layers ahead gives the disk a full layer's
+/// worth of lead while bounding how much of the page cache the stream occupies
+/// (~2.5 GB at depth 3).
+pub const PREFETCH_AHEAD_DEPTH: usize = 3;
+
+/// Size of the scratch buffer used per `pread` syscall.  The bytes are
+/// discarded — the page cache is the transport — so this only bounds syscall
+/// size.  4 MiB keeps syscall overhead negligible without pinning much RAM.
+const PREFETCH_CHUNK: usize = 4 * 1024 * 1024;
+
+/// How long the thread naps when it has caught up with the compute thread.
+const PREFETCH_POLL: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// A background thread that pre-reads upcoming layer byte ranges into the page
+/// cache while the caller computes the current layer.
+///
+/// The other prefetch paths are *hints*: `MADV_WILLNEED`/`MADV_SEQUENTIAL`
+/// ask the kernel to start readahead, but the reads are driven by the compute
+/// thread's fault stream, so the matmuls still stall on the first touches of
+/// each page.  This thread issues actual `pread(2)` calls through its own file
+/// descriptor — its own readahead context, independent of the mmap's — so the
+/// kernel streams each range at full device bandwidth *ahead* of the layer
+/// loop, and the later mmap faults are pure page-cache hits.  The read data is
+/// discarded; the page cache is the transport.
+///
+/// The thread is best-effort: an I/O error stops the current range and the
+/// loop continues; prefill never fails because prefetch failed.
+#[cfg(unix)]
+pub struct LayerPrefetcher {
+    /// The layer the compute thread is on; the thread keeps `[cur+1, cur+depth)`
+    /// streamed (plus the current layer, so a cold start warms it too).
+    current: Arc<AtomicUsize>,
+    stop: Arc<AtomicBool>,
+    join: Option<JoinHandle<()>>,
+}
+
+#[cfg(unix)]
+impl LayerPrefetcher {
+    /// Spawn the prefetch thread for `ranges` (per-layer `(start, end)` byte
+    /// offsets into `file`, absolute in the file, as produced by
+    /// [`crate::gguf_ext::GgufHeader::layer_expert_ranges`]).
+    pub fn spawn(
+        file: Arc<File>,
+        ranges: Arc<Vec<Option<(usize, usize)>>>,
+        depth: usize,
+    ) -> Self {
+        let current = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let join = {
+            let file = Arc::clone(&file);
+            let ranges = Arc::clone(&ranges);
+            let current = Arc::clone(&current);
+            let stop = Arc::clone(&stop);
+            std::thread::Builder::new()
+                .name("layer-prefetch".into())
+                .spawn(move || run_prefetch(file, ranges, current, stop, depth))
+                .ok()
+        };
+        Self {
+            current,
+            stop,
+            join,
+        }
+    }
+
+    /// Tell the thread which layer the compute thread is on.  Called once per
+    /// layer, at its start.
+    pub fn set_current(&self, layer: usize) {
+        self.current.store(layer, Ordering::Release);
+    }
+
+    /// Signal the thread to stop and wait for it to exit.
+    pub fn stop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for LayerPrefetcher {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+#[cfg(unix)]
+fn run_prefetch(
+    file: Arc<File>,
+    ranges: Arc<Vec<Option<(usize, usize)>>>,
+    current: Arc<AtomicUsize>,
+    stop: Arc<AtomicBool>,
+    depth: usize,
+) {
+    use std::os::unix::fs::FileExt;
+    let mut buf = vec![0u8; PREFETCH_CHUNK];
+    let file_len = file.metadata().map(|m| m.len() as usize).unwrap_or(0);
+    // Next layer index whose range we still need to stream.  Monotonic: the
+    // thread never re-reads a range, only catches up when the caller advances.
+    let mut next = 0usize;
+    while !stop.load(Ordering::Acquire) {
+        let cur = current.load(Ordering::Acquire);
+        let target = cur.saturating_add(depth).min(ranges.len());
+        let mut advanced = false;
+        while next < target {
+            if let Some((b0, e1)) = ranges[next] {
+                if b0 < e1 && e1 <= file_len {
+                    let mut off = b0;
+                    // Best effort: on error, skip the rest of this range.
+                    let mut ok = true;
+                    while ok && off < e1 {
+                        let n = (e1 - off).min(buf.len());
+                        match file.read_at(&mut buf[..n], off as u64) {
+                            Ok(0) => break,
+                            Ok(k) => off += k,
+                            Err(_) => ok = false,
+                        }
+                    }
+                }
+            }
+            next += 1;
+            advanced = true;
+        }
+        if !advanced {
+            // Caught up with cur + depth: wait for the compute thread to move.
+            std::thread::sleep(PREFETCH_POLL);
+        }
+    }
+}
+
+/// Non-unix builds get a no-op handle so the model code compiles unchanged.
+#[cfg(not(unix))]
+pub struct LayerPrefetcher;
+
+#[cfg(not(unix))]
+impl LayerPrefetcher {
+    pub fn spawn(
+        _file: Arc<File>,
+        _ranges: Arc<Vec<Option<(usize, usize)>>>,
+        _depth: usize,
+    ) -> Self {
+        Self
+    }
+    pub fn set_current(&self, _layer: usize) {}
+    pub fn stop(&mut self) {}
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -600,6 +918,111 @@ mod tests {
             .unwrap()
             .is_none());
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Fraction of the mapping's pages currently resident (0.0–1.0).
+    #[cfg(target_os = "linux")]
+    fn resident_fraction(mmap: &Mmap) -> f64 {
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        let len = mmap.len();
+        let n = len.div_ceil(page);
+        let mut vec = vec![0u8; n];
+        let rc = unsafe {
+            libc::mincore(
+                mmap.as_ptr() as *mut libc::c_void,
+                len,
+                vec.as_mut_ptr() as *mut libc::c_uchar,
+            )
+        };
+        assert_eq!(rc, 0, "mincore failed");
+        let resident = vec.iter().filter(|b| *b & 0x1 != 0).count();
+        resident as f64 / n as f64
+    }
+
+    /// The prefetch thread must stream a dropped range back into the page cache
+    /// so that later mmap faults are hits.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn prefetcher_warms_page_cache() {
+        use std::os::unix::fs::FileExt;
+        use std::os::unix::io::AsRawFd;
+
+        let dir = std::env::temp_dir().join(format!("joshua-pf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("model.bin");
+        let len = 32 * 1024 * 1024;
+        let mut f = std::fs::File::create(&path).unwrap();
+        // Write real data: sparse holes are served from the shared zero page
+        // and never populate the page cache, which would make the residency
+        // assertion vacuous.  Real GGUFs are dense.
+        {
+            use std::io::Write;
+            let chunk = vec![0x5au8; 1024 * 1024];
+            let mut written = 0usize;
+            while written < len {
+                f.write_all(&chunk).unwrap();
+                written += chunk.len();
+            }
+        }
+        f.sync_all().unwrap();
+        drop(f);
+        // Reopen read-only before mapping, like the GGUF tests do.
+        let file = Arc::new(std::fs::File::open(&path).unwrap());
+        let mmap = Arc::new(unsafe { Mmap::map(&file).unwrap() });
+
+        // Drop the file's pages from the cache so the test starts cold.
+        let rc = unsafe {
+            libc::posix_fadvise(
+                file.as_raw_fd(),
+                0,
+                len as libc::off_t,
+                libc::POSIX_FADV_DONTNEED,
+            )
+        };
+        assert_eq!(rc, 0, "posix_fadvise failed");
+        // Give the kernel a moment to actually drop them.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let cold = resident_fraction(&mmap);
+        if cold > 0.9 {
+            // Cache not droppable here (e.g. tmpfs-backed /tmp): the residency
+            // assertion would be vacuous, so skip rather than flake.
+            eprintln!("prefetch test skipped: pages not droppable (resident {cold:.2})");
+            drop(mmap);
+            std::fs::remove_dir_all(&dir).ok();
+            return;
+        }
+
+        let ranges: Vec<Option<(usize, usize)>> = vec![Some((0, len))];
+        let mut pf = LayerPrefetcher::spawn(
+            Arc::clone(&file),
+            Arc::new(ranges),
+            PREFETCH_AHEAD_DEPTH,
+        );
+        pf.set_current(0);
+
+        // Poll until the thread has streamed the whole range (or timeout).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut resident = 0.0;
+        while std::time::Instant::now() < deadline {
+            resident = resident_fraction(&mmap);
+            if resident > 0.99 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        pf.stop();
+        assert!(
+            resident > 0.99,
+            "prefetch thread did not warm the cache: resident {resident:.3}"
+        );
+
+        // Sanity: the warm pages are readable via the mapping.
+        let mut probe = vec![0u8; 4096];
+        let n = file.read_at(&mut probe, 0).unwrap();
+        assert_eq!(n, 4096);
+
+        drop(mmap);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

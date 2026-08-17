@@ -133,6 +133,7 @@ fn main() -> anyhow::Result<()> {
             &mut cursor,
             &dev,
             Some(Arc::clone(&mmap_arc)),
+            None,
         )?
     };
     let load_s = t0.elapsed().as_secs_f64();
