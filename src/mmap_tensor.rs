@@ -785,11 +785,13 @@ fn run_prefetch(
     use std::os::unix::fs::FileExt;
     let mut buf = vec![0u8; PREFETCH_CHUNK];
     let file_len = file.metadata().map(|m| m.len() as usize).unwrap_or(0);
-    // Next layer index whose range we still need to stream.  Monotonic: the
-    // thread never re-reads a range, only catches up when the caller advances.
+    // Next layer index whose range we still need to stream.  Never re-reads a
+    // range; if the compute thread overtakes us we skip forward to it rather
+    // than streaming layers that have already been consumed.
     let mut next = 0usize;
     while !stop.load(Ordering::Acquire) {
         let cur = current.load(Ordering::Acquire);
+        next = next.max(cur);
         let target = cur.saturating_add(depth).min(ranges.len());
         let mut advanced = false;
         while next < target && !stop.load(Ordering::Acquire) {
