@@ -623,12 +623,14 @@ impl Engine {
             hot_pinning,
         )?;
         // Explicit huge pages copy the model into anonymous RAM — there is no
-        // file to prefetch from, so drop the handle.
-        let model_file = if matches!(options.huge_pages, HugePages::Explicit(_)) {
-            None
-        } else {
-            Some(Arc::new(model_file))
-        };
+        // file to prefetch from, so drop the handle.  With `lazy_weights` the
+        // copy is skipped and the mapping stays file-backed, so keep it.
+        let model_file =
+            if matches!(options.huge_pages, HugePages::Explicit(_)) && !options.lazy_weights {
+                None
+            } else {
+                Some(Arc::new(model_file))
+            };
 
         // Read GGUF metadata once to validate the architecture up front and
         // extract EOS token IDs.  The tolerant reader keeps dtypes candle
