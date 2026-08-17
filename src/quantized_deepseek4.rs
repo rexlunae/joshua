@@ -2000,12 +2000,16 @@ impl ModelWeights {
         // the next few layers' expert spans into the page cache while the
         // layer loop computes (see [`LayerPrefetcher`]); the kernel streams at
         // full device bandwidth and the layer's mmap faults become cache hits.
+        // The madvise hints below only need the mapping; the pread thread
+        // additionally needs the model file handle, so loads that supply a
+        // mapping but no file (public `from_gguf_mmap(..., Some(mmap), None)`)
+        // keep the hints and just skip the thread.
         let prefetch_layers = seq_len >= PREFETCH_AHEAD_MIN
             && !self.layer_expert_ranges.is_empty()
-            && self.mmap.is_some()
-            && self.file.is_some();
+            && self.mmap.is_some();
+        let prefetch_thread = prefetch_layers && self.file.is_some();
 
-        let prefetcher = if prefetch_layers {
+        let prefetcher = if prefetch_thread {
             Some(crate::mmap_tensor::LayerPrefetcher::spawn(
                 self.file.as_ref().expect("checked above").clone(),
                 std::sync::Arc::new(self.layer_expert_ranges.clone()),
