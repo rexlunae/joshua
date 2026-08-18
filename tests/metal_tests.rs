@@ -153,7 +153,7 @@ fn deepseek4_iq2xxs_experts_refuse_metal() {
     let header = joshua::gguf_ext::read_header(&mut cursor).unwrap();
     let content = header.to_candle_content().unwrap();
     let mut cursor = std::io::Cursor::new(&bytes[..]);
-    let err = QuantizedModel::from_gguf_mmap(content, &mut cursor, &dev, None)
+    let err = QuantizedModel::from_gguf_mmap(content, &mut cursor, &dev, None, None)
         .err()
         .expect("IQ2_XXS load on Metal must fail, not allocate ~16× f32");
     let msg = format!("{err}");

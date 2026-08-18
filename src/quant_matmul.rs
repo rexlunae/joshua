@@ -79,6 +79,12 @@ pub fn decode_raw_to_f32(dtype: u32, bytes: &[u8], elems: usize) -> Result<Optio
             crate::iq2xxs::dequantize(blocks, &mut out)?;
             out
         }
+        crate::mxfp4::GGML_TYPE_MXFP4 => {
+            let blocks = crate::mxfp4::blocks_from_bytes(bytes)?;
+            let mut out = vec![0f32; elems];
+            crate::mxfp4::dequantize(blocks, &mut out)?;
+            out
+        }
         2 => kquant!(BlockQ4_0),
         3 => kquant!(BlockQ4_1),
         6 => kquant!(BlockQ5_0),

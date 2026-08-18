@@ -1543,6 +1543,9 @@ pub struct ModelWeights {
     device: Device,
     /// The model mapping, retained so prefill can prefetch whole layers.
     mmap: Option<std::sync::Arc<memmap2::Mmap>>,
+    /// The model file, retained so prefill can run a layer-ahead pread
+    /// prefetch thread (see [`crate::mmap_tensor::LayerPrefetcher`]).
+    file: Option<std::sync::Arc<std::fs::File>>,
     /// Per-layer expert byte ranges in the mapping (see
     /// [`crate::gguf_ext::GgufHeader::layer_expert_ranges`]).
     layer_expert_ranges: Vec<Option<(usize, usize)>>,
@@ -1557,6 +1560,8 @@ struct Reader<R: Read + Seek> {
     reader: R,
     device: Device,
     mmap: Option<std::sync::Arc<memmap2::Mmap>>,
+    /// The model file, for the layer-ahead pread prefetch thread.
+    file: Option<std::sync::Arc<std::fs::File>>,
 }
 
 impl<R: Read + Seek> Reader<R> {
@@ -1750,7 +1755,7 @@ impl ModelWeights {
         reader: &mut R,
         device: &Device,
     ) -> Result<Self> {
-        Self::from_gguf_mmap(ct, None, reader, device, None)
+        Self::from_gguf_mmap(ct, None, reader, device, None, None)
     }
 
     /// Load with weights borrowed in place from `mmap` where possible.
@@ -1764,6 +1769,7 @@ impl ModelWeights {
         reader: &mut R,
         device: &Device,
         mmap: Option<std::sync::Arc<memmap2::Mmap>>,
+        file: Option<std::sync::Arc<std::fs::File>>,
     ) -> Result<Self> {
         let cfg = Config::from_metadata(&ct.metadata)?;
         let mut rd = Reader {
@@ -1772,6 +1778,7 @@ impl ModelWeights {
             reader,
             device: device.clone(),
             mmap,
+            file,
         };
 
         let tok_embeddings = rd.f32_tensor("token_embd.weight")?;
@@ -1942,6 +1949,7 @@ impl ModelWeights {
             .map(|r| r.layer_expert_ranges(cfg.n_layer))
             .unwrap_or_default();
         let mmap = rd.mmap.clone();
+        let file = rd.file.clone();
 
         Ok(Self {
             tok_embeddings,
@@ -1958,6 +1966,7 @@ impl ModelWeights {
             max_seq: kv_cap,
             device: device.clone(),
             mmap,
+            file,
             layer_expert_ranges,
         })
     }
@@ -1987,16 +1996,34 @@ impl ModelWeights {
         // dispatch-level prefetch covers the current layer's *selected*
         // experts but fires right before the expert loop — no head start, so
         // the matmuls still stall on page faults.  For real prefill
-        // (seq_len ≥ PREFETCH_AHEAD_MIN), kick off the WILLNEED streams for
-        // this and the next two layers up front: the kernel reads them
-        // sequentially while the layer computes, and by the time the next
-        // layers' MoE runs their pages are resident.
+        // (seq_len ≥ PREFETCH_AHEAD_MIN), a background thread preads this and
+        // the next few layers' expert spans into the page cache while the
+        // layer loop computes (see [`LayerPrefetcher`]); the kernel streams at
+        // full device bandwidth and the layer's mmap faults become cache hits.
+        // The madvise hints below only need the mapping; the pread thread
+        // additionally needs the model file handle, so loads that supply a
+        // mapping but no file (public `from_gguf_mmap(..., Some(mmap), None)`)
+        // keep the hints and just skip the thread.
         let prefetch_layers = seq_len >= PREFETCH_AHEAD_MIN
             && !self.layer_expert_ranges.is_empty()
             && self.mmap.is_some();
+        let prefetch_thread = prefetch_layers && self.file.is_some();
+
+        let prefetcher = if prefetch_thread {
+            Some(crate::mmap_tensor::LayerPrefetcher::spawn(
+                self.file.as_ref().expect("checked above").clone(),
+                std::sync::Arc::new(self.layer_expert_ranges.clone()),
+                crate::mmap_tensor::PREFETCH_AHEAD_DEPTH,
+            ))
+        } else {
+            None
+        };
 
         for (i, layer) in self.layers.iter_mut().enumerate() {
             let t_layer = std::time::Instant::now();
+            if let Some(pf) = &prefetcher {
+                pf.set_current(i);
+            }
             if i == 0 && prefetch_layers {
                 if let Some(mmap) = &self.mmap {
                     // The lazy-weights path advises MADV_RANDOM over the
@@ -2080,6 +2107,13 @@ impl ModelWeights {
             }
         }
 
+        // Stop the prefetch thread: prefill is over, and decode reads a handful
+        // of experts per layer — the thread's sequential stream would fight the
+        // random-access hint below.
+        if let Some(mut pf) = prefetcher {
+            pf.stop();
+        }
+
         // Restore the sparse-access hint after a prefill pass: decode reads a
         // handful of experts per layer, so SEQUENTIAL's aggressive readahead
         // would waste bandwidth pulling the wrong pages.
@@ -2156,6 +2190,99 @@ impl ModelWeights {
 
 /// Slice an IQ2_XXS expert tensor (`[n_expert, out, in]`, GGUF dims reversed)
 /// into per-expert [`QMatMul`]s whose blocks stay in the mapping.
+fn split_mxfp4_experts<R: Read + Seek>(
+    rd: &mut Reader<R>,
+    name: &str,
+    info: &crate::gguf_ext::RawTensorInfo,
+    n_expert: usize,
+) -> Result<Vec<ExpertTensor>> {
+    let dims = info.dims.clone();
+    if dims.len() != 3 || dims[0] != n_expert {
+        candle_core::bail!(
+            "deepseek4: expected expert tensor `{name}` shaped [n_expert, out, in], got {dims:?}"
+        );
+    }
+    let (out, inn) = (dims[1], dims[2]);
+    let per_elems = out * inn;
+    let mxfp4_block = std::mem::size_of::<crate::mxfp4::BlockMxfp4>();
+    if !per_elems.is_multiple_of(crate::mxfp4::QK_MXFP4) {
+        candle_core::bail!(
+            "deepseek4: MXFP4 expert `{name}` rows {out}x{inn} are not a multiple of {}",
+            crate::mxfp4::QK_MXFP4
+        );
+    }
+    let per_bytes = per_elems / crate::mxfp4::QK_MXFP4 * mxfp4_block;
+    let tensor_data_offset = rd
+        .raw
+        .as_ref()
+        .map(|r| r.tensor_data_offset)
+        .unwrap_or(rd.ct.tensor_data_offset);
+
+    // Zero-copy: one borrowed QTensor per expert, pointing into the mapping.
+    // Only sound on CPU — borrowed blocks are `QStorage::Cpu`, so on
+    // accelerator devices decode to f32 and copy below (which uses
+    // `rd.device`) instead.
+    if let Some(mmap) = rd.mmap.as_ref().filter(|_| rd.device.is_cpu()) {
+        let base = tensor_data_offset.saturating_add(info.offset) as usize;
+        let mut experts = Vec::with_capacity(n_expert);
+        for e in 0..n_expert {
+            match crate::mmap_tensor::borrowed_range_mxfp4(
+                mmap,
+                base + e * per_bytes,
+                (out, inn).into(),
+            )? {
+                Some(qt) => experts.push(ExpertTensor {
+                    qmatmul: QMatMul::from_qtensor(qt)?,
+                    prefetch: crate::mmap_tensor::prefetch_handle_mxfp4(
+                        mmap,
+                        base + e * per_bytes,
+                        per_elems / crate::mxfp4::QK_MXFP4,
+                    ),
+                }),
+                None => {
+                    experts.clear();
+                    break;
+                }
+            }
+        }
+        if experts.len() == n_expert {
+            return Ok(experts);
+        }
+        tracing::warn!("deepseek4: could not borrow `{name}` from the mapping, decoding to f32");
+    }
+
+    // The fallback below materializes the whole stacked tensor as f32 — an
+    // order-of-magnitude blow-up for real model footprints (~9 GB of 4-bit
+    // data per stacked tensor becomes ~140 GB), and accelerator devices cannot
+    // borrow the blocks (they are CPU storage).  Refuse loudly rather than OOM.
+    if !rd.device.is_cpu() {
+        candle_core::bail!(
+            "deepseek4: MXFP4 expert tensor `{name}` is only supported on the CPU device"
+        );
+    }
+
+    // No mapping (or borrow declined): decode the whole tensor to f32 and hand
+    // each expert over as an f32 QMatMul.  Only reachable in tests for the
+    // production footprint of these tensors.
+    let bytes = rd.raw_bytes_from(name)?;
+    let blocks = crate::mxfp4::blocks_from_bytes(&bytes)?;
+    let mut all = vec![0f32; info.elem_count()];
+    crate::mxfp4::dequantize(blocks, &mut all)?;
+    let mut experts = Vec::with_capacity(n_expert);
+    for e in 0..n_expert {
+        let t = Tensor::from_vec(
+            all[e * per_elems..(e + 1) * per_elems].to_vec(),
+            (out, inn),
+            &rd.device,
+        )?;
+        experts.push(ExpertTensor {
+            qmatmul: QMatMul::from_qtensor(QTensor::quantize(&t, GgmlDType::F32)?)?,
+            prefetch: None,
+        });
+    }
+    Ok(experts)
+}
+
 fn split_iq2xxs_experts<R: Read + Seek>(
     rd: &mut Reader<R>,
     name: &str,
@@ -2353,6 +2480,9 @@ fn split_experts<R: Read + Seek>(
     if let Some(info) = raw_info {
         if info.dtype == crate::iq2xxs::GGML_TYPE_IQ2_XXS {
             return split_iq2xxs_experts(rd, name, &info, n_expert);
+        }
+        if info.dtype == crate::mxfp4::GGML_TYPE_MXFP4 {
+            return split_mxfp4_experts(rd, name, &info, n_expert);
         }
     }
     let qt = rd.qtensor(name)?;

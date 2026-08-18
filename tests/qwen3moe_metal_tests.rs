@@ -79,6 +79,7 @@ fn qwen3moe_metal_routing_stays_in_range() {
         &mut cursor,
         &dev,
         Some(std::sync::Arc::clone(&mmap_arc)),
+        None,
     )
     .unwrap();
     let out = mm.forward(&input, 0).unwrap();
@@ -114,6 +115,7 @@ fn qwen3moe_metal_routing_stays_in_range() {
         &mut cursor,
         &dev,
         Some(std::sync::Arc::clone(&mmap_arc)),
+        None,
     )
     .unwrap();
     let ref_prefill: Vec<f32> = cref
