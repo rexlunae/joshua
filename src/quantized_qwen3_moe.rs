@@ -366,13 +366,33 @@ impl Attention {
         // Scaled dot-product attention (GQA: repeat K/V heads).
         let k = repeat_kv(k, self.n_head / self.n_kv_head)?.contiguous()?;
         let v = repeat_kv(v, self.n_head / self.n_kv_head)?.contiguous()?;
-        let scores = (q.contiguous()?.matmul(&k.transpose(2, 3)?.contiguous()?)? * self.softmax_scale)?;
-        let scores = match mask {
-            Some(m) => scores.broadcast_add(m)?,
-            None => scores,
-        };
-        let probs = softmax_last_dim(&scores)?;
-        let ctx = probs.matmul(&v)?; // [b, n_head, seq, head_dim]
+
+        // Chunked attention over query rows.  The naive `q @ kᵀ` materialises
+        // `[n_head, seq, kv_seq]` f32 scores — quadratic in the prompt length —
+        // which blows past the device's per-buffer ceiling (~1GB on Apple
+        // Metal) somewhere around 2–3K tokens of prefill and dies with
+        // "Failed to create metal resource: Buffer" (followed by garbage
+        // router reads once buffers start failing).  Softmax is row-wise and
+        // the K/V tensors are shared across query rows, so chunking the query
+        // rows is exact and bounds the largest allocation.
+        let kt = k.transpose(2, 3)?.contiguous()?; // [b, n_head, head_dim, kv_seq]
+        let kv_len = k.dim(3)?;
+        let heads = k.dim(1)?;
+        // Target ≤512MB per scores buffer: rows = 512MiB / (heads × kv_len × 4B).
+        let chunk = (512 * 1024 * 1024 / (heads * kv_len * 4).max(1)).clamp(16, 512);
+        let n_q = q.dim(2)?;
+        let mut parts = Vec::new();
+        for start in (0..n_q).step_by(chunk) {
+            let end = (start + chunk).min(n_q);
+            let qc = q.narrow(2, start, end - start)?.contiguous()?;
+            let mut sc = (qc.matmul(&kt)? * self.softmax_scale)?;
+            if let Some(m) = mask {
+                sc = sc.broadcast_add(&m.narrow(2, start, end - start)?)?;
+            }
+            let probs = softmax_last_dim(&sc)?;
+            parts.push(probs.matmul(&v)?); // [b, n_head, chunk, head_dim]
+        }
+        let ctx = Tensor::cat(&parts, 2)?; // [b, n_head, seq, head_dim]
         let ctx = ctx
             .transpose(1, 2)?
             .contiguous()?
