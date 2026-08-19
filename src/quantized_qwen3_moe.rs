@@ -441,10 +441,30 @@ impl Moe {
     /// Router logits → softmax probs → top-k ids and gathered weights, with
     /// llama.cpp's `norm_topk_prob` normalisation (min-clamp to the f16
     /// epsilon so a degenerate routing can never divide by zero).
+    ///
+    /// The top-k selection runs on the host.  The GPU argsort path
+    /// (`arg_sort_last_dim` → narrow → contiguous) returns stale buffer
+    /// contents under long-prompt memory pressure — the readback can come
+    /// back holding the previous occupant of the reused Metal buffer (the
+    /// probs themselves), which surfaces as absurd "expert ids" at token 0.
+    /// The router tensor is tiny ([n_tokens, n_expert] f32, ~15MB at 29K
+    /// tokens), so a host-side sort of each row is microseconds and exact.
     fn route(&self, x2: &Tensor) -> Result<(Tensor, Tensor)> {
+        let n_tokens = x2.dim(0)?;
+        let k = self.n_expert_used;
         let logits = x2.matmul(&self.gate_t)?; // [n_tokens, n_expert]
-        let probs = softmax_last_dim(&logits)?;
-        let topk_idx = topk_indices(&probs, self.n_expert_used)?; // [n_tokens, k]
+        let probs = softmax_last_dim(&logits)?; // [n_tokens, n_expert]
+
+        let p: Vec<Vec<f32>> = probs.to_vec2()?; // host copy: syncs the pipeline
+        let mut idxv: Vec<u32> = Vec::with_capacity(n_tokens * k);
+        let mut order: Vec<u32> = (0..self.gate_t.dim(1)? as u32).collect();
+        for row in p.iter() {
+            order.sort_unstable_by(|&a, &b| {
+                row[b as usize].partial_cmp(&row[a as usize]).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            idxv.extend_from_slice(&order[..k]);
+        }
+        let topk_idx = Tensor::from_vec(idxv, (n_tokens, k), x2.device())?;
         let mut weights = probs.gather(&topk_idx, D::Minus1)?; // [n_tokens, k]
         if self.weights_norm {
             let denom = weights
@@ -538,13 +558,6 @@ impl Moe {
         let y = out.broadcast_mul(&w)?.sum(0)?; // [1, h]
         Ok(y)
     }
-}
-
-/// Indices of the top-`k` values along the last dim (descending), as u32.
-fn topk_indices(t: &Tensor, k: usize) -> Result<Tensor> {
-    t.arg_sort_last_dim(false)?
-        .narrow(D::Minus1, 0, k)?
-        .contiguous()
 }
 
 // ─── Layer + model ───────────────────────────────────────────────────────────
