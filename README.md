@@ -13,8 +13,8 @@ framework) and [tokenizers](https://github.com/huggingface/tokenizers).
 | Feature | Details |
 |---|---|
 | **Pure Rust** | Zero C/C++ dependencies — `cargo build` requires only a Rust toolchain |
-| **mmap loading** | The GGUF file is memory-mapped like llama.cpp: weights page in lazily and stay in the OS page cache |
-| **Huge pages** | Optional transparent (`MADV_HUGEPAGE`) or explicit 2 MiB / 1 GiB (`MAP_HUGETLB`) backing to cut TLB misses on large models |
+| **mmap loading** | The GGUF file is memory-mapped like llama.cpp: weights live in the OS page cache, shared across engine clones — and a model that fits in RAM is prefetched whole at load (`MADV_WILLNEED`), so inference never re-reads weights from disk |
+| **Huge pages** | Transparent 2 MiB pages (`MADV_HUGEPAGE`, default on Linux) or explicit 2 MiB / 1 GiB (`MAP_HUGETLB`) backing to cut TLB misses on large models |
 | **OpenAI-compatible** | Drop-in replacement for `/v1/chat/completions`, `/v1/embeddings`, `/v1/models` |
 | **Streaming** | Server-Sent Events (SSE) for token-by-token streaming |
 | **GGUF support** | Llama/Mistral/Mixtral, Gemma 1–3, GLM-4, LFM2, Phi-2, Phi-3, Qwen2, Qwen3, Qwen3-MoE, DeepSeek-V2/V3, DeepSeek-V4, Kimi-K2 |
@@ -342,18 +342,22 @@ can call `server::serve_with_state_tls` directly.
 ## Huge pages
 
 Large models thrash the TLB: a 7B Q4 model is ~4 GB, which is two million
-4 KiB pages.  Backing the mapping with huge pages cuts TLB misses.  Select a
+4 KiB pages.  Backing the mapping with huge pages cuts TLB misses — and cuts
+page-fault count by the same factor while the model warms up.  Select a
 strategy with `--huge-pages` (or `EngineOptions::huge_pages` in the library);
-the huge-page modes are Linux-only and fall back to normal pages elsewhere.
+the huge-page modes are Linux-only and fall back to normal pages elsewhere
+(macOS maps files on its 16 KiB base pages and has no file-backed superpage
+API to ask for).
 
 | Mode | Mechanism | Trade-off |
 |---|---|---|
-| `off` (default) | file-backed `mmap`, normal pages | shared via the page cache; no setup |
-| `transparent` | file-backed `mmap` + `MADV_HUGEPAGE` | keeps the shared page cache; best-effort, kernel picks the size (usually 2 MiB); no setup |
+| `transparent` (**default on Linux**) | file-backed `mmap` + `MADV_HUGEPAGE` | keeps the shared page cache; best-effort, kernel picks the size (usually 2 MiB); no setup |
+| `off` (default elsewhere) | file-backed `mmap`, normal pages | shared via the page cache; no setup |
 | `2mb` / `1gb` / `huge` | model copied into an anonymous `MAP_HUGETLB` mapping | guarantees the page size, but uses **private** RAM (no shared page cache) and needs a preallocated pool |
 
 ```bash
-# Best-effort transparent huge pages — safe to enable anywhere:
+# Best-effort transparent huge pages — safe to enable anywhere (and the
+# Linux default already does this):
 joshua serve --model m.gguf --huge-pages transparent
 
 # Explicit 1 GiB pages (reserve the pool first):
@@ -361,10 +365,11 @@ sudo sysctl vm.nr_hugepages=$(( 5 * 1024 / 2 ))   # ~5 GiB of 2 MiB pages
 joshua serve --model m.gguf --huge-pages 2mb
 ```
 
-`transparent` is the safe default to try: it preserves Joshua's shared-page-cache
-model and simply does nothing if the kernel can't honour it.  The explicit
-modes give you a guaranteed page size at the cost of a private in-RAM copy and
-a preconfigured hugepage pool (`vm.nr_hugepages`, or `hugeadm` for 1 GiB pages).
+`transparent` is default-on for the CLI on Linux because it is free when it
+works and free when it doesn't: the kernel simply keeps normal pages if THP is
+unavailable, and the mapping stays file-backed either way.  The explicit modes
+give you a guaranteed page size at the cost of a private in-RAM copy and a
+preconfigured hugepage pool (`vm.nr_hugepages`, or `hugeadm` for 1 GiB pages).
 
 ---
 
@@ -416,18 +421,27 @@ than RAM has a bimodal access pattern that plain mmap serves poorly.  A small
 *dense* set — embeddings, norms, attention, routers, shared experts,
 indexer/compressor, output — is touched on **every** token, while the routed
 experts are touched sparsely (a token routes through a handful of the 256 per
-layer).  The default readahead hint (`MADV_SEQUENTIAL`) sets "free after use"
-on the whole mapping, so the dense set gets evicted between requests; a blanket
+layer).  A whole-mapping hint is wrong for one of the two halves: sequential
+readahead sets "free after use" and drags expert pages in wholesale; a blanket
 random hint kills readahead for everything.
 
-Joshua splits the model into dense and expert ranges and treats them
-differently:
+Joshua therefore never hints the model mapping sequentially at all, and splits
+the model into dense and expert ranges that are treated differently:
 
 | Flag | Effect |
 |---|---|
-| `--pin-hot-weights` | Prefetches the dense ranges (`MADV_WILLNEED`) at load and advises `MADV_RANDOM` on expert ranges, so the per-token working set is resident before the first request.  **Auto-on when the model file is larger than RAM**; `--pin-hot-weights=false` forces it off. |
+| `--prefetch-model` | Prefetches the **whole file** into the page cache at load (`MADV_WILLNEED`), so a model that fits in RAM is fully resident before the first request and inference never re-reads weights from disk.  **Auto-on when the model file fits in RAM**; `--prefetch-model=false` forces it off. |
+| `--pin-hot-weights` | For models larger than RAM: prefetches only the dense ranges (`MADV_WILLNEED`) at load and advises `MADV_RANDOM` on expert ranges, so the per-token working set is resident before the first request while experts page in on demand.  **Auto-on when the model file is larger than RAM**; `--pin-hot-weights=false` forces it off. |
 | `--mlock-hot-weights` | Additionally `mlock(2)`s the dense ranges for a hard residency guarantee.  `=required` fails the load when the memlock limit is too low; the default (`on`) warns once and degrades to advisory pinning. |
 | `--lazy-weights` | The blanket random-access hint for the whole mapping — no readahead at all.  Mostly superseded by `--pin-hot-weights`, kept for the truly-RAM-starved case. |
+
+The auto choice between the first two is made from the model size vs total RAM
+(`/proc/meminfo` on Linux, `hw.memsize` on macOS) and logged at startup:
+
+```text
+INFO joshua: page-cache auto: model 0.4 GiB vs RAM 24.0 GiB — prefetching the
+     whole model into the page cache
+```
 
 The memlock limit is checked against the hot-set size **before** any `mlock`
 call, with one warning naming limit vs required size (on DeepSeek-V4-Flash Q2_K
@@ -472,6 +486,7 @@ prints the dense/expert split of any GGUF to sanity-check a new model.
 | `JOSHUA_TLS_CERT` | PEM certificate chain for HTTPS (same as `--tls-cert`; needs `--features tls`) |
 | `JOSHUA_TLS_KEY` | PEM private key for HTTPS (same as `--tls-key`) |
 | `JOSHUA_LAZY_WEIGHTS` | Same as `--lazy-weights` |
+| `JOSHUA_PREFETCH_MODEL` | Same as `--prefetch-model` (`true`/`false`, or the flag with no value) |
 | `JOSHUA_PIN_HOT_WEIGHTS` | Same as `--pin-hot-weights` (`true`/`false`, or the flag with no value) |
 | `JOSHUA_MLOCK_HOT_WEIGHTS` | Same as `--mlock-hot-weights` (`on`, `required`, or `off`) |
 | `JOSHUA_MAX_CONCURRENCY` | Cap on simultaneous generations/embeddings (same as `--max-concurrency`) |

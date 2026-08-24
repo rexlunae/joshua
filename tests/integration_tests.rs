@@ -614,6 +614,41 @@ mod synthetic {
     }
 
     #[test]
+    fn whole_model_prefetch_loads_and_matches_untouched_mapping() {
+        use joshua::{types::GenerationOptions, EngineOptions};
+
+        let dir = model_dir("prefetch-whole");
+        write_tiny_gguf(&dir.join("model.gguf"), "llama");
+
+        let greedy = GenerationOptions {
+            max_tokens: 4,
+            temperature: 0.0,
+            repetition_penalty: 1.0,
+            ..Default::default()
+        };
+
+        // Baseline: the mapping is left to the page cache with no prefetch.
+        let opts = || EngineOptions::with_n_ctx(64);
+        let (baseline, _, _, _) = joshua::Engine::with_options(&dir, opts())
+            .expect("plain mmap load")
+            .complete_raw("hello a b", &greedy)
+            .unwrap();
+
+        // Whole-model prefetch (MADV_WILLNEED at load): advisory only, so it
+        // must load everywhere and produce identical output.
+        let (prefetched, _, _, _) = joshua::Engine::with_options(
+            &dir,
+            opts().prefetch_whole_model(true),
+        )
+        .expect("whole-model prefetch load")
+        .complete_raw("hello a b", &greedy)
+        .unwrap();
+        assert_eq!(prefetched, baseline, "prefetch must not change output");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn compressed_model_file_is_refused_when_mmap_is_explicit() {
         use joshua::{EngineOptions, MmapMode};
 
