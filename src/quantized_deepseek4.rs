@@ -1351,7 +1351,7 @@ struct Moe {
 }
 
 impl Moe {
-    fn forward(&self, xs: &Tensor, input_ids: &Tensor) -> Result<Tensor> {
+    fn forward(&self, xs: &Tensor, input_ids: &Tensor) -> Result<(Tensor, Vec<u32>)> {
         let (b, seq_len, h) = xs.dims3()?;
         let n_tokens = b * seq_len;
         let x2 = xs.reshape((n_tokens, h))?;
@@ -1400,12 +1400,12 @@ impl Moe {
             (weights, topk_idx)
         };
 
-        let routed = self.dispatch(&x2, &indices, &weights, n_tokens)?;
+        let (routed, routed_ids) = self.dispatch(&x2, &indices, &weights, n_tokens)?;
         let mut out = routed;
         if let Some(shared) = &self.shared {
             out = (out + shared.forward(&x2)?)?;
         }
-        out.reshape((b, seq_len, h))
+        Ok((out.reshape((b, seq_len, h))?, routed_ids))
     }
 
     fn dispatch(
@@ -1414,7 +1414,7 @@ impl Moe {
         indices: &Tensor,
         weights: &Tensor,
         n_tokens: usize,
-    ) -> Result<Tensor> {
+    ) -> Result<(Tensor, Vec<u32>)> {
         let k = self.n_expert_used;
         let h = x2.dim(1)?;
         let ids: Vec<u32> = indices.flatten_all()?.to_vec1()?;
@@ -1488,7 +1488,17 @@ impl Moe {
                 y = y.index_add(&idx, &out.broadcast_mul(&w)?, 0)?;
             }
         }
-        Ok(y)
+
+        // Routing record for the speculative next-step prefetch: during
+        // decode, every id this step routed to (routing consistency makes
+        // the next step likely to repeat them); during prefill only the
+        // final row's ids — the routing the immediately following decode
+        // step is most likely to continue from.
+        let mut routed_ids: Vec<u32> =
+            ids[n_tokens.saturating_sub(1) * k..].to_vec();
+        routed_ids.sort_unstable();
+        routed_ids.dedup();
+        Ok((y, routed_ids))
     }
 }
 
@@ -1519,7 +1529,7 @@ enum FeedForward {
 }
 
 impl FeedForward {
-    fn forward(&self, xs: &Tensor, input_ids: &Tensor) -> Result<Tensor> {
+    fn forward(&self, xs: &Tensor, input_ids: &Tensor) -> Result<(Tensor, Vec<u32>)> {
         match self {
             Self::Moe(m) => m.forward(xs, input_ids),
         }
@@ -1549,6 +1559,10 @@ pub struct ModelWeights {
     /// Per-layer expert byte ranges in the mapping (see
     /// [`crate::gguf_ext::GgufHeader::layer_expert_ranges`]).
     layer_expert_ranges: Vec<Option<(usize, usize)>>,
+    /// Routed-expert ids of the most recent forward pass, per layer index
+    /// (see [`ModelWeights::last_routed_experts`]).  The prediction source
+    /// for the speculative decode prefetch.
+    last_routed: Vec<Vec<u32>>,
 }
 
 /// Small GGUF reader over the memory-mapped file.
@@ -1951,6 +1965,7 @@ impl ModelWeights {
         let mmap = rd.mmap.clone();
         let file = rd.file.clone();
 
+        let n_layers = layers.len();
         Ok(Self {
             tok_embeddings,
             layers,
@@ -1968,7 +1983,45 @@ impl ModelWeights {
             mmap,
             file,
             layer_expert_ranges,
+            last_routed: vec![Vec::new(); n_layers],
         })
+    }
+
+    /// Fire the speculative prefetch for each MoE layer's predicted experts
+    /// (the ids recorded by the previous forward pass — see
+    /// [`ModelWeights::last_routed_experts`]).
+    ///
+    /// Best-effort and idempotent: a no-op for layers that have not routed
+    /// yet, dense layers, and every expert whose weights are not mmap-backed
+    /// (streamed loads keep no prefetch handles).
+    fn prefetch_speculative(&self) {
+        for (i, ids) in self.last_routed.iter().enumerate() {
+            if ids.is_empty() {
+                continue;
+            }
+            let Some(layer) = self.layers.get(i) else {
+                continue;
+            };
+            // Every layer of this architecture carries an MoE block.
+            let FeedForward::Moe(moe) = &layer.ffn;
+            for &e in ids {
+                if let Some(expert) = moe.experts.get(e as usize) {
+                    expert.prefetch();
+                }
+            }
+        }
+    }
+
+    /// Routed-expert ids of the most recent forward pass, per layer index
+    /// (dense layers and not-yet-run layers report empty vectors).
+    ///
+    /// Seeded during prefill from the final prompt token's routing and
+    /// refreshed by every decode step; the speculative decode prefetch
+    /// fires these ids' pages before each step so they stream in behind
+    /// compute instead of faulting on demand.  Diagnostics hook — also lets
+    /// tests observe that routing is being tracked.
+    pub fn last_routed_experts(&self) -> &[Vec<u32>] {
+        &self.last_routed
     }
 
     /// Forward pass. `input` is `[1, seq_len]`; `offset` is the KV-cache
@@ -2019,7 +2072,24 @@ impl ModelWeights {
             None
         };
 
-        for (i, layer) in self.layers.iter_mut().enumerate() {
+        // Speculative next-step expert prefetch (decode only): routing is
+        // temporally local — the step now being generated routes to a large
+        // extent to the experts the previous step chose (measured across
+        // model families).  Firing WILLNEED for each MoE layer's *predicted*
+        // experts before any layer runs gives those pages a full step of
+        // compute to stream in the background, instead of the dispatch-level
+        // prefetch below, which fires right before the expert matmuls with
+        // no head start.  Mispredictions are cheap: the advice call is
+        // idempotent and best-effort, and the dispatch-level prefetch still
+        // covers whatever was missed.
+        if seq_len == 1 {
+            self.prefetch_speculative();
+        }
+
+        // Field-split borrows so the loop can record each layer's routing.
+        let layers = &mut self.layers;
+        let last_routed = &mut self.last_routed;
+        for (i, layer) in layers.iter_mut().enumerate() {
             let t_layer = std::time::Instant::now();
             if let Some(pf) = &prefetcher {
                 pf.set_current(i);
@@ -2076,7 +2146,8 @@ impl ModelWeights {
             )?;
             let residual = xs;
             let h = layer.ffn_norm.forward(&x)?;
-            let h = layer.ffn.forward(&h, input)?;
+            let (h, routed_ids) = layer.ffn.forward(&h, input)?;
+            last_routed[i] = routed_ids;
             xs = hc_post(&h, &residual, &post, &comb)?;
             if let Some((_, m, _)) = prof.as_mut() {
                 m.push(t_moe.elapsed().as_secs_f64());
@@ -2184,6 +2255,13 @@ impl ModelWeights {
                 Ok(n) => *kv = n,
                 Err(e) => eprintln!("deepseek4: failed to reset KV state for layer {i}: {e}"),
             }
+        }
+        // The speculative prefetch predicts from the *previous step's*
+        // routing; after a reset that routing belongs to whatever ran on
+        // this instance before, so drop it.  (Advice-only either way — a
+        // stale prediction can waste readahead, never change logits.)
+        for ids in &mut self.last_routed {
+            ids.clear();
         }
     }
 }

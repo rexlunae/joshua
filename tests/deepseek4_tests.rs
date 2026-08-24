@@ -382,3 +382,88 @@ fn deepseek4_from_gguf_without_raw_header_loads() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// The speculative next-step expert prefetch must track routing: empty
+/// before the first pass, seeded by prefill's final row, refreshed by every
+/// decode step — and every recorded id must be a valid expert index.
+///
+/// The prediction itself only fires `MADV_WILLNEED` (unobservable here);
+/// what the test pins down is the bookkeeping the prediction is derived
+/// from, plus that recording routing does not disturb outputs: two freshly
+/// loaded models must produce identical logits with identical recorded
+/// state.
+#[test]
+fn deepseek4_speculative_routing_state_tracks_forward_passes() {
+    const N_EXPERT: u32 = 8; // fixture's expert count
+
+    let dir = common::model_dir("deepseek4-speculative");
+    let model_path = dir.join("model.gguf");
+    common::write_tiny_deepseek4_gguf(&model_path);
+
+    let mut a = load(&model_path, true);
+    // A second instance of the *same* load path: recording routing must not
+    // disturb the math, so both must produce identical logits and records.
+    // (Cross-load-path parity — mmap vs streamed — has small float deltas by
+    // design and is covered by its own tolerance-based tests.)
+    let mut b = load(&model_path, true);
+
+    let routed = |m: &QuantizedModel| -> Vec<Vec<u32>> {
+        match m {
+            QuantizedModel::DeepSeek4(w) => w.last_routed_experts().to_vec(),
+            _ => panic!("expected DeepSeek4 model"),
+        }
+    };
+    let assert_valid = |state: &[Vec<u32>]| {
+        for ids in state {
+            for pair in ids.windows(2) {
+                assert!(pair[0] < pair[1], "recorded ids must be sorted+deduped");
+            }
+            assert!(
+                ids.iter().all(|&e| e < N_EXPERT),
+                "recorded ids must be valid expert indices: {ids:?}"
+            );
+        }
+    };
+
+    // Nothing has routed yet.
+    let initial = routed(&a);
+    assert_eq!(initial.len(), 2, "one entry per fixture layer");
+    assert!(initial.iter().all(|v| v.is_empty()));
+
+    // Prefill seeds the record from the final row of the prompt.
+    let la = logits(&mut a, &[1, 4, 5], 0);
+    let after_prefill = routed(&a);
+    assert_valid(&after_prefill);
+    assert!(
+        after_prefill.iter().any(|v| !v.is_empty()),
+        "prefill must seed the routing record: {after_prefill:?}"
+    );
+
+    // Decode refreshes it; outputs and records stay deterministic across
+    // instances (the prefetch advice cannot affect the math).
+    let d1a = logits(&mut a, &[7], 3);
+    let lb = logits(&mut b, &[1, 4, 5], 0);
+    let db = logits(&mut b, &[7], 3);
+    assert_valid(&routed(&a));
+    assert_valid(&routed(&b));
+    assert_eq!(la, lb, "identical loads must produce identical logits");
+    assert_eq!(d1a, db, "decode must be deterministic and unaffected");
+
+    // Clearing the cache drops the speculative routing state too: it
+    // belongs to whatever ran on this instance before the reset.
+    match (&mut a, &mut b) {
+        (QuantizedModel::DeepSeek4(wa), QuantizedModel::DeepSeek4(wb)) => {
+            wa.clear_kv_cache();
+            wb.clear_kv_cache();
+        }
+        _ => panic!("expected DeepSeek4 models"),
+    }
+    assert!(
+        routed(&a).iter().all(|v| v.is_empty()),
+        "clear must reset routing records: {:?}",
+        routed(&a)
+    );
+    assert!(routed(&b).iter().all(|v| v.is_empty()));
+
+    std::fs::remove_dir_all(&dir).ok();
+}

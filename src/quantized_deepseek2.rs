@@ -501,6 +501,36 @@ impl Attention {
     fn clear_kv_cache(&mut self) {
         self.kv_cache = None;
     }
+
+    /// Keep only the first `keep` sequence positions of the KV cache.
+    ///
+    /// Edited-context prefix reuse: positions `[0..keep)` were produced by
+    /// exactly the tokens both conversations share, so they remain valid;
+    /// everything from `keep` on is dropped and recomputed by the next
+    /// prefill (which continues at absolute position `keep`).  The prefix is
+    /// materialised (`contiguous`) so the full-length buffer is actually
+    /// freed instead of lingering behind a view until the next append.
+    fn truncate_kv_cache(&mut self, keep: usize) -> Result<()> {
+        match &mut self.kv_cache {
+            None => Ok(()),
+            Some((_k, _v)) if keep == 0 => {
+                self.kv_cache = None;
+                Ok(())
+            }
+            Some((k, v)) => {
+                // The cache lives transposed — [b, n_head, dim, seq] — so
+                // the sequence dimension is dim 3 here (see `forward`).
+                let len = k.dim(3)?;
+                if keep >= len {
+                    return Ok(());
+                }
+                let k = k.narrow(3, 0, keep)?.contiguous()?;
+                let v = v.narrow(3, 0, keep)?.contiguous()?;
+                self.kv_cache = Some((k, v));
+                Ok(())
+            }
+        }
+    }
 }
 
 // ─── Mixture of experts (DeepSeek routing + shared experts) ──────────────────
@@ -922,6 +952,19 @@ impl ModelWeights {
         for layer in self.layers.iter_mut() {
             layer.attn.clear_kv_cache();
         }
+    }
+
+    /// Keep only the first `keep` fed tokens of every layer's KV cache.
+    ///
+    /// See [`Attention::truncate_kv_cache`] for the semantics; used by the
+    /// engine's edited-context prefix reuse (a follow-up prompt that shares
+    /// a prefix with the cached history after an agent harness truncated or
+    /// replaced middle blocks).
+    pub fn truncate_kv_cache(&mut self, keep: usize) -> Result<()> {
+        for layer in self.layers.iter_mut() {
+            layer.attn.truncate_kv_cache(keep)?;
+        }
+        Ok(())
     }
 }
 

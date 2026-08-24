@@ -8,26 +8,42 @@
 //! # Memory mapping
 //!
 //! The GGUF file is memory-mapped (`mmap`) once when the engine is created,
-//! exactly like llama.cpp's default loading strategy.  Weight data is paged
-//! in lazily by the OS on first touch and stays resident in the page cache,
-//! so it is shared between engine clones and across requests, and never
-//! copied through a `read()` syscall path.
+//! exactly like llama.cpp's default loading strategy.  Weight data lives in
+//! the OS page cache, so it is shared between engine clones and across
+//! requests and never copied through a `read()` syscall path.
+//!
+//! How much of the model is resident up front is a choice:
+//!
+//! * [`EngineOptions::prefetch_whole_model`] issues a best-effort
+//!   `MADV_WILLNEED` over the whole mapping at load, so a model that fits in
+//!   RAM is fully resident in the page cache before the first request and
+//!   inference never re-reads weights from disk.  This is the CLI default
+//!   whenever the model file fits in RAM.
+//! * Without it, nothing is read until inference touches a weight: pages
+//!   fault in on first use and the kernel evicts them under memory pressure
+//!   like any clean file-backed page.  The mapping is never hinted
+//!   `MADV_SEQUENTIAL` — that would mean "free after use" and evict weight
+//!   pages right after each token, which is the opposite of what an engine
+//!   that re-reads every weight on every token wants.
 //!
 //! The page size is selectable via [`EngineOptions::huge_pages`]: the default
 //! keeps this file-backed mapping on normal pages; [`HugePages::Transparent`]
-//! adds a `MADV_HUGEPAGE` hint while preserving the shared page cache; and
+//! adds a `MADV_HUGEPAGE` hint (2 MiB pages where the kernel can manage it —
+//! the CLI default on Linux) while preserving the shared page cache; and
 //! [`HugePages::Explicit`] copies the weights into an anonymous `MAP_HUGETLB`
 //! mapping of a chosen size (2 MiB / 1 GiB) for guaranteed huge pages at the
-//! cost of private RAM.
+//! cost of private RAM.  File-backed huge pages are Linux-only: macOS maps
+//! files on its 16 KiB base pages and has no file-backed superpage API.
 //!
 //! For a sparse mixture-of-experts model far larger than RAM, the access
-//! pattern is bimodal and the blanket hints above are wrong for one of the
-//! two halves: the dense weights are touched on every token, while routed
-//! experts are touched sparsely.  [`EngineOptions::pin_hot_weights`] prefetches
+//! pattern is bimodal and neither of the two whole-mapping strategies above is
+//! right: the dense weights are touched on every token, while routed experts
+//! are touched sparsely.  [`EngineOptions::pin_hot_weights`] prefetches
 //! the dense ranges (`MADV_WILLNEED`) at load and advises `MADV_RANDOM` on the
 //! expert ranges so they page in on demand without evicting the hot set;
 //! [`EngineOptions::mlock_hot_weights`] additionally locks the dense ranges
-//! into RAM for a hard residency guarantee.
+//! into RAM for a hard residency guarantee.  The CLI turns this on by default
+//! when the model file is larger than RAM.
 //!
 //! Because that mapping is the whole loading strategy, the file is checked
 //! before it is mapped: a model that is really a gzip/zstd/… stream, or one
@@ -225,12 +241,18 @@ pub struct EngineOptions {
     pub huge_pages: HugePages,
     /// Optimise the mapping for models far larger than RAM.
     ///
-    /// Normally the loader walks every tensor in file order, so the kernel is
-    /// told to read ahead aggressively.  For a sparse mixture-of-experts model
-    /// that is counter-productive: a given token touches a handful of experts,
-    /// and readahead drags in hundreds of megabytes that are immediately
-    /// evicted.  Setting this swaps the hint to "random access", so pages
-    /// fault in only as weights are genuinely touched.
+    /// For a sparse mixture-of-experts model that does not fit in RAM, a
+    /// given token touches a handful of experts and whole-file readahead
+    /// drags in hundreds of megabytes that are immediately evicted.  Setting
+    /// this advises `MADV_RANDOM` on the whole mapping, so pages fault in
+    /// only as weights are genuinely touched and clean pages stay evictable.
+    ///
+    /// Without it the mapping gets no blanket hint at all (the kernel's
+    /// default readahead and normal page-cache retention apply), which is
+    /// right for models that fit in RAM — see
+    /// [`EngineOptions::prefetch_whole_model`] for warming those in at load.
+    /// This does not conflict with `prefetch_whole_model`: the explicit
+    /// whole-file prefetch wins and the random hint is skipped.
     ///
     /// Only meaningful for architectures whose loaders borrow from the mapping
     /// (see [`crate::mmap_tensor`]); the readahead hint never affects
@@ -249,6 +271,26 @@ pub struct EngineOptions {
     /// [`MmapMode::Required`] turns "this file cannot usefully be mapped" from
     /// a warning into a load error.
     pub mmap: MmapMode,
+    /// Prefetch the whole model file into the OS page cache at load.
+    ///
+    /// Issues a best-effort `MADV_WILLNEED` over the entire mapping right
+    /// after it is created, so a model that fits in RAM is fully resident
+    /// before the first request: inference never re-reads weights from disk,
+    /// and engine clones all share the same cached pages.  The prefetch is
+    /// advisory — under memory pressure the kernel evicts clean pages and the
+    /// next access re-faults them, exactly as if nothing had been prefetched.
+    ///
+    /// Right for models whose file fits comfortably in RAM; wasteful for
+    /// models far larger than RAM, where the whole file could never be
+    /// resident and the eager read only thrashes the cache (use
+    /// [`EngineOptions::pin_hot_weights`] there instead — the CLI auto-picks
+    /// between the two from the model size vs RAM).
+    ///
+    /// Redundant for [`HugePages::Explicit`], which copies the whole model
+    /// into anonymous RAM up front; the request is then ignored with a
+    /// warning.  On non-Unix platforms there is no `madvise` and the request
+    /// is a no-op.
+    pub prefetch_whole_model: bool,
     /// Prefetch the always-touched weights at load and advise random access
     /// on routed-expert weights.
     ///
@@ -258,15 +300,14 @@ pub struct EngineOptions {
     /// every token, while the routed experts are touched sparsely (a token
     /// routes through a handful of the 256 per layer).  Plain mmap leaves both
     /// to the page cache: the dense set faults in on first use, and the
-    /// readahead hint normally given to the mapping (see
-    /// [`EngineOptions::lazy_weights`]) drags in expert pages that are
-    /// immediately evicted.
+    /// experts fault in per touch (the per-range `MADV_RANDOM` advice here
+    /// stops whole-file readahead from dragging them in wholesale).
     ///
     /// With this set, the dense ranges are prefetched (`MADV_WILLNEED`) so the
     /// per-token working set is resident before the first request, and the
     /// expert ranges get `MADV_RANDOM` so sparse access does not evict it.  The
-    /// blanket sequential/random hint is skipped in favour of these per-range
-    /// hints.  The prefetch is best-effort (the kernel decides); combine with
+    /// blanket hint is skipped in favour of these per-range hints.  The
+    /// prefetch is best-effort (the kernel decides); combine with
     /// [`EngineOptions::mlock_hot_weights`] for a hard guarantee.
     ///
     /// Meaningless for [`HugePages::Explicit`], which copies the whole model
@@ -326,6 +367,13 @@ impl EngineOptions {
         self
     }
 
+    /// Prefetch the whole model into the OS page cache at load.  See
+    /// [`EngineOptions::prefetch_whole_model`].
+    pub fn prefetch_whole_model(mut self, prefetch: bool) -> Self {
+        self.prefetch_whole_model = prefetch;
+        self
+    }
+
     /// Prefetch the always-touched weights at load and advise random access on
     /// routed experts.  See [`EngineOptions::pin_hot_weights`].
     pub fn pin_hot_weights(mut self, pin: bool) -> Self {
@@ -362,6 +410,15 @@ pub struct Engine {
     model_file: Option<Arc<File>>,
     /// Stateless tokenizer, shared across all inference calls.
     tokenizer: Arc<Tokenizer>,
+    /// Whether the tokenizer uses a byte-level decoder (`ByteLevel`).
+    ///
+    /// Byte-level BPE tokenizers (DeepSeek-V2/V3, Kimi-K2, Qwen, ...) store
+    /// raw bytes in their vocab and can split a multi-byte UTF-8 character
+    /// across two tokens — a lone byte such as `0xE4` is invalid UTF-8 on its
+    /// own.  Those tokenizers need whole-buffer decoding so the byte state
+    /// carries across tokens; decoder-less/word-level tokenizers must instead
+    /// be decoded token-by-token (batch decoding them would insert spaces).
+    byte_level_decode: bool,
     /// EOS token IDs derived from the GGUF metadata and common special tokens.
     eos_token_ids: Vec<u32>,
     /// The model's chat template from GGUF metadata, if it ships one.
@@ -377,6 +434,12 @@ pub struct Engine {
     model_cache: Mutex<Vec<CachedModel>>,
     /// Number of requests that continued from a cached KV prefix.
     kv_reuses: AtomicU64,
+    /// Number of requests that continued from a cached KV prefix recovered
+    /// across an *edit* of the conversation — the prompt shares only a
+    /// prefix with the cached history (agent harnesses truncate or replace
+    /// middle blocks), so the session state was rewound to that prefix
+    /// instead of being cleared.  A subset of [`Engine::kv_reuse_count`].
+    kv_edit_reuses: AtomicU64,
     /// Optional NPU backend with its circuit breaker.
     npu: Option<NpuState>,
     /// Number of generations/embeddings currently executing.
@@ -497,6 +560,36 @@ impl GenSession {
         }
     }
 
+    /// Whether this session's KV state can be truncated to a prefix length
+    /// at all (see [`GenSession::truncate_to`]).
+    fn supports_truncate(&self) -> bool {
+        match self {
+            Self::Candle(model) => model.supports_kv_truncate(),
+            Self::Npu(_) => false,
+        }
+    }
+
+    /// Keep only the first `keep` fed tokens of the session's KV state.
+    ///
+    /// This is what makes *edited-context* prefix reuse sound: positions
+    /// `[0..keep)` were produced by exactly the tokens both conversations
+    /// share, so they stay valid; everything after is recomputed when the
+    /// caller prefills from absolute position `keep`.  Returns `false` when
+    /// the architecture cannot truncate or the operation failed — callers
+    /// fall back to the plain clear/fresh-load paths.
+    fn truncate_to(&mut self, keep: usize) -> bool {
+        match self {
+            Self::Candle(model) => match model.truncate_kv_cache(keep) {
+                Ok(supported) => supported,
+                Err(e) => {
+                    tracing::debug!(error = %e, keep, "KV truncation failed");
+                    false
+                }
+            },
+            Self::Npu(_) => false,
+        }
+    }
+
     fn is_npu(&self) -> bool {
         matches!(self, Self::Npu(_))
     }
@@ -556,6 +649,93 @@ impl NpuState {
     }
 }
 
+/// Whether the tokenizer at `path` uses a byte-level decoder.
+///
+/// Byte-level BPE tokenizers (DeepSeek-V2/V3, Kimi-K2, Qwen, ...) map raw
+/// bytes through their own table and can split a multi-byte UTF-8 sequence
+/// across two tokens, so generated text must be decoded from the whole
+/// accumulated token buffer rather than one token at a time.  Detected from
+/// the `decoder.type` in `tokenizer.json`; everything else (word-level,
+/// decoder-less, BPE with explicit decoders) decodes token-by-token.
+fn tokenizer_is_byte_level(path: &std::path::Path) -> Result<bool, JoshuaError> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| JoshuaError::ModelLoad(format!("tokenizer read failed: {e}")))?;
+    let value: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| JoshuaError::ModelLoad(format!("tokenizer parse failed: {e}")))?;
+    Ok(matches!(
+        value.pointer("/decoder/type").and_then(|v| v.as_str()),
+        Some("ByteLevel")
+    ))
+}
+
+/// Incremental decoder for byte-level tokenizers (GPT-2 style, where a
+/// token's text is a byte-unicode string and may be a *lone* byte).
+///
+/// Byte-level BPE splits multi-byte UTF-8 across token boundaries — a single
+/// generated token can carry one raw byte (e.g. DeepSeek's vocab entries
+/// `¡`..`ÿ`), so byte state must survive across tokens.  Re-decoding the
+/// whole accumulated buffer every step did that at O(n²) in output length;
+/// instead keep only a small trailing window:
+///
+/// * within a window whose boundary does not split a codepoint, decoding is
+///   per-character, so a prefix-stable extension adds exactly the suffix a
+///   whole-buffer decode would add;
+/// * whenever stability breaks, fall back to one whole-buffer decode of all
+///   ids so far — reproducing the previous behaviour verbatim.
+///
+/// A codepoint spans at most 4 bytes, so an 8-token window always contains
+/// every not-yet-final byte.
+#[derive(Default)]
+struct ByteWindowDecoder {
+    tail: Vec<u32>,
+    tail_text: String,
+}
+
+impl ByteWindowDecoder {
+    const WINDOW: usize = 8;
+
+    /// Feed one token, returning the updated output text (`response`).
+    fn push(
+        &mut self,
+        tokenizer: &Tokenizer,
+        token: u32,
+        response: String,
+        all_ids: &[u32],
+    ) -> Result<String> {
+        let decode = |ids: &[u32]| -> Result<String> {
+            tokenizer
+                .decode(ids, false)
+                .map_err(|e| JoshuaError::Inference(e.to_string()))
+        };
+
+        self.tail.push(token);
+        let new_text = decode(&self.tail)?;
+        let mut response = if new_text.starts_with(&self.tail_text) {
+            // Stable extension: append just the new suffix.
+            let mut response = response;
+            response.push_str(&new_text[self.tail_text.len()..]);
+            response
+        } else {
+            // A codepoint completed across the boundary: take the oracle.
+            decode(all_ids)?
+        };
+        self.tail_text = new_text;
+
+        if self.tail.len() > Self::WINDOW {
+            // Slide.  `response` already holds every decoded byte — the head
+            // token's text was appended when it was pushed — so sliding only
+            // shrinks the window to keep future steps cheap; appending here
+            // would duplicate output (and slicing `tail_text` at a byte
+            // offset could split a codepoint).  Just refresh the window text
+            // to match the shrunken window.
+            let shrunk = decode(&self.tail[1..])?;
+            self.tail.remove(0);
+            self.tail_text = shrunk;
+        }
+        Ok(response)
+    }
+}
+
 impl Engine {
     /// Load a GGUF model using a 4 096-token context window.
     ///
@@ -607,20 +787,24 @@ impl Engine {
 
         let tokenizer = Tokenizer::from_file(&tokenizer_path)
             .map_err(|e| JoshuaError::ModelLoad(format!("tokenizer load failed: {e}")))?;
-
+        let byte_level_decode = tokenizer_is_byte_level(&tokenizer_path)?;
         // Map the GGUF file into memory using the configured backing.
         //
         // Hot-weight pinning applies per-range advice after the header is
-        // parsed below, so it asks map_model to skip the blanket
-        // sequential/random hint (which would otherwise keep "free after use"
-        // semantics on the very ranges we want to keep resident).
-        let hot_pinning = options.pin_hot_weights || options.mlock_hot_weights != MlockMode::Off;
+        // parsed below, and whole-model prefetch replaces the blanket hint
+        // entirely, so both ask map_model to skip the blanket random/sequential
+        // hint (which would otherwise keep "free after use" semantics on the
+        // very ranges we want to keep resident).
+        let hot_pinning = options.pin_hot_weights
+            || options.mlock_hot_weights != MlockMode::Off
+            || options.prefetch_whole_model;
         let (mmap, model_file) = map_model(
             &gguf_path,
             options.huge_pages,
             options.lazy_weights,
             options.mmap,
             hot_pinning,
+            options.prefetch_whole_model,
         )?;
         // Explicit huge pages copy the model into anonymous RAM — there is no
         // file to prefetch from, so drop the handle.  With `lazy_weights` the
@@ -646,19 +830,25 @@ impl Engine {
         if hot_pinning {
             if matches!(options.huge_pages, HugePages::Explicit(_)) {
                 tracing::warn!(
-                    "ignoring hot-weight pinning: explicit huge pages already copy the whole \
-                     model into anonymous RAM, so every range is resident. Use --huge-pages \
-                     transparent (or none) for pinning to matter."
+                    "ignoring hot-weight pinning and whole-model prefetch: explicit huge pages \
+                     already copy the whole model into anonymous RAM, so every range is \
+                     resident. Use --huge-pages transparent (or none) for either to matter."
                 );
             } else {
-                let raw = crate::gguf_ext::read_header(&mut Cursor::new(&mmap[..]))
-                    .map_err(|e| JoshuaError::ModelLoad(format!("GGUF header re-read failed: {e}")))?;
+                let raw =
+                    crate::gguf_ext::read_header(&mut Cursor::new(&mmap[..])).map_err(|e| {
+                        JoshuaError::ModelLoad(format!("GGUF header re-read failed: {e}"))
+                    })?;
+                // A whole-file prefetch already covers the dense ranges, so the
+                // dense WILLNEED is skipped; the expert RANDOM advice (and any
+                // mlock) still apply.
                 apply_hot_weight_pinning(
                     &mmap,
                     &raw,
-                    options.pin_hot_weights,
+                    options.pin_hot_weights && !options.prefetch_whole_model,
                     options.mlock_hot_weights,
-                )?;            }
+                )?;
+            }
         }
 
         // The API identifier is the file stem — the documented contract on
@@ -723,11 +913,13 @@ impl Engine {
             mmap: Arc::new(mmap),
             model_file,
             tokenizer: Arc::new(tokenizer),
+            byte_level_decode,
             eos_token_ids,
             chat_template,
             embed_model: Mutex::new(None),
             model_cache: Mutex::new(Vec::new()),
             kv_reuses: AtomicU64::new(0),
+            kv_edit_reuses: AtomicU64::new(0),
             npu: None,
             in_flight: AtomicUsize::new(0),
             max_concurrency,
@@ -1233,6 +1425,9 @@ impl Engine {
 
         let mut rng = thread_rng();
         let mut response = String::new();
+        let mut decoded_ids: Vec<u32> = Vec::new();
+        // Incremental byte-level decode state (see [`ByteWindowDecoder`]).
+        let mut byte_window = ByteWindowDecoder::default();
         let mut fed_tokens: Vec<u32> = Vec::new();
         let mut n_decoded: u32 = 0;
         let mut n_cur = start_pos;
@@ -1254,12 +1449,26 @@ impl Engine {
                 break;
             }
 
-            // Decode the new token to text.
-            let piece = self
-                .tokenizer
-                .decode(&[next_token], false)
-                .map_err(|e| JoshuaError::Inference(e.to_string()))?;
-            response.push_str(&piece);
+            if self.byte_level_decode {
+                // Byte-level BPE splits multi-byte UTF-8 across token
+                // boundaries — a single token can be a lone byte (e.g.
+                // DeepSeek's raw-byte vocab entries `¡`..`ÿ`), which is
+                // invalid UTF-8 on its own and would decode to U+FFFD.
+                // [`ByteWindowDecoder`] keeps that byte state across tokens
+                // without re-decoding the whole output every step (the old
+                // whole-buffer decode made generation O(n²) in length).
+                decoded_ids.push(next_token);
+                response =
+                    byte_window.push(&self.tokenizer, next_token, response, &decoded_ids)?;
+            } else {
+                // Decoder-less / word-level tokenizers: batch decoding would
+                // join pieces with spaces, so decode each token and append.
+                let piece = self
+                    .tokenizer
+                    .decode(&[next_token], false)
+                    .map_err(|e| JoshuaError::Inference(e.to_string()))?;
+                response.push_str(&piece);
+            }
             n_decoded += 1;
 
             // Maintain sliding-window token history for repetition penalty.
@@ -1366,6 +1575,14 @@ impl Engine {
         self.kv_reuses.load(Ordering::Relaxed)
     }
 
+    /// Number of requests so far that continued from a cached KV prefix
+    /// recovered across an edit of the conversation (the prompt shares only
+    /// a prefix with the cached history, so the session state was rewound
+    /// to that common prefix).  Included in [`Engine::kv_reuse_count`].
+    pub fn kv_edit_reuse_count(&self) -> u64 {
+        self.kv_edit_reuses.load(Ordering::Relaxed)
+    }
+
     /// Route generation through an NPU backend (see [`crate::npu`]).
     ///
     /// Generation requests try the backend first and transparently fall back
@@ -1400,15 +1617,25 @@ impl Engine {
     ///
     /// 1. a pooled instance whose fed-token history is a strict prefix of
     ///    the prompt (longest match wins) — only the suffix needs prefill;
-    /// 2. a pooled instance whose state can be cleared — skips re-creating
+    /// 2. a pooled instance whose history shares only a *prefix* with the
+    ///    prompt (an edited conversation — agent harnesses truncate or
+    ///    replace middle blocks such as old tool outputs): where the
+    ///    architecture supports it, its KV state is rewound to the longest
+    ///    common prefix and only the diverging remainder is prefilled;
+    /// 3. a pooled instance whose state can be cleared — skips re-creating
     ///    the session;
-    /// 3. a fresh session (NPU) or a fresh instance from the mmap (candle).
+    /// 4. a fresh session (NPU) or a fresh instance from the mmap (candle).
     fn acquire_session(
         &self,
         prompt_tokens: &[u32],
         allow_npu: bool,
     ) -> Result<(GenSession, usize)> {
         let want_npu = allow_npu && self.npu.as_ref().is_some_and(|n| n.usable());
+
+        // Edited-context candidate, if any: picked under the pool lock, but
+        // rewound (a potentially large KV copy) outside the critical section
+        // below so concurrent acquire/release is never stalled by it.
+        let mut edit_pick: Option<(CachedModel, usize)> = None;
 
         {
             let mut pool = self.model_pool();
@@ -1419,7 +1646,12 @@ impl Engine {
                 .iter()
                 .enumerate()
                 .filter(|(_, c)| {
-                    c.session.is_npu() == want_npu
+                    // An empty history is a prefix of every prompt but
+                    // carries no reusable KV — skip it so entries parked
+                    // empty (or poisoned, below) reach the clearing path
+                    // instead of being served as-is.
+                    !c.tokens.is_empty()
+                        && c.session.is_npu() == want_npu
                         && c.tokens.len() < prompt_tokens.len()
                         && prompt_tokens.starts_with(&c.tokens)
                 })
@@ -1436,14 +1668,92 @@ impl Engine {
                 );
                 return Ok((cached.session, cached.tokens.len()));
             }
-            let resettable = pool.iter().position(|c| c.session.is_npu() == want_npu);
-            if let Some(i) = resettable {
-                let mut cached = pool.swap_remove(i);
-                if cached.session.clear_state() {
-                    tracing::debug!(npu = want_npu, "Reusing pooled session with cleared state");
-                    return Ok((cached.session, 0));
+            // Edited-context reuse: no pooled history extends this prompt,
+            // but one may share a prefix with it.  Rewind that instance's
+            // KV state to the common prefix instead of throwing the whole
+            // prefill away.  Candle path only — NPU plugins own their token
+            // history internally, so their sessions can never be rewound.
+            //
+            // Two shapes of edit reach this path:
+            // * a *truncating* edit (harness dropped/replaced middle blocks)
+            //   leaves `lcp < prompt.len()`: rewind to `lcp` and prefill the
+            //   diverging remainder;
+            // * a *rollback* (regenerate/retry: prompt is a strict prefix of
+            //   the history) has `lcp == prompt.len()` — rewinding to `lcp`
+            //   would leave nothing to prefill, and the logits for the token
+            //   after the prompt are not recoverable from a cache alone, so
+            //   rewind to `lcp - 1` and re-prefill just the final token.
+            //   (`keep == 0` on single-token prompts degenerates to a clear.)
+            if !want_npu {
+                let best_edit = pool
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| c.session.supports_truncate())
+                    .map(|(i, c)| (i, longest_common_prefix(&c.tokens, prompt_tokens)))
+                    .filter(|(_, lcp)| *lcp > 0 && *lcp <= prompt_tokens.len())
+                    // Longest common prefix first; pass 1's exact-prefix
+                    // matches are intentionally preferred over longer edit
+                    // candidates because they need no KV copy at all.
+                    .max_by_key(|(_, lcp)| *lcp);
+                if let Some((i, lcp)) = best_edit {
+                    // Rollback case: keep one token behind so the suffix
+                    // prefill is never empty.
+                    let keep = lcp.min(prompt_tokens.len() - 1);
+                    edit_pick = Some((pool.swap_remove(i), keep));
                 }
-                // Reset failed (e.g. dead shim): drop it and fall through.
+            }
+            // The clear path runs only when no rewind was picked — rewinding
+            // preserves strictly more work than clearing.
+            if edit_pick.is_none() {
+                let resettable = pool.iter().position(|c| c.session.is_npu() == want_npu);
+                if let Some(i) = resettable {
+                    let mut cached = pool.swap_remove(i);
+                    if cached.session.clear_state() {
+                        tracing::debug!(
+                            npu = want_npu,
+                            "Reusing pooled session with cleared state"
+                        );
+                        return Ok((cached.session, 0));
+                    }
+                    // Reset failed (e.g. dead shim): drop it and fall through.
+                }
+            }
+        }
+
+        // Attempt the rewind outside the pool lock.
+        if let Some((mut cached, lcp)) = edit_pick {
+            if cached.session.truncate_to(lcp) {
+                self.kv_reuses.fetch_add(1, Ordering::Relaxed);
+                self.kv_edit_reuses.fetch_add(1, Ordering::Relaxed);
+                tracing::debug!(
+                    reused_tokens = lcp,
+                    dropped_tokens = cached.tokens.len().saturating_sub(lcp),
+                    prompt_tokens = prompt_tokens.len(),
+                    "Continuing from cached KV prefix after context edit"
+                );
+                return Ok((cached.session, lcp));
+            }
+            // Truncation failed unexpectedly.  The failure may have hit
+            // part-way through the per-layer loop, leaving earlier layers
+            // shortened and later ones not — a cache that no longer matches
+            // any single prefix of anything.  Poison the entry twice over:
+            // clear the state outright when possible, and park it with empty
+            // tokens so every reuse pass skips it (an empty history is a
+            // prefix of every prompt, so the strict-prefix pass alone would
+            // still match it).  If the clear also fails, the entry is dropped
+            // by falling out of the block with `clear_ok == false`.
+            {
+                let clear_ok = cached.session.clear_state();
+                if clear_ok {
+                    cached.tokens.clear();
+                    let mut pool = self.model_pool();
+                    pool.push(cached);
+                    while pool.len() > MAX_CACHED_MODELS {
+                        pool.remove(0);
+                    }
+                }
+                // !clear_ok: drop the instance entirely — a session whose
+                // state cannot even be reset is not worth parking.
             }
         }
 
@@ -1613,14 +1923,18 @@ fn load_image_bytes(source: &str) -> Result<Vec<u8>> {
 /// the file is truncated or rewritten while mapped.  Model files are treated
 /// as immutable once downloaded, matching llama.cpp's own mmap usage.
 ///
-/// `per_range_advice` skips the blanket sequential/random hint: the caller
-/// (hot-weight pinning) applies per-range advice after parsing the header.
+/// `per_range_advice` skips the blanket hint: the caller (hot-weight pinning)
+/// applies per-range advice after parsing the header.  `prefetch_whole` asks
+/// the kernel to pull the whole file into the page cache right after mapping
+/// (a single `MADV_WILLNEED`); it implies `per_range_advice` (the blanket
+/// hint is pointless once every page is being read in anyway).
 fn map_model(
     path: &Path,
     huge: HugePages,
     lazy: bool,
     mmap_mode: MmapMode,
     per_range_advice: bool,
+    prefetch_whole: bool,
 ) -> Result<(Mmap, File)> {
     let file = File::open(path)?;
 
@@ -1649,20 +1963,22 @@ fn map_model(
 
     let mmap = map_model_file_padded(&file)?;
 
-    // Weight tensors are normally consumed in file order during a load, so
-    // ask the kernel to read ahead aggressively.  When the caller has flagged
-    // the model as far larger than RAM the access pattern is sparse instead —
-    // a token touches a few experts — and readahead would evict more than it
-    // saves, so ask for random access.  Hot-weight pinning skips the blanket
-    // hint entirely: the dense ranges get a targeted prefetch and the expert
-    // ranges get the random-access hint, applied per range after the header
-    // is parsed.  Best effort either way.
+    // Blanket access hint.  The engine *re-reads* every weight on every token,
+    // so `MADV_SEQUENTIAL` ("pages may be freed soon after they are accessed")
+    // would evict the model from the page cache right after each use — the
+    // default path keeps no blanket hint instead, letting the kernel's normal
+    // readahead and page-cache retention apply.  Only a model explicitly
+    // flagged as far larger than RAM gets `MADV_RANDOM`, since sparse expert
+    // access makes readahead evict more than it saves.  Hot-weight pinning and
+    // whole-model prefetch skip the blanket hint entirely: they apply targeted
+    // advice per range (or none) after the header is parsed.  Best effort
+    // either way.
     #[cfg(unix)]
-    if !per_range_advice {
+    if !per_range_advice && !prefetch_whole {
         let _ = mmap.advise(if lazy {
             memmap2::Advice::Random
         } else {
-            memmap2::Advice::Sequential
+            memmap2::Advice::Normal
         });
     }
 
@@ -1678,6 +1994,24 @@ fn map_model(
         tracing::warn!("transparent huge pages are Linux-only; using normal pages");
     }
 
+    // Prefetch the whole model into the page cache so it is resident before
+    // the first request.  A single whole-mapping `MADV_WILLNEED`: the kernel
+    // streams the file in behind the load, and clean pages stay evictable
+    // under memory pressure, so this is advisory and never blocks for long.
+    #[cfg(unix)]
+    if prefetch_whole {
+        match mmap.advise(memmap2::Advice::WillNeed) {
+            Ok(()) => {
+                tracing::info!("prefetching the whole model into the page cache (MADV_WILLNEED)")
+            }
+            Err(e) => tracing::warn!("could not prefetch the model into the page cache: {e}"),
+        }
+    }
+    #[cfg(not(unix))]
+    if prefetch_whole {
+        tracing::warn!("whole-model prefetch is unix-only (madvise); ignoring the request");
+    }
+
     Ok((mmap, file))
 }
 
@@ -1685,6 +2019,16 @@ fn map_model(
 
 /// A byte range in the model mapping: `(offset, len)`.
 type ByteRange = (usize, usize);
+
+/// Length of the longest common token prefix of two sequences.
+///
+/// The reuse predicate for *edited* conversations: an agent harness that
+/// truncates or replaces middle blocks (old tool outputs, thinking segments)
+/// leaves a follow-up prompt that shares a prefix with the cached history
+/// without extending it.  O(min(len)) with no allocation.
+fn longest_common_prefix(a: &[u32], b: &[u32]) -> usize {
+    a.iter().zip(b).take_while(|(x, y)| x == y).count()
+}
 
 /// Whether a tensor name belongs to the routed-expert set.
 ///
@@ -1705,13 +2049,26 @@ fn is_routed_expert(name: &str) -> bool {
 /// normally 32 bytes), so each tensor's size is the gap to the next tensor's
 /// offset and the last tensor ends at the file size.  Offsets are absolute
 /// (the header's `tensor_data_offset` is added).  Ranges separated by at most
-/// one page are merged — `madvise`/`mlock` work in pages, so a sub-page gap
-/// costs nothing and merging cuts the syscall count.
+/// one *system base page* are merged — `madvise`/`mlock` round in base pages,
+/// so a sub-page gap costs nothing and merging cuts the syscall count.  (The
+/// merge gap stays at base-page granularity on purpose: a huge-page-sized gap
+/// would merge dense ranges across the expert tensors between them, turning
+/// the dense/expert split into "prefetch everything".)
 ///
 /// Returns `(dense, routed_experts)`, each a sorted list of [`ByteRange`]s.
 fn weight_ranges(
     header: &crate::gguf_ext::GgufHeader,
     file_size: u64,
+) -> (Vec<ByteRange>, Vec<ByteRange>) {
+    weight_ranges_with_page(header, file_size, base_page_size())
+}
+
+/// [`weight_ranges`] with an explicit page size, so tests can pin the merge
+/// granularity without touching the real system.
+fn weight_ranges_with_page(
+    header: &crate::gguf_ext::GgufHeader,
+    file_size: u64,
+    page: usize,
 ) -> (Vec<ByteRange>, Vec<ByteRange>) {
     let mut all: Vec<(u64, &str)> = header
         .tensors
@@ -1740,12 +2097,12 @@ fn weight_ranges(
         }
     }
 
-    fn merge(mut ranges: Vec<ByteRange>) -> Vec<ByteRange> {
+    fn merge(mut ranges: Vec<ByteRange>, page: usize) -> Vec<ByteRange> {
         ranges.sort_by_key(|(o, _)| *o);
         let mut out: Vec<ByteRange> = Vec::new();
         for (off, len) in ranges {
             if let Some(last) = out.last_mut() {
-                if off <= last.0 + last.1 + 4096 {
+                if off <= last.0 + last.1 + page {
                     let end = (off + len).max(last.0 + last.1);
                     last.1 = end - last.0;
                     continue;
@@ -1756,7 +2113,21 @@ fn weight_ranges(
         out
     }
 
-    (merge(dense), merge(experts))
+    (merge(dense, page), merge(experts, page))
+}
+
+/// Base memory page size in bytes — the granularity `madvise`/`mlock` round
+/// to.  4 KiB on most Linux, 16 KiB on Apple Silicon macOS; falls back to
+/// 4 KiB when the system value is unavailable or implausible.
+fn base_page_size() -> usize {
+    #[cfg(unix)]
+    {
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        if page >= 4096 && page.is_power_of_two() {
+            return page;
+        }
+    }
+    4096
 }
 
 /// Apply hot-weight pinning to the model mapping: prefetch (`MADV_WILLNEED`)
@@ -1776,11 +2147,13 @@ fn apply_hot_weight_pinning(
     mlock: MlockMode,
 ) -> Result<()> {
     let (dense, experts) = weight_ranges(header, mmap.len() as u64);
-    let gib = |r: &[ByteRange]| r.iter().map(|(_, l)| *l as u64).sum::<u64>() as f64 / 2f64.powi(30);
+    let gib =
+        |r: &[ByteRange]| r.iter().map(|(_, l)| *l as u64).sum::<u64>() as f64 / 2f64.powi(30);
     tracing::info!(
-        "hot-weight pinning: {} dense range(s) ({:.2} GiB) to keep resident, {} expert range(s) ({:.2} GiB) on demand",
+        "hot-weight pinning: {} dense range(s) ({:.2} GiB, WILLNEED {}) and {} expert range(s) ({:.2} GiB, RANDOM)",
         dense.len(),
         gib(&dense),
+        if prefetch { "on" } else { "off" },
         experts.len(),
         gib(&experts),
     );
@@ -1788,68 +2161,76 @@ fn apply_hot_weight_pinning(
     if prefetch {
         let mut failed = 0usize;
         for &(off, len) in &dense {
-            if mmap.advise_range(memmap2::Advice::WillNeed, off, len).is_err() {
+            if mmap
+                .advise_range(memmap2::Advice::WillNeed, off, len)
+                .is_err()
+            {
                 failed += 1;
             }
         }
         if failed > 0 {
-            tracing::warn!("{failed}/{} dense ranges ignored the WILLNEED prefetch hint", dense.len());
+            tracing::warn!(
+                "{failed}/{} dense ranges ignored the WILLNEED prefetch hint",
+                dense.len()
+            );
         }
     }
 
     {
         let mut failed = 0usize;
         for &(off, len) in &experts {
-            if mmap.advise_range(memmap2::Advice::Random, off, len).is_err() {
+            if mmap
+                .advise_range(memmap2::Advice::Random, off, len)
+                .is_err()
+            {
                 failed += 1;
             }
         }
         if failed > 0 {
-            tracing::warn!("{failed}/{} expert ranges ignored the RANDOM access hint", experts.len());
+            tracing::warn!(
+                "{failed}/{} expert ranges ignored the RANDOM access hint",
+                experts.len()
+            );
         }
     }
 
     if mlock != MlockMode::Off {
-        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
-        if page == 0 || !page.is_power_of_two() {
-            tracing::warn!("mlock skipped: could not determine the system page size");
-        } else {
-            let required = aligned_range_bytes(&dense, page, mmap.len());
-            let limit = memlock_limit_bytes();
-            match mlock_decision(mlock, limit, required) {
-                MlockDecision::Proceed => {
-                    let failed = mlock_ranges(mmap, &dense, page);
-                    if failed > 0 && mlock == MlockMode::Required {
-                        return Err(JoshuaError::ModelLoad(format!(
-                            "mlock of the hot weight set failed ({failed}/{} ranges) despite \
-                             RLIMIT_MEMLOCK appearing sufficient — see the warnings above",
-                            dense.len()
-                        )));
-                    }
+        let page = base_page_size();
+        let required = aligned_range_bytes(&dense, page, mmap.len());
+        let limit = memlock_limit_bytes();
+        match mlock_decision(mlock, limit, required) {
+            MlockDecision::Proceed => {
+                let failed = mlock_ranges(mmap, &dense, page);
+                if failed > 0 && mlock == MlockMode::Required {
+                    return Err(JoshuaError::ModelLoad(format!(
+                        "mlock of the hot weight set failed ({failed}/{} ranges) despite \
+                         RLIMIT_MEMLOCK appearing sufficient — see the warnings above",
+                        dense.len()
+                    )));
                 }
-                MlockDecision::Degrade => tracing::warn!(
-                    "RLIMIT_MEMLOCK is {limit}, below the {:.2} GiB hot set — skipping the lock \
-                     and degrading to advisory pinning. Raise it with /etc/security/limits.conf \
-                     (`{user} - memlock unlimited`), `LimitMEMLOCK=infinity` (systemd), or \
-                     `ulimit -l unlimited`; for a live systemd user session apply it without \
-                     re-login: `sudo prlimit --pid <user manager pid> --memlock=-1:-1`.",
+            }
+            MlockDecision::Degrade => tracing::warn!(
+                "RLIMIT_MEMLOCK is {limit}, below the {:.2} GiB hot set — skipping the lock \
+                 and degrading to advisory pinning. Raise it with /etc/security/limits.conf \
+                 (`{user} - memlock unlimited`), `LimitMEMLOCK=infinity` (systemd), or \
+                 `ulimit -l unlimited`; for a live systemd user session apply it without \
+                 re-login: `sudo prlimit --pid <user manager pid> --memlock=-1:-1`.",
+                required as f64 / 2f64.powi(30),
+                limit = display_memlock_limit(limit),
+                user = whoami(),
+            ),
+            MlockDecision::Fail => {
+                return Err(JoshuaError::ModelLoad(format!(
+                    "RLIMIT_MEMLOCK is {limit}, below the {:.2} GiB hot set that \
+                     --mlock-hot-weights=required demands be locked. Raise it with \
+                     /etc/security/limits.conf (`{user} - memlock unlimited`), \
+                     `LimitMEMLOCK=infinity` (systemd), or `ulimit -l unlimited`; for a \
+                     live systemd user session: `sudo prlimit --pid <user manager pid> \
+                     --memlock=-1:-1`.",
                     required as f64 / 2f64.powi(30),
                     limit = display_memlock_limit(limit),
                     user = whoami(),
-                ),
-                MlockDecision::Fail => {
-                    return Err(JoshuaError::ModelLoad(format!(
-                        "RLIMIT_MEMLOCK is {limit}, below the {:.2} GiB hot set that \
-                         --mlock-hot-weights=required demands be locked. Raise it with \
-                         /etc/security/limits.conf (`{user} - memlock unlimited`), \
-                         `LimitMEMLOCK=infinity` (systemd), or `ulimit -l unlimited`; for a \
-                         live systemd user session: `sudo prlimit --pid <user manager pid> \
-                         --memlock=-1:-1`.",
-                        required as f64 / 2f64.powi(30),
-                        limit = display_memlock_limit(limit),
-                        user = whoami(),
-                    )))
-                }
+                )))
             }
         }
     }
@@ -2523,6 +2904,14 @@ mod tests {
         // Pinning is off by default and settable through the builders.
         assert!(!EngineOptions::default().pin_hot_weights);
         assert_eq!(EngineOptions::default().mlock_hot_weights, MlockMode::Off);
+        // Whole-model prefetch is off by default and settable through the
+        // builder.
+        assert!(!EngineOptions::default().prefetch_whole_model);
+        assert!(
+            EngineOptions::default()
+                .prefetch_whole_model(true)
+                .prefetch_whole_model
+        );
         let o = EngineOptions::default()
             .pin_hot_weights(true)
             .mlock_hot_weights(MlockMode::On);
@@ -2561,6 +2950,132 @@ mod tests {
                 .collect(),
             tensor_data_offset,
         }
+    }
+
+    /// A minimal GPT-2-style byte-level tokenizer: the ByteLevel decoder
+    /// maps each token's byte-unicode characters back to raw bytes, so a
+    /// token can carry a single UTF-8 byte — including lone *continuation*
+    /// bytes that are invalid UTF-8 on their own.  `\u{c3}` is byte 0xC3,
+    /// `\u{a9}` is 0xA9 (together they form `é`), `\u{bc}` is 0xBC
+    /// (with 0xC3: `ü`); ASCII letters map to themselves.  Every vocabulary
+    /// character must be a genuine GPT-2 byte-unicode table entry — a
+    /// character outside the table passes through decoding untouched and
+    /// would make the fixture lie about what decoders produce.
+    fn byte_level_tokenizer() -> Tokenizer {
+        use std::str::FromStr;
+        let json = r#"{
+            "version": "1.0",
+            "truncation": null,
+            "padding": null,
+            "added_tokens": [],
+            "normalizer": null,
+            "pre_tokenizer": {"type": "Whitespace"},
+            "post_processor": null,
+            "decoder": {"type": "ByteLevel", "add_prefix_space": false,
+                        "trim_offsets": true, "use_regex": false},
+            "model": {
+                "type": "WordLevel",
+                "vocab": {"<unk>": 0, "h": 1, "i": 2, "Ã": 3, "©": 4,
+                          "¼": 5, "x": 6},
+                "unk_token": "<unk>"
+            }
+        }"#;
+        Tokenizer::from_str(json).expect("byte-level fixture tokenizer must parse")
+    }
+
+    #[test]
+    fn byte_window_decoder_completes_split_codepoints() {
+        let tk = byte_level_tokenizer();
+        let mut w = ByteWindowDecoder::default();
+        let mut response = String::new();
+        let mut all = Vec::new();
+
+        // é arrives as two lone bytes (0xC3, 0xA9).
+        for t in [3u32, 4] {
+            all.push(t);
+            response = w.push(&tk, t, response, &all).unwrap();
+        }
+        assert_eq!(response, "é", "split codepoint must complete: {response:?}");
+
+        // ü arrives right behind it, again as two lone bytes.
+        for t in [3u32, 5] {
+            all.push(t);
+            response = w.push(&tk, t, response, &all).unwrap();
+        }
+        assert_eq!(response, "éü");
+    }
+
+    #[test]
+    fn byte_window_decoder_handles_long_identical_token_runs() {
+        let tk = byte_level_tokenizer();
+        let mut w = ByteWindowDecoder::default();
+        let mut response = String::new();
+        let mut all = Vec::new();
+
+        // Twelve identical ASCII tokens: slides start at step 9 while every
+        // window boundary stays clean, so any double-commit on slide shows
+        // up immediately as duplicated characters.
+        for _ in 0..12 {
+            all.push(1u32); // "h"
+            response = w.push(&tk, 1, response, &all).unwrap();
+        }
+        assert_eq!(response, "hhhhhhhhhhhh");
+
+        // And a completing multi-byte pair right behind the run.
+        for t in [3u32, 4] {
+            all.push(t);
+            response = w.push(&tk, t, response, &all).unwrap();
+        }
+        assert_eq!(response, "hhhhhhhhhhhhé");
+    }
+
+    #[test]
+    fn byte_window_decoder_matches_whole_buffer_oracle() {
+        let tk = byte_level_tokenizer();
+        let mut w = ByteWindowDecoder::default();
+        let mut response = String::new();
+        let mut all = Vec::new();
+
+        // Deterministic pseudo-random stream over the whole vocabulary:
+        // heavy on lone continuation bytes so codepoints repeatedly complete
+        // across boundaries, and long enough to slide the 8-token window
+        // many times.  The incremental result must equal the old
+        // whole-buffer decode after every single step.
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        for step in 0..400 {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            // Every third step repeats the previous token so the stream
+            // contains long identical runs — the shape that exercises
+            // clean-boundary window slides.
+            let t = if step % 3 == 2 && !all.is_empty() {
+                *all.last().unwrap()
+            } else {
+                (state >> 33) as u32 % 7
+            };
+            let _ = step;
+            all.push(t);
+            response = w.push(&tk, t, response, &all).unwrap();
+            let oracle = tk.decode(all.as_slice(), false).unwrap();
+            assert_eq!(
+                response, oracle,
+                "incremental text diverged from whole-buffer decode at step {}",
+                all.len()
+            );
+        }
+    }
+
+    #[test]
+    fn longest_common_prefix_basics() {
+        assert_eq!(longest_common_prefix(&[], &[]), 0);
+        assert_eq!(longest_common_prefix(&[1], &[]), 0);
+        assert_eq!(longest_common_prefix(&[], &[1]), 0);
+        // Identical sequences share their full length.
+        assert_eq!(longest_common_prefix(&[1, 2, 3], &[1, 2, 3]), 3);
+        // Proper common prefix.
+        assert_eq!(longest_common_prefix(&[1, 2, 9], &[1, 2, 3, 4]), 2);
+        assert_eq!(longest_common_prefix(&[7], &[1, 2, 3]), 0);
     }
 
     #[test]
@@ -2647,14 +3162,61 @@ mod tests {
     fn weight_ranges_adds_tensor_data_offset() {
         let header = header_with_tensors(
             0x1_0000,
-            &[
-                ("token_embd.weight", 0),
-                ("blk.0.ffn_down_exps.weight", 64),
-            ],
+            &[("token_embd.weight", 0), ("blk.0.ffn_down_exps.weight", 64)],
         );
         let (dense, experts) = weight_ranges(&header, 0x1_0000 + 128);
         assert_eq!(dense, vec![(0x1_0000, 64)]);
         assert_eq!(experts, vec![(0x1_0000 + 64, 64)]);
+    }
+
+    #[test]
+    fn weight_ranges_merge_gap_follows_the_base_page_size() {
+        // An 8 KiB expert between two dense tensors is sub-page on a 16 KiB
+        // system (Apple Silicon macOS) but spans two 4 KiB pages — so the
+        // same file merges into one dense range there and stays split on
+        // classic 4 KiB Linux.  Either way the expert range itself is
+        // classified exactly once.
+        let header = header_with_tensors(
+            0,
+            &[
+                ("blk.0.attn_q.weight", 0),
+                ("blk.0.ffn_gate_exps.weight", 100), // 8 KiB expert
+                ("blk.0.ffn_norm.weight", 100 + 8192),
+            ],
+        );
+        let size = 100usize + 8192 + 100;
+        let (dense_16k, experts) = weight_ranges_with_page(&header, size as u64, 16 * 1024);
+        assert_eq!(
+            dense_16k,
+            vec![(0, size)],
+            "8 KiB gap is sub-page at 16 KiB"
+        );
+        assert_eq!(experts, vec![(100, 8192)]);
+        let (dense_4k, _) = weight_ranges_with_page(&header, size as u64, 4096);
+        assert_eq!(
+            dense_4k,
+            vec![(0, 100), (100 + 8192, 100)],
+            "an 8 KiB gap spans pages at 4 KiB"
+        );
+    }
+
+    /// The production split must merge at *base*-page granularity: that is
+    /// what `madvise`/`mlock` round to, and it keeps the dense/expert
+    /// classification intact even when transparent huge pages are in play.
+    #[test]
+    fn base_page_size_matches_the_system() {
+        let page = base_page_size();
+        assert!(page >= 4096 && page.is_power_of_two(), "got {page}");
+        #[cfg(unix)]
+        {
+            let sys = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+            let expected = if sys >= 4096 && sys.is_power_of_two() {
+                sys
+            } else {
+                4096
+            };
+            assert_eq!(page, expected);
+        }
     }
 
     /// The advice/mlock path must never fail the load, even when the mapping
@@ -2689,11 +3251,35 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// Whole-model prefetch must never fail the load: `MADV_WILLNEED` over
+    /// the whole mapping is advisory, and a mapping that supports advice at
+    /// all accepts it.  The observable contract is a usable mapping of the
+    /// full file length whose contents are readable.
+    #[cfg(unix)]
+    #[test]
+    fn map_model_prefetch_whole_is_best_effort_and_readable() {
+        let payload = vec![7u8; 64 * 1024];
+        let (path, _) = model_fixture("prefetch.gguf", &payload);
+
+        // With prefetch (and with pinning, which skips the blanket hint too):
+        let (mmap, _) = map_model(&path, HugePages::Off, false, MmapMode::Auto, true, true)
+            .expect("prefetching map must succeed");
+        assert_eq!(mmap.len(), payload.len());
+        assert!(mmap[..].iter().all(|&b| b == 7), "contents readable");
+
+        // And without any of it — the plain default path.
+        let (mmap, _) = map_model(&path, HugePages::Off, false, MmapMode::Auto, false, false)
+            .expect("plain map must still succeed");
+        assert_eq!(mmap.len(), payload.len());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[cfg(unix)]
     #[test]
     fn mlock_decision_degrades_or_fails_on_short_limit() {
         let required = 8 * 1024 * 1024 * 1024; // 8 GiB hot set
-        // On: too-small limit degrades; sufficient or unknown limit proceeds.
+                                               // On: too-small limit degrades; sufficient or unknown limit proceeds.
         assert_eq!(
             mlock_decision(MlockMode::On, Some(8 * 1024 * 1024), required),
             MlockDecision::Degrade

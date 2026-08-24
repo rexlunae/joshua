@@ -449,6 +449,38 @@ impl QuantizedModel {
         )
     }
 
+    /// Whether [`QuantizedModel::truncate_kv_cache`] can shorten this
+    /// instance's KV cache to an arbitrary prefix length.
+    ///
+    /// Only the Joshua-owned loaders with plain append-only caches qualify:
+    /// candle's stock loaders keep their caches private, and `deepseek4`'s
+    /// hybrid attention keeps running compressor states that cannot be
+    /// rewound to an arbitrary past position (only cleared).
+    pub fn supports_kv_truncate(&self) -> bool {
+        matches!(self, Self::Qwen3Moe(_) | Self::DeepSeek2(_))
+    }
+
+    /// Keep only the first `keep_len` fed tokens of every layer's KV cache.
+    ///
+    /// Positions `[0..keep_len)` stay exactly as they were produced by the
+    /// tokens both conversations share; everything after is recomputed by
+    /// the next prefill, which continues at absolute position `keep_len`.
+    /// Used for edited-context prefix reuse: agent harnesses truncate or
+    /// replace middle blocks of a conversation (old tool outputs, thinking
+    /// segments), so a follow-up prompt often shares a *prefix* with the
+    /// cached history without extending it.
+    ///
+    /// Returns `Ok(false)` when the architecture has no truncation hook —
+    /// check [`Self::supports_kv_truncate`] to distinguish that from a real
+    /// error.
+    pub fn truncate_kv_cache(&mut self, keep_len: usize) -> Result<bool> {
+        match self {
+            Self::Qwen3Moe(m) => m.truncate_kv_cache(keep_len).map(|_| true),
+            Self::DeepSeek2(m) => m.truncate_kv_cache(keep_len).map(|_| true),
+            _ => Ok(false),
+        }
+    }
+
     /// Unified forward pass.
     ///
     /// `input` has shape `[1, seq_len]` for the initial prefill, or `[1, 1]`
