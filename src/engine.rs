@@ -668,6 +668,75 @@ fn tokenizer_is_byte_level(path: &std::path::Path) -> Result<bool, JoshuaError> 
     ))
 }
 
+/// Incremental decoder for byte-level tokenizers (GPT-2 style, where a
+/// token's text is a byte-unicode string and may be a *lone* byte).
+///
+/// Byte-level BPE splits multi-byte UTF-8 across token boundaries — a single
+/// generated token can carry one raw byte (e.g. DeepSeek's vocab entries
+/// `¡`..`ÿ`), so byte state must survive across tokens.  Re-decoding the
+/// whole accumulated buffer every step did that at O(n²) in output length;
+/// instead keep only a small trailing window:
+///
+/// * within a window whose boundary does not split a codepoint, decoding is
+///   per-character, so a prefix-stable extension adds exactly the suffix a
+///   whole-buffer decode would add;
+/// * whenever stability breaks, fall back to one whole-buffer decode of all
+///   ids so far — reproducing the previous behaviour verbatim.
+///
+/// A codepoint spans at most 4 bytes, so an 8-token window always contains
+/// every not-yet-final byte.
+#[derive(Default)]
+struct ByteWindowDecoder {
+    tail: Vec<u32>,
+    tail_text: String,
+}
+
+impl ByteWindowDecoder {
+    const WINDOW: usize = 8;
+
+    /// Feed one token, returning the updated output text (`response`).
+    fn push(
+        &mut self,
+        tokenizer: &Tokenizer,
+        token: u32,
+        response: String,
+        all_ids: &[u32],
+    ) -> Result<String> {
+        let decode = |ids: &[u32]| -> Result<String> {
+            tokenizer
+                .decode(ids, false)
+                .map_err(|e| JoshuaError::Inference(e.to_string()))
+        };
+
+        self.tail.push(token);
+        let new_text = decode(&self.tail)?;
+        let mut response = if new_text.starts_with(&self.tail_text) {
+            // Stable extension: append just the new suffix.
+            let mut response = response;
+            response.push_str(&new_text[self.tail_text.len()..]);
+            response
+        } else {
+            // A codepoint completed across the boundary: take the oracle.
+            decode(all_ids)?
+        };
+        self.tail_text = new_text;
+
+        if self.tail.len() > Self::WINDOW {
+            // Slide: commit the window head's text and drop it.
+            let shrunk = decode(&self.tail[1..])?;
+            if self.tail_text.starts_with(&shrunk) {
+                let commit = self.tail_text.len() - shrunk.len();
+                response.push_str(&self.tail_text[..commit]);
+            } else {
+                response = decode(all_ids)?;
+            }
+            self.tail.remove(0);
+            self.tail_text = shrunk;
+        }
+        Ok(response)
+    }
+}
+
 impl Engine {
     /// Load a GGUF model using a 4 096-token context window.
     ///
@@ -1358,6 +1427,8 @@ impl Engine {
         let mut rng = thread_rng();
         let mut response = String::new();
         let mut decoded_ids: Vec<u32> = Vec::new();
+        // Incremental byte-level decode state (see [`ByteWindowDecoder`]).
+        let mut byte_window = ByteWindowDecoder::default();
         let mut fed_tokens: Vec<u32> = Vec::new();
         let mut n_decoded: u32 = 0;
         let mut n_cur = start_pos;
@@ -1384,13 +1455,12 @@ impl Engine {
                 // boundaries — a single token can be a lone byte (e.g.
                 // DeepSeek's raw-byte vocab entries `¡`..`ÿ`), which is
                 // invalid UTF-8 on its own and would decode to U+FFFD.
-                // Decoding the accumulated buffer keeps the byte state
-                // across tokens and produces the correct text.
+                // [`ByteWindowDecoder`] keeps that byte state across tokens
+                // without re-decoding the whole output every step (the old
+                // whole-buffer decode made generation O(n²) in length).
                 decoded_ids.push(next_token);
-                response = self
-                    .tokenizer
-                    .decode(&decoded_ids, false)
-                    .map_err(|e| JoshuaError::Inference(e.to_string()))?;
+                response =
+                    byte_window.push(&self.tokenizer, next_token, response, &decoded_ids)?;
             } else {
                 // Decoder-less / word-level tokenizers: batch decoding would
                 // join pieces with spaces, so decode each token and append.
@@ -1600,20 +1670,32 @@ impl Engine {
             // prefill away.  Candle path only — NPU plugins own their token
             // history internally, so their sessions can never be rewound.
             //
-            // The common prefix must end inside *both* sequences: covering
-            // the whole prompt would leave nothing to prefill (the logits
-            // for the next token are not recoverable from a cache alone),
-            // and matching a whole history was already handled above.
+            // Two shapes of edit reach this path:
+            // * a *truncating* edit (harness dropped/replaced middle blocks)
+            //   leaves `lcp < prompt.len()`: rewind to `lcp` and prefill the
+            //   diverging remainder;
+            // * a *rollback* (regenerate/retry: prompt is a strict prefix of
+            //   the history) has `lcp == prompt.len()` — rewinding to `lcp`
+            //   would leave nothing to prefill, and the logits for the token
+            //   after the prompt are not recoverable from a cache alone, so
+            //   rewind to `lcp - 1` and re-prefill just the final token.
+            //   (`keep == 0` on single-token prompts degenerates to a clear.)
             if !want_npu {
                 let best_edit = pool
                     .iter()
                     .enumerate()
                     .filter(|(_, c)| c.session.supports_truncate())
                     .map(|(i, c)| (i, longest_common_prefix(&c.tokens, prompt_tokens)))
-                    .filter(|(_, lcp)| *lcp > 0 && *lcp < prompt_tokens.len())
+                    .filter(|(_, lcp)| *lcp > 0 && *lcp <= prompt_tokens.len())
+                    // Longest common prefix first; pass 1's exact-prefix
+                    // matches are intentionally preferred over longer edit
+                    // candidates because they need no KV copy at all.
                     .max_by_key(|(_, lcp)| *lcp);
                 if let Some((i, lcp)) = best_edit {
-                    edit_pick = Some((pool.swap_remove(i), lcp));
+                    // Rollback case: keep one token behind so the suffix
+                    // prefill is never empty.
+                    let keep = lcp.min(prompt_tokens.len() - 1);
+                    edit_pick = Some((pool.swap_remove(i), keep));
                 }
             }
             // The clear path runs only when no rewind was picked — rewinding
@@ -1647,10 +1729,16 @@ impl Engine {
                 );
                 return Ok((cached.session, lcp));
             }
-            // Truncation failed unexpectedly: park the instance again (it is
-            // still perfectly usable for later requests) and fall through to
-            // the fresh-session paths.
+            // Truncation failed unexpectedly.  The failure may have hit
+            // part-way through the per-layer loop, leaving earlier layers
+            // shortened and later ones not — a cache that no longer matches
+            // any single prefix of `cached.tokens`.  Repooling it with its
+            // original history would let a later strict-prefix match serve
+            // silently wrong state, so poison the entry: empty tokens make
+            // it unreachable by every reuse pass, and the next acquire
+            // clears (or drops) it before use.
             {
+                cached.tokens.clear();
                 let mut pool = self.model_pool();
                 pool.push(cached);
                 while pool.len() > MAX_CACHED_MODELS {
@@ -2851,6 +2939,88 @@ mod tests {
                 })
                 .collect(),
             tensor_data_offset,
+        }
+    }
+
+    /// A minimal GPT-2-style byte-level tokenizer: the ByteLevel decoder
+    /// maps each token's byte-unicode characters back to raw bytes, so a
+    /// token can carry a single UTF-8 byte — including lone *continuation*
+    /// bytes that are invalid UTF-8 on their own.  `\u{c3}` is byte 0xC3,
+    /// `\u{a9}` is 0xA9 (together they form `é`), `\u{bc}` is 0xBC
+    /// (with 0xC3: `ü`); ASCII letters map to themselves.  Every vocabulary
+    /// character must be a genuine GPT-2 byte-unicode table entry — a
+    /// character outside the table passes through decoding untouched and
+    /// would make the fixture lie about what decoders produce.
+    fn byte_level_tokenizer() -> Tokenizer {
+        use std::str::FromStr;
+        let json = r#"{
+            "version": "1.0",
+            "truncation": null,
+            "padding": null,
+            "added_tokens": [],
+            "normalizer": null,
+            "pre_tokenizer": {"type": "Whitespace"},
+            "post_processor": null,
+            "decoder": {"type": "ByteLevel", "add_prefix_space": false,
+                        "trim_offsets": true, "use_regex": false},
+            "model": {
+                "type": "WordLevel",
+                "vocab": {"<unk>": 0, "h": 1, "i": 2, "Ã": 3, "©": 4,
+                          "¼": 5, "x": 6},
+                "unk_token": "<unk>"
+            }
+        }"#;
+        Tokenizer::from_str(json).expect("byte-level fixture tokenizer must parse")
+    }
+
+    #[test]
+    fn byte_window_decoder_completes_split_codepoints() {
+        let tk = byte_level_tokenizer();
+        let mut w = ByteWindowDecoder::default();
+        let mut response = String::new();
+        let mut all = Vec::new();
+
+        // é arrives as two lone bytes (0xC3, 0xA9).
+        for t in [3u32, 4] {
+            all.push(t);
+            response = w.push(&tk, t, response, &all).unwrap();
+        }
+        assert_eq!(response, "é", "split codepoint must complete: {response:?}");
+
+        // ü arrives right behind it, again as two lone bytes.
+        for t in [3u32, 5] {
+            all.push(t);
+            response = w.push(&tk, t, response, &all).unwrap();
+        }
+        assert_eq!(response, "éü");
+    }
+
+    #[test]
+    fn byte_window_decoder_matches_whole_buffer_oracle() {
+        let tk = byte_level_tokenizer();
+        let mut w = ByteWindowDecoder::default();
+        let mut response = String::new();
+        let mut all = Vec::new();
+
+        // Deterministic pseudo-random stream over the whole vocabulary:
+        // heavy on lone continuation bytes so codepoints repeatedly complete
+        // across boundaries, and long enough to slide the 8-token window
+        // many times.  The incremental result must equal the old
+        // whole-buffer decode after every single step.
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        for _ in 0..400 {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let t = ((state >> 33) % 7) as u32;
+            all.push(t);
+            response = w.push(&tk, t, response, &all).unwrap();
+            let oracle = tk.decode(all.as_slice(), false).unwrap();
+            assert_eq!(
+                response, oracle,
+                "incremental text diverged from whole-buffer decode at step {}",
+                all.len()
+            );
         }
     }
 

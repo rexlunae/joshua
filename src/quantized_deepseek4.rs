@@ -2256,6 +2256,13 @@ impl ModelWeights {
                 Err(e) => eprintln!("deepseek4: failed to reset KV state for layer {i}: {e}"),
             }
         }
+        // The speculative prefetch predicts from the *previous step's*
+        // routing; after a reset that routing belongs to whatever ran on
+        // this instance before, so drop it.  (Advice-only either way — a
+        // stale prediction can waste readahead, never change logits.)
+        for ids in &mut self.last_routed {
+            ids.clear();
+        }
     }
 }
 

@@ -449,5 +449,21 @@ fn deepseek4_speculative_routing_state_tracks_forward_passes() {
     assert_eq!(la, lb, "identical loads must produce identical logits");
     assert_eq!(d1a, db, "decode must be deterministic and unaffected");
 
+    // Clearing the cache drops the speculative routing state too: it
+    // belongs to whatever ran on this instance before the reset.
+    match (&mut a, &mut b) {
+        (QuantizedModel::DeepSeek4(wa), QuantizedModel::DeepSeek4(wb)) => {
+            wa.clear_kv_cache();
+            wb.clear_kv_cache();
+        }
+        _ => panic!("expected DeepSeek4 models"),
+    }
+    assert!(
+        routed(&a).iter().all(|v| v.is_empty()),
+        "clear must reset routing records: {:?}",
+        routed(&a)
+    );
+    assert!(routed(&b).iter().all(|v| v.is_empty()));
+
     std::fs::remove_dir_all(&dir).ok();
 }

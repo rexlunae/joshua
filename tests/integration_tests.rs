@@ -392,18 +392,45 @@ mod synthetic {
             "edited prompt must take the truncation path"
         );
 
-        // A third request extending the *edited* conversation takes the
-        // ordinary strict-prefix path on top of the rewound state.
+        // A third request that extends the *edited* prompt but skips the two
+        // generated tokens diverges from the cached history again, so this
+        // also rewinds (to the three shared tokens) rather than extending.
         let (_, _, _, _) = warm.complete_raw("hello b c d e", &greedy(2)).unwrap();
         assert_eq!(warm.kv_reuse_count(), 2);
+        assert_eq!(warm.kv_edit_reuse_count(), 2);
 
-        // Fresh engine: same edited prompt with an empty cache.
+        // A *rollback* (regenerate/retry): the new prompt is a strict
+        // PREFIX of the cached history.  Rewinding all the way to it would
+        // leave nothing to prefill, so the engine rewinds one token short
+        // and re-prefills just the final prompt token — still counted as an
+        // edited-context reuse.
+        let (rb_text, rb_usage, _, _) = warm.complete_raw("hello b", &greedy(2)).unwrap();
+        assert_eq!(
+            warm.kv_reuse_count(),
+            3,
+            "rollback must count as KV reuse"
+        );
+        assert_eq!(
+            warm.kv_edit_reuse_count(),
+            3,
+            "rollback must take the truncation path"
+        );
+
+        // Fresh engines: same prompts, empty caches — outputs and usage must
+        // be indistinguishable.
         let fresh = Engine::with_n_ctx(&dir, 64).expect("engine should load");
         let (fresh_text, fresh_usage, _, _) = fresh.complete_raw("hello b c", &greedy(2)).unwrap();
+
+        let fresh_rb = Engine::with_n_ctx(&dir, 64).expect("engine should load");
+        let (fresh_rb_text, fresh_rb_usage, _, _) =
+            fresh_rb.complete_raw("hello b", &greedy(2)).unwrap();
 
         assert_eq!(warm_text, fresh_text, "prefix truncation must not change output");
         assert_eq!(warm_usage.prompt_tokens, fresh_usage.prompt_tokens);
         assert_eq!(warm_usage.completion_tokens, fresh_usage.completion_tokens);
+        assert_eq!(rb_text, fresh_rb_text, "rollback reuse must not change output");
+        assert_eq!(rb_usage.prompt_tokens, fresh_rb_usage.prompt_tokens);
+        assert_eq!(rb_usage.completion_tokens, fresh_rb_usage.completion_tokens);
 
         std::fs::remove_dir_all(&dir).ok();
     }
