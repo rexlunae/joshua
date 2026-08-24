@@ -442,7 +442,6 @@ fn deepseek4_speculative_routing_state_tracks_forward_passes() {
     // Decode refreshes it; outputs and records stay deterministic across
     // instances (the prefetch advice cannot affect the math).
     let d1a = logits(&mut a, &[7], 3);
-    let d1b = logits(&mut b, &[7], 3);
     let lb = logits(&mut b, &[1, 4, 5], 0);
     let db = logits(&mut b, &[7], 3);
     assert_valid(&routed(&a));
