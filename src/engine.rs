@@ -1646,7 +1646,12 @@ impl Engine {
                 .iter()
                 .enumerate()
                 .filter(|(_, c)| {
-                    c.session.is_npu() == want_npu
+                    // An empty history is a prefix of every prompt but
+                    // carries no reusable KV — skip it so entries parked
+                    // empty (or poisoned, below) reach the clearing path
+                    // instead of being served as-is.
+                    !c.tokens.is_empty()
+                        && c.session.is_npu() == want_npu
                         && c.tokens.len() < prompt_tokens.len()
                         && prompt_tokens.starts_with(&c.tokens)
                 })
@@ -1731,18 +1736,24 @@ impl Engine {
             // Truncation failed unexpectedly.  The failure may have hit
             // part-way through the per-layer loop, leaving earlier layers
             // shortened and later ones not — a cache that no longer matches
-            // any single prefix of `cached.tokens`.  Repooling it with its
-            // original history would let a later strict-prefix match serve
-            // silently wrong state, so poison the entry: empty tokens make
-            // it unreachable by every reuse pass, and the next acquire
-            // clears (or drops) it before use.
+            // any single prefix of anything.  Poison the entry twice over:
+            // clear the state outright when possible, and park it with empty
+            // tokens so every reuse pass skips it (an empty history is a
+            // prefix of every prompt, so the strict-prefix pass alone would
+            // still match it).  If the clear also fails, the entry is dropped
+            // by falling out of the block with `clear_ok == false`.
             {
-                cached.tokens.clear();
-                let mut pool = self.model_pool();
-                pool.push(cached);
-                while pool.len() > MAX_CACHED_MODELS {
-                    pool.remove(0);
+                let clear_ok = cached.session.clear_state();
+                if clear_ok {
+                    cached.tokens.clear();
+                    let mut pool = self.model_pool();
+                    pool.push(cached);
+                    while pool.len() > MAX_CACHED_MODELS {
+                        pool.remove(0);
+                    }
                 }
+                // !clear_ok: drop the instance entirely — a session whose
+                // state cannot even be reset is not worth parking.
             }
         }
 
