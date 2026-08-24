@@ -334,6 +334,90 @@ mod synthetic {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Edited-context reuse: a follow-up prompt that shares only a *prefix*
+    /// with the cached history (an agent harness truncated or replaced the
+    /// middle of the conversation) rewinds the session's KV state to that
+    /// common prefix instead of throwing the prefill away.  Output must be
+    /// indistinguishable from a fresh engine — the reused positions were
+    /// produced by exactly the tokens both prompts share.
+    ///
+    /// The WordLevel test tokenizer maps every word to one token, so
+    /// "hello a" → [1, 4] and "hello b c" → [1, 5, 6]: a common prefix of
+    /// exactly one token that is neither an extension of the history nor a
+    /// full cover of the prompt.
+    fn edited_context_reuse_matches_fresh_engine(arch: &str) {
+        use joshua::{types::GenerationOptions, Engine};
+
+        let write_model: fn(&std::path::Path);
+        let name: &str;
+        match arch {
+            "qwen3moe" => {
+                write_model = write_tiny_qwen3moe_gguf;
+                name = "tiny-qwen3moe-kvedit";
+            }
+            "deepseek2" => {
+                write_model = write_tiny_deepseek2_gguf;
+                name = "tiny-deepseek2-kvedit";
+            }
+            other => panic!("unsupported arch {other}"),
+        }
+
+        let dir = model_dir(name);
+        write_model(&dir.join("model.gguf"));
+
+        let greedy = |max_tokens| GenerationOptions {
+            max_tokens,
+            temperature: 0.0,
+            repetition_penalty: 1.0,
+            ..Default::default()
+        };
+
+        // Warm engine: seed the pool with the original conversation.
+        let warm = Engine::with_n_ctx(&dir, 64).expect("engine should load");
+        warm.complete_raw("hello a", &greedy(0)).unwrap();
+        assert_eq!(warm.kv_reuse_count(), 0);
+        assert_eq!(warm.kv_edit_reuse_count(), 0);
+
+        // Same conversation after an edit dropped/changed everything after
+        // the first token.  Must rewind to the shared prefix, not clear.
+        let (warm_text, warm_usage, _, _) = warm.complete_raw("hello b c", &greedy(2)).unwrap();
+        assert_eq!(
+            warm.kv_reuse_count(),
+            1,
+            "edited prompt must still count as KV reuse"
+        );
+        assert_eq!(
+            warm.kv_edit_reuse_count(),
+            1,
+            "edited prompt must take the truncation path"
+        );
+
+        // A third request extending the *edited* conversation takes the
+        // ordinary strict-prefix path on top of the rewound state.
+        let (_, _, _, _) = warm.complete_raw("hello b c d e", &greedy(2)).unwrap();
+        assert_eq!(warm.kv_reuse_count(), 2);
+
+        // Fresh engine: same edited prompt with an empty cache.
+        let fresh = Engine::with_n_ctx(&dir, 64).expect("engine should load");
+        let (fresh_text, fresh_usage, _, _) = fresh.complete_raw("hello b c", &greedy(2)).unwrap();
+
+        assert_eq!(warm_text, fresh_text, "prefix truncation must not change output");
+        assert_eq!(warm_usage.prompt_tokens, fresh_usage.prompt_tokens);
+        assert_eq!(warm_usage.completion_tokens, fresh_usage.completion_tokens);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn kv_edited_context_reuse_matches_fresh_engine_qwen3moe() {
+        edited_context_reuse_matches_fresh_engine("qwen3moe");
+    }
+
+    #[test]
+    fn kv_edited_context_reuse_matches_fresh_engine_deepseek2() {
+        edited_context_reuse_matches_fresh_engine("deepseek2");
+    }
+
 
     /// The embedding forward pass must reproduce candle's generation-model
     /// logits exactly (same weights, same input): if the hidden states going

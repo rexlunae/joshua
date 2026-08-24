@@ -430,6 +430,12 @@ pub struct Engine {
     model_cache: Mutex<Vec<CachedModel>>,
     /// Number of requests that continued from a cached KV prefix.
     kv_reuses: AtomicU64,
+    /// Number of requests that continued from a cached KV prefix recovered
+    /// across an *edit* of the conversation — the prompt shares only a
+    /// prefix with the cached history (agent harnesses truncate or replace
+    /// middle blocks), so the session state was rewound to that prefix
+    /// instead of being cleared.  A subset of [`Engine::kv_reuse_count`].
+    kv_edit_reuses: AtomicU64,
     /// Optional NPU backend with its circuit breaker.
     npu: Option<NpuState>,
     /// Number of generations/embeddings currently executing.
@@ -547,6 +553,36 @@ impl GenSession {
         match self {
             Self::Candle(model) => model.clear_kv_cache(),
             Self::Npu(session) => session.reset(),
+        }
+    }
+
+    /// Whether this session's KV state can be truncated to a prefix length
+    /// at all (see [`GenSession::truncate_to`]).
+    fn supports_truncate(&self) -> bool {
+        match self {
+            Self::Candle(model) => model.supports_kv_truncate(),
+            Self::Npu(_) => false,
+        }
+    }
+
+    /// Keep only the first `keep` fed tokens of the session's KV state.
+    ///
+    /// This is what makes *edited-context* prefix reuse sound: positions
+    /// `[0..keep)` were produced by exactly the tokens both conversations
+    /// share, so they stay valid; everything after is recomputed when the
+    /// caller prefills from absolute position `keep`.  Returns `false` when
+    /// the architecture cannot truncate or the operation failed — callers
+    /// fall back to the plain clear/fresh-load paths.
+    fn truncate_to(&mut self, keep: usize) -> bool {
+        match self {
+            Self::Candle(model) => match model.truncate_kv_cache(keep) {
+                Ok(supported) => supported,
+                Err(e) => {
+                    tracing::debug!(error = %e, keep, "KV truncation failed");
+                    false
+                }
+            },
+            Self::Npu(_) => false,
         }
     }
 
@@ -801,6 +837,7 @@ impl Engine {
             embed_model: Mutex::new(None),
             model_cache: Mutex::new(Vec::new()),
             kv_reuses: AtomicU64::new(0),
+            kv_edit_reuses: AtomicU64::new(0),
             npu: None,
             in_flight: AtomicUsize::new(0),
             max_concurrency,
@@ -1455,6 +1492,14 @@ impl Engine {
         self.kv_reuses.load(Ordering::Relaxed)
     }
 
+    /// Number of requests so far that continued from a cached KV prefix
+    /// recovered across an edit of the conversation (the prompt shares only
+    /// a prefix with the cached history, so the session state was rewound
+    /// to that common prefix).  Included in [`Engine::kv_reuse_count`].
+    pub fn kv_edit_reuse_count(&self) -> u64 {
+        self.kv_edit_reuses.load(Ordering::Relaxed)
+    }
+
     /// Route generation through an NPU backend (see [`crate::npu`]).
     ///
     /// Generation requests try the backend first and transparently fall back
@@ -1489,9 +1534,14 @@ impl Engine {
     ///
     /// 1. a pooled instance whose fed-token history is a strict prefix of
     ///    the prompt (longest match wins) — only the suffix needs prefill;
-    /// 2. a pooled instance whose state can be cleared — skips re-creating
+    /// 2. a pooled instance whose history shares only a *prefix* with the
+    ///    prompt (an edited conversation — agent harnesses truncate or
+    ///    replace middle blocks such as old tool outputs): where the
+    ///    architecture supports it, its KV state is rewound to the longest
+    ///    common prefix and only the diverging remainder is prefilled;
+    /// 3. a pooled instance whose state can be cleared — skips re-creating
     ///    the session;
-    /// 3. a fresh session (NPU) or a fresh instance from the mmap (candle).
+    /// 4. a fresh session (NPU) or a fresh instance from the mmap (candle).
     fn acquire_session(
         &self,
         prompt_tokens: &[u32],
@@ -1524,6 +1574,46 @@ impl Engine {
                     "Continuing from cached KV prefix"
                 );
                 return Ok((cached.session, cached.tokens.len()));
+            }
+            // Edited-context reuse: no pooled history extends this prompt,
+            // but one may share a prefix with it.  Rewind that instance's
+            // KV state to the common prefix instead of throwing the whole
+            // prefill away.  Candle path only — NPU plugins own their token
+            // history internally, so their sessions can never be rewound.
+            //
+            // The common prefix must end inside *both* sequences: covering
+            // the whole prompt would leave nothing to prefill (the logits
+            // for the next token are not recoverable from a cache alone),
+            // and matching a whole history was already handled above.
+            if !want_npu {
+                let best_edit = pool
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| c.session.supports_truncate())
+                    .map(|(i, c)| (i, longest_common_prefix(&c.tokens, prompt_tokens)))
+                    .filter(|(_, lcp)| *lcp > 0 && *lcp < prompt_tokens.len())
+                    .max_by_key(|(_, lcp)| *lcp);
+                if let Some((i, lcp)) = best_edit {
+                    let mut cached = pool.swap_remove(i);
+                    if cached.session.truncate_to(lcp) {
+                        self.kv_reuses.fetch_add(1, Ordering::Relaxed);
+                        self.kv_edit_reuses.fetch_add(1, Ordering::Relaxed);
+                        tracing::debug!(
+                            reused_tokens = lcp,
+                            dropped_tokens = cached.tokens.len().saturating_sub(lcp),
+                            prompt_tokens = prompt_tokens.len(),
+                            "Continuing from cached KV prefix after context edit"
+                        );
+                        return Ok((cached.session, lcp));
+                    }
+                    // Truncation failed unexpectedly: park the instance
+                    // again (it is still perfectly usable for the plain
+                    // clear/reload paths below) and fall through.
+                    pool.push(cached);
+                    while pool.len() > MAX_CACHED_MODELS {
+                        pool.remove(0);
+                    }
+                }
             }
             let resettable = pool.iter().position(|c| c.session.is_npu() == want_npu);
             if let Some(i) = resettable {
@@ -1798,6 +1888,16 @@ fn map_model(
 
 /// A byte range in the model mapping: `(offset, len)`.
 type ByteRange = (usize, usize);
+
+/// Length of the longest common token prefix of two sequences.
+///
+/// The reuse predicate for *edited* conversations: an agent harness that
+/// truncates or replaces middle blocks (old tool outputs, thinking segments)
+/// leaves a follow-up prompt that shares a prefix with the cached history
+/// without extending it.  O(min(len)) with no allocation.
+fn longest_common_prefix(a: &[u32], b: &[u32]) -> usize {
+    a.iter().zip(b).take_while(|(x, y)| x == y).count()
+}
 
 /// Whether a tensor name belongs to the routed-expert set.
 ///
@@ -2698,6 +2798,18 @@ mod tests {
                 .collect(),
             tensor_data_offset,
         }
+    }
+
+    #[test]
+    fn longest_common_prefix_basics() {
+        assert_eq!(longest_common_prefix(&[], &[]), 0);
+        assert_eq!(longest_common_prefix(&[1], &[]), 0);
+        assert_eq!(longest_common_prefix(&[], &[1]), 0);
+        // Identical sequences share their full length.
+        assert_eq!(longest_common_prefix(&[1, 2, 3], &[1, 2, 3]), 3);
+        // Proper common prefix.
+        assert_eq!(longest_common_prefix(&[1, 2, 9], &[1, 2, 3, 4]), 2);
+        assert_eq!(longest_common_prefix(&[7], &[1, 2, 3]), 0);
     }
 
     #[test]
