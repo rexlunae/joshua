@@ -1563,6 +1563,11 @@ impl Engine {
     ) -> Result<(GenSession, usize)> {
         let want_npu = allow_npu && self.npu.as_ref().is_some_and(|n| n.usable());
 
+        // Edited-context candidate, if any: picked under the pool lock, but
+        // rewound (a potentially large KV copy) outside the critical section
+        // below so concurrent acquire/release is never stalled by it.
+        let mut edit_pick: Option<(CachedModel, usize)> = None;
+
         {
             let mut pool = self.model_pool();
             // Only reuse sessions of the kind this request will run on —
@@ -1608,35 +1613,49 @@ impl Engine {
                     .filter(|(_, lcp)| *lcp > 0 && *lcp < prompt_tokens.len())
                     .max_by_key(|(_, lcp)| *lcp);
                 if let Some((i, lcp)) = best_edit {
-                    let mut cached = pool.swap_remove(i);
-                    if cached.session.truncate_to(lcp) {
-                        self.kv_reuses.fetch_add(1, Ordering::Relaxed);
-                        self.kv_edit_reuses.fetch_add(1, Ordering::Relaxed);
-                        tracing::debug!(
-                            reused_tokens = lcp,
-                            dropped_tokens = cached.tokens.len().saturating_sub(lcp),
-                            prompt_tokens = prompt_tokens.len(),
-                            "Continuing from cached KV prefix after context edit"
-                        );
-                        return Ok((cached.session, lcp));
-                    }
-                    // Truncation failed unexpectedly: park the instance
-                    // again (it is still perfectly usable for the plain
-                    // clear/reload paths below) and fall through.
-                    pool.push(cached);
-                    while pool.len() > MAX_CACHED_MODELS {
-                        pool.remove(0);
-                    }
+                    edit_pick = Some((pool.swap_remove(i), lcp));
                 }
             }
-            let resettable = pool.iter().position(|c| c.session.is_npu() == want_npu);
-            if let Some(i) = resettable {
-                let mut cached = pool.swap_remove(i);
-                if cached.session.clear_state() {
-                    tracing::debug!(npu = want_npu, "Reusing pooled session with cleared state");
-                    return Ok((cached.session, 0));
+            // The clear path runs only when no rewind was picked — rewinding
+            // preserves strictly more work than clearing.
+            if edit_pick.is_none() {
+                let resettable = pool.iter().position(|c| c.session.is_npu() == want_npu);
+                if let Some(i) = resettable {
+                    let mut cached = pool.swap_remove(i);
+                    if cached.session.clear_state() {
+                        tracing::debug!(
+                            npu = want_npu,
+                            "Reusing pooled session with cleared state"
+                        );
+                        return Ok((cached.session, 0));
+                    }
+                    // Reset failed (e.g. dead shim): drop it and fall through.
                 }
-                // Reset failed (e.g. dead shim): drop it and fall through.
+            }
+        }
+
+        // Attempt the rewind outside the pool lock.
+        if let Some((mut cached, lcp)) = edit_pick {
+            if cached.session.truncate_to(lcp) {
+                self.kv_reuses.fetch_add(1, Ordering::Relaxed);
+                self.kv_edit_reuses.fetch_add(1, Ordering::Relaxed);
+                tracing::debug!(
+                    reused_tokens = lcp,
+                    dropped_tokens = cached.tokens.len().saturating_sub(lcp),
+                    prompt_tokens = prompt_tokens.len(),
+                    "Continuing from cached KV prefix after context edit"
+                );
+                return Ok((cached.session, lcp));
+            }
+            // Truncation failed unexpectedly: park the instance again (it is
+            // still perfectly usable for later requests) and fall through to
+            // the fresh-session paths.
+            {
+                let mut pool = self.model_pool();
+                pool.push(cached);
+                while pool.len() > MAX_CACHED_MODELS {
+                    pool.remove(0);
+                }
             }
         }
 
