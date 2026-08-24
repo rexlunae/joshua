@@ -722,14 +722,13 @@ impl ByteWindowDecoder {
         self.tail_text = new_text;
 
         if self.tail.len() > Self::WINDOW {
-            // Slide: commit the window head's text and drop it.
+            // Slide.  `response` already holds every decoded byte — the head
+            // token's text was appended when it was pushed — so sliding only
+            // shrinks the window to keep future steps cheap; appending here
+            // would duplicate output (and slicing `tail_text` at a byte
+            // offset could split a codepoint).  Just refresh the window text
+            // to match the shrunken window.
             let shrunk = decode(&self.tail[1..])?;
-            if self.tail_text.starts_with(&shrunk) {
-                let commit = self.tail_text.len() - shrunk.len();
-                response.push_str(&self.tail_text[..commit]);
-            } else {
-                response = decode(all_ids)?;
-            }
             self.tail.remove(0);
             self.tail_text = shrunk;
         }
@@ -2996,6 +2995,30 @@ mod tests {
     }
 
     #[test]
+    fn byte_window_decoder_handles_long_identical_token_runs() {
+        let tk = byte_level_tokenizer();
+        let mut w = ByteWindowDecoder::default();
+        let mut response = String::new();
+        let mut all = Vec::new();
+
+        // Twelve identical ASCII tokens: slides start at step 9 while every
+        // window boundary stays clean, so any double-commit on slide shows
+        // up immediately as duplicated characters.
+        for _ in 0..12 {
+            all.push(1u32); // "h"
+            response = w.push(&tk, 1, response, &all).unwrap();
+        }
+        assert_eq!(response, "hhhhhhhhhhhh");
+
+        // And a completing multi-byte pair right behind the run.
+        for t in [3u32, 4] {
+            all.push(t);
+            response = w.push(&tk, t, response, &all).unwrap();
+        }
+        assert_eq!(response, "hhhhhhhhhhhhé");
+    }
+
+    #[test]
     fn byte_window_decoder_matches_whole_buffer_oracle() {
         let tk = byte_level_tokenizer();
         let mut w = ByteWindowDecoder::default();
@@ -3008,11 +3031,19 @@ mod tests {
         // many times.  The incremental result must equal the old
         // whole-buffer decode after every single step.
         let mut state = 0x2545_F491_4F6C_DD1Du64;
-        for _ in 0..400 {
+        for step in 0..400 {
             state = state
                 .wrapping_mul(6364136223846793005)
                 .wrapping_add(1442695040888963407);
-            let t = ((state >> 33) % 7) as u32;
+            // Every third step repeats the previous token so the stream
+            // contains long identical runs — the shape that exercises
+            // clean-boundary window slides.
+            let t = if step % 3 == 2 && !all.is_empty() {
+                *all.last().unwrap()
+            } else {
+                (state >> 33) as u32 % 7
+            };
+            let _ = step;
             all.push(t);
             response = w.push(&tk, t, response, &all).unwrap();
             let oracle = tk.decode(all.as_slice(), false).unwrap();
