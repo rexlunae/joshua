@@ -293,7 +293,7 @@ impl QuantizedModel {
         reader: &mut R,
         device: &Device,
     ) -> Result<Self> {
-        Self::from_gguf_mmap(gguf, reader, device, None)
+        Self::from_gguf_mmap(gguf, reader, device, None, None)
     }
 
     /// Load, borrowing weights in place from `mmap` for the architectures
@@ -308,6 +308,7 @@ impl QuantizedModel {
         reader: &mut R,
         device: &Device,
         mmap: Option<std::sync::Arc<memmap2::Mmap>>,
+        file: Option<std::sync::Arc<std::fs::File>>,
     ) -> Result<Self> {
         let arch = Architecture::detect(&gguf.metadata).map_err(candle_core::Error::Msg)?;
 
@@ -394,7 +395,7 @@ impl QuantizedModel {
                     .map(Self::DeepSeek2)
             }
             Architecture::DeepSeek4 => crate::quantized_deepseek4::ModelWeights::from_gguf_mmap(
-                gguf, raw, reader, device, mmap,
+                gguf, raw, reader, device, mmap, file,
             )
             .map(Self::DeepSeek4),
         }

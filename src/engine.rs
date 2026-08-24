@@ -404,6 +404,10 @@ pub struct Engine {
     /// page cache backs every request and engine clones share the same
     /// physical pages.
     mmap: Arc<Mmap>,
+    /// The model file itself, kept so the deepseek4 prefill can run a
+    /// layer-ahead `pread` prefetch thread against it.  `None` when the model
+    /// was loaded into anonymous huge pages (nothing to prefetch).
+    model_file: Option<Arc<File>>,
     /// Stateless tokenizer, shared across all inference calls.
     tokenizer: Arc<Tokenizer>,
     /// Whether the tokenizer uses a byte-level decoder (`ByteLevel`).
@@ -726,7 +730,7 @@ impl Engine {
         let hot_pinning = options.pin_hot_weights
             || options.mlock_hot_weights != MlockMode::Off
             || options.prefetch_whole_model;
-        let mmap = map_model(
+        let (mmap, model_file) = map_model(
             &gguf_path,
             options.huge_pages,
             options.lazy_weights,
@@ -734,6 +738,15 @@ impl Engine {
             hot_pinning,
             options.prefetch_whole_model,
         )?;
+        // Explicit huge pages copy the model into anonymous RAM — there is no
+        // file to prefetch from, so drop the handle.  With `lazy_weights` the
+        // copy is skipped and the mapping stays file-backed, so keep it.
+        let model_file =
+            if matches!(options.huge_pages, HugePages::Explicit(_)) && !options.lazy_weights {
+                None
+            } else {
+                Some(Arc::new(model_file))
+            };
 
         // Read GGUF metadata once to validate the architecture up front and
         // extract EOS token IDs.  The tolerant reader keeps dtypes candle
@@ -830,6 +843,7 @@ impl Engine {
         Ok(Self {
             model_path: gguf_path,
             mmap: Arc::new(mmap),
+            model_file,
             tokenizer: Arc::new(tokenizer),
             byte_level_decode,
             eos_token_ids,
@@ -1702,6 +1716,7 @@ impl Engine {
             &mut cursor,
             &self.device,
             Some(Arc::clone(&self.mmap)),
+            self.model_file.clone(),
         )
         .map_err(|e| JoshuaError::ModelLoad(format!("model init failed: {e}")))
     }
@@ -1803,7 +1818,7 @@ fn map_model(
     mmap_mode: MmapMode,
     per_range_advice: bool,
     prefetch_whole: bool,
-) -> Result<Mmap> {
+) -> Result<(Mmap, File)> {
     let file = File::open(path)?;
 
     // Explicit huge pages use an anonymous copy; handle separately.
@@ -1823,14 +1838,13 @@ fn map_model(
             );
         } else {
             check_mappable(path, &file, mmap_mode, false)?;
-            return map_model_hugetlb(path, &file, size);
+            return map_model_hugetlb(path, &file, size).map(|m| (m, file));
         }
     }
 
     check_mappable(path, &file, mmap_mode, true)?;
 
-    let mmap = unsafe { Mmap::map(&file) }
-        .map_err(|e| JoshuaError::ModelLoad(format!("mmap of GGUF file failed: {e}")))?;
+    let mmap = map_model_file_padded(&file)?;
 
     // Blanket access hint.  The engine *re-reads* every weight on every token,
     // so `MADV_SEQUENTIAL` ("pages may be freed soon after they are accessed")
@@ -1881,7 +1895,7 @@ fn map_model(
         tracing::warn!("whole-model prefetch is unix-only (madvise); ignoring the request");
     }
 
-    Ok(mmap)
+    Ok((mmap, file))
 }
 
 // ─── Hot-weight pinning ────────────────────────────────────────────────────────
@@ -2357,7 +2371,28 @@ fn map_model_hugetlb(path: &Path, file: &File, size: PageSize) -> Result<Mmap> {
 #[cfg(not(target_os = "linux"))]
 fn map_model_hugetlb(_path: &Path, file: &File, _size: PageSize) -> Result<Mmap> {
     tracing::warn!("explicit huge pages are Linux-only; using a normal file mapping");
-    unsafe { Mmap::map(file) }
+    map_model_file_padded(file)
+}
+
+/// Map `file` with its length rounded up to a whole page.
+///
+/// `mmap(2)` maps whole pages anyway, so the rounded-up region is valid
+/// address space (the tail past EOF is zero-filled).  The page-multiple
+/// length matters to the zero-copy Metal weight path:
+/// `newBufferWithBytesNoCopy` requires the wrapped region's length to be a
+/// multiple of the page size.
+fn map_model_file_padded(file: &File) -> Result<Mmap> {
+    let len = file
+        .metadata()
+        .map_err(|e| JoshuaError::ModelLoad(format!("stat of GGUF file failed: {e}")))?
+        .len() as usize;
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+    let map_len = if page > 0 && page.is_power_of_two() {
+        len.next_multiple_of(page)
+    } else {
+        len
+    };
+    unsafe { memmap2::MmapOptions::new().len(map_len).map(file) }
         .map_err(|e| JoshuaError::ModelLoad(format!("mmap of GGUF file failed: {e}")))
 }
 
@@ -2996,13 +3031,13 @@ mod tests {
         let (path, _) = model_fixture("prefetch.gguf", &payload);
 
         // With prefetch (and with pinning, which skips the blanket hint too):
-        let mmap = map_model(&path, HugePages::Off, false, MmapMode::Auto, true, true)
+        let (mmap, _) = map_model(&path, HugePages::Off, false, MmapMode::Auto, true, true)
             .expect("prefetching map must succeed");
         assert_eq!(mmap.len(), payload.len());
         assert!(mmap[..].iter().all(|&b| b == 7), "contents readable");
 
         // And without any of it — the plain default path.
-        let mmap = map_model(&path, HugePages::Off, false, MmapMode::Auto, false, false)
+        let (mmap, _) = map_model(&path, HugePages::Off, false, MmapMode::Auto, false, false)
             .expect("plain map must still succeed");
         assert_eq!(mmap.len(), payload.len());
 

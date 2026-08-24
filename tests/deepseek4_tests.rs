@@ -26,7 +26,7 @@ fn load(model: &std::path::Path, mmap: bool) -> QuantizedModel {
         None
     };
     let mut cursor = std::io::Cursor::new(&bytes[..]);
-    QuantizedModel::from_gguf_mmap(content, &mut cursor, &Device::Cpu, mmap).unwrap()
+    QuantizedModel::from_gguf_mmap(content, &mut cursor, &Device::Cpu, mmap, None).unwrap()
 }
 
 fn logits(model: &mut QuantizedModel, tokens: &[u32], offset: usize) -> Vec<f32> {
@@ -252,7 +252,7 @@ fn deepseek4_header_reread_failure_is_reported() {
 
     // The reader passes candle's parse but fails every read afterwards.
     let mut failing = FailAllReads(std::io::Cursor::new(bytes));
-    let err = match QuantizedModel::from_gguf_mmap(content, &mut failing, &Device::Cpu, None) {
+    let err = match QuantizedModel::from_gguf_mmap(content, &mut failing, &Device::Cpu, None, None) {
         Err(e) => e,
         Ok(_) => panic!("from_gguf_mmap must fail when the raw header re-read fails"),
     };

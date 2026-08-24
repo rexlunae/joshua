@@ -109,8 +109,14 @@ fn qwen3moe_mmap_load_matches_heap_load() {
     let mut cursor = Cursor::new(&bytes[..]);
     let content = candle_core::quantized::gguf_file::Content::read(&mut cursor).unwrap();
     let mut mapped =
-        QuantizedModel::from_gguf_mmap(content, &mut cursor, &Device::Cpu, Some(std::sync::Arc::new(mmap)))
-            .unwrap();
+        QuantizedModel::from_gguf_mmap(
+            content,
+            &mut cursor,
+            &Device::Cpu,
+            Some(std::sync::Arc::new(mmap)),
+            None,
+        )
+        .unwrap();
     let mapped_logits = logits(&mut mapped, &tokens, 0);
 
     assert_eq!(heap_logits.len(), mapped_logits.len());

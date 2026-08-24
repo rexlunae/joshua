@@ -29,6 +29,9 @@
 //! Blocks are `align_of == 1`, so unlike the k-quants they are always
 //! borrowable straight out of a memory mapping regardless of file alignment.
 
+use candle_core::Result;
+use half::f16;
+
 /// Elements per MXFP4 block.
 pub const QK_MXFP4: usize = 32;
 
@@ -93,9 +96,9 @@ impl BlockMxfp4 {
 
 /// Decode a run of blocks into `out`, which must hold `blocks.len() * 32`
 /// values.
-pub fn dequantize(blocks: &[BlockMxfp4], out: &mut [f32]) -> crate::Result<()> {
+pub fn dequantize(blocks: &[BlockMxfp4], out: &mut [f32]) -> Result<()> {
     if out.len() != blocks.len() * QK_MXFP4 {
-        return Err(crate::JoshuaError::Inference(format!(
+        return Err(candle_core::Error::Msg(format!(
             "mxfp4: output holds {} values, expected {}",
             out.len(),
             blocks.len() * QK_MXFP4
@@ -119,8 +122,30 @@ pub fn matmul_t(
     lhs: &[f32],
     rhs: &[BlockMxfp4],
     dst: &mut [f32],
-) -> crate::Result<()> {
-    let err = |msg: String| crate::JoshuaError::Inference(msg);
+) -> Result<()> {
+    let blocks_per_row = validate_matmul_t((m, k, n), lhs, rhs, dst)?;
+    matmul_t_impl((m, k, n), blocks_per_row, lhs, rhs, dst, true)
+}
+
+/// Same as [`matmul_t`] with a serial row loop — used by the determinism
+/// tests to prove the parallel path is bit-identical to serial.
+pub fn matmul_t_serial(
+    (m, k, n): (usize, usize, usize),
+    lhs: &[f32],
+    rhs: &[BlockMxfp4],
+    dst: &mut [f32],
+) -> Result<()> {
+    let blocks_per_row = validate_matmul_t((m, k, n), lhs, rhs, dst)?;
+    matmul_t_impl((m, k, n), blocks_per_row, lhs, rhs, dst, false)
+}
+
+fn validate_matmul_t(
+    (m, k, n): (usize, usize, usize),
+    lhs: &[f32],
+    rhs: &[BlockMxfp4],
+    dst: &mut [f32],
+) -> Result<usize> {
+    let err = |msg: String| candle_core::Error::Msg(msg);
     if !k.is_multiple_of(QK_MXFP4) {
         return Err(err(format!(
             "mxfp4 matmul: k={k} is not a multiple of the block size {QK_MXFP4}"
@@ -143,29 +168,91 @@ pub fn matmul_t(
             m * n
         )));
     }
+    Ok(blocks_per_row)
+}
 
+fn matmul_t_impl(
+    (m, k, n): (usize, usize, usize),
+    blocks_per_row: usize,
+    lhs: &[f32],
+    rhs: &[BlockMxfp4],
+    dst: &mut [f32],
+    parallel: bool,
+) -> Result<()> {
+    if n == 0 || m == 0 {
+        return Ok(());
+    }
     // Each weight row is summed a block at a time, so the destination has to
     // start from zero. Clear it rather than requiring callers to — candle's
     // own `k_quants::matmul` assigns, and silently accumulating into a reused
     // buffer would corrupt results with no error.
-    let mut decoded = [0f32; QK_MXFP4];
     dst.fill(0.0);
-    for row in 0..n {
-        let row_blocks = &rhs[row * blocks_per_row..(row + 1) * blocks_per_row];
-        for (b, block) in row_blocks.iter().enumerate() {
-            block.dequantize(&mut decoded);
-            let base = b * QK_MXFP4;
-            // Accumulate this block's contribution for every lhs row, so each
-            // block is decoded once rather than once per output element.
-            for i in 0..m {
-                let a = &lhs[i * k + base..i * k + base + QK_MXFP4];
-                let mut acc = 0f32;
-                for (x, w) in a.iter().zip(decoded.iter()) {
-                    acc += x * w;
-                }
-                dst[i * n + row] += acc;
-            }
+    let dst_ptr = crate::simd::DstPtr::new(dst);
+    let worker = |row: usize| {
+        matmul_row_scalar(m, k, n, lhs, rhs, blocks_per_row, row, &dst_ptr);
+    };
+    if parallel {
+        crate::simd::for_each_row(n, worker);
+    } else {
+        for row in 0..n {
+            worker(row);
         }
+    }
+    Ok(())
+}
+
+/// Scalar per-row worker: decode each block and accumulate `lhs · block`
+/// into `dst[i*n + row]` one block at a time (bit-compatible with the
+/// original single-threaded loop).
+#[allow(clippy::too_many_arguments)] // (m, k, n) is the matmul shape; kept flat for the hot loop
+fn matmul_row_scalar(
+    m: usize,
+    k: usize,
+    n: usize,
+    lhs: &[f32],
+    rhs: &[BlockMxfp4],
+    blocks_per_row: usize,
+    row: usize,
+    dst: &crate::simd::DstPtr,
+) {
+    let row_blocks = &rhs[row * blocks_per_row..(row + 1) * blocks_per_row];
+    let mut decoded = [0f32; QK_MXFP4];
+    for (b, block) in row_blocks.iter().enumerate() {
+        block.dequantize(&mut decoded);
+        let base = b * QK_MXFP4;
+        for i in 0..m {
+            let a = &lhs[i * k + base..i * k + base + QK_MXFP4];
+            let mut acc = 0f32;
+            for (x, w) in a.iter().zip(decoded.iter()) {
+                acc += x * w;
+            }
+            // SAFETY: row `row` owns dst[i*n + row] for all i (disjoint per
+            // row, see `crate::simd`); the buffer was zero-filled by the
+            // caller before any worker ran.
+            unsafe { dst.add(i * n + row, acc) };
+        }
+    }
+}
+
+/// f16 variant of [`matmul_t`], for candle's `QuantizedType` contract.
+///
+/// Converts through f32: the weights are decoded exactly the same way and the
+/// products accumulate in f32, so the result is the f16-rounded f32 answer —
+/// matching what the IQ2_XXS and k-quant kernels do.
+pub fn matmul_t_f16(
+    (m, k, n): (usize, usize, usize),
+    lhs: &[f16],
+    rhs: &[BlockMxfp4],
+    dst: &mut [f16],
+) -> Result<()> {
+    let mut lhs_f32 = vec![0f32; lhs.len()];
+    for (o, v) in lhs_f32.iter_mut().zip(lhs.iter()) {
+        *o = v.to_f32();
+    }
+    let mut dst_f32 = vec![0f32; m * n];
+    matmul_t((m, k, n), &lhs_f32, rhs, &mut dst_f32)?;
+    for (o, v) in dst.iter_mut().zip(dst_f32.iter()) {
+        *o = f16::from_f32(*v);
     }
     Ok(())
 }
@@ -175,10 +262,10 @@ pub fn matmul_t(
 /// Blocks are byte-aligned, so this only has to check that the length is a
 /// whole number of blocks — which makes MXFP4 weights borrowable directly from
 /// a memory mapping.
-pub fn blocks_from_bytes(bytes: &[u8]) -> crate::Result<&[BlockMxfp4]> {
+pub fn blocks_from_bytes(bytes: &[u8]) -> Result<&[BlockMxfp4]> {
     let sz = std::mem::size_of::<BlockMxfp4>();
     if !bytes.len().is_multiple_of(sz) {
-        return Err(crate::JoshuaError::Inference(format!(
+        return Err(candle_core::Error::Msg(format!(
             "mxfp4: {} bytes is not a whole number of {sz}-byte blocks",
             bytes.len()
         )));
@@ -326,6 +413,40 @@ mod tests {
         matmul_t((m, k, n), &lhs, &rhs, &mut dirty).unwrap();
 
         assert_eq!(fresh, dirty, "a pre-filled destination must be overwritten");
+    }
+
+    /// Parallel and serial execution must agree bit-for-bit: rows are
+    /// independent and each is computed with identical per-element
+    /// operations, so the thread count must not change a single bit.
+    #[test]
+    fn threaded_matches_serial_bit_exact() {
+        let (m, k, n) = (4, 1024, 23);
+        let blocks_per_row = k / QK_MXFP4;
+        let mut rhs = Vec::new();
+        for r in 0..n {
+            for b in 0..blocks_per_row {
+                let mut qs = [0u8; 16];
+                for (j, q) in qs.iter_mut().enumerate() {
+                    // Deterministic spread over the code space.
+                    *q = (((j + r * 3 + b * 5) % 16) as u8) | ((((j + r) % 16) as u8) << 4);
+                }
+                rhs.push(BlockMxfp4 {
+                    e: 127 + (r as u8 % 3),
+                    qs,
+                });
+            }
+        }
+        let lhs: Vec<f32> = (0..m * k)
+            .map(|i| ((i * 104729) % 1000) as f32 / 100.0 - 5.0)
+            .collect();
+
+        let mut par = vec![0f32; m * n];
+        matmul_t((m, k, n), &lhs, &rhs, &mut par).unwrap();
+
+        let mut ser = vec![0f32; m * n];
+        matmul_t_serial((m, k, n), &lhs, &rhs, &mut ser).unwrap();
+
+        assert_eq!(par, ser, "parallel and serial matmul must be bit-identical");
     }
 
     #[test]
