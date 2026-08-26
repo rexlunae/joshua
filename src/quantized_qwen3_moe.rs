@@ -598,6 +598,7 @@ impl Moe {
 
         let dev = x2.device();
         let mut y = Tensor::zeros((n_tokens, h), DType::F32, dev)?;
+        let _p = prof::Phase::start(&prof::EXPERTS);
         for (e, bucket) in per_expert.iter().enumerate() {
             if bucket.is_empty() {
                 continue;
@@ -611,6 +612,7 @@ impl Moe {
             let w = Tensor::from_vec(w, (count, 1), dev)?;
             y = y.index_add(&idx, &out.broadcast_mul(&w)?, 0)?;
         }
+        drop(_p);
         Ok(y)
     }
 
@@ -632,9 +634,11 @@ impl Moe {
         // pool contention; the memory streams of k=8 experts overlap fine
         // within that pool.
         let mut outs = Vec::with_capacity(k);
+        let _p = prof::Phase::start(&prof::EXPERTS);
         for &e in ids.iter() {
             outs.push(self.experts[e as usize].forward(x2)?); // [1, h] each
         }
+        drop(_p);
         let out = Tensor::stack(&outs, 0)?; // [k, 1, h]
         let w = weights.reshape((k, 1, 1))?; // [k, 1, 1]
         let y = out.broadcast_mul(&w)?.sum(0)?; // [1, h]
