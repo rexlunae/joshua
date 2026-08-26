@@ -19,8 +19,12 @@
 //! `k_quants::matmul` unchanged — bit-identical to joshua's previous
 //! behavior.
 
-use candle_core::quantized::k_quants::{self, GgmlType};
-use candle_core::{bail, Result};
+use candle_core::quantized::k_quants::{
+    self, BlockQ4_0, BlockQ4_1, BlockQ5_0, BlockQ5_1, BlockQ6K, BlockQ8_0, BlockQ8K, BlockQ8_1,
+    BlockQ2K, BlockQ3K, BlockQ4K, BlockQ5K, GgmlType,
+};
+use candle_core::quantized::{GgmlDType, QTensor};
+use candle_core::{bail, Device, DType, Result, Tensor};
 use half::f16;
 
 /// Decode raw GGUF tensor bytes to f32, for the streamed (non-mmap) load
@@ -100,6 +104,144 @@ pub fn decode_raw_to_f32(dtype: u32, bytes: &[u8], elems: usize) -> Result<Optio
         _ => return Ok(None),
     };
     Ok(Some(out))
+}
+
+/// Fast CPU forward for a quantized weight that candle would otherwise run
+/// through its own (scalar, single-threaded) kernel.
+///
+/// `qt` is the untouched quantized tensor behind a `QMatMul::QTensor` weight
+/// and `xs` the f32 activations.  Returns:
+///
+/// * `None` — this input has no fast path here (non-CPU device, non-f32
+///   activations, non-contiguous activations, or a dtype without a kernel);
+///   the caller should fall back to candle unchanged,
+/// * `Some(Ok(t))` — the matmul ran through Joshua's SIMD path,
+///   `t = xs · qtᵀ` with `xs`'s leading dims flattened to rows,
+/// * `Some(Err(e))` — the input was accepted but something failed; surface
+///   the error rather than silently retrying.
+///
+/// Dtype routing: Q8_0 / Q2_K / Q4_K go to the fused dequant-in-registers
+/// kernels ([`crate::kquant_dot::try_matmul_fused`], AVX2 on x86_64, NEON on
+/// aarch64); every other k-quant goes to [`matmul_kquant`] — candle's
+/// `to_float` dequant per row plus the SIMD dot and rayon row parallelism.
+/// Both paths dot **f32 activations**, matching candle's dequantize-then-gemm
+/// semantics up to FMA rounding (the same contract as the rest of this
+/// module), so results differ from candle by rounding only.
+pub fn try_fast_cpu_qmatmul(qt: &QTensor, xs: &Tensor) -> Option<Result<Tensor>> {
+    if !matches!(xs.device(), Device::Cpu) || xs.dtype() != DType::F32 {
+        return None;
+    }
+    let [n, k] = qt.shape().dims() else {
+        return None;
+    };
+    let (k, n) = (*k, *n);
+    let xs_dims = xs.dims();
+    if xs_dims.len() < 2 || xs_dims[xs_dims.len() - 1] != k || !xs.is_contiguous() {
+        return None;
+    }
+    let dtype = qt.dtype();
+    let covered = matches!(
+        dtype,
+        GgmlDType::Q8_0
+            | GgmlDType::Q2K
+            | GgmlDType::Q4K
+            | GgmlDType::Q4_0
+            | GgmlDType::Q4_1
+            | GgmlDType::Q5_0
+            | GgmlDType::Q5_1
+            | GgmlDType::Q8_1
+            | GgmlDType::Q3K
+            | GgmlDType::Q5K
+            | GgmlDType::Q6K
+            | GgmlDType::Q8K
+    );
+    if !covered || k == 0 || n == 0 {
+        return None;
+    }
+    let m: usize = xs_dims[..xs_dims.len() - 1].iter().product();
+
+    // ── Dispatch policy (measured, see `examples/bench_neon.rs`) ────────────
+    //
+    // aarch64, when this build has candle's dotprod support compiled in
+    // (`target-cpu=native` or similar):
+    //
+    // * **Q4_K, n%8==0** — candle's repacked `BlockQ4Kx8` SDOT kernel wins at
+    //   every batch size (≈5× our fused NEON kernels at m=1 and m=32);
+    //   defer.
+    // * **small batches (decode)** — candle's NEON vec_dots win for the
+    //   remaining k-quants too; defer.
+    // * **larger batches (prefill)** — Joshua's row-parallel dequant+dot
+    //   spreads across all cores and overtakes candle's single-threaded
+    //   kernel (measured crossover below m≈8); take over.
+    //
+    // On x86_64 the AVX2 fused kernels stay first-choice (candle has no
+    // comparable repacked path there).
+    #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+    if dtype == GgmlDType::Q4K && n.is_multiple_of(8) {
+        return None;
+    }
+    // Small batches: candle wins across the board here, but only in the
+    // same dotprod builds where that was measured.
+    #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+    if m < 8 {
+        return None;
+    }
+
+    // Committed from here on: errors are returned, not swallowed.  (`ok()?`
+    // on the flatten: a non-materializable view simply has no fast path.)
+    let lhs = match xs.flatten_all().ok()?.to_vec1::<f32>() {
+        Ok(v) => v,
+        Err(e) => return Some(Err(e)),
+    };
+    let bytes = match qt.data() {
+        Ok(b) => b,
+        Err(e) => return Some(Err(e.into())),
+    };
+
+    let mut dst = vec![0f32; m * n];
+    let mkn = (m, k, n);
+    let ran = if matches!(dtype, GgmlDType::Q8_0 | GgmlDType::Q2K | GgmlDType::Q4K) {
+        crate::kquant_dot::try_matmul_fused(dtype, mkn, &lhs, &bytes, &mut dst, true)
+    } else {
+        // Generic path for the remaining k-quants: reinterpret the bytes as
+        // candle blocks (same cast candle's own reader performs — every byte
+        // pattern is a valid block) and run the dequant+SIMD-dot matmul.
+        macro_rules! generic_kquant {
+            ($ty:ty) => {{
+                let block_bytes = std::mem::size_of::<$ty>();
+                if !bytes.len().is_multiple_of(block_bytes) {
+                    false
+                } else {
+                    let blocks = unsafe {
+                        std::slice::from_raw_parts(
+                            bytes.as_ptr() as *const $ty,
+                            bytes.len() / block_bytes,
+                        )
+                    };
+                    matmul_kquant::<$ty>(mkn, &lhs, blocks, &mut dst).is_ok()
+                }
+            }};
+        }
+        match dtype {
+            GgmlDType::Q4_0 => generic_kquant!(BlockQ4_0),
+            GgmlDType::Q4_1 => generic_kquant!(BlockQ4_1),
+            GgmlDType::Q5_0 => generic_kquant!(BlockQ5_0),
+            GgmlDType::Q5_1 => generic_kquant!(BlockQ5_1),
+            GgmlDType::Q8_1 => generic_kquant!(BlockQ8_1),
+            GgmlDType::Q3K => generic_kquant!(BlockQ3K),
+            GgmlDType::Q5K => generic_kquant!(BlockQ5K),
+            GgmlDType::Q6K => generic_kquant!(BlockQ6K),
+            GgmlDType::Q8K => generic_kquant!(BlockQ8K),
+            _ => false,
+        }
+    };
+    if !ran {
+        return None;
+    }
+
+    let mut out_shape = xs_dims[..xs_dims.len() - 1].to_vec();
+    out_shape.push(n);
+    Some(Tensor::from_vec(dst, out_shape, &Device::Cpu))
 }
 
 /// `dst[m, n] = lhs[m, k] · rhs[n, k]ᵀ` over candle k-quant blocks.
@@ -605,5 +747,159 @@ mod tests {
         assert!(matmul_kquant::<BlockQ8_0>((1, 256, 4), &lhs, &blocks, &mut dst).is_err());
         // Mismatched lhs/dst lengths.
         assert!(matmul_kquant::<BlockQ8_0>((1, 256, 2), &[0.0], &blocks, &mut dst).is_err());
+    }
+
+    // ── try_fast_cpu_qmatmul (the QMatMul::QTensor forward hook) ────────────
+
+    /// Build a quantized `[n, k]` QTensor and matching activations.
+    fn qtensor_and_xs(
+        n: usize,
+        k: usize,
+        dtype: GgmlDType,
+        m: usize,
+    ) -> (candle_core::quantized::QTensor, Tensor) {
+        let data: Vec<f32> = (0..n * k)
+            .map(|i| ((((i as u64) * 2654435761) % 100000) as f32 / 1000.0) - 50.0)
+            .collect();
+        let t = Tensor::from_vec(data, (n, k), &Device::Cpu).unwrap();
+        let qt = candle_core::quantized::QTensor::quantize(&t, dtype).unwrap();
+        let xs: Vec<f32> = (0..m * k).map(|i| (((i * 40503) % 997) as f32 / 317.0) - 1.5).collect();
+        let xs = Tensor::from_vec(xs, (m, k), &Device::Cpu).unwrap();
+        (qt, xs)
+    }
+
+    /// The fast path must reproduce candle's dequantize-then-gemm for every
+    /// dtype it accepts — including Q6_K/Q5K etc. that only have the generic
+    /// dequant+NEON-dot route.  Tolerances absorb accumulation-order and FMA
+    /// rounding only (same contract as `run_case` above).
+    ///
+    /// Policy-aware: under the measured dispatch policy some inputs are
+    /// deferred to candle (`None`); when that happens we just assert the
+    /// deferral is the documented one instead of checking numerics.
+    #[test]
+    fn fast_cpu_qmatmul_matches_candle_dequantized_gemm() {
+        let dev = Device::Cpu;
+        // On a dotprod build Q4K defers to candle at every m; other
+        // k-quants defer below the parallel-amortization threshold.
+        let deferred = |dtype: GgmlDType, m: usize, n: usize| -> bool {
+            #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+            {
+                if dtype == GgmlDType::Q4K && n.is_multiple_of(8) {
+                    return true;
+                }
+                m < 8
+            }
+            #[cfg(not(all(target_arch = "aarch64", target_feature = "dotprod")))]
+            {
+                let _ = (dtype, m, n);
+                false
+            }
+        };
+        for dtype in [
+            GgmlDType::Q8_0,
+            GgmlDType::Q2K,
+            GgmlDType::Q4K,
+            GgmlDType::Q6K,
+            GgmlDType::Q5K,
+            GgmlDType::Q4_0,
+        ] {
+            let (qt, xs) = qtensor_and_xs(48, 256, dtype, 3);
+            match try_fast_cpu_qmatmul(&qt, &xs) {
+                None => assert!(deferred(dtype, 3, 48), "{dtype:?}: unexpected deferral"),
+                Some(out) => {
+                    let out = out.unwrap();
+                    assert_eq!(out.dims(), &[3, 48]);
+                    let w = qt.dequantize(&dev).unwrap(); // [n, k] f32
+                    let reference = xs.matmul(&w.t().unwrap()).unwrap();
+                    let fast = out.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                    let refr =
+                        reference.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                    for (i, (a, b)) in fast.iter().zip(refr.iter()).enumerate() {
+                        let tol = 2e-2 * b.abs().max(1.0);
+                        assert!(
+                            (a - b).abs() <= tol,
+                            "{dtype:?}: dst[{i}] fast={a} candle-gemm={b} (tol {tol})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Real model shapes from the Qwen3-Coder-30B-A3B Q4_K_M GGUF: expert
+    /// gate/up [768, 2048] Q4_K, early-layer ffn_down/attn_v [2048, 768] /
+    /// [512, 2048] Q6_K — in the prefill regime (m=16), where the parallel
+    /// path is supposed to run.
+    #[test]
+    fn fast_cpu_qmatmul_at_model_shapes() {
+        for (dtype, n, k) in [
+            (GgmlDType::Q4K, 768usize, 2048usize),
+            (GgmlDType::Q6K, 2048, 768),
+            (GgmlDType::Q6K, 512, 2048),
+            (GgmlDType::Q4K, 4096, 2048),
+        ] {
+            let (qt, xs) = qtensor_and_xs(n, k, dtype, 16);
+            let res = try_fast_cpu_qmatmul(&qt, &xs);
+            #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+            if dtype == GgmlDType::Q4K && n.is_multiple_of(8) {
+                assert!(
+                    res.is_none(),
+                    "{dtype:?}: Q4K defers to candle's repacked path"
+                );
+                continue;
+            }
+            let out = res
+                .unwrap_or_else(|| panic!("{dtype:?} must be covered"))
+                .unwrap();
+            assert_eq!(out.dims(), &[16, n]);
+        }
+    }
+
+    /// Inputs without a fast path must return `None` (caller falls back to
+    /// candle), and 3-D activations must flatten correctly.
+    #[test]
+    fn fast_cpu_qmatmul_fallbacks_and_flattening() {
+        // F32 weights are never routed here (candle keeps them exact).
+        let data = vec![0.5f32; 4 * 256];
+        let bytes_f32: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let storage = candle_core::quantized::QStorage::from_data(
+            std::borrow::Cow::Owned(bytes_f32),
+            &Device::Cpu,
+            GgmlDType::F32,
+        )
+        .unwrap();
+        let qt_f32 = candle_core::quantized::QTensor::new(storage, 4 * 256).unwrap();
+        let xs = Tensor::zeros((2, 1024), DType::F32, &Device::Cpu).unwrap();
+        assert!(try_fast_cpu_qmatmul(&qt_f32, &xs).is_none());
+
+        // Non-f32 activations fall back.
+        let (qt, _) = qtensor_and_xs(4, 256, GgmlDType::Q4K, 2);
+        let xs_h = Tensor::zeros((2, 256), DType::F16, &Device::Cpu).unwrap();
+        assert!(try_fast_cpu_qmatmul(&qt, &xs_h).is_none());
+
+        // Non-contiguous activations fall back.
+        let wide = Tensor::from_vec(
+            (0..2 * 512).map(|i| i as f32 * 0.01).collect::<Vec<_>>(),
+            (2, 512),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let xs_nc = wide.narrow(1, 128, 256).unwrap(); // strided view
+        assert!(!xs_nc.is_contiguous());
+        assert!(try_fast_cpu_qmatmul(&qt, &xs_nc).is_none());
+
+        // Last-dim mismatch falls back.
+        let xs_bad = Tensor::zeros((2, 128), DType::F32, &Device::Cpu).unwrap();
+        assert!(try_fast_cpu_qmatmul(&qt, &xs_bad).is_none());
+
+        // 3-D contiguous activations flatten to rows and reshape back
+        // (m=12: above the parallel-amortization threshold; Q6_K because
+        // Q4_K always defers to candle on dotprod builds).
+        let (qt8, xs_flat) = qtensor_and_xs(8, 256, GgmlDType::Q6K, 12);
+        let xs_3d = xs_flat.reshape((2, 6, 256)).unwrap();
+        let out = try_fast_cpu_qmatmul(&qt8, &xs_3d)
+            .expect("covered dtype")
+            .unwrap();
+        assert_eq!(out.dims(), &[2, 6, 8]);
     }
 }
