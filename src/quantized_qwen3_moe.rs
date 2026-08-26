@@ -42,6 +42,80 @@ use candle_transformers::quantized_nn::RmsNorm;
 
 use crate::zero_copy_metal::{ZcContext, ZcWeight};
 
+// ─── Opt-in phase profiler (JOSHUA_PROFILE=1) ────────────────────────────────
+//
+// Diagnostic for the CPU decode path: accumulates nanoseconds per phase
+// across forward passes and prints per-step averages every 16 steps on the
+// calling thread.  Off by default; zero cost when disabled.
+mod prof {
+    use std::cell::Cell;
+    use std::sync::OnceLock;
+    use std::time::Instant;
+
+    type Slot = &'static std::thread::LocalKey<Cell<u128>>;
+
+    pub fn enabled() -> bool {
+        static E: OnceLock<bool> = OnceLock::new();
+        *E.get_or_init(|| {
+            std::env::var("JOSHUA_PROFILE").map(|v| !v.is_empty()).unwrap_or(false)
+        })
+    }
+
+    thread_local! {
+        pub static ATT: Cell<u128> = Cell::new(0);
+        pub static MOE: Cell<u128> = Cell::new(0);
+        pub static EXPERTS: Cell<u128> = Cell::new(0);
+        pub static HEAD: Cell<u128> = Cell::new(0);
+        static STEPS: Cell<u64> = Cell::new(0);
+    }
+
+    pub struct Phase(Option<(Instant, Slot)>);
+
+    impl Phase {
+        pub fn start(slot: Slot) -> Self {
+            Self(if enabled() { Some((Instant::now(), slot)) } else { None })
+        }
+    }
+
+    impl Drop for Phase {
+        fn drop(&mut self) {
+            if let Some((t0, slot)) = self.0.take() {
+                let ns = t0.elapsed().as_nanos();
+                slot.with(|c| c.set(c.get() + ns));
+            }
+        }
+    }
+
+    /// Report averages over the steps accumulated so far and reset.
+    pub fn report() {
+        if !enabled() {
+            return;
+        }
+        STEPS.with(|s| {
+            let n = s.get() + 1;
+            s.set(n);
+            if n % 16 == 0 {
+                let a = ATT.with(|c| c.get());
+                let m = MOE.with(|c| c.get());
+                let e = EXPERTS.with(|c| c.get());
+                let h = HEAD.with(|c| c.get());
+                eprintln!(
+                    "[profile] avg ms/step over last 16: attention {:.1}, moe {:.1} \
+                     (expert matmuls {:.1}), lm_head {:.1}",
+                    a as f64 / 16e6,
+                    m as f64 / 16e6,
+                    e as f64 / 16e6,
+                    h as f64 / 16e6,
+                );
+                ATT.with(|c| c.set(0));
+                MOE.with(|c| c.set(0));
+                EXPERTS.with(|c| c.set(0));
+                HEAD.with(|c| c.set(0));
+            }
+        });
+    }
+}
+
 // ─── Configuration ───────────────────────────────────────────────────────────
 
 struct Config {
@@ -220,7 +294,19 @@ enum Weight {
 impl Weight {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         match self {
-            Weight::Candle(q) => q.forward(xs),
+            Weight::Candle(q) => {
+                // Joshua's SIMD path first: fused dequant+dot kernels
+                // (Q8_0/Q2_K/Q4_K) or dequant-row + NEON/AVX2 dot (other
+                // k-quants), parallelised across rows — instead of candle's
+                // scalar single-threaded kernel.  Anything without a fast
+                // path here falls through to candle unchanged.
+                if let QMatMul::QTensor(qt) = q {
+                    if let Some(res) = crate::quant_matmul::try_fast_cpu_qmatmul(qt, xs) {
+                        return res;
+                    }
+                }
+                q.forward(xs)
+            }
             Weight::Zc(z) => z.forward(xs),
         }
     }
@@ -318,6 +404,7 @@ impl Attention {
     }
 
     fn forward(&mut self, xs: &Tensor, mask: Option<&Tensor>, offset: usize) -> Result<Tensor> {
+        let _p = prof::Phase::start(&prof::ATT);
         let (b, seq_len, _) = xs.dims3()?;
 
         let q = self
@@ -439,6 +526,7 @@ struct Moe {
 
 impl Moe {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        let _p = prof::Phase::start(&prof::MOE);
         let (b, seq_len, h) = xs.dims3()?;
         let n_tokens = b * seq_len;
         let x2 = xs.reshape((n_tokens, h))?;
@@ -538,6 +626,11 @@ impl Moe {
     ) -> Result<Tensor> {
         let k = self.n_expert_used;
         let ids: Vec<u32> = topk_idx.flatten_all()?.to_vec1()?; // [k] — the one host sync
+        // NB: deliberately serial.  Candle's own CPU kernels already fan out
+        // through its global rayon pool per op, and an outer parallel loop
+        // over experts measurably *regresses* decode (~20%) through nested-
+        // pool contention; the memory streams of k=8 experts overlap fine
+        // within that pool.
         let mut outs = Vec::with_capacity(k);
         for &e in ids.iter() {
             outs.push(self.experts[e as usize].forward(x2)?); // [1, h] each
@@ -844,7 +937,11 @@ impl GGUFQWenMoE {
 
         let xs = xs.narrow(1, seq_len - 1, 1)?;
         let xs = self.norm.forward(&xs)?;
-        self.output.forward(&xs)?.to_dtype(DType::F32)?.squeeze(1)
+        let _p = prof::Phase::start(&prof::HEAD);
+        let out = self.output.forward(&xs)?.to_dtype(DType::F32)?.squeeze(1);
+        drop(_p);
+        prof::report();
+        out
     }
 
     /// Reset the KV cache so this instance can serve an unrelated prompt.
