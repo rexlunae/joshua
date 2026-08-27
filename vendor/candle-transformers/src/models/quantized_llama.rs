@@ -264,7 +264,9 @@ impl LayerWeights {
         // always n_embd — they differ when head_dim * n_head != n_embd
         // (MiniCPM5-1B: 16*128=2048 vs hidden 1536).  attention_wo projects
         // back to n_embd below.
-        let y = y.transpose(1, 2)?.reshape(&[b_sz, seq_len, self.n_head * self.head_dim])?;
+        let y = y
+            .transpose(1, 2)?
+            .reshape(&[b_sz, seq_len, self.n_head * self.head_dim])?;
         let y = self.attention_wo.forward(&y)?;
         Ok(y)
     }
