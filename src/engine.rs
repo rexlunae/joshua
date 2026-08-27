@@ -1445,6 +1445,19 @@ impl Engine {
 
             let next_token = sample_token(&logits_vec, options, &mut rng, &recent_tokens)?;
 
+            if std::env::var_os("JOSHUA_DEBUG_TOKENS").is_some() {
+                let mut order: Vec<usize> = (0..logits_vec.len()).collect();
+                order.sort_by(|&a, &b| logits_vec[b].total_cmp(&logits_vec[a]));
+                let top5: Vec<(usize, f32)> = order[..5.min(order.len())]
+                    .iter()
+                    .map(|&i| (i, logits_vec[i]))
+                    .collect();
+                eprintln!(
+                    "[eng] n_cur={n_cur} tok={next_token} temp={} topk={} topp={} minp={} reppen={} top5={top5:?}",
+                    options.temperature, options.top_k, options.top_p, options.min_p, options.repetition_penalty
+                );
+            }
+
             if self.eos_token_ids.contains(&next_token) {
                 break;
             }
@@ -2732,14 +2745,23 @@ fn sample_token(
     // multiply negative logits by `repetition_penalty` (> 1.0 discourages
     // repetition; 1.0 is a no-op).  Applied before temperature so the penalty
     // is independent of the temperature scale.
-    let logits: Vec<f32> = if opts.repetition_penalty != 1.0 {
+    // NOTE: at temperature 0 the penalty is skipped entirely (pure greedy),
+    // unless JOSHUA_LEGACY_REPPEN is set — matching the semantics of every
+    // other sampler where a "temperature" of 0 means "take the argmax of the
+    // raw logits".
+    let reppen = if opts.temperature <= 0.0 && std::env::var_os("JOSHUA_LEGACY_REPPEN").is_none() {
+        1.0
+    } else {
+        opts.repetition_penalty
+    };
+    let logits: Vec<f32> = if reppen != 1.0 {
         let mut v = logits.to_vec();
         for &token in recent_tokens {
             if let Some(l) = v.get_mut(token as usize) {
                 if *l > 0.0 {
-                    *l /= opts.repetition_penalty;
+                    *l /= reppen;
                 } else {
-                    *l *= opts.repetition_penalty;
+                    *l *= reppen;
                 }
             }
         }
