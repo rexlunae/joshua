@@ -55,6 +55,11 @@ tls = ["dep:axum-server", "dep:rustls"]
 # Always applied so the vendored crate is the one candle-core links against.
 [patch.crates-io]
 candle-metal-kernels = { path = "vendor/candle-metal-kernels" }
+# Vendored so joshua can fix upstream gaps — currently: quantized_llama must
+# honour the GGUF head_dim (`llama.attention.key_length` / rope dimension)
+# instead of assuming n_embd/n_head (MiniCPM5-1B: 1536 hidden, 16 heads,
+# head_dim 128), and MAX_SEQ_LEN is raised to 131072 for 128K-context models.
+candle-transformers = { path = "vendor/candle-transformers" }
 
 [dependencies]
 # Pure Rust ML inference (no C/C++ dependencies required for CPU)
