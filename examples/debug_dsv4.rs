@@ -37,7 +37,7 @@ fn main() -> anyhow::Result<()> {
     let model_path = &args[1];
     let tok_path = &args[2];
     let prompt = &args[3];
-    let mut max_tokens: usize = args.get(4).map(|s| s.parse().unwrap()).unwrap_or(80);
+    let mut max_tokens: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(80);
     let chat = args.iter().any(|a| a == "--chat");
 
     // ---- Load exactly like the engine (mmap + raw header + candle content).
