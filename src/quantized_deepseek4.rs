@@ -2108,8 +2108,8 @@ impl ModelWeights {
         // before the layer loop so the prefetch has a full step of compute
         // to stream in behind.  The per-token routing recorded below feeds
         // the counters.
-        let step = self.hot_experts.begin_step();
-        if self.hot_experts.refresh_due(seq_len == 1) {
+        let step = self.hot_experts.begin_step(seq_len == 1);
+        if self.hot_experts.refresh_due() {
             for (l, e) in self.hot_experts.refresh() {
                 self.prefetch_expert(l, e);
             }

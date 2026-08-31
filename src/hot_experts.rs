@@ -84,16 +84,28 @@ impl HotExpertCache {
 
     /// Advance the recency clock; call once per forward pass and pass the
     /// returned step to [`HotExpertCache::record`].
-    pub fn begin_step(&mut self) -> u64 {
-        self.step = self.step.wrapping_add(1);
+    ///
+    /// The clock counts **decode steps only**: pass `decode = seq_len == 1`.
+    /// Prefill forwards record routing against the current step but do not
+    /// advance it, so the refresh interval and the recency tie-break measure
+    /// decode activity — a long prompt cannot consume the interval and
+    /// trigger premature refresh churn.
+    pub fn begin_step(&mut self, decode: bool) -> u64 {
+        if decode {
+            self.step = self.step.wrapping_add(1);
+        }
         self.step
     }
 
     /// Record that one layer routed through `ids` at `step` (the value
     /// returned by [`HotExpertCache::begin_step`] for this forward pass).
     /// Bounds-checked per layer/expert, so dense layers and hash layers that
-    /// report a different expert count are safe no-ops.
+    /// report a different expert count are safe no-ops.  A disabled cache
+    /// (budget 0) is fully inert.
     pub fn record(&mut self, layer: usize, ids: &[u32], step: u64) {
+        if self.budget == 0 {
+            return;
+        }
         let Some(hits) = self.hits.get_mut(layer) else {
             return;
         };
@@ -106,16 +118,23 @@ impl HotExpertCache {
         }
     }
 
-    /// Whether a decode-step refresh is due.  Pass `decode = seq_len == 1`.
-    pub fn refresh_due(&self, decode: bool) -> bool {
-        decode && self.budget > 0 && self.step > 0 && self.step % REFRESH_STEPS == 0
+    /// Whether a decode-step refresh is due.  The clock only advances on
+    /// decode steps, so the interval boundary can only be reached by decode
+    /// activity.
+    pub fn refresh_due(&self) -> bool {
+        self.budget > 0 && self.step > 0 && self.step % REFRESH_STEPS == 0
     }
 
     /// Re-select the hot set from routing frequency (recency as the
-    /// tie-break) and return the experts that joined it since the last
-    /// refresh, in priority order, for the owner to prefetch.
+    /// tie-break) and return it in priority order for the owner to prefetch.
     ///
-    /// Best-effort and idempotent: a stable hot set returns an empty list.
+    /// The **whole** hot set is returned on every refresh, not just the
+    /// members that changed: `MADV_WILLNEED` is an advisory hint whose effect
+    /// can be evicted by memory pressure, so a stable set must re-assert its
+    /// residency periodically or evicted pages would return through demand
+    /// faults indefinitely.  Re-advising already-resident pages is
+    /// effectively free; the refresh cadence bounds how stale a resident
+    /// hint may get.
     pub fn refresh(&mut self) -> Vec<(u32, u32)> {
         if self.budget == 0 {
             return Vec::new();
@@ -133,23 +152,16 @@ impl HotExpertCache {
         cand.sort_unstable_by(|a, b| b.cmp(a));
         cand.truncate(self.budget);
         let new_hot: Vec<(u32, u32)> = cand.into_iter().map(|(_, _, l, e)| (l, e)).collect();
+        self.hot_set = new_hot;
 
-        let mut additions = Vec::new();
-        for pair in &new_hot {
-            if !self.hot_set.contains(pair) {
-                additions.push(*pair);
-            }
-        }
-        if !additions.is_empty() {
+        if !self.hot_set.is_empty() {
             tracing::info!(
-                "expert cache: {} hot experts (budget {}) — prefetched {} new",
-                new_hot.len(),
+                "expert cache: {} hot experts (budget {}) — re-asserting residency",
+                self.hot_set.len(),
                 self.budget,
-                additions.len(),
             );
         }
-        self.hot_set = new_hot;
-        additions
+        self.hot_set.clone()
     }
 }
 
@@ -164,15 +176,15 @@ mod tests {
         c.set_budget(3);
         // Layer 0: expert 1 used twice, expert 0 once (old), expert 2 once (new).
         // Layer 1: expert 3 used once (newest).
-        let s1 = c.begin_step();
+        let s1 = c.begin_step(true);
         c.record(0, &[1], s1);
-        let s2 = c.begin_step();
+        let s2 = c.begin_step(true);
         c.record(0, &[1], s2);
-        let s3 = c.begin_step();
+        let s3 = c.begin_step(true);
         c.record(0, &[0], s3);
-        let s4 = c.begin_step();
+        let s4 = c.begin_step(true);
         c.record(0, &[2], s4);
-        let s5 = c.begin_step();
+        let s5 = c.begin_step(true);
         c.record(1, &[3], s5);
 
         let hot = c.refresh();
@@ -186,28 +198,55 @@ mod tests {
         assert_eq!(hot[2], (0, 2));
     }
 
-    /// A stable hot set returns no additions on the next refresh.
+    /// A stable hot set is returned in full on every refresh: residency
+    /// hints are advisory and can be evicted, so the whole set must be
+    /// re-asserted periodically rather than only when members change.
     #[test]
-    fn refresh_only_returns_additions() {
+    fn refresh_reasserts_the_full_hot_set() {
         let mut c = HotExpertCache::new(1, 4, 2);
         c.set_budget(2);
-        let s1 = c.begin_step();
+        let s1 = c.begin_step(true);
         c.record(0, &[1, 2], s1);
         let first = c.refresh();
         assert_eq!(first.len(), 2);
 
-        let s2 = c.begin_step();
+        let s2 = c.begin_step(true);
         c.record(0, &[1, 2], s2);
         let second = c.refresh();
-        assert!(second.is_empty(), "stable hot set must not re-prefetch");
+        assert_eq!(second.len(), 2, "stable hot set must be re-asserted in full");
+        assert_eq!(second, first);
+    }
+
+    /// The recency clock advances on decode steps only: prefills record
+    /// routing without consuming the refresh interval.
+    #[test]
+    fn step_counts_decode_only() {
+        let mut c = HotExpertCache::new(1, 4, 2);
+        c.set_budget(2);
+        // 60 decode steps then 5000 prefill tokens: refresh must NOT be due.
+        for _ in 0..60 {
+            let s = c.begin_step(true);
+            c.record(0, &[1], s);
+        }
+        for _ in 0..5000 {
+            let s = c.begin_step(false);
+            c.record(0, &[1, 2], s);
+        }
+        assert!(!c.refresh_due(), "prefills must not advance the decode clock");
+        // Exactly four more decode steps reach the interval boundary.
+        for _ in 0..4 {
+            let s = c.begin_step(true);
+            c.record(0, &[1], s);
+        }
+        assert!(c.refresh_due(), "refresh due after exactly 64 decode steps");
     }
 
     /// Budget zero disables refresh; the cache stays inert.
     #[test]
     fn disabled_cache_noops() {
         let mut c = HotExpertCache::new(1, 4, 0);
-        assert!(!c.refresh_due(true));
-        let s = c.begin_step();
+        assert!(!c.refresh_due());
+        let s = c.begin_step(true);
         c.record(0, &[1], s);
         assert!(c.refresh().is_empty());
         assert_eq!(c.budget(), 0);
@@ -217,7 +256,7 @@ mod tests {
     #[test]
     fn record_bounds_checks() {
         let mut c = HotExpertCache::new(2, 4, 1);
-        let s = c.begin_step();
+        let s = c.begin_step(true);
         c.record(9, &[0], s);
         c.record(0, &[99], s);
         c.record(0, &[1], s);

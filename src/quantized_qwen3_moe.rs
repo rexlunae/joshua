@@ -551,8 +551,11 @@ impl Moe {
         let n_tokens = b * seq_len;
         let x2 = xs.reshape((n_tokens, h))?;
         let (topk_idx, weights) = self.route(&x2)?;
-        let ids: Vec<u32> = topk_idx.flatten_all()?.to_vec1()?;
-        let routed = self.dispatch(&x2, &topk_idx, &weights, n_tokens)?;
+        // dispatch already drains the routed ids to the host for its own
+        // bucketing; reuse them for the hot-expert cache instead of a second
+        // device-to-host sync (which would cost a synchronization per layer
+        // even when the cache is disabled).
+        let (routed, ids) = self.dispatch(&x2, &topk_idx, &weights, n_tokens)?;
         Ok((routed.reshape((b, seq_len, h))?, ids))
     }
 
@@ -585,7 +588,7 @@ impl Moe {
         topk_idx: &Tensor,
         weights: &Tensor,
         n_tokens: usize,
-    ) -> Result<Tensor> {
+    ) -> Result<(Tensor, Vec<u32>)> {
         if n_tokens == 1 {
             return self.dispatch_decode(x2, topk_idx, weights);
         }
@@ -634,7 +637,7 @@ impl Moe {
             y = y.index_add(&idx, &out.broadcast_mul(&w)?, 0)?;
         }
         drop(_p);
-        Ok(y)
+        Ok((y, ids))
     }
 
     /// Single-token decode dispatch.  With one token every selected expert
@@ -646,7 +649,7 @@ impl Moe {
         x2: &Tensor,
         topk_idx: &Tensor,
         weights: &Tensor,
-    ) -> Result<Tensor> {
+    ) -> Result<(Tensor, Vec<u32>)> {
         let k = self.n_expert_used;
         let ids: Vec<u32> = topk_idx.flatten_all()?.to_vec1()?; // [k] — the one host sync
         // NB: deliberately serial.  Candle's own CPU kernels already fan out
@@ -663,7 +666,7 @@ impl Moe {
         let out = Tensor::stack(&outs, 0)?; // [k, 1, h]
         let w = weights.reshape((k, 1, 1))?; // [k, 1, 1]
         let y = out.broadcast_mul(&w)?.sum(0)?; // [1, h]
-        Ok(y)
+        Ok((y, ids))
     }
 }
 
@@ -986,8 +989,8 @@ impl GGUFQWenMoE {
         // pages, so the common routing path stays resident instead of
         // faulting from disk each step.  Runs before the layer loop so the
         // prefetch has a full step of compute to stream in behind.
-        let step = self.hot_experts.begin_step();
-        if self.hot_experts.refresh_due(seq_len == 1) {
+        let step = self.hot_experts.begin_step(seq_len == 1);
+        if self.hot_experts.refresh_due() {
             for (l, e) in self.hot_experts.refresh() {
                 self.prefetch_expert(l, e);
             }
