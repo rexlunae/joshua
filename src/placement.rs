@@ -79,7 +79,10 @@ pub fn adaptive_budget(
             0.0
         };
         if has_bus && bus_time > 0.001 {
-            return (current * 2).min(max_budget);
+            // saturating_mul: `current` can exceed usize::MAX / 2 when the
+            // cap is huge; a plain `* 2` would panic in debug builds and
+            // wrap below min_budget in release.
+            return current.saturating_mul(2).min(max_budget);
         }
         return current;
     }
@@ -162,6 +165,14 @@ mod tests {
         assert_eq!(adaptive_budget(100, 0.90, (1 << 20) as f64, 63.0 * 1e9, 10, 10_000), 100);
         // Growth is capped at max_budget.
         assert_eq!(adaptive_budget(6_000, 0.40, (1 << 30) as f64, 63.0 * 1e9, 10, 10_000), 10_000);
+        // A huge budget must saturate rather than wrap: usize::MAX / 2 + 10
+        // doubled would overflow a plain `* 2` (panic in debug, wrap below
+        // the floor in release).
+        assert_eq!(
+            adaptive_budget(usize::MAX / 2 + 10, 0.40, (1 << 30) as f64, 63.0 * 1e9, 10, usize::MAX),
+            usize::MAX,
+            "saturating growth must not wrap"
+        );
         // A zero cap disables the cache entirely.
         assert_eq!(adaptive_budget(100, 0.40, (1 << 30) as f64, 63.0 * 1e9, 0, 0), 0);
     }
