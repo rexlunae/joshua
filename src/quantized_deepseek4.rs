@@ -1537,6 +1537,11 @@ impl FeedForward {
 }
 
 /// A quantized DeepSeek-V4 model loaded from GGUF.
+/// How often (in decode steps) the routing-frequency hot-expert cache
+/// re-selects its pinned set.  A refresh is a cheap sort over the
+/// per-expert hit counters, so the interval mostly bounds madvise churn.
+pub(crate) const HOT_EXPERTS_REFRESH_STEPS: u64 = 64;
+
 pub struct ModelWeights {
     tok_embeddings: Tensor,
     layers: Vec<Layer>,
@@ -1563,6 +1568,23 @@ pub struct ModelWeights {
     /// (see [`ModelWeights::last_routed_experts`]).  The prediction source
     /// for the speculative decode prefetch.
     last_routed: Vec<Vec<u32>>,
+    /// Routing-frequency hot-expert cache budget — the number of
+    /// `(layer, expert)` pairs kept resident (0 = disabled).  Set after load
+    /// via [`ModelWeights::set_pin_hot_experts`]; the CLI flag is
+    /// `--pin-hot-experts`.
+    pin_hot_experts: usize,
+    /// Per-layer per-expert routing hit counts, indexed `[layer][expert]`.
+    /// The frequency side of the routing-frequency LRU.
+    expert_hits: Vec<Vec<u64>>,
+    /// Per-layer per-expert step of the last route — the recency clock that
+    /// breaks frequency ties (the LRU side of the routing-frequency LRU).
+    expert_last_used: Vec<Vec<u64>>,
+    /// Total forward passes completed; the shared recency clock.
+    step: u64,
+    /// The currently pinned hot experts as `(layer, expert)` pairs, in
+    /// priority order.  Diffed against the recomputed top set on every
+    /// refresh so only additions are re-prefetched.
+    hot_set: Vec<(usize, usize)>,
 }
 
 /// Small GGUF reader over the memory-mapped file.
@@ -1966,6 +1988,7 @@ impl ModelWeights {
         let file = rd.file.clone();
 
         let n_layers = layers.len();
+        let n_expert = cfg.n_expert;
         Ok(Self {
             tok_embeddings,
             layers,
@@ -1984,6 +2007,11 @@ impl ModelWeights {
             file,
             layer_expert_ranges,
             last_routed: vec![Vec::new(); n_layers],
+            pin_hot_experts: 0,
+            expert_hits: vec![vec![0u64; n_expert]; n_layers],
+            expert_last_used: vec![vec![0u64; n_expert]; n_layers],
+            step: 0,
+            hot_set: Vec::new(),
         })
     }
 
@@ -2022,6 +2050,70 @@ impl ModelWeights {
     /// tests observe that routing is being tracked.
     pub fn last_routed_experts(&self) -> &[Vec<u32>] {
         &self.last_routed
+    }
+
+    /// Set the routing-frequency hot-expert cache budget (experts kept
+    /// resident).  Call once after load, before serving; routing is recorded
+    /// from the first forward pass and the pinned set is re-selected every
+    /// [`HOT_EXPERTS_REFRESH_STEPS`] decode steps.
+    pub fn set_pin_hot_experts(&mut self, n: usize) {
+        if self.pin_hot_experts == n {
+            return;
+        }
+        self.pin_hot_experts = n;
+        self.hot_set.clear();
+        if n > 0 {
+            let total: usize = self.expert_hits.iter().map(|v| v.len()).sum();
+            tracing::info!("expert cache: pinning up to {n} hot experts ({total} available)");
+        }
+    }
+
+    /// Re-select the hot-expert set from routing frequency (recency as the
+    /// tie-break) and WILLNEED any experts that joined it since the last
+    /// refresh.  Best-effort and idempotent; a no-op when the budget is zero
+    /// or no routing has happened yet.
+    fn refresh_hot_experts(&mut self) {
+        let budget = self.pin_hot_experts;
+        if budget == 0 {
+            return;
+        }
+        // Sort key `(hits desc, last_used desc)`: frequency first, recency
+        // breaks ties — the routing-frequency LRU policy.
+        let mut cand: Vec<(u64, u64, usize, usize)> = Vec::new();
+        for (l, layer_hits) in self.expert_hits.iter().enumerate() {
+            for (e, &h) in layer_hits.iter().enumerate() {
+                if h > 0 {
+                    cand.push((h, self.expert_last_used[l][e], l, e));
+                }
+            }
+        }
+        cand.sort_unstable_by(|a, b| b.cmp(a));
+        cand.truncate(budget);
+        let new_hot: Vec<(usize, usize)> =
+            cand.into_iter().map(|(_, _, l, e)| (l, e)).collect();
+
+        // Diff against the current set so only additions pay for a prefetch.
+        let mut additions = 0usize;
+        for &(l, e) in &new_hot {
+            if self.hot_set.contains(&(l, e)) {
+                continue;
+            }
+            if let Some(layer) = self.layers.get(l) {
+                // Every layer of this architecture carries an MoE block.
+                let FeedForward::Moe(moe) = &layer.ffn;
+                if let Some(exp) = moe.experts.get(e) {
+                    exp.prefetch();
+                    additions += 1;
+                }
+            }
+        }
+        if additions > 0 {
+            tracing::info!(
+                "expert cache: {} hot experts (budget {budget}) — prefetched {additions} new",
+                new_hot.len(),
+            );
+        }
+        self.hot_set = new_hot;
     }
 
     /// Forward pass. `input` is `[1, seq_len]`; `offset` is the KV-cache
@@ -2071,6 +2163,19 @@ impl ModelWeights {
         } else {
             None
         };
+
+        // Routing-frequency hot-expert cache: every HOT_EXPERTS_REFRESH_STEPS
+        // decode steps, re-select the most-used experts (recency as the
+        // tie-break) and WILLNEED their pages, so the common routing path
+        // stays resident instead of faulting from disk each step.  Runs
+        // before the layer loop so the prefetch has a full step of compute
+        // to stream in behind.  The per-token routing recorded below feeds
+        // the counters.
+        self.step = self.step.wrapping_add(1);
+        let step = self.step;
+        if seq_len == 1 && self.pin_hot_experts > 0 && self.step % HOT_EXPERTS_REFRESH_STEPS == 0 {
+            self.refresh_hot_experts();
+        }
 
         // Speculative next-step expert prefetch (decode only): routing is
         // temporally local — the step now being generated routes to a large
@@ -2148,6 +2253,21 @@ impl ModelWeights {
             let h = layer.ffn_norm.forward(&x)?;
             let (h, routed_ids) = layer.ffn.forward(&h, input)?;
             last_routed[i] = routed_ids;
+            if self.pin_hot_experts > 0 {
+                // Routing-frequency LRU bookkeeping: bump the hit count and
+                // recency of every expert this token routed through.  The
+                // recency clock is `step`, copied before the field-split so
+                // the loop can read it without touching `self.step`.
+                let hits = &mut self.expert_hits[i];
+                let used = &mut self.expert_last_used[i];
+                for &e in &last_routed[i] {
+                    let e = e as usize;
+                    if e < hits.len() {
+                        hits[e] = hits[e].saturating_add(1);
+                        used[e] = step;
+                    }
+                }
+            }
             xs = hc_post(&h, &residual, &post, &comb)?;
             if let Some((_, m, _)) = prof.as_mut() {
                 m.push(t_moe.elapsed().as_secs_f64());

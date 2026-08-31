@@ -401,6 +401,21 @@ impl QuantizedModel {
         }
     }
 
+    /// Pass the routing-frequency hot-expert cache budget to loaders that
+    /// implement it (`deepseek4`); other architectures ignore the request.
+    ///
+    /// The budget is applied after load so the loader's signature stays
+    /// stable for every other architecture and for tests.
+    pub fn set_pin_hot_experts(&mut self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        match self {
+            Self::DeepSeek4(m) => m.set_pin_hot_experts(n),
+            _ => {}
+        }
+    }
+
     /// Clear the KV cache so the instance can serve an unrelated prompt,
     /// where the underlying candle model supports it.
     ///

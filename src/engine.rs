@@ -331,6 +331,25 @@ pub struct EngineOptions {
     /// silently capped — apply `sudo prlimit --pid <user manager> --memlock=-1:-1`
     /// for a live fix, or re-login.
     pub mlock_hot_weights: MlockMode,
+    /// Keep the `N` most frequently routed experts resident (a
+    /// routing-frequency LRU cache).
+    ///
+    /// Sparse MoE models far larger than RAM (DeepSeek-V4-Flash, ...)
+    /// demand-fault their routed-expert weights from the mapping on every
+    /// token; routing is temporally local, so a small fraction of experts
+    /// carries most of the traffic.  When this is non-zero, the engine
+    /// records which experts each token routes through and, every
+    /// [`crate::quantized_deepseek4::HOT_EXPERTS_REFRESH_STEPS`] decode
+    /// steps, re-selects the `N` most-used experts (recency as the tie-break)
+    /// and issues a best-effort `MADV_WILLNEED` on their weight pages, so the
+    /// hot set stays resident in the page cache instead of faulting from disk
+    /// on every step.  Advisory: under memory pressure the kernel may still
+    /// evict clean pages, so size the budget below the free RAM.
+    ///
+    /// `0` disables the cache.  Currently wired for the `deepseek4` loader
+    /// (the routed-expert architecture Joshua implements with per-expert
+    /// prefetch handles); other architectures ignore the setting.
+    pub pin_hot_experts: usize,
 }
 
 impl EngineOptions {
@@ -385,6 +404,13 @@ impl EngineOptions {
     /// [`EngineOptions::mlock_hot_weights`] and [`MlockMode`].
     pub fn mlock_hot_weights(mut self, mode: MlockMode) -> Self {
         self.mlock_hot_weights = mode;
+        self
+    }
+
+    /// Keep the `n` most frequently routed experts resident.  See
+    /// [`EngineOptions::pin_hot_experts`].
+    pub fn pin_hot_experts(mut self, n: usize) -> Self {
+        self.pin_hot_experts = n;
         self
     }
 }
@@ -458,6 +484,9 @@ pub struct Engine {
     model_name: String,
     /// Context-window size in tokens.
     n_ctx: u32,
+    /// Routing-frequency hot-expert cache budget (see
+    /// [`EngineOptions::pin_hot_experts`]).
+    pin_hot_experts: usize,
     /// Compute device: CUDA or Metal when built with the matching feature
     /// (falling back to CPU if unavailable at runtime), CPU otherwise.
     device: Device,
@@ -759,6 +788,7 @@ impl Engine {
         } else {
             options.n_ctx
         };
+        let pin_hot_experts = options.pin_hot_experts;
         let raw_path = model_path.as_ref().to_path_buf();
 
         // Resolve the actual .gguf file path.
@@ -926,6 +956,7 @@ impl Engine {
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             model_name,
             n_ctx,
+            pin_hot_experts,
             device,
             arch_error,
         })
@@ -1841,14 +1872,16 @@ impl Engine {
             .map_err(|e| JoshuaError::ModelLoad(format!("GGUF read failed: {e}")))?;
         // Hand the loader the mapping so architectures Joshua implements
         // itself can borrow weights in place rather than copying them.
-        QuantizedModel::from_gguf_mmap(
+        let mut model = QuantizedModel::from_gguf_mmap(
             gguf,
             &mut cursor,
             &self.device,
             Some(Arc::clone(&self.mmap)),
             self.model_file.clone(),
         )
-        .map_err(|e| JoshuaError::ModelLoad(format!("model init failed: {e}")))
+        .map_err(|e| JoshuaError::ModelLoad(format!("model init failed: {e}")))?;
+        model.set_pin_hot_experts(self.pin_hot_experts);
+        Ok(model)
     }
 
     /// Scan `response` for any configured stop sequence and truncate it.

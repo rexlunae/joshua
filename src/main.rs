@@ -174,6 +174,11 @@ enum Commands {
         /// `--pin-hot-weights=false` to force it off.
         #[arg(long, env = "JOSHUA_PIN_HOT_WEIGHTS", num_args = 0..=1, default_missing_value = "true")]
         pin_hot_weights: Option<bool>,
+        /// Keep the N most frequently routed experts resident (routing-
+        /// frequency LRU; recency as the tie-break).  0 disables.  Currently
+        /// wired for the deepseek4 architecture.
+        #[arg(long, env = "JOSHUA_PIN_HOT_EXPERTS", default_value_t = 0)]
+        pin_hot_experts: usize,
         /// Lock the always-touched weights into RAM (mlock).  Needs the
         /// process memlock limit to cover the hot set: `LimitMEMLOCK=infinity`
         /// (systemd), `ulimit -l unlimited`, or /etc/security/limits.conf.
@@ -261,6 +266,11 @@ enum Commands {
         /// larger than RAM; pass `--pin-hot-weights=false` to force it off.
         #[arg(long, env = "JOSHUA_PIN_HOT_WEIGHTS", num_args = 0..=1, default_missing_value = "true")]
         pin_hot_weights: Option<bool>,
+        /// Keep the N most frequently routed experts resident (routing-
+        /// frequency LRU; recency as the tie-break).  0 disables.  Currently
+        /// wired for the deepseek4 architecture.
+        #[arg(long, env = "JOSHUA_PIN_HOT_EXPERTS", default_value_t = 0)]
+        pin_hot_experts: usize,
         /// Lock the always-touched weights into RAM (mlock).  Needs the
         /// process memlock limit to cover the hot set: `LimitMEMLOCK=infinity`
         /// (systemd), `ulimit -l unlimited`, or /etc/security/limits.conf.
@@ -327,6 +337,7 @@ async fn main() -> anyhow::Result<()> {
             lazy_weights,
             prefetch_model,
             pin_hot_weights,
+            pin_hot_experts,
             mlock_hot_weights,
             npu_plugin,
             npu_in_process,
@@ -356,6 +367,7 @@ async fn main() -> anyhow::Result<()> {
                 .lazy_weights(lazy_weights)
                 .prefetch_whole_model(prefetch)
                 .pin_hot_weights(pin_hot)
+                .pin_hot_experts(pin_hot_experts)
                 .mlock_hot_weights(
                     mlock_hot_weights
                         .map(MlockMode::from)
@@ -420,6 +432,7 @@ async fn main() -> anyhow::Result<()> {
             lazy_weights,
             prefetch_model,
             pin_hot_weights,
+            pin_hot_experts,
             mlock_hot_weights,
             npu_plugin,
             npu_in_process,
@@ -434,6 +447,7 @@ async fn main() -> anyhow::Result<()> {
                 .lazy_weights(lazy_weights)
                 .prefetch_whole_model(prefetch)
                 .pin_hot_weights(pin_hot)
+                .pin_hot_experts(pin_hot_experts)
                 .mlock_hot_weights(
                     mlock_hot_weights
                         .map(MlockMode::from)
