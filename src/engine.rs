@@ -351,6 +351,13 @@ pub struct EngineOptions {
     /// prefetch handles; other architectures — including Mixtral through the
     /// vendored candle `llama` loader — ignore the setting.
     pub pin_hot_experts: usize,
+    /// Size the hot-expert cache automatically at load (phase 5 of the
+    /// device expert cache design): the budget is computed from available
+    /// memory, the model's per-expert bytes and the residency backend's
+    /// capacity via [`crate::placement::expert_budget_for_memory`], instead
+    /// of taking [`EngineOptions::pin_hot_experts`] verbatim.  `auto` sizing
+    /// wins when set; `pin_hot_experts` remains the explicit override.
+    pub expert_cache_auto: bool,
 }
 
 impl EngineOptions {
@@ -412,6 +419,13 @@ impl EngineOptions {
     /// [`EngineOptions::pin_hot_experts`].
     pub fn pin_hot_experts(mut self, n: usize) -> Self {
         self.pin_hot_experts = n;
+        self
+    }
+
+    /// Size the hot-expert cache automatically at load.  See
+    /// [`EngineOptions::expert_cache_auto`].
+    pub fn expert_cache_auto(mut self, auto: bool) -> Self {
+        self.expert_cache_auto = auto;
         self
     }
 }
@@ -488,6 +502,9 @@ pub struct Engine {
     /// Routing-frequency hot-expert cache budget (see
     /// [`EngineOptions::pin_hot_experts`]).
     pin_hot_experts: usize,
+    /// Whether the budget is sized automatically at load (see
+    /// [`EngineOptions::expert_cache_auto`]).
+    expert_cache_auto: bool,
     /// Compute device: CUDA or Metal when built with the matching feature
     /// (falling back to CPU if unavailable at runtime), CPU otherwise.
     device: Device,
@@ -790,6 +807,7 @@ impl Engine {
             options.n_ctx
         };
         let pin_hot_experts = options.pin_hot_experts;
+        let expert_cache_auto = options.expert_cache_auto;
         let raw_path = model_path.as_ref().to_path_buf();
 
         // Resolve the actual .gguf file path.
@@ -958,6 +976,7 @@ impl Engine {
             model_name,
             n_ctx,
             pin_hot_experts,
+            expert_cache_auto,
             device,
             arch_error,
         })
@@ -1881,8 +1900,37 @@ impl Engine {
             self.model_file.clone(),
         )
         .map_err(|e| JoshuaError::ModelLoad(format!("model init failed: {e}")))?;
-        model.set_pin_hot_experts(self.pin_hot_experts);
+        let budget = if self.expert_cache_auto {
+            self.auto_expert_budget(&model)
+        } else {
+            self.pin_hot_experts
+        };
+        model.set_pin_hot_experts(budget);
         Ok(model)
+    }
+
+    /// Phase-5 automatic sizing: pick the hot-expert budget from available
+    /// memory, the per-expert byte size (model file / residency capacity) and
+    /// a fixed headroom for the KV cache and the OS.
+    fn auto_expert_budget(&self, model: &QuantizedModel) -> usize {
+        let Some(free) = crate::placement::available_ram_bytes() else {
+            tracing::info!("expert cache auto: no memory probe — leaving the budget 0");
+            return 0;
+        };
+        let capacity = model.expert_residency_capacity();
+        if capacity == 0 {
+            tracing::info!("expert cache auto: no mmap-backed experts — leaving the budget 0");
+            return 0;
+        }
+        let expert_bytes = (self.mmap.len() / capacity) as u64;
+        let budget =
+            crate::placement::expert_budget_for_memory(free, expert_bytes, capacity, AUTO_EXPERT_HEADROOM);
+        tracing::info!(
+            "expert cache auto: {budget} experts from {:.1} GiB free (expert ~{:.1} MiB, capacity {capacity})",
+            free as f64 / 2f64.powi(30),
+            expert_bytes as f64 / 2f64.powi(20),
+        );
+        budget
     }
 
     /// Scan `response` for any configured stop sequence and truncate it.
@@ -1922,6 +1970,10 @@ fn resolve_message_media(messages: &[ChatMessage]) -> Result<(Vec<ChatMessage>, 
     }
     Ok((marked, images))
 }
+
+/// Memory reserved for the KV cache and the OS when auto-sizing the expert
+/// cache (see [`Engine::auto_expert_budget`]).
+const AUTO_EXPERT_HEADROOM: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Maximum size of a decoded inline image, as a defence-in-depth cap on
 /// top of the HTTP body limit.  16 MiB comfortably covers any real photo.

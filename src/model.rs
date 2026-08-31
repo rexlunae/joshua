@@ -420,6 +420,17 @@ impl QuantizedModel {
         }
     }
 
+    /// Number of experts the residency backend can hold resident (a phase-5
+    /// auto-sizing input); 0 for architectures without per-expert handles.
+    pub fn expert_residency_capacity(&self) -> usize {
+        match self {
+            Self::DeepSeek2(m) => m.expert_residency_capacity(),
+            Self::DeepSeek4(m) => m.expert_residency_capacity(),
+            Self::Qwen3Moe(m) => m.expert_residency_capacity(),
+            _ => 0,
+        }
+    }
+
     /// Clear the KV cache so the instance can serve an unrelated prompt,
     /// where the underlying candle model supports it.
     ///

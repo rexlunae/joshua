@@ -118,6 +118,28 @@ impl From<MlockArg> for MlockMode {
     }
 }
 
+/// `--expert-cache` value: `auto` (size the budget from memory at load) or a
+/// fixed expert count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExpertCacheArg {
+    Auto,
+    Count(usize),
+}
+
+impl std::str::FromStr for ExpertCacheArg {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.eq_ignore_ascii_case("auto") {
+            Ok(Self::Auto)
+        } else {
+            s.parse::<usize>()
+                .map(Self::Count)
+                .map_err(|_| "expected `auto` or a number of experts".to_string())
+        }
+    }
+}
+
 /// An mmap-based LLM inference engine — a Rust clone of Cactus.
 #[derive(Parser)]
 #[command(name = "joshua", version, about, long_about = None)]
@@ -179,6 +201,10 @@ enum Commands {
         /// the joshua-native MoE loaders (deepseek2, deepseek4, qwen3moe).
         #[arg(long, env = "JOSHUA_PIN_HOT_EXPERTS", default_value_t = 0)]
         pin_hot_experts: usize,
+        /// Size the hot-expert cache automatically at load (`auto`), or set a
+        /// fixed expert count.  Overrides --pin-hot-experts when given a count.
+        #[arg(long, env = "JOSHUA_EXPERT_CACHE", value_parser = clap::value_parser!(ExpertCacheArg))]
+        expert_cache: Option<ExpertCacheArg>,
         /// Lock the always-touched weights into RAM (mlock).  Needs the
         /// process memlock limit to cover the hot set: `LimitMEMLOCK=infinity`
         /// (systemd), `ulimit -l unlimited`, or /etc/security/limits.conf.
@@ -271,6 +297,10 @@ enum Commands {
         /// the joshua-native MoE loaders (deepseek2, deepseek4, qwen3moe).
         #[arg(long, env = "JOSHUA_PIN_HOT_EXPERTS", default_value_t = 0)]
         pin_hot_experts: usize,
+        /// Size the hot-expert cache automatically at load (`auto`), or set a
+        /// fixed expert count.  Overrides --pin-hot-experts when given a count.
+        #[arg(long, env = "JOSHUA_EXPERT_CACHE", value_parser = clap::value_parser!(ExpertCacheArg))]
+        expert_cache: Option<ExpertCacheArg>,
         /// Lock the always-touched weights into RAM (mlock).  Needs the
         /// process memlock limit to cover the hot set: `LimitMEMLOCK=infinity`
         /// (systemd), `ulimit -l unlimited`, or /etc/security/limits.conf.
@@ -338,6 +368,7 @@ async fn main() -> anyhow::Result<()> {
             prefetch_model,
             pin_hot_weights,
             pin_hot_experts,
+            expert_cache,
             mlock_hot_weights,
             npu_plugin,
             npu_in_process,
@@ -360,6 +391,11 @@ async fn main() -> anyhow::Result<()> {
             let (auto_pin, auto_prefetch) = cache_plan(&model);
             let pin_hot = pin_hot_weights.unwrap_or(auto_pin);
             let prefetch = prefetch_model.unwrap_or(auto_prefetch);
+            let (pin_hot_experts, expert_cache_auto) = match expert_cache {
+                Some(ExpertCacheArg::Auto) => (pin_hot_experts, true),
+                Some(ExpertCacheArg::Count(n)) => (n, false),
+                None => (pin_hot_experts, false),
+            };
             let opts = EngineOptions::with_n_ctx(n_ctx)
                 .backend(device.into())
                 .huge_pages(huge_pages.into())
@@ -368,6 +404,7 @@ async fn main() -> anyhow::Result<()> {
                 .prefetch_whole_model(prefetch)
                 .pin_hot_weights(pin_hot)
                 .pin_hot_experts(pin_hot_experts)
+                .expert_cache_auto(expert_cache_auto)
                 .mlock_hot_weights(
                     mlock_hot_weights
                         .map(MlockMode::from)
@@ -433,6 +470,7 @@ async fn main() -> anyhow::Result<()> {
             prefetch_model,
             pin_hot_weights,
             pin_hot_experts,
+            expert_cache,
             mlock_hot_weights,
             npu_plugin,
             npu_in_process,
@@ -440,6 +478,11 @@ async fn main() -> anyhow::Result<()> {
             let (auto_pin, auto_prefetch) = cache_plan(&model);
             let pin_hot = pin_hot_weights.unwrap_or(auto_pin);
             let prefetch = prefetch_model.unwrap_or(auto_prefetch);
+            let (pin_hot_experts, expert_cache_auto) = match expert_cache {
+                Some(ExpertCacheArg::Auto) => (pin_hot_experts, true),
+                Some(ExpertCacheArg::Count(n)) => (n, false),
+                None => (pin_hot_experts, false),
+            };
             let opts = EngineOptions::with_n_ctx(n_ctx)
                 .backend(device.into())
                 .huge_pages(huge_pages.into())
@@ -448,6 +491,7 @@ async fn main() -> anyhow::Result<()> {
                 .prefetch_whole_model(prefetch)
                 .pin_hot_weights(pin_hot)
                 .pin_hot_experts(pin_hot_experts)
+                .expert_cache_auto(expert_cache_auto)
                 .mlock_hot_weights(
                     mlock_hot_weights
                         .map(MlockMode::from)

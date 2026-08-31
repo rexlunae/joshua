@@ -2049,6 +2049,12 @@ impl ModelWeights {
         self.hot_experts.set_budget(n);
     }
 
+    /// Number of experts the residency backend can hold resident
+    /// (informational on CPU; a phase-5 auto-sizing input on devices).
+    pub fn expert_residency_capacity(&self) -> usize {
+        self.residency.capacity()
+    }
+
     /// Forward pass. `input` is `[1, seq_len]`; `offset` is the KV-cache
     /// position of the first input token.
     pub fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {
