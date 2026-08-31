@@ -421,13 +421,7 @@ struct Mlp {
     /// When the weights are borrowed from the model mapping, handles that
     /// can `MADV_WILLNEED` the gate/up/down byte ranges ahead of a matmul.
     /// `None` for streamed/fallback loads (weights are plain memory then).
-    prefetch: Option<MlpPrefetch>,
-}
-
-struct MlpPrefetch {
-    gate: Arc<dyn crate::mmap_tensor::MmapPrefetch>,
-    up: Arc<dyn crate::mmap_tensor::MmapPrefetch>,
-    down: Arc<dyn crate::mmap_tensor::MmapPrefetch>,
+    prefetch: Option<crate::residency::ExpertHandles>,
 }
 
 /// One expert's weight tensor: the [`QMatMul`] plus an optional handle for
@@ -1567,8 +1561,11 @@ pub struct ModelWeights {
     /// after load via [`ModelWeights::set_pin_hot_experts`], CLI flag
     /// `--pin-hot-experts`).  Records routing, re-selects the hot set every
     /// [`crate::hot_experts::REFRESH_STEPS`] decode steps, and reports newly
-    /// hot experts for [`ModelWeights::prefetch_expert`].
+    /// hot experts for the residency backend.
     hot_experts: crate::hot_experts::HotExpertCache,
+    /// Executes residency for the hot set (CPU madvise today; a device slot
+    /// cache later).  Built once at load from the per-expert handles.
+    residency: std::sync::Arc<dyn crate::residency::ExpertResidency>,
 }
 
 /// Small GGUF reader over the memory-mapped file.
@@ -1973,6 +1970,17 @@ impl ModelWeights {
 
         let n_layers = layers.len();
         let n_expert = cfg.n_expert;
+        let residency: std::sync::Arc<dyn crate::residency::ExpertResidency> =
+            std::sync::Arc::new(crate::residency::CpuResidency::new(
+                layers
+                    .iter()
+                    .map(|layer| {
+                        // Every layer of this architecture carries an MoE block.
+                        let FeedForward::Moe(moe) = &layer.ffn;
+                        moe.experts.iter().map(|m| m.prefetch.clone()).collect()
+                    })
+                    .collect(),
+            ));
         Ok(Self {
             tok_embeddings,
             layers,
@@ -1992,6 +2000,7 @@ impl ModelWeights {
             layer_expert_ranges,
             last_routed: vec![Vec::new(); n_layers],
             hot_experts: crate::hot_experts::HotExpertCache::new(n_layers, n_expert, 0),
+            residency,
         })
     }
 
@@ -2038,19 +2047,6 @@ impl ModelWeights {
     /// [`crate::hot_experts::REFRESH_STEPS`] decode steps.
     pub fn set_pin_hot_experts(&mut self, n: usize) {
         self.hot_experts.set_budget(n);
-    }
-
-    /// Prefetch one reported-hot expert's weight pages (best-effort
-    /// `MADV_WILLNEED` via its per-tensor handles; a no-op for layers
-    /// without mmap-backed experts).
-    fn prefetch_expert(&self, layer: u32, expert: u32) {
-        if let Some(layer) = self.layers.get(layer as usize) {
-            // Every layer of this architecture carries an MoE block.
-            let FeedForward::Moe(moe) = &layer.ffn;
-            if let Some(exp) = moe.experts.get(expert as usize) {
-                exp.prefetch();
-            }
-        }
     }
 
     /// Forward pass. `input` is `[1, seq_len]`; `offset` is the KV-cache
@@ -2111,7 +2107,7 @@ impl ModelWeights {
         let step = self.hot_experts.begin_step(seq_len == 1);
         if self.hot_experts.refresh_due(seq_len == 1) {
             for (l, e) in self.hot_experts.refresh() {
-                self.prefetch_expert(l, e);
+                self.residency.acquire(l, e);
             }
         }
 
@@ -2545,7 +2541,7 @@ fn load_moe<R: Read + Seek>(
         .zip(down_exps)
         .map(|((gate, up), down)| {
             let prefetch = match (&gate.prefetch, &up.prefetch, &down.prefetch) {
-                (Some(g), Some(u), Some(d)) => Some(MlpPrefetch {
+                (Some(g), Some(u), Some(d)) => Some(crate::residency::ExpertHandles {
                     gate: g.clone(),
                     up: u.clone(),
                     down: d.clone(),
