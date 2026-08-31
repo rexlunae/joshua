@@ -5,7 +5,7 @@
 
 **Status:** design + phased implementation.  Phase 1 (residency seam) and
 phase 5 core (placement math) are merged; the CUDA/ROCm-dependent phases are
-tracked future work in [issue #51](https://github.com/rexlunae/joshua/issues/51).
+tracked future work in [issue #52](https://github.com/rexlunae/joshua/issues/52).
 
 | Phase | What | Status |
 |---|---|---|
