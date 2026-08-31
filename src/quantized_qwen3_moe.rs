@@ -503,12 +503,6 @@ impl Attention {
 
 // ─── Mixture of experts (Qwen3MoE routing) ──────────────────────────────────
 
-struct MlpPrefetch {
-    gate: Arc<dyn crate::mmap_tensor::MmapPrefetch>,
-    up: Arc<dyn crate::mmap_tensor::MmapPrefetch>,
-    down: Arc<dyn crate::mmap_tensor::MmapPrefetch>,
-}
-
 struct Mlp {
     gate: Weight,
     up: Weight,
@@ -516,7 +510,7 @@ struct Mlp {
     /// Per-tensor byte-range handles for best-effort page prefetch, present
     /// only when the weights are borrowed from the model mapping (absent for
     /// zero-copy Metal buffers and streamed loads).
-    prefetch: Option<MlpPrefetch>,
+    prefetch: Option<crate::residency::ExpertHandles>,
 }
 
 impl Mlp {
@@ -697,8 +691,11 @@ pub struct GGUFQWenMoE {
     /// after load via [`GGUFQWenMoE::set_pin_hot_experts`], CLI flag
     /// `--pin-hot-experts`).  Records routing, re-selects the hot set every
     /// [`crate::hot_experts::REFRESH_STEPS`] decode steps, and reports newly
-    /// hot experts for [`GGUFQWenMoE::prefetch_expert`].
+    /// hot experts for the residency backend.
     hot_experts: crate::hot_experts::HotExpertCache,
+    /// Executes residency for the hot set (CPU madvise today; a device slot
+    /// cache later).  Built once at load from the per-expert handles.
+    residency: std::sync::Arc<dyn crate::residency::ExpertResidency>,
 }
 
 /// Slice a 3-D expert tensor `[n_expert, out, in]` into per-expert [`Weight`]s
@@ -836,7 +833,9 @@ fn load_moe<R: Read + Seek>(rd: &mut Reader<R>, p: &str, cfg: &Config) -> Result
             up: up.0,
             down: down.0,
             prefetch: match (gate.1, up.1, down.1) {
-                (Some(gate), Some(up), Some(down)) => Some(MlpPrefetch { gate, up, down }),
+                (Some(gate), Some(up), Some(down)) => {
+                    Some(crate::residency::ExpertHandles { gate, up, down })
+                }
                 _ => None,
             },
         })
@@ -941,6 +940,13 @@ impl GGUFQWenMoE {
         }
 
         let n_layers = layers.len();
+        let residency: std::sync::Arc<dyn crate::residency::ExpertResidency> =
+            std::sync::Arc::new(crate::residency::CpuResidency::new(
+                layers
+                    .iter()
+                    .map(|layer| layer.ffn.experts.iter().map(|m| m.prefetch.clone()).collect())
+                    .collect(),
+            ));
         Ok(Self {
             tok_embeddings,
             layers,
@@ -952,6 +958,7 @@ impl GGUFQWenMoE {
                 cfg.n_expert,
                 0,
             ),
+            residency,
         })
     }
 
@@ -992,7 +999,7 @@ impl GGUFQWenMoE {
         let step = self.hot_experts.begin_step(seq_len == 1);
         if self.hot_experts.refresh_due(seq_len == 1) {
             for (l, e) in self.hot_experts.refresh() {
-                self.prefetch_expert(l, e);
+                self.residency.acquire(l, e);
             }
         }
 
@@ -1024,17 +1031,6 @@ impl GGUFQWenMoE {
     /// [`crate::hot_experts::REFRESH_STEPS`] decode steps.
     pub fn set_pin_hot_experts(&mut self, n: usize) {
         self.hot_experts.set_budget(n);
-    }
-
-    /// Prefetch one reported-hot expert's weight pages (best-effort
-    /// `MADV_WILLNEED` via its per-tensor handles; a no-op for experts whose
-    /// weights are not mmap-backed, e.g. zero-copy Metal buffers).
-    fn prefetch_expert(&self, layer: u32, expert: u32) {
-        if let Some(layer) = self.layers.get(layer as usize) {
-            if let Some(exp) = layer.ffn.experts.get(expert as usize) {
-                exp.prefetch();
-            }
-        }
     }
 
     /// Reset the KV cache so this instance can serve an unrelated prompt.
