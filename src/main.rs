@@ -175,8 +175,8 @@ enum Commands {
         #[arg(long, env = "JOSHUA_PIN_HOT_WEIGHTS", num_args = 0..=1, default_missing_value = "true")]
         pin_hot_weights: Option<bool>,
         /// Keep the N most frequently routed experts resident (routing-
-        /// frequency LRU; recency as the tie-break).  0 disables.  Currently
-        /// wired for the deepseek4 architecture.
+        /// frequency LRU; recency as the tie-break).  0 disables.  Wired for
+        /// the joshua-native MoE loaders (deepseek2, deepseek4, qwen3moe).
         #[arg(long, env = "JOSHUA_PIN_HOT_EXPERTS", default_value_t = 0)]
         pin_hot_experts: usize,
         /// Lock the always-touched weights into RAM (mlock).  Needs the
@@ -267,8 +267,8 @@ enum Commands {
         #[arg(long, env = "JOSHUA_PIN_HOT_WEIGHTS", num_args = 0..=1, default_missing_value = "true")]
         pin_hot_weights: Option<bool>,
         /// Keep the N most frequently routed experts resident (routing-
-        /// frequency LRU; recency as the tie-break).  0 disables.  Currently
-        /// wired for the deepseek4 architecture.
+        /// frequency LRU; recency as the tie-break).  0 disables.  Wired for
+        /// the joshua-native MoE loaders (deepseek2, deepseek4, qwen3moe).
         #[arg(long, env = "JOSHUA_PIN_HOT_EXPERTS", default_value_t = 0)]
         pin_hot_experts: usize,
         /// Lock the always-touched weights into RAM (mlock).  Needs the

@@ -340,10 +340,19 @@ fn yarn_linear_ramp(min: f32, mut max: f32, dim: usize) -> Vec<f32> {
 // ─── Linear helpers ─────────────────────────────────────────────────────────
 
 /// SwiGLU MLP over quantized weights (dense layers and shared experts).
+struct MlpPrefetch {
+    gate: Arc<dyn crate::mmap_tensor::MmapPrefetch>,
+    up: Arc<dyn crate::mmap_tensor::MmapPrefetch>,
+    down: Arc<dyn crate::mmap_tensor::MmapPrefetch>,
+}
+
 struct Mlp {
     gate: QMatMul,
     up: QMatMul,
     down: QMatMul,
+    /// Per-tensor byte-range handles for best-effort page prefetch, present
+    /// only when the weights are borrowed from the model mapping.
+    prefetch: Option<MlpPrefetch>,
 }
 
 impl Mlp {
@@ -351,6 +360,16 @@ impl Mlp {
         let gate = candle_nn::ops::silu(&self.gate.forward(xs)?)?;
         let up = self.up.forward(xs)?;
         self.down.forward(&(gate * up)?)
+    }
+
+    /// Ask the kernel to prefetch this expert's weight pages (best effort;
+    /// no-op when the weights are not mmap-backed).
+    fn prefetch(&self) {
+        if let Some(p) = &self.prefetch {
+            p.gate.prefetch();
+            p.up.prefetch();
+            p.down.prefetch();
+        }
     }
 }
 
@@ -549,7 +568,7 @@ struct Moe {
 }
 
 impl Moe {
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+    fn forward(&self, xs: &Tensor) -> Result<(Tensor, Vec<u32>)> {
         let (b, seq_len, h) = xs.dims3()?;
         let n_tokens = b * seq_len;
         let x2 = xs.reshape((n_tokens, h))?;
@@ -581,11 +600,12 @@ impl Moe {
         }
 
         let routed = self.dispatch(&x2, &topk_idx, &weights, n_tokens)?;
+        let ids: Vec<u32> = topk_idx.flatten_all()?.to_vec1()?;
         let mut out = routed;
         if let Some(shared) = &self.shared {
             out = (out + shared.forward(&x2)?)?;
         }
-        out.reshape((b, seq_len, h))
+        Ok((out.reshape((b, seq_len, h))?, ids))
     }
 
     /// Zero out experts outside the top `topk_group` groups (scored by the sum
@@ -725,6 +745,15 @@ impl FeedForward {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         match self {
             Self::Dense(m) => m.forward(xs),
+            Self::Moe(m) => m.forward(xs).map(|(t, _)| t),
+        }
+    }
+
+    /// [`FeedForward::forward`] plus the routed-expert ids this input used
+    /// (empty for dense blocks) — the routing-frequency cache's input.
+    fn forward_routed(&self, xs: &Tensor) -> Result<(Tensor, Vec<u32>)> {
+        match self {
+            Self::Dense(m) => Ok((m.forward(xs)?, Vec::new())),
             Self::Moe(m) => m.forward(xs),
         }
     }
@@ -744,6 +773,12 @@ pub struct ModelWeights {
     norm: RmsNorm,
     output: QMatMul,
     device: Device,
+    /// Routing-frequency LRU hot-expert cache (shared bookkeeping; budget set
+    /// after load via [`ModelWeights::set_pin_hot_experts`], CLI flag
+    /// `--pin-hot-experts`).  Records routing, re-selects the hot set every
+    /// [`crate::hot_experts::REFRESH_STEPS`] decode steps, and reports newly
+    /// hot experts for [`ModelWeights::prefetch_expert`].
+    hot_experts: crate::hot_experts::HotExpertCache,
 }
 
 /// Small GGUF reader over the memory-mapped file.
@@ -795,6 +830,7 @@ impl<R: Read + Seek> Reader<R> {
             gate: self.qmatmul(&format!("{prefix}_gate.weight"))?,
             up: self.qmatmul(&format!("{prefix}_up.weight"))?,
             down: self.qmatmul(&format!("{prefix}_down.weight"))?,
+            prefetch: None,
         })
     }
 }
@@ -893,12 +929,18 @@ impl ModelWeights {
             });
         }
 
+        let n_layers = layers.len();
         Ok(Self {
             tok_embeddings,
             layers,
             norm,
             output,
             device: device.clone(),
+            hot_experts: crate::hot_experts::HotExpertCache::new(
+                n_layers,
+                cfg.n_expert,
+                0,
+            ),
         })
     }
 
@@ -930,7 +972,20 @@ impl ModelWeights {
             Some(self.causal_mask(seq_len, offset)?)
         };
 
-        for layer in self.layers.iter_mut() {
+        // Routing-frequency hot-expert cache: every
+        // crate::hot_experts::REFRESH_STEPS decode steps, re-select the
+        // most-used experts (recency as the tie-break) and WILLNEED their
+        // pages, so the common routing path stays resident instead of
+        // faulting from disk each step.  Runs before the layer loop so the
+        // prefetch has a full step of compute to stream in behind.
+        let step = self.hot_experts.begin_step();
+        if self.hot_experts.refresh_due(seq_len == 1) {
+            for (l, e) in self.hot_experts.refresh() {
+                self.prefetch_expert(l, e);
+            }
+        }
+
+        for (i, layer) in self.layers.iter_mut().enumerate() {
             let residual = &xs;
             let h = layer.attn_norm.forward(&xs)?;
             let h = layer.attn.forward(&h, mask.as_ref(), offset)?;
@@ -938,13 +993,35 @@ impl ModelWeights {
 
             let residual = &xs2;
             let h = layer.ffn_norm.forward(&xs2)?;
-            let h = layer.ffn.forward(&h)?;
+            let (h, routed) = layer.ffn.forward_routed(&h)?;
+            self.hot_experts.record(i, &routed, step);
             xs = (residual + h)?;
         }
 
         let xs = xs.narrow(1, seq_len - 1, 1)?;
         let xs = self.norm.forward(&xs)?;
         self.output.forward(&xs)?.to_dtype(DType::F32)?.squeeze(1)
+    }
+
+    /// Set the routing-frequency hot-expert cache budget (experts kept
+    /// resident).  Call once after load, before serving; routing is recorded
+    /// from the first forward pass and the pinned set is re-selected every
+    /// [`crate::hot_experts::REFRESH_STEPS`] decode steps.
+    pub fn set_pin_hot_experts(&mut self, n: usize) {
+        self.hot_experts.set_budget(n);
+    }
+
+    /// Prefetch one reported-hot expert's weight pages (best-effort
+    /// `MADV_WILLNEED` via its per-tensor handles; a no-op for experts whose
+    /// weights are not mmap-backed).
+    fn prefetch_expert(&self, layer: u32, expert: u32) {
+        if let Some(layer) = self.layers.get(layer as usize) {
+            if let FeedForward::Moe(moe) = &layer.ffn {
+                if let Some(exp) = moe.experts.get(expert as usize) {
+                    exp.prefetch();
+                }
+            }
+        }
     }
 
     /// Reset the KV cache so this instance can serve an unrelated prompt.
@@ -1015,7 +1092,15 @@ fn load_moe<R: Read + Seek>(rd: &mut Reader<R>, p: &str, cfg: &Config) -> Result
         .into_iter()
         .zip(up_exps)
         .zip(down_exps)
-        .map(|((gate, up), down)| Mlp { gate, up, down })
+        .map(|((gate, up), down)| Mlp {
+            gate: gate.qmatmul,
+            up: up.qmatmul,
+            down: down.qmatmul,
+            prefetch: match (gate.prefetch, up.prefetch, down.prefetch) {
+                (Some(gate), Some(up), Some(down)) => Some(MlpPrefetch { gate, up, down }),
+                _ => None,
+            },
+        })
         .collect();
 
     let shared = if cfg.n_expert_shared > 0 {
@@ -1023,6 +1108,7 @@ fn load_moe<R: Read + Seek>(rd: &mut Reader<R>, p: &str, cfg: &Config) -> Result
             gate: rd.qmatmul(&format!("{p}.ffn_gate_shexp.weight"))?,
             up: rd.qmatmul(&format!("{p}.ffn_up_shexp.weight"))?,
             down: rd.qmatmul(&format!("{p}.ffn_down_shexp.weight"))?,
+            prefetch: None,
         })
     } else {
         None
@@ -1045,11 +1131,18 @@ fn load_moe<R: Read + Seek>(rd: &mut Reader<R>, p: &str, cfg: &Config) -> Result
 /// Split a 3-D expert weight `[n_expert, out, in]` into `n_expert` quantized
 /// 2-D `QMatMul`s by carving its raw quantized byte-buffer — no dequantization,
 /// so the experts keep their on-disk size.
+/// One expert's weight: the [`QMatMul`] plus an optional handle for
+/// prefetching its byte range from the mapping.
+struct ExpertWeight {
+    qmatmul: QMatMul,
+    prefetch: Option<Arc<dyn crate::mmap_tensor::MmapPrefetch>>,
+}
+
 fn split_experts<R: Read + Seek>(
     rd: &mut Reader<R>,
     name: &str,
     n_expert: usize,
-) -> Result<Vec<QMatMul>> {
+) -> Result<Vec<ExpertWeight>> {
     let qt = rd.qtensor(name)?;
     let dims = qt.shape().dims().to_vec();
     if dims.len() != 3 || dims[0] != n_expert {
@@ -1084,7 +1177,15 @@ fn split_experts<R: Read + Seek>(
                         base + e * per_bytes,
                         (out, inn).into(),
                     )? {
-                        Some(t) => borrowed.push(QMatMul::from_qtensor(t)?),
+                        Some(t) => borrowed.push(ExpertWeight {
+                            qmatmul: QMatMul::from_qtensor(t)?,
+                            prefetch: crate::mmap_tensor::prefetch_handle(
+                                &mmap,
+                                dtype,
+                                base + e * per_bytes,
+                                per_elems / block_size,
+                            ),
+                        }),
                         // Any expert that cannot be borrowed (misalignment,
                         // truncated file) drops the whole layer to the copying
                         // path rather than mixing the two.
@@ -1114,7 +1215,10 @@ fn split_experts<R: Read + Seek>(
         let slice = &bytes[e * per..(e + 1) * per];
         let storage = QStorage::from_data(Cow::Borrowed(slice), &rd.device, dtype)?;
         let qt = QTensor::new(storage, (out, inn))?;
-        experts.push(QMatMul::from_qtensor(qt)?);
+        experts.push(ExpertWeight {
+            qmatmul: QMatMul::from_qtensor(qt)?,
+            prefetch: None,
+        });
     }
     Ok(experts)
 }
@@ -1317,6 +1421,7 @@ mod tests {
                 gate: lin(ffn, h),
                 up: lin(ffn, h),
                 down: lin(h, ffn),
+                prefetch: None,
             })
             .collect();
         let moe = Moe {
@@ -1334,12 +1439,12 @@ mod tests {
 
         // Batched path: 3 tokens in one forward (softmax routing per token).
         let xs = Tensor::randn(0f32, 1f32, (1, 3, h), &dev)?;
-        let out_batch = moe.forward(&xs)?; // [1, 3, h]
+        let (out_batch, _) = moe.forward(&xs)?; // [1, 3, h]
 
         // Decode path: same 3 tokens one at a time, concatenated.
         let mut out_inc = Vec::new();
         for t in 0..3 {
-            out_inc.push(moe.forward(&xs.narrow(1, t, 1)?)?); // [1, 1, h]
+            out_inc.push(moe.forward(&xs.narrow(1, t, 1)?)?.0); // [1, 1, h]
         }
         let out_inc = Tensor::cat(&out_inc, 1)?; // [1, 3, h]
 

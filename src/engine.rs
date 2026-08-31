@@ -334,21 +334,22 @@ pub struct EngineOptions {
     /// Keep the `N` most frequently routed experts resident (a
     /// routing-frequency LRU cache).
     ///
-    /// Sparse MoE models far larger than RAM (DeepSeek-V4-Flash, ...)
-    /// demand-fault their routed-expert weights from the mapping on every
-    /// token; routing is temporally local, so a small fraction of experts
-    /// carries most of the traffic.  When this is non-zero, the engine
-    /// records which experts each token routes through and, every
-    /// [`crate::quantized_deepseek4::HOT_EXPERTS_REFRESH_STEPS`] decode
-    /// steps, re-selects the `N` most-used experts (recency as the tie-break)
+    /// Sparse MoE models far larger than RAM (DeepSeek-V2/V3/V4,
+    /// Qwen3-MoE, …) demand-fault their routed-expert weights from the
+    /// mapping on every token; routing is temporally local, so a small
+    /// fraction of experts carries most of the traffic.  When this is
+    /// non-zero, the engine records which experts each token routes through
+    /// and, every [`crate::hot_experts::REFRESH_STEPS`] decode steps,
+    /// re-selects the `N` most-used experts (recency as the tie-break)
     /// and issues a best-effort `MADV_WILLNEED` on their weight pages, so the
     /// hot set stays resident in the page cache instead of faulting from disk
     /// on every step.  Advisory: under memory pressure the kernel may still
     /// evict clean pages, so size the budget below the free RAM.
     ///
-    /// `0` disables the cache.  Currently wired for the `deepseek4` loader
-    /// (the routed-expert architecture Joshua implements with per-expert
-    /// prefetch handles); other architectures ignore the setting.
+    /// `0` disables the cache.  Wired for the joshua-native MoE loaders
+    /// (`deepseek2`, `deepseek4`, `qwen3moe`), which carry per-expert
+    /// prefetch handles; other architectures — including Mixtral through the
+    /// vendored candle `llama` loader — ignore the setting.
     pub pin_hot_experts: usize,
 }
 

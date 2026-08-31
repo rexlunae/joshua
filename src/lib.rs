@@ -26,6 +26,7 @@ pub mod embedding;
 pub mod engine;
 pub mod error;
 pub mod gguf_ext;
+pub mod hot_experts;
 pub mod iq2xxs;
 pub mod kquant_dot;
 pub mod kimi_k3;
