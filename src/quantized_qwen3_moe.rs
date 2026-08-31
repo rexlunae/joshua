@@ -503,10 +503,20 @@ impl Attention {
 
 // ─── Mixture of experts (Qwen3MoE routing) ──────────────────────────────────
 
+struct MlpPrefetch {
+    gate: Arc<dyn crate::mmap_tensor::MmapPrefetch>,
+    up: Arc<dyn crate::mmap_tensor::MmapPrefetch>,
+    down: Arc<dyn crate::mmap_tensor::MmapPrefetch>,
+}
+
 struct Mlp {
     gate: Weight,
     up: Weight,
     down: Weight,
+    /// Per-tensor byte-range handles for best-effort page prefetch, present
+    /// only when the weights are borrowed from the model mapping (absent for
+    /// zero-copy Metal buffers and streamed loads).
+    prefetch: Option<MlpPrefetch>,
 }
 
 impl Mlp {
@@ -514,6 +524,16 @@ impl Mlp {
         let w1 = self.gate.forward(xs)?;
         let w3 = self.up.forward(xs)?;
         self.down.forward(&(silu(&w1)? * w3)?)
+    }
+
+    /// Ask the kernel to prefetch this expert's weight pages (best effort;
+    /// no-op when the weights are not mmap-backed).
+    fn prefetch(&self) {
+        if let Some(p) = &self.prefetch {
+            p.gate.prefetch();
+            p.up.prefetch();
+            p.down.prefetch();
+        }
     }
 }
 
@@ -525,14 +545,18 @@ struct Moe {
 }
 
 impl Moe {
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+    fn forward(&self, xs: &Tensor) -> Result<(Tensor, Vec<u32>)> {
         let _p = prof::Phase::start(&prof::MOE);
         let (b, seq_len, h) = xs.dims3()?;
         let n_tokens = b * seq_len;
         let x2 = xs.reshape((n_tokens, h))?;
         let (topk_idx, weights) = self.route(&x2)?;
-        let routed = self.dispatch(&x2, &topk_idx, &weights, n_tokens)?;
-        routed.reshape((b, seq_len, h))
+        // dispatch already drains the routed ids to the host for its own
+        // bucketing; reuse them for the hot-expert cache instead of a second
+        // device-to-host sync (which would cost a synchronization per layer
+        // even when the cache is disabled).
+        let (routed, ids) = self.dispatch(&x2, &topk_idx, &weights, n_tokens)?;
+        Ok((routed.reshape((b, seq_len, h))?, ids))
     }
 
     /// Router logits → softmax probs → top-k ids and gathered weights, with
@@ -564,7 +588,7 @@ impl Moe {
         topk_idx: &Tensor,
         weights: &Tensor,
         n_tokens: usize,
-    ) -> Result<Tensor> {
+    ) -> Result<(Tensor, Vec<u32>)> {
         if n_tokens == 1 {
             return self.dispatch_decode(x2, topk_idx, weights);
         }
@@ -613,7 +637,7 @@ impl Moe {
             y = y.index_add(&idx, &out.broadcast_mul(&w)?, 0)?;
         }
         drop(_p);
-        Ok(y)
+        Ok((y, ids))
     }
 
     /// Single-token decode dispatch.  With one token every selected expert
@@ -625,7 +649,7 @@ impl Moe {
         x2: &Tensor,
         topk_idx: &Tensor,
         weights: &Tensor,
-    ) -> Result<Tensor> {
+    ) -> Result<(Tensor, Vec<u32>)> {
         let k = self.n_expert_used;
         let ids: Vec<u32> = topk_idx.flatten_all()?.to_vec1()?; // [k] — the one host sync
         // NB: deliberately serial.  Candle's own CPU kernels already fan out
@@ -642,7 +666,7 @@ impl Moe {
         let out = Tensor::stack(&outs, 0)?; // [k, 1, h]
         let w = weights.reshape((k, 1, 1))?; // [k, 1, 1]
         let y = out.broadcast_mul(&w)?.sum(0)?; // [1, h]
-        Ok(y)
+        Ok((y, ids))
     }
 }
 
@@ -669,9 +693,16 @@ pub struct GGUFQWenMoE {
     norm: RmsNorm,
     output: Weight,
     device: Device,
+    /// Routing-frequency LRU hot-expert cache (shared bookkeeping; budget set
+    /// after load via [`GGUFQWenMoE::set_pin_hot_experts`], CLI flag
+    /// `--pin-hot-experts`).  Records routing, re-selects the hot set every
+    /// [`crate::hot_experts::REFRESH_STEPS`] decode steps, and reports newly
+    /// hot experts for [`GGUFQWenMoE::prefetch_expert`].
+    hot_experts: crate::hot_experts::HotExpertCache,
 }
 
-/// Slice a 3-D expert tensor `[n_expert, out, in]` into per-expert [`Weight`]s.
+/// Slice a 3-D expert tensor `[n_expert, out, in]` into per-expert [`Weight`]s
+/// plus an optional prefetch handle for the expert's bytes in the mapping.
 ///
 /// Preferred paths point each expert at its own bytes **without reading or
 /// copying anything**: on Metal via a no-copy buffer at the expert's file
@@ -683,7 +714,7 @@ fn split_experts<R: Read + Seek>(
     rd: &mut Reader<R>,
     name: &str,
     n_expert: usize,
-) -> Result<Vec<Weight>> {
+) -> Result<Vec<(Weight, Option<Arc<dyn crate::mmap_tensor::MmapPrefetch>>)>> {
     let dims = {
         let Some(info) = rd.ct.tensor_infos.get(name) else {
             candle_core::bail!("qwen3moe: missing tensor `{name}`");
@@ -707,13 +738,16 @@ fn split_experts<R: Read + Seek>(
             let per_bytes = per_elems / block_size * dtype.type_size();
             let mut experts = Vec::with_capacity(n_expert);
             for e in 0..n_expert {
-                experts.push(Weight::Zc(Arc::new(ZcWeight::expert(
-                    zc,
-                    info,
-                    rd.ct.tensor_data_offset,
-                    [out, inn],
-                    e * per_bytes,
-                )?)));
+                experts.push((
+                    Weight::Zc(Arc::new(ZcWeight::expert(
+                        zc,
+                        info,
+                        rd.ct.tensor_data_offset,
+                        [out, inn],
+                        e * per_bytes,
+                    )?)),
+                    None, // Metal no-copy buffers have no pages to advise.
+                ));
             }
             return Ok(experts);
         }
@@ -739,7 +773,15 @@ fn split_experts<R: Read + Seek>(
                         base + e * per_bytes,
                         (out, inn).into(),
                     )? {
-                        Some(t) => borrowed.push(Weight::Candle(QMatMul::from_qtensor(t)?)),
+                        Some(t) => borrowed.push((
+                            Weight::Candle(QMatMul::from_qtensor(t)?),
+                            crate::mmap_tensor::prefetch_handle(
+                                &mmap,
+                                dtype,
+                                base + e * per_bytes,
+                                per_elems / block_size,
+                            ),
+                        )),
                         // Any expert that cannot be borrowed (misalignment,
                         // truncated file) drops the whole layer to the copying
                         // path rather than mixing the two.
@@ -771,7 +813,7 @@ fn split_experts<R: Read + Seek>(
         let slice = &bytes[e * per..(e + 1) * per];
         let storage = QStorage::from_data(Cow::Borrowed(slice), &rd.device, dtype)?;
         let qt = QTensor::new(storage, (out, inn))?;
-        experts.push(Weight::Candle(QMatMul::from_qtensor(qt)?));
+        experts.push((Weight::Candle(QMatMul::from_qtensor(qt)?), None));
     }
     Ok(experts)
 }
@@ -789,7 +831,15 @@ fn load_moe<R: Read + Seek>(rd: &mut Reader<R>, p: &str, cfg: &Config) -> Result
         .into_iter()
         .zip(up_exps)
         .zip(down_exps)
-        .map(|((gate, up), down)| Mlp { gate, up, down })
+        .map(|((gate, up), down)| Mlp {
+            gate: gate.0,
+            up: up.0,
+            down: down.0,
+            prefetch: match (gate.1, up.1, down.1) {
+                (Some(gate), Some(up), Some(down)) => Some(MlpPrefetch { gate, up, down }),
+                _ => None,
+            },
+        })
         .collect();
 
     Ok(Moe {
@@ -890,12 +940,18 @@ impl GGUFQWenMoE {
             });
         }
 
+        let n_layers = layers.len();
         Ok(Self {
             tok_embeddings,
             layers,
             norm,
             output,
             device: device.clone(),
+            hot_experts: crate::hot_experts::HotExpertCache::new(
+                n_layers,
+                cfg.n_expert,
+                0,
+            ),
         })
     }
 
@@ -927,7 +983,20 @@ impl GGUFQWenMoE {
             Some(self.causal_mask(seq_len, offset)?)
         };
 
-        for layer in self.layers.iter_mut() {
+        // Routing-frequency hot-expert cache: every
+        // crate::hot_experts::REFRESH_STEPS decode steps, re-select the
+        // most-used experts (recency as the tie-break) and WILLNEED their
+        // pages, so the common routing path stays resident instead of
+        // faulting from disk each step.  Runs before the layer loop so the
+        // prefetch has a full step of compute to stream in behind.
+        let step = self.hot_experts.begin_step(seq_len == 1);
+        if self.hot_experts.refresh_due(seq_len == 1) {
+            for (l, e) in self.hot_experts.refresh() {
+                self.prefetch_expert(l, e);
+            }
+        }
+
+        for (i, layer) in self.layers.iter_mut().enumerate() {
             let residual = &xs;
             let h = layer.attn_norm.forward(&xs)?;
             let h = layer.attn.forward(&h, mask.as_ref(), offset)?;
@@ -935,7 +1004,8 @@ impl GGUFQWenMoE {
 
             let residual = &xs2;
             let h = layer.ffn_norm.forward(&xs2)?;
-            let h = layer.ffn.forward(&h)?;
+            let (h, routed) = layer.ffn.forward(&h)?;
+            self.hot_experts.record(i, &routed, step);
             xs = (residual + h)?;
         }
 
@@ -946,6 +1016,25 @@ impl GGUFQWenMoE {
         drop(_p);
         prof::report();
         out
+    }
+
+    /// Set the routing-frequency hot-expert cache budget (experts kept
+    /// resident).  Call once after load, before serving; routing is recorded
+    /// from the first forward pass and the pinned set is re-selected every
+    /// [`crate::hot_experts::REFRESH_STEPS`] decode steps.
+    pub fn set_pin_hot_experts(&mut self, n: usize) {
+        self.hot_experts.set_budget(n);
+    }
+
+    /// Prefetch one reported-hot expert's weight pages (best-effort
+    /// `MADV_WILLNEED` via its per-tensor handles; a no-op for experts whose
+    /// weights are not mmap-backed, e.g. zero-copy Metal buffers).
+    fn prefetch_expert(&self, layer: u32, expert: u32) {
+        if let Some(layer) = self.layers.get(layer as usize) {
+            if let Some(exp) = layer.ffn.experts.get(expert as usize) {
+                exp.prefetch();
+            }
+        }
     }
 
     /// Reset the KV cache so this instance can serve an unrelated prompt.
@@ -994,6 +1083,7 @@ mod tests {
                 gate: lin(nfe, h, &Tensor::randn(0f32, 1f32, (nfe, h), dev)?),
                 up: lin(nfe, h, &Tensor::randn(0f32, 1f32, (nfe, h), dev)?),
                 down: lin(h, nfe, &Tensor::randn(0f32, 1f32, (h, nfe), dev)?),
+                prefetch: None,
             });
         }
         Ok(Moe {
@@ -1060,8 +1150,8 @@ mod tests {
         let moe = tiny_moe(&dev, true)?;
         let row = Tensor::randn(0f32, 1f32, (1, 1, 8), &dev)?;
         let two = Tensor::cat(&[&row, &row], 1)?; // [1, 2, 8], identical rows
-        let out2 = moe.forward(&two)?; // prefill path (n_tokens = 2)
-        let out1 = moe.forward(&row)?; // decode path (n_tokens = 1)
+        let (out2, _) = moe.forward(&two)?; // prefill path (n_tokens = 2)
+        let (out1, _) = moe.forward(&row)?; // decode path (n_tokens = 1)
         let a: Vec<f32> = out2.narrow(1, 1, 1)?.flatten_all()?.to_vec1()?;
         let b: Vec<f32> = out1.flatten_all()?.to_vec1()?;
         for (x, y) in a.iter().zip(&b) {

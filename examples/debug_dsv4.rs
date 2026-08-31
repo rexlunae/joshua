@@ -52,6 +52,7 @@ fn main() -> anyhow::Result<()> {
         &mut cursor,
         &device,
         Some(Arc::clone(&mmap)),
+        None,
     )?;
     println!("model loaded");
 
