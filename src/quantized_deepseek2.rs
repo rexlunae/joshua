@@ -982,7 +982,7 @@ impl ModelWeights {
         // faulting from disk each step.  Runs before the layer loop so the
         // prefetch has a full step of compute to stream in behind.
         let step = self.hot_experts.begin_step(seq_len == 1);
-        if self.hot_experts.refresh_due() {
+        if self.hot_experts.refresh_due(seq_len == 1) {
             for (l, e) in self.hot_experts.refresh() {
                 self.prefetch_expert(l, e);
             }

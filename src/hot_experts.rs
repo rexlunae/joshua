@@ -121,8 +121,15 @@ impl HotExpertCache {
     /// Whether a decode-step refresh is due.  The clock only advances on
     /// decode steps, so the interval boundary can only be reached by decode
     /// activity.
-    pub fn refresh_due(&self) -> bool {
-        self.budget > 0 && self.step > 0 && self.step % REFRESH_STEPS == 0
+    /// Whether a decode-step refresh is due.  Pass `decode = seq_len == 1`.
+    ///
+    /// The decode gate is load-bearing, not just an optimization: the clock
+    /// only advances on decode steps, so after the 64th decode step it sits
+    /// exactly on the interval boundary — without the gate, every prefill
+    /// that follows would retrigger a refresh that was already completed
+    /// (the clock only moves again on the next decode).
+    pub fn refresh_due(&self, decode: bool) -> bool {
+        decode && self.budget > 0 && self.step > 0 && self.step % REFRESH_STEPS == 0
     }
 
     /// Re-select the hot set from routing frequency (recency as the
@@ -232,20 +239,46 @@ mod tests {
             let s = c.begin_step(false);
             c.record(0, &[1, 2], s);
         }
-        assert!(!c.refresh_due(), "prefills must not advance the decode clock");
+        assert!(!c.refresh_due(false), "prefills must not advance the decode clock");
         // Exactly four more decode steps reach the interval boundary.
         for _ in 0..4 {
             let s = c.begin_step(true);
             c.record(0, &[1], s);
         }
-        assert!(c.refresh_due(), "refresh due after exactly 64 decode steps");
+        assert!(c.refresh_due(true), "refresh due after exactly 64 decode steps");
+    }
+
+    /// A prefill that arrives while the decode clock sits on the refresh
+    /// boundary must not retrigger a refresh that was already completed.
+    #[test]
+    fn prefill_does_not_retrigger_refresh_at_boundary() {
+        let mut c = HotExpertCache::new(1, 4, 2);
+        c.set_budget(2);
+        for _ in 0..64 {
+            let s = c.begin_step(true);
+            c.record(0, &[1], s);
+        }
+        assert!(c.refresh_due(true), "boundary reached after 64 decode steps");
+        c.refresh();
+        // Prefills at the boundary must not re-issue the hot-set prefetch.
+        for _ in 0..5 {
+            let s = c.begin_step(false);
+            c.record(0, &[1, 2], s);
+            assert!(
+                !c.refresh_due(false),
+                "prefill must not retrigger a completed refresh"
+            );
+        }
+        // One more decode step moves the clock off the boundary.
+        let _ = c.begin_step(true);
+        assert!(!c.refresh_due(true), "step 65 is not an interval boundary");
     }
 
     /// Budget zero disables refresh; the cache stays inert.
     #[test]
     fn disabled_cache_noops() {
         let mut c = HotExpertCache::new(1, 4, 0);
-        assert!(!c.refresh_due());
+        assert!(!c.refresh_due(true));
         let s = c.begin_step(true);
         c.record(0, &[1], s);
         assert!(c.refresh().is_empty());
