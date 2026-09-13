@@ -1898,6 +1898,7 @@ impl Engine {
             &self.device,
             Some(Arc::clone(&self.mmap)),
             self.model_file.clone(),
+            self.n_ctx as usize,
         )
         .map_err(|e| JoshuaError::ModelLoad(format!("model init failed: {e}")))?;
         let budget = if self.expert_cache_auto {

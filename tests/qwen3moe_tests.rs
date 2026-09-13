@@ -115,6 +115,7 @@ fn qwen3moe_mmap_load_matches_heap_load() {
             &Device::Cpu,
             Some(std::sync::Arc::new(mmap)),
             None,
+            0,
         )
         .unwrap();
     let mapped_logits = logits(&mut mapped, &tokens, 0);

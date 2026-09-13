@@ -354,6 +354,10 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
+    // Opt-in P-core affinity (JOSHUA_CPU_AFFINITY), applied before any worker
+    // pool is created so every pool inherits the mask on Linux.
+    joshua::cpu_pinning::apply_p_core_affinity();
+
     let cli = Cli::parse();
 
     match cli.command {

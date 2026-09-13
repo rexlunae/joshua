@@ -22,6 +22,7 @@
 //! alongside the `.gguf` file so the engine can tokenise prompts.
 
 pub mod compression;
+pub mod cpu_pinning;
 pub mod embedding;
 pub mod engine;
 pub mod error;

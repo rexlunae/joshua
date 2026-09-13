@@ -906,7 +906,11 @@ impl Indexer {
         let dev = x.device();
         let n_lid = (offset + seq) / self.compressor.ratio;
         if n_lid == 0 {
-            return Tensor::zeros((seq, 0), DType::U32, dev);
+            // No compressed KV rows yet at this position.  An empty `[seq, 0]`
+            // tensor is only ever read back on the host in `build_kv` (dims +
+            // flatten), so allocate on CPU: on CUDA, `cuMemAlloc(0)` inside
+            // `Tensor::zeros` fails with CUDA_ERROR_INVALID_VALUE.
+            return Tensor::zeros((seq, 0), DType::U32, &Device::Cpu);
         }
         let q = self
             .attn_q_b
@@ -1087,20 +1091,30 @@ impl Attention {
         let k_win = k_src
             .index_select(&Tensor::from_vec(w_rows, (seq * win,), dev)?, 0)?
             .reshape((seq, win, d))?;
-        let k_comp = match (kv.comp.as_ref(), n_comp) {
-            (Some(c), n) if n > 0 => c
+        // A ratio-0 (sliding-window-only) layer has no compressed keys, so
+        // `n_comp` is 0.  Allocating `(seq, 0, d)` as a separate empty tensor
+        // is fine on the CPU backend but on CUDA it asks `cuMemAlloc(0)`,
+        // which fails with CUDA_ERROR_INVALID_VALUE.  Build the key/mask pair
+        // directly from the window rows in that case instead.
+        let k_all;
+        let mask;
+        if n_comp > 0 {
+            let c = kv.comp.as_ref().unwrap();
+            let k_comp = c
                 .index_select(&Tensor::from_vec(c_rows, (seq * n_comp,), dev)?, 0)?
-                .reshape((seq, n_comp, d))?,
-            _ => Tensor::zeros((seq, 0, d), DType::F32, dev)?,
-        };
-        let k_all = Tensor::cat(&[k_win, k_comp], 1)?;
-        let mask = Tensor::cat(
-            &[
-                Tensor::from_vec(w_mask, (seq, win), dev)?,
-                Tensor::from_vec(c_mask, (seq, n_comp), dev)?,
-            ],
-            1,
-        )?;
+                .reshape((seq, n_comp, d))?;
+            k_all = Tensor::cat(&[k_win, k_comp], 1)?;
+            mask = Tensor::cat(
+                &[
+                    Tensor::from_vec(w_mask, (seq, win), dev)?,
+                    Tensor::from_vec(c_mask, (seq, n_comp), dev)?,
+                ],
+                1,
+            )?;
+        } else {
+            k_all = k_win;
+            mask = Tensor::from_vec(w_mask, (seq, win), dev)?;
+        }
         Ok((k_all, mask))
     }
 
@@ -1342,6 +1356,12 @@ struct Moe {
     n_expert_used: usize,
     weights_scale: f64,
     hash: bool,
+    /// Device the routed-expert weights live on.  This is the model device
+    /// for a CPU load, but on an accelerator it is the CPU: the gate/up
+    /// experts are IQ2_XXS (no CUDA/Metal kernel) and the expert pool is far
+    /// larger than the VRAM of the cards that can run the dense set.
+    /// [`Moe::dispatch`] runs the whole block there and moves the result back.
+    expert_device: Device,
 }
 
 impl Moe {
@@ -1414,6 +1434,21 @@ impl Moe {
         let ids: Vec<u32> = indices.flatten_all()?.to_vec1()?;
         let wts: Vec<f32> = weights.flatten_all()?.to_vec1()?;
 
+        // The routed experts may live on a different device from the
+        // activations: on an accelerator the dense set is on the device while
+        // the expert pool stays in host memory (see `Moe::expert_device`).
+        // Move the whole MoE block's input across once and its result back
+        // once, so the device boundary costs two transfers per layer instead
+        // of one per expert matmul.  Everything below reads and writes `dev`.
+        let out_device = x2.device().clone();
+        let x2_hopped;
+        let x2 = if self.expert_device.same_device(&out_device) {
+            x2
+        } else {
+            x2_hopped = x2.to_device(&self.expert_device)?;
+            &x2_hopped
+        };
+
         // The gate has just told us which experts this token needs.  Each
         // expert's weights are a contiguous run inside the model mapping, so
         // `MADV_WILLNEED` turns the scattered page faults that would otherwise
@@ -1436,7 +1471,7 @@ impl Moe {
             }
         }
 
-        let dev = x2.device();
+        let dev = &self.expert_device;
         let mut y = Tensor::zeros((n_tokens, h), DType::F32, dev)?;
         // Select each expert's input rows once; all three phases reuse them.
         let mut sel: Vec<Option<(Vec<u32>, Tensor)>> = Vec::with_capacity(self.experts.len());
@@ -1492,6 +1527,12 @@ impl Moe {
             ids[n_tokens.saturating_sub(1) * k..].to_vec();
         routed_ids.sort_unstable();
         routed_ids.dedup();
+        // …and hand the block's output back to the model's device.
+        let y = if self.expert_device.same_device(&out_device) {
+            y
+        } else {
+            y.to_device(&out_device)?
+        };
         Ok((y, routed_ids))
     }
 }
@@ -1576,6 +1617,12 @@ struct Reader<R: Read + Seek> {
     raw: Option<GgufHeader>,
     reader: R,
     device: Device,
+    /// Device the routed-expert tensors are built on.  Same as `device` for a
+    /// CPU model; the CPU when the model is mapped and running on an
+    /// accelerator, because a mapped expert is borrowed as CPU storage and
+    /// the IQ2_XXS dtype has no accelerator kernel either way.  See
+    /// [`Moe::expert_device`].
+    expert_device: Device,
     mmap: Option<std::sync::Arc<memmap2::Mmap>>,
     /// The model file, for the layer-ahead pread prefetch thread.
     file: Option<std::sync::Arc<std::fs::File>>,
@@ -1772,7 +1819,7 @@ impl ModelWeights {
         reader: &mut R,
         device: &Device,
     ) -> Result<Self> {
-        Self::from_gguf_mmap(ct, None, reader, device, None, None)
+        Self::from_gguf_mmap(ct, None, reader, device, None, None, 0)
     }
 
     /// Load with weights borrowed in place from `mmap` where possible.
@@ -1787,13 +1834,32 @@ impl ModelWeights {
         device: &Device,
         mmap: Option<std::sync::Arc<memmap2::Mmap>>,
         file: Option<std::sync::Arc<std::fs::File>>,
+        // The engine's configured context length.  The KV caches are sized
+        // to `min(context_length, KV_CAP, n_ctx)`; 0 means "no engine limit".
+        //
+        // This matters on an accelerator: the dense weights already occupy
+        // most of VRAM, so an engine serving 4K tokens must not reserve the
+        // 256K cap (several GiB) and fail the first attention call.
+        n_ctx: usize,
     ) -> Result<Self> {
         let cfg = Config::from_metadata(&ct.metadata)?;
+        // Routed experts stay on the CPU whenever the model is memory-mapped,
+        // even if the rest of the model is going to an accelerator: each
+        // expert is borrowed from the mapping as `QStorage::Cpu`, and the
+        // IQ2_XXS gate/up weights have no GPU kernel anyway.  The dense set
+        // (embeddings, attention, norms, routers, shared experts, output —
+        // ~8 GiB for V4-Flash) is what benefits from the device.
+        let expert_device = if mmap.is_some() {
+            Device::Cpu
+        } else {
+            device.clone()
+        };
         let mut rd = Reader {
             ct,
             raw: raw.cloned(),
             reader,
             device: device.clone(),
+            expert_device,
             mmap,
             file,
         };
@@ -1950,9 +2016,13 @@ impl ModelWeights {
         }
 
         // KV caches are sized to the configured context, capped so a 1M-token
-        // config does not silently reserve ~20 GB of CPU RAM per instance.
-        // The cap is a hard limit enforced in `forward` (clear error if hit).
-        let kv_cap = cfg.context_length.min(KV_CAP);
+        // config does not silently reserve ~20 GB of CPU RAM per instance, and
+        // further capped by the engine's own `n_ctx`.  The cap is a hard limit
+        // enforced in `forward` (clear error if hit).
+        let mut kv_cap = cfg.context_length.min(KV_CAP);
+        if n_ctx != 0 {
+            kv_cap = kv_cap.min(n_ctx);
+        }
         let mut kv_states = Vec::with_capacity(cfg.n_layer);
         for i in 0..cfg.n_layer {
             kv_states.push(KvState::new(&cfg, i, device, kv_cap)?);
@@ -2343,10 +2413,12 @@ fn split_mxfp4_experts<R: Read + Seek>(
         .unwrap_or(rd.ct.tensor_data_offset);
 
     // Zero-copy: one borrowed QTensor per expert, pointing into the mapping.
-    // Only sound on CPU — borrowed blocks are `QStorage::Cpu`, so on
-    // accelerator devices decode to f32 and copy below (which uses
-    // `rd.device`) instead.
-    if let Some(mmap) = rd.mmap.as_ref().filter(|_| rd.device.is_cpu()) {
+    // A borrow is `QStorage::Cpu` by construction, so it is only taken when
+    // the experts' home device is the CPU — which it is for every mapped
+    // model, including one whose dense set runs on an accelerator (see
+    // `Reader::expert_device`).  Otherwise decode to f32 and copy onto
+    // `rd.expert_device` below.
+    if let Some(mmap) = rd.mmap.as_ref().filter(|_| rd.expert_device.is_cpu()) {
         let base = tensor_data_offset.saturating_add(info.offset) as usize;
         let mut experts = Vec::with_capacity(n_expert);
         for e in 0..n_expert {
@@ -2379,7 +2451,7 @@ fn split_mxfp4_experts<R: Read + Seek>(
     // order-of-magnitude blow-up for real model footprints (~9 GB of 4-bit
     // data per stacked tensor becomes ~140 GB), and accelerator devices cannot
     // borrow the blocks (they are CPU storage).  Refuse loudly rather than OOM.
-    if !rd.device.is_cpu() {
+    if !rd.expert_device.is_cpu() {
         candle_core::bail!(
             "deepseek4: MXFP4 expert tensor `{name}` is only supported on the CPU device"
         );
@@ -2397,7 +2469,7 @@ fn split_mxfp4_experts<R: Read + Seek>(
         let t = Tensor::from_vec(
             all[e * per_elems..(e + 1) * per_elems].to_vec(),
             (out, inn),
-            &rd.device,
+            &rd.expert_device,
         )?;
         experts.push(ExpertTensor {
             qmatmul: QMatMul::from_qtensor(QTensor::quantize(&t, GgmlDType::F32)?)?,
@@ -2435,10 +2507,12 @@ fn split_iq2xxs_experts<R: Read + Seek>(
         .unwrap_or(rd.ct.tensor_data_offset);
 
     // Zero-copy: one borrowed QTensor per expert, pointing into the mapping.
-    // Only sound on CPU — borrowed blocks are `QStorage::Cpu`, so on
-    // accelerator devices decode to f32 and copy below (which uses
-    // `rd.device`) instead.
-    if let Some(mmap) = rd.mmap.as_ref().filter(|_| rd.device.is_cpu()) {
+    // A borrow is `QStorage::Cpu` by construction, so it is only taken when
+    // the experts' home device is the CPU — which it is for every mapped
+    // model, including one whose dense set runs on an accelerator (see
+    // `Reader::expert_device`).  Otherwise decode to f32 and copy onto
+    // `rd.expert_device` below.
+    if let Some(mmap) = rd.mmap.as_ref().filter(|_| rd.expert_device.is_cpu()) {
         let base = tensor_data_offset.saturating_add(info.offset) as usize;
         let mut experts = Vec::with_capacity(n_expert);
         for e in 0..n_expert {
@@ -2471,7 +2545,7 @@ fn split_iq2xxs_experts<R: Read + Seek>(
     // order-of-magnitude blow-up for real model footprints (~40 GB of 2-bit
     // data becomes ~640 GB) — and accelerator devices cannot borrow the
     // blocks (they are CPU storage).  Refuse loudly rather than OOM.
-    if !rd.device.is_cpu() {
+    if !rd.expert_device.is_cpu() {
         candle_core::bail!(
             "deepseek4: IQ2_XXS expert tensor `{name}` is only supported on the CPU device"
         );
@@ -2489,7 +2563,7 @@ fn split_iq2xxs_experts<R: Read + Seek>(
         let t = Tensor::from_vec(
             all[e * per_elems..(e + 1) * per_elems].to_vec(),
             (out, inn),
-            &rd.device,
+            &rd.expert_device,
         )?;
         experts.push(ExpertTensor {
             qmatmul: QMatMul::from_qtensor(QTensor::quantize(
@@ -2585,6 +2659,7 @@ fn load_moe<R: Read + Seek>(
         n_expert_used: cfg.n_expert_used,
         weights_scale: cfg.expert_weights_scale,
         hash,
+        expert_device: rd.expert_device.clone(),
     })
 }
 
@@ -2609,17 +2684,29 @@ fn split_experts<R: Read + Seek>(
             return split_mxfp4_experts(rd, name, &info, n_expert);
         }
     }
-    let qt = rd.qtensor(name)?;
-    let dims = qt.shape().dims().to_vec();
-    if dims.len() != 3 || dims[0] != n_expert {
-        candle_core::bail!(
-            "deepseek4: expected expert tensor `{name}` shaped [n_expert, out, in], got {dims:?}"
-        );
-    }
-    let (out, inn) = (dims[1], dims[2]);
-    let dtype: GgmlDType = qt.dtype();
+    // Read the shape and dtype straight from the header instead of
+    // materialising the tensor first: on an accelerator `Reader::qtensor`
+    // would upload the whole `[n_expert, out, in]` stack to VRAM (28 GiB for
+    // V4-Flash's Q2_K `ffn_down_exps`) only to slice it back into per-expert
+    // pieces.
+    let (out, inn, dtype) = match rd.ct.tensor_infos.get(name) {
+        Some(info) => {
+            let dims = info.shape.dims().to_vec();
+            if dims.len() != 3 || dims[0] != n_expert {
+                candle_core::bail!(
+                    "deepseek4: expected expert tensor `{name}` shaped [n_expert, out, in], got {dims:?}"
+                );
+            }
+            (dims[1], dims[2], info.ggml_dtype)
+        }
+        None => candle_core::bail!("deepseek4: tensor `{name}` is missing from the GGUF header"),
+    };
 
-    if let Some(mmap) = rd.mmap.clone().filter(|_| rd.device.is_cpu()) {
+    // The routed experts are built on `rd.expert_device` — the CPU for every
+    // mapped model, including a GPU build (see `Reader::expert_device`), so
+    // this borrow path is the production one on an accelerator too: the dense
+    // set is what gets uploaded, not the 72 GiB expert pool.
+    if let Some(mmap) = rd.mmap.clone().filter(|_| rd.expert_device.is_cpu()) {
         if let Some(info) = rd.ct.tensor_infos.get(name) {
             let block_size = dtype.block_size();
             let per_elems = out * inn;
@@ -2656,6 +2743,7 @@ fn split_experts<R: Read + Seek>(
         }
     }
 
+    let qt = rd.qtensor(name)?;
     let bytes = qt.data()?;
     if bytes.len() % n_expert != 0 {
         candle_core::bail!(
@@ -2667,7 +2755,7 @@ fn split_experts<R: Read + Seek>(
     let mut experts = Vec::with_capacity(n_expert);
     for e in 0..n_expert {
         let slice = &bytes[e * per..(e + 1) * per];
-        let storage = QStorage::from_data(Cow::Borrowed(slice), &rd.device, dtype)?;
+        let storage = QStorage::from_data(Cow::Borrowed(slice), &rd.expert_device, dtype)?;
         let qt = QTensor::new(storage, (out, inn))?;
         experts.push(ExpertTensor {
             qmatmul: QMatMul::from_qtensor(qt)?,
