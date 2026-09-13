@@ -252,7 +252,7 @@ fn deepseek4_header_reread_failure_is_reported() {
 
     // The reader passes candle's parse but fails every read afterwards.
     let mut failing = FailAllReads(std::io::Cursor::new(bytes));
-    let err = match QuantizedModel::from_gguf_mmap(content, &mut failing, &Device::Cpu, None, None) {
+    let err = match QuantizedModel::from_gguf_mmap(content, &mut failing, &Device::Cpu, None, None, 0) {
         Err(e) => e,
         Ok(_) => panic!("from_gguf_mmap must fail when the raw header re-read fails"),
     };
@@ -291,7 +291,7 @@ fn deepseek4_streamed_load_handles_k_quant_weights() {
     let model = dir.join("model.gguf");
     common::write_tiny_deepseek4_gguf_kquant(&model);
 
-    let mut m = load(&model, false);
+    let mut m = load(&model, true);
     let out = logits(&mut m, &[1, 4, 2, 7, 5], 0);
     assert_eq!(out.len(), 16);
     assert!(
@@ -464,6 +464,70 @@ fn deepseek4_speculative_routing_state_tracks_forward_passes() {
         routed(&a)
     );
     assert!(routed(&b).iter().all(|v| v.is_empty()));
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Batched `forward_sequences` must be exact per-sequence: forwarding two
+/// independent one-token sequences together (per-sequence KV, shared MoE)
+/// must produce the same logits as forwarding each via the single-sequence
+/// path, at any two positions.
+#[test]
+fn deepseek4_forward_sequences_matches_single_sequence() {
+    let dir = common::model_dir("deepseek4-batched");
+    let model = dir.join("model.gguf");
+    common::write_tiny_deepseek4_gguf(&model);
+
+    // CPU, no mmap: fully deterministic, no prefetch/noise.
+    let m = load(&model, true);
+
+    let make_input = |tokens: &[u32]| {
+        Tensor::new(tokens, &Device::Cpu).unwrap().unsqueeze(0).unwrap()
+    };
+    let a = make_input(&[3]);
+    let b = make_input(&[8]);
+    let seqs = &[(&a, 0usize), (&b, 5usize)];
+
+    // Single-sequence references, each on a FRESH model: an independent sequence
+    // has its own empty KV, so the reference must not carry another sequence's
+    // writes.
+    let mut m_a = load(&model, true);
+    let mut m_b = load(&model, true);
+    let refs: Vec<Vec<f32>> = vec![logits(&mut m_a, &[3], 0), logits(&mut m_b, &[8], 5)];
+
+    // Batched forward (per-sequence KV, shared MoE) on a fresh model so the
+    // batched KV starts empty, exactly like the single-path references.
+    let mut m2 = load(&model, true);
+    let batched = match &mut m2 {
+        QuantizedModel::DeepSeek4(w) => w.forward_sequences(seqs).unwrap(),
+        _ => panic!("expected DeepSeek4 model"),
+    };
+    assert_eq!(batched.len(), 2, "one logits row per sequence");
+
+    for (s, got) in batched.iter().enumerate() {
+        let want = refs.get(s).unwrap();
+        assert_eq!(got.len(), want.len(), "logits widths must match (vocab size)");
+        // Batched dispatch shares the MoE's quantized matmul and index_add
+        // across tokens, which reorders the f32 summation relative to a
+        // single-token forward.  The math is identical; the only expected
+        // divergence is f32 sum-order rounding (~1e-6).  Use a tight relative
+        // tolerance to catch a real logic error (cross-sequence leakage, a
+        // wrong per-seq split) while allowing the expected rounding.
+        let mut max_rel = 0.0f32;
+        let mut max_abs = 0.0f32;
+        for (g, v) in got.iter().zip(want.iter()) {
+            let denom = (*g).abs().max((*v).abs()).max(1.0e-4);
+            max_rel = max_rel.max((*g - *v).abs() / denom);
+            max_abs = max_abs.max((*g - *v).abs());
+        }
+        eprintln!(
+            "seq {s}: max relative logit delta {max_rel:.3e} (abs {max_abs:.3e})",
+        );
+        assert!(
+            max_rel <= 1.0e-4,
+            "batched dispatch must match single-sequence within f32 rounding (seq {s}: rel {max_rel})"
+        );
+    }
 
     std::fs::remove_dir_all(&dir).ok();
 }

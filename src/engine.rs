@@ -597,6 +597,27 @@ impl GenSession {
         }
     }
 
+    /// Feed one decode step across `seqs` **independent** sequences at their
+    /// own positions, returning one logits vector per sequence.  The MoE
+    /// dispatch for the batch is shared, so the routed-expert fetch is
+    /// amortized across the sequences (see
+    /// `quantized_deepseek4::ModelWeights::forward_sequences`).  Only the
+    /// candle deepseek4 model implements this; anything else reports an
+    /// unsupported error so callers can fall back to per-sequence steps.
+    fn forward_tokens_batched(
+        &mut self,
+        seqs: &[(&Tensor, usize)],
+    ) -> Result<Vec<Vec<f32>>, JoshuaError> {
+        match self {
+            Self::Candle(model) => model
+                .forward_sequences(seqs)
+                .map_err(|e| JoshuaError::Inference(e.to_string())),
+            Self::Npu(_) => Err(JoshuaError::Inference(
+                "batched forward is not supported on the NPU session".into(),
+            )),
+        }
+    }
+
     /// Clear internal state for reuse with an unrelated prompt.
     ///
     /// Returns `false` when the session cannot be reset and must be dropped.
