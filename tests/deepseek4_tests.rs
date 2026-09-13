@@ -531,3 +531,51 @@ fn deepseek4_forward_sequences_matches_single_sequence() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Multi-step batched decode must persist per-sequence KV across calls: after
+/// feeding token `a` then token `b` to the *same* sequence through two
+/// `forward_sequences` calls, the step-2 logits must match feeding `a` then
+/// `b` through two sequential single-`forward` calls on a fresh model.  This
+/// is the property the persistent `kv_seq` cache exists to guarantee — the
+/// single-step test alone cannot catch KV being reset each call.
+#[test]
+fn deepseek4_forward_sequences_persists_kv_across_steps() {
+    let dir = common::model_dir("deepseek4-batched-multistep");
+    let model = dir.join("model.gguf");
+    common::write_tiny_deepseek4_gguf(&model);
+
+    let mut single = load(&model, true);
+    let make_input = |tokens: &[u32]| {
+        Tensor::new(tokens, &Device::Cpu).unwrap().unsqueeze(0).unwrap()
+    };
+    let a = make_input(&[3]);
+    let b = make_input(&[8]);
+    // Sequential single-sequence references: feed [3] at pos 0, then [8] at pos 1.
+    let _ = logits(&mut single, &[3], 0);
+    let ref_second = logits(&mut single, &[8], 1);
+
+    // Batched: feed the same sequence [3]@0 then [8]@1 through the persistent-KV path.
+    let mut batched = load(&model, true);
+    let logits = match &mut batched {
+        QuantizedModel::DeepSeek4(w) => {
+            let _ = w.forward_sequences(&[(&a, 0usize)]).unwrap();
+            w.forward_sequences(&[(&b, 1usize)]).unwrap()
+        }
+        _ => panic!("expected DeepSeek4 model"),
+    };
+    let got = logits.get(0).unwrap();
+
+    assert_eq!(got.len(), ref_second.len(), "vocab sizes must match");
+    let mut max_rel = 0.0f32;
+    for (g, v) in got.iter().zip(ref_second.iter()) {
+        let denom = (*g).abs().max((*v).abs()).max(1.0e-4);
+        max_rel = max_rel.max((*g - *v).abs() / denom);
+    }
+    eprintln!("multi-step batched vs sequential: max relative logit delta {max_rel:.3e}");
+    assert!(
+        max_rel <= 1.0e-4,
+        "batched KV must persist across steps (rel {max_rel})"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
