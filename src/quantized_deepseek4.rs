@@ -1576,6 +1576,11 @@ pub struct ModelWeights {
     tok_embeddings: Tensor,
     layers: Vec<Layer>,
     kv: Vec<KvState>,
+    /// Per-sequence KV state for batched `forward_sequences` decode:
+    /// `[layer][seq]`.  Persistent across steps (unlike a fresh-per-call
+    /// cache) so multi-token batched generation keeps each sequence's
+    /// attention history.  Reset via [`ModelWeights::reset_batch_kv`].
+    kv_seq: Vec<Vec<KvState>>,
     cfg: Config,
     norm: RmsNorm,
     output: QMatMul,
@@ -2055,6 +2060,7 @@ impl ModelWeights {
             tok_embeddings,
             layers,
             kv: kv_states,
+            kv_seq: Vec::new(),
             cfg,
             norm,
             output,
@@ -2373,16 +2379,20 @@ impl ModelWeights {
         let hc = self.hc_mult;
         let d = self.tok_embeddings.dim(1)?;
 
-        // Per-sequence KV caches: [layer][seq].  Each sequence keeps its own
-        // Attention key/value state so batches of independent sequences never
-        // read one another's keys.
-        let mut kv: Vec<Vec<KvState>> = Vec::with_capacity(self.layers.len());
-        for i in 0..self.layers.len() {
-            let mut per_seq: Vec<KvState> = Vec::with_capacity(n_seq);
-            for _ in 0..n_seq {
-                per_seq.push(KvState::new(&self.cfg, i, &self.device, self.max_seq)?);
+        // Persistent per-sequence KV: reset when the batch size changes (a new
+        // batch of sequences starts), otherwise reuse the cache across steps so
+        // multi-token generation keeps each sequence's attention history.
+        if self.kv_seq.len() != self.layers.len()
+            || self.kv_seq.first().unwrap_or(&Vec::new()).len() != n_seq
+        {
+            self.kv_seq.clear();
+            for i in 0..self.layers.len() {
+                let mut per_seq: Vec<KvState> = Vec::with_capacity(n_seq);
+                for _ in 0..n_seq {
+                    per_seq.push(KvState::new(&self.cfg, i, &self.device, self.max_seq)?);
+                }
+                self.kv_seq.push(per_seq);
             }
-            kv.push(per_seq);
         }
 
         // Per-sequence embeddings -> [1, 1, hc, d].
@@ -2427,7 +2437,7 @@ impl ModelWeights {
                 let h = layer.attn_norm.forward(&x)?;
                 let h = layer
                     .attn
-                    .forward(&mut kv[i][s], &h, *off, self.max_seq)?;
+                    .forward(&mut self.kv_seq.get_mut(i).unwrap().get_mut(s).unwrap(), &h, *off, self.max_seq)?;
                 let xs_s2 = hc_post(&h, &residual, &post, &comb)?;
 
                 let (x2, fpost, fcomb) = hc_pre(
