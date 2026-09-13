@@ -26,7 +26,7 @@ fn load(model: &std::path::Path, mmap: bool) -> QuantizedModel {
         None
     };
     let mut cursor = std::io::Cursor::new(&bytes[..]);
-    QuantizedModel::from_gguf_mmap(content, &mut cursor, &Device::Cpu, mmap, None).unwrap()
+    QuantizedModel::from_gguf_mmap(content, &mut cursor, &Device::Cpu, mmap, None, 0).unwrap()
 }
 
 fn logits(model: &mut QuantizedModel, tokens: &[u32], offset: usize) -> Vec<f32> {

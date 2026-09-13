@@ -293,7 +293,7 @@ impl QuantizedModel {
         reader: &mut R,
         device: &Device,
     ) -> Result<Self> {
-        Self::from_gguf_mmap(gguf, reader, device, None, None)
+        Self::from_gguf_mmap(gguf, reader, device, None, None, 0)
     }
 
     /// Load, borrowing weights in place from `mmap` for the architectures
@@ -309,6 +309,10 @@ impl QuantizedModel {
         device: &Device,
         mmap: Option<std::sync::Arc<memmap2::Mmap>>,
         file: Option<std::sync::Arc<std::fs::File>>,
+        // The engine's configured context length (0 = no engine limit).
+        // Only `deepseek4` consumes it, to size its KV caches to what the
+        // engine will actually serve instead of the model's context length.
+        n_ctx: usize,
     ) -> Result<Self> {
         let arch = Architecture::detect(&gguf.metadata).map_err(candle_core::Error::Msg)?;
 
@@ -395,7 +399,7 @@ impl QuantizedModel {
                     .map(Self::DeepSeek2)
             }
             Architecture::DeepSeek4 => crate::quantized_deepseek4::ModelWeights::from_gguf_mmap(
-                gguf, raw, reader, device, mmap, file,
+                gguf, raw, reader, device, mmap, file, n_ctx,
             )
             .map(Self::DeepSeek4),
         }

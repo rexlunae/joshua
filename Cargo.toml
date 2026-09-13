@@ -54,6 +54,10 @@ tls = ["dep:axum-server", "dep:rustls"]
 # candle-metal-kernels, patched with offset-aware quantized entry points.
 # Always applied so the vendored crate is the one candle-core links against.
 [patch.crates-io]
+# Vendored to fix a build failure with CUDA >= 12.4: candle-kernels'
+# compatibility.cuh redefines __hmax_nan/__hmin_nan for __half, which the
+# toolkit already declares for every architecture (see the file's comment).
+candle-kernels = { path = "vendor/candle-kernels" }
 candle-metal-kernels = { path = "vendor/candle-metal-kernels" }
 # Vendored so joshua can fix upstream gaps — currently: quantized_llama must
 # honour the GGUF head_dim (`llama.attention.key_length` / rope dimension)
