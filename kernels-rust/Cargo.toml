@@ -1,0 +1,24 @@
+# kernels-rust — joshua's Rust-native CUDA kernels (cuda-oxide)
+#
+# NOT part of the main joshua build: this crate needs CUDA 13 and the
+# cuda-oxide rustc backend, and must never be pulled into the CUDA-12.4 build.
+# Build it explicitly on a CUDA-13 host with `cargo oxide`.
+
+[package]
+name = "joshua-kernels-rust"
+version = "0.0.1"
+description = "joshua's Rust-native CUDA kernels via NVlabs/cuda-oxide (CUDA-13 only)"
+# Must not be picked up by the outer workspace `cargo build`.
+autolib = false
+autoexe = false
+
+[oxide]
+# Minimal so `cargo oxide` has a CUDA target to target.  cuda-oxide lowers
+# #[kernel] fns to PTX regardless of host target; this pins the SIMT target.
+cuda-version = ">=13.0"
+
+[dependencies]
+cuda-macros = { git = "https://github.com/NVlabs/cuda-oxide.git", package = "cuda-macros" }
+cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", package = "cuda-host" }
+cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", package = "cuda-core" }
+cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", package = "cuda-device" }
