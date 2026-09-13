@@ -36,6 +36,18 @@ impl ExpertHandles {
         self.up.prefetch();
         self.down.prefetch();
     }
+
+    /// Ask the backend to `mlock` all three weight ranges into RAM so the OS
+    /// cannot evict them (see [`crate::mmap_tensor::MmapPrefetch::lock`]).
+    ///
+    /// `mlock` guarantees residency where `MADV_WILLNEED` is only a hint the
+    /// ZFS ARC ignores — the mechanism that makes the routing-hot subset
+    /// immune to eviction on a capacity-constrained host.
+    pub fn lock(&self) {
+        self.gate.lock();
+        self.up.lock();
+        self.down.lock();
+    }
 }
 
 /// Where a hot expert's weights live, and how to make them resident on the
@@ -83,7 +95,17 @@ impl ExpertResidency for CpuResidency {
             .and_then(|row| row.get(expert as usize))
             .and_then(|h| h.as_ref())
         {
-            h.prefetch();
+            // JOSHUA_LOCK_HOT_EXPERTS: mlock the hot expert's pages into RAM
+            // (guaranteed residency) instead of the advisory MADV_WILLNEED.
+            // Default off — locking real RAM is only worthwhile on a host
+            // where the routed set is small enough to stay resident and where
+            // mlock is permitted (unlimited rlimit).  Falls back to prefetch
+            // on any error.
+            if std::env::var_os("JOSHUA_LOCK_HOT_EXPERTS").is_some() {
+                h.lock();
+            } else {
+                h.prefetch();
+            }
         }
     }
 

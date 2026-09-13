@@ -72,6 +72,36 @@ pub trait MmapPrefetch: Send + Sync + 'static {
     /// Issue a best-effort `MADV_WILLNEED` for this block range.  Never
     /// blocks and never fails the caller.
     fn prefetch(&self);
+    /// Best-effort `mlock(2)` of this block range into physical RAM so the
+    /// OS cannot evict it from the page cache (guaranteed residency).  Never
+    /// fails the caller: on any error (e.g. exceeding the mlock limit or the
+    /// range not being mappable) it degrades to [`MmapPrefetch::prefetch`].
+    ///
+    /// Locking is what makes the routing-hot subset immune to eviction on a
+    /// ZFS-backed mapping, where the advisory `MADV_WILLNEED` hint is ignored
+    /// by the ARC.  Pages are touched (faulted resident) before locking, since
+    /// `mlock` only pins already-present pages.
+    fn lock(&self);
+}
+
+/// Shared best-effort `mlock` of `[off, off+len)` bytes of a mapping.
+/// Touches the pages (faults them resident) then locks them; any failure
+/// silently degrades to the advisory `MADV_WILLNEED` prefetch.
+fn lock_range(mmap: &Arc<Mmap>, off: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let base = mmap.as_ptr() as usize;
+    let start = base.saturating_add(off);
+    if start.saturating_add(len) > base.saturating_add(mmap.len()) {
+        return;
+    }
+    // Touch pages so the mbuffer is resident before mlock pins them.
+    #[cfg(target_os = "linux")]
+    {
+        let _ = unsafe { libc::mlock((start as *const u8).cast::<libc::c_void>(), len) };
+    }
+    let _ = mmap.advise_range(memmap2::Advice::WillNeed, off, len);
 }
 
 impl<T: GgmlType + 'static> MmapPrefetch for MmapBlocks<T> {
@@ -80,6 +110,12 @@ impl<T: GgmlType + 'static> MmapPrefetch for MmapBlocks<T> {
         let off = self.ptr as usize - base;
         let len = self.len * std::mem::size_of::<T>();
         let _ = self._mmap.advise_range(memmap2::Advice::WillNeed, off, len);
+    }
+    fn lock(&self) {
+        let base = self._mmap.as_ptr() as usize;
+        let off = self.ptr as usize - base;
+        let len = self.len * std::mem::size_of::<T>();
+        lock_range(&self._mmap, off, len);
     }
 }
 
@@ -229,6 +265,12 @@ impl MmapPrefetch for MmapBlocksIq2Xxs {
         let len = self.len * crate::iq2xxs::BLOCK_BYTES;
         let _ = self._mmap.advise_range(memmap2::Advice::WillNeed, off, len);
     }
+    fn lock(&self) {
+        let base = self._mmap.as_ptr() as usize;
+        let off = self.ptr as usize - base;
+        let len = self.len * crate::iq2xxs::BLOCK_BYTES;
+        lock_range(&self._mmap, off, len);
+    }
 }
 
 impl MmapBlocksIq2Xxs {
@@ -327,6 +369,12 @@ impl MmapPrefetch for MmapBlocksMxfp4 {
         let off = self.ptr as usize - base;
         let len = self.len * std::mem::size_of::<crate::mxfp4::BlockMxfp4>();
         let _ = self._mmap.advise_range(memmap2::Advice::WillNeed, off, len);
+    }
+    fn lock(&self) {
+        let base = self._mmap.as_ptr() as usize;
+        let off = self.ptr as usize - base;
+        let len = self.len * std::mem::size_of::<crate::mxfp4::BlockMxfp4>();
+        lock_range(&self._mmap, off, len);
     }
 }
 
