@@ -2347,6 +2347,159 @@ impl ModelWeights {
         logits.to_dtype(DType::F32)
     }
 
+    /// Forward one decode step for `n_seq` **independent** sequences at their
+    /// own `(1 token, position)` pairs, amortizing the routed-expert fetch and
+    /// the MoE dispatch across the batch (each routed expert is fetched once
+    /// and applied to every token that routes to it).
+    ///
+    /// The **attention** branch stays per-sequence — each sequence reads and
+    /// writes its own [`KvState`] at its own position, so sequences never see
+    /// one another's keys.  The **MoE/FFN** branch runs once on the
+    /// concatenation of the per-sequence layer outputs, which is exact because
+    /// `dispatch` is sequence-agnostic (each token's routing only depends on
+    /// its own hidden state).  This is the engine-facing entry for
+    /// `JOSHUA_BATCH`.
+    ///
+    /// Returns the per-sequence logits (one `n_vocab` vector each), split back
+    /// from the shared output head.
+    pub fn forward_sequences(
+        &mut self,
+        seqs: &[(&Tensor, usize)],
+    ) -> Result<Vec<Vec<f32>>> {
+        let n_seq = seqs.len();
+        if n_seq == 0 {
+            return Ok(Vec::new());
+        }
+        let hc = self.hc_mult;
+        let d = self.tok_embeddings.dim(1)?;
+
+        // Per-sequence KV caches: [layer][seq].  Each sequence keeps its own
+        // Attention key/value state so batches of independent sequences never
+        // read one another's keys.
+        let mut kv: Vec<Vec<KvState>> = Vec::with_capacity(self.layers.len());
+        for i in 0..self.layers.len() {
+            let mut per_seq: Vec<KvState> = Vec::with_capacity(n_seq);
+            for _ in 0..n_seq {
+                per_seq.push(KvState::new(&self.cfg, i, &self.device, self.max_seq)?);
+            }
+            kv.push(per_seq);
+        }
+
+        // Per-sequence embeddings -> [1, 1, hc, d].
+        let mut xs_seq: Vec<Tensor> = Vec::with_capacity(n_seq);
+        let mut ids_cat: Vec<u32> = Vec::new();
+        for (input, _) in seqs {
+            let tok = self
+                .tok_embeddings
+                .index_select(&input.flatten_all()?, 0)?
+                .reshape((1, 1, d))?;
+            xs_seq.push(tok.unsqueeze(2)?.broadcast_as((1, 1, hc, d))?);
+            ids_cat.push(input.flatten_all()?.to_vec1()?.get(0).copied().unwrap_or(0));
+        }
+
+        let _step = self.hot_experts.begin_step(true);
+        if self.hot_experts.refresh_due(true) {
+            for (l, e) in self.hot_experts.refresh() {
+                self.residency.acquire(l, e);
+            }
+        }
+
+        for i in 0..self.layers.len() {
+            let layer = &self.layers[i];
+
+            // Per-sequence attention branch, then stash everything the shared
+            // MoE branch needs to hc_post back per-sequence.
+            let mut ffn_pre: Vec<Tensor> = Vec::with_capacity(n_seq); // h to feed the MoE
+            let mut ffn_residual: Vec<Tensor> = Vec::with_capacity(n_seq);
+            let mut ffn_post: Vec<Tensor> = Vec::with_capacity(n_seq);
+            let mut ffn_comb: Vec<Tensor> = Vec::with_capacity(n_seq);
+            for (s, (_, off)) in seqs.iter().enumerate() {
+                let xs_s = &xs_seq[s];
+                let (x, post, comb) = hc_pre(
+                    xs_s,
+                    &layer.hc_attn_fn,
+                    &layer.hc_attn_scale,
+                    &layer.hc_attn_base,
+                    self.hc_eps,
+                    self.cfg.hc_sinkhorn_iters,
+                )?;
+                let residual = xs_s;
+                let h = layer.attn_norm.forward(&x)?;
+                let h = layer
+                    .attn
+                    .forward(&mut kv[i][s], &h, *off, self.max_seq)?;
+                let xs_s2 = hc_post(&h, &residual, &post, &comb)?;
+
+                let (x2, fpost, fcomb) = hc_pre(
+                    &xs_s2,
+                    &layer.hc_ffn_fn,
+                    &layer.hc_ffn_scale,
+                    &layer.hc_ffn_base,
+                    self.hc_eps,
+                    self.cfg.hc_sinkhorn_iters,
+                )?;
+                ffn_pre.push(layer.ffn_norm.forward(&x2)?);
+                ffn_residual.push(xs_s2);
+                ffn_post.push(fpost);
+                ffn_comb.push(fcomb);
+            }
+
+            // Shared MoE: concatenate the per-seq FFN inputs + token ids.
+            let ffn_cats: Vec<Tensor> =
+                (0..n_seq).map(|s| ffn_pre.get(s).unwrap().clone()).collect();
+            let h_cat = Tensor::cat(&ffn_cats, 1)?;
+            let input_cat = Tensor::new(ids_cat.as_slice(), &self.device)
+                .and_then(|t| t.unsqueeze(0))?;
+            let (h_out, _routed) = layer.ffn.forward(&h_cat, &input_cat)?;
+
+            // Split the MoE output back per-sequence and hc_post each.
+            let (_, n_tok, _) = h_out.dims3()?;
+            let per_seq = n_tok / n_seq;
+            for s in 0..n_seq {
+                let h_out_s = h_out.narrow(1, s * per_seq, per_seq)?;
+                let xs_s2 = hc_post(&h_out_s, &ffn_residual[s], &ffn_post[s], &ffn_comb[s])?;
+                xs_seq[s] = xs_s2;
+            }
+        }
+
+        // Logits head on the concatenated last-layer output.
+        // Concatenate xs_seq along the token dim -> [1, n_seq, hc, d].
+        let xs_cats: Vec<Tensor> =
+            (0..n_seq).map(|s| xs_seq.get(s).unwrap().clone()).collect();
+        let xs_cat = Tensor::cat(&xs_cats, 1)?;
+        let seq_len = n_seq;
+        let flat = xs_cat.reshape((seq_len, hc * d))?;
+        let rsqrt = flat
+            .sqr()?
+            .mean_keepdim(D::Minus1)?
+            .affine(1.0, self.hc_eps)?
+            .powf(-0.5)?;
+        let mixes = self.hc_head_fn.forward(&flat)?.broadcast_mul(&rsqrt)?;
+        let pre = sigmoid(&mixes.broadcast_mul(&self.hc_head_scale)?.broadcast_add(&self.hc_head_base)?)?
+            .affine(1.0, self.hc_eps)?;
+        let y = pre
+            .unsqueeze(D::Minus1)?
+            .broadcast_as((seq_len, hc, d))?
+            .mul(&xs_cat.squeeze(0)?)?
+            .sum(D::Minus2)?; // [n_seq, d]
+        let y = self.norm.forward(&y)?;
+        let logits_all = self.output.forward(&y)?; // [n_seq, n_vocab]
+        // Split logits per sequence (each is 1 row).
+        let mut out: Vec<Vec<f32>> = Vec::with_capacity(n_seq);
+        for s in 0..n_seq {
+            let row = logits_all
+                .narrow(0, s, 1)?
+                .squeeze(0)?
+                .to_dtype(DType::F32)?
+                .to_vec1()?;
+            out.push(row);
+        }
+        Ok(out)
+    }
+
+    /// Peel the per-sequence ffn-branch hc_post off the residual stack (the
+    /// post/comb were stashed per-seq; xs_s2 here is the ffn-residual taken
+    /// from `ffn_pending`, mirroring the single-seq layer tail).
     /// Number of routed experts whose weights are mmap-backed (and therefore
     /// prefetchable) vs the total, for diagnostics.
     pub fn mmap_backed_experts(&self) -> (usize, usize) {
