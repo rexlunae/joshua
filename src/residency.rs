@@ -142,6 +142,10 @@ mod tests {
         fn prefetch(&self) {
             self.0.fetch_add(1, Ordering::Relaxed);
         }
+        fn lock(&self) {
+            // mlock in a test is unnecessary; count it like a prefetch.
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     fn handle(counter: &Arc<AtomicUsize>) -> Arc<dyn crate::mmap_tensor::MmapPrefetch> {
