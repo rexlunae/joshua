@@ -692,6 +692,23 @@ struct DecodeOutcome {
     decode_tps: f64,
 }
 
+/// Mutable per-sequence state for the batched decode loop.  The per-sequence
+/// RNG is stored as an erased `dyn rand::Rng` (the concrete `ThreadRng` type
+/// is crate-internal and unnameable from here); `sample_token` takes `&mut dyn
+/// rand::Rng`, and `Distribution::sample::<dyn rand::Rng>` monomorphizes.
+struct SeqDecodeState {
+    logits: Vec<f32>,
+    recent_tokens: Vec<u32>,
+    response: String,
+    decoded_ids: Vec<u32>,
+    byte_window: ByteWindowDecoder,
+    fed_tokens: Vec<u32>,
+    n_decoded: u32,
+    n_cur: usize,
+    /// Set once EOS / a stop sequence / max_tokens ends this sequence.
+    done: bool,
+}
+
 /// NPU backend state: the backend plus its circuit breaker.
 struct NpuState {
     backend: Arc<dyn NpuBackend>,
@@ -1585,6 +1602,138 @@ impl Engine {
             fed_tokens,
             decode_tps,
         })
+    }
+
+    /// Batched decode: step `states` (N **independent** sequences) lockstep,
+    /// feeding all live sequences' next tokens through one shared
+    /// `forward_sequences` pass so the routed-expert fetch is amortized across
+    /// the batch.  Only used behind `JOSHUA_BATCH` (see
+    /// `QuantizedModel::forward_sequences` / `GenSession::forward_tokens_batched`).
+    fn decode_loop_batched(
+        &self,
+        model: &mut GenSession,
+        start_logits: &Vec<Vec<f32>>,
+        start_pos: &Vec<usize>,
+        options: &GenerationOptions,
+    ) -> Result<Vec<DecodeOutcome>> {
+        const REP_WINDOW: usize = 64;
+        let n_seq = start_logits.len();
+        let mut states: Vec<SeqDecodeState> = Vec::with_capacity(n_seq);
+        for s in 0..n_seq {
+            states.push(SeqDecodeState {
+                logits: start_logits.get(s).unwrap().clone(),
+                recent_tokens: Vec::new(),
+                response: String::new(),
+                decoded_ids: Vec::new(),
+                byte_window: ByteWindowDecoder::default(),
+                fed_tokens: Vec::new(),
+                n_decoded: 0,
+                n_cur: start_pos.get(s).copied().unwrap_or(0),
+                done: false,
+            });
+        }
+
+        let decode_start = Instant::now();
+        let mut decoded_steps: u64 = 0;
+        // One shared thread-local RNG for sampling across the batch (the
+        // reference greedy path is exact; sampled draws stay random).  We do
+        // not persist a per-sequence RNG because the rand crate deliberately
+        // makes its concrete ThreadRng type unnameable from outside.
+        let mut rng = thread_rng();
+        loop {
+            if decoded_steps >= options.max_tokens as u64 {
+                break;
+            }
+            if states.iter().all(|s| s.done) {
+                break;
+            }
+
+            // 1. Sample each live sequence's next token; build the batched input.
+            let mut live: Vec<usize> = Vec::new();
+            let mut next_tokens: Vec<u32> = Vec::new();
+            let mut input_tensors: Vec<Tensor> = Vec::new();
+            for (s, st) in states.iter_mut().enumerate() {
+                if st.done {
+                    continue;
+                }
+                let t = sample_token(&st.logits, options, &mut rng, &st.recent_tokens)?;
+                live.push(s);
+                next_tokens.push(t);
+                let input = Tensor::new(&[t], &self.device)
+                    .and_then(|x| x.unsqueeze(0))
+                    .map_err(|e| JoshuaError::Inference(e.to_string()))?;
+                input_tensors.push(input);
+            }
+            if live.is_empty() {
+                break;
+            }
+
+            // 2. One batched forward across the live sequences.
+            let mut seqs: Vec<(&Tensor, usize)> = Vec::with_capacity(live.len());
+            for (k, s) in live.iter().enumerate() {
+                let pos = states[*s].n_cur;
+                seqs.push((&input_tensors[k], pos));
+            }
+            let new_logits = model.forward_tokens_batched(&seqs)?;
+
+            // 3. Apply each live token to its own sequence.
+            for (k, s) in live.iter().enumerate() {
+                if let Some(mut st) = states.get_mut(*s) {
+                    if st.done {
+                        continue;
+                    }
+                    let next = next_tokens[k];
+                    if self.eos_token_ids.contains(&next) {
+                        st.done = true;
+                        continue;
+                    }
+                    if self.byte_level_decode {
+                        st.decoded_ids.push(next);
+                        st.response = st
+                            .byte_window
+                            .push(&self.tokenizer, next, st.response.clone(), &st.decoded_ids)?;
+                    } else {
+                        let piece = self
+                            .tokenizer
+                            .decode(&[next], false)
+                            .map_err(|e| JoshuaError::Inference(e.to_string()))?;
+                        st.response.push_str(&piece);
+                    }
+                    st.n_decoded += 1;
+                    if st.recent_tokens.len() >= REP_WINDOW {
+                        st.recent_tokens.remove(0);
+                    }
+                    st.recent_tokens.push(next);
+                    if Self::check_stop_sequences(&mut st.response, &options.stop_sequences) {
+                        st.done = true;
+                        continue;
+                    }
+                    if let Some(lg) = new_logits.get(k) {
+                        st.logits = lg.clone();
+                    }
+                    st.fed_tokens.push(next);
+                    st.n_cur += 1;
+                }
+            }
+            decoded_steps += 1;
+        }
+
+        let mut outs: Vec<DecodeOutcome> = Vec::with_capacity(n_seq);
+        for st in states {
+            let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
+            let decode_tps = if decode_ms > 0.0 && st.n_decoded > 0 {
+                st.n_decoded as f64 / (decode_ms / 1000.0)
+            } else {
+                0.0
+            };
+            outs.push(DecodeOutcome {
+                response: st.response,
+                n_decoded: st.n_decoded,
+                fed_tokens: st.fed_tokens,
+                decode_tps,
+            });
+        }
+        Ok(outs)
     }
 
     // ─── Embeddings ───────────────────────────────────────────────────────────
