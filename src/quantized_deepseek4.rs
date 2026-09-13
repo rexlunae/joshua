@@ -2038,6 +2038,21 @@ impl ModelWeights {
         let mmap = rd.mmap.clone();
         let file = rd.file.clone();
 
+        // Opt-in memory-cache lever: when the dense set has been uploaded to an
+        // accelerator, its CPU page-cache bytes are dead weight.  Advise the
+        // kernel to drop them (best effort) so ~8 GiB of page cache / ARC
+        // returns to the routed-expert working set, which is what the mmap
+        // actually re-touches every token.
+        if !device.is_cpu() {
+            if let Some(raw) = rd.raw.as_ref() {
+                crate::quantized_deepseek4::release_dense_map_ranges(
+                    file.as_ref(),
+                    &raw.tensors,
+                    raw.tensor_data_offset,
+                );
+            }
+        }
+
         let n_layers = layers.len();
         let n_expert = cfg.n_expert;
         let residency: std::sync::Arc<dyn crate::residency::ExpertResidency> =
@@ -2574,6 +2589,66 @@ fn split_iq2xxs_experts<R: Read + Seek>(
         });
     }
     Ok(experts)
+}
+
+/// Opt-in memory-cache lever (see the call in `ModelWeights::from_gguf_mmap`).
+///
+/// When `JOSHUA_RELEASE_DENSE=1`, advise the kernel to drop the CPU
+/// page-cache bytes of the dense tensors once they have been uploaded to an
+/// accelerator.  The dense set is read once to fill VRAM and then never
+/// touched by the CPU again, so dropping its pages returns a meaningful slab
+/// of page cache / ARC (several GiB for V4-Flash) to the routed-expert
+/// working set, which is what the mmap re-touches on every token.
+///
+/// Best-effort and advisory only: `POSIX_FADV_DONTNEED` (and `MADV_DONTNEED`)
+/// are hints on a ZFS mmap, and an error is never fatal to the load.  Gated
+/// off by default because turning it on trades dense-set residency (cheap to
+/// re-read) for expert-set residency (expensive), a swap that only pays on a
+/// card where the dense set has truly left the CPU path.
+#[cfg(target_os = "linux")]
+pub fn release_dense_map_ranges(
+    file: Option<&std::sync::Arc<std::fs::File>>,
+    tensor_infos: &std::collections::HashMap<String, crate::gguf_ext::RawTensorInfo>,
+    tensor_data_offset: u64,
+) {
+    use std::os::unix::io::AsRawFd;
+    let enabled = std::env::var_os("JOSHUA_RELEASE_DENSE").is_some();
+    if !enabled {
+        return;
+    }
+    if let Some(file) = file {
+        let fd = (*file).as_raw_fd();
+        // Byte range of each tensor = distance to the next tensor in data
+        // order (the GGUF data section is one packed run), relative to the
+        // data section start.
+        let mut starts: Vec<u64> = tensor_infos.values().map(|t| t.offset).collect();
+        starts.sort_unstable();
+        for (name, info) in tensor_infos.iter() {
+            // Skip the routed-expert tensors: those are exactly what we want
+            // to keep cached.
+            if name.ends_with("_exps.weight") {
+                continue;
+            }
+            let begin = info.offset;
+            let end = match starts.binary_search(&begin) {
+                Ok(i) => starts.get(i + 1).copied().unwrap_or(u64::MAX),
+                Err(_) => u64::MAX,
+            };
+            if end <= begin {
+                continue;
+            }
+            let abs_begin = tensor_data_offset.saturating_add(begin) as libc::off_t;
+            let abs_end = tensor_data_offset.saturating_add(end) as libc::off_t;
+            let _ = unsafe {
+                libc::posix_fadvise(
+                    fd,
+                    abs_begin,
+                    abs_end.saturating_sub(abs_begin),
+                    libc::POSIX_FADV_DONTNEED,
+                )
+            };
+        }
+    }
 }
 
 fn load_moe<R: Read + Seek>(
