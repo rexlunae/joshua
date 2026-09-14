@@ -37,7 +37,8 @@ enum DeviceArg {
     /// NVIDIA CUDA (build with `--features cuda`).
     Cuda,
     /// OpenCL (Intel iGPU/Arc or any OpenCL ICD; build with `--features
-    /// opencl`).
+    /// opencl`; use `--device opencl`).
+    #[value(name = "opencl")]
     OpenCl,
 }
 
