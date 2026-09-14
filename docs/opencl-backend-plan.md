@@ -1,6 +1,6 @@
 # OpenCL accelerator backend for joshua (design + plan)
 
-**Status:** M1 round-trip + M2 operators done + verified on the host iGPU; M3 `--device opencl` wired + accepted; M4 (deepseek4 dense set on OpenCL) next. **Owner:** joshua (this repo). **Target:** run the
+**Status:** M1-M4 DONE + verified on the host iGPU: full DeepSeek-V4-Flash runs end-to-end on `--device opencl` (Intel UHD 730) with real `JOSHUA_PROFILE_LAYERS` numbers. M5 (native iGPU kernels for speed) open. **Owner:** joshua (this repo). **Target:** run the
 DeepSeek-V4-Flash benchmark on an Intel OpenCL GPU (iGPU now; M40 via the
 NVIDIA OpenCL ICD when reconnected) through a joshua-native `--device opencl`.
 
@@ -146,6 +146,19 @@ CPU as today.
     gated on the M4 dense-set load (OpenClStorage quantized weights).
 - **M4.** Dense deepseek4 over OpenCL on the real model; `JOSHUA_PROFILE_LAYERS`
   benchmark = the deliverable "same benchmark on OpenCL" numbers.
+  - **M4 VERIFIED ✅ (2026-09-14, host iGPU):** `--device opencl` now loads the
+    80.8 GiB deepseek-v4-flash IQ2XXS model and generates text end-to-end
+    ("Hello! How can I help you today? …"). Data-path pieces added: `QStorage::OpenCl`
+    (densest weights held as dequantized f32 on the OpenCl device, `84b6686`),
+    deepseek4 `Reader::qtensor` lets non-expert raw-dtype tensors dequantize onto
+    the device while routed experts stay CPU (`c860eee`), `from_raw_data::<T>`
+    OpenCl arm (`5e917a3`), and `apply_op*`/`inplace_op*` custom-op CPU-fallback
+    arms (`5451a3a`). `JOSHUA_PROFILE_LAYERS` on OpenCl (two passes, warm):
+    `[prof] attn total 102.7s -> 49.0s (avg 2.389 -> 1.140 s/layer) | moe total
+    78.1 -> 22.9s (avg 1.817 -> 0.534) | layer 180.8 -> 72.0s`. Absolute
+    latencies are high because the dense GEMMs run through M2 CPU-fallback ops +
+    host<->device transfers; native iGPU kernels are the M5 speed step (fails on
+    usable-but-slow, matching the "how far can we take it" brief).
 - **M5.** (optional) quantized dense kernels; M40-OpenCL cross-check.
 
 Each milestone lands as its own PR. M1–M4 are the "run the benchmark" critical
