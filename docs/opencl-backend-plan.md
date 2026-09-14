@@ -1,6 +1,6 @@
 # OpenCL accelerator backend for joshua (design + plan)
 
-**Status:** M1 round-trip + M2 operators done + verified on the host iGPU; M3 `--device opencl` next. **Owner:** joshua (this repo). **Target:** run the
+**Status:** M1 round-trip + M2 operators done + verified on the host iGPU; M3 `--device opencl` wired + accepted; M4 (deepseek4 dense set on OpenCL) next. **Owner:** joshua (this repo). **Target:** run the
 DeepSeek-V4-Flash benchmark on an Intel OpenCL GPU (iGPU now; M40 via the
 NVIDIA OpenCL ICD when reconnected) through a joshua-native `--device opencl`.
 
@@ -135,6 +135,15 @@ CPU as today.
     matmul, sum, to_dtype and index_select all match CPU on the real UHD 730.
     (Real OpenCL ND-range kernels are tracked as an M5 perf optimization.)
 - **M3.** joshua `--device opencl` + `DeviceArg::opencl`; tiny-model parity test.
+  - **M3 WIRED ✅ (commits `97ddb6e`, `5705146`):** `DeviceArg::OpenCl`
+    (`#[value(name = "opencl")]` so `--device opencl` is the accepted spelling),
+    `ComputeBackend::OpenCl`, strict `Engine::resolve_device` (load error when
+    the `opencl` feature is off or the device is unavailable) and `default_device`
+    tries OpenCL before CPU fallback. `cargo check` (no-feature + opencl) green.
+    Verified on the host binary (built `--features opencl`): `joshua serve
+    --device opencl` is accepted (fails only on the required `--model`, not on
+    the device value). Full quantized-model forward over `--device opencl` is
+    gated on the M4 dense-set load (OpenClStorage quantized weights).
 - **M4.** Dense deepseek4 over OpenCL on the real model; `JOSHUA_PROFILE_LAYERS`
   benchmark = the deliverable "same benchmark on OpenCL" numbers.
 - **M5.** (optional) quantized dense kernels; M40-OpenCL cross-check.
