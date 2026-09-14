@@ -322,8 +322,12 @@ impl BackendStorage for OpenClStorage {
         &self.device
     }
 
-    fn const_set(&mut self, _s: crate::scalar::Scalar, _layout: &Layout) -> Result<()> {
-        crate::bail!("opencl const_set not implemented yet (M2)")
+    fn const_set(&mut self, s: crate::scalar::Scalar, layout: &Layout) -> Result<()> {
+        let mut cpu = self.to_cpu_storage()?;
+        cpu.const_set(s, layout)?;
+        let dev = self.device.clone();
+        *self = dev.storage_from_cpu_storage(&cpu)?;
+        Ok(())
     }
 
     fn to_cpu_storage(&self) -> Result<CpuStorage> {
@@ -353,179 +357,265 @@ impl BackendStorage for OpenClStorage {
         })
     }
 
-    fn affine(&self, _: &Layout, _: f64, _: f64) -> Result<Self> {
-        crate::bail!("opencl affine not implemented yet (M2)")
+    fn affine(&self, layout: &Layout, mul: f64, add: f64) -> Result<Self> {
+        let cpu = self.to_cpu_storage()?;
+        let out = cpu.affine(layout, mul, add)?;
+        self.device.storage_from_cpu_storage(&out)
     }
 
-    fn powf(&self, _: &Layout, _: f64) -> Result<Self> {
-        crate::bail!("opencl powf not implemented yet (M2)")
+    fn powf(&self, layout: &Layout, e: f64) -> Result<Self> {
+        let cpu = self.to_cpu_storage()?;
+        let out = cpu.powf(layout, e)?;
+        self.device.storage_from_cpu_storage(&out)
     }
 
-    fn elu(&self, _: &Layout, _: f64) -> Result<Self> {
-        crate::bail!("opencl elu not implemented yet (M2)")
+    fn elu(&self, layout: &Layout, alpha: f64) -> Result<Self> {
+        let cpu = self.to_cpu_storage()?;
+        let out = cpu.elu(layout, alpha)?;
+        self.device.storage_from_cpu_storage(&out)
     }
 
-    fn reduce_op(&self, _: ReduceOp, _: &Layout, _: &[usize]) -> Result<Self> {
-        crate::bail!("opencl reduce_op not implemented yet (M2)")
+    fn reduce_op(&self, op: ReduceOp, layout: &Layout, s: &[usize]) -> Result<Self> {
+        let cpu = self.to_cpu_storage()?;
+        let out = cpu.reduce_op(op, layout, s)?;
+        self.device.storage_from_cpu_storage(&out)
     }
 
-    fn cmp(&self, _: CmpOp, _: &Self, _: &Layout, _: &Layout) -> Result<Self> {
-        crate::bail!("opencl cmp not implemented yet (M2)")
+    fn cmp(&self, op: CmpOp, rhs: &Self, lhs_l: &Layout, rhs_l: &Layout) -> Result<Self> {
+        let lhs = self.to_cpu_storage()?;
+        let rhs = rhs.to_cpu_storage()?;
+        let out = lhs.cmp(op, &rhs, lhs_l, rhs_l)?;
+        self.device.storage_from_cpu_storage(&out)
     }
 
-    fn to_dtype(&self, _: &Layout, _: DType) -> Result<Self> {
-        crate::bail!("opencl to_dtype not implemented yet (M2)")
+    fn to_dtype(&self, layout: &Layout, dtype: DType) -> Result<Self> {
+        let cpu = self.to_cpu_storage()?;
+        let out = cpu.to_dtype(layout, dtype)?;
+        self.device.storage_from_cpu_storage(&out)
     }
 
-    fn unary_impl<B: UnaryOpT>(&self, _: &Layout) -> Result<Self> {
-        crate::bail!("opencl unary not implemented yet (M2)")
+    fn unary_impl<B: UnaryOpT>(&self, layout: &Layout) -> Result<Self> {
+        let cpu = self.to_cpu_storage()?;
+        let out = cpu.unary_impl::<B>(layout)?;
+        self.device.storage_from_cpu_storage(&out)
     }
 
-    fn binary_impl<B: BinaryOpT>(&self, _: &Self, _: &Layout, _: &Layout) -> Result<Self> {
-        crate::bail!("opencl binary not implemented yet (M2)")
+    fn binary_impl<B: BinaryOpT>(&self, rhs: &Self, lhs_l: &Layout, rhs_l: &Layout) -> Result<Self> {
+        let lhs = self.to_cpu_storage()?;
+        let rhs = rhs.to_cpu_storage()?;
+        let out = lhs.binary_impl::<B>(&rhs, lhs_l, rhs_l)?;
+        self.device.storage_from_cpu_storage(&out)
     }
 
-    fn where_cond(&self, _: &Layout, _: &Self, _: &Layout, _: &Self, _: &Layout) -> Result<Self> {
-        crate::bail!("opencl where_cond not implemented yet (M2)")
+    fn where_cond(
+        &self,
+        layout: &Layout,
+        t: &Self,
+        t_l: &Layout,
+        f: &Self,
+        f_l: &Layout,
+    ) -> Result<Self> {
+        let cond = self.to_cpu_storage()?;
+        let t = t.to_cpu_storage()?;
+        let f = f.to_cpu_storage()?;
+        let out = cond.where_cond(layout, &t, t_l, &f, f_l)?;
+        self.device.storage_from_cpu_storage(&out)
     }
 
     fn conv1d(
         &self,
-        _: &Layout,
-        _: &Self,
-        _: &Layout,
-        _: &crate::conv::ParamsConv1D,
+        l: &Layout,
+        kernel: &Self,
+        kernel_l: &Layout,
+        params: &crate::conv::ParamsConv1D,
     ) -> Result<Self> {
-        crate::bail!("opencl conv1d not implemented yet (M2)")
+        let inp = self.to_cpu_storage()?;
+        let kernel = kernel.to_cpu_storage()?;
+        let out = inp.conv1d(l, &kernel, kernel_l, params)?;
+        self.device.storage_from_cpu_storage(&out)
     }
 
     fn conv_transpose1d(
         &self,
-        _: &Layout,
-        _: &Self,
-        _: &Layout,
-        _: &crate::conv::ParamsConvTranspose1D,
+        l: &Layout,
+        kernel: &Self,
+        kernel_l: &Layout,
+        params: &crate::conv::ParamsConvTranspose1D,
     ) -> Result<Self> {
-        crate::bail!("opencl conv_transpose1d not implemented yet (M2)")
+        let inp = self.to_cpu_storage()?;
+        let kernel = kernel.to_cpu_storage()?;
+        let out = inp.conv_transpose1d(l, &kernel, kernel_l, params)?;
+        self.device.storage_from_cpu_storage(&out)
     }
 
     fn conv2d(
         &self,
-        _: &Layout,
-        _: &Self,
-        _: &Layout,
-        _: &crate::conv::ParamsConv2D,
+        l: &Layout,
+        kernel: &Self,
+        kernel_l: &Layout,
+        params: &crate::conv::ParamsConv2D,
     ) -> Result<Self> {
-        crate::bail!("opencl conv2d not implemented yet (M2)")
+        let inp = self.to_cpu_storage()?;
+        let kernel = kernel.to_cpu_storage()?;
+        let out = inp.conv2d(l, &kernel, kernel_l, params)?;
+        self.device.storage_from_cpu_storage(&out)
     }
 
     fn conv_transpose2d(
         &self,
-        _: &Layout,
-        _: &Self,
-        _: &Layout,
-        _: &crate::conv::ParamsConvTranspose2D,
+        l: &Layout,
+        kernel: &Self,
+        kernel_l: &Layout,
+        params: &crate::conv::ParamsConvTranspose2D,
     ) -> Result<Self> {
-        crate::bail!("opencl conv_transpose2d not implemented yet (M2)")
+        let inp = self.to_cpu_storage()?;
+        let kernel = kernel.to_cpu_storage()?;
+        let out = inp.conv_transpose2d(l, &kernel, kernel_l, params)?;
+        self.device.storage_from_cpu_storage(&out)
     }
 
-    fn index_select(&self, _: &Self, _: &Layout, _: &Layout, _: usize) -> Result<Self> {
-        crate::bail!("opencl index_select not implemented yet (M2)")
+    fn index_select(&self, ids: &Self, l: &Layout, ids_l: &Layout, dim: usize) -> Result<Self> {
+        let src = self.to_cpu_storage()?;
+        let ids = ids.to_cpu_storage()?;
+        let out = src.index_select(&ids, l, ids_l, dim)?;
+        self.device.storage_from_cpu_storage(&out)
     }
 
-    fn gather(&self, _: &Layout, _: &Self, _: &Layout, _: usize) -> Result<Self> {
-        crate::bail!("opencl gather not implemented yet (M2)")
+    fn gather(&self, l: &Layout, ids: &Self, ids_l: &Layout, dim: usize) -> Result<Self> {
+        let src = self.to_cpu_storage()?;
+        let ids = ids.to_cpu_storage()?;
+        let out = src.gather(l, &ids, ids_l, dim)?;
+        self.device.storage_from_cpu_storage(&out)
     }
 
     fn scatter_set(
         &mut self,
-        _: &Layout,
-        _: &Self,
-        _: &Layout,
-        _: &Self,
-        _: &Layout,
-        _: usize,
+        l: &Layout,
+        ids: &Self,
+        ids_l: &Layout,
+        src: &Self,
+        src_l: &Layout,
+        dim: usize,
     ) -> Result<()> {
-        crate::bail!("opencl scatter_set not implemented yet (M2)")
+        let mut tgt = self.to_cpu_storage()?;
+        let ids = ids.to_cpu_storage()?;
+        let src = src.to_cpu_storage()?;
+        tgt.scatter_set(l, &ids, ids_l, &src, src_l, dim)?;
+        let dev = self.device.clone();
+        *self = dev.storage_from_cpu_storage(&tgt)?;
+        Ok(())
     }
 
     fn scatter_add_set(
         &mut self,
-        _: &Layout,
-        _: &Self,
-        _: &Layout,
-        _: &Self,
-        _: &Layout,
-        _: usize,
+        l: &Layout,
+        ids: &Self,
+        ids_l: &Layout,
+        src: &Self,
+        src_l: &Layout,
+        dim: usize,
     ) -> Result<()> {
-        crate::bail!("opencl scatter_add_set not implemented yet (M2)")
+        let mut tgt = self.to_cpu_storage()?;
+        let ids = ids.to_cpu_storage()?;
+        let src = src.to_cpu_storage()?;
+        tgt.scatter_add_set(l, &ids, ids_l, &src, src_l, dim)?;
+        let dev = self.device.clone();
+        *self = dev.storage_from_cpu_storage(&tgt)?;
+        Ok(())
     }
 
     fn index_add(
         &self,
-        _: &Layout,
-        _: &Self,
-        _: &Layout,
-        _: &Self,
-        _: &Layout,
-        _: usize,
+        l: &Layout,
+        ids: &Self,
+        ids_l: &Layout,
+        src: &Self,
+        src_l: &Layout,
+        dim: usize,
     ) -> Result<Self> {
-        crate::bail!("opencl index_add not implemented yet (M2)")
+        let tgt = self.to_cpu_storage()?;
+        let ids = ids.to_cpu_storage()?;
+        let src = src.to_cpu_storage()?;
+        let out = tgt.index_add(l, &ids, ids_l, &src, src_l, dim)?;
+        self.device.storage_from_cpu_storage(&out)
     }
 
     fn matmul(
         &self,
-        _: &Self,
-        _: (usize, usize, usize, usize),
-        _: &Layout,
-        _: &Layout,
+        rhs: &Self,
+        bmnk: (usize, usize, usize, usize),
+        lhs_l: &Layout,
+        rhs_l: &Layout,
     ) -> Result<Self> {
-        crate::bail!("opencl matmul not implemented yet (M2)")
+        let lhs = self.to_cpu_storage()?;
+        let rhs = rhs.to_cpu_storage()?;
+        let out = lhs.matmul(&rhs, bmnk, lhs_l, rhs_l)?;
+        self.device.storage_from_cpu_storage(&out)
     }
 
-    fn copy_strided_src(&self, _dst: &mut Self, _dst_offset: usize, _src_l: &Layout) -> Result<()> {
-        crate::bail!("opencl copy_strided_src not implemented yet (M2)")
+    fn copy_strided_src(&self, dst: &mut Self, dst_offset: usize, src_l: &Layout) -> Result<()> {
+        let src = self.to_cpu_storage()?;
+        let mut dst_cpu = dst.to_cpu_storage()?;
+        src.copy_strided_src(&mut dst_cpu, dst_offset, src_l)?;
+        let dev = dst.device.clone();
+        *dst = dev.storage_from_cpu_storage(&dst_cpu)?;
+        Ok(())
     }
 
     fn copy2d(
         &self,
-        _: &mut Self,
-        _: usize,
-        _: usize,
-        _: usize,
-        _: usize,
-        _: usize,
-        _: usize,
+        dst: &mut Self,
+        d1: usize,
+        d2: usize,
+        src_s: usize,
+        dst_s: usize,
+        src_o: usize,
+        dst_o: usize,
     ) -> Result<()> {
-        crate::bail!("opencl copy2d not implemented yet (M2)")
+        let src = self.to_cpu_storage()?;
+        let mut dst_cpu = dst.to_cpu_storage()?;
+        src.copy2d(&mut dst_cpu, d1, d2, src_s, dst_s, src_o, dst_o)?;
+        let dev = dst.device.clone();
+        *dst = dev.storage_from_cpu_storage(&dst_cpu)?;
+        Ok(())
     }
 
-    fn avg_pool2d(&self, _: &Layout, _: (usize, usize), _: (usize, usize)) -> Result<Self> {
-        crate::bail!("opencl avg_pool2d not implemented yet (M2)")
+    fn avg_pool2d(&self, layout: &Layout, k: (usize, usize), s: (usize, usize)) -> Result<Self> {
+        let cpu = self.to_cpu_storage()?;
+        let out = cpu.avg_pool2d(layout, k, s)?;
+        self.device.storage_from_cpu_storage(&out)
     }
 
-    fn max_pool2d(&self, _: &Layout, _: (usize, usize), _: (usize, usize)) -> Result<Self> {
-        crate::bail!("opencl max_pool2d not implemented yet (M2)")
+    fn max_pool2d(&self, layout: &Layout, k: (usize, usize), s: (usize, usize)) -> Result<Self> {
+        let cpu = self.to_cpu_storage()?;
+        let out = cpu.max_pool2d(layout, k, s)?;
+        self.device.storage_from_cpu_storage(&out)
     }
 
-    fn upsample_nearest1d(&self, _: &Layout, _: usize) -> Result<Self> {
-        crate::bail!("opencl upsample_nearest1d not implemented yet (M2)")
+    fn upsample_nearest1d(&self, layout: &Layout, sz: usize) -> Result<Self> {
+        let cpu = self.to_cpu_storage()?;
+        let out = cpu.upsample_nearest1d(layout, sz)?;
+        self.device.storage_from_cpu_storage(&out)
     }
 
-    fn upsample_nearest2d(&self, _: &Layout, _: usize, _: usize) -> Result<Self> {
-        crate::bail!("opencl upsample_nearest2d not implemented yet (M2)")
+    fn upsample_nearest2d(&self, layout: &Layout, h: usize, w: usize) -> Result<Self> {
+        let cpu = self.to_cpu_storage()?;
+        let out = cpu.upsample_nearest2d(layout, h, w)?;
+        self.device.storage_from_cpu_storage(&out)
     }
 
     fn upsample_bilinear2d(
         &self,
-        _: &Layout,
-        _: usize,
-        _: usize,
-        _: bool,
-        _: Option<f64>,
-        _: Option<f64>,
+        layout: &Layout,
+        h: usize,
+        w: usize,
+        align_corners: bool,
+        scale_h: Option<f64>,
+        scale_w: Option<f64>,
     ) -> Result<Self> {
-        crate::bail!("opencl upsample_bilinear2d not implemented yet (M2)")
+        let cpu = self.to_cpu_storage()?;
+        let out = cpu.upsample_bilinear2d(layout, h, w, align_corners, scale_h, scale_w)?;
+        self.device.storage_from_cpu_storage(&out)
     }
 }
 
