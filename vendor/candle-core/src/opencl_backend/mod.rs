@@ -639,6 +639,39 @@ impl BackendStorage for OpenClStorage {
         lhs_l: &Layout,
         rhs_l: &Layout,
     ) -> Result<Self> {
+        let (b, m, n, k) = bmnk;
+        // M5 native GEMM, single-batch contiguous f32 only (attention's batched
+        // GEMMs with b == num_heads fall back to the CPU path, which is correct).
+        if b == 1
+            && kernels::native_enabled()
+            && lhs_l.is_contiguous()
+            && rhs_l.is_contiguous()
+            && self.dtype == DType::F32
+            && rhs.dtype == DType::F32
+        {
+            let out_buf = create_buffer(self.device.context(), m * n * 4, cl::CL_MEM_READ_WRITE)?;
+            match kernels::run_matmul(
+                self.device.context(),
+                self.device.device_id,
+                self.device.queue(),
+                self.buffer,
+                rhs.buffer,
+                out_buf,
+                (m, n, k),
+            ) {
+                Ok(()) => {
+                    return Ok(OpenClStorage {
+                        buffer: out_buf,
+                        dtype: self.dtype,
+                        numel: m * n,
+                        device: self.device.clone(),
+                    });
+                }
+                Err(_) => {
+                    unsafe { clReleaseMemObject(out_buf) };
+                }
+            }
+        }
         let lhs = self.to_cpu_storage()?;
         let rhs = rhs.to_cpu_storage()?;
         let out = lhs.matmul(&rhs, bmnk, lhs_l, rhs_l)?;
