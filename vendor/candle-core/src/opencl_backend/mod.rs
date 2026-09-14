@@ -26,6 +26,9 @@ mod cl {
 }
 
 // --- Minimal hand-rolled OpenCL FFI (CL 1.2 buffer-transfer subset). ---
+// The `#[link]` directive makes rustc link against `-lOpenCL` (the ICD loader,
+// libOpenCL.so on Linux / OpenCL.framework or libOpenCL on macOS).
+#[link(name = "OpenCL")]
 extern "C" {
     fn clGetPlatformIDs(num_entries: u32, platforms: *mut usize, num_platforms: *mut u32) -> i32;
     fn clGetDeviceIDs(
