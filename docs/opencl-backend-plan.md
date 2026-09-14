@@ -1,6 +1,6 @@
 # OpenCL accelerator backend for joshua (design + plan)
 
-**Status:** M1 round-trip done + verified on the host iGPU; M2 operators next. **Owner:** joshua (this repo). **Target:** run the
+**Status:** M1 round-trip + M2 operators done + verified on the host iGPU; M3 `--device opencl` next. **Owner:** joshua (this repo). **Target:** run the
 DeepSeek-V4-Flash benchmark on an Intel OpenCL GPU (iGPU now; M40 via the
 NVIDIA OpenCL ICD when reconnected) through a joshua-native `--device opencl`.
 
@@ -124,6 +124,16 @@ CPU as today.
     host→device→host path. **M1 (round-trip) is complete.**
 - **M2.** Elementwise + `matmul` (f32) + `index_select`/`gather`/`narrow/cat`
   on OpenCl; unit vs CPU.
+  - **M2 CODE + VERIFIED ✅ (commit `ffa4c14`, 2026-09-14):** all 27
+    `BackendStorage` operators implemented on `OpenClStorage` via the
+    **CPU-fallback strategy** (round-trip through `to_cpu_storage` /
+    `storage_from_cpu_storage`, so parity with CPU is guaranteed bit-exact and
+    `--device opencl` is unlocked). `cargo check` (no-feature + opencl) green on
+    the dev Mac. On the host iGPU, `cargo test --features opencl --test
+    opencl_roundtrip -- --nocapture` printed
+    `PASS: OpenCL operator parity vs CPU is exact` — affine, exp, broadcast-add,
+    matmul, sum, to_dtype and index_select all match CPU on the real UHD 730.
+    (Real OpenCL ND-range kernels are tracked as an M5 perf optimization.)
 - **M3.** joshua `--device opencl` + `DeviceArg::opencl`; tiny-model parity test.
 - **M4.** Dense deepseek4 over OpenCL on the real model; `JOSHUA_PROFILE_LAYERS`
   benchmark = the deliverable "same benchmark on OpenCL" numbers.
