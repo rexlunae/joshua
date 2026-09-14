@@ -13,6 +13,8 @@
 //! for now rather than a silent wrong result.
 #![allow(clippy::missing_safety_doc)]
 
+pub mod kernels;
+
 use crate::backend::{BackendDevice, BackendStorage};
 use crate::op::{BinaryOpT, CmpOp, ReduceOp, UnaryOpT};
 use crate::{CpuStorage, DType, Error, Layout, Result, Shape};
@@ -358,6 +360,34 @@ impl BackendStorage for OpenClStorage {
     }
 
     fn affine(&self, layout: &Layout, mul: f64, add: f64) -> Result<Self> {
+        // M5 native kernel path (opt-in, contiguous f32): run on the iGPU.
+        if kernels::native_enabled() && layout.is_contiguous() && self.dtype == DType::F32 {
+            let n = self.numel;
+            let out_buf = create_buffer(self.device.context(), n * 4, cl::CL_MEM_READ_WRITE)?;
+            match kernels::run_affine(
+                self.device.context(),
+                self.device.device_id,
+                self.device.queue(),
+                self.buffer,
+                out_buf,
+                n,
+                mul as f32,
+                add as f32,
+            ) {
+                Ok(()) => {
+                    return Ok(OpenClStorage {
+                        buffer: out_buf,
+                        dtype: self.dtype,
+                        numel: self.numel,
+                        device: self.device.clone(),
+                    });
+                }
+                Err(_) => {
+                    unsafe { clReleaseMemObject(out_buf) };
+                    // fall through to CPU fallback below
+                }
+            }
+        }
         let cpu = self.to_cpu_storage()?;
         let out = cpu.affine(layout, mul, add)?;
         self.device.storage_from_cpu_storage(&out)
@@ -395,12 +425,74 @@ impl BackendStorage for OpenClStorage {
     }
 
     fn unary_impl<B: UnaryOpT>(&self, layout: &Layout) -> Result<Self> {
+        if kernels::native_enabled()
+            && layout.is_contiguous()
+            && self.dtype == DType::F32
+            && kernels::has_unary(B::NAME)
+        {
+            let n = self.numel;
+            let out_buf = create_buffer(self.device.context(), n * 4, cl::CL_MEM_READ_WRITE)?;
+            match kernels::run_unary(
+                self.device.context(),
+                self.device.device_id,
+                self.device.queue(),
+                B::NAME,
+                self.buffer,
+                out_buf,
+                n,
+            ) {
+                Ok(()) => {
+                    return Ok(OpenClStorage {
+                        buffer: out_buf,
+                        dtype: self.dtype,
+                        numel: self.numel,
+                        device: self.device.clone(),
+                    });
+                }
+                Err(_) => {
+                    unsafe { clReleaseMemObject(out_buf) };
+                }
+            }
+        }
         let cpu = self.to_cpu_storage()?;
         let out = cpu.unary_impl::<B>(layout)?;
         self.device.storage_from_cpu_storage(&out)
     }
 
     fn binary_impl<B: BinaryOpT>(&self, rhs: &Self, lhs_l: &Layout, rhs_l: &Layout) -> Result<Self> {
+        if kernels::native_enabled()
+            && lhs_l.is_contiguous()
+            && rhs_l.is_contiguous()
+            && self.dtype == DType::F32
+            && rhs.dtype == DType::F32
+            && self.numel == rhs.numel
+            && kernels::has_binary(B::NAME)
+        {
+            let n = self.numel;
+            let out_buf = create_buffer(self.device.context(), n * 4, cl::CL_MEM_READ_WRITE)?;
+            match kernels::run_binary(
+                self.device.context(),
+                self.device.device_id,
+                self.device.queue(),
+                B::NAME,
+                self.buffer,
+                rhs.buffer,
+                out_buf,
+                n,
+            ) {
+                Ok(()) => {
+                    return Ok(OpenClStorage {
+                        buffer: out_buf,
+                        dtype: self.dtype,
+                        numel: self.numel,
+                        device: self.device.clone(),
+                    });
+                }
+                Err(_) => {
+                    unsafe { clReleaseMemObject(out_buf) };
+                }
+            }
+        }
         let lhs = self.to_cpu_storage()?;
         let rhs = rhs.to_cpu_storage()?;
         let out = lhs.binary_impl::<B>(&rhs, lhs_l, rhs_l)?;
