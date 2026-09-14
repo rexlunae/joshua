@@ -42,6 +42,10 @@ cudnn = [
     "cudarc/cudnn",
 ]
 default = []
+
+# OpenCL accelerator backend (Intel Arc/iGPU via the OpenCL ICD).
+# Hand-rolled libOpenCL FFI; no extra crate dep. Off by default.
+opencl = []
 metal = [
     "dep:objc2-metal",
     "dep:objc2-foundation",
