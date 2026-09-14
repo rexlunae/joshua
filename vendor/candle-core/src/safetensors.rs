@@ -274,11 +274,18 @@ impl Tensor {
                         );
                         Storage::Metal(storage)
                     }
+
                     #[cfg(not(feature = "metal"))]
                     Device::Metal(_) => {
                         return Err(Error::Msg("Metal support not compiled".to_string()));
                     }
+                    Device::OpenCl(_) => {
+                        return Err(Error::Msg(
+                            "OpenCL support for sub-byte dtypes is not implemented (M1)".to_string(),
+                        ));
+                    }
                 };
+
 
                 let op = BackpropOp::none();
                 Ok(from_storage(storage, shape, op, false))
@@ -377,6 +384,11 @@ fn convert_dummy(view: &st::TensorView<'_>, device: &Device) -> Result<Tensor> {
         #[cfg(not(feature = "metal"))]
         Device::Metal(_) => {
             return Err(Error::Msg("Metal support not compiled".to_string()));
+        }
+        Device::OpenCl(_) => {
+            return Err(Error::Msg(
+                "OpenCL support for sub-byte dtypes is not implemented (M1)".to_string(),
+            ));
         }
     };
 

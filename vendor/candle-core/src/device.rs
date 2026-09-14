@@ -9,14 +9,16 @@ pub enum DeviceLocation {
     Cpu,
     Cuda { gpu_id: usize },
     Metal { gpu_id: usize },
+    OpenCl { gpu_id: usize },
 }
 
-/// Cpu, Cuda, or Metal
+/// Cpu, Cuda, Metal, or OpenCL
 #[derive(Debug, Clone)]
 pub enum Device {
     Cpu,
     Cuda(crate::CudaDevice),
     Metal(crate::MetalDevice),
+    OpenCl(crate::OpenClDevice),
 }
 
 pub trait NdArray {
@@ -235,11 +237,25 @@ impl Device {
         Ok(Self::Cuda(crate::CudaDevice::new(ordinal)?))
     }
 
+    pub fn new_opencl(ordinal: usize) -> Result<Self> {
+        Ok(Self::OpenCl(crate::OpenClDevice::new(ordinal)?))
+    }
+
     pub fn as_cuda_device(&self) -> Result<&crate::CudaDevice> {
         match self {
             Self::Cuda(d) => Ok(d),
             Self::Cpu => crate::bail!("expected a cuda device, got cpu"),
             Self::Metal(_) => crate::bail!("expected a cuda device, got Metal"),
+            Self::OpenCl(_) => crate::bail!("expected a cuda device, got OpenCl"),
+        }
+    }
+
+    pub fn as_opencl_device(&self) -> Result<&crate::OpenClDevice> {
+        match self {
+            Self::OpenCl(d) => Ok(d),
+            Self::Cpu => crate::bail!("expected an opencl device, got cpu"),
+            Self::Cuda(_) => crate::bail!("expected an opencl device, got cuda"),
+            Self::Metal(_) => crate::bail!("expected an opencl device, got Metal"),
         }
     }
 
@@ -248,6 +264,7 @@ impl Device {
             Self::Cuda(_) => crate::bail!("expected a metal device, got cuda"),
             Self::Cpu => crate::bail!("expected a metal device, got cpu"),
             Self::Metal(d) => Ok(d),
+            Self::OpenCl(_) => crate::bail!("expected a metal device, got OpenCl"),
         }
     }
 
@@ -280,6 +297,7 @@ impl Device {
             Self::Cpu => CpuDevice.set_seed(seed),
             Self::Cuda(c) => c.set_seed(seed),
             Self::Metal(m) => m.set_seed(seed),
+            Self::OpenCl(o) => o.set_seed(seed),
         }
     }
 
@@ -288,6 +306,7 @@ impl Device {
             Self::Cpu => CpuDevice.get_current_seed(),
             Self::Cuda(c) => c.get_current_seed(),
             Self::Metal(m) => m.get_current_seed(),
+            Self::OpenCl(o) => o.get_current_seed(),
         }
     }
 
@@ -296,6 +315,7 @@ impl Device {
             (Self::Cpu, Self::Cpu) => true,
             (Self::Cuda(lhs), Self::Cuda(rhs)) => lhs.same_device(rhs),
             (Self::Metal(lhs), Self::Metal(rhs)) => lhs.same_device(rhs),
+            (Self::OpenCl(lhs), Self::OpenCl(rhs)) => lhs.same_device(rhs),
             _ => false,
         }
     }
@@ -305,6 +325,7 @@ impl Device {
             Self::Cpu => DeviceLocation::Cpu,
             Self::Cuda(device) => device.location(),
             Device::Metal(device) => device.location(),
+            Device::OpenCl(device) => device.location(),
         }
     }
 
@@ -320,10 +341,15 @@ impl Device {
         matches!(self, Self::Metal(_))
     }
 
+    pub fn is_opencl(&self) -> bool {
+        matches!(self, Self::OpenCl(_))
+    }
+
     pub fn supports_bf16(&self) -> bool {
         match self {
             Self::Cuda(_) | Self::Metal(_) => true,
             Self::Cpu => false,
+            Self::OpenCl(_) => false,
         }
     }
 
@@ -347,6 +373,14 @@ impl Device {
     pub fn metal_if_available(ordinal: usize) -> Result<Self> {
         if crate::utils::metal_is_available() {
             Self::new_metal(ordinal)
+        } else {
+            Ok(Self::Cpu)
+        }
+    }
+
+    pub fn opencl_if_available(ordinal: usize) -> Result<Self> {
+        if crate::utils::opencl_is_available() {
+            Self::new_opencl(ordinal)
         } else {
             Ok(Self::Cpu)
         }
@@ -377,6 +411,10 @@ impl Device {
             Device::Metal(device) => {
                 let storage = device.rand_uniform(shape, dtype, lo, up)?;
                 Ok(Storage::Metal(storage))
+            }
+            Device::OpenCl(device) => {
+                let storage = device.rand_uniform(shape, dtype, lo, up)?;
+                Ok(Storage::OpenCl(storage))
             }
         }
     }
@@ -416,6 +454,10 @@ impl Device {
                 let storage = device.rand_normal(shape, dtype, mean, std)?;
                 Ok(Storage::Metal(storage))
             }
+            Device::OpenCl(device) => {
+                let storage = device.rand_normal(shape, dtype, mean, std)?;
+                Ok(Storage::OpenCl(storage))
+            }
         }
     }
 
@@ -442,6 +484,10 @@ impl Device {
                 let storage = device.zeros_impl(shape, dtype)?;
                 Ok(Storage::Metal(storage))
             }
+            Device::OpenCl(device) => {
+                let storage = device.zeros_impl(shape, dtype)?;
+                Ok(Storage::OpenCl(storage))
+            }
         }
     }
 
@@ -459,6 +505,10 @@ impl Device {
                 let storage = device.alloc_uninit(shape, dtype)?;
                 Ok(Storage::Metal(storage))
             }
+            Device::OpenCl(device) => {
+                let storage = device.alloc_uninit(shape, dtype)?;
+                Ok(Storage::OpenCl(storage))
+            }
         }
     }
 
@@ -472,6 +522,10 @@ impl Device {
             Device::Metal(device) => {
                 let storage = device.storage_from_slice(data)?;
                 Ok(Storage::Metal(storage))
+            }
+            Device::OpenCl(device) => {
+                let storage = device.storage_from_slice(data)?;
+                Ok(Storage::OpenCl(storage))
             }
         }
     }
@@ -489,6 +543,11 @@ impl Device {
                 let storage = device.storage_from_cpu_storage_owned(storage)?;
                 Ok(Storage::Metal(storage))
             }
+            Device::OpenCl(device) => {
+                let storage = array.to_cpu_storage();
+                let storage = device.storage_from_cpu_storage_owned(storage)?;
+                Ok(Storage::OpenCl(storage))
+            }
         }
     }
 
@@ -505,6 +564,11 @@ impl Device {
                 let storage = device.storage_from_cpu_storage_owned(storage)?;
                 Ok(Storage::Metal(storage))
             }
+            Device::OpenCl(device) => {
+                let storage = S::to_cpu_storage_owned(data);
+                let storage = device.storage_from_cpu_storage_owned(storage)?;
+                Ok(Storage::OpenCl(storage))
+            }
         }
     }
 
@@ -513,6 +577,7 @@ impl Device {
             Self::Cpu => Ok(()),
             Self::Cuda(d) => d.synchronize(),
             Self::Metal(d) => d.synchronize(),
+            Self::OpenCl(d) => d.synchronize(),
         }
     }
 }

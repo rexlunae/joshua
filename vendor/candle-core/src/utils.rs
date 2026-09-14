@@ -407,6 +407,10 @@ pub fn metal_is_available() -> bool {
     cfg!(feature = "metal")
 }
 
+pub fn opencl_is_available() -> bool {
+    cfg!(feature = "opencl")
+}
+
 pub fn with_avx() -> bool {
     cfg!(target_feature = "avx2")
 }

@@ -64,6 +64,10 @@ mod dtype;
 pub mod dummy_cuda_backend;
 pub mod dummy_dtype;
 mod dummy_metal_backend;
+#[cfg(feature = "opencl")]
+pub mod opencl_backend;
+#[cfg(not(feature = "opencl"))]
+pub mod dummy_opencl_backend;
 pub mod error;
 mod indexer;
 pub mod layout;
@@ -123,6 +127,12 @@ pub use metal_backend::{MetalDevice, MetalError, MetalStorage};
 
 #[cfg(not(feature = "metal"))]
 pub use dummy_metal_backend::{MetalDevice, MetalError, MetalStorage};
+
+#[cfg(feature = "opencl")]
+pub use opencl_backend::{OpenClDevice, OpenClStorage};
+
+#[cfg(not(feature = "opencl"))]
+pub use dummy_opencl_backend::{OpenClDevice, OpenClStorage};
 
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;

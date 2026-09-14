@@ -164,6 +164,9 @@ pub enum Error {
     #[error("the candle crate has not been built with metal support")]
     NotCompiledWithMetalSupport,
 
+    #[error("the candle crate has not been built with opencl support")]
+    NotCompiledWithOpenClSupport,
+
     #[error("cannot find tensor {path}")]
     CannotFindTensor { path: String },
 
