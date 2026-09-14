@@ -1,4 +1,4 @@
-use crate::backend::BackendStorage;
+use crate::backend::{BackendDevice, BackendStorage};
 use crate::op::{self, CmpOp, ReduceOp};
 use crate::scalar::Scalar;
 use crate::{CpuStorage, CudaStorage, DType, Device, Error, Layout, MetalStorage, OpenClStorage, Result, Shape};
@@ -248,8 +248,11 @@ impl Storage {
                 let (storage, shape) = c.metal_fwd(storage, l)?;
                 Ok((Self::Metal(storage), shape))
             }
-            Self::OpenCl(_) => {
-                crate::bail!("opencl custom ops not supported yet (M2)")
+            Self::OpenCl(storage) => {
+                let cpu = storage.to_cpu_storage()?;
+                let (out, shape) = c.cpu_fwd(&cpu, l)?;
+                let dev = storage.device.clone();
+                Ok((Self::OpenCl(dev.storage_from_cpu_storage(&out)?), shape))
             }
         }
     }
@@ -275,8 +278,12 @@ impl Storage {
                 let (s, shape) = c.metal_fwd(s1, l1, s2, l2)?;
                 Ok((Self::Metal(s), shape))
             }
-            (Self::OpenCl(_), Self::OpenCl(_)) => {
-                crate::bail!("opencl custom ops not supported yet (M2)")
+            (Self::OpenCl(s1), Self::OpenCl(s2)) => {
+                let c1 = s1.to_cpu_storage()?;
+                let c2 = s2.to_cpu_storage()?;
+                let (s, shape) = c.cpu_fwd(&c1, l1, &c2, l2)?;
+                let dev = s1.device.clone();
+                Ok((Self::OpenCl(dev.storage_from_cpu_storage(&s)?), shape))
             }
             _ => unreachable!(),
         }
@@ -306,8 +313,13 @@ impl Storage {
                 let (s, shape) = c.metal_fwd(s1, l1, s2, l2, s3, l3)?;
                 Ok((Self::Metal(s), shape))
             }
-            (Self::OpenCl(_), Self::OpenCl(_), Self::OpenCl(_)) => {
-                crate::bail!("opencl custom ops not supported yet (M2)")
+            (Self::OpenCl(s1), Self::OpenCl(s2), Self::OpenCl(s3)) => {
+                let c1 = s1.to_cpu_storage()?;
+                let c2 = s2.to_cpu_storage()?;
+                let c3 = s3.to_cpu_storage()?;
+                let (s, shape) = c.cpu_fwd(&c1, l1, &c2, l2, &c3, l3)?;
+                let dev = s1.device.clone();
+                Ok((Self::OpenCl(dev.storage_from_cpu_storage(&s)?), shape))
             }
             _ => unreachable!(),
         }
@@ -318,7 +330,13 @@ impl Storage {
             Self::Cpu(storage) => c.cpu_fwd(storage, l),
             Self::Cuda(storage) => c.cuda_fwd(storage, l),
             Self::Metal(storage) => c.metal_fwd(storage, l),
-            Self::OpenCl(_) => crate::bail!("opencl custom ops not supported yet (M2)"),
+            Self::OpenCl(storage) => {
+                let mut cpu = storage.to_cpu_storage()?;
+                c.cpu_fwd(&mut cpu, l)?;
+                let dev = storage.device.clone();
+                *storage = dev.storage_from_cpu_storage(&cpu)?;
+                Ok(())
+            }
         }
     }
 
@@ -334,8 +352,13 @@ impl Storage {
             (Self::Cpu(s1), Self::Cpu(s2)) => c.cpu_fwd(s1, l1, s2, l2),
             (Self::Cuda(s1), Self::Cuda(s2)) => c.cuda_fwd(s1, l1, s2, l2),
             (Self::Metal(s1), Self::Metal(s2)) => c.metal_fwd(s1, l1, s2, l2),
-            (Self::OpenCl(_), Self::OpenCl(_)) => {
-                crate::bail!("opencl custom ops not supported yet (M2)")
+            (Self::OpenCl(s1), Self::OpenCl(s2)) => {
+                let mut c1 = s1.to_cpu_storage()?;
+                let c2 = s2.to_cpu_storage()?;
+                c.cpu_fwd(&mut c1, l1, &c2, l2)?;
+                let dev = s1.device.clone();
+                *s1 = dev.storage_from_cpu_storage(&c1)?;
+                Ok(())
             }
             _ => unreachable!(),
         }
@@ -358,8 +381,14 @@ impl Storage {
             (Self::Metal(s1), Self::Metal(s2), Self::Metal(s3)) => {
                 c.metal_fwd(s1, l1, s2, l2, s3, l3)
             }
-            (Self::OpenCl(_), Self::OpenCl(_), Self::OpenCl(_)) => {
-                crate::bail!("opencl custom ops not supported yet (M2)")
+            (Self::OpenCl(s1), Self::OpenCl(s2), Self::OpenCl(s3)) => {
+                let mut c1 = s1.to_cpu_storage()?;
+                let c2 = s2.to_cpu_storage()?;
+                let c3 = s3.to_cpu_storage()?;
+                c.cpu_fwd(&mut c1, l1, &c2, l2, &c3, l3)?;
+                let dev = s1.device.clone();
+                *s1 = dev.storage_from_cpu_storage(&c1)?;
+                Ok(())
             }
             _ => unreachable!(),
         }
