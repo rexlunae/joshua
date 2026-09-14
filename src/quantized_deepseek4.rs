@@ -1615,6 +1615,16 @@ pub struct ModelWeights {
 }
 
 /// Small GGUF reader over the memory-mapped file.
+/// Whether a deepseek4 tensor name belongs to the routed-expert set
+/// (`.ffn_gate_exps` / `.ffn_up_exps` / `.ffn_down_exps`).  These are the only
+/// weights that stay CPU-resident on an accelerator; everything else is dense
+/// and can be dequantized onto the device (M4).
+fn is_routed_expert(name: &str) -> bool {
+    name.contains(".ffn_gate_exps")
+        || name.contains(".ffn_down_exps")
+        || name.contains(".ffn_up_exps")
+}
+
 struct Reader<R: Read + Seek> {
     ct: gguf_file::Content,
     /// Raw header with every tensor's dtype as its GGUF id, including types
@@ -1659,13 +1669,18 @@ impl<R: Read + Seek> Reader<R> {
                     }
                 }
                 // Accelerator devices cannot borrow (the blocks are CPU
-                // storage), and decoding a real IQ2_XXS tensor to f32 is an
-                // order-of-magnitude memory blow-up (the expert tensors alone
-                // are ~40 GB of 2-bit data, ~640 GB as f32).  Fail fast with
-                // an explicit limitation instead of an allocation abort.
-                if !self.device.is_cpu() {
+                // storage), and decoding a routed-expert IQ2_XXS tensor to f32
+                // is an order-of-magnitude memory blow-up (the experts alone
+                // are ~40 GB of 2-bit data, ~640 GB as f32).  Routed experts
+                // therefore stay on the CPU (the design always keeps the
+                // expert pool in host RAM on an accelerator via `expert_device`).
+                // Dense (non-expert) raw-dtype tensors, in contrast, are small
+                // enough (~GiB) to dequantize onto the accelerator, so we let
+                // those fall through to the decode-to-f32-on-device path below
+                // (M4: dense set on OpenCl).
+                if !self.device.is_cpu() && is_routed_expert(name) {
                     candle_core::bail!(
-                        "deepseek4: tensor `{name}` has GGUF dtype {} which is only supported on the CPU device",
+                        "deepseek4: tensor `{name}` has GGUF dtype {} which is only supported on the CPU device (routed expert)",
                         info.dtype
                     );
                 }
