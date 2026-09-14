@@ -159,7 +159,15 @@ CPU as today.
     latencies are high because the dense GEMMs run through M2 CPU-fallback ops +
     host<->device transfers; native iGPU kernels are the M5 speed step (fails on
     usable-but-slow, matching the "how far can we take it" brief).
-- **M5.** (optional) quantized dense kernels; M40-OpenCL cross-check.
+- **M5.** native iGPU kernels (the speed step). In progress, compiling+wired:
+  `opencl_backend/kernels.rs` (program/kernel/ND-range FFI, per-device compile
+  cache; affine/elementwise exp/log/sqrt/sqr/neg/recip + add/sub/mul; f32 GEMM).
+  `affine`, `unary_impl`, `binary_impl` and single-batch `matmul` run as native
+  kernels under `JOSHUA_OPENCL_NATIVE=1` (contiguous f32; batched attention GEMM
+  and everything else still use the M2 CPU-fallback). Both builds compile
+  (`b34eb63`, `eebaeba`). **Not yet host-verified** (correctness/speed on the
+  iGPU) — that run needs the ~5-13 min model reload + benchmark; and the
+  `--dense-offload` knob still to add.
 
 Each milestone lands as its own PR. M1–M4 are the "run the benchmark" critical
 path.
