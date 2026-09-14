@@ -130,8 +130,14 @@ fn from_raw_data<T: super::GgmlType + Send + Sync + 'static>(
         Device::Cpu => QStorage::Cpu(Box::new(data.to_vec())),
         Device::Metal(metal) => super::metal::load_quantized(metal, data)?,
         Device::Cuda(cuda) => super::cuda::load_quantized(cuda, data)?,
-        Device::OpenCl(_) => {
-            crate::bail!("opencl quantized tensors are not implemented yet (M2)")
+        Device::OpenCl(d) => {
+            // M4 dense-on-OpenCl: dequantize the weight to f32 and hold it on the
+            // device (OpenClStorage).  `T` is a GgmlType so `T::to_float` gives
+            // the dequant; BLCK_SIZE is 1 for the f32/f16/bf16 scalars.
+            let n = data.len() * T::BLCK_SIZE;
+            let mut ys = vec![0f32; n];
+            T::to_float(data, &mut ys);
+            QStorage::OpenCl(crate::OpenClStorage::from_vec(ys, d)?)
         }
     };
     super::QTensor::new(data, dims)
