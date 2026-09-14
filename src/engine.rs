@@ -225,6 +225,9 @@ pub enum ComputeBackend {
     Metal,
     /// NVIDIA CUDA.  Requires the `cuda` cargo feature and a CUDA toolkit.
     Cuda,
+    /// OpenCL (any vendor ICD: Intel iGPU/Arc, NVIDIA via the OpenCL ICD,
+    /// ...).  Requires the `opencl` cargo feature and a system libOpenCL.
+    OpenCl,
 }
 
 /// Construction options for [`Engine`].
@@ -1057,6 +1060,13 @@ impl Engine {
                 Err(e) => tracing::warn!("Metal unavailable, falling back to CPU: {e}"),
             }
         }
+        #[cfg(feature = "opencl")]
+        {
+            match Device::new_opencl(0) {
+                Ok(device) => return device,
+                Err(e) => tracing::warn!("OpenCL unavailable, falling back to CPU: {e}"),
+            }
+        }
         Device::Cpu
     }
 
@@ -1107,6 +1117,26 @@ impl Engine {
                     Err(JoshuaError::ModelLoad(
                         "CUDA device requested but this build has no `cuda` feature. \
                          Rebuild with `cargo build --features cuda`, or pass --device cpu / auto."
+                            .to_string(),
+                    ))
+                }
+            }
+            ComputeBackend::OpenCl => {
+                #[cfg(feature = "opencl")]
+                {
+                    Device::new_opencl(0).map_err(|e| {
+                        JoshuaError::ModelLoad(format!(
+                            "OpenCL device requested but unavailable: {e}. \
+                             Build with `--features opencl` on a host with libOpenCL \
+                             (Intel iGPU/Arc, NVIDIA ICD, ...), or pass --device cpu / auto."
+                        ))
+                    })
+                }
+                #[cfg(not(feature = "opencl"))]
+                {
+                    Err(JoshuaError::ModelLoad(
+                        "OpenCL device requested but this build has no `opencl` feature. \
+                         Rebuild with `cargo build --features opencl`, or pass --device cpu / auto."
                             .to_string(),
                     ))
                 }

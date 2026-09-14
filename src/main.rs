@@ -36,6 +36,9 @@ enum DeviceArg {
     Metal,
     /// NVIDIA CUDA (build with `--features cuda`).
     Cuda,
+    /// OpenCL (Intel iGPU/Arc or any OpenCL ICD; build with `--features
+    /// opencl`).
+    OpenCl,
 }
 
 impl From<DeviceArg> for ComputeBackend {
@@ -45,6 +48,7 @@ impl From<DeviceArg> for ComputeBackend {
             DeviceArg::Cpu => ComputeBackend::Cpu,
             DeviceArg::Metal => ComputeBackend::Metal,
             DeviceArg::Cuda => ComputeBackend::Cuda,
+            DeviceArg::OpenCl => ComputeBackend::OpenCl,
         }
     }
 }
