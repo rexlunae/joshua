@@ -1,6 +1,6 @@
 # OpenCL accelerator backend for joshua (design + plan)
 
-**Status:** scoping / design. **Owner:** joshua (this repo). **Target:** run the
+**Status:** M1 hardware proof done. **Owner:** joshua (this repo). **Target:** run the
 DeepSeek-V4-Flash benchmark on an Intel OpenCL GPU (iGPU now; M40 via the
 NVIDIA OpenCL ICD when reconnected) through a joshua-native `--device opencl`.
 
@@ -98,6 +98,15 @@ CPU as today.
 - **M1.** `candle-core`: add `OpenCl` location+device+storage skeletons; `zeros`
   + `from_vec` + `to_cpu_storage` round-trip; unit test. (Reaches the GPU: a
   tensor can live on OpenCL and come back.)
+  - **M1 hardware proof ✅ (2026-09-13):** `docs/ocl_roundtrip.c` verified PASS on
+    `Intel(R) UHD Graphics 730` — host→device→host f32 buffer round-trip
+    (`clEnqueueWriteBuffer`/`clEnqueueReadBuffer`), the raw equivalent of
+    `OpenClStorage::from_vec`/`to_cpu_storage`. Combined with the earlier
+    `docs/ocl_smoke.c` kernel-exec PASS, the data path + kernel path are both
+    proven on the iGPU. Remaining: wire `OpenClDevice`/`OpenClStorage` into the
+    vendored `Device`/`Storage`/`DeviceLocation` enums behind the `opencl`
+    feature (the coupled storage.rs/device.rs/backend.rs change), then the in-
+    crate round-trip unit test.
 - **M2.** Elementwise + `matmul` (f32) + `index_select`/`gather`/`narrow/cat`
   on OpenCl; unit vs CPU.
 - **M3.** joshua `--device opencl` + `DeviceArg::opencl`; tiny-model parity test.
