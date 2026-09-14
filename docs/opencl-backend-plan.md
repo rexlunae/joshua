@@ -107,6 +107,14 @@ CPU as today.
     vendored `Device`/`Storage`/`DeviceLocation` enums behind the `opencl`
     feature (the coupled storage.rs/device.rs/backend.rs change), then the in-
     crate round-trip unit test.
+  - **M1 wiring ✅ (commit `11fcf68`):** `opencl_backend/mod.rs`
+    (`OpenClDevice`/`OpenClStorage` + hand-rolled libOpenCL FFI) and
+    `dummy_opencl_backend.rs` (no-feature dummy) wired into the
+    `Device`/`Storage`/`DeviceLocation` enums; joshua `opencl` feature added
+    (`candle-core/opencl`). `cargo check` (no-feature) and
+    `cargo check --features opencl` both green on the dev Mac. Round-trip
+    verified by `tests/opencl_roundtrip.rs` (feature-gated) — run it on the
+    host iGPU via `cargo test --features opencl --test opencl_roundtrip`.
 - **M2.** Elementwise + `matmul` (f32) + `index_select`/`gather`/`narrow/cat`
   on OpenCl; unit vs CPU.
 - **M3.** joshua `--device opencl` + `DeviceArg::opencl`; tiny-model parity test.
