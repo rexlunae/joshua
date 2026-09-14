@@ -8,10 +8,21 @@ use crate::{CpuStorage, DType, Error, Layout, Result, Shape};
 pub struct OpenClDevice;
 
 #[derive(Debug)]
-pub struct OpenClStorage;
+pub struct OpenClStorage {
+    #[allow(dead_code)]
+    pub numel: usize,
+    #[allow(dead_code)]
+    pub dtype: DType,
+    #[allow(dead_code)]
+    pub device: OpenClDevice,
+}
 
 impl OpenClStorage {
     pub fn transfer_to_device(&self, _dst: &OpenClDevice) -> Result<Self> {
+        Err(Error::NotCompiledWithOpenClSupport)
+    }
+
+    pub fn from_vec<T: crate::WithDType>(_slice: Vec<T>, _device: &OpenClDevice) -> Result<Self> {
         Err(Error::NotCompiledWithOpenClSupport)
     }
 }
@@ -30,6 +41,9 @@ impl OpenClDevice {
     }
     pub fn id(&self) -> DeviceId {
         DeviceId(0)
+    }
+    pub fn storage_from_cpu_storage(&self, _: &CpuStorage) -> Result<OpenClStorage> {
+        Err(Error::NotCompiledWithOpenClSupport)
     }
 }
 

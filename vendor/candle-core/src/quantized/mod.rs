@@ -1,5 +1,5 @@
 use crate::{
-    backend::BackendStorage, CpuStorage, DType, Device, Result, Shape, Storage, Tensor, D,
+    backend::{BackendDevice, BackendStorage}, CpuStorage, DType, Device, Result, Shape, Storage, Tensor, D,
 };
 use k_quants::*;
 use std::{borrow::Cow, sync::OnceLock};
@@ -80,8 +80,14 @@ impl Device {
                 let storage = cuda::QCudaStorage::zeros(cuda, elem_count, dtype)?;
                 Ok(QStorage::Cuda(storage))
             }
-            Device::OpenCl(_) => {
-                crate::bail!("opencl quantized tensors are not implemented yet (M2)")
+            Device::OpenCl(ocl) => {
+                // M4 dense-on-OpenCl strategy: hold the weights as a dequantized
+                // f32 buffer on the OpenCl device (OpenClStorage).  Block-quantized
+                // dtypes other than f32 are errors here; f32 is what the deepseek4
+                // mmap loader builds for a `--device opencl` run.
+                let shape = crate::Shape::from(vec![elem_count, 1]);
+                let storage = ocl.zeros_impl(&shape, crate::DType::F32)?;
+                Ok(QStorage::OpenCl(storage))
             }
         }
     }
@@ -91,6 +97,7 @@ pub enum QStorage {
     Cpu(Box<dyn QuantizedType>),
     Metal(metal::QMetalStorage),
     Cuda(cuda::QCudaStorage),
+    OpenCl(crate::OpenClStorage),
 }
 
 impl QStorage {
@@ -132,8 +139,21 @@ impl QStorage {
                 GgmlDType::Q8K => cuda::load_quantized(d, as_t_slice::<BlockQ8K>(data)),
                 GgmlDType::BF16 => cuda::load_quantized(d, as_t_slice::<bf16>(data)),
             },
-            Device::OpenCl(_) => {
-                crate::bail!("opencl quantized tensors are not implemented yet (M2)")
+            Device::OpenCl(d) => {
+                // f32 only (dequantized dense set on the device); the deepseek4
+                // mmap loader supplies f32 here.  True block dtypes are not held
+                // on OpenCl in M4.
+                match dtype {
+                    GgmlDType::F32 => {
+                        let f32s = as_t_slice::<f32>(data);
+                        Ok(QStorage::OpenCl(
+                            crate::OpenClStorage::from_vec(f32s.to_vec(), d)?
+                        ))
+                    }
+                    _ => crate::bail!(
+                        "opencl quantized storage is f32-only (M4); got {dtype:?}"
+                    ),
+                }
             }
         }
     }
@@ -143,6 +163,7 @@ impl QStorage {
             QStorage::Cpu(storage) => storage.block_size(),
             QStorage::Metal(storage) => storage.dtype().block_size(),
             QStorage::Cuda(storage) => storage.dtype().block_size(),
+            QStorage::OpenCl(_) => 1, // f32 block size
         }
     }
 
@@ -151,6 +172,7 @@ impl QStorage {
             QStorage::Cpu(storage) => storage.dtype(),
             QStorage::Metal(storage) => storage.dtype(),
             QStorage::Cuda(storage) => storage.dtype(),
+            QStorage::OpenCl(_) => GgmlDType::F32,
         }
     }
 
@@ -159,6 +181,7 @@ impl QStorage {
             QStorage::Cpu(_storage) => Device::Cpu,
             QStorage::Metal(storage) => Device::Metal(storage.device().clone()),
             QStorage::Cuda(storage) => Device::Cuda(storage.device().clone()),
+            QStorage::OpenCl(storage) => Device::OpenCl(storage.device().clone()),
         }
     }
 
@@ -167,6 +190,7 @@ impl QStorage {
             QStorage::Cpu(storage) => storage.storage_size_in_bytes(),
             QStorage::Metal(storage) => storage.storage_size_in_bytes(),
             QStorage::Cuda(storage) => storage.storage_size_in_bytes(),
+            QStorage::OpenCl(storage) => storage.numel * storage.dtype.size_in_bytes(),
         }
     }
 
@@ -177,6 +201,15 @@ impl QStorage {
             }
             (QStorage::Metal(storage), Storage::Metal(src)) => storage.quantize(src)?,
             (QStorage::Cuda(storage), Storage::Cuda(src)) => storage.quantize(src)?,
+            (QStorage::OpenCl(dst), Storage::OpenCl(src)) => {
+                let cpu = src.to_cpu_storage()?;
+                let dev = dst.device.clone();
+                *dst = dev.storage_from_cpu_storage(&cpu)?;
+            }
+            (QStorage::OpenCl(dst), Storage::Cpu(src)) => {
+                let dev = dst.device.clone();
+                *dst = dev.storage_from_cpu_storage(src)?;
+            }
             _ => crate::bail!("Invalid quantize storage locations do not match"),
         }
         Ok(())
@@ -198,6 +231,12 @@ impl QStorage {
             (QStorage::Cuda(storage), Storage::Cuda(src)) => {
                 storage.quantize_imatrix(src, imatrix_weights, n_per_row)?
             }
+            (QStorage::OpenCl(dst), Storage::OpenCl(src)) => {
+                let _ = (imatrix_weights, n_per_row);
+                let cpu = src.to_cpu_storage()?;
+                let dev = dst.device.clone();
+                *dst = dev.storage_from_cpu_storage(&cpu)?;
+            }
             _ => crate::bail!("Invalid quantize storage locations do not match"),
         }
         Ok(())
@@ -210,6 +249,10 @@ impl QStorage {
             }
             (QStorage::Metal(storage), Storage::Cpu(src)) => storage.quantize_onto(src)?,
             (QStorage::Cuda(storage), Storage::Cpu(src)) => storage.quantize_onto(src)?,
+            (QStorage::OpenCl(dst), Storage::Cpu(src)) => {
+                let dev = dst.device.clone();
+                *dst = dev.storage_from_cpu_storage(src)?;
+            }
             _ => crate::bail!("Invalid quantize source storage locations: not on cpu"),
         }
         Ok(())
@@ -231,6 +274,11 @@ impl QStorage {
             (QStorage::Cuda(storage), Storage::Cpu(src)) => {
                 storage.quantize_imatrix_onto(src, imatrix_weights, n_per_row)?
             }
+            (QStorage::OpenCl(dst), Storage::Cpu(src)) => {
+                let _ = (imatrix_weights, n_per_row);
+                let dev = dst.device.clone();
+                *dst = dev.storage_from_cpu_storage(src)?;
+            }
             _ => crate::bail!("Invalid quantize storage locations do not match"),
         }
         Ok(())
@@ -241,6 +289,10 @@ impl QStorage {
             QStorage::Cpu(storage) => Ok(Storage::Cpu(storage.dequantize(elem_count)?)),
             QStorage::Metal(storage) => Ok(Storage::Metal(storage.dequantize(elem_count)?)),
             QStorage::Cuda(storage) => Ok(Storage::Cuda(storage.dequantize(elem_count)?)),
+            QStorage::OpenCl(storage) => {
+                let cpu = storage.to_cpu_storage()?;
+                Ok(Storage::OpenCl(storage.device.storage_from_cpu_storage(&cpu)?))
+            },
         }
     }
 
@@ -254,13 +306,14 @@ impl QStorage {
             }
             QStorage::Cuda(storage) => Ok(Cow::from(storage.data()?)),
             QStorage::Metal(storage) => Ok(Cow::from(storage.data()?)),
+            QStorage::OpenCl(_) => crate::bail!("opencl QStorage::data is not supported (M4)"),
         }
     }
 
     pub fn device_ptr(&self) -> Result<*const u8> {
         match self {
             QStorage::Cuda(storage) => storage.device_ptr(),
-            QStorage::Metal(_) | QStorage::Cpu(_) => {
+            QStorage::OpenCl(_) | QStorage::Metal(_) | QStorage::Cpu(_) => {
                 crate::bail!("not implemented");
             }
         }
@@ -748,6 +801,9 @@ impl QTensor {
                 }
                 _ => unreachable!("ids were moved to the QTensor device"),
             },
+            QStorage::OpenCl(_) => {
+                crate::bail!("unreachable: opencl dense f32 uses the device-Tensor path")
+            }
         };
         let none = crate::op::BackpropOp::none();
         Ok(crate::tensor::from_storage(storage, out_shape, none, false))
@@ -792,7 +848,7 @@ impl QTensor {
     pub fn device_ptr(&self) -> Result<*const u8> {
         match &self.storage {
             QStorage::Cuda(storage) => storage.device_ptr(),
-            QStorage::Metal(_) | QStorage::Cpu(_) => {
+            QStorage::OpenCl(_) | QStorage::Metal(_) | QStorage::Cpu(_) => {
                 crate::bail!("not implemented");
             }
         }
@@ -931,7 +987,9 @@ impl crate::CustomOp1 for QTensor {
         #[allow(clippy::infallible_destructuring_match)]
         let self_storage = match &self.storage {
             QStorage::Cpu(storage) => storage,
-            QStorage::Metal(_) | QStorage::Cuda(_) => crate::bail!("Invalid storage"),
+            QStorage::OpenCl(_) | QStorage::Metal(_) | QStorage::Cuda(_) => {
+                crate::bail!("Invalid storage")
+            }
         };
         match storage.dtype() {
             DType::F32 => {
