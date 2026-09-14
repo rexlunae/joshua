@@ -1,6 +1,6 @@
 # OpenCL accelerator backend for joshua (design + plan)
 
-**Status:** M1 hardware proof done. **Owner:** joshua (this repo). **Target:** run the
+**Status:** M1 round-trip done + verified on the host iGPU; M2 operators next. **Owner:** joshua (this repo). **Target:** run the
 DeepSeek-V4-Flash benchmark on an Intel OpenCL GPU (iGPU now; M40 via the
 NVIDIA OpenCL ICD when reconnected) through a joshua-native `--device opencl`.
 
@@ -107,14 +107,21 @@ CPU as today.
     vendored `Device`/`Storage`/`DeviceLocation` enums behind the `opencl`
     feature (the coupled storage.rs/device.rs/backend.rs change), then the in-
     crate round-trip unit test.
-  - **M1 wiring ✅ (commit `11fcf68`):** `opencl_backend/mod.rs`
+  - **M1 wiring ✅ (commits `11fcf68`, `33af0d5`):** `opencl_backend/mod.rs`
     (`OpenClDevice`/`OpenClStorage` + hand-rolled libOpenCL FFI) and
     `dummy_opencl_backend.rs` (no-feature dummy) wired into the
     `Device`/`Storage`/`DeviceLocation` enums; joshua `opencl` feature added
     (`candle-core/opencl`). `cargo check` (no-feature) and
-    `cargo check --features opencl` both green on the dev Mac. Round-trip
-    verified by `tests/opencl_roundtrip.rs` (feature-gated) — run it on the
-    host iGPU via `cargo test --features opencl --test opencl_roundtrip`.
+    `cargo check --features opencl` both green. `#[link(name = "OpenCL")]`
+    required so the linker emits `-lOpenCL` (caught by the host test build).
+  - **M1 VERIFIED ✅ (2026-09-14, host iGPU):**
+    `cargo test --features opencl --test opencl_roundtrip` on the
+    `~/joshua-opencl` clone of `opencl-backend` printed
+    `running OpenCL round-trip on device: OpenCl(...)` then
+    **`PASS: OpenCL f32 buffer round-trip is exact`** — a real (not-skipped)
+    bit-exact f32 write+read-back through `Tensor::from_vec` →
+    `OpenClStorage` → `to_device(&Cpu)` → `to_vec1`, plus the reverse
+    host→device→host path. **M1 (round-trip) is complete.**
 - **M2.** Elementwise + `matmul` (f32) + `index_select`/`gather`/`narrow/cat`
   on OpenCl; unit vs CPU.
 - **M3.** joshua `--device opencl` + `DeviceArg::opencl`; tiny-model parity test.
