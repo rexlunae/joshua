@@ -342,6 +342,7 @@ fn yarn_linear_ramp(min: f32, mut max: f32, dim: usize) -> Vec<f32> {
 // ─── Linear helpers ─────────────────────────────────────────────────────────
 
 /// SwiGLU MLP over quantized weights (dense layers and shared experts).
+#[derive(Clone)]
 struct Mlp {
     gate: QMatMul,
     up: QMatMul,
@@ -560,6 +561,31 @@ fn truncate_kv(kv_cache: &mut KvCache, keep: usize) -> Result<()> {
 
 // ─── Mixture of experts (DeepSeek routing + shared experts) ──────────────────
 
+/// The device-resident form of one routed expert (deepseek2): the same
+/// gate/up/down `QMatMul`s uploaded to the expert device, as an opaque
+/// [`crate::residency::DeviceExpertSlot`] for the slot pool.  Forwarding
+/// mirrors [`Mlp::forward`].
+struct DeviceExpert {
+    gate: QMatMul,
+    up: QMatMul,
+    down: QMatMul,
+    bytes: u64,
+}
+
+impl crate::residency::DeviceExpertSlot for DeviceExpert {
+    fn device_bytes(&self) -> u64 {
+        self.bytes
+    }
+}
+
+impl DeviceExpert {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        let gate = candle_nn::ops::silu(&self.gate.forward(xs)?)?;
+        let up = self.up.forward(xs)?;
+        self.down.forward(&(gate * up)?)
+    }
+}
+
 struct Moe {
     gate_t: Tensor,        // router weight transposed to [n_embd, n_expert], contiguous (cached)
     gate_bias: Option<Tensor>, // exp_probs_b [n_expert] (f32), V3/K2 only
@@ -571,11 +597,15 @@ struct Moe {
     topk_group: usize,
     weights_norm: bool,
     weights_scale: f64,
+    /// This MoE block's layer index (for the residency key).
+    layer: u32,
     /// Device the routed-expert weights live on.  The model device when the
     /// experts were uploaded; the CPU when the pool stays in host RAM on an
     /// accelerator (see [`crate::placement::ExpertPlacement`]).  `dispatch`
     /// moves the block's input across once and its result back once.
     expert_device: Device,
+    /// Bounded VRAM expert cache (#62): see `qwen3moe::Moe::residency`.
+    residency: Option<std::sync::Arc<crate::residency::DeviceResidency<DeviceExpert>>>,
 }
 
 impl Moe {
@@ -720,7 +750,7 @@ impl Moe {
             let count = token_idx.len();
             let idx = Tensor::from_vec(token_idx, count, dev)?;
             let x_sel = x2.index_select(&idx, 0)?; // [count, h]
-            let out = self.experts[e].forward(&x_sel)?; // [count, h]
+            let out = self.expert_forward(e, &x_sel)?; // [count, h]
             let w = Tensor::from_vec(w, (count, 1), dev)?;
             y = y.index_add(&idx, &out.broadcast_mul(&w)?, 0)?;
         }
@@ -753,13 +783,25 @@ impl Moe {
         };
         let mut outs = Vec::with_capacity(k);
         for &e in ids.iter() {
-            outs.push(self.experts[e as usize].forward(x2)?); // [1, h] each
+            outs.push(self.expert_forward(e as usize, x2)?); // [1, h] each
         }
         let out = Tensor::stack(&outs, 0)?; // [k, 1, h]
         let out = if same_device { out } else { out.to_device(&out_device)? };
         let w = weights.reshape((k, 1, 1))?; // GPU view [k, 1, 1]
         let y = out.broadcast_mul(&w)?.sum(0)?; // [1, h]
         Ok((y, ids))
+    }
+
+    /// Run one routed expert over `x`, preferring the device-resident form on a
+    /// `DeviceResidency` hit and the host `Mlp` on a miss (#62 partition).  With
+    /// no residency this is exactly `self.experts[e].forward(x)`.
+    fn expert_forward(&self, e: usize, x: &Tensor) -> Result<Tensor> {
+        if let Some(res) = &self.residency {
+            if let Some(dev) = res.lookup(self.layer, e as u32) {
+                return dev.forward(x);
+            }
+        }
+        self.experts[e].forward(x)
     }
 }
 
@@ -1261,7 +1303,9 @@ fn load_moe<R: Read + Seek>(rd: &mut Reader<R>, p: &str, cfg: &Config) -> Result
         topk_group: cfg.topk_group,
         weights_norm: cfg.expert_weights_norm,
         weights_scale: cfg.expert_weights_scale,
+        layer: 0,
         expert_device: rd.expert_device.clone(),
+        residency: None,
     })
 }
 
@@ -1609,7 +1653,9 @@ mod tests {
             topk_group: 1,
             weights_norm: false,
             weights_scale: 0.0,
+            layer: 0,
             expert_device: dev.clone(),
+            residency: None,
         };
 
         // Batched path: 3 tokens in one forward (softmax routing per token).

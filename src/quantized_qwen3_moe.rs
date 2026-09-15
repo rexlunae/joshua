@@ -1400,7 +1400,7 @@ mod tests {
         // mixed shares moe's exact weights (same clones), differing only in the
         // residency: hits run the (numerically identical) device form, misses run
         // the host form.
-        let mut mixed = Moe {
+        let mixed = Moe {
             gate_t: moe.gate_t.clone(),
             experts: moe.experts.clone(),
             n_expert_used: moe.n_expert_used,
