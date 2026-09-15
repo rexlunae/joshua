@@ -85,6 +85,14 @@ pub fn program_for(context: usize, device_id: usize) -> Result<usize> {
 }
 
 fn create_kernel(program: usize, name: &str) -> Result<usize> {
+    // clCreateKernel expects a NUL-terminated C string; a plain Rust &str carries
+    // no terminator, so build one (this is what the docs/devloop call out).
+    let name = match std::ffi::CString::new(name) {
+        Ok(n) => n,
+        Err(_) => return Err(Error::Msg(format!(
+            "opencl create_kernel: kernel name {name:?} contains a NUL byte"
+        ))),
+    };
     let mut e: i32 = 0;
     let k = unsafe { clCreateKernel(program, name.as_ptr() as *const std::ffi::c_void, &mut e) };
     if e != CL_SUCCESS || k == 0 {
@@ -171,10 +179,10 @@ pub fn run_binary(ctx: usize, dev: usize, queue: usize, op: &str, a: usize, b: u
     Ok(())
 }
 
-pub fn run_matmul(ctx: usize, dev: usize, queue: usize, a: usize, b: usize, out: usize, (m, n, k): (usize, usize, usize)) -> Result<()> {
+pub fn run_matmul(ctx: usize, dev: usize, queue: usize, a: usize, b: usize, out: usize, (m, n, _k): (usize, usize, usize)) -> Result<()> {
     let program = program_for(ctx, dev)?;
     let k = create_kernel(program, "kmatmul")?;
-    let (M, N, K, b0, b1, b2) = (m as i32, n as i32, k as i32, a, b, out);
+    let (M, N, K, b0, b1, b2) = (m as i32, n as i32, _k as i32, a, b, out);
     set_arg(k, 0, addr_of(&b0), 8)?;
     set_arg(k, 1, addr_of(&b1), 8)?;
     set_arg(k, 2, addr_of(&b2), 8)?;
@@ -196,3 +204,16 @@ pub fn native_enabled() -> bool {
 
 pub fn has_unary(name: &str) -> bool { matches!(name, "exp" | "log" | "sqrt" | "sqr" | "neg" | "recip") }
 pub fn has_binary(name: &str) -> bool { matches!(name, "add" | "sub" | "mul") }
+
+/// Count of native OpenCL kernels that actually executed (not silently fallen
+/// back). Used by the parity test to assert that native compute really ran rather
+/// than accepting a CPU-fallback result.
+static NATIVE_EXEC: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub fn note_native_exec() {
+    NATIVE_EXEC.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn native_exec_count() -> usize {
+    NATIVE_EXEC.load(std::sync::atomic::Ordering::Relaxed)
+}

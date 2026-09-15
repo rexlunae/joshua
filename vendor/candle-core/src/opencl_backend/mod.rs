@@ -92,16 +92,40 @@ extern "C" {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct DeviceId(usize);
 
-/// An OpenCL device: a `cl_context` + `cl_command_queue` pair for one GPU.
+/// A reference-counted OpenCL `cl_context` + `cl_command_queue` pair.
+///
+/// An OpenCL memory object belongs permanently to the context passed to
+/// `clCreateBuffer`, and every command on a buffer must be issued on a command
+/// queue that shares that same context. So a device's context and queue are kept
+/// in one heap allocation shared by every `OpenClDevice` clone (the same
+/// reference-counting approach the CUDA and Metal backends use). The handle is
+/// released only when the last clone / storage sharing it is dropped.
 #[derive(Debug)]
-pub struct OpenClDevice {
-    gpu_id: usize,
+struct OpenClContext {
     context: usize,
     queue: usize,
+}
+
+impl Drop for OpenClContext {
+    fn drop(&mut self) {
+        if self.queue != 0 {
+            unsafe { clReleaseCommandQueue(self.queue) };
+        }
+        if self.context != 0 {
+            unsafe { clReleaseContext(self.context) };
+        }
+    }
+}
+
+/// An OpenCL device: an immutable `gpu_id` + the shared context/queue handles.
+#[derive(Debug, Clone)]
+pub struct OpenClDevice {
+    gpu_id: usize,
     #[allow(dead_code)]
     platform_id: usize,
     #[allow(dead_code)]
     device_id: usize,
+    inner: std::sync::Arc<OpenClContext>,
 }
 
 fn opencl_error(code: i32, op: &str) -> Error {
@@ -109,7 +133,7 @@ fn opencl_error(code: i32, op: &str) -> Error {
 }
 
 /// Connect to the first OpenCL GPU and build a context + queue.
-fn init_device(gpu_id: usize) -> Result<(usize, usize, usize, usize)> {
+fn init_device(gpu_id: usize) -> Result<OpenClDevice> {
     let mut num_platforms: u32 = 0;
     let mut platforms = [0usize; 4];
     let rc = unsafe { clGetPlatformIDs(4, platforms.as_mut_ptr(), &mut num_platforms) };
@@ -149,54 +173,20 @@ fn init_device(gpu_id: usize) -> Result<(usize, usize, usize, usize)> {
             if err != cl::CL_SUCCESS || queue == 0 {
                 return Err(opencl_error(err, "clCreateCommandQueue"));
             }
-            return Ok((context, queue, platforms[i], device));
+            return Ok(OpenClDevice {
+                gpu_id,
+                platform_id: platforms[i],
+                device_id: device,
+                inner: std::sync::Arc::new(OpenClContext { context, queue }),
+            });
         }
     }
     Err(Error::Msg("opencl: no OpenCL GPU device found".to_string()))
 }
 
-impl Drop for OpenClDevice {
-    fn drop(&mut self) {
-        if self.queue != 0 {
-            unsafe { clReleaseCommandQueue(self.queue) };
-        }
-        if self.context != 0 {
-            unsafe { clReleaseContext(self.context) };
-        }
-    }
-}
-
-impl Clone for OpenClDevice {
-    fn clone(&self) -> Self {
-        match init_device(self.gpu_id) {
-            Ok((context, queue, platform_id, device_id)) => Self {
-                gpu_id: self.gpu_id,
-                context,
-                queue,
-                platform_id,
-                device_id,
-            },
-            Err(_) => Self {
-                gpu_id: self.gpu_id,
-                context: 0,
-                queue: 0,
-                platform_id: self.platform_id,
-                device_id: self.device_id,
-            },
-        }
-    }
-}
-
 impl OpenClDevice {
     pub fn new(gpu_id: usize) -> Result<Self> {
-        let (context, queue, platform_id, device_id) = init_device(gpu_id)?;
-        Ok(Self {
-            gpu_id,
-            context,
-            queue,
-            platform_id,
-            device_id,
-        })
+        init_device(gpu_id)
     }
 
     pub fn new_with_stream(gpu_id: usize) -> Result<Self> {
@@ -208,11 +198,11 @@ impl OpenClDevice {
     }
 
     pub(crate) fn queue(&self) -> usize {
-        self.queue
+        self.inner.queue
     }
 
     pub(crate) fn context(&self) -> usize {
-        self.context
+        self.inner.context
     }
 }
 
@@ -307,6 +297,21 @@ unsafe fn read_buffer(queue: usize, buffer: usize, bytes: usize, ptr: *mut u8) -
     Ok(())
 }
 
+// --- Native-kernel gating helpers. ---
+/// A contiguous layout is safe for the native kernels only when it starts at
+/// element 0 and spans exactly the whole storage (a view with a nonzero
+/// `start_offset` or padding before/after would read the wrong slice). Also
+/// reject element counts / dimensions that would overflow the i32 dimensions the
+/// kernel wrappers pass to OpenCL.
+const OPENCL_NATIVE_MAX_DIM: usize = i32::MAX as usize;
+
+fn native_ok(layout: &Layout, numel: usize) -> bool {
+    layout.is_contiguous()
+        && layout.start_offset() == 0
+        && layout.shape().elem_count() == numel
+        && numel <= OPENCL_NATIVE_MAX_DIM
+}
+
 impl BackendStorage for OpenClStorage {
     type Device = OpenClDevice;
 
@@ -360,12 +365,12 @@ impl BackendStorage for OpenClStorage {
     }
 
     fn affine(&self, layout: &Layout, mul: f64, add: f64) -> Result<Self> {
-        if kernels::native_enabled() && layout.is_contiguous() && self.dtype == DType::F32 {
+        if kernels::native_enabled() && native_ok(layout, self.numel) && self.dtype == DType::F32 {
             let n = self.numel;
             let out_buf = create_buffer(self.device.context(), n * 4, cl::CL_MEM_READ_WRITE)?;
             match kernels::run_affine(self.device.context(), self.device.device_id, self.device.queue(),
                 self.buffer, out_buf, n, mul as f32, add as f32) {
-                Ok(()) => return Ok(OpenClStorage { buffer: out_buf, dtype: self.dtype, numel: self.numel, device: self.device.clone() }),
+                Ok(()) => { kernels::note_native_exec(); return Ok(OpenClStorage { buffer: out_buf, dtype: self.dtype, numel: self.numel, device: self.device.clone() }); }
                 Err(_) => { unsafe { clReleaseMemObject(out_buf) }; },
             }
         }
@@ -406,12 +411,12 @@ impl BackendStorage for OpenClStorage {
     }
 
     fn unary_impl<B: UnaryOpT>(&self, layout: &Layout) -> Result<Self> {
-        if kernels::native_enabled() && layout.is_contiguous() && self.dtype == DType::F32 && kernels::has_unary(B::NAME) {
+        if kernels::native_enabled() && native_ok(layout, self.numel) && self.dtype == DType::F32 && kernels::has_unary(B::NAME) {
             let n = self.numel;
             let out_buf = create_buffer(self.device.context(), n * 4, cl::CL_MEM_READ_WRITE)?;
             match kernels::run_unary(self.device.context(), self.device.device_id, self.device.queue(),
                 B::NAME, self.buffer, out_buf, n) {
-                Ok(()) => return Ok(OpenClStorage { buffer: out_buf, dtype: self.dtype, numel: self.numel, device: self.device.clone() }),
+                Ok(()) => { kernels::note_native_exec(); return Ok(OpenClStorage { buffer: out_buf, dtype: self.dtype, numel: self.numel, device: self.device.clone() }); }
                 Err(_) => { unsafe { clReleaseMemObject(out_buf) }; },
             }
         }
@@ -421,7 +426,7 @@ impl BackendStorage for OpenClStorage {
     }
 
     fn binary_impl<B: BinaryOpT>(&self, rhs: &Self, lhs_l: &Layout, rhs_l: &Layout) -> Result<Self> {
-        if kernels::native_enabled() && lhs_l.is_contiguous() && rhs_l.is_contiguous()
+        if kernels::native_enabled() && native_ok(lhs_l, self.numel) && native_ok(rhs_l, rhs.numel)
             && self.dtype == DType::F32 && rhs.dtype == DType::F32 && self.numel == rhs.numel
             && kernels::has_binary(B::NAME)
         {
@@ -429,7 +434,7 @@ impl BackendStorage for OpenClStorage {
             let out_buf = create_buffer(self.device.context(), n * 4, cl::CL_MEM_READ_WRITE)?;
             match kernels::run_binary(self.device.context(), self.device.device_id, self.device.queue(),
                 B::NAME, self.buffer, rhs.buffer, out_buf, n) {
-                Ok(()) => return Ok(OpenClStorage { buffer: out_buf, dtype: self.dtype, numel: self.numel, device: self.device.clone() }),
+                Ok(()) => { kernels::note_native_exec(); return Ok(OpenClStorage { buffer: out_buf, dtype: self.dtype, numel: self.numel, device: self.device.clone() }); }
                 Err(_) => { unsafe { clReleaseMemObject(out_buf) }; },
             }
         }
@@ -579,20 +584,22 @@ impl BackendStorage for OpenClStorage {
         lhs_l: &Layout,
         rhs_l: &Layout,
     ) -> Result<Self> {
-        if kernels::native_enabled() && lhs_l.is_contiguous() && rhs_l.is_contiguous()
+        if kernels::native_enabled() && native_ok(lhs_l, self.numel) && native_ok(rhs_l, rhs.numel)
             && self.dtype == DType::F32 && rhs.dtype == DType::F32
         {
             // bmnk = (batch, m, n, k). Only a single non-batched tile is handled
             // natively (the common linear/attention case); batched matmuls fall back
             // to CPU. Native kernel is o[row*N+col] = sum_k a[row*K+k]*b[k*N+col],
             // which is exactly candle's row-major m@k times k@n when both operands
-            // are contiguous (non-transposed).
+            // are contiguous (non-transposed) and start at element 0.
             let (batch, m, n, k) = bmnk;
-            if batch == 1 {
+            if batch == 1 && m <= OPENCL_NATIVE_MAX_DIM && n <= OPENCL_NATIVE_MAX_DIM
+                && k <= OPENCL_NATIVE_MAX_DIM && rhs.numel <= OPENCL_NATIVE_MAX_DIM
+            {
                 let out_buf = create_buffer(self.device.context(), m * n * 4, cl::CL_MEM_READ_WRITE)?;
                 match kernels::run_matmul(self.device.context(), self.device.device_id, self.device.queue(),
                     self.buffer, rhs.buffer, out_buf, (m, n, k)) {
-                    Ok(()) => return Ok(OpenClStorage { buffer: out_buf, dtype: self.dtype, numel: m * n, device: self.device.clone() }),
+                    Ok(()) => { kernels::note_native_exec(); return Ok(OpenClStorage { buffer: out_buf, dtype: self.dtype, numel: m * n, device: self.device.clone() }); }
                     Err(_) => { unsafe { clReleaseMemObject(out_buf) }; }
                 }
             }
@@ -710,7 +717,7 @@ impl BackendDevice for OpenClDevice {
         if numel > 0 && dtype.size_in_bytes() > 0 {
             let bytes = numel * dtype.size_in_bytes();
             let zeros = vec![0u8; bytes];
-            unsafe { write_buffer(self.queue, storage.buffer, bytes, zeros.as_ptr()) }?;
+            unsafe { write_buffer(self.queue(), storage.buffer, bytes, zeros.as_ptr()) }?;
         }
         Ok(storage)
     }
@@ -723,7 +730,7 @@ impl BackendDevice for OpenClDevice {
             ));
         }
         let bytes = numel * dtype.size_in_bytes();
-        let buffer = create_buffer(self.context, bytes, cl::CL_MEM_READ_WRITE)?;
+        let buffer = create_buffer(self.context(), bytes, cl::CL_MEM_READ_WRITE)?;
         Ok(OpenClStorage {
             buffer,
             dtype,
@@ -766,7 +773,7 @@ impl BackendDevice for OpenClDevice {
     }
 
     fn synchronize(&self) -> Result<()> {
-        let rc = unsafe { clFinish(self.queue) };
+        let rc = unsafe { clFinish(self.queue()) };
         if rc != cl::CL_SUCCESS {
             return Err(opencl_error(rc, "clFinish"));
         }
@@ -824,6 +831,7 @@ mod tests {
 
         let native = kernels::native_enabled();
         eprintln!("JOSHUA_OPENCL_NATIVE={native}");
+        let exec0 = kernels::native_exec_count();
 
         macro_rules! gen {
             ($n:expr) => {{
@@ -875,7 +883,7 @@ mod tests {
 
 
         // ---- matmul: A(m,k) @ B(k,n), single batch ----
-        let (mm, mk, mn, mk2) = (37usize, 64usize, 51usize, 64usize); // m,k,n; k==k2
+        let (mm, _mk, mn, mk2) = (37usize, 64usize, 51usize, 64usize); // m,k,n; k==k2
         let a_v = (0..mm * mk2).map(|i| ((i % 7) as f32 - 3.0) * 0.5).collect::<Vec<f32>>();
         let b_v = (0..mk2 * mn).map(|i| ((i % 11) as f32 - 5.0) * 0.25).collect::<Vec<f32>>();
         let ac = Tensor::from_vec(a_v.clone(), (mm, mk2), &Device::Cpu)?;
@@ -897,6 +905,16 @@ mod tests {
         let ao2 = Tensor::from_vec((0..mm2 * mk4).map(|i| ((i % 5) as f32 - 2.0) * 0.4).collect(), (mm2, mk4), &dev)?;
         let got_oc2 = ao2.matmul(&wo)?.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
         approx(&got_cpu2.flatten_all()?.to_vec1::<f32>()?, &got_oc2, 1e-2, "matmul_transposed_weight");
+
+        // ---- assert native kernels actually ran (not silent CPU fallback) ----
+        let exec = kernels::native_exec_count() - exec0;
+        eprintln!("opencl parity: native kernel executions this test = {exec}");
+        if native {
+            assert!(
+                exec >= 4,
+                "JOSHUA_OPENCL_NATIVE was set but only {exec} native kernels ran;                  the ops fell back to CPU and the parity result is not a native-check.                  (expected >= 4: affine, exp, add, matmul)"
+            );
+        }
 
         eprintln!("opencl parity: all wired ops OK");
         Ok(())
