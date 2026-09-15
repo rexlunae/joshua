@@ -99,10 +99,16 @@ not fit with headroom is refused at load, naming both numbers, rather than
 deferred to an out-of-memory upload.  `deepseek4` is always resolved as
 `host` (its loader keeps the IQ2_XXS experts on the CPU regardless), so
 its per-session device footprint is the dense set alone.
-A GGUF without `output.weight` (tied head) makes the loaders load the
-embedding table a second time as the output projection, so the device
-accounting counts that table twice.  Models candle cannot load at all
-(NPU-only) allocate nothing on the device and skip the check.
+The device accounting follows what each loader leaves resident rather
+than the on-disk bytes: the stock candle loaders (llama, gemma, glm4,
+lfm2, phi, qwen2, qwen3) dequantize the embedding table to a persistent
+f32 tensor, deepseek4 decodes its raw-dtype (IQ2_XXS/MXFP4) dense tensors
+to f32 on the device, everything is f32 on OpenCL, and the rest stays in
+its quantized blocks.  A tied output head (no head tensor) is a second,
+quantized copy of the embedding table; where several head names are
+present the largest candidate the loader could end up reading is counted,
+never fewer.  Models candle cannot load at all (NPU-only) allocate nothing
+on the device and skip the check.
 
 Per-device memory with `host` placement:
 
