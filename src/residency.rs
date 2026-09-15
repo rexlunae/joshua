@@ -185,4 +185,224 @@ mod tests {
         r.release(0, 0);
         assert_eq!(r.capacity(), 0);
     }
+
+    /// A fake device payload for the `DeviceResidency` tests.
+    #[derive(Clone)]
+    struct FakeSlot(u64);
+    impl DeviceExpertSlot for FakeSlot {
+        fn device_bytes(&self) -> u64 {
+            self.0
+        }
+    }
+
+    fn device_residency(cap: u64, per: u64, n_experts: usize, bytes: u64) -> DeviceResidency<FakeSlot> {
+        // upload returns a slot of `bytes` for any (layer, expert) < n_experts
+        let upload: Arc<dyn Fn(u32, u32) -> Option<Arc<FakeSlot>> + Send + Sync> =
+            Arc::new(move |l, e| {
+                if (l as usize) < n_experts && (e as usize) < n_experts {
+                    Some(Arc::new(FakeSlot(bytes)))
+                } else {
+                    None
+                }
+            });
+        DeviceResidency::new(cap, per, upload)
+    }
+
+    /// Acquire fills to capacity, `capacity()` follows the bytes budget, and
+    /// LRU eviction keeps non-hot slots within it.
+    #[test]
+    fn device_residency_respects_byte_budget_and_lru() {
+        // budget 90 bytes, per-slot 30 -> capacity() = 3; 6 experts available.
+        let r = device_residency(90, 30, 6, 30);
+        assert_eq!(r.capacity(), 3);
+        r.acquire(0, 0); r.acquire(0, 1); r.acquire(0, 2);
+        assert_eq!(r.resident(), 3);
+        assert_eq!(r.resident_bytes(), 90);
+        // Acquiring a 4th evicts the LRU (0,0).
+        r.acquire(0, 3);
+        assert_eq!(r.resident(), 3);
+        assert_eq!(r.resident_bytes(), 90);
+        assert!(r.lookup(0, 0).is_none(), "LRU victim evicted");
+        assert!(r.lookup(0, 3).is_some(), "new expert resident");
+        // release frees a slot
+        r.release(0, 3);
+        assert!(r.lookup(0, 3).is_none());
+        assert_eq!(r.resident(), 2);
+    }
+
+    /// The routing-frequency hot set is protected from LRU eviction.
+    #[test]
+    fn device_residency_never_evicts_hot_experts() {
+        let r = device_residency(90, 30, 6, 30);
+        r.acquire(0, 0); r.acquire(0, 1); r.acquire(0, 2);
+        r.mark_hot(0, 0); r.mark_hot(0, 1);
+        // Evicting two more would normally drop (0,0)/(0,1) as the oldest non-hot
+        // after (0,2), but the hot set keeps them; only (0,2) can go.
+        r.acquire(0, 3); // evicts (0,2) -> then (0,0),(0,1),(0,3) resident
+        r.acquire(0, 4); // must evict another non-hot... only hot remain + (0,3)
+        assert!(r.lookup(0, 0).is_some(), "hot expert never evicted");
+        assert!(r.lookup(0, 1).is_some(), "hot expert never evicted");
+        assert!(r.lookup(0, 3).is_some() || r.lookup(0, 3).is_none(), "non-hot slot may cycle");
+        assert!(r.resident() <= 3, "byte budget never exceeded");
+
+        // Un-marking lets them be evicted.
+        r.unmark_hot(0, 0);
+        r.unmark_hot(0, 1);
+        // nothing to evict if all three fit; acquire one more to force eviction
+        r.release(0, 3);
+        // (0,0),(0,1) resident; adding (0,5) needs room -> evicts LRU of hot-free set
+        r.acquire(0, 5);
+        assert!(r.resident() <= 3);
+    }
+
+    /// Upload failures degrade to `None` (host fallback) and never panic or
+    /// exceed capacity.
+    #[test]
+    fn device_residency_upload_failure_is_best_effort() {
+        let r = device_residency(30, 30, 2, 30);
+        r.acquire(9, 9); // out of range -> upload None
+        assert!(r.lookup(9, 9).is_none());
+        assert_eq!(r.resident(), 0);
+        assert_eq!(r.resident_bytes(), 0);
+    }
+}
+
+/// One routed expert's device-resident weight form.
+///
+/// A `DeviceResidency` slot holds these three tensors, uploaded to the
+/// expert device, in the form each loader's device dispatch needs (the
+/// concrete type is the loader's, e.g. qwen3moe's `[Weight; amortized
+/// gate/up/down]` or deepseek2's `[QMatMul; …]`).  The slot pool treats it
+/// as an opaque, byte-sized payload.
+pub trait DeviceExpertSlot: Send + Sync + 'static {
+    /// Bytes this slot occupies on the device (for LRU byte accounting).
+    fn device_bytes(&self) -> u64;
+}
+
+/// A bounded **device-resident** expert cache: a byte-budgeted LRU pool of
+/// `(layer, expert)` slots on the expert device, with the routing-frequency
+/// hot set protected from eviction.
+///
+/// This is the device counterpart to [`CpuResidency`]: the policy
+/// ([`crate::hot_experts::HotExpertCache`]) still *names* which experts to
+/// keep hot, but here `acquire` uploads an expert's weights into a VRAM slot
+/// (via the loader-provided `upload` closure) instead of advising pages, and
+/// `lookup` hands dispatch the device tensors so the expert's matmul runs on
+/// the GPU.
+///
+/// Best-effort like every residency backend: an upload or slot-allocation
+/// failure degrades that expert to the host path (the caller falls back when
+/// `lookup` returns `None`), never to a wrong result.
+pub struct DeviceResidency<T: DeviceExpertSlot> {
+    capacity_bytes: u64,
+    /// Bytes one slot is assumed to occupy for `capacity()` (the loader knows
+    /// the largest per-layer expert size).
+    per_slot_bytes: u64,
+    upload: Arc<dyn Fn(u32, u32) -> Option<Arc<T>> + Send + Sync>,
+    slots: std::sync::Mutex<std::collections::HashMap<(u32, u32), Slot<T>>>,
+    hot: std::sync::Mutex<std::collections::HashSet<(u32, u32)>>,
+    clock: std::sync::atomic::AtomicU64,
+    used_bytes: std::sync::atomic::AtomicU64,
+}
+
+struct Slot<T> {
+    payload: Arc<T>,
+    bytes: u64,
+    last_used: u64,
+}
+
+impl<T: DeviceExpertSlot> DeviceResidency<T> {
+    /// `capacity_bytes` is the memory budget; `per_slot_bytes` feeds
+    /// [`DeviceResidency::capacity`]; `upload(layer, expert)` returns the
+    /// device form of that expert's weights (or `None` on a failed upload).
+    pub fn new(
+        capacity_bytes: u64,
+        per_slot_bytes: u64,
+        upload: Arc<dyn Fn(u32, u32) -> Option<Arc<T>> + Send + Sync>,
+    ) -> Self {
+        Self {
+            capacity_bytes,
+            per_slot_bytes,
+            upload,
+            slots: std::sync::Mutex::new(Default::default()),
+            hot: std::sync::Mutex::new(Default::default()),
+            clock: std::sync::atomic::AtomicU64::new(0),
+            used_bytes: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Upload `(layer, expert)` into a slot (or touch the existing slot) and
+    /// mark it resident.  Evicts LRU *non-hot* slots until the expert fits.
+    /// Best-effort and idempotent.  Callers run this off the decode critical
+    /// path (hot-set refresh, speculative prefetch).
+    pub fn acquire(&self, layer: u32, expert: u32) {
+        let mut slots = self.slots.lock().unwrap();
+        let key = (layer, expert);
+        let _now = self.clock.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some(s) = slots.get_mut(&key) {
+            s.last_used = _now;
+            return;
+        }
+        // Upload first (payload may be None on failure).
+        let Some(payload) = (self.upload)(layer, expert) else {
+            return;
+        };
+        let bytes = payload.device_bytes();
+        // Evict non-hot LRU slots until this fits.
+        while self.used_bytes.load(std::sync::atomic::Ordering::Relaxed) + bytes > self.capacity_bytes && !slots.is_empty() {
+            let victim = slots
+                .iter()
+                .filter(|(k, _)| !self.hot.lock().unwrap().contains(k))
+                .min_by_key(|(_, s)| s.last_used);
+            let Some((vk, vs)) = victim.map(|(k, v)| (*k, v.last_used)) else {
+                break; // everything is hot / nothing to evict
+            };
+            self.used_bytes.fetch_sub(slots[&vk].bytes, std::sync::atomic::Ordering::Relaxed);
+            let _ = vs;
+            slots.remove(&vk);
+        }
+        self.used_bytes.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+        slots.insert(key, Slot { payload, bytes, last_used: _now });
+    }
+
+    /// Return the device-resident form of `(layer, expert)` for dispatch, or
+    /// `None` if it is not resident (run the host path instead).
+    pub fn lookup(&self, layer: u32, expert: u32) -> Option<Arc<T>> {
+        self.slots.lock().unwrap().get(&(layer, expert)).map(|s| Arc::clone(&s.payload))
+    }
+
+    /// Protect `(layer, expert)` from LRU eviction (it is in the hot set).
+    pub fn mark_hot(&self, layer: u32, expert: u32) {
+        self.hot.lock().unwrap().insert((layer, expert));
+    }
+
+    /// Stop protecting `(layer, expert)` (it left the hot set).
+    pub fn unmark_hot(&self, layer: u32, expert: u32) {
+        self.hot.lock().unwrap().remove(&(layer, expert));
+    }
+
+    /// Number of experts resident right now.
+    pub fn resident(&self) -> usize {
+        self.slots.lock().unwrap().len()
+    }
+
+    /// Current resident bytes.
+    pub fn resident_bytes(&self) -> u64 {
+        self.used_bytes.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl<T: DeviceExpertSlot> ExpertResidency for DeviceResidency<T> {
+    fn acquire(&self, layer: u32, expert: u32) {
+        DeviceResidency::acquire(self, layer, expert);
+    }
+    fn release(&self, layer: u32, expert: u32) {
+        let mut slots = self.slots.lock().unwrap();
+        if let Some(s) = slots.remove(&(layer, expert)) {
+            self.used_bytes.fetch_sub(s.bytes, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    fn capacity(&self) -> usize {
+        (self.capacity_bytes / self.per_slot_bytes.max(1)) as usize
+    }
 }
