@@ -76,12 +76,17 @@ pub fn program_for(context: usize, device_id: usize) -> Result<usize> {
     if e != CL_SUCCESS || pr == 0 {
         return Err(err(e, "clCreateProgramWithSource"));
     }
+    let prg = ProgGuard(pr);
     let bc = unsafe { clBuildProgram(pr, 1, &device_id, std::ptr::null(), std::ptr::null(), std::ptr::null()) };
     if bc != CL_SUCCESS {
+        // prg drops here -> clReleaseProgram (no leak on build failure).
         return Err(err(bc, "clBuildProgram"));
     }
-    list.push((context, KernelProg { program: pr }));
-    Ok(pr)
+    // Hand the program to the cache (KernelProg owns it via its own Drop); the
+    // transient guard must not release it again.
+    let raw = prg.into_raw();
+    list.push((context, KernelProg { program: raw }));
+    Ok(raw)
 }
 
 fn create_kernel(program: usize, name: &str) -> Result<usize> {
@@ -125,17 +130,54 @@ fn run_nd(queue: usize, kernel: usize, gsz: &[usize], dim: u32) -> Result<()> {
     Ok(())
 }
 
+/// RAII guard that releases a `cl_program` on drop unless ownership is handed
+/// off to the program cache (whose `KernelProg` carries its own Drop).
+struct ProgGuard(usize);
+impl ProgGuard {
+    fn into_raw(self) -> usize {
+        let v = self.0;
+        std::mem::forget(self);
+        v
+    }
+}
+impl Drop for ProgGuard {
+    fn drop(&mut self) {
+        if self.0 != 0 {
+            unsafe { clReleaseProgram(self.0) };
+        }
+    }
+}
+
+/// RAII guard that releases a `cl_kernel` on drop — on BOTH success and error
+/// paths, so a failure between `clCreateKernel` and the final enqueue no longer
+/// leaks the kernel handle.
+struct KernelGuard(usize);
+impl KernelGuard {
+    fn into_raw(self) -> usize {
+        let v = self.0;
+        std::mem::forget(self);
+        v
+    }
+}
+impl Drop for KernelGuard {
+    fn drop(&mut self) {
+        if self.0 != 0 {
+            unsafe { clReleaseKernel(self.0) };
+        }
+    }
+}
+
 pub fn run_affine(ctx: usize, dev: usize, queue: usize, x: usize, out: usize, n: usize, mul: f32, add: f32) -> Result<()> {
     let program = program_for(ctx, dev)?;
-    let k = create_kernel(program, "kaffine")?;
+    let k = KernelGuard(create_kernel(program, "kaffine")?);
     let (n32, b0, b1) = (n as i32, x, out);
-    set_arg(k, 0, addr_of(&b0), 8)?;
-    set_arg(k, 1, addr_of(&b1), 8)?;
-    set_arg(k, 2, addr_of(&n32), 4)?;
-    set_arg(k, 3, addr_of(&mul), 4)?;
-    set_arg(k, 4, addr_of(&add), 4)?;
-    run_nd(queue, k, &[n.max(1)], 1)?;
-    unsafe { clReleaseKernel(k) };
+    set_arg(k.0, 0, addr_of(&b0), 8)?;
+    set_arg(k.0, 1, addr_of(&b1), 8)?;
+    set_arg(k.0, 2, addr_of(&n32), 4)?;
+    set_arg(k.0, 3, addr_of(&mul), 4)?;
+    set_arg(k.0, 4, addr_of(&add), 4)?;
+    run_nd(queue, k.0, &[n.max(1)], 1)?;
+    // k drops here -> clReleaseKernel.
     Ok(())
 }
 
@@ -150,13 +192,13 @@ pub fn run_unary(ctx: usize, dev: usize, queue: usize, op: &str, x: usize, out: 
         "recip" => "krecip",
         _ => "kexp",
     };
-    let k = create_kernel(program, kname)?;
+    let k = KernelGuard(create_kernel(program, kname)?);
     let (n32, b0, b1) = (n as i32, x, out);
-    set_arg(k, 0, addr_of(&b0), 8)?;
-    set_arg(k, 1, addr_of(&b1), 8)?;
-    set_arg(k, 2, addr_of(&n32), 4)?;
-    run_nd(queue, k, &[n.max(1)], 1)?;
-    unsafe { clReleaseKernel(k) };
+    set_arg(k.0, 0, addr_of(&b0), 8)?;
+    set_arg(k.0, 1, addr_of(&b1), 8)?;
+    set_arg(k.0, 2, addr_of(&n32), 4)?;
+    run_nd(queue, k.0, &[n.max(1)], 1)?;
+    // k drops here -> clReleaseKernel.
     Ok(())
 }
 
@@ -168,29 +210,29 @@ pub fn run_binary(ctx: usize, dev: usize, queue: usize, op: &str, a: usize, b: u
         "mul" => "kmul",
         _ => "kadd",
     };
-    let k = create_kernel(program, kname)?;
+    let k = KernelGuard(create_kernel(program, kname)?);
     let (n32, b0, b1, b2) = (n as i32, a, b, out);
-    set_arg(k, 0, addr_of(&b0), 8)?;
-    set_arg(k, 1, addr_of(&b1), 8)?;
-    set_arg(k, 2, addr_of(&b2), 8)?;
-    set_arg(k, 3, addr_of(&n32), 4)?;
-    run_nd(queue, k, &[n.max(1)], 1)?;
-    unsafe { clReleaseKernel(k) };
+    set_arg(k.0, 0, addr_of(&b0), 8)?;
+    set_arg(k.0, 1, addr_of(&b1), 8)?;
+    set_arg(k.0, 2, addr_of(&b2), 8)?;
+    set_arg(k.0, 3, addr_of(&n32), 4)?;
+    run_nd(queue, k.0, &[n.max(1)], 1)?;
+    // k drops here -> clReleaseKernel.
     Ok(())
 }
 
 pub fn run_matmul(ctx: usize, dev: usize, queue: usize, a: usize, b: usize, out: usize, (m, n, _k): (usize, usize, usize)) -> Result<()> {
     let program = program_for(ctx, dev)?;
-    let k = create_kernel(program, "kmatmul")?;
+    let k = KernelGuard(create_kernel(program, "kmatmul")?);
     let (M, N, K, b0, b1, b2) = (m as i32, n as i32, _k as i32, a, b, out);
-    set_arg(k, 0, addr_of(&b0), 8)?;
-    set_arg(k, 1, addr_of(&b1), 8)?;
-    set_arg(k, 2, addr_of(&b2), 8)?;
-    set_arg(k, 3, addr_of(&M), 4)?;
-    set_arg(k, 4, addr_of(&N), 4)?;
-    set_arg(k, 5, addr_of(&K), 4)?;
-    run_nd(queue, k, &[m.max(1), n.max(1)], 2)?;
-    unsafe { clReleaseKernel(k) };
+    set_arg(k.0, 0, addr_of(&b0), 8)?;
+    set_arg(k.0, 1, addr_of(&b1), 8)?;
+    set_arg(k.0, 2, addr_of(&b2), 8)?;
+    set_arg(k.0, 3, addr_of(&M), 4)?;
+    set_arg(k.0, 4, addr_of(&N), 4)?;
+    set_arg(k.0, 5, addr_of(&K), 4)?;
+    run_nd(queue, k.0, &[m.max(1), n.max(1)], 2)?;
+    // k drops here -> clReleaseKernel.
     Ok(())
 }
 

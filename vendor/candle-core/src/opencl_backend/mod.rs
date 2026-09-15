@@ -708,7 +708,13 @@ impl BackendDevice for OpenClDevice {
     }
 
     fn same_device(&self, other: &Self) -> bool {
+        // Two devices are only "the same" when they share the exact same OpenCL
+        // context+queue (i.e. are clones of one another). Comparing only gpu_id
+        // would let two *independent* `new(0)` contexts look equal and route
+        // cross-context operations down the native path, silently failing their
+        // kernels and falling back to CPU.
         self.gpu_id == other.gpu_id
+            && std::sync::Arc::ptr_eq(&self.inner, &other.inner)
     }
 
     fn zeros_impl(&self, shape: &Shape, dtype: DType) -> Result<Self::Storage> {
