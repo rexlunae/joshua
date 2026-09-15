@@ -622,6 +622,31 @@ impl QuantizedModel {
         }
     }
 
+    /// Layer-streaming prefill over a set of bounded chunks.  See
+    /// [`crate::stream_prefill`].  Only the joshua-native MoE loaders
+    /// (qwen3moe, deepseek2, deepseek4) implement it today; other
+    /// architectures report an unsupported error and the engine falls back to
+    /// the standard chunked prefill.
+    /// Whether this architecture has a native layer-streaming prefill path.
+    pub fn supports_streaming(&self) -> bool {
+        matches!(self, Self::Qwen3Moe(_) | Self::DeepSeek2(_) | Self::DeepSeek4(_))
+    }
+
+    pub fn prefill_streamed(
+        &mut self,
+        chunks: &[crate::stream_prefill::Chunk],
+        device: &Device,
+    ) -> Result<Tensor> {
+        match self {
+            Self::Qwen3Moe(m) => crate::stream_prefill::stream_prefill(m, chunks, device),
+            Self::DeepSeek2(m) => crate::stream_prefill::stream_prefill(m, chunks, device),
+            Self::DeepSeek4(m) => crate::stream_prefill::stream_prefill(m, chunks, device),
+            _ => Err(candle_core::Error::Msg(
+                "layer-streaming prefill is not implemented for this architecture".into(),
+            )),
+        }
+    }
+
     /// Batch one decode step across `seqs` independent sequences, amortizing
     /// the routed-expert fetch across the MoE dispatch.  See
     /// `quantized_deepseek4::ModelWeights::forward_sequences`.  Only supported

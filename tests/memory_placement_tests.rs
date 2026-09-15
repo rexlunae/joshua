@@ -281,3 +281,38 @@ fn engine_shares_one_weight_set_across_sessions() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// The layer-streaming prefill (layer-outer / chunk-inner, shared framework)
+/// must produce bit-identical last-token logits to today's standard
+/// chunked prefill — the KV reordering is numerically identical (each layer's
+/// KV accumulates in the same order across chunks).
+#[test]
+fn stream_prefill_matches_chunked_forward() {
+    for (name, write) in fixtures() {
+        let dir = common::model_dir(&format!("lsp-{name}"));
+        let model = dir.join("model.gguf");
+        write(&model);
+        let mut plain = load_placed(&model, &Device::Cpu);
+        let mut stream = load_placed(&model, &Device::Cpu);
+        let tokens: Vec<u32> = vec![1, 4, 2, 7, 5, 3, 8, 9];
+        let reference = logits(&mut plain, &tokens, 0);
+
+        // A prompt long enough to split into 2 chunks of 4.
+        let chunks: Vec<joshua::stream_prefill::Chunk> = vec![
+            joshua::stream_prefill::Chunk { tokens: &tokens[0..4], pos: 0 },
+            joshua::stream_prefill::Chunk { tokens: &tokens[4..8], pos: 4 },
+        ];
+        let out = stream
+            .prefill_streamed(&chunks, &Device::Cpu)
+            .expect("streaming supported");
+        let got: Vec<f32> = out.flatten_all().unwrap().to_vec1().unwrap();
+        assert_eq!(got.len(), reference.len(), "{name}: vocab widths");
+        for (i, (g, r)) in got.iter().zip(reference.iter()).enumerate() {
+            assert!(
+                (g - r).abs() < 1e-4,
+                "{name}: streamed logit {i} diverges: {g} vs {r}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}

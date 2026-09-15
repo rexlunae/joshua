@@ -43,6 +43,7 @@ pub mod residency;
 pub mod npu;
 pub mod paged_weights;
 pub mod placement;
+pub mod stream_prefill;
 pub mod server;
 pub mod simd;
 pub mod template;
