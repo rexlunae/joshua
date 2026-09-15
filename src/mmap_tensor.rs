@@ -690,7 +690,28 @@ use std::thread::JoinHandle;
 /// compute time, so staying 2–3 layers ahead gives the disk a full layer's
 /// worth of lead while bounding how much of the page cache the stream occupies
 /// (~2.5 GB at depth 3).
-pub const PREFETCH_AHEAD_DEPTH: usize = 3;
+///
+/// The depth is **byte-budgeted by available RAM** (architecture finding #3):
+/// on a small machine 3 layers of read-ahead can evict useful pages, so the
+/// lead shrinks to 2 / 1 / 0 as free memory drops.  The budget floor is chosen
+/// so the default (plenty of RAM) keeps the full 3-layer lead.
+pub fn prefetch_ahead_depth() -> usize {
+    match crate::placement::available_ram_bytes() {
+        Some(free) => {
+            let free_gib = free / (1024 * 1024 * 1024);
+            if free_gib < 2 {
+                0
+            } else if free_gib < 4 {
+                1
+            } else if free_gib < 8 {
+                2
+            } else {
+                3
+            }
+        }
+        None => 3, // cannot probe; keep the default lead
+    }
+}
 
 /// Size of the scratch buffer used per `pread` syscall.  The bytes are
 /// discarded — the page cache is the transport — so this only bounds syscall
@@ -1097,7 +1118,7 @@ mod tests {
         let mut pf = LayerPrefetcher::spawn(
             Arc::clone(&file),
             Arc::new(ranges),
-            PREFETCH_AHEAD_DEPTH,
+            prefetch_ahead_depth(),
         );
         pf.set_current(0);
 

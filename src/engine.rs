@@ -525,6 +525,13 @@ pub struct Engine {
 // `Mutex<…>`, and `AtomicU64` are all `Send + Sync`, so Engine is
 // automatically `Send + Sync`.
 
+/// Minimum free system RAM required to admit a new request (bytes).  Below
+/// this the engine refuses new generations (memory-aware admission, #2) rather
+/// than letting a heavy load push the working set into swap.  Kept well above
+/// a single decode's transient allocations so it only fires under real
+/// pressure.
+const LOW_MEM_FLOOR: u64 = 1536 * 1024 * 1024; // 1.5 GiB
+
 /// Maximum number of idle model instances kept warm in the pool.
 ///
 /// Each instance holds the (quantized) weights plus its KV cache, so this
@@ -551,6 +558,19 @@ struct InFlightGuard<'a> {
 
 impl<'a> InFlightGuard<'a> {
     fn acquire(counter: &'a AtomicUsize, max: usize) -> Result<Self> {
+        // Memory-aware admission (finding #2): reject before reserving a slot
+        // when the machine is critically low on RAM, so a new request cannot
+        // push a heavy model load/working set into swap.  Conservative: this
+        // only admits *fewer* than the concurrency cap under pressure.
+        if let Some(free) = crate::placement::available_ram_bytes() {
+            if free < LOW_MEM_FLOOR {
+                return Err(JoshuaError::Overloaded(format!(
+                    "low memory ({} MiB free < {} MiB floor); retry shortly",
+                    free / (1024 * 1024),
+                    LOW_MEM_FLOOR / (1024 * 1024),
+                )));
+            }
+        }
         // Reserve a slot optimistically, then bail out if we blew the cap.
         let prev = counter.fetch_add(1, Ordering::AcqRel);
         if prev >= max {
@@ -2057,13 +2077,19 @@ impl Engine {
 
     /// Return a finished session (state = `tokens`) to the pool.
     fn release_model(&self, session: GenSession, tokens: Vec<u32>) {
-        {
-            let mut pool = self.model_pool();
-            pool.push(CachedModel { session, tokens });
-            // Evict oldest beyond the cap.
-            while pool.len() > MAX_CACHED_MODELS {
-                pool.remove(0);
-            }
+        let mut pool = self.model_pool();
+        pool.push(CachedModel { session, tokens });
+        // Evict oldest beyond the cap.  Under memory pressure the pool also
+        // holds fewer (or no) idle sessions, so a heavy model's working set
+        // isn't kept resident twice/three times just to warm a next request
+        // (finding #2).
+        let pool_cap: usize = match crate::placement::available_ram_bytes() {
+            Some(free) if free < LOW_MEM_FLOOR => 0,
+            Some(free) if free < LOW_MEM_FLOOR * 2 => 1,
+            _ => MAX_CACHED_MODELS,
+        };
+        while pool.len() > pool_cap {
+            pool.remove(0);
         }
     }
 
