@@ -91,8 +91,14 @@ two `hidden × 4`-byte transfers per layer, negligible on PCIe.  `auto` picks
 `device` only when `dense + experts + 1 GiB` fits the device's free memory
 (`cudaMemGetInfo` on CUDA, or `--vram-budget`), and `host` otherwise; on
 OpenCL, whose storage is dense f32 (an uploaded expert would be 8–16× its
-on-disk size), `auto` is always `host`.  With no probe and no budget the
-historical layout is kept, so nothing changes on machines that fit.
+on-disk size), `auto` is always `host` and every device figure is the f32
+footprint (`elem_count × 4`), not the on-disk bytes.  With no probe and no
+budget the historical layout is kept, so nothing changes on machines that
+fit.  Placement moves only the routed experts: a budget the dense set does
+not fit with headroom is refused at load, naming both numbers, rather than
+deferred to an out-of-memory upload.  `deepseek4` is always resolved as
+`host` (its loader keeps the IQ2_XXS experts on the CPU regardless), so
+its per-session device footprint is the dense set alone.
 
 Per-device memory with `host` placement:
 

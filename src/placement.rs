@@ -226,6 +226,18 @@ pub fn resolve_expert_placement(
     }
 }
 
+/// Whether the dense set — which always goes to the compute device — fits
+/// the device's memory with headroom.  Expert placement can only move the
+/// routed experts; a budget below this cannot be honoured by any placement,
+/// so the engine refuses the load instead of deferring an oversized upload
+/// to the first request.
+pub fn dense_set_fits(dense_device_bytes: u64, headroom_bytes: u64, budget_bytes: u64) -> bool {
+    // An overflowing requirement is "does not fit", never a wrap into fitting.
+    dense_device_bytes
+        .checked_add(headroom_bytes)
+        .is_some_and(|need| need <= budget_bytes)
+}
+
 /// How many full copies of `instance_bytes` fit in `free_bytes` once
 /// `headroom_bytes` is set aside — the number of model sessions an
 /// accelerator can hold when each session carries its own weight copy.
@@ -422,6 +434,14 @@ mod tests {
             ResolvedPlacement::Device,
             "saturating add must not wrap below the probe"
         );
+    }
+
+    #[test]
+    fn dense_set_fit_is_checked_with_headroom() {
+        assert!(dense_set_fits(6 * GIB, GIB, 7 * GIB));
+        assert!(!dense_set_fits(6 * GIB, GIB, 7 * GIB - 1));
+        assert!(!dense_set_fits(6 * GIB, GIB, 4 * GIB));
+        assert!(!dense_set_fits(u64::MAX, GIB, u64::MAX), "saturating add must not wrap into a fit");
     }
 
     #[test]

@@ -229,7 +229,13 @@ experts.  `--expert-placement` chooses where the routed experts of a
 
 `--vram-budget <MiB>` (or `JOSHUA_VRAM_BUDGET`) states the memory the model
 may use when there is no probe (Metal's unified memory, OpenCL) or when the
-card is shared.  The decision is logged at startup:
+card is shared.  Placement can only move the routed experts: the dense set
+always goes to the device, so a budget (or probed free memory) it does not
+fit with 1 GiB of headroom fails the load with the two numbers instead of
+running out of device memory on the first request.  On OpenCL the figures
+are the f32 footprint, since that backend dequantizes every uploaded weight.
+`deepseek4` always keeps its IQ2_XXS experts on the host whatever is
+requested.  The decision is logged at startup:
 
 ```text
 INFO joshua: expert placement: host RAM — experts borrowed from the mapping,

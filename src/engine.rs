@@ -1009,6 +1009,16 @@ impl Engine {
             let sum = |r: &[ByteRange]| r.iter().map(|(_, len)| *len as u64).sum::<u64>();
             (sum(&dense), sum(&experts))
         };
+        // What those sets occupy *on the device*: their quantized bytes on
+        // CUDA/Metal, but f32 on OpenCL, whose storage dequantizes every
+        // uploaded weight (4–16× the on-disk size).
+        let (dense_device_bytes, expert_device_bytes) = if options.backend == ComputeBackend::OpenCl
+            || (options.backend == ComputeBackend::Auto && cfg!(feature = "opencl"))
+        {
+            f32_weight_bytes(&raw)
+        } else {
+            (dense_bytes, expert_bytes)
+        };
 
         // Prefetch and/or lock the always-touched weights, and advise random
         // access on routed experts, when requested.
@@ -1071,15 +1081,67 @@ impl Engine {
         let device_budget = options
             .device_memory_budget
             .or_else(|| crate::placement::device_memory_info(&device).map(|(free, _)| free));
+        // The device figures below follow the *resolved* device, not the
+        // requested backend (`auto` may have degraded to the CPU).
+        let (dense_device_bytes, expert_device_bytes) = if device.is_opencl() {
+            (dense_device_bytes, expert_device_bytes)
+        } else {
+            (dense_bytes, expert_bytes)
+        };
+        // The dense set always goes to the device: no placement can shrink
+        // it, so a budget it does not fit is refused here, with the numbers,
+        // rather than deferred to an out-of-memory upload on the first
+        // request.
+        if !device.is_cpu() {
+            if let Some(budget) = device_budget {
+                if !crate::placement::dense_set_fits(
+                    dense_device_bytes,
+                    crate::placement::DEVICE_PLACEMENT_HEADROOM,
+                    budget,
+                ) {
+                    return Err(JoshuaError::ModelLoad(format!(
+                        "the model's dense set ({:.2} GiB on {:?}, plus {:.1} GiB headroom) does not fit \
+                         the device memory budget of {:.2} GiB ({}). Expert placement can only move \
+                         the routed experts off the device; run with --device cpu, free device memory, \
+                         or raise --vram-budget if the budget was set by hand.",
+                        dense_device_bytes as f64 / 2f64.powi(30),
+                        device,
+                        crate::placement::DEVICE_PLACEMENT_HEADROOM as f64 / 2f64.powi(30),
+                        budget as f64 / 2f64.powi(30),
+                        if options.device_memory_budget.is_some() {
+                            "--vram-budget"
+                        } else {
+                            "probed free memory"
+                        },
+                    )));
+                }
+            }
+        }
+        // Architectures whose loader keeps the experts on the CPU no matter
+        // what (deepseek4: IQ2_XXS has no device kernel) are resolved as
+        // host placement so the device accounting below matches what the
+        // loader actually uploads.
+        let experts_host_only = arch.is_some_and(|a| a.experts_always_on_host());
+        let requested_placement = if experts_host_only {
+            if !device.is_cpu() && options.expert_placement == ExpertPlacement::Device {
+                tracing::info!(
+                    "expert placement `device` requested, but this architecture always keeps its \
+                     routed experts in host RAM; only the dense set goes to the device"
+                );
+            }
+            ExpertPlacement::Host
+        } else {
+            options.expert_placement
+        };
         let placement = crate::placement::resolve_expert_placement(
-            options.expert_placement,
+            requested_placement,
             crate::placement::DeviceProfile {
                 is_cpu: device.is_cpu(),
                 dense_only: device.is_opencl(),
                 free_bytes: device_budget,
             },
-            dense_bytes,
-            expert_bytes,
+            dense_device_bytes,
+            expert_device_bytes,
             crate::placement::DEVICE_PLACEMENT_HEADROOM,
         );
         let expert_device = match placement {
@@ -1092,9 +1154,9 @@ impl Engine {
         let instance_device_bytes = if device.is_cpu() || shares_weights {
             0
         } else if expert_device.is_cpu() {
-            dense_bytes
+            dense_device_bytes
         } else {
-            dense_bytes.saturating_add(expert_bytes)
+            dense_device_bytes.saturating_add(expert_device_bytes)
         };
         let device_session_cap = match (device_budget, instance_device_bytes) {
             (Some(free), bytes) if bytes > 0 => Some(crate::placement::instances_for_memory(
@@ -1107,19 +1169,20 @@ impl Engine {
         };
         if !device.is_cpu() && expert_bytes > 0 {
             tracing::info!(
-                "expert placement: {} (dense {:.1} GiB, experts {:.1} GiB, device budget {}, requested {:?})",
+                "expert placement: {} (dense {:.1} GiB, experts {:.1} GiB{}, device budget {}, requested {:?})",
                 match placement {
                     crate::placement::ResolvedPlacement::Host =>
                         "host RAM — experts borrowed from the mapping, dense set on the device",
                     crate::placement::ResolvedPlacement::Device => "device",
                 },
-                dense_bytes as f64 / 2f64.powi(30),
-                expert_bytes as f64 / 2f64.powi(30),
+                dense_device_bytes as f64 / 2f64.powi(30),
+                expert_device_bytes as f64 / 2f64.powi(30),
+                if device.is_opencl() { " as f32 on OpenCL" } else { "" },
                 match device_budget {
                     Some(b) => format!("{:.1} GiB", b as f64 / 2f64.powi(30)),
                     None => "unknown".to_string(),
                 },
-                options.expert_placement,
+                requested_placement,
             );
         }
 
@@ -2602,6 +2665,24 @@ fn is_routed_expert(name: &str) -> bool {
         || name.contains(".ffn_up_exps")
 }
 
+/// Bytes the dense and routed-expert weights occupy once dequantized to
+/// f32 (`elem_count × 4` per tensor), split like [`weight_ranges`].  This
+/// is the device footprint on a backend whose storage is dense f32
+/// (OpenCL), where the on-disk quantized size undercounts by 4–16×.
+fn f32_weight_bytes(header: &crate::gguf_ext::GgufHeader) -> (u64, u64) {
+    let mut dense = 0u64;
+    let mut experts = 0u64;
+    for (name, info) in &header.tensors {
+        let bytes = (info.elem_count() as u64).saturating_mul(4);
+        if is_routed_expert(name) {
+            experts = experts.saturating_add(bytes);
+        } else {
+            dense = dense.saturating_add(bytes);
+        }
+    }
+    (dense, experts)
+}
+
 /// Byte ranges of the model file holding dense vs routed-expert weights.
 ///
 /// Tensor data is laid out back-to-back (aligned to `general.alignment`,
@@ -3494,6 +3575,32 @@ mod tests {
     }
 
     // ─── Hot-weight pinning ────────────────────────────────────────────────
+
+    /// The f32 device footprint counts elements, not on-disk bytes, split
+    /// by the same dense/expert rule as the byte ranges.
+    #[test]
+    fn f32_weight_bytes_counts_elements_by_set() {
+        use std::collections::HashMap;
+        let tensor = |dims: Vec<usize>| crate::gguf_ext::RawTensorInfo {
+            dtype: 12, // Q4_K on disk — irrelevant to the f32 footprint
+            dims,
+            offset: 0,
+        };
+        let header = crate::gguf_ext::GgufHeader {
+            version: 3,
+            metadata: HashMap::new(),
+            tensors: HashMap::from([
+                ("token_embd.weight".to_string(), tensor(vec![8, 16])),
+                ("blk.0.attn_q.weight".to_string(), tensor(vec![8, 8])),
+                ("blk.0.ffn_gate_exps.weight".to_string(), tensor(vec![4, 8, 2])),
+                ("blk.0.ffn_up_exps.weight".to_string(), tensor(vec![4, 8, 2])),
+            ]),
+            tensor_data_offset: 0,
+        };
+        let (dense, experts) = f32_weight_bytes(&header);
+        assert_eq!(dense, (8 * 16 + 8 * 8) * 4);
+        assert_eq!(experts, 2 * (4 * 8 * 2) * 4);
+    }
 
     fn header_with_tensors(
         tensor_data_offset: u64,

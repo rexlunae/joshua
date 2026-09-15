@@ -240,6 +240,16 @@ impl Architecture {
         matches!(self, Self::Qwen3Moe | Self::DeepSeek2)
     }
 
+    /// Whether this architecture's loader keeps the routed experts in host
+    /// RAM regardless of the requested placement.  `deepseek4`'s IQ2_XXS
+    /// experts have no accelerator kernel, so its loader always borrows
+    /// them from the mapping on the CPU and runs only the dense set on the
+    /// device; an `ExpertPlacement::Device` request cannot change that and
+    /// must not be accounted as if it had.
+    pub fn experts_always_on_host(&self) -> bool {
+        matches!(self, Self::DeepSeek4)
+    }
+
     pub fn is_known_llama_cpp_arch(name: &str) -> bool {
         Self::from_name(name).is_some() || KNOWN_UNSUPPORTED_ARCHS.contains(&name)
     }
