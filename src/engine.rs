@@ -1061,9 +1061,12 @@ impl Engine {
             let (dense, experts) = weight_ranges(&raw, mmap.len() as u64);
             let sum = |r: &[ByteRange]| r.iter().map(|(_, len)| *len as u64).sum::<u64>();
             // A tied output head reloads the embedding table as a second
-            // tensor, so the device holds it twice.
+            // tensor, so the device holds it twice; an output alias the
+            // selected loader never reads is never uploaded at all.
             (
-                sum(&dense).saturating_add(tied_output_bytes(&raw, arch, false)),
+                sum(&dense)
+                    .saturating_sub(ignored_alias_bytes(&raw, arch, false))
+                    .saturating_add(tied_output_bytes(&raw, arch, false)),
                 sum(&experts),
             )
         };
@@ -2690,7 +2693,53 @@ fn f32_weight_bytes(header: &crate::gguf_ext::GgufHeader, arch: Option<Architect
             dense = dense.saturating_add(bytes);
         }
     }
-    (dense.saturating_add(tied_output_bytes(header, arch, true)), experts)
+    (
+        dense
+            .saturating_sub(ignored_alias_bytes(header, arch, true))
+            .saturating_add(tied_output_bytes(header, arch, true)),
+        experts,
+    )
+}
+
+/// The output-head names candle's `lfm2` loader probes besides
+/// `output.weight`.  No other loader reads them.
+const LFM2_OUTPUT_ALIASES: [&str; 3] = [
+    "lm_head.weight",
+    "model.output.weight",
+    "model.lm_head.weight",
+];
+
+/// Bytes of the tensor `name` in the header: dequantized f32 when `f32`,
+/// otherwise its on-disk quantized size.  Zero when absent or of a dtype
+/// with no known size.
+fn tensor_bytes(header: &crate::gguf_ext::GgufHeader, name: &str, f32: bool) -> u64 {
+    let Some(info) = header.tensors.get(name) else {
+        return 0;
+    };
+    if f32 {
+        (info.elem_count() as u64).saturating_mul(4)
+    } else {
+        crate::gguf_ext::type_size_bytes(info.dtype, info.elem_count())
+            .map(|b| b as u64)
+            .unwrap_or(0)
+    }
+}
+
+/// Bytes of output-head alias tensors present in the file that the
+/// selected loader never reads (and so never uploads): the LFM2 aliases in
+/// any file that is not an LFM2 model.  The whole-file scans count every
+/// tensor, so this is subtracted from the dense figure.
+fn ignored_alias_bytes(
+    header: &crate::gguf_ext::GgufHeader,
+    arch: Option<Architecture>,
+    f32: bool,
+) -> u64 {
+    if arch == Some(Architecture::Lfm2) {
+        return 0;
+    }
+    LFM2_OUTPUT_ALIASES
+        .iter()
+        .fold(0u64, |acc, n| acc.saturating_add(tensor_bytes(header, n, f32)))
 }
 
 /// Extra device bytes a *tied* output head costs: a GGUF without
@@ -2708,23 +2757,13 @@ fn tied_output_bytes(
     // Only that loader honours them — another architecture's loader ignores
     // such a tensor and still reloads the embedding, so the aliases count
     // as a head for LFM2 alone.
-    const LFM2_ALIASES: [&str; 3] = ["lm_head.weight", "model.output.weight", "model.lm_head.weight"];
     let has_head = header.tensors.contains_key("output.weight")
         || (arch == Some(Architecture::Lfm2)
-            && LFM2_ALIASES.iter().any(|n| header.tensors.contains_key(*n)));
+            && LFM2_OUTPUT_ALIASES.iter().any(|n| header.tensors.contains_key(*n)));
     if has_head {
         return 0;
     }
-    let Some(embd) = header.tensors.get("token_embd.weight") else {
-        return 0;
-    };
-    if f32 {
-        (embd.elem_count() as u64).saturating_mul(4)
-    } else {
-        crate::gguf_ext::type_size_bytes(embd.dtype, embd.elem_count())
-            .map(|b| b as u64)
-            .unwrap_or(0)
-    }
+    tensor_bytes(header, "token_embd.weight", f32)
 }
 
 /// Byte ranges of the model file holding dense vs routed-expert weights.
@@ -3673,6 +3712,15 @@ mod tests {
             assert_eq!(tied_output_bytes(&aliased, lfm2, false), 0, "{alias}: LFM2 head");
             assert_eq!(tied_output_bytes(&aliased, q, true), 256 * 4 * 4, "{alias}: ignored by qwen3moe");
             assert_eq!(tied_output_bytes(&aliased, None, false), 576, "{alias}: unknown arch stays tied");
+            // …and the ignored alias itself is never uploaded, so the dense
+            // total for a non-LFM2 model excludes it: embedding twice + attn_q.
+            let (dense, _) = f32_weight_bytes(&aliased, q);
+            assert_eq!(dense, (2 * 256 * 4 + 8 * 8) * 4, "{alias}: unused alias not counted");
+            assert_eq!(ignored_alias_bytes(&aliased, q, false), 576, "{alias}: quantized size");
+            // For LFM2 the alias is the head: counted once, no tied copy.
+            let (dense, _) = f32_weight_bytes(&aliased, lfm2);
+            assert_eq!(dense, (256 * 4 + 256 * 4 + 8 * 8) * 4, "{alias}: LFM2 head counted once");
+            assert_eq!(ignored_alias_bytes(&aliased, lfm2, true), 0);
         }
     }
 
