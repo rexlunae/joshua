@@ -360,6 +360,15 @@ impl BackendStorage for OpenClStorage {
     }
 
     fn affine(&self, layout: &Layout, mul: f64, add: f64) -> Result<Self> {
+        if kernels::native_enabled() && layout.is_contiguous() && self.dtype == DType::F32 {
+            let n = self.numel;
+            let out_buf = create_buffer(self.device.context(), n * 4, cl::CL_MEM_READ_WRITE)?;
+            match kernels::run_affine(self.device.context(), self.device.device_id, self.device.queue(),
+                self.buffer, out_buf, n, mul as f32, add as f32) {
+                Ok(()) => return Ok(OpenClStorage { buffer: out_buf, dtype: self.dtype, numel: self.numel, device: self.device.clone() }),
+                Err(_) => { unsafe { clReleaseMemObject(out_buf) }; },
+            }
+        }
         let cpu = self.to_cpu_storage()?;
         let out = cpu.affine(layout, mul, add)?;
         self.device.storage_from_cpu_storage(&out)
@@ -397,12 +406,33 @@ impl BackendStorage for OpenClStorage {
     }
 
     fn unary_impl<B: UnaryOpT>(&self, layout: &Layout) -> Result<Self> {
+        if kernels::native_enabled() && layout.is_contiguous() && self.dtype == DType::F32 && kernels::has_unary(B::NAME) {
+            let n = self.numel;
+            let out_buf = create_buffer(self.device.context(), n * 4, cl::CL_MEM_READ_WRITE)?;
+            match kernels::run_unary(self.device.context(), self.device.device_id, self.device.queue(),
+                B::NAME, self.buffer, out_buf, n) {
+                Ok(()) => return Ok(OpenClStorage { buffer: out_buf, dtype: self.dtype, numel: self.numel, device: self.device.clone() }),
+                Err(_) => { unsafe { clReleaseMemObject(out_buf) }; },
+            }
+        }
         let cpu = self.to_cpu_storage()?;
         let out = cpu.unary_impl::<B>(layout)?;
         self.device.storage_from_cpu_storage(&out)
     }
 
     fn binary_impl<B: BinaryOpT>(&self, rhs: &Self, lhs_l: &Layout, rhs_l: &Layout) -> Result<Self> {
+        if kernels::native_enabled() && lhs_l.is_contiguous() && rhs_l.is_contiguous()
+            && self.dtype == DType::F32 && rhs.dtype == DType::F32 && self.numel == rhs.numel
+            && kernels::has_binary(B::NAME)
+        {
+            let n = self.numel;
+            let out_buf = create_buffer(self.device.context(), n * 4, cl::CL_MEM_READ_WRITE)?;
+            match kernels::run_binary(self.device.context(), self.device.device_id, self.device.queue(),
+                B::NAME, self.buffer, rhs.buffer, out_buf, n) {
+                Ok(()) => return Ok(OpenClStorage { buffer: out_buf, dtype: self.dtype, numel: self.numel, device: self.device.clone() }),
+                Err(_) => { unsafe { clReleaseMemObject(out_buf) }; },
+            }
+        }
         let lhs = self.to_cpu_storage()?;
         let rhs = rhs.to_cpu_storage()?;
         let out = lhs.binary_impl::<B>(&rhs, lhs_l, rhs_l)?;
@@ -754,3 +784,78 @@ mod tests {
         Ok(())
     }
 }
+
+    /// M5 parity: for each candidate op, compute on Cpu and on OpenCl (native kernels,
+    /// enabled only when JOSHUA_OPENCL_NATIVE=1) and require near-identical results.
+    /// Catches NaN / orientation bugs per-op. Run on the OpenCL host:
+    ///   JOSHUA_OPENCL_NATIVE=1 cargo test --features opencl -p candle-core -- --ignored opencl_parity
+    #[test]
+    #[ignore]
+    fn opencl_parity_native() -> crate::Result<()> {
+        use rand::{Rng, SeedableRng};
+        use rand::rngs::StdRng;
+        let mut rng = StdRng::seed_from_u64(42);
+
+        let dev = match crate::OpenClDevice::new(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping opencl parity: {e}");
+                return Ok(());
+            }
+        };
+        let dev = Device::OpenCl(dev);
+
+        let native = kernels::native_enabled();
+        eprintln!("JOSHUA_OPENCL_NATIVE={native}");
+
+        macro_rules! gen {
+            ($n:expr) => {{
+                (0..$n).map(|_| rng.gen_range(-2.0f32..2.0)).collect::<Vec<f32>>()
+            }};
+        }
+
+        fn approx(a: &[f32], b: &[f32], tol: f32, what: &str) {
+            assert_eq!(a.len(), b.len(), "{what}: length");
+            let mut worst = 0.0f32;
+            for i in 0..a.len() {
+                let mut d = (a[i] - b[i]).abs();
+                if a[i].abs() + b[i].abs() > 1.0 {
+                    d /= (a[i].abs() + b[i].abs()).max(1e-6);
+                }
+                if !d.is_finite() || d > worst { worst = d; }
+            }
+            eprintln!("  {what}: worst rel diff = {worst:.3e} (len {})", a.len());
+            assert!(worst < tol, "{what}: parity FAILED worst={worst:.3e}");
+        }
+
+        // ---- affine: y = a*x + b ----
+        let n = 4096;
+        let cpu_v = gen!(n);
+        let mul = 1.5f32; let add = -0.25f32;
+        let cpu = Tensor::from_vec(cpu_v.clone(), (n,), &Device::Cpu)?;
+        let got_cpu = cpu.affine(f64::from(mul), f64::from(add))?;
+        let oc = Tensor::from_vec(cpu_v, (n,), &dev)?;
+        let got_oc = oc.affine(f64::from(mul), f64::from(add))?.to_device(&Device::Cpu)?.to_vec1::<f32>()?;
+        approx(&got_cpu.to_vec1::<f32>()?, &got_oc, 1e-3, "affine");
+
+        // ---- unary: exp ----
+        let cpu_v = gen!(n);
+        let cpu = Tensor::from_vec(cpu_v.clone(), (n,), &Device::Cpu)?;
+        let got_cpu = cpu.exp()?;
+        let oc = Tensor::from_vec(cpu_v, (n,), &dev)?;
+        let got_oc = oc.exp()?.to_device(&Device::Cpu)?.to_vec1::<f32>()?;
+        approx(&got_cpu.to_vec1::<f32>()?, &got_oc, 1e-3, "exp");
+
+        // ---- binary: add ----
+        let a_v = gen!(n); let b_v = gen!(n);
+        let ac = Tensor::from_vec(a_v.clone(), (n,), &Device::Cpu)?;
+        let bc = Tensor::from_vec(b_v.clone(), (n,), &Device::Cpu)?;
+        let got_cpu = ac.add(&bc)?;
+        let ao = Tensor::from_vec(a_v, (n,), &dev)?;
+        let bo = Tensor::from_vec(b_v, (n,), &dev)?;
+        let got_oc = ao.add(&bo)?.to_device(&Device::Cpu)?.to_vec1::<f32>()?;
+        approx(&got_cpu.to_vec1::<f32>()?, &got_oc, 1e-3, "add");
+
+        eprintln!("opencl parity: all wired ops OK");
+        Ok(())
+    }
