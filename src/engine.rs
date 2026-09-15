@@ -2697,7 +2697,15 @@ fn f32_weight_bytes(header: &crate::gguf_ext::GgufHeader) -> (u64, u64) {
 /// as the embedding, once as the head.  `f32` selects the dequantized size
 /// (OpenCL) over the on-disk quantized size.  Zero for an untied model.
 fn tied_output_bytes(header: &crate::gguf_ext::GgufHeader, f32: bool) -> u64 {
-    if header.tensors.contains_key("output.weight") {
+    // Every name a loader accepts for a separate output head: `output.weight`
+    // everywhere, plus the aliases candle's `lfm2` loader probes.
+    const OUTPUT_HEADS: [&str; 4] = [
+        "output.weight",
+        "lm_head.weight",
+        "model.output.weight",
+        "model.lm_head.weight",
+    ];
+    if OUTPUT_HEADS.iter().any(|n| header.tensors.contains_key(*n)) {
         return 0;
     }
     let Some(embd) = header.tensors.get("token_embd.weight") else {
@@ -3645,6 +3653,15 @@ mod tests {
         assert_eq!(tied_output_bytes(&tied, true), 256 * 4 * 4);
         // Q4_K: 256 elements per 144-byte block → 1024 elems = 576 bytes.
         assert_eq!(tied_output_bytes(&tied, false), 576);
+
+        // A head under one of LFM2's alias names is a separate tensor the
+        // scan already counted: not tied.
+        for alias in ["lm_head.weight", "model.output.weight", "model.lm_head.weight"] {
+            let mut aliased = tied.clone();
+            aliased.tensors.insert(alias.to_string(), tensor(vec![256, 4]));
+            assert_eq!(tied_output_bytes(&aliased, true), 0, "{alias} is an untied head");
+            assert_eq!(tied_output_bytes(&aliased, false), 0, "{alias} is an untied head");
+        }
     }
 
     fn header_with_tensors(
