@@ -39,6 +39,7 @@ pub mod quantized_deepseek2;
 pub mod quantized_deepseek4;
 pub mod quantized_qwen3_moe;
 pub mod quant_matmul;
+pub mod cuda_io;
 pub mod residency;
 pub mod npu;
 pub mod paged_weights;
