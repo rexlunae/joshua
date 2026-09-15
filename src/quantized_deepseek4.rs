@@ -2188,7 +2188,7 @@ impl ModelWeights {
             Some(crate::mmap_tensor::LayerPrefetcher::spawn(
                 self.file.as_ref().expect("checked above").clone(),
                 std::sync::Arc::new(self.layer_expert_ranges.clone()),
-                crate::mmap_tensor::PREFETCH_AHEAD_DEPTH,
+                crate::mmap_tensor::prefetch_ahead_depth(),
             ))
         } else {
             None
