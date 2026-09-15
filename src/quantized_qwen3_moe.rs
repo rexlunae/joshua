@@ -298,6 +298,7 @@ impl<R: Read + Seek> Reader<R> {
 /// * [`Weight::Zc`] — a [`ZcWeight`] bound at its file offset inside a
 ///   no-copy Metal buffer.  The GPU reads the mapped pages directly; nothing
 ///   is copied or uploaded.
+#[derive(Clone)]
 enum Weight {
     Candle(QMatMul),
     Zc(Arc<ZcWeight>),
@@ -524,6 +525,7 @@ fn truncate_kv(kv_cache: &mut KvCache, keep: usize) -> Result<()> {
 
 // ─── Mixture of experts (Qwen3MoE routing) ──────────────────────────────────
 
+#[derive(Clone)]
 struct Mlp {
     gate: Weight,
     up: Weight,
@@ -552,16 +554,56 @@ impl Mlp {
     }
 }
 
+/// The device-resident form of one routed expert: the same gate/up/down
+/// projections, uploaded to the expert device, wrapped in an opaque
+/// [`crate::residency::DeviceExpertSlot`] payload so the
+/// [`crate::residency::DeviceResidency`] pool can hold it and dispatch can run
+/// it on the GPU.  Forwarding mirrors [`Mlp::forward`] (silu(gate·x)⊗up then
+/// down), operating on the device tensors.
+struct DeviceExpert {
+    gate: Weight,
+    up: Weight,
+    down: Weight,
+    bytes: u64,
+}
+
+impl crate::residency::DeviceExpertSlot for DeviceExpert {
+    fn device_bytes(&self) -> u64 {
+        self.bytes
+    }
+}
+
+impl DeviceExpert {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        let w1 = self.gate.forward(xs)?;
+        let w3 = self.up.forward(xs)?;
+        self.down.forward(&(silu(&w1)? * w3)?)
+    }
+}
+
+/// Monotonic per-layer expert index mix: layer + a per-layer monotonic clock
+/// so the residency LRU's recency is comparable across layers.
+type ExpertKey = (u32, u32);
+
 struct Moe {
     gate_t: Tensor, // router weight transposed to [n_embd, n_expert], contiguous (cached)
     experts: Vec<Mlp>,
     n_expert_used: usize,
     weights_norm: bool,
+    /// This MoE block's layer index (for the residency key).
+    layer: u32,
     /// Device the routed-expert weights live on.  The model device when the
     /// experts were uploaded; the CPU when the pool stays in host RAM on an
     /// accelerator (see [`crate::placement::ExpertPlacement`]).  `dispatch`
     /// moves the block's input across once and its result back once.
     expert_device: Device,
+    /// Bounded VRAM expert cache (#62): `Some` when a device-resident subset of
+    /// the routed experts is enabled.  `dispatch`/`dispatch_decode` call
+    /// [`crate::residency::DeviceResidency::lookup`] per expert and run the
+    /// resident device form on `expert_device`, falling back to the host
+    /// `experts[e]` on a miss.  `None` (the default) keeps today's all-host or
+    /// all-device path byte-for-byte.
+    residency: Option<std::sync::Arc<crate::residency::DeviceResidency<DeviceExpert>>>,
 }
 
 impl Moe {
@@ -667,7 +709,7 @@ impl Moe {
             let count = token_idx.len();
             let idx = Tensor::from_vec(token_idx, count, dev)?;
             let x_sel = x2.index_select(&idx, 0)?; // [count, h]
-            let out = self.experts[e].forward(&x_sel)?; // [count, h]
+            let out = self.expert_forward(e, &x_sel)?; // [count, h]
             let w = Tensor::from_vec(w, (count, 1), dev)?;
             y = y.index_add(&idx, &out.broadcast_mul(&w)?, 0)?;
         }
@@ -707,7 +749,7 @@ impl Moe {
         let mut outs = Vec::with_capacity(k);
         let _p = prof::Phase::start(&prof::EXPERTS);
         for &e in ids.iter() {
-            outs.push(self.experts[e as usize].forward(x2)?); // [1, h] each
+            outs.push(self.expert_forward(e as usize, x2)?); // [1, h] each
         }
         drop(_p);
         let out = Tensor::stack(&outs, 0)?; // [k, 1, h]
@@ -715,6 +757,19 @@ impl Moe {
         let w = weights.reshape((k, 1, 1))?; // [k, 1, 1]
         let y = out.broadcast_mul(&w)?.sum(0)?; // [1, h]
         Ok((y, ids))
+    }
+
+    /// Run one routed expert over `x`, preferring the device-resident form
+    /// (a `DeviceResidency` hit) and falling back to the host `Mlp` on a miss
+    /// (#62 dispatch partition).  With no residency configured this is exactly
+    /// `self.experts[e].forward(x)` — byte-for-byte the pre-cache path.
+    fn expert_forward(&self, e: usize, x: &Tensor) -> Result<Tensor> {
+        if let Some(res) = &self.residency {
+            if let Some(dev) = res.lookup(self.layer, e as u32) {
+                return dev.forward(x);
+            }
+        }
+        self.experts[e].forward(x)
     }
 }
 
@@ -953,12 +1008,19 @@ fn load_moe<R: Read + Seek>(rd: &mut Reader<R>, p: &str, cfg: &Config) -> Result
         })
         .collect();
 
+    let layer = p
+        .rsplit('.')
+        .next()
+        .and_then(|id| id.parse::<u32>().ok())
+        .unwrap_or(0);
     Ok(Moe {
         gate_t,
         experts,
         n_expert_used: cfg.n_expert_used,
         weights_norm: cfg.expert_weights_norm,
+        layer,
         expert_device: rd.expert_device.clone(),
+        residency: None,
     })
 }
 
@@ -1291,8 +1353,77 @@ mod tests {
             experts,
             n_expert_used: 2,
             weights_norm,
+            layer: 0,
             expert_device: dev.clone(),
+            residency: None,
         })
+    }
+
+    /// A mixed-residency `Moe` (some experts resident in a `DeviceResidency`,
+    /// the rest host) must produce **same logits** as the all-host `Moe` from
+    /// the same weights.  The fake "device" form wraps the same host weights,
+    /// so the assertion exercises the dispatch *partition* (per-expert lookup /
+    /// hit-vs-miss routing), not real device math — the actual VRAM copy and
+    /// GPU matmul still need a real accelerator to validate (issue #62).
+    #[test]
+    fn mixed_residency_dispatch_matches_all_host() -> Result<()> {
+        let dev = Device::Cpu;
+        let moe = tiny_moe(&dev, false)?; // all-host reference
+
+        // A cache whose slots wrap the **same** expert weights (as "device
+        // form"), so a hit runs numerically-identical math on the CPU.
+        let experts: Vec<Mlp> = moe.experts.clone();
+        let upload: std::sync::Arc<
+            dyn Fn(u32, u32) -> Option<std::sync::Arc<DeviceExpert>> + Send + Sync,
+        > = std::sync::Arc::new(move |l, e| {
+            experts
+                .get(e as usize)
+                .map(|m| {
+                    std::sync::Arc::new(DeviceExpert {
+                        gate: m.gate.clone(),
+                        up: m.up.clone(),
+                        down: m.down.clone(),
+                        bytes: 1024,
+                    })
+                })
+                .filter(|_| l == 0)
+        });
+        let res = std::sync::Arc::new(crate::residency::DeviceResidency::<DeviceExpert>::new(
+            2048, 1024, upload,
+        ));
+        // Experts 1,2 resident; 0,3 are host misses -> a genuine mixed layout.
+        res.mark_hot(0, 1);
+        res.mark_hot(0, 2);
+        res.acquire(0, 1);
+        res.acquire(0, 2);
+
+        // mixed shares moe's exact weights (same clones), differing only in the
+        // residency: hits run the (numerically identical) device form, misses run
+        // the host form.
+        let mut mixed = Moe {
+            gate_t: moe.gate_t.clone(),
+            experts: moe.experts.clone(),
+            n_expert_used: moe.n_expert_used,
+            weights_norm: moe.weights_norm,
+            layer: moe.layer,
+            expert_device: moe.expert_device.clone(),
+            residency: Some(std::sync::Arc::clone(&res)),
+        };
+        let _ = &res;
+
+        let xs = Tensor::randn(0f32, 1f32, (1, 4, 8), &dev)?; // [b, seq, h]
+        let (a, _) = moe.forward(&xs)?;
+        let (b, _) = mixed.forward(&xs)?;
+        let av = a.flatten_all()?.to_vec1::<f32>()?;
+        let bv = b.flatten_all()?.to_vec1::<f32>()?;
+        assert_eq!(av.len(), bv.len());
+        for (i, (x, y)) in av.iter().zip(bv.iter()).enumerate() {
+            assert!(
+                (x - y).abs() < 1e-5,
+                "mixed/host logit {i} diverges: {x} vs {y}"
+            );
+        }
+        Ok(())
     }
 
     /// Half-split RoPE must pair `(i, i + d/2)` with the `(d/2)`-long
