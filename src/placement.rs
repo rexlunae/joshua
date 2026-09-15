@@ -92,6 +92,49 @@ pub fn adaptive_budget(
     current
 }
 
+/// Budget (in **miBytes** of the expert device) for the bounded VRAM expert
+/// cache (#62): the part of the device's free memory left after the dense set,
+/// the static placement headroom and a KV reserve.  The device form of a routed
+/// expert is larger than its on-disk quantized bytes (e.g. Q4_K → as uploaded),
+/// so callers pass the per-expert *uploaded* byte size; `expert_bytes` here is
+/// that uploaded figure.
+///
+/// Returns a byte budget; 0 when `free_bytes` leaves nothing after the
+/// reservations.  The engine divides this by the per-expert upload size to get a
+/// slot count (and passes it to `--vram-expert-cache auto`).
+pub fn device_expert_cache_bytes(
+    free_bytes: u64,
+    dense_upper_bytes: u64,
+    headroom_bytes: u64,
+    kv_reserve_bytes: u64,
+) -> u64 {
+    // The entire leftover of the device budget belongs to the cache (the 0.5
+    // RAM fraction is the host-cache heuristic; the device budget already
+    // reserved dense + headroom + KV, so there is nothing left to discount).
+    free_bytes
+        .saturating_sub(dense_upper_bytes)
+        .saturating_sub(headroom_bytes)
+        .saturating_sub(kv_reserve_bytes)
+}
+
+/// Like [`device_expert_cache_bytes`] but returns a slot count (experts) that
+/// fit in the budget.  `uploaded_expert_bytes` is the device form's per-expert
+/// upload size; `max_experts` caps it.
+pub fn device_expert_slots(
+    free_bytes: u64,
+    dense_upper_bytes: u64,
+    headroom_bytes: u64,
+    kv_reserve_bytes: u64,
+    uploaded_expert_bytes: u64,
+    max_experts: usize,
+) -> usize {
+    if uploaded_expert_bytes == 0 {
+        return 0;
+    }
+    let budget = device_expert_cache_bytes(free_bytes, dense_upper_bytes, headroom_bytes, kv_reserve_bytes);
+    (budget / uploaded_expert_bytes).min(max_experts as u64) as usize
+}
+
 /// Bytes of memory available for allocation, from `/proc/meminfo`'s
 /// `MemAvailable` (Linux).  `None` where unavailable; callers fall back to a
 /// conservative assumption (no auto sizing).
@@ -287,6 +330,26 @@ mod tests {
         // 8 GiB free, 1 MiB experts, half usable → 4096 experts.
         let b = expert_budget_for_memory(8 << 30, 1 << 20, 10_000, 0);
         assert_eq!(b, 4096);
+    }
+
+    #[test]
+    fn device_expert_cache_leaves_only_the_untouched_leftover() {
+        // 12 GiB free, 1.1 GiB dense, 1 GiB headroom, 2 GiB KV -> 7.9 GiB cache.
+        let b = device_expert_cache_bytes(12 << 30, 1_100 << 20, 1 << 30, 2 << 30);
+        assert_eq!(b, (12 << 30) - (1_100 << 20) - (1 << 30) - (2 << 30));
+        // Dense + headroom + KV >= free -> 0 (never go negative / overcommit).
+        let b0 = device_expert_cache_bytes(3 << 30, 2 << 30, 1 << 30, 1 << 30);
+        assert_eq!(b0, 0);
+    }
+
+    #[test]
+    fn device_expert_slots_fit_uploaded_size_and_cap() {
+        // 8 GiB budget, 2 MiB per-expert upload -> 4096 slots, capped at 1000.
+        let n = device_expert_slots(8 << 30, 1 << 30, 1 << 30, 1 << 30, 2 << 20, 1000);
+        assert_eq!(n, 1000);
+        // Uploaded size 1 MiB -> 5120 slots (uncappeduene cap).
+        let n2 = device_expert_slots(8 << 30, 1 << 30, 1 << 30, 1 << 30, 1 << 20, 10_000);
+        assert_eq!(n2, (5 << 30) / (1 << 20));
     }
 
     #[test]
