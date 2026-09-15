@@ -100,11 +100,15 @@ deferred to an out-of-memory upload.  `deepseek4` is always resolved as
 `host` (its loader keeps the IQ2_XXS experts on the CPU regardless), so
 its per-session device footprint is the dense set alone.
 The device accounting follows what each loader leaves resident rather
-than the on-disk bytes: the stock candle loaders (llama, gemma, glm4,
-lfm2, phi, qwen2, qwen3) dequantize the embedding table to a persistent
-f32 tensor, deepseek4 decodes its raw-dtype (IQ2_XXS/MXFP4) dense tensors
-to f32 on the device, everything is f32 on OpenCL, and the rest stays in
-its quantized blocks.  A tied output head (no head tensor) is a second,
+than the on-disk bytes.  Only two kinds of tensor stay quantized on the
+device: the routed experts and the weight matrices every loader wraps in a
+`QMatMul` (attention/feed-forward projections, output heads).  Everything
+else is counted as f32, which is what the loaders make of it — norms,
+biases, routers, deepseek2's split-KV halves (folded into a dense
+up-projection), deepseek4's hyper-connection vectors and raw-dtype
+(IQ2_XXS/MXFP4) dense tensors, the stock candle loaders' embedding tables,
+float-dtype tables on an accelerator — or, for a tensor no rule names, the
+conservative upper bound.  Everything is f32 on OpenCL.  A tied output head (no head tensor) is a second,
 quantized copy of the embedding table; where several head names are
 present the largest candidate the loader could end up reading is counted,
 never fewer.  Models candle cannot load at all (NPU-only) allocate nothing
