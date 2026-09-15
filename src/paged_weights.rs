@@ -5,7 +5,11 @@
 //! this intentionally trades overlap for a simple buffer lifetime contract.
 //!
 //! Opt-in: a cache is only built when a positive byte budget is configured
-//! (see `EngineOptions::gpu_weight_cache_bytes` / CLI `--opencl-weight-cache`).
+//! (`JOSHUA_GPU_WEIGHT_CACHE=<MiB>`, read by the `qwen3moe` loader).  For a
+//! model larger than device memory the default answer is instead
+//! `ExpertPlacement::Host` (see `crate::placement`), which keeps the experts
+//! in host RAM on the CPU kernels; this cache is the experimental
+//! upload-on-demand alternative.
 //! Compressed quantized weights stay in the mmap; an expert's tile is uploaded
 //! to the device on demand and evicted (LRU) when the budget is exceeded.
 use std::{borrow::Cow, collections::HashMap, sync::{Arc, Mutex}};

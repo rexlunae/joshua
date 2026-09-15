@@ -108,6 +108,164 @@ pub fn available_ram_bytes() -> Option<u64> {
     None
 }
 
+// ─── Expert placement (where the routed-expert pool lives) ───────────────────
+
+/// Where a sparse MoE model's routed-expert weights live when inference runs
+/// on an accelerator.
+///
+/// The dense set (embeddings, norms, attention, routers, shared experts,
+/// output) is small and touched on every token, so it always goes to the
+/// compute device.  The routed experts are the bulk of the file and are
+/// touched sparsely, so they can either be uploaded too (fastest, needs the
+/// whole model in device memory) or stay in host RAM, borrowed in place from
+/// the model mapping and run through the CPU expert kernels, with only the
+/// per-layer activation hopping across the bus.  The host variant is what
+/// makes a model larger than VRAM runnable at all; it is the layout the
+/// `deepseek4` loader has always used, extended to `qwen3moe` / `deepseek2`.
+///
+/// On the CPU device the placement is moot (everything is host memory) and
+/// the setting is ignored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExpertPlacement {
+    /// Decide from the device's memory: keep experts on the device when the
+    /// whole model fits with headroom, otherwise keep them in host RAM.  When
+    /// no memory probe is available the experts go to the device (the
+    /// historical behaviour) unless the backend cannot hold quantized blocks
+    /// at all (OpenCL), which always keeps them on the host.
+    #[default]
+    Auto,
+    /// Always upload the routed experts to the compute device.
+    Device,
+    /// Always keep the routed experts in host RAM (mmap-borrowed on CPU).
+    Host,
+}
+
+impl std::str::FromStr for ExpertPlacement {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "device" | "gpu" | "vram" => Ok(Self::Device),
+            "host" | "cpu" | "ram" => Ok(Self::Host),
+            other => Err(format!(
+                "unknown expert placement `{other}` (expected auto, device or host)"
+            )),
+        }
+    }
+}
+
+/// A resolved placement: [`ExpertPlacement`] minus `Auto`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolvedPlacement {
+    /// Routed experts uploaded to the compute device.
+    Device,
+    /// Routed experts kept in host RAM.
+    Host,
+}
+
+/// Memory the routed-expert upload must leave free on the device, for the KV
+/// cache, activations and allocator slack (bytes).
+pub const DEVICE_PLACEMENT_HEADROOM: u64 = 1024 * 1024 * 1024; // 1 GiB
+
+/// What is known about the compute device when placing the experts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceProfile {
+    /// The device is the CPU: placement is irrelevant.
+    pub is_cpu: bool,
+    /// The backend cannot hold quantized blocks (its storage is dense f32),
+    /// so uploading the experts would dequantize them — 8–16× the on-disk
+    /// size.  True for OpenCL today.
+    pub dense_only: bool,
+    /// Bytes of device memory available for weights, when known: a probe
+    /// (`cudaMemGetInfo`), or the operator's `--vram-budget`.
+    pub free_bytes: Option<u64>,
+}
+
+/// Decide where the routed experts live.  Pure: every input is a number, so
+/// the rule is unit-testable without a device.
+///
+/// * `Device` / `Host` requests are honoured as-is (a `Device` request on a
+///   dense-only backend is honoured too — it is the operator's explicit
+///   choice — but logged by the caller).
+/// * `Auto` on the CPU is `Host` (moot).  On a dense-only backend it is
+///   `Host`.  With a memory figure it is `Device` only when
+///   `dense + experts + headroom` fits; without one it is `Device`, the
+///   historical behaviour, so a machine with no probe changes nothing.
+pub fn resolve_expert_placement(
+    requested: ExpertPlacement,
+    device: DeviceProfile,
+    dense_bytes: u64,
+    expert_bytes: u64,
+    headroom_bytes: u64,
+) -> ResolvedPlacement {
+    if device.is_cpu {
+        return ResolvedPlacement::Host;
+    }
+    match requested {
+        ExpertPlacement::Device => ResolvedPlacement::Device,
+        ExpertPlacement::Host => ResolvedPlacement::Host,
+        ExpertPlacement::Auto => {
+            if device.dense_only {
+                return ResolvedPlacement::Host;
+            }
+            match device.free_bytes {
+                Some(free) => {
+                    let need = dense_bytes
+                        .saturating_add(expert_bytes)
+                        .saturating_add(headroom_bytes);
+                    if need <= free {
+                        ResolvedPlacement::Device
+                    } else {
+                        ResolvedPlacement::Host
+                    }
+                }
+                None => ResolvedPlacement::Device,
+            }
+        }
+    }
+}
+
+/// How many full copies of `instance_bytes` fit in `free_bytes` once
+/// `headroom_bytes` is set aside — the number of model sessions an
+/// accelerator can hold when each session carries its own weight copy.
+/// Always at least 1 (the first session is loaded regardless) and never more
+/// than `cap`.
+pub fn instances_for_memory(free_bytes: u64, instance_bytes: u64, headroom_bytes: u64, cap: usize) -> usize {
+    if instance_bytes == 0 {
+        return cap.max(1);
+    }
+    let usable = free_bytes.saturating_sub(headroom_bytes);
+    let n = (usable / instance_bytes) as usize;
+    n.clamp(1, cap.max(1))
+}
+
+/// Free and total memory of the compute device in bytes, when the backend
+/// can report it.
+///
+/// * CUDA: `cuMemGetInfo` through cudarc (the `cuda` feature).
+/// * Metal: unified memory — the GPU shares system RAM, so the caller's
+///   system-RAM figure is the right budget and this returns `None`.
+/// * OpenCL / CPU: `None`.
+pub fn device_memory_info(device: &candle_core::Device) -> Option<(u64, u64)> {
+    match device {
+        #[cfg(feature = "cuda")]
+        candle_core::Device::Cuda(dev) => cuda_memory_info(dev),
+        _ => None,
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn cuda_memory_info(dev: &candle_core::CudaDevice) -> Option<(u64, u64)> {
+    use candle_core::cuda::cudarc;
+    // cudarc's `CudaContext::mem_get_info` wraps `cuMemGetInfo` for this
+    // device's own context, so the figures are for the GPU joshua runs on.
+    let stream = dev.cuda_stream();
+    let ctx: &std::sync::Arc<cudarc::driver::CudaContext> = stream.context();
+    let (free, total) = ctx.mem_get_info().ok()?;
+    Some((free as u64, total as u64))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,5 +333,107 @@ mod tests {
         );
         // A zero cap disables the cache entirely.
         assert_eq!(adaptive_budget(100, 0.40, (1 << 30) as f64, 63.0 * 1e9, 0, 0), 0);
+    }
+
+    // ── Expert placement ────────────────────────────────────────────────
+
+    const GIB: u64 = 1 << 30;
+
+    fn gpu(free: Option<u64>) -> DeviceProfile {
+        DeviceProfile { is_cpu: false, dense_only: false, free_bytes: free }
+    }
+
+    #[test]
+    fn placement_parses_aliases() {
+        assert_eq!("auto".parse::<ExpertPlacement>().unwrap(), ExpertPlacement::Auto);
+        assert_eq!("Device".parse::<ExpertPlacement>().unwrap(), ExpertPlacement::Device);
+        assert_eq!("gpu".parse::<ExpertPlacement>().unwrap(), ExpertPlacement::Device);
+        assert_eq!("host".parse::<ExpertPlacement>().unwrap(), ExpertPlacement::Host);
+        assert_eq!("cpu".parse::<ExpertPlacement>().unwrap(), ExpertPlacement::Host);
+        assert!("sideways".parse::<ExpertPlacement>().is_err());
+    }
+
+    #[test]
+    fn placement_on_cpu_is_always_host() {
+        let cpu = DeviceProfile { is_cpu: true, dense_only: false, free_bytes: Some(100 * GIB) };
+        for req in [ExpertPlacement::Auto, ExpertPlacement::Device, ExpertPlacement::Host] {
+            assert_eq!(resolve_expert_placement(req, cpu, GIB, GIB, 0), ResolvedPlacement::Host);
+        }
+    }
+
+    #[test]
+    fn placement_explicit_requests_are_honoured() {
+        // Even a model that plainly does not fit goes to the device on request…
+        assert_eq!(
+            resolve_expert_placement(ExpertPlacement::Device, gpu(Some(4 * GIB)), 8 * GIB, 60 * GIB, GIB),
+            ResolvedPlacement::Device
+        );
+        // …and a tiny model stays on the host on request.
+        assert_eq!(
+            resolve_expert_placement(ExpertPlacement::Host, gpu(Some(80 * GIB)), GIB, GIB, GIB),
+            ResolvedPlacement::Host
+        );
+    }
+
+    #[test]
+    fn placement_auto_follows_the_memory_probe() {
+        // Qwen3-30B-A3B Q4_K_M on a 12 GiB card: dense ~1 GiB + experts ~17 GiB.
+        assert_eq!(
+            resolve_expert_placement(ExpertPlacement::Auto, gpu(Some(12 * GIB)), GIB, 17 * GIB, GIB),
+            ResolvedPlacement::Host
+        );
+        // The same model on a 24 GiB card fits with headroom.
+        assert_eq!(
+            resolve_expert_placement(ExpertPlacement::Auto, gpu(Some(24 * GIB)), GIB, 17 * GIB, GIB),
+            ResolvedPlacement::Device
+        );
+        // Exactly at the limit still fits; one byte over does not.
+        assert_eq!(
+            resolve_expert_placement(ExpertPlacement::Auto, gpu(Some(19 * GIB)), GIB, 17 * GIB, GIB),
+            ResolvedPlacement::Device
+        );
+        assert_eq!(
+            resolve_expert_placement(ExpertPlacement::Auto, gpu(Some(19 * GIB - 1)), GIB, 17 * GIB, GIB),
+            ResolvedPlacement::Host
+        );
+    }
+
+    #[test]
+    fn placement_auto_without_a_probe_keeps_the_historical_layout() {
+        assert_eq!(
+            resolve_expert_placement(ExpertPlacement::Auto, gpu(None), GIB, 100 * GIB, GIB),
+            ResolvedPlacement::Device
+        );
+    }
+
+    #[test]
+    fn placement_auto_on_a_dense_only_backend_is_host() {
+        let ocl = DeviceProfile { is_cpu: false, dense_only: true, free_bytes: Some(1000 * GIB) };
+        assert_eq!(
+            resolve_expert_placement(ExpertPlacement::Auto, ocl, GIB, GIB, 0),
+            ResolvedPlacement::Host
+        );
+    }
+
+    #[test]
+    fn placement_handles_overflowing_sizes() {
+        assert_eq!(
+            resolve_expert_placement(ExpertPlacement::Auto, gpu(Some(u64::MAX)), u64::MAX, u64::MAX, u64::MAX),
+            ResolvedPlacement::Device,
+            "saturating add must not wrap below the probe"
+        );
+    }
+
+    #[test]
+    fn instances_for_memory_counts_whole_copies() {
+        // 24 GiB free, 1 GiB headroom, 5 GiB per instance → 4 sessions.
+        assert_eq!(instances_for_memory(24 * GIB, 5 * GIB, GIB, 8), 4);
+        // Capped by the pool limit.
+        assert_eq!(instances_for_memory(24 * GIB, GIB, 0, 2), 2);
+        // Never below one, even when nothing fits.
+        assert_eq!(instances_for_memory(GIB, 5 * GIB, GIB, 8), 1);
+        // Unknown instance size: no constraint.
+        assert_eq!(instances_for_memory(GIB, 0, 0, 3), 3);
+        assert_eq!(instances_for_memory(GIB, 0, 0, 0), 1);
     }
 }

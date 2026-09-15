@@ -36,6 +36,8 @@ use candle_core::{DType, Device, IndexOp, Module, Result, Tensor, D};
 use candle_nn::ops::{sigmoid, softmax_last_dim};
 use candle_transformers::quantized_nn::RmsNorm;
 
+use crate::token_embedding::TokenEmbedding;
+
 /// Expert gating (scoring) function.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Gating {
@@ -412,8 +414,16 @@ struct Attention {
     /// per-head result to the cache: decode stays O(1) in reconstruction, at
     /// the cost of caching the ~8x larger per-head form (still far below a
     /// plain MHA model, since MLA keeps Q and the latent low-rank).
-    kv_cache: Option<(Tensor, Tensor)>,
+    ///
+    /// The cache itself is per session, not per weight set — see
+    /// [`KvCache`] and [`ModelWeights::new_session`].
+    _kv_layout: (),
 }
+
+/// One layer's MLA cache: `(k [b, n_head, q_head_dim, seq], v [b, n_head,
+/// v_head_dim, seq])`, appended along dim 3.  Owned by the session, not
+/// the (shared) weights.
+type KvCache = Option<(Tensor, Tensor)>;
 
 /// The KV up-projection, either a native combined weight or one reconstructed
 /// from the pre-split MLA `attn_k_b`/`attn_v_b` tensors.
@@ -433,7 +443,13 @@ impl KvB {
 }
 
 impl Attention {
-    fn forward(&mut self, xs: &Tensor, mask: Option<&Tensor>, offset: usize) -> Result<Tensor> {
+    fn forward(
+        &self,
+        kv_cache: &mut KvCache,
+        xs: &Tensor,
+        mask: Option<&Tensor>,
+        offset: usize,
+    ) -> Result<Tensor> {
         let (b, seq_len, _) = xs.dims3()?;
 
         // Q → [b, n_head, seq, q_head_dim], split into nope/rope slices.
@@ -486,14 +502,14 @@ impl Attention {
         // transpose of it.
         let k_new = k_new.transpose(2, 3)?.contiguous()?; // [b, n_head, q_head_dim, seq_len]
         let v_new = v.transpose(2, 3)?.contiguous()?; // [b, n_head, v_head_dim, seq_len]
-        let (k_cache, v_cache) = match &self.kv_cache {
+        let (k_cache, v_cache) = match &*kv_cache {
             None => (k_new, v_new),
             Some((kc, vc)) => (
                 Tensor::cat(&[kc, &k_new], 3)?.contiguous()?,
                 Tensor::cat(&[vc, &v_new], 3)?.contiguous()?,
             ),
         };
-        self.kv_cache = Some((k_cache.clone(), v_cache.clone()));
+        *kv_cache = Some((k_cache.clone(), v_cache.clone()));
 
         // Scaled dot-product attention over the whole cached context.
         let scores = (q.contiguous()?.matmul(&k_cache)? * self.softmax_scale)?; // [b, n_head, seq_len, seq_total]
@@ -510,38 +526,34 @@ impl Attention {
             .reshape((b, seq_len, self.n_head * self.v_head_dim))?;
         self.o_proj.forward(&ctx)
     }
+}
 
-    fn clear_kv_cache(&mut self) {
-        self.kv_cache = None;
-    }
-
-    /// Keep only the first `keep` sequence positions of the KV cache.
-    ///
-    /// Edited-context prefix reuse: positions `[0..keep)` were produced by
-    /// exactly the tokens both conversations share, so they remain valid;
-    /// everything from `keep` on is dropped and recomputed by the next
-    /// prefill (which continues at absolute position `keep`).  The prefix is
-    /// materialised (`contiguous`) so the full-length buffer is actually
-    /// freed instead of lingering behind a view until the next append.
-    fn truncate_kv_cache(&mut self, keep: usize) -> Result<()> {
-        match &mut self.kv_cache {
-            None => Ok(()),
-            Some((_k, _v)) if keep == 0 => {
-                self.kv_cache = None;
-                Ok(())
+/// Keep only the first `keep` sequence positions of a layer's KV cache.
+///
+/// Edited-context prefix reuse: positions `[0..keep)` were produced by
+/// exactly the tokens both conversations share, so they remain valid;
+/// everything from `keep` on is dropped and recomputed by the next
+/// prefill (which continues at absolute position `keep`).  The prefix is
+/// materialised (`contiguous`) so the full-length buffer is actually
+/// freed instead of lingering behind a view until the next append.
+fn truncate_kv(kv_cache: &mut KvCache, keep: usize) -> Result<()> {
+    match kv_cache {
+        None => Ok(()),
+        Some((_k, _v)) if keep == 0 => {
+            *kv_cache = None;
+            Ok(())
+        }
+        Some((k, v)) => {
+            // The cache lives transposed — [b, n_head, dim, seq] — so the
+            // sequence dimension is dim 3 here (see `Attention::forward`).
+            let len = k.dim(3)?;
+            if keep >= len {
+                return Ok(());
             }
-            Some((k, v)) => {
-                // The cache lives transposed — [b, n_head, dim, seq] — so
-                // the sequence dimension is dim 3 here (see `forward`).
-                let len = k.dim(3)?;
-                if keep >= len {
-                    return Ok(());
-                }
-                let k = k.narrow(3, 0, keep)?.contiguous()?;
-                let v = v.narrow(3, 0, keep)?.contiguous()?;
-                self.kv_cache = Some((k, v));
-                Ok(())
-            }
+            let k = k.narrow(3, 0, keep)?.contiguous()?;
+            let v = v.narrow(3, 0, keep)?.contiguous()?;
+            *kv_cache = Some((k, v));
+            Ok(())
         }
     }
 }
@@ -559,6 +571,11 @@ struct Moe {
     topk_group: usize,
     weights_norm: bool,
     weights_scale: f64,
+    /// Device the routed-expert weights live on.  The model device when the
+    /// experts were uploaded; the CPU when the pool stays in host RAM on an
+    /// accelerator (see [`crate::placement::ExpertPlacement`]).  `dispatch`
+    /// moves the block's input across once and its result back once.
+    expert_device: Device,
 }
 
 impl Moe {
@@ -668,6 +685,21 @@ impl Moe {
         let ids: Vec<u32> = topk_idx.flatten_all()?.to_vec1()?;
         let wts: Vec<f32> = weights.flatten_all()?.to_vec1()?;
 
+        // The routed experts may live on a different device from the
+        // activations (host-resident expert pool on an accelerator).  Move
+        // the whole block's input across once and its result back once, so
+        // the boundary costs two transfers per layer instead of one per
+        // expert matmul.
+        let out_device = x2.device().clone();
+        let same_device = self.expert_device.same_device(&out_device);
+        let x2_hopped;
+        let x2 = if same_device {
+            x2
+        } else {
+            x2_hopped = x2.to_device(&self.expert_device)?;
+            &x2_hopped
+        };
+
         // Bucket (token, weight) pairs by expert.
         let mut per_expert: Vec<Vec<(u32, f32)>> = vec![Vec::new(); self.experts.len()];
         for t in 0..n_tokens {
@@ -677,7 +709,7 @@ impl Moe {
             }
         }
 
-        let dev = x2.device();
+        let dev = &self.expert_device;
         let mut y = Tensor::zeros((n_tokens, h), DType::F32, dev)?;
         for (e, bucket) in per_expert.iter().enumerate() {
             if bucket.is_empty() {
@@ -692,6 +724,7 @@ impl Moe {
             let w = Tensor::from_vec(w, (count, 1), dev)?;
             y = y.index_add(&idx, &out.broadcast_mul(&w)?, 0)?;
         }
+        let y = if same_device { y } else { y.to_device(&out_device)? };
         Ok((y, ids))
     }
 
@@ -707,11 +740,23 @@ impl Moe {
     ) -> Result<(Tensor, Vec<u32>)> {
         let k = self.n_expert_used;
         let ids: Vec<u32> = topk_idx.flatten_all()?.to_vec1()?; // [k] — the one host sync
+        // Host-resident experts on an accelerator: one hop in, one hop out
+        // (see `dispatch`).
+        let out_device = x2.device().clone();
+        let same_device = self.expert_device.same_device(&out_device);
+        let x2_hopped;
+        let x2 = if same_device {
+            x2
+        } else {
+            x2_hopped = x2.to_device(&self.expert_device)?;
+            &x2_hopped
+        };
         let mut outs = Vec::with_capacity(k);
         for &e in ids.iter() {
             outs.push(self.experts[e as usize].forward(x2)?); // [1, h] each
         }
         let out = Tensor::stack(&outs, 0)?; // [k, 1, h]
+        let out = if same_device { out } else { out.to_device(&out_device)? };
         let w = weights.reshape((k, 1, 1))?; // GPU view [k, 1, 1]
         let y = out.broadcast_mul(&w)?.sum(0)?; // [1, h]
         Ok((y, ids))
@@ -763,22 +808,34 @@ struct Layer {
     ffn: FeedForward,
 }
 
-/// A quantized DeepSeek-V2/V3/Kimi-K2 model loaded from GGUF.
-pub struct ModelWeights {
-    tok_embeddings: Tensor,
+/// The immutable half of a loaded model: every weight, the expert residency
+/// backend and the device.  Sessions share one `Arc` of it (see
+/// [`ModelWeights::new_session`]) and own only their KV caches, so a second
+/// concurrent conversation costs its KV cache rather than a second copy of
+/// the weights — on an accelerator, a second upload of the whole model.
+struct Shared {
+    tok_embeddings: TokenEmbedding,
     layers: Vec<Layer>,
     norm: RmsNorm,
     output: QMatMul,
     device: Device,
+    /// Executes residency for the hot set (CPU madvise today; a device slot
+    /// cache later).  Built once at load from the per-expert handles.
+    residency: std::sync::Arc<dyn crate::residency::ExpertResidency>,
+    n_expert: usize,
+}
+
+/// A quantized DeepSeek-V2/V3/Kimi-K2 model loaded from GGUF.
+pub struct ModelWeights {
+    shared: Arc<Shared>,
+    /// Per-layer KV cache — the only per-session tensor state.
+    kv: Vec<KvCache>,
     /// Routing-frequency LRU hot-expert cache (shared bookkeeping; budget set
     /// after load via [`ModelWeights::set_pin_hot_experts`], CLI flag
     /// `--pin-hot-experts`).  Records routing, re-selects the hot set every
     /// [`crate::hot_experts::REFRESH_STEPS`] decode steps, and reports newly
     /// hot experts for the residency backend.
     hot_experts: crate::hot_experts::HotExpertCache,
-    /// Executes residency for the hot set (CPU madvise today; a device slot
-    /// cache later).  Built once at load from the per-expert handles.
-    residency: std::sync::Arc<dyn crate::residency::ExpertResidency>,
 }
 
 /// Small GGUF reader over the memory-mapped file.
@@ -786,6 +843,12 @@ struct Reader<R: Read + Seek> {
     ct: gguf_file::Content,
     reader: R,
     device: Device,
+    /// Device the routed-expert tensors are built on.  Same as `device` for
+    /// a CPU model or when the experts are uploaded; the CPU when the model
+    /// runs on an accelerator that cannot hold the expert pool (see
+    /// [`crate::placement::ExpertPlacement`]) — each expert is then borrowed
+    /// from the mapping and [`Moe::dispatch`] hops the activations across.
+    expert_device: Device,
     /// When present, tensors are borrowed in place from this mapping instead
     /// of being copied onto the heap (see [`crate::mmap_tensor`]).  This is
     /// what makes a model far larger than RAM loadable: pages fault in only
@@ -850,13 +913,42 @@ impl ModelWeights {
     /// Without a mapping every tensor is copied onto the heap and the whole
     /// model must fit in RAM.  With one, weights are referenced directly in
     /// the page cache and fault in on demand — the difference between a
-    /// trillion-parameter MoE being unloadable and merely slow.
+    /// trillion-parameter MoE being unloadable and merely slow.  The routed
+    /// experts go to `device` too; see
+    /// [`ModelWeights::from_gguf_mmap_placed`] to keep them in host RAM on an
+    /// accelerator.
     pub fn from_gguf_mmap<R: Read + Seek>(
         ct: gguf_file::Content,
         reader: &mut R,
         device: &Device,
         mmap: Option<std::sync::Arc<memmap2::Mmap>>,
     ) -> Result<Self> {
+        Self::from_gguf_mmap_placed(ct, reader, device, device, mmap)
+    }
+
+    /// [`ModelWeights::from_gguf_mmap`] with an explicit device for the
+    /// routed experts.
+    ///
+    /// The dense set always goes to `device`.  With `expert_device` the CPU
+    /// on an accelerator model, the routed-expert pool stays in host RAM —
+    /// borrowed in place from `mmap` (or read onto the heap without one) and
+    /// run through the CPU expert kernels, with the MoE block's activations
+    /// hopping across the bus once per layer.  That is the layout for a
+    /// model larger than the device's memory (see
+    /// [`crate::placement::ExpertPlacement`]).  Any other `expert_device`
+    /// must equal `device`.
+    pub fn from_gguf_mmap_placed<R: Read + Seek>(
+        ct: gguf_file::Content,
+        reader: &mut R,
+        device: &Device,
+        expert_device: &Device,
+        mmap: Option<std::sync::Arc<memmap2::Mmap>>,
+    ) -> Result<Self> {
+        if !expert_device.is_cpu() && !expert_device.same_device(device) {
+            candle_core::bail!(
+                "deepseek2: routed experts must live on the model device or the CPU, not {expert_device:?}"
+            );
+        }
         let cfg = Config::from_metadata(&ct.metadata)?;
         // The Content owns metadata; move it into our reader together with the
         // underlying file handle (borrowed for the lifetime of the load).
@@ -864,10 +956,14 @@ impl ModelWeights {
             ct,
             reader,
             device: device.clone(),
+            expert_device: expert_device.clone(),
             mmap,
         };
 
-        let tok_embeddings = rd.f32_tensor("token_embd.weight")?;
+        // Kept quantized: dequantizing the table to f32 costs vocab × hidden
+        // × 4 bytes of anonymous memory per instance (3.7 GiB on V3, 4.7 GiB
+        // on Kimi-K2).
+        let tok_embeddings = TokenEmbedding::load(rd.qtensor("token_embd.weight")?, device)?;
         let norm = rd.rms_norm("output_norm.weight", cfg.rms_eps)?;
         let output = match rd.qmatmul_opt("output.weight") {
             Some(o) => o,
@@ -912,7 +1008,7 @@ impl ModelWeights {
                 v_head_dim: cfg.v_head_dim,
                 q_head_dim: cfg.q_head_dim(),
                 softmax_scale: cfg.softmax_scale,
-                kv_cache: None,
+                _kv_layout: (),
             };
 
             let ffn = if cfg.n_expert > 0 && i >= cfg.leading_dense {
@@ -943,18 +1039,47 @@ impl ModelWeights {
                     .collect(),
             ));
         Ok(Self {
-            tok_embeddings,
-            layers,
-            norm,
-            output,
-            device: device.clone(),
+            shared: Arc::new(Shared {
+                tok_embeddings,
+                layers,
+                norm,
+                output,
+                device: device.clone(),
+                residency,
+                n_expert: cfg.n_expert,
+            }),
+            kv: vec![None; n_layers],
             hot_experts: crate::hot_experts::HotExpertCache::new(
                 n_layers,
                 cfg.n_expert,
                 0,
             ),
-            residency,
         })
+    }
+
+    /// A fresh session over the same weights: shares every weight tensor
+    /// (one `Arc` clone — no read, no upload) and starts with an empty KV
+    /// cache and a fresh routing record under the same hot-expert budget.
+    pub fn new_session(&self) -> Self {
+        Self {
+            shared: Arc::clone(&self.shared),
+            kv: vec![None; self.kv.len()],
+            hot_experts: crate::hot_experts::HotExpertCache::new(
+                self.kv.len(),
+                self.shared.n_expert,
+                self.hot_experts.budget(),
+            ),
+        }
+    }
+
+    /// Number of sessions (including this one) sharing these weights.
+    pub fn shared_session_count(&self) -> usize {
+        Arc::strong_count(&self.shared)
+    }
+
+    /// Whether the token-embedding table is held quantized (diagnostics).
+    pub fn embeddings_quantized(&self) -> bool {
+        self.shared.tok_embeddings.is_quantized()
     }
 
     fn causal_mask(&self, seq_len: usize, offset: usize) -> Result<Tensor> {
@@ -969,15 +1094,18 @@ impl ModelWeights {
                 })
             })
             .collect();
-        Tensor::from_slice(&mask, (1, 1, seq_len, seq_len + offset), &self.device)
+        Tensor::from_slice(&mask, (1, 1, seq_len, seq_len + offset), &self.shared.device)
     }
 
     /// Forward pass. `input` is `[1, seq_len]`; `offset` is the KV-cache
     /// position of the first input token.
     pub fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {
         let (_b, seq_len) = input.dims2()?;
-        let mut xs = self.tok_embeddings.index_select(&input.flatten_all()?, 0)?
-            .reshape((1, seq_len, self.tok_embeddings.dim(1)?))?;
+        let sh = Arc::clone(&self.shared);
+        let mut xs = sh
+            .tok_embeddings
+            .forward(&input.flatten_all()?)?
+            .reshape((1, seq_len, sh.tok_embeddings.hidden()?))?;
 
         let mask = if seq_len == 1 {
             None
@@ -994,14 +1122,14 @@ impl ModelWeights {
         let step = self.hot_experts.begin_step(seq_len == 1);
         if self.hot_experts.refresh_due(seq_len == 1) {
             for (l, e) in self.hot_experts.refresh() {
-                self.residency.acquire(l, e);
+                sh.residency.acquire(l, e);
             }
         }
 
-        for (i, layer) in self.layers.iter_mut().enumerate() {
+        for (i, layer) in sh.layers.iter().enumerate() {
             let residual = &xs;
             let h = layer.attn_norm.forward(&xs)?;
-            let h = layer.attn.forward(&h, mask.as_ref(), offset)?;
+            let h = layer.attn.forward(&mut self.kv[i], &h, mask.as_ref(), offset)?;
             let xs2 = (residual + h)?;
 
             let residual = &xs2;
@@ -1012,8 +1140,8 @@ impl ModelWeights {
         }
 
         let xs = xs.narrow(1, seq_len - 1, 1)?;
-        let xs = self.norm.forward(&xs)?;
-        self.output.forward(&xs)?.to_dtype(DType::F32)?.squeeze(1)
+        let xs = sh.norm.forward(&xs)?;
+        sh.output.forward(&xs)?.to_dtype(DType::F32)?.squeeze(1)
     }
 
     /// Set the routing-frequency hot-expert cache budget (experts kept
@@ -1027,13 +1155,13 @@ impl ModelWeights {
     /// Number of experts the residency backend can hold resident
     /// (informational on CPU; a phase-5 auto-sizing input on devices).
     pub fn expert_residency_capacity(&self) -> usize {
-        self.residency.capacity()
+        self.shared.residency.capacity()
     }
 
     /// Reset the KV cache so this instance can serve an unrelated prompt.
     pub fn clear_kv_cache(&mut self) {
-        for layer in self.layers.iter_mut() {
-            layer.attn.clear_kv_cache();
+        for kv in self.kv.iter_mut() {
+            *kv = None;
         }
     }
 
@@ -1044,8 +1172,8 @@ impl ModelWeights {
     /// a prefix with the cached history after an agent harness truncated or
     /// replaced middle blocks).
     pub fn truncate_kv_cache(&mut self, keep: usize) -> Result<()> {
-        for layer in self.layers.iter_mut() {
-            layer.attn.truncate_kv_cache(keep)?;
+        for kv in self.kv.iter_mut() {
+            truncate_kv(kv, keep)?;
         }
         Ok(())
     }
@@ -1133,6 +1261,7 @@ fn load_moe<R: Read + Seek>(rd: &mut Reader<R>, p: &str, cfg: &Config) -> Result
         topk_group: cfg.topk_group,
         weights_norm: cfg.expert_weights_norm,
         weights_scale: cfg.expert_weights_scale,
+        expert_device: rd.expert_device.clone(),
     })
 }
 
@@ -1151,65 +1280,99 @@ fn split_experts<R: Read + Seek>(
     name: &str,
     n_expert: usize,
 ) -> Result<Vec<ExpertWeight>> {
-    let qt = rd.qtensor(name)?;
-    let dims = qt.shape().dims().to_vec();
+    let (dims, dtype, tensor_offset) = {
+        let Some(info) = rd.ct.tensor_infos.get(name) else {
+            candle_core::bail!("deepseek2: missing tensor `{name}`");
+        };
+        (info.shape.dims().to_vec(), info.ggml_dtype, info.offset)
+    };
     if dims.len() != 3 || dims[0] != n_expert {
         candle_core::bail!(
             "deepseek2: expected expert tensor `{name}` shaped [n_expert, out, in], got {dims:?}"
         );
     }
     let (out, inn) = (dims[1], dims[2]);
-    let dtype: GgmlDType = qt.dtype();
+    let per_elems = out * inn;
+    let block_size = dtype.block_size();
+    let whole_blocks = block_size > 0 && per_elems.is_multiple_of(block_size);
+    let base = rd.ct.tensor_data_offset.saturating_add(tensor_offset) as usize;
+    let host_experts = rd.expert_device.is_cpu();
 
-    // Preferred path: point each expert straight at its own slice of the
-    // mapping.  Building all of them reads nothing — an expert is a pointer
-    // and a length — so a layer with hundreds of experts costs almost no
-    // memory until tokens actually route to them, at which point the kernel
-    // faults in just those pages and can evict them again later.
-    // Borrowed storage is always CPU-resident, so this is only valid when the
-    // model itself runs on the CPU — otherwise the experts would sit in host
-    // memory while activations live on the accelerator. `qtensor_from_mmap`
-    // applies the same guard for ordinary tensors.
-    if let Some(mmap) = rd.mmap.clone().filter(|_| rd.device.is_cpu()) {
-        if let Some(info) = rd.ct.tensor_infos.get(name) {
-            let block_size = dtype.block_size();
-            let per_elems = out * inn;
-            if block_size > 0 && per_elems.is_multiple_of(block_size) {
-                let per_bytes = per_elems / block_size * dtype.type_size();
-                let base = rd.ct.tensor_data_offset.saturating_add(info.offset) as usize;
-                let mut borrowed = Vec::with_capacity(n_expert);
-                for e in 0..n_expert {
-                    match crate::mmap_tensor::borrowed_range(
-                        &mmap,
-                        dtype,
-                        base + e * per_bytes,
-                        (out, inn).into(),
-                    )? {
-                        Some(t) => borrowed.push(ExpertWeight {
-                            qmatmul: QMatMul::from_qtensor(t)?,
-                            prefetch: crate::mmap_tensor::prefetch_handle(
-                                &mmap,
-                                dtype,
-                                base + e * per_bytes,
-                                per_elems / block_size,
-                            ),
-                        }),
-                        // Any expert that cannot be borrowed (misalignment,
-                        // truncated file) drops the whole layer to the copying
-                        // path rather than mixing the two.
-                        None => {
-                            borrowed.clear();
-                            break;
-                        }
+    // Preferred path for host-resident experts: point each expert straight
+    // at its own slice of the mapping.  Building all of them reads nothing —
+    // an expert is a pointer and a length — so a layer with hundreds of
+    // experts costs almost no memory until tokens actually route to them, at
+    // which point the kernel faults in just those pages and can evict them
+    // again later.  Borrowed storage is always CPU-resident, hence the
+    // `host_experts` gate; on an accelerator this is the
+    // `ExpertPlacement::Host` layout (dense set on the device, experts in
+    // host RAM, activations hopping across in `Moe::dispatch`).
+    if host_experts && whole_blocks {
+        if let Some(mmap) = rd.mmap.clone() {
+            let per_bytes = per_elems / block_size * dtype.type_size();
+            let mut borrowed = Vec::with_capacity(n_expert);
+            for e in 0..n_expert {
+                match crate::mmap_tensor::borrowed_range(
+                    &mmap,
+                    dtype,
+                    base + e * per_bytes,
+                    (out, inn).into(),
+                )? {
+                    Some(t) => borrowed.push(ExpertWeight {
+                        qmatmul: QMatMul::from_qtensor(t)?,
+                        prefetch: crate::mmap_tensor::prefetch_handle(
+                            &mmap,
+                            dtype,
+                            base + e * per_bytes,
+                            per_elems / block_size,
+                        ),
+                    }),
+                    // Any expert that cannot be borrowed (misalignment,
+                    // truncated file) drops the whole layer to the copying
+                    // path rather than mixing the two.
+                    None => {
+                        borrowed.clear();
+                        break;
                     }
                 }
-                if borrowed.len() == n_expert {
-                    return Ok(borrowed);
-                }
+            }
+            if borrowed.len() == n_expert {
+                return Ok(borrowed);
             }
         }
     }
 
+    // Device-resident experts with a mapping: upload each expert straight
+    // from its bytes in the mapping.  This used to read the whole stacked
+    // tensor into a host `Vec`, upload it as one device tensor, download it
+    // again (`QTensor::data`) and re-upload it per expert — three bus
+    // crossings and a transient whole-tensor device buffer per layer (a
+    // Kimi-K2 expert tensor is ~2.5 GiB).  Now each expert is one copy from
+    // the page cache.
+    if !host_experts {
+        if let Some(mmap) = rd.mmap.as_ref() {
+            if let Some(slices) =
+                crate::mmap_tensor::expert_slices(mmap, dtype, base, n_expert, per_elems)
+            {
+                let mut experts = Vec::with_capacity(n_expert);
+                for slice in slices {
+                    let storage =
+                        QStorage::from_data(Cow::Borrowed(slice), &rd.expert_device, dtype)?;
+                    let qt = QTensor::new(storage, (out, inn))?;
+                    experts.push(ExpertWeight {
+                        qmatmul: QMatMul::from_qtensor(qt)?,
+                        prefetch: None,
+                    });
+                }
+                return Ok(experts);
+            }
+        }
+    }
+
+    // No mapping (streamed load) or a tensor that cannot be sliced: read the
+    // stacked tensor once onto the host and copy per-expert slices to the
+    // expert device.  The host copy is the only staging buffer.
+    let qt = rd.ct.tensor(&mut rd.reader, name, &Device::Cpu)?;
     let bytes = qt.data()?;
     if bytes.len() % n_expert != 0 {
         candle_core::bail!(
@@ -1221,7 +1384,7 @@ fn split_experts<R: Read + Seek>(
     let mut experts = Vec::with_capacity(n_expert);
     for e in 0..n_expert {
         let slice = &bytes[e * per..(e + 1) * per];
-        let storage = QStorage::from_data(Cow::Borrowed(slice), &rd.device, dtype)?;
+        let storage = QStorage::from_data(Cow::Borrowed(slice), &rd.expert_device, dtype)?;
         let qt = QTensor::new(storage, (out, inn))?;
         experts.push(ExpertWeight {
             qmatmul: QMatMul::from_qtensor(qt)?,
@@ -1328,7 +1491,7 @@ mod tests {
             v_head_dim: w.vh,
             q_head_dim: w.qd,
             softmax_scale: cfg.softmax_scale,
-            kv_cache: None,
+            _kv_layout: (),
         })
     }
 
@@ -1339,12 +1502,13 @@ mod tests {
     fn mla_cache_stores_reconstructed_per_head_kv() -> Result<()> {
         let dev = Device::Cpu;
         let w = tiny_weights(&dev)?;
-        let mut attn = tiny_attention(&dev, &w)?;
+        let attn = tiny_attention(&dev, &w)?;
+        let mut kv: KvCache = None;
 
         // Prefill: 3 tokens at once.
         let xs = Tensor::randn(0f32, 1f32, (1, 3, 8), &dev)?;
-        attn.forward(&xs, None, 0)?;
-        let (k, v) = attn.kv_cache.as_ref().expect("cache populated after prefill");
+        attn.forward(&mut kv, &xs, None, 0)?;
+        let (k, v) = kv.as_ref().expect("cache populated after prefill");
         assert_eq!(
             k.dims(),
             &[1, 2, 8, 3],
@@ -1354,8 +1518,8 @@ mod tests {
 
         // Decode: one more token appends along seq.
         let xs2 = Tensor::randn(0f32, 1f32, (1, 1, 8), &dev)?;
-        attn.forward(&xs2, None, 3)?;
-        let (k, v) = attn.kv_cache.as_ref().expect("cache after decode");
+        attn.forward(&mut kv, &xs2, None, 3)?;
+        let (k, v) = kv.as_ref().expect("cache after decode");
         assert_eq!(k.dims(), &[1, 2, 8, 4]);
         assert_eq!(v.dims(), &[1, 2, 4, 4]);
         Ok(())
@@ -1370,24 +1534,26 @@ mod tests {
 
         // Prefill path: 3 tokens in one forward (causal mask, as the engine does).
         let w = tiny_weights(&dev)?;
-        let mut a = tiny_attention(&dev, &w)?;
+        let a = tiny_attention(&dev, &w)?;
+        let mut kv_a: KvCache = None;
         let xs = Tensor::randn(0f32, 1f32, (1, 3, 8), &dev)?;
         let mask: Vec<f32> = (0..3)
             .flat_map(|i| (0..3).map(move |j| if j > i { f32::NEG_INFINITY } else { 0.0 }))
             .collect();
         let mask = Tensor::from_slice(&mask, (1, 1, 3, 3), &dev)?;
-        let out_prefill = a.forward(&xs, Some(&mask), 0)?;
-        let (c_pre, k_pre) = a.kv_cache.as_ref().unwrap();
+        let out_prefill = a.forward(&mut kv_a, &xs, Some(&mask), 0)?;
+        let (c_pre, k_pre) = kv_a.as_ref().unwrap();
 
         // Incremental path: 1 + 1 + 1 tokens with growing offset.
-        let mut b = tiny_attention(&dev, &w)?;
+        let b = tiny_attention(&dev, &w)?;
+        let mut kv_b: KvCache = None;
         let mut out_inc = Vec::new();
         for off in 0..3 {
             let t = xs.narrow(1, off, 1)?;
-            out_inc.push(b.forward(&t, None, off)?);
+            out_inc.push(b.forward(&mut kv_b, &t, None, off)?);
         }
         let out_inc = Tensor::cat(&out_inc, 1)?;
-        let (c_inc, k_inc) = b.kv_cache.as_ref().unwrap();
+        let (c_inc, k_inc) = kv_b.as_ref().unwrap();
 
         assert_eq!(c_pre.dims(), c_inc.dims());
         assert_eq!(k_pre.dims(), k_inc.dims());
@@ -1443,6 +1609,7 @@ mod tests {
             topk_group: 1,
             weights_norm: false,
             weights_scale: 0.0,
+            expert_device: dev.clone(),
         };
 
         // Batched path: 3 tokens in one forward (softmax routing per token).

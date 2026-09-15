@@ -654,6 +654,45 @@ pub fn borrowed_range(
     QTensor::new(QStorage::Cpu(storage), shape).map(Some)
 }
 
+/// The byte slices of each expert in a stacked `[n_expert, out, in]` expert
+/// tensor, straight out of the mapping.
+///
+/// This is the *upload* counterpart of [`borrowed_range`]: where a CPU model
+/// points each expert at its bytes in place, a model running on an
+/// accelerator needs those same bytes copied onto the device.  Slicing the
+/// mapping directly hands the device copy its source without any host-side
+/// staging — no `Vec` read of the whole tensor, no round trip through a
+/// whole-tensor device buffer.  The bytes at `[e * per_bytes, (e + 1) *
+/// per_bytes)` of the tensor are exactly expert `e`'s quantized blocks, in
+/// the order candle's own `QTensor::data` would return them.
+///
+/// Returns `None` when the tensor's element count is not a whole number of
+/// blocks, or the range runs past the mapping (a truncated file) — callers
+/// then fall back to candle's copying reader.
+pub fn expert_slices<'m>(
+    mmap: &'m Mmap,
+    dtype: GgmlDType,
+    byte_offset: usize,
+    n_expert: usize,
+    per_expert_elems: usize,
+) -> Option<Vec<&'m [u8]>> {
+    let block_size = dtype.block_size();
+    if block_size == 0 || n_expert == 0 || !per_expert_elems.is_multiple_of(block_size) {
+        return None;
+    }
+    let per_bytes = (per_expert_elems / block_size).checked_mul(dtype.type_size())?;
+    let total = per_bytes.checked_mul(n_expert)?;
+    let end = byte_offset.checked_add(total)?;
+    if end > mmap.len() {
+        return None;
+    }
+    Some(
+        (0..n_expert)
+            .map(|e| &mmap[byte_offset + e * per_bytes..byte_offset + (e + 1) * per_bytes])
+            .collect(),
+    )
+}
+
 /// Load a tensor by name, borrowing from the mapping when possible and
 /// falling back to candle's copying reader otherwise.
 pub fn qtensor_from_mmap<R: std::io::Read + std::io::Seek>(
@@ -1144,6 +1183,61 @@ mod tests {
         assert_eq!(n, 4096);
 
         drop(mmap);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `expert_slices` must hand out exactly the bytes candle's own reader
+    /// would produce for each expert of a stacked expert tensor — this is
+    /// what lets an accelerator load upload experts straight from the
+    /// mapping instead of staging the whole tensor on the host and device.
+    #[test]
+    fn expert_slices_match_candle_tensor_data() {
+        let dir = std::env::temp_dir().join(format!("joshua-exps-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (n_expert, out, inn) = (3usize, 4usize, 64usize);
+        let data: Vec<f32> = (0..n_expert * out * inn).map(|i| (i % 23) as f32 - 11.0).collect();
+        let t = Tensor::from_vec(data, (n_expert, out, inn), &Device::Cpu).unwrap();
+        let q = QT::quantize(&t, GgmlDType::Q8_0).unwrap();
+        let path = dir.join("e.gguf");
+        let mut f = std::fs::File::create(&path).unwrap();
+        gguf_file::write(&mut f, &[], &[("blk.0.ffn_up_exps.weight", &q)]).unwrap();
+        drop(f);
+        let f = std::fs::File::open(&path).unwrap();
+        let mmap = Arc::new(unsafe { Mmap::map(&f) }.unwrap());
+        let content = gguf_file::Content::read(&mut std::io::Cursor::new(&mmap[..])).unwrap();
+        let info = &content.tensor_infos["blk.0.ffn_up_exps.weight"];
+        let base = (content.tensor_data_offset + info.offset) as usize;
+
+        let slices = expert_slices(&mmap, GgmlDType::Q8_0, base, n_expert, out * inn).unwrap();
+        let expected = q.data().unwrap();
+        let per = expected.len() / n_expert;
+        assert_eq!(slices.len(), n_expert);
+        for (e, s) in slices.iter().enumerate() {
+            assert_eq!(s.len(), per);
+            assert_eq!(*s, &expected[e * per..(e + 1) * per], "expert {e} bytes differ");
+        }
+        // Each slice is a valid expert matrix that matmuls like the reference.
+        let xs = Tensor::from_vec((0..inn).map(|i| (i % 5) as f32).collect::<Vec<_>>(), (1, inn), &Device::Cpu)
+            .unwrap();
+        for (e, s) in slices.iter().enumerate() {
+            let st = QStorage::from_data(std::borrow::Cow::Borrowed(s), &Device::Cpu, GgmlDType::Q8_0).unwrap();
+            let qt = QT::new(st, (out, inn)).unwrap();
+            let got = QMatMul::from_qtensor(qt).unwrap().forward(&xs).unwrap();
+            // `get` yields an offset view; rebuild it so quantize sees only
+            // this expert's elements.
+            let ref_e: Vec<f32> = t.get(e).unwrap().flatten_all().unwrap().to_vec1().unwrap();
+            let ref_e = Tensor::from_vec(ref_e, (out, inn), &Device::Cpu).unwrap();
+            let want = QMatMul::from_qtensor(QT::quantize(&ref_e, GgmlDType::Q8_0).unwrap())
+                .unwrap()
+                .forward(&xs)
+                .unwrap();
+            let diff = (got - want).unwrap().abs().unwrap().max_all().unwrap().to_scalar::<f32>().unwrap();
+            assert!(diff < 1e-5, "expert {e} matmul differs by {diff}");
+        }
+
+        // Truncated ranges and non-block element counts are declined.
+        assert!(expert_slices(&mmap, GgmlDType::Q8_0, base, n_expert + 1, out * inn).is_none());
+        assert!(expert_slices(&mmap, GgmlDType::Q8_0, base, n_expert, out * inn + 1).is_none());
         std::fs::remove_dir_all(&dir).ok();
     }
 }

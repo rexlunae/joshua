@@ -21,7 +21,7 @@ use tracing_subscriber::EnvFilter;
 
 use joshua::{
     engine::Engine, server, types::GenerationOptions, ChatMessage, ComputeBackend, EngineOptions,
-    HugePages, MlockMode, MmapMode, PageSize,
+    ExpertPlacement, HugePages, MlockMode, MmapMode, PageSize,
 };
 
 /// Values for `--device` (CLI form of [`ComputeBackend`]).
@@ -221,6 +221,19 @@ enum Commands {
         /// any mlock attempt, with one warning naming limit vs required size.
         #[arg(long, env = "JOSHUA_MLOCK_HOT_WEIGHTS", num_args = 0..=1, default_missing_value = "on", value_enum)]
         mlock_hot_weights: Option<MlockArg>,
+        /// Where a MoE model's routed experts live on a GPU: `device` uploads
+        /// them (the whole model must fit), `host` keeps them in RAM borrowed
+        /// from the mapping with only the dense set on the GPU (runs models
+        /// larger than VRAM), `auto` picks `device` only when the model fits
+        /// the GPU's free memory with headroom.  Ignored on the CPU.
+        #[arg(long, env = "JOSHUA_EXPERT_PLACEMENT", default_value = "auto", value_parser = clap::value_parser!(ExpertPlacement))]
+        expert_placement: ExpertPlacement,
+        /// GPU memory the model may use, in MiB.  Overrides the probe for the
+        /// `--expert-placement auto` decision and the per-GPU session cap;
+        /// the way to state the budget on backends without a probe (Metal,
+        /// OpenCL) or when sharing the card.
+        #[arg(long, env = "JOSHUA_VRAM_BUDGET")]
+        vram_budget: Option<u64>,
         /// NPU vendor plugin (a cdylib exporting the joshua_npu_* ABI).
         #[arg(long, env = "JOSHUA_NPU_PLUGIN")]
         npu_plugin: Option<PathBuf>,
@@ -317,6 +330,19 @@ enum Commands {
         /// any mlock attempt, with one warning naming limit vs required size.
         #[arg(long, env = "JOSHUA_MLOCK_HOT_WEIGHTS", num_args = 0..=1, default_missing_value = "on", value_enum)]
         mlock_hot_weights: Option<MlockArg>,
+        /// Where a MoE model's routed experts live on a GPU: `device` uploads
+        /// them (the whole model must fit), `host` keeps them in RAM borrowed
+        /// from the mapping with only the dense set on the GPU (runs models
+        /// larger than VRAM), `auto` picks `device` only when the model fits
+        /// the GPU's free memory with headroom.  Ignored on the CPU.
+        #[arg(long, env = "JOSHUA_EXPERT_PLACEMENT", default_value = "auto", value_parser = clap::value_parser!(ExpertPlacement))]
+        expert_placement: ExpertPlacement,
+        /// GPU memory the model may use, in MiB.  Overrides the probe for the
+        /// `--expert-placement auto` decision and the per-GPU session cap;
+        /// the way to state the budget on backends without a probe (Metal,
+        /// OpenCL) or when sharing the card.
+        #[arg(long, env = "JOSHUA_VRAM_BUDGET")]
+        vram_budget: Option<u64>,
         /// NPU vendor plugin (a cdylib exporting the joshua_npu_* ABI).
         #[arg(long, env = "JOSHUA_NPU_PLUGIN")]
         npu_plugin: Option<PathBuf>,
@@ -379,6 +405,8 @@ async fn main() -> anyhow::Result<()> {
             pin_hot_experts,
             expert_cache,
             mlock_hot_weights,
+            expert_placement,
+            vram_budget,
             npu_plugin,
             npu_in_process,
             whisper_model,
@@ -418,7 +446,9 @@ async fn main() -> anyhow::Result<()> {
                     mlock_hot_weights
                         .map(MlockMode::from)
                         .unwrap_or(MlockMode::Off),
-                );
+                )
+                .expert_placement(expert_placement)
+                .device_memory_budget(vram_budget.map(|mib| mib.saturating_mul(1024 * 1024)));
             let mut engine = Engine::with_options(&model, opts)?;
             if let Some(plugin) = npu_plugin {
                 engine = engine.with_npu_backend(npu_backend(&plugin, npu_in_process)?);
@@ -481,6 +511,8 @@ async fn main() -> anyhow::Result<()> {
             pin_hot_experts,
             expert_cache,
             mlock_hot_weights,
+            expert_placement,
+            vram_budget,
             npu_plugin,
             npu_in_process,
         } => {
@@ -505,7 +537,9 @@ async fn main() -> anyhow::Result<()> {
                     mlock_hot_weights
                         .map(MlockMode::from)
                         .unwrap_or(MlockMode::Off),
-                );
+                )
+                .expert_placement(expert_placement)
+                .device_memory_budget(vram_budget.map(|mib| mib.saturating_mul(1024 * 1024)));
             let mut engine = Engine::with_options(&model, opts)?;
             if let Some(plugin) = npu_plugin {
                 engine = engine.with_npu_backend(npu_backend(&plugin, npu_in_process)?);

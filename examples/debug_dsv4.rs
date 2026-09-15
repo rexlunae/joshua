@@ -53,6 +53,7 @@ fn main() -> anyhow::Result<()> {
         &device,
         Some(Arc::clone(&mmap)),
         None,
+        0,
     )?;
     println!("model loaded");
 

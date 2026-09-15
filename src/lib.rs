@@ -45,6 +45,7 @@ pub mod placement;
 pub mod server;
 pub mod simd;
 pub mod template;
+pub mod token_embedding;
 pub mod whisper;
 pub mod zero_copy_metal;
 pub mod tools;
@@ -57,8 +58,8 @@ pub mod types;
 pub use rustls;
 
 pub use engine::{
-    find_gguf_in_dir, ComputeBackend, Engine, EngineOptions, HugePages, MlockMode, MmapMode,
-    PageSize,
+    find_gguf_in_dir, ComputeBackend, Engine, EngineOptions, ExpertPlacement, HugePages, MlockMode,
+    MmapMode, PageSize,
 };
 pub use error::{JoshuaError, Result};
 pub use types::{
