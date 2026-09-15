@@ -237,7 +237,7 @@ impl Architecture {
     /// handle so sessions can be derived without copying them (see
     /// [`QuantizedModel::new_session`]).
     pub fn shares_weights(&self) -> bool {
-        matches!(self, Self::Qwen3Moe | Self::DeepSeek2)
+        matches!(self, Self::Qwen3Moe | Self::DeepSeek2 | Self::DeepSeek4)
     }
 
     /// Whether this architecture's loader keeps the routed experts in host
@@ -467,6 +467,7 @@ impl QuantizedModel {
         match self {
             Self::Qwen3Moe(m) => Some(Self::Qwen3Moe(m.new_session())),
             Self::DeepSeek2(m) => Some(Self::DeepSeek2(m.new_session())),
+            Self::DeepSeek4(m) => Some(Self::DeepSeek4(m.new_session())),
             _ => None,
         }
     }
@@ -474,7 +475,7 @@ impl QuantizedModel {
     /// Whether [`QuantizedModel::new_session`] can derive sessions from this
     /// instance without copying its weights.
     pub fn supports_shared_weights(&self) -> bool {
-        matches!(self, Self::Qwen3Moe(_) | Self::DeepSeek2(_))
+        matches!(self, Self::Qwen3Moe(_) | Self::DeepSeek2(_) | Self::DeepSeek4(_))
     }
 
     /// Whether the loaded token-embedding table is held quantized rather

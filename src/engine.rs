@@ -548,12 +548,12 @@ pub struct Engine {
     /// [`EngineOptions::expert_placement`]).
     expert_device: Device,
     /// The one fully loaded instance of a weight-sharing architecture
-    /// (`qwen3moe`, `deepseek2`), never used for inference itself: every
-    /// session is derived from it with [`QuantizedModel::new_session`] and
-    /// shares its weights, so concurrent requests cost one KV cache each
-    /// rather than one copy — on an accelerator, one upload — of the model.
-    /// `None` until the first load, and always for architectures whose
-    /// instances own their weights.
+    /// (`qwen3moe`, `deepseek2`, `deepseek4`), never used for inference
+    /// itself: every session is derived from it with
+    /// [`QuantizedModel::new_session`] and shares its weights, so concurrent
+    /// requests cost one KV cache each rather than one copy — on an
+    /// accelerator, one upload — of the model.  `None` until the first load,
+    /// and always for architectures whose instances own their weights.
     weights_template: Mutex<Option<QuantizedModel>>,
     /// Cap on idle sessions kept warm for architectures whose sessions each
     /// carry a full copy of the weights on an accelerator, sized from the

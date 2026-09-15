@@ -1572,18 +1572,17 @@ impl FeedForward {
 }
 
 /// A quantized DeepSeek-V4 model loaded from GGUF.
-pub struct ModelWeights {
-    /// Token-embedding table, kept quantized (see
-    /// [`crate::token_embedding::TokenEmbedding`]): dequantizing V4-Flash's
-    /// table to f32 cost ~2 GiB of anonymous memory per instance.
+/// The immutable, weight-bearing half of a DeepSeek-V4 model.
+///
+/// Holds every weight tensor, the rotary/compressor/reference tables, the
+/// mmap backing, and the residency backend — nothing here is mutated after
+/// load (the qwen3moe/deepseek2 pattern from #60).  Wrapped in an `Arc` and
+/// shared by every [`ModelWeights`] session derived via
+/// [`ModelWeights::new_session`]: a second concurrent request on an
+/// accelerator reuses the already-uploaded dense set instead of reloading it.
+struct Shared {
     tok_embeddings: crate::token_embedding::TokenEmbedding,
     layers: Vec<Layer>,
-    kv: Vec<KvState>,
-    /// Per-sequence KV state for batched `forward_sequences` decode:
-    /// `[layer][seq]`.  Persistent across steps (unlike a fresh-per-call
-    /// cache) so multi-token batched generation keeps each sequence's
-    /// attention history.  Reset via [`ModelWeights::reset_batch_kv`].
-    kv_seq: Vec<Vec<KvState>>,
     cfg: Config,
     norm: RmsNorm,
     output: QMatMul,
@@ -1602,19 +1601,35 @@ pub struct ModelWeights {
     /// Per-layer expert byte ranges in the mapping (see
     /// [`crate::gguf_ext::GgufHeader::layer_expert_ranges`]).
     layer_expert_ranges: Vec<Option<(usize, usize)>>,
+    /// Executes residency for the hot set (CPU madvise today; a device slot
+    /// cache later).  Built once at load from the per-expert handles.
+    residency: std::sync::Arc<dyn crate::residency::ExpertResidency>,
+}
+
+/// A quantized DeepSeek-V4 model: one shared set of weights plus per-session
+/// mutable state (KV caches, batched-KV, the speculative-routing predictor and
+/// the hot-expert cache).  Sessions are derived from one template via
+/// [`ModelWeights::new_session`] (one `Arc` clone of the weights, no re-read,
+/// no re-upload).
+pub struct ModelWeights {
+    shared: std::sync::Arc<Shared>,
+    /// Per-layer KV cache — the primary per-session tensor state.
+    kv: Vec<KvState>,
+    /// Per-sequence KV state for batched `forward_sequences` decode:
+    /// `[layer][seq]`.  Persistent across steps (unlike a fresh-per-call
+    /// cache) so multi-token batched generation keeps each sequence's
+    /// attention history.  Reset via [`ModelWeights::reset_batch_kv`].
+    kv_seq: Vec<Vec<KvState>>,
     /// Routed-expert ids of the most recent forward pass, per layer index
     /// (see [`ModelWeights::last_routed_experts`]).  The prediction source
     /// for the speculative decode prefetch.
     last_routed: Vec<Vec<u32>>,
-    /// Routing-frequency LRU hot-expert cache (shared bookkeeping; budget set
-    /// after load via [`ModelWeights::set_pin_hot_experts`], CLI flag
+    /// Routing-frequency LRU hot-expert cache (per-session bookkeeping; budget
+    /// set after load via [`ModelWeights::set_pin_hot_experts`], CLI flag
     /// `--pin-hot-experts`).  Records routing, re-selects the hot set every
     /// [`crate::hot_experts::REFRESH_STEPS`] decode steps, and reports newly
     /// hot experts for the residency backend.
     hot_experts: crate::hot_experts::HotExpertCache,
-    /// Executes residency for the hot set (CPU madvise today; a device slot
-    /// cache later).  Built once at load from the per-expert handles.
-    residency: std::sync::Arc<dyn crate::residency::ExpertResidency>,
 }
 
 /// Small GGUF reader over the memory-mapped file.
@@ -2062,7 +2077,6 @@ impl ModelWeights {
         let mmap = rd.mmap.clone();
         let file = rd.file.clone();
 
-        let n_layers = layers.len();
         let n_expert = cfg.n_expert;
         let residency: std::sync::Arc<dyn crate::residency::ExpertResidency> =
             std::sync::Arc::new(crate::residency::CpuResidency::new(
@@ -2075,11 +2089,10 @@ impl ModelWeights {
                     })
                     .collect(),
             ));
-        Ok(Self {
+        let n_layers = layers.len();
+        let shared = std::sync::Arc::new(Shared {
             tok_embeddings,
             layers,
-            kv: kv_states,
-            kv_seq: Vec::new(),
             cfg,
             norm,
             output,
@@ -2093,9 +2106,14 @@ impl ModelWeights {
             mmap,
             file,
             layer_expert_ranges,
+            residency,
+        });
+        Ok(Self {
+            shared,
+            kv: kv_states,
+            kv_seq: Vec::new(),
             last_routed: vec![Vec::new(); n_layers],
             hot_experts: crate::hot_experts::HotExpertCache::new(n_layers, n_expert, 0),
-            residency,
         })
     }
 
@@ -2111,7 +2129,7 @@ impl ModelWeights {
             if ids.is_empty() {
                 continue;
             }
-            let Some(layer) = self.layers.get(i) else {
+            let Some(layer) = self.shared.layers.get(i) else {
                 continue;
             };
             // Every layer of this architecture carries an MoE block.
@@ -2147,22 +2165,58 @@ impl ModelWeights {
     /// Number of experts the residency backend can hold resident
     /// (informational on CPU; a phase-5 auto-sizing input on devices).
     pub fn expert_residency_capacity(&self) -> usize {
-        self.residency.capacity()
+        self.shared.residency.capacity()
     }
 
     /// Whether the token-embedding table is held quantized (diagnostics).
     pub fn embeddings_quantized(&self) -> bool {
-        self.tok_embeddings.is_quantized()
+        self.shared.tok_embeddings.is_quantized()
+    }
+
+    /// A fresh session over the same weights: shares every weight tensor
+    /// (one `Arc` clone — no re-read, no re-upload) and starts with empty KV
+    /// caches (per-layer + per-sequence) and a fresh routing record under the
+    /// same hot-expert budget.  Two concurrent sessions on an accelerator
+    /// therefore reuse the dense set that was uploaded once for the template.
+    pub fn new_session(&self) -> Self {
+        // A fresh session rebuilds its KV caches from scratch (the documented
+        // per-session cost).  Allocation failure is unrecoverable device/CPU
+        // OOM — the same condition the loader's own eager KV build fails on —
+        // so panic loudly rather than hand forward a half-built cache.  Unlike
+        // qwen3moe/deepseek2 (whose KV is a lazy `Option`), deepseek4 allocates
+        // its KV eagerly, so `new_session` cannot be infallible by construction.
+        let kv: Vec<KvState> = (0..self.shared.layers.len())
+            .map(|i| KvState::new(&self.shared.cfg, i, &self.shared.device, self.shared.max_seq))
+            .collect::<Result<Vec<_>>>()
+            .unwrap_or_else(|e| {
+                panic!("deepseek4: new-session KV cache allocation failed: {e}")
+            });
+        Self {
+            shared: std::sync::Arc::clone(&self.shared),
+            kv,
+            kv_seq: Vec::new(),
+            last_routed: vec![Vec::new(); self.shared.layers.len()],
+            hot_experts: crate::hot_experts::HotExpertCache::new(
+                self.shared.layers.len(),
+                self.shared.cfg.n_expert,
+                self.hot_experts.budget(),
+            ),
+        }
+    }
+
+    /// Number of sessions (including this one) sharing these weights.
+    pub fn shared_session_count(&self) -> usize {
+        std::sync::Arc::strong_count(&self.shared)
     }
 
     /// Forward pass. `input` is `[1, seq_len]`; `offset` is the KV-cache
     /// position of the first input token.
     pub fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {
         let (_b, seq_len) = input.dims2()?;
-        let hc = self.hc_mult;
-        let d = self.tok_embeddings.hidden()?;
+        let hc = self.shared.hc_mult;
+        let d = self.shared.tok_embeddings.hidden()?;
 
-        let tok = self
+        let tok = self.shared
             .tok_embeddings
             .forward(&input.flatten_all()?)?
             .reshape((1, seq_len, d))?;
@@ -2171,7 +2225,7 @@ impl ModelWeights {
 
         let profile = std::env::var_os("JOSHUA_PROFILE_LAYERS").is_some();
         let mut prof = if profile {
-            Some((Vec::with_capacity(self.layers.len()), Vec::with_capacity(self.layers.len()), Vec::with_capacity(self.layers.len())))
+            Some((Vec::with_capacity(self.shared.layers.len()), Vec::with_capacity(self.shared.layers.len()), Vec::with_capacity(self.shared.layers.len())))
         } else {
             None
         };
@@ -2189,14 +2243,14 @@ impl ModelWeights {
         // mapping but no file (public `from_gguf_mmap(..., Some(mmap), None)`)
         // keep the hints and just skip the thread.
         let prefetch_layers = seq_len >= PREFETCH_AHEAD_MIN
-            && !self.layer_expert_ranges.is_empty()
-            && self.mmap.is_some();
-        let prefetch_thread = prefetch_layers && self.file.is_some();
+            && !self.shared.layer_expert_ranges.is_empty()
+            && self.shared.mmap.is_some();
+        let prefetch_thread = prefetch_layers && self.shared.file.is_some();
 
         let prefetcher = if prefetch_thread {
             Some(crate::mmap_tensor::LayerPrefetcher::spawn(
-                self.file.as_ref().expect("checked above").clone(),
-                std::sync::Arc::new(self.layer_expert_ranges.clone()),
+                self.shared.file.as_ref().expect("checked above").clone(),
+                std::sync::Arc::new(self.shared.layer_expert_ranges.clone()),
                 crate::mmap_tensor::prefetch_ahead_depth(),
             ))
         } else {
@@ -2213,7 +2267,7 @@ impl ModelWeights {
         let step = self.hot_experts.begin_step(seq_len == 1);
         if self.hot_experts.refresh_due(seq_len == 1) {
             for (l, e) in self.hot_experts.refresh() {
-                self.residency.acquire(l, e);
+                self.shared.residency.acquire(l, e);
             }
         }
 
@@ -2232,15 +2286,17 @@ impl ModelWeights {
         }
 
         // Field-split borrows so the loop can record each layer's routing.
-        let layers = &mut self.layers;
+        // `shared.layers` is immutable (Arc) and only ever read here; the mutable
+        // per-session state (`last_routed`, `hot_experts`) is captured separately.
+        let layers = &self.shared.layers;
         let last_routed = &mut self.last_routed;
-        for (i, layer) in layers.iter_mut().enumerate() {
+        for (i, layer) in layers.iter().enumerate() {
             let t_layer = std::time::Instant::now();
             if let Some(pf) = &prefetcher {
                 pf.set_current(i);
             }
             if i == 0 && prefetch_layers {
-                if let Some(mmap) = &self.mmap {
+                if let Some(mmap) = &self.shared.mmap {
                     // The lazy-weights path advises MADV_RANDOM over the
                     // whole mapping, which disables kernel readahead: every
                     // demand fault is a single 4 KiB page read (~175 MB/s
@@ -2251,8 +2307,8 @@ impl ModelWeights {
                     // layer loop computes.  The tensor-major MoE dispatch
                     // below then reads each expert tensor as one clean pass.
                     if let (Some(Some((b0, _))), Some(Some((_, e_n)))) = (
-                        self.layer_expert_ranges.first(),
-                        self.layer_expert_ranges.last(),
+                        self.shared.layer_expert_ranges.first(),
+                        self.shared.layer_expert_ranges.last(),
                     ) {
                         let span = e_n.saturating_sub(*b0);
                         if span > 0 && *e_n <= mmap.len() {
@@ -2267,14 +2323,14 @@ impl ModelWeights {
                 &layer.hc_attn_fn,
                 &layer.hc_attn_scale,
                 &layer.hc_attn_base,
-                self.hc_eps,
-                self.cfg.hc_sinkhorn_iters,
+                self.shared.hc_eps,
+                self.shared.cfg.hc_sinkhorn_iters,
             )?;
             let residual = xs;
             let h = layer.attn_norm.forward(&x)?;
             let h = layer
                 .attn
-                .forward(&mut self.kv[i], &h, offset, self.max_seq)?;
+                .forward(&mut self.kv[i], &h, offset, self.shared.max_seq)?;
             xs = hc_post(&h, &residual, &post, &comb)?;
             if let Some((a, _, _)) = prof.as_mut() {
                 a.push(t_layer.elapsed().as_secs_f64());
@@ -2286,8 +2342,8 @@ impl ModelWeights {
                 &layer.hc_ffn_fn,
                 &layer.hc_ffn_scale,
                 &layer.hc_ffn_base,
-                self.hc_eps,
-                self.cfg.hc_sinkhorn_iters,
+                self.shared.hc_eps,
+                self.shared.cfg.hc_sinkhorn_iters,
             )?;
             let residual = xs;
             let h = layer.ffn_norm.forward(&x)?;
@@ -2335,10 +2391,10 @@ impl ModelWeights {
         // handful of experts per layer, so SEQUENTIAL's aggressive readahead
         // would waste bandwidth pulling the wrong pages.
         if prefetch_layers {
-            if let Some(mmap) = &self.mmap {
+            if let Some(mmap) = &self.shared.mmap {
                 if let (Some(Some((b0, _))), Some(Some((_, e_n)))) = (
-                    self.layer_expert_ranges.first(),
-                    self.layer_expert_ranges.last(),
+                    self.shared.layer_expert_ranges.first(),
+                    self.shared.layer_expert_ranges.last(),
                 ) {
                     let span = e_n.saturating_sub(*b0);
                     if span > 0 && *e_n <= mmap.len() {
@@ -2354,15 +2410,15 @@ impl ModelWeights {
         let rsqrt = flat
             .sqr()?
             .mean_keepdim(D::Minus1)?
-            .affine(1.0, self.hc_eps)?
+            .affine(1.0, self.shared.hc_eps)?
             .powf(-0.5)?;
-        let mixes = self.hc_head_fn.forward(&flat)?.broadcast_mul(&rsqrt)?; // [s, hc]
+        let mixes = self.shared.hc_head_fn.forward(&flat)?.broadcast_mul(&rsqrt)?; // [s, hc]
         let pre = sigmoid(
             &mixes
-                .broadcast_mul(&self.hc_head_scale)?
-                .broadcast_add(&self.hc_head_base)?,
+                .broadcast_mul(&self.shared.hc_head_scale)?
+                .broadcast_add(&self.shared.hc_head_base)?,
         )?
-        .affine(1.0, self.hc_eps)?; // + eps
+        .affine(1.0, self.shared.hc_eps)?; // + eps
         let y = pre
             .unsqueeze(D::Minus1)?
             .broadcast_as((seq_len, hc, d))?
@@ -2372,8 +2428,8 @@ impl ModelWeights {
         // Only the last position's logits are needed, and the engine's
         // `squeeze_batch_logits` requires a single row.
         let y = y.narrow(0, seq_len - 1, 1)?;
-        let y = self.norm.forward(&y)?;
-        let logits = self.output.forward(&y)?; // [1, n_vocab]
+        let y = self.shared.norm.forward(&y)?;
+        let logits = self.shared.output.forward(&y)?; // [1, n_vocab]
         logits.to_dtype(DType::F32)
     }
 
@@ -2400,20 +2456,20 @@ impl ModelWeights {
         if n_seq == 0 {
             return Ok(Vec::new());
         }
-        let hc = self.hc_mult;
-        let d = self.tok_embeddings.hidden()?;
+        let hc = self.shared.hc_mult;
+        let d = self.shared.tok_embeddings.hidden()?;
 
         // Persistent per-sequence KV: reset when the batch size changes (a new
         // batch of sequences starts), otherwise reuse the cache across steps so
         // multi-token generation keeps each sequence's attention history.
-        if self.kv_seq.len() != self.layers.len()
+        if self.kv_seq.len() != self.shared.layers.len()
             || self.kv_seq.first().unwrap_or(&Vec::new()).len() != n_seq
         {
             self.kv_seq.clear();
-            for i in 0..self.layers.len() {
+            for i in 0..self.shared.layers.len() {
                 let mut per_seq: Vec<KvState> = Vec::with_capacity(n_seq);
                 for _ in 0..n_seq {
-                    per_seq.push(KvState::new(&self.cfg, i, &self.device, self.max_seq)?);
+                    per_seq.push(KvState::new(&self.shared.cfg, i, &self.shared.device, self.shared.max_seq)?);
                 }
                 self.kv_seq.push(per_seq);
             }
@@ -2423,7 +2479,7 @@ impl ModelWeights {
         let mut xs_seq: Vec<Tensor> = Vec::with_capacity(n_seq);
         let mut ids_cat: Vec<u32> = Vec::new();
         for (input, _) in seqs {
-            let tok = self
+            let tok = self.shared
                 .tok_embeddings
                 .forward(&input.flatten_all()?)?
                 .reshape((1, 1, d))?;
@@ -2434,12 +2490,12 @@ impl ModelWeights {
         let _step = self.hot_experts.begin_step(true);
         if self.hot_experts.refresh_due(true) {
             for (l, e) in self.hot_experts.refresh() {
-                self.residency.acquire(l, e);
+                self.shared.residency.acquire(l, e);
             }
         }
 
-        for i in 0..self.layers.len() {
-            let layer = &self.layers[i];
+        for i in 0..self.shared.layers.len() {
+            let layer = &self.shared.layers[i];
 
             // Per-sequence attention branch, then stash everything the shared
             // MoE branch needs to hc_post back per-sequence.
@@ -2454,14 +2510,14 @@ impl ModelWeights {
                     &layer.hc_attn_fn,
                     &layer.hc_attn_scale,
                     &layer.hc_attn_base,
-                    self.hc_eps,
-                    self.cfg.hc_sinkhorn_iters,
+                    self.shared.hc_eps,
+                    self.shared.cfg.hc_sinkhorn_iters,
                 )?;
                 let residual = xs_s;
                 let h = layer.attn_norm.forward(&x)?;
                 let h = layer
                     .attn
-                    .forward(&mut self.kv_seq.get_mut(i).unwrap().get_mut(s).unwrap(), &h, *off, self.max_seq)?;
+                    .forward(&mut self.kv_seq.get_mut(i).unwrap().get_mut(s).unwrap(), &h, *off, self.shared.max_seq)?;
                 let xs_s2 = hc_post(&h, &residual, &post, &comb)?;
 
                 let (x2, fpost, fcomb) = hc_pre(
@@ -2469,8 +2525,8 @@ impl ModelWeights {
                     &layer.hc_ffn_fn,
                     &layer.hc_ffn_scale,
                     &layer.hc_ffn_base,
-                    self.hc_eps,
-                    self.cfg.hc_sinkhorn_iters,
+                    self.shared.hc_eps,
+                    self.shared.cfg.hc_sinkhorn_iters,
                 )?;
                 ffn_pre.push(layer.ffn_norm.forward(&x2)?);
                 ffn_residual.push(xs_s2);
@@ -2482,7 +2538,7 @@ impl ModelWeights {
             let ffn_cats: Vec<Tensor> =
                 (0..n_seq).map(|s| ffn_pre.get(s).unwrap().clone()).collect();
             let h_cat = Tensor::cat(&ffn_cats, 1)?;
-            let input_cat = Tensor::new(ids_cat.as_slice(), &self.device)
+            let input_cat = Tensor::new(ids_cat.as_slice(), &self.shared.device)
                 .and_then(|t| t.unsqueeze(0))?;
             let (h_out, _routed) = layer.ffn.forward(&h_cat, &input_cat)?;
 
@@ -2506,18 +2562,18 @@ impl ModelWeights {
         let rsqrt = flat
             .sqr()?
             .mean_keepdim(D::Minus1)?
-            .affine(1.0, self.hc_eps)?
+            .affine(1.0, self.shared.hc_eps)?
             .powf(-0.5)?;
-        let mixes = self.hc_head_fn.forward(&flat)?.broadcast_mul(&rsqrt)?;
-        let pre = sigmoid(&mixes.broadcast_mul(&self.hc_head_scale)?.broadcast_add(&self.hc_head_base)?)?
-            .affine(1.0, self.hc_eps)?;
+        let mixes = self.shared.hc_head_fn.forward(&flat)?.broadcast_mul(&rsqrt)?;
+        let pre = sigmoid(&mixes.broadcast_mul(&self.shared.hc_head_scale)?.broadcast_add(&self.shared.hc_head_base)?)?
+            .affine(1.0, self.shared.hc_eps)?;
         let y = pre
             .unsqueeze(D::Minus1)?
             .broadcast_as((seq_len, hc, d))?
             .mul(&xs_cat.squeeze(0)?)?
             .sum(D::Minus2)?; // [n_seq, d]
-        let y = self.norm.forward(&y)?;
-        let logits_all = self.output.forward(&y)?; // [n_seq, n_vocab]
+        let y = self.shared.norm.forward(&y)?;
+        let logits_all = self.shared.output.forward(&y)?; // [n_seq, n_vocab]
         // Split logits per sequence (each is 1 row).
         let mut out: Vec<Vec<f32>> = Vec::with_capacity(n_seq);
         for s in 0..n_seq {
@@ -2538,7 +2594,7 @@ impl ModelWeights {
     /// prefetchable) vs the total, for diagnostics.
     pub fn mmap_backed_experts(&self) -> (usize, usize) {
         let (mut backed, mut total) = (0, 0);
-        for layer in &self.layers {
+        for layer in &self.shared.layers {
             let FeedForward::Moe(moe) = &layer.ffn;
             for e in &moe.experts {
                 total += 1;
@@ -2552,9 +2608,9 @@ impl ModelWeights {
 
     /// Reset the KV caches so this instance can serve an unrelated prompt.
     pub fn clear_kv_cache(&mut self) {
-        let dev = self.device.clone();
+        let dev = self.shared.device.clone();
         for (i, kv) in self.kv.iter_mut().enumerate() {
-            match KvState::new(&self.cfg, i, &dev, self.max_seq) {
+            match KvState::new(&self.shared.cfg, i, &dev, self.shared.max_seq) {
                 Ok(n) => *kv = n,
                 Err(e) => eprintln!("deepseek4: failed to reset KV state for layer {i}: {e}"),
             }
