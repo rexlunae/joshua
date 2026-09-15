@@ -331,7 +331,7 @@ impl QuantizedModel {
         // engine will actually serve instead of the model's context length.
         n_ctx: usize,
     ) -> Result<Self> {
-        Self::from_gguf_mmap_placed(gguf, reader, device, device, mmap, file, n_ctx)
+        Self::from_gguf_mmap_placed(gguf, reader, device, device, mmap, file, n_ctx, None)
     }
 
     /// [`QuantizedModel::from_gguf_mmap`] with an explicit device for the
@@ -353,6 +353,7 @@ impl QuantizedModel {
         mmap: Option<std::sync::Arc<memmap2::Mmap>>,
         file: Option<std::sync::Arc<std::fs::File>>,
         n_ctx: usize,
+        device_expert_cache_bytes: Option<u64>,
     ) -> Result<Self> {
         let arch = Architecture::detect(&gguf.metadata).map_err(candle_core::Error::Msg)?;
 
@@ -436,6 +437,7 @@ impl QuantizedModel {
                 device,
                 expert_device,
                 mmap,
+                device_expert_cache_bytes,
             )
             .map(Self::Qwen3Moe),
             Architecture::DeepSeek2 => crate::quantized_deepseek2::ModelWeights::from_gguf_mmap_placed(
@@ -444,6 +446,7 @@ impl QuantizedModel {
                 device,
                 expert_device,
                 mmap,
+                device_expert_cache_bytes,
             )
             .map(Self::DeepSeek2),
             Architecture::DeepSeek4 => crate::quantized_deepseek4::ModelWeights::from_gguf_mmap(
