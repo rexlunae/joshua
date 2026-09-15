@@ -1004,26 +1004,6 @@ impl Engine {
         // drops them.
         let raw = crate::gguf_ext::read_header(&mut Cursor::new(&mmap[..]))
             .map_err(|e| JoshuaError::ModelLoad(format!("GGUF header re-read failed: {e}")))?;
-        let (dense_bytes, expert_bytes) = {
-            let (dense, experts) = weight_ranges(&raw, mmap.len() as u64);
-            let sum = |r: &[ByteRange]| r.iter().map(|(_, len)| *len as u64).sum::<u64>();
-            // A tied output head reloads the embedding table as a second
-            // tensor, so the device holds it twice.
-            (
-                sum(&dense).saturating_add(tied_output_bytes(&raw, false)),
-                sum(&experts),
-            )
-        };
-        // What those sets occupy *on the device*: their quantized bytes on
-        // CUDA/Metal, but f32 on OpenCL, whose storage dequantizes every
-        // uploaded weight (4–16× the on-disk size).
-        let (dense_device_bytes, expert_device_bytes) = if options.backend == ComputeBackend::OpenCl
-            || (options.backend == ComputeBackend::Auto && cfg!(feature = "opencl"))
-        {
-            f32_weight_bytes(&raw)
-        } else {
-            (dense_bytes, expert_bytes)
-        };
 
         // Prefetch and/or lock the always-touched weights, and advise random
         // access on routed experts, when requested.
@@ -1074,6 +1054,28 @@ impl Engine {
                 tracing::warn!("{e} (continuing; an NPU backend may still serve this model)");
                 (None, Some(e))
             }
+        };
+
+        // Dense vs routed-expert bytes, as the loaders will allocate them.
+        let (dense_bytes, expert_bytes) = {
+            let (dense, experts) = weight_ranges(&raw, mmap.len() as u64);
+            let sum = |r: &[ByteRange]| r.iter().map(|(_, len)| *len as u64).sum::<u64>();
+            // A tied output head reloads the embedding table as a second
+            // tensor, so the device holds it twice.
+            (
+                sum(&dense).saturating_add(tied_output_bytes(&raw, arch, false)),
+                sum(&experts),
+            )
+        };
+        // What those sets occupy *on the device*: their quantized bytes on
+        // CUDA/Metal, but f32 on OpenCL, whose storage dequantizes every
+        // uploaded weight (4–16× the on-disk size).
+        let (dense_device_bytes, expert_device_bytes) = if options.backend == ComputeBackend::OpenCl
+            || (options.backend == ComputeBackend::Auto && cfg!(feature = "opencl"))
+        {
+            f32_weight_bytes(&raw, arch)
+        } else {
+            (dense_bytes, expert_bytes)
         };
 
         let eos_token_ids = extract_eos_ids(&gguf, &tokenizer);
@@ -2677,7 +2679,7 @@ fn is_routed_expert(name: &str) -> bool {
 /// f32 (`elem_count × 4` per tensor), split like [`weight_ranges`].  This
 /// is the device footprint on a backend whose storage is dense f32
 /// (OpenCL), where the on-disk quantized size undercounts by 4–16×.
-fn f32_weight_bytes(header: &crate::gguf_ext::GgufHeader) -> (u64, u64) {
+fn f32_weight_bytes(header: &crate::gguf_ext::GgufHeader, arch: Option<Architecture>) -> (u64, u64) {
     let mut dense = 0u64;
     let mut experts = 0u64;
     for (name, info) in &header.tensors {
@@ -2688,7 +2690,7 @@ fn f32_weight_bytes(header: &crate::gguf_ext::GgufHeader) -> (u64, u64) {
             dense = dense.saturating_add(bytes);
         }
     }
-    (dense.saturating_add(tied_output_bytes(header, true)), experts)
+    (dense.saturating_add(tied_output_bytes(header, arch, true)), experts)
 }
 
 /// Extra device bytes a *tied* output head costs: a GGUF without
@@ -2696,16 +2698,21 @@ fn f32_weight_bytes(header: &crate::gguf_ext::GgufHeader) -> (u64, u64) {
 /// time as the output projection, so the table is resident twice — once
 /// as the embedding, once as the head.  `f32` selects the dequantized size
 /// (OpenCL) over the on-disk quantized size.  Zero for an untied model.
-fn tied_output_bytes(header: &crate::gguf_ext::GgufHeader, f32: bool) -> u64 {
-    // Every name a loader accepts for a separate output head: `output.weight`
-    // everywhere, plus the aliases candle's `lfm2` loader probes.
-    const OUTPUT_HEADS: [&str; 4] = [
-        "output.weight",
-        "lm_head.weight",
-        "model.output.weight",
-        "model.lm_head.weight",
-    ];
-    if OUTPUT_HEADS.iter().any(|n| header.tensors.contains_key(*n)) {
+fn tied_output_bytes(
+    header: &crate::gguf_ext::GgufHeader,
+    arch: Option<Architecture>,
+    f32: bool,
+) -> u64 {
+    // The names a loader accepts for a separate output head: `output.weight`
+    // everywhere; candle's `lfm2` loader additionally probes three aliases.
+    // Only that loader honours them — another architecture's loader ignores
+    // such a tensor and still reloads the embedding, so the aliases count
+    // as a head for LFM2 alone.
+    const LFM2_ALIASES: [&str; 3] = ["lm_head.weight", "model.output.weight", "model.lm_head.weight"];
+    let has_head = header.tensors.contains_key("output.weight")
+        || (arch == Some(Architecture::Lfm2)
+            && LFM2_ALIASES.iter().any(|n| header.tensors.contains_key(*n)));
+    if has_head {
         return 0;
     }
     let Some(embd) = header.tensors.get("token_embd.weight") else {
@@ -3635,12 +3642,13 @@ mod tests {
             ]),
             tensor_data_offset: 0,
         };
-        let (dense, experts) = f32_weight_bytes(&header);
+        let q = Some(Architecture::Qwen3Moe);
+        let (dense, experts) = f32_weight_bytes(&header, q);
         assert_eq!(dense, (8 * 16 + 8 * 16 + 8 * 8) * 4);
         assert_eq!(experts, 2 * (4 * 8 * 2) * 4);
         // Untied: the head is its own tensor, nothing extra.
-        assert_eq!(tied_output_bytes(&header, true), 0);
-        assert_eq!(tied_output_bytes(&header, false), 0);
+        assert_eq!(tied_output_bytes(&header, q, true), 0);
+        assert_eq!(tied_output_bytes(&header, q, false), 0);
 
         // Tied output (no `output.weight`): the embedding table is loaded
         // twice, so it counts twice — f32 on OpenCL, quantized elsewhere.
@@ -3648,19 +3656,23 @@ mod tests {
         tied.tensors.remove("output.weight");
         tied.tensors
             .insert("token_embd.weight".to_string(), tensor(vec![256, 4])); // 1024 Q4_K elems
-        let (dense, _) = f32_weight_bytes(&tied);
+        let (dense, _) = f32_weight_bytes(&tied, q);
         assert_eq!(dense, (2 * 256 * 4 + 8 * 8) * 4, "f32 footprint counts the tied table twice");
-        assert_eq!(tied_output_bytes(&tied, true), 256 * 4 * 4);
+        assert_eq!(tied_output_bytes(&tied, q, true), 256 * 4 * 4);
         // Q4_K: 256 elements per 144-byte block → 1024 elems = 576 bytes.
-        assert_eq!(tied_output_bytes(&tied, false), 576);
+        assert_eq!(tied_output_bytes(&tied, q, false), 576);
 
-        // A head under one of LFM2's alias names is a separate tensor the
-        // scan already counted: not tied.
+        // A head under one of LFM2's alias names is a separate tensor that
+        // only the lfm2 loader uses: untied for LFM2, still tied (the
+        // embedding is reloaded, the alias ignored) for every other loader.
         for alias in ["lm_head.weight", "model.output.weight", "model.lm_head.weight"] {
             let mut aliased = tied.clone();
             aliased.tensors.insert(alias.to_string(), tensor(vec![256, 4]));
-            assert_eq!(tied_output_bytes(&aliased, true), 0, "{alias} is an untied head");
-            assert_eq!(tied_output_bytes(&aliased, false), 0, "{alias} is an untied head");
+            let lfm2 = Some(Architecture::Lfm2);
+            assert_eq!(tied_output_bytes(&aliased, lfm2, true), 0, "{alias}: LFM2 head");
+            assert_eq!(tied_output_bytes(&aliased, lfm2, false), 0, "{alias}: LFM2 head");
+            assert_eq!(tied_output_bytes(&aliased, q, true), 256 * 4 * 4, "{alias}: ignored by qwen3moe");
+            assert_eq!(tied_output_bytes(&aliased, None, false), 576, "{alias}: unknown arch stays tied");
         }
     }
 
