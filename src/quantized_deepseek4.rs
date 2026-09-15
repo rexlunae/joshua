@@ -2614,6 +2614,100 @@ impl ModelWeights {
     }
 }
 
+
+// ─── Layer-streaming prefill (shared framework) ──────────────────────────────
+impl crate::stream_prefill::StreamPrefill for ModelWeights {
+    fn n_layers(&self) -> usize {
+        self.layers.len()
+    }
+
+    fn embed_chunk(&self, tokens: &[u32], device: &candle_core::Device) -> Result<Tensor> {
+        let hc = self.hc_mult;
+        let d = self.tok_embeddings.hidden()?;
+        let tok = self
+            .tok_embeddings
+            .forward(&Tensor::new(tokens.to_vec(), device)?.unsqueeze(0)?)?
+            .reshape((1, tokens.len(), d))?;
+        // `xs` form: expand to the hc copies.
+        tok.unsqueeze(2)?.broadcast_as((1, tokens.len(), hc, d))
+    }
+
+    fn apply_layer_chunk(
+        &mut self,
+        l: usize,
+        xs: &Tensor,
+        pos: usize,
+        tokens: &[u32],
+    ) -> Result<Tensor> {
+        let layer = &self.layers[l];
+        let kv = &mut self.kv[l];
+        let hc_eps = self.hc_eps;
+        let sinkhorn = self.cfg.hc_sinkhorn_iters;
+        let max_seq = self.max_seq;
+
+        // hc_pre with attention weights.
+        let (x, post, comb) = hc_pre(
+            xs,
+            &layer.hc_attn_fn,
+            &layer.hc_attn_scale,
+            &layer.hc_attn_base,
+            hc_eps,
+            sinkhorn,
+        )?;
+        let residual = xs.clone();
+        let h = layer.attn_norm.forward(&x)?;
+        let h = layer.attn.forward(kv, &h, pos, max_seq)?;
+        let mut xs = hc_post(&h, &residual, &post, &comb)?;
+
+        // hc_pre with FFN weights, then the MoE block.
+        let (x, post, comb) = hc_pre(
+            &xs,
+            &layer.hc_ffn_fn,
+            &layer.hc_ffn_scale,
+            &layer.hc_ffn_base,
+            hc_eps,
+            sinkhorn,
+        )?;
+        let residual = xs.clone();
+        let h = layer.ffn_norm.forward(&x)?;
+        let input = Tensor::new(tokens.to_vec(), &self.device)?.unsqueeze(0)?;
+        let (h, routed_ids) = layer.ffn.forward(&h, &input)?;
+        self.last_routed[l] = routed_ids;
+        // Advisory: routing recording feeds the (hot-expert) prefetch policy,
+        // never the logits.  Record against a fixed step; prefilter streaming
+        // does not advance the decode clock.
+        let step = self.hot_experts.begin_step(false);
+        self.hot_experts.record(l, &self.last_routed[l], step);
+        Ok(hc_post(&h, &residual, &post, &comb)?)
+    }
+
+    fn final_logits(&self, last: &Tensor) -> Result<Tensor> {
+        let (_, seq_len, hc, d) = last.dims4()?;
+        let flat = last.reshape((seq_len, hc * d))?;
+        let rsqrt = flat
+            .sqr()?
+            .mean_keepdim(D::Minus1)?
+            .affine(1.0, self.hc_eps)?
+            .powf(-0.5)?;
+        let mixes = self.hc_head_fn.forward(&flat)?.broadcast_mul(&rsqrt)?;
+        let pre = sigmoid(
+            &mixes
+                .broadcast_mul(&self.hc_head_scale)?
+                .broadcast_add(&self.hc_head_base)?,
+        )?
+        .affine(1.0, self.hc_eps)?;
+        let y = pre
+            .unsqueeze(D::Minus1)?
+            .broadcast_as((seq_len, hc, d))?
+            .mul(&last.squeeze(0)?)?
+            .sum(D::Minus2)?; // [seq, d]
+        let y = y.narrow(0, seq_len - 1, 1)?;
+        let y = self.norm.forward(&y)?;
+        let logits = self.output.forward(&y)?.to_dtype(DType::F32)?;
+        Ok(logits)
+    }
+}
+
 /// Slice an IQ2_XXS expert tensor (`[n_expert, out, in]`, GGUF dims reversed)
 /// into per-expert [`QMatMul`]s whose blocks stay in the mapping.
 fn split_mxfp4_experts<R: Read + Seek>(

@@ -1187,6 +1187,56 @@ impl GGUFQWenMoE {
     }
 }
 
+// ─── Layer-streaming prefill (shared framework) ──────────────────────────────
+impl crate::stream_prefill::StreamPrefill for GGUFQWenMoE {
+    fn n_layers(&self) -> usize {
+        self.shared.layers.len()
+    }
+
+    fn embed_chunk(&self, tokens: &[u32], device: &candle_core::Device) -> Result<Tensor> {
+        let sh = Arc::clone(&self.shared);
+        sh.tok_embeddings
+            .forward(&Tensor::new(tokens.to_vec(), device)?.unsqueeze(0)?)?
+            .reshape((1, tokens.len(), sh.tok_embeddings.hidden()?))
+    }
+
+    fn apply_layer_chunk(
+        &mut self,
+        l: usize,
+        xs: &Tensor,
+        pos: usize,
+        _tokens: &[u32],
+    ) -> Result<Tensor> {
+        // Chunk-local causal mask: this chunk's tokens attend to all prior
+        // positions ([chunk_len, chunk_len + pos]) — the same causal mask
+        // today's chunked prefill builds for the same `pos`.  Built before
+        // borrowing any field mutably so its &self borrow ends first.
+        let chunk_len = xs.dim(1)?;
+        let mask = self.causal_mask(chunk_len, pos)?;
+        let sh = Arc::clone(&self.shared);
+        let layer = &sh.layers[l];
+        let kv = &mut self.kv[l];
+        let residual = &*xs;
+        let h = layer.attn_norm.forward(xs)?;
+        let h = layer.attn.forward(kv, &h, Some(&mask), pos)?;
+        let xs = (residual + h)?;
+        let residual = &xs;
+        let h = layer.ffn_norm.forward(&xs)?;
+        let (h, routed) = layer.ffn.forward(&h)?;
+        let step = self.hot_experts.begin_step(false);
+        self.hot_experts.record(l, &routed, step);
+        Ok((residual + h)?)
+    }
+
+    fn final_logits(&self, last: &Tensor) -> Result<Tensor> {
+        let sh = Arc::clone(&self.shared);
+        let seq_len = last.dim(1)?;
+        let xs = last.narrow(1, seq_len - 1, 1)?;
+        let xs = sh.norm.forward(&xs)?;
+        sh.output.forward(&xs)?.to_dtype(DType::F32)?.squeeze(1)
+    }
+}
+
 // ─── Unit tests ──────────────────────────────────────────────────────────────
 
 #[cfg(test)]

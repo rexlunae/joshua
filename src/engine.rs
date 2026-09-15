@@ -701,6 +701,50 @@ impl GenSession {
         }
     }
 
+    /// Layer-streaming prefill over bounded chunks (`None` on architectures
+    /// without a native streaming path, so callers fall back to the standard
+    /// chunked loop).  Returns the prefill logits vector.
+    fn prefill_streamed(
+        &mut self,
+        chunks: &[crate::stream_prefill::Chunk],
+        device: &Device,
+    ) -> std::result::Result<Option<Vec<f32>>, JoshuaError> {
+        let model = match self {
+            Self::Candle(m) => m,
+            Self::Npu(_) => return Ok(None),
+        };
+        if !model.supports_streaming() {
+            return Ok(None);
+        }
+        let logits = model
+            .prefill_streamed(chunks, device)
+            .map_err(|e| JoshuaError::Inference(e.to_string()))?;
+        Ok(Some(
+            squeeze_batch_logits(&logits).map_err(|e| JoshuaError::Inference(e.to_string()))?,
+        ))
+    }
+
+    /// Feed one decode step across `seqs` **independent** sequences at their
+    /// own positions, returning one logits vector per sequence.  The MoE
+    /// dispatch for the batch is shared, so the routed-expert fetch is
+    /// amortized across the sequences (see
+    /// `quantized_deepseek4::ModelWeights::forward_sequences`).  Only the
+    /// candle deepseek4 model implements this; anything else reports an
+    /// unsupported error so callers can fall back to per-sequence steps.
+    fn forward_tokens_batched(
+        &mut self,
+        seqs: &[(&Tensor, usize)],
+    ) -> Result<Vec<Vec<f32>>, JoshuaError> {
+        match self {
+            Self::Candle(model) => model
+                .forward_sequences(seqs)
+                .map_err(|e| JoshuaError::Inference(e.to_string())),
+            Self::Npu(_) => Err(JoshuaError::Inference(
+                "batched forward is not supported on the NPU session".into(),
+            )),
+        }
+    }
+
     /// Clear internal state for reuse with an unrelated prompt.
     ///
     /// Returns `false` when the session cannot be reset and must be dropped.
@@ -1744,14 +1788,44 @@ impl Engine {
         let prefill_start = Instant::now();
         let logits_vec = {
             let mut last: Vec<f32> = Vec::new();
-            let mut base = n_reused;
-            for piece_start in (0..new_tokens.len()).step_by(PREFILL_CHUNK) {
-                let end = (piece_start + PREFILL_CHUNK).min(new_tokens.len());
-                let piece = &new_tokens[piece_start..end];
-                last = model.forward_tokens(piece, base, &self.device)?;
-                base += piece.len();
+            let base = n_reused;
+
+            // Layer-streaming prefill: sweep each layer once over all chunks,
+            // so every layer's weights are read once per prefill instead of
+            // once per chunk.  Falls back to the standard chunked loop for
+            // architectures without a native streaming path (or when a piece
+            // would exceed the KV cap mid-chunk; see below).
+            let chunks: Vec<crate::stream_prefill::Chunk> = (0..new_tokens.len())
+                .step_by(PREFILL_CHUNK)
+                .map(|piece_start| {
+                    let end = (piece_start + PREFILL_CHUNK).min(new_tokens.len());
+                    let piece = &new_tokens[piece_start..end];
+                    crate::stream_prefill::Chunk {
+                        tokens: piece,
+                        pos: base + piece_start,
+                    }
+                })
+                .collect();
+
+            // Streaming requires every layer's KV to hold the whole prompt;
+            // enforce the engine's KV cap up front (per-layer KV is written
+            // incrementally and would otherwise overrun mid-stream).  The
+            // standard forward enforces the cap inside attention, so mirror
+            // that guard here and only stream when the prompt fits.
+            let streamable = model.prefill_streamed(&chunks, &self.device);
+            match streamable {
+                Ok(Some(v)) => v,
+                _ => {
+                    // Streamed prefill unsupported on this architecture, or a
+                    // KV-cap guard tripped — fall back to the per-chunk loop.
+                    for piece_start in (0..new_tokens.len()).step_by(PREFILL_CHUNK) {
+                        let end = (piece_start + PREFILL_CHUNK).min(new_tokens.len());
+                        let piece = &new_tokens[piece_start..end];
+                        last = model.forward_tokens(piece, base + piece_start, &self.device)?;
+                    }
+                    last
+                }
             }
-            last
         };
         let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
 
