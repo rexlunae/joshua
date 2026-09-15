@@ -147,8 +147,8 @@ requests uploaded the model 16 times and kept 4 copies warm.
 
 *Fix:* weight sharing (R2) removes the multiplier for `qwen3moe` /
 `deepseek2`: every session shares the one uploaded copy.  For architectures
-whose sessions still own their weights (candle's stock loaders, deepseek4),
-the engine now sizes the default concurrency and the warm-pool cap from the
+whose sessions still own their weights (candle's stock loaders), the engine
+now sizes the default concurrency and the warm-pool cap from the
 device's free memory and the per-session device footprint
 (`placement::instances_for_memory`) when a probe or `--vram-budget` is
 available.
@@ -179,10 +179,9 @@ been in, now with attention and the output head on the GPU.
   CPU — FreeToken's split) is the next step past `host` placement; the
   `WeightCache` in `paged_weights.rs` and the `ExpertResidency` seam are the
   pieces.  Requires a GPU to validate.
-* **deepseek4 weight sharing.**  Its KV is already separate from the
-  weights, so the same `Arc<Shared>` split applies, but the loader is 3 000
-  lines and was not refactored here; on an accelerator its ~8 GiB dense set
-  is still per session, bounded by the new device-aware caps.
+* **deepseek4 weight sharing.**  Done (#63): deepseek4 now uses the same
+  `Arc<Shared>` split as `qwen3moe`/`deepseek2`, so every session shares the
+  one uploaded dense set and costs only its KV cache.
 * **candle's stock loaders** (llama, gemma, …) copy the whole model to the
   heap/device and cannot share weights; they are the vendored crate's
   code.

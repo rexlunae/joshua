@@ -244,9 +244,9 @@ INFO joshua: expert placement: host RAM — experts borrowed from the mapping,
 ```
 
 Two things make a second concurrent conversation cheap on the device.
-Weights of a `qwen3moe` / `deepseek2` model are loaded (and uploaded) once
-and shared by every session: a new session is one reference-count bump plus
-an empty KV cache, never a second copy.  And the token-embedding table is
+Weights of a `qwen3moe` / `deepseek2` / `deepseek4` model are loaded (and
+uploaded) once and shared by every session: a new session is one
+reference-count bump plus an empty KV cache, never a second copy.  And the token-embedding table is
 kept quantized and gathered per row instead of being dequantized to a
 private f32 copy per session (1.2 GB on Qwen3-30B-A3B, 4.7 GB on Kimi-K2).
 For architectures whose sessions still own their weights, the default
