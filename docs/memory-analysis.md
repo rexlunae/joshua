@@ -188,3 +188,9 @@ been in, now with attention and the output head on the GPU.
   code.
 * **Metal memory probe.**  Unified memory: use `--vram-budget` to state
   the budget; `auto` without it keeps today's zero-copy Metal layout.
+* **Loader-derived residency.**  The device accounting keys on tensor
+  names (`engine::residency`) and must be kept in step with what each
+  loader dequantizes.  The lower/upper bounds make a gap harmless rather
+  than wrong, but the cleaner design is for each loader to report the
+  resident form of every tensor it reads, so the accounting cannot drift
+  from the loaders.
