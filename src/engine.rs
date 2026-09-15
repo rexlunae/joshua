@@ -2731,12 +2731,13 @@ const QUANTIZED_MATRIX_STEMS: [&str; 41] = [
 ];
 
 /// Tensor-name stems a loader is known to hold as dequantized f32 on an
-/// accelerator (besides norms and biases, matched by name): routers the
-/// joshua-native loaders read with `f32_tensor`, deepseek2's split-KV halves
-/// (folded into a dense up-projection), deepseek4's hyper-connection and
-/// compressor position vectors, lfm2's conv kernels.
-const F32_STEMS: [&str; 12] = [
-    "ffn_gate_inp",
+/// accelerator (besides norms and biases, matched by name): deepseek2's
+/// split-KV halves (folded into a dense up-projection), deepseek4's
+/// hyper-connection and compressor position vectors, lfm2's conv kernels.
+/// The MoE router (`ffn_gate_inp`) is handled per architecture in
+/// [`residency`]: the joshua-native loaders read it with `f32_tensor`, the
+/// stock `llama` loader (Mixtral) keeps it a quantized `QMatMul`.
+const F32_STEMS: [&str; 11] = [
     "attn_k_b",
     "attn_v_b",
     "hc_attn_base",
@@ -2821,6 +2822,15 @@ fn residency(arch: Option<Architecture>, name: &str, info: &crate::gguf_ext::Raw
         return Residency::F32;
     }
     let stem = tensor_stem(name);
+    if stem == "ffn_gate_inp" {
+        return match arch {
+            Architecture::Llama => Residency::Quantized,
+            Architecture::Qwen3Moe | Architecture::DeepSeek2 | Architecture::DeepSeek4 => {
+                Residency::F32
+            }
+            _ => Residency::Unknown,
+        };
+    }
     if QUANTIZED_MATRIX_STEMS.contains(&stem) {
         Residency::Quantized
     } else if F32_STEMS.contains(&stem) {
@@ -2897,11 +2907,63 @@ fn device_weight_bytes(
     }
     let scanned = scanned_head_bytes(header, dense_f32);
     let resident = resident_head_bytes(header, arch, dense_f32);
+    // Likewise the embedding table: a loader that probes several names
+    // keeps the first it can read, so the tables the scan counted are
+    // replaced by one — the smallest candidate in the lower bound, the
+    // largest in the upper.
+    let (emb_scanned_lo, emb_scanned_hi) = scanned_embedding_bounds(header, arch, dense_f32);
+    let (emb_lo, emb_hi) = resident_embedding_bounds(header, arch, dense_f32);
     DeviceFootprint {
-        dense_lower: lower.saturating_sub(scanned).saturating_add(resident),
-        dense_upper: upper.saturating_sub(scanned).saturating_add(resident),
+        dense_lower: lower
+            .saturating_sub(scanned)
+            .saturating_add(resident)
+            .saturating_sub(emb_scanned_lo)
+            .saturating_add(emb_lo),
+        dense_upper: upper
+            .saturating_sub(scanned)
+            .saturating_add(resident)
+            .saturating_sub(emb_scanned_hi)
+            .saturating_add(emb_hi),
         experts,
     }
+}
+
+/// Summed [`resident_tensor_bounds`] of every embedding-table name `arch`'s
+/// loader probes that is present — what the whole-header scan counted for
+/// the table.
+fn scanned_embedding_bounds(
+    header: &crate::gguf_ext::GgufHeader,
+    arch: Option<Architecture>,
+    dense_f32: bool,
+) -> (u64, u64) {
+    probed_embedding_names(arch)
+        .iter()
+        .filter_map(|n| header.tensors.get(*n).map(|info| (*n, info)))
+        .fold((0u64, 0u64), |(lo, hi), (n, info)| {
+            let (l, h) = resident_tensor_bounds(arch, n, info, dense_f32);
+            (lo.saturating_add(l), hi.saturating_add(h))
+        })
+}
+
+/// Bounds on the one embedding table the loader keeps resident: it takes
+/// the first name it can read, which sizing cannot know, so the lower bound
+/// is the smallest candidate present and the upper the largest.  Zero when
+/// none is present.
+fn resident_embedding_bounds(
+    header: &crate::gguf_ext::GgufHeader,
+    arch: Option<Architecture>,
+    dense_f32: bool,
+) -> (u64, u64) {
+    let mut lo: Option<u64> = None;
+    let mut hi = 0u64;
+    for n in probed_embedding_names(arch) {
+        if let Some(info) = header.tensors.get(*n) {
+            let (l, h) = resident_tensor_bounds(arch, n, info, dense_f32);
+            lo = Some(lo.map_or(l, |x| x.min(l)));
+            hi = hi.max(h);
+        }
+    }
+    (lo.unwrap_or(0), hi)
 }
 
 /// Every tensor name any loader may read as the output head.  `output.weight`
@@ -4016,6 +4078,27 @@ mod tests {
         assert_eq!(resident_head_bytes(&lfm2_embd, q, false), 0);
         assert_eq!(fp(&lfm2_embd, q, false).dense_lower, 576 + 144);
         assert_eq!(fp(&lfm2_embd, q, false).dense_upper, EMBD_F32 + 144);
+
+        // Two embedding names present: the lfm2 loader keeps the first it
+        // can read, so exactly one table is resident — the smaller in the
+        // lower bound, the larger in the upper — plus the tied head copy.
+        let mut two_tables = tied.clone();
+        two_tables.tensors.insert("model.embed_tokens.weight".to_string(), q4k(vec![64, 4])); // 256 elems
+        let t = fp(&two_tables, lfm2, false);
+        assert_eq!(t.dense_lower, 256 * 4 + 144 + 576, "smaller table, f32, plus the head copy");
+        assert_eq!(t.dense_upper, EMBD_F32 + 144 + 576, "larger table, f32, plus the head copy");
+        // Another loader probes only token_embd.weight: the alias is an
+        // unknown tensor, the table is counted once as before.
+        let t = fp(&two_tables, q, false);
+        assert_eq!(t.dense_lower, 576 + 144 + 576 + 144);
+        assert_eq!(t.dense_upper, 576 + 144 + 576 + 256 * 4);
+
+        // The MoE router is per loader: Mixtral (llama) keeps it a quantized
+        // QMatMul, the joshua-native loaders read it as f32.
+        let mut router = base.clone();
+        router.tensors.insert("blk.0.ffn_gate_inp.weight".to_string(), q4k(vec![256, 1]));
+        assert_eq!(fp(&router, llama, false), known(EMBD_F32 + 576 + 144 + 144, 2 * 144));
+        assert_eq!(fp(&router, q, false), known(576 + 576 + 144 + 1024, 2 * 144));
 
         // Several head names present: only one ends up resident.  Sizing
         // cannot know which read succeeds, so it keeps the largest candidate
