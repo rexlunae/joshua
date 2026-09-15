@@ -1060,13 +1060,13 @@ impl Engine {
         let (dense_bytes, expert_bytes) = {
             let (dense, experts) = weight_ranges(&raw, mmap.len() as u64);
             let sum = |r: &[ByteRange]| r.iter().map(|(_, len)| *len as u64).sum::<u64>();
-            // A tied output head reloads the embedding table as a second
-            // tensor, so the device holds it twice; an output alias the
-            // selected loader never reads is never uploaded at all.
+            // Replace every output-head tensor the scan counted with the one
+            // head the loader ends up resident with (the embedding table
+            // again, when the head is tied to it) — see `resident_head_bytes`.
             (
                 sum(&dense)
-                    .saturating_sub(ignored_alias_bytes(&raw, arch, false))
-                    .saturating_add(tied_output_bytes(&raw, arch, false)),
+                    .saturating_sub(scanned_head_bytes(&raw, false))
+                    .saturating_add(resident_head_bytes(&raw, arch, false)),
                 sum(&experts),
             )
         };
@@ -2695,19 +2695,30 @@ fn f32_weight_bytes(header: &crate::gguf_ext::GgufHeader, arch: Option<Architect
     }
     (
         dense
-            .saturating_sub(ignored_alias_bytes(header, arch, true))
-            .saturating_add(tied_output_bytes(header, arch, true)),
+            .saturating_sub(scanned_head_bytes(header, true))
+            .saturating_add(resident_head_bytes(header, arch, true)),
         experts,
     )
 }
 
-/// The output-head names candle's `lfm2` loader probes besides
-/// `output.weight`.  No other loader reads them.
-const LFM2_OUTPUT_ALIASES: [&str; 3] = [
+/// Every tensor name any loader may read as the output head.  `output.weight`
+/// is universal; candle's `lfm2` loader additionally probes the three
+/// aliases, in this order, and stops at the first one it can read.
+const OUTPUT_HEAD_NAMES: [&str; 4] = [
+    "output.weight",
     "lm_head.weight",
     "model.output.weight",
     "model.lm_head.weight",
 ];
+
+/// The head names `arch`'s loader probes, in its precedence order.
+fn probed_head_names(arch: Option<Architecture>) -> &'static [&'static str] {
+    if arch == Some(Architecture::Lfm2) {
+        &OUTPUT_HEAD_NAMES
+    } else {
+        &OUTPUT_HEAD_NAMES[..1]
+    }
+}
 
 /// Bytes of the tensor `name` in the header: dequantized f32 when `f32`,
 /// otherwise its on-disk quantized size.  Zero when absent or of a dtype
@@ -2725,59 +2736,36 @@ fn tensor_bytes(header: &crate::gguf_ext::GgufHeader, name: &str, f32: bool) -> 
     }
 }
 
-/// Bytes of output-head tensors present in the file that the selected
-/// loader never reads (and so never uploads).  Every loader probes
-/// `output.weight`; the `lfm2` loader then tries the three aliases in
-/// order and stops at the first hit, so under LFM2 exactly one of the four
-/// names is loaded and any others present are dead weight, while under any
-/// other architecture all three aliases are.  The whole-file scans count
-/// every tensor, so this is subtracted from the dense figure.
-fn ignored_alias_bytes(
-    header: &crate::gguf_ext::GgufHeader,
-    arch: Option<Architecture>,
-    f32: bool,
-) -> u64 {
-    const ALL_HEADS: [&str; 4] = [
-        "output.weight",
-        LFM2_OUTPUT_ALIASES[0],
-        LFM2_OUTPUT_ALIASES[1],
-        LFM2_OUTPUT_ALIASES[2],
-    ];
-    // The names this architecture's loader probes, in its precedence order.
-    let probed: &[&str] = if arch == Some(Architecture::Lfm2) {
-        &ALL_HEADS
-    } else {
-        &ALL_HEADS[..1]
-    };
-    let selected = probed.iter().find(|n| header.tensors.contains_key(**n));
-    ALL_HEADS
+/// Bytes of every output-head-named tensor present in the file — what the
+/// whole-file scans counted for the head, whether or not a loader reads it.
+fn scanned_head_bytes(header: &crate::gguf_ext::GgufHeader, f32: bool) -> u64 {
+    OUTPUT_HEAD_NAMES
         .iter()
-        .filter(|n| Some(*n) != selected)
         .fold(0u64, |acc, n| acc.saturating_add(tensor_bytes(header, n, f32)))
 }
 
-/// Extra device bytes a *tied* output head costs: a GGUF without
-/// `output.weight` makes the loaders load `token_embd.weight` a second
-/// time as the output projection, so the table is resident twice — once
-/// as the embedding, once as the head.  `f32` selects the dequantized size
-/// (OpenCL) over the on-disk quantized size.  Zero for an untied model.
-fn tied_output_bytes(
+/// Bytes of the output head the loader ends up with on the device, sized
+/// conservatively.  A loader probes its head names in order and takes the
+/// first it can *read* — a present-but-unreadable tensor (bad block count,
+/// truncated data) is skipped, not fatal — and falls back to reloading
+/// `token_embd.weight` as the head when none reads, so the embedding is
+/// then resident twice.  Sizing cannot know which read succeeds without
+/// loading, so it takes the largest of the candidates the loader could end
+/// up with: every probed head present, and the embedding-table fallback.
+/// That never undercounts; at worst it overcounts by the size difference
+/// between a head and the embedding (same shape, possibly a different
+/// dtype).  Head tensors the loader never probes are not candidates.
+fn resident_head_bytes(
     header: &crate::gguf_ext::GgufHeader,
     arch: Option<Architecture>,
     f32: bool,
 ) -> u64 {
-    // The names a loader accepts for a separate output head: `output.weight`
-    // everywhere; candle's `lfm2` loader additionally probes three aliases.
-    // Only that loader honours them — another architecture's loader ignores
-    // such a tensor and still reloads the embedding, so the aliases count
-    // as a head for LFM2 alone.
-    let has_head = header.tensors.contains_key("output.weight")
-        || (arch == Some(Architecture::Lfm2)
-            && LFM2_OUTPUT_ALIASES.iter().any(|n| header.tensors.contains_key(*n)));
-    if has_head {
-        return 0;
-    }
-    tensor_bytes(header, "token_embd.weight", f32)
+    probed_head_names(arch)
+        .iter()
+        .map(|n| tensor_bytes(header, n, f32))
+        .chain(std::iter::once(tensor_bytes(header, "token_embd.weight", f32)))
+        .max()
+        .unwrap_or(0)
 }
 
 /// Byte ranges of the model file holding dense vs routed-expert weights.
@@ -3674,7 +3662,8 @@ mod tests {
     // ─── Hot-weight pinning ────────────────────────────────────────────────
 
     /// The f32 device footprint counts elements, not on-disk bytes, split
-    /// by the same dense/expert rule as the byte ranges.
+    /// by the same dense/expert rule as the byte ranges, with the output
+    /// head accounted as the loader leaves it resident.
     #[test]
     fn f32_weight_bytes_counts_elements_by_set() {
         use std::collections::HashMap;
@@ -3696,72 +3685,67 @@ mod tests {
             tensor_data_offset: 0,
         };
         let q = Some(Architecture::Qwen3Moe);
+        let lfm2 = Some(Architecture::Lfm2);
+        // Untied: the head is its own tensor, counted once.
         let (dense, experts) = f32_weight_bytes(&header, q);
         assert_eq!(dense, (8 * 16 + 8 * 16 + 8 * 8) * 4);
         assert_eq!(experts, 2 * (4 * 8 * 2) * 4);
-        // Untied: the head is its own tensor, nothing extra.
-        assert_eq!(tied_output_bytes(&header, q, true), 0);
-        assert_eq!(tied_output_bytes(&header, q, false), 0);
+        assert_eq!(scanned_head_bytes(&header, true), 8 * 16 * 4);
+        assert_eq!(resident_head_bytes(&header, q, true), 8 * 16 * 4);
 
-        // Tied output (no `output.weight`): the embedding table is loaded
-        // twice, so it counts twice — f32 on OpenCL, quantized elsewhere.
+        // Tied output (no head tensor): the embedding table is loaded twice,
+        // so it counts twice — f32 on OpenCL, quantized elsewhere.
         let mut tied = header;
         tied.tensors.remove("output.weight");
         tied.tensors
             .insert("token_embd.weight".to_string(), tensor(vec![256, 4])); // 1024 Q4_K elems
         let (dense, _) = f32_weight_bytes(&tied, q);
         assert_eq!(dense, (2 * 256 * 4 + 8 * 8) * 4, "f32 footprint counts the tied table twice");
-        assert_eq!(tied_output_bytes(&tied, q, true), 256 * 4 * 4);
+        assert_eq!(scanned_head_bytes(&tied, true), 0);
+        assert_eq!(resident_head_bytes(&tied, q, true), 256 * 4 * 4);
         // Q4_K: 256 elements per 144-byte block → 1024 elems = 576 bytes.
-        assert_eq!(tied_output_bytes(&tied, q, false), 576);
+        assert_eq!(resident_head_bytes(&tied, None, false), 576, "unknown arch: tied too");
 
-        // A head under one of LFM2's alias names is a separate tensor that
-        // only the lfm2 loader uses: untied for LFM2, still tied (the
-        // embedding is reloaded, the alias ignored) for every other loader.
+        // An LFM2 alias is a head for the lfm2 loader (counted once, no tied
+        // copy) and dead weight for every other loader (excluded, embedding
+        // still tied).
         for alias in ["lm_head.weight", "model.output.weight", "model.lm_head.weight"] {
             let mut aliased = tied.clone();
             aliased.tensors.insert(alias.to_string(), tensor(vec![256, 4]));
-            let lfm2 = Some(Architecture::Lfm2);
-            assert_eq!(tied_output_bytes(&aliased, lfm2, true), 0, "{alias}: LFM2 head");
-            assert_eq!(tied_output_bytes(&aliased, lfm2, false), 0, "{alias}: LFM2 head");
-            assert_eq!(tied_output_bytes(&aliased, q, true), 256 * 4 * 4, "{alias}: ignored by qwen3moe");
-            assert_eq!(tied_output_bytes(&aliased, None, false), 576, "{alias}: unknown arch stays tied");
-            // …and the ignored alias itself is never uploaded, so the dense
-            // total for a non-LFM2 model excludes it: embedding twice + attn_q.
-            let (dense, _) = f32_weight_bytes(&aliased, q);
-            assert_eq!(dense, (2 * 256 * 4 + 8 * 8) * 4, "{alias}: unused alias not counted");
-            assert_eq!(ignored_alias_bytes(&aliased, q, false), 576, "{alias}: quantized size");
-            // For LFM2 the alias is the head: counted once, no tied copy.
+            assert_eq!(scanned_head_bytes(&aliased, true), 256 * 4 * 4, "{alias}: scanned");
             let (dense, _) = f32_weight_bytes(&aliased, lfm2);
-            assert_eq!(dense, (256 * 4 + 256 * 4 + 8 * 8) * 4, "{alias}: LFM2 head counted once");
-            assert_eq!(ignored_alias_bytes(&aliased, lfm2, true), 0);
+            assert_eq!(dense, (2 * 256 * 4 + 8 * 8) * 4, "{alias}: LFM2 head counted once");
+            let (dense, _) = f32_weight_bytes(&aliased, q);
+            assert_eq!(dense, (2 * 256 * 4 + 8 * 8) * 4, "{alias}: unused alias dropped, embedding tied");
+            assert_eq!(scanned_head_bytes(&aliased, false), 576, "{alias}: quantized size");
         }
 
-        // The lfm2 loader stops at the first head name it finds, in order:
-        // every other head tensor present is never uploaded.
-        let lfm2 = Some(Architecture::Lfm2);
+        // Several head names present: only one ends up resident.  Sizing
+        // cannot know which read succeeds, so it keeps the largest candidate
+        // — here the big `lm_head.weight` over a small (possibly unreadable)
+        // `output.weight` — and never undercounts.
         let mut two = tied.clone();
-        two.tensors.insert("output.weight".to_string(), tensor(vec![256, 4]));
-        two.tensors.insert("lm_head.weight".to_string(), tensor(vec![128, 4]));
-        assert_eq!(ignored_alias_bytes(&two, lfm2, true), 128 * 4 * 4, "lm_head loses to output.weight");
+        two.tensors.insert("output.weight".to_string(), tensor(vec![64, 4]));
+        two.tensors.insert("lm_head.weight".to_string(), tensor(vec![256, 4]));
+        assert_eq!(scanned_head_bytes(&two, true), (64 * 4 + 256 * 4) * 4);
+        assert_eq!(resident_head_bytes(&two, lfm2, true), 256 * 4 * 4, "largest LFM2 candidate");
         let (dense, _) = f32_weight_bytes(&two, lfm2);
-        assert_eq!(dense, (256 * 4 + 256 * 4 + 8 * 8) * 4, "only output.weight is counted");
-        // Under another architecture output.weight is the head too and the
-        // alias is dead weight either way.
-        assert_eq!(ignored_alias_bytes(&two, q, true), 128 * 4 * 4);
+        assert_eq!(dense, (256 * 4 + 256 * 4 + 8 * 8) * 4, "one head resident, sized as the largest");
+        // Another architecture never reads the alias: its candidates are
+        // output.weight and the embedding fallback, and the embedding wins.
+        assert_eq!(resident_head_bytes(&two, q, true), 256 * 4 * 4);
+        let (dense, _) = f32_weight_bytes(&two, q);
+        assert_eq!(dense, (256 * 4 + 256 * 4 + 8 * 8) * 4);
 
+        // Two aliases, no output.weight: LFM2 keeps the larger candidate
+        // (the embedding fallback here, larger than either alias).
         let mut aliases_only = tied.clone();
         aliases_only.tensors.insert("model.lm_head.weight".to_string(), tensor(vec![64, 4]));
         aliases_only.tensors.insert("lm_head.weight".to_string(), tensor(vec![128, 4]));
-        assert_eq!(
-            ignored_alias_bytes(&aliases_only, lfm2, true),
-            64 * 4 * 4,
-            "lm_head.weight precedes model.lm_head.weight"
-        );
-        assert_eq!(tied_output_bytes(&aliases_only, lfm2, true), 0, "LFM2 has a head");
-        // Non-LFM2: both aliases ignored, embedding tied.
-        assert_eq!(ignored_alias_bytes(&aliases_only, q, true), (64 + 128) * 4 * 4);
-        assert_eq!(tied_output_bytes(&aliases_only, q, true), 256 * 4 * 4);
+        assert_eq!(scanned_head_bytes(&aliases_only, true), (64 * 4 + 128 * 4) * 4);
+        assert_eq!(resident_head_bytes(&aliases_only, lfm2, true), 256 * 4 * 4);
+        let (dense, _) = f32_weight_bytes(&aliases_only, lfm2);
+        assert_eq!(dense, (2 * 256 * 4 + 8 * 8) * 4);
     }
 
     fn header_with_tensors(
