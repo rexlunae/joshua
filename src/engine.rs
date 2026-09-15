@@ -2725,20 +2725,34 @@ fn tensor_bytes(header: &crate::gguf_ext::GgufHeader, name: &str, f32: bool) -> 
     }
 }
 
-/// Bytes of output-head alias tensors present in the file that the
-/// selected loader never reads (and so never uploads): the LFM2 aliases in
-/// any file that is not an LFM2 model.  The whole-file scans count every
-/// tensor, so this is subtracted from the dense figure.
+/// Bytes of output-head tensors present in the file that the selected
+/// loader never reads (and so never uploads).  Every loader probes
+/// `output.weight`; the `lfm2` loader then tries the three aliases in
+/// order and stops at the first hit, so under LFM2 exactly one of the four
+/// names is loaded and any others present are dead weight, while under any
+/// other architecture all three aliases are.  The whole-file scans count
+/// every tensor, so this is subtracted from the dense figure.
 fn ignored_alias_bytes(
     header: &crate::gguf_ext::GgufHeader,
     arch: Option<Architecture>,
     f32: bool,
 ) -> u64 {
-    if arch == Some(Architecture::Lfm2) {
-        return 0;
-    }
-    LFM2_OUTPUT_ALIASES
+    const ALL_HEADS: [&str; 4] = [
+        "output.weight",
+        LFM2_OUTPUT_ALIASES[0],
+        LFM2_OUTPUT_ALIASES[1],
+        LFM2_OUTPUT_ALIASES[2],
+    ];
+    // The names this architecture's loader probes, in its precedence order.
+    let probed: &[&str] = if arch == Some(Architecture::Lfm2) {
+        &ALL_HEADS
+    } else {
+        &ALL_HEADS[..1]
+    };
+    let selected = probed.iter().find(|n| header.tensors.contains_key(**n));
+    ALL_HEADS
         .iter()
+        .filter(|n| Some(*n) != selected)
         .fold(0u64, |acc, n| acc.saturating_add(tensor_bytes(header, n, f32)))
 }
 
@@ -3722,6 +3736,32 @@ mod tests {
             assert_eq!(dense, (256 * 4 + 256 * 4 + 8 * 8) * 4, "{alias}: LFM2 head counted once");
             assert_eq!(ignored_alias_bytes(&aliased, lfm2, true), 0);
         }
+
+        // The lfm2 loader stops at the first head name it finds, in order:
+        // every other head tensor present is never uploaded.
+        let lfm2 = Some(Architecture::Lfm2);
+        let mut two = tied.clone();
+        two.tensors.insert("output.weight".to_string(), tensor(vec![256, 4]));
+        two.tensors.insert("lm_head.weight".to_string(), tensor(vec![128, 4]));
+        assert_eq!(ignored_alias_bytes(&two, lfm2, true), 128 * 4 * 4, "lm_head loses to output.weight");
+        let (dense, _) = f32_weight_bytes(&two, lfm2);
+        assert_eq!(dense, (256 * 4 + 256 * 4 + 8 * 8) * 4, "only output.weight is counted");
+        // Under another architecture output.weight is the head too and the
+        // alias is dead weight either way.
+        assert_eq!(ignored_alias_bytes(&two, q, true), 128 * 4 * 4);
+
+        let mut aliases_only = tied.clone();
+        aliases_only.tensors.insert("model.lm_head.weight".to_string(), tensor(vec![64, 4]));
+        aliases_only.tensors.insert("lm_head.weight".to_string(), tensor(vec![128, 4]));
+        assert_eq!(
+            ignored_alias_bytes(&aliases_only, lfm2, true),
+            64 * 4 * 4,
+            "lm_head.weight precedes model.lm_head.weight"
+        );
+        assert_eq!(tied_output_bytes(&aliases_only, lfm2, true), 0, "LFM2 has a head");
+        // Non-LFM2: both aliases ignored, embedding tied.
+        assert_eq!(ignored_alias_bytes(&aliases_only, q, true), (64 + 128) * 4 * 4);
+        assert_eq!(tied_output_bytes(&aliases_only, q, true), 256 * 4 * 4);
     }
 
     fn header_with_tensors(
