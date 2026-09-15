@@ -783,7 +783,6 @@ mod tests {
         assert_eq!(v, vec![1.5f32, 2.0, 3.0, -4.5]);
         Ok(())
     }
-}
 
     /// M5 parity: for each candidate op, compute on Cpu and on OpenCl (native kernels,
     /// enabled only when JOSHUA_OPENCL_NATIVE=1) and require near-identical results.
@@ -859,3 +858,4 @@ mod tests {
         eprintln!("opencl parity: all wired ops OK");
         Ok(())
     }
+}
