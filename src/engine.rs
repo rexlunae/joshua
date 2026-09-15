@@ -111,6 +111,7 @@ use tokenizers::Tokenizer;
 use crate::embedding::EmbeddingModel;
 use crate::model::{Architecture, QuantizedModel};
 use crate::npu::{NpuBackend, NpuSession};
+pub use crate::placement::ExpertPlacement;
 use crate::template::ChatTemplate;
 
 use crate::error::{JoshuaError, Result};
@@ -361,6 +362,23 @@ pub struct EngineOptions {
     /// of taking [`EngineOptions::pin_hot_experts`] verbatim.  `auto` sizing
     /// wins when set; `pin_hot_experts` remains the explicit override.
     pub expert_cache_auto: bool,
+    /// Where a sparse MoE model's routed experts live when inference runs on
+    /// an accelerator: uploaded to the device, or kept in host RAM (borrowed
+    /// from the mapping, run on the CPU expert kernels, activations hopping
+    /// across per layer).  [`ExpertPlacement::Auto`] (the default) uploads
+    /// them only when the whole model fits the device's free memory with
+    /// headroom — probed with `cudaMemGetInfo` on CUDA, or taken from
+    /// [`EngineOptions::device_memory_budget`] — and otherwise keeps them on
+    /// the host, which is what runs a model larger than VRAM.  Ignored on the
+    /// CPU device.  Wired for `qwen3moe` and `deepseek2`; `deepseek4` always
+    /// keeps a mapped model's experts on the host.
+    pub expert_placement: ExpertPlacement,
+    /// Bytes of accelerator memory the model may use, overriding the probe
+    /// for the [`ExpertPlacement::Auto`] decision and the per-device session
+    /// cap.  `None` uses the probe where one exists.  This is the knob for
+    /// backends without a probe (Metal's unified memory, OpenCL) and for
+    /// sharing a card with other processes.
+    pub device_memory_budget: Option<u64>,
 }
 
 impl EngineOptions {
@@ -429,6 +447,20 @@ impl EngineOptions {
     /// [`EngineOptions::expert_cache_auto`].
     pub fn expert_cache_auto(mut self, auto: bool) -> Self {
         self.expert_cache_auto = auto;
+        self
+    }
+
+    /// Choose where the routed experts of a MoE model live on an
+    /// accelerator.  See [`EngineOptions::expert_placement`].
+    pub fn expert_placement(mut self, placement: ExpertPlacement) -> Self {
+        self.expert_placement = placement;
+        self
+    }
+
+    /// Cap the accelerator memory the model may use (bytes).  See
+    /// [`EngineOptions::device_memory_budget`].
+    pub fn device_memory_budget(mut self, bytes: Option<u64>) -> Self {
+        self.device_memory_budget = bytes;
         self
     }
 }
@@ -511,6 +543,23 @@ pub struct Engine {
     /// Compute device: CUDA or Metal when built with the matching feature
     /// (falling back to CPU if unavailable at runtime), CPU otherwise.
     device: Device,
+    /// Device the routed-expert pool of a MoE model is built on: `device`,
+    /// or the CPU when the experts stay in host RAM (see
+    /// [`EngineOptions::expert_placement`]).
+    expert_device: Device,
+    /// The one fully loaded instance of a weight-sharing architecture
+    /// (`qwen3moe`, `deepseek2`), never used for inference itself: every
+    /// session is derived from it with [`QuantizedModel::new_session`] and
+    /// shares its weights, so concurrent requests cost one KV cache each
+    /// rather than one copy — on an accelerator, one upload — of the model.
+    /// `None` until the first load, and always for architectures whose
+    /// instances own their weights.
+    weights_template: Mutex<Option<QuantizedModel>>,
+    /// Cap on idle sessions kept warm for architectures whose sessions each
+    /// carry a full copy of the weights on an accelerator, sized from the
+    /// device's memory at load (see [`crate::placement::instances_for_memory`]).
+    /// `None` leaves the pool on the RAM-adaptive rule.
+    device_session_cap: Option<usize>,
     /// Why the candle path cannot load this model, if it cannot.
     ///
     /// `Engine` construction succeeds even for architectures candle has no
@@ -948,10 +997,21 @@ impl Engine {
         let gguf = read_gguf_header(&mmap)
             .map_err(|e| JoshuaError::ModelLoad(format!("GGUF read failed: {e}")))?;
 
+        // The raw header keeps every tensor's dtype id, so tensors in dtypes
+        // candle cannot name (IQ2_XXS, I32, MXFP4) are still classified into
+        // the dense / routed-expert split that hot-weight pinning and the
+        // expert placement below both need; the projected `Content` above
+        // drops them.
+        let raw = crate::gguf_ext::read_header(&mut Cursor::new(&mmap[..]))
+            .map_err(|e| JoshuaError::ModelLoad(format!("GGUF header re-read failed: {e}")))?;
+        let (dense_bytes, expert_bytes) = {
+            let (dense, experts) = weight_ranges(&raw, mmap.len() as u64);
+            let sum = |r: &[ByteRange]| r.iter().map(|(_, len)| *len as u64).sum::<u64>();
+            (sum(&dense), sum(&experts))
+        };
+
         // Prefetch and/or lock the always-touched weights, and advise random
-        // access on routed experts, when requested.  The raw header is used so
-        // tensors in dtypes candle cannot name (IQ2_XXS, I32, MXFP4) are still
-        // classified; the projected `Content` above drops them.
+        // access on routed experts, when requested.
         if hot_pinning {
             if matches!(options.huge_pages, HugePages::Explicit(_)) {
                 tracing::warn!(
@@ -960,10 +1020,6 @@ impl Engine {
                      resident. Use --huge-pages transparent (or none) for either to matter."
                 );
             } else {
-                let raw =
-                    crate::gguf_ext::read_header(&mut Cursor::new(&mmap[..])).map_err(|e| {
-                        JoshuaError::ModelLoad(format!("GGUF header re-read failed: {e}"))
-                    })?;
                 // A whole-file prefetch already covers the dense ranges, so the
                 // dense WILLNEED is skipped; the expert RANDOM advice (and any
                 // mlock) still apply.
@@ -1009,6 +1065,64 @@ impl Engine {
         let chat_template = extract_chat_template(&gguf, &tokenizer);
         let device = Self::resolve_device(options.backend)?;
 
+        // Memory placement on an accelerator: where the routed experts live,
+        // and how many full weight copies the device can hold for the
+        // architectures whose sessions cannot share one.
+        let device_budget = options
+            .device_memory_budget
+            .or_else(|| crate::placement::device_memory_info(&device).map(|(free, _)| free));
+        let placement = crate::placement::resolve_expert_placement(
+            options.expert_placement,
+            crate::placement::DeviceProfile {
+                is_cpu: device.is_cpu(),
+                dense_only: device.is_opencl(),
+                free_bytes: device_budget,
+            },
+            dense_bytes,
+            expert_bytes,
+            crate::placement::DEVICE_PLACEMENT_HEADROOM,
+        );
+        let expert_device = match placement {
+            crate::placement::ResolvedPlacement::Host => Device::Cpu,
+            crate::placement::ResolvedPlacement::Device => device.clone(),
+        };
+        let shares_weights = arch.is_some_and(|a| a.shares_weights());
+        // Device memory one session's weights occupy (0 when sessions share
+        // the template's weights and only add a KV cache).
+        let instance_device_bytes = if device.is_cpu() || shares_weights {
+            0
+        } else if expert_device.is_cpu() {
+            dense_bytes
+        } else {
+            dense_bytes.saturating_add(expert_bytes)
+        };
+        let device_session_cap = match (device_budget, instance_device_bytes) {
+            (Some(free), bytes) if bytes > 0 => Some(crate::placement::instances_for_memory(
+                free,
+                bytes,
+                crate::placement::DEVICE_PLACEMENT_HEADROOM,
+                MAX_CACHED_MODELS,
+            )),
+            _ => None,
+        };
+        if !device.is_cpu() && expert_bytes > 0 {
+            tracing::info!(
+                "expert placement: {} (dense {:.1} GiB, experts {:.1} GiB, device budget {}, requested {:?})",
+                match placement {
+                    crate::placement::ResolvedPlacement::Host =>
+                        "host RAM — experts borrowed from the mapping, dense set on the device",
+                    crate::placement::ResolvedPlacement::Device => "device",
+                },
+                dense_bytes as f64 / 2f64.powi(30),
+                expert_bytes as f64 / 2f64.powi(30),
+                match device_budget {
+                    Some(b) => format!("{:.1} GiB", b as f64 / 2f64.powi(30)),
+                    None => "unknown".to_string(),
+                },
+                options.expert_placement,
+            );
+        }
+
         tracing::info!(
             "Model '{}' ready (arch={}, ctx={}, eos_ids={:?}, chat_template={}, device={:?})",
             display_name,
@@ -1028,10 +1142,31 @@ impl Engine {
         // Default the concurrency cap to the machine's parallelism: running
         // more heavyweight generations at once than the CPU can serve gains
         // no throughput and only multiplies peak memory.  Operators tune it
-        // with `with_max_concurrency`.
-        let max_concurrency = std::thread::available_parallelism()
+        // with `with_max_concurrency`.  On an accelerator where every session
+        // carries its own copy of the weights, the device's memory is the
+        // real bound: a CPU-count of concurrent uploads would exhaust it.
+        let cpu_parallelism = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4);
+        let max_concurrency = match (device_budget, instance_device_bytes) {
+            (Some(free), bytes) if bytes > 0 => {
+                let n = crate::placement::instances_for_memory(
+                    free,
+                    bytes,
+                    crate::placement::DEVICE_PLACEMENT_HEADROOM,
+                    cpu_parallelism,
+                );
+                if n < cpu_parallelism {
+                    tracing::info!(
+                        "device memory fits {n} model instance(s) of {:.1} GiB — capping \
+                         concurrency at {n} (override with --max-concurrency)",
+                        bytes as f64 / 2f64.powi(30)
+                    );
+                }
+                n
+            }
+            _ => cpu_parallelism,
+        };
 
         Ok(Self {
             model_path: gguf_path,
@@ -1054,6 +1189,9 @@ impl Engine {
             pin_hot_experts,
             expert_cache_auto,
             device,
+            expert_device,
+            weights_template: Mutex::new(None),
+            device_session_cap,
             arch_error,
         })
     }
@@ -1192,6 +1330,29 @@ impl Engine {
     /// Context-window size in tokens.
     pub fn n_ctx(&self) -> u32 {
         self.n_ctx
+    }
+
+    /// Device the routed-expert pool of a MoE model lives on: the compute
+    /// device, or the CPU when the experts stay in host RAM (see
+    /// [`EngineOptions::expert_placement`]).
+    pub fn expert_device(&self) -> &Device {
+        &self.expert_device
+    }
+
+    /// Number of sessions currently sharing the loaded weights of a
+    /// weight-sharing architecture (the template counts as one), or 0 when
+    /// no such template has been loaded.  Diagnostics.
+    pub fn shared_weight_sessions(&self) -> usize {
+        self.weights_template
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .map(|m| match m {
+                QuantizedModel::Qwen3Moe(m) => m.shared_session_count(),
+                QuantizedModel::DeepSeek2(m) => m.shared_session_count(),
+                _ => 1,
+            })
+            .unwrap_or(0)
     }
 
     /// The compute device inference runs on (CPU, or Metal/CUDA when the
@@ -2118,12 +2279,25 @@ impl Engine {
         // concurrent requests REUSE one loaded model (and one GPU upload) rather
         // than each load+upload its own working set — that is the "share
         // immutable weights across sessions" win (#5), bounded by memory.
-        let pool_cap: usize = match crate::placement::available_ram_bytes() {
+        let mut pool_cap: usize = match crate::placement::available_ram_bytes() {
             Some(free) if free < LOW_MEM_FLOOR => 0,
             Some(free) if free < LOW_MEM_FLOOR * 2 => 1,
             Some(free) if free >= MAX_CACHED_MODELS_MEM_HEADROOM => MAX_CACHED_MODELS_MEM,
             _ => MAX_CACHED_MODELS,
         };
+        // On an accelerator, a session of an architecture that cannot share
+        // weights is a whole copy of the model in device memory; the device
+        // budget, not free RAM, bounds how many can stay warm.  Sessions
+        // derived from the shared template are only a KV cache and keep the
+        // RAM rule.
+        if let Some(cap) = self.device_session_cap {
+            let owns_weights = pool
+                .last()
+                .is_some_and(|c| matches!(&c.session, GenSession::Candle(m) if !m.supports_shared_weights()));
+            if owns_weights {
+                pool_cap = pool_cap.min(cap);
+            }
+        }
         while pool.len() > pool_cap {
             pool.remove(0);
         }
@@ -2149,15 +2323,29 @@ impl Engine {
             };
             return Err(JoshuaError::ModelLoad(msg));
         }
+        // Weight-sharing architectures load once: the first load becomes the
+        // template and every session — this one included — is derived from
+        // it, sharing the weights and adding only a KV cache.  The template
+        // lock is held across the load so two first requests cannot race
+        // into two uploads; later callers find the template and derive a
+        // session in microseconds.
+        let mut template = self
+            .weights_template
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(session) = template.as_ref().and_then(|t| t.new_session()) {
+            return Ok(session);
+        }
         let mut cursor = Cursor::new(&self.mmap[..]);
         let gguf = read_gguf_header(&self.mmap)
             .map_err(|e| JoshuaError::ModelLoad(format!("GGUF read failed: {e}")))?;
         // Hand the loader the mapping so architectures Joshua implements
         // itself can borrow weights in place rather than copying them.
-        let mut model = QuantizedModel::from_gguf_mmap(
+        let mut model = QuantizedModel::from_gguf_mmap_placed(
             gguf,
             &mut cursor,
             &self.device,
+            &self.expert_device,
             Some(Arc::clone(&self.mmap)),
             self.model_file.clone(),
             self.n_ctx as usize,
@@ -2169,7 +2357,16 @@ impl Engine {
             self.pin_hot_experts
         };
         model.set_pin_hot_experts(budget);
-        Ok(model)
+        match model.new_session() {
+            Some(session) => {
+                tracing::info!(
+                    "weights loaded once and shared: every session adds only its KV cache"
+                );
+                *template = Some(model);
+                Ok(session)
+            }
+            None => Ok(model),
+        }
     }
 
     /// Phase-5 automatic sizing: pick the hot-expert budget from available

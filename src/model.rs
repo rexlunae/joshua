@@ -233,6 +233,13 @@ impl Architecture {
 
     /// Whether `name` appears in llama.cpp's architecture registry (either
     /// supported here or known-but-unimplemented).
+    /// Whether this architecture's loader keeps its weights behind a shared
+    /// handle so sessions can be derived without copying them (see
+    /// [`QuantizedModel::new_session`]).
+    pub fn shares_weights(&self) -> bool {
+        matches!(self, Self::Qwen3Moe | Self::DeepSeek2)
+    }
+
     pub fn is_known_llama_cpp_arch(name: &str) -> bool {
         Self::from_name(name).is_some() || KNOWN_UNSUPPORTED_ARCHS.contains(&name)
     }
@@ -314,6 +321,29 @@ impl QuantizedModel {
         // engine will actually serve instead of the model's context length.
         n_ctx: usize,
     ) -> Result<Self> {
+        Self::from_gguf_mmap_placed(gguf, reader, device, device, mmap, file, n_ctx)
+    }
+
+    /// [`QuantizedModel::from_gguf_mmap`] with an explicit device for the
+    /// routed-expert pool of a sparse MoE model.
+    ///
+    /// The dense set always goes to `device`.  With `expert_device` the CPU
+    /// on an accelerator model, the MoE loaders (`qwen3moe`, `deepseek2`)
+    /// keep the routed experts in host RAM — borrowed from the mapping and
+    /// run through the CPU expert kernels, with each layer's MoE activations
+    /// hopping across the bus — which is what runs a model larger than the
+    /// device's memory (see [`crate::placement::ExpertPlacement`]).
+    /// `deepseek4` always keeps a mapped model's experts on the CPU, and
+    /// dense architectures ignore the parameter.
+    pub fn from_gguf_mmap_placed<R: Read + Seek>(
+        gguf: gguf_file::Content,
+        reader: &mut R,
+        device: &Device,
+        expert_device: &Device,
+        mmap: Option<std::sync::Arc<memmap2::Mmap>>,
+        file: Option<std::sync::Arc<std::fs::File>>,
+        n_ctx: usize,
+    ) -> Result<Self> {
         let arch = Architecture::detect(&gguf.metadata).map_err(candle_core::Error::Msg)?;
 
         tracing::info!("Detected model architecture: {}", arch.display_name());
@@ -390,18 +420,61 @@ impl QuantizedModel {
             Architecture::Qwen3 => {
                 quantized_qwen3::ModelWeights::from_gguf(gguf, reader, device).map(Self::Qwen3)
             }
-            Architecture::Qwen3Moe => {
-                crate::quantized_qwen3_moe::GGUFQWenMoE::from_gguf_mmap(gguf, reader, device, mmap)
-                    .map(Self::Qwen3Moe)
-            }
-            Architecture::DeepSeek2 => {
-                crate::quantized_deepseek2::ModelWeights::from_gguf_mmap(gguf, reader, device, mmap)
-                    .map(Self::DeepSeek2)
-            }
+            Architecture::Qwen3Moe => crate::quantized_qwen3_moe::GGUFQWenMoE::from_gguf_mmap_placed(
+                gguf,
+                reader,
+                device,
+                expert_device,
+                mmap,
+            )
+            .map(Self::Qwen3Moe),
+            Architecture::DeepSeek2 => crate::quantized_deepseek2::ModelWeights::from_gguf_mmap_placed(
+                gguf,
+                reader,
+                device,
+                expert_device,
+                mmap,
+            )
+            .map(Self::DeepSeek2),
             Architecture::DeepSeek4 => crate::quantized_deepseek4::ModelWeights::from_gguf_mmap(
                 gguf, raw, reader, device, mmap, file, n_ctx,
             )
             .map(Self::DeepSeek4),
+        }
+    }
+
+    /// A fresh session over this instance's weights, sharing every weight
+    /// tensor and starting with an empty KV cache — for loaders that keep
+    /// their weights behind a shared handle (`qwen3moe`, `deepseek2`).
+    ///
+    /// `None` for architectures whose instances own their weights (candle's
+    /// stock loaders, `deepseek4`); those need a full load per session.
+    /// The engine keeps one loaded instance as the template and derives
+    /// every concurrent session from it, so extra sessions cost their KV
+    /// cache rather than a second copy (on an accelerator, a second upload)
+    /// of the weights.
+    pub fn new_session(&self) -> Option<Self> {
+        match self {
+            Self::Qwen3Moe(m) => Some(Self::Qwen3Moe(m.new_session())),
+            Self::DeepSeek2(m) => Some(Self::DeepSeek2(m.new_session())),
+            _ => None,
+        }
+    }
+
+    /// Whether [`QuantizedModel::new_session`] can derive sessions from this
+    /// instance without copying its weights.
+    pub fn supports_shared_weights(&self) -> bool {
+        matches!(self, Self::Qwen3Moe(_) | Self::DeepSeek2(_))
+    }
+
+    /// Whether the loaded token-embedding table is held quantized rather
+    /// than dequantized to f32 (joshua-native loaders; diagnostics).
+    pub fn embeddings_quantized(&self) -> Option<bool> {
+        match self {
+            Self::Qwen3Moe(m) => Some(m.embeddings_quantized()),
+            Self::DeepSeek2(m) => Some(m.embeddings_quantized()),
+            Self::DeepSeek4(m) => Some(m.embeddings_quantized()),
+            _ => None,
         }
     }
 

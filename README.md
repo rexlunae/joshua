@@ -208,10 +208,44 @@ through its fused attention kernel, which supports head dims ≥ 32 — every
 real model (llama 64/128, Qwen 128, Gemma 256, DeepSeek MLA 64/128)
 qualifies; only toy embeddings with head dim 4 need the CPU.
 
-**What stays on CPU.** `deepseek4` (DeepSeek-V4-Flash) refuses a GPU device
-at load: its IQ2_XXS expert weights have no Metal/CUDA kernel and the
-loader degrades to a clear error rather than materialising ~16× f32.
-Whisper transcription is CPU-only.
+**What stays on CPU.** `deepseek4` (DeepSeek-V4-Flash) keeps its IQ2_XXS
+routed experts on the CPU (no Metal/CUDA kernel exists for them) and runs
+only the dense set on the device.  Whisper transcription is CPU-only.
+
+### Models larger than VRAM
+
+A sparse MoE model is mostly routed experts, and a GPU that cannot hold all
+of them can still run the model well: the *dense* set (embeddings, norms,
+attention, routers, shared experts, output) is what every token touches and
+what benefits from the device, while each token touches only a handful of
+experts.  `--expert-placement` chooses where the routed experts of a
+`qwen3moe` / `deepseek2` model live:
+
+| Value | Effect |
+|---|---|
+| `auto` (default) | `device` when `dense + experts + 1 GiB` fits the GPU's free memory (`cudaMemGetInfo` on CUDA, or `--vram-budget`), else `host`.  On OpenCL always `host`.  With neither a probe nor a budget, `device`. |
+| `device` | Upload the experts too — the whole model must fit. |
+| `host` | Keep the experts in host RAM, borrowed in place from the mapping and run on the CPU SIMD expert kernels (with the hot-expert cache and prefetch machinery active); only the dense set goes to the GPU.  Each MoE layer moves its activations across once in each direction. |
+
+`--vram-budget <MiB>` (or `JOSHUA_VRAM_BUDGET`) states the memory the model
+may use when there is no probe (Metal's unified memory, OpenCL) or when the
+card is shared.  The decision is logged at startup:
+
+```text
+INFO joshua: expert placement: host RAM — experts borrowed from the mapping,
+     dense set on the device (dense 1.1 GiB, experts 17.5 GiB, device budget
+     11.6 GiB, requested Auto)
+```
+
+Two things make a second concurrent conversation cheap on the device.
+Weights of a `qwen3moe` / `deepseek2` model are loaded (and uploaded) once
+and shared by every session: a new session is one reference-count bump plus
+an empty KV cache, never a second copy.  And the token-embedding table is
+kept quantized and gathered per row instead of being dequantized to a
+private f32 copy per session (1.2 GB on Qwen3-30B-A3B, 4.7 GB on Kimi-K2).
+For architectures whose sessions still own their weights, the default
+concurrency and the warm-session pool are sized from the device's free
+memory.  See `docs/memory-analysis.md` for the full accounting.
 
 ---
 
@@ -490,6 +524,8 @@ prints the dense/expert split of any GGUF to sanity-check a new model.
 | `JOSHUA_PREFETCH_MODEL` | Same as `--prefetch-model` (`true`/`false`, or the flag with no value) |
 | `JOSHUA_PIN_HOT_WEIGHTS` | Same as `--pin-hot-weights` (`true`/`false`, or the flag with no value) |
 | `JOSHUA_MLOCK_HOT_WEIGHTS` | Same as `--mlock-hot-weights` (`on`, `required`, or `off`) |
+| `JOSHUA_EXPERT_PLACEMENT` | Same as `--expert-placement` (`auto`, `device`, or `host`) |
+| `JOSHUA_VRAM_BUDGET` | Same as `--vram-budget` (MiB of accelerator memory the model may use) |
 | `JOSHUA_MAX_CONCURRENCY` | Cap on simultaneous generations/embeddings (same as `--max-concurrency`) |
 | `JOSHUA_MAX_OUTPUT_TOKENS` | Hard ceiling on generated tokens per request (same as `--max-output-tokens`) |
 | `JOSHUA_WHISPER_MODEL` | Whisper model directory mounted at `/v1/audio/transcriptions` (same as `--whisper-model`) |
@@ -677,6 +713,7 @@ candle path on the same weights.
 - [x] DeepSeek-V2/V3 MLA latent cache (~70× smaller KV cache, prefill == incremental)
 - [x] Fused AVX2 k-quant kernels and SIMD quantized matmuls (CPU prefill/decode speed-ups)
 - [x] Sparse-MoE weight management (hot-weight pinning, mlock with memlock-limit check, prefill streaming)
+- [x] Models larger than VRAM (host-resident experts with the dense set on the GPU, weights shared across sessions, quantized embedding table)
 - [x] Vision / multimodal support (OpenAI image messages via llama.cpp `mtmd` through the plugin shim)
 - [x] Speech-to-text (Whisper — pure-Rust pipeline, `/v1/audio/transcriptions`)
 - [x] NPU backend architecture (isolated vendor-plugin shim + llama.cpp adapter for Hexagon/CANN/…)

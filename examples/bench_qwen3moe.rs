@@ -134,6 +134,7 @@ fn main() -> anyhow::Result<()> {
             &dev,
             Some(Arc::clone(&mmap_arc)),
             None,
+            0,
         )?
     };
     let load_s = t0.elapsed().as_secs_f64();

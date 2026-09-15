@@ -1573,7 +1573,10 @@ impl FeedForward {
 
 /// A quantized DeepSeek-V4 model loaded from GGUF.
 pub struct ModelWeights {
-    tok_embeddings: Tensor,
+    /// Token-embedding table, kept quantized (see
+    /// [`crate::token_embedding::TokenEmbedding`]): dequantizing V4-Flash's
+    /// table to f32 cost ~2 GiB of anonymous memory per instance.
+    tok_embeddings: crate::token_embedding::TokenEmbedding,
     layers: Vec<Layer>,
     kv: Vec<KvState>,
     /// Per-sequence KV state for batched `forward_sequences` decode:
@@ -1884,7 +1887,8 @@ impl ModelWeights {
             file,
         };
 
-        let tok_embeddings = rd.f32_tensor("token_embd.weight")?;
+        let tok_embeddings =
+            crate::token_embedding::TokenEmbedding::load(rd.qtensor("token_embd.weight")?, device)?;
         let norm = rd.rms_norm("output_norm.weight", cfg.rms_eps)?;
         let output = match rd.qmatmul_opt("output.weight")? {
             Some(o) => o,
@@ -2146,16 +2150,21 @@ impl ModelWeights {
         self.residency.capacity()
     }
 
+    /// Whether the token-embedding table is held quantized (diagnostics).
+    pub fn embeddings_quantized(&self) -> bool {
+        self.tok_embeddings.is_quantized()
+    }
+
     /// Forward pass. `input` is `[1, seq_len]`; `offset` is the KV-cache
     /// position of the first input token.
     pub fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {
         let (_b, seq_len) = input.dims2()?;
         let hc = self.hc_mult;
-        let d = self.tok_embeddings.dim(1)?;
+        let d = self.tok_embeddings.hidden()?;
 
         let tok = self
             .tok_embeddings
-            .index_select(&input.flatten_all()?, 0)?
+            .forward(&input.flatten_all()?)?
             .reshape((1, seq_len, d))?;
         // Expand to hc copies.
         let mut xs = tok.unsqueeze(2)?.broadcast_as((1, seq_len, hc, d))?;
@@ -2392,7 +2401,7 @@ impl ModelWeights {
             return Ok(Vec::new());
         }
         let hc = self.hc_mult;
-        let d = self.tok_embeddings.dim(1)?;
+        let d = self.tok_embeddings.hidden()?;
 
         // Persistent per-sequence KV: reset when the batch size changes (a new
         // batch of sequences starts), otherwise reuse the cache across steps so
@@ -2416,7 +2425,7 @@ impl ModelWeights {
         for (input, _) in seqs {
             let tok = self
                 .tok_embeddings
-                .index_select(&input.flatten_all()?, 0)?
+                .forward(&input.flatten_all()?)?
                 .reshape((1, 1, d))?;
             xs_seq.push(tok.unsqueeze(2)?.broadcast_as((1, 1, hc, d))?);
             ids_cat.push(input.flatten_all()?.to_vec1()?.get(0).copied().unwrap_or(0));
