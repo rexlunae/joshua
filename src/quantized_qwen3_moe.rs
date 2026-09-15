@@ -36,6 +36,7 @@ use std::io::{Read, Seek};
 use std::sync::Arc;
 
 use candle_core::quantized::{gguf_file, GgmlDType, QMatMul, QStorage, QTensor};
+use crate::paged_weights::{PagedWeight, WeightCache};
 use candle_core::{DType, Device, Module, Result, Tensor, D};
 use candle_nn::ops::{silu, softmax_last_dim};
 use candle_transformers::quantized_nn::RmsNorm;
@@ -235,6 +236,10 @@ struct Reader<R: Read + Seek> {
     /// being uploaded.  `None` on CPU, without a mapping, or when the
     /// no-copy buffer could not be created (the loader then copies).
     zc: Option<Arc<ZcContext>>,
+    /// Opt-in bounded GPU weight cache (see `JOSHUA_GPU_WEIGHT_CACHE`).  When
+    /// present, quantized experts are kept compressed in the mmap and uploaded
+    /// to the device on demand instead of being copied up front.
+    gpu_cache: Option<Arc<WeightCache>>,
 }
 
 impl<R: Read + Seek> Reader<R> {
@@ -289,6 +294,10 @@ impl<R: Read + Seek> Reader<R> {
 enum Weight {
     Candle(QMatMul),
     Zc(Arc<ZcWeight>),
+    /// Quantized weights kept compressed in mmap and uploaded to the device on
+    /// demand through a bounded [`WeightCache`] (opt-in; see
+    /// `JOSHUA_GPU_WEIGHT_CACHE`).  Each expert owns one [`PagedWeight`].
+    Paged(Arc<PagedWeight>),
 }
 
 impl Weight {
@@ -308,6 +317,7 @@ impl Weight {
                 q.forward(xs)
             }
             Weight::Zc(z) => z.forward(xs),
+            Weight::Paged(p) => p.forward(xs),
         }
     }
 }
@@ -795,6 +805,35 @@ fn split_experts<R: Read + Seek>(
         }
     }
 
+    // GPU paging path: keep each expert's quantized block compressed in the
+    // mmap and upload it to the device on demand through the bounded cache,
+    // instead of copying every expert up front.  Only for block-capable
+    // devices (Metal/CUDA); OpenCL cannot host quantized blocks yet
+    // (OpenClStorage is f32-dense), so it keeps the eager-copy path below.
+    if let Some(cache) = rd.gpu_cache.clone().filter(|_| !rd.device.is_cpu() && !rd.device.is_opencl()) {
+        if let Some(info) = rd.ct.tensor_infos.get(name) {
+            let dtype = info.ggml_dtype;
+            let block_size = dtype.block_size();
+            if block_size > 0 && per_elems.is_multiple_of(block_size) {
+                let per_bytes = per_elems / block_size * dtype.type_size();
+                let base = rd.ct.tensor_data_offset.saturating_add(info.offset) as usize;
+                let mut paged = Vec::with_capacity(n_expert);
+                for e in 0..n_expert {
+                    match cache.weight(base + e * per_bytes, out, inn, dtype) {
+                        Ok(p) => paged.push((Weight::Paged(Arc::new(p)), None)),
+                        Err(_) => {
+                            paged.clear();
+                            break;
+                        }
+                    }
+                }
+                if paged.len() == n_expert {
+                    return Ok(paged);
+                }
+            }
+        }
+    }
+
     let qt = rd.qtensor(name)?;
     let dtype: GgmlDType = qt.dtype();
     let bytes = qt.data()?;
@@ -899,6 +938,27 @@ impl GGUFQWenMoE {
             }
             _ => None,
         };
+        // Opt-in bounded GPU weight cache.  Heed the env budget (MiB); 0/unset
+        // disables.  Only meaningful with an mmap-backed model on a device that
+        // can hold quantized blocks; building it is best-effort.
+        let gpu_cache = match std::env::var("JOSHUA_GPU_WEIGHT_CACHE") {
+            Ok(v) if !v.is_empty() && v != "0" => {
+                let MiB = v.parse::<usize>().unwrap_or(0);
+                if MiB == 0 {
+                    None
+                } else if let Some(m) = mmap.clone() {
+                    crate::paged_weights::WeightCache::new(
+                        m.clone(),
+                        device.clone(),
+                        MiB * 1024 * 1024,
+                    ).ok()
+                } else {
+                    tracing::warn!("JOSHUA_GPU_WEIGHT_CACHE set but no mmap-backed model; disabled");
+                    None
+                }
+            }
+            _ => None,
+        };
         // The Content owns metadata; move it into our reader together with the
         // underlying file handle (borrowed for the lifetime of the load).
         let mut rd = Reader {
@@ -907,6 +967,7 @@ impl GGUFQWenMoE {
             device: device.clone(),
             mmap,
             zc,
+            gpu_cache,
         };
 
         let tok_embeddings = rd.f32_tensor("token_embd.weight")?;
