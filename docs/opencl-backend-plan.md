@@ -1,6 +1,6 @@
 # OpenCL accelerator backend for joshua (design + plan)
 
-**Status:** M1-M4 DONE + verified on the host iGPU: full DeepSeek-V4-Flash runs end-to-end on `--device opencl` (Intel UHD 730) with real `JOSHUA_PROFILE_LAYERS` numbers. M5 (native iGPU kernels for speed) open. **Owner:** joshua (this repo). **Target:** run the
+**Status:** M1-M5 DONE + verified on the host iGPU (2026-09-14): full DeepSeek-V4-Flash runs end-to-end on `--device opencl` (Intel UHD 730) with real `JOSHUA_PROFILE_LAYERS` numbers, and the M5 native kernels are bit-exact on the iGPU (correct output, NaN fixed). Native kernels do **not** beat CPU end-to-end because the MoE experts run on CPU by design (see M5) — the iGPU accelerates only the ~8 GiB dense set. **Owner:** joshua (this repo). **Target:** run the
 DeepSeek-V4-Flash benchmark on an Intel OpenCL GPU (iGPU now; M40 via the
 NVIDIA OpenCL ICD when reconnected) through a joshua-native `--device opencl`.
 
@@ -159,15 +159,25 @@ CPU as today.
     latencies are high because the dense GEMMs run through M2 CPU-fallback ops +
     host<->device transfers; native iGPU kernels are the M5 speed step (fails on
     usable-but-slow, matching the "how far can we take it" brief).
-- **M5.** native iGPU kernels (the speed step). In progress, compiling+wired:
-  `opencl_backend/kernels.rs` (program/kernel/ND-range FFI, per-device compile
-  cache; affine/elementwise exp/log/sqrt/sqr/neg/recip + add/sub/mul; f32 GEMM).
-  `affine`, `unary_impl`, `binary_impl` and single-batch `matmul` run as native
-  kernels under `JOSHUA_OPENCL_NATIVE=1` (contiguous f32; batched attention GEMM
-  and everything else still use the M2 CPU-fallback). Both builds compile
-  (`b34eb63`, `eebaeba`). **Not yet host-verified** (correctness/speed on the
-  iGPU) — that run needs the ~5-13 min model reload + benchmark; and the
-  `--dense-offload` knob still to add.
+- **M5.** native iGPU kernels. **Host-verified: bit-exact, NaN fixed, but no
+  end-to-end speedup.** `opencl_backend/kernels.rs` implements affine, elementwise
+  (exp/log/sqrt/sqr/neg/recip + add/sub/mul), and a single-batch f32 GEMM as real
+  OpenCL ND-range kernels, wired into `OpenClStorage::{affine,unary_impl,
+  binary_impl,matmul}` under `JOSHUA_OPENCL_NATIVE=1` (contiguous-f32; batched
+  attention GEMM and transposed operands fall back to the M2 CPU path).
+  Correctness is proven by an in-crate parity test on the iGPU
+  (`opencl_parity_native`, `cargo test -p candle-core --features candle-core/opencl
+  -- --ignored --nocapture opencl_parity`): all five cases are bit-exact
+  (worst rel diff = 0.000e0) for affine, exp, add, matmul, and a transposed-weight
+  fallback. The model then runs `--device opencl` with native kernels end-to-end and
+  answers correctly — the earlier M5 "A weight is invalid in distribution" (NaN)
+  is gone. **Speed:** first request (load-dominated) OpenCl 399s vs CPU 353s ~ 0.05
+  tps; warmed request OpenCl 288s vs CPU 312s ~ 0.06 tps — statistically tied, i.e.
+  the iGPU does not beat CPU. Root cause is architectural, not the kernels: deepseek
+  routes the MoE experts to `Device::Cpu` whenever the model is mmap-backed (always
+  for the 80 GiB GGUF), and ~85%+ of FLOPs are in routed experts, so the iGPU only
+  accelerates the ~8 GiB dense set while also paying host<->device transport. Native
+  correctness holds (`fb14861`); speed is bounded by the CPU-expert design.
 
 Each milestone lands as its own PR. M1–M4 are the "run the benchmark" critical
 path.

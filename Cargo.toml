@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/joshua-mock-npu", "crates/joshua-llamacpp-npu"]
+members = [".", "crates/joshua-mock-npu", "crates/joshua-llamacpp-npu", "vendor/candle-core"]
 # The llama.cpp adapter compiles C++ (llama.cpp itself) and is therefore not
 # part of the default build: `cargo build`/`cargo test` stay pure Rust.
 default-members = [".", "crates/joshua-mock-npu"]
