@@ -532,12 +532,27 @@ pub struct Engine {
 /// pressure.
 const LOW_MEM_FLOOR: u64 = 1536 * 1024 * 1024; // 1.5 GiB
 
+/// Tokens processed per prefill batch, bounding the transient activation
+/// tensor for a long prompt (finding #4).  512 keeps memory flat for a huge
+/// prompt without re-reading expert weights so often that it dominates.
+const PREFILL_CHUNK: usize = 512;
+
 /// Maximum number of idle model instances kept warm in the pool.
 ///
 /// Each instance holds the (quantized) weights plus its KV cache, so this
 /// bounds memory: two instances cover the common "one active conversation
 /// plus one concurrent request" pattern without tripling residency.
 const MAX_CACHED_MODELS: usize = 2;
+
+/// Upper pool cap used only when free RAM is ample, so several concurrent
+/// requests reuse one loaded model (and one device upload) instead of each
+/// loading its own (#5).  `release_model` picks between 0 / 1 / MAX_CACHED_MODELS
+/// / MAX_CACHED_MODELS_MEM by free RAM.
+const MAX_CACHED_MODELS_MEM: usize = 4;
+
+/// Free RAM (bytes) above which the pool keeps `MAX_CACHED_MODELS_MEM` warm
+/// sessions; below it degrades toward the baseline and then to 0.
+const MAX_CACHED_MODELS_MEM_HEADROOM: u64 = 16 * 1024 * 1024 * 1024; // 16 GiB
 
 /// Consecutive NPU failures before the backend is disabled for the rest of
 /// the engine's lifetime (all requests then run on the candle path).
@@ -1492,10 +1507,25 @@ impl Engine {
         let mut kv_tokens = prompt_tokens.to_vec();
 
         // ── Prefill ───────────────────────────────────────────────────────────
-        // Process the not-yet-cached prompt tokens in a single forward pass,
-        // starting right after the reused KV prefix.
+        // Process the not-yet-cached prompt tokens in bounded chunks, starting
+        // right after the reused KV prefix.  Feeding an arbitrarily long prompt
+        // in one pass materializes a `[1, n_prompt, hidden]` activation tensor;
+        // chunking caps that transient allocation (finding #4).  Positions
+        // advance so the KV cache accumulates across pieces, and only the final
+        // piece's last-token logits are kept (the prefill prediction).  Smaller
+        // chunks bound memory but can re-read expert weights more often.
         let prefill_start = Instant::now();
-        let logits_vec = model.forward_tokens(new_tokens, n_reused, &self.device)?;
+        let logits_vec = {
+            let mut last: Vec<f32> = Vec::new();
+            let mut base = n_reused;
+            for piece_start in (0..new_tokens.len()).step_by(PREFILL_CHUNK) {
+                let end = (piece_start + PREFILL_CHUNK).min(new_tokens.len());
+                let piece = &new_tokens[piece_start..end];
+                last = model.forward_tokens(piece, base, &self.device)?;
+                base += piece.len();
+            }
+            last
+        };
         let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
 
         // ── Repetition-penalty history ────────────────────────────────────────
@@ -2083,9 +2113,15 @@ impl Engine {
         // holds fewer (or no) idle sessions, so a heavy model's working set
         // isn't kept resident twice/three times just to warm a next request
         // (finding #2).
+        // RAM-adaptive pool cap (#2 + #5).  Under pressure keep few/no idle
+        // sessions (#2).  With ample free RAM keep MORE than the baseline so
+        // concurrent requests REUSE one loaded model (and one GPU upload) rather
+        // than each load+upload its own working set — that is the "share
+        // immutable weights across sessions" win (#5), bounded by memory.
         let pool_cap: usize = match crate::placement::available_ram_bytes() {
             Some(free) if free < LOW_MEM_FLOOR => 0,
             Some(free) if free < LOW_MEM_FLOOR * 2 => 1,
+            Some(free) if free >= MAX_CACHED_MODELS_MEM_HEADROOM => MAX_CACHED_MODELS_MEM,
             _ => MAX_CACHED_MODELS,
         };
         while pool.len() > pool_cap {
