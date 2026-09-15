@@ -1007,7 +1007,12 @@ impl Engine {
         let (dense_bytes, expert_bytes) = {
             let (dense, experts) = weight_ranges(&raw, mmap.len() as u64);
             let sum = |r: &[ByteRange]| r.iter().map(|(_, len)| *len as u64).sum::<u64>();
-            (sum(&dense), sum(&experts))
+            // A tied output head reloads the embedding table as a second
+            // tensor, so the device holds it twice.
+            (
+                sum(&dense).saturating_add(tied_output_bytes(&raw, false)),
+                sum(&experts),
+            )
         };
         // What those sets occupy *on the device*: their quantized bytes on
         // CUDA/Metal, but f32 on OpenCL, whose storage dequantizes every
@@ -1091,8 +1096,11 @@ impl Engine {
         // The dense set always goes to the device: no placement can shrink
         // it, so a budget it does not fit is refused here, with the numbers,
         // rather than deferred to an out-of-memory upload on the first
-        // request.
-        if !device.is_cpu() {
+        // request.  Only for architectures the candle path loads: a model
+        // candle cannot load (`arch == None`) allocates nothing on the
+        // device and may still be served by an NPU backend attached after
+        // construction, so its deferred `arch_error` path is left alone.
+        if !device.is_cpu() && arch.is_some() {
             if let Some(budget) = device_budget {
                 if !crate::placement::dense_set_fits(
                     dense_device_bytes,
@@ -2680,7 +2688,28 @@ fn f32_weight_bytes(header: &crate::gguf_ext::GgufHeader) -> (u64, u64) {
             dense = dense.saturating_add(bytes);
         }
     }
-    (dense, experts)
+    (dense.saturating_add(tied_output_bytes(header, true)), experts)
+}
+
+/// Extra device bytes a *tied* output head costs: a GGUF without
+/// `output.weight` makes the loaders load `token_embd.weight` a second
+/// time as the output projection, so the table is resident twice — once
+/// as the embedding, once as the head.  `f32` selects the dequantized size
+/// (OpenCL) over the on-disk quantized size.  Zero for an untied model.
+fn tied_output_bytes(header: &crate::gguf_ext::GgufHeader, f32: bool) -> u64 {
+    if header.tensors.contains_key("output.weight") {
+        return 0;
+    }
+    let Some(embd) = header.tensors.get("token_embd.weight") else {
+        return 0;
+    };
+    if f32 {
+        (embd.elem_count() as u64).saturating_mul(4)
+    } else {
+        crate::gguf_ext::type_size_bytes(embd.dtype, embd.elem_count())
+            .map(|b| b as u64)
+            .unwrap_or(0)
+    }
 }
 
 /// Byte ranges of the model file holding dense vs routed-expert weights.
@@ -3591,6 +3620,7 @@ mod tests {
             metadata: HashMap::new(),
             tensors: HashMap::from([
                 ("token_embd.weight".to_string(), tensor(vec![8, 16])),
+                ("output.weight".to_string(), tensor(vec![8, 16])),
                 ("blk.0.attn_q.weight".to_string(), tensor(vec![8, 8])),
                 ("blk.0.ffn_gate_exps.weight".to_string(), tensor(vec![4, 8, 2])),
                 ("blk.0.ffn_up_exps.weight".to_string(), tensor(vec![4, 8, 2])),
@@ -3598,8 +3628,23 @@ mod tests {
             tensor_data_offset: 0,
         };
         let (dense, experts) = f32_weight_bytes(&header);
-        assert_eq!(dense, (8 * 16 + 8 * 8) * 4);
+        assert_eq!(dense, (8 * 16 + 8 * 16 + 8 * 8) * 4);
         assert_eq!(experts, 2 * (4 * 8 * 2) * 4);
+        // Untied: the head is its own tensor, nothing extra.
+        assert_eq!(tied_output_bytes(&header, true), 0);
+        assert_eq!(tied_output_bytes(&header, false), 0);
+
+        // Tied output (no `output.weight`): the embedding table is loaded
+        // twice, so it counts twice — f32 on OpenCL, quantized elsewhere.
+        let mut tied = header;
+        tied.tensors.remove("output.weight");
+        tied.tensors
+            .insert("token_embd.weight".to_string(), tensor(vec![256, 4])); // 1024 Q4_K elems
+        let (dense, _) = f32_weight_bytes(&tied);
+        assert_eq!(dense, (2 * 256 * 4 + 8 * 8) * 4, "f32 footprint counts the tied table twice");
+        assert_eq!(tied_output_bytes(&tied, true), 256 * 4 * 4);
+        // Q4_K: 256 elements per 144-byte block → 1024 elems = 576 bytes.
+        assert_eq!(tied_output_bytes(&tied, false), 576);
     }
 
     fn header_with_tensors(

@@ -99,6 +99,10 @@ not fit with headroom is refused at load, naming both numbers, rather than
 deferred to an out-of-memory upload.  `deepseek4` is always resolved as
 `host` (its loader keeps the IQ2_XXS experts on the CPU regardless), so
 its per-session device footprint is the dense set alone.
+A GGUF without `output.weight` (tied head) makes the loaders load the
+embedding table a second time as the output projection, so the device
+accounting counts that table twice.  Models candle cannot load at all
+(NPU-only) allocate nothing on the device and skip the check.
 
 Per-device memory with `host` placement:
 
