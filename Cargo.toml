@@ -45,6 +45,11 @@ metal = [
     "dep:candle-metal-kernels",
     "dep:objc2-metal",
 ]
+# OpenCL accelerator (vendored candle-core `opencl` backend: OpenClDevice /
+# OpenClStorage + buffer round-trip). Bring-up target is Intel OpenCL hardware
+# (iGPU now; a more powerful Intel card later). Requires a system libOpenCL
+# (-lOpenCL, e.g. intel-opencl-icd on Linux) at link time.
+opencl = ["candle-core/opencl"]
 # HTTPS termination via rustls. Opt-in because the ring crypto provider
 # compiles C/assembly, which would break the default build's
 # "only a Rust toolchain required" guarantee.
@@ -54,6 +59,11 @@ tls = ["dep:axum-server", "dep:rustls"]
 # candle-metal-kernels, patched with offset-aware quantized entry points.
 # Always applied so the vendored crate is the one candle-core links against.
 [patch.crates-io]
+# candle-core is vendored so joshua can add an OpenCL accelerator backend
+# (opencl feature: OpenClDevice/OpenClStorage + BackendStorage ops) for running
+# the deepseek4 dense set on Intel OpenCL hardware. Inactive until the
+# `opencl` feature is added; the default build is byte-for-byte unchanged.
+candle-core = { path = "vendor/candle-core" }
 # candle-kernels is patched to a tiny fork (rexlunae/candle-kernels) carrying
 # two CUDA-12.4 compatibility fixes, instead of vendoring the crate's ~21K
 # lines of C kernels into this tree: (1) compatibility.cuh redefines

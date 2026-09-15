@@ -40,6 +40,7 @@ pub mod quantized_qwen3_moe;
 pub mod quant_matmul;
 pub mod residency;
 pub mod npu;
+pub mod paged_weights;
 pub mod placement;
 pub mod server;
 pub mod simd;
