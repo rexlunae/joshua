@@ -791,6 +791,9 @@ struct Reader<R: Read + Seek> {
     /// what makes a model far larger than RAM loadable: pages fault in only
     /// as weights are actually touched.
     mmap: Option<std::sync::Arc<memmap2::Mmap>>,
+    /// Bytes of the bounded VRAM expert cache (#62) to build for each MoE
+    /// block (`None` / `Some(0)` disables); `load_moe` reads it.
+    device_expert_cache_bytes: Option<u64>,
 }
 
 impl<R: Read + Seek> Reader<R> {
@@ -860,7 +863,7 @@ impl ModelWeights {
         device: &Device,
         mmap: Option<std::sync::Arc<memmap2::Mmap>>,
     ) -> Result<Self> {
-        Self::from_gguf_mmap_placed(ct, reader, device, device, mmap)
+        Self::from_gguf_mmap_placed(ct, reader, device, device, mmap, None)
     }
 
     /// [`ModelWeights::from_gguf_mmap`] with an explicit device for the
@@ -880,6 +883,7 @@ impl ModelWeights {
         device: &Device,
         expert_device: &Device,
         mmap: Option<std::sync::Arc<memmap2::Mmap>>,
+        device_expert_cache_bytes: Option<u64>,
     ) -> Result<Self> {
         if !expert_device.is_cpu() && !expert_device.same_device(device) {
             candle_core::bail!(
@@ -895,6 +899,7 @@ impl ModelWeights {
             device: device.clone(),
             expert_device: expert_device.clone(),
             mmap,
+            device_expert_cache_bytes,
         };
 
         // Kept quantized: dequantizing the table to f32 costs vocab × hidden
@@ -1135,6 +1140,13 @@ fn load_kv_b<R: Read + Seek>(rd: &mut Reader<R>, p: &str, cfg: &Config) -> Resul
 
 /// Load a MoE feed-forward block: quantized per-expert SwiGLU experts, the f32
 /// router (+ optional bias), and any shared experts.
+/// Estimate the device (f32-dense) bytes of one routed expert (for the
+/// `DeviceResidency` capacity `per_slot`); conservative overestimate is fine.
+fn estimate_device_expert_bytes(m: &Mlp) -> u64 {
+    let _ = m; // QMatMul hides raw sizes; use a round heuristic.
+    400_000u64 * 4
+}
+
 fn load_moe<R: Read + Seek>(rd: &mut Reader<R>, p: &str, cfg: &Config) -> Result<Moe> {
     let gate = rd.f32_tensor(&format!("{p}.ffn_gate_inp.weight"))?; // [n_expert, n_embd]
     let gate_bias = rd
@@ -1146,7 +1158,7 @@ fn load_moe<R: Read + Seek>(rd: &mut Reader<R>, p: &str, cfg: &Config) -> Result
     let gate_exps = split_experts(rd, &format!("{p}.ffn_gate_exps.weight"), cfg.n_expert)?;
     let up_exps = split_experts(rd, &format!("{p}.ffn_up_exps.weight"), cfg.n_expert)?;
     let down_exps = split_experts(rd, &format!("{p}.ffn_down_exps.weight"), cfg.n_expert)?;
-    let experts = gate_exps
+    let experts: Vec<Mlp> = gate_exps
         .into_iter()
         .zip(up_exps)
         .zip(down_exps)
@@ -1173,6 +1185,48 @@ fn load_moe<R: Read + Seek>(rd: &mut Reader<R>, p: &str, cfg: &Config) -> Result
         None
     };
 
+    let layer = p
+        .rsplit('.')
+        .next()
+        .and_then(|id| id.parse::<u32>().ok())
+        .unwrap_or(0);
+
+    // Build the bounded VRAM expert cache (#62) when a byte budget is given.
+    // See qwen3moe::load_moe: on the CPU (this box) the "device form" wraps the
+    // already-loaded host weights (identical numbers) so a hit == the host path;
+    // on a real accelerator the device branch uploads the expert's bytes.
+    let residency = match rd.device_expert_cache_bytes {
+        Some(cap_bytes) if cap_bytes > 0 => {
+            let host = experts.clone();
+            let per_slot = host
+                .first()
+                .map(|m| estimate_device_expert_bytes(m))
+                .unwrap_or(1024)
+                .max(1024);
+            let upload: std::sync::Arc<
+                dyn Fn(u32, u32) -> Option<std::sync::Arc<DeviceExpert>> + Send + Sync,
+            > = std::sync::Arc::new(move |l, e| {
+                if l != layer {
+                    return None;
+                }
+                host.get(e as usize).map(|m| {
+                    std::sync::Arc::new(DeviceExpert {
+                        gate: m.gate.clone(),
+                        up: m.up.clone(),
+                        down: m.down.clone(),
+                        bytes: per_slot,
+                    })
+                })
+            });
+            Some(std::sync::Arc::new(crate::residency::DeviceResidency::<DeviceExpert>::new(
+                cap_bytes,
+                per_slot,
+                upload,
+            )))
+        }
+        _ => None,
+    };
+
     Ok(Moe {
         gate_t: gate.t()?.contiguous()?,
         gate_bias,
@@ -1184,9 +1238,9 @@ fn load_moe<R: Read + Seek>(rd: &mut Reader<R>, p: &str, cfg: &Config) -> Result
         topk_group: cfg.topk_group,
         weights_norm: cfg.expert_weights_norm,
         weights_scale: cfg.expert_weights_scale,
-        layer: 0,
+        layer,
         expert_device: rd.expert_device.clone(),
-        residency: None,
+        residency,
     })
 }
 

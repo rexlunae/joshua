@@ -47,6 +47,27 @@ fn load_placed(model: &Path, expert_device: &Device) -> QuantizedModel {
         Some(Arc::clone(&mmap)),
         None,
         0,
+        None,
+    )
+    .unwrap()
+}
+
+/// Like [`load_placed`], but with a `device_expert_cache_bytes` budget so the
+/// loader builds a per-layer `DeviceResidency` and the dispatch partition runs
+/// (on CPU, a hit wraps the same host weights — parity holds).
+fn load_placed_with_cache(model: &Path, cache_bytes: u64) -> QuantizedModel {
+    let mmap = unsafe { memmap2::Mmap::map(&std::fs::File::open(model).unwrap()) }.unwrap();
+    let mmap = Arc::new(mmap);
+    let (content, mut cursor) = read_content(&mmap[..]);
+    QuantizedModel::from_gguf_mmap_placed(
+        content,
+        &mut cursor,
+        &Device::Cpu,
+        &Device::Cpu,
+        Some(Arc::clone(&mmap)),
+        None,
+        0,
+        Some(cache_bytes),
     )
     .unwrap()
 }
@@ -290,6 +311,27 @@ fn deepseek4_sessions_share_weights_and_isolate_batch_kv() {
     let b2 = fseq_logits(&mut b, &[(&[8], 1)]);
     let fb2 = fseq_logits(&mut fresh_b, &[(&[8], 1)]);
     assert_close(&b2[0], &fb2[0], "deepseek4 session-b step2@1");
+
+
+/// Loading a qwen3moe model with a non-zero `device_expert_cache_bytes`
+/// budget threads a per-layer `DeviceResidency` into every MoE block; on the
+/// CPU the device form wraps the same host weights, so a mixed-residency run
+/// must produce exactly the no-cache logits (proves the budget plumbing +
+/// partition end-to-end through `QuantizedModel::from_gguf_mmap_placed`).
+#[test]
+fn vram_expert_cache_budget_loads_and_preserves_logits() {
+    let dir = common::model_dir("vram-cache-qwen3moe");
+    let model = dir.join("model.gguf");
+    common::write_tiny_qwen3moe_gguf(&model);
+
+    let mut plain = load_placed(&model, &Device::Cpu);
+    let mut cached = load_placed_with_cache(&model, 8 << 20); // 8 MiB budget
+    let tokens = [1u32, 4, 2, 7, 5];
+    assert_close(
+        &logits(&mut plain, &tokens, 0),
+        &logits(&mut cached, &tokens, 0),
+        "vram-expert-cache budget load preserves logits",
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
