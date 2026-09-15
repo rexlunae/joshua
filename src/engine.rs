@@ -1069,11 +1069,15 @@ impl Engine {
             .or_else(|| crate::placement::device_memory_info(&device).map(|(free, _)| free));
         // Device footprint of the dense and routed-expert sets, as the
         // loaders leave them resident on the *resolved* device (see
-        // `device_weight_bytes`): quantized blocks where a loader keeps them,
-        // f32 where it dequantizes (every weight on OpenCL, the stock
-        // loaders' embedding tables, deepseek4's raw-dtype dense tensors).
-        let (dense_device_bytes, expert_device_bytes) =
-            device_weight_bytes(&raw, arch, device.is_opencl());
+        // `device_weight_bytes`).  The dense set comes as two bounds: the
+        // lower one assumes every tensor whose residency is not known for
+        // certain stays quantized, the upper one assumes it is dequantized
+        // to f32.  A hard refusal to load needs certainty, so it uses the
+        // lower bound; the soft decisions (expert placement, per-session
+        // caps) err on the safe side with the upper bound.
+        let footprint = device_weight_bytes(&raw, arch, device.is_opencl());
+        let dense_device_bytes = footprint.dense_upper;
+        let expert_device_bytes = footprint.experts;
         let expert_bytes = expert_device_bytes;
         // The dense set always goes to the device: no placement can shrink
         // it, so a budget it does not fit is refused here, with the numbers,
@@ -1085,16 +1089,16 @@ impl Engine {
         if !device.is_cpu() && arch.is_some() {
             if let Some(budget) = device_budget {
                 if !crate::placement::dense_set_fits(
-                    dense_device_bytes,
+                    footprint.dense_lower,
                     crate::placement::DEVICE_PLACEMENT_HEADROOM,
                     budget,
                 ) {
                     return Err(JoshuaError::ModelLoad(format!(
-                        "the model's dense set ({:.2} GiB on {:?}, plus {:.1} GiB headroom) does not fit \
+                        "the model's dense set (at least {:.2} GiB on {:?}, plus {:.1} GiB headroom) does not fit \
                          the device memory budget of {:.2} GiB ({}). Expert placement can only move \
                          the routed experts off the device; run with --device cpu, free device memory, \
                          or raise --vram-budget if the budget was set by hand.",
-                        dense_device_bytes as f64 / 2f64.powi(30),
+                        footprint.dense_lower as f64 / 2f64.powi(30),
                         device,
                         crate::placement::DEVICE_PLACEMENT_HEADROOM as f64 / 2f64.powi(30),
                         budget as f64 / 2f64.powi(30),
@@ -1159,13 +1163,14 @@ impl Engine {
         };
         if !device.is_cpu() && expert_bytes > 0 {
             tracing::info!(
-                "expert placement: {} (dense {:.1} GiB, experts {:.1} GiB{}, device budget {}, requested {:?})",
+                "expert placement: {} (dense {:.1}–{:.1} GiB, experts {:.1} GiB{}, device budget {}, requested {:?})",
                 match placement {
                     crate::placement::ResolvedPlacement::Host =>
                         "host RAM — experts borrowed from the mapping, dense set on the device",
                     crate::placement::ResolvedPlacement::Device => "device",
                 },
-                dense_device_bytes as f64 / 2f64.powi(30),
+                footprint.dense_lower as f64 / 2f64.powi(30),
+                footprint.dense_upper as f64 / 2f64.powi(30),
                 expert_device_bytes as f64 / 2f64.powi(30),
                 if device.is_opencl() { " as f32 on OpenCL" } else { "" },
                 match device_budget {
@@ -2673,15 +2678,15 @@ fn probed_embedding_names(arch: Option<Architecture>) -> &'static [&'static str]
     }
 }
 
-/// Tensor-name stems (after the `blk.N.` prefix, before `.weight`) that every
-/// loader keeps as quantized `QMatMul` weights on an accelerator: the
-/// attention and feed-forward projections of the joshua-native loaders
-/// (`qwen3moe`, `deepseek2`, `deepseek4`) and the stock candle loaders
-/// (`llama`, `gemma*`, `glm4`, `lfm2`, `phi*`, `qwen2`, `qwen3`), deepseek4's
-/// hyper-connection and indexer projections, and lfm2's short-conv
-/// projections.  Anything not listed is sized as f32 (see
-/// [`resident_as_f32`]).
-const QUANTIZED_MATRIX_STEMS: [&str; 30] = [
+/// Tensor-name stems (see [`tensor_stem`]) that a loader keeps as quantized
+/// `QMatMul` weights on an accelerator: the attention and feed-forward
+/// projections of the joshua-native loaders (`qwen3moe`, `deepseek2`,
+/// `deepseek4`) and the stock candle loaders (`llama` incl. Mixtral's
+/// per-expert `ffn_gate.<i>` matrices, `gemma*`, `glm4`, `lfm2` with its
+/// `feed_forward.*` / `mlp.*_proj` / `shortconv.*_proj` aliases, `phi*`,
+/// `qwen2`, `qwen3`), and deepseek4's hyper-connection, indexer and
+/// compressor projections.
+const QUANTIZED_MATRIX_STEMS: [&str; 41] = [
     "attn_q",
     "attn_k",
     "attn_v",
@@ -2700,10 +2705,21 @@ const QUANTIZED_MATRIX_STEMS: [&str; 30] = [
     "ffn_gate_shexp",
     "ffn_up_shexp",
     "ffn_down_shexp",
+    "feed_forward.w1",
+    "feed_forward.w2",
+    "feed_forward.w3",
+    "mlp.gate_proj",
+    "mlp.up_proj",
+    "mlp.down_proj",
     "hc_attn_fn",
     "hc_ffn_fn",
+    "output_hc_fn",
     "indexer.proj",
     "indexer.attn_q_b",
+    "attn_compressor_kv",
+    "attn_compressor_gate",
+    "indexer_compressor_kv",
+    "indexer_compressor_gate",
     "shortconv.in_proj",
     "shortconv.out_proj",
     "conv.in_proj",
@@ -2714,90 +2730,151 @@ const QUANTIZED_MATRIX_STEMS: [&str; 30] = [
     "self_attn.out_proj",
 ];
 
-/// `name` without its `blk.<n>.` prefix and `.weight` suffix — the part the
+/// Tensor-name stems a loader is known to hold as dequantized f32 on an
+/// accelerator (besides norms and biases, matched by name): routers the
+/// joshua-native loaders read with `f32_tensor`, deepseek2's split-KV halves
+/// (folded into a dense up-projection), deepseek4's hyper-connection and
+/// compressor position vectors, lfm2's conv kernels.
+const F32_STEMS: [&str; 12] = [
+    "ffn_gate_inp",
+    "attn_k_b",
+    "attn_v_b",
+    "hc_attn_base",
+    "hc_attn_scale",
+    "hc_ffn_base",
+    "hc_ffn_scale",
+    "output_hc_base",
+    "output_hc_scale",
+    "attn_compressor_ape",
+    "indexer_compressor_ape",
+    "shortconv.conv",
+];
+
+/// `name` without its `blk.<n>.` prefix, `.weight` suffix and any trailing
+/// `.<index>` (Mixtral's per-expert `ffn_gate.3.weight`) — the part the
 /// residency rules key on.  `blk.3.attn_q.weight` → `attn_q`,
-/// `output.weight` → `output`, `blk.0.attn_q.bias` → `attn_q.bias`.
+/// `output.weight` → `output`, `blk.0.attn_q.bias` → `attn_q.bias`,
+/// `blk.0.ffn_up.7.weight` → `ffn_up`.
 fn tensor_stem(name: &str) -> &str {
     let rest = match name.strip_prefix("blk.") {
         Some(r) => r.split_once('.').map(|(_, tail)| tail).unwrap_or(r),
         None => name,
     };
-    rest.strip_suffix(".weight").unwrap_or(rest)
+    let rest = rest.strip_suffix(".weight").unwrap_or(rest);
+    match rest.rsplit_once('.') {
+        Some((head, idx)) if !idx.is_empty() && idx.bytes().all(|b| b.is_ascii_digit()) => head,
+        _ => rest,
+    }
 }
 
-/// Whether `arch`'s loader keeps the tensor `name` resident on an
-/// accelerator as dequantized f32 rather than in its quantized blocks.
+/// How a loader keeps a tensor resident on an accelerator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Residency {
+    /// In its quantized blocks (a `QMatMul` weight, a routed expert).
+    Quantized,
+    /// Dequantized to f32 (norms, biases, dequantized tables, …).
+    F32,
+    /// No rule names the tensor: somewhere between the two.
+    Unknown,
+}
+
+/// The residency of tensor `name` under `arch`'s loader.
 ///
-/// Only two kinds of tensor stay quantized on the device: the routed
-/// experts, and the weight matrices every loader wraps in a `QMatMul`
-/// ([`QUANTIZED_MATRIX_STEMS`] plus the output heads).  Everything else is
-/// counted as f32, which is what the loaders make of it — norms
-/// (`RmsNorm::from_qtensor` dequantizes), biases, routers (`ffn_gate_inp`,
-/// dequantized by the joshua-native loaders), deepseek2's `attn_k_b` /
-/// `attn_v_b` (folded into a dense f32 up-projection), deepseek4's
-/// hyper-connection base/scale vectors and any tensor in a dtype candle
-/// cannot represent (decoded to f32), lfm2's conv kernels — or, for a
-/// tensor no rule names, the conservative upper bound.  The embedding table
-/// is f32 for the stock loaders and for float dtypes on an accelerator
-/// ([`crate::token_embedding::TokenEmbedding`]), quantized otherwise.
-fn resident_as_f32(
-    arch: Option<Architecture>,
-    name: &str,
-    info: &crate::gguf_ext::RawTensorInfo,
-) -> bool {
+/// * Routed experts are never dequantized.
+/// * `deepseek4` decodes every tensor in a dtype candle cannot represent
+///   (IQ2_XXS, MXFP4, I32) to f32 on the device.
+/// * The embedding table is f32 for the stock candle loaders, and for float
+///   dtypes on an accelerator with the joshua-native loaders
+///   ([`crate::token_embedding::TokenEmbedding`]); quantized otherwise.
+/// * Output heads and the [`QUANTIZED_MATRIX_STEMS`] are `QMatMul`s.
+/// * Norms (`RmsNorm::from_qtensor` dequantizes), biases and the
+///   [`F32_STEMS`] are f32.
+/// * Anything else — or anything at all for a model candle cannot load —
+///   is [`Residency::Unknown`].
+fn residency(arch: Option<Architecture>, name: &str, info: &crate::gguf_ext::RawTensorInfo) -> Residency {
     if is_routed_expert(name) {
-        return false;
+        return Residency::Quantized;
     }
-    if arch == Some(Architecture::DeepSeek4) && !crate::gguf_ext::is_candle_supported(info.dtype) {
-        return true;
+    let Some(arch) = arch else {
+        return Residency::Unknown;
+    };
+    if arch == Architecture::DeepSeek4 && !crate::gguf_ext::is_candle_supported(info.dtype) {
+        return Residency::F32;
     }
-    if probed_embedding_names(arch).contains(&name) {
+    if probed_embedding_names(Some(arch)).contains(&name) {
         // GGUF dtype ids: 0 = F32, 1 = F16, 30 = BF16.
         let float_dtype = matches!(info.dtype, 0 | 1 | 30);
-        return match arch {
-            None => false,
-            Some(Architecture::Qwen3Moe | Architecture::DeepSeek2 | Architecture::DeepSeek4) => {
-                float_dtype
-            }
-            Some(_) => true,
+        let native = matches!(
+            arch,
+            Architecture::Qwen3Moe | Architecture::DeepSeek2 | Architecture::DeepSeek4
+        );
+        return if native && !float_dtype {
+            Residency::Quantized
+        } else {
+            Residency::F32
         };
     }
-    if arch.is_none() {
-        // Nothing candle loads: no device residency at all.
-        return false;
-    }
     if OUTPUT_HEAD_NAMES.contains(&name) {
-        return false;
+        return Residency::Quantized;
     }
     if name.ends_with(".bias") || name.contains("norm") {
-        return true;
+        return Residency::F32;
     }
-    !QUANTIZED_MATRIX_STEMS.contains(&tensor_stem(name))
+    let stem = tensor_stem(name);
+    if QUANTIZED_MATRIX_STEMS.contains(&stem) {
+        Residency::Quantized
+    } else if F32_STEMS.contains(&stem) {
+        Residency::F32
+    } else {
+        Residency::Unknown
+    }
 }
 
-/// Bytes the tensor `info` occupies resident on the device: f32 when the
-/// backend stores everything dense (`dense_f32`, OpenCL) or the loader
-/// dequantizes it, otherwise its quantized size (f32 for a dtype of unknown
-/// size, which no quantized kernel could hold anyway).
-fn resident_tensor_bytes(
+/// Lower and upper bounds on the bytes tensor `info` occupies resident on
+/// the device: its quantized size (f32 for a dtype of unknown size, which
+/// no quantized kernel could hold anyway) and its f32 size.  A tensor of
+/// known residency has equal bounds; an [`Residency::Unknown`] one spans
+/// both.  With `dense_f32` (OpenCL, whose storage is dense f32) everything
+/// is f32.
+fn resident_tensor_bounds(
     arch: Option<Architecture>,
     name: &str,
     info: &crate::gguf_ext::RawTensorInfo,
     dense_f32: bool,
-) -> u64 {
+) -> (u64, u64) {
     let f32_bytes = (info.elem_count() as u64).saturating_mul(4);
-    if dense_f32 || resident_as_f32(arch, name, info) {
-        return f32_bytes;
+    if dense_f32 {
+        return (f32_bytes, f32_bytes);
     }
-    crate::gguf_ext::type_size_bytes(info.dtype, info.elem_count())
+    let quantized = crate::gguf_ext::type_size_bytes(info.dtype, info.elem_count())
         .map(|b| b as u64)
-        .unwrap_or(f32_bytes)
+        .unwrap_or(f32_bytes);
+    match residency(arch, name, info) {
+        Residency::Quantized => (quantized, quantized),
+        Residency::F32 => (f32_bytes, f32_bytes),
+        Residency::Unknown => (quantized, f32_bytes),
+    }
+}
+
+/// Device footprint of a model's weights as the loader leaves them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DeviceFootprint {
+    /// Dense set, assuming every tensor of unknown residency stays
+    /// quantized — the least the loader can allocate.  A load is refused
+    /// only when this does not fit.
+    dense_lower: u64,
+    /// Dense set, assuming every tensor of unknown residency is f32 — the
+    /// most the loader can allocate.  Drives the placement decision and the
+    /// per-session caps.
+    dense_upper: u64,
+    /// Routed experts (always quantized, or f32 on OpenCL).
+    experts: u64,
 }
 
 /// Bytes the dense and routed-expert weights occupy on the device once the
 /// loader has placed them, split like [`weight_ranges`].
 ///
-/// Each tensor counts as [`resident_tensor_bytes`]; then every output-head
+/// Each tensor counts as [`resident_tensor_bounds`]; then every output-head
 /// tensor the scan counted is replaced by the one head the loader ends up
 /// resident with, which for a tied head is a second, quantized copy of the
 /// embedding table (see [`resident_head_bytes`]).
@@ -2805,23 +2882,26 @@ fn device_weight_bytes(
     header: &crate::gguf_ext::GgufHeader,
     arch: Option<Architecture>,
     dense_f32: bool,
-) -> (u64, u64) {
-    let mut dense = 0u64;
+) -> DeviceFootprint {
+    let mut lower = 0u64;
+    let mut upper = 0u64;
     let mut experts = 0u64;
     for (name, info) in &header.tensors {
-        let bytes = resident_tensor_bytes(arch, name, info, dense_f32);
+        let (lo, hi) = resident_tensor_bounds(arch, name, info, dense_f32);
         if is_routed_expert(name) {
-            experts = experts.saturating_add(bytes);
+            experts = experts.saturating_add(lo);
         } else {
-            dense = dense.saturating_add(bytes);
+            lower = lower.saturating_add(lo);
+            upper = upper.saturating_add(hi);
         }
     }
-    (
-        dense
-            .saturating_sub(scanned_head_bytes(header, dense_f32))
-            .saturating_add(resident_head_bytes(header, arch, dense_f32)),
+    let scanned = scanned_head_bytes(header, dense_f32);
+    let resident = resident_head_bytes(header, arch, dense_f32);
+    DeviceFootprint {
+        dense_lower: lower.saturating_sub(scanned).saturating_add(resident),
+        dense_upper: upper.saturating_sub(scanned).saturating_add(resident),
         experts,
-    )
+    }
 }
 
 /// Every tensor name any loader may read as the output head.  `output.weight`
@@ -3786,10 +3866,11 @@ mod tests {
 
     // ─── Hot-weight pinning ────────────────────────────────────────────────
 
-    /// Device sizing follows what each loader leaves resident: quantized
-    /// blocks by default, f32 where the loader dequantizes (stock loaders'
-    /// embedding tables, deepseek4's raw-dtype dense tensors, everything on
-    /// OpenCL), with the output head counted once as the loader keeps it.
+    /// Device sizing follows what each loader leaves resident — quantized
+    /// `QMatMul` matrices and routed experts, f32 for norms, biases, routers,
+    /// dequantized tables and deepseek4's raw-dtype tensors, both bounds for
+    /// a tensor no rule names — with the output head counted once as the
+    /// loader keeps it.
     #[test]
     fn device_weight_bytes_follows_loader_residency() {
         use std::collections::HashMap;
@@ -3812,56 +3893,64 @@ mod tests {
         let lfm2 = Some(Architecture::Lfm2);
         let ds4 = Some(Architecture::DeepSeek4);
         const EMBD_F32: u64 = 1024 * 4;
+        let fp = |h: &crate::gguf_ext::GgufHeader, a, f32| device_weight_bytes(h, a, f32);
+        let known = |lower: u64, experts: u64| DeviceFootprint { dense_lower: lower, dense_upper: lower, experts };
 
-        // joshua-native loader, CUDA/Metal: everything stays quantized.
-        assert_eq!(device_weight_bytes(&base, q, false), (576 + 576 + 144, 2 * 144));
-        // Stock loader: the embedding table is dequantized to f32, the head
-        // stays a quantized QMatMul.
-        assert_eq!(device_weight_bytes(&base, llama, false), (EMBD_F32 + 576 + 144, 2 * 144));
+        // joshua-native loader, CUDA/Metal: everything known and quantized.
+        assert_eq!(fp(&base, q, false), known(576 + 576 + 144, 2 * 144));
+        // Stock loader: the embedding table is f32, the head a quantized QMatMul.
+        assert_eq!(fp(&base, llama, false), known(EMBD_F32 + 576 + 144, 2 * 144));
         // OpenCL: every tensor is f32.
-        assert_eq!(
-            device_weight_bytes(&base, q, true),
-            ((1024 + 1024 + 256) * 4, 2 * 256 * 4)
-        );
+        assert_eq!(fp(&base, q, true), known((1024 + 1024 + 256) * 4, 2 * 256 * 4));
         assert_eq!(scanned_head_bytes(&base, false), 576);
         assert_eq!(resident_head_bytes(&base, q, false), 576);
 
-        // Tied head (no output tensor): the embedding is resident twice —
-        // as the table (quantized for joshua-native, f32 for stock) and as a
+        // Tied head (no head tensor): the embedding is resident twice — as
+        // the table (quantized for joshua-native, f32 for stock) and as a
         // quantized head copy.
         let mut tied = base.clone();
         tied.tensors.remove("output.weight");
         assert_eq!(scanned_head_bytes(&tied, false), 0);
         assert_eq!(resident_head_bytes(&tied, q, false), 576, "tied head is the quantized table");
-        assert_eq!(device_weight_bytes(&tied, q, false).0, 576 + 144 + 576);
-        assert_eq!(device_weight_bytes(&tied, llama, false).0, EMBD_F32 + 144 + 576);
-        assert_eq!(device_weight_bytes(&tied, None, false).0, 576 + 144 + 576, "unknown arch: tied");
-        assert_eq!(device_weight_bytes(&tied, q, true).0, (1024 + 256 + 1024) * 4);
+        assert_eq!(fp(&tied, q, false).dense_lower, 576 + 144 + 576);
+        assert_eq!(fp(&tied, llama, false), known(EMBD_F32 + 144 + 576, 2 * 144));
+        assert_eq!(fp(&tied, q, true).dense_lower, (1024 + 256 + 1024) * 4);
+        // A model candle cannot load: nothing is known, the bounds span
+        // quantized..f32 for every tensor (and the check never runs).
+        let unknown = fp(&tied, None, false);
+        assert_eq!(unknown.dense_lower, 576 + 144 + 576);
+        assert_eq!(unknown.dense_upper, EMBD_F32 + 1024 + 576);
 
-        // A float-dtype embedding is f32 on an accelerator for every loader
-        // (TokenEmbedding keeps only block-quantized tables quantized there).
+        // A float-dtype embedding is f32 on an accelerator for every loader.
         let mut f16_embd = tied.clone();
         f16_embd.tensors.insert(
             "token_embd.weight".to_string(),
             crate::gguf_ext::RawTensorInfo { dtype: 1, dims: vec![256, 4], offset: 0 },
         );
         // Table f32 + head copy at its on-disk f16 size (2 B/elem).
-        assert_eq!(device_weight_bytes(&f16_embd, q, false).0, EMBD_F32 + 144 + 1024 * 2);
+        assert_eq!(fp(&f16_embd, q, false), known(EMBD_F32 + 144 + 1024 * 2, 2 * 144));
 
         // deepseek4 decodes a raw-dtype (IQ2_XXS = 16) dense tensor to f32 on
-        // the device; a Q4_K dense tensor stays quantized.
+        // the device; its compressor projections stay quantized, the
+        // position vector is f32.
         let mut ds4h = base.clone();
         ds4h.tensors.insert(
             "blk.0.attn_output.weight".to_string(),
             crate::gguf_ext::RawTensorInfo { dtype: 16, dims: vec![256, 1], offset: 0 },
         );
-        let (dense, _) = device_weight_bytes(&ds4h, ds4, false);
-        assert_eq!(dense, 576 + 576 + 144 + 256 * 4, "IQ2_XXS dense tensor counted as f32");
+        ds4h.tensors.insert("blk.0.attn_compressor_kv.weight".to_string(), q4k(vec![256, 1]));
+        ds4h.tensors.insert("blk.0.attn_compressor_ape.weight".to_string(), q4k(vec![256, 1]));
+        ds4h.tensors.insert("output_hc_fn.weight".to_string(), q4k(vec![256, 1]));
+        assert_eq!(
+            fp(&ds4h, ds4, false),
+            known(576 + 576 + 144 + 1024 + 144 + 1024 + 144, 2 * 144),
+            "IQ2_XXS dense tensor and ape vector as f32, projections quantized"
+        );
 
-        // Everything that is not a QMatMul weight matrix is resident as f32:
-        // norms, biases, routers, deepseek2's split-KV halves, deepseek4's
-        // hyper-connection vectors, and any tensor no rule names.  The
-        // projections and heads stay quantized.
+        // Everything known to be dequantized is f32 in both bounds: norms,
+        // biases, routers, deepseek2's split-KV halves, deepseek4's
+        // hyper-connection vectors.  A tensor no rule names spans
+        // quantized..f32.  Projections stay quantized.
         let mut misc = base.clone();
         for n in [
             "blk.0.attn_norm.weight",
@@ -3869,19 +3958,40 @@ mod tests {
             "blk.0.ffn_gate_inp.weight",
             "blk.0.attn_k_b.weight",
             "blk.0.hc_attn_base.weight",
-            "blk.0.some_future_tensor.weight",
         ] {
             misc.tensors.insert(n.to_string(), q4k(vec![256, 1])); // 144 B quantized, 1024 B f32
         }
+        misc.tensors.insert("blk.0.some_future_tensor.weight".to_string(), q4k(vec![256, 1]));
         misc.tensors.insert("blk.0.attn_kv_b.weight".to_string(), q4k(vec![256, 1]));
         misc.tensors.insert("blk.0.ffn_gate_shexp.weight".to_string(), q4k(vec![256, 1]));
-        let (dense, _) = device_weight_bytes(&misc, Some(Architecture::DeepSeek2), false);
-        assert_eq!(dense, 576 + 576 + 144 + 6 * 1024 + 2 * 144, "six f32 vectors, two more quantized matrices");
+        let m = fp(&misc, Some(Architecture::DeepSeek2), false);
+        assert_eq!(m.dense_lower, 576 + 576 + 144 + 5 * 1024 + 144 + 2 * 144, "unknown tensor quantized in the lower bound");
+        assert_eq!(m.dense_upper, 576 + 576 + 144 + 5 * 1024 + 1024 + 2 * 144, "unknown tensor f32 in the upper bound");
         assert_eq!(tensor_stem("blk.12.attn_q.weight"), "attn_q");
         assert_eq!(tensor_stem("output.weight"), "output");
         assert_eq!(tensor_stem("blk.0.attn_q.bias"), "attn_q.bias");
-        // A model candle cannot load has no device residency to size.
-        assert_eq!(device_weight_bytes(&misc, None, false).0, 576 + 144 + 8 * 144 + 576);
+        assert_eq!(tensor_stem("blk.0.ffn_up.7.weight"), "ffn_up");
+        assert_eq!(tensor_stem("blk.0.feed_forward.w1.weight"), "feed_forward.w1");
+
+        // Mixtral's per-expert matrices (`ffn_gate.<i>`) and lfm2's aliases
+        // are QMatMuls: quantized in both bounds, so a fitting model is never
+        // refused for them.
+        let mut mixtral = base.clone();
+        for n in ["blk.0.ffn_gate.3.weight", "blk.0.ffn_up.3.weight", "blk.0.ffn_down.3.weight"] {
+            mixtral.tensors.insert(n.to_string(), q4k(vec![256, 1]));
+        }
+        assert_eq!(fp(&mixtral, llama, false), known(EMBD_F32 + 576 + 144 + 3 * 144, 2 * 144));
+        let mut lfm = base.clone();
+        for n in [
+            "blk.0.feed_forward.w1.weight",
+            "blk.0.mlp.gate_proj.weight",
+            "blk.0.shortconv.in_proj.weight",
+            "blk.0.self_attn.out_proj.weight",
+        ] {
+            lfm.tensors.insert(n.to_string(), q4k(vec![256, 1]));
+        }
+        lfm.tensors.insert("blk.0.shortconv.conv.weight".to_string(), q4k(vec![256, 1])); // dequantized kernel
+        assert_eq!(fp(&lfm, lfm2, false), known(EMBD_F32 + 576 + 144 + 4 * 144 + 1024, 2 * 144));
 
         // LFM2: an alias head is a head (counted once, no tied copy); for
         // any other loader it is dead weight and the embedding is tied.
@@ -3889,8 +3999,8 @@ mod tests {
             let mut aliased = tied.clone();
             aliased.tensors.insert(alias.to_string(), q4k(vec![256, 4]));
             assert_eq!(scanned_head_bytes(&aliased, false), 576, "{alias}: scanned");
-            assert_eq!(device_weight_bytes(&aliased, lfm2, false).0, EMBD_F32 + 144 + 576, "{alias}: LFM2 head");
-            assert_eq!(device_weight_bytes(&aliased, q, false).0, 576 + 144 + 576, "{alias}: alias dropped, tied");
+            assert_eq!(fp(&aliased, lfm2, false).dense_lower, EMBD_F32 + 144 + 576, "{alias}: LFM2 head");
+            assert_eq!(fp(&aliased, q, false).dense_lower, 576 + 144 + 576, "{alias}: alias dropped, tied");
         }
 
         // LFM2 embedding aliases: the table under `model.embed_tokens.weight`
@@ -3900,11 +4010,12 @@ mod tests {
         lfm2_embd.tensors.remove("token_embd.weight");
         lfm2_embd.tensors.insert("model.embed_tokens.weight".to_string(), q4k(vec![256, 4]));
         assert_eq!(resident_head_bytes(&lfm2_embd, lfm2, false), 576, "alias table is the tied head");
-        assert_eq!(device_weight_bytes(&lfm2_embd, lfm2, false).0, EMBD_F32 + 144 + 576);
-        // Another loader never probes that name: a tensor no rule names,
-        // sized f32 conservatively, and no head.
+        assert_eq!(fp(&lfm2_embd, lfm2, false).dense_lower, EMBD_F32 + 144 + 576);
+        // Another loader never probes that name: a tensor no rule names
+        // (quantized..f32), and no head.
         assert_eq!(resident_head_bytes(&lfm2_embd, q, false), 0);
-        assert_eq!(device_weight_bytes(&lfm2_embd, q, false).0, EMBD_F32 + 144);
+        assert_eq!(fp(&lfm2_embd, q, false).dense_lower, 576 + 144);
+        assert_eq!(fp(&lfm2_embd, q, false).dense_upper, EMBD_F32 + 144);
 
         // Several head names present: only one ends up resident.  Sizing
         // cannot know which read succeeds, so it keeps the largest candidate
@@ -3914,10 +4025,10 @@ mod tests {
         two.tensors.insert("lm_head.weight".to_string(), q4k(vec![256, 4]));
         assert_eq!(scanned_head_bytes(&two, false), 144 + 576);
         assert_eq!(resident_head_bytes(&two, lfm2, false), 576, "largest LFM2 candidate");
-        assert_eq!(device_weight_bytes(&two, lfm2, false).0, EMBD_F32 + 144 + 576);
+        assert_eq!(fp(&two, lfm2, false).dense_lower, EMBD_F32 + 144 + 576);
         // Another loader: candidates are output.weight and the table fallback.
         assert_eq!(resident_head_bytes(&two, q, false), 576);
-        assert_eq!(device_weight_bytes(&two, q, false).0, 576 + 144 + 576);
+        assert_eq!(fp(&two, q, false).dense_lower, 576 + 144 + 576);
     }
 
     fn header_with_tensors(

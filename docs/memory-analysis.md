@@ -107,8 +107,13 @@ else is counted as f32, which is what the loaders make of it — norms,
 biases, routers, deepseek2's split-KV halves (folded into a dense
 up-projection), deepseek4's hyper-connection vectors and raw-dtype
 (IQ2_XXS/MXFP4) dense tensors, the stock candle loaders' embedding tables,
-float-dtype tables on an accelerator — or, for a tensor no rule names, the
-conservative upper bound.  Everything is f32 on OpenCL.  A tied output head (no head tensor) is a second,
+float-dtype tables on an accelerator.  A tensor no rule names spans both:
+the dense set is carried as a *lower* bound (unknown tensors quantized)
+and an *upper* bound (unknown tensors f32).  A load is refused only when
+the lower bound does not fit — a hard rejection needs certainty, so a gap
+in the name rules can never reject a fitting model — while the soft
+decisions (expert placement, per-session caps) use the upper bound and err
+on the safe side.  Everything is f32 on OpenCL.  A tied output head (no head tensor) is a second,
 quantized copy of the embedding table; where several head names are
 present the largest candidate the loader could end up reading is counted,
 never fewer.  Models candle cannot load at all (NPU-only) allocate nothing
