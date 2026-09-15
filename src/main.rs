@@ -145,6 +145,28 @@ impl std::str::FromStr for ExpertCacheArg {
     }
 }
 
+/// `--vram-expert-cache` value: `auto` (size the device-expert cache from the
+/// accelerator's free memory at load) or a fixed MiB budget.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VramExpertCacheArg {
+    Auto,
+    MiB(usize),
+}
+
+impl std::str::FromStr for VramExpertCacheArg {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.eq_ignore_ascii_case("auto") {
+            Ok(Self::Auto)
+        } else {
+            s.parse::<usize>()
+                .map(Self::MiB)
+                .map_err(|_| "expected `auto` or a MiB byte budget".to_string())
+        }
+    }
+}
+
 /// An mmap-based LLM inference engine — a Rust clone of Cactus.
 #[derive(Parser)]
 #[command(name = "joshua", version, about, long_about = None)]
@@ -210,6 +232,12 @@ enum Commands {
         /// fixed expert count.  Overrides --pin-hot-experts when given a count.
         #[arg(long, env = "JOSHUA_EXPERT_CACHE", value_parser = clap::value_parser!(ExpertCacheArg))]
         expert_cache: Option<ExpertCacheArg>,
+        /// Size the bounded VRAM expert cache (#62): upload a hot subset of the
+        /// routed experts to the accelerator.  `auto` derives the device byte
+        /// budget at load (device free − dense − headroom − KV); a number is a
+        /// fixed MiB budget; unset/0 disables (all experts stay on the host).
+        #[arg(long, env = "JOSHUA_VRAM_EXPERT_CACHE", value_parser = clap::value_parser!(VramExpertCacheArg))]
+        vram_expert_cache: Option<VramExpertCacheArg>,
         /// Lock the always-touched weights into RAM (mlock).  Needs the
         /// process memlock limit to cover the hot set: `LimitMEMLOCK=infinity`
         /// (systemd), `ulimit -l unlimited`, or /etc/security/limits.conf.
@@ -319,6 +347,12 @@ enum Commands {
         /// fixed expert count.  Overrides --pin-hot-experts when given a count.
         #[arg(long, env = "JOSHUA_EXPERT_CACHE", value_parser = clap::value_parser!(ExpertCacheArg))]
         expert_cache: Option<ExpertCacheArg>,
+        /// Size the bounded VRAM expert cache (#62): upload a hot subset of the
+        /// routed experts to the accelerator.  `auto` derives the device byte
+        /// budget at load (device free − dense − headroom − KV); a number is a
+        /// fixed MiB budget; unset/0 disables (all experts stay on the host).
+        #[arg(long, env = "JOSHUA_VRAM_EXPERT_CACHE", value_parser = clap::value_parser!(VramExpertCacheArg))]
+        vram_expert_cache: Option<VramExpertCacheArg>,
         /// Lock the always-touched weights into RAM (mlock).  Needs the
         /// process memlock limit to cover the hot set: `LimitMEMLOCK=infinity`
         /// (systemd), `ulimit -l unlimited`, or /etc/security/limits.conf.
@@ -404,6 +438,7 @@ async fn main() -> anyhow::Result<()> {
             pin_hot_weights,
             pin_hot_experts,
             expert_cache,
+            vram_expert_cache,
             mlock_hot_weights,
             expert_placement,
             vram_budget,
@@ -433,6 +468,11 @@ async fn main() -> anyhow::Result<()> {
                 Some(ExpertCacheArg::Count(n)) => (n, false),
                 None => (pin_hot_experts, false),
             };
+            let vram_bytes: Option<u64> = match vram_expert_cache {
+                Some(VramExpertCacheArg::Auto) => Some(0), // engine sizes at load
+                Some(VramExpertCacheArg::MiB(n)) if n > 0 => Some(n as u64 * 1024 * 1024),
+                _ => None,
+            };
             let opts = EngineOptions::with_n_ctx(n_ctx)
                 .backend(device.into())
                 .huge_pages(huge_pages.into())
@@ -442,6 +482,7 @@ async fn main() -> anyhow::Result<()> {
                 .pin_hot_weights(pin_hot)
                 .pin_hot_experts(pin_hot_experts)
                 .expert_cache_auto(expert_cache_auto)
+                .vram_expert_cache(vram_bytes)
                 .mlock_hot_weights(
                     mlock_hot_weights
                         .map(MlockMode::from)
@@ -510,6 +551,7 @@ async fn main() -> anyhow::Result<()> {
             pin_hot_weights,
             pin_hot_experts,
             expert_cache,
+            vram_expert_cache,
             mlock_hot_weights,
             expert_placement,
             vram_budget,
@@ -524,6 +566,11 @@ async fn main() -> anyhow::Result<()> {
                 Some(ExpertCacheArg::Count(n)) => (n, false),
                 None => (pin_hot_experts, false),
             };
+            let vram_bytes: Option<u64> = match vram_expert_cache {
+                Some(VramExpertCacheArg::Auto) => Some(0), // engine sizes at load
+                Some(VramExpertCacheArg::MiB(n)) if n > 0 => Some(n as u64 * 1024 * 1024),
+                _ => None,
+            };
             let opts = EngineOptions::with_n_ctx(n_ctx)
                 .backend(device.into())
                 .huge_pages(huge_pages.into())
@@ -533,6 +580,7 @@ async fn main() -> anyhow::Result<()> {
                 .pin_hot_weights(pin_hot)
                 .pin_hot_experts(pin_hot_experts)
                 .expert_cache_auto(expert_cache_auto)
+                .vram_expert_cache(vram_bytes)
                 .mlock_hot_weights(
                     mlock_hot_weights
                         .map(MlockMode::from)

@@ -331,7 +331,7 @@ impl QuantizedModel {
         // engine will actually serve instead of the model's context length.
         n_ctx: usize,
     ) -> Result<Self> {
-        Self::from_gguf_mmap_placed(gguf, reader, device, device, mmap, file, n_ctx)
+        Self::from_gguf_mmap_placed(gguf, reader, device, device, mmap, file, n_ctx, None)
     }
 
     /// [`QuantizedModel::from_gguf_mmap`] with an explicit device for the
@@ -353,6 +353,7 @@ impl QuantizedModel {
         mmap: Option<std::sync::Arc<memmap2::Mmap>>,
         file: Option<std::sync::Arc<std::fs::File>>,
         n_ctx: usize,
+        device_expert_cache_bytes: Option<u64>,
     ) -> Result<Self> {
         let arch = Architecture::detect(&gguf.metadata).map_err(candle_core::Error::Msg)?;
 
@@ -436,6 +437,7 @@ impl QuantizedModel {
                 device,
                 expert_device,
                 mmap,
+                device_expert_cache_bytes,
             )
             .map(Self::Qwen3Moe),
             Architecture::DeepSeek2 => crate::quantized_deepseek2::ModelWeights::from_gguf_mmap_placed(
@@ -444,6 +446,7 @@ impl QuantizedModel {
                 device,
                 expert_device,
                 mmap,
+                device_expert_cache_bytes,
             )
             .map(Self::DeepSeek2),
             Architecture::DeepSeek4 => crate::quantized_deepseek4::ModelWeights::from_gguf_mmap(
@@ -616,6 +619,31 @@ impl QuantizedModel {
             Self::Qwen3Moe(m) => m.forward(input, index_pos),
             Self::DeepSeek2(m) => m.forward(input, index_pos),
             Self::DeepSeek4(m) => m.forward(input, index_pos),
+        }
+    }
+
+    /// Layer-streaming prefill over a set of bounded chunks.  See
+    /// [`crate::stream_prefill`].  Only the joshua-native MoE loaders
+    /// (qwen3moe, deepseek2, deepseek4) implement it today; other
+    /// architectures report an unsupported error and the engine falls back to
+    /// the standard chunked prefill.
+    /// Whether this architecture has a native layer-streaming prefill path.
+    pub fn supports_streaming(&self) -> bool {
+        matches!(self, Self::Qwen3Moe(_) | Self::DeepSeek2(_) | Self::DeepSeek4(_))
+    }
+
+    pub fn prefill_streamed(
+        &mut self,
+        chunks: &[crate::stream_prefill::Chunk],
+        device: &Device,
+    ) -> Result<Tensor> {
+        match self {
+            Self::Qwen3Moe(m) => crate::stream_prefill::stream_prefill(m, chunks, device),
+            Self::DeepSeek2(m) => crate::stream_prefill::stream_prefill(m, chunks, device),
+            Self::DeepSeek4(m) => crate::stream_prefill::stream_prefill(m, chunks, device),
+            _ => Err(candle_core::Error::Msg(
+                "layer-streaming prefill is not implemented for this architecture".into(),
+            )),
         }
     }
 

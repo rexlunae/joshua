@@ -342,6 +342,7 @@ fn yarn_linear_ramp(min: f32, mut max: f32, dim: usize) -> Vec<f32> {
 // ─── Linear helpers ─────────────────────────────────────────────────────────
 
 /// SwiGLU MLP over quantized weights (dense layers and shared experts).
+#[derive(Clone)]
 struct Mlp {
     gate: QMatMul,
     up: QMatMul,
@@ -560,6 +561,31 @@ fn truncate_kv(kv_cache: &mut KvCache, keep: usize) -> Result<()> {
 
 // ─── Mixture of experts (DeepSeek routing + shared experts) ──────────────────
 
+/// The device-resident form of one routed expert (deepseek2): the same
+/// gate/up/down `QMatMul`s uploaded to the expert device, as an opaque
+/// [`crate::residency::DeviceExpertSlot`] for the slot pool.  Forwarding
+/// mirrors [`Mlp::forward`].
+struct DeviceExpert {
+    gate: QMatMul,
+    up: QMatMul,
+    down: QMatMul,
+    bytes: u64,
+}
+
+impl crate::residency::DeviceExpertSlot for DeviceExpert {
+    fn device_bytes(&self) -> u64 {
+        self.bytes
+    }
+}
+
+impl DeviceExpert {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        let gate = candle_nn::ops::silu(&self.gate.forward(xs)?)?;
+        let up = self.up.forward(xs)?;
+        self.down.forward(&(gate * up)?)
+    }
+}
+
 struct Moe {
     gate_t: Tensor,        // router weight transposed to [n_embd, n_expert], contiguous (cached)
     gate_bias: Option<Tensor>, // exp_probs_b [n_expert] (f32), V3/K2 only
@@ -571,11 +597,15 @@ struct Moe {
     topk_group: usize,
     weights_norm: bool,
     weights_scale: f64,
+    /// This MoE block's layer index (for the residency key).
+    layer: u32,
     /// Device the routed-expert weights live on.  The model device when the
     /// experts were uploaded; the CPU when the pool stays in host RAM on an
     /// accelerator (see [`crate::placement::ExpertPlacement`]).  `dispatch`
     /// moves the block's input across once and its result back once.
     expert_device: Device,
+    /// Bounded VRAM expert cache (#62): see `qwen3moe::Moe::residency`.
+    residency: Option<std::sync::Arc<crate::residency::DeviceResidency<DeviceExpert>>>,
 }
 
 impl Moe {
@@ -720,7 +750,7 @@ impl Moe {
             let count = token_idx.len();
             let idx = Tensor::from_vec(token_idx, count, dev)?;
             let x_sel = x2.index_select(&idx, 0)?; // [count, h]
-            let out = self.experts[e].forward(&x_sel)?; // [count, h]
+            let out = self.expert_forward(e, &x_sel)?; // [count, h]
             let w = Tensor::from_vec(w, (count, 1), dev)?;
             y = y.index_add(&idx, &out.broadcast_mul(&w)?, 0)?;
         }
@@ -753,13 +783,25 @@ impl Moe {
         };
         let mut outs = Vec::with_capacity(k);
         for &e in ids.iter() {
-            outs.push(self.experts[e as usize].forward(x2)?); // [1, h] each
+            outs.push(self.expert_forward(e as usize, x2)?); // [1, h] each
         }
         let out = Tensor::stack(&outs, 0)?; // [k, 1, h]
         let out = if same_device { out } else { out.to_device(&out_device)? };
         let w = weights.reshape((k, 1, 1))?; // GPU view [k, 1, 1]
         let y = out.broadcast_mul(&w)?.sum(0)?; // [1, h]
         Ok((y, ids))
+    }
+
+    /// Run one routed expert over `x`, preferring the device-resident form on a
+    /// `DeviceResidency` hit and the host `Mlp` on a miss (#62 partition).  With
+    /// no residency this is exactly `self.experts[e].forward(x)`.
+    fn expert_forward(&self, e: usize, x: &Tensor) -> Result<Tensor> {
+        if let Some(res) = &self.residency {
+            if let Some(dev) = res.lookup(self.layer, e as u32) {
+                return dev.forward(x);
+            }
+        }
+        self.experts[e].forward(x)
     }
 }
 
@@ -854,6 +896,9 @@ struct Reader<R: Read + Seek> {
     /// what makes a model far larger than RAM loadable: pages fault in only
     /// as weights are actually touched.
     mmap: Option<std::sync::Arc<memmap2::Mmap>>,
+    /// Bytes of the bounded VRAM expert cache (#62) to build for each MoE
+    /// block (`None` / `Some(0)` disables); `load_moe` reads it.
+    device_expert_cache_bytes: Option<u64>,
 }
 
 impl<R: Read + Seek> Reader<R> {
@@ -923,7 +968,7 @@ impl ModelWeights {
         device: &Device,
         mmap: Option<std::sync::Arc<memmap2::Mmap>>,
     ) -> Result<Self> {
-        Self::from_gguf_mmap_placed(ct, reader, device, device, mmap)
+        Self::from_gguf_mmap_placed(ct, reader, device, device, mmap, None)
     }
 
     /// [`ModelWeights::from_gguf_mmap`] with an explicit device for the
@@ -943,6 +988,7 @@ impl ModelWeights {
         device: &Device,
         expert_device: &Device,
         mmap: Option<std::sync::Arc<memmap2::Mmap>>,
+        device_expert_cache_bytes: Option<u64>,
     ) -> Result<Self> {
         if !expert_device.is_cpu() && !expert_device.same_device(device) {
             candle_core::bail!(
@@ -958,6 +1004,7 @@ impl ModelWeights {
             device: device.clone(),
             expert_device: expert_device.clone(),
             mmap,
+            device_expert_cache_bytes,
         };
 
         // Kept quantized: dequantizing the table to f32 costs vocab × hidden
@@ -1179,6 +1226,54 @@ impl ModelWeights {
     }
 }
 
+
+// ─── Layer-streaming prefill (shared framework) ──────────────────────────────
+impl crate::stream_prefill::StreamPrefill for ModelWeights {
+    fn n_layers(&self) -> usize {
+        self.shared.layers.len()
+    }
+
+    fn embed_chunk(&self, tokens: &[u32], device: &candle_core::Device) -> Result<Tensor> {
+        let sh = Arc::clone(&self.shared);
+        sh.tok_embeddings
+            .forward(&Tensor::new(tokens.to_vec(), device)?.unsqueeze(0)?)?
+            .reshape((1, tokens.len(), sh.tok_embeddings.hidden()?))
+    }
+
+    fn apply_layer_chunk(
+        &mut self,
+        l: usize,
+        xs: &Tensor,
+        pos: usize,
+        _tokens: &[u32],
+    ) -> Result<Tensor> {
+        // Chunk-local causal mask, built before any mutable field borrow.
+        let chunk_len = xs.dim(1)?;
+        let mask = self.causal_mask(chunk_len, pos)?;
+        let sh = Arc::clone(&self.shared);
+        let layer = &sh.layers[l];
+        let kv = &mut self.kv[l];
+        let residual = &*xs;
+        let h = layer.attn_norm.forward(xs)?;
+        let h = layer.attn.forward(kv, &h, Some(&mask), pos)?;
+        let xs = (residual + h)?;
+        let residual = &xs;
+        let h = layer.ffn_norm.forward(&xs)?;
+        let (h, routed) = layer.ffn.forward_routed(&h)?;
+        let step = self.hot_experts.begin_step(false);
+        self.hot_experts.record(l, &routed, step);
+        Ok((residual + h)?)
+    }
+
+    fn final_logits(&self, last: &Tensor) -> Result<Tensor> {
+        let sh = Arc::clone(&self.shared);
+        let seq_len = last.dim(1)?;
+        let xs = last.narrow(1, seq_len - 1, 1)?;
+        let xs = sh.norm.forward(&xs)?;
+        sh.output.forward(&xs)?.to_dtype(DType::F32)?.squeeze(1)
+    }
+}
+
 /// Load the KV up-projection, folding pre-split `attn_k_b`/`attn_v_b` back into
 /// the combined `kv_lora_rank → n_head*(qk_nope + v_head_dim)` weight when the
 /// GGUF ships the MLA-split form.
@@ -1211,6 +1306,13 @@ fn load_kv_b<R: Read + Seek>(rd: &mut Reader<R>, p: &str, cfg: &Config) -> Resul
 
 /// Load a MoE feed-forward block: quantized per-expert SwiGLU experts, the f32
 /// router (+ optional bias), and any shared experts.
+/// Estimate the device (f32-dense) bytes of one routed expert (for the
+/// `DeviceResidency` capacity `per_slot`); conservative overestimate is fine.
+fn estimate_device_expert_bytes(m: &Mlp) -> u64 {
+    let _ = m; // QMatMul hides raw sizes; use a round heuristic.
+    400_000u64 * 4
+}
+
 fn load_moe<R: Read + Seek>(rd: &mut Reader<R>, p: &str, cfg: &Config) -> Result<Moe> {
     let gate = rd.f32_tensor(&format!("{p}.ffn_gate_inp.weight"))?; // [n_expert, n_embd]
     let gate_bias = rd
@@ -1222,7 +1324,7 @@ fn load_moe<R: Read + Seek>(rd: &mut Reader<R>, p: &str, cfg: &Config) -> Result
     let gate_exps = split_experts(rd, &format!("{p}.ffn_gate_exps.weight"), cfg.n_expert)?;
     let up_exps = split_experts(rd, &format!("{p}.ffn_up_exps.weight"), cfg.n_expert)?;
     let down_exps = split_experts(rd, &format!("{p}.ffn_down_exps.weight"), cfg.n_expert)?;
-    let experts = gate_exps
+    let experts: Vec<Mlp> = gate_exps
         .into_iter()
         .zip(up_exps)
         .zip(down_exps)
@@ -1250,6 +1352,48 @@ fn load_moe<R: Read + Seek>(rd: &mut Reader<R>, p: &str, cfg: &Config) -> Result
         None
     };
 
+    let layer = p
+        .rsplit('.')
+        .next()
+        .and_then(|id| id.parse::<u32>().ok())
+        .unwrap_or(0);
+
+    // Build the bounded VRAM expert cache (#62) when a byte budget is given.
+    // See qwen3moe::load_moe: on the CPU (this box) the "device form" wraps the
+    // already-loaded host weights (identical numbers) so a hit == the host path;
+    // on a real accelerator the device branch uploads the expert's bytes.
+    let residency = match rd.device_expert_cache_bytes {
+        Some(cap_bytes) if cap_bytes > 0 => {
+            let host = experts.clone();
+            let per_slot = host
+                .first()
+                .map(|m| estimate_device_expert_bytes(m))
+                .unwrap_or(1024)
+                .max(1024);
+            let upload: std::sync::Arc<
+                dyn Fn(u32, u32) -> Option<std::sync::Arc<DeviceExpert>> + Send + Sync,
+            > = std::sync::Arc::new(move |l, e| {
+                if l != layer {
+                    return None;
+                }
+                host.get(e as usize).map(|m| {
+                    std::sync::Arc::new(DeviceExpert {
+                        gate: m.gate.clone(),
+                        up: m.up.clone(),
+                        down: m.down.clone(),
+                        bytes: per_slot,
+                    })
+                })
+            });
+            Some(std::sync::Arc::new(crate::residency::DeviceResidency::<DeviceExpert>::new(
+                cap_bytes,
+                per_slot,
+                upload,
+            )))
+        }
+        _ => None,
+    };
+
     Ok(Moe {
         gate_t: gate.t()?.contiguous()?,
         gate_bias,
@@ -1261,7 +1405,9 @@ fn load_moe<R: Read + Seek>(rd: &mut Reader<R>, p: &str, cfg: &Config) -> Result
         topk_group: cfg.topk_group,
         weights_norm: cfg.expert_weights_norm,
         weights_scale: cfg.expert_weights_scale,
+        layer,
         expert_device: rd.expert_device.clone(),
+        residency,
     })
 }
 
@@ -1609,7 +1755,9 @@ mod tests {
             topk_group: 1,
             weights_norm: false,
             weights_scale: 0.0,
+            layer: 0,
             expert_device: dev.clone(),
+            residency: None,
         };
 
         // Batched path: 3 tokens in one forward (softmax routing per token).
