@@ -329,7 +329,7 @@ impl QStorage {
     )> {
         match self {
             QStorage::Cuda(storage) => storage.device_ptr_with_guard(stream),
-            QStorage::Metal(_) | QStorage::Cpu(_) => {
+            QStorage::Metal(_) | QStorage::Cpu(_) | QStorage::OpenCl(_) => {
                 crate::bail!("not implemented");
             }
         }
