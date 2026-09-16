@@ -706,6 +706,69 @@ impl candle::CustomOp2 for RmsNorm {
         let newstorage = candle::MetalStorage::new(output, device.clone(), elem_count, s1.dtype());
         Ok((newstorage, l1.shape().clone()))
     }
+    #[cfg(feature = "vulkan")]
+    fn vulkan_fwd(
+        &self,
+        s1: &candle::VulkanStorage,
+        l1: &Layout,
+        s2: &candle::VulkanStorage,
+        l2: &Layout,
+    ) -> Result<(candle::VulkanStorage, Shape)> {
+        use candle::backend::BackendStorage;
+        use candle::{CpuStorage, D, Device, Tensor};
+        let eps = self.eps;
+
+        let dims = l1.shape().dims().to_vec();
+        let (o1, o2) = match l1.contiguous_offsets() {
+            Some(o) => o,
+            None => candle::bail!("vulkan rms-norm: input has to be contiguous"),
+        };
+        let (a1, a2) = match l2.contiguous_offsets() {
+            Some(o) => o,
+            None => candle::bail!("vulkan rms-norm: alpha has to be contiguous"),
+        };
+        let device = Device::Vulkan(s1.device.clone());
+
+        let x_cpu = s1.to_cpu_storage()?;
+        let xs = match &x_cpu {
+            CpuStorage::F32(d) => Tensor::from_vec(d[o1..o2].to_vec(), dims.clone(), &device)?,
+            CpuStorage::F16(d) => Tensor::from_vec(d[o1..o2].to_vec(), dims.clone(), &device)?,
+            CpuStorage::BF16(d) => Tensor::from_vec(d[o1..o2].to_vec(), dims.clone(), &device)?,
+            CpuStorage::F64(d) => Tensor::from_vec(d[o1..o2].to_vec(), dims.clone(), &device)?,
+            _ => candle::bail!("vulkan rms-norm: unsupported input dtype {:?}", x_cpu),
+        };
+        let a_cpu = s2.to_cpu_storage()?;
+        let a_dims = l2.shape().dims().to_vec();
+        let alpha = match &a_cpu {
+            CpuStorage::F32(d) => Tensor::from_vec(d[a1..a2].to_vec(), a_dims, &device)?,
+            CpuStorage::F16(d) => Tensor::from_vec(d[a1..a2].to_vec(), a_dims, &device)?,
+            CpuStorage::BF16(d) => Tensor::from_vec(d[a1..a2].to_vec(), a_dims, &device)?,
+            CpuStorage::F64(d) => Tensor::from_vec(d[a1..a2].to_vec(), a_dims, &device)?,
+            _ => candle::bail!("vulkan rms-norm: unsupported alpha dtype {:?}", a_cpu),
+        };
+
+        // mean(x^2) over the last dim (native sum-reduce), denom = sqrt(mean+eps).
+        let sq = xs.sqr()?;
+        let mean = sq.sum(D::Minus1)?.unsqueeze(D::Minus1)?;
+        let mean = mean.broadcast_as(dims.clone())?.contiguous()?;
+        // Elementwise scalar add of eps (candle Scalars/affine on the device).
+        let mean_eps = mean.affine(1.0f64, eps as f64)?;
+        let denom = mean_eps.sqrt()?;
+        let x_norm = xs.broadcast_div(&denom)?.contiguous()?;
+        // alpha is (hidden,) broadcast over rows; materialize then multiply.
+        let alpha_b = alpha.broadcast_as(dims.clone())?.contiguous()?;
+        let out = x_norm.mul(&alpha_b)?.contiguous()?;
+
+        let (out_storage, out_layout) = out.storage_and_layout();
+        match &*out_storage {
+            candle::Storage::Vulkan(vs) => {
+                let vs = vs.try_clone(&out_layout)?;
+                Ok((vs, Shape::from_dims(&dims)))
+            }
+            _ => candle::bail!("vulkan rms-norm produced non-vulkan storage"),
+        }
+    }
+
 }
 
 pub fn rms_norm_slow(x: &Tensor, alpha: &Tensor, eps: f32) -> Result<Tensor> {
@@ -1418,6 +1481,48 @@ mod vulkan_softmax_tests {
         assert!(
             worst < 1e-4,
             "vulkan softmax diverged from CPU: worst diff {worst:.3e}"
+        );
+        Ok(())
+    }
+
+    /// On-device rms_norm must match the CPU result. This exercises the vendored
+    /// `RmsNorm::vulkan_fwd` custom-op path. Run with:
+    ///   cargo test -p candle-nn --features vulkan -- --ignored vulkan_rmsnorm
+    #[test]
+    #[ignore]
+    fn rms_norm_vulkan_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+        use super::rms_norm;
+        let vk = match candle::VulkanDevice::new(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping vulkan rms_norm test: {e}");
+                return Ok(());
+            }
+        };
+        let vdevice = Device::Vulkan(vk);
+        let (r, c) = (5usize, 8usize);
+        let x: Vec<f32> = (0..r * c).map(|i| ((i % 13) as f32 - 6.0) * 0.7).collect();
+        let alpha: Vec<f32> = (0..c).map(|i| 0.8 + 0.1 * (i % 4) as f32).collect();
+        let eps = 1e-5f32;
+
+        let xc = Tensor::from_vec(x.clone(), (r, c), &Device::Cpu)?;
+        let ac = Tensor::from_vec(alpha.clone(), (c,), &Device::Cpu)?;
+        let out_cpu = rms_norm(&xc, &ac, eps)?.to_vec2::<f32>()?;
+
+        let xv = Tensor::from_vec(x, (r, c), &vdevice)?;
+        let av = Tensor::from_vec(alpha, (c,), &vdevice)?;
+        let out_vk = rms_norm(&xv, &av, eps)?
+            .to_device(&Device::Cpu)?
+            .to_vec2::<f32>()?;
+
+        let mut worst = 0.0f32;
+        for (a, b) in out_cpu.iter().flatten().zip(out_vk.iter().flatten()) {
+            worst = worst.max((a - b).abs());
+        }
+        eprintln!("vulkan rms_norm: worst diff = {worst:.3e}");
+        assert!(
+            worst < 1e-4,
+            "vulkan rms_norm diverged from CPU: worst diff {worst:.3e}"
         );
         Ok(())
     }
