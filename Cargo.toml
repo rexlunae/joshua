@@ -65,16 +65,14 @@ tls = ["dep:axum-server", "dep:rustls"]
 # candle-metal-kernels, patched with offset-aware quantized entry points.
 # Always applied so the vendored crate is the one candle-core links against.
 [patch.crates-io]
-# candle-core is vendored so joshua can add an OpenCL accelerator backend
-# (opencl feature: OpenClDevice/OpenClStorage + BackendStorage ops) for running
-# the deepseek4 dense set on Intel OpenCL hardware. Inactive until the
-# `opencl` feature is added; the default build is byte-for-byte unchanged.
-candle-core = { path = "vendor/candle-core" }
-# candle-nn is vendored so joshua can add device-native CustomOp implementations
-# (e.g. SoftmaxLastDim / RmsNorm `vulkan_fwd`) for the Vulkan accelerator
-# backend, mirroring how candle-core is vendored. Inactive until the `vulkan`
-# feature is used; the default build is unchanged.
-candle-nn = { path = "vendor/candle-nn" }
+# candle-core is patched to the rexlunae/candle-core fork (a candle-core 0.11.0
+# with the Vulkan accelerator backend: VulkanDevice/VulkanStorage + CustomOp1/2
+# ::vulkan_fwd hooks). Using a git fork means joshua's work doesn't wait on
+# upstream; the vendored copy in vendor/candle-core is the same content.
+candle-core = { git = "https://github.com/rexlunae/candle-core.git", branch = "joshua-vulkan" }
+# candle-nn patched to the rexlunae/candle-nn fork (device-native CustomOp
+# `vulkan_fwd` for softmax/RMSNorm), so it doesn't wait on upstream either.
+candle-nn = { git = "https://github.com/rexlunae/candle-nn.git", branch = "joshua-vulkan" }
 # candle-kernels is patched to a tiny fork (rexlunae/candle-kernels) carrying
 # two CUDA-12.4 compatibility fixes, instead of vendoring the crate's ~21K
 # lines of C kernels into this tree: (1) compatibility.cuh redefines
