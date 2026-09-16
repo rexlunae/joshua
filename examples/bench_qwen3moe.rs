@@ -153,7 +153,7 @@ fn main() -> anyhow::Result<()> {
     let prefill_s = t0.elapsed().as_secs_f64();
     let prefill_tps = prefill as f64 / prefill_s;
     println!("prefill: {prefill} tok in {prefill_s:.2}s = {prefill_tps:.1} tok/s");
-    dump_topk(&logits, 5, "prefill");
+    dump_topk(&logits, 5, "prefill")?;
 
     // ── Decode ──
     let t0 = Instant::now();
@@ -163,7 +163,7 @@ fn main() -> anyhow::Result<()> {
         let logits = model.forward(&tok, prefill + step)?;
         last_top = logits.argmax(candle_core::D::Minus1)?.flatten_all()?.to_vec1()?[0];
         if step == 0 {
-            dump_topk(&logits, 5, "decode-step-0");
+            dump_topk(&logits, 5, "decode-step-0")?;
         }
     }
     let decode_s = t0.elapsed().as_secs_f64();

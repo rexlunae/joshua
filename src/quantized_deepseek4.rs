@@ -471,9 +471,7 @@ impl Mlp {
     /// no-op when the weights are not mmap-backed).
     fn prefetch(&self) {
         if let Some(p) = &self.prefetch {
-            p.gate.prefetch();
-            p.up.prefetch();
-            p.down.prefetch();
+            p.prefetch();
         }
     }
 }
@@ -1441,13 +1439,7 @@ impl Moe {
         // once, so the device boundary costs two transfers per layer instead
         // of one per expert matmul.  Everything below reads and writes `dev`.
         let out_device = x2.device().clone();
-        let x2_hopped;
-        let x2 = if self.expert_device.same_device(&out_device) {
-            x2
-        } else {
-            x2_hopped = x2.to_device(&self.expert_device)?;
-            &x2_hopped
-        };
+        let x2 = crate::moe::on_device(x2, &self.expert_device)?;
 
         // The gate has just told us which experts this token needs.  Each
         // expert's weights are a contiguous run inside the model mapping, so
@@ -1528,11 +1520,7 @@ impl Moe {
         routed_ids.sort_unstable();
         routed_ids.dedup();
         // …and hand the block's output back to the model's device.
-        let y = if self.expert_device.same_device(&out_device) {
-            y
-        } else {
-            y.to_device(&out_device)?
-        };
+        let y = crate::moe::on_device(&y, &out_device)?.into_owned();
         Ok((y, routed_ids))
     }
 }
@@ -1617,17 +1605,12 @@ pub struct ModelWeights {
     residency: std::sync::Arc<dyn crate::residency::ExpertResidency>,
 }
 
-/// Small GGUF reader over the memory-mapped file.
-/// Whether a deepseek4 tensor name belongs to the routed-expert set
-/// (`.ffn_gate_exps` / `.ffn_up_exps` / `.ffn_down_exps`).  These are the only
-/// weights that stay CPU-resident on an accelerator; everything else is dense
-/// and can be dequantized onto the device (M4).
-fn is_routed_expert(name: &str) -> bool {
-    name.contains(".ffn_gate_exps")
-        || name.contains(".ffn_down_exps")
-        || name.contains(".ffn_up_exps")
-}
+// Routed experts (see `crate::moe::is_routed_expert`) are the only weights
+// that stay CPU-resident on an accelerator; everything else is dense and can
+// be dequantized onto the device (M4).
+use crate::moe::is_routed_expert;
 
+/// Small GGUF reader over the memory-mapped file.
 struct Reader<R: Read + Seek> {
     ct: gguf_file::Content,
     /// Raw header with every tensor's dtype as its GGUF id, including types
@@ -2428,7 +2411,7 @@ impl ModelWeights {
                 .forward(&input.flatten_all()?)?
                 .reshape((1, 1, d))?;
             xs_seq.push(tok.unsqueeze(2)?.broadcast_as((1, 1, hc, d))?);
-            ids_cat.push(input.flatten_all()?.to_vec1()?.get(0).copied().unwrap_or(0));
+            ids_cat.push(input.flatten_all()?.to_vec1()?.first().copied().unwrap_or(0));
         }
 
         let _step = self.hot_experts.begin_step(true);
@@ -2461,8 +2444,8 @@ impl ModelWeights {
                 let h = layer.attn_norm.forward(&x)?;
                 let h = layer
                     .attn
-                    .forward(&mut self.kv_seq.get_mut(i).unwrap().get_mut(s).unwrap(), &h, *off, self.max_seq)?;
-                let xs_s2 = hc_post(&h, &residual, &post, &comb)?;
+                    .forward(self.kv_seq.get_mut(i).unwrap().get_mut(s).unwrap(), &h, *off, self.max_seq)?;
+                let xs_s2 = hc_post(&h, residual, &post, &comb)?;
 
                 let (x2, fpost, fcomb) = hc_pre(
                     &xs_s2,

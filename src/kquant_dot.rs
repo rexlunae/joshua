@@ -787,7 +787,7 @@ mod tests {
 
     /// Quantize a random `[n, k]` f32 tensor with `dtype` and return the raw
     /// block bytes (mirrors `quant_matmul`'s test helper).
-    fn quantized_block_bytes<T: GgmlType>(n: usize, k: usize, dtype: GgmlDType) -> Vec<u8> {
+    fn quantized_block_bytes(n: usize, k: usize, dtype: GgmlDType) -> Vec<u8> {
         let data: Vec<f32> = (0..n * k)
             .map(|i| ((((i as u64) * 2654435761) % 100000) as f32 / 1000.0) - 50.0)
             .collect();
@@ -797,7 +797,7 @@ mod tests {
     }
 
     fn run_case(dtype: GgmlDType, m: usize, k: usize, n: usize) {
-        let block_bytes = quantized_block_bytes::<BlockQ8_0>(n, k, dtype); // any GgmlType works
+        let block_bytes = quantized_block_bytes(n, k, dtype); // any GgmlType works
         let lhs: Vec<f32> = (0..m * k)
             .map(|i| (((i * 40503) % 1000) as f32 / 100.0) - 5.0)
             .collect();
@@ -881,7 +881,7 @@ mod tests {
 
     fn blocks_of<T: Clone>(bytes: &[u8]) -> Vec<T> {
         let size = std::mem::size_of::<T>();
-        assert!(bytes.len() % size == 0);
+        assert!(bytes.len().is_multiple_of(size));
         let ptr = bytes.as_ptr() as *const T;
         let len = bytes.len() / size;
         let blocks = unsafe { std::slice::from_raw_parts(ptr, len) };
@@ -917,8 +917,7 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     fn fused_parallel_matches_serial_bit_exact() {
         for dtype in [GgmlDType::Q8_0, GgmlDType::Q2K, GgmlDType::Q4K] {
-            let block_bytes = quantized_block_bytes::<BlockQ8_0>(24, 256, dtype);
-            let block_bytes = quantized_block_bytes::<BlockQ8_0>(24, 256, dtype);
+            let block_bytes = quantized_block_bytes(24, 256, dtype);
             let lhs: Vec<f32> = (0..3 * 256).map(|i| (i as f32) * 0.01 - 1.0).collect();
             let mut par = vec![0f32; 3 * 24];
             assert!(try_matmul_fused_avx2(dtype, (3, 256, 24), &lhs, &block_bytes, &mut par, true));
@@ -931,7 +930,7 @@ mod tests {
     /// Dtypes without a fused kernel must be declined (caller falls back).
     #[test]
     fn unknown_dtype_is_declined() {
-        let block_bytes = quantized_block_bytes::<BlockQ8_0>(2, 256, GgmlDType::Q8_0);
+        let block_bytes = quantized_block_bytes(2, 256, GgmlDType::Q8_0);
         let mut dst = vec![0f32; 2];
         // Q3K has no fused kernel here.
         assert!(!try_matmul_fused(
@@ -988,7 +987,7 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     fn neon_fused_parallel_matches_serial_bit_exact() {
         for dtype in [GgmlDType::Q8_0, GgmlDType::Q2K, GgmlDType::Q4K] {
-            let block_bytes = quantized_block_bytes::<BlockQ8_0>(24, 256, dtype);
+            let block_bytes = quantized_block_bytes(24, 256, dtype);
             let lhs: Vec<f32> = (0..3 * 256).map(|i| (i as f32) * 0.01 - 1.0).collect();
             let mut par = vec![0f32; 3 * 24];
             assert!(try_matmul_fused_neon(dtype, (3, 256, 24), &lhs, &block_bytes, &mut par, true));
@@ -1001,7 +1000,7 @@ mod tests {
     /// The unified dispatcher must route to the right ISA on each arch.
     #[test]
     fn unified_dispatcher_runs_fused_kernels() {        for dtype in [GgmlDType::Q8_0, GgmlDType::Q2K, GgmlDType::Q4K] {
-            let block_bytes = quantized_block_bytes::<BlockQ8_0>(8, 256, dtype);
+            let block_bytes = quantized_block_bytes(8, 256, dtype);
             let lhs: Vec<f32> = (0..2 * 256).map(|i| (i as f32) * 0.01 - 1.0).collect();
             let mut dst = vec![0f32; 2 * 8];
             let ran = try_matmul_fused(dtype, (2, 256, 8), &lhs, &block_bytes, &mut dst, false);

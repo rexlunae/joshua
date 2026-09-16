@@ -691,6 +691,11 @@ impl GenSession {
     /// `quantized_deepseek4::ModelWeights::forward_sequences`).  Only the
     /// candle deepseek4 model implements this; anything else reports an
     /// unsupported error so callers can fall back to per-sequence steps.
+    ///
+    /// Not yet wired into a request path: the `JOSHUA_BATCH` mode from #54
+    /// is still to come, so this and [`Engine::decode_loop_batched`] are
+    /// kept for it rather than removed.
+    #[allow(dead_code)]
     fn forward_tokens_batched(
         &mut self,
         seqs: &[(&Tensor, usize)],
@@ -783,6 +788,7 @@ struct DecodeOutcome {
 /// RNG is stored as an erased `dyn rand::Rng` (the concrete `ThreadRng` type
 /// is crate-internal and unnameable from here); `sample_token` takes `&mut dyn
 /// rand::Rng`, and `Distribution::sample::<dyn rand::Rng>` monomorphizes.
+#[allow(dead_code)] // pending the `JOSHUA_BATCH` mode from #54
 struct SeqDecodeState {
     logits: Vec<f32>,
     recent_tokens: Vec<u32>,
@@ -882,7 +888,7 @@ impl ByteWindowDecoder {
 
         self.tail.push(token);
         let new_text = decode(&self.tail)?;
-        let mut response = if new_text.starts_with(&self.tail_text) {
+        let response = if new_text.starts_with(&self.tail_text) {
             // Stable extension: append just the new suffix.
             let mut response = response;
             response.push_str(&new_text[self.tail_text.len()..]);
@@ -1908,11 +1914,14 @@ impl Engine {
     /// `forward_sequences` pass so the routed-expert fetch is amortized across
     /// the batch.  Only used behind `JOSHUA_BATCH` (see
     /// `QuantizedModel::forward_sequences` / `GenSession::forward_tokens_batched`).
+    /// That mode is not wired yet, so this loop has no caller; it is kept for
+    /// it rather than removed.
+    #[allow(dead_code)]
     fn decode_loop_batched(
         &self,
         model: &mut GenSession,
-        start_logits: &Vec<Vec<f32>>,
-        start_pos: &Vec<usize>,
+        start_logits: &[Vec<f32>],
+        start_pos: &[usize],
         options: &GenerationOptions,
     ) -> Result<Vec<DecodeOutcome>> {
         const REP_WINDOW: usize = 64;
@@ -1977,7 +1986,7 @@ impl Engine {
 
             // 3. Apply each live token to its own sequence.
             for (k, s) in live.iter().enumerate() {
-                if let Some(mut st) = states.get_mut(*s) {
+                if let Some(st) = states.get_mut(*s) {
                     if st.done {
                         continue;
                     }
@@ -2647,18 +2656,7 @@ fn longest_common_prefix(a: &[u32], b: &[u32]) -> usize {
     a.iter().zip(b).take_while(|(x, y)| x == y).count()
 }
 
-/// Whether a tensor name belongs to the routed-expert set.
-///
-/// These are the only weights touched sparsely: a token routes through a
-/// handful of the model's experts per layer, so readahead/prefetch drags in
-/// far more than a token will use.  Everything else — embeddings, norms,
-/// attention, routers, shared experts, indexer/compressor, output — is dense
-/// and touched on every token.
-fn is_routed_expert(name: &str) -> bool {
-    name.contains(".ffn_gate_exps")
-        || name.contains(".ffn_down_exps")
-        || name.contains(".ffn_up_exps")
-}
+use crate::moe::is_routed_expert;
 
 /// Names a loader may read as the token-embedding table, in precedence:
 /// `token_embd.weight` everywhere, plus two aliases candle's `lfm2` loader
@@ -2669,13 +2667,20 @@ const EMBEDDING_NAMES: [&str; 3] = [
     "model.embed_tokens.weight",
 ];
 
+/// The names `arch`'s loader probes for a tensor, in its precedence order:
+/// candle's `lfm2` loader tries every alias in `all`; every other loader
+/// reads only the canonical first name.
+fn probed_names(arch: Option<Architecture>, all: &'static [&'static str]) -> &'static [&'static str] {
+    if arch == Some(Architecture::Lfm2) {
+        all
+    } else {
+        &all[..1]
+    }
+}
+
 /// The embedding-table names `arch`'s loader probes, in its precedence order.
 fn probed_embedding_names(arch: Option<Architecture>) -> &'static [&'static str] {
-    if arch == Some(Architecture::Lfm2) {
-        &EMBEDDING_NAMES
-    } else {
-        &EMBEDDING_NAMES[..1]
-    }
+    probed_names(arch, &EMBEDDING_NAMES)
 }
 
 /// Tensor-name stems (see [`tensor_stem`]) that a loader keeps as quantized
@@ -2978,11 +2983,7 @@ const OUTPUT_HEAD_NAMES: [&str; 4] = [
 
 /// The head names `arch`'s loader probes, in its precedence order.
 fn probed_head_names(arch: Option<Architecture>) -> &'static [&'static str] {
-    if arch == Some(Architecture::Lfm2) {
-        &OUTPUT_HEAD_NAMES
-    } else {
-        &OUTPUT_HEAD_NAMES[..1]
-    }
+    probed_names(arch, &OUTPUT_HEAD_NAMES)
 }
 
 /// Bytes of the tensor `name` in the header as the output head holds it:

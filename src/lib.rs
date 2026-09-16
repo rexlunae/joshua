@@ -32,6 +32,7 @@ pub mod iq2xxs;
 pub mod kquant_dot;
 pub mod kimi_k3;
 pub mod mmap_tensor;
+pub mod moe;
 pub mod mxfp4;
 pub mod model;
 pub mod quantized_deepseek2;

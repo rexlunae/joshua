@@ -39,7 +39,7 @@ pub fn p_core_list() -> Option<Vec<u32>> {
     match v {
         // Explicitly off, or unset (default off).
         Some(s)
-            if s == "0" || s == "off" || s == "false" || s == "none" || s == "no" || s == "" =>
+            if s.is_empty() || s == "0" || s == "off" || s == "false" || s == "none" || s == "no" =>
             None,
         // Automatic detection.
         Some(s) if s == "auto" => detect_p_cores(),
@@ -125,7 +125,7 @@ fn parse_cpu_list(s: &str) -> Option<Vec<u32>> {
         let p = part.trim();
         if p.contains("-") {
             let r = p.split("-").collect::<Vec<&str>>();
-            let lo = r.get(0)?.trim().parse::<u32>().ok();
+            let lo = r.first()?.trim().parse::<u32>().ok();
             let hi = r.get(1)?.trim().parse::<u32>().ok();
             if let Some(lo) = lo {
                 if let Some(hi) = hi {

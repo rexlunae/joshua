@@ -129,7 +129,7 @@ impl HotExpertCache {
     /// that follows would retrigger a refresh that was already completed
     /// (the clock only moves again on the next decode).
     pub fn refresh_due(&self, decode: bool) -> bool {
-        decode && self.budget > 0 && self.step > 0 && self.step % REFRESH_STEPS == 0
+        decode && self.budget > 0 && self.step > 0 && self.step.is_multiple_of(REFRESH_STEPS)
     }
 
     /// Re-select the hot set from routing frequency (recency as the
