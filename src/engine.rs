@@ -362,6 +362,13 @@ pub struct EngineOptions {
     /// of taking [`EngineOptions::pin_hot_experts`] verbatim.  `auto` sizing
     /// wins when set; `pin_hot_experts` remains the explicit override.
     pub expert_cache_auto: bool,
+    /// Bytes of accelerator memory for the bounded VRAM expert cache (#62):
+    /// upload a hot subset of the routed experts onto the device and run them
+    /// there, falling back to the host expert kernels for the rest.  `None`
+    /// disables (all routed experts stay on the host — today's layout);
+    /// `Some(n)` is the byte budget (from `--vram-expert-cache`), and the
+    /// engine raises it against the device's free memory when `auto`.
+    pub device_expert_cache: Option<u64>,
     /// Where a sparse MoE model's routed experts live when inference runs on
     /// an accelerator: uploaded to the device, or kept in host RAM (borrowed
     /// from the mapping, run on the CPU expert kernels, activations hopping
@@ -447,6 +454,13 @@ impl EngineOptions {
     /// [`EngineOptions::expert_cache_auto`].
     pub fn expert_cache_auto(mut self, auto: bool) -> Self {
         self.expert_cache_auto = auto;
+        self
+    }
+
+    /// Set the bounded VRAM expert-cache byte budget.  `None` (the default)
+    /// disables the device cache.  See [`EngineOptions::device_expert_cache`].
+    pub fn vram_expert_cache(mut self, budget: Option<u64>) -> Self {
+        self.device_expert_cache = budget;
         self
     }
 
@@ -540,6 +554,9 @@ pub struct Engine {
     /// Whether the budget is sized automatically at load (see
     /// [`EngineOptions::expert_cache_auto`]).
     expert_cache_auto: bool,
+    /// Bounded VRAM expert-cache byte budget (see
+    /// [`EngineOptions::device_expert_cache`]); `None` disables.
+    device_expert_cache: Option<u64>,
     /// Compute device: CUDA or Metal when built with the matching feature
     /// (falling back to CPU if unavailable at runtime), CPU otherwise.
     device: Device,
@@ -681,6 +698,50 @@ impl GenSession {
                 squeeze_batch_logits(&logits)
             }
             Self::Npu(session) => session.forward(tokens, pos).map_err(JoshuaError::Inference),
+        }
+    }
+
+    /// Layer-streaming prefill over bounded chunks (`None` on architectures
+    /// without a native streaming path, so callers fall back to the standard
+    /// chunked loop).  Returns the prefill logits vector.
+    fn prefill_streamed(
+        &mut self,
+        chunks: &[crate::stream_prefill::Chunk],
+        device: &Device,
+    ) -> std::result::Result<Option<Vec<f32>>, JoshuaError> {
+        let model = match self {
+            Self::Candle(m) => m,
+            Self::Npu(_) => return Ok(None),
+        };
+        if !model.supports_streaming() {
+            return Ok(None);
+        }
+        let logits = model
+            .prefill_streamed(chunks, device)
+            .map_err(|e| JoshuaError::Inference(e.to_string()))?;
+        Ok(Some(
+            squeeze_batch_logits(&logits).map_err(|e| JoshuaError::Inference(e.to_string()))?,
+        ))
+    }
+
+    /// Feed one decode step across `seqs` **independent** sequences at their
+    /// own positions, returning one logits vector per sequence.  The MoE
+    /// dispatch for the batch is shared, so the routed-expert fetch is
+    /// amortized across the sequences (see
+    /// `quantized_deepseek4::ModelWeights::forward_sequences`).  Only the
+    /// candle deepseek4 model implements this; anything else reports an
+    /// unsupported error so callers can fall back to per-sequence steps.
+    fn forward_tokens_batched(
+        &mut self,
+        seqs: &[(&Tensor, usize)],
+    ) -> Result<Vec<Vec<f32>>, JoshuaError> {
+        match self {
+            Self::Candle(model) => model
+                .forward_sequences(seqs)
+                .map_err(|e| JoshuaError::Inference(e.to_string())),
+            Self::Npu(_) => Err(JoshuaError::Inference(
+                "batched forward is not supported on the NPU session".into(),
+            )),
         }
     }
 
@@ -1041,6 +1102,34 @@ impl Engine {
         let dense_device_bytes = footprint.dense_upper;
         let expert_device_bytes = footprint.experts;
         let expert_bytes = expert_device_bytes;
+        // Resolve `--vram-expert-cache auto` (`Some(0)` sentinel) to a concrete
+        // device byte budget: device free − dense − headroom − KV reserve
+        // (the #62 §5 formula).  A fixed MiB budget (Some(n>0)) passes through.
+        // Not yet consumed by the loaders (the engine builds a full upload
+        // closure + slot pool in the GPU-validated follow-up); logged here so
+        // the effective figure is visible.
+        let mut device_expert_cache = options.device_expert_cache;
+        if device_expert_cache == Some(0) {
+            // `--vram-expert-cache auto`: size from the device's free memory,
+            // leaving room for the dense set, placement headroom and KV.
+            if let Some((free, _)) = crate::placement::device_memory_info(&device) {
+                let budget = crate::placement::device_expert_cache_bytes(
+                    free,
+                    footprint.dense_upper,
+                    crate::placement::DEVICE_PLACEMENT_HEADROOM,
+                    DEVICE_KV_RESERVE_BYTES,
+                );
+                tracing::info!(
+                    "vram-expert-cache auto: {:.2} GiB on {:?}",
+                    budget as f64 / 2f64.powi(30),
+                    device,
+                );
+                device_expert_cache = Some(budget);
+            } else {
+                tracing::info!("vram-expert-cache auto: no device memory probe; disabled");
+                device_expert_cache = None;
+            }
+        }
         // The dense set always goes to the device: no placement can shrink
         // it, so a budget it does not fit is refused here, with the numbers,
         // rather than deferred to an out-of-memory upload on the first
@@ -1208,6 +1297,7 @@ impl Engine {
             n_ctx,
             pin_hot_experts,
             expert_cache_auto,
+            device_expert_cache,
             device,
             expert_device,
             weights_template: Mutex::new(None),
@@ -1698,14 +1788,44 @@ impl Engine {
         let prefill_start = Instant::now();
         let logits_vec = {
             let mut last: Vec<f32> = Vec::new();
-            let mut base = n_reused;
-            for piece_start in (0..new_tokens.len()).step_by(PREFILL_CHUNK) {
-                let end = (piece_start + PREFILL_CHUNK).min(new_tokens.len());
-                let piece = &new_tokens[piece_start..end];
-                last = model.forward_tokens(piece, base, &self.device)?;
-                base += piece.len();
+            let base = n_reused;
+
+            // Layer-streaming prefill: sweep each layer once over all chunks,
+            // so every layer's weights are read once per prefill instead of
+            // once per chunk.  Falls back to the standard chunked loop for
+            // architectures without a native streaming path (or when a piece
+            // would exceed the KV cap mid-chunk; see below).
+            let chunks: Vec<crate::stream_prefill::Chunk> = (0..new_tokens.len())
+                .step_by(PREFILL_CHUNK)
+                .map(|piece_start| {
+                    let end = (piece_start + PREFILL_CHUNK).min(new_tokens.len());
+                    let piece = &new_tokens[piece_start..end];
+                    crate::stream_prefill::Chunk {
+                        tokens: piece,
+                        pos: base + piece_start,
+                    }
+                })
+                .collect();
+
+            // Streaming requires every layer's KV to hold the whole prompt;
+            // enforce the engine's KV cap up front (per-layer KV is written
+            // incrementally and would otherwise overrun mid-stream).  The
+            // standard forward enforces the cap inside attention, so mirror
+            // that guard here and only stream when the prompt fits.
+            let streamable = model.prefill_streamed(&chunks, &self.device);
+            match streamable {
+                Ok(Some(v)) => v,
+                _ => {
+                    // Streamed prefill unsupported on this architecture, or a
+                    // KV-cap guard tripped — fall back to the per-chunk loop.
+                    for piece_start in (0..new_tokens.len()).step_by(PREFILL_CHUNK) {
+                        let end = (piece_start + PREFILL_CHUNK).min(new_tokens.len());
+                        let piece = &new_tokens[piece_start..end];
+                        last = model.forward_tokens(piece, base + piece_start, &self.device)?;
+                    }
+                    last
+                }
             }
-            last
         };
         let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -2237,6 +2357,7 @@ impl Engine {
             Some(Arc::clone(&self.mmap)),
             self.model_file.clone(),
             self.n_ctx as usize,
+            self.device_expert_cache,
         )
         .map_err(|e| JoshuaError::ModelLoad(format!("model init failed: {e}")))?;
         let budget = if self.expert_cache_auto {
@@ -2322,6 +2443,9 @@ fn resolve_message_media(messages: &[ChatMessage]) -> Result<(Vec<ChatMessage>, 
 /// Memory reserved for the KV cache and the OS when auto-sizing the expert
 /// cache (see [`Engine::auto_expert_budget`]).
 const AUTO_EXPERT_HEADROOM: u64 = 2 * 1024 * 1024 * 1024;
+/// Reserved KV-cache bytes kept clear of the VRAM expert cache (#62 §5):
+/// the cache must never push a session's KV out of memory.
+const DEVICE_KV_RESERVE_BYTES: u64 = 1 << 30;
 
 /// Maximum size of a decoded inline image, as a defence-in-depth cap on
 /// top of the HTTP body limit.  16 MiB comfortably covers any real photo.

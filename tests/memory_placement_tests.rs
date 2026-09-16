@@ -47,6 +47,27 @@ fn load_placed(model: &Path, expert_device: &Device) -> QuantizedModel {
         Some(Arc::clone(&mmap)),
         None,
         0,
+        None,
+    )
+    .unwrap()
+}
+
+/// Like [`load_placed`], but with a `device_expert_cache_bytes` budget so the
+/// loader builds a per-layer `DeviceResidency` and the dispatch partition runs
+/// (on CPU, a hit wraps the same host weights — parity holds).
+fn load_placed_with_cache(model: &Path, cache_bytes: u64) -> QuantizedModel {
+    let mmap = unsafe { memmap2::Mmap::map(&std::fs::File::open(model).unwrap()) }.unwrap();
+    let mmap = Arc::new(mmap);
+    let (content, mut cursor) = read_content(&mmap[..]);
+    QuantizedModel::from_gguf_mmap_placed(
+        content,
+        &mut cursor,
+        &Device::Cpu,
+        &Device::Cpu,
+        Some(Arc::clone(&mmap)),
+        None,
+        0,
+        Some(cache_bytes),
     )
     .unwrap()
 }
@@ -293,6 +314,28 @@ fn deepseek4_sessions_share_weights_and_isolate_batch_kv() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// Loading a qwen3moe model with a non-zero `device_expert_cache_bytes`
+/// budget threads a per-layer `DeviceResidency` into every MoE block; on the
+/// CPU the device form wraps the same host weights, so a mixed-residency run
+/// must produce exactly the no-cache logits (proves the budget plumbing +
+/// partition end-to-end through `QuantizedModel::from_gguf_mmap_placed`).
+#[test]
+fn vram_expert_cache_budget_loads_and_preserves_logits() {
+    let dir = common::model_dir("vram-cache-qwen3moe");
+    let model = dir.join("model.gguf");
+    common::write_tiny_qwen3moe_gguf(&model);
+
+    let mut plain = load_placed(&model, &Device::Cpu);
+    let mut cached = load_placed_with_cache(&model, 8 << 20); // 8 MiB budget
+    let tokens = [1u32, 4, 2, 7, 5];
+    assert_close(
+        &logits(&mut plain, &tokens, 0),
+        &logits(&mut cached, &tokens, 0),
+        "vram-expert-cache budget load preserves logits",
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// Explicit placement requests other than the model device or the CPU are
 /// rejected at load rather than silently ignored.
 #[test]
@@ -349,4 +392,39 @@ fn engine_shares_one_weight_set_across_sessions() {
         engine.shared_weight_sessions()
     );
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The layer-streaming prefill (layer-outer / chunk-inner, shared framework)
+/// must produce bit-identical last-token logits to today's standard
+/// chunked prefill — the KV reordering is numerically identical (each layer's
+/// KV accumulates in the same order across chunks).
+#[test]
+fn stream_prefill_matches_chunked_forward() {
+    for (name, write) in fixtures() {
+        let dir = common::model_dir(&format!("lsp-{name}"));
+        let model = dir.join("model.gguf");
+        write(&model);
+        let mut plain = load_placed(&model, &Device::Cpu);
+        let mut stream = load_placed(&model, &Device::Cpu);
+        let tokens: Vec<u32> = vec![1, 4, 2, 7, 5, 3, 8, 9];
+        let reference = logits(&mut plain, &tokens, 0);
+
+        // A prompt long enough to split into 2 chunks of 4.
+        let chunks: Vec<joshua::stream_prefill::Chunk> = vec![
+            joshua::stream_prefill::Chunk { tokens: &tokens[0..4], pos: 0 },
+            joshua::stream_prefill::Chunk { tokens: &tokens[4..8], pos: 4 },
+        ];
+        let out = stream
+            .prefill_streamed(&chunks, &Device::Cpu)
+            .expect("streaming supported");
+        let got: Vec<f32> = out.flatten_all().unwrap().to_vec1().unwrap();
+        assert_eq!(got.len(), reference.len(), "{name}: vocab widths");
+        for (i, (g, r)) in got.iter().zip(reference.iter()).enumerate() {
+            assert!(
+                (g - r).abs() < 1e-4,
+                "{name}: streamed logit {i} diverges: {g} vs {r}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
