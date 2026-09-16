@@ -741,7 +741,7 @@ impl BackendStorage for VulkanStorage {
     ) -> Result<Self> {
         if shaders::native_enabled()
             && native_ok(lhs_l, self.numel)
-            && native_ok(rhs_l, rhs.numel)
+            && rhs_l.start_offset() == 0
             && self.dtype == DType::F32
             && rhs.dtype == DType::F32
         {
@@ -752,12 +752,23 @@ impl BackendStorage for VulkanStorage {
                 && k <= VULKAN_NATIVE_MAX_DIM
                 && rhs.numel <= VULKAN_NATIVE_MAX_DIM
             {
-                match shaders::run_matmul(&self.device, self, rhs, (m, n, k)) {
-                    Ok(out) => {
-                        shaders::note_native_exec();
-                        return Ok(out);
+                // The kernel reads B as b[k*bsk + col*bsn]; pass the RHS layout's
+                // strides along k and n so a transposed weight ([1,K]) or the
+                // attention KV broadcast ([0,1]) runs on-device instead of
+                // copying the (possibly large) operand to CPU. LHS stays
+                // contiguous (row-major), per the deepseek4 matmul profile.
+                let rstride = rhs_l.stride();
+                let n_dims = rstride.len();
+                if n_dims >= 2 {
+                    let bsn = rstride[n_dims - 1];
+                    let bsk = rstride[n_dims - 2];
+                    match shaders::run_matmul(&self.device, self, rhs, (m, n, k), bsk, bsn) {
+                        Ok(out) => {
+                            shaders::note_native_exec();
+                            return Ok(out);
+                        }
+                        Err(e) => shaders::log_native_fallback("matmul", &e),
                     }
-                    Err(e) => shaders::log_native_fallback("matmul", &e),
                 }
             }
         }
@@ -1059,6 +1070,29 @@ mod tests {
             &got_vk,
             1e-2,
             "matmul(37,64,51)",
+        );
+
+        // Transposed-RHS matmul (weight-transpose pattern): ao @ (w_t.t()) where
+        // w_t is (n,k) contiguous -> a (k,n) non-contiguous transposed view.
+        // Exercises the kernel's bsk/bsn stride path.
+        let (m2, k2, n2) = (23usize, 48usize, 36usize);
+        let a2_v = (0..m2 * k2).map(|i| ((i % 5) as f32 - 2.0) * 0.4).collect::<Vec<f32>>();
+        let w_v = (0..n2 * k2).map(|i| ((i % 9) as f32 - 4.0) * 0.3).collect::<Vec<f32>>(); // (n,k) row-major
+        let ac2 = Tensor::from_vec(a2_v.clone(), (m2, k2), &Device::Cpu)?;
+        let wc = Tensor::from_vec(w_v.clone(), (n2, k2), &Device::Cpu)?.t()?; // (k,n) transposed view
+        let got_cpu2 = ac2.matmul(&wc)?;
+        let a2o = Tensor::from_vec(a2_v, (m2, k2), &dev)?;
+        let wo = Tensor::from_vec(w_v, (n2, k2), &dev)?.t()?;
+        let got_vk2 = a2o
+            .matmul(&wo)?
+            .to_device(&Device::Cpu)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        approx(
+            &got_cpu2.flatten_all()?.to_vec1::<f32>()?,
+            &got_vk2,
+            1e-2,
+            "matmul_transposed_rhs(23,48,36)",
         );
 
         if native {
