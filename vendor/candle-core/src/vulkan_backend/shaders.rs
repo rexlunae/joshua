@@ -165,6 +165,42 @@ void main() {
 }
 "#;
 
+/// Reduce the last dimension of a contiguous f32 tensor (one row per thread):
+/// out[r] = sum|max|mean over the row's COLS elements. This is the primitive
+/// softmax and RMSNorm need (max over the row, then sum over the row).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ReduceLastDimOp {
+    Sum,
+    Max,
+    Mean,
+}
+
+const GLSL_REDUCE_LASTDIM: &str = r#"
+#version 450
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0) readonly buffer InBuf { float x[]; };
+layout(set = 0, binding = 1) buffer OutBuf { float o[]; };
+layout(push_constant) uniform PC { uint ROWS; uint COLS; uint OP; } pc;
+float acc_of(float a, float b) {
+    if (pc.OP == 1u) return max(a, b);      // max
+    else return a + b;                       // sum (mean divides at the end)
+}
+void main() {
+    uint r = gl_GlobalInvocationID.x;
+    if (r >= pc.ROWS) return;
+    uint base = r * pc.COLS;
+    // Max initializes from the row's first element (correct IEEE-754 identity
+    // for -inf) and skips it in the loop; sum starts at 0.0 and includes it.
+    float acc = (pc.OP == 1u) ? x[base] : 0.0;
+    uint cs = (pc.OP == 1u) ? 1u : 0u;
+    for (uint c = cs; c < pc.COLS; c++) {
+        acc = acc_of(acc, x[base + c]);
+    }
+    if (pc.OP == 2u) acc = acc / float(pc.COLS); // mean
+    o[r] = acc;
+}
+"#;
+
 // ---------------------------------------------------------------------------
 // naga GLSL -> SPIR-V.
 // ---------------------------------------------------------------------------
@@ -643,6 +679,57 @@ pub fn run_matmul(
         &[a.buffer, b.buffer, out.buffer],
         (16, 16, 1),
         (gx, gy, batch as u32),
+        &push,
+    )?;
+    Ok(out)
+}
+/// Reduce the last dimension of a contiguous f32 tensor `x` shaped `(rows, cols)`
+/// into a `(rows,)` output. `op` selects sum / max / mean.
+pub fn run_reduce_last_dim(
+    dev: &VulkanDevice,
+    x: &VulkanStorage,
+    rows: usize,
+    cols: usize,
+    op: ReduceLastDimOp,
+) -> Result<VulkanStorage> {
+    if rows == 0 {
+        return unsafe { dev.alloc_buffer(0, crate::DType::F32, 0) };
+    }
+    // An empty row has no well-defined max (and the CPU path errors); keep the
+    // kernel's max-from-first-element contract by rejecting cols == 0.
+    if cols == 0 {
+        if op == ReduceLastDimOp::Max {
+            return Err(Error::Msg(
+                "vulkan reduce max over an empty row has no identity".into(),
+            ));
+        }
+        // Sum over an empty row is 0; allocate a zeroed output.
+        let out = unsafe { dev.alloc_buffer(rows * 4, crate::DType::F32, rows) }?;
+        let zeros = vec![0u8; rows * 4];
+        unsafe { out.set_bytes(&zeros) }?;
+        return Ok(out);
+    }
+    let spirv = glsl_to_spirv(GLSL_REDUCE_LASTDIM, "main")?;
+    let out = unsafe { dev.alloc_buffer(rows * 4, crate::DType::F32, rows) }?;
+    let d = Dispatch::new(dev, &spirv, 2, 12)?;
+    let opval = match op {
+        ReduceLastDimOp::Sum => 0u32,
+        ReduceLastDimOp::Max => 1u32,
+        ReduceLastDimOp::Mean => 2u32,
+    };
+    let push = [rows as u32, cols as u32, opval]
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect::<Vec<u8>>();
+    // The workgroup is 64 threads wide, so one X workgroup already covers up to
+    // 64 rows: dispatch ceil(rows/64) X workgroups (the shader bounds-checks the
+    // final partial group) instead of one per row.
+    let groups_x = ((rows as u32) + 63) / 64;
+    d.run(
+        dev,
+        &[x.buffer, out.buffer],
+        (64, 1, 1),
+        (groups_x, 1, 1),
         &push,
     )?;
     Ok(out)
