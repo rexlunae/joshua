@@ -1212,7 +1212,7 @@ impl crate::stream_prefill::StreamPrefill for GGUFQWenMoE {
         // today's chunked prefill builds for the same `pos`.  Built before
         // borrowing any field mutably so its &self borrow ends first.
         let chunk_len = xs.dim(1)?;
-        let mask = self.causal_mask(chunk_len, pos)?;
+        let mask = crate::moe::causal_mask(chunk_len, pos, xs.device())?;
         let sh = Arc::clone(&self.shared);
         let layer = &sh.layers[l];
         let kv = &mut self.kv[l];

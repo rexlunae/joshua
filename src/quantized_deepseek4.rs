@@ -2618,13 +2618,14 @@ impl ModelWeights {
 // ─── Layer-streaming prefill (shared framework) ──────────────────────────────
 impl crate::stream_prefill::StreamPrefill for ModelWeights {
     fn n_layers(&self) -> usize {
-        self.layers.len()
+        self.shared.layers.len()
     }
 
     fn embed_chunk(&self, tokens: &[u32], device: &candle_core::Device) -> Result<Tensor> {
-        let hc = self.hc_mult;
-        let d = self.tok_embeddings.hidden()?;
+        let hc = self.shared.hc_mult;
+        let d = self.shared.tok_embeddings.hidden()?;
         let tok = self
+            .shared
             .tok_embeddings
             .forward(&Tensor::new(tokens.to_vec(), device)?.unsqueeze(0)?)?
             .reshape((1, tokens.len(), d))?;
@@ -2639,11 +2640,11 @@ impl crate::stream_prefill::StreamPrefill for ModelWeights {
         pos: usize,
         tokens: &[u32],
     ) -> Result<Tensor> {
-        let layer = &self.layers[l];
+        let layer = &self.shared.layers[l];
         let kv = &mut self.kv[l];
-        let hc_eps = self.hc_eps;
-        let sinkhorn = self.cfg.hc_sinkhorn_iters;
-        let max_seq = self.max_seq;
+        let hc_eps = self.shared.hc_eps;
+        let sinkhorn = self.shared.cfg.hc_sinkhorn_iters;
+        let max_seq = self.shared.max_seq;
 
         // hc_pre with attention weights.
         let (x, post, comb) = hc_pre(
@@ -2670,7 +2671,7 @@ impl crate::stream_prefill::StreamPrefill for ModelWeights {
         )?;
         let residual = xs.clone();
         let h = layer.ffn_norm.forward(&x)?;
-        let input = Tensor::new(tokens.to_vec(), &self.device)?.unsqueeze(0)?;
+        let input = Tensor::new(tokens.to_vec(), &self.shared.device)?.unsqueeze(0)?;
         let (h, routed_ids) = layer.ffn.forward(&h, &input)?;
         self.last_routed[l] = routed_ids;
         // Advisory: routing recording feeds the (hot-expert) prefetch policy,
@@ -2687,23 +2688,23 @@ impl crate::stream_prefill::StreamPrefill for ModelWeights {
         let rsqrt = flat
             .sqr()?
             .mean_keepdim(D::Minus1)?
-            .affine(1.0, self.hc_eps)?
+            .affine(1.0, self.shared.hc_eps)?
             .powf(-0.5)?;
-        let mixes = self.hc_head_fn.forward(&flat)?.broadcast_mul(&rsqrt)?;
+        let mixes = self.shared.hc_head_fn.forward(&flat)?.broadcast_mul(&rsqrt)?;
         let pre = sigmoid(
             &mixes
-                .broadcast_mul(&self.hc_head_scale)?
-                .broadcast_add(&self.hc_head_base)?,
+                .broadcast_mul(&self.shared.hc_head_scale)?
+                .broadcast_add(&self.shared.hc_head_base)?,
         )?
-        .affine(1.0, self.hc_eps)?;
+        .affine(1.0, self.shared.hc_eps)?;
         let y = pre
             .unsqueeze(D::Minus1)?
             .broadcast_as((seq_len, hc, d))?
             .mul(&last.squeeze(0)?)?
             .sum(D::Minus2)?; // [seq, d]
         let y = y.narrow(0, seq_len - 1, 1)?;
-        let y = self.norm.forward(&y)?;
-        let logits = self.output.forward(&y)?.to_dtype(DType::F32)?;
+        let y = self.shared.norm.forward(&y)?;
+        let logits = self.shared.output.forward(&y)?.to_dtype(DType::F32)?;
         Ok(logits)
     }
 }

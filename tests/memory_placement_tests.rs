@@ -311,7 +311,8 @@ fn deepseek4_sessions_share_weights_and_isolate_batch_kv() {
     let b2 = fseq_logits(&mut b, &[(&[8], 1)]);
     let fb2 = fseq_logits(&mut fresh_b, &[(&[8], 1)]);
     assert_close(&b2[0], &fb2[0], "deepseek4 session-b step2@1");
-
+    std::fs::remove_dir_all(&dir).ok();
+}
 
 /// Loading a qwen3moe model with a non-zero `device_expert_cache_bytes`
 /// budget threads a per-layer `DeviceResidency` into every MoE block; on the

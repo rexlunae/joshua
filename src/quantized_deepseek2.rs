@@ -1131,7 +1131,7 @@ impl crate::stream_prefill::StreamPrefill for ModelWeights {
     ) -> Result<Tensor> {
         // Chunk-local causal mask, built before any mutable field borrow.
         let chunk_len = xs.dim(1)?;
-        let mask = self.causal_mask(chunk_len, pos)?;
+        let mask = crate::moe::causal_mask(chunk_len, pos, xs.device())?;
         let sh = Arc::clone(&self.shared);
         let layer = &sh.layers[l];
         let kv = &mut self.kv[l];
