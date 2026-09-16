@@ -189,11 +189,11 @@ void main() {
     uint r = gl_GlobalInvocationID.x;
     if (r >= pc.ROWS) return;
     uint base = r * pc.COLS;
-    // Initialize a max from the row's first element so the identity is correct
-    // for negative-infinity inputs (a finite sentinel is NOT an identity for
-    // IEEE-754 max). Cols >= 1 is guaranteed by the caller.
+    // Max initializes from the row's first element (correct IEEE-754 identity
+    // for -inf) and skips it in the loop; sum starts at 0.0 and includes it.
     float acc = (pc.OP == 1u) ? x[base] : 0.0;
-    for (uint c = 1u; c < pc.COLS; c++) {
+    uint cs = (pc.OP == 1u) ? 1u : 0u;
+    for (uint c = cs; c < pc.COLS; c++) {
         acc = acc_of(acc, x[base + c]);
     }
     if (pc.OP == 2u) acc = acc / float(pc.COLS); // mean
