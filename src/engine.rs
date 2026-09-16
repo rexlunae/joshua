@@ -229,6 +229,10 @@ pub enum ComputeBackend {
     /// OpenCL (any vendor ICD: Intel iGPU/Arc, NVIDIA via the OpenCL ICD,
     /// ...).  Requires the `opencl` cargo feature and a system libOpenCL.
     OpenCl,
+    /// Vulkan (any ICD: AMD RADV, Intel ANV, ...).  Requires the `vulkan`
+    /// cargo feature and a system libvulkan.so.  Bring-up target is the AMD
+    /// Renoir iGPU (unified memory, host-visible+coherent round-trip fast path).
+    Vulkan,
 }
 
 /// Construction options for [`Engine`].
@@ -1098,7 +1102,7 @@ impl Engine {
         // to f32.  A hard refusal to load needs certainty, so it uses the
         // lower bound; the soft decisions (expert placement, per-session
         // caps) err on the safe side with the upper bound.
-        let footprint = device_weight_bytes(&raw, arch, device.is_opencl());
+        let footprint = device_weight_bytes(&raw, arch, device.is_opencl() || device.is_vulkan());
         let dense_device_bytes = footprint.dense_upper;
         let expert_device_bytes = footprint.experts;
         let expert_bytes = expert_device_bytes;
@@ -1182,7 +1186,7 @@ impl Engine {
             requested_placement,
             crate::placement::DeviceProfile {
                 is_cpu: device.is_cpu(),
-                dense_only: device.is_opencl(),
+                dense_only: device.is_opencl() || device.is_vulkan(),
                 free_bytes: device_budget,
             },
             dense_device_bytes,
@@ -1223,7 +1227,13 @@ impl Engine {
                 footprint.dense_lower as f64 / 2f64.powi(30),
                 footprint.dense_upper as f64 / 2f64.powi(30),
                 expert_device_bytes as f64 / 2f64.powi(30),
-                if device.is_opencl() { " as f32 on OpenCL" } else { "" },
+                if device.is_opencl() {
+                    " as f32 on OpenCL"
+                } else if device.is_vulkan() {
+                    " as f32 on Vulkan"
+                } else {
+                    ""
+                },
                 match device_budget {
                     Some(b) => format!("{:.1} GiB", b as f64 / 2f64.powi(30)),
                     None => "unknown".to_string(),
@@ -1350,6 +1360,13 @@ impl Engine {
                 Err(e) => tracing::warn!("OpenCL unavailable, falling back to CPU: {e}"),
             }
         }
+        #[cfg(feature = "vulkan")]
+        {
+            match Device::new_vulkan(0) {
+                Ok(device) => return device,
+                Err(e) => tracing::warn!("Vulkan unavailable, falling back to CPU: {e}"),
+            }
+        }
         Device::Cpu
     }
 
@@ -1420,6 +1437,26 @@ impl Engine {
                     Err(JoshuaError::ModelLoad(
                         "OpenCL device requested but this build has no `opencl` feature. \
                          Rebuild with `cargo build --features opencl`, or pass --device cpu / auto."
+                            .to_string(),
+                    ))
+                }
+            }
+            ComputeBackend::Vulkan => {
+                #[cfg(feature = "vulkan")]
+                {
+                    Device::new_vulkan(0).map_err(|e| {
+                        JoshuaError::ModelLoad(format!(
+                            "Vulkan device requested but unavailable: {e}. \
+                             Build with `--features vulkan` on a host with libvulkan.so \
+                             (AMD RADV, Intel ANV, ...), or pass --device cpu / auto."
+                        ))
+                    })
+                }
+                #[cfg(not(feature = "vulkan"))]
+                {
+                    Err(JoshuaError::ModelLoad(
+                        "Vulkan device requested but this build has no `vulkan` feature. \
+                         Rebuild with `cargo build --features vulkan`, or pass --device cpu / auto."
                             .to_string(),
                     ))
                 }
