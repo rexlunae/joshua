@@ -335,8 +335,17 @@ impl candle::CustomOp1 for SoftmaxLastDim {
         storage: &candle::VulkanStorage,
         layout: &Layout,
     ) -> Result<(candle::VulkanStorage, Shape)> {
-        use candle::backend::BackendStorage;
-        use candle::{CpuStorage, D, Device, Tensor};
+        use candle::backend::{BackendDevice, BackendStorage};
+        use candle::{CpuStorage, D, Device, DType, Tensor};
+
+        // Only F32 has a native Vulkan kernel path (the elementwise/reduce kernels
+        // are F32); any other dtype falls back to the correct CPU round-trip.
+        if storage.dtype() != DType::F32 {
+            let cpu = storage.to_cpu_storage()?;
+            let (out, shape) = self.cpu_fwd(&cpu, layout)?;
+            let dev = storage.device.clone();
+            return Ok((dev.storage_from_cpu_storage(&out)?, shape));
+        }
 
         // Build a contiguous on-device input tensor from the storage, run the
         // softmax as a chain of candle ops (each executes on the Vulkan device's
@@ -352,9 +361,6 @@ impl candle::CustomOp1 for SoftmaxLastDim {
         let device = Device::Vulkan(storage.device.clone());
         let xs = match &cpu {
             CpuStorage::F32(d) => Tensor::from_vec(d[o1..o2].to_vec(), dims.clone(), &device)?,
-            CpuStorage::F16(d) => Tensor::from_vec(d[o1..o2].to_vec(), dims.clone(), &device)?,
-            CpuStorage::BF16(d) => Tensor::from_vec(d[o1..o2].to_vec(), dims.clone(), &device)?,
-            CpuStorage::F64(d) => Tensor::from_vec(d[o1..o2].to_vec(), dims.clone(), &device)?,
             _ => candle::bail!("vulkan softmax-last-dim: unsupported dtype {:?}", cpu),
         };
         // xs.max/sum over the last dim use the native last-dim reduction; the
@@ -714,9 +720,19 @@ impl candle::CustomOp2 for RmsNorm {
         s2: &candle::VulkanStorage,
         l2: &Layout,
     ) -> Result<(candle::VulkanStorage, Shape)> {
-        use candle::backend::BackendStorage;
-        use candle::{CpuStorage, D, Device, Tensor};
+        use candle::backend::{BackendDevice, BackendStorage};
+        use candle::{CpuStorage, D, Device, DType, Tensor};
         let eps = self.eps;
+
+        // Only F32 has a native Vulkan kernel path; any other dtype falls back
+        // to the correct CPU round-trip.
+        if s1.dtype() != DType::F32 || s2.dtype() != DType::F32 {
+            let c1 = s1.to_cpu_storage()?;
+            let c2 = s2.to_cpu_storage()?;
+            let (out, shape) = self.cpu_fwd(&c1, l1, &c2, l2)?;
+            let dev = s1.device.clone();
+            return Ok((dev.storage_from_cpu_storage(&out)?, shape));
+        }
 
         let dims = l1.shape().dims().to_vec();
         let (o1, o2) = match l1.contiguous_offsets() {
@@ -732,18 +748,12 @@ impl candle::CustomOp2 for RmsNorm {
         let x_cpu = s1.to_cpu_storage()?;
         let xs = match &x_cpu {
             CpuStorage::F32(d) => Tensor::from_vec(d[o1..o2].to_vec(), dims.clone(), &device)?,
-            CpuStorage::F16(d) => Tensor::from_vec(d[o1..o2].to_vec(), dims.clone(), &device)?,
-            CpuStorage::BF16(d) => Tensor::from_vec(d[o1..o2].to_vec(), dims.clone(), &device)?,
-            CpuStorage::F64(d) => Tensor::from_vec(d[o1..o2].to_vec(), dims.clone(), &device)?,
             _ => candle::bail!("vulkan rms-norm: unsupported input dtype {:?}", x_cpu),
         };
         let a_cpu = s2.to_cpu_storage()?;
         let a_dims = l2.shape().dims().to_vec();
         let alpha = match &a_cpu {
             CpuStorage::F32(d) => Tensor::from_vec(d[a1..a2].to_vec(), a_dims, &device)?,
-            CpuStorage::F16(d) => Tensor::from_vec(d[a1..a2].to_vec(), a_dims, &device)?,
-            CpuStorage::BF16(d) => Tensor::from_vec(d[a1..a2].to_vec(), a_dims, &device)?,
-            CpuStorage::F64(d) => Tensor::from_vec(d[a1..a2].to_vec(), a_dims, &device)?,
             _ => candle::bail!("vulkan rms-norm: unsupported alpha dtype {:?}", a_cpu),
         };
 
@@ -1526,6 +1536,48 @@ mod vulkan_softmax_tests {
             worst < 1e-4,
             "vulkan rms_norm diverged from CPU: worst diff {worst:.3e}"
         );
+
+        // Rank-4 input (b, h, r, c): rms_norm over the last dim.
+        let (b, h, r2, c2) = (2usize, 3usize, 4usize, 6usize);
+        let x4: Vec<f32> = (0..b * h * r2 * c2)
+            .map(|i| ((i % 19) as f32 - 9.0) * 0.3)
+            .collect();
+        let x4c = Tensor::from_vec(x4.clone(), (b, h, r2, c2), &Device::Cpu)?;
+        let a4c = Tensor::from_vec(alpha.clone(), (c2,), &Device::Cpu)?;
+        let out4_cpu = rms_norm(&x4c, &a4c, eps)?.flatten_all()?.to_vec1::<f32>()?;
+        let x4v = Tensor::from_vec(x4, (b, h, r2, c2), &vdevice)?;
+        let a4v = Tensor::from_vec(alpha.clone(), (c2,), &vdevice)?;
+        let out4_vk = rms_norm(&x4v, &a4v, eps)?
+            .to_device(&Device::Cpu)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let mut worst4 = 0.0f32;
+        for (a, b_) in out4_cpu.iter().zip(out4_vk.iter()) {
+            worst4 = worst4.max((a - b_).abs());
+        }
+        eprintln!("vulkan rms_norm rank-4: worst diff = {worst4:.3e}");
+        assert!(worst4 < 1e-4, "vulkan rms_norm rank-4 diverged: {worst4:.3e}");
+
+        // Offset view: a narrowed contiguous slice of a larger backing tensor.
+        let (orows, ocols) = (6usize, 8usize);
+        let big: Vec<f32> = (0..orows * ocols).map(|i| ((i % 7) as f32 - 3.0) * 0.5).collect();
+        let bigc = Tensor::from_vec(big.clone(), (orows, ocols), &Device::Cpu)?;
+        let slice = bigc.narrow(0, 1, 3)?; // rows 1..4, still contiguous view
+        let out_s_cpu = rms_norm(&slice, &ac, eps)?.to_vec2::<f32>()?;
+        let bigv = Tensor::from_vec(big, (orows, ocols), &vdevice)?;
+        let slicev = bigv.narrow(0, 1, 3)?;
+        let out_s_vk = rms_norm(&slicev, &av, eps)?
+            .to_device(&Device::Cpu)?
+            .to_vec2::<f32>()?;
+        let mut worst_s = 0.0f32;
+        for (row_c, row_v) in out_s_cpu.iter().zip(out_s_vk.iter()) {
+            for (a, b_) in row_c.iter().zip(row_v.iter()) {
+                worst_s = worst_s.max((a - b_).abs());
+            }
+        }
+        eprintln!("vulkan rms_norm offset-view: worst diff = {worst_s:.3e}");
+        assert!(worst_s < 1e-4, "vulkan rms_norm offset-view diverged: {worst_s:.3e}");
+
         Ok(())
     }
 }
