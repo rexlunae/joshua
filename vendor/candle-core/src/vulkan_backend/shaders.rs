@@ -165,6 +165,39 @@ void main() {
 }
 "#;
 
+/// Reduce the last dimension of a contiguous f32 tensor (one row per thread):
+/// out[r] = sum|max|mean over the row's COLS elements. This is the primitive
+/// softmax and RMSNorm need (max over the row, then sum over the row).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ReduceLastDimOp {
+    Sum,
+    Max,
+    Mean,
+}
+
+const GLSL_REDUCE_LASTDIM: &str = r#"
+#version 450
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0) readonly buffer InBuf { float x[]; };
+layout(set = 0, binding = 1) buffer OutBuf { float o[]; };
+layout(push_constant) uniform PC { uint ROWS; uint COLS; uint OP; } pc;
+float acc_of(float a, float b) {
+    if (pc.OP == 1u) return max(a, b);      // max
+    else return a + b;                       // sum (mean divides at the end)
+}
+void main() {
+    uint r = gl_GlobalInvocationID.x;
+    if (r >= pc.ROWS) return;
+    float acc = (pc.OP == 1u) ? -3.4028235e38 : 0.0;
+    uint base = r * pc.COLS;
+    for (uint c = 0u; c < pc.COLS; c++) {
+        acc = acc_of(acc, x[base + c]);
+    }
+    if (pc.OP == 2u) acc = acc / float(pc.COLS); // mean
+    o[r] = acc;
+}
+"#;
+
 // ---------------------------------------------------------------------------
 // naga GLSL -> SPIR-V.
 // ---------------------------------------------------------------------------
@@ -643,6 +676,39 @@ pub fn run_matmul(
         &[a.buffer, b.buffer, out.buffer],
         (16, 16, 1),
         (gx, gy, batch as u32),
+        &push,
+    )?;
+    Ok(out)
+}
+/// Reduce the last dimension of a contiguous f32 tensor `x` shaped `(rows, cols)`
+/// into a `(rows,)` output. `op` selects sum / max / mean.
+pub fn run_reduce_last_dim(
+    dev: &VulkanDevice,
+    x: &VulkanStorage,
+    rows: usize,
+    cols: usize,
+    op: ReduceLastDimOp,
+) -> Result<VulkanStorage> {
+    if rows == 0 {
+        return unsafe { dev.alloc_buffer(0, crate::DType::F32, 0) };
+    }
+    let spirv = glsl_to_spirv(GLSL_REDUCE_LASTDIM, "main")?;
+    let out = unsafe { dev.alloc_buffer(rows * 4, crate::DType::F32, rows) }?;
+    let d = Dispatch::new(dev, &spirv, 2, 12)?;
+    let opval = match op {
+        ReduceLastDimOp::Sum => 0u32,
+        ReduceLastDimOp::Max => 1u32,
+        ReduceLastDimOp::Mean => 2u32,
+    };
+    let push = [rows as u32, cols as u32, opval]
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect::<Vec<u8>>();
+    d.run(
+        dev,
+        &[x.buffer, out.buffer],
+        (64, 1, 1),
+        (rows as u32, 1, 1),
         &push,
     )?;
     Ok(out)

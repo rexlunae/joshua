@@ -537,6 +537,39 @@ impl BackendStorage for VulkanStorage {
     }
 
     fn reduce_op(&self, op: ReduceOp, layout: &Layout, s: &[usize]) -> Result<Self> {
+        // Native fast path: reduce the *last* dim of a contiguous F32 tensor to a
+        // 1-D result. This is the primitive softmax (max, then sum) and RMSNorm
+        // (sum of squares / mean) need. SUM/MAX are supported directly; MIN is
+        // handled by negating around a MAX. Mean is folded into the reshape-the
+        // -result caller on CPU, so we only do raw reductions here.
+        if shaders::native_enabled()
+            && self.dtype == DType::F32
+            && layout.is_contiguous()
+            && layout.start_offset() == 0
+            && s.len() == 1
+            && s[0] == layout.shape().dims().len() - 1 // last dim
+            && layout.shape().rank() >= 1
+        {
+            let dims = layout.shape().dims();
+            let cols = dims[dims.len() - 1];
+            let rows = if dims.len() == 1 { 1 } else { dims[..dims.len() - 1].iter().product() };
+            let reduced_op = match op {
+                ReduceOp::Sum => Some(shaders::ReduceLastDimOp::Sum),
+                ReduceOp::Max => Some(shaders::ReduceLastDimOp::Max),
+                // Min == -max(-x); emit a max here and let the caller negate? Not
+                // composable, so fall back to CPU for Min.
+                _ => None,
+            };
+            if let Some(rop) = reduced_op {
+                match shaders::run_reduce_last_dim(&self.device, self, rows, cols, rop) {
+                    Ok(storage) => {
+                        shaders::note_native_exec();
+                        return Ok(storage);
+                    }
+                    Err(e) => shaders::log_native_fallback("reduce_op", &e),
+                }
+            }
+        }
         let cpu = self.to_cpu_storage()?;
         let out = cpu.reduce_op(op, layout, s)?;
         self.device.storage_from_cpu_storage(&out)
@@ -1173,6 +1206,28 @@ mod tests {
             &got_vk5,
             1e-2,
             "matmul_rank4_multi_axis(2,3,16,24)",
+        );
+
+        // Last-dim reduction (softmax/RMSNorm primitive): sum and max over rows.
+        let (rr, cc) = (128usize, 64usize);
+        let r_v = (0..rr * cc).map(|i| ((i % 17) as f32 - 8.0) * 0.5).collect::<Vec<f32>>();
+        let rc = Tensor::from_vec(r_v.clone(), (rr, cc), &Device::Cpu)?;
+        let got_sum_cpu = rc.sum(1)?;
+        let got_max_cpu = rc.max(1)?;
+        let ro = Tensor::from_vec(r_v, (rr, cc), &dev)?;
+        let got_sum_vk = ro.sum(1)?.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
+        let got_max_vk = ro.max(1)?.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
+        approx(
+            &got_sum_cpu.flatten_all()?.to_vec1::<f32>()?,
+            &got_sum_vk,
+            1e-2,
+            "reduce_sum_lastdim(128,64)",
+        );
+        approx(
+            &got_max_cpu.flatten_all()?.to_vec1::<f32>()?,
+            &got_max_vk,
+            1e-2,
+            "reduce_max_lastdim(128,64)",
         );
 
         if native {
