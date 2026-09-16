@@ -38,6 +38,15 @@ pub(crate) fn note_native_exec() {
     NATIVE_EXEC.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Log why a native Vulkan kernel fell back to CPU, when
+/// `JOSHUA_VULKAN_DEBUG=1`. Silent fallback hides device loss / misconfiguration,
+/// so this gives production runs an opt-in diagnostic.
+pub(crate) fn log_native_fallback(op: &str, err: &Error) {
+    if std::env::var("JOSHUA_VULKAN_DEBUG").map(|v| v == "1").unwrap_or(false) {
+        eprintln!("vulkan: {op} fell back to CPU: {err}");
+    }
+}
+
 /// Which unary GLSL ops we can dispatch (name -> GLSL expression).
 pub fn has_unary(name: &'static str) -> bool {
     matches!(name, "exp" | "sin" | "cos" | "tan" | "sqrt" | "abs" | "neg" | "ln")
@@ -58,8 +67,10 @@ const GLSL_UNARY: &str = r#"
 layout(local_size_x = 256) in;
 layout(set = 0, binding = 0) readonly buffer InBuf { float inp[]; };
 layout(set = 0, binding = 1) buffer OutBuf { float outp[]; };
+layout(push_constant) uniform PC { uint N; } pc;
 void main() {
     uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.N) return;
     float x = inp[i];
     float r = {EXPR};
     outp[i] = r;
@@ -72,9 +83,10 @@ const GLSL_AFFINE: &str = r#"
 layout(local_size_x = 256) in;
 layout(set = 0, binding = 0) readonly buffer InBuf { float inp[]; };
 layout(set = 0, binding = 1) buffer OutBuf { float outp[]; };
-layout(push_constant) uniform PC { float a; float b; } pc;
+layout(push_constant) uniform PC { uint N; float a; float b; } pc;
 void main() {
     uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.N) return;
     outp[i] = pc.a * inp[i] + pc.b;
 }
 "#;
@@ -86,8 +98,10 @@ layout(local_size_x = 256) in;
 layout(set = 0, binding = 0) readonly buffer InBuf0 { float lhs[]; };
 layout(set = 0, binding = 1) readonly buffer InBuf1 { float rhs[]; };
 layout(set = 0, binding = 2) buffer OutBuf { float outp[]; };
+layout(push_constant) uniform PC { uint N; } pc;
 void main() {
     uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.N) return;
     float a = lhs[i];
     float b = rhs[i];
     outp[i] = {EXPR};
@@ -169,12 +183,24 @@ struct Dispatch {
 }
 
 impl Dispatch {
-    fn new(dev: &VulkanDevice, spirv: &[u32], buffer_count: u32) -> Result<Self> {
+    fn new(dev: &VulkanDevice, spirv: &[u32], buffer_count: u32, push_size: u32) -> Result<Self> {
         let ash_dev = dev.device();
 
         let sm_ci = vk::ShaderModuleCreateInfo::default().code(spirv);
-        let shader_module = unsafe { ash_dev.create_shader_module(&sm_ci, None) }
-            .map_err(|e| Error::Msg(format!("vulkan create_shader_module failed: {e:?}")))?;
+        let shader_module = match unsafe { ash_dev.create_shader_module(&sm_ci, None) } {
+            Ok(m) => m,
+            Err(e) => return Err(Error::Msg(format!("vulkan create_shader_module failed: {e:?}"))),
+        };
+        // On any later failure we must unwind every handle we already created.
+        macro_rules! cleanup_and_fail {
+            ($fn:expr) => {{
+                let e = $fn;
+                unsafe {
+                    ash_dev.destroy_shader_module(shader_module, None);
+                }
+                return Err(e);
+            }};
+        }
 
         let bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..buffer_count)
             .map(|bi| {
@@ -187,17 +213,39 @@ impl Dispatch {
             .collect();
         let dsl_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
         let descriptor_set_layout =
-            unsafe { ash_dev.create_descriptor_set_layout(&dsl_info, None) }
-                .map_err(|e| {
-                    Error::Msg(format!("vulkan create_descriptor_set_layout failed: {e:?}"))
-                })?;
+            match unsafe { ash_dev.create_descriptor_set_layout(&dsl_info, None) } {
+                Ok(l) => l,
+                Err(e) => cleanup_and_fail!(Error::Msg(format!(
+                    "vulkan create_descriptor_set_layout failed: {e:?}"
+                ))),
+            };
 
+        let push_ranges: Vec<vk::PushConstantRange> = if push_size > 0 {
+            vec![vk::PushConstantRange {
+                stage_flags: vk::ShaderStageFlags::COMPUTE,
+                offset: 0,
+                size: push_size,
+            }]
+        } else {
+            vec![]
+        };
         let set_layouts = [descriptor_set_layout];
         let pipeline_layout_info = vk::PipelineLayoutCreateInfo::default()
             .set_layouts(&set_layouts)
-            .push_constant_ranges(&[]);
-        let pipeline_layout = unsafe { ash_dev.create_pipeline_layout(&pipeline_layout_info, None) }
-            .map_err(|e| Error::Msg(format!("vulkan create_pipeline_layout failed: {e:?}")))?;
+            .push_constant_ranges(&push_ranges);
+        let pipeline_layout =
+            match unsafe { ash_dev.create_pipeline_layout(&pipeline_layout_info, None) } {
+                Ok(l) => l,
+                Err(e) => {
+                    unsafe {
+                        ash_dev.destroy_descriptor_set_layout(descriptor_set_layout, None);
+                        ash_dev.destroy_shader_module(shader_module, None);
+                    }
+                    return Err(Error::Msg(format!(
+                        "vulkan create_pipeline_layout failed: {e:?}"
+                    )));
+                }
+            };
 
         let entry = std::ffi::CString::new("main").unwrap();
         let stage = vk::PipelineShaderStageCreateInfo::default()
@@ -208,10 +256,22 @@ impl Dispatch {
             .stage(stage)
             .layout(pipeline_layout);
         let pipeline_stack = [compute_info];
-        let pipelines = unsafe {
+        let pipelines = match unsafe {
             ash_dev.create_compute_pipelines(vk::PipelineCache::null(), &pipeline_stack, None)
-        }
-        .map_err(|e| Error::Msg(format!("vulkan create_compute_pipelines failed: {:?}", e.1)))?;
+        } {
+            Ok(ps) => ps,
+            Err(e) => {
+                unsafe {
+                    ash_dev.destroy_pipeline_layout(pipeline_layout, None);
+                    ash_dev.destroy_descriptor_set_layout(descriptor_set_layout, None);
+                    ash_dev.destroy_shader_module(shader_module, None);
+                }
+                return Err(Error::Msg(format!(
+                    "vulkan create_compute_pipelines failed: {:?}",
+                    e.1
+                )));
+            }
+        };
         let pipeline = pipelines[0];
 
         let pool_sizes: Vec<vk::DescriptorPoolSize> = (0..buffer_count)
@@ -220,23 +280,48 @@ impl Dispatch {
                 descriptor_count: 1,
             })
             .collect();
-        let pool = unsafe {
+        let pool = match unsafe {
             ash_dev.create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default()
                     .max_sets(1)
                     .pool_sizes(&pool_sizes),
                 None,
             )
-        }
-        .map_err(|e| Error::Msg(format!("vulkan create_descriptor_pool failed: {e:?}")))?;
+        } {
+            Ok(p) => p,
+            Err(e) => {
+                unsafe {
+                    ash_dev.destroy_pipeline(pipeline, None);
+                    ash_dev.destroy_pipeline_layout(pipeline_layout, None);
+                    ash_dev.destroy_descriptor_set_layout(descriptor_set_layout, None);
+                    ash_dev.destroy_shader_module(shader_module, None);
+                }
+                return Err(Error::Msg(format!(
+                    "vulkan create_descriptor_pool failed: {e:?}"
+                )));
+            }
+        };
 
-        let cmd_pool = unsafe {
+        let cmd_pool = match unsafe {
             ash_dev.create_command_pool(
                 &vk::CommandPoolCreateInfo::default().queue_family_index(dev.queue_family()),
                 None,
             )
-        }
-        .map_err(|e| Error::Msg(format!("vulkan create_command_pool failed: {e:?}")))?;
+        } {
+            Ok(c) => c,
+            Err(e) => {
+                unsafe {
+                    ash_dev.destroy_descriptor_pool(pool, None);
+                    ash_dev.destroy_pipeline(pipeline, None);
+                    ash_dev.destroy_pipeline_layout(pipeline_layout, None);
+                    ash_dev.destroy_descriptor_set_layout(descriptor_set_layout, None);
+                    ash_dev.destroy_shader_module(shader_module, None);
+                }
+                return Err(Error::Msg(format!(
+                    "vulkan create_command_pool failed: {e:?}"
+                )));
+            }
+        };
 
         Ok(Dispatch {
             device: ash_dev.clone(),
@@ -337,6 +422,10 @@ impl Dispatch {
         unsafe { ash_dev.end_command_buffer(cmd) }
             .map_err(|e| Error::Msg(format!("vulkan end_command_buffer failed: {e:?}")))?;
 
+        // Host access to a VkQueue is externally synchronized: hold the per-device
+        // queue lock from submit through the matching wait so a concurrent dispatch
+        // on a cloned device can't race the same queue.
+        let _guard = unsafe { dev.with_queue_lock() };
         let submit_cmds = [cmd];
         let submit = vk::SubmitInfo::default().command_buffers(&submit_cmds);
         unsafe { ash_dev.queue_submit(dev.queue(), &[submit], vk::Fence::null()).map_err(|e| Error::Msg(format!("vulkan queue_submit failed: {e:?}")))? };
@@ -359,6 +448,13 @@ impl Drop for Dispatch {
     }
 }
 
+const ELEM_WORKGROUP: u32 = 256;
+
+/// Elementwise dispatch helper: launches `ceil(n/256)` 1D workgroups (never
+/// more invocations than elements — the shaders bounds-check against `N`).
+/// `push_size` is the byte size of `push`'s layout
+/// (4 for `{uint N}`, 12 for `{uint N; float a; float b}`); it also drives the
+/// pipeline layout's push-constant range.
 fn dispatch_1buf(
     dev: &VulkanDevice,
     spirv: &[u32],
@@ -366,10 +462,14 @@ fn dispatch_1buf(
     out: &VulkanStorage,
     n: usize,
     push: &[u8],
+    push_size: u32,
 ) -> Result<()> {
-    let d = Dispatch::new(dev, spirv, 2)?;
-    let n32 = n as u32;
-    d.run(dev, &[inp.buffer, out.buffer], (256, 1, 1), (n32, 1, 1), push)
+    if n == 0 {
+        return Ok(());
+    }
+    let d = Dispatch::new(dev, spirv, 2, push_size)?;
+    let groups = ((n as u32) + ELEM_WORKGROUP - 1) / ELEM_WORKGROUP;
+    d.run(dev, &[inp.buffer, out.buffer], (ELEM_WORKGROUP, 1, 1), (groups, 1, 1), push)
 }
 
 fn dispatch_2buf(
@@ -380,19 +480,23 @@ fn dispatch_2buf(
     out: &VulkanStorage,
     n: usize,
     push: &[u8],
+    push_size: u32,
 ) -> Result<()> {
-    let d = Dispatch::new(dev, spirv, 3)?;
-    let n32 = n as u32;
+    if n == 0 {
+        return Ok(());
+    }
+    let d = Dispatch::new(dev, spirv, 3, push_size)?;
+    let groups = ((n as u32) + ELEM_WORKGROUP - 1) / ELEM_WORKGROUP;
     d.run(
         dev,
         &[lhs.buffer, rhs.buffer, out.buffer],
-        (256, 1, 1),
-        (n32, 1, 1),
+        (ELEM_WORKGROUP, 1, 1),
+        (groups, 1, 1),
         push,
     )
 }
 
-/// out[i] = a*inp[i] + b.
+/// out[i] = a*inp[i] + b.  Push layout `{uint N; float a; float b}`.
 pub fn run_affine(
     dev: &VulkanDevice,
     inp: &VulkanStorage,
@@ -402,17 +506,15 @@ pub fn run_affine(
 ) -> Result<VulkanStorage> {
     let spirv = glsl_to_spirv(GLSL_AFFINE, "main")?;
     let out = unsafe { dev.alloc_buffer(n * 4, crate::DType::F32, n) }?;
-    let push = a
-        .to_le_bytes()
-        .iter()
-        .chain(b.to_le_bytes().iter())
-        .copied()
-        .collect::<Vec<u8>>();
-    dispatch_1buf(dev, &spirv, inp, &out, n, &push)?;
+    let mut push = Vec::with_capacity(12);
+    push.extend_from_slice(&(n as u32).to_le_bytes());
+    push.extend_from_slice(&a.to_le_bytes());
+    push.extend_from_slice(&b.to_le_bytes());
+    dispatch_1buf(dev, &spirv, inp, &out, n, &push, 12)?;
     Ok(out)
 }
 
-/// out[i] = op(inp[i]).
+/// out[i] = op(inp[i]).  Push layout `{uint N}`.
 pub fn run_unary(dev: &VulkanDevice, name: &str, inp: &VulkanStorage, n: usize) -> Result<VulkanStorage> {
     let expr = match name {
         "exp" => "exp(x)",
@@ -428,11 +530,12 @@ pub fn run_unary(dev: &VulkanDevice, name: &str, inp: &VulkanStorage, n: usize) 
     let src = GLSL_UNARY.replace("{EXPR}", expr);
     let spirv = glsl_to_spirv(&src, "main")?;
     let out = unsafe { dev.alloc_buffer(n * 4, crate::DType::F32, n) }?;
-    dispatch_1buf(dev, &spirv, inp, &out, n, &[])?;
+    let push = (n as u32).to_le_bytes().to_vec();
+    dispatch_1buf(dev, &spirv, inp, &out, n, &push, 4)?;
     Ok(out)
 }
 
-/// out[i] = op(lhs[i], rhs[i]).
+/// out[i] = op(lhs[i], rhs[i]).  Push layout `{uint N}`.
 pub fn run_binary(
     dev: &VulkanDevice,
     name: &str,
@@ -451,7 +554,8 @@ pub fn run_binary(
     let src = GLSL_BINARY.replace("{EXPR}", expr);
     let spirv = glsl_to_spirv(&src, "main")?;
     let out = unsafe { dev.alloc_buffer(n * 4, crate::DType::F32, n) }?;
-    dispatch_2buf(dev, &spirv, lhs, rhs, &out, n, &[])?;
+    let push = (n as u32).to_le_bytes().to_vec();
+    dispatch_2buf(dev, &spirv, lhs, rhs, &out, n, &push, 4)?;
     Ok(out)
 }
 
@@ -464,7 +568,10 @@ pub fn run_matmul(
 ) -> Result<VulkanStorage> {
     let spirv = glsl_to_spirv(GLSL_MATMUL, "main")?;
     let out = unsafe { dev.alloc_buffer(m * n * 4, crate::DType::F32, m * n) }?;
-    let d = Dispatch::new(dev, &spirv, 3)?;
+    if m == 0 || n == 0 || k == 0 {
+        return Ok(out); // no work; buffer is empty/valid
+    }
+    let d = Dispatch::new(dev, &spirv, 3, 12)?;
     let push = [m as u32, n as u32, k as u32]
         .iter()
         .flat_map(|v| v.to_le_bytes())

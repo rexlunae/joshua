@@ -416,7 +416,14 @@ impl Device {
 
     pub fn vulkan_if_available(ordinal: usize) -> Result<Self> {
         if crate::utils::vulkan_is_available() {
-            Self::new_vulkan(ordinal)
+            match Self::new_vulkan(ordinal) {
+                Ok(d) => Ok(d),
+                Err(_) => {
+                    // No usable Vulkan loader/ICD/hardware at runtime: fall back
+                    // to CPU rather than failing the caller.
+                    Ok(Self::Cpu)
+                }
+            }
         } else {
             Ok(Self::Cpu)
         }

@@ -63,10 +63,12 @@ impl Storage {
         let rhs_device = rhs.device();
         let lhs = lhs_device.location();
         let rhs = rhs_device.location();
-        let same_device = if self.device().is_metal() {
-            // On metal, we require the device to be exactly the same rather than
-            // having the same location. In cuda this is not necessary as all CudaDevice on the
-            // same GPU will use the same cuda stream.
+        let same_device = if self.device().is_metal() || self.device().is_vulkan() {
+            // On Metal and Vulkan we require the device to be exactly the same
+            // rather than having the same location: two independently-created
+            // VulkanDevice/MetalDevice are distinct logical devices, and a buffer
+            // handle is only valid on the device that created it. In cuda this is
+            // not necessary as all CudaDevice on the same GPU share one stream.
             lhs_device.same_device(&rhs_device)
         } else {
             lhs == rhs

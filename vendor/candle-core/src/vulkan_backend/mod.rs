@@ -42,9 +42,15 @@ struct VulkanContext {
     device: ash::Device,
     queue: vk::Queue,
     queue_family: u32,
-    /// A heap index whose memory type is HOST_VISIBLE | HOST_COHERENT — the
-    /// fast path on unified-memory parts (AMD Renoir).
-    host_visible_coh_mem_index: u32,
+    /// Serialises host access to `queue`. Vulkan defines host access to a
+    /// `VkQueue` as externally synchronized, so every submit + wait (and
+    /// `synchronize`) must hold this lock to keep concurrent tensor ops from
+    /// racing the same queue.
+    queue_lock: std::sync::Mutex<()>,
+    /// Physical-device memory properties, retained so `alloc_buffer` can pick a
+    /// HOST_VISIBLE|HOST_COHERENT type that is *also* set in each resource's
+    /// `memory_type_bits` (compatibility is per-resource, not global).
+    memory_properties: vk::PhysicalDeviceMemoryProperties,
     #[allow(dead_code)]
     min_uniform_alignment: vk::DeviceSize,
 }
@@ -126,8 +132,17 @@ fn init_vulkan(gpu_id: usize) -> Result<VulkanDevice> {
         }
     };
 
-    let idx = gpu_id.min(phys_list.len() - 1);
-    let physical = phys_list[idx];
+    let physical = match phys_list.get(gpu_id) {
+        Some(&p) => p,
+        None => {
+            let _ = unsafe { instance.destroy_instance(None) };
+            return Err(Error::Msg(format!(
+                "vulkan: gpu_id {gpu_id} out of range ({} physical device(s) available)",
+                phys_list.len()
+            )));
+        }
+    };
+    let idx = gpu_id;
 
     let props = unsafe { instance.get_physical_device_properties(physical) };
     let mut device_name = [0u8; vk::MAX_PHYSICAL_DEVICE_NAME_SIZE];
@@ -169,27 +184,24 @@ fn init_vulkan(gpu_id: usize) -> Result<VulkanDevice> {
 
     let queue = unsafe { device.get_device_queue(queue_family, 0) };
 
-    // Choose the host-visible+coherent memory type (fast path on unified memory).
+    // Retain the memory properties so alloc_buffer can pick a compatible
+    // HOST_VISIBLE|HOST_COHERENT type per resource. Early-validate that at
+    // least one such type exists (the unified-memory fast path we rely on).
     let mem_props = unsafe { instance.get_physical_device_memory_properties(physical) };
-    let mut host_visible_coh_mem_index = None;
-    for (i, mt) in mem_props.memory_types.iter().enumerate() {
-        if mt.property_flags.contains(vk::MemoryPropertyFlags::HOST_VISIBLE)
+    let has_host_coh = mem_props.memory_types.iter().any(|mt| {
+        mt.property_flags.contains(vk::MemoryPropertyFlags::HOST_VISIBLE)
             && mt.property_flags.contains(vk::MemoryPropertyFlags::HOST_COHERENT)
-        {
-            host_visible_coh_mem_index = Some(i as u32);
-            break;
-        }
-    }
-    let host_visible_coh_mem_index = host_visible_coh_mem_index.ok_or_else(|| {
+    });
+    if !has_host_coh {
         let _ = unsafe {
             device.destroy_device(None);
             instance.destroy_instance(None)
         };
-        Error::Msg(format!(
+        return Err(Error::Msg(format!(
             "vulkan: {name} exposes no HOST_VISIBLE|HOST_COHERENT memory type \
              (needed for the unified-memory round-trip fast path)"
-        ))
-    })?;
+        )));
+    }
 
     eprintln!("vulkan: connected to {name} (gpu {idx}), queue family {queue_family}");
 
@@ -201,7 +213,8 @@ fn init_vulkan(gpu_id: usize) -> Result<VulkanDevice> {
             device,
             queue,
             queue_family,
-            host_visible_coh_mem_index,
+            queue_lock: std::sync::Mutex::new(()),
+            memory_properties: mem_props,
             min_uniform_alignment: 0,
         }),
     })
@@ -228,6 +241,18 @@ impl VulkanDevice {
         self.inner.queue
     }
 
+    /// Acquire the per-device queue lock for the duration of a submit+wait,
+    /// returning a `MutexGuard` whose drop releases it.
+    ///
+    /// # Safety
+    /// The caller must hold the returned guard for the whole span of Vulkan
+    /// commands that touch `self.queue()` (e.g. `queue_submit` up to the
+    /// matching `queue_wait_idle`), because host access to a `VkQueue` is
+    /// externally synchronized.
+    pub(crate) unsafe fn with_queue_lock(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.inner.queue_lock.lock().expect("vulkan queue lock poisoned")
+    }
+
     pub(crate) fn queue_family(&self) -> u32 {
         self.inner.queue_family
     }
@@ -236,7 +261,15 @@ impl VulkanDevice {
     /// layer to reason about the round-trip fast path).
     #[allow(dead_code)]
     pub(crate) fn host_chain_mem_index(&self) -> u32 {
-        self.inner.host_visible_coh_mem_index
+        self.inner
+            .memory_properties
+            .memory_types
+            .iter()
+            .position(|mt| {
+                mt.property_flags.contains(vk::MemoryPropertyFlags::HOST_VISIBLE)
+                    && mt.property_flags.contains(vk::MemoryPropertyFlags::HOST_COHERENT)
+            })
+            .unwrap_or(0) as u32
     }
 
     /// Allocate a `VulkanStorage` device buffer of `bytes`
@@ -252,12 +285,15 @@ impl VulkanDevice {
         dtype: DType,
         numel: usize,
     ) -> Result<VulkanStorage> {
+        // Vulkan forbids zero-sized buffers; represent a 0-element tensor with a
+        // minimal backing allocation while keeping the logical capacity/numel.
+        let backing = if bytes == 0 { 1 } else { bytes };
         let buffer = unsafe {
             self.inner
                 .device
                 .create_buffer(
                     &vk::BufferCreateInfo::default()
-                        .size(bytes as vk::DeviceSize)
+                        .size(backing as vk::DeviceSize)
                         .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
                         .sharing_mode(vk::SharingMode::EXCLUSIVE),
                     None,
@@ -266,9 +302,32 @@ impl VulkanDevice {
         }?;
 
         let mem_req = unsafe { self.inner.device.get_buffer_memory_requirements(buffer) };
+        // Choose a HOST_VISIBLE|HOST_COHERENT type that is ALSO compatible with
+        // this specific buffer (its `memory_type_bits`).
+        let mem_type = self
+            .inner
+            .memory_properties
+            .memory_types
+            .iter()
+            .enumerate()
+            .find(|(i, mt)| {
+                (mem_req.memory_type_bits & (1 << i)) != 0
+                    && mt.property_flags.contains(vk::MemoryPropertyFlags::HOST_VISIBLE)
+                    && mt.property_flags.contains(vk::MemoryPropertyFlags::HOST_COHERENT)
+            })
+            .map(|(i, _)| i as u32)
+            .ok_or_else(|| {
+                let _ = unsafe { self.inner.device.destroy_buffer(buffer, None) };
+                Error::Msg(format!(
+                    "vulkan: no compatible HOST_VISIBLE|HOST_COHERENT memory type for size {bytes} (mask {:b}, types {})",
+                    mem_req.memory_type_bits,
+                    self.inner.memory_properties.memory_types.len()
+                ))
+            })?;
+
         let alloc_info = vk::MemoryAllocateInfo::default()
             .allocation_size(mem_req.size)
-            .memory_type_index(self.inner.host_visible_coh_mem_index);
+            .memory_type_index(mem_type);
         let memory = unsafe { self.inner.device.allocate_memory(&alloc_info, None) }.map_err(
             |e| {
                 let _ = unsafe { self.inner.device.destroy_buffer(buffer, None) };
@@ -295,7 +354,7 @@ impl VulkanDevice {
             buffer,
             memory,
             mapped: mapped as *mut u8,
-            capacity_bytes: bytes,
+            capacity_bytes: bytes, // logical capacity (0 for empty tensors)
             dtype,
             numel,
             device: self.clone(),
@@ -452,9 +511,12 @@ impl BackendStorage for VulkanStorage {
     fn affine(&self, layout: &Layout, mul: f64, add: f64) -> Result<Self> {
         if shaders::native_enabled() && native_ok(layout, self.numel) && self.dtype == DType::F32 {
             let n = self.numel;
-            if let Ok(out) = shaders::run_affine(&self.device, self, n, mul as f32, add as f32) {
-                shaders::note_native_exec();
-                return Ok(out);
+            match shaders::run_affine(&self.device, self, n, mul as f32, add as f32) {
+                Ok(out) => {
+                    shaders::note_native_exec();
+                    return Ok(out);
+                }
+                Err(e) => shaders::log_native_fallback("affine", &e),
             }
         }
         let cpu = self.to_cpu_storage()?;
@@ -500,9 +562,12 @@ impl BackendStorage for VulkanStorage {
             && shaders::has_unary(B::NAME)
         {
             let n = self.numel;
-            if let Ok(out) = shaders::run_unary(&self.device, B::NAME, self, n) {
-                shaders::note_native_exec();
-                return Ok(out);
+            match shaders::run_unary(&self.device, B::NAME, self, n) {
+                Ok(out) => {
+                    shaders::note_native_exec();
+                    return Ok(out);
+                }
+                Err(e) => shaders::log_native_fallback(B::NAME, &e),
             }
         }
         let cpu = self.to_cpu_storage()?;
@@ -520,9 +585,12 @@ impl BackendStorage for VulkanStorage {
             && shaders::has_binary(B::NAME)
         {
             let n = self.numel;
-            if let Ok(out) = shaders::run_binary(&self.device, B::NAME, self, rhs, n) {
-                shaders::note_native_exec();
-                return Ok(out);
+            match shaders::run_binary(&self.device, B::NAME, self, rhs, n) {
+                Ok(out) => {
+                    shaders::note_native_exec();
+                    return Ok(out);
+                }
+                Err(e) => shaders::log_native_fallback(B::NAME, &e),
             }
         }
         let lhs = self.to_cpu_storage()?;
@@ -684,9 +752,12 @@ impl BackendStorage for VulkanStorage {
                 && k <= VULKAN_NATIVE_MAX_DIM
                 && rhs.numel <= VULKAN_NATIVE_MAX_DIM
             {
-                if let Ok(out) = shaders::run_matmul(&self.device, self, rhs, (m, n, k)) {
-                    shaders::note_native_exec();
-                    return Ok(out);
+                match shaders::run_matmul(&self.device, self, rhs, (m, n, k)) {
+                    Ok(out) => {
+                        shaders::note_native_exec();
+                        return Ok(out);
+                    }
+                    Err(e) => shaders::log_native_fallback("matmul", &e),
                 }
             }
         }
@@ -857,6 +928,8 @@ impl BackendDevice for VulkanDevice {
     }
 
     fn synchronize(&self) -> Result<()> {
+        // Hold the queue lock so we don't race a concurrent dispatch's submit.
+        let _guard = unsafe { self.with_queue_lock() };
         unsafe {
             self.inner
                 .device
