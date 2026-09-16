@@ -343,12 +343,18 @@ impl candle::CustomOp1 for SoftmaxLastDim {
         // native kernels), and hand the on-device result back.
         let cpu = storage.to_cpu_storage()?;
         let dims = layout.shape().dims().to_vec();
+        // A contiguous view can start partway through the backing storage; match
+        // cpu_fwd's contract by uploading only the view's range.
+        let (o1, o2) = match layout.contiguous_offsets() {
+            Some(offsets) => offsets,
+            None => candle::bail!("vulkan softmax-last-dim: input has to be contiguous"),
+        };
         let device = Device::Vulkan(storage.device.clone());
         let xs = match &cpu {
-            CpuStorage::F32(d) => Tensor::from_vec(d.clone(), dims.clone(), &device)?,
-            CpuStorage::F16(d) => Tensor::from_vec(d.clone(), dims.clone(), &device)?,
-            CpuStorage::BF16(d) => Tensor::from_vec(d.clone(), dims.clone(), &device)?,
-            CpuStorage::F64(d) => Tensor::from_vec(d.clone(), dims.clone(), &device)?,
+            CpuStorage::F32(d) => Tensor::from_vec(d[o1..o2].to_vec(), dims.clone(), &device)?,
+            CpuStorage::F16(d) => Tensor::from_vec(d[o1..o2].to_vec(), dims.clone(), &device)?,
+            CpuStorage::BF16(d) => Tensor::from_vec(d[o1..o2].to_vec(), dims.clone(), &device)?,
+            CpuStorage::F64(d) => Tensor::from_vec(d[o1..o2].to_vec(), dims.clone(), &device)?,
             _ => candle::bail!("vulkan softmax-last-dim: unsupported dtype {:?}", cpu),
         };
         // xs.max/sum over the last dim use the native last-dim reduction; the
