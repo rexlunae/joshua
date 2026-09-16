@@ -109,6 +109,14 @@ void main() {
 "#;
 
 /// Matmul (row-major, single non-batched tile): o[r*N+c] = sum_k a[r*K+k]*b[k*N+c].
+///
+/// A register-blocked kernel: each thread computes a 4x1 output tile (four rows
+/// in one column) directly from global memory, reusing each B element across the
+/// four output rows (4x less global traffic vs the naive 1-output kernel). It
+/// uses only scalar arithmetic (no shared memory / barriers / vectors), so it is
+/// race-free and bit-exact. Boundary reads/writes are guarded so non-multiple-of
+/// M/N stay correct. The reduced traffic also stops a large single dispatch
+/// (e.g. K=4096) from tripping the iGPU compute watchdog / device-lost.
 const GLSL_MATMUL: &str = r#"
 #version 450
 layout(local_size_x = 16, local_size_y = 16) in;
@@ -117,14 +125,31 @@ layout(set = 0, binding = 1) readonly buffer InBufB { float b[]; };
 layout(set = 0, binding = 2) buffer OutBuf { float o[]; };
 layout(push_constant) uniform PC { uint M; uint N; uint K; } pc;
 void main() {
-    uint r = gl_GlobalInvocationID.y;
-    uint c = gl_GlobalInvocationID.x;
-    if (r >= pc.M || c >= pc.N) return;
-    float acc = 0.0;
+    uint tx = gl_LocalInvocationID.x;
+    uint ty = gl_LocalInvocationID.y;
+    uint row0 = gl_WorkGroupID.y * 64u + ty * 4u;
+    uint col = gl_WorkGroupID.x * 16u + tx;
+    float c0 = 0.0;
+    float c1 = 0.0;
+    float c2 = 0.0;
+    float c3 = 0.0;
     for (uint k = 0u; k < pc.K; k++) {
-        acc += a[r * pc.K + k] * b[k * pc.N + c];
+        float a0 = (row0 + 0u < pc.M) ? a[(row0 + 0u) * pc.K + k] : 0.0;
+        float a1 = (row0 + 1u < pc.M) ? a[(row0 + 1u) * pc.K + k] : 0.0;
+        float a2 = (row0 + 2u < pc.M) ? a[(row0 + 2u) * pc.K + k] : 0.0;
+        float a3 = (row0 + 3u < pc.M) ? a[(row0 + 3u) * pc.K + k] : 0.0;
+        float bv = (col < pc.N) ? b[k * pc.N + col] : 0.0;
+        c0 += a0 * bv;
+        c1 += a1 * bv;
+        c2 += a2 * bv;
+        c3 += a3 * bv;
     }
-    o[r * pc.N + c] = acc;
+    if (col < pc.N) {
+        if (row0 + 0u < pc.M) o[(row0 + 0u) * pc.N + col] = c0;
+        if (row0 + 1u < pc.M) o[(row0 + 1u) * pc.N + col] = c1;
+        if (row0 + 2u < pc.M) o[(row0 + 2u) * pc.N + col] = c2;
+        if (row0 + 3u < pc.M) o[(row0 + 3u) * pc.N + col] = c3;
+    }
 }
 "#;
 
@@ -576,8 +601,18 @@ pub fn run_matmul(
         .iter()
         .flat_map(|v| v.to_le_bytes())
         .collect::<Vec<u8>>();
-    let gx = ((n as u32 + 15) / 16).max(1);
-    let gy = ((m as u32 + 15) / 16).max(1);
-    d.run(dev, &[a.buffer, b.buffer, out.buffer], (16, 16, 1), (gx, gy, 1), &push)?;
+    // Each 16x16 workgroup computes a 64x16 output tile (4 rows x 1 col per
+    // thread): grid X = ceil(N/16), grid Y = ceil(M/64).
+    let tile_n = 16u32;
+    let tile_m = 64u32;
+    let gx = ((n as u32) + tile_n - 1) / tile_n;
+    let gy = ((m as u32) + tile_m - 1) / tile_m;
+    d.run(
+        dev,
+        &[a.buffer, b.buffer, out.buffer],
+        (16, 16, 1),
+        (gx, gy, 1),
+        &push,
+    )?;
     Ok(out)
 }
