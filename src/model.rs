@@ -618,6 +618,25 @@ impl QuantizedModel {
             Self::DeepSeek4(m) => m.forward(input, index_pos),
         }
     }
+
+    /// Batch one decode step across `seqs` independent sequences, amortizing
+    /// the routed-expert fetch across the MoE dispatch.  See
+    /// `quantized_deepseek4::ModelWeights::forward_sequences`.  Only supported
+    /// on architectures with a native batched path (deepseek4); other
+    /// architectures report an unsupported error so a caller can fall back
+    /// to iterating sequences individually.  Part of the library API; the
+    /// engine's own request paths do not batch yet.
+    pub fn forward_sequences(
+        &mut self,
+        seqs: &[(&Tensor, usize)],
+    ) -> Result<Vec<Vec<f32>>> {
+        match self {
+            Self::DeepSeek4(m) => m.forward_sequences(seqs),
+            _ => Err(candle_core::Error::Msg(
+                "batched forward_sequences is not implemented for this architecture".into(),
+            )),
+        }
+    }
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
