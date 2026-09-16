@@ -124,34 +124,43 @@ layout(set = 0, binding = 0) readonly buffer InBufA { float a[]; };
 layout(set = 0, binding = 1) readonly buffer InBufB { float b[]; };
 layout(set = 0, binding = 2) buffer OutBuf { float o[]; };
 // bsk/bsn are the RHS layout strides along k and n, so a single kernel handles
-// a contiguous B ([K,1]), a transposed B ([1,K] — the weight-transpose case),
-// and broadcast B ([0,1] — the attention KV broadcast). LHS is always row-major.
-layout(push_constant) uniform PC { uint M; uint N; uint K; uint bsk; uint bsn; } pc;
+// a contiguous B ([K,1]), transposed B ([1,K] — weight-transpose) and broadcast
+// B ([0,1] — attention KV broadcast). LHS is always row-major. ba/bb/bo are the
+// per-batch strides of A/B/o; the batch index rides the workgroup's Z axis.
+layout(push_constant) uniform PC {
+    uint M; uint N; uint K;
+    uint bsk; uint bsn;
+    uint ba; uint bb; uint bo;
+} pc;
 void main() {
     uint tx = gl_LocalInvocationID.x;
     uint ty = gl_LocalInvocationID.y;
+    uint bz = gl_WorkGroupID.z;
     uint row0 = gl_WorkGroupID.y * 64u + ty * 4u;
     uint col = gl_WorkGroupID.x * 16u + tx;
+    uint ao = bz * pc.ba; // A base offset for this batch
+    uint bo_ptr = bz * pc.bb; // B base offset for this batch
+    uint oo = bz * pc.bo; // O base offset for this batch
     float c0 = 0.0;
     float c1 = 0.0;
     float c2 = 0.0;
     float c3 = 0.0;
     for (uint k = 0u; k < pc.K; k++) {
-        float a0 = (row0 + 0u < pc.M) ? a[(row0 + 0u) * pc.K + k] : 0.0;
-        float a1 = (row0 + 1u < pc.M) ? a[(row0 + 1u) * pc.K + k] : 0.0;
-        float a2 = (row0 + 2u < pc.M) ? a[(row0 + 2u) * pc.K + k] : 0.0;
-        float a3 = (row0 + 3u < pc.M) ? a[(row0 + 3u) * pc.K + k] : 0.0;
-        float bv = (col < pc.N) ? b[k * pc.bsk + col * pc.bsn] : 0.0;
+        float a0 = (row0 + 0u < pc.M) ? a[ao + (row0 + 0u) * pc.K + k] : 0.0;
+        float a1 = (row0 + 1u < pc.M) ? a[ao + (row0 + 1u) * pc.K + k] : 0.0;
+        float a2 = (row0 + 2u < pc.M) ? a[ao + (row0 + 2u) * pc.K + k] : 0.0;
+        float a3 = (row0 + 3u < pc.M) ? a[ao + (row0 + 3u) * pc.K + k] : 0.0;
+        float bv = (col < pc.N) ? b[bo_ptr + k * pc.bsk + col * pc.bsn] : 0.0;
         c0 += a0 * bv;
         c1 += a1 * bv;
         c2 += a2 * bv;
         c3 += a3 * bv;
     }
     if (col < pc.N) {
-        if (row0 + 0u < pc.M) o[(row0 + 0u) * pc.N + col] = c0;
-        if (row0 + 1u < pc.M) o[(row0 + 1u) * pc.N + col] = c1;
-        if (row0 + 2u < pc.M) o[(row0 + 2u) * pc.N + col] = c2;
-        if (row0 + 3u < pc.M) o[(row0 + 3u) * pc.N + col] = c3;
+        if (row0 + 0u < pc.M) o[oo + (row0 + 0u) * pc.N + col] = c0;
+        if (row0 + 1u < pc.M) o[oo + (row0 + 1u) * pc.N + col] = c1;
+        if (row0 + 2u < pc.M) o[oo + (row0 + 2u) * pc.N + col] = c2;
+        if (row0 + 3u < pc.M) o[oo + (row0 + 3u) * pc.N + col] = c3;
     }
 }
 "#;
@@ -587,29 +596,44 @@ pub fn run_binary(
     Ok(out)
 }
 
-/// o(row-major m×n) = a(m×k) @ b(k×n), single non-batched tile.
-/// / are b's layout strides along k and n, so a transposed or
-/// broadcast rhs is handled in-kernel (see GLSL_MATMUL).
+/// o(row-major m×n) = a(m×k) @ b(k×n), batched.
+/// `batch` matrices run with the batch index on the workgroup Z axis. `bsk/bsn`
+/// are b's layout strides along k and n (transposed/broadcast rhs handled
+/// in-kernel); `ba/bb/bo` are the per-batch strides of a/b/o.
 pub fn run_matmul(
     dev: &VulkanDevice,
     a: &VulkanStorage,
     b: &VulkanStorage,
-    (m, n, k): (usize, usize, usize),
+    (batch, m, n, k): (usize, usize, usize, usize),
     bsk: usize,
     bsn: usize,
+    ba: usize,
+    bb: usize,
+    bo: usize,
 ) -> Result<VulkanStorage> {
     let spirv = glsl_to_spirv(GLSL_MATMUL, "main")?;
-    let out = unsafe { dev.alloc_buffer(m * n * 4, crate::DType::F32, m * n) }?;
-    if m == 0 || n == 0 || k == 0 {
+    let out = unsafe {
+        dev.alloc_buffer(m * n * batch * 4, crate::DType::F32, m * n * batch)
+    }?;
+    if m == 0 || n == 0 || k == 0 || batch == 0 {
         return Ok(out); // no work; buffer is empty/valid
     }
-    let d = Dispatch::new(dev, &spirv, 3, 20)?;
-    let push = [m as u32, n as u32, k as u32, bsk as u32, bsn as u32]
-        .iter()
-        .flat_map(|v| v.to_le_bytes())
-        .collect::<Vec<u8>>();
+    let d = Dispatch::new(dev, &spirv, 3, 32)?;
+    let push = [
+        m as u32,
+        n as u32,
+        k as u32,
+        bsk as u32,
+        bsn as u32,
+        ba as u32,
+        bb as u32,
+        bo as u32,
+    ]
+    .iter()
+    .flat_map(|v| v.to_le_bytes())
+    .collect::<Vec<u8>>();
     // Each 16x16 workgroup computes a 64x16 output tile (4 rows x 1 col per
-    // thread): grid X = ceil(N/16), grid Y = ceil(M/64).
+    // thread): grid X = ceil(N/16), grid Y = ceil(M/64), grid Z = batch.
     let tile_n = 16u32;
     let tile_m = 64u32;
     let gx = ((n as u32) + tile_n - 1) / tile_n;
@@ -618,7 +642,7 @@ pub fn run_matmul(
         dev,
         &[a.buffer, b.buffer, out.buffer],
         (16, 16, 1),
-        (gx, gy, 1),
+        (gx, gy, batch as u32),
         &push,
     )?;
     Ok(out)

@@ -746,23 +746,42 @@ impl BackendStorage for VulkanStorage {
             && rhs.dtype == DType::F32
         {
             let (batch, m, n, k) = bmnk;
-            if batch == 1
+            if batch <= VULKAN_NATIVE_MAX_DIM
                 && m <= VULKAN_NATIVE_MAX_DIM
                 && n <= VULKAN_NATIVE_MAX_DIM
                 && k <= VULKAN_NATIVE_MAX_DIM
                 && rhs.numel <= VULKAN_NATIVE_MAX_DIM
             {
-                // The kernel reads B as b[k*bsk + col*bsn]; pass the RHS layout's
-                // strides along k and n so a transposed weight ([1,K]) or the
-                // attention KV broadcast ([0,1]) runs on-device instead of
-                // copying the (possibly large) operand to CPU. LHS stays
-                // contiguous (row-major), per the deepseek4 matmul profile.
+                // The kernel reads B as b[bb*bz + k*bsk + col*bsn]; bsk/bsn are
+                // the RHS layout strides along k/n, so a transposed weight
+                // ([1,K]) or the attention KV broadcast ([0,1]) runs on-device.
+                // ba/bb/bo are the per-batch strides of A/B/o (0 => broadcast).
+                // LHS stays row-major (confirmed contiguous in the profile).
                 let rstride = rhs_l.stride();
-                let n_dims = rstride.len();
-                if n_dims >= 2 {
-                    let bsn = rstride[n_dims - 1];
-                    let bsk = rstride[n_dims - 2];
-                    match shaders::run_matmul(&self.device, self, rhs, (m, n, k), bsk, bsn) {
+                let rd = rstride.len();
+                if rd >= 2 {
+                    let bsn = rstride[rd - 1];
+                    let bsk = rstride[rd - 2];
+                    // `batch` flattens every leading axis, so for rank>=4 the
+                    // per-matrix stride is the *matrix element count*, not the
+                    // first axis's stride. LHS is contiguous (native_ok), so its
+                    // matrices are laid out linearly at m*k.
+                    let ba = m * k;
+                    // RHS: accept native only when its batch is linear — the
+                    // innermost batch-axis stride equals the k*n matrix size
+                    // (contiguous / transposed storage both satisfy this). A
+                    // broadcast batch gives 0. Any other layout falls back to CPU
+                    // rather than indexing the wrong matrix.
+                    let bb = if rd >= 3 {
+                        let inner = rstride[rd - 3];
+                        if inner == k * n { inner } else { 0 }
+                    } else {
+                        0 // 2D RHS broadcast across all batch groups
+                    };
+                    let bo = m * n;
+                    match shaders::run_matmul(
+                        &self.device, self, rhs, (batch, m, n, k), bsk, bsn, ba, bb, bo,
+                    ) {
                         Ok(out) => {
                             shaders::note_native_exec();
                             return Ok(out);
@@ -1093,6 +1112,67 @@ mod tests {
             &got_vk2,
             1e-2,
             "matmul_transposed_rhs(23,48,36)",
+        );
+
+        // Batched matmul (batch>1): a (8,37,64) @ b (8,64,51).
+        let (bsz, m3, k3, n3) = (8usize, 37usize, 64usize, 51usize);
+        let a3_v = (0..bsz * m3 * k3).map(|i| ((i % 6) as f32 - 3.0) * 0.5).collect::<Vec<f32>>();
+        let b3_v = (0..bsz * k3 * n3).map(|i| ((i % 10) as f32 - 5.0) * 0.25).collect::<Vec<f32>>();
+        let a3c = Tensor::from_vec(a3_v.clone(), (bsz, m3, k3), &Device::Cpu)?;
+        let b3c = Tensor::from_vec(b3_v.clone(), (bsz, k3, n3), &Device::Cpu)?;
+        let got_cpu3 = a3c.matmul(&b3c)?;
+        let a3o = Tensor::from_vec(a3_v, (bsz, m3, k3), &dev)?;
+        let b3o = Tensor::from_vec(b3_v, (bsz, k3, n3), &dev)?;
+        let got_vk3 = a3o
+            .matmul(&b3o)?
+            .to_device(&Device::Cpu)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        approx(
+            &got_cpu3.flatten_all()?.to_vec1::<f32>()?,
+            &got_vk3,
+            1e-2,
+            "matmul_batched(8,37,64@64x51)",
+        );
+
+        // Rank-4 batched matmul (Devin): lhs [1,8,m,k] @ rhs [1,8,k,n].
+        let a4_v = (0..1 * 8 * 64 * 512).map(|i| ((i % 7) as f32 - 3.0) * 0.5).collect::<Vec<f32>>();
+        let b4_v = (0..1 * 8 * 512 * 51).map(|i| ((i % 11) as f32 - 5.0) * 0.25).collect::<Vec<f32>>();
+        let a4c = Tensor::from_vec(a4_v.clone(), (1, 8, 64, 512), &Device::Cpu)?;
+        let b4c = Tensor::from_vec(b4_v.clone(), (1, 8, 512, 51), &Device::Cpu)?;
+        let got_cpu4 = a4c.matmul(&b4c)?;
+        let a4o = Tensor::from_vec(a4_v, (1, 8, 64, 512), &dev)?;
+        let b4o = Tensor::from_vec(b4_v, (1, 8, 512, 51), &dev)?;
+        let got_vk4 = a4o
+            .matmul(&b4o)?
+            .to_device(&Device::Cpu)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        approx(
+            &got_cpu4.flatten_all()?.to_vec1::<f32>()?,
+            &got_vk4,
+            1e-2,
+            "matmul_rank4(1,8,64,512)",
+        );
+
+        // Rank-4 with two non-unit batch axes: [2,3,m,k] @ [2,3,k,n].
+        let a5_v = (0..2 * 3 * 16 * 24).map(|i| ((i % 9) as f32 - 4.0) * 0.3).collect::<Vec<f32>>();
+        let b5_v = (0..2 * 3 * 24 * 20).map(|i| ((i % 13) as f32 - 6.0) * 0.2).collect::<Vec<f32>>();
+        let a5c = Tensor::from_vec(a5_v.clone(), (2, 3, 16, 24), &Device::Cpu)?;
+        let b5c = Tensor::from_vec(b5_v.clone(), (2, 3, 24, 20), &Device::Cpu)?;
+        let got_cpu5 = a5c.matmul(&b5c)?;
+        let a5o = Tensor::from_vec(a5_v, (2, 3, 16, 24), &dev)?;
+        let b5o = Tensor::from_vec(b5_v, (2, 3, 24, 20), &dev)?;
+        let got_vk5 = a5o
+            .matmul(&b5o)?
+            .to_device(&Device::Cpu)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        approx(
+            &got_cpu5.flatten_all()?.to_vec1::<f32>()?,
+            &got_vk5,
+            1e-2,
+            "matmul_rank4_multi_axis(2,3,16,24)",
         );
 
         if native {
