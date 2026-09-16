@@ -677,6 +677,7 @@ impl Tensor {
             Storage::Cuda(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
             Storage::Metal(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
             Storage::OpenCl(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
+            Storage::Vulkan(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
         }
     }
 
@@ -1950,6 +1951,7 @@ impl Tensor {
             Storage::Cuda(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
             Storage::Metal(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
             Storage::OpenCl(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
+            Storage::Vulkan(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
         }
     }
 
@@ -1982,6 +1984,7 @@ impl Tensor {
             Storage::Cuda(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
             Storage::Metal(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
             Storage::OpenCl(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
+            Storage::Vulkan(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
         }
     }
 
@@ -2024,6 +2027,7 @@ impl Tensor {
             Storage::Cuda(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
             Storage::Metal(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
             Storage::OpenCl(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
+            Storage::Vulkan(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
         }
     }
 
@@ -2383,12 +2387,20 @@ impl Tensor {
                 (Storage::Cpu(storage), Device::OpenCl(ocl)) => {
                     Storage::OpenCl(ocl.storage_from_cpu_storage(storage)?)
                 }
+                (Storage::Cpu(storage), Device::Vulkan(vk)) => {
+                    Storage::Vulkan(vk.storage_from_cpu_storage(storage)?)
+                }
                 (Storage::Cuda(storage), Device::Cpu) => Storage::Cpu(storage.to_cpu_storage()?),
                 (Storage::Metal(storage), Device::Cpu) => Storage::Cpu(storage.to_cpu_storage()?),
                 (Storage::OpenCl(storage), Device::Cpu) => Storage::Cpu(storage.to_cpu_storage()?),
+                (Storage::Vulkan(storage), Device::Cpu) => Storage::Cpu(storage.to_cpu_storage()?),
                 (Storage::OpenCl(storage), Device::OpenCl(ocl)) => {
                     let dst = storage.transfer_to_device(ocl)?;
                     Storage::OpenCl(dst)
+                }
+                (Storage::Vulkan(storage), Device::Vulkan(vk)) => {
+                    let dst = storage.transfer_to_device(vk)?;
+                    Storage::Vulkan(dst)
                 }
                 (Storage::Cuda(storage), Device::Cuda(cuda)) => {
                     // can't clone storage if it's the same device because of the underlying device ptr

@@ -284,6 +284,11 @@ impl Tensor {
                             "OpenCL support for sub-byte dtypes is not implemented (M1)".to_string(),
                         ));
                     }
+                    Device::Vulkan(_) => {
+                        return Err(Error::Msg(
+                            "Vulkan support for sub-byte dtypes is not implemented (M1)".to_string(),
+                        ));
+                    }
                 };
 
 
@@ -388,6 +393,11 @@ fn convert_dummy(view: &st::TensorView<'_>, device: &Device) -> Result<Tensor> {
         Device::OpenCl(_) => {
             return Err(Error::Msg(
                 "OpenCL support for sub-byte dtypes is not implemented (M1)".to_string(),
+            ));
+        }
+        Device::Vulkan(_) => {
+            return Err(Error::Msg(
+                "Vulkan support for sub-byte dtypes is not implemented (M1)".to_string(),
             ));
         }
     };

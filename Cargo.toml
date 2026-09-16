@@ -50,6 +50,12 @@ metal = [
 # (iGPU now; a more powerful Intel card later). Requires a system libOpenCL
 # (-lOpenCL, e.g. intel-opencl-icd on Linux) at link time.
 opencl = ["candle-core/opencl"]
+# Vulkan accelerator (vendored candle-core `vulkan` backend: VulkanDevice /
+# VulkanStorage + host-visible round-trip + naga-compiled compute kernels).
+# Bring-up target is the AMD Renoir iGPU (unified memory, RADV). Requires a
+# system Vulkan loader + ICD (libvulkan.so, e.g. mesa-vulkan-drivers) at
+# runtime; ash loads it dynamically so there is no hard link dependency.
+vulkan = ["candle-core/vulkan"]
 # HTTPS termination via rustls. Opt-in because the ring crypto provider
 # compiles C/assembly, which would break the default build's
 # "only a Rust toolchain required" guarantee.
