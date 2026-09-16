@@ -1522,7 +1522,7 @@ mod vulkan_softmax_tests {
         let out_cpu = rms_norm(&xc, &ac, eps)?.to_vec2::<f32>()?;
 
         let xv = Tensor::from_vec(x, (r, c), &vdevice)?;
-        let av = Tensor::from_vec(alpha, (c,), &vdevice)?;
+        let av = Tensor::from_vec(alpha.clone(), (c,), &vdevice)?;
         let out_vk = rms_norm(&xv, &av, eps)?
             .to_device(&Device::Cpu)?
             .to_vec2::<f32>()?;
