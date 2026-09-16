@@ -21,6 +21,7 @@
 //! A `tokenizer.json` from the model's HuggingFace repository must be placed
 //! alongside the `.gguf` file so the engine can tokenise prompts.
 
+pub mod auto_placement;
 pub mod compression;
 pub mod cpu_pinning;
 pub mod embedding;
@@ -61,8 +62,8 @@ pub mod types;
 pub use rustls;
 
 pub use engine::{
-    find_gguf_in_dir, ComputeBackend, Engine, EngineOptions, ExpertPlacement, HugePages, MlockMode,
-    MmapMode, PageSize,
+    find_gguf_in_dir, ComputeBackend, Engine, EngineOptions, DensePlacement, ExpertPlacement,
+    HugePages, MlockMode, MmapMode, PageSize,
 };
 pub use error::{JoshuaError, Result};
 pub use types::{

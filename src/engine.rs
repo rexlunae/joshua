@@ -111,7 +111,7 @@ use tokenizers::Tokenizer;
 use crate::embedding::EmbeddingModel;
 use crate::model::{Architecture, QuantizedModel};
 use crate::npu::{NpuBackend, NpuSession};
-pub use crate::placement::ExpertPlacement;
+pub use crate::placement::{DensePlacement, ExpertPlacement};
 use crate::template::ChatTemplate;
 
 use crate::error::{JoshuaError, Result};
@@ -384,6 +384,15 @@ pub struct EngineOptions {
     /// CPU device.  Wired for `qwen3moe` and `deepseek2`; `deepseek4` always
     /// keeps a mapped model's experts on the host.
     pub expert_placement: ExpertPlacement,
+    /// Where the dense set (embeddings, norms, attention, routers, shared
+    /// experts, output) lives on an accelerator: the device itself, or the CPU.
+    /// [`DensePlacement::Auto`] (the default) keeps dense on the device —
+    /// right for a real accelerator whose GEMM beats CPU-BLAS.  On a weak
+    /// iGPU / software OpenCL backend the device GEMM can be ~50x *slower*
+    /// than CPU-BLAS, so [`DensePlacement::Cpu`] keeps the dense set on the
+    /// host (the routed-expert placement is unaffected).  Ignored on the CPU
+    /// device.
+    pub dense_placement: DensePlacement,
     /// Bytes of accelerator memory the model may use, overriding the probe
     /// for the [`ExpertPlacement::Auto`] decision and the per-device session
     /// cap.  `None` uses the probe where one exists.  This is the knob for
@@ -472,6 +481,13 @@ impl EngineOptions {
     /// accelerator.  See [`EngineOptions::expert_placement`].
     pub fn expert_placement(mut self, placement: ExpertPlacement) -> Self {
         self.expert_placement = placement;
+        self
+    }
+
+    /// Choose where the dense set lives on an accelerator.  See
+    /// [`EngineOptions::dense_placement`].
+    pub fn dense_placement(mut self, placement: DensePlacement) -> Self {
+        self.dense_placement = placement;
         self
     }
 
@@ -564,6 +580,11 @@ pub struct Engine {
     /// Compute device: CUDA or Metal when built with the matching feature
     /// (falling back to CPU if unavailable at runtime), CPU otherwise.
     device: Device,
+    /// Device the dense set runs on: `device`, or the CPU when the operator
+    /// forced [`EngineOptions::dense_placement`] to `Cpu` (e.g. a weak iGPU
+    /// whose accelerator GEMM is slower than CPU-BLAS).  The dense weights are
+    /// laid out on this device and the accelerator is unused for them.
+    dense_device: Device,
     /// Device the routed-expert pool of a MoE model is built on: `device`,
     /// or the CPU when the experts stay in host RAM (see
     /// [`EngineOptions::expert_placement`]).
@@ -1197,6 +1218,44 @@ impl Engine {
             crate::placement::ResolvedPlacement::Host => Device::Cpu,
             crate::placement::ResolvedPlacement::Device => device.clone(),
         };
+        // Where the dense set runs.  A real accelerator (fast GEMM) wants dense
+        // on-device; a weak iGPU / software OpenCL-Vulkan path is far slower
+        // than CPU-BLAS and wants dense on the CPU.  `Auto` (the default)
+        // runs a quick probe and picks by measured throughput; an explicit
+        // `Device` / `Cpu` request is honoured as-is.
+        let resolved_dense = if !device.is_cpu()
+            && options.dense_placement == crate::placement::DensePlacement::Auto
+            && crate::auto_placement::probe_enabled()
+        {
+            let bench = crate::auto_placement::benchmark(&device);
+            tracing::info!(
+                "dense placement probe: device decode {:.1} GFLOPS / prefill {:.1}; \
+                 cpu decode {:.1} GFLOPS / prefill {:.1}; decode speedup {:.2}x / prefill {:.2}x",
+                bench.dev_decode_gflops,
+                bench.dev_prefill_gflops,
+                bench.cpu_decode_gflops,
+                bench.cpu_prefill_gflops,
+                bench.decode_speedup(),
+                bench.prefill_speedup(),
+            );
+            crate::auto_placement::recommend_dense(options.dense_placement, &bench, false)
+        } else {
+            crate::placement::resolve_dense_placement(options.dense_placement, device.is_cpu())
+        };
+        let dense_device = match resolved_dense {
+            crate::placement::ResolvedDense::Device => device.clone(),
+            crate::placement::ResolvedDense::Cpu => Device::Cpu,
+        };
+        if !device.is_cpu() && dense_device.is_cpu() {
+            tracing::info!(
+                "dense placement: cpu — keeping the dense set on CPU-BLAS (requested {:?}); \
+                 the {:?} accelerator is reserved but unused for weights",
+                options.dense_placement,
+                device,
+            );
+        } else {
+            tracing::info!("dense placement: device ({device:?})",);
+        }
         let shares_weights = arch.is_some_and(|a| a.shares_weights());
         // Device memory one session's weights occupy (0 when sessions share
         // the template's weights and only add a KV cache).
@@ -1309,6 +1368,7 @@ impl Engine {
             expert_cache_auto,
             device_expert_cache,
             device,
+            dense_device,
             expert_device,
             weights_template: Mutex::new(None),
             device_session_cap,
@@ -1849,7 +1909,7 @@ impl Engine {
             // incrementally and would otherwise overrun mid-stream).  The
             // standard forward enforces the cap inside attention, so mirror
             // that guard here and only stream when the prompt fits.
-            let streamable = model.prefill_streamed(&chunks, &self.device);
+            let streamable = model.prefill_streamed(&chunks, &self.dense_device);
             match streamable {
                 Ok(Some(v)) => v,
                 _ => {
@@ -1858,7 +1918,7 @@ impl Engine {
                     for piece_start in (0..new_tokens.len()).step_by(PREFILL_CHUNK) {
                         let end = (piece_start + PREFILL_CHUNK).min(new_tokens.len());
                         let piece = &new_tokens[piece_start..end];
-                        last = model.forward_tokens(piece, base + piece_start, &self.device)?;
+                        last = model.forward_tokens(piece, base + piece_start, &self.dense_device)?;
                     }
                     last
                 }
@@ -2002,7 +2062,7 @@ impl Engine {
             }
 
             // Single-token decode step.
-            logits_vec = model.forward_tokens(&[next_token], n_cur, &self.device)?;
+            logits_vec = model.forward_tokens(&[next_token], n_cur, &self.dense_device)?;
             fed_tokens.push(next_token);
             n_cur += 1;
         }
@@ -2389,7 +2449,7 @@ impl Engine {
         let mut model = QuantizedModel::from_gguf_mmap_placed(
             gguf,
             &mut cursor,
-            &self.device,
+            &self.dense_device,
             &self.expert_device,
             Some(Arc::clone(&self.mmap)),
             self.model_file.clone(),

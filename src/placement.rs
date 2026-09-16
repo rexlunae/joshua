@@ -269,11 +269,84 @@ pub fn resolve_expert_placement(
     }
 }
 
-/// Whether the dense set — which always goes to the compute device — fits
-/// the device's memory with headroom.  Expert placement can only move the
-/// routed experts; a budget below this cannot be honoured by any placement,
-/// so the engine refuses the load instead of deferring an oversized upload
-/// to the first request.
+// ─── Dense placement (where the dense set lives) ─────────────────────────────
+
+/// Where a model's dense set — embeddings, norms, attention, routers, shared
+/// experts, output — runs when inference is requested on an accelerator.
+///
+/// These weights are touched on *every* token, so on a backend whose GEMM is
+/// faster than CPU-BLAS (big discrete GPUs) they belong on the device.  But a
+/// weak integrated GPU / software OpenCL path can be far *slower* than CPU-BLAS
+/// (e.g. the Renoir iGPU runs dense OpenCL at ~21 GFLOPS vs ~384 GFLOPS for
+/// 16-core BLAS, ~50x worse on attention).  On such systems the best placement
+/// keeps the dense set on the CPU and only uses the accelerator where it helps,
+/// which is what this knob enables.
+///
+/// On the CPU device the setting is moot (everything is host memory) and ignored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DensePlacement {
+    /// Dense set goes to the requested compute device.  This is the historical
+    /// and recommended behaviour on a real accelerator.
+    #[default]
+    Auto,
+    /// The dense set goes to the requested compute device (explicit).
+    Device,
+    /// The dense set runs on the CPU (CPU-BLAS), even when an accelerator is
+    /// requested.  The routed-expert placement is unaffected.  Use this on
+    /// systems where the accelerator's GEMM is slower than CPU-BLAS.
+    Cpu,
+}
+
+impl std::str::FromStr for DensePlacement {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "device" | "gpu" | "accelerator" => Ok(Self::Device),
+            "cpu" | "host" | "blas" => Ok(Self::Cpu),
+            other => Err(format!(
+                "unknown dense placement `{other}` (expected auto, device or cpu)"
+            )),
+        }
+    }
+}
+
+/// A resolved dense placement: [`DensePlacement`] minus `Auto`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolvedDense {
+    /// Dense set runs on the accelerator.
+    Device,
+    /// Dense set runs on the CPU (CPU-BLAS).
+    Cpu,
+}
+
+/// Decide where the dense set lives.  Pure: every input is a number, so the
+/// rule is unit-testable without a device.
+///
+/// * `Device` / `Cpu` requests are honoured as-is.
+/// * `Auto` on the CPU is `Cpu` (moot).  On any accelerator it is `Device`,
+///   keeping the historical "dense always on the device" behaviour so a real
+///   GPU is unchanged unless the operator opts into `cpu`.
+pub fn resolve_dense_placement(
+    requested: DensePlacement,
+    is_cpu_device: bool,
+) -> ResolvedDense {
+    if is_cpu_device {
+        return ResolvedDense::Cpu;
+    }
+    match requested {
+        DensePlacement::Device => ResolvedDense::Device,
+        DensePlacement::Cpu => ResolvedDense::Cpu,
+        DensePlacement::Auto => ResolvedDense::Device,
+    }
+}
+
+/// Whether the dense set — which, when not forced to the CPU, goes to the
+/// compute device — fits the device's memory with headroom.  Expert placement
+/// can only move the routed experts; a budget below this cannot be honoured by
+/// any placement, so the engine refuses the load instead of deferring an
+/// oversized upload to the first request.
 pub fn dense_set_fits(dense_device_bytes: u64, headroom_bytes: u64, budget_bytes: u64) -> bool {
     // An overflowing requirement is "does not fit", never a wrap into fitting.
     dense_device_bytes

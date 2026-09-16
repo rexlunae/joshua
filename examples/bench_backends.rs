@@ -12,7 +12,7 @@
 //! JOSHUA_VULKAN_NATIVE; set the relevant one (or leave unset to measure the
 //! CPU-fallback path).
 
-use candle_core::{Device, DType, Tensor};
+use candle_core::{Device, Tensor};
 
 fn main() -> anyhow::Result<()> {
     let mut device = "cpu".to_string();

@@ -20,8 +20,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use tracing_subscriber::EnvFilter;
 
 use joshua::{
-    engine::Engine, server, types::GenerationOptions, ChatMessage, ComputeBackend, EngineOptions,
-    ExpertPlacement, HugePages, MlockMode, MmapMode, PageSize,
+    engine::Engine, server, types::GenerationOptions, ChatMessage, ComputeBackend, DensePlacement,
+    EngineOptions, ExpertPlacement, HugePages, MlockMode, MmapMode, PageSize,
 };
 
 /// Values for `--device` (CLI form of [`ComputeBackend`]).
@@ -296,6 +296,18 @@ enum Commands {
         /// PEM private key for --tls-cert.
         #[arg(long, env = "JOSHUA_TLS_KEY", requires = "tls_cert")]
         tls_key: Option<PathBuf>,
+        /// Where the dense set (embeddings, norms, attention, routers, shared
+        /// experts, output) runs on a GPU: `device` offloads it (right for a
+        /// real GPU whose GEMM beats CPU-BLAS), `cpu` keeps it on CPU-BLAS
+        /// (right when the accelerator is a weak iGPU / software OpenCL-Vulkan
+        /// path that is slower than the CPU), `auto` runs a quick startup probe
+        /// and picks by measured throughput.  Ignored on the CPU.
+        #[arg(long, env = "JOSHUA_DENSE_PLACEMENT", default_value = "auto", value_parser = clap::value_parser!(DensePlacement))]
+        dense_placement: DensePlacement,
+        /// Skip the `--dense auto` startup probe (fast launch; `auto` then keeps
+        /// the dense set on the device).
+        #[arg(long, env = "JOSHUA_SKIP_PLACEMENT_BENCH", num_args = 0..=1, default_missing_value = "true")]
+        skip_placement_bench: bool,
     },
     /// Run a single chat completion and print the response.
     Run {
@@ -389,6 +401,18 @@ enum Commands {
         /// (lower overhead; a plugin crash takes the server down).
         #[arg(long, default_value_t = false)]
         npu_in_process: bool,
+        /// Where the dense set (embeddings, norms, attention, routers, shared
+        /// experts, output) runs on a GPU: `device` offloads it (right for a
+        /// real GPU whose GEMM beats CPU-BLAS), `cpu` keeps it on CPU-BLAS
+        /// (right when the accelerator is a weak iGPU / software OpenCL-Vulkan
+        /// path that is slower than the CPU), `auto` runs a quick startup probe
+        /// and picks by measured throughput.  Ignored on the CPU.
+        #[arg(long, env = "JOSHUA_DENSE_PLACEMENT", default_value = "auto", value_parser = clap::value_parser!(DensePlacement))]
+        dense_placement: DensePlacement,
+        /// Skip the `--dense auto` startup probe (fast launch; `auto` then keeps
+        /// the dense set on the device).
+        #[arg(long, env = "JOSHUA_SKIP_PLACEMENT_BENCH", num_args = 0..=1, default_missing_value = "true")]
+        skip_placement_bench: bool,
     },
     /// Transcribe a WAV file with a Whisper model.
     Transcribe {
@@ -446,6 +470,8 @@ async fn main() -> anyhow::Result<()> {
             vram_expert_cache,
             mlock_hot_weights,
             expert_placement,
+            dense_placement,
+            skip_placement_bench,
             vram_budget,
             npu_plugin,
             npu_in_process,
@@ -456,6 +482,9 @@ async fn main() -> anyhow::Result<()> {
             tls_cert,
             tls_key,
         } => {
+            if skip_placement_bench {
+                std::env::set_var("JOSHUA_SKIP_PLACEMENT_BENCH", "1");
+            }
             // Fail fast, before the (potentially slow) model load, when TLS
             // flags are passed to a build compiled without TLS support.
             #[cfg(not(feature = "tls"))]
@@ -494,6 +523,7 @@ async fn main() -> anyhow::Result<()> {
                         .unwrap_or(MlockMode::Off),
                 )
                 .expert_placement(expert_placement)
+                .dense_placement(dense_placement)
                 .device_memory_budget(vram_budget.map(|mib| mib.saturating_mul(1024 * 1024)));
             let mut engine = Engine::with_options(&model, opts)?;
             if let Some(plugin) = npu_plugin {
@@ -559,10 +589,15 @@ async fn main() -> anyhow::Result<()> {
             vram_expert_cache,
             mlock_hot_weights,
             expert_placement,
+            dense_placement,
+            skip_placement_bench,
             vram_budget,
             npu_plugin,
             npu_in_process,
         } => {
+            if skip_placement_bench {
+                std::env::set_var("JOSHUA_SKIP_PLACEMENT_BENCH", "1");
+            }
             let (auto_pin, auto_prefetch) = cache_plan(&model);
             let pin_hot = pin_hot_weights.unwrap_or(auto_pin);
             let prefetch = prefetch_model.unwrap_or(auto_prefetch);
@@ -592,6 +627,7 @@ async fn main() -> anyhow::Result<()> {
                         .unwrap_or(MlockMode::Off),
                 )
                 .expert_placement(expert_placement)
+                .dense_placement(dense_placement)
                 .device_memory_budget(vram_budget.map(|mib| mib.saturating_mul(1024 * 1024)));
             let mut engine = Engine::with_options(&model, opts)?;
             if let Some(plugin) = npu_plugin {
