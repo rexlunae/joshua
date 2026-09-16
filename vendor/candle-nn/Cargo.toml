@@ -59,66 +59,6 @@ vulkan = ["candle/vulkan"]
 name = "candle_nn"
 path = "src/lib.rs"
 
-[[example]]
-name = "basic_optimizer"
-path = "examples/basic_optimizer.rs"
-
-[[example]]
-name = "cpu_benchmarks"
-path = "examples/cpu_benchmarks.rs"
-
-[[test]]
-name = "batch_norm"
-path = "tests/batch_norm.rs"
-
-[[test]]
-name = "cpu_flash_attn"
-path = "tests/cpu_flash_attn.rs"
-
-[[test]]
-name = "group_norm"
-path = "tests/group_norm.rs"
-
-[[test]]
-name = "kv_cache"
-path = "tests/kv_cache.rs"
-
-[[test]]
-name = "layer_norm"
-path = "tests/layer_norm.rs"
-
-[[test]]
-name = "loss"
-path = "tests/loss.rs"
-
-[[test]]
-name = "one_hot"
-path = "tests/one_hot.rs"
-
-[[test]]
-name = "ops"
-path = "tests/ops.rs"
-
-[[test]]
-name = "optim"
-path = "tests/optim.rs"
-
-[[test]]
-name = "rnn"
-path = "tests/rnn.rs"
-
-[[test]]
-name = "sdpa"
-path = "tests/sdpa.rs"
-
-[[test]]
-name = "varlen_flash_attention"
-path = "tests/varlen_flash_attention.rs"
-
-[[bench]]
-name = "bench_main"
-path = "benches/bench_main.rs"
-harness = false
 
 [dependencies.accelerate-src]
 version = "0.3.2"
