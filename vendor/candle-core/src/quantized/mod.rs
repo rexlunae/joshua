@@ -89,6 +89,11 @@ impl Device {
                 let storage = ocl.zeros_impl(&shape, crate::DType::F32)?;
                 Ok(QStorage::OpenCl(storage))
             }
+            Device::Vulkan(_) => {
+                crate::bail!(
+                    "vulkan: quantized (QStorage) zeros are not wired yet; use F32 dense tensors"
+                )
+            }
         }
     }
 }
@@ -154,6 +159,15 @@ impl QStorage {
                         "opencl quantized storage is f32-only (M4); got {dtype:?}"
                     ),
                 }
+            }
+            Device::Vulkan(_) => {
+                // QStorage::Vulkan is not wired yet; Vulkan bring-up covers F32
+                // dense tensors only. Loading quantized weights onto Vulkan is an
+                // explicit error rather than a silent wrong result.
+                crate::bail!(
+                    "vulkan: quantized (QStorage::from_data) loading is not wired yet \
+                     (f32-only dense bring-up); got {dtype:?}"
+                )
             }
         }
     }

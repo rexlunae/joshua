@@ -68,6 +68,10 @@ mod dummy_metal_backend;
 pub mod opencl_backend;
 #[cfg(not(feature = "opencl"))]
 pub mod dummy_opencl_backend;
+#[cfg(feature = "vulkan")]
+pub mod vulkan_backend;
+#[cfg(not(feature = "vulkan"))]
+pub mod dummy_vulkan_backend;
 pub mod error;
 mod indexer;
 pub mod layout;
@@ -133,6 +137,12 @@ pub use opencl_backend::{OpenClDevice, OpenClStorage};
 
 #[cfg(not(feature = "opencl"))]
 pub use dummy_opencl_backend::{OpenClDevice, OpenClStorage};
+
+#[cfg(feature = "vulkan")]
+pub use vulkan_backend::{VulkanDevice, VulkanStorage};
+
+#[cfg(not(feature = "vulkan"))]
+pub use dummy_vulkan_backend::{VulkanDevice, VulkanStorage};
 
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;

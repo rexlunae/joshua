@@ -411,6 +411,10 @@ pub fn opencl_is_available() -> bool {
     cfg!(feature = "opencl")
 }
 
+pub fn vulkan_is_available() -> bool {
+    cfg!(feature = "vulkan")
+}
+
 pub fn with_avx() -> bool {
     cfg!(target_feature = "avx2")
 }

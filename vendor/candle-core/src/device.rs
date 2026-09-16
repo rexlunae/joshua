@@ -10,15 +10,17 @@ pub enum DeviceLocation {
     Cuda { gpu_id: usize },
     Metal { gpu_id: usize },
     OpenCl { gpu_id: usize },
+    Vulkan { gpu_id: usize },
 }
 
-/// Cpu, Cuda, Metal, or OpenCL
+/// Cpu, Cuda, Metal, OpenCL, or Vulkan
 #[derive(Debug, Clone)]
 pub enum Device {
     Cpu,
     Cuda(crate::CudaDevice),
     Metal(crate::MetalDevice),
     OpenCl(crate::OpenClDevice),
+    Vulkan(crate::VulkanDevice),
 }
 
 pub trait NdArray {
@@ -241,12 +243,17 @@ impl Device {
         Ok(Self::OpenCl(crate::OpenClDevice::new(ordinal)?))
     }
 
+    pub fn new_vulkan(ordinal: usize) -> Result<Self> {
+        Ok(Self::Vulkan(crate::VulkanDevice::new(ordinal)?))
+    }
+
     pub fn as_cuda_device(&self) -> Result<&crate::CudaDevice> {
         match self {
             Self::Cuda(d) => Ok(d),
             Self::Cpu => crate::bail!("expected a cuda device, got cpu"),
             Self::Metal(_) => crate::bail!("expected a cuda device, got Metal"),
             Self::OpenCl(_) => crate::bail!("expected a cuda device, got OpenCl"),
+            Self::Vulkan(_) => crate::bail!("expected a cuda device, got Vulkan"),
         }
     }
 
@@ -256,6 +263,17 @@ impl Device {
             Self::Cpu => crate::bail!("expected an opencl device, got cpu"),
             Self::Cuda(_) => crate::bail!("expected an opencl device, got cuda"),
             Self::Metal(_) => crate::bail!("expected an opencl device, got Metal"),
+            Self::Vulkan(_) => crate::bail!("expected an opencl device, got Vulkan"),
+        }
+    }
+
+    pub fn as_vulkan_device(&self) -> Result<&crate::VulkanDevice> {
+        match self {
+            Self::Vulkan(d) => Ok(d),
+            Self::Cpu => crate::bail!("expected a vulkan device, got cpu"),
+            Self::Cuda(_) => crate::bail!("expected a vulkan device, got cuda"),
+            Self::Metal(_) => crate::bail!("expected a vulkan device, got Metal"),
+            Self::OpenCl(_) => crate::bail!("expected a vulkan device, got OpenCl"),
         }
     }
 
@@ -265,6 +283,7 @@ impl Device {
             Self::Cpu => crate::bail!("expected a metal device, got cpu"),
             Self::Metal(d) => Ok(d),
             Self::OpenCl(_) => crate::bail!("expected a metal device, got OpenCl"),
+            Self::Vulkan(_) => crate::bail!("expected a metal device, got Vulkan"),
         }
     }
 
@@ -298,6 +317,7 @@ impl Device {
             Self::Cuda(c) => c.set_seed(seed),
             Self::Metal(m) => m.set_seed(seed),
             Self::OpenCl(o) => o.set_seed(seed),
+            Self::Vulkan(v) => v.set_seed(seed),
         }
     }
 
@@ -307,6 +327,7 @@ impl Device {
             Self::Cuda(c) => c.get_current_seed(),
             Self::Metal(m) => m.get_current_seed(),
             Self::OpenCl(o) => o.get_current_seed(),
+            Self::Vulkan(v) => v.get_current_seed(),
         }
     }
 
@@ -316,6 +337,7 @@ impl Device {
             (Self::Cuda(lhs), Self::Cuda(rhs)) => lhs.same_device(rhs),
             (Self::Metal(lhs), Self::Metal(rhs)) => lhs.same_device(rhs),
             (Self::OpenCl(lhs), Self::OpenCl(rhs)) => lhs.same_device(rhs),
+            (Self::Vulkan(lhs), Self::Vulkan(rhs)) => lhs.same_device(rhs),
             _ => false,
         }
     }
@@ -326,6 +348,7 @@ impl Device {
             Self::Cuda(device) => device.location(),
             Device::Metal(device) => device.location(),
             Device::OpenCl(device) => device.location(),
+            Device::Vulkan(device) => device.location(),
         }
     }
 
@@ -345,11 +368,16 @@ impl Device {
         matches!(self, Self::OpenCl(_))
     }
 
+    pub fn is_vulkan(&self) -> bool {
+        matches!(self, Self::Vulkan(_))
+    }
+
     pub fn supports_bf16(&self) -> bool {
         match self {
             Self::Cuda(_) | Self::Metal(_) => true,
             Self::Cpu => false,
             Self::OpenCl(_) => false,
+            Self::Vulkan(_) => false,
         }
     }
 
@@ -386,6 +414,14 @@ impl Device {
         }
     }
 
+    pub fn vulkan_if_available(ordinal: usize) -> Result<Self> {
+        if crate::utils::vulkan_is_available() {
+            Self::new_vulkan(ordinal)
+        } else {
+            Ok(Self::Cpu)
+        }
+    }
+
     pub(crate) fn rand_uniform_f64(
         &self,
         lo: f64,
@@ -415,6 +451,10 @@ impl Device {
             Device::OpenCl(device) => {
                 let storage = device.rand_uniform(shape, dtype, lo, up)?;
                 Ok(Storage::OpenCl(storage))
+            }
+            Device::Vulkan(device) => {
+                let storage = device.rand_uniform(shape, dtype, lo, up)?;
+                Ok(Storage::Vulkan(storage))
             }
         }
     }
@@ -458,6 +498,10 @@ impl Device {
                 let storage = device.rand_normal(shape, dtype, mean, std)?;
                 Ok(Storage::OpenCl(storage))
             }
+            Device::Vulkan(device) => {
+                let storage = device.rand_normal(shape, dtype, mean, std)?;
+                Ok(Storage::Vulkan(storage))
+            }
         }
     }
 
@@ -488,6 +532,10 @@ impl Device {
                 let storage = device.zeros_impl(shape, dtype)?;
                 Ok(Storage::OpenCl(storage))
             }
+            Device::Vulkan(device) => {
+                let storage = device.zeros_impl(shape, dtype)?;
+                Ok(Storage::Vulkan(storage))
+            }
         }
     }
 
@@ -509,6 +557,10 @@ impl Device {
                 let storage = device.alloc_uninit(shape, dtype)?;
                 Ok(Storage::OpenCl(storage))
             }
+            Device::Vulkan(device) => {
+                let storage = device.alloc_uninit(shape, dtype)?;
+                Ok(Storage::Vulkan(storage))
+            }
         }
     }
 
@@ -526,6 +578,10 @@ impl Device {
             Device::OpenCl(device) => {
                 let storage = device.storage_from_slice(data)?;
                 Ok(Storage::OpenCl(storage))
+            }
+            Device::Vulkan(device) => {
+                let storage = device.storage_from_slice(data)?;
+                Ok(Storage::Vulkan(storage))
             }
         }
     }
@@ -548,6 +604,11 @@ impl Device {
                 let storage = device.storage_from_cpu_storage_owned(storage)?;
                 Ok(Storage::OpenCl(storage))
             }
+            Device::Vulkan(device) => {
+                let storage = array.to_cpu_storage();
+                let storage = device.storage_from_cpu_storage_owned(storage)?;
+                Ok(Storage::Vulkan(storage))
+            }
         }
     }
 
@@ -569,6 +630,11 @@ impl Device {
                 let storage = device.storage_from_cpu_storage_owned(storage)?;
                 Ok(Storage::OpenCl(storage))
             }
+            Device::Vulkan(device) => {
+                let storage = S::to_cpu_storage_owned(data);
+                let storage = device.storage_from_cpu_storage_owned(storage)?;
+                Ok(Storage::Vulkan(storage))
+            }
         }
     }
 
@@ -578,6 +644,7 @@ impl Device {
             Self::Cuda(d) => d.synchronize(),
             Self::Metal(d) => d.synchronize(),
             Self::OpenCl(d) => d.synchronize(),
+            Self::Vulkan(d) => d.synchronize(),
         }
     }
 }
