@@ -576,3 +576,57 @@ fn deepseek4_forward_sequences_persists_kv_across_steps() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// `clear_kv_cache` must also drop the batched per-sequence KV.  The sliding
+/// window and the compressed tables are position-masked, so stale rows there
+/// are harmless, but the CSA compressor's streaming state is not: its
+/// "previous window" half carries the last block of whatever ran before, and
+/// a same-sized batch started after a reset would fold that into its own
+/// block 0 the moment the block completes (position `ratio - 1`).  Runs
+/// enough steps on the compressor fixture to cross that boundary and checks
+/// every step against the same batch on a fresh model.
+#[test]
+fn deepseek4_clear_kv_cache_resets_batched_kv() {
+    let dir = common::model_dir("deepseek4-batched-clear");
+    let model = dir.join("model.gguf");
+    common::write_tiny_deepseek4_gguf_compress(&model);
+
+    let make_input = |tok: u32| Tensor::new(&[tok], &Device::Cpu).unwrap().unsqueeze(0).unwrap();
+    let first: [[u32; 2]; 6] = [[3, 8], [1, 9], [4, 2], [7, 7], [2, 5], [6, 1]];
+    let second: [[u32; 2]; 6] = [[5, 1], [9, 4], [2, 8], [3, 3], [8, 6], [1, 2]];
+    let run = |m: &mut QuantizedModel, toks: &[[u32; 2]; 6]| -> Vec<Vec<Vec<f32>>> {
+        toks.iter()
+            .enumerate()
+            .map(|(pos, [a, b])| {
+                let (a, b) = (make_input(*a), make_input(*b));
+                m.forward_sequences(&[(&a, pos), (&b, pos)]).unwrap()
+            })
+            .collect()
+    };
+
+    // Reference: the second batch alone, on a fresh model.
+    let mut fresh = load(&model, true);
+    let want = run(&mut fresh, &second);
+
+    // Same batch after an unrelated same-sized batch and a reset.
+    let mut reused = load(&model, true);
+    let _ = run(&mut reused, &first);
+    reused.clear_kv_cache();
+    let got = run(&mut reused, &second);
+
+    for (step, (g_step, w_step)) in got.iter().zip(&want).enumerate() {
+        for (s, (g, w)) in g_step.iter().zip(w_step).enumerate() {
+            assert_eq!(g.len(), w.len(), "step {step} seq {s}: vocab sizes must match");
+            let mut max_rel = 0.0f32;
+            for (x, y) in g.iter().zip(w) {
+                let denom = x.abs().max(y.abs()).max(1.0e-4);
+                max_rel = max_rel.max((x - y).abs() / denom);
+            }
+            assert!(
+                max_rel <= 1.0e-4,
+                "step {step} seq {s}: batched KV must be cleared by clear_kv_cache (rel {max_rel})"
+            );
+        }
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}

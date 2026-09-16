@@ -1570,7 +1570,8 @@ pub struct ModelWeights {
     /// Per-sequence KV state for batched `forward_sequences` decode:
     /// `[layer][seq]`.  Persistent across steps (unlike a fresh-per-call
     /// cache) so multi-token batched generation keeps each sequence's
-    /// attention history.  Reset via [`ModelWeights::reset_batch_kv`].
+    /// attention history.  Dropped by [`ModelWeights::clear_kv_cache`] and
+    /// rebuilt by the next `forward_sequences` call.
     kv_seq: Vec<Vec<KvState>>,
     cfg: Config,
     norm: RmsNorm,
@@ -2542,6 +2543,11 @@ impl ModelWeights {
                 Err(e) => eprintln!("deepseek4: failed to reset KV state for layer {i}: {e}"),
             }
         }
+        // The batched path keeps its own per-sequence history and only
+        // rebuilds it when the batch size changes, so a same-sized batch
+        // after a reset would otherwise continue the previous batch's
+        // attention.  Drop it; `forward_sequences` re-creates it empty.
+        self.kv_seq.clear();
         // The speculative prefetch predicts from the *previous step's*
         // routing; after a reset that routing belongs to whatever ran on
         // this instance before, so drop it.  (Advice-only either way — a
