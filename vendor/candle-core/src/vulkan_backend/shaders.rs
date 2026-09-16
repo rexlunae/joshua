@@ -188,9 +188,12 @@ float acc_of(float a, float b) {
 void main() {
     uint r = gl_GlobalInvocationID.x;
     if (r >= pc.ROWS) return;
-    float acc = (pc.OP == 1u) ? -3.4028235e38 : 0.0;
     uint base = r * pc.COLS;
-    for (uint c = 0u; c < pc.COLS; c++) {
+    // Initialize a max from the row's first element so the identity is correct
+    // for negative-infinity inputs (a finite sentinel is NOT an identity for
+    // IEEE-754 max). Cols >= 1 is guaranteed by the caller.
+    float acc = (pc.OP == 1u) ? x[base] : 0.0;
+    for (uint c = 1u; c < pc.COLS; c++) {
         acc = acc_of(acc, x[base + c]);
     }
     if (pc.OP == 2u) acc = acc / float(pc.COLS); // mean
@@ -692,6 +695,20 @@ pub fn run_reduce_last_dim(
     if rows == 0 {
         return unsafe { dev.alloc_buffer(0, crate::DType::F32, 0) };
     }
+    // An empty row has no well-defined max (and the CPU path errors); keep the
+    // kernel's max-from-first-element contract by rejecting cols == 0.
+    if cols == 0 {
+        if op == ReduceLastDimOp::Max {
+            return Err(Error::Msg(
+                "vulkan reduce max over an empty row has no identity".into(),
+            ));
+        }
+        // Sum over an empty row is 0; allocate a zeroed output.
+        let out = unsafe { dev.alloc_buffer(rows * 4, crate::DType::F32, rows) }?;
+        let zeros = vec![0u8; rows * 4];
+        unsafe { out.set_bytes(&zeros) }?;
+        return Ok(out);
+    }
     let spirv = glsl_to_spirv(GLSL_REDUCE_LASTDIM, "main")?;
     let out = unsafe { dev.alloc_buffer(rows * 4, crate::DType::F32, rows) }?;
     let d = Dispatch::new(dev, &spirv, 2, 12)?;
@@ -704,11 +721,15 @@ pub fn run_reduce_last_dim(
         .iter()
         .flat_map(|v| v.to_le_bytes())
         .collect::<Vec<u8>>();
+    // The workgroup is 64 threads wide, so one X workgroup already covers up to
+    // 64 rows: dispatch ceil(rows/64) X workgroups (the shader bounds-checks the
+    // final partial group) instead of one per row.
+    let groups_x = ((rows as u32) + 63) / 64;
     d.run(
         dev,
         &[x.buffer, out.buffer],
         (64, 1, 1),
-        (rows as u32, 1, 1),
+        (groups_x, 1, 1),
         &push,
     )?;
     Ok(out)

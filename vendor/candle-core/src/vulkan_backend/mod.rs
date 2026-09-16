@@ -1211,6 +1211,7 @@ mod tests {
         // Last-dim reduction (softmax/RMSNorm primitive): sum and max over rows.
         let (rr, cc) = (128usize, 64usize);
         let r_v = (0..rr * cc).map(|i| ((i % 17) as f32 - 8.0) * 0.5).collect::<Vec<f32>>();
+        let redux_base = shaders::native_exec_count();
         let rc = Tensor::from_vec(r_v.clone(), (rr, cc), &Device::Cpu)?;
         let got_sum_cpu = rc.sum(1)?;
         let got_max_cpu = rc.max(1)?;
@@ -1229,6 +1230,15 @@ mod tests {
             1e-2,
             "reduce_max_lastdim(128,64)",
         );
+
+        // The reductions must run natively (not silently fall back to CPU).
+        if native {
+            let redux = shaders::native_exec_count() - redux_base;
+            assert!(
+                redux >= 2,
+                "JOSHUA_VULKAN_NATIVE was set but only {redux} of the 2 reductions ran natively"
+            );
+        }
 
         if native {
             let exec = shaders::native_exec_count() - exec0;
