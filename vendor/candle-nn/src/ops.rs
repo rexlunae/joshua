@@ -747,11 +747,13 @@ impl candle::CustomOp2 for RmsNorm {
             _ => candle::bail!("vulkan rms-norm: unsupported alpha dtype {:?}", a_cpu),
         };
 
-        // mean(x^2) over the last dim (native sum-reduce), denom = sqrt(mean+eps).
+        // mean(x^2) over the last dim: native sum-reduce, divide by the row length
+        // (affine), then broadcast to full shape; denom = sqrt(mean + eps).
+        let sqlast = dims[dims.len() - 1];
         let sq = xs.sqr()?;
-        let mean = sq.sum(D::Minus1)?.unsqueeze(D::Minus1)?;
+        let sum = sq.sum(D::Minus1)?.unsqueeze(D::Minus1)?;
+        let mean = sum.affine(1.0f64 / sqlast as f64, 0.0f64)?;
         let mean = mean.broadcast_as(dims.clone())?.contiguous()?;
-        // Elementwise scalar add of eps (candle Scalars/affine on the device).
         let mean_eps = mean.affine(1.0f64, eps as f64)?;
         let denom = mean_eps.sqrt()?;
         let x_norm = xs.broadcast_div(&denom)?.contiguous()?;
