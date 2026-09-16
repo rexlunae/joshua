@@ -669,13 +669,13 @@ pub fn borrowed_range(
 /// Returns `None` when the tensor's element count is not a whole number of
 /// blocks, or the range runs past the mapping (a truncated file) — callers
 /// then fall back to candle's copying reader.
-pub fn expert_slices<'m>(
-    mmap: &'m Mmap,
+pub fn expert_slices(
+    mmap: &Mmap,
     dtype: GgmlDType,
     byte_offset: usize,
     n_expert: usize,
     per_expert_elems: usize,
-) -> Option<Vec<&'m [u8]>> {
+) -> Option<Vec<&[u8]>> {
     let block_size = dtype.block_size();
     if block_size == 0 || n_expert == 0 || !per_expert_elems.is_multiple_of(block_size) {
         return None;

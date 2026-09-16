@@ -75,8 +75,11 @@ fn assert_close(a: &[f32], b: &[f32], what: &str) {
     }
 }
 
+/// A MoE fixture: `(name, writer)`.
+type Fixture = (&'static str, fn(&Path));
+
 /// Each MoE fixture as `(name, writer)`.
-fn fixtures() -> Vec<(&'static str, fn(&Path))> {
+fn fixtures() -> Vec<Fixture> {
     vec![
         ("qwen3moe", common::write_tiny_qwen3moe_gguf as fn(&Path)),
         ("deepseek2", common::write_tiny_deepseek2_gguf as fn(&Path)),

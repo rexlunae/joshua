@@ -53,7 +53,7 @@ impl WeightCache {
             .ok_or_else(|| candle_core::Error::Msg("paged tensor byte count overflow".into()))?;
         if bytes > self.mmap.len() { candle_core::bail!("paged matrix exceeds model mapping"); }
         let alignment = if dtype == GgmlDType::Q8K { 4 } else { 2 };
-        if offset % alignment != 0 || row_bytes % alignment != 0 {
+        if !offset.is_multiple_of(alignment) || !row_bytes.is_multiple_of(alignment) {
             candle_core::bail!("paged quantized matrix is not block-aligned");
         }
         let tile_rows = self.capacity / row_bytes;

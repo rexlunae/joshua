@@ -142,7 +142,7 @@ fn main() -> anyhow::Result<()> {
         let t1 = std::time::Instant::now();
         input = Tensor::new(&[best as u32], &device)?.unsqueeze(0)?;
         logits = model.forward(&input, pos)?;
-        if gen % 16 == 0 {
+        if gen.is_multiple_of(16) {
             eprintln!("[step {gen}: forward {:.3}s]", t1.elapsed().as_secs_f32());
         }
         pos += 1;

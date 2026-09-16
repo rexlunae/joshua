@@ -478,9 +478,6 @@ fn deepseek4_forward_sequences_matches_single_sequence() {
     let model = dir.join("model.gguf");
     common::write_tiny_deepseek4_gguf(&model);
 
-    // CPU, no mmap: fully deterministic, no prefetch/noise.
-    let m = load(&model, true);
-
     let make_input = |tokens: &[u32]| {
         Tensor::new(tokens, &Device::Cpu).unwrap().unsqueeze(0).unwrap()
     };
@@ -563,7 +560,7 @@ fn deepseek4_forward_sequences_persists_kv_across_steps() {
         }
         _ => panic!("expected DeepSeek4 model"),
     };
-    let got = logits.get(0).unwrap();
+    let got = logits.first().unwrap();
 
     assert_eq!(got.len(), ref_second.len(), "vocab sizes must match");
     let mut max_rel = 0.0f32;

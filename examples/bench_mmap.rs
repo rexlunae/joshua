@@ -4,7 +4,7 @@
 //! Usage: cargo run --release --example bench_mmap -- <model.gguf>
 
 use std::fs::File;
-use std::io::{Cursor, Read, Seek};
+use std::io::{Cursor, Read};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -104,7 +104,7 @@ fn main() {
         aqm.forward(&axs).unwrap();
     });
 
-    stream_probe::run(Arc::clone(&mmap), base, per_bytes, ne as usize);
+    stream_probe::run(Arc::clone(&mmap), base, per_bytes, ne);
 }
 
 // ── appended: raw streaming probe over expert regions ────────────────────

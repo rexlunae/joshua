@@ -20,8 +20,8 @@
 //! behavior.
 
 use candle_core::quantized::k_quants::{
-    self, BlockQ4_0, BlockQ4_1, BlockQ5_0, BlockQ5_1, BlockQ6K, BlockQ8_0, BlockQ8K, BlockQ8_1,
-    BlockQ2K, BlockQ3K, BlockQ4K, BlockQ5K, GgmlType,
+    self, BlockQ3K, BlockQ4_0, BlockQ4_1, BlockQ5K, BlockQ5_0, BlockQ5_1, BlockQ6K, BlockQ8K,
+    BlockQ8_1, GgmlType,
 };
 use candle_core::quantized::{GgmlDType, QTensor};
 use candle_core::{bail, Device, DType, Result, Tensor};
@@ -195,7 +195,7 @@ pub fn try_fast_cpu_qmatmul(qt: &QTensor, xs: &Tensor) -> Option<Result<Tensor>>
     };
     let bytes = match qt.data() {
         Ok(b) => b,
-        Err(e) => return Some(Err(e.into())),
+        Err(e) => return Some(Err(e)),
     };
 
     let mut dst = vec![0f32; m * n];

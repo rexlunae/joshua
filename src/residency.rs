@@ -30,6 +30,21 @@ pub struct ExpertHandles {
 }
 
 impl ExpertHandles {
+    /// Bundle the three per-tensor handles, present only when all three are:
+    /// an expert with a handle for some of its tensors but not others cannot
+    /// be made resident as a unit, so it gets none.
+    pub fn from_parts(
+        gate: Option<Arc<dyn crate::mmap_tensor::MmapPrefetch>>,
+        up: Option<Arc<dyn crate::mmap_tensor::MmapPrefetch>>,
+        down: Option<Arc<dyn crate::mmap_tensor::MmapPrefetch>>,
+    ) -> Option<Self> {
+        Some(Self {
+            gate: gate?,
+            up: up?,
+            down: down?,
+        })
+    }
+
     /// Ask the backend to make all three weight ranges resident (best effort).
     pub fn prefetch(&self) {
         self.gate.prefetch();
