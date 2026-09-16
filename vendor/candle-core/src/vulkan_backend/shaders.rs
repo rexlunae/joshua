@@ -123,7 +123,10 @@ layout(local_size_x = 16, local_size_y = 16) in;
 layout(set = 0, binding = 0) readonly buffer InBufA { float a[]; };
 layout(set = 0, binding = 1) readonly buffer InBufB { float b[]; };
 layout(set = 0, binding = 2) buffer OutBuf { float o[]; };
-layout(push_constant) uniform PC { uint M; uint N; uint K; } pc;
+// bsk/bsn are the RHS layout strides along k and n, so a single kernel handles
+// a contiguous B ([K,1]), a transposed B ([1,K] — the weight-transpose case),
+// and broadcast B ([0,1] — the attention KV broadcast). LHS is always row-major.
+layout(push_constant) uniform PC { uint M; uint N; uint K; uint bsk; uint bsn; } pc;
 void main() {
     uint tx = gl_LocalInvocationID.x;
     uint ty = gl_LocalInvocationID.y;
@@ -138,7 +141,7 @@ void main() {
         float a1 = (row0 + 1u < pc.M) ? a[(row0 + 1u) * pc.K + k] : 0.0;
         float a2 = (row0 + 2u < pc.M) ? a[(row0 + 2u) * pc.K + k] : 0.0;
         float a3 = (row0 + 3u < pc.M) ? a[(row0 + 3u) * pc.K + k] : 0.0;
-        float bv = (col < pc.N) ? b[k * pc.N + col] : 0.0;
+        float bv = (col < pc.N) ? b[k * pc.bsk + col * pc.bsn] : 0.0;
         c0 += a0 * bv;
         c1 += a1 * bv;
         c2 += a2 * bv;
@@ -585,19 +588,23 @@ pub fn run_binary(
 }
 
 /// o(row-major m×n) = a(m×k) @ b(k×n), single non-batched tile.
+/// / are b's layout strides along k and n, so a transposed or
+/// broadcast rhs is handled in-kernel (see GLSL_MATMUL).
 pub fn run_matmul(
     dev: &VulkanDevice,
     a: &VulkanStorage,
     b: &VulkanStorage,
     (m, n, k): (usize, usize, usize),
+    bsk: usize,
+    bsn: usize,
 ) -> Result<VulkanStorage> {
     let spirv = glsl_to_spirv(GLSL_MATMUL, "main")?;
     let out = unsafe { dev.alloc_buffer(m * n * 4, crate::DType::F32, m * n) }?;
     if m == 0 || n == 0 || k == 0 {
         return Ok(out); // no work; buffer is empty/valid
     }
-    let d = Dispatch::new(dev, &spirv, 3, 12)?;
-    let push = [m as u32, n as u32, k as u32]
+    let d = Dispatch::new(dev, &spirv, 3, 20)?;
+    let push = [m as u32, n as u32, k as u32, bsk as u32, bsn as u32]
         .iter()
         .flat_map(|v| v.to_le_bytes())
         .collect::<Vec<u8>>();
