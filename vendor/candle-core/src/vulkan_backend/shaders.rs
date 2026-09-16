@@ -49,7 +49,10 @@ pub(crate) fn log_native_fallback(op: &str, err: &Error) {
 
 /// Which unary GLSL ops we can dispatch (name -> GLSL expression).
 pub fn has_unary(name: &'static str) -> bool {
-    matches!(name, "exp" | "sin" | "cos" | "tan" | "sqrt" | "abs" | "neg" | "ln")
+    matches!(
+        name,
+        "exp" | "sin" | "cos" | "tan" | "sqrt" | "abs" | "neg" | "ln" | "sqr"
+    )
 }
 
 /// Which binary GLSL ops we can dispatch (name -> GLSL expression).
@@ -598,6 +601,7 @@ pub fn run_unary(dev: &VulkanDevice, name: &str, inp: &VulkanStorage, n: usize) 
         "abs" => "abs(x)",
         "neg" => "-x",
         "ln" => "log(x)",
+        "sqr" => "x * x",
         _ => return Err(Error::Msg(format!("vulkan unary {name} not wired"))),
     };
     let src = GLSL_UNARY.replace("{EXPR}", expr);
