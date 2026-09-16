@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/joshua-mock-npu", "crates/joshua-llamacpp-npu", "vendor/candle-core"]
+members = [".", "crates/joshua-mock-npu", "crates/joshua-llamacpp-npu", "vendor/candle-core", "vendor/candle-nn"]
 # The llama.cpp adapter compiles C++ (llama.cpp itself) and is therefore not
 # part of the default build: `cargo build`/`cargo test` stay pure Rust.
 default-members = [".", "crates/joshua-mock-npu"]
@@ -55,7 +55,7 @@ opencl = ["candle-core/opencl"]
 # Bring-up target is the AMD Renoir iGPU (unified memory, RADV). Requires a
 # system Vulkan loader + ICD (libvulkan.so, e.g. mesa-vulkan-drivers) at
 # runtime; ash loads it dynamically so there is no hard link dependency.
-vulkan = ["candle-core/vulkan"]
+vulkan = ["candle-core/vulkan", "candle-nn/vulkan"]
 # HTTPS termination via rustls. Opt-in because the ring crypto provider
 # compiles C/assembly, which would break the default build's
 # "only a Rust toolchain required" guarantee.
@@ -70,6 +70,11 @@ tls = ["dep:axum-server", "dep:rustls"]
 # the deepseek4 dense set on Intel OpenCL hardware. Inactive until the
 # `opencl` feature is added; the default build is byte-for-byte unchanged.
 candle-core = { path = "vendor/candle-core" }
+# candle-nn is vendored so joshua can add device-native CustomOp implementations
+# (e.g. SoftmaxLastDim / RmsNorm `vulkan_fwd`) for the Vulkan accelerator
+# backend, mirroring how candle-core is vendored. Inactive until the `vulkan`
+# feature is used; the default build is unchanged.
+candle-nn = { path = "vendor/candle-nn" }
 # candle-kernels is patched to a tiny fork (rexlunae/candle-kernels) carrying
 # two CUDA-12.4 compatibility fixes, instead of vendoring the crate's ~21K
 # lines of C kernels into this tree: (1) compatibility.cuh redefines

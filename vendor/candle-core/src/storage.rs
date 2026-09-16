@@ -289,10 +289,8 @@ impl Storage {
                 Ok((Self::OpenCl(dev.storage_from_cpu_storage(&out)?), shape))
             }
             Self::Vulkan(storage) => {
-                let cpu = storage.to_cpu_storage()?;
-                let (out, shape) = c.cpu_fwd(&cpu, l)?;
-                let dev = storage.device.clone();
-                Ok((Self::Vulkan(dev.storage_from_cpu_storage(&out)?), shape))
+                let (storage, shape) = c.vulkan_fwd(storage, l)?;
+                Ok((Self::Vulkan(storage), shape))
             }
         }
     }
@@ -326,11 +324,8 @@ impl Storage {
                 Ok((Self::OpenCl(dev.storage_from_cpu_storage(&s)?), shape))
             }
             (Self::Vulkan(s1), Self::Vulkan(s2)) => {
-                let c1 = s1.to_cpu_storage()?;
-                let c2 = s2.to_cpu_storage()?;
-                let (s, shape) = c.cpu_fwd(&c1, l1, &c2, l2)?;
-                let dev = s1.device.clone();
-                Ok((Self::Vulkan(dev.storage_from_cpu_storage(&s)?), shape))
+                let (s, shape) = c.vulkan_fwd(s1, l1, s2, l2)?;
+                Ok((Self::Vulkan(s), shape))
             }
             _ => unreachable!(),
         }

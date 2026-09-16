@@ -1,6 +1,7 @@
+use crate::backend::{BackendDevice, BackendStorage};
 use crate::op::{BackpropOp, Op};
 use crate::tensor::from_storage;
-use crate::{CpuStorage, CudaStorage, Layout, MetalStorage, Result, Shape, Tensor};
+use crate::{CpuStorage, CudaStorage, Layout, MetalStorage, Result, Shape, Tensor, VulkanStorage};
 use std::sync::Arc;
 
 /// Unary ops that can be defined in user-land.
@@ -30,6 +31,24 @@ pub trait CustomOp1 {
         Err(crate::Error::Metal(
             format!("no metal implementation for {}", self.name()).into(),
         ))
+    }
+
+    /// The forward pass, as run on a vulkan device. Note that the storage can
+    /// use arbitrary strides, offsets etc so the associated layout should be
+    /// used to access it.
+    ///
+    /// The default falls back to a correct CPU round-trip (read to CPU, run
+    /// `cpu_fwd`, upload back); a backend with a native implementation should
+    /// override this to keep the computation on-device.
+    fn vulkan_fwd(
+        &self,
+        storage: &VulkanStorage,
+        layout: &Layout,
+    ) -> Result<(VulkanStorage, Shape)> {
+        let cpu = storage.to_cpu_storage()?;
+        let (out, shape) = self.cpu_fwd(&cpu, layout)?;
+        let dev = storage.device.clone();
+        Ok((dev.storage_from_cpu_storage(&out)?, shape))
     }
 
     /// This function takes as argument the argument `arg` used in the forward pass, the result
@@ -79,6 +98,23 @@ pub trait CustomOp2 {
         Err(crate::Error::Metal(
             format!("no metal implementation for {}", self.name()).into(),
         ))
+    }
+
+    /// The forward pass, as run on a vulkan device. The default falls back to a
+    /// correct CPU round-trip; a backend with a native implementation overrides
+    /// it to keep the computation on-device.
+    fn vulkan_fwd(
+        &self,
+        s1: &VulkanStorage,
+        l1: &Layout,
+        s2: &VulkanStorage,
+        l2: &Layout,
+    ) -> Result<(VulkanStorage, Shape)> {
+        let c1 = s1.to_cpu_storage()?;
+        let c2 = s2.to_cpu_storage()?;
+        let (out, shape) = self.cpu_fwd(&c1, l1, &c2, l2)?;
+        let dev = s1.device.clone();
+        Ok((dev.storage_from_cpu_storage(&out)?, shape))
     }
 
     fn bwd(
