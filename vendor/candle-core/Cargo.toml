@@ -96,6 +96,11 @@ name = "metal_basics"
 path = "examples/metal_basics.rs"
 required-features = ["metal"]
 
+[[example]]
+name = "vulkan_benchmark"
+path = "examples/vulkan_benchmark.rs"
+required-features = ["vulkan"]
+
 [[test]]
 name = "bilinear_tests"
 path = "tests/bilinear_tests.rs"
