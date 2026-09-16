@@ -8,16 +8,24 @@
 //!   JOSHUA_VULKAN_NATIVE=1 cargo run --release --features vulkan \
 //!       --example vulkan_benchmark -- <m> <k> <n> <iters>
 //!
-//! Defaults to a 4096x4096x4096 matmul and a 1M-element affine over 50 iters.
+//! Defaults to a 1024x1024x1024 matmul (a size that runs reliably on iGPUs;
+//! very large single-dispatches such as 4096^3 can trip a compute-shader
+//! watchdog / device-lost) and a 1M-element affine, each over 50 iters.
 
-use candle_core::{DType, Device, Tensor};
+use candle_core::{Device, Tensor};
 
 fn main() -> anyhow::Result<()> {
     let args = std::env::args().collect::<Vec<String>>();
-    let m: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(4096);
-    let k: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(4096);
-    let n: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(4096);
-    let iters: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(50);
+    let m: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(1024);
+    let k: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(1024);
+    let n: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(1024);
+    // `iters` of 0 would make every timing/throughput figure a divide-by-zero,
+    // so clamp it to a usable minimum.
+    let iters: usize = args
+        .get(4)
+        .and_then(|s| s.parse::<usize>().ok())
+        .map(|v| v.max(1))
+        .unwrap_or(50);
 
     let native = std::env::var("JOSHUA_VULKAN_NATIVE").map(|v| v == "1").unwrap_or(false);
     let dev = match candle_core::VulkanDevice::new(0) {
