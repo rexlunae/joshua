@@ -139,16 +139,14 @@ fn from_raw_data<T: super::GgmlType + Send + Sync + 'static>(
             T::to_float(data, &mut ys);
             QStorage::OpenCl(crate::OpenClStorage::from_vec(ys, d)?)
         }
-        Device::Vulkan(_d) => {
-            // Quantized weights on Vulkan are not wired yet (Vulkan bring-up
-            // covers F32 dense compute + kernel round-trip only). Until a
-            // QStorage::Vulkan variant exists, loading a GGML tensor onto the
-            // Vulkan device is an explicit, clear error rather than a silent
-            // wrong result.
-            crate::bail!(
-                "vulkan: quantized (GGML) tensor loading is not implemented yet \
-                 (QStorage::Vulkan is not wired); use F32 dense tensors."
-            )
+        Device::Vulkan(d) => {
+            // M1 dense-on-Vulkan: mirror the OpenCl M4 path — dequantize the
+            // weight to f32 and hold it on the device (VulkanStorage,
+            // host-visible+coherent on the Renoir's unified memory).
+            let n = data.len() * T::BLCK_SIZE;
+            let mut ys = vec![0f32; n];
+            T::to_float(data, &mut ys);
+            QStorage::Vulkan(crate::VulkanStorage::from_vec(ys, d)?)
         }
     };
     super::QTensor::new(data, dims)

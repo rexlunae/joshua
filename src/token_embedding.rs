@@ -46,7 +46,8 @@ impl TokenEmbedding {
             table.dtype(),
             GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16
         );
-        let keep_quantized = device.is_cpu() || (!device.is_opencl() && !float_dtype);
+        let keep_quantized =
+            device.is_cpu() || (!device.is_opencl() && !device.is_vulkan() && !float_dtype);
         if keep_quantized {
             Ok(Self::Quantized(table))
         } else {

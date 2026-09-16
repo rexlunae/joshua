@@ -40,6 +40,10 @@ enum DeviceArg {
     /// opencl`; use `--device opencl`).
     #[value(name = "opencl")]
     OpenCl,
+    /// Vulkan (AMD RADV / Intel ANV / any Vulkan ICD; build with `--features
+    /// vulkan`; use `--device vulkan`). Bring-up target is the AMD Renoir iGPU.
+    #[value(name = "vulkan")]
+    Vulkan,
 }
 
 impl From<DeviceArg> for ComputeBackend {
@@ -50,6 +54,7 @@ impl From<DeviceArg> for ComputeBackend {
             DeviceArg::Metal => ComputeBackend::Metal,
             DeviceArg::Cuda => ComputeBackend::Cuda,
             DeviceArg::OpenCl => ComputeBackend::OpenCl,
+            DeviceArg::Vulkan => ComputeBackend::Vulkan,
         }
     }
 }
