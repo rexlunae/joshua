@@ -1,7 +1,7 @@
 use crate::backend::{BackendDevice, BackendStorage};
 use crate::op::{BackpropOp, Op};
 use crate::tensor::from_storage;
-use crate::{CpuStorage, CudaStorage, Layout, MetalStorage, Result, Shape, Tensor, VulkanStorage};
+use crate::{OpenClStorage, CpuStorage, CudaStorage, Layout, MetalStorage, Result, Shape, Tensor, VulkanStorage};
 use std::sync::Arc;
 
 /// Unary ops that can be defined in user-land.
@@ -45,6 +45,19 @@ pub trait CustomOp1 {
         storage: &VulkanStorage,
         layout: &Layout,
     ) -> Result<(VulkanStorage, Shape)> {
+        let cpu = storage.to_cpu_storage()?;
+        let (out, shape) = self.cpu_fwd(&cpu, layout)?;
+        let dev = storage.device.clone();
+        Ok((dev.storage_from_cpu_storage(&out)?, shape))
+    }
+
+    /// The forward pass on an OpenCL device.  The default is a correct CPU
+    /// round-trip; a backend with a native kernel overrides it.
+    fn opencl_fwd(
+        &self,
+        storage: &OpenClStorage,
+        layout: &Layout,
+    ) -> Result<(OpenClStorage, Shape)> {
         let cpu = storage.to_cpu_storage()?;
         let (out, shape) = self.cpu_fwd(&cpu, layout)?;
         let dev = storage.device.clone();
@@ -117,6 +130,21 @@ pub trait CustomOp2 {
         Ok((dev.storage_from_cpu_storage(&out)?, shape))
     }
 
+    /// The forward pass on an OpenCL device (CPU round-trip by default).
+    fn opencl_fwd(
+        &self,
+        s1: &OpenClStorage,
+        l1: &Layout,
+        s2: &OpenClStorage,
+        l2: &Layout,
+    ) -> Result<(OpenClStorage, Shape)> {
+        let c1 = s1.to_cpu_storage()?;
+        let c2 = s2.to_cpu_storage()?;
+        let (out, shape) = self.cpu_fwd(&c1, l1, &c2, l2)?;
+        let dev = s1.device.clone();
+        Ok((dev.storage_from_cpu_storage(&out)?, shape))
+    }
+
     fn bwd(
         &self,
         _arg1: &Tensor,
@@ -173,6 +201,24 @@ pub trait CustomOp3 {
         Err(crate::Error::Metal(
             format!("no metal implementation for {}", self.name()).into(),
         ))
+    }
+
+    /// The forward pass on an OpenCL device (CPU round-trip by default).
+    fn opencl_fwd(
+        &self,
+        s1: &OpenClStorage,
+        l1: &Layout,
+        s2: &OpenClStorage,
+        l2: &Layout,
+        s3: &OpenClStorage,
+        l3: &Layout,
+    ) -> Result<(OpenClStorage, Shape)> {
+        let c1 = s1.to_cpu_storage()?;
+        let c2 = s2.to_cpu_storage()?;
+        let c3 = s3.to_cpu_storage()?;
+        let (out, shape) = self.cpu_fwd(&c1, l1, &c2, l2, &c3, l3)?;
+        let dev = s1.device.clone();
+        Ok((dev.storage_from_cpu_storage(&out)?, shape))
     }
 
     fn bwd(

@@ -2,26 +2,33 @@
 //!
 //! The right place to run the dense set depends on the *actual hardware*, so an
 //! `Auto` dense-placement (the default) probes the accelerator once, briefly,
-//! before loading the model.  It measures the GEMM throughput of CPU-BLAS
-//! versus the requested compute device on the two shapes that dominate a
-//! transformer:
+//! before loading the model.  It measures the throughput of the CPU versus the
+//! requested compute device on the operation that dominates a quantized
+//! transformer — a block-quantized weight matrix (Q4_K here, the most common
+//! GGUF dtype) applied to f32 activations — on the two shapes that matter:
 //!
-//! * **decode** — `(1, H) @ (H, H)`, one token's dense projections; and
-//! * **prefill** — `(B, H) @ (H, H)`, a chunk of prompt tokens.
+//! * **decode** — `(1, H) · Wᵀ`, one token's dense projections; and
+//! * **prefill** — `(B, H) · Wᵀ`, a chunk of prompt tokens.
 //!
-//! If the device's GEMM is faster than CPU-BLAS by a usable margin it is worth
+//! Probing the quantized matmul rather than an f32 GEMM is deliberate: it is
+//! what the loaders actually run (the CPU's SIMD `k_quants` kernels against
+//! the device's dequantize-in-kernel GEMV / tiled GEMM), and on an iGPU that
+//! shares DRAM with the CPU the difference between streaming 4-bit blocks and
+//! streaming f32 weights *is* the whole result.
+//!
+//! If the device is faster than the CPU by a usable margin it is worth
 //! offloading the dense set; if not (a weak iGPU or a software OpenCL/Vulkan
-//! path — e.g. Renoir runs dense OpenCL at ~21 GFLOPS vs ~384 GFLOPS of
-//! 16-core BLAS), the dense set should stay on CPU-BLAS.  Because the rule is a
+//! path), the dense set should stay on the CPU.  Because the rule is a
 //! measured *ratio* it adapts automatically to every kind of card: a big
 //! discrete GPU scores high and keeps dense on-device, a weak iGPU scores low
 //! and keeps it on CPU, with no operator guesswork.
 //!
 //! The probe is small and bounded (see [`BENCH_H`]/[`BENCH_B`]) so startup stays
 //! fast; the CPU-vs-device ratio is stable across widths even when absolute
-//! GFLOPS is not.
+//! throughput is not.
 
-use candle_core::{Device, Tensor};
+use candle_core::quantized::{GgmlDType, QMatMul, QStorage, QTensor};
+use candle_core::{Device, Module, Tensor};
 
 use crate::placement::{DensePlacement, ResolvedDense};
 
@@ -36,7 +43,7 @@ const BENCH_ITERS: usize = 3;
 /// Total wall-clock budget for the whole probe (all shapes, both devices).
 const BENCH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(8);
 
-/// Measured dense GEMM throughput of CPU-BLAS vs an accelerator.
+/// Measured quantized-matmul throughput of the CPU vs an accelerator.
 #[derive(Debug, Clone, Copy)]
 pub struct DenseBench {
     /// Accelerator decode `(1,H)` GFLOPS (0 when the device could not be probed).
@@ -74,18 +81,42 @@ impl DenseBench {
     }
 }
 
-/// Measure GEMM GFLOPS for shape `(m, H) @ (H, H)` on `device`, bailing with
-/// `None` (as "unmeasurable") if `deadline` passes — a cooperative guard so a
-/// wedged GPU cannot hang startup forever.
+/// The quantized weight matrix every probe multiplies against, built once on
+/// the CPU (quantizing is far slower than the matmuls being timed) and
+/// re-uploaded per device.
+fn probe_weights() -> Option<&'static QTensor> {
+    static W: std::sync::OnceLock<Option<QTensor>> = std::sync::OnceLock::new();
+    W.get_or_init(|| {
+        let h = BENCH_H;
+        let w: Vec<f32> = (0..h * h).map(|i| ((i % 11) as f32 - 5.0) * 0.25).collect();
+        let w = Tensor::from_vec(w, (h, h), &Device::Cpu).ok()?;
+        QTensor::quantize(&w, GgmlDType::Q4K).ok()
+    })
+    .as_ref()
+}
+
+/// The probe weights as a `QMatMul` resident on `device`.
+fn probe_matmul(device: &Device) -> Option<QMatMul> {
+    let w = probe_weights()?;
+    let bytes = w.data().ok()?;
+    let storage = QStorage::from_data(bytes, device, w.dtype()).ok()?;
+    let q = QTensor::new(storage, w.shape().clone()).ok()?;
+    QMatMul::from_qtensor(q).ok()
+}
+
+/// Measure the quantized-matmul throughput (in f32-equivalent GFLOPS) for
+/// shape `(m, H) · Wᵀ` on `device`, bailing with `None` (as "unmeasurable")
+/// if `deadline` passes — a cooperative guard so a wedged GPU cannot hang
+/// startup forever.
 fn measure_gemm(device: &Device, m: usize, deadline: std::time::Instant) -> Option<f64> {
     let h = BENCH_H;
     let a: Vec<f32> = (0..m * h).map(|i| ((i % 17) as f32 - 8.0) * 0.5).collect();
-    let b: Vec<f32> = (0..h * h).map(|i| ((i % 11) as f32 - 5.0) * 0.25).collect();
     let a = Tensor::from_vec(a, (m, h), device).ok()?;
-    let b = Tensor::from_vec(b, (h, h), device).ok()?;
+    let w = probe_matmul(device)?;
 
     // Warm-up (best-effort; a failure here means "can't probe", not 0 GFLOPS).
-    match a.matmul(&b) {
+    // On a device this also compiles the kernels, which must not be timed.
+    match w.forward(&a) {
         Ok(_) => {}
         Err(_) => return None,
     }
@@ -97,7 +128,7 @@ fn measure_gemm(device: &Device, m: usize, deadline: std::time::Instant) -> Opti
             break;
         }
         let start = std::time::Instant::now();
-        let c = match a.matmul(&b) {
+        let c = match w.forward(&a) {
             Ok(c) => c,
             Err(_) => break,
         };
@@ -115,7 +146,7 @@ fn measure_gemm(device: &Device, m: usize, deadline: std::time::Instant) -> Opti
     Some(2.0 * m as f64 * h as f64 * h as f64 / secs / 1e9)
 }
 
-/// Run the quick probe: time CPU-BLAS and the accelerator on decode + prefill
+/// Run the quick probe: time the CPU and the accelerator on decode + prefill
 /// shapes and return the measured throughput.  A device that cannot be probed
 /// (fails or runs past the deadline) yields `0.0` for its figures, which the
 /// decision logic treats as "no faster than CPU".

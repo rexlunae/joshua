@@ -133,10 +133,10 @@ pub use metal_backend::{MetalDevice, MetalError, MetalStorage};
 pub use dummy_metal_backend::{MetalDevice, MetalError, MetalStorage};
 
 #[cfg(feature = "opencl")]
-pub use opencl_backend::{OpenClDevice, OpenClStorage};
+pub use opencl_backend::{OpenClDevice, OpenClStorage, QOpenClStorage};
 
 #[cfg(not(feature = "opencl"))]
-pub use dummy_opencl_backend::{OpenClDevice, OpenClStorage};
+pub use dummy_opencl_backend::{OpenClDevice, OpenClStorage, QOpenClStorage};
 
 #[cfg(feature = "vulkan")]
 pub use vulkan_backend::{VulkanDevice, VulkanStorage};

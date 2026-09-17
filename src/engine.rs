@@ -1123,7 +1123,7 @@ impl Engine {
         // to f32.  A hard refusal to load needs certainty, so it uses the
         // lower bound; the soft decisions (expert placement, per-session
         // caps) err on the safe side with the upper bound.
-        let footprint = device_weight_bytes(&raw, arch, device.is_opencl() || device.is_vulkan());
+        let footprint = device_weight_bytes(&raw, arch, device.is_vulkan());
         let dense_device_bytes = footprint.dense_upper;
         let expert_device_bytes = footprint.experts;
         let expert_bytes = expert_device_bytes;
@@ -1286,13 +1286,7 @@ impl Engine {
                 footprint.dense_lower as f64 / 2f64.powi(30),
                 footprint.dense_upper as f64 / 2f64.powi(30),
                 expert_device_bytes as f64 / 2f64.powi(30),
-                if device.is_opencl() {
-                    " as f32 on OpenCL"
-                } else if device.is_vulkan() {
-                    " as f32 on Vulkan"
-                } else {
-                    ""
-                },
+                if device.is_vulkan() { " as f32 on Vulkan" } else { "" },
                 match device_budget {
                     Some(b) => format!("{:.1} GiB", b as f64 / 2f64.powi(30)),
                     None => "unknown".to_string(),
@@ -1416,7 +1410,10 @@ impl Engine {
         #[cfg(feature = "opencl")]
         {
             match Device::new_opencl(0) {
-                Ok(device) => return device,
+                Ok(device) => {
+                    Self::log_opencl_device(&device);
+                    return device;
+                }
                 Err(e) => tracing::warn!("OpenCL unavailable, falling back to CPU: {e}"),
             }
         }
@@ -1428,6 +1425,25 @@ impl Engine {
             }
         }
         Device::Cpu
+    }
+
+    /// Log which OpenCL device was opened and how it holds weights, so a
+    /// slow run can be read off the log: a device without host-unified
+    /// memory (a discrete card) copies the weights, one with it (an iGPU or
+    /// a CPU runtime) aliases the memory-mapped file in place.
+    #[cfg(feature = "opencl")]
+    fn log_opencl_device(device: &Device) {
+        if let Ok(ocl) = device.as_opencl_device() {
+            let unified = ocl.host_unified_memory();
+            tracing::info!(
+                "OpenCL device: {} ({} MiB global memory, {}; native kernels {}, zero-copy weights {})",
+                ocl.name(),
+                ocl.global_mem_size().unwrap_or(0) >> 20,
+                if unified { "host-unified memory" } else { "discrete memory" },
+                if candle_core::opencl_backend::native_enabled() { "on" } else { "off" },
+                if unified && candle_core::opencl_backend::zero_copy_enabled() { "on" } else { "off" },
+            );
+        }
     }
 
     /// Resolve the [`ComputeBackend`] requested in [`EngineOptions`] to a
@@ -1484,13 +1500,15 @@ impl Engine {
             ComputeBackend::OpenCl => {
                 #[cfg(feature = "opencl")]
                 {
-                    Device::new_opencl(0).map_err(|e| {
+                    let device = Device::new_opencl(0).map_err(|e| {
                         JoshuaError::ModelLoad(format!(
                             "OpenCL device requested but unavailable: {e}. \
                              Build with `--features opencl` on a host with libOpenCL \
                              (Intel iGPU/Arc, NVIDIA ICD, ...), or pass --device cpu / auto."
                         ))
-                    })
+                    })?;
+                    Self::log_opencl_device(&device);
+                    Ok(device)
                 }
                 #[cfg(not(feature = "opencl"))]
                 {
@@ -2891,7 +2909,7 @@ fn residency(arch: Option<Architecture>, name: &str, info: &crate::gguf_ext::Raw
 /// the device: its quantized size (f32 for a dtype of unknown size, which
 /// no quantized kernel could hold anyway) and its f32 size.  A tensor of
 /// known residency has equal bounds; an [`Residency::Unknown`] one spans
-/// both.  With `dense_f32` (OpenCL, whose storage is dense f32) everything
+/// both.  With `dense_f32` (Vulkan, whose storage is dense f32) everything
 /// is f32.
 fn resident_tensor_bounds(
     arch: Option<Architecture>,
@@ -2924,7 +2942,7 @@ struct DeviceFootprint {
     /// most the loader can allocate.  Drives the placement decision and the
     /// per-session caps.
     dense_upper: u64,
-    /// Routed experts (always quantized, or f32 on OpenCL).
+    /// Routed experts (always quantized, or f32 on Vulkan).
     experts: u64,
 }
 

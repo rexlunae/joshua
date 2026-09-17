@@ -702,9 +702,9 @@ pub fn qtensor_from_mmap<R: std::io::Read + std::io::Seek>(
     name: &str,
     device: &candle_core::Device,
 ) -> Result<QTensor> {
-    // Borrowing is only sound on CPU; accelerator storage must be copied over.
-    if device.is_cpu() {
-        if let Some(info) = content.tensor_infos.get(name) {
+    if let Some(info) = content.tensor_infos.get(name) {
+        // Borrowing CPU block storage is only sound on the CPU device.
+        if device.is_cpu() {
             if let Some(t) = borrowed_qtensor(mmap, info, content.tensor_data_offset)? {
                 return Ok(t);
             }
@@ -713,8 +713,76 @@ pub fn qtensor_from_mmap<R: std::io::Read + std::io::Seek>(
                 "tensor not borrowable from the mapping, copying instead"
             );
         }
+        // An OpenCL device with host-unified memory (an iGPU, or a CPU
+        // runtime) can alias the mapped pages directly instead of holding a
+        // second copy of the weights.
+        #[cfg(feature = "opencl")]
+        if let Some(t) = opencl_zero_copy_qtensor(mmap, info, content.tensor_data_offset, device)? {
+            return Ok(t);
+        }
     }
     content.tensor(reader, name, device)
+}
+
+/// Wrap a tensor's mapped bytes as a zero-copy OpenCL buffer
+/// (`CL_MEM_USE_HOST_PTR`) when the device shares memory with the host.
+///
+/// On an iGPU the device reads DRAM either way; aliasing the page cache saves
+/// the whole second copy of the weights and lets the kernel evict clean pages
+/// under pressure, exactly as on the CPU.  A discrete GPU (no unified memory)
+/// is better served by an explicit upload, so `Ok(None)` sends the caller to
+/// the copying reader.  `JOSHUA_OPENCL_ZERO_COPY=0` disables aliasing.
+#[cfg(feature = "opencl")]
+fn opencl_zero_copy_qtensor(
+    mmap: &Arc<Mmap>,
+    info: &gguf_file::TensorInfo,
+    tensor_data_offset: u64,
+    device: &candle_core::Device,
+) -> Result<Option<QTensor>> {
+    let Ok(ocl) = device.as_opencl_device() else {
+        return Ok(None);
+    };
+    if !candle_core::opencl_backend::zero_copy_enabled() || !ocl.host_unified_memory() {
+        return Ok(None);
+    }
+    let Ok(offset) = usize::try_from(tensor_data_offset.saturating_add(info.offset)) else {
+        return Ok(None);
+    };
+    let dtype = info.ggml_dtype;
+    let elem_count = info.shape.elem_count();
+    let block_size = dtype.block_size();
+    if block_size == 0 || !elem_count.is_multiple_of(block_size) {
+        return Ok(None);
+    }
+    let bytes = (elem_count / block_size).checked_mul(dtype.type_size());
+    if bytes
+        .and_then(|b| offset.checked_add(b))
+        .is_none_or(|end| end > mmap.len())
+    {
+        return Ok(None);
+    }
+    let keepalive: Arc<dyn std::any::Any + Send + Sync> = mmap.clone();
+    // SAFETY: the mapping is read-only and immutable for the life of the
+    // process (the module-level safety model), the range was bounds-checked
+    // above, and `keepalive` holds the mapping for as long as the buffer.
+    let storage = unsafe {
+        candle_core::QOpenClStorage::from_host_mapping(
+            ocl,
+            dtype,
+            elem_count,
+            mmap.as_ptr(),
+            mmap.len(),
+            offset,
+            keepalive,
+        )
+    };
+    match storage {
+        Ok(storage) => QTensor::new(QStorage::OpenCl(storage), info.shape.clone()).map(Some),
+        Err(e) => {
+            tracing::debug!(error = %e, "opencl zero-copy mapping declined, uploading instead");
+            Ok(None)
+        }
+    }
 }
 
 // ─── Layer-ahead pread prefetch thread ───────────────────────────────────────

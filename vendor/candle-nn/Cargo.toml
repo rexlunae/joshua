@@ -36,6 +36,7 @@ accelerate = [
     "candle/accelerate",
 ]
 cuda = ["candle/cuda"]
+opencl = ["candle/opencl"]
 cudnn = ["candle/cudnn"]
 default = []
 metal = [

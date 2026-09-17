@@ -385,6 +385,37 @@ impl candle::CustomOp1 for SoftmaxLastDim {
         }
     }
 
+    #[cfg(feature = "opencl")]
+    fn opencl_fwd(
+        &self,
+        storage: &candle::OpenClStorage,
+        layout: &Layout,
+    ) -> Result<(candle::OpenClStorage, Shape)> {
+        use candle::backend::{BackendDevice, BackendStorage};
+        use candle::opencl_backend::kernels;
+        // One fused kernel per row; the input only needs to be contiguous.
+        if storage.dtype() == DType::F32 && kernels::native_enabled() {
+            if let Some((o1, _)) = layout.contiguous_offsets() {
+                let dims = layout.shape().dims();
+                let cols = dims.last().copied().unwrap_or(0);
+                if cols > 0 {
+                    let rows = layout.shape().elem_count() / cols;
+                    let out = storage.device.alloc(DType::F32, rows * cols)?;
+                    match kernels::run_softmax_last(&storage.device.ctx(), storage.buffer, out.buffer, rows, cols, o1) {
+                        Ok(()) => return Ok((out, layout.shape().clone())),
+                        Err(e) => kernels::note_fallback("softmax_last_dim", Some(&e)),
+                    }
+                }
+            } else {
+                kernels::note_fallback("softmax_last_dim", None);
+            }
+        }
+        let cpu = storage.to_cpu_storage()?;
+        let (out, shape) = self.cpu_fwd(&cpu, layout)?;
+        let dev = storage.device.clone();
+        Ok((dev.storage_from_cpu_storage(&out)?, shape))
+    }
+
     #[cfg(feature = "cuda")]
     fn cuda_fwd(
         &self,
@@ -779,6 +810,39 @@ impl candle::CustomOp2 for RmsNorm {
             }
             _ => candle::bail!("vulkan rms-norm produced non-vulkan storage"),
         }
+    }
+
+    #[cfg(feature = "opencl")]
+    fn opencl_fwd(
+        &self,
+        s1: &candle::OpenClStorage,
+        l1: &Layout,
+        s2: &candle::OpenClStorage,
+        l2: &Layout,
+    ) -> Result<(candle::OpenClStorage, Shape)> {
+        use candle::backend::{BackendDevice, BackendStorage};
+        use candle::opencl_backend::kernels;
+        if s1.dtype() == DType::F32 && s2.dtype() == DType::F32 && kernels::native_enabled() {
+            if let (Some((o1, _)), Some((a1, _))) = (l1.contiguous_offsets(), l2.contiguous_offsets()) {
+                let dims = l1.shape().dims();
+                let cols = dims.last().copied().unwrap_or(0);
+                if cols > 0 && l2.shape().elem_count() == cols {
+                    let rows = l1.shape().elem_count() / cols;
+                    let out = s1.device.alloc(DType::F32, rows * cols)?;
+                    match kernels::run_rmsnorm(&s1.device.ctx(), s1.buffer, s2.buffer, out.buffer, rows, cols, o1, a1, self.eps) {
+                        Ok(()) => return Ok((out, l1.shape().clone())),
+                        Err(e) => kernels::note_fallback("rms_norm", Some(&e)),
+                    }
+                }
+            } else {
+                kernels::note_fallback("rms_norm", None);
+            }
+        }
+        let c1 = s1.to_cpu_storage()?;
+        let c2 = s2.to_cpu_storage()?;
+        let (out, shape) = self.cpu_fwd(&c1, l1, &c2, l2)?;
+        let dev = s1.device.clone();
+        Ok((dev.storage_from_cpu_storage(&out)?, shape))
     }
 
 }

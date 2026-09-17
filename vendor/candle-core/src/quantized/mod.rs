@@ -81,13 +81,9 @@ impl Device {
                 Ok(QStorage::Cuda(storage))
             }
             Device::OpenCl(ocl) => {
-                // M4 dense-on-OpenCl strategy: hold the weights as a dequantized
-                // f32 buffer on the OpenCl device (OpenClStorage).  Block-quantized
-                // dtypes other than f32 are errors here; f32 is what the deepseek4
-                // mmap loader builds for a `--device opencl` run.
-                let shape = crate::Shape::from(vec![elem_count, 1]);
-                let storage = ocl.zeros_impl(&shape, crate::DType::F32)?;
-                Ok(QStorage::OpenCl(storage))
+                // Blocks stay in their GGUF format on the device; the OpenCL
+                // kernels dequantize inside the matmul.
+                Ok(QStorage::OpenCl(crate::QOpenClStorage::zeros(ocl, elem_count, dtype)?))
             }
             Device::Vulkan(vk) => {
                 // f32-dense zeros on the Vulkan device, mirroring OpenCl.
@@ -99,11 +95,21 @@ impl Device {
     }
 }
 
+/// Quantize `xs` on the CPU into `dst`'s block format and upload it.
+fn opencl_quantize(dst: &mut crate::QOpenClStorage, xs: &[f32]) -> Result<()> {
+    let mut cpu = dst.dtype().cpu_zeros(dst.elem_count);
+    cpu.from_float(xs);
+    // # Safety: the storage owns `storage_size_in_bytes` bytes at `as_ptr`.
+    let bytes = unsafe { std::slice::from_raw_parts(cpu.as_ptr(), cpu.storage_size_in_bytes()) };
+    *dst = crate::QOpenClStorage::from_bytes(dst.device(), dst.dtype(), dst.elem_count, bytes)?;
+    Ok(())
+}
+
 pub enum QStorage {
     Cpu(Box<dyn QuantizedType>),
     Metal(metal::QMetalStorage),
     Cuda(cuda::QCudaStorage),
-    OpenCl(crate::OpenClStorage),
+    OpenCl(crate::QOpenClStorage),
     Vulkan(crate::VulkanStorage),
 }
 
@@ -147,20 +153,9 @@ impl QStorage {
                 GgmlDType::BF16 => cuda::load_quantized(d, as_t_slice::<bf16>(data)),
             },
             Device::OpenCl(d) => {
-                // f32 only (dequantized dense set on the device); the deepseek4
-                // mmap loader supplies f32 here.  True block dtypes are not held
-                // on OpenCl in M4.
-                match dtype {
-                    GgmlDType::F32 => {
-                        let f32s = as_t_slice::<f32>(data);
-                        Ok(QStorage::OpenCl(
-                            crate::OpenClStorage::from_vec(f32s.to_vec(), d)?
-                        ))
-                    }
-                    _ => crate::bail!(
-                        "opencl quantized storage is f32-only (M4); got {dtype:?}"
-                    ),
-                }
+                // Every block format is uploaded as-is; see `QOpenClStorage`.
+                let elem_count = data.len() / dtype.type_size() * dtype.block_size();
+                Ok(QStorage::OpenCl(crate::QOpenClStorage::from_bytes(d, dtype, elem_count, data)?))
             }
             Device::Vulkan(d) => {
                 // f32 only (dequantized dense set on the device), mirroring the
@@ -186,7 +181,7 @@ impl QStorage {
             QStorage::Cpu(storage) => storage.block_size(),
             QStorage::Metal(storage) => storage.dtype().block_size(),
             QStorage::Cuda(storage) => storage.dtype().block_size(),
-            QStorage::OpenCl(_) => 1,   // f32 block size
+            QStorage::OpenCl(storage) => storage.dtype().block_size(),
             QStorage::Vulkan(_) => 1,   // f32 block size
         }
     }
@@ -196,7 +191,7 @@ impl QStorage {
             QStorage::Cpu(storage) => storage.dtype(),
             QStorage::Metal(storage) => storage.dtype(),
             QStorage::Cuda(storage) => storage.dtype(),
-            QStorage::OpenCl(_) => GgmlDType::F32,
+            QStorage::OpenCl(storage) => storage.dtype(),
             QStorage::Vulkan(_) => GgmlDType::F32,
         }
     }
@@ -216,7 +211,7 @@ impl QStorage {
             QStorage::Cpu(storage) => storage.storage_size_in_bytes(),
             QStorage::Metal(storage) => storage.storage_size_in_bytes(),
             QStorage::Cuda(storage) => storage.storage_size_in_bytes(),
-            QStorage::OpenCl(storage) => storage.numel * storage.dtype.size_in_bytes(),
+            QStorage::OpenCl(storage) => storage.storage_size_in_bytes(),
             QStorage::Vulkan(storage) => storage.numel * storage.dtype.size_in_bytes(),
         }
     }
@@ -230,12 +225,10 @@ impl QStorage {
             (QStorage::Cuda(storage), Storage::Cuda(src)) => storage.quantize(src)?,
             (QStorage::OpenCl(dst), Storage::OpenCl(src)) => {
                 let cpu = src.to_cpu_storage()?;
-                let dev = dst.device.clone();
-                *dst = dev.storage_from_cpu_storage(&cpu)?;
+                opencl_quantize(dst, cpu.as_slice::<f32>()?)?;
             }
             (QStorage::OpenCl(dst), Storage::Cpu(src)) => {
-                let dev = dst.device.clone();
-                *dst = dev.storage_from_cpu_storage(src)?;
+                opencl_quantize(dst, src.as_slice::<f32>()?)?;
             }
             (QStorage::Vulkan(dst), Storage::Vulkan(src)) => {
                 let cpu = src.to_cpu_storage()?;
@@ -270,8 +263,7 @@ impl QStorage {
             (QStorage::OpenCl(dst), Storage::OpenCl(src)) => {
                 let _ = (imatrix_weights, n_per_row);
                 let cpu = src.to_cpu_storage()?;
-                let dev = dst.device.clone();
-                *dst = dev.storage_from_cpu_storage(&cpu)?;
+                opencl_quantize(dst, cpu.as_slice::<f32>()?)?;
             }
             (QStorage::Vulkan(dst), Storage::Vulkan(src)) => {
                 let _ = (imatrix_weights, n_per_row);
@@ -292,8 +284,7 @@ impl QStorage {
             (QStorage::Metal(storage), Storage::Cpu(src)) => storage.quantize_onto(src)?,
             (QStorage::Cuda(storage), Storage::Cpu(src)) => storage.quantize_onto(src)?,
             (QStorage::OpenCl(dst), Storage::Cpu(src)) => {
-                let dev = dst.device.clone();
-                *dst = dev.storage_from_cpu_storage(src)?;
+                opencl_quantize(dst, src.as_slice::<f32>()?)?;
             }
             (QStorage::Vulkan(dst), Storage::Cpu(src)) => {
                 let dev = dst.device.clone();
@@ -322,8 +313,7 @@ impl QStorage {
             }
             (QStorage::OpenCl(dst), Storage::Cpu(src)) => {
                 let _ = (imatrix_weights, n_per_row);
-                let dev = dst.device.clone();
-                *dst = dev.storage_from_cpu_storage(src)?;
+                opencl_quantize(dst, src.as_slice::<f32>()?)?;
             }
             (QStorage::Vulkan(dst), Storage::Cpu(src)) => {
                 let _ = (imatrix_weights, n_per_row);
@@ -340,10 +330,7 @@ impl QStorage {
             QStorage::Cpu(storage) => Ok(Storage::Cpu(storage.dequantize(elem_count)?)),
             QStorage::Metal(storage) => Ok(Storage::Metal(storage.dequantize(elem_count)?)),
             QStorage::Cuda(storage) => Ok(Storage::Cuda(storage.dequantize(elem_count)?)),
-            QStorage::OpenCl(storage) => {
-                let cpu = storage.to_cpu_storage()?;
-                Ok(Storage::OpenCl(storage.device.storage_from_cpu_storage(&cpu)?))
-            },
+            QStorage::OpenCl(storage) => Ok(Storage::OpenCl(storage.dequantize(elem_count)?)),
             QStorage::Vulkan(storage) => {
                 let cpu = storage.to_cpu_storage()?;
                 Ok(Storage::Vulkan(storage.device.storage_from_cpu_storage(&cpu)?))
@@ -361,7 +348,7 @@ impl QStorage {
             }
             QStorage::Cuda(storage) => Ok(Cow::from(storage.data()?)),
             QStorage::Metal(storage) => Ok(Cow::from(storage.data()?)),
-            QStorage::OpenCl(_) => crate::bail!("opencl QStorage::data is not supported (M4)"),
+            QStorage::OpenCl(storage) => Ok(Cow::from(storage.data()?)),
             QStorage::Vulkan(_) => crate::bail!("vulkan QStorage::data is not supported (M1)"),
         }
     }
@@ -857,8 +844,14 @@ impl QTensor {
                 }
                 _ => unreachable!("ids were moved to the QTensor device"),
             },
-            QStorage::OpenCl(_) | QStorage::Vulkan(_) => {
-                crate::bail!("unreachable: opencl dense f32 uses the device-Tensor path")
+            QStorage::OpenCl(storage) => match &*ids.storage() {
+                Storage::OpenCl(ids_storage) => {
+                    Storage::OpenCl(storage.embedding(rows, hidden, ids_storage, ids.layout())?)
+                }
+                _ => unreachable!("ids were moved to the QTensor device"),
+            },
+            QStorage::Vulkan(_) => {
+                crate::bail!("unreachable: vulkan dense f32 uses the device-Tensor path")
             }
         };
         let none = crate::op::BackpropOp::none();
@@ -1132,6 +1125,18 @@ impl crate::CustomOp1 for QTensor {
         let self_storage = match &self.storage {
             QStorage::Cuda(cuda) => cuda,
             _ => unreachable!("Cannot call cuda matmul on non cuda QTensor"),
+        };
+        self_storage.fwd(&self.shape, storage, layout)
+    }
+
+    fn opencl_fwd(
+        &self,
+        storage: &crate::OpenClStorage,
+        layout: &crate::Layout,
+    ) -> Result<(crate::OpenClStorage, Shape)> {
+        let self_storage = match &self.storage {
+            QStorage::OpenCl(ocl) => ocl,
+            _ => unreachable!("Cannot call opencl matmul on non opencl QTensor"),
         };
         self_storage.fwd(&self.shape, storage, layout)
     }

@@ -283,10 +283,8 @@ impl Storage {
                 Ok((Self::Metal(storage), shape))
             }
             Self::OpenCl(storage) => {
-                let cpu = storage.to_cpu_storage()?;
-                let (out, shape) = c.cpu_fwd(&cpu, l)?;
-                let dev = storage.device.clone();
-                Ok((Self::OpenCl(dev.storage_from_cpu_storage(&out)?), shape))
+                let (storage, shape) = c.opencl_fwd(storage, l)?;
+                Ok((Self::OpenCl(storage), shape))
             }
             Self::Vulkan(storage) => {
                 let (storage, shape) = c.vulkan_fwd(storage, l)?;
@@ -317,11 +315,8 @@ impl Storage {
                 Ok((Self::Metal(s), shape))
             }
             (Self::OpenCl(s1), Self::OpenCl(s2)) => {
-                let c1 = s1.to_cpu_storage()?;
-                let c2 = s2.to_cpu_storage()?;
-                let (s, shape) = c.cpu_fwd(&c1, l1, &c2, l2)?;
-                let dev = s1.device.clone();
-                Ok((Self::OpenCl(dev.storage_from_cpu_storage(&s)?), shape))
+                let (s, shape) = c.opencl_fwd(s1, l1, s2, l2)?;
+                Ok((Self::OpenCl(s), shape))
             }
             (Self::Vulkan(s1), Self::Vulkan(s2)) => {
                 let (s, shape) = c.vulkan_fwd(s1, l1, s2, l2)?;
@@ -356,12 +351,8 @@ impl Storage {
                 Ok((Self::Metal(s), shape))
             }
             (Self::OpenCl(s1), Self::OpenCl(s2), Self::OpenCl(s3)) => {
-                let c1 = s1.to_cpu_storage()?;
-                let c2 = s2.to_cpu_storage()?;
-                let c3 = s3.to_cpu_storage()?;
-                let (s, shape) = c.cpu_fwd(&c1, l1, &c2, l2, &c3, l3)?;
-                let dev = s1.device.clone();
-                Ok((Self::OpenCl(dev.storage_from_cpu_storage(&s)?), shape))
+                let (s, shape) = c.opencl_fwd(s1, l1, s2, l2, s3, l3)?;
+                Ok((Self::OpenCl(s), shape))
             }
             (Self::Vulkan(s1), Self::Vulkan(s2), Self::Vulkan(s3)) => {
                 let c1 = s1.to_cpu_storage()?;

@@ -16,6 +16,41 @@ impl candle::CustomOp3 for RotaryEmbI {
         "rotary-emb-int"
     }
 
+    #[cfg(feature = "opencl")]
+    fn opencl_fwd(
+        &self,
+        s1: &candle::OpenClStorage,
+        l1: &Layout,
+        s2: &candle::OpenClStorage,
+        l2: &Layout,
+        s3: &candle::OpenClStorage,
+        l3: &Layout,
+    ) -> Result<(candle::OpenClStorage, Shape)> {
+        use candle::backend::{BackendDevice, BackendStorage};
+        use candle::opencl_backend::kernels;
+        use candle::DType;
+        if s1.dtype() == DType::F32 && s2.dtype() == DType::F32 && s3.dtype() == DType::F32 && kernels::native_enabled() {
+            if let (Some((o1, _)), Some((c1, _)), Some((n1, _)), Ok((b, h, t, d))) =
+                (l1.contiguous_offsets(), l2.contiguous_offsets(), l3.contiguous_offsets(), l1.shape().dims4())
+            {
+                let cs_batched = l2.dims().len() == 3 && l3.dims().len() == 3;
+                let out = s1.device.alloc(DType::F32, b * h * t * d)?;
+                match kernels::run_rope(&s1.device.ctx(), true, s1.buffer, s2.buffer, s3.buffer, out.buffer, (b, h, t, d), o1, c1, n1, cs_batched) {
+                    Ok(()) => return Ok((out, l1.shape().clone())),
+                    Err(e) => kernels::note_fallback("rotary-emb-int", Some(&e)),
+                }
+            } else {
+                kernels::note_fallback("rotary-emb-int", None);
+            }
+        }
+        let c1 = s1.to_cpu_storage()?;
+        let c2 = s2.to_cpu_storage()?;
+        let c3 = s3.to_cpu_storage()?;
+        let (out, shape) = self.cpu_fwd(&c1, l1, &c2, l2, &c3, l3)?;
+        let dev = s1.device.clone();
+        Ok((dev.storage_from_cpu_storage(&out)?, shape))
+    }
+
     fn cpu_fwd(
         &self,
         s1: &CpuStorage,
@@ -314,6 +349,41 @@ struct RotaryEmb;
 impl candle::CustomOp3 for RotaryEmb {
     fn name(&self) -> &'static str {
         "rotary-emb"
+    }
+
+    #[cfg(feature = "opencl")]
+    fn opencl_fwd(
+        &self,
+        s1: &candle::OpenClStorage,
+        l1: &Layout,
+        s2: &candle::OpenClStorage,
+        l2: &Layout,
+        s3: &candle::OpenClStorage,
+        l3: &Layout,
+    ) -> Result<(candle::OpenClStorage, Shape)> {
+        use candle::backend::{BackendDevice, BackendStorage};
+        use candle::opencl_backend::kernels;
+        use candle::DType;
+        if s1.dtype() == DType::F32 && s2.dtype() == DType::F32 && s3.dtype() == DType::F32 && kernels::native_enabled() {
+            if let (Some((o1, _)), Some((c1, _)), Some((n1, _)), Ok((b, h, t, d))) =
+                (l1.contiguous_offsets(), l2.contiguous_offsets(), l3.contiguous_offsets(), l1.shape().dims4())
+            {
+                let cs_batched = l2.dims().len() == 3 && l3.dims().len() == 3;
+                let out = s1.device.alloc(DType::F32, b * h * t * d)?;
+                match kernels::run_rope(&s1.device.ctx(), false, s1.buffer, s2.buffer, s3.buffer, out.buffer, (b, h, t, d), o1, c1, n1, cs_batched) {
+                    Ok(()) => return Ok((out, l1.shape().clone())),
+                    Err(e) => kernels::note_fallback("rotary-emb", Some(&e)),
+                }
+            } else {
+                kernels::note_fallback("rotary-emb", None);
+            }
+        }
+        let c1 = s1.to_cpu_storage()?;
+        let c2 = s2.to_cpu_storage()?;
+        let c3 = s3.to_cpu_storage()?;
+        let (out, shape) = self.cpu_fwd(&c1, l1, &c2, l2, &c3, l3)?;
+        let dev = s1.device.clone();
+        Ok((dev.storage_from_cpu_storage(&out)?, shape))
     }
 
     fn cpu_fwd(
