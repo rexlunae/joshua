@@ -420,7 +420,14 @@ impl OpenClStorage {
             DType::I64 | DType::U8 => {
                 let n = l.shape().elem_count();
                 let out = self.device.alloc(DType::U32, n)?;
-                let name = kernels::cast_kernel(self.dtype, DType::U32).ok_or_else(|| Error::Msg("opencl: no id cast".into()))?;
+                // i64 ids saturate (negative / beyond u32 → u32::MAX) so the
+                // consuming kernel's bounds check faults instead of a
+                // truncated id selecting the wrong element.
+                let name = if self.dtype == DType::I64 {
+                    "k_ids_i64"
+                } else {
+                    kernels::cast_kernel(self.dtype, DType::U32).ok_or_else(|| Error::Msg("opencl: no id cast".into()))?
+                };
                 kernels::run_cast(&self.ctx(), name, self.buffer, out.buffer, n, l)?;
                 Ok((std::borrow::Cow::Owned(out), 0))
             }
@@ -1610,6 +1617,11 @@ mod tests {
         // device stays usable afterwards.
         let bad = Tensor::new(&[1u32, 9], &dev)?;
         assert!(xd.index_select(&bad, 0)?.to_device(&cpu).is_err(), "out-of-range index_select must fail");
+        // An i64 id beyond u32 (or negative) is out of range, not truncated.
+        let big_id = Tensor::new(&[4_294_967_297i64, 1], &dev)?;
+        assert!(xd.gather(&big_id.reshape((2, 1))?.broadcast_as((2, 24))?.contiguous()?, 0).and_then(|t| t.to_device(&cpu)).is_err(), "i64 id beyond u32 must fail");
+        let neg_id = Tensor::new(&[-1i64, 1], &dev)?;
+        assert!(xd.index_select(&neg_id, 0)?.to_device(&cpu).is_err(), "negative i64 id must fail");
         close(&xd.index_select(&ids.to_device(&dev)?, 0)?, &x.index_select(&ids, 0)?, 0.0, "index_select after a fault");
 
         // Matmul: NN, NT (weight transpose), batched with broadcast rhs, decode GEMV.

@@ -826,6 +826,14 @@ pub fn cast_supported(from: crate::DType, to: crate::DType) -> bool {
     }
 }
 
+/// i64 ids → u32 with out-of-range values saturated (see `glsl::k_ids_i64`).
+pub fn run_ids_i64(d: &VulkanDevice, x: Buf, out: Buf, n: usize, l: &Layout) -> Result<()> {
+    let ix = Idx::new(l.dims())?.with_layout(0, l)?;
+    let push = Push::default().us(n)?;
+    let lim = d.limits();
+    d.launch("ids_i64", glsl::k_ids_i64, &[x, out], push, &[ix], grid(n, lim.wg, 1, lim.max_groups_x))
+}
+
 pub fn run_cast(d: &VulkanDevice, from: crate::DType, to: crate::DType, x: Buf, out: Buf, n: usize, l: &Layout) -> Result<()> {
     let (Some(f), Some(t)) = (cls_of(from), cls_of(to)) else {
         return Err(Error::Msg(format!("vulkan: no cast kernel {from:?} -> {to:?}")));

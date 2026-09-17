@@ -352,6 +352,15 @@ __kernel void k_cast_i64_u32(__global const long* x, __global uint* o, int n, Id
     int i = get_global_id(0);
     if (i < n) o[i] = (uint)x[off_of(i, &ix, ix.s0, ix.o0)];
 }
+// i64 ids to u32 for the indexing kernels: a negative id or one that does
+// not fit in 32 bits becomes 0xFFFFFFFF, which every bounds check (against
+// a dimension below 2^31) rejects and reports through the fault word.
+__kernel void k_ids_i64(__global const long* x, __global uint* o, int n, Idx ix) {
+    int i = get_global_id(0);
+    if (i >= n) return;
+    long v = x[off_of(i, &ix, ix.s0, ix.o0)];
+    o[i] = (v < 0 || v > 0xFFFFFFFFL) ? 0xFFFFFFFFu : (uint)v;
+}
 __kernel void k_cast_u8_u32(__global const uchar* x, __global uint* o, int n, Idx ix) {
     int i = get_global_id(0);
     if (i < n) o[i] = (uint)x[off_of(i, &ix, ix.s0, ix.o0)];

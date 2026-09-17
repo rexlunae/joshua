@@ -415,6 +415,27 @@ impl Cls {
     }
 }
 
+/// i64 ids to u32 for the indexing kernels: a negative id or one that does
+/// not fit in 32 bits becomes `0xFFFFFFFF`, which every bounds check
+/// (against a dimension below 2³¹) rejects and reports through the fault
+/// word.  Push: `n`.
+pub fn k_ids_i64(wg: usize) -> String {
+    let mut s = prelude(wg, 2);
+    s += &buf(0, "uvec2", "x", true);
+    s += &buf(1, "uint", "o", false);
+    s += r#"
+layout(push_constant) uniform PC { int n; } pc;
+layout(local_size_x = WG) in;
+void main() {
+    int i = gid();
+    if (i >= pc.n) return;
+    uvec2 r = x[off0(i)];
+    o[i] = r.y != 0u ? 0xFFFFFFFFu : r.x;
+}
+"#;
+    s
+}
+
 /// `to_dtype` between two storage classes: strided input, contiguous
 /// output.  Values go through `float` (for floats) or `int`/`uint` (ints);
 /// an i64 becomes a float from both of its words (f32 precision), and the
