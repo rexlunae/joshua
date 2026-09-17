@@ -71,6 +71,17 @@ pub trait ExpertResidency: Send + Sync + 'static {
     /// hot-expert-cache budget on devices; on CPU it is informational (the
     /// budget stays operator-set via `--pin-hot-experts`).
     fn capacity(&self) -> usize;
+
+    /// Protect `(layer, expert)` from LRU eviction: it is in the routing-
+    /// frequency hot set, so a device slot cache must keep it resident.
+    /// Backends without a fixed-size device pool (CPU madvise, no-op) ignore
+    /// this. Default is a no-op so CPU/host and higher-performance-GPU paths
+    /// are unchanged.
+    fn mark_hot(&self, _layer: u32, _expert: u32) {}
+
+    /// Stop protecting `(layer, expert)` once it leaves the hot set.
+    /// Default is a no-op, symmetric with [`ExpertResidency::mark_hot`].
+    fn unmark_hot(&self, _layer: u32, _expert: u32) {}
 }
 
 /// CPU residency backend: best-effort `MADV_WILLNEED` over each hot expert's
@@ -404,5 +415,13 @@ impl<T: DeviceExpertSlot> ExpertResidency for DeviceResidency<T> {
     }
     fn capacity(&self) -> usize {
         (self.capacity_bytes / self.per_slot_bytes.max(1)) as usize
+    }
+
+    fn mark_hot(&self, layer: u32, expert: u32) {
+        DeviceResidency::mark_hot(self, layer, expert);
+    }
+
+    fn unmark_hot(&self, layer: u32, expert: u32) {
+        DeviceResidency::unmark_hot(self, layer, expert);
     }
 }

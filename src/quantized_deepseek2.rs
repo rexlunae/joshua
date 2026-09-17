@@ -1049,6 +1049,10 @@ impl ModelWeights {
         let step = self.hot_experts.begin_step(seq_len == 1);
         if self.hot_experts.refresh_due(seq_len == 1) {
             for (l, e) in self.hot_experts.refresh() {
+                // Protect the routing-frequency hot set from LRU eviction in a
+                // device slot pool (#62), then make it resident. No-op on
+                // CPU/host residency backends.
+                sh.residency.mark_hot(l, e);
                 sh.residency.acquire(l, e);
             }
         }
