@@ -121,8 +121,9 @@ pub struct DeviceId(usize);
 struct OpenClContext {
     context: usize,
     queue: usize,
-    /// One `uint` the indexing kernels set on an out-of-range id (see
-    /// `kernels.cl`); read and cleared by [`OpenClDevice::check_fault`].
+    /// One `uint` per thread slot (`crate::fault_slot`) that the indexing
+    /// kernels set on an out-of-range id (see `kernels.cl`); read and
+    /// cleared by [`OpenClDevice::check_fault`].
     fault: usize,
 }
 
@@ -231,7 +232,7 @@ fn init_device(gpu_id: usize) -> Result<OpenClDevice> {
         unsafe { clReleaseContext(context) };
         return Err(opencl_error(err, "clCreateCommandQueue"));
     }
-    let fault = match create_buffer(context, 4, cl::CL_MEM_READ_WRITE) {
+    let fault = match create_buffer(context, crate::fault_slot::BYTES, cl::CL_MEM_READ_WRITE) {
         Ok(b) => b,
         Err(e) => {
             unsafe {
@@ -241,8 +242,8 @@ fn init_device(gpu_id: usize) -> Result<OpenClDevice> {
             return Err(e);
         }
     };
-    let zero = 0u32;
-    if let Err(e) = unsafe { write_buffer(queue, fault, 4, &zero as *const u32 as *const u8) } {
+    let zeros = vec![0u8; crate::fault_slot::BYTES];
+    if let Err(e) = unsafe { write_buffer(queue, fault, zeros.len(), zeros.as_ptr()) } {
         unsafe {
             clReleaseMemObject(fault);
             clReleaseCommandQueue(queue);
@@ -297,21 +298,22 @@ impl OpenClDevice {
 
     /// Handles a kernel launch needs.
     pub fn ctx(&self) -> Ctx {
-        Ctx { context: self.context(), device: self.device_id, queue: self.queue(), fault: self.inner.fault }
+        Ctx { context: self.context(), device: self.device_id, queue: self.queue(), fault: self.inner.fault, fslot: crate::fault_slot::current() as i32 }
     }
 
-    /// Report (and clear) an out-of-range id an indexing kernel flagged since
-    /// the last check.  Called at every host read-back and `synchronize`,
-    /// the points where the CPU backend's error for the same input would
-    /// have been observed.
+    /// Report (and clear) an out-of-range id an indexing kernel launched by
+    /// this thread flagged since the last check.  Called at every host
+    /// read-back and `synchronize`, the points where the CPU backend's
+    /// error for the same input would have been observed.
     pub fn check_fault(&self) -> Result<()> {
+        let slot = crate::fault_slot::current() * 4;
         let mut v = 0u32;
-        unsafe { read_buffer(self.queue(), self.inner.fault, 0, 4, &mut v as *mut u32 as *mut u8) }?;
+        unsafe { read_buffer(self.queue(), self.inner.fault, slot, 4, &mut v as *mut u32 as *mut u8) }?;
         if v == 0 {
             return Ok(());
         }
         let zero = 0u32;
-        unsafe { write_buffer(self.queue(), self.inner.fault, 4, &zero as *const u32 as *const u8) }?;
+        unsafe { write_buffer_at(self.queue(), self.inner.fault, slot, 4, &zero as *const u32 as *const u8) }?;
         Err(Error::Msg(
             "opencl: an index_select / gather / scatter / index_add / embedding id was out of range for the indexed dimension (reported at the next host read-back)".into(),
         ))
@@ -435,6 +437,17 @@ unsafe fn write_buffer(queue: usize, buffer: usize, bytes: usize, ptr: *const u8
         return Ok(());
     }
     let rc = clEnqueueWriteBuffer(queue, buffer, cl::CL_TRUE, 0, bytes, ptr as *const std::ffi::c_void, 0, std::ptr::null(), std::ptr::null_mut());
+    if rc != cl::CL_SUCCESS {
+        return Err(opencl_error(rc, "clEnqueueWriteBuffer"));
+    }
+    Ok(())
+}
+
+unsafe fn write_buffer_at(queue: usize, buffer: usize, offset: usize, bytes: usize, ptr: *const u8) -> Result<()> {
+    if bytes == 0 {
+        return Ok(());
+    }
+    let rc = clEnqueueWriteBuffer(queue, buffer, cl::CL_TRUE, offset, bytes, ptr as *const std::ffi::c_void, 0, std::ptr::null(), std::ptr::null_mut());
     if rc != cl::CL_SUCCESS {
         return Err(opencl_error(rc, "clEnqueueWriteBuffer"));
     }
@@ -1258,7 +1271,16 @@ impl Drop for QOpenClStorage {
     }
 }
 
-const PAGE: usize = 4096;
+/// The system base page size, the granularity `CL_MEM_USE_HOST_PTR`
+/// ranges are widened to (every mapping is page-aligned, whatever the
+/// page size).
+fn page_size() -> usize {
+    static PAGE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *PAGE.get_or_init(|| {
+        let v = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if v > 0 { v as usize } else { 4096 }
+    })
+}
 
 /// Whether zero-copy host buffers are enabled (`JOSHUA_OPENCL_ZERO_COPY=0`
 /// disables them; useful when a driver copies anyway).
@@ -1328,9 +1350,10 @@ impl QOpenClStorage {
         if offset.checked_add(bytes).is_none_or(|end| end > base_len) {
             return Err(Error::Msg("opencl: tensor range exceeds the host mapping".into()));
         }
-        let start = offset & !(PAGE - 1);
-        let end = (offset + bytes).div_ceil(PAGE) * PAGE;
-        let end = end.min(base_len.div_ceil(PAGE) * PAGE).max(offset + bytes);
+        let page = page_size();
+        let start = offset & !(page - 1);
+        let end = (offset + bytes).div_ceil(page) * page;
+        let end = end.min(base_len.div_ceil(page) * page).max(offset + bytes);
         let mut err: i32 = 0;
         let buffer = unsafe {
             clCreateBuffer(
@@ -1448,11 +1471,7 @@ impl QOpenClStorage {
                 kernels::run_index_select(&c, false, false, self.buffer, ids_s.buffer, out.buffer, n_ids * hidden, 1, n_ids, hidden, rows, (self.byte_offset / 4) as usize, ids_off)?;
             }
             GgmlDType::F16 | GgmlDType::BF16 => {
-                // Dequantize the whole table only when it is small; otherwise
-                // gather through a half-precision row kernel would be better,
-                // but embedding tables in f16 are rare in GGUF.
-                let w = self.dequantize(rows * hidden)?;
-                kernels::run_index_select(&c, false, false, w.buffer, ids_s.buffer, out.buffer, n_ids * hidden, 1, n_ids, hidden, rows, 0, ids_off)?;
+                kernels::run_hembed(&c, self.dtype == GgmlDType::BF16, self.buffer, ids_s.buffer, out.buffer, n_ids, hidden, rows, self.byte_offset, ids_off)?;
             }
             _ => kernels::run_qembed(&c, self.dtype, self.buffer, ids_s.buffer, out.buffer, n_ids, hidden, rows, self.byte_offset, ids_off)?,
         }
@@ -1661,8 +1680,8 @@ mod tests {
         let q_cpu = QTensor::quantize(&w, GgmlDType::Q4K)?;
         let bytes = q_cpu.data()?.into_owned();
         // Place the tensor at an unaligned offset inside a larger host block.
-        let mut host = vec![0u8; 3 * PAGE + bytes.len() + 100];
-        let off = PAGE + 96;
+        let mut host = vec![0u8; 3 * page_size() + bytes.len() + 100];
+        let off = page_size() + 96;
         host[off..off + bytes.len()].copy_from_slice(&bytes);
         let host: Arc<Vec<u8>> = Arc::new(host);
         let ocl = dev.as_opencl_device()?;
@@ -1693,6 +1712,28 @@ mod tests {
             let q_onto = crate::quantized::QTensor::quantize_imatrix_onto(&x, &w, dtype, &dev)?;
             assert_eq!(q_cpu.data()?.as_ref(), q_onto.data()?.as_ref(), "{dtype:?}: imatrix blocks (onto)");
         }
+        Ok(())
+    }
+
+    /// A fault raised by one thread's launch is reported to that thread only:
+    /// a thread doing valid work on the same device never sees it.
+    #[test]
+    fn opencl_fault_is_per_thread() -> crate::Result<()> {
+        let Some(dev) = device() else { return Ok(()) };
+        let cpu = Device::Cpu;
+        let x = Tensor::arange(0f32, 32f32, &cpu)?.reshape((4, 8))?.to_device(&dev)?;
+        let bad = Tensor::new(&[1u32, 9], &dev)?;
+        let good = Tensor::new(&[1u32, 3], &dev)?;
+        let faulty = std::thread::spawn({
+            let (x, bad, cpu) = (x.clone(), bad.clone(), cpu.clone());
+            move || (0..20).all(|_| x.index_select(&bad, 0).and_then(|t| t.to_device(&cpu)).is_err())
+        });
+        let clean = std::thread::spawn({
+            let (x, good, cpu) = (x.clone(), good.clone(), cpu.clone());
+            move || (0..200).all(|_| x.index_select(&good, 0).and_then(|t| t.to_device(&cpu)).is_ok())
+        });
+        assert!(faulty.join().unwrap(), "the faulting thread must see its error every time");
+        assert!(clean.join().unwrap(), "the clean thread must never see another thread's fault");
         Ok(())
     }
 }

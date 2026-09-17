@@ -64,6 +64,8 @@ mod dtype;
 pub mod dummy_cuda_backend;
 pub mod dummy_dtype;
 mod dummy_metal_backend;
+#[cfg(any(feature = "opencl", feature = "vulkan"))]
+pub mod fault_slot;
 #[cfg(feature = "opencl")]
 pub mod opencl_backend;
 #[cfg(not(feature = "opencl"))]

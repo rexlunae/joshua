@@ -598,9 +598,10 @@ void main() {
 }
 
 // Out-of-range ids: the CPU backend returns an error, which a kernel
-// cannot.  Every indexing kernel binds the device's `fault` word last and
-// sets it (skipping the element) when an id exceeds the indexed dimension;
-// the host checks and clears the word at the next read-back or
+// cannot.  Every indexing kernel binds the device's `fault` buffer last,
+// takes the calling thread's slot in it as its last push constant, and
+// sets the slot (skipping the element) when an id exceeds the indexed
+// dimension; the host checks and clears its slot at the next read-back or
 // synchronize and reports the error there, so a bad id never reads or
 // writes out of bounds and never turns into a plausible result.
 
@@ -621,7 +622,7 @@ pub fn k_index_select(wg: usize, elem8: bool, ids_i64: bool) -> String {
     };
     s += &format!(
         r#"
-layout(push_constant) uniform PC {{ int n; int left; int n_ids; int right; int dim_size; int src_off; int ids_off; }} pc;
+layout(push_constant) uniform PC {{ int n; int left; int n_ids; int right; int dim_size; int src_off; int ids_off; int fslot; }} pc;
 layout(local_size_x = WG) in;
 void main() {{
     int i = gid();
@@ -631,7 +632,7 @@ void main() {{
     int j = t % pc.n_ids;
     int l = t / pc.n_ids;
     {id}
-    if (id >= uint(pc.dim_size)) {{ fault[0] = 1u; return; }}
+    if (id >= uint(pc.dim_size)) {{ fault[pc.fslot] = 1u; return; }}
     o[i] = src[pc.src_off + (l * pc.dim_size + int(id)) * pc.right + r];
 }}
 "#
@@ -648,13 +649,13 @@ pub fn k_gather(wg: usize) -> String {
     s += &buf(2, "uint", "o", false);
     s += &buf(3, "uint", "fault", false);
     s += r#"
-layout(push_constant) uniform PC { int n; int src_dim_stride; int dim_size; } pc;
+layout(push_constant) uniform PC { int n; int src_dim_stride; int dim_size; int fslot; } pc;
 layout(local_size_x = WG) in;
 void main() {
     int i = gid();
     if (i >= pc.n) return;
     uint id = ids[off0(i)];
-    if (id >= uint(pc.dim_size)) { fault[0] = 1u; return; }
+    if (id >= uint(pc.dim_size)) { fault[pc.fslot] = 1u; return; }
     o[i] = src[off1(i) + int(id) * pc.src_dim_stride];
 }
 "#;
@@ -681,7 +682,7 @@ pub fn k_scatter(wg: usize, add: bool) -> String {
     };
     s += &format!(
         r#"
-layout(push_constant) uniform PC {{ int n; int n_j; int ids_ds; int src_ds; int dst_ds; int dim_size; }} pc;
+layout(push_constant) uniform PC {{ int n; int n_j; int ids_ds; int src_ds; int dst_ds; int dim_size; int fslot; }} pc;
 layout(local_size_x = WG) in;
 void main() {{
     int i = gid();
@@ -691,7 +692,7 @@ void main() {{
     int d = off2(i);
     for (int j = 0; j < pc.n_j; j++) {{
         uint id = ids[a + j * pc.ids_ds];
-        if (id >= uint(pc.dim_size)) {{ fault[0] = 1u; continue; }}
+        if (id >= uint(pc.dim_size)) {{ fault[pc.fslot] = 1u; continue; }}
         {ty} v = src[b + j * pc.src_ds];
         {write}
     }}
@@ -711,7 +712,7 @@ pub fn k_index_add(wg: usize) -> String {
     s += &buf(2, "float", "src", true);
     s += &buf(3, "uint", "fault", false);
     s += r#"
-layout(push_constant) uniform PC { int n_lr; int left; int n_ids; int right; int dim_size; int src_off; int ids_off; } pc;
+layout(push_constant) uniform PC { int n_lr; int left; int n_ids; int right; int dim_size; int src_off; int ids_off; int fslot; } pc;
 layout(local_size_x = WG) in;
 void main() {
     int i = gid();
@@ -720,7 +721,7 @@ void main() {
     int l = i / pc.right;
     for (int j = 0; j < pc.n_ids; j++) {
         uint id = ids[pc.ids_off + j];
-        if (id >= uint(pc.dim_size)) { fault[0] = 1u; continue; }
+        if (id >= uint(pc.dim_size)) { fault[pc.fslot] = 1u; continue; }
         dst[(l * pc.dim_size + int(id)) * pc.right + r] += src[pc.src_off + (l * pc.n_ids + j) * pc.right + r];
     }
 }
@@ -1276,6 +1277,35 @@ void main() {
     s
 }
 
+/// Half-precision embedding gather: `O[j, :] = f32(W[ids[j], :])` for an
+/// f16 / bf16 `[vocab, K]` table, one invocation per output element.
+/// Push: `n, K, is_bf16, ids_off, vocab, fslot`.
+pub fn k_hembed(wg: usize) -> String {
+    let mut s = prelude(wg, 4);
+    s += &buf(0, "uint", "W", true);
+    s += &buf(1, "uint", "ids", true);
+    s += &buf(2, "float", "O", false);
+    s += &buf(3, "uint", "fault", false);
+    s += r#"
+float h_at(int e, int bf16) {
+    uint v = (W[e >> 1] >> (uint(e & 1) * 16u)) & 0xFFFFu;
+    return bf16 != 0 ? uintBitsToFloat(v << 16u) : unpackHalf2x16(v).x;
+}
+layout(push_constant) uniform PC { int n; int K; int is_bf16; int ids_off; int vocab; int fslot; } pc;
+layout(local_size_x = WG) in;
+void main() {
+    int i = gid();
+    if (i >= pc.n) return;
+    int j = i / pc.K;
+    int c = i - j * pc.K;
+    uint id = ids[pc.ids_off + j];
+    if (id >= uint(pc.vocab)) { fault[pc.fslot] = 1u; return; }
+    O[i] = h_at(int(id) * pc.K + c, pc.is_bf16);
+}
+"#;
+    s
+}
+
 /// Quantized embedding gather: `O[j, :] = dequant(W[ids[j], :])`, one
 /// work-group per row striding over sub-blocks.
 /// Push: `n_ids, K, qt, qk, bsz, ids_off, vocab`.
@@ -1287,14 +1317,14 @@ pub fn k_qembed(wg: usize) -> String {
     s += &buf(3, "uint", "fault", false);
     s += QUANT_FN;
     s += r#"
-layout(push_constant) uniform PC { int n_ids; int K; int qt; int qk; int bsz; int ids_off; int vocab; } pc;
+layout(push_constant) uniform PC { int n_ids; int K; int qt; int qk; int bsz; int ids_off; int vocab; int fslot; } pc;
 layout(local_size_x = WG) in;
 void main() {
     int j = grow();
     int t = int(gl_LocalInvocationID.x);
     if (j >= pc.n_ids) return;
     uint id = ids[pc.ids_off + j];
-    if (id >= uint(pc.vocab)) { fault[0] = 1u; return; }
+    if (id >= uint(pc.vocab)) { fault[pc.fslot] = 1u; return; }
     int spb = pc.qk / 32;
     int nsub = pc.K / 32;
     uint row = id * uint(pc.K / pc.qk) * uint(pc.bsz);

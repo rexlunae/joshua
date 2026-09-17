@@ -257,8 +257,9 @@ pub struct Exec {
     params_mem: vk::DeviceMemory,
     params_map: *mut u8,
     params_off: usize,
-    /// The device's fault word (see `glsl.rs`): indexing kernels set it on
-    /// an out-of-range id; [`Exec::take_fault`] reads and clears it.
+    /// The device's fault buffer (see `glsl.rs`, one word per thread slot
+    /// of `crate::fault_slot`): indexing kernels set the calling thread's
+    /// slot on an out-of-range id; [`Exec::take_fault`] reads and clears it.
     fault_buf: vk::Buffer,
     fault_mem: vk::DeviceMemory,
     fault_map: *mut u8,
@@ -453,10 +454,11 @@ impl Exec {
         Buf { buffer: self.fault_buf, bytes: FAULT_BYTES as u64 }
     }
 
-    /// Whether an indexing kernel flagged an out-of-range id since the last
-    /// call (the flag is cleared).  Meaningful after a flush.
+    /// Whether an indexing kernel launched by this thread flagged an
+    /// out-of-range id since the last call (the flag is cleared).
+    /// Meaningful after a flush.
     pub(super) fn take_fault(&mut self) -> bool {
-        let p = self.fault_map as *mut u32;
+        let p = unsafe { (self.fault_map as *mut u32).add(crate::fault_slot::current()) };
         let v = unsafe { std::ptr::read_volatile(p) };
         if v != 0 {
             unsafe { std::ptr::write_volatile(p, 0) };
@@ -465,8 +467,8 @@ impl Exec {
     }
 }
 
-/// Size of the fault buffer (one word, padded to a safe allocation size).
-const FAULT_BYTES: usize = 256;
+/// Size of the fault buffer (one word per thread slot).
+const FAULT_BYTES: usize = crate::fault_slot::BYTES;
 
 /// A small host-visible buffer bound to its own allocation and mapped.
 fn host_buffer(device: &ash::Device, size: u64, mem_type: u32, what: &str) -> Result<(vk::Buffer, vk::DeviceMemory, *mut u8)> {
@@ -861,15 +863,20 @@ pub fn run_reduce_generic(d: &VulkanDevice, op: i32, x: Buf, out: Buf, n: usize,
 
 // ─── Indexing ────────────────────────────────────────────────────────────────
 
+/// The calling thread's fault slot, as a push constant.
+fn fslot() -> i32 {
+    crate::fault_slot::current() as i32
+}
+
 pub fn run_index_select(d: &VulkanDevice, elem8: bool, ids_i64: bool, src: Buf, ids: Buf, out: Buf, n: usize, left: usize, n_ids: usize, right: usize, dim_size: usize, src_off: usize, ids_off: usize) -> Result<()> {
-    let push = Push::default().us(n)?.us(left)?.us(n_ids)?.us(right)?.us(dim_size)?.us(src_off)?.us(ids_off)?;
+    let push = Push::default().us(n)?.us(left)?.us(n_ids)?.us(right)?.us(dim_size)?.us(src_off)?.us(ids_off)?.i(fslot());
     let lim = d.limits();
     let key = format!("index_select_{}_{}", if ids_i64 { "i64" } else { "u32" }, if elem8 { 8 } else { 4 });
     d.launch(&key, |wg| glsl::k_index_select(wg, elem8, ids_i64), &[src, ids, out, d.fault_buf()], push, &[], grid(n, lim.wg, 1, lim.max_groups_x))
 }
 
 pub fn run_gather(d: &VulkanDevice, src: Buf, ids: Buf, out: Buf, n: usize, ix: Idx, src_dim_stride: usize, dim_size: usize) -> Result<()> {
-    let push = Push::default().us(n)?.us(src_dim_stride)?.us(dim_size)?;
+    let push = Push::default().us(n)?.us(src_dim_stride)?.us(dim_size)?.i(fslot());
     let lim = d.limits();
     d.launch("gather_4", glsl::k_gather, &[src, ids, out, d.fault_buf()], push, &[ix], grid(n, lim.wg, 1, lim.max_groups_x))
 }
@@ -878,7 +885,7 @@ pub fn run_gather(d: &VulkanDevice, src: Buf, ids: Buf, out: Buf, n: usize, ix: 
 /// (s0 ids, s1 src, s2 dst with the dim stride zeroed); the `*_ds` are the
 /// strides along `dim`.
 pub fn run_scatter(d: &VulkanDevice, add: bool, dst: Buf, ids: Buf, src: Buf, n: usize, ix: Idx, n_j: usize, ids_ds: usize, src_ds: usize, dst_ds: usize, dim_size: usize) -> Result<()> {
-    let push = Push::default().us(n)?.us(n_j)?.us(ids_ds)?.us(src_ds)?.us(dst_ds)?.us(dim_size)?;
+    let push = Push::default().us(n)?.us(n_j)?.us(ids_ds)?.us(src_ds)?.us(dst_ds)?.us(dim_size)?.i(fslot());
     let lim = d.limits();
     let key = if add { "scatter_add_f32" } else { "scatter_set_4" };
     d.launch(key, |wg| glsl::k_scatter(wg, add), &[dst, ids, src, d.fault_buf()], push, &[ix], grid(n, lim.wg, 1, lim.max_groups_x))
@@ -886,7 +893,7 @@ pub fn run_scatter(d: &VulkanDevice, add: bool, dst: Buf, ids: Buf, src: Buf, n:
 
 pub fn run_index_add(d: &VulkanDevice, dst: Buf, ids: Buf, src: Buf, left: usize, n_ids: usize, right: usize, dim_size: usize, src_off: usize, ids_off: usize) -> Result<()> {
     let n_lr = left * right;
-    let push = Push::default().us(n_lr)?.us(left)?.us(n_ids)?.us(right)?.us(dim_size)?.us(src_off)?.us(ids_off)?;
+    let push = Push::default().us(n_lr)?.us(left)?.us(n_ids)?.us(right)?.us(dim_size)?.us(src_off)?.us(ids_off)?.i(fslot());
     let lim = d.limits();
     d.launch("index_add_f32", glsl::k_index_add, &[dst, ids, src, d.fault_buf()], push, &[], grid(n_lr, lim.wg, 1, lim.max_groups_x))
 }
@@ -1022,9 +1029,17 @@ pub fn run_dequant(d: &VulkanDevice, dtype: crate::quantized::GgmlDType, w: Buf,
     }
 }
 
+/// Gather rows of an f16 / bf16 `[vocab, K]` table into f32 `[n_ids, K]`.
+pub fn run_hembed(d: &VulkanDevice, bf16: bool, w: Buf, ids: Buf, out: Buf, n_ids: usize, k: usize, vocab: usize, ids_off: usize) -> Result<()> {
+    let n = n_ids * k;
+    let push = Push::default().us(n)?.us(k)?.i(bf16 as i32).us(ids_off)?.us(vocab)?.i(fslot());
+    let lim = d.limits();
+    d.launch("hembed", glsl::k_hembed, &[w, ids, out, d.fault_buf()], push, &[], grid(n, lim.wg, 1, lim.max_groups_x))
+}
+
 /// Gather rows of a block-quantized `[vocab, K]` table into f32 `[n_ids, K]`.
 pub fn run_qembed(d: &VulkanDevice, dtype: crate::quantized::GgmlDType, w: Buf, ids: Buf, out: Buf, n_ids: usize, k: usize, vocab: usize, ids_off: usize) -> Result<()> {
-    let push = Push::default().us(n_ids)?.us(k)?.i(qtype_code(dtype)).us(dtype.block_size())?.us(dtype.type_size())?.us(ids_off)?.us(vocab)?;
+    let push = Push::default().us(n_ids)?.us(k)?.i(qtype_code(dtype)).us(dtype.block_size())?.us(dtype.type_size())?.us(ids_off)?.us(vocab)?.i(fslot());
     let lim = d.limits();
     d.launch("qembed", glsl::k_qembed, &[w, ids, out, d.fault_buf()], push, &[], row_grid(n_ids, 1, lim.max_groups_x))
 }

@@ -97,11 +97,16 @@ INFO joshua: Vulkan device: AMD Radeon Graphics (RADV RENOIR) (host-unified memo
   host, candle's CPU kernel runs and the result goes up.
 * An out-of-range id in `index_select`, `gather`, `scatter`, `index_add` or
   an embedding gather cannot raise an error inside a kernel.  The kernel
-  skips the element and sets a per-device fault word instead, which the
-  host checks and clears at the next read-back or `synchronize` and reports
-  as an error there.  Nothing is read or written out of bounds and a bad id
-  never becomes a plausible result; the error surfaces at the point where
-  the CPU backend's error for the same input would have been observed.
+  skips the element and sets a fault word instead, which the host checks
+  and clears at the next read-back or `synchronize` and reports as an error
+  there.  Nothing is read or written out of bounds and a bad id never
+  becomes a plausible result; the error surfaces at the point where the CPU
+  backend's error for the same input would have been observed.  The fault
+  buffer holds one word per thread (a request's launches and read-backs
+  run on the same thread), so concurrent requests sharing the device never
+  see each other's faults.
+* F16 / BF16 embedding tables are gathered row by row by a half-precision
+  kernel, like the block-quantized ones; no table is ever expanded to f32.
 * naga's GLSL front end has no atomics, so the Vulkan scatter kernels walk
   the scattered dimension sequentially per output position (deterministic,
   same result as the CPU loop), and 1- and 2-byte outputs are written a

@@ -331,10 +331,12 @@ pub struct Ctx {
     pub context: usize,
     pub device: usize,
     pub queue: usize,
-    /// The device's fault word (see `kernels.cl`): indexing kernels set it
-    /// on an out-of-range id; the host reports and clears it at the next
-    /// read-back.
+    /// The device's fault buffer (see `kernels.cl`): indexing kernels set
+    /// the calling thread's slot on an out-of-range id; the host reports
+    /// and clears it at the next read-back.
     pub fault: usize,
+    /// The calling thread's slot in `fault`.
+    pub fslot: i32,
 }
 
 impl Ctx {
@@ -589,14 +591,14 @@ pub fn run_index_select(c: &Ctx, elem8: bool, ids_i64: bool, src: usize, ids: us
         (true, true) => return Err(Error::Msg("opencl: i64 ids with 8-byte elements has no kernel".into())),
     };
     let mut k = c.kernel(name)?;
-    k.buf(src)?.buf(ids)?.buf(out)?.val(to_i32(n)?)?.val(to_i32(left)?)?.val(to_i32(n_ids)?)?.val(to_i32(right)?)?.val(to_i32(dim_size)?)?.val(to_i32(src_off)?)?.val(to_i32(ids_off)?)?.buf(c.fault)?;
+    k.buf(src)?.buf(ids)?.buf(out)?.val(to_i32(n)?)?.val(to_i32(left)?)?.val(to_i32(n_ids)?)?.val(to_i32(right)?)?.val(to_i32(dim_size)?)?.val(to_i32(src_off)?)?.val(to_i32(ids_off)?)?.buf(c.fault)?.val(c.fslot)?;
     k.run(&[n], None)
 }
 
 #[allow(clippy::too_many_arguments)]
 pub fn run_gather(c: &Ctx, src: usize, ids: usize, out: usize, n: usize, ix: Idx, src_dim_stride: usize, dim_size: usize) -> Result<()> {
     let mut k = c.kernel("k_gather_4")?;
-    k.buf(src)?.buf(ids)?.buf(out)?.val(to_i32(n)?)?.val(ix)?.val(to_i32(src_dim_stride)?)?.val(to_i32(dim_size)?)?.buf(c.fault)?;
+    k.buf(src)?.buf(ids)?.buf(out)?.val(to_i32(n)?)?.val(ix)?.val(to_i32(src_dim_stride)?)?.val(to_i32(dim_size)?)?.buf(c.fault)?.val(c.fslot)?;
     k.run(&[n], None)
 }
 
@@ -606,7 +608,7 @@ pub fn run_gather(c: &Ctx, src: usize, ids: usize, out: usize, n: usize, ix: Idx
 #[allow(clippy::too_many_arguments)]
 pub fn run_scatter(c: &Ctx, add: bool, dst: usize, ids: usize, src: usize, n: usize, ix: Idx, n_j: usize, ids_ds: usize, src_ds: usize, dst_ds: usize, dim_size: usize) -> Result<()> {
     let mut k = c.kernel(if add { "k_scatter_add_f32" } else { "k_scatter_set_4" })?;
-    k.buf(dst)?.buf(ids)?.buf(src)?.val(to_i32(n)?)?.val(ix)?.val(to_i32(n_j)?)?.val(to_i32(ids_ds)?)?.val(to_i32(src_ds)?)?.val(to_i32(dst_ds)?)?.val(to_i32(dim_size)?)?.buf(c.fault)?;
+    k.buf(dst)?.buf(ids)?.buf(src)?.val(to_i32(n)?)?.val(ix)?.val(to_i32(n_j)?)?.val(to_i32(ids_ds)?)?.val(to_i32(src_ds)?)?.val(to_i32(dst_ds)?)?.val(to_i32(dim_size)?)?.buf(c.fault)?.val(c.fslot)?;
     k.run(&[n], None)
 }
 
@@ -614,7 +616,7 @@ pub fn run_scatter(c: &Ctx, add: bool, dst: usize, ids: usize, src: usize, n: us
 pub fn run_index_add(c: &Ctx, dst: usize, ids: usize, src: usize, left: usize, n_ids: usize, right: usize, dim_size: usize, src_off: usize, ids_off: usize) -> Result<()> {
     let mut k = c.kernel("k_index_add_f32")?;
     let n_lr = left * right;
-    k.buf(dst)?.buf(ids)?.buf(src)?.val(to_i32(n_lr)?)?.val(to_i32(left)?)?.val(to_i32(n_ids)?)?.val(to_i32(right)?)?.val(to_i32(dim_size)?)?.val(to_i32(src_off)?)?.val(to_i32(ids_off)?)?.buf(c.fault)?;
+    k.buf(dst)?.buf(ids)?.buf(src)?.val(to_i32(n_lr)?)?.val(to_i32(left)?)?.val(to_i32(n_ids)?)?.val(to_i32(right)?)?.val(to_i32(dim_size)?)?.val(to_i32(src_off)?)?.val(to_i32(ids_off)?)?.buf(c.fault)?.val(c.fslot)?;
     k.run(&[n_lr], None)
 }
 
@@ -770,6 +772,17 @@ pub fn run_dequant(c: &Ctx, dtype: crate::quantized::GgmlDType, w: usize, out: u
     }
 }
 
+/// Gather rows of an f16 / bf16 `[vocab, K]` table into f32 `[n_ids, K]`.
+#[allow(clippy::too_many_arguments)]
+pub fn run_hembed(c: &Ctx, bf16: bool, w: usize, ids: usize, out: usize, n_ids: usize, k: usize, vocab: usize, woff: u64, ids_off: usize) -> Result<()> {
+    let n = n_ids * k;
+    let mut kn = c.kernel("k_hembed")?;
+    kn.buf(w)?.buf(ids)?.buf(out)?
+        .val(to_i32(n)?)?.val(to_i32(k)?)?.val(bf16 as i32)?
+        .val(woff)?.val(to_i32(ids_off)?)?.val(to_i32(vocab)?)?.buf(c.fault)?.val(c.fslot)?;
+    kn.run(&[n], None)
+}
+
 /// Gather rows of a block-quantized `[vocab, K]` table into f32 `[n_ids, K]`.
 #[allow(clippy::too_many_arguments)]
 pub fn run_qembed(c: &Ctx, dtype: crate::quantized::GgmlDType, w: usize, ids: usize, out: usize, n_ids: usize, k: usize, vocab: usize, woff: u64, ids_off: usize) -> Result<()> {
@@ -778,6 +791,6 @@ pub fn run_qembed(c: &Ctx, dtype: crate::quantized::GgmlDType, w: usize, ids: us
     kn.buf(w)?.buf(ids)?.buf(out)?
         .val(to_i32(n_ids)?)?.val(to_i32(k)?)?
         .val(qtype_code(dtype))?.val(to_i32(dtype.block_size())?)?.val(to_i32(dtype.type_size())?)?
-        .val(woff)?.val(to_i32(ids_off)?)?.val(to_i32(vocab)?)?.buf(c.fault)?;
+        .val(woff)?.val(to_i32(ids_off)?)?.val(to_i32(vocab)?)?.buf(c.fault)?.val(c.fslot)?;
     kn.run(&[n_ids * wg], Some(&[wg]))
 }

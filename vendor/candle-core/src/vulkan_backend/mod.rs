@@ -405,10 +405,10 @@ impl VulkanDevice {
         self.exec().fault()
     }
 
-    /// Report (and clear) an out-of-range id an indexing kernel flagged in
-    /// the batches completed so far.  Called at every host read-back and
-    /// `synchronize`, the points where the CPU backend's error for the same
-    /// input would have been observed.
+    /// Report (and clear) an out-of-range id an indexing kernel launched by
+    /// this thread flagged in the batches completed so far.  Called at
+    /// every host read-back and `synchronize`, the points where the CPU
+    /// backend's error for the same input would have been observed.
     pub fn check_fault(&self) -> Result<()> {
         if self.exec().take_fault() {
             return Err(Error::Msg(
@@ -1514,8 +1514,7 @@ impl QVulkanStorage {
                 kernels::run_index_select(dev, false, false, self.inner.buf(), ids_s.buf(), out.buf(), n_ids * hidden, 1, n_ids, hidden, rows, 0, ids_off)?;
             }
             GgmlDType::F16 | GgmlDType::BF16 => {
-                let w = self.dequantize(rows * hidden)?;
-                kernels::run_index_select(dev, false, false, w.buf(), ids_s.buf(), out.buf(), n_ids * hidden, 1, n_ids, hidden, rows, 0, ids_off)?;
+                kernels::run_hembed(dev, self.dtype == GgmlDType::BF16, self.inner.buf(), ids_s.buf(), out.buf(), n_ids, hidden, rows, ids_off)?;
             }
             _ => kernels::run_qembed(dev, self.dtype, self.inner.buf(), ids_s.buf(), out.buf(), n_ids, hidden, rows, ids_off)?,
         }
@@ -1769,6 +1768,28 @@ mod tests {
             let q_onto = crate::quantized::QTensor::quantize_imatrix_onto(&x, &w, dtype, &dev)?;
             assert_eq!(q_cpu.data()?.as_ref(), q_onto.data()?.as_ref(), "{dtype:?}: imatrix blocks (onto)");
         }
+        Ok(())
+    }
+
+    /// A fault raised by one thread's launch is reported to that thread only:
+    /// a thread doing valid work on the same device never sees it.
+    #[test]
+    fn vulkan_fault_is_per_thread() -> crate::Result<()> {
+        let Some(dev) = device() else { return Ok(()) };
+        let cpu = Device::Cpu;
+        let x = Tensor::arange(0f32, 32f32, &cpu)?.reshape((4, 8))?.to_device(&dev)?;
+        let bad = Tensor::new(&[1u32, 9], &dev)?;
+        let good = Tensor::new(&[1u32, 3], &dev)?;
+        let faulty = std::thread::spawn({
+            let (x, bad, cpu) = (x.clone(), bad.clone(), cpu.clone());
+            move || (0..20).all(|_| x.index_select(&bad, 0).and_then(|t| t.to_device(&cpu)).is_err())
+        });
+        let clean = std::thread::spawn({
+            let (x, good, cpu) = (x.clone(), good.clone(), cpu.clone());
+            move || (0..200).all(|_| x.index_select(&good, 0).and_then(|t| t.to_device(&cpu)).is_ok())
+        });
+        assert!(faulty.join().unwrap(), "the faulting thread must see its error every time");
+        assert!(clean.join().unwrap(), "the clean thread must never see another thread's fault");
         Ok(())
     }
 }
