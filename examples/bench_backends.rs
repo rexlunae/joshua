@@ -1,18 +1,20 @@
 //! Cross-backend throughput benchmark: CPU vs OpenCL vs Vulkan.
 //!
 //! Runs the same LLM-shaped ops on a chosen device and reports ms/op and an
-//! effective decode tokens/s. The decode path is dominated by
-//! `(1, H) @ (H, H)` dense matmuls, so per-token latency ~ decode_matmul_ms.
+//! effective decode tokens/s.  The decode path of a quantized model is
+//! dominated by `(1, H) · Wᵀ` matmuls against block-quantized weights, so
+//! the quantized figures are the ones that predict per-token latency; the
+//! f32 GEMM figures show raw compute.
 //!
 //! Usage:
 //!   cargo run --release --features opencl,vulkan --example bench_backends -- \
 //!       --device cpu|opencl|vulkan [--H 4096] [--seq 512] [--iters 50]
 //!
-//! Native kernels for opencl/vulkan are gated by JOSHUA_OPENCL_NATIVE /
-//! JOSHUA_VULKAN_NATIVE; set the relevant one (or leave unset to measure the
-//! CPU-fallback path).
+//! Native kernels run by default on opencl/vulkan; `JOSHUA_OPENCL_NATIVE=0` /
+//! `JOSHUA_VULKAN_NATIVE=0` measure the CPU round-trip path instead.
 
-use candle_core::{Device, Tensor};
+use candle_core::quantized::{GgmlDType, QMatMul, QStorage, QTensor};
+use candle_core::{Device, Module, Tensor};
 
 fn main() -> anyhow::Result<()> {
     let mut device = "cpu".to_string();
@@ -64,10 +66,54 @@ fn main() -> anyhow::Result<()> {
             return Ok(());
         }
     };
+    println!("backend: {device}  H={h} seq={seq} iters={iters}");
+    #[cfg(feature = "opencl")]
+    if dev.is_opencl() {
+        println!("  (opencl native kernels: {})", candle_core::opencl_backend::native_enabled());
+    }
+    #[cfg(feature = "vulkan")]
+    if dev.is_vulkan() {
+        println!("  (vulkan native kernels: {})", candle_core::vulkan_backend::native_enabled());
+    }
+
+    // ---- Quantized matmuls: what a GGUF model actually runs. ----
+    let wq_v: Vec<f32> = (0..h * h).map(|i| ((i % 11) as f32 - 5.0) * 0.25).collect();
+    let wq = QTensor::quantize(&Tensor::from_vec(wq_v, (h, h), &Device::Cpu)?, GgmlDType::Q4K)?;
+    let wq_bytes = wq.data()?.into_owned();
+    let wq = QMatMul::from_qtensor(QTensor::new(
+        QStorage::from_data(std::borrow::Cow::Borrowed(&wq_bytes), &dev, GgmlDType::Q4K)?,
+        (h, h),
+    )?)?;
+    let xq_v: Vec<f32> = (0..h).map(|i| ((i % 17) as f32 - 8.0) * 0.5).collect();
+    let xq = Tensor::from_vec(xq_v, (1, h), &dev)?;
+    let _ = wq.forward(&xq)?;
+    candle_core::Device::synchronize(&dev)?;
+    let start = std::time::Instant::now();
+    for _ in 0..iters {
+        let c = wq.forward(&xq)?;
+        candle_core::Device::synchronize(&dev)?;
+        drop(c);
+    }
+    let qdec_ms = start.elapsed().as_secs_f64() * 1000.0 / iters as f64;
     println!(
-        "backend: {device}  H={h} seq={seq} iters={iters}\n  (native kernels: {} opencl / {} vulkan)",
-        std::env::var("JOSHUA_OPENCL_NATIVE").unwrap_or_default(),
-        std::env::var("JOSHUA_VULKAN_NATIVE").unwrap_or_default(),
+        "  q4_k decode (1,{h})·W^T: {qdec_ms:.3} ms/op -> ~{:.1} t/s (ref: 6 matmuls/token), {:.1} GB/s of weights",
+        1000.0 / (qdec_ms * 6.0),
+        (h * h) as f64 * 0.5625 / (qdec_ms / 1000.0) / 1e9
+    );
+    let xp_v: Vec<f32> = (0..seq * h).map(|i| ((i % 13) as f32 - 6.0) * 0.4).collect();
+    let xp = Tensor::from_vec(xp_v, (seq, h), &dev)?;
+    let _ = wq.forward(&xp)?;
+    candle_core::Device::synchronize(&dev)?;
+    let start = std::time::Instant::now();
+    for _ in 0..iters {
+        let c = wq.forward(&xp)?;
+        candle_core::Device::synchronize(&dev)?;
+        drop(c);
+    }
+    let qpre_ms = start.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+    println!(
+        "  q4_k prefill ({seq},{h})·W^T: {qpre_ms:.3} ms/op, {:.1} GFLOPS",
+        2.0 * seq as f64 * h as f64 * h as f64 / (qpre_ms / 1000.0) / 1e9
     );
 
     // ---- Decode-shaped matmul: (1, H) @ (H, H) — the per-token cost. ----

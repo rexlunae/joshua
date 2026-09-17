@@ -42,9 +42,6 @@ impl OpenClDevice {
     pub fn id(&self) -> DeviceId {
         DeviceId(0)
     }
-    pub fn storage_from_cpu_storage(&self, _: &CpuStorage) -> Result<OpenClStorage> {
-        Err(Error::NotCompiledWithOpenClSupport)
-    }
 }
 
 impl crate::backend::BackendStorage for OpenClStorage {
@@ -329,3 +326,43 @@ pub fn gemm_reduced_precision_f32() -> bool {
 /// This bool controls whether reduced precision reductions (e.g., with fp16 accumulation type) are
 /// allowed with f32 GEMMs.
 pub fn set_gemm_reduced_precision_f32(_b: bool) {}
+
+/// Block-quantized OpenCL storage stub (the `opencl` feature is off).
+#[derive(Debug)]
+pub struct QOpenClStorage {
+    pub elem_count: usize,
+    pub device: OpenClDevice,
+}
+
+impl QOpenClStorage {
+    pub fn zeros(_: &OpenClDevice, _: usize, _: crate::quantized::GgmlDType) -> Result<Self> {
+        Err(Error::NotCompiledWithOpenClSupport)
+    }
+    pub fn from_bytes(_: &OpenClDevice, _: crate::quantized::GgmlDType, _: usize, _: &[u8]) -> Result<Self> {
+        Err(Error::NotCompiledWithOpenClSupport)
+    }
+    pub fn dtype(&self) -> crate::quantized::GgmlDType {
+        fail!()
+    }
+    pub fn device(&self) -> &OpenClDevice {
+        &self.device
+    }
+    pub fn storage_size_in_bytes(&self) -> usize {
+        fail!()
+    }
+    pub fn is_zero_copy(&self) -> bool {
+        false
+    }
+    pub fn data(&self) -> Result<Vec<u8>> {
+        Err(Error::NotCompiledWithOpenClSupport)
+    }
+    pub fn dequantize(&self, _: usize) -> Result<OpenClStorage> {
+        Err(Error::NotCompiledWithOpenClSupport)
+    }
+    pub fn fwd(&self, _: &Shape, _: &OpenClStorage, _: &Layout) -> Result<(OpenClStorage, Shape)> {
+        Err(Error::NotCompiledWithOpenClSupport)
+    }
+    pub fn embedding(&self, _: usize, _: usize, _: &OpenClStorage, _: &Layout) -> Result<OpenClStorage> {
+        Err(Error::NotCompiledWithOpenClSupport)
+    }
+}

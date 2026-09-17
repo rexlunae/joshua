@@ -42,9 +42,6 @@ impl VulkanDevice {
     pub fn id(&self) -> DeviceId {
         DeviceId(0)
     }
-    pub fn storage_from_cpu_storage(&self, _: &CpuStorage) -> Result<VulkanStorage> {
-        Err(Error::NotCompiledWithVulkanSupport)
-    }
 }
 
 impl crate::backend::BackendStorage for VulkanStorage {
@@ -329,3 +326,43 @@ pub fn gemm_reduced_precision_f32() -> bool {
 /// This bool controls whether reduced precision reductions (e.g., with fp16 accumulation type) are
 /// allowed with f32 GEMMs.
 pub fn set_gemm_reduced_precision_f32(_b: bool) {}
+
+/// Block-quantized Vulkan storage stub (the `vulkan` feature is off).
+#[derive(Debug)]
+pub struct QVulkanStorage {
+    pub elem_count: usize,
+    pub device: VulkanDevice,
+}
+
+impl QVulkanStorage {
+    pub fn zeros(_: &VulkanDevice, _: usize, _: crate::quantized::GgmlDType) -> Result<Self> {
+        Err(Error::NotCompiledWithVulkanSupport)
+    }
+    pub fn from_bytes(_: &VulkanDevice, _: crate::quantized::GgmlDType, _: usize, _: &[u8]) -> Result<Self> {
+        Err(Error::NotCompiledWithVulkanSupport)
+    }
+    pub fn dtype(&self) -> crate::quantized::GgmlDType {
+        fail!()
+    }
+    pub fn device(&self) -> &VulkanDevice {
+        &self.device
+    }
+    pub fn elem_count(&self) -> usize {
+        self.elem_count
+    }
+    pub fn storage_size_in_bytes(&self) -> usize {
+        fail!()
+    }
+    pub fn data(&self) -> Result<Vec<u8>> {
+        Err(Error::NotCompiledWithVulkanSupport)
+    }
+    pub fn dequantize(&self, _: usize) -> Result<VulkanStorage> {
+        Err(Error::NotCompiledWithVulkanSupport)
+    }
+    pub fn fwd(&self, _: &Shape, _: &VulkanStorage, _: &Layout) -> Result<(VulkanStorage, Shape)> {
+        Err(Error::NotCompiledWithVulkanSupport)
+    }
+    pub fn embedding(&self, _: usize, _: usize, _: &VulkanStorage, _: &Layout) -> Result<VulkanStorage> {
+        Err(Error::NotCompiledWithVulkanSupport)
+    }
+}

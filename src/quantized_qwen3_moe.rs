@@ -771,11 +771,8 @@ fn split_experts<R: Read + Seek>(
 
     // GPU paging path: keep each expert's quantized block compressed in the
     // mmap and upload it to the device on demand through the bounded cache,
-    // instead of copying every expert up front.  Only for block-capable
-    // devices (Metal/CUDA); OpenCL and Vulkan cannot host quantized blocks yet
-    // (OpenClStorage / VulkanStorage are f32-dense), so they keep the
-    // eager-copy path below.
-    if !host_experts && !rd.expert_device.is_opencl() && !rd.expert_device.is_vulkan() {
+    // instead of copying every expert up front.
+    if !host_experts {
         if let (Some(per_bytes), Some(cache)) = (et.bytes_per_expert(), rd.gpu_cache.clone()) {
             let (out, inn) = et.expert_shape();
             let mut paged = Vec::with_capacity(n_expert);

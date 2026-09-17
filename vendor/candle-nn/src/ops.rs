@@ -336,53 +336,59 @@ impl candle::CustomOp1 for SoftmaxLastDim {
         layout: &Layout,
     ) -> Result<(candle::VulkanStorage, Shape)> {
         use candle::backend::{BackendDevice, BackendStorage};
-        use candle::{CpuStorage, D, Device, DType, Tensor};
-
-        // Only F32 has a native Vulkan kernel path (the elementwise/reduce kernels
-        // are F32); any other dtype falls back to the correct CPU round-trip.
-        if storage.dtype() != DType::F32 {
-            let cpu = storage.to_cpu_storage()?;
-            let (out, shape) = self.cpu_fwd(&cpu, layout)?;
-            let dev = storage.device.clone();
-            return Ok((dev.storage_from_cpu_storage(&out)?, shape));
-        }
-
-        // Build a contiguous on-device input tensor from the storage, run the
-        // softmax as a chain of candle ops (each executes on the Vulkan device's
-        // native kernels), and hand the on-device result back.
-        let cpu = storage.to_cpu_storage()?;
-        let dims = layout.shape().dims().to_vec();
-        // A contiguous view can start partway through the backing storage; match
-        // cpu_fwd's contract by uploading only the view's range.
-        let (o1, o2) = match layout.contiguous_offsets() {
-            Some(offsets) => offsets,
-            None => candle::bail!("vulkan softmax-last-dim: input has to be contiguous"),
-        };
-        let device = Device::Vulkan(storage.device.clone());
-        let xs = match &cpu {
-            CpuStorage::F32(d) => Tensor::from_vec(d[o1..o2].to_vec(), dims.clone(), &device)?,
-            _ => candle::bail!("vulkan softmax-last-dim: unsupported dtype {:?}", cpu),
-        };
-        // xs.max/sum over the last dim use the native last-dim reduction; the
-        // broadcasted operands are materialized to full shape so the elementwise
-        // sub/exp/div run on equal-size (native) buffers, keeping compute on-device.
-        let max = xs.max(D::Minus1)?.unsqueeze(D::Minus1)?;
-        let max = max.broadcast_as(dims.clone())?.contiguous()?;
-        let e = xs.sub(&max)?.exp()?;
-        let sum = e.sum(D::Minus1)?.unsqueeze(D::Minus1)?;
-        let sum = sum.broadcast_as(dims.clone())?.contiguous()?;
-        let out = e.broadcast_div(&sum)?;
-        let out = out.contiguous()?;
-        let (out_storage, out_layout) = out.storage_and_layout();
-        match &*out_storage {
-            candle::Storage::Vulkan(vs) => {
-                // The op machinery needs an owned storage; VulkanStorage is not
-                // Clone (it wraps a device buffer), so copy device-to-device.
-                let vs = vs.try_clone(&out_layout)?;
-                Ok((vs, Shape::from_dims(&dims)))
+        use candle::vulkan_backend::kernels;
+        // One fused kernel per row; the input only needs to be contiguous.
+        if storage.dtype() == DType::F32 && kernels::native_enabled() {
+            if let Some((o1, _)) = layout.contiguous_offsets() {
+                let dims = layout.shape().dims();
+                let cols = dims.last().copied().unwrap_or(0);
+                if cols > 0 {
+                    let rows = layout.shape().elem_count() / cols;
+                    let out = storage.device.alloc(DType::F32, rows * cols)?;
+                    match kernels::run_softmax_last(&storage.device, storage.buf(), out.buf(), rows, cols, o1) {
+                        Ok(()) => return Ok((out, layout.shape().clone())),
+                        Err(e) => kernels::note_fallback("softmax_last_dim", Some(&e)),
+                    }
+                }
+            } else {
+                kernels::note_fallback("softmax_last_dim", None);
             }
-            _ => candle::bail!("vulkan softmax-last-dim produced non-vulkan storage"),
         }
+        let cpu = storage.to_cpu_storage()?;
+        let (out, shape) = self.cpu_fwd(&cpu, layout)?;
+        let dev = storage.device.clone();
+        Ok((dev.storage_from_cpu_storage(&out)?, shape))
+    }
+
+    #[cfg(feature = "opencl")]
+    fn opencl_fwd(
+        &self,
+        storage: &candle::OpenClStorage,
+        layout: &Layout,
+    ) -> Result<(candle::OpenClStorage, Shape)> {
+        use candle::backend::{BackendDevice, BackendStorage};
+        use candle::opencl_backend::kernels;
+        // One fused kernel per row; the input only needs to be contiguous.
+        if storage.dtype() == DType::F32 && kernels::native_enabled() {
+            if let Some((o1, _)) = layout.contiguous_offsets() {
+                let dims = layout.shape().dims();
+                let cols = dims.last().copied().unwrap_or(0);
+                if cols > 0 {
+                    let rows = layout.shape().elem_count() / cols;
+                    let out = storage.device.alloc(DType::F32, rows * cols)?;
+                    match kernels::run_softmax_last(&storage.device.ctx(), storage.buffer, out.buffer, rows, cols, o1) {
+                        Ok(()) => return Ok((out, layout.shape().clone())),
+                        Err(e) => kernels::note_fallback("softmax_last_dim", Some(&e)),
+                    }
+                }
+            } else {
+                kernels::note_fallback("softmax_last_dim", None);
+            }
+        }
+        let cpu = storage.to_cpu_storage()?;
+        let (out, shape) = self.cpu_fwd(&cpu, layout)?;
+        let dev = storage.device.clone();
+        Ok((dev.storage_from_cpu_storage(&out)?, shape))
     }
 
     #[cfg(feature = "cuda")]
@@ -721,64 +727,61 @@ impl candle::CustomOp2 for RmsNorm {
         l2: &Layout,
     ) -> Result<(candle::VulkanStorage, Shape)> {
         use candle::backend::{BackendDevice, BackendStorage};
-        use candle::{CpuStorage, D, Device, DType, Tensor};
-        let eps = self.eps;
-
-        // Only F32 has a native Vulkan kernel path; any other dtype falls back
-        // to the correct CPU round-trip.
-        if s1.dtype() != DType::F32 || s2.dtype() != DType::F32 {
-            let c1 = s1.to_cpu_storage()?;
-            let c2 = s2.to_cpu_storage()?;
-            let (out, shape) = self.cpu_fwd(&c1, l1, &c2, l2)?;
-            let dev = s1.device.clone();
-            return Ok((dev.storage_from_cpu_storage(&out)?, shape));
-        }
-
-        let dims = l1.shape().dims().to_vec();
-        let (o1, o2) = match l1.contiguous_offsets() {
-            Some(o) => o,
-            None => candle::bail!("vulkan rms-norm: input has to be contiguous"),
-        };
-        let (a1, a2) = match l2.contiguous_offsets() {
-            Some(o) => o,
-            None => candle::bail!("vulkan rms-norm: alpha has to be contiguous"),
-        };
-        let device = Device::Vulkan(s1.device.clone());
-
-        let x_cpu = s1.to_cpu_storage()?;
-        let xs = match &x_cpu {
-            CpuStorage::F32(d) => Tensor::from_vec(d[o1..o2].to_vec(), dims.clone(), &device)?,
-            _ => candle::bail!("vulkan rms-norm: unsupported input dtype {:?}", x_cpu),
-        };
-        let a_cpu = s2.to_cpu_storage()?;
-        let a_dims = l2.shape().dims().to_vec();
-        let alpha = match &a_cpu {
-            CpuStorage::F32(d) => Tensor::from_vec(d[a1..a2].to_vec(), a_dims, &device)?,
-            _ => candle::bail!("vulkan rms-norm: unsupported alpha dtype {:?}", a_cpu),
-        };
-
-        // mean(x^2) over the last dim: native sum-reduce, divide by the row length
-        // (affine), then broadcast to full shape; denom = sqrt(mean + eps).
-        let sqlast = dims[dims.len() - 1];
-        let sq = xs.sqr()?;
-        let sum = sq.sum(D::Minus1)?.unsqueeze(D::Minus1)?;
-        let mean = sum.affine(1.0f64 / sqlast as f64, 0.0f64)?;
-        let mean = mean.broadcast_as(dims.clone())?.contiguous()?;
-        let mean_eps = mean.affine(1.0f64, eps as f64)?;
-        let denom = mean_eps.sqrt()?;
-        let x_norm = xs.broadcast_div(&denom)?.contiguous()?;
-        // alpha is (hidden,) broadcast over rows; materialize then multiply.
-        let alpha_b = alpha.broadcast_as(dims.clone())?.contiguous()?;
-        let out = x_norm.mul(&alpha_b)?.contiguous()?;
-
-        let (out_storage, out_layout) = out.storage_and_layout();
-        match &*out_storage {
-            candle::Storage::Vulkan(vs) => {
-                let vs = vs.try_clone(&out_layout)?;
-                Ok((vs, Shape::from_dims(&dims)))
+        use candle::vulkan_backend::kernels;
+        if s1.dtype() == DType::F32 && s2.dtype() == DType::F32 && kernels::native_enabled() {
+            if let (Some((o1, _)), Some((a1, _))) = (l1.contiguous_offsets(), l2.contiguous_offsets()) {
+                let dims = l1.shape().dims();
+                let cols = dims.last().copied().unwrap_or(0);
+                if cols > 0 && l2.shape().elem_count() == cols {
+                    let rows = l1.shape().elem_count() / cols;
+                    let out = s1.device.alloc(DType::F32, rows * cols)?;
+                    match kernels::run_rmsnorm(&s1.device, s1.buf(), s2.buf(), out.buf(), rows, cols, o1, a1, self.eps) {
+                        Ok(()) => return Ok((out, l1.shape().clone())),
+                        Err(e) => kernels::note_fallback("rms_norm", Some(&e)),
+                    }
+                }
+            } else {
+                kernels::note_fallback("rms_norm", None);
             }
-            _ => candle::bail!("vulkan rms-norm produced non-vulkan storage"),
         }
+        let c1 = s1.to_cpu_storage()?;
+        let c2 = s2.to_cpu_storage()?;
+        let (out, shape) = self.cpu_fwd(&c1, l1, &c2, l2)?;
+        let dev = s1.device.clone();
+        Ok((dev.storage_from_cpu_storage(&out)?, shape))
+    }
+
+    #[cfg(feature = "opencl")]
+    fn opencl_fwd(
+        &self,
+        s1: &candle::OpenClStorage,
+        l1: &Layout,
+        s2: &candle::OpenClStorage,
+        l2: &Layout,
+    ) -> Result<(candle::OpenClStorage, Shape)> {
+        use candle::backend::{BackendDevice, BackendStorage};
+        use candle::opencl_backend::kernels;
+        if s1.dtype() == DType::F32 && s2.dtype() == DType::F32 && kernels::native_enabled() {
+            if let (Some((o1, _)), Some((a1, _))) = (l1.contiguous_offsets(), l2.contiguous_offsets()) {
+                let dims = l1.shape().dims();
+                let cols = dims.last().copied().unwrap_or(0);
+                if cols > 0 && l2.shape().elem_count() == cols {
+                    let rows = l1.shape().elem_count() / cols;
+                    let out = s1.device.alloc(DType::F32, rows * cols)?;
+                    match kernels::run_rmsnorm(&s1.device.ctx(), s1.buffer, s2.buffer, out.buffer, rows, cols, o1, a1, self.eps) {
+                        Ok(()) => return Ok((out, l1.shape().clone())),
+                        Err(e) => kernels::note_fallback("rms_norm", Some(&e)),
+                    }
+                }
+            } else {
+                kernels::note_fallback("rms_norm", None);
+            }
+        }
+        let c1 = s1.to_cpu_storage()?;
+        let c2 = s2.to_cpu_storage()?;
+        let (out, shape) = self.cpu_fwd(&c1, l1, &c2, l2)?;
+        let dev = s1.device.clone();
+        Ok((dev.storage_from_cpu_storage(&out)?, shape))
     }
 
 }

@@ -158,7 +158,7 @@ cargo build --release
     --addr 0.0.0.0:8080
 ```
 
-### 5 — GPU acceleration (Metal / CUDA)
+### 5 — GPU acceleration (Metal / CUDA / OpenCL / Vulkan)
 
 Joshua runs inference on the CPU by default, but a single build can also run
 on a GPU, chosen per invocation.  Add the backend feature **at build time**
@@ -170,6 +170,12 @@ cargo build --release --features metal
 
 # NVIDIA GPU: CUDA (needs a CUDA toolkit; Linux/Windows)
 cargo build --release --features cuda
+
+# Any OpenCL ICD (Intel iGPU/Arc, pocl, NVIDIA): needs libOpenCL at link time
+cargo build --release --features opencl
+
+# Any Vulkan ICD (AMD RADV, Intel ANV, llvmpipe): loads libvulkan.so at runtime
+cargo build --release --features vulkan
 ```
 
 Then pick the device at runtime — `auto` (the default) uses the best backend
@@ -182,8 +188,8 @@ request is strict and fails the load if the device is missing:
 ./target/release/joshua serve --model m.gguf --device auto       # default
 ```
 
-`--device` also accepts `cuda`, and the same selection is available as
-`JOSHUA_DEVICE` for the server.  The resolved device is logged at startup;
+`--device` also accepts `cuda`, `opencl` and `vulkan`, and the same
+selection is available as `JOSHUA_DEVICE` for the server.  The resolved device is logged at startup;
 library callers use [`EngineOptions::backend`]:
 
 ```rust
@@ -212,6 +218,17 @@ qualifies; only toy embeddings with head dim 4 need the CPU.
 routed experts on the CPU (no Metal/CUDA kernel exists for them) and runs
 only the dense set on the device.  Whisper transcription is CPU-only.
 
+**OpenCL and Vulkan (integrated GPUs).** Both backends run every operator
+as a device kernel, keep block-quantized weights in their GGUF format on
+the device (dequantized inside the matmul, for every quantisation) and
+execute asynchronously; on a device with host-unified memory the OpenCL
+backend aliases the memory-mapped file instead of copying it.  The routed
+experts of an MoE model stay on the CPU expert kernels, and
+`--dense-placement auto` measures whether the device beats the CPU on the
+quantized matmul before moving the dense set there.  See
+[`docs/accelerator-backends.md`](docs/accelerator-backends.md) for the
+design, the environment variables and the limits.
+
 ### Models larger than VRAM
 
 A sparse MoE model is mostly routed experts, and a GPU that cannot hold all
@@ -223,19 +240,18 @@ experts.  `--expert-placement` chooses where the routed experts of a
 
 | Value | Effect |
 |---|---|
-| `auto` (default) | `device` when `dense + experts + 1 GiB` fits the GPU's free memory (`cudaMemGetInfo` on CUDA, or `--vram-budget`), else `host`.  On OpenCL always `host`.  With neither a probe nor a budget, `device`. |
+| `auto` (default) | `device` when `dense + experts + 1 GiB` fits the GPU's free memory (`cudaMemGetInfo` on CUDA, or `--vram-budget`), else `host`.  On OpenCL and Vulkan always `host` (the dense set is what an iGPU speeds up; the experts run on the CPU expert kernels).  With neither a probe nor a budget, `device`. |
 | `device` | Upload the experts too — the whole model must fit. |
 | `host` | Keep the experts in host RAM, borrowed in place from the mapping and run on the CPU SIMD expert kernels (with the hot-expert cache and prefetch machinery active); only the dense set goes to the GPU.  Each MoE layer moves its activations across once in each direction. |
 
 `--vram-budget <MiB>` (or `JOSHUA_VRAM_BUDGET`) states the memory the model
-may use when there is no probe (Metal's unified memory, OpenCL) or when the
-card is shared.  Placement can only move the routed experts: the dense set
-always goes to the device, so a budget (or probed free memory) it does not
-fit with 1 GiB of headroom fails the load with the two numbers instead of
-running out of device memory on the first request.  On OpenCL the figures
-are the f32 footprint, since that backend dequantizes every uploaded weight.
-`deepseek4` always keeps its IQ2_XXS experts on the host whatever is
-requested.  The decision is logged at startup:
+may use when there is no probe (Metal's unified memory, OpenCL, Vulkan) or
+when the card is shared.  Placement can only move the routed experts: the
+dense set always goes to the device, so a budget (or probed free memory) it
+does not fit with 1 GiB of headroom fails the load with the two numbers
+instead of running out of device memory on the first request.  The figures
+are the on-disk (quantized) sizes on every backend.  `deepseek4` always
+keeps its IQ2_XXS experts on the host whatever is requested.  The decision is logged at startup:
 
 ```text
 INFO joshua: expert placement: host RAM — experts borrowed from the mapping,
@@ -532,6 +548,11 @@ prints the dense/expert split of any GGUF to sanity-check a new model.
 | `JOSHUA_MLOCK_HOT_WEIGHTS` | Same as `--mlock-hot-weights` (`on`, `required`, or `off`) |
 | `JOSHUA_EXPERT_PLACEMENT` | Same as `--expert-placement` (`auto`, `device`, or `host`) |
 | `JOSHUA_VRAM_BUDGET` | Same as `--vram-budget` (MiB of accelerator memory the model may use) |
+| `JOSHUA_DENSE_PLACEMENT` | Same as `--dense-placement` (`auto`, `device`, or `cpu`) |
+| `JOSHUA_SKIP_PLACEMENT_BENCH` | Skip the startup quantized-matmul probe that `auto` dense placement uses |
+| `JOSHUA_OPENCL_NATIVE` / `JOSHUA_VULKAN_NATIVE` | `0` runs every operator through the CPU round-trip instead of the device kernels (default on) |
+| `JOSHUA_OPENCL_TRACE` / `JOSHUA_VULKAN_TRACE` | `1` logs each operator that falls back to the CPU and why |
+| `JOSHUA_OPENCL_ZERO_COPY` | `0` uploads weights instead of aliasing the memory-mapped file on unified-memory OpenCL devices |
 | `JOSHUA_MAX_CONCURRENCY` | Cap on simultaneous generations/embeddings (same as `--max-concurrency`) |
 | `JOSHUA_MAX_OUTPUT_TOKENS` | Hard ceiling on generated tokens per request (same as `--max-output-tokens`) |
 | `JOSHUA_WHISPER_MODEL` | Whisper model directory mounted at `/v1/audio/transcriptions` (same as `--whisper-model`) |

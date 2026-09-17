@@ -1123,7 +1123,7 @@ impl Engine {
         // to f32.  A hard refusal to load needs certainty, so it uses the
         // lower bound; the soft decisions (expert placement, per-session
         // caps) err on the safe side with the upper bound.
-        let footprint = device_weight_bytes(&raw, arch, device.is_opencl() || device.is_vulkan());
+        let footprint = device_weight_bytes(&raw, arch);
         let dense_device_bytes = footprint.dense_upper;
         let expert_device_bytes = footprint.experts;
         let expert_bytes = expert_device_bytes;
@@ -1277,7 +1277,7 @@ impl Engine {
         };
         if !device.is_cpu() && expert_bytes > 0 {
             tracing::info!(
-                "expert placement: {} (dense {:.1}–{:.1} GiB, experts {:.1} GiB{}, device budget {}, requested {:?})",
+                "expert placement: {} (dense {:.1}–{:.1} GiB, experts {:.1} GiB, device budget {}, requested {:?})",
                 match placement {
                     crate::placement::ResolvedPlacement::Host =>
                         "host RAM — experts borrowed from the mapping, dense set on the device",
@@ -1286,13 +1286,6 @@ impl Engine {
                 footprint.dense_lower as f64 / 2f64.powi(30),
                 footprint.dense_upper as f64 / 2f64.powi(30),
                 expert_device_bytes as f64 / 2f64.powi(30),
-                if device.is_opencl() {
-                    " as f32 on OpenCL"
-                } else if device.is_vulkan() {
-                    " as f32 on Vulkan"
-                } else {
-                    ""
-                },
                 match device_budget {
                     Some(b) => format!("{:.1} GiB", b as f64 / 2f64.powi(30)),
                     None => "unknown".to_string(),
@@ -1416,18 +1409,56 @@ impl Engine {
         #[cfg(feature = "opencl")]
         {
             match Device::new_opencl(0) {
-                Ok(device) => return device,
+                Ok(device) => {
+                    Self::log_opencl_device(&device);
+                    return device;
+                }
                 Err(e) => tracing::warn!("OpenCL unavailable, falling back to CPU: {e}"),
             }
         }
         #[cfg(feature = "vulkan")]
         {
             match Device::new_vulkan(0) {
-                Ok(device) => return device,
+                Ok(device) => {
+                    Self::log_vulkan_device(&device);
+                    return device;
+                }
                 Err(e) => tracing::warn!("Vulkan unavailable, falling back to CPU: {e}"),
             }
         }
         Device::Cpu
+    }
+
+    /// Log which OpenCL device was opened and how it holds weights, so a
+    /// slow run can be read off the log: a device without host-unified
+    /// memory (a discrete card) copies the weights, one with it (an iGPU or
+    /// a CPU runtime) aliases the memory-mapped file in place.
+    #[cfg(feature = "opencl")]
+    fn log_opencl_device(device: &Device) {
+        if let Ok(ocl) = device.as_opencl_device() {
+            let unified = ocl.host_unified_memory();
+            tracing::info!(
+                "OpenCL device: {} ({} MiB global memory, {}; native kernels {}, zero-copy weights {})",
+                ocl.name(),
+                ocl.global_mem_size().unwrap_or(0) >> 20,
+                if unified { "host-unified memory" } else { "discrete memory" },
+                if candle_core::opencl_backend::native_enabled() { "on" } else { "off" },
+                if unified && candle_core::opencl_backend::zero_copy_enabled() { "on" } else { "off" },
+            );
+        }
+    }
+
+    /// Log which Vulkan device was opened and how it holds weights.
+    #[cfg(feature = "vulkan")]
+    fn log_vulkan_device(device: &Device) {
+        if let Ok(vk) = device.as_vulkan_device() {
+            tracing::info!(
+                "Vulkan device: {} ({}; native kernels {})",
+                vk.name(),
+                if vk.host_unified_memory() { "host-unified memory" } else { "discrete memory, host-visible staging" },
+                if candle_core::vulkan_backend::native_enabled() { "on" } else { "off" },
+            );
+        }
     }
 
     /// Resolve the [`ComputeBackend`] requested in [`EngineOptions`] to a
@@ -1484,13 +1515,15 @@ impl Engine {
             ComputeBackend::OpenCl => {
                 #[cfg(feature = "opencl")]
                 {
-                    Device::new_opencl(0).map_err(|e| {
+                    let device = Device::new_opencl(0).map_err(|e| {
                         JoshuaError::ModelLoad(format!(
                             "OpenCL device requested but unavailable: {e}. \
                              Build with `--features opencl` on a host with libOpenCL \
                              (Intel iGPU/Arc, NVIDIA ICD, ...), or pass --device cpu / auto."
                         ))
-                    })
+                    })?;
+                    Self::log_opencl_device(&device);
+                    Ok(device)
                 }
                 #[cfg(not(feature = "opencl"))]
                 {
@@ -1504,13 +1537,15 @@ impl Engine {
             ComputeBackend::Vulkan => {
                 #[cfg(feature = "vulkan")]
                 {
-                    Device::new_vulkan(0).map_err(|e| {
+                    let device = Device::new_vulkan(0).map_err(|e| {
                         JoshuaError::ModelLoad(format!(
                             "Vulkan device requested but unavailable: {e}. \
                              Build with `--features vulkan` on a host with libvulkan.so \
                              (AMD RADV, Intel ANV, ...), or pass --device cpu / auto."
                         ))
-                    })
+                    })?;
+                    Self::log_vulkan_device(&device);
+                    Ok(device)
                 }
                 #[cfg(not(feature = "vulkan"))]
                 {
@@ -2891,18 +2926,13 @@ fn residency(arch: Option<Architecture>, name: &str, info: &crate::gguf_ext::Raw
 /// the device: its quantized size (f32 for a dtype of unknown size, which
 /// no quantized kernel could hold anyway) and its f32 size.  A tensor of
 /// known residency has equal bounds; an [`Residency::Unknown`] one spans
-/// both.  With `dense_f32` (OpenCL, whose storage is dense f32) everything
-/// is f32.
+/// both.
 fn resident_tensor_bounds(
     arch: Option<Architecture>,
     name: &str,
     info: &crate::gguf_ext::RawTensorInfo,
-    dense_f32: bool,
 ) -> (u64, u64) {
     let f32_bytes = (info.elem_count() as u64).saturating_mul(4);
-    if dense_f32 {
-        return (f32_bytes, f32_bytes);
-    }
     let quantized = crate::gguf_ext::type_size_bytes(info.dtype, info.elem_count())
         .map(|b| b as u64)
         .unwrap_or(f32_bytes);
@@ -2924,7 +2954,7 @@ struct DeviceFootprint {
     /// most the loader can allocate.  Drives the placement decision and the
     /// per-session caps.
     dense_upper: u64,
-    /// Routed experts (always quantized, or f32 on OpenCL).
+    /// Routed experts (always quantized).
     experts: u64,
 }
 
@@ -2938,13 +2968,12 @@ struct DeviceFootprint {
 fn device_weight_bytes(
     header: &crate::gguf_ext::GgufHeader,
     arch: Option<Architecture>,
-    dense_f32: bool,
 ) -> DeviceFootprint {
     let mut lower = 0u64;
     let mut upper = 0u64;
     let mut experts = 0u64;
     for (name, info) in &header.tensors {
-        let (lo, hi) = resident_tensor_bounds(arch, name, info, dense_f32);
+        let (lo, hi) = resident_tensor_bounds(arch, name, info);
         if is_routed_expert(name) {
             experts = experts.saturating_add(lo);
         } else {
@@ -2952,14 +2981,14 @@ fn device_weight_bytes(
             upper = upper.saturating_add(hi);
         }
     }
-    let scanned = scanned_head_bytes(header, dense_f32);
-    let resident = resident_head_bytes(header, arch, dense_f32);
+    let scanned = scanned_head_bytes(header);
+    let resident = resident_head_bytes(header, arch);
     // Likewise the embedding table: a loader that probes several names
     // keeps the first it can read, so the tables the scan counted are
     // replaced by one — the smallest candidate in the lower bound, the
     // largest in the upper.
-    let (emb_scanned_lo, emb_scanned_hi) = scanned_embedding_bounds(header, arch, dense_f32);
-    let (emb_lo, emb_hi) = resident_embedding_bounds(header, arch, dense_f32);
+    let (emb_scanned_lo, emb_scanned_hi) = scanned_embedding_bounds(header, arch);
+    let (emb_lo, emb_hi) = resident_embedding_bounds(header, arch);
     DeviceFootprint {
         dense_lower: lower
             .saturating_sub(scanned)
@@ -2981,13 +3010,12 @@ fn device_weight_bytes(
 fn scanned_embedding_bounds(
     header: &crate::gguf_ext::GgufHeader,
     arch: Option<Architecture>,
-    dense_f32: bool,
 ) -> (u64, u64) {
     probed_embedding_names(arch)
         .iter()
         .filter_map(|n| header.tensors.get(*n).map(|info| (*n, info)))
         .fold((0u64, 0u64), |(lo, hi), (n, info)| {
-            let (l, h) = resident_tensor_bounds(arch, n, info, dense_f32);
+            let (l, h) = resident_tensor_bounds(arch, n, info);
             (lo.saturating_add(l), hi.saturating_add(h))
         })
 }
@@ -2999,13 +3027,12 @@ fn scanned_embedding_bounds(
 fn resident_embedding_bounds(
     header: &crate::gguf_ext::GgufHeader,
     arch: Option<Architecture>,
-    dense_f32: bool,
 ) -> (u64, u64) {
     let mut lo: Option<u64> = None;
     let mut hi = 0u64;
     for n in probed_embedding_names(arch) {
         if let Some(info) = header.tensors.get(*n) {
-            let (l, h) = resident_tensor_bounds(arch, n, info, dense_f32);
+            let (l, h) = resident_tensor_bounds(arch, n, info);
             lo = Some(lo.map_or(l, |x| x.min(l)));
             hi = hi.max(h);
         }
@@ -3032,25 +3059,21 @@ fn probed_head_names(arch: Option<Architecture>) -> &'static [&'static str] {
 /// dequantized f32 when `f32` (OpenCL), otherwise its on-disk quantized
 /// size (every loader keeps the head a quantized `QMatMul`).  Zero when
 /// absent or of a dtype with no known size.
-fn tensor_bytes(header: &crate::gguf_ext::GgufHeader, name: &str, f32: bool) -> u64 {
+fn tensor_bytes(header: &crate::gguf_ext::GgufHeader, name: &str) -> u64 {
     let Some(info) = header.tensors.get(name) else {
         return 0;
     };
-    if f32 {
-        (info.elem_count() as u64).saturating_mul(4)
-    } else {
-        crate::gguf_ext::type_size_bytes(info.dtype, info.elem_count())
-            .map(|b| b as u64)
-            .unwrap_or(0)
-    }
+    crate::gguf_ext::type_size_bytes(info.dtype, info.elem_count())
+        .map(|b| b as u64)
+        .unwrap_or(0)
 }
 
 /// Bytes of every output-head-named tensor present in the file — what the
 /// whole-file scans counted for the head, whether or not a loader reads it.
-fn scanned_head_bytes(header: &crate::gguf_ext::GgufHeader, f32: bool) -> u64 {
+fn scanned_head_bytes(header: &crate::gguf_ext::GgufHeader) -> u64 {
     OUTPUT_HEAD_NAMES
         .iter()
-        .fold(0u64, |acc, n| acc.saturating_add(tensor_bytes(header, n, f32)))
+        .fold(0u64, |acc, n| acc.saturating_add(tensor_bytes(header, n)))
 }
 
 /// Bytes of the output head the loader ends up with on the device, sized
@@ -3068,12 +3091,11 @@ fn scanned_head_bytes(header: &crate::gguf_ext::GgufHeader, f32: bool) -> u64 {
 fn resident_head_bytes(
     header: &crate::gguf_ext::GgufHeader,
     arch: Option<Architecture>,
-    f32: bool,
 ) -> u64 {
     probed_head_names(arch)
         .iter()
         .chain(probed_embedding_names(arch).iter())
-        .map(|n| tensor_bytes(header, n, f32))
+        .map(|n| tensor_bytes(header, n))
         .max()
         .unwrap_or(0)
 }
@@ -3998,31 +4020,28 @@ mod tests {
         let lfm2 = Some(Architecture::Lfm2);
         let ds4 = Some(Architecture::DeepSeek4);
         const EMBD_F32: u64 = 1024 * 4;
-        let fp = |h: &crate::gguf_ext::GgufHeader, a, f32| device_weight_bytes(h, a, f32);
+        let fp = |h: &crate::gguf_ext::GgufHeader, a| device_weight_bytes(h, a);
         let known = |lower: u64, experts: u64| DeviceFootprint { dense_lower: lower, dense_upper: lower, experts };
 
         // joshua-native loader, CUDA/Metal: everything known and quantized.
-        assert_eq!(fp(&base, q, false), known(576 + 576 + 144, 2 * 144));
+        assert_eq!(fp(&base, q), known(576 + 576 + 144, 2 * 144));
         // Stock loader: the embedding table is f32, the head a quantized QMatMul.
-        assert_eq!(fp(&base, llama, false), known(EMBD_F32 + 576 + 144, 2 * 144));
-        // OpenCL: every tensor is f32.
-        assert_eq!(fp(&base, q, true), known((1024 + 1024 + 256) * 4, 2 * 256 * 4));
-        assert_eq!(scanned_head_bytes(&base, false), 576);
-        assert_eq!(resident_head_bytes(&base, q, false), 576);
+        assert_eq!(fp(&base, llama), known(EMBD_F32 + 576 + 144, 2 * 144));
+        assert_eq!(scanned_head_bytes(&base), 576);
+        assert_eq!(resident_head_bytes(&base, q), 576);
 
         // Tied head (no head tensor): the embedding is resident twice — as
         // the table (quantized for joshua-native, f32 for stock) and as a
         // quantized head copy.
         let mut tied = base.clone();
         tied.tensors.remove("output.weight");
-        assert_eq!(scanned_head_bytes(&tied, false), 0);
-        assert_eq!(resident_head_bytes(&tied, q, false), 576, "tied head is the quantized table");
-        assert_eq!(fp(&tied, q, false).dense_lower, 576 + 144 + 576);
-        assert_eq!(fp(&tied, llama, false), known(EMBD_F32 + 144 + 576, 2 * 144));
-        assert_eq!(fp(&tied, q, true).dense_lower, (1024 + 256 + 1024) * 4);
+        assert_eq!(scanned_head_bytes(&tied), 0);
+        assert_eq!(resident_head_bytes(&tied, q), 576, "tied head is the quantized table");
+        assert_eq!(fp(&tied, q).dense_lower, 576 + 144 + 576);
+        assert_eq!(fp(&tied, llama), known(EMBD_F32 + 144 + 576, 2 * 144));
         // A model candle cannot load: nothing is known, the bounds span
         // quantized..f32 for every tensor (and the check never runs).
-        let unknown = fp(&tied, None, false);
+        let unknown = fp(&tied, None);
         assert_eq!(unknown.dense_lower, 576 + 144 + 576);
         assert_eq!(unknown.dense_upper, EMBD_F32 + 1024 + 576);
 
@@ -4033,7 +4052,7 @@ mod tests {
             crate::gguf_ext::RawTensorInfo { dtype: 1, dims: vec![256, 4], offset: 0 },
         );
         // Table f32 + head copy at its on-disk f16 size (2 B/elem).
-        assert_eq!(fp(&f16_embd, q, false), known(EMBD_F32 + 144 + 1024 * 2, 2 * 144));
+        assert_eq!(fp(&f16_embd, q), known(EMBD_F32 + 144 + 1024 * 2, 2 * 144));
 
         // deepseek4 decodes a raw-dtype (IQ2_XXS = 16) dense tensor to f32 on
         // the device; its compressor projections stay quantized, the
@@ -4047,7 +4066,7 @@ mod tests {
         ds4h.tensors.insert("blk.0.attn_compressor_ape.weight".to_string(), q4k(vec![256, 1]));
         ds4h.tensors.insert("output_hc_fn.weight".to_string(), q4k(vec![256, 1]));
         assert_eq!(
-            fp(&ds4h, ds4, false),
+            fp(&ds4h, ds4),
             known(576 + 576 + 144 + 1024 + 144 + 1024 + 144, 2 * 144),
             "IQ2_XXS dense tensor and ape vector as f32, projections quantized"
         );
@@ -4069,7 +4088,7 @@ mod tests {
         misc.tensors.insert("blk.0.some_future_tensor.weight".to_string(), q4k(vec![256, 1]));
         misc.tensors.insert("blk.0.attn_kv_b.weight".to_string(), q4k(vec![256, 1]));
         misc.tensors.insert("blk.0.ffn_gate_shexp.weight".to_string(), q4k(vec![256, 1]));
-        let m = fp(&misc, Some(Architecture::DeepSeek2), false);
+        let m = fp(&misc, Some(Architecture::DeepSeek2));
         assert_eq!(m.dense_lower, 576 + 576 + 144 + 5 * 1024 + 144 + 2 * 144, "unknown tensor quantized in the lower bound");
         assert_eq!(m.dense_upper, 576 + 576 + 144 + 5 * 1024 + 1024 + 2 * 144, "unknown tensor f32 in the upper bound");
         assert_eq!(tensor_stem("blk.12.attn_q.weight"), "attn_q");
@@ -4085,7 +4104,7 @@ mod tests {
         for n in ["blk.0.ffn_gate.3.weight", "blk.0.ffn_up.3.weight", "blk.0.ffn_down.3.weight"] {
             mixtral.tensors.insert(n.to_string(), q4k(vec![256, 1]));
         }
-        assert_eq!(fp(&mixtral, llama, false), known(EMBD_F32 + 576 + 144 + 3 * 144, 2 * 144));
+        assert_eq!(fp(&mixtral, llama), known(EMBD_F32 + 576 + 144 + 3 * 144, 2 * 144));
         let mut lfm = base.clone();
         for n in [
             "blk.0.feed_forward.w1.weight",
@@ -4096,16 +4115,16 @@ mod tests {
             lfm.tensors.insert(n.to_string(), q4k(vec![256, 1]));
         }
         lfm.tensors.insert("blk.0.shortconv.conv.weight".to_string(), q4k(vec![256, 1])); // dequantized kernel
-        assert_eq!(fp(&lfm, lfm2, false), known(EMBD_F32 + 576 + 144 + 4 * 144 + 1024, 2 * 144));
+        assert_eq!(fp(&lfm, lfm2), known(EMBD_F32 + 576 + 144 + 4 * 144 + 1024, 2 * 144));
 
         // LFM2: an alias head is a head (counted once, no tied copy); for
         // any other loader it is dead weight and the embedding is tied.
         for alias in ["lm_head.weight", "model.output.weight", "model.lm_head.weight"] {
             let mut aliased = tied.clone();
             aliased.tensors.insert(alias.to_string(), q4k(vec![256, 4]));
-            assert_eq!(scanned_head_bytes(&aliased, false), 576, "{alias}: scanned");
-            assert_eq!(fp(&aliased, lfm2, false).dense_lower, EMBD_F32 + 144 + 576, "{alias}: LFM2 head");
-            assert_eq!(fp(&aliased, q, false).dense_lower, 576 + 144 + 576, "{alias}: alias dropped, tied");
+            assert_eq!(scanned_head_bytes(&aliased), 576, "{alias}: scanned");
+            assert_eq!(fp(&aliased, lfm2).dense_lower, EMBD_F32 + 144 + 576, "{alias}: LFM2 head");
+            assert_eq!(fp(&aliased, q).dense_lower, 576 + 144 + 576, "{alias}: alias dropped, tied");
         }
 
         // LFM2 embedding aliases: the table under `model.embed_tokens.weight`
@@ -4114,25 +4133,25 @@ mod tests {
         let mut lfm2_embd = tied.clone();
         lfm2_embd.tensors.remove("token_embd.weight");
         lfm2_embd.tensors.insert("model.embed_tokens.weight".to_string(), q4k(vec![256, 4]));
-        assert_eq!(resident_head_bytes(&lfm2_embd, lfm2, false), 576, "alias table is the tied head");
-        assert_eq!(fp(&lfm2_embd, lfm2, false).dense_lower, EMBD_F32 + 144 + 576);
+        assert_eq!(resident_head_bytes(&lfm2_embd, lfm2), 576, "alias table is the tied head");
+        assert_eq!(fp(&lfm2_embd, lfm2).dense_lower, EMBD_F32 + 144 + 576);
         // Another loader never probes that name: a tensor no rule names
         // (quantized..f32), and no head.
-        assert_eq!(resident_head_bytes(&lfm2_embd, q, false), 0);
-        assert_eq!(fp(&lfm2_embd, q, false).dense_lower, 576 + 144);
-        assert_eq!(fp(&lfm2_embd, q, false).dense_upper, EMBD_F32 + 144);
+        assert_eq!(resident_head_bytes(&lfm2_embd, q), 0);
+        assert_eq!(fp(&lfm2_embd, q).dense_lower, 576 + 144);
+        assert_eq!(fp(&lfm2_embd, q).dense_upper, EMBD_F32 + 144);
 
         // Two embedding names present: the lfm2 loader keeps the first it
         // can read, so exactly one table is resident — the smaller in the
         // lower bound, the larger in the upper — plus the tied head copy.
         let mut two_tables = tied.clone();
         two_tables.tensors.insert("model.embed_tokens.weight".to_string(), q4k(vec![64, 4])); // 256 elems
-        let t = fp(&two_tables, lfm2, false);
+        let t = fp(&two_tables, lfm2);
         assert_eq!(t.dense_lower, 256 * 4 + 144 + 576, "smaller table, f32, plus the head copy");
         assert_eq!(t.dense_upper, EMBD_F32 + 144 + 576, "larger table, f32, plus the head copy");
         // Another loader probes only token_embd.weight: the alias is an
         // unknown tensor, the table is counted once as before.
-        let t = fp(&two_tables, q, false);
+        let t = fp(&two_tables, q);
         assert_eq!(t.dense_lower, 576 + 144 + 576 + 144);
         assert_eq!(t.dense_upper, 576 + 144 + 576 + 256 * 4);
 
@@ -4140,8 +4159,8 @@ mod tests {
         // QMatMul, the joshua-native loaders read it as f32.
         let mut router = base.clone();
         router.tensors.insert("blk.0.ffn_gate_inp.weight".to_string(), q4k(vec![256, 1]));
-        assert_eq!(fp(&router, llama, false), known(EMBD_F32 + 576 + 144 + 144, 2 * 144));
-        assert_eq!(fp(&router, q, false), known(576 + 576 + 144 + 1024, 2 * 144));
+        assert_eq!(fp(&router, llama), known(EMBD_F32 + 576 + 144 + 144, 2 * 144));
+        assert_eq!(fp(&router, q), known(576 + 576 + 144 + 1024, 2 * 144));
 
         // Several head names present: only one ends up resident.  Sizing
         // cannot know which read succeeds, so it keeps the largest candidate
@@ -4149,12 +4168,12 @@ mod tests {
         let mut two = tied.clone();
         two.tensors.insert("output.weight".to_string(), q4k(vec![64, 4])); // 256 elems = 144 B
         two.tensors.insert("lm_head.weight".to_string(), q4k(vec![256, 4]));
-        assert_eq!(scanned_head_bytes(&two, false), 144 + 576);
-        assert_eq!(resident_head_bytes(&two, lfm2, false), 576, "largest LFM2 candidate");
-        assert_eq!(fp(&two, lfm2, false).dense_lower, EMBD_F32 + 144 + 576);
+        assert_eq!(scanned_head_bytes(&two), 144 + 576);
+        assert_eq!(resident_head_bytes(&two, lfm2), 576, "largest LFM2 candidate");
+        assert_eq!(fp(&two, lfm2).dense_lower, EMBD_F32 + 144 + 576);
         // Another loader: candidates are output.weight and the table fallback.
-        assert_eq!(resident_head_bytes(&two, q, false), 576);
-        assert_eq!(fp(&two, q, false).dense_lower, 576 + 144 + 576);
+        assert_eq!(resident_head_bytes(&two, q), 576);
+        assert_eq!(fp(&two, q).dense_lower, 576 + 144 + 576);
     }
 
     fn header_with_tensors(

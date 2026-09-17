@@ -64,6 +64,8 @@ mod dtype;
 pub mod dummy_cuda_backend;
 pub mod dummy_dtype;
 mod dummy_metal_backend;
+#[cfg(any(feature = "opencl", feature = "vulkan"))]
+pub mod fault_slot;
 #[cfg(feature = "opencl")]
 pub mod opencl_backend;
 #[cfg(not(feature = "opencl"))]
@@ -133,16 +135,16 @@ pub use metal_backend::{MetalDevice, MetalError, MetalStorage};
 pub use dummy_metal_backend::{MetalDevice, MetalError, MetalStorage};
 
 #[cfg(feature = "opencl")]
-pub use opencl_backend::{OpenClDevice, OpenClStorage};
+pub use opencl_backend::{OpenClDevice, OpenClStorage, QOpenClStorage};
 
 #[cfg(not(feature = "opencl"))]
-pub use dummy_opencl_backend::{OpenClDevice, OpenClStorage};
+pub use dummy_opencl_backend::{OpenClDevice, OpenClStorage, QOpenClStorage};
 
 #[cfg(feature = "vulkan")]
-pub use vulkan_backend::{VulkanDevice, VulkanStorage};
+pub use vulkan_backend::{QVulkanStorage, VulkanDevice, VulkanStorage};
 
 #[cfg(not(feature = "vulkan"))]
-pub use dummy_vulkan_backend::{VulkanDevice, VulkanStorage};
+pub use dummy_vulkan_backend::{QVulkanStorage, VulkanDevice, VulkanStorage};
 
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;

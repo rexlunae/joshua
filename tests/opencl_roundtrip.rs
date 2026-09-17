@@ -65,10 +65,25 @@ fn opencl_or_skip() -> Option<Device> {
     }
 }
 
-/// M2: run a representative set of operators on OpenClStorage and assert the
-/// result equals the same computation on CPU. Because the OpenCL backend
-/// forwards to candle's CPU kernels (M2 CPU-fallback strategy), the results
-/// must match bit-exactly.
+/// Element-wise comparison with a small relative tolerance: the native
+/// kernels use the device's own `exp`/`fma`, which may differ from the CPU
+/// by an ulp.
+fn assert_close<const N: usize>(a: &[[f32; N]], b: &[[f32; N]], what: &str) {
+    for (ra, rb) in a.iter().zip(b) {
+        for (x, y) in ra.iter().zip(rb) {
+            let tol = 1e-5 * x.abs().max(y.abs()).max(1.0);
+            assert!((x - y).abs() <= tol, "{what}: {x} vs {y}");
+        }
+    }
+}
+
+fn rows2<const N: usize>(v: Vec<Vec<f32>>) -> Vec<[f32; N]> {
+    v.into_iter().map(|r| <[f32; N]>::try_from(r).unwrap()).collect()
+}
+
+/// Run a representative set of operators on OpenClStorage and assert the
+/// result equals the same computation on CPU up to floating-point rounding
+/// (the kernels run natively on the device).
 #[test]
 fn operators_match_cpu() -> candle_core::Result<()> {
     let ocl = match opencl_or_skip() {
@@ -89,7 +104,7 @@ fn operators_match_cpu() -> candle_core::Result<()> {
     // 2) unary exp
     let o = a.exp()?.to_device(&cpu)?.to_vec2::<f32>()?;
     let c = a_cpu.exp()?.to_vec2::<f32>()?;
-    assert_eq!(o, c, "exp parity");
+    assert_close(&rows2::<2>(o), &rows2::<2>(c), "exp parity");
 
     // 3) binary add (via broadcast)
     let b = Tensor::from_vec(vec![10.0f32, 20.0, 30.0, 40.0], (2, 2), &ocl)?;
@@ -135,6 +150,6 @@ fn operators_match_cpu() -> candle_core::Result<()> {
     let c = a_cpu.index_select(&ids_cpu, 0)?.to_vec2::<f32>()?;
     assert_eq!(o, c, "index_select parity");
 
-    eprintln!("PASS: OpenCL operator parity vs CPU is exact");
+    eprintln!("PASS: OpenCL operator parity vs CPU");
     Ok(())
 }

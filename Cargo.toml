@@ -49,7 +49,7 @@ metal = [
 # OpenClStorage + buffer round-trip). Bring-up target is Intel OpenCL hardware
 # (iGPU now; a more powerful Intel card later). Requires a system libOpenCL
 # (-lOpenCL, e.g. intel-opencl-icd on Linux) at link time.
-opencl = ["candle-core/opencl"]
+opencl = ["candle-core/opencl", "candle-nn/opencl"]
 # Vulkan accelerator (vendored candle-core `vulkan` backend: VulkanDevice /
 # VulkanStorage + host-visible round-trip + naga-compiled compute kernels).
 # Bring-up target is the AMD Renoir iGPU (unified memory, RADV). Requires a
@@ -69,10 +69,14 @@ tls = ["dep:axum-server", "dep:rustls"]
 # with the Vulkan accelerator backend: VulkanDevice/VulkanStorage + CustomOp1/2
 # ::vulkan_fwd hooks). Using a git fork means joshua's work doesn't wait on
 # upstream; the vendored copy in vendor/candle-core is the same content.
-candle-core = { git = "https://github.com/rexlunae/candle-core.git", branch = "joshua-vulkan" }
+# Built from the vendored copy so the tree is self-contained: the OpenCL
+# backend's native kernels, block-quantized device storage and zero-copy
+# mapping live in vendor/candle-core (the fork's `joshua-vulkan` branch is
+# the same content minus those additions).
+candle-core = { path = "vendor/candle-core" }
 # candle-nn patched to the rexlunae/candle-nn fork (device-native CustomOp
 # `vulkan_fwd` for softmax/RMSNorm), so it doesn't wait on upstream either.
-candle-nn = { git = "https://github.com/rexlunae/candle-nn.git", branch = "joshua-vulkan" }
+candle-nn = { path = "vendor/candle-nn" }
 # candle-kernels is patched to a tiny fork (rexlunae/candle-kernels) carrying
 # two CUDA-12.4 compatibility fixes, instead of vendoring the crate's ~21K
 # lines of C kernels into this tree: (1) compatibility.cuh redefines

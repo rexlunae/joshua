@@ -131,22 +131,14 @@ fn from_raw_data<T: super::GgmlType + Send + Sync + 'static>(
         Device::Metal(metal) => super::metal::load_quantized(metal, data)?,
         Device::Cuda(cuda) => super::cuda::load_quantized(cuda, data)?,
         Device::OpenCl(d) => {
-            // M4 dense-on-OpenCl: dequantize the weight to f32 and hold it on the
-            // device (OpenClStorage).  `T` is a GgmlType so `T::to_float` gives
-            // the dequant; BLCK_SIZE is 1 for the f32/f16/bf16 scalars.
+            // Blocks go to the device as-is; the kernels dequantize in place.
             let n = data.len() * T::BLCK_SIZE;
-            let mut ys = vec![0f32; n];
-            T::to_float(data, &mut ys);
-            QStorage::OpenCl(crate::OpenClStorage::from_vec(ys, d)?)
+            QStorage::OpenCl(crate::QOpenClStorage::from_bytes(d, T::DTYPE, n, &raw_data[..size_in_bytes])?)
         }
         Device::Vulkan(d) => {
-            // M1 dense-on-Vulkan: mirror the OpenCl M4 path — dequantize the
-            // weight to f32 and hold it on the device (VulkanStorage,
-            // host-visible+coherent on the Renoir's unified memory).
+            // Blocks go to the device as-is; the kernels dequantize in place.
             let n = data.len() * T::BLCK_SIZE;
-            let mut ys = vec![0f32; n];
-            T::to_float(data, &mut ys);
-            QStorage::Vulkan(crate::VulkanStorage::from_vec(ys, d)?)
+            QStorage::Vulkan(crate::QVulkanStorage::from_bytes(d, T::DTYPE, n, &raw_data[..size_in_bytes])?)
         }
     };
     super::QTensor::new(data, dims)
