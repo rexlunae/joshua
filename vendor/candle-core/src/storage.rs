@@ -355,12 +355,8 @@ impl Storage {
                 Ok((Self::OpenCl(s), shape))
             }
             (Self::Vulkan(s1), Self::Vulkan(s2), Self::Vulkan(s3)) => {
-                let c1 = s1.to_cpu_storage()?;
-                let c2 = s2.to_cpu_storage()?;
-                let c3 = s3.to_cpu_storage()?;
-                let (s, shape) = c.cpu_fwd(&c1, l1, &c2, l2, &c3, l3)?;
-                let dev = s1.device.clone();
-                Ok((Self::Vulkan(dev.storage_from_cpu_storage(&s)?), shape))
+                let (s, shape) = c.vulkan_fwd(s1, l1, s2, l2, s3, l3)?;
+                Ok((Self::Vulkan(s), shape))
             }
             _ => unreachable!(),
         }

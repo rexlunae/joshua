@@ -56,8 +56,8 @@ resident in the page cache.
 gathers rows through candle's quantized embedding kernel (borrowed from the
 mapping on the CPU, uploaded compressed on CUDA/Metal).  Per-session cost is
 now zero; the numbers are bit-identical (same blocks, same `to_float`, per
-row instead of whole).  Dense f32 is kept only for OpenCL (its storage is
-f32 already) and float dtypes on accelerators.
+row instead of whole).  Dense f32 is kept only for float-dtype tables on
+CUDA/Metal; OpenCL and Vulkan gather rows with a dequantizing kernel.
 
 **R2. Every session was a full model instance.**  `Engine::load_model`
 built a complete `QuantizedModel` per session.  On the CPU that is cheap
@@ -90,9 +90,8 @@ back once (`Moe::dispatch`), exactly as deepseek4 does; for decode that is
 two `hidden × 4`-byte transfers per layer, negligible on PCIe.  `auto` picks
 `device` only when `dense + experts + 1 GiB` fits the device's free memory
 (`cudaMemGetInfo` on CUDA, or `--vram-budget`), and `host` otherwise; on
-OpenCL, whose storage is dense f32 (an uploaded expert would be 8–16× its
-on-disk size), `auto` is always `host` and every device figure is the f32
-footprint (`elem_count × 4`), not the on-disk bytes.  With no probe and no
+OpenCL and Vulkan `auto` is always `host` (the experts run on the CPU
+expert kernels; the device speeds up the dense set).  With no probe and no
 budget the historical layout is kept, so nothing changes on machines that
 fit.  Placement moves only the routed experts: a budget the dense set does
 not fit with headroom is refused at load, naming both numbers, rather than
@@ -113,7 +112,7 @@ and an *upper* bound (unknown tensors f32).  A load is refused only when
 the lower bound does not fit — a hard rejection needs certainty, so a gap
 in the name rules can never reject a fitting model — while the soft
 decisions (expert placement, per-session caps) use the upper bound and err
-on the safe side.  Everything is f32 on OpenCL.  A tied output head (no head tensor) is a second,
+on the safe side.  A tied output head (no head tensor) is a second,
 quantized copy of the embedding table; where several head names are
 present the largest candidate the loader could end up reading is counted,
 never fewer.  Models candle cannot load at all (NPU-only) allocate nothing

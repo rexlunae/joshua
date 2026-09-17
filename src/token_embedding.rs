@@ -38,18 +38,16 @@ impl TokenEmbedding {
     ///
     /// Quantized wherever candle's quantized embedding gather serves the
     /// storage: always on the CPU (both the borrowed-mmap and heap storages
-    /// implement it for every dtype), on OpenCL (the block storage gathers
-    /// rows with an on-device dequantizing kernel for every GGUF dtype), and
-    /// for block-quantized dtypes on CUDA/Metal.  Dense on Vulkan and for
-    /// float dtypes on CUDA/Metal.
+    /// implement it for every dtype), on OpenCL and Vulkan (their block
+    /// storages gather rows with an on-device dequantizing kernel for every
+    /// GGUF dtype), and for block-quantized dtypes on CUDA/Metal.  Dense
+    /// only for float dtypes on CUDA/Metal.
     pub fn load(table: QTensor, device: &Device) -> Result<Self> {
         let float_dtype = matches!(
             table.dtype(),
             GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16
         );
-        let keep_quantized = device.is_cpu()
-            || device.is_opencl()
-            || (!device.is_vulkan() && !float_dtype);
+        let keep_quantized = device.is_cpu() || device.is_opencl() || device.is_vulkan() || !float_dtype;
         if keep_quantized {
             Ok(Self::Quantized(table))
         } else {

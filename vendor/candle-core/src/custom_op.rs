@@ -203,6 +203,24 @@ pub trait CustomOp3 {
         ))
     }
 
+    /// The forward pass on a Vulkan device (CPU round-trip by default).
+    fn vulkan_fwd(
+        &self,
+        s1: &VulkanStorage,
+        l1: &Layout,
+        s2: &VulkanStorage,
+        l2: &Layout,
+        s3: &VulkanStorage,
+        l3: &Layout,
+    ) -> Result<(VulkanStorage, Shape)> {
+        let c1 = s1.to_cpu_storage()?;
+        let c2 = s2.to_cpu_storage()?;
+        let c3 = s3.to_cpu_storage()?;
+        let (out, shape) = self.cpu_fwd(&c1, l1, &c2, l2, &c3, l3)?;
+        let dev = s1.device.clone();
+        Ok((dev.storage_from_cpu_storage(&out)?, shape))
+    }
+
     /// The forward pass on an OpenCL device (CPU round-trip by default).
     fn opencl_fwd(
         &self,

@@ -216,12 +216,11 @@ pub const DEVICE_PLACEMENT_HEADROOM: u64 = 1024 * 1024 * 1024; // 1 GiB
 pub struct DeviceProfile {
     /// The device is the CPU: placement is irrelevant.
     pub is_cpu: bool,
-    /// The routed experts stay on the host unless explicitly requested:
-    /// either the backend cannot hold quantized blocks (Vulkan's storage is
-    /// dense f32, so uploading the experts would dequantize them — 8–16× the
-    /// on-disk size), or it is OpenCL, where the dense set is what the
-    /// device speeds up and the experts run on the CPU SIMD expert kernels
-    /// with the hot-expert cache and prefetch machinery.
+    /// The routed experts stay on the host unless explicitly requested
+    /// (OpenCL and Vulkan): the dense set is what the device speeds up,
+    /// while the experts run on the CPU SIMD expert kernels with the
+    /// hot-expert cache and prefetch machinery, sharing DRAM with an iGPU
+    /// either way.
     pub dense_only: bool,
     /// Bytes of device memory available for weights, when known: a probe
     /// (`cudaMemGetInfo`), or the operator's `--vram-budget`.

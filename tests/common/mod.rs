@@ -751,7 +751,10 @@ pub fn write_tiny_qwen3moe_gguf(path: &Path) {
         (key("expert_used_count"), u32v(2)),
         (key("expert_feed_forward_length"), u32v(NFE as u32)),
         (key("expert_shared_feed_forward_length"), u32v(0)),
-        (key("attention.norm_topk_prob"), gguf_file::Value::Bool(true)),
+        (
+            key("attention.norm_topk_prob"),
+            gguf_file::Value::Bool(true),
+        ),
         (
             "tokenizer.ggml.eos_token_id".to_string(),
             gguf_file::Value::U32(3),
@@ -841,14 +844,8 @@ pub fn write_tiny_qwen3moe_gguf(path: &Path) {
             format!("{p}.attn_output.weight"),
             qtensor(next(EMB * H * HD), &[EMB, H * HD]),
         ));
-        tensors.push((
-            format!("{p}.attn_q_norm.weight"),
-            qtensor(ones(HD), &[HD]),
-        ));
-        tensors.push((
-            format!("{p}.attn_k_norm.weight"),
-            qtensor(ones(HD), &[HD]),
-        ));
+        tensors.push((format!("{p}.attn_q_norm.weight"), qtensor(ones(HD), &[HD])));
+        tensors.push((format!("{p}.attn_k_norm.weight"), qtensor(ones(HD), &[HD])));
         tensors.push((
             format!("{p}.ffn_gate_inp.weight"),
             qtensor(next(NE * EMB), &[NE, EMB]),
@@ -911,7 +908,10 @@ pub fn write_tiny_qwen3moe_metal_gguf(path: &Path) {
         (key("expert_used_count"), u32v(8)),
         (key("expert_feed_forward_length"), u32v(NFE as u32)),
         (key("expert_shared_feed_forward_length"), u32v(0)),
-        (key("attention.norm_topk_prob"), gguf_file::Value::Bool(true)),
+        (
+            key("attention.norm_topk_prob"),
+            gguf_file::Value::Bool(true),
+        ),
         (
             "tokenizer.ggml.eos_token_id".to_string(),
             gguf_file::Value::U32(3),
@@ -973,10 +973,7 @@ pub fn write_tiny_qwen3moe_metal_gguf(path: &Path) {
             "token_embd.weight".to_string(),
             qtensor_q4k(weights(VOCAB * EMB, 1), &[VOCAB, EMB]),
         ),
-        (
-            "output_norm.weight".to_string(),
-            qtensor(ones(EMB), &[EMB]),
-        ),
+        ("output_norm.weight".to_string(), qtensor(ones(EMB), &[EMB])),
     ];
 
     let mut seed = 10u32;
@@ -1004,14 +1001,8 @@ pub fn write_tiny_qwen3moe_metal_gguf(path: &Path) {
             format!("{p}.attn_output.weight"),
             qtensor_q4k(next(EMB * H * HD), &[EMB, H * HD]),
         ));
-        tensors.push((
-            format!("{p}.attn_q_norm.weight"),
-            qtensor(ones(HD), &[HD]),
-        ));
-        tensors.push((
-            format!("{p}.attn_k_norm.weight"),
-            qtensor(ones(HD), &[HD]),
-        ));
+        tensors.push((format!("{p}.attn_q_norm.weight"), qtensor(ones(HD), &[HD])));
+        tensors.push((format!("{p}.attn_k_norm.weight"), qtensor(ones(HD), &[HD])));
         tensors.push((
             format!("{p}.ffn_gate_inp.weight"),
             qtensor(next(NE * EMB), &[NE, EMB]),
@@ -1674,10 +1665,7 @@ fn write_tiny_deepseek4_gguf_opts(path: &Path, opts: TinyDeepseek4Opts) {
             &format!("{p}.ffn_gate_shexp.weight"),
             next(NFE * EMB),
         ));
-        tensors.push(shexp(
-            &format!("{p}.ffn_up_shexp.weight"),
-            next(NFE * EMB),
-        ));
+        tensors.push(shexp(&format!("{p}.ffn_up_shexp.weight"), next(NFE * EMB)));
         tensors.push(RawTensor::f16(
             &format!("{p}.ffn_down_shexp.weight"),
             next(EMB * NFE),

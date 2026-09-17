@@ -1,6 +1,14 @@
 # OpenCL accelerator backend for joshua (design + plan)
 
-**Status:** M1-M5 DONE + verified on the host iGPU (2026-09-14): full DeepSeek-V4-Flash runs end-to-end on `--device opencl` (Intel UHD 730) with real `JOSHUA_PROFILE_LAYERS` numbers, and the M5 native kernels are bit-exact on the iGPU (correct output, NaN fixed). Native kernels do **not** beat CPU end-to-end because the MoE experts run on CPU by design (see M5) — the iGPU accelerates only the ~8 GiB dense set. **Owner:** joshua (this repo). **Target:** run the
+**Status (2026-09-17):** superseded by the on-device rewrite described in
+[`accelerator-backends.md`](accelerator-backends.md).  The M2 "CPU round-trip"
+execution strategy and the M4 dense-f32 storage recorded below are gone: every
+operator now runs as an OpenCL kernel, block-quantized weights stay quantized
+on the device (dequantized inside the matmul) and, on unified-memory devices,
+alias the memory-mapped file, and the same design was ported to Vulkan.  The
+M1–M5 history below is kept as the record of how the backend was brought up.
+
+**Earlier status:** M1-M5 DONE + verified on the host iGPU (2026-09-14): full DeepSeek-V4-Flash runs end-to-end on `--device opencl` (Intel UHD 730) with real `JOSHUA_PROFILE_LAYERS` numbers, and the M5 native kernels are bit-exact on the iGPU (correct output, NaN fixed). Native kernels do **not** beat CPU end-to-end because the MoE experts run on CPU by design (see M5) — the iGPU accelerates only the ~8 GiB dense set. **Owner:** joshua (this repo). **Target:** run the
 DeepSeek-V4-Flash benchmark on an Intel OpenCL GPU (iGPU now; M40 via the
 NVIDIA OpenCL ICD when reconnected) through a joshua-native `--device opencl`.
 

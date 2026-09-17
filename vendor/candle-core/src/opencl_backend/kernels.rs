@@ -742,10 +742,10 @@ pub fn run_dequant(c: &Ctx, dtype: crate::quantized::GgmlDType, w: usize, out: u
         }
         F32 => Err(Error::Msg("opencl: f32 weights need no dequantization".into())),
         _ => {
-            let nblk = elem_count / dtype.block_size();
+            let nsub = elem_count / 32;
             let mut kn = c.kernel("k_dequant")?;
-            kn.buf(w)?.buf(out)?.val(to_i32(nblk)?)?.val(qtype_code(dtype))?.val(to_i32(dtype.block_size())?)?.val(to_i32(dtype.type_size())?)?.val(woff)?;
-            kn.run(&[nblk], None)
+            kn.buf(w)?.buf(out)?.val(to_i32(nsub)?)?.val(qtype_code(dtype))?.val(to_i32(dtype.block_size())?)?.val(to_i32(dtype.type_size())?)?.val(woff)?;
+            kn.run(&[nsub], None)
         }
     }
 }

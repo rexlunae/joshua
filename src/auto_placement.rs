@@ -183,7 +183,11 @@ pub fn benchmark(device: &Device) -> DenseBench {
 ///   moves it to CPU-BLAS otherwise.  An unmeasurable device (0 GFLOPS) counts
 ///   as "no faster" and dense goes to CPU.
 /// * On the CPU device, `Auto` is CPU.
-pub fn recommend_dense(requested: DensePlacement, bench: &DenseBench, is_cpu_device: bool) -> ResolvedDense {
+pub fn recommend_dense(
+    requested: DensePlacement,
+    bench: &DenseBench,
+    is_cpu_device: bool,
+) -> ResolvedDense {
     match requested {
         DensePlacement::Device => ResolvedDense::Device,
         DensePlacement::Cpu => ResolvedDense::Cpu,
@@ -234,44 +238,68 @@ mod tests {
     fn auto_keeps_dense_when_device_is_much_faster() {
         // A8070-class device: ~30x faster decode, ~15x faster prefill.
         let b = bench(1200.0, 900.0, 40.0, 60.0);
-        assert_eq!(recommend_dense(DensePlacement::Auto, &b, false), ResolvedDense::Device);
+        assert_eq!(
+            recommend_dense(DensePlacement::Auto, &b, false),
+            ResolvedDense::Device
+        );
     }
 
     #[test]
     fn auto_moves_dense_to_cpu_on_weak_igpu() {
         // Renoir-class device: far slower than CPU-BLAS.
         let b = bench(5.0, 8.0, 40.0, 120.0);
-        assert_eq!(recommend_dense(DensePlacement::Auto, &b, false), ResolvedDense::Cpu);
+        assert_eq!(
+            recommend_dense(DensePlacement::Auto, &b, false),
+            ResolvedDense::Cpu
+        );
     }
 
     #[test]
     fn auto_is_cpu_on_cpu_device() {
         let b = bench(0.0, 0.0, 40.0, 120.0);
-        assert_eq!(recommend_dense(DensePlacement::Auto, &b, true), ResolvedDense::Cpu);
+        assert_eq!(
+            recommend_dense(DensePlacement::Auto, &b, true),
+            ResolvedDense::Cpu
+        );
     }
 
     #[test]
     fn unmeasurable_device_falls_back_to_cpu() {
         let b = bench(0.0, 0.0, 40.0, 120.0);
-        assert_eq!(recommend_dense(DensePlacement::Auto, &b, false), ResolvedDense::Cpu);
+        assert_eq!(
+            recommend_dense(DensePlacement::Auto, &b, false),
+            ResolvedDense::Cpu
+        );
     }
 
     #[test]
     fn explicit_requests_win() {
         let weak = bench(5.0, 8.0, 40.0, 120.0);
         // Operator can still force the device even when Auto would pick CPU.
-        assert_eq!(recommend_dense(DensePlacement::Device, &weak, false), ResolvedDense::Device);
+        assert_eq!(
+            recommend_dense(DensePlacement::Device, &weak, false),
+            ResolvedDense::Device
+        );
         let strong = bench(1200.0, 900.0, 40.0, 60.0);
-        assert_eq!(recommend_dense(DensePlacement::Cpu, &strong, false), ResolvedDense::Cpu);
+        assert_eq!(
+            recommend_dense(DensePlacement::Cpu, &strong, false),
+            ResolvedDense::Cpu
+        );
     }
 
     #[test]
     fn boundary_is_min_speedup() {
         // Exactly at the threshold keeps dense on the device.
         let b = bench(MIN_DEVICE_SPEEDUP * 40.0, 1.0, 40.0, 120.0);
-        assert_eq!(recommend_dense(DensePlacement::Auto, &b, false), ResolvedDense::Device);
+        assert_eq!(
+            recommend_dense(DensePlacement::Auto, &b, false),
+            ResolvedDense::Device
+        );
         // Just under the threshold on every shape moves dense to CPU.
         let b = bench(MIN_DEVICE_SPEEDUP * 40.0 - 1.0, 1.0, 40.0, 120.0);
-        assert_eq!(recommend_dense(DensePlacement::Auto, &b, false), ResolvedDense::Cpu);
+        assert_eq!(
+            recommend_dense(DensePlacement::Auto, &b, false),
+            ResolvedDense::Cpu
+        );
     }
 }

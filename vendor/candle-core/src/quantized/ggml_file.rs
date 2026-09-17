@@ -136,13 +136,9 @@ fn from_raw_data<T: super::GgmlType + Send + Sync + 'static>(
             QStorage::OpenCl(crate::QOpenClStorage::from_bytes(d, T::DTYPE, n, &raw_data[..size_in_bytes])?)
         }
         Device::Vulkan(d) => {
-            // M1 dense-on-Vulkan: mirror the OpenCl M4 path — dequantize the
-            // weight to f32 and hold it on the device (VulkanStorage,
-            // host-visible+coherent on the Renoir's unified memory).
+            // Blocks go to the device as-is; the kernels dequantize in place.
             let n = data.len() * T::BLCK_SIZE;
-            let mut ys = vec![0f32; n];
-            T::to_float(data, &mut ys);
-            QStorage::Vulkan(crate::VulkanStorage::from_vec(ys, d)?)
+            QStorage::Vulkan(crate::QVulkanStorage::from_bytes(d, T::DTYPE, n, &raw_data[..size_in_bytes])?)
         }
     };
     super::QTensor::new(data, dims)

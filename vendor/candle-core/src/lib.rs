@@ -139,10 +139,10 @@ pub use opencl_backend::{OpenClDevice, OpenClStorage, QOpenClStorage};
 pub use dummy_opencl_backend::{OpenClDevice, OpenClStorage, QOpenClStorage};
 
 #[cfg(feature = "vulkan")]
-pub use vulkan_backend::{VulkanDevice, VulkanStorage};
+pub use vulkan_backend::{QVulkanStorage, VulkanDevice, VulkanStorage};
 
 #[cfg(not(feature = "vulkan"))]
-pub use dummy_vulkan_backend::{VulkanDevice, VulkanStorage};
+pub use dummy_vulkan_backend::{QVulkanStorage, VulkanDevice, VulkanStorage};
 
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;

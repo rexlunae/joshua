@@ -1,10 +1,9 @@
-#![cfg(feature = "opencl")]
-//! End-to-end OpenCL tests: tiny models run on the OpenCL device (native
-//! kernels, quantized weights on device, zero-copy mmap) must agree with the
-//! CPU path.  Skips when no OpenCL platform is installed (any device type
-//! serves: a GPU, or a CPU runtime such as pocl in CI).
+#![cfg(feature = "vulkan")]
+//! End-to-end Vulkan tests: tiny models run on the Vulkan device (native
+//! kernels, quantized weights on device) must agree with the CPU path.  Skips when no Vulkan platform is installed (any device type
+//! serves: a GPU, or a CPU runtime such as llvmpipe in CI).
 //!
-//!   cargo test --features opencl --test opencl_model_tests
+//!   cargo test --features vulkan --test vulkan_model_tests
 
 mod common;
 
@@ -14,15 +13,15 @@ use std::io::Cursor;
 use std::path::Path;
 use std::sync::Arc;
 
-fn opencl_or_skip() -> Option<Device> {
-    match Device::opencl_if_available(0) {
+fn vulkan_or_skip() -> Option<Device> {
+    match Device::vulkan_if_available(0) {
         Ok(Device::Cpu) => {
-            eprintln!("SKIP: no OpenCL device available on this host");
+            eprintln!("SKIP: no Vulkan device available on this host");
             None
         }
         Ok(dev) => Some(dev),
         Err(e) => {
-            eprintln!("SKIP: opencl init failed: {e}");
+            eprintln!("SKIP: vulkan init failed: {e}");
             None
         }
     }
@@ -96,11 +95,11 @@ fn assert_close(what: &str, dev: &[f32], cpu: &[f32]) {
 }
 
 /// Run `tokens` through the tiny model written by `write` on the CPU and on
-/// the OpenCL device (heap-loaded when `heap`, and memory-mapped) and compare
+/// the Vulkan device (heap-loaded when `heap`, and memory-mapped) and compare
 /// the prefill and single-token decode logits.
 fn run_model(name: &str, write: fn(&Path), tokens: &[u32], heap: bool) {
-    let Some(ocl) = opencl_or_skip() else { return };
-    let dir = common::model_dir(&format!("opencl-{name}"));
+    let Some(ocl) = vulkan_or_skip() else { return };
+    let dir = common::model_dir(&format!("vulkan-{name}"));
     let model = dir.join("model.gguf");
     write(&model);
 
@@ -119,22 +118,22 @@ fn run_model(name: &str, write: fn(&Path), tokens: &[u32], heap: bool) {
         runs.push(("heap", load_heap(&model, &ocl)));
     }
     for (path, mut m) in runs {
-        let before = candle_core::opencl_backend::fallback_count();
+        let before = candle_core::vulkan_backend::fallback_count();
         let prefill = logits(&mut m, tokens, 0, &ocl);
         assert_close(&format!("{name} {path} prefill"), &prefill, &ref_prefill);
         let decode = logits(&mut m, &tokens[tokens.len() - 1..], tokens.len(), &ocl);
         assert_close(&format!("{name} {path} decode"), &decode, &ref_decode);
         eprintln!(
             "{name} {path}: {} native launches so far, {} fallbacks during this model",
-            candle_core::opencl_backend::native_exec_count(),
-            candle_core::opencl_backend::fallback_count() - before
+            candle_core::vulkan_backend::native_exec_count(),
+            candle_core::vulkan_backend::fallback_count() - before
         );
     }
     std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
-fn opencl_qwen3moe_matches_cpu() {
+fn vulkan_qwen3moe_matches_cpu() {
     run_model(
         "qwen3moe",
         common::write_tiny_qwen3moe_gguf,
@@ -144,7 +143,7 @@ fn opencl_qwen3moe_matches_cpu() {
 }
 
 #[test]
-fn opencl_deepseek2_matches_cpu() {
+fn vulkan_deepseek2_matches_cpu() {
     run_model(
         "deepseek2",
         common::write_tiny_deepseek2_gguf,
@@ -154,7 +153,7 @@ fn opencl_deepseek2_matches_cpu() {
 }
 
 #[test]
-fn opencl_llama_matches_cpu() {
+fn vulkan_llama_matches_cpu() {
     run_model(
         "llama",
         common::write_tiny_llama_gguf,
@@ -164,7 +163,7 @@ fn opencl_llama_matches_cpu() {
 }
 
 #[test]
-fn opencl_deepseek4_matches_cpu() {
+fn vulkan_deepseek4_matches_cpu() {
     // deepseek4 needs the raw header (IQ2_XXS experts), so only the mmap
     // loader applies; the experts stay on the CPU, the dense set runs on
     // the device.

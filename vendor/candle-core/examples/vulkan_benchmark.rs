@@ -1,11 +1,11 @@
 //! Vulkan backend micro-benchmark: measures native kernel throughput on a
 //! Vulkan device (bring-up target: AMD Renoir iGPU / RADV).
 //!
-//! Requires the `vulkan` feature. Native kernels run only when
-//! `JOSHUA_VULKAN_NATIVE=1`; without it the ops fall back to CPU, which this
-//! benchmark then measures for comparison. Run on the Vulkan host with:
+//! Requires the `vulkan` feature. Native kernels run by default;
+//! `JOSHUA_VULKAN_NATIVE=0` measures the CPU round-trip path instead. Run on
+//! the Vulkan host with:
 //!
-//!   JOSHUA_VULKAN_NATIVE=1 cargo run --release --features vulkan \
+//!   cargo run --release --features vulkan \
 //!       --example vulkan_benchmark -- <m> <k> <n> <iters>
 //!
 //! Defaults to a 1024x1024x1024 matmul (a size that runs reliably on iGPUs;
@@ -27,7 +27,7 @@ fn main() -> anyhow::Result<()> {
         .map(|v| v.max(1))
         .unwrap_or(50);
 
-    let native = std::env::var("JOSHUA_VULKAN_NATIVE").map(|v| v == "1").unwrap_or(false);
+    let native = candle_core::vulkan_backend::native_enabled();
     let dev = match candle_core::VulkanDevice::new(0) {
         Ok(d) => d,
         Err(e) => {

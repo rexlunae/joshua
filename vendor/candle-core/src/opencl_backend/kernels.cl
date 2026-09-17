@@ -811,9 +811,11 @@ inline short i16_at(__global const uchar* p) {
 #define QT_Q8_K 15
 #define QT_BF16 30
 
-// Dequantize block `blk` (element index `blk * qk` .. ) of a row into `out`
-// (qk floats).  `p` points at the block.
-inline void dequant_block(int qt, __global const uchar* p, float* out) {
+// Dequantize elements [32*j, 32*j + 32) of the block at `p` into `out`
+// (32 floats).  Sub-blocks are the unit of parallelism: a K-quant block
+// holds 256 elements, and one work-item per 32 keeps a work-group busy on
+// a row of a few thousand elements.  `j` is always 0 for 32-element blocks.
+inline void dequant_sub(int qt, __global const uchar* p, int j, float* out) {
     if (qt == QT_Q8_0) {
         float d = f16_at(p);
         for (int i = 0; i < 32; i++) out[i] = d * (float)((char)p[2 + i]);
@@ -854,144 +856,98 @@ inline void dequant_block(int qt, __global const uchar* p, float* out) {
     } else if (qt == QT_Q8_1) {
         float d = f16_at(p);
         for (int i = 0; i < 32; i++) out[i] = d * (float)((char)p[4 + i]);
-    } else if (qt == QT_Q4_K) {
+    } else if (qt == QT_Q4_K || qt == QT_Q5_K) {
+        // 64-element groups g share a (scale, min) pair per 32-half.
         float d = f16_at(p), dmin = f16_at(p + 2);
         __global const uchar* sc = p + 4;
-        __global const uchar* qs = p + 16;
-        int is = 0;
-        int o = 0;
-        for (int j = 0; j < 256; j += 64) {
-            uchar sc1, m1, sc2, m2;
-            // get_scale_min_k4(is, sc)
-            if (is < 4) { sc1 = sc[is] & 63; m1 = sc[is + 4] & 63; }
-            else { sc1 = (sc[is + 4] & 0xF) | ((sc[is - 4] >> 6) << 4); m1 = (sc[is + 4] >> 4) | ((sc[is] >> 6) << 4); }
-            if (is + 1 < 4) { sc2 = sc[is + 1] & 63; m2 = sc[is + 5] & 63; }
-            else { sc2 = (sc[is + 5] & 0xF) | ((sc[is - 3] >> 6) << 4); m2 = (sc[is + 5] >> 4) | ((sc[is + 1] >> 6) << 4); }
-            float d1 = d * (float)sc1, mm1 = dmin * (float)m1;
-            float d2 = d * (float)sc2, mm2 = dmin * (float)m2;
-            for (int l = 0; l < 32; l++) out[o + l] = d1 * (float)(qs[l] & 0xF) - mm1;
-            for (int l = 0; l < 32; l++) out[o + 32 + l] = d2 * (float)(qs[l] >> 4) - mm2;
-            qs += 32;
-            o += 64;
-            is += 2;
-        }
-    } else if (qt == QT_Q5_K) {
-        float d = f16_at(p), dmin = f16_at(p + 2);
-        __global const uchar* sc = p + 4;
-        __global const uchar* qh = p + 16;
-        __global const uchar* ql = p + 48;
-        int is = 0;
-        int o = 0;
-        uchar u1 = 1, u2 = 2;
-        for (int j = 0; j < 256; j += 64) {
-            uchar sc1, m1, sc2, m2;
-            if (is < 4) { sc1 = sc[is] & 63; m1 = sc[is + 4] & 63; }
-            else { sc1 = (sc[is + 4] & 0xF) | ((sc[is - 4] >> 6) << 4); m1 = (sc[is + 4] >> 4) | ((sc[is] >> 6) << 4); }
-            if (is + 1 < 4) { sc2 = sc[is + 1] & 63; m2 = sc[is + 5] & 63; }
-            else { sc2 = (sc[is + 5] & 0xF) | ((sc[is - 3] >> 6) << 4); m2 = (sc[is + 5] >> 4) | ((sc[is + 1] >> 6) << 4); }
-            float d1 = d * (float)sc1, mm1 = dmin * (float)m1;
-            float d2 = d * (float)sc2, mm2 = dmin * (float)m2;
-            for (int l = 0; l < 32; l++) out[o + l] = d1 * (float)((ql[l] & 0xF) + ((qh[l] & u1) ? 16 : 0)) - mm1;
-            for (int l = 0; l < 32; l++) out[o + 32 + l] = d2 * (float)((ql[l] >> 4) + ((qh[l] & u2) ? 16 : 0)) - mm2;
-            ql += 32;
-            o += 64;
-            is += 2;
-            u1 <<= 2;
-            u2 <<= 2;
+        int g = j >> 1, hf = j & 1;
+        int is = 2 * g + hf;
+        uchar sc1, m1;
+        if (is < 4) { sc1 = sc[is] & 63; m1 = sc[is + 4] & 63; }
+        else { sc1 = (sc[is + 4] & 0xF) | ((sc[is - 4] >> 6) << 4); m1 = (sc[is + 4] >> 4) | ((sc[is] >> 6) << 4); }
+        float d1 = d * (float)sc1, mm1 = dmin * (float)m1;
+        if (qt == QT_Q4_K) {
+            __global const uchar* qs = p + 16 + 32 * g;
+            for (int l = 0; l < 32; l++) {
+                uchar q = qs[l];
+                out[l] = d1 * (float)(hf ? (q >> 4) : (q & 0xF)) - mm1;
+            }
+        } else {
+            __global const uchar* qh = p + 16;
+            __global const uchar* ql = p + 48 + 32 * g;
+            uchar u = (uchar)(1 << (2 * g + hf));
+            for (int l = 0; l < 32; l++) {
+                uchar q = ql[l];
+                out[l] = d1 * (float)((hf ? (q >> 4) : (q & 0xF)) + ((qh[l] & u) ? 16 : 0)) - mm1;
+            }
         }
     } else if (qt == QT_Q6_K) {
-        __global const uchar* ql = p;
-        __global const uchar* qh = p + 128;
-        __global const uchar* sc = p + 192;
+        int hh = j >> 2, q = j & 3;
+        __global const uchar* ql = p + 64 * hh;
+        __global const uchar* qh = p + 128 + 32 * hh;
+        __global const uchar* sc = p + 192 + 8 * hh;
         float d = f16_at(p + 208);
-        for (int n = 0; n < 256; n += 128) {
-            for (int l = 0; l < 32; l++) {
-                int is = l / 16;
-                char q1 = (char)((ql[l] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
-                char q2 = (char)((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
-                char q3 = (char)((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
-                char q4 = (char)((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
-                out[n + l] = d * (float)((char)sc[is]) * (float)q1;
-                out[n + l + 32] = d * (float)((char)sc[is + 2]) * (float)q2;
-                out[n + l + 64] = d * (float)((char)sc[is + 4]) * (float)q3;
-                out[n + l + 96] = d * (float)((char)sc[is + 6]) * (float)q4;
-            }
-            ql += 64;
-            qh += 32;
-            sc += 8;
+        for (int l = 0; l < 32; l++) {
+            int is = l / 16;
+            int v;
+            char s;
+            if (q == 0) { v = (ql[l] & 0xF) | (((qh[l] >> 0) & 3) << 4); s = (char)sc[is]; }
+            else if (q == 1) { v = (ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4); s = (char)sc[is + 2]; }
+            else if (q == 2) { v = (ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4); s = (char)sc[is + 4]; }
+            else { v = (ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4); s = (char)sc[is + 6]; }
+            out[l] = d * (float)s * (float)(v - 32);
         }
     } else if (qt == QT_Q8_K) {
         float d = as_float((uint)p[0] | ((uint)p[1] << 8) | ((uint)p[2] << 16) | ((uint)p[3] << 24));
-        for (int i = 0; i < 256; i++) out[i] = d * (float)((char)p[4 + i]);
+        for (int i = 0; i < 32; i++) out[i] = d * (float)((char)p[4 + 32 * j + i]);
     } else if (qt == QT_Q2_K) {
-        __global const uchar* sc = p;
-        __global const uchar* qs = p + 16;
+        int hh = j >> 2, m = j & 3;
+        __global const uchar* sc = p + 8 * hh + 2 * m;
+        __global const uchar* qs = p + 16 + 32 * hh;
         float d = f16_at(p + 80), dmin = f16_at(p + 82);
-        int is = 0;
-        int o = 0;
-        for (int n = 0; n < 256; n += 128) {
-            int shift = 0;
-            for (int j = 0; j < 4; j++) {
-                uchar s = sc[is++];
-                float dl = d * (float)(s & 0xF), ml = dmin * (float)(s >> 4);
-                for (int l = 0; l < 16; l++) out[o + l] = dl * (float)((qs[l] >> shift) & 3) - ml;
-                o += 16;
-                s = sc[is++];
-                dl = d * (float)(s & 0xF); ml = dmin * (float)(s >> 4);
-                for (int l = 0; l < 16; l++) out[o + l] = dl * (float)((qs[l + 16] >> shift) & 3) - ml;
-                o += 16;
-                shift += 2;
-            }
-            qs += 32;
+        int shift = 2 * m;
+        uchar s0 = sc[0], s1 = sc[1];
+        float dl0 = d * (float)(s0 & 0xF), ml0 = dmin * (float)(s0 >> 4);
+        float dl1 = d * (float)(s1 & 0xF), ml1 = dmin * (float)(s1 >> 4);
+        for (int l = 0; l < 16; l++) {
+            out[l] = dl0 * (float)((qs[l] >> shift) & 3) - ml0;
+            out[16 + l] = dl1 * (float)((qs[l + 16] >> shift) & 3) - ml1;
         }
     } else if (qt == QT_Q3_K) {
         __global const uchar* hm = p;
-        __global const uchar* qs = p + 32;
         __global const uchar* scp = p + 96;
         float d = f16_at(p + 108);
         // Unpack the 16 6-bit scales.
-        int scales[16];
         uint aux[4];
         for (int i = 0; i < 4; i++) aux[i] = (uint)scp[4 * i] | ((uint)scp[4 * i + 1] << 8) | ((uint)scp[4 * i + 2] << 16) | ((uint)scp[4 * i + 3] << 24);
         uint kmask1 = 0x03030303u, kmask2 = 0x0f0f0f0fu;
         uint tmp = aux[2];
-        uint a0 = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
-        uint a1 = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
-        uint a2 = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
-        uint a3 = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
-        uint as4[4] = { a0, a1, a2, a3 };
-        for (int i = 0; i < 16; i++) scales[i] = (int)(char)((as4[i / 4] >> (8 * (i % 4))) & 0xFF) - 32;
-        uchar m = 1;
-        int is = 0;
-        int o = 0;
-        for (int n = 0; n < 256; n += 128) {
-            int shift = 0;
-            for (int j = 0; j < 4; j++) {
-                float dl = d * (float)scales[is++];
-                for (int l = 0; l < 16; l++) {
-                    int q = (int)((qs[l] >> shift) & 3) - ((hm[l] & m) ? 0 : 4);
-                    out[o + l] = dl * (float)q;
-                }
-                o += 16;
-                dl = d * (float)scales[is++];
-                for (int l = 0; l < 16; l++) {
-                    int q = (int)((qs[l + 16] >> shift) & 3) - ((hm[l + 16] & m) ? 0 : 4);
-                    out[o + l] = dl * (float)q;
-                }
-                o += 16;
-                shift += 2;
-                m <<= 1;
-            }
-            qs += 32;
+        uint as4[4];
+        as4[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
+        as4[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
+        as4[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+        as4[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+        int hh = j >> 2, m = j & 3;
+        int is = 8 * hh + 2 * m;
+        int s0 = (int)(char)((as4[is / 4] >> (8 * (is % 4))) & 0xFF) - 32;
+        int s1 = (int)(char)((as4[(is + 1) / 4] >> (8 * ((is + 1) % 4))) & 0xFF) - 32;
+        uchar mask = (uchar)(1 << (4 * hh + m));
+        int shift = 2 * m;
+        __global const uchar* qs = p + 32 + 32 * hh;
+        float dl0 = d * (float)s0, dl1 = d * (float)s1;
+        for (int l = 0; l < 16; l++) {
+            int q0 = (int)((qs[l] >> shift) & 3) - ((hm[l] & mask) ? 0 : 4);
+            int q1 = (int)((qs[l + 16] >> shift) & 3) - ((hm[l + 16] & mask) ? 0 : 4);
+            out[l] = dl0 * (float)q0;
+            out[16 + l] = dl1 * (float)q1;
         }
     }
 }
 
 // Quantized GEMV/GEMM: C[m, n] = sum_k X[m, k] * W[n, k]; W blocks at
-// `w + woff`, `bpr` bytes per row, `qk` elements per block, `bsz` bytes per
-// block.  One work-group per (n, m); the group's work-items stride over
-// blocks, dequantizing each block into private memory.  For F16/BF16/F32
-// weights `qk` is 1... handled by the dense path instead.
+// `w + woff`, `qk` elements per block, `bsz` bytes per block.  One
+// work-group per (n, m); the group's work-items stride over 32-element
+// sub-blocks, dequantizing each into private memory.
 __kernel __attribute__((reqd_work_group_size(WG, 1, 1)))
 void k_qgemv(__global const float* X, __global const uchar* W, __global float* C,
              int N, int K, int qt, int qk, int bsz, ulong woff, int xoff, int coff, int M) {
@@ -1002,15 +958,18 @@ void k_qgemv(__global const float* X, __global const uchar* W, __global float* C
     if (n >= N || m >= M) return;
     __global const float* x = X + xoff + (long)m * K;
     __global const uchar* row = W + woff + (ulong)n * (ulong)(K / qk) * (ulong)bsz;
-    int nblk = K / qk;
+    int spb = qk / 32;
+    int nsub = K / 32;
     float acc = 0.0f;
-    float buf[256];
-    for (int b = t; b < nblk; b += WG) {
-        dequant_block(qt, row + (ulong)b * bsz, buf);
-        __global const float* xb = x + b * qk;
-        float s = 0.0f;
-        for (int i = 0; i < qk; i++) s += xb[i] * buf[i];
-        acc += s;
+    float buf[32];
+    for (int s = t; s < nsub; s += WG) {
+        int b = s / spb;
+        int jj = s - b * spb;
+        dequant_sub(qt, row + (ulong)b * bsz, jj, buf);
+        __global const float* xb = x + s * 32;
+        float d = 0.0f;
+        for (int i = 0; i < 32; i++) d += xb[i] * buf[i];
+        acc += d;
     }
     sh[t] = acc;
     barrier(CLK_LOCAL_MEM_FENCE);
@@ -1046,14 +1005,17 @@ void k_hgemv(__global const float* X, __global const uchar* W, __global float* C
     if (t == 0) C[coff + (long)m * N + n] = sh[0];
 }
 
-// Dequantize a whole tensor to f32: one work-item per block.
-__kernel void k_dequant(__global const uchar* W, __global float* O, int nblk, int qt, int qk, int bsz, ulong woff) {
-    int b = get_global_id(0);
-    if (b >= nblk) return;
-    float buf[256];
-    dequant_block(qt, W + woff + (ulong)b * bsz, buf);
-    __global float* o = O + (long)b * qk;
-    for (int i = 0; i < qk; i++) o[i] = buf[i];
+// Dequantize a whole tensor to f32: one work-item per 32-element sub-block.
+__kernel void k_dequant(__global const uchar* W, __global float* O, int nsub, int qt, int qk, int bsz, ulong woff) {
+    int s = get_global_id(0);
+    if (s >= nsub) return;
+    int spb = qk / 32;
+    int b = s / spb;
+    int jj = s - b * spb;
+    float buf[32];
+    dequant_sub(qt, W + woff + (ulong)b * bsz, jj, buf);
+    __global float* o = O + (long)s * 32;
+    for (int i = 0; i < 32; i++) o[i] = buf[i];
 }
 
 __kernel void k_dequant_half(__global const uchar* W, __global float* O, int n, int is_bf16, ulong woff) {
@@ -1063,7 +1025,7 @@ __kernel void k_dequant_half(__global const uchar* W, __global float* O, int n, 
 }
 
 // Quantized embedding gather: O[j, :] = dequant(W[ids[j], :]); one work-group
-// per row, work-items stride over blocks.
+// per row, work-items stride over sub-blocks.
 __kernel __attribute__((reqd_work_group_size(WG, 1, 1)))
 void k_qembed(__global const uchar* W, __global const uint* ids, __global float* O,
               int n_ids, int K, int qt, int qk, int bsz, ulong woff, int ids_off, int vocab) {
@@ -1074,10 +1036,13 @@ void k_qembed(__global const uchar* W, __global const uint* ids, __global float*
     if (id >= (uint)vocab) id = 0;
     __global const uchar* row = W + woff + (ulong)id * (ulong)(K / qk) * (ulong)bsz;
     __global float* o = O + (long)j * K;
-    int nblk = K / qk;
-    float buf[256];
-    for (int b = t; b < nblk; b += WG) {
-        dequant_block(qt, row + (ulong)b * bsz, buf);
-        for (int i = 0; i < qk; i++) o[b * qk + i] = buf[i];
+    int spb = qk / 32;
+    int nsub = K / 32;
+    float buf[32];
+    for (int s = t; s < nsub; s += WG) {
+        int b = s / spb;
+        int jj = s - b * spb;
+        dequant_sub(qt, row + (ulong)b * bsz, jj, buf);
+        for (int i = 0; i < 32; i++) o[s * 32 + i] = buf[i];
     }
 }
