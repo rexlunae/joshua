@@ -14,18 +14,26 @@ use std::io::Cursor;
 use std::path::Path;
 use std::sync::Arc;
 
+/// The one OpenCL device every test in this binary shares, as a server
+/// shares one device across its sessions.  Opened once: the tests run on
+/// parallel threads, and creating and tearing down a context per test while
+/// other threads run kernels is a configuration no real user has (and one
+/// that trips reference-counting bugs in pocl).
 fn opencl_or_skip() -> Option<Device> {
-    match Device::opencl_if_available(0) {
-        Ok(Device::Cpu) => {
-            eprintln!("SKIP: no OpenCL device available on this host");
-            None
-        }
-        Ok(dev) => Some(dev),
-        Err(e) => {
-            eprintln!("SKIP: opencl init failed: {e}");
-            None
-        }
-    }
+    static DEVICE: std::sync::OnceLock<Option<Device>> = std::sync::OnceLock::new();
+    DEVICE
+        .get_or_init(|| match Device::opencl_if_available(0) {
+            Ok(Device::Cpu) => {
+                eprintln!("SKIP: no OpenCL device available on this host");
+                None
+            }
+            Ok(dev) => Some(dev),
+            Err(e) => {
+                eprintln!("SKIP: opencl init failed: {e}");
+                None
+            }
+        })
+        .clone()
 }
 
 fn load_heap(model: &Path, device: &Device) -> QuantizedModel {

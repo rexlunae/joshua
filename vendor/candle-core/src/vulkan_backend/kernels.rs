@@ -257,6 +257,11 @@ pub struct Exec {
     params_mem: vk::DeviceMemory,
     params_map: *mut u8,
     params_off: usize,
+    /// The device's fault word (see `glsl.rs`): indexing kernels set it on
+    /// an out-of-range id; [`Exec::take_fault`] reads and clears it.
+    fault_buf: vk::Buffer,
+    fault_mem: vk::DeviceMemory,
+    fault_map: *mut u8,
     pub(super) recording: bool,
     launches: usize,
     pub(super) garbage: Vec<Garbage>,
@@ -308,6 +313,8 @@ impl Exec {
             .map_err(|e| Error::Msg(format!("vulkan bind_buffer_memory(params) failed: {e:?}")))?;
         let params_map = unsafe { device.map_memory(params_mem, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) }
             .map_err(|e| Error::Msg(format!("vulkan map_memory(params) failed: {e:?}")))? as *mut u8;
+        let (fault_buf, fault_mem, fault_map) = host_buffer(device, FAULT_BYTES as u64, host_mem_type, "fault")?;
+        unsafe { std::ptr::write_bytes(fault_map, 0, FAULT_BYTES) };
         Ok(Exec {
             device: device.clone(),
             queue,
@@ -319,6 +326,9 @@ impl Exec {
             params_mem,
             params_map,
             params_off: 0,
+            fault_buf,
+            fault_mem,
+            fault_map,
             recording: false,
             launches: 0,
             garbage: Vec::new(),
@@ -437,10 +447,52 @@ impl Exec {
     }
 }
 
+impl Exec {
+    /// The fault word as a kernel argument.
+    pub(super) fn fault(&self) -> Buf {
+        Buf { buffer: self.fault_buf, bytes: FAULT_BYTES as u64 }
+    }
+
+    /// Whether an indexing kernel flagged an out-of-range id since the last
+    /// call (the flag is cleared).  Meaningful after a flush.
+    pub(super) fn take_fault(&mut self) -> bool {
+        let p = self.fault_map as *mut u32;
+        let v = unsafe { std::ptr::read_volatile(p) };
+        if v != 0 {
+            unsafe { std::ptr::write_volatile(p, 0) };
+        }
+        v != 0
+    }
+}
+
+/// Size of the fault buffer (one word, padded to a safe allocation size).
+const FAULT_BYTES: usize = 256;
+
+/// A small host-visible buffer bound to its own allocation and mapped.
+fn host_buffer(device: &ash::Device, size: u64, mem_type: u32, what: &str) -> Result<(vk::Buffer, vk::DeviceMemory, *mut u8)> {
+    let buf = unsafe {
+        device.create_buffer(
+            &vk::BufferCreateInfo::default().size(size).usage(vk::BufferUsageFlags::STORAGE_BUFFER).sharing_mode(vk::SharingMode::EXCLUSIVE),
+            None,
+        )
+    }
+    .map_err(|e| Error::Msg(format!("vulkan create_buffer({what}) failed: {e:?}")))?;
+    let req = unsafe { device.get_buffer_memory_requirements(buf) };
+    let mem = unsafe { device.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(mem_type), None) }
+        .map_err(|e| Error::Msg(format!("vulkan allocate_memory({what}) failed: {e:?}")))?;
+    unsafe { device.bind_buffer_memory(buf, mem, 0) }.map_err(|e| Error::Msg(format!("vulkan bind_buffer_memory({what}) failed: {e:?}")))?;
+    let map = unsafe { device.map_memory(mem, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) }
+        .map_err(|e| Error::Msg(format!("vulkan map_memory({what}) failed: {e:?}")))? as *mut u8;
+    Ok((buf, mem, map))
+}
+
 impl Drop for Exec {
     fn drop(&mut self) {
         unsafe {
             let _ = self.device.device_wait_idle();
+            self.device.unmap_memory(self.fault_mem);
+            self.device.destroy_buffer(self.fault_buf, None);
+            self.device.free_memory(self.fault_mem, None);
             self.device.unmap_memory(self.params_mem);
             self.device.destroy_buffer(self.params_buf, None);
             self.device.free_memory(self.params_mem, None);
@@ -813,13 +865,13 @@ pub fn run_index_select(d: &VulkanDevice, elem8: bool, ids_i64: bool, src: Buf, 
     let push = Push::default().us(n)?.us(left)?.us(n_ids)?.us(right)?.us(dim_size)?.us(src_off)?.us(ids_off)?;
     let lim = d.limits();
     let key = format!("index_select_{}_{}", if ids_i64 { "i64" } else { "u32" }, if elem8 { 8 } else { 4 });
-    d.launch(&key, |wg| glsl::k_index_select(wg, elem8, ids_i64), &[src, ids, out], push, &[], grid(n, lim.wg, 1, lim.max_groups_x))
+    d.launch(&key, |wg| glsl::k_index_select(wg, elem8, ids_i64), &[src, ids, out, d.fault_buf()], push, &[], grid(n, lim.wg, 1, lim.max_groups_x))
 }
 
 pub fn run_gather(d: &VulkanDevice, src: Buf, ids: Buf, out: Buf, n: usize, ix: Idx, src_dim_stride: usize, dim_size: usize) -> Result<()> {
     let push = Push::default().us(n)?.us(src_dim_stride)?.us(dim_size)?;
     let lim = d.limits();
-    d.launch("gather_4", glsl::k_gather, &[src, ids, out], push, &[ix], grid(n, lim.wg, 1, lim.max_groups_x))
+    d.launch("gather_4", glsl::k_gather, &[src, ids, out, d.fault_buf()], push, &[ix], grid(n, lim.wg, 1, lim.max_groups_x))
 }
 
 /// scatter set / add: `ix` enumerates the ids space with `dim` collapsed
@@ -829,14 +881,14 @@ pub fn run_scatter(d: &VulkanDevice, add: bool, dst: Buf, ids: Buf, src: Buf, n:
     let push = Push::default().us(n)?.us(n_j)?.us(ids_ds)?.us(src_ds)?.us(dst_ds)?.us(dim_size)?;
     let lim = d.limits();
     let key = if add { "scatter_add_f32" } else { "scatter_set_4" };
-    d.launch(key, |wg| glsl::k_scatter(wg, add), &[dst, ids, src], push, &[ix], grid(n, lim.wg, 1, lim.max_groups_x))
+    d.launch(key, |wg| glsl::k_scatter(wg, add), &[dst, ids, src, d.fault_buf()], push, &[ix], grid(n, lim.wg, 1, lim.max_groups_x))
 }
 
 pub fn run_index_add(d: &VulkanDevice, dst: Buf, ids: Buf, src: Buf, left: usize, n_ids: usize, right: usize, dim_size: usize, src_off: usize, ids_off: usize) -> Result<()> {
     let n_lr = left * right;
     let push = Push::default().us(n_lr)?.us(left)?.us(n_ids)?.us(right)?.us(dim_size)?.us(src_off)?.us(ids_off)?;
     let lim = d.limits();
-    d.launch("index_add_f32", glsl::k_index_add, &[dst, ids, src], push, &[], grid(n_lr, lim.wg, 1, lim.max_groups_x))
+    d.launch("index_add_f32", glsl::k_index_add, &[dst, ids, src, d.fault_buf()], push, &[], grid(n_lr, lim.wg, 1, lim.max_groups_x))
 }
 
 // ─── Dense GEMM / GEMV ───────────────────────────────────────────────────────
@@ -974,7 +1026,7 @@ pub fn run_dequant(d: &VulkanDevice, dtype: crate::quantized::GgmlDType, w: Buf,
 pub fn run_qembed(d: &VulkanDevice, dtype: crate::quantized::GgmlDType, w: Buf, ids: Buf, out: Buf, n_ids: usize, k: usize, vocab: usize, ids_off: usize) -> Result<()> {
     let push = Push::default().us(n_ids)?.us(k)?.i(qtype_code(dtype)).us(dtype.block_size())?.us(dtype.type_size())?.us(ids_off)?.us(vocab)?;
     let lim = d.limits();
-    d.launch("qembed", glsl::k_qembed, &[w, ids, out], push, &[], row_grid(n_ids, 1, lim.max_groups_x))
+    d.launch("qembed", glsl::k_qembed, &[w, ids, out, d.fault_buf()], push, &[], row_grid(n_ids, 1, lim.max_groups_x))
 }
 
 /// Type alias for the pipeline cache map.

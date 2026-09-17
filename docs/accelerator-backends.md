@@ -88,9 +88,20 @@ INFO joshua: Vulkan device: AMD Radeon Graphics (RADV RENOIR) (host-unified memo
 
 * Tensors stay below 2³¹ elements (kernel indices are 32-bit).
 * A Vulkan kernel cannot bind a buffer larger than the device's
-  `maxStorageBufferRange`; the op then falls back to the CPU path (or, for a
-  quantized weight, fails with the limit named).  Real drivers report 4 GiB;
+  `maxStorageBufferRange`; the op, quantized matmuls and embedding gathers
+  included, then falls back to the CPU path.  Real drivers report 4 GiB;
   llvmpipe reports 128 MiB.
+* The quantized ops (matmul, embedding gather) follow the same contract as
+  every other operator: with `JOSHUA_*_NATIVE=0`, or when the device
+  rejects a launch, the block bytes and the activation come back to the
+  host, candle's CPU kernel runs and the result goes up.
+* An out-of-range id in `index_select`, `gather`, `scatter`, `index_add` or
+  an embedding gather cannot raise an error inside a kernel.  The kernel
+  skips the element and sets a per-device fault word instead, which the
+  host checks and clears at the next read-back or `synchronize` and reports
+  as an error there.  Nothing is read or written out of bounds and a bad id
+  never becomes a plausible result; the error surfaces at the point where
+  the CPU backend's error for the same input would have been observed.
 * naga's GLSL front end has no atomics, so the Vulkan scatter kernels walk
   the scattered dimension sequentially per output position (deterministic,
   same result as the CPU loop), and 1- and 2-byte outputs are written a

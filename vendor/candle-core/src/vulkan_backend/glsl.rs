@@ -597,17 +597,25 @@ void main() {
     s
 }
 
+// Out-of-range ids: the CPU backend returns an error, which a kernel
+// cannot.  Every indexing kernel binds the device's `fault` word last and
+// sets it (skipping the element) when an id exceeds the indexed dimension;
+// the host checks and clears the word at the next read-back or
+// synchronize and reports the error there, so a bad id never reads or
+// writes out of bounds and never turns into a plausible result.
+
 /// `out[l, i, r] = src[l, ids[i], r]` over a contiguous source; u32 ids
-/// (`ids_i64`: `uvec2` ids, low word used, negative → 0).
+/// (`ids_i64`: `uvec2` ids; a non-zero high word is out of range).
 /// Push: `n, left, n_ids, right, dim_size, src_off, ids_off`.
 pub fn k_index_select(wg: usize, elem8: bool, ids_i64: bool) -> String {
     let ty = if elem8 { "uvec2" } else { "uint" };
-    let mut s = prelude(wg, 3);
+    let mut s = prelude(wg, 4);
     s += &buf(0, ty, "src", true);
     s += &buf(1, if ids_i64 { "uvec2" } else { "uint" }, "ids", true);
     s += &buf(2, ty, "o", false);
+    s += &buf(3, "uint", "fault", false);
     let id = if ids_i64 {
-        "uvec2 rr = ids[pc.ids_off + j]; uint id = (rr.y & 0x80000000u) != 0u ? 0u : rr.x;"
+        "uvec2 rr = ids[pc.ids_off + j]; uint id = rr.y != 0u ? 0xFFFFFFFFu : rr.x;"
     } else {
         "uint id = ids[pc.ids_off + j];"
     };
@@ -623,7 +631,7 @@ void main() {{
     int j = t % pc.n_ids;
     int l = t / pc.n_ids;
     {id}
-    if (id >= uint(pc.dim_size)) id = 0u;
+    if (id >= uint(pc.dim_size)) {{ fault[0] = 1u; return; }}
     o[i] = src[pc.src_off + (l * pc.dim_size + int(id)) * pc.right + r];
 }}
 "#
@@ -634,10 +642,11 @@ void main() {{
 /// gather along `dim`: `ix.s0` maps output index → ids offset, `ix.s1` →
 /// src offset with the `dim` coordinate zeroed.  Push: `n, src_dim_stride, dim_size`.
 pub fn k_gather(wg: usize) -> String {
-    let mut s = prelude(wg, 3);
+    let mut s = prelude(wg, 4);
     s += &buf(0, "uint", "src", true);
     s += &buf(1, "uint", "ids", true);
     s += &buf(2, "uint", "o", false);
+    s += &buf(3, "uint", "fault", false);
     s += r#"
 layout(push_constant) uniform PC { int n; int src_dim_stride; int dim_size; } pc;
 layout(local_size_x = WG) in;
@@ -645,7 +654,7 @@ void main() {
     int i = gid();
     if (i >= pc.n) return;
     uint id = ids[off0(i)];
-    if (id >= uint(pc.dim_size)) id = 0u;
+    if (id >= uint(pc.dim_size)) { fault[0] = 1u; return; }
     o[i] = src[off1(i) + int(id) * pc.src_dim_stride];
 }
 "#;
@@ -660,10 +669,11 @@ void main() {
 /// Push: `n, n_j, ids_ds, src_ds, dst_ds, dim_size`.
 pub fn k_scatter(wg: usize, add: bool) -> String {
     let ty = if add { "float" } else { "uint" };
-    let mut s = prelude(wg, 3);
+    let mut s = prelude(wg, 4);
     s += &buf(0, ty, "dst", false);
     s += &buf(1, "uint", "ids", true);
     s += &buf(2, ty, "src", true);
+    s += &buf(3, "uint", "fault", false);
     let write = if add {
         "dst[d + int(id) * pc.dst_ds] += v;"
     } else {
@@ -681,7 +691,7 @@ void main() {{
     int d = off2(i);
     for (int j = 0; j < pc.n_j; j++) {{
         uint id = ids[a + j * pc.ids_ds];
-        if (id >= uint(pc.dim_size)) continue;
+        if (id >= uint(pc.dim_size)) {{ fault[0] = 1u; continue; }}
         {ty} v = src[b + j * pc.src_ds];
         {write}
     }}
@@ -695,10 +705,11 @@ void main() {{
 /// `(l, r)` looping over `j` (no atomics, CPU order).
 /// Push: `n_lr, left, n_ids, right, dim_size, src_off, ids_off`.
 pub fn k_index_add(wg: usize) -> String {
-    let mut s = prelude(wg, 3);
+    let mut s = prelude(wg, 4);
     s += &buf(0, "float", "dst", false);
     s += &buf(1, "uint", "ids", true);
     s += &buf(2, "float", "src", true);
+    s += &buf(3, "uint", "fault", false);
     s += r#"
 layout(push_constant) uniform PC { int n_lr; int left; int n_ids; int right; int dim_size; int src_off; int ids_off; } pc;
 layout(local_size_x = WG) in;
@@ -709,7 +720,7 @@ void main() {
     int l = i / pc.right;
     for (int j = 0; j < pc.n_ids; j++) {
         uint id = ids[pc.ids_off + j];
-        if (id >= uint(pc.dim_size)) continue;
+        if (id >= uint(pc.dim_size)) { fault[0] = 1u; continue; }
         dst[(l * pc.dim_size + int(id)) * pc.right + r] += src[pc.src_off + (l * pc.n_ids + j) * pc.right + r];
     }
 }
@@ -1269,10 +1280,11 @@ void main() {
 /// work-group per row striding over sub-blocks.
 /// Push: `n_ids, K, qt, qk, bsz, ids_off, vocab`.
 pub fn k_qembed(wg: usize) -> String {
-    let mut s = prelude(wg, 3);
+    let mut s = prelude(wg, 4);
     s += &buf(0, "uint", "W", true);
     s += &buf(1, "uint", "ids", true);
     s += &buf(2, "float", "O", false);
+    s += &buf(3, "uint", "fault", false);
     s += QUANT_FN;
     s += r#"
 layout(push_constant) uniform PC { int n_ids; int K; int qt; int qk; int bsz; int ids_off; int vocab; } pc;
@@ -1282,7 +1294,7 @@ void main() {
     int t = int(gl_LocalInvocationID.x);
     if (j >= pc.n_ids) return;
     uint id = ids[pc.ids_off + j];
-    if (id >= uint(pc.vocab)) id = 0u;
+    if (id >= uint(pc.vocab)) { fault[0] = 1u; return; }
     int spb = pc.qk / 32;
     int nsub = pc.K / 32;
     uint row = id * uint(pc.K / pc.qk) * uint(pc.bsz);

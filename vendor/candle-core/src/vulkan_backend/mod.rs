@@ -400,6 +400,24 @@ impl VulkanDevice {
         self.inner.exec.lock().unwrap_or_else(|p| p.into_inner())
     }
 
+    /// The device's fault word, bound last by every indexing kernel.
+    pub(crate) fn fault_buf(&self) -> kernels::Buf {
+        self.exec().fault()
+    }
+
+    /// Report (and clear) an out-of-range id an indexing kernel flagged in
+    /// the batches completed so far.  Called at every host read-back and
+    /// `synchronize`, the points where the CPU backend's error for the same
+    /// input would have been observed.
+    pub fn check_fault(&self) -> Result<()> {
+        if self.exec().take_fault() {
+            return Err(Error::Msg(
+                "vulkan: an index_select / gather / scatter / index_add / embedding id was out of range for the indexed dimension (reported at the next host read-back)".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn pipes(&self) -> MutexGuard<'_, kernels::PipeMap> {
         self.inner.pipes.lock().unwrap_or_else(|p| p.into_inner())
     }
@@ -570,6 +588,7 @@ impl VulkanStorage {
     /// Read `bytes` from the buffer after completing the pending batch.
     pub(crate) fn get_bytes(&self, bytes: usize) -> Result<Vec<u8>> {
         self.device.flush()?;
+        self.device.check_fault()?;
         let n = bytes.min(self.capacity_bytes);
         let mut out = vec![0u8; n];
         unsafe { std::ptr::copy_nonoverlapping(self.mapped, out.as_mut_ptr(), n) };
@@ -1353,7 +1372,8 @@ impl BackendDevice for VulkanDevice {
     }
 
     fn synchronize(&self) -> Result<()> {
-        self.flush()
+        self.flush()?;
+        self.check_fault()
     }
 }
 
@@ -1508,14 +1528,19 @@ mod tests {
     use super::*;
     use crate::{Device, Tensor};
 
+    /// One device shared by every test in the module (they run on parallel
+    /// threads; a context per test is not a real configuration).
     fn device() -> Option<Device> {
-        match Device::new_vulkan(0) {
-            Ok(d) => Some(d),
-            Err(e) => {
-                eprintln!("skipping vulkan test: {e}");
-                None
-            }
-        }
+        static DEVICE: std::sync::OnceLock<Option<Device>> = std::sync::OnceLock::new();
+        DEVICE
+            .get_or_init(|| match Device::new_vulkan(0) {
+                Ok(d) => Some(d),
+                Err(e) => {
+                    eprintln!("skipping vulkan test: {e}");
+                    None
+                }
+            })
+            .clone()
     }
 
     fn close(a: &Tensor, b: &Tensor, tol: f32, what: &str) {
@@ -1612,6 +1637,15 @@ mod tests {
         let base = Tensor::zeros((4, 3), DType::F32, &cpu)?;
         close(&base.to_device(&dev)?.scatter_add(&sc_ids.to_device(&dev)?, &sc_src.to_device(&dev)?, 0)?, &base.scatter_add(&sc_ids, &sc_src, 0)?, 0.0, "scatter_add");
         close(&base.to_device(&dev)?.scatter(&sc_ids.to_device(&dev)?, &sc_src.to_device(&dev)?, 0)?, &base.scatter(&sc_ids, &sc_src, 0)?, 0.0, "scatter");
+        // Duplicate ids resolve like the sequential CPU loop (last write wins).
+        let dup_ids = Tensor::new(&[[0u32, 1, 1], [0, 1, 1]], &cpu)?;
+        close(&base.to_device(&dev)?.scatter(&dup_ids.to_device(&dev)?, &sc_src.to_device(&dev)?, 0)?, &base.scatter(&dup_ids, &sc_src, 0)?, 0.0, "scatter duplicate ids");
+        close(&base.to_device(&dev)?.scatter_add(&dup_ids.to_device(&dev)?, &sc_src.to_device(&dev)?, 0)?, &base.scatter_add(&dup_ids, &sc_src, 0)?, 0.0, "scatter_add duplicate ids");
+        // An out-of-range id is reported at the next host read-back; the
+        // device stays usable afterwards.
+        let bad = Tensor::new(&[1u32, 9], &dev)?;
+        assert!(xd.index_select(&bad, 0)?.to_device(&cpu).is_err(), "out-of-range index_select must fail");
+        close(&xd.index_select(&ids.to_device(&dev)?, 0)?, &x.index_select(&ids, 0)?, 0.0, "index_select after a fault");
 
         let a = Tensor::arange(0f32, 24f32 * 40f32, &cpu)?.reshape((24, 40))?.affine(1e-3, -0.4)?;
         let w = Tensor::arange(0f32, 40f32 * 17f32, &cpu)?.reshape((17, 40))?.affine(-2e-3, 0.3)?;
@@ -1718,6 +1752,23 @@ mod tests {
             }
         }
         close(&acc, &acc_cpu, 1e-4, "allocator churn");
+        Ok(())
+    }
+
+    /// Importance-weighted quantization on the device yields the CPU's blocks.
+    #[test]
+    fn vulkan_imatrix_quantize() -> crate::Result<()> {
+        let Some(dev) = device() else { return Ok(()) };
+        let cpu = Device::Cpu;
+        let x = Tensor::arange(0f32, 512f32, &cpu)?.affine(0.01, -2.0)?.reshape((2, 256))?;
+        let w: Vec<f32> = (0..256).map(|i| 1.0 + (i % 7) as f32).collect();
+        for dtype in [GgmlDType::Q4K, GgmlDType::Q6K] {
+            let q_cpu = crate::quantized::QTensor::quantize_imatrix(&x, &w, dtype)?;
+            let q_dev = crate::quantized::QTensor::quantize_imatrix(&x.to_device(&dev)?, &w, dtype)?;
+            assert_eq!(q_cpu.data()?.as_ref(), q_dev.data()?.as_ref(), "{dtype:?}: imatrix blocks");
+            let q_onto = crate::quantized::QTensor::quantize_imatrix_onto(&x, &w, dtype, &dev)?;
+            assert_eq!(q_cpu.data()?.as_ref(), q_onto.data()?.as_ref(), "{dtype:?}: imatrix blocks (onto)");
+        }
         Ok(())
     }
 }

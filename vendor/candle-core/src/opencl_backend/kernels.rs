@@ -247,9 +247,19 @@ pub struct Kernel {
     pub wg: usize,
 }
 
+/// Serialises kernel-object creation and release.  pocl keeps one
+/// reference-counted dlhandle per compiled program hash across contexts,
+/// and its count is not thread-safe: concurrent `clCreateKernel` /
+/// `clReleaseKernel` from several threads (each with its own context) trips
+/// `pocl_release_dlhandle_cache: Assertion found->ref_count > 0` and aborts
+/// the process.  Both calls take microseconds, so the lock costs nothing
+/// measurable and is harmless on other ICDs.
+static KERNEL_OBJECTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 impl Drop for Kernel {
     fn drop(&mut self) {
         if self.k != 0 {
+            let _guard = KERNEL_OBJECTS.lock().unwrap_or_else(|p| p.into_inner());
             unsafe { clReleaseKernel(self.k) };
         }
     }
@@ -260,7 +270,10 @@ impl Kernel {
         let (program, wg) = program_for(ctx, dev)?;
         let cname = std::ffi::CString::new(name).map_err(|_| Error::Msg("opencl: kernel name has a NUL".into()))?;
         let mut e: i32 = 0;
-        let k = unsafe { clCreateKernel(program, cname.as_ptr() as *const c_void, &mut e) };
+        let k = {
+            let _guard = KERNEL_OBJECTS.lock().unwrap_or_else(|p| p.into_inner());
+            unsafe { clCreateKernel(program, cname.as_ptr() as *const c_void, &mut e) }
+        };
         if e != CL_SUCCESS || k == 0 {
             return Err(Error::Msg(format!("opencl clCreateKernel({name}) failed with status {e}")));
         }
@@ -318,6 +331,10 @@ pub struct Ctx {
     pub context: usize,
     pub device: usize,
     pub queue: usize,
+    /// The device's fault word (see `kernels.cl`): indexing kernels set it
+    /// on an out-of-range id; the host reports and clears it at the next
+    /// read-back.
+    pub fault: usize,
 }
 
 impl Ctx {
@@ -572,21 +589,24 @@ pub fn run_index_select(c: &Ctx, elem8: bool, ids_i64: bool, src: usize, ids: us
         (true, true) => return Err(Error::Msg("opencl: i64 ids with 8-byte elements has no kernel".into())),
     };
     let mut k = c.kernel(name)?;
-    k.buf(src)?.buf(ids)?.buf(out)?.val(to_i32(n)?)?.val(to_i32(left)?)?.val(to_i32(n_ids)?)?.val(to_i32(right)?)?.val(to_i32(dim_size)?)?.val(to_i32(src_off)?)?.val(to_i32(ids_off)?)?;
+    k.buf(src)?.buf(ids)?.buf(out)?.val(to_i32(n)?)?.val(to_i32(left)?)?.val(to_i32(n_ids)?)?.val(to_i32(right)?)?.val(to_i32(dim_size)?)?.val(to_i32(src_off)?)?.val(to_i32(ids_off)?)?.buf(c.fault)?;
     k.run(&[n], None)
 }
 
 #[allow(clippy::too_many_arguments)]
 pub fn run_gather(c: &Ctx, src: usize, ids: usize, out: usize, n: usize, ix: Idx, src_dim_stride: usize, dim_size: usize) -> Result<()> {
     let mut k = c.kernel("k_gather_4")?;
-    k.buf(src)?.buf(ids)?.buf(out)?.val(to_i32(n)?)?.val(ix)?.val(to_i32(src_dim_stride)?)?.val(to_i32(dim_size)?)?;
+    k.buf(src)?.buf(ids)?.buf(out)?.val(to_i32(n)?)?.val(ix)?.val(to_i32(src_dim_stride)?)?.val(to_i32(dim_size)?)?.buf(c.fault)?;
     k.run(&[n], None)
 }
 
+/// scatter set / add: `ix` enumerates the ids space with `dim` collapsed
+/// (s0 ids, s1 src, s2 dst); the `*_ds` are the strides along `dim`, which
+/// the kernel walks in order (`n_j` positions).
 #[allow(clippy::too_many_arguments)]
-pub fn run_scatter(c: &Ctx, add: bool, dst: usize, ids: usize, src: usize, n: usize, ix: Idx, dst_dim_stride: usize, dim_size: usize) -> Result<()> {
+pub fn run_scatter(c: &Ctx, add: bool, dst: usize, ids: usize, src: usize, n: usize, ix: Idx, n_j: usize, ids_ds: usize, src_ds: usize, dst_ds: usize, dim_size: usize) -> Result<()> {
     let mut k = c.kernel(if add { "k_scatter_add_f32" } else { "k_scatter_set_4" })?;
-    k.buf(dst)?.buf(ids)?.buf(src)?.val(to_i32(n)?)?.val(ix)?.val(to_i32(dst_dim_stride)?)?.val(to_i32(dim_size)?)?;
+    k.buf(dst)?.buf(ids)?.buf(src)?.val(to_i32(n)?)?.val(ix)?.val(to_i32(n_j)?)?.val(to_i32(ids_ds)?)?.val(to_i32(src_ds)?)?.val(to_i32(dst_ds)?)?.val(to_i32(dim_size)?)?.buf(c.fault)?;
     k.run(&[n], None)
 }
 
@@ -594,7 +614,7 @@ pub fn run_scatter(c: &Ctx, add: bool, dst: usize, ids: usize, src: usize, n: us
 pub fn run_index_add(c: &Ctx, dst: usize, ids: usize, src: usize, left: usize, n_ids: usize, right: usize, dim_size: usize, src_off: usize, ids_off: usize) -> Result<()> {
     let mut k = c.kernel("k_index_add_f32")?;
     let n_lr = left * right;
-    k.buf(dst)?.buf(ids)?.buf(src)?.val(to_i32(n_lr)?)?.val(to_i32(left)?)?.val(to_i32(n_ids)?)?.val(to_i32(right)?)?.val(to_i32(dim_size)?)?.val(to_i32(src_off)?)?.val(to_i32(ids_off)?)?;
+    k.buf(dst)?.buf(ids)?.buf(src)?.val(to_i32(n_lr)?)?.val(to_i32(left)?)?.val(to_i32(n_ids)?)?.val(to_i32(right)?)?.val(to_i32(dim_size)?)?.val(to_i32(src_off)?)?.val(to_i32(ids_off)?)?.buf(c.fault)?;
     k.run(&[n_lr], None)
 }
 
@@ -758,6 +778,6 @@ pub fn run_qembed(c: &Ctx, dtype: crate::quantized::GgmlDType, w: usize, ids: us
     kn.buf(w)?.buf(ids)?.buf(out)?
         .val(to_i32(n_ids)?)?.val(to_i32(k)?)?
         .val(qtype_code(dtype))?.val(to_i32(dtype.block_size())?)?.val(to_i32(dtype.type_size())?)?
-        .val(woff)?.val(to_i32(ids_off)?)?.val(to_i32(vocab)?)?;
+        .val(woff)?.val(to_i32(ids_off)?)?.val(to_i32(vocab)?)?.buf(c.fault)?;
     kn.run(&[n_ids * wg], Some(&[wg]))
 }

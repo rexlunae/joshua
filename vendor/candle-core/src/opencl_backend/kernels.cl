@@ -459,11 +459,19 @@ void k_arg_last(__global const float* x, __global uint* o, int rows, int cols, i
 }
 
 // ─── index_select / gather / scatter / index_add ─────────────────────────────
+//
+// Out-of-range ids: the CPU backend returns an error, which a kernel cannot.
+// Every indexing kernel takes the device's `fault` word as its last argument
+// and sets it (skipping the element) when an id exceeds the indexed
+// dimension; the host checks and clears the word at the next read-back or
+// synchronize and reports the error there, so a bad id never reads or
+// writes out of bounds and never turns into a plausible result.
 
 // out[l, i, r] = src[l, ids[i], r]; src is contiguous with `dim_size` along
 // the selected dim; ids are u32 (i64 ids are cast on the host side kernel).
 __kernel void k_index_select_u32_4(__global const uint* src, __global const uint* ids, __global uint* o,
-                                   int n, int left, int n_ids, int right, int dim_size, int src_off, int ids_off) {
+                                   int n, int left, int n_ids, int right, int dim_size, int src_off, int ids_off,
+                                   __global uint* fault) {
     int i = get_global_id(0);
     if (i >= n) return;
     int r = i % right;
@@ -471,11 +479,12 @@ __kernel void k_index_select_u32_4(__global const uint* src, __global const uint
     int j = t % n_ids;
     int l = t / n_ids;
     uint id = ids[ids_off + j];
-    if (id >= (uint)dim_size) id = 0;
+    if (id >= (uint)dim_size) { *fault = 1; return; }
     o[i] = src[src_off + ((long)l * dim_size + id) * right + r];
 }
 __kernel void k_index_select_i64_4(__global const uint* src, __global const long* ids, __global uint* o,
-                                   int n, int left, int n_ids, int right, int dim_size, int src_off, int ids_off) {
+                                   int n, int left, int n_ids, int right, int dim_size, int src_off, int ids_off,
+                                   __global uint* fault) {
     int i = get_global_id(0);
     if (i >= n) return;
     int r = i % right;
@@ -483,11 +492,12 @@ __kernel void k_index_select_i64_4(__global const uint* src, __global const long
     int j = t % n_ids;
     int l = t / n_ids;
     long id = ids[ids_off + j];
-    if (id < 0 || id >= dim_size) id = 0;
+    if (id < 0 || id >= dim_size) { *fault = 1; return; }
     o[i] = src[src_off + ((long)l * dim_size + id) * right + r];
 }
 __kernel void k_index_select_u32_8(__global const ulong* src, __global const uint* ids, __global ulong* o,
-                                   int n, int left, int n_ids, int right, int dim_size, int src_off, int ids_off) {
+                                   int n, int left, int n_ids, int right, int dim_size, int src_off, int ids_off,
+                                   __global uint* fault) {
     int i = get_global_id(0);
     if (i >= n) return;
     int r = i % right;
@@ -495,7 +505,7 @@ __kernel void k_index_select_u32_8(__global const ulong* src, __global const uin
     int j = t % n_ids;
     int l = t / n_ids;
     uint id = ids[ids_off + j];
-    if (id >= (uint)dim_size) id = 0;
+    if (id >= (uint)dim_size) { *fault = 1; return; }
     o[i] = src[src_off + ((long)l * dim_size + id) * right + r];
 }
 
@@ -504,58 +514,61 @@ __kernel void k_index_select_u32_8(__global const ulong* src, __global const uin
 // `dim`, `sx` maps output index -> src offset with the `dim` coordinate zeroed
 // (s1); u32 ids.
 __kernel void k_gather_4(__global const uint* src, __global const uint* ids, __global uint* o,
-                         int n, Idx ix, int src_dim_stride, int dim_size) {
+                         int n, Idx ix, int src_dim_stride, int dim_size, __global uint* fault) {
     int i = get_global_id(0);
     if (i >= n) return;
     uint id = ids[off_of(i, &ix, ix.s0, ix.o0)];
-    if (id >= (uint)dim_size) id = 0;
+    if (id >= (uint)dim_size) { *fault = 1; return; }
     o[i] = src[off_of(i, &ix, ix.s1, ix.o1) + (int)id * src_dim_stride];
 }
 
-// scatter (set) along `dim` from `src` into a contiguous `dst` copy:
-// dst[..., ids[i], ...] = src[..., i, ...]; one work-item per src element.
-// Later writes to the same slot win (same as a sequential loop only when ids
-// are unique; candle's own semantics for duplicates are "last wins" which a
-// parallel kernel cannot promise — callers with duplicate ids use scatter_add).
+// scatter (set or add) along `dim`: one work-item per position of the ids
+// space with `dim` collapsed (`ix` enumerates that space: s0 = ids, s1 =
+// src, s2 = dst); the work-item walks the `n_j` positions along `dim` in
+// order, so duplicate ids resolve exactly as the sequential CPU loop does
+// (last write wins / sums in order) with no atomics.
 __kernel void k_scatter_set_4(__global uint* dst, __global const uint* ids, __global const uint* src,
-                              int n, Idx ix, int dst_dim_stride, int dim_size) {
+                              int n, Idx ix, int n_j, int ids_ds, int src_ds, int dst_ds, int dim_size,
+                              __global uint* fault) {
     int i = get_global_id(0);
     if (i >= n) return;
-    uint id = ids[off_of(i, &ix, ix.s0, ix.o0)];
-    if (id >= (uint)dim_size) return;
-    uint v = src[off_of(i, &ix, ix.s1, ix.o1)];
-    dst[off_of(i, &ix, ix.s2, ix.o2) + (int)id * dst_dim_stride] = v;
-}
-
-inline void atomic_add_f32(volatile __global float* p, float v) {
-    union { uint u; float f; } old, nw;
-    do {
-        old.f = *p;
-        nw.f = old.f + v;
-    } while (atomic_cmpxchg((volatile __global uint*)p, old.u, nw.u) != old.u);
+    int a = off_of(i, &ix, ix.s0, ix.o0);
+    int b = off_of(i, &ix, ix.s1, ix.o1);
+    int d = off_of(i, &ix, ix.s2, ix.o2);
+    for (int j = 0; j < n_j; j++) {
+        uint id = ids[a + j * ids_ds];
+        if (id >= (uint)dim_size) { *fault = 1; continue; }
+        dst[d + (int)id * dst_ds] = src[b + j * src_ds];
+    }
 }
 
 __kernel void k_scatter_add_f32(__global float* dst, __global const uint* ids, __global const float* src,
-                                int n, Idx ix, int dst_dim_stride, int dim_size) {
+                                int n, Idx ix, int n_j, int ids_ds, int src_ds, int dst_ds, int dim_size,
+                                __global uint* fault) {
     int i = get_global_id(0);
     if (i >= n) return;
-    uint id = ids[off_of(i, &ix, ix.s0, ix.o0)];
-    if (id >= (uint)dim_size) return;
-    float v = src[off_of(i, &ix, ix.s1, ix.o1)];
-    atomic_add_f32(dst + off_of(i, &ix, ix.s2, ix.o2) + (int)id * dst_dim_stride, v);
+    int a = off_of(i, &ix, ix.s0, ix.o0);
+    int b = off_of(i, &ix, ix.s1, ix.o1);
+    int d = off_of(i, &ix, ix.s2, ix.o2);
+    for (int j = 0; j < n_j; j++) {
+        uint id = ids[a + j * ids_ds];
+        if (id >= (uint)dim_size) { *fault = 1; continue; }
+        dst[d + (int)id * dst_ds] += src[b + j * src_ds];
+    }
 }
 
 // index_add: dst[l, ids[j], r] += src[l, j, r]; one work-item per (l, r),
 // looping over j, so no atomics and the order matches the CPU path exactly.
 __kernel void k_index_add_f32(__global float* dst, __global const uint* ids, __global const float* src,
-                              int n_lr, int left, int n_ids, int right, int dim_size, int src_off, int ids_off) {
+                              int n_lr, int left, int n_ids, int right, int dim_size, int src_off, int ids_off,
+                              __global uint* fault) {
     int i = get_global_id(0);
     if (i >= n_lr) return;
     int r = i % right;
     int l = i / right;
     for (int j = 0; j < n_ids; j++) {
         uint id = ids[ids_off + j];
-        if (id >= (uint)dim_size) continue;
+        if (id >= (uint)dim_size) { *fault = 1; continue; }
         dst[((long)l * dim_size + id) * right + r] += src[src_off + ((long)l * n_ids + j) * right + r];
     }
 }
@@ -1028,12 +1041,13 @@ __kernel void k_dequant_half(__global const uchar* W, __global float* O, int n, 
 // per row, work-items stride over sub-blocks.
 __kernel __attribute__((reqd_work_group_size(WG, 1, 1)))
 void k_qembed(__global const uchar* W, __global const uint* ids, __global float* O,
-              int n_ids, int K, int qt, int qk, int bsz, ulong woff, int ids_off, int vocab) {
+              int n_ids, int K, int qt, int qk, int bsz, ulong woff, int ids_off, int vocab,
+              __global uint* fault) {
     int j = get_group_id(0);
     int t = get_local_id(0);
     if (j >= n_ids) return;
     uint id = ids[ids_off + j];
-    if (id >= (uint)vocab) id = 0;
+    if (id >= (uint)vocab) { *fault = 1; return; }
     __global const uchar* row = W + woff + (ulong)id * (ulong)(K / qk) * (ulong)bsz;
     __global float* o = O + (long)j * K;
     int spb = qk / 32;

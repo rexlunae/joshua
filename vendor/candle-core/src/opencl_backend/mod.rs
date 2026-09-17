@@ -121,10 +121,16 @@ pub struct DeviceId(usize);
 struct OpenClContext {
     context: usize,
     queue: usize,
+    /// One `uint` the indexing kernels set on an out-of-range id (see
+    /// `kernels.cl`); read and cleared by [`OpenClDevice::check_fault`].
+    fault: usize,
 }
 
 impl Drop for OpenClContext {
     fn drop(&mut self) {
+        if self.fault != 0 {
+            unsafe { clReleaseMemObject(self.fault) };
+        }
         if self.queue != 0 {
             unsafe { clReleaseCommandQueue(self.queue) };
         }
@@ -225,11 +231,30 @@ fn init_device(gpu_id: usize) -> Result<OpenClDevice> {
         unsafe { clReleaseContext(context) };
         return Err(opencl_error(err, "clCreateCommandQueue"));
     }
+    let fault = match create_buffer(context, 4, cl::CL_MEM_READ_WRITE) {
+        Ok(b) => b,
+        Err(e) => {
+            unsafe {
+                clReleaseCommandQueue(queue);
+                clReleaseContext(context);
+            }
+            return Err(e);
+        }
+    };
+    let zero = 0u32;
+    if let Err(e) = unsafe { write_buffer(queue, fault, 4, &zero as *const u32 as *const u8) } {
+        unsafe {
+            clReleaseMemObject(fault);
+            clReleaseCommandQueue(queue);
+            clReleaseContext(context);
+        }
+        return Err(e);
+    }
     Ok(OpenClDevice {
         gpu_id,
         platform_id,
         device_id: device,
-        inner: Arc::new(OpenClContext { context, queue }),
+        inner: Arc::new(OpenClContext { context, queue, fault }),
     })
 }
 
@@ -272,7 +297,24 @@ impl OpenClDevice {
 
     /// Handles a kernel launch needs.
     pub fn ctx(&self) -> Ctx {
-        Ctx { context: self.context(), device: self.device_id, queue: self.queue() }
+        Ctx { context: self.context(), device: self.device_id, queue: self.queue(), fault: self.inner.fault }
+    }
+
+    /// Report (and clear) an out-of-range id an indexing kernel flagged since
+    /// the last check.  Called at every host read-back and `synchronize`,
+    /// the points where the CPU backend's error for the same input would
+    /// have been observed.
+    pub fn check_fault(&self) -> Result<()> {
+        let mut v = 0u32;
+        unsafe { read_buffer(self.queue(), self.inner.fault, 0, 4, &mut v as *mut u32 as *mut u8) }?;
+        if v == 0 {
+            return Ok(());
+        }
+        let zero = 0u32;
+        unsafe { write_buffer(self.queue(), self.inner.fault, 4, &zero as *const u32 as *const u8) }?;
+        Err(Error::Msg(
+            "opencl: an index_select / gather / scatter / index_add / embedding id was out of range for the indexed dimension (reported at the next host read-back)".into(),
+        ))
     }
 
     /// Uninitialised device storage for `numel` elements of `dtype`.
@@ -525,6 +567,7 @@ impl BackendStorage for OpenClStorage {
         let bytes = self.numel * self.elem_size();
         let mut raw = vec![0u8; bytes];
         unsafe { read_buffer(self.device.queue(), self.buffer, 0, bytes, raw.as_mut_ptr()) }?;
+        self.device.check_fault()?;
         Ok(match self.dtype {
             DType::U8 => CpuStorage::U8(raw),
             DType::U32 => CpuStorage::U32(transmute_bytes(&raw, self.numel)),
@@ -1030,15 +1073,28 @@ impl OpenClStorage {
         }
         let (ids_s, ids_off) = ids.ids_u32(ids_l)?;
         let ids_layout = Layout::new(ids_l.shape().clone(), ids_l.stride().to_vec(), ids_off);
-        let n = ids_l.shape().elem_count();
-        let mut dst_strides = l.stride().to_vec();
-        let dim_stride = dst_strides[dim];
-        dst_strides[dim] = 0;
-        let ix = Idx::new(ids_l.dims())?
-            .with_layout(0, if ids_s.buffer == ids.buffer { ids_l } else { &ids_layout })?
-            .with_layout(1, src_l)?
-            .with_strides(2, &dst_strides, l.start_offset())?;
-        kernels::run_scatter(&self.ctx(), add, self.buffer, ids_s.buffer, src.buffer, n, ix, dim_stride, dims[dim])
+        let ids_l = if ids_s.buffer == ids.buffer { ids_l } else { &ids_layout };
+        // Enumerate the ids space with `dim` collapsed; the kernel walks
+        // `dim` itself, in order.
+        let mut cdims = ids_l.dims().to_vec();
+        let n_j = cdims[dim];
+        cdims[dim] = 1;
+        let n = cdims.iter().product::<usize>();
+        let ix = Idx::new(&cdims)?.with_layout(0, ids_l)?.with_layout(1, src_l)?.with_layout(2, l)?;
+        kernels::run_scatter(
+            &self.ctx(),
+            add,
+            self.buffer,
+            ids_s.buffer,
+            src.buffer,
+            n,
+            ix,
+            n_j,
+            ids_l.stride()[dim],
+            src_l.stride()[dim],
+            l.stride()[dim],
+            dims[dim],
+        )
     }
 
     fn index_add_native(&self, l: &Layout, ids: &Self, ids_l: &Layout, src: &Self, src_l: &Layout, dim: usize) -> Result<Self> {
@@ -1162,7 +1218,7 @@ impl BackendDevice for OpenClDevice {
         if rc != cl::CL_SUCCESS {
             return Err(opencl_error(rc, "clFinish"));
         }
-        Ok(())
+        self.check_fault()
     }
 }
 
@@ -1313,6 +1369,7 @@ impl QOpenClStorage {
         let bytes = self.storage_size_in_bytes();
         let mut out = vec![0u8; bytes];
         unsafe { read_buffer(self.device.queue(), self.buffer, self.byte_offset as usize, bytes, out.as_mut_ptr()) }?;
+        self.device.check_fault()?;
         Ok(out)
     }
 
@@ -1408,14 +1465,19 @@ mod tests {
     use super::*;
     use crate::{Device, Tensor};
 
+    /// One device shared by every test in the module (they run on parallel
+    /// threads; a context per test is not a real configuration).
     fn device() -> Option<Device> {
-        match Device::new_opencl(0) {
-            Ok(d) => Some(d),
-            Err(e) => {
-                eprintln!("skipping opencl test: {e}");
-                None
-            }
-        }
+        static DEVICE: std::sync::OnceLock<Option<Device>> = std::sync::OnceLock::new();
+        DEVICE
+            .get_or_init(|| match Device::new_opencl(0) {
+                Ok(d) => Some(d),
+                Err(e) => {
+                    eprintln!("skipping opencl test: {e}");
+                    None
+                }
+            })
+            .clone()
     }
 
     fn close(a: &Tensor, b: &Tensor, tol: f32, what: &str) {
@@ -1502,6 +1564,16 @@ mod tests {
         let sc_src = Tensor::new(&[[10f32, 11., 12.], [13., 14., 15.]], &cpu)?;
         let base = Tensor::zeros((4, 3), DType::F32, &cpu)?;
         close(&base.to_device(&dev)?.scatter_add(&sc_ids.to_device(&dev)?, &sc_src.to_device(&dev)?, 0)?, &base.scatter_add(&sc_ids, &sc_src, 0)?, 0.0, "scatter_add");
+        close(&base.to_device(&dev)?.scatter(&sc_ids.to_device(&dev)?, &sc_src.to_device(&dev)?, 0)?, &base.scatter(&sc_ids, &sc_src, 0)?, 0.0, "scatter");
+        // Duplicate ids resolve like the sequential CPU loop (last write wins).
+        let dup_ids = Tensor::new(&[[0u32, 1, 1], [0, 1, 1]], &cpu)?;
+        close(&base.to_device(&dev)?.scatter(&dup_ids.to_device(&dev)?, &sc_src.to_device(&dev)?, 0)?, &base.scatter(&dup_ids, &sc_src, 0)?, 0.0, "scatter duplicate ids");
+        close(&base.to_device(&dev)?.scatter_add(&dup_ids.to_device(&dev)?, &sc_src.to_device(&dev)?, 0)?, &base.scatter_add(&dup_ids, &sc_src, 0)?, 0.0, "scatter_add duplicate ids");
+        // An out-of-range id is reported at the next host read-back; the
+        // device stays usable afterwards.
+        let bad = Tensor::new(&[1u32, 9], &dev)?;
+        assert!(xd.index_select(&bad, 0)?.to_device(&cpu).is_err(), "out-of-range index_select must fail");
+        close(&xd.index_select(&ids.to_device(&dev)?, 0)?, &x.index_select(&ids, 0)?, 0.0, "index_select after a fault");
 
         // Matmul: NN, NT (weight transpose), batched with broadcast rhs, decode GEMV.
         let a = Tensor::arange(0f32, 24f32 * 40f32, &cpu)?.reshape((24, 40))?.affine(1e-3, -0.4)?;
@@ -1604,6 +1676,23 @@ mod tests {
         use crate::Module;
         let w_ref = q_cpu.dequantize(&cpu)?;
         close(&QMatMul::from_qtensor(q_dev)?.forward(&x.to_device(&dev)?)?, &x.matmul(&w_ref.t()?)?, 1e-4, "zero-copy gemv");
+        Ok(())
+    }
+
+    /// Importance-weighted quantization on the device yields the CPU's blocks.
+    #[test]
+    fn opencl_imatrix_quantize() -> crate::Result<()> {
+        let Some(dev) = device() else { return Ok(()) };
+        let cpu = Device::Cpu;
+        let x = Tensor::arange(0f32, 512f32, &cpu)?.affine(0.01, -2.0)?.reshape((2, 256))?;
+        let w: Vec<f32> = (0..256).map(|i| 1.0 + (i % 7) as f32).collect();
+        for dtype in [GgmlDType::Q4K, GgmlDType::Q6K] {
+            let q_cpu = crate::quantized::QTensor::quantize_imatrix(&x, &w, dtype)?;
+            let q_dev = crate::quantized::QTensor::quantize_imatrix(&x.to_device(&dev)?, &w, dtype)?;
+            assert_eq!(q_cpu.data()?.as_ref(), q_dev.data()?.as_ref(), "{dtype:?}: imatrix blocks");
+            let q_onto = crate::quantized::QTensor::quantize_imatrix_onto(&x, &w, dtype, &dev)?;
+            assert_eq!(q_cpu.data()?.as_ref(), q_onto.data()?.as_ref(), "{dtype:?}: imatrix blocks (onto)");
+        }
         Ok(())
     }
 }
