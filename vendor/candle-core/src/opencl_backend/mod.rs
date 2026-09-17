@@ -127,8 +127,19 @@ struct OpenClContext {
     fault: usize,
 }
 
+impl OpenClContext {
+    /// Complete every queued command and clear fault `slot`: the drain hook
+    /// `crate::fault_slot` runs before a thread's slot is recycled.
+    fn drain_slot(&self, slot: usize) {
+        unsafe { clFinish(self.queue) };
+        let zero = 0u32;
+        let _ = unsafe { write_buffer_at(self.queue, self.fault, slot * 4, 4, &zero as *const u32 as *const u8) };
+    }
+}
+
 impl Drop for OpenClContext {
     fn drop(&mut self) {
+        kernels::forget_context(self.context);
         if self.fault != 0 {
             unsafe { clReleaseMemObject(self.fault) };
         }
@@ -251,12 +262,16 @@ fn init_device(gpu_id: usize) -> Result<OpenClDevice> {
         }
         return Err(e);
     }
-    Ok(OpenClDevice {
-        gpu_id,
-        platform_id,
-        device_id: device,
-        inner: Arc::new(OpenClContext { context, queue, fault }),
-    })
+    let inner = Arc::new(OpenClContext { context, queue, fault });
+    let weak = Arc::downgrade(&inner);
+    crate::fault_slot::register_drain(Box::new(move |slot| match weak.upgrade() {
+        Some(ctx) => {
+            ctx.drain_slot(slot);
+            true
+        }
+        None => false,
+    }));
+    Ok(OpenClDevice { gpu_id, platform_id, device_id: device, inner })
 }
 
 impl OpenClDevice {
@@ -1588,6 +1603,9 @@ mod tests {
         let dup_ids = Tensor::new(&[[0u32, 1, 1], [0, 1, 1]], &cpu)?;
         close(&base.to_device(&dev)?.scatter(&dup_ids.to_device(&dev)?, &sc_src.to_device(&dev)?, 0)?, &base.scatter(&dup_ids, &sc_src, 0)?, 0.0, "scatter duplicate ids");
         close(&base.to_device(&dev)?.scatter_add(&dup_ids.to_device(&dev)?, &sc_src.to_device(&dev)?, 0)?, &base.scatter_add(&dup_ids, &sc_src, 0)?, 0.0, "scatter_add duplicate ids");
+        // i64 → f32 keeps the high word.
+        let big = Tensor::new(&[4_294_967_296i64, -4_294_967_297, 5, -1], &cpu)?;
+        close(&big.to_device(&dev)?.to_dtype(DType::F32)?, &big.to_dtype(DType::F32)?, 0.0, "cast large i64 to f32");
         // An out-of-range id is reported at the next host read-back; the
         // device stays usable afterwards.
         let bad = Tensor::new(&[1u32, 9], &dev)?;
@@ -1734,6 +1752,32 @@ mod tests {
         });
         assert!(faulty.join().unwrap(), "the faulting thread must see its error every time");
         assert!(clean.join().unwrap(), "the clean thread must never see another thread's fault");
+        Ok(())
+    }
+
+    /// A thread that exits with a faulting launch still in flight does not
+    /// hand its fault to the next owner of its slot.
+    #[test]
+    fn opencl_fault_slot_is_drained_on_thread_exit() -> crate::Result<()> {
+        let Some(dev) = device() else { return Ok(()) };
+        let cpu = Device::Cpu;
+        let x = Tensor::arange(0f32, 32f32, &cpu)?.reshape((4, 8))?.to_device(&dev)?;
+        let bad = Tensor::new(&[1u32, 9], &dev)?;
+        let good = Tensor::new(&[1u32, 3], &dev)?;
+        for _ in 0..4 {
+            std::thread::spawn({
+                let (x, bad) = (x.clone(), bad.clone());
+                // Launch and drop without any read-back, then exit.
+                move || drop(x.index_select(&bad, 0))
+            })
+            .join()
+            .unwrap();
+            let clean = std::thread::spawn({
+                let (x, good, cpu) = (x.clone(), good.clone(), cpu.clone());
+                move || (0..20).all(|_| x.index_select(&good, 0).and_then(|t| t.to_device(&cpu)).is_ok())
+            });
+            assert!(clean.join().unwrap(), "a recycled slot must come back clean");
+        }
         Ok(())
     }
 }

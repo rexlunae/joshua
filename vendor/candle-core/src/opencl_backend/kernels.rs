@@ -83,6 +83,15 @@ fn reduction_wg(device_id: usize) -> usize {
     wg
 }
 
+/// Release the program compiled for `context` (called when the context is
+/// dropped, so the cache does not outlive the contexts it serves).
+pub(super) fn forget_context(context: usize) {
+    let Some(cache) = PROGS.get() else { return };
+    let mut list = cache.lock().unwrap_or_else(|p| p.into_inner());
+    let _guard = KERNEL_OBJECTS.lock().unwrap_or_else(|p| p.into_inner());
+    list.retain(|p| p.context != context);
+}
+
 /// Compile (or fetch the cached) program for `(context, device_id)`.  Returns
 /// the program handle and the reduction work-group size it was built with.
 pub fn program_for(context: usize, device_id: usize) -> Result<(usize, usize)> {

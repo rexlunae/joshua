@@ -454,6 +454,11 @@ impl Exec {
         Buf { buffer: self.fault_buf, bytes: FAULT_BYTES as u64 }
     }
 
+    /// Clear fault `slot` (after a flush).
+    pub(super) fn clear_fault(&mut self, slot: usize) {
+        unsafe { std::ptr::write_volatile((self.fault_map as *mut u32).add(slot), 0) };
+    }
+
     /// Whether an indexing kernel launched by this thread flagged an
     /// out-of-range id since the last call (the flag is cleared).
     /// Meaningful after a flush.
@@ -480,6 +485,10 @@ fn host_buffer(device: &ash::Device, size: u64, mem_type: u32, what: &str) -> Re
     }
     .map_err(|e| Error::Msg(format!("vulkan create_buffer({what}) failed: {e:?}")))?;
     let req = unsafe { device.get_buffer_memory_requirements(buf) };
+    if req.memory_type_bits & (1 << mem_type) == 0 {
+        unsafe { device.destroy_buffer(buf, None) };
+        return Err(Error::Msg(format!("vulkan: the {what} buffer cannot use memory type {mem_type} (memoryTypeBits {:#x})", req.memory_type_bits)));
+    }
     let mem = unsafe { device.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(mem_type), None) }
         .map_err(|e| Error::Msg(format!("vulkan allocate_memory({what}) failed: {e:?}")))?;
     unsafe { device.bind_buffer_memory(buf, mem, 0) }.map_err(|e| Error::Msg(format!("vulkan bind_buffer_memory({what}) failed: {e:?}")))?;

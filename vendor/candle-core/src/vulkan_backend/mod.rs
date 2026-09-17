@@ -245,6 +245,11 @@ fn cstr_name(raw: &[std::ffi::c_char]) -> String {
     String::from_utf8_lossy(&bytes).to_string()
 }
 
+/// Usage every tensor buffer is created with (and the memory-type probe).
+const TENSOR_USAGE: vk::BufferUsageFlags = vk::BufferUsageFlags::from_raw(
+    vk::BufferUsageFlags::STORAGE_BUFFER.as_raw() | vk::BufferUsageFlags::TRANSFER_SRC.as_raw() | vk::BufferUsageFlags::TRANSFER_DST.as_raw(),
+);
+
 /// Serialises first-time initialisation (some loaders mis-enumerate under
 /// concurrent instance creation).
 static INIT: Mutex<()> = Mutex::new(());
@@ -293,11 +298,13 @@ fn init_vulkan(gpu_id: usize) -> Result<VulkanDevice> {
     let queue = unsafe { device.get_device_queue(queue_family, 0) };
 
     // Memory type for tensors: host-visible + coherent, device-local when
-    // available, compatible with a storage buffer.
+    // available, compatible with a buffer of the usage every tensor buffer
+    // declares (`alloc_raw`).  Each later allocation still checks its own
+    // `memoryTypeBits` against the choice.
     let mem_props = unsafe { instance.get_physical_device_memory_properties(physical) };
     let probe = unsafe {
         device.create_buffer(
-            &vk::BufferCreateInfo::default().size(4096).usage(vk::BufferUsageFlags::STORAGE_BUFFER).sharing_mode(vk::SharingMode::EXCLUSIVE),
+            &vk::BufferCreateInfo::default().size(4096).usage(TENSOR_USAGE).sharing_mode(vk::SharingMode::EXCLUSIVE),
             None,
         )
     };
@@ -348,7 +355,7 @@ fn init_vulkan(gpu_id: usize) -> Result<VulkanDevice> {
             fail!("{e}")
         }
     };
-    Ok(VulkanDevice {
+    let device = VulkanDevice {
         gpu_id,
         inner: Arc::new(VulkanContext {
             entry,
@@ -362,7 +369,19 @@ fn init_vulkan(gpu_id: usize) -> Result<VulkanDevice> {
             pipes: Mutex::new(HashMap::new()),
             layouts: Mutex::new(HashMap::new()),
         }),
-    })
+    };
+    let weak = Arc::downgrade(&device.inner);
+    crate::fault_slot::register_drain(Box::new(move |slot| match weak.upgrade() {
+        Some(inner) => {
+            // A throwaway handle: flush the pending batch, then clear the slot.
+            let d = VulkanDevice { gpu_id: 0, inner };
+            let _ = d.flush();
+            d.exec().clear_fault(slot);
+            true
+        }
+        None => false,
+    }));
+    Ok(device)
 }
 
 impl VulkanDevice {
@@ -482,16 +501,20 @@ impl VulkanDevice {
         let dev = &self.inner.device;
         let buffer = unsafe {
             dev.create_buffer(
-                &vk::BufferCreateInfo::default()
-                    .size(capacity)
-                    .usage(vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)
-                    .sharing_mode(vk::SharingMode::EXCLUSIVE),
+                &vk::BufferCreateInfo::default().size(capacity).usage(TENSOR_USAGE).sharing_mode(vk::SharingMode::EXCLUSIVE),
                 None,
             )
         }
         .map_err(|e| Error::Msg(format!("vulkan create_buffer failed: {e:?}")))?;
         let req = unsafe { dev.get_buffer_memory_requirements(buffer) };
         let mut mem = self.inner.mem.lock().unwrap_or_else(|p| p.into_inner());
+        if req.memory_type_bits & (1 << mem.mem_type) == 0 {
+            unsafe { dev.destroy_buffer(buffer, None) };
+            return Err(Error::Msg(format!(
+                "vulkan: a {capacity}-byte tensor buffer cannot use memory type {} (memoryTypeBits {:#x})",
+                mem.mem_type, req.memory_type_bits
+            )));
+        }
         let (alloc, mapped) = match mem.alloc(dev, req.size, req.alignment.max(self.inner.buffer_align)) {
             Ok(a) => a,
             Err(e) => {
@@ -1640,6 +1663,9 @@ mod tests {
         let dup_ids = Tensor::new(&[[0u32, 1, 1], [0, 1, 1]], &cpu)?;
         close(&base.to_device(&dev)?.scatter(&dup_ids.to_device(&dev)?, &sc_src.to_device(&dev)?, 0)?, &base.scatter(&dup_ids, &sc_src, 0)?, 0.0, "scatter duplicate ids");
         close(&base.to_device(&dev)?.scatter_add(&dup_ids.to_device(&dev)?, &sc_src.to_device(&dev)?, 0)?, &base.scatter_add(&dup_ids, &sc_src, 0)?, 0.0, "scatter_add duplicate ids");
+        // i64 → f32 keeps the high word.
+        let big = Tensor::new(&[4_294_967_296i64, -4_294_967_297, 5, -1], &cpu)?;
+        close(&big.to_device(&dev)?.to_dtype(DType::F32)?, &big.to_dtype(DType::F32)?, 0.0, "cast large i64 to f32");
         // An out-of-range id is reported at the next host read-back; the
         // device stays usable afterwards.
         let bad = Tensor::new(&[1u32, 9], &dev)?;
@@ -1790,6 +1816,32 @@ mod tests {
         });
         assert!(faulty.join().unwrap(), "the faulting thread must see its error every time");
         assert!(clean.join().unwrap(), "the clean thread must never see another thread's fault");
+        Ok(())
+    }
+
+    /// A thread that exits with a faulting launch still in flight does not
+    /// hand its fault to the next owner of its slot.
+    #[test]
+    fn vulkan_fault_slot_is_drained_on_thread_exit() -> crate::Result<()> {
+        let Some(dev) = device() else { return Ok(()) };
+        let cpu = Device::Cpu;
+        let x = Tensor::arange(0f32, 32f32, &cpu)?.reshape((4, 8))?.to_device(&dev)?;
+        let bad = Tensor::new(&[1u32, 9], &dev)?;
+        let good = Tensor::new(&[1u32, 3], &dev)?;
+        for _ in 0..4 {
+            std::thread::spawn({
+                let (x, bad) = (x.clone(), bad.clone());
+                // Launch and drop without any read-back, then exit.
+                move || drop(x.index_select(&bad, 0))
+            })
+            .join()
+            .unwrap();
+            let clean = std::thread::spawn({
+                let (x, good, cpu) = (x.clone(), good.clone(), cpu.clone());
+                move || (0..20).all(|_| x.index_select(&good, 0).and_then(|t| t.to_device(&cpu)).is_ok())
+            });
+            assert!(clean.join().unwrap(), "a recycled slot must come back clean");
+        }
         Ok(())
     }
 }

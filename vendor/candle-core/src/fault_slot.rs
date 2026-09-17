@@ -12,9 +12,33 @@
 //! Slots come from a fixed pool (the buffer holds [`SLOTS`] words); a
 //! thread that starts after the pool is exhausted shares slot 0, which
 //! degrades to the device-wide word rather than failing.
+//!
+//! A slot is recycled when its thread exits.  Launches are asynchronous,
+//! so before the number goes back to the pool every live device *drains*
+//! it: it completes the work it has queued and clears the word (see
+//! [`register_drain`]).  A later owner therefore never inherits a fault
+//! raised by a kernel the previous owner left in flight.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
+
+/// A device's drain hook: complete pending work and clear `slot`.  Returns
+/// `false` once the device is gone, which unregisters the hook.
+pub type Drain = Box<dyn Fn(usize) -> bool + Send + Sync>;
+
+static DRAINS: Mutex<Vec<Drain>> = Mutex::new(Vec::new());
+
+/// Register a device's drain hook (called once per device at creation).
+pub fn register_drain(drain: Drain) {
+    DRAINS.lock().unwrap_or_else(|p| p.into_inner()).push(drain);
+}
+
+/// Run every live device's drain for `slot`, dropping the hooks of devices
+/// that no longer exist.
+fn drain(slot: usize) {
+    let mut drains = DRAINS.lock().unwrap_or_else(|p| p.into_inner());
+    drains.retain(|d| d(slot));
+}
 
 /// Number of slots in a device's fault buffer.
 pub const SLOTS: usize = 1024;
@@ -31,6 +55,7 @@ struct Slot(usize);
 impl Drop for Slot {
     fn drop(&mut self) {
         if self.0 != 0 {
+            drain(self.0);
             FREE.lock().unwrap_or_else(|p| p.into_inner()).push(self.0 as u32);
         }
     }

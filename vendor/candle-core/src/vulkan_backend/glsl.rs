@@ -417,8 +417,9 @@ impl Cls {
 
 /// `to_dtype` between two storage classes: strided input, contiguous
 /// output.  Values go through `float` (for floats) or `int`/`uint` (ints);
-/// f64 is handled as "f32 widened" and i64 as sign-extended i32, which is
-/// what candle's tensors here need (indices, masks, casts of activations).
+/// an i64 becomes a float from both of its words (f32 precision), and the
+/// integer casts of an i64 keep its low word (the values candle's tensors
+/// hold here: indices, masks).
 /// Push: `n` (+ `nw` for packed outputs).
 pub fn k_cast(wg: usize, from: Cls, to: Cls) -> Option<String> {
     use Cls::*;
@@ -427,7 +428,7 @@ pub fn k_cast(wg: usize, from: Cls, to: Cls) -> Option<String> {
         F32 | F16 | BF16 => (true, format!("float v = {};", from.read())),
         U32 | U8 => (true, format!("float v = float({});", from.read())),
         I32 => (true, format!("float v = float({});", from.read())),
-        I64 => (true, "uvec2 r = x[e]; float v = float(int(r.x));".into()),
+        I64 => (true, String::new()),
         F64 => return None,
     };
     let _ = float_in;
@@ -462,8 +463,16 @@ pub fn k_cast(wg: usize, from: Cls, to: Cls) -> Option<String> {
         BF16 => ("((floatBitsToUint(v) + 0x7FFFu + ((floatBitsToUint(v) >> 16u) & 1u)) >> 16u)".into(), "packed"),
         F64 => return None,
     };
-    // Integer inputs also expose `v` for the float-valued targets.
-    let load_stmt = if int_in { format!("{iload} float v = float(iv);") } else { load };
+    // Integer inputs also expose `v` for the float-valued targets (an i64
+    // from both of its words).
+    let load_stmt = match from {
+        // Exact when the value fits in 32 bits, f32 precision beyond.
+        I64 => format!(
+            "{iload} float v = (r.y == (int(r.x) < 0 ? 0xFFFFFFFFu : 0u)) ? float(int(r.x)) : float(int(r.y)) * 4294967296.0 + float(r.x);"
+        ),
+        _ if int_in => format!("{iload} float v = float(iv);"),
+        _ => load,
+    };
     if store_ty == "packed" {
         let (per, bits, mask) = to.packed().unwrap();
         s += &format!(

@@ -104,7 +104,8 @@ INFO joshua: Vulkan device: AMD Radeon Graphics (RADV RENOIR) (host-unified memo
   backend's error for the same input would have been observed.  The fault
   buffer holds one word per thread (a request's launches and read-backs
   run on the same thread), so concurrent requests sharing the device never
-  see each other's faults.
+  see each other's faults; a thread's word is drained (pending work
+  completed, word cleared) on every device before it is recycled.
 * F16 / BF16 embedding tables are gathered row by row by a half-precision
   kernel, like the block-quantized ones; no table is ever expanded to f32.
 * naga's GLSL front end has no atomics, so the Vulkan scatter kernels walk
