@@ -976,6 +976,7 @@ pub struct Iq2OpenClWeight {
     pub k: usize,
 }
 
+#[cfg(feature = "opencl")]
 impl Iq2OpenClWeight {
     /// Upload `rhs` (66-byte IQ2 blocks, `[n, k/256]`) onto OpenCl device `dev`.
     #[cfg(feature = "opencl")]
