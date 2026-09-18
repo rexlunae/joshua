@@ -80,3 +80,59 @@ fn opencl_iq2xxs_matches_cpu() {
     }
     dev.synchronize().unwrap();
 }
+
+/// The resident-device path (`Iq2OpenClWeight`) — weights uploaded once, the
+/// activation already on the device — must match the CPU reference on the
+/// exact decode shape, and shows the transfer-amortized speedup.
+#[test]
+fn opencl_iq2xxs_resident_matches_cpu() {
+    use joshua::iq2xxs::Iq2OpenClWeight;
+    let Some(dev) = device() else {
+        eprintln!("SKIP: no OpenCL device");
+        return;
+    };
+    let odev = match dev.as_opencl_device() {
+        Ok(d) => d.clone(),
+        Err(_) => return,
+    };
+    for (m, k, n) in [(1usize, 2048usize, 2048usize), (1, 4096, 2048)] {
+        let (blocks, _) = blocks_for((m, k, n));
+        // Resident weight (upload once).
+        let w = Iq2OpenClWeight::upload(&odev, &blocks, n, k).unwrap();
+        // Activation as an OpenCl tensor.
+        let x_v: Vec<f32> = (0..m * k).map(|i| ((i % 29) as f32 - 14.0) * 0.03).collect();
+        let xs = candle_core::Tensor::from_vec(x_v.clone(), (m, k), &dev).unwrap();
+
+        // Device result (resident path, activation on device).
+        let out = w.matmul(&odev, &xs).unwrap();
+        odev.synchronize().unwrap();
+        let gpu: Vec<f32> = out.flatten_all().unwrap().to_vec1().unwrap();
+
+        // CPU reference.
+        let mut cpu = vec![0.0f32; m * n];
+        matmul_t((m, k, n), &x_v, &blocks, &mut cpu).unwrap();
+
+        let mut worst = 0.0f32;
+        for i in 0..m * n {
+            let rel = (gpu[i] - cpu[i]).abs() / cpu[i].abs().max(1e-4);
+            worst = worst.max(rel);
+        }
+        eprintln!("resident ({m},{k},{n}): worst rel diff = {worst:.3e}");
+        assert!(worst < 2e-3, "resident ({m},{k},{n}) parity failed: worst={worst:.3e}");
+
+        // Transfer-amortized timing: repeated matmuls, weights resident.
+        let cpu_start = std::time::Instant::now();
+        for _ in 0..30 {
+            let mut c2 = vec![0.0f32; m * n];
+            matmul_t((m, k, n), &x_v, &blocks, &mut c2).unwrap();
+        }
+        let cpu_ms = cpu_start.elapsed().as_secs_f64() * 1e3 / 30.0;
+        let gpu_start = std::time::Instant::now();
+        for _ in 0..30 {
+            w.matmul(&odev, &xs).unwrap();
+        }
+        odev.synchronize().unwrap(); // include completion
+        let gpu_ms = gpu_start.elapsed().as_secs_f64() * 1e3 / 30.0;
+        eprintln!("  resident timing ({m},{k},{n}): cpu {cpu_ms:.3} ms  gpu {gpu_ms:.3} ms  speedup {:.2}x", cpu_ms / gpu_ms.max(1e-9));
+    }
+}

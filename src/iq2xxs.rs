@@ -1000,10 +1000,12 @@ impl Iq2OpenClWeight {
         }
         let ctx = dev.ctx();
         // Activation is already on the OpenCl device (dispatch moved it once).
+        // NOTE: no `synchronize()` here — enqueue only, so a caller can launch
+        // many expert matmuls back-to-back and sync once at the end (the
+        // transfer/launch amortization that makes a discrete GPU win on decode).
         let xbuf = opencl_buffer(xs)?;
         let out = dev.alloc_raw(m * self.n * 4)?;
         ocl::kernels::run_iq2xxs_qgemv(&ctx, xbuf, self.buffer.buffer, out.buffer, m, self.n, k, 0, 0)?;
-        dev.synchronize()?;
         let storage = candle_core::Storage::OpenCl(out);
         Ok(candle_core::Tensor::from_storage(storage, (m, self.n), candle_core::op::BackpropOp::none(), false))
     }
