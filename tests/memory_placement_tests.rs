@@ -312,9 +312,6 @@ fn deepseek4_sessions_share_weights_and_isolate_batch_kv() {
 #[test]
 fn zero_device_expert_cache_budget_is_host_placement() {
     for (name, write) in fixtures() {
-        if name == "deepseek4" {
-            continue; // deepseek4 keeps experts host regardless (IQ2_XXS)
-        }
         let dir = common::model_dir(&format!("vram-cache0-{name}"));
         let model = dir.join("model.gguf");
         write(&model);
@@ -329,6 +326,62 @@ fn zero_device_expert_cache_budget_is_host_placement() {
         );
         std::fs::remove_dir_all(&dir).ok();
     }
+}
+
+/// The deepseek4 device expert pool on the CPU "device": a slot shares the
+/// host tensors, so a hit is numerically the host path and the partition
+/// (resident experts through the pool, the rest through the host loop,
+/// prefill lookup-only, decode misses uploaded in the background, LRU
+/// eviction under a budget of three experts) must reproduce the plain
+/// load's logits exactly while the pool's counters show it all happened.
+#[test]
+fn deepseek4_expert_pool_partition_preserves_logits() {
+    let dir = common::model_dir("vram-cache-deepseek4");
+    let model = dir.join("model.gguf");
+    common::write_tiny_deepseek4_gguf(&model);
+
+    // One tiny expert: IQ2_XXS gate + up (128x256 -> 128 blocks x 66 B each)
+    // and a Q8_0 down (256x128 -> 1024 blocks x 34 B) = 51,712 bytes.
+    const SLOT_BYTES: u64 = 2 * 128 * 66 + 1024 * 34;
+    let mut plain = load_ds4(&model);
+    let mut cached = load_placed_with_cache(&model, 3 * SLOT_BYTES);
+    let report = cached.device_expert_cache().expect("deepseek4 builds a pool from the budget");
+    assert_eq!(report.slots, 3, "exact per-expert byte accounting");
+    assert_eq!(report.resident, 0);
+
+    let tokens = [1u32, 4, 2, 7, 5];
+    assert_close(
+        &logits(&mut plain, &tokens, 0),
+        &logits(&mut cached, &tokens, 0),
+        "deepseek4 prefill with a device pool",
+    );
+    // Prefill never fills the pool from its own routing, but queues the last
+    // row's experts for the decode that follows.
+    cached.wait_for_expert_uploads();
+    let after_prefill = cached.device_expert_cache().unwrap();
+    assert!(after_prefill.resident >= 1, "last prompt row seeds the pool: {after_prefill:?}");
+    assert!(after_prefill.stats.hits == 0, "prefill is lookup-only: {after_prefill:?}");
+
+    // Decode: misses run on the host and are uploaded behind the step; the
+    // same token again routes (at least the hash layer) to the same experts,
+    // so hits follow, and four requests per step against three slots evict.
+    for (i, t) in [3u32, 3, 3, 3, 8, 3].iter().enumerate() {
+        assert_close(
+            &logits(&mut plain, &[*t], tokens.len() + i),
+            &logits(&mut cached, &[*t], tokens.len() + i),
+            &format!("deepseek4 decode step {i} with a device pool"),
+        );
+        cached.wait_for_expert_uploads();
+    }
+    let r = cached.device_expert_cache().unwrap();
+    assert!(r.stats.hits > 0, "resident experts were used: {r:?}");
+    assert!(r.stats.misses > 0, "misses ran on the host: {r:?}");
+    assert!(r.stats.uploads >= 3 && r.stats.evictions > 0, "the pool churned: {r:?}");
+    assert!(r.resident <= 3 && r.resident_bytes <= r.budget_bytes, "budget respected: {r:?}");
+    assert_eq!(r.stats.refused, 0, "{r:?}");
+    assert_eq!(r.stats.upload_failures, 0, "{r:?}");
+    assert_eq!(r.upload_drops, 0, "{r:?}");
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 /// Loading a qwen3moe model with a non-zero `device_expert_cache_bytes`

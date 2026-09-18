@@ -62,6 +62,18 @@ fn block_bytes(blocks: &[BlockIq2Xxs]) -> Vec<u8> {
 /// magnitude: a 4096-term dot product that cancels to near zero differs
 /// between two f32 accumulation orders by the rounding noise of its *terms*,
 /// so a per-element relative error there measures nothing about the decode.
+/// The native kernels multiply f32 activations against the decoded blocks
+/// and agree with the fused CPU kernel to accumulation-order noise; under
+/// `JOSHUA_OPENCL_NATIVE=0` the op runs candle's CPU reference instead,
+/// which quantizes the activations to Q8_K first (a few percent).
+fn tolerance() -> f32 {
+    if candle_core::opencl_backend::native_enabled() {
+        1e-3
+    } else {
+        5e-2
+    }
+}
+
 fn worst_rel(got: &[f32], want: &[f32]) -> f32 {
     assert_eq!(got.len(), want.len());
     let mean_abs = want.iter().map(|w| w.abs()).sum::<f32>() / want.len().max(1) as f32;
@@ -119,7 +131,7 @@ fn opencl_iq2xxs_qmatmul_matches_cpu_kernel() {
             let worst = worst_rel(&got, &want);
             eprintln!("iq2xxs ({m},{k},{n}): worst rel diff = {worst:.3e}");
             assert!(
-                worst < 1e-3,
+                worst < tolerance(),
                 "({m},{k},{n}) parity failed: worst={worst:.3e}"
             );
         }
@@ -174,7 +186,7 @@ fn opencl_iq2xxs_resident_timing() {
             .unwrap()
             .to_vec1()
             .unwrap();
-        assert!(worst_rel(&got, &want) < 1e-3);
+        assert!(worst_rel(&got, &want) < tolerance());
 
         let cpu_start = std::time::Instant::now();
         for _ in 0..30 {

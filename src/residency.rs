@@ -316,6 +316,9 @@ pub trait DeviceExpertSlot: Send + Sync + 'static {
 /// may occupy (numerator, denominator).
 pub const HOT_SET_SHARE: (usize, usize) = (3, 4);
 
+/// Retired payloads held before the oldest are freed without a `reclaim`.
+pub const RETIRED_MAX: usize = 256;
+
 /// Hit/miss/eviction counters of a [`DeviceResidency`] pool (diagnostics).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DeviceResidencyStats {
@@ -352,6 +355,17 @@ pub struct DeviceResidencyStats {
 /// dropped after the lock is released, so a backend whose buffer release
 /// blocks (a queue drain) never stalls other sessions' lookups.
 ///
+/// Evicted payloads are not freed on the spot: dispatch may still have
+/// launches in flight that read them, and while a conforming driver defers
+/// a buffer's deletion until those commands complete, not every runtime
+/// does (pocl frees eagerly).  They are parked in a retire list that the
+/// dispatch thread drains with [`DeviceResidency::reclaim`] at a point it
+/// knows its launches have completed (after a blocking read-back), and
+/// dispatch parks its own payload handles the same way with
+/// [`DeviceResidency::retire`].  The list is bounded: past
+/// [`RETIRED_MAX`] entries the oldest are freed regardless (by then their
+/// commands are long done on any runtime).
+///
 /// Best-effort like every residency backend: an upload or slot-allocation
 /// failure degrades that expert to the host path (the caller falls back when
 /// `lookup` returns `None`), never to a wrong result.
@@ -364,6 +378,9 @@ pub struct DeviceResidency<T: DeviceExpertSlot> {
     per_slot_bytes: u64,
     upload: Arc<dyn Fn(u32, u32) -> Option<Arc<T>> + Send + Sync>,
     state: std::sync::Mutex<PoolState<T>>,
+    /// Payloads evicted or released but not yet freed (see
+    /// [`DeviceResidency::reclaim`]).
+    retired: std::sync::Mutex<Vec<Arc<T>>>,
     clock: std::sync::atomic::AtomicU64,
     hits: std::sync::atomic::AtomicU64,
     misses: std::sync::atomic::AtomicU64,
@@ -408,6 +425,7 @@ impl<T: DeviceExpertSlot> DeviceResidency<T> {
                 hot: Default::default(),
                 used_bytes: 0,
             }),
+            retired: std::sync::Mutex::new(Vec::new()),
             clock: std::sync::atomic::AtomicU64::new(0),
             hits: std::sync::atomic::AtomicU64::new(0),
             misses: std::sync::atomic::AtomicU64::new(0),
@@ -488,14 +506,14 @@ impl<T: DeviceExpertSlot> DeviceResidency<T> {
                 self.refused
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 drop(st);
-                drop(evicted);
+                self.retire_all(evicted);
                 return;
             }
             st.used_bytes += reserve;
             st.in_flight.insert(key, reserve);
             evicted
         };
-        drop(evicted);
+        self.retire_all(evicted);
 
         let payload = (self.upload)(layer, expert);
 
@@ -515,7 +533,8 @@ impl<T: DeviceExpertSlot> DeviceResidency<T> {
                 self.refused
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 drop(st);
-                drop(evicted);
+                self.retire_all(evicted);
+                // Never launched on: safe to free now.
                 drop(payload);
                 return;
             }
@@ -532,7 +551,44 @@ impl<T: DeviceExpertSlot> DeviceResidency<T> {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             evicted
         };
-        drop(evicted);
+        self.retire_all(evicted);
+    }
+
+    /// Park `payload` until the next [`DeviceResidency::reclaim`]: dispatch
+    /// hands over the handles it looked up once its launches are enqueued,
+    /// so a concurrent eviction can never free a buffer those launches read.
+    pub fn retire(&self, payload: Arc<T>) {
+        self.retire_all(vec![payload]);
+    }
+
+    fn retire_all(&self, payloads: Vec<Arc<T>>) {
+        if payloads.is_empty() {
+            return;
+        }
+        let overflow = {
+            let mut r = self.retired.lock().unwrap_or_else(|p| p.into_inner());
+            r.extend(payloads);
+            if r.len() > RETIRED_MAX {
+                let n = r.len() - RETIRED_MAX;
+                r.drain(..n).collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            }
+        };
+        drop(overflow);
+    }
+
+    /// Free every retired payload.  Call from the thread that launches on
+    /// the payloads, at a point where its launches are known complete (after
+    /// a blocking read-back on its queue).
+    pub fn reclaim(&self) {
+        let retired = std::mem::take(&mut *self.retired.lock().unwrap_or_else(|p| p.into_inner()));
+        drop(retired);
+    }
+
+    /// Payloads parked for the next `reclaim` (tests).
+    pub fn retired_len(&self) -> usize {
+        self.retired.lock().unwrap_or_else(|p| p.into_inner()).len()
     }
 
     /// Return the device-resident form of `(layer, expert)` for dispatch, or
@@ -621,8 +677,10 @@ impl<T: DeviceExpertSlot> ExpertResidency for DeviceResidency<T> {
             }
             s
         };
-        // Dropped outside the lock (see the type docs).
-        drop(removed);
+        // Freed at the next `reclaim`, outside the lock (see the type docs).
+        if let Some(s) = removed {
+            self.retire(s.payload);
+        }
     }
     fn capacity(&self) -> usize {
         (self.capacity_bytes / self.per_slot_bytes) as usize
@@ -788,7 +846,7 @@ impl<T: DeviceExpertSlot> Drop for ExpertUploader<T> {
 pub struct CompositeResidency<T: DeviceExpertSlot> {
     cpu: CpuResidency,
     device: Option<Arc<DeviceResidency<T>>>,
-    uploader: Option<ExpertUploader<T>>,
+    uploader: Option<Arc<ExpertUploader<T>>>,
 }
 
 impl<T: DeviceExpertSlot> CompositeResidency<T> {
@@ -801,9 +859,13 @@ impl<T: DeviceExpertSlot> CompositeResidency<T> {
         }
     }
 
-    /// Host residency plus a device pool filled by a background uploader.
-    pub fn with_device_pool(cpu: CpuResidency, pool: Arc<DeviceResidency<T>>) -> Self {
-        let uploader = ExpertUploader::spawn(Arc::clone(&pool));
+    /// Host residency plus a device pool, filled through `uploader` (the
+    /// loader shares the same uploader with its dispatch).
+    pub fn with_device_pool(
+        cpu: CpuResidency,
+        pool: Arc<DeviceResidency<T>>,
+        uploader: Arc<ExpertUploader<T>>,
+    ) -> Self {
         Self {
             cpu,
             device: Some(pool),
@@ -817,8 +879,45 @@ impl<T: DeviceExpertSlot> CompositeResidency<T> {
     }
 
     /// The background uploader, when a device pool exists.
-    pub fn uploader(&self) -> Option<&ExpertUploader<T>> {
+    pub fn uploader(&self) -> Option<&Arc<ExpertUploader<T>>> {
         self.uploader.as_ref()
+    }
+}
+
+/// A snapshot of a device expert pool for logs and diagnostics.
+#[derive(Debug, Clone)]
+pub struct DeviceCacheReport {
+    /// Slots the budget holds (`capacity()`).
+    pub slots: usize,
+    /// The byte budget.
+    pub budget_bytes: u64,
+    /// Experts resident now.
+    pub resident: usize,
+    /// Bytes resident now (reservations of uploads in flight included).
+    pub resident_bytes: u64,
+    /// Hit/miss/upload/eviction counters.
+    pub stats: DeviceResidencyStats,
+    /// Background upload requests accepted (0 without an uploader).
+    pub upload_requests: u64,
+    /// Background upload requests dropped on a full queue.
+    pub upload_drops: u64,
+}
+
+impl DeviceCacheReport {
+    /// Snapshot `pool` (and its uploader's counters, when given).
+    pub fn of<T: DeviceExpertSlot>(
+        pool: &DeviceResidency<T>,
+        uploader: Option<&ExpertUploader<T>>,
+    ) -> Self {
+        Self {
+            slots: pool.capacity(),
+            budget_bytes: pool.capacity_bytes(),
+            resident: pool.resident(),
+            resident_bytes: pool.resident_bytes(),
+            stats: pool.stats(),
+            upload_requests: uploader.map_or(0, |u| u.requested()),
+            upload_drops: uploader.map_or(0, |u| u.dropped()),
+        }
     }
 }
 
@@ -1021,7 +1120,8 @@ mod device_pool_tests {
         };
         let cpu = CpuResidency::new(vec![vec![Some(handles), None]]);
         let pool = Arc::new(pool(100, 10, 8, 10));
-        let comp = CompositeResidency::with_device_pool(cpu, Arc::clone(&pool));
+        let uploader = Arc::new(ExpertUploader::spawn(Arc::clone(&pool)));
+        let comp = CompositeResidency::with_device_pool(cpu, Arc::clone(&pool), uploader);
         assert_eq!(comp.capacity(), 1, "host count, not device slots");
         comp.acquire(0, 0);
         comp.uploader().unwrap().wait_idle();
@@ -1034,6 +1134,28 @@ mod device_pool_tests {
             CompositeResidency::host(CpuResidency::new(vec![]));
         host_only.acquire(0, 0);
         assert!(host_only.device().is_none());
+    }
+
+    /// Evicted and released payloads are parked until `reclaim`, and the
+    /// parking list is bounded.
+    #[test]
+    fn evicted_payloads_wait_for_reclaim() {
+        let r = pool(60, 30, 400, 30);
+        r.acquire(0, 0);
+        r.acquire(0, 1);
+        r.acquire(0, 2); // evicts (0,0)
+        assert_eq!(r.retired_len(), 1);
+        r.release(0, 1);
+        assert_eq!(r.retired_len(), 2);
+        let held = r.lookup(0, 2).unwrap();
+        r.retire(held);
+        assert_eq!(r.retired_len(), 3);
+        r.reclaim();
+        assert_eq!(r.retired_len(), 0);
+        for e in 3..(3 + RETIRED_MAX as u32 + 40) {
+            r.acquire(0, e);
+        }
+        assert!(r.retired_len() <= RETIRED_MAX, "bounded: {}", r.retired_len());
     }
 
     /// A payload larger than its reservation is settled at its real size and

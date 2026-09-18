@@ -630,3 +630,25 @@ fn deepseek4_clear_kv_cache_resets_batched_kv() {
     }
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// The real V4-Flash expert layout (IQ2_XXS gate/up over a 256-wide expert,
+/// Q2_K down projection) loads from the mapping, runs on the CPU expert
+/// kernels, and agrees with the streamed load.
+#[test]
+fn deepseek4_q2k_down_experts_load_and_match_streamed_path() {
+    let dir = common::model_dir("deepseek4-q2k-down");
+    let model = dir.join("model.gguf");
+    common::write_tiny_deepseek4_gguf_q2k_down(&model);
+    let tokens = [1u32, 4, 2, 7, 5];
+    let mut mapped = load(&model, true);
+    let a = logits(&mut mapped, &tokens, 0);
+    assert!(a.iter().all(|v| v.is_finite()), "mmap logits: {a:?}");
+    let b = logits(&mut mapped, &[3], tokens.len());
+    assert!(b.iter().all(|v| v.is_finite()), "mmap decode logits: {b:?}");
+    let mut streamed = load(&model, false);
+    let c = logits(&mut streamed, &tokens, 0);
+    for (i, (x, y)) in a.iter().zip(&c).enumerate() {
+        assert!((x - y).abs() < 1e-3, "logit {i}: mmap {x} vs streamed {y}");
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
