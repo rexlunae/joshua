@@ -55,6 +55,30 @@ fn load_mmap(model: &Path, device: &Device) -> QuantizedModel {
         .unwrap()
 }
 
+/// Load on `device` (an accelerator) via the placed entry point with a
+/// non-zero `device_expert_cache_bytes` budget, so every MoE block threads a
+/// `DeviceResidency` and the dispatch partition runs for real on the device
+/// (backend-generic upload via `QStorage::from_data`, #62).
+fn load_mmap_with_cache(model: &Path, device: &Device, cache_bytes: u64) -> QuantizedModel {
+    let bytes = std::fs::read(model).unwrap();
+    let mut cursor = Cursor::new(&bytes[..]);
+    let header = joshua::gguf_ext::read_header(&mut cursor).unwrap();
+    let content = header.to_candle_content().unwrap();
+    let mmap = unsafe { memmap2::Mmap::map(&std::fs::File::open(model).unwrap()) }.unwrap();
+    let mut cursor = Cursor::new(&bytes[..]);
+    QuantizedModel::from_gguf_mmap_placed(
+        content,
+        &mut cursor,
+        device,
+        device, // experts live on the model device for a model that fits VRAM
+        Some(Arc::new(mmap)),
+        None,
+        0,
+        Some(cache_bytes),
+    )
+    .unwrap()
+}
+
 fn logits(model: &mut QuantizedModel, tokens: &[u32], offset: usize, device: &Device) -> Vec<f32> {
     let input = Tensor::new(tokens, device)
         .unwrap()
@@ -187,4 +211,45 @@ fn vulkan_deepseek4_matches_cpu() {
         &[1, 4, 2, 7, 5],
         false,
     );
+}
+
+/// The #62 device-expert cache must produce the same logits on a *non-CPU*
+/// backend: a non-zero `device_expert_cache_bytes` budget threads a
+/// `DeviceResidency` into every MoE block, the upload closure materialises a
+/// Vulkan-resident copy of each hot expert (backend-generic via
+/// `QStorage::from_data`), and dispatch runs the device form on the Vulkan
+/// device with host parity.  This validates the whole path on Vulkan, not
+/// just the CPU-parity fallback.
+#[test]
+fn vulkan_expert_cache_preserves_logits() {
+    let Some(vk) = vulkan_or_skip() else { return };
+    let dir = common::model_dir("vulkan-expert-cache");
+    for (name, write) in [
+        ("qwen3moe", common::write_tiny_qwen3moe_gguf as fn(&Path)),
+        ("deepseek2", common::write_tiny_deepseek2_gguf as fn(&Path)),
+    ] {
+        let model = dir.join(format!("{name}.gguf"));
+        write(&model);
+        let cpu = Device::Cpu;
+
+        let mut ref_model = load_mmap(&model, &cpu);
+        let tokens = [1u32, 4, 2, 7, 5];
+        let ref_prefill = logits(&mut ref_model, &tokens, 0, &cpu);
+
+        // A generous budget resident-caches every expert for this tiny model.
+        let mut cached = load_mmap_with_cache(&model, &vk, 1 << 30); // 1 GiB budget
+        assert_close(
+            &format!("{name} Vulkan expert-cache prefill"),
+            &logits(&mut cached, &tokens, 0, &vk),
+            &ref_prefill,
+        );
+        // Decode continues correctly through the residency-aware dispatch.
+        let ref_decode = logits(&mut ref_model, &tokens[tokens.len() - 1..], tokens.len(), &cpu);
+        assert_close(
+            &format!("{name} Vulkan expert-cache decode"),
+            &logits(&mut cached, &tokens[tokens.len() - 1..], tokens.len(), &vk),
+            &ref_decode,
+        );
+    }
+    std::fs::remove_dir_all(&dir).ok();
 }

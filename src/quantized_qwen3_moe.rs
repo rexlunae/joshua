@@ -34,7 +34,8 @@
 use std::io::{Read, Seek};
 use std::sync::Arc;
 
-use candle_core::quantized::{gguf_file, QMatMul, QTensor};
+use candle_core::quantized::{gguf_file, QMatMul, QStorage, QTensor};
+use std::borrow::Cow;
 use crate::paged_weights::{PagedWeight, WeightCache};
 use candle_core::{DType, Device, Module, Result, Tensor, D};
 use candle_nn::ops::{silu, softmax_last_dim};
@@ -312,6 +313,34 @@ enum Weight {
 }
 
 impl Weight {
+    /// Re-upload this weight's quantized blocks onto `device`.
+    ///
+    /// Only `Weight::Candle` over a `QMatMul::QTensor` is re-uploadable
+    /// (copies its raw blocks via `QStorage::from_data`, which is
+    /// backend-generic — CPU, Vulkan, Metal, OpenCL, CUDA).  Other variants
+    /// (plain `Tensor`, zero-copy Metal, paged) return `None`: they have no
+    /// standalone quantized form to re-upload here.  This is what lets the
+    /// #62 device-expert cache hold hot experts on a *non-CPU* backend.
+    fn to_uploadable(&self, device: &Device) -> Option<Weight> {
+        let q = match self {
+            Weight::Candle(q) => q,
+            _ => return None,
+        };
+        let qt = match q {
+            QMatMul::QTensor(qt) => qt.clone(),
+            QMatMul::Tensor(_) | QMatMul::TensorF16(_) => return None,
+        };
+        if device.same_device(&qt.device()) {
+            return Some(self.clone());
+        }
+        let dtype = qt.dtype();
+        let bytes = qt.data().ok()?;
+        let shape = qt.shape().clone();
+        let storage = QStorage::from_data(Cow::Borrowed(&bytes), device, dtype).ok()?;
+        let qt = QTensor::new(storage, shape).ok()?;
+        Some(Weight::Candle(QMatMul::QTensor(std::sync::Arc::new(qt))))
+    }
+
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         match self {
             Weight::Candle(q) => {
@@ -623,8 +652,24 @@ impl Moe {
         n_tokens: usize,
     ) -> Result<(Tensor, Vec<u32>)> {
         let _p = prof::Phase::start(&prof::EXPERTS);
+        // Residency-aware per-expert forward: on a `DeviceResidency` hit run the
+        // device-resident (uploaded) weights, moving the activation to that
+        // expert's device; on a miss run the host form. `None` residency keeps
+        // today's single-device path byte-for-byte (`dispatch_decode`/`_prefill`).
+        let fwd: crate::moe::ResidencyForward<'_> = match &self.residency {
+            Some(res) => Some(&(|e: usize, x: &Tensor| {
+                if let Some(dev) = res.lookup(self.layer, e as u32) {
+                    let xd = crate::moe::on_device(x, &self.expert_device)?;
+                    let out = dev.forward(&xd)?;
+                    crate::moe::on_device(&out, x.device()).map(|c| c.into_owned())
+                } else {
+                    self.experts[e].forward(x)
+                }
+            })),
+            None => None,
+        };
         if n_tokens == 1 {
-            crate::moe::dispatch_decode(
+            crate::moe::dispatch_decode_with(
                 "qwen3moe",
                 &self.experts,
                 &self.expert_device,
@@ -632,9 +677,10 @@ impl Moe {
                 topk_idx,
                 weights,
                 self.n_expert_used,
+                fwd,
             )
         } else {
-            crate::moe::dispatch_prefill(
+            crate::moe::dispatch_prefill_with(
                 "qwen3moe",
                 &self.experts,
                 &self.expert_device,
@@ -643,6 +689,7 @@ impl Moe {
                 weights,
                 n_tokens,
                 self.n_expert_used,
+                fwd,
             )
         }
 
@@ -857,7 +904,7 @@ fn load_moe<R: Read + Seek>(rd: &mut Reader<R>, p: &str, cfg: &Config) -> Result
     // no-op device copy we cannot benchmark without hardware.
     let residency = match rd.device_expert_cache_bytes {
         Some(cap_bytes) if cap_bytes > 0 => {
-            let host = experts.clone(); // for CPU-hit parity
+            let host = experts.clone(); // fallback / CPU-parity source
             // Per-slot uploaded size estimate: f32 dense form of one expert's
             // three tensors (the device form in a real backend), summed from the
             // first expert's element counts; used only by `capacity()`.
@@ -866,20 +913,36 @@ fn load_moe<R: Read + Seek>(rd: &mut Reader<R>, p: &str, cfg: &Config) -> Result
                 .map(|m| estimate_device_expert_bytes(m))
                 .unwrap_or(1024)
                 .max(1024);
+            let expert_dev = rd.expert_device.clone();
             let upload: std::sync::Arc<
                 dyn Fn(u32, u32) -> Option<std::sync::Arc<DeviceExpert>> + Send + Sync,
             > = std::sync::Arc::new(move |l, e| {
                 if l != layer {
                     return None;
                 }
-                host.get(e as usize).map(|m| {
-                    std::sync::Arc::new(DeviceExpert {
-                        gate: m.gate.clone(),
-                        up: m.up.clone(),
-                        down: m.down.clone(),
+                let m: &Mlp = host.get(e as usize)?;
+                // On a non-CPU expert device, upload each weight's quantized
+                // blocks onto that device so a residency hit runs for real on
+                // the accelerator (#62; backend-generic via QStorage::from_data).
+                // On the CPU we keep sharing the host weights — a hit is
+                // numerically the host path, which the parity tests assert.
+                if !expert_dev.is_cpu() {
+                    let gate = m.gate.to_uploadable(&expert_dev)?;
+                    let up = m.up.to_uploadable(&expert_dev)?;
+                    let down = m.down.to_uploadable(&expert_dev)?;
+                    return Some(std::sync::Arc::new(DeviceExpert {
+                        gate,
+                        up,
+                        down,
                         bytes: per_slot,
-                    })
-                })
+                    }));
+                }
+                Some(std::sync::Arc::new(DeviceExpert {
+                    gate: m.gate.clone(),
+                    up: m.up.clone(),
+                    down: m.down.clone(),
+                    bytes: per_slot,
+                }))
             });
             Some(std::sync::Arc::new(crate::residency::DeviceResidency::<DeviceExpert>::new(
                 cap_bytes,

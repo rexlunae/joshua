@@ -107,6 +107,16 @@ pub trait Expert {
     fn forward(&self, xs: &Tensor) -> Result<Tensor>;
 }
 
+/// Per-expert forward used by the MoE dispatch, with optional residency
+/// (device-resident hot experts, #62).
+///
+/// The resolver receives the expert index and the block activation and runs
+/// that expert's *correct form*: the device-resident weights on the expert
+/// device when a hit, the host weights otherwise.  `None` (the default) makes
+/// the dispatch call `experts[e].forward` exactly as before, so an
+/// unprefixed model is byte-for-byte unchanged.
+pub type ResidencyForward<'a> = Option<&'a dyn Fn(usize, &Tensor) -> Result<Tensor>>;
+
 /// Router output for one MoE block, drained to the host once.
 struct Routing {
     /// Selected expert ids, `[n_tokens * k]`, token-major.
@@ -159,6 +169,23 @@ pub fn dispatch_prefill<E: Expert>(
     n_tokens: usize,
     k: usize,
 ) -> Result<(Tensor, Vec<u32>)> {
+    dispatch_prefill_with(arch, experts, expert_device, x2, topk_idx, weights, n_tokens, k, None)
+}
+
+/// [`dispatch_prefill`] with an optional residency-aware per-expert forward.
+/// When `forward_expert` is `None` this is byte-for-byte [`dispatch_prefill`].
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_prefill_with<E: Expert>(
+    arch: &str,
+    experts: &[E],
+    expert_device: &Device,
+    x2: &Tensor,
+    topk_idx: &Tensor,
+    weights: &Tensor,
+    n_tokens: usize,
+    k: usize,
+    forward_expert: ResidencyForward<'_>,
+) -> Result<(Tensor, Vec<u32>)> {
     let h = x2.dim(1)?;
     let routing = Routing::read(topk_idx, weights)?;
     let out_device = x2.device().clone();
@@ -174,6 +201,8 @@ pub fn dispatch_prefill<E: Expert>(
         }
     }
 
+    let default_fwd = |e: usize, x: &Tensor| experts[e].forward(x);
+    let fwd = forward_expert.unwrap_or(&default_fwd);
     let mut y = Tensor::zeros((n_tokens, h), DType::F32, expert_device)?;
     for (e, bucket) in per_expert.iter().enumerate() {
         if bucket.is_empty() {
@@ -184,7 +213,7 @@ pub fn dispatch_prefill<E: Expert>(
         let count = token_idx.len();
         let idx = Tensor::from_vec(token_idx, count, expert_device)?;
         let x_sel = x2.index_select(&idx, 0)?; // [count, h]
-        let out = experts[e].forward(&x_sel)?; // [count, h]
+        let out = fwd(e, &x_sel)?; // [count, h]
         let w = Tensor::from_vec(w, (count, 1), expert_device)?;
         y = y.index_add(&idx, &out.broadcast_mul(&w)?, 0)?;
     }
@@ -210,13 +239,36 @@ pub fn dispatch_decode<E: Expert>(
     weights: &Tensor,
     k: usize,
 ) -> Result<(Tensor, Vec<u32>)> {
+    dispatch_decode_with(arch, experts, expert_device, x2, topk_idx, weights, k, None)
+}
+
+/// [`dispatch_decode`] with an optional residency-aware per-expert forward.
+///
+/// When `forward_expert` is `None`, this is byte-for-byte [`dispatch_decode`].
+/// When present, each routed expert runs through it: on a device-resident
+/// hit it runs the uploaded weights (moving `xs` to the expert device); on a
+/// miss it runs the host form. This is what lets the #62 device-expert cache
+/// serve hot experts from a non-CUDA device while the rest stay host.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_decode_with<E: Expert>(
+    arch: &str,
+    experts: &[E],
+    expert_device: &Device,
+    x2: &Tensor,
+    topk_idx: &Tensor,
+    weights: &Tensor,
+    k: usize,
+    forward_expert: ResidencyForward<'_>,
+) -> Result<(Tensor, Vec<u32>)> {
     let ids: Vec<u32> = topk_idx.flatten_all()?.to_vec1()?; // [k] — the one host sync
     let out_device = x2.device().clone();
     let x2 = on_device(x2, expert_device)?;
+    let default_fwd = |e: usize, x: &Tensor| experts[e].forward(x);
+    let fwd = forward_expert.unwrap_or(&default_fwd);
     let mut outs = Vec::with_capacity(k);
     for (s, &e) in ids.iter().enumerate() {
         check_expert_id(arch, e as usize, experts.len(), 0, s)?;
-        outs.push(experts[e as usize].forward(&x2)?); // [1, h] each
+        outs.push(fwd(e as usize, &x2)?); // [1, h] each
     }
     let out = Tensor::stack(&outs, 0)?; // [k, 1, h]
     let out = on_device(&out, &out_device)?;
