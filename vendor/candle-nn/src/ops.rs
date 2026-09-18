@@ -53,6 +53,54 @@ impl candle::CustomOp1 for Sigmoid {
         "sigmoid"
     }
 
+    #[cfg(feature = "opencl")]
+    fn opencl_fwd(
+        &self,
+        storage: &candle::OpenClStorage,
+        layout: &Layout,
+    ) -> Result<(candle::OpenClStorage, Shape)> {
+        use candle::backend::{BackendDevice, BackendStorage};
+        use candle::opencl_backend::kernels;
+        if storage.dtype() == DType::F32 && kernels::native_enabled() {
+            let n = layout.shape().elem_count();
+            let out = storage.device.alloc(DType::F32, n)?;
+            match kernels::run_unary(&storage.device.ctx(), 19, storage.buffer, out.buffer, n, layout) {
+                Ok(()) => return Ok((out, layout.shape().clone())),
+                Err(e) => kernels::note_fallback("sigmoid", Some(&e)),
+            }
+        } else if kernels::native_enabled() {
+            kernels::note_fallback("sigmoid", None);
+        }
+        let cpu = storage.to_cpu_storage()?;
+        let (out, shape) = self.cpu_fwd(&cpu, layout)?;
+        let dev = storage.device.clone();
+        Ok((dev.storage_from_cpu_storage(&out)?, shape))
+    }
+
+    #[cfg(feature = "vulkan")]
+    fn vulkan_fwd(
+        &self,
+        storage: &candle::VulkanStorage,
+        layout: &Layout,
+    ) -> Result<(candle::VulkanStorage, Shape)> {
+        use candle::backend::{BackendDevice, BackendStorage};
+        use candle::vulkan_backend::kernels;
+        if storage.dtype() == DType::F32 && kernels::native_enabled() {
+            let n = layout.shape().elem_count();
+            let out = storage.device.alloc(DType::F32, n)?;
+            match kernels::run_unary(&storage.device, 19, storage.buf(), out.buf(), n, layout) {
+                Ok(()) => return Ok((out, layout.shape().clone())),
+                Err(e) => kernels::note_fallback("sigmoid", Some(&e)),
+            }
+        } else if kernels::native_enabled() {
+            kernels::note_fallback("sigmoid", None);
+        }
+        let cpu = storage.to_cpu_storage()?;
+        let (out, shape) = self.cpu_fwd(&cpu, layout)?;
+        let dev = storage.device.clone();
+        Ok((dev.storage_from_cpu_storage(&out)?, shape))
+    }
+
     fn cpu_fwd(&self, storage: &CpuStorage, layout: &Layout) -> Result<(CpuStorage, Shape)> {
         use candle::backend::BackendStorage;
 
@@ -1452,6 +1500,53 @@ pub fn sdpa(
             do_causal,
         },
     )
+}
+
+#[cfg(all(test, any(feature = "opencl", feature = "vulkan")))]
+mod accel_sigmoid_tests {
+    use super::sigmoid;
+    use candle::{Device, Tensor};
+
+    fn check(device: Device, what: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let data: Vec<f32> = (0..97).map(|i| (i as f32 - 48.0) * 0.37).collect();
+        let cpu_in = Tensor::from_vec(data.clone(), 97, &Device::Cpu)?;
+        let want = sigmoid(&cpu_in)?.to_vec1::<f32>()?;
+        // A narrowed (offset) view exercises the strided launch too.
+        let dev_in = Tensor::from_vec(data, 97, &device)?;
+        let got = sigmoid(&dev_in)?.to_device(&Device::Cpu)?.to_vec1::<f32>()?;
+        let got_view = sigmoid(&dev_in.narrow(0, 3, 90)?)?.to_device(&Device::Cpu)?.to_vec1::<f32>()?;
+        for (i, (a, b)) in want.iter().zip(&got).enumerate() {
+            assert!((a - b).abs() < 1e-6, "{what} sigmoid: element {i}: device {b} vs cpu {a}");
+        }
+        for (i, (a, b)) in want[3..93].iter().zip(&got_view).enumerate() {
+            assert!((a - b).abs() < 1e-6, "{what} sigmoid (view): element {i}: device {b} vs cpu {a}");
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "opencl")]
+    #[test]
+    fn sigmoid_opencl_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+        match candle::OpenClDevice::new(0) {
+            Ok(d) => check(Device::OpenCl(d), "opencl"),
+            Err(e) => {
+                eprintln!("skipping opencl sigmoid test: {e}");
+                Ok(())
+            }
+        }
+    }
+
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn sigmoid_vulkan_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+        match candle::VulkanDevice::new(0) {
+            Ok(d) => check(Device::Vulkan(d), "vulkan"),
+            Err(e) => {
+                eprintln!("skipping vulkan sigmoid test: {e}");
+                Ok(())
+            }
+        }
+    }
 }
 
 #[cfg(all(test, feature = "vulkan"))]

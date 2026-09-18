@@ -110,7 +110,11 @@ pub fn program_for(context: usize, device_id: usize) -> Result<(usize, usize)> {
         return Err(err(e, "clCreateProgramWithSource"));
     }
     let guard = Prog { context, program, wg };
-    let opts = std::ffi::CString::new(format!("-D WG={wg} -cl-std=CL1.2")).unwrap();
+    // `JOSHUA_OPENCL_BUILD_OPTS` appends compiler options (e.g. `-cl-opt-disable`
+    // to rule the driver's optimiser in or out when bisecting a bad result).
+    let extra = std::env::var("JOSHUA_OPENCL_BUILD_OPTS").unwrap_or_default();
+    let opts = std::ffi::CString::new(format!("-D WG={wg} -cl-std=CL1.2 {extra}").trim().to_string())
+        .map_err(|_| Error::Msg("opencl: JOSHUA_OPENCL_BUILD_OPTS contains a NUL".into()))?;
     let bc = unsafe {
         clBuildProgram(program, 1, &device_id, opts.as_ptr() as *const c_void, std::ptr::null(), std::ptr::null())
     };
@@ -274,8 +278,25 @@ impl Drop for Kernel {
     }
 }
 
+/// Kernels named in `JOSHUA_OPENCL_NATIVE_DENY` (comma-separated, e.g.
+/// `k_gemm,k_qgemv`) fail to launch, so the op that wanted them takes the CPU
+/// round-trip instead: a per-kernel bisecting tool for a result that is only
+/// wrong on one driver.  `JOSHUA_OPENCL_TRACE=1` shows which ops fell back.
+fn denied(name: &str) -> bool {
+    static DENY: std::sync::OnceLock<std::collections::HashSet<String>> = std::sync::OnceLock::new();
+    let set = DENY.get_or_init(|| {
+        std::env::var("JOSHUA_OPENCL_NATIVE_DENY")
+            .map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+            .unwrap_or_default()
+    });
+    !set.is_empty() && set.contains(name)
+}
+
 impl Kernel {
     pub fn new(ctx: usize, dev: usize, queue: usize, name: &str) -> Result<Self> {
+        if denied(name) {
+            return Err(Error::Msg(format!("opencl: kernel {name} is disabled by JOSHUA_OPENCL_NATIVE_DENY")));
+        }
         let (program, wg) = program_for(ctx, dev)?;
         let cname = std::ffi::CString::new(name).map_err(|_| Error::Msg("opencl: kernel name has a NUL".into()))?;
         let mut e: i32 = 0;
@@ -647,8 +668,14 @@ pub struct MatStrides {
 /// `C[bz] = A[bz] @ B[bz]` for `batch` matrices of `(m, k) @ (k, n)`; C is
 /// written contiguous `[batch, m, n]`.  Picks the GEMV kernels for `m == 1`.
 pub fn run_matmul(c: &Ctx, a: usize, b: usize, out: usize, (batch, m, n, k): (usize, usize, usize, usize), sa: MatStrides, sb: MatStrides) -> Result<()> {
-    if batch == 0 || m == 0 || n == 0 || k == 0 {
+    if batch == 0 || m == 0 || n == 0 {
         return Ok(());
+    }
+    if k == 0 {
+        // An empty contraction is a zero matrix on every backend; the freshly
+        // allocated output holds whatever the device had there, so fill it.
+        let n_out = batch * m * n;
+        return run_fill(c, 4, out, n_out, &Layout::contiguous(n_out), 0);
     }
     let (m32, n32, k32) = (to_i32(m)?, to_i32(n)?, to_i32(k)?);
     if m == 1 && sa.col == 1 {
@@ -739,9 +766,20 @@ pub fn is_block_dtype(dtype: crate::quantized::GgmlDType) -> bool {
     !matches!(dtype, F32 | F16 | BF16)
 }
 
+/// The block kernels stride whole 32-element sub-blocks and whole blocks;
+/// an inner dimension that is not a multiple of both would silently drop its
+/// tail, so refuse it here and let the op take the CPU path.
+fn check_block_k(k: usize, block: usize, what: &str) -> Result<()> {
+    if k == 0 || !k.is_multiple_of(32) || !k.is_multiple_of(block) {
+        return Err(Error::Msg(format!("opencl {what}: inner dimension {k} is not a multiple of the {block}-element block")));
+    }
+    Ok(())
+}
+
 /// `C[m, n] = sum_k X[m, k] * W[n, k]` over block-quantized `W` (`[N, K]`).
 #[allow(clippy::too_many_arguments)]
 pub fn run_qgemv(c: &Ctx, dtype: crate::quantized::GgmlDType, x: usize, w: usize, out: usize, m: usize, n: usize, k: usize, woff: u64, xoff: usize) -> Result<()> {
+    check_block_k(k, dtype.block_size(), "qgemv")?;
     let mut kn = c.kernel("k_qgemv")?;
     let wg = kn.wg;
     kn.buf(x)?.buf(w)?.buf(out)?
@@ -757,6 +795,7 @@ pub fn run_qgemv(c: &Ctx, dtype: crate::quantized::GgmlDType, x: usize, w: usize
 /// bsz=66 bytes/block.
 #[allow(clippy::too_many_arguments)]
 pub fn run_iq2xxs_qgemv(c: &Ctx, x: usize, w: usize, out: usize, m: usize, n: usize, k: usize, woff: u64, xoff: usize) -> Result<()> {
+    check_block_k(k, 256, "iq2xxs qgemv")?;
     let mut kn = c.kernel("k_qgemv")?;
     let wg = kn.wg;
     kn.buf(x)?.buf(w)?.buf(out)?
@@ -788,6 +827,7 @@ pub fn run_dequant(c: &Ctx, dtype: crate::quantized::GgmlDType, w: usize, out: u
         }
         F32 => Err(Error::Msg("opencl: f32 weights need no dequantization".into())),
         _ => {
+            check_block_k(elem_count, dtype.block_size(), "dequant")?;
             let nsub = elem_count / 32;
             let mut kn = c.kernel("k_dequant")?;
             kn.buf(w)?.buf(out)?.val(to_i32(nsub)?)?.val(qtype_code(dtype))?.val(to_i32(dtype.block_size())?)?.val(to_i32(dtype.type_size())?)?.val(woff)?;
@@ -810,6 +850,7 @@ pub fn run_hembed(c: &Ctx, bf16: bool, w: usize, ids: usize, out: usize, n_ids: 
 /// Gather rows of a block-quantized `[vocab, K]` table into f32 `[n_ids, K]`.
 #[allow(clippy::too_many_arguments)]
 pub fn run_qembed(c: &Ctx, dtype: crate::quantized::GgmlDType, w: usize, ids: usize, out: usize, n_ids: usize, k: usize, vocab: usize, woff: u64, ids_off: usize) -> Result<()> {
+    check_block_k(k, dtype.block_size(), "qembed")?;
     let mut kn = c.kernel("k_qembed")?;
     let wg = kn.wg;
     kn.buf(w)?.buf(ids)?.buf(out)?
