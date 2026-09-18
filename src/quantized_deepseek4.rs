@@ -431,28 +431,38 @@ struct ExpertTensor {
     prefetch: Option<Arc<dyn crate::mmap_tensor::MmapPrefetch>>,
 }
 
+/// The swiglu gate clamp, `(-inf, clamp]` when `clamp > 0`.  Shared by the
+/// host [`Mlp`] and the device-resident [`Ds4DeviceExpert`] so the two
+/// forms cannot drift.
+fn clamp_gate(gate: Tensor, clamp: f64) -> Result<Tensor> {
+    if clamp > 0.0 {
+        gate.clamp(f64::NEG_INFINITY, clamp)
+    } else {
+        Ok(gate)
+    }
+}
+
+/// The swiglu up clamp, `[-clamp, clamp]` when `clamp > 0`.
+fn clamp_up(up: Tensor, clamp: f64) -> Result<Tensor> {
+    if clamp > 0.0 {
+        up.clamp(-clamp, clamp)
+    } else {
+        Ok(up)
+    }
+}
+
 impl Mlp {
     /// Gate projection + optional clamp.  Split out of [`Mlp::forward`] so
     /// the MoE dispatch can run all experts' gates (then all ups, then all
     /// downs) — reading each weight tensor as one sequential stream instead
     /// of jumping between gate/up/down on every expert.
     fn gate_forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let gate = self.gate.forward(xs)?;
-        if self.clamp > 0.0 {
-            gate.clamp(f64::NEG_INFINITY, self.clamp)
-        } else {
-            Ok(gate)
-        }
+        clamp_gate(self.gate.forward(xs)?, self.clamp)
     }
 
     /// Up projection + optional clamp (see [`Mlp::gate_forward`]).
     fn up_forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let up = self.up.forward(xs)?;
-        if self.clamp > 0.0 {
-            up.clamp(-self.clamp, self.clamp)
-        } else {
-            Ok(up)
-        }
+        clamp_up(self.up.forward(xs)?, self.clamp)
     }
 
     /// Combine `silu(gate) * up` and run the down projection.
@@ -474,6 +484,193 @@ impl Mlp {
             p.prefetch();
         }
     }
+}
+
+/// One routed expert resident in the device expert pool: the same three
+/// block-quantized projections as its host [`Mlp`], uploaded as-is
+/// (IQ2_XXS gate/up, Q2_K down on the real model) and run through the
+/// device's quantized kernels.  An opaque, byte-sized payload for
+/// [`crate::residency::DeviceResidency`].
+pub(crate) struct Ds4DeviceExpert {
+    gate: QMatMul,
+    up: QMatMul,
+    down: QMatMul,
+    clamp: f64,
+    bytes: u64,
+}
+
+impl crate::residency::DeviceExpertSlot for Ds4DeviceExpert {
+    fn device_bytes(&self) -> u64 {
+        self.bytes
+    }
+}
+
+impl Ds4DeviceExpert {
+    /// `down(silu(clamp(gate·x)) ⊙ clamp(up·x))`, exactly [`Mlp::forward`].
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        let gate = clamp_gate(self.gate.forward(xs)?, self.clamp)?;
+        let up = clamp_up(self.up.forward(xs)?, self.clamp)?;
+        self.down.forward(&(silu(&gate)? * up)?)
+    }
+}
+
+/// The host-side view of one routed expert the device pool uploads from:
+/// the borrowed (mmap) block tensors, their prefetch handles and the exact
+/// byte size a slot will occupy.
+struct HostExpert {
+    gate: Arc<QTensor>,
+    up: Arc<QTensor>,
+    down: Arc<QTensor>,
+    clamp: f64,
+    prefetch: Option<crate::residency::ExpertHandles>,
+    bytes: u64,
+}
+
+/// How a routed expert that is *not* resident in the device pool runs
+/// during decode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MissPolicy {
+    /// Run the host kernels now (overlapping the device's work on the
+    /// resident experts) and queue a background upload, so the next step
+    /// that routes here finds the expert resident.  The default.
+    Host,
+    /// Upload synchronously (a blocking write on the device's transfer
+    /// queue) and run on the device.  A measurement mode
+    /// (`JOSHUA_EXPERT_MISS=upload`): it stalls the decode thread for the
+    /// transfer but warms the pool fastest.
+    Upload,
+}
+
+impl MissPolicy {
+    fn from_env() -> Self {
+        match std::env::var("JOSHUA_EXPERT_MISS").as_deref() {
+            Ok("upload") | Ok("sync") => Self::Upload,
+            _ => Self::Host,
+        }
+    }
+}
+
+/// The model-wide device expert pool: a byte-budgeted LRU of
+/// [`Ds4DeviceExpert`] slots keyed by `(layer, expert)`, the background
+/// uploader that fills it, and the device the slots live on.  Shared by
+/// every MoE layer (for lookups and warming requests) and by the model's
+/// residency handle (hot-set protection).
+struct Ds4DevicePool {
+    device: Device,
+    pool: Arc<crate::residency::DeviceResidency<Ds4DeviceExpert>>,
+    uploader: Arc<crate::residency::ExpertUploader<Ds4DeviceExpert>>,
+    miss: MissPolicy,
+}
+
+/// The block-quantized tensor behind a `QMatMul`, when it kept one.
+fn qtensor_of(m: &QMatMul) -> Option<Arc<QTensor>> {
+    match m {
+        QMatMul::QTensor(qt) => Some(Arc::clone(qt)),
+        QMatMul::Tensor(_) | QMatMul::TensorF16(_) => None,
+    }
+}
+
+/// Build the device expert pool over every layer's routed experts.
+///
+/// `None` (with a log line) when the experts are not block-quantized
+/// tensors (a streamed load decoded them to f32) or the budget holds no
+/// expert.  On a CPU "device" (tests, `--device cpu` with a budget) a slot
+/// shares the host tensors — a hit is numerically the host path — so the
+/// partition can be exercised without an accelerator.
+fn build_device_pool(layers: &[Layer], dev: &Device, budget: u64) -> Option<Arc<Ds4DevicePool>> {
+    let mut host: Vec<Vec<HostExpert>> = Vec::with_capacity(layers.len());
+    for layer in layers {
+        // Every layer of this architecture carries an MoE block.
+        let FeedForward::Moe(moe) = &layer.ffn;
+        let mut row = Vec::with_capacity(moe.experts.len());
+        for m in &moe.experts {
+            let (Some(gate), Some(up), Some(down)) =
+                (qtensor_of(&m.gate), qtensor_of(&m.up), qtensor_of(&m.down))
+            else {
+                tracing::warn!(
+                    "deepseek4: the routed experts are not block-quantized tensors (streamed load); \
+                     VRAM expert cache disabled"
+                );
+                return None;
+            };
+            let bytes =
+                (gate.storage_size_in_bytes() + up.storage_size_in_bytes() + down.storage_size_in_bytes()) as u64;
+            row.push(HostExpert { gate, up, down, clamp: m.clamp, prefetch: m.prefetch.clone(), bytes });
+        }
+        host.push(row);
+    }
+    let per_slot = host.first().and_then(|r| r.first()).map_or(0, |h| h.bytes);
+    let n_experts: usize = host.iter().map(Vec::len).sum();
+    if per_slot == 0 || n_experts == 0 {
+        return None;
+    }
+    let slots = (budget / per_slot) as usize;
+    if slots == 0 {
+        tracing::warn!(
+            "deepseek4: VRAM expert cache budget of {:.1} MiB holds no expert ({:.2} MiB each); cache disabled",
+            budget as f64 / 2f64.powi(20),
+            per_slot as f64 / 2f64.powi(20),
+        );
+        return None;
+    }
+    let host = Arc::new(host);
+    let share_host = dev.is_cpu();
+    let dev2 = dev.clone();
+    let upload_one = move |l: u32, e: u32| -> Result<Option<Ds4DeviceExpert>> {
+        let Some(ex) = host.get(l as usize).and_then(|row| row.get(e as usize)) else {
+            return Ok(None);
+        };
+        if share_host {
+            return Ok(Some(Ds4DeviceExpert {
+                gate: QMatMul::from_arc(Arc::clone(&ex.gate))?,
+                up: QMatMul::from_arc(Arc::clone(&ex.up))?,
+                down: QMatMul::from_arc(Arc::clone(&ex.down))?,
+                clamp: ex.clamp,
+                bytes: ex.bytes,
+            }));
+        }
+        // Advise the three ranges in before the blocking write so it does
+        // not page-fault its way through the mapping mid-transfer.
+        if let Some(p) = &ex.prefetch {
+            p.prefetch();
+        }
+        let upload = |qt: &Arc<QTensor>| -> Result<QMatMul> {
+            // `data()` borrows the mapped bytes for a CPU storage: no host copy.
+            let bytes = qt.data()?;
+            let storage = QStorage::from_data_transfer(bytes, &dev2, qt.dtype())?;
+            QMatMul::from_qtensor(QTensor::new(storage, qt.shape().clone())?)
+        };
+        Ok(Some(Ds4DeviceExpert {
+            gate: upload(&ex.gate)?,
+            up: upload(&ex.up)?,
+            down: upload(&ex.down)?,
+            clamp: ex.clamp,
+            bytes: ex.bytes,
+        }))
+    };
+    let upload: Arc<dyn Fn(u32, u32) -> Option<Arc<Ds4DeviceExpert>> + Send + Sync> =
+        Arc::new(move |l, e| match upload_one(l, e) {
+            Ok(slot) => slot.map(Arc::new),
+            Err(err) => {
+                tracing::warn!("deepseek4: expert ({l}, {e}) upload to the VRAM cache failed: {err}");
+                None
+            }
+        });
+    let pool = Arc::new(crate::residency::DeviceResidency::new(budget, per_slot, upload));
+    let uploader = Arc::new(crate::residency::ExpertUploader::spawn(Arc::clone(&pool)));
+    let miss = MissPolicy::from_env();
+    tracing::info!(
+        "deepseek4: VRAM expert cache on {dev:?}: {:.2} GiB budget = {slots} slots of {:.2} MiB \
+         ({n_experts} routed experts in the model, {:.1}% resident at most); decode misses run on the {}",
+        budget as f64 / 2f64.powi(30),
+        per_slot as f64 / 2f64.powi(20),
+        100.0 * slots.min(n_experts) as f64 / n_experts as f64,
+        match miss {
+            MissPolicy::Host => "host and are uploaded in the background",
+            MissPolicy::Upload => "device after a synchronous upload (JOSHUA_EXPERT_MISS=upload)",
+        },
+    );
+    Some(Arc::new(Ds4DevicePool { device: dev.clone(), pool, uploader, miss }))
 }
 
 // ─── HC (hyper-computation) stream mixing ───────────────────────────────────
@@ -1346,7 +1543,9 @@ impl KvState {
 // ─── MoE ────────────────────────────────────────────────────────────────────
 
 struct Moe {
-    gate: Tensor,              // [n_expert, n_embd] (f32)
+    /// Router weight, transposed to `[n_embd, n_expert]` and made contiguous
+    /// once at load (it was a transpose + copy per forward call).
+    gate_t: Tensor,
     gate_bias: Option<Tensor>, // [n_expert]
     tid2eid: Option<Tensor>,   // [n_vocab, n_expert_used] (candle shape after gguf dim reversal)
     experts: Vec<Mlp>,
@@ -1360,11 +1559,11 @@ struct Moe {
     /// larger than the VRAM of the cards that can run the dense set.
     /// [`Moe::dispatch`] runs the whole block there and moves the result back.
     expert_device: Device,
-    /// Optional OpenCL IQ2 accelerator: when `expert_device` is an OpenCl
-    /// device, the routed gate/up IQ2 matmuls run on it with per-expert
-    /// device-resident weights (batched, transfer-amortized). `None` keeps the
-    /// CPU SIMD path byte-for-byte.
-    iq2_opencl: Option<std::sync::Arc<Iq2OpenClAccel>>,
+    /// This block's layer index: the `(layer, expert)` key into the pool.
+    layer: u32,
+    /// The device expert pool, when a VRAM cache budget was given: routed
+    /// experts resident there run on the device, the rest on the host.
+    device_pool: Option<Arc<Ds4DevicePool>>,
 }
 
 impl Moe {
@@ -1373,7 +1572,7 @@ impl Moe {
         let n_tokens = b * seq_len;
         let x2 = xs.reshape((n_tokens, h))?;
 
-        let logits = x2.matmul(&self.gate.t()?.contiguous()?)?; // [n_tokens, n_expert]
+        let logits = x2.matmul(&self.gate_t)?; // [n_tokens, n_expert]
                                                                 // sqrt(softplus(x)) scoring; bias shifts selection only.
         let probs = softplus(&logits)?.sqrt()?;
         let (weights, indices) = if self.hash {
@@ -1417,7 +1616,9 @@ impl Moe {
             (weights, topk_idx)
         };
 
-        let (routed, routed_ids) = self.dispatch(&x2, &indices, &weights, n_tokens)?;
+        // One token per sequence is a decode step (batched or not): the pool
+        // warms from its routing; a multi-token prefill only reads the pool.
+        let (routed, routed_ids) = self.dispatch(&x2, &indices, &weights, n_tokens, seq_len == 1)?;
         let mut out = routed;
         if let Some(shared) = &self.shared {
             out = (out + shared.forward(&x2)?)?;
@@ -1431,31 +1632,20 @@ impl Moe {
         indices: &Tensor,
         weights: &Tensor,
         n_tokens: usize,
+        decode: bool,
     ) -> Result<(Tensor, Vec<u32>)> {
         let k = self.n_expert_used;
         let h = x2.dim(1)?;
         let ids: Vec<u32> = indices.flatten_all()?.to_vec1()?;
         let wts: Vec<f32> = weights.flatten_all()?.to_vec1()?;
-
-        // The routed experts may live on a different device from the
-        // activations: on an accelerator the dense set is on the device while
-        // the expert pool stays in host memory (see `Moe::expert_device`).
-        // Move the whole MoE block's input across once and its result back
-        // once, so the device boundary costs two transfers per layer instead
-        // of one per expert matmul.  Everything below reads and writes `dev`.
         let out_device = x2.device().clone();
-        let x2 = crate::moe::on_device(x2, &self.expert_device)?;
-
-        // The gate has just told us which experts this token needs.  Each
-        // expert's weights are a contiguous run inside the model mapping, so
-        // `MADV_WILLNEED` turns the scattered page faults that would otherwise
-        // stall the expert matmuls into sequential background reads — the
-        // kernel streams the selected experts while the first matmul runs.
-        // Idempotent and best-effort (a no-op for non-mmap loads).
-        for e in &ids {
-            if let Some(exp) = self.experts.get(*e as usize) {
-                exp.prefetch();
-            }
+        if let Some(pool) = &self.device_pool {
+            // Every launch of the previous MoE layer has completed: with the
+            // dense set on the device the routing read-back above waited for
+            // the in-order queue, and with it on the CPU that layer's pooled
+            // dispatch ended with a blocking read of its device sum (or
+            // launched nothing).  Buffers evicted since can go.
+            pool.pool.reclaim();
         }
 
         let mut per_expert: Vec<Vec<(u32, f32)>> = vec![Vec::new(); self.experts.len()];
@@ -1468,74 +1658,6 @@ impl Moe {
             }
         }
 
-        let dev = &self.expert_device;
-        let mut y = Tensor::zeros((n_tokens, h), DType::F32, dev)?;
-        // Select each expert's input rows once; all three phases reuse them.
-        let mut sel: Vec<Option<(Vec<u32>, Tensor)>> = Vec::with_capacity(self.experts.len());
-        for bucket in per_expert.iter() {
-            if bucket.is_empty() {
-                sel.push(None);
-                continue;
-            }
-            let token_idx: Vec<u32> = bucket.iter().map(|(t, _)| *t).collect();
-            let count = token_idx.len();
-            let idx = Tensor::from_vec(token_idx.clone(), count, dev)?;
-            sel.push(Some((token_idx, x2.index_select(&idx, 0)?)));
-        }
-
-        // Tensor-major MoE: run every expert's gate, then every expert's up,
-        // then every expert's down.  Reads of a weight tensor are one
-        // sequential pass over the selected experts instead of jumping
-        // between gate/up/down regions on each expert — the kernel's
-        // readahead streams each tensor at full device bandwidth, which is
-        // what the disk-bound prefill path needs.  Gate/up outputs for the
-        // whole batch are a few hundred KiB.
-        let mut gates: Vec<Option<Tensor>> = vec![None; self.experts.len()];
-        let mut ups: Vec<Option<Tensor>> = vec![None; self.experts.len()];
-        if let Some(accel) = &self.iq2_opencl {
-            // OpenCL IQ2 accelerator: run the active experts' gate+up IQ2
-            // matmuls on the device with resident weights (batched, no
-            // per-expert sync), then move results back to `dev` for the Q2_K
-            // down projection.  `x_sel` is already on the OpenCl device.
-            for (e, s) in sel.iter().enumerate() {
-                if let Some((_, x_sel)) = s {
-                    let (g, u) = accel.gate_up(
-                        e as u32,
-                        &self.experts[e].gate,
-                        &self.experts[e].up,
-                        x_sel,
-                    )?;
-                    let g = crate::moe::on_device(&g, dev)?;
-                    let u = crate::moe::on_device(&u, dev)?;
-                    gates[e] = Some(g.into_owned());
-                    ups[e] = Some(u.into_owned());
-                }
-            }
-        } else {
-            for (e, s) in sel.iter().enumerate() {
-                if let Some((_, x_sel)) = s {
-                    gates[e] = Some(self.experts[e].gate_forward(x_sel)?);
-                }
-            }
-            for (e, s) in sel.iter().enumerate() {
-                if let Some((_, x_sel)) = s {
-                    ups[e] = Some(self.experts[e].up_forward(x_sel)?);
-                }
-            }
-        }
-        for (e, s) in sel.iter().enumerate() {
-            if let Some((token_idx, _)) = s {
-                let out = self.experts[e].combine_and_down(
-                    gates[e].take().expect("gate ran"),
-                    ups[e].take().expect("up ran"),
-                )?;
-                let idx = Tensor::from_vec(token_idx.clone(), token_idx.len(), dev)?;
-                let w: Vec<f32> = per_expert[e].iter().map(|(_, w)| *w).collect();
-                let w = Tensor::from_vec(w, (token_idx.len(), 1), dev)?;
-                y = y.index_add(&idx, &out.broadcast_mul(&w)?, 0)?;
-            }
-        }
-
         // Routing record for the speculative next-step prefetch: during
         // decode, every id this step routed to (routing consistency makes
         // the next step likely to repeat them); during prefill only the
@@ -1545,9 +1667,229 @@ impl Moe {
             ids[n_tokens.saturating_sub(1) * k..].to_vec();
         routed_ids.sort_unstable();
         routed_ids.dedup();
+
+        let y = match &self.device_pool {
+            Some(pool) => self.dispatch_pooled(pool, x2, &per_expert, &routed_ids, n_tokens, decode, h)?,
+            None => {
+                // The routed experts may live on a different device from the
+                // activations: on an accelerator the dense set is on the
+                // device while the expert pool stays in host memory (see
+                // `Moe::expert_device`).  Move the whole MoE block's input
+                // across once and its result back once, so the device
+                // boundary costs two transfers per layer instead of one per
+                // expert matmul.
+                let x2 = crate::moe::on_device(x2, &self.expert_device)?;
+                let active: Vec<usize> =
+                    (0..self.experts.len()).filter(|e| !per_expert[*e].is_empty()).collect();
+                self.host_experts(&x2, &per_expert, &active, n_tokens, h)?
+            }
+        };
         // …and hand the block's output back to the model's device.
         let y = crate::moe::on_device(&y, &out_device)?.into_owned();
         Ok((y, routed_ids))
+    }
+
+    /// Run the routed experts `active` over their token buckets on the host
+    /// form (`x2` on [`Moe::expert_device`]) and return the weighted sum
+    /// `[n_tokens, h]` on that device.
+    fn host_experts(
+        &self,
+        x2: &Tensor,
+        per_expert: &[Vec<(u32, f32)>],
+        active: &[usize],
+        n_tokens: usize,
+        h: usize,
+    ) -> Result<Tensor> {
+        // The gate has just told us which experts this token needs.  Each
+        // expert's weights are a contiguous run inside the model mapping, so
+        // `MADV_WILLNEED` turns the scattered page faults that would otherwise
+        // stall the expert matmuls into sequential background reads — the
+        // kernel streams the selected experts while the first matmul runs.
+        // Idempotent and best-effort (a no-op for non-mmap loads).
+        for &e in active {
+            self.experts[e].prefetch();
+        }
+
+        let dev = x2.device();
+        let mut y = Tensor::zeros((n_tokens, h), DType::F32, dev)?;
+        // Select each expert's input rows once; all three phases reuse them.
+        let mut sel: Vec<(usize, Vec<u32>, Tensor)> = Vec::with_capacity(active.len());
+        for &e in active {
+            let token_idx: Vec<u32> = per_expert[e].iter().map(|(t, _)| *t).collect();
+            let count = token_idx.len();
+            if count == 0 {
+                continue;
+            }
+            let idx = Tensor::from_vec(token_idx.clone(), count, dev)?;
+            sel.push((e, token_idx, x2.index_select(&idx, 0)?));
+        }
+
+        // Tensor-major MoE: run every expert's gate, then every expert's up,
+        // then every expert's down.  Reads of a weight tensor are one
+        // sequential pass over the selected experts instead of jumping
+        // between gate/up/down regions on each expert — the kernel's
+        // readahead streams each tensor at full device bandwidth, which is
+        // what the disk-bound prefill path needs.  Gate/up outputs for the
+        // whole batch are a few hundred KiB.
+        let mut gates: Vec<Tensor> = Vec::with_capacity(sel.len());
+        for (e, _, x_sel) in &sel {
+            gates.push(self.experts[*e].gate_forward(x_sel)?);
+        }
+        let mut ups: Vec<Tensor> = Vec::with_capacity(sel.len());
+        for (e, _, x_sel) in &sel {
+            ups.push(self.experts[*e].up_forward(x_sel)?);
+        }
+        for (((e, token_idx, _), gate), up) in sel.iter().zip(gates).zip(ups) {
+            let out = self.experts[*e].combine_and_down(gate, up)?;
+            let idx = Tensor::from_vec(token_idx.clone(), token_idx.len(), dev)?;
+            let w: Vec<f32> = per_expert[*e].iter().map(|(_, w)| *w).collect();
+            let w = Tensor::from_vec(w, (token_idx.len(), 1), dev)?;
+            y = y.index_add(&idx, &out.broadcast_mul(&w)?, 0)?;
+        }
+        Ok(y)
+    }
+
+    /// The MoE block with a device expert pool: routed experts resident in
+    /// the pool run on the device, the rest on the host, and the two partial
+    /// sums are added on the block's output device.
+    ///
+    /// * Decode (one token per sequence): the resident experts are enqueued
+    ///   first (asynchronous launches), then the misses run on the host while
+    ///   the device works; every miss is queued for a background upload so
+    ///   the next step that routes here finds it resident
+    ///   (`JOSHUA_EXPERT_MISS=upload` uploads synchronously instead).
+    /// * Prefill: resident experts only — a prompt routes through nearly
+    ///   every expert of every layer, and uploading them all would stream the
+    ///   whole pool over the bus and evict the decode working set.  The last
+    ///   prompt row's routing is queued, so the decode that follows starts
+    ///   with its likely experts resident.
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_pooled(
+        &self,
+        pool: &Ds4DevicePool,
+        x2: &Tensor,
+        per_expert: &[Vec<(u32, f32)>],
+        last_row_ids: &[u32],
+        n_tokens: usize,
+        decode: bool,
+        h: usize,
+    ) -> Result<Tensor> {
+        let dev = &pool.device;
+        let mut hits: Vec<(usize, Arc<Ds4DeviceExpert>)> = Vec::new();
+        let mut misses: Vec<usize> = Vec::new();
+        for (e, bucket) in per_expert.iter().enumerate() {
+            if bucket.is_empty() {
+                continue;
+            }
+            if decode && pool.miss == MissPolicy::Upload {
+                pool.pool.acquire(self.layer, e as u32);
+            }
+            match pool.pool.lookup(self.layer, e as u32) {
+                Some(slot) => hits.push((e, slot)),
+                None => {
+                    misses.push(e);
+                    if decode {
+                        pool.uploader.request(self.layer, e as u32);
+                    }
+                }
+            }
+        }
+        if !decode {
+            for &e in last_row_ids {
+                pool.uploader.request(self.layer, e);
+            }
+        }
+
+        // Device part first: the launches are asynchronous, so the host
+        // misses below overlap with them.
+        let y_dev = if hits.is_empty() {
+            None
+        } else {
+            let x_dev = crate::moe::on_device(x2, dev)?;
+            Some(if n_tokens == 1 {
+                Self::pooled_decode(&hits, per_expert, &x_dev)?
+            } else {
+                Self::pooled_prefill(&hits, per_expert, &x_dev, n_tokens, h)?
+            })
+        };
+        let y_host = if misses.is_empty() {
+            None
+        } else {
+            let x_host = crate::moe::on_device(x2, &self.expert_device)?;
+            Some(self.host_experts(&x_host, per_expert, &misses, n_tokens, h)?)
+        };
+        // The handles this layer launched on go back to the pool's retire
+        // list: freed at the next `reclaim`, after a read-back proved the
+        // launches complete, even if the uploader evicts them meanwhile.
+        for (_, slot) in hits {
+            pool.pool.retire(slot);
+        }
+        let out_device = x2.device();
+        Ok(match (y_dev, y_host) {
+            (Some(d), Some(hst)) => {
+                let d = crate::moe::on_device(&d, out_device)?;
+                let hst = crate::moe::on_device(&hst, out_device)?;
+                (d.as_ref() + hst.as_ref())?
+            }
+            (Some(y), None) | (None, Some(y)) => crate::moe::on_device(&y, out_device)?.into_owned(),
+            (None, None) => Tensor::zeros((n_tokens, h), DType::F32, out_device)?,
+        })
+    }
+
+    /// Decode over the resident experts: `x_dev` is the one row `[1, h]`;
+    /// each expert's output is scaled by its routing weight (a host scalar,
+    /// no upload) and the outputs are summed.
+    fn pooled_decode(
+        hits: &[(usize, Arc<Ds4DeviceExpert>)],
+        per_expert: &[Vec<(u32, f32)>],
+        x_dev: &Tensor,
+    ) -> Result<Tensor> {
+        let mut acc: Option<Tensor> = None;
+        for (e, slot) in hits {
+            let w = per_expert[*e].first().map_or(0.0, |(_, w)| *w) as f64;
+            let out = slot.forward(x_dev)?.affine(w, 0.0)?;
+            acc = Some(match acc {
+                None => out,
+                Some(a) => (a + out)?,
+            });
+        }
+        acc.ok_or_else(|| candle_core::Error::Msg("deepseek4: no resident expert to run".into()))
+    }
+
+    /// Prefill over the resident experts: one packed token-index buffer and
+    /// one packed routing-weight buffer per layer (a single upload each);
+    /// each expert gathers its rows through a narrowed view, and the
+    /// weighted outputs are scattered back with one `index_add`.
+    fn pooled_prefill(
+        hits: &[(usize, Arc<Ds4DeviceExpert>)],
+        per_expert: &[Vec<(u32, f32)>],
+        x_dev: &Tensor,
+        n_tokens: usize,
+        h: usize,
+    ) -> Result<Tensor> {
+        let dev = x_dev.device();
+        let mut idx_all: Vec<u32> = Vec::new();
+        let mut w_all: Vec<f32> = Vec::new();
+        let mut spans: Vec<(usize, usize)> = Vec::with_capacity(hits.len());
+        for (e, _) in hits {
+            let off = idx_all.len();
+            for (t, w) in &per_expert[*e] {
+                idx_all.push(*t);
+                w_all.push(*w);
+            }
+            spans.push((off, idx_all.len() - off));
+        }
+        let total = idx_all.len();
+        let idx_t = Tensor::from_vec(idx_all, total, dev)?;
+        let w_t = Tensor::from_vec(w_all, (total, 1), dev)?;
+        let mut outs: Vec<Tensor> = Vec::with_capacity(hits.len());
+        for ((_, slot), (off, count)) in hits.iter().zip(spans) {
+            let idx = idx_t.narrow(0, off, count)?;
+            let x_sel = x_dev.index_select(&idx, 0)?;
+            outs.push(slot.forward(&x_sel)?.broadcast_mul(&w_t.narrow(0, off, count)?)?);
+        }
+        let all = Tensor::cat(&outs, 0)?;
+        Tensor::zeros((n_tokens, h), DType::F32, dev)?.index_add(&idx_t, &all, 0)
     }
 }
 
@@ -1616,9 +1958,13 @@ struct Shared {
     /// Per-layer expert byte ranges in the mapping (see
     /// [`crate::gguf_ext::GgufHeader::layer_expert_ranges`]).
     layer_expert_ranges: Vec<Option<(usize, usize)>>,
-    /// Executes residency for the hot set (CPU madvise today; a device slot
-    /// cache later).  Built once at load from the per-expert handles.
+    /// Executes residency for the hot set: CPU madvise, plus the device
+    /// pool's uploader when one exists.  Built once at load from the
+    /// per-expert handles.
     residency: std::sync::Arc<dyn crate::residency::ExpertResidency>,
+    /// The device expert pool (see [`ModelWeights::from_gguf_mmap_placed`]),
+    /// kept for diagnostics; the MoE blocks hold their own handles.
+    device_pool: Option<Arc<Ds4DevicePool>>,
 }
 
 /// A quantized DeepSeek-V4 model: one shared set of weights plus per-session
@@ -1660,10 +2006,9 @@ struct Reader<R: Read + Seek> {
     raw: Option<GgufHeader>,
     reader: R,
     device: Device,
-    /// Device the routed-expert tensors are built on.  Same as `device` for a
-    /// CPU model; the CPU when the model is mapped and running on an
-    /// accelerator, because a mapped expert is borrowed as CPU storage and
-    /// the IQ2_XXS dtype has no accelerator kernel either way.  See
+    /// Device the routed-expert tensors are built on: the CPU for every
+    /// mapped model (a mapped expert is borrowed as CPU storage; a device
+    /// expert cache uploads from it), `device` for a streamed load.  See
     /// [`Moe::expert_device`].
     expert_device: Device,
     mmap: Option<std::sync::Arc<memmap2::Mmap>>,
@@ -1882,26 +2227,90 @@ impl ModelWeights {
         device: &Device,
         mmap: Option<std::sync::Arc<memmap2::Mmap>>,
         file: Option<std::sync::Arc<std::fs::File>>,
-        // The engine's configured context length.  The KV caches are sized
-        // to `min(context_length, KV_CAP, n_ctx)`; 0 means "no engine limit".
-        //
-        // This matters on an accelerator: the dense weights already occupy
-        // most of VRAM, so an engine serving 4K tokens must not reserve the
-        // 256K cap (several GiB) and fail the first attention call.
         n_ctx: usize,
     ) -> Result<Self> {
+        Self::from_gguf_mmap_placed(ct, raw, reader, device, device, mmap, file, n_ctx, None)
+    }
+
+    /// [`ModelWeights::from_gguf_mmap`] with an explicit expert placement and
+    /// a VRAM expert-cache budget.
+    ///
+    /// A mapped model's routed experts are *always* borrowed from the mapping
+    /// on the host (IQ2_XXS gate/up + Q2_K down; the ~72 GiB pool of
+    /// V4-Flash never fits a card).  `device_expert_cache_bytes` (> 0) adds a
+    /// bounded device pool over them: a byte-budgeted LRU of experts
+    /// uploaded to `device`, filled by a background uploader from the
+    /// routing (decode misses, the routing-frequency hot set, the last
+    /// prompt row), consulted by every MoE layer — resident experts run on
+    /// the device, the rest on the host, in the same forward pass.  The
+    /// pool needs an IQ2_XXS kernel, which only the OpenCL backend (and, for
+    /// tests, the CPU, where a slot shares the host tensors) has; on other
+    /// accelerators the budget is ignored with a log line.
+    ///
+    /// `expert_device` is the engine's resolved expert placement: an OpenCL
+    /// device there means "run the routed experts on the device", which
+    /// this loader can only honour through the pool — without a budget it
+    /// logs and keeps them on the host.
+    ///
+    /// `n_ctx` is the engine's configured context length.  The KV caches are
+    /// sized to `min(context_length, KV_CAP, n_ctx)`; 0 means "no engine
+    /// limit".  This matters on an accelerator: the dense weights already
+    /// occupy most of VRAM, so an engine serving 4K tokens must not reserve
+    /// the 256K cap (several GiB) and fail the first attention call.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_gguf_mmap_placed<R: Read + Seek>(
+        ct: gguf_file::Content,
+        raw: Option<&GgufHeader>,
+        reader: &mut R,
+        device: &Device,
+        expert_device: &Device,
+        mmap: Option<std::sync::Arc<memmap2::Mmap>>,
+        file: Option<std::sync::Arc<std::fs::File>>,
+        n_ctx: usize,
+        device_expert_cache_bytes: Option<u64>,
+    ) -> Result<Self> {
         let cfg = Config::from_metadata(&ct.metadata)?;
-        // Routed experts stay on the CPU whenever the model is memory-mapped
-        // AND the active device has no IQ2_XXS kernel.  On an OpenCL device
-        // (e.g. Arc discrete GPU) `crate::iq2xxs` provides a fused OpenCL
-        // GEMV kernel, so the experts may target the device too; the dense
-        // set (embeddings, attention, norms, routers, shared experts, output)
-        // still benefits the most.  Vulkan/Metal/CUDA host-only for IQ2.
-        let expert_device = if mmap.is_some() && !device.is_opencl() {
-            Device::Cpu
+        if !(expert_device.is_cpu() || expert_device.is_opencl() || expert_device.same_device(device)) {
+            candle_core::bail!(
+                "deepseek4: routed experts must live on the model device, an OpenCL device or the CPU, \
+                 not {expert_device:?}"
+            );
+        }
+        // Where the device expert pool lives, if one is built at all (see
+        // the doc comment above).  Decided up front so the log lines land
+        // before the (long) load, and so the streamed path — which decodes
+        // the experts to f32 on the model device — never pretends to cache.
+        let cache_bytes = device_expert_cache_bytes.unwrap_or(0);
+        let pool_device: Option<Device> = if mmap.is_none() {
+            None
+        } else if cache_bytes == 0 {
+            if expert_device.is_opencl() {
+                tracing::warn!(
+                    "deepseek4: expert placement `device` requested without a VRAM expert-cache budget \
+                     (--vram-expert-cache); the routed experts stay on the host"
+                );
+            }
+            None
+        } else if expert_device.is_opencl() {
+            // The B50 configuration: dense set on the CPU (or the device),
+            // routed experts cached on the card.
+            Some(expert_device.clone())
+        } else if device.is_opencl() {
+            Some(device.clone())
+        } else if device.is_cpu() && expert_device.is_cpu() {
+            Some(Device::Cpu)
         } else {
-            device.clone()
+            tracing::info!(
+                "deepseek4: {device:?} has no IQ2_XXS kernel; VRAM expert cache disabled, routed \
+                 experts stay on the host"
+            );
+            None
         };
+        // The host form of every routed expert: borrowed from the mapping on
+        // the CPU whenever there is one (the source of truth, the CPU path
+        // and what the device pool uploads from); a streamed load decodes
+        // them to f32 on the model device instead.
+        let expert_device = if mmap.is_some() { Device::Cpu } else { device.clone() };
         let mut rd = Reader {
             ct,
             raw: raw.cloned(),
@@ -2088,17 +2497,35 @@ impl ModelWeights {
         let file = rd.file.clone();
 
         let n_expert = cfg.n_expert;
-        let residency: std::sync::Arc<dyn crate::residency::ExpertResidency> =
-            std::sync::Arc::new(crate::residency::CpuResidency::new(
-                layers
-                    .iter()
-                    .map(|layer| {
-                        // Every layer of this architecture carries an MoE block.
-                        let FeedForward::Moe(moe) = &layer.ffn;
-                        moe.experts.iter().map(|m| m.prefetch.clone()).collect()
-                    })
-                    .collect(),
-            ));
+        // The device expert pool spans every layer (one LRU keyed by
+        // (layer, expert), so a layer with skewed routing can hold more
+        // experts than an even split would give it); every MoE block gets a
+        // handle for lookups and warming requests.
+        let device_pool = pool_device.and_then(|dev| build_device_pool(&layers, &dev, cache_bytes));
+        if let Some(pool) = &device_pool {
+            for layer in layers.iter_mut() {
+                let FeedForward::Moe(moe) = &mut layer.ffn;
+                moe.device_pool = Some(Arc::clone(pool));
+            }
+        }
+        let cpu_residency = crate::residency::CpuResidency::new(
+            layers
+                .iter()
+                .map(|layer| {
+                    // Every layer of this architecture carries an MoE block.
+                    let FeedForward::Moe(moe) = &layer.ffn;
+                    moe.experts.iter().map(|m| m.prefetch.clone()).collect()
+                })
+                .collect(),
+        );
+        let residency: std::sync::Arc<dyn crate::residency::ExpertResidency> = match &device_pool {
+            Some(pool) => std::sync::Arc::new(crate::residency::CompositeResidency::with_device_pool(
+                cpu_residency,
+                Arc::clone(&pool.pool),
+                Arc::clone(&pool.uploader),
+            )),
+            None => std::sync::Arc::new(cpu_residency),
+        };
         let n_layers = layers.len();
         let shared = std::sync::Arc::new(Shared {
             tok_embeddings,
@@ -2117,6 +2544,7 @@ impl ModelWeights {
             file,
             layer_expert_ranges,
             residency,
+            device_pool,
         });
         Ok(Self {
             shared,
@@ -2172,10 +2600,51 @@ impl ModelWeights {
         self.hot_experts.set_budget(n);
     }
 
-    /// Number of experts the residency backend can hold resident
-    /// (informational on CPU; a phase-5 auto-sizing input on devices).
+    /// Number of mmap-backed experts the host residency backend knows
+    /// (informational; the host hot-expert auto-sizing input).  The device
+    /// pool is reported separately by [`ModelWeights::device_expert_cache`].
     pub fn expert_residency_capacity(&self) -> usize {
         self.shared.residency.capacity()
+    }
+
+    /// The device expert pool's budget, occupancy and hit/miss counters,
+    /// when a VRAM cache was built at load.
+    pub fn device_expert_cache(&self) -> Option<crate::residency::DeviceCacheReport> {
+        self.shared.device_pool.as_ref().map(|p| {
+            crate::residency::DeviceCacheReport::of(&p.pool, Some(&p.uploader))
+        })
+    }
+
+    /// Block until the background uploader has drained its queue (tests and
+    /// diagnostics: makes "the misses of the last step are resident now"
+    /// observable).  A no-op without a device pool.
+    pub fn wait_for_expert_uploads(&self) {
+        if let Some(p) = &self.shared.device_pool {
+            p.uploader.wait_idle();
+        }
+    }
+
+    /// A periodic `debug` line with the device pool's state (every
+    /// [`crate::hot_experts::REFRESH_STEPS`] decode steps).
+    fn log_device_cache(&self, step: u64) {
+        if let Some(r) = self.device_expert_cache() {
+            tracing::debug!(
+                "deepseek4 vram expert cache @step {step}: {}/{} slots ({:.2}/{:.2} GiB), hits {} misses {} \
+                 uploads {} evictions {} refused {} failed {}; upload requests {} (dropped {})",
+                r.resident,
+                r.slots,
+                r.resident_bytes as f64 / 2f64.powi(30),
+                r.budget_bytes as f64 / 2f64.powi(30),
+                r.stats.hits,
+                r.stats.misses,
+                r.stats.uploads,
+                r.stats.evictions,
+                r.stats.refused,
+                r.stats.upload_failures,
+                r.upload_requests,
+                r.upload_drops,
+            );
+        }
     }
 
     /// Whether the token-embedding table is held quantized (diagnostics).
@@ -2276,9 +2745,14 @@ impl ModelWeights {
         // the counters.
         let step = self.hot_experts.begin_step(seq_len == 1);
         if self.hot_experts.refresh_due(seq_len == 1) {
-            for (l, e) in self.hot_experts.refresh() {
+            let hot = self.hot_experts.refresh();
+            self.shared.residency.replace_hot_set(&hot);
+            for (l, e) in hot {
                 self.shared.residency.acquire(l, e);
             }
+        }
+        if seq_len == 1 && step.is_multiple_of(crate::hot_experts::REFRESH_STEPS) {
+            self.log_device_cache(step);
         }
 
         // Speculative next-step expert prefetch (decode only): routing is
@@ -2497,11 +2971,16 @@ impl ModelWeights {
             ids_cat.push(input.flatten_all()?.to_vec1()?.first().copied().unwrap_or(0));
         }
 
-        let _step = self.hot_experts.begin_step(true);
+        let step = self.hot_experts.begin_step(true);
         if self.hot_experts.refresh_due(true) {
-            for (l, e) in self.hot_experts.refresh() {
+            let hot = self.hot_experts.refresh();
+            self.shared.residency.replace_hot_set(&hot);
+            for (l, e) in hot {
                 self.shared.residency.acquire(l, e);
             }
+        }
+        if step.is_multiple_of(crate::hot_experts::REFRESH_STEPS) {
+            self.log_device_cache(step);
         }
 
         for i in 0..self.shared.layers.len() {
@@ -2860,12 +3339,10 @@ fn split_iq2xxs_experts<R: Read + Seek>(
         .unwrap_or(rd.ct.tensor_data_offset);
 
     // Zero-copy: one borrowed QTensor per expert, pointing into the mapping.
-    // The borrow is `QStorage::Cpu` by construction.  We take it for a CPU
-    // expert home AND an OpenCL expert home: on OpenCL the borrowed blocks
-    // still act as the residency source (the device cache uploads each active
-    // expert's blocks once via the same pointer), so the CPU-borrow remains the
-    // source of truth for both paths.
-    if let Some(mmap) = rd.mmap.as_ref().filter(|_| rd.expert_device.is_cpu() || rd.expert_device.is_opencl()) {
+    // The borrow is `QStorage::Cpu` by construction and is the source of
+    // truth for both the host path and the device expert cache (which
+    // uploads an active expert's blocks from the same bytes).
+    if let Some(mmap) = rd.mmap.as_ref().filter(|_| rd.expert_device.is_cpu()) {
         let base = tensor_data_offset.saturating_add(info.offset) as usize;
         let mut experts = Vec::with_capacity(n_expert);
         for e in 0..n_expert {
@@ -2936,7 +3413,9 @@ fn load_moe<R: Read + Seek>(
     layer: usize,
     hash: bool,
 ) -> Result<Moe> {
-    let gate = rd.f32_tensor(&format!("{p}.ffn_gate_inp.weight"))?;
+    // Router weight `[n_expert, n_embd]`, kept transposed + contiguous for
+    // the per-call `x @ Wᵀ` (numerically identical to transposing per call).
+    let gate_t = rd.f32_tensor(&format!("{p}.ffn_gate_inp.weight"))?.t()?.contiguous()?;
     let gate_bias = if hash {
         None
     } else {
@@ -3003,9 +3482,8 @@ fn load_moe<R: Read + Seek>(
         None
     };
 
-    let iq2_opencl = Iq2OpenClAccel::new(&rd.expert_device).map(std::sync::Arc::new);
-        Ok(Moe {
-        gate,
+    Ok(Moe {
+        gate_t,
         gate_bias,
         tid2eid,
         experts,
@@ -3014,7 +3492,8 @@ fn load_moe<R: Read + Seek>(
         weights_scale: cfg.expert_weights_scale,
         hash,
         expert_device: rd.expert_device.clone(),
-        iq2_opencl: Iq2OpenClAccel::new(&rd.expert_device).map(std::sync::Arc::new),
+        layer: layer as u32,
+        device_pool: None,
     })
 }
 
@@ -3060,7 +3539,8 @@ fn split_experts<R: Read + Seek>(
     // The routed experts are built on `rd.expert_device` — the CPU for every
     // mapped model, including a GPU build (see `Reader::expert_device`), so
     // this borrow path is the production one on an accelerator too: the dense
-    // set is what gets uploaded, not the 72 GiB expert pool.
+    // set is what gets uploaded, not the 72 GiB expert pool (the VRAM expert
+    // cache uploads individual experts from these borrowed tensors).
     if let Some(mmap) = rd.mmap.clone().filter(|_| rd.expert_device.is_cpu()) {
         if let Some(info) = rd.ct.tensor_infos.get(name) {
             let block_size = dtype.block_size();
@@ -3206,102 +3686,5 @@ mod tests {
             msg.contains("rope"),
             "error should name the rotary-dimension metadata, got: {msg}"
         );
-    }
-}
-// ─── OpenCL IQ2 accelerator for the routed gate/up experts ──────────────────
-#[cfg(feature = "opencl")]
-struct Iq2OpenClAccel {
-    dev: candle_core::OpenClDevice,
-    /// Per-expert cached (gate, up) device weights.  Keyed by expert index in
-    /// [0, n_expert); one `Moe` is a layer, so indices are layer-local.
-    cache: std::sync::Mutex<std::collections::HashMap<u32, (crate::iq2xxs::Iq2OpenClWeight, crate::iq2xxs::Iq2OpenClWeight)>>,
-}
-
-#[cfg(feature = "opencl")]
-impl Iq2OpenClAccel {
-    fn new(device: &Device) -> Option<Self> {
-        Some(Self { dev: device.as_opencl_device().ok()?.clone(), cache: Default::default() })
-    }
-
-    /// Run expert `e`'s IQ2 gate and up matmuls over the on-device activation
-    /// `xs` (`[1 or m, k]`, f32, on the OpenCl device), returning `(gate, up)`
-    /// both `[m, n]` on the device.  Weights upload once (cached), kernels are
-    /// enqueued (no per-expert sync); the caller batches many experts then syncs.
-    fn gate_up(
-        &self,
-        e: u32,
-        gate: &QMatMul,
-        up: &QMatMul,
-        xs: &Tensor,
-    ) -> Result<(Tensor, Tensor)> {
-        let mut cache = self.cache.lock().unwrap();
-        let pair = if let Some(p) = cache.get(&e) {
-            p.clone()
-        } else {
-            let g = iq2_weight_from_qmatmul(&self.dev, gate)?;
-            let u = iq2_weight_from_qmatmul(&self.dev, up)?;
-            cache.insert(e, (g.clone(), u.clone()));
-            (g, u)
-        };
-        drop(cache);
-        let g = pair.0.matmul(&self.dev, xs)?;
-        let u = pair.1.matmul(&self.dev, xs)?;
-        Ok((g, u))
-    }
-}
-
-/// Build a resident [`crate::iq2xxs::Iq2OpenClWeight`] from `m`'s IQ2 blocks.
-/// `m` must be a `QMatMul::QTensor` whose storage is the CPU-borrowed
-/// `MmapBlocksIq2Xxs` (the blocks this expert borrows from the mapping).
-#[cfg(feature = "opencl")]
-fn iq2_weight_from_qmatmul(
-    dev: &candle_core::OpenClDevice,
-    m: &QMatMul,
-) -> Result<crate::iq2xxs::Iq2OpenClWeight> {
-    use candle_core::quantized::QuantizedType;
-    let qt = match m {
-        QMatMul::QTensor(qt) => qt.clone(),
-        QMatMul::Tensor(_) | QMatMul::TensorF16(_) => {
-            candle_core::bail!("deepseek4 opencl: expert weight is not IQ2 blocks")
-        }
-    };
-    let (n, k) = dims2_of(qt.shape())?;
-    let data = qt.data()?; // borrowed block bytes (IQ2), contiguous
-    let block_bytes = data.len();
-    let n_blocks = block_bytes / crate::iq2xxs::BLOCK_BYTES;
-    // Reinterpret as BlockIq2Xxs and upload.
-    let blocks: &[crate::iq2xxs::BlockIq2Xxs] = unsafe {
-        core::slice::from_raw_parts(data.as_ptr() as *const crate::iq2xxs::BlockIq2Xxs, n_blocks)
-    };
-    crate::iq2xxs::Iq2OpenClWeight::upload(dev, blocks, n, k)
-}
-
-#[cfg(feature = "opencl")]
-fn dims2_of(s: &candle_core::Shape) -> Result<(usize, usize)> {
-    let d = s.dims();
-    if d.len() != 2 {
-        candle_core::bail!("deepseek4 opencl: expected a 2-D expert weight, got {d:?}");
-    }
-    Ok((d[0], d[1]))
-}
-
-// Non-OpenCL stub: no accelerator exists (the CPU SIMD path is used as-is).
-#[cfg(not(feature = "opencl"))]
-struct Iq2OpenClAccel;
-#[cfg(not(feature = "opencl"))]
-impl Iq2OpenClAccel {
-    fn new(_device: &Device) -> Option<Self> {
-        None
-    }
-    // Never called (iq2_opencl is always None without the feature), but must
-    // exist so the dispatch branch compiles.
-    fn gate_up(
-        &self,
-        _e: u32,
-        _gate: &QMatMul,
-        _up: &QMatMul,
-        _xs: &Tensor,
-    ) -> Result<(Tensor, Tensor)> {
-        candle_core::bail!("deepseek4: OpenCL IQ2 accelerator unavailable (no opencl feature)")
     }
 }

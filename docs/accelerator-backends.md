@@ -61,12 +61,101 @@ Both backends implement the same design:
   per device (GLSL → SPIR-V through `naga`, no external compiler).
 
 The routed experts of an MoE model stay on the CPU SIMD expert kernels on
-both backends (see `--expert-placement`): the dense set is what the iGPU
-speeds up, and on unified memory the two share DRAM either way.  The dense
-set itself is placed by the startup probe (`--dense-placement auto`), which
-now times the *quantized* matmul the loaders actually run — a Q4_K weight
-against f32 activations on the CPU and on the device — rather than an f32
-GEMM, so it measures the path a model takes.
+both backends by default (see `--expert-placement`): the dense set is what
+an iGPU speeds up, and on unified memory the two share DRAM either way.  A
+discrete OpenCL card can additionally hold a bounded cache of `deepseek4`'s
+routed experts — see the next section.  The dense set itself is placed by
+the startup probe (`--dense-placement auto`), which times the *quantized*
+matmul the loaders actually run — a Q4_K weight against f32 activations on
+the CPU and on the device — rather than an f32 GEMM, so it measures the
+path a model takes.
+
+## Discrete GPUs: the VRAM expert cache (DeepSeek-V4 on an Arc B50)
+
+DeepSeek-V4-Flash is 43 MoE layers × 256 routed experts (6 used per token);
+each expert is IQ2_XXS gate/up plus a Q2_K down projection, 6.75 MiB, and
+the pool is ~72 GiB — more than any card holds, while the dense set is
+~8 GiB.  On a discrete OpenCL device (an Intel Arc B50, 16 GB) the loader
+therefore keeps *every* routed expert borrowed from the memory-mapped file
+on the host — the CPU path, the prefetch source and the source of truth —
+and runs a **bounded device cache** over them:
+
+* One model-wide slot pool (`residency::DeviceResidency`), a byte-budgeted
+  LRU keyed by `(layer, expert)`.  A slot is the expert's three quantized
+  tensors uploaded as-is (IQ2_XXS is a first-class candle dtype on the
+  device; `k_qgemv` decodes it in the kernel) — 7,077,888 bytes each on the
+  real model, counted exactly against the budget, never over-committed.
+* A background uploader thread fills it on the device's *transfer queue*
+  (a second in-order OpenCL queue), so an upload never waits behind, or
+  holds back, the compute queue's kernels.  Uploads are blocking writes on
+  that queue; a slot becomes visible only after its write returned, which
+  makes it safe for any later launch on any queue of the context.
+* Per MoE layer, dispatch partitions the routed experts: the resident ones
+  are enqueued on the device first (asynchronous launches), the rest run on
+  the host expert kernels while the device works, and the two partial sums
+  are added on the block's output device.  Decode misses are queued for
+  upload so the next step that routes there finds them resident; a prefill
+  only *reads* the pool (a prompt routes through nearly every expert, and
+  uploading them all would stream the pool over the bus and evict the
+  decode working set) but queues the last prompt row's experts for the
+  decode that follows.  The routing-frequency hot set
+  (`--pin-hot-experts` / `--expert-cache`, defaulting to ¾ of the slots
+  when a pool exists) is protected from eviction.
+* The dense set can live on the card too, or stay on the CPU
+  (`--dense-placement cpu`) with only the expert cache on the device; the
+  activations then hop across once per layer in each direction.
+
+Flags (all also environment variables, `JOSHUA_…`):
+
+| Flag | Effect |
+|---|---|
+| `--expert-placement device` | On OpenCL for `deepseek4`: run the routed experts from the VRAM cache, sized as `--vram-expert-cache auto` unless a budget is given. |
+| `--vram-expert-cache auto` / `<MiB>` | The cache budget.  `auto` is device memory − dense set (only when the dense set is on the device) − 1 GiB placement headroom − scratch (512 MiB with the dense set on the CPU, 1 GiB with it on the device) − 1 GiB KV reserve (only with the dense set on the device).  `0` / unset disables the cache. |
+| `--dense-placement cpu` | Keep the dense set on the CPU and use the card for the expert cache alone (the largest budget: ~14.5 GiB → ~2,200 slots on a 16 GB card). |
+
+The load log prints the budget and slot count; every 64 decode steps a
+`debug` line reports hits, misses, uploads, evictions and resident bytes
+(`RUST_LOG=joshua=debug`).  `JOSHUA_EXPERT_MISS=upload` switches decode
+misses to a synchronous upload on the calling thread followed by a device
+run — a measurement mode that warms the pool fastest at the cost of
+stalling the token for the transfer.
+
+Numbers to check on the card rather than assume: the host-to-device
+bandwidth from mapped pages (the per-upload time is in the debug line;
+6.75 MiB should take well under a millisecond on PCIe 5.0 x8), whether the
+runtime over-subscribes silently past 16 GB (the budget is byte-counted for
+that reason; keep `auto`'s headroom), and the hit rate the counters show
+for a real prompt — that is what decides how much of the expert block the
+card carries.
+
+### Finding a wrong result on one driver
+
+A result that is NaN (or plainly wrong) only on the hardware and correct on
+pocl is bisected without recompiling:
+
+1. `JOSHUA_OPENCL_NATIVE=0` — every operator through the CPU round-trip.
+   Correct now?  A kernel is at fault; otherwise look elsewhere.
+2. `JOSHUA_OPENCL_NATIVE_DENY=k_gemm,k_qgemv` — a comma-separated list of
+   *kernel* names (as in `kernels.cl`) that are refused, so only the ops
+   that wanted them take the CPU path.  Halve the list until one kernel
+   remains.  `JOSHUA_OPENCL_TRACE=1` shows which ops fell back.
+3. `JOSHUA_OPENCL_CHECK_NAN=1` — after every native launch that produces an
+   f32 tensor, count the NaNs on the device and report the first op whose
+   output has any (a sync per op; infinities are not reported, mask fills
+   and reduction identities are legitimate).
+4. `JOSHUA_OPENCL_BUILD_OPTS="-cl-opt-disable"` — extra options for the
+   kernel compiler.  A result that changes with the optimiser is a compiler
+   issue, not a kernel bug.
+5. `JOSHUA_OPENCL_QGEMV=v1` — the expert formats (IQ2_XXS, Q2_K) normally
+   run `k_qgemv_mr`, which decodes each weight once for up to 16 rows with
+   every lane owning eight consecutive elements; this switches them to the
+   one-row `k_qgemv` every other block format uses.
+
+The per-visit device cost of an expert is what the cache's hit rate buys,
+so the kernel matters as much as the residency: with `k_qgemv_mr` a
+resident IQ2_XXS `[2048, 4096]` matmul agrees with the fused CPU kernel to
+~2e-6 (`iq2_opencl_tests` prints the timings next to the CPU's; run it on
+the card for the real numbers).
 
 ## Environment variables
 
@@ -75,6 +164,11 @@ GEMM, so it measures the path a model takes.
 | `JOSHUA_OPENCL_NATIVE=0` / `JOSHUA_VULKAN_NATIVE=0` | Run every operator through the CPU round-trip (a correctness reference). Native kernels are on by default. |
 | `JOSHUA_OPENCL_TRACE=1` / `JOSHUA_VULKAN_TRACE=1` | Log each operator that still falls back to the CPU and why. |
 | `JOSHUA_OPENCL_ZERO_COPY=0` | Upload weights instead of aliasing the mapped file (for a driver that copies anyway). |
+| `JOSHUA_OPENCL_NATIVE_DENY=k_a,k_b` | Refuse the named kernels so their ops take the CPU path (bisecting a bad result on one driver). |
+| `JOSHUA_OPENCL_CHECK_NAN=1` | Count NaNs on the device after every native f32 launch and name the first op that produced one. |
+| `JOSHUA_OPENCL_BUILD_OPTS="…"` | Extra options for the OpenCL kernel compiler (e.g. `-cl-opt-disable`). |
+| `JOSHUA_EXPERT_MISS=upload` | Decode misses of the VRAM expert cache upload synchronously and run on the device (measurement mode). |
+| `JOSHUA_OPENCL_QGEMV=v1` | Run the expert formats through the one-row quantized GEMV instead of the multi-row kernel (bisecting). |
 
 The engine logs the device it opened, its memory model and the active paths
 at startup:
@@ -124,12 +218,19 @@ device:
 cargo test -p candle-core --features opencl --lib -- opencl     # every op, every quantized dtype, zero-copy
 cargo test -p candle-core --features vulkan --lib -- vulkan     # every op, every quantized dtype, allocator churn
 cargo test --features opencl,vulkan --test opencl_model_tests --test vulkan_model_tests
+cargo test --features opencl --test iq2_opencl_tests --test opencl_ds4_cache_tests
 ```
 
 The model tests run the tiny llama / qwen3moe / deepseek2 / deepseek4 GGUFs
 on the device and compare prefill and decode logits with the CPU; they also
 report the number of native launches and fallbacks (zero for all four).
-In CI they run on pocl (OpenCL) and llvmpipe (Vulkan).
+`iq2_opencl_tests` checks the IQ2_XXS device matmul against the fused CPU
+kernel at the real expert shapes and prints resident-weight timings;
+`opencl_ds4_cache_tests` runs the tiny deepseek4 through the VRAM expert
+cache under a three-slot budget (dense set on the device and on the CPU,
+background and synchronous uploads) and asserts parity, the pool's
+counters and that no expert op fell back to the CPU.  In CI they run on
+pocl (OpenCL) and llvmpipe (Vulkan).
 
 `cargo run --release --features opencl,vulkan --example bench_backends --
 --device opencl` times the quantized decode / prefill matmuls and the f32

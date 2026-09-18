@@ -929,8 +929,14 @@ pub struct MatStrides {
 /// `C[bz] = A[bz] @ B[bz]` for `batch` matrices of `(m, k) @ (k, n)`; C is
 /// written contiguous `[batch, m, n]`.  Picks the GEMV kernels for `m == 1`.
 pub fn run_matmul(d: &VulkanDevice, a: Buf, b: Buf, out: Buf, (batch, m, n, k): (usize, usize, usize, usize), sa: MatStrides, sb: MatStrides) -> Result<()> {
-    if batch == 0 || m == 0 || n == 0 || k == 0 {
+    if batch == 0 || m == 0 || n == 0 {
         return Ok(());
+    }
+    if k == 0 {
+        // An empty contraction is a zero matrix on every backend; the freshly
+        // allocated output holds whatever the device had there, so fill it.
+        let n_out = batch * m * n;
+        return run_fill(d, 4, out, n_out, &Layout::contiguous(n_out), 0);
     }
     let lim = d.limits();
     if m == 1 && sa.col == 1 {
@@ -1010,6 +1016,7 @@ pub fn qtype_code(dtype: crate::quantized::GgmlDType) -> i32 {
         Q5K => 13,
         Q6K => 14,
         Q8K => 15,
+        Iq2Xxs => 16,
         BF16 => 30,
     }
 }

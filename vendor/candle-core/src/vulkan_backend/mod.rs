@@ -1429,6 +1429,11 @@ impl std::fmt::Debug for QVulkanStorage {
 
 impl QVulkanStorage {
     fn bytes_for(dtype: GgmlDType, elem_count: usize) -> Result<usize> {
+        if dtype == GgmlDType::Iq2Xxs {
+            // The GLSL `dequant_sub` has no IQ2_XXS case; refuse at upload so
+            // the op takes the CPU path instead of decoding garbage.
+            return Err(Error::Msg("vulkan: IQ2_XXS weights are not supported on this backend".into()));
+        }
         let bs = dtype.block_size();
         if !elem_count.is_multiple_of(bs) {
             return Err(Error::Msg(format!("vulkan: {elem_count} elements is not a whole number of {dtype:?} blocks")));
@@ -1670,6 +1675,11 @@ mod tests {
         let dup_ids = Tensor::new(&[[0u32, 1, 1], [0, 1, 1]], &cpu)?;
         close(&base.to_device(&dev)?.scatter(&dup_ids.to_device(&dev)?, &sc_src.to_device(&dev)?, 0)?, &base.scatter(&dup_ids, &sc_src, 0)?, 0.0, "scatter duplicate ids");
         close(&base.to_device(&dev)?.scatter_add(&dup_ids.to_device(&dev)?, &sc_src.to_device(&dev)?, 0)?, &base.scatter_add(&dup_ids, &sc_src, 0)?, 0.0, "scatter_add duplicate ids");
+        // An empty contraction is a zero matrix, not whatever the fresh
+        // output buffer held.
+        let e0 = Tensor::zeros((3, 0), DType::F32, &dev)?;
+        let e1 = Tensor::zeros((0, 5), DType::F32, &dev)?;
+        close(&e0.matmul(&e1)?, &Tensor::zeros((3, 5), DType::F32, &cpu)?, 0.0, "matmul with K == 0");
         // i64 → f32 keeps the high word.
         let big = Tensor::new(&[4_294_967_296i64, -4_294_967_297, 5, -1], &cpu)?;
         close(&big.to_device(&dev)?.to_dtype(DType::F32)?, &big.to_dtype(DType::F32)?, 0.0, "cast large i64 to f32");
@@ -1853,6 +1863,27 @@ mod tests {
                 move || (0..20).all(|_| x.index_select(&good, 0).and_then(|t| t.to_device(&cpu)).is_ok())
             });
             assert!(clean.join().unwrap(), "a recycled slot must come back clean");
+        }
+        Ok(())
+    }
+
+    /// A quantized matmul with a small, block-aligned inner dimension runs
+    /// the fused GEMV (m <= 16) and the dequantize + GEMM branch (m > 16)
+    /// and matches the CPU on both.
+    #[test]
+    fn vulkan_quantized_matmul_small_k() -> crate::Result<()> {
+        use crate::quantized::{GgmlDType, QMatMul, QStorage, QTensor};
+        use crate::Module;
+        let Some(dev) = device() else { return Ok(()) };
+        let cpu = Device::Cpu;
+        let (n, k) = (5usize, 96usize);
+        let w = Tensor::arange(0f32, (n * k) as f32, &cpu)?.affine(0.01, -0.3)?.reshape((n, k))?;
+        let q_cpu = QTensor::quantize(&w, GgmlDType::Q8_0)?;
+        let q_dev = QTensor::new(QStorage::from_data(q_cpu.data()?, &dev, GgmlDType::Q8_0)?, (n, k))?;
+        let (mm_cpu, mm_dev) = (QMatMul::from_qtensor(q_cpu)?, QMatMul::from_qtensor(q_dev)?);
+        for m in [1usize, 20] {
+            let x = Tensor::arange(0f32, (m * k) as f32, &cpu)?.affine(0.002, -0.1)?.reshape((m, k))?;
+            close(&mm_dev.forward(&x.to_device(&dev)?)?, &mm_cpu.forward(&x)?, 2e-3, "quantized matmul k=96");
         }
         Ok(())
     }

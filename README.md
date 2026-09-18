@@ -241,7 +241,7 @@ experts.  `--expert-placement` chooses where the routed experts of a
 | Value | Effect |
 |---|---|
 | `auto` (default) | `device` when `dense + experts + 1 GiB` fits the GPU's free memory (`cudaMemGetInfo` on CUDA, or `--vram-budget`), else `host`.  On OpenCL and Vulkan always `host` (the dense set is what an iGPU speeds up; the experts run on the CPU expert kernels).  With neither a probe nor a budget, `device`. |
-| `device` | Upload the experts too — the whole model must fit. |
+| `device` | Upload the experts too — the whole model must fit.  For `deepseek4` on OpenCL: run them from a bounded VRAM cache instead (sized as `--vram-expert-cache auto` unless a budget is given; see [`docs/accelerator-backends.md`](docs/accelerator-backends.md)). |
 | `host` | Keep the experts in host RAM, borrowed in place from the mapping and run on the CPU SIMD expert kernels (with the hot-expert cache and prefetch machinery active); only the dense set goes to the GPU.  Each MoE layer moves its activations across once in each direction. |
 
 `--vram-budget <MiB>` (or `JOSHUA_VRAM_BUDGET`) states the memory the model
@@ -549,10 +549,16 @@ prints the dense/expert split of any GGUF to sanity-check a new model.
 | `JOSHUA_EXPERT_PLACEMENT` | Same as `--expert-placement` (`auto`, `device`, or `host`) |
 | `JOSHUA_VRAM_BUDGET` | Same as `--vram-budget` (MiB of accelerator memory the model may use) |
 | `JOSHUA_DENSE_PLACEMENT` | Same as `--dense-placement` (`auto`, `device`, or `cpu`) |
+| `JOSHUA_VRAM_EXPERT_CACHE` | Same as `--vram-expert-cache` (`auto` or MiB of device memory for the bounded expert cache) |
+| `JOSHUA_EXPERT_MISS` | `upload` makes the VRAM expert cache upload decode misses synchronously (measurement mode; default: host run + background upload) |
 | `JOSHUA_SKIP_PLACEMENT_BENCH` | Skip the startup quantized-matmul probe that `auto` dense placement uses |
 | `JOSHUA_OPENCL_NATIVE` / `JOSHUA_VULKAN_NATIVE` | `0` runs every operator through the CPU round-trip instead of the device kernels (default on) |
 | `JOSHUA_OPENCL_TRACE` / `JOSHUA_VULKAN_TRACE` | `1` logs each operator that falls back to the CPU and why |
 | `JOSHUA_OPENCL_ZERO_COPY` | `0` uploads weights instead of aliasing the memory-mapped file on unified-memory OpenCL devices |
+| `JOSHUA_OPENCL_NATIVE_DENY` | Comma-separated OpenCL kernel names to refuse (their ops take the CPU path) — bisecting a bad result on one driver |
+| `JOSHUA_OPENCL_CHECK_NAN` | `1` counts NaNs on the device after every native f32 launch and names the first op that produced one |
+| `JOSHUA_OPENCL_BUILD_OPTS` | Extra options for the OpenCL kernel compiler (e.g. `-cl-opt-disable`) |
+| `JOSHUA_OPENCL_QGEMV` | `v1` runs the IQ2_XXS / Q2_K matmuls through the one-row quantized GEMV instead of the multi-row kernel (bisecting) |
 | `JOSHUA_MAX_CONCURRENCY` | Cap on simultaneous generations/embeddings (same as `--max-concurrency`) |
 | `JOSHUA_MAX_OUTPUT_TOKENS` | Hard ceiling on generated tokens per request (same as `--max-output-tokens`) |
 | `JOSHUA_WHISPER_MODEL` | Whisper model directory mounted at `/v1/audio/transcriptions` (same as `--whisper-model`) |

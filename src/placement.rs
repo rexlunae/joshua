@@ -376,11 +376,24 @@ pub fn instances_for_memory(free_bytes: u64, instance_bytes: u64, headroom_bytes
 /// * CUDA: `cuMemGetInfo` through cudarc (the `cuda` feature).
 /// * Metal: unified memory — the GPU shares system RAM, so the caller's
 ///   system-RAM figure is the right budget and this returns `None`.
-/// * OpenCL / CPU: `None`.
+/// * OpenCL: a *discrete* device reports `CL_DEVICE_GLOBAL_MEM_SIZE` as both
+///   figures (OpenCL has no free-memory query; the engine's headroom and KV
+///   reserve are what absorb the difference).  A device sharing host memory
+///   (an iGPU, a CPU runtime such as pocl) returns `None` like Metal: its
+///   "global memory" is system RAM, which the caller already budgets.
+/// * CPU / Vulkan: `None`.
 pub fn device_memory_info(device: &candle_core::Device) -> Option<(u64, u64)> {
     match device {
         #[cfg(feature = "cuda")]
         candle_core::Device::Cuda(dev) => cuda_memory_info(dev),
+        #[cfg(feature = "opencl")]
+        candle_core::Device::OpenCl(dev) => {
+            if dev.host_unified_memory() {
+                return None;
+            }
+            let total = dev.global_mem_size()?;
+            (total > 0).then_some((total, total))
+        }
         _ => None,
     }
 }

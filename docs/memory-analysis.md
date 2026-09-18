@@ -95,9 +95,11 @@ expert kernels; the device speeds up the dense set).  With no probe and no
 budget the historical layout is kept, so nothing changes on machines that
 fit.  Placement moves only the routed experts: a budget the dense set does
 not fit with headroom is refused at load, naming both numbers, rather than
-deferred to an out-of-memory upload.  `deepseek4` is always resolved as
-`host` (its loader keeps the IQ2_XXS experts on the CPU regardless), so
-its per-session device footprint is the dense set alone.
+deferred to an out-of-memory upload.  `deepseek4` keeps its IQ2_XXS
+experts borrowed on the CPU on every backend; on OpenCL `device` (or a
+`--vram-expert-cache` budget) adds a bounded device cache over them — see
+`docs/accelerator-backends.md` — whose footprint is the budget, not the
+pool, so its per-session device footprint is the dense set alone.
 The device accounting follows what each loader leaves resident rather
 than the on-disk bytes.  Only two kinds of tensor stay quantized on the
 device: the routed experts and the weight matrices every loader wraps in a

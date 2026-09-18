@@ -115,6 +115,7 @@ impl QMetalStorage {
                 let vec: Vec<crate::quantized::BlockQ8K> = read_to_vec(&buffer, block_len);
                 crate::quantized::BlockQ8K::to_float(&vec, &mut out);
             }
+            GgmlDType::Iq2Xxs => crate::bail!("IQ2_XXS weights are not supported on Metal"),
         }
 
         let buffer = self
@@ -497,6 +498,9 @@ impl From<GgmlDType> for candle_metal_kernels::GgmlDType {
             GgmlDType::F16 => candle_metal_kernels::GgmlDType::F16,
             GgmlDType::F32 => candle_metal_kernels::GgmlDType::F32,
             GgmlDType::BF16 => candle_metal_kernels::GgmlDType::BF16,
+            // Never constructed on Metal: `QStorage::from_data` refuses the
+            // dtype before any kernel could be selected for it.
+            GgmlDType::Iq2Xxs => unreachable!("IQ2_XXS weights are not supported on Metal"),
         }
     }
 }

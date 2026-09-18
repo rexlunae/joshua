@@ -1046,6 +1046,7 @@ pub fn write_unsupported_gguf(path: &Path) {
 const DTYPE_F32: u32 = 0;
 const DTYPE_F16: u32 = 1;
 const DTYPE_Q8_0: u32 = 8;
+const DTYPE_Q2_K: u32 = 10;
 const DTYPE_Q4_K: u32 = 12;
 const DTYPE_IQ2_XXS: u32 = 16;
 const DTYPE_I32: u32 = 26;
@@ -1100,6 +1101,20 @@ impl RawTensor {
         Self {
             name: name.into(),
             dtype: DTYPE_Q8_0,
+            dims: qt.shape().dims().to_vec(),
+            data: qt.data().unwrap().to_vec(),
+        }
+    }
+
+    /// Quantize f32 data to Q2_K via candle (the real DeepSeek-V4-Flash
+    /// files store the routed down projections this way).  Same alignment
+    /// contract as [`RawTensor::q4k`].
+    pub fn q2k(name: &str, data: Vec<f32>, dims: &[usize]) -> Self {
+        let t = Tensor::from_vec(data, dims, &Device::Cpu).unwrap();
+        let qt = QTensor::quantize(&t, GgmlDType::Q2K).unwrap();
+        Self {
+            name: name.into(),
+            dtype: DTYPE_Q2_K,
             dims: qt.shape().dims().to_vec(),
             data: qt.data().unwrap().to_vec(),
         }
@@ -1312,6 +1327,10 @@ pub struct TinyDeepseek4Opts {
     /// I32) so the model loads through `ModelWeights::from_gguf`, whose
     /// streamed entry point has no raw header.
     pub candle_only: bool,
+    /// Store the routed down projections as Q2_K with a 256-wide expert
+    /// (the real V4-Flash layout: IQ2_XXS gate/up, Q2_K down), instead of
+    /// Q8_0 with a 128-wide one.
+    pub q2k_down: bool,
 }
 
 pub fn write_tiny_deepseek4_gguf(path: &Path) {
@@ -1362,6 +1381,18 @@ pub fn write_tiny_deepseek4_gguf_kquant(path: &Path) {
 /// `GgmlDType` can name (routed experts Q8_0 instead of IQ2_XXS, id table F32
 /// instead of I32) so the file also loads through `ModelWeights::from_gguf`
 /// (no raw header).
+/// Like [`write_tiny_deepseek4_gguf`] with the real V4-Flash expert layout:
+/// IQ2_XXS gate/up and a Q2_K down projection over a 256-wide expert.
+pub fn write_tiny_deepseek4_gguf_q2k_down(path: &Path) {
+    write_tiny_deepseek4_gguf_opts(
+        path,
+        TinyDeepseek4Opts {
+            q2k_down: true,
+            ..Default::default()
+        },
+    );
+}
+
 pub fn write_tiny_deepseek4_gguf_candle_only(path: &Path) {
     write_tiny_deepseek4_gguf_opts(
         path,
@@ -1378,6 +1409,7 @@ fn write_tiny_deepseek4_gguf_opts(path: &Path, opts: TinyDeepseek4Opts) {
         compress,
         kquant_weights,
         candle_only,
+        q2k_down,
     } = opts;
     const VOCAB: usize = 16;
     // EMB must be a multiple of the IQ2_XXS block size (256): each expert's
@@ -1393,7 +1425,9 @@ fn write_tiny_deepseek4_gguf_opts(path: &Path, opts: TinyDeepseek4Opts) {
     const O_GROUPS: usize = 2;
     const O_LORA: usize = 4;
     const NE: usize = 8;
-    const NFE: usize = 128; // expert ffn width (out of gate/up, in of down)
+    // Expert ffn width (out of gate/up, in of down): 256 so a Q2_K down
+    // projection has a block-aligned contraction dim, 128 otherwise.
+    let nfe: usize = if q2k_down { 256 } else { 128 };
     const NUSED: usize = 2;
     const N_SHARED: usize = 1;
     const HC: usize = 2;
@@ -1633,43 +1667,45 @@ fn write_tiny_deepseek4_gguf_opts(path: &Path, opts: TinyDeepseek4Opts) {
                 &[NE],
             ));
         }
-        let gate_up = next(NE * NFE * EMB);
-        let up = next(NE * NFE * EMB);
-        let down = next(NE * NFE * EMB);
+        let gate_up = next(NE * nfe * EMB);
+        let up = next(NE * nfe * EMB);
+        let down = next(NE * nfe * EMB);
         // `candle_only` uses Q8_0 for the routed experts so the whole file
         // stays loadable without the raw header (IQ2_XXS is not a dtype
         // candle's `Content` can carry).
-        let exps = if candle_only {
-            |name: &str, data: Vec<f32>| RawTensor::q8_0(name, data, &[NE, NFE, EMB])
-        } else {
-            |name: &str, data: Vec<f32>| RawTensor::iq2xxs(name, data, &[NE, NFE, EMB])
+        let exps = |name: &str, data: Vec<f32>| {
+            if candle_only {
+                RawTensor::q8_0(name, data, &[NE, nfe, EMB])
+            } else {
+                RawTensor::iq2xxs(name, data, &[NE, nfe, EMB])
+            }
         };
         tensors.push(exps(&format!("{p}.ffn_gate_exps.weight"), gate_up));
         tensors.push(exps(&format!("{p}.ffn_up_exps.weight"), up));
-        tensors.push(RawTensor::q8_0(
-            &format!("{p}.ffn_down_exps.weight"),
-            down,
-            &[NE, EMB, NFE],
-        ));
+        tensors.push(if q2k_down {
+            RawTensor::q2k(&format!("{p}.ffn_down_exps.weight"), down, &[NE, EMB, nfe])
+        } else {
+            RawTensor::q8_0(&format!("{p}.ffn_down_exps.weight"), down, &[NE, EMB, nfe])
+        });
         // Shared expert: F16 normally, Q4_K in the k-quant variant (gate/up
-        // have EMB = 256 as their contraction dim; down's is NFE = 128, so it
+        // have EMB = 256 as their contraction dim; down's is nfe = 128, so it
         // stays F16).
         let shexp = |name: &str, data: Vec<f32>| {
             if kquant_weights {
-                RawTensor::q4k(name, data, &[NFE, EMB])
+                RawTensor::q4k(name, data, &[nfe, EMB])
             } else {
-                RawTensor::f16(name, data, &[NFE, EMB])
+                RawTensor::f16(name, data, &[nfe, EMB])
             }
         };
         tensors.push(shexp(
             &format!("{p}.ffn_gate_shexp.weight"),
-            next(NFE * EMB),
+            next(nfe * EMB),
         ));
-        tensors.push(shexp(&format!("{p}.ffn_up_shexp.weight"), next(NFE * EMB)));
+        tensors.push(shexp(&format!("{p}.ffn_up_shexp.weight"), next(nfe * EMB)));
         tensors.push(RawTensor::f16(
             &format!("{p}.ffn_down_shexp.weight"),
-            next(EMB * NFE),
-            &[EMB, NFE],
+            next(EMB * nfe),
+            &[EMB, nfe],
         ));
         if i < N_HASH {
             // Routed-id table: I32, [vocab, n_expert_used], ids in [0, NE).

@@ -58,15 +58,22 @@ const MAX_STRING_LENGTH: u64 = 1 << 24;
 const MAX_ARRAY_ELEMENTS: u64 = 1 << 24;
 const MAX_VALUE_DEPTH: usize = 64;
 
-/// GGUF dtype ids candle's `GgmlDType` table can represent.
+/// GGUF dtype ids that flow through candle's own GGUF content.
 ///
-/// Candle maps only 0,1,2,3,6..15,30 (see `GgmlDType::from_u32`, which is
-/// crate-private, so the set is mirrored here).
+/// Candle maps 0,1,2,3,6..16,30 (see `GgmlDType::from_u32`, which is
+/// crate-private, so the set is mirrored here) — but IQ2_XXS (16) is kept
+/// on the raw-header path on purpose: `GgmlDType::Iq2Xxs` exists so device
+/// backends can hold the blocks as ordinary quantized storage, while the CPU
+/// form of an IQ2 tensor must stay [`crate::mmap_tensor::MmapBlocksIq2Xxs`]
+/// (the fused AVX2 matmul), never candle's reference decode.  Reporting 16
+/// as supported would route dense IQ2 tensors through candle's loader.
 pub fn is_candle_supported(dtype: u32) -> bool {
     matches!(dtype, 0..=3 | 6..=15 | 30)
 }
 
-/// Mirror of candle's (crate-private) `GgmlDType::from_u32`.
+/// Mirror of candle's (crate-private) `GgmlDType::from_u32`, restricted to
+/// the ids [`is_candle_supported`] admits (IQ2_XXS deliberately excluded,
+/// see there).
 pub fn ggml_dtype_from_id(dtype: u32) -> Option<GgmlDType> {
     Some(match dtype {
         0 => GgmlDType::F32,
@@ -110,6 +117,7 @@ pub fn ggml_id_from_dtype(dtype: GgmlDType) -> u32 {
         GgmlDType::Q5K => 13,
         GgmlDType::Q6K => 14,
         GgmlDType::Q8K => 15,
+        GgmlDType::Iq2Xxs => 16,
         // `GgmlDType` has no non_exhaustive marker; add new candle types here.
     }
 }
@@ -618,6 +626,18 @@ mod tests {
         let bytes = header_bytes(0); // F32
         let h = read_header(&mut Cursor::new(&bytes[..])).unwrap();
         assert!(h.unsupported_by_candle().is_empty());
+    }
+
+    /// IQ2_XXS (16) is a candle dtype now, but stays on the raw-header path
+    /// so the CPU form is joshua's fused kernel (see `is_candle_supported`).
+    #[test]
+    fn iq2xxs_stays_on_the_raw_header_path() {
+        assert!(!is_candle_supported(16));
+        assert!(ggml_dtype_from_id(16).is_none());
+        assert_eq!(ggml_id_from_dtype(GgmlDType::Iq2Xxs), 16);
+        let bytes = header_bytes(16);
+        let h = read_header(&mut Cursor::new(&bytes[..])).unwrap();
+        assert_eq!(h.unsupported_by_candle(), vec![16]);
     }
 
     #[test]

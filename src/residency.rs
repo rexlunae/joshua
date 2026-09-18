@@ -5,12 +5,12 @@
 //! module is the *executor* — it makes a named expert's weights resident on
 //! the active compute device.
 //!
-//! Today the only backend is **CPU** (best-effort `MADV_WILLNEED` over each
-//! expert's borrowed mmap ranges — the historical `--pin-hot-experts`
-//! behavior).  The trait exists so a device backend (a CUDA/Metal slot cache
-//! that copies hot experts into VRAM) can be added later without touching the
-//! policy or the loaders: policy names experts, `acquire`/`release` move
-//! bytes, `capacity` sizes the budget.
+//! Two backends exist: **CPU** ([`CpuResidency`], best-effort `MADV_WILLNEED`
+//! over each expert's borrowed mmap ranges — the historical
+//! `--pin-hot-experts` behavior) and a **device slot pool**
+//! ([`DeviceResidency`], a byte-budgeted LRU of experts uploaded to the
+//! expert device, with the hot set protected from eviction).  Policy names
+//! experts, `acquire`/`release` move bytes, `capacity` sizes the budget.
 
 use std::sync::Arc;
 
@@ -82,6 +82,15 @@ pub trait ExpertResidency: Send + Sync + 'static {
     /// Stop protecting `(layer, expert)` once it leaves the hot set.
     /// Default is a no-op, symmetric with [`ExpertResidency::mark_hot`].
     fn unmark_hot(&self, _layer: u32, _expert: u32) {}
+
+    /// Replace the protected set wholesale with `hot` (the routing-frequency
+    /// refresh hands over the *whole* hot set each time, so members that
+    /// dropped out become evictable again).  Default: mark each member hot.
+    fn replace_hot_set(&self, hot: &[(u32, u32)]) {
+        for &(l, e) in hot {
+            self.mark_hot(l, e);
+        }
+    }
 }
 
 /// CPU residency backend: best-effort `MADV_WILLNEED` over each hot expert's
@@ -140,7 +149,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[derive(Default)]
-    struct CountingPrefetch(Arc<AtomicUsize>);
+    pub(super) struct CountingPrefetch(pub(super) Arc<AtomicUsize>);
 
     impl crate::mmap_tensor::MmapPrefetch for CountingPrefetch {
         fn prefetch(&self) {
@@ -206,7 +215,12 @@ mod tests {
         }
     }
 
-    fn device_residency(cap: u64, per: u64, n_experts: usize, bytes: u64) -> DeviceResidency<FakeSlot> {
+    fn device_residency(
+        cap: u64,
+        per: u64,
+        n_experts: usize,
+        bytes: u64,
+    ) -> DeviceResidency<FakeSlot> {
         // upload returns a slot of `bytes` for any (layer, expert) < n_experts
         let upload: Arc<dyn Fn(u32, u32) -> Option<Arc<FakeSlot>> + Send + Sync> =
             Arc::new(move |l, e| {
@@ -226,7 +240,9 @@ mod tests {
         // budget 90 bytes, per-slot 30 -> capacity() = 3; 6 experts available.
         let r = device_residency(90, 30, 6, 30);
         assert_eq!(r.capacity(), 3);
-        r.acquire(0, 0); r.acquire(0, 1); r.acquire(0, 2);
+        r.acquire(0, 0);
+        r.acquire(0, 1);
+        r.acquire(0, 2);
         assert_eq!(r.resident(), 3);
         assert_eq!(r.resident_bytes(), 90);
         // Acquiring a 4th evicts the LRU (0,0).
@@ -245,15 +261,21 @@ mod tests {
     #[test]
     fn device_residency_never_evicts_hot_experts() {
         let r = device_residency(90, 30, 6, 30);
-        r.acquire(0, 0); r.acquire(0, 1); r.acquire(0, 2);
-        r.mark_hot(0, 0); r.mark_hot(0, 1);
+        r.acquire(0, 0);
+        r.acquire(0, 1);
+        r.acquire(0, 2);
+        r.mark_hot(0, 0);
+        r.mark_hot(0, 1);
         // Evicting two more would normally drop (0,0)/(0,1) as the oldest non-hot
         // after (0,2), but the hot set keeps them; only (0,2) can go.
         r.acquire(0, 3); // evicts (0,2) -> then (0,0),(0,1),(0,3) resident
         r.acquire(0, 4); // must evict another non-hot... only hot remain + (0,3)
         assert!(r.lookup(0, 0).is_some(), "hot expert never evicted");
         assert!(r.lookup(0, 1).is_some(), "hot expert never evicted");
-        assert!(r.lookup(0, 3).is_some() || r.lookup(0, 3).is_none(), "non-hot slot may cycle");
+        assert!(
+            r.lookup(0, 3).is_some() || r.lookup(0, 3).is_none(),
+            "non-hot slot may cycle"
+        );
         assert!(r.resident() <= 3, "byte budget never exceeded");
 
         // Un-marking lets them be evicted.
@@ -283,11 +305,35 @@ mod tests {
 /// A `DeviceResidency` slot holds these three tensors, uploaded to the
 /// expert device, in the form each loader's device dispatch needs (the
 /// concrete type is the loader's, e.g. qwen3moe's `[Weight; amortized
-/// gate/up/down]` or deepseek2's `[QMatMul; …]`).  The slot pool treats it
-/// as an opaque, byte-sized payload.
+/// gate/up/down]` or deepseek4's IQ2/Q2_K device experts).  The slot pool
+/// treats it as an opaque, byte-sized payload.
 pub trait DeviceExpertSlot: Send + Sync + 'static {
     /// Bytes this slot occupies on the device (for LRU byte accounting).
     fn device_bytes(&self) -> u64;
+}
+
+/// Largest share of a [`DeviceResidency`] pool's slots the protected hot set
+/// may occupy (numerator, denominator).
+pub const HOT_SET_SHARE: (usize, usize) = (3, 4);
+
+/// Retired payloads held before the oldest are freed without a `reclaim`.
+pub const RETIRED_MAX: usize = 256;
+
+/// Hit/miss/eviction counters of a [`DeviceResidency`] pool (diagnostics).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DeviceResidencyStats {
+    /// `lookup` calls that found the expert resident.
+    pub hits: u64,
+    /// `lookup` calls that did not.
+    pub misses: u64,
+    /// Experts uploaded into a slot.
+    pub uploads: u64,
+    /// Slots evicted to make room.
+    pub evictions: u64,
+    /// Uploads the loader's closure declined or that failed.
+    pub upload_failures: u64,
+    /// Acquires refused because every resident slot was hot.
+    pub refused: u64,
 }
 
 /// A bounded **device-resident** expert cache: a byte-budgeted LRU pool of
@@ -301,19 +347,56 @@ pub trait DeviceExpertSlot: Send + Sync + 'static {
 /// `lookup` hands dispatch the device tensors so the expert's matmul runs on
 /// the GPU.
 ///
+/// The pool never holds its lock across an upload: `acquire` reserves the
+/// slot's bytes (evicting LRU non-hot slots in one pass), releases the lock,
+/// runs the upload, then inserts the payload.  A concurrent `acquire` of the
+/// same expert (another session) sees the reservation and returns; a
+/// concurrent `lookup` misses and runs the host form.  Evicted payloads are
+/// dropped after the lock is released, so a backend whose buffer release
+/// blocks (a queue drain) never stalls other sessions' lookups.
+///
+/// Evicted payloads are not freed on the spot: dispatch may still have
+/// launches in flight that read them, and while a conforming driver defers
+/// a buffer's deletion until those commands complete, not every runtime
+/// does (pocl frees eagerly).  They are parked in a retire list that the
+/// dispatch thread drains with [`DeviceResidency::reclaim`] at a point it
+/// knows its launches have completed (after a blocking read-back), and
+/// dispatch parks its own payload handles the same way with
+/// [`DeviceResidency::retire`].  The list is bounded: past
+/// [`RETIRED_MAX`] entries the oldest are freed regardless (by then their
+/// commands are long done on any runtime).
+///
 /// Best-effort like every residency backend: an upload or slot-allocation
 /// failure degrades that expert to the host path (the caller falls back when
 /// `lookup` returns `None`), never to a wrong result.
 pub struct DeviceResidency<T: DeviceExpertSlot> {
     capacity_bytes: u64,
-    /// Bytes one slot is assumed to occupy for `capacity()` (the loader knows
-    /// the largest per-layer expert size).
+    /// Bytes one slot is assumed to occupy for `capacity()` and for the
+    /// reservation made before an upload (the loader knows the per-expert
+    /// size; every deepseek4 expert is the same size, and a qwen3moe /
+    /// deepseek2 pool passes its largest).
     per_slot_bytes: u64,
     upload: Arc<dyn Fn(u32, u32) -> Option<Arc<T>> + Send + Sync>,
-    slots: std::sync::Mutex<std::collections::HashMap<(u32, u32), Slot<T>>>,
-    hot: std::sync::Mutex<std::collections::HashSet<(u32, u32)>>,
+    state: std::sync::Mutex<PoolState<T>>,
+    /// Payloads evicted or released but not yet freed (see
+    /// [`DeviceResidency::reclaim`]).
+    retired: std::sync::Mutex<Vec<Arc<T>>>,
     clock: std::sync::atomic::AtomicU64,
-    used_bytes: std::sync::atomic::AtomicU64,
+    hits: std::sync::atomic::AtomicU64,
+    misses: std::sync::atomic::AtomicU64,
+    uploads: std::sync::atomic::AtomicU64,
+    evictions: std::sync::atomic::AtomicU64,
+    upload_failures: std::sync::atomic::AtomicU64,
+    refused: std::sync::atomic::AtomicU64,
+}
+
+struct PoolState<T> {
+    slots: std::collections::HashMap<(u32, u32), Slot<T>>,
+    /// Experts whose upload is in flight; their reservation is counted in
+    /// `used_bytes` so a second acquire cannot over-commit the budget.
+    in_flight: std::collections::HashMap<(u32, u32), u64>,
+    hot: std::collections::HashSet<(u32, u32)>,
+    used_bytes: u64,
 }
 
 struct Slot<T> {
@@ -324,8 +407,9 @@ struct Slot<T> {
 
 impl<T: DeviceExpertSlot> DeviceResidency<T> {
     /// `capacity_bytes` is the memory budget; `per_slot_bytes` feeds
-    /// [`DeviceResidency::capacity`]; `upload(layer, expert)` returns the
-    /// device form of that expert's weights (or `None` on a failed upload).
+    /// [`DeviceResidency::capacity`] and the pre-upload reservation;
+    /// `upload(layer, expert)` returns the device form of that expert's
+    /// weights (or `None` on a failed upload).
     pub fn new(
         capacity_bytes: u64,
         per_slot_bytes: u64,
@@ -333,73 +417,250 @@ impl<T: DeviceExpertSlot> DeviceResidency<T> {
     ) -> Self {
         Self {
             capacity_bytes,
-            per_slot_bytes,
+            per_slot_bytes: per_slot_bytes.max(1),
             upload,
-            slots: std::sync::Mutex::new(Default::default()),
-            hot: std::sync::Mutex::new(Default::default()),
+            state: std::sync::Mutex::new(PoolState {
+                slots: Default::default(),
+                in_flight: Default::default(),
+                hot: Default::default(),
+                used_bytes: 0,
+            }),
+            retired: std::sync::Mutex::new(Vec::new()),
             clock: std::sync::atomic::AtomicU64::new(0),
-            used_bytes: std::sync::atomic::AtomicU64::new(0),
+            hits: std::sync::atomic::AtomicU64::new(0),
+            misses: std::sync::atomic::AtomicU64::new(0),
+            uploads: std::sync::atomic::AtomicU64::new(0),
+            evictions: std::sync::atomic::AtomicU64::new(0),
+            upload_failures: std::sync::atomic::AtomicU64::new(0),
+            refused: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// The byte budget this pool was built with.
+    pub fn capacity_bytes(&self) -> u64 {
+        self.capacity_bytes
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, PoolState<T>> {
+        // A panic while holding the lock (an upload closure never runs under
+        // it) leaves consistent bookkeeping; keep serving rather than poison
+        // every later lookup.
+        self.state.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn tick(&self) -> u64 {
+        self.clock
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Evict LRU non-hot slots (one pass, oldest first) until `need` bytes
+    /// fit within the budget.  Returns the evicted payloads for the caller
+    /// to drop *after* the lock is released, and whether it fits.
+    fn make_room(&self, st: &mut PoolState<T>, need: u64) -> (Vec<Arc<T>>, bool) {
+        let mut evicted = Vec::new();
+        if st.used_bytes.saturating_add(need) <= self.capacity_bytes {
+            return (evicted, true);
+        }
+        let mut victims: Vec<((u32, u32), u64, u64)> = st
+            .slots
+            .iter()
+            .filter(|(k, _)| !st.hot.contains(k))
+            .map(|(k, s)| (*k, s.last_used, s.bytes))
+            .collect();
+        victims.sort_unstable_by_key(|(_, last_used, _)| *last_used);
+        for (key, _, bytes) in victims {
+            if st.used_bytes.saturating_add(need) <= self.capacity_bytes {
+                break;
+            }
+            if let Some(s) = st.slots.remove(&key) {
+                st.used_bytes = st.used_bytes.saturating_sub(bytes);
+                evicted.push(s.payload);
+            }
+        }
+        let fits = st.used_bytes.saturating_add(need) <= self.capacity_bytes;
+        self.evictions
+            .fetch_add(evicted.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        (evicted, fits)
     }
 
     /// Upload `(layer, expert)` into a slot (or touch the existing slot) and
-    /// mark it resident.  Evicts LRU *non-hot* slots until the expert fits.
-    /// Best-effort and idempotent.  Callers run this off the decode critical
-    /// path (hot-set refresh, speculative prefetch).
+    /// mark it resident.  Evicts LRU *non-hot* slots until the expert fits;
+    /// when every resident slot is hot the acquire is refused (a miss for
+    /// dispatch, never an over-commit).  Best-effort and idempotent.  The
+    /// upload itself runs outside the pool lock.
     pub fn acquire(&self, layer: u32, expert: u32) {
-        let mut slots = self.slots.lock().unwrap();
         let key = (layer, expert);
-        let _now = self.clock.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if let Some(s) = slots.get_mut(&key) {
-            s.last_used = _now;
-            return;
-        }
-        // Upload first (payload may be None on failure).
-        let Some(payload) = (self.upload)(layer, expert) else {
-            return;
+        let now = self.tick();
+        let reserve = self.per_slot_bytes;
+        let evicted = {
+            let mut st = self.lock();
+            if let Some(s) = st.slots.get_mut(&key) {
+                s.last_used = now;
+                return;
+            }
+            if st.in_flight.contains_key(&key) {
+                return; // another session is uploading it
+            }
+            let (evicted, fits) = self.make_room(&mut st, reserve);
+            if !fits {
+                self.refused
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                drop(st);
+                self.retire_all(evicted);
+                return;
+            }
+            st.used_bytes += reserve;
+            st.in_flight.insert(key, reserve);
+            evicted
         };
-        let bytes = payload.device_bytes();
-        // Evict non-hot LRU slots until this fits.
-        while self.used_bytes.load(std::sync::atomic::Ordering::Relaxed) + bytes > self.capacity_bytes && !slots.is_empty() {
-            let victim = slots
-                .iter()
-                .filter(|(k, _)| !self.hot.lock().unwrap().contains(k))
-                .min_by_key(|(_, s)| s.last_used);
-            let Some((vk, vs)) = victim.map(|(k, v)| (*k, v.last_used)) else {
-                break; // everything is hot / nothing to evict
+        self.retire_all(evicted);
+
+        let payload = (self.upload)(layer, expert);
+
+        let evicted = {
+            let mut st = self.lock();
+            let reserved = st.in_flight.remove(&key).unwrap_or(reserve);
+            st.used_bytes = st.used_bytes.saturating_sub(reserved);
+            let Some(payload) = payload else {
+                self.upload_failures
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return;
             };
-            self.used_bytes.fetch_sub(slots[&vk].bytes, std::sync::atomic::Ordering::Relaxed);
-            let _ = vs;
-            slots.remove(&vk);
+            let bytes = payload.device_bytes();
+            // The reservation was an estimate; settle the real size.
+            let (evicted, fits) = self.make_room(&mut st, bytes);
+            if !fits && !st.slots.is_empty() {
+                self.refused
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                drop(st);
+                self.retire_all(evicted);
+                // Never launched on: safe to free now.
+                drop(payload);
+                return;
+            }
+            st.used_bytes += bytes;
+            st.slots.insert(
+                key,
+                Slot {
+                    payload,
+                    bytes,
+                    last_used: self.tick(),
+                },
+            );
+            self.uploads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            evicted
+        };
+        self.retire_all(evicted);
+    }
+
+    /// Park `payload` until the next [`DeviceResidency::reclaim`]: dispatch
+    /// hands over the handles it looked up once its launches are enqueued,
+    /// so a concurrent eviction can never free a buffer those launches read.
+    pub fn retire(&self, payload: Arc<T>) {
+        self.retire_all(vec![payload]);
+    }
+
+    fn retire_all(&self, payloads: Vec<Arc<T>>) {
+        if payloads.is_empty() {
+            return;
         }
-        self.used_bytes.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
-        slots.insert(key, Slot { payload, bytes, last_used: _now });
+        let overflow = {
+            let mut r = self.retired.lock().unwrap_or_else(|p| p.into_inner());
+            r.extend(payloads);
+            if r.len() > RETIRED_MAX {
+                let n = r.len() - RETIRED_MAX;
+                r.drain(..n).collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            }
+        };
+        drop(overflow);
+    }
+
+    /// Free every retired payload.  Call from the thread that launches on
+    /// the payloads, at a point where its launches are known complete (after
+    /// a blocking read-back on its queue).
+    pub fn reclaim(&self) {
+        let retired = std::mem::take(&mut *self.retired.lock().unwrap_or_else(|p| p.into_inner()));
+        drop(retired);
+    }
+
+    /// Payloads parked for the next `reclaim` (tests).
+    pub fn retired_len(&self) -> usize {
+        self.retired.lock().unwrap_or_else(|p| p.into_inner()).len()
     }
 
     /// Return the device-resident form of `(layer, expert)` for dispatch, or
-    /// `None` if it is not resident (run the host path instead).
+    /// `None` if it is not resident (run the host path instead).  A hit
+    /// refreshes the slot's recency.
     pub fn lookup(&self, layer: u32, expert: u32) -> Option<Arc<T>> {
-        self.slots.lock().unwrap().get(&(layer, expert)).map(|s| Arc::clone(&s.payload))
+        let now = self.tick();
+        let mut st = self.lock();
+        match st.slots.get_mut(&(layer, expert)) {
+            Some(s) => {
+                s.last_used = now;
+                self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Some(Arc::clone(&s.payload))
+            }
+            None => {
+                self.misses
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                None
+            }
+        }
+    }
+
+    /// Whether `(layer, expert)` is resident, without touching recency or
+    /// the hit/miss counters.
+    pub fn contains(&self, layer: u32, expert: u32) -> bool {
+        self.lock().slots.contains_key(&(layer, expert))
     }
 
     /// Protect `(layer, expert)` from LRU eviction (it is in the hot set).
     pub fn mark_hot(&self, layer: u32, expert: u32) {
-        self.hot.lock().unwrap().insert((layer, expert));
+        self.lock().hot.insert((layer, expert));
     }
 
     /// Stop protecting `(layer, expert)` (it left the hot set).
     pub fn unmark_hot(&self, layer: u32, expert: u32) {
-        self.hot.lock().unwrap().remove(&(layer, expert));
+        self.lock().hot.remove(&(layer, expert));
+    }
+
+    /// Replace the whole protected set: members of the previous hot set that
+    /// are not in `hot` become evictable again.  `hot` is in priority order
+    /// (the routing-frequency refresh hands it over that way) and is capped
+    /// at [`HOT_SET_SHARE`] of the pool's slots, so evictable slots always
+    /// exist and a hot budget sized from host RAM cannot freeze the pool.
+    pub fn replace_hot_set(&self, hot: &[(u32, u32)]) {
+        let cap = (self.capacity_bytes / self.per_slot_bytes) as usize * HOT_SET_SHARE.0
+            / HOT_SET_SHARE.1;
+        let mut st = self.lock();
+        st.hot.clear();
+        st.hot.extend(hot.iter().take(cap).copied());
     }
 
     /// Number of experts resident right now.
     pub fn resident(&self) -> usize {
-        self.slots.lock().unwrap().len()
+        self.lock().slots.len()
     }
 
-    /// Current resident bytes.
+    /// Current resident bytes (including reservations of uploads in flight).
     pub fn resident_bytes(&self) -> u64 {
-        self.used_bytes.load(std::sync::atomic::Ordering::Relaxed)
+        self.lock().used_bytes
+    }
+
+    /// Hit/miss/upload/eviction counters.
+    pub fn stats(&self) -> DeviceResidencyStats {
+        use std::sync::atomic::Ordering::Relaxed;
+        DeviceResidencyStats {
+            hits: self.hits.load(Relaxed),
+            misses: self.misses.load(Relaxed),
+            uploads: self.uploads.load(Relaxed),
+            evictions: self.evictions.load(Relaxed),
+            upload_failures: self.upload_failures.load(Relaxed),
+            refused: self.refused.load(Relaxed),
+        }
     }
 }
 
@@ -408,13 +669,21 @@ impl<T: DeviceExpertSlot> ExpertResidency for DeviceResidency<T> {
         DeviceResidency::acquire(self, layer, expert);
     }
     fn release(&self, layer: u32, expert: u32) {
-        let mut slots = self.slots.lock().unwrap();
-        if let Some(s) = slots.remove(&(layer, expert)) {
-            self.used_bytes.fetch_sub(s.bytes, std::sync::atomic::Ordering::Relaxed);
+        let removed = {
+            let mut st = self.lock();
+            let s = st.slots.remove(&(layer, expert));
+            if let Some(s) = &s {
+                st.used_bytes = st.used_bytes.saturating_sub(s.bytes);
+            }
+            s
+        };
+        // Freed at the next `reclaim`, outside the lock (see the type docs).
+        if let Some(s) = removed {
+            self.retire(s.payload);
         }
     }
     fn capacity(&self) -> usize {
-        (self.capacity_bytes / self.per_slot_bytes.max(1)) as usize
+        (self.capacity_bytes / self.per_slot_bytes) as usize
     }
 
     fn mark_hot(&self, layer: u32, expert: u32) {
@@ -423,5 +692,494 @@ impl<T: DeviceExpertSlot> ExpertResidency for DeviceResidency<T> {
 
     fn unmark_hot(&self, layer: u32, expert: u32) {
         DeviceResidency::unmark_hot(self, layer, expert);
+    }
+
+    fn replace_hot_set(&self, hot: &[(u32, u32)]) {
+        DeviceResidency::replace_hot_set(self, hot);
+    }
+}
+
+/// A background uploader for a [`DeviceResidency`] pool.
+///
+/// The pool's `acquire` blocks its caller for the transfer (a blocking write
+/// on the device's transfer queue); on the decode thread that would be time
+/// taken from the token.  The uploader owns a thread that performs the
+/// acquires instead: [`ExpertUploader::request`] only enqueues a `(layer,
+/// expert)` key (deduplicated against slots that are resident, in flight or
+/// already queued) and returns.  Callers that need the slot *now* keep using
+/// `DeviceResidency::acquire` directly.
+///
+/// Best-effort: the request queue is bounded and a request that finds it
+/// full is dropped (counted), never waited on.
+pub struct ExpertUploader<T: DeviceExpertSlot> {
+    pool: Arc<DeviceResidency<T>>,
+    tx: Option<std::sync::mpsc::SyncSender<(u32, u32)>>,
+    state: Arc<UploaderState>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+struct UploaderState {
+    /// Keys queued or being uploaded by the thread.
+    pending: std::sync::Mutex<std::collections::HashSet<(u32, u32)>>,
+    idle: std::sync::Condvar,
+    dropped: std::sync::atomic::AtomicU64,
+    requested: std::sync::atomic::AtomicU64,
+}
+
+/// Requests the uploader holds before dropping new ones.
+pub const UPLOAD_QUEUE_DEPTH: usize = 64;
+
+impl<T: DeviceExpertSlot> ExpertUploader<T> {
+    /// Start the uploader thread for `pool`.
+    pub fn spawn(pool: Arc<DeviceResidency<T>>) -> Self {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<(u32, u32)>(UPLOAD_QUEUE_DEPTH);
+        let state = Arc::new(UploaderState {
+            pending: std::sync::Mutex::new(Default::default()),
+            idle: std::sync::Condvar::new(),
+            dropped: std::sync::atomic::AtomicU64::new(0),
+            requested: std::sync::atomic::AtomicU64::new(0),
+        });
+        let (pool2, state2) = (Arc::clone(&pool), Arc::clone(&state));
+        let thread = std::thread::Builder::new()
+            .name("expert-uploader".into())
+            .spawn(move || {
+                while let Ok((l, e)) = rx.recv() {
+                    pool2.acquire(l, e);
+                    let mut pending = state2.pending.lock().unwrap_or_else(|p| p.into_inner());
+                    pending.remove(&(l, e));
+                    if pending.is_empty() {
+                        state2.idle.notify_all();
+                    }
+                }
+            })
+            .expect("spawn expert uploader thread");
+        Self {
+            pool,
+            tx: Some(tx),
+            state,
+            thread: Some(thread),
+        }
+    }
+
+    /// Ask for `(layer, expert)` to be made resident in the background.
+    /// Returns immediately; a no-op when the expert is resident, in flight,
+    /// or already queued, and a dropped (counted) request when the queue is
+    /// full.
+    pub fn request(&self, layer: u32, expert: u32) {
+        let key = (layer, expert);
+        if self.pool.contains(layer, expert) {
+            return;
+        }
+        {
+            let mut pending = self.state.pending.lock().unwrap_or_else(|p| p.into_inner());
+            if !pending.insert(key) {
+                return;
+            }
+        }
+        self.state
+            .requested
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let sent = self.tx.as_ref().is_some_and(|tx| tx.try_send(key).is_ok());
+        if !sent {
+            self.state
+                .dropped
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.state
+                .pending
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&key);
+        }
+    }
+
+    /// Block until every queued request has been processed (tests, shutdown).
+    pub fn wait_idle(&self) {
+        let mut pending = self.state.pending.lock().unwrap_or_else(|p| p.into_inner());
+        while !pending.is_empty() {
+            pending = self
+                .state
+                .idle
+                .wait(pending)
+                .unwrap_or_else(|p| p.into_inner());
+        }
+    }
+
+    /// Requests accepted so far.
+    pub fn requested(&self) -> u64 {
+        self.state
+            .requested
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Requests dropped because the queue was full.
+    pub fn dropped(&self) -> u64 {
+        self.state
+            .dropped
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The pool this uploader fills.
+    pub fn pool(&self) -> &Arc<DeviceResidency<T>> {
+        &self.pool
+    }
+}
+
+impl<T: DeviceExpertSlot> Drop for ExpertUploader<T> {
+    fn drop(&mut self) {
+        // Closing the channel ends the thread after the queued requests.
+        drop(self.tx.take());
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// Host residency plus an optional device slot pool, behind the one
+/// [`ExpertResidency`] handle a loader stores.
+///
+/// `acquire` advises the host pages (the CPU backend) *and* asks the
+/// uploader for a device slot in the background; `capacity` stays the host
+/// count (it sizes the host hot-expert budget, a different unit from device
+/// slots — those are reported through [`CompositeResidency::device`]).  The
+/// hot set is advisory and model-wide: sessions sharing the weights replace
+/// it in turn, last writer wins.
+pub struct CompositeResidency<T: DeviceExpertSlot> {
+    cpu: CpuResidency,
+    device: Option<Arc<DeviceResidency<T>>>,
+    uploader: Option<Arc<ExpertUploader<T>>>,
+}
+
+impl<T: DeviceExpertSlot> CompositeResidency<T> {
+    /// Host residency only.
+    pub fn host(cpu: CpuResidency) -> Self {
+        Self {
+            cpu,
+            device: None,
+            uploader: None,
+        }
+    }
+
+    /// Host residency plus a device pool, filled through `uploader` (the
+    /// loader shares the same uploader with its dispatch).
+    pub fn with_device_pool(
+        cpu: CpuResidency,
+        pool: Arc<DeviceResidency<T>>,
+        uploader: Arc<ExpertUploader<T>>,
+    ) -> Self {
+        Self {
+            cpu,
+            device: Some(pool),
+            uploader: Some(uploader),
+        }
+    }
+
+    /// The device pool, when one exists.
+    pub fn device(&self) -> Option<&Arc<DeviceResidency<T>>> {
+        self.device.as_ref()
+    }
+
+    /// The background uploader, when a device pool exists.
+    pub fn uploader(&self) -> Option<&Arc<ExpertUploader<T>>> {
+        self.uploader.as_ref()
+    }
+}
+
+/// A snapshot of a device expert pool for logs and diagnostics.
+#[derive(Debug, Clone)]
+pub struct DeviceCacheReport {
+    /// Slots the budget holds (`capacity()`).
+    pub slots: usize,
+    /// The byte budget.
+    pub budget_bytes: u64,
+    /// Experts resident now.
+    pub resident: usize,
+    /// Bytes resident now (reservations of uploads in flight included).
+    pub resident_bytes: u64,
+    /// Hit/miss/upload/eviction counters.
+    pub stats: DeviceResidencyStats,
+    /// Background upload requests accepted (0 without an uploader).
+    pub upload_requests: u64,
+    /// Background upload requests dropped on a full queue.
+    pub upload_drops: u64,
+}
+
+impl DeviceCacheReport {
+    /// Snapshot `pool` (and its uploader's counters, when given).
+    pub fn of<T: DeviceExpertSlot>(
+        pool: &DeviceResidency<T>,
+        uploader: Option<&ExpertUploader<T>>,
+    ) -> Self {
+        Self {
+            slots: pool.capacity(),
+            budget_bytes: pool.capacity_bytes(),
+            resident: pool.resident(),
+            resident_bytes: pool.resident_bytes(),
+            stats: pool.stats(),
+            upload_requests: uploader.map_or(0, |u| u.requested()),
+            upload_drops: uploader.map_or(0, |u| u.dropped()),
+        }
+    }
+}
+
+impl<T: DeviceExpertSlot> ExpertResidency for CompositeResidency<T> {
+    fn acquire(&self, layer: u32, expert: u32) {
+        self.cpu.acquire(layer, expert);
+        if let Some(u) = &self.uploader {
+            u.request(layer, expert);
+        }
+    }
+
+    fn release(&self, layer: u32, expert: u32) {
+        if let Some(d) = &self.device {
+            d.release(layer, expert);
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        self.cpu.capacity()
+    }
+
+    fn mark_hot(&self, layer: u32, expert: u32) {
+        if let Some(d) = &self.device {
+            d.mark_hot(layer, expert);
+        }
+    }
+
+    fn unmark_hot(&self, layer: u32, expert: u32) {
+        if let Some(d) = &self.device {
+            d.unmark_hot(layer, expert);
+        }
+    }
+
+    fn replace_hot_set(&self, hot: &[(u32, u32)]) {
+        if let Some(d) = &self.device {
+            d.replace_hot_set(hot);
+        }
+    }
+}
+
+#[cfg(test)]
+mod device_pool_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A fake device payload.
+    struct FakeSlot(u64);
+    impl DeviceExpertSlot for FakeSlot {
+        fn device_bytes(&self) -> u64 {
+            self.0
+        }
+    }
+
+    fn pool(cap: u64, per: u64, n: usize, bytes: u64) -> DeviceResidency<FakeSlot> {
+        let upload: Arc<dyn Fn(u32, u32) -> Option<Arc<FakeSlot>> + Send + Sync> =
+            Arc::new(move |l, e| {
+                ((l as usize) < n && (e as usize) < n).then(|| Arc::new(FakeSlot(bytes)))
+            });
+        DeviceResidency::new(cap, per, upload)
+    }
+
+    /// Churning through many more experts than fit never exceeds the budget,
+    /// evicts strictly LRU, and counts every event.
+    #[test]
+    fn churn_stays_within_budget_and_evicts_lru() {
+        let r = pool(100, 30, 64, 30);
+        assert_eq!(r.capacity(), 3);
+        for e in 0..40u32 {
+            r.acquire(0, e);
+            assert!(r.resident_bytes() <= 100, "over budget at expert {e}");
+            assert!(r.resident() <= 3);
+        }
+        // The last three acquired are resident; older ones are gone.
+        assert!(r.contains(0, 39) && r.contains(0, 38) && r.contains(0, 37));
+        assert!(!r.contains(0, 36));
+        let s = r.stats();
+        assert_eq!(s.uploads, 40);
+        assert_eq!(s.evictions, 37);
+        assert_eq!(s.refused, 0);
+        // A lookup hit refreshes recency: touching 37 makes 38 the next victim.
+        assert!(r.lookup(0, 37).is_some());
+        r.acquire(0, 40);
+        assert!(r.contains(0, 37) && !r.contains(0, 38));
+        assert_eq!(r.stats().hits, 1);
+        assert!(r.lookup(0, 38).is_none());
+        assert_eq!(r.stats().misses, 1);
+    }
+
+    /// When every resident slot is hot, a new acquire is refused instead of
+    /// over-committing the budget or evicting a hot expert; replacing the hot
+    /// set frees the old members.
+    #[test]
+    fn all_hot_pool_refuses_instead_of_overcommitting() {
+        let r = pool(60, 30, 8, 30);
+        r.acquire(0, 0);
+        r.acquire(0, 1);
+        // `mark_hot` is uncapped (the capped entry point is `replace_hot_set`).
+        r.mark_hot(0, 0);
+        r.mark_hot(0, 1);
+        r.acquire(0, 2);
+        assert!(!r.contains(0, 2), "refused: nothing evictable");
+        assert!(r.contains(0, 0) && r.contains(0, 1));
+        assert_eq!(r.resident_bytes(), 60);
+        assert_eq!(r.stats().refused, 1);
+        assert_eq!(r.stats().uploads, 2, "a refused acquire never uploads");
+        // Replacing the hot set with only (0,1) makes (0,0) evictable again.
+        r.replace_hot_set(&[(0, 1)]);
+        r.acquire(0, 2);
+        assert!(r.contains(0, 2) && r.contains(0, 1) && !r.contains(0, 0));
+    }
+
+    /// The upload closure runs outside the pool lock: it can itself consult
+    /// the pool without deadlocking.
+    #[test]
+    fn upload_runs_outside_the_lock() {
+        let cell: Arc<std::sync::OnceLock<std::sync::Weak<DeviceResidency<FakeSlot>>>> =
+            Arc::new(std::sync::OnceLock::new());
+        let seen = Arc::new(AtomicUsize::new(0));
+        let (cell2, seen2) = (Arc::clone(&cell), Arc::clone(&seen));
+        let upload: Arc<dyn Fn(u32, u32) -> Option<Arc<FakeSlot>> + Send + Sync> =
+            Arc::new(move |_l, _e| {
+                if let Some(p) = cell2.get().and_then(|w| w.upgrade()) {
+                    // Would deadlock if `acquire` held its lock across the upload.
+                    seen2.store(p.resident() + 1, Ordering::Relaxed);
+                }
+                Some(Arc::new(FakeSlot(10)))
+            });
+        let r = Arc::new(DeviceResidency::new(100, 10, upload));
+        cell.set(Arc::downgrade(&r)).ok();
+        r.acquire(0, 0);
+        assert_eq!(seen.load(Ordering::Relaxed), 1);
+        assert!(r.contains(0, 0));
+    }
+
+    /// The protected set is capped below the pool's slot count so evictable
+    /// slots always exist, and a refused acquire leaves `lookup` at `None`.
+    #[test]
+    fn hot_set_is_capped_to_a_share_of_the_pool() {
+        let r = pool(120, 30, 16, 30); // 4 slots -> at most 3 hot
+        r.replace_hot_set(&[(0, 0), (0, 1), (0, 2), (0, 3)]);
+        for e in 0..4u32 {
+            r.acquire(0, e);
+        }
+        assert_eq!(r.resident(), 4);
+        // (0,3) was beyond the cap: it is the only evictable slot.
+        r.acquire(0, 4);
+        assert!(r.contains(0, 0) && r.contains(0, 1) && r.contains(0, 2) && r.contains(0, 4));
+        assert!(!r.contains(0, 3));
+        assert_eq!(r.stats().refused, 0);
+        // Three hot of four slots: exactly one slot keeps cycling.
+        r.replace_hot_set(&[(0, 0), (0, 1), (0, 2)]);
+        r.acquire(0, 5); // evicts (0,4)
+        r.acquire(0, 6); // evicts (0,5)
+        assert!(r.contains(0, 6) && !r.contains(0, 5) && !r.contains(0, 4));
+        assert_eq!(r.stats().refused, 0);
+        assert!(r.resident_bytes() <= 120);
+    }
+
+    /// The background uploader fills the pool off the caller's thread,
+    /// deduplicates requests, and `wait_idle` observes completion.
+    #[test]
+    fn uploader_fills_the_pool_in_the_background() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls2 = Arc::clone(&calls);
+        let upload: Arc<dyn Fn(u32, u32) -> Option<Arc<FakeSlot>> + Send + Sync> =
+            Arc::new(move |_l, _e| {
+                calls2.fetch_add(1, Ordering::Relaxed);
+                std::thread::sleep(std::time::Duration::from_millis(2));
+                Some(Arc::new(FakeSlot(10)))
+            });
+        let pool = Arc::new(DeviceResidency::new(1000, 10, upload));
+        let up = ExpertUploader::spawn(Arc::clone(&pool));
+        for e in 0..8u32 {
+            up.request(1, e);
+            up.request(1, e); // duplicate while queued: ignored
+        }
+        up.wait_idle();
+        assert_eq!(pool.resident(), 8);
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            8,
+            "one upload per distinct request"
+        );
+        up.request(1, 3); // resident: ignored without touching the queue
+        up.wait_idle();
+        assert_eq!(calls.load(Ordering::Relaxed), 8);
+        assert_eq!(up.requested(), 8);
+        assert_eq!(up.dropped(), 0);
+    }
+
+    /// The composite forwards host advice and background device acquires,
+    /// keeps the host capacity, and caps the hot set on the device pool.
+    #[test]
+    fn composite_residency_drives_both_backends() {
+        let n = Arc::new(AtomicUsize::new(0));
+        let handles = super::ExpertHandles {
+            gate: Arc::new(super::tests::CountingPrefetch(Arc::clone(&n))),
+            up: Arc::new(super::tests::CountingPrefetch(Arc::clone(&n))),
+            down: Arc::new(super::tests::CountingPrefetch(Arc::clone(&n))),
+        };
+        let cpu = CpuResidency::new(vec![vec![Some(handles), None]]);
+        let pool = Arc::new(pool(100, 10, 8, 10));
+        let uploader = Arc::new(ExpertUploader::spawn(Arc::clone(&pool)));
+        let comp = CompositeResidency::with_device_pool(cpu, Arc::clone(&pool), uploader);
+        assert_eq!(comp.capacity(), 1, "host count, not device slots");
+        comp.acquire(0, 0);
+        comp.uploader().unwrap().wait_idle();
+        assert_eq!(n.load(Ordering::Relaxed), 3, "host pages advised");
+        assert!(pool.contains(0, 0), "device slot filled in the background");
+        comp.replace_hot_set(&[(0, 0)]);
+        comp.release(0, 0);
+        assert!(!pool.contains(0, 0));
+        let host_only: CompositeResidency<FakeSlot> =
+            CompositeResidency::host(CpuResidency::new(vec![]));
+        host_only.acquire(0, 0);
+        assert!(host_only.device().is_none());
+    }
+
+    /// Evicted and released payloads are parked until `reclaim`, and the
+    /// parking list is bounded.
+    #[test]
+    fn evicted_payloads_wait_for_reclaim() {
+        let r = pool(60, 30, 400, 30);
+        r.acquire(0, 0);
+        r.acquire(0, 1);
+        r.acquire(0, 2); // evicts (0,0)
+        assert_eq!(r.retired_len(), 1);
+        r.release(0, 1);
+        assert_eq!(r.retired_len(), 2);
+        let held = r.lookup(0, 2).unwrap();
+        r.retire(held);
+        assert_eq!(r.retired_len(), 3);
+        r.reclaim();
+        assert_eq!(r.retired_len(), 0);
+        for e in 3..(3 + RETIRED_MAX as u32 + 40) {
+            r.acquire(0, e);
+        }
+        assert!(r.retired_len() <= RETIRED_MAX, "bounded: {}", r.retired_len());
+    }
+
+    /// A payload larger than its reservation is settled at its real size and
+    /// still evicts to fit; an oversized payload with an otherwise empty pool
+    /// is kept (the only way anything is ever resident on a tiny budget).
+    #[test]
+    fn real_payload_size_is_settled_after_upload() {
+        let r = pool(100, 10, 8, 40);
+        r.acquire(0, 0);
+        r.acquire(0, 1);
+        assert_eq!(r.resident_bytes(), 80);
+        r.acquire(0, 2); // 40 more does not fit: evicts (0,0)
+        assert_eq!(r.resident_bytes(), 80);
+        assert!(!r.contains(0, 0) && r.contains(0, 1) && r.contains(0, 2));
+        let big = pool(50, 10, 8, 80);
+        big.acquire(0, 0);
+        assert!(
+            big.contains(0, 0),
+            "an empty pool keeps an oversized payload"
+        );
+        big.acquire(0, 1);
+        assert!(
+            big.contains(0, 1) && !big.contains(0, 0),
+            "…and cycles it out for the next"
+        );
     }
 }

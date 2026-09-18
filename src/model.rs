@@ -265,6 +265,16 @@ impl Architecture {
         }
     }
 
+    /// Whether this architecture's "experts on the device" form is a bounded
+    /// VRAM cache over the host pool rather than an upload of the whole pool:
+    /// `deepseek4` on OpenCL keeps every routed expert borrowed from the
+    /// mapping and caches a budgeted subset on the card (the ~72 GiB pool of
+    /// V4-Flash never fits), so an `ExpertPlacement::Device` request means
+    /// "size that cache" (see `--vram-expert-cache`).
+    pub fn device_experts_are_a_cache(&self, device: &Device) -> bool {
+        matches!(self, Self::DeepSeek4) && device.is_opencl()
+    }
+
     pub fn is_known_llama_cpp_arch(name: &str) -> bool {
         Self::from_name(name).is_some() || KNOWN_UNSUPPORTED_ARCHS.contains(&name)
     }
@@ -358,8 +368,11 @@ impl QuantizedModel {
     /// run through the CPU expert kernels, with each layer's MoE activations
     /// hopping across the bus — which is what runs a model larger than the
     /// device's memory (see [`crate::placement::ExpertPlacement`]).
-    /// `deepseek4` always keeps a mapped model's experts on the CPU, and
-    /// dense architectures ignore the parameter.
+    /// `deepseek4` always keeps a mapped model's experts borrowed on the
+    /// CPU; with a `device_expert_cache_bytes` budget on an OpenCL device it
+    /// also runs a bounded cache of them on the card (see
+    /// [`crate::quantized_deepseek4::ModelWeights::from_gguf_mmap_placed`]).
+    /// Dense architectures ignore the parameter.
     pub fn from_gguf_mmap_placed<R: Read + Seek>(
         gguf: gguf_file::Content,
         reader: &mut R,
@@ -464,8 +477,16 @@ impl QuantizedModel {
                 device_expert_cache_bytes,
             )
             .map(Self::DeepSeek2),
-            Architecture::DeepSeek4 => crate::quantized_deepseek4::ModelWeights::from_gguf_mmap(
-                gguf, raw, reader, device, mmap, file, n_ctx,
+            Architecture::DeepSeek4 => crate::quantized_deepseek4::ModelWeights::from_gguf_mmap_placed(
+                gguf,
+                raw,
+                reader,
+                device,
+                expert_device,
+                mmap,
+                file,
+                n_ctx,
+                device_expert_cache_bytes,
             )
             .map(Self::DeepSeek4),
         }
@@ -534,6 +555,23 @@ impl QuantizedModel {
             Self::DeepSeek4(m) => m.expert_residency_capacity(),
             Self::Qwen3Moe(m) => m.expert_residency_capacity(),
             _ => 0,
+        }
+    }
+
+    /// The model-wide device expert pool's budget, occupancy and counters,
+    /// for the loaders that build one from a VRAM cache budget (`deepseek4`).
+    pub fn device_expert_cache(&self) -> Option<crate::residency::DeviceCacheReport> {
+        match self {
+            Self::DeepSeek4(m) => m.device_expert_cache(),
+            _ => None,
+        }
+    }
+
+    /// Block until the device expert pool's background uploads have drained
+    /// (tests, diagnostics); a no-op without a pool.
+    pub fn wait_for_expert_uploads(&self) {
+        if let Self::DeepSeek4(m) = self {
+            m.wait_for_expert_uploads();
         }
     }
 

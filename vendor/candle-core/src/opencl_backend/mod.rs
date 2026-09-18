@@ -120,28 +120,80 @@ pub struct DeviceId(usize);
 #[derive(Debug)]
 struct OpenClContext {
     context: usize,
+    /// The compute queue: every kernel launch and every blocking host
+    /// read-back goes here, in order.
     queue: usize,
+    /// A second in-order queue for weight uploads
+    /// ([`QOpenClStorage::from_bytes_transfer`]).  A blocking write on the
+    /// compute queue would wait behind every kernel already enqueued and
+    /// then hold the next ones back for the transfer; on its own queue it
+    /// only blocks the calling thread, and its completion is a
+    /// synchronization point every later-enqueued command on any queue of
+    /// the context observes (OpenCL 1.2 §5.11), so no events are needed.
+    transfer_queue: usize,
     /// One `uint` per thread slot (`crate::fault_slot`) that the indexing
     /// kernels set on an out-of-range id (see `kernels.cl`); read and
     /// cleared by [`OpenClDevice::check_fault`].
     fault: usize,
+    /// A device buffer reused by the prefill dequantize-then-GEMM path of
+    /// [`QOpenClStorage::fwd`] (see [`OpenClContext::scratch`]).
+    scratch: std::sync::Mutex<Scratch>,
 }
+
+#[derive(Debug, Default)]
+struct Scratch {
+    buffer: usize,
+    bytes: usize,
+}
+
+/// Largest dequantize scratch kept resident between calls; bigger requests
+/// (a vocabulary-sized output projection) allocate per call as before.
+const SCRATCH_MAX_BYTES: usize = 256 << 20;
 
 impl OpenClContext {
     /// Complete every queued command and clear fault `slot`: the drain hook
     /// `crate::fault_slot` runs before a thread's slot is recycled.
     fn drain_slot(&self, slot: usize) {
         unsafe { clFinish(self.queue) };
+        unsafe { clFinish(self.transfer_queue) };
         let zero = 0u32;
         let _ = unsafe { write_buffer_at(self.queue, self.fault, slot * 4, 4, &zero as *const u32 as *const u8) };
+    }
+
+    /// Lock the shared dequantize scratch and return a buffer of at least
+    /// `bytes`, growing it when needed.  The guard must be held across the
+    /// launches that use the buffer: successive users are then adjacent on
+    /// the in-order compute queue, which orders their write-after-read
+    /// hazards for free, and the host can never enqueue more scratch than
+    /// one buffer ahead of the GPU (the unbounded-in-flight allocation
+    /// pattern a per-call scratch has when the host runs far ahead).
+    fn scratch(&self, bytes: usize) -> Result<std::sync::MutexGuard<'_, Scratch>> {
+        let mut g = self.scratch.lock().unwrap_or_else(|p| p.into_inner());
+        if g.bytes < bytes {
+            let buffer = create_buffer(self.context, bytes.max(1), cl::CL_MEM_READ_WRITE)?;
+            if g.buffer != 0 {
+                unsafe { clReleaseMemObject(g.buffer) };
+            }
+            g.buffer = buffer;
+            g.bytes = bytes;
+        }
+        Ok(g)
     }
 }
 
 impl Drop for OpenClContext {
     fn drop(&mut self) {
         kernels::forget_context(self.context);
+        if let Ok(g) = self.scratch.get_mut() {
+            if g.buffer != 0 {
+                unsafe { clReleaseMemObject(g.buffer) };
+            }
+        }
         if self.fault != 0 {
             unsafe { clReleaseMemObject(self.fault) };
+        }
+        if self.transfer_queue != 0 {
+            unsafe { clReleaseCommandQueue(self.transfer_queue) };
         }
         if self.queue != 0 {
             unsafe { clReleaseCommandQueue(self.queue) };
@@ -243,10 +295,19 @@ fn init_device(gpu_id: usize) -> Result<OpenClDevice> {
         unsafe { clReleaseContext(context) };
         return Err(opencl_error(err, "clCreateCommandQueue"));
     }
+    let transfer_queue = unsafe { clCreateCommandQueue(context, device, 0, &mut err) };
+    if err != cl::CL_SUCCESS || transfer_queue == 0 {
+        unsafe {
+            clReleaseCommandQueue(queue);
+            clReleaseContext(context);
+        }
+        return Err(opencl_error(err, "clCreateCommandQueue(transfer)"));
+    }
     let fault = match create_buffer(context, crate::fault_slot::BYTES, cl::CL_MEM_READ_WRITE) {
         Ok(b) => b,
         Err(e) => {
             unsafe {
+                clReleaseCommandQueue(transfer_queue);
                 clReleaseCommandQueue(queue);
                 clReleaseContext(context);
             }
@@ -257,12 +318,13 @@ fn init_device(gpu_id: usize) -> Result<OpenClDevice> {
     if let Err(e) = unsafe { write_buffer(queue, fault, zeros.len(), zeros.as_ptr()) } {
         unsafe {
             clReleaseMemObject(fault);
+            clReleaseCommandQueue(transfer_queue);
             clReleaseCommandQueue(queue);
             clReleaseContext(context);
         }
         return Err(e);
     }
-    let inner = Arc::new(OpenClContext { context, queue, fault });
+    let inner = Arc::new(OpenClContext { context, queue, transfer_queue, fault, scratch: std::sync::Mutex::new(Scratch::default()) });
     let weak = Arc::downgrade(&inner);
     crate::fault_slot::register_drain(Box::new(move |slot| match weak.upgrade() {
         Some(ctx) => {
@@ -307,6 +369,11 @@ impl OpenClDevice {
         self.inner.queue
     }
 
+    /// The upload queue (see `OpenClContext::transfer_queue`).
+    pub(crate) fn transfer_queue(&self) -> usize {
+        self.inner.transfer_queue
+    }
+
     pub(crate) fn context(&self) -> usize {
         self.inner.context
     }
@@ -345,36 +412,16 @@ impl OpenClDevice {
         Ok(OpenClStorage { buffer, dtype, numel, device: self.clone() })
     }
 
-    /// Allocate a raw byte buffer (no `GgmlDType`) for weights like IQ2_XXS
-    /// that candle has no dtype for.  The `OpenClStorage`'s dtype is a F32
-    /// placeholder; only the buffer handle and byte_offset are consulted
-    /// when feeding raw block bytes to the quantized kernels.
-    pub fn alloc_raw(&self, n_bytes: usize) -> Result<OpenClStorage> {
-        let bytes = n_bytes.max(1);
-        let buffer = create_buffer(self.context(), bytes, cl::CL_MEM_READ_WRITE)?;
-        // F32 placeholder element count (only the byte buffer is meaningful).
-        let numel = (n_bytes + 3) / 4;
-        Ok(OpenClStorage { buffer, dtype: DType::F32, numel, device: self.clone() })
-    }
-
-    /// Synchronously copy `bytes` into `buffer` (raw, not dtype-aware — for
-    /// uploading block-quantized weights candle has no `GgmlDType` for).
-    pub fn write_raw_bytes(&self, buffer: usize, bytes: &[u8]) -> Result<()> {
-        unsafe { write_buffer(self.queue(), buffer, bytes.len(), bytes.as_ptr()) }
-    }
-
-    /// Synchronously copy `bytes` out of `buffer`.
-    pub fn read_raw_bytes(&self, buffer: usize, bytes: &mut [u8]) -> Result<()> {
-        unsafe { read_buffer(self.queue(), buffer, 0, bytes.len(), bytes.as_mut_ptr()) }
-    }
-
-    /// Block until all queued kernels on `self.queue` complete.
+    /// Block until every queued command completes, then report any index
+    /// fault this thread's launches raised (the same contract as the
+    /// `BackendDevice::synchronize` impl; this inherent method exists so
+    /// callers holding a bare `&OpenClDevice` need no trait import).
     pub fn synchronize(&self) -> Result<()> {
         let e = unsafe { clFinish(self.queue()) };
         if e != cl::CL_SUCCESS {
             return Err(opencl_error(e, "clFinish"));
         }
-        Ok(())
+        self.check_fault()
     }
 }
 
@@ -475,7 +522,13 @@ impl Clone for OpenClStorage {
     }
 }
 
-fn create_buffer(context: usize, bytes: usize, flags: u64) -> Result<usize> {
+pub(crate) fn release_mem(buffer: usize) {
+    if buffer != 0 {
+        unsafe { clReleaseMemObject(buffer) };
+    }
+}
+
+pub(crate) fn create_buffer(context: usize, bytes: usize, flags: u64) -> Result<usize> {
     let mut err: i32 = 0;
     let buffer = unsafe { clCreateBuffer(context, flags, bytes, std::ptr::null_mut(), &mut err) };
     if err != cl::CL_SUCCESS || buffer == 0 {
@@ -497,7 +550,7 @@ unsafe fn write_buffer(queue: usize, buffer: usize, bytes: usize, ptr: *const u8
     Ok(())
 }
 
-unsafe fn write_buffer_at(queue: usize, buffer: usize, offset: usize, bytes: usize, ptr: *const u8) -> Result<()> {
+pub(crate) unsafe fn write_buffer_at(queue: usize, buffer: usize, offset: usize, bytes: usize, ptr: *const u8) -> Result<()> {
     if bytes == 0 {
         return Ok(());
     }
@@ -510,7 +563,7 @@ unsafe fn write_buffer_at(queue: usize, buffer: usize, offset: usize, bytes: usi
 
 /// # Safety
 /// `ptr` must point to at least `bytes` valid bytes.
-unsafe fn read_buffer(queue: usize, buffer: usize, offset: usize, bytes: usize, ptr: *mut u8) -> Result<()> {
+pub(crate) unsafe fn read_buffer(queue: usize, buffer: usize, offset: usize, bytes: usize, ptr: *mut u8) -> Result<()> {
     if bytes == 0 {
         return Ok(());
     }
@@ -534,6 +587,15 @@ fn transmute_bytes<T: Copy>(raw: &[u8], numel: usize) -> Vec<T> {
 
 fn native() -> bool {
     kernels::native_enabled()
+}
+
+/// Hand a native op's f32 result on, after the `JOSHUA_OPENCL_CHECK_NAN`
+/// device-side NaN count when that diagnostic is enabled.
+fn nan_checked(op: &str, out: OpenClStorage) -> OpenClStorage {
+    if out.dtype == DType::F32 && kernels::check_nan_enabled() {
+        kernels::debug_check_nan(&out.device.ctx(), op, out.buffer, out.numel);
+    }
+    out
 }
 
 /// Strides of a matmul operand `[batch..., rows, cols]` under `l`, when
@@ -654,7 +716,7 @@ impl BackendStorage for OpenClStorage {
             let n = layout.shape().elem_count();
             let out = self.device.alloc(DType::F32, n)?;
             match kernels::run_affine(&self.ctx(), self.buffer, out.buffer, n, layout, mul as f32, add as f32) {
-                Ok(()) => return Ok(out),
+                Ok(()) => return Ok(nan_checked("affine", out)),
                 Err(e) => kernels::note_fallback("affine", Some(&e)),
             }
         } else if native() {
@@ -670,7 +732,7 @@ impl BackendStorage for OpenClStorage {
             let n = layout.shape().elem_count();
             let out = self.device.alloc(DType::F32, n)?;
             match kernels::run_powf(&self.ctx(), self.buffer, out.buffer, n, layout, e as f32) {
-                Ok(()) => return Ok(out),
+                Ok(()) => return Ok(nan_checked("powf", out)),
                 Err(err) => kernels::note_fallback("powf", Some(&err)),
             }
         } else if native() {
@@ -686,7 +748,7 @@ impl BackendStorage for OpenClStorage {
             let n = layout.shape().elem_count();
             let out = self.device.alloc(DType::F32, n)?;
             match kernels::run_elu(&self.ctx(), self.buffer, out.buffer, n, layout, alpha as f32) {
-                Ok(()) => return Ok(out),
+                Ok(()) => return Ok(nan_checked("elu", out)),
                 Err(err) => kernels::note_fallback("elu", Some(&err)),
             }
         } else if native() {
@@ -700,7 +762,7 @@ impl BackendStorage for OpenClStorage {
     fn reduce_op(&self, op: ReduceOp, layout: &Layout, s: &[usize]) -> Result<Self> {
         if native() && self.dtype == DType::F32 {
             match self.reduce_native(op, layout, s) {
-                Ok(Some(out)) => return Ok(out),
+                Ok(Some(out)) => return Ok(nan_checked("reduce_op", out)),
                 Ok(None) => kernels::note_fallback("reduce_op", None),
                 Err(e) => kernels::note_fallback("reduce_op", Some(&e)),
             }
@@ -717,7 +779,7 @@ impl BackendStorage for OpenClStorage {
             let n = lhs_l.shape().elem_count();
             let out = self.device.alloc(DType::U8, n)?;
             match kernels::run_cmp(&self.ctx(), kernels::cmp_code(op), self.buffer, rhs.buffer, out.buffer, n, lhs_l, rhs_l, self.dtype == DType::U32) {
-                Ok(()) => return Ok(out),
+                Ok(()) => return Ok(nan_checked("cmp", out)),
                 Err(e) => kernels::note_fallback("cmp", Some(&e)),
             }
         } else if native() {
@@ -739,7 +801,7 @@ impl BackendStorage for OpenClStorage {
                     let n = layout.shape().elem_count();
                     let out = self.device.alloc(dtype, n)?;
                     match kernels::run_cast(&self.ctx(), name, self.buffer, out.buffer, n, layout) {
-                        Ok(()) => return Ok(out),
+                        Ok(()) => return Ok(nan_checked("to_dtype", out)),
                         Err(e) => kernels::note_fallback("to_dtype", Some(&e)),
                     }
                 }
@@ -757,7 +819,7 @@ impl BackendStorage for OpenClStorage {
                 let n = layout.shape().elem_count();
                 let out = self.device.alloc(DType::F32, n)?;
                 match kernels::run_unary(&self.ctx(), code, self.buffer, out.buffer, n, layout) {
-                    Ok(()) => return Ok(out),
+                    Ok(()) => return Ok(nan_checked(B::NAME, out)),
                     Err(e) => kernels::note_fallback(B::NAME, Some(&e)),
                 }
             } else {
@@ -777,7 +839,7 @@ impl BackendStorage for OpenClStorage {
                 let n = lhs_l.shape().elem_count();
                 let out = self.device.alloc(self.dtype, n)?;
                 match kernels::run_binary(&self.ctx(), code, self.buffer, rhs.buffer, out.buffer, n, lhs_l, rhs_l, self.dtype == DType::U32) {
-                    Ok(()) => return Ok(out),
+                    Ok(()) => return Ok(nan_checked(B::NAME, out)),
                     Err(e) => kernels::note_fallback(B::NAME, Some(&e)),
                 }
             } else {
@@ -799,7 +861,7 @@ impl BackendStorage for OpenClStorage {
                 let n = layout.shape().elem_count();
                 let out = self.device.alloc(t.dtype, n)?;
                 match kernels::run_where(&self.ctx(), self.buffer, t.buffer, f.buffer, out.buffer, n, layout, t_l, f_l, self.dtype == DType::U32, elem == 8) {
-                    Ok(()) => return Ok(out),
+                    Ok(()) => return Ok(nan_checked("where_cond", out)),
                     Err(e) => kernels::note_fallback("where_cond", Some(&e)),
                 }
             } else {
@@ -858,7 +920,7 @@ impl BackendStorage for OpenClStorage {
     fn index_select(&self, ids: &Self, l: &Layout, ids_l: &Layout, dim: usize) -> Result<Self> {
         if native() && matches!(self.elem_size(), 4 | 8) && matches!(ids.dtype, DType::U32 | DType::I64 | DType::U8) {
             match self.index_select_native(ids, l, ids_l, dim) {
-                Ok(out) => return Ok(out),
+                Ok(out) => return Ok(nan_checked("index_select", out)),
                 Err(e) => kernels::note_fallback("index_select", Some(&e)),
             }
         } else if native() {
@@ -873,7 +935,7 @@ impl BackendStorage for OpenClStorage {
     fn gather(&self, l: &Layout, ids: &Self, ids_l: &Layout, dim: usize) -> Result<Self> {
         if native() && self.elem_size() == 4 && matches!(ids.dtype, DType::U32 | DType::I64 | DType::U8) {
             match self.gather_native(l, ids, ids_l, dim) {
-                Ok(out) => return Ok(out),
+                Ok(out) => return Ok(nan_checked("gather", out)),
                 Err(e) => kernels::note_fallback("gather", Some(&e)),
             }
         } else if native() {
@@ -924,7 +986,7 @@ impl BackendStorage for OpenClStorage {
     fn index_add(&self, l: &Layout, ids: &Self, ids_l: &Layout, src: &Self, src_l: &Layout, dim: usize) -> Result<Self> {
         if native() && self.dtype == DType::F32 && src.dtype == DType::F32 {
             match self.index_add_native(l, ids, ids_l, src, src_l, dim) {
-                Ok(out) => return Ok(out),
+                Ok(out) => return Ok(nan_checked("index_add", out)),
                 Err(e) => kernels::note_fallback("index_add", Some(&e)),
             }
         } else if native() {
@@ -940,7 +1002,7 @@ impl BackendStorage for OpenClStorage {
     fn matmul(&self, rhs: &Self, bmnk: (usize, usize, usize, usize), lhs_l: &Layout, rhs_l: &Layout) -> Result<Self> {
         if native() && self.dtype == DType::F32 && rhs.dtype == DType::F32 {
             match self.matmul_native(rhs, bmnk, lhs_l, rhs_l) {
-                Ok(out) => return Ok(out),
+                Ok(out) => return Ok(nan_checked("matmul", out)),
                 Err(e) => kernels::note_fallback("matmul", Some(&e)),
             }
         } else if native() {
@@ -1294,7 +1356,27 @@ impl BackendDevice for OpenClDevice {
 /// Rows below which a quantized matmul dequantizes inside the GEMV kernel;
 /// larger inputs (prefill) dequantize the weight to a scratch f32 buffer
 /// once and run the tiled GEMM.
-const QGEMV_MAX_ROWS: usize = 16;
+/// Rows up to which `fwd` runs the fused dequantize-and-dot GEMV instead of
+/// dequantizing the whole weight once and running the tiled GEMM.
+///
+/// `k_qgemv` decodes every block again for every row (its second grid
+/// dimension is the row), so its cost grows linearly with `m` while the
+/// GEMM path pays one decode of the matrix plus a GEMM that is nearly free at
+/// these sizes; for the 256-element block formats (the K-quants and IQ2_XXS,
+/// whose decode dominates) the break-even sits at a handful of rows.  The
+/// half-precision `k_hgemv` reads its weights as-is and keeps the wider window.
+fn qgemv_max_rows(dtype: GgmlDType) -> usize {
+    use GgmlDType::*;
+    if kernels::qgemv_multirow(dtype) {
+        // `k_qgemv_mr` decodes each weight once for up to 16 rows.
+        return kernels::QGEMV_MR_MAX_ROWS;
+    }
+    match dtype {
+        F16 | BF16 => 16,
+        Q2K | Q3K | Q4K | Q5K | Q6K | Q8K | Iq2Xxs => 4,
+        _ => 8,
+    }
+}
 
 /// A GGUF-block-quantized tensor held on the device in its on-disk format.
 ///
@@ -1368,14 +1450,28 @@ impl QOpenClStorage {
         Ok(Self { buffer, byte_offset: 0, dtype, elem_count, device: device.clone(), _host: None })
     }
 
-    /// Upload raw block bytes.
+    /// Upload raw block bytes (a blocking write on the compute queue).
     pub fn from_bytes(device: &OpenClDevice, dtype: GgmlDType, elem_count: usize, data: &[u8]) -> Result<Self> {
+        Self::from_bytes_on(device, device.queue(), dtype, elem_count, data)
+    }
+
+    /// Upload raw block bytes on the device's *transfer* queue: the write
+    /// still blocks the calling thread until the bytes are on the device,
+    /// but it neither waits for nor delays the kernels queued on the compute
+    /// queue, so a background uploader (an expert cache warming slots from
+    /// the model mapping) never stalls the decode thread.  The storage is
+    /// safe to use from any queue once this returns.
+    pub fn from_bytes_transfer(device: &OpenClDevice, dtype: GgmlDType, elem_count: usize, data: &[u8]) -> Result<Self> {
+        Self::from_bytes_on(device, device.transfer_queue(), dtype, elem_count, data)
+    }
+
+    fn from_bytes_on(device: &OpenClDevice, queue: usize, dtype: GgmlDType, elem_count: usize, data: &[u8]) -> Result<Self> {
         let bytes = Self::bytes_for(dtype, elem_count)?;
         if data.len() < bytes {
             return Err(Error::Msg(format!("opencl: {} bytes given for a {dtype:?} tensor needing {bytes}", data.len())));
         }
         let buffer = create_buffer(device.context(), bytes.max(1), cl::CL_MEM_READ_WRITE)?;
-        if let Err(e) = unsafe { write_buffer(device.queue(), buffer, bytes, data.as_ptr()) } {
+        if let Err(e) = unsafe { write_buffer(queue, buffer, bytes, data.as_ptr()) } {
             unsafe { clReleaseMemObject(buffer) };
             return Err(e);
         }
@@ -1453,18 +1549,24 @@ impl QOpenClStorage {
     /// Dequantize to an f32 storage on the device.
     pub fn dequantize(&self, elem_count: usize) -> Result<OpenClStorage> {
         let out = self.device.alloc(DType::F32, elem_count)?;
+        self.dequantize_into(out.buffer, elem_count)?;
+        Ok(out)
+    }
+
+    /// Dequantize `elem_count` elements into the f32 device buffer `out`.
+    fn dequantize_into(&self, out: usize, elem_count: usize) -> Result<()> {
         match self.dtype {
             GgmlDType::F32 => {
                 let rc = unsafe {
-                    clEnqueueCopyBuffer(self.device.queue(), self.buffer, out.buffer, self.byte_offset as usize, 0, elem_count * 4, 0, std::ptr::null(), std::ptr::null_mut())
+                    clEnqueueCopyBuffer(self.device.queue(), self.buffer, out, self.byte_offset as usize, 0, elem_count * 4, 0, std::ptr::null(), std::ptr::null_mut())
                 };
                 if rc != cl::CL_SUCCESS {
                     return Err(opencl_error(rc, "clEnqueueCopyBuffer"));
                 }
+                Ok(())
             }
-            _ => kernels::run_dequant(&self.device.ctx(), self.dtype, self.buffer, out.buffer, elem_count, self.byte_offset)?,
+            _ => kernels::run_dequant(&self.device.ctx(), self.dtype, self.buffer, out, elem_count, self.byte_offset),
         }
-        Ok(out)
     }
 
     /// `x @ W^T` for `x` on the device (f32, contiguous) and this `[n, k]` weight.
@@ -1497,21 +1599,31 @@ impl QOpenClStorage {
                 let sb = MatStrides { row: 1, col: k, offset: (self.byte_offset / 4) as usize, batch: 0 };
                 kernels::run_matmul(&c, storage.buffer, self.buffer, out.buffer, (1, m, n, k), sa, sb)?;
             }
-            GgmlDType::F16 | GgmlDType::BF16 if m <= QGEMV_MAX_ROWS => {
+            GgmlDType::F16 | GgmlDType::BF16 if m <= qgemv_max_rows(self.dtype) => {
                 kernels::run_hgemv(&c, self.dtype == GgmlDType::BF16, storage.buffer, self.buffer, out.buffer, m, n, k, self.byte_offset, o1)?;
             }
-            _ if m <= QGEMV_MAX_ROWS => {
+            _ if m <= qgemv_max_rows(self.dtype) => {
                 kernels::run_qgemv(&c, self.dtype, storage.buffer, self.buffer, out.buffer, m, n, k, self.byte_offset, o1)?;
             }
             _ => {
-                // Prefill: dequantize once, then the tiled GEMM.
-                let w = self.dequantize(n * k)?;
+                // Prefill: dequantize once, then the tiled GEMM.  The f32
+                // copy lives in the device's shared scratch (held for the
+                // two launches) so a long prefill cannot queue one fresh
+                // `n*k*4`-byte buffer per matmul ahead of the GPU.
                 let sa = MatStrides { row: k, col: 1, offset: o1, batch: 0 };
                 let sb = MatStrides { row: 1, col: k, offset: 0, batch: 0 };
-                kernels::run_matmul(&c, storage.buffer, w.buffer, out.buffer, (1, m, n, k), sa, sb)?;
+                let bytes = n * k * 4;
+                if bytes <= SCRATCH_MAX_BYTES {
+                    let scratch = self.device.inner.scratch(bytes)?;
+                    self.dequantize_into(scratch.buffer, n * k)?;
+                    kernels::run_matmul(&c, storage.buffer, scratch.buffer, out.buffer, (1, m, n, k), sa, sb)?;
+                } else {
+                    let w = self.dequantize(n * k)?;
+                    kernels::run_matmul(&c, storage.buffer, w.buffer, out.buffer, (1, m, n, k), sa, sb)?;
+                }
             }
         }
-        Ok((out, dst_shape))
+        Ok((nan_checked("qmatmul", out), dst_shape))
     }
 
     /// Gather rows `ids` of this `[rows, hidden]` table as f32 `[n_ids, hidden]`.
@@ -1642,6 +1754,11 @@ mod tests {
         let dup_ids = Tensor::new(&[[0u32, 1, 1], [0, 1, 1]], &cpu)?;
         close(&base.to_device(&dev)?.scatter(&dup_ids.to_device(&dev)?, &sc_src.to_device(&dev)?, 0)?, &base.scatter(&dup_ids, &sc_src, 0)?, 0.0, "scatter duplicate ids");
         close(&base.to_device(&dev)?.scatter_add(&dup_ids.to_device(&dev)?, &sc_src.to_device(&dev)?, 0)?, &base.scatter_add(&dup_ids, &sc_src, 0)?, 0.0, "scatter_add duplicate ids");
+        // An empty contraction is a zero matrix, not whatever the fresh
+        // output buffer held.
+        let e0 = Tensor::zeros((3, 0), DType::F32, &dev)?;
+        let e1 = Tensor::zeros((0, 5), DType::F32, &dev)?;
+        close(&e0.matmul(&e1)?, &Tensor::zeros((3, 5), DType::F32, &cpu)?, 0.0, "matmul with K == 0");
         // i64 → f32 keeps the high word.
         let big = Tensor::new(&[4_294_967_296i64, -4_294_967_297, 5, -1], &cpu)?;
         close(&big.to_device(&dev)?.to_dtype(DType::F32)?, &big.to_dtype(DType::F32)?, 0.0, "cast large i64 to f32");
@@ -1723,6 +1840,10 @@ mod tests {
             let devm = mm_dev.forward(&xm.to_device(&dev)?)?;
             close(&dev1, &ref1, 1e-4, &format!("{what} gemv vs f32"));
             close(&devm, &refm, 1e-4, &format!("{what} gemm vs f32"));
+            // A dozen rows: the multi-row kernel for the expert dtypes, the
+            // dequantize + GEMM path for the rest.
+            let x12 = xm.narrow(0, 3, 12)?;
+            close(&mm_dev.forward(&x12.to_device(&dev)?)?, &x12.matmul(&w_ref.t()?)?, 1e-4, &format!("{what} 12 rows vs f32"));
             close(&dev1, &mm_cpu.forward(&x1)?, 2e-2, &format!("{what} gemv vs cpu"));
             close(&devm, &mm_cpu.forward(&xm)?, 2e-2, &format!("{what} gemm vs cpu"));
             let ids = Tensor::new(&[3u32, 0, 11, 3], &cpu)?;
@@ -1825,4 +1946,168 @@ mod tests {
         Ok(())
     }
 
+
+    /// A quantized matmul with a small, block-aligned inner dimension runs
+    /// the fused GEMV (m <= 16) and the dequantize + GEMM branch (m > 16)
+    /// and matches the CPU on both.
+    #[test]
+    fn opencl_quantized_matmul_small_k() -> crate::Result<()> {
+        use crate::quantized::{GgmlDType, QMatMul, QStorage, QTensor};
+        use crate::Module;
+        let Some(dev) = device() else { return Ok(()) };
+        let cpu = Device::Cpu;
+        let (n, k) = (5usize, 96usize);
+        let w = Tensor::arange(0f32, (n * k) as f32, &cpu)?.affine(0.01, -0.3)?.reshape((n, k))?;
+        let q_cpu = QTensor::quantize(&w, GgmlDType::Q8_0)?;
+        let q_dev = QTensor::new(QStorage::from_data(q_cpu.data()?, &dev, GgmlDType::Q8_0)?, (n, k))?;
+        let (mm_cpu, mm_dev) = (QMatMul::from_qtensor(q_cpu)?, QMatMul::from_qtensor(q_dev)?);
+        for m in [1usize, 20] {
+            let x = Tensor::arange(0f32, (m * k) as f32, &cpu)?.affine(0.002, -0.1)?.reshape((m, k))?;
+            close(&mm_dev.forward(&x.to_device(&dev)?)?, &mm_cpu.forward(&x)?, 2e-3, "quantized matmul k=96");
+        }
+        Ok(())
+    }
+
+    /// IQ2_XXS blocks are a first-class device dtype: upload, read back,
+    /// dequantize, GEMV / GEMM through `QMatMul`, and the embedding gather
+    /// all agree with the CPU decode; the transfer-queue upload serves the
+    /// same numbers as the compute-queue one.
+    #[test]
+    fn opencl_iq2xxs_dtype_parity() -> crate::Result<()> {
+        use crate::quantized::iq2xxs::{synthetic_block, BlockIq2Xxs, BLOCK_BYTES};
+        use crate::quantized::{GgmlDType, GgmlType, QMatMul, QStorage, QTensor};
+        use crate::Module;
+        let Some(dev) = device() else { return Ok(()) };
+        let cpu = Device::Cpu;
+        let (n, k) = (24usize, 768usize);
+        let blocks: Vec<BlockIq2Xxs> = (0..n * k / 256).map(|i| synthetic_block(i as u32 + 1)).collect();
+        let bytes: Vec<u8> = blocks.iter().flat_map(|b| {
+            let mut v = Vec::with_capacity(BLOCK_BYTES);
+            v.extend_from_slice(&b.d);
+            v.extend_from_slice(&b.qs);
+            v
+        }).collect();
+        let mut w = vec![0f32; n * k];
+        BlockIq2Xxs::to_float(&blocks, &mut w);
+        let w_ref = Tensor::from_vec(w, (n, k), &cpu)?;
+        assert!(w_ref.flatten_all()?.to_vec1::<f32>()?.iter().all(|v| v.is_finite()));
+
+        let q_dev = QTensor::new(QStorage::from_data(std::borrow::Cow::Borrowed(&bytes), &dev, GgmlDType::Iq2Xxs)?, (n, k))?;
+        assert_eq!(q_dev.dtype(), GgmlDType::Iq2Xxs);
+        assert_eq!(q_dev.data()?.as_ref(), &bytes[..], "block bytes round-trip");
+        close(&q_dev.dequantize(&dev)?, &w_ref, 0.0, "iq2xxs dequantize");
+        let mm_dev = QMatMul::from_qtensor(q_dev)?;
+        // Both the fused GEMV (m <= 16, decoded once per weight) and
+        // dequantize-then-GEMM (larger m).
+        for m in [1usize, 3, 4, 5, 12, 16, 17, 40] {
+            let x = Tensor::arange(0f32, (m * k) as f32, &cpu)?.affine(1.7e-3, -0.6)?.sin()?.reshape((m, k))?;
+            let want = x.matmul(&w_ref.t()?)?;
+            close(&mm_dev.forward(&x.to_device(&dev)?)?, &want, 1e-4, &format!("iq2xxs qmatmul m={m}"));
+            // A strided/offset input view (the MoE dispatch narrows packed buffers).
+            let wide = Tensor::cat(&[&x, &x.affine(0.5, 0.1)?], 0)?.to_device(&dev)?;
+            let view = wide.narrow(0, m, m)?;
+            close(&mm_dev.forward(&view)?, &x.affine(0.5, 0.1)?.matmul(&w_ref.t()?)?, 1e-4, &format!("iq2xxs qmatmul offset view m={m}"));
+        }
+        let ids = Tensor::new(&[5u32, 0, 23, 5], &cpu)?;
+        close(&mm_dev.embedding(&ids.to_device(&dev)?)?, &w_ref.index_select(&ids, 0)?, 0.0, "iq2xxs embedding");
+
+        // A column count that is not a multiple of the kernel's columns per
+        // work-group, a single-block row (K = 256) and the real expert
+        // shape's K = 4096 (one column per group).
+        for (n2, k2) in [(25usize, 512usize), (7, 256), (5, 4096)] {
+            let blocks: Vec<BlockIq2Xxs> = (0..n2 * k2 / 256).map(|i| synthetic_block(i as u32 + 100)).collect();
+            let bytes: Vec<u8> = blocks.iter().flat_map(|b| { let mut v = b.d.to_vec(); v.extend_from_slice(&b.qs); v }).collect();
+            let mut w = vec![0f32; n2 * k2];
+            BlockIq2Xxs::to_float(&blocks, &mut w);
+            let w_ref = Tensor::from_vec(w, (n2, k2), &cpu)?;
+            let q = QTensor::new(QStorage::from_data(std::borrow::Cow::Borrowed(&bytes), &dev, GgmlDType::Iq2Xxs)?, (n2, k2))?;
+            let mm = QMatMul::from_qtensor(q)?;
+            for m in [1usize, 2, 9, 16] {
+                let x = Tensor::arange(0f32, (m * k2) as f32, &cpu)?.affine(3.1e-3, -0.4)?.sin()?.reshape((m, k2))?;
+                close(&mm.forward(&x.to_device(&dev)?)?, &x.matmul(&w_ref.t()?)?, 1e-4, &format!("iq2xxs qmatmul n={n2} k={k2} m={m}"));
+            }
+        }
+
+        // Transfer-queue upload: identical storage, usable from the compute queue.
+        let ocl = dev.as_opencl_device()?;
+        let st = QOpenClStorage::from_bytes_transfer(ocl, GgmlDType::Iq2Xxs, n * k, &bytes)?;
+        let q_t = QTensor::new(QStorage::OpenCl(st), (n, k))?;
+        assert_eq!(q_t.data()?.as_ref(), &bytes[..]);
+        let x = Tensor::arange(0f32, k as f32, &cpu)?.affine(2e-3, -0.9)?.cos()?.reshape((1, k))?;
+        close(&QMatMul::from_qtensor(q_t)?.forward(&x.to_device(&dev)?)?, &x.matmul(&w_ref.t()?)?, 1e-4, "iq2xxs transfer upload");
+
+        // The CPU form is reference-only but must agree (Q8_K activations).
+        let q_cpu = QTensor::new(QStorage::from_data(std::borrow::Cow::Borrowed(&bytes), &cpu, GgmlDType::Iq2Xxs)?, (n, k))?;
+        close(&QMatMul::from_qtensor(q_cpu)?.forward(&x)?, &x.matmul(&w_ref.t()?)?, 2e-2, "iq2xxs cpu reference");
+        // Quantizing *to* IQ2_XXS is refused rather than guessed.
+        assert!(QTensor::quantize(&w_ref, GgmlDType::Iq2Xxs).is_err());
+        Ok(())
+    }
+
+    /// The prefill path's dequantize scratch is shared per device and reused
+    /// across weights and threads without mixing their contents.
+    #[test]
+    fn opencl_dequant_scratch_is_reused_safely() -> crate::Result<()> {
+        use crate::quantized::{GgmlDType, QMatMul, QStorage, QTensor};
+        use crate::Module;
+        let Some(dev) = device() else { return Ok(()) };
+        let cpu = Device::Cpu;
+        let mut mms = Vec::new();
+        let mut refs = Vec::new();
+        for (i, (n, k)) in [(16usize, 256usize), (40, 512), (8, 1024)].into_iter().enumerate() {
+            let w = Tensor::arange(0f32, (n * k) as f32, &cpu)?.affine(1e-3 * (i + 1) as f64, -0.5)?.sin()?.reshape((n, k))?;
+            let q = QTensor::quantize(&w, GgmlDType::Q4K)?;
+            refs.push(q.dequantize(&cpu)?);
+            mms.push(QMatMul::from_qtensor(QTensor::new(QStorage::from_data(q.data()?, &dev, GgmlDType::Q4K)?, (n, k))?)?);
+        }
+        // m = 12 is above every cut-over: each call dequantizes into the
+        // shared scratch, alternating sizes, results queued back to back.
+        let mut outs = Vec::new();
+        for round in 0..3 {
+            for (i, mm) in mms.iter().enumerate() {
+                let k = refs[i].dim(1)?;
+                let x = Tensor::arange(0f32, (12 * k) as f32, &cpu)?.affine(7e-4, -0.3 - round as f64 * 0.1)?.cos()?.reshape((12, k))?;
+                outs.push((mm.forward(&x.to_device(&dev)?)?, x.matmul(&refs[i].t()?)?));
+            }
+        }
+        for (i, (got, want)) in outs.iter().enumerate() {
+            close(got, want, 1e-4, &format!("scratch reuse call {i}"));
+        }
+        // Another thread on the same device interleaves with this one.
+        let (dev2, mm2, ref2) = (dev.clone(), mms[1].clone(), refs[1].clone());
+        let handle = std::thread::spawn(move || -> crate::Result<()> {
+            for _ in 0..5 {
+                let k = ref2.dim(1)?;
+                let x = Tensor::arange(0f32, (9 * k) as f32, &Device::Cpu)?.affine(5e-4, 0.2)?.sin()?.reshape((9, k))?;
+                close(&mm2.forward(&x.to_device(&dev2)?)?, &x.matmul(&ref2.t()?)?, 1e-4, "scratch reuse other thread");
+            }
+            Ok(())
+        });
+        for _ in 0..5 {
+            let k = refs[2].dim(1)?;
+            let x = Tensor::arange(0f32, (9 * k) as f32, &cpu)?.affine(5e-4, 0.2)?.sin()?.reshape((9, k))?;
+            close(&mms[2].forward(&x.to_device(&dev)?)?, &x.matmul(&refs[2].t()?)?, 1e-4, "scratch reuse main thread");
+        }
+        handle.join().expect("thread")?;
+        Ok(())
+    }
+
+    /// The `JOSHUA_OPENCL_CHECK_NAN` counter kernel counts exactly the NaNs
+    /// (infinities are not errors), and per-op fallback counts are kept.
+    #[test]
+    fn opencl_nan_counter_and_fallback_counts() -> crate::Result<()> {
+        let Some(dev) = device() else { return Ok(()) };
+        let v = vec![1.0f32, f32::NAN, f32::INFINITY, -f32::INFINITY, 0.0, f32::NAN, 3.0];
+        let t = Tensor::from_vec(v, 7, &dev)?;
+        let (st, _) = t.storage_and_layout();
+        let crate::Storage::OpenCl(st) = &*st else { panic!("not an opencl tensor") };
+        let ocl = dev.as_opencl_device()?;
+        assert_eq!(kernels::count_nan(&ocl.ctx(), st.buffer, 7)?, 2);
+        let before = kernels::fallback_counts_by_op().into_iter().find(|(op, _)| op == "unit-test-op").map_or(0, |(_, n)| n);
+        kernels::note_fallback("unit-test-op", None);
+        kernels::note_fallback("unit-test-op", None);
+        let after = kernels::fallback_counts_by_op().into_iter().find(|(op, _)| op == "unit-test-op").map_or(0, |(_, n)| n);
+        assert_eq!(after, before + 2);
+        Ok(())
+    }
 }
