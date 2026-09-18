@@ -2834,12 +2834,12 @@ fn split_iq2xxs_experts<R: Read + Seek>(
         .unwrap_or(rd.ct.tensor_data_offset);
 
     // Zero-copy: one borrowed QTensor per expert, pointing into the mapping.
-    // A borrow is `QStorage::Cpu` by construction, so it is only taken when
-    // the experts' home device is the CPU — which it is for every mapped
-    // model, including one whose dense set runs on an accelerator (see
-    // `Reader::expert_device`).  Otherwise decode to f32 and copy onto
-    // `rd.expert_device` below.
-    if let Some(mmap) = rd.mmap.as_ref().filter(|_| rd.expert_device.is_cpu()) {
+    // The borrow is `QStorage::Cpu` by construction.  We take it for a CPU
+    // expert home AND an OpenCL expert home: on OpenCL the borrowed blocks
+    // still act as the residency source (the device cache uploads each active
+    // expert's blocks once via the same pointer), so the CPU-borrow remains the
+    // source of truth for both paths.
+    if let Some(mmap) = rd.mmap.as_ref().filter(|_| rd.expert_device.is_cpu() || rd.expert_device.is_opencl()) {
         let base = tensor_data_offset.saturating_add(info.offset) as usize;
         let mut experts = Vec::with_capacity(n_expert);
         for e in 0..n_expert {
