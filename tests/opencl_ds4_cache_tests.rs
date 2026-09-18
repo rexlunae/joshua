@@ -40,7 +40,12 @@ fn opencl_or_skip() -> Option<Device> {
 /// Load through the placed entry point: the dense set on `device`, the
 /// routed experts borrowed on the host with a device pool of `cache_bytes`
 /// on `expert_device`.
-fn load(model: &Path, device: &Device, expert_device: &Device, cache_bytes: Option<u64>) -> QuantizedModel {
+fn load(
+    model: &Path,
+    device: &Device,
+    expert_device: &Device,
+    cache_bytes: Option<u64>,
+) -> QuantizedModel {
     let bytes = std::fs::read(model).unwrap();
     let mut cursor = Cursor::new(&bytes[..]);
     let header = joshua::gguf_ext::read_header(&mut cursor).unwrap();
@@ -61,7 +66,10 @@ fn load(model: &Path, device: &Device, expert_device: &Device, cache_bytes: Opti
 }
 
 fn logits(model: &mut QuantizedModel, tokens: &[u32], offset: usize, device: &Device) -> Vec<f32> {
-    let input = Tensor::new(tokens, device).unwrap().reshape((1, tokens.len())).unwrap();
+    let input = Tensor::new(tokens, device)
+        .unwrap()
+        .reshape((1, tokens.len()))
+        .unwrap();
     model
         .forward(&input, offset)
         .unwrap()
@@ -78,16 +86,28 @@ fn logits(model: &mut QuantizedModel, tokens: &[u32], offset: usize, device: &De
 /// down-projection quantizes activations to 8 bits.
 fn assert_close(what: &str, dev: &[f32], cpu: &[f32]) {
     assert_eq!(dev.len(), cpu.len(), "{what}: logit count");
-    assert!(dev.iter().all(|v| v.is_finite()), "{what}: device logits not finite: {dev:?}");
+    assert!(
+        dev.iter().all(|v| v.is_finite()),
+        "{what}: device logits not finite: {dev:?}"
+    );
     let lo = cpu.iter().cloned().fold(f32::INFINITY, f32::min);
     let hi = cpu.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let spread = (hi - lo).max(1e-3);
-    let worst = dev.iter().zip(cpu).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+    let worst = dev
+        .iter()
+        .zip(cpu)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
     assert!(
         worst <= 0.05 * spread,
         "{what}: device logits diverge from cpu by {worst} (spread {spread}):\n dev {dev:?}\n cpu {cpu:?}"
     );
-    let arg = |v: &[f32]| v.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map(|(i, _)| i);
+    let arg = |v: &[f32]| {
+        v.iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .map(|(i, _)| i)
+    };
     assert_eq!(arg(dev), arg(cpu), "{what}: argmax differs");
 }
 
@@ -120,9 +140,20 @@ const SLOT_BYTES_Q2K: u64 = 2 * 256 * 66 + 256 * 84;
 
 /// Run prefill + decode on `cached` (dense on `dense`) against the all-CPU
 /// `plain`, checking parity at every step and the pool's counters at the end.
-fn exercise(what: &str, plain: &mut QuantizedModel, cached: &mut QuantizedModel, dense: &Device, expect_hits: bool) {
-    let report = cached.device_expert_cache().expect("a pool was built from the budget");
-    assert_eq!(report.slots, 3, "{what}: exact per-expert byte accounting: {report:?}");
+fn exercise(
+    what: &str,
+    plain: &mut QuantizedModel,
+    cached: &mut QuantizedModel,
+    dense: &Device,
+    expect_hits: bool,
+) {
+    let report = cached
+        .device_expert_cache()
+        .expect("a pool was built from the budget");
+    assert_eq!(
+        report.slots, 3,
+        "{what}: exact per-expert byte accounting: {report:?}"
+    );
 
     let tokens = [1u32, 4, 2, 7, 5];
     let before = fallback_counts();
@@ -133,8 +164,14 @@ fn exercise(what: &str, plain: &mut QuantizedModel, cached: &mut QuantizedModel,
     );
     cached.wait_for_expert_uploads();
     let after_prefill = cached.device_expert_cache().unwrap();
-    assert_eq!(after_prefill.stats.hits, 0, "{what}: prefill is lookup-only: {after_prefill:?}");
-    assert!(after_prefill.resident >= 1, "{what}: the last prompt row seeds the pool: {after_prefill:?}");
+    assert_eq!(
+        after_prefill.stats.hits, 0,
+        "{what}: prefill is lookup-only: {after_prefill:?}"
+    );
+    assert!(
+        after_prefill.resident >= 1,
+        "{what}: the last prompt row seeds the pool: {after_prefill:?}"
+    );
 
     for (i, t) in [3u32, 3, 3, 3, 8, 3, 3].iter().enumerate() {
         assert_close(
@@ -144,14 +181,23 @@ fn exercise(what: &str, plain: &mut QuantizedModel, cached: &mut QuantizedModel,
         );
         cached.wait_for_expert_uploads();
         let r = cached.device_expert_cache().unwrap();
-        assert!(r.resident <= 3 && r.resident_bytes <= r.budget_bytes, "{what}: budget respected: {r:?}");
+        assert!(
+            r.resident <= 3 && r.resident_bytes <= r.budget_bytes,
+            "{what}: budget respected: {r:?}"
+        );
     }
     let r = cached.device_expert_cache().unwrap();
     eprintln!("{what}: {r:?}");
     if expect_hits {
-        assert!(r.stats.hits > 0, "{what}: resident experts were used on the device: {r:?}");
+        assert!(
+            r.stats.hits > 0,
+            "{what}: resident experts were used on the device: {r:?}"
+        );
     }
-    assert!(r.stats.uploads >= 3 && r.stats.evictions > 0, "{what}: the pool churned: {r:?}");
+    assert!(
+        r.stats.uploads >= 3 && r.stats.evictions > 0,
+        "{what}: the pool churned: {r:?}"
+    );
     assert_eq!(r.stats.refused, 0, "{what}: {r:?}");
     assert_eq!(r.stats.upload_failures, 0, "{what}: {r:?}");
     assert_eq!(r.upload_drops, 0, "{what}: {r:?}");
@@ -162,11 +208,21 @@ fn exercise(what: &str, plain: &mut QuantizedModel, cached: &mut QuantizedModel,
     // is not a counted fallback.)
     let delta = fallback_delta(&before, &fallback_counts());
     eprintln!("{what}: fallbacks {delta:?}");
-    for op in ["qmatmul", "matmul", "index_select", "index_add", "gather", "binary", "unary"] {
-        assert!(
-            !delta.iter().any(|(name, _)| name == op),
-            "{what}: `{op}` fell back to the CPU round-trip: {delta:?}"
-        );
+    if candle_core::opencl_backend::native_enabled() {
+        for op in [
+            "qmatmul",
+            "matmul",
+            "index_select",
+            "index_add",
+            "gather",
+            "binary",
+            "unary",
+        ] {
+            assert!(
+                !delta.iter().any(|(name, _)| name == op),
+                "{what}: `{op}` fell back to the CPU round-trip: {delta:?}"
+            );
+        }
     }
 }
 
@@ -200,14 +256,20 @@ fn deepseek4_vram_expert_cache_matches_cpu() {
         std::env::remove_var("JOSHUA_EXPERT_MISS");
         exercise("sync upload on miss", &mut plain, &mut cached, &cpu, true);
         let r = cached.device_expert_cache().unwrap();
-        assert!(r.stats.hits >= r.stats.misses, "every decode miss became a same-step hit: {r:?}");
+        assert!(
+            r.stats.hits >= r.stats.misses,
+            "every decode miss became a same-step hit: {r:?}"
+        );
     }
     // Budget 0 and no budget are the plain host path: no pool at all.
     {
         let none = load(&model, &ocl, &cpu, Some(0));
         assert!(none.device_expert_cache().is_none());
         let none = load(&model, &ocl, &ocl, None);
-        assert!(none.device_expert_cache().is_none(), "an OpenCL expert home without a budget stays on the host");
+        assert!(
+            none.device_expert_cache().is_none(),
+            "an OpenCL expert home without a budget stays on the host"
+        );
         // Loading dequantizes F16 dense weights on the device; dropping the
         // models before those launches complete is fine on a conforming
         // runtime (buffer deletion is deferred) but pocl frees eagerly.
@@ -223,7 +285,13 @@ fn deepseek4_vram_expert_cache_matches_cpu() {
     {
         let mut plain = load(&model, &cpu, &cpu, None);
         let mut cached = load(&model, &cpu, &ocl, Some(3 * SLOT_BYTES_Q2K));
-        exercise("q2k down, dense on cpu", &mut plain, &mut cached, &cpu, true);
+        exercise(
+            "q2k down, dense on cpu",
+            &mut plain,
+            &mut cached,
+            &cpu,
+            true,
+        );
     }
     std::fs::remove_dir_all(&dir).ok();
 }

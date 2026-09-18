@@ -146,6 +146,16 @@ pocl is bisected without recompiling:
 4. `JOSHUA_OPENCL_BUILD_OPTS="-cl-opt-disable"` — extra options for the
    kernel compiler.  A result that changes with the optimiser is a compiler
    issue, not a kernel bug.
+5. `JOSHUA_OPENCL_QGEMV=v1` — the expert formats (IQ2_XXS, Q2_K) normally
+   run `k_qgemv_mr`, which decodes each weight once for up to 16 rows with
+   every lane owning eight consecutive elements; this switches them to the
+   one-row `k_qgemv` every other block format uses.
+
+The per-visit device cost of an expert is what the cache's hit rate buys,
+so the kernel matters as much as the residency: with `k_qgemv_mr` a
+resident IQ2_XXS `[2048, 4096]` matmul agrees with the fused CPU kernel to
+~2e-6 (`iq2_opencl_tests` prints the timings next to the CPU's; run it on
+the card for the real numbers).
 
 ## Environment variables
 
@@ -158,6 +168,7 @@ pocl is bisected without recompiling:
 | `JOSHUA_OPENCL_CHECK_NAN=1` | Count NaNs on the device after every native f32 launch and name the first op that produced one. |
 | `JOSHUA_OPENCL_BUILD_OPTS="…"` | Extra options for the OpenCL kernel compiler (e.g. `-cl-opt-disable`). |
 | `JOSHUA_EXPERT_MISS=upload` | Decode misses of the VRAM expert cache upload synchronously and run on the device (measurement mode). |
+| `JOSHUA_OPENCL_QGEMV=v1` | Run the expert formats through the one-row quantized GEMV instead of the multi-row kernel (bisecting). |
 
 The engine logs the device it opened, its memory model and the active paths
 at startup:

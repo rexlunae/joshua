@@ -1367,6 +1367,10 @@ impl BackendDevice for OpenClDevice {
 /// half-precision `k_hgemv` reads its weights as-is and keeps the wider window.
 fn qgemv_max_rows(dtype: GgmlDType) -> usize {
     use GgmlDType::*;
+    if kernels::qgemv_multirow(dtype) {
+        // `k_qgemv_mr` decodes each weight once for up to 16 rows.
+        return kernels::QGEMV_MR_MAX_ROWS;
+    }
     match dtype {
         F16 | BF16 => 16,
         Q2K | Q3K | Q4K | Q5K | Q6K | Q8K | Iq2Xxs => 4,
@@ -1836,6 +1840,10 @@ mod tests {
             let devm = mm_dev.forward(&xm.to_device(&dev)?)?;
             close(&dev1, &ref1, 1e-4, &format!("{what} gemv vs f32"));
             close(&devm, &refm, 1e-4, &format!("{what} gemm vs f32"));
+            // A dozen rows: the multi-row kernel for the expert dtypes, the
+            // dequantize + GEMM path for the rest.
+            let x12 = xm.narrow(0, 3, 12)?;
+            close(&mm_dev.forward(&x12.to_device(&dev)?)?, &x12.matmul(&w_ref.t()?)?, 1e-4, &format!("{what} 12 rows vs f32"));
             close(&dev1, &mm_cpu.forward(&x1)?, 2e-2, &format!("{what} gemv vs cpu"));
             close(&devm, &mm_cpu.forward(&xm)?, 2e-2, &format!("{what} gemm vs cpu"));
             let ids = Tensor::new(&[3u32, 0, 11, 3], &cpu)?;
@@ -1989,8 +1997,9 @@ mod tests {
         assert_eq!(q_dev.data()?.as_ref(), &bytes[..], "block bytes round-trip");
         close(&q_dev.dequantize(&dev)?, &w_ref, 0.0, "iq2xxs dequantize");
         let mm_dev = QMatMul::from_qtensor(q_dev)?;
-        // Both the fused GEMV (small m) and dequantize-then-GEMM (larger m).
-        for m in [1usize, 3, 4, 5, 17, 40] {
+        // Both the fused GEMV (m <= 16, decoded once per weight) and
+        // dequantize-then-GEMM (larger m).
+        for m in [1usize, 3, 4, 5, 12, 16, 17, 40] {
             let x = Tensor::arange(0f32, (m * k) as f32, &cpu)?.affine(1.7e-3, -0.6)?.sin()?.reshape((m, k))?;
             let want = x.matmul(&w_ref.t()?)?;
             close(&mm_dev.forward(&x.to_device(&dev)?)?, &want, 1e-4, &format!("iq2xxs qmatmul m={m}"));
@@ -2001,6 +2010,23 @@ mod tests {
         }
         let ids = Tensor::new(&[5u32, 0, 23, 5], &cpu)?;
         close(&mm_dev.embedding(&ids.to_device(&dev)?)?, &w_ref.index_select(&ids, 0)?, 0.0, "iq2xxs embedding");
+
+        // A column count that is not a multiple of the kernel's columns per
+        // work-group, a single-block row (K = 256) and the real expert
+        // shape's K = 4096 (one column per group).
+        for (n2, k2) in [(25usize, 512usize), (7, 256), (5, 4096)] {
+            let blocks: Vec<BlockIq2Xxs> = (0..n2 * k2 / 256).map(|i| synthetic_block(i as u32 + 100)).collect();
+            let bytes: Vec<u8> = blocks.iter().flat_map(|b| { let mut v = b.d.to_vec(); v.extend_from_slice(&b.qs); v }).collect();
+            let mut w = vec![0f32; n2 * k2];
+            BlockIq2Xxs::to_float(&blocks, &mut w);
+            let w_ref = Tensor::from_vec(w, (n2, k2), &cpu)?;
+            let q = QTensor::new(QStorage::from_data(std::borrow::Cow::Borrowed(&bytes), &dev, GgmlDType::Iq2Xxs)?, (n2, k2))?;
+            let mm = QMatMul::from_qtensor(q)?;
+            for m in [1usize, 2, 9, 16] {
+                let x = Tensor::arange(0f32, (m * k2) as f32, &cpu)?.affine(3.1e-3, -0.4)?.sin()?.reshape((m, k2))?;
+                close(&mm.forward(&x.to_device(&dev)?)?, &x.matmul(&w_ref.t()?)?, 1e-4, &format!("iq2xxs qmatmul n={n2} k={k2} m={m}"));
+            }
+        }
 
         // Transfer-queue upload: identical storage, usable from the compute queue.
         let ocl = dev.as_opencl_device()?;

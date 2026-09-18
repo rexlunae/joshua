@@ -1118,6 +1118,103 @@ void k_qgemv(__global const float* X, __global const uchar* W, __global float* C
     if (t == 0) C[coff + (long)m * N + n] = sh[0];
 }
 
+// Multi-row quantized GEMV for the 256-element block formats the routed
+// experts use (IQ2_XXS, Q2_K): C[m, n] = sum_k X[m, k] * W[n, k] for every
+// row m < M (M <= 16) with each weight decoded ONCE.  A work-group handles
+// `cols` output columns; the LPC = WG / cols lanes of a column each own
+// whole 8-element groups (one IQ2_XXS grid code, a quarter of a Q2_K
+// sub-block), so a lane decodes 8 weights into a float8 and multiplies them
+// against a float8 of every row's activations — adjacent lanes read
+// adjacent activations (coalesced) and the per-row cost is one vector
+// FMA per group instead of a fresh decode.  Column sums are reduced
+// through local memory for all M rows at once.
+inline void dequant8(int qt, __global const uchar* blk, int j, int l, float* w) {
+    if (qt == QT_IQ2_XXS) {
+        // Sub-block j: 4 u16 codes at bytes 2 + 8j; lo = codes, hi = signs + scale.
+        float d = f16_at(blk);
+        uchar4 lo4 = vload4(0, blk + 2 + j * 8);
+        uchar4 hi4 = vload4(0, blk + 6 + j * 8);
+        uint hi = (uint)hi4.x | ((uint)hi4.y << 8) | ((uint)hi4.z << 16) | ((uint)hi4.w << 24);
+        float db = d * (0.5f + (float)(hi >> 28)) * 0.25f;
+        uchar code = (l == 0) ? lo4.x : (l == 1) ? lo4.y : (l == 2) ? lo4.z : lo4.w;
+        ulong g = IQ2XXS_GRID[code];
+        uchar signs = KSIGNS_IQ2XS[(hi >> (7 * l)) & 127];
+        for (int v = 0; v < 8; v++) {
+            char gv = (char)((g >> (8 * v)) & 0xFFUL);
+            w[v] = (signs & (uchar)(1 << v)) ? -db * (float)gv : db * (float)gv;
+        }
+    } else {
+        // Q2_K: sub-block j = (hh, m); its two 16-element halves have their
+        // own (scale, min); group l covers qs[8l .. 8l+8) of half l>>1.
+        int hh = j >> 2, m = j & 3;
+        uchar sc = blk[8 * hh + 2 * m + (l >> 1)];
+        float d = f16_at(blk + 80), dmin = f16_at(blk + 82);
+        float dl = d * (float)(sc & 0xF), ml = dmin * (float)(sc >> 4);
+        int shift = 2 * m;
+        uchar8 q = vload8(0, blk + 16 + 32 * hh + 8 * l);
+        w[0] = dl * (float)((q.s0 >> shift) & 3) - ml;
+        w[1] = dl * (float)((q.s1 >> shift) & 3) - ml;
+        w[2] = dl * (float)((q.s2 >> shift) & 3) - ml;
+        w[3] = dl * (float)((q.s3 >> shift) & 3) - ml;
+        w[4] = dl * (float)((q.s4 >> shift) & 3) - ml;
+        w[5] = dl * (float)((q.s5 >> shift) & 3) - ml;
+        w[6] = dl * (float)((q.s6 >> shift) & 3) - ml;
+        w[7] = dl * (float)((q.s7 >> shift) & 3) - ml;
+    }
+}
+
+#define QGEMV_MR_MAX_ROWS 16
+
+__kernel __attribute__((reqd_work_group_size(WG, 1, 1)))
+void k_qgemv_mr(__global const float* X, __global const uchar* W, __global float* C,
+                int N, int K, int qt, int bsz, ulong woff, int xoff, int coff, int M, int cols) {
+    __local float sh[QGEMV_MR_MAX_ROWS * WG];
+    int t = get_local_id(0);
+    int lpc = WG / cols;                 // lanes per column
+    int c = t / lpc;                     // this lane's column within the group
+    int lane = t - c * lpc;
+    int n = get_group_id(0) * cols + c;
+    int ngroups = K / 8;                 // 8-element groups per row
+    float acc[QGEMV_MR_MAX_ROWS];
+    for (int m = 0; m < QGEMV_MR_MAX_ROWS; m++) acc[m] = 0.0f;
+    if (n < N) {
+        __global const uchar* row = W + woff + (ulong)n * (ulong)(K / 256) * (ulong)bsz;
+        __global const float* x = X + xoff;
+        float w[8];
+        for (int g = lane; g < ngroups; g += lpc) {
+            int b = g >> 5;                       // 256-element block
+            int j = (g >> 2) & 7;                 // 32-element sub-block
+            int l = g & 3;                        // 8-element group
+            dequant8(qt, row + (ulong)b * bsz, j, l, w);
+            float8 wv = (float8)(w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+            __global const float* xg = x + g * 8;
+            if (M == 1) {
+                float8 xv = vload8(0, xg);
+                acc[0] += dot(wv.lo, xv.lo) + dot(wv.hi, xv.hi);
+            } else {
+                #pragma unroll
+                for (int m = 0; m < QGEMV_MR_MAX_ROWS; m++) {
+                    if (m < M) {
+                        float8 xv = vload8(0, xg + (long)m * K);
+                        acc[m] += dot(wv.lo, xv.lo) + dot(wv.hi, xv.hi);
+                    }
+                }
+            }
+        }
+    }
+    for (int m = 0; m < M; m++) sh[m * WG + t] = acc[m];
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int s = lpc / 2; s > 0; s >>= 1) {
+        if (lane < s) {
+            for (int m = 0; m < M; m++) sh[m * WG + t] += sh[m * WG + t + s];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (lane == 0 && n < N) {
+        for (int m = 0; m < M; m++) C[coff + (long)m * N + n] = sh[m * WG + t];
+    }
+}
+
 // Half / bf16 weight GEMV (no blocks): C[m, n] = sum_k X[m,k] * W[n,k].
 __kernel __attribute__((reqd_work_group_size(WG, 1, 1)))
 void k_hgemv(__global const float* X, __global const uchar* W, __global float* C,

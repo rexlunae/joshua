@@ -913,10 +913,45 @@ fn check_block_k(k: usize, block: usize, what: &str) -> Result<()> {
     Ok(())
 }
 
+/// Rows the multi-row kernel accumulates per launch (`QGEMV_MR_MAX_ROWS`).
+pub const QGEMV_MR_MAX_ROWS: usize = 16;
+
+/// Whether `dtype` has a lane-level decoder in `k_qgemv_mr` (the routed
+/// experts' formats).  `JOSHUA_OPENCL_QGEMV=v1` forces the one-row kernel
+/// for every dtype (a bisect switch for a wrong result on one driver).
+pub fn qgemv_multirow(dtype: crate::quantized::GgmlDType) -> bool {
+    use crate::quantized::GgmlDType::*;
+    static V1: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let forced_v1 = *V1.get_or_init(|| matches!(std::env::var("JOSHUA_OPENCL_QGEMV"), Ok(s) if s.eq_ignore_ascii_case("v1")));
+    !forced_v1 && matches!(dtype, Iq2Xxs | Q2K)
+}
+
+/// Output columns one `k_qgemv_mr` work-group handles: enough that every
+/// lane owns at least one 8-element group of its column (`K / 8` groups per
+/// column), capped at 8 so a group never spans more than 8 columns.
+fn qgemv_mr_cols(k: usize, wg: usize) -> usize {
+    let groups = k / 8;
+    let mut cols = 1;
+    while cols < 8 && groups * cols < wg {
+        cols *= 2;
+    }
+    cols
+}
+
 /// `C[m, n] = sum_k X[m, k] * W[n, k]` over block-quantized `W` (`[N, K]`).
 #[allow(clippy::too_many_arguments)]
 pub fn run_qgemv(c: &Ctx, dtype: crate::quantized::GgmlDType, x: usize, w: usize, out: usize, m: usize, n: usize, k: usize, woff: u64, xoff: usize) -> Result<()> {
     check_block_k(k, dtype.block_size(), "qgemv")?;
+    if m <= QGEMV_MR_MAX_ROWS && qgemv_multirow(dtype) {
+        let mut kn = c.kernel("k_qgemv_mr")?;
+        let wg = kn.wg;
+        let cols = qgemv_mr_cols(k, wg);
+        kn.buf(x)?.buf(w)?.buf(out)?
+            .val(to_i32(n)?)?.val(to_i32(k)?)?
+            .val(qtype_code(dtype))?.val(to_i32(dtype.type_size())?)?
+            .val(woff)?.val(to_i32(xoff)?)?.val(0i32)?.val(to_i32(m)?)?.val(to_i32(cols)?)?;
+        return kn.run(&[n.div_ceil(cols) * wg], Some(&[wg]));
+    }
     let mut kn = c.kernel("k_qgemv")?;
     let wg = kn.wg;
     kn.buf(x)?.buf(w)?.buf(out)?
