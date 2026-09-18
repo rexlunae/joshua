@@ -1191,7 +1191,7 @@ impl Engine {
         // what (deepseek4: IQ2_XXS has no device kernel) are resolved as
         // host placement so the device accounting below matches what the
         // loader actually uploads.
-        let experts_host_only = arch.is_some_and(|a| a.experts_always_on_host());
+        let experts_host_only = arch.is_some_and(|a| a.experts_always_on_host_for(&device));
         let requested_placement = if experts_host_only {
             if !device.is_cpu() && options.expert_placement == ExpertPlacement::Device {
                 tracing::info!(
@@ -1207,7 +1207,7 @@ impl Engine {
             requested_placement,
             crate::placement::DeviceProfile {
                 is_cpu: device.is_cpu(),
-                dense_only: device.is_opencl() || device.is_vulkan(),
+                dense_only: device.is_vulkan(),
                 free_bytes: device_budget,
             },
             dense_device_bytes,

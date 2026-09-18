@@ -246,8 +246,23 @@ impl Architecture {
     /// them from the mapping on the CPU and runs only the dense set on the
     /// device; an `ExpertPlacement::Device` request cannot change that and
     /// must not be accounted as if it had.
+    ///
+    /// Exception: on an OpenCL device (e.g. an Arc discrete GPU) there IS an
+    /// IQ2_XXS kernel (`crate::iq2xxs` OpenCL fused GEMV), so experts may
+    /// target the device there.  See [`Self::experts_always_on_host_for`].
     pub fn experts_always_on_host(&self) -> bool {
         matches!(self, Self::DeepSeek4)
+    }
+
+    /// Whether the routed experts must stay in host RAM *given the active
+    /// device*.  `DeepSeek4` experts may run on an OpenCL device (which has
+    /// the IQ2_XXS kernel); on every other device (CPU, Vulkan, Metal, CUDA)
+    /// they are host-only.  Non-MoE architectures never force host experts.
+    pub fn experts_always_on_host_for(&self, device: &Device) -> bool {
+        match self {
+            Self::DeepSeek4 => !device.is_opencl(),
+            _ => false,
+        }
     }
 
     pub fn is_known_llama_cpp_arch(name: &str) -> bool {

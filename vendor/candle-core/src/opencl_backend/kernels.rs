@@ -751,6 +751,21 @@ pub fn run_qgemv(c: &Ctx, dtype: crate::quantized::GgmlDType, x: usize, w: usize
     kn.run(&[n * wg, m], Some(&[wg, 1]))
 }
 
+/// `C[m, n] = sum_k X[m, k] * W[n, k]` over IQ2_XXS block-quantized `W`
+/// (`[N, K]`).  IQ2_XXS has no `GgmlDType`, so the quant / block-size / block
+/// bytes are hardcoded: qt=16 (QT_IQ2_XXS), qk=256 elements/block,
+/// bsz=66 bytes/block.
+#[allow(clippy::too_many_arguments)]
+pub fn run_iq2xxs_qgemv(c: &Ctx, x: usize, w: usize, out: usize, m: usize, n: usize, k: usize, woff: u64, xoff: usize) -> Result<()> {
+    let mut kn = c.kernel("k_qgemv")?;
+    let wg = kn.wg;
+    kn.buf(x)?.buf(w)?.buf(out)?
+        .val(to_i32(n)?)?.val(to_i32(k)?)?
+        .val(16i32)?.val(256i32)?.val(66i32)?
+        .val(woff)?.val(to_i32(xoff)?)?.val(0i32)?.val(to_i32(m)?)?;
+    kn.run(&[n * wg, m], Some(&[wg, 1]))
+}
+
 /// `C[m, n] = sum_k X[m, k] * W[n, k]` over f16 / bf16 `W`.
 #[allow(clippy::too_many_arguments)]
 pub fn run_hgemv(c: &Ctx, bf16: bool, x: usize, w: usize, out: usize, m: usize, n: usize, k: usize, woff: u64, xoff: usize) -> Result<()> {

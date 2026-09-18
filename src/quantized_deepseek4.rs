@@ -1865,13 +1865,13 @@ impl ModelWeights {
         n_ctx: usize,
     ) -> Result<Self> {
         let cfg = Config::from_metadata(&ct.metadata)?;
-        // Routed experts stay on the CPU whenever the model is memory-mapped,
-        // even if the rest of the model is going to an accelerator: each
-        // expert is borrowed from the mapping as `QStorage::Cpu`, and the
-        // IQ2_XXS gate/up weights have no GPU kernel anyway.  The dense set
-        // (embeddings, attention, norms, routers, shared experts, output —
-        // ~8 GiB for V4-Flash) is what benefits from the device.
-        let expert_device = if mmap.is_some() {
+        // Routed experts stay on the CPU whenever the model is memory-mapped
+        // AND the active device has no IQ2_XXS kernel.  On an OpenCL device
+        // (e.g. Arc discrete GPU) `crate::iq2xxs` provides a fused OpenCL
+        // GEMV kernel, so the experts may target the device too; the dense
+        // set (embeddings, attention, norms, routers, shared experts, output)
+        // still benefits the most.  Vulkan/Metal/CUDA host-only for IQ2.
+        let expert_device = if mmap.is_some() && !device.is_opencl() {
             Device::Cpu
         } else {
             device.clone()

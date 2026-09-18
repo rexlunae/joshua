@@ -344,6 +344,38 @@ impl OpenClDevice {
         let buffer = create_buffer(self.context(), bytes.max(1), cl::CL_MEM_READ_WRITE)?;
         Ok(OpenClStorage { buffer, dtype, numel, device: self.clone() })
     }
+
+    /// Allocate a raw byte buffer (no `GgmlDType`) for weights like IQ2_XXS
+    /// that candle has no dtype for.  The `OpenClStorage`'s dtype is a F32
+    /// placeholder; only the buffer handle and byte_offset are consulted
+    /// when feeding raw block bytes to the quantized kernels.
+    pub fn alloc_raw(&self, n_bytes: usize) -> Result<OpenClStorage> {
+        let bytes = n_bytes.max(1);
+        let buffer = create_buffer(self.context(), bytes, cl::CL_MEM_READ_WRITE)?;
+        // F32 placeholder element count (only the byte buffer is meaningful).
+        let numel = (n_bytes + 3) / 4;
+        Ok(OpenClStorage { buffer, dtype: DType::F32, numel, device: self.clone() })
+    }
+
+    /// Synchronously copy `bytes` into `buffer` (raw, not dtype-aware — for
+    /// uploading block-quantized weights candle has no `GgmlDType` for).
+    pub fn write_raw_bytes(&self, buffer: usize, bytes: &[u8]) -> Result<()> {
+        unsafe { write_buffer(self.queue(), buffer, bytes.len(), bytes.as_ptr()) }
+    }
+
+    /// Synchronously copy `bytes` out of `buffer`.
+    pub fn read_raw_bytes(&self, buffer: usize, bytes: &mut [u8]) -> Result<()> {
+        unsafe { read_buffer(self.queue(), buffer, 0, bytes.len(), bytes.as_mut_ptr()) }
+    }
+
+    /// Block until all queued kernels on `self.queue` complete.
+    pub fn synchronize(&self) -> Result<()> {
+        let e = unsafe { clFinish(self.queue()) };
+        if e != cl::CL_SUCCESS {
+            return Err(opencl_error(e, "clFinish"));
+        }
+        Ok(())
+    }
 }
 
 /// An OpenCL storage: a raw `cl_mem` device buffer + dtype + element count.
@@ -1792,4 +1824,5 @@ mod tests {
         }
         Ok(())
     }
+
 }

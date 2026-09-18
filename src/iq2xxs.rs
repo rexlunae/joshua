@@ -901,3 +901,58 @@ mod tests {
         }
     }
 }
+
+
+// ─── OpenCL-accelerated IQ2_XXS matmul (Arc-family discrete GPUs) ───────────
+
+/// Run the IQ2_XXS fused dequant+GEMV on an OpenCL device, when one is given.
+///
+/// `device` must be an `OpenCl` device (e.g. the Arc B50 Pro).  Uploads
+/// `rhs`'s 66-byte blocks once, launches candle-core's `run_iq2xxs_qgemv`
+/// kernel (the `k_qgemv` + IQ2_XXS dequant branch), and writes
+/// `dst[m, n] = lhs[m, k] · rhs[n, k]ᵀ`.  Returns `Ok(false)` when the device
+/// isn't OpenCL so the caller falls back to the CPU `matmul_t`.
+#[cfg(feature = "opencl")]
+pub fn try_opencl_matmul(
+    device: &candle_core::Device,
+    (m, k, n): (usize, usize, usize),
+    lhs: &[f32],
+    rhs: &[BlockIq2Xxs],
+    dst: &mut [f32],
+) -> candle_core::Result<bool> {
+    use candle_core::opencl_backend as ocl;
+    validate_matmul_t((m, k, n), lhs, rhs, dst)?;
+    let dev = match device.as_opencl_device() {
+        Ok(d) => d,
+        Err(_) => return Ok(false), // not an OpenCL device: caller uses CPU matmul_t
+    };
+    let ctx = dev.ctx();
+
+    let x_bytes = m * k * 4;
+    let xbuf = dev.alloc_raw(x_bytes)?;
+    unsafe { dev.write_raw_bytes(xbuf.buffer, slice_bytes(lhs))? };
+
+    // rhs: 66 bytes per 256-elem block; contiguous `[BlockIq2Xxs]`.
+    let total = rhs.len() * BLOCK_BYTES;
+    let wbuf = dev.alloc_raw(total)?;
+    let raw: &[u8] =
+        unsafe { core::slice::from_raw_parts(rhs.as_ptr() as *const u8, total) };
+    unsafe { dev.write_raw_bytes(wbuf.buffer, raw)? };
+
+    let obuf = dev.alloc_raw(m * n * 4)?;
+    ocl::kernels::run_iq2xxs_qgemv(&ctx, xbuf.buffer, wbuf.buffer, obuf.buffer, m, n, k, 0, 0)?;
+    dev.synchronize()?;
+    unsafe { dev.read_raw_bytes(obuf.buffer, slice_bytes_mut(dst))? };
+    Ok(true)
+}
+
+/// Reinterpret `&[f32]` as `&[u8]` (for device uploads).
+#[cfg(feature = "opencl")]
+fn slice_bytes(x: &[f32]) -> &[u8] {
+    unsafe { core::slice::from_raw_parts(x.as_ptr() as *const u8, x.len() * 4) }
+}
+/// Reinterpret `&mut [f32]` as `&mut [u8]` (for device read-back).
+#[cfg(feature = "opencl")]
+fn slice_bytes_mut(x: &mut [f32]) -> &mut [u8] {
+    unsafe { core::slice::from_raw_parts_mut(x.as_mut_ptr() as *mut u8, x.len() * 4) }
+}
