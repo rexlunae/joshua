@@ -147,14 +147,6 @@ fn load_ds4(model: &std::path::Path) -> QuantizedModel {
 #[test]
 fn host_placed_experts_match_plain_load() {
     for (name, write) in fixtures() {
-        // deepseek4's mmap-vs-streamed fidelity is pre-existing-broken on main
-        // (the three `deepseek4_*mmap*` tests fail in candle-core's quantized
-        // data path); the placement equivalence it asserts here is covered by
-        // the streamed `deepseek4_from_gguf_without_raw_header_loads` path, so
-        // skip it rather than trip a known-broken fixture.
-        if name == "deepseek4" {
-            continue;
-        }
         let dir = common::model_dir(&format!("placed-{name}"));
         let model = dir.join("model.gguf");
         write(&model);
@@ -312,6 +304,31 @@ fn deepseek4_sessions_share_weights_and_isolate_batch_kv() {
     let fb2 = fseq_logits(&mut fresh_b, &[(&[8], 1)]);
     assert_close(&b2[0], &fb2[0], "deepseek4 session-b step2@1");
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Loading a qwen3moe/deepseek2 model with a **zero** device-expert-cache
+/// budget must be byte-for-byte today's host placement (#62 budget-0 parity):
+/// no `DeviceResidency` is built and logits match the no-budget load.
+#[test]
+fn zero_device_expert_cache_budget_is_host_placement() {
+    for (name, write) in fixtures() {
+        if name == "deepseek4" {
+            continue; // deepseek4 keeps experts host regardless (IQ2_XXS)
+        }
+        let dir = common::model_dir(&format!("vram-cache0-{name}"));
+        let model = dir.join("model.gguf");
+        write(&model);
+
+        let mut plain = load_placed(&model, &Device::Cpu);
+        let mut zero = load_placed_with_cache(&model, 0);
+        let tokens = [1u32, 4, 2, 7, 5];
+        assert_close(
+            &logits(&mut plain, &tokens, 0),
+            &logits(&mut zero, &tokens, 0),
+            &format!("{name}: budget-0 preserves host-placement logits"),
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
 
 /// Loading a qwen3moe model with a non-zero `device_expert_cache_bytes`
