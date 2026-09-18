@@ -3071,18 +3071,43 @@ fn split_experts<R: Read + Seek>(
     }
 
     let qt = rd.qtensor(name)?;
+    // Split the whole stacked tensor into per-expert slices for the storage of
+    // whatever `qt` actually holds.  The streamed (no-mmap) path decodes the
+    // weight to f32, so the storage dtype here is the *decoded* one, not the
+    // GGUF header dtype — slicing by the decoded dtype's block size is the only
+    // way the per-expert `QStorage::from_data` is block-aligned.  (The
+    // production mmap path takes the `borrowed_range` branch above and never
+    // reaches this fallback for a well-formed file.)
+    let storage_dtype = qt.dtype();
     let bytes = qt.data()?;
-    if bytes.len() % n_expert != 0 {
+    let block = storage_dtype.block_size();
+    let per_elems = out * inn;
+    let per_bytes = if block > 0 && per_elems.is_multiple_of(block) {
+        per_elems / block * storage_dtype.type_size()
+    } else {
+        // Unquantized (f32/f16/bf16) storage, or a block that doesn't divide the
+        // per-expert element count: each expert is `per_elems` contiguous
+        // `type_size`-byte elements.
+        per_elems
+            .checked_mul(storage_dtype.type_size())
+            .ok_or_else(|| candle_core::Error::Msg(format!("deepseek4: expert tensor `{name}` size overflow")))?
+    };
+    let total_needed = per_bytes
+        .checked_mul(n_expert)
+        .ok_or_else(|| candle_core::Error::Msg(format!("deepseek4: expert tensor `{name}` size overflow")))?;
+    if bytes.len() < total_needed {
         candle_core::bail!(
-            "deepseek4: expert tensor `{name}` byte length {} not divisible by n_expert {n_expert}",
-            bytes.len()
+            "deepseek4: expert tensor `{name}` byte length {} is smaller than the {} experts × {per_bytes} bytes needed",
+            bytes.len(),
+            n_expert
         );
     }
-    let per = bytes.len() / n_expert;
     let mut experts = Vec::with_capacity(n_expert);
     for e in 0..n_expert {
-        let slice = &bytes[e * per..(e + 1) * per];
-        let storage = QStorage::from_data(Cow::Borrowed(slice), &rd.expert_device, dtype)?;
+        let slice = &bytes[e * per_bytes..(e + 1) * per_bytes];
+        // Rebuild with the *storage* dtype, not the header dtype, so a decoded
+        // (f32) fallback storage is sliced consistently.
+        let storage = QStorage::from_data(Cow::Borrowed(slice), &rd.expert_device, storage_dtype)?;
         let qt = QTensor::new(storage, (out, inn))?;
         experts.push(ExpertTensor {
             qmatmul: QMatMul::from_qtensor(qt)?,
