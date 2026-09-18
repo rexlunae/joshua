@@ -11,6 +11,7 @@ mod dummy_metal;
 pub mod ggml_file;
 pub mod gguf_file;
 pub mod imatrix_file;
+pub mod iq2xxs;
 pub mod k_quants;
 #[cfg(feature = "metal")]
 pub mod metal;
@@ -38,6 +39,7 @@ pub mod simd128;
 pub mod utils;
 use half::{bf16, f16};
 
+pub use iq2xxs::BlockIq2Xxs;
 pub use k_quants::GgmlType;
 
 fn as_t_slice<T>(data: &[u8]) -> &[T] {
@@ -189,6 +191,7 @@ impl QStorage {
                 GgmlDType::Q5K => metal::load_quantized(d, as_t_slice::<BlockQ5K>(data)),
                 GgmlDType::Q6K => metal::load_quantized(d, as_t_slice::<BlockQ6K>(data)),
                 GgmlDType::Q8K => metal::load_quantized(d, as_t_slice::<BlockQ8K>(data)),
+                GgmlDType::Iq2Xxs => crate::bail!("IQ2_XXS weights are not supported on Metal"),
                 GgmlDType::BF16 => metal::load_quantized(d, as_t_slice::<bf16>(data)),
             },
             Device::Cuda(d) => match dtype {
@@ -206,6 +209,7 @@ impl QStorage {
                 GgmlDType::Q5K => cuda::load_quantized(d, as_t_slice::<BlockQ5K>(data)),
                 GgmlDType::Q6K => cuda::load_quantized(d, as_t_slice::<BlockQ6K>(data)),
                 GgmlDType::Q8K => cuda::load_quantized(d, as_t_slice::<BlockQ8K>(data)),
+                GgmlDType::Iq2Xxs => crate::bail!("IQ2_XXS weights are not supported on CUDA"),
                 GgmlDType::BF16 => cuda::load_quantized(d, as_t_slice::<bf16>(data)),
             },
             Device::OpenCl(d) => {
@@ -218,6 +222,22 @@ impl QStorage {
                 let elem_count = data.len() / dtype.type_size() * dtype.block_size();
                 Ok(QStorage::Vulkan(crate::QVulkanStorage::from_bytes(d, dtype, elem_count, data)?))
             }
+        }
+    }
+
+    /// [`QStorage::from_data`] for a background uploader: on an OpenCL
+    /// device the bytes go through the device's transfer queue
+    /// (`QOpenClStorage::from_bytes_transfer`), so the blocking write neither
+    /// waits for nor delays the compute queue's kernels; every other backend
+    /// is the plain `from_data`.
+    pub fn from_data_transfer(data: Cow<'_, [u8]>, device: &Device, dtype: GgmlDType) -> Result<Self> {
+        match device {
+            Device::OpenCl(d) => {
+                let data: &[u8] = &data;
+                let elem_count = data.len() / dtype.type_size() * dtype.block_size();
+                Ok(QStorage::OpenCl(crate::QOpenClStorage::from_bytes_transfer(d, dtype, elem_count, data)?))
+            }
+            _ => Self::from_data(data, device, dtype),
         }
     }
 
@@ -433,6 +453,8 @@ pub enum GgmlDType {
     Q5K,
     Q6K,
     Q8K,
+    /// 2.0625-bit trellis blocks (ggml type 16), see [`iq2xxs`].
+    Iq2Xxs,
 }
 
 impl GgmlDType {
@@ -452,6 +474,7 @@ impl GgmlDType {
             13 => Self::Q5K,
             14 => Self::Q6K,
             15 => Self::Q8K,
+            16 => Self::Iq2Xxs,
             // https://github.com/ggerganov/ggml/blob/29d87fc6676e7ed0cdfdec0804b06001d9c2bb44/include/ggml.h#L389
             30 => Self::BF16,
             _ => crate::bail!("unknown dtype for tensor {u}"),
@@ -475,6 +498,7 @@ impl GgmlDType {
             Self::Q5K => 13,
             Self::Q6K => 14,
             Self::Q8K => 15,
+            Self::Iq2Xxs => 16,
             // https://github.com/ggerganov/ggml/blob/29d87fc6676e7ed0cdfdec0804b06001d9c2bb44/include/ggml.h#L389
             Self::BF16 => 30,
         }
@@ -497,6 +521,7 @@ impl GgmlDType {
             Self::Q5K => Box::new(vec![BlockQ5K::zeros(); elem_count / BlockQ5K::BLCK_SIZE]),
             Self::Q6K => Box::new(vec![BlockQ6K::zeros(); elem_count / BlockQ6K::BLCK_SIZE]),
             Self::Q8K => Box::new(vec![BlockQ8K::zeros(); elem_count / BlockQ8K::BLCK_SIZE]),
+            Self::Iq2Xxs => Box::new(vec![BlockIq2Xxs::zeros(); elem_count / BlockIq2Xxs::BLCK_SIZE]),
             Self::BF16 => Box::new(vec![bf16::zeros(); elem_count]),
         }
     }
@@ -518,6 +543,7 @@ impl GgmlDType {
             Self::Q5K => Box::new(as_t_slice::<BlockQ5K>(data).to_vec()),
             Self::Q6K => Box::new(as_t_slice::<BlockQ6K>(data).to_vec()),
             Self::Q8K => Box::new(as_t_slice::<BlockQ8K>(data).to_vec()),
+            Self::Iq2Xxs => Box::new(as_t_slice::<BlockIq2Xxs>(data).to_vec()),
             Self::BF16 => Box::new(as_t_slice::<bf16>(data).to_vec()),
         }
     }
@@ -541,6 +567,7 @@ impl GgmlDType {
             Self::Q5K => std::mem::size_of::<BlockQ5K>(),
             Self::Q6K => std::mem::size_of::<BlockQ6K>(),
             Self::Q8K => std::mem::size_of::<BlockQ8K>(),
+            Self::Iq2Xxs => std::mem::size_of::<BlockIq2Xxs>(),
         }
     }
 
@@ -555,7 +582,7 @@ impl GgmlDType {
             Self::Q5_1 => k_quants::QK5_1,
             Self::Q8_0 => k_quants::QK8_0,
             Self::Q8_1 => k_quants::QK8_1,
-            Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K | Self::Q8K => k_quants::QK_K,
+            Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K | Self::Q8K | Self::Iq2Xxs => k_quants::QK_K,
         }
     }
 }
@@ -680,6 +707,11 @@ impl QTensor {
     }
 
     pub fn quantize(src: &Tensor, dtype: GgmlDType) -> Result<Self> {
+        if dtype == GgmlDType::Iq2Xxs {
+            crate::bail!(
+                "IQ2_XXS cannot be quantized from float: it needs an importance matrix (use llama.cpp's quantizer)"
+            )
+        }
         let shape = src.shape();
         let block_size = dtype.block_size();
         check_shape(shape, block_size)?;

@@ -1429,6 +1429,11 @@ impl std::fmt::Debug for QVulkanStorage {
 
 impl QVulkanStorage {
     fn bytes_for(dtype: GgmlDType, elem_count: usize) -> Result<usize> {
+        if dtype == GgmlDType::Iq2Xxs {
+            // The GLSL `dequant_sub` has no IQ2_XXS case; refuse at upload so
+            // the op takes the CPU path instead of decoding garbage.
+            return Err(Error::Msg("vulkan: IQ2_XXS weights are not supported on this backend".into()));
+        }
         let bs = dtype.block_size();
         if !elem_count.is_multiple_of(bs) {
             return Err(Error::Msg(format!("vulkan: {elem_count} elements is not a whole number of {dtype:?} blocks")));

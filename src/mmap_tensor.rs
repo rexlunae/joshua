@@ -204,12 +204,11 @@ impl<T: GgmlType + Send + Sync> QuantizedType for MmapBlocks<T> {
 
 /// IQ2_XXS blocks borrowed from the mapping.
 ///
-/// Candle's `GgmlDType` has no IQ2_XXS variant, so this cannot be expressed
-/// as `MmapBlocks<T: GgmlType>`.  `dtype()` returns a placeholder: the only
-/// consumer comparing it is `QMatMul::from_qtensor`, which distinguishes
-/// f32/f16/bf16 (dequantise eagerly) from everything else (keep as QTensor),
-/// and the aarch64 Q4K repack path that this deliberately is not.  The real
-/// dtype travels alongside the raw header instead.
+/// Deliberately not `MmapBlocks<BlockIq2Xxs>`: candle's `GgmlType` impl for
+/// the block is the reference decode (Q8_K activations), while this storage
+/// runs [`crate::iq2xxs::matmul_t`], the fused f32 AVX2 kernel.  Its dtype is
+/// the real one so a device upload of these bytes (`QStorage::from_data`
+/// with `qt.dtype()`) lands as IQ2_XXS device storage.
 pub struct MmapBlocksIq2Xxs {
     /// Keeps the mapping alive; never dereferenced directly.
     _mmap: Arc<Mmap>,
@@ -290,6 +289,8 @@ pub fn prefetch_handle(
         GgmlDType::Q5K => handle!(k_quants::BlockQ5K),
         GgmlDType::Q6K => handle!(k_quants::BlockQ6K),
         GgmlDType::Q8K => handle!(k_quants::BlockQ8K),
+        // The IQ2_XXS mmap form is `MmapBlocksIq2Xxs` (`prefetch_handle_iq2xxs`).
+        GgmlDType::Iq2Xxs => None,
     }
 }
 
@@ -441,7 +442,7 @@ impl QuantizedType for MmapBlocksMxfp4 {
 
 impl QuantizedType for MmapBlocksIq2Xxs {
     fn dtype(&self) -> GgmlDType {
-        GgmlDType::Q2K // placeholder; see struct docs
+        GgmlDType::Iq2Xxs
     }
 
     fn matmul_t(&self, mkn: (usize, usize, usize), lhs: &[f32], dst: &mut [f32]) -> Result<()> {
@@ -649,6 +650,11 @@ pub fn borrowed_range(
         GgmlDType::Q5K => Box::new(borrow!(k_quants::BlockQ5K)),
         GgmlDType::Q6K => Box::new(borrow!(k_quants::BlockQ6K)),
         GgmlDType::Q8K => Box::new(borrow!(k_quants::BlockQ8K)),
+        // The IQ2_XXS mmap form is `MmapBlocksIq2Xxs` (`borrowed_range_iq2xxs`),
+        // which keeps the fused AVX2 matmul instead of candle's reference decode.
+        GgmlDType::Iq2Xxs => candle_core::bail!(
+            "IQ2_XXS tensors are borrowed with `borrowed_range_iq2xxs`, not the generic block borrow"
+        ),
     };
 
     QTensor::new(QStorage::Cpu(storage), shape).map(Some)

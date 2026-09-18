@@ -1200,3 +1200,9 @@ void k_qembed(__global const uchar* W, __global const uint* ids, __global float*
         for (int i = 0; i < 32; i++) o[s * 32 + i] = buf[i];
     }
 }
+
+// Diagnostic (JOSHUA_OPENCL_CHECK_NAN): count the NaNs in an f32 buffer.
+__kernel void k_count_nan(__global const float* x, __global uint* cnt, int n) {
+    int i = get_global_id(0);
+    if (i < n && isnan(x[i])) atomic_inc(cnt);
+}

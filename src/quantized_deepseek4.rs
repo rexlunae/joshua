@@ -1360,11 +1360,6 @@ struct Moe {
     /// larger than the VRAM of the cards that can run the dense set.
     /// [`Moe::dispatch`] runs the whole block there and moves the result back.
     expert_device: Device,
-    /// Optional OpenCL IQ2 accelerator: when `expert_device` is an OpenCl
-    /// device, the routed gate/up IQ2 matmuls run on it with per-expert
-    /// device-resident weights (batched, transfer-amortized). `None` keeps the
-    /// CPU SIMD path byte-for-byte.
-    iq2_opencl: Option<std::sync::Arc<Iq2OpenClAccel>>,
 }
 
 impl Moe {
@@ -1492,35 +1487,14 @@ impl Moe {
         // whole batch are a few hundred KiB.
         let mut gates: Vec<Option<Tensor>> = vec![None; self.experts.len()];
         let mut ups: Vec<Option<Tensor>> = vec![None; self.experts.len()];
-        if let Some(accel) = &self.iq2_opencl {
-            // OpenCL IQ2 accelerator: run the active experts' gate+up IQ2
-            // matmuls on the device with resident weights (batched, no
-            // per-expert sync), then move results back to `dev` for the Q2_K
-            // down projection.  `x_sel` is already on the OpenCl device.
-            for (e, s) in sel.iter().enumerate() {
-                if let Some((_, x_sel)) = s {
-                    let (g, u) = accel.gate_up(
-                        e as u32,
-                        &self.experts[e].gate,
-                        &self.experts[e].up,
-                        x_sel,
-                    )?;
-                    let g = crate::moe::on_device(&g, dev)?;
-                    let u = crate::moe::on_device(&u, dev)?;
-                    gates[e] = Some(g.into_owned());
-                    ups[e] = Some(u.into_owned());
-                }
+        for (e, s) in sel.iter().enumerate() {
+            if let Some((_, x_sel)) = s {
+                gates[e] = Some(self.experts[e].gate_forward(x_sel)?);
             }
-        } else {
-            for (e, s) in sel.iter().enumerate() {
-                if let Some((_, x_sel)) = s {
-                    gates[e] = Some(self.experts[e].gate_forward(x_sel)?);
-                }
-            }
-            for (e, s) in sel.iter().enumerate() {
-                if let Some((_, x_sel)) = s {
-                    ups[e] = Some(self.experts[e].up_forward(x_sel)?);
-                }
+        }
+        for (e, s) in sel.iter().enumerate() {
+            if let Some((_, x_sel)) = s {
+                ups[e] = Some(self.experts[e].up_forward(x_sel)?);
             }
         }
         for (e, s) in sel.iter().enumerate() {
@@ -3003,8 +2977,7 @@ fn load_moe<R: Read + Seek>(
         None
     };
 
-    let iq2_opencl = Iq2OpenClAccel::new(&rd.expert_device).map(std::sync::Arc::new);
-        Ok(Moe {
+    Ok(Moe {
         gate,
         gate_bias,
         tid2eid,
@@ -3014,7 +2987,6 @@ fn load_moe<R: Read + Seek>(
         weights_scale: cfg.expert_weights_scale,
         hash,
         expert_device: rd.expert_device.clone(),
-        iq2_opencl: Iq2OpenClAccel::new(&rd.expert_device).map(std::sync::Arc::new),
     })
 }
 
@@ -3206,102 +3178,5 @@ mod tests {
             msg.contains("rope"),
             "error should name the rotary-dimension metadata, got: {msg}"
         );
-    }
-}
-// ─── OpenCL IQ2 accelerator for the routed gate/up experts ──────────────────
-#[cfg(feature = "opencl")]
-struct Iq2OpenClAccel {
-    dev: candle_core::OpenClDevice,
-    /// Per-expert cached (gate, up) device weights.  Keyed by expert index in
-    /// [0, n_expert); one `Moe` is a layer, so indices are layer-local.
-    cache: std::sync::Mutex<std::collections::HashMap<u32, (crate::iq2xxs::Iq2OpenClWeight, crate::iq2xxs::Iq2OpenClWeight)>>,
-}
-
-#[cfg(feature = "opencl")]
-impl Iq2OpenClAccel {
-    fn new(device: &Device) -> Option<Self> {
-        Some(Self { dev: device.as_opencl_device().ok()?.clone(), cache: Default::default() })
-    }
-
-    /// Run expert `e`'s IQ2 gate and up matmuls over the on-device activation
-    /// `xs` (`[1 or m, k]`, f32, on the OpenCl device), returning `(gate, up)`
-    /// both `[m, n]` on the device.  Weights upload once (cached), kernels are
-    /// enqueued (no per-expert sync); the caller batches many experts then syncs.
-    fn gate_up(
-        &self,
-        e: u32,
-        gate: &QMatMul,
-        up: &QMatMul,
-        xs: &Tensor,
-    ) -> Result<(Tensor, Tensor)> {
-        let mut cache = self.cache.lock().unwrap();
-        let pair = if let Some(p) = cache.get(&e) {
-            p.clone()
-        } else {
-            let g = iq2_weight_from_qmatmul(&self.dev, gate)?;
-            let u = iq2_weight_from_qmatmul(&self.dev, up)?;
-            cache.insert(e, (g.clone(), u.clone()));
-            (g, u)
-        };
-        drop(cache);
-        let g = pair.0.matmul(&self.dev, xs)?;
-        let u = pair.1.matmul(&self.dev, xs)?;
-        Ok((g, u))
-    }
-}
-
-/// Build a resident [`crate::iq2xxs::Iq2OpenClWeight`] from `m`'s IQ2 blocks.
-/// `m` must be a `QMatMul::QTensor` whose storage is the CPU-borrowed
-/// `MmapBlocksIq2Xxs` (the blocks this expert borrows from the mapping).
-#[cfg(feature = "opencl")]
-fn iq2_weight_from_qmatmul(
-    dev: &candle_core::OpenClDevice,
-    m: &QMatMul,
-) -> Result<crate::iq2xxs::Iq2OpenClWeight> {
-    use candle_core::quantized::QuantizedType;
-    let qt = match m {
-        QMatMul::QTensor(qt) => qt.clone(),
-        QMatMul::Tensor(_) | QMatMul::TensorF16(_) => {
-            candle_core::bail!("deepseek4 opencl: expert weight is not IQ2 blocks")
-        }
-    };
-    let (n, k) = dims2_of(qt.shape())?;
-    let data = qt.data()?; // borrowed block bytes (IQ2), contiguous
-    let block_bytes = data.len();
-    let n_blocks = block_bytes / crate::iq2xxs::BLOCK_BYTES;
-    // Reinterpret as BlockIq2Xxs and upload.
-    let blocks: &[crate::iq2xxs::BlockIq2Xxs] = unsafe {
-        core::slice::from_raw_parts(data.as_ptr() as *const crate::iq2xxs::BlockIq2Xxs, n_blocks)
-    };
-    crate::iq2xxs::Iq2OpenClWeight::upload(dev, blocks, n, k)
-}
-
-#[cfg(feature = "opencl")]
-fn dims2_of(s: &candle_core::Shape) -> Result<(usize, usize)> {
-    let d = s.dims();
-    if d.len() != 2 {
-        candle_core::bail!("deepseek4 opencl: expected a 2-D expert weight, got {d:?}");
-    }
-    Ok((d[0], d[1]))
-}
-
-// Non-OpenCL stub: no accelerator exists (the CPU SIMD path is used as-is).
-#[cfg(not(feature = "opencl"))]
-struct Iq2OpenClAccel;
-#[cfg(not(feature = "opencl"))]
-impl Iq2OpenClAccel {
-    fn new(_device: &Device) -> Option<Self> {
-        None
-    }
-    // Never called (iq2_opencl is always None without the feature), but must
-    // exist so the dispatch branch compiles.
-    fn gate_up(
-        &self,
-        _e: u32,
-        _gate: &QMatMul,
-        _up: &QMatMul,
-        _xs: &Tensor,
-    ) -> Result<(Tensor, Tensor)> {
-        candle_core::bail!("deepseek4: OpenCL IQ2 accelerator unavailable (no opencl feature)")
     }
 }

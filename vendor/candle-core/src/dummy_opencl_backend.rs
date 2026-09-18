@@ -341,6 +341,9 @@ impl QOpenClStorage {
     pub fn from_bytes(_: &OpenClDevice, _: crate::quantized::GgmlDType, _: usize, _: &[u8]) -> Result<Self> {
         Err(Error::NotCompiledWithOpenClSupport)
     }
+    pub fn from_bytes_transfer(_: &OpenClDevice, _: crate::quantized::GgmlDType, _: usize, _: &[u8]) -> Result<Self> {
+        Err(Error::NotCompiledWithOpenClSupport)
+    }
     pub fn dtype(&self) -> crate::quantized::GgmlDType {
         fail!()
     }

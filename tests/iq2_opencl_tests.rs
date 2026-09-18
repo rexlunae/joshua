@@ -1,11 +1,17 @@
-//! OpenCL IQ2_XXS matmul parity (runs on an OpenCL host, e.g. the Arc B50 Pro).
-//! Validates that joshua::iq2xxs::try_opencl_matmul reproduces the CPU
-//! matmul_t reference for decode-shaped matmuls. Skips when no OpenCL device.
+//! IQ2_XXS on an OpenCL device: `QMatMul` over `QStorage::from_data(..,
+//! GgmlDType::Iq2Xxs)` (the form the deepseek4 expert cache uploads) must
+//! reproduce joshua's fused CPU kernel (`iq2xxs::matmul_t`, the host expert
+//! path) at the real expert shapes, for the decode GEMV and the prefill
+//! dequantize-then-GEMM paths alike.  Prints resident-weight timings so a run
+//! on real hardware (an Arc B50) shows the per-matmul cost next to the CPU.
+//! Skips when no OpenCL device (or runtime) is available.
 
 #![cfg(feature = "opencl")]
 
-use candle_core::Device;
-use joshua::iq2xxs::{matmul_t, try_opencl_matmul, BlockIq2Xxs, QK_IQ2_XXS};
+use candle_core::quantized::{GgmlDType, QMatMul, QStorage, QTensor};
+use candle_core::{Device, Module, Tensor};
+use half::f16;
+use joshua::iq2xxs::{matmul_t, BlockIq2Xxs, BLOCK_BYTES, QK_IQ2_XXS};
 
 fn device() -> Option<Device> {
     static D: std::sync::OnceLock<Option<Device>> = std::sync::OnceLock::new();
@@ -16,123 +22,178 @@ fn device() -> Option<Device> {
     .clone()
 }
 
-fn blocks_for(dims: (usize, usize, usize)) -> (Vec<BlockIq2Xxs>, usize) {
-    let (m, k, n) = dims;
-    let bpr = k / QK_IQ2_XXS;
-    let n_blocks = n * bpr;
+/// `n * k / 256` blocks with pseudo-random codes and signs and a *finite*
+/// fp16 scale (random scale bits would make NaN/Inf blocks, which say nothing
+/// about parity).
+fn blocks_for(k: usize, n: usize) -> Vec<BlockIq2Xxs> {
+    let n_blocks = n * k / QK_IQ2_XXS;
     let mut seed: u64 = 0xdead_beef_cafe_f00d;
     let mut rnd = move || {
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        (seed >> 33) as u8
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (seed >> 33) as u32
     };
-    // 66-byte block: scale(2) + codes(64).  Any bytes decode deterministically.
-    let bytes: Vec<u8> = (0..n_blocks * 66).map(|_| rnd()).collect();
-    let blocks: Vec<BlockIq2Xxs> = bytes
-        .chunks_exact(66)
-        .map(|c| BlockIq2Xxs {
-            d: [c[0], c[1]],
-            qs: c[2..66].try_into().unwrap(),
+    (0..n_blocks)
+        .map(|_| {
+            let mut qs = [0u8; 64];
+            for c in qs.chunks_exact_mut(4) {
+                c.copy_from_slice(&rnd().to_le_bytes());
+            }
+            let scale = f16::from_f32(1e-3 + (rnd() % 1000) as f32 * 1e-5);
+            BlockIq2Xxs {
+                d: scale.to_le_bytes(),
+                qs,
+            }
         })
-        .collect();
-    let _ = (m, bpr);
-    (blocks, n_blocks)
+        .collect()
 }
 
+fn block_bytes(blocks: &[BlockIq2Xxs]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(blocks.len() * BLOCK_BYTES);
+    for b in blocks {
+        out.extend_from_slice(&b.d);
+        out.extend_from_slice(&b.qs);
+    }
+    out
+}
+
+/// Worst error relative to the larger of the element and the output's mean
+/// magnitude: a 4096-term dot product that cancels to near zero differs
+/// between two f32 accumulation orders by the rounding noise of its *terms*,
+/// so a per-element relative error there measures nothing about the decode.
+fn worst_rel(got: &[f32], want: &[f32]) -> f32 {
+    assert_eq!(got.len(), want.len());
+    let mean_abs = want.iter().map(|w| w.abs()).sum::<f32>() / want.len().max(1) as f32;
+    got.iter()
+        .zip(want)
+        .map(|(g, w)| (g - w).abs() / w.abs().max(mean_abs).max(1e-6))
+        .fold(0.0f32, f32::max)
+}
+
+/// The uploaded IQ2_XXS weight agrees with the fused CPU kernel at the real
+/// expert shapes (gate/up: [2048, 4096]) for one row (decode), a few rows
+/// (the fused GEMV path) and many rows (the dequantize-then-GEMM path), and
+/// every device result is finite.
 #[test]
-fn opencl_iq2xxs_matches_cpu() {
+fn opencl_iq2xxs_qmatmul_matches_cpu_kernel() {
     let Some(dev) = device() else {
         eprintln!("SKIP: no OpenCL device");
         return;
     };
-    for (m, k, n) in [(1usize, 512usize, 1024usize), (1, 2048, 2048), (4, 4096, 2048)] {
-        let (blocks, _) = blocks_for((m, k, n));
-        let x: Vec<f32> = (0..m * k).map(|i| ((i % 29) as f32 - 14.0) * 0.03).collect();
-
-        let mut cpu = vec![0.0f32; m * n];
-        matmul_t((m, k, n), &x, &blocks, &mut cpu).unwrap();
-
-        let mut gpu = vec![0.0f32; m * n];
-        let ran = try_opencl_matmul(&dev, (m, k, n), &x, &blocks, &mut gpu).unwrap();
-        assert!(ran, "opencl matmul should run on an OpenCl device");
-
-        let mut worst = 0.0f32;
-        for i in 0..m * n {
-            let rel = (gpu[i] - cpu[i]).abs() / cpu[i].abs().max(1e-4);
-            worst = worst.max(rel);
+    let cpu = Device::Cpu;
+    for (k, n) in [(4096usize, 2048usize), (2048, 1024), (256, 64)] {
+        let blocks = blocks_for(k, n);
+        let bytes = block_bytes(&blocks);
+        let q = QTensor::new(
+            QStorage::from_data(std::borrow::Cow::Borrowed(&bytes), &dev, GgmlDType::Iq2Xxs)
+                .unwrap(),
+            (n, k),
+        )
+        .unwrap();
+        assert_eq!(q.dtype(), GgmlDType::Iq2Xxs);
+        let mm = QMatMul::from_qtensor(q).unwrap();
+        for m in [1usize, 6, 16, 17, 64] {
+            let x: Vec<f32> = (0..m * k)
+                .map(|i| ((i % 29) as f32 - 14.0) * 0.03)
+                .collect();
+            let mut want = vec![0f32; m * n];
+            matmul_t((m, k, n), &x, &blocks, &mut want).unwrap();
+            let xs = Tensor::from_vec(x, (m, k), &cpu)
+                .unwrap()
+                .to_device(&dev)
+                .unwrap();
+            let got: Vec<f32> = mm
+                .forward(&xs)
+                .unwrap()
+                .to_device(&cpu)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            assert!(
+                got.iter().all(|v| v.is_finite()),
+                "({m},{k},{n}): non-finite device output"
+            );
+            let worst = worst_rel(&got, &want);
+            eprintln!("iq2xxs ({m},{k},{n}): worst rel diff = {worst:.3e}");
+            assert!(
+                worst < 1e-3,
+                "({m},{k},{n}) parity failed: worst={worst:.3e}"
+            );
         }
-        eprintln!("shape ({m},{k},{n}): worst rel diff = {worst:.3e}");
-        assert!(worst < 2e-3, "({m},{k},{n}) parity failed: worst={worst:.3e}");
+    }
+}
 
-        // Rough CPU-vs-GPU throughput on the expert decode shape (m small).
+/// Resident-weight timing on the decode shape: weights uploaded once, the
+/// activation already on the device, launches batched with one sync — the
+/// per-visit cost the expert cache pays on a hit — next to the CPU kernel.
+#[test]
+fn opencl_iq2xxs_resident_timing() {
+    let Some(dev) = device() else {
+        eprintln!("SKIP: no OpenCL device");
+        return;
+    };
+    let cpu = Device::Cpu;
+    for (m, k, n) in [
+        (1usize, 4096usize, 2048usize),
+        (6, 4096, 2048),
+        (12, 4096, 2048),
+    ] {
+        let blocks = blocks_for(k, n);
+        let bytes = block_bytes(&blocks);
+        let upload = std::time::Instant::now();
+        let q = QTensor::new(
+            QStorage::from_data_transfer(
+                std::borrow::Cow::Borrowed(&bytes),
+                &dev,
+                GgmlDType::Iq2Xxs,
+            )
+            .unwrap(),
+            (n, k),
+        )
+        .unwrap();
+        let upload_ms = upload.elapsed().as_secs_f64() * 1e3;
+        let mm = QMatMul::from_qtensor(q).unwrap();
+        let x: Vec<f32> = (0..m * k)
+            .map(|i| ((i % 31) as f32 - 15.0) * 0.02)
+            .collect();
+        let xs = Tensor::from_vec(x.clone(), (m, k), &cpu)
+            .unwrap()
+            .to_device(&dev)
+            .unwrap();
+        let mut want = vec![0f32; m * n];
+        matmul_t((m, k, n), &x, &blocks, &mut want).unwrap();
+        let got: Vec<f32> = mm
+            .forward(&xs)
+            .unwrap()
+            .to_device(&cpu)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        assert!(worst_rel(&got, &want) < 1e-3);
+
         let cpu_start = std::time::Instant::now();
-        for _ in 0..20 {
+        for _ in 0..30 {
             let mut c2 = vec![0.0f32; m * n];
             matmul_t((m, k, n), &x, &blocks, &mut c2).unwrap();
         }
-        let cpu_ms = cpu_start.elapsed().as_secs_f64() * 1e3 / 20.0;
-        let gpu_start = std::time::Instant::now();
-        for _ in 0..20 {
-            let mut g2 = vec![0.0f32; m * n];
-            try_opencl_matmul(&dev, (m, k, n), &x, &blocks, &mut g2).unwrap();
-        }
-        let gpu_ms = gpu_start.elapsed().as_secs_f64() * 1e3 / 20.0;
-        eprintln!("  timing ({m},{k},{n}): cpu {cpu_ms:.3} ms  gpu {gpu_ms:.3} ms  speedup {:.2}x", cpu_ms / gpu_ms.max(1e-9));
-    }
-    dev.synchronize().unwrap();
-}
-
-/// The resident-device path (`Iq2OpenClWeight`) — weights uploaded once, the
-/// activation already on the device — must match the CPU reference on the
-/// exact decode shape, and shows the transfer-amortized speedup.
-#[test]
-fn opencl_iq2xxs_resident_matches_cpu() {
-    use joshua::iq2xxs::Iq2OpenClWeight;
-    let Some(dev) = device() else {
-        eprintln!("SKIP: no OpenCL device");
-        return;
-    };
-    let odev = match dev.as_opencl_device() {
-        Ok(d) => d.clone(),
-        Err(_) => return,
-    };
-    for (m, k, n) in [(1usize, 2048usize, 2048usize), (1, 4096, 2048)] {
-        let (blocks, _) = blocks_for((m, k, n));
-        // Resident weight (upload once).
-        let w = Iq2OpenClWeight::upload(&odev, &blocks, n, k).unwrap();
-        // Activation as an OpenCl tensor.
-        let x_v: Vec<f32> = (0..m * k).map(|i| ((i % 29) as f32 - 14.0) * 0.03).collect();
-        let xs = candle_core::Tensor::from_vec(x_v.clone(), (m, k), &dev).unwrap();
-
-        // Device result (resident path, activation on device).
-        let out = w.matmul(&odev, &xs).unwrap();
-        odev.synchronize().unwrap();
-        let gpu: Vec<f32> = out.flatten_all().unwrap().to_vec1().unwrap();
-
-        // CPU reference.
-        let mut cpu = vec![0.0f32; m * n];
-        matmul_t((m, k, n), &x_v, &blocks, &mut cpu).unwrap();
-
-        let mut worst = 0.0f32;
-        for i in 0..m * n {
-            let rel = (gpu[i] - cpu[i]).abs() / cpu[i].abs().max(1e-4);
-            worst = worst.max(rel);
-        }
-        eprintln!("resident ({m},{k},{n}): worst rel diff = {worst:.3e}");
-        assert!(worst < 2e-3, "resident ({m},{k},{n}) parity failed: worst={worst:.3e}");
-
-        // Transfer-amortized timing: repeated matmuls, weights resident.
-        let cpu_start = std::time::Instant::now();
-        for _ in 0..30 {
-            let mut c2 = vec![0.0f32; m * n];
-            matmul_t((m, k, n), &x_v, &blocks, &mut c2).unwrap();
-        }
         let cpu_ms = cpu_start.elapsed().as_secs_f64() * 1e3 / 30.0;
         let gpu_start = std::time::Instant::now();
+        let mut last = None;
         for _ in 0..30 {
-            w.matmul(&odev, &xs).unwrap();
+            last = Some(mm.forward(&xs).unwrap());
         }
-        odev.synchronize().unwrap(); // include completion
+        dev.synchronize().unwrap();
+        drop(last);
         let gpu_ms = gpu_start.elapsed().as_secs_f64() * 1e3 / 30.0;
-        eprintln!("  resident timing ({m},{k},{n}): cpu {cpu_ms:.3} ms  gpu {gpu_ms:.3} ms  speedup {:.2}x", cpu_ms / gpu_ms.max(1e-9));
+        eprintln!(
+            "resident iq2xxs ({m},{k},{n}): upload {upload_ms:.3} ms ({:.1} MB); per matmul cpu {cpu_ms:.3} ms  gpu {gpu_ms:.3} ms  ratio {:.2}x",
+            bytes.len() as f64 / 1e6,
+            cpu_ms / gpu_ms.max(1e-9)
+        );
     }
 }

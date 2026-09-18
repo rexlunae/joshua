@@ -1207,7 +1207,7 @@ impl Engine {
             requested_placement,
             crate::placement::DeviceProfile {
                 is_cpu: device.is_cpu(),
-                dense_only: device.is_vulkan(),
+                dense_only: device.is_opencl() || device.is_vulkan(),
                 free_bytes: device_budget,
             },
             dense_device_bytes,

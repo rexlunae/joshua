@@ -1016,6 +1016,7 @@ pub fn qtype_code(dtype: crate::quantized::GgmlDType) -> i32 {
         Q5K => 13,
         Q6K => 14,
         Q8K => 15,
+        Iq2Xxs => 16,
         BF16 => 30,
     }
 }

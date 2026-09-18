@@ -232,6 +232,9 @@ pub fn try_fast_cpu_qmatmul(qt: &QTensor, xs: &Tensor) -> Option<Result<Tensor>>
             GgmlDType::Q5K => generic_kquant!(BlockQ5K),
             GgmlDType::Q6K => generic_kquant!(BlockQ6K),
             GgmlDType::Q8K => generic_kquant!(BlockQ8K),
+            // IQ2_XXS on the CPU is `MmapBlocksIq2Xxs` (not `covered` above);
+            // candle's block type is the reference form and never lands here.
+            GgmlDType::Iq2Xxs => false,
             _ => false,
         }
     };

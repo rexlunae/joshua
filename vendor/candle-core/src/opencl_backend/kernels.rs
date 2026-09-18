@@ -167,11 +167,85 @@ pub fn fallback_count() -> usize {
     FALLBACKS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+static FALLBACKS_BY_OP: std::sync::Mutex<Vec<(String, usize)>> = std::sync::Mutex::new(Vec::new());
+
+/// Per-op CPU round-trip counts (op name as passed to `note_fallback`), so a
+/// test can assert *which* ops fell back rather than diffing the global
+/// count, which every test in a binary shares.
+pub fn fallback_counts_by_op() -> Vec<(String, usize)> {
+    FALLBACKS_BY_OP.lock().unwrap_or_else(|p| p.into_inner()).clone()
+}
+
+/// Whether `JOSHUA_OPENCL_CHECK_NAN=1` is set: every native launch that
+/// produces an f32 storage is followed by a NaN count on the device (a
+/// sync per op) and the first op whose output holds a NaN is reported.
+/// A diagnostic for a result that is NaN only on one driver; never on by
+/// default.  Only NaN counts: infinities are legitimate (mask fills,
+/// reduction identities).
+pub fn check_nan_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| matches!(std::env::var("JOSHUA_OPENCL_CHECK_NAN"), Ok(s) if !s.is_empty() && s != "0"))
+}
+
+/// Count the NaNs in the f32 buffer `x` (`n` elements) on the device and
+/// report the first op whose output has any; see [`check_nan_enabled`].
+/// Errors of the check itself are swallowed (it is a diagnostic).
+pub fn debug_check_nan(c: &Ctx, op: &str, x: usize, n: usize) {
+    if n == 0 {
+        return;
+    }
+    match count_nan(c, x, n) {
+        Ok(0) => {}
+        Ok(v) => {
+            static FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            let first = !FIRST.swap(true, std::sync::atomic::Ordering::Relaxed);
+            eprintln!(
+                "[opencl] check-nan: op `{op}` produced {v} NaN(s) in {n} elements{}",
+                if first { " (first NaN-producing op)" } else { "" }
+            );
+        }
+        Err(e) => eprintln!("[opencl] check-nan: could not check `{op}`: {e}"),
+    }
+}
+
+/// Number of NaNs in the f32 device buffer `x` (`n` elements): one kernel
+/// launch plus a 4-byte blocking read-back.
+pub fn count_nan(c: &Ctx, x: usize, n: usize) -> Result<u32> {
+    let zero = 0u32;
+    let cnt = crate::opencl_backend::create_buffer(c.context, 4, 0x01)?; // CL_MEM_READ_WRITE
+    let guard = scopeguard_release(cnt);
+    unsafe { crate::opencl_backend::write_buffer_at(c.queue, cnt, 0, 4, &zero as *const u32 as *const u8) }?;
+    let mut kn = c.kernel("k_count_nan")?;
+    kn.buf(x)?.buf(cnt)?.val(to_i32(n)?)?;
+    kn.run(&[n], None)?;
+    let mut v = 0u32;
+    unsafe { crate::opencl_backend::read_buffer(c.queue, cnt, 0, 4, &mut v as *mut u32 as *mut u8) }?;
+    drop(guard);
+    Ok(v)
+}
+
+struct ReleaseOnDrop(usize);
+impl Drop for ReleaseOnDrop {
+    fn drop(&mut self) {
+        crate::opencl_backend::release_mem(self.0);
+    }
+}
+fn scopeguard_release(buffer: usize) -> ReleaseOnDrop {
+    ReleaseOnDrop(buffer)
+}
+
 /// Record (and, under `JOSHUA_OPENCL_TRACE`, log) an op that fell back to the
 /// CPU path.  `why` is `None` when no native kernel exists for the case and
 /// `Some(err)` when the kernel failed.
 pub fn note_fallback(op: &str, why: Option<&Error>) {
     FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    {
+        let mut by_op = FALLBACKS_BY_OP.lock().unwrap_or_else(|p| p.into_inner());
+        match by_op.iter_mut().find(|(name, _)| name == op) {
+            Some((_, n)) => *n += 1,
+            None => by_op.push((op.to_string(), 1)),
+        }
+    }
     if trace_enabled() {
         match why {
             Some(e) => eprintln!("[opencl] {op}: native kernel failed, using CPU round-trip: {e}"),
@@ -251,13 +325,51 @@ pub fn to_i32(v: usize) -> Result<i32> {
 // ─── Launch helper ───────────────────────────────────────────────────────────
 
 /// One kernel launch: `Kernel::new(...)`, `arg*` in parameter order, then
-/// `run`.  The kernel object is released on drop, on every path.
+/// `run`.  The kernel object comes from (and returns to) the calling
+/// thread's pool on drop, on every path.
 pub struct Kernel {
     k: usize,
     next: u32,
     queue: usize,
     /// Reduction work-group size the program was compiled with.
     pub wg: usize,
+    /// The program the object belongs to and its name: the pool key.
+    program: usize,
+    name: String,
+}
+
+/// Per-thread pool of kernel objects, keyed by program then kernel name.
+///
+/// `clCreateKernel` + `clReleaseKernel` per launch cost tens of microseconds
+/// of host time under a process-wide lock (see `KERNEL_OBJECTS`); a decode
+/// step issues a thousand launches, so a MoE model spent a noticeable share
+/// of its token time creating kernels.  A kernel object's argument state is
+/// per object (`clSetKernelArg` is not thread-safe on one object), so each
+/// thread keeps its own; arguments are captured at enqueue time, so an
+/// object can be reused before its previous launch has run.  Objects retain
+/// their program and context, so a context released elsewhere stays alive
+/// until the last pooled object is dropped with its thread.
+struct KernelPool(std::collections::HashMap<usize, std::collections::HashMap<String, Vec<usize>>>);
+
+/// Idle objects kept per (program, name); beyond that a returned object is
+/// released.
+const POOL_PER_KERNEL: usize = 4;
+
+impl Drop for KernelPool {
+    fn drop(&mut self) {
+        let _guard = KERNEL_OBJECTS.lock().unwrap_or_else(|p| p.into_inner());
+        for by_name in self.0.values() {
+            for objs in by_name.values() {
+                for &k in objs {
+                    unsafe { clReleaseKernel(k) };
+                }
+            }
+        }
+    }
+}
+
+thread_local! {
+    static KERNEL_POOL: std::cell::RefCell<KernelPool> = std::cell::RefCell::new(KernelPool(Default::default()));
 }
 
 /// Serialises kernel-object creation and release.  pocl keeps one
@@ -271,9 +383,25 @@ static KERNEL_OBJECTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 impl Drop for Kernel {
     fn drop(&mut self) {
-        if self.k != 0 {
+        if self.k == 0 {
+            return;
+        }
+        let k = self.k;
+        let returned = KERNEL_POOL
+            .try_with(|pool| {
+                let mut pool = pool.borrow_mut();
+                let objs = pool.0.entry(self.program).or_default().entry(std::mem::take(&mut self.name)).or_default();
+                if objs.len() < POOL_PER_KERNEL {
+                    objs.push(k);
+                    true
+                } else {
+                    false
+                }
+            })
+            .unwrap_or(false);
+        if !returned {
             let _guard = KERNEL_OBJECTS.lock().unwrap_or_else(|p| p.into_inner());
-            unsafe { clReleaseKernel(self.k) };
+            unsafe { clReleaseKernel(k) };
         }
     }
 }
@@ -298,6 +426,14 @@ impl Kernel {
             return Err(Error::Msg(format!("opencl: kernel {name} is disabled by JOSHUA_OPENCL_NATIVE_DENY")));
         }
         let (program, wg) = program_for(ctx, dev)?;
+        // A pooled object first (no driver call at all).
+        let pooled = KERNEL_POOL
+            .try_with(|pool| pool.borrow_mut().0.get_mut(&program).and_then(|m| m.get_mut(name)).and_then(|v| v.pop()))
+            .ok()
+            .flatten();
+        if let Some(k) = pooled {
+            return Ok(Self { k, next: 0, queue, wg, program, name: name.to_string() });
+        }
         let cname = std::ffi::CString::new(name).map_err(|_| Error::Msg("opencl: kernel name has a NUL".into()))?;
         let mut e: i32 = 0;
         let k = {
@@ -307,7 +443,7 @@ impl Kernel {
         if e != CL_SUCCESS || k == 0 {
             return Err(Error::Msg(format!("opencl clCreateKernel({name}) failed with status {e}")));
         }
-        Ok(Self { k, next: 0, queue, wg })
+        Ok(Self { k, next: 0, queue, wg, program, name: name.to_string() })
     }
 
     fn set(&mut self, size: usize, ptr: *const c_void) -> Result<&mut Self> {
@@ -755,6 +891,7 @@ pub fn qtype_code(dtype: crate::quantized::GgmlDType) -> i32 {
         Q5K => 13,
         Q6K => 14,
         Q8K => 15,
+        Iq2Xxs => 16,
         BF16 => 30,
     }
 }
@@ -785,22 +922,6 @@ pub fn run_qgemv(c: &Ctx, dtype: crate::quantized::GgmlDType, x: usize, w: usize
     kn.buf(x)?.buf(w)?.buf(out)?
         .val(to_i32(n)?)?.val(to_i32(k)?)?
         .val(qtype_code(dtype))?.val(to_i32(dtype.block_size())?)?.val(to_i32(dtype.type_size())?)?
-        .val(woff)?.val(to_i32(xoff)?)?.val(0i32)?.val(to_i32(m)?)?;
-    kn.run(&[n * wg, m], Some(&[wg, 1]))
-}
-
-/// `C[m, n] = sum_k X[m, k] * W[n, k]` over IQ2_XXS block-quantized `W`
-/// (`[N, K]`).  IQ2_XXS has no `GgmlDType`, so the quant / block-size / block
-/// bytes are hardcoded: qt=16 (QT_IQ2_XXS), qk=256 elements/block,
-/// bsz=66 bytes/block.
-#[allow(clippy::too_many_arguments)]
-pub fn run_iq2xxs_qgemv(c: &Ctx, x: usize, w: usize, out: usize, m: usize, n: usize, k: usize, woff: u64, xoff: usize) -> Result<()> {
-    check_block_k(k, 256, "iq2xxs qgemv")?;
-    let mut kn = c.kernel("k_qgemv")?;
-    let wg = kn.wg;
-    kn.buf(x)?.buf(w)?.buf(out)?
-        .val(to_i32(n)?)?.val(to_i32(k)?)?
-        .val(16i32)?.val(256i32)?.val(66i32)?
         .val(woff)?.val(to_i32(xoff)?)?.val(0i32)?.val(to_i32(m)?)?;
     kn.run(&[n * wg, m], Some(&[wg, 1]))
 }
