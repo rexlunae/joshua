@@ -956,3 +956,78 @@ fn slice_bytes(x: &[f32]) -> &[u8] {
 fn slice_bytes_mut(x: &mut [f32]) -> &mut [u8] {
     unsafe { core::slice::from_raw_parts_mut(x.as_mut_ptr() as *mut u8, x.len() * 4) }
 }
+
+// ─── Resident OpenCL IQ2_XXS matmul (net-win, transfer-amortized) ───────────
+
+/// A resident IQ2_XXS weight buffer on an OpenCL device.
+///
+/// The device matmul path uploads each expert's 66-byte IQ2 blocks once and
+/// reuses the buffer across decode steps — the transfer-amortization that
+/// makes a discrete GPU a net win over the CPU SIMD path on decode shapes
+/// (resident-GPU is ~2.2x faster).  A `[BlockIq2Xxs]` slice borrows the model
+/// mapping, so the upload can be keyed by the block pointer: the same expert
+/// always has the same pointer, deduplicating uploads.
+#[cfg(feature = "opencl")]
+#[derive(Clone)]
+pub struct Iq2OpenClWeight {
+    pub buffer: candle_core::opencl_backend::OpenClStorage,
+    /// Output rows = weight rows `n`.
+    pub n: usize,
+    pub k: usize,
+}
+
+impl Iq2OpenClWeight {
+    /// Upload `rhs` (66-byte IQ2 blocks, `[n, k/256]`) onto OpenCl device `dev`.
+    #[cfg(feature = "opencl")]
+    pub fn upload(dev: &candle_core::OpenClDevice, rhs: &[BlockIq2Xxs], n: usize, k: usize) -> candle_core::Result<Self> {
+        use candle_core::opencl_backend as ocl;
+        let total = rhs.len() * BLOCK_BYTES;
+        let st = dev.alloc_raw(total)?;
+        let raw: &[u8] =
+            unsafe { core::slice::from_raw_parts(rhs.as_ptr() as *const u8, total) };
+        unsafe { dev.write_raw_bytes(st.buffer, raw)? };
+        Ok(Self { buffer: st, n, k })
+    }
+
+    /// `dst[m, n] = xs[m, k] · W[n, k]ᵀ`, `xs` an OpenCl f32 tensor `[m, k]`.
+    #[cfg(feature = "opencl")]
+    pub fn matmul(&self, dev: &candle_core::OpenClDevice, xs: &candle_core::Tensor) -> candle_core::Result<candle_core::Tensor> {
+        use candle_core::opencl_backend as ocl;
+        let (m, k) = dims2(xs)?;
+        if k != self.k {
+            candle_core::bail!("iq2xxs opencl: input k={k} != weight k={}", self.k);
+        }
+        let ctx = dev.ctx();
+        // Activation is already on the OpenCl device (dispatch moved it once).
+        let xbuf = opencl_buffer(xs)?;
+        let out = dev.alloc_raw(m * self.n * 4)?;
+        ocl::kernels::run_iq2xxs_qgemv(&ctx, xbuf, self.buffer.buffer, out.buffer, m, self.n, k, 0, 0)?;
+        dev.synchronize()?;
+        let storage = candle_core::Storage::OpenCl(out);
+        Ok(candle_core::Tensor::from_storage(storage, (m, self.n), candle_core::op::BackpropOp::none(), false))
+    }
+}
+
+/// The OpenCl buffer handle of a contiguous f32 OpenCl tensor.
+#[cfg(feature = "opencl")]
+fn opencl_buffer(t: &candle_core::Tensor) -> candle_core::Result<usize> {
+    let (s, _) = t.storage_and_layout();
+    match &*s {
+        candle_core::Storage::OpenCl(st) => {
+            if st.dtype != candle_core::DType::F32 {
+                candle_core::bail!("iq2xxs opencl matmul: expected f32 tensor");
+            }
+            Ok(st.buffer)
+        }
+        other => candle_core::bail!("iq2xxs opencl matmul: expected an OpenCl tensor, got {other:?}"),
+    }
+}
+
+#[cfg(feature = "opencl")]
+fn dims2(t: &candle_core::Tensor) -> candle_core::Result<(usize, usize)> {
+    let d = t.dims();
+    if d.len() != 2 {
+        candle_core::bail!("iq2xxs opencl matmul: expected [m,k], got {d:?}");
+    }
+    Ok((d[0], d[1]))
+}
