@@ -550,6 +550,153 @@ impl MissPolicy {
     }
 }
 
+/// What happens to a routed expert's *host* pages once it is resident in
+/// the device pool.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HostPagePolicy {
+    /// Drop them from the mapping and the page cache
+    /// ([`crate::residency::ExpertHandles::release_host_pages`]) a moment
+    /// after the upload, so RAM holds experts the card does not: the two
+    /// tiers are exclusive and a host smaller than the pool covers more of
+    /// it.  The default.
+    Drop,
+    /// Leave them to the kernel (`JOSHUA_EXPERT_HOST_PAGES=keep`): the page
+    /// cache may carry a copy of the card's experts.  For hosts whose RAM
+    /// holds the whole pool anyway, or to bisect a regression.
+    Keep,
+}
+
+impl HostPagePolicy {
+    fn from_env() -> Self {
+        match std::env::var("JOSHUA_EXPERT_HOST_PAGES").as_deref() {
+            Ok("keep") | Ok("0") => Self::Keep,
+            _ => Self::Drop,
+        }
+    }
+}
+
+/// Where the time of a forward pass with a device expert pool goes, and
+/// how much of what the host had to run was in RAM when it ran.  One
+/// accumulator each for decode steps and prefill; snapshot with
+/// [`ModelWeights::expert_phase_timing`] and printed in the periodic
+/// `debug` line.
+#[derive(Default)]
+struct PhaseTiming {
+    /// Forward passes accumulated (decode steps, or prefill layer-chunks).
+    passes: std::sync::atomic::AtomicU64,
+    /// Wall time of those passes.
+    pass_ns: std::sync::atomic::AtomicU64,
+    /// Enqueuing the resident experts' launches.
+    device_launch_ns: std::sync::atomic::AtomicU64,
+    /// Running the misses on the host expert kernels.
+    host_ns: std::sync::atomic::AtomicU64,
+    /// Waiting for the device's partial sum after the host part (the
+    /// read-back when the block's output lives on the CPU; with the dense
+    /// set on the device the wait lands in the next layer's work instead).
+    device_wait_ns: std::sync::atomic::AtomicU64,
+    /// Host misses (expert visits run on the host).
+    miss_experts: std::sync::atomic::AtomicU64,
+    /// Host misses whose pages were all resident before the run (RAM, not
+    /// disk).  Counted only while page probing is on.
+    miss_experts_resident: std::sync::atomic::AtomicU64,
+    /// Pages of the probed host misses, and how many were resident.
+    miss_pages: std::sync::atomic::AtomicU64,
+    miss_pages_resident: std::sync::atomic::AtomicU64,
+}
+
+/// A snapshot of one [`PhaseTiming`] accumulator.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExpertPhaseTiming {
+    /// Forward passes accumulated (decode steps, or prefill layer-chunks).
+    pub passes: u64,
+    /// Wall time of those passes, nanoseconds.
+    pub pass_ns: u64,
+    /// Time enqueuing the resident experts' launches, nanoseconds.
+    pub device_launch_ns: u64,
+    /// Time running the misses on the host, nanoseconds.
+    pub host_ns: u64,
+    /// Time waiting for the device's partial sum, nanoseconds.
+    pub device_wait_ns: u64,
+    /// Host misses.
+    pub miss_experts: u64,
+    /// Host misses whose pages were all resident before the run.
+    pub miss_experts_resident: u64,
+    /// Pages of the probed host misses.
+    pub miss_pages: u64,
+    /// …of which resident before the run.
+    pub miss_pages_resident: u64,
+}
+
+impl PhaseTiming {
+    fn add(counter: &std::sync::atomic::AtomicU64, v: u64) {
+        counter.fetch_add(v, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> ExpertPhaseTiming {
+        use std::sync::atomic::Ordering::Relaxed;
+        ExpertPhaseTiming {
+            passes: self.passes.load(Relaxed),
+            pass_ns: self.pass_ns.load(Relaxed),
+            device_launch_ns: self.device_launch_ns.load(Relaxed),
+            host_ns: self.host_ns.load(Relaxed),
+            device_wait_ns: self.device_wait_ns.load(Relaxed),
+            miss_experts: self.miss_experts.load(Relaxed),
+            miss_experts_resident: self.miss_experts_resident.load(Relaxed),
+            miss_pages: self.miss_pages.load(Relaxed),
+            miss_pages_resident: self.miss_pages_resident.load(Relaxed),
+        }
+    }
+
+    /// Snapshot and zero (the prefill accumulator is reported per prefill).
+    fn take(&self) -> ExpertPhaseTiming {
+        use std::sync::atomic::Ordering::Relaxed;
+        ExpertPhaseTiming {
+            passes: self.passes.swap(0, Relaxed),
+            pass_ns: self.pass_ns.swap(0, Relaxed),
+            device_launch_ns: self.device_launch_ns.swap(0, Relaxed),
+            host_ns: self.host_ns.swap(0, Relaxed),
+            device_wait_ns: self.device_wait_ns.swap(0, Relaxed),
+            miss_experts: self.miss_experts.swap(0, Relaxed),
+            miss_experts_resident: self.miss_experts_resident.swap(0, Relaxed),
+            miss_pages: self.miss_pages.swap(0, Relaxed),
+            miss_pages_resident: self.miss_pages_resident.swap(0, Relaxed),
+        }
+    }
+}
+
+impl ExpertPhaseTiming {
+    /// The time split as one log-friendly line: per-pass averages in
+    /// milliseconds and the host-miss page residency.
+    pub fn describe(&self, per: &str) -> String {
+        let n = self.passes.max(1) as f64;
+        let ms = |ns: u64| ns as f64 / 1e6 / n;
+        let rest = self
+            .pass_ns
+            .saturating_sub(self.device_launch_ns + self.host_ns + self.device_wait_ns);
+        let pages = if self.miss_pages > 0 {
+            format!(
+                ", {:.1}% of their pages resident before the run ({} of {} experts fully resident)",
+                100.0 * self.miss_pages_resident as f64 / self.miss_pages as f64,
+                self.miss_experts_resident,
+                self.miss_experts,
+            )
+        } else {
+            String::new()
+        };
+        format!(
+            "per {per} (avg over {}): total {:.1} ms = device launch {:.1} + host experts {:.1} + \
+             device wait {:.1} + rest {:.1}; host misses {:.1} experts{pages}",
+            self.passes,
+            ms(self.pass_ns),
+            ms(self.device_launch_ns),
+            ms(self.host_ns),
+            ms(self.device_wait_ns),
+            ms(rest),
+            self.miss_experts as f64 / n,
+        )
+    }
+}
+
 /// The model-wide device expert pool: a byte-budgeted LRU of
 /// [`Ds4DeviceExpert`] slots keyed by `(layer, expert)`, the background
 /// uploader that fills it, and the device the slots live on.  Shared by
@@ -558,6 +705,15 @@ impl MissPolicy {
 struct Ds4DevicePool {
     device: Device,
     pool: Arc<crate::residency::DeviceResidency<Ds4DeviceExpert>>,
+    /// Decode-step time split and host-miss residency.
+    decode: PhaseTiming,
+    /// The same for the prefill in progress (taken and logged at its end).
+    prefill: PhaseTiming,
+    /// Probe each host miss's page residency (`mincore`) before it runs.
+    /// On with `JOSHUA_EXPERT_STATS=1` or a `debug`-level `joshua` log
+    /// filter at load; a few hundred syscalls per decode step otherwise
+    /// nobody reads.
+    probe_pages: bool,
     uploader: Arc<crate::residency::ExpertUploader<Ds4DeviceExpert>>,
     miss: MissPolicy,
 }
@@ -577,7 +733,12 @@ fn qtensor_of(m: &QMatMul) -> Option<Arc<QTensor>> {
 /// expert.  On a CPU "device" (tests, `--device cpu` with a budget) a slot
 /// shares the host tensors — a hit is numerically the host path — so the
 /// partition can be exercised without an accelerator.
-fn build_device_pool(layers: &[Layer], dev: &Device, budget: u64) -> Option<Arc<Ds4DevicePool>> {
+fn build_device_pool(
+    layers: &[Layer],
+    dev: &Device,
+    budget: u64,
+    file: Option<Arc<std::fs::File>>,
+) -> Option<Arc<Ds4DevicePool>> {
     let mut host: Vec<Vec<HostExpert>> = Vec::with_capacity(layers.len());
     for layer in layers {
         // Every layer of this architecture carries an MoE block.
@@ -613,6 +774,12 @@ fn build_device_pool(layers: &[Layer], dev: &Device, budget: u64) -> Option<Arc<
         );
         return None;
     }
+    // Per-expert prefetch handles, for the host-page release hook below.
+    let host_handles: Arc<Vec<Vec<Option<crate::residency::ExpertHandles>>>> = Arc::new(
+        host.iter()
+            .map(|row| row.iter().map(|h| h.prefetch.clone()).collect())
+            .collect(),
+    );
     let host = Arc::new(host);
     let share_host = dev.is_cpu();
     let dev2 = dev.clone();
@@ -657,11 +824,35 @@ fn build_device_pool(layers: &[Layer], dev: &Device, budget: u64) -> Option<Arc<
             }
         });
     let pool = Arc::new(crate::residency::DeviceResidency::new(budget, per_slot, upload));
-    let uploader = Arc::new(crate::residency::ExpertUploader::spawn(Arc::clone(&pool)));
+    // On a real device the host pages of an uploaded expert are released
+    // (exclusive tiers).  With the CPU as the "device" the slot *is* the
+    // host tensor, so there is nothing to release.
+    let host_pages = if share_host {
+        HostPagePolicy::Keep
+    } else {
+        HostPagePolicy::from_env()
+    };
+    let release: Option<crate::residency::ReleaseHook> = match host_pages {
+        HostPagePolicy::Drop => {
+            let host = Arc::clone(&host_handles);
+            Some(Arc::new(move |l: u32, e: u32| {
+                if let Some(Some(h)) = host.get(l as usize).and_then(|row| row.get(e as usize)) {
+                    h.release_host_pages(file.as_deref());
+                }
+            }))
+        }
+        HostPagePolicy::Keep => None,
+    };
+    let uploader = Arc::new(crate::residency::ExpertUploader::spawn_with_release(
+        Arc::clone(&pool),
+        release,
+        crate::residency::HOST_RELEASE_DELAY,
+    ));
     let miss = MissPolicy::from_env();
     tracing::info!(
         "deepseek4: VRAM expert cache on {dev:?}: {:.2} GiB budget = {slots} slots of {:.2} MiB \
-         ({n_experts} routed experts in the model, {:.1}% resident at most); decode misses run on the {}",
+         ({n_experts} routed experts in the model, {:.1}% resident at most); decode misses run on the {}; \
+         host pages of uploaded experts are {}",
         budget as f64 / 2f64.powi(30),
         per_slot as f64 / 2f64.powi(20),
         100.0 * slots.min(n_experts) as f64 / n_experts as f64,
@@ -669,8 +860,22 @@ fn build_device_pool(layers: &[Layer], dev: &Device, budget: u64) -> Option<Arc<
             MissPolicy::Host => "host and are uploaded in the background",
             MissPolicy::Upload => "device after a synchronous upload (JOSHUA_EXPERT_MISS=upload)",
         },
+        match host_pages {
+            HostPagePolicy::Drop => "released (RAM and VRAM hold different experts)",
+            HostPagePolicy::Keep => "kept (JOSHUA_EXPERT_HOST_PAGES=keep)",
+        },
     );
-    Some(Arc::new(Ds4DevicePool { device: dev.clone(), pool, uploader, miss }))
+    let probe_pages = std::env::var_os("JOSHUA_EXPERT_STATS").is_some()
+        || tracing::enabled!(target: "joshua", tracing::Level::DEBUG);
+    Some(Arc::new(Ds4DevicePool {
+        device: dev.clone(),
+        pool,
+        decode: PhaseTiming::default(),
+        prefill: PhaseTiming::default(),
+        probe_pages,
+        uploader,
+        miss,
+    }))
 }
 
 // ─── HC (hyper-computation) stream mixing ───────────────────────────────────
@@ -1638,6 +1843,7 @@ impl Moe {
         let h = x2.dim(1)?;
         let ids: Vec<u32> = indices.flatten_all()?.to_vec1()?;
         let wts: Vec<f32> = weights.flatten_all()?.to_vec1()?;
+        crate::route_trace::record(self.layer, &ids, k);
         let out_device = x2.device().clone();
         if let Some(pool) = &self.device_pool {
             // Every launch of the previous MoE layer has completed: with the
@@ -1783,6 +1989,9 @@ impl Moe {
             }
             if decode && pool.miss == MissPolicy::Upload {
                 pool.pool.acquire(self.layer, e as u32);
+                // Uploaded here, not by the uploader: still release the host
+                // pages in due course.
+                pool.uploader.note_resident(self.layer, e as u32);
             }
             match pool.pool.lookup(self.layer, e as u32) {
                 Some(slot) => hits.push((e, slot)),
@@ -1800,8 +2009,30 @@ impl Moe {
             }
         }
 
+        let timing = if decode { &pool.decode } else { &pool.prefill };
+        PhaseTiming::add(&timing.miss_experts, misses.len() as u64);
+        if pool.probe_pages {
+            // Was what the host is about to run in RAM, or is it about to
+            // come from disk?  Probed before the prefetch below so the
+            // answer is the state the step found, not the one it made.
+            for &e in &misses {
+                if let Some((res, total)) = self.experts[e]
+                    .prefetch
+                    .as_ref()
+                    .and_then(|h| h.resident_pages())
+                {
+                    PhaseTiming::add(&timing.miss_pages, total as u64);
+                    PhaseTiming::add(&timing.miss_pages_resident, res as u64);
+                    if res == total {
+                        PhaseTiming::add(&timing.miss_experts_resident, 1);
+                    }
+                }
+            }
+        }
+
         // Device part first: the launches are asynchronous, so the host
         // misses below overlap with them.
+        let t0 = std::time::Instant::now();
         let y_dev = if hits.is_empty() {
             None
         } else {
@@ -1812,12 +2043,14 @@ impl Moe {
                 Self::pooled_prefill(&hits, per_expert, &x_dev, n_tokens, h)?
             })
         };
+        let t1 = std::time::Instant::now();
         let y_host = if misses.is_empty() {
             None
         } else {
             let x_host = crate::moe::on_device(x2, &self.expert_device)?;
             Some(self.host_experts(&x_host, per_expert, &misses, n_tokens, h)?)
         };
+        let t2 = std::time::Instant::now();
         // The handles this layer launched on go back to the pool's retire
         // list: freed at the next `reclaim`, after a read-back proved the
         // launches complete, even if the uploader evicts them meanwhile.
@@ -1825,7 +2058,7 @@ impl Moe {
             pool.pool.retire(slot);
         }
         let out_device = x2.device();
-        Ok(match (y_dev, y_host) {
+        let y = match (y_dev, y_host) {
             (Some(d), Some(hst)) => {
                 let d = crate::moe::on_device(&d, out_device)?;
                 let hst = crate::moe::on_device(&hst, out_device)?;
@@ -1833,7 +2066,12 @@ impl Moe {
             }
             (Some(y), None) | (None, Some(y)) => crate::moe::on_device(&y, out_device)?.into_owned(),
             (None, None) => Tensor::zeros((n_tokens, h), DType::F32, out_device)?,
-        })
+        };
+        let t3 = std::time::Instant::now();
+        PhaseTiming::add(&timing.device_launch_ns, (t1 - t0).as_nanos() as u64);
+        PhaseTiming::add(&timing.host_ns, (t2 - t1).as_nanos() as u64);
+        PhaseTiming::add(&timing.device_wait_ns, (t3 - t2).as_nanos() as u64);
+        Ok(y)
     }
 
     /// Decode over the resident experts: `x_dev` is the one row `[1, h]`;
@@ -2501,7 +2739,8 @@ impl ModelWeights {
         // (layer, expert), so a layer with skewed routing can hold more
         // experts than an even split would give it); every MoE block gets a
         // handle for lookups and warming requests.
-        let device_pool = pool_device.and_then(|dev| build_device_pool(&layers, &dev, cache_bytes));
+        let device_pool =
+            pool_device.and_then(|dev| build_device_pool(&layers, &dev, cache_bytes, file.clone()));
         if let Some(pool) = &device_pool {
             for layer in layers.iter_mut() {
                 let FeedForward::Moe(moe) = &mut layer.ffn;
@@ -2563,6 +2802,7 @@ impl ModelWeights {
     /// yet, dense layers, and every expert whose weights are not mmap-backed
     /// (streamed loads keep no prefetch handles).
     fn prefetch_speculative(&self) {
+        let pool = self.shared.device_pool.as_ref();
         for (i, ids) in self.last_routed.iter().enumerate() {
             if ids.is_empty() {
                 continue;
@@ -2573,6 +2813,11 @@ impl ModelWeights {
             // Every layer of this architecture carries an MoE block.
             let FeedForward::Moe(moe) = &layer.ffn;
             for &e in ids {
+                // An expert resident on the device runs there; its host
+                // pages are not wanted (exclusive tiers).
+                if pool.is_some_and(|p| p.pool.contains(i as u32, e)) {
+                    continue;
+                }
                 if let Some(expert) = moe.experts.get(e as usize) {
                     expert.prefetch();
                 }
@@ -2615,6 +2860,44 @@ impl ModelWeights {
         })
     }
 
+    /// The decode-step time split of the device expert pool (launch / host
+    /// misses / device wait / rest) and the host misses' page residency,
+    /// accumulated since load.  `None` without a pool.
+    pub fn expert_phase_timing(&self) -> Option<ExpertPhaseTiming> {
+        self.shared
+            .device_pool
+            .as_ref()
+            .map(|p| p.decode.snapshot())
+    }
+
+    /// Account one forward pass's wall time to the pool's decode or prefill
+    /// accumulator; a no-op without a pool.
+    fn note_pass(&self, decode: bool, elapsed: std::time::Duration) {
+        if let Some(p) = &self.shared.device_pool {
+            let t = if decode { &p.decode } else { &p.prefill };
+            PhaseTiming::add(&t.passes, 1);
+            PhaseTiming::add(&t.pass_ns, elapsed.as_nanos() as u64);
+        }
+    }
+
+    /// Log and reset the prefill accumulator (at the end of a prefill;
+    /// `n_tokens` is unknown on the layer-streaming path).
+    fn log_prefill_timing(&self, n_tokens: Option<usize>) {
+        if let Some(p) = &self.shared.device_pool {
+            let t = p.prefill.take();
+            if t.passes > 0 && tracing::enabled!(target: "joshua", tracing::Level::DEBUG) {
+                let what = match n_tokens {
+                    Some(n) => format!("prefill of {n} tokens"),
+                    None => "streamed prefill".to_string(),
+                };
+                tracing::debug!(
+                    "deepseek4 {what} with the vram expert cache: {}",
+                    t.describe("layer pass")
+                );
+            }
+        }
+    }
+
     /// Block until the background uploader has drained its queue (tests and
     /// diagnostics: makes "the misses of the last step are resident now"
     /// observable).  A no-op without a device pool.
@@ -2630,7 +2913,7 @@ impl ModelWeights {
         if let Some(r) = self.device_expert_cache() {
             tracing::debug!(
                 "deepseek4 vram expert cache @step {step}: {}/{} slots ({:.2}/{:.2} GiB), hits {} misses {} \
-                 uploads {} evictions {} refused {} failed {}; upload requests {} (dropped {})",
+                 uploads {} evictions {} refused {} failed {}; upload requests {} (dropped {}), host pages released {}",
                 r.resident,
                 r.slots,
                 r.resident_bytes as f64 / 2f64.powi(30),
@@ -2643,7 +2926,14 @@ impl ModelWeights {
                 r.stats.upload_failures,
                 r.upload_requests,
                 r.upload_drops,
+                r.host_releases,
             );
+            if let Some(t) = self.expert_phase_timing() {
+                tracing::debug!(
+                    "deepseek4 decode time split @step {step}: {}",
+                    t.describe("decode step")
+                );
+            }
         }
     }
 
@@ -2691,7 +2981,22 @@ impl ModelWeights {
     /// Forward pass. `input` is `[1, seq_len]`; `offset` is the KV-cache
     /// position of the first input token.
     pub fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {
+        let t_pass = std::time::Instant::now();
         let (_b, seq_len) = input.dims2()?;
+        let logits = self.forward_inner(input, offset, seq_len)?;
+        self.note_pass(seq_len == 1, t_pass.elapsed());
+        if seq_len > 1 {
+            self.log_prefill_timing(Some(seq_len));
+        }
+        Ok(logits)
+    }
+
+    fn forward_inner(&mut self, input: &Tensor, offset: usize, seq_len: usize) -> Result<Tensor> {
+        crate::route_trace::begin_call(if seq_len == 1 {
+            crate::route_trace::Phase::Decode
+        } else {
+            crate::route_trace::Phase::Prefill
+        });
         let hc = self.shared.hc_mult;
         let d = self.shared.tok_embeddings.hidden()?;
 
@@ -2936,10 +3241,20 @@ impl ModelWeights {
         &mut self,
         seqs: &[(&Tensor, usize)],
     ) -> Result<Vec<Vec<f32>>> {
+        let t_pass = std::time::Instant::now();
+        let out = self.forward_sequences_inner(seqs)?;
+        if !seqs.is_empty() {
+            self.note_pass(true, t_pass.elapsed());
+        }
+        Ok(out)
+    }
+
+    fn forward_sequences_inner(&mut self, seqs: &[(&Tensor, usize)]) -> Result<Vec<Vec<f32>>> {
         let n_seq = seqs.len();
         if n_seq == 0 {
             return Ok(Vec::new());
         }
+        crate::route_trace::begin_call(crate::route_trace::Phase::Decode);
         let hc = self.shared.hc_mult;
         let d = self.shared.tok_embeddings.hidden()?;
 
@@ -3126,6 +3441,10 @@ impl crate::stream_prefill::StreamPrefill for ModelWeights {
         self.shared.layers.len()
     }
 
+    fn begin_stream(&mut self) {
+        crate::route_trace::begin_call(crate::route_trace::Phase::Prefill);
+    }
+
     fn embed_chunk(&self, tokens: &[u32], device: &candle_core::Device) -> Result<Tensor> {
         let hc = self.shared.hc_mult;
         let d = self.shared.tok_embeddings.hidden()?;
@@ -3139,6 +3458,27 @@ impl crate::stream_prefill::StreamPrefill for ModelWeights {
     }
 
     fn apply_layer_chunk(
+        &mut self,
+        l: usize,
+        xs: &Tensor,
+        pos: usize,
+        tokens: &[u32],
+    ) -> Result<Tensor> {
+        let t_pass = std::time::Instant::now();
+        let out = self.apply_layer_chunk_inner(l, xs, pos, tokens)?;
+        self.note_pass(false, t_pass.elapsed());
+        Ok(out)
+    }
+
+    fn final_logits(&self, last: &Tensor) -> Result<Tensor> {
+        let logits = self.final_logits_inner(last);
+        self.log_prefill_timing(None);
+        logits
+    }
+}
+
+impl ModelWeights {
+    fn apply_layer_chunk_inner(
         &mut self,
         l: usize,
         xs: &Tensor,
@@ -3163,7 +3503,7 @@ impl crate::stream_prefill::StreamPrefill for ModelWeights {
         let residual = xs.clone();
         let h = layer.attn_norm.forward(&x)?;
         let h = layer.attn.forward(kv, &h, pos, max_seq)?;
-        let mut xs = hc_post(&h, &residual, &post, &comb)?;
+        let xs = hc_post(&h, &residual, &post, &comb)?;
 
         // hc_pre with FFN weights, then the MoE block.
         let (x, post, comb) = hc_pre(
@@ -3184,10 +3524,10 @@ impl crate::stream_prefill::StreamPrefill for ModelWeights {
         // does not advance the decode clock.
         let step = self.hot_experts.begin_step(false);
         self.hot_experts.record(l, &self.last_routed[l], step);
-        Ok(hc_post(&h, &residual, &post, &comb)?)
+        hc_post(&h, &residual, &post, &comb)
     }
 
-    fn final_logits(&self, last: &Tensor) -> Result<Tensor> {
+    fn final_logits_inner(&self, last: &Tensor) -> Result<Tensor> {
         let (_, seq_len, hc, d) = last.dims4()?;
         let flat = last.reshape((seq_len, hc * d))?;
         let rsqrt = flat

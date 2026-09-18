@@ -243,6 +243,17 @@ enum Commands {
         /// fixed MiB budget; unset/0 disables (all experts stay on the host).
         #[arg(long, env = "JOSHUA_VRAM_EXPERT_CACHE", value_parser = clap::value_parser!(VramExpertCacheArg))]
         vram_expert_cache: Option<VramExpertCacheArg>,
+        /// Tokens per prefill chunk (default 512).  Bounds the per-layer
+        /// prefill workspace and sets how many prompt rows each routed expert
+        /// sees per matmul; the joshua-native MoE loaders read each layer's
+        /// weights once per prefill whatever the chunk.
+        #[arg(
+            long,
+            env = "JOSHUA_PREFILL_CHUNK",
+            default_value_t = 0,
+            hide_default_value = true
+        )]
+        prefill_chunk: usize,
         /// Lock the always-touched weights into RAM (mlock).  Needs the
         /// process memlock limit to cover the hot set: `LimitMEMLOCK=infinity`
         /// (systemd), `ulimit -l unlimited`, or /etc/security/limits.conf.
@@ -370,6 +381,17 @@ enum Commands {
         /// fixed MiB budget; unset/0 disables (all experts stay on the host).
         #[arg(long, env = "JOSHUA_VRAM_EXPERT_CACHE", value_parser = clap::value_parser!(VramExpertCacheArg))]
         vram_expert_cache: Option<VramExpertCacheArg>,
+        /// Tokens per prefill chunk (default 512).  Bounds the per-layer
+        /// prefill workspace and sets how many prompt rows each routed expert
+        /// sees per matmul; the joshua-native MoE loaders read each layer's
+        /// weights once per prefill whatever the chunk.
+        #[arg(
+            long,
+            env = "JOSHUA_PREFILL_CHUNK",
+            default_value_t = 0,
+            hide_default_value = true
+        )]
+        prefill_chunk: usize,
         /// Lock the always-touched weights into RAM (mlock).  Needs the
         /// process memlock limit to cover the hot set: `LimitMEMLOCK=infinity`
         /// (systemd), `ulimit -l unlimited`, or /etc/security/limits.conf.
@@ -468,6 +490,7 @@ async fn main() -> anyhow::Result<()> {
             pin_hot_experts,
             expert_cache,
             vram_expert_cache,
+            prefill_chunk,
             mlock_hot_weights,
             expert_placement,
             dense_placement,
@@ -517,6 +540,7 @@ async fn main() -> anyhow::Result<()> {
                 .pin_hot_experts(pin_hot_experts)
                 .expert_cache_auto(expert_cache_auto)
                 .vram_expert_cache(vram_bytes)
+                .prefill_chunk(prefill_chunk)
                 .mlock_hot_weights(
                     mlock_hot_weights
                         .map(MlockMode::from)
@@ -587,6 +611,7 @@ async fn main() -> anyhow::Result<()> {
             pin_hot_experts,
             expert_cache,
             vram_expert_cache,
+            prefill_chunk,
             mlock_hot_weights,
             expert_placement,
             dense_placement,
@@ -621,6 +646,7 @@ async fn main() -> anyhow::Result<()> {
                 .pin_hot_experts(pin_hot_experts)
                 .expert_cache_auto(expert_cache_auto)
                 .vram_expert_cache(vram_bytes)
+                .prefill_chunk(prefill_chunk)
                 .mlock_hot_weights(
                     mlock_hot_weights
                         .map(MlockMode::from)

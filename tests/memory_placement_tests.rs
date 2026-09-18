@@ -384,6 +384,68 @@ fn deepseek4_expert_pool_partition_preserves_logits() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// The pool's decode time split and the routing trace observe a run: after
+/// a prefill and decode steps the decode accumulator counts the steps and
+/// the host misses (and, with the page probe on, their residency), and the
+/// installed tracer holds one row per routed visit.
+#[test]
+fn deepseek4_expert_pool_reports_time_split_and_trace() {
+    let dir = common::model_dir("vram-cache-stats-deepseek4");
+    let model = dir.join("model.gguf");
+    common::write_tiny_deepseek4_gguf(&model);
+    const SLOT_BYTES: u64 = 2 * 128 * 66 + 1024 * 34;
+    // The page probe is read from the environment at load.
+    std::env::set_var("JOSHUA_EXPERT_STATS", "1");
+    let trace_path = dir.join("trace.csv");
+    let tracer = Arc::new(joshua::route_trace::Tracer::create(&trace_path).unwrap());
+    joshua::route_trace::install(Arc::clone(&tracer));
+
+    let mut cached = load_placed_with_cache(&model, 3 * SLOT_BYTES);
+    assert_eq!(cached.expert_phase_timing().unwrap(), Default::default());
+    let tokens = [1u32, 4, 2, 7, 5];
+    let rows_before = tracer.rows();
+    let _ = logits(&mut cached, &tokens, 0);
+    // Two layers, two experts per row, five rows (other tests in this
+    // process may add rows of their own; never fewer).
+    assert!(
+        tracer.rows() >= rows_before + 2 * 2 * 5,
+        "trace rows: {}",
+        tracer.rows()
+    );
+    let t = cached.expert_phase_timing().unwrap();
+    assert_eq!(t.passes, 0, "prefill is not a decode step: {t:?}");
+    for (i, tok) in [3u32, 3, 8].iter().enumerate() {
+        let _ = logits(&mut cached, &[*tok], tokens.len() + i);
+    }
+    let t = cached.expert_phase_timing().unwrap();
+    assert_eq!(t.passes, 3, "{t:?}");
+    assert!(t.pass_ns > 0 && t.host_ns > 0, "{t:?}");
+    assert!(t.miss_experts > 0, "{t:?}");
+    assert!(t.miss_pages > 0, "page probe on: {t:?}");
+    assert!(t.miss_pages_resident <= t.miss_pages, "{t:?}");
+    assert!(
+        t.pass_ns >= t.device_launch_ns + t.host_ns + t.device_wait_ns,
+        "{t:?}"
+    );
+    let line = t.describe("decode step");
+    assert!(
+        line.contains("host experts") && line.contains("pages resident"),
+        "{line}"
+    );
+
+    tracer.flush();
+    let text = std::fs::read_to_string(&trace_path).unwrap();
+    let parsed = joshua::cache_sim::Trace::parse(&text).unwrap();
+    assert!(parsed.decode_steps() >= 3, "{}", parsed.decode_steps());
+    let cfg = joshua::cache_sim::Config {
+        slots: 3,
+        prefill_inserts: false,
+    };
+    let r = joshua::cache_sim::simulate(&parsed, joshua::cache_sim::Policy::Lru, &cfg);
+    assert!(r.decode_visits >= 3 * 2, "{r:?}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// Loading a qwen3moe model with a non-zero `device_expert_cache_bytes`
 /// budget threads a per-layer `DeviceResidency` into every MoE block; on the
 /// CPU the device form wraps the same host weights, so a mixed-residency run

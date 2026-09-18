@@ -72,6 +72,156 @@ pub trait MmapPrefetch: Send + Sync + 'static {
     /// Issue a best-effort `MADV_WILLNEED` for this block range.  Never
     /// blocks and never fails the caller.
     fn prefetch(&self);
+
+    /// The byte range this handle covers inside its mapping, for page
+    /// accounting and release ([`MappedRange`]).  `None` for handles that
+    /// are not backed by a mapping (test doubles).
+    fn mapped_range(&self) -> Option<MappedRange> {
+        None
+    }
+}
+
+/// A byte range inside a read-only file mapping: the unit the expert
+/// residency code accounts for and releases.
+///
+/// The mapping covers the model file from offset 0, so `offset` is also the
+/// file offset — which is what [`MappedRange::evict_from_cache`] needs.
+#[derive(Clone)]
+pub struct MappedRange {
+    mmap: Arc<Mmap>,
+    /// Byte offset of the range inside the mapping (and the file).
+    pub offset: usize,
+    /// Length in bytes.
+    pub len: usize,
+}
+
+impl std::fmt::Debug for MappedRange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MappedRange")
+            .field("offset", &self.offset)
+            .field("len", &self.len)
+            .finish()
+    }
+}
+
+/// The system page size (bytes).
+fn page_size() -> usize {
+    #[cfg(unix)]
+    {
+        // SAFETY: sysconf has no preconditions.
+        let n = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if n > 0 {
+            return n as usize;
+        }
+    }
+    4096
+}
+
+impl MappedRange {
+    fn new(mmap: &Arc<Mmap>, ptr: *const u8, len: usize) -> Self {
+        let offset = ptr as usize - mmap.as_ptr() as usize;
+        Self {
+            mmap: Arc::clone(mmap),
+            offset,
+            len,
+        }
+    }
+
+    /// The whole pages strictly inside the range, `(offset, len)`; `None`
+    /// when the range holds no whole page.  Partial pages at either end are
+    /// shared with a neighbouring tensor, so page-granular release leaves
+    /// them alone.
+    fn inner_pages(&self) -> Option<(usize, usize)> {
+        let page = page_size();
+        let start = self.offset.div_ceil(page) * page;
+        let end = (self.offset + self.len) / page * page;
+        (end > start).then_some((start, end - start))
+    }
+
+    /// The whole pages that cover the range (start rounded down, end up).
+    fn covering_pages(&self) -> (usize, usize) {
+        let page = page_size();
+        let start = self.offset / page * page;
+        let end = (self.offset + self.len).div_ceil(page) * page;
+        (start, end - start)
+    }
+
+    /// How many of the pages covering this range are resident in memory
+    /// right now, as `(resident, total)`.  `None` where the kernel cannot
+    /// tell us (non-Linux, or a `mincore` failure).
+    pub fn resident_pages(&self) -> Option<(usize, usize)> {
+        #[cfg(target_os = "linux")]
+        {
+            let (start, len) = self.covering_pages();
+            if len == 0 || start + len > self.mmap.len().div_ceil(page_size()) * page_size() {
+                return None;
+            }
+            let page = page_size();
+            let n = len.div_ceil(page);
+            let mut vec = vec![0u8; n];
+            // SAFETY: `start` is page-aligned and `[start, start + len)` lies
+            // within the mapping (checked above, rounded to whole pages the
+            // mapping itself occupies); `vec` holds one byte per page.
+            let rc = unsafe {
+                libc::mincore(
+                    self.mmap.as_ptr().add(start) as *mut libc::c_void,
+                    len,
+                    vec.as_mut_ptr() as *mut libc::c_uchar,
+                )
+            };
+            if rc != 0 {
+                return None;
+            }
+            let resident = vec.iter().filter(|b| *b & 0x1 != 0).count();
+            return Some((resident, n));
+        }
+        #[allow(unreachable_code)]
+        None
+    }
+
+    /// Drop this range's whole pages from the process (`MADV_DONTNEED`), so
+    /// the mapping no longer holds them and the page cache may reclaim them.
+    /// Safe on a read-only file mapping: the next touch re-faults the same
+    /// bytes from the file.  Best-effort; a no-op off Unix.
+    pub fn drop_pages(&self) {
+        #[cfg(unix)]
+        if let Some((start, len)) = self.inner_pages() {
+            if start + len <= self.mmap.len() {
+                // SAFETY: page-aligned range inside a read-only, file-backed
+                // mapping; DONTNEED on such a mapping only discards clean
+                // pages that re-fault from the file.
+                let _ = unsafe {
+                    libc::madvise(
+                        self.mmap.as_ptr().add(start) as *mut libc::c_void,
+                        len,
+                        libc::MADV_DONTNEED,
+                    )
+                };
+            }
+        }
+    }
+
+    /// Ask the kernel to evict this range's whole pages from the page cache
+    /// (`posix_fadvise(POSIX_FADV_DONTNEED)` on `file`, the mapped file).
+    /// Only pages no mapping still holds are dropped, so call
+    /// [`MappedRange::drop_pages`] first.  Best-effort; a no-op off Linux.
+    pub fn evict_from_cache(&self, file: &std::fs::File) {
+        #[cfg(target_os = "linux")]
+        if let Some((start, len)) = self.inner_pages() {
+            use std::os::unix::io::AsRawFd;
+            // SAFETY: a plain advisory syscall on an open descriptor.
+            let _ = unsafe {
+                libc::posix_fadvise(
+                    file.as_raw_fd(),
+                    start as libc::off_t,
+                    len as libc::off_t,
+                    libc::POSIX_FADV_DONTNEED,
+                )
+            };
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = file;
+    }
 }
 
 impl<T: GgmlType + 'static> MmapPrefetch for MmapBlocks<T> {
@@ -80,6 +230,14 @@ impl<T: GgmlType + 'static> MmapPrefetch for MmapBlocks<T> {
         let off = self.ptr as usize - base;
         let len = self.len * std::mem::size_of::<T>();
         let _ = self._mmap.advise_range(memmap2::Advice::WillNeed, off, len);
+    }
+
+    fn mapped_range(&self) -> Option<MappedRange> {
+        Some(MappedRange::new(
+            &self._mmap,
+            self.ptr as *const u8,
+            self.len * std::mem::size_of::<T>(),
+        ))
     }
 }
 
@@ -228,6 +386,14 @@ impl MmapPrefetch for MmapBlocksIq2Xxs {
         let len = self.len * crate::iq2xxs::BLOCK_BYTES;
         let _ = self._mmap.advise_range(memmap2::Advice::WillNeed, off, len);
     }
+
+    fn mapped_range(&self) -> Option<MappedRange> {
+        Some(MappedRange::new(
+            &self._mmap,
+            self.ptr as *const u8,
+            self.len * crate::iq2xxs::BLOCK_BYTES,
+        ))
+    }
 }
 
 impl MmapBlocksIq2Xxs {
@@ -328,6 +494,14 @@ impl MmapPrefetch for MmapBlocksMxfp4 {
         let off = self.ptr as usize - base;
         let len = self.len * std::mem::size_of::<crate::mxfp4::BlockMxfp4>();
         let _ = self._mmap.advise_range(memmap2::Advice::WillNeed, off, len);
+    }
+
+    fn mapped_range(&self) -> Option<MappedRange> {
+        Some(MappedRange::new(
+            &self._mmap,
+            self.ptr as *const u8,
+            self.len * std::mem::size_of::<crate::mxfp4::BlockMxfp4>(),
+        ))
     }
 }
 
@@ -1172,6 +1346,87 @@ mod tests {
         assert_eq!(rc, 0, "mincore failed");
         let resident = vec.iter().filter(|b| *b & 0x1 != 0).count();
         resident as f64 / n as f64
+    }
+
+    /// A mapped range reports its page residency, `drop_pages` +
+    /// `evict_from_cache` release it, and touching it again re-faults the
+    /// same bytes.
+    ///
+    /// `mincore` reports page-cache residency for a file mapping, and
+    /// `posix_fadvise(DONTNEED)` only frees the page-cache folios that lie
+    /// wholly inside the range (a large folio straddling an edge is
+    /// deactivated instead), so the assertion is "most of a 6 MiB range
+    /// goes", not "every page".
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mapped_range_accounts_and_releases_pages() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("joshua-mr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("blocks.bin");
+        let len = 12 * 1024 * 1024;
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            let chunk = vec![0x3cu8; 1024 * 1024];
+            for _ in 0..(len / chunk.len()) {
+                f.write_all(&chunk).unwrap();
+            }
+            f.sync_all().unwrap();
+        }
+        let file = Arc::new(std::fs::File::open(&path).unwrap());
+        let mmap = Arc::new(unsafe { Mmap::map(&file).unwrap() });
+        // An f32 handle over the middle 6 MiB, at a deliberately unaligned
+        // (but 4-byte aligned) offset so partial edge pages exist.
+        let n_blocks = 6 * 1024 * 1024 / 4;
+        let handle = MmapBlocks::<f32>::borrow(&mmap, 3 * 1024 * 1024 + 100, n_blocks).unwrap();
+        let range = handle.mapped_range().unwrap();
+        assert_eq!(range.offset, 3 * 1024 * 1024 + 100);
+        assert_eq!(range.len, n_blocks * 4);
+
+        // Touch every byte: the pages are resident afterwards.
+        let expect = u64::from(0x3c3c3c3cu32) * n_blocks as u64;
+        let sum: u64 = handle.blocks().iter().map(|v| u64::from(v.to_bits())).sum();
+        assert_eq!(sum, expect);
+        let (res, total) = range.resident_pages().expect("mincore works on linux");
+        assert!(total > 0);
+        assert_eq!(res, total, "just-touched pages are resident");
+
+        range.drop_pages();
+        range.evict_from_cache(&file);
+        let (res_after, _) = range.resident_pages().unwrap();
+        if res_after == res {
+            // Can this environment drop file pages at all?  (tmpfs cannot.)
+            // A whole-file DONTNEED is the reference; skip rather than
+            // flake when even that keeps everything resident.
+            use std::os::unix::io::AsRawFd;
+            unsafe {
+                libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
+            }
+            if range.resident_pages().unwrap().0 == res {
+                eprintln!("mapped_range test skipped: pages not droppable here");
+                drop(handle);
+                drop(mmap);
+                std::fs::remove_dir_all(&dir).ok();
+                return;
+            }
+            panic!("range release dropped nothing although a whole-file release does");
+        }
+        // At least the whole 2 MiB-aligned folios inside the range are gone:
+        // two of them fit in a 6 MiB range at any alignment.
+        assert!(
+            res_after + 2 * 512 <= res,
+            "resident after release: {res_after}/{total}"
+        );
+
+        // Re-touching re-faults the same bytes.
+        let sum: u64 = handle.blocks().iter().map(|v| u64::from(v.to_bits())).sum();
+        assert_eq!(sum, expect);
+        let (res, _) = range.resident_pages().unwrap();
+        assert_eq!(res, total);
+
+        drop(handle);
+        drop(mmap);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The prefetch thread must stream a dropped range back into the page cache
