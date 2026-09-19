@@ -151,49 +151,62 @@ impl Trace {
         set.len()
     }
 
-    /// The lookups a call performs, per layer: distinct experts in first-seen
-    /// order (the dispatch buckets per expert).
+    /// The lookups a call performs, as the dispatch groups that run in
+    /// order: per layer, and for a streamed prefill per chunk within the
+    /// layer (layer-outer, chunk-inner, as the streaming sweep runs), the
+    /// distinct experts of that dispatch in first-seen order.
     fn lookups(call: &Call) -> Vec<Vec<Key>> {
-        call.layers
-            .iter()
-            .enumerate()
-            .map(|(l, visits)| {
+        let mut groups = Vec::new();
+        for (l, visits) in call.layers.iter().enumerate() {
+            let mut chunks: Vec<u32> = visits.iter().map(|v| v.chunk).collect();
+            chunks.sort_unstable();
+            chunks.dedup();
+            for chunk in chunks {
                 let mut seen = HashSet::new();
-                visits
-                    .iter()
-                    .filter(|v| seen.insert(v.expert))
-                    .map(|v| (l as u32, v.expert))
-                    .collect()
-            })
-            .collect()
+                groups.push(
+                    visits
+                        .iter()
+                        .filter(|v| v.chunk == chunk && seen.insert(v.expert))
+                        .map(|v| (l as u32, v.expert))
+                        .collect(),
+                );
+            }
+        }
+        groups
     }
 
-    /// What the hot-set counters record for a call: every distinct expert
-    /// per layer of a decode step; for a prefill, the last row of *each
-    /// chunk* per layer (the loader records after every layer-chunk pass).
+    /// What the hot-set counters record for a call, as the groups the
+    /// loader records: every distinct expert per layer of a decode step;
+    /// for a prefill, the last row of *each chunk* per layer as its own
+    /// group (the loader records after every layer-chunk pass, so an expert
+    /// in two chunks' final rows earns two observations).
     fn recorded(call: &Call) -> Vec<Vec<Key>> {
         match call.phase {
             Phase::Decode => Self::lookups(call),
-            Phase::Prefill => call
-                .layers
-                .iter()
-                .enumerate()
-                .map(|(l, visits)| {
-                    let mut last_row: HashMap<u32, u32> = HashMap::new();
-                    for v in visits {
-                        let r = last_row.entry(v.chunk).or_insert(v.row);
-                        *r = (*r).max(v.row);
+            Phase::Prefill => {
+                let mut groups = Vec::new();
+                for (l, visits) in call.layers.iter().enumerate() {
+                    let mut chunks: Vec<u32> = visits.iter().map(|v| v.chunk).collect();
+                    chunks.sort_unstable();
+                    chunks.dedup();
+                    for chunk in chunks {
+                        let last_row = visits
+                            .iter()
+                            .filter(|v| v.chunk == chunk)
+                            .map(|v| v.row)
+                            .max();
+                        let mut last: Vec<Key> = visits
+                            .iter()
+                            .filter(|v| v.chunk == chunk && Some(v.row) == last_row)
+                            .map(|v| (l as u32, v.expert))
+                            .collect();
+                        last.sort_unstable();
+                        last.dedup();
+                        groups.push(last);
                     }
-                    let mut last: Vec<Key> = visits
-                        .iter()
-                        .filter(|v| last_row.get(&v.chunk) == Some(&v.row))
-                        .map(|v| (l as u32, v.expert))
-                        .collect();
-                    last.sort_unstable();
-                    last.dedup();
-                    last
-                })
-                .collect(),
+                }
+                groups
+            }
         }
     }
 
@@ -874,9 +887,11 @@ mod tests {
         );
     }
 
-    /// A streamed prefill's hot-set record is each chunk's last row (what
-    /// the loader records after every layer-chunk pass); the pool seed is
-    /// the final chunk's last row only.
+    /// A streamed prefill's hot-set record is each chunk's last row as its
+    /// own group (what the loader records after every layer-chunk pass, so
+    /// an expert in two chunks' final rows counts twice); its lookups are
+    /// one dispatch per chunk in sweep order; the pool seed is the final
+    /// chunk's last row only.
     #[test]
     fn streamed_prefill_records_each_chunks_last_row() {
         let call = Call {
@@ -884,12 +899,20 @@ mod tests {
             layers: vec![vec![
                 visit(0, 0, 1),
                 visit(0, 1, 2), // chunk 0 ends on expert 2
-                visit(1, 2, 3),
-                visit(1, 3, 4), // chunk 1 (the last) ends on expert 4
+                visit(1, 2, 2), // chunk 1 (the last) ends on experts 2 and 4
+                visit(1, 2, 4),
             ]],
         };
-        assert_eq!(Trace::recorded(&call), vec![vec![(0, 2), (0, 4)]]);
-        assert_eq!(Trace::prefill_seed(&call), vec![vec![(0, 4)]]);
+        assert_eq!(
+            Trace::recorded(&call),
+            vec![vec![(0, 2)], vec![(0, 2), (0, 4)]]
+        );
+        assert_eq!(
+            Trace::lookups(&call),
+            vec![vec![(0, 1), (0, 2)], vec![(0, 2), (0, 4)]],
+            "one dispatch per chunk; expert 2 is looked up in both"
+        );
+        assert_eq!(Trace::prefill_seed(&call), vec![vec![(0, 2), (0, 4)]]);
     }
 
     /// A cyclic sweep one expert wider than the cache: LRU never hits,
