@@ -33,9 +33,20 @@ pub type Key = (u32, u32);
 pub struct Call {
     /// Prefill or decode.
     pub phase: Phase,
-    /// Per layer, the routed `(row, expert)` visits in trace order
-    /// (duplicates kept; a batched decode has several rows).
-    pub layers: Vec<Vec<(u32, u32)>>,
+    /// Per layer, the routed visits in trace order (duplicates kept; a
+    /// batched decode has several rows, a streamed prefill several chunks).
+    pub layers: Vec<Vec<Visit>>,
+}
+
+/// One routed visit of a call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Visit {
+    /// The streamed prefill chunk (0 for a whole-prompt or decode call).
+    pub chunk: u32,
+    /// The token row inside the call (across chunks for a streamed prefill).
+    pub row: u32,
+    /// The expert id.
+    pub expert: u32,
 }
 
 /// A parsed routing trace.
@@ -69,6 +80,9 @@ impl Trace {
                 "d" => Phase::Decode,
                 other => return Err(format!("line {}: phase `{other}`", n + 1)),
             };
+            let chunk: u32 = next("chunk")?
+                .parse()
+                .map_err(|e| format!("line {}: chunk: {e}", n + 1))?;
             let row: u32 = next("row")?
                 .parse()
                 .map_err(|e| format!("line {}: row: {e}", n + 1))?;
@@ -105,7 +119,7 @@ impl Trace {
             if c.layers.len() <= layer {
                 c.layers.resize(layer + 1, Vec::new());
             }
-            c.layers[layer].push((row, expert));
+            c.layers[layer].push(Visit { chunk, row, expert });
         }
         Ok(Self { calls })
     }
@@ -129,8 +143,8 @@ impl Trace {
         let mut set = HashSet::new();
         for c in &self.calls {
             for (l, visits) in c.layers.iter().enumerate() {
-                for &(_, e) in visits {
-                    set.insert((l as u32, e));
+                for v in visits {
+                    set.insert((l as u32, v.expert));
                 }
             }
         }
@@ -147,16 +161,16 @@ impl Trace {
                 let mut seen = HashSet::new();
                 visits
                     .iter()
-                    .filter(|(_, e)| seen.insert(*e))
-                    .map(|&(_, e)| (l as u32, e))
+                    .filter(|v| seen.insert(v.expert))
+                    .map(|v| (l as u32, v.expert))
                     .collect()
             })
             .collect()
     }
 
     /// What the hot-set counters record for a call: every distinct expert
-    /// per layer of a decode step; the last row's experts per layer of a
-    /// prefill (which are also the experts the prefill seeds the pool with).
+    /// per layer of a decode step; for a prefill, the last row of *each
+    /// chunk* per layer (the loader records after every layer-chunk pass).
     fn recorded(call: &Call) -> Vec<Vec<Key>> {
         match call.phase {
             Phase::Decode => Self::lookups(call),
@@ -165,11 +179,15 @@ impl Trace {
                 .iter()
                 .enumerate()
                 .map(|(l, visits)| {
-                    let last_row = visits.iter().map(|(r, _)| *r).max();
+                    let mut last_row: HashMap<u32, u32> = HashMap::new();
+                    for v in visits {
+                        let r = last_row.entry(v.chunk).or_insert(v.row);
+                        *r = (*r).max(v.row);
+                    }
                     let mut last: Vec<Key> = visits
                         .iter()
-                        .filter(|(r, _)| Some(*r) == last_row)
-                        .map(|&(_, e)| (l as u32, e))
+                        .filter(|v| last_row.get(&v.chunk) == Some(&v.row))
+                        .map(|v| (l as u32, v.expert))
                         .collect();
                     last.sort_unstable();
                     last.dedup();
@@ -177,6 +195,31 @@ impl Trace {
                 })
                 .collect(),
         }
+    }
+
+    /// The experts a prefill seeds the pool with: the last row of its
+    /// final chunk, per layer.
+    fn prefill_seed(call: &Call) -> Vec<Vec<Key>> {
+        call.layers
+            .iter()
+            .enumerate()
+            .map(|(l, visits)| {
+                let last_chunk = visits.iter().map(|v| v.chunk).max();
+                let last_row = visits
+                    .iter()
+                    .filter(|v| Some(v.chunk) == last_chunk)
+                    .map(|v| v.row)
+                    .max();
+                let mut last: Vec<Key> = visits
+                    .iter()
+                    .filter(|v| Some(v.chunk) == last_chunk && Some(v.row) == last_row)
+                    .map(|v| (l as u32, v.expert))
+                    .collect();
+                last.sort_unstable();
+                last.dedup();
+                last
+            })
+            .collect()
     }
 }
 
@@ -439,8 +482,10 @@ fn simulate_lru(trace: &Trace, policy: Policy, cfg: &Config) -> Report {
         }
         for keys in Trace::recorded(call) {
             hot.record(&keys);
-            if !decode && !cfg.prefill_inserts {
-                // The last prompt row seeds the pool for the decode that follows.
+        }
+        if !decode && !cfg.prefill_inserts {
+            // The last prompt row seeds the pool for the decode that follows.
+            for keys in Trace::prefill_seed(call) {
                 for key in keys {
                     tier.insert(key);
                 }
@@ -528,7 +573,7 @@ fn simulate_belady(trace: &Trace, cfg: &Config) -> Report {
             }
         }
         if !decode && !cfg.prefill_inserts {
-            for keys in Trace::recorded(call) {
+            for keys in Trace::prefill_seed(call) {
                 for key in keys {
                     seq.push((key, Event::Seed));
                 }
@@ -749,7 +794,9 @@ pub fn simulate_two_tier(trace: &Trace, cfg: &TwoTierConfig) -> TwoTierReport {
         }
         for keys in Trace::recorded(call) {
             hot.record(&keys);
-            if !decode {
+        }
+        if !decode {
+            for keys in Trace::prefill_seed(call) {
                 for key in keys {
                     upload(key, &mut device, &mut host, &mut rep);
                 }
@@ -768,17 +815,21 @@ mod tests {
     use super::*;
 
     /// A one-row decode call.
+    fn visit(chunk: u32, row: u32, expert: u32) -> Visit {
+        Visit { chunk, row, expert }
+    }
+
     fn decode(layers: &[&[u32]]) -> Call {
         Call {
             phase: Phase::Decode,
             layers: layers
                 .iter()
-                .map(|l| l.iter().map(|&e| (0, e)).collect())
+                .map(|l| l.iter().map(|&e| visit(0, 0, e)).collect())
                 .collect(),
         }
     }
 
-    /// A prefill call given as per-layer rows of experts.
+    /// A prefill call given as per-layer rows of experts (one chunk).
     fn prefill(layers: &[&[&[u32]]]) -> Call {
         Call {
             phase: Phase::Prefill,
@@ -787,7 +838,7 @@ mod tests {
                 .map(|rows| {
                     rows.iter()
                         .enumerate()
-                        .flat_map(|(r, es)| es.iter().map(move |&e| (r as u32, e)))
+                        .flat_map(|(r, es)| es.iter().map(move |&e| visit(0, r as u32, e)))
                         .collect()
                 })
                 .collect(),
@@ -796,8 +847,7 @@ mod tests {
 
     #[test]
     fn parses_the_tracer_format() {
-        let text =
-            "call,phase,row,layer,expert\n0,p,0,0,3\n0,p,1,0,3\n0,p,0,1,7\n1,d,0,0,1\n1,d,0,1,2\n";
+        let text = "call,phase,chunk,row,layer,expert\n0,p,0,0,0,3\n0,p,0,1,0,3\n0,p,0,0,1,7\n1,d,0,0,0,1\n1,d,0,0,1,2\n";
         let t = Trace::parse(text).unwrap();
         assert_eq!(
             t,
@@ -807,21 +857,39 @@ mod tests {
         );
         assert_eq!(t.decode_steps(), 1);
         assert_eq!(t.distinct_keys(), 4);
-        assert!(Trace::parse("0,x,0,0,1").is_err());
-        assert!(Trace::parse("0,d,0,0,1,9").is_err(), "too many fields");
-        assert!(Trace::parse("0,d,0,0").is_err(), "too few fields");
+        assert!(Trace::parse("0,x,0,0,0,1").is_err());
+        assert!(Trace::parse("0,d,0,0,0,1,9").is_err(), "too many fields");
+        assert!(Trace::parse("0,d,0,0,1").is_err(), "too few fields");
         assert!(
-            Trace::parse("0,p,0,0,1\n0,d,0,0,2\n").is_err(),
+            Trace::parse("0,p,0,0,0,1\n0,d,0,0,0,2\n").is_err(),
             "a call cannot change phase"
         );
         assert!(
-            Trace::parse("1,d,0,0,1\n0,d,0,0,2\n").is_err(),
+            Trace::parse("1,d,0,0,0,1\n0,d,0,0,0,2\n").is_err(),
             "calls must be in order"
         );
         assert!(
-            Trace::parse("0,d,0,0,1\n0,d,0,1,2\n1,d,0,0,3\n").is_ok(),
+            Trace::parse("0,d,0,0,0,1\n0,d,0,0,1,2\n1,d,0,0,0,3\n").is_ok(),
             "in-order calls parse"
         );
+    }
+
+    /// A streamed prefill's hot-set record is each chunk's last row (what
+    /// the loader records after every layer-chunk pass); the pool seed is
+    /// the final chunk's last row only.
+    #[test]
+    fn streamed_prefill_records_each_chunks_last_row() {
+        let call = Call {
+            phase: Phase::Prefill,
+            layers: vec![vec![
+                visit(0, 0, 1),
+                visit(0, 1, 2), // chunk 0 ends on expert 2
+                visit(1, 2, 3),
+                visit(1, 3, 4), // chunk 1 (the last) ends on expert 4
+            ]],
+        };
+        assert_eq!(Trace::recorded(&call), vec![vec![(0, 2), (0, 4)]]);
+        assert_eq!(Trace::prefill_seed(&call), vec![vec![(0, 4)]]);
     }
 
     /// A cyclic sweep one expert wider than the cache: LRU never hits,
@@ -919,7 +987,14 @@ mod tests {
     fn batched_rows_do_not_widen_the_prefill_seed() {
         let batched = Call {
             phase: Phase::Decode,
-            layers: vec![vec![(0, 1), (0, 2), (1, 2), (1, 3), (2, 4), (2, 5)]],
+            layers: vec![vec![
+                visit(0, 0, 1),
+                visit(0, 0, 2),
+                visit(0, 1, 2),
+                visit(0, 1, 3),
+                visit(0, 2, 4),
+                visit(0, 2, 5),
+            ]],
         };
         let trace = Trace {
             calls: vec![

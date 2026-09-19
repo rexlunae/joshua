@@ -968,8 +968,15 @@ impl<T: DeviceExpertSlot> ExpertUploader<T> {
         if !self.has_release || !self.pool.contains(layer, expert) {
             return;
         }
-        if let Some(tx) = &self.tx {
-            let _ = tx.try_send((layer, expert, true));
+        let sent = self
+            .tx
+            .as_ref()
+            .is_some_and(|tx| tx.try_send((layer, expert, true)).is_ok());
+        if !sent {
+            // That upload keeps its host pages; the counter says so.
+            self.state
+                .dropped
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -1026,7 +1033,8 @@ impl<T: DeviceExpertSlot> ExpertUploader<T> {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Requests dropped because the queue was full.
+    /// Requests, and release notes (`note_resident`), dropped because the
+    /// queue was full.
     pub fn dropped(&self) -> u64 {
         self.state
             .dropped

@@ -162,8 +162,8 @@ warms the pool fastest at the cost of stalling the token for the transfer.
 
 ### Routing trace and the offline cache simulator
 
-`JOSHUA_ROUTE_TRACE=trace.csv` writes every `(call, phase, row, layer,
-expert)` visit of a run to a CSV (one file per process: trace one request
+`JOSHUA_ROUTE_TRACE=trace.csv` writes every `(call, phase, chunk, row,
+layer, expert)` visit of a run to a CSV (one file per process: trace one request
 at a time, since concurrent sessions interleave their calls).  `cargo run --release --example cache_sim
 -- trace.csv --slots 2067 --host-slots 7400` replays it against plain LRU,
 the loader's LRU with the protected hot set, a static most-frequent

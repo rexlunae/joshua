@@ -6,7 +6,7 @@
 //! `(token row, layer, expert)` visit:
 //!
 //! ```text
-//! call,phase,row,layer,expert
+//! call,phase,chunk,row,layer,expert
 //! 0,p,0,0,17
 //! 0,p,0,0,203
 //! …
@@ -59,7 +59,7 @@ impl Tracer {
     /// Create (truncate) the trace file at `path` and write the header.
     pub fn create(path: &std::path::Path) -> std::io::Result<Self> {
         let mut out = std::io::BufWriter::new(std::fs::File::create(path)?);
-        writeln!(out, "call,phase,row,layer,expert")?;
+        writeln!(out, "call,phase,chunk,row,layer,expert")?;
         Ok(Self {
             out: Mutex::new(out),
             // The first `begin_call` makes this 0.
@@ -109,7 +109,12 @@ impl Tracer {
     /// Record one layer's routing: `ids` holds `k` expert ids per token row,
     /// and the rows are numbered from `row_base` (a streamed prefill is one
     /// call whose chunks each start at their offset in the prompt).
-    pub fn record(&self, layer: u32, ids: &[u32], k: usize, row_base: usize) {
+    ///
+    /// `chunk` is the streamed prefill chunk the rows belong to (0 for a
+    /// whole-prompt or decode call): the hot-set counters record each
+    /// chunk's last row, and the simulator needs the boundaries to do the
+    /// same.
+    pub fn record(&self, layer: u32, ids: &[u32], k: usize, row_base: usize, chunk: usize) {
         let call = self.call.load(Ordering::Relaxed);
         let phase = self.phase.load(Ordering::Relaxed) as char;
         let k = k.max(1);
@@ -119,7 +124,7 @@ impl Tracer {
         for (row, per_row) in ids.chunks(k).enumerate() {
             let row = row + row_base;
             for &e in per_row {
-                let _ = writeln!(out, "{call},{phase},{row},{layer},{e}");
+                let _ = writeln!(out, "{call},{phase},{chunk},{row},{layer},{e}");
             }
         }
         self.rows.fetch_add(ids.len() as u64, Ordering::Relaxed);
@@ -163,9 +168,9 @@ pub fn begin_call(phase: Phase) {
 }
 
 /// [`Tracer::record`] on the global tracer, if any.
-pub fn record(layer: u32, ids: &[u32], k: usize, row_base: usize) {
+pub fn record(layer: u32, ids: &[u32], k: usize, row_base: usize, chunk: usize) {
     if let Some(t) = Tracer::global() {
-        t.record(layer, ids, k, row_base);
+        t.record(layer, ids, k, row_base, chunk);
     }
 }
 
@@ -180,29 +185,29 @@ mod tests {
         let path = dir.join("trace.csv");
         let t = Tracer::create(&path).unwrap();
         t.begin_call(Phase::Prefill);
-        t.record(0, &[3, 1, 3, 2], 2, 0); // two rows, k = 2
-        t.record(1, &[7, 7], 2, 0); // one row's worth, duplicates kept
-        t.record(0, &[9, 9], 2, 2); // a second chunk: rows continue at 2
+        t.record(0, &[3, 1, 3, 2], 2, 0, 0); // two rows, k = 2
+        t.record(1, &[7, 7], 2, 0, 0); // one row's worth, duplicates kept
+        t.record(0, &[9, 9], 2, 2, 1); // a second chunk: rows continue at 2
         t.begin_call(Phase::Decode);
-        t.record(0, &[1, 2], 2, 0);
+        t.record(0, &[1, 2], 2, 0, 0);
         t.flush();
         assert_eq!(t.rows(), 10);
         let text = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines[0], "call,phase,row,layer,expert");
+        assert_eq!(lines[0], "call,phase,chunk,row,layer,expert");
         assert_eq!(
             &lines[1..],
             &[
-                "0,p,0,0,3",
-                "0,p,0,0,1",
-                "0,p,1,0,3",
-                "0,p,1,0,2",
-                "0,p,0,1,7",
-                "0,p,0,1,7",
-                "0,p,2,0,9",
-                "0,p,2,0,9",
-                "1,d,0,0,1",
-                "1,d,0,0,2",
+                "0,p,0,0,0,3",
+                "0,p,0,0,0,1",
+                "0,p,0,1,0,3",
+                "0,p,0,1,0,2",
+                "0,p,0,0,1,7",
+                "0,p,0,0,1,7",
+                "0,p,1,2,0,9",
+                "0,p,1,2,0,9",
+                "1,d,0,0,0,1",
+                "1,d,0,0,0,2",
             ]
         );
         drop(t);

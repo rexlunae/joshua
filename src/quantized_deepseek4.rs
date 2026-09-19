@@ -728,6 +728,41 @@ struct Ds4DevicePool {
 /// `Ds4DevicePool::busy`).
 type BusyExperts = std::sync::Mutex<std::collections::HashMap<(u32, u32), u32>>;
 
+/// Holds one host run's count on each of `keys` in a [`BusyExperts`] map,
+/// released on drop — on every exit path, an error or a panic included, so
+/// a failed transfer can never pin an expert's host pages for good.
+struct BusyGuard<'a> {
+    busy: &'a BusyExperts,
+    keys: Vec<(u32, u32)>,
+}
+
+impl<'a> BusyGuard<'a> {
+    fn new(busy: &'a BusyExperts, keys: Vec<(u32, u32)>) -> Self {
+        {
+            let mut map = busy.lock().unwrap_or_else(|p| p.into_inner());
+            for k in &keys {
+                *map.entry(*k).or_insert(0) += 1;
+            }
+        }
+        Self { busy, keys }
+    }
+}
+
+impl Drop for BusyGuard<'_> {
+    fn drop(&mut self) {
+        // Only this run's count: another session may still be on it.
+        let mut map = self.busy.lock().unwrap_or_else(|p| p.into_inner());
+        for k in &self.keys {
+            if let Some(n) = map.get_mut(k) {
+                *n -= 1;
+                if *n == 0 {
+                    map.remove(k);
+                }
+            }
+        }
+    }
+}
+
 /// Per-call dispatch settings a session passes down to its MoE blocks
 /// (never stored in the shared pool: concurrent sessions would race).
 #[derive(Clone)]
@@ -744,6 +779,9 @@ struct DispatchCtx {
     /// Row offset of this call's tokens inside the prompt, for the routing
     /// trace (a streamed prefill is one trace call across its chunks).
     trace_row_base: usize,
+    /// The streamed prefill chunk this call runs (0 otherwise), for the
+    /// routing trace.
+    trace_chunk: usize,
     /// This session's prefill time split (see `ModelWeights::prefill_timing`).
     prefill_timing: Arc<PhaseTiming>,
 }
@@ -1905,7 +1943,7 @@ impl Moe {
         let h = x2.dim(1)?;
         let ids: Vec<u32> = indices.flatten_all()?.to_vec1()?;
         let wts: Vec<f32> = weights.flatten_all()?.to_vec1()?;
-        crate::route_trace::record(self.layer, &ids, k, ctx.trace_row_base);
+        crate::route_trace::record(self.layer, &ids, k, ctx.trace_row_base, ctx.trace_chunk);
         let out_device = x2.device().clone();
         if let Some(pool) = &self.device_pool {
             // Every launch of the previous MoE layer has completed: with the
@@ -2129,27 +2167,9 @@ impl Moe {
             // The release hook must not drop these experts' pages while the
             // host kernels read them.
             let keys: Vec<(u32, u32)> = misses.iter().map(|&e| (self.layer, e as u32)).collect();
-            {
-                let mut busy = pool.busy.lock().unwrap_or_else(|p| p.into_inner());
-                for k in &keys {
-                    *busy.entry(*k).or_insert(0) += 1;
-                }
-            }
+            let _busy = BusyGuard::new(&pool.busy, keys);
             let x_host = crate::moe::on_device(x2, &self.expert_device)?;
-            let y = self.host_experts(&x_host, per_expert, &misses, n_tokens, h);
-            {
-                // Only this run's count: another session may still be on it.
-                let mut busy = pool.busy.lock().unwrap_or_else(|p| p.into_inner());
-                for k in &keys {
-                    if let Some(n) = busy.get_mut(k) {
-                        *n -= 1;
-                        if *n == 0 {
-                            busy.remove(k);
-                        }
-                    }
-                }
-            }
-            Some(y?)
+            Some(self.host_experts(&x_host, per_expert, &misses, n_tokens, h)?)
         };
         let t2 = std::time::Instant::now();
         // The handles this layer launched on go back to the pool's retire
@@ -2914,6 +2934,7 @@ impl ModelWeights {
                 decode: false,
                 seed_prefill: true,
                 trace_row_base: 0,
+                trace_chunk: 0,
                 prefill_timing: Arc::clone(&prefill_timing),
             },
             prefill_timing,
@@ -3005,6 +3026,7 @@ impl ModelWeights {
             decode,
             seed_prefill: true,
             trace_row_base: 0,
+            trace_chunk: 0,
             prefill_timing: Arc::clone(&self.prefill_timing),
         }
     }
@@ -3119,6 +3141,7 @@ impl ModelWeights {
                 decode: false,
                 seed_prefill: true,
                 trace_row_base: 0,
+                trace_chunk: 0,
                 prefill_timing: Arc::clone(&prefill_timing),
             },
             prefill_timing,
@@ -3606,6 +3629,7 @@ impl crate::stream_prefill::StreamPrefill for ModelWeights {
             decode: false,
             seed_prefill: chunk + 1 == n_chunks,
             trace_row_base: row_base,
+            trace_chunk: chunk,
             prefill_timing: Arc::clone(&self.prefill_timing),
         };
     }
