@@ -2,7 +2,8 @@
 //!
 //! # The problem
 //!
-//! The engine prefills a long prompt in bounded chunks ([`crate::engine::PREFILL_CHUNK`])
+//! The engine prefills a long prompt in bounded chunks ([`crate::engine::DEFAULT_PREFILL_CHUNK`]
+//! tokens unless `--prefill-chunk` says otherwise)
 //! so a `[1, n_prompt, hidden]` activation is never materialized in one piece.
 //! Each chunk is fed through *the whole model* ([`crate::model::QuantizedModel::forward`]),
 //! so for a 4096-token prompt split into 8 chunks, every layer's weights are
@@ -58,6 +59,17 @@ pub trait StreamPrefill {
     /// Number of transformer layers (the outer loop bound).
     fn n_layers(&self) -> usize;
 
+    /// Called once before a sweep starts (before any chunk is embedded):
+    /// a hook for per-prefill bookkeeping such as the routing trace.
+    fn begin_stream(&mut self) {}
+
+    /// Called before each `apply_layer_chunk` with the chunk's index, the
+    /// chunk count and the number of prompt tokens before this chunk, so a
+    /// loader can tell the final prompt chunk apart (the deepseek4 device
+    /// expert pool seeds itself from that chunk's last row only) and number
+    /// the chunk's rows within the prompt.  Default: ignored.
+    fn set_stream_progress(&mut self, _chunk: usize, _n_chunks: usize, _row_base: usize) {}
+
     /// Embed `tokens` into one chunk's activation (the layer-`-1` step),
     /// returning whatever activation shape the loader's layers consume.
     fn embed_chunk(&self, tokens: &[u32], device: &Device) -> Result<Tensor>;
@@ -109,6 +121,7 @@ pub fn stream_prefill<M: StreamPrefill + ?Sized>(
         return m.final_logits(&t);
     };
 
+    m.begin_stream();
     // Embed every chunk once (layer -1), into the persistent activation array.
     let mut acts: Vec<Tensor> = chunks
         .iter()
@@ -119,7 +132,10 @@ pub fn stream_prefill<M: StreamPrefill + ?Sized>(
     // across all chunks; each chunk's KV at this layer accumulates in order as
     // we sweep, so attention sees the same KV it would have in linear order.
     for l in 0..m.n_layers() {
+        let mut row_base = 0usize;
         for (c, chunk) in chunks.iter().enumerate() {
+            m.set_stream_progress(c, chunks.len(), row_base);
+            row_base += chunk.tokens.len();
             acts[c] = m.apply_layer_chunk(l, &acts[c], chunk.pos, chunk.tokens)?;
         }
     }

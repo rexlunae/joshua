@@ -625,6 +625,44 @@ mod synthetic {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// The prefill chunk is a memory/batching knob, never a numeric one: a
+    /// prompt prefilled three tokens at a time must generate exactly what the
+    /// default chunk generates.
+    #[test]
+    fn prefill_chunk_does_not_change_generation() {
+        use joshua::{types::GenerationOptions, Engine, EngineOptions};
+
+        let dir = model_dir("prefill-chunk");
+        write_tiny_gguf(&dir.join("model.gguf"), "llama");
+        let options = GenerationOptions {
+            max_tokens: 4,
+            temperature: 0.0,
+            repetition_penalty: 1.0,
+            ..Default::default()
+        };
+        let prompt = "the quick brown fox jumps over the lazy dog again and again";
+
+        let default = Engine::with_n_ctx(&dir, 64).expect("engine should load");
+        let (text_default, usage_default, _, _) = default.complete_raw(prompt, &options).unwrap();
+        drop(default);
+
+        let chunked = Engine::with_options(&dir, EngineOptions::with_n_ctx(64).prefill_chunk(3))
+            .expect("engine should load with a 3-token prefill chunk");
+        let (text_chunked, usage_chunked, _, _) = chunked.complete_raw(prompt, &options).unwrap();
+
+        assert!(
+            usage_default.prompt_tokens > 3,
+            "the prompt must span several chunks"
+        );
+        assert_eq!(usage_chunked.prompt_tokens, usage_default.prompt_tokens);
+        assert_eq!(
+            text_chunked, text_default,
+            "chunking changed the greedy output"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn concurrency_cap_rejects_when_full() {
         use joshua::{types::GenerationOptions, ChatMessage, Engine};

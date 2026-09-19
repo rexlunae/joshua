@@ -551,6 +551,10 @@ prints the dense/expert split of any GGUF to sanity-check a new model.
 | `JOSHUA_DENSE_PLACEMENT` | Same as `--dense-placement` (`auto`, `device`, or `cpu`) |
 | `JOSHUA_VRAM_EXPERT_CACHE` | Same as `--vram-expert-cache` (`auto` or MiB of device memory for the bounded expert cache) |
 | `JOSHUA_EXPERT_MISS` | `upload` makes the VRAM expert cache upload decode misses synchronously (measurement mode; default: host run + background upload) |
+| `JOSHUA_EXPERT_HOST_PAGES` | `keep` leaves an uploaded expert's host pages in the page cache; the default releases them so RAM and VRAM hold different experts |
+| `JOSHUA_EXPERT_STATS` | `1` probes host-miss page residency for the decode time split logged with the VRAM expert cache |
+| `JOSHUA_ROUTE_TRACE` | Path of a routing-trace CSV to write, for `cargo run --example cache_sim` |
+| `JOSHUA_PREFILL_CHUNK` | Tokens per prefill chunk (default 512; also `--prefill-chunk`) |
 | `JOSHUA_SKIP_PLACEMENT_BENCH` | Skip the startup quantized-matmul probe that `auto` dense placement uses |
 | `JOSHUA_OPENCL_NATIVE` / `JOSHUA_VULKAN_NATIVE` | `0` runs every operator through the CPU round-trip instead of the device kernels (default on) |
 | `JOSHUA_OPENCL_TRACE` / `JOSHUA_VULKAN_TRACE` | `1` logs each operator that falls back to the CPU and why |

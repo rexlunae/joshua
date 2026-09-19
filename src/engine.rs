@@ -373,6 +373,19 @@ pub struct EngineOptions {
     /// `Some(n)` is the byte budget (from `--vram-expert-cache`), and the
     /// engine raises it against the device's free memory when `auto`.
     pub device_expert_cache: Option<u64>,
+    /// Tokens per prefill chunk; `0` selects [`DEFAULT_PREFILL_CHUNK`].
+    ///
+    /// A prompt is prefilled in chunks of this many tokens.  The chunk bounds
+    /// the per-layer transient workspace (attention scores, MoE dispatch
+    /// buffers) and, for the MoE loaders, sets how many prompt rows each
+    /// routed expert sees per matmul: a larger chunk batches more rows per
+    /// expert (fewer, wider kernel launches on a device expert cache) at the
+    /// cost of a larger per-layer workspace.  The joshua-native MoE loaders
+    /// stream the prefill layer by layer, so each layer's weights are read
+    /// once per prefill whatever the chunk; on the other architectures every
+    /// chunk re-reads the whole model, so a larger chunk also means fewer
+    /// passes over the weights.
+    pub prefill_chunk: usize,
     /// Where a sparse MoE model's routed experts live when inference runs on
     /// an accelerator: uploaded to the device, or kept in host RAM (borrowed
     /// from the mapping, run on the CPU expert kernels, activations hopping
@@ -477,6 +490,13 @@ impl EngineOptions {
         self
     }
 
+    /// Set the tokens per prefill chunk (`0` = the default).  See
+    /// [`EngineOptions::prefill_chunk`].
+    pub fn prefill_chunk(mut self, tokens: usize) -> Self {
+        self.prefill_chunk = tokens;
+        self
+    }
+
     /// Choose where the routed experts of a MoE model live on an
     /// accelerator.  See [`EngineOptions::expert_placement`].
     pub fn expert_placement(mut self, placement: ExpertPlacement) -> Self {
@@ -577,6 +597,9 @@ pub struct Engine {
     /// Bounded VRAM expert-cache byte budget (see
     /// [`EngineOptions::device_expert_cache`]); `None` disables.
     device_expert_cache: Option<u64>,
+    /// Tokens per prefill chunk (see [`EngineOptions::prefill_chunk`]),
+    /// resolved to at least one token.
+    prefill_chunk: usize,
     /// Compute device: CUDA or Metal when built with the matching feature
     /// (falling back to CPU if unavailable at runtime), CPU otherwise.
     device: Device,
@@ -623,10 +646,12 @@ pub struct Engine {
 /// pressure.
 const LOW_MEM_FLOOR: u64 = 1536 * 1024 * 1024; // 1.5 GiB
 
-/// Tokens processed per prefill batch, bounding the transient activation
-/// tensor for a long prompt (finding #4).  512 keeps memory flat for a huge
-/// prompt without re-reading expert weights so often that it dominates.
-const PREFILL_CHUNK: usize = 512;
+/// Default tokens per prefill chunk ([`EngineOptions::prefill_chunk`]),
+/// bounding the transient activation tensor for a long prompt (finding #4).
+/// 512 keeps memory flat for a huge prompt without re-reading expert weights
+/// so often that it dominates on the architectures without a layer-streaming
+/// prefill.
+pub const DEFAULT_PREFILL_CHUNK: usize = 512;
 
 /// Maximum number of idle model instances kept warm in the pool.
 ///
@@ -981,6 +1006,10 @@ impl Engine {
         };
         let pin_hot_experts = options.pin_hot_experts;
         let expert_cache_auto = options.expert_cache_auto;
+        let prefill_chunk = match options.prefill_chunk {
+            0 => DEFAULT_PREFILL_CHUNK,
+            n => n,
+        };
         let raw_path = model_path.as_ref().to_path_buf();
 
         // Resolve the actual .gguf file path.
@@ -1387,6 +1416,7 @@ impl Engine {
             pin_hot_experts,
             expert_cache_auto,
             device_expert_cache,
+            prefill_chunk,
             device,
             dense_device,
             expert_device,
@@ -1954,10 +1984,11 @@ impl Engine {
             // once per chunk.  Falls back to the standard chunked loop for
             // architectures without a native streaming path (or when a piece
             // would exceed the KV cap mid-chunk; see below).
+            let chunk = self.prefill_chunk;
             let chunks: Vec<crate::stream_prefill::Chunk> = (0..new_tokens.len())
-                .step_by(PREFILL_CHUNK)
+                .step_by(chunk)
                 .map(|piece_start| {
-                    let end = (piece_start + PREFILL_CHUNK).min(new_tokens.len());
+                    let end = (piece_start + chunk).min(new_tokens.len());
                     let piece = &new_tokens[piece_start..end];
                     crate::stream_prefill::Chunk {
                         tokens: piece,
@@ -1977,8 +2008,8 @@ impl Engine {
                 _ => {
                     // Streamed prefill unsupported on this architecture, or a
                     // KV-cap guard tripped — fall back to the per-chunk loop.
-                    for piece_start in (0..new_tokens.len()).step_by(PREFILL_CHUNK) {
-                        let end = (piece_start + PREFILL_CHUNK).min(new_tokens.len());
+                    for piece_start in (0..new_tokens.len()).step_by(chunk) {
+                        let end = (piece_start + chunk).min(new_tokens.len());
                         let piece = &new_tokens[piece_start..end];
                         last = model.forward_tokens(piece, base + piece_start, &self.dense_device)?;
                     }

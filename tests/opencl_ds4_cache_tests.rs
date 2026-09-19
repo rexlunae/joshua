@@ -186,8 +186,23 @@ fn exercise(
             "{what}: budget respected: {r:?}"
         );
     }
+    // Exclusive tiers: a moment after an upload settles, the expert's host
+    // pages are released (this is a real device, so the policy applies).
+    // Parity must survive it: a later host miss re-faults the same bytes.
+    std::thread::sleep(joshua::residency::HOST_RELEASE_DELAY + std::time::Duration::from_millis(300));
+    cached.wait_for_expert_uploads();
+    assert_close(
+        &format!("{what}: decode after the host pages were released"),
+        &logits(cached, &[3], tokens.len() + 7, dense),
+        &logits(plain, &[3], tokens.len() + 7, &Device::Cpu),
+    );
+    cached.wait_for_expert_uploads();
     let r = cached.device_expert_cache().unwrap();
     eprintln!("{what}: {r:?}");
+    assert!(
+        r.host_releases > 0,
+        "{what}: host pages of uploaded experts were released: {r:?}"
+    );
     if expect_hits {
         assert!(
             r.stats.hits > 0,

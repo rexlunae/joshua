@@ -567,6 +567,15 @@ impl QuantizedModel {
         }
     }
 
+    /// The device expert pool's decode time split and host-miss page
+    /// residency (`deepseek4`); `None` without a pool.
+    pub fn expert_phase_timing(&self) -> Option<crate::quantized_deepseek4::ExpertPhaseTiming> {
+        match self {
+            Self::DeepSeek4(m) => m.expert_phase_timing(),
+            _ => None,
+        }
+    }
+
     /// Block until the device expert pool's background uploads have drained
     /// (tests, diagnostics); a no-op without a pool.
     pub fn wait_for_expert_uploads(&self) {

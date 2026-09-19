@@ -51,6 +51,40 @@ impl ExpertHandles {
         self.up.prefetch();
         self.down.prefetch();
     }
+
+    /// The three mapped byte ranges (empty for handles without a mapping).
+    pub fn mapped_ranges(&self) -> Vec<crate::mmap_tensor::MappedRange> {
+        [&self.gate, &self.up, &self.down]
+            .into_iter()
+            .filter_map(|h| h.mapped_range())
+            .collect()
+    }
+
+    /// How many of the expert's pages are resident in memory right now, as
+    /// `(resident, total)`; `None` when no range can be probed.
+    pub fn resident_pages(&self) -> Option<(usize, usize)> {
+        let mut acc: Option<(usize, usize)> = None;
+        for r in self.mapped_ranges() {
+            if let Some((res, total)) = r.resident_pages() {
+                let (a, b) = acc.unwrap_or((0, 0));
+                acc = Some((a + res, b + total));
+            }
+        }
+        acc
+    }
+
+    /// Release the expert's host pages: drop them from the mapping and,
+    /// when the model `file` is known, from the page cache too.  For an
+    /// expert that is resident on a device, so the RAM it occupied can hold
+    /// experts that are not.  Best-effort.
+    pub fn release_host_pages(&self, file: Option<&std::fs::File>) {
+        for r in self.mapped_ranges() {
+            r.drop_pages();
+            if let Some(f) = file {
+                r.evict_from_cache(f);
+            }
+        }
+    }
 }
 
 /// Where a hot expert's weights live, and how to make them resident on the
@@ -396,6 +430,9 @@ struct PoolState<T> {
     /// `used_bytes` so a second acquire cannot over-commit the budget.
     in_flight: std::collections::HashMap<(u32, u32), u64>,
     hot: std::collections::HashSet<(u32, u32)>,
+    /// Slots under a [`DeviceResidency::with_lease`] callback: never
+    /// evicted or released until the callback returns.
+    leased: std::collections::HashSet<(u32, u32)>,
     used_bytes: u64,
 }
 
@@ -403,6 +440,10 @@ struct Slot<T> {
     payload: Arc<T>,
     bytes: u64,
     last_used: u64,
+    /// Identifies this upload: a later re-upload of the same key gets a
+    /// new generation, so a deferred action taken against the old one
+    /// (the host-page release) can tell it is stale.
+    generation: u64,
 }
 
 impl<T: DeviceExpertSlot> DeviceResidency<T> {
@@ -423,6 +464,7 @@ impl<T: DeviceExpertSlot> DeviceResidency<T> {
                 slots: Default::default(),
                 in_flight: Default::default(),
                 hot: Default::default(),
+                leased: Default::default(),
                 used_bytes: 0,
             }),
             retired: std::sync::Mutex::new(Vec::new()),
@@ -464,7 +506,7 @@ impl<T: DeviceExpertSlot> DeviceResidency<T> {
         let mut victims: Vec<((u32, u32), u64, u64)> = st
             .slots
             .iter()
-            .filter(|(k, _)| !st.hot.contains(k))
+            .filter(|(k, _)| !st.hot.contains(k) && !st.leased.contains(k))
             .map(|(k, s)| (*k, s.last_used, s.bytes))
             .collect();
         victims.sort_unstable_by_key(|(_, last_used, _)| *last_used);
@@ -539,12 +581,14 @@ impl<T: DeviceExpertSlot> DeviceResidency<T> {
                 return;
             }
             st.used_bytes += bytes;
+            let generation = self.tick();
             st.slots.insert(
                 key,
                 Slot {
                     payload,
                     bytes,
-                    last_used: self.tick(),
+                    last_used: generation,
+                    generation,
                 },
             );
             self.uploads
@@ -617,6 +661,49 @@ impl<T: DeviceExpertSlot> DeviceResidency<T> {
         self.lock().slots.contains_key(&(layer, expert))
     }
 
+    /// The generation of the resident slot for `(layer, expert)` (a fresh
+    /// value per upload), or `None` when it is not resident.
+    pub fn generation(&self, layer: u32, expert: u32) -> Option<u64> {
+        self.lock()
+            .slots
+            .get(&(layer, expert))
+            .map(|s| s.generation)
+    }
+
+    /// Run `f` while the slot for `(layer, expert)` is guaranteed to stay
+    /// resident: `None` unless the slot is resident with exactly
+    /// `generation`; otherwise the slot is leased (neither eviction nor
+    /// `release` can remove it) for the duration of `f`, and `f`'s result
+    /// is returned.  The host-page release runs under this, so an
+    /// eviction can never slip in between the generation check and the
+    /// drop and leave an expert with neither a device slot nor host pages.
+    pub fn with_lease<R>(
+        &self,
+        layer: u32,
+        expert: u32,
+        generation: u64,
+        f: impl FnOnce() -> R,
+    ) -> Option<R> {
+        let key = (layer, expert);
+        {
+            let mut st = self.lock();
+            if st.slots.get(&key).map(|s| s.generation) != Some(generation) {
+                return None;
+            }
+            st.leased.insert(key);
+        }
+        // The lease ends when the guard drops: on return and on a panic in
+        // `f`, so a slot can never stay protected for good.
+        struct Unlease<'a, T: DeviceExpertSlot>(&'a DeviceResidency<T>, (u32, u32));
+        impl<T: DeviceExpertSlot> Drop for Unlease<'_, T> {
+            fn drop(&mut self) {
+                self.0.lock().leased.remove(&self.1);
+            }
+        }
+        let _unlease = Unlease(self, key);
+        Some(f())
+    }
+
     /// Protect `(layer, expert)` from LRU eviction (it is in the hot set).
     pub fn mark_hot(&self, layer: u32, expert: u32) {
         self.lock().hot.insert((layer, expert));
@@ -671,6 +758,10 @@ impl<T: DeviceExpertSlot> ExpertResidency for DeviceResidency<T> {
     fn release(&self, layer: u32, expert: u32) {
         let removed = {
             let mut st = self.lock();
+            if st.leased.contains(&(layer, expert)) {
+                // Under a `with_lease` callback: it goes at the next churn.
+                return;
+            }
             let s = st.slots.remove(&(layer, expert));
             if let Some(s) = &s {
                 st.used_bytes = st.used_bytes.saturating_sub(s.bytes);
@@ -713,9 +804,13 @@ impl<T: DeviceExpertSlot> ExpertResidency for DeviceResidency<T> {
 /// full is dropped (counted), never waited on.
 pub struct ExpertUploader<T: DeviceExpertSlot> {
     pool: Arc<DeviceResidency<T>>,
-    tx: Option<std::sync::mpsc::SyncSender<(u32, u32)>>,
+    /// `(layer, expert, resident_only)`: an upload request, or (with the
+    /// flag) a note that the caller uploaded the expert itself and the
+    /// release hook should run for it in due course.
+    tx: Option<std::sync::mpsc::SyncSender<(u32, u32, bool)>>,
     state: Arc<UploaderState>,
     thread: Option<std::thread::JoinHandle<()>>,
+    has_release: bool,
 }
 
 struct UploaderState {
@@ -724,33 +819,142 @@ struct UploaderState {
     idle: std::sync::Condvar,
     dropped: std::sync::atomic::AtomicU64,
     requested: std::sync::atomic::AtomicU64,
+    /// Experts whose host pages the release hook was called for.
+    released: std::sync::atomic::AtomicU64,
 }
 
 /// Requests the uploader holds before dropping new ones.
 pub const UPLOAD_QUEUE_DEPTH: usize = 64;
 
+/// How long after an upload the host-page release hook runs (see
+/// [`ExpertUploader::spawn_with_release`]).
+///
+/// A decode miss runs on the host *while* its upload is requested, so the
+/// pages of a freshly uploaded expert may still be under the host kernels;
+/// releasing them immediately would make that run re-fault mid-matmul.  One
+/// second is longer than any step's host work on the target hosts and costs
+/// nothing in steady state (the pages go a second later).
+pub const HOST_RELEASE_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// A callback run for `(layer, expert)` once its upload has settled (see
+/// [`ExpertUploader::spawn_with_release`]).  Returns whether it released;
+/// `false` means "not now" (the host is still running the expert) and the
+/// uploader retries after another delay, up to [`RELEASE_RETRIES`] times.
+pub type ReleaseHook = Arc<dyn Fn(u32, u32) -> bool + Send + Sync>;
+
+/// How many times a release the hook declined is re-deferred.
+pub const RELEASE_RETRIES: u32 = 3;
+
+/// A host-page release waiting for its delay: due time, key, the slot
+/// generation it was scheduled for, retries left.
+type DeferredRelease = (std::time::Instant, (u32, u32), u64, u32);
+
 impl<T: DeviceExpertSlot> ExpertUploader<T> {
     /// Start the uploader thread for `pool`.
     pub fn spawn(pool: Arc<DeviceResidency<T>>) -> Self {
-        let (tx, rx) = std::sync::mpsc::sync_channel::<(u32, u32)>(UPLOAD_QUEUE_DEPTH);
+        Self::spawn_with_release(pool, None, HOST_RELEASE_DELAY)
+    }
+
+    /// Start the uploader thread for `pool` with a **release hook**: `delay`
+    /// after an expert's upload succeeded, and provided it is still resident
+    /// then, `release(layer, expert)` runs on the uploader thread.  The
+    /// deepseek4 loader drops the expert's host pages there, so the host
+    /// page cache and the device pool hold *different* experts (exclusive
+    /// tiers) instead of the page cache carrying a copy of the card.
+    pub fn spawn_with_release(
+        pool: Arc<DeviceResidency<T>>,
+        release: Option<ReleaseHook>,
+        delay: std::time::Duration,
+    ) -> Self {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<(u32, u32, bool)>(UPLOAD_QUEUE_DEPTH);
+        let has_release = release.is_some();
         let state = Arc::new(UploaderState {
             pending: std::sync::Mutex::new(Default::default()),
             idle: std::sync::Condvar::new(),
             dropped: std::sync::atomic::AtomicU64::new(0),
             requested: std::sync::atomic::AtomicU64::new(0),
+            released: std::sync::atomic::AtomicU64::new(0),
         });
         let (pool2, state2) = (Arc::clone(&pool), Arc::clone(&state));
         let thread = std::thread::Builder::new()
             .name("expert-uploader".into())
             .spawn(move || {
-                while let Ok((l, e)) = rx.recv() {
-                    pool2.acquire(l, e);
-                    let mut pending = state2.pending.lock().unwrap_or_else(|p| p.into_inner());
-                    pending.remove(&(l, e));
-                    if pending.is_empty() {
-                        state2.idle.notify_all();
+                use std::sync::atomic::Ordering::Relaxed;
+                use std::sync::mpsc::RecvTimeoutError;
+                // Uploads whose release is due at the recorded instant.
+                let mut deferred: std::collections::VecDeque<DeferredRelease> = Default::default();
+                let flush = |deferred: &mut std::collections::VecDeque<DeferredRelease>| {
+                    let now = std::time::Instant::now();
+                    let mut retry: Vec<DeferredRelease> = Vec::new();
+                    while let Some((due, key, generation, retries)) = deferred.front().copied() {
+                        if due > now {
+                            break;
+                        }
+                        deferred.pop_front();
+                        let Some(release) = &release else { continue };
+                        // Only the upload this was scheduled for: a key
+                        // evicted and uploaded again since has a new
+                        // generation and its own deadline.  The slot is
+                        // leased while the hook runs, so it cannot be
+                        // evicted between the check and the drop.
+                        match pool2.with_lease(key.0, key.1, generation, || release(key.0, key.1)) {
+                            None => continue,
+                            Some(true) => {
+                                state2.released.fetch_add(1, Relaxed);
+                            }
+                            Some(false) if retries > 0 => {
+                                retry.push((now + delay, key, generation, retries - 1));
+                            }
+                            Some(false) => {}
+                        }
                     }
+                    deferred.extend(retry);
+                };
+                loop {
+                    // Wake for the next due release even when no request
+                    // arrives; without a hook, plain blocking receive.
+                    let next = match (&release, deferred.front()) {
+                        (Some(_), Some((due, _, _, _))) => {
+                            match rx.recv_timeout(
+                                due.saturating_duration_since(std::time::Instant::now()),
+                            ) {
+                                Ok(key) => Some(key),
+                                Err(RecvTimeoutError::Timeout) => None,
+                                Err(RecvTimeoutError::Disconnected) => break,
+                            }
+                        }
+                        _ => match rx.recv() {
+                            Ok(key) => Some(key),
+                            Err(_) => break,
+                        },
+                    };
+                    if let Some((l, e, resident_only)) = next {
+                        if !resident_only {
+                            pool2.acquire(l, e);
+                        }
+                        if release.is_some() {
+                            if let Some(generation) = pool2.generation(l, e) {
+                                deferred.push_back((
+                                    std::time::Instant::now() + delay,
+                                    (l, e),
+                                    generation,
+                                    RELEASE_RETRIES,
+                                ));
+                            }
+                        }
+                        if !resident_only {
+                            let mut pending =
+                                state2.pending.lock().unwrap_or_else(|p| p.into_inner());
+                            pending.remove(&(l, e));
+                            if pending.is_empty() {
+                                state2.idle.notify_all();
+                            }
+                        }
+                    }
+                    flush(&mut deferred);
                 }
+                // Channel closed: run the releases that are already due.
+                flush(&mut deferred);
             })
             .expect("spawn expert uploader thread");
         Self {
@@ -758,6 +962,28 @@ impl<T: DeviceExpertSlot> ExpertUploader<T> {
             tx: Some(tx),
             state,
             thread: Some(thread),
+            has_release,
+        }
+    }
+
+    /// Tell the uploader that the caller made `(layer, expert)` resident
+    /// itself (a synchronous `DeviceResidency::acquire`), so the release
+    /// hook runs for it after the delay as it would for a background
+    /// upload.  A no-op without a hook; dropped (never waited on) when the
+    /// queue is full.
+    pub fn note_resident(&self, layer: u32, expert: u32) {
+        if !self.has_release || !self.pool.contains(layer, expert) {
+            return;
+        }
+        let sent = self
+            .tx
+            .as_ref()
+            .is_some_and(|tx| tx.try_send((layer, expert, true)).is_ok());
+        if !sent {
+            // That upload keeps its host pages; the counter says so.
+            self.state
+                .dropped
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -779,7 +1005,10 @@ impl<T: DeviceExpertSlot> ExpertUploader<T> {
         self.state
             .requested
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let sent = self.tx.as_ref().is_some_and(|tx| tx.try_send(key).is_ok());
+        let sent = self
+            .tx
+            .as_ref()
+            .is_some_and(|tx| tx.try_send((key.0, key.1, false)).is_ok());
         if !sent {
             self.state
                 .dropped
@@ -811,10 +1040,18 @@ impl<T: DeviceExpertSlot> ExpertUploader<T> {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Requests dropped because the queue was full.
+    /// Requests, and release notes (`note_resident`), dropped because the
+    /// queue was full.
     pub fn dropped(&self) -> u64 {
         self.state
             .dropped
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Experts the release hook has run for (0 without a hook).
+    pub fn released(&self) -> u64 {
+        self.state
+            .released
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
@@ -837,8 +1074,9 @@ impl<T: DeviceExpertSlot> Drop for ExpertUploader<T> {
 /// Host residency plus an optional device slot pool, behind the one
 /// [`ExpertResidency`] handle a loader stores.
 ///
-/// `acquire` advises the host pages (the CPU backend) *and* asks the
-/// uploader for a device slot in the background; `capacity` stays the host
+/// `acquire` advises the host pages (the CPU backend) — unless the expert
+/// is already resident on the device, whose copy is the one that runs — *and*
+/// asks the uploader for a device slot in the background; `capacity` stays the host
 /// count (it sizes the host hot-expert budget, a different unit from device
 /// slots — those are reported through [`CompositeResidency::device`]).  The
 /// hot set is advisory and model-wide: sessions sharing the weights replace
@@ -847,6 +1085,9 @@ pub struct CompositeResidency<T: DeviceExpertSlot> {
     cpu: CpuResidency,
     device: Option<Arc<DeviceResidency<T>>>,
     uploader: Option<Arc<ExpertUploader<T>>>,
+    /// Advise the host pages of device-resident experts too (inclusive
+    /// tiers).  Off by default: see `acquire`.
+    advise_device_resident: bool,
 }
 
 impl<T: DeviceExpertSlot> CompositeResidency<T> {
@@ -856,11 +1097,13 @@ impl<T: DeviceExpertSlot> CompositeResidency<T> {
             cpu,
             device: None,
             uploader: None,
+            advise_device_resident: false,
         }
     }
 
     /// Host residency plus a device pool, filled through `uploader` (the
-    /// loader shares the same uploader with its dispatch).
+    /// loader shares the same uploader with its dispatch).  Exclusive
+    /// tiers: host advice skips device-resident experts.
     pub fn with_device_pool(
         cpu: CpuResidency,
         pool: Arc<DeviceResidency<T>>,
@@ -870,7 +1113,15 @@ impl<T: DeviceExpertSlot> CompositeResidency<T> {
             cpu,
             device: Some(pool),
             uploader: Some(uploader),
+            advise_device_resident: false,
         }
+    }
+
+    /// Advise the host pages of device-resident experts as well (the
+    /// inclusive layout a loader that keeps host pages wants).
+    pub fn advise_device_resident(mut self, yes: bool) -> Self {
+        self.advise_device_resident = yes;
+        self
     }
 
     /// The device pool, when one exists.
@@ -901,6 +1152,9 @@ pub struct DeviceCacheReport {
     pub upload_requests: u64,
     /// Background upload requests dropped on a full queue.
     pub upload_drops: u64,
+    /// Experts whose host pages were released after their upload (0 when
+    /// the loader keeps host pages).
+    pub host_releases: u64,
 }
 
 impl DeviceCacheReport {
@@ -917,13 +1171,24 @@ impl DeviceCacheReport {
             stats: pool.stats(),
             upload_requests: uploader.map_or(0, |u| u.requested()),
             upload_drops: uploader.map_or(0, |u| u.dropped()),
+            host_releases: uploader.map_or(0, |u| u.released()),
         }
     }
 }
 
 impl<T: DeviceExpertSlot> ExpertResidency for CompositeResidency<T> {
     fn acquire(&self, layer: u32, expert: u32) {
-        self.cpu.acquire(layer, expert);
+        // An expert resident on the device runs there: advising its host
+        // pages would only duplicate the card's contents in the page cache,
+        // evicting experts the host still has to run (the two tiers are
+        // exclusive; see `ExpertUploader::spawn_with_release`).
+        let on_device = self
+            .device
+            .as_ref()
+            .is_some_and(|d| d.contains(layer, expert));
+        if self.advise_device_resident || !on_device {
+            self.cpu.acquire(layer, expert);
+        }
         if let Some(u) = &self.uploader {
             u.request(layer, expert);
         }
@@ -1134,6 +1399,235 @@ mod device_pool_tests {
             CompositeResidency::host(CpuResidency::new(vec![]));
         host_only.acquire(0, 0);
         assert!(host_only.device().is_none());
+    }
+
+    /// Host advice is skipped for an expert the device already holds: the
+    /// two tiers are exclusive, so the hot-set refresh must not pull the
+    /// card's experts back into the page cache.
+    #[test]
+    fn composite_skips_host_advice_for_device_resident_experts() {
+        let n = Arc::new(AtomicUsize::new(0));
+        let handle = || {
+            Some(super::ExpertHandles {
+                gate: Arc::new(super::tests::CountingPrefetch(Arc::clone(&n))),
+                up: Arc::new(super::tests::CountingPrefetch(Arc::clone(&n))),
+                down: Arc::new(super::tests::CountingPrefetch(Arc::clone(&n))),
+            })
+        };
+        let cpu = CpuResidency::new(vec![vec![handle(), handle()]]);
+        let pool = Arc::new(pool(100, 10, 8, 10));
+        let uploader = Arc::new(ExpertUploader::spawn(Arc::clone(&pool)));
+        let comp = CompositeResidency::with_device_pool(cpu, Arc::clone(&pool), uploader);
+        comp.acquire(0, 0);
+        comp.uploader().unwrap().wait_idle();
+        assert_eq!(
+            n.load(Ordering::Relaxed),
+            3,
+            "first acquire advises the host pages"
+        );
+        assert!(pool.contains(0, 0));
+        // A refresh re-acquires the (now device-resident) expert: no host advice.
+        comp.acquire(0, 0);
+        comp.uploader().unwrap().wait_idle();
+        assert_eq!(
+            n.load(Ordering::Relaxed),
+            3,
+            "device-resident: host pages not advised"
+        );
+        // A different, non-resident expert is still advised.
+        comp.acquire(0, 1);
+        comp.uploader().unwrap().wait_idle();
+        assert_eq!(n.load(Ordering::Relaxed), 6);
+        // Once released from the device, host advice resumes.
+        comp.release(0, 0);
+        comp.acquire(0, 0);
+        comp.uploader().unwrap().wait_idle();
+        assert_eq!(n.load(Ordering::Relaxed), 9);
+    }
+
+    /// The release hook runs once per settled upload, after the delay, only
+    /// while the expert is still resident, and never for a failed upload.
+    #[test]
+    fn release_hook_runs_after_settled_uploads() {
+        let released = Arc::new(std::sync::Mutex::new(Vec::<(u32, u32)>::new()));
+        let hook: super::ReleaseHook = {
+            let released = Arc::clone(&released);
+            Arc::new(move |l, e| {
+                released.lock().unwrap().push((l, e));
+                true
+            })
+        };
+        // Three slots; expert indices >= 4 fail to upload (the fake pool
+        // only uploads (l, e) with l, e < 4).
+        let pool = Arc::new(pool(30, 10, 4, 10));
+        let up = ExpertUploader::spawn_with_release(
+            Arc::clone(&pool),
+            Some(hook),
+            std::time::Duration::from_millis(20),
+        );
+        up.request(0, 0);
+        up.request(0, 1);
+        up.request(0, 9); // fails: never released
+        up.wait_idle();
+        assert!(pool.contains(0, 0) && pool.contains(0, 1));
+        assert_eq!(pool.stats().upload_failures, 1);
+        // Not yet: the delay has not elapsed (the thread is idle in the
+        // timed wait until it does).
+        assert!(released.lock().unwrap().is_empty() || up.released() <= 2);
+        // Evict (0, 0) before its release comes due: it must be skipped.
+        pool.release(0, 0);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while up.released() < 1 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // Give a possible second (wrong) release a moment to show up.
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        assert_eq!(released.lock().unwrap().as_slice(), &[(0, 1)]);
+        assert_eq!(up.released(), 1);
+        // A synchronous acquire by the caller is released too, once noted.
+        pool.acquire(0, 2);
+        up.note_resident(0, 2);
+        up.note_resident(0, 3); // not resident: ignored
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while up.released() < 2 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(released.lock().unwrap().as_slice(), &[(0, 1), (0, 2)]);
+        drop(up);
+    }
+
+    /// A release scheduled for one upload never fires against a later
+    /// upload of the same key (evicted and uploaded again before the
+    /// deadline): the newer slot gets its own deadline.
+    #[test]
+    fn stale_release_skips_a_re_uploaded_key() {
+        let released = Arc::new(AtomicUsize::new(0));
+        let hook: super::ReleaseHook = {
+            let released = Arc::clone(&released);
+            Arc::new(move |_, _| {
+                released.fetch_add(1, Ordering::Relaxed);
+                true
+            })
+        };
+        let pool = Arc::new(pool(30, 10, 4, 10));
+        let up = ExpertUploader::spawn_with_release(
+            Arc::clone(&pool),
+            Some(hook),
+            std::time::Duration::from_millis(60),
+        );
+        up.request(0, 0);
+        up.wait_idle();
+        let first = pool.generation(0, 0).unwrap();
+        // Evict and re-upload directly (a synchronous acquire) before the
+        // deadline: a new generation.
+        pool.release(0, 0);
+        pool.acquire(0, 0);
+        assert_ne!(pool.generation(0, 0), Some(first));
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert_eq!(
+            released.load(Ordering::Relaxed),
+            0,
+            "stale deadline must not release"
+        );
+        // Noting the new upload schedules its own release.
+        up.note_resident(0, 0);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while up.released() < 1 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(released.load(Ordering::Relaxed), 1);
+        drop(up);
+    }
+
+    /// A leased slot survives the churn that would evict it, and an
+    /// explicit release, until the callback returns; a wrong generation
+    /// gets no callback at all.
+    #[test]
+    fn lease_pins_the_slot_for_the_callback() {
+        let r = pool(10, 10, 8, 10); // one slot
+        r.acquire(0, 0);
+        let gen = r.generation(0, 0).unwrap();
+        assert!(
+            r.with_lease(0, 0, gen + 1, || ()).is_none(),
+            "stale generation"
+        );
+        let ran = r.with_lease(0, 0, gen, || {
+            // Churn under the lease: (0, 1) cannot take the only slot.
+            r.acquire(0, 1);
+            assert!(r.contains(0, 0) && !r.contains(0, 1));
+            r.release(0, 0);
+            assert!(r.contains(0, 0), "release is deferred under a lease");
+            true
+        });
+        assert_eq!(ran, Some(true));
+        assert_eq!(r.stats().refused, 1);
+        // The lease is gone: the next acquire evicts it.
+        r.acquire(0, 1);
+        assert!(!r.contains(0, 0) && r.contains(0, 1));
+        // A panicking callback releases the lease too.
+        let gen1 = r.generation(0, 1).unwrap();
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            r.with_lease(0, 1, gen1, || panic!("hook failed"))
+        }));
+        assert!(panicked.is_err());
+        r.acquire(0, 2);
+        assert!(
+            !r.contains(0, 1) && r.contains(0, 2),
+            "lease released after the panic"
+        );
+    }
+
+    /// A hook that declines (the host still runs the expert) is retried
+    /// after another delay, and gives up after `RELEASE_RETRIES`.
+    #[test]
+    fn declined_release_is_retried() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let hook: super::ReleaseHook = {
+            let calls = Arc::clone(&calls);
+            // Decline twice, then release.
+            Arc::new(move |_, _| calls.fetch_add(1, Ordering::Relaxed) >= 2)
+        };
+        let pool_a = Arc::new(pool(30, 10, 4, 10));
+        let up = ExpertUploader::spawn_with_release(
+            Arc::clone(&pool_a),
+            Some(hook),
+            std::time::Duration::from_millis(15),
+        );
+        up.request(0, 1);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while up.released() < 1 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(up.released(), 1);
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            3,
+            "declined twice, released on the third"
+        );
+        // Always declining: RELEASE_RETRIES retries, then it is dropped.
+        let never = Arc::new(AtomicUsize::new(0));
+        let hook: super::ReleaseHook = {
+            let never = Arc::clone(&never);
+            Arc::new(move |_, _| {
+                never.fetch_add(1, Ordering::Relaxed);
+                false
+            })
+        };
+        let pool2 = Arc::new(pool(30, 10, 4, 10));
+        let up2 = ExpertUploader::spawn_with_release(
+            Arc::clone(&pool2),
+            Some(hook),
+            std::time::Duration::from_millis(10),
+        );
+        up2.request(0, 2);
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        assert_eq!(
+            never.load(Ordering::Relaxed),
+            1 + super::RELEASE_RETRIES as usize
+        );
+        assert_eq!(up2.released(), 0);
+        drop(up);
+        drop(up2);
     }
 
     /// Evicted and released payloads are parked until `reclaim`, and the

@@ -42,6 +42,8 @@ pub mod quantized_qwen3_moe;
 pub mod quant_matmul;
 pub mod cuda_io;
 pub mod residency;
+pub mod route_trace;
+pub mod cache_sim;
 pub mod npu;
 pub mod paged_weights;
 pub mod placement;

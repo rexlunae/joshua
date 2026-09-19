@@ -104,6 +104,24 @@ and runs a **bounded device cache** over them:
 * The dense set can live on the card too, or stay on the CPU
   (`--dense-placement cpu`) with only the expert cache on the device; the
   activations then hop across once per layer in each direction.
+* **The host page cache and the device pool hold different experts.**  On
+  a host whose RAM cannot hold the whole pool (64 GB against ~72 GiB), every
+  expert the card carries is one the page cache no longer needs: the
+  hot-set refresh and the speculative next-step prefetch skip the host
+  pages of device-resident experts, and a second after an upload the
+  expert's host pages are dropped from the mapping and the page cache
+  (`MADV_DONTNEED` + `posix_fadvise(DONTNEED)`; the page-cache folios that
+  lie wholly inside the expert's ranges go at once, the ones straddling
+  an edge are unmapped and deactivated, so the kernel reclaims them
+  first), so RAM fills with the experts the host still has to run.  The
+  release skips an expert the host kernels are running at that moment and
+  retries later, and only ever targets the upload it was scheduled for.
+  Before this the refresh pulled the
+  card's ~14 GiB back into the page cache every 64 steps, and each decode
+  step re-advised the previous step's experts whether or not they were on
+  the device.  `JOSHUA_EXPERT_HOST_PAGES=keep` restores the old, inclusive
+  behaviour in full — pages kept, device-resident experts advised again
+  (for a host with RAM to spare, or to bisect).
 
 Flags (all also environment variables, `JOSHUA_…`):
 
@@ -112,13 +130,49 @@ Flags (all also environment variables, `JOSHUA_…`):
 | `--expert-placement device` | On OpenCL for `deepseek4`: run the routed experts from the VRAM cache, sized as `--vram-expert-cache auto` unless a budget is given. |
 | `--vram-expert-cache auto` / `<MiB>` | The cache budget.  `auto` is device memory − dense set (only when the dense set is on the device) − 1 GiB placement headroom − scratch (512 MiB with the dense set on the CPU, 1 GiB with it on the device) − 1 GiB KV reserve (only with the dense set on the device).  `0` / unset disables the cache. |
 | `--dense-placement cpu` | Keep the dense set on the CPU and use the card for the expert cache alone (the largest budget: ~14.5 GiB → ~2,200 slots on a 16 GB card). |
+| `--prefill-chunk <tokens>` | Tokens per prefill chunk (default 512).  The MoE loaders stream a prefill layer by layer, so each layer's weights are read once per prefill whatever the chunk; the chunk sets how many prompt rows each resident expert batches per launch and the per-layer workspace. |
 
 The load log prints the budget and slot count; every 64 decode steps a
-`debug` line reports hits, misses, uploads, evictions and resident bytes
-(`RUST_LOG=joshua=debug`).  `JOSHUA_EXPERT_MISS=upload` switches decode
-misses to a synchronous upload on the calling thread followed by a device
-run — a measurement mode that warms the pool fastest at the cost of
-stalling the token for the transfer.
+`debug` line reports hits, misses, uploads, evictions, resident bytes and
+the host pages released (`RUST_LOG=joshua=debug`), followed by the
+**decode time split**: per step, how long the resident experts' launches
+took to enqueue, how long the host misses ran, how long the step then
+waited for the device, and the rest (attention, dense set, routing); and
+for the host misses, what share of their pages were resident in RAM before
+they ran — the difference between a miss served from the page cache and one
+read from the disk.  A prefill logs the same split once at its end.  The
+page probe (`mincore` per host miss) is on whenever the `joshua` `debug`
+filter is active at load, or with `JOSHUA_EXPERT_STATS=1`.
+`JOSHUA_EXPERT_MISS=upload` switches decode misses to a synchronous upload
+on the calling thread followed by a device run — a measurement mode that
+warms the pool fastest at the cost of stalling the token for the transfer.
+
+### Reading the time split
+
+* **host experts** dominates and the pages were mostly *not* resident:
+  the disk is the clock.  More RAM, a faster disk, a smaller expert
+  quantization, or a larger device budget (a higher hit rate) are the
+  levers; nothing in the kernels is.
+* **host experts** dominates with the pages resident: the CPU expert
+  kernels are the clock, and a higher hit rate is the lever.
+* **device wait** dominates: the card is the clock (few misses, the device
+  kernels slower than the host would have been).
+* **rest** dominates: attention and the dense set — the dense placement
+  question, not the expert cache.
+
+### Routing trace and the offline cache simulator
+
+`JOSHUA_ROUTE_TRACE=trace.csv` writes every `(call, phase, chunk, row,
+layer, expert)` visit of a run to a CSV (one file per process: trace one request
+at a time, since concurrent sessions interleave their calls).  `cargo run --release --example cache_sim
+-- trace.csv --slots 2067 --host-slots 7400` replays it against plain LRU,
+the loader's LRU with the protected hot set, a static most-frequent
+placement and Belady's optimal policy at that slot count — the hit-rate
+ceiling for the observed routing, so a pinning-budget tweak (`--hot-share
+n/d`) is judged offline before a run.  With `--host-slots` (RAM available
+for experts ÷ expert size) it also replays the two tiers together and
+reports the visits per decode step served by the device, by RAM and by the
+disk, for exclusive and for inclusive tiers.
 
 Numbers to check on the card rather than assume: the host-to-device
 bandwidth from mapped pages (the per-upload time is in the debug line;
@@ -168,6 +222,10 @@ the card for the real numbers).
 | `JOSHUA_OPENCL_CHECK_NAN=1` | Count NaNs on the device after every native f32 launch and name the first op that produced one. |
 | `JOSHUA_OPENCL_BUILD_OPTS="…"` | Extra options for the OpenCL kernel compiler (e.g. `-cl-opt-disable`). |
 | `JOSHUA_EXPERT_MISS=upload` | Decode misses of the VRAM expert cache upload synchronously and run on the device (measurement mode). |
+| `JOSHUA_EXPERT_HOST_PAGES=keep` | Keep an uploaded expert's host pages instead of releasing them (inclusive tiers; the default releases them). |
+| `JOSHUA_EXPERT_STATS=1` | Probe each host miss's page residency for the decode time split even without a `debug` log filter. |
+| `JOSHUA_ROUTE_TRACE=<path>` | Write the routing trace CSV for the offline cache simulator (`examples/cache_sim.rs`).  One file per process: run a single request at a time while tracing, or concurrent requests interleave their calls. |
+| `JOSHUA_PREFILL_CHUNK=<n>` | Tokens per prefill chunk (also `--prefill-chunk`). |
 | `JOSHUA_OPENCL_QGEMV=v1` | Run the expert formats through the one-row quantized GEMV instead of the multi-row kernel (bisecting). |
 
 The engine logs the device it opened, its memory model and the active paths
