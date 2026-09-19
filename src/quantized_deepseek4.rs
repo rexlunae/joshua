@@ -2133,9 +2133,12 @@ impl Moe {
             // come from disk?  Probed before the prefetch below so the
             // answer is the state the step found, not the one it made.
             for &e in &misses {
-                if let Some((res, total)) = self.experts[e]
-                    .prefetch
-                    .as_ref()
+                let handle = self.experts[e].prefetch.as_ref();
+                if std::env::var("JOSHUA_DS4_PROBE_DEBUG").as_deref() == Ok("1") {
+                    let rp = handle.and_then(|h| h.resident_pages());
+                    eprintln!("DBG probe layer={} e={e} handle={} resident_pages={:?}", self.layer, handle.is_some(), rp);
+                }
+                if let Some((res, total)) = handle
                     .and_then(|h| h.resident_pages())
                 {
                     PhaseTiming::add(&timing.miss_pages, total as u64);

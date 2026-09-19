@@ -431,6 +431,9 @@ fn deepseek4_expert_pool_reports_time_split_and_trace() {
         "batched decode components accounted as decode: {t:?}"
     );
     assert!(t.miss_experts > 0, "{t:?}");
+    // The page probe is mincore-based and therefore Linux-only; on other
+    // platforms `resident_pages` is None and no pages are counted.
+    #[cfg(target_os = "linux")]
     assert!(t.miss_pages > 0, "page probe on: {t:?}");
     assert!(t.miss_pages_resident <= t.miss_pages, "{t:?}");
     assert!(
@@ -438,10 +441,15 @@ fn deepseek4_expert_pool_reports_time_split_and_trace() {
         "{t:?}"
     );
     let line = t.describe("decode step");
+    // The "pages resident" clause only exists when the mincore-based probe
+    // produced page counts (Linux); other platforms omit it.
+    #[cfg(target_os = "linux")]
     assert!(
         line.contains("host experts") && line.contains("pages resident"),
         "{line}"
     );
+    #[cfg(not(target_os = "linux"))]
+    assert!(line.contains("host experts"), "{line}");
 
     tracer.flush();
     let text = std::fs::read_to_string(&trace_path).unwrap();

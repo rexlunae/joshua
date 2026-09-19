@@ -189,3 +189,74 @@ fn opencl_deepseek4_matches_cpu() {
         false,
     );
 }
+
+/// Long-prompt parity: at prompt lengths where real-model long-context
+/// degradation was observed, the OpenCL path must track the CPU path —
+/// same logits (within device rounding) and same greedy continuation.
+/// Complements the short-prompt `run_model` cases, which cannot reach the
+/// window/compressed-cache paths that only engage with longer prompts.
+#[test]
+fn opencl_deepseek4_long_prompt_matches_cpu() {
+    let Some(ocl) = opencl_or_skip() else { return };
+    let dir = common::model_dir("opencl-ds4-longprompt");
+    let model = dir.join("model.gguf");
+    common::write_tiny_deepseek4_gguf(&model);
+
+    // ~200 prompt tokens cycling the tiny model's vocab (ids 1..=15).
+    let tokens: Vec<u32> = (0..200).map(|i| 1 + (i % 15) as u32).collect();
+
+    let cpu = Device::Cpu;
+    let mut ref_model = load_mmap(&model, &cpu);
+    let ref_prefill = logits(&mut ref_model, &tokens, 0, &cpu);
+    let ref_decode = logits(
+        &mut ref_model,
+        &[tokens[tokens.len() - 1]],
+        tokens.len(),
+        &cpu,
+    );
+
+    let mut dev_model = load_mmap(&model, &ocl);
+    let before = candle_core::opencl_backend::fallback_count();
+    let dev_prefill = logits(&mut dev_model, &tokens, 0, &ocl);
+    assert_close("opencl long-prompt prefill", &dev_prefill, &ref_prefill);
+    let dev_decode = logits(
+        &mut dev_model,
+        &[tokens[tokens.len() - 1]],
+        tokens.len(),
+        &ocl,
+    );
+    assert_close("opencl long-prompt decode", &dev_decode, &ref_decode);
+    eprintln!(
+        "opencl long prompt: {} native launches, {} fallbacks",
+        candle_core::opencl_backend::native_exec_count(),
+        candle_core::opencl_backend::fallback_count() - before
+    );
+
+    // Greedy continuation must agree too: 8 tokens of argmax decode on each
+    // device must pick the same ids.
+    let mut cpu_ids = tokens.clone();
+    let mut dev_ids = tokens.clone();
+    let mut cpu_last = ref_decode.clone();
+    let mut dev_last = dev_decode.clone();
+    for step in 0..8 {
+        let cpu_next = cpu_last
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .map(|(i, _)| i as u32)
+            .unwrap();
+        let dev_next = dev_last
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .map(|(i, _)| i as u32)
+            .unwrap();
+        assert_eq!(cpu_next, dev_next, "greedy step {step}: argmax diverged");
+        cpu_ids.push(cpu_next);
+        dev_ids.push(dev_next);
+        cpu_last = logits(&mut ref_model, &[*cpu_next], cpu_ids.len() - 1, &cpu);
+        dev_last = logits(&mut dev_model, &[*dev_next], dev_ids.len() - 1, &ocl);
+    }
+
+    std::fs::remove_dir_all(&dir).ok();
+}

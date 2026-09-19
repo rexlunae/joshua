@@ -652,3 +652,100 @@ fn deepseek4_q2k_down_experts_load_and_match_streamed_path() {
     }
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Long-prefill regression gate: at prompt lengths where real-model long-context
+/// cliffs have been observed, the engine must stay self-consistent — a single
+/// long prefill, a chunked prefill, and KV-continuation decode must all agree.
+/// Catches position / causal-mask / KV drift that short prompts cannot reach.
+#[test]
+fn deepseek4_long_prefill_consistency() {
+    let dir = common::model_dir("deepseek4-longprefill");
+    let model = dir.join("model.gguf");
+    common::write_tiny_deepseek4_gguf(&model);
+
+    // 300 prompt tokens cycling the tiny model's vocab (ids 1..=15; 0 is pad).
+    let n = 300;
+    let prompt: Vec<u32> = (0..n).map(|i| 1 + (i % 15) as u32).collect();
+    assert!(n < 512, "fixture context is 512");
+
+    // 1. Single long prefill (the reference).
+    let mut single = load(&model, true);
+    let reference = logits(&mut single, &prompt, 0);
+
+    // 2. Chunked prefill: 3 chunks of 100 on a fresh instance.
+    let mut chunked = load(&model, true);
+    let mut chunked_last = Vec::new();
+    for (ci, chunk) in prompt.chunks(100).enumerate() {
+        chunked_last = logits(&mut chunked, chunk, ci * 100);
+    }
+
+    // 3. KV continuation: decode 8 greedy tokens from the chunked instance.
+    let mut incremental_ids = prompt.clone();
+    let mut incremental_last = chunked_last.clone();
+    let mut decoded: Vec<u32> = Vec::new();
+    for step in 0..8 {
+        let next = incremental_last
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .map(|(i, _)| i as u32)
+            .unwrap();
+        decoded.push(next);
+        incremental_last = logits(&mut chunked, &[next], n + step);
+        incremental_ids.push(next);
+    }
+
+    // 4. Reference for the continuation: a fresh instance prefilled over the
+    //    full prompt + decoded prefix in one call (no incremental KV).
+    let mut fresh = load(&model, true);
+    let full_reference = logits(&mut fresh, &incremental_ids, 0);
+
+    // Chunked vs single prefill must agree at the final position.
+    assert_eq!(reference.len(), chunked_last.len(), "vocab widths");
+    let mut worst = 0.0f32;
+    for (i, (g, r)) in chunked_last.iter().zip(&reference).enumerate() {
+        worst = worst.max((g - r).abs());
+        let _ = i;
+    }
+    assert!(
+        worst < 1e-2,
+        "chunked prefill diverges from single prefill at {n} tokens (max abs {worst})"
+    );
+
+    // Incremental decode must match the fresh full-prefix reference — this is
+    // what breaks when KV placement or position accounting drifts at length.
+    assert_eq!(incremental_last.len(), full_reference.len(), "vocab widths");
+    let mut worst_kv = 0.0f32;
+    for (g, r) in incremental_last.iter().zip(&full_reference) {
+        worst_kv = worst_kv.max((g - r).abs());
+    }
+    assert!(
+        worst_kv < 1e-2,
+        "KV continuation diverges from fresh full-prefix prefill (max abs {worst_kv})"
+    );
+
+    // And the greedy continuation must be self-consistent: the fresh reference
+    // re-derived greedy tokens must equal the incremental ones.
+    let mut ref_ids = prompt.clone();
+    let mut ref_last = reference.clone();
+    let mut ref_decoded: Vec<u32> = Vec::new();
+    for step in 0..8 {
+        let next = ref_last
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .map(|(i, _)| i as u32)
+            .unwrap();
+        ref_decoded.push(next);
+        // Re-prefill the whole prefix on a fresh instance each step.
+        ref_ids.push(next);
+        let mut fresh2 = load(&model, true);
+        ref_last = logits(&mut fresh2, &ref_ids, 0);
+    }
+    assert_eq!(
+        decoded, ref_decoded,
+        "greedy continuation differs between incremental KV and fresh re-prefill"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}

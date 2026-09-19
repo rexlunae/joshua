@@ -1472,7 +1472,9 @@ fn write_tiny_deepseek4_gguf_opts(path: &Path, opts: TinyDeepseek4Opts) {
         (key("expert_weights_scale"), f32v(1.0)),
         (key("expert_gating_func"), u32v(2)),
         (key("rope.freq_base"), f32v(10_000.0)),
-        (key("context_length"), u32v(32)),
+        // 512-token context: long-prefill engine tests (chunked vs single,
+        // KV continuation) need headroom beyond the old 32-token cap.
+        (key("context_length"), u32v(512)),
         ("tokenizer.ggml.eos_token_id".to_string(), u32v(3)),
         ("tokenizer.ggml.bos_token_id".to_string(), u32v(3)),
         ("tokenizer.ggml.unknown_token_id".to_string(), u32v(0)),
