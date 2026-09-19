@@ -31,8 +31,8 @@ fn load_mmap(model: &Path, device: &Device) -> QuantizedModel {
     QuantizedModel::from_gguf_mmap(content, &mut cursor, device, mmap, None, 0).unwrap()
 }
 
-fn logits(model: &mut QuantizedModel, tokens: &[u32], offset: usize) -> Vec<f32> {
-    let input = Tensor::new(tokens, &Device::Cpu)
+fn logits(model: &mut QuantizedModel, tokens: &[u32], offset: usize, device: &Device) -> Vec<f32> {
+    let input = Tensor::new(tokens, device)
         .unwrap()
         .unsqueeze(0)
         .unwrap();
@@ -134,10 +134,10 @@ fn backend_matrix_parity() {
         let short: Vec<u32> = vec![1, 4, 2, 7, 5];
         let long: Vec<u32> = (0..200).map(|i| 1 + (i % 15) as u32).collect();
         let mut cpu_short_model = load_mmap(&model, &Device::Cpu);
-        let ref_short = logits(&mut cpu_short_model, &short, 0);
+        let ref_short = logits(&mut cpu_short_model, &short, 0, &Device::Cpu);
         drop(cpu_short_model);
         let mut cpu_long_model = load_mmap(&model, &Device::Cpu);
-        let ref_long = logits(&mut cpu_long_model, &long, 0);
+        let ref_long = logits(&mut cpu_long_model, &long, 0, &Device::Cpu);
 
         // Greedy reference: 6 steps from the long-prefill state.
         let mut ref_ids = long.clone();
@@ -146,7 +146,7 @@ fn backend_matrix_parity() {
             .map(|step| {
                 let next = argmax(&ref_last);
                 ref_ids.push(next);
-                ref_last = logits(&mut cpu_long_model, &[next], ref_ids.len() - 1);
+                ref_last = logits(&mut cpu_long_model, &[next], ref_ids.len() - 1, &Device::Cpu);
                 next
             })
             .collect::<Vec<u32>>();
@@ -169,7 +169,7 @@ fn backend_matrix_parity() {
                 continue;
             }
             let mut m_short = load_mmap(&model, &backend.device);
-            let got_short = logits(&mut m_short, &short, 0);
+            let got_short = logits(&mut m_short, &short, 0, &backend.device);
             assert_spread_close(
                 &format!("[{arch} × {}] short prefill", backend.name),
                 &got_short,
@@ -177,7 +177,7 @@ fn backend_matrix_parity() {
             );
             drop(m_short);
             let mut m = load_mmap(&model, &backend.device);
-            let got_long = logits(&mut m, &long, 0);
+            let got_long = logits(&mut m, &long, 0, &backend.device);
             assert_spread_close(
                 &format!("[{arch} × {}] long prefill (200 tok)", backend.name),
                 &got_long,
@@ -194,7 +194,7 @@ fn backend_matrix_parity() {
                     backend.name, ref_greedy[step]
                 );
                 ref_ids.push(dev_next);
-                dev_last = logits(&mut m, &[dev_next], ref_ids.len() - 1);
+                dev_last = logits(&mut m, &[dev_next], ref_ids.len() - 1, &backend.device);
             }
 
             // Batched decode parity (skipped when the arch has no

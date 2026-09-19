@@ -73,8 +73,8 @@ fn load_mmap(model: &Path, device: &Device) -> QuantizedModel {
     QuantizedModel::from_gguf_mmap(content, &mut cursor, device, mmap, None, 0).unwrap()
 }
 
-fn logits(model: &mut QuantizedModel, tokens: &[u32], offset: usize) -> Vec<f32> {
-    let input = Tensor::new(tokens, &Device::Cpu)
+fn logits(model: &mut QuantizedModel, tokens: &[u32], offset: usize, device: &Device) -> Vec<f32> {
+    let input = Tensor::new(tokens, device)
         .unwrap()
         .unsqueeze(0)
         .unwrap();
@@ -101,9 +101,8 @@ fn parity_with(dev_model: &mut QuantizedModel, model: &Path, device: &Device, wh
     let ref_prefill = logits(&mut cpu, &tokens, 0);
     let ref_decode = logits(&mut cpu, &tokens[tokens.len() - 1..], tokens.len(), );
 
-    let dev = dev_model;
-    let got_prefill = logits(dev, &tokens, 0);
-    let got_decode = logits(dev, &tokens[tokens.len() - 1..], tokens.len());
+    let got_prefill = logits(dev_model, &tokens, 0, device);
+    let got_decode = logits(dev_model, &tokens[tokens.len() - 1..], tokens.len(), device);
 
     for (phase, got, want) in [
         ("prefill", &got_prefill, &ref_prefill),
