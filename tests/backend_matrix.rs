@@ -139,14 +139,17 @@ fn backend_matrix_parity() {
         let mut cpu_long_model = load_mmap(&model, &Device::Cpu);
         let ref_long = logits(&mut cpu_long_model, &long, 0, &Device::Cpu);
 
-        // Greedy reference: 6 steps from the long-prefill state.
+        // Greedy reference: 6 steps from the long-prefill state, recording
+        // the per-step CPU logits for teacher-forced device comparison.
         let mut ref_ids = long.clone();
         let mut ref_last = ref_long.clone();
+        let mut ref_step_logits: Vec<Vec<f32>> = Vec::new();
         let ref_greedy = (0..6)
             .map(|step| {
                 let next = argmax(&ref_last);
                 ref_ids.push(next);
                 ref_last = logits(&mut cpu_long_model, &[next], ref_ids.len() - 1, &Device::Cpu);
+                ref_step_logits.push(ref_last.clone());
                 next
             })
             .collect::<Vec<u32>>();
@@ -184,17 +187,20 @@ fn backend_matrix_parity() {
                 &ref_long,
             );
 
-            // Greedy continuation must pick the same tokens as the CPU.
+            // Teacher-forced continuation parity: feed the CPU reference
+            // tokens to the device and compare per-step logits.  (Strict
+            // argmax identity is too strong for MoE arches — near-tied router
+            // scores flip expert selection on tiny numeric differences — but
+            // KV/position drift shows up as large per-step divergence.)
             let mut dev_last = got_long.clone();
             for step in 0..6 {
-                let dev_next = argmax(&dev_last);
-                assert_eq!(
-                    dev_next, ref_greedy[step],
-                    "[{arch} × {}] greedy step {step}: device argmax {dev_next} vs cpu {}",
-                    backend.name, ref_greedy[step]
+                let cpu_tok = ref_greedy[step];
+                dev_last = logits(&mut m, &[cpu_tok], ref_ids.len() + step, &backend.device);
+                assert_spread_close(
+                    &format!("[{arch} × {}] teacher-forced step {step}", backend.name),
+                    &dev_last,
+                    &ref_step_logits[step],
                 );
-                ref_ids.push(dev_next);
-                dev_last = logits(&mut m, &[dev_next], ref_ids.len() - 1, &backend.device);
             }
 
             // Batched decode parity (skipped when the arch has no
