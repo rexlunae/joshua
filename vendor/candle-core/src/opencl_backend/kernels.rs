@@ -410,13 +410,13 @@ impl Drop for Kernel {
 /// `k_gemm,k_qgemv`) fail to launch, so the op that wanted them takes the CPU
 /// round-trip instead: a per-kernel bisecting tool for a result that is only
 /// wrong on one driver.  `JOSHUA_OPENCL_TRACE=1` shows which ops fell back.
+///
+/// Read per launch rather than once per process: the deny-sweep test flips
+/// the variable between kernels, and the lookup is noise next to a launch.
 fn denied(name: &str) -> bool {
-    static DENY: std::sync::OnceLock<std::collections::HashSet<String>> = std::sync::OnceLock::new();
-    let set = DENY.get_or_init(|| {
-        std::env::var("JOSHUA_OPENCL_NATIVE_DENY")
-            .map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
-            .unwrap_or_default()
-    });
+    let set = std::env::var("JOSHUA_OPENCL_NATIVE_DENY")
+        .map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect::<std::collections::HashSet<_>>())
+        .unwrap_or_default();
     !set.is_empty() && set.contains(name)
 }
 
