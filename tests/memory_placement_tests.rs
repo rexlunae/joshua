@@ -420,6 +420,16 @@ fn deepseek4_expert_pool_reports_time_split_and_trace() {
     let t = cached.expert_phase_timing().unwrap();
     assert_eq!(t.passes, 3, "{t:?}");
     assert!(t.pass_ns > 0 && t.host_ns > 0, "{t:?}");
+    // A batched decode (two sequences, one token each) is a decode step
+    // too, not a prefill: its components land in the decode split.
+    let components = t.device_launch_ns + t.host_ns + t.device_wait_ns;
+    let _ = fseq_logits(&mut cached, &[(&[3u32], 0), (&[8u32], 0)]);
+    let t = cached.expert_phase_timing().unwrap();
+    assert_eq!(t.passes, 4, "{t:?}");
+    assert!(
+        t.device_launch_ns + t.host_ns + t.device_wait_ns > components,
+        "batched decode components accounted as decode: {t:?}"
+    );
     assert!(t.miss_experts > 0, "{t:?}");
     assert!(t.miss_pages > 0, "page probe on: {t:?}");
     assert!(t.miss_pages_resident <= t.miss_pages, "{t:?}");

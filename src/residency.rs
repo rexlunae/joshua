@@ -430,6 +430,9 @@ struct PoolState<T> {
     /// `used_bytes` so a second acquire cannot over-commit the budget.
     in_flight: std::collections::HashMap<(u32, u32), u64>,
     hot: std::collections::HashSet<(u32, u32)>,
+    /// Slots under a [`DeviceResidency::with_lease`] callback: never
+    /// evicted or released until the callback returns.
+    leased: std::collections::HashSet<(u32, u32)>,
     used_bytes: u64,
 }
 
@@ -461,6 +464,7 @@ impl<T: DeviceExpertSlot> DeviceResidency<T> {
                 slots: Default::default(),
                 in_flight: Default::default(),
                 hot: Default::default(),
+                leased: Default::default(),
                 used_bytes: 0,
             }),
             retired: std::sync::Mutex::new(Vec::new()),
@@ -502,7 +506,7 @@ impl<T: DeviceExpertSlot> DeviceResidency<T> {
         let mut victims: Vec<((u32, u32), u64, u64)> = st
             .slots
             .iter()
-            .filter(|(k, _)| !st.hot.contains(k))
+            .filter(|(k, _)| !st.hot.contains(k) && !st.leased.contains(k))
             .map(|(k, s)| (*k, s.last_used, s.bytes))
             .collect();
         victims.sort_unstable_by_key(|(_, last_used, _)| *last_used);
@@ -666,6 +670,33 @@ impl<T: DeviceExpertSlot> DeviceResidency<T> {
             .map(|s| s.generation)
     }
 
+    /// Run `f` while the slot for `(layer, expert)` is guaranteed to stay
+    /// resident: `None` unless the slot is resident with exactly
+    /// `generation`; otherwise the slot is leased (neither eviction nor
+    /// `release` can remove it) for the duration of `f`, and `f`'s result
+    /// is returned.  The host-page release runs under this, so an
+    /// eviction can never slip in between the generation check and the
+    /// drop and leave an expert with neither a device slot nor host pages.
+    pub fn with_lease<R>(
+        &self,
+        layer: u32,
+        expert: u32,
+        generation: u64,
+        f: impl FnOnce() -> R,
+    ) -> Option<R> {
+        let key = (layer, expert);
+        {
+            let mut st = self.lock();
+            if st.slots.get(&key).map(|s| s.generation) != Some(generation) {
+                return None;
+            }
+            st.leased.insert(key);
+        }
+        let r = f();
+        self.lock().leased.remove(&key);
+        Some(r)
+    }
+
     /// Protect `(layer, expert)` from LRU eviction (it is in the hot set).
     pub fn mark_hot(&self, layer: u32, expert: u32) {
         self.lock().hot.insert((layer, expert));
@@ -720,6 +751,10 @@ impl<T: DeviceExpertSlot> ExpertResidency for DeviceResidency<T> {
     fn release(&self, layer: u32, expert: u32) {
         let removed = {
             let mut st = self.lock();
+            if st.leased.contains(&(layer, expert)) {
+                // Under a `with_lease` callback: it goes at the next churn.
+                return;
+            }
             let s = st.slots.remove(&(layer, expert));
             if let Some(s) = &s {
                 st.used_bytes = st.used_bytes.saturating_sub(s.bytes);
@@ -852,14 +887,18 @@ impl<T: DeviceExpertSlot> ExpertUploader<T> {
                         let Some(release) = &release else { continue };
                         // Only the upload this was scheduled for: a key
                         // evicted and uploaded again since has a new
-                        // generation and its own deadline.
-                        if pool2.generation(key.0, key.1) != Some(generation) {
-                            continue;
-                        }
-                        if release(key.0, key.1) {
-                            state2.released.fetch_add(1, Relaxed);
-                        } else if retries > 0 {
-                            retry.push((now + delay, key, generation, retries - 1));
+                        // generation and its own deadline.  The slot is
+                        // leased while the hook runs, so it cannot be
+                        // evicted between the check and the drop.
+                        match pool2.with_lease(key.0, key.1, generation, || release(key.0, key.1)) {
+                            None => continue,
+                            Some(true) => {
+                                state2.released.fetch_add(1, Relaxed);
+                            }
+                            Some(false) if retries > 0 => {
+                                retry.push((now + delay, key, generation, retries - 1));
+                            }
+                            Some(false) => {}
                         }
                     }
                     deferred.extend(retry);
@@ -1483,6 +1522,33 @@ mod device_pool_tests {
         }
         assert_eq!(released.load(Ordering::Relaxed), 1);
         drop(up);
+    }
+
+    /// A leased slot survives the churn that would evict it, and an
+    /// explicit release, until the callback returns; a wrong generation
+    /// gets no callback at all.
+    #[test]
+    fn lease_pins_the_slot_for_the_callback() {
+        let r = pool(10, 10, 8, 10); // one slot
+        r.acquire(0, 0);
+        let gen = r.generation(0, 0).unwrap();
+        assert!(
+            r.with_lease(0, 0, gen + 1, || ()).is_none(),
+            "stale generation"
+        );
+        let ran = r.with_lease(0, 0, gen, || {
+            // Churn under the lease: (0, 1) cannot take the only slot.
+            r.acquire(0, 1);
+            assert!(r.contains(0, 0) && !r.contains(0, 1));
+            r.release(0, 0);
+            assert!(r.contains(0, 0), "release is deferred under a lease");
+            true
+        });
+        assert_eq!(ran, Some(true));
+        assert_eq!(r.stats().refused, 1);
+        // The lease is gone: the next acquire evicts it.
+        r.acquire(0, 1);
+        assert!(!r.contains(0, 0) && r.contains(0, 1));
     }
 
     /// A hook that declines (the host still runs the expert) is retried

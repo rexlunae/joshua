@@ -705,10 +705,9 @@ impl ExpertPhaseTiming {
 struct Ds4DevicePool {
     device: Device,
     pool: Arc<crate::residency::DeviceResidency<Ds4DeviceExpert>>,
-    /// Decode-step time split and host-miss residency.
+    /// Decode-step time split and host-miss residency (model-wide,
+    /// cumulative).  Prefill timing is per session (`ModelWeights`).
     decode: PhaseTiming,
-    /// The same for the prefill in progress (taken and logged at its end).
-    prefill: PhaseTiming,
     /// Probe each host miss's page residency (`mincore`) before it runs.
     /// On with `JOSHUA_EXPERT_STATS=1` or a `debug`-level `joshua` log
     /// filter at load; a few hundred syscalls per decode step otherwise
@@ -731,8 +730,13 @@ type BusyExperts = std::sync::Mutex<std::collections::HashMap<(u32, u32), u32>>;
 
 /// Per-call dispatch settings a session passes down to its MoE blocks
 /// (never stored in the shared pool: concurrent sessions would race).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone)]
 struct DispatchCtx {
+    /// A decode step (one token per sequence, batched or not): the pool
+    /// warms from its routing.  A prefill only reads the pool.  Explicit,
+    /// never derived from the tensor's sequence length: a batched decode
+    /// concatenates one token per sequence into a longer one.
+    decode: bool,
     /// Whether a prefill's last row seeds the device pool: true for a
     /// whole-prompt forward and for the final chunk of a streamed prefill
     /// only, so a small prefill chunk does not queue an upload per chunk.
@@ -740,14 +744,8 @@ struct DispatchCtx {
     /// Row offset of this call's tokens inside the prompt, for the routing
     /// trace (a streamed prefill is one trace call across its chunks).
     trace_row_base: usize,
-}
-
-impl DispatchCtx {
-    /// A whole forward pass (one prompt or one decode step).
-    const WHOLE: Self = Self {
-        seed_prefill: true,
-        trace_row_base: 0,
-    };
+    /// This session's prefill time split (see `ModelWeights::prefill_timing`).
+    prefill_timing: Arc<PhaseTiming>,
 }
 
 /// Whether an environment flag is set to something other than off
@@ -927,7 +925,6 @@ fn build_device_pool(
         device: dev.clone(),
         pool,
         decode: PhaseTiming::default(),
-        prefill: PhaseTiming::default(),
         probe_pages,
         uploader,
         miss,
@@ -1884,10 +1881,10 @@ impl Moe {
             (weights, topk_idx)
         };
 
-        // One token per sequence is a decode step (batched or not): the pool
-        // warms from its routing; a multi-token prefill only reads the pool.
-        let (routed, routed_ids) =
-            self.dispatch(&x2, &indices, &weights, n_tokens, seq_len == 1, ctx)?;
+        // A decode step (one token per sequence, batched or not) warms the
+        // pool from its routing; a prefill only reads the pool.
+        let decode = ctx.decode;
+        let (routed, routed_ids) = self.dispatch(&x2, &indices, &weights, n_tokens, decode, ctx)?;
         let mut out = routed;
         if let Some(shared) = &self.shared {
             out = (out + shared.forward(&x2)?)?;
@@ -1947,7 +1944,7 @@ impl Moe {
                 &routed_ids,
                 n_tokens,
                 decode,
-                ctx.seed_prefill,
+                &ctx,
                 h,
             )?,
             None => {
@@ -2052,7 +2049,7 @@ impl Moe {
         last_row_ids: &[u32],
         n_tokens: usize,
         decode: bool,
-        seed_prefill: bool,
+        ctx: &DispatchCtx,
         h: usize,
     ) -> Result<Tensor> {
         let dev = &pool.device;
@@ -2063,10 +2060,13 @@ impl Moe {
                 continue;
             }
             if decode && pool.miss == MissPolicy::Upload {
+                let before = pool.pool.generation(self.layer, e as u32);
                 pool.pool.acquire(self.layer, e as u32);
                 // Uploaded here, not by the uploader: still release the host
-                // pages in due course.
-                pool.uploader.note_resident(self.layer, e as u32);
+                // pages in due course — for a new upload only, not a hit.
+                if pool.pool.generation(self.layer, e as u32) != before {
+                    pool.uploader.note_resident(self.layer, e as u32);
+                }
             }
             match pool.pool.lookup(self.layer, e as u32) {
                 Some(slot) => hits.push((e, slot)),
@@ -2078,13 +2078,17 @@ impl Moe {
                 }
             }
         }
-        if !decode && seed_prefill {
+        if !decode && ctx.seed_prefill {
             for &e in last_row_ids {
                 pool.uploader.request(self.layer, e);
             }
         }
 
-        let timing = if decode { &pool.decode } else { &pool.prefill };
+        let timing: &PhaseTiming = if decode {
+            &pool.decode
+        } else {
+            &ctx.prefill_timing
+        };
         PhaseTiming::add(&timing.miss_experts, misses.len() as u64);
         if pool.probe_pages {
             // Was what the host is about to run in RAM, or is it about to
@@ -2334,6 +2338,10 @@ pub struct ModelWeights {
     /// Dispatch settings for the streamed prefill in progress (set per
     /// chunk by the streaming runner; per session, never shared).
     stream_ctx: DispatchCtx,
+    /// This session's prefill time split (taken and logged at the end of
+    /// each prefill).  Per session: concurrent prefills must not take each
+    /// other's counters.
+    prefill_timing: Arc<PhaseTiming>,
 }
 
 // Routed experts (see `crate::moe::is_routed_expert`) are the only weights
@@ -2895,13 +2903,20 @@ impl ModelWeights {
             residency,
             device_pool,
         });
+        let prefill_timing = Arc::new(PhaseTiming::default());
         Ok(Self {
             shared,
             kv: kv_states,
             kv_seq: Vec::new(),
             last_routed: vec![Vec::new(); n_layers],
             hot_experts: crate::hot_experts::HotExpertCache::new(n_layers, n_expert, 0),
-            stream_ctx: DispatchCtx::WHOLE,
+            stream_ctx: DispatchCtx {
+                decode: false,
+                seed_prefill: true,
+                trace_row_base: 0,
+                prefill_timing: Arc::clone(&prefill_timing),
+            },
+            prefill_timing,
         })
     }
 
@@ -2983,21 +2998,37 @@ impl ModelWeights {
             .map(|p| p.decode.snapshot())
     }
 
-    /// Account one forward pass's wall time to the pool's decode or prefill
-    /// accumulator; a no-op without a pool.
+    /// The context of a whole forward pass (one prompt, or one decode step
+    /// for one or several sequences).
+    fn ctx_whole(&self, decode: bool) -> DispatchCtx {
+        DispatchCtx {
+            decode,
+            seed_prefill: true,
+            trace_row_base: 0,
+            prefill_timing: Arc::clone(&self.prefill_timing),
+        }
+    }
+
+    /// Account one forward pass's wall time to the pool's decode
+    /// accumulator or this session's prefill accumulator; a no-op without
+    /// a pool.
     fn note_pass(&self, decode: bool, elapsed: std::time::Duration) {
         if let Some(p) = &self.shared.device_pool {
-            let t = if decode { &p.decode } else { &p.prefill };
+            let t: &PhaseTiming = if decode {
+                &p.decode
+            } else {
+                &self.prefill_timing
+            };
             PhaseTiming::add(&t.passes, 1);
             PhaseTiming::add(&t.pass_ns, elapsed.as_nanos() as u64);
         }
     }
 
-    /// Log and reset the prefill accumulator (at the end of a prefill;
-    /// `n_tokens` is unknown on the layer-streaming path).
+    /// Log and reset this session's prefill accumulator (at the end of a
+    /// prefill; `n_tokens` is unknown on the layer-streaming path).
     fn log_prefill_timing(&self, n_tokens: Option<usize>) {
-        if let Some(p) = &self.shared.device_pool {
-            let t = p.prefill.take();
+        if self.shared.device_pool.is_some() {
+            let t = self.prefill_timing.take();
             if t.passes > 0 && tracing::enabled!(target: "joshua", tracing::Level::DEBUG) {
                 let what = match n_tokens {
                     Some(n) => format!("prefill of {n} tokens"),
@@ -3073,6 +3104,7 @@ impl ModelWeights {
             .unwrap_or_else(|e| {
                 panic!("deepseek4: new-session KV cache allocation failed: {e}")
             });
+        let prefill_timing = Arc::new(PhaseTiming::default());
         Self {
             shared: std::sync::Arc::clone(&self.shared),
             kv,
@@ -3083,7 +3115,13 @@ impl ModelWeights {
                 self.shared.cfg.n_expert,
                 self.hot_experts.budget(),
             ),
-            stream_ctx: DispatchCtx::WHOLE,
+            stream_ctx: DispatchCtx {
+                decode: false,
+                seed_prefill: true,
+                trace_row_base: 0,
+                prefill_timing: Arc::clone(&prefill_timing),
+            },
+            prefill_timing,
         }
     }
 
@@ -3188,6 +3226,7 @@ impl ModelWeights {
             self.prefetch_speculative();
         }
 
+        let ctx = self.ctx_whole(seq_len == 1);
         // Field-split borrows so the loop can record each layer's routing.
         // `shared.layers` is immutable (Arc) and only ever read here; the mutable
         // per-session state (`last_routed`, `hot_experts`) is captured separately.
@@ -3250,7 +3289,7 @@ impl ModelWeights {
             )?;
             let residual = xs;
             let h = layer.ffn_norm.forward(&x)?;
-            let (h, routed_ids) = layer.ffn.forward(&h, input, DispatchCtx::WHOLE)?;
+            let (h, routed_ids) = layer.ffn.forward(&h, input, ctx.clone())?;
             last_routed[i] = routed_ids;
             self.hot_experts.record(i, &last_routed[i], step);
             xs = hc_post(&h, &residual, &post, &comb)?;
@@ -3412,6 +3451,7 @@ impl ModelWeights {
             self.log_device_cache(step);
         }
 
+        let ctx = self.ctx_whole(true);
         for i in 0..self.shared.layers.len() {
             let layer = &self.shared.layers[i];
 
@@ -3458,7 +3498,7 @@ impl ModelWeights {
             let h_cat = Tensor::cat(&ffn_cats, 1)?;
             let input_cat = Tensor::new(ids_cat.as_slice(), &self.shared.device)
                 .and_then(|t| t.unsqueeze(0))?;
-            let (h_out, _routed) = layer.ffn.forward(&h_cat, &input_cat, DispatchCtx::WHOLE)?;
+            let (h_out, _routed) = layer.ffn.forward(&h_cat, &input_cat, ctx.clone())?;
 
             // Split the MoE output back per-sequence and hc_post each.
             let (_, n_tok, _) = h_out.dims3()?;
@@ -3563,8 +3603,10 @@ impl crate::stream_prefill::StreamPrefill for ModelWeights {
         // Only the final chunk's last row is the routing the decode that
         // follows continues from; the trace numbers rows across the prompt.
         self.stream_ctx = DispatchCtx {
+            decode: false,
             seed_prefill: chunk + 1 == n_chunks,
             trace_row_base: row_base,
+            prefill_timing: Arc::clone(&self.prefill_timing),
         };
     }
 
@@ -3640,7 +3682,7 @@ impl ModelWeights {
         let residual = xs.clone();
         let h = layer.ffn_norm.forward(&x)?;
         let input = Tensor::new(tokens.to_vec(), &self.shared.device)?.unsqueeze(0)?;
-        let (h, routed_ids) = layer.ffn.forward(&h, &input, self.stream_ctx)?;
+        let (h, routed_ids) = layer.ffn.forward(&h, &input, self.stream_ctx.clone())?;
         self.last_routed[l] = routed_ids;
         // Advisory: routing recording feeds the (hot-expert) prefetch policy,
         // never the logits.  Record against a fixed step; prefilter streaming
