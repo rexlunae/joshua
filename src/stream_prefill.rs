@@ -63,11 +63,12 @@ pub trait StreamPrefill {
     /// a hook for per-prefill bookkeeping such as the routing trace.
     fn begin_stream(&mut self) {}
 
-    /// Called before each `apply_layer_chunk` with the chunk's index and the
-    /// chunk count, so a loader can tell the final prompt chunk apart (the
-    /// deepseek4 device expert pool seeds itself from that chunk's last row
-    /// only).  Default: ignored.
-    fn set_stream_progress(&mut self, _chunk: usize, _n_chunks: usize) {}
+    /// Called before each `apply_layer_chunk` with the chunk's index, the
+    /// chunk count and the number of prompt tokens before this chunk, so a
+    /// loader can tell the final prompt chunk apart (the deepseek4 device
+    /// expert pool seeds itself from that chunk's last row only) and number
+    /// the chunk's rows within the prompt.  Default: ignored.
+    fn set_stream_progress(&mut self, _chunk: usize, _n_chunks: usize, _row_base: usize) {}
 
     /// Embed `tokens` into one chunk's activation (the layer-`-1` step),
     /// returning whatever activation shape the loader's layers consume.
@@ -131,8 +132,10 @@ pub fn stream_prefill<M: StreamPrefill + ?Sized>(
     // across all chunks; each chunk's KV at this layer accumulates in order as
     // we sweep, so attention sees the same KV it would have in linear order.
     for l in 0..m.n_layers() {
+        let mut row_base = 0usize;
         for (c, chunk) in chunks.iter().enumerate() {
-            m.set_stream_progress(c, chunks.len());
+            m.set_stream_progress(c, chunks.len(), row_base);
+            row_base += chunk.tokens.len();
             acts[c] = m.apply_layer_chunk(l, &acts[c], chunk.pos, chunk.tokens)?;
         }
     }

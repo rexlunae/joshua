@@ -718,13 +718,48 @@ struct Ds4DevicePool {
     miss: MissPolicy,
     /// What happens to an uploaded expert's host pages.
     host_pages: HostPagePolicy,
-    /// Experts the host kernels are running right now (decode misses in
-    /// flight); the release hook declines them and retries later.
-    busy: Arc<std::sync::Mutex<std::collections::HashSet<(u32, u32)>>>,
-    /// Whether a prefill chunk's last row seeds the pool: only the final
-    /// chunk of a prompt (set by the streaming runner), so a small prefill
-    /// chunk does not queue an upload per chunk.
-    seed_from_prefill: std::sync::atomic::AtomicBool,
+    /// Experts the host kernels are running right now, with how many runs
+    /// (sessions) are on each; the release hook declines them and retries
+    /// later.  A count, not a set: two sessions missing the same expert
+    /// must both finish before its pages may go.
+    busy: Arc<BusyExperts>,
+}
+
+/// Reference counts of the experts under host kernels (see
+/// `Ds4DevicePool::busy`).
+type BusyExperts = std::sync::Mutex<std::collections::HashMap<(u32, u32), u32>>;
+
+/// Per-call dispatch settings a session passes down to its MoE blocks
+/// (never stored in the shared pool: concurrent sessions would race).
+#[derive(Clone, Copy, Debug)]
+struct DispatchCtx {
+    /// Whether a prefill's last row seeds the device pool: true for a
+    /// whole-prompt forward and for the final chunk of a streamed prefill
+    /// only, so a small prefill chunk does not queue an upload per chunk.
+    seed_prefill: bool,
+    /// Row offset of this call's tokens inside the prompt, for the routing
+    /// trace (a streamed prefill is one trace call across its chunks).
+    trace_row_base: usize,
+}
+
+impl DispatchCtx {
+    /// A whole forward pass (one prompt or one decode step).
+    const WHOLE: Self = Self {
+        seed_prefill: true,
+        trace_row_base: 0,
+    };
+}
+
+/// Whether an environment flag is set to something other than off
+/// (`1`, `true`, `on`, … — not `0`, `false`, `off`, `no` or empty).
+fn env_flag(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "" | "0" | "false" | "off" | "no"
+        ),
+        Err(_) => false,
+    }
 }
 
 /// The block-quantized tensor behind a `QMatMul`, when it kept one.
@@ -841,7 +876,7 @@ fn build_device_pool(
     } else {
         HostPagePolicy::from_env()
     };
-    let busy: Arc<std::sync::Mutex<std::collections::HashSet<(u32, u32)>>> = Default::default();
+    let busy: Arc<BusyExperts> = Default::default();
     let release: Option<crate::residency::ReleaseHook> = match host_pages {
         HostPagePolicy::Drop => {
             let host = Arc::clone(&host_handles);
@@ -852,7 +887,7 @@ fn build_device_pool(
                 if busy
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
-                    .contains(&(l, e))
+                    .contains_key(&(l, e))
                 {
                     return false;
                 }
@@ -886,7 +921,7 @@ fn build_device_pool(
             HostPagePolicy::Keep => "kept (JOSHUA_EXPERT_HOST_PAGES=keep)",
         },
     );
-    let probe_pages = std::env::var_os("JOSHUA_EXPERT_STATS").is_some()
+    let probe_pages = env_flag("JOSHUA_EXPERT_STATS")
         || tracing::enabled!(target: "joshua", tracing::Level::DEBUG);
     Some(Arc::new(Ds4DevicePool {
         device: dev.clone(),
@@ -898,7 +933,6 @@ fn build_device_pool(
         miss,
         host_pages,
         busy,
-        seed_from_prefill: std::sync::atomic::AtomicBool::new(true),
     }))
 }
 
@@ -1796,7 +1830,12 @@ struct Moe {
 }
 
 impl Moe {
-    fn forward(&self, xs: &Tensor, input_ids: &Tensor) -> Result<(Tensor, Vec<u32>)> {
+    fn forward(
+        &self,
+        xs: &Tensor,
+        input_ids: &Tensor,
+        ctx: DispatchCtx,
+    ) -> Result<(Tensor, Vec<u32>)> {
         let (b, seq_len, h) = xs.dims3()?;
         let n_tokens = b * seq_len;
         let x2 = xs.reshape((n_tokens, h))?;
@@ -1847,7 +1886,8 @@ impl Moe {
 
         // One token per sequence is a decode step (batched or not): the pool
         // warms from its routing; a multi-token prefill only reads the pool.
-        let (routed, routed_ids) = self.dispatch(&x2, &indices, &weights, n_tokens, seq_len == 1)?;
+        let (routed, routed_ids) =
+            self.dispatch(&x2, &indices, &weights, n_tokens, seq_len == 1, ctx)?;
         let mut out = routed;
         if let Some(shared) = &self.shared {
             out = (out + shared.forward(&x2)?)?;
@@ -1862,12 +1902,13 @@ impl Moe {
         weights: &Tensor,
         n_tokens: usize,
         decode: bool,
+        ctx: DispatchCtx,
     ) -> Result<(Tensor, Vec<u32>)> {
         let k = self.n_expert_used;
         let h = x2.dim(1)?;
         let ids: Vec<u32> = indices.flatten_all()?.to_vec1()?;
         let wts: Vec<f32> = weights.flatten_all()?.to_vec1()?;
-        crate::route_trace::record(self.layer, &ids, k);
+        crate::route_trace::record(self.layer, &ids, k, ctx.trace_row_base);
         let out_device = x2.device().clone();
         if let Some(pool) = &self.device_pool {
             // Every launch of the previous MoE layer has completed: with the
@@ -1899,7 +1940,16 @@ impl Moe {
         routed_ids.dedup();
 
         let y = match &self.device_pool {
-            Some(pool) => self.dispatch_pooled(pool, x2, &per_expert, &routed_ids, n_tokens, decode, h)?,
+            Some(pool) => self.dispatch_pooled(
+                pool,
+                x2,
+                &per_expert,
+                &routed_ids,
+                n_tokens,
+                decode,
+                ctx.seed_prefill,
+                h,
+            )?,
             None => {
                 // The routed experts may live on a different device from the
                 // activations: on an accelerator the dense set is on the
@@ -2002,6 +2052,7 @@ impl Moe {
         last_row_ids: &[u32],
         n_tokens: usize,
         decode: bool,
+        seed_prefill: bool,
         h: usize,
     ) -> Result<Tensor> {
         let dev = &pool.device;
@@ -2027,11 +2078,7 @@ impl Moe {
                 }
             }
         }
-        if !decode
-            && pool
-                .seed_from_prefill
-                .load(std::sync::atomic::Ordering::Relaxed)
-        {
+        if !decode && seed_prefill {
             for &e in last_row_ids {
                 pool.uploader.request(self.layer, e);
             }
@@ -2078,16 +2125,24 @@ impl Moe {
             // The release hook must not drop these experts' pages while the
             // host kernels read them.
             let keys: Vec<(u32, u32)> = misses.iter().map(|&e| (self.layer, e as u32)).collect();
-            pool.busy
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .extend(keys.iter().copied());
-            let x_host = crate::moe::on_device(x2, &self.expert_device)?;
-            let y = self.host_experts(&x_host, per_expert, &misses, n_tokens, h);
             {
                 let mut busy = pool.busy.lock().unwrap_or_else(|p| p.into_inner());
                 for k in &keys {
-                    busy.remove(k);
+                    *busy.entry(*k).or_insert(0) += 1;
+                }
+            }
+            let x_host = crate::moe::on_device(x2, &self.expert_device)?;
+            let y = self.host_experts(&x_host, per_expert, &misses, n_tokens, h);
+            {
+                // Only this run's count: another session may still be on it.
+                let mut busy = pool.busy.lock().unwrap_or_else(|p| p.into_inner());
+                for k in &keys {
+                    if let Some(n) = busy.get_mut(k) {
+                        *n -= 1;
+                        if *n == 0 {
+                            busy.remove(k);
+                        }
+                    }
                 }
             }
             Some(y?)
@@ -2200,9 +2255,14 @@ enum FeedForward {
 }
 
 impl FeedForward {
-    fn forward(&self, xs: &Tensor, input_ids: &Tensor) -> Result<(Tensor, Vec<u32>)> {
+    fn forward(
+        &self,
+        xs: &Tensor,
+        input_ids: &Tensor,
+        ctx: DispatchCtx,
+    ) -> Result<(Tensor, Vec<u32>)> {
         match self {
-            Self::Moe(m) => m.forward(xs, input_ids),
+            Self::Moe(m) => m.forward(xs, input_ids, ctx),
         }
     }
 }
@@ -2271,6 +2331,9 @@ pub struct ModelWeights {
     /// [`crate::hot_experts::REFRESH_STEPS`] decode steps, and reports newly
     /// hot experts for the residency backend.
     hot_experts: crate::hot_experts::HotExpertCache,
+    /// Dispatch settings for the streamed prefill in progress (set per
+    /// chunk by the streaming runner; per session, never shared).
+    stream_ctx: DispatchCtx,
 }
 
 // Routed experts (see `crate::moe::is_routed_expert`) are the only weights
@@ -2838,6 +2901,7 @@ impl ModelWeights {
             kv_seq: Vec::new(),
             last_routed: vec![Vec::new(); n_layers],
             hot_experts: crate::hot_experts::HotExpertCache::new(n_layers, n_expert, 0),
+            stream_ctx: DispatchCtx::WHOLE,
         })
     }
 
@@ -2917,15 +2981,6 @@ impl ModelWeights {
             .device_pool
             .as_ref()
             .map(|p| p.decode.snapshot())
-    }
-
-    /// Whether the next prefill chunk's last row seeds the device pool
-    /// (see `Ds4DevicePool::seed_from_prefill`); a no-op without a pool.
-    fn set_seed_from_prefill(&self, seed: bool) {
-        if let Some(p) = &self.shared.device_pool {
-            p.seed_from_prefill
-                .store(seed, std::sync::atomic::Ordering::Relaxed);
-        }
     }
 
     /// Account one forward pass's wall time to the pool's decode or prefill
@@ -3028,6 +3083,7 @@ impl ModelWeights {
                 self.shared.cfg.n_expert,
                 self.hot_experts.budget(),
             ),
+            stream_ctx: DispatchCtx::WHOLE,
         }
     }
 
@@ -3055,8 +3111,6 @@ impl ModelWeights {
         } else {
             crate::route_trace::Phase::Prefill
         });
-        // A whole prompt in one call: its last row seeds the pool.
-        self.set_seed_from_prefill(true);
         let hc = self.shared.hc_mult;
         let d = self.shared.tok_embeddings.hidden()?;
 
@@ -3196,7 +3250,7 @@ impl ModelWeights {
             )?;
             let residual = xs;
             let h = layer.ffn_norm.forward(&x)?;
-            let (h, routed_ids) = layer.ffn.forward(&h, input)?;
+            let (h, routed_ids) = layer.ffn.forward(&h, input, DispatchCtx::WHOLE)?;
             last_routed[i] = routed_ids;
             self.hot_experts.record(i, &last_routed[i], step);
             xs = hc_post(&h, &residual, &post, &comb)?;
@@ -3404,7 +3458,7 @@ impl ModelWeights {
             let h_cat = Tensor::cat(&ffn_cats, 1)?;
             let input_cat = Tensor::new(ids_cat.as_slice(), &self.shared.device)
                 .and_then(|t| t.unsqueeze(0))?;
-            let (h_out, _routed) = layer.ffn.forward(&h_cat, &input_cat)?;
+            let (h_out, _routed) = layer.ffn.forward(&h_cat, &input_cat, DispatchCtx::WHOLE)?;
 
             // Split the MoE output back per-sequence and hc_post each.
             let (_, n_tok, _) = h_out.dims3()?;
@@ -3505,10 +3559,13 @@ impl crate::stream_prefill::StreamPrefill for ModelWeights {
         crate::route_trace::begin_call(crate::route_trace::Phase::Prefill);
     }
 
-    fn set_stream_progress(&mut self, chunk: usize, n_chunks: usize) {
+    fn set_stream_progress(&mut self, chunk: usize, n_chunks: usize, row_base: usize) {
         // Only the final chunk's last row is the routing the decode that
-        // follows continues from.
-        self.set_seed_from_prefill(chunk + 1 == n_chunks);
+        // follows continues from; the trace numbers rows across the prompt.
+        self.stream_ctx = DispatchCtx {
+            seed_prefill: chunk + 1 == n_chunks,
+            trace_row_base: row_base,
+        };
     }
 
     fn embed_chunk(&self, tokens: &[u32], device: &candle_core::Device) -> Result<Tensor> {
@@ -3583,7 +3640,7 @@ impl ModelWeights {
         let residual = xs.clone();
         let h = layer.ffn_norm.forward(&x)?;
         let input = Tensor::new(tokens.to_vec(), &self.shared.device)?.unsqueeze(0)?;
-        let (h, routed_ids) = layer.ffn.forward(&h, &input)?;
+        let (h, routed_ids) = layer.ffn.forward(&h, &input, self.stream_ctx)?;
         self.last_routed[l] = routed_ids;
         // Advisory: routing recording feeds the (hot-expert) prefetch policy,
         // never the logits.  Record against a fixed step; prefilter streaming
