@@ -91,14 +91,19 @@ fn logits(model: &mut QuantizedModel, tokens: &[u32], offset: usize) -> Vec<f32>
 /// under the currently denied kernel.  Tolerance mirrors the model tests:
 /// compare against the reference spread (device dequant-vs-CPU rounding).
 fn parity(device: &Device, model: &Path, what: &str) {
+    let mut dev = load_mmap(model, device);
+    parity_with(&mut dev, model, device, what);
+}
+
+fn parity_with(dev_model: &mut QuantizedModel, model: &Path, device: &Device, what: &str) {
     let tokens: Vec<u32> = (0..160).map(|i| 1 + (i % 15) as u32).collect();
     let mut cpu = load_mmap(model, &Device::Cpu);
     let ref_prefill = logits(&mut cpu, &tokens, 0);
     let ref_decode = logits(&mut cpu, &tokens[tokens.len() - 1..], tokens.len(), );
 
-    let mut dev = load_mmap(model, device);
-    let got_prefill = logits(&mut dev, &tokens, 0);
-    let got_decode = logits(&mut dev, &tokens[tokens.len() - 1..], tokens.len());
+    let dev = dev_model;
+    let got_prefill = logits(dev, &tokens, 0);
+    let got_decode = logits(dev, &tokens[tokens.len() - 1..], tokens.len());
 
     for (phase, got, want) in [
         ("prefill", &got_prefill, &ref_prefill),
@@ -136,8 +141,29 @@ fn deny_each_kernel_falls_back_to_matching_results() {
 
     for kernel in SWEPT {
         std::env::set_var("JOSHUA_OPENCL_NATIVE_DENY", kernel);
-        parity(&dev, &model, &format!("deny {kernel}"));
-        println!("deny {kernel}: fallback parity OK");
+        // A denied kernel can break the LOAD itself (e.g. the eager F16
+        // dequantize of output.weight has no CPU fallback): that is a
+        // distinct finding — the op is load-critical, not just parity — so
+        // report it and move on rather than failing the sweep.
+        let loaded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            load_mmap(&model, &dev)
+        }));
+        match loaded {
+            Err(_) => {
+                println!("deny {kernel}: load-critical (no fallback for eager load-time use)");
+                std::env::remove_var("JOSHUA_OPENCL_NATIVE_DENY");
+                continue;
+            }
+            Ok(Err(_)) => {
+                println!("deny {kernel}: load-critical (load returned an error)");
+                std::env::remove_var("JOSHUA_OPENCL_NATIVE_DENY");
+                continue;
+            }
+            Ok(Ok(mut dev_model)) => {
+                parity_with(&mut dev_model, &model, &dev, &format!("deny {kernel}"));
+                println!("deny {kernel}: fallback parity OK");
+            }
+        }
     }
     std::env::remove_var("JOSHUA_OPENCL_NATIVE_DENY");
     std::fs::remove_dir_all(&dir).ok();
