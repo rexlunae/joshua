@@ -692,9 +692,16 @@ impl<T: DeviceExpertSlot> DeviceResidency<T> {
             }
             st.leased.insert(key);
         }
-        let r = f();
-        self.lock().leased.remove(&key);
-        Some(r)
+        // The lease ends when the guard drops: on return and on a panic in
+        // `f`, so a slot can never stay protected for good.
+        struct Unlease<'a, T: DeviceExpertSlot>(&'a DeviceResidency<T>, (u32, u32));
+        impl<T: DeviceExpertSlot> Drop for Unlease<'_, T> {
+            fn drop(&mut self) {
+                self.0.lock().leased.remove(&self.1);
+            }
+        }
+        let _unlease = Unlease(self, key);
+        Some(f())
     }
 
     /// Protect `(layer, expert)` from LRU eviction (it is in the hot set).
@@ -1557,6 +1564,14 @@ mod device_pool_tests {
         // The lease is gone: the next acquire evicts it.
         r.acquire(0, 1);
         assert!(!r.contains(0, 0) && r.contains(0, 1));
+        // A panicking callback releases the lease too.
+        let gen1 = r.generation(0, 1).unwrap();
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            r.with_lease(0, 1, gen1, || panic!("hook failed"))
+        }));
+        assert!(panicked.is_err());
+        r.acquire(0, 2);
+        assert!(!r.contains(0, 1) && r.contains(0, 2), "lease released after the panic");
     }
 
     /// A hook that declines (the host still runs the expert) is retried
