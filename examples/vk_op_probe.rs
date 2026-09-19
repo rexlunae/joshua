@@ -21,11 +21,16 @@ fn check(what: &str, dev: &Tensor, cpu: &Tensor) -> bool {
         .to_vec1::<f32>()
         .unwrap();
     let c = cpu.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    assert_eq!(d.len(), c.len());
     let tol = spread_tol(&c);
     let mut worst = 0.0f32;
     let mut wi = 0;
     for (i, (a, b)) in d.iter().zip(&c).enumerate() {
-        let diff = (a - b).abs();
+        let diff = if a.is_finite() && b.is_finite() {
+            (a - b).abs()
+        } else {
+            f32::INFINITY
+        };
         if diff > worst {
             worst = diff;
             wi = i;
@@ -47,6 +52,10 @@ fn main() -> candle_core::Result<()> {
         println!("SKIP: no vulkan device");
         return Ok(());
     }
+    if let Device::Vulkan(vk) = &dev {
+        println!("limits: {:?}", vk.limits());
+    }
+    let mut all_ok = true;
     for seq in [8usize, 32, 48, 64, 72, 80, 88, 96, 104, 128, 160, 200] {
         let (b, h, d) = (1usize, 8usize, 64usize);
         let xs_v: Vec<f32> = (0..b * h * seq * d)
@@ -70,9 +79,10 @@ fn main() -> candle_core::Result<()> {
             first_bad_in.map(|i| in_dev[i]),
             first_bad_in.map(|i| in_cpu[i])
         );
+        all_ok &= first_bad_in.is_none();
         let sm_dev = candle_nn::ops::softmax_last_dim(&s_dev)?;
         let sm_cpu = candle_nn::ops::softmax_last_dim(&s_cpu)?;
-        check(
+        all_ok &= check(
             &format!("softmax_last [{seq}]"),
             &sm_dev,
             &sm_cpu,
@@ -104,7 +114,7 @@ fn main() -> candle_core::Result<()> {
         let x_cpu = Tensor::from_vec(xs_v.clone(), (b, seq, d), &Device::Cpu)?;
         let x_dev = Tensor::from_vec(xs_v.clone(), (b, seq, d), &dev)?;
         let alpha = Tensor::ones(d, candle_core::DType::F32, &Device::Cpu)?;
-        check(
+        all_ok &= check(
             &format!("rms_norm [{seq}]"),
             &candle_nn::ops::rms_norm(&x_dev, &alpha.to_device(&dev)?, 1e-5)?,
             &candle_nn::ops::rms_norm(&x_cpu, &alpha, 1e-5)?,
@@ -129,7 +139,7 @@ fn main() -> candle_core::Result<()> {
         let xr_dev = Tensor::from_vec(xs_v.clone(), (b, h, seq, d), &dev)?;
         let r_cpu = candle_nn::rotary_emb::rope(&xr_cpu, &sin_cpu, &cos_cpu)?;
         let r_dev = candle_nn::rotary_emb::rope(&xr_dev, &sin_dev, &cos_dev)?;
-        check(&format!("rope [{seq}]"), &r_dev, &r_cpu);
+        all_ok &= check(&format!("rope [{seq}]"), &r_dev, &r_cpu);
 
         // 4. plain broadcast multiply: [b, h, seq, half] * [seq, half].
         let m_cpu = (xr_cpu.narrow(D::Minus1, 0, half)? * &sin_cpu.broadcast_as(
@@ -142,7 +152,10 @@ fn main() -> candle_core::Result<()> {
                 .narrow(D::Minus1, 0, half)?
                 .shape(),
         )?)?;
-        check(&format!("broadcast mul [{seq}]"), &m_dev, &m_cpu);
+        all_ok &= check(&format!("broadcast mul [{seq}]"), &m_dev, &m_cpu);
+    }
+    if !all_ok {
+        candle_core::bail!("Vulkan op probe failed");
     }
     Ok(())
 }
