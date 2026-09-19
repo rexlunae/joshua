@@ -254,8 +254,8 @@ fn opencl_deepseek4_long_prompt_matches_cpu() {
         assert_eq!(cpu_next, dev_next, "greedy step {step}: argmax diverged");
         cpu_ids.push(cpu_next);
         dev_ids.push(dev_next);
-        cpu_last = logits(&mut ref_model, &[*cpu_next], cpu_ids.len() - 1, &cpu);
-        dev_last = logits(&mut dev_model, &[*dev_next], dev_ids.len() - 1, &ocl);
+        cpu_last = logits(&mut ref_model, &[cpu_next], cpu_ids.len() - 1, &cpu);
+        dev_last = logits(&mut dev_model, &[dev_next], dev_ids.len() - 1, &ocl);
     }
 
     std::fs::remove_dir_all(&dir).ok();

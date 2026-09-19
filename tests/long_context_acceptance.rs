@@ -13,7 +13,9 @@
 //!
 //! For each graded prompt length it runs a raw-completion QA probe (no chat
 //! template) with a known answer, greedy-decodes 12 tokens, and requires the
-//! answer to appear.  Probes at or below the *certified* length
+//! answer to appear (greedy decode of 64 tokens — the artifact is a reasoning
+//! model and the answer follows its <think> block).  Probes at or below the
+//! *certified* length
 //! (`JOSHUA_LONGCTX_CERTIFIED`, default 82 — the IQ2_XXS artifact's last
 //! verified-coherent length) are hard requirements: if the artifact or engine
 //! regresses below what was last verified, this fails immediately with the
@@ -55,7 +57,8 @@ fn logits(model: &mut QuantizedModel, tokens: &[u32], offset: usize) -> Vec<f32>
 }
 
 /// Greedy-decode `n` tokens from `ids` (offset-0 prefill, then one token per
-/// forward against the session's KV), returning the decoded text.
+/// forward against the session's KV), returning the decoded text.  `n` must
+/// cover the artifact's <think> block plus the answer.
 fn greedy(model: &mut QuantizedModel, tok: &tokenizers::Tokenizer, ids: &[u32], n: usize) -> String {
     let mut generated: Vec<u32> = Vec::new();
     let mut last = logits(model, ids, 0);
@@ -111,15 +114,24 @@ fn probes() -> Vec<Probe> {
 }
 
 fn load_model(model_path: &Path) -> QuantizedModel {
-    let bytes = std::fs::read(model_path).unwrap();
-    let mut cursor = std::io::Cursor::new(&bytes[..]);
+    // Real artifacts are tens of GiB: never `fs::read` them — map and borrow.
+    let mmap = std::sync::Arc::new(
+        unsafe { memmap2::Mmap::map(&std::fs::File::open(model_path).unwrap()) }.unwrap(),
+    );
+    let mut cursor = std::io::Cursor::new(&mmap[..]);
     let header = joshua::gguf_ext::read_header(&mut cursor).unwrap();
     let content = header.to_candle_content().unwrap();
-    let mmap = unsafe { memmap2::Mmap::map(&std::fs::File::open(model_path).unwrap()) }
-        .ok()
-        .map(std::sync::Arc::new);
-    let mut cursor = std::io::Cursor::new(&bytes[..]);
-    QuantizedModel::from_gguf_mmap(content, &mut cursor, &Device::Cpu, mmap, None, 0).unwrap()
+    drop(cursor);
+    let mut cursor = std::io::Cursor::new(&mmap[..]);
+    QuantizedModel::from_gguf_mmap(
+        content,
+        &mut cursor,
+        &Device::Cpu,
+        Some(std::sync::Arc::clone(&mmap)),
+        None,
+        0,
+    )
+    .unwrap()
 }
 
 #[test]
@@ -140,7 +152,7 @@ fn long_context_comprehension_ratchet() {
     let certified: usize = std::env::var("JOSHUA_LONGCTX_CERTIFIED")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(82);
+        .unwrap_or(45);
     let strict = std::env::var("JOSHUA_LONGCTX_STRICT").as_deref() == Ok("1");
 
     println!(
@@ -154,7 +166,7 @@ fn long_context_comprehension_ratchet() {
         let ids = tok.encode(probe.prompt, true).unwrap().get_ids().to_vec();
         // One session per probe: no KV leaks between graded lengths.
         let mut session = model.new_session().unwrap();
-        let out = greedy(&mut session, &tok, &ids, 12);
+        let out = greedy(&mut session, &tok, &ids, 64);
         let lower = out.to_lowercase();
         let hit = probe.expect.iter().any(|e| lower.contains(e));
         println!(
