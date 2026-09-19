@@ -59,6 +59,17 @@ fn main() -> candle_core::Result<()> {
             .collect();
         let s_cpu = Tensor::from_vec(scores.clone(), (b, h, seq, seq), &Device::Cpu)?;
         let s_dev = Tensor::from_vec(scores, (b, h, seq, seq), &dev)?;
+        // Probe the UPLOAD first: read the device input back and compare.
+        let in_dev = s_dev.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
+        let in_cpu = s_cpu.flatten_all()?.to_vec1::<f32>()?;
+        let first_bad_in = in_dev.iter().zip(&in_cpu).position(|(a, b)| (a - b).abs() > 1e-5);
+        println!(
+            "  upload [{seq}]: elements={} first_bad={:?} (dev={:?} cpu={:?})",
+            in_cpu.len(),
+            first_bad_in,
+            first_bad_in.map(|i| in_dev[i]),
+            first_bad_in.map(|i| in_cpu[i])
+        );
         let sm_dev = candle_nn::ops::softmax_last_dim(&s_dev)?;
         let sm_cpu = candle_nn::ops::softmax_last_dim(&s_cpu)?;
         check(
