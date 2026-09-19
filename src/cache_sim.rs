@@ -82,6 +82,13 @@ impl Trace {
                 return Err(format!("line {}: too many fields", n + 1));
             }
             if current != Some(call) {
+                if current.is_some_and(|prev| call < prev) {
+                    return Err(format!(
+                        "line {}: call {call} after call {}: calls must be in order (an edited or interleaved trace)",
+                        n + 1,
+                        current.unwrap_or(0)
+                    ));
+                }
                 calls.push(Call {
                     phase,
                     layers: Vec::new(),
@@ -89,6 +96,12 @@ impl Trace {
                 current = Some(call);
             }
             let c = calls.last_mut().expect("pushed above");
+            if c.phase != phase {
+                return Err(format!(
+                    "line {}: call {call} changes phase mid-call (an edited or interleaved trace)",
+                    n + 1
+                ));
+            }
             if c.layers.len() <= layer {
                 c.layers.resize(layer + 1, Vec::new());
             }
@@ -797,6 +810,18 @@ mod tests {
         assert!(Trace::parse("0,x,0,0,1").is_err());
         assert!(Trace::parse("0,d,0,0,1,9").is_err(), "too many fields");
         assert!(Trace::parse("0,d,0,0").is_err(), "too few fields");
+        assert!(
+            Trace::parse("0,p,0,0,1\n0,d,0,0,2\n").is_err(),
+            "a call cannot change phase"
+        );
+        assert!(
+            Trace::parse("1,d,0,0,1\n0,d,0,0,2\n").is_err(),
+            "calls must be in order"
+        );
+        assert!(
+            Trace::parse("0,d,0,0,1\n0,d,0,1,2\n1,d,0,0,3\n").is_ok(),
+            "in-order calls parse"
+        );
     }
 
     /// A cyclic sweep one expert wider than the cache: LRU never hits,
