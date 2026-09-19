@@ -16,6 +16,7 @@
 //!     --test opencl_deny_sweep -- --ignored --nocapture
 #![cfg(feature = "opencl")]
 
+mod common;
 use candle_core::{Device, Tensor};
 use joshua::model::QuantizedModel;
 use std::path::Path;
