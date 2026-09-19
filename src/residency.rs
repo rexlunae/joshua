@@ -1571,7 +1571,10 @@ mod device_pool_tests {
         }));
         assert!(panicked.is_err());
         r.acquire(0, 2);
-        assert!(!r.contains(0, 1) && r.contains(0, 2), "lease released after the panic");
+        assert!(
+            !r.contains(0, 1) && r.contains(0, 2),
+            "lease released after the panic"
+        );
     }
 
     /// A hook that declines (the host still runs the expert) is retried
