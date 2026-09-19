@@ -11,7 +11,7 @@
 //! Visit semantics mirror the deepseek4 dispatch: per call and per layer the
 //! routed experts are deduplicated (one lookup per distinct expert); a decode
 //! miss is uploaded (inserted) right away; a prefill only looks the pool up,
-//! except that the last row's experts are requested at its end.  The
+//! except that its last row's experts are requested at its end.  The
 //! routing-frequency hot set counts one visit per distinct expert per decode
 //! call (and the last row per layer of a prefill), is re-selected every
 //! [`crate::hot_experts::REFRESH_STEPS`] decode steps, capped at
@@ -33,9 +33,9 @@ pub type Key = (u32, u32);
 pub struct Call {
     /// Prefill or decode.
     pub phase: Phase,
-    /// Per layer, the routed expert ids in row order (`k` per row,
-    /// duplicates kept).
-    pub layers: Vec<Vec<u32>>,
+    /// Per layer, the routed `(row, expert)` visits in trace order
+    /// (duplicates kept; a batched decode has several rows).
+    pub layers: Vec<Vec<(u32, u32)>>,
 }
 
 /// A parsed routing trace.
@@ -69,7 +69,7 @@ impl Trace {
                 "d" => Phase::Decode,
                 other => return Err(format!("line {}: phase `{other}`", n + 1)),
             };
-            let _row: u64 = next("row")?
+            let row: u32 = next("row")?
                 .parse()
                 .map_err(|e| format!("line {}: row: {e}", n + 1))?;
             let layer: usize = next("layer")?
@@ -78,6 +78,9 @@ impl Trace {
             let expert: u32 = next("expert")?
                 .parse()
                 .map_err(|e| format!("line {}: expert: {e}", n + 1))?;
+            if f.next().is_some() {
+                return Err(format!("line {}: too many fields", n + 1));
+            }
             if current != Some(call) {
                 calls.push(Call {
                     phase,
@@ -89,7 +92,7 @@ impl Trace {
             if c.layers.len() <= layer {
                 c.layers.resize(layer + 1, Vec::new());
             }
-            c.layers[layer].push(expert);
+            c.layers[layer].push((row, expert));
         }
         Ok(Self { calls })
     }
@@ -112,8 +115,8 @@ impl Trace {
     pub fn distinct_keys(&self) -> usize {
         let mut set = HashSet::new();
         for c in &self.calls {
-            for (l, ids) in c.layers.iter().enumerate() {
-                for &e in ids {
+            for (l, visits) in c.layers.iter().enumerate() {
+                for &(_, e) in visits {
                     set.insert((l as u32, e));
                 }
             }
@@ -127,11 +130,12 @@ impl Trace {
         call.layers
             .iter()
             .enumerate()
-            .map(|(l, ids)| {
+            .map(|(l, visits)| {
                 let mut seen = HashSet::new();
-                ids.iter()
-                    .filter(|e| seen.insert(**e))
-                    .map(|&e| (l as u32, e))
+                visits
+                    .iter()
+                    .filter(|(_, e)| seen.insert(*e))
+                    .map(|&(_, e)| (l as u32, e))
                     .collect()
             })
             .collect()
@@ -139,36 +143,27 @@ impl Trace {
 
     /// What the hot-set counters record for a call: every distinct expert
     /// per layer of a decode step; the last row's experts per layer of a
-    /// prefill.
-    fn recorded(call: &Call, k: usize) -> Vec<Vec<Key>> {
+    /// prefill (which are also the experts the prefill seeds the pool with).
+    fn recorded(call: &Call) -> Vec<Vec<Key>> {
         match call.phase {
             Phase::Decode => Self::lookups(call),
             Phase::Prefill => call
                 .layers
                 .iter()
                 .enumerate()
-                .map(|(l, ids)| {
-                    let k = k.max(1);
-                    let start = ids.len().saturating_sub(k);
-                    let mut last: Vec<Key> = ids[start..].iter().map(|&e| (l as u32, e)).collect();
+                .map(|(l, visits)| {
+                    let last_row = visits.iter().map(|(r, _)| *r).max();
+                    let mut last: Vec<Key> = visits
+                        .iter()
+                        .filter(|(r, _)| Some(*r) == last_row)
+                        .map(|&(_, e)| (l as u32, e))
+                        .collect();
                     last.sort_unstable();
                     last.dedup();
                     last
                 })
                 .collect(),
         }
-    }
-
-    /// Experts per row (`k`): the most common row length seen, from the
-    /// largest per-layer decode count.
-    fn k(&self) -> usize {
-        self.calls
-            .iter()
-            .filter(|c| c.phase == Phase::Decode)
-            .flat_map(|c| c.layers.iter().map(Vec::len))
-            .max()
-            .unwrap_or(1)
-            .max(1)
     }
 }
 
@@ -255,10 +250,6 @@ impl Lru {
     fn set_hot(&mut self, hot: &[Key]) {
         self.hot = hot.iter().copied().collect();
     }
-
-    fn resident(&self) -> usize {
-        self.map.len()
-    }
 }
 
 /// The routing-frequency hot-set policy of [`crate::hot_experts`], replayed.
@@ -279,10 +270,10 @@ impl HotSet {
         }
     }
 
-    fn record(&mut self, keys: &[Key], step: u64) {
+    fn record(&mut self, keys: &[Key]) {
         for &k in keys {
             *self.hits.entry(k).or_insert(0) += 1;
-            self.last_used.insert(k, step);
+            self.last_used.insert(k, self.step);
         }
     }
 
@@ -403,7 +394,6 @@ fn simulate_lru(trace: &Trace, policy: Policy, cfg: &Config) -> Report {
         _ => 0,
     };
     let mut hot = HotSet::new(hot_budget);
-    let k = trace.k();
     for call in &trace.calls {
         let decode = call.phase == Phase::Decode;
         if decode {
@@ -416,7 +406,7 @@ fn simulate_lru(trace: &Trace, policy: Policy, cfg: &Config) -> Report {
                 }
             }
         }
-        for (l, keys) in Trace::lookups(call).into_iter().enumerate() {
+        for keys in Trace::lookups(call) {
             for key in keys {
                 let hit = tier.touch(key);
                 if decode {
@@ -433,17 +423,15 @@ fn simulate_lru(trace: &Trace, policy: Policy, cfg: &Config) -> Report {
                     }
                 }
             }
-            let _ = l;
         }
-        for (l, keys) in Trace::recorded(call, k).into_iter().enumerate() {
-            hot.record(&keys, hot.step);
+        for keys in Trace::recorded(call) {
+            hot.record(&keys);
             if !decode && !cfg.prefill_inserts {
                 // The last prompt row seeds the pool for the decode that follows.
                 for key in keys {
                     tier.insert(key);
                 }
             }
-            let _ = l;
         }
     }
     rep.uploads = tier.inserts;
@@ -491,6 +479,15 @@ fn simulate_static(trace: &Trace, cfg: &Config) -> Report {
     rep
 }
 
+/// One event of the flattened Belady sequence.
+#[derive(Clone, Copy)]
+enum Event {
+    /// A lookup (`decode`), inserting on a miss when `inserts`.
+    Visit { decode: bool, inserts: bool },
+    /// The prefill's last-row seeding: an insert that is not a lookup.
+    Seed,
+}
+
 fn simulate_belady(trace: &Trace, cfg: &Config) -> Report {
     let mut rep = Report {
         policy: Policy::Belady.name(),
@@ -498,9 +495,9 @@ fn simulate_belady(trace: &Trace, cfg: &Config) -> Report {
         ..Default::default()
     };
     // Flatten the lookups; prefill visits count as lookups (and inform the
-    // next-use distances) but only decode misses insert, as in the loader.
-    // (key, decode visit, may insert on a miss)
-    let mut seq: Vec<(Key, bool, bool)> = Vec::new();
+    // next-use distances) but only decode misses insert, as in the loader —
+    // plus the prefill's last-row seed, which the loader uploads.
+    let mut seq: Vec<(Key, Event)> = Vec::new();
     for call in &trace.calls {
         let decode = call.phase == Phase::Decode;
         if decode {
@@ -508,30 +505,52 @@ fn simulate_belady(trace: &Trace, cfg: &Config) -> Report {
         }
         for keys in Trace::lookups(call) {
             for key in keys {
-                seq.push((key, decode, decode || cfg.prefill_inserts));
+                seq.push((
+                    key,
+                    Event::Visit {
+                        decode,
+                        inserts: decode || cfg.prefill_inserts,
+                    },
+                ));
+            }
+        }
+        if !decode && !cfg.prefill_inserts {
+            for keys in Trace::recorded(call) {
+                for key in keys {
+                    seq.push((key, Event::Seed));
+                }
             }
         }
     }
     let n = seq.len();
+    // Next *visit* of each key after position i (seeds are not uses).
     let mut next_use = vec![u64::MAX; n];
     let mut last_seen: HashMap<Key, usize> = HashMap::new();
     for i in (0..n).rev() {
         if let Some(&j) = last_seen.get(&seq[i].0) {
             next_use[i] = j as u64;
         }
-        last_seen.insert(seq[i].0, i);
+        if matches!(seq[i].1, Event::Visit { .. }) {
+            last_seen.insert(seq[i].0, i);
+        }
     }
     let mut resident: HashMap<Key, u64> = HashMap::new(); // key → next use
     let mut by_next: BTreeSet<(u64, Key)> = BTreeSet::new();
-    for (i, &(key, decode, inserts)) in seq.iter().enumerate() {
+    for (i, &(key, event)) in seq.iter().enumerate() {
         let hit = resident.contains_key(&key);
-        if decode {
-            rep.decode_visits += 1;
-            rep.decode_hits += hit as u64;
-        } else {
-            rep.prefill_visits += 1;
-            rep.prefill_hits += hit as u64;
-        }
+        let inserts = match event {
+            Event::Visit { decode, inserts } => {
+                if decode {
+                    rep.decode_visits += 1;
+                    rep.decode_hits += hit as u64;
+                } else {
+                    rep.prefill_visits += 1;
+                    rep.prefill_hits += hit as u64;
+                }
+                inserts
+            }
+            Event::Seed => true,
+        };
         if hit {
             let old = resident[&key];
             by_next.remove(&(old, key));
@@ -595,15 +614,21 @@ pub struct TwoTierReport {
     pub device_evictions: u64,
     /// Disk reads made by uploads (an upload's pages were not in RAM).
     pub upload_disk: u64,
+    /// Disk reads made by host prefetches (the hot-set refresh and the
+    /// speculative next-step advice pulling in a cold expert).
+    pub prefetch_disk: u64,
 }
 
 impl TwoTierReport {
-    /// Disk reads per decode step (visits plus uploads whose pages were cold).
+    /// Disk reads per decode step: demand misses plus uploads and prefetches
+    /// whose pages were cold.  Prefill reads are excluded (they are
+    /// per-prompt, not per-token).
     pub fn disk_reads_per_decode_step(&self) -> f64 {
         if self.decode_steps == 0 {
             0.0
         } else {
-            (self.decode_disk + self.upload_disk) as f64 / self.decode_steps as f64
+            (self.decode_disk + self.upload_disk + self.prefetch_disk) as f64
+                / self.decode_steps as f64
         }
     }
 }
@@ -616,9 +641,15 @@ pub fn simulate_two_tier(trace: &Trace, cfg: &TwoTierConfig) -> TwoTierReport {
     let mut host = Lru::new(cfg.host_slots);
     let hot_budget = cfg.device_slots * cfg.hot_share.0 / cfg.hot_share.1.max(1);
     let mut hot = HotSet::new(hot_budget);
-    let k = trace.k();
     let mut previous_routed: Vec<Key> = Vec::new();
 
+    // A host prefetch (`MADV_WILLNEED`): a cold expert is read from the disk.
+    let prefetch = |key: Key, host: &mut Lru, rep: &mut TwoTierReport| {
+        if !host.touch(key) {
+            rep.prefetch_disk += 1;
+            host.insert(key);
+        }
+    };
     // Upload `key`: reads its host pages (disk if cold), inserts it on the
     // device; with exclusive tiers the host pages then go.
     let upload = |key: Key, device: &mut Lru, host: &mut Lru, rep: &mut TwoTierReport| {
@@ -630,7 +661,6 @@ pub fn simulate_two_tier(trace: &Trace, cfg: &TwoTierConfig) -> TwoTierReport {
             rep.upload_disk += 1;
             host.insert(key);
         }
-        let before = device.resident();
         device.insert(key);
         if device.contains(key) {
             rep.uploads += 1;
@@ -638,7 +668,6 @@ pub fn simulate_two_tier(trace: &Trace, cfg: &TwoTierConfig) -> TwoTierReport {
                 host.remove(key);
             }
         }
-        let _ = before;
     };
 
     for call in &trace.calls {
@@ -653,7 +682,7 @@ pub fn simulate_two_tier(trace: &Trace, cfg: &TwoTierConfig) -> TwoTierReport {
                     // on the device and the tiers are exclusive) and asks
                     // for an upload.
                     if !(cfg.exclusive && device.contains(key)) {
-                        host.insert(key);
+                        prefetch(key, &mut host, &mut rep);
                     }
                     upload(key, &mut device, &mut host, &mut rep);
                 }
@@ -661,7 +690,7 @@ pub fn simulate_two_tier(trace: &Trace, cfg: &TwoTierConfig) -> TwoTierReport {
             // Speculative prefetch of the previous step's routing.
             for &key in &previous_routed {
                 if !(cfg.exclusive && device.contains(key)) {
-                    host.insert(key);
+                    prefetch(key, &mut host, &mut rep);
                 }
             }
         }
@@ -705,8 +734,8 @@ pub fn simulate_two_tier(trace: &Trace, cfg: &TwoTierConfig) -> TwoTierReport {
                 }
             }
         }
-        for keys in Trace::recorded(call, k) {
-            hot.record(&keys, hot.step);
+        for keys in Trace::recorded(call) {
+            hot.record(&keys);
             if !decode {
                 for key in keys {
                     upload(key, &mut device, &mut host, &mut rep);
@@ -725,17 +754,30 @@ pub fn simulate_two_tier(trace: &Trace, cfg: &TwoTierConfig) -> TwoTierReport {
 mod tests {
     use super::*;
 
+    /// A one-row decode call.
     fn decode(layers: &[&[u32]]) -> Call {
         Call {
             phase: Phase::Decode,
-            layers: layers.iter().map(|l| l.to_vec()).collect(),
+            layers: layers
+                .iter()
+                .map(|l| l.iter().map(|&e| (0, e)).collect())
+                .collect(),
         }
     }
 
-    fn prefill(layers: &[&[u32]]) -> Call {
+    /// A prefill call given as per-layer rows of experts.
+    fn prefill(layers: &[&[&[u32]]]) -> Call {
         Call {
             phase: Phase::Prefill,
-            layers: layers.iter().map(|l| l.to_vec()).collect(),
+            layers: layers
+                .iter()
+                .map(|rows| {
+                    rows.iter()
+                        .enumerate()
+                        .flat_map(|(r, es)| es.iter().map(move |&e| (r as u32, e)))
+                        .collect()
+                })
+                .collect(),
         }
     }
 
@@ -747,12 +789,14 @@ mod tests {
         assert_eq!(
             t,
             Trace {
-                calls: vec![prefill(&[&[3, 3], &[7]]), decode(&[&[1], &[2]])]
+                calls: vec![prefill(&[&[&[3], &[3]], &[&[7]]]), decode(&[&[1], &[2]])]
             }
         );
         assert_eq!(t.decode_steps(), 1);
         assert_eq!(t.distinct_keys(), 4);
         assert!(Trace::parse("0,x,0,0,1").is_err());
+        assert!(Trace::parse("0,d,0,0,1,9").is_err(), "too many fields");
+        assert!(Trace::parse("0,d,0,0").is_err(), "too few fields");
     }
 
     /// A cyclic sweep one expert wider than the cache: LRU never hits,
@@ -799,17 +843,21 @@ mod tests {
         let hot = simulate(&trace, Policy::LruHot { share: (1, 2) }, &cfg);
         // With one protected slot expert 0 always hits after the first
         // refresh (step 64); LRU evicts it every step.
-        let hot0 = hot.decode_hits;
-        assert!(hot0 > plain.decode_hits, "hot {hot:?} vs lru {plain:?}");
-        assert!(hot0 >= 200 - 64, "{hot:?}");
+        assert!(
+            hot.decode_hits > plain.decode_hits,
+            "hot {hot:?} vs lru {plain:?}"
+        );
+        assert!(hot.decode_hits >= 200 - 64, "{hot:?}");
     }
 
-    /// Prefill is lookup-only except for its last row, which seeds the pool.
+    /// Prefill is lookup-only except for its last row, which seeds the pool
+    /// under every policy — Belady included, so its ceiling starts the
+    /// decode from the loader's cache state.
     #[test]
     fn prefill_seeds_only_the_last_row() {
         let trace = Trace {
             calls: vec![
-                prefill(&[&[1, 2, 3, 4, 5, 6]]), // k = 2 rows of two: last row (5, 6)
+                prefill(&[&[&[1, 2], &[3, 4], &[5, 6]]]), // last row (5, 6)
                 decode(&[&[5, 6]]),
                 decode(&[&[1, 2]]),
             ],
@@ -818,14 +866,16 @@ mod tests {
             slots: 4,
             prefill_inserts: false,
         };
-        let r = simulate(&trace, Policy::Lru, &cfg);
-        assert_eq!(r.prefill_visits, 6);
-        assert_eq!(r.prefill_hits, 0);
-        assert_eq!(r.decode_visits, 4);
-        assert_eq!(
-            r.decode_hits, 2,
-            "the seeded (5, 6) hit, (1, 2) miss: {r:?}"
-        );
+        for policy in [Policy::Lru, Policy::Belady] {
+            let r = simulate(&trace, policy, &cfg);
+            assert_eq!(r.prefill_visits, 6, "{r:?}");
+            assert_eq!(r.prefill_hits, 0, "{r:?}");
+            assert_eq!(r.decode_visits, 4, "{r:?}");
+            assert_eq!(
+                r.decode_hits, 2,
+                "the seeded (5, 6) hit, (1, 2) miss: {r:?}"
+            );
+        }
         let all = simulate(
             &trace,
             Policy::Lru,
@@ -837,11 +887,39 @@ mod tests {
         assert_eq!(all.decode_hits, 4);
     }
 
+    /// A batched decode (several rows per call) is one lookup per distinct
+    /// expert, and a prefill's seed is its last *row*, not the last
+    /// `batch × k` entries.
+    #[test]
+    fn batched_rows_do_not_widen_the_prefill_seed() {
+        let batched = Call {
+            phase: Phase::Decode,
+            layers: vec![vec![(0, 1), (0, 2), (1, 2), (1, 3), (2, 4), (2, 5)]],
+        };
+        let trace = Trace {
+            calls: vec![
+                batched,
+                prefill(&[&[&[7, 8], &[9, 10], &[11, 12]]]),
+                decode(&[&[9, 10, 11, 12]]),
+            ],
+        };
+        let cfg = Config {
+            slots: 8,
+            prefill_inserts: false,
+        };
+        let r = simulate(&trace, Policy::Lru, &cfg);
+        // The batched call: 5 distinct experts, all misses.
+        // The last decode: (11, 12) seeded, (9, 10) not.
+        assert_eq!(r.decode_visits, 5 + 4, "{r:?}");
+        assert_eq!(r.decode_hits, 2, "{r:?}");
+    }
+
     /// Exclusive tiers: once the hot set pins expert 2 on the one device
     /// slot, the two host slots hold experts 0 and 1 and no visit reaches
     /// the disk.  Inclusive tiers advise expert 2's host pages every step
     /// too (the speculative prefetch), which takes a host slot from 0 or 1
-    /// and sends one of them to the disk on every step.
+    /// and sends one of them to the disk on every step — and that prefetch
+    /// itself is a disk read that the report counts.
     #[test]
     fn exclusive_tiers_stop_the_duplicate_from_evicting_the_host_experts() {
         // Expert 2 is visited one step more than 0 and 1, so the refresh at
@@ -867,11 +945,17 @@ mod tests {
         assert_eq!(ex.decode_visits, 901);
         assert_eq!(inc.decode_visits, 901);
         // Exclusive: nothing from the disk after the refresh (≤ 3 reads per
-        // step for the 64 thrashing steps before it).
-        assert!(ex.decode_disk + ex.upload_disk <= 3 * 64 + 3, "{ex:?}");
+        // step for the 64 thrashing steps before it, uploads and
+        // prefetches included).
+        assert!(
+            ex.decode_disk + ex.upload_disk + ex.prefetch_disk <= 3 * 64 + 3,
+            "{ex:?}"
+        );
         assert!(ex.decode_device_hits >= 300 - 64, "{ex:?}");
-        // Inclusive: two disk reads per step for the ~236 steps after it.
+        // Inclusive: two demand disk reads per step for the ~236 steps
+        // after it, plus the cold prefetch of the device-resident expert.
         assert!(inc.decode_disk >= 2 * 230, "{inc:?}");
+        assert!(inc.prefetch_disk >= 230, "{inc:?}");
         assert!(ex.disk_reads_per_decode_step() < inc.disk_reads_per_decode_step());
     }
 }

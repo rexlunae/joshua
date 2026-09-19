@@ -113,11 +113,14 @@ and runs a **bounded device cache** over them:
   (`MADV_DONTNEED` + `posix_fadvise(DONTNEED)`; the page-cache folios that
   lie wholly inside the expert's ranges go at once, the ones straddling
   an edge are unmapped and deactivated, so the kernel reclaims them
-  first), so RAM fills with the experts the host still has to run.  Before
-  this the refresh pulled the
+  first), so RAM fills with the experts the host still has to run.  The
+  release skips an expert the host kernels are running at that moment and
+  retries later, and only ever targets the upload it was scheduled for.
+  Before this the refresh pulled the
   card's ~14 GiB back into the page cache every 64 steps, and each decode
   step re-advised the previous step's experts whether or not they were on
-  the device.  `JOSHUA_EXPERT_HOST_PAGES=keep` restores the old behaviour
+  the device.  `JOSHUA_EXPERT_HOST_PAGES=keep` restores the old, inclusive
+  behaviour in full — pages kept, device-resident experts advised again
   (for a host with RAM to spare, or to bisect).
 
 Flags (all also environment variables, `JOSHUA_…`):
@@ -160,7 +163,8 @@ warms the pool fastest at the cost of stalling the token for the transfer.
 ### Routing trace and the offline cache simulator
 
 `JOSHUA_ROUTE_TRACE=trace.csv` writes every `(call, phase, row, layer,
-expert)` visit of a run to a CSV.  `cargo run --release --example cache_sim
+expert)` visit of a run to a CSV (one file per process: trace one request
+at a time, since concurrent sessions interleave their calls).  `cargo run --release --example cache_sim
 -- trace.csv --slots 2067 --host-slots 7400` replays it against plain LRU,
 the loader's LRU with the protected hot set, a static most-frequent
 placement and Belady's optimal policy at that slot count — the hit-rate
@@ -220,7 +224,7 @@ the card for the real numbers).
 | `JOSHUA_EXPERT_MISS=upload` | Decode misses of the VRAM expert cache upload synchronously and run on the device (measurement mode). |
 | `JOSHUA_EXPERT_HOST_PAGES=keep` | Keep an uploaded expert's host pages instead of releasing them (inclusive tiers; the default releases them). |
 | `JOSHUA_EXPERT_STATS=1` | Probe each host miss's page residency for the decode time split even without a `debug` log filter. |
-| `JOSHUA_ROUTE_TRACE=<path>` | Write the routing trace CSV for the offline cache simulator (`examples/cache_sim.rs`). |
+| `JOSHUA_ROUTE_TRACE=<path>` | Write the routing trace CSV for the offline cache simulator (`examples/cache_sim.rs`).  One file per process: run a single request at a time while tracing, or concurrent requests interleave their calls. |
 | `JOSHUA_PREFILL_CHUNK=<n>` | Tokens per prefill chunk (also `--prefill-chunk`). |
 | `JOSHUA_OPENCL_QGEMV=v1` | Run the expert formats through the one-row quantized GEMV instead of the multi-row kernel (bisecting). |
 

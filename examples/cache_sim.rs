@@ -34,6 +34,10 @@ fn main() {
                 let v = args.next().expect("--hot-share n/d");
                 let (n, d) = v.split_once('/').expect("n/d");
                 hot_share = (n.parse().expect("n"), d.parse().expect("d"));
+                if hot_share.1 == 0 || hot_share.0 > hot_share.1 {
+                    eprintln!("--hot-share must be a fraction n/d with 0 < d and n <= d");
+                    std::process::exit(2);
+                }
             }
             "--expert-mib" => {
                 expert_mib = args.next().expect("--expert-mib F").parse().expect("MiB")

@@ -716,6 +716,15 @@ struct Ds4DevicePool {
     probe_pages: bool,
     uploader: Arc<crate::residency::ExpertUploader<Ds4DeviceExpert>>,
     miss: MissPolicy,
+    /// What happens to an uploaded expert's host pages.
+    host_pages: HostPagePolicy,
+    /// Experts the host kernels are running right now (decode misses in
+    /// flight); the release hook declines them and retries later.
+    busy: Arc<std::sync::Mutex<std::collections::HashSet<(u32, u32)>>>,
+    /// Whether a prefill chunk's last row seeds the pool: only the final
+    /// chunk of a prompt (set by the streaming runner), so a small prefill
+    /// chunk does not queue an upload per chunk.
+    seed_from_prefill: std::sync::atomic::AtomicBool,
 }
 
 /// The block-quantized tensor behind a `QMatMul`, when it kept one.
@@ -832,13 +841,25 @@ fn build_device_pool(
     } else {
         HostPagePolicy::from_env()
     };
+    let busy: Arc<std::sync::Mutex<std::collections::HashSet<(u32, u32)>>> = Default::default();
     let release: Option<crate::residency::ReleaseHook> = match host_pages {
         HostPagePolicy::Drop => {
             let host = Arc::clone(&host_handles);
+            let busy = Arc::clone(&busy);
             Some(Arc::new(move |l: u32, e: u32| {
+                // Not while the host kernels are reading it: the uploader
+                // retries after another delay.
+                if busy
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .contains(&(l, e))
+                {
+                    return false;
+                }
                 if let Some(Some(h)) = host.get(l as usize).and_then(|row| row.get(e as usize)) {
                     h.release_host_pages(file.as_deref());
                 }
+                true
             }))
         }
         HostPagePolicy::Keep => None,
@@ -875,6 +896,9 @@ fn build_device_pool(
         probe_pages,
         uploader,
         miss,
+        host_pages,
+        busy,
+        seed_from_prefill: std::sync::atomic::AtomicBool::new(true),
     }))
 }
 
@@ -2003,7 +2027,11 @@ impl Moe {
                 }
             }
         }
-        if !decode {
+        if !decode
+            && pool
+                .seed_from_prefill
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
             for &e in last_row_ids {
                 pool.uploader.request(self.layer, e);
             }
@@ -2047,8 +2075,22 @@ impl Moe {
         let y_host = if misses.is_empty() {
             None
         } else {
+            // The release hook must not drop these experts' pages while the
+            // host kernels read them.
+            let keys: Vec<(u32, u32)> = misses.iter().map(|&e| (self.layer, e as u32)).collect();
+            pool.busy
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .extend(keys.iter().copied());
             let x_host = crate::moe::on_device(x2, &self.expert_device)?;
-            Some(self.host_experts(&x_host, per_expert, &misses, n_tokens, h)?)
+            let y = self.host_experts(&x_host, per_expert, &misses, n_tokens, h);
+            {
+                let mut busy = pool.busy.lock().unwrap_or_else(|p| p.into_inner());
+                for k in &keys {
+                    busy.remove(k);
+                }
+            }
+            Some(y?)
         };
         let t2 = std::time::Instant::now();
         // The handles this layer launched on go back to the pool's retire
@@ -2758,11 +2800,16 @@ impl ModelWeights {
                 .collect(),
         );
         let residency: std::sync::Arc<dyn crate::residency::ExpertResidency> = match &device_pool {
-            Some(pool) => std::sync::Arc::new(crate::residency::CompositeResidency::with_device_pool(
-                cpu_residency,
-                Arc::clone(&pool.pool),
-                Arc::clone(&pool.uploader),
-            )),
+            Some(pool) => std::sync::Arc::new(
+                crate::residency::CompositeResidency::with_device_pool(
+                    cpu_residency,
+                    Arc::clone(&pool.pool),
+                    Arc::clone(&pool.uploader),
+                )
+                // Keeping host pages means the inclusive layout: advise
+                // device-resident experts too.
+                .advise_device_resident(pool.host_pages == HostPagePolicy::Keep),
+            ),
             None => std::sync::Arc::new(cpu_residency),
         };
         let n_layers = layers.len();
@@ -2813,9 +2860,11 @@ impl ModelWeights {
             // Every layer of this architecture carries an MoE block.
             let FeedForward::Moe(moe) = &layer.ffn;
             for &e in ids {
-                // An expert resident on the device runs there; its host
-                // pages are not wanted (exclusive tiers).
-                if pool.is_some_and(|p| p.pool.contains(i as u32, e)) {
+                // An expert resident on the device runs there; with
+                // exclusive tiers its host pages are not wanted.
+                if pool.is_some_and(|p| {
+                    p.host_pages == HostPagePolicy::Drop && p.pool.contains(i as u32, e)
+                }) {
                     continue;
                 }
                 if let Some(expert) = moe.experts.get(e as usize) {
@@ -2868,6 +2917,15 @@ impl ModelWeights {
             .device_pool
             .as_ref()
             .map(|p| p.decode.snapshot())
+    }
+
+    /// Whether the next prefill chunk's last row seeds the device pool
+    /// (see `Ds4DevicePool::seed_from_prefill`); a no-op without a pool.
+    fn set_seed_from_prefill(&self, seed: bool) {
+        if let Some(p) = &self.shared.device_pool {
+            p.seed_from_prefill
+                .store(seed, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// Account one forward pass's wall time to the pool's decode or prefill
@@ -2997,6 +3055,8 @@ impl ModelWeights {
         } else {
             crate::route_trace::Phase::Prefill
         });
+        // A whole prompt in one call: its last row seeds the pool.
+        self.set_seed_from_prefill(true);
         let hc = self.shared.hc_mult;
         let d = self.shared.tok_embeddings.hidden()?;
 
@@ -3443,6 +3503,12 @@ impl crate::stream_prefill::StreamPrefill for ModelWeights {
 
     fn begin_stream(&mut self) {
         crate::route_trace::begin_call(crate::route_trace::Phase::Prefill);
+    }
+
+    fn set_stream_progress(&mut self, chunk: usize, n_chunks: usize) {
+        // Only the final chunk's last row is the routing the decode that
+        // follows continues from.
+        self.set_seed_from_prefill(chunk + 1 == n_chunks);
     }
 
     fn embed_chunk(&self, tokens: &[u32], device: &candle_core::Device) -> Result<Tensor> {
