@@ -1554,12 +1554,9 @@ mod vulkan_softmax_tests {
     use super::softmax_last_dim;
     use candle::{Device, Tensor};
 
-    /// On-device softmax-last-dim must match the CPU result exactly. This
-    /// exercises the vendored `SoftmaxLastDim::vulkan_fwd` custom-op path.
-    /// Run on a Vulkan host with:
-    ///   cargo test -p candle-nn --features vulkan -- --ignored vulkan_softmax
+    /// Exercise subgroup/workgroup boundaries, multiple stride iterations,
+    /// causal masks and nonzero storage offsets (#81). No model files needed.
     #[test]
-    #[ignore]
     fn softmax_last_dim_vulkan_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
         let vk = match candle::VulkanDevice::new(0) {
             Ok(d) => d,
@@ -1568,30 +1565,68 @@ mod vulkan_softmax_tests {
                 return Ok(());
             }
         };
+        let wg = vk.limits().wg;
         let vdevice = Device::Vulkan(vk);
-        // A (rows, cols) input with a wide dynamic range (stresses max subtraction).
-        let (r, c) = (7usize, 11usize);
-        let data: Vec<f32> = (0..r * c)
-            .map(|i| ((i * 7) % 23) as f32 - 11.0 + ((i % 3) as f32) * 5.0)
-            .collect();
-        let cpu_in = Tensor::from_vec(data.clone(), (r, c), &Device::Cpu)?;
-        let out_cpu = softmax_last_dim(&cpu_in)?.to_vec2::<f32>()?;
-
-        let vk_in = Tensor::from_vec(data, (r, c), &vdevice)?;
-        let out_vk = softmax_last_dim(&vk_in)?
-            .to_device(&Device::Cpu)?
-            .to_vec2::<f32>()?;
-
-        assert_eq!(out_cpu.len(), out_vk.len());
-        let mut worst = 0.0f32;
-        for (a, b) in out_cpu.iter().flatten().zip(out_vk.iter().flatten()) {
-            worst = worst.max((a - b).abs());
+        let mut lengths = vec![
+            1,
+            11,
+            32,
+            63,
+            64,
+            65,
+            72,
+            96,
+            128,
+            200,
+            1025,
+            wg - 1,
+            wg,
+            wg + 1,
+            2 * wg + 1,
+        ];
+        lengths.sort_unstable();
+        lengths.dedup();
+        for cols in lengths {
+            for masked in [false, true] {
+                let data: Vec<f32> = (0..4 * 7 * cols)
+                    .map(|i| {
+                        let row = i / cols;
+                        let col = i % cols;
+                        if masked && col > (row * 53) % cols {
+                            f32::NEG_INFINITY
+                        } else {
+                            // Vary the row maximum across subgroups, with a
+                            // large offset to require stable max subtraction.
+                            1000.0 + ((i * 7) % 23) as f32 - 11.0
+                        }
+                    })
+                    .collect();
+                let cpu = Tensor::from_vec(data.clone(), (4, 7, cols), &Device::Cpu)?;
+                let gpu = Tensor::from_vec(data, (4, 7, cols), &vdevice)?;
+                for offset in [0, 1] {
+                    let cpu = cpu.narrow(0, offset, 3)?;
+                    let gpu = gpu.narrow(0, offset, 3)?;
+                    let want = softmax_last_dim(&cpu)?.flatten_all()?.to_vec1::<f32>()?;
+                    let got = softmax_last_dim(&gpu)?
+                        .to_device(&Device::Cpu)?
+                        .flatten_all()?
+                        .to_vec1::<f32>()?;
+                    assert_eq!(got.len(), want.len());
+                    for (i, (&a, &b)) in got.iter().zip(&want).enumerate() {
+                        assert!(a.is_finite() && a >= 0.0 &&
+                                    (a - b).abs() <= 2e-6 + b.abs() * 1e-4,
+                                    "softmax cols={cols} masked={masked} offset={offset} element={i}: vulkan={a} cpu={b}");
+                    }
+                    for (row, values) in got.chunks_exact(cols).enumerate() {
+                        let sum: f32 = values.iter().sum();
+                        assert!(
+                            (sum - 1.0).abs() < 1e-5,
+                            "softmax cols={cols} masked={masked} offset={offset} row={row}: sum={sum}"
+                        );
+                    }
+                }
+            }
         }
-        eprintln!("vulkan softmax last-dim: worst diff = {worst:.3e}");
-        assert!(
-            worst < 1e-4,
-            "vulkan softmax diverged from CPU: worst diff {worst:.3e}"
-        );
         Ok(())
     }
 

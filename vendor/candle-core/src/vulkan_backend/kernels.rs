@@ -152,6 +152,40 @@ pub struct Pipe {
     pub nbuf: u32,
 }
 
+/// Naga 27 lowers GLSL `barrier()` to `Barrier::all()`, which includes
+/// SUB_GROUP. Its SPIR-V writer interprets that flag as *subgroup execution
+/// scope*, even when WORK_GROUP is also set. That leaves different subgroups
+/// racing on shared reduction/tile memory (#81). GLSL barrier() in a compute
+/// shader must rendezvous the whole workgroup. Correct the execution scope
+/// before validation/emission, retaining the other memory-ordering flags.
+fn fix_glsl_barrier_scope(block: &mut naga::Block) {
+    use naga::Statement;
+    for statement in block.iter_mut() {
+        match statement {
+            Statement::ControlBarrier(flags) if flags.contains(naga::Barrier::WORK_GROUP) => {
+                flags.remove(naga::Barrier::SUB_GROUP);
+            }
+            Statement::Block(body) => fix_glsl_barrier_scope(body),
+            Statement::If { accept, reject, .. } => {
+                fix_glsl_barrier_scope(accept);
+                fix_glsl_barrier_scope(reject);
+            }
+            Statement::Switch { cases, .. } => {
+                for case in cases {
+                    fix_glsl_barrier_scope(&mut case.body);
+                }
+            }
+            Statement::Loop {
+                body, continuing, ..
+            } => {
+                fix_glsl_barrier_scope(body);
+                fix_glsl_barrier_scope(continuing);
+            }
+            _ => {}
+        }
+    }
+}
+
 fn glsl_to_spirv(source: &str) -> Result<Vec<u32>> {
     use naga::back::spv;
     use naga::front::glsl::{Frontend, Options};
@@ -160,9 +194,15 @@ fn glsl_to_spirv(source: &str) -> Result<Vec<u32>> {
 
     let options = Options::from(ShaderStage::Compute);
     let mut frontend = Frontend::default();
-    let module = frontend.parse(&options, source).map_err(|e| {
+    let mut module = frontend.parse(&options, source).map_err(|e| {
         Error::Msg(format!("vulkan shader parse failed: {}\n--- source ---\n{source}", e.emit_to_string(source)))
     })?;
+    for (_, function) in module.functions.iter_mut() {
+        fix_glsl_barrier_scope(&mut function.body);
+    }
+    for entry in &mut module.entry_points {
+        fix_glsl_barrier_scope(&mut entry.function.body);
+    }
     let mut validator = Validator::new(ValidationFlags::all(), Capabilities::all());
     let info = validator
         .validate(&module)
@@ -1070,3 +1110,82 @@ pub fn run_qembed(d: &VulkanDevice, dtype: crate::quantized::GgmlDType, w: Buf, 
 
 /// Type alias for the pipeline cache map.
 pub type PipeMap = HashMap<String, std::sync::Arc<Pipe>>;
+
+#[cfg(test)]
+mod barrier_tests {
+    use super::{glsl, glsl_to_spirv};
+    use std::collections::HashMap;
+
+    // Inspect the emitted SPIR-V, so this catches a regression in either
+    // Naga's frontend or writer even on CI without a Vulkan device.
+    fn assert_workgroup_barriers(source: &str) {
+        let words = glsl_to_spirv(source).unwrap();
+        let mut constants = HashMap::new();
+        let mut barriers = Vec::new();
+        let mut cursor = 5; // SPIR-V module header.
+        while cursor < words.len() {
+            let count = (words[cursor] >> 16) as usize;
+            let opcode = words[cursor] & 0xffff;
+            assert!(count > 0 && cursor + count <= words.len());
+            let args = &words[cursor + 1..cursor + count];
+            match opcode {
+                43 if args.len() == 3 => {
+                    // OpConstant: type, result id, literal.
+                    constants.insert(args[1], args[2]);
+                }
+                224 => barriers.push((args[0], args[2])), // OpControlBarrier.
+                _ => {}
+            }
+            cursor += count;
+        }
+        assert!(
+            !barriers.is_empty(),
+            "expected at least one control barrier"
+        );
+        for (scope, semantics) in barriers {
+            assert_eq!(
+                constants[&scope], 2,
+                "barrier must use Workgroup execution scope"
+            );
+            // AcquireRelease (0x8) and WorkgroupMemory (0x100).
+            assert_eq!(constants[&semantics] & 0x108, 0x108);
+        }
+    }
+
+    #[test]
+    fn glsl_barriers_synchronize_whole_workgroups() {
+        for wg in [64, 128, 256] {
+            for source in [
+                glsl::k_softmax_last(wg),
+                glsl::k_rmsnorm(wg),
+                glsl::k_reduce_last(wg),
+                glsl::k_arg_last(wg),
+                glsl::k_gemv_nt(wg),
+                glsl::k_qgemv(wg),
+                glsl::k_hgemv(wg),
+                glsl::k_gemm(wg, 8),
+                glsl::k_gemm(wg, 16),
+            ] {
+                assert_workgroup_barriers(&source);
+            }
+        }
+        // Cover helper functions and nested control flow as well as the
+        // reduction loops in the actual kernels above.
+        assert_workgroup_barriers(
+            r#"#version 450
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC { int mode; } pc;
+void sync_group() { barrier(); }
+void main() {
+    { barrier(); }
+    if (pc.mode == 0) { barrier(); } else { sync_group(); }
+    switch (pc.mode) {
+        case 1: barrier(); break;
+        default: barrier(); break;
+    }
+    for (int i = 0; i < 2; i++) { barrier(); }
+}
+"#,
+        );
+    }
+}

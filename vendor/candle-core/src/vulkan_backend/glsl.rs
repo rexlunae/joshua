@@ -940,12 +940,7 @@ void main() {
         barrier();
     }
     float inv = 1.0 / sh[0];
-    // Write each output element exactly once, fully normalized.  The previous
-    // form wrote raw exp() here and scaled it with a second pass over the same
-    // global buffer; on some drivers that second pass read stale memory for
-    // the elements a kernel's later stride iterations covered — rows summed to
-    // ~56 instead of 1 (half the row at 0.49x, the rest at 15.5x).  Recompute
-    // the exp and write once: no global read of the uninitialized output.
+    // Recompute exp() so each output element is written once, fully normalized.
     barrier();
     for (int c = t; c < pc.cols; c += WG) o[w + c] = exp(x[r + c] - m) * inv;
 }
