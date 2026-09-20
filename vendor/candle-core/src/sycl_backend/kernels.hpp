@@ -98,30 +98,27 @@ inline int off_of(int lin, const Idx* ix, const int* s, int o) {
 #define OP_SIGMOID 19
 
 inline float unary_f(float v, int op) {
-    switch (op) {
-        case OP_EXP: return exp(v);
-        case OP_LOG: return log(v);
-        case OP_SIN: return sin(v);
-        case OP_COS: return cos(v);
-        case OP_TANH: return tanh(v);
-        case OP_NEG: return -v;
-        case OP_RECIP: return 1.0f / v;
-        case OP_SQR: return v * v;
-        case OP_SQRT: return sqrt(v);
-        // candle's Gelu is the tanh approximation.
-        case OP_GELU: return 0.5f * v * (1.0f + tanh(0.79788456080286535588f * v * (1.0f + 0.044715f * v * v)));
-        case OP_GELU_ERF: return 0.5f * v * (1.0f + erf(v * 0.70710678118654752440f));
-        case OP_ERF: return erf(v);
-        case OP_SILU: return v / (1.0f + exp(-v));
-        case OP_ABS: return fabs(v);
-        case OP_CEIL: return ceil(v);
-        case OP_FLOOR: return floor(v);
-        case OP_ROUND: return round(v);
-        case OP_RELU: return v > 0.0f ? v : 0.0f;
-        case OP_SIGN: return v > 0.0f ? 1.0f : (v < 0.0f ? -1.0f : 0.0f);
-        case OP_SIGMOID: return 1.0f / (1.0f + exp(-v));
-        default: return v;
-    }
+    if (op == OP_EXP) return exp(v);
+    if (op == OP_LOG) return log(v);
+    if (op == OP_SIN) return sin(v);
+    if (op == OP_COS) return cos(v);
+    if (op == OP_TANH) return tanh(v);
+    if (op == OP_NEG) return -v;
+    if (op == OP_RECIP) return 1.0f / v;
+    if (op == OP_SQR) return v * v;
+    if (op == OP_SQRT) return sqrt(v);
+    if (op == OP_GELU) return 0.5f * v * (1.0f + tanh(0.79788456080286535588f * v * (1.0f + 0.044715f * v * v)));
+    if (op == OP_GELU_ERF) return 0.5f * v * (1.0f + erf(v * 0.70710678118654752440f));
+    if (op == OP_ERF) return erf(v);
+    if (op == OP_SILU) return v / (1.0f + exp(-v));
+    if (op == OP_ABS) return fabs(v);
+    if (op == OP_CEIL) return ceil(v);
+    if (op == OP_FLOOR) return floor(v);
+    if (op == OP_ROUND) return round(v);
+    if (op == OP_RELU) return v > 0.0f ? v : 0.0f;
+    if (op == OP_SIGN) return v > 0.0f ? 1.0f : (v < 0.0f ? -1.0f : 0.0f);
+    if (op == OP_SIGMOID) return 1.0f / (1.0f + exp(-v));
+    return v;
 }
 
 
