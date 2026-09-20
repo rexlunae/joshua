@@ -68,6 +68,8 @@ mod dummy_metal_backend;
 pub mod fault_slot;
 #[cfg(feature = "opencl")]
 pub mod opencl_backend;
+#[cfg(feature = "sycl")]
+pub mod sycl_backend;
 #[cfg(not(feature = "opencl"))]
 pub mod dummy_opencl_backend;
 #[cfg(feature = "vulkan")]

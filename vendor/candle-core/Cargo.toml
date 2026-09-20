@@ -47,6 +47,11 @@ default = []
 # Hand-rolled libOpenCL FFI; no extra crate dep. Off by default.
 opencl = []
 
+# SYCL backend (Intel oneAPI / DPC++ via a runtime-loaded C ABI bridge).
+# The kernels build out-of-tree into libjoshua_sycl.so with the oneAPI
+# toolchain (sycl_backend/CMakeLists.txt); off by default.
+sycl = ["dep:libloading"]
+
 # Vulkan accelerator backend (iGPU/dGPU via libvulkan.so, e.g. RADV).
 # Uses ash (libloading-injected, no hard link) + naga (pure-Rust GLSL→SPIR-V
 # so kernels need no external glslc). Off by default.
@@ -165,6 +170,10 @@ path = "tests/tensor_tests.rs"
 name = "bench_main"
 path = "benches/bench_main.rs"
 harness = false
+
+[dependencies.libloading]
+version = "0.8"
+optional = true
 
 [dependencies.accelerate-src]
 version = "0.3.2"
