@@ -400,6 +400,36 @@ impl SyclDevice {
         self.launch("k_qgemv", &mut builder, [n * WG, m, 1], [WG, 1, 1])
     }
 
+    /// Multi-row quantized GEMV (kernel `k_qgemv_mr`), the decode path for
+    /// IQ2/Q2K weights (mirrors the OpenCL launcher's arg order and cols
+    /// formula; `cols` is the per-work-group column count).
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_qgemv_mr(&self, x: usize, w: usize, c: usize, n: usize, k: usize, qt: i32, tsize: i32, woff: u64, xoff: i32, coff: i32, m: usize, cols: usize) -> crate::Result<()> {
+        let mut builder = ArgBuilder::new();
+        builder.buf(x).buf(w).buf(c)
+            .i32(n as i32).i32(k as i32).i32(qt).i32(tsize)
+            .u64(woff).i32(xoff).i32(coff).i32(m as i32).i32(cols as i32);
+        self.launch("k_qgemv_mr", &mut builder, [n.div_ceil(cols) * WG, 1, 1], [WG, 1, 1])
+    }
+
+    /// Quantized GEMV routed like the OpenCL launcher: IQ2/Q2K weights take
+    /// the multi-row kernel for m rows, everything else the single-row one.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_qgemv(&self, qt: i32, tsize: i32, multirow: bool, x: usize, w: usize, c: usize, n: usize, k: usize, woff: u64, xoff: i32, m: usize) -> crate::Result<()> {
+        if multirow && m <= 16 {
+            let cols = {
+                let groups = k / 8;
+                let mut cols = 1;
+                while cols < 8 && groups * cols < WG {
+                    cols *= 2;
+                }
+                cols
+            };
+            return self.run_qgemv_mr(x, w, c, n, k, qt, tsize, woff, xoff, 0, m, cols);
+        }
+        self.run_qgemv(x, w, c, n, k, qt, k / 8, woff, xoff, 0, m)
+    }
+
     /// Dequantize a block-quantized tensor to f32 (kernel `k_dequant`).
     pub fn run_dequant(&self, w: usize, o: usize, nsub: usize, qt: i32, qk: i32, bsz: i32, woff: u64) -> crate::Result<()> {
         let mut b = ArgBuilder::new();
