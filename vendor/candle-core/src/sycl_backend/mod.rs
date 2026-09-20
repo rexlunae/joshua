@@ -267,7 +267,7 @@ pub struct SyclDevice {
     fault: usize,
     /// Reusable scratch for the quantized prefill path (dequantize-then-GEMM
     /// must not queue one fresh n*k*4-byte buffer per matmul).
-    scratch: Mutex<Option<(usize, Option<Box<SyclStorage>)>>>,
+    scratch: Mutex<Option<(usize, Option<Box<SyclStorage>>)>>,
 }
 
 impl SyclDevice {
