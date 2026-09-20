@@ -19,7 +19,8 @@ use std::ffi::{c_char, CString};
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
-use crate::{BackendDevice, BackendStorage, CpuStorage, DType, Error, Layout, Result, Shape, WithDType};
+use crate::backend::{BackendDevice, BackendStorage};
+use crate::{CpuStorage, DType, Error, Layout, Result, Shape, WithDType};
 
 pub mod kernels;
 
@@ -265,7 +266,7 @@ pub struct SyclDevice {
     fault: usize,
     /// Reusable scratch for the quantized prefill path (dequantize-then-GEMM
     /// must not queue one fresh n*k*4-byte buffer per matmul).
-    scratch: Mutex<Option<(usize, Option<SyclStorage>)>>,
+    scratch: Mutex<Option<(usize, Option<Box<SyclStorage>)>>>,
 }
 
 impl SyclDevice {
@@ -371,7 +372,7 @@ impl SyclDevice {
             }
         }
         let st = self.alloc(DType::F32, bytes.div_ceil(4))?;
-        *guard = Some((bytes, Some(st.clone())));
+        *guard = Some((bytes, Some(Box::new(st.clone()))));
         Ok(st)
     }
 
@@ -677,7 +678,7 @@ impl BackendStorage for SyclStorage {
 
     fn unary_impl<B: crate::op::UnaryOpT>(&self, layout: &Layout) -> Result<Self> {
         if self.dtype == DType::F32 {
-            if let Some(code) = crate::opencl_unary_code(B::NAME) {
+            if let Some(code) = kernels::unary_code(B::NAME) {
                 let n = layout.shape().elem_count();
                 let out = self.device.alloc(DType::F32, n)?;
                 if let Ok(()) = kernels::run_unary(&self.device, code, self.buffer, out.buffer, n, layout) {
@@ -1466,7 +1467,9 @@ impl QSyclStorage {
                 let sb = MatStrides { row: 1, col: k, offset: 0, batch: 0 };
                 let bytes = n * k * 4;
                 if bytes <= 1 << 30 {
-                    let scratch = self.device.scratch(bytes)?;
+                    // ManuallyDrop: the alias must not free the device's
+                    // shared scratch buffer on scope exit.
+                    let scratch = std::mem::ManuallyDrop::new(self.device.scratch(bytes)?);
                     self.dequantize_into(scratch.buffer, n * k)?;
                     kernels::run_matmul(&self.device, storage.buffer, scratch.buffer, out.buffer, (1, m, n, k), sa, sb)?;
                 } else {
