@@ -211,12 +211,8 @@ fn sycl_rmsnorm_matches_cpu(dev: &SyclDevice) {
 }
 
 /// Tiled GEMM [64, 96] × [96, 51] — N=51 exercises the tile guard paths.
-/// FIXME(#SYCL): segfaults on the Arc B50 — the 3D nd_range dimension
-/// reversal (OpenCL x/y/z → SYCL z/y/x) in the 16×16-tile kernel needs
-/// dedicated debugging.  The elementwise / reduction / quantized-GEMV kernels
-/// all pass on the same bridge, confirming the launch plumbing itself.
-/// Called from the serial wrapper, not a standalone #[test] (which would
-/// reject the `&SyclDevice` argument).
+/// (Was segfault-gated: the real bug was the Bs tile overlapping As in
+/// shared memory — see the kernels.hpp fix.)
 fn sycl_gemm_matches_cpu(dev: &SyclDevice) {
     let (m, k, n) = (64usize, 96usize, 51usize);
     let a: Vec<f32> = (0..m * k).map(|i| ((i % 13) as f32 - 6.0) * 0.25).collect();
