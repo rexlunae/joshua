@@ -71,7 +71,9 @@ fn opencl_bandwidth(n: usize, k: usize, iters: usize) -> Option<f64> {
     let wbytes = n * (k / IQ2_XXS_QK) * IQ2_XXS_TSIZE as usize;
     // Buffers: uninitialized device memory is fine for a bandwidth benchmark
     // (values do not change the streaming cost).
-    let wb = dev.alloc(candle_core::DType::U8, wbytes).unwrap().buffer;
+    // F32 storage sized to hold the same bytes (U8 alloc isn't a supported
+    // device-storage path); the kernel streams raw bytes within it.
+    let wb = dev.alloc(candle_core::DType::F32, wbytes / 4).unwrap().buffer;
     let xb = dev.alloc(candle_core::DType::F32, k).unwrap().buffer;
     let ob = dev.alloc(candle_core::DType::F32, n).unwrap().buffer;
     let ctx = dev.ctx();
