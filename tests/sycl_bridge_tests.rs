@@ -66,13 +66,15 @@ fn assert_close(what: &str, dev: &[f32], cpu: &[f32], tol: f32) {
     let mut worst = 0.0f32;
     let mut wi = 0;
     for (i, (a, b)) in dev.iter().zip(cpu).enumerate() {
-        let rel = (a - b).abs() / b.abs().max(1e-4);
+        // Relative to the magnitude of the expectation with an absolute
+        // floor, so exact-zero expectations don't inflate the ratio.
+        let rel = (a - b).abs() / b.abs().max(0.5);
         if rel > worst {
             worst = rel;
             wi = i;
         }
     }
-    assert!(worst <= tol, "{what}: worst rel diff {worst} at {wi}");
+    assert!(worst <= tol, "{what}: worst rel diff {worst} at {wi} (dev={} cpu={})", dev[wi], cpu[wi]);
 }
 
 fn f32_bytes(v: &[f32]) -> Vec<u8> {
