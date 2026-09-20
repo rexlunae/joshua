@@ -369,8 +369,10 @@ impl SyclDevice {
         // batch dimension must still contain one work group or the kernel
         // never executes and the output stays uninitialized.
         let batch = ba.max(bb).max(bc).max(1);
-        let gx = n.div_ceil(16) * 16;
-        let gy = m.div_ceil(16) * 16;
+        // The kernel's tile is TM=64, TN=64 (kernels.hpp), covered by a
+        // 16×16 thread tile whose threads each compute a 4×4 sub-block.
+        let gx = n.div_ceil(64) * 64;
+        let gy = m.div_ceil(64) * 64;
         self.launch("k_gemm", &mut builder, [gx, gy, batch], [16, 16, 1])
     }
 
