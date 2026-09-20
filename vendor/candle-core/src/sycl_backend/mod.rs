@@ -51,7 +51,7 @@ pub struct SyclFns {
     pub launch: unsafe extern "C" fn(h: usize, name: *const c_char, args: *const SyclArg, count: usize, global: *const usize, local: *const usize) -> i32,
 }
 
-unsafe fn resolve(lib: &libloading::Library) -> Result<SyclFns, String> {
+unsafe fn resolve(lib: &libloading::os::unix::Library) -> Result<SyclFns, String> {
     macro_rules! sym {
         ($lib:expr, $name:literal) => {
             *$lib.get::<unsafe extern "C" fn($($unused)*) -> ()>(b"joshua_sycl_dummy").unwrap_or_else(|_| unreachable!())
