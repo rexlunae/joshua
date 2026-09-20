@@ -414,14 +414,10 @@ impl SyclDevice {
     }
 }
 
-impl Drop for SyclDevice {
-    fn drop(&mut self) {
-        if self.handle != 0 {
-            let fns = self.bridge.fns;
-            unsafe { (fns.close)(self.handle) };
-        }
-    }
-}
+// NOTE: SyclDevice has no Drop - the bridge context handle is shared by
+// every clone (each SyclStorage holds one), so closing it on drop would
+// kill the context under the first storage drop. Contexts live for the
+// process, like the dlopened bridge itself.
 
 unsafe impl Send for SyclDevice {}
 unsafe impl Sync for SyclDevice {}
