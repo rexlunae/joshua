@@ -365,7 +365,10 @@ impl SyclDevice {
             .i32(sam as i32).i32(sak as i32).i32(sbk as i32).i32(sbn as i32)
             .i32(oa as i32).i32(ob as i32).i32(oc as i32)
             .i32(ba as i32).i32(bb as i32).i32(bc as i32).i32(b_kc);
-        let batch = ba.max(bb).max(bc);
+        // A single (non-batched) GEMM passes all-zero batch strides; the
+        // batch dimension must still contain one work group or the kernel
+        // never executes and the output stays uninitialized.
+        let batch = ba.max(bb).max(bc).max(1);
         let gx = n.div_ceil(16) * 16;
         let gy = m.div_ceil(16) * 16;
         self.launch("k_gemm", &mut builder, [gx, gy, batch], [16, 16, 1])
@@ -380,7 +383,7 @@ impl SyclDevice {
             .i32(n as i32).i32(k as i32).i32(sbn as i32)
             .i32(oa as i32).i32(ob as i32).i32(oc as i32)
             .i32(ba as i32).i32(bb as i32).i32(bc as i32);
-        let batch = ba.max(bb).max(bc);
+        let batch = ba.max(bb).max(bc).max(1);
         self.launch("k_gemv_nt", &mut builder, [n * WG, batch, 1], [WG, 1, 1])
     }
 
