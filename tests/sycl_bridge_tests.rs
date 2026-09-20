@@ -367,11 +367,6 @@ fn sycl_hembed_matches_cpu(dev: &SyclDevice) {
             want[j * k + c] = table[*id as usize * k + c];
         }
     }
-    for j in 0..n_ids {
-        eprintln!("row {j} (id={}):", ids[j]);
-        eprintln!("  dev : {:?}", &got[j * k..(j + 1) * k]);
-        eprintln!("  want: {:?}", &want[j * k..(j + 1) * k]);
-    }
     assert_close("hembed f16", &got, &want, 1e-6);
     dev.free(wb).unwrap();
     dev.free(idb).unwrap();
