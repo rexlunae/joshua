@@ -208,9 +208,9 @@ pub fn run_binary(dev: &SyclDevice, op: i32, a: usize, b: usize, out: usize, n: 
 
 pub fn run_cmp(dev: &SyclDevice, op: i32, a: usize, b: usize, out: usize, n: usize, la: &Layout, lb: &Layout, u32: bool) -> Result<()> {
     let ix = Idx::new(la.dims())?.with_layout(0, la)?.with_layout(1, lb)?;
-    let mut b = super::ArgBuilder::new();
-    b.buf(a).buf(b).buf(out).i32(n as i32).idx(ix).i32(op);
-    dev.launch(if u32 { "k_cmp_u32" } else { "k_cmp_f32" }, &mut b, [n, 1, 1], [WG, 1, 1])
+    let mut ab = super::ArgBuilder::new();
+    ab.buf(a).buf(b).buf(out).i32(n as i32).idx(ix).i32(op);
+    dev.launch(if u32 { "k_cmp_u32" } else { "k_cmp_f32" }, &mut ab, [n, 1, 1], [WG, 1, 1])
 }
 
 /// `where_cond` with a u8 or u32 condition over 4- or 8-byte payloads.
