@@ -74,7 +74,16 @@ fn assert_close(what: &str, dev: &[f32], cpu: &[f32], tol: f32) {
             wi = i;
         }
     }
-    assert!(worst <= tol, "{what}: worst rel diff {worst} at {wi} (dev={} cpu={})", dev[wi], cpu[wi]);
+    if worst > tol {
+        let mut shown = 0;
+        for (i, (a, b)) in dev.iter().zip(cpu).enumerate() {
+            if (a - b).abs() > tol * b.abs().max(0.5) && shown < 6 {
+                eprintln!("  mismatch[{i}]: dev={a} cpu={b}");
+                shown += 1;
+            }
+        }
+        assert!(false, "{what}: worst rel diff {worst} at {wi} (dev={} cpu={})", dev[wi], cpu[wi]);
+    }
 }
 
 fn f32_bytes(v: &[f32]) -> Vec<u8> {
