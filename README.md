@@ -25,7 +25,7 @@ framework) and [tokenizers](https://github.com/huggingface/tokenizers).
 | **Embeddings** | Dense sentence embeddings for llama / qwen2 / qwen3 embedding models, with GGUF pooling metadata |
 | **KV-cache reuse** | Multi-turn requests continue from a warm model pool and prefill only the new suffix — including across *context edits*: when an agent harness truncates or replaces middle blocks, the pooled session's KV state is rewound to the longest common token prefix instead of being cleared (Qwen3-MoE and DeepSeek-V2/V3/K2 loaders). DeepSeek MLA caches the compressed latent (`c_kv` + `k_pe`) instead of the reconstructed per-head K/V, cutting KV memory ~70× |
 | **Speculative expert prefetch** | Decode fires `MADV_WILLNEED` for each MoE layer's *predicted* experts (the ids its router chose last step — routing is temporally local) before any layer runs, so expert pages stream in behind compute instead of faulting on demand (`deepseek4` loader) |
-| **GPU (optional)** | `--features cuda` or `metal` route inference through candle's GPU backends |
+| **GPU (optional)** | `--features cuda`, `metal`, `opencl`, `vulkan` or `sycl` route inference through candle's GPU backends |
 | **NPU / llama.cpp interop (optional)** | Vendor plugins run in a crash-isolated shim process; a llama.cpp adapter brings every ggml backend (Hexagon NPU, CANN, CUDA, Vulkan, …) |
 | **Vision (optional)** | OpenAI-style image messages routed through llama.cpp's `mtmd` (Qwen2.5-VL, Gemma 3, LLaVA, …) via the same isolated plugin |
 | **Speech-to-text** | Whisper transcription in pure Rust: `/v1/audio/transcriptions` + `joshua transcribe` |
@@ -158,7 +158,7 @@ cargo build --release
     --addr 0.0.0.0:8080
 ```
 
-### 5 — GPU acceleration (Metal / CUDA / OpenCL / Vulkan)
+### 5 — GPU acceleration (Metal / CUDA / OpenCL / Vulkan / SYCL)
 
 Joshua runs inference on the CPU by default, but a single build can also run
 on a GPU, chosen per invocation.  Add the backend feature **at build time**
@@ -176,6 +176,10 @@ cargo build --release --features opencl
 
 # Any Vulkan ICD (AMD RADV, Intel ANV, llvmpipe): loads libvulkan.so at runtime
 cargo build --release --features vulkan
+
+# SYCL 2020 (Intel oneAPI/LLVM): the Rust crate compiles without a SYCL
+# toolchain; build the bridge with a SYCL compiler, then run with JOSHUA_SYCL_LIBRARY set
+cargo build --release --features sycl
 ```
 
 Then pick the device at runtime — `auto` (the default) uses the best backend
@@ -188,7 +192,7 @@ request is strict and fails the load if the device is missing:
 ./target/release/joshua serve --model m.gguf --device auto       # default
 ```
 
-`--device` also accepts `cuda`, `opencl` and `vulkan`, and the same
+`--device` also accepts `cuda`, `opencl`, `vulkan` and `sycl`, and the same
 selection is available as `JOSHUA_DEVICE` for the server.  The resolved device is logged at startup;
 library callers use [`EngineOptions::backend`]:
 
@@ -228,6 +232,16 @@ experts of an MoE model stay on the CPU expert kernels, and
 quantized matmul before moving the dense set there.  See
 [`docs/accelerator-backends.md`](docs/accelerator-backends.md) for the
 design, the environment variables and the limits.
+
+**SYCL (Intel oneAPI / LLVM).** The Rust crate always compiles without a
+SYCL toolchain; the kernels live in a separate `libjoshua_sycl` shared
+library (built from `vendor/candle-core/src/sycl_backend/bridge.cpp` with
+a SYCL compiler via `cmake`), which joshua `dlopen`s at first use.  Point
+`JOSHUA_SYCL_LIBRARY` at a non-standard path, `JOSHUA_SYCL_NATIVE=0` to
+force the CPU round-trip, and `JOSHUA_SYCL_TRACE=1` to log every native
+kernel and fallback.  Supported operations run as native SYCL kernels
+(f32 GEMM, RMSNorm, RoPE, softmax, reductions, index/gather/scatter), and
+block-quantized weights stay in their GGUF format on the device.
 
 ### Models larger than VRAM
 

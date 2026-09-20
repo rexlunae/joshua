@@ -87,6 +87,11 @@ impl Device {
                 // kernels dequantize inside the matmul.
                 Ok(QStorage::OpenCl(crate::QOpenClStorage::zeros(ocl, elem_count, dtype)?))
             }
+            Device::Sycl(ocl) => {
+                // Blocks stay in their GGUF format on the device; the SYCL
+                // kernels dequantize inside the matmul.
+                Ok(QStorage::Sycl(crate::QSyclStorage::zeros(ocl, elem_count, dtype)?))
+            }
             Device::Vulkan(vk) => {
                 // Blocks stay in their GGUF format on the device; the Vulkan
                 // kernels dequantize inside the matmul.
@@ -103,6 +108,16 @@ fn opencl_quantize(dst: &mut crate::QOpenClStorage, xs: &[f32]) -> Result<()> {
     // # Safety: the storage owns `storage_size_in_bytes` bytes at `as_ptr`.
     let bytes = unsafe { std::slice::from_raw_parts(cpu.as_ptr(), cpu.storage_size_in_bytes()) };
     *dst = crate::QOpenClStorage::from_bytes(dst.device(), dst.dtype(), dst.elem_count, bytes)?;
+    Ok(())
+}
+
+/// Quantize `xs` on the CPU into `dst`'s block format and upload it.
+fn sycl_quantize(dst: &mut crate::QSyclStorage, xs: &[f32]) -> Result<()> {
+    let mut cpu = dst.dtype().cpu_zeros(dst.elem_count);
+    cpu.from_float(xs);
+    // # Safety: the storage owns `storage_size_in_bytes` bytes at `as_ptr`.
+    let bytes = unsafe { std::slice::from_raw_parts(cpu.as_ptr(), cpu.storage_size_in_bytes()) };
+    *dst = crate::QSyclStorage::from_bytes(dst.device(), dst.dtype(), dst.elem_count, bytes)?;
     Ok(())
 }
 
@@ -136,16 +151,35 @@ fn cpu_imatrix_blocks(
 fn opencl_native() -> bool {
     crate::opencl_backend::native_enabled()
 }
+
+/// Whether the SYCL native kernels are on (`false` without the feature).
+#[cfg(feature = "sycl")]
+fn sycl_native() -> bool {
+    crate::sycl_backend::native_enabled()
+}
 #[cfg(not(feature = "opencl"))]
 fn opencl_native() -> bool {
+    false
+}
+
+#[cfg(not(feature = "sycl"))]
+fn sycl_native() -> bool {
     false
 }
 #[cfg(feature = "opencl")]
 fn opencl_note_fallback(op: &str, why: Option<&crate::Error>) {
     crate::opencl_backend::kernels::note_fallback(op, why)
 }
+
+#[cfg(feature = "sycl")]
+fn sycl_note_fallback(op: &str, why: Option<&crate::Error>) {
+    crate::sycl_backend::kernels::note_fallback(op, why)
+}
 #[cfg(not(feature = "opencl"))]
 fn opencl_note_fallback(_op: &str, _why: Option<&crate::Error>) {}
+
+#[cfg(not(feature = "sycl"))]
+fn sycl_note_fallback(_op: &str, _why: Option<&crate::Error>) {}
 
 /// Whether the Vulkan native kernels are on (`false` without the feature).
 #[cfg(feature = "vulkan")]
@@ -168,6 +202,7 @@ pub enum QStorage {
     Metal(metal::QMetalStorage),
     Cuda(cuda::QCudaStorage),
     OpenCl(crate::QOpenClStorage),
+    Sycl(crate::QSyclStorage),
     Vulkan(crate::QVulkanStorage),
 }
 
@@ -217,6 +252,11 @@ impl QStorage {
                 let elem_count = data.len() / dtype.type_size() * dtype.block_size();
                 Ok(QStorage::OpenCl(crate::QOpenClStorage::from_bytes(d, dtype, elem_count, data)?))
             }
+            Device::Sycl(d) => {
+                // Every block format is uploaded as-is; see `QSyclStorage`.
+                let elem_count = data.len() / dtype.type_size() * dtype.block_size();
+                Ok(QStorage::Sycl(crate::QSyclStorage::from_bytes(d, dtype, elem_count, data)?))
+            }
             Device::Vulkan(d) => {
                 // Every block format is uploaded as-is; see `QVulkanStorage`.
                 let elem_count = data.len() / dtype.type_size() * dtype.block_size();
@@ -237,6 +277,11 @@ impl QStorage {
                 let elem_count = data.len() / dtype.type_size() * dtype.block_size();
                 Ok(QStorage::OpenCl(crate::QOpenClStorage::from_bytes_transfer(d, dtype, elem_count, data)?))
             }
+            Device::Sycl(d) => {
+                let data: &[u8] = &data;
+                let elem_count = data.len() / dtype.type_size() * dtype.block_size();
+                Ok(QStorage::Sycl(crate::QSyclStorage::from_bytes_transfer(d, dtype, elem_count, data)?))
+            }
             _ => Self::from_data(data, device, dtype),
         }
     }
@@ -247,6 +292,7 @@ impl QStorage {
             QStorage::Metal(storage) => storage.dtype().block_size(),
             QStorage::Cuda(storage) => storage.dtype().block_size(),
             QStorage::OpenCl(storage) => storage.dtype().block_size(),
+            QStorage::Sycl(storage) => storage.dtype().block_size(),
             QStorage::Vulkan(storage) => storage.dtype().block_size(),
         }
     }
@@ -257,6 +303,7 @@ impl QStorage {
             QStorage::Metal(storage) => storage.dtype(),
             QStorage::Cuda(storage) => storage.dtype(),
             QStorage::OpenCl(storage) => storage.dtype(),
+            QStorage::Sycl(storage) => storage.dtype(),
             QStorage::Vulkan(storage) => storage.dtype(),
         }
     }
@@ -267,6 +314,7 @@ impl QStorage {
             QStorage::Metal(storage) => Device::Metal(storage.device().clone()),
             QStorage::Cuda(storage) => Device::Cuda(storage.device().clone()),
             QStorage::OpenCl(storage) => Device::OpenCl(storage.device().clone()),
+            QStorage::Sycl(storage) => Device::Sycl(storage.device().clone()),
             QStorage::Vulkan(storage) => Device::Vulkan(storage.device().clone()),
         }
     }
@@ -277,6 +325,7 @@ impl QStorage {
             QStorage::Metal(storage) => storage.storage_size_in_bytes(),
             QStorage::Cuda(storage) => storage.storage_size_in_bytes(),
             QStorage::OpenCl(storage) => storage.storage_size_in_bytes(),
+            QStorage::Sycl(storage) => storage.storage_size_in_bytes(),
             QStorage::Vulkan(storage) => storage.storage_size_in_bytes(),
         }
     }
@@ -292,8 +341,15 @@ impl QStorage {
                 let cpu = src.to_cpu_storage()?;
                 opencl_quantize(dst, cpu.as_slice::<f32>()?)?;
             }
+            (QStorage::Sycl(dst), Storage::Sycl(src)) => {
+                let cpu = src.to_cpu_storage()?;
+                sycl_quantize(dst, cpu.as_slice::<f32>()?)?;
+            }
             (QStorage::OpenCl(dst), Storage::Cpu(src)) => {
                 opencl_quantize(dst, src.as_slice::<f32>()?)?;
+            }
+            (QStorage::Sycl(dst), Storage::Cpu(src)) => {
+                sycl_quantize(dst, src.as_slice::<f32>()?)?;
             }
             (QStorage::Vulkan(dst), Storage::Vulkan(src)) => {
                 let cpu = src.to_cpu_storage()?;
@@ -328,6 +384,11 @@ impl QStorage {
                 let bytes = cpu_imatrix_blocks(dst.dtype(), dst.elem_count, cpu.as_slice::<f32>()?, imatrix_weights, n_per_row);
                 *dst = crate::QOpenClStorage::from_bytes(dst.device(), dst.dtype(), dst.elem_count, &bytes)?;
             }
+            (QStorage::Sycl(dst), Storage::Sycl(src)) => {
+                let cpu = src.to_cpu_storage()?;
+                let bytes = cpu_imatrix_blocks(dst.dtype(), dst.elem_count, cpu.as_slice::<f32>()?, imatrix_weights, n_per_row);
+                *dst = crate::QSyclStorage::from_bytes(dst.device(), dst.dtype(), dst.elem_count, &bytes)?;
+            }
             (QStorage::Vulkan(dst), Storage::Vulkan(src)) => {
                 let cpu = src.to_cpu_storage()?;
                 let bytes = cpu_imatrix_blocks(dst.dtype(), dst.elem_count(), cpu.as_slice::<f32>()?, imatrix_weights, n_per_row);
@@ -347,6 +408,9 @@ impl QStorage {
             (QStorage::Cuda(storage), Storage::Cpu(src)) => storage.quantize_onto(src)?,
             (QStorage::OpenCl(dst), Storage::Cpu(src)) => {
                 opencl_quantize(dst, src.as_slice::<f32>()?)?;
+            }
+            (QStorage::Sycl(dst), Storage::Cpu(src)) => {
+                sycl_quantize(dst, src.as_slice::<f32>()?)?;
             }
             (QStorage::Vulkan(dst), Storage::Cpu(src)) => {
                 vulkan_quantize(dst, src.as_slice::<f32>()?)?;
@@ -376,6 +440,10 @@ impl QStorage {
                 let bytes = cpu_imatrix_blocks(dst.dtype(), dst.elem_count, src.as_slice::<f32>()?, imatrix_weights, n_per_row);
                 *dst = crate::QOpenClStorage::from_bytes(dst.device(), dst.dtype(), dst.elem_count, &bytes)?;
             }
+            (QStorage::Sycl(dst), Storage::Cpu(src)) => {
+                let bytes = cpu_imatrix_blocks(dst.dtype(), dst.elem_count, src.as_slice::<f32>()?, imatrix_weights, n_per_row);
+                *dst = crate::QSyclStorage::from_bytes(dst.device(), dst.dtype(), dst.elem_count, &bytes)?;
+            }
             (QStorage::Vulkan(dst), Storage::Cpu(src)) => {
                 let bytes = cpu_imatrix_blocks(dst.dtype(), dst.elem_count(), src.as_slice::<f32>()?, imatrix_weights, n_per_row);
                 *dst = crate::QVulkanStorage::from_bytes(dst.device(), dst.dtype(), dst.elem_count(), &bytes)?;
@@ -391,6 +459,7 @@ impl QStorage {
             QStorage::Metal(storage) => Ok(Storage::Metal(storage.dequantize(elem_count)?)),
             QStorage::Cuda(storage) => Ok(Storage::Cuda(storage.dequantize(elem_count)?)),
             QStorage::OpenCl(storage) => Ok(Storage::OpenCl(storage.dequantize(elem_count)?)),
+            QStorage::Sycl(storage) => Ok(Storage::Sycl(storage.dequantize(elem_count)?)),
             QStorage::Vulkan(storage) => Ok(Storage::Vulkan(storage.dequantize(elem_count)?)),
         }
     }
@@ -406,6 +475,7 @@ impl QStorage {
             QStorage::Cuda(storage) => Ok(Cow::from(storage.data()?)),
             QStorage::Metal(storage) => Ok(Cow::from(storage.data()?)),
             QStorage::OpenCl(storage) => Ok(Cow::from(storage.data()?)),
+            QStorage::Sycl(storage) => Ok(Cow::from(storage.data()?)),
             QStorage::Vulkan(storage) => Ok(Cow::from(storage.data()?)),
         }
     }
@@ -413,7 +483,7 @@ impl QStorage {
     pub fn device_ptr(&self) -> Result<*const u8> {
         match self {
             QStorage::Cuda(storage) => storage.device_ptr(),
-            QStorage::OpenCl(_) | QStorage::Metal(_) | QStorage::Cpu(_) | QStorage::Vulkan(_) => {
+            QStorage::OpenCl(_) | QStorage::Sycl(_) | QStorage::Metal(_) | QStorage::Cpu(_) | QStorage::Vulkan(_) => {
                 crate::bail!("not implemented");
             }
         }
@@ -429,7 +499,7 @@ impl QStorage {
     )> {
         match self {
             QStorage::Cuda(storage) => storage.device_ptr_with_guard(stream),
-            QStorage::Metal(_) | QStorage::Cpu(_) | QStorage::OpenCl(_) | QStorage::Vulkan(_) => {
+            QStorage::Metal(_) | QStorage::Cpu(_) | QStorage::OpenCl(_) | QStorage::Sycl(_) | QStorage::Vulkan(_) => {
                 crate::bail!("not implemented");
             }
         }
@@ -940,6 +1010,33 @@ impl QTensor {
                     }
                 }
             }
+            QStorage::Sycl(storage) => {
+                use crate::backend::BackendDevice;
+                let native = if sycl_native() {
+                    match &*ids.storage() {
+                        Storage::Sycl(ids_storage) => {
+                            match storage.embedding(rows, hidden, ids_storage, ids.layout()) {
+                                Ok(out) => Some(out),
+                                Err(e) => {
+                                    sycl_note_fallback("qembedding", Some(&e));
+                                    None
+                                }
+                            }
+                        }
+                        _ => unreachable!("ids were moved to the QTensor device"),
+                    }
+                } else {
+                    sycl_note_fallback("qembedding", None);
+                    None
+                };
+                match native {
+                    Some(out) => Storage::Sycl(out),
+                    None => {
+                        let out = self.cpu_embedding(&ids, rows, hidden)?;
+                        Storage::Sycl(storage.device().storage_from_cpu_storage(&out)?)
+                    }
+                }
+            }
             QStorage::Vulkan(storage) => {
                 use crate::backend::BackendDevice;
                 let native = if vulkan_native() {
@@ -1029,7 +1126,7 @@ impl QTensor {
     pub fn device_ptr(&self) -> Result<*const u8> {
         match &self.storage {
             QStorage::Cuda(storage) => storage.device_ptr(),
-            QStorage::OpenCl(_) | QStorage::Metal(_) | QStorage::Cpu(_) | QStorage::Vulkan(_) => {
+            QStorage::OpenCl(_) | QStorage::Sycl(_) | QStorage::Metal(_) | QStorage::Cpu(_) | QStorage::Vulkan(_) => {
                 crate::bail!("not implemented");
             }
         }
@@ -1168,7 +1265,7 @@ impl crate::CustomOp1 for QTensor {
         #[allow(clippy::infallible_destructuring_match)]
         let self_storage = match &self.storage {
             QStorage::Cpu(storage) => storage,
-            QStorage::OpenCl(_) | QStorage::Metal(_) | QStorage::Cuda(_) | QStorage::Vulkan(_) => {
+            QStorage::OpenCl(_) | QStorage::Sycl(_) | QStorage::Metal(_) | QStorage::Cuda(_) | QStorage::Vulkan(_) => {
                 crate::bail!("Invalid storage")
             }
         };
@@ -1282,6 +1379,34 @@ impl crate::CustomOp1 for QTensor {
             }
         } else {
             opencl_note_fallback("qmatmul", None);
+        }
+        let cpu_q = self.cpu_copy()?;
+        let cpu_in = storage.to_cpu_storage()?;
+        let (out, shape) = crate::CustomOp1::cpu_fwd(&cpu_q, &cpu_in, layout)?;
+        Ok((self_storage.device().storage_from_cpu_storage(&out)?, shape))
+    }
+
+    /// Native quantized matmul when the kernels are on and the launch is
+    /// accepted; otherwise the CPU reference path (block bytes and the
+    /// activation come back to the host, the result goes up), the same
+    /// contract as every other operator of the backend.
+    fn sycl_fwd(
+        &self,
+        storage: &crate::SyclStorage,
+        layout: &crate::Layout,
+    ) -> Result<(crate::SyclStorage, Shape)> {
+        use crate::backend::BackendDevice;
+        let self_storage = match &self.storage {
+            QStorage::Sycl(ocl) => ocl,
+            _ => unreachable!("Cannot call sycl matmul on non sycl QTensor"),
+        };
+        if sycl_native() {
+            match self_storage.fwd(&self.shape, storage, layout) {
+                Ok(out) => return Ok(out),
+                Err(e) => sycl_note_fallback("qmatmul", Some(&e)),
+            }
+        } else {
+            sycl_note_fallback("qmatmul", None);
         }
         let cpu_q = self.cpu_copy()?;
         let cpu_in = storage.to_cpu_storage()?;

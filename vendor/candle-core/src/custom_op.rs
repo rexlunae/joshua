@@ -2,6 +2,7 @@ use crate::backend::{BackendDevice, BackendStorage};
 use crate::op::{BackpropOp, Op};
 use crate::tensor::from_storage;
 use crate::{OpenClStorage, CpuStorage, CudaStorage, Layout, MetalStorage, Result, Shape, Tensor, VulkanStorage};
+use crate::SyclStorage;
 use std::sync::Arc;
 
 /// Unary ops that can be defined in user-land.
@@ -58,6 +59,19 @@ pub trait CustomOp1 {
         storage: &OpenClStorage,
         layout: &Layout,
     ) -> Result<(OpenClStorage, Shape)> {
+        let cpu = storage.to_cpu_storage()?;
+        let (out, shape) = self.cpu_fwd(&cpu, layout)?;
+        let dev = storage.device.clone();
+        Ok((dev.storage_from_cpu_storage(&out)?, shape))
+    }
+
+    /// The forward pass on an SYCL device.  The default is a correct CPU
+    /// round-trip; a backend with a native kernel overrides it.
+    fn sycl_fwd(
+        &self,
+        storage: &SyclStorage,
+        layout: &Layout,
+    ) -> Result<(SyclStorage, Shape)> {
         let cpu = storage.to_cpu_storage()?;
         let (out, shape) = self.cpu_fwd(&cpu, layout)?;
         let dev = storage.device.clone();
@@ -138,6 +152,21 @@ pub trait CustomOp2 {
         s2: &OpenClStorage,
         l2: &Layout,
     ) -> Result<(OpenClStorage, Shape)> {
+        let c1 = s1.to_cpu_storage()?;
+        let c2 = s2.to_cpu_storage()?;
+        let (out, shape) = self.cpu_fwd(&c1, l1, &c2, l2)?;
+        let dev = s1.device.clone();
+        Ok((dev.storage_from_cpu_storage(&out)?, shape))
+    }
+
+    /// The forward pass on an SYCL device (CPU round-trip by default).
+    fn sycl_fwd(
+        &self,
+        s1: &SyclStorage,
+        l1: &Layout,
+        s2: &SyclStorage,
+        l2: &Layout,
+    ) -> Result<(SyclStorage, Shape)> {
         let c1 = s1.to_cpu_storage()?;
         let c2 = s2.to_cpu_storage()?;
         let (out, shape) = self.cpu_fwd(&c1, l1, &c2, l2)?;
@@ -231,6 +260,24 @@ pub trait CustomOp3 {
         s3: &OpenClStorage,
         l3: &Layout,
     ) -> Result<(OpenClStorage, Shape)> {
+        let c1 = s1.to_cpu_storage()?;
+        let c2 = s2.to_cpu_storage()?;
+        let c3 = s3.to_cpu_storage()?;
+        let (out, shape) = self.cpu_fwd(&c1, l1, &c2, l2, &c3, l3)?;
+        let dev = s1.device.clone();
+        Ok((dev.storage_from_cpu_storage(&out)?, shape))
+    }
+
+    /// The forward pass on an SYCL device (CPU round-trip by default).
+    fn sycl_fwd(
+        &self,
+        s1: &SyclStorage,
+        l1: &Layout,
+        s2: &SyclStorage,
+        l2: &Layout,
+        s3: &SyclStorage,
+        l3: &Layout,
+    ) -> Result<(SyclStorage, Shape)> {
         let c1 = s1.to_cpu_storage()?;
         let c2 = s2.to_cpu_storage()?;
         let c3 = s3.to_cpu_storage()?;

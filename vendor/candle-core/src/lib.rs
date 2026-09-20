@@ -64,7 +64,7 @@ mod dtype;
 pub mod dummy_cuda_backend;
 pub mod dummy_dtype;
 mod dummy_metal_backend;
-#[cfg(any(feature = "opencl", feature = "vulkan"))]
+#[cfg(any(feature = "opencl", feature = "vulkan", feature = "sycl"))]
 pub mod fault_slot;
 #[cfg(feature = "opencl")]
 pub mod opencl_backend;
@@ -199,3 +199,12 @@ impl<M: Module> ModuleT for M {
         self.forward(xs)
     }
 }
+
+#[cfg(feature = "sycl")]
+pub mod sycl_backend;
+#[cfg(not(feature = "sycl"))]
+pub mod dummy_sycl_backend;
+#[cfg(feature = "sycl")]
+pub use sycl_backend::{QSyclStorage, SyclDevice, SyclStorage};
+#[cfg(not(feature = "sycl"))]
+pub use dummy_sycl_backend::{QSyclStorage, SyclDevice, SyclStorage};

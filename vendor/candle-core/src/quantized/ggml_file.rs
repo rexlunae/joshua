@@ -135,6 +135,11 @@ fn from_raw_data<T: super::GgmlType + Send + Sync + 'static>(
             let n = data.len() * T::BLCK_SIZE;
             QStorage::OpenCl(crate::QOpenClStorage::from_bytes(d, T::DTYPE, n, &raw_data[..size_in_bytes])?)
         }
+        Device::Sycl(d) => {
+            // Blocks go to the device as-is; the kernels dequantize in place.
+            let n = data.len() * T::BLCK_SIZE;
+            QStorage::Sycl(crate::QSyclStorage::from_bytes(d, T::DTYPE, n, &raw_data[..size_in_bytes])?)
+        }
         Device::Vulkan(d) => {
             // Blocks go to the device as-is; the kernels dequantize in place.
             let n = data.len() * T::BLCK_SIZE;

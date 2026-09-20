@@ -33,6 +33,7 @@ name = "joshua"
 path = "src/lib.rs"
 
 [features]
+sycl = ["candle-core/sycl", "candle-nn/sycl"]
 default = []
 # GPU acceleration. CPU inference stays pure Rust; enabling one of these
 # pulls in the corresponding candle backend (CUDA needs the NVIDIA toolkit

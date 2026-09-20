@@ -233,6 +233,12 @@ pub enum ComputeBackend {
     /// cargo feature and a system libvulkan.so.  Bring-up target is the AMD
     /// Renoir iGPU (unified memory, host-visible+coherent round-trip fast path).
     Vulkan,
+    /// SYCL 2020 (Intel oneAPI/LLVM `--features sycl` bridge looped through a
+    /// dynamically loaded C++ library — no SYCL toolchain needed to build the
+    /// Rust crate).  Requires the `sycl` cargo feature and a `libjoshua_sycl`
+    /// bridge built with a SYCL compiler.  Use `--device sycl`, or set
+    /// `JOSHUA_SYCL_LIBRARY` to point at a non-standard bridge path.
+    Sycl,
 }
 
 /// Construction options for [`Engine`].
@@ -1483,6 +1489,16 @@ impl Engine {
                 Err(e) => tracing::warn!("Vulkan unavailable, falling back to CPU: {e}"),
             }
         }
+        #[cfg(feature = "sycl")]
+        {
+            match Device::new_sycl(0) {
+                Ok(device) => {
+                    Self::log_sycl_device(&device);
+                    return device;
+                }
+                Err(e) => tracing::warn!("SYCL unavailable, falling back to CPU: {e}"),
+            }
+        }
         Device::Cpu
     }
 
@@ -1514,6 +1530,19 @@ impl Engine {
                 vk.name(),
                 if vk.host_unified_memory() { "host-unified memory" } else { "discrete memory, host-visible staging" },
                 if candle_core::vulkan_backend::native_enabled() { "on" } else { "off" },
+            );
+        }
+    }
+
+    /// Log which SYCL device was opened and whether its native kernels are on.
+    #[cfg(feature = "sycl")]
+    fn log_sycl_device(device: &Device) {
+        if let Ok(sycl) = device.as_sycl_device() {
+            tracing::info!(
+                "SYCL device: {} ({}; native kernels {})",
+                sycl.name(),
+                if sycl.host_unified_memory() { "host-unified memory" } else { "discrete memory" },
+                if candle_core::sycl_backend::kernels::native_enabled() { "on" } else { "off" },
             );
         }
     }
@@ -1609,6 +1638,28 @@ impl Engine {
                     Err(JoshuaError::ModelLoad(
                         "Vulkan device requested but this build has no `vulkan` feature. \
                          Rebuild with `cargo build --features vulkan`, or pass --device cpu / auto."
+                            .to_string(),
+                    ))
+                }
+            }
+            ComputeBackend::Sycl => {
+                #[cfg(feature = "sycl")]
+                {
+                    let device = Device::new_sycl(0).map_err(|e| {
+                        JoshuaError::ModelLoad(format!(
+                            "SYCL device requested but unavailable: {e}. \
+                             Build `--features sycl` and point JOSHUA_SYCL_LIBRARY at the built \
+                             libjoshua_sycl (SYCL 2020 oneAPI/LLVM bridge), or pass --device cpu / auto."
+                        ))
+                    })?;
+                    Self::log_sycl_device(&device);
+                    Ok(device)
+                }
+                #[cfg(not(feature = "sycl"))]
+                {
+                    Err(JoshuaError::ModelLoad(
+                        "SYCL device requested but this build has no `sycl` feature. \
+                         Rebuild with `cargo build --features sycl`, or pass --device cpu / auto."
                             .to_string(),
                     ))
                 }

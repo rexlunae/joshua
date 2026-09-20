@@ -1,0 +1,8 @@
+cmake_minimum_required(VERSION 3.20)
+project(joshua_sycl LANGUAGES CXX)
+add_library(joshua_sycl SHARED bridge.cpp)
+target_compile_features(joshua_sycl PRIVATE cxx_std_17)
+target_compile_options(joshua_sycl PRIVATE -fsycl)
+target_link_options(joshua_sycl PRIVATE -fsycl)
+set_target_properties(joshua_sycl PROPERTIES CXX_VISIBILITY_PRESET hidden)
+install(TARGETS joshua_sycl LIBRARY DESTINATION lib RUNTIME DESTINATION bin)
