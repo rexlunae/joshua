@@ -101,6 +101,11 @@ struct Bridge {
 
 unsafe impl Send for Bridge {}
 unsafe impl Sync for Bridge {}
+impl std::fmt::Debug for Bridge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Bridge")
+    }
+}
 
 unsafe fn dlopen_global(path: &std::path::Path) -> std::result::Result<libloading::os::unix::Library, String> {
     libloading::os::unix::Library::open(
@@ -166,7 +171,7 @@ unsafe fn dlopen_bridge() -> Result<&'static Bridge> {
         }
         match dlopen_global(&path) {
             Ok(lib) => {
-                let fns = resolve(&lib).map_err(|e| format!("symbol resolution: {e}"))?;
+                let fns = resolve(&lib).map_err(|e| Error::Msg(format!("symbol resolution: {e}")))?;
                 let bridge = Bridge { _runtime: runtime, _bridge: lib, fns };
                 return Ok(&*Box::leak(Box::new(bridge)));
             }

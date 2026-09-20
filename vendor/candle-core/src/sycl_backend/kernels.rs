@@ -195,15 +195,15 @@ pub fn run_elu(dev: &SyclDevice, x: usize, out: usize, n: usize, l: &Layout, alp
 pub fn run_binary(dev: &SyclDevice, op: i32, a: usize, b: usize, out: usize, n: usize, la: &Layout, lb: &Layout, u32: bool) -> Result<()> {
     if !u32 {
         if let (Some((oa, _)), Some((ob, _))) = (la.contiguous_offsets(), lb.contiguous_offsets()) {
-            let mut builder = super::ArgBuilder::new();
-            builder.buf(a).buf(b).buf(out).i32(n as i32).i32(oa as i32).i32(ob as i32).i32(op);
-            return dev.launch("k_binary_c", &mut builder, [n, 1, 1], [WG, 1, 1]);
+            let mut ab = super::ArgBuilder::new();
+            ab.buf(a).buf(b).buf(out).i32(n as i32).i32(oa as i32).i32(ob as i32).i32(op);
+            return dev.launch("k_binary_c", &mut ab, [n, 1, 1], [WG, 1, 1]);
         }
     }
     let ix = Idx::new(la.dims())?.with_layout(0, la)?.with_layout(1, lb)?;
-    let mut builder = super::ArgBuilder::new();
-    builder.buf(a).buf(b).buf(out).i32(n as i32).idx(ix).i32(op);
-    dev.launch(if u32 { "k_binary_u32_s" } else { "k_binary_s" }, &mut builder, [n, 1, 1], [WG, 1, 1])
+    let mut ab = super::ArgBuilder::new();
+    ab.buf(a).buf(b).buf(out).i32(n as i32).idx(ix).i32(op);
+    dev.launch(if u32 { "k_binary_u32_s" } else { "k_binary_s" }, &mut ab, [n, 1, 1], [WG, 1, 1])
 }
 
 pub fn run_cmp(dev: &SyclDevice, op: i32, a: usize, b: usize, out: usize, n: usize, la: &Layout, lb: &Layout, u32: bool) -> Result<()> {
