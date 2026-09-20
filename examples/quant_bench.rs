@@ -72,10 +72,14 @@ fn opencl_bandwidth(n: usize, k: usize, iters: usize) -> Option<f64> {
     // Buffers: uninitialized device memory is fine for a bandwidth benchmark
     // (values do not change the streaming cost).
     // F32 storage sized to hold the same bytes (U8 alloc isn't a supported
-    // device-storage path); the kernel streams raw bytes within it.
-    let wb = dev.alloc(candle_core::DType::F32, wbytes / 4).unwrap().buffer;
-    let xb = dev.alloc(candle_core::DType::F32, k).unwrap().buffer;
-    let ob = dev.alloc(candle_core::DType::F32, n).unwrap().buffer;
+    // device-storage path); the kernel streams raw bytes within it.  The
+    // storages must stay alive: dropping one releases its cl_mem.
+    let wb_s = dev.alloc(candle_core::DType::F32, wbytes / 4).unwrap();
+    let xb_s = dev.alloc(candle_core::DType::F32, k).unwrap();
+    let ob_s = dev.alloc(candle_core::DType::F32, n).unwrap();
+    let wb = wb_s.buffer;
+    let xb = xb_s.buffer;
+    let ob = ob_s.buffer;
     let ctx = dev.ctx();
     for _ in 0..5 {
         ocl::run_qgemv(&ctx, GgmlDType::Iq2Xxs, xb, wb, ob, 1, n, k, 0, 0).unwrap();
