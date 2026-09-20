@@ -333,9 +333,12 @@ fn sycl_hembed_matches_cpu(dev: &SyclDevice) {
     let wb = dev.alloc(f16_bytes.len()).unwrap();
     let idb = dev.alloc(ids.len() * 4).unwrap();
     let ob = dev.alloc(n_ids * k * 4).unwrap();
+    // The kernel writes a fault flag per slot; zero the checker buffer.
+    let faultb = dev.alloc(4).unwrap();
+    dev.write(faultb, 0, &0u32.to_ne_bytes()).unwrap();
     dev.write(wb, 0, &f16_bytes).unwrap();
     dev.write(idb, 0, &ids.iter().flat_map(|v| v.to_ne_bytes()).collect::<Vec<u8>>()).unwrap();
-    dev.run_hembed(wb, idb, ob, n_ids, k, false, 0, 0, vocab).unwrap();
+    dev.run_hembed(wb, idb, ob, n_ids, k, false, 0, 0, vocab, faultb, 0).unwrap();
     dev.finish().unwrap();
     let mut out = vec![0u8; n_ids * k * 4];
     dev.read(ob, 0, &mut out).unwrap();

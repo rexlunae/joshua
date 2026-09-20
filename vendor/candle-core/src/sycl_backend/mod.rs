@@ -407,12 +407,15 @@ impl SyclDevice {
         self.launch("k_dequant", &mut b, [nsub, 1, 1], [WG, 1, 1])
     }
 
-    /// F16/BF16 embedding gather (kernel `k_hembed`).
+    /// F16/BF16 embedding gather (kernel `k_hembed`).  The kernel carries the
+    /// backend's fault checker (`fault` buffer + `fslot` slot index) like the
+    /// OpenCL launcher: the test passes a zeroed u32 slot.
     #[allow(clippy::too_many_arguments)]
-    pub fn run_hembed(&self, w: usize, ids: usize, o: usize, n: usize, k: usize, bf16: bool, woff: u64, ids_off: usize, vocab: usize) -> crate::Result<()> {
+    pub fn run_hembed(&self, w: usize, ids: usize, o: usize, n: usize, k: usize, bf16: bool, woff: u64, ids_off: usize, vocab: usize, fault: usize, fslot: i32) -> crate::Result<()> {
         let mut b = ArgBuilder::new();
         b.buf(w).buf(ids).buf(o).i32(n as i32).i32(k as i32)
-            .i32(bf16 as i32).u64(woff).i32(ids_off as i32).i32(vocab as i32);
+            .i32(bf16 as i32).u64(woff).i32(ids_off as i32).i32(vocab as i32)
+            .buf(fault).i32(fslot);
         self.launch("k_hembed", &mut b, [n, 1, 1], [WG, 1, 1])
     }
 }
