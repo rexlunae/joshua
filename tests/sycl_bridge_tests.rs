@@ -19,6 +19,32 @@ use candle_core::sycl_backend::SyclDevice;
 
 /// All tests share one device: the DPC++ runtime crashes when contexts are
 /// opened and closed concurrently from parallel test threads.
+
+/// All SYCL kernel parity tests run in a single serial test: the DPC++
+/// runtime crashes with SIGSEGV when multiple threads submit kernels
+/// concurrently, even through the same bridge.  Each sub-test is called
+/// sequentially here.
+#[test]
+fn sycl_kernel_parity() {
+    let tests: Vec<(&'static str, fn(&SyclDevice))> = vec![
+        ("affine", sycl_affine_matches_cpu),
+        ("unary_exp", sycl_unary_exp_matches_cpu),
+        ("binary_add", sycl_binary_add_matches_cpu),
+        ("softmax", sycl_softmax_matches_cpu),
+        ("rmsnorm", sycl_rmsnorm_matches_cpu),
+        ("gemm", sycl_gemm_matches_cpu),
+        ("qgemv_q8_0", sycl_qgemv_q8_0_matches_cpu),
+        ("hembed", sycl_hembed_matches_cpu),
+    ];
+    eprintln!("SYCL device: {} ({} MiB)", dev.name(), dev.memory() / (1024 * 1024));
+    for (name, test) in &tests {
+        eprintln!("  {name}...");
+        test(&dev);
+        eprintln!("  {name} OK");
+    }
+    println!("all SYCL kernel parity tests passed");
+}
+
 fn device() -> Option<&'static SyclDevice> {
     static DEV: std::sync::OnceLock<Result<SyclDevice, String>> = std::sync::OnceLock::new();
     let dev = DEV.get_or_init(|| SyclDevice::new(0).map_err(|e| e.to_string()));
@@ -57,9 +83,7 @@ fn f32_from(bytes: &[u8]) -> Vec<f32> {
 }
 
 /// `o = x * mul + add` (kernel `k_affine_c`).
-#[test]
-fn sycl_affine_matches_cpu() {
-    let Some(dev) = device() else { return };
+fn sycl_affine_matches_cpu(dev: &SyclDevice) {
     let n = 4096;
     let x: Vec<f32> = (0..n).map(|i| ((i % 17) as f32 - 8.0) * 0.5).collect();
     let xb = dev.alloc(n * 4).unwrap();
@@ -77,9 +101,7 @@ fn sycl_affine_matches_cpu() {
 }
 
 /// Unary `exp` (kernel `k_unary_c`, op 0).
-#[test]
-fn sycl_unary_exp_matches_cpu() {
-    let Some(dev) = device() else { return };
+fn sycl_unary_exp_matches_cpu(dev: &SyclDevice) {
     let n = 4096;
     let x: Vec<f32> = (0..n).map(|i| ((i % 13) as f32 - 6.0) * 0.4).collect();
     let xb = dev.alloc(n * 4).unwrap();
@@ -97,9 +119,7 @@ fn sycl_unary_exp_matches_cpu() {
 }
 
 /// Binary add (kernel `k_binary_c`, op 0).
-#[test]
-fn sycl_binary_add_matches_cpu() {
-    let Some(dev) = device() else { return };
+fn sycl_binary_add_matches_cpu(dev: &SyclDevice) {
     let n = 4096;
     let a: Vec<f32> = (0..n).map(|i| ((i % 11) as f32 - 5.0) * 0.25).collect();
     let b: Vec<f32> = (0..n).map(|i| ((i % 7) as f32 - 3.0) * 0.5).collect();
@@ -122,9 +142,7 @@ fn sycl_binary_add_matches_cpu() {
 
 /// Row softmax over [8, 200] — 200-wide rows exercise the multi-stride
 /// reduction path that broke the Vulkan softmax at these lengths (#81).
-#[test]
-fn sycl_softmax_matches_cpu() {
-    let Some(dev) = device() else { return };
+fn sycl_softmax_matches_cpu(dev: &SyclDevice) {
     let (rows, cols) = (8usize, 200usize);
     let n = rows * cols;
     let x: Vec<f32> = (0..n).map(|i| ((i % 23) as f32 - 11.0) * 0.3).collect();
@@ -158,9 +176,7 @@ fn sycl_softmax_matches_cpu() {
 }
 
 /// Row RMSNorm over [8, 200] with unit alpha.
-#[test]
-fn sycl_rmsnorm_matches_cpu() {
-    let Some(dev) = device() else { return };
+fn sycl_rmsnorm_matches_cpu(dev: &SyclDevice) {
     let (rows, cols) = (8usize, 200usize);
     let n = rows * cols;
     let x: Vec<f32> = (0..n).map(|i| ((i % 37) as f32 - 18.0) * 0.05).collect();
@@ -197,8 +213,7 @@ fn sycl_rmsnorm_matches_cpu() {
 /// all pass on the same bridge, confirming the launch plumbing itself.
 #[test]
 #[ignore]
-fn sycl_gemm_matches_cpu() {
-    let Some(dev) = device() else { return };
+fn sycl_gemm_matches_cpu(dev: &SyclDevice) {
     let (m, k, n) = (64usize, 96usize, 51usize);
     let a: Vec<f32> = (0..m * k).map(|i| ((i % 13) as f32 - 6.0) * 0.25).collect();
     let b: Vec<f32> = (0..k * n).map(|i| ((i % 17) as f32 - 8.0) * 0.25).collect();
@@ -229,9 +244,7 @@ fn sycl_gemm_matches_cpu() {
 
 /// Quantized GEMV (kernel `k_qgemv`, Q8_0): dequantize-in-kernel over
 /// GGUF blocks, the single-token decode path.
-#[test]
-fn sycl_qgemv_q8_0_matches_cpu() {
-    let Some(dev) = device() else { return };
+fn sycl_qgemv_q8_0_matches_cpu(dev: &SyclDevice) {
     let (n, k) = (24usize, 128usize);
     let (qk, bsz) = (32usize, 34usize);
     // Q8_0 blocks: fp16 scale + 32 i8 values.
@@ -307,9 +320,7 @@ fn half_from_bits(bits: u16) -> f32 {
 }
 
 /// F16 embedding gather (kernel `k_hembed`).
-#[test]
-fn sycl_hembed_matches_cpu() {
-    let Some(dev) = device() else { return };
+fn sycl_hembed_matches_cpu(dev: &SyclDevice) {
     let (vocab, k, n_ids) = (64usize, 32usize, 5usize);
     let table: Vec<f32> = (0..vocab * k).map(|i| ((i % 29) as f32 - 14.0) * 0.125).collect();
     let mut f16_bytes = vec![0u8; vocab * k * 2];
