@@ -1,41 +1,40 @@
-//! Rust bridge for the SYCL backend (Intel oneAPI / DPC++ target, e.g. the
-//! Arc Pro B50).
+//! Rust bridge + full candle backend for SYCL (Intel oneAPI / DPC++ target,
+//! e.g. the Arc Pro B50).
 //!
-//! Phase 1 (this module): the C ABI bridge loader and kernel launch plumbing.
-//! The C++ side lives in `sycl_backend/{bridge.cpp, kernels.hpp, dispatch.inc,
-//! CMakeLists.txt}` and builds out-of-tree into `libjoshua_sycl.so` (DPC++
-//! `clang++ -fsycl`); the kernels are a 1:1 port of the OpenCL backend's
-//! `kernels.cl` (same names, same argument orders — `dispatch.inc` consumes
-//! the launch arguments in the order the OpenCL launchers supply them).
-//!
-//! Phase 2 (follow-up): a full `BackendStorage`/`BackendDevice` integration
-//! wired into `Device`, mirroring `opencl_backend`.  Until then the bridge is
-//! exercised directly by `tests/sycl_bridge_tests.rs`, which proves the
-//! kernels are numerically correct on real SYCL hardware.
+//! Phase 2: a full `BackendDevice`/`BackendStorage` implementation mirroring
+//! `opencl_backend/mod.rs` — the same native op set (all 68 kernels are a 1:1
+//! port of the OpenCL ones, and the launchers in `kernels.rs` mirror the
+//! OpenCL launcher argument orders), the same CPU-fallback contract for
+//! anything a launcher refuses, and the same block-quantized device weights
+//! (`QSyclStorage`, `fwd` / `embedding`).
 //!
 //! Library loading: the bridge is `dlopen`ed at runtime (no hard link) with
 //! `RTLD_GLOBAL`, and the SYCL runtime (`libsycl.so.9`) is pre-loaded
-//! `RTLD_GLOBAL` from the oneAPI toolchain so the bridge's dependency resolves
-//! without LD_LIBRARY_PATH.  Override the locations with `JOSHUA_SYCL_LIBRARY`
-//! (bridge) and `JOSHUA_SYCL_RUNTIME` (libsycl.so.9).
+//! `RTLD_GLOBAL` from the oneAPI toolchain so the bridge's dependency
+//! resolves without LD_LIBRARY_PATH.  Override the locations with
+//! `JOSHUA_SYCL_LIBRARY` (bridge) and `JOSHUA_SYCL_RUNTIME` (libsycl.so.9).
 #![cfg(all(feature = "sycl", target_os = "linux"))]
 
-use std::ffi::{c_char, c_void, CString};
+use std::ffi::{c_char, CString};
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
+
+use crate::{BackendDevice, BackendStorage, CpuStorage, DType, Error, Layout, Result, Shape, WithDType};
+
+pub mod kernels;
+
+use kernels::{Idx, MatStrides};
 
 const WG: usize = 64; // matches kernels.hpp `constexpr int WG`
 
 #[repr(C)]
-struct SyclArg {
+pub struct SyclArg {
     data: *const u8,
     size: usize,
 }
 
-/// C ABI function pointers, resolved from the dlopened bridge at startup.
-/// The bridge is loaded with `RTLD_GLOBAL` but the extern "C" declarations
-/// would still be undefined symbols at Rust link time — resolve them via
-/// libloading like every other runtime-loaded backend (vulkan, npu shim).
+/// C ABI function pointers, resolved from the dlopened bridge at startup
+/// (the same pattern as every runtime-loaded backend).
 #[derive(Clone, Copy)]
 pub struct SyclFns {
     pub error: unsafe extern "C" fn() -> *const c_char,
@@ -51,24 +50,25 @@ pub struct SyclFns {
     pub launch: unsafe extern "C" fn(h: usize, name: *const c_char, args: *const SyclArg, count: usize, global: *const usize, local: *const usize) -> i32,
 }
 
-unsafe fn resolve(lib: &libloading::os::unix::Library) -> Result<SyclFns, String> {
-    macro_rules! sym {
-        ($lib:expr, $name:literal) => {
-            *$lib.get::<unsafe extern "C" fn($($unused)*) -> ()>(b"joshua_sycl_dummy").unwrap_or_else(|_| unreachable!())
-        };
+unsafe fn resolve(lib: &libloading::os::unix::Library) -> std::result::Result<SyclFns, String> {
+    unsafe fn get<T: Copy>(lib: &libloading::os::unix::Library, name: &[u8]) -> std::result::Result<T, String> {
+        let sym = lib
+            .get::<T>(name)
+            .map_err(|e| format!("{}: {e}", std::str::from_utf8(&name[..name.len() - 1]).unwrap_or("?")))?;
+        Ok(*sym)
     }
     Ok(SyclFns {
-        error: *lib.get(b"joshua_sycl_error\0").map_err(|e| format!("joshua_sycl_error: {e}"))?,
-        open: *lib.get(b"joshua_sycl_open\0").map_err(|e| format!("joshua_sycl_open: {e}"))?,
-        close: *lib.get(b"joshua_sycl_close\0").map_err(|e| format!("joshua_sycl_close: {e}"))?,
-        info: *lib.get(b"joshua_sycl_info\0").map_err(|e| format!("joshua_sycl_info: {e}"))?,
-        alloc: *lib.get(b"joshua_sycl_alloc\0").map_err(|e| format!("joshua_sycl_alloc: {e}"))?,
-        free: *lib.get(b"joshua_sycl_free\0").map_err(|e| format!("joshua_sycl_free: {e}"))?,
-        finish: *lib.get(b"joshua_sycl_finish\0").map_err(|e| format!("joshua_sycl_finish: {e}"))?,
-        write: *lib.get(b"joshua_sycl_write\0").map_err(|e| format!("joshua_sycl_write: {e}"))?,
-        read: *lib.get(b"joshua_sycl_read\0").map_err(|e| format!("joshua_sycl_read: {e}"))?,
-        copy: *lib.get(b"joshua_sycl_copy\0").map_err(|e| format!("joshua_sycl_copy: {e}"))?,
-        launch: *lib.get(b"joshua_sycl_launch\0").map_err(|e| format!("joshua_sycl_launch: {e}"))?,
+        error: get(lib, b"joshua_sycl_error\0")?,
+        open: get(lib, b"joshua_sycl_open\0")?,
+        close: get(lib, b"joshua_sycl_close\0")?,
+        info: get(lib, b"joshua_sycl_info\0")?,
+        alloc: get(lib, b"joshua_sycl_alloc\0")?,
+        free: get(lib, b"joshua_sycl_free\0")?,
+        finish: get(lib, b"joshua_sycl_finish\0")?,
+        write: get(lib, b"joshua_sycl_write\0")?,
+        read: get(lib, b"joshua_sycl_read\0")?,
+        copy: get(lib, b"joshua_sycl_copy\0")?,
+        launch: get(lib, b"joshua_sycl_launch\0")?,
     })
 }
 
@@ -81,32 +81,27 @@ unsafe fn last_error(fns: &SyclFns) -> String {
     }
 }
 
-/// Serializes ALL bridge operations.  The DPC++ runtime on the Arc B50
-/// crashes with SIGSEGV when multiple threads submit SYCL kernels
-/// concurrently, even through separate contexts.  The tests are correctness
-/// gates, not throughput benchmarks, so serialization is the safe choice.
-static GLOBAL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-unsafe fn check(rc: i32, fns: &SyclFns) -> crate::Result<()> {
+unsafe fn check(rc: i32, fns: &SyclFns) -> Result<()> {
     if rc == 0 {
         return Ok(());
     }
     crate::bail!("sycl: {}", last_error(fns))
 }
 
-/// The dlopened bridge and SYCL runtime handles, intentionally leaked for the
-/// life of the process (the bridge's Context handles stay valid regardless).
+/// Serializes ALL bridge operations: the DPC++ runtime is not thread-safe
+/// for concurrent kernel submissions from multiple threads.
+static GLOBAL_LOCK: Mutex<()> = Mutex::new(());
+
 struct Bridge {
     _runtime: Option<libloading::os::unix::Library>,
     _bridge: libloading::os::unix::Library,
     fns: SyclFns,
 }
-// Libraries are safe to share across threads; handles are used behind the
-// bridge's own internal mutex.
+
 unsafe impl Send for Bridge {}
 unsafe impl Sync for Bridge {}
 
-unsafe fn dlopen_global(path: &std::path::Path) -> Result<libloading::os::unix::Library, String> {
+unsafe fn dlopen_global(path: &std::path::Path) -> std::result::Result<libloading::os::unix::Library, String> {
     libloading::os::unix::Library::open(
         Some(path),
         libloading::os::unix::RTLD_NOW | libloading::os::unix::RTLD_GLOBAL,
@@ -120,7 +115,6 @@ fn sycl_runtime_candidates() -> Vec<PathBuf> {
         candidates.push(PathBuf::from(p));
     }
     if let Ok(home) = std::env::var("HOME") {
-        // The oneAPI toolchain layout used on the SYCL boxes.
         if let Ok(entries) = std::fs::read_dir(std::path::Path::new(&home)) {
             let mut roots: Vec<PathBuf> = entries
                 .filter_map(|e| e.ok())
@@ -137,7 +131,6 @@ fn sycl_runtime_candidates() -> Vec<PathBuf> {
                 candidates.push(dir.join("lib").join("libsycl.so.9"));
             }
         }
-        candidates.push(PathBuf::from(&home).join("sycl-toolchain-20260918/lib/libsycl.so.9"));
     }
     candidates
 }
@@ -148,12 +141,13 @@ fn bridge_candidates() -> Vec<PathBuf> {
         candidates.push(PathBuf::from(p));
     }
     if let Ok(home) = std::env::var("HOME") {
+        candidates.push(PathBuf::from(&home).join("joshua-sycl/build/libjoshua_sycl.so"));
         candidates.push(PathBuf::from(&home).join("joshua-sycl/libjoshua_sycl.so"));
     }
     candidates
 }
 
-unsafe fn dlopen_bridge() -> Result<Bridge, String> {
+unsafe fn dlopen_bridge() -> Result<&'static Bridge> {
     let mut runtime = None;
     for path in sycl_runtime_candidates() {
         if path.exists() {
@@ -172,301 +166,32 @@ unsafe fn dlopen_bridge() -> Result<Bridge, String> {
         match dlopen_global(&path) {
             Ok(lib) => {
                 let fns = resolve(&lib).map_err(|e| format!("symbol resolution: {e}"))?;
-                return Ok(Bridge { _runtime: runtime, _bridge: lib, fns });
+                let bridge = Bridge { _runtime: runtime, _bridge: lib, fns };
+                return Ok(&*Box::leak(Box::new(bridge)));
             }
             Err(e) => last = e,
         }
     }
-    Err(last)
+    Err(Error::Msg(format!("sycl: {last}")))
 }
 
-fn bridge() -> crate::Result<&'static Bridge> {
-    static BRIDGE: OnceLock<Result<&'static Bridge, String>> = OnceLock::new();
-    // The DPC++ runtime initialization (sycl::device::get_devices, queue
-    // creation) is not thread-safe on some driver versions: multiple threads
-    // racing the first SYCL call crash with SIGSEGV.  Serialize the entire
-    // dlopen + resolve + first device open behind a mutex.
-    static INIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _init = INIT.lock().unwrap();
-    let bridge = BRIDGE.get_or_init(|| unsafe { dlopen_bridge().map(|b| &*Box::leak(Box::new(b))) });
-    bridge.clone().map_err(|e| crate::Error::Msg(format!("sycl: {e}")))
-}
-
-/// An opened SYCL device: one bridge context handle.
-pub struct SyclDevice {
-    handle: usize,
-    name: String,
-    memory: u64,
-    fns: SyclFns,
-}
-
-impl SyclDevice {
-    /// Open SYCL device `ordinal` (the bridge prefers GPUs when present).
-    pub fn new(ordinal: usize) -> crate::Result<Self> {
-        let b = bridge()?;
-        let fns = b.fns;
-        static DEV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _dev = DEV_LOCK.lock().unwrap();
-        unsafe {
-            let mut h: usize = 0;
-            check((fns.open)(ordinal, &mut h), &fns)?;
-            let mut name_buf = [0u8; 128];
-            let mut memory: u64 = 0;
-            check((fns.info)(h, name_buf.as_mut_ptr(), name_buf.len(), &mut memory), &fns)?;
-            let end = name_buf.iter().position(|&b| b == 0).unwrap_or(name_buf.len());
-            Ok(Self {
-                handle: h,
-                name: String::from_utf8_lossy(&name_buf[..end]).into_owned(),
-                memory,
-                fns,
-            })
-        }
-    }
-
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    pub fn memory(&self) -> u64 {
-        self.memory
-    }
-
-    /// Allocate `bytes` on the device; returns the buffer handle used by the
-    /// launchers and the read/write helpers.
-    pub fn alloc(&self, bytes: usize) -> crate::Result<usize> {
-        let _lock = GLOBAL_LOCK.lock().unwrap();
-        unsafe {
-            let mut h: usize = 0;
-            check((self.fns.alloc)(self.handle, bytes, &mut h), &self.fns)?;
-            Ok(h)
-        }
-    }
-
-    pub fn free(&self, buffer: usize) -> crate::Result<()> {
-        unsafe { check((self.fns.free)(buffer), &self.fns) }
-    }
-
-    pub fn write(&self, buffer: usize, off: usize, bytes: &[u8]) -> crate::Result<()> {
-        let _lock = GLOBAL_LOCK.lock().unwrap();
-        unsafe { check((self.fns.write)(self.handle, buffer, off, bytes.len(), bytes.as_ptr()), &self.fns) }
-    }
-
-    pub fn read(&self, buffer: usize, off: usize, out: &mut [u8]) -> crate::Result<()> {
-        let _lock = GLOBAL_LOCK.lock().unwrap();
-        unsafe { check((self.fns.read)(self.handle, buffer, off, out.len(), out.as_mut_ptr()), &self.fns) }
-    }
-
-    pub fn copy(&self, src: usize, dst: usize, so: usize, d: usize, size: usize) -> crate::Result<()> {
-        unsafe { check((self.fns.copy)(self.handle, src, dst, so, d, size), &self.fns) }
-    }
-
-    /// Block until all queued work completes.
-    pub fn finish(&self) -> crate::Result<()> {
-        let _lock = GLOBAL_LOCK.lock().unwrap();
-        unsafe { check((self.fns.finish)(self.handle), &self.fns) }
-    }
-
-    fn launch(
-        &self,
-        kernel: &str,
-        b: &mut ArgBuilder,
-        global: [usize; 3],
-        local: [usize; 3],
-    ) -> crate::Result<()> {
-        let name = CString::new(kernel).unwrap();
-        let mut g = global;
-        // The bridge requires global % local == 0 on every dimension; round
-        // the 1-D global up so padded launches never fail the check.
-        if local[1] == 1 && local[2] == 1 && local[0] > 1 {
-            g[0] = g[0].div_ceil(local[0]) * local[0];
-        }
-        let _lock = GLOBAL_LOCK.lock().unwrap();
-        let args = b.args();
-        unsafe {
-            check((self.fns.launch)(
-                self.handle,
-                name.as_ptr(),
-                args.as_ptr(),
-                args.len(),
-                g.as_ptr(),
-                local.as_ptr(),
-            ), &self.fns)
-        }
-    }
-
-    // ── Kernel launchers (arg order mirrors dispatch.inc / kernels.hpp) ──
-
-    /// `o = x * mul + add` over `n` elements (kernel `k_affine_c`).
-    pub fn run_affine_c(&self, x: usize, o: usize, n: usize, off: usize, mul: f32, add: f32) -> crate::Result<()> {
-        let mut b = ArgBuilder::new();
-        b.buf(x).buf(o).i32(n as i32).i32(off as i32).f32(mul).f32(add);
-        self.launch("k_affine_c", &mut b, [n, 1, 1], [WG, 1, 1])
-    }
-
-    /// Unary op `op` over `n` elements (kernel `k_unary_c`; op codes match the
-    /// OpenCL backend: 0=exp, 1=log, 2=sin, 3=cos, ...).
-    pub fn run_unary_c(&self, x: usize, o: usize, n: usize, off: usize, op: i32) -> crate::Result<()> {
-        let mut b = ArgBuilder::new();
-        b.buf(x).buf(o).i32(n as i32).i32(off as i32).i32(op);
-        self.launch("k_unary_c", &mut b, [n, 1, 1], [WG, 1, 1])
-    }
-
-    /// `o = a op b` elementwise (kernel `k_binary_c`; op codes match the
-    /// OpenCL backend: 0=add, 1=sub, 2=mul, 3=div).
-    #[allow(clippy::too_many_arguments)]
-    pub fn run_binary_c(&self, a: usize, b: usize, o: usize, n: usize, off_a: usize, off_b: usize, op: i32) -> crate::Result<()> {
-        let mut builder = ArgBuilder::new();
-        builder.buf(a).buf(b).buf(o).i32(n as i32).i32(off_a as i32).i32(off_b as i32).i32(op);
-        self.launch("k_binary_c", &mut builder, [n, 1, 1], [WG, 1, 1])
-    }
-
-    /// Row softmax (kernel `k_softmax_last`): one work-group of WG lanes per
-    /// row, `[rows, cols]` contiguous input at `off`.
-    pub fn run_softmax_last(&self, x: usize, o: usize, rows: usize, cols: usize, off: usize) -> crate::Result<()> {
-        let mut b = ArgBuilder::new();
-        b.buf(x).buf(o).i32(rows as i32).i32(cols as i32).i32(off as i32);
-        self.launch("k_softmax_last", &mut b, [WG * rows, 1, 1], [WG, 1, 1])
-    }
-
-    /// Row RMSNorm (kernel `k_rmsnorm`).
-    #[allow(clippy::too_many_arguments)]
-    pub fn run_rmsnorm(&self, x: usize, alpha: usize, o: usize, rows: usize, cols: usize, off: usize, aoff: usize, eps: f32) -> crate::Result<()> {
-        let mut b = ArgBuilder::new();
-        b.buf(x).buf(alpha).buf(o).i32(rows as i32).i32(cols as i32).i32(off as i32).i32(aoff as i32).f32(eps);
-        self.launch("k_rmsnorm", &mut b, [WG * rows, 1, 1], [WG, 1, 1])
-    }
-
-    /// Tiled GEMM (kernel `k_gemm`): `C[m, n] = Σ_k A[m, k] * B[k, n]` with
-    /// arbitrary strides and batch strides (16×16 tiles, 256 lanes).
-    #[allow(clippy::too_many_arguments)]
-    pub fn run_gemm(
-        &self,
-        a: usize,
-        b: usize,
-        c: usize,
-        m: usize,
-        n: usize,
-        k: usize,
-        sam: usize,
-        sak: usize,
-        sbk: usize,
-        sbn: usize,
-        oa: usize,
-        ob: usize,
-        oc: usize,
-        ba: usize,
-        bb: usize,
-        bc: usize,
-        b_kc: i32,
-    ) -> crate::Result<()> {
-        let mut builder = ArgBuilder::new();
-        builder.buf(a).buf(b).buf(c)
-            .i32(m as i32).i32(n as i32).i32(k as i32)
-            .i32(sam as i32).i32(sak as i32).i32(sbk as i32).i32(sbn as i32)
-            .i32(oa as i32).i32(ob as i32).i32(oc as i32)
-            .i32(ba as i32).i32(bb as i32).i32(bc as i32).i32(b_kc);
-        // A single (non-batched) GEMM passes all-zero batch strides; the
-        // batch dimension must still contain one work group or the kernel
-        // never executes and the output stays uninitialized.
-        let batch = ba.max(bb).max(bc).max(1);
-        // The kernel's tile is TM=64, TN=64 (kernels.hpp), covered by a
-        // 16×16 thread tile whose threads each compute a 4×4 sub-block.
-        let gx = n.div_ceil(64) * 64;
-        let gy = m.div_ceil(64) * 64;
-        self.launch("k_gemm", &mut builder, [gx, gy, batch], [16, 16, 1])
-    }
-
-    /// GEMV with transposed weight rows (kernel `k_gemv_nt`):
-    /// `C[bz, n] = Σ_k A[bz, k] * B[n, k]`, one work-group per output.
-    #[allow(clippy::too_many_arguments)]
-    pub fn run_gemv_nt(&self, a: usize, b: usize, c: usize, n: usize, k: usize, sbn: usize, oa: usize, ob: usize, oc: usize, ba: usize, bb: usize, bc: usize) -> crate::Result<()> {
-        let mut builder = ArgBuilder::new();
-        builder.buf(a).buf(b).buf(c)
-            .i32(n as i32).i32(k as i32).i32(sbn as i32)
-            .i32(oa as i32).i32(ob as i32).i32(oc as i32)
-            .i32(ba as i32).i32(bb as i32).i32(bc as i32);
-        let batch = ba.max(bb).max(bc).max(1);
-        self.launch("k_gemv_nt", &mut builder, [n * WG, batch, 1], [WG, 1, 1])
-    }
-
-    /// Dequantize-in-kernel quantized GEMV (kernel `k_qgemv`), the
-    /// single-token decode path: `C[m, n] = Σ_k X[m, k] * dequant(W[n, k])`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn run_qgemv(&self, x: usize, w: usize, c: usize, n: usize, k: usize, qt: i32, qk: i32, bsz: i32, woff: u64, xoff: i32, coff: i32, m: usize) -> crate::Result<()> {
-        let mut builder = ArgBuilder::new();
-        builder.buf(x).buf(w).buf(c)
-            .i32(n as i32).i32(k as i32).i32(qt).i32(qk).i32(bsz)
-            .u64(woff).i32(xoff).i32(coff).i32(m as i32);
-        self.launch("k_qgemv", &mut builder, [n * WG, m, 1], [WG, 1, 1])
-    }
-
-    /// Multi-row quantized GEMV (kernel `k_qgemv_mr`), the decode path for
-    /// IQ2/Q2K weights (mirrors the OpenCL launcher's arg order and cols
-    /// formula; `cols` is the per-work-group column count).
-    #[allow(clippy::too_many_arguments)]
-    pub fn run_qgemv_mr(&self, x: usize, w: usize, c: usize, n: usize, k: usize, qt: i32, tsize: i32, woff: u64, xoff: i32, coff: i32, m: usize, cols: usize) -> crate::Result<()> {
-        let mut builder = ArgBuilder::new();
-        builder.buf(x).buf(w).buf(c)
-            .i32(n as i32).i32(k as i32).i32(qt).i32(tsize)
-            .u64(woff).i32(xoff).i32(coff).i32(m as i32).i32(cols as i32);
-        self.launch("k_qgemv_mr", &mut builder, [n.div_ceil(cols) * WG, 1, 1], [WG, 1, 1])
-    }
-
-    /// Quantized GEMV routed like the OpenCL launcher: IQ2/Q2K weights take
-    /// the multi-row kernel for m rows, everything else the single-row one.
-    #[allow(clippy::too_many_arguments)]
-    pub fn run_qgemv_routed(&self, qt: i32, qk: i32, tsize: i32, multirow: bool, x: usize, w: usize, c: usize, n: usize, k: usize, woff: u64, xoff: i32, m: usize) -> crate::Result<()> {
-        if multirow && m <= 16 {
-            let cols = {
-                let groups = k / 8;
-                let mut cols = 1;
-                while cols < 8 && groups * cols < WG {
-                    cols *= 2;
-                }
-                cols
-            };
-            return self.run_qgemv_mr(x, w, c, n, k, qt, tsize, woff, xoff, 0, m, cols);
-        }
-        self.run_qgemv(x, w, c, n, k, qt, qk, tsize, woff, xoff, 0, m)
-    }
-
-    /// Dequantize a block-quantized tensor to f32 (kernel `k_dequant`).
-    pub fn run_dequant(&self, w: usize, o: usize, nsub: usize, qt: i32, qk: i32, bsz: i32, woff: u64) -> crate::Result<()> {
-        let mut b = ArgBuilder::new();
-        b.buf(w).buf(o).i32(nsub as i32).i32(qt).i32(qk).i32(bsz).u64(woff);
-        self.launch("k_dequant", &mut b, [nsub, 1, 1], [WG, 1, 1])
-    }
-
-    /// F16/BF16 embedding gather (kernel `k_hembed`): `n_ids` rows of `k`
-    /// gathered from the `[vocab, k]` table.  The kernel carries the backend's
-    /// fault checker (`fault` buffer + `fslot` slot index) like the OpenCL
-    /// launcher: the caller passes a zeroed u32 slot.
-    #[allow(clippy::too_many_arguments)]
-    pub fn run_hembed(&self, w: usize, ids: usize, o: usize, n_ids: usize, k: usize, bf16: bool, woff: u64, ids_off: usize, vocab: usize, fault: usize, fslot: i32) -> crate::Result<()> {
-        let n = n_ids * k;
-        let mut b = ArgBuilder::new();
-        b.buf(w).buf(ids).buf(o).i32(n as i32).i32(k as i32)
-            .i32(bf16 as i32).u64(woff).i32(ids_off as i32).i32(vocab as i32)
-            .buf(fault).i32(fslot);
-        self.launch("k_hembed", &mut b, [n, 1, 1], [WG, 1, 1])
-    }
+fn bridge() -> Result<&'static Bridge> {
+    static BRIDGE: OnceLock<std::result::Result<&'static Bridge, String>> = OnceLock::new();
+    let _init = GLOBAL_LOCK.lock().unwrap();
+    let b = BRIDGE.get_or_init(|| unsafe { dlopen_bridge().map_err(|e| e.to_string()) });
+    b.clone().map_err(|e| Error::Msg(format!("sycl: {e}")))
 }
 
 /// Launch-argument builder: an arena of 8-byte-aligned slots plus the
-/// `SyclArg` descriptors.  `Arg.size` must match the C++ `sizeof(T)` for the
-/// slot (8 for pointer/u64, 4 for int/float), which the bridge checks.
-///
-/// The descriptors are materialised only when the arena is final: taking
-/// `arena.as_ptr()` during the pushes would dangle every earlier argument
-/// the first time the Vec reallocates (a use-after-free that works until the
-/// heap layout changes, then segfaults inside the bridge's buffer lookup).
+/// `SyclArg` descriptors, materialised once after the arena is final (taking
+/// `arena.as_ptr()` during the pushes would dangle on reallocation).
 pub struct ArgBuilder {
     arena: Vec<u8>,
     layout: Vec<(usize, usize)>,
 }
 
 impl ArgBuilder {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self { arena: Vec::new(), layout: Vec::new() }
     }
 
@@ -479,18 +204,6 @@ impl ArgBuilder {
         self.layout.push((off, bytes.len()));
     }
 
-    fn args(&self) -> Vec<SyclArg> {
-        self.layout
-            .iter()
-            .map(|&(off, size)| SyclArg {
-                data: unsafe { self.arena.as_ptr().add(off) },
-                size,
-            })
-            .collect()
-    }
-
-    /// A kernel pointer argument: carries the buffer handle; the bridge
-    /// resolves it to the device pointer.
     pub fn buf(&mut self, handle: usize) -> &mut Self {
         self.push(&handle.to_ne_bytes());
         self
@@ -515,21 +228,1322 @@ impl ArgBuilder {
         self.push(&v.to_ne_bytes());
         self
     }
+
+    /// A stride-descriptor argument (the `Idx` struct, 144 bytes, `repr(C)`).
+    pub fn idx(&mut self, ix: Idx) -> &mut Self {
+        // # Safety: the reference points at `size_of::<Idx>()` plain bytes.
+        self.push(unsafe {
+            std::slice::from_raw_parts(&ix as *const Idx as *const u8, std::mem::size_of::<Idx>())
+        });
+        self
+    }
+
+    pub fn push_raw(&mut self, bytes: &[u8]) -> &mut Self {
+        self.push(bytes);
+        self
+    }
+
+    fn args(&self) -> Vec<SyclArg> {
+        self.layout
+            .iter()
+            .map(|&(off, size)| SyclArg {
+                data: unsafe { self.arena.as_ptr().add(off) },
+                size,
+            })
+            .collect()
+    }
 }
 
+/// An opened SYCL device: one bridge context handle.
+pub struct SyclDevice {
+    bridge: &'static Bridge,
+    handle: usize,
+    name: String,
+    memory: u64,
+    /// The kernels' shared index-fault buffer (u32 per slot; a gather or
+    /// embedding sets its thread's slot on an out-of-range id).
+    fault: usize,
+    /// Reusable scratch for the quantized prefill path (dequantize-then-GEMM
+    /// must not queue one fresh n*k*4-byte buffer per matmul).
+    scratch: Mutex<Option<(usize, Option<SyclStorage>)>>,
+}
 
+impl SyclDevice {
+    /// Open SYCL device `ordinal` (the bridge prefers GPUs when present).
+    pub fn new(ordinal: usize) -> Result<Self> {
+        let b = bridge()?;
+        let fns = b.fns;
+        static DEV_LOCK: Mutex<()> = Mutex::new(());
+        let _dev = DEV_LOCK.lock().unwrap();
+        unsafe {
+            let mut h: usize = 0;
+            check((fns.open)(ordinal, &mut h), &fns)?;
+            let mut name_buf = [0u8; 128];
+            let mut memory: u64 = 0;
+            check((fns.info)(h, name_buf.as_mut_ptr(), name_buf.len(), &mut memory), &fns)?;
+            let end = name_buf.iter().position(|&x| x == 0).unwrap_or(name_buf.len());
+            Ok(Self {
+                bridge: b,
+                handle: h,
+                name: String::from_utf8_lossy(&name_buf[..end]).into_owned(),
+                memory,
+                fault: 0,
+                scratch: Mutex::new(None),
+            })
+        }
+    }
 
-fn batch_max(ba: usize, bb: usize, bc: usize) -> usize {
-    ba.max(bb).max(bc)
+    /// Allocate the fault-checker buffer (once, after construction).
+    fn init_fault(&mut self) -> Result<()> {
+        let storage = self.alloc(DType::U32, 1024)?;
+        self.fault = storage.buffer;
+        Ok(())
+    }
+
+    fn alloc_bytes(&self, bytes: usize) -> Result<usize> {
+        let fns = self.bridge.fns;
+        unsafe {
+            let mut h: usize = 0;
+            check((fns.alloc)(self.handle, bytes, &mut h), &fns)?;
+            Ok(h)
+        }
+    }
+
+    /// Allocate `numel` elements of `dtype` on the device.
+    pub fn alloc(&self, dtype: DType, numel: usize) -> Result<SyclStorage> {
+        let bytes = numel
+            .checked_mul(dtype.size_in_bytes())
+            .ok_or_else(|| Error::Msg("sycl: overflow in storage size".into()))?;
+        let buffer = self.alloc_bytes(bytes.max(1))?;
+        Ok(SyclStorage { buffer, dtype, numel, device: self.clone() })
+    }
+
+    /// Allocate raw bytes (quantized blocks, etc.).
+    pub fn alloc_raw(&self, bytes: usize) -> Result<usize> {
+        self.alloc_bytes(bytes.max(1))
+    }
+
+    pub fn write_bytes(&self, buffer: usize, off: usize, bytes: &[u8]) -> Result<()> {
+        let fns = self.bridge.fns;
+        unsafe { check((fns.write)(self.handle, buffer, off, bytes.len(), bytes.as_ptr()), &fns) }
+    }
+
+    pub fn read_bytes(&self, buffer: usize, off: usize, out: &mut [u8]) -> Result<()> {
+        let fns = self.bridge.fns;
+        unsafe { check((fns.read)(self.handle, buffer, off, out.len(), out.as_mut_ptr()), &fns) }
+    }
+
+    pub fn copy(&self, src: usize, dst: usize, so: usize, d: usize, size: usize) -> Result<()> {
+        let fns = self.bridge.fns;
+        unsafe { check((fns.copy)(self.handle, src, dst, so, d, size), &fns) }
+    }
+
+    /// Launch `kernel` with marshalled arguments (global/local in the OpenCL
+    /// x/y/z convention; the bridge reverses for SYCL).
+    pub fn launch(&self, kernel: &str, b: &mut ArgBuilder, global: [usize; 3], local: [usize; 3]) -> Result<()> {
+        let name = CString::new(kernel).unwrap();
+        let mut g = global;
+        if local[1] == 1 && local[2] == 1 && local[0] > 1 {
+            g[0] = g[0].div_ceil(local[0]) * local[0];
+        }
+        let args = b.args();
+        let _lock = GLOBAL_LOCK.lock().unwrap();
+        unsafe {
+            check(
+                (self.bridge.fns.launch)(self.handle, name.as_ptr(), args.as_ptr(), args.len(), g.as_ptr(), local.as_ptr()),
+                &self.bridge.fns,
+            )
+        }
+    }
+
+    /// A reusable device buffer of at least `bytes` (the quantized prefill's
+    /// dequantize scratch).
+    pub fn scratch(&self, bytes: usize) -> Result<SyclStorage> {
+        let mut guard = self.scratch.lock().unwrap();
+        if let Some((cap, Some(st))) = guard.as_mut() {
+            if *cap >= bytes {
+                return Ok(SyclStorage {
+                    buffer: st.buffer,
+                    dtype: DType::F32,
+                    numel: bytes / 4,
+                    device: self.clone(),
+                });
+            }
+        }
+        let st = self.alloc(DType::F32, bytes.div_ceil(4))?;
+        *guard = Some((bytes, Some(st.clone())));
+        Ok(st)
+    }
+
+    /// Check (and clear) this thread's index-fault slot.
+    pub fn check_fault(&self) -> Result<()> {
+        if self.fault == 0 {
+            return Ok(());
+        }
+        let slot = crate::fault_slot::current();
+        let mut buf = [0u8; 4];
+        self.read_bytes(self.fault, slot * 4, &mut buf)?;
+        let v = u32::from_ne_bytes(buf);
+        if v != 0 {
+            self.write_bytes(self.fault, slot * 4, &0u32.to_ne_bytes())?;
+            crate::bail!("sycl: an index kernel faulted on an out-of-range id")
+        }
+        Ok(())
+    }
+
+    /// Block until all queued work completes.
+    pub fn finish(&self) -> Result<()> {
+        let fns = self.bridge.fns;
+        let _lock = GLOBAL_LOCK.lock().unwrap();
+        unsafe { check((fns.finish)(self.handle), &fns) }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn global_mem_size(&self) -> Option<u64> {
+        Some(self.memory)
+    }
 }
 
 impl Drop for SyclDevice {
     fn drop(&mut self) {
         if self.handle != 0 {
-            unsafe { (self.fns.close)(self.handle) };
+            let fns = self.bridge.fns;
+            unsafe { (fns.close)(self.handle) };
         }
     }
 }
 
 unsafe impl Send for SyclDevice {}
 unsafe impl Sync for SyclDevice {}
+
+impl Clone for SyclDevice {
+    fn clone(&self) -> Self {
+        Self {
+            bridge: self.bridge,
+            handle: self.handle,
+            name: self.name.clone(),
+            memory: self.memory,
+            fault: self.fault,
+            scratch: Mutex::new(None),
+        }
+    }
+}
+
+/// Storage on the SYCL device.
+pub struct SyclStorage {
+    pub buffer: usize,
+    pub dtype: DType,
+    pub numel: usize,
+    pub device: SyclDevice,
+}
+
+impl Drop for SyclStorage {
+    fn drop(&mut self) {
+        if self.buffer != 0 {
+            let fns = self.device.bridge.fns;
+            unsafe { (fns.free)(self.buffer) };
+        }
+    }
+}
+
+fn transmute_bytes<T: Copy>(raw: &[u8], numel: usize) -> Vec<T> {
+    let mut out = Vec::with_capacity(numel);
+    let size = std::mem::size_of::<T>();
+    for i in 0..numel {
+        // # Safety: raw holds numel * size bytes, T is plain data.
+        let v = unsafe { std::ptr::read_unaligned(raw.as_ptr().add(i * size) as *const T) };
+        out.push(v);
+    }
+    out
+}
+
+impl SyclStorage {
+    pub fn from_vec<T: WithDType>(slice: Vec<T>, device: &SyclDevice) -> Result<Self> {
+        let dtype = T::DTYPE;
+        let bytes = dtype
+            .size_in_bytes()
+            .checked_mul(slice.len())
+            .ok_or_else(|| Error::Msg("sycl: overflow in storage size".into()))?;
+        let buffer = device.alloc_bytes(bytes.max(1))?;
+        if bytes > 0 {
+            // # Safety: slice.as_ptr() points to `bytes` valid bytes.
+            let data = unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const u8, bytes) };
+            if let Err(e) = device.write_bytes(buffer, 0, data) {
+                let fns = device.bridge.fns;
+                unsafe { (fns.free)(buffer) };
+                return Err(e);
+            }
+        }
+        Ok(Self { buffer, dtype, numel: slice.len(), device: device.clone() })
+    }
+
+    fn elem_size(&self) -> usize {
+        self.dtype.size_in_bytes()
+    }
+
+    /// A contiguous copy of the elements addressed by `l`, on the device.
+    pub fn contiguous_copy(&self, l: &Layout) -> Result<Self> {
+        let n = l.shape().elem_count();
+        let out = self.device.alloc(self.dtype, n)?;
+        kernels::run_copy_strided(&self.device, self.elem_size(), self.buffer, out.buffer, n, l, 0)?;
+        Ok(out)
+    }
+
+    /// `(storage, offset)`: the storage itself when `l` is contiguous, else
+    /// a contiguous copy at offset 0.
+    pub fn as_contiguous(&self, l: &Layout) -> Result<(std::borrow::Cow<'_, Self>, usize)> {
+        match l.contiguous_offsets() {
+            Some((o1, _)) => Ok((std::borrow::Cow::Borrowed(self), o1)),
+            None => Ok((std::borrow::Cow::Owned(self.contiguous_copy(l)?), 0)),
+        }
+    }
+
+    /// u32 ids from a u32 / i64 / u8 id storage (cast on the device when
+    /// needed).
+    pub fn ids_u32(&self, l: &Layout) -> Result<(std::borrow::Cow<'_, Self>, usize)> {
+        match self.dtype {
+            DType::U32 => self.as_contiguous(l),
+            DType::I64 | DType::U8 => {
+                let n = l.shape().elem_count();
+                let out = self.device.alloc(DType::U32, n)?;
+                let name = if self.dtype == DType::I64 {
+                    "k_ids_i64"
+                } else {
+                    kernels::cast_kernel(self.dtype, DType::U32)
+                        .ok_or_else(|| Error::Msg("sycl: no id cast".into()))?
+                };
+                kernels::run_cast(&self.device, name, self.buffer, out.buffer, n, l)?;
+                Ok((std::borrow::Cow::Owned(out), 0))
+            }
+            d => Err(Error::Msg(format!("sycl: unsupported index dtype {d:?}"))),
+        }
+    }
+}
+
+impl Clone for SyclStorage {
+    fn clone(&self) -> Self {
+        self.try_clone(&Layout::contiguous(self.numel))
+            .expect("sycl: device buffer copy failed")
+    }
+}
+
+impl BackendStorage for SyclStorage {
+    type Device = SyclDevice;
+
+    fn try_clone(&self, _layout: &Layout) -> Result<Self> {
+        let bytes = self.numel * self.elem_size();
+        let buffer = self.device.alloc_bytes(bytes.max(1))?;
+        if bytes > 0 {
+            self.device.copy(self.buffer, buffer, 0, 0, bytes)?;
+        }
+        Ok(Self { buffer, dtype: self.dtype, numel: self.numel, device: self.device.clone() })
+    }
+
+    fn dtype(&self) -> DType {
+        self.dtype
+    }
+
+    fn device(&self) -> &Self::Device {
+        &self.device
+    }
+
+    fn const_set(&mut self, s: crate::scalar::Scalar, layout: &Layout) -> Result<()> {
+        if let Some(bits) = scalar_bits(s) {
+            let n = layout.shape().elem_count();
+            return kernels::run_fill(&self.device, self.elem_size(), self.buffer, n, layout, bits);
+        }
+        let mut cpu = self.to_cpu_storage()?;
+        cpu.const_set(s, layout)?;
+        let dev = self.device.clone();
+        *self = dev.storage_from_cpu_storage(&cpu)?;
+        Ok(())
+    }
+
+    fn to_cpu_storage(&self) -> Result<CpuStorage> {
+        let bytes = self.numel * self.elem_size();
+        let mut raw = vec![0u8; bytes];
+        self.device.read_bytes(self.buffer, 0, &mut raw)?;
+        self.device.check_fault()?;
+        Ok(match self.dtype {
+            DType::U8 => CpuStorage::U8(raw),
+            DType::U32 => CpuStorage::U32(transmute_bytes(&raw, self.numel)),
+            DType::I16 => CpuStorage::I16(transmute_bytes(&raw, self.numel)),
+            DType::I32 => CpuStorage::I32(transmute_bytes(&raw, self.numel)),
+            DType::I64 => CpuStorage::I64(transmute_bytes(&raw, self.numel)),
+            DType::F32 => CpuStorage::F32(transmute_bytes(&raw, self.numel)),
+            DType::F64 => CpuStorage::F64(transmute_bytes(&raw, self.numel)),
+            DType::F16 => CpuStorage::F16(
+                transmute_bytes::<u16>(&raw, self.numel).into_iter().map(half::f16::from_bits).collect(),
+            ),
+            DType::BF16 => CpuStorage::BF16(
+                transmute_bytes::<u16>(&raw, self.numel).into_iter().map(half::bf16::from_bits).collect(),
+            ),
+            other => return Err(Error::Msg(format!("sycl to_cpu_storage: dtype {other:?} not supported"))),
+        })
+    }
+
+    fn affine(&self, layout: &Layout, mul: f64, add: f64) -> Result<Self> {
+        if self.dtype == DType::F32 {
+            let n = layout.shape().elem_count();
+            let out = self.device.alloc(DType::F32, n)?;
+            if let Ok(()) = kernels::run_affine(&self.device, self.buffer, out.buffer, n, layout, mul as f32, add as f32) {
+                return Ok(out);
+            }
+        }
+        let cpu = self.to_cpu_storage()?;
+        let out = cpu.affine(layout, mul, add)?;
+        self.device.storage_from_cpu_storage(&out)
+    }
+
+    fn powf(&self, layout: &Layout, e: f64) -> Result<Self> {
+        if self.dtype == DType::F32 {
+            let n = layout.shape().elem_count();
+            let out = self.device.alloc(DType::F32, n)?;
+            if let Ok(()) = kernels::run_powf(&self.device, self.buffer, out.buffer, n, layout, e as f32) {
+                return Ok(out);
+            }
+        }
+        let cpu = self.to_cpu_storage()?;
+        let out = cpu.powf(layout, e)?;
+        self.device.storage_from_cpu_storage(&out)
+    }
+
+    fn elu(&self, layout: &Layout, alpha: f64) -> Result<Self> {
+        if self.dtype == DType::F32 {
+            let n = layout.shape().elem_count();
+            let out = self.device.alloc(DType::F32, n)?;
+            if let Ok(()) = kernels::run_elu(&self.device, self.buffer, out.buffer, n, layout, alpha as f32) {
+                return Ok(out);
+            }
+        }
+        let cpu = self.to_cpu_storage()?;
+        let out = cpu.elu(layout, alpha)?;
+        self.device.storage_from_cpu_storage(&out)
+    }
+
+    fn reduce_op(&self, op: crate::op::ReduceOp, layout: &Layout, s: &[usize]) -> Result<Self> {
+        if self.dtype == DType::F32 {
+            if let Ok(Some(out)) = self.reduce_native(op, layout, s) {
+                return Ok(out);
+            }
+        }
+        let cpu = self.to_cpu_storage()?;
+        let out = cpu.reduce_op(op, layout, s)?;
+        self.device.storage_from_cpu_storage(&out)
+    }
+
+    fn cmp(&self, op: crate::op::CmpOp, rhs: &Self, lhs_l: &Layout, rhs_l: &Layout) -> Result<Self> {
+        if self.dtype == rhs.dtype && matches!(self.dtype, DType::F32 | DType::U32) {
+            let n = lhs_l.shape().elem_count();
+            let out = self.device.alloc(DType::U8, n)?;
+            if let Ok(()) = kernels::run_cmp(
+                &self.device,
+                kernels::cmp_code(op),
+                self.buffer,
+                rhs.buffer,
+                out.buffer,
+                n,
+                lhs_l,
+                rhs_l,
+                self.dtype == DType::U32,
+            ) {
+                return Ok(out);
+            }
+        }
+        let lhs = self.to_cpu_storage()?;
+        let rhs = rhs.to_cpu_storage()?;
+        let out = lhs.cmp(op, &rhs, lhs_l, rhs_l)?;
+        self.device.storage_from_cpu_storage(&out)
+    }
+
+    fn to_dtype(&self, layout: &Layout, dtype: DType) -> Result<Self> {
+        if dtype == self.dtype {
+            return self.contiguous_copy(layout);
+        }
+        if let Some(name) = kernels::cast_kernel(self.dtype, dtype) {
+            let n = layout.shape().elem_count();
+            let out = self.device.alloc(dtype, n)?;
+            if let Ok(()) = kernels::run_cast(&self.device, name, self.buffer, out.buffer, n, layout) {
+                return Ok(out);
+            }
+        }
+        let cpu = self.to_cpu_storage()?;
+        let out = cpu.to_dtype(layout, dtype)?;
+        self.device.storage_from_cpu_storage(&out)
+    }
+
+    fn unary_impl<B: crate::op::UnaryOpT>(&self, layout: &Layout) -> Result<Self> {
+        if self.dtype == DType::F32 {
+            if let Some(code) = crate::opencl_unary_code(B::NAME) {
+                let n = layout.shape().elem_count();
+                let out = self.device.alloc(DType::F32, n)?;
+                if let Ok(()) = kernels::run_unary(&self.device, code, self.buffer, out.buffer, n, layout) {
+                    return Ok(out);
+                }
+            }
+        }
+        let cpu = self.to_cpu_storage()?;
+        let out = cpu.unary_impl::<B>(layout)?;
+        self.device.storage_from_cpu_storage(&out)
+    }
+
+    fn binary_impl<B: crate::op::BinaryOpT>(&self, rhs: &Self, lhs_l: &Layout, rhs_l: &Layout) -> Result<Self> {
+        if self.dtype == rhs.dtype && matches!(self.dtype, DType::F32 | DType::U32) {
+            if let Some(code) = kernels::binary_code(B::NAME) {
+                let n = lhs_l.shape().elem_count();
+                let out = self.device.alloc(self.dtype, n)?;
+                if let Ok(()) = kernels::run_binary(&self.device, code, self.buffer, rhs.buffer, out.buffer, n, lhs_l, rhs_l, self.dtype == DType::U32) {
+                    return Ok(out);
+                }
+            }
+        }
+        let lhs = self.to_cpu_storage()?;
+        let rhs = rhs.to_cpu_storage()?;
+        let out = lhs.binary_impl::<B>(&rhs, lhs_l, rhs_l)?;
+        self.device.storage_from_cpu_storage(&out)
+    }
+
+    fn where_cond(&self, layout: &Layout, t: &Self, t_l: &Layout, f: &Self, f_l: &Layout) -> Result<Self> {
+        if t.dtype == f.dtype && matches!(self.dtype, DType::U8 | DType::U32) {
+            let elem = t.elem_size();
+            if elem == 4 || (elem == 8 && self.dtype == DType::U8) {
+                let n = layout.shape().elem_count();
+                let out = self.device.alloc(t.dtype, n)?;
+                if let Ok(()) = kernels::run_where(
+                    &self.device,
+                    self.buffer,
+                    t.buffer,
+                    f.buffer,
+                    out.buffer,
+                    n,
+                    layout,
+                    t_l,
+                    f_l,
+                    self.dtype == DType::U32,
+                    elem == 8,
+                ) {
+                    return Ok(out);
+                }
+            }
+        }
+        let cond = self.to_cpu_storage()?;
+        let t = t.to_cpu_storage()?;
+        let f = f.to_cpu_storage()?;
+        let out = cond.where_cond(layout, &t, t_l, &f, f_l)?;
+        self.device.storage_from_cpu_storage(&out)
+    }
+
+    fn conv1d(&self, l: &Layout, kernel: &Self, kernel_l: &Layout, params: &crate::conv::ParamsConv1D) -> Result<Self> {
+        let inp = self.to_cpu_storage()?;
+        let kernel = kernel.to_cpu_storage()?;
+        let out = inp.conv1d(l, &kernel, kernel_l, params)?;
+        self.device.storage_from_cpu_storage(&out)
+    }
+
+    fn conv_transpose1d(&self, l: &Layout, kernel: &Self, kernel_l: &Layout, params: &crate::conv::ParamsConvTranspose1D) -> Result<Self> {
+        let inp = self.to_cpu_storage()?;
+        let kernel = kernel.to_cpu_storage()?;
+        let out = inp.conv_transpose1d(l, &kernel, kernel_l, params)?;
+        self.device.storage_from_cpu_storage(&out)
+    }
+
+    fn conv2d(&self, l: &Layout, kernel: &Self, kernel_l: &Layout, params: &crate::conv::ParamsConv2D) -> Result<Self> {
+        let inp = self.to_cpu_storage()?;
+        let kernel = kernel.to_cpu_storage()?;
+        let out = inp.conv2d(l, &kernel, kernel_l, params)?;
+        self.device.storage_from_cpu_storage(&out)
+    }
+
+    fn conv_transpose2d(&self, l: &Layout, kernel: &Self, kernel_l: &Layout, params: &crate::conv::ParamsConvTranspose2D) -> Result<Self> {
+        let inp = self.to_cpu_storage()?;
+        let kernel = kernel.to_cpu_storage()?;
+        let out = inp.conv_transpose2d(l, &kernel, kernel_l, params)?;
+        self.device.storage_from_cpu_storage(&out)
+    }
+
+    fn index_select(&self, ids: &Self, l: &Layout, ids_l: &Layout, dim: usize) -> Result<Self> {
+        if matches!(self.elem_size(), 4 | 8) && matches!(ids.dtype, DType::U32 | DType::I64 | DType::U8) {
+            match self.index_select_native(ids, l, ids_l, dim) {
+                Ok(out) => return Ok(out),
+                Err(_) => {}
+            }
+        }
+        let src = self.to_cpu_storage()?;
+        let ids = ids.to_cpu_storage()?;
+        let out = src.index_select(&ids, l, ids_l, dim)?;
+        self.device.storage_from_cpu_storage(&out)
+    }
+
+    fn gather(&self, l: &Layout, ids: &Self, ids_l: &Layout, dim: usize) -> Result<Self> {
+        if self.elem_size() == 4 && matches!(ids.dtype, DType::U32 | DType::I64 | DType::U8) {
+            match self.gather_native(l, ids, ids_l, dim) {
+                Ok(out) => return Ok(out),
+                Err(_) => {}
+            }
+        }
+        let src = self.to_cpu_storage()?;
+        let ids = ids.to_cpu_storage()?;
+        let out = src.gather(l, &ids, ids_l, dim)?;
+        self.device.storage_from_cpu_storage(&out)
+    }
+
+    fn scatter_set(&mut self, l: &Layout, ids: &Self, ids_l: &Layout, src: &Self, src_l: &Layout, dim: usize) -> Result<()> {
+        if self.elem_size() == 4 && src.dtype == self.dtype && l.is_contiguous() {
+            if self.scatter_native(false, l, ids, ids_l, src, src_l, dim).is_ok() {
+                return Ok(());
+            }
+        }
+        let mut tgt = self.to_cpu_storage()?;
+        let ids = ids.to_cpu_storage()?;
+        let src = src.to_cpu_storage()?;
+        tgt.scatter_set(l, &ids, ids_l, &src, src_l, dim)?;
+        let dev = self.device.clone();
+        *self = dev.storage_from_cpu_storage(&tgt)?;
+        Ok(())
+    }
+
+    fn scatter_add_set(&mut self, l: &Layout, ids: &Self, ids_l: &Layout, src: &Self, src_l: &Layout, dim: usize) -> Result<()> {
+        if self.dtype == DType::F32 && src.dtype == DType::F32 && l.is_contiguous() {
+            if self.scatter_native(true, l, ids, ids_l, src, src_l, dim).is_ok() {
+                return Ok(());
+            }
+        }
+        let mut tgt = self.to_cpu_storage()?;
+        let ids = ids.to_cpu_storage()?;
+        let src = src.to_cpu_storage()?;
+        tgt.scatter_add_set(l, &ids, ids_l, &src, src_l, dim)?;
+        let dev = self.device.clone();
+        *self = dev.storage_from_cpu_storage(&tgt)?;
+        Ok(())
+    }
+
+    fn index_add(&self, l: &Layout, ids: &Self, ids_l: &Layout, src: &Self, src_l: &Layout, dim: usize) -> Result<Self> {
+        if self.dtype == DType::F32 && src.dtype == DType::F32 {
+            match self.index_add_native(l, ids, ids_l, src, src_l, dim) {
+                Ok(out) => return Ok(out),
+                Err(_) => {}
+            }
+        }
+        let tgt = self.to_cpu_storage()?;
+        let ids = ids.to_cpu_storage()?;
+        let src = src.to_cpu_storage()?;
+        let out = tgt.index_add(l, &ids, ids_l, &src, src_l, dim)?;
+        self.device.storage_from_cpu_storage(&out)
+    }
+
+    fn matmul(&self, rhs: &Self, bmnk: (usize, usize, usize, usize), lhs_l: &Layout, rhs_l: &Layout) -> Result<Self> {
+        if self.dtype == DType::F32 && rhs.dtype == DType::F32 {
+            match self.matmul_native(rhs, bmnk, lhs_l, rhs_l) {
+                Ok(out) => return Ok(out),
+                Err(_) => {}
+            }
+        }
+        let lhs = self.to_cpu_storage()?;
+        let rhs = rhs.to_cpu_storage()?;
+        let out = lhs.matmul(&rhs, bmnk, lhs_l, rhs_l)?;
+        self.device.storage_from_cpu_storage(&out)
+    }
+
+    fn copy_strided_src(&self, dst: &mut Self, dst_offset: usize, src_l: &Layout) -> Result<()> {
+        if dst.dtype == self.dtype {
+            let n = src_l.shape().elem_count();
+            if let Ok(()) = kernels::run_copy_strided(&self.device, self.elem_size(), self.buffer, dst.buffer, n, src_l, dst_offset) {
+                return Ok(());
+            }
+        }
+        let src = self.to_cpu_storage()?;
+        let mut dst_cpu = dst.to_cpu_storage()?;
+        src.copy_strided_src(&mut dst_cpu, dst_offset, src_l)?;
+        let dev = dst.device.clone();
+        *dst = dev.storage_from_cpu_storage(&dst_cpu)?;
+        Ok(())
+    }
+
+    fn copy2d(&self, dst: &mut Self, d1: usize, d2: usize, src_s: usize, dst_s: usize, src_o: usize, dst_o: usize) -> Result<()> {
+        if dst.dtype == self.dtype {
+            if let Ok(()) = kernels::run_copy2d(&self.device, self.elem_size(), self.buffer, dst.buffer, d1, d2, src_s, dst_s, src_o, dst_o) {
+                return Ok(());
+            }
+        }
+        let src = self.to_cpu_storage()?;
+        let mut dst_cpu = dst.to_cpu_storage()?;
+        src.copy2d(&mut dst_cpu, d1, d2, src_s, dst_s, src_o, dst_o)?;
+        let dev = dst.device.clone();
+        *dst = dev.storage_from_cpu_storage(&dst_cpu)?;
+        Ok(())
+    }
+
+    fn avg_pool2d(&self, layout: &Layout, k: (usize, usize), s: (usize, usize)) -> Result<Self> {
+        let cpu = self.to_cpu_storage()?;
+        let out = cpu.avg_pool2d(layout, k, s)?;
+        self.device.storage_from_cpu_storage(&out)
+    }
+
+    fn max_pool2d(&self, layout: &Layout, k: (usize, usize), s: (usize, usize)) -> Result<Self> {
+        let cpu = self.to_cpu_storage()?;
+        let out = cpu.max_pool2d(layout, k, s)?;
+        self.device.storage_from_cpu_storage(&out)
+    }
+
+    fn upsample_nearest1d(&self, layout: &Layout, sz: usize) -> Result<Self> {
+        let cpu = self.to_cpu_storage()?;
+        let out = cpu.upsample_nearest1d(layout, sz)?;
+        self.device.storage_from_cpu_storage(&out)
+    }
+
+    fn upsample_nearest2d(&self, layout: &Layout, h: usize, w: usize) -> Result<Self> {
+        let cpu = self.to_cpu_storage()?;
+        let out = cpu.upsample_nearest2d(layout, h, w)?;
+        self.device.storage_from_cpu_storage(&out)
+    }
+
+    fn upsample_bilinear2d(&self, layout: &Layout, h: usize, w: usize, align_corners: bool, scale_h: Option<f64>, scale_w: Option<f64>) -> Result<Self> {
+        let cpu = self.to_cpu_storage()?;
+        let out = cpu.upsample_bilinear2d(layout, h, w, align_corners, scale_h, scale_w)?;
+        self.device.storage_from_cpu_storage(&out)
+    }
+}
+
+/// Strides of a matmul operand `[batch..., rows, cols]` under `l`, when the
+/// batch dims collapse to one stride — identical to the OpenCL helper.
+pub fn mat_strides(l: &Layout, batch: usize) -> Option<MatStrides> {
+    let dims = l.dims();
+    let st = l.stride();
+    let r = dims.len();
+    if r < 2 {
+        return None;
+    }
+    let row = st[r - 2];
+    let col = st[r - 1];
+    let batch_stride = if r == 2 {
+        0
+    } else {
+        let bdims = &dims[..r - 2];
+        let bst = &st[..r - 2];
+        if bdims.iter().product::<usize>() != batch {
+            return None;
+        }
+        if bst.iter().all(|&s| s == 0) {
+            0
+        } else {
+            let inner = bst[bdims.len() - 1];
+            for i in 0..bdims.len() - 1 {
+                if bdims[i] > 1 && bst[i] != bdims[i + 1] * bst[i + 1] {
+                    return None;
+                }
+            }
+            inner
+        }
+    };
+    Some(MatStrides { row, col, offset: l.start_offset(), batch: batch_stride })
+}
+
+fn scalar_bits(s: crate::scalar::Scalar) -> Option<u64> {
+    use crate::scalar::Scalar::*;
+    Some(match s {
+        U8(v) => v as u64,
+        U32(v) => v as u64,
+        I16(v) => v as u16 as u64,
+        I32(v) => v as u32 as u64,
+        I64(v) => v as u64,
+        BF16(v) => v.to_bits() as u64,
+        F16(v) => v.to_bits() as u64,
+        F32(v) => v.to_bits() as u64,
+        F64(v) => v.to_bits(),
+        _ => return None,
+    })
+}
+
+impl SyclStorage {
+    fn reduce_native(&self, op: crate::op::ReduceOp, layout: &Layout, s: &[usize]) -> Result<Option<Self>> {
+        let dims = layout.dims();
+        let rank = dims.len();
+        let code = match op {
+            crate::op::ReduceOp::Sum => kernels::RED_SUM,
+            crate::op::ReduceOp::Max => kernels::RED_MAX,
+            crate::op::ReduceOp::Min => kernels::RED_MIN,
+            crate::op::ReduceOp::ArgMax | crate::op::ReduceOp::ArgMin => {
+                if rank == 0 || s != [rank - 1] {
+                    return Ok(None);
+                }
+                let Some((o1, _)) = layout.contiguous_offsets() else { return Ok(None) };
+                let cols = dims[rank - 1];
+                let rows = dims[..rank - 1].iter().product::<usize>();
+                if cols == 0 {
+                    return Ok(None);
+                }
+                let out = self.device.alloc(DType::U32, rows)?;
+                kernels::run_arg_last(
+                    &self.device,
+                    matches!(op, crate::op::ReduceOp::ArgMax),
+                    self.buffer,
+                    out.buffer,
+                    rows,
+                    cols,
+                    o1,
+                )?;
+                return Ok(Some(out));
+            }
+        };
+        let mut reduced = s.to_vec();
+        reduced.sort_unstable();
+        reduced.dedup();
+        if reduced.iter().any(|&d| d >= rank) {
+            return Ok(None);
+        }
+        let out_dims: Vec<usize> = dims
+            .iter()
+            .enumerate()
+            .map(|(i, &d)| if reduced.contains(&i) { 1 } else { d })
+            .collect();
+        let n_out = out_dims.iter().product::<usize>();
+        if let Some((o1, _)) = layout.contiguous_offsets() {
+            let n_trailing = reduced.len();
+            let trailing_ok = reduced.iter().enumerate().all(|(i, &d)| d == rank - n_trailing + i);
+            if trailing_ok && n_trailing > 0 {
+                let cols = dims[rank - n_trailing..].iter().product::<usize>();
+                let rows = n_out;
+                if cols == 0 && code != kernels::RED_SUM {
+                    return Ok(None);
+                }
+                let out = self.device.alloc(DType::F32, rows)?;
+                if cols == 0 {
+                    kernels::run_fill(&self.device, 4, out.buffer, rows, &Layout::contiguous(rows), 0)?;
+                } else {
+                    kernels::run_reduce_last(&self.device, code, self.buffer, out.buffer, rows, cols, o1)?;
+                }
+                return Ok(Some(out));
+            }
+        }
+        let count = reduced.iter().map(|&d| dims[d]).product::<usize>();
+        if count == 0 && code != kernels::RED_SUM {
+            return Ok(None);
+        }
+        let st = layout.stride();
+        let out_strides: Vec<usize> = st
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| if reduced.contains(&i) { 0 } else { v })
+            .collect();
+        let ix = Idx::new(&out_dims)?.with_strides(0, &out_strides, layout.start_offset())?;
+        let rdims: Vec<usize> = reduced.iter().map(|&d| dims[d]).collect();
+        let rstrides: Vec<usize> = reduced.iter().map(|&d| st[d]).collect();
+        let rd = if rdims.is_empty() {
+            Idx::new(&[1])?.with_strides(0, &[0], 0)?
+        } else {
+            Idx::new(&rdims)?.with_strides(0, &rstrides, 0)?
+        };
+        let out = self.device.alloc(DType::F32, n_out)?;
+        kernels::run_reduce_generic(
+            &self.device,
+            code,
+            self.buffer,
+            out.buffer,
+            n_out,
+            ix,
+            rd,
+            count.max(if rdims.is_empty() { 1 } else { 0 }),
+        )?;
+        Ok(Some(out))
+    }
+
+    fn index_select_native(&self, ids: &Self, l: &Layout, ids_l: &Layout, dim: usize) -> Result<Self> {
+        let dims = l.dims();
+        if dim >= dims.len() {
+            return Err(Error::Msg("sycl index_select: bad dim".into()));
+        }
+        let (src, src_off) = self.as_contiguous(l)?;
+        let n_ids = ids_l.shape().elem_count();
+        let left = dims[..dim].iter().product::<usize>();
+        let dim_size = dims[dim];
+        let right = dims[dim + 1..].iter().product::<usize>();
+        let n = left * n_ids * right;
+        let out = self.device.alloc(self.dtype, n)?;
+        let elem8 = self.elem_size() == 8;
+        let (ids_s, ids_off, i64_ids) = match ids.dtype {
+            DType::I64 if !elem8 => {
+                let (s, o) = ids.as_contiguous(ids_l)?;
+                (s, o, true)
+            }
+            _ => {
+                let (s, o) = ids.ids_u32(ids_l)?;
+                (s, o, false)
+            }
+        };
+        kernels::run_index_select(
+            &self.device,
+            elem8,
+            i64_ids,
+            src.buffer,
+            ids_s.buffer,
+            out.buffer,
+            n,
+            left,
+            n_ids,
+            right,
+            dim_size,
+            src_off,
+            ids_off,
+            self.device.fault,
+            crate::fault_slot::current() as i32,
+        )?;
+        Ok(out)
+    }
+
+    fn gather_native(&self, l: &Layout, ids: &Self, ids_l: &Layout, dim: usize) -> Result<Self> {
+        let dims = l.dims();
+        if dim >= dims.len() || ids_l.dims().len() != dims.len() {
+            return Err(Error::Msg("sycl gather: bad dim or rank".into()));
+        }
+        let (ids_s, ids_off) = ids.ids_u32(ids_l)?;
+        let ids_layout = Layout::new(ids_l.shape().clone(), ids_l.stride().to_vec(), ids_off);
+        let n = ids_l.shape().elem_count();
+        let mut src_strides = l.stride().to_vec();
+        let dim_stride = src_strides[dim];
+        src_strides[dim] = 0;
+        let ix = Idx::new(ids_l.dims())?
+            .with_layout(0, if ids_s.buffer == ids.buffer { ids_l } else { &ids_layout })?
+            .with_strides(1, &src_strides, l.start_offset())?;
+        let out = self.device.alloc(self.dtype, n)?;
+        kernels::run_gather(
+            &self.device,
+            self.buffer,
+            ids_s.buffer,
+            out.buffer,
+            n,
+            ix,
+            dim_stride,
+            dims[dim],
+            self.device.fault,
+            crate::fault_slot::current() as i32,
+        )?;
+        Ok(out)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn scatter_native(&mut self, add: bool, l: &Layout, ids: &Self, ids_l: &Layout, src: &Self, src_l: &Layout, dim: usize) -> Result<()> {
+        let dims = l.dims();
+        if dim >= dims.len() || ids_l.dims().len() != dims.len() || src_l.dims().len() != dims.len() {
+            return Err(Error::Msg("sycl scatter: bad dim or rank".into()));
+        }
+        let (ids_s, ids_off) = ids.ids_u32(ids_l)?;
+        let ids_layout = Layout::new(ids_l.shape().clone(), ids_l.stride().to_vec(), ids_off);
+        let ids_l = if ids_s.buffer == ids.buffer { ids_l } else { &ids_layout };
+        let mut cdims = ids_l.dims().to_vec();
+        let n_j = cdims[dim];
+        cdims[dim] = 1;
+        let n = cdims.iter().product::<usize>();
+        let ix = Idx::new(&cdims)?.with_layout(0, ids_l)?.with_layout(1, src_l)?.with_layout(2, l)?;
+        kernels::run_scatter(
+            &self.device,
+            add,
+            self.buffer,
+            ids_s.buffer,
+            src.buffer,
+            n,
+            ix,
+            n_j,
+            ids_l.stride()[dim],
+            src_l.stride()[dim],
+            l.stride()[dim],
+            dims[dim],
+            self.device.fault,
+            crate::fault_slot::current() as i32,
+        )
+    }
+
+    fn index_add_native(&self, l: &Layout, ids: &Self, ids_l: &Layout, src: &Self, src_l: &Layout, dim: usize) -> Result<Self> {
+        let dims = l.dims();
+        if dim >= dims.len() {
+            return Err(Error::Msg("sycl index_add: bad dim".into()));
+        }
+        let dst = self.contiguous_copy(l)?;
+        let (src_c, src_off) = src.as_contiguous(src_l)?;
+        let (ids_s, ids_off) = ids.ids_u32(ids_l)?;
+        let n_ids = ids_l.shape().elem_count();
+        let left = dims[..dim].iter().product::<usize>();
+        let right = dims[dim + 1..].iter().product::<usize>();
+        kernels::run_index_add(
+            &self.device,
+            dst.buffer,
+            ids_s.buffer,
+            src_c.buffer,
+            left,
+            n_ids,
+            right,
+            dims[dim],
+            src_off,
+            ids_off,
+            self.device.fault,
+            crate::fault_slot::current() as i32,
+        )?;
+        Ok(dst)
+    }
+
+    fn matmul_native(&self, rhs: &Self, bmnk: (usize, usize, usize, usize), lhs_l: &Layout, rhs_l: &Layout) -> Result<Self> {
+        let (batch, m, n, k) = bmnk;
+        let out = self.device.alloc(DType::F32, batch * m * n)?;
+        let (lhs_buf, sa, _lhs_keep) = match mat_strides(lhs_l, batch) {
+            Some(s) => (self.buffer, s, None),
+            None => {
+                let c = self.contiguous_copy(lhs_l)?;
+                (c.buffer, MatStrides { row: k, col: 1, offset: 0, batch: m * k }, Some(c))
+            }
+        };
+        let (rhs_buf, sb, _rhs_keep) = match mat_strides(rhs_l, batch) {
+            Some(s) => (rhs.buffer, s, None),
+            None => {
+                let c = rhs.contiguous_copy(rhs_l)?;
+                (c.buffer, MatStrides { row: n, col: 1, offset: 0, batch: k * n }, Some(c))
+            }
+        };
+        kernels::run_matmul(&self.device, lhs_buf, rhs_buf, out.buffer, (batch, m, n, k), sa, sb)?;
+        Ok(out)
+    }
+}
+
+impl BackendDevice for SyclDevice {
+    type Storage = SyclStorage;
+
+    fn new(ordinal: usize) -> Result<Self> {
+        Self::new(ordinal)
+    }
+
+    fn set_seed(&self, _seed: u64) -> Result<()> {
+        Ok(())
+    }
+
+    fn get_current_seed(&self) -> Result<u64> {
+        Ok(0)
+    }
+
+    fn location(&self) -> crate::DeviceLocation {
+        crate::DeviceLocation::Sycl { ordinal: 0 }
+    }
+
+    fn same_device(&self, other: &Self) -> bool {
+        self.handle == other.handle
+    }
+
+    fn zeros_impl(&self, shape: &Shape, dtype: DType) -> Result<Self::Storage> {
+        let numel = shape.elem_count();
+        let storage = self.alloc(dtype, numel)?;
+        if numel > 0 {
+            let l = Layout::contiguous(numel);
+            if matches!(dtype.size_in_bytes(), 1 | 2 | 4 | 8) {
+                kernels::run_fill(self, dtype.size_in_bytes(), storage.buffer, numel, &l, 0)?;
+            } else {
+                let bytes = numel * dtype.size_in_bytes();
+                let zeros = vec![0u8; bytes];
+                self.write_bytes(storage.buffer, 0, &zeros)?;
+            }
+        }
+        Ok(storage)
+    }
+
+    unsafe fn alloc_uninit(&self, shape: &Shape, dtype: DType) -> Result<Self::Storage> {
+        self.alloc(dtype, shape.elem_count())
+    }
+
+    fn storage_from_slice<T: WithDType>(&self, s: &[T]) -> Result<Self::Storage> {
+        SyclStorage::from_vec(s.to_vec(), self)
+    }
+
+    fn storage_from_cpu_storage(&self, cpu: &CpuStorage) -> Result<Self::Storage> {
+        match cpu {
+            CpuStorage::U8(v) => SyclStorage::from_vec(v.clone(), self),
+            CpuStorage::U32(v) => SyclStorage::from_vec(v.clone(), self),
+            CpuStorage::I16(v) => SyclStorage::from_vec(v.clone(), self),
+            CpuStorage::I32(v) => SyclStorage::from_vec(v.clone(), self),
+            CpuStorage::I64(v) => SyclStorage::from_vec(v.clone(), self),
+            CpuStorage::F32(v) => SyclStorage::from_vec(v.clone(), self),
+            CpuStorage::F64(v) => SyclStorage::from_vec(v.clone(), self),
+            CpuStorage::F16(v) => SyclStorage::from_vec(v.clone(), self),
+            CpuStorage::BF16(v) => SyclStorage::from_vec(v.clone(), self),
+            other => Err(Error::Msg(format!(
+                "sycl storage_from_cpu_storage: dtype {:?} not supported",
+                other.dtype()
+            ))),
+        }
+    }
+
+    fn storage_from_cpu_storage_owned(&self, cpu: CpuStorage) -> Result<Self::Storage> {
+        self.storage_from_cpu_storage(&cpu)
+    }
+
+    fn rand_uniform(&self, shape: &Shape, dtype: DType, lo: f64, hi: f64) -> Result<Self::Storage> {
+        let cpu = crate::cpu_backend::CpuDevice.rand_uniform(shape, dtype, lo, hi)?;
+        self.storage_from_cpu_storage(&cpu)
+    }
+
+    fn rand_normal(&self, shape: &Shape, dtype: DType, mean: f64, std: f64) -> Result<Self::Storage> {
+        let cpu = crate::cpu_backend::CpuDevice.rand_normal(shape, dtype, mean, std)?;
+        self.storage_from_cpu_storage(&cpu)
+    }
+
+    fn synchronize(&self) -> Result<()> {
+        self.finish()?;
+        self.check_fault()
+    }
+}
+
+/// Rows up to which `fwd` runs the fused dequantize-and-dot GEMV instead of
+/// dequantizing the whole weight once and running the tiled GEMM.
+fn qgemv_max_rows(dtype: crate::quantized::GgmlDType) -> usize {
+    use crate::quantized::GgmlDType::*;
+    if kernels::qgemv_multirow(dtype) {
+        return kernels::QGEMV_MR_MAX_ROWS;
+    }
+    match dtype {
+        F16 | BF16 => 16,
+        Q2K | Q3K | Q4K | Q5K | Q6K | Q8K | Iq2Xxs => 4,
+        _ => 8,
+    }
+}
+
+/// A GGUF-block-quantized tensor held on the SYCL device in its on-disk
+/// format (mirror of `QOpenClStorage` without the zero-copy host mappings).
+pub struct QSyclStorage {
+    pub buffer: usize,
+    pub byte_offset: u64,
+    pub dtype: crate::quantized::GgmlDType,
+    pub elem_count: usize,
+    pub device: SyclDevice,
+}
+
+impl std::fmt::Debug for QSyclStorage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "QSyclStorage({:?}, {} elems)", self.dtype, self.elem_count)
+    }
+}
+
+impl Drop for QSyclStorage {
+    fn drop(&mut self) {
+        if self.buffer != 0 {
+            let fns = self.device.bridge.fns;
+            unsafe { (fns.free)(self.buffer) };
+        }
+    }
+}
+
+impl QSyclStorage {
+    fn bytes_for(dtype: crate::quantized::GgmlDType, elem_count: usize) -> Result<usize> {
+        let bs = dtype.block_size();
+        if !elem_count.is_multiple_of(bs) {
+            return Err(Error::Msg(format!(
+                "sycl: {elem_count} elements is not a whole number of {dtype:?} blocks"
+            )));
+        }
+        Ok(elem_count / bs * dtype.type_size())
+    }
+
+    pub fn zeros(device: &SyclDevice, elem_count: usize, dtype: crate::quantized::GgmlDType) -> Result<Self> {
+        let bytes = Self::bytes_for(dtype, elem_count)?;
+        let buffer = device.alloc_raw(bytes)?;
+        if bytes > 0 {
+            device.write_bytes(buffer, 0, &vec![0u8; bytes])?;
+        }
+        Ok(Self { buffer, byte_offset: 0, dtype, elem_count, device: device.clone() })
+    }
+
+    /// Upload raw block bytes (a blocking write on the compute queue).
+    pub fn from_bytes(device: &SyclDevice, dtype: crate::quantized::GgmlDType, elem_count: usize, data: &[u8]) -> Result<Self> {
+        let bytes = Self::bytes_for(dtype, elem_count)?;
+        if data.len() < bytes {
+            return Err(Error::Msg(format!(
+                "sycl: {} bytes given for a {dtype:?} tensor needing {bytes}",
+                data.len()
+            )));
+        }
+        let buffer = device.alloc_raw(bytes)?;
+        if let Err(e) = device.write_bytes(buffer, 0, &data[..bytes]) {
+            let fns = device.bridge.fns;
+            unsafe { (fns.free)(buffer) };
+            return Err(e);
+        }
+        Ok(Self { buffer, byte_offset: 0, dtype, elem_count, device: device.clone() })
+    }
+
+    pub fn dtype(&self) -> crate::quantized::GgmlDType {
+        self.dtype
+    }
+
+    pub fn device(&self) -> &SyclDevice {
+        &self.device
+    }
+
+    pub fn storage_size_in_bytes(&self) -> usize {
+        Self::bytes_for(self.dtype, self.elem_count).unwrap_or(0)
+    }
+
+    /// Read the block bytes back to the host.
+    pub fn data(&self) -> Result<Vec<u8>> {
+        let bytes = self.storage_size_in_bytes();
+        let mut out = vec![0u8; bytes];
+        self.device.read_bytes(self.buffer, self.byte_offset as usize, &mut out)?;
+        self.device.check_fault()?;
+        Ok(out)
+    }
+
+    /// Dequantize to an f32 storage on the device.
+    pub fn dequantize(&self, elem_count: usize) -> Result<SyclStorage> {
+        let out = self.device.alloc(DType::F32, elem_count)?;
+        self.dequantize_into(out.buffer, elem_count)?;
+        Ok(out)
+    }
+
+    fn dequantize_into(&self, out: usize, elem_count: usize) -> Result<()> {
+        use crate::quantized::GgmlDType;
+        match self.dtype {
+            GgmlDType::F32 => {
+                // Dense f32 weights: a straight device-to-device copy.
+                let bytes = self.storage_size_in_bytes();
+                let mut tmp = vec![0u8; bytes];
+                self.device.read_bytes(self.buffer, self.byte_offset as usize, &mut tmp)?;
+                self.device.write_bytes(out, 0, &tmp)
+            }
+            _ => kernels::run_dequant(&self.device, self.dtype, self.buffer, out, elem_count, self.byte_offset),
+        }
+    }
+
+    /// Quantized matmul: `out[m, n] = x[m, k] @ W[n, k]` — the same routing
+    /// as `QOpenClStorage::fwd` (GEMV for decode rows, dequantize + GEMM for
+    /// prefill).
+    pub fn fwd(&self, self_shape: &Shape, storage: &SyclStorage, layout: &Layout) -> Result<(SyclStorage, Shape)> {
+        if storage.dtype != DType::F32 {
+            return Err(Error::Msg(format!(
+                "sycl qmatmul: input must be f32, got {:?}",
+                storage.dtype
+            )));
+        }
+        let Some((o1, _)) = layout.contiguous_offsets() else {
+            return Err(Error::Msg(format!("sycl qmatmul: input tensor is not contiguous {layout:?}")));
+        };
+        let (n, k) = self_shape.dims2()?;
+        let src_shape = layout.shape();
+        if src_shape.rank() < 2 {
+            return Err(Error::Msg(format!("sycl qmatmul: input has only one dimension {layout:?}")));
+        }
+        let mut dst_dims = src_shape.dims().to_vec();
+        let last_k = dst_dims.pop().unwrap();
+        if last_k != k {
+            return Err(Error::Msg(format!(
+                "sycl qmatmul: input {layout:?} incompatible with {self_shape:?}"
+            )));
+        }
+        dst_dims.push(n);
+        let dst_shape = Shape::from(dst_dims);
+        let m = src_shape.elem_count() / k;
+        let out = self.device.alloc(DType::F32, m * n)?;
+        match self.dtype {
+            crate::quantized::GgmlDType::F32 => {
+                let sa = MatStrides { row: k, col: 1, offset: o1, batch: 0 };
+                let sb = MatStrides { row: 1, col: k, offset: (self.byte_offset / 4) as usize, batch: 0 };
+                kernels::run_matmul(&self.device, storage.buffer, self.buffer, out.buffer, (1, m, n, k), sa, sb)?;
+            }
+            crate::quantized::GgmlDType::F16 | crate::quantized::GgmlDType::BF16 if m <= qgemv_max_rows(self.dtype) => {
+                kernels::run_hgemv(
+                    &self.device,
+                    self.dtype == crate::quantized::GgmlDType::BF16,
+                    storage.buffer,
+                    self.buffer,
+                    out.buffer,
+                    m,
+                    n,
+                    k,
+                    self.byte_offset,
+                    o1,
+                )?;
+            }
+            _ if m <= qgemv_max_rows(self.dtype) => {
+                kernels::run_qgemv(&self.device, self.dtype, storage.buffer, self.buffer, out.buffer, m, n, k, self.byte_offset, o1)?;
+            }
+            _ => {
+                let sa = MatStrides { row: k, col: 1, offset: o1, batch: 0 };
+                let sb = MatStrides { row: 1, col: k, offset: 0, batch: 0 };
+                let bytes = n * k * 4;
+                if bytes <= 1 << 30 {
+                    let scratch = self.device.scratch(bytes)?;
+                    self.dequantize_into(scratch.buffer, n * k)?;
+                    kernels::run_matmul(&self.device, storage.buffer, scratch.buffer, out.buffer, (1, m, n, k), sa, sb)?;
+                } else {
+                    let w = self.dequantize(n * k)?;
+                    kernels::run_matmul(&self.device, storage.buffer, w.buffer, out.buffer, (1, m, n, k), sa, sb)?;
+                }
+            }
+        }
+        Ok((out, dst_shape))
+    }
+
+    /// Gather rows `ids` of this `[rows, hidden]` table as f32 `[n_ids, hidden]`.
+    pub fn embedding(&self, rows: usize, hidden: usize, ids: &SyclStorage, ids_l: &Layout) -> Result<SyclStorage> {
+        let (ids_s, ids_off) = ids.ids_u32(ids_l)?;
+        let n_ids = ids_l.shape().elem_count();
+        let out = self.device.alloc(DType::F32, n_ids * hidden)?;
+        let fslot = crate::fault_slot::current() as i32;
+        match self.dtype {
+            crate::quantized::GgmlDType::F32 => {
+                kernels::run_index_select(
+                    &self.device,
+                    false,
+                    false,
+                    self.buffer,
+                    ids_s.buffer,
+                    out.buffer,
+                    n_ids * hidden,
+                    1,
+                    n_ids,
+                    hidden,
+                    rows,
+                    (self.byte_offset / 4) as usize,
+                    ids_off,
+                    self.device.fault,
+                    fslot,
+                )?;
+            }
+            crate::quantized::GgmlDType::F16 | crate::quantized::GgmlDType::BF16 => {
+                kernels::run_hembed(
+                    &self.device,
+                    self.dtype == crate::quantized::GgmlDType::BF16,
+                    self.buffer,
+                    ids_s.buffer,
+                    out.buffer,
+                    n_ids,
+                    hidden,
+                    rows,
+                    self.byte_offset,
+                    ids_off,
+                    self.device.fault,
+                    fslot,
+                )?;
+            }
+            _ => {
+                kernels::run_qembed(
+                    &self.device,
+                    self.dtype,
+                    self.buffer,
+                    ids_s.buffer,
+                    out.buffer,
+                    n_ids,
+                    hidden,
+                    rows,
+                    self.byte_offset,
+                    ids_off,
+                    self.device.fault,
+                    fslot,
+                )?
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Open a SYCL device and initialise its fault buffer.
+pub fn new_sycl_device(ordinal: usize) -> Result<SyclDevice> {
+    let mut dev = SyclDevice::new(ordinal)?;
+    dev.init_fault()?;
+    Ok(dev)
+}

@@ -255,12 +255,13 @@ impl Architecture {
     }
 
     /// Whether the routed experts must stay in host RAM *given the active
-    /// device*.  `DeepSeek4` experts may run on an OpenCL device (which has
-    /// the IQ2_XXS kernel); on every other device (CPU, Vulkan, Metal, CUDA)
-    /// they are host-only.  Non-MoE architectures never force host experts.
+    /// device*.  `DeepSeek4` experts may run on an OpenCL or SYCL device
+    /// (both have the IQ2_XXS kernel); on every other device (CPU, Vulkan,
+    /// Metal, CUDA) they are host-only.  Non-MoE architectures never force
+    /// host experts.
     pub fn experts_always_on_host_for(&self, device: &Device) -> bool {
         match self {
-            Self::DeepSeek4 => !device.is_opencl(),
+            Self::DeepSeek4 => !(device.is_opencl() || device.is_sycl()),
             _ => false,
         }
     }

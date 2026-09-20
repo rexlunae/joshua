@@ -233,6 +233,9 @@ pub enum ComputeBackend {
     /// cargo feature and a system libvulkan.so.  Bring-up target is the AMD
     /// Renoir iGPU (unified memory, host-visible+coherent round-trip fast path).
     Vulkan,
+    /// Intel SYCL / oneAPI DPC++.  Requires the `sycl` cargo feature and the
+    /// oneAPI runtime.  Bring-up target is the Arc Pro B50.
+    Sycl,
 }
 
 /// Construction options for [`Engine`].
@@ -1609,6 +1612,33 @@ impl Engine {
                     Err(JoshuaError::ModelLoad(
                         "Vulkan device requested but this build has no `vulkan` feature. \
                          Rebuild with `cargo build --features vulkan`, or pass --device cpu / auto."
+                            .to_string(),
+                    ))
+                }
+            }
+            ComputeBackend::Sycl => {
+                #[cfg(feature = "sycl")]
+                {
+                    let device = Device::new_sycl(0).map_err(|e| {
+                        JoshuaError::ModelLoad(format!(
+                            "SYCL device requested but unavailable: {e}. \
+                             Build with `--features sycl` and load the oneAPI runtime, or pass --device cpu / auto."
+                        ))
+                    })?;
+                    if let Ok(s) = device.as_sycl_device() {
+                        tracing::info!(
+                            "SYCL device: {} ({} MiB global memory; native kernels on)",
+                            s.name(),
+                            s.global_mem_size().unwrap_or(0) >> 20,
+                        );
+                    }
+                    Ok(device)
+                }
+                #[cfg(not(feature = "sycl"))]
+                {
+                    Err(JoshuaError::ModelLoad(
+                        "SYCL device requested but this build has no `sycl` feature. \
+                         Rebuild with `cargo build --features sycl`, or pass --device cpu / auto."
                             .to_string(),
                     ))
                 }

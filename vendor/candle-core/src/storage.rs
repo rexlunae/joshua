@@ -1,7 +1,7 @@
 use crate::backend::{BackendDevice, BackendStorage};
 use crate::op::{self, CmpOp, ReduceOp};
 use crate::scalar::Scalar;
-use crate::{CpuStorage, CudaStorage, DType, Device, Error, Layout, MetalStorage, OpenClStorage, Result, Shape, VulkanStorage};
+use crate::{CpuStorage, CudaStorage, DType, Device, Error, Layout, MetalStorage, OpenClStorage, SyclStorage, Result, Shape, VulkanStorage};
 use crate::{CustomOp1, CustomOp2, CustomOp3, InplaceOp1, InplaceOp2, InplaceOp3};
 
 // We do not want to implement Clone on Storage as cloning may fail because of
@@ -12,6 +12,7 @@ pub enum Storage {
     Cuda(CudaStorage),
     Metal(MetalStorage),
     OpenCl(OpenClStorage),
+    Sycl(SyclStorage),
     Vulkan(VulkanStorage),
 }
 
@@ -31,6 +32,10 @@ impl Storage {
                 let storage = storage.try_clone(layout)?;
                 Ok(Self::OpenCl(storage))
             }
+            Self::Sycl(storage) => {
+                let storage = storage.try_clone(layout)?;
+                Ok(Self::Sycl(storage))
+            }
             Self::Vulkan(storage) => {
                 let storage = storage.try_clone(layout)?;
                 Ok(Self::Vulkan(storage))
@@ -44,6 +49,7 @@ impl Storage {
             Self::Cuda(storage) => Device::Cuda(storage.device().clone()),
             Self::Metal(storage) => Device::Metal(storage.device().clone()),
             Self::OpenCl(storage) => Device::OpenCl(storage.device().clone()),
+            Self::Sycl(storage) => Device::Sycl(storage.device().clone()),
             Self::Vulkan(storage) => Device::Vulkan(storage.device().clone()),
         }
     }
@@ -54,6 +60,7 @@ impl Storage {
             Self::Cuda(storage) => storage.dtype(),
             Self::Metal(storage) => storage.dtype(),
             Self::OpenCl(storage) => storage.dtype(),
+            Self::Sycl(storage) => storage.dtype(),
             Self::Vulkan(storage) => storage.dtype(),
         }
     }
@@ -96,6 +103,7 @@ impl Storage {
             Storage::Cuda(storage) => storage.const_set(v, l),
             Storage::Metal(storage) => storage.const_set(v, l),
             Storage::OpenCl(storage) => storage.const_set(v, l),
+            Storage::Sycl(storage) => storage.const_set(v, l),
             Storage::Vulkan(storage) => storage.const_set(v, l),
         }
     }
@@ -117,6 +125,10 @@ impl Storage {
             Self::OpenCl(storage) => {
                 let storage = storage.affine(layout, mul, add)?;
                 Ok(Self::OpenCl(storage))
+            }
+            Self::Sycl(storage) => {
+                let storage = storage.affine(layout, mul, add)?;
+                Ok(Self::Sycl(storage))
             }
             Self::Vulkan(storage) => {
                 let storage = storage.affine(layout, mul, add)?;
@@ -143,6 +155,10 @@ impl Storage {
                 let storage = storage.powf(layout, alpha)?;
                 Ok(Self::OpenCl(storage))
             }
+            Self::Sycl(storage) => {
+                let storage = storage.powf(layout, alpha)?;
+                Ok(Self::Sycl(storage))
+            }
             Self::Vulkan(storage) => {
                 let storage = storage.powf(layout, alpha)?;
                 Ok(Self::Vulkan(storage))
@@ -167,6 +183,10 @@ impl Storage {
             Self::OpenCl(storage) => {
                 let storage = storage.elu(layout, alpha)?;
                 Ok(Self::OpenCl(storage))
+            }
+            Self::Sycl(storage) => {
+                let storage = storage.elu(layout, alpha)?;
+                Ok(Self::Sycl(storage))
             }
             Self::Vulkan(storage) => {
                 let storage = storage.elu(layout, alpha)?;
@@ -236,6 +256,10 @@ impl Storage {
                 let storage = storage.reduce_op(op, layout, s)?;
                 Ok(Self::OpenCl(storage))
             }
+            Self::Sycl(storage) => {
+                let storage = storage.reduce_op(op, layout, s)?;
+                Ok(Self::Sycl(storage))
+            }
             Self::Vulkan(storage) => {
                 let storage = storage.reduce_op(op, layout, s)?;
                 Ok(Self::Vulkan(storage))
@@ -261,6 +285,10 @@ impl Storage {
                 let storage = storage.to_dtype(layout, dtype)?;
                 Ok(Self::OpenCl(storage))
             }
+            Self::Sycl(storage) => {
+                let storage = storage.to_dtype(layout, dtype)?;
+                Ok(Self::Sycl(storage))
+            }
             Self::Vulkan(storage) => {
                 let storage = storage.to_dtype(layout, dtype)?;
                 Ok(Self::Vulkan(storage))
@@ -285,6 +313,10 @@ impl Storage {
             Self::OpenCl(storage) => {
                 let (storage, shape) = c.opencl_fwd(storage, l)?;
                 Ok((Self::OpenCl(storage), shape))
+            }
+            Self::Sycl(storage) => {
+                let (storage, shape) = c.sycl_fwd(storage, l)?;
+                Ok((Self::Sycl(storage), shape))
             }
             Self::Vulkan(storage) => {
                 let (storage, shape) = c.vulkan_fwd(storage, l)?;
@@ -368,6 +400,13 @@ impl Storage {
             Self::Cuda(storage) => c.cuda_fwd(storage, l),
             Self::Metal(storage) => c.metal_fwd(storage, l),
             Self::OpenCl(storage) => {
+                let mut cpu = storage.to_cpu_storage()?;
+                c.cpu_fwd(&mut cpu, l)?;
+                let dev = storage.device.clone();
+                *storage = dev.storage_from_cpu_storage(&cpu)?;
+                Ok(())
+            }
+            Self::Sycl(storage) => {
                 let mut cpu = storage.to_cpu_storage()?;
                 c.cpu_fwd(&mut cpu, l)?;
                 let dev = storage.device.clone();
@@ -472,6 +511,10 @@ impl Storage {
             Self::OpenCl(storage) => {
                 let storage = storage.unary_impl::<B>(layout)?;
                 Ok(Self::OpenCl(storage))
+            }
+            Self::Sycl(storage) => {
+                let storage = storage.unary_impl::<B>(layout)?;
+                Ok(Self::Sycl(storage))
             }
             Self::Vulkan(storage) => {
                 let storage = storage.unary_impl::<B>(layout)?;
@@ -701,6 +744,10 @@ impl Storage {
                 let storage = storage.avg_pool2d(layout, kernel_size, stride)?;
                 Ok(Self::OpenCl(storage))
             }
+            Self::Sycl(storage) => {
+                let storage = storage.avg_pool2d(layout, kernel_size, stride)?;
+                Ok(Self::Sycl(storage))
+            }
             Self::Vulkan(storage) => {
                 let storage = storage.avg_pool2d(layout, kernel_size, stride)?;
                 Ok(Self::Vulkan(storage))
@@ -731,6 +778,10 @@ impl Storage {
                 let storage = storage.max_pool2d(layout, kernel_size, stride)?;
                 Ok(Self::OpenCl(storage))
             }
+            Self::Sycl(storage) => {
+                let storage = storage.max_pool2d(layout, kernel_size, stride)?;
+                Ok(Self::Sycl(storage))
+            }
             Self::Vulkan(storage) => {
                 let storage = storage.max_pool2d(layout, kernel_size, stride)?;
                 Ok(Self::Vulkan(storage))
@@ -756,6 +807,10 @@ impl Storage {
                 let storage = storage.upsample_nearest1d(layout, sz)?;
                 Ok(Self::OpenCl(storage))
             }
+            Self::Sycl(storage) => {
+                let storage = storage.upsample_nearest1d(layout, sz)?;
+                Ok(Self::Sycl(storage))
+            }
             Self::Vulkan(storage) => {
                 let storage = storage.upsample_nearest1d(layout, sz)?;
                 Ok(Self::Vulkan(storage))
@@ -780,6 +835,10 @@ impl Storage {
             Self::OpenCl(storage) => {
                 let storage = storage.upsample_nearest2d(layout, h, w)?;
                 Ok(Self::OpenCl(storage))
+            }
+            Self::Sycl(storage) => {
+                let storage = storage.upsample_nearest2d(layout, h, w)?;
+                Ok(Self::Sycl(storage))
             }
             Self::Vulkan(storage) => {
                 let storage = storage.upsample_nearest2d(layout, h, w)?;
@@ -817,6 +876,11 @@ impl Storage {
                 let storage =
                     storage.upsample_bilinear2d(layout, h, w, align_corners, scale_h, scale_w)?;
                 Ok(Self::OpenCl(storage))
+            }
+            Self::Sycl(storage) => {
+                let storage =
+                    storage.upsample_bilinear2d(layout, h, w, align_corners, scale_h, scale_w)?;
+                Ok(Self::Sycl(storage))
             }
             Self::Vulkan(storage) => {
                 let storage =

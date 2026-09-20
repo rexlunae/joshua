@@ -87,6 +87,11 @@ impl Device {
                 // kernels dequantize inside the matmul.
                 Ok(QStorage::OpenCl(crate::QOpenClStorage::zeros(ocl, elem_count, dtype)?))
             }
+            Device::Sycl(s) => {
+                // Blocks stay in their GGUF format on the device; the SYCL
+                // kernels dequantize inside the matmul.
+                Ok(QStorage::Sycl(crate::QSyclStorage::zeros(s, elem_count, dtype)?))
+            }
             Device::Vulkan(vk) => {
                 // Blocks stay in their GGUF format on the device; the Vulkan
                 // kernels dequantize inside the matmul.
@@ -163,11 +168,17 @@ fn vulkan_note_fallback(op: &str, why: Option<&crate::Error>) {
 #[cfg(not(feature = "vulkan"))]
 fn vulkan_note_fallback(_op: &str, _why: Option<&crate::Error>) {}
 
+#[cfg(feature = "sycl")]
+fn sycl_note_fallback(_op: &str, _why: Option<&crate::Error>) {}
+#[cfg(not(feature = "sycl"))]
+fn sycl_note_fallback(_op: &str, _why: Option<&crate::Error>) {}
+
 pub enum QStorage {
     Cpu(Box<dyn QuantizedType>),
     Metal(metal::QMetalStorage),
     Cuda(cuda::QCudaStorage),
     OpenCl(crate::QOpenClStorage),
+    Sycl(crate::QSyclStorage),
     Vulkan(crate::QVulkanStorage),
 }
 
@@ -222,6 +233,11 @@ impl QStorage {
                 let elem_count = data.len() / dtype.type_size() * dtype.block_size();
                 Ok(QStorage::Vulkan(crate::QVulkanStorage::from_bytes(d, dtype, elem_count, data)?))
             }
+            Device::Sycl(d) => {
+                // Every block format is uploaded as-is; see `QSyclStorage`.
+                let elem_count = data.len() / dtype.type_size() * dtype.block_size();
+                Ok(QStorage::Sycl(crate::QSyclStorage::from_bytes(d, dtype, elem_count, data)?))
+            }
         }
     }
 
@@ -247,6 +263,7 @@ impl QStorage {
             QStorage::Metal(storage) => storage.dtype().block_size(),
             QStorage::Cuda(storage) => storage.dtype().block_size(),
             QStorage::OpenCl(storage) => storage.dtype().block_size(),
+            QStorage::Sycl(storage) => storage.dtype().block_size(),
             QStorage::Vulkan(storage) => storage.dtype().block_size(),
         }
     }
@@ -257,6 +274,7 @@ impl QStorage {
             QStorage::Metal(storage) => storage.dtype(),
             QStorage::Cuda(storage) => storage.dtype(),
             QStorage::OpenCl(storage) => storage.dtype(),
+            QStorage::Sycl(storage) => storage.dtype(),
             QStorage::Vulkan(storage) => storage.dtype(),
         }
     }
@@ -267,6 +285,7 @@ impl QStorage {
             QStorage::Metal(storage) => Device::Metal(storage.device().clone()),
             QStorage::Cuda(storage) => Device::Cuda(storage.device().clone()),
             QStorage::OpenCl(storage) => Device::OpenCl(storage.device().clone()),
+            QStorage::Sycl(storage) => Device::Sycl(storage.device().clone()),
             QStorage::Vulkan(storage) => Device::Vulkan(storage.device().clone()),
         }
     }
@@ -277,6 +296,7 @@ impl QStorage {
             QStorage::Metal(storage) => storage.storage_size_in_bytes(),
             QStorage::Cuda(storage) => storage.storage_size_in_bytes(),
             QStorage::OpenCl(storage) => storage.storage_size_in_bytes(),
+            QStorage::Sycl(storage) => storage.storage_size_in_bytes(),
             QStorage::Vulkan(storage) => storage.storage_size_in_bytes(),
         }
     }
@@ -391,6 +411,7 @@ impl QStorage {
             QStorage::Metal(storage) => Ok(Storage::Metal(storage.dequantize(elem_count)?)),
             QStorage::Cuda(storage) => Ok(Storage::Cuda(storage.dequantize(elem_count)?)),
             QStorage::OpenCl(storage) => Ok(Storage::OpenCl(storage.dequantize(elem_count)?)),
+            QStorage::Sycl(storage) => Ok(Storage::Sycl(storage.dequantize(elem_count)?)),
             QStorage::Vulkan(storage) => Ok(Storage::Vulkan(storage.dequantize(elem_count)?)),
         }
     }
@@ -406,6 +427,7 @@ impl QStorage {
             QStorage::Cuda(storage) => Ok(Cow::from(storage.data()?)),
             QStorage::Metal(storage) => Ok(Cow::from(storage.data()?)),
             QStorage::OpenCl(storage) => Ok(Cow::from(storage.data()?)),
+            QStorage::Sycl(storage) => Ok(Cow::from(storage.data()?)),
             QStorage::Vulkan(storage) => Ok(Cow::from(storage.data()?)),
         }
     }
@@ -413,7 +435,7 @@ impl QStorage {
     pub fn device_ptr(&self) -> Result<*const u8> {
         match self {
             QStorage::Cuda(storage) => storage.device_ptr(),
-            QStorage::OpenCl(_) | QStorage::Metal(_) | QStorage::Cpu(_) | QStorage::Vulkan(_) => {
+            QStorage::OpenCl(_) | QStorage::Metal(_) | QStorage::Cpu(_) | QStorage::Sycl(_) | QStorage::Vulkan(_) => {
                 crate::bail!("not implemented");
             }
         }
@@ -913,6 +935,25 @@ impl QTensor {
                 }
                 _ => unreachable!("ids were moved to the QTensor device"),
             },
+            QStorage::Sycl(storage) => {
+                use crate::backend::BackendDevice;
+                let native = match &*ids.storage() {
+                    Storage::Sycl(ids_storage) => {
+                        match storage.embedding(rows, hidden, ids_storage, ids.layout()) {
+                            Ok(out) => Some(out),
+                            Err(_) => None,
+                        }
+                    }
+                    _ => unreachable!("ids were moved to the QTensor device"),
+                };
+                match native {
+                    Some(out) => Storage::Sycl(out),
+                    None => {
+                        let out = self.cpu_embedding(&ids, rows, hidden)?;
+                        Storage::Sycl(storage.device().storage_from_cpu_storage(&out)?)
+                    }
+                }
+            }
             QStorage::OpenCl(storage) => {
                 use crate::backend::BackendDevice;
                 let native = if opencl_native() {
@@ -1029,7 +1070,7 @@ impl QTensor {
     pub fn device_ptr(&self) -> Result<*const u8> {
         match &self.storage {
             QStorage::Cuda(storage) => storage.device_ptr(),
-            QStorage::OpenCl(_) | QStorage::Metal(_) | QStorage::Cpu(_) | QStorage::Vulkan(_) => {
+            QStorage::OpenCl(_) | QStorage::Metal(_) | QStorage::Cpu(_) | QStorage::Sycl(_) | QStorage::Vulkan(_) => {
                 crate::bail!("not implemented");
             }
         }
@@ -1168,7 +1209,7 @@ impl crate::CustomOp1 for QTensor {
         #[allow(clippy::infallible_destructuring_match)]
         let self_storage = match &self.storage {
             QStorage::Cpu(storage) => storage,
-            QStorage::OpenCl(_) | QStorage::Metal(_) | QStorage::Cuda(_) | QStorage::Vulkan(_) => {
+            QStorage::OpenCl(_) | QStorage::Metal(_) | QStorage::Cuda(_) | QStorage::Sycl(_) | QStorage::Vulkan(_) => {
                 crate::bail!("Invalid storage")
             }
         };
@@ -1298,7 +1339,7 @@ impl crate::CustomOp1 for QTensor {
         use crate::backend::BackendDevice;
         let self_storage = match &self.storage {
             QStorage::Vulkan(vk) => vk,
-            _ => unreachable!("Cannot call vulkan matmul on non vulkan QTensor"),
+            _ => unreachable!("Cannot call sycl matmul on non sycl QTensor"),
         };
         if vulkan_native() {
             match self_storage.fwd(&self.shape, storage, layout) {
@@ -1313,6 +1354,27 @@ impl crate::CustomOp1 for QTensor {
         let (out, shape) = crate::CustomOp1::cpu_fwd(&cpu_q, &cpu_in, layout)?;
         Ok((self_storage.device().storage_from_cpu_storage(&out)?, shape))
     }
+
+fn sycl_fwd(
+        &self,
+        storage: &crate::SyclStorage,
+        layout: &crate::Layout,
+    ) -> Result<(crate::SyclStorage, Shape)> {
+        use crate::backend::BackendDevice;
+        let self_storage = match &self.storage {
+            QStorage::Sycl(s) => s,
+            _ => unreachable!("Cannot call sycl matmul on non sycl QTensor"),
+        };
+        match self_storage.fwd(&self.shape, storage, layout) {
+            Ok(out) => return Ok(out),
+            Err(e) => sycl_note_fallback("qmatmul", Some(&e)),
+        }
+        let cpu_q = self.cpu_copy()?;
+        let cpu_in = storage.to_cpu_storage()?;
+        let (out, shape) = crate::CustomOp1::cpu_fwd(&cpu_q, &cpu_in, layout)?;
+        Ok((self_storage.device().storage_from_cpu_storage(&out)?, shape))
+    }
+
 }
 
 impl crate::Module for QMatMul {

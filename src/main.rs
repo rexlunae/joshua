@@ -44,6 +44,10 @@ enum DeviceArg {
     /// vulkan`; use `--device vulkan`). Bring-up target is the AMD Renoir iGPU.
     #[value(name = "vulkan")]
     Vulkan,
+    /// Intel SYCL / oneAPI DPC++ (build with `--features sycl`; use `--device
+    /// sycl`). Bring-up target is the Arc Pro B50.
+    #[value(name = "sycl")]
+    Sycl,
 }
 
 impl From<DeviceArg> for ComputeBackend {
@@ -55,6 +59,7 @@ impl From<DeviceArg> for ComputeBackend {
             DeviceArg::Cuda => ComputeBackend::Cuda,
             DeviceArg::OpenCl => ComputeBackend::OpenCl,
             DeviceArg::Vulkan => ComputeBackend::Vulkan,
+            DeviceArg::Sycl => ComputeBackend::Sycl,
         }
     }
 }

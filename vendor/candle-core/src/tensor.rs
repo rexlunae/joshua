@@ -677,6 +677,7 @@ impl Tensor {
             Storage::Cuda(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
             Storage::Metal(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
             Storage::OpenCl(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
+            Storage::Sycl(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
             Storage::Vulkan(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
         }
     }
@@ -1951,6 +1952,7 @@ impl Tensor {
             Storage::Cuda(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
             Storage::Metal(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
             Storage::OpenCl(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
+            Storage::Sycl(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
             Storage::Vulkan(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
         }
     }
@@ -1984,6 +1986,7 @@ impl Tensor {
             Storage::Cuda(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
             Storage::Metal(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
             Storage::OpenCl(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
+            Storage::Sycl(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
             Storage::Vulkan(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
         }
     }
@@ -2027,6 +2030,7 @@ impl Tensor {
             Storage::Cuda(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
             Storage::Metal(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
             Storage::OpenCl(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
+            Storage::Sycl(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
             Storage::Vulkan(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
         }
     }

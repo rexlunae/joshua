@@ -64,6 +64,18 @@ pub trait CustomOp1 {
         Ok((dev.storage_from_cpu_storage(&out)?, shape))
     }
 
+    /// The forward pass on a SYCL device — the same contract as `opencl_fwd`.
+    fn sycl_fwd(
+        &self,
+        storage: &crate::SyclStorage,
+        layout: &Layout,
+    ) -> Result<(crate::SyclStorage, Shape)> {
+        let cpu = storage.to_cpu_storage()?;
+        let (out, shape) = self.cpu_fwd(&cpu, layout)?;
+        let dev = storage.device.clone();
+        Ok((dev.storage_from_cpu_storage(&out)?, shape))
+    }
+
     /// This function takes as argument the argument `arg` used in the forward pass, the result
     /// produced by the forward operation `res` and the gradient of the result `grad_res`.
     /// The function should return the gradient of the argument.
