@@ -176,6 +176,12 @@ unsafe fn dlopen_bridge() -> Result<Bridge, String> {
 
 fn bridge() -> crate::Result<&'static Bridge> {
     static BRIDGE: OnceLock<Result<&'static Bridge, String>> = OnceLock::new();
+    // The DPC++ runtime initialization (sycl::device::get_devices, queue
+    // creation) is not thread-safe on some driver versions: multiple threads
+    // racing the first SYCL call crash with SIGSEGV.  Serialize the entire
+    // dlopen + resolve + first device open behind a mutex.
+    static INIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _init = INIT.lock().unwrap();
     let bridge = BRIDGE.get_or_init(|| unsafe { dlopen_bridge().map(|b| &*Box::leak(Box::new(b))) });
     bridge.clone().map_err(|e| crate::Error::Msg(format!("sycl: {e}")))
 }
@@ -193,6 +199,8 @@ impl SyclDevice {
     pub fn new(ordinal: usize) -> crate::Result<Self> {
         let b = bridge()?;
         let fns = b.fns;
+        static DEV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _dev = DEV_LOCK.lock().unwrap();
         unsafe {
             let mut h: usize = 0;
             check((fns.open)(ordinal, &mut h), &fns)?;
