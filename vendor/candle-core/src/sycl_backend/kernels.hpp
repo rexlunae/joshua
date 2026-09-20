@@ -1138,7 +1138,7 @@ struct Kernels {
             int sam, int sak, int sbk, int sbn,
             int oa, int ob, int oc, int ba, int bb, int bc, int b_kc) const {
     auto &As = *reinterpret_cast<float (*)[TK][TM + 1]>(scratch + (0));
-    auto &Bs = *reinterpret_cast<float (*)[TK][TN + 1]>(scratch + (sizeof(float) * (TK * TM + 1)));
+    auto &Bs = *reinterpret_cast<float (*)[TK][TN + 1]>(scratch + (sizeof(float) * (TK * (TM + 1))));
     int tx = item.get_local_id(2 - 0), ty = item.get_local_id(2 - 1);
     int m0 = item.get_group(2 - 1) * TM, n0 = item.get_group(2 - 0) * TN;
     int bz = item.get_global_id(2 - 2);
