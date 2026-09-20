@@ -281,12 +281,13 @@ impl SyclDevice {
             g[0] = g[0].div_ceil(local[0]) * local[0];
         }
         let _lock = GLOBAL_LOCK.lock().unwrap();
+        let args = b.args();
         unsafe {
             check((self.fns.launch)(
                 self.handle,
                 name.as_ptr(),
-                b.args.as_ptr(),
-                b.args.len(),
+                args.as_ptr(),
+                args.len(),
                 g.as_ptr(),
                 local.as_ptr(),
             ), &self.fns)
@@ -414,14 +415,19 @@ impl SyclDevice {
 /// Launch-argument builder: an arena of 8-byte-aligned slots plus the
 /// `SyclArg` descriptors.  `Arg.size` must match the C++ `sizeof(T)` for the
 /// slot (8 for pointer/u64, 4 for int/float), which the bridge checks.
+///
+/// The descriptors are materialised only when the arena is final: taking
+/// `arena.as_ptr()` during the pushes would dangle every earlier argument
+/// the first time the Vec reallocates (a use-after-free that works until the
+/// heap layout changes, then segfaults inside the bridge's buffer lookup).
 pub struct ArgBuilder {
     arena: Vec<u8>,
-    args: Vec<SyclArg>,
+    layout: Vec<(usize, usize)>,
 }
 
 impl ArgBuilder {
     fn new() -> Self {
-        Self { arena: Vec::new(), args: Vec::new() }
+        Self { arena: Vec::new(), layout: Vec::new() }
     }
 
     fn push(&mut self, bytes: &[u8]) {
@@ -430,10 +436,17 @@ impl ArgBuilder {
         }
         let off = self.arena.len();
         self.arena.extend_from_slice(bytes);
-        self.args.push(SyclArg {
-            data: unsafe { self.arena.as_ptr().add(off) },
-            size: bytes.len(),
-        });
+        self.layout.push((off, bytes.len()));
+    }
+
+    fn args(&self) -> Vec<SyclArg> {
+        self.layout
+            .iter()
+            .map(|&(off, size)| SyclArg {
+                data: unsafe { self.arena.as_ptr().add(off) },
+                size,
+            })
+            .collect()
     }
 
     /// A kernel pointer argument: carries the buffer handle; the bridge
