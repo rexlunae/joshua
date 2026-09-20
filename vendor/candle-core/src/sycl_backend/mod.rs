@@ -81,6 +81,12 @@ unsafe fn last_error(fns: &SyclFns) -> String {
     }
 }
 
+/// Serializes ALL bridge operations.  The DPC++ runtime on the Arc B50
+/// crashes with SIGSEGV when multiple threads submit SYCL kernels
+/// concurrently, even through separate contexts.  The tests are correctness
+/// gates, not throughput benchmarks, so serialization is the safe choice.
+static GLOBAL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 unsafe fn check(rc: i32, fns: &SyclFns) -> crate::Result<()> {
     if rc == 0 {
         return Ok(());
@@ -228,6 +234,7 @@ impl SyclDevice {
     /// Allocate `bytes` on the device; returns the buffer handle used by the
     /// launchers and the read/write helpers.
     pub fn alloc(&self, bytes: usize) -> crate::Result<usize> {
+        let _lock = GLOBAL_LOCK.lock().unwrap();
         unsafe {
             let mut h: usize = 0;
             check((self.fns.alloc)(self.handle, bytes, &mut h), &self.fns)?;
@@ -240,10 +247,12 @@ impl SyclDevice {
     }
 
     pub fn write(&self, buffer: usize, off: usize, bytes: &[u8]) -> crate::Result<()> {
+        let _lock = GLOBAL_LOCK.lock().unwrap();
         unsafe { check((self.fns.write)(self.handle, buffer, off, bytes.len(), bytes.as_ptr()), &self.fns) }
     }
 
     pub fn read(&self, buffer: usize, off: usize, out: &mut [u8]) -> crate::Result<()> {
+        let _lock = GLOBAL_LOCK.lock().unwrap();
         unsafe { check((self.fns.read)(self.handle, buffer, off, out.len(), out.as_mut_ptr()), &self.fns) }
     }
 
@@ -253,6 +262,7 @@ impl SyclDevice {
 
     /// Block until all queued work completes.
     pub fn finish(&self) -> crate::Result<()> {
+        let _lock = GLOBAL_LOCK.lock().unwrap();
         unsafe { check((self.fns.finish)(self.handle), &self.fns) }
     }
 
@@ -270,6 +280,7 @@ impl SyclDevice {
         if local[1] == 1 && local[2] == 1 && local[0] > 1 {
             g[0] = g[0].div_ceil(local[0]) * local[0];
         }
+        let _lock = GLOBAL_LOCK.lock().unwrap();
         unsafe {
             check((self.fns.launch)(
                 self.handle,
