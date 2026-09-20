@@ -36,6 +36,10 @@ fn sycl_kernel_parity() {
         ("qgemv_q8_0", sycl_qgemv_q8_0_matches_cpu),
         ("hembed", sycl_hembed_matches_cpu),
     ];
+    let Some(dev) = device() else {
+        eprintln!("SKIP: no SYCL device");
+        return;
+    };
     eprintln!("SYCL device: {} ({} MiB)", dev.name(), dev.memory() / (1024 * 1024));
     for (name, test) in &tests {
         eprintln!("  {name}...");
