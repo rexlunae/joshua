@@ -111,10 +111,11 @@ fn main() {
         if let Some(b) = sycl_bandwidth(n, k, 60) { s.0 += b; }
         if let Some(b) = opencl_bandwidth(n, k, 60) { o.0 += b; }
     }
-    println!("aggregate streaming bandwidth: sycl {:.1} GB/s, opencl {:.1} GB/s", s.0, o.0);
-    // The engine streams ~2.3 GiB of expert weights per decode token.
-    let expert_gib = 2.3;
-    println!("projected expert-streaming decode: sycl ≈ {:.2} t/s, opencl ≈ {:.2} t/s",
-        s.0 / expert_gib, o.0 / expert_gib);
-    println!("(OpenCL engine measured end-to-end decode: 0.8 t/s on this model)");
+    // The per-stream rate is the projection input (2.3 GiB/token streams at
+    // one kernel's rate, not the sum of both shapes').
+    println!("aggregate bandwidth: sycl {:.1} GB/s, opencl {:.1} GB/s", s.0, o.0);
+    let expert_gb = 2.3 * 1.073741824_f64; // 2.3 GiB in GB
+    println!("pure-device compute ceiling: sycl ≈ {:.1} t/s, opencl ≈ {:.1} t/s",
+        s.0 / expert_gb, o.0 / expert_gb);
+    println!("(OpenCL engine measured end-to-end decode: 0.8 t/s — PCIe cache-miss streaming dominates)");
 }
