@@ -351,6 +351,13 @@ fn sycl_hembed_matches_cpu(dev: &SyclDevice) {
     dev.write(idb, 0, &ids.iter().flat_map(|v| v.to_ne_bytes()).collect::<Vec<u8>>()).unwrap();
     dev.run_hembed(wb, idb, ob, n_ids, k, false, 0, 0, vocab, faultb, 0).unwrap();
     dev.finish().unwrap();
+    // Overlap check: the kernel must not have corrupted the weight table.
+    let mut w_back = vec![0u8; f16_bytes.len()];
+    dev.read(wb, 0, &mut w_back).unwrap();
+    if w_back != f16_bytes {
+        let diffs = w_back.iter().zip(&f16_bytes).filter(|(a, b)| a != b).count();
+        eprintln!("WEIGHT TABLE CORRUPTED by the kernel: {diffs} bytes differ (output buffer overlaps W)");
+    }
     let mut out = vec![0u8; n_ids * k * 4];
     dev.read(ob, 0, &mut out).unwrap();
     let got = f32_from(&out);
