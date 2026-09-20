@@ -256,6 +256,7 @@ impl ArgBuilder {
 }
 
 /// An opened SYCL device: one bridge context handle.
+#[derive(Debug)]
 pub struct SyclDevice {
     bridge: &'static Bridge,
     handle: usize,
@@ -434,6 +435,7 @@ impl Clone for SyclDevice {
 }
 
 /// Storage on the SYCL device.
+#[derive(Debug)]
 pub struct SyclStorage {
     pub buffer: usize,
     pub dtype: DType,
@@ -1307,6 +1309,7 @@ fn qgemv_max_rows(dtype: crate::quantized::GgmlDType) -> usize {
 
 /// A GGUF-block-quantized tensor held on the SYCL device in its on-disk
 /// format (mirror of `QOpenClStorage` without the zero-copy host mappings).
+#[derive(Debug)]
 pub struct QSyclStorage {
     pub buffer: usize,
     pub byte_offset: u64,

@@ -120,6 +120,31 @@ pub fn cmp_code(op: crate::op::CmpOp) -> i32 {
     }
 }
 
+pub fn unary_code(name: &str) -> Option<i32> {
+    Some(match name {
+        "exp" => 0,
+        "log" => 1,
+        "sin" => 2,
+        "cos" => 3,
+        "tanh" => 4,
+        "neg" => 5,
+        "recip" => 6,
+        "sqr" => 7,
+        "sqrt" => 8,
+        "gelu" => 9,
+        "gelu_erf" => 10,
+        "erf" => 11,
+        "silu" => 12,
+        "relu" => 13,
+        "sigmoid" => 14,
+        "abs" => 15,
+        "ceil" => 16,
+        "floor" => 17,
+        "round" => 18,
+        _ => return None,
+    })
+}
+
 pub const RED_SUM: i32 = 0;
 pub const RED_MAX: i32 = 1;
 pub const RED_MIN: i32 = 2;
