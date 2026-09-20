@@ -18,7 +18,7 @@ using sycl::tanh; using sycl::sqrt; using sycl::erf; using sycl::fabs;
 using sycl::ceil; using sycl::floor; using sycl::round; using sycl::pow;
 using sycl::fmax; using sycl::fmin; using sycl::rsqrt; using sycl::isnan;
 using sycl::min; using sycl::max; using sycl::dot;
-constexpr int WG = 256;
+constexpr int WG = 64;
 inline float as_float(uint v) { return sycl::bit_cast<float>(v); }
 inline float vload_half(size_t i, const half* p) { return static_cast<float>(p[i]); }
 inline void vstore_half(float v, size_t i, half* p) { p[i] = half(v); }

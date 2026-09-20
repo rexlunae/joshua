@@ -24,7 +24,7 @@ use std::ffi::{c_char, c_void, CString};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-const WG: usize = 256; // matches kernels.hpp `constexpr int WG`
+const WG: usize = 64; // matches kernels.hpp `constexpr int WG`
 
 #[repr(C)]
 struct SyclArg {

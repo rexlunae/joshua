@@ -87,10 +87,10 @@ API int joshua_sycl_open(size_t ordinal, uintptr_t* out) noexcept {
         require(ordinal < devices.size(), "SYCL device ordinal out of range (or no device available)");
         auto dev = devices[ordinal];
         require(dev.has(sycl::aspect::usm_device_allocations), "SYCL device has no device USM support");
-        require(dev.get_info<sycl::info::device::max_work_group_size>() >= 256, "SYCL backend requires workgroups of 256 invocations");
+        require(dev.get_info<sycl::info::device::max_work_group_size>() >= 64, "SYCL backend requires workgroups of 64 invocations");
         require(dev.get_info<sycl::info::device::local_mem_size>() >= 16384, "SYCL backend requires 16 KiB of local memory");
         auto sizes = dev.get_info<sycl::info::device::max_work_item_sizes<3>>();
-        require(sizes[2] >= 256 && sizes[1] >= 16, "SYCL work item limits are too small");
+        require(sizes[2] >= 64 && sizes[1] >= 16, "SYCL work item limits are too small");
         *out = reinterpret_cast<uintptr_t>(new Handle(std::make_shared<Context>(dev)));
     });
 }
