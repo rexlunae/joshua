@@ -32,29 +32,48 @@ struct SyclArg {
     size: usize,
 }
 
-extern "C" {
-    fn joshua_sycl_error() -> *const c_char;
-    fn joshua_sycl_open(ordinal: usize, out: *mut usize) -> i32;
-    fn joshua_sycl_close(h: usize) -> i32;
-    fn joshua_sycl_info(h: usize, name: *mut u8, len: usize, memory: *mut u64) -> i32;
-    fn joshua_sycl_alloc(h: usize, size: usize, out: *mut usize) -> i32;
-    fn joshua_sycl_free(h: usize) -> i32;
-    fn joshua_sycl_finish(h: usize) -> i32;
-    fn joshua_sycl_write(h: usize, dst: usize, off: usize, size: usize, src: *const u8) -> i32;
-    fn joshua_sycl_read(h: usize, src: usize, off: usize, size: usize, dst: *mut u8) -> i32;
-    fn joshua_sycl_copy(h: usize, src: usize, dst: usize, so: usize, d: usize, size: usize) -> i32;
-    fn joshua_sycl_launch(
-        h: usize,
-        name: *const c_char,
-        args: *const SyclArg,
-        count: usize,
-        global: *const usize,
-        local: *const usize,
-    ) -> i32;
+/// C ABI function pointers, resolved from the dlopened bridge at startup.
+/// The bridge is loaded with `RTLD_GLOBAL` but the extern "C" declarations
+/// would still be undefined symbols at Rust link time — resolve them via
+/// libloading like every other runtime-loaded backend (vulkan, npu shim).
+#[derive(Clone, Copy)]
+pub struct SyclFns {
+    pub error: unsafe extern "C" fn() -> *const c_char,
+    pub open: unsafe extern "C" fn(ordinal: usize, out: *mut usize) -> i32,
+    pub close: unsafe extern "C" fn(h: usize) -> i32,
+    pub info: unsafe extern "C" fn(h: usize, name: *mut u8, len: usize, memory: *mut u64) -> i32,
+    pub alloc: unsafe extern "C" fn(h: usize, size: usize, out: *mut usize) -> i32,
+    pub free: unsafe extern "C" fn(h: usize) -> i32,
+    pub finish: unsafe extern "C" fn(h: usize) -> i32,
+    pub write: unsafe extern "C" fn(h: usize, dst: usize, off: usize, size: usize, src: *const u8) -> i32,
+    pub read: unsafe extern "C" fn(h: usize, src: usize, off: usize, size: usize, dst: *mut u8) -> i32,
+    pub copy: unsafe extern "C" fn(h: usize, src: usize, dst: usize, so: usize, d: usize, size: usize) -> i32,
+    pub launch: unsafe extern "C" fn(h: usize, name: *const c_char, args: *const SyclArg, count: usize, global: *const usize, local: *const usize) -> i32,
 }
 
-unsafe fn last_error() -> String {
-    let p = joshua_sycl_error();
+unsafe fn resolve(lib: &libloading::Library) -> Result<SyclFns, String> {
+    macro_rules! sym {
+        ($lib:expr, $name:literal) => {
+            *$lib.get::<unsafe extern "C" fn($($unused)*) -> ()>(b"joshua_sycl_dummy").unwrap_or_else(|_| unreachable!())
+        };
+    }
+    Ok(SyclFns {
+        error: *lib.get(b"joshua_sycl_error\0").map_err(|e| format!("joshua_sycl_error: {e}"))?,
+        open: *lib.get(b"joshua_sycl_open\0").map_err(|e| format!("joshua_sycl_open: {e}"))?,
+        close: *lib.get(b"joshua_sycl_close\0").map_err(|e| format!("joshua_sycl_close: {e}"))?,
+        info: *lib.get(b"joshua_sycl_info\0").map_err(|e| format!("joshua_sycl_info: {e}"))?,
+        alloc: *lib.get(b"joshua_sycl_alloc\0").map_err(|e| format!("joshua_sycl_alloc: {e}"))?,
+        free: *lib.get(b"joshua_sycl_free\0").map_err(|e| format!("joshua_sycl_free: {e}"))?,
+        finish: *lib.get(b"joshua_sycl_finish\0").map_err(|e| format!("joshua_sycl_finish: {e}"))?,
+        write: *lib.get(b"joshua_sycl_write\0").map_err(|e| format!("joshua_sycl_write: {e}"))?,
+        read: *lib.get(b"joshua_sycl_read\0").map_err(|e| format!("joshua_sycl_read: {e}"))?,
+        copy: *lib.get(b"joshua_sycl_copy\0").map_err(|e| format!("joshua_sycl_copy: {e}"))?,
+        launch: *lib.get(b"joshua_sycl_launch\0").map_err(|e| format!("joshua_sycl_launch: {e}"))?,
+    })
+}
+
+unsafe fn last_error(fns: &SyclFns) -> String {
+    let p = (fns.error)();
     if p.is_null() {
         "unknown SYCL error".to_string()
     } else {
@@ -62,11 +81,11 @@ unsafe fn last_error() -> String {
     }
 }
 
-unsafe fn check(rc: i32) -> crate::Result<()> {
+unsafe fn check(rc: i32, fns: &SyclFns) -> crate::Result<()> {
     if rc == 0 {
         return Ok(());
     }
-    crate::bail!("sycl: {}", last_error())
+    crate::bail!("sycl: {}", last_error(fns))
 }
 
 /// The dlopened bridge and SYCL runtime handles, intentionally leaked for the
@@ -74,6 +93,7 @@ unsafe fn check(rc: i32) -> crate::Result<()> {
 struct Bridge {
     _runtime: Option<libloading::os::unix::Library>,
     _bridge: libloading::os::unix::Library,
+    fns: SyclFns,
 }
 // Libraries are safe to share across threads; handles are used behind the
 // bridge's own internal mutex.
@@ -144,7 +164,10 @@ unsafe fn dlopen_bridge() -> Result<Bridge, String> {
             continue;
         }
         match dlopen_global(&path) {
-            Ok(lib) => return Ok(Bridge { _runtime: runtime, _bridge: lib }),
+            Ok(lib) => {
+                let fns = resolve(&lib).map_err(|e| format!("symbol resolution: {e}"))?;
+                return Ok(Bridge { _runtime: runtime, _bridge: lib, fns });
+            }
             Err(e) => last = e,
         }
     }
@@ -162,23 +185,26 @@ pub struct SyclDevice {
     handle: usize,
     name: String,
     memory: u64,
+    fns: SyclFns,
 }
 
 impl SyclDevice {
     /// Open SYCL device `ordinal` (the bridge prefers GPUs when present).
     pub fn new(ordinal: usize) -> crate::Result<Self> {
-        bridge()?;
+        let b = bridge()?;
+        let fns = b.fns;
         unsafe {
             let mut h: usize = 0;
-            check(joshua_sycl_open(ordinal, &mut h))?;
+            check((fns.open)(ordinal, &mut h), &fns)?;
             let mut name_buf = [0u8; 128];
             let mut memory: u64 = 0;
-            check(joshua_sycl_info(h, name_buf.as_mut_ptr(), name_buf.len(), &mut memory))?;
+            check((fns.info)(h, name_buf.as_mut_ptr(), name_buf.len(), &mut memory), &fns)?;
             let end = name_buf.iter().position(|&b| b == 0).unwrap_or(name_buf.len());
             Ok(Self {
                 handle: h,
                 name: String::from_utf8_lossy(&name_buf[..end]).into_owned(),
                 memory,
+                fns,
             })
         }
     }
@@ -196,30 +222,30 @@ impl SyclDevice {
     pub fn alloc(&self, bytes: usize) -> crate::Result<usize> {
         unsafe {
             let mut h: usize = 0;
-            check(joshua_sycl_alloc(self.handle, bytes, &mut h))?;
+            check((self.fns.alloc)(self.handle, bytes, &mut h), &self.fns)?;
             Ok(h)
         }
     }
 
     pub fn free(&self, buffer: usize) -> crate::Result<()> {
-        unsafe { check(joshua_sycl_free(buffer)) }
+        unsafe { check((self.fns.free)(buffer), &self.fns) }
     }
 
     pub fn write(&self, buffer: usize, off: usize, bytes: &[u8]) -> crate::Result<()> {
-        unsafe { check(joshua_sycl_write(self.handle, buffer, off, bytes.len(), bytes.as_ptr())) }
+        unsafe { check((self.fns.write)(self.handle, buffer, off, bytes.len(), bytes.as_ptr()), &self.fns) }
     }
 
     pub fn read(&self, buffer: usize, off: usize, out: &mut [u8]) -> crate::Result<()> {
-        unsafe { check(joshua_sycl_read(self.handle, buffer, off, out.len(), out.as_mut_ptr())) }
+        unsafe { check((self.fns.read)(self.handle, buffer, off, out.len(), out.as_mut_ptr()), &self.fns) }
     }
 
     pub fn copy(&self, src: usize, dst: usize, so: usize, d: usize, size: usize) -> crate::Result<()> {
-        unsafe { check(joshua_sycl_copy(self.handle, src, dst, so, d, size)) }
+        unsafe { check((self.fns.copy)(self.handle, src, dst, so, d, size), &self.fns) }
     }
 
     /// Block until all queued work completes.
     pub fn finish(&self) -> crate::Result<()> {
-        unsafe { check(joshua_sycl_finish(self.handle)) }
+        unsafe { check((self.fns.finish)(self.handle), &self.fns) }
     }
 
     fn launch(
@@ -237,14 +263,14 @@ impl SyclDevice {
             g[0] = g[0].div_ceil(local[0]) * local[0];
         }
         unsafe {
-            check(joshua_sycl_launch(
+            check((self.fns.launch)(
                 self.handle,
                 name.as_ptr(),
                 b.args.as_ptr(),
                 b.args.len(),
                 g.as_ptr(),
                 local.as_ptr(),
-            ))
+            ), &self.fns)
         }
     }
 
@@ -428,7 +454,7 @@ fn batch_max(ba: usize, bb: usize, bc: usize) -> usize {
 impl Drop for SyclDevice {
     fn drop(&mut self) {
         if self.handle != 0 {
-            unsafe { joshua_sycl_close(self.handle) };
+            unsafe { (self.fns.close)(self.handle) };
         }
     }
 }
