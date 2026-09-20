@@ -221,6 +221,10 @@ impl Storage {
                 let storage = lhs.cmp(op, rhs, lhs_layout, rhs_layout)?;
                 Ok(Self::OpenCl(storage))
             }
+            (Self::Sycl(lhs), Self::Sycl(rhs)) => {
+                let storage = lhs.cmp(op, rhs, lhs_layout, rhs_layout)?;
+                Ok(Self::Sycl(storage))
+            }
             (Self::Vulkan(lhs), Self::Vulkan(rhs)) => {
                 let storage = lhs.cmp(op, rhs, lhs_layout, rhs_layout)?;
                 Ok(Self::Vulkan(storage))
@@ -350,6 +354,10 @@ impl Storage {
                 let (s, shape) = c.opencl_fwd(s1, l1, s2, l2)?;
                 Ok((Self::OpenCl(s), shape))
             }
+            (Self::Sycl(s1), Self::Sycl(s2)) => {
+                let (s, shape) = c.sycl_fwd(s1, l1, s2, l2)?;
+                Ok((Self::Sycl(s), shape))
+            }
             (Self::Vulkan(s1), Self::Vulkan(s2)) => {
                 let (s, shape) = c.vulkan_fwd(s1, l1, s2, l2)?;
                 Ok((Self::Vulkan(s), shape))
@@ -385,6 +393,10 @@ impl Storage {
             (Self::OpenCl(s1), Self::OpenCl(s2), Self::OpenCl(s3)) => {
                 let (s, shape) = c.opencl_fwd(s1, l1, s2, l2, s3, l3)?;
                 Ok((Self::OpenCl(s), shape))
+            }
+            (Self::Sycl(s1), Self::Sycl(s2), Self::Sycl(s3)) => {
+                let (s, shape) = c.sycl_fwd(s1, l1, s2, l2, s3, l3)?;
+                Ok((Self::Sycl(s), shape))
             }
             (Self::Vulkan(s1), Self::Vulkan(s2), Self::Vulkan(s3)) => {
                 let (s, shape) = c.vulkan_fwd(s1, l1, s2, l2, s3, l3)?;
@@ -443,6 +455,14 @@ impl Storage {
                 *s1 = dev.storage_from_cpu_storage(&c1)?;
                 Ok(())
             }
+            (Self::Sycl(s1), Self::Sycl(s2)) => {
+                let mut c1 = s1.to_cpu_storage()?;
+                let c2 = s2.to_cpu_storage()?;
+                c.cpu_fwd(&mut c1, l1, &c2, l2)?;
+                let dev = s1.device.clone();
+                *s1 = dev.storage_from_cpu_storage(&c1)?;
+                Ok(())
+            }
             (Self::Vulkan(s1), Self::Vulkan(s2)) => {
                 let mut c1 = s1.to_cpu_storage()?;
                 let c2 = s2.to_cpu_storage()?;
@@ -473,6 +493,15 @@ impl Storage {
                 c.metal_fwd(s1, l1, s2, l2, s3, l3)
             }
             (Self::OpenCl(s1), Self::OpenCl(s2), Self::OpenCl(s3)) => {
+                let mut c1 = s1.to_cpu_storage()?;
+                let c2 = s2.to_cpu_storage()?;
+                let c3 = s3.to_cpu_storage()?;
+                c.cpu_fwd(&mut c1, l1, &c2, l2, &c3, l3)?;
+                let dev = s1.device.clone();
+                *s1 = dev.storage_from_cpu_storage(&c1)?;
+                Ok(())
+            }
+            (Self::Sycl(s1), Self::Sycl(s2), Self::Sycl(s3)) => {
                 let mut c1 = s1.to_cpu_storage()?;
                 let c2 = s2.to_cpu_storage()?;
                 let c3 = s3.to_cpu_storage()?;
@@ -547,6 +576,10 @@ impl Storage {
             (Self::OpenCl(lhs), Self::OpenCl(rhs)) => {
                 let storage = lhs.binary_impl::<B>(rhs, lhs_layout, rhs_layout)?;
                 Ok(Self::OpenCl(storage))
+            }
+            (Self::Sycl(lhs), Self::Sycl(rhs)) => {
+                let storage = lhs.binary_impl::<B>(rhs, lhs_layout, rhs_layout)?;
+                Ok(Self::Sycl(storage))
             }
             (Self::Vulkan(lhs), Self::Vulkan(rhs)) => {
                 let storage = lhs.binary_impl::<B>(rhs, lhs_layout, rhs_layout)?;
@@ -918,6 +951,10 @@ impl Storage {
                 let storage = cond.where_cond(layout, t, layout_t, f, layout_f)?;
                 Ok(Self::OpenCl(storage))
             }
+            (Self::Sycl(cond), Self::Sycl(t), Self::Sycl(f)) => {
+                let storage = cond.where_cond(layout, t, layout_t, f, layout_f)?;
+                Ok(Self::Sycl(storage))
+            }
             (Self::Vulkan(cond), Self::Vulkan(t), Self::Vulkan(f)) => {
                 let storage = cond.where_cond(layout, t, layout_t, f, layout_f)?;
                 Ok(Self::Vulkan(storage))
@@ -956,6 +993,10 @@ impl Storage {
                 let storage = s.gather(l, indexes, indexes_l, d)?;
                 Ok(Self::OpenCl(storage))
             }
+            (Self::Sycl(s), Self::Sycl(indexes)) => {
+                let storage = s.gather(l, indexes, indexes_l, d)?;
+                Ok(Self::Sycl(storage))
+            }
             (Self::Vulkan(s), Self::Vulkan(indexes)) => {
                 let storage = s.gather(l, indexes, indexes_l, d)?;
                 Ok(Self::Vulkan(storage))
@@ -988,6 +1029,9 @@ impl Storage {
             (Self::OpenCl(s), Self::OpenCl(indexes), Self::OpenCl(source)) => {
                 s.scatter_set(l, indexes, indexes_l, source, source_l, d)?;
             }
+            (Self::Sycl(s), Self::Sycl(indexes), Self::Sycl(source)) => {
+                s.scatter_set(l, indexes, indexes_l, source, source_l, d)?;
+            }
             (Self::Vulkan(s), Self::Vulkan(indexes), Self::Vulkan(source)) => {
                 s.scatter_set(l, indexes, indexes_l, source, source_l, d)?;
             }
@@ -1018,6 +1062,9 @@ impl Storage {
                 s.scatter_add_set(l, indexes, indexes_l, source, source_l, d)?;
             }
             (Self::OpenCl(s), Self::OpenCl(indexes), Self::OpenCl(source)) => {
+                s.scatter_add_set(l, indexes, indexes_l, source, source_l, d)?;
+            }
+            (Self::Sycl(s), Self::Sycl(indexes), Self::Sycl(source)) => {
                 s.scatter_add_set(l, indexes, indexes_l, source, source_l, d)?;
             }
             (Self::Vulkan(s), Self::Vulkan(indexes), Self::Vulkan(source)) => {
@@ -1056,6 +1103,10 @@ impl Storage {
                 let storage = s.index_add(l, indexes, indexes_l, source, source_l, d)?;
                 Ok(Self::OpenCl(storage))
             }
+            (Self::Sycl(s), Self::Sycl(indexes), Self::Sycl(source)) => {
+                let storage = s.index_add(l, indexes, indexes_l, source, source_l, d)?;
+                Ok(Self::Sycl(storage))
+            }
             (Self::Vulkan(s), Self::Vulkan(indexes), Self::Vulkan(source)) => {
                 let storage = s.index_add(l, indexes, indexes_l, source, source_l, d)?;
                 Ok(Self::Vulkan(storage))
@@ -1088,6 +1139,10 @@ impl Storage {
             (Self::OpenCl(lhs), Self::OpenCl(rhs)) => {
                 let storage = lhs.index_select(rhs, lhs_l, rhs_l, d)?;
                 Ok(Self::OpenCl(storage))
+            }
+            (Self::Sycl(lhs), Self::Sycl(rhs)) => {
+                let storage = lhs.index_select(rhs, lhs_l, rhs_l, d)?;
+                Ok(Self::Sycl(storage))
             }
             (Self::Vulkan(lhs), Self::Vulkan(rhs)) => {
                 let storage = lhs.index_select(rhs, lhs_l, rhs_l, d)?;
@@ -1128,6 +1183,10 @@ impl Storage {
                 let storage = lhs.matmul(rhs, bmnk, lhs_layout, rhs_layout)?;
                 Ok(Self::OpenCl(storage))
             }
+            (Self::Sycl(lhs), Self::Sycl(rhs)) => {
+                let storage = lhs.matmul(rhs, bmnk, lhs_layout, rhs_layout)?;
+                Ok(Self::Sycl(storage))
+            }
             (Self::Vulkan(lhs), Self::Vulkan(rhs)) => {
                 let storage = lhs.matmul(rhs, bmnk, lhs_layout, rhs_layout)?;
                 Ok(Self::Vulkan(storage))
@@ -1155,6 +1214,9 @@ impl Storage {
                 Ok(src.copy_strided_src(dst, dst_offset, src_l)?)
             }
             (Self::OpenCl(src), Self::OpenCl(dst)) => {
+                Ok(src.copy_strided_src(dst, dst_offset, src_l)?)
+            }
+            (Self::Sycl(src), Self::Sycl(dst)) => {
                 Ok(src.copy_strided_src(dst, dst_offset, src_l)?)
             }
             (Self::Vulkan(src), Self::Vulkan(dst)) => {
@@ -1189,6 +1251,9 @@ impl Storage {
                 Ok(src.copy2d(dst, d1, d2, src_s, dst_s, src_o, dst_o)?)
             }
             (Self::OpenCl(src), Self::OpenCl(dst)) => {
+                Ok(src.copy2d(dst, d1, d2, src_s, dst_s, src_o, dst_o)?)
+            }
+            (Self::Sycl(src), Self::Sycl(dst)) => {
                 Ok(src.copy2d(dst, d1, d2, src_s, dst_s, src_o, dst_o)?)
             }
             (Self::Vulkan(src), Self::Vulkan(dst)) => {

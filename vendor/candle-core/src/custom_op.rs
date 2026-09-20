@@ -157,6 +157,21 @@ pub trait CustomOp2 {
         Ok((dev.storage_from_cpu_storage(&out)?, shape))
     }
 
+    /// The forward pass on a SYCL device — the same contract as `opencl_fwd`.
+    fn sycl_fwd(
+        &self,
+        s1: &crate::SyclStorage,
+        l1: &Layout,
+        s2: &crate::SyclStorage,
+        l2: &Layout,
+    ) -> Result<(crate::SyclStorage, Shape)> {
+        let c1 = s1.to_cpu_storage()?;
+        let c2 = s2.to_cpu_storage()?;
+        let (out, shape) = self.cpu_fwd(&c1, l1, &c2, l2)?;
+        let dev = s1.device.clone();
+        Ok((dev.storage_from_cpu_storage(&out)?, shape))
+    }
+
     fn bwd(
         &self,
         _arg1: &Tensor,
@@ -243,6 +258,24 @@ pub trait CustomOp3 {
         s3: &OpenClStorage,
         l3: &Layout,
     ) -> Result<(OpenClStorage, Shape)> {
+        let c1 = s1.to_cpu_storage()?;
+        let c2 = s2.to_cpu_storage()?;
+        let c3 = s3.to_cpu_storage()?;
+        let (out, shape) = self.cpu_fwd(&c1, l1, &c2, l2, &c3, l3)?;
+        let dev = s1.device.clone();
+        Ok((dev.storage_from_cpu_storage(&out)?, shape))
+    }
+
+    /// The forward pass on a SYCL device — the same contract as `opencl_fwd`.
+    fn sycl_fwd(
+        &self,
+        s1: &crate::SyclStorage,
+        l1: &Layout,
+        s2: &crate::SyclStorage,
+        l2: &Layout,
+        s3: &crate::SyclStorage,
+        l3: &Layout,
+    ) -> Result<(crate::SyclStorage, Shape)> {
         let c1 = s1.to_cpu_storage()?;
         let c2 = s2.to_cpu_storage()?;
         let c3 = s3.to_cpu_storage()?;
