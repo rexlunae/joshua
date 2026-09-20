@@ -38,12 +38,12 @@ fn sycl_bandwidth(n: usize, k: usize, iters: usize) -> Option<f64> {
 
     // warmup
     for _ in 0..5 {
-        dev.run_qgemv(QT_IQ2_XXS, IQ2_XXS_TSIZE, true, xb, wb, ob, n, k, 0, 0, 1).unwrap();
+        dev.run_qgemv_routed(QT_IQ2_XXS, IQ2_XXS_QK as i32, IQ2_XXS_TSIZE, true, xb, wb, ob, n, k, 0, 0, 1).unwrap();
     }
     dev.finish().unwrap();
     let t0 = std::time::Instant::now();
     for _ in 0..iters {
-        dev.run_qgemv(QT_IQ2_XXS, IQ2_XXS_TSIZE, true, xb, wb, ob, n, k, 0, 0, 1).unwrap();
+        dev.run_qgemv_routed(QT_IQ2_XXS, IQ2_XXS_QK as i32, IQ2_XXS_TSIZE, true, xb, wb, ob, n, k, 0, 0, 1).unwrap();
     }
     dev.finish().unwrap();
     let el = t0.elapsed().as_secs_f64();

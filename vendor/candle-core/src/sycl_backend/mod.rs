@@ -415,7 +415,7 @@ impl SyclDevice {
     /// Quantized GEMV routed like the OpenCL launcher: IQ2/Q2K weights take
     /// the multi-row kernel for m rows, everything else the single-row one.
     #[allow(clippy::too_many_arguments)]
-    pub fn run_qgemv(&self, qt: i32, tsize: i32, multirow: bool, x: usize, w: usize, c: usize, n: usize, k: usize, woff: u64, xoff: i32, m: usize) -> crate::Result<()> {
+    pub fn run_qgemv_routed(&self, qt: i32, qk: i32, tsize: i32, multirow: bool, x: usize, w: usize, c: usize, n: usize, k: usize, woff: u64, xoff: i32, m: usize) -> crate::Result<()> {
         if multirow && m <= 16 {
             let cols = {
                 let groups = k / 8;
@@ -427,7 +427,7 @@ impl SyclDevice {
             };
             return self.run_qgemv_mr(x, w, c, n, k, qt, tsize, woff, xoff, 0, m, cols);
         }
-        self.run_qgemv(x, w, c, n, k, qt, k / 8, woff, xoff, 0, m)
+        self.run_qgemv(x, w, c, n, k, qt, qk, tsize, woff, xoff, 0, m)
     }
 
     /// Dequantize a block-quantized tensor to f32 (kernel `k_dequant`).
