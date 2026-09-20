@@ -215,8 +215,8 @@ fn sycl_rmsnorm_matches_cpu(dev: &SyclDevice) {
 /// reversal (OpenCL x/y/z → SYCL z/y/x) in the 16×16-tile kernel needs
 /// dedicated debugging.  The elementwise / reduction / quantized-GEMV kernels
 /// all pass on the same bridge, confirming the launch plumbing itself.
-#[test]
-#[ignore]
+/// Called from the serial wrapper, not a standalone #[test] (which would
+/// reject the `&SyclDevice` argument).
 fn sycl_gemm_matches_cpu(dev: &SyclDevice) {
     let (m, k, n) = (64usize, 96usize, 51usize);
     let a: Vec<f32> = (0..m * k).map(|i| ((i % 13) as f32 - 6.0) * 0.25).collect();
