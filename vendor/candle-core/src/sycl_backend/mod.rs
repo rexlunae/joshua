@@ -1318,11 +1318,6 @@ pub struct QSyclStorage {
     pub device: SyclDevice,
 }
 
-impl std::fmt::Debug for QSyclStorage {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "QSyclStorage({:?}, {} elems)", self.dtype, self.elem_count)
-    }
-}
 
 impl Drop for QSyclStorage {
     fn drop(&mut self) {
