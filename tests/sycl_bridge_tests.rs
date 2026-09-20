@@ -17,8 +17,12 @@
 use candle_core::{Device, Tensor};
 use candle_core::sycl_backend::SyclDevice;
 
-fn device() -> Option<SyclDevice> {
-    match SyclDevice::new(0) {
+/// All tests share one device: the DPC++ runtime crashes when contexts are
+/// opened and closed concurrently from parallel test threads.
+fn device() -> Option<&'static SyclDevice> {
+    static DEV: std::sync::OnceLock<Result<SyclDevice, String>> = std::sync::OnceLock::new();
+    let dev = DEV.get_or_init(|| SyclDevice::new(0).map_err(|e| e.to_string()));
+    match dev {
         Ok(d) => Some(d),
         Err(e) => {
             eprintln!("SKIP: no SYCL device/bridge available: {e}");
