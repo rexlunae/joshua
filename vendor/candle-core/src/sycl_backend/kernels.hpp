@@ -98,40 +98,36 @@ inline int off_of(int lin, const Idx* ix, const int* s, int o) {
 #define OP_SIGMOID 19
 
 inline float unary_f(float v, int op) {
-    // sycl::native:: math (single GPU instructions) instead of the precise
+    // sycl::native math (single GPU instructions) instead of the precise
     // expansions: the DPC++ compiler inlines every branch of the op table,
     // and the precise expansions blow the Arc B50's register budget — the
     // launch fails with UR_RESULT_ERROR_OUT_OF_RESOURCES (or, outside gdb,
     // corrupts runtime state and the next launch segfaults).  The OpenCL
     // backend gets this for free because the OpenCL compiler emits calls to
     // precompiled library functions.
-    using nexp = sycl::native::exp;
-    using nlog = sycl::native::log;
-    using nsin = sycl::native::sin;
-    using ncos = sycl::native::cos;
-    auto ntanh = [](float x) { return 1.0f - 2.0f / (nexp(2.0f * x) + 1.0f); };
-    if (op == OP_EXP) return nexp(v);
-    if (op == OP_LOG) return nlog(v);
-    if (op == OP_SIN) return nsin(v);
-    if (op == OP_COS) return ncos(v);
-    if (op == OP_TANH) return ntanh(v);
+    if (op == OP_EXP) return sycl::native::exp(v);
+    if (op == OP_LOG) return sycl::native::log(v);
+    if (op == OP_SIN) return sycl::native::sin(v);
+    if (op == OP_COS) return sycl::native::cos(v);
+    if (op == OP_TANH) return 1.0f - 2.0f / (sycl::native::exp(2.0f * v) + 1.0f);
     if (op == OP_NEG) return -v;
-    if (op == OP_RECIP) return 1.0f / v;
+    if (op == OP_RECIP) return sycl::native::recip(v);
     if (op == OP_SQR) return v * v;
     if (op == OP_SQRT) return sycl::native::sqrt(v);
-    if (op == OP_GELU) return 0.5f * v * (1.0f + ntanh(0.79788456080286535588f * v * (1.0f + 0.044715f * v * v)));
+    if (op == OP_GELU) return 0.5f * v * (1.0f + (1.0f - 2.0f / (sycl::native::exp(2.0f * 0.79788456080286535588f * v * (1.0f + 0.044715f * v * v)) + 1.0f)));
     if (op == OP_GELU_ERF) return 0.5f * v * (1.0f + erf(v * 0.70710678118654752440f));
     if (op == OP_ERF) return erf(v);
-    if (op == OP_SILU) return v / (1.0f + nexp(-v));
+    if (op == OP_SILU) return v / (1.0f + sycl::native::exp(-v));
     if (op == OP_ABS) return fabs(v);
     if (op == OP_CEIL) return ceil(v);
     if (op == OP_FLOOR) return floor(v);
     if (op == OP_ROUND) return round(v);
     if (op == OP_RELU) return v > 0.0f ? v : 0.0f;
     if (op == OP_SIGN) return v > 0.0f ? 1.0f : (v < 0.0f ? -1.0f : 0.0f);
-    if (op == OP_SIGMOID) return 1.0f / (1.0f + nexp(-v));
+    if (op == OP_SIGMOID) return 1.0f / (1.0f + sycl::native::exp(-v));
     return v;
 }
+
 
 
 
