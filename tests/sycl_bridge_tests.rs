@@ -348,7 +348,11 @@ fn sycl_reduce_last_sum_matches_cpu(dev: &SyclDevice) {
     kernels::run_reduce_last(&dev.ctx(), kernels::RED_SUM, xb.buffer, ob.buffer, rows, cols, 0).unwrap();
     dev.synchronize().unwrap();
     let got = read_f32(&ob);
-    let want: Vec<f32> = (0..rows).map(|r| x[r * cols..(r + 1) * cols].iter().sum::<f32>()).collect();
+    let mut want = vec![0f32; rows];
+    for r in 0..rows {
+        let row = &x[r * cols..(r + 1) * cols];
+        want[r] = row.iter().sum::<f32>();
+    }
     assert_close("reduce_last sum", &got, &want, 1e-4);
 }
 
