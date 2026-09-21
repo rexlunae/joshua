@@ -834,9 +834,17 @@ fn build_device_pool(
                 );
                 return None;
             };
-            let bytes =
-                (gate.storage_size_in_bytes() + up.storage_size_in_bytes() + down.storage_size_in_bytes()) as u64;
-            row.push(HostExpert { gate, up, down, clamp: m.clamp, prefetch: m.prefetch.clone(), bytes });
+            let bytes = (gate.storage_size_in_bytes()
+                + up.storage_size_in_bytes()
+                + down.storage_size_in_bytes()) as u64;
+            row.push(HostExpert {
+                gate,
+                up,
+                down,
+                clamp: m.clamp,
+                prefetch: m.prefetch.clone(),
+                bytes,
+            });
         }
         host.push(row);
     }
@@ -899,11 +907,15 @@ fn build_device_pool(
         Arc::new(move |l, e| match upload_one(l, e) {
             Ok(slot) => slot.map(Arc::new),
             Err(err) => {
-                tracing::warn!("deepseek4: expert ({l}, {e}) upload to the VRAM cache failed: {err}");
+                tracing::warn!(
+                    "deepseek4: expert ({l}, {e}) upload to the VRAM cache failed: {err}"
+                );
                 None
             }
         });
-    let pool = Arc::new(crate::residency::DeviceResidency::new(budget, per_slot, upload));
+    let pool = Arc::new(crate::residency::DeviceResidency::new(
+        budget, per_slot, upload,
+    ));
     // On a real device the host pages of an uploaded expert are released
     // (exclusive tiers).  With the CPU as the "device" the slot *is* the
     // host tensor, so there is nothing to release.
@@ -1876,7 +1888,7 @@ impl Moe {
         let x2 = xs.reshape((n_tokens, h))?;
 
         let logits = x2.matmul(&self.gate_t)?; // [n_tokens, n_expert]
-                                                                // sqrt(softplus(x)) scoring; bias shifts selection only.
+                                               // sqrt(softplus(x)) scoring; bias shifts selection only.
         let probs = softplus(&logits)?.sqrt()?;
         let (weights, indices) = if self.hash {
             // Hash layers: expert *selection* comes from tid2eid[token_id], but the
@@ -1969,8 +1981,7 @@ impl Moe {
         // the next step likely to repeat them); during prefill only the
         // final row's ids — the routing the immediately following decode
         // step is most likely to continue from.
-        let mut routed_ids: Vec<u32> =
-            ids[n_tokens.saturating_sub(1) * k..].to_vec();
+        let mut routed_ids: Vec<u32> = ids[n_tokens.saturating_sub(1) * k..].to_vec();
         routed_ids.sort_unstable();
         routed_ids.dedup();
 
@@ -1994,8 +2005,9 @@ impl Moe {
                 // boundary costs two transfers per layer instead of one per
                 // expert matmul.
                 let x2 = crate::moe::on_device(x2, &self.expert_device)?;
-                let active: Vec<usize> =
-                    (0..self.experts.len()).filter(|e| !per_expert[*e].is_empty()).collect();
+                let active: Vec<usize> = (0..self.experts.len())
+                    .filter(|e| !per_expert[*e].is_empty())
+                    .collect();
                 self.host_experts(&x2, &per_expert, &active, n_tokens, h)?
             }
         };
@@ -2136,11 +2148,14 @@ impl Moe {
                 let handle = self.experts[e].prefetch.as_ref();
                 if std::env::var("JOSHUA_DS4_PROBE_DEBUG").as_deref() == Ok("1") {
                     let rp = handle.and_then(|h| h.resident_pages());
-                    eprintln!("DBG probe layer={} e={e} handle={} resident_pages={:?}", self.layer, handle.is_some(), rp);
+                    eprintln!(
+                        "DBG probe layer={} e={e} handle={} resident_pages={:?}",
+                        self.layer,
+                        handle.is_some(),
+                        rp
+                    );
                 }
-                if let Some((res, total)) = handle
-                    .and_then(|h| h.resident_pages())
-                {
+                if let Some((res, total)) = handle.and_then(|h| h.resident_pages()) {
                     PhaseTiming::add(&timing.miss_pages, total as u64);
                     PhaseTiming::add(&timing.miss_pages_resident, res as u64);
                     if res == total {
@@ -2188,7 +2203,9 @@ impl Moe {
                 let hst = crate::moe::on_device(&hst, out_device)?;
                 (d.as_ref() + hst.as_ref())?
             }
-            (Some(y), None) | (None, Some(y)) => crate::moe::on_device(&y, out_device)?.into_owned(),
+            (Some(y), None) | (None, Some(y)) => {
+                crate::moe::on_device(&y, out_device)?.into_owned()
+            }
             (None, None) => Tensor::zeros((n_tokens, h), DType::F32, out_device)?,
         };
         let t3 = std::time::Instant::now();
@@ -2248,7 +2265,10 @@ impl Moe {
         for ((_, slot), (off, count)) in hits.iter().zip(spans) {
             let idx = idx_t.narrow(0, off, count)?;
             let x_sel = x_dev.index_select(&idx, 0)?;
-            outs.push(slot.forward(&x_sel)?.broadcast_mul(&w_t.narrow(0, off, count)?)?);
+            outs.push(
+                slot.forward(&x_sel)?
+                    .broadcast_mul(&w_t.narrow(0, off, count)?)?,
+            );
         }
         let all = Tensor::cat(&outs, 0)?;
         Tensor::zeros((n_tokens, h), DType::F32, dev)?.index_add(&idx_t, &all, 0)
@@ -2442,11 +2462,9 @@ impl<R: Read + Seek> Reader<R> {
                 // path is only practical for small models — the mmap path is
                 // the production one.
                 let bytes = self.raw_bytes_from(name)?;
-                if let Some(f32s) = crate::quant_matmul::decode_raw_to_f32(
-                    info.dtype,
-                    &bytes,
-                    info.elem_count(),
-                )? {
+                if let Some(f32s) =
+                    crate::quant_matmul::decode_raw_to_f32(info.dtype, &bytes, info.elem_count())?
+                {
                     let t = Tensor::from_vec(f32s, info.dims.clone(), &self.device)?;
                     return QTensor::quantize(&t, GgmlDType::F32);
                 }
@@ -2473,11 +2491,12 @@ impl<R: Read + Seek> Reader<R> {
         // on-disk offset); `ModelWeights::from_gguf` (raw = None) falls
         // through to candle's own reader instead.
         if self.raw.is_some() {
-            let decode = self
-                .ct
-                .tensor_infos
-                .get(name)
-                .map(|info| (crate::gguf_ext::ggml_id_from_dtype(info.ggml_dtype), info.shape.clone()));
+            let decode = self.ct.tensor_infos.get(name).map(|info| {
+                (
+                    crate::gguf_ext::ggml_id_from_dtype(info.ggml_dtype),
+                    info.shape.clone(),
+                )
+            });
             if let Some((dtype, shape)) = decode {
                 if let Some(f32s) = crate::quant_matmul::decode_raw_to_f32(
                     dtype,
@@ -2617,11 +2636,12 @@ impl ModelWeights {
     /// routing (decode misses, the routing-frequency hot set, the last
     /// prompt row), consulted by every MoE layer — resident experts run on
     /// the device, the rest on the host, in the same forward pass.  The
-    /// pool needs an IQ2_XXS kernel, which only the OpenCL backend (and, for
+    /// pool needs an IQ2_XXS kernel, which only the OpenCL and SYCL backends (and, for
     /// tests, the CPU, where a slot shares the host tensors) has; on other
     /// accelerators the budget is ignored with a log line.
     ///
-    /// `expert_device` is the engine's resolved expert placement: an OpenCL
+    /// `expert_device` is the engine's resolved expert placement: an OpenCL or
+    /// SYCL
     /// device there means "run the routed experts on the device", which
     /// this loader can only honour through the pool — without a budget it
     /// logs and keeps them on the host.
@@ -2644,9 +2664,13 @@ impl ModelWeights {
         device_expert_cache_bytes: Option<u64>,
     ) -> Result<Self> {
         let cfg = Config::from_metadata(&ct.metadata)?;
-        if !(expert_device.is_cpu() || expert_device.is_opencl() || expert_device.same_device(device)) {
+        if !(expert_device.is_cpu()
+            || expert_device.is_opencl()
+            || expert_device.is_sycl()
+            || expert_device.same_device(device))
+        {
             candle_core::bail!(
-                "deepseek4: routed experts must live on the model device, an OpenCL device or the CPU, \
+                "deepseek4: routed experts must live on the model device, an OpenCL, SYCL or CPU device, \
                  not {expert_device:?}"
             );
         }
@@ -2658,18 +2682,18 @@ impl ModelWeights {
         let pool_device: Option<Device> = if mmap.is_none() {
             None
         } else if cache_bytes == 0 {
-            if expert_device.is_opencl() {
+            if expert_device.is_opencl() || expert_device.is_sycl() {
                 tracing::warn!(
                     "deepseek4: expert placement `device` requested without a VRAM expert-cache budget \
                      (--vram-expert-cache); the routed experts stay on the host"
                 );
             }
             None
-        } else if expert_device.is_opencl() {
+        } else if expert_device.is_opencl() || expert_device.is_sycl() {
             // The B50 configuration: dense set on the CPU (or the device),
             // routed experts cached on the card.
             Some(expert_device.clone())
-        } else if device.is_opencl() {
+        } else if device.is_opencl() || device.is_sycl() {
             Some(device.clone())
         } else if device.is_cpu() && expert_device.is_cpu() {
             Some(Device::Cpu)
@@ -2684,7 +2708,11 @@ impl ModelWeights {
         // the CPU whenever there is one (the source of truth, the CPU path
         // and what the device pool uploads from); a streamed load decodes
         // them to f32 on the model device instead.
-        let expert_device = if mmap.is_some() { Device::Cpu } else { device.clone() };
+        let expert_device = if mmap.is_some() {
+            Device::Cpu
+        } else {
+            device.clone()
+        };
         let mut rd = Reader {
             ct,
             raw: raw.cloned(),
@@ -3007,9 +3035,10 @@ impl ModelWeights {
     /// The device expert pool's budget, occupancy and hit/miss counters,
     /// when a VRAM cache was built at load.
     pub fn device_expert_cache(&self) -> Option<crate::residency::DeviceCacheReport> {
-        self.shared.device_pool.as_ref().map(|p| {
-            crate::residency::DeviceCacheReport::of(&p.pool, Some(&p.uploader))
-        })
+        self.shared
+            .device_pool
+            .as_ref()
+            .map(|p| crate::residency::DeviceCacheReport::of(&p.pool, Some(&p.uploader)))
     }
 
     /// The decode-step time split of the device expert pool (launch / host
@@ -3124,11 +3153,16 @@ impl ModelWeights {
         // qwen3moe/deepseek2 (whose KV is a lazy `Option`), deepseek4 allocates
         // its KV eagerly, so `new_session` cannot be infallible by construction.
         let kv: Vec<KvState> = (0..self.shared.layers.len())
-            .map(|i| KvState::new(&self.shared.cfg, i, &self.shared.device, self.shared.max_seq))
+            .map(|i| {
+                KvState::new(
+                    &self.shared.cfg,
+                    i,
+                    &self.shared.device,
+                    self.shared.max_seq,
+                )
+            })
             .collect::<Result<Vec<_>>>()
-            .unwrap_or_else(|e| {
-                panic!("deepseek4: new-session KV cache allocation failed: {e}")
-            });
+            .unwrap_or_else(|e| panic!("deepseek4: new-session KV cache allocation failed: {e}"));
         let prefill_timing = Arc::new(PhaseTiming::default());
         Self {
             shared: std::sync::Arc::clone(&self.shared),
@@ -3178,7 +3212,8 @@ impl ModelWeights {
         let hc = self.shared.hc_mult;
         let d = self.shared.tok_embeddings.hidden()?;
 
-        let tok = self.shared
+        let tok = self
+            .shared
             .tok_embeddings
             .forward(&input.flatten_all()?)?
             .reshape((1, seq_len, d))?;
@@ -3187,7 +3222,11 @@ impl ModelWeights {
 
         let profile = std::env::var_os("JOSHUA_PROFILE_LAYERS").is_some();
         let mut prof = if profile {
-            Some((Vec::with_capacity(self.shared.layers.len()), Vec::with_capacity(self.shared.layers.len()), Vec::with_capacity(self.shared.layers.len())))
+            Some((
+                Vec::with_capacity(self.shared.layers.len()),
+                Vec::with_capacity(self.shared.layers.len()),
+                Vec::with_capacity(self.shared.layers.len()),
+            ))
         } else {
             None
         };
@@ -3328,12 +3367,11 @@ impl ModelWeights {
         }
 
         if let Some((a, m, t)) = prof {
-            let (sa, sm, st): (f64, f64, f64) = (
-                a.iter().sum(),
-                m.iter().sum(),
-                t.iter().sum(),
+            let (sa, sm, st): (f64, f64, f64) = (a.iter().sum(), m.iter().sum(), t.iter().sum());
+            let (ma, mm) = (
+                a.iter().copied().fold(0.0, f64::max),
+                m.iter().copied().fold(0.0, f64::max),
             );
-            let (ma, mm) = (a.iter().copied().fold(0.0, f64::max), m.iter().copied().fold(0.0, f64::max));
             eprintln!(
                 "[prof] attn: total {sa:.1}s avg {:.3}s max {ma:.3}s | moe: total {sm:.1}s avg {:.3}s max {mm:.3}s | layer: total {st:.1}s",
                 sa / a.len() as f64,
@@ -3380,7 +3418,11 @@ impl ModelWeights {
             .mean_keepdim(D::Minus1)?
             .affine(1.0, self.shared.hc_eps)?
             .powf(-0.5)?;
-        let mixes = self.shared.hc_head_fn.forward(&flat)?.broadcast_mul(&rsqrt)?; // [s, hc]
+        let mixes = self
+            .shared
+            .hc_head_fn
+            .forward(&flat)?
+            .broadcast_mul(&rsqrt)?; // [s, hc]
         let pre = sigmoid(
             &mixes
                 .broadcast_mul(&self.shared.hc_head_scale)?
@@ -3416,10 +3458,7 @@ impl ModelWeights {
     ///
     /// Returns the per-sequence logits (one `n_vocab` vector each), split back
     /// from the shared output head.
-    pub fn forward_sequences(
-        &mut self,
-        seqs: &[(&Tensor, usize)],
-    ) -> Result<Vec<Vec<f32>>> {
+    pub fn forward_sequences(&mut self, seqs: &[(&Tensor, usize)]) -> Result<Vec<Vec<f32>>> {
         let t_pass = std::time::Instant::now();
         let out = self.forward_sequences_inner(seqs)?;
         if !seqs.is_empty() {
@@ -3447,7 +3486,12 @@ impl ModelWeights {
             for i in 0..self.shared.layers.len() {
                 let mut per_seq: Vec<KvState> = Vec::with_capacity(n_seq);
                 for _ in 0..n_seq {
-                    per_seq.push(KvState::new(&self.shared.cfg, i, &self.shared.device, self.shared.max_seq)?);
+                    per_seq.push(KvState::new(
+                        &self.shared.cfg,
+                        i,
+                        &self.shared.device,
+                        self.shared.max_seq,
+                    )?);
                 }
                 self.kv_seq.push(per_seq);
             }
@@ -3457,12 +3501,20 @@ impl ModelWeights {
         let mut xs_seq: Vec<Tensor> = Vec::with_capacity(n_seq);
         let mut ids_cat: Vec<u32> = Vec::new();
         for (input, _) in seqs {
-            let tok = self.shared
+            let tok = self
+                .shared
                 .tok_embeddings
                 .forward(&input.flatten_all()?)?
                 .reshape((1, 1, d))?;
             xs_seq.push(tok.unsqueeze(2)?.broadcast_as((1, 1, hc, d))?);
-            ids_cat.push(input.flatten_all()?.to_vec1()?.first().copied().unwrap_or(0));
+            ids_cat.push(
+                input
+                    .flatten_all()?
+                    .to_vec1()?
+                    .first()
+                    .copied()
+                    .unwrap_or(0),
+            );
         }
 
         let step = self.hot_experts.begin_step(true);
@@ -3499,9 +3551,12 @@ impl ModelWeights {
                 )?;
                 let residual = xs_s;
                 let h = layer.attn_norm.forward(&x)?;
-                let h = layer
-                    .attn
-                .forward(&mut self.kv_seq.get_mut(i).unwrap().get_mut(s).unwrap(), &h, *off, self.shared.max_seq)?;
+                let h = layer.attn.forward(
+                    &mut self.kv_seq.get_mut(i).unwrap().get_mut(s).unwrap(),
+                    &h,
+                    *off,
+                    self.shared.max_seq,
+                )?;
                 let xs_s2 = hc_post(&h, &residual, &post, &comb)?;
 
                 let (x2, fpost, fcomb) = hc_pre(
@@ -3519,8 +3574,9 @@ impl ModelWeights {
             }
 
             // Shared MoE: concatenate the per-seq FFN inputs + token ids.
-            let ffn_cats: Vec<Tensor> =
-                (0..n_seq).map(|s| ffn_pre.get(s).unwrap().clone()).collect();
+            let ffn_cats: Vec<Tensor> = (0..n_seq)
+                .map(|s| ffn_pre.get(s).unwrap().clone())
+                .collect();
             let h_cat = Tensor::cat(&ffn_cats, 1)?;
             let input_cat = Tensor::new(ids_cat.as_slice(), &self.shared.device)
                 .and_then(|t| t.unsqueeze(0))?;
@@ -3538,8 +3594,7 @@ impl ModelWeights {
 
         // Logits head on the concatenated last-layer output.
         // Concatenate xs_seq along the token dim -> [1, n_seq, hc, d].
-        let xs_cats: Vec<Tensor> =
-            (0..n_seq).map(|s| xs_seq.get(s).unwrap().clone()).collect();
+        let xs_cats: Vec<Tensor> = (0..n_seq).map(|s| xs_seq.get(s).unwrap().clone()).collect();
         let xs_cat = Tensor::cat(&xs_cats, 1)?;
         let seq_len = n_seq;
         let flat = xs_cat.reshape((seq_len, hc * d))?;
@@ -3548,9 +3603,17 @@ impl ModelWeights {
             .mean_keepdim(D::Minus1)?
             .affine(1.0, self.shared.hc_eps)?
             .powf(-0.5)?;
-        let mixes = self.shared.hc_head_fn.forward(&flat)?.broadcast_mul(&rsqrt)?;
-        let pre = sigmoid(&mixes.broadcast_mul(&self.shared.hc_head_scale)?.broadcast_add(&self.shared.hc_head_base)?)?
-            .affine(1.0, self.shared.hc_eps)?;
+        let mixes = self
+            .shared
+            .hc_head_fn
+            .forward(&flat)?
+            .broadcast_mul(&rsqrt)?;
+        let pre = sigmoid(
+            &mixes
+                .broadcast_mul(&self.shared.hc_head_scale)?
+                .broadcast_add(&self.shared.hc_head_base)?,
+        )?
+        .affine(1.0, self.shared.hc_eps)?;
         let y = pre
             .unsqueeze(D::Minus1)?
             .broadcast_as((seq_len, hc, d))?
@@ -3558,7 +3621,7 @@ impl ModelWeights {
             .sum(D::Minus2)?; // [n_seq, d]
         let y = self.shared.norm.forward(&y)?;
         let logits_all = self.shared.output.forward(&y)?; // [n_seq, n_vocab]
-        // Split logits per sequence (each is 1 row).
+                                                          // Split logits per sequence (each is 1 row).
         let mut out: Vec<Vec<f32>> = Vec::with_capacity(n_seq);
         for s in 0..n_seq {
             let row = logits_all
@@ -3613,7 +3676,6 @@ impl ModelWeights {
         }
     }
 }
-
 
 // ─── Layer-streaming prefill (shared framework) ──────────────────────────────
 impl crate::stream_prefill::StreamPrefill for ModelWeights {
@@ -3727,7 +3789,11 @@ impl ModelWeights {
             .mean_keepdim(D::Minus1)?
             .affine(1.0, self.shared.hc_eps)?
             .powf(-0.5)?;
-        let mixes = self.shared.hc_head_fn.forward(&flat)?.broadcast_mul(&rsqrt)?;
+        let mixes = self
+            .shared
+            .hc_head_fn
+            .forward(&flat)?
+            .broadcast_mul(&rsqrt)?;
         let pre = sigmoid(
             &mixes
                 .broadcast_mul(&self.shared.hc_head_scale)?
@@ -3928,10 +3994,7 @@ fn split_iq2xxs_experts<R: Read + Seek>(
             &rd.expert_device,
         )?;
         experts.push(ExpertTensor {
-            qmatmul: QMatMul::from_qtensor(QTensor::quantize(
-                &t,
-                GgmlDType::F32,
-            )?)?,
+            qmatmul: QMatMul::from_qtensor(QTensor::quantize(&t, GgmlDType::F32)?)?,
             prefetch: None,
         });
     }
@@ -3947,7 +4010,10 @@ fn load_moe<R: Read + Seek>(
 ) -> Result<Moe> {
     // Router weight `[n_expert, n_embd]`, kept transposed + contiguous for
     // the per-call `x @ Wᵀ` (numerically identical to transposing per call).
-    let gate_t = rd.f32_tensor(&format!("{p}.ffn_gate_inp.weight"))?.t()?.contiguous()?;
+    let gate_t = rd
+        .f32_tensor(&format!("{p}.ffn_gate_inp.weight"))?
+        .t()?
+        .contiguous()?;
     let gate_bias = if hash {
         None
     } else {
@@ -4130,11 +4196,13 @@ fn split_experts<R: Read + Seek>(
         // `type_size`-byte elements.
         per_elems
             .checked_mul(storage_dtype.type_size())
-            .ok_or_else(|| candle_core::Error::Msg(format!("deepseek4: expert tensor `{name}` size overflow")))?
+            .ok_or_else(|| {
+                candle_core::Error::Msg(format!("deepseek4: expert tensor `{name}` size overflow"))
+            })?
     };
-    let total_needed = per_bytes
-        .checked_mul(n_expert)
-        .ok_or_else(|| candle_core::Error::Msg(format!("deepseek4: expert tensor `{name}` size overflow")))?;
+    let total_needed = per_bytes.checked_mul(n_expert).ok_or_else(|| {
+        candle_core::Error::Msg(format!("deepseek4: expert tensor `{name}` size overflow"))
+    })?;
     if bytes.len() < total_needed {
         candle_core::bail!(
             "deepseek4: expert tensor `{name}` byte length {} is smaller than the {} experts × {per_bytes} bytes needed",

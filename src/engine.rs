@@ -1139,7 +1139,6 @@ impl Engine {
             }
         };
 
-
         let eos_token_ids = extract_eos_ids(&gguf, &tokenizer);
         let chat_template = extract_chat_template(&gguf, &tokenizer);
         let device = Self::resolve_device(options.backend)?;
@@ -1268,7 +1267,7 @@ impl Engine {
         // on the device) − placement headroom − scratch − KV reserve (only
         // when the KV cache is on the device, i.e. with the dense set).  A
         // fixed MiB budget (Some(n>0)) passes through.  An architecture whose
-        // device expert form *is* this cache (deepseek4 on OpenCL) treats an
+        // device expert form *is* this cache (deepseek4 on OpenCL/SYCL) treats an
         // explicit `--expert-placement device` with no budget as `auto`, so
         // the flag alone puts experts on the card.
         let expert_cache_implied = arch.is_some_and(|a| a.device_experts_are_a_cache(&device))
@@ -1284,13 +1283,18 @@ impl Engine {
             options.device_expert_cache
         };
         if device_expert_cache == Some(0) {
-            // `--vram-expert-cache auto`: size from the device's memory,
-            // leaving room for whatever else lives there.
-            if let Some((free, _)) = crate::placement::device_memory_info(&device) {
+            // `--vram-expert-cache auto`: size from the device's memory
+            // budget (`--vram-budget`, else the probe), leaving room for
+            // whatever else lives there.
+            if let Some(free) = device_budget {
                 let (dense_term, kv_reserve, scratch) = if dense_device.is_cpu() {
                     (0, 0, DEVICE_SCRATCH_RESERVE_DENSE_ON_CPU)
                 } else {
-                    (footprint.dense_upper, DEVICE_KV_RESERVE_BYTES, DEVICE_SCRATCH_RESERVE_DENSE_ON_DEVICE)
+                    (
+                        footprint.dense_upper,
+                        DEVICE_KV_RESERVE_BYTES,
+                        DEVICE_SCRATCH_RESERVE_DENSE_ON_DEVICE,
+                    )
                 };
                 let budget = crate::placement::device_expert_cache_bytes(
                     free,
@@ -1310,7 +1314,9 @@ impl Engine {
                 );
                 device_expert_cache = Some(budget);
             } else {
-                tracing::info!("vram-expert-cache auto: no device memory probe; disabled");
+                tracing::info!(
+                    "vram-expert-cache auto: no device memory probe and no --vram-budget; disabled"
+                );
                 device_expert_cache = None;
             }
         }
@@ -1528,8 +1534,16 @@ impl Engine {
             tracing::info!(
                 "Vulkan device: {} ({}; native kernels {})",
                 vk.name(),
-                if vk.host_unified_memory() { "host-unified memory" } else { "discrete memory, host-visible staging" },
-                if candle_core::vulkan_backend::native_enabled() { "on" } else { "off" },
+                if vk.host_unified_memory() {
+                    "host-unified memory"
+                } else {
+                    "discrete memory, host-visible staging"
+                },
+                if candle_core::vulkan_backend::native_enabled() {
+                    "on"
+                } else {
+                    "off"
+                },
             );
         }
     }
@@ -1541,8 +1555,16 @@ impl Engine {
             tracing::info!(
                 "SYCL device: {} ({}; native kernels {})",
                 sycl.name(),
-                if sycl.host_unified_memory() { "host-unified memory" } else { "discrete memory" },
-                if candle_core::sycl_backend::kernels::native_enabled() { "on" } else { "off" },
+                if sycl.host_unified_memory() {
+                    "host-unified memory"
+                } else {
+                    "discrete memory"
+                },
+                if candle_core::sycl_backend::kernels::native_enabled() {
+                    "on"
+                } else {
+                    "off"
+                },
             );
         }
     }
@@ -2062,7 +2084,8 @@ impl Engine {
                     for piece_start in (0..new_tokens.len()).step_by(chunk) {
                         let end = (piece_start + chunk).min(new_tokens.len());
                         let piece = &new_tokens[piece_start..end];
-                        last = model.forward_tokens(piece, base + piece_start, &self.dense_device)?;
+                        last =
+                            model.forward_tokens(piece, base + piece_start, &self.dense_device)?;
                     }
                     last
                 }
@@ -2182,8 +2205,7 @@ impl Engine {
                 // without re-decoding the whole output every step (the old
                 // whole-buffer decode made generation O(n²) in length).
                 decoded_ids.push(next_token);
-                response =
-                    byte_window.push(&self.tokenizer, next_token, response, &decoded_ids)?;
+                response = byte_window.push(&self.tokenizer, next_token, response, &decoded_ids)?;
             } else {
                 // Decoder-less / word-level tokenizers: batch decoding would
                 // join pieces with spaces, so decode each token and append.
@@ -2540,9 +2562,9 @@ impl Engine {
         // derived from the shared template are only a KV cache and keep the
         // RAM rule.
         if let Some(cap) = self.device_session_cap {
-            let owns_weights = pool
-                .last()
-                .is_some_and(|c| matches!(&c.session, GenSession::Candle(m) if !m.supports_shared_weights()));
+            let owns_weights = pool.last().is_some_and(
+                |c| matches!(&c.session, GenSession::Candle(m) if !m.supports_shared_weights()),
+            );
             if owns_weights {
                 pool_cap = pool_cap.min(cap);
             }
@@ -2621,7 +2643,8 @@ impl Engine {
                 // With a device pool the hot set is what stays resident
                 // under churn; size it to the pool's protected share so the
                 // frequency policy runs without an explicit host budget.
-                budget = cache.slots * crate::residency::HOT_SET_SHARE.0 / crate::residency::HOT_SET_SHARE.1;
+                budget = cache.slots * crate::residency::HOT_SET_SHARE.0
+                    / crate::residency::HOT_SET_SHARE.1;
             }
         }
         model.set_pin_hot_experts(budget);
@@ -2651,8 +2674,12 @@ impl Engine {
             return 0;
         }
         let expert_bytes = (self.mmap.len() / capacity) as u64;
-        let budget =
-            crate::placement::expert_budget_for_memory(free, expert_bytes, capacity, AUTO_EXPERT_HEADROOM);
+        let budget = crate::placement::expert_budget_for_memory(
+            free,
+            expert_bytes,
+            capacity,
+            AUTO_EXPERT_HEADROOM,
+        );
         tracing::info!(
             "expert cache auto: {budget} experts from {:.1} GiB free (expert ~{:.1} MiB, capacity {capacity})",
             free as f64 / 2f64.powi(30),
@@ -2882,7 +2909,10 @@ const EMBEDDING_NAMES: [&str; 3] = [
 /// The names `arch`'s loader probes for a tensor, in its precedence order:
 /// candle's `lfm2` loader tries every alias in `all`; every other loader
 /// reads only the canonical first name.
-fn probed_names(arch: Option<Architecture>, all: &'static [&'static str]) -> &'static [&'static str] {
+fn probed_names(
+    arch: Option<Architecture>,
+    all: &'static [&'static str],
+) -> &'static [&'static str] {
     if arch == Some(Architecture::Lfm2) {
         all
     } else {
@@ -3009,7 +3039,11 @@ enum Residency {
 ///   [`F32_STEMS`] are f32.
 /// * Anything else — or anything at all for a model candle cannot load —
 ///   is [`Residency::Unknown`].
-fn residency(arch: Option<Architecture>, name: &str, info: &crate::gguf_ext::RawTensorInfo) -> Residency {
+fn residency(
+    arch: Option<Architecture>,
+    name: &str,
+    info: &crate::gguf_ext::RawTensorInfo,
+) -> Residency {
     if is_routed_expert(name) {
         return Residency::Quantized;
     }
@@ -3223,10 +3257,7 @@ fn scanned_head_bytes(header: &crate::gguf_ext::GgufHeader) -> u64 {
 /// by the size difference between a head and the embedding (same shape,
 /// possibly a different dtype).  Head tensors the loader never probes are
 /// not candidates.
-fn resident_head_bytes(
-    header: &crate::gguf_ext::GgufHeader,
-    arch: Option<Architecture>,
-) -> u64 {
+fn resident_head_bytes(header: &crate::gguf_ext::GgufHeader, arch: Option<Architecture>) -> u64 {
     probed_head_names(arch)
         .iter()
         .chain(probed_embedding_names(arch).iter())
@@ -3557,12 +3588,8 @@ fn mlock_ranges(mmap: &Mmap, ranges: &[ByteRange], page: usize) -> usize {
         // SAFETY: `start..end` lies within the mapping (clamped above) and
         // mlock does not modify memory.  The mapping lives until the engine
         // is dropped; mlock is released automatically on munmap.
-        let rc = unsafe {
-            libc::mlock(
-                mmap.as_ptr().add(start).cast::<libc::c_void>(),
-                end - start,
-            )
-        };
+        let rc =
+            unsafe { libc::mlock(mmap.as_ptr().add(start).cast::<libc::c_void>(), end - start) };
         if rc == 0 {
             locked += (end - start) as u64;
         } else {
@@ -4137,7 +4164,11 @@ mod tests {
     fn device_weight_bytes_follows_loader_residency() {
         use std::collections::HashMap;
         // Q4_K: 256 elements per 144-byte block.
-        let q4k = |dims: Vec<usize>| crate::gguf_ext::RawTensorInfo { dtype: 12, dims, offset: 0 };
+        let q4k = |dims: Vec<usize>| crate::gguf_ext::RawTensorInfo {
+            dtype: 12,
+            dims,
+            offset: 0,
+        };
         let base = crate::gguf_ext::GgufHeader {
             version: 3,
             metadata: HashMap::new(),
@@ -4145,7 +4176,10 @@ mod tests {
                 ("token_embd.weight".to_string(), q4k(vec![256, 4])), // 1024 elems = 576 B
                 ("output.weight".to_string(), q4k(vec![256, 4])),     // 576 B
                 ("blk.0.attn_q.weight".to_string(), q4k(vec![256, 1])), // 256 elems = 144 B
-                ("blk.0.ffn_gate_exps.weight".to_string(), q4k(vec![4, 64, 1])), // 144 B
+                (
+                    "blk.0.ffn_gate_exps.weight".to_string(),
+                    q4k(vec![4, 64, 1]),
+                ), // 144 B
                 ("blk.0.ffn_up_exps.weight".to_string(), q4k(vec![4, 64, 1])),
             ]),
             tensor_data_offset: 0,
@@ -4156,7 +4190,11 @@ mod tests {
         let ds4 = Some(Architecture::DeepSeek4);
         const EMBD_F32: u64 = 1024 * 4;
         let fp = |h: &crate::gguf_ext::GgufHeader, a| device_weight_bytes(h, a);
-        let known = |lower: u64, experts: u64| DeviceFootprint { dense_lower: lower, dense_upper: lower, experts };
+        let known = |lower: u64, experts: u64| DeviceFootprint {
+            dense_lower: lower,
+            dense_upper: lower,
+            experts,
+        };
 
         // joshua-native loader, CUDA/Metal: everything known and quantized.
         assert_eq!(fp(&base, q), known(576 + 576 + 144, 2 * 144));
@@ -4171,7 +4209,11 @@ mod tests {
         let mut tied = base.clone();
         tied.tensors.remove("output.weight");
         assert_eq!(scanned_head_bytes(&tied), 0);
-        assert_eq!(resident_head_bytes(&tied, q), 576, "tied head is the quantized table");
+        assert_eq!(
+            resident_head_bytes(&tied, q),
+            576,
+            "tied head is the quantized table"
+        );
         assert_eq!(fp(&tied, q).dense_lower, 576 + 144 + 576);
         assert_eq!(fp(&tied, llama), known(EMBD_F32 + 144 + 576, 2 * 144));
         // A model candle cannot load: nothing is known, the bounds span
@@ -4184,7 +4226,11 @@ mod tests {
         let mut f16_embd = tied.clone();
         f16_embd.tensors.insert(
             "token_embd.weight".to_string(),
-            crate::gguf_ext::RawTensorInfo { dtype: 1, dims: vec![256, 4], offset: 0 },
+            crate::gguf_ext::RawTensorInfo {
+                dtype: 1,
+                dims: vec![256, 4],
+                offset: 0,
+            },
         );
         // Table f32 + head copy at its on-disk f16 size (2 B/elem).
         assert_eq!(fp(&f16_embd, q), known(EMBD_F32 + 144 + 1024 * 2, 2 * 144));
@@ -4195,11 +4241,22 @@ mod tests {
         let mut ds4h = base.clone();
         ds4h.tensors.insert(
             "blk.0.attn_output.weight".to_string(),
-            crate::gguf_ext::RawTensorInfo { dtype: 16, dims: vec![256, 1], offset: 0 },
+            crate::gguf_ext::RawTensorInfo {
+                dtype: 16,
+                dims: vec![256, 1],
+                offset: 0,
+            },
         );
-        ds4h.tensors.insert("blk.0.attn_compressor_kv.weight".to_string(), q4k(vec![256, 1]));
-        ds4h.tensors.insert("blk.0.attn_compressor_ape.weight".to_string(), q4k(vec![256, 1]));
-        ds4h.tensors.insert("output_hc_fn.weight".to_string(), q4k(vec![256, 1]));
+        ds4h.tensors.insert(
+            "blk.0.attn_compressor_kv.weight".to_string(),
+            q4k(vec![256, 1]),
+        );
+        ds4h.tensors.insert(
+            "blk.0.attn_compressor_ape.weight".to_string(),
+            q4k(vec![256, 1]),
+        );
+        ds4h.tensors
+            .insert("output_hc_fn.weight".to_string(), q4k(vec![256, 1]));
         assert_eq!(
             fp(&ds4h, ds4),
             known(576 + 576 + 144 + 1024 + 144 + 1024 + 144, 2 * 144),
@@ -4220,26 +4277,49 @@ mod tests {
         ] {
             misc.tensors.insert(n.to_string(), q4k(vec![256, 1])); // 144 B quantized, 1024 B f32
         }
-        misc.tensors.insert("blk.0.some_future_tensor.weight".to_string(), q4k(vec![256, 1]));
-        misc.tensors.insert("blk.0.attn_kv_b.weight".to_string(), q4k(vec![256, 1]));
-        misc.tensors.insert("blk.0.ffn_gate_shexp.weight".to_string(), q4k(vec![256, 1]));
+        misc.tensors.insert(
+            "blk.0.some_future_tensor.weight".to_string(),
+            q4k(vec![256, 1]),
+        );
+        misc.tensors
+            .insert("blk.0.attn_kv_b.weight".to_string(), q4k(vec![256, 1]));
+        misc.tensors
+            .insert("blk.0.ffn_gate_shexp.weight".to_string(), q4k(vec![256, 1]));
         let m = fp(&misc, Some(Architecture::DeepSeek2));
-        assert_eq!(m.dense_lower, 576 + 576 + 144 + 5 * 1024 + 144 + 2 * 144, "unknown tensor quantized in the lower bound");
-        assert_eq!(m.dense_upper, 576 + 576 + 144 + 5 * 1024 + 1024 + 2 * 144, "unknown tensor f32 in the upper bound");
+        assert_eq!(
+            m.dense_lower,
+            576 + 576 + 144 + 5 * 1024 + 144 + 2 * 144,
+            "unknown tensor quantized in the lower bound"
+        );
+        assert_eq!(
+            m.dense_upper,
+            576 + 576 + 144 + 5 * 1024 + 1024 + 2 * 144,
+            "unknown tensor f32 in the upper bound"
+        );
         assert_eq!(tensor_stem("blk.12.attn_q.weight"), "attn_q");
         assert_eq!(tensor_stem("output.weight"), "output");
         assert_eq!(tensor_stem("blk.0.attn_q.bias"), "attn_q.bias");
         assert_eq!(tensor_stem("blk.0.ffn_up.7.weight"), "ffn_up");
-        assert_eq!(tensor_stem("blk.0.feed_forward.w1.weight"), "feed_forward.w1");
+        assert_eq!(
+            tensor_stem("blk.0.feed_forward.w1.weight"),
+            "feed_forward.w1"
+        );
 
         // Mixtral's per-expert matrices (`ffn_gate.<i>`) and lfm2's aliases
         // are QMatMuls: quantized in both bounds, so a fitting model is never
         // refused for them.
         let mut mixtral = base.clone();
-        for n in ["blk.0.ffn_gate.3.weight", "blk.0.ffn_up.3.weight", "blk.0.ffn_down.3.weight"] {
+        for n in [
+            "blk.0.ffn_gate.3.weight",
+            "blk.0.ffn_up.3.weight",
+            "blk.0.ffn_down.3.weight",
+        ] {
             mixtral.tensors.insert(n.to_string(), q4k(vec![256, 1]));
         }
-        assert_eq!(fp(&mixtral, llama), known(EMBD_F32 + 576 + 144 + 3 * 144, 2 * 144));
+        assert_eq!(
+            fp(&mixtral, llama),
+            known(EMBD_F32 + 576 + 144 + 3 * 144, 2 * 144)
+        );
         let mut lfm = base.clone();
         for n in [
             "blk.0.feed_forward.w1.weight",
@@ -4249,17 +4329,33 @@ mod tests {
         ] {
             lfm.tensors.insert(n.to_string(), q4k(vec![256, 1]));
         }
-        lfm.tensors.insert("blk.0.shortconv.conv.weight".to_string(), q4k(vec![256, 1])); // dequantized kernel
-        assert_eq!(fp(&lfm, lfm2), known(EMBD_F32 + 576 + 144 + 4 * 144 + 1024, 2 * 144));
+        lfm.tensors
+            .insert("blk.0.shortconv.conv.weight".to_string(), q4k(vec![256, 1])); // dequantized kernel
+        assert_eq!(
+            fp(&lfm, lfm2),
+            known(EMBD_F32 + 576 + 144 + 4 * 144 + 1024, 2 * 144)
+        );
 
         // LFM2: an alias head is a head (counted once, no tied copy); for
         // any other loader it is dead weight and the embedding is tied.
-        for alias in ["lm_head.weight", "model.output.weight", "model.lm_head.weight"] {
+        for alias in [
+            "lm_head.weight",
+            "model.output.weight",
+            "model.lm_head.weight",
+        ] {
             let mut aliased = tied.clone();
             aliased.tensors.insert(alias.to_string(), q4k(vec![256, 4]));
             assert_eq!(scanned_head_bytes(&aliased), 576, "{alias}: scanned");
-            assert_eq!(fp(&aliased, lfm2).dense_lower, EMBD_F32 + 144 + 576, "{alias}: LFM2 head");
-            assert_eq!(fp(&aliased, q).dense_lower, 576 + 144 + 576, "{alias}: alias dropped, tied");
+            assert_eq!(
+                fp(&aliased, lfm2).dense_lower,
+                EMBD_F32 + 144 + 576,
+                "{alias}: LFM2 head"
+            );
+            assert_eq!(
+                fp(&aliased, q).dense_lower,
+                576 + 144 + 576,
+                "{alias}: alias dropped, tied"
+            );
         }
 
         // LFM2 embedding aliases: the table under `model.embed_tokens.weight`
@@ -4267,8 +4363,14 @@ mod tests {
         // the tied head's fallback.
         let mut lfm2_embd = tied.clone();
         lfm2_embd.tensors.remove("token_embd.weight");
-        lfm2_embd.tensors.insert("model.embed_tokens.weight".to_string(), q4k(vec![256, 4]));
-        assert_eq!(resident_head_bytes(&lfm2_embd, lfm2), 576, "alias table is the tied head");
+        lfm2_embd
+            .tensors
+            .insert("model.embed_tokens.weight".to_string(), q4k(vec![256, 4]));
+        assert_eq!(
+            resident_head_bytes(&lfm2_embd, lfm2),
+            576,
+            "alias table is the tied head"
+        );
         assert_eq!(fp(&lfm2_embd, lfm2).dense_lower, EMBD_F32 + 144 + 576);
         // Another loader never probes that name: a tensor no rule names
         // (quantized..f32), and no head.
@@ -4280,10 +4382,20 @@ mod tests {
         // can read, so exactly one table is resident — the smaller in the
         // lower bound, the larger in the upper — plus the tied head copy.
         let mut two_tables = tied.clone();
-        two_tables.tensors.insert("model.embed_tokens.weight".to_string(), q4k(vec![64, 4])); // 256 elems
+        two_tables
+            .tensors
+            .insert("model.embed_tokens.weight".to_string(), q4k(vec![64, 4])); // 256 elems
         let t = fp(&two_tables, lfm2);
-        assert_eq!(t.dense_lower, 256 * 4 + 144 + 576, "smaller table, f32, plus the head copy");
-        assert_eq!(t.dense_upper, EMBD_F32 + 144 + 576, "larger table, f32, plus the head copy");
+        assert_eq!(
+            t.dense_lower,
+            256 * 4 + 144 + 576,
+            "smaller table, f32, plus the head copy"
+        );
+        assert_eq!(
+            t.dense_upper,
+            EMBD_F32 + 144 + 576,
+            "larger table, f32, plus the head copy"
+        );
         // Another loader probes only token_embd.weight: the alias is an
         // unknown tensor, the table is counted once as before.
         let t = fp(&two_tables, q);
@@ -4293,18 +4405,29 @@ mod tests {
         // The MoE router is per loader: Mixtral (llama) keeps it a quantized
         // QMatMul, the joshua-native loaders read it as f32.
         let mut router = base.clone();
-        router.tensors.insert("blk.0.ffn_gate_inp.weight".to_string(), q4k(vec![256, 1]));
-        assert_eq!(fp(&router, llama), known(EMBD_F32 + 576 + 144 + 144, 2 * 144));
+        router
+            .tensors
+            .insert("blk.0.ffn_gate_inp.weight".to_string(), q4k(vec![256, 1]));
+        assert_eq!(
+            fp(&router, llama),
+            known(EMBD_F32 + 576 + 144 + 144, 2 * 144)
+        );
         assert_eq!(fp(&router, q), known(576 + 576 + 144 + 1024, 2 * 144));
 
         // Several head names present: only one ends up resident.  Sizing
         // cannot know which read succeeds, so it keeps the largest candidate
         // — the big alias over a small (possibly unreadable) output.weight.
         let mut two = tied.clone();
-        two.tensors.insert("output.weight".to_string(), q4k(vec![64, 4])); // 256 elems = 144 B
-        two.tensors.insert("lm_head.weight".to_string(), q4k(vec![256, 4]));
+        two.tensors
+            .insert("output.weight".to_string(), q4k(vec![64, 4])); // 256 elems = 144 B
+        two.tensors
+            .insert("lm_head.weight".to_string(), q4k(vec![256, 4]));
         assert_eq!(scanned_head_bytes(&two), 144 + 576);
-        assert_eq!(resident_head_bytes(&two, lfm2), 576, "largest LFM2 candidate");
+        assert_eq!(
+            resident_head_bytes(&two, lfm2),
+            576,
+            "largest LFM2 candidate"
+        );
         assert_eq!(fp(&two, lfm2).dense_lower, EMBD_F32 + 144 + 576);
         // Another loader: candidates are output.weight and the table fallback.
         assert_eq!(resident_head_bytes(&two, q), 576);
@@ -4443,7 +4566,8 @@ mod tests {
             response = w.push(&tk, t, response, &all).unwrap();
             let oracle = tk.decode(all.as_slice(), false).unwrap();
             assert_eq!(
-                response, oracle,
+                response,
+                oracle,
                 "incremental text diverged from whole-buffer decode at step {}",
                 all.len()
             );
@@ -4506,7 +4630,10 @@ mod tests {
         );
         let (dense, experts) = weight_ranges(&header, 4096 + 5 * 1024 * 1024 + 300);
         // attn_q 0..100; ffn_norm (5MiB+100)..(5MiB+200)
-        assert_eq!(dense, vec![(4096, 100), (4096 + 5 * 1024 * 1024 + 100, 100)]);
+        assert_eq!(
+            dense,
+            vec![(4096, 100), (4096 + 5 * 1024 * 1024 + 100, 100)]
+        );
         // gate_exps 100..(5MiB+100) and up_exps (5MiB+200)..(5MiB+300) are
         // separated by only the 100-byte norm tensor — a sub-page gap, so the
         // two expert ranges merge into one.

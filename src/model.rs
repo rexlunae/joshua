@@ -268,12 +268,12 @@ impl Architecture {
 
     /// Whether this architecture's "experts on the device" form is a bounded
     /// VRAM cache over the host pool rather than an upload of the whole pool:
-    /// `deepseek4` on OpenCL keeps every routed expert borrowed from the
+    /// `deepseek4` on OpenCL or SYCL keeps every routed expert borrowed from the
     /// mapping and caches a budgeted subset on the card (the ~72 GiB pool of
     /// V4-Flash never fits), so an `ExpertPlacement::Device` request means
     /// "size that cache" (see `--vram-expert-cache`).
     pub fn device_experts_are_a_cache(&self, device: &Device) -> bool {
-        matches!(self, Self::DeepSeek4) && device.is_opencl()
+        matches!(self, Self::DeepSeek4) && (device.is_opencl() || device.is_sycl())
     }
 
     pub fn is_known_llama_cpp_arch(name: &str) -> bool {
@@ -370,7 +370,8 @@ impl QuantizedModel {
     /// hopping across the bus — which is what runs a model larger than the
     /// device's memory (see [`crate::placement::ExpertPlacement`]).
     /// `deepseek4` always keeps a mapped model's experts borrowed on the
-    /// CPU; with a `device_expert_cache_bytes` budget on an OpenCL device it
+    /// CPU; with a `device_expert_cache_bytes` budget on an OpenCL or SYCL
+    /// device it
     /// also runs a bounded cache of them on the card (see
     /// [`crate::quantized_deepseek4::ModelWeights::from_gguf_mmap_placed`]).
     /// Dense architectures ignore the parameter.
@@ -460,36 +461,42 @@ impl QuantizedModel {
             Architecture::Qwen3 => {
                 quantized_qwen3::ModelWeights::from_gguf(gguf, reader, device).map(Self::Qwen3)
             }
-            Architecture::Qwen3Moe => crate::quantized_qwen3_moe::GGUFQWenMoE::from_gguf_mmap_placed(
-                gguf,
-                reader,
-                device,
-                expert_device,
-                mmap,
-                device_expert_cache_bytes,
-            )
-            .map(Self::Qwen3Moe),
-            Architecture::DeepSeek2 => crate::quantized_deepseek2::ModelWeights::from_gguf_mmap_placed(
-                gguf,
-                reader,
-                device,
-                expert_device,
-                mmap,
-                device_expert_cache_bytes,
-            )
-            .map(Self::DeepSeek2),
-            Architecture::DeepSeek4 => crate::quantized_deepseek4::ModelWeights::from_gguf_mmap_placed(
-                gguf,
-                raw,
-                reader,
-                device,
-                expert_device,
-                mmap,
-                file,
-                n_ctx,
-                device_expert_cache_bytes,
-            )
-            .map(Self::DeepSeek4),
+            Architecture::Qwen3Moe => {
+                crate::quantized_qwen3_moe::GGUFQWenMoE::from_gguf_mmap_placed(
+                    gguf,
+                    reader,
+                    device,
+                    expert_device,
+                    mmap,
+                    device_expert_cache_bytes,
+                )
+                .map(Self::Qwen3Moe)
+            }
+            Architecture::DeepSeek2 => {
+                crate::quantized_deepseek2::ModelWeights::from_gguf_mmap_placed(
+                    gguf,
+                    reader,
+                    device,
+                    expert_device,
+                    mmap,
+                    device_expert_cache_bytes,
+                )
+                .map(Self::DeepSeek2)
+            }
+            Architecture::DeepSeek4 => {
+                crate::quantized_deepseek4::ModelWeights::from_gguf_mmap_placed(
+                    gguf,
+                    raw,
+                    reader,
+                    device,
+                    expert_device,
+                    mmap,
+                    file,
+                    n_ctx,
+                    device_expert_cache_bytes,
+                )
+                .map(Self::DeepSeek4)
+            }
         }
     }
 
@@ -515,7 +522,10 @@ impl QuantizedModel {
     /// Whether [`QuantizedModel::new_session`] can derive sessions from this
     /// instance without copying its weights.
     pub fn supports_shared_weights(&self) -> bool {
-        matches!(self, Self::Qwen3Moe(_) | Self::DeepSeek2(_) | Self::DeepSeek4(_))
+        matches!(
+            self,
+            Self::Qwen3Moe(_) | Self::DeepSeek2(_) | Self::DeepSeek4(_)
+        )
     }
 
     /// Whether the loaded token-embedding table is held quantized rather
@@ -693,7 +703,10 @@ impl QuantizedModel {
     /// the standard chunked prefill.
     /// Whether this architecture has a native layer-streaming prefill path.
     pub fn supports_streaming(&self) -> bool {
-        matches!(self, Self::Qwen3Moe(_) | Self::DeepSeek2(_) | Self::DeepSeek4(_))
+        matches!(
+            self,
+            Self::Qwen3Moe(_) | Self::DeepSeek2(_) | Self::DeepSeek4(_)
+        )
     }
 
     pub fn prefill_streamed(
@@ -718,10 +731,7 @@ impl QuantizedModel {
     /// architectures report an unsupported error so a caller can fall back
     /// to iterating sequences individually.  Part of the library API; the
     /// engine's own request paths do not batch yet.
-    pub fn forward_sequences(
-        &mut self,
-        seqs: &[(&Tensor, usize)],
-    ) -> Result<Vec<Vec<f32>>> {
+    pub fn forward_sequences(&mut self, seqs: &[(&Tensor, usize)]) -> Result<Vec<Vec<f32>>> {
         match self {
             Self::DeepSeek4(m) => m.forward_sequences(seqs),
             _ => Err(candle_core::Error::Msg(

@@ -381,6 +381,9 @@ pub fn instances_for_memory(free_bytes: u64, instance_bytes: u64, headroom_bytes
 ///   reserve are what absorb the difference).  A device sharing host memory
 ///   (an iGPU, a CPU runtime such as pocl) returns `None` like Metal: its
 ///   "global memory" is system RAM, which the caller already budgets.
+/// * SYCL: the device's global memory as both figures, as for a discrete
+///   OpenCL device (the backend allocates explicit device USM even on an
+///   iGPU, so its global memory is the right budget).
 /// * CPU / Vulkan: `None`.
 pub fn device_memory_info(device: &candle_core::Device) -> Option<(u64, u64)> {
     match device {
@@ -391,6 +394,11 @@ pub fn device_memory_info(device: &candle_core::Device) -> Option<(u64, u64)> {
             if dev.host_unified_memory() {
                 return None;
             }
+            let total = dev.global_mem_size()?;
+            (total > 0).then_some((total, total))
+        }
+        #[cfg(feature = "sycl")]
+        candle_core::Device::Sycl(dev) => {
             let total = dev.global_mem_size()?;
             (total > 0).then_some((total, total))
         }
