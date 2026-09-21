@@ -100,6 +100,13 @@ fn backends() -> Vec<Backend> {
             eprintln!("matrix: vulkan unavailable (no device)");
         }
     }
+    #[cfg(feature = "sycl")]
+    {
+        match Device::new_sycl(0) {
+            Ok(d) => v.push(Backend { name: "sycl", device: d }),
+            Err(e) => eprintln!("matrix: sycl unavailable: {e}"),
+        }
+    }
     #[cfg(feature = "metal")]
     if let Ok(d) = Device::metal_if_available(0) {
         if !d.is_cpu() {

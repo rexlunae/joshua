@@ -445,10 +445,10 @@ impl Device {
     }
 
     pub fn sycl_if_available(ordinal: usize) -> Result<Self> {
-        if crate::utils::sycl_is_available() {
-            Self::new_sycl(ordinal)
-        } else {
-            Ok(Self::Cpu)
+        match Self::new_sycl(ordinal) {
+            Ok(d) => Ok(d),
+            // No usable SYCL runtime/ICD/device: fall back to CPU.
+            Err(_) => Ok(Self::Cpu),
         }
     }
 

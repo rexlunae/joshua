@@ -53,7 +53,7 @@ fn main() -> candle_core::Result<()> {
         return Ok(());
     }
     if let Device::Vulkan(vk) = &dev {
-        println!("limits: {:?}", vk.limits());
+        println!("limits: {:?}", "vulkan device");
     }
     let mut all_ok = true;
     for seq in [8usize, 32, 48, 64, 72, 80, 88, 96, 104, 128, 160, 200] {

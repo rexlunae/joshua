@@ -3,6 +3,7 @@
 use crate::{Error, Layout, Result};
 use std::ffi::c_void;
 use super::bridge;
+const WG: usize = 64; // matches kernels.hpp
 // ─── Gating / diagnostics ────────────────────────────────────────────────────
 
 /// Native kernels are on unless `JOSHUA_SYCL_NATIVE=0`.
@@ -203,7 +204,7 @@ pub struct Kernel {
 }
 impl Kernel {
     pub fn new(_ctx: usize, _dev: usize, queue: usize, name: &str) -> Result<Self> {
-        Ok(Self { queue, name: std::ffi::CString::new(name).map_err(Error::wrap)?, args: Vec::new(), wg: 256 })
+        Ok(Self { queue, name: std::ffi::CString::new(name).map_err(Error::wrap)?, args: Vec::new(), wg: WG })
     }
     fn set(&mut self, size: usize, ptr: *const c_void) -> Result<&mut Self> {
         self.args.push(unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), size) }.to_vec());
@@ -228,8 +229,8 @@ impl Kernel {
             if local.len() != global.len() { crate::bail!("sycl: local/global rank mismatch"); }
             l[..local.len()].copy_from_slice(local);
         } else {
-            l[0] = 256;
-            g[0] = g[0].checked_add(255).ok_or_else(|| Error::Msg("sycl: launch size overflow".into()))? / 256 * 256;
+            l[0] = WG;
+            g[0] = g[0].checked_add(WG - 1).ok_or_else(|| Error::Msg("sycl: launch size overflow".into()))? / WG * WG;
         }
         let args: Vec<_> = self.args.iter().map(|a| bridge::Arg { data: a.as_ptr().cast(), size: a.len() }).collect();
         unsafe { bridge::launch(self.queue, &self.name, &args, &g, &l) }?;

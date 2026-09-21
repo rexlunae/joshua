@@ -242,6 +242,8 @@ force the CPU round-trip, and `JOSHUA_SYCL_TRACE=1` to log every native
 kernel and fallback.  Supported operations run as native SYCL kernels
 (f32 GEMM, RMSNorm, RoPE, softmax, reductions, index/gather/scatter), and
 block-quantized weights stay in their GGUF format on the device.
+On Linux, `JOSHUA_SYCL_RUNTIME` can point to `libsycl.so.9` to preload
+the oneAPI runtime when it is not on the system library path.
 
 ### Models larger than VRAM
 

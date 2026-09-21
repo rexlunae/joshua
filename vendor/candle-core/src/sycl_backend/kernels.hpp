@@ -18,7 +18,7 @@ using sycl::tanh; using sycl::sqrt; using sycl::erf; using sycl::fabs;
 using sycl::ceil; using sycl::floor; using sycl::round; using sycl::pow;
 using sycl::fmax; using sycl::fmin; using sycl::rsqrt; using sycl::isnan;
 using sycl::min; using sycl::max; using sycl::dot;
-constexpr int WG = 256;
+constexpr int WG = 64;
 inline float as_float(uint v) { return sycl::bit_cast<float>(v); }
 inline float vload_half(size_t i, const half* p) { return static_cast<float>(p[i]); }
 inline void vstore_half(float v, size_t i, half* p) { p[i] = half(v); }
@@ -98,31 +98,37 @@ inline int off_of(int lin, const Idx* ix, const int* s, int o) {
 #define OP_SIGMOID 19
 
 inline float unary_f(float v, int op) {
-    switch (op) {
-        case OP_EXP: return exp(v);
-        case OP_LOG: return log(v);
-        case OP_SIN: return sin(v);
-        case OP_COS: return cos(v);
-        case OP_TANH: return tanh(v);
-        case OP_NEG: return -v;
-        case OP_RECIP: return 1.0f / v;
-        case OP_SQR: return v * v;
-        case OP_SQRT: return sqrt(v);
-        // candle's Gelu is the tanh approximation.
-        case OP_GELU: return 0.5f * v * (1.0f + tanh(0.79788456080286535588f * v * (1.0f + 0.044715f * v * v)));
-        case OP_GELU_ERF: return 0.5f * v * (1.0f + erf(v * 0.70710678118654752440f));
-        case OP_ERF: return erf(v);
-        case OP_SILU: return v / (1.0f + exp(-v));
-        case OP_ABS: return fabs(v);
-        case OP_CEIL: return ceil(v);
-        case OP_FLOOR: return floor(v);
-        case OP_ROUND: return round(v);
-        case OP_RELU: return v > 0.0f ? v : 0.0f;
-        case OP_SIGN: return v > 0.0f ? 1.0f : (v < 0.0f ? -1.0f : 0.0f);
-        case OP_SIGMOID: return 1.0f / (1.0f + exp(-v));
-        default: return v;
-    }
+    // sycl::native math (single GPU instructions) instead of the precise
+    // expansions: the DPC++ compiler inlines every branch of the op table,
+    // and the precise expansions blow the Arc B50's register budget — the
+    // launch fails with UR_RESULT_ERROR_OUT_OF_RESOURCES (or, outside gdb,
+    // corrupts runtime state and the next launch segfaults).  The OpenCL
+    // backend gets this for free because the OpenCL compiler emits calls to
+    // precompiled library functions.
+    if (op == OP_EXP) return sycl::native::exp(v);
+    if (op == OP_LOG) return sycl::native::log(v);
+    if (op == OP_SIN) return sycl::native::sin(v);
+    if (op == OP_COS) return sycl::native::cos(v);
+    if (op == OP_TANH) return 1.0f - 2.0f / (sycl::native::exp(2.0f * v) + 1.0f);
+    if (op == OP_NEG) return -v;
+    if (op == OP_RECIP) return sycl::native::recip(v);
+    if (op == OP_SQR) return v * v;
+    if (op == OP_SQRT) return sycl::native::sqrt(v);
+    if (op == OP_GELU) return 0.5f * v * (1.0f + (1.0f - 2.0f / (sycl::native::exp(2.0f * 0.79788456080286535588f * v * (1.0f + 0.044715f * v * v)) + 1.0f)));
+    if (op == OP_GELU_ERF) return 0.5f * v * (1.0f + erf(v * 0.70710678118654752440f));
+    if (op == OP_ERF) return erf(v);
+    if (op == OP_SILU) return v / (1.0f + sycl::native::exp(-v));
+    if (op == OP_ABS) return fabs(v);
+    if (op == OP_CEIL) return ceil(v);
+    if (op == OP_FLOOR) return floor(v);
+    if (op == OP_ROUND) return round(v);
+    if (op == OP_RELU) return v > 0.0f ? v : 0.0f;
+    if (op == OP_SIGN) return v > 0.0f ? 1.0f : (v < 0.0f ? -1.0f : 0.0f);
+    if (op == OP_SIGMOID) return 1.0f / (1.0f + sycl::native::exp(-v));
+    return v;
 }
+
+
 
 
 
@@ -1132,7 +1138,7 @@ struct Kernels {
             int sam, int sak, int sbk, int sbn,
             int oa, int ob, int oc, int ba, int bb, int bc, int b_kc) const {
     auto &As = *reinterpret_cast<float (*)[TK][TM + 1]>(scratch + (0));
-    auto &Bs = *reinterpret_cast<float (*)[TK][TN + 1]>(scratch + (sizeof(float) * (TK * TM + 1)));
+    auto &Bs = *reinterpret_cast<float (*)[TK][TN + 1]>(scratch + (sizeof(float) * (TK * (TM + 1))));
     int tx = item.get_local_id(2 - 0), ty = item.get_local_id(2 - 1);
     int m0 = item.get_group(2 - 1) * TM, n0 = item.get_group(2 - 0) * TN;
     int bz = item.get_global_id(2 - 2);

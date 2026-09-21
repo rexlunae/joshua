@@ -2,6 +2,55 @@
 //! needed to compile the Rust crate, including on machines without SYCL.
 use crate::{Error, Result};
 use std::ffi::{c_char, c_void, CStr};
+use std::path::{Path, PathBuf};
+
+unsafe fn load_library(path: &Path) -> std::result::Result<libloading::Library, libloading::Error> {
+    #[cfg(target_os = "linux")]
+    {
+        libloading::os::unix::Library::open(
+            Some(path),
+            libloading::os::unix::RTLD_NOW | libloading::os::unix::RTLD_GLOBAL,
+        ).map(Into::into)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        libloading::Library::new(path)
+    }
+}
+
+fn runtime_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(path) = std::env::var_os("JOSHUA_SYCL_RUNTIME") {
+        candidates.push(path.into());
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(home) = std::env::var_os("HOME") {
+        if let Ok(entries) = std::fs::read_dir(home) {
+            let mut roots: Vec<_> = entries.filter_map(|e| e.ok()).map(|e| e.path())
+                .filter(|p| p.file_name().and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("sycl-toolchain-"))).collect();
+            roots.sort();
+            if let Some(root) = roots.pop() {
+                candidates.push(root.join("lib/libsycl.so.9"));
+            }
+        }
+    }
+    candidates
+}
+
+fn bridge_candidates() -> Vec<PathBuf> {
+    if let Some(path) = std::env::var_os("JOSHUA_SYCL_LIBRARY") {
+        return vec![path.into()];
+    }
+    let mut candidates = vec![libloading::library_filename("joshua_sycl").into()];
+    #[cfg(target_os = "linux")]
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        candidates.push(home.join("joshua-sycl/build/libjoshua_sycl.so"));
+        candidates.push(home.join("joshua-sycl/libjoshua_sycl.so"));
+    }
+    candidates
+}
 
 #[repr(C)]
 pub struct Arg { pub data: *const c_void, pub size: usize }
@@ -10,18 +59,28 @@ macro_rules! api {
     ($($name:ident($($arg:ty),*) -> $ret:ty;)+) => {
         struct Api {
             _library: libloading::Library,
+            _runtime: Option<libloading::Library>,
             $($name: unsafe extern "C" fn($($arg),*) -> $ret,)+
         }
         impl Api {
             unsafe fn load() -> std::result::Result<Self, String> {
-                let path = std::env::var_os("JOSHUA_SYCL_LIBRARY")
-                    .unwrap_or_else(|| libloading::library_filename("joshua_sycl").into());
-                let library = libloading::Library::new(&path)
-                    .map_err(|e| format!("cannot load SYCL bridge {path:?}: {e}; build the SYCL bridge and set JOSHUA_SYCL_LIBRARY"))?;
+                let runtime = runtime_candidates().iter().find_map(|p| load_library(p).ok());
+                let mut loaded = None;
+                let mut errors = Vec::new();
+                for path in bridge_candidates() {
+                    match load_library(&path) {
+                        Ok(library) => { loaded = Some(library); break; }
+                        Err(e) => errors.push(format!("{path:?}: {e}")),
+                    }
+                }
+                let library = loaded.ok_or_else(|| format!(
+                    "cannot load SYCL bridge: {}; build the SYCL bridge and set JOSHUA_SYCL_LIBRARY",
+                    errors.join("; ")
+                ))?;
                 let version = library.get::<unsafe extern "C" fn() -> u32>(b"joshua_sycl_abi_version\0").map_err(|e| e.to_string())?;
                 if version() != 1 { return Err("SYCL bridge ABI version mismatch (expected 1)".into()); }
                 $(let $name = *library.get(concat!("joshua_sycl_", stringify!($name), "\0").as_bytes()).map_err(|e| e.to_string())?;)+
-                Ok(Self { _library: library, $($name,)+ })
+                Ok(Self { _library: library, _runtime: runtime, $($name,)+ })
             }
         }
     }
