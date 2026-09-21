@@ -44,8 +44,8 @@ enum DeviceArg {
     /// vulkan`; use `--device vulkan`). Bring-up target is the AMD Renoir iGPU.
     #[value(name = "vulkan")]
     Vulkan,
-    /// Intel SYCL / oneAPI DPC++ (build with `--features sycl`; use `--device
-    /// sycl`). Bring-up target is the Arc Pro B50.
+    /// SYCL 2020 (Intel oneAPI/LLVM `--features sycl` bridge via a dynamically
+    /// loaded libjoshua_sycl; build with `--features sycl`; use `--device sycl`).
     #[value(name = "sycl")]
     Sycl,
 }

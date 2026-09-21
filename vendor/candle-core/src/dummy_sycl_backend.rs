@@ -1,4 +1,4 @@
-//! Implementation of the OpenCL backend when OpenCL support has not been compiled in.
+//! Implementation of the SYCL backend when SYCL support has not been compiled in.
 //!
 #![allow(dead_code)]
 use crate::op::{BinaryOpT, CmpOp, ReduceOp, UnaryOpT};
@@ -29,7 +29,7 @@ impl SyclStorage {
 
 macro_rules! fail {
     () => {
-        unimplemented!("sycl support has not been enabled, add `SYCL` feature to enable.")
+        unimplemented!("sycl support has not been enabled, add `sycl` feature to enable.")
     };
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -38,12 +38,6 @@ pub struct DeviceId(usize);
 impl SyclDevice {
     pub fn new_with_stream(_: usize) -> Result<Self> {
         Err(Error::NotCompiledWithSyclSupport)
-    }
-    pub fn name(&self) -> &str {
-        "sycl (not compiled)"
-    }
-    pub fn global_mem_size(&self) -> Option<u64> {
-        None
     }
     pub fn id(&self) -> DeviceId {
         DeviceId(0)
@@ -333,7 +327,7 @@ pub fn gemm_reduced_precision_f32() -> bool {
 /// allowed with f32 GEMMs.
 pub fn set_gemm_reduced_precision_f32(_b: bool) {}
 
-/// Block-quantized OpenCL storage stub (the `SYCL` feature is off).
+/// Block-quantized SYCL storage stub (the `sycl` feature is off).
 #[derive(Debug)]
 pub struct QSyclStorage {
     pub elem_count: usize,
@@ -374,8 +368,4 @@ impl QSyclStorage {
     pub fn embedding(&self, _: usize, _: usize, _: &SyclStorage, _: &Layout) -> Result<SyclStorage> {
         Err(Error::NotCompiledWithSyclSupport)
     }
-}
-
-pub fn new_sycl_device(_ordinal: usize) -> Result<SyclDevice> {
-    Err(Error::NotCompiledWithSyclSupport)
 }

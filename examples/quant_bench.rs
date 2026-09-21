@@ -12,12 +12,12 @@
 
 use candle_core::quantized::GgmlDType;
 
-const QT_IQ2_XXS: i32 = 16;
 const IQ2_XXS_TSIZE: i32 = 66;
 const IQ2_XXS_QK: usize = 256;
 
 #[cfg(all(feature = "sycl", target_os = "linux"))]
 fn sycl_bandwidth(n: usize, k: usize, iters: usize) -> Option<f64> {
+    use candle_core::sycl_backend::{kernels, SyclStorage};
     let dev = match candle_core::sycl_backend::SyclDevice::new(0) {
         Ok(d) => d,
         Err(e) => {
@@ -26,26 +26,25 @@ fn sycl_bandwidth(n: usize, k: usize, iters: usize) -> Option<f64> {
         }
     };
     let wbytes = n * (k / IQ2_XXS_QK) * IQ2_XXS_TSIZE as usize;
-    let wb = dev.alloc(wbytes).unwrap();
     // Data content does not affect GEMV streaming bandwidth; fill with a
     // repeating byte so the dequant path stays on its normal branch.
     let fill: Vec<u8> = (0..wbytes).map(|i| (i % 251) as u8).collect();
-    dev.write(wb, 0, &fill).unwrap();
-    let xb = dev.alloc(k * 4).unwrap();
+    let wb = SyclStorage::from_vec(fill, &dev).unwrap();
     let x: Vec<u8> = (0..k * 4).map(|i| (i % 7) as u8).collect();
-    dev.write(xb, 0, &x).unwrap();
-    let ob = dev.alloc(n * 4).unwrap();
+    let xb = SyclStorage::from_vec(x, &dev).unwrap();
+    let ob = dev.alloc(candle_core::DType::F32, n).unwrap();
+    let ctx = dev.ctx();
 
     // warmup
     for _ in 0..5 {
-        dev.run_qgemv_routed(QT_IQ2_XXS, IQ2_XXS_QK as i32, IQ2_XXS_TSIZE, true, xb, wb, ob, n, k, 0, 0, 1).unwrap();
+        kernels::run_qgemv(&ctx, GgmlDType::Iq2Xxs, xb.buffer, wb.buffer, ob.buffer, 1, n, k, 0, 0).unwrap();
     }
-    dev.finish().unwrap();
+    dev.synchronize().unwrap();
     let t0 = std::time::Instant::now();
     for _ in 0..iters {
-        dev.run_qgemv_routed(QT_IQ2_XXS, IQ2_XXS_QK as i32, IQ2_XXS_TSIZE, true, xb, wb, ob, n, k, 0, 0, 1).unwrap();
+        kernels::run_qgemv(&ctx, GgmlDType::Iq2Xxs, xb.buffer, wb.buffer, ob.buffer, 1, n, k, 0, 0).unwrap();
     }
-    dev.finish().unwrap();
+    dev.synchronize().unwrap();
     let el = t0.elapsed().as_secs_f64();
     let gbs = (wbytes as f64) * (iters as f64) / el / 1e9;
     println!("  sycl  k_qgemv_mr [{n}, {k}]: {gbs:.1} GB/s ({iters} iters, {wbytes} B/launch)");

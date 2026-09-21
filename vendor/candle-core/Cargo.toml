@@ -31,6 +31,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/huggingface/candle"
 
 [features]
+sycl = ["dep:libloading"]
 accelerate = ["dep:accelerate-src"]
 cuda = [
     "cudarc",
@@ -46,11 +47,6 @@ default = []
 # OpenCL accelerator backend (Intel Arc/iGPU via the OpenCL ICD).
 # Hand-rolled libOpenCL FFI; no extra crate dep. Off by default.
 opencl = []
-
-# SYCL backend (Intel oneAPI / DPC++ via a runtime-loaded C ABI bridge).
-# The kernels build out-of-tree into libjoshua_sycl.so with the oneAPI
-# toolchain (sycl_backend/CMakeLists.txt); off by default.
-sycl = ["dep:libloading"]
 
 # Vulkan accelerator backend (iGPU/dGPU via libvulkan.so, e.g. RADV).
 # Uses ash (libloading-injected, no hard link) + naga (pure-Rust GLSL→SPIR-V
@@ -170,10 +166,6 @@ path = "tests/tensor_tests.rs"
 name = "bench_main"
 path = "benches/bench_main.rs"
 harness = false
-
-[dependencies.libloading]
-version = "0.8"
-optional = true
 
 [dependencies.accelerate-src]
 version = "0.3.2"
@@ -315,3 +307,7 @@ optional = true
 version = "0.22.0"
 features = ["onig"]
 default-features = false
+
+[dependencies.libloading]
+version = "0.8"
+optional = true

@@ -411,6 +411,10 @@ pub fn opencl_is_available() -> bool {
     cfg!(feature = "opencl")
 }
 
+pub fn sycl_is_available() -> bool {
+    cfg!(feature = "sycl")
+}
+
 pub fn vulkan_is_available() -> bool {
     cfg!(feature = "vulkan")
 }

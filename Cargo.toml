@@ -33,6 +33,7 @@ name = "joshua"
 path = "src/lib.rs"
 
 [features]
+sycl = ["candle-core/sycl", "candle-nn/sycl"]
 default = []
 # GPU acceleration. CPU inference stays pure Rust; enabling one of these
 # pulls in the corresponding candle backend (CUDA needs the NVIDIA toolkit
@@ -56,7 +57,6 @@ opencl = ["candle-core/opencl", "candle-nn/opencl"]
 # system Vulkan loader + ICD (libvulkan.so, e.g. mesa-vulkan-drivers) at
 # runtime; ash loads it dynamically so there is no hard link dependency.
 vulkan = ["candle-core/vulkan", "candle-nn/vulkan"]
-sycl = ["candle-core/sycl"]
 # HTTPS termination via rustls. Opt-in because the ring crypto provider
 # compiles C/assembly, which would break the default build's
 # "only a Rust toolchain required" guarantee.

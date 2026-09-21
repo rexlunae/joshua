@@ -1,7 +1,8 @@
 use crate::backend::{BackendDevice, BackendStorage};
 use crate::op::{self, CmpOp, ReduceOp};
 use crate::scalar::Scalar;
-use crate::{CpuStorage, CudaStorage, DType, Device, Error, Layout, MetalStorage, OpenClStorage, SyclStorage, Result, Shape, VulkanStorage};
+use crate::{CpuStorage, CudaStorage, DType, Device, Error, Layout, MetalStorage, OpenClStorage, Result, Shape, VulkanStorage};
+use crate::SyclStorage;
 use crate::{CustomOp1, CustomOp2, CustomOp3, InplaceOp1, InplaceOp2, InplaceOp3};
 
 // We do not want to implement Clone on Storage as cloning may fail because of
@@ -70,12 +71,13 @@ impl Storage {
         let rhs_device = rhs.device();
         let lhs = lhs_device.location();
         let rhs = rhs_device.location();
-        let same_device = if self.device().is_metal() || self.device().is_vulkan() {
-            // On Metal and Vulkan we require the device to be exactly the same
-            // rather than having the same location: two independently-created
-            // VulkanDevice/MetalDevice are distinct logical devices, and a buffer
-            // handle is only valid on the device that created it. In cuda this is
-            // not necessary as all CudaDevice on the same GPU share one stream.
+        let same_device = if self.device().is_metal() || self.device().is_vulkan() || self.device().is_sycl() {
+            // On Metal, Vulkan and SYCL we require the device to be exactly the
+            // same rather than having the same location: two independently-created
+            // devices are distinct logical devices (each SYCL device owns its own
+            // context and USM buffers), and a buffer handle is only valid on the
+            // device that created it. In cuda this is not necessary as all
+            // CudaDevice on the same GPU share one stream.
             lhs_device.same_device(&rhs_device)
         } else {
             lhs == rhs
@@ -624,6 +626,10 @@ impl Storage {
                 let s = inp.conv1d(l, kernel, kernel_l, params)?;
                 Ok(Self::OpenCl(s))
             }
+            (Storage::Sycl(inp), Storage::Sycl(kernel)) => {
+                let s = inp.conv1d(l, kernel, kernel_l, params)?;
+                Ok(Self::Sycl(s))
+            }
             (Storage::Vulkan(inp), Storage::Vulkan(kernel)) => {
                 let s = inp.conv1d(l, kernel, kernel_l, params)?;
                 Ok(Self::Vulkan(s))
@@ -662,6 +668,10 @@ impl Storage {
             (Storage::OpenCl(inp), Storage::OpenCl(kernel)) => {
                 let s = inp.conv_transpose1d(l, kernel, kernel_l, params)?;
                 Ok(Self::OpenCl(s))
+            }
+            (Storage::Sycl(inp), Storage::Sycl(kernel)) => {
+                let s = inp.conv_transpose1d(l, kernel, kernel_l, params)?;
+                Ok(Self::Sycl(s))
             }
             (Storage::Vulkan(inp), Storage::Vulkan(kernel)) => {
                 let s = inp.conv_transpose1d(l, kernel, kernel_l, params)?;
@@ -702,6 +712,10 @@ impl Storage {
                 let s = inp.conv2d(l, kernel, kernel_l, params)?;
                 Ok(Self::OpenCl(s))
             }
+            (Storage::Sycl(inp), Storage::Sycl(kernel)) => {
+                let s = inp.conv2d(l, kernel, kernel_l, params)?;
+                Ok(Self::Sycl(s))
+            }
             (Storage::Vulkan(inp), Storage::Vulkan(kernel)) => {
                 let s = inp.conv2d(l, kernel, kernel_l, params)?;
                 Ok(Self::Vulkan(s))
@@ -740,6 +754,10 @@ impl Storage {
             (Storage::OpenCl(inp), Storage::OpenCl(kernel)) => {
                 let s = inp.conv_transpose2d(l, kernel, kernel_l, params)?;
                 Ok(Self::OpenCl(s))
+            }
+            (Storage::Sycl(inp), Storage::Sycl(kernel)) => {
+                let s = inp.conv_transpose2d(l, kernel, kernel_l, params)?;
+                Ok(Self::Sycl(s))
             }
             (Storage::Vulkan(inp), Storage::Vulkan(kernel)) => {
                 let s = inp.conv_transpose2d(l, kernel, kernel_l, params)?;

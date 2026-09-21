@@ -10,7 +10,7 @@ pub enum DeviceLocation {
     Cuda { gpu_id: usize },
     Metal { gpu_id: usize },
     OpenCl { gpu_id: usize },
-    Sycl { ordinal: usize },
+    Sycl { gpu_id: usize },
     Vulkan { gpu_id: usize },
 }
 
@@ -245,12 +245,12 @@ impl Device {
         Ok(Self::OpenCl(crate::OpenClDevice::new(ordinal)?))
     }
 
-    pub fn new_vulkan(ordinal: usize) -> Result<Self> {
-        Ok(Self::Vulkan(crate::VulkanDevice::new(ordinal)?))
+    pub fn new_sycl(ordinal: usize) -> Result<Self> {
+        Ok(Self::Sycl(crate::SyclDevice::new(ordinal)?))
     }
 
-    pub fn new_sycl(ordinal: usize) -> Result<Self> {
-        Ok(Self::Sycl(crate::new_sycl_device(ordinal)?))
+    pub fn new_vulkan(ordinal: usize) -> Result<Self> {
+        Ok(Self::Vulkan(crate::VulkanDevice::new(ordinal)?))
     }
 
     pub fn as_cuda_device(&self) -> Result<&crate::CudaDevice> {
@@ -267,10 +267,10 @@ impl Device {
     pub fn as_opencl_device(&self) -> Result<&crate::OpenClDevice> {
         match self {
             Self::OpenCl(d) => Ok(d),
+            Self::Sycl(_) => crate::bail!("expected an opencl device, got SYCL"),
             Self::Cpu => crate::bail!("expected an opencl device, got cpu"),
             Self::Cuda(_) => crate::bail!("expected an opencl device, got cuda"),
             Self::Metal(_) => crate::bail!("expected an opencl device, got Metal"),
-            Self::Sycl(_) => crate::bail!("expected an opencl device, got Sycl"),
             Self::Vulkan(_) => crate::bail!("expected an opencl device, got Vulkan"),
         }
     }
@@ -278,11 +278,11 @@ impl Device {
     pub fn as_sycl_device(&self) -> Result<&crate::SyclDevice> {
         match self {
             Self::Sycl(d) => Ok(d),
-            Self::Cpu => crate::bail!("expected a sycl device, got cpu"),
-            Self::Cuda(_) => crate::bail!("expected a sycl device, got cuda"),
-            Self::Metal(_) => crate::bail!("expected a sycl device, got Metal"),
-            Self::OpenCl(_) => crate::bail!("expected a sycl device, got OpenCl"),
-            Self::Vulkan(_) => crate::bail!("expected a sycl device, got Vulkan"),
+            Self::OpenCl(_) => crate::bail!("expected a sycl device, got OpenCL"),
+            Self::Cpu => crate::bail!("expected an sycl device, got cpu"),
+            Self::Cuda(_) => crate::bail!("expected an sycl device, got cuda"),
+            Self::Metal(_) => crate::bail!("expected an sycl device, got Metal"),
+            Self::Vulkan(_) => crate::bail!("expected an sycl device, got Vulkan"),
         }
     }
 
@@ -393,12 +393,12 @@ impl Device {
         matches!(self, Self::OpenCl(_))
     }
 
-    pub fn is_vulkan(&self) -> bool {
-        matches!(self, Self::Vulkan(_))
-    }
-
     pub fn is_sycl(&self) -> bool {
         matches!(self, Self::Sycl(_))
+    }
+
+    pub fn is_vulkan(&self) -> bool {
+        matches!(self, Self::Vulkan(_))
     }
 
     pub fn supports_bf16(&self) -> bool {

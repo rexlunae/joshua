@@ -68,12 +68,8 @@ mod dummy_metal_backend;
 pub mod fault_slot;
 #[cfg(feature = "opencl")]
 pub mod opencl_backend;
-#[cfg(all(feature = "sycl", target_os = "linux"))]
-pub mod sycl_backend;
 #[cfg(not(feature = "opencl"))]
 pub mod dummy_opencl_backend;
-#[cfg(not(all(feature = "sycl", target_os = "linux")))]
-pub mod dummy_sycl_backend;
 #[cfg(feature = "vulkan")]
 pub mod vulkan_backend;
 #[cfg(not(feature = "vulkan"))]
@@ -150,12 +146,6 @@ pub use vulkan_backend::{QVulkanStorage, VulkanDevice, VulkanStorage};
 #[cfg(not(feature = "vulkan"))]
 pub use dummy_vulkan_backend::{QVulkanStorage, VulkanDevice, VulkanStorage};
 
-#[cfg(all(feature = "sycl", target_os = "linux"))]
-pub use sycl_backend::{new_sycl_device, QSyclStorage, SyclDevice, SyclStorage};
-
-#[cfg(not(all(feature = "sycl", target_os = "linux")))]
-pub use dummy_sycl_backend::{new_sycl_device, QSyclStorage, SyclDevice, SyclStorage};
-
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 
@@ -209,3 +199,12 @@ impl<M: Module> ModuleT for M {
         self.forward(xs)
     }
 }
+
+#[cfg(feature = "sycl")]
+pub mod sycl_backend;
+#[cfg(not(feature = "sycl"))]
+pub mod dummy_sycl_backend;
+#[cfg(feature = "sycl")]
+pub use sycl_backend::{QSyclStorage, SyclDevice, SyclStorage};
+#[cfg(not(feature = "sycl"))]
+pub use dummy_sycl_backend::{QSyclStorage, SyclDevice, SyclStorage};

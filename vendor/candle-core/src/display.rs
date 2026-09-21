@@ -21,8 +21,8 @@ impl Tensor {
             crate::DeviceLocation::OpenCl { gpu_id } => {
                 format!(", opencl:{gpu_id}")
             }
-            crate::DeviceLocation::Sycl { ordinal } => {
-                format!(", sycl:{ordinal}")
+            crate::DeviceLocation::Sycl { gpu_id } => {
+                format!(", sycl:{gpu_id}")
             }
             crate::DeviceLocation::Vulkan { gpu_id } => {
                 format!(", vulkan:{gpu_id}")
@@ -557,8 +557,8 @@ impl std::fmt::Display for Tensor {
             crate::DeviceLocation::OpenCl { gpu_id } => {
                 format!(", opencl:{gpu_id}")
             }
-            crate::DeviceLocation::Sycl { ordinal } => {
-                format!(", sycl:{ordinal}")
+            crate::DeviceLocation::Sycl { gpu_id } => {
+                format!(", sycl:{gpu_id}")
             }
             crate::DeviceLocation::Vulkan { gpu_id } => {
                 format!(", vulkan:{gpu_id}")

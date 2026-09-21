@@ -1,6 +1,6 @@
 //! SYCL bridge kernel parity tests (Intel Arc Pro B50 / any SYCL 2020 GPU).
 //!
-//! Every test drives the bridge directly (`joshua::sycl_backend`): alloc,
+//! Every test drives the bridge directly (`candle_core::sycl_backend`): alloc,
 //! write the input, launch one kernel, read the output, compare against a CPU
 //! reference computed in the test.  These are the correctness gate for the
 //! SYCL kernels on real hardware — the same role the OpenCL parity tests play
@@ -14,8 +14,10 @@
 //! layout used on the SYCL boxes.
 #![cfg(all(feature = "sycl", target_os = "linux"))]
 
-use candle_core::{Device, Tensor};
-use candle_core::sycl_backend::SyclDevice;
+use candle_core::backend::BackendStorage;
+use candle_core::{DType, Layout};
+use candle_core::quantized::GgmlDType;
+use candle_core::sycl_backend::{kernels, SyclDevice, SyclStorage};
 
 /// All tests share one device: the DPC++ runtime crashes when contexts are
 /// opened and closed concurrently from parallel test threads.
@@ -35,12 +37,16 @@ fn sycl_kernel_parity() {
         ("gemm", sycl_gemm_matches_cpu),
         ("qgemv_q8_0", sycl_qgemv_q8_0_matches_cpu),
         ("hembed", sycl_hembed_matches_cpu),
+        ("cast_f32_u32", sycl_cast_f32_u32_matches_cpu),
+        ("reduce_last_sum", sycl_reduce_last_sum_matches_cpu),
+        ("index_select", sycl_index_select_matches_cpu),
+        ("where", sycl_where_matches_cpu),
     ];
     let Some(dev) = device() else {
         eprintln!("SKIP: no SYCL device");
         return;
     };
-    eprintln!("SYCL device: {} ({} MiB)", dev.name(), dev.memory() / (1024 * 1024));
+    eprintln!("SYCL device: {} ({} MiB)", dev.name(), dev.global_mem_size().unwrap_or(0) / (1024 * 1024));
     for (name, test) in &tests {
         eprintln!("  {name}...");
         test(&dev);
@@ -66,6 +72,7 @@ fn assert_close(what: &str, dev: &[f32], cpu: &[f32], tol: f32) {
     let mut worst = 0.0f32;
     let mut wi = 0;
     for (i, (a, b)) in dev.iter().zip(cpu).enumerate() {
+        assert!(a.is_finite() && b.is_finite(), "{what}: non-finite value at {i}: dev={a} cpu={b}");
         // Relative to the magnitude of the expectation with an absolute
         // floor, so exact-zero expectations don't inflate the ratio.
         let rel = (a - b).abs() / b.abs().max(0.5);
@@ -86,51 +93,34 @@ fn assert_close(what: &str, dev: &[f32], cpu: &[f32], tol: f32) {
     }
 }
 
-fn f32_bytes(v: &[f32]) -> Vec<u8> {
-    v.iter().flat_map(|f| f.to_ne_bytes()).collect()
-}
-
-fn f32_from(bytes: &[u8]) -> Vec<f32> {
-    bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_ne_bytes(c.try_into().unwrap()))
-        .collect()
+fn read_f32(storage: &SyclStorage) -> Vec<f32> {
+    storage.to_cpu_storage().unwrap().as_slice::<f32>().unwrap().to_vec()
 }
 
 /// `o = x * mul + add` (kernel `k_affine_c`).
 fn sycl_affine_matches_cpu(dev: &SyclDevice) {
     let n = 4096;
     let x: Vec<f32> = (0..n).map(|i| ((i % 17) as f32 - 8.0) * 0.5).collect();
-    let xb = dev.alloc(n * 4).unwrap();
-    let ob = dev.alloc(n * 4).unwrap();
-    dev.write(xb, 0, &f32_bytes(&x)).unwrap();
-    dev.run_affine_c(xb, ob, n, 0, 1.5, -0.25).unwrap();
-    dev.finish().unwrap();
-    let mut out = vec![0u8; n * 4];
-    dev.read(ob, 0, &mut out).unwrap();
-    let got = f32_from(&out);
+    let xb = SyclStorage::from_vec(x.clone(), dev).unwrap();
+    let ob = dev.alloc(DType::F32, n).unwrap();
+    kernels::run_affine(&dev.ctx(), xb.buffer, ob.buffer, n, &Layout::contiguous(n), 1.5, -0.25).unwrap();
+    dev.synchronize().unwrap();
+    let got = read_f32(&ob);
     let want: Vec<f32> = x.iter().map(|v| v * 1.5 - 0.25).collect();
     assert_close("affine", &got, &want, 1e-6);
-    dev.free(xb).unwrap();
-    dev.free(ob).unwrap();
 }
 
 /// Unary `exp` (kernel `k_unary_c`, op 0).
 fn sycl_unary_exp_matches_cpu(dev: &SyclDevice) {
     let n = 4096;
     let x: Vec<f32> = (0..n).map(|i| ((i % 13) as f32 - 6.0) * 0.4).collect();
-    let xb = dev.alloc(n * 4).unwrap();
-    let ob = dev.alloc(n * 4).unwrap();
-    dev.write(xb, 0, &f32_bytes(&x)).unwrap();
-    dev.run_unary_c(xb, ob, n, 0, 0).unwrap();
-    dev.finish().unwrap();
-    let mut out = vec![0u8; n * 4];
-    dev.read(ob, 0, &mut out).unwrap();
-    let got = f32_from(&out);
+    let xb = SyclStorage::from_vec(x.clone(), dev).unwrap();
+    let ob = dev.alloc(DType::F32, n).unwrap();
+    kernels::run_unary(&dev.ctx(), 0, xb.buffer, ob.buffer, n, &Layout::contiguous(n)).unwrap();
+    dev.synchronize().unwrap();
+    let got = read_f32(&ob);
     let want: Vec<f32> = x.iter().map(|v| v.exp()).collect();
     assert_close("unary exp", &got, &want, 1e-6);
-    dev.free(xb).unwrap();
-    dev.free(ob).unwrap();
 }
 
 /// Binary add (kernel `k_binary_c`, op 0).
@@ -138,21 +128,15 @@ fn sycl_binary_add_matches_cpu(dev: &SyclDevice) {
     let n = 4096;
     let a: Vec<f32> = (0..n).map(|i| ((i % 11) as f32 - 5.0) * 0.25).collect();
     let b: Vec<f32> = (0..n).map(|i| ((i % 7) as f32 - 3.0) * 0.5).collect();
-    let ab = dev.alloc(n * 4).unwrap();
-    let bb = dev.alloc(n * 4).unwrap();
-    let ob = dev.alloc(n * 4).unwrap();
-    dev.write(ab, 0, &f32_bytes(&a)).unwrap();
-    dev.write(bb, 0, &f32_bytes(&b)).unwrap();
-    dev.run_binary_c(ab, bb, ob, n, 0, 0, 0).unwrap();
-    dev.finish().unwrap();
-    let mut out = vec![0u8; n * 4];
-    dev.read(ob, 0, &mut out).unwrap();
-    let got = f32_from(&out);
+    let ab = SyclStorage::from_vec(a.clone(), dev).unwrap();
+    let bb = SyclStorage::from_vec(b.clone(), dev).unwrap();
+    let ob = dev.alloc(DType::F32, n).unwrap();
+    let layout = Layout::contiguous(n);
+    kernels::run_binary(&dev.ctx(), 0, ab.buffer, bb.buffer, ob.buffer, n, &layout, &layout, false).unwrap();
+    dev.synchronize().unwrap();
+    let got = read_f32(&ob);
     let want: Vec<f32> = a.iter().zip(&b).map(|(x, y)| x + y).collect();
     assert_close("binary add", &got, &want, 1e-6);
-    dev.free(ab).unwrap();
-    dev.free(bb).unwrap();
-    dev.free(ob).unwrap();
 }
 
 /// Row softmax over [8, 200] — 200-wide rows exercise the multi-stride
@@ -161,14 +145,11 @@ fn sycl_softmax_matches_cpu(dev: &SyclDevice) {
     let (rows, cols) = (8usize, 200usize);
     let n = rows * cols;
     let x: Vec<f32> = (0..n).map(|i| ((i % 23) as f32 - 11.0) * 0.3).collect();
-    let xb = dev.alloc(n * 4).unwrap();
-    let ob = dev.alloc(n * 4).unwrap();
-    dev.write(xb, 0, &f32_bytes(&x)).unwrap();
-    dev.run_softmax_last(xb, ob, rows, cols, 0).unwrap();
-    dev.finish().unwrap();
-    let mut out = vec![0u8; n * 4];
-    dev.read(ob, 0, &mut out).unwrap();
-    let got = f32_from(&out);
+    let xb = SyclStorage::from_vec(x.clone(), dev).unwrap();
+    let ob = dev.alloc(DType::F32, n).unwrap();
+    kernels::run_softmax_last(&dev.ctx(), xb.buffer, ob.buffer, rows, cols, 0).unwrap();
+    dev.synchronize().unwrap();
+    let got = read_f32(&ob);
     // CPU reference: softmax per row.
     let mut want = vec![0f32; n];
     for r in 0..rows {
@@ -186,8 +167,6 @@ fn sycl_softmax_matches_cpu(dev: &SyclDevice) {
         let s: f32 = got[r * cols..(r + 1) * cols].iter().sum();
         assert!((s - 1.0).abs() < 1e-4, "row {r} sums to {s}, expected 1");
     }
-    dev.free(xb).unwrap();
-    dev.free(ob).unwrap();
 }
 
 /// Row RMSNorm over [8, 200] with unit alpha.
@@ -196,16 +175,12 @@ fn sycl_rmsnorm_matches_cpu(dev: &SyclDevice) {
     let n = rows * cols;
     let x: Vec<f32> = (0..n).map(|i| ((i % 37) as f32 - 18.0) * 0.05).collect();
     let alpha = vec![1.0f32; cols];
-    let xb = dev.alloc(n * 4).unwrap();
-    let ab = dev.alloc(cols * 4).unwrap();
-    let ob = dev.alloc(n * 4).unwrap();
-    dev.write(xb, 0, &f32_bytes(&x)).unwrap();
-    dev.write(ab, 0, &f32_bytes(&alpha)).unwrap();
-    dev.run_rmsnorm(xb, ab, ob, rows, cols, 0, 0, 1e-5).unwrap();
-    dev.finish().unwrap();
-    let mut out = vec![0u8; n * 4];
-    dev.read(ob, 0, &mut out).unwrap();
-    let got = f32_from(&out);
+    let xb = SyclStorage::from_vec(x.clone(), dev).unwrap();
+    let ab = SyclStorage::from_vec(alpha.clone(), dev).unwrap();
+    let ob = dev.alloc(DType::F32, n).unwrap();
+    kernels::run_rmsnorm(&dev.ctx(), xb.buffer, ab.buffer, ob.buffer, rows, cols, 0, 0, 1e-5).unwrap();
+    dev.synchronize().unwrap();
+    let got = read_f32(&ob);
     let mut want = vec![0f32; n];
     for r in 0..rows {
         let row = &x[r * cols..(r + 1) * cols];
@@ -216,9 +191,6 @@ fn sycl_rmsnorm_matches_cpu(dev: &SyclDevice) {
         }
     }
     assert_close("rmsnorm", &got, &want, 1e-5);
-    dev.free(xb).unwrap();
-    dev.free(ab).unwrap();
-    dev.free(ob).unwrap();
 }
 
 /// Tiled GEMM [64, 96] × [96, 51] — N=51 exercises the tile guard paths.
@@ -228,18 +200,16 @@ fn sycl_gemm_matches_cpu(dev: &SyclDevice) {
     let (m, k, n) = (64usize, 96usize, 51usize);
     let a: Vec<f32> = (0..m * k).map(|i| ((i % 13) as f32 - 6.0) * 0.25).collect();
     let b: Vec<f32> = (0..k * n).map(|i| ((i % 17) as f32 - 8.0) * 0.25).collect();
-    let ab = dev.alloc(m * k * 4).unwrap();
-    let bb = dev.alloc(k * n * 4).unwrap();
-    let cb = dev.alloc(m * n * 4).unwrap();
-    dev.write(ab, 0, &f32_bytes(&a)).unwrap();
-    dev.write(bb, 0, &f32_bytes(&b)).unwrap();
+    let ab = SyclStorage::from_vec(a.clone(), dev).unwrap();
+    let bb = SyclStorage::from_vec(b.clone(), dev).unwrap();
+    let cb = dev.alloc(DType::F32, m * n).unwrap();
     // Row-major: sam = k (A stride over m), sak = 1; B contiguous [k, n]:
     // sbk = n, sbn = 1. b_kc = 0 (B contiguous along n).
-    dev.run_gemm(ab, bb, cb, m, n, k, k, 1, n, 1, 0, 0, 0, 0, 0, 0, 0).unwrap();
-    dev.finish().unwrap();
-    let mut out = vec![0u8; m * n * 4];
-    dev.read(cb, 0, &mut out).unwrap();
-    let got = f32_from(&out);
+    let sa = kernels::MatStrides { row: k, col: 1, offset: 0, batch: 0 };
+    let sb = kernels::MatStrides { row: n, col: 1, offset: 0, batch: 0 };
+    kernels::run_matmul(&dev.ctx(), ab.buffer, bb.buffer, cb.buffer, (1, m, n, k), sa, sb).unwrap();
+    dev.synchronize().unwrap();
+    let got = read_f32(&cb);
     let mut want = vec![0f32; m * n];
     for r in 0..m {
         for c in 0..n {
@@ -248,9 +218,6 @@ fn sycl_gemm_matches_cpu(dev: &SyclDevice) {
         }
     }
     assert_close("gemm", &got, &want, 1e-3);
-    dev.free(ab).unwrap();
-    dev.free(bb).unwrap();
-    dev.free(cb).unwrap();
 }
 
 /// Quantized GEMV (kernel `k_qgemv`, Q8_0): dequantize-in-kernel over
@@ -270,17 +237,13 @@ fn sycl_qgemv_q8_0_matches_cpu(dev: &SyclDevice) {
     }
     let x: Vec<f32> = (0..k).map(|i| ((i % 9) as f32 - 4.0) * 0.5).collect();
 
-    let wb = dev.alloc(w_bytes.len()).unwrap();
-    let xb = dev.alloc(k * 4).unwrap();
-    let cb = dev.alloc(n * 4).unwrap();
-    dev.write(wb, 0, &w_bytes).unwrap();
-    dev.write(xb, 0, &f32_bytes(&x)).unwrap();
+    let wb = SyclStorage::from_vec(w_bytes.clone(), dev).unwrap();
+    let xb = SyclStorage::from_vec(x.clone(), dev).unwrap();
+    let cb = dev.alloc(DType::F32, n).unwrap();
     // QT_Q8_0 = 8, qk = 32, bsz = 34, woff = 0, xoff = 0, coff = 0, m = 1.
-    dev.run_qgemv(xb, wb, cb, n, k, 8, 32, 34, 0, 0, 0, 1).unwrap();
-    dev.finish().unwrap();
-    let mut out = vec![0u8; n * 4];
-    dev.read(cb, 0, &mut out).unwrap();
-    let got = f32_from(&out);
+    kernels::run_qgemv(&dev.ctx(), GgmlDType::Q8_0, xb.buffer, wb.buffer, cb.buffer, 1, n, k, 0, 0).unwrap();
+    dev.synchronize().unwrap();
+    let got = read_f32(&cb);
 
     // CPU reference: dequant each Q8_0 block, dot with x.
     let mut want = vec![0f32; n];
@@ -301,9 +264,6 @@ fn sycl_qgemv_q8_0_matches_cpu(dev: &SyclDevice) {
         want[row] = acc;
     }
     assert_close("qgemv q8_0", &got, &want, 1e-3);
-    dev.free(wb).unwrap();
-    dev.free(xb).unwrap();
-    dev.free(cb).unwrap();
 }
 
 fn half_to_bits(v: f32) -> u16 {
@@ -341,26 +301,18 @@ fn sycl_hembed_matches_cpu(dev: &SyclDevice) {
     }
     let ids: Vec<u32> = vec![3, 17, 0, 41, 63];
 
-    let wb = dev.alloc(f16_bytes.len()).unwrap();
-    let idb = dev.alloc(ids.len() * 4).unwrap();
-    let ob = dev.alloc(n_ids * k * 4).unwrap();
-    // The kernel writes a fault flag per slot; zero the checker buffer.
-    let faultb = dev.alloc(4).unwrap();
-    dev.write(faultb, 0, &0u32.to_ne_bytes()).unwrap();
-    dev.write(wb, 0, &f16_bytes).unwrap();
-    dev.write(idb, 0, &ids.iter().flat_map(|v| v.to_ne_bytes()).collect::<Vec<u8>>()).unwrap();
-    dev.run_hembed(wb, idb, ob, n_ids, k, false, 0, 0, vocab, faultb, 0).unwrap();
-    dev.finish().unwrap();
+    let wb = SyclStorage::from_vec(f16_bytes.clone(), dev).unwrap();
+    let idb = SyclStorage::from_vec(ids.clone(), dev).unwrap();
+    let ob = dev.alloc(DType::F32, n_ids * k).unwrap();
+    kernels::run_hembed(&dev.ctx(), false, wb.buffer, idb.buffer, ob.buffer, n_ids, k, vocab, 0, 0).unwrap();
+    dev.synchronize().unwrap();
     // Overlap check: the kernel must not have corrupted the weight table.
-    let mut w_back = vec![0u8; f16_bytes.len()];
-    dev.read(wb, 0, &mut w_back).unwrap();
+    let w_back = wb.to_cpu_storage().unwrap().as_slice::<u8>().unwrap().to_vec();
     if w_back != f16_bytes {
         let diffs = w_back.iter().zip(&f16_bytes).filter(|(a, b)| a != b).count();
         eprintln!("WEIGHT TABLE CORRUPTED by the kernel: {diffs} bytes differ (output buffer overlaps W)");
     }
-    let mut out = vec![0u8; n_ids * k * 4];
-    dev.read(ob, 0, &mut out).unwrap();
-    let got = f32_from(&out);
+    let got = read_f32(&ob);
     let mut want = vec![0f32; n_ids * k];
     for (j, id) in ids.iter().enumerate() {
         for c in 0..k {
@@ -368,7 +320,78 @@ fn sycl_hembed_matches_cpu(dev: &SyclDevice) {
         }
     }
     assert_close("hembed f16", &got, &want, 1e-6);
-    dev.free(wb).unwrap();
-    dev.free(idb).unwrap();
-    dev.free(ob).unwrap();
 }
+fn read_u32(storage: &SyclStorage) -> Vec<u32> {
+    storage.to_cpu_storage().unwrap().as_slice::<u32>().unwrap().to_vec()
+}
+
+/// Cast f32 -> u32 (kernel `k_cast_f32_u32`): covers the cast-launcher path.
+fn sycl_cast_f32_u32_matches_cpu(dev: &SyclDevice) {
+    let n = 4096;
+    let x: Vec<f32> = (0..n).map(|i| ((i % 19) as f32 - 9.0) * 1.25).collect();
+    let xb = SyclStorage::from_vec(x.clone(), dev).unwrap();
+    let ob = dev.alloc(DType::U32, n).unwrap();
+    kernels::run_cast(&dev.ctx(), "k_cast_f32_u32", xb.buffer, ob.buffer, n, &Layout::contiguous(n)).unwrap();
+    dev.synchronize().unwrap();
+    let got = read_u32(&ob);
+    let want: Vec<u32> = x.iter().map(|v| *v as u32).collect();
+    assert_eq!(got, want, "cast f32->u32");
+}
+
+/// Row sum reduction (kernel `k_reduce_last`, RED_SUM): rows of cols -> rows.
+fn sycl_reduce_last_sum_matches_cpu(dev: &SyclDevice) {
+    let (rows, cols) = (8usize, 200usize);
+    let n = rows * cols;
+    let x: Vec<f32> = (0..n).map(|i| ((i % 31) as f32 - 15.0) * 0.4).collect();
+    let xb = SyclStorage::from_vec(x.clone(), dev).unwrap();
+    let ob = dev.alloc(DType::F32, rows).unwrap();
+    kernels::run_reduce_last(&dev.ctx(), kernels::RED_SUM, xb.buffer, ob.buffer, rows, cols, 0).unwrap();
+    dev.synchronize().unwrap();
+    let got = read_f32(&ob);
+    let mut want = vec![0f32; rows];
+    for r in 0..rows {
+        let row = &x[r * cols..(r + 1) * cols];
+        want[r] = row.iter().sum::<f32>();
+    }
+    assert_close("reduce_last sum", &got, &want, 1e-4);
+}
+
+/// Index a [16, 8] tensor along dim 1 with 3 ids (kernel `k_index_select_u32_4`).
+fn sycl_index_select_matches_cpu(dev: &SyclDevice) {
+    let (rows, dim, n_ids) = (16usize, 8usize, 3usize);
+    let src: Vec<f32> = (0..rows * dim).map(|i| ((i % 27) as f32 - 13.0) * 0.5).collect();
+    let ids: Vec<u32> = vec![2, 7, 0];
+    let sb = SyclStorage::from_vec(src.clone(), dev).unwrap();
+    let idb = SyclStorage::from_vec(ids.clone(), dev).unwrap();
+    let ob = dev.alloc(DType::F32, rows * n_ids).unwrap();
+    let n = rows * n_ids;
+    kernels::run_index_select(&dev.ctx(), false, false, sb.buffer, idb.buffer, ob.buffer, n, rows, n_ids, 1, dim, 0, 0).unwrap();
+    dev.synchronize().unwrap();
+    let got = read_f32(&ob);
+    let mut want = vec![0f32; rows * n_ids];
+    for r in 0..rows {
+        for (j, id) in ids.iter().enumerate() {
+            want[r * n_ids + j] = src[r * dim + *id as usize];
+        }
+    }
+    assert_close("index_select", &got, &want, 1e-6);
+}
+
+/// Elementwise where (kernel `k_where_4`): cond u8 selects between t and f.
+fn sycl_where_matches_cpu(dev: &SyclDevice) {
+    let n = 4096;
+    let t: Vec<f32> = (0..n).map(|i| ((i % 21) as f32 - 10.0) * 0.3).collect();
+    let f: Vec<f32> = (0..n).map(|i| ((i % 13) as f32 - 6.0) * 0.7).collect();
+    let cond: Vec<u8> = (0..n).map(|i| (i % 3 == 0) as u8).collect();
+    let cb = SyclStorage::from_vec(cond.clone(), dev).unwrap();
+    let tb = SyclStorage::from_vec(t.clone(), dev).unwrap();
+    let fb = SyclStorage::from_vec(f.clone(), dev).unwrap();
+    let ob = dev.alloc(DType::F32, n).unwrap();
+    let l = Layout::contiguous(n);
+    kernels::run_where(&dev.ctx(), cb.buffer, tb.buffer, fb.buffer, ob.buffer, n, &l, &l, &l, false, false).unwrap();
+    dev.synchronize().unwrap();
+    let got = read_f32(&ob);
+    let want: Vec<f32> = (0..n).map(|i| if cond[i] != 0 { t[i] } else { f[i] }).collect();
+    assert_close("where", &got, &want, 1e-6);
+}
+

@@ -167,7 +167,7 @@ pub enum Error {
     #[error("the candle crate has not been built with opencl support")]
     NotCompiledWithOpenClSupport,
 
-    #[error("the candle crate has not been built with sycl support")]
+    #[error("SYCL support is not enabled; rebuild with --features sycl")]
     NotCompiledWithSyclSupport,
 
     #[error("the candle crate has not been built with vulkan support")]

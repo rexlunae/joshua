@@ -19,9 +19,11 @@
 
 namespace {
 thread_local std::string last_error;
+// DPC++ also requires serialization across separate device contexts.
+std::mutex runtime_mutex;
 void require(bool ok, const char* message) { if (!ok) throw std::runtime_error(message); }
 template<class F> int guard(F&& f) noexcept {
-    try { f(); return 0; }
+    try { std::lock_guard lock(runtime_mutex); f(); return 0; }
     catch (const std::exception& e) { last_error = e.what(); }
     catch (...) { last_error = "unknown SYCL exception"; }
     return -1;
