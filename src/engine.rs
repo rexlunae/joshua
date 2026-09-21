@@ -1283,9 +1283,10 @@ impl Engine {
             options.device_expert_cache
         };
         if device_expert_cache == Some(0) {
-            // `--vram-expert-cache auto`: size from the device's memory,
-            // leaving room for whatever else lives there.
-            if let Some((free, _)) = crate::placement::device_memory_info(&device) {
+            // `--vram-expert-cache auto`: size from the device's memory
+            // budget (`--vram-budget`, else the probe), leaving room for
+            // whatever else lives there.
+            if let Some(free) = device_budget {
                 let (dense_term, kv_reserve, scratch) = if dense_device.is_cpu() {
                     (0, 0, DEVICE_SCRATCH_RESERVE_DENSE_ON_CPU)
                 } else {
@@ -1313,7 +1314,9 @@ impl Engine {
                 );
                 device_expert_cache = Some(budget);
             } else {
-                tracing::info!("vram-expert-cache auto: no device memory probe; disabled");
+                tracing::info!(
+                    "vram-expert-cache auto: no device memory probe and no --vram-budget; disabled"
+                );
                 device_expert_cache = None;
             }
         }
