@@ -1161,38 +1161,6 @@ impl Engine {
         let dense_device_bytes = footprint.dense_upper;
         let expert_device_bytes = footprint.experts;
         let expert_bytes = expert_device_bytes;
-        // The dense set always goes to the device: no placement can shrink
-        // it, so a budget it does not fit is refused here, with the numbers,
-        // rather than deferred to an out-of-memory upload on the first
-        // request.  Only for architectures the candle path loads: a model
-        // candle cannot load (`arch == None`) allocates nothing on the
-        // device and may still be served by an NPU backend attached after
-        // construction, so its deferred `arch_error` path is left alone.
-        if !device.is_cpu() && arch.is_some() {
-            if let Some(budget) = device_budget {
-                if !crate::placement::dense_set_fits(
-                    footprint.dense_lower,
-                    crate::placement::DEVICE_PLACEMENT_HEADROOM,
-                    budget,
-                ) {
-                    return Err(JoshuaError::ModelLoad(format!(
-                        "the model's dense set (at least {:.2} GiB on {:?}, plus {:.1} GiB headroom) does not fit \
-                         the device memory budget of {:.2} GiB ({}). Expert placement can only move \
-                         the routed experts off the device; run with --device cpu, free device memory, \
-                         or raise --vram-budget if the budget was set by hand.",
-                        footprint.dense_lower as f64 / 2f64.powi(30),
-                        device,
-                        crate::placement::DEVICE_PLACEMENT_HEADROOM as f64 / 2f64.powi(30),
-                        budget as f64 / 2f64.powi(30),
-                        if options.device_memory_budget.is_some() {
-                            "--vram-budget"
-                        } else {
-                            "probed free memory"
-                        },
-                    )));
-                }
-            }
-        }
         // Architectures whose loader keeps the experts on the CPU no matter
         // what (deepseek4 off OpenCL: IQ2_XXS has a kernel only there) are
         // resolved as host placement so the device accounting below matches
@@ -1261,6 +1229,38 @@ impl Engine {
             );
         } else {
             tracing::info!("dense placement: device ({device:?})",);
+        }
+        // A dense set placed on the device cannot be shrunk by any expert
+        // placement, so a budget it does not fit is refused here, with the
+        // numbers, rather than deferred to an out-of-memory upload on the
+        // first request.  Only for architectures the candle path loads: a
+        // model candle cannot load (`arch == None`) allocates nothing on the
+        // device and may still be served by an NPU backend attached after
+        // construction, so its deferred `arch_error` path is left alone.
+        if !dense_device.is_cpu() && arch.is_some() {
+            if let Some(budget) = device_budget {
+                if !crate::placement::dense_set_fits(
+                    footprint.dense_lower,
+                    crate::placement::DEVICE_PLACEMENT_HEADROOM,
+                    budget,
+                ) {
+                    return Err(JoshuaError::ModelLoad(format!(
+                        "the model's dense set (at least {:.2} GiB on {:?}, plus {:.1} GiB headroom) does not fit \
+                         the device memory budget of {:.2} GiB ({}). Expert placement can only move \
+                         the routed experts off the device; run with --device cpu or --dense-placement cpu, \
+                         free device memory, or raise --vram-budget if the budget was set by hand.",
+                        footprint.dense_lower as f64 / 2f64.powi(30),
+                        device,
+                        crate::placement::DEVICE_PLACEMENT_HEADROOM as f64 / 2f64.powi(30),
+                        budget as f64 / 2f64.powi(30),
+                        if options.device_memory_budget.is_some() {
+                            "--vram-budget"
+                        } else {
+                            "probed free memory"
+                        },
+                    )));
+                }
+            }
         }
         // Resolve `--vram-expert-cache auto` (`Some(0)` sentinel) to a concrete
         // device byte budget: device free − dense (only when the dense set is
