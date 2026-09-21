@@ -2644,9 +2644,9 @@ impl ModelWeights {
         device_expert_cache_bytes: Option<u64>,
     ) -> Result<Self> {
         let cfg = Config::from_metadata(&ct.metadata)?;
-        if !(expert_device.is_cpu() || expert_device.is_opencl() || expert_device.same_device(device)) {
+        if !(expert_device.is_cpu() || expert_device.is_opencl() || expert_device.is_sycl() || expert_device.same_device(device)) {
             candle_core::bail!(
-                "deepseek4: routed experts must live on the model device, an OpenCL device or the CPU, \
+                "deepseek4: routed experts must live on the model device, an OpenCL, SYCL or CPU device, \
                  not {expert_device:?}"
             );
         }
