@@ -37,6 +37,10 @@ fn sycl_kernel_parity() {
         ("gemm", sycl_gemm_matches_cpu),
         ("qgemv_q8_0", sycl_qgemv_q8_0_matches_cpu),
         ("hembed", sycl_hembed_matches_cpu),
+        ("cast_f32_u32", sycl_cast_f32_u32_matches_cpu),
+        ("reduce_last_sum", sycl_reduce_last_sum_matches_cpu),
+        ("index_select", sycl_index_select_matches_cpu),
+        ("where", sycl_where_matches_cpu),
     ];
     let Some(dev) = device() else {
         eprintln!("SKIP: no SYCL device");
@@ -317,3 +321,73 @@ fn sycl_hembed_matches_cpu(dev: &SyclDevice) {
     }
     assert_close("hembed f16", &got, &want, 1e-6);
 }
+fn read_u32(storage: &SyclStorage) -> Vec<u32> {
+    storage.to_cpu_storage().unwrap().as_slice::<u32>().unwrap().to_vec()
+}
+
+/// Cast f32 -> u32 (kernel `k_cast_f32_u32`): covers the cast-launcher path.
+fn sycl_cast_f32_u32_matches_cpu(dev: &SyclDevice) {
+    let n = 4096;
+    let x: Vec<f32> = (0..n).map(|i| ((i % 19) as f32 - 9.0) * 1.25).collect();
+    let xb = SyclStorage::from_vec(x.clone(), dev).unwrap();
+    let ob = dev.alloc(DType::U32, n).unwrap();
+    kernels::run_cast(&dev.ctx(), "k_cast_f32_u32", xb.buffer, ob.buffer, n, &Layout::contiguous(n)).unwrap();
+    dev.synchronize().unwrap();
+    let got = read_u32(&ob);
+    let want: Vec<u32> = x.iter().map(|v| *v as u32).collect();
+    assert_eq!(got, want, "cast f32->u32");
+}
+
+/// Row sum reduction (kernel `k_reduce_last`, RED_SUM): rows of cols -> rows.
+fn sycl_reduce_last_sum_matches_cpu(dev: &SyclDevice) {
+    let (rows, cols) = (8usize, 200usize);
+    let n = rows * cols;
+    let x: Vec<f32> = (0..n).map(|i| ((i % 31) as f32 - 15.0) * 0.4).collect();
+    let xb = SyclStorage::from_vec(x.clone(), dev).unwrap();
+    let ob = dev.alloc(DType::F32, rows).unwrap();
+    kernels::run_reduce_last(&dev.ctx(), kernels::RED_SUM, xb.buffer, ob.buffer, rows, cols, 0).unwrap();
+    dev.synchronize().unwrap();
+    let got = read_f32(&ob);
+    let want: Vec<f32> = (0..rows).map(|r| x[r * cols..(r + 1) * cols].iter().sum::<f32>()).collect();
+    assert_close("reduce_last sum", &got, &want, 1e-4);
+}
+
+/// Index a [16, 8] tensor along dim 1 with 3 ids (kernel `k_index_select_u32_4`).
+fn sycl_index_select_matches_cpu(dev: &SyclDevice) {
+    let (rows, dim, n_ids) = (16usize, 8usize, 3usize);
+    let src: Vec<f32> = (0..rows * dim).map(|i| ((i % 27) as f32 - 13.0) * 0.5).collect();
+    let ids: Vec<u32> = vec![2, 7, 0];
+    let sb = SyclStorage::from_vec(src.clone(), dev).unwrap();
+    let idb = SyclStorage::from_vec(ids.clone(), dev).unwrap();
+    let ob = dev.alloc(DType::F32, rows * n_ids).unwrap();
+    let n = rows * n_ids;
+    kernels::run_index_select(&dev.ctx(), false, false, sb.buffer, idb.buffer, ob.buffer, n, rows, n_ids, 1, dim, 0, 0).unwrap();
+    dev.synchronize().unwrap();
+    let got = read_f32(&ob);
+    let mut want = vec![0f32; rows * n_ids];
+    for r in 0..rows {
+        for (j, id) in ids.iter().enumerate() {
+            want[r * n_ids + j] = src[r * dim + *id as usize];
+        }
+    }
+    assert_close("index_select", &got, &want, 1e-6);
+}
+
+/// Elementwise where (kernel `k_where_4`): cond u8 selects between t and f.
+fn sycl_where_matches_cpu(dev: &SyclDevice) {
+    let n = 4096;
+    let t: Vec<f32> = (0..n).map(|i| ((i % 21) as f32 - 10.0) * 0.3).collect();
+    let f: Vec<f32> = (0..n).map(|i| ((i % 13) as f32 - 6.0) * 0.7).collect();
+    let cond: Vec<u8> = (0..n).map(|i| (i % 3 == 0) as u8).collect();
+    let cb = SyclStorage::from_vec(cond.clone(), dev).unwrap();
+    let tb = SyclStorage::from_vec(t.clone(), dev).unwrap();
+    let fb = SyclStorage::from_vec(f.clone(), dev).unwrap();
+    let ob = dev.alloc(DType::F32, n).unwrap();
+    let l = Layout::contiguous(n);
+    kernels::run_where(&dev.ctx(), cb.buffer, tb.buffer, fb.buffer, ob.buffer, n, &l, &l, &l, false, false).unwrap();
+    dev.synchronize().unwrap();
+    let got = read_f32(&ob);
+    let want: Vec<f32> = (0..n).map(|i| if cond[i] != 0 { t[i] } else { f[i] }).collect();
+    assert_close("where", &got, &want, 1e-6);
+}
+

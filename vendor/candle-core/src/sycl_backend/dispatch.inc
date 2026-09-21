@@ -919,7 +919,10 @@
         auto a15 = arg<int>(args, count, 15);
         auto a16 = arg<int>(args, count, 16);
         ctx.submit([&](sycl::handler& h) {
-            sycl::local_accessor<uint64_t, 1> local(sycl::range<1>((sizeof(float) * (TK * TM + 1) + sizeof(float) * (TK * TN + 1) + 7) / 8), h);
+            // Local tile buffers: As is [TK][TM+1] floats at offset 0, Bs is
+            // [TK][TN+1] floats after it.  Allocate the full padded span so Bs
+            // does not overlap As (see kernels.hpp k_gemm).
+            sycl::local_accessor<uint64_t, 1> local(sycl::range<1>((sizeof(float) * TK * ((TM + 1) + (TN + 1)) + 7) / 8), h);
             h.parallel_for(sycl::nd_range<3>(global, local_size), [=](sycl::nd_item<3> item) {
                 auto scratch = reinterpret_cast<uchar*>(local.template get_multi_ptr<sycl::access::decorated::no>().get());
                 Kernels{item, scratch}.k_gemm(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16);

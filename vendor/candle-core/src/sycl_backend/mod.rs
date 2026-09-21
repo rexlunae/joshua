@@ -53,27 +53,54 @@ impl Drop for SyclContext {
         }
     }
 }
+
+/// Owns the raw bridge context handle while [`SyclDevice::new`] is still
+/// setting the device up.  Defused once an owning [`SyclContext`] (whose
+/// `Drop` closes the handle) has been constructed; a setup failure before
+/// that drops the guard and closes the handle, so a failed initialization
+/// can never leak a SYCL runtime context.
+struct ContextOpenGuard {
+    context: usize,
+    active: bool,
+}
+impl Drop for ContextOpenGuard {
+    fn drop(&mut self) {
+        if self.active {
+            unsafe { bridge::close(self.context); }
+        }
+    }
+}
 #[derive(Clone, Debug)]
 pub struct SyclDevice { gpu_id: usize, inner: Arc<SyclContext> }
 fn sycl_error(_code: i32, op: &str) -> Error { bridge::error(op) }
 impl SyclDevice {
     pub fn new(gpu_id: usize) -> Result<Self> {
+        // build_inner guarantees the raw context handle is closed on every
+        // failure path (via the open guard or the owning SyclContext Drop), so
+        // a failed initialization can never leak a SYCL runtime context.
         let context = bridge::open(gpu_id)?;
-        let result = (|| {
-            let (name, memory) = bridge::info(context)?;
-            let fault = bridge::alloc(context, crate::fault_slot::BYTES)?;
-            let inner = Arc::new(SyclContext { context, fault, name, memory, scratch: Default::default() });
-            let zeros = vec![0u8; crate::fault_slot::BYTES];
-            // From this point the context is owned by inner, including on error.
-            unsafe { write_buffer(context, fault, zeros.len(), zeros.as_ptr()) }?;
-            let weak = Arc::downgrade(&inner);
-            crate::fault_slot::register_drain(Box::new(move |slot| match weak.upgrade() {
-                Some(ctx) => { ctx.drain_slot(slot); true }
-                None => false,
-            }));
-            Ok(Self { gpu_id, inner })
-        })();
-        result
+        Ok(Self { gpu_id, inner: Self::build_inner(context)? })
+    }
+
+    /// Construct and wire up the owning [`SyclContext`] for an already-opened
+    /// bridge context.  See [`Self::new`] for the ownership/cleanup contract.
+    fn build_inner(context: usize) -> Result<Arc<SyclContext>> {
+        // The guard owns the raw handle until inner (whose Drop closes it)
+        // exists.  On any pre-ownership error the guard Drop closes the handle;
+        // once defused, ownership belongs to inner and its Drop handles closing.
+        let mut guard = ContextOpenGuard { context, active: true };
+        let (name, memory) = bridge::info(context)?;
+        let fault = bridge::alloc(context, crate::fault_slot::BYTES)?;
+        let inner = Arc::new(SyclContext { context, fault, name, memory, scratch: Default::default() });
+        guard.active = false;
+        let zeros = vec![0u8; crate::fault_slot::BYTES];
+        unsafe { write_buffer(context, fault, zeros.len(), zeros.as_ptr()) }?;
+        let weak = Arc::downgrade(&inner);
+        crate::fault_slot::register_drain(Box::new(move |slot| match weak.upgrade() {
+            Some(ctx) => { ctx.drain_slot(slot); true }
+            None => false,
+        }));
+        Ok(inner)
     }
     pub fn new_with_stream(gpu_id: usize) -> Result<Self> { Self::new(gpu_id) }
     pub fn id(&self) -> DeviceId { DeviceId(self.gpu_id) }
