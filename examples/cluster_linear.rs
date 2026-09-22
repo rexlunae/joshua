@@ -3,7 +3,7 @@
 use std::{
     fs::File,
     io::BufReader,
-    net::Ipv4Addr,
+    net::{Ipv4Addr, SocketAddr},
     path::PathBuf,
     time::{Duration, Instant},
 };
@@ -13,13 +13,14 @@ use candle_core::{
     quantized::{gguf_file, GgmlDType, QTensor},
     Device, Tensor,
 };
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use joshua::{
     distributed::{
         collective::{AllReduceGroup, MulticastConfig, MAX_PARTICIPANTS},
         discovery::{Discovery, NodeInfo},
         partition::{plan_partition, LinkObservation, NodeCapacity, TensorWorkload},
         shard::{dtype_layout, ShardedTensor},
+        tcp::{TcpAllReduceGroup, TcpConfig},
     },
     gguf_ext,
 };
@@ -54,6 +55,12 @@ enum Command {
         rank: usize,
         #[arg(long, default_value_t = 2)]
         world_size: usize,
+        /// Select TCP explicitly on networks without multicast; never switches mid-job.
+        #[arg(long, value_enum, default_value_t = Transport::Udp)]
+        transport: Transport,
+        /// TCP listen addresses in rank order; identical on every rank.
+        #[arg(long, value_delimiter = ',', required_if_eq("transport", "tcp"))]
+        peers: Vec<SocketAddr>,
         /// Fresh shared v4 UUID for this job (never reuse after a restart).
         #[arg(long)]
         session: Uuid,
@@ -100,6 +107,26 @@ struct MatrixArgs {
     model: PathBuf,
     #[arg(long, default_value = "linear.weight")]
     tensor: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum Transport {
+    Udp,
+    Tcp,
+}
+
+enum Collective {
+    Udp(AllReduceGroup),
+    Tcp(TcpAllReduceGroup),
+}
+
+impl Collective {
+    fn all_reduce_sum(&mut self, values: &mut [f32]) -> Result<()> {
+        match self {
+            Self::Udp(group) => group.all_reduce_sum(values),
+            Self::Tcp(group) => group.all_reduce_sum(values),
+        }
+    }
 }
 
 fn fixture(output: &PathBuf) -> Result<()> {
@@ -221,6 +248,8 @@ fn main() -> Result<()> {
             matrix,
             rank,
             world_size,
+            transport,
+            peers,
             session,
             group,
             port,
@@ -234,19 +263,38 @@ fn main() -> Result<()> {
                 "invalid rank or world size"
             );
             ensure!((1..=1000).contains(&steps), "steps must be in 1..=1000");
-            let mut collective = AllReduceGroup::new(
-                rank,
-                world_size,
-                session,
-                &key_from_env()?,
-                MulticastConfig {
-                    group,
-                    port,
-                    interface,
-                    timeout: Duration::from_secs(timeout_seconds),
-                    ..Default::default()
-                },
-            )?;
+            let key = key_from_env()?;
+            let timeout = Duration::from_secs(timeout_seconds);
+            let mut collective = match transport {
+                Transport::Udp => {
+                    ensure!(peers.is_empty(), "--peers requires --transport tcp");
+                    Collective::Udp(AllReduceGroup::new(
+                        rank,
+                        world_size,
+                        session,
+                        &key,
+                        MulticastConfig {
+                            group,
+                            port,
+                            interface,
+                            timeout,
+                            ..Default::default()
+                        },
+                    )?)
+                }
+                Transport::Tcp => {
+                    ensure!(
+                        peers.len() == world_size,
+                        "--peers must contain exactly --world-size addresses in rank order"
+                    );
+                    Collective::Tcp(TcpAllReduceGroup::new(
+                        rank,
+                        session,
+                        &key,
+                        TcpConfig { peers, timeout },
+                    )?)
+                }
+            };
             let shard = load(&matrix, rank, world_size)?;
             shard.prefetch()?;
             let x = input(shard.input_width());
@@ -327,5 +375,107 @@ mod tests {
         assert!(decode_key("").is_err());
         assert!(decode_key(&"é".repeat(32)).is_err());
         assert!(decode_key(&"x".repeat(64)).is_err());
+    }
+
+    #[test]
+    fn transport_cli_defaults_to_udp_and_requires_tcp_peers() -> Result<()> {
+        let session = Uuid::new_v4().to_string();
+        let base = [
+            "cluster_linear",
+            "rank",
+            "--model",
+            "model.gguf",
+            "--rank",
+            "0",
+            "--session",
+            &session,
+        ];
+        assert!(matches!(
+            Cli::try_parse_from(base)?.command,
+            Command::Rank {
+                transport: Transport::Udp,
+                peers,
+                ..
+            } if peers.is_empty()
+        ));
+        let mut args = base.to_vec();
+        args.extend(["--transport", "tcp"]);
+        assert!(Cli::try_parse_from(&args).is_err());
+        args.extend(["--peers", "127.0.0.1:48888,127.0.0.1:48889"]);
+        assert!(matches!(
+            Cli::try_parse_from(&args)?.command,
+            Command::Rank {
+                transport: Transport::Tcp,
+                peers,
+                ..
+            } if peers.len() == 2
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn tcp_quantized_shards_match_reference_across_steps() -> Result<()> {
+        use std::net::TcpListener;
+
+        let path = std::env::temp_dir().join(format!("joshua-tcp-{}.gguf", Uuid::new_v4()));
+        fixture(&path)?;
+        let result = (|| -> Result<()> {
+            let matrix = MatrixArgs {
+                model: path.clone(),
+                tensor: "linear.weight".into(),
+            };
+            let full = load(&matrix, 0, 1)?;
+            let x = input(full.input_width());
+            let reference = full.forward(&x)?;
+            let reservations: Vec<_> = (0..3)
+                .map(|_| TcpListener::bind("127.0.0.1:0"))
+                .collect::<std::io::Result<_>>()?;
+            let peers: Vec<_> = reservations
+                .iter()
+                .map(TcpListener::local_addr)
+                .collect::<std::io::Result<_>>()?;
+            drop(reservations);
+            let session = Uuid::new_v4();
+            let key = rand::random::<[u8; 32]>();
+            let mut ranks = Vec::new();
+            for rank in 0..peers.len() {
+                ranks.push((
+                    TcpAllReduceGroup::new(
+                        rank,
+                        session,
+                        &key,
+                        TcpConfig {
+                            peers: peers.clone(),
+                            timeout: Duration::from_secs(5),
+                        },
+                    )?,
+                    load(&matrix, rank, peers.len())?,
+                ));
+            }
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = ranks
+                    .into_iter()
+                    .map(|(mut collective, shard)| {
+                        let x = &x;
+                        let reference = &reference;
+                        scope.spawn(move || -> Result<()> {
+                            shard.prefetch()?;
+                            for _ in 0..3 {
+                                let mut output = shard.forward(x)?;
+                                collective.all_reduce_sum(&mut output)?;
+                                compare(&output, reference)?;
+                            }
+                            Ok(())
+                        })
+                    })
+                    .collect();
+                for handle in handles {
+                    handle.join().expect("rank thread panicked")?;
+                }
+                Ok(())
+            })
+        })();
+        std::fs::remove_file(path)?;
+        result
     }
 }

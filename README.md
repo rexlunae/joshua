@@ -759,6 +759,8 @@ is unchanged. The library exposes:
   matrices, local mmap ownership, shard-only prefetch, and partial matvecs.
 - `distributed::collective` (feature-gated): authenticated UDP multicast
   summation for a fixed set of ranks, with bounded retries/timeouts.
+- `distributed::tcp` (feature-gated): authenticated TCP ring summation for
+  explicitly configured ranks on networks without multicast.
 - `distributed::discovery` (feature-gated): advisory `_joshua._tcp.local.`
   discovery and coordinator selection. Discovered nodes are **not** automatically
   trusted or admitted to a collective.
@@ -825,6 +827,52 @@ chosen multicast group/UDP port through the firewall. Launch all ranks within
 the configured deadline (`--timeout-seconds`, default 10); rank output is one
 JSON vector per step. This proves a **linear layer**, not token generation.
 
+### TCP fallback without multicast (#88)
+
+Select `--transport tcp` explicitly before starting the job. Supply the same
+`--peers` list on every rank, ordered by rank number, with exactly `--world-size`
+distinct IP:port addresses. Each rank listens on its own listed address and
+connects to its successor in the ring; the last rank connects to rank zero.
+Use reachable local-interface addresses, not wildcard addresses. For a
+same-machine test, assign a different loopback port to each process:
+
+```bash
+export JOSHUA_CLUSTER_KEY="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+session="$(cat /proc/sys/kernel/random/uuid)"
+peers="127.0.0.1:48888,127.0.0.1:48889"
+
+./target/debug/examples/cluster_linear rank --model /tmp/joshua-linear.gguf \
+  --transport tcp --peers "$peers" --rank 0 --world-size 2 \
+  --session "$session" --steps 3 --verify &
+rank0=$!
+./target/debug/examples/cluster_linear rank --model /tmp/joshua-linear.gguf \
+  --transport tcp --peers "$peers" --rank 1 --world-size 2 \
+  --session "$session" --steps 3 --verify &
+rank1=$!
+wait "$rank0"
+wait "$rank1"
+unset JOSHUA_CLUSTER_KEY
+```
+
+On separate machines, replace loopback with each machine's LAN address and
+permit inbound TCP on the listed ports. The UDP `--group`, `--port` and
+`--interface` settings do not configure TCP. All ranks still require the same
+immutable local GGUF, tensor, fresh session and key. TCP does not perform
+discovery, model synchronization or automatic cluster admission.
+
+The library's `TcpAllReduceGroup` binds its listener on construction and
+establishes ring connections during the first collective. Connections persist
+across steps. Input vectors circulate around the ring and are summed in rank
+order, with the same tensor/aggregate storage bounds as UDP. This is a
+correctness-first ring exchange, not an optimized reduce-scatter implementation.
+Authentication binds messages to the session and ordered membership; it does
+**not encrypt** activations. Connection setup and I/O share a bounded deadline.
+An exchange failure leaves the caller's input unchanged and poisons the group.
+Restart **all ranks** with a new session after failure; never switch transports
+mid-job. TCP does not guarantee globally atomic success during a partition.
+
+### Discovery and planning
+
 For advisory discovery, run `cluster_linear discover --node-id <persistent-UUID>`
 on each machine. Save each node's UUID in its configuration and reuse it on
 restart. The advertised port is reserved for future control-plane integration;
@@ -854,15 +902,23 @@ can cause participants to observe different success/failure outcomes.
 
 These issues remain **partially addressed**: full-model forward/KV-cache
 integration, authenticated cluster admission and live topology probes,
-automatic model sync, TCP fallback, FEC, draining/repartitioning, and hardware
+automatic model sync, FEC, draining/repartitioning, and hardware
 acceptance tests are future work. Neither two-machine/100-node discovery,
 10% real-network packet-loss tolerance, `/proc/self/smaps` scaling, nor the
 80%-throughput and <10%-imbalance targets have been established. The planner
 is a heuristic, not an optimal P99 scheduler.
 
 Validation includes quantized shard/reference comparisons, deterministic
-membership/election and memory-planning tests, and real loopback UDP retry
-tests with injected packet loss. The multicast integration test is explicitly
+membership/election and memory-planning tests, real loopback UDP retry
+tests with injected packet loss, and TCP ring tests. The example tests also
+compare three TCP ranks' quantized partial matvecs with an unsharded reference:
+
+```bash
+cargo test -p joshua --features distributed --lib distributed
+cargo test -p joshua --features distributed --example cluster_linear
+```
+
+The multicast integration test is explicitly
 ignored by default and can be run on a multicast-enabled host:
 
 ```bash
