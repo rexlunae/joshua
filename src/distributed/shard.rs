@@ -472,7 +472,7 @@ mod tests {
     fn actual_gguf_header_reverses_dimensions_before_sharding() {
         use std::io::Cursor;
         for dtype in [8, 12, 10, 16, 39] {
-            let (source, tensor, weights) = fixture(dtype, 7, 3);
+            let (source, tensor, weights) = fixture(dtype, 8, 4);
             let width = tensor.dims[1];
             let mut bytes = b"GGUF".to_vec();
             bytes.extend_from_slice(&3u32.to_le_bytes());
@@ -482,7 +482,7 @@ mod tests {
             bytes.push(b'w');
             bytes.extend_from_slice(&2u32.to_le_bytes());
             bytes.extend_from_slice(&(width as u64).to_le_bytes());
-            bytes.extend_from_slice(&3u64.to_le_bytes());
+            bytes.extend_from_slice(&4u64.to_le_bytes());
             bytes.extend_from_slice(&dtype.to_le_bytes());
             bytes.extend_from_slice(&0u64.to_le_bytes());
             bytes.resize(bytes.len().div_ceil(32) * 32, 0);
@@ -491,14 +491,14 @@ mod tests {
             let header = crate::gguf_ext::read_header(&mut Cursor::new(&bytes)).unwrap();
             assert_eq!(header.tensor_data_offset, data_offset);
             let parsed = &header.tensors["w"];
-            assert_eq!(parsed.dims, vec![3, width]);
+            assert_eq!(parsed.dims, vec![4, width]);
             let mmap = mapping(&bytes);
             let input = vec![0.25; width];
-            let mut actual = vec![0.0f32; 3];
+            let mut actual = vec![0.0f32; 4];
             for rank in 0..3 {
                 let shard = ShardedTensor::new(mmap.clone(), parsed, data_offset, rank, 3).unwrap();
                 assert_eq!(shard.input_width(), width);
-                assert_eq!(shard.output_width(), 3);
+                assert_eq!(shard.output_width(), 4);
                 for (sum, partial) in actual.iter_mut().zip(shard.forward(&input).unwrap()) {
                     *sum += partial;
                 }
