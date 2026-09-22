@@ -749,6 +749,132 @@ candle path on the same weights.
 
 ---
 
+## Experimental distributed building blocks (#86–91)
+
+The `distributed` Cargo feature adds **static-cluster primitives**, not a
+distributed `Engine::complete` or server mode. Existing single-node inference
+is unchanged. The library exposes:
+
+- `distributed::shard`: checked, block-aligned input-column slices of GGUF
+  matrices, local mmap ownership, shard-only prefetch, and partial matvecs.
+- `distributed::collective` (feature-gated): authenticated UDP multicast
+  summation for a fixed set of ranks, with bounded retries/timeouts.
+- `distributed::discovery` (feature-gated): advisory `_joshua._tcp.local.`
+  discovery and coordinator selection. Discovered nodes are **not** automatically
+  trusted or admitted to a collective.
+- `distributed::partition`: deterministic, memory-constrained block allocation
+  using caller-supplied capacity and topology observations.
+
+### Correctness and memory model
+
+Joshua stores a linear weight as `[output, input]` and computes `y = W x`.
+For an all-reduce, split the **input/reduction dimension**: each rank computes
+`W[:, start..end] x[start..end]`, then sums full-length output vectors. These
+columns form a separate byte range in **every output row**, not one contiguous
+slice of the tensor. Splitting output rows instead requires an all-gather,
+not an all-reduce.
+
+Boundaries are whole quantization blocks. Q8_0, Q4_K, Q2_K, IQ2_XXS and MXFP4
+are covered by the sharding tests; invalid and empty shards are rejected.
+Byte reconstruction is exact, but floating-point sums can differ with reduction
+grouping, so numerical comparisons use tolerances rather than promising
+bit-identical logits or generated tokens.
+
+Pre-sync the **same immutable GGUF** to each node's local SSD, for example with
+`rsync --partial model.gguf node:/srv/models/`, and compare `sha256sum` on each
+copy before launch. Do not overwrite or truncate a file while mapped.
+The shard path maps the local file lazily and only accesses/prefetches local
+row slices; it does not call the engine's full-file prefetch. Mapping the whole
+file reserves virtual addresses, not that amount of physical RAM. OS page
+granularity, readahead, metadata, activations and runtime allocations mean RSS
+is **not exactly** the encoded shard size; reserve additional RAM accordingly.
+NFS does not share a page cache across machines and is not required.
+
+### Run the linear-layer proof
+
+The example generates deterministic activations and accepts any supported 2-D
+GGUF weight via `--model` / `--tensor`. A small Q8_0 fixture avoids downloading
+a model:
+
+```bash
+cargo build --features distributed --example cluster_linear
+./target/debug/examples/cluster_linear fixture --output /tmp/joshua-linear.gguf
+./target/debug/examples/cluster_linear local --model /tmp/joshua-linear.gguf --shards 3
+
+# Generate once per job; share these out of band with the other ranks.
+export JOSHUA_CLUSTER_KEY="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+session="$(cat /proc/sys/kernel/random/uuid)"
+
+# Two independent processes, three consecutive collectives, on Linux loopback.
+./target/debug/examples/cluster_linear rank --model /tmp/joshua-linear.gguf \
+  --rank 0 --world-size 2 --session "$session" --steps 3 --verify &
+rank0=$!
+./target/debug/examples/cluster_linear rank --model /tmp/joshua-linear.gguf \
+  --rank 1 --world-size 2 --session "$session" --steps 3 --verify &
+rank1=$!
+wait "$rank0"
+wait "$rank1"
+unset JOSHUA_CLUSTER_KEY
+```
+
+The fixture command refuses to overwrite existing files. `--verify` deliberately
+reads the full weight on each rank; omit it when evaluating shard-only residency.
+For two machines, use the same key, fresh session, tensor and GGUF on both,
+distinct ranks, and `--interface <local-LAN-IPv4>` instead of loopback. Permit the
+chosen multicast group/UDP port through the firewall. Launch all ranks within
+the configured deadline (`--timeout-seconds`, default 10); rank output is one
+JSON vector per step. This proves a **linear layer**, not token generation.
+
+For advisory discovery, run `cluster_linear discover --node-id <persistent-UUID>`
+on each machine. Save each node's UUID in its configuration and reuse it on
+restart. The advertised port is reserved for future control-plane integration;
+the example does not implement a TCP inference service.
+
+`cluster_linear plan --model <GGUF> --tensor <name> --nodes <nodes.json>`
+prints a static allocation. `nodes.json` is an array of `NodeCapacity` records
+(`id`, `available_bytes`, `reserved_bytes`, `compute_weight`);
+`--links <links.json>` accepts measured `LinkObservation` records (`from`, `to`,
+`latency_seconds`, `bandwidth_bytes_per_second`). These records are operator
+inputs, not automatically collected probes. Library callers can apply the
+returned column ranges with `ShardedTensor::with_input_range`; the `rank`
+example intentionally uses equal block partitions rather than consuming a plan.
+
+### Operational limits and remaining work
+
+Use an isolated, trusted LAN. Collective participants must share a fresh
+session ID and a strong pre-shared key; authentication does not encrypt
+activations or protect against a malicious key holder. Never reuse a session
+ID after restarting ranks. mDNS advertisements are untrusted hints, not an
+authorization or resource-verification mechanism.
+
+A missing rank causes an error, never a silently incomplete activation sum.
+After a failed collective, stop the entire job and restart all ranks with a new
+session; dynamic membership/remapping is not implemented. A network partition
+can cause participants to observe different success/failure outcomes.
+
+These issues remain **partially addressed**: full-model forward/KV-cache
+integration, authenticated cluster admission and live topology probes,
+automatic model sync, TCP fallback, FEC, draining/repartitioning, and hardware
+acceptance tests are future work. Neither two-machine/100-node discovery,
+10% real-network packet-loss tolerance, `/proc/self/smaps` scaling, nor the
+80%-throughput and <10%-imbalance targets have been established. The planner
+is a heuristic, not an optimal P99 scheduler.
+
+Validation includes quantized shard/reference comparisons, deterministic
+membership/election and memory-planning tests, and real loopback UDP retry
+tests with injected packet loss. The multicast integration test is explicitly
+ignored by default and can be run on a multicast-enabled host:
+
+```bash
+cargo test -p joshua --features distributed --lib distributed::collective -- --ignored
+```
+
+The development sandbox rejected multicast sends with `EPERM`, including the
+two-process example above; unicast loopback protocol tests do not establish
+multicast interoperability or LAN throughput.
+
+---
+
 ## Roadmap
 
 - [x] Chat completions (non-streaming)

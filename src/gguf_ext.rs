@@ -128,7 +128,7 @@ pub struct RawTensorInfo {
     /// GGML type id — e.g. 39 for MXFP4. Deliberately not narrowed to
     /// candle's `GgmlDType`, which cannot represent every type.
     pub dtype: u32,
-    /// Dimensions, in GGUF order (fastest-varying first).
+    /// Dimensions in row-major order (reversed from GGUF; matrices are `[output, input]`).
     pub dims: Vec<usize>,
     /// Byte offset from `tensor_data_offset`.
     pub offset: u64,
