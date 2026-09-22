@@ -24,6 +24,7 @@
 pub mod auto_placement;
 pub mod compression;
 pub mod cpu_pinning;
+pub mod distributed;
 pub mod embedding;
 pub mod engine;
 pub mod error;

@@ -28,6 +28,10 @@ all-features = false
 name = "joshua"
 path = "src/main.rs"
 
+[[example]]
+name = "cluster_linear"
+required-features = ["distributed"]
+
 [lib]
 name = "joshua"
 path = "src/lib.rs"
@@ -61,6 +65,8 @@ vulkan = ["candle-core/vulkan", "candle-nn/vulkan"]
 # compiles C/assembly, which would break the default build's
 # "only a Rust toolchain required" guarantee.
 tls = ["dep:axum-server", "dep:rustls"]
+# Experimental static-cluster discovery and authenticated UDP collectives.
+distributed = ["dep:mdns-sd", "dep:socket2", "dep:hmac"]
 
 # Zero-copy Metal weights (mmap-backed GPU buffers) use the vendored
 # candle-metal-kernels, patched with offset-aware quantized entry points.
@@ -167,6 +173,9 @@ tokio-stream = "0.1"
 # default aws-lc-rs (needs CMake).
 axum-server = { version = "0.7", default-features = false, features = ["tls-rustls-no-provider"], optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"], optional = true }
+mdns-sd = { version = "0.21.4", optional = true }
+socket2 = { version = "0.6.5", optional = true }
+hmac = { version = "0.12.1", optional = true }
 
 [dev-dependencies]
 # Used by integration tests to synthesise tiny GGUF model files and
