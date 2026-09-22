@@ -2,8 +2,9 @@
 //!
 //! GGUF sharding and capacity planning are available without networking.
 //! The `distributed` feature enables advisory mDNS discovery and authenticated
-//! UDP collectives. These APIs do not change [`crate::Engine`]'s single-node
-//! execution or automatically admit discovered machines to a cluster.
+//! UDP collectives and an explicitly selected TCP ring fallback. These APIs do not
+//! change [`crate::Engine`]'s single-node execution or automatically admit discovered
+//! machines to a cluster.
 
 #[cfg(feature = "distributed")]
 pub mod collective;
@@ -11,3 +12,5 @@ pub mod collective;
 pub mod discovery;
 pub mod partition;
 pub mod shard;
+#[cfg(feature = "distributed")]
+pub mod tcp;
