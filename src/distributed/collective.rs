@@ -11,7 +11,8 @@
 //! rank. UDP cannot guarantee globally atomic success during a partition (one rank
 //! can succeed while another times out). Brief completion-ack linger and replay
 //! during the next call mitigate lost final acknowledgements, not that limitation.
-//! TCP fallback, FEC, dynamic membership and performance guarantees are deferred.
+//! For networks without multicast, select [`super::tcp`] before starting the job.
+//! FEC, dynamic membership and performance guarantees are deferred.
 
 use anyhow::{bail, ensure, Context, Result};
 use hmac::{Hmac, Mac};

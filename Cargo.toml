@@ -65,7 +65,7 @@ vulkan = ["candle-core/vulkan", "candle-nn/vulkan"]
 # compiles C/assembly, which would break the default build's
 # "only a Rust toolchain required" guarantee.
 tls = ["dep:axum-server", "dep:rustls"]
-# Experimental static-cluster discovery and authenticated UDP collectives.
+# Experimental static-cluster discovery and authenticated UDP/TCP collectives.
 distributed = ["dep:mdns-sd", "dep:socket2", "dep:hmac"]
 
 # Zero-copy Metal weights (mmap-backed GPU buffers) use the vendored
