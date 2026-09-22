@@ -749,12 +749,18 @@ candle path on the same weights.
 
 ---
 
-## Experimental distributed building blocks (#86–91)
+## Experimental DeepSeek V4 clustering (#86–91)
 
-The `distributed` Cargo feature adds **static-cluster primitives**, not a
-distributed `Engine::complete` or server mode. Existing single-node inference
-is unchanged. The library exposes:
+The `distributed` Cargo feature adds **CPU-only, static-cluster DeepSeek V4
+generation** through `joshua cluster-run`, plus the building blocks below.
+DeepSeek V4 Flash is the first full-model target. This is not a distributed
+`Engine::complete` or OpenAI server mode; existing single-node inference is
+unchanged. The library exposes:
 
+- `distributed::deepseek4::DeepSeekCluster`: one ordered DeepSeek V4 request
+  with routed-expert tensor parallelism, replicated attention and KV caches.
+- `distributed::session::ClusterSession`: fixed authenticated membership,
+  input/configuration agreement, chunked reductions and rank-zero broadcasts.
 - `distributed::shard`: checked, block-aligned input-column slices of GGUF
   matrices, local mmap ownership, shard-only prefetch, and partial matvecs.
 - `distributed::collective` (feature-gated): authenticated UDP multicast
@@ -791,6 +797,110 @@ file reserves virtual addresses, not that amount of physical RAM. OS page
 granularity, readahead, metadata, activations and runtime allocations mean RSS
 is **not exactly** the encoded shard size; reserve additional RAM accordingly.
 NFS does not share a page cache across machines and is not required.
+
+### Run DeepSeek V4 Flash on a static cluster
+
+Build the **same revision** on every node:
+
+```bash
+cargo build --release -p joshua --features distributed
+```
+
+Pre-sync the GGUF and `tokenizer.json` to each node's local SSD and verify
+their checksums before launching. Startup checks GGUF headers, file lengths,
+context limits, input tokens and generation settings; it deliberately **does
+not hash all weight bytes**, which would read off-rank weights. Equal headers
+do not prove equal weights.
+
+Create a fresh job UUID and a random 32-byte key once, and securely distribute
+the same values to every rank. For example:
+
+```bash
+export SESSION=$(python3 -c 'import uuid; print(uuid.uuid4())')
+export JOSHUA_CLUSTER_KEY=$(openssl rand -hex 32)
+```
+
+On node 0 (`10.0.0.1`), with the model under `/srv/models/`:
+
+```bash
+./target/release/joshua cluster-run \
+  --model /srv/models/deepseek-v4-flash.gguf \
+  --rank 0 --world-size 2 --transport tcp \
+  --peers 10.0.0.1:48888,10.0.0.2:48888 --session "$SESSION" \
+  --n-ctx 4096 --prefill-chunk 32 --max-tokens 64 \
+  "Explain how a hash table works."
+```
+
+Run the identical command on node 1, changing only `--rank 0` to `--rank 1`
+and, if necessary, the local model/tokenizer paths. Launch all ranks together.
+Only rank zero prints the completion; all ranks must participate until the job
+finishes. The GGUF chat template is used by default. Use `--raw-prompt` for
+already-formatted model input, or `--tokens 1,4,2` instead of a text prompt to
+test pre-tokenized input and receive generated token IDs as JSON.
+
+TCP is the default. To use multicast, omit `--peers`, select `--transport udp`,
+and set the same `--group`/`--port` on every node with a per-node `--interface`
+LAN address. For local testing, TCP peers can be
+`127.0.0.1:48888,127.0.0.1:48889`. Open only the selected ports on a trusted
+network: HMAC authenticates traffic but does **not encrypt it**. mDNS does not
+automatically admit machines to the job.
+
+Each routed MLP splits its intermediate dimension: gate/up **output rows**
+and matching down-projection **input columns**. The elementwise SwiGLU stays
+local; the weighted routed outputs are reduced before adding the replicated
+shared expert. Boundaries respect down-projection quantization blocks. Too
+many ranks for a nonempty aligned shard are rejected. Router decisions and
+generated tokens are coordinated across ranks; sampling is greedy.
+
+The encoded routed-expert byte totals printed at startup are **not RSS**.
+Dense weights, embeddings, shared experts, attention/compression state and KV
+are replicated on every node. Only local routed-expert ranges are read or
+prefetched; whole-layer expert prefetch and the device expert cache are
+disabled on this path. This first implementation uses CPU reference shard
+matvecs, not the optimized accelerator or fused quantized kernels. It is a
+correctness bring-up path, **not a throughput promise**.
+
+The cluster handles one request at a time, with fixed membership and equal
+block-balanced expert shards. It does not yet consume the heterogeneous
+partition planner. A mismatch, timeout or failed rank invalidates the job;
+restart **every** rank with a fresh UUID. There is no partial-result
+degradation, mid-request transport switch, live repartitioning or automatic
+failover. `--timeout-seconds` (default 120, maximum 120) applies to each
+transport exchange, not the total inference time.
+
+### Offline acceptance checks and issue status
+
+Local regression tests compare tiny DeepSeek V4 IQ2_XXS/I32 hash and regular
+MoE inference against a single-node reference, including prefill and decode.
+Run the clustering and model tests with:
+
+```bash
+cargo test -p joshua --features distributed --lib distributed
+cargo test -p joshua --features distributed --test deepseek4_tests
+cargo test -p joshua --features distributed --bin joshua cluster_cli
+```
+
+Before treating the RFC as complete, validate the real Flash GGUF offline:
+
+1. Compare a one-rank `cluster-run` baseline with two ranks using identical
+   token input and greedy decoding. Record revision, GGUF checksum, quantization,
+   context/chunk size, generated IDs and per-rank encoded shard bytes.
+2. Inspect each process's `/proc/<pid>/smaps_rollup` after prefill and decode.
+   Include replicated weights/KV and page overhead when interpreting residency.
+3. Repeat on the LAN with both TCP and UDP; record end-to-end throughput
+   (including prefill), interconnect speed and packet-loss behavior. Kill a rank
+   and confirm peers fail within their configured exchange deadlines rather
+   than emitting a successful incomplete completion.
+4. Separately validate discovery join/leave timing and a 100-node discovery
+   load. A tiny loopback test is not evidence for the LAN scalability targets.
+
+Issues #86–91 are **not all complete**: #87 still needs LAN/scalability
+verification; #88 needs real-network loss/throughput validation and its remaining
+protocol optimizations; #89 has local shard/model coverage but does not promise
+bit-exact floating-point results; #90 needs real-model residency measurements;
+#91 still needs live topology measurement, runtime scheduling/repartitioning and
+wall-clock balance validation. These gaps must not be marked complete merely
+because the local inference path works.
 
 ### Run the linear-layer proof
 

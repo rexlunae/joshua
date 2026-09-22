@@ -7,6 +7,92 @@ mod common;
 use candle_core::{Device, Tensor};
 use joshua::model::{Architecture, QuantizedModel};
 
+#[cfg(feature = "distributed")]
+fn cluster_sessions(count: usize) -> Vec<std::sync::Arc<joshua::distributed::session::ClusterSession>> {
+    use joshua::distributed::{session::ClusterSession, tcp::TcpConfig};
+    let listeners: Vec<_> = (0..count)
+        .map(|_| std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap())
+        .collect();
+    let config = TcpConfig {
+        peers: listeners.iter().map(|l| l.local_addr().unwrap()).collect(),
+        timeout: std::time::Duration::from_secs(30),
+    };
+    drop(listeners);
+    let session = uuid::Uuid::new_v4();
+    (0..count).map(|rank| {
+        std::sync::Arc::new(ClusterSession::tcp(
+            rank, session, b"deepseek-loopback-test-key-only!!", config.clone(),
+        ).unwrap())
+    }).collect()
+}
+
+#[cfg(feature = "distributed")]
+#[test]
+fn deepseek4_cluster_matches_single_node_prefill_decode() {
+    use joshua::distributed::deepseek4::DeepSeekCluster;
+    for (name, opts) in [
+        ("q8", common::TinyDeepseek4Opts::default()),
+        ("q2k-compressed", common::TinyDeepseek4Opts {
+            compress: true, q2k_down: true, expert_width: Some(512), ..Default::default()
+        }),
+    ] {
+        let dir = common::model_dir(&format!("deepseek4-cluster-{name}"));
+        let path = dir.join("model.gguf");
+        common::write_tiny_deepseek4_gguf_opts(&path, opts);
+        let mut reference = load(&path, true);
+        let calls = [(&[1, 4, 2, 7, 5, 3, 8, 2, 6][..], 0), (&[3][..], 9), (&[8][..], 10), (&[2][..], 11)];
+        let expected: Vec<_> = calls.iter().map(|(tokens, offset)| logits(&mut reference, tokens, *offset)).collect();
+        for count in [1, 2] {
+            let sessions = cluster_sessions(count);
+            let outputs = std::thread::scope(|scope| {
+                let workers: Vec<_> = sessions.into_iter().map(|session| {
+                    let path = &path;
+                    let calls = &calls;
+                    scope.spawn(move || {
+                        let mut model = DeepSeekCluster::load(path, 32, session).unwrap();
+                        let (local_bytes, full_bytes) = model.expert_shard_bytes();
+                        assert!(local_bytes > 0);
+                        assert_eq!(local_bytes * count, full_bytes);
+                        calls.iter().map(|(tokens, offset)| model.forward(tokens, *offset).unwrap()).collect::<Vec<_>>()
+                    })
+                }).collect();
+                workers.into_iter().map(|w| w.join().unwrap()).collect::<Vec<_>>()
+            });
+            for rank in &outputs {
+                assert_eq!(rank, &outputs[0], "ranks must produce identical logits");
+                for (step, (actual, expected)) in rank.iter().zip(&expected).enumerate() {
+                    for (i, (&a, &e)) in actual.iter().zip(expected).enumerate() {
+                        let tolerance = 1e-3 * e.abs().max(1.0);
+                        assert!((a - e).abs() <= tolerance,
+                            "{name}, {count} ranks, step {step}, logit {i}: {a} != {e} (tol {tolerance})");
+                    }
+                }
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(feature = "distributed")]
+#[test]
+fn deepseek4_cluster_rejects_more_ranks_than_down_blocks() {
+    use joshua::distributed::deepseek4::DeepSeekCluster;
+    let dir = common::model_dir("deepseek4-cluster-alignment");
+    let path = dir.join("model.gguf");
+    common::write_tiny_deepseek4_gguf_q2k_down(&path);
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = cluster_sessions(2).into_iter().map(|session| {
+            let path = &path;
+            scope.spawn(move || {
+                let error = DeepSeekCluster::load(path, 32, session).err().unwrap();
+                assert!(error.to_string().contains("more shards than input blocks"), "{error}");
+            })
+        }).collect();
+        for worker in workers { worker.join().unwrap(); }
+    });
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 fn load(model: &std::path::Path, mmap: bool) -> QuantizedModel {
     let bytes = std::fs::read(model).unwrap();
     let mut cursor = std::io::Cursor::new(&bytes[..]);

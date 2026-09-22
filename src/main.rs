@@ -19,6 +19,9 @@ use std::sync::Arc;
 use clap::{Parser, Subcommand, ValueEnum};
 use tracing_subscriber::EnvFilter;
 
+#[cfg(feature = "distributed")]
+mod cluster_cli;
+
 use joshua::{
     engine::Engine, server, types::GenerationOptions, ChatMessage, ComputeBackend, DensePlacement,
     EngineOptions, ExpertPlacement, HugePages, MlockMode, MmapMode, PageSize,
@@ -187,6 +190,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Run CPU DeepSeek V4 generation on an explicit static cluster (experimental).
+    #[cfg(feature = "distributed")]
+    ClusterRun(cluster_cli::ClusterRun),
     /// Start the OpenAI-compatible HTTP API server.
     Serve {
         /// Path to the GGUF model file.
@@ -482,6 +488,8 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        #[cfg(feature = "distributed")]
+        Commands::ClusterRun(args) => args.run()?,
         Commands::Serve {
             model,
             addr,
