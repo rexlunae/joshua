@@ -282,7 +282,15 @@ impl ShardedTensor {
     /// are never accessed. Sum peer outputs to recover the full matvec.
     pub fn forward(&self, input: &[f32]) -> Result<Vec<f32>> {
         ensure!(input.len() == self.input_width, "incorrect input width");
-        let input = &input[self.input_range.clone()];
+        self.forward_local(&input[self.input_range.clone()])
+    }
+
+    /// Multiply a compact activation vector containing only this shard's columns.
+    pub fn forward_local(&self, input: &[f32]) -> Result<Vec<f32>> {
+        ensure!(
+            input.len() == self.input_range.len(),
+            "incorrect local input width"
+        );
         let mut output = Vec::new();
         output
             .try_reserve_exact(self.output_width)
@@ -448,6 +456,12 @@ mod tests {
                 let mut local_input = vec![f32::NAN; width];
                 let local = shard.input_range();
                 local_input[local.clone()].copy_from_slice(&input[local]);
+                assert_eq!(
+                    shard.forward(&local_input).unwrap(),
+                    shard.forward_local(&input[shard.input_range()]).unwrap()
+                );
+                assert!(shard.forward_local(&[]).is_err());
+                assert!(shard.forward_local(&input).is_err());
                 for (total, value) in sum.iter_mut().zip(shard.forward(&local_input).unwrap()) {
                     *total += value;
                 }

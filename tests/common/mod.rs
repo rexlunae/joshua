@@ -1331,6 +1331,8 @@ pub struct TinyDeepseek4Opts {
     /// (the real V4-Flash layout: IQ2_XXS gate/up, Q2_K down), instead of
     /// Q8_0 with a 128-wide one.
     pub q2k_down: bool,
+    /// Override routed intermediate width for multi-block shard fixtures.
+    pub expert_width: Option<usize>,
 }
 
 pub fn write_tiny_deepseek4_gguf(path: &Path) {
@@ -1403,13 +1405,14 @@ pub fn write_tiny_deepseek4_gguf_candle_only(path: &Path) {
     );
 }
 
-fn write_tiny_deepseek4_gguf_opts(path: &Path, opts: TinyDeepseek4Opts) {
+pub fn write_tiny_deepseek4_gguf_opts(path: &Path, opts: TinyDeepseek4Opts) {
     let TinyDeepseek4Opts {
         iq2xxs_output,
         compress,
         kquant_weights,
         candle_only,
         q2k_down,
+        expert_width,
     } = opts;
     const VOCAB: usize = 16;
     // EMB must be a multiple of the IQ2_XXS block size (256): each expert's
@@ -1427,7 +1430,7 @@ fn write_tiny_deepseek4_gguf_opts(path: &Path, opts: TinyDeepseek4Opts) {
     const NE: usize = 8;
     // Expert ffn width (out of gate/up, in of down): 256 so a Q2_K down
     // projection has a block-aligned contraction dim, 128 otherwise.
-    let nfe: usize = if q2k_down { 256 } else { 128 };
+    let nfe: usize = expert_width.unwrap_or(if q2k_down { 256 } else { 128 });
     const NUSED: usize = 2;
     const N_SHARED: usize = 1;
     const HC: usize = 2;

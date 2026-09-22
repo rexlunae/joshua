@@ -7,6 +7,353 @@ mod common;
 use candle_core::{Device, Tensor};
 use joshua::model::{Architecture, QuantizedModel};
 
+#[cfg(feature = "distributed")]
+fn cluster_sessions(
+    count: usize,
+) -> Vec<std::sync::Arc<joshua::distributed::session::ClusterSession>> {
+    use joshua::distributed::{session::ClusterSession, tcp::TcpConfig};
+    let listeners: Vec<_> = (0..count)
+        .map(|_| std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap())
+        .collect();
+    let config = TcpConfig {
+        peers: listeners.iter().map(|l| l.local_addr().unwrap()).collect(),
+        timeout: std::time::Duration::from_secs(30),
+    };
+    drop(listeners);
+    let session = uuid::Uuid::new_v4();
+    let key = rand::random::<[u8; 32]>();
+    (0..count)
+        .map(|rank| {
+            std::sync::Arc::new(
+                ClusterSession::tcp(rank, session, &key, config.clone()).unwrap(),
+            )
+        })
+        .collect()
+}
+
+#[cfg(feature = "distributed")]
+#[test]
+fn deepseek4_cluster_matches_single_node_prefill_decode() {
+    use joshua::distributed::deepseek4::DeepSeekCluster;
+    for (name, opts) in [
+        ("q8", common::TinyDeepseek4Opts::default()),
+        (
+            "q2k-compressed",
+            common::TinyDeepseek4Opts {
+                compress: true,
+                q2k_down: true,
+                expert_width: Some(512),
+                ..Default::default()
+            },
+        ),
+    ] {
+        let dir = common::model_dir(&format!("deepseek4-cluster-{name}"));
+        let path = dir.join("model.gguf");
+        common::write_tiny_deepseek4_gguf_opts(&path, opts);
+        let mut reference = load(&path, true);
+        let calls = [
+            (&[1, 4, 2, 7, 5, 3, 8, 2, 6][..], 0),
+            (&[3][..], 9),
+            (&[8][..], 10),
+            (&[2][..], 11),
+        ];
+        let expected: Vec<_> = calls
+            .iter()
+            .map(|(tokens, offset)| logits(&mut reference, tokens, *offset))
+            .collect();
+        for count in [1, 2] {
+            let sessions = cluster_sessions(count);
+            let outputs = std::thread::scope(|scope| {
+                let workers: Vec<_> = sessions
+                    .into_iter()
+                    .map(|session| {
+                        let path = &path;
+                        let calls = &calls;
+                        scope.spawn(move || {
+                            let mut model = DeepSeekCluster::load(path, 32, session).unwrap();
+                            let (local_bytes, full_bytes) = model.expert_shard_bytes();
+                            assert!(local_bytes > 0);
+                            assert_eq!(local_bytes * count, full_bytes);
+                            calls
+                                .iter()
+                                .map(|(tokens, offset)| model.forward(tokens, *offset).unwrap())
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                    .collect();
+                workers
+                    .into_iter()
+                    .map(|w| w.join().unwrap())
+                    .collect::<Vec<_>>()
+            });
+            for rank in &outputs {
+                assert_eq!(rank, &outputs[0], "ranks must produce identical logits");
+                for (step, (actual, expected)) in rank.iter().zip(&expected).enumerate() {
+                    for (i, (&a, &e)) in actual.iter().zip(expected).enumerate() {
+                        let tolerance = 1e-3 * e.abs().max(1.0);
+                        assert!((a - e).abs() <= tolerance,
+                            "{name}, {count} ranks, step {step}, logit {i}: {a} != {e} (tol {tolerance})");
+                    }
+                }
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(feature = "distributed")]
+#[test]
+fn deepseek4_cluster_uses_rank_zero_routing_despite_peer_drift() {
+    use joshua::distributed::deepseek4::DeepSeekCluster;
+    let dir = common::model_dir("deepseek4-cluster-routing");
+    let root_path = dir.join("root.gguf");
+    let peer_path = dir.join("peer.gguf");
+    common::write_tiny_deepseek4_gguf(&root_path);
+    let mut bytes = std::fs::read(&root_path).unwrap();
+    let header = joshua::gguf_ext::read_header(&mut std::io::Cursor::new(&bytes)).unwrap();
+    // Deliberately alter only the peer's routers to amplify numerical drift.
+    // Real deployments must verify identical model checksums out of band.
+    for (name, tensor) in &header.tensors {
+        if name.ends_with(".ffn_gate_inp.weight") || name.ends_with(".exp_probs_b.bias") {
+            assert_eq!(tensor.dtype, 0);
+            let start = (header.tensor_data_offset + tensor.offset) as usize;
+            let len = tensor.dims.iter().product::<usize>() * 4;
+            bytes[start..start + len].fill(0);
+            if name.ends_with(".exp_probs_b.bias") {
+                bytes[start..start + 4].copy_from_slice(&100f32.to_le_bytes());
+            }
+        }
+    }
+    std::fs::write(&peer_path, bytes).unwrap();
+    let tokens = [1, 4, 2, 7, 5];
+    let expected = logits(&mut load(&root_path, true), &tokens, 0);
+    let perturbed = logits(&mut load(&peer_path, true), &tokens, 0);
+    assert!(expected
+        .iter()
+        .zip(&perturbed)
+        .any(|(a, b)| (a - b).abs() > 1e-4));
+    let outputs = std::thread::scope(|scope| {
+        let workers: Vec<_> = cluster_sessions(2)
+            .into_iter()
+            .enumerate()
+            .map(|(rank, session)| {
+                let path = if rank == 0 { &root_path } else { &peer_path };
+                let tokens = &tokens;
+                scope.spawn(move || {
+                    DeepSeekCluster::load(path, 32, session)
+                        .unwrap()
+                        .forward(tokens, 0)
+                        .unwrap()
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .map(|w| w.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(outputs[0], outputs[1]);
+    for (&actual, &expected) in outputs[0].iter().zip(&expected) {
+        assert!((actual - expected).abs() <= 1e-3 * expected.abs().max(1.0));
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(feature = "distributed")]
+#[test]
+fn deepseek4_cluster_cli_generates_like_single_node() {
+    use std::process::{Child, Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    struct ChildGuard(Option<Child>);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            if let Some(child) = self.0.as_mut() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    let dir = common::model_dir("deepseek4-cluster-cli");
+    let path = dir.join("model.gguf");
+    common::write_tiny_deepseek4_gguf(&path);
+    let mut reference = load(&path, true);
+    let mut next = logits(&mut reference, &[1, 4], 0);
+    assert!(next.iter().all(|v| v.is_finite()));
+    next = logits(&mut reference, &[2], 2);
+    let mut expected = Vec::new();
+    for step in 0..3 {
+        let best =
+            (1..next.len()).fold(0, |best, i| if next[i] > next[best] { i } else { best }) as u32;
+        expected.push(best);
+        if step < 2 {
+            next = logits(&mut reference, &[best], 3 + step);
+        }
+    }
+
+    for count in [1, 2] {
+        let listeners: Vec<_> = (0..count)
+            .map(|_| std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap())
+            .collect();
+        let peers = listeners
+            .iter()
+            .map(|listener| listener.local_addr().unwrap().to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        drop(listeners);
+        let session = uuid::Uuid::new_v4().to_string();
+        let key: String = rand::random::<[u8; 32]>()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let mut children: Vec<_> = (0..count)
+            .map(|rank| {
+                ChildGuard(Some(
+                    Command::new(env!("CARGO_BIN_EXE_joshua"))
+                        .args(["cluster-run", "--model"])
+                        .arg(&path)
+                        .args([
+                            "--tokens",
+                            "1,4,2",
+                            "--n-ctx",
+                            "32",
+                            "--max-tokens",
+                            "3",
+                            "--prefill-chunk",
+                            "2",
+                            "--rank",
+                            &rank.to_string(),
+                            "--world-size",
+                            &count.to_string(),
+                            "--session",
+                            &session,
+                            "--transport",
+                            "tcp",
+                            "--peers",
+                            &peers,
+                            "--timeout-seconds",
+                            "30",
+                        ])
+                        .env("JOSHUA_CLUSTER_KEY", &key)
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .spawn()
+                        .unwrap(),
+                ))
+            })
+            .collect();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let complete = children
+                .iter_mut()
+                .all(|child| child.0.as_mut().unwrap().try_wait().unwrap().is_some());
+            if complete {
+                break;
+            }
+            assert!(Instant::now() < deadline, "cluster CLI processes timed out");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        for (rank, child) in children.iter_mut().enumerate() {
+            let output = child.0.take().unwrap().wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "{count} ranks, rank {rank}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stderr).contains("routed_expert_bytes="));
+            if rank == 0 {
+                let actual: Vec<u32> = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(actual, expected, "{count}-rank CLI generation differs");
+            } else {
+                assert!(output.stdout.is_empty(), "only rank zero prints output");
+            }
+        }
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(feature = "distributed")]
+#[test]
+fn deepseek4_cluster_mismatched_inputs_fail_and_poison_every_rank() {
+    use joshua::distributed::deepseek4::DeepSeekCluster;
+    let dir = common::model_dir("deepseek4-cluster-input-mismatch");
+    let path = dir.join("model.gguf");
+    common::write_tiny_deepseek4_gguf(&path);
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = cluster_sessions(2)
+            .into_iter()
+            .enumerate()
+            .map(|(rank, session)| {
+                let path = &path;
+                scope.spawn(move || {
+                    let mut model = DeepSeekCluster::load(path, 32, session).unwrap();
+                    let tokens = [1, 4 + rank as u32];
+                    let error = model.forward(&tokens, 0).unwrap_err();
+                    assert!(error.to_string().contains("disagree"), "{error}");
+                    let error = model.forward(&[1, 4], 0).unwrap_err();
+                    assert!(error.to_string().contains("session failed"), "{error}");
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+    });
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(feature = "distributed")]
+#[test]
+fn deepseek4_cluster_invalid_inputs_fail_and_poison_session() {
+    use joshua::distributed::deepseek4::DeepSeekCluster;
+    let dir = common::model_dir("deepseek4-cluster-invalid-input");
+    let path = dir.join("model.gguf");
+    common::write_tiny_deepseek4_gguf(&path);
+    for (tokens, offset, message) in [
+        (vec![16], 0, "out-of-vocabulary"),
+        (vec![1], 1, "offset is not contiguous"),
+        (vec![1; 33], 0, "context exhausted"),
+        (Vec::new(), 0, "must not be empty"),
+    ] {
+        let session = cluster_sessions(1).pop().unwrap();
+        let mut model = DeepSeekCluster::load(&path, 32, session).unwrap();
+        let error = model.forward(&tokens, offset).unwrap_err();
+        assert!(error.to_string().contains(message), "{error}");
+        let error = model.forward(&[1], 0).unwrap_err();
+        assert!(error.to_string().contains("session failed"), "{error}");
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(feature = "distributed")]
+#[test]
+fn deepseek4_cluster_rejects_more_ranks_than_down_blocks() {
+    use joshua::distributed::deepseek4::DeepSeekCluster;
+    let dir = common::model_dir("deepseek4-cluster-alignment");
+    let path = dir.join("model.gguf");
+    common::write_tiny_deepseek4_gguf_q2k_down(&path);
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = cluster_sessions(2)
+            .into_iter()
+            .map(|session| {
+                let path = &path;
+                scope.spawn(move || {
+                    let error = DeepSeekCluster::load(path, 32, session).err().unwrap();
+                    assert!(
+                        error.to_string().contains("more shards than input blocks"),
+                        "{error}"
+                    );
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+    });
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 fn load(model: &std::path::Path, mmap: bool) -> QuantizedModel {
     let bytes = std::fs::read(model).unwrap();
     let mut cursor = std::io::Cursor::new(&bytes[..]);

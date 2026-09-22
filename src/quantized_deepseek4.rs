@@ -1852,6 +1852,110 @@ impl KvState {
 
 // ─── MoE ────────────────────────────────────────────────────────────────────
 
+#[cfg(feature = "distributed")]
+struct DistributedExpert {
+    gate: crate::distributed::shard::ShardedTensor,
+    up: crate::distributed::shard::ShardedTensor,
+    down: crate::distributed::shard::ShardedTensor,
+}
+
+#[cfg(feature = "distributed")]
+struct DistributedMoe {
+    experts: Vec<DistributedExpert>,
+    cluster: Arc<crate::distributed::session::ClusterSession>,
+    clamp: f64,
+    local_bytes: usize,
+    full_bytes: usize,
+}
+
+#[cfg(feature = "distributed")]
+impl DistributedMoe {
+    fn synchronize_routing(&self, ids: &mut [u32], weights: &mut [f32]) -> Result<()> {
+        if ids.len() != weights.len() {
+            candle_core::bail!("deepseek4: invalid distributed routing dimensions");
+        }
+        let count = ids.len().checked_mul(2).ok_or_else(|| {
+            candle_core::Error::Msg("deepseek4: routing broadcast size overflow".into())
+        })?;
+        let mut routing = Vec::new();
+        routing
+            .try_reserve_exact(count)
+            .map_err(candle_core::Error::wrap)?;
+        for (&id, &weight) in ids.iter().zip(weights.iter()) {
+            routing.extend_from_slice(&[id as f32, weight]);
+        }
+        // Routing must be rank-0 authoritative even when replicated CPU kernels
+        // differ in their floating-point rounding near a top-k boundary.
+        self.cluster
+            .broadcast(&mut routing)
+            .map_err(candle_core::Error::wrap)?;
+        for ((id, weight), pair) in ids.iter_mut().zip(weights).zip(routing.chunks_exact(2)) {
+            let chosen = pair[0];
+            if chosen < 0.0 || chosen.fract() != 0.0 || chosen as usize >= self.experts.len() {
+                candle_core::bail!("deepseek4: invalid broadcast expert id");
+            }
+            *id = chosen as u32;
+            *weight = pair[1];
+        }
+        Ok(())
+    }
+
+    fn dispatch(
+        &self,
+        xs: &Tensor,
+        ids: &[u32],
+        weights: &[f32],
+        k: usize,
+    ) -> Result<(Tensor, Vec<u32>)> {
+        let (n, h) = xs.dims2()?;
+        if k == 0 || n.checked_mul(k) != Some(ids.len()) || weights.len() != ids.len() {
+            candle_core::bail!("deepseek4: invalid distributed routing dimensions");
+        }
+        let input = xs.flatten_all()?.to_vec1::<f32>()?;
+        let mut output = vec![0f32; input.len()];
+        let mut buckets = vec![Vec::new(); self.experts.len()];
+        for (i, (&id, &weight)) in ids.iter().zip(weights).enumerate() {
+            let bucket = buckets.get_mut(id as usize).ok_or_else(|| {
+                candle_core::Error::Msg("deepseek4: routed expert id out of range".into())
+            })?;
+            bucket.push((i / k, weight));
+        }
+        for (expert, bucket) in self.experts.iter().zip(&buckets) {
+            if bucket.is_empty() {
+                continue;
+            }
+            // These handles contain only local rows/columns, not full experts.
+            for tensor in [&expert.gate, &expert.up, &expert.down] {
+                let _ = tensor.prefetch();
+            }
+            for &(token, weight) in bucket {
+                let x = &input[token * h..(token + 1) * h];
+                let gate = expert.gate.forward(x).map_err(candle_core::Error::wrap)?;
+                let up = expert.up.forward(x).map_err(candle_core::Error::wrap)?;
+                let width = gate.len();
+                let gate = clamp_gate(Tensor::from_vec(gate, width, &Device::Cpu)?, self.clamp)?;
+                let up = clamp_up(Tensor::from_vec(up, width, &Device::Cpu)?, self.clamp)?;
+                let hidden = (silu(&gate)? * up)?.to_vec1::<f32>()?;
+                let local = expert
+                    .down
+                    .forward_local(&hidden)
+                    .map_err(candle_core::Error::wrap)?;
+                for (out, value) in output[token * h..(token + 1) * h].iter_mut().zip(local) {
+                    *out += weight * value;
+                }
+            }
+        }
+        // Exactly one logical reduction per MoE, before the replicated shared MLP.
+        self.cluster
+            .all_reduce_sum(&mut output)
+            .map_err(candle_core::Error::wrap)?;
+        let mut last = ids[n.saturating_sub(1) * k..].to_vec();
+        last.sort_unstable();
+        last.dedup();
+        Ok((Tensor::from_vec(output, (n, h), &Device::Cpu)?, last))
+    }
+}
+
 struct Moe {
     /// Router weight, transposed to `[n_embd, n_expert]` and made contiguous
     /// once at load (it was a transpose + copy per forward call).
@@ -1859,6 +1963,8 @@ struct Moe {
     gate_bias: Option<Tensor>, // [n_expert]
     tid2eid: Option<Tensor>,   // [n_vocab, n_expert_used] (candle shape after gguf dim reversal)
     experts: Vec<Mlp>,
+    #[cfg(feature = "distributed")]
+    distributed: Option<DistributedMoe>,
     shared: Option<Mlp>,
     n_expert_used: usize,
     weights_scale: f64,
@@ -1955,7 +2061,19 @@ impl Moe {
         let h = x2.dim(1)?;
         let ids: Vec<u32> = indices.flatten_all()?.to_vec1()?;
         let wts: Vec<f32> = weights.flatten_all()?.to_vec1()?;
+        #[cfg(feature = "distributed")]
+        let (ids, wts) = {
+            let (mut ids, mut wts) = (ids, wts);
+            if let Some(distributed) = &self.distributed {
+                distributed.synchronize_routing(&mut ids, &mut wts)?;
+            }
+            (ids, wts)
+        };
         crate::route_trace::record(self.layer, &ids, k, ctx.trace_row_base, ctx.trace_chunk);
+        #[cfg(feature = "distributed")]
+        if let Some(distributed) = &self.distributed {
+            return distributed.dispatch(x2, &ids, &wts, k);
+        }
         let out_device = x2.device().clone();
         if let Some(pool) = &self.device_pool {
             // Every launch of the previous MoE layer has completed: with the
@@ -2408,6 +2526,8 @@ struct Reader<R: Read + Seek> {
     mmap: Option<std::sync::Arc<memmap2::Mmap>>,
     /// The model file, for the layer-ahead pread prefetch thread.
     file: Option<std::sync::Arc<std::fs::File>>,
+    #[cfg(feature = "distributed")]
+    cluster: Option<Arc<crate::distributed::session::ClusterSession>>,
 }
 
 impl<R: Read + Seek> Reader<R> {
@@ -2663,6 +2783,59 @@ impl ModelWeights {
         n_ctx: usize,
         device_expert_cache_bytes: Option<u64>,
     ) -> Result<Self> {
+        Self::load_gguf(
+            ct,
+            raw,
+            reader,
+            device,
+            expert_device,
+            mmap,
+            file,
+            n_ctx,
+            device_expert_cache_bytes,
+            #[cfg(feature = "distributed")]
+            None,
+        )
+    }
+
+    #[cfg(feature = "distributed")]
+    pub(crate) fn from_gguf_distributed<R: Read + Seek>(
+        ct: gguf_file::Content,
+        raw: &GgufHeader,
+        reader: &mut R,
+        mmap: Arc<memmap2::Mmap>,
+        n_ctx: usize,
+        cluster: Arc<crate::distributed::session::ClusterSession>,
+    ) -> Result<Self> {
+        Self::load_gguf(
+            ct,
+            Some(raw),
+            reader,
+            &Device::Cpu,
+            &Device::Cpu,
+            Some(mmap),
+            None,
+            n_ctx,
+            None,
+            Some(cluster),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn load_gguf<R: Read + Seek>(
+        ct: gguf_file::Content,
+        raw: Option<&GgufHeader>,
+        reader: &mut R,
+        device: &Device,
+        expert_device: &Device,
+        mmap: Option<Arc<memmap2::Mmap>>,
+        file: Option<Arc<std::fs::File>>,
+        n_ctx: usize,
+        device_expert_cache_bytes: Option<u64>,
+        #[cfg(feature = "distributed")] cluster: Option<
+            Arc<crate::distributed::session::ClusterSession>,
+        >,
+    ) -> Result<Self> {
         let cfg = Config::from_metadata(&ct.metadata)?;
         if !(expert_device.is_cpu()
             || expert_device.is_opencl()
@@ -2721,6 +2894,8 @@ impl ModelWeights {
             expert_device,
             mmap,
             file,
+            #[cfg(feature = "distributed")]
+            cluster,
         };
 
         let tok_embeddings =
@@ -2897,6 +3072,14 @@ impl ModelWeights {
             .unwrap_or_default();
         let mmap = rd.mmap.clone();
         let file = rd.file.clone();
+        // Shards retain their own mappings. Do not expose whole expert ranges
+        // to the layer-ahead or residency prefetch paths.
+        #[cfg(feature = "distributed")]
+        let (mmap, file, layer_expert_ranges) = if rd.cluster.is_some() {
+            (None, None, Vec::new())
+        } else {
+            (mmap, file, layer_expert_ranges)
+        };
 
         let n_expert = cfg.n_expert;
         // The device expert pool spans every layer (one LRU keyed by
@@ -2955,7 +3138,7 @@ impl ModelWeights {
             device_pool,
         });
         let prefill_timing = Arc::new(PhaseTiming::default());
-        Ok(Self {
+        let model = Self {
             shared,
             kv: kv_states,
             kv_seq: Vec::new(),
@@ -2969,7 +3152,12 @@ impl ModelWeights {
                 prefill_timing: Arc::clone(&prefill_timing),
             },
             prefill_timing,
-        })
+        };
+        #[cfg(feature = "distributed")]
+        if rd.cluster.is_some() {
+            debug_assert!(model.distributed_prefetch_is_shard_only());
+        }
+        Ok(model)
     }
 
     /// Fire the speculative prefetch for each MoE layer's predicted experts
@@ -3634,9 +3822,33 @@ impl ModelWeights {
         Ok(out)
     }
 
-    /// Peel the per-sequence ffn-branch hc_post off the residual stack (the
-    /// post/comb were stashed per-seq; xs_s2 here is the ffn-residual taken
-    /// from `ffn_pending`, mirroring the single-seq layer tail).
+    /// Routed expert bytes addressable by this rank versus the unsharded total.
+    #[cfg(feature = "distributed")]
+    pub(crate) fn distributed_expert_bytes(&self) -> (usize, usize) {
+        self.shared
+            .layers
+            .iter()
+            .fold((0, 0), |(local, full), layer| {
+                let FeedForward::Moe(moe) = &layer.ffn;
+                match &moe.distributed {
+                    Some(shards) => (local + shards.local_bytes, full + shards.full_bytes),
+                    None => (local, full),
+                }
+            })
+    }
+
+    #[cfg(feature = "distributed")]
+    fn distributed_prefetch_is_shard_only(&self) -> bool {
+        self.shared.mmap.is_none()
+            && self.shared.file.is_none()
+            && self.shared.layer_expert_ranges.is_empty()
+            && self.shared.device_pool.is_none()
+            && self.shared.layers.iter().all(|layer| {
+                let FeedForward::Moe(moe) = &layer.ffn;
+                moe.experts.is_empty() && moe.distributed.is_some() && moe.device_pool.is_none()
+            })
+    }
+
     /// Number of routed experts whose weights are mmap-backed (and therefore
     /// prefetchable) vs the total, for diagnostics.
     pub fn mmap_backed_experts(&self) -> (usize, usize) {
@@ -4041,32 +4253,52 @@ fn load_moe<R: Read + Seek>(
         }
     }
 
-    let gate_exps = split_experts(rd, &format!("{p}.ffn_gate_exps.weight"), cfg.n_expert)?;
-    let up_exps = split_experts(rd, &format!("{p}.ffn_up_exps.weight"), cfg.n_expert)?;
-    let down_exps = split_experts(rd, &format!("{p}.ffn_down_exps.weight"), cfg.n_expert)?;
     let clamp = cfg.swiglu_clamp.get(layer).copied().unwrap_or(0.0);
-    let experts = gate_exps
-        .into_iter()
-        .zip(up_exps)
-        .zip(down_exps)
-        .map(|((gate, up), down)| {
-            let prefetch = match (&gate.prefetch, &up.prefetch, &down.prefetch) {
-                (Some(g), Some(u), Some(d)) => Some(crate::residency::ExpertHandles {
-                    gate: g.clone(),
-                    up: u.clone(),
-                    down: d.clone(),
-                }),
-                _ => None,
-            };
-            Mlp {
-                gate: gate.qmatmul,
-                up: up.qmatmul,
-                down: down.qmatmul,
-                clamp,
-                prefetch,
-            }
-        })
-        .collect();
+    #[cfg(feature = "distributed")]
+    let distributed = if rd.cluster.is_some() {
+        if gate_t.dim(1)? != cfg.n_expert {
+            candle_core::bail!("deepseek4: invalid distributed router dimensions");
+        }
+        Some(
+            load_distributed_experts(rd, p, cfg, gate_t.dim(0)?, clamp)
+                .map_err(candle_core::Error::wrap)?,
+        )
+    } else {
+        None
+    };
+    #[cfg(feature = "distributed")]
+    let sharded = distributed.is_some();
+    #[cfg(not(feature = "distributed"))]
+    let sharded = false;
+    let experts = if sharded {
+        Vec::new()
+    } else {
+        let gate_exps = split_experts(rd, &format!("{p}.ffn_gate_exps.weight"), cfg.n_expert)?;
+        let up_exps = split_experts(rd, &format!("{p}.ffn_up_exps.weight"), cfg.n_expert)?;
+        let down_exps = split_experts(rd, &format!("{p}.ffn_down_exps.weight"), cfg.n_expert)?;
+        gate_exps
+            .into_iter()
+            .zip(up_exps)
+            .zip(down_exps)
+            .map(|((gate, up), down)| {
+                let prefetch = match (&gate.prefetch, &up.prefetch, &down.prefetch) {
+                    (Some(g), Some(u), Some(d)) => Some(crate::residency::ExpertHandles {
+                        gate: g.clone(),
+                        up: u.clone(),
+                        down: d.clone(),
+                    }),
+                    _ => None,
+                };
+                Mlp {
+                    gate: gate.qmatmul,
+                    up: up.qmatmul,
+                    down: down.qmatmul,
+                    clamp,
+                    prefetch,
+                }
+            })
+            .collect()
+    };
 
     let shared = if cfg.n_expert_shared > 0 {
         Some(Mlp {
@@ -4085,6 +4317,8 @@ fn load_moe<R: Read + Seek>(
         gate_bias,
         tid2eid,
         experts,
+        #[cfg(feature = "distributed")]
+        distributed,
         shared,
         n_expert_used: cfg.n_expert_used,
         weights_scale: cfg.expert_weights_scale,
@@ -4092,6 +4326,162 @@ fn load_moe<R: Read + Seek>(
         expert_device: rd.expert_device.clone(),
         layer: layer as u32,
         device_pool: None,
+    })
+}
+
+#[cfg(feature = "distributed")]
+fn load_distributed_experts<R: Read + Seek>(
+    rd: &Reader<R>,
+    p: &str,
+    cfg: &Config,
+    hidden: usize,
+    clamp: f64,
+) -> anyhow::Result<DistributedMoe> {
+    use crate::distributed::shard::{dtype_layout, ShardSpec, ShardedTensor};
+    use crate::gguf_ext::RawTensorInfo;
+    use anyhow::{ensure, Context};
+    ensure!(
+        rd.device.is_cpu() && rd.expert_device.is_cpu(),
+        "cluster experts require CPU"
+    );
+    let raw = rd
+        .raw
+        .as_ref()
+        .context("cluster requires raw GGUF header")?;
+    let mmap = rd
+        .mmap
+        .as_ref()
+        .context("cluster requires mapped weights")?;
+    let cluster = rd.cluster.as_ref().context("missing cluster session")?;
+    ensure!(
+        cfg.n_expert > 0 && cfg.n_expert_used > 0 && cfg.n_expert_used <= cfg.n_expert,
+        "invalid routed expert counts"
+    );
+    ensure!(
+        cfg.n_expert <= 1 << 24,
+        "expert count exceeds exact f32 routing broadcast range"
+    );
+    let get = |suffix: &str| {
+        raw.tensors
+            .get(&format!("{p}.{suffix}.weight"))
+            .with_context(|| format!("missing {p}.{suffix}.weight"))
+    };
+    let gate = get("ffn_gate_exps")?;
+    let up = get("ffn_up_exps")?;
+    let down = get("ffn_down_exps")?;
+    ensure!(
+        gate.dims.len() == 3 && gate.dims[0] == cfg.n_expert && gate.dims[2] == hidden,
+        "invalid gate expert dimensions"
+    );
+    let intermediate = gate.dims[1];
+    ensure!(up.dims == gate.dims, "gate/up expert dimensions differ");
+    ensure!(
+        down.dims == [cfg.n_expert, hidden, intermediate],
+        "invalid down expert dimensions"
+    );
+    let range = ShardSpec::new(cluster.rank(), cluster.world_size())?
+        .input_range(intermediate, dtype_layout(down.dtype)?.block_elements)?;
+    let mut full_bytes = 0usize;
+    let mut strides = Vec::new();
+    for info in [gate, up, down] {
+        let layout = dtype_layout(info.dtype)?;
+        info.dims
+            .iter()
+            .try_fold(1usize, |n, &dim| n.checked_mul(dim))
+            .context("expert tensor element count overflow")?;
+        ensure!(
+            info.dims[2] > 0 && info.dims[2].is_multiple_of(layout.block_elements),
+            "expert input dimension is not block-aligned"
+        );
+        let row = (info.dims[2] / layout.block_elements)
+            .checked_mul(layout.block_bytes)
+            .context("expert row bytes overflow")?;
+        let stride = row
+            .checked_mul(info.dims[1])
+            .context("expert stride overflow")?;
+        let total = stride
+            .checked_mul(cfg.n_expert)
+            .context("expert tensor bytes overflow")?;
+        let start = usize::try_from(
+            raw.tensor_data_offset
+                .checked_add(info.offset)
+                .context("expert file offset overflow")?,
+        )?;
+        ensure!(
+            start
+                .checked_add(total)
+                .context("expert file end overflow")?
+                <= mmap.len(),
+            "expert tensor exceeds mapping"
+        );
+        full_bytes = full_bytes
+            .checked_add(total)
+            .context("expert byte accounting overflow")?;
+        strides.push((row, stride));
+    }
+    let matrix = |info: &RawTensorInfo,
+                  expert: usize,
+                  rows: std::ops::Range<usize>,
+                  stride: (usize, usize)|
+     -> anyhow::Result<RawTensorInfo> {
+        let relative = expert
+            .checked_mul(stride.1)
+            .and_then(|v| {
+                rows.start
+                    .checked_mul(stride.0)
+                    .and_then(|r| v.checked_add(r))
+            })
+            .context("expert slice offset overflow")?;
+        Ok(RawTensorInfo {
+            dtype: info.dtype,
+            dims: vec![rows.len(), info.dims[2]],
+            offset: info
+                .offset
+                .checked_add(u64::try_from(relative)?)
+                .context("expert slice file offset overflow")?,
+        })
+    };
+    let mut experts = Vec::with_capacity(cfg.n_expert);
+    let mut local_bytes = 0usize;
+    for e in 0..cfg.n_expert {
+        let g = matrix(gate, e, range.clone(), strides[0])?;
+        let u = matrix(up, e, range.clone(), strides[1])?;
+        let d = matrix(down, e, 0..hidden, strides[2])?;
+        let expert = DistributedExpert {
+            gate: ShardedTensor::with_input_range(
+                mmap.clone(),
+                &g,
+                raw.tensor_data_offset,
+                0..hidden,
+            )?,
+            up: ShardedTensor::with_input_range(
+                mmap.clone(),
+                &u,
+                raw.tensor_data_offset,
+                0..hidden,
+            )?,
+            down: ShardedTensor::with_input_range(
+                mmap.clone(),
+                &d,
+                raw.tensor_data_offset,
+                range.clone(),
+            )?,
+        };
+        for t in [&expert.gate, &expert.up, &expert.down] {
+            for row in t.row_ranges() {
+                local_bytes = local_bytes
+                    .checked_add(row.len())
+                    .context("shard byte accounting overflow")?;
+            }
+        }
+        experts.push(expert);
+    }
+    Ok(DistributedMoe {
+        experts,
+        cluster: cluster.clone(),
+        clamp,
+        local_bytes,
+        full_bytes,
     })
 }
 
