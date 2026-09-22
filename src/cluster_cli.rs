@@ -120,8 +120,9 @@ impl ClusterRun {
             (1..=512).contains(&self.prefill_chunk),
             "--prefill-chunk must be in 1..=512"
         );
-        let key = std::env::var("JOSHUA_CLUSTER_KEY")
-            .context("set JOSHUA_CLUSTER_KEY to 64 hex characters of random key material")?;
+        let key = std::env::var("JOSHUA_CLUSTER_KEY").map_err(|_| {
+            anyhow::anyhow!("set JOSHUA_CLUSTER_KEY to 64 hex characters of random key material")
+        })?;
         let key = decode_key(&key)?;
         let timeout = Duration::from_secs(self.timeout_seconds);
         let cluster = Arc::new(match self.transport {
@@ -202,7 +203,7 @@ impl ClusterRun {
                 .map_err(anyhow::Error::msg)?
             };
             let input = tokenizer
-                .encode(text, self.raw_prompt)
+                .encode(text, false)
                 .map_err(|e| anyhow::anyhow!("encoding cluster prompt: {e}"))?
                 .get_ids()
                 .to_vec();

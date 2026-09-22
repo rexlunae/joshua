@@ -856,7 +856,11 @@ The encoded routed-expert byte totals printed at startup are **not RSS**.
 Dense weights, embeddings, shared experts, attention/compression state and KV
 are replicated on every node. Only local routed-expert ranges are read or
 prefetched; whole-layer expert prefetch and the device expert cache are
-disabled on this path. This first implementation uses CPU reference shard
+disabled on this path. Short down-projection rows can put local and off-rank
+columns on **every same OS page**, so that projection's residency can remain
+near its unsharded size even though only local columns are decoded. Do not
+budget physical RAM from the encoded shard ratio alone.
+This first implementation uses CPU reference shard
 matvecs, not the optimized accelerator or fused quantized kernels. It is a
 correctness bring-up path, **not a throughput promise**.
 

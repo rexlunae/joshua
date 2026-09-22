@@ -461,6 +461,7 @@ mod tests {
                     shard.forward_local(&input[shard.input_range()]).unwrap()
                 );
                 assert!(shard.forward_local(&[]).is_err());
+                assert!(shard.forward_local(&input).is_err());
                 for (total, value) in sum.iter_mut().zip(shard.forward(&local_input).unwrap()) {
                     *total += value;
                 }
