@@ -3138,7 +3138,7 @@ impl ModelWeights {
             device_pool,
         });
         let prefill_timing = Arc::new(PhaseTiming::default());
-        Ok(Self {
+        let model = Self {
             shared,
             kv: kv_states,
             kv_seq: Vec::new(),
@@ -3152,7 +3152,12 @@ impl ModelWeights {
                 prefill_timing: Arc::clone(&prefill_timing),
             },
             prefill_timing,
-        })
+        };
+        #[cfg(feature = "distributed")]
+        if rd.cluster.is_some() {
+            debug_assert!(model.distributed_prefetch_is_shard_only());
+        }
+        Ok(model)
     }
 
     /// Fire the speculative prefetch for each MoE layer's predicted experts
@@ -3820,7 +3825,6 @@ impl ModelWeights {
     /// Routed expert bytes addressable by this rank versus the unsharded total.
     #[cfg(feature = "distributed")]
     pub(crate) fn distributed_expert_bytes(&self) -> (usize, usize) {
-        debug_assert!(self.distributed_prefetch_is_shard_only());
         self.shared
             .layers
             .iter()

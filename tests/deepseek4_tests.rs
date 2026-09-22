@@ -21,16 +21,11 @@ fn cluster_sessions(
     };
     drop(listeners);
     let session = uuid::Uuid::new_v4();
+    let key = rand::random::<[u8; 32]>();
     (0..count)
         .map(|rank| {
             std::sync::Arc::new(
-                ClusterSession::tcp(
-                    rank,
-                    session,
-                    b"deepseek-loopback-test-key-only!!",
-                    config.clone(),
-                )
-                .unwrap(),
+                ClusterSession::tcp(rank, session, &key, config.clone()).unwrap(),
             )
         })
         .collect()
@@ -274,6 +269,59 @@ fn deepseek4_cluster_cli_generates_like_single_node() {
                 assert!(output.stdout.is_empty(), "only rank zero prints output");
             }
         }
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(feature = "distributed")]
+#[test]
+fn deepseek4_cluster_mismatched_inputs_fail_and_poison_every_rank() {
+    use joshua::distributed::deepseek4::DeepSeekCluster;
+    let dir = common::model_dir("deepseek4-cluster-input-mismatch");
+    let path = dir.join("model.gguf");
+    common::write_tiny_deepseek4_gguf(&path);
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = cluster_sessions(2)
+            .into_iter()
+            .enumerate()
+            .map(|(rank, session)| {
+                let path = &path;
+                scope.spawn(move || {
+                    let mut model = DeepSeekCluster::load(path, 32, session).unwrap();
+                    let tokens = [1, 4 + rank as u32];
+                    let error = model.forward(&tokens, 0).unwrap_err();
+                    assert!(error.to_string().contains("disagree"), "{error}");
+                    let error = model.forward(&[1, 4], 0).unwrap_err();
+                    assert!(error.to_string().contains("session failed"), "{error}");
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+    });
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(feature = "distributed")]
+#[test]
+fn deepseek4_cluster_invalid_inputs_fail_and_poison_session() {
+    use joshua::distributed::deepseek4::DeepSeekCluster;
+    let dir = common::model_dir("deepseek4-cluster-invalid-input");
+    let path = dir.join("model.gguf");
+    common::write_tiny_deepseek4_gguf(&path);
+    for (tokens, offset, message) in [
+        (vec![16], 0, "out-of-vocabulary"),
+        (vec![1], 1, "offset is not contiguous"),
+        (vec![1; 33], 0, "context exhausted"),
+        (Vec::new(), 0, "must not be empty"),
+    ] {
+        let session = cluster_sessions(1).pop().unwrap();
+        let mut model = DeepSeekCluster::load(&path, 32, session).unwrap();
+        let error = model.forward(&tokens, offset).unwrap_err();
+        assert!(error.to_string().contains(message), "{error}");
+        let error = model.forward(&[1], 0).unwrap_err();
+        assert!(error.to_string().contains("session failed"), "{error}");
     }
     std::fs::remove_dir_all(dir).unwrap();
 }
