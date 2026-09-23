@@ -24,6 +24,7 @@ framework) and [tokenizers](https://github.com/huggingface/tokenizers).
 | **Tool calling** | OpenAI-compatible `tools` / `tool_calls`, parsing Hermes/Qwen, Mistral, and Llama-3 call formats |
 | **Embeddings** | Dense sentence embeddings for llama / qwen2 / qwen3 embedding models, with GGUF pooling metadata |
 | **KV-cache reuse** | Multi-turn requests continue from a warm model pool and prefill only the new suffix — including across *context edits*: when an agent harness truncates or replaces middle blocks, the pooled session's KV state is rewound to the longest common token prefix instead of being cleared (Qwen3-MoE and DeepSeek-V2/V3/K2 loaders). DeepSeek MLA caches the compressed latent (`c_kv` + `k_pe`) instead of the reconstructed per-head K/V, cutting KV memory ~70× |
+| **Speculative decoding** | `--speculative N` drafts up to N tokens per step by prompt lookup and verifies them in one forward pass, rolling the KV cache back past the first rejection — output unchanged (token-identical when greedy, same distribution when sampling), fewer weight sweeps on repetitive output (`qwen3moe`, `deepseek2` loaders) |
 | **Speculative expert prefetch** | Decode fires `MADV_WILLNEED` for each MoE layer's *predicted* experts (the ids its router chose last step — routing is temporally local) before any layer runs, so expert pages stream in behind compute instead of faulting on demand (`deepseek4` loader) |
 | **GPU (optional)** | `--features cuda`, `metal`, `opencl`, `vulkan` or `sycl` route inference through candle's GPU backends |
 | **NPU / llama.cpp interop (optional)** | Vendor plugins run in a crash-isolated shim process; a llama.cpp adapter brings every ggml backend (Hexagon NPU, CANN, CUDA, Vulkan, …) |
@@ -571,6 +572,7 @@ prints the dense/expert split of any GGUF to sanity-check a new model.
 | `JOSHUA_EXPERT_STATS` | `1` probes host-miss page residency for the decode time split logged with the VRAM expert cache |
 | `JOSHUA_ROUTE_TRACE` | Path of a routing-trace CSV to write, for `cargo run --example cache_sim` |
 | `JOSHUA_PREFILL_CHUNK` | Tokens per prefill chunk (default 512; also `--prefill-chunk`) |
+| `JOSHUA_SPECULATIVE` | Max draft tokens per speculative decode step (default 0 = off; also `--speculative`) |
 | `JOSHUA_SKIP_PLACEMENT_BENCH` | Skip the startup quantized-matmul probe that `auto` dense placement uses |
 | `JOSHUA_OPENCL_NATIVE` / `JOSHUA_VULKAN_NATIVE` | `0` runs every operator through the CPU round-trip instead of the device kernels (default on) |
 | `JOSHUA_OPENCL_TRACE` / `JOSHUA_VULKAN_TRACE` | `1` logs each operator that falls back to the CPU and why |
@@ -587,6 +589,45 @@ prints the dense/expert split of any GGUF to sanity-check a new model.
 | `JOSHUA_LLAMA_MMPROJ` | Multimodal projector GGUF for vision via llama.cpp's `mtmd` |
 | `JOSHUA_LLAMA_BACKENDS_DIR` | Directory of `libggml-<name>` modules to register at adapter startup (llama.cpp `dynamic-backends` builds) |
 | `RUST_LOG` | Log filter (e.g. `info`, `joshua=debug`) |
+
+---
+
+## Speculative decoding
+
+A decode step is bound by reading the weights — for a sparse MoE model, by
+faulting in the routed experts — not by arithmetic, so scoring several tokens
+in one pass costs little more than scoring one.  `--speculative N` (or
+[`EngineOptions::speculative`]) uses that:
+
+1. After each token, a **prompt-lookup drafter** finds the latest earlier
+   occurrence of the context's trailing n-gram (4 down to 2 tokens) and
+   proposes the up-to-N tokens that followed it.  No draft model is needed;
+   drafting is a hash lookup.
+2. The model scores the token plus the draft in **one forward pass**,
+   returning logits for every position.
+3. Draft tokens are checked in order against the request's own sampler
+   (repetition penalty, temperature, top-k/min-p/top-p).  Greedy decoding
+   accepts a token iff it is the argmax; sampled decoding uses speculative
+   sampling (accept with probability `p(x)`, otherwise sample the
+   correction from `p` without `x`), so the output distribution is exactly
+   that of plain decoding.
+4. The KV cache is truncated back past the first rejected token, and the
+   live draft length adapts (doubling after a fully accepted draft, halving
+   after a fully rejected one).
+
+It pays off on output that repeats its context — code edits, quoted
+passages, tool-call arguments, structured data — and costs roughly nothing
+when the drafter finds no match (it then falls back to the one-token step).
+
+```bash
+joshua run model.gguf "Rewrite this function with better names: ..." --speculative 8
+# stderr ends with: [speculative: accepted <a>/<d> drafted (<rate>%) over <n> verify steps]
+```
+
+Library users read the same counters from `Engine::speculative_stats()`.
+Supported by the architectures whose KV cache can be rolled back —
+`qwen3moe` and `deepseek2` (DeepSeek-V2/V3, Kimi-K2); other models ignore the
+setting and decode one token at a time.
 
 ---
 
@@ -1058,6 +1099,7 @@ multicast interoperability or LAN throughput.
 - [x] Tool / function calling (OpenAI-compatible, Hermes/Mistral/Llama-3 formats)
 - [x] GPU acceleration (`cuda` / `metal` cargo features)
 - [x] KV-cache sharing across requests (warm model pool with prefix reuse)
+- [x] Speculative decoding (prompt-lookup drafts, lossless verification with KV rollback)
 - [x] DeepSeek-V4 sparse-attention MoE loader (Hyper-Connections, CSA/HCA KV compression, Lightning Indexer, IQ2_XXS experts)
 - [x] DeepSeek-V2/V3 MLA latent cache (~70× smaller KV cache, prefill == incremental)
 - [x] Fused AVX2 k-quant kernels and SIMD quantized matmuls (CPU prefill/decode speed-ups)

@@ -51,6 +51,7 @@ pub mod placement;
 pub mod stream_prefill;
 pub mod server;
 pub mod simd;
+pub mod speculative;
 pub mod template;
 pub mod token_embedding;
 pub mod whisper;
@@ -69,6 +70,7 @@ pub use engine::{
     HugePages, MlockMode, MmapMode, PageSize,
 };
 pub use error::{JoshuaError, Result};
+pub use speculative::{SpeculativeConfig, SpeculativeStats};
 pub use types::{
     ChatMessage, EmbeddingRequest, EmbeddingResponse, GenerationOptions, UsageInfo,
 };
