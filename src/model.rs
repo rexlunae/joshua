@@ -696,6 +696,28 @@ impl QuantizedModel {
         }
     }
 
+    /// Whether this instance can run speculative decoding: score every
+    /// position of a multi-token input ([`Self::forward_all_logits`]) *and*
+    /// roll the KV cache back past rejected draft tokens
+    /// ([`Self::truncate_kv_cache`]).  See [`crate::speculative`].
+    pub fn supports_speculative(&self) -> bool {
+        self.supports_kv_truncate()
+    }
+
+    /// Forward pass returning the logits of every input position,
+    /// `[1, seq_len, vocab]` — the speculative-decoding verification pass.
+    /// Only the architectures reporting [`Self::supports_speculative`]
+    /// implement it; the rest return an unsupported error.
+    pub fn forward_all_logits(&mut self, input: &Tensor, index_pos: usize) -> Result<Tensor> {
+        match self {
+            Self::Qwen3Moe(m) => m.forward_all_logits(input, index_pos),
+            Self::DeepSeek2(m) => m.forward_all_logits(input, index_pos),
+            _ => Err(candle_core::Error::Msg(
+                "all-position logits are not implemented for this architecture".into(),
+            )),
+        }
+    }
+
     /// Layer-streaming prefill over a set of bounded chunks.  See
     /// [`crate::stream_prefill`].  Only the joshua-native MoE loaders
     /// (qwen3moe, deepseek2, deepseek4) implement it today; other

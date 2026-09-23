@@ -24,7 +24,7 @@ mod cluster_cli;
 
 use joshua::{
     engine::Engine, server, types::GenerationOptions, ChatMessage, ComputeBackend, DensePlacement,
-    EngineOptions, ExpertPlacement, HugePages, MlockMode, MmapMode, PageSize,
+    EngineOptions, ExpertPlacement, HugePages, MlockMode, MmapMode, PageSize, SpeculativeConfig,
 };
 
 /// Values for `--device` (CLI form of [`ComputeBackend`]).
@@ -265,6 +265,20 @@ enum Commands {
             hide_default_value = true
         )]
         prefill_chunk: usize,
+        /// Speculative token generation: draft up to N tokens per step by
+        /// prompt lookup (the continuation of the latest earlier occurrence
+        /// of the output's trailing n-gram) and verify them in one forward
+        /// pass.  Output is unchanged; repetitive output (code edits, quoted
+        /// context, tool-call arguments) decodes in fewer weight sweeps.
+        /// `0` (the default) disables it.  Applies to qwen3moe and
+        /// deepseek2 (incl. V3 / Kimi-K2); other models ignore it.
+        #[arg(
+            long,
+            env = "JOSHUA_SPECULATIVE",
+            default_value_t = 0,
+            hide_default_value = true
+        )]
+        speculative: usize,
         /// Lock the always-touched weights into RAM (mlock).  Needs the
         /// process memlock limit to cover the hot set: `LimitMEMLOCK=infinity`
         /// (systemd), `ulimit -l unlimited`, or /etc/security/limits.conf.
@@ -403,6 +417,20 @@ enum Commands {
             hide_default_value = true
         )]
         prefill_chunk: usize,
+        /// Speculative token generation: draft up to N tokens per step by
+        /// prompt lookup (the continuation of the latest earlier occurrence
+        /// of the output's trailing n-gram) and verify them in one forward
+        /// pass.  Output is unchanged; repetitive output (code edits, quoted
+        /// context, tool-call arguments) decodes in fewer weight sweeps.
+        /// `0` (the default) disables it.  Applies to qwen3moe and
+        /// deepseek2 (incl. V3 / Kimi-K2); other models ignore it.
+        #[arg(
+            long,
+            env = "JOSHUA_SPECULATIVE",
+            default_value_t = 0,
+            hide_default_value = true
+        )]
+        speculative: usize,
         /// Lock the always-touched weights into RAM (mlock).  Needs the
         /// process memlock limit to cover the hot set: `LimitMEMLOCK=infinity`
         /// (systemd), `ulimit -l unlimited`, or /etc/security/limits.conf.
@@ -504,6 +532,7 @@ async fn main() -> anyhow::Result<()> {
             expert_cache,
             vram_expert_cache,
             prefill_chunk,
+            speculative,
             mlock_hot_weights,
             expert_placement,
             dense_placement,
@@ -554,6 +583,7 @@ async fn main() -> anyhow::Result<()> {
                 .expert_cache_auto(expert_cache_auto)
                 .vram_expert_cache(vram_bytes)
                 .prefill_chunk(prefill_chunk)
+                .speculative(speculative_config(speculative))
                 .mlock_hot_weights(
                     mlock_hot_weights
                         .map(MlockMode::from)
@@ -625,6 +655,7 @@ async fn main() -> anyhow::Result<()> {
             expert_cache,
             vram_expert_cache,
             prefill_chunk,
+            speculative,
             mlock_hot_weights,
             expert_placement,
             dense_placement,
@@ -660,6 +691,7 @@ async fn main() -> anyhow::Result<()> {
                 .expert_cache_auto(expert_cache_auto)
                 .vram_expert_cache(vram_bytes)
                 .prefill_chunk(prefill_chunk)
+                .speculative(speculative_config(speculative))
                 .mlock_hot_weights(
                     mlock_hot_weights
                         .map(MlockMode::from)
@@ -684,6 +716,16 @@ async fn main() -> anyhow::Result<()> {
                 "\n[tokens: prompt={} completion={} | prefill={:.1}t/s decode={:.1}t/s]",
                 usage.prompt_tokens, usage.completion_tokens, prefill_tps, decode_tps
             );
+            let spec = engine.speculative_stats();
+            if spec.drafted > 0 {
+                eprintln!(
+                    "[speculative: accepted {}/{} drafted ({:.0}%) over {} verify steps]",
+                    spec.accepted,
+                    spec.drafted,
+                    spec.acceptance_rate() * 100.0,
+                    spec.verify_steps
+                );
+            }
         }
 
         Commands::Embed {
@@ -774,6 +816,11 @@ fn model_file_size(model: &Path) -> Option<u64> {
         .ok()
         .and_then(|p| p.metadata().ok())
         .map(|m| m.len())
+}
+
+/// `--speculative N`: `0` disables, anything else is the draft bound.
+fn speculative_config(max_draft: usize) -> Option<SpeculativeConfig> {
+    (max_draft > 0).then(|| SpeculativeConfig::with_max_draft(max_draft))
 }
 
 /// Pure decision behind [`cache_plan`]: given model file size and total RAM,

@@ -104,13 +104,16 @@ use std::time::Instant;
 use candle_core::quantized::gguf_file;
 use candle_core::{Device, Tensor};
 use memmap2::Mmap;
-use rand::distributions::{Distribution, WeightedIndex};
 use rand::thread_rng;
 use tokenizers::Tokenizer;
 
 use crate::embedding::EmbeddingModel;
 use crate::model::{Architecture, QuantizedModel};
 use crate::npu::{NpuBackend, NpuSession};
+use crate::speculative::{
+    next_draft_len, verify_token, NgramDrafter, SpeculativeConfig, SpeculativeStats, TokenDist,
+    Verdict,
+};
 pub use crate::placement::{DensePlacement, ExpertPlacement};
 use crate::template::ChatTemplate;
 
@@ -418,6 +421,23 @@ pub struct EngineOptions {
     /// backends without a probe (Metal's unified memory, OpenCL) and for
     /// sharing a card with other processes.
     pub device_memory_budget: Option<u64>,
+    /// Speculative token generation (draft-and-verify decoding).  `None`
+    /// (the default) decodes one token per forward pass.
+    ///
+    /// With `Some(config)`, each decode step drafts up to
+    /// [`SpeculativeConfig::max_draft`] tokens by prompt lookup (the
+    /// continuation of the latest earlier occurrence of the context's
+    /// trailing n-gram), scores them all in one forward pass and keeps the
+    /// prefix the model agrees with, rolling the KV cache back past the
+    /// first rejection.  Output is unchanged — token-identical under greedy
+    /// decoding, identically distributed under sampling — while repetitive
+    /// output (code edits, quoted context, tool-call arguments) needs far
+    /// fewer weight sweeps.  See [`crate::speculative`].
+    ///
+    /// Applies to the architectures that can score every position and
+    /// truncate their KV cache (`qwen3moe`, `deepseek2`); others silently
+    /// keep one-token decoding.
+    pub speculative: Option<SpeculativeConfig>,
 }
 
 impl EngineOptions {
@@ -521,6 +541,13 @@ impl EngineOptions {
     /// [`EngineOptions::device_memory_budget`].
     pub fn device_memory_budget(mut self, bytes: Option<u64>) -> Self {
         self.device_memory_budget = bytes;
+        self
+    }
+
+    /// Enable (or, with `None`, disable) speculative token generation.  See
+    /// [`EngineOptions::speculative`].
+    pub fn speculative(mut self, config: Option<SpeculativeConfig>) -> Self {
+        self.speculative = config;
         self
     }
 }
@@ -631,6 +658,14 @@ pub struct Engine {
     /// device's memory at load (see [`crate::placement::instances_for_memory`]).
     /// `None` leaves the pool on the RAM-adaptive rule.
     device_session_cap: Option<usize>,
+    /// Speculative decoding settings (see [`EngineOptions::speculative`]).
+    speculative: Option<SpeculativeConfig>,
+    /// Draft tokens verified by speculative decoding.
+    spec_drafted: AtomicU64,
+    /// Draft tokens the model accepted.
+    spec_accepted: AtomicU64,
+    /// Multi-token verification passes run.
+    spec_verify_steps: AtomicU64,
     /// Why the candle path cannot load this model, if it cannot.
     ///
     /// `Engine` construction succeeds even for architectures candle has no
@@ -757,6 +792,41 @@ impl GenSession {
         }
     }
 
+    /// Feed `tokens` at absolute position `pos`, returning the logits of
+    /// every fed position (row `i` predicts the token after `tokens[i]`).
+    /// Only valid when [`GenSession::supports_speculative`] holds.
+    fn forward_tokens_all(
+        &mut self,
+        tokens: &[u32],
+        pos: usize,
+        device: &Device,
+    ) -> Result<Vec<Vec<f32>>> {
+        match self {
+            Self::Candle(model) => {
+                let input = Tensor::new(tokens, device)
+                    .and_then(|t| t.unsqueeze(0))
+                    .map_err(|e| JoshuaError::Inference(e.to_string()))?;
+                model
+                    .forward_all_logits(&input, pos)
+                    .and_then(|l| l.squeeze(0))
+                    .and_then(|l| l.to_vec2::<f32>())
+                    .map_err(|e| JoshuaError::Inference(e.to_string()))
+            }
+            Self::Npu(_) => Err(JoshuaError::Inference(
+                "speculative verification is not supported on the NPU session".into(),
+            )),
+        }
+    }
+
+    /// Whether this session can verify drafts (all-position logits plus KV
+    /// truncation) — see [`crate::speculative`].
+    fn supports_speculative(&self) -> bool {
+        match self {
+            Self::Candle(model) => model.supports_speculative(),
+            Self::Npu(_) => false,
+        }
+    }
+
     /// Layer-streaming prefill over bounded chunks (`None` on architectures
     /// without a native streaming path, so callers fall back to the standard
     /// chunked loop).  Returns the prefill logits vector.
@@ -873,6 +943,35 @@ struct DecodeOutcome {
     /// Tokens actually fed to the model during decode (KV-state delta).
     fed_tokens: Vec<u32>,
     decode_tps: f64,
+}
+
+/// Repetition-penalty window: the last this-many tokens are penalised.
+const REP_WINDOW: usize = 64;
+
+/// Output-side state of a decode loop: the text so far and the token
+/// history the sampler penalises.
+struct DecodeText {
+    response: String,
+    /// Generated ids, for byte-level whole-buffer fallback decoding.
+    decoded_ids: Vec<u32>,
+    /// Incremental byte-level decode state (see [`ByteWindowDecoder`]).
+    byte_window: ByteWindowDecoder,
+    /// Sliding repetition-penalty window.
+    recent_tokens: Vec<u32>,
+    n_decoded: u32,
+}
+
+impl DecodeText {
+    /// Fresh state whose penalty window is seeded with the tail of `seed`.
+    fn new(seed: &[u32]) -> Self {
+        Self {
+            response: String::new(),
+            decoded_ids: Vec::new(),
+            byte_window: ByteWindowDecoder::default(),
+            recent_tokens: seed[seed.len().saturating_sub(REP_WINDOW)..].to_vec(),
+            n_decoded: 0,
+        }
+    }
 }
 
 /// NPU backend state: the backend plus its circuit breaker.
@@ -1434,6 +1533,10 @@ impl Engine {
             expert_device,
             weights_template: Mutex::new(None),
             device_session_cap,
+            speculative: options.speculative.map(SpeculativeConfig::normalized),
+            spec_drafted: AtomicU64::new(0),
+            spec_accepted: AtomicU64::new(0),
+            spec_verify_steps: AtomicU64::new(0),
             arch_error,
         })
     }
@@ -2136,7 +2239,14 @@ impl Engine {
     /// `start_pos` is the absolute position of the next token to feed
     /// (`prompt length` for text prompts, `n_past` after a multimodal
     /// prefill).  `penalty_seed` primes the repetition-penalty window
-    /// (empty when prompt tokens are unknown, e.g. multimodal prefill).
+    /// (empty when prompt tokens are unknown, e.g. multimodal prefill) and
+    /// is the context the speculative drafter matches against.
+    ///
+    /// With speculative decoding enabled on a session that supports it, each
+    /// step feeds the chosen token together with a prompt-lookup draft and
+    /// verifies the draft against the per-position logits (see
+    /// [`crate::speculative`]); otherwise — or whenever the drafter has
+    /// nothing to propose — it is the plain one-token loop.
     fn decode_loop(
         &self,
         model: &mut GenSession,
@@ -2145,30 +2255,26 @@ impl Engine {
         penalty_seed: &[u32],
         options: &GenerationOptions,
     ) -> Result<DecodeOutcome> {
-        // Seed the recent-token window with the tail of the prompt (up to 64 tokens).
-        const REP_WINDOW: usize = 64;
-        let mut recent_tokens: Vec<u32> = penalty_seed
-            .iter()
-            .rev()
-            .take(REP_WINDOW)
-            .copied()
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect();
-
+        let mut text = DecodeText::new(penalty_seed);
         let mut rng = thread_rng();
-        let mut response = String::new();
-        let mut decoded_ids: Vec<u32> = Vec::new();
-        // Incremental byte-level decode state (see [`ByteWindowDecoder`]).
-        let mut byte_window = ByteWindowDecoder::default();
         let mut fed_tokens: Vec<u32> = Vec::new();
-        let mut n_decoded: u32 = 0;
         let mut n_cur = start_pos;
         let decode_start = Instant::now();
 
+        // Speculative decoding needs a text context to draft from and a
+        // session that can verify and roll back.
+        let spec = self
+            .speculative
+            .filter(|_| !penalty_seed.is_empty() && model.supports_speculative());
+        let mut drafter = spec.map(|c| NgramDrafter::new(c, penalty_seed));
+        let mut draft_len = spec.map_or(0, |c| c.max_draft);
+        let (mut n_drafted, mut n_accepted, mut n_verify) = (0u64, 0u64, 0u64);
+        // A token already chosen by a rejected verification (the
+        // correction), to emit before sampling anything new.
+        let mut pending: Option<u32> = None;
+
         loop {
-            if n_decoded >= options.max_tokens {
+            if text.n_decoded >= options.max_tokens {
                 break;
             }
             // Never generate past the context window, regardless of
@@ -2177,63 +2283,134 @@ impl Engine {
                 break;
             }
 
-            let next_token = sample_token(&logits_vec, options, &mut rng, &recent_tokens)?;
-
-            if std::env::var_os("JOSHUA_DEBUG_TOKENS").is_some() {
-                let mut order: Vec<usize> = (0..logits_vec.len()).collect();
-                order.sort_by(|&a, &b| logits_vec[b].total_cmp(&logits_vec[a]));
-                let top5: Vec<(usize, f32)> = order[..5.min(order.len())]
-                    .iter()
-                    .map(|&i| (i, logits_vec[i]))
-                    .collect();
-                eprintln!(
-                    "[eng] n_cur={n_cur} tok={next_token} temp={} topk={} topp={} minp={} reppen={} top5={top5:?}",
-                    options.temperature, options.top_k, options.top_p, options.min_p, options.repetition_penalty
-                );
-            }
+            let next_token = match pending.take() {
+                Some(t) => t,
+                None => {
+                    let t = sample_token(&logits_vec, options, &mut rng, &text.recent_tokens)?;
+                    if std::env::var_os("JOSHUA_DEBUG_TOKENS").is_some() {
+                        let mut order: Vec<usize> = (0..logits_vec.len()).collect();
+                        order.sort_by(|&a, &b| logits_vec[b].total_cmp(&logits_vec[a]));
+                        let top5: Vec<(usize, f32)> = order[..5.min(order.len())]
+                            .iter()
+                            .map(|&i| (i, logits_vec[i]))
+                            .collect();
+                        eprintln!(
+                            "[eng] n_cur={n_cur} tok={t} temp={} topk={} topp={} minp={} reppen={} top5={top5:?}",
+                            options.temperature, options.top_k, options.top_p, options.min_p, options.repetition_penalty
+                        );
+                    }
+                    t
+                }
+            };
 
             if self.eos_token_ids.contains(&next_token) {
                 break;
             }
-
-            if self.byte_level_decode {
-                // Byte-level BPE splits multi-byte UTF-8 across token
-                // boundaries — a single token can be a lone byte (e.g.
-                // DeepSeek's raw-byte vocab entries `¡`..`ÿ`), which is
-                // invalid UTF-8 on its own and would decode to U+FFFD.
-                // [`ByteWindowDecoder`] keeps that byte state across tokens
-                // without re-decoding the whole output every step (the old
-                // whole-buffer decode made generation O(n²) in length).
-                decoded_ids.push(next_token);
-                response = byte_window.push(&self.tokenizer, next_token, response, &decoded_ids)?;
-            } else {
-                // Decoder-less / word-level tokenizers: batch decoding would
-                // join pieces with spaces, so decode each token and append.
-                let piece = self
-                    .tokenizer
-                    .decode(&[next_token], false)
-                    .map_err(|e| JoshuaError::Inference(e.to_string()))?;
-                response.push_str(&piece);
-            }
-            n_decoded += 1;
-
-            // Maintain sliding-window token history for repetition penalty.
-            if recent_tokens.len() >= REP_WINDOW {
-                recent_tokens.remove(0);
-            }
-            recent_tokens.push(next_token);
-
-            if Self::check_stop_sequences(&mut response, &options.stop_sequences) {
+            if self.emit_token(&mut text, next_token, options)? {
                 break;
             }
+            if let Some(d) = drafter.as_mut() {
+                d.push(next_token);
+            }
 
-            // Single-token decode step.
-            logits_vec = model.forward_tokens(&[next_token], n_cur, &self.dense_device)?;
+            // Draft continuation tokens, bounded so that every accepted one
+            // can still be emitted (max_tokens) and fed (context window).
+            let drafts = match drafter.as_mut() {
+                Some(d) => {
+                    let room = (options.max_tokens - text.n_decoded) as usize;
+                    let ctx_room = (self.n_ctx as usize).saturating_sub(n_cur + 1);
+                    d.draft(draft_len.min(room).min(ctx_room))
+                }
+                None => Vec::new(),
+            };
+
+            if drafts.is_empty() {
+                // Single-token decode step.
+                logits_vec = model.forward_tokens(&[next_token], n_cur, &self.dense_device)?;
+                fed_tokens.push(next_token);
+                n_cur += 1;
+                continue;
+            }
+
+            // ── Verify the draft in one forward pass ─────────────────────────
+            // Row i of `rows` predicts the token after block[i], so row 0
+            // checks drafts[0], and the last row is the next step's logits if
+            // the whole draft is accepted.
+            let mut block = Vec::with_capacity(drafts.len() + 1);
+            block.push(next_token);
+            block.extend_from_slice(&drafts);
+            let mut rows = model.forward_tokens_all(&block, n_cur, &self.dense_device)?;
             fed_tokens.push(next_token);
             n_cur += 1;
+
+            let mut accepted = 0usize;
+            let mut kept = 0usize;
+            let mut stop = false;
+            for (i, &draft) in drafts.iter().enumerate() {
+                let dist = token_distribution(&rows[i], options, &text.recent_tokens);
+                match verify_token(&dist, draft, &mut rng)? {
+                    Verdict::Accept => {
+                        accepted += 1;
+                        if self.eos_token_ids.contains(&draft) {
+                            stop = true;
+                            break;
+                        }
+                        // The token is in the KV cache already; count it as
+                        // fed before the stop check so the cache and
+                        // `fed_tokens` agree however the loop exits.
+                        kept += 1;
+                        fed_tokens.push(draft);
+                        n_cur += 1;
+                        if let Some(d) = drafter.as_mut() {
+                            d.push(draft);
+                        }
+                        if self.emit_token(&mut text, draft, options)? {
+                            stop = true;
+                            break;
+                        }
+                    }
+                    Verdict::Reject(correction) => {
+                        pending = Some(correction);
+                        break;
+                    }
+                }
+            }
+
+            n_drafted += drafts.len() as u64;
+            n_accepted += accepted as u64;
+            n_verify += 1;
+            let max_draft = spec.map_or(1, |c| c.max_draft);
+            draft_len = next_draft_len(draft_len, drafts.len(), accepted, max_draft);
+
+            // Roll the KV cache back past every draft token not kept.
+            if kept < drafts.len() && !model.truncate_to(n_cur) {
+                return Err(JoshuaError::Inference(format!(
+                    "speculative decoding could not roll the KV cache back to {n_cur} tokens"
+                )));
+            }
+            if stop {
+                break;
+            }
+            if pending.is_none() {
+                // Whole draft accepted: the last row predicts the next token.
+                logits_vec = rows.swap_remove(drafts.len());
+            }
+        }
+
+        if spec.is_some() && n_drafted > 0 {
+            self.spec_drafted.fetch_add(n_drafted, Ordering::Relaxed);
+            self.spec_accepted.fetch_add(n_accepted, Ordering::Relaxed);
+            self.spec_verify_steps.fetch_add(n_verify, Ordering::Relaxed);
+            tracing::debug!(
+                drafted = n_drafted,
+                accepted = n_accepted,
+                acceptance = n_accepted as f64 / n_drafted as f64,
+                "Speculative decoding"
+            );
         }
 
         let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
+        let n_decoded = text.n_decoded;
         let decode_tps = if decode_ms > 0.0 && n_decoded > 0 {
             n_decoded as f64 / (decode_ms / 1000.0)
         } else {
@@ -2241,11 +2418,56 @@ impl Engine {
         };
 
         Ok(DecodeOutcome {
-            response,
+            response: text.response,
             n_decoded,
             fed_tokens,
             decode_tps,
         })
+    }
+
+    /// Append one generated token to the response text and the
+    /// repetition-penalty window.  Returns `true` when a stop sequence has
+    /// been reached (the response is trimmed to before it).
+    fn emit_token(
+        &self,
+        text: &mut DecodeText,
+        token: u32,
+        options: &GenerationOptions,
+    ) -> Result<bool> {
+        if self.byte_level_decode {
+            // Byte-level BPE splits multi-byte UTF-8 across token
+            // boundaries — a single token can be a lone byte (e.g.
+            // DeepSeek's raw-byte vocab entries `¡`..`ÿ`), which is
+            // invalid UTF-8 on its own and would decode to U+FFFD.
+            // [`ByteWindowDecoder`] keeps that byte state across tokens
+            // without re-decoding the whole output every step (the old
+            // whole-buffer decode made generation O(n²) in length).
+            text.decoded_ids.push(token);
+            let response = std::mem::take(&mut text.response);
+            text.response =
+                text.byte_window
+                    .push(&self.tokenizer, token, response, &text.decoded_ids)?;
+        } else {
+            // Decoder-less / word-level tokenizers: batch decoding would
+            // join pieces with spaces, so decode each token and append.
+            let piece = self
+                .tokenizer
+                .decode(&[token], false)
+                .map_err(|e| JoshuaError::Inference(e.to_string()))?;
+            text.response.push_str(&piece);
+        }
+        text.n_decoded += 1;
+
+        // Maintain sliding-window token history for repetition penalty.
+        if text.recent_tokens.len() >= REP_WINDOW {
+            text.recent_tokens.remove(0);
+        }
+        text.recent_tokens.push(token);
+
+        Ok(Self::check_stop_sequences(
+            &mut text.response,
+            &options.stop_sequences,
+        ))
     }
 
     // ─── Embeddings ───────────────────────────────────────────────────────────
@@ -2327,6 +2549,27 @@ impl Engine {
     /// to that common prefix).  Included in [`Engine::kv_reuse_count`].
     pub fn kv_edit_reuse_count(&self) -> u64 {
         self.kv_edit_reuses.load(Ordering::Relaxed)
+    }
+
+    /// Speculative decoding settings in effect, if enabled.
+    pub fn speculative_config(&self) -> Option<SpeculativeConfig> {
+        self.speculative
+    }
+
+    /// Enable (or disable) speculative token generation after construction.
+    /// See [`EngineOptions::speculative`].
+    pub fn with_speculative(mut self, config: Option<SpeculativeConfig>) -> Self {
+        self.speculative = config.map(SpeculativeConfig::normalized);
+        self
+    }
+
+    /// Speculative-decoding counters accumulated over every request so far.
+    pub fn speculative_stats(&self) -> SpeculativeStats {
+        SpeculativeStats {
+            drafted: self.spec_drafted.load(Ordering::Relaxed),
+            accepted: self.spec_accepted.load(Ordering::Relaxed),
+            verify_steps: self.spec_verify_steps.load(Ordering::Relaxed),
+        }
     }
 
     /// Route generation through an NPU backend (see [`crate::npu`]).
@@ -3942,8 +4185,19 @@ fn sample_token(
     rng: &mut impl rand::Rng,
     recent_tokens: &[u32],
 ) -> Result<u32> {
+    token_distribution(logits, opts, recent_tokens).sample(rng)
+}
+
+/// The next-token distribution [`sample_token`] draws from: the raw logits
+/// after the repetition penalty, temperature, top-k, min-p and top-p
+/// transforms.  Speculative verification checks draft tokens against it.
+fn token_distribution(
+    logits: &[f32],
+    opts: &GenerationOptions,
+    recent_tokens: &[u32],
+) -> TokenDist {
     if logits.is_empty() {
-        return Ok(0);
+        return TokenDist::Greedy(0);
     }
 
     // ── Repetition penalty ────────────────────────────────────────────────────
@@ -3978,12 +4232,7 @@ fn sample_token(
 
     // ── Greedy ────────────────────────────────────────────────────────────────
     if opts.temperature <= 0.0 {
-        return Ok(logits
-            .iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(i, _)| i as u32)
-            .unwrap_or(0));
+        return TokenDist::Greedy(argmax(&logits));
     }
 
     // ── Temperature scaling ───────────────────────────────────────────────────
@@ -4047,20 +4296,24 @@ fn sample_token(
     let total: f32 = probs.iter().sum();
     if total <= 0.0 {
         // Fallback: greedy from original (penalty-adjusted) logits.
-        return Ok(logits
-            .iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(i, _)| i as u32)
-            .unwrap_or(0));
+        return TokenDist::Greedy(argmax(&logits));
     }
 
     for p in &mut probs {
         *p /= total;
     }
 
-    let dist = WeightedIndex::new(&probs).map_err(|e| JoshuaError::Inference(e.to_string()))?;
-    Ok(dist.sample(rng) as u32)
+    TokenDist::Probs(probs)
+}
+
+/// Index of the largest logit (0 for an empty vector).
+fn argmax(logits: &[f32]) -> u32 {
+    logits
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(i, _)| i as u32)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]

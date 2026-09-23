@@ -1162,9 +1162,24 @@ impl GGUFQWenMoE {
     }
 
     /// Forward pass. `input` is `[1, seq_len]`; `offset` is the KV-cache
-    /// position of the first input token.
+    /// position of the first input token.  Returns the last position's
+    /// logits, `[1, vocab]`.
     pub fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {
+        self.forward_impl(input, offset, false)
+    }
+
+    /// [`Self::forward`], returning the logits of **every** input position,
+    /// `[1, seq_len, vocab]` — the speculative-decoding verification pass,
+    /// which scores a whole draft in one step (see [`crate::speculative`]).
+    pub fn forward_all_logits(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {
+        self.forward_impl(input, offset, true)
+    }
+
+    fn forward_impl(&mut self, input: &Tensor, offset: usize, all_logits: bool) -> Result<Tensor> {
         let (_b, seq_len) = input.dims2()?;
+        // A verification pass is a (multi-token) decode step, not a prefill:
+        // it advances the hot-expert cadence like a single-token step.
+        let decode = seq_len == 1 || all_logits;
         let sh: &Shared = &self.shared;
         let mut xs = sh
             .tok_embeddings
@@ -1183,8 +1198,8 @@ impl GGUFQWenMoE {
         // pages, so the common routing path stays resident instead of
         // faulting from disk each step.  Runs before the layer loop so the
         // prefetch has a full step of compute to stream in behind.
-        let step = self.hot_experts.begin_step(seq_len == 1);
-        if self.hot_experts.refresh_due(seq_len == 1) {
+        let step = self.hot_experts.begin_step(decode);
+        if self.hot_experts.refresh_due(decode) {
             for (l, e) in self.hot_experts.refresh() {
                 // Protect the routing-frequency hot set from LRU eviction in a
                 // device slot pool (#62: "the pool evicts non-hot slots"), then
@@ -1207,10 +1222,15 @@ impl GGUFQWenMoE {
             xs = (residual + h)?;
         }
 
-        let xs = xs.narrow(1, seq_len - 1, 1)?;
-        let xs = sh.norm.forward(&xs)?;
         let _p = prof::Phase::start(&prof::HEAD);
-        let out = sh.output.forward(&xs)?.to_dtype(DType::F32)?.squeeze(1);
+        let out = if all_logits {
+            let xs = sh.norm.forward(&xs)?;
+            sh.output.forward(&xs)?.to_dtype(DType::F32)
+        } else {
+            let xs = xs.narrow(1, seq_len - 1, 1)?;
+            let xs = sh.norm.forward(&xs)?;
+            sh.output.forward(&xs)?.to_dtype(DType::F32)?.squeeze(1)
+        };
         drop(_p);
         prof::report();
         out
