@@ -16,6 +16,18 @@ use candle_core::{Device, Result, Tensor};
 use crate::residency::ExpertResidency;
 use crate::token_embedding::TokenEmbedding;
 
+/// What a decoder layer sees besides its input activations.
+pub struct LayerInput<'a> {
+    /// Additive causal mask `[1, 1, seq, offset + seq]`, or `None` for a
+    /// single-token step.
+    pub mask: Option<&'a Tensor>,
+    /// Absolute position of the first input token.
+    pub offset: usize,
+    /// Every token fed so far, through this input (`offset + seq` of them)
+    /// — only when [`LayerStack::wants_tokens`], else empty.
+    pub tokens: &'a [u32],
+}
+
 /// A loader's immutable weights, seen as an embedding, a stack of decoder
 /// layers, and an output head.
 pub trait LayerStack: Send + Sync + 'static {
@@ -30,19 +42,31 @@ pub trait LayerStack: Send + Sync + 'static {
     /// The expert residency backend the hot set is pushed to.
     fn residency(&self) -> &Arc<dyn ExpertResidency>;
 
-    /// Run layer `l` over `xs` (`[1, seq, hidden]`) at absolute position
-    /// `offset`, updating `state`.  Returns the layer output and the routed
-    /// expert ids this input used (empty for a dense layer).
+    /// Whether layers read the token history ([`LayerInput::tokens`]).  The
+    /// session then keeps it, at the cost of a host copy of each input.
+    fn wants_tokens(&self) -> bool {
+        false
+    }
+
+    /// Turn the token embedding `[1, seq, n_embd]` into the residual form
+    /// the layers carry (identity by default; hyper-connection models widen
+    /// it into parallel streams).
+    fn lift(&self, emb: Tensor) -> Result<Tensor> {
+        Ok(emb)
+    }
+
+    /// Run layer `l` over `xs` (`[1, seq, residual]`), updating `state`.
+    /// Returns the layer output and the routed expert ids this input used
+    /// (empty for a dense layer).
     fn layer(
         &self,
         l: usize,
         state: &mut Self::State,
         xs: &Tensor,
-        mask: Option<&Tensor>,
-        offset: usize,
+        input: &LayerInput<'_>,
     ) -> Result<(Tensor, Vec<u32>)>;
 
-    /// Final norm + output head: `[1, n, hidden]` → `[1, n, vocab]` (f32).
+    /// Final norm + output head: `[1, n, residual]` → `[1, n, vocab]` (f32).
     fn head(&self, xs: &Tensor) -> Result<Tensor>;
 
     /// Whether every layer's state can be cut back to an arbitrary prefix
@@ -60,6 +84,8 @@ pub trait LayerStack: Send + Sync + 'static {
 pub struct Session<W: LayerStack> {
     weights: Arc<W>,
     state: Vec<W::State>,
+    /// Every token fed so far, when the weights [want it](LayerStack::wants_tokens).
+    tokens: Vec<u32>,
     /// Routing-frequency LRU hot-expert cache (shared bookkeeping; budget set
     /// after load via [`Session::set_pin_hot_experts`], CLI flag
     /// `--pin-hot-experts`).  Records routing, re-selects the hot set every
@@ -75,6 +101,7 @@ impl<W: LayerStack> Session<W> {
         let n = weights.n_layers();
         Self {
             state: vec![W::State::default(); n],
+            tokens: Vec::new(),
             hot_experts: crate::hot_experts::HotExpertCache::new(n, weights.n_expert(), 0),
             weights,
         }
@@ -92,6 +119,7 @@ impl<W: LayerStack> Session<W> {
         Self {
             weights: Arc::clone(&self.weights),
             state: vec![W::State::default(); self.state.len()],
+            tokens: Vec::new(),
             hot_experts: crate::hot_experts::HotExpertCache::new(
                 self.state.len(),
                 self.weights.n_expert(),
@@ -112,8 +140,25 @@ impl<W: LayerStack> Session<W> {
 
     fn embed(&self, ids: &Tensor, seq_len: usize) -> Result<Tensor> {
         let emb = self.weights.tok_embeddings();
-        emb.forward(&ids.flatten_all()?)?
-            .reshape((1, seq_len, emb.hidden()?))
+        let xs = emb.forward(&ids.flatten_all()?)?.reshape((1, seq_len, emb.hidden()?))?;
+        self.weights.lift(xs)
+    }
+
+    /// Record `new` as the tokens at `offset..` of the history (when the
+    /// weights want it).  Re-feeding a position overwrites what followed.
+    fn record_tokens(&mut self, offset: usize, new: &[u32]) -> Result<()> {
+        if !self.weights.wants_tokens() {
+            return Ok(());
+        }
+        if self.tokens.len() < offset {
+            candle_core::bail!(
+                "token history covers {} positions but input starts at {offset}",
+                self.tokens.len()
+            );
+        }
+        self.tokens.truncate(offset);
+        self.tokens.extend_from_slice(new);
+        Ok(())
     }
 
     /// Forward pass. `input` is `[1, seq_len]`; `offset` is the cache
@@ -136,6 +181,10 @@ impl<W: LayerStack> Session<W> {
         // it advances the hot-expert cadence like a single-token step.
         let decode = seq_len == 1 || all_logits;
         let w = Arc::clone(&self.weights);
+        if w.wants_tokens() {
+            let ids: Vec<u32> = input.flatten_all()?.to_vec1()?;
+            self.record_tokens(offset, &ids)?;
+        }
         let mut xs = self.embed(input, seq_len)?;
         let mask = if seq_len == 1 {
             None
@@ -160,8 +209,13 @@ impl<W: LayerStack> Session<W> {
             }
         }
 
+        let layer_input = LayerInput {
+            mask: mask.as_ref(),
+            offset,
+            tokens: if w.wants_tokens() { &self.tokens[..offset + seq_len] } else { &[] },
+        };
         for (l, state) in self.state.iter_mut().enumerate() {
-            let (out, routed) = w.layer(l, state, &xs, mask.as_ref(), offset)?;
+            let (out, routed) = w.layer(l, state, &xs, &layer_input)?;
             self.hot_experts.record(l, &routed, step);
             xs = out;
         }
@@ -193,6 +247,7 @@ impl<W: LayerStack> Session<W> {
         for s in self.state.iter_mut() {
             *s = W::State::default();
         }
+        self.tokens.clear();
     }
 
     /// Whether [`Self::truncate_kv_cache`] can cut the state back to an
@@ -214,6 +269,7 @@ impl<W: LayerStack> Session<W> {
         for s in self.state.iter_mut() {
             W::truncate_state(s, keep)?;
         }
+        self.tokens.truncate(keep);
         Ok(())
     }
 }
@@ -236,14 +292,22 @@ impl<W: LayerStack> crate::stream_prefill::StreamPrefill for Session<W> {
         l: usize,
         xs: &Tensor,
         pos: usize,
-        _tokens: &[u32],
+        tokens: &[u32],
     ) -> Result<Tensor> {
+        // The sweep is layer-outer: layer 0 sees each chunk first, in order,
+        // so that is when its tokens join the history.
+        if l == 0 {
+            self.record_tokens(pos, tokens)?;
+        }
         // Chunk-local causal mask: this chunk's tokens attend to all prior
         // positions ([chunk_len, chunk_len + pos]) — the same causal mask the
         // chunked prefill builds for the same `pos`.
-        let mask = crate::moe::causal_mask(xs.dim(1)?, pos, xs.device())?;
+        let seq = xs.dim(1)?;
+        let mask = crate::moe::causal_mask(seq, pos, xs.device())?;
         let w = Arc::clone(&self.weights);
-        let (out, routed) = w.layer(l, &mut self.state[l], xs, Some(&mask), pos)?;
+        let tokens = if w.wants_tokens() { &self.tokens[..pos + seq] } else { &[][..] };
+        let input = LayerInput { mask: Some(&mask), offset: pos, tokens };
+        let (out, routed) = w.layer(l, &mut self.state[l], xs, &input)?;
         let step = self.hot_experts.begin_step(false);
         self.hot_experts.record(l, &routed, step);
         Ok(out)

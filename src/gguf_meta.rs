@@ -55,12 +55,17 @@ impl<'a> Meta<'a> {
     }
 
     pub fn u32(&self, suffix: &str) -> Result<u32> {
-        self.required(suffix)?.to_u32()
+        let v = self.required(suffix)?;
+        match as_u64(v).and_then(|x| u32::try_from(x).ok()) {
+            Some(x) => Ok(x),
+            None => candle_core::bail!("{}: `{}` is not a u32: {v:?}", self.arch, self.key(suffix)),
+        }
     }
 
-    /// `suffix` as a `u32`, or `None` when absent or not an integer.
+    /// `suffix` as a `u32`, or `None` when absent or not a non-negative
+    /// integer that fits.
     pub fn u32_opt(&self, suffix: &str) -> Option<u32> {
-        self.get(suffix).and_then(|v| v.to_u32().ok())
+        self.get(suffix).and_then(as_u64).and_then(|x| u32::try_from(x).ok())
     }
 
     pub fn u32_or(&self, suffix: &str, default: u32) -> u32 {
@@ -94,9 +99,19 @@ impl<'a> Meta<'a> {
     }
 
     /// A per-layer integer array, truncated or zero-padded to `n` entries
-    /// (all zeros when absent).
+    /// (all zeros when absent).  Any integer element type is accepted:
+    /// llama.cpp's converter writes Python int lists as I32 arrays.
     pub fn array_u32(&self, suffix: &str, n: usize) -> Vec<usize> {
-        self.array(suffix, n, |v| v.to_u32().unwrap_or(0) as usize)
+        self.array(suffix, n, |v| as_u64(v).unwrap_or(0) as usize)
+    }
+
+    /// An integer array read at full 64-bit width (hash constants), or
+    /// `None` when absent.
+    pub fn array_u64(&self, suffix: &str) -> Option<Vec<u64>> {
+        match self.get(suffix)? {
+            gguf_file::Value::Array(arr) => Some(arr.iter().map(|v| as_u64(v).unwrap_or(0)).collect()),
+            _ => None,
+        }
     }
 
     /// A per-layer boolean array, truncated or `false`-padded to `n`
@@ -118,6 +133,24 @@ impl<'a> Meta<'a> {
         };
         out.resize(n, T::default());
         out
+    }
+}
+
+/// Any GGUF integer (or bool) value as a `u64`; `None` for negatives and
+/// non-integers.
+fn as_u64(v: &gguf_file::Value) -> Option<u64> {
+    use gguf_file::Value as V;
+    match *v {
+        V::U8(x) => Some(x as u64),
+        V::U16(x) => Some(x as u64),
+        V::U32(x) => Some(x as u64),
+        V::U64(x) => Some(x),
+        V::I8(x) => u64::try_from(x).ok(),
+        V::I16(x) => u64::try_from(x).ok(),
+        V::I32(x) => u64::try_from(x).ok(),
+        V::I64(x) => u64::try_from(x).ok(),
+        V::Bool(x) => Some(x as u64),
+        _ => None,
     }
 }
 
@@ -146,7 +179,33 @@ mod tests {
         assert!(!m.contains("expert_count"));
         assert_eq!(m.array_f64("swiglu", 3), vec![1.5, 0.0, 0.0]);
         assert_eq!(m.array_u32("absent", 2), vec![0, 0]);
+        assert_eq!(m.array_u64("absent"), None);
         let err = m.u32("expert_count").unwrap_err().to_string();
         assert!(err.contains("deepseek2.expert_count"), "{err}");
+    }
+
+    /// Converters write Python ints as I32 (arrays) and large constants as
+    /// U64; both must read back exactly.
+    #[test]
+    fn integers_of_any_width_read_back() {
+        let md: HashMap<String, gguf_file::Value> = [
+            ("a.n".to_string(), gguf_file::Value::I32(7)),
+            ("a.neg".to_string(), gguf_file::Value::I32(-1)),
+            (
+                "a.ratios".to_string(),
+                gguf_file::Value::Array(vec![gguf_file::Value::I32(0), gguf_file::Value::I32(4)]),
+            ),
+            (
+                "a.mult".to_string(),
+                gguf_file::Value::Array(vec![gguf_file::Value::U64(24_000_000_000_017)]),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let m = Meta::new(&md, "a");
+        assert_eq!(m.u32("n").unwrap(), 7);
+        assert_eq!(m.u32_opt("neg"), None);
+        assert_eq!(m.array_u32("ratios", 2), vec![0, 4]);
+        assert_eq!(m.array_u64("mult"), Some(vec![24_000_000_000_017]));
     }
 }

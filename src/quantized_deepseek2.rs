@@ -741,11 +741,10 @@ impl crate::native_session::LayerStack for Weights {
         l: usize,
         kv: &mut KvCache,
         xs: &Tensor,
-        mask: Option<&Tensor>,
-        offset: usize,
+        input: &crate::native_session::LayerInput<'_>,
     ) -> Result<(Tensor, Vec<u32>)> {
         let layer = &self.layers[l];
-        let h = layer.attn.forward(kv, &layer.attn_norm.forward(xs)?, mask, offset)?;
+        let h = layer.attn.forward(kv, &layer.attn_norm.forward(xs)?, input.mask, input.offset)?;
         let xs = (xs + h)?;
         let (h, routed) = layer.ffn.forward_routed(&layer.ffn_norm.forward(&xs)?)?;
         Ok(((xs + h)?, routed))

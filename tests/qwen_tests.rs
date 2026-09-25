@@ -19,6 +19,7 @@ const ARCHES: &[(&str, bool)] = &[
     ("qwen3next", true),
     ("qwen35", true),
     ("qwen35moe", true),
+    ("qwen4exp", true),
 ];
 
 fn load(model: &std::path::Path) -> QuantizedModel {
@@ -64,7 +65,7 @@ fn every_qwen_architecture_is_supported() {
     }
     // The remaining Qwen-branded registry entries are recognised with a
     // specific "known but not loadable" error rather than "unrecognised".
-    for name in ["qwen4exp", "qwen3tts", "rwkv6qwen2"] {
+    for name in ["qwen3tts", "rwkv6qwen2"] {
         assert_eq!(Architecture::from_name(name), None, "{name}");
         assert!(Architecture::is_known_llama_cpp_arch(name), "{name}");
     }
@@ -201,5 +202,80 @@ fn qwen_family_matches_llama_cpp_reference() {
         checked += 1;
         std::fs::remove_dir_all(&dir).ok();
     }
-    assert_eq!(checked, ARCHES.len(), "every architecture has a reference");
+    // qwen4exp has its own all-position reference below.
+    assert_eq!(checked, ARCHES.len() - 1, "every architecture has a reference");
+}
+
+/// `qwen4exp` (hyper-connections, QSA block-sparse attention, PLE n-gram
+/// hash embeddings) matches an independent float64 NumPy transcription of
+/// llama.cpp's `src/models/qwen4exp.cpp` at **every** position
+/// (`tests/data/qwen4exp_reference_logits.txt`).  The prompt is longer than
+/// the fixture's QSA budget (2 cells + tail), so most queries attend
+/// sparsely, and it contains an EOS to exercise the PLE hash reset.  Every
+/// position is checked because the QSA layer is the last layer: only the
+/// earlier rows expose each query's own selection.
+#[test]
+fn qwen4exp_matches_llama_cpp_reference_at_every_position() {
+    let tokens = [1u32, 4, 2, 7, 5, 9, 3, 6, 8, 4, 1];
+    let golden = include_str!("data/qwen4exp_reference_logits.txt");
+    let want: Vec<Vec<f32>> = golden
+        .lines()
+        .filter(|l| !l.starts_with('#') && !l.is_empty())
+        .map(|l| l.split_whitespace().map(|x| x.parse().unwrap()).collect())
+        .collect();
+    assert_eq!(want.len(), tokens.len());
+
+    let dir = common::model_dir("qwen4exp-ref");
+    let model = dir.join("model.gguf");
+    common::write_tiny_qwen_gguf(&model, "qwen4exp");
+    let mut m = load(&model);
+    let input = Tensor::new(&tokens[..], &Device::Cpu).unwrap().unsqueeze(0).unwrap();
+    let got: Vec<Vec<f32>> = m
+        .forward_all_logits(&input, 0)
+        .unwrap()
+        .squeeze(0)
+        .unwrap()
+        .to_vec2()
+        .unwrap();
+    for (pos, (g, w)) in got.iter().zip(&want).enumerate() {
+        assert_close(g, w, 1e-6, &format!("qwen4exp position {pos} vs llama.cpp reference"));
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The layer-streaming prefill (layer-outer, chunk-inner) reproduces a
+/// single forward for every architecture — including the ones whose layers
+/// carry recurrent state and read the token history (qwen4exp's PLE), which
+/// the sweep feeds chunk by chunk.
+#[test]
+fn qwen_family_streamed_prefill_matches_forward() {
+    use joshua::stream_prefill::Chunk;
+    let tokens = [1u32, 4, 2, 7, 5, 9, 3, 6, 8, 4, 1];
+    for &(arch, _) in ARCHES {
+        let dir = common::model_dir(&format!("qwen-family-stream-{arch}"));
+        let model = dir.join("model.gguf");
+        common::write_tiny_qwen_gguf(&model, arch);
+
+        let mut single = load(&model);
+        let want = logits(&mut single, &tokens, 0);
+        let mut streamed = single.new_session().unwrap();
+        let chunks = [
+            Chunk { tokens: &tokens[..4], pos: 0 },
+            Chunk { tokens: &tokens[4..7], pos: 4 },
+            Chunk { tokens: &tokens[7..], pos: 7 },
+        ];
+        let got: Vec<f32> = streamed
+            .prefill_streamed(&chunks, &Device::Cpu)
+            .unwrap()
+            .squeeze(0)
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        assert_close(&want, &got, 1e-4, &format!("{arch} streamed prefill"));
+        // The streamed session continues decoding like the single one.
+        let a = logits(&mut single, &[2], tokens.len());
+        let b = logits(&mut streamed, &[2], tokens.len());
+        assert_close(&a, &b, 1e-4, &format!("{arch} decode after streamed prefill"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

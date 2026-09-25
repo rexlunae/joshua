@@ -13,6 +13,7 @@
 //! | `qwen3next`  | Qwen3-Next-80B-A3B                | gated / Gated DeltaNet    | MoE + gated shared expert |
 //! | `qwen35`     | Qwen3.5 dense                     | gated / Gated DeltaNet, IM-RoPE | dense |
 //! | `qwen35moe`  | Qwen3.5-MoE                       | gated / Gated DeltaNet, IM-RoPE | MoE + gated shared expert |
+//! | `qwen4exp`   | Qwen3.8-Flash-Next                | as `qwen35moe` + QSA block-sparse attention | MoE + gated shared expert |
 //!
 //! (`qwen2` and `qwen3` dense run through candle's stock loaders.)  The
 //! pieces that vary are all optional parts of one decoder layer:
@@ -41,6 +42,10 @@
 //!   the mmap when possible), so the model keeps its on-disk footprint
 //!   instead of exploding to f32 in RAM.
 //!
+//! `qwen4exp` further replaces every layer norm with hyper-connections over
+//! parallel residual streams and adds n-gram hash embeddings (PLE) on one
+//! layer; those pieces live in [`qwen4exp`].
+//!
 //! The math follows llama.cpp's `src/models/qwen*.cpp` graphs on the same
 //! GGUF tensors.  Activations run in f32 for CPU accuracy, mirroring the
 //! other Joshua quantized loaders (`glm4`, `deepseek2`).
@@ -55,6 +60,9 @@ use candle_nn::ops::{sigmoid, silu, softmax_last_dim};
 use candle_transformers::quantized_nn::RmsNorm;
 
 use crate::attention::{KvCache, Rope, RopeStyle};
+
+mod qwen4exp;
+use qwen4exp::{HyperMix, Ple, PleConfig, Qsa, QsaConfig};
 use crate::gguf_meta::Meta;
 use crate::token_embedding::TokenEmbedding;
 use crate::zero_copy_metal::{ZcContext, ZcWeight};
@@ -146,6 +154,7 @@ pub const ARCHES: &[&str] = &[
     "qwen3next",
     "qwen35",
     "qwen35moe",
+    "qwen4exp",
 ];
 
 /// How a Gated DeltaNet layer's value heads share the (fewer) key heads.
@@ -211,6 +220,12 @@ struct Config {
     /// Per layer: Gated DeltaNet (true) or attention (false).
     recurrent: Vec<bool>,
     ssm: Option<SsmConfig>,
+    /// DeltaNet output gate `sigmoid(z)` (qwen4exp) instead of `silu(z)`.
+    delta_sigmoid_gate: bool,
+    /// Hyper-connection stream count (qwen4exp); `None` = pre-norm layers.
+    hyper: Option<usize>,
+    qsa: Option<QsaConfig>,
+    ple: Option<PleConfig>,
     // MoE (`n_expert == 0` → dense FFN).
     n_expert: usize,
     n_expert_used: usize,
@@ -263,14 +278,18 @@ impl Config {
         };
         let interleaved_mrope = match arch {
             "qwen2vl" => Some(false),
-            "qwen3vl" | "qwen3vlmoe" | "qwen35" | "qwen35moe" => Some(true),
+            "qwen3vl" | "qwen3vlmoe" | "qwen35" | "qwen35moe" | "qwen4exp" => Some(true),
             _ => None,
         };
         let mrope = interleaved_mrope.map(|interleaved| {
             let s = m.array_u32("rope.dimension_sections", 4);
             let s = [s[0], s[1], s[2], s[3]];
             // Qwen3.5's converter default when a checkpoint omits the field.
-            let s = if s == [0; 4] && arch.starts_with("qwen35") { [11, 11, 10, 0] } else { s };
+            let s = if s == [0; 4] && matches!(arch, "qwen35" | "qwen35moe" | "qwen4exp") {
+                [11, 11, 10, 0]
+            } else {
+                s
+            };
             (s, interleaved)
         });
         let attn_scale = match m.f32_or("attention.scale", 0.0) {
@@ -278,7 +297,7 @@ impl Config {
             _ => 1.0 / (head_dim as f64).sqrt(),
         };
 
-        let hybrid = matches!(arch, "qwen3next" | "qwen35" | "qwen35moe");
+        let hybrid = matches!(arch, "qwen3next" | "qwen35" | "qwen35moe" | "qwen4exp");
         let (recurrent, ssm) = if hybrid {
             let recurrent = match m.array_bool("attention.recurrent_layers", n_layer) {
                 Some(r) => r,
@@ -328,6 +347,24 @@ impl Config {
         let expert_weights_norm = m.bool_or("attention.norm_topk_prob", arch != "qwen2moe");
         let expert_weights_scale = m.f32_or("expert_weights_scale", 0.0) as f64;
 
+        let qwen4 = arch == "qwen4exp";
+        let hyper = if qwen4 {
+            let hc = m.u32("hyper_connection.count")? as usize;
+            if hc <= 1 {
+                candle_core::bail!("{arch}: hyper_connection.count must be greater than one, got {hc}");
+            }
+            Some(hc)
+        } else {
+            None
+        };
+        let qsa = if qwen4 { QsaConfig::from_meta(&m, n_layer)? } else { None };
+        let ple = if qwen4 { PleConfig::from_meta(&m, n_layer)? } else { None };
+        if let Some(p) = &ple {
+            if !recurrent[p.layer] {
+                candle_core::bail!("{arch}: PLE layer {} is not a linear-attention layer", p.layer);
+            }
+        }
+
         Ok(Self {
             arch,
             n_layer,
@@ -344,6 +381,10 @@ impl Config {
             gated_attn: hybrid,
             recurrent,
             ssm,
+            delta_sigmoid_gate: qwen4,
+            hyper,
+            qsa,
+            ple,
             n_expert,
             n_expert_used,
             expert_weights_norm,
@@ -596,6 +637,8 @@ struct Attention {
     /// scaled by `sigmoid(gate)` before `o` (Qwen3-Next / Qwen3.5).
     gated: bool,
     rope: Arc<Rope>,
+    /// Block-sparse selection (qwen4exp QSA layers).
+    qsa: Option<Qsa>,
     n_head: usize,
     n_kv_head: usize,
     head_dim: usize,
@@ -603,8 +646,18 @@ struct Attention {
 }
 
 impl Attention {
-    fn load<R: Read + Seek>(rd: &mut Reader<R>, p: &str, cfg: &Config, rope: Arc<Rope>) -> Result<Self> {
+    fn load<R: Read + Seek>(
+        rd: &mut Reader<R>,
+        layer: usize,
+        p: &str,
+        cfg: &Config,
+        rope: Arc<Rope>,
+    ) -> Result<Self> {
         let hd = cfg.head_dim;
+        let qsa = match &cfg.qsa {
+            Some(q) => Qsa::load(rd, q, layer, p, rope.clone(), cfg.rms_eps)?,
+            None => None,
+        };
         let q_dim = cfg.n_head * hd * if cfg.gated_attn { 2 } else { 1 };
         let kv_dim = cfg.n_kv_head * hd;
         Ok(Self {
@@ -617,6 +670,7 @@ impl Attention {
             k_norm: rd.rms_norm_opt(&format!("{p}.attn_k_norm.weight"), cfg.rms_eps)?,
             gated: cfg.gated_attn,
             rope,
+            qsa,
             n_head: cfg.n_head,
             n_kv_head: cfg.n_kv_head,
             head_dim: hd,
@@ -626,7 +680,7 @@ impl Attention {
 
     fn forward(
         &self,
-        kv_cache: &mut KvCache,
+        state: &mut LayerState,
         xs: &Tensor,
         mask: Option<&Tensor>,
         offset: usize,
@@ -634,6 +688,13 @@ impl Attention {
         let _p = prof::Phase::start(&prof::ATT);
         let (b, seq_len, _) = xs.dims3()?;
         let hd = self.head_dim;
+        // QSA narrows each query to its selected cells (None: dense).
+        let sparse = match &self.qsa {
+            Some(q) => q.mask(&mut state.index_keys, xs, offset)?,
+            None => None,
+        };
+        let mask = sparse.as_ref().or(mask);
+        let kv_cache = &mut state.kv;
         let (q, k, v) = self.qkv.forward(xs)?;
 
         let (q, gate) = if self.gated {
@@ -704,6 +765,8 @@ struct GatedDeltaNet {
     norm: RmsNorm, // [head_v_dim]
     out: Weight,
     ssm: SsmConfig,
+    /// `sigmoid(z)` output gate (qwen4exp) instead of `silu(z)`.
+    sigmoid_gate: bool,
     eps: f64,
 }
 
@@ -738,6 +801,7 @@ impl GatedDeltaNet {
             norm: rd.rms_norm(&format!("{p}.ssm_norm.weight"), cfg.rms_eps)?,
             out: rd.qmatmul(&format!("{p}.ssm_out.weight"))?,
             ssm,
+            sigmoid_gate: cfg.delta_sigmoid_gate,
             eps: cfg.rms_eps,
         })
     }
@@ -839,7 +903,8 @@ impl GatedDeltaNet {
 
         // Gated RMSNorm over each head: norm(o) · silu(z).
         let z = z.reshape((t, c.n_v_heads, c.head_v_dim))?;
-        let o = (self.norm.forward(&o)? * silu(&z)?)?.reshape((1, t, vd))?;
+        let z = if self.sigmoid_gate { sigmoid(&z)? } else { silu(&z)? };
+        let o = (self.norm.forward(&o)? * z)?.reshape((1, t, vd))?;
         self.out.forward(&o)
     }
 }
@@ -932,6 +997,8 @@ fn gated_delta_rule(
 }
 
 /// A layer's token mixer.
+// Built once per layer at load; the size difference is irrelevant.
+#[allow(clippy::large_enum_variant)]
 enum Mixer {
     Attention(Attention),
     DeltaNet(GatedDeltaNet),
@@ -1159,20 +1226,58 @@ impl FeedForward {
     }
 }
 
+/// How a layer reads and updates the residual stream.
+// Built once per layer at load; the size difference is irrelevant.
+#[allow(clippy::large_enum_variant)]
+enum Residual {
+    /// `x + mixer(norm(x))`, then `x + ffn(norm(x))`.
+    PreNorm {
+        attn_norm: RmsNorm,
+        /// `ffn_norm`, or `post_attention_norm` in the Qwen3-Next generation.
+        ffn_norm: RmsNorm,
+    },
+    /// Hyper-connections over parallel streams (qwen4exp), with the
+    /// optional PLE block applied to the streams first.
+    Hyper {
+        attn: HyperMix,
+        ffn: HyperMix,
+        ple: Option<Ple>,
+    },
+}
+
 struct Layer {
-    attn_norm: RmsNorm,
+    residual: Residual,
     mixer: Mixer,
-    /// `ffn_norm`, or `post_attention_norm` in the Qwen3-Next generation.
-    ffn_norm: RmsNorm,
     ffn: FeedForward,
 }
 
-/// One layer's per-session state: the KV cache of an attention layer or the
-/// recurrent state of a Gated DeltaNet layer.
+impl Layer {
+    fn mixer_forward(&self, state: &mut LayerState, h: &Tensor, mask: Option<&Tensor>, offset: usize) -> Result<Tensor> {
+        match &self.mixer {
+            Mixer::Attention(a) => a.forward(state, h, mask, offset),
+            Mixer::DeltaNet(d) => d.forward(&mut state.delta, h),
+        }
+    }
+}
+
+/// One layer's per-session state: the KV cache (and QSA indexer keys) of an
+/// attention layer, or the recurrent state (and PLE conv history) of a Gated
+/// DeltaNet layer.
 #[derive(Clone, Default)]
 pub struct LayerState {
     kv: KvCache,
     delta: Option<DeltaState>,
+    /// Raw QSA indexer keys, `[seq, dim]`.
+    index_keys: Option<Tensor>,
+    /// The PLE conv's input history.
+    ple_conv: Option<Tensor>,
+}
+
+/// The final norm before the output projection.
+enum HeadNorm {
+    Rms(RmsNorm),
+    /// The last hyper-connection mixer doubles as the output norm.
+    Hyper(HyperMix),
 }
 
 /// The immutable half of a loaded model: every weight, the expert residency
@@ -1183,8 +1288,10 @@ pub struct LayerState {
 pub struct Weights {
     tok_embeddings: TokenEmbedding,
     layers: Vec<Layer>,
-    norm: RmsNorm,
+    norm: HeadNorm,
     output: Linear,
+    /// Hyper-connection streams the residual carries (1 = plain residual).
+    streams: usize,
     device: Device,
     /// Executes residency for the hot set (CPU madvise today; a device slot
     /// cache later).  Built once at load from the per-expert handles.
@@ -1211,28 +1318,62 @@ impl crate::native_session::LayerStack for Weights {
         &self.residency
     }
 
+    fn wants_tokens(&self) -> bool {
+        // The PLE hash reads each token's predecessors.
+        self.layers
+            .iter()
+            .any(|l| matches!(&l.residual, Residual::Hyper { ple: Some(_), .. }))
+    }
+
+    fn lift(&self, emb: Tensor) -> Result<Tensor> {
+        if self.streams == 1 {
+            return Ok(emb);
+        }
+        // The wide residual starts as identical copies of the embedding.
+        let (b, t, n) = emb.dims3()?;
+        emb.unsqueeze(2)?
+            .broadcast_as((b, t, self.streams, n))?
+            .reshape((b, t, self.streams * n))
+    }
+
     fn layer(
         &self,
         l: usize,
         state: &mut LayerState,
         xs: &Tensor,
-        mask: Option<&Tensor>,
-        offset: usize,
+        input: &crate::native_session::LayerInput<'_>,
     ) -> Result<(Tensor, Vec<u32>)> {
+        let (mask, offset) = (input.mask, input.offset);
         let layer = &self.layers[l];
-        let h = layer.attn_norm.forward(xs)?;
-        let h = match &layer.mixer {
-            Mixer::Attention(a) => a.forward(&mut state.kv, &h, mask, offset)?,
-            Mixer::DeltaNet(d) => d.forward(&mut state.delta, &h)?,
-        };
-        let xs = (xs + h)?;
-        let (h, routed) = layer.ffn.forward(&layer.ffn_norm.forward(&xs)?)?;
-        Ok(((xs + h)?, routed))
+        match &layer.residual {
+            Residual::PreNorm { attn_norm, ffn_norm } => {
+                let h = layer.mixer_forward(state, &attn_norm.forward(xs)?, mask, offset)?;
+                let xs = (xs + h)?;
+                let (h, routed) = layer.ffn.forward(&ffn_norm.forward(&xs)?)?;
+                Ok(((xs + h)?, routed))
+            }
+            Residual::Hyper { attn, ffn, ple } => {
+                let res = match ple {
+                    Some(p) => p.forward(xs, input.tokens, &mut state.ple_conv)?,
+                    None => xs.clone(),
+                };
+                let (h, inject) = attn.mix(&res)?;
+                let h = layer.mixer_forward(state, &h, mask, offset)?;
+                let res = attn.combine(&res, &h, &inject.expect("layer mixers inject"))?;
+                let (h, inject) = ffn.mix(&res)?;
+                let (h, routed) = layer.ffn.forward(&h)?;
+                Ok((ffn.combine(&res, &h, &inject.expect("layer mixers inject"))?, routed))
+            }
+        }
     }
 
     fn head(&self, xs: &Tensor) -> Result<Tensor> {
         let _p = prof::Phase::start(&prof::HEAD);
-        let out = self.output.forward(&self.norm.forward(xs)?)?.to_dtype(DType::F32);
+        let normed = match &self.norm {
+            HeadNorm::Rms(n) => n.forward(xs)?,
+            HeadNorm::Hyper(h) => h.mix(xs)?.0,
+        };
+        let out = self.output.forward(&normed)?.to_dtype(DType::F32);
         drop(_p);
         prof::report();
         out
@@ -1570,7 +1711,11 @@ impl ModelWeights {
         // Kept quantized: dequantizing the table to f32 costs vocab × hidden
         // × 4 bytes of anonymous memory per instance (1.2 GiB on 30B-A3B).
         let tok_embeddings = TokenEmbedding::load(rd.qtensor("token_embd.weight")?, device)?;
-        let norm = rd.rms_norm("output_norm.weight", cfg.rms_eps)?;
+        let n_embd = tok_embeddings.hidden()?;
+        let norm = match cfg.hyper {
+            Some(hc) => HeadNorm::Hyper(HyperMix::load(&mut rd, "output_hc", hc, n_embd, cfg.rms_eps)?),
+            None => HeadNorm::Rms(rd.rms_norm("output_norm.weight", cfg.rms_eps)?),
+        };
         let output = Linear {
             w: match rd.qmatmul_opt("output.weight") {
                 Some(q) => q,
@@ -1585,27 +1730,36 @@ impl ModelWeights {
         let mut layers = Vec::with_capacity(cfg.n_layer);
         for layer_idx in 0..cfg.n_layer {
             let p = format!("blk.{layer_idx}");
-            let attn_norm = rd.rms_norm(&format!("{p}.attn_norm.weight"), cfg.rms_eps)?;
-            let ffn_norm = match rd.rms_norm_opt(&format!("{p}.post_attention_norm.weight"), cfg.rms_eps)? {
-                Some(n) => n,
-                None => rd.rms_norm(&format!("{p}.ffn_norm.weight"), cfg.rms_eps)?,
+            let residual = match cfg.hyper {
+                Some(hc) => Residual::Hyper {
+                    attn: HyperMix::load(&mut rd, &format!("{p}.hc_attn"), hc, n_embd, cfg.rms_eps)?,
+                    ffn: HyperMix::load(&mut rd, &format!("{p}.hc_ffn"), hc, n_embd, cfg.rms_eps)?,
+                    ple: match &cfg.ple {
+                        Some(pc) if pc.layer == layer_idx => {
+                            Some(Ple::load(&mut rd, pc, &p, hc, n_embd, cfg.rms_eps)?)
+                        }
+                        _ => None,
+                    },
+                },
+                None => Residual::PreNorm {
+                    attn_norm: rd.rms_norm(&format!("{p}.attn_norm.weight"), cfg.rms_eps)?,
+                    ffn_norm: match rd.rms_norm_opt(&format!("{p}.post_attention_norm.weight"), cfg.rms_eps)? {
+                        Some(n) => n,
+                        None => rd.rms_norm(&format!("{p}.ffn_norm.weight"), cfg.rms_eps)?,
+                    },
+                },
             };
             let mixer = if cfg.recurrent[layer_idx] {
                 Mixer::DeltaNet(GatedDeltaNet::load(&mut rd, &p, &cfg)?)
             } else {
-                Mixer::Attention(Attention::load(&mut rd, &p, &cfg, rope.clone())?)
+                Mixer::Attention(Attention::load(&mut rd, layer_idx, &p, &cfg, rope.clone())?)
             };
             let ffn = if cfg.n_expert > 0 {
                 FeedForward::Moe(load_moe(&mut rd, &p, &cfg)?)
             } else {
                 FeedForward::Dense(Mlp::load(&mut rd, &p, "")?)
             };
-            layers.push(Layer {
-                attn_norm,
-                mixer,
-                ffn_norm,
-                ffn,
-            });
+            layers.push(Layer { residual, mixer, ffn });
         }
 
         let residency: std::sync::Arc<dyn crate::residency::ExpertResidency> =
@@ -1623,6 +1777,7 @@ impl ModelWeights {
             layers,
             norm,
             output,
+            streams: cfg.hyper.unwrap_or(1),
             device: device.clone(),
             residency,
             n_expert: cfg.n_expert,
@@ -1834,6 +1989,7 @@ mod tests {
             k_norm: Some(rms_from_f32(&vec![1.0; hd], hd, dev)?),
             gated,
             rope: Arc::new(Rope::new(hd, 10_000.0, 64, RopeStyle::Neox, dev)?),
+            qsa: None,
             n_head: nh,
             n_kv_head: nkv,
             head_dim: hd,
@@ -1850,18 +2006,18 @@ mod tests {
         let (h, nkv, hd) = (8usize, 1usize, 4usize);
         for gated in [false, true] {
             let attn = tiny_attention(&dev, false, gated)?;
-            let mut kv_cache: KvCache = None;
+            let mut state = LayerState::default();
 
             let xs = Tensor::randn(0f32, 1f32, (1, 3, h), &dev)?;
-            let out = attn.forward(&mut kv_cache, &xs, None, 0)?;
+            let out = attn.forward(&mut state, &xs, None, 0)?;
             assert_eq!(out.dims(), &[1, 3, h]);
-            let (k, v) = kv_cache.as_ref().expect("cache after prefill");
+            let (k, v) = state.kv.as_ref().expect("cache after prefill");
             assert_eq!(k.dims(), &[1, nkv, hd, 3], "k cache must be [b, n_kv_head, head_dim, seq]");
             assert_eq!(v.dims(), &[1, nkv, hd, 3]);
 
             // Decode appends one more position.
-            let _ = attn.forward(&mut kv_cache, &Tensor::randn(0f32, 1f32, (1, 1, h), &dev)?, None, 3)?;
-            let (k, v) = kv_cache.as_ref().expect("cache after decode");
+            let _ = attn.forward(&mut state, &Tensor::randn(0f32, 1f32, (1, 1, h), &dev)?, None, 3)?;
+            let (k, v) = state.kv.as_ref().expect("cache after decode");
             assert_eq!(k.dims(), &[1, nkv, hd, 4]);
             assert_eq!(v.dims(), &[1, nkv, hd, 4]);
         }
@@ -1929,6 +2085,7 @@ mod tests {
             norm: rms_from_f32(&vec![1.0; c.head_v_dim], c.head_v_dim, &dev).unwrap(),
             out: lin(0, 0, &Tensor::zeros((h, c.value_dim()), DType::F32, &dev).unwrap()),
             ssm: c.clone(),
+            sigmoid_gate: false,
             eps: 1e-6,
         };
         let split = net(DeltaInput::Split { qkv: lin(0, 0, &qkv), z: lin(0, 0, &z) });

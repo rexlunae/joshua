@@ -3173,7 +3173,7 @@ fn probed_embedding_names(arch: Option<Architecture>) -> &'static [&'static str]
 /// `feed_forward.*` / `mlp.*_proj` / `shortconv.*_proj` aliases, `phi*`,
 /// `qwen2`, `qwen3`), and deepseek4's hyper-connection, indexer and
 /// compressor projections.
-const QUANTIZED_MATRIX_STEMS: [&str; 47] = [
+const QUANTIZED_MATRIX_STEMS: [&str; 60] = [
     "attn_q",
     "attn_k",
     "attn_v",
@@ -3221,6 +3221,19 @@ const QUANTIZED_MATRIX_STEMS: [&str; 47] = [
     "ssm_beta",
     "ssm_alpha",
     "ssm_out",
+    "hc_attn_down",
+    "hc_attn_up",
+    "hc_attn_inject",
+    "hc_ffn_down",
+    "hc_ffn_up",
+    "hc_ffn_inject",
+    "output_hc_down",
+    "output_hc_up",
+    "ple_key",
+    "ple_value",
+    "indexer.q_proj",
+    "indexer.k_proj",
+    "per_layer_token_embd",
 ];
 
 /// Tensor-name stems a loader is known to hold as dequantized f32 on an
@@ -3232,7 +3245,7 @@ const QUANTIZED_MATRIX_STEMS: [&str; 47] = [
 /// The MoE router (`ffn_gate_inp`) is handled per architecture in
 /// [`residency`]: the joshua-native loaders read it with `f32_tensor`, the
 /// stock `llama` loader (Mixtral) keeps it a quantized `QMatMul`.
-const F32_STEMS: [&str; 14] = [
+const F32_STEMS: [&str; 15] = [
     "attn_k_b",
     "attn_v_b",
     "hc_attn_base",
@@ -3247,6 +3260,7 @@ const F32_STEMS: [&str; 14] = [
     "ssm_conv1d",
     "ssm_a",
     "ffn_gate_inp_shexp",
+    "ple_conv1d",
 ];
 
 /// `name` without its `blk.<n>.` prefix, `.weight` suffix and any trailing
