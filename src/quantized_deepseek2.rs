@@ -1,12 +1,22 @@
-//! Pure-Rust quantized loader for the `deepseek2` GGUF architecture.
+//! Pure-Rust quantized loader for the `deepseek` and `deepseek2` GGUF
+//! architectures.
 //!
-//! Covers DeepSeek-V2, DeepSeek-V2-Lite, DeepSeek-V3 and **Kimi-K2** — every
-//! model llama.cpp labels `general.architecture = "deepseek2"`.  candle ships a
-//! *full-precision* `deepseek2` model but no quantized/GGUF one, and its gate
-//! only implements DeepSeek-V2 softmax routing; this module adds the GGUF path
-//! plus the DeepSeek-V3 / Kimi-K2 sigmoid-with-bias, group-limited routing.
+//! Covers DeepSeek-MoE (`deepseek`), DeepSeek-V2, DeepSeek-V2-Lite,
+//! DeepSeek-V2.5, DeepSeek-V3 / V3.1 / R1 and **Kimi-K2** — every model
+//! llama.cpp labels `general.architecture = "deepseek"` or `"deepseek2"`.
+//! candle ships a *full-precision* `deepseek2` model but no quantized/GGUF
+//! one, and its gate only implements DeepSeek-V2 softmax routing; this module
+//! adds the GGUF path plus the DeepSeek-V3 / Kimi-K2 sigmoid-with-bias,
+//! group-limited routing.
 //!
-//! Two things make this architecture unusual:
+//! The two architectures share the whole MoE stack (leading dense layers,
+//! fine-grained routed experts, always-on shared experts) and differ only in
+//! attention: `deepseek` (DeepSeek-MoE 16B, the V1 generation) uses plain
+//! GQA with full-width RoPE, `deepseek2` uses MLA.  Both run through one
+//! cached-attention kernel ([`cached_attention`]) over the same transposed
+//! KV-cache layout.
+//!
+//! Two things make the `deepseek2` architecture unusual:
 //!
 //! * **MLA (Multi-head Latent Attention).**  Q and KV are produced through
 //!   low-rank projections; only a small `qk_rope_head_dim` slice of each head
@@ -36,7 +46,10 @@ use candle_core::{DType, Device, IndexOp, Module, Result, Tensor, D};
 use candle_nn::ops::{sigmoid, softmax_last_dim};
 use candle_transformers::quantized_nn::RmsNorm;
 
+use crate::gguf_meta::Meta;
+use crate::moe::{topk_indices, topk_values};
 use crate::token_embedding::TokenEmbedding;
+use crate::yarn::YarnConfig;
 
 /// Expert gating (scoring) function.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,12 +60,18 @@ enum Gating {
     Sigmoid,
 }
 
-/// Parsed `deepseek2` hyper-parameters.
+/// Parsed `deepseek` / `deepseek2` hyper-parameters.
+///
+/// A `deepseek` (GQA) model reuses the MLA head-dim fields with no un-rotated
+/// slice: `qk_nope_head_dim = 0`, `qk_rope_head_dim = head_dim`, and
+/// `kv_lora_rank = 0` marks the absence of the latent projection.
 struct Config {
     n_layer: usize,
     n_head: usize,
+    /// KV heads (GQA); equal to `n_head` for MLA.
+    n_kv_head: usize,
     rms_eps: f64,
-    // MLA dims.
+    // MLA dims (`kv_lora_rank == 0` for GQA).
     q_lora_rank: Option<usize>,
     kv_lora_rank: usize,
     qk_nope_head_dim: usize,
@@ -61,6 +80,8 @@ struct Config {
     softmax_scale: f64,
     // RoPE.
     rope_theta: f32,
+    /// Linear RoPE scaling (`1 / rope.scaling.factor` for `"linear"`), else 1.
+    rope_freq_scale: f32,
     context_length: usize,
     yarn: Option<YarnConfig>,
     // FFN / MoE.
@@ -80,130 +101,124 @@ impl Config {
     fn q_head_dim(&self) -> usize {
         self.qk_nope_head_dim + self.qk_rope_head_dim
     }
-}
 
-struct YarnConfig {
-    factor: f32,
-    orig_context_length: usize,
-    /// `mscale_all_dim` recovered from `rope.scaling.yarn_log_multiplier`.
-    mscale_all_dim: f32,
-}
-
-// ─── Metadata helpers ───────────────────────────────────────────────────────
-
-struct Meta<'a>(&'a std::collections::HashMap<String, gguf_file::Value>);
-
-impl Meta<'_> {
-    fn u32(&self, key: &str) -> Result<u32> {
-        match self.0.get(key) {
-            Some(v) => v.to_u32(),
-            None => candle_core::bail!("deepseek2: missing GGUF metadata key `{key}`"),
-        }
-    }
-    fn u32_or(&self, key: &str, default: u32) -> u32 {
-        self.0.get(key).and_then(|v| v.to_u32().ok()).unwrap_or(default)
-    }
-    fn f32(&self, key: &str) -> Result<f32> {
-        match self.0.get(key) {
-            Some(v) => v.to_f32(),
-            None => candle_core::bail!("deepseek2: missing GGUF metadata key `{key}`"),
-        }
-    }
-    fn f32_or(&self, key: &str, default: f32) -> f32 {
-        self.0.get(key).and_then(|v| v.to_f32().ok()).unwrap_or(default)
-    }
-    fn bool_or(&self, key: &str, default: bool) -> bool {
-        self.0.get(key).and_then(|v| v.to_bool().ok()).unwrap_or(default)
-    }
-    fn string(&self, key: &str) -> Option<String> {
-        self.0.get(key).and_then(|v| v.to_string().ok().cloned())
+    /// Whether attention is MLA (`deepseek2`) rather than GQA (`deepseek`).
+    fn is_mla(&self) -> bool {
+        self.kv_lora_rank > 0
     }
 }
 
 impl Config {
-    fn from_metadata(md: &std::collections::HashMap<String, gguf_file::Value>) -> Result<Self> {
-        let m = Meta(md);
-        let a = "deepseek2";
-        let n_head = m.u32(&format!("{a}.attention.head_count"))? as usize;
-        let n_embd = m.u32(&format!("{a}.embedding_length"))? as usize;
-        let n_layer = m.u32(&format!("{a}.block_count"))? as usize;
-        let rms_eps = m.f32(&format!("{a}.attention.layer_norm_rms_epsilon"))? as f64;
+    /// Parse the hyper-parameters of a `deepseek` or `deepseek2` GGUF.
+    fn from_metadata(
+        md: &std::collections::HashMap<String, gguf_file::Value>,
+        arch: &str,
+    ) -> Result<Self> {
+        let m = Meta::new(md, arch);
+        let n_head = m.u32("attention.head_count")? as usize;
+        let n_embd = m.u32("embedding_length")? as usize;
+        let n_layer = m.u32("block_count")? as usize;
+        let rms_eps = m.f32("attention.layer_norm_rms_epsilon")? as f64;
+        let context_length = m.u32("context_length")? as usize;
+        if n_head == 0 {
+            candle_core::bail!("{arch}: attention.head_count must be positive");
+        }
+
+        // MLA advertises its latent rank (required for `deepseek2`);
+        // DeepSeek-MoE (`deepseek`) has none.
+        let kv_lora_rank = if arch == "deepseek2" {
+            m.u32("attention.kv_lora_rank")?
+        } else {
+            m.u32_or("attention.kv_lora_rank", 0)
+        } as usize;
+        let mla = kv_lora_rank > 0;
 
         // Head dims. `is_mla` (pre-split k_b/v_b) advertises key_length_mla;
         // otherwise fall back to key_length / value_length (default n_embd/n_head).
-        let key_length_mla = m.u32_or(&format!("{a}.attention.key_length_mla"), 0) as usize;
-        let value_length_mla = m.u32_or(&format!("{a}.attention.value_length_mla"), 0) as usize;
-        let is_mla = key_length_mla != 0 && value_length_mla != 0;
-        let n_embd_head_k = if is_mla {
+        let key_length_mla = m.u32_or("attention.key_length_mla", 0) as usize;
+        let value_length_mla = m.u32_or("attention.value_length_mla", 0) as usize;
+        let split_mla = key_length_mla != 0 && value_length_mla != 0;
+        let n_embd_head_k = if split_mla {
             key_length_mla
         } else {
-            m.u32_or(&format!("{a}.attention.key_length"), (n_embd / n_head) as u32) as usize
+            m.u32_or("attention.key_length", (n_embd / n_head) as u32) as usize
         };
-        let v_head_dim = if is_mla {
+        let v_head_dim = if split_mla {
             value_length_mla
         } else {
-            m.u32_or(&format!("{a}.attention.value_length"), (n_embd / n_head) as u32) as usize
+            m.u32_or("attention.value_length", (n_embd / n_head) as u32) as usize
         };
-        let qk_rope_head_dim =
-            m.u32_or(&format!("{a}.rope.dimension_count"), n_embd_head_k as u32) as usize;
+        let qk_rope_head_dim = m.u32_or("rope.dimension_count", n_embd_head_k as u32) as usize;
         let qk_nope_head_dim = n_embd_head_k.saturating_sub(qk_rope_head_dim);
 
-        let q_lora_rank = m
-            .0
-            .get(&format!("{a}.attention.q_lora_rank"))
-            .and_then(|v| v.to_u32().ok())
-            .map(|v| v as usize)
-            .filter(|&v| v > 0);
-        let kv_lora_rank = m.u32(&format!("{a}.attention.kv_lora_rank"))? as usize;
-
-        let rope_theta = m.f32_or(&format!("{a}.rope.freq_base"), 10_000.0);
-        let context_length = m.u32(&format!("{a}.context_length"))? as usize;
-
-        // YaRN long-context scaling (optional).
-        let scaling_type = m.string(&format!("{a}.rope.scaling.type"));
-        let yarn = if scaling_type.as_deref() == Some("yarn") {
-            let factor = m.f32_or(&format!("{a}.rope.scaling.factor"), 1.0);
-            let orig_context_length = m.u32_or(
-                &format!("{a}.rope.scaling.original_context_length"),
-                context_length as u32,
-            ) as usize;
-            // llama.cpp stores 0.1 * mscale_all_dim and divides it back out.
-            let log_mul = m.f32_or(&format!("{a}.rope.scaling.yarn_log_multiplier"), 0.0);
-            Some(YarnConfig {
-                factor,
-                orig_context_length,
-                mscale_all_dim: log_mul / 0.1,
-            })
+        let n_kv_head = if mla {
+            n_head
         } else {
-            None
+            m.u32_or("attention.head_count_kv", n_head as u32) as usize
+        };
+        if !mla {
+            if n_kv_head == 0 || !n_head.is_multiple_of(n_kv_head) {
+                candle_core::bail!(
+                    "{arch}: head_count {n_head} must be a multiple of head_count_kv {n_kv_head}"
+                );
+            }
+            if qk_nope_head_dim != 0 {
+                candle_core::bail!(
+                    "{arch}: partial rotary embeddings (rope.dimension_count {qk_rope_head_dim} < \
+                     head dim {n_embd_head_k}) are not supported"
+                );
+            }
+        }
+        if qk_rope_head_dim == 0 || !qk_rope_head_dim.is_multiple_of(2) {
+            candle_core::bail!(
+                "{arch}: invalid rotary dimension {qk_rope_head_dim} (must be a positive even number)"
+            );
+        }
+
+        let q_lora_rank = m.u32_opt("attention.q_lora_rank").map(|v| v as usize).filter(|&v| v > 0);
+
+        let rope_theta = m.f32_or("rope.freq_base", 10_000.0);
+        // YaRN long-context scaling (optional), or plain linear interpolation.
+        let yarn = YarnConfig::from_meta(&m, 1.0, context_length);
+        let rope_freq_scale = match m.string("rope.scaling.type").as_deref() {
+            Some("linear") => {
+                let factor = m.f32_or("rope.scaling.factor", 1.0);
+                if factor > 0.0 { 1.0 / factor } else { 1.0 }
+            }
+            _ => 1.0,
         };
 
         // Softmax scale: 1/sqrt(q_head_dim), YaRN-corrected by mscale².
         let q_head_dim = qk_nope_head_dim + qk_rope_head_dim;
         let mut softmax_scale = 1.0f64 / (q_head_dim as f64).sqrt();
         if let Some(y) = &yarn {
-            let mscale = yarn_get_mscale(y.factor, y.mscale_all_dim) as f64;
+            let mscale = y.mscale() as f64;
             softmax_scale *= mscale * mscale;
         }
 
-        let leading_dense = m.u32_or(&format!("{a}.leading_dense_block_count"), 0) as usize;
-        let n_expert = m.u32_or(&format!("{a}.expert_count"), 0) as usize;
-        let n_expert_used = m.u32_or(&format!("{a}.expert_used_count"), 0) as usize;
-        let n_expert_shared = m.u32_or(&format!("{a}.expert_shared_count"), 0) as usize;
-        let expert_weights_scale =
-            m.f32_or(&format!("{a}.expert_weights_scale"), 0.0) as f64;
-        let expert_weights_norm = m.bool_or(&format!("{a}.expert_weights_norm"), false);
-        // Gating: 1=softmax, 2=sigmoid. Absent → softmax (DeepSeek-V2).
-        let gating = match m.u32_or(&format!("{a}.expert_gating_func"), 1) {
+        let leading_dense = m.u32_or("leading_dense_block_count", 0) as usize;
+        let n_expert = m.u32_or("expert_count", 0) as usize;
+        let n_expert_used = m.u32_or("expert_used_count", 0) as usize;
+        let n_expert_shared = m.u32_or("expert_shared_count", 0) as usize;
+        let expert_weights_scale = m.f32_or("expert_weights_scale", 0.0) as f64;
+        let expert_weights_norm = m.bool_or("expert_weights_norm", false);
+        // Gating: 1=softmax, 2=sigmoid. Absent → softmax (DeepSeek-MoE / V2).
+        let gating = match m.u32_or("expert_gating_func", 1) {
             2 => Gating::Sigmoid,
             _ => Gating::Softmax,
         };
-        let n_group = m.u32_or(&format!("{a}.expert_group_count"), 0) as usize;
-        let topk_group = m.u32_or(&format!("{a}.expert_group_used_count"), 0) as usize;
+        let n_group = m.u32_or("expert_group_count", 0) as usize;
+        let topk_group = m.u32_or("expert_group_used_count", 0) as usize;
+        if n_expert > 0 && (n_expert_used == 0 || n_expert_used > n_expert) {
+            candle_core::bail!(
+                "{arch}: expert_used_count {n_expert_used} must be in 1..=expert_count {n_expert}"
+            );
+        }
 
         Ok(Self {
             n_layer,
             n_head,
+            n_kv_head,
             rms_eps,
             q_lora_rank,
             kv_lora_rank,
@@ -212,6 +227,7 @@ impl Config {
             v_head_dim,
             softmax_scale,
             rope_theta,
+            rope_freq_scale,
             context_length,
             yarn,
             leading_dense,
@@ -224,16 +240,6 @@ impl Config {
             n_group,
             topk_group,
         })
-    }
-}
-
-/// YaRN attention/temperature scale: `0.1 * mscale * ln(scale) + 1` for
-/// `scale > 1`, else 1.
-fn yarn_get_mscale(scale: f32, mscale: f32) -> f32 {
-    if scale <= 1.0 {
-        1.0
-    } else {
-        0.1 * mscale * scale.ln() + 1.0
     }
 }
 
@@ -253,39 +259,13 @@ impl RotaryEmbedding {
             None => {
                 let inv_freq: Vec<f32> = (0..dim)
                     .step_by(2)
-                    .map(|i| 1f32 / theta.powf(i as f32 / dim as f32))
+                    .map(|i| cfg.rope_freq_scale / theta.powf(i as f32 / dim as f32))
                     .collect();
                 Self::from_inv_freq(inv_freq, max_seq, 1.0, dev)
             }
-            Some(y) => {
-                // Interpolated vs extrapolated frequencies blended by a ramp
-                // over the YaRN correction range (see DeepSeek modeling code).
-                let half = dim / 2;
-                let freq_extra: Vec<f32> = (0..dim)
-                    .step_by(2)
-                    .map(|i| 1f32 / theta.powf(i as f32 / dim as f32))
-                    .collect();
-                let freq_inter: Vec<f32> = (0..dim)
-                    .step_by(2)
-                    .map(|i| 1f32 / (y.factor * theta.powf(i as f32 / dim as f32)))
-                    .collect();
-                let (low, high) = yarn_correction_range(
-                    32.0,
-                    1.0,
-                    dim,
-                    theta,
-                    y.orig_context_length,
-                );
-                let ramp = yarn_linear_ramp(low, high, half);
-                let inv_freq: Vec<f32> = (0..half)
-                    .map(|i| {
-                        let mask = 1.0 - ramp[i];
-                        freq_inter[i] * (1.0 - mask) + freq_extra[i] * mask
-                    })
-                    .collect();
-                let mscale = yarn_get_mscale(y.factor, y.mscale_all_dim);
-                Self::from_inv_freq(inv_freq, max_seq, mscale, dev)
-            }
+            // Interpolated vs extrapolated frequencies blended by a ramp over
+            // the YaRN correction range (see DeepSeek modeling code).
+            Some(y) => Self::from_inv_freq(crate::yarn::inv_freq(dim, theta, y), max_seq, y.mscale(), dev),
         }
     }
 
@@ -313,32 +293,6 @@ impl RotaryEmbedding {
     }
 }
 
-fn yarn_find_correction_dim(num_rot: f32, dim: usize, base: f32, max_pos: usize) -> f32 {
-    (dim as f32 * (max_pos as f32 / (num_rot * 2.0 * std::f32::consts::PI)).ln())
-        / (2.0 * base.ln())
-}
-
-fn yarn_correction_range(
-    low_rot: f32,
-    high_rot: f32,
-    dim: usize,
-    base: f32,
-    max_pos: usize,
-) -> (f32, f32) {
-    let low = yarn_find_correction_dim(low_rot, dim, base, max_pos).floor();
-    let high = yarn_find_correction_dim(high_rot, dim, base, max_pos).ceil();
-    (low.max(0.0), high.min(dim as f32 - 1.0))
-}
-
-fn yarn_linear_ramp(min: f32, mut max: f32, dim: usize) -> Vec<f32> {
-    if (min - max).abs() < f32::EPSILON {
-        max += 0.001;
-    }
-    (0..dim)
-        .map(|i| (((i as f32) - min) / (max - min)).clamp(0.0, 1.0))
-        .collect()
-}
-
 // ─── Linear helpers ─────────────────────────────────────────────────────────
 
 /// SwiGLU MLP over quantized weights (dense layers and shared experts).
@@ -352,11 +306,17 @@ struct Mlp {
     prefetch: Option<crate::residency::ExpertHandles>,
 }
 
+/// `down(silu(gate(x)) * up(x))` — the one SwiGLU body shared by dense
+/// layers, shared experts and both forms of a routed expert.
+fn swiglu(gate: &QMatMul, up: &QMatMul, down: &QMatMul, xs: &Tensor) -> Result<Tensor> {
+    let gate = candle_nn::ops::silu(&gate.forward(xs)?)?;
+    let up = up.forward(xs)?;
+    down.forward(&(gate * up)?)
+}
+
 impl Mlp {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let gate = candle_nn::ops::silu(&self.gate.forward(xs)?)?;
-        let up = self.up.forward(xs)?;
-        self.down.forward(&(gate * up)?)
+        swiglu(&self.gate, &self.up, &self.down, xs)
     }
 }
 
@@ -381,9 +341,145 @@ impl QProj {
     }
 }
 
-// ─── Attention (MLA, unabsorbed / full-MHA form) ─────────────────────────────
+// ─── Attention ───────────────────────────────────────────────────────────────
 
-struct Attention {
+/// One layer's KV cache, kept transposed — `(k [b, n_kv, dk, seq], v [b,
+/// n_kv, dv, seq])` — and appended along dim 3.  Owned by the session, not
+/// the (shared) weights (see [`ModelWeights::new_session`]).
+///
+/// MLA caches the *reconstructed* per-head K/V rather than the compressed
+/// latent.  The latent is only `kv_lora_rank + qk_rope` ≈ 576 elems/token vs
+/// `n_head·(qk_nope + v_head_dim)` ≈ 40,960 for the full per-head K/V, so
+/// caching it would save ~70x memory — but reconstructing the full K/V from
+/// it every forward is O(seq) work per step, which makes decode degrade
+/// linearly with context length.  Instead K/V is reconstructed for the *new*
+/// tokens only (a linear map over the latent) and appended: decode stays
+/// O(1) in reconstruction, at the cost of caching the ~8x larger per-head
+/// form (still far below a plain MHA model, since MLA keeps Q and the latent
+/// low-rank).
+type KvCache = crate::moe::KvCache;
+
+/// Append this step's keys/values to `kv_cache` and attend `q` over the whole
+/// cached context — the kernel shared by MLA and GQA.
+///
+/// * `q`: `[b, n_head, seq, dk]`
+/// * `k_new`: `[b, n_kv, dk, seq]`, `v_new`: `[b, n_kv, dv, seq]` (transposed,
+///   matching the cache layout)
+///
+/// `n_head` must be a multiple of `n_kv`; query head `h` reads KV head
+/// `h / (n_head / n_kv)` (MLA is the `n_kv == n_head` case).  Returns the
+/// attention context `[b, seq, n_head * dv]`, ready for the output projection.
+///
+/// The cache lives transposed so the matmuls run directly on it: `q · kᵀ`
+/// becomes `q · k_cache` and `probs · v` becomes `v_cache · probsᵀ`.  A decode
+/// step then copies only the two append cats (the accumulated context), never
+/// an extra transpose of it.  Grouped query heads are folded into the row
+/// dimension of their KV head instead of repeating K/V per query head.
+fn cached_attention(
+    kv_cache: &mut KvCache,
+    q: &Tensor,
+    k_new: Tensor,
+    v_new: Tensor,
+    mask: Option<&Tensor>,
+    softmax_scale: f64,
+) -> Result<Tensor> {
+    let (b, n_head, seq_len, dk) = q.dims4()?;
+    let n_kv = k_new.dim(1)?;
+    let dv = v_new.dim(2)?;
+    let rep = n_head / n_kv;
+
+    let (k_cache, v_cache) = match &*kv_cache {
+        None => (k_new, v_new),
+        Some((kc, vc)) => (
+            Tensor::cat(&[kc, &k_new], 3)?.contiguous()?,
+            Tensor::cat(&[vc, &v_new], 3)?.contiguous()?,
+        ),
+    };
+    *kv_cache = Some((k_cache.clone(), v_cache.clone()));
+    let seq_total = k_cache.dim(3)?;
+
+    // Scaled dot-product attention over the whole cached context.
+    let q = q.contiguous()?.reshape((b, n_kv, rep * seq_len, dk))?;
+    let scores = (q.matmul(&k_cache)? * softmax_scale)?.reshape((b, n_head, seq_len, seq_total))?;
+    let scores = match mask {
+        Some(m) => scores.broadcast_add(m)?,
+        None => scores,
+    };
+    let probs = softmax_last_dim(&scores)?.reshape((b, n_kv, rep * seq_len, seq_total))?;
+    let ctx = v_cache.matmul(&probs.transpose(2, 3)?.contiguous()?)?; // [b, n_kv, dv, rep*seq]
+    ctx.reshape((b, n_kv, dv, rep, seq_len))?
+        .permute((0, 4, 1, 3, 2))? // [b, seq, n_kv, rep, dv]
+        .contiguous()?
+        .reshape((b, seq_len, n_head * dv))
+}
+
+/// A layer's attention block: MLA (`deepseek2`) or GQA (`deepseek`).
+enum Attention {
+    Mla(MlaAttention),
+    Gqa(GqaAttention),
+}
+
+impl Attention {
+    fn forward(
+        &self,
+        kv_cache: &mut KvCache,
+        xs: &Tensor,
+        mask: Option<&Tensor>,
+        offset: usize,
+    ) -> Result<Tensor> {
+        match self {
+            Self::Mla(a) => a.forward(kv_cache, xs, mask, offset),
+            Self::Gqa(a) => a.forward(kv_cache, xs, mask, offset),
+        }
+    }
+}
+
+/// Grouped-query attention with full-width interleaved RoPE (DeepSeek-MoE,
+/// llama.cpp `LLM_ARCH_DEEPSEEK`).
+struct GqaAttention {
+    q: QMatMul,
+    k: QMatMul,
+    v: QMatMul,
+    o_proj: QMatMul,
+    rotary: Arc<RotaryEmbedding>,
+    n_head: usize,
+    n_kv_head: usize,
+    head_dim: usize,
+    v_head_dim: usize,
+    softmax_scale: f64,
+}
+
+impl GqaAttention {
+    fn forward(
+        &self,
+        kv_cache: &mut KvCache,
+        xs: &Tensor,
+        mask: Option<&Tensor>,
+        offset: usize,
+    ) -> Result<Tensor> {
+        let (b, seq_len, _) = xs.dims3()?;
+        // Project and split into heads: [b, n, seq, d].
+        let heads = |w: &QMatMul, n: usize, d: usize| -> Result<Tensor> {
+            w.forward(xs)?.reshape((b, seq_len, n, d))?.transpose(1, 2)
+        };
+        let q = heads(&self.q, self.n_head, self.head_dim)?;
+        let k = heads(&self.k, self.n_kv_head, self.head_dim)?;
+        let v = heads(&self.v, self.n_kv_head, self.v_head_dim)?;
+        let (q, k) = self.rotary.apply(&q, &k, offset)?;
+        let ctx = cached_attention(
+            kv_cache,
+            &q,
+            k.transpose(2, 3)?.contiguous()?,
+            v.transpose(2, 3)?.contiguous()?,
+            mask,
+            self.softmax_scale,
+        )?;
+        self.o_proj.forward(&ctx)
+    }
+}
+
+/// Multi-head latent attention in the unabsorbed (full-MHA) form.
+struct MlaAttention {
     q: QProj,
     kv_a_mqa: QMatMul,
     kv_a_norm: RmsNorm,
@@ -398,29 +494,7 @@ struct Attention {
     v_head_dim: usize,
     q_head_dim: usize,
     softmax_scale: f64,
-    /// MLA cache: reconstructed per-head K/V kept transposed —
-    /// `(k [b, n_head, q_head_dim, seq], v [b, n_head, v_head_dim, seq])` —
-    /// and appended incrementally.
-    ///
-    /// The compressed latent is only `kv_lora_rank + qk_rope` ≈ 576 elems/token
-    /// vs `n_head·(qk_nope + v_head_dim)` ≈ 40,960 for the full per-head K/V, so
-    /// caching the latent saves ~70x memory — but reconstructing the full K/V
-    /// from it every forward is O(seq) work per step, which makes decode
-    /// degrade linearly with context length.  Instead we reconstruct K/V for
-    /// the *new* tokens only (a linear map over the latent) and append the
-    /// per-head result to the cache: decode stays O(1) in reconstruction, at
-    /// the cost of caching the ~8x larger per-head form (still far below a
-    /// plain MHA model, since MLA keeps Q and the latent low-rank).
-    ///
-    /// The cache itself is per session, not per weight set — see
-    /// [`KvCache`] and [`ModelWeights::new_session`].
-    _kv_layout: (),
 }
-
-/// One layer's MLA cache: `(k [b, n_head, q_head_dim, seq], v [b, n_head,
-/// v_head_dim, seq])`, appended along dim 3.  Owned by the session, not
-/// the (shared) weights.
-type KvCache = crate::moe::KvCache;
 
 /// The KV up-projection, either a native combined weight or one reconstructed
 /// from the pre-split MLA `attn_k_b`/`attn_v_b` tensors.
@@ -439,7 +513,7 @@ impl KvB {
     }
 }
 
-impl Attention {
+impl MlaAttention {
     fn forward(
         &self,
         kv_cache: &mut KvCache,
@@ -470,57 +544,33 @@ impl Attention {
             .transpose(1, 2)?;
 
         // RoPE the *_pe slices, then reassemble Q (nope ‖ rope).  The single-head
-        // key is RoPE'd here too; the cached copy below is already post-RoPE.
+        // key is RoPE'd here too; the cached copy is already post-RoPE.
         let (q_pe, k_pe) = self.rotary.apply(&q_pe, &k_pe, offset)?;
         let q = Tensor::cat(&[&q_nope.contiguous()?, &q_pe.contiguous()?], D::Minus1)?;
 
-        // Reconstruct per-head K/V for the *new* tokens only and append it to
-        // the cache.  kv_a_norm is a per-row norm and kv_b a linear map, so
-        // applying them to this step's latent is bit-identical to the old
-        // whole-cache reconstruction — just O(seq_len) instead of O(seq_total)
-        // per step, which is what made decode slow down with context length.
+        // Reconstruct per-head K/V for the *new* tokens only (see [`KvCache`]).
+        // kv_a_norm is a per-row norm and kv_b a linear map, so applying them
+        // to this step's latent is bit-identical to a whole-cache
+        // reconstruction — just O(seq_len) instead of O(seq_total) per step.
         let kv = self
             .kv_b
             .forward(&self.kv_a_norm.forward(&kv_cmpr)?)?
             .reshape((b, seq_len, self.n_head, self.qk_nope + self.v_head_dim))?
             .transpose(1, 2)?; // [b, n_head, seq_len, qk_nope + v_head_dim]
         let k_nope = kv.narrow(D::Minus1, 0, self.qk_nope)?; // [b, n_head, seq_len, qk_nope]
-        let v = kv
-            .narrow(D::Minus1, self.qk_nope, self.v_head_dim)?
-            .contiguous()?; // [b, n_head, seq_len, v_head_dim]
+        let v = kv.narrow(D::Minus1, self.qk_nope, self.v_head_dim)?; // [b, n_head, seq_len, v_head_dim]
         // The single-head RoPE'd key is shared (MQA-style) across query heads.
         let k_pe = k_pe.broadcast_as((b, self.n_head, seq_len, self.qk_rope))?;
         let k_new = Tensor::cat(&[&k_nope.contiguous()?, &k_pe], D::Minus1)?; // [b, n_head, seq_len, q_head_dim]
 
-        // The cache lives transposed — [b, n_head, dim, seq] — so the attention
-        // matmuls below run directly on it: `q · kᵀ` becomes `q · k_cache` and
-        // `probs · v` becomes `v_cache · probsᵀ`.  A decode step then copies
-        // only the two append cats (the accumulated context), never an extra
-        // transpose of it.
-        let k_new = k_new.transpose(2, 3)?.contiguous()?; // [b, n_head, q_head_dim, seq_len]
-        let v_new = v.transpose(2, 3)?.contiguous()?; // [b, n_head, v_head_dim, seq_len]
-        let (k_cache, v_cache) = match &*kv_cache {
-            None => (k_new, v_new),
-            Some((kc, vc)) => (
-                Tensor::cat(&[kc, &k_new], 3)?.contiguous()?,
-                Tensor::cat(&[vc, &v_new], 3)?.contiguous()?,
-            ),
-        };
-        *kv_cache = Some((k_cache.clone(), v_cache.clone()));
-
-        // Scaled dot-product attention over the whole cached context.
-        let scores = (q.contiguous()?.matmul(&k_cache)? * self.softmax_scale)?; // [b, n_head, seq_len, seq_total]
-        let scores = match mask {
-            Some(m) => scores.broadcast_add(m)?,
-            None => scores,
-        };
-        let probs = softmax_last_dim(&scores)?;
-        let ctx = v_cache.matmul(&probs.transpose(2, 3)?.contiguous()?)?; // [b, n_head, v_head_dim, seq_len]
-        let ctx = ctx
-            .transpose(1, 3)?
-            .transpose(2, 3)?
-            .contiguous()?
-            .reshape((b, seq_len, self.n_head * self.v_head_dim))?;
+        let ctx = cached_attention(
+            kv_cache,
+            &q,
+            k_new.transpose(2, 3)?.contiguous()?,
+            v.transpose(2, 3)?.contiguous()?,
+            mask,
+            self.softmax_scale,
+        )?;
         self.o_proj.forward(&ctx)
     }
 }
@@ -546,9 +596,7 @@ impl crate::residency::DeviceExpertSlot for DeviceExpert {
 
 impl DeviceExpert {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let gate = candle_nn::ops::silu(&self.gate.forward(xs)?)?;
-        let up = self.up.forward(xs)?;
-        self.down.forward(&(gate * up)?)
+        swiglu(&self.gate, &self.up, &self.down, xs)
     }
 }
 
@@ -565,6 +613,8 @@ struct Moe {
     weights_scale: f64,
     /// This MoE block's layer index (for the residency key).
     layer: u32,
+    /// `general.architecture`, for error context.
+    arch: &'static str,
     /// Device the routed-expert weights live on.  The model device when the
     /// experts were uploaded; the CPU when the pool stays in host RAM on an
     /// accelerator (see [`crate::placement::ExpertPlacement`]).  `dispatch`
@@ -687,7 +737,7 @@ impl Moe {
         };
         if n_tokens == 1 {
             crate::moe::dispatch_decode_with(
-                "deepseek2",
+                self.arch,
                 &self.experts,
                 &self.expert_device,
                 x2,
@@ -698,7 +748,7 @@ impl Moe {
             )
         } else {
             crate::moe::dispatch_prefill_with(
-                "deepseek2",
+                self.arch,
                 &self.experts,
                 &self.expert_device,
                 x2,
@@ -709,33 +759,7 @@ impl Moe {
                 fwd,
             )
         }
-
     }
-
-    /// Run one routed expert over `x`, preferring the device-resident form on a
-    /// `DeviceResidency` hit and the host `Mlp` on a miss (#62 partition).  With
-    /// no residency this is exactly `self.experts[e].forward(x)`.
-    fn expert_forward(&self, e: usize, x: &Tensor) -> Result<Tensor> {
-        if let Some(res) = &self.residency {
-            if let Some(dev) = res.lookup(self.layer, e as u32) {
-                return dev.forward(x);
-            }
-        }
-        self.experts[e].forward(x)
-    }
-}
-
-/// Indices of the top-`k` values along the last dim (descending), as u32.
-fn topk_indices(t: &Tensor, k: usize) -> Result<Tensor> {
-    t.arg_sort_last_dim(false)?
-        .narrow(D::Minus1, 0, k)?
-        .contiguous()
-}
-
-/// Top-`k` values along the last dim (descending).
-fn topk_values(t: &Tensor, k: usize) -> Result<Tensor> {
-    let idx = topk_indices(t, k)?;
-    t.gather(&idx, D::Minus1)
 }
 
 // ─── Layer + model ───────────────────────────────────────────────────────────
@@ -780,7 +804,7 @@ struct Shared {
     n_expert: usize,
 }
 
-/// A quantized DeepSeek-V2/V3/Kimi-K2 model loaded from GGUF.
+/// A quantized DeepSeek-MoE / V2 / V3 / Kimi-K2 model loaded from GGUF.
 pub struct ModelWeights {
     shared: Arc<Shared>,
     /// Per-layer KV cache — the only per-session tensor state.
@@ -812,6 +836,8 @@ struct Reader<R: Read + Seek> {
     /// Bytes of the bounded VRAM expert cache (#62) to build for each MoE
     /// block (`None` / `Some(0)` disables); `load_moe` reads it.
     device_expert_cache_bytes: Option<u64>,
+    /// `general.architecture` (`deepseek` or `deepseek2`), for error context.
+    arch: &'static str,
 }
 
 impl<R: Read + Seek> Reader<R> {
@@ -846,18 +872,65 @@ impl<R: Read + Seek> Reader<R> {
     fn has(&self, name: &str) -> bool {
         self.ct.tensor_infos.contains_key(name)
     }
-    fn mlp(&mut self, prefix: &str) -> Result<Mlp> {
+    /// A dense SwiGLU block: `{p}.ffn_{gate,up,down}{suffix}.weight`
+    /// (`suffix` is `""` for a dense layer, `"_shexp"` for shared experts).
+    fn mlp(&mut self, p: &str, suffix: &str) -> Result<Mlp> {
         Ok(Mlp {
-            gate: self.qmatmul(&format!("{prefix}_gate.weight"))?,
-            up: self.qmatmul(&format!("{prefix}_up.weight"))?,
-            down: self.qmatmul(&format!("{prefix}_down.weight"))?,
+            gate: self.qmatmul(&format!("{p}.ffn_gate{suffix}.weight"))?,
+            up: self.qmatmul(&format!("{p}.ffn_up{suffix}.weight"))?,
+            down: self.qmatmul(&format!("{p}.ffn_down{suffix}.weight"))?,
             prefetch: None,
         })
+    }
+
+    /// Layer `p`'s attention block, MLA or GQA per `cfg`.
+    fn attention(&mut self, p: &str, cfg: &Config, rotary: &Arc<RotaryEmbedding>) -> Result<Attention> {
+        let o_proj = self.qmatmul(&format!("{p}.attn_output.weight"))?;
+        if !cfg.is_mla() {
+            return Ok(Attention::Gqa(GqaAttention {
+                q: self.qmatmul(&format!("{p}.attn_q.weight"))?,
+                k: self.qmatmul(&format!("{p}.attn_k.weight"))?,
+                v: self.qmatmul(&format!("{p}.attn_v.weight"))?,
+                o_proj,
+                rotary: rotary.clone(),
+                n_head: cfg.n_head,
+                n_kv_head: cfg.n_kv_head,
+                head_dim: cfg.q_head_dim(),
+                v_head_dim: cfg.v_head_dim,
+                softmax_scale: cfg.softmax_scale,
+            }));
+        }
+        // Q projection: LoRA (V2-full/V3/K2) or plain (V2-Lite).
+        let q = if cfg.q_lora_rank.is_some() {
+            QProj::Lora {
+                a: self.qmatmul(&format!("{p}.attn_q_a.weight"))?,
+                norm: self.rms_norm(&format!("{p}.attn_q_a_norm.weight"), cfg.rms_eps)?,
+                b: self.qmatmul(&format!("{p}.attn_q_b.weight"))?,
+            }
+        } else {
+            QProj::Plain(self.qmatmul(&format!("{p}.attn_q.weight"))?)
+        };
+        Ok(Attention::Mla(MlaAttention {
+            q,
+            kv_a_mqa: self.qmatmul(&format!("{p}.attn_kv_a_mqa.weight"))?,
+            kv_a_norm: self.rms_norm(&format!("{p}.attn_kv_a_norm.weight"), cfg.rms_eps)?,
+            kv_b: load_kv_b(self, p, cfg)?,
+            o_proj,
+            rotary: rotary.clone(),
+            n_head: cfg.n_head,
+            kv_lora_rank: cfg.kv_lora_rank,
+            qk_nope: cfg.qk_nope_head_dim,
+            qk_rope: cfg.qk_rope_head_dim,
+            v_head_dim: cfg.v_head_dim,
+            q_head_dim: cfg.q_head_dim(),
+            softmax_scale: cfg.softmax_scale,
+        }))
     }
 }
 
 impl ModelWeights {
-    /// Load a `deepseek2` GGUF (DeepSeek-V2/V3, Kimi-K2).
+    /// Load a `deepseek` (DeepSeek-MoE) or `deepseek2` (DeepSeek-V2/V3,
+    /// Kimi-K2) GGUF.
     pub fn from_gguf<R: Read + Seek>(
         ct: gguf_file::Content,
         reader: &mut R,
@@ -903,12 +976,16 @@ impl ModelWeights {
         mmap: Option<std::sync::Arc<memmap2::Mmap>>,
         device_expert_cache_bytes: Option<u64>,
     ) -> Result<Self> {
+        let arch = match crate::model::Architecture::arch_name(&ct.metadata).as_deref() {
+            Some("deepseek") => "deepseek",
+            _ => "deepseek2",
+        };
         if !expert_device.is_cpu() && !expert_device.same_device(device) {
             candle_core::bail!(
-                "deepseek2: routed experts must live on the model device or the CPU, not {expert_device:?}"
+                "{arch}: routed experts must live on the model device or the CPU, not {expert_device:?}"
             );
         }
-        let cfg = Config::from_metadata(&ct.metadata)?;
+        let cfg = Config::from_metadata(&ct.metadata, arch)?;
         // The Content owns metadata; move it into our reader together with the
         // underlying file handle (borrowed for the lifetime of the load).
         let mut rd = Reader {
@@ -918,6 +995,7 @@ impl ModelWeights {
             expert_device: expert_device.clone(),
             mmap,
             device_expert_cache_bytes,
+            arch,
         };
 
         // Kept quantized: dequantizing the table to f32 costs vocab × hidden
@@ -938,43 +1016,12 @@ impl ModelWeights {
             let attn_norm = rd.rms_norm(&format!("{p}.attn_norm.weight"), cfg.rms_eps)?;
             let ffn_norm = rd.rms_norm(&format!("{p}.ffn_norm.weight"), cfg.rms_eps)?;
 
-            // Q projection: LoRA (V2-full/V3/K2) or plain (V2-Lite).
-            let q = if cfg.q_lora_rank.is_some() {
-                QProj::Lora {
-                    a: rd.qmatmul(&format!("{p}.attn_q_a.weight"))?,
-                    norm: rd.rms_norm(&format!("{p}.attn_q_a_norm.weight"), cfg.rms_eps)?,
-                    b: rd.qmatmul(&format!("{p}.attn_q_b.weight"))?,
-                }
-            } else {
-                QProj::Plain(rd.qmatmul(&format!("{p}.attn_q.weight"))?)
-            };
-
-            let kv_a_mqa = rd.qmatmul(&format!("{p}.attn_kv_a_mqa.weight"))?;
-            let kv_a_norm = rd.rms_norm(&format!("{p}.attn_kv_a_norm.weight"), cfg.rms_eps)?;
-            let kv_b = load_kv_b(&mut rd, &p, &cfg)?;
-            let o_proj = rd.qmatmul(&format!("{p}.attn_output.weight"))?;
-
-            let attn = Attention {
-                q,
-                kv_a_mqa,
-                kv_a_norm,
-                kv_b,
-                o_proj,
-                rotary: rotary.clone(),
-                n_head: cfg.n_head,
-                kv_lora_rank: cfg.kv_lora_rank,
-                qk_nope: cfg.qk_nope_head_dim,
-                qk_rope: cfg.qk_rope_head_dim,
-                v_head_dim: cfg.v_head_dim,
-                q_head_dim: cfg.q_head_dim(),
-                softmax_scale: cfg.softmax_scale,
-                _kv_layout: (),
-            };
+            let attn = rd.attention(&p, &cfg, &rotary)?;
 
             let ffn = if cfg.n_expert > 0 && i >= cfg.leading_dense {
                 FeedForward::Moe(load_moe(&mut rd, &p, &cfg)?)
             } else {
-                FeedForward::Dense(rd.mlp(&format!("{p}.ffn"))?)
+                FeedForward::Dense(rd.mlp(&p, "")?)
             };
 
             layers.push(Layer {
@@ -1284,12 +1331,7 @@ fn load_moe<R: Read + Seek>(rd: &mut Reader<R>, p: &str, cfg: &Config) -> Result
         .collect();
 
     let shared = if cfg.n_expert_shared > 0 {
-        Some(Mlp {
-            gate: rd.qmatmul(&format!("{p}.ffn_gate_shexp.weight"))?,
-            up: rd.qmatmul(&format!("{p}.ffn_up_shexp.weight"))?,
-            down: rd.qmatmul(&format!("{p}.ffn_down_shexp.weight"))?,
-            prefetch: None,
-        })
+        Some(rd.mlp(p, "_shexp")?)
     } else {
         None
     };
@@ -1363,6 +1405,7 @@ fn load_moe<R: Read + Seek>(rd: &mut Reader<R>, p: &str, cfg: &Config) -> Result
         weights_norm: cfg.expert_weights_norm,
         weights_scale: cfg.expert_weights_scale,
         layer,
+        arch: rd.arch,
         expert_device: rd.expert_device.clone(),
         residency,
     })
@@ -1383,7 +1426,7 @@ fn split_experts<R: Read + Seek>(
     name: &str,
     n_expert: usize,
 ) -> Result<Vec<ExpertWeight>> {
-    let et = crate::moe::ExpertTensor::lookup(&rd.ct, "deepseek2", name, n_expert)?;
+    let et = crate::moe::ExpertTensor::lookup(&rd.ct, rd.arch, name, n_expert)?;
     let host_experts = rd.expert_device.is_cpu();
     let uploaded = |qt: QTensor| -> Result<ExpertWeight> {
         Ok(ExpertWeight {
@@ -1423,7 +1466,7 @@ fn split_experts<R: Read + Seek>(
     }
 
     // No mapping (streamed load) or a tensor that cannot be sliced.
-    et.read_and_split(&rd.ct, &mut rd.reader, "deepseek2", &rd.expert_device)?
+    et.read_and_split(&rd.ct, &mut rd.reader, rd.arch, &rd.expert_device)?
         .into_iter()
         .map(uploaded)
         .collect()
@@ -1492,6 +1535,7 @@ mod tests {
         let cfg = Config {
             n_layer: 1,
             n_head: w.nh,
+            n_kv_head: w.nh,
             rms_eps: 1e-5,
             q_lora_rank: None,
             kv_lora_rank: w.lkv,
@@ -1500,6 +1544,7 @@ mod tests {
             v_head_dim: w.vh,
             softmax_scale: 1.0 / (w.qd as f64).sqrt(),
             rope_theta: 10_000.0,
+            rope_freq_scale: 1.0,
             context_length: 4096,
             yarn: None,
             leading_dense: 0,
@@ -1512,7 +1557,7 @@ mod tests {
             n_group: 1,
             topk_group: 1,
         };
-        Ok(Attention {
+        Ok(Attention::Mla(MlaAttention {
             q: QProj::Plain(lin(w.nh * w.qd, w.h, &w.q)),
             kv_a_mqa: lin(w.lkv + w.r, w.h, &w.kv_a),
             kv_a_norm: norm,
@@ -1526,8 +1571,7 @@ mod tests {
             v_head_dim: w.vh,
             q_head_dim: w.qd,
             softmax_scale: cfg.softmax_scale,
-            _kv_layout: (),
-        })
+        }))
     }
 
     /// The cache must hold the reconstructed per-head K/V (appended
@@ -1607,6 +1651,70 @@ mod tests {
         Ok(())
     }
 
+    /// Grouped attention must equal the textbook form: K/V repeated per query
+    /// head, softmax(q·kᵀ·scale + mask)·v — over both a prefill and a decode
+    /// step appended to the cache.
+    #[test]
+    fn gqa_cached_attention_matches_repeated_kv_reference() -> Result<()> {
+        let dev = Device::Cpu;
+        let (b, n_head, n_kv, d, dv) = (1usize, 4usize, 2usize, 6usize, 5usize);
+        let rep = n_head / n_kv;
+        let scale = 0.37;
+
+        // Reference over the full sequence: q [b, h, s, d], k [b, kv, s, d].
+        let reference = |q: &Tensor, k: &Tensor, v: &Tensor, mask: Option<&Tensor>| -> Result<Tensor> {
+            let expand = |x: &Tensor| -> Result<Tensor> {
+                let (b, kv, s, d) = x.dims4()?;
+                x.unsqueeze(2)?
+                    .expand((b, kv, rep, s, d))?
+                    .reshape((b, kv * rep, s, d))
+            };
+            let (k, v) = (expand(k)?, expand(v)?);
+            let mut scores = (q.matmul(&k.t()?)? * scale)?;
+            if let Some(m) = mask {
+                scores = scores.broadcast_add(m)?;
+            }
+            let ctx = softmax_last_dim(&scores)?.matmul(&v)?; // [b, h, s, dv]
+            let s = ctx.dim(2)?;
+            ctx.transpose(1, 2)?.contiguous()?.reshape((b, s, n_head * dv))
+        };
+
+        let total = 4usize;
+        let q = Tensor::randn(0f32, 1f32, (b, n_head, total, d), &dev)?;
+        let k = Tensor::randn(0f32, 1f32, (b, n_kv, total, d), &dev)?;
+        let v = Tensor::randn(0f32, 1f32, (b, n_kv, total, dv), &dev)?;
+        let t = |x: &Tensor| x.transpose(2, 3).and_then(|x| x.contiguous());
+
+        let mut kv: KvCache = None;
+        // Prefill 3 tokens, then decode the 4th.
+        let mask = crate::moe::causal_mask(3, 0, &dev)?;
+        let pre = cached_attention(
+            &mut kv,
+            &q.narrow(2, 0, 3)?,
+            t(&k.narrow(2, 0, 3)?)?,
+            t(&v.narrow(2, 0, 3)?)?,
+            Some(&mask),
+            scale,
+        )?;
+        let dec = cached_attention(
+            &mut kv,
+            &q.narrow(2, 3, 1)?,
+            t(&k.narrow(2, 3, 1)?)?,
+            t(&v.narrow(2, 3, 1)?)?,
+            None,
+            scale,
+        )?;
+        let got = Tensor::cat(&[&pre, &dec], 1)?;
+        let want = reference(&q, &k, &v, Some(&crate::moe::causal_mask(total, 0, &dev)?))?;
+
+        let max = (got - want)?.abs()?.flatten_all()?.max(0)?.to_scalar::<f32>()?;
+        assert!(max < 1e-5, "grouped attention diverges from reference: {max}");
+        let (kc, vc) = kv.as_ref().unwrap();
+        assert_eq!(kc.dims(), &[b, n_kv, d, total], "cache keeps the un-repeated KV heads");
+        assert_eq!(vc.dims(), &[b, n_kv, dv, total]);
+        Ok(())
+    }
+
     /// The single-token decode dispatch path must agree exactly with the
     /// batched prefill path: each token is routed to the same experts and the
     /// per-expert MLPs are applied to the same input, just gathered/stacked
@@ -1645,6 +1753,7 @@ mod tests {
             weights_norm: false,
             weights_scale: 0.0,
             layer: 0,
+            arch: "deepseek2",
             expert_device: dev.clone(),
             residency: None,
         };

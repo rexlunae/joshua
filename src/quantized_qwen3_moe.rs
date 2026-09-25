@@ -135,50 +135,21 @@ struct Config {
     expert_weights_norm: bool,
 }
 
-// ─── Metadata helpers ───────────────────────────────────────────────────────
-
-struct Meta<'a>(&'a std::collections::HashMap<String, gguf_file::Value>);
-
-impl Meta<'_> {
-    fn u32(&self, key: &str) -> Result<u32> {
-        match self.0.get(key) {
-            Some(v) => v.to_u32(),
-            None => candle_core::bail!("qwen3moe: missing GGUF metadata key `{key}`"),
-        }
-    }
-    fn u32_or(&self, key: &str, default: u32) -> u32 {
-        self.0.get(key).and_then(|v| v.to_u32().ok()).unwrap_or(default)
-    }
-    fn f32(&self, key: &str) -> Result<f32> {
-        match self.0.get(key) {
-            Some(v) => v.to_f32(),
-            None => candle_core::bail!("qwen3moe: missing GGUF metadata key `{key}`"),
-        }
-    }
-    fn f32_or(&self, key: &str, default: f32) -> f32 {
-        self.0.get(key).and_then(|v| v.to_f32().ok()).unwrap_or(default)
-    }
-    fn bool_or(&self, key: &str, default: bool) -> bool {
-        self.0.get(key).and_then(|v| v.to_bool().ok()).unwrap_or(default)
-    }
-}
-
 impl Config {
     fn from_metadata(md: &std::collections::HashMap<String, gguf_file::Value>) -> Result<Self> {
-        let m = Meta(md);
-        let a = "qwen3moe";
-        let n_head = m.u32(&format!("{a}.attention.head_count"))? as usize;
-        let n_kv_head = m.u32(&format!("{a}.attention.head_count_kv"))? as usize;
-        let n_layer = m.u32(&format!("{a}.block_count"))? as usize;
-        let n_embd = m.u32(&format!("{a}.embedding_length"))? as usize;
-        let context_length = m.u32(&format!("{a}.context_length"))? as usize;
-        let rms_eps = m.f32(&format!("{a}.attention.layer_norm_rms_epsilon"))? as f64;
+        let m = crate::gguf_meta::Meta::new(md, "qwen3moe");
+        let n_head = m.u32("attention.head_count")? as usize;
+        let n_kv_head = m.u32("attention.head_count_kv")? as usize;
+        let n_layer = m.u32("block_count")? as usize;
+        let n_embd = m.u32("embedding_length")? as usize;
+        let context_length = m.u32("context_length")? as usize;
+        let rms_eps = m.f32("attention.layer_norm_rms_epsilon")? as f64;
 
         // Qwen3-Coder decouples head_dim from the embedding width (2048/32 = 64
         // would be wrong; the real value is 128), so `attention.key_length`
         // must win when present.  Fall back to n_embd/n_head only for GGUFs
         // that omit it.
-        let head_dim = m.u32_or(&format!("{a}.attention.key_length"), (n_embd / n_head) as u32)
+        let head_dim = m.u32_or("attention.key_length", (n_embd / n_head) as u32)
             as usize;
         if head_dim == 0 || !head_dim.is_multiple_of(2) {
             candle_core::bail!("qwen3moe: invalid head_dim {head_dim} (must be a positive even number)");
@@ -189,11 +160,11 @@ impl Config {
             );
         }
 
-        let rope_theta = m.f32_or(&format!("{a}.rope.freq_base"), 10_000.0);
+        let rope_theta = m.f32_or("rope.freq_base", 10_000.0);
 
-        let n_expert = m.u32(&format!("{a}.expert_count"))? as usize;
-        let n_expert_used = m.u32(&format!("{a}.expert_used_count"))? as usize;
-        let expert_ff = m.u32(&format!("{a}.expert_feed_forward_length"))? as usize;
+        let n_expert = m.u32("expert_count")? as usize;
+        let n_expert_used = m.u32("expert_used_count")? as usize;
+        let expert_ff = m.u32("expert_feed_forward_length")? as usize;
         if n_expert_used == 0 || n_expert_used > n_expert {
             candle_core::bail!(
                 "qwen3moe: expert_used_count {n_expert_used} must be in 1..=expert_count {n_expert}"
@@ -205,7 +176,7 @@ impl Config {
         // Qwen3MoE always normalises the top-k routing weights; the metadata
         // key is present in well-formed conversions, but default to the
         // architecture's true behaviour when a conversion omits it.
-        let expert_weights_norm = m.bool_or(&format!("{a}.attention.norm_topk_prob"), true);
+        let expert_weights_norm = m.bool_or("attention.norm_topk_prob", true);
 
         Ok(Self {
             n_layer,
@@ -580,10 +551,6 @@ impl DeviceExpert {
     }
 }
 
-/// Monotonic per-layer expert index mix: layer + a per-layer monotonic clock
-/// so the residency LRU's recency is comparable across layers.
-type ExpertKey = (u32, u32);
-
 struct Moe {
     gate_t: Tensor, // router weight transposed to [n_embd, n_expert], contiguous (cached)
     experts: Vec<Mlp>,
@@ -626,7 +593,7 @@ impl Moe {
     fn route(&self, x2: &Tensor) -> Result<(Tensor, Tensor)> {
         let logits = x2.matmul(&self.gate_t)?; // [n_tokens, n_expert]
         let probs = softmax_last_dim(&logits)?;
-        let topk_idx = topk_indices(&probs, self.n_expert_used)?; // [n_tokens, k]
+        let topk_idx = crate::moe::topk_indices(&probs, self.n_expert_used)?; // [n_tokens, k]
         let mut weights = probs.gather(&topk_idx, D::Minus1)?; // [n_tokens, k]
         if self.weights_norm {
             let denom = weights
@@ -692,28 +659,7 @@ impl Moe {
                 fwd,
             )
         }
-
     }
-
-    /// Run one routed expert over `x`, preferring the device-resident form
-    /// (a `DeviceResidency` hit) and falling back to the host `Mlp` on a miss
-    /// (#62 dispatch partition).  With no residency configured this is exactly
-    /// `self.experts[e].forward(x)` — byte-for-byte the pre-cache path.
-    fn expert_forward(&self, e: usize, x: &Tensor) -> Result<Tensor> {
-        if let Some(res) = &self.residency {
-            if let Some(dev) = res.lookup(self.layer, e as u32) {
-                return dev.forward(x);
-            }
-        }
-        self.experts[e].forward(x)
-    }
-}
-
-/// Indices of the top-`k` values along the last dim (descending), as u32.
-fn topk_indices(t: &Tensor, k: usize) -> Result<Tensor> {
-    t.arg_sort_last_dim(false)?
-        .narrow(D::Minus1, 0, k)?
-        .contiguous()
 }
 
 // ─── Layer + model ───────────────────────────────────────────────────────────

@@ -15,7 +15,7 @@ use std::io::{Read, Seek};
 use std::sync::Arc;
 
 use candle_core::quantized::{gguf_file, GgmlDType, QStorage, QTensor};
-use candle_core::{DType, Device, Result, Tensor};
+use candle_core::{DType, Device, Result, Tensor, D};
 use memmap2::Mmap;
 
 use crate::mmap_tensor::MmapPrefetch;
@@ -82,6 +82,21 @@ pub fn causal_mask(seq_len: usize, offset: usize, device: &Device) -> Result<Ten
         })
         .collect();
     Tensor::from_slice(&mask, (1, 1, seq_len, seq_len + offset), device)
+}
+
+// ─── Routing helpers ─────────────────────────────────────────────────────────
+
+/// Indices of the top-`k` values along the last dim (descending), as u32.
+pub fn topk_indices(t: &Tensor, k: usize) -> Result<Tensor> {
+    t.arg_sort_last_dim(false)?
+        .narrow(D::Minus1, 0, k)?
+        .contiguous()
+}
+
+/// Top-`k` values along the last dim (descending).
+pub fn topk_values(t: &Tensor, k: usize) -> Result<Tensor> {
+    let idx = topk_indices(t, k)?;
+    t.gather(&idx, D::Minus1)
 }
 
 // ─── Routed-expert dispatch ──────────────────────────────────────────────────

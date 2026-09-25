@@ -15,8 +15,13 @@
 //! | `qwen2`                                         | `quantized_qwen2`
 //! | `qwen3`                                         | `quantized_qwen3`
 //! | `qwen3moe`                                      | `quantized_qwen3_moe`
-//! | `deepseek2` (DeepSeek-V2/V3, Kimi-K2)            | `quantized_deepseek2` (Joshua)
+//! | `deepseek` (DeepSeek-MoE)                        | `quantized_deepseek2` (Joshua)
+//! | `deepseek2` (DeepSeek-V2/V2.5/V3/V3.1/R1, Kimi-K2) | `quantized_deepseek2` (Joshua)
 //! | `deepseek4` (DeepSeek-V4)                        | `quantized_deepseek4` (Joshua)
+//!
+//! The dense DeepSeek releases — DeepSeek-LLM, DeepSeek-Coder (V1) and the
+//! DeepSeek-R1 distills — are converted by llama.cpp as `llama` or `qwen2`
+//! and load through those rows.
 //!
 //! Every other architecture name in llama.cpp's registry is recognised and
 //! reported with a clear "known but not yet loadable in pure Rust" error, so
@@ -57,7 +62,12 @@ pub enum Architecture {
     Qwen3,
     /// `qwen3moe` — Qwen3 mixture-of-experts models.
     Qwen3Moe,
-    /// `deepseek2` — DeepSeek-V2/V3 and Kimi-K2 (MLA + fine-grained MoE).
+    /// `deepseek` — DeepSeek-MoE (GQA + fine-grained MoE with shared
+    /// experts).  Loaded by the `deepseek2` loader into
+    /// [`QuantizedModel::DeepSeek2`].
+    DeepSeek,
+    /// `deepseek2` — DeepSeek-V2/V2.5/V3/V3.1/R1 and Kimi-K2 (MLA +
+    /// fine-grained MoE).
     DeepSeek2,
     /// `deepseek4` — DeepSeek-V4 (sliding-window MLA + KV compression +
     /// indexer-selected sparse attention + Hyper-Connections).
@@ -88,7 +98,6 @@ const KNOWN_UNSUPPORTED_ARCHS: &[&str] = &[
     "command-r",
     "dbrx",
     "deci",
-    "deepseek",
     "dots1",
     "dream",
     "ernie4_5",
@@ -180,6 +189,7 @@ impl Architecture {
             "qwen2" => Self::Qwen2,
             "qwen3" => Self::Qwen3,
             "qwen3moe" => Self::Qwen3Moe,
+            "deepseek" => Self::DeepSeek,
             "deepseek2" => Self::DeepSeek2,
             "deepseek4" => Self::DeepSeek4,
             _ => return None,
@@ -237,7 +247,18 @@ impl Architecture {
     /// handle so sessions can be derived without copying them (see
     /// [`QuantizedModel::new_session`]).
     pub fn shares_weights(&self) -> bool {
-        matches!(self, Self::Qwen3Moe | Self::DeepSeek2 | Self::DeepSeek4)
+        self.is_native_moe()
+    }
+
+    /// Whether this architecture is served by one of Joshua's own sparse-MoE
+    /// loaders (`qwen3moe`, `deepseek`/`deepseek2`, `deepseek4`) rather than
+    /// a stock candle loader.  Those keep the token embedding and output head
+    /// quantized, hold the router in f32, and share weights across sessions.
+    pub fn is_native_moe(&self) -> bool {
+        matches!(
+            self,
+            Self::Qwen3Moe | Self::DeepSeek | Self::DeepSeek2 | Self::DeepSeek4
+        )
     }
 
     /// Whether this architecture's loader keeps the routed experts in host
@@ -292,7 +313,8 @@ impl Architecture {
             Self::Qwen2 => "Qwen2 / Qwen2.5",
             Self::Qwen3 => "Qwen3",
             Self::Qwen3Moe => "Qwen3-MoE",
-            Self::DeepSeek2 => "DeepSeek-V2 / DeepSeek-V3 / Kimi-K2",
+            Self::DeepSeek => "DeepSeek-MoE",
+            Self::DeepSeek2 => "DeepSeek-V2 / DeepSeek-V3 / DeepSeek-R1 / Kimi-K2",
             Self::DeepSeek4 => "DeepSeek-V4",
         }
     }
@@ -300,7 +322,7 @@ impl Architecture {
     /// Comma-separated list of supported architecture names for error messages.
     pub fn list_known() -> &'static str {
         "llama (incl. Mistral/Mixtral), gemma, gemma2, gemma3, gemma-embedding, \
-         glm4, lfm2, phi2, phi3, qwen2, qwen3, qwen3moe, deepseek2, deepseek4"
+         glm4, lfm2, phi2, phi3, qwen2, qwen3, qwen3moe, deepseek, deepseek2, deepseek4"
     }
 }
 
@@ -472,7 +494,9 @@ impl QuantizedModel {
                 )
                 .map(Self::Qwen3Moe)
             }
-            Architecture::DeepSeek2 => {
+            // One loader serves both: DeepSeek-MoE differs from V2+ only in
+            // its (GQA) attention.
+            Architecture::DeepSeek | Architecture::DeepSeek2 => {
                 crate::quantized_deepseek2::ModelWeights::from_gguf_mmap_placed(
                     gguf,
                     reader,
@@ -793,6 +817,7 @@ mod tests {
             ("qwen2", Architecture::Qwen2),
             ("qwen3", Architecture::Qwen3),
             ("qwen3moe", Architecture::Qwen3Moe),
+            ("deepseek", Architecture::DeepSeek),
             ("deepseek2", Architecture::DeepSeek2),
             ("deepseek4", Architecture::DeepSeek4),
         ] {
@@ -808,7 +833,7 @@ mod tests {
 
     #[test]
     fn known_unsupported_architectures_give_specific_error() {
-        for name in ["mamba", "gpt2", "deepseek", "rwkv7", "starcoder2"] {
+        for name in ["mamba", "gpt2", "dots1", "rwkv7", "starcoder2"] {
             assert_eq!(Architecture::from_name(name), None);
             assert!(Architecture::is_known_llama_cpp_arch(name), "arch {name}");
             let err = Architecture::detect(&metadata_with_arch(name)).unwrap_err();
