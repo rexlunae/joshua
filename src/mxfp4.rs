@@ -97,6 +97,28 @@ impl crate::raw_block::RawBlock for BlockMxfp4 {
     const QK: usize = QK_MXFP4;
     const NAME: &'static str = "mxfp4";
     const CANDLE_DTYPE: candle_core::quantized::GgmlDType = candle_core::quantized::GgmlDType::Q2K;
+    const DECODE_AVX512: bool = true;
+
+    /// The 16 low nibbles (elements 0..16) and 16 high nibbles (16..32)
+    /// each index the E2M1 table in one `vpermps`, then scale.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx2,fma")]
+    #[inline]
+    unsafe fn decode_avx512(&self, _c: usize) -> [std::arch::x86_64::__m512; 2] {
+        use std::arch::x86_64::*;
+        let Some(d) = e8m0_to_f32(self.e) else {
+            return [_mm512_setzero_ps(); 2];
+        };
+        let table = _mm512_loadu_ps(E2M1.as_ptr());
+        let d = _mm512_set1_ps(d);
+        let bytes = _mm512_cvtepu8_epi32(_mm_loadu_si128(self.qs.as_ptr() as *const __m128i));
+        let lo = _mm512_and_si512(bytes, _mm512_set1_epi32(0x0F));
+        let hi = _mm512_srli_epi32(bytes, 4);
+        [
+            _mm512_mul_ps(_mm512_permutexvar_ps(lo, table), d),
+            _mm512_mul_ps(_mm512_permutexvar_ps(hi, table), d),
+        ]
+    }
 
     fn dequantize_block(&self, out: &mut [f32]) {
         self.dequantize(out.try_into().expect("one MXFP4 block"));
@@ -194,6 +216,9 @@ mod tests {
     #[test]
     fn matmul_matches_an_explicit_dequantized_reference() {
         crate::raw_block::testing::check_matmul(&fixture_rows(23, 1024), 1024);
+        let mut rows = fixture_rows(23, 1024);
+        rows[5].e = 0xFF; // the NaN scale decodes to zeros on every path
+        crate::raw_block::testing::check_decode_avx512(&rows);
     }
 
     #[test]

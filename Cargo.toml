@@ -14,7 +14,7 @@ repository = "https://github.com/rexlunae/joshua"
 homepage = "https://github.com/rexlunae/joshua"
 documentation = "https://docs.rs/joshua"
 readme = "README.md"
-rust-version = "1.88"
+rust-version = "1.89"
 keywords = ["llm", "inference", "ai", "openai", "gguf"]
 categories = ["science", "api-bindings"]
 

@@ -10,9 +10,14 @@
 //! from the mmap, decoded *inside* the dot in SIMD registers, and FMA-
 //! accumulated against the activations.  No f32 weight row is ever written.
 //!
-//! Two ISA families are supported, selected by [`try_matmul_fused`]:
+//! Three ISA families are supported, selected by [`try_matmul_fused`] from
+//! [`crate::simd::simd_level`]:
 //!
-//! * **x86_64** — AVX2/FMA, 8 f32 lanes (`vfmadd231ps`), kernels
+//! * **x86_64 AVX-512** — 16 f32 lanes (`zmm`), kernels `fused_row_*_avx512`.
+//!   A Q2_K scale group (16 values) or half a Q8_0/Q4_K group widens into
+//!   exactly one register, so each group is one dequant + one FMA per
+//!   activation row.
+//! * **x86_64 AVX2** — AVX2/FMA, 8 f32 lanes (`vfmadd231ps`), kernels
 //!   `fused_row_q8_0` / `fused_row_q2k` / `fused_row_q4k`, entered only
 //!   after `avx2_fma_available()`.
 //! * **aarch64** — NEON, 4 f32 lanes (`fmla`), kernels
@@ -39,7 +44,7 @@
 //! `i in 0..m` through a [`crate::simd::DstPtr`], and every byte pattern is
 //! a valid block, so reinterpreting a checked byte slice as blocks is sound.
 //! The kernels are only entered after the matching availability check and
-//! carry `#[target_feature(enable = "avx2,fma")]` where the ISA is not
+//! carry `#[target_feature(enable = ...)]` for their ISA where it is not
 //! baseline (NEON needs no attribute on AArch64).
 
 use candle_core::quantized::GgmlDType;
@@ -131,15 +136,37 @@ pub fn try_matmul_fused(
     dst: &mut [f32],
     parallel: bool,
 ) -> bool {
-    #[cfg(target_arch = "x86_64")]
-    if crate::simd::avx2_fma_available() {
-        return try_matmul_fused_avx2(dtype, (m, k, n), lhs, block_bytes, dst, parallel);
+    use crate::simd::SimdLevel;
+    match crate::simd::simd_level() {
+        #[cfg(target_arch = "x86_64")]
+        SimdLevel::Avx512 => try_matmul_fused_avx512(dtype, (m, k, n), lhs, block_bytes, dst, parallel),
+        #[cfg(target_arch = "x86_64")]
+        SimdLevel::Avx2 => try_matmul_fused_avx2(dtype, (m, k, n), lhs, block_bytes, dst, parallel),
+        #[cfg(target_arch = "aarch64")]
+        SimdLevel::Neon => try_matmul_fused_neon(dtype, (m, k, n), lhs, block_bytes, dst, parallel),
+        _ => false,
     }
-    #[cfg(target_arch = "aarch64")]
-    if crate::simd::neon_available() {
-        return try_matmul_fused_neon(dtype, (m, k, n), lhs, block_bytes, dst, parallel);
+}
+
+/// x86_64 (AVX-512) fused dispatch — see [`try_matmul_fused`].
+#[cfg(target_arch = "x86_64")]
+pub fn try_matmul_fused_avx512(
+    dtype: GgmlDType,
+    (m, k, n): (usize, usize, usize),
+    lhs: &[f32],
+    block_bytes: &[u8],
+    dst: &mut [f32],
+    parallel: bool,
+) -> bool {
+    if !crate::simd::avx512_available() {
+        return false;
     }
-    false
+    match dtype {
+        GgmlDType::Q8_0 => try_fused::<BlockQ8_0Raw, QK8_0>(m, k, n, lhs, block_bytes, dst, parallel, fused_row_q8_0_avx512),
+        GgmlDType::Q2K => try_fused::<BlockQ2KRaw, QK_K>(m, k, n, lhs, block_bytes, dst, parallel, fused_row_q2k_avx512),
+        GgmlDType::Q4K => try_fused::<BlockQ4KRaw, QK_K>(m, k, n, lhs, block_bytes, dst, parallel, fused_row_q4k_avx512),
+        _ => false,
+    }
 }
 
 /// x86_64 (AVX2/FMA) fused dispatch — see [`try_matmul_fused`].
@@ -234,9 +261,9 @@ fn try_fused<B: Sync, const BLOCK_ELEMS: usize>(
     };
     let dst_ptr = crate::simd::DstPtr::new(dst);
     let worker = |row: usize| {
-        // SAFETY: the caller checked the SIMD capability of this CPU (either
-        // `avx2_fma_available()` or `neon_available()`, matching the kernel
-        // family), so the target_feature kernel may run; row `row` writes
+        // SAFETY: the caller checked the SIMD capability of this CPU
+        // (`avx512_available()`, `avx2_fma_available()` or `neon_available()`,
+        // matching the kernel family), so the target_feature kernel may run; row `row` writes
         // exactly dst[i*n + row] for i in 0..m, disjoint from every other
         // row (see `crate::simd`'s safety model).
         unsafe { row_kernel(m, k, n, lhs, blocks, blocks_per_row, row, &dst_ptr) }
@@ -480,6 +507,131 @@ unsafe fn fused_row_q4k(
         }
         m0 += MTILE;
     }
+}
+
+// ─── AVX-512 row kernels (x86_64) ─────────────────────────────────────────
+//
+// Same fused design on 16-lane `zmm` registers.  `vpmovzxbd` / `vpmovsxbd`
+// widen 16 bytes straight into one 16-lane i32 vector, so each 16-value
+// quant group is one convert + one fmsub; the m-tile is 8 activation rows
+// (32 architectural registers leave room for 8 accumulators plus the
+// dequantized weights), which halves how often each block is decoded.  The
+// tile driver and FMA helper are shared with IQ2_XXS (`crate::simd`).
+
+/// # Safety
+/// Caller must have verified AVX-512 and row-disjointness (see
+/// [`try_fused`]).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx2,fma")]
+#[allow(clippy::too_many_arguments)] // (m, k, n) is the matmul shape; kept flat for the hot loop
+unsafe fn fused_row_q8_0_avx512(
+    m: usize,
+    k: usize,
+    n: usize,
+    lhs: &[f32],
+    blocks: &[BlockQ8_0Raw],
+    blocks_per_row: usize,
+    row: usize,
+    dst: &crate::simd::DstPtr,
+) {
+    use std::arch::x86_64::*;
+    crate::simd::row_tiles_avx512(m, n, blocks, blocks_per_row, row, dst, |b, block, acc, m0, mcnt| {
+        let d = _mm512_set1_ps(f16::from_le_bytes(block.d).to_f32());
+        // 32 i8 → two 16-lane f32 vectors, scaled by d.
+        let lo = _mm_loadu_si128(block.qs.as_ptr() as *const __m128i);
+        let hi = _mm_loadu_si128(block.qs.as_ptr().add(16) as *const __m128i);
+        let w = [
+            _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(lo)), d),
+            _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(hi)), d),
+        ];
+        crate::simd::fma_tile_avx512(acc, lhs, k, m0, mcnt, b * QK8_0, &w);
+    });
+}
+
+/// # Safety
+/// See [`fused_row_q8_0_avx512`].
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx2,fma")]
+#[allow(clippy::too_many_arguments)] // (m, k, n) is the matmul shape; kept flat for the hot loop
+unsafe fn fused_row_q2k_avx512(
+    m: usize,
+    k: usize,
+    n: usize,
+    lhs: &[f32],
+    blocks: &[BlockQ2KRaw],
+    blocks_per_row: usize,
+    row: usize,
+    dst: &crate::simd::DstPtr,
+) {
+    use std::arch::x86_64::*;
+    let m3 = _mm256_set1_epi8(3);
+    crate::simd::row_tiles_avx512(m, n, blocks, blocks_per_row, row, dst, |b, block, acc, m0, mcnt| {
+        let d = f16::from_le_bytes(block.d).to_f32();
+        let dmin = f16::from_le_bytes(block.dmin).to_f32();
+        for sg in 0..2usize {
+            // Same field layout as the AVX2 kernel: sub-group j (16 values)
+            // is shift 2*(j/2) of the low (even j) or high (odd j) 16 bytes.
+            let x = _mm256_loadu_si256(block.qs[sg * 32..].as_ptr() as *const __m256i);
+            let xf = [
+                _mm256_and_si256(x, m3),
+                _mm256_and_si256(_mm256_srli_epi16(x, 2), m3),
+                _mm256_and_si256(_mm256_srli_epi16(x, 4), m3),
+                _mm256_and_si256(_mm256_srli_epi16(x, 6), m3),
+            ];
+            for j in 0..8usize {
+                let sc = block.scales[sg * 8 + j];
+                let bytes = if j % 2 == 0 {
+                    _mm256_castsi256_si128(xf[j / 2])
+                } else {
+                    _mm256_extracti128_si256(xf[j / 2], 1)
+                };
+                // w' = d·dl·q − dmin·dh, one fmsub over all 16 values.
+                let w = [_mm512_fmsub_ps(
+                    _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(bytes)),
+                    _mm512_set1_ps(d * (sc & 0xF) as f32),
+                    _mm512_set1_ps(dmin * (sc >> 4) as f32),
+                )];
+                crate::simd::fma_tile_avx512(acc, lhs, k, m0, mcnt, b * QK_K + sg * 128 + 16 * j, &w);
+            }
+        }
+    });
+}
+
+/// # Safety
+/// See [`fused_row_q8_0_avx512`].
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx2,fma")]
+#[allow(clippy::too_many_arguments)] // (m, k, n) is the matmul shape; kept flat for the hot loop
+unsafe fn fused_row_q4k_avx512(
+    m: usize,
+    k: usize,
+    n: usize,
+    lhs: &[f32],
+    blocks: &[BlockQ4KRaw],
+    blocks_per_row: usize,
+    row: usize,
+    dst: &crate::simd::DstPtr,
+) {
+    use std::arch::x86_64::*;
+    let mf = _mm256_set1_epi8(0x0F);
+    crate::simd::row_tiles_avx512(m, n, blocks, blocks_per_row, row, dst, |b, block, acc, m0, mcnt| {
+        let d = f16::from_le_bytes(block.d).to_f32();
+        let dmin = f16::from_le_bytes(block.dmin).to_f32();
+        for c in 0..4usize {
+            // Low nibbles: values [64c, 64c+32), scale pair 2c; high
+            // nibbles: [64c+32, 64c+64), pair 2c+1.
+            let x = _mm256_loadu_si256(block.qs[c * 32..].as_ptr() as *const __m256i);
+            let halves = [_mm256_and_si256(x, mf), _mm256_and_si256(_mm256_srli_epi16(x, 4), mf)];
+            for (r, xv) in halves.into_iter().enumerate() {
+                let (sc, mn) = q4k_scale_min(&block.scales, 2 * c + r);
+                let d1 = _mm512_set1_ps(d * sc as f32);
+                let m1 = _mm512_set1_ps(dmin * mn as f32);
+                let deq = |bytes: __m128i| _mm512_fmsub_ps(_mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(bytes)), d1, m1);
+                let w = [deq(_mm256_castsi256_si128(xv)), deq(_mm256_extracti128_si256(xv, 1))];
+                crate::simd::fma_tile_avx512(acc, lhs, k, m0, mcnt, b * QK_K + 64 * c + 32 * r, &w);
+            }
+        }
+    });
 }
 
 // ─── NEON row kernels (aarch64) ───────────────────────────────────────────
@@ -796,14 +948,51 @@ mod tests {
         qt.data().unwrap().to_vec()
     }
 
+    /// A fused kernel family's entry point and accumulator lane width.
+    type Family = (
+        &'static str,
+        fn(GgmlDType, (usize, usize, usize), &[f32], &[u8], &mut [f32], bool) -> bool,
+        usize,
+    );
+
+    /// Every fused kernel family this CPU can run.
+    fn families() -> Vec<Family> {
+        let mut out: Vec<Family> = Vec::new();
+        #[cfg(target_arch = "x86_64")]
+        {
+            if crate::simd::avx2_fma_available() {
+                out.push(("avx2", try_matmul_fused_avx2, 8));
+            }
+            if crate::simd::avx512_available() {
+                out.push(("avx512", try_matmul_fused_avx512, 16));
+            }
+        }
+        #[cfg(target_arch = "aarch64")]
+        out.push(("neon", try_matmul_fused_neon, 4));
+        out
+    }
+
     fn run_case(dtype: GgmlDType, m: usize, k: usize, n: usize) {
+        for family in families() {
+            run_case_on(family, dtype, m, k, n);
+        }
+        // The dispatcher runs whichever family the process selected (none at
+        // `JOSHUA_SIMD=scalar`, which turns the fused kernels off).
+        let block_bytes = quantized_block_bytes(n, k, dtype);
+        let lhs = vec![0.5f32; m * k];
+        let mut out = vec![0f32; m * n];
+        let ran = try_matmul_fused(dtype, (m, k, n), &lhs, &block_bytes, &mut out, false);
+        assert_eq!(ran, crate::simd::simd_level() != crate::simd::SimdLevel::Scalar);
+    }
+
+    fn run_case_on((name, fused, lanes): Family, dtype: GgmlDType, m: usize, k: usize, n: usize) {
         let block_bytes = quantized_block_bytes(n, k, dtype); // any GgmlType works
         let lhs: Vec<f32> = (0..m * k)
             .map(|i| (((i * 40503) % 1000) as f32 / 100.0) - 5.0)
             .collect();
         let mut fast = vec![0f32; m * n];
-        let ran = try_matmul_fused(dtype, (m, k, n), &lhs, &block_bytes, &mut fast, false);
-        assert!(ran, "{dtype:?}: fused kernel must handle this dtype");
+        let ran = fused(dtype, (m, k, n), &lhs, &block_bytes, &mut fast, false);
+        assert!(ran, "{name} {dtype:?}: fused kernel must handle this dtype");
 
         // Reference weights: candle's own dequant (the authoritative GGUF
         // decode).
@@ -838,10 +1027,9 @@ mod tests {
         // only residual difference is the dequant rounding (fused: one
         // fmsub; to_float: two rounded ops), ≤ 1 ulp per element.  This is
         // what pins the numerics to FMA-rounding level.
-        let lanes = if cfg!(target_arch = "aarch64") { 4 } else { 8 };
         for (i, fastv) in fast.iter().enumerate() {
             let (ii, jj) = (i / n, i % n);
-            let mut acc = [0f32; 8];
+            let mut acc = [0f32; 16];
             let mut c = 0;
             while c + lanes <= k {
                 for l in 0..lanes {
@@ -853,7 +1041,7 @@ mod tests {
             let tol = 1e-3 * s.abs().max(1.0);
             assert!(
                 (fastv - s).abs() <= tol,
-                "{dtype:?}: dst[{i}] fused={} same-order-dot={} (tol {tol})",
+                "{name} {dtype:?}: dst[{i}] fused={} same-order-dot={} (tol {tol})",
                 fast[i],
                 s
             );
@@ -872,7 +1060,7 @@ mod tests {
             let tol = 2e-2 * acc.abs().max(1.0);
             assert!(
                 (fastv - acc).abs() <= tol,
-                "{dtype:?}: dst[{i}] fused={} f32-gemm={} (tol {tol})",
+                "{name} {dtype:?}: dst[{i}] fused={} f32-gemm={} (tol {tol})",
                 fast[i],
                 acc
             );
@@ -899,6 +1087,10 @@ mod tests {
         run_case(GgmlDType::Q4K, 1, 256, 40);
         run_case(GgmlDType::Q4K, 3, 512, 13);
         run_case(GgmlDType::Q4K, 4, 768, 25);
+        // More activation rows than one m-tile, with a partial last tile.
+        run_case(GgmlDType::Q8_0, 11, 512, 7);
+        run_case(GgmlDType::Q2K, 11, 512, 7);
+        run_case(GgmlDType::Q4K, 11, 512, 7);
     }
     /// The real model's shapes: decode m=1 and m=32 against f32 GEMM.
     #[test]
@@ -916,14 +1108,17 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn fused_parallel_matches_serial_bit_exact() {
-        for dtype in [GgmlDType::Q8_0, GgmlDType::Q2K, GgmlDType::Q4K] {
-            let block_bytes = quantized_block_bytes(24, 256, dtype);
-            let lhs: Vec<f32> = (0..3 * 256).map(|i| (i as f32) * 0.01 - 1.0).collect();
-            let mut par = vec![0f32; 3 * 24];
-            assert!(try_matmul_fused_avx2(dtype, (3, 256, 24), &lhs, &block_bytes, &mut par, true));
-            let mut ser = vec![0f32; 3 * 24];
-            assert!(try_matmul_fused_avx2(dtype, (3, 256, 24), &lhs, &block_bytes, &mut ser, false));
-            assert_eq!(par, ser, "{dtype:?}: parallel and serial must be bit-identical");
+        for (name, fused, _) in families() {
+            for dtype in [GgmlDType::Q8_0, GgmlDType::Q2K, GgmlDType::Q4K] {
+                // m = 11 covers a full and a partial m-tile on every family.
+                let block_bytes = quantized_block_bytes(24, 256, dtype);
+                let lhs: Vec<f32> = (0..11 * 256).map(|i| (i as f32) * 0.01 - 1.0).collect();
+                let mut par = vec![0f32; 11 * 24];
+                assert!(fused(dtype, (11, 256, 24), &lhs, &block_bytes, &mut par, true));
+                let mut ser = vec![0f32; 11 * 24];
+                assert!(fused(dtype, (11, 256, 24), &lhs, &block_bytes, &mut ser, false));
+                assert_eq!(par, ser, "{name} {dtype:?}: parallel and serial must be bit-identical");
+            }
         }
     }
 
@@ -997,18 +1192,17 @@ mod tests {
         }
     }
 
-    /// The unified dispatcher must route to the right ISA on each arch.
+    /// The unified dispatcher runs a fused kernel at every SIMD level and
+    /// declines at the scalar one.
     #[test]
-    fn unified_dispatcher_runs_fused_kernels() {        for dtype in [GgmlDType::Q8_0, GgmlDType::Q2K, GgmlDType::Q4K] {
+    fn unified_dispatcher_runs_fused_kernels() {
+        let simd = crate::simd::simd_level() != crate::simd::SimdLevel::Scalar;
+        for dtype in [GgmlDType::Q8_0, GgmlDType::Q2K, GgmlDType::Q4K] {
             let block_bytes = quantized_block_bytes(8, 256, dtype);
             let lhs: Vec<f32> = (0..2 * 256).map(|i| (i as f32) * 0.01 - 1.0).collect();
             let mut dst = vec![0f32; 2 * 8];
             let ran = try_matmul_fused(dtype, (2, 256, 8), &lhs, &block_bytes, &mut dst, false);
-            if cfg!(any(target_arch = "x86_64", target_arch = "aarch64")) {
-                assert!(ran, "{dtype:?}: fused kernel must handle this dtype on this arch");
-            } else {
-                assert!(!ran, "{dtype:?}: no fused kernel expected on this arch");
-            }
+            assert_eq!(ran, simd, "{dtype:?} at {:?}", crate::simd::simd_level());
         }
     }
 }

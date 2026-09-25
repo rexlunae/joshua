@@ -39,6 +39,23 @@ pub trait RawBlock: Copy + Send + Sync + 'static {
     /// Decode this block into `out` (`out.len() == Self::QK`).
     fn dequantize_block(&self, out: &mut [f32]);
 
+    /// Whether [`RawBlock::decode_avx512`] is implemented, which gives the
+    /// format the fused AVX-512 matmul.
+    const DECODE_AVX512: bool = false;
+
+    /// Decode values `[32c, 32c + 32)` of this block into two 16-lane
+    /// vectors.  (A 32-value slice keeps the fused kernel's decode and FMAs
+    /// interleaved in registers; a whole 256-value block would spill.)
+    ///
+    /// # Safety
+    /// AVX-512 (see [`crate::simd::avx512_available`]) must be available,
+    /// `c < Self::QK / 32`, and `DECODE_AVX512` must be true.
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn decode_avx512(&self, c: usize) -> [std::arch::x86_64::__m512; 2] {
+        let _ = c;
+        unreachable!("{}: no AVX-512 decode", Self::NAME)
+    }
+
     /// `dst[m, n] = lhs[m, k] · rhs[n, k]ᵀ`; a format with a fused SIMD
     /// kernel overrides the portable [`matmul_t`].
     fn matmul_t(
@@ -182,11 +199,25 @@ fn matmul_t_rows<B: RawBlock>(
     if n == 0 || m == 0 {
         return Ok(());
     }
-    // Each row is summed a block at a time, so the destination has to start
-    // from zero.
-    dst.fill(0.0);
+    #[cfg(target_arch = "x86_64")]
+    let avx512 = B::DECODE_AVX512 && crate::simd::simd_level() == crate::simd::SimdLevel::Avx512;
+    #[cfg(not(target_arch = "x86_64"))]
+    let avx512 = false;
+    // The portable worker sums a row a block at a time, so the destination
+    // has to start from zero (the fused kernel assigns every element).
+    if !avx512 {
+        dst.fill(0.0);
+    }
     let dst_ptr = crate::simd::DstPtr::new(dst);
-    let worker = |row: usize| matmul_row_scalar((m, k, n), lhs, rhs, blocks_per_row, row, &dst_ptr);
+    let worker = |row: usize| {
+        #[cfg(target_arch = "x86_64")]
+        if avx512 {
+            // SAFETY: the level check above means this CPU has AVX-512 and
+            // `B` implements its decode; rows are disjoint (`crate::simd`).
+            return unsafe { matmul_row_avx512((m, k, n), lhs, rhs, blocks_per_row, row, &dst_ptr) };
+        }
+        matmul_row_scalar((m, k, n), lhs, rhs, blocks_per_row, row, &dst_ptr)
+    };
     if parallel {
         crate::simd::for_each_row(n, worker);
     } else {
@@ -195,8 +226,35 @@ fn matmul_t_rows<B: RawBlock>(
     Ok(())
 }
 
-/// Scalar per-row worker: decode each block of weight row `row` and
-/// accumulate `lhs · block` into `dst[i*n + row]`.  `dst` must be zeroed.
+/// Fused AVX-512 per-row worker: each block decodes straight into 16-lane
+/// registers ([`RawBlock::decode_avx512`]) and is FMA-accumulated against an
+/// 8-row tile of activations; each `dst[i*n + row]` is assigned once.
+///
+/// # Safety
+/// AVX-512 must be available, `B::DECODE_AVX512` true, and each row handed
+/// to one task only (see `crate::simd`).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx2,fma")]
+pub(crate) unsafe fn matmul_row_avx512<B: RawBlock>(
+    (m, k, n): (usize, usize, usize),
+    lhs: &[f32],
+    rhs: &[B],
+    blocks_per_row: usize,
+    row: usize,
+    dst: &crate::simd::DstPtr,
+) {
+    const { assert!(B::QK.is_multiple_of(32)) };
+    crate::simd::row_tiles_avx512(m, n, rhs, blocks_per_row, row, dst, |b, block, acc, m0, mcnt| {
+        for c in 0..B::QK / 32 {
+            let w = block.decode_avx512(c);
+            crate::simd::fma_tile_avx512(acc, lhs, k, m0, mcnt, b * B::QK + 32 * c, &w);
+        }
+    });
+}
+
+/// Portable per-row worker: decode each block of weight row `row` and
+/// accumulate `lhs · block` (the process's SIMD dot, [`crate::simd::dot_fn`])
+/// into `dst[i*n + row]`.  `dst` must be zeroed.
 pub(crate) fn matmul_row_scalar<B: RawBlock>(
     (m, k, n): (usize, usize, usize),
     lhs: &[f32],
@@ -209,15 +267,12 @@ pub(crate) fn matmul_row_scalar<B: RawBlock>(
     let row_blocks = &rhs[row * blocks_per_row..(row + 1) * blocks_per_row];
     let mut scratch = [0f32; MAX_QK];
     let decoded = &mut scratch[..B::QK];
+    let dot = crate::simd::dot_fn();
     for (b, block) in row_blocks.iter().enumerate() {
         block.dequantize_block(decoded);
         let base = b * B::QK;
         for i in 0..m {
-            let a = &lhs[i * k + base..i * k + base + B::QK];
-            let mut acc = 0f32;
-            for (x, w) in a.iter().zip(decoded.iter()) {
-                acc += x * w;
-            }
+            let acc = dot(&lhs[i * k + base..i * k + base + B::QK], decoded);
             // SAFETY: row `row` owns dst[i*n + row] for all i (disjoint per
             // row, see `crate::simd`); the buffer was zero-filled first.
             unsafe { dst.add(i * n + row, acc) };
@@ -328,6 +383,46 @@ pub(crate) mod testing {
         // Shape errors are explicit.
         assert!(B::matmul_t((1, k + 1, n), &lhs[..k + 1], rhs, &mut got[..n]).is_err());
         assert!(B::matmul_t((1, k, n + 1), &lhs[..k], rhs, &mut got[..n + 1]).is_err());
+    }
+
+    /// `decode_avx512` reproduces `dequantize_block` exactly for every block
+    /// (a no-op without AVX-512 or for formats without the hook), and the
+    /// fused AVX-512 row worker matches the portable one.
+    pub fn check_decode_avx512<B: RawBlock>(blocks: &[B]) {
+        #[cfg(target_arch = "x86_64")]
+        if B::DECODE_AVX512 && crate::simd::avx512_available() {
+            use std::arch::x86_64::*;
+            for (i, block) in blocks.iter().enumerate() {
+                let mut want = vec![0f32; B::QK];
+                block.dequantize_block(&mut want);
+                let mut got = vec![0f32; B::QK];
+                // SAFETY: AVX-512 checked above; `c` stays below QK/32.
+                unsafe {
+                    for c in 0..B::QK / 32 {
+                        let [lo, hi] = block.decode_avx512(c);
+                        _mm512_storeu_ps(got.as_mut_ptr().add(32 * c), lo);
+                        _mm512_storeu_ps(got.as_mut_ptr().add(32 * c + 16), hi);
+                    }
+                }
+                assert_eq!(got, want, "{} block {i}: AVX-512 decode differs", B::NAME);
+            }
+            // Fused worker vs portable worker on the same rows.
+            let k = B::QK * 2;
+            let n = blocks.len() / 2;
+            let m = 11;
+            let lhs: Vec<f32> = (0..m * k).map(|i| ((i * 7919) % 1000) as f32 / 500.0 - 1.0).collect();
+            let (mut fused, mut portable) = (vec![0f32; m * n], vec![0f32; m * n]);
+            let (fp, pp) = (crate::simd::DstPtr::new(&mut fused), crate::simd::DstPtr::new(&mut portable));
+            for row in 0..n {
+                // SAFETY: AVX-512 checked above; rows are disjoint.
+                unsafe { matmul_row_avx512((m, k, n), &lhs, &blocks[..2 * n], 2, row, &fp) };
+                matmul_row_scalar((m, k, n), &lhs, &blocks[..2 * n], 2, row, &pp);
+            }
+            for (i, (f, p)) in fused.iter().zip(&portable).enumerate() {
+                assert!((f - p).abs() <= 1e-4 * p.abs().max(1.0), "{} dst[{i}]: fused {f} vs portable {p}", B::NAME);
+            }
+        }
+        let _ = blocks;
     }
 
     /// A partial block is rejected; whole blocks reinterpret.
