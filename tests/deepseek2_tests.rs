@@ -1,5 +1,6 @@
 //! Native (pure-Rust) validation for the `deepseek2` quantized loader:
-//! DeepSeek-V2/V3 and Kimi-K2. These run on the default `cargo test` — no
+//! DeepSeek-V2/V3 and Kimi-K2, plus DeepSeek-MoE (`deepseek`), which the same
+//! loader serves with GQA attention. These run on the default `cargo test` — no
 //! llama.cpp, no network. A numeric cross-check against llama.cpp lives in
 //! `llamacpp_adapter_tests.rs` (gated on the built adapter plugin).
 
@@ -255,6 +256,67 @@ fn deepseek2_kv_cache_clear_allows_reuse() {
     let again = logits(&mut m, &[1, 4, 2], 0);
     for (a, b) in first.iter().zip(&again) {
         assert!((a - b).abs() < 1e-4, "reset run diverged: {a} vs {b}");
+    }
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn deepseek_moe_is_a_supported_architecture() {
+    assert_eq!(
+        Architecture::from_name("deepseek"),
+        Some(Architecture::DeepSeek)
+    );
+    assert!(Architecture::DeepSeek.shares_weights());
+}
+
+#[test]
+fn deepseek_moe_loads_and_produces_finite_logits() {
+    let dir = common::model_dir("deepseek-load");
+    let model = dir.join("model.gguf");
+    common::write_tiny_deepseek_gguf(&model);
+
+    let mut m = load(&model);
+    let out = logits(&mut m, &[1, 4, 2, 7, 5], 0);
+    assert_eq!(out.len(), 16, "logits must cover the 16-token vocab");
+    assert!(
+        out.iter().all(|v| v.is_finite()),
+        "all logits must be finite: {out:?}"
+    );
+    let first = out[0];
+    assert!(
+        out.iter().any(|v| (v - first).abs() > 1e-6),
+        "logits are degenerate"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn deepseek_moe_prefill_matches_incremental_decode() {
+    // GQA attention (2 query heads sharing 1 KV head), the grouped cache and
+    // softmax routing with a shared expert must agree between one prefill and
+    // token-by-token decode, and a fresh session must reproduce the result.
+    let dir = common::model_dir("deepseek-cache");
+    let model = dir.join("model.gguf");
+    common::write_tiny_deepseek_gguf(&model);
+    let tokens = [1u32, 4, 2, 7, 5, 9];
+
+    let mut prefill_model = load(&model);
+    let prefill = logits(&mut prefill_model, &tokens, 0);
+
+    let mut step_model = prefill_model.new_session().expect("deepseek shares weights");
+    let mut last = Vec::new();
+    for (pos, &tok) in tokens.iter().enumerate() {
+        last = logits(&mut step_model, &[tok], pos);
+    }
+
+    assert_eq!(prefill.len(), last.len());
+    for (i, (a, b)) in prefill.iter().zip(&last).enumerate() {
+        assert!(
+            (a - b).abs() < 1e-3,
+            "prefill vs incremental logit {i} diverges: {a} vs {b}"
+        );
     }
 
     std::fs::remove_dir_all(&dir).ok();

@@ -17,7 +17,7 @@ framework) and [tokenizers](https://github.com/huggingface/tokenizers).
 | **Huge pages** | Transparent 2 MiB pages (`MADV_HUGEPAGE`, default on Linux) or explicit 2 MiB / 1 GiB (`MAP_HUGETLB`) backing to cut TLB misses on large models |
 | **OpenAI-compatible** | Drop-in replacement for `/v1/chat/completions`, `/v1/embeddings`, `/v1/models` |
 | **Streaming** | Server-Sent Events (SSE) for token-by-token streaming |
-| **GGUF support** | Llama/Mistral/Mixtral, Gemma 1–3, GLM-4, LFM2, Phi-2, Phi-3, Qwen2, Qwen3, Qwen3-MoE, DeepSeek-V2/V3, DeepSeek-V4, Kimi-K2 |
+| **GGUF support** | Llama/Mistral/Mixtral, Gemma 1–3, GLM-4, LFM2, Phi-2, Phi-3, Qwen2, Qwen3, Qwen3-MoE, DeepSeek-MoE, DeepSeek-V2/V2.5/V3/R1, DeepSeek-V4, Kimi-K2 (dense DeepSeek-LLM / Coder / R1-Distill load as `llama` / `qwen2`) |
 | **Exotic quant dtypes** | In-mapping decoders for IQ2_XXS (DeepSeek-V4's 2.0625-bit expert weights) and MXFP4 (Kimi-K3-class), with matmuls that keep the blocks in the mmap instead of materialising f32 |
 | **Fused SIMD kernels** | AVX2 dequant+dot fusion for Q8_0/Q2_K/Q4_K and parallel SIMD quantized matmuls on x86-64 |
 | **Chat templates** | Renders the model's own `tokenizer.chat_template` from the GGUF (Jinja via pure-Rust minijinja); ChatML fallback |
@@ -661,7 +661,8 @@ the matching pure-Rust candle loader.  Currently supported architectures:
 | `qwen2` | Qwen1.5, Qwen2, Qwen2.5 |
 | `qwen3` | Qwen3 (dense) |
 | `qwen3moe` | Qwen3 mixture-of-experts |
-| `deepseek2` | DeepSeek-V2, DeepSeek-V3, **Kimi-K2** (MLA attention + fine-grained MoE) |
+| `deepseek` | DeepSeek-MoE 16B (GQA attention + fine-grained MoE with shared experts) |
+| `deepseek2` | DeepSeek-V2, DeepSeek-V2-Lite, DeepSeek-V2.5, DeepSeek-V3 / V3.1, DeepSeek-R1, **Kimi-K2** (MLA attention + fine-grained MoE) |
 | `deepseek4` | DeepSeek-V4 (Hyper-Connections residual mixing, alternating sliding-window / learned KV-compressor attention, Lightning-Indexer sparse attention, fine-grained MoE with IQ2_XXS experts) |
 
 The `deepseek2` loader is Joshua's own (candle has no quantized DeepSeek
@@ -674,7 +675,13 @@ reconstructed per-head K/V — numerically identical to llama.cpp and ~70× less
 KV memory for V3-class models; the full K/V is rebuilt once per forward from
 the latent. Both the legacy combined (`attn_kv_b`) and modern MLA-split
 (`attn_k_b`/`attn_v_b`) GGUF encodings load, and its logits are cross-checked
-against llama.cpp.
+against llama.cpp. The same loader serves `deepseek` (DeepSeek-MoE, the V1
+generation), which shares the whole MoE stack and swaps MLA for plain GQA
+attention over the same KV-cache layout.
+
+The dense DeepSeek releases — DeepSeek-LLM, DeepSeek-Coder V1 and the
+DeepSeek-R1 distills — are converted by llama.cpp as `llama` or `qwen2` and
+load through those rows.
 
 The `deepseek4` loader handles the architecture's three additions over V3:
 Hyper-Connections mix the residual stream to `hc_mult` parallel copies with
@@ -700,11 +707,11 @@ Example models:
 - `microsoft/Phi-3-mini-4k-instruct`
 - `mistralai/Mistral-7B-Instruct-v0.3`
 - `THUDM/GLM-4-9B-0414`
-- `deepseek-ai/DeepSeek-V2-Lite`, `moonshotai/Kimi-K2-Instruct` (as GGUF)
+- `deepseek-ai/deepseek-moe-16b-chat`, `deepseek-ai/DeepSeek-V2-Lite`, `moonshotai/Kimi-K2-Instruct` (as GGUF)
 - `deepseek-ai/DeepSeek-V4-Flash-162B` (as GGUF)
 
 Every other architecture name in llama.cpp's registry (Mamba, RWKV, GPT-2,
-DeepSeek-V1, Granite, OLMo, StarCoder2, and ~70 more) is recognised at load time
+Granite, OLMo, StarCoder2, and ~70 more) is recognised at load time
 and rejected with an error that names the architecture and lists what is
 supported — so an unsupported model fails fast with a clear message instead
 of a cryptic missing-tensor error.  Coverage grows as candle gains loaders;

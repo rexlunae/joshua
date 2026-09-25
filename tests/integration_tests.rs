@@ -359,6 +359,10 @@ mod synthetic {
                 write_model = write_tiny_deepseek2_gguf;
                 name = "tiny-deepseek2-kvedit";
             }
+            "deepseek" => {
+                write_model = write_tiny_deepseek_gguf;
+                name = "tiny-deepseek-kvedit";
+            }
             other => panic!("unsupported arch {other}"),
         }
 
@@ -443,6 +447,11 @@ mod synthetic {
     #[test]
     fn kv_edited_context_reuse_matches_fresh_engine_deepseek2() {
         edited_context_reuse_matches_fresh_engine("deepseek2");
+    }
+
+    #[test]
+    fn kv_edited_context_reuse_matches_fresh_engine_deepseek() {
+        edited_context_reuse_matches_fresh_engine("deepseek");
     }
 
 

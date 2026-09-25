@@ -42,6 +42,8 @@ use candle_nn::ops::{sigmoid, silu, softmax, softmax_last_dim};
 use candle_transformers::quantized_nn::RmsNorm;
 
 use crate::gguf_ext::GgufHeader;
+use crate::gguf_meta::Meta;
+use crate::yarn::YarnConfig;
 
 /// Numerically stable `log(1 + exp(x))`.
 fn softplus(x: &Tensor) -> Result<Tensor> {
@@ -96,99 +98,25 @@ struct Config {
     yarn: Option<YarnConfig>,
 }
 
-struct YarnConfig {
-    factor: f32,
-    orig_context_length: usize,
-    mscale_all_dim: f32,
-}
-
-// ─── Metadata helpers ───────────────────────────────────────────────────────
-
-struct Meta<'a>(&'a std::collections::HashMap<String, gguf_file::Value>);
-
-impl Meta<'_> {
-    fn u32(&self, key: &str) -> Result<u32> {
-        match self.0.get(key) {
-            Some(v) => v.to_u32(),
-            None => candle_core::bail!("deepseek4: missing GGUF metadata key `{key}`"),
-        }
-    }
-    fn u32_or(&self, key: &str, default: u32) -> u32 {
-        self.0
-            .get(key)
-            .and_then(|v| v.to_u32().ok())
-            .unwrap_or(default)
-    }
-    fn f32(&self, key: &str) -> Result<f32> {
-        match self.0.get(key) {
-            Some(v) => v.to_f32(),
-            None => candle_core::bail!("deepseek4: missing GGUF metadata key `{key}`"),
-        }
-    }
-    fn f32_or(&self, key: &str, default: f32) -> f32 {
-        self.0
-            .get(key)
-            .and_then(|v| v.to_f32().ok())
-            .unwrap_or(default)
-    }
-    #[allow(dead_code)]
-    fn bool_or(&self, key: &str, default: bool) -> bool {
-        self.0
-            .get(key)
-            .and_then(|v| v.to_bool().ok())
-            .unwrap_or(default)
-    }
-    fn array_f64(&self, key: &str, n: usize) -> Vec<f64> {
-        match self.0.get(key) {
-            Some(gguf_file::Value::Array(arr)) => {
-                let mut out = Vec::with_capacity(n);
-                for v in arr.iter().take(n) {
-                    out.push(v.to_f32().map(|x| x as f64).unwrap_or(0.0));
-                }
-                while out.len() < n {
-                    out.push(0.0);
-                }
-                out
-            }
-            _ => vec![0.0; n],
-        }
-    }
-    fn array_u32(&self, key: &str, n: usize) -> Vec<usize> {
-        match self.0.get(key) {
-            Some(gguf_file::Value::Array(arr)) => {
-                let mut out = Vec::with_capacity(n);
-                for v in arr.iter().take(n) {
-                    out.push(v.to_u32().unwrap_or(0) as usize);
-                }
-                while out.len() < n {
-                    out.push(0);
-                }
-                out
-            }
-            _ => vec![0; n],
-        }
-    }
-}
-
 impl Config {
     fn from_metadata(md: &std::collections::HashMap<String, gguf_file::Value>) -> Result<Self> {
-        let m = Meta(md);
-        let a = "deepseek4";
-        let n_layer = m.u32(&format!("{a}.block_count"))? as usize;
-        let n_head = m.u32(&format!("{a}.attention.head_count"))? as usize;
-        let _n_embd = m.u32(&format!("{a}.embedding_length"))? as usize;
-        let rms_eps = m.f32(&format!("{a}.attention.layer_norm_rms_epsilon"))? as f64;
+        let m = Meta::new(md, "deepseek4");
+        let a = m.arch();
+        let n_layer = m.u32("block_count")? as usize;
+        let n_head = m.u32("attention.head_count")? as usize;
+        let _n_embd = m.u32("embedding_length")? as usize;
+        let rms_eps = m.f32("attention.layer_norm_rms_epsilon")? as f64;
 
-        let q_lora_rank = m.u32(&format!("{a}.attention.q_lora_rank"))? as usize;
-        let head_dim = m.u32_or(&format!("{a}.attention.key_length"), 0).max(1) as usize;
+        let q_lora_rank = m.u32("attention.q_lora_rank")? as usize;
+        let head_dim = m.u32_or("attention.key_length", 0).max(1) as usize;
         // llama.cpp stores this at `{a}.rope.dimension_count`; older files used
         // `{a}.attention.rope.dimension_count`.  Prefer the current key and
         // fall back to the legacy one.  A file with neither is malformed for
         // this architecture (every real model ships it), so refuse to load —
         // a silent 1-wide rotary would only fail on the first generated token.
         let rope_head_dim = m
-            .u32(&format!("{a}.rope.dimension_count"))
-            .or_else(|_| m.u32(&format!("{a}.attention.rope.dimension_count")))
+            .u32("rope.dimension_count")
+            .or_else(|_| m.u32("attention.rope.dimension_count"))
             .map(|v| v as usize)
             .map_err(|_| {
                 candle_core::Error::Msg(format!(
@@ -198,54 +126,42 @@ impl Config {
             })?;
         let nope_head_dim = head_dim.saturating_sub(rope_head_dim);
 
-        let compress_ratios = m.array_u32(&format!("{a}.attention.compress_ratios"), n_layer);
+        let compress_ratios = m.array_u32("attention.compress_ratios", n_layer);
         let compress_rope_base =
-            m.f32_or(&format!("{a}.attention.compress_rope_freq_base"), 160000.0);
+            m.f32_or("attention.compress_rope_freq_base", 160000.0);
         let window_size = m
-            .u32_or(&format!("{a}.attention.sliding_window"), 128)
+            .u32_or("attention.sliding_window", 128)
             .max(1) as usize;
 
-        let index_n_head = m.u32_or(&format!("{a}.attention.indexer.head_count"), 64) as usize;
-        let index_head_dim = m.u32_or(&format!("{a}.attention.indexer.key_length"), 128) as usize;
-        let index_topk = m.u32_or(&format!("{a}.attention.indexer.top_k"), 512) as usize;
+        let index_n_head = m.u32_or("attention.indexer.head_count", 64) as usize;
+        let index_head_dim = m.u32_or("attention.indexer.key_length", 128) as usize;
+        let index_topk = m.u32_or("attention.indexer.top_k", 512) as usize;
 
-        let o_groups = m.u32_or(&format!("{a}.attention.output_group_count"), 8) as usize;
-        let o_lora_rank = m.u32_or(&format!("{a}.attention.output_lora_rank"), 1024) as usize;
+        let o_groups = m.u32_or("attention.output_group_count", 8) as usize;
+        let o_lora_rank = m.u32_or("attention.output_lora_rank", 1024) as usize;
 
-        let hc_mult = m.u32_or(&format!("{a}.hyper_connection.count"), 4) as usize;
+        let hc_mult = m.u32_or("hyper_connection.count", 4) as usize;
         let hc_sinkhorn_iters = m
-            .u32_or(&format!("{a}.hyper_connection.sinkhorn_iterations"), 20)
+            .u32_or("hyper_connection.sinkhorn_iterations", 20)
             .max(1) as usize;
-        let hc_eps = m.f32_or(&format!("{a}.hyper_connection.epsilon"), 1e-6) as f64;
+        let hc_eps = m.f32_or("hyper_connection.epsilon", 1e-6) as f64;
 
-        let n_expert = m.u32(&format!("{a}.expert_count"))? as usize;
-        let n_expert_used = m.u32(&format!("{a}.expert_used_count"))? as usize;
-        let n_expert_shared = m.u32_or(&format!("{a}.expert_shared_count"), 1).max(1) as usize;
-        let n_hash_layer = m.u32_or(&format!("{a}.hash_layer_count"), 0) as usize;
-        let expert_weights_scale = m.f32_or(&format!("{a}.expert_weights_scale"), 0.0) as f64;
-        let swiglu_clamp = m.array_f64(&format!("{a}.swiglu_clamp_exp"), n_layer);
+        let n_expert = m.u32("expert_count")? as usize;
+        let n_expert_used = m.u32("expert_used_count")? as usize;
+        let n_expert_shared = m.u32_or("expert_shared_count", 1).max(1) as usize;
+        let n_hash_layer = m.u32_or("hash_layer_count", 0) as usize;
+        let expert_weights_scale = m.f32_or("expert_weights_scale", 0.0) as f64;
+        let swiglu_clamp = m.array_f64("swiglu_clamp_exp", n_layer);
         // llama.cpp: clamp_shexp defaults to clamp_exp when absent.
-        let swiglu_clamp_shexp = if m.0.contains_key(&format!("{a}.swiglu_clamp_shexp")) {
-            m.array_f64(&format!("{a}.swiglu_clamp_shexp"), n_layer)
+        let swiglu_clamp_shexp = if m.contains("swiglu_clamp_shexp") {
+            m.array_f64("swiglu_clamp_shexp", n_layer)
         } else {
             swiglu_clamp.clone()
         };
 
-        let rope_theta = m.f32_or(&format!("{a}.rope.freq_base"), 10000.0);
-        let context_length = m.u32_or(&format!("{a}.context_length"), 0).max(1) as usize;
-        let yarn =
-            m.0.get(&format!("{a}.rope.scaling.type"))
-                .and_then(|v| v.to_string().ok().cloned())
-                .filter(|s| s == "yarn")
-                .map(|_| YarnConfig {
-                    factor: m.f32_or(&format!("{a}.rope.scaling.factor"), 16.0),
-                    orig_context_length: m
-                        .u32_or(&format!("{a}.rope.scaling.original_context_length"), 65536)
-                        as usize,
-                    // llama.cpp stores 0.1 * mscale_all_dim and divides it back out.
-                    mscale_all_dim: m.f32_or(&format!("{a}.rope.scaling.yarn_log_multiplier"), 0.0)
-                        / 0.1,
-                });
+        let rope_theta = m.f32_or("rope.freq_base", 10000.0);
+        let context_length = m.u32_or("context_length", 0).max(1) as usize;
+        let yarn = YarnConfig::from_meta(&m, 16.0, 65536);
 
         Ok(Self {
             n_layer,
@@ -298,33 +214,16 @@ impl RotaryEmbedding {
     /// yarn config.  Table covers token positions `[0, max_seq)`.
     fn new(cfg: &Config, dev: &Device, base: f32, yarn: bool, max_seq: usize) -> Result<Self> {
         let dim = cfg.rope_head_dim;
-        let inv_freq: Vec<f32> = (0..dim)
-            .step_by(2)
-            .map(|i| 1f32 / base.powf(i as f32 / dim as f32))
-            .collect();
-        let mscale = if yarn {
-            let y = cfg
-                .yarn
-                .as_ref()
-                .expect("yarn rope requested without yarn config");
-            yarn_get_mscale(y.factor, y.mscale_all_dim)
-        } else {
-            1.0
-        };
-        let inv_freq = if yarn {
-            let y = cfg.yarn.as_ref().unwrap();
-            let half = dim / 2;
-            let freq_inter: Vec<f32> = inv_freq.iter().map(|f| f / y.factor).collect();
-            let (low, high) = yarn_correction_range(32.0, 1.0, dim, base, y.orig_context_length);
-            let ramp = yarn_linear_ramp(low, high, half);
-            (0..half)
-                .map(|i| {
-                    let mask = 1.0 - ramp[i];
-                    freq_inter[i] * (1.0 - mask) + inv_freq[i] * mask
-                })
-                .collect()
-        } else {
-            inv_freq
+        let (inv_freq, mscale) = match cfg.yarn.as_ref().filter(|_| yarn) {
+            Some(y) => (crate::yarn::inv_freq(dim, base, y), y.mscale()),
+            None => {
+                assert!(!yarn, "yarn rope requested without yarn config");
+                let inv_freq = (0..dim)
+                    .step_by(2)
+                    .map(|i| 1f32 / base.powf(i as f32 / dim as f32))
+                    .collect();
+                (inv_freq, 1.0)
+            }
         };
         Self::from_inv_freq(inv_freq, max_seq, mscale, dev)
     }
@@ -377,39 +276,6 @@ impl RotaryEmbedding {
     }
 }
 
-fn yarn_find_correction_dim(num_rot: f32, dim: usize, base: f32, max_pos: usize) -> f32 {
-    (dim as f32 * (max_pos as f32 / (num_rot * 2.0 * std::f32::consts::PI)).ln())
-        / (2.0 * base.ln())
-}
-
-fn yarn_correction_range(
-    low_rot: f32,
-    high_rot: f32,
-    dim: usize,
-    base: f32,
-    max_pos: usize,
-) -> (f32, f32) {
-    let low = yarn_find_correction_dim(low_rot, dim, base, max_pos).floor();
-    let high = yarn_find_correction_dim(high_rot, dim, base, max_pos).ceil();
-    (low.max(0.0), high.min(dim as f32 - 1.0))
-}
-
-fn yarn_linear_ramp(min: f32, mut max: f32, dim: usize) -> Vec<f32> {
-    if (min - max).abs() < f32::EPSILON {
-        max += 0.001;
-    }
-    (0..dim)
-        .map(|i| (((i as f32) - min) / (max - min)).clamp(0.0, 1.0))
-        .collect()
-}
-
-fn yarn_get_mscale(scale: f32, mscale: f32) -> f32 {
-    if scale <= 1.0 {
-        1.0
-    } else {
-        0.1 * mscale * scale.ln() + 1.0
-    }
-}
 
 // ─── Linear helpers ─────────────────────────────────────────────────────────
 
@@ -1459,7 +1325,7 @@ impl Indexer {
         }
         let mask = Tensor::from_vec(vals, (seq, n_lid), dev)?;
         let sc = (sc + mask)?;
-        topk_indices(&sc, self.topk.min(n_lid))
+        crate::moe::topk_indices(&sc, self.topk.min(n_lid))
     }
 }
 
@@ -2024,7 +1890,7 @@ impl Moe {
                 Some(bias) => probs.broadcast_add(&bias.reshape((1, ()))?)?,
                 None => probs.clone(),
             };
-            let topk_idx = topk_indices(&selection, self.n_expert_used)?;
+            let topk_idx = crate::moe::topk_indices(&selection, self.n_expert_used)?;
             let mut weights = probs.gather(&topk_idx, D::Minus1)?;
             weights = weights.broadcast_div(
                 &weights
@@ -2393,12 +2259,6 @@ impl Moe {
     }
 }
 
-/// Indices of the top-`k` values along the last dim (descending), as u32.
-fn topk_indices(t: &Tensor, k: usize) -> Result<Tensor> {
-    t.arg_sort_last_dim(false)?
-        .narrow(D::Minus1, 0, k)?
-        .contiguous()
-}
 
 // ─── Layer + model ───────────────────────────────────────────────────────────
 

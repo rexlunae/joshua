@@ -3299,11 +3299,7 @@ fn residency(
     if probed_embedding_names(Some(arch)).contains(&name) {
         // GGUF dtype ids: 0 = F32, 1 = F16, 30 = BF16.
         let float_dtype = matches!(info.dtype, 0 | 1 | 30);
-        let native = matches!(
-            arch,
-            Architecture::Qwen3Moe | Architecture::DeepSeek2 | Architecture::DeepSeek4
-        );
-        return if native && !float_dtype {
+        return if arch.is_native_moe() && !float_dtype {
             Residency::Quantized
         } else {
             Residency::F32
@@ -3319,9 +3315,7 @@ fn residency(
     if stem == "ffn_gate_inp" {
         return match arch {
             Architecture::Llama => Residency::Quantized,
-            Architecture::Qwen3Moe | Architecture::DeepSeek2 | Architecture::DeepSeek4 => {
-                Residency::F32
-            }
+            a if a.is_native_moe() => Residency::F32,
             _ => Residency::Unknown,
         };
     }

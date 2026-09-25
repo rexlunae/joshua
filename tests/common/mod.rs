@@ -430,6 +430,66 @@ pub fn write_tiny_llama_gguf_hd32(path: &Path) {
     gguf_file::write(&mut file, &metadata_refs, &tensor_refs).unwrap();
 }
 
+/// The 16-token SentencePiece-style vocabulary, special-token ids and
+/// trivial chat template shared by the tiny MoE fixtures.
+pub fn tiny_tokenizer_metadata() -> Vec<(String, gguf_file::Value)> {
+    vec![
+    (
+        "tokenizer.ggml.eos_token_id".to_string(),
+        gguf_file::Value::U32(3),
+    ),
+    (
+        "tokenizer.ggml.bos_token_id".to_string(),
+        gguf_file::Value::U32(3),
+    ),
+    (
+        "tokenizer.ggml.unknown_token_id".to_string(),
+        gguf_file::Value::U32(0),
+    ),
+    (
+        "tokenizer.ggml.model".to_string(),
+        gguf_file::Value::String("llama".to_string()),
+    ),
+    (
+        "tokenizer.ggml.tokens".to_string(),
+        gguf_file::Value::Array(
+            [
+                "<unk>", "hello", "world", "</s>", "a", "b", "c", "d", "e", "f", "g", "h", "i",
+                "j", "k", "l",
+            ]
+            .iter()
+            .map(|s| gguf_file::Value::String(s.to_string()))
+            .collect(),
+        ),
+    ),
+    (
+        "tokenizer.ggml.scores".to_string(),
+        gguf_file::Value::Array(
+            (0..16)
+                .map(|i| gguf_file::Value::F32(-(i as f32)))
+                .collect(),
+        ),
+    ),
+    (
+        "tokenizer.ggml.token_type".to_string(),
+        gguf_file::Value::Array(
+            [2, 1, 1, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+                .iter()
+                .map(|&t| gguf_file::Value::I32(t))
+                .collect(),
+        ),
+    ),
+    (
+        "tokenizer.chat_template".to_string(),
+        gguf_file::Value::String(
+            "{% for message in messages %}hello {{ message.content }} \
+             {% endfor %}{% if add_generation_prompt %}world{% endif %}"
+                .to_string(),
+        ),
+    ),
+    ]
+}
+
 /// Write a tiny `deepseek2` GGUF with the KV up-projection in the legacy
 /// combined `attn_kv_b` form (both Joshua and llama.cpp take the unabsorbed
 /// attention path). DeepSeek-V3 / Kimi-K2 style (sigmoid gating + selection
@@ -463,6 +523,19 @@ pub fn write_tiny_deepseek2_v2_gguf(path: &Path) {
 /// style routing (softmax gating, no `exp_probs_b` selection bias) instead of
 /// the DeepSeek-V3 / Kimi-K2 default (sigmoid gating with a bias).
 pub fn write_deepseek2_gguf(path: &Path, split_mla: bool, softmax_v2: bool) {
+    write_deepseek_family_gguf(path, false, split_mla, softmax_v2);
+}
+
+/// Write a tiny `deepseek` (DeepSeek-MoE) GGUF: GQA attention (2 query heads
+/// over 1 KV head) with full-width RoPE, a leading dense layer, then a
+/// softmax-routed MoE layer with a shared expert and no weight
+/// normalisation — the same MoE stack as [`write_deepseek2_gguf`], minus MLA.
+pub fn write_tiny_deepseek_gguf(path: &Path) {
+    write_deepseek_family_gguf(path, true, false, true);
+}
+
+/// Shared body of the `deepseek` (`gqa`) and `deepseek2` fixture writers.
+fn write_deepseek_family_gguf(path: &Path, gqa: bool, split_mla: bool, softmax_v2: bool) {
     const VOCAB: usize = 16;
     const EMB: usize = 8;
     const H: usize = 2; // heads
@@ -476,96 +549,59 @@ pub fn write_deepseek2_gguf(path: &Path, split_mla: bool, softmax_v2: bool) {
     const NE: usize = 4; // experts
     const NFE: usize = 8; // expert ffn
     const NLAYER: usize = 2;
+    const KV: usize = 1; // GQA kv heads (`deepseek` only)
 
+    let arch = if gqa { "deepseek" } else { "deepseek2" };
     let u32v = |v: u32| gguf_file::Value::U32(v);
     let f32v = |v: f32| gguf_file::Value::F32(v);
-    let key = |s: &str| format!("deepseek2.{s}");
+    let key = |s: &str| format!("{arch}.{s}");
     let mut metadata: Vec<(String, gguf_file::Value)> = vec![
         (
             "general.architecture".to_string(),
-            gguf_file::Value::String("deepseek2".to_string()),
+            gguf_file::Value::String(arch.to_string()),
         ),
         (key("attention.head_count"), u32v(H as u32)),
-        (key("attention.head_count_kv"), u32v(H as u32)),
         (key("block_count"), u32v(NLAYER as u32)),
         (key("embedding_length"), u32v(EMB as u32)),
         (key("context_length"), u32v(512)),
         (key("attention.layer_norm_rms_epsilon"), f32v(1e-5)),
         (key("attention.key_length"), u32v(KH as u32)),
-        (key("attention.value_length"), u32v(VH as u32)),
-        (key("rope.dimension_count"), u32v(R as u32)),
         (key("rope.freq_base"), f32v(10_000.0)),
-        (key("attention.q_lora_rank"), u32v(LQ as u32)),
-        (key("attention.kv_lora_rank"), u32v(LKV as u32)),
         (key("feed_forward_length"), u32v(NFF as u32)),
         (key("leading_dense_block_count"), u32v(1)),
         (key("expert_count"), u32v(NE as u32)),
         (key("expert_used_count"), u32v(2)),
         (key("expert_feed_forward_length"), u32v(NFE as u32)),
         (key("expert_shared_count"), u32v(1)),
-        (key("expert_weights_scale"), f32v(2.5)),
-        (key("expert_weights_norm"), gguf_file::Value::Bool(true)),
-        // 1 = softmax (DeepSeek-V2), 2 = sigmoid (DeepSeek-V3 / Kimi-K2).
-        (
-            key("expert_gating_func"),
-            u32v(if softmax_v2 { 1 } else { 2 }),
-        ),
-        (key("expert_group_count"), u32v(2)),
-        (key("expert_group_used_count"), u32v(1)),
-        (
-            "tokenizer.ggml.eos_token_id".to_string(),
-            gguf_file::Value::U32(3),
-        ),
-        (
-            "tokenizer.ggml.bos_token_id".to_string(),
-            gguf_file::Value::U32(3),
-        ),
-        (
-            "tokenizer.ggml.unknown_token_id".to_string(),
-            gguf_file::Value::U32(0),
-        ),
-        (
-            "tokenizer.ggml.model".to_string(),
-            gguf_file::Value::String("llama".to_string()),
-        ),
-        (
-            "tokenizer.ggml.tokens".to_string(),
-            gguf_file::Value::Array(
-                [
-                    "<unk>", "hello", "world", "</s>", "a", "b", "c", "d", "e", "f", "g", "h", "i",
-                    "j", "k", "l",
-                ]
-                .iter()
-                .map(|s| gguf_file::Value::String(s.to_string()))
-                .collect(),
-            ),
-        ),
-        (
-            "tokenizer.ggml.scores".to_string(),
-            gguf_file::Value::Array(
-                (0..16)
-                    .map(|i| gguf_file::Value::F32(-(i as f32)))
-                    .collect(),
-            ),
-        ),
-        (
-            "tokenizer.ggml.token_type".to_string(),
-            gguf_file::Value::Array(
-                [2, 1, 1, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
-                    .iter()
-                    .map(|&t| gguf_file::Value::I32(t))
-                    .collect(),
-            ),
-        ),
-        (
-            "tokenizer.chat_template".to_string(),
-            gguf_file::Value::String(
-                "{% for message in messages %}hello {{ message.content }} \
-                 {% endfor %}{% if add_generation_prompt %}world{% endif %}"
-                    .to_string(),
-            ),
-        ),
     ];
+    if gqa {
+        // DeepSeek-MoE: plain GQA, RoPE over the whole head, softmax routing
+        // without normalisation (llama.cpp defaults for `deepseek`).
+        metadata.extend([
+            (key("attention.head_count_kv"), u32v(KV as u32)),
+            (key("attention.value_length"), u32v(KH as u32)),
+            (key("rope.dimension_count"), u32v(KH as u32)),
+            (key("expert_weights_scale"), f32v(1.0)),
+        ]);
+    } else {
+        metadata.extend([
+            (key("attention.head_count_kv"), u32v(H as u32)),
+            (key("attention.value_length"), u32v(VH as u32)),
+            (key("rope.dimension_count"), u32v(R as u32)),
+            (key("attention.q_lora_rank"), u32v(LQ as u32)),
+            (key("attention.kv_lora_rank"), u32v(LKV as u32)),
+            (key("expert_weights_scale"), f32v(2.5)),
+            (key("expert_weights_norm"), gguf_file::Value::Bool(true)),
+            // 1 = softmax (DeepSeek-V2), 2 = sigmoid (DeepSeek-V3 / Kimi-K2).
+            (
+                key("expert_gating_func"),
+                u32v(if softmax_v2 { 1 } else { 2 }),
+            ),
+            (key("expert_group_count"), u32v(2)),
+            (key("expert_group_used_count"), u32v(1)),
+        ]);
+    }
+    metadata.extend(tiny_tokenizer_metadata());
     if split_mla {
         // Advertise the pre-split MLA head dims so llama.cpp reads attn_k_b /
         // attn_v_b and takes its absorbed MLA path.
@@ -591,74 +627,84 @@ pub fn write_deepseek2_gguf(path: &Path, split_mla: bool, softmax_v2: bool) {
         let p = format!("blk.{i}");
         tensors.push((format!("{p}.attn_norm.weight"), qtensor(ones(EMB), &[EMB])));
         tensors.push((format!("{p}.ffn_norm.weight"), qtensor(ones(EMB), &[EMB])));
-        // MLA attention (Q-LoRA + combined KV-B).
-        tensors.push((
-            format!("{p}.attn_q_a.weight"),
-            qtensor(next(LQ * EMB), &[LQ, EMB]),
-        ));
-        tensors.push((
-            format!("{p}.attn_q_a_norm.weight"),
-            qtensor(ones(LQ), &[LQ]),
-        ));
-        tensors.push((
-            format!("{p}.attn_q_b.weight"),
-            qtensor(next(H * KH * LQ), &[H * KH, LQ]),
-        ));
-        tensors.push((
-            format!("{p}.attn_kv_a_mqa.weight"),
-            qtensor(next((LKV + R) * EMB), &[LKV + R, EMB]),
-        ));
-        tensors.push((
-            format!("{p}.attn_kv_a_norm.weight"),
-            qtensor(ones(LKV), &[LKV]),
-        ));
-        // Draw the KV up-projection from a single source (per head: A = [NP,LKV]
-        // mapping the latent to k_nope, B = [VH,LKV] mapping it to v) regardless
-        // of encoding, so the legacy and split forms are the *same* model — the
-        // RNG stream stays identical either way — and can be compared directly.
-        let a = next(H * NP * LKV); // head-major [H][NP][LKV]
-        let bmat = next(H * VH * LKV); // head-major [H][VH][LKV]
-        if split_mla {
-            // attn_k_b: ggml {NP, LKV, H} → candle [H, LKV, NP], element[h][l][np] = A[h][np][l].
-            let mut kb = vec![0f32; H * LKV * NP];
-            for h in 0..H {
-                for l in 0..LKV {
-                    for np in 0..NP {
-                        kb[h * LKV * NP + l * NP + np] = a[h * NP * LKV + np * LKV + l];
-                    }
-                }
-            }
-            tensors.push((format!("{p}.attn_k_b.weight"), qtensor(kb, &[H, LKV, NP])));
-            // attn_v_b: ggml {LKV, VH, H} → candle [H, VH, LKV] = B directly.
+        if gqa {
+            tensors.push((format!("{p}.attn_q.weight"), qtensor(next(H * KH * EMB), &[H * KH, EMB])));
+            tensors.push((format!("{p}.attn_k.weight"), qtensor(next(KV * KH * EMB), &[KV * KH, EMB])));
+            tensors.push((format!("{p}.attn_v.weight"), qtensor(next(KV * KH * EMB), &[KV * KH, EMB])));
             tensors.push((
-                format!("{p}.attn_v_b.weight"),
-                qtensor(bmat.clone(), &[H, VH, LKV]),
+                format!("{p}.attn_output.weight"),
+                qtensor(next(EMB * H * KH), &[EMB, H * KH]),
             ));
         } else {
-            // Combined kv_b: per head, rows [A (NP×LKV); B (VH×LKV)].
-            let mut kv = vec![0f32; H * (NP + VH) * LKV];
-            for h in 0..H {
-                let base = h * (NP + VH) * LKV;
-                for r in 0..NP {
+            // MLA attention (Q-LoRA + combined KV-B).
+            tensors.push((
+                format!("{p}.attn_q_a.weight"),
+                qtensor(next(LQ * EMB), &[LQ, EMB]),
+            ));
+            tensors.push((
+                format!("{p}.attn_q_a_norm.weight"),
+                qtensor(ones(LQ), &[LQ]),
+            ));
+            tensors.push((
+                format!("{p}.attn_q_b.weight"),
+                qtensor(next(H * KH * LQ), &[H * KH, LQ]),
+            ));
+            tensors.push((
+                format!("{p}.attn_kv_a_mqa.weight"),
+                qtensor(next((LKV + R) * EMB), &[LKV + R, EMB]),
+            ));
+            tensors.push((
+                format!("{p}.attn_kv_a_norm.weight"),
+                qtensor(ones(LKV), &[LKV]),
+            ));
+            // Draw the KV up-projection from a single source (per head: A = [NP,LKV]
+            // mapping the latent to k_nope, B = [VH,LKV] mapping it to v) regardless
+            // of encoding, so the legacy and split forms are the *same* model — the
+            // RNG stream stays identical either way — and can be compared directly.
+            let a = next(H * NP * LKV); // head-major [H][NP][LKV]
+            let bmat = next(H * VH * LKV); // head-major [H][VH][LKV]
+            if split_mla {
+                // attn_k_b: ggml {NP, LKV, H} → candle [H, LKV, NP], element[h][l][np] = A[h][np][l].
+                let mut kb = vec![0f32; H * LKV * NP];
+                for h in 0..H {
                     for l in 0..LKV {
-                        kv[base + r * LKV + l] = a[h * NP * LKV + r * LKV + l];
+                        for np in 0..NP {
+                            kb[h * LKV * NP + l * NP + np] = a[h * NP * LKV + np * LKV + l];
+                        }
                     }
                 }
-                for r in 0..VH {
-                    for l in 0..LKV {
-                        kv[base + (NP + r) * LKV + l] = bmat[h * VH * LKV + r * LKV + l];
+                tensors.push((format!("{p}.attn_k_b.weight"), qtensor(kb, &[H, LKV, NP])));
+                // attn_v_b: ggml {LKV, VH, H} → candle [H, VH, LKV] = B directly.
+                tensors.push((
+                    format!("{p}.attn_v_b.weight"),
+                    qtensor(bmat.clone(), &[H, VH, LKV]),
+                ));
+            } else {
+                // Combined kv_b: per head, rows [A (NP×LKV); B (VH×LKV)].
+                let mut kv = vec![0f32; H * (NP + VH) * LKV];
+                for h in 0..H {
+                    let base = h * (NP + VH) * LKV;
+                    for r in 0..NP {
+                        for l in 0..LKV {
+                            kv[base + r * LKV + l] = a[h * NP * LKV + r * LKV + l];
+                        }
+                    }
+                    for r in 0..VH {
+                        for l in 0..LKV {
+                            kv[base + (NP + r) * LKV + l] = bmat[h * VH * LKV + r * LKV + l];
+                        }
                     }
                 }
+                tensors.push((
+                    format!("{p}.attn_kv_b.weight"),
+                    qtensor(kv, &[H * (NP + VH), LKV]),
+                ));
             }
             tensors.push((
-                format!("{p}.attn_kv_b.weight"),
-                qtensor(kv, &[H * (NP + VH), LKV]),
+                format!("{p}.attn_output.weight"),
+                qtensor(next(EMB * H * VH), &[EMB, H * VH]),
             ));
         }
-        tensors.push((
-            format!("{p}.attn_output.weight"),
-            qtensor(next(EMB * H * VH), &[EMB, H * VH]),
-        ));
 
         if i == 0 {
             // Dense SwiGLU layer.
@@ -680,7 +726,7 @@ pub fn write_deepseek2_gguf(path: &Path, split_mla: bool, softmax_v2: bool) {
                 format!("{p}.ffn_gate_inp.weight"),
                 qtensor(next(NE * EMB), &[NE, EMB]),
             ));
-            if !softmax_v2 {
+            if !softmax_v2 && !gqa {
                 tensors.push((format!("{p}.exp_probs_b.bias"), qtensor(next(NE), &[NE])));
             }
             tensors.push((
@@ -734,7 +780,7 @@ pub fn write_tiny_qwen3moe_gguf(path: &Path) {
     let u32v = |v: u32| gguf_file::Value::U32(v);
     let f32v = |v: f32| gguf_file::Value::F32(v);
     let key = |s: &str| format!("qwen3moe.{s}");
-    let metadata: Vec<(String, gguf_file::Value)> = vec![
+    let mut metadata: Vec<(String, gguf_file::Value)> = vec![
         (
             "general.architecture".to_string(),
             gguf_file::Value::String("qwen3moe".to_string()),
@@ -755,60 +801,8 @@ pub fn write_tiny_qwen3moe_gguf(path: &Path) {
             key("attention.norm_topk_prob"),
             gguf_file::Value::Bool(true),
         ),
-        (
-            "tokenizer.ggml.eos_token_id".to_string(),
-            gguf_file::Value::U32(3),
-        ),
-        (
-            "tokenizer.ggml.bos_token_id".to_string(),
-            gguf_file::Value::U32(3),
-        ),
-        (
-            "tokenizer.ggml.unknown_token_id".to_string(),
-            gguf_file::Value::U32(0),
-        ),
-        (
-            "tokenizer.ggml.model".to_string(),
-            gguf_file::Value::String("llama".to_string()),
-        ),
-        (
-            "tokenizer.ggml.tokens".to_string(),
-            gguf_file::Value::Array(
-                [
-                    "<unk>", "hello", "world", "</s>", "a", "b", "c", "d", "e", "f", "g", "h", "i",
-                    "j", "k", "l",
-                ]
-                .iter()
-                .map(|s| gguf_file::Value::String(s.to_string()))
-                .collect(),
-            ),
-        ),
-        (
-            "tokenizer.ggml.scores".to_string(),
-            gguf_file::Value::Array(
-                (0..16)
-                    .map(|i| gguf_file::Value::F32(-(i as f32)))
-                    .collect(),
-            ),
-        ),
-        (
-            "tokenizer.ggml.token_type".to_string(),
-            gguf_file::Value::Array(
-                [2, 1, 1, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
-                    .iter()
-                    .map(|&t| gguf_file::Value::I32(t))
-                    .collect(),
-            ),
-        ),
-        (
-            "tokenizer.chat_template".to_string(),
-            gguf_file::Value::String(
-                "{% for message in messages %}hello {{ message.content }} \
-                 {% endfor %}{% if add_generation_prompt %}world{% endif %}"
-                    .to_string(),
-            ),
-        ),
     ];
+    metadata.extend(tiny_tokenizer_metadata());
 
     let ones = |n: usize| vec![1.0f32; n];
     let mut tensors: Vec<(String, QTensor)> = vec![
@@ -891,7 +885,7 @@ pub fn write_tiny_qwen3moe_metal_gguf(path: &Path) {
     let u32v = |v: u32| gguf_file::Value::U32(v);
     let f32v = |v: f32| gguf_file::Value::F32(v);
     let key = |s: &str| format!("qwen3moe.{s}");
-    let metadata: Vec<(String, gguf_file::Value)> = vec![
+    let mut metadata: Vec<(String, gguf_file::Value)> = vec![
         (
             "general.architecture".to_string(),
             gguf_file::Value::String("qwen3moe".to_string()),
@@ -912,60 +906,8 @@ pub fn write_tiny_qwen3moe_metal_gguf(path: &Path) {
             key("attention.norm_topk_prob"),
             gguf_file::Value::Bool(true),
         ),
-        (
-            "tokenizer.ggml.eos_token_id".to_string(),
-            gguf_file::Value::U32(3),
-        ),
-        (
-            "tokenizer.ggml.bos_token_id".to_string(),
-            gguf_file::Value::U32(3),
-        ),
-        (
-            "tokenizer.ggml.unknown_token_id".to_string(),
-            gguf_file::Value::U32(0),
-        ),
-        (
-            "tokenizer.ggml.model".to_string(),
-            gguf_file::Value::String("llama".to_string()),
-        ),
-        (
-            "tokenizer.ggml.tokens".to_string(),
-            gguf_file::Value::Array(
-                [
-                    "<unk>", "hello", "world", "</s>", "a", "b", "c", "d", "e", "f", "g", "h", "i",
-                    "j", "k", "l",
-                ]
-                .iter()
-                .map(|s| gguf_file::Value::String(s.to_string()))
-                .collect(),
-            ),
-        ),
-        (
-            "tokenizer.ggml.scores".to_string(),
-            gguf_file::Value::Array(
-                (0..16)
-                    .map(|i| gguf_file::Value::F32(-(i as f32)))
-                    .collect(),
-            ),
-        ),
-        (
-            "tokenizer.ggml.token_type".to_string(),
-            gguf_file::Value::Array(
-                [2, 1, 1, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
-                    .iter()
-                    .map(|&t| gguf_file::Value::I32(t))
-                    .collect(),
-            ),
-        ),
-        (
-            "tokenizer.chat_template".to_string(),
-            gguf_file::Value::String(
-                "{% for message in messages %}hello {{ message.content }} \
-                 {% endfor %}{% if add_generation_prompt %}world{% endif %}"
-                    .to_string(),
-            ),
-        ),
     ];
+    metadata.extend(tiny_tokenizer_metadata());
 
     let ones = |n: usize| vec![1.0f32; n];
     let mut tensors: Vec<(String, QTensor)> = vec![
