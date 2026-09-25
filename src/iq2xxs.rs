@@ -43,6 +43,40 @@ impl crate::raw_block::RawBlock for BlockIq2Xxs {
         self.dequantize(out.try_into().expect("one IQ2_XXS block"));
     }
 
+    const DECODE_AVX512: bool = true;
+
+    /// Two 8-value grid codes per 16-lane register: the codes' grid bytes
+    /// widen straight to f32 (`vpmovzxbd`) and their sign patterns become
+    /// one 16-bit lane mask that negates in place (`vsubps` under mask) — no
+    /// ±1 multiply and no cross-lane shuffles, so the decode stays cheap
+    /// even at one activation row.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx2,fma")]
+    #[inline]
+    unsafe fn decode_avx512(&self, ib32: usize) -> [std::arch::x86_64::__m512; 2] {
+        use std::arch::x86_64::*;
+        let zero = _mm512_setzero_ps();
+        let d = half::f16::from_le_bytes(self.d).to_f32();
+        let q = &self.qs[ib32 * 8..ib32 * 8 + 8];
+        let lo = u32::from_le_bytes([q[0], q[1], q[2], q[3]]);
+        let hi = u32::from_le_bytes([q[4], q[5], q[6], q[7]]);
+        let db = _mm512_set1_ps(d * (0.5 + ((hi >> 28) as f32)) * 0.25);
+        let mut w = [zero; 2];
+        // (A loop rather than `array::map`: a closure called through a
+        // non-target-feature function cannot inline these intrinsics.)
+        for (h, wh) in w.iter_mut().enumerate() {
+            let l = 2 * h as u32;
+            let (c0, c1) = ((lo >> (8 * l)) & 0xFF, (lo >> (8 * (l + 1))) & 0xFF);
+            let grid = _mm_set_epi64x(IQ2XXS_GRID[c1 as usize] as i64, IQ2XXS_GRID[c0 as usize] as i64);
+            let v = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(grid));
+            // Bit j of a sign byte negates lane j of its code.
+            let s0 = KSIGNS_IQ2XS[((hi >> (7 * l)) & 0x7F) as usize] as u16;
+            let s1 = KSIGNS_IQ2XS[((hi >> (7 * (l + 1))) & 0x7F) as usize] as u16;
+            *wh = _mm512_mul_ps(_mm512_mask_sub_ps(v, s0 | (s1 << 8), zero, v), db);
+        }
+        w
+    }
+
     fn matmul_t(
         mkn: (usize, usize, usize),
         lhs: &[f32],
@@ -55,12 +89,13 @@ impl crate::raw_block::RawBlock for BlockIq2Xxs {
 
 /// `dst[m, n] = lhs[m, k] · rhs[n, k]ᵀ`, with `rhs` held as IQ2_XXS blocks.
 ///
-/// On x86_64 with AVX2+FMA this dispatches to a fused dequant+dot kernel
-/// (see `try_avx2_matmul`) and spreads the independent output rows across
-/// the rayon pool; elsewhere it is the portable [`crate::raw_block::matmul_t`].
-/// Both paths compute each output element with the same per-element
-/// operation sequence, so results are deterministic and agree to within one
-/// ulp of FMA rounding (the fused kernel accumulates in 8-lane registers).
+/// At the AVX2 level this runs the fused AVX2 dequant+dot kernel (see
+/// `try_avx2_matmul`), spreading the independent output rows across the
+/// rayon pool; every other level goes through [`crate::raw_block::matmul_t`],
+/// whose AVX-512 form decodes with [`RawBlock::decode_avx512`].  Every path
+/// is deterministic and they agree to FMA / accumulation-order rounding.
+///
+/// [`RawBlock::decode_avx512`]: crate::raw_block::RawBlock::decode_avx512
 pub fn matmul_t(
     mkn: (usize, usize, usize),
     lhs: &[f32],
@@ -88,12 +123,9 @@ fn matmul_t_dispatch(
     }
 }
 
-/// AVX2/FMA fast path for [`matmul_t`]: fused IQ2_XXS dequant+dot for
-/// every row.  Returns `true` if it ran.  The kernel (and its const f32
-/// tables) are `#[cfg(target_arch = "x86_64")]`, so the whole branch lives
-/// behind the same cfg here — on other targets this stub returns `false` and
-/// callers use the portable scalar path.
-#[cfg(target_arch = "x86_64")]
+/// The fused AVX2 kernel for every row, at the AVX2 level only.  Returns
+/// `true` if it ran; the kernel writes each dst element exactly once, so no
+/// zero-fill is needed.
 fn try_avx2_matmul(
     mkn: (usize, usize, usize),
     blocks_per_row: usize,
@@ -102,39 +134,24 @@ fn try_avx2_matmul(
     dst: &mut [f32],
     parallel: bool,
 ) -> bool {
-    let (m, k, n) = mkn;
-    if !crate::simd::avx2_fma_available() {
-        return false;
-    }
-    // The AVX2 kernel writes every dst element exactly once, so no
-    // zero-fill is needed up front.
-    let dst_ptr = crate::simd::DstPtr::new(dst);
-    let worker = |row: usize| {
-        // SAFETY: avx2_fma_available() was checked above, so the
-        // target_feature kernel may run on this CPU; row `row` writes
-        // exactly dst[i*n + row] for i in 0..m, disjoint from every
-        // other row (see `crate::simd`'s safety model).
-        unsafe { matmul_row_avx2(m, k, n, lhs, rhs, blocks_per_row, row, &dst_ptr) }
-    };
-    if parallel {
-        crate::simd::for_each_row(n, worker);
-    } else {
-        for row in 0..n {
-            worker(row);
+    #[cfg(target_arch = "x86_64")]
+    if crate::simd::simd_level() == crate::simd::SimdLevel::Avx2 {
+        let (m, k, n) = mkn;
+        let dst_ptr = crate::simd::DstPtr::new(dst);
+        let worker = |row: usize| {
+            // SAFETY: `simd_level` only reports levels this CPU supports;
+            // row `row` writes exactly dst[i*n + row] for i in 0..m,
+            // disjoint from every other row (see `crate::simd`).
+            unsafe { matmul_row_avx2(m, k, n, lhs, rhs, blocks_per_row, row, &dst_ptr) }
+        };
+        if parallel {
+            crate::simd::for_each_row(n, worker);
+        } else {
+            (0..n).for_each(worker);
         }
+        return true;
     }
-    true
-}
-
-#[cfg(not(target_arch = "x86_64"))]
-fn try_avx2_matmul(
-    _mkn: (usize, usize, usize),
-    _blocks_per_row: usize,
-    _lhs: &[f32],
-    _rhs: &[BlockIq2Xxs],
-    _dst: &mut [f32],
-    _parallel: bool,
-) -> bool {
+    let _ = (mkn, blocks_per_row, lhs, rhs, dst, parallel);
     false
 }
 
@@ -387,39 +404,66 @@ mod tests {
         rhs
     }
 
-    /// The AVX2 fused kernel and the scalar worker must agree on the same
-    /// weights/activations.  On AVX2 machines this exercises the SIMD decode
-    /// against the reference dequant; elsewhere both paths are scalar and the
-    /// comparison is exact.
+    /// Every fused kernel and the scalar worker must agree on the same
+    /// weights/activations: each fused decode is checked against the
+    /// reference dequant (with 11 activation rows, a full and a partial m-tile
+    /// on every kernel).
     #[test]
-    fn avx2_and_scalar_paths_agree() {
-        let (m, k, n) = (3, 1024, 11);
+    fn simd_and_scalar_paths_agree() {
+        let (m, k, n) = (11, 1024, 11);
         let rhs = fixture_rhs(k, n);
         let lhs: Vec<f32> = (0..m * k)
             .map(|i| ((i * 7919) % 1000) as f32 / 100.0 - 5.0)
             .collect();
 
-        // Dispatched matmul: AVX2 when the CPU supports it, else scalar.
-        let mut fast = vec![0f32; m * n];
-        matmul_t((m, k, n), &lhs, &rhs, &mut fast).unwrap();
-
         // Scalar worker, forced.
         let mut scalar = vec![0f32; m * n];
-        scalar.fill(0.0);
         let dstp = crate::simd::DstPtr::new(&mut scalar);
         for row in 0..n {
             crate::raw_block::matmul_row_scalar((m, k, n), &lhs, &rhs, k / QK_IQ2_XXS, row, &dstp);
         }
 
-        for i in 0..m * n {
-            let tol = 1e-4 * scalar[i].abs().max(1.0);
-            assert!(
-                (fast[i] - scalar[i]).abs() <= tol,
-                "dst[{i}] fast={} scalar={} (tol {tol})",
-                fast[i],
-                scalar[i]
-            );
+        // The AVX2 kernel, plus the dispatched matmul (AVX-512's fused worker
+        // is checked against the portable one in `avx512_decode_matches_reference`).
+        type RowKernel = unsafe fn(usize, usize, usize, &[f32], &[BlockIq2Xxs], usize, usize, &crate::simd::DstPtr);
+        let mut kernels: Vec<(&str, RowKernel)> = Vec::new();
+        #[cfg(target_arch = "x86_64")]
+        {
+            if crate::simd::avx2_fma_available() {
+                kernels.push(("avx2", matmul_row_avx2));
+            }
         }
+        let mut results = Vec::new();
+        for (name, kernel) in kernels {
+            let mut out = vec![0f32; m * n];
+            let dstp = crate::simd::DstPtr::new(&mut out);
+            for row in 0..n {
+                // SAFETY: the kernel's ISA was checked above; rows are disjoint.
+                unsafe { kernel(m, k, n, &lhs, &rhs, k / QK_IQ2_XXS, row, &dstp) };
+            }
+            results.push((name, out));
+        }
+        let mut dispatched = vec![0f32; m * n];
+        matmul_t((m, k, n), &lhs, &rhs, &mut dispatched).unwrap();
+        results.push(("dispatched", dispatched));
+
+        for (name, fast) in &results {
+            for i in 0..m * n {
+                let tol = 1e-4 * scalar[i].abs().max(1.0);
+                assert!(
+                    (fast[i] - scalar[i]).abs() <= tol,
+                    "{name}: dst[{i}] fast={} scalar={} (tol {tol})",
+                    fast[i],
+                    scalar[i]
+                );
+            }
+        }
+    }
+
+    /// The AVX-512 decode reproduces candle's reference dequant exactly.
+    #[test]
+    fn avx512_decode_matches_reference() {
+        crate::raw_block::testing::check_decode_avx512(&fixture_rhs(1024, 12));
     }
 
     /// Parallel and serial execution must agree bit-for-bit: rows are

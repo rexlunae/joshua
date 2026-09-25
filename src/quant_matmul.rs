@@ -20,8 +20,8 @@
 //! behavior.
 
 use candle_core::quantized::k_quants::{
-    self, BlockQ3K, BlockQ4_0, BlockQ4_1, BlockQ5K, BlockQ5_0, BlockQ5_1, BlockQ6K, BlockQ8K,
-    BlockQ8_1, GgmlType,
+    self, BlockQ2K, BlockQ3K, BlockQ4K, BlockQ4_0, BlockQ4_1, BlockQ5K, BlockQ5_0, BlockQ5_1,
+    BlockQ6K, BlockQ8K, BlockQ8_0, BlockQ8_1, GgmlType,
 };
 use candle_core::quantized::{GgmlDType, QTensor};
 use candle_core::{bail, Device, DType, Result, Tensor};
@@ -191,43 +191,40 @@ pub fn try_fast_cpu_qmatmul(qt: &QTensor, xs: &Tensor) -> Option<Result<Tensor>>
 
     let mut dst = vec![0f32; m * n];
     let mkn = (m, k, n);
-    let ran = if matches!(dtype, GgmlDType::Q8_0 | GgmlDType::Q2K | GgmlDType::Q4K) {
-        crate::kquant_dot::try_matmul_fused(dtype, mkn, &lhs, &bytes, &mut dst, true)
-    } else {
-        // Generic path for the remaining k-quants: reinterpret the bytes as
-        // candle blocks (same cast candle's own reader performs — every byte
-        // pattern is a valid block) and run the dequant+SIMD-dot matmul.
-        macro_rules! generic_kquant {
-            ($ty:ty) => {{
-                let block_bytes = std::mem::size_of::<$ty>();
-                if !bytes.len().is_multiple_of(block_bytes) {
-                    false
-                } else {
-                    let blocks = unsafe {
-                        std::slice::from_raw_parts(
-                            bytes.as_ptr() as *const $ty,
-                            bytes.len() / block_bytes,
-                        )
-                    };
-                    matmul_kquant::<$ty>(mkn, &lhs, blocks, &mut dst).is_ok()
-                }
-            }};
-        }
-        match dtype {
-            GgmlDType::Q4_0 => generic_kquant!(BlockQ4_0),
-            GgmlDType::Q4_1 => generic_kquant!(BlockQ4_1),
-            GgmlDType::Q5_0 => generic_kquant!(BlockQ5_0),
-            GgmlDType::Q5_1 => generic_kquant!(BlockQ5_1),
-            GgmlDType::Q8_1 => generic_kquant!(BlockQ8_1),
-            GgmlDType::Q3K => generic_kquant!(BlockQ3K),
-            GgmlDType::Q5K => generic_kquant!(BlockQ5K),
-            GgmlDType::Q6K => generic_kquant!(BlockQ6K),
-            GgmlDType::Q8K => generic_kquant!(BlockQ8K),
-            // IQ2_XXS on the CPU is `MmapRawBlocks` (not `covered` above);
-            // candle's block type is the reference form and never lands here.
-            GgmlDType::Iq2Xxs => false,
-            _ => false,
-        }
+    // Every covered k-quant goes through `matmul_kquant`, which tries the
+    // fused kernels (Q8_0 / Q2_K / Q4_K) first and otherwise dequantizes a
+    // row and dots it — f32 activations at every SIMD level, scalar
+    // included.  Reinterpreting the bytes as candle blocks is the same cast
+    // candle's own reader performs (every byte pattern is a valid block).
+    macro_rules! kquant {
+        ($ty:ty) => {{
+            let block_bytes = std::mem::size_of::<$ty>();
+            if !bytes.len().is_multiple_of(block_bytes) {
+                false
+            } else {
+                let blocks = unsafe {
+                    std::slice::from_raw_parts(bytes.as_ptr() as *const $ty, bytes.len() / block_bytes)
+                };
+                matmul_kquant::<$ty>(mkn, &lhs, blocks, &mut dst).is_ok()
+            }
+        }};
+    }
+    let ran = match dtype {
+        GgmlDType::Q8_0 => kquant!(BlockQ8_0),
+        GgmlDType::Q2K => kquant!(BlockQ2K),
+        GgmlDType::Q4K => kquant!(BlockQ4K),
+        GgmlDType::Q4_0 => kquant!(BlockQ4_0),
+        GgmlDType::Q4_1 => kquant!(BlockQ4_1),
+        GgmlDType::Q5_0 => kquant!(BlockQ5_0),
+        GgmlDType::Q5_1 => kquant!(BlockQ5_1),
+        GgmlDType::Q8_1 => kquant!(BlockQ8_1),
+        GgmlDType::Q3K => kquant!(BlockQ3K),
+        GgmlDType::Q5K => kquant!(BlockQ5K),
+        GgmlDType::Q6K => kquant!(BlockQ6K),
+        GgmlDType::Q8K => kquant!(BlockQ8K),
+        // IQ2_XXS on the CPU is `MmapRawBlocks` (not `covered` above);
+        // candle's block type is the reference form and never lands here.
+        _ => false,
     };
     if !ran {
         return None;
@@ -315,8 +312,8 @@ fn matmul_kquant_impl<T: GgmlType>(
     if try_simd_kquant(mkn, blocks_per_row, lhs, blocks, dst, parallel) {
         return Ok(());
     }
-    // Scalar fallback: candle's own kernel, exactly as before (bit-identical
-    // to joshua's prior behavior on non-SIMD CPUs and unusual shapes).
+    // Fallback for shapes the SIMD row dots cannot take (`k % 8 != 0`):
+    // candle's own kernel.
     k_quants::matmul((m, k, n), lhs, blocks, dst)
 }
 
@@ -329,8 +326,9 @@ fn matmul_kquant_impl<T: GgmlType>(
 /// into an f32 scratch, then dot it against every activation row with
 /// SIMD FMA.  Returns `true` if a kernel ran.
 ///
-/// On x86_64 this uses AVX2/FMA when available; on aarch64 it uses NEON
-/// (always available).  On other targets it declines.
+/// Follows [`crate::simd::simd_level`]: AVX-512 or AVX2/FMA on x86_64, NEON
+/// on aarch64, and a sequential scalar dot at the scalar level — the same
+/// f32-activation semantics everywhere.
 fn try_simd_kquant<T: GgmlType>(
     mkn: (usize, usize, usize),
     blocks_per_row: usize,
@@ -340,13 +338,10 @@ fn try_simd_kquant<T: GgmlType>(
     parallel: bool,
 ) -> bool {
     let (m, k, n) = mkn;
-    #[cfg(target_arch = "x86_64")]
-    let fused = crate::simd::avx2_fma_available();
-    #[cfg(target_arch = "aarch64")]
-    let fused = crate::simd::neon_available();
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    let fused = false;
-    if !(fused && k.is_multiple_of(8)) {
+    // The SIMD row dots consume `k` in 8-lane chunks with no tail; the
+    // scalar level handles any `k`.
+    let scalar = crate::simd::simd_level() == crate::simd::SimdLevel::Scalar;
+    if !(scalar || k.is_multiple_of(8)) {
         return false;
     }
     // SAFETY: `blocks` is `n * blocks_per_row` T-blocks; reinterpreting it
@@ -368,10 +363,11 @@ fn try_simd_kquant<T: GgmlType>(
         let mut wrow = vec![0f32; k];
         for &row in rows {
             T::to_float(&blocks[row * blocks_per_row..(row + 1) * blocks_per_row], &mut wrow);
-            // SAFETY: `fused` (the matching SIMD availability check) was
-            // verified above, so the target_feature kernel may run on this
-            // CPU; row `row` writes exactly dst[i*n + row] for i in 0..m,
-            // disjoint from every other row (see `crate::simd`).
+            // SAFETY: `simd_level` only reports levels this CPU supports and
+            // `k % 8 == 0` was checked for the SIMD ones, so the
+            // target_feature kernel may run; row `row` writes exactly
+            // dst[i*n + row] for i in 0..m, disjoint from every other row
+            // (see `crate::simd`).
             unsafe { dot_row_simd(m, k, n, lhs, &wrow, row, &dst_ptr) }
         }
     };
@@ -385,12 +381,12 @@ fn try_simd_kquant<T: GgmlType>(
 }
 
 /// SIMD dot of one dequantized weight row against all m activation rows,
-/// 4 lhs rows at a time.  Dispatches to the CPU's SIMD ISA.
+/// a tile of lhs rows at a time.  Dispatches on [`crate::simd::simd_level`].
 ///
 /// # Safety
-/// The caller must have verified the matching SIMD availability check and
-/// `k % 8 == 0` (the loop consumes `k` in 8-lane chunks with no tail), and
-/// must only hand out disjoint rows per [`crate::simd::DstPtr`].
+/// At a SIMD level `k % 8 == 0` (the AVX2 / NEON loops consume `k` in 8- /
+/// 4-lane chunks with no tail), and only disjoint rows may be handed out
+/// per [`crate::simd::DstPtr`].
 unsafe fn dot_row_simd(
     m: usize,
     k: usize,
@@ -400,18 +396,74 @@ unsafe fn dot_row_simd(
     row: usize,
     dst: &crate::simd::DstPtr,
 ) {
-    #[cfg(target_arch = "x86_64")]
-    {
-        dot_row_avx2(m, k, n, lhs, wrow, row, dst)
+    use crate::simd::SimdLevel;
+    match crate::simd::simd_level() {
+        #[cfg(target_arch = "x86_64")]
+        SimdLevel::Avx512 => dot_row_avx512(m, k, n, lhs, wrow, row, dst),
+        #[cfg(target_arch = "x86_64")]
+        SimdLevel::Avx2 => dot_row_avx2(m, k, n, lhs, wrow, row, dst),
+        #[cfg(target_arch = "aarch64")]
+        SimdLevel::Neon => dot_row_neon(m, k, n, lhs, wrow, row, dst),
+        _ => {
+            for i in 0..m {
+                let mut acc = 0f32;
+                for (a, w) in lhs[i * k..(i + 1) * k].iter().zip(wrow) {
+                    acc += a * w;
+                }
+                dst.write(i * n + row, acc);
+            }
+        }
     }
-    #[cfg(target_arch = "aarch64")]
-    {
-        dot_row_neon(m, k, n, lhs, wrow, row, dst)
-    }
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    {
-        let _ = (m, k, n, lhs, wrow, row, dst);
-        unreachable!("dot_row_simd is only called after a SIMD availability check")
+}
+
+/// AVX-512 dot of one dequantized weight row against all m activation rows,
+/// 8 lhs rows at a time; a `k` tail below 16 columns uses masked loads.
+///
+/// # Safety
+/// The caller must have verified `avx512_available()` and must only hand
+/// out disjoint rows per [`crate::simd::DstPtr`].
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+#[allow(clippy::too_many_arguments)] // (m, k, n) is the matmul shape; kept flat for the hot loop
+unsafe fn dot_row_avx512(
+    m: usize,
+    k: usize,
+    n: usize,
+    lhs: &[f32],
+    wrow: &[f32],
+    row: usize,
+    dst: &crate::simd::DstPtr,
+) {
+    use std::arch::x86_64::*;
+
+    const MTILE: usize = 8;
+    let tail = k % 16;
+    let mask: __mmask16 = ((1u32 << tail) - 1) as u16;
+    let mut m0 = 0;
+    while m0 < m {
+        let mcnt = (m - m0).min(MTILE);
+        let mut acc = [_mm512_setzero_ps(); MTILE];
+        let mut c = 0;
+        while c + 16 <= k {
+            let wv = _mm512_loadu_ps(wrow.as_ptr().add(c));
+            for (i, a) in acc.iter_mut().enumerate().take(mcnt) {
+                *a = _mm512_fmadd_ps(_mm512_loadu_ps(lhs.as_ptr().add((m0 + i) * k + c)), wv, *a);
+            }
+            c += 16;
+        }
+        if tail != 0 {
+            let wv = _mm512_maskz_loadu_ps(mask, wrow.as_ptr().add(c));
+            for (i, a) in acc.iter_mut().enumerate().take(mcnt) {
+                let x = _mm512_maskz_loadu_ps(mask, lhs.as_ptr().add((m0 + i) * k + c));
+                *a = _mm512_fmadd_ps(x, wv, *a);
+            }
+        }
+        for (i, acc_i) in acc.iter().enumerate().take(mcnt) {
+            // SAFETY: row `row` owns dst[i*n + row] for all i; disjoint per
+            // row (see `crate::simd`).
+            dst.write((m0 + i) * n + row, crate::simd::hsum512(*acc_i));
+        }
+        m0 += MTILE;
     }
 }
 
@@ -549,21 +601,17 @@ mod tests {
         //
         // Accumulation order: when a SIMD fused kernel is active, replicate
         // its exact lane order with `mul_add` (single rounding) so the
-        // comparison is pinned at FMA-rounding level.  AVX2 kernels are
-        // 8-lane; the NEON kernels accumulate in a float32x4_t (4 lanes) for
-        // every dtype.  Without SIMD the scalar kernel accumulates
+        // comparison is pinned at FMA-rounding level.  AVX-512 kernels are
+        // 16-lane, AVX2 8-lane; the NEON kernels accumulate in a float32x4_t
+        // (4 lanes) for every dtype.  Without SIMD the scalar kernel accumulates
         // sequentially with two roundings per term.
         let mut w = vec![0f32; n * k];
         T::to_float(&blocks, &mut w);
-        let lanes: usize = if crate::simd::avx2_fma_available() || crate::simd::neon_available()
-        {
-            if cfg!(target_arch = "aarch64") {
-                4
-            } else {
-                8
-            }
-        } else {
-            1
+        let lanes: usize = match crate::simd::simd_level() {
+            crate::simd::SimdLevel::Avx512 => 16,
+            crate::simd::SimdLevel::Avx2 => 8,
+            crate::simd::SimdLevel::Neon => 4,
+            crate::simd::SimdLevel::Scalar => 1,
         };
         for (i, fastv) in fast.iter().enumerate() {
             let (ii, jj) = (i / n, i % n);
@@ -573,7 +621,7 @@ mod tests {
                     acc += lhs[ii * k + kk] * wv;
                 }
             } else {
-                let mut accv = [0f32; 8];
+                let mut accv = [0f32; 16];
                 let mut c = 0;
                 while c + lanes <= k {
                     for l in 0..lanes {

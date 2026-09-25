@@ -19,7 +19,7 @@ framework) and [tokenizers](https://github.com/huggingface/tokenizers).
 | **Streaming** | Server-Sent Events (SSE) for token-by-token streaming |
 | **GGUF support** | Llama/Mistral/Mixtral, Gemma 1–3, GLM-4, LFM2, Phi-2, Phi-3, every Qwen generation (Qwen 1, Qwen1.5/2/2.5 incl. MoE, Qwen2/2.5-VL and Qwen3-VL text, Qwen3, Qwen3-MoE, Qwen3-Next, Qwen3.5 dense/MoE, Qwen3.8-Flash-Next / `qwen4exp`, Bonsai 1-bit / 2-bit), DeepSeek-MoE, DeepSeek-V2/V2.5/V3/R1, DeepSeek-V4 / V4-Flash, DeepSeek-V4.1-Flash, Kimi-K2 (dense DeepSeek-LLM / Coder / R1-Distill load as `llama` / `qwen2`) |
 | **Exotic quant dtypes** | In-mapping decoders for IQ2_XXS (DeepSeek-V4's 2.0625-bit expert weights), MXFP4 (Kimi-K3-class) and Q1_0 / Q2_0 (Bonsai's 1-bit and 2-bit weights), with matmuls that keep the blocks in the mmap instead of materialising f32 — one generic `RawBlock` layer, so any native loader reads any of them |
-| **Fused SIMD kernels** | AVX2 dequant+dot fusion for Q8_0/Q2_K/Q4_K and parallel SIMD quantized matmuls on x86-64 |
+| **Fused SIMD kernels** | AVX-512 and AVX2 (x86-64) and NEON (aarch64) dequant+dot fusion — the weights decode inside the dot in registers — for Q8_0/Q2_K/Q4_K, IQ2_XXS, MXFP4 and Bonsai's Q1_0/Q2_0, plus parallel SIMD matmuls for the other k-quants; the widest ISA the CPU has is picked at startup (`JOSHUA_SIMD` overrides) |
 | **Chat templates** | Renders the model's own `tokenizer.chat_template` from the GGUF (Jinja via pure-Rust minijinja); ChatML fallback |
 | **Tool calling** | OpenAI-compatible `tools` / `tool_calls`, parsing Hermes/Qwen, Mistral, and Llama-3 call formats |
 | **Embeddings** | Dense sentence embeddings for llama / qwen2 / qwen3 embedding models, with GGUF pooling metadata |
@@ -58,11 +58,11 @@ framework) and [tokenizers](https://github.com/huggingface/tokenizers).
 
 | Tool | Minimum version |
 |---|---|
-| Rust toolchain | 1.88 |
+| Rust toolchain | 1.89 |
 
-The minimum is set by the dependency tree — currently `zip 8.6.0`, which
-requires Rust 1.88 (the table previously claimed 1.87 via `candle-core`'s use
-of `{integer}::is_multiple_of`, but the tree has moved on).
+The minimum is set by the AVX-512 kernels, whose `core::arch` intrinsics
+were stabilized in Rust 1.89 (the dependency tree alone needs 1.88, for
+`zip 8.6.0`).
 
 No CMake, no C++ compiler, no CUDA toolkit required.
 
@@ -573,6 +573,7 @@ prints the dense/expert split of any GGUF to sanity-check a new model.
 | `JOSHUA_ROUTE_TRACE` | Path of a routing-trace CSV to write, for `cargo run --example cache_sim` |
 | `JOSHUA_PREFILL_CHUNK` | Tokens per prefill chunk (default 512; also `--prefill-chunk`) |
 | `JOSHUA_SPECULATIVE` | Max draft tokens per speculative decode step (default 0 = off; also `--speculative`) |
+| `JOSHUA_SIMD` | Force a lower CPU kernel family: `avx512`, `avx2`, `neon` or `scalar` (default: the widest the CPU supports).  Every level computes the same f32-activation math, so this bisects a numerical difference or a slowdown to one family |
 | `JOSHUA_SKIP_PLACEMENT_BENCH` | Skip the startup quantized-matmul probe that `auto` dense placement uses |
 | `JOSHUA_OPENCL_NATIVE` / `JOSHUA_VULKAN_NATIVE` | `0` runs every operator through the CPU round-trip instead of the device kernels (default on) |
 | `JOSHUA_OPENCL_TRACE` / `JOSHUA_VULKAN_TRACE` | `1` logs each operator that falls back to the CPU and why |
@@ -1161,6 +1162,7 @@ multicast interoperability or LAN throughput.
 - [x] DeepSeek-V4 sparse-attention MoE loader (Hyper-Connections, CSA/HCA KV compression, Lightning Indexer, IQ2_XXS experts)
 - [x] DeepSeek-V2/V3 MLA latent cache (~70× smaller KV cache, prefill == incremental)
 - [x] Fused AVX2 k-quant kernels and SIMD quantized matmuls (CPU prefill/decode speed-ups)
+- [x] AVX-512 backend: 16-lane fused kernels for every CPU quant format (k-quants, IQ2_XXS, MXFP4, Q1_0/Q2_0)
 - [x] Sparse-MoE weight management (hot-weight pinning, mlock with memlock-limit check, prefill streaming)
 - [x] Models larger than VRAM (host-resident experts with the dense set on the GPU, weights shared across sessions, quantized embedding table)
 - [x] Vision / multimodal support (OpenAI image messages via llama.cpp `mtmd` through the plugin shim)
