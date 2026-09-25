@@ -17,7 +17,7 @@ framework) and [tokenizers](https://github.com/huggingface/tokenizers).
 | **Huge pages** | Transparent 2 MiB pages (`MADV_HUGEPAGE`, default on Linux) or explicit 2 MiB / 1 GiB (`MAP_HUGETLB`) backing to cut TLB misses on large models |
 | **OpenAI-compatible** | Drop-in replacement for `/v1/chat/completions`, `/v1/embeddings`, `/v1/models` |
 | **Streaming** | Server-Sent Events (SSE) for token-by-token streaming |
-| **GGUF support** | Llama/Mistral/Mixtral, Gemma 1–3, GLM-4, LFM2, Phi-2, Phi-3, every Qwen generation (Qwen 1, Qwen1.5/2/2.5 incl. MoE, Qwen2/2.5-VL and Qwen3-VL text, Qwen3, Qwen3-MoE, Qwen3-Next, Qwen3.5 dense/MoE), DeepSeek-MoE, DeepSeek-V2/V2.5/V3/R1, DeepSeek-V4, Kimi-K2 (dense DeepSeek-LLM / Coder / R1-Distill load as `llama` / `qwen2`) |
+| **GGUF support** | Llama/Mistral/Mixtral, Gemma 1–3, GLM-4, LFM2, Phi-2, Phi-3, every Qwen generation (Qwen 1, Qwen1.5/2/2.5 incl. MoE, Qwen2/2.5-VL and Qwen3-VL text, Qwen3, Qwen3-MoE, Qwen3-Next, Qwen3.5 dense/MoE, Qwen3.8-Flash-Next / `qwen4exp`), DeepSeek-MoE, DeepSeek-V2/V2.5/V3/R1, DeepSeek-V4, Kimi-K2 (dense DeepSeek-LLM / Coder / R1-Distill load as `llama` / `qwen2`) |
 | **Exotic quant dtypes** | In-mapping decoders for IQ2_XXS (DeepSeek-V4's 2.0625-bit expert weights) and MXFP4 (Kimi-K3-class), with matmuls that keep the blocks in the mmap instead of materialising f32 |
 | **Fused SIMD kernels** | AVX2 dequant+dot fusion for Q8_0/Q2_K/Q4_K and parallel SIMD quantized matmuls on x86-64 |
 | **Chat templates** | Renders the model's own `tokenizer.chat_template` from the GGUF (Jinja via pure-Rust minijinja); ChatML fallback |
@@ -669,6 +669,7 @@ the matching pure-Rust candle loader.  Currently supported architectures:
 | `qwen3vl` / `qwen3vlmoe` | Qwen3-VL dense / MoE (text decoder, interleaved M-RoPE) |
 | `qwen3next` | Qwen3-Next (Gated DeltaNet + gated attention hybrid, MoE) |
 | `qwen35` / `qwen35moe` | Qwen3.5 dense / MoE (Gated DeltaNet hybrid) |
+| `qwen4exp` | Qwen3.8-Flash-Next (Qwen3.5-MoE plus hyper-connections, QSA block-sparse attention, PLE n-gram hash embeddings) |
 | `deepseek` | DeepSeek-MoE 16B (GQA attention + fine-grained MoE with shared experts) |
 | `deepseek2` | DeepSeek-V2, DeepSeek-V2-Lite, DeepSeek-V2.5, DeepSeek-V3 / V3.1, DeepSeek-R1, **Kimi-K2** (MLA attention + fine-grained MoE) |
 | `deepseek4` | DeepSeek-V4 (Hyper-Connections residual mixing, alternating sliding-window / learned KV-compressor attention, Lightning-Indexer sparse attention, fine-grained MoE with IQ2_XXS experts) |
@@ -707,12 +708,18 @@ MoE FFN with a sigmoid-gated shared expert, and Gated DeltaNet linear
 attention (causal conv + gated delta rule) for the hybrid models.  The VL
 models' multi-section RoPE reduces, for text positions, to 1-D RoPE with the
 "extra"-section frequencies frozen, exactly as llama.cpp computes it; image
-input goes through the llama.cpp `mtmd` plugin below.  Each architecture's
-logits are pinned to an independent NumPy transcription of llama.cpp's
-graphs.  Recurrent layers cannot rewind to an arbitrary prefix, so Qwen3-Next
+input goes through the llama.cpp `mtmd` plugin below.  `qwen4exp` adds three
+pieces: hyper-connections (the residual is several parallel streams mixed
+by low-rank sigmoid gates, and the final mixer is the output norm), QSA
+block-sparse attention (an indexer scores mean-pooled blocks of cached keys
+and each query attends only to its best `indexer.top_k` cells plus its
+incomplete tail block — dense until the context outgrows that budget), and
+PLE n-gram hash embeddings (each token hashes its preceding n-grams into
+rows of a shared table, gated into every stream through a dilated causal
+conv).  Each architecture's logits are pinned to an independent NumPy
+transcription of llama.cpp's graphs.  Recurrent layers cannot rewind to an arbitrary prefix, so Qwen3-Next
 and Qwen3.5 re-prefill on edited contexts instead of truncating.  Not
-loadable: `qwen4exp` (experimental Hyper-Connection / compressed-attention
-hybrid), `qwen3tts` (speech codec output) and `rwkv6qwen2` (an RWKV-6
+loadable: `qwen3tts` (speech codec output) and `rwkv6qwen2` (an RWKV-6
 distillation, not a Qwen decoder).
 
 **Kimi-K3 (in progress).** The correctness-critical primitives — Kimi Delta

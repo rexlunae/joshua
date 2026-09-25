@@ -310,10 +310,16 @@ mod synthetic {
     /// match a fresh engine exactly.
     #[test]
     fn kv_prefix_reuse_matches_fresh_engine_recurrent_qwen() {
+        for arch in ["qwen35", "qwen4exp"] {
+            recurrent_prefix_reuse_matches_fresh_engine(arch);
+        }
+    }
+
+    fn recurrent_prefix_reuse_matches_fresh_engine(arch: &str) {
         use joshua::{types::GenerationOptions, Engine};
 
-        let dir = model_dir("tiny-qwen35-kv");
-        write_tiny_qwen_gguf(&dir.join("model.gguf"), "qwen35");
+        let dir = model_dir(&format!("tiny-{arch}-kv"));
+        write_tiny_qwen_gguf(&dir.join("model.gguf"), arch);
         let greedy = |max_tokens| GenerationOptions {
             max_tokens,
             temperature: 0.0,

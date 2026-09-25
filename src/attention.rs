@@ -161,15 +161,21 @@ impl Rope {
         Tensor::cat(&[&rot, &pass], D::Minus1)
     }
 
-    /// Rotate rows of `x` (`[n, n_rot]`) at explicit per-row `positions`
-    /// (`[n]` u32).
+    /// Rotate rows of `x` (`[n, d]`, `d >= n_rot`) at explicit per-row
+    /// `positions` (`[n]` u32); like [`Self::apply_leading`], only the
+    /// leading `n_rot` dims turn.
     pub fn apply_at(&self, x: &Tensor, positions: &Tensor) -> Result<Tensor> {
         let (n, d) = x.dims2()?;
-        let x4 = x.reshape((n, 1, 1, d))?;
+        let n_rot = self.n_rot()?;
+        let rot = x.narrow(1, 0, n_rot)?.contiguous()?.reshape((n, 1, 1, n_rot))?;
         // rope / rope_i accept 3-D cos/sin as [b, t, d], one row per batch item.
         let cos = self.cos.index_select(positions, 0)?.unsqueeze(1)?;
         let sin = self.sin.index_select(positions, 0)?.unsqueeze(1)?;
-        self.rotate(&x4, &cos, &sin)?.reshape((n, d))
+        let rot = self.rotate(&rot, &cos, &sin)?.reshape((n, n_rot))?;
+        if n_rot >= d {
+            return Ok(rot);
+        }
+        Tensor::cat(&[&rot, &x.narrow(1, n_rot, d - n_rot)?.contiguous()?], 1)
     }
 }
 

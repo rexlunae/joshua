@@ -793,13 +793,20 @@ pub fn write_tiny_qwen_gguf(path: &Path, arch: &str) {
     const NFE: usize = 8; // expert ffn
     const NFF: usize = 16; // dense ffn
 
-    let hybrid = matches!(arch, "qwen3next" | "qwen35" | "qwen35moe");
+    let hybrid = matches!(arch, "qwen3next" | "qwen35" | "qwen35moe" | "qwen4exp");
     let moe = matches!(
         arch,
-        "qwen2moe" | "qwen3moe" | "qwen3vlmoe" | "qwen3next" | "qwen35moe"
+        "qwen2moe" | "qwen3moe" | "qwen3vlmoe" | "qwen3next" | "qwen35moe" | "qwen4exp"
     );
-    let shared_expert = matches!(arch, "qwen2moe" | "qwen3next" | "qwen35moe");
-    let qk_norm = arch.starts_with("qwen3");
+    let shared_expert = matches!(arch, "qwen2moe" | "qwen3next" | "qwen35moe" | "qwen4exp");
+    // qwen4exp: hyper-connections (2 streams, rank 3), QSA on the attention
+    // layer (blocks of 2, budget 2 cells + tail) and PLE on the DeltaNet layer
+    // (3-grams, 2 heads per n-gram, 2-wide rows, kernel 3).
+    let hyper = arch == "qwen4exp";
+    let (hc, hc_rank) = (2usize, 3usize);
+    let (idx_heads, idx_dim) = (2usize, 6usize);
+    let (ple_heads, ple_dim, ple_rows, ple_kernel) = (4usize, 2usize, 40usize, 3usize);
+    let qk_norm = arch.starts_with("qwen3") || arch == "qwen4exp";
     let biases = matches!(arch, "qwen2moe" | "qwen2vl");
     let fused_qkv = arch == "qwen";
     let h = 2usize;
@@ -853,6 +860,28 @@ pub fn write_tiny_qwen_gguf(path: &Path, arch: &str) {
             gguf_file::Value::Bool(true),
         ));
     }
+    if hyper {
+        // Python int lists convert to I32 arrays; the hash constants are U64.
+        let i32s = |v: &[i32]| gguf_file::Value::Array(v.iter().map(|&x| gguf_file::Value::I32(x)).collect());
+        let u64s = |v: &[u64]| gguf_file::Value::Array(v.iter().map(|&x| gguf_file::Value::U64(x)).collect());
+        metadata.extend([
+            (key("hyper_connection.count"), u32v(hc as u32)),
+            (key("hyper_connection.low_rank"), u32v(hc_rank as u32)),
+            (key("attention.indexer.head_count"), u32v(idx_heads as u32)),
+            (key("attention.indexer.key_length"), u32v(idx_dim as u32)),
+            (key("attention.indexer.top_k"), u32v(2)),
+            (key("attention.compress_ratios"), i32s(&[0, 2])),
+            (key("ple.layers"), i32s(&[0])),
+            (key("ple.ngram_size"), u32v(3)),
+            (key("ple.heads_per_ngram"), u32v(2)),
+            (key("ple.conv_kernel"), u32v(ple_kernel as u32)),
+            (key("ple.eos_token_id"), u32v(3)),
+            (key("ple.layer_multipliers"), u64s(&[3, 1_000_003, 24_000_000_000_017])),
+            (key("ple.head_offsets"), u64s(&[0, 10, 20, 30])),
+            (key("ple.head_vocab_sizes"), u64s(&[10, 9, 10, 7])),
+            (key("embedding_length_per_layer_input"), u32v(ple_dim as u32)),
+        ]);
+    }
     let sections = |s: [u32; 4]| {
         gguf_file::Value::Array(s.iter().map(|&x| gguf_file::Value::U32(x)).collect())
     };
@@ -866,6 +895,8 @@ pub fn write_tiny_qwen_gguf(path: &Path, arch: &str) {
         "qwen35" | "qwen35moe" => {
             metadata.push((key("rope.dimension_sections"), sections([1, 1, 0, 0])))
         }
+        // IM-RoPE over 2 pairs with sections [1, 0, 0, 1]: pair 1 is frozen.
+        "qwen4exp" => metadata.push((key("rope.dimension_sections"), sections([1, 0, 0, 1]))),
         _ => {}
     }
     if hybrid {
@@ -889,28 +920,66 @@ pub fn write_tiny_qwen_gguf(path: &Path, arch: &str) {
         ),
         ("output_norm.weight".to_string(), qtensor(ones(EMB), &[EMB])),
     ];
+    if hyper {
+        tensors.pop(); // the final hyper-connection mixer is the output norm
+    }
 
     let mut seed = 10u32;
     let mut next = |n: usize| {
         seed = seed.wrapping_add(7).wrapping_mul(2_654_435_761) | 1;
         weights(n, seed)
     };
+    // Gammas near 1 (the converter folds zero-centred ones to 1 + w).
+    let gamma = |w: Vec<f32>| w.into_iter().map(|x| 1.0 + 3.0 * x).collect::<Vec<f32>>();
     let q_dim = h * hd * if hybrid { 2 } else { 1 };
+    if hyper {
+        let wide = hc * EMB;
+        tensors.push(("output_hc_norm.weight".to_string(), qtensor(gamma(next(wide)), &[hc, EMB])));
+        tensors.push(("output_hc_down.weight".to_string(), qtensor(next(hc_rank * wide).iter().map(|x| x * 10.0).collect(), &[hc_rank, wide])));
+        tensors.push(("output_hc_up.weight".to_string(), qtensor(next(wide * hc_rank).iter().map(|x| x * 10.0).collect(), &[wide, hc_rank])));
+        tensors.push((
+            "per_layer_token_embd.weight".to_string(),
+            qtensor(next(ple_rows * ple_dim).iter().map(|x| x * 10.0).collect(), &[ple_rows, ple_dim]),
+        ));
+    }
     for i in 0..n_layer {
         let p = format!("blk.{i}");
         let mut push = |name: &str, data: Vec<f32>, shape: &[usize]| {
             tensors.push((format!("{p}.{name}"), qtensor(data, shape)));
         };
-        push("attn_norm.weight", ones(EMB), &[EMB]);
-        push(
-            if hybrid {
-                "post_attention_norm.weight"
+        if hyper {
+            let wide = hc * EMB;
+            for m in ["hc_attn", "hc_ffn"] {
+                push(&format!("{m}_norm.weight"), gamma(next(wide)), &[hc, EMB]);
+                push(&format!("{m}_down.weight"), next(hc_rank * wide).iter().map(|x| x * 10.0).collect(), &[hc_rank, wide]);
+                push(&format!("{m}_up.weight"), next(wide * hc_rank).iter().map(|x| x * 10.0).collect(), &[wide, hc_rank]);
+                push(&format!("{m}_inject.weight"), next(hc * wide).iter().map(|x| x * 10.0).collect(), &[hc, wide]);
+            }
+            if i == 0 {
+                push("ple_key.weight", next(wide * EMB).iter().map(|x| x * 10.0).collect(), &[wide, EMB]);
+                push("ple_value.weight", next(EMB * EMB).iter().map(|x| x * 10.0).collect(), &[EMB, EMB]);
+                for n in ["ple_norm_key", "ple_norm_query", "ple_norm_conv"] {
+                    push(&format!("{n}.weight"), gamma(next(wide)), &[hc, EMB]);
+                }
+                push("ple_conv1d.weight", next(wide * ple_kernel).iter().map(|x| x * 10.0).collect(), &[wide, ple_kernel]);
             } else {
-                "ffn_norm.weight"
-            },
-            ones(EMB),
-            &[EMB],
-        );
+                push("indexer.q_proj.weight", next(idx_heads * idx_dim * EMB).iter().map(|x| x * 10.0).collect(), &[idx_heads * idx_dim, EMB]);
+                push("indexer.k_proj.weight", next(idx_dim * EMB).iter().map(|x| x * 10.0).collect(), &[idx_dim, EMB]);
+                push("indexer.q_norm.weight", gamma(next(idx_dim)), &[idx_dim]);
+                push("indexer.k_norm.weight", gamma(next(idx_dim)), &[idx_dim]);
+            }
+        } else {
+            push("attn_norm.weight", ones(EMB), &[EMB]);
+            push(
+                if hybrid {
+                    "post_attention_norm.weight"
+                } else {
+                    "ffn_norm.weight"
+                },
+                ones(EMB),
+                &[EMB],
+            );
+        }
         if hybrid && i == 0 {
             // Gated DeltaNet layer.
             push("attn_qkv.weight", next(conv_dim * EMB), &[conv_dim, EMB]);

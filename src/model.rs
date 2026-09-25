@@ -14,7 +14,7 @@
 //! | `phi3`                                          | `quantized_phi3`
 //! | `qwen2`                                         | `quantized_qwen2`
 //! | `qwen3`                                         | `quantized_qwen3`
-//! | `qwen`, `qwen2moe`, `qwen2vl`, `qwen3moe`, `qwen3vl`, `qwen3vlmoe`, `qwen3next`, `qwen35`, `qwen35moe` | `quantized_qwen` (Joshua)
+//! | `qwen`, `qwen2moe`, `qwen2vl`, `qwen3moe`, `qwen3vl`, `qwen3vlmoe`, `qwen3next`, `qwen35`, `qwen35moe`, `qwen4exp` | `quantized_qwen` (Joshua)
 //! | `deepseek` (DeepSeek-MoE)                        | `quantized_deepseek2` (Joshua)
 //! | `deepseek2` (DeepSeek-V2/V2.5/V3/V3.1/R1, Kimi-K2) | `quantized_deepseek2` (Joshua)
 //! | `deepseek4` (DeepSeek-V4)                        | `quantized_deepseek4` (Joshua)
@@ -78,6 +78,9 @@ pub enum Architecture {
     Qwen35,
     /// `qwen35moe` — Qwen3.5-MoE (Gated DeltaNet hybrid).
     Qwen35Moe,
+    /// `qwen4exp` — Qwen3.8-Flash-Next (Qwen3.5-MoE plus hyper-connections,
+    /// QSA block-sparse attention and PLE n-gram hash embeddings).
+    Qwen4Exp,
     /// `deepseek` — DeepSeek-MoE (GQA + fine-grained MoE with shared
     /// experts).  Loaded by the `deepseek2` loader into
     /// [`QuantizedModel::DeepSeek2`].
@@ -168,9 +171,6 @@ const KNOWN_UNSUPPORTED_ARCHS: &[&str] = &[
     "plamo",
     "plamo2",
     "plm",
-    // Qwen4-exp: Hyper-Connections, DeepSeek-V4-style compressed/indexed
-    // attention and n-gram hash embeddings on top of Gated DeltaNet.
-    "qwen4exp",
     // Qwen3-TTS emits audio codec tokens, not text.
     "qwen3tts",
     "refact",
@@ -212,6 +212,7 @@ const NAMES: &[(&str, Architecture)] = &[
     ("qwen3next", Architecture::Qwen3Next),
     ("qwen35", Architecture::Qwen35),
     ("qwen35moe", Architecture::Qwen35Moe),
+    ("qwen4exp", Architecture::Qwen4Exp),
     ("deepseek", Architecture::DeepSeek),
     ("deepseek2", Architecture::DeepSeek2),
     ("deepseek4", Architecture::DeepSeek4),
@@ -365,6 +366,7 @@ impl Architecture {
             Self::Qwen3Next => "Qwen3-Next",
             Self::Qwen35 => "Qwen3.5",
             Self::Qwen35Moe => "Qwen3.5-MoE",
+            Self::Qwen4Exp => "Qwen3.8-Flash-Next (qwen4exp)",
             Self::DeepSeek => "DeepSeek-MoE",
             Self::DeepSeek2 => "DeepSeek-V2 / DeepSeek-V3 / DeepSeek-R1 / Kimi-K2",
             Self::DeepSeek4 => "DeepSeek-V4",
@@ -587,7 +589,8 @@ impl QuantizedModel {
             | Architecture::Qwen3VlMoe
             | Architecture::Qwen3Next
             | Architecture::Qwen35
-            | Architecture::Qwen35Moe => {
+            | Architecture::Qwen35Moe
+            | Architecture::Qwen4Exp => {
                 crate::quantized_qwen::ModelWeights::from_gguf_mmap_placed(
                     gguf,
                     reader,
