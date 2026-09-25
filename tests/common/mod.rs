@@ -564,7 +564,16 @@ pub fn write_tiny_deepseek2_v2_gguf(path: &Path) {
 /// style routing (softmax gating, no `exp_probs_b` selection bias) instead of
 /// the DeepSeek-V3 / Kimi-K2 default (sigmoid gating with a bias).
 pub fn write_deepseek2_gguf(path: &Path, split_mla: bool, softmax_v2: bool) {
-    write_deepseek_family_gguf(path, false, split_mla, softmax_v2);
+    write_deepseek_family_gguf(path, false, split_mla, softmax_v2, false);
+}
+
+/// Write a tiny `glm-dsa` (GLM-5.x) GGUF: the split-MLA `deepseek2` stack
+/// with DeepSeek Sparse Attention over four layers — full indexers on layers
+/// 0 and 2, each shared by the layer after it (IndexShare) — with a top-k of
+/// 3 so a six-token prompt is sparse from its fourth query, plus a trailing
+/// NextN block the trunk must skip.
+pub fn write_tiny_glm_dsa_gguf(path: &Path) {
+    write_deepseek_family_gguf(path, false, true, false, true);
 }
 
 /// Write a tiny `deepseek` (DeepSeek-MoE) GGUF: GQA attention (2 query heads
@@ -572,11 +581,12 @@ pub fn write_deepseek2_gguf(path: &Path, split_mla: bool, softmax_v2: bool) {
 /// softmax-routed MoE layer with a shared expert and no weight
 /// normalisation — the same MoE stack as [`write_deepseek2_gguf`], minus MLA.
 pub fn write_tiny_deepseek_gguf(path: &Path) {
-    write_deepseek_family_gguf(path, true, false, true);
+    write_deepseek_family_gguf(path, true, false, true, false);
 }
 
-/// Shared body of the `deepseek` (`gqa`) and `deepseek2` fixture writers.
-fn write_deepseek_family_gguf(path: &Path, gqa: bool, split_mla: bool, softmax_v2: bool) {
+/// Shared body of the `deepseek` (`gqa`), `deepseek2` and `glm-dsa` (`dsa`)
+/// fixture writers.
+fn write_deepseek_family_gguf(path: &Path, gqa: bool, split_mla: bool, softmax_v2: bool, dsa: bool) {
     const VOCAB: usize = 16;
     const EMB: usize = 8;
     const H: usize = 2; // heads
@@ -589,10 +599,20 @@ fn write_deepseek_family_gguf(path: &Path, gqa: bool, split_mla: bool, softmax_v
     const NFF: usize = 16; // dense ffn
     const NE: usize = 4; // experts
     const NFE: usize = 8; // expert ffn
-    const NLAYER: usize = 2;
     const KV: usize = 1; // GQA kv heads (`deepseek` only)
+    const IH: usize = 2; // indexer heads (`glm-dsa`)
+    const ID: usize = 6; // indexer head dim
+    let n_layer = if dsa { 4 } else { 2 };
+    let nextn = usize::from(dsa);
+    let full = |i: usize| i.is_multiple_of(2); // glm-dsa layers running their own indexer
 
-    let arch = if gqa { "deepseek" } else { "deepseek2" };
+    let arch = if gqa {
+        "deepseek"
+    } else if dsa {
+        "glm-dsa"
+    } else {
+        "deepseek2"
+    };
     let u32v = |v: u32| gguf_file::Value::U32(v);
     let f32v = |v: f32| gguf_file::Value::F32(v);
     let key = |s: &str| format!("{arch}.{s}");
@@ -602,7 +622,7 @@ fn write_deepseek_family_gguf(path: &Path, gqa: bool, split_mla: bool, softmax_v
             gguf_file::Value::String(arch.to_string()),
         ),
         (key("attention.head_count"), u32v(H as u32)),
-        (key("block_count"), u32v(NLAYER as u32)),
+        (key("block_count"), u32v((n_layer + nextn) as u32)),
         (key("embedding_length"), u32v(EMB as u32)),
         (key("context_length"), u32v(512)),
         (key("attention.layer_norm_rms_epsilon"), f32v(1e-5)),
@@ -642,6 +662,18 @@ fn write_deepseek_family_gguf(path: &Path, gqa: bool, split_mla: bool, softmax_v
             (key("expert_group_used_count"), u32v(1)),
         ]);
     }
+    if dsa {
+        metadata.extend([
+            (key("nextn_predict_layers"), u32v(nextn as u32)),
+            (key("attention.indexer.head_count"), u32v(IH as u32)),
+            (key("attention.indexer.key_length"), u32v(ID as u32)),
+            (key("attention.indexer.top_k"), u32v(3)),
+            (
+                key("attention.indexer.types"),
+                gguf_file::Value::Array((0..n_layer).map(|i| gguf_file::Value::Bool(full(i))).collect()),
+            ),
+        ]);
+    }
     metadata.extend(tiny_tokenizer_metadata());
     if split_mla {
         // Advertise the pre-split MLA head dims so llama.cpp reads attn_k_b /
@@ -664,8 +696,26 @@ fn write_deepseek_family_gguf(path: &Path, gqa: bool, split_mla: bool, softmax_v
         seed = seed.wrapping_add(7).wrapping_mul(2_654_435_761) | 1;
         weights(n, seed)
     };
-    for i in 0..NLAYER {
+    for i in 0..n_layer + nextn {
         let p = format!("blk.{i}");
+        if i >= n_layer {
+            // The NextN block: only its own inputs; never loaded.
+            tensors.push((format!("{p}.nextn.eh_proj.weight"), qtensor(next(EMB * 2 * EMB), &[EMB, 2 * EMB])));
+            tensors.push((format!("{p}.nextn.enorm.weight"), qtensor(ones(EMB), &[EMB])));
+            continue;
+        }
+        if dsa && full(i) {
+            // Scaled up so the indexer's choice visibly moves the logits.
+            let big = |w: Vec<f32>| w.into_iter().map(|x| x * 10.0).collect::<Vec<f32>>();
+            tensors.push((format!("{p}.indexer.attn_q_b.weight"), qtensor(big(next(IH * ID * LQ)), &[IH * ID, LQ])));
+            tensors.push((format!("{p}.indexer.attn_k.weight"), qtensor(big(next(ID * EMB)), &[ID, EMB])));
+            tensors.push((
+                format!("{p}.indexer.k_norm.weight"),
+                qtensor(next(ID).iter().map(|x| 1.0 + 3.0 * x).collect(), &[ID]),
+            ));
+            tensors.push((format!("{p}.indexer.k_norm.bias"), qtensor(next(ID), &[ID])));
+            tensors.push((format!("{p}.indexer.proj.weight"), qtensor(big(next(IH * EMB)), &[IH, EMB])));
+        }
         tensors.push((format!("{p}.attn_norm.weight"), qtensor(ones(EMB), &[EMB])));
         tensors.push((format!("{p}.ffn_norm.weight"), qtensor(ones(EMB), &[EMB])));
         if gqa {
@@ -804,6 +854,178 @@ fn write_deepseek_family_gguf(path: &Path, gqa: bool, split_mla: bool, softmax_v
     gguf_file::write(&mut file, &metadata_refs, &tensor_refs).unwrap();
 }
 
+/// Write a tiny GLM-5.3-Flash GGUF under either architecture name llama.cpp's
+/// open pull requests use: `glm5-next` (with `indexer.types`: the second
+/// sparse layer shares the first's selection across a KDA layer) or
+/// `glm5next` (no types: every sparse layer runs its own indexer).  Four
+/// layers — KDA, sparse NoPE MLA, KDA, sparse NoPE MLA — over four
+/// hyper-connection streams, a k-pool indexer (pools of 2, top-k 2: one
+/// pool plus the query's tail), a leading dense layer then sigmoid,
+/// group-limited MoE with SwiGLU clamps tight enough to bite, and a trailing
+/// NextN block the trunk must skip.
+pub fn write_tiny_glm5next_gguf(path: &Path, arch: &str) {
+    const VOCAB: usize = 16;
+    const EMB: usize = 8;
+    const H: usize = 2; // heads (KDA and MLA)
+    const KD: usize = 4; // KDA head dim
+    const INNER: usize = H * KD;
+    const CONV: usize = 3;
+    const LQ: usize = 6; // q_lora_rank
+    const LKV: usize = 6; // kv_lora_rank
+    const NP: usize = 4; // qk_nope (NoPE: the whole key)
+    const VH: usize = 4;
+    const IH: usize = 2; // indexer heads
+    const ID: usize = 4; // indexer head dim
+    const KPOOL: usize = 2;
+    const HC: usize = 4;
+    const NFF: usize = 16;
+    const NE: usize = 4;
+    const NFE: usize = 8;
+    let n_layer = 4;
+    let recurrent = |i: usize| i.is_multiple_of(2);
+    let with_types = arch == "glm5-next";
+    let full = |i: usize| !with_types || i != 3;
+
+    let u32v = |v: u32| gguf_file::Value::U32(v);
+    let f32v = |v: f32| gguf_file::Value::F32(v);
+    let key = |s: &str| format!("{arch}.{s}");
+    let arr = |v: Vec<gguf_file::Value>| gguf_file::Value::Array(v);
+    let mut metadata: Vec<(String, gguf_file::Value)> = vec![
+        ("general.architecture".to_string(), gguf_file::Value::String(arch.to_string())),
+        (key("attention.head_count"), u32v(H as u32)),
+        (
+            key("attention.head_count_kv"),
+            arr((0..=n_layer).map(|i| u32v(u32::from(i == n_layer || !recurrent(i)))).collect()),
+        ),
+        (key("block_count"), u32v(n_layer as u32 + 1)),
+        (key("nextn_predict_layers"), u32v(1)),
+        (key("embedding_length"), u32v(EMB as u32)),
+        (key("context_length"), u32v(512)),
+        (key("attention.layer_norm_rms_epsilon"), f32v(1e-5)),
+        (key("attention.layer_norm_epsilon"), f32v(1e-6)),
+        (key("attention.q_lora_rank"), u32v(LQ as u32)),
+        (key("attention.kv_lora_rank"), u32v(LKV as u32)),
+        (key("attention.key_length_mla"), u32v(NP as u32)),
+        (key("attention.value_length_mla"), u32v(VH as u32)),
+        (key("rope.dimension_count"), u32v(0)),
+        (key("kda.head_dim"), u32v(KD as u32)),
+        (key("kda.gate_lower_bound"), f32v(-5.0)),
+        (key("ssm.conv_kernel"), u32v(CONV as u32)),
+        (key("attention.indexer.head_count"), u32v(IH as u32)),
+        (key("attention.indexer.key_length"), u32v(ID as u32)),
+        (key("attention.indexer.top_k"), u32v(2)),
+        (key("attention.indexer.kpool"), u32v(KPOOL as u32)),
+        (key("hyper_connection.count"), u32v(HC as u32)),
+        (key("hyper_connection.sinkhorn_iterations"), u32v(3)),
+        (key("hyper_connection.epsilon"), f32v(1e-6)),
+        (key("feed_forward_length"), u32v(NFF as u32)),
+        (key("leading_dense_block_count"), u32v(1)),
+        (key("expert_count"), u32v(NE as u32)),
+        (key("expert_used_count"), u32v(2)),
+        (key("expert_feed_forward_length"), u32v(NFE as u32)),
+        (key("expert_shared_count"), u32v(1)),
+        (key("expert_gating_func"), u32v(2)),
+        (key("expert_weights_scale"), f32v(2.5)),
+        (key("expert_weights_norm"), gguf_file::Value::Bool(true)),
+        (key("expert_group_count"), u32v(2)),
+        (key("expert_group_used_count"), u32v(1)),
+        (key("swiglu_clamp_exp"), arr((0..=n_layer).map(|_| f32v(0.1)).collect())),
+        (key("swiglu_clamp_shexp"), arr((0..=n_layer).map(|_| f32v(0.15)).collect())),
+    ];
+    if with_types {
+        metadata.push((key("attention.indexer.kpool_select_tail"), gguf_file::Value::Bool(true)));
+        metadata.push((
+            key("attention.indexer.types"),
+            arr((0..n_layer).map(|i| gguf_file::Value::Bool(full(i))).collect()),
+        ));
+    }
+    metadata.extend(tiny_tokenizer_metadata());
+
+    let mut seed = 20u32;
+    let mut next = |n: usize| {
+        seed = seed.wrapping_add(7).wrapping_mul(2_654_435_761) | 1;
+        weights(n, seed)
+    };
+    let gamma = |w: Vec<f32>| w.into_iter().map(|x| 1.0 + 3.0 * x).collect::<Vec<f32>>();
+    let big = |w: Vec<f32>| w.into_iter().map(|x| x * 10.0).collect::<Vec<f32>>();
+    let mut tensors: Vec<(String, QTensor)> = vec![
+        ("token_embd.weight".to_string(), qtensor(weights(VOCAB * EMB, 1), &[VOCAB, EMB])),
+        ("output_norm.weight".to_string(), qtensor(gamma(next(EMB)), &[EMB])),
+        ("output.weight".to_string(), qtensor(next(VOCAB * EMB), &[VOCAB, EMB])),
+    ];
+    for i in 0..=n_layer {
+        let p = format!("blk.{i}");
+        let mut push = |name: &str, data: Vec<f32>, shape: &[usize]| {
+            tensors.push((format!("{p}.{name}"), qtensor(data, shape)));
+        };
+        if i == n_layer {
+            push("nextn.eh_proj.weight", next(EMB * 2 * EMB), &[EMB, 2 * EMB]);
+            continue;
+        }
+        push("attn_norm.weight", gamma(next(EMB)), &[EMB]);
+        push("ffn_norm.weight", gamma(next(EMB)), &[EMB]);
+        let mix = (2 + HC) * HC;
+        for m in ["hc_attn", "hc_ffn"] {
+            push(&format!("{m}_fn.weight"), big(next(mix * HC * EMB)), &[mix, HC * EMB]);
+            push(&format!("{m}_base.weight"), big(next(mix)), &[mix]);
+            push(&format!("{m}_scale.weight"), gamma(next(3)), &[3]);
+        }
+        if recurrent(i) {
+            for c in ["q", "k", "v"] {
+                push(&format!("attn_{c}.weight"), big(next(INNER * EMB)), &[INNER, EMB]);
+                push(&format!("ssm_conv1d_{c}.weight"), big(next(INNER * CONV)), &[1, INNER, 1, CONV]);
+            }
+            push("ssm_f_a.weight", big(next(KD * EMB)), &[KD, EMB]);
+            push("ssm_f_b.weight", big(next(INNER * KD)), &[INNER, KD]);
+            push("ssm_dt.bias", next(INNER), &[INNER]);
+            // −exp(A_log), as the converters store it.
+            push("ssm_a", next(H).iter().map(|x| -(1.0 + 10.0 * x.abs())).collect(), &[H]);
+            push("ssm_beta.weight", big(next(H * EMB)), &[H, EMB]);
+            push("ssm_g_a.weight", big(next(KD * EMB)), &[KD, EMB]);
+            push("ssm_g_b.weight", big(next(INNER * KD)), &[INNER, KD]);
+            push("ssm_norm.weight", gamma(next(KD)), &[KD]);
+            push("attn_output.weight", next(EMB * INNER), &[EMB, INNER]);
+        } else {
+            push("attn_q_a.weight", next(LQ * EMB), &[LQ, EMB]);
+            push("attn_q_a_norm.weight", gamma(next(LQ)), &[LQ]);
+            push("attn_q_b.weight", big(next(H * NP * LQ)), &[H * NP, LQ]);
+            push("attn_kv_a_mqa.weight", next(LKV * EMB), &[LKV, EMB]);
+            push("attn_kv_a_norm.weight", gamma(next(LKV)), &[LKV]);
+            push("attn_k_b.weight", next(H * LKV * NP), &[H, LKV, NP]);
+            push("attn_v_b.weight", next(H * VH * LKV), &[H, VH, LKV]);
+            push("attn_output.weight", next(EMB * H * VH), &[EMB, H * VH]);
+            if full(i) {
+                push("indexer.attn_q_b.weight", big(next(IH * ID * LQ)), &[IH * ID, LQ]);
+                push("indexer.attn_k.weight", big(next(ID * EMB)), &[ID, EMB]);
+                push("indexer.k_norm.weight", gamma(next(ID)), &[ID]);
+                push("indexer.k_norm.bias", next(ID), &[ID]);
+                push("indexer.proj.weight", big(next(IH * EMB)), &[IH, EMB]);
+                push("indexer_compressor_gate.weight", big(next(ID * EMB)), &[ID, EMB]);
+                push("indexer_compressor_ape.weight", big(next(KPOOL * ID)), &[KPOOL, ID]);
+            }
+        }
+        if i == 0 {
+            push("ffn_gate.weight", next(NFF * EMB), &[NFF, EMB]);
+            push("ffn_up.weight", next(NFF * EMB), &[NFF, EMB]);
+            push("ffn_down.weight", next(EMB * NFF), &[EMB, NFF]);
+        } else {
+            push("ffn_gate_inp.weight", next(NE * EMB), &[NE, EMB]);
+            push("exp_probs_b.bias", next(NE), &[NE]);
+            push("ffn_gate_exps.weight", big(next(NE * NFE * EMB)), &[NE, NFE, EMB]);
+            push("ffn_up_exps.weight", big(next(NE * NFE * EMB)), &[NE, NFE, EMB]);
+            push("ffn_down_exps.weight", next(NE * EMB * NFE), &[NE, EMB, NFE]);
+            push("ffn_gate_shexp.weight", big(next(NFE * EMB)), &[NFE, EMB]);
+            push("ffn_up_shexp.weight", big(next(NFE * EMB)), &[NFE, EMB]);
+            push("ffn_down_shexp.weight", next(EMB * NFE), &[EMB, NFE]);
+        }
+    }
+
+    let metadata_refs: Vec<(&str, &gguf_file::Value)> = metadata.iter().map(|(k, v)| (k.as_str(), v)).collect();
+    let tensor_refs: Vec<(&str, &QTensor)> = tensors.iter().map(|(k, v)| (k.as_str(), v)).collect();
+    let mut file = File::create(path).unwrap();
+    gguf_file::write(&mut file, &metadata_refs, &tensor_refs).unwrap();
+}
+
 /// Write a tiny but structurally valid `qwen3moe` GGUF exercising the full
 /// Qwen3-MoE feature set: GQA attention with per-head Q/K norms and a
 /// half-split RoPE over a head_dim decoupled from the embedding width, plus a
@@ -837,8 +1059,17 @@ pub fn write_tiny_qwen_gguf(path: &Path, arch: &str) {
     let hybrid = matches!(arch, "qwen3next" | "qwen35" | "qwen35moe" | "qwen4exp");
     let moe = matches!(
         arch,
-        "qwen2moe" | "qwen3moe" | "qwen3vlmoe" | "qwen3next" | "qwen35moe" | "qwen4exp"
+        "qwen2moe" | "qwen3moe" | "qwen3vlmoe" | "qwen3next" | "qwen35moe" | "qwen4exp" | "glm4moe"
     );
+    // GLM: partial rotary (half of each head), fused `[gate ‖ up]` FFN for
+    // the dense generations, GLM-4's sandwich norms, and a trailing NextN
+    // (MTP) block the trunk must skip.  glm4moe: dense layer 0, then a
+    // sigmoid-routed MoE with a selection bias and an ungated shared expert.
+    let glm = matches!(arch, "chatglm" | "glm4" | "glm4moe");
+    let fused_ffn = matches!(arch, "chatglm" | "glm4");
+    let sandwich = arch == "glm4";
+    let nextn = if matches!(arch, "glm4" | "glm4moe") { 1 } else { 0 };
+    let leading_dense = if arch == "glm4moe" { 1 } else { 0 };
     let shared_expert = matches!(arch, "qwen2moe" | "qwen3next" | "qwen35moe" | "qwen4exp");
     // qwen4exp: hyper-connections (2 streams, rank 3), QSA on the attention
     // layer (blocks of 2, budget 2 cells + tail) and PLE on the DeltaNet layer
@@ -847,9 +1078,9 @@ pub fn write_tiny_qwen_gguf(path: &Path, arch: &str) {
     let (hc, hc_rank) = (2usize, 3usize);
     let (idx_heads, idx_dim) = (2usize, 6usize);
     let (ple_dim, ple_rows, ple_kernel) = (2usize, 40usize, 3usize);
-    let qk_norm = arch.starts_with("qwen3") || arch == "qwen4exp";
-    let biases = matches!(arch, "qwen2moe" | "qwen2vl");
-    let fused_qkv = arch == "qwen";
+    let qk_norm = arch.starts_with("qwen3") || arch == "qwen4exp" || arch == "glm4moe";
+    let biases = matches!(arch, "qwen2moe" | "qwen2vl" | "glm4" | "glm4moe");
+    let fused_qkv = arch == "qwen" || arch == "chatglm";
     let h = 2usize;
     let kv = if arch == "qwen" { 2 } else { 1 };
     let hd = if arch == "qwen3moe" || arch == "qwen" || arch == "qwen2moe" {
@@ -873,7 +1104,7 @@ pub fn write_tiny_qwen_gguf(path: &Path, arch: &str) {
         ),
         (key("attention.head_count"), u32v(h as u32)),
         (key("attention.head_count_kv"), u32v(kv as u32)),
-        (key("block_count"), u32v(n_layer as u32)),
+        (key("block_count"), u32v((n_layer + nextn) as u32)),
         (key("embedding_length"), u32v(EMB as u32)),
         (key("context_length"), u32v(512)),
         (key("attention.layer_norm_rms_epsilon"), f32v(1e-5)),
@@ -900,6 +1131,22 @@ pub fn write_tiny_qwen_gguf(path: &Path, arch: &str) {
             key("attention.norm_topk_prob"),
             gguf_file::Value::Bool(true),
         ));
+    }
+    if glm {
+        metadata.push((key("rope.dimension_count"), u32v((hd / 2) as u32)));
+    }
+    if nextn > 0 {
+        metadata.push((key("nextn_predict_layers"), u32v(nextn as u32)));
+    }
+    if arch == "glm4moe" {
+        metadata.extend([
+            (key("feed_forward_length"), u32v(NFF as u32)),
+            (key("leading_dense_block_count"), u32v(leading_dense as u32)),
+            (key("expert_shared_count"), u32v(1)),
+            (key("expert_gating_func"), u32v(2)),
+            (key("expert_weights_scale"), f32v(2.5)),
+            (key("expert_weights_norm"), gguf_file::Value::Bool(true)),
+        ]);
     }
     if hyper {
         // Python int lists convert to I32 arrays; the hash constants are U64.
@@ -983,11 +1230,17 @@ pub fn write_tiny_qwen_gguf(path: &Path, arch: &str) {
             qtensor(next(ple_rows * ple_dim).iter().map(|x| x * 10.0).collect(), &[ple_rows, ple_dim]),
         ));
     }
-    for i in 0..n_layer {
+    for i in 0..n_layer + nextn {
         let p = format!("blk.{i}");
         let mut push = |name: &str, data: Vec<f32>, shape: &[usize]| {
             tensors.push((format!("{p}.{name}"), qtensor(data, shape)));
         };
+        if i >= n_layer {
+            // The NextN block's own inputs; its layer tensors follow below.
+            push("nextn.eh_proj.weight", next(EMB * 2 * EMB), &[EMB, 2 * EMB]);
+            push("nextn.enorm.weight", gamma(next(EMB)), &[EMB]);
+            push("nextn.hnorm.weight", gamma(next(EMB)), &[EMB]);
+        }
         if hyper {
             let wide = hc * EMB;
             for m in ["hc_attn", "hc_ffn"] {
@@ -1009,10 +1262,14 @@ pub fn write_tiny_qwen_gguf(path: &Path, arch: &str) {
                 push("indexer.q_norm.weight", gamma(next(idx_dim)), &[idx_dim]);
                 push("indexer.k_norm.weight", gamma(next(idx_dim)), &[idx_dim]);
             }
+        } else if sandwich {
+            for n in ["attn_norm", "post_attention_norm", "ffn_norm", "post_ffw_norm"] {
+                push(&format!("{n}.weight"), gamma(next(EMB)), &[EMB]);
+            }
         } else {
             push("attn_norm.weight", ones(EMB), &[EMB]);
             push(
-                if hybrid {
+                if hybrid || arch == "glm4moe" {
                     "post_attention_norm.weight"
                 } else {
                     "ffn_norm.weight"
@@ -1066,8 +1323,11 @@ pub fn write_tiny_qwen_gguf(path: &Path, arch: &str) {
                 push("attn_k_norm.weight", ones(hd), &[hd]);
             }
         }
-        if moe {
+        if moe && i >= leading_dense {
             push("ffn_gate_inp.weight", next(NE * EMB), &[NE, EMB]);
+            if arch == "glm4moe" {
+                push("exp_probs_b.bias", next(NE).iter().map(|x| x * 3.0).collect(), &[NE]);
+            }
             push(
                 "ffn_gate_exps.weight",
                 next(NE * NFE * EMB),
@@ -1079,12 +1339,17 @@ pub fn write_tiny_qwen_gguf(path: &Path, arch: &str) {
                 next(NE * EMB * NFE),
                 &[NE, EMB, NFE],
             );
-            if shared_expert {
-                push("ffn_gate_inp_shexp.weight", next(EMB), &[EMB]);
+            if shared_expert || arch == "glm4moe" {
+                if shared_expert {
+                    push("ffn_gate_inp_shexp.weight", next(EMB), &[EMB]);
+                }
                 push("ffn_gate_shexp.weight", next(NFE * EMB), &[NFE, EMB]);
                 push("ffn_up_shexp.weight", next(NFE * EMB), &[NFE, EMB]);
                 push("ffn_down_shexp.weight", next(EMB * NFE), &[EMB, NFE]);
             }
+        } else if fused_ffn {
+            push("ffn_up.weight", next(2 * NFF * EMB), &[2 * NFF, EMB]);
+            push("ffn_down.weight", next(EMB * NFF), &[EMB, NFF]);
         } else {
             push("ffn_gate.weight", next(NFF * EMB), &[NFF, EMB]);
             push("ffn_up.weight", next(NFF * EMB), &[NFF, EMB]);

@@ -59,10 +59,11 @@ use std::sync::Arc;
 use candle_core::quantized::{gguf_file, QMatMul, QTensor};
 use crate::paged_weights::{PagedWeight, WeightCache};
 use candle_core::{DType, Device, Module, Result, Tensor, D};
-use candle_nn::ops::{sigmoid, silu, softmax_last_dim};
+use candle_nn::ops::{sigmoid, silu};
 use candle_transformers::quantized_nn::RmsNorm;
 
 use crate::attention::{KvCache, Rope, RopeStyle};
+use crate::moe::Gating;
 
 mod qwen4exp;
 use qwen4exp::{HyperMix, Ple, PleConfig, Qsa, QsaConfig};
@@ -161,6 +162,9 @@ pub const ARCHES: &[&str] = &[
     "qwen35",
     "qwen35moe",
     "qwen4exp",
+    "chatglm",
+    "glm4",
+    "glm4moe",
 ];
 
 /// How a Gated DeltaNet layer's value heads share the (fewer) key heads.
@@ -213,6 +217,9 @@ struct Config {
     rms_eps: f64,
     // RoPE.
     n_rot: usize,
+    /// Pairing of the rotated dims: NEOX for the Qwens and GLM-4-MoE,
+    /// adjacent pairs (llama.cpp `NORM`) for ChatGLM and GLM-4.
+    rope_style: RopeStyle,
     rope_theta: f32,
     /// Linear RoPE scaling (`1 / rope.scaling.factor` for `"linear"`), else 1.
     rope_freq_scale: f32,
@@ -235,6 +242,9 @@ struct Config {
     // MoE (`n_expert == 0` → dense FFN).
     n_expert: usize,
     n_expert_used: usize,
+    /// Leading layers with a dense FFN before the MoE ones (GLM-4-MoE).
+    leading_dense: usize,
+    gating: Gating,
     expert_weights_norm: bool,
     expert_weights_scale: f64,
 }
@@ -247,7 +257,13 @@ impl Config {
         let m = Meta::new(md, arch);
         let n_head = m.u32("attention.head_count")? as usize;
         let n_kv_head = m.u32_or("attention.head_count_kv", n_head as u32) as usize;
-        let n_layer = m.u32("block_count")? as usize;
+        // `block_count` includes any appended NextN / MTP blocks (GLM-4.5+,
+        // GLM-OCR); those are draft heads, not part of the trunk.
+        let block_count = m.u32("block_count")?;
+        let Some(n_layer) = block_count.checked_sub(m.u32_or("nextn_predict_layers", 0)) else {
+            candle_core::bail!("{arch}: nextn_predict_layers exceeds block_count {block_count}");
+        };
+        let n_layer = n_layer as usize;
         let n_embd = m.u32("embedding_length")? as usize;
         let context_length = m.u32("context_length")? as usize;
         let rms_eps = m.f32("attention.layer_norm_rms_epsilon")? as f64;
@@ -282,22 +298,31 @@ impl Config {
             }
             _ => 1.0,
         };
+        let sections = {
+            let s = m.array_u32("rope.dimension_sections", 4);
+            [s[0], s[1], s[2], s[3]]
+        };
+        let glm = matches!(arch, "chatglm" | "glm4" | "glm4moe");
         let interleaved_mrope = match arch {
             "qwen2vl" => Some(false),
             "qwen3vl" | "qwen3vlmoe" | "qwen35" | "qwen35moe" | "qwen4exp" => Some(true),
+            // The GLM-4.xV conversions (llama.cpp `use_mrope`).
+            "glm4" | "glm4moe" if sections[0] > 0 && sections[1] > 0 => Some(false),
             _ => None,
         };
         let mrope = interleaved_mrope.map(|interleaved| {
-            let s = m.array_u32("rope.dimension_sections", 4);
-            let s = [s[0], s[1], s[2], s[3]];
             // Qwen3.5's converter default when a checkpoint omits the field.
-            let s = if s == [0; 4] && matches!(arch, "qwen35" | "qwen35moe" | "qwen4exp") {
+            let s = if sections == [0; 4] && matches!(arch, "qwen35" | "qwen35moe" | "qwen4exp") {
                 [11, 11, 10, 0]
             } else {
-                s
+                sections
             };
             (s, interleaved)
         });
+        let rope_style = match arch {
+            "chatglm" | "glm4" if mrope.is_none() => RopeStyle::Interleaved,
+            _ => RopeStyle::Neox,
+        };
         let attn_scale = match m.f32_or("attention.scale", 0.0) {
             s if s != 0.0 => s as f64,
             _ => 1.0 / (head_dim as f64).sqrt(),
@@ -349,9 +374,15 @@ impl Config {
             );
         }
         // llama.cpp normalises the top-k routing weights for every Qwen MoE
-        // except Qwen1.5/Qwen2-MoE (`norm_topk_prob = false`).
-        let expert_weights_norm = m.bool_or("attention.norm_topk_prob", arch != "qwen2moe");
+        // except Qwen1.5/Qwen2-MoE (`norm_topk_prob = false`); GLM-4-MoE
+        // says so explicitly.
+        let expert_weights_norm = if glm {
+            m.bool_or("expert_weights_norm", false)
+        } else {
+            m.bool_or("attention.norm_topk_prob", arch != "qwen2moe")
+        };
         let expert_weights_scale = m.f32_or("expert_weights_scale", 0.0) as f64;
+        let gating = Gating::from_meta(&m, if glm { Gating::Sigmoid } else { Gating::Softmax });
 
         let qwen4 = arch == "qwen4exp";
         let hyper = if qwen4 {
@@ -379,6 +410,7 @@ impl Config {
             head_dim,
             rms_eps,
             n_rot,
+            rope_style,
             rope_theta,
             rope_freq_scale,
             mrope,
@@ -393,13 +425,15 @@ impl Config {
             ple,
             n_expert,
             n_expert_used,
+            leading_dense: m.u32_or("leading_dense_block_count", 0) as usize,
+            gating,
             expert_weights_norm,
             expert_weights_scale,
         })
     }
 
-    /// NEOX RoPE over the leading `n_rot` dims, with the M-RoPE text mask
-    /// applied for the multi-section models.
+    /// RoPE over the leading `n_rot` dims, with the M-RoPE text mask applied
+    /// for the multi-section models.
     fn rope(&self, dev: &Device) -> Result<Rope> {
         let mut inv_freq: Vec<f32> = crate::attention::inv_freq(self.n_rot, self.rope_theta)
             .into_iter()
@@ -408,7 +442,7 @@ impl Config {
         if let Some((sections, interleaved)) = self.mrope {
             crate::attention::mrope_text_mask(&mut inv_freq, sections, interleaved);
         }
-        Rope::from_inv_freq(inv_freq, self.context_length, 1.0, RopeStyle::Neox, dev)
+        Rope::from_inv_freq(inv_freq, self.context_length, 1.0, self.rope_style, dev)
     }
 }
 
@@ -995,7 +1029,8 @@ enum Mixer {
 
 #[derive(Clone)]
 struct Mlp {
-    gate: Weight,
+    /// `None`: `up` is the fused `[gate ‖ up]` projection (ChatGLM, GLM-4).
+    gate: Option<Weight>,
     up: Weight,
     down: Weight,
     /// Per-tensor byte-range handles for best-effort page prefetch, present
@@ -1007,7 +1042,7 @@ struct Mlp {
 impl Mlp {
     fn load<R: Read + Seek>(rd: &mut Reader<R>, p: &str, suffix: &str) -> Result<Self> {
         Ok(Self {
-            gate: rd.qmatmul(&format!("{p}.ffn_gate{suffix}.weight"))?,
+            gate: rd.qmatmul_opt(&format!("{p}.ffn_gate{suffix}.weight")),
             up: rd.qmatmul(&format!("{p}.ffn_up{suffix}.weight"))?,
             down: rd.qmatmul(&format!("{p}.ffn_down{suffix}.weight"))?,
             prefetch: None,
@@ -1015,8 +1050,16 @@ impl Mlp {
     }
 
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let w1 = self.gate.forward(xs)?;
-        let w3 = self.up.forward(xs)?;
+        let (w1, w3) = match &self.gate {
+            Some(gate) => (gate.forward(xs)?, self.up.forward(xs)?),
+            // llama.cpp `LLM_FFN_SWIGLU`: silu of the first half times the
+            // second.
+            None => {
+                let y = self.up.forward(xs)?;
+                let half = y.dim(D::Minus1)? / 2;
+                (y.narrow(D::Minus1, 0, half)?, y.narrow(D::Minus1, half, half)?)
+            }
+        };
         self.down.forward(&(silu(&w1)? * w3)?)
     }
 
@@ -1025,7 +1068,10 @@ impl Mlp {
     /// quantized form.
     fn to_device(&self, device: &Device) -> Option<Self> {
         Some(Self {
-            gate: self.gate.to_uploadable(device)?,
+            gate: match &self.gate {
+                Some(g) => Some(g.to_uploadable(device)?),
+                None => None,
+            },
             up: self.up.to_uploadable(device)?,
             down: self.down.to_uploadable(device)?,
             prefetch: None,
@@ -1075,6 +1121,9 @@ impl SharedExpert {
 
 struct Moe {
     gate_t: Tensor, // router weight transposed to [n_embd, n_expert], contiguous (cached)
+    /// Selection-only expert bias (`exp_probs_b`, GLM-4-MoE).
+    gate_bias: Option<Tensor>,
+    gating: Gating,
     experts: Vec<Mlp>,
     shared: Option<SharedExpert>,
     n_expert_used: usize,
@@ -1117,24 +1166,18 @@ impl Moe {
         Ok((out.reshape((b, seq_len, h))?, ids))
     }
 
-    /// Router logits → softmax probs → top-k ids and gathered weights, with
-    /// llama.cpp's `norm_topk_prob` normalisation (min-clamp to the f16
-    /// epsilon so a degenerate routing can never divide by zero).
+    /// Router logits → scores → top-k ids and their weights (see
+    /// [`crate::moe::route`]).
     fn route(&self, x2: &Tensor) -> Result<(Tensor, Tensor)> {
-        let logits = x2.matmul(&self.gate_t)?; // [n_tokens, n_expert]
-        let probs = softmax_last_dim(&logits)?;
-        let topk_idx = crate::moe::topk_indices(&probs, self.n_expert_used)?; // [n_tokens, k]
-        let mut weights = probs.gather(&topk_idx, D::Minus1)?; // [n_tokens, k]
-        if self.weights_norm {
-            let denom = weights
-                .sum_keepdim(D::Minus1)?
-                .clamp(6.103_515_6e-5, f32::INFINITY)?;
-            weights = weights.broadcast_div(&denom)?;
-        }
-        if self.weights_scale != 0.0 && self.weights_scale != 1.0 {
-            weights = (weights * self.weights_scale)?;
-        }
-        Ok((topk_idx, weights))
+        let scores = self.gating.scores(&x2.matmul(&self.gate_t)?)?; // [n_tokens, n_expert]
+        crate::moe::route(
+            &scores,
+            self.gate_bias.as_ref(),
+            self.n_expert_used,
+            self.weights_norm,
+            self.weights_scale,
+            Ok,
+        )
     }
 
     /// Run each selected expert over its routed tokens and accumulate the
@@ -1222,6 +1265,14 @@ enum Residual {
         attn_norm: RmsNorm,
         /// `ffn_norm`, or `post_attention_norm` in the Qwen3-Next generation.
         ffn_norm: RmsNorm,
+    },
+    /// GLM-4's sandwich norms: each sub-block's output is normalised again
+    /// before it joins the residual.
+    Sandwich {
+        attn_norm: RmsNorm,
+        attn_post_norm: RmsNorm,
+        ffn_norm: RmsNorm,
+        ffn_post_norm: RmsNorm,
     },
     /// Hyper-connections over parallel streams (qwen4exp), with the
     /// optional PLE block applied to the streams first.
@@ -1326,10 +1377,11 @@ impl crate::native_session::LayerStack for Weights {
     fn layer(
         &self,
         l: usize,
-        state: &mut LayerState,
+        states: &mut [LayerState],
         xs: &Tensor,
         input: &crate::native_session::LayerInput<'_>,
     ) -> Result<(Tensor, Vec<u32>)> {
+        let state = &mut states[l];
         let (mask, offset) = (input.mask, input.offset);
         let layer = &self.layers[l];
         match &layer.residual {
@@ -1338,6 +1390,12 @@ impl crate::native_session::LayerStack for Weights {
                 let xs = (xs + h)?;
                 let (h, routed) = layer.ffn.forward(&ffn_norm.forward(&xs)?)?;
                 Ok(((xs + h)?, routed))
+            }
+            Residual::Sandwich { attn_norm, attn_post_norm, ffn_norm, ffn_post_norm } => {
+                let h = layer.mixer_forward(state, &attn_norm.forward(xs)?, mask, offset)?;
+                let xs = (xs + attn_post_norm.forward(&h)?)?;
+                let (h, routed) = layer.ffn.forward(&ffn_norm.forward(&xs)?)?;
+                Ok(((xs + ffn_post_norm.forward(&h)?)?, routed))
             }
             Residual::Hyper { attn, ffn, ple } => {
                 let res = match ple {
@@ -1504,7 +1562,7 @@ fn load_moe<R: Read + Seek>(rd: &mut Reader<R>, p: &str, cfg: &Config) -> Result
         .zip(up_exps)
         .zip(down_exps)
         .map(|((gate, up), down)| Mlp {
-            gate: gate.0,
+            gate: Some(gate.0),
             up: up.0,
             down: down.0,
             prefetch: crate::residency::ExpertHandles::from_parts(gate.1, up.1, down.1),
@@ -1567,6 +1625,8 @@ fn load_moe<R: Read + Seek>(rd: &mut Reader<R>, p: &str, cfg: &Config) -> Result
 
     Ok(Moe {
         gate_t,
+        gate_bias: rd.f32_opt(&format!("{p}.exp_probs_b.bias"))?,
+        gating: cfg.gating,
         experts,
         shared,
         n_expert_used: cfg.n_expert_used,
@@ -1736,6 +1796,12 @@ impl ModelWeights {
                         _ => None,
                     },
                 },
+                None if rd.has(&format!("{p}.post_ffw_norm.weight")) => Residual::Sandwich {
+                    attn_norm: rd.rms_norm(&format!("{p}.attn_norm.weight"), cfg.rms_eps)?,
+                    attn_post_norm: rd.rms_norm(&format!("{p}.post_attention_norm.weight"), cfg.rms_eps)?,
+                    ffn_norm: rd.rms_norm(&format!("{p}.ffn_norm.weight"), cfg.rms_eps)?,
+                    ffn_post_norm: rd.rms_norm(&format!("{p}.post_ffw_norm.weight"), cfg.rms_eps)?,
+                },
                 None => Residual::PreNorm {
                     attn_norm: rd.rms_norm(&format!("{p}.attn_norm.weight"), cfg.rms_eps)?,
                     ffn_norm: match rd.rms_norm_opt(&format!("{p}.post_attention_norm.weight"), cfg.rms_eps)? {
@@ -1749,7 +1815,7 @@ impl ModelWeights {
             } else {
                 Mixer::Attention(Attention::load(&mut rd, layer_idx, &p, &cfg, rope.clone())?)
             };
-            let ffn = if cfg.n_expert > 0 {
+            let ffn = if cfg.n_expert > 0 && layer_idx >= cfg.leading_dense {
                 FeedForward::Moe(load_moe(&mut rd, &p, &cfg)?)
             } else {
                 FeedForward::Dense(Mlp::load(&mut rd, &p, "")?)
@@ -1804,7 +1870,7 @@ mod tests {
         let mut experts = Vec::with_capacity(ne);
         for _ in 0..ne {
             experts.push(Mlp {
-                gate: lin(nfe, h, &Tensor::randn(0f32, 1f32, (nfe, h), dev)?),
+                gate: Some(lin(nfe, h, &Tensor::randn(0f32, 1f32, (nfe, h), dev)?)),
                 up: lin(nfe, h, &Tensor::randn(0f32, 1f32, (nfe, h), dev)?),
                 down: lin(h, nfe, &Tensor::randn(0f32, 1f32, (h, nfe), dev)?),
                 prefetch: None,
@@ -1812,6 +1878,8 @@ mod tests {
         }
         Ok(Moe {
             gate_t,
+            gate_bias: None,
+            gating: Gating::Softmax,
             experts,
             shared: None,
             n_expert_used: 2,
@@ -1860,6 +1928,8 @@ mod tests {
         // the host form.
         let mixed = Moe {
             gate_t: moe.gate_t.clone(),
+            gate_bias: None,
+            gating: moe.gating,
             experts: moe.experts.clone(),
             shared: None,
             n_expert_used: moe.n_expert_used,

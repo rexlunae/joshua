@@ -38,10 +38,11 @@ use std::sync::Arc;
 
 use candle_core::quantized::{gguf_file, GgmlDType, QMatMul, QStorage, QTensor};
 use candle_core::{DType, Device, Module, Result, Tensor, D};
-use candle_nn::ops::{sigmoid, silu, softmax, softmax_last_dim};
+use candle_nn::ops::{sigmoid, silu, softmax};
 use candle_transformers::quantized_nn::RmsNorm;
 
 use crate::gguf_ext::GgufHeader;
+use crate::mhc::{collapse as hc_collapse, post as hc_post, rms_rows, HcMix};
 use crate::gguf_meta::Meta;
 use crate::ngram::grouped_rms;
 use crate::yarn::YarnConfig;
@@ -882,98 +883,10 @@ fn build_device_pool(
 
 // ─── HC (hyper-computation) stream mixing ───────────────────────────────────
 
-struct HcMix {
-    pre: Tensor,  // [b, s, hc]
-    post: Tensor, // [b, s, hc]
-    comb: Tensor, // [b, s, hc, hc]
-}
-
-/// Split the mixes row `[hc, 2*hc, hc*hc]` into pre/post/comb and run the
-/// Sinkhorn normalization on the comb block, matching the reference
-/// `hc_split_sinkhorn` kernel:
-///   softmax over k (last dim), column-normalize over j (dim 1),
-///   then `iters - 1` rounds of row (dim 2) then column (dim 1) normalization.
-fn hc_split_sinkhorn(
-    mixes: &Tensor,
-    scale: &Tensor,
-    base: &Tensor,
-    hc: usize,
-    iters: usize,
-    eps: f64,
-) -> Result<HcMix> {
-    let shape = mixes.shape().dims().to_vec();
-    let n = shape[..shape.len() - 1].iter().product::<usize>();
-    let m = mixes.reshape((n, (2 + hc) * hc))?;
-
-    let s: Vec<f32> = scale.flatten_all()?.to_vec1()?;
-    if s.len() < 3 {
-        candle_core::bail!(
-            "deepseek4: hc scale tensor has {} entries, expected 3",
-            s.len()
-        );
-    }
-
-    let pre = sigmoid(
-        &m.narrow(D::Minus1, 0, hc)?
-            .affine(s[0] as f64, 0.0)?
-            .broadcast_add(&base.narrow(0, 0, hc)?)?,
-    )?
-    .affine(1.0, eps)?;
-    let post = (sigmoid(
-        &m.narrow(D::Minus1, hc, hc)?
-            .affine(s[1] as f64, 0.0)?
-            .broadcast_add(&base.narrow(0, hc, hc)?)?,
-    )? * 2.0)?;
-    let comb0 = m
-        .narrow(D::Minus1, 2 * hc, hc * hc)?
-        .affine(s[2] as f64, 0.0)?
-        .broadcast_add(&base.narrow(0, 2 * hc, hc * hc)?)?;
-    let comb0 = comb0.reshape((n, hc, hc))?;
-
-    let mut comb = softmax_last_dim(&comb0)?.affine(1.0, eps)?;
-    comb = comb.broadcast_div(&comb.sum_keepdim(1)?.affine(1.0, eps)?)?;
-    for _ in 0..iters.saturating_sub(1) {
-        comb = comb.broadcast_div(&comb.sum_keepdim(2)?.affine(1.0, eps)?)?;
-        comb = comb.broadcast_div(&comb.sum_keepdim(1)?.affine(1.0, eps)?)?;
-    }
-
-    let mut pre_shape = shape[..shape.len() - 1].to_vec();
-    pre_shape.push(hc);
-    let pre = pre.reshape(pre_shape)?;
-    let mut post_shape = shape[..shape.len() - 1].to_vec();
-    post_shape.push(hc);
-    let post = post.reshape(post_shape)?;
-    let mut comb_shape = shape[..shape.len() - 1].to_vec();
-    comb_shape.push(hc);
-    comb_shape.push(hc);
-    let comb = comb.reshape(comb_shape)?;
-    Ok(HcMix { pre, post, comb })
-}
-
-/// A sublayer's mixing coefficients, from the stream `x` (`[b, s, hc, d]`):
-/// `hc_fn` (`[hc_dim, mix_hc]`) applied to the flattened copies RMS-normalized
-/// with the model's norm eps, then split by [`hc_split_sinkhorn`] (llama.cpp
-/// `build_hc_mixes`).
+/// A sublayer's mixing coefficients from the stream `x` (`[b, s, hc, d]`)
+/// under this model's norm eps and Sinkhorn settings.
 fn hc_mixes(x: &Tensor, hc_fn: &QMatMul, hc_scale: &Tensor, hc_base: &Tensor, cfg: &Config) -> Result<HcMix> {
-    let (b, s, hc, d) = x.dims4()?;
-    let flat = x.reshape((b * s, hc * d))?;
-    let mixes = hc_fn.forward(&rms_rows(&flat, cfg.rms_eps)?)?; // [b*s, (2+hc)*hc]
-    let mixes = mixes.reshape((b, s, (2 + hc) * hc))?;
-    hc_split_sinkhorn(&mixes, hc_scale, hc_base, hc, cfg.hc_sinkhorn_iters, cfg.hc_eps)
-}
-
-/// Unweighted RMS norm over the last dim.
-fn rms_rows(x: &Tensor, eps: f64) -> Result<Tensor> {
-    x.broadcast_mul(&x.sqr()?.mean_keepdim(D::Minus1)?.affine(1.0, eps)?.powf(-0.5)?)
-}
-
-/// Collapse the `hc` copies of `x` (`[b, s, hc, d]`) to one stream with the
-/// weights `pre` (`[b, s, hc]`).
-fn hc_collapse(x: &Tensor, pre: &Tensor) -> Result<Tensor> {
-    pre.unsqueeze(D::Minus1)?
-        .broadcast_as(x.shape())?
-        .mul(x)?
-        .sum(D::Minus2)
+    crate::mhc::mixes(x, hc_fn, hc_scale, hc_base, cfg.rms_eps, cfg.hc_sinkhorn_iters, cfg.hc_eps)
 }
 
 /// The hyper-connection stream between sublayers: the `hc` copies, plus —
@@ -1046,20 +959,6 @@ impl Stream {
             pre: Some(t.narrow(D::Minus1, d, 1)?.squeeze(D::Minus1)?),
         })
     }
-}
-
-/// `hc_post`: expand one stream back to `hc` copies.
-/// `x`: `[b, s, d]`, `residual`: `[b, s, hc, d]`, `post`: `[b, s, hc]`,
-/// `comb`: `[b, s, hc(src), hc(dst)]` (Sinkhorn-normalized over `dst`
-/// first).  Copy `dst` becomes `post[dst]·x + Σ_src comb[src, dst]·residual[src]`
-/// (llama.cpp `build_hc_post`).
-fn hc_post(x: &Tensor, residual: &Tensor, post: &Tensor, comb: &Tensor) -> Result<Tensor> {
-    let (b, s, hc, d) = residual.dims4()?;
-    let post_t = post.unsqueeze(D::Minus1)?.broadcast_as((b, s, hc, d))?;
-    let x_t = x.unsqueeze(2)?.broadcast_as((b, s, hc, d))?;
-    // [b, s, dst, src] · [b, s, src, d] → [b, s, dst, d]
-    let comb_src = comb.transpose(2, 3)?.contiguous()?.matmul(&residual.contiguous()?)?;
-    (post_t * x_t)?.add(&comb_src)
 }
 
 // ─── Engram (DeepSeek-V4.1) ──────────────────────────────────────────────────
@@ -2070,7 +1969,7 @@ impl Moe {
 
         let logits = x2.matmul(&self.gate_t)?; // [n_tokens, n_expert]
                                                // sqrt(softplus(x)) scoring; bias shifts selection only.
-        let probs = crate::moe::softplus(&logits)?.sqrt()?;
+        let probs = crate::moe::Gating::SqrtSoftplus.scores(&logits)?;
         let (weights, indices) = if self.hash {
             // Hash layers: expert *selection* comes from tid2eid[token_id], but the
             // routing *weights* still come from the gate network's softplus scores
@@ -2084,32 +1983,17 @@ impl Moe {
                 .unwrap()
                 .index_select(&tid, 0)?
                 .to_dtype(DType::U32)?; // [n_tokens, k]
-            let mut weights = probs.gather(&idx, D::Minus1)?;
-            weights = weights.broadcast_div(
-                &weights
-                    .sum_keepdim(D::Minus1)?
-                    .clamp(6.103_515_6e-5, f32::INFINITY)?,
-            )?;
-            if self.weights_scale != 0.0 && self.weights_scale != 1.0 {
-                weights = (weights * self.weights_scale)?;
-            }
-            (weights, idx)
+            (crate::moe::routing_weights(&probs, &idx, true, self.weights_scale)?, idx)
         } else {
-            let selection = match &self.gate_bias {
-                Some(bias) => probs.broadcast_add(&bias.reshape((1, ()))?)?,
-                None => probs.clone(),
-            };
-            let topk_idx = crate::moe::topk_indices(&selection, self.n_expert_used)?;
-            let mut weights = probs.gather(&topk_idx, D::Minus1)?;
-            weights = weights.broadcast_div(
-                &weights
-                    .sum_keepdim(D::Minus1)?
-                    .clamp(6.103_515_6e-5, f32::INFINITY)?,
+            let (idx, weights) = crate::moe::route(
+                &probs,
+                self.gate_bias.as_ref(),
+                self.n_expert_used,
+                true,
+                self.weights_scale,
+                Ok,
             )?;
-            if self.weights_scale != 0.0 && self.weights_scale != 1.0 {
-                weights = (weights * self.weights_scale)?;
-            }
-            (weights, topk_idx)
+            (weights, idx)
         };
 
         // A decode step (one token per sequence, batched or not) warms the

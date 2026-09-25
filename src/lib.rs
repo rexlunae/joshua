@@ -37,6 +37,7 @@ pub mod kquant_dot;
 pub mod kimi_k3;
 pub mod low_bit;
 pub mod mmap_tensor;
+pub mod mhc;
 pub mod moe;
 pub mod mxfp4;
 pub mod native_session;
