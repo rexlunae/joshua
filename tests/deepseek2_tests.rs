@@ -6,29 +6,14 @@
 
 mod common;
 
-use candle_core::{Device, Tensor};
+use candle_core::Device;
+use common::logits;
 use joshua::model::{Architecture, QuantizedModel};
 
 fn load(model: &std::path::Path) -> QuantizedModel {
-    let bytes = std::fs::read(model).unwrap();
-    let mut cursor = std::io::Cursor::new(&bytes[..]);
-    let content = candle_core::quantized::gguf_file::Content::read(&mut cursor).unwrap();
-    QuantizedModel::from_gguf(content, &mut cursor, &Device::Cpu).unwrap()
+    common::load_model(model, false)
 }
 
-fn logits(model: &mut QuantizedModel, tokens: &[u32], offset: usize) -> Vec<f32> {
-    let input = Tensor::new(tokens, &Device::Cpu)
-        .unwrap()
-        .unsqueeze(0)
-        .unwrap();
-    model
-        .forward(&input, offset)
-        .unwrap()
-        .squeeze(0)
-        .unwrap()
-        .to_vec1()
-        .unwrap()
-}
 
 #[test]
 fn deepseek2_is_a_supported_architecture() {
@@ -157,8 +142,8 @@ fn deepseek2_v2_softmax_group_routing_loads_and_is_consistent() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// A reader that refuses to rewind to offset 0, so a caller attempting to
-/// re-parse the header from the start is detected.
+/// A reader that refuses to rewind to offset 0, so re-parsing the header
+/// from the start fails.
 struct NoRewind<R>(R);
 
 impl<R: std::io::Read> std::io::Read for NoRewind<R> {
@@ -177,13 +162,12 @@ impl<R: std::io::Seek> std::io::Seek for NoRewind<R> {
 }
 
 #[test]
-fn deepseek2_skips_the_raw_header_rereread() {
-    // The raw header re-read exists for the deepseek4 loader, which reads
-    // tensors by their raw GGUF dtype id.  deepseek2 never consumes it, so
-    // running it here would be pure cost — and, because `read_header` is
-    // stricter than candle's parser in places, could reject a file candle
-    // accepts.  Only deepseek4 may rewind and re-parse; every other
-    // architecture must keep loading exactly as candle parsed it.
+fn deepseek2_loads_when_the_raw_header_cannot_be_reread() {
+    // The native loaders re-read the header with raw dtype ids to find
+    // tensors in formats candle cannot name (Q1_0, MXFP4, …).  A file
+    // candle parsed has none, and because `read_header` is stricter than
+    // candle's parser in places, a failed re-read must never reject a file
+    // candle accepts: deepseek2 must load exactly as candle parsed it.
     let dir = common::model_dir("deepseek2-no-reread");
     let model = dir.join("model.gguf");
     common::write_tiny_deepseek2_gguf(&model);
@@ -192,11 +176,10 @@ fn deepseek2_skips_the_raw_header_rereread() {
     let mut cursor = std::io::Cursor::new(&bytes[..]);
     let content = candle_core::quantized::gguf_file::Content::read(&mut cursor).unwrap();
 
-    // If from_gguf_mmap tried to re-read the header it would rewind to 0 and
-    // fail here.  It must not.
+    // The re-read rewinds to 0, which this reader refuses.
     let mut no_rewind = NoRewind(std::io::Cursor::new(bytes));
     let mut m = QuantizedModel::from_gguf_mmap(content, &mut no_rewind, &Device::Cpu, None, None, 0)
-        .expect("deepseek2 must not re-read the raw header");
+        .expect("a failed raw-header re-read must not fail deepseek2");
     // And the loaded model must actually work.
     let logits = logits(&mut m, &[1u32, 4, 2, 7, 5], 0);
     assert!(logits.iter().all(|l| l.is_finite()));

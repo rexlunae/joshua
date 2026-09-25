@@ -20,8 +20,7 @@
 //!   trellis with 4 codes of 8 values, and stores sign bits packed 7 per
 //!   code in the upper 28 bits of the second 32-bit word.
 
-use candle_core::{bail, Result};
-use half::f16;
+use candle_core::Result;
 
 /// GGML type id for IQ2_XXS (ggml.h `GGML_TYPE_IQ2_XXS`).
 pub const GGML_TYPE_IQ2_XXS: u32 = 16;
@@ -33,120 +32,63 @@ pub use candle_core::quantized::iq2xxs::{
     BlockIq2Xxs, BLOCK_BYTES, IQ2XXS_GRID, KMASK_IQ2XS, KSIGNS_IQ2XS, QK_IQ2_XXS,
 };
 
-/// Decode a run of blocks into `out` (one f32 per element).
-pub fn dequantize(blocks: &[BlockIq2Xxs], out: &mut [f32]) -> Result<()> {
-    if out.len() != blocks.len() * QK_IQ2_XXS {
-        bail!(
-            "iq2_xxs: output holds {} values, expected {}",
-            out.len(),
-            blocks.len() * QK_IQ2_XXS
-        );
+impl crate::raw_block::RawBlock for BlockIq2Xxs {
+    const GGML_TYPE: u32 = GGML_TYPE_IQ2_XXS;
+    const QK: usize = QK_IQ2_XXS;
+    const NAME: &'static str = "iq2_xxs";
+    const CANDLE_DTYPE: candle_core::quantized::GgmlDType =
+        candle_core::quantized::GgmlDType::Iq2Xxs;
+
+    fn dequantize_block(&self, out: &mut [f32]) {
+        self.dequantize(out.try_into().expect("one IQ2_XXS block"));
     }
-    let mut scratch = [0f32; QK_IQ2_XXS];
-    for (block, chunk) in blocks.iter().zip(out.chunks_exact_mut(QK_IQ2_XXS)) {
-        block.dequantize(&mut scratch);
-        chunk.copy_from_slice(&scratch);
+
+    fn matmul_t(
+        mkn: (usize, usize, usize),
+        lhs: &[f32],
+        rhs: &[Self],
+        dst: &mut [f32],
+    ) -> Result<()> {
+        matmul_t(mkn, lhs, rhs, dst)
     }
-    Ok(())
 }
 
 /// `dst[m, n] = lhs[m, k] · rhs[n, k]ᵀ`, with `rhs` held as IQ2_XXS blocks.
 ///
-/// Each weight row's blocks are decoded once into a stack buffer and
-/// accumulated against every lhs row, so the weights are never materialised
-/// as f32 in bulk — the same contract as [`crate::mxfp4::matmul_t`].
-///
 /// On x86_64 with AVX2+FMA this dispatches to a fused dequant+dot kernel
 /// (see `try_avx2_matmul`) and spreads the independent output rows across
-/// the rayon pool; elsewhere it falls back to the scalar row loop.  Both
-/// paths compute each output element with the same per-element operation
-/// sequence, so results are deterministic and agree to within one ulp of
-/// FMA rounding (the fused kernel accumulates in 8-lane registers).
+/// the rayon pool; elsewhere it is the portable [`crate::raw_block::matmul_t`].
+/// Both paths compute each output element with the same per-element
+/// operation sequence, so results are deterministic and agree to within one
+/// ulp of FMA rounding (the fused kernel accumulates in 8-lane registers).
 pub fn matmul_t(
-    (m, k, n): (usize, usize, usize),
-    lhs: &[f32],
-    rhs: &[BlockIq2Xxs],
-    dst: &mut [f32],
-) -> Result<()> {
-    let blocks_per_row = validate_matmul_t((m, k, n), lhs, rhs, dst)?;
-    matmul_t_impl((m, k, n), blocks_per_row, lhs, rhs, dst, true)
-}
-
-/// Same as [`matmul_t`] with a serial row loop — used by the determinism
-/// tests to prove the parallel path is bit-identical.
-#[cfg(test)]
-pub fn matmul_t_serial(
-    (m, k, n): (usize, usize, usize),
-    lhs: &[f32],
-    rhs: &[BlockIq2Xxs],
-    dst: &mut [f32],
-) -> Result<()> {
-    let blocks_per_row = validate_matmul_t((m, k, n), lhs, rhs, dst)?;
-    matmul_t_impl((m, k, n), blocks_per_row, lhs, rhs, dst, false)
-}
-
-fn validate_matmul_t(
-    (m, k, n): (usize, usize, usize),
-    lhs: &[f32],
-    rhs: &[BlockIq2Xxs],
-    dst: &mut [f32],
-) -> Result<usize> {
-    if !k.is_multiple_of(QK_IQ2_XXS) {
-        bail!("iq2_xxs matmul: k={k} is not a multiple of the block size {QK_IQ2_XXS}");
-    }
-    let blocks_per_row = k / QK_IQ2_XXS;
-    if rhs.len() != n * blocks_per_row {
-        bail!(
-            "iq2_xxs matmul: rhs holds {} blocks, expected {}",
-            rhs.len(),
-            n * blocks_per_row
-        );
-    }
-    if lhs.len() != m * k || dst.len() != m * n {
-        bail!(
-            "iq2_xxs matmul: lhs/dst sized {}/{} expected {}/{}",
-            lhs.len(),
-            dst.len(),
-            m * k,
-            m * n
-        );
-    }
-    Ok(blocks_per_row)
-}
-
-fn matmul_t_impl(
     mkn: (usize, usize, usize),
-    blocks_per_row: usize,
+    lhs: &[f32],
+    rhs: &[BlockIq2Xxs],
+    dst: &mut [f32],
+) -> Result<()> {
+    matmul_t_dispatch(mkn, lhs, rhs, dst, true)
+}
+
+fn matmul_t_dispatch(
+    mkn: (usize, usize, usize),
     lhs: &[f32],
     rhs: &[BlockIq2Xxs],
     dst: &mut [f32],
     parallel: bool,
 ) -> Result<()> {
-    let (m, k, n) = mkn;
-    if n == 0 || m == 0 {
+    let blocks_per_row = crate::raw_block::validate_matmul_t(mkn, lhs, rhs, dst)?;
+    if mkn.0 == 0 || mkn.2 == 0 || try_avx2_matmul(mkn, blocks_per_row, lhs, rhs, dst, parallel) {
         return Ok(());
     }
-    if try_avx2_matmul(mkn, blocks_per_row, lhs, rhs, dst, parallel) {
-        return Ok(());
-    }
-    // Scalar path: dst must start at zero because each block's partial
-    // dot is accumulated into it (matching the original implementation).
-    dst.fill(0.0);
-    let dst_ptr = crate::simd::DstPtr::new(dst);
-    let worker = |row: usize| {
-        matmul_row_scalar(m, k, n, lhs, rhs, blocks_per_row, row, &dst_ptr);
-    };
     if parallel {
-        crate::simd::for_each_row(n, worker);
+        crate::raw_block::matmul_t(mkn, lhs, rhs, dst)
     } else {
-        for row in 0..n {
-            worker(row);
-        }
+        crate::raw_block::matmul_t_serial(mkn, lhs, rhs, dst)
     }
-    Ok(())
 }
 
-/// AVX2/FMA fast path for [`matmul_t_impl`]: fused IQ2_XXS dequant+dot for
+/// AVX2/FMA fast path for [`matmul_t`]: fused IQ2_XXS dequant+dot for
 /// every row.  Returns `true` if it ran.  The kernel (and its const f32
 /// tables) are `#[cfg(target_arch = "x86_64")]`, so the whole branch lives
 /// behind the same cfg here — on other targets this stub returns `false` and
@@ -194,39 +136,6 @@ fn try_avx2_matmul(
     _parallel: bool,
 ) -> bool {
     false
-}
-
-/// Scalar per-row worker: decode each block and accumulate `lhs · block`
-/// into `dst[i*n + row]` one block at a time (bit-compatible with the
-/// original single-threaded loop).
-#[allow(clippy::too_many_arguments)] // (m, k, n) is the matmul shape; kept flat for the hot loop
-fn matmul_row_scalar(
-    m: usize,
-    k: usize,
-    n: usize,
-    lhs: &[f32],
-    rhs: &[BlockIq2Xxs],
-    blocks_per_row: usize,
-    row: usize,
-    dst: &crate::simd::DstPtr,
-) {
-    let row_blocks = &rhs[row * blocks_per_row..(row + 1) * blocks_per_row];
-    let mut decoded = [0f32; QK_IQ2_XXS];
-    for (b, block) in row_blocks.iter().enumerate() {
-        block.dequantize(&mut decoded);
-        let base = b * QK_IQ2_XXS;
-        for i in 0..m {
-            let a = &lhs[i * k + base..i * k + base + QK_IQ2_XXS];
-            let mut acc = 0f32;
-            for (x, w) in a.iter().zip(decoded.iter()) {
-                acc += x * w;
-            }
-            // SAFETY: row `row` owns dst[i*n + row] for all i (disjoint per
-            // row, see `crate::simd`); the buffer was zero-filled by the
-            // caller before any worker ran.
-            unsafe { dst.add(i * n + row, acc) };
-        }
-    }
 }
 
 // ─── AVX2/FMA fused dequant+dot kernel ────────────────────────────────────
@@ -309,7 +218,7 @@ unsafe fn matmul_row_avx2(
         let mcnt = (m - m0).min(MTILE);
         let mut acc = [_mm256_setzero_ps(); MTILE];
         for (b, block) in row_blocks.iter().enumerate() {
-            let d = f16::from_le_bytes(block.d).to_f32();
+            let d = half::f16::from_le_bytes(block.d).to_f32();
             for ib32 in 0..8usize {
                 let base = ib32 * 8;
                 let lo = u32::from_le_bytes([
@@ -352,53 +261,14 @@ unsafe fn matmul_row_avx2(
     }
 }
 
-/// Same as [`matmul_t`] but with f16 activations in and out.  The decode is
-/// done in f32; only the dot product inputs/outputs are converted, so
-/// numerics match the f32 path to rounding.
-pub fn matmul_t_f16(
-    (m, k, n): (usize, usize, usize),
-    lhs: &[f16],
-    rhs: &[BlockIq2Xxs],
-    dst: &mut [f16],
-) -> Result<()> {
-    let mut lhs_f32 = vec![0f32; lhs.len()];
-    for (o, v) in lhs_f32.iter_mut().zip(lhs.iter()) {
-        *o = v.to_f32();
-    }
-    let mut dst_f32 = vec![0f32; m * n];
-    matmul_t((m, k, n), &lhs_f32, rhs, &mut dst_f32)?;
-    for (o, v) in dst.iter_mut().zip(dst_f32.iter()) {
-        *o = f16::from_f32(*v);
-    }
-    Ok(())
-}
-
-/// Reinterpret `bytes` as IQ2_XXS blocks.  The packed layout is byte-aligned,
-/// so this only has to check the length is a whole number of blocks.
-///
-/// Safety: the caller must keep `bytes` alive for the returned slice's
-/// lifetime and must not mutate it — i.e. the source must be an immutable
-/// buffer or a read-only mapping of a file that no party modifies (see
-/// `mmap_tensor`'s safety model).  Every byte pattern is a valid block, so
-/// within the checked length the conversion cannot create invalid data.
-pub fn blocks_from_bytes(bytes: &[u8]) -> Result<&[BlockIq2Xxs]> {
-    if !bytes.len().is_multiple_of(BLOCK_BYTES) {
-        bail!(
-            "iq2_xxs: {} bytes is not a whole number of {} byte blocks",
-            bytes.len(),
-            BLOCK_BYTES
-        );
-    }
-    let n = bytes.len() / BLOCK_BYTES;
-    // SAFETY: BlockIq2Xxs is packed (align 1) and every byte pattern is a
-    // valid block, so any byte slice of the right length is a valid slice of
-    // blocks.  The caller keeps `bytes` alive (an mmap borrow, by contract).
-    Ok(unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const BlockIq2Xxs, n) })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::raw_block::dequantize;
+
+    fn blocks_from_bytes(bytes: &[u8]) -> Result<&[BlockIq2Xxs]> {
+        crate::raw_block::blocks_from_bytes(bytes)
+    }
 
     /// Golden vectors produced by compiling llama.cpp's own
     /// `dequantize_row_iq2_xxs` (ggml-quants.c, master) with the reference
@@ -538,7 +408,7 @@ mod tests {
         scalar.fill(0.0);
         let dstp = crate::simd::DstPtr::new(&mut scalar);
         for row in 0..n {
-            matmul_row_scalar(m, k, n, &lhs, &rhs, k / QK_IQ2_XXS, row, &dstp);
+            crate::raw_block::matmul_row_scalar((m, k, n), &lhs, &rhs, k / QK_IQ2_XXS, row, &dstp);
         }
 
         for i in 0..m * n {
@@ -567,7 +437,7 @@ mod tests {
         matmul_t((m, k, n), &lhs, &rhs, &mut par).unwrap();
 
         let mut ser = vec![0f32; m * n];
-        matmul_t_serial((m, k, n), &lhs, &rhs, &mut ser).unwrap();
+        matmul_t_dispatch((m, k, n), &lhs, &rhs, &mut ser, false).unwrap();
 
         assert_eq!(par, ser, "parallel and serial matmul must be bit-identical");
     }

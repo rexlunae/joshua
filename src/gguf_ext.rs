@@ -13,8 +13,8 @@
 //! touched, and regardless of whether the caller intended to decode it.
 //!
 //! This reader parses the same header but keeps each tensor's dtype as its raw
-//! `u32`, so unknown types survive to be handled by [`crate::mxfp4`],
-//! [`crate::iq2xxs`] (or reported precisely).  Metadata is decoded into
+//! `u32`, so unknown types survive to be handled by [`crate::raw_block`]
+//! (or reported precisely).  Metadata is decoded into
 //! candle's own [`gguf_file::Value`] so existing hyper-parameter code keeps
 //! working unchanged.
 //!
@@ -64,7 +64,7 @@ const MAX_VALUE_DEPTH: usize = 64;
 /// crate-private, so the set is mirrored here) — but IQ2_XXS (16) is kept
 /// on the raw-header path on purpose: `GgmlDType::Iq2Xxs` exists so device
 /// backends can hold the blocks as ordinary quantized storage, while the CPU
-/// form of an IQ2 tensor must stay [`crate::mmap_tensor::MmapBlocksIq2Xxs`]
+/// form of an IQ2 tensor must stay [`crate::mmap_tensor::MmapRawBlocks`]
 /// (the fused AVX2 matmul), never candle's reference decode.  Reporting 16
 /// as supported would route dense IQ2 tensors through candle's loader.
 pub fn is_candle_supported(dtype: u32) -> bool {
@@ -152,6 +152,72 @@ pub struct GgufHeader {
 }
 
 impl GgufHeader {
+    /// A tensor's raw bytes, read from `reader` (works for dtypes candle
+    /// cannot describe).
+    pub fn read_tensor_bytes<R: Read + Seek>(
+        &self,
+        reader: &mut R,
+        name: &str,
+    ) -> candle_core::Result<Vec<u8>> {
+        let info = self.tensors.get(name).ok_or_else(|| {
+            candle_core::Error::Msg(format!("tensor `{name}` not in the GGUF header"))
+        })?;
+        let size = type_size_bytes(info.dtype, info.elem_count()).ok_or_else(|| {
+            candle_core::Error::Msg(format!(
+                "tensor `{name}`: no size known for GGUF dtype {}",
+                info.dtype
+            ))
+        })?;
+        reader.seek(SeekFrom::Start(self.tensor_data_offset + info.offset))?;
+        let mut buf = vec![0u8; size];
+        reader.read_exact(&mut buf)?;
+        Ok(buf)
+    }
+
+    /// Load `name` when its dtype is one candle's `Content` cannot carry
+    /// (the tensors [`GgufHeader::to_candle_content`] drops); `Ok(None)` for
+    /// every other tensor, which the caller loads through candle as usual.
+    ///
+    /// On a CPU model with a mapping the blocks are borrowed in place
+    /// ([`crate::mmap_tensor::borrowed_qtensor_raw`]) and decoded inside the
+    /// matmul.  Otherwise — an accelerator, which cannot hold CPU-borrowed
+    /// storage, or a streamed load — the tensor is decoded to f32 and held
+    /// as an F32 `QTensor` on `device`, so downstream `QMatMul` code is
+    /// unchanged and both paths share f32-activation semantics.
+    pub fn load_raw_only<R: Read + Seek>(
+        &self,
+        name: &str,
+        mmap: Option<&std::sync::Arc<memmap2::Mmap>>,
+        reader: &mut R,
+        device: &candle_core::Device,
+    ) -> candle_core::Result<Option<candle_core::quantized::QTensor>> {
+        let Some(info) = self.tensors.get(name).filter(|i| !is_candle_supported(i.dtype)) else {
+            return Ok(None);
+        };
+        if let Some(mmap) = mmap.filter(|_| device.is_cpu()) {
+            if let Some(qt) = crate::mmap_tensor::borrowed_qtensor_raw(
+                mmap,
+                info.dtype,
+                info.offset,
+                self.tensor_data_offset,
+                info.dims.clone().into(),
+            )? {
+                return Ok(Some(qt));
+            }
+        }
+        let bytes = self.read_tensor_bytes(reader, name)?;
+        match crate::quant_matmul::decode_raw_to_f32(info.dtype, &bytes, info.elem_count())? {
+            Some(f32s) => {
+                let t = candle_core::Tensor::from_vec(f32s, info.dims.clone(), device)?;
+                candle_core::quantized::QTensor::quantize(&t, GgmlDType::F32).map(Some)
+            }
+            None => candle_core::bail!(
+                "tensor `{name}` has GGUF dtype {} which has no decoder here",
+                info.dtype
+            ),
+        }
+    }
+
     /// `general.architecture`, if present.
     pub fn architecture(&self) -> Option<String> {
         self.metadata
@@ -225,12 +291,17 @@ impl GgufHeader {
         out
     }
 
+    /// Whether any tensor is in a dtype candle's `Content` cannot carry.
+    pub fn has_unsupported_tensors(&self) -> bool {
+        self.tensors.values().any(|t| !is_candle_supported(t.dtype))
+    }
+
     /// `(name, raw dtype id)` pairs for the tensors candle cannot represent,
     /// sorted by name for deterministic error messages.
     ///
     /// These are exactly the tensors [`Self::to_candle_content`] drops, so a
-    /// caller that does not consult the raw header (any loader other than
-    /// deepseek4) must treat a non-empty result as "this file needs a decoder
+    /// caller that does not consult the raw header (candle's stock loaders)
+    /// must treat a non-empty result as "this file needs a decoder
     /// that is not attached" rather than silently proceeding.
     pub fn unsupported_tensors(&self) -> Vec<(String, u32)> {
         let mut out: Vec<(String, u32)> = self
@@ -509,9 +580,7 @@ pub fn type_size_bytes(dtype: u32, elems: usize) -> Option<usize> {
         14 => (256, 210), // Q6_K
         15 => (256, 292), // Q8_K
         26 => (1, 4),  // I32 (routed-expert id tables)
-        crate::iq2xxs::GGML_TYPE_IQ2_XXS => (crate::iq2xxs::QK_IQ2_XXS, crate::iq2xxs::BLOCK_BYTES),
-        crate::mxfp4::GGML_TYPE_MXFP4 => (crate::mxfp4::QK_MXFP4, 17),
-        _ => return None,
+        _ => crate::raw_block::layout(dtype)?,
     };
     if !elems.is_multiple_of(blck) {
         return None;

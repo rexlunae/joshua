@@ -46,6 +46,7 @@ use candle_core::quantized::{gguf_file, k_quants, GgmlDType, GgmlType, QStorage,
 use candle_core::{CpuStorage, Result};
 use half::{bf16, f16};
 use memmap2::Mmap;
+use crate::raw_block::{self, RawBlock};
 
 /// A run of quantized blocks borrowed from the memory-mapped model file.
 ///
@@ -360,64 +361,135 @@ impl<T: GgmlType + Send + Sync> QuantizedType for MmapBlocks<T> {
     }
 }
 
-/// IQ2_XXS blocks borrowed from the mapping.
+/// Blocks of a [`RawBlock`] format (IQ2_XXS, MXFP4, Q1_0, Q2_0) borrowed
+/// from the mapping.
 ///
-/// Deliberately not `MmapBlocks<BlockIq2Xxs>`: candle's `GgmlType` impl for
-/// the block is the reference decode (Q8_K activations), while this storage
-/// runs [`crate::iq2xxs::matmul_t`], the fused f32 AVX2 kernel.  Its dtype is
-/// the real one so a device upload of these bytes (`QStorage::from_data`
-/// with `qt.dtype()`) lands as IQ2_XXS device storage.
-pub struct MmapBlocksIq2Xxs {
+/// Deliberately not `MmapBlocks<T>`: that runs candle's `GgmlType` kernels
+/// (Q8-quantized activations; and candle has no type at all for most of
+/// these formats), while this storage runs [`RawBlock::matmul_t`] — f32
+/// activations, a block decoded at a time.  IQ2_XXS reports its real dtype
+/// so a device upload of these bytes (`QStorage::from_data` with
+/// `qt.dtype()`) lands as IQ2_XXS device storage.
+pub struct MmapRawBlocks<B: RawBlock> {
     /// Keeps the mapping alive; never dereferenced directly.
     _mmap: Arc<Mmap>,
-    ptr: *const crate::iq2xxs::BlockIq2Xxs,
+    ptr: *const B,
     len: usize,
 }
 
 // SAFETY: same argument as `MmapBlocks`: read-only mapping kept alive by
 // `_mmap`, blocks never mutated or moved.
-unsafe impl Send for MmapBlocksIq2Xxs {}
-unsafe impl Sync for MmapBlocksIq2Xxs {}
+unsafe impl<B: RawBlock> Send for MmapRawBlocks<B> {}
+unsafe impl<B: RawBlock> Sync for MmapRawBlocks<B> {}
 
-impl MmapPrefetch for MmapBlocksIq2Xxs {
+impl<B: RawBlock> MmapPrefetch for MmapRawBlocks<B> {
     fn prefetch(&self) {
         let base = self._mmap.as_ptr() as usize;
         let off = self.ptr as usize - base;
-        let len = self.len * crate::iq2xxs::BLOCK_BYTES;
-        let _ = self._mmap.advise_range(memmap2::Advice::WillNeed, off, len);
+        let _ = self
+            ._mmap
+            .advise_range(memmap2::Advice::WillNeed, off, self.size());
     }
 
     fn mapped_range(&self) -> Option<MappedRange> {
-        Some(MappedRange::new(
-            &self._mmap,
-            self.ptr as *const u8,
-            self.len * crate::iq2xxs::BLOCK_BYTES,
-        ))
+        Some(MappedRange::new(&self._mmap, self.ptr as *const u8, self.size()))
     }
 }
 
-impl MmapBlocksIq2Xxs {
-    fn blocks(&self) -> &[crate::iq2xxs::BlockIq2Xxs] {
-        // SAFETY: bounds- and alignment-checked in `borrow` (alignment is 1
-        // for the packed block type, so only bounds matter) against a mapping
-        // that `_mmap` keeps alive and that is never mutated.
+impl<B: RawBlock> MmapRawBlocks<B> {
+    fn blocks(&self) -> &[B] {
+        // SAFETY: bounds-checked in `borrow` (blocks are align 1, so only
+        // bounds matter) against a mapping that `_mmap` keeps alive and that
+        // is never mutated.
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
 
     fn borrow(mmap: &Arc<Mmap>, byte_offset: usize, n_blocks: usize) -> Option<Self> {
-        let size = n_blocks.checked_mul(crate::iq2xxs::BLOCK_BYTES)?;
+        let size = n_blocks.checked_mul(raw_block::block_bytes::<B>())?;
         let end = byte_offset.checked_add(size)?;
         if end > mmap.len() {
             return None;
         }
         // SAFETY: `byte_offset <= end <= mmap.len()`.
         let ptr = unsafe { mmap.as_ptr().add(byte_offset) };
-        // The block type is packed (align 1), so any offset is aligned.
         Some(Self {
             _mmap: Arc::clone(mmap),
-            ptr: ptr as *const crate::iq2xxs::BlockIq2Xxs,
+            ptr: ptr as *const B,
             len: n_blocks,
         })
+    }
+}
+
+impl<B: RawBlock> QuantizedType for MmapRawBlocks<B> {
+    fn dtype(&self) -> GgmlDType {
+        B::CANDLE_DTYPE
+    }
+
+    fn matmul_t(&self, mkn: (usize, usize, usize), lhs: &[f32], dst: &mut [f32]) -> Result<()> {
+        B::matmul_t(mkn, lhs, self.blocks(), dst)
+    }
+
+    fn matmul_t_f16(&self, mkn: (usize, usize, usize), lhs: &[f16], dst: &mut [f16]) -> Result<()> {
+        raw_block::matmul_t_f16(mkn, lhs, self.blocks(), dst)
+    }
+
+    fn embedding(&self, ids: &[u32], rows: usize, hidden: usize) -> Result<CpuStorage> {
+        if !hidden.is_multiple_of(B::QK) {
+            candle_core::bail!(
+                "quantized embedding hidden size {hidden} is not divisible by block size {}",
+                B::QK
+            )
+        }
+        let blocks = self.blocks();
+        let row_blocks = hidden / B::QK;
+        if blocks.len() != rows * row_blocks {
+            candle_core::bail!(
+                "quantized tensor has {} blocks, expected {}",
+                blocks.len(),
+                rows * row_blocks
+            )
+        }
+        let mut out = vec![0f32; ids.len() * hidden];
+        for (out_row, &row_id) in ids.iter().enumerate() {
+            let row = row_id as usize;
+            if row >= rows {
+                candle_core::bail!("embedding id {row} is out of range for {rows} rows")
+            }
+            let src = &blocks[row * row_blocks..(row + 1) * row_blocks];
+            let dst = &mut out[out_row * hidden..(out_row + 1) * hidden];
+            raw_block::dequantize(src, dst)?;
+        }
+        Ok(CpuStorage::F32(out))
+    }
+
+    fn dequantize(&self, elem_count: usize) -> Result<CpuStorage> {
+        let mut ys = vec![0.0f32; elem_count];
+        raw_block::dequantize(self.blocks(), &mut ys)?;
+        Ok(CpuStorage::F32(ys))
+    }
+
+    fn storage_size_in_bytes(&self) -> usize {
+        self.size()
+    }
+
+    fn as_ptr(&self) -> *const u8 {
+        self.ptr as *const u8
+    }
+
+    fn block_size(&self) -> usize {
+        B::QK
+    }
+
+    fn size(&self) -> usize {
+        self.len * raw_block::block_bytes::<B>()
+    }
+
+    fn from_float(&mut self, _xs: &[f32]) {
+        panic!("cannot quantize into a read-only memory-mapped tensor")
+    }
+
+    fn from_float_imatrix(&mut self, _xs: &[f32], _imatrix_weights: &[f32], _n_per_row: usize) {
+        panic!("cannot quantize into a read-only memory-mapped tensor")
     }
 }
 
@@ -455,243 +527,26 @@ pub fn prefetch_handle(
         GgmlDType::Q5K => handle!(k_quants::BlockQ5K),
         GgmlDType::Q6K => handle!(k_quants::BlockQ6K),
         GgmlDType::Q8K => handle!(k_quants::BlockQ8K),
-        // The IQ2_XXS mmap form is `MmapBlocksIq2Xxs` (`prefetch_handle_iq2xxs`).
+        // The IQ2_XXS mmap form is `MmapRawBlocks` (`prefetch_handle_raw`).
         GgmlDType::Iq2Xxs => None,
     }
 }
 
-/// Prefetch handle for `n_blocks` IQ2_XXS blocks; see [`prefetch_handle`].
-pub fn prefetch_handle_iq2xxs(
+/// Prefetch handle for `n_blocks` [`RawBlock`] blocks; see [`prefetch_handle`].
+pub fn prefetch_handle_raw<B: RawBlock>(
     mmap: &Arc<Mmap>,
     byte_offset: usize,
     n_blocks: usize,
 ) -> Option<Arc<dyn MmapPrefetch>> {
-    MmapBlocksIq2Xxs::borrow(mmap, byte_offset, n_blocks)
+    MmapRawBlocks::<B>::borrow(mmap, byte_offset, n_blocks)
         .map(|b| Arc::new(b) as Arc<dyn MmapPrefetch>)
-}
-
-/// MXFP4 blocks borrowed from the mapping.
-///
-/// Same shape as [`MmapBlocksIq2Xxs`]: candle's `GgmlDType` has no MXFP4
-/// variant either, so this is a bespoke `QuantizedType` with a placeholder
-/// `dtype()` (only `QMatMul::from_qtensor` compares it, and only to tell
-/// eager-dequantise f32/f16/bf16 apart from everything else).
-pub struct MmapBlocksMxfp4 {
-    /// Keeps the mapping alive; never dereferenced directly.
-    _mmap: Arc<Mmap>,
-    ptr: *const crate::mxfp4::BlockMxfp4,
-    len: usize,
-}
-
-// SAFETY: same argument as `MmapBlocks`: read-only mapping kept alive by
-// `_mmap`, blocks never mutated or moved.
-unsafe impl Send for MmapBlocksMxfp4 {}
-unsafe impl Sync for MmapBlocksMxfp4 {}
-
-impl MmapPrefetch for MmapBlocksMxfp4 {
-    fn prefetch(&self) {
-        let base = self._mmap.as_ptr() as usize;
-        let off = self.ptr as usize - base;
-        let len = self.len * std::mem::size_of::<crate::mxfp4::BlockMxfp4>();
-        let _ = self._mmap.advise_range(memmap2::Advice::WillNeed, off, len);
-    }
-
-    fn mapped_range(&self) -> Option<MappedRange> {
-        Some(MappedRange::new(
-            &self._mmap,
-            self.ptr as *const u8,
-            self.len * std::mem::size_of::<crate::mxfp4::BlockMxfp4>(),
-        ))
-    }
-}
-
-impl MmapBlocksMxfp4 {
-    fn blocks(&self) -> &[crate::mxfp4::BlockMxfp4] {
-        // SAFETY: bounds- and alignment-checked in `borrow` (alignment is 1
-        // for the packed block type, so only bounds matter) against a mapping
-        // that `_mmap` keeps alive and that is never mutated.
-        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
-    }
-
-    fn borrow(mmap: &Arc<Mmap>, byte_offset: usize, n_blocks: usize) -> Option<Self> {
-        let block_bytes = std::mem::size_of::<crate::mxfp4::BlockMxfp4>();
-        let size = n_blocks.checked_mul(block_bytes)?;
-        let end = byte_offset.checked_add(size)?;
-        if end > mmap.len() {
-            return None;
-        }
-        // SAFETY: `byte_offset <= end <= mmap.len()`.
-        let ptr = unsafe { mmap.as_ptr().add(byte_offset) };
-        // The block type is packed (align 1), so any offset is aligned.
-        Some(Self {
-            _mmap: Arc::clone(mmap),
-            ptr: ptr as *const crate::mxfp4::BlockMxfp4,
-            len: n_blocks,
-        })
-    }
-}
-
-/// Prefetch handle for `n_blocks` MXFP4 blocks; see [`prefetch_handle`].
-pub fn prefetch_handle_mxfp4(
-    mmap: &Arc<Mmap>,
-    byte_offset: usize,
-    n_blocks: usize,
-) -> Option<Arc<dyn MmapPrefetch>> {
-    MmapBlocksMxfp4::borrow(mmap, byte_offset, n_blocks)
-        .map(|b| Arc::new(b) as Arc<dyn MmapPrefetch>)
-}
-
-impl QuantizedType for MmapBlocksMxfp4 {
-    fn dtype(&self) -> GgmlDType {
-        GgmlDType::Q2K // placeholder; see struct docs
-    }
-
-    fn matmul_t(&self, mkn: (usize, usize, usize), lhs: &[f32], dst: &mut [f32]) -> Result<()> {
-        crate::mxfp4::matmul_t(mkn, lhs, self.blocks(), dst)
-    }
-
-    fn matmul_t_f16(&self, mkn: (usize, usize, usize), lhs: &[f16], dst: &mut [f16]) -> Result<()> {
-        crate::mxfp4::matmul_t_f16(mkn, lhs, self.blocks(), dst)
-    }
-
-    fn embedding(&self, ids: &[u32], rows: usize, hidden: usize) -> Result<CpuStorage> {
-        if !hidden.is_multiple_of(crate::mxfp4::QK_MXFP4) {
-            candle_core::bail!(
-                "quantized embedding hidden size {hidden} is not divisible by block size {}",
-                crate::mxfp4::QK_MXFP4
-            )
-        }
-        let blocks = self.blocks();
-        let row_blocks = hidden / crate::mxfp4::QK_MXFP4;
-        if blocks.len() != rows * row_blocks {
-            candle_core::bail!(
-                "quantized tensor has {} blocks, expected {}",
-                blocks.len(),
-                rows * row_blocks
-            )
-        }
-        let mut out = vec![0f32; ids.len() * hidden];
-        for (out_row, &row_id) in ids.iter().enumerate() {
-            let row = row_id as usize;
-            if row >= rows {
-                candle_core::bail!("embedding id {row} is out of range for {rows} rows")
-            }
-            let src = &blocks[row * row_blocks..(row + 1) * row_blocks];
-            let dst = &mut out[out_row * hidden..(out_row + 1) * hidden];
-            crate::mxfp4::dequantize(src, dst)?;
-        }
-        Ok(CpuStorage::F32(out))
-    }
-
-    fn dequantize(&self, elem_count: usize) -> Result<CpuStorage> {
-        let mut ys = vec![0.0f32; elem_count];
-        crate::mxfp4::dequantize(self.blocks(), &mut ys)?;
-        Ok(CpuStorage::F32(ys))
-    }
-
-    fn storage_size_in_bytes(&self) -> usize {
-        self.len * std::mem::size_of::<crate::mxfp4::BlockMxfp4>()
-    }
-
-    fn as_ptr(&self) -> *const u8 {
-        self.ptr as *const u8
-    }
-
-    fn block_size(&self) -> usize {
-        crate::mxfp4::QK_MXFP4
-    }
-
-    fn size(&self) -> usize {
-        self.len * std::mem::size_of::<crate::mxfp4::BlockMxfp4>()
-    }
-
-    fn from_float(&mut self, _xs: &[f32]) {
-        panic!("cannot quantize into a read-only memory-mapped tensor")
-    }
-
-    fn from_float_imatrix(&mut self, _xs: &[f32], _imatrix_weights: &[f32], _n_per_row: usize) {
-        panic!("cannot quantize into a read-only memory-mapped tensor")
-    }
-}
-
-impl QuantizedType for MmapBlocksIq2Xxs {
-    fn dtype(&self) -> GgmlDType {
-        GgmlDType::Iq2Xxs
-    }
-
-    fn matmul_t(&self, mkn: (usize, usize, usize), lhs: &[f32], dst: &mut [f32]) -> Result<()> {
-        crate::iq2xxs::matmul_t(mkn, lhs, self.blocks(), dst)
-    }
-
-    fn matmul_t_f16(&self, mkn: (usize, usize, usize), lhs: &[f16], dst: &mut [f16]) -> Result<()> {
-        crate::iq2xxs::matmul_t_f16(mkn, lhs, self.blocks(), dst)
-    }
-
-    fn embedding(&self, ids: &[u32], rows: usize, hidden: usize) -> Result<CpuStorage> {
-        if !hidden.is_multiple_of(crate::iq2xxs::QK_IQ2_XXS) {
-            candle_core::bail!(
-                "quantized embedding hidden size {hidden} is not divisible by block size {}",
-                crate::iq2xxs::QK_IQ2_XXS
-            )
-        }
-        let blocks = self.blocks();
-        let row_blocks = hidden / crate::iq2xxs::QK_IQ2_XXS;
-        if blocks.len() != rows * row_blocks {
-            candle_core::bail!(
-                "quantized tensor has {} blocks, expected {}",
-                blocks.len(),
-                rows * row_blocks
-            )
-        }
-        let mut out = vec![0f32; ids.len() * hidden];
-        for (out_row, &row_id) in ids.iter().enumerate() {
-            let row = row_id as usize;
-            if row >= rows {
-                candle_core::bail!("embedding id {row} is out of range for {rows} rows")
-            }
-            let src = &blocks[row * row_blocks..(row + 1) * row_blocks];
-            let dst = &mut out[out_row * hidden..(out_row + 1) * hidden];
-            crate::iq2xxs::dequantize(src, dst)?;
-        }
-        Ok(CpuStorage::F32(out))
-    }
-
-    fn dequantize(&self, elem_count: usize) -> Result<CpuStorage> {
-        let mut ys = vec![0.0f32; elem_count];
-        crate::iq2xxs::dequantize(self.blocks(), &mut ys)?;
-        Ok(CpuStorage::F32(ys))
-    }
-
-    fn storage_size_in_bytes(&self) -> usize {
-        self.len * crate::iq2xxs::BLOCK_BYTES
-    }
-
-    fn as_ptr(&self) -> *const u8 {
-        self.ptr as *const u8
-    }
-
-    fn block_size(&self) -> usize {
-        crate::iq2xxs::QK_IQ2_XXS
-    }
-
-    fn size(&self) -> usize {
-        self.len * crate::iq2xxs::BLOCK_BYTES
-    }
-
-    fn from_float(&mut self, _xs: &[f32]) {
-        panic!("cannot quantize into a read-only memory-mapped tensor")
-    }
-
-    fn from_float_imatrix(&mut self, _xs: &[f32], _imatrix_weights: &[f32], _n_per_row: usize) {
-        panic!("cannot quantize into a read-only memory-mapped tensor")
-    }
 }
 
 /// Borrow a tensor by raw GGUF dtype id, falling back to candle's table.
 ///
-/// `dtype` is the raw header id, so IQ2_XXS (16) — which candle cannot name —
-/// can still be borrowed.  Returns `Ok(None)` when the dtype is unknown or the
-/// range cannot be borrowed safely.
+/// `dtype` is the raw header id, so [`RawBlock`] formats candle cannot name
+/// (IQ2_XXS, MXFP4, Q1_0, Q2_0) can still be borrowed.  Returns `Ok(None)`
+/// when the dtype is unknown or the range cannot be borrowed safely.
 pub fn borrowed_qtensor_raw(
     mmap: &Arc<Mmap>,
     dtype: u32,
@@ -699,17 +554,12 @@ pub fn borrowed_qtensor_raw(
     tensor_data_offset: u64,
     shape: candle_core::Shape,
 ) -> Result<Option<QTensor>> {
-    if dtype == crate::iq2xxs::GGML_TYPE_IQ2_XXS {
+    if raw_block::is_raw_block(dtype) {
         let Ok(off) = usize::try_from(tensor_data_offset.saturating_add(offset)) else {
             return Ok(None);
         };
-        return borrowed_range_iq2xxs(mmap, off, shape);
-    }
-    if dtype == crate::mxfp4::GGML_TYPE_MXFP4 {
-        let Ok(off) = usize::try_from(tensor_data_offset.saturating_add(offset)) else {
-            return Ok(None);
-        };
-        return borrowed_range_mxfp4(mmap, off, shape);
+        return crate::with_raw_block!(dtype, B => borrowed_range_raw::<B>(mmap, off, shape))
+            .unwrap_or(Ok(None));
     }
     let Some(ggml_dtype) = crate::gguf_ext::ggml_dtype_from_id(dtype) else {
         return Ok(None);
@@ -722,36 +572,18 @@ pub fn borrowed_qtensor_raw(
     borrowed_qtensor(mmap, &info, tensor_data_offset)
 }
 
-/// Borrow an IQ2_XXS tensor (or per-expert slice of one) from the mapping.
-pub fn borrowed_range_iq2xxs(
+/// Borrow a [`RawBlock`] tensor (or per-expert slice of one) from the
+/// mapping.
+pub fn borrowed_range_raw<B: RawBlock>(
     mmap: &Arc<Mmap>,
     offset: usize,
     shape: candle_core::Shape,
 ) -> Result<Option<QTensor>> {
     let elem_count = shape.elem_count();
-    if !elem_count.is_multiple_of(crate::iq2xxs::QK_IQ2_XXS) {
+    if !elem_count.is_multiple_of(B::QK) {
         return Ok(None);
     }
-    let n_blocks = elem_count / crate::iq2xxs::QK_IQ2_XXS;
-    let Some(blocks) = MmapBlocksIq2Xxs::borrow(mmap, offset, n_blocks) else {
-        return Ok(None);
-    };
-    let storage: Box<dyn QuantizedType> = Box::new(blocks);
-    QTensor::new(QStorage::Cpu(storage), shape).map(Some)
-}
-
-/// Borrow an MXFP4 tensor (or per-expert slice of one) from the mapping.
-pub fn borrowed_range_mxfp4(
-    mmap: &Arc<Mmap>,
-    offset: usize,
-    shape: candle_core::Shape,
-) -> Result<Option<QTensor>> {
-    let elem_count = shape.elem_count();
-    if !elem_count.is_multiple_of(crate::mxfp4::QK_MXFP4) {
-        return Ok(None);
-    }
-    let n_blocks = elem_count / crate::mxfp4::QK_MXFP4;
-    let Some(blocks) = MmapBlocksMxfp4::borrow(mmap, offset, n_blocks) else {
+    let Some(blocks) = MmapRawBlocks::<B>::borrow(mmap, offset, elem_count / B::QK) else {
         return Ok(None);
     };
     let storage: Box<dyn QuantizedType> = Box::new(blocks);
@@ -824,10 +656,10 @@ pub fn borrowed_range(
         GgmlDType::Q5K => Box::new(borrow!(k_quants::BlockQ5K)),
         GgmlDType::Q6K => Box::new(borrow!(k_quants::BlockQ6K)),
         GgmlDType::Q8K => Box::new(borrow!(k_quants::BlockQ8K)),
-        // The IQ2_XXS mmap form is `MmapBlocksIq2Xxs` (`borrowed_range_iq2xxs`),
+        // The IQ2_XXS mmap form is `MmapRawBlocks` (`borrowed_range_raw`),
         // which keeps the fused AVX2 matmul instead of candle's reference decode.
         GgmlDType::Iq2Xxs => candle_core::bail!(
-            "IQ2_XXS tensors are borrowed with `borrowed_range_iq2xxs`, not the generic block borrow"
+            "IQ2_XXS tensors are borrowed with `borrowed_range_raw`, not the generic block borrow"
         ),
     };
 
@@ -1191,7 +1023,7 @@ mod tests {
             }
         }
         let mut weights = vec![0f32; n_rows * k];
-        crate::mxfp4::dequantize(&blocks, &mut weights).unwrap();
+        crate::raw_block::dequantize(&blocks, &mut weights).unwrap();
         (blocks, weights)
     }
 
@@ -1213,7 +1045,7 @@ mod tests {
             .collect();
         let mmap = mmap_bytes(&dir, &bytes);
 
-        let qt = borrowed_range_mxfp4(&mmap, 0, (n_rows, k).into())
+        let qt = borrowed_range_raw::<crate::mxfp4::BlockMxfp4>(&mmap, 0, (n_rows, k).into())
             .unwrap()
             .expect("MXFP4 range should borrow");
         let qmm = QMatMul::from_qtensor(qt).unwrap();
@@ -1238,7 +1070,7 @@ mod tests {
 
         // A per-expert slice (3 rows at a 3-row offset) must also borrow and
         // agree with the same reference rows.
-        let qt2 = borrowed_range_mxfp4(&mmap, 3 * 2 * 17, (3, k).into())
+        let qt2 = borrowed_range_raw::<crate::mxfp4::BlockMxfp4>(&mmap, 3 * 2 * 17, (3, k).into())
             .unwrap()
             .expect("sliced MXFP4 range should borrow");
         let qmm2 = QMatMul::from_qtensor(qt2).unwrap();
@@ -1254,7 +1086,7 @@ mod tests {
         }
 
         // Out-of-bounds borrows decline.
-        assert!(borrowed_range_mxfp4(&mmap, bytes.len(), (n_rows, k).into())
+        assert!(borrowed_range_raw::<crate::mxfp4::BlockMxfp4>(&mmap, bytes.len(), (n_rows, k).into())
             .unwrap()
             .is_none());
 

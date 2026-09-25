@@ -952,10 +952,12 @@ impl QTensor {
 
     pub fn embedding(&self, ids: &Tensor) -> Result<Tensor> {
         let (rows, hidden) = self.shape.dims2()?;
-        if !hidden.is_multiple_of(self.dtype().block_size()) {
+        // The storage's own block size, as `QTensor::new` checks: CPU storage
+        // for a block format outside `GgmlDType` reports a placeholder dtype.
+        let block_size = self.storage.block_size();
+        if !hidden.is_multiple_of(block_size) {
             crate::bail!(
-                "quantized embedding hidden size {hidden} is not divisible by block size {}",
-                self.dtype().block_size()
+                "quantized embedding hidden size {hidden} is not divisible by block size {block_size}"
             )
         }
         let mut out_shape = ids.dims().to_vec();

@@ -51,15 +51,13 @@ pub fn dtype_layout(dtype: u32) -> Result<DtypeLayout> {
         13 => layout!(BlockQ5K),
         14 => layout!(BlockQ6K),
         15 => layout!(BlockQ8K),
-        16 => DtypeLayout {
-            block_elements: crate::iq2xxs::QK_IQ2_XXS,
-            block_bytes: crate::iq2xxs::BLOCK_BYTES,
+        _ => match crate::raw_block::layout(dtype) {
+            Some((block_elements, block_bytes)) => DtypeLayout {
+                block_elements,
+                block_bytes,
+            },
+            None => anyhow::bail!("unsupported GGUF shard dtype {dtype}"),
         },
-        39 => DtypeLayout {
-            block_elements: crate::mxfp4::QK_MXFP4,
-            block_bytes: std::mem::size_of::<crate::mxfp4::BlockMxfp4>(),
-        },
-        _ => anyhow::bail!("unsupported GGUF shard dtype {dtype}"),
     })
 }
 
@@ -355,9 +353,11 @@ fn decode_block(dtype: u32, bytes: &[u8], out: &mut [f32]) -> Result<()> {
                 _ => unreachable!(),
             }
         }
-        16 => crate::iq2xxs::dequantize(crate::iq2xxs::blocks_from_bytes(bytes)?, out)?,
-        39 => crate::mxfp4::dequantize(crate::mxfp4::blocks_from_bytes(bytes)?, out)?,
-        _ => anyhow::bail!("unsupported GGUF shard dtype {dtype}"),
+        _ => crate::with_raw_block!(dtype, B => crate::raw_block::dequantize(
+            crate::raw_block::blocks_from_bytes::<B>(bytes)?,
+            out,
+        ))
+        .ok_or_else(|| anyhow::anyhow!("unsupported GGUF shard dtype {dtype}"))??,
     }
     Ok(())
 }

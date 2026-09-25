@@ -5,6 +5,7 @@
 mod common;
 
 use candle_core::{Device, Tensor};
+use common::logits;
 use joshua::model::{Architecture, QuantizedModel};
 
 #[cfg(feature = "distributed")]
@@ -355,39 +356,7 @@ fn deepseek4_cluster_rejects_more_ranks_than_down_blocks() {
 }
 
 fn load(model: &std::path::Path, mmap: bool) -> QuantizedModel {
-    let bytes = std::fs::read(model).unwrap();
-    let mut cursor = std::io::Cursor::new(&bytes[..]);
-    // Load exactly the way the engine does: the tolerant header (raw dtype
-    // ids) projected onto candle's Content.  `Content::read` itself would
-    // reject the file on the first IQ2_XXS tensor.  `from_gguf_mmap` re-reads
-    // the raw header from the cursor internally.
-    let header = joshua::gguf_ext::read_header(&mut cursor).unwrap();
-    let content = header.to_candle_content().unwrap();
-    let _ = header;
-    let mmap = if mmap {
-        // Safety: the file is read-only for the lifetime of the mapping.
-        unsafe { memmap2::Mmap::map(&std::fs::File::open(model).unwrap()) }
-            .ok()
-            .map(std::sync::Arc::new)
-    } else {
-        None
-    };
-    let mut cursor = std::io::Cursor::new(&bytes[..]);
-    QuantizedModel::from_gguf_mmap(content, &mut cursor, &Device::Cpu, mmap, None, 0).unwrap()
-}
-
-fn logits(model: &mut QuantizedModel, tokens: &[u32], offset: usize) -> Vec<f32> {
-    let input = Tensor::new(tokens, &Device::Cpu)
-        .unwrap()
-        .unsqueeze(0)
-        .unwrap();
-    model
-        .forward(&input, offset)
-        .unwrap()
-        .squeeze(0)
-        .unwrap()
-        .to_vec1()
-        .unwrap()
+    common::load_model(model, mmap)
 }
 
 /// The mmap load path must wire up prefetch handles for every routed expert

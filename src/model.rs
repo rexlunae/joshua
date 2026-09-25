@@ -13,11 +13,10 @@
 //! | `phi2`                                          | `quantized_phi`
 //! | `phi3`                                          | `quantized_phi3`
 //! | `qwen2`                                         | `quantized_qwen2`
-//! | `qwen3`                                         | `quantized_qwen3`
-//! | `qwen`, `qwen2moe`, `qwen2vl`, `qwen3moe`, `qwen3vl`, `qwen3vlmoe`, `qwen3next`, `qwen35`, `qwen35moe`, `qwen4exp` | `quantized_qwen` (Joshua)
+//! | `qwen`, `qwen2moe`, `qwen2vl`, `qwen3`, `qwen3moe`, `qwen3vl`, `qwen3vlmoe`, `qwen3next`, `qwen35`, `qwen35moe`, `qwen4exp` | `quantized_qwen` (Joshua)
 //! | `deepseek` (DeepSeek-MoE)                        | `quantized_deepseek2` (Joshua)
 //! | `deepseek2` (DeepSeek-V2/V2.5/V3/V3.1/R1, Kimi-K2) | `quantized_deepseek2` (Joshua)
-//! | `deepseek4` (DeepSeek-V4)                        | `quantized_deepseek4` (Joshua)
+//! | `deepseek4` (DeepSeek-V4), `deepseek41` (DeepSeek-V4.1) | `quantized_deepseek4` (Joshua)
 //!
 //! The dense DeepSeek releases — DeepSeek-LLM, DeepSeek-Coder (V1) and the
 //! DeepSeek-R1 distills — are converted by llama.cpp as `llama` or `qwen2`
@@ -35,7 +34,7 @@ use candle_core::quantized::gguf_file;
 use candle_core::{DType, Device, Result, Tensor};
 use candle_transformers::models::{
     quantized_gemma3, quantized_glm4, quantized_lfm2, quantized_llama, quantized_phi,
-    quantized_phi3, quantized_qwen2, quantized_qwen3,
+    quantized_phi3, quantized_qwen2,
 };
 
 // ─── Architecture enum ──────────────────────────────────────────────────────
@@ -91,6 +90,10 @@ pub enum Architecture {
     /// `deepseek4` — DeepSeek-V4 (sliding-window MLA + KV compression +
     /// indexer-selected sparse attention + Hyper-Connections).
     DeepSeek4,
+    /// `deepseek41` — DeepSeek-V4.1 (V4 with a lagged hyper-connection mix,
+    /// KV compressed on a few source layers and shared, engram n-gram
+    /// tables).  Served by the `deepseek4` loader.
+    DeepSeek41,
 }
 
 /// Architecture names understood by llama.cpp but without a pure-Rust
@@ -216,6 +219,7 @@ const NAMES: &[(&str, Architecture)] = &[
     ("deepseek", Architecture::DeepSeek),
     ("deepseek2", Architecture::DeepSeek2),
     ("deepseek4", Architecture::DeepSeek4),
+    ("deepseek41", Architecture::DeepSeek41),
 ];
 
 impl Architecture {
@@ -302,7 +306,6 @@ impl Architecture {
                 | Self::Phi2
                 | Self::Phi3
                 | Self::Qwen2
-                | Self::Qwen3
         )
     }
 
@@ -317,7 +320,12 @@ impl Architecture {
     /// IQ2_XXS kernel (`crate::iq2xxs` OpenCL fused GEMV), so experts may
     /// target the device there.  See [`Self::experts_always_on_host_for`].
     pub fn experts_always_on_host(&self) -> bool {
-        matches!(self, Self::DeepSeek4)
+        self.is_deepseek4()
+    }
+
+    /// DeepSeek-V4 or V4.1 — the architectures the `deepseek4` loader serves.
+    pub fn is_deepseek4(&self) -> bool {
+        matches!(self, Self::DeepSeek4 | Self::DeepSeek41)
     }
 
     /// Whether the routed experts must stay in host RAM *given the active
@@ -326,10 +334,7 @@ impl Architecture {
     /// Metal, CUDA) they are host-only.  Non-MoE architectures never force
     /// host experts.
     pub fn experts_always_on_host_for(&self, device: &Device) -> bool {
-        match self {
-            Self::DeepSeek4 => !(device.is_opencl() || device.is_sycl()),
-            _ => false,
-        }
+        self.is_deepseek4() && !(device.is_opencl() || device.is_sycl())
     }
 
     /// Whether this architecture's "experts on the device" form is a bounded
@@ -339,7 +344,7 @@ impl Architecture {
     /// V4-Flash never fits), so an `ExpertPlacement::Device` request means
     /// "size that cache" (see `--vram-expert-cache`).
     pub fn device_experts_are_a_cache(&self, device: &Device) -> bool {
-        matches!(self, Self::DeepSeek4) && (device.is_opencl() || device.is_sycl())
+        self.is_deepseek4() && (device.is_opencl() || device.is_sycl())
     }
 
     pub fn is_known_llama_cpp_arch(name: &str) -> bool {
@@ -370,6 +375,7 @@ impl Architecture {
             Self::DeepSeek => "DeepSeek-MoE",
             Self::DeepSeek2 => "DeepSeek-V2 / DeepSeek-V3 / DeepSeek-R1 / Kimi-K2",
             Self::DeepSeek4 => "DeepSeek-V4",
+            Self::DeepSeek41 => "DeepSeek-V4.1",
         }
     }
 
@@ -398,7 +404,6 @@ pub enum QuantizedModel {
     Phi2(quantized_phi::ModelWeights),
     Phi3(quantized_phi3::ModelWeights),
     Qwen2(quantized_qwen2::ModelWeights),
-    Qwen3(quantized_qwen3::ModelWeights),
     /// Every architecture of the Qwen family loader (see
     /// [`crate::quantized_qwen::ARCHES`]).
     Qwen(crate::quantized_qwen::ModelWeights),
@@ -510,48 +515,52 @@ impl QuantizedModel {
         tracing::info!("Detected model architecture: {}", arch.display_name());
 
         // Re-read the header the way `gguf_ext` does — with each tensor's
-        // dtype kept as its raw GGUF id — but only for deepseek4, the one
-        // loader that consumes the raw table (candle's `Content` cannot name
-        // IQ2_XXS or I32, so the deepseek4 loader needs this to decode those
-        // tensors).  The reader is rewound to where candle's header parse
-        // left it (the aligned data start) afterwards, so nothing downstream
-        // shifts.
+        // dtype kept as its raw GGUF id — for Joshua's own loaders, which
+        // decode the formats candle's `Content` cannot name (IQ2_XXS, MXFP4,
+        // Bonsai's Q1_0 / Q2_0, I32).  The reader is rewound to where
+        // candle's header parse left it (the aligned data start) afterwards,
+        // so nothing downstream shifts.
         //
-        // The re-read must not run for other architectures: none of them
-        // consume the raw table, so the second parse would be pure cost (a
-        // full re-parse and clone of the metadata + tensor maps for every
-        // warm-pool instance) and any difference between the two parsers
-        // could reject a file candle accepts.  `read_header` is a superset of
-        // candle's parser for every file that can actually load (nested
-        // arrays, depth cap, lenient strings; its per-string/array resource
-        // caps are deliberately tighter than candle's theoretical 1 GiB, on
-        // which candle itself eagerly allocates and fails), but other
-        // architectures should stay on exactly the behaviour candle gave
-        // them.
+        // Candle's stock loaders never consume the raw table, so they skip
+        // the second parse and stay on exactly the behaviour candle gave
+        // them.  For the native loaders other than deepseek4 (which also
+        // reads I32 tables through it) the table is kept only when some
+        // tensor actually needs it, so a warm pool of ordinary instances
+        // does not hold a second copy of the metadata.
         //
-        // A failed re-read is a real header problem (truncated/corrupt file,
-        // implausible counts, non-UTF-8 key) — surface it as the load error
-        // rather than silently treating the file as having no raw table, which
-        // would surface much later as a misleading "cannot find tensor".
-        let raw = if arch == Architecture::DeepSeek4 {
+        // For deepseek4 a failed re-read is a real header problem
+        // (truncated/corrupt file, implausible counts, non-UTF-8 key) —
+        // surface it as the load error rather than silently treating the
+        // file as having no raw table, which would surface much later as a
+        // misleading "cannot find tensor".  The other native loaders read
+        // every tensor candle accepted through `gguf` anyway, so there the
+        // re-read must never reject a file candle parsed: a failure just
+        // means no raw table.
+        let raw = if arch.is_native() {
             let data_pos = reader.stream_position()?;
             let h = (|| -> std::result::Result<_, crate::JoshuaError> {
                 reader.seek(SeekFrom::Start(0))?;
                 let h = crate::gguf_ext::read_header(reader)?;
                 reader.seek(SeekFrom::Start(data_pos))?;
                 Ok(h)
-            })()
-            .map_err(|e| {
-                // Restore the reader even on failure so callers see a
-                // deterministic position, then report the actual problem.
-                let _ = reader.seek(SeekFrom::Start(data_pos));
-                candle_core::Error::Msg(format!("GGUF header re-read failed: {e}"))
-            })?;
-            Some(h)
+            })();
+            // Restore the reader even on failure so callers see a
+            // deterministic position.
+            let _ = reader.seek(SeekFrom::Start(data_pos));
+            match h {
+                Ok(h) if arch.is_deepseek4() || h.has_unsupported_tensors() => Some(h),
+                Ok(_) => None,
+                Err(e) if arch.is_deepseek4() => {
+                    return Err(candle_core::Error::Msg(format!("GGUF header re-read failed: {e}")))
+                }
+                Err(e) => {
+                    tracing::debug!("GGUF header re-read failed ({e}); loading without a raw table");
+                    None
+                }
+            }
         } else {
             None
         };
-        let raw = raw.as_ref();
 
         match arch {
             Architecture::Llama => {
@@ -578,10 +587,8 @@ impl QuantizedModel {
             Architecture::Qwen2 => {
                 quantized_qwen2::ModelWeights::from_gguf(gguf, reader, device).map(Self::Qwen2)
             }
-            Architecture::Qwen3 => {
-                quantized_qwen3::ModelWeights::from_gguf(gguf, reader, device).map(Self::Qwen3)
-            }
             Architecture::Qwen
+            | Architecture::Qwen3
             | Architecture::Qwen2Moe
             | Architecture::Qwen2Vl
             | Architecture::Qwen3Moe
@@ -593,6 +600,7 @@ impl QuantizedModel {
             | Architecture::Qwen4Exp => {
                 crate::quantized_qwen::ModelWeights::from_gguf_mmap_placed(
                     gguf,
+                    raw,
                     reader,
                     device,
                     expert_device,
@@ -606,6 +614,7 @@ impl QuantizedModel {
             Architecture::DeepSeek | Architecture::DeepSeek2 => {
                 crate::quantized_deepseek2::ModelWeights::from_gguf_mmap_placed(
                     gguf,
+                    raw,
                     reader,
                     device,
                     expert_device,
@@ -614,10 +623,10 @@ impl QuantizedModel {
                 )
                 .map(Self::DeepSeek2)
             }
-            Architecture::DeepSeek4 => {
+            Architecture::DeepSeek4 | Architecture::DeepSeek41 => {
                 crate::quantized_deepseek4::ModelWeights::from_gguf_mmap_placed(
                     gguf,
-                    raw,
+                    raw.as_ref(),
                     reader,
                     device,
                     expert_device,
@@ -715,7 +724,6 @@ impl QuantizedModel {
         match self {
             Self::Llama(m) => m.clear_kv_cache(),
             Self::Qwen2(m) => m.clear_kv_cache(),
-            Self::Qwen3(m) => m.clear_kv_cache(),
             other => return native!(other, m => { m.clear_kv_cache(); true }, _ => false),
         }
         true
@@ -723,7 +731,7 @@ impl QuantizedModel {
 
     /// Whether [`QuantizedModel::clear_kv_cache`] can reset this instance.
     pub fn supports_kv_clear(&self) -> bool {
-        matches!(self, Self::Llama(_) | Self::Qwen2(_) | Self::Qwen3(_)) || self.supports_shared_weights()
+        matches!(self, Self::Llama(_) | Self::Qwen2(_)) || self.supports_shared_weights()
     }
 
     /// Whether [`QuantizedModel::truncate_kv_cache`] can shorten this
@@ -772,7 +780,6 @@ impl QuantizedModel {
             Self::Phi2(m) => m.forward(input, index_pos),
             Self::Phi3(m) => m.forward(input, index_pos),
             Self::Qwen2(m) => m.forward(input, index_pos),
-            Self::Qwen3(m) => m.forward(input, index_pos),
             Self::Qwen(m) => m.forward(input, index_pos),
             Self::DeepSeek2(m) => m.forward(input, index_pos),
             Self::DeepSeek4(m) => m.forward(input, index_pos),

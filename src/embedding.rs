@@ -11,9 +11,10 @@
 //! | `qwen2`                | gte-Qwen2-1.5B/7B-instruct |
 //! | `qwen3`                | Qwen3-Embedding-0.6B/4B/8B |
 //!
-//! The forward pass mirrors candle's `quantized_llama` / `quantized_qwen2` /
-//! `quantized_qwen3` op-for-op (verified in the test suite by reproducing
-//! their LM-head logits exactly), differing only in that no KV cache is kept
+//! The forward pass mirrors the generation loaders — candle's
+//! `quantized_llama` / `quantized_qwen2` and Joshua's `quantized_qwen` for
+//! `qwen3` — op-for-op (verified in the test suite by reproducing their
+//! LM-head logits), differing only in that no KV cache is kept
 //! — embedding extraction is a single full-sequence pass.
 //!
 //! Pooling follows the GGUF `{arch}.pooling_type` metadata written by

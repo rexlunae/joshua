@@ -34,6 +34,47 @@ pub fn qtensor_q4k(data: Vec<f32>, shape: &[usize]) -> QTensor {
     QTensor::quantize(&t, GgmlDType::Q4K).unwrap()
 }
 
+/// Load a GGUF on the CPU the way the engine does: the tolerant header (raw
+/// dtype ids) projected onto candle's `Content` — `Content::read` itself
+/// rejects a file holding a dtype candle cannot name (IQ2_XXS, Q1_0, …) —
+/// with the weights borrowed from a memory mapping when `mmap` is set, else
+/// streamed from the reader.  The loader re-reads the raw header from the
+/// reader for the tensors the projection drops.
+pub fn load_model(path: &Path, mmap: bool) -> joshua::model::QuantizedModel {
+    let bytes = std::fs::read(path).unwrap();
+    let content = joshua::gguf_ext::read_header(&mut std::io::Cursor::new(&bytes[..]))
+        .unwrap()
+        .to_candle_content()
+        .unwrap();
+    let mmap = mmap.then(|| {
+        // Safety: the file is read-only for the lifetime of the mapping.
+        std::sync::Arc::new(unsafe { memmap2::Mmap::map(&File::open(path).unwrap()) }.unwrap())
+    });
+    let mut cursor = std::io::Cursor::new(&bytes[..]);
+    joshua::model::QuantizedModel::from_gguf_mmap(content, &mut cursor, &Device::Cpu, mmap, None, 0)
+        .unwrap()
+}
+
+/// Last-position logits for `tokens` fed at `offset` (CPU).
+pub fn logits(model: &mut joshua::model::QuantizedModel, tokens: &[u32], offset: usize) -> Vec<f32> {
+    let input = Tensor::new(tokens, &Device::Cpu).unwrap().unsqueeze(0).unwrap();
+    model
+        .forward(&input, offset)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap()
+}
+
+/// Element-wise `|a - b| < tol`, naming the first diverging logit.
+pub fn assert_close(a: &[f32], b: &[f32], tol: f32, what: &str) {
+    assert_eq!(a.len(), b.len(), "{what}: length");
+    for (i, (x, y)) in a.iter().zip(b).enumerate() {
+        assert!((x - y).abs() < tol, "{what}: logit {i} diverges: {x} vs {y}");
+    }
+}
+
 /// A minimal WordLevel tokenizer with a 16-token vocabulary.
 pub const TOKENIZER_JSON: &str = r#"{
     "version": "1.0",
@@ -805,7 +846,7 @@ pub fn write_tiny_qwen_gguf(path: &Path, arch: &str) {
     let hyper = arch == "qwen4exp";
     let (hc, hc_rank) = (2usize, 3usize);
     let (idx_heads, idx_dim) = (2usize, 6usize);
-    let (ple_heads, ple_dim, ple_rows, ple_kernel) = (4usize, 2usize, 40usize, 3usize);
+    let (ple_dim, ple_rows, ple_kernel) = (2usize, 40usize, 3usize);
     let qk_norm = arch.starts_with("qwen3") || arch == "qwen4exp";
     let biases = matches!(arch, "qwen2moe" | "qwen2vl");
     let fused_qkv = arch == "qwen";
@@ -1468,10 +1509,28 @@ pub struct TinyDeepseek4Opts {
     pub q2k_down: bool,
     /// Override routed intermediate width for multi-block shard fixtures.
     pub expert_width: Option<usize>,
+    /// Write a `deepseek41` (DeepSeek-V4.1) file instead: 4 layers with
+    /// compress ratios [2, 2, 1, 0] — layer 0 a gated ratio-2 source that
+    /// owns the index keys and scores top-k, layer 1 a reader that scores
+    /// layer 0's keys (and carries the engram), layer 2 a gateless ratio-1
+    /// source owning its keys, layer 3 window-only — no hyper-connection
+    /// head, no hash layers, randomized norms.
+    pub v41: bool,
 }
 
 pub fn write_tiny_deepseek4_gguf(path: &Path) {
     write_tiny_deepseek4_gguf_opts(path, TinyDeepseek4Opts::default());
+}
+
+/// The tiny `deepseek41` (DeepSeek-V4.1) fixture; see [`TinyDeepseek4Opts::v41`].
+pub fn write_tiny_deepseek41_gguf(path: &Path) {
+    write_tiny_deepseek4_gguf_opts(
+        path,
+        TinyDeepseek4Opts {
+            v41: true,
+            ..Default::default()
+        },
+    );
 }
 
 /// Like [`write_tiny_deepseek4_gguf`], but also emits `output.weight` as an
@@ -1548,14 +1607,16 @@ pub fn write_tiny_deepseek4_gguf_opts(path: &Path, opts: TinyDeepseek4Opts) {
         candle_only,
         q2k_down,
         expert_width,
+        v41,
     } = opts;
+    let arch = if v41 { "deepseek41" } else { "deepseek4" };
     const VOCAB: usize = 16;
     // EMB must be a multiple of the IQ2_XXS block size (256): each expert's
     // in-dimension is EMB, and candle requires the innermost dim of a QTensor
     // to be block-aligned.  The real DeepSeek-V4-Flash files satisfy this
     // with EMB = 4096.
     const EMB: usize = 256;
-    const NLAYER: usize = 2;
+    let nlayer: usize = if v41 { 4 } else { 2 };
     const NHEAD: usize = 4;
     const HEAD_DIM: usize = 16;
     const ROPE_DIM: usize = 8;
@@ -1569,24 +1630,29 @@ pub fn write_tiny_deepseek4_gguf_opts(path: &Path, opts: TinyDeepseek4Opts) {
     const NUSED: usize = 2;
     const N_SHARED: usize = 1;
     const HC: usize = 2;
-    const N_HASH: usize = 1;
+    let n_hash: usize = if v41 { 0 } else { 1 };
     // Lightning indexer (CSA layers only).
     const INDEX_NHEAD: usize = 4;
     const INDEX_HD: usize = 16;
 
     let u32v = |v: u32| gguf_file::Value::U32(v);
     let f32v = |v: f32| gguf_file::Value::F32(v);
-    let key = |s: &str| format!("deepseek4.{s}");
+    let key = |s: &str| format!("{arch}.{s}");
+    let ratios: Vec<u32> = if v41 {
+        vec![2, 2, 1, 0]
+    } else {
+        vec![if compress { 4 } else { 0 }, 0]
+    };
     let mut metadata: Vec<(String, gguf_file::Value)> = vec![
         (
             "general.architecture".to_string(),
-            gguf_file::Value::String("deepseek4".to_string()),
+            gguf_file::Value::String(arch.to_string()),
         ),
         (
             "general.name".to_string(),
-            gguf_file::Value::String("DeepSeek-V4".to_string()),
+            gguf_file::Value::String(if v41 { "DeepSeek-V4.1" } else { "DeepSeek-V4" }.to_string()),
         ),
-        (key("block_count"), u32v(NLAYER as u32)),
+        (key("block_count"), u32v(nlayer as u32)),
         (key("attention.head_count"), u32v(NHEAD as u32)),
         (key("embedding_length"), u32v(EMB as u32)),
         (key("attention.layer_norm_rms_epsilon"), f32v(1e-5)),
@@ -1595,7 +1661,7 @@ pub fn write_tiny_deepseek4_gguf_opts(path: &Path, opts: TinyDeepseek4Opts) {
         (key("rope.dimension_count"), u32v(ROPE_DIM as u32)),
         (
             key("attention.compress_ratios"),
-            gguf_file::Value::Array(vec![u32v(if compress { 4 } else { 0 }), u32v(0)]),
+            gguf_file::Value::Array(ratios.iter().map(|&r| u32v(r)).collect()),
         ),
         (key("attention.sliding_window"), u32v(8)),
         (key("attention.output_group_count"), u32v(O_GROUPS as u32)),
@@ -1606,7 +1672,7 @@ pub fn write_tiny_deepseek4_gguf_opts(path: &Path, opts: TinyDeepseek4Opts) {
         (key("expert_count"), u32v(NE as u32)),
         (key("expert_used_count"), u32v(NUSED as u32)),
         (key("expert_shared_count"), u32v(N_SHARED as u32)),
-        (key("hash_layer_count"), u32v(N_HASH as u32)),
+        (key("hash_layer_count"), u32v(n_hash as u32)),
         (key("expert_weights_scale"), f32v(1.0)),
         (key("expert_gating_func"), u32v(2)),
         (key("rope.freq_base"), f32v(10_000.0)),
@@ -1650,7 +1716,7 @@ pub fn write_tiny_deepseek4_gguf_opts(path: &Path, opts: TinyDeepseek4Opts) {
             ),
         ),
     ];
-    if compress {
+    if compress || v41 {
         metadata.extend([
             (
                 key("attention.indexer.head_count"),
@@ -1660,8 +1726,49 @@ pub fn write_tiny_deepseek4_gguf_opts(path: &Path, opts: TinyDeepseek4Opts) {
             (key("attention.indexer.top_k"), u32v(2)),
         ]);
     }
+    // Engram on layer 1: 3-grams, 2 heads per n-gram, 16-wide rows.
+    const ENGRAM_KEY: usize = 16;
+    let engram_primes: [u64; 4] = [5, 7, 11, 13];
+    let engram_rows = engram_primes.iter().sum::<u64>() as usize;
+    if v41 {
+        let u64s = |v: &[u64]| gguf_file::Value::Array(v.iter().map(|&x| gguf_file::Value::U64(x)).collect());
+        let offsets: Vec<u64> = engram_primes
+            .iter()
+            .scan(0, |acc, &p| {
+                let o = *acc;
+                *acc += p;
+                Some(o)
+            })
+            .collect();
+        metadata.extend([
+            (key("attention.compress_rope_freq_base"), f32v(40_000.0)),
+            (key("engram.layer_ids"), gguf_file::Value::Array(vec![gguf_file::Value::I32(1)])),
+            (key("engram.head_count"), u32v(2)),
+            (key("engram.key_length"), u32v(ENGRAM_KEY as u32)),
+            (key("engram.max_ngram_size"), u32v(3)),
+            (key("engram.multipliers"), u64s(&[1_000_003, 2_000_029, 3_000_017])),
+            (key("engram.primes"), u64s(&engram_primes)),
+            (key("engram.offsets"), u64s(&offsets)),
+            // Case folding: tokens 4..=15 map pairwise onto one id.
+            (
+                key("engram.token_map"),
+                gguf_file::Value::Array((0..VOCAB as i32).map(|t| gguf_file::Value::I32(if t < 4 { t } else { 4 + (t - 4) / 2 })).collect()),
+            ),
+            (key("engram.pad_id"), u32v(2)),
+        ]);
+    }
 
-    let ones = |n: usize| vec![1.0f32; n];
+    // Norm gammas: ones for V4 (as it always was), randomized for V4.1 so a
+    // misplaced norm moves the logits.
+    let mut norm_seed = 500u32;
+    let mut ones = |n: usize| {
+        norm_seed += 1;
+        if v41 {
+            weights(n, norm_seed).iter().map(|w| 1.0 + 3.0 * w).collect()
+        } else {
+            vec![1.0f32; n]
+        }
+    };
     let mut seed = 10u32;
     let mut next = |n: usize| {
         seed = seed.wrapping_add(7).wrapping_mul(2_654_435_761) | 1;
@@ -1671,16 +1778,22 @@ pub fn write_tiny_deepseek4_gguf_opts(path: &Path, opts: TinyDeepseek4Opts) {
     let mut tensors: Vec<RawTensor> = vec![
         RawTensor::f16("token_embd.weight", weights(VOCAB * EMB, 1), &[VOCAB, EMB]),
         RawTensor::f32("output_norm.weight", ones(EMB), &[EMB]),
-        RawTensor::f16(
-            "output_hc_fn.weight",
-            next(HC * (HC * EMB)),
-            &[HC, HC * EMB],
-        ),
-        RawTensor::f32("output_hc_base.weight", ones(HC), &[HC]),
-        RawTensor::f32("output_hc_scale.weight", ones(HC), &[HC]),
     ];
+    if v41 {
+        tensors.push(RawTensor::f16("output.weight", weights(VOCAB * EMB, 2), &[VOCAB, EMB]));
+    } else {
+        tensors.extend([
+            RawTensor::f16(
+                "output_hc_fn.weight",
+                next(HC * (HC * EMB)),
+                &[HC, HC * EMB],
+            ),
+            RawTensor::f32("output_hc_base.weight", vec![1.0; HC], &[HC]),
+            RawTensor::f32("output_hc_scale.weight", vec![1.0; HC], &[HC]),
+        ]);
+    }
     let o_group_dim = (NHEAD / O_GROUPS) * HEAD_DIM;
-    for i in 0..NLAYER {
+    for i in 0..nlayer {
         let p = format!("blk.{i}");
         tensors.push(RawTensor::f32(
             &format!("{p}.attn_norm.weight"),
@@ -1732,9 +1845,71 @@ pub fn write_tiny_deepseek4_gguf_opts(path: &Path, opts: TinyDeepseek4Opts) {
         ));
         tensors.push(RawTensor::f32(
             &format!("{p}.attn_sinks.weight"),
-            ones(NHEAD),
+            if v41 { next(NHEAD) } else { vec![1.0; NHEAD] },
             &[NHEAD],
         ));
+
+        if v41 {
+            // Sources: layers 0 (ratio 2, gated) and 2 (ratio 1, no gate).
+            if i == 0 || i == 2 {
+                tensors.push(RawTensor::f16(
+                    &format!("{p}.attn_compressor_kv.weight"),
+                    next(HEAD_DIM * EMB),
+                    &[HEAD_DIM, EMB],
+                ));
+                if i == 0 {
+                    tensors.push(RawTensor::f16(
+                        &format!("{p}.attn_compressor_gate.weight"),
+                        next(HEAD_DIM * EMB),
+                        &[HEAD_DIM, EMB],
+                    ));
+                }
+                tensors.push(RawTensor::f32(
+                    &format!("{p}.attn_compressor_norm.weight"),
+                    ones(HEAD_DIM),
+                    &[HEAD_DIM],
+                ));
+                // Index-key owners.
+                tensors.push(RawTensor::f16(
+                    &format!("{p}.indexer.attn_k.weight"),
+                    next(INDEX_HD * HEAD_DIM),
+                    &[INDEX_HD, HEAD_DIM],
+                ));
+                tensors.push(RawTensor::f32(
+                    &format!("{p}.indexer.k_norm.weight"),
+                    ones(INDEX_HD),
+                    &[INDEX_HD],
+                ));
+            }
+            // Index sources: every compressed layer but none of the window-only one.
+            if i < 3 {
+                tensors.push(RawTensor::f16(
+                    &format!("{p}.indexer.proj.weight"),
+                    next(INDEX_NHEAD * EMB),
+                    &[INDEX_NHEAD, EMB],
+                ));
+                tensors.push(RawTensor::f16(
+                    &format!("{p}.indexer.attn_q_b.weight"),
+                    next(INDEX_NHEAD * INDEX_HD * Q_LORA),
+                    &[INDEX_NHEAD * INDEX_HD, Q_LORA],
+                ));
+            }
+            if i == 1 {
+                let n_cols = 4;
+                tensors.push(RawTensor::f16(
+                    &format!("{p}.engram_embd.weight"),
+                    next(engram_rows * ENGRAM_KEY),
+                    &[engram_rows, ENGRAM_KEY],
+                ));
+                tensors.push(RawTensor::f16(
+                    &format!("{p}.engram_wkv.weight"),
+                    next((HC + 1) * EMB * n_cols * ENGRAM_KEY),
+                    &[(HC + 1) * EMB, n_cols * ENGRAM_KEY],
+                ));
+                tensors.push(RawTensor::f32(&format!("{p}.engram_q.weight"), ones(HC * EMB), &[HC, EMB]));
+                tensors.push(RawTensor::f32(&format!("{p}.engram_k.weight"), ones(HC * EMB), &[HC, EMB]));
+            }
+        }
 
         // CSA layer 0: main compressor + lightning indexer (and its own
         // ratio-4 compressor).  Both write their caches with a scatter whose
@@ -1800,7 +1975,7 @@ pub fn write_tiny_deepseek4_gguf_opts(path: &Path, opts: TinyDeepseek4Opts) {
             next(NE * EMB),
             &[NE, EMB],
         ));
-        if i >= N_HASH {
+        if i >= n_hash {
             tensors.push(RawTensor::f32(
                 &format!("{p}.exp_probs_b.bias"),
                 next(NE),
@@ -1847,7 +2022,7 @@ pub fn write_tiny_deepseek4_gguf_opts(path: &Path, opts: TinyDeepseek4Opts) {
             next(EMB * nfe),
             &[EMB, nfe],
         ));
-        if i < N_HASH {
+        if i < n_hash {
             // Routed-id table: I32, [vocab, n_expert_used], ids in [0, NE).
             let ids: Vec<i32> = (0..VOCAB).map(|t| ((t * 3 + 1) % NE) as i32).collect();
             let ids = [ids.clone(), ids.clone()].concat();
@@ -1881,9 +2056,10 @@ pub fn write_tiny_deepseek4_gguf_opts(path: &Path, opts: TinyDeepseek4Opts) {
             next(hc_out),
             &[hc_out],
         ));
+        let hc_scale = if v41 { vec![0.7, 1.3, 0.9] } else { vec![1.0, 1.0, 1.0] };
         tensors.push(RawTensor::f32(
             &format!("{p}.hc_attn_scale.weight"),
-            vec![1.0, 1.0, 1.0],
+            hc_scale.clone(),
             &[3],
         ));
         tensors.push(RawTensor::f16(
@@ -1898,7 +2074,7 @@ pub fn write_tiny_deepseek4_gguf_opts(path: &Path, opts: TinyDeepseek4Opts) {
         ));
         tensors.push(RawTensor::f32(
             &format!("{p}.hc_ffn_scale.weight"),
-            vec![1.0, 1.0, 1.0],
+            hc_scale,
             &[3],
         ));
     }
@@ -1913,6 +2089,97 @@ pub fn write_tiny_deepseek4_gguf_opts(path: &Path, opts: TinyDeepseek4Opts) {
         ));
     }
 
+    write_raw_gguf(path, &metadata, &tensors);
+}
+
+/// How [`write_tiny_bonsai_gguf`] stores its matrices.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum BonsaiWeights {
+    /// Bonsai's formats: Q1_0 embedding + attention, Q2_0 FFN + head.
+    LowBit,
+    /// The same values dequantized to F32 (a candle-readable twin).
+    Dequantized,
+}
+
+/// Write a tiny `qwen3` GGUF in the layout Bonsai models ship: Q1_0
+/// (1-bit) token embedding and attention projections, Q2_0 (2-bit) FFN and
+/// output head, F32 norms.  Widths are block multiples (128-dim embedding,
+/// 2 heads of 64, one KV head, 128-wide FFN, 2 layers).  With
+/// [`BonsaiWeights::Dequantized`] every matrix holds exactly the values its
+/// low-bit blocks decode to, stored as F32.
+pub fn write_tiny_bonsai_gguf(path: &Path, weights_as: BonsaiWeights) {
+    use joshua::low_bit::{blocks_as_bytes, quantize_q1_0, quantize_q2_0, BlockQ1_0, BlockQ2_0};
+    use joshua::raw_block::{dequantize, RawBlock};
+    const VOCAB: usize = 16;
+    const EMB: usize = 128;
+    const HD: usize = 64;
+    const NFF: usize = 128;
+    let (h, kv, n_layer) = (2usize, 1usize, 2usize);
+
+    let arch = "qwen3";
+    let key = |s: &str| format!("{arch}.{s}");
+    let u32v = gguf_file::Value::U32;
+    let metadata = vec![
+        ("general.architecture".to_string(), gguf_file::Value::String(arch.into())),
+        (key("attention.head_count"), u32v(h as u32)),
+        (key("attention.head_count_kv"), u32v(kv as u32)),
+        (key("block_count"), u32v(n_layer as u32)),
+        (key("embedding_length"), u32v(EMB as u32)),
+        (key("feed_forward_length"), u32v(NFF as u32)),
+        (key("context_length"), u32v(512)),
+        (key("attention.layer_norm_rms_epsilon"), gguf_file::Value::F32(1e-6)),
+        (key("attention.key_length"), u32v(HD as u32)),
+        (key("rope.freq_base"), gguf_file::Value::F32(1_000_000.0)),
+    ];
+
+    let mut seed = 0u32;
+    let mut tensors = Vec::new();
+    let mut matrix = |name: String, dims: &[usize], q1: bool| {
+        seed += 1;
+        let w = weights(dims.iter().product(), seed * 7919);
+        let (dtype, bytes, decoded) = if q1 {
+            let b = quantize_q1_0(&w);
+            let mut d = vec![0f32; w.len()];
+            dequantize(&b, &mut d).unwrap();
+            (BlockQ1_0::GGML_TYPE, blocks_as_bytes(&b).to_vec(), d)
+        } else {
+            let b = quantize_q2_0(&w);
+            let mut d = vec![0f32; w.len()];
+            dequantize(&b, &mut d).unwrap();
+            (BlockQ2_0::GGML_TYPE, blocks_as_bytes(&b).to_vec(), d)
+        };
+        tensors.push(match weights_as {
+            BonsaiWeights::LowBit => RawTensor {
+                name,
+                dtype,
+                dims: dims.to_vec(),
+                data: bytes,
+            },
+            BonsaiWeights::Dequantized => RawTensor::f32(&name, decoded, dims),
+        });
+    };
+    matrix("token_embd.weight".into(), &[VOCAB, EMB], true);
+    for l in 0..n_layer {
+        let p = |n: &str| format!("blk.{l}.{n}.weight");
+        matrix(p("attn_q"), &[h * HD, EMB], true);
+        matrix(p("attn_k"), &[kv * HD, EMB], true);
+        matrix(p("attn_v"), &[kv * HD, EMB], true);
+        matrix(p("attn_output"), &[EMB, h * HD], true);
+        matrix(p("ffn_gate"), &[NFF, EMB], false);
+        matrix(p("ffn_up"), &[NFF, EMB], false);
+        matrix(p("ffn_down"), &[EMB, NFF], false);
+    }
+    matrix("output.weight".into(), &[VOCAB, EMB], false);
+    let norm = |name: String, n: usize, seed: u32| {
+        RawTensor::f32(&name, weights(n, seed).iter().map(|v| 1.0 + 5.0 * v).collect(), &[n])
+    };
+    for l in 0..n_layer {
+        tensors.push(norm(format!("blk.{l}.attn_norm.weight"), EMB, 101 + l as u32));
+        tensors.push(norm(format!("blk.{l}.ffn_norm.weight"), EMB, 201 + l as u32));
+        tensors.push(norm(format!("blk.{l}.attn_q_norm.weight"), HD, 301 + l as u32));
+        tensors.push(norm(format!("blk.{l}.attn_k_norm.weight"), HD, 401 + l as u32));
+    }
+    tensors.push(norm("output_norm.weight".into(), EMB, 501));
     write_raw_gguf(path, &metadata, &tensors);
 }
 

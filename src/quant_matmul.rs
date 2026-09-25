@@ -66,6 +66,9 @@ pub fn decode_raw_to_f32(dtype: u32, bytes: &[u8], elems: usize) -> Result<Optio
         }};
     }
 
+    if let Some(out) = crate::with_raw_block!(dtype, B => crate::raw_block::decode_bytes::<B>(bytes, elems)) {
+        return out.map(Some);
+    }
     let out = match dtype {
         0 => return Ok(None), // F32: candle's reader keeps it exact.
         1 => {
@@ -76,18 +79,6 @@ pub fn decode_raw_to_f32(dtype: u32, bytes: &[u8], elems: usize) -> Result<Optio
                 .chunks_exact(2)
                 .map(|c| f16::from_le_bytes([c[0], c[1]]).to_f32())
                 .collect()
-        }
-        crate::iq2xxs::GGML_TYPE_IQ2_XXS => {
-            let blocks = crate::iq2xxs::blocks_from_bytes(bytes)?;
-            let mut out = vec![0f32; elems];
-            crate::iq2xxs::dequantize(blocks, &mut out)?;
-            out
-        }
-        crate::mxfp4::GGML_TYPE_MXFP4 => {
-            let blocks = crate::mxfp4::blocks_from_bytes(bytes)?;
-            let mut out = vec![0f32; elems];
-            crate::mxfp4::dequantize(blocks, &mut out)?;
-            out
         }
         2 => kquant!(BlockQ4_0),
         3 => kquant!(BlockQ4_1),
@@ -232,7 +223,7 @@ pub fn try_fast_cpu_qmatmul(qt: &QTensor, xs: &Tensor) -> Option<Result<Tensor>>
             GgmlDType::Q5K => generic_kquant!(BlockQ5K),
             GgmlDType::Q6K => generic_kquant!(BlockQ6K),
             GgmlDType::Q8K => generic_kquant!(BlockQ8K),
-            // IQ2_XXS on the CPU is `MmapBlocksIq2Xxs` (not `covered` above);
+            // IQ2_XXS on the CPU is `MmapRawBlocks` (not `covered` above);
             // candle's block type is the reference form and never lands here.
             GgmlDType::Iq2Xxs => false,
             _ => false,
