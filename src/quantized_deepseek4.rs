@@ -43,10 +43,10 @@ use candle_transformers::quantized_nn::RmsNorm;
 
 use crate::gguf_ext::GgufHeader;
 use crate::gguf_meta::Meta;
+use crate::ngram::grouped_rms;
 use crate::yarn::YarnConfig;
 use crate::raw_block::RawBlock;
 
-const HCA_RATIO: usize = 128;
 const CSA_RATIO: usize = 4;
 /// Hard cap on the KV context (and rope tables) per model instance.
 const KV_CAP: usize = 262_144;
@@ -54,13 +54,16 @@ const KV_CAP: usize = 262_144;
 /// (shorter prompts don't justify streaming whole layers).
 const PREFETCH_AHEAD_MIN: usize = 8;
 
-/// Parsed `deepseek4` hyper-parameters.
+/// Parsed `deepseek4` / `deepseek41` hyper-parameters.
 struct Config {
+    /// DeepSeek-V4.1 (`deepseek41`): lagged hyper-connection pre-mix with no
+    /// learned head, shared compressed streams, no per-head q norm, engram.
+    v41: bool,
+    engram: Option<EngramConfig>,
     n_layer: usize,
     n_head: usize,
     rms_eps: f64,
     // MLA dims.
-    q_lora_rank: usize,
     head_dim: usize,
     rope_head_dim: usize,
     nope_head_dim: usize,
@@ -92,16 +95,106 @@ struct Config {
     yarn: Option<YarnConfig>,
 }
 
+/// DeepSeek-V4.1 engram n-gram tables (`{arch}.engram.*`): each engram
+/// layer hashes every token's preceding n-grams into rows of its table.
+struct EngramConfig {
+    layer_ids: Vec<usize>,
+    n_head: usize,
+    key_len: usize,
+    max_ngram: usize,
+    /// `[n_engram_layer, max_ngram]`.
+    multipliers: Vec<u64>,
+    /// `[n_engram_layer, (max_ngram - 1) * n_head]` bucket sizes and starts.
+    primes: Vec<u64>,
+    offsets: Vec<u64>,
+    /// Token id → compressed id (case / accent folding).
+    token_map: Vec<u64>,
+    /// The (already mapped) id standing in for positions before the start.
+    pad_id: u64,
+}
+
+impl EngramConfig {
+    fn from_meta(m: &Meta, n_layer: usize) -> Result<Option<Self>> {
+        let Some(layer_ids) = m.array_u64("engram.layer_ids") else {
+            return Ok(None);
+        };
+        let a = m.arch();
+        let layer_ids: Vec<usize> = layer_ids.into_iter().map(|v| v as usize).collect();
+        let n_head = m.u32("engram.head_count")? as usize;
+        let max_ngram = m.u32("engram.max_ngram_size")? as usize;
+        let n_cols = max_ngram.saturating_sub(1) * n_head;
+        let arr = |k: &str| {
+            m.array_u64(k)
+                .ok_or_else(|| candle_core::Error::Msg(format!("{a}: missing `{a}.{k}`")))
+        };
+        let cfg = Self {
+            n_head,
+            key_len: m.u32("engram.key_length")? as usize,
+            max_ngram,
+            multipliers: arr("engram.multipliers")?,
+            primes: arr("engram.primes")?,
+            offsets: arr("engram.offsets")?,
+            token_map: arr("engram.token_map")?,
+            pad_id: m.u32("engram.pad_id")? as u64,
+            layer_ids,
+        };
+        let n_eg = cfg.layer_ids.len();
+        if n_head == 0 || max_ngram < 2 || cfg.layer_ids.iter().any(|&l| l >= n_layer) {
+            candle_core::bail!("{a}: engram layers/heads/n-gram size out of range");
+        }
+        if cfg.multipliers.len() != n_eg * max_ngram
+            || cfg.primes.len() != n_eg * n_cols
+            || cfg.offsets.len() != cfg.primes.len()
+            || cfg.primes.contains(&0)
+        {
+            candle_core::bail!("{a}: engram hash constants do not match layers x buckets");
+        }
+        Ok(Some(cfg))
+    }
+
+    /// Row indices (`[seq * n_cols]`, token-major) of the engram table for
+    /// engram layer `eg` at positions `[offset, offset + seq)` of `history`
+    /// (every token of the sequence so far).  Mirrors llama.cpp's
+    /// `llm_graph_input_engram::set_input`: look-back stops at the start of
+    /// the sequence, where every older slot reads as the pad id.
+    fn rows(&self, eg: usize, history: &[u32], offset: usize, seq: usize) -> Vec<u32> {
+        let n = self.max_ngram;
+        let n_cols = (n - 1) * self.n_head;
+        let mult = &self.multipliers[eg * n..(eg + 1) * n];
+        let prime = &self.primes[eg * n_cols..(eg + 1) * n_cols];
+        let off = &self.offsets[eg * n_cols..(eg + 1) * n_cols];
+        let map = |t: u32| self.token_map.get(t as usize).copied().unwrap_or(self.pad_id);
+        let mut out = Vec::with_capacity(seq * n_cols);
+        for p in offset..offset + seq {
+            let mut rolling = map(history[p]).wrapping_mul(mult[0]);
+            for s in 1..n {
+                let ctx = if p >= s { map(history[p - s]) } else { self.pad_id };
+                rolling ^= ctx.wrapping_mul(mult[s]);
+                for h in 0..self.n_head {
+                    let b = (s - 1) * self.n_head + h;
+                    out.push((rolling % prime[b] + off[b]) as u32);
+                }
+            }
+        }
+        out
+    }
+}
+
 impl Config {
     fn from_metadata(md: &std::collections::HashMap<String, gguf_file::Value>) -> Result<Self> {
-        let m = Meta::new(md, "deepseek4");
+        let arch = match crate::model::Architecture::arch_name(md).as_deref() {
+            Some("deepseek41") => "deepseek41",
+            _ => "deepseek4",
+        };
+        let m = Meta::new(md, arch);
         let a = m.arch();
         let n_layer = m.u32("block_count")? as usize;
         let n_head = m.u32("attention.head_count")? as usize;
         let _n_embd = m.u32("embedding_length")? as usize;
         let rms_eps = m.f32("attention.layer_norm_rms_epsilon")? as f64;
 
-        let q_lora_rank = m.u32("attention.q_lora_rank")? as usize;
+        // Implied by the weight shapes; required so a malformed file fails early.
+        m.u32("attention.q_lora_rank")?;
         let head_dim = m.u32_or("attention.key_length", 0).max(1) as usize;
         // llama.cpp stores this at `{a}.rope.dimension_count`; older files used
         // `{a}.attention.rope.dimension_count`.  Prefer the current key and
@@ -158,10 +251,11 @@ impl Config {
         let yarn = YarnConfig::from_meta(&m, 16.0, 65536);
 
         Ok(Self {
+            v41: arch == "deepseek41",
+            engram: EngramConfig::from_meta(&m, n_layer)?,
             n_layer,
             n_head,
             rms_eps,
-            q_lora_rank,
             head_dim,
             rope_head_dim,
             nope_head_dim,
@@ -856,50 +950,154 @@ fn hc_split_sinkhorn(
     Ok(HcMix { pre, post, comb })
 }
 
-/// `hc_pre`: mix `hc` copies down to one stream.
-/// `x`: `[b, s, hc, d]`, `hc_fn`: `[hc_dim, mix_hc]`, `hc_scale`: `[3]`,
-/// `hc_base`: `[mix_hc]`, eps from config.
-fn hc_pre(
-    x: &Tensor,
-    hc_fn: &QMatMul,
-    hc_scale: &Tensor,
-    hc_base: &Tensor,
-    eps: f64,
-    sinkhorn_iters: usize,
-) -> Result<(Tensor, Tensor, Tensor)> {
-    let shape = x.shape().dims().to_vec(); // [b, s, hc, d]
-    let (b, s, hc, d) = (shape[0], shape[1], shape[2], shape[3]);
+/// A sublayer's mixing coefficients, from the stream `x` (`[b, s, hc, d]`):
+/// `hc_fn` (`[hc_dim, mix_hc]`) applied to the flattened copies RMS-normalized
+/// with the model's norm eps, then split by [`hc_split_sinkhorn`] (llama.cpp
+/// `build_hc_mixes`).
+fn hc_mixes(x: &Tensor, hc_fn: &QMatMul, hc_scale: &Tensor, hc_base: &Tensor, cfg: &Config) -> Result<HcMix> {
+    let (b, s, hc, d) = x.dims4()?;
     let flat = x.reshape((b * s, hc * d))?;
-    let rsqrt = flat
-        .sqr()?
-        .mean_keepdim(D::Minus1)?
-        .affine(1.0, eps)?
-        .powf(-0.5)?;
-    let mixes = hc_fn.forward(&flat)?.broadcast_mul(&rsqrt)?; // [b*s, (2+hc)*hc]
+    let mixes = hc_fn.forward(&rms_rows(&flat, cfg.rms_eps)?)?; // [b*s, (2+hc)*hc]
     let mixes = mixes.reshape((b, s, (2 + hc) * hc))?;
-    let mix = hc_split_sinkhorn(&mixes, hc_scale, hc_base, hc, sinkhorn_iters, eps)?;
-    // y = sum over hc of pre[..., h] * x[..., h, :]
-    let y = mix
-        .pre
-        .unsqueeze(D::Minus1)?
-        .broadcast_as((b, s, hc, d))?
+    hc_split_sinkhorn(&mixes, hc_scale, hc_base, hc, cfg.hc_sinkhorn_iters, cfg.hc_eps)
+}
+
+/// Unweighted RMS norm over the last dim.
+fn rms_rows(x: &Tensor, eps: f64) -> Result<Tensor> {
+    x.broadcast_mul(&x.sqr()?.mean_keepdim(D::Minus1)?.affine(1.0, eps)?.powf(-0.5)?)
+}
+
+/// Collapse the `hc` copies of `x` (`[b, s, hc, d]`) to one stream with the
+/// weights `pre` (`[b, s, hc]`).
+fn hc_collapse(x: &Tensor, pre: &Tensor) -> Result<Tensor> {
+    pre.unsqueeze(D::Minus1)?
+        .broadcast_as(x.shape())?
         .mul(x)?
-        .sum(D::Minus2)?; // [b, s, d]
-    Ok((y, mix.post, mix.comb))
+        .sum(D::Minus2)
+}
+
+/// The hyper-connection stream between sublayers: the `hc` copies, plus —
+/// for DeepSeek-V4.1, whose sublayers collapse with the mix the *previous*
+/// sublayer computed — that carried pre-mix.
+#[derive(Clone)]
+struct Stream {
+    xs: Tensor,          // [1, s, hc, d]
+    pre: Option<Tensor>, // [1, s, hc]
+}
+
+impl Stream {
+    /// The embedded tokens `[1, s, d]` expanded to `hc` copies.  V4.1's first
+    /// layer has no previous sublayer, so it collapses with a one-hot mix
+    /// selecting the first copy.
+    fn from_embeddings(tok: &Tensor, hc: usize, v41: bool) -> Result<Self> {
+        let (b, s, d) = tok.dims3()?;
+        let xs = tok.unsqueeze(2)?.broadcast_as((b, s, hc, d))?;
+        let pre = v41
+            .then(|| {
+                let mut one_hot = vec![0f32; hc];
+                one_hot[0] = 1.0;
+                Tensor::from_vec(one_hot, hc, tok.device())?.broadcast_as((b, s, hc))
+            })
+            .transpose()?;
+        Ok(Self { xs, pre })
+    }
+
+    /// Enter a sublayer: its mixes, and the stream collapsed with the carried
+    /// pre-mix (V4.1) or its own (V4).  Returns `(x, mix)`; `mix.pre` is what
+    /// the next sublayer carries.
+    fn enter(
+        &self,
+        hc_fn: &QMatMul,
+        hc_scale: &Tensor,
+        hc_base: &Tensor,
+        cfg: &Config,
+    ) -> Result<(Tensor, HcMix)> {
+        let mix = hc_mixes(&self.xs, hc_fn, hc_scale, hc_base, cfg)?;
+        let x = hc_collapse(&self.xs, self.pre.as_ref().unwrap_or(&mix.pre))?;
+        Ok((x, mix))
+    }
+
+    /// Leave a sublayer: expand its output `h` back onto the copies with the
+    /// sublayer's post/comb, carrying `mix.pre` forward for V4.1.
+    fn leave(&self, h: &Tensor, mix: HcMix, v41: bool) -> Result<Self> {
+        Ok(Self {
+            xs: hc_post(h, &self.xs, &mix.post, &mix.comb)?,
+            pre: v41.then_some(mix.pre),
+        })
+    }
+
+    /// The stream as one tensor for [`crate::stream_prefill::StreamPrefill`],
+    /// which carries a single tensor between layers: the carried pre-mix
+    /// rides along as one extra trailing column.
+    fn pack(&self) -> Result<Tensor> {
+        match &self.pre {
+            Some(pre) => Tensor::cat(&[self.xs.contiguous()?, pre.unsqueeze(D::Minus1)?], D::Minus1),
+            None => Ok(self.xs.clone()),
+        }
+    }
+
+    fn unpack(t: &Tensor, v41: bool) -> Result<Self> {
+        if !v41 {
+            return Ok(Self { xs: t.clone(), pre: None });
+        }
+        let d = t.dim(D::Minus1)? - 1;
+        Ok(Self {
+            xs: t.narrow(D::Minus1, 0, d)?,
+            pre: Some(t.narrow(D::Minus1, d, 1)?.squeeze(D::Minus1)?),
+        })
+    }
 }
 
 /// `hc_post`: expand one stream back to `hc` copies.
 /// `x`: `[b, s, d]`, `residual`: `[b, s, hc, d]`, `post`: `[b, s, hc]`,
-/// `comb`: `[b, s, hc, hc]`.
+/// `comb`: `[b, s, hc(src), hc(dst)]` (Sinkhorn-normalized over `dst`
+/// first).  Copy `dst` becomes `post[dst]·x + Σ_src comb[src, dst]·residual[src]`
+/// (llama.cpp `build_hc_post`).
 fn hc_post(x: &Tensor, residual: &Tensor, post: &Tensor, comb: &Tensor) -> Result<Tensor> {
-    let shape = residual.shape().dims().to_vec(); // [b, s, hc, d]
-    let (b, s, hc, d) = (shape[0], shape[1], shape[2], shape[3]);
+    let (b, s, hc, d) = residual.dims4()?;
     let post_t = post.unsqueeze(D::Minus1)?.broadcast_as((b, s, hc, d))?;
-    let comb_t = comb.unsqueeze(D::Minus1)?.broadcast_as((b, s, hc, hc, d))?;
     let x_t = x.unsqueeze(2)?.broadcast_as((b, s, hc, d))?;
-    let comb_src =
-        (comb_t * residual.unsqueeze(2)?.broadcast_as((b, s, hc, hc, d))?)?.sum(D::Minus2)?; // [b, s, hc, d]
+    // [b, s, dst, src] · [b, s, src, d] → [b, s, dst, d]
+    let comb_src = comb.transpose(2, 3)?.contiguous()?.matmul(&residual.contiguous()?)?;
     (post_t * x_t)?.add(&comb_src)
+}
+
+// ─── Engram (DeepSeek-V4.1) ──────────────────────────────────────────────────
+
+/// An engram layer: n-gram keyed rows of a (huge, lazily paged) table,
+/// projected to a key per copy plus a shared value, and gated into every
+/// copy of the stream before the layer runs (llama.cpp `build_engram`).
+struct Engram {
+    /// Which engram layer this is (indexes the hash constants).
+    index: usize,
+    /// `[n_rows, key_len]`, kept on the CPU (hundreds of millions of rows),
+    /// gathered per token.
+    table: crate::token_embedding::TokenEmbedding,
+    wkv: QMatMul,  // [n_cols * key_len] -> [(hc + 1) * d]
+    q: Tensor,     // [hc, d] query norm weight
+    k: Tensor,     // [hc, d] key norm weight
+    eps: f64,
+}
+
+impl Engram {
+    fn forward(&self, xs: &Tensor, rows: Vec<u32>) -> Result<Tensor> {
+        let (b, s, hc, d) = xs.dims4()?;
+        let dev = xs.device();
+        let n = rows.len();
+        let emb = self
+            .table
+            .forward(&Tensor::from_vec(rows, n, &Device::Cpu)?)?
+            .to_device(dev)?
+            .reshape((b * s, ()))?; // buckets laid out slowest, per token
+        let kv = self.wkv.forward(&emb)?; // [s, (hc + 1) * d]
+        let key = kv.narrow(1, 0, hc * d)?.reshape((b, s, hc, d))?;
+        let value = kv.narrow(1, hc * d, d)?.reshape((b, s, 1, d))?;
+        let gate = crate::ngram::keyed_gate(
+            &grouped_rms(&key, &self.k, self.eps)?,
+            &grouped_rms(xs, &self.q, self.eps)?,
+        )?; // [b, s, hc]
+        xs + value.broadcast_mul(&gate.unsqueeze(D::Minus1)?)?
+    }
 }
 
 // ─── Quantized-rotation helpers ─────────────────────────────────────────────
@@ -947,11 +1145,13 @@ fn hadamard_rows(x: &Tensor) -> Result<Tensor> {
 
 struct Compressor {
     wkv: QMatMul,
-    wgate: QMatMul,
-    ape: Tensor, // [ratio, coff*head_dim] (GGUF stores it as [coff*head_dim, ratio])
+    /// Pooling-score projection.  V4.1's ratio-1 compressors have none: the
+    /// softmax then runs over one row and passes the values through.
+    wgate: Option<QMatMul>,
+    ape: Option<Tensor>, // [ratio, coff*head_dim] (GGUF stores it as [coff*head_dim, ratio])
     norm: RmsNorm,
     ratio: usize,
-    coff: usize, // 2 for CSA (overlap), 1 for HCA
+    coff: usize, // 2 for CSA (overlap), 1 for HCA and every V4.1 compressor
     head_dim: usize,
     rope_head_dim: usize,
     rotate: bool, // indexer compressor applies the Hadamard rotation
@@ -973,29 +1173,60 @@ impl CompressorState {
     }
 }
 
+/// A compressor's output for one chunk: the newly completed rows
+/// (normalized, roped at their block's first token), their block indices,
+/// and the same rows before the rope (V4.1 derives its index keys there).
+struct Compressed {
+    rows: Tensor,     // [n, head_dim]
+    blocks: Tensor,   // [n] u32
+    starts: Tensor,   // [n] u32, each block's first token
+    pre_rope: Tensor, // [n, head_dim]
+}
+
 impl Compressor {
+    #[allow(clippy::too_many_arguments)]
     fn load<R: Read + Seek>(
         rd: &mut Reader<R>,
         prefix: &str, // e.g. "blk.0.attn_compressor" or "blk.0.indexer_compressor"
         ratio: usize,
+        overlap: bool,
         head_dim: usize,
         rope_head_dim: usize,
         eps: f64,
         rotate: bool,
     ) -> Result<Self> {
-        debug_assert!(ratio == CSA_RATIO || ratio == HCA_RATIO);
-        let coff = if ratio == CSA_RATIO { 2 } else { 1 };
+        let gate = format!("{prefix}_gate.weight");
+        let ape = format!("{prefix}_ape.weight");
         Ok(Self {
             wkv: rd.qmatmul(&format!("{prefix}_kv.weight"))?,
-            wgate: rd.qmatmul(&format!("{prefix}_gate.weight"))?,
-            ape: rd.f32_tensor(&format!("{prefix}_ape.weight"))?, // [ratio, coff*head_dim] (gguf reader reverses dims)
+            wgate: rd.qmatmul_opt(&gate)?,
+            // [ratio, coff*head_dim] (gguf reader reverses dims)
+            ape: rd.has(&ape).then(|| rd.f32_tensor(&ape)).transpose()?,
             norm: rd.rms_norm(&format!("{prefix}_norm.weight"), eps)?,
             ratio,
-            coff,
+            coff: if overlap { 2 } else { 1 },
             head_dim,
             rope_head_dim,
             rotate,
         })
+    }
+
+    /// The `(kv, score)` rows `[seq, coff*head_dim]` of `x` (`[1, seq, n]`).
+    fn project(&self, x: &Tensor) -> Result<(Tensor, Tensor)> {
+        let kv = self.wkv.forward(x)?.squeeze(0)?;
+        let score = match &self.wgate {
+            Some(g) => g.forward(x)?.squeeze(0)?,
+            None => kv.clone(),
+        };
+        Ok((kv, score))
+    }
+
+    /// `score` plus the absolute-position embedding rows `[start, start+len)`.
+    fn add_ape(&self, score: &Tensor, start: usize, len: usize) -> Result<Tensor> {
+        match &self.ape {
+            Some(ape) => score.broadcast_add(&ape.narrow(0, start, len)?),
+            None => Ok(score.clone()),
+        }
     }
 
     /// Compress `kv`/`score` rows for tokens `[offset, offset+seq)` and update
@@ -1014,7 +1245,7 @@ impl Compressor {
         seq: usize,
         rotary: &RotaryEmbedding,
         dev: &Device,
-    ) -> Result<Option<(Tensor, Tensor)>> {
+    ) -> Result<Option<Compressed>> {
         let ratio = self.ratio;
         let coff = self.coff;
         let hd = self.head_dim;
@@ -1028,23 +1259,24 @@ impl Compressor {
             if coff == 2 && cutoff >= ratio {
                 // Previous window = the last full block of this prompt.
                 let prev = kv.narrow(0, cutoff - ratio, ratio)?;
-                let prev_s = (score.narrow(0, cutoff - ratio, ratio)? + &self.ape)?;
+                let prev_s = self.add_ape(&score.narrow(0, cutoff - ratio, ratio)?, 0, ratio)?;
                 state.kv = state.kv.slice_scatter(&prev, 0, 0)?;
                 state.score = state.score.slice_scatter(&prev_s, 0, 0)?;
             }
             if rem > 0 {
                 let kv_rest = kv.narrow(0, cutoff, rem)?;
-                let sc_rest = (score.narrow(0, cutoff, rem)? + self.ape.narrow(0, 0, rem)?)?;
+                let sc_rest = self.add_ape(&score.narrow(0, cutoff, rem)?, 0, rem)?;
                 let at = if coff == 2 { ratio } else { 0 };
                 state.kv = state.kv.slice_scatter(&kv_rest, 0, at)?;
                 state.score = state.score.slice_scatter(&sc_rest, 0, at)?;
             }
             if nb > 0 {
                 let bkv = kv.narrow(0, 0, cutoff)?.reshape((nb, ratio, coff * hd))?;
-                let bsc = score
-                    .narrow(0, 0, cutoff)?
-                    .reshape((nb, ratio, coff * hd))?
-                    .broadcast_add(&self.ape.unsqueeze(0)?)?;
+                let bsc = self.add_ape(
+                    &score.narrow(0, 0, cutoff)?.reshape((nb, ratio, coff * hd))?,
+                    0,
+                    ratio,
+                )?;
                 let (bkv, bsc) = if coff == 2 {
                     // Overlap transform: the pooled window of block b spans
                     // `2*ratio` tokens — block b-1 seen through its
@@ -1074,8 +1306,9 @@ impl Compressor {
             for i in 0..seq {
                 let pos = offset + i;
                 let k = kv.narrow(0, i, 1)?.reshape((coff * hd,))?;
-                let s = (score.narrow(0, i, 1)?.reshape((coff * hd,))?
-                    + self.ape.narrow(0, pos % ratio, 1)?.reshape((coff * hd,))?)?;
+                let s = self
+                    .add_ape(&score.narrow(0, i, 1)?, pos % ratio, 1)?
+                    .reshape((coff * hd,))?;
                 if coff == 2 {
                     state.kv = state
                         .kv
@@ -1133,27 +1366,14 @@ impl Compressor {
         if rows.is_empty() {
             return Ok(None);
         }
-        let mut comp = Tensor::cat(&rows, 0)?; // [n, hd]
-        comp = self.norm.forward(&comp)?;
-        // RoPE on the trailing rope dims at the compressed positions.
-        let rd = self.rope_head_dim;
-        let poss_t = Tensor::from_vec(poss, comp.dim(0)?, dev)?;
-        // Rotate at the TOKEN position where each block starts (b*ratio), which
-        // is what llama passes as `comp_pos` and the python uses via
-        // `freqs_cis[:cutoff:ratio]`.
-        let poss_tok = Tensor::from_vec(
-            poss_t
-                .to_vec1::<u32>()?
-                .iter()
-                .map(|b| b * self.ratio as u32)
-                .collect(),
-            comp.dim(0)?,
-            dev,
-        )?;
-        let nope = comp.narrow(D::Minus1, 0, hd - rd)?;
-        let pe = comp.narrow(D::Minus1, hd - rd, rd)?;
-        let pe = rotary.apply_at(&pe, &poss_tok)?;
-        let comp = Tensor::cat(&[nope, pe], D::Minus1)?;
+        let pre_rope = self.norm.forward(&Tensor::cat(&rows, 0)?)?; // [n, hd]
+        // RoPE on the trailing rope dims, at the TOKEN position where each
+        // block starts (b*ratio), which is what llama passes as `comp_pos`
+        // and the python uses via `freqs_cis[:cutoff:ratio]`.
+        let n = pre_rope.dim(0)?;
+        let starts: Vec<u32> = poss.iter().map(|b| b * ratio as u32).collect();
+        let starts = Tensor::from_vec(starts, n, dev)?;
+        let comp = rope_tail(rotary, &pre_rope, self.rope_head_dim, &starts)?;
         // The indexer stores its compressed KV Hadamard-rotated, matching the
         // official `rotate_activation`; the indexer query is rotated the same
         // way, so the relative scores are unchanged but QAT-aligned.
@@ -1162,8 +1382,30 @@ impl Compressor {
         } else {
             comp
         };
-        Ok(Some((comp, poss_t)))
+        Ok(Some(Compressed {
+            rows: comp,
+            blocks: Tensor::from_vec(poss, n, dev)?,
+            starts,
+            pre_rope,
+        }))
     }
+}
+
+/// Write `rows` (`[n, dim]`) into `cache` (`[max_rows, dim]`) at the row
+/// indices `at` (`[n]` u32).  Scatter needs a dense index tensor — a
+/// broadcast view of the positions is not one.
+fn scatter_rows(cache: &Tensor, at: &Tensor, rows: &Tensor) -> Result<Tensor> {
+    let idx = at.unsqueeze(1)?.broadcast_as(rows.shape())?.contiguous()?;
+    cache.scatter(&idx, rows, 0)
+}
+
+/// RoPE the trailing `rope_dim` columns of the rows `x` (`[n, dim]`) at the
+/// per-row token positions `pos` (`[n]` u32).
+fn rope_tail(rotary: &RotaryEmbedding, x: &Tensor, rope_dim: usize, pos: &Tensor) -> Result<Tensor> {
+    let dim = x.dim(D::Minus1)?;
+    let nope = x.narrow(D::Minus1, 0, dim - rope_dim)?;
+    let pe = rotary.apply_at(&x.narrow(D::Minus1, dim - rope_dim, rope_dim)?, pos)?;
+    Tensor::cat(&[nope, pe], D::Minus1)
 }
 
 /// Apply (or invert) RoPE on the trailing `rope_dim` slice of a
@@ -1187,9 +1429,14 @@ fn rope_apply(
 }
 
 struct Indexer {
-    proj: QMatMul,          // [n_embd, index_n_head]
-    attn_q_b: QMatMul,      // [q_lora_rank, index_n_head * index_head_dim]
-    compressor: Compressor, // ratio 4, head_dim = index_head_dim, rotate
+    proj: QMatMul,     // [n_embd, index_n_head]
+    attn_q_b: QMatMul, // [q_lora_rank, index_n_head * index_head_dim]
+    /// V4's own lid compressor (ratio 4, head_dim = index_head_dim, rotate).
+    /// V4.1 scores against the index keys a key-owner layer derived from the
+    /// shared latent instead (see [`IndexKey`]).
+    compressor: Option<Compressor>,
+    /// Tokens per compressed row of the keys this indexer scores.
+    ratio: usize,
     n_head: usize,
     head_dim: usize,
     rope_head_dim: usize,
@@ -1211,7 +1458,7 @@ impl Indexer {
         rotary: &RotaryEmbedding,
     ) -> Result<Tensor> {
         let dev = x.device();
-        let n_lid = (offset + seq) / self.compressor.ratio;
+        let n_lid = (offset + seq) / self.ratio;
         if n_lid == 0 {
             // No compressed KV rows yet at this position.  An empty `[seq, 0]`
             // tensor is only ever read back on the host in `build_kv` (dims +
@@ -1233,11 +1480,16 @@ impl Indexer {
             false,
         )?;
         let q = q4.transpose(1, 2)?.squeeze(0)?.contiguous()?; // [seq, ih, ihd]
-                                                               // The official model rotates the indexer query with the Hadamard matrix
-                                                               // (same one the compressor applied to the lid rows); llama.cpp does the
-                                                               // same with `k_rot`.  Applied to both sides it is an exact orthogonal
-                                                               // change of basis, so this only matters for QAT/quantization alignment.
-        let q = hadamard_rows(&q)?;
+        // The official model rotates the indexer query with the Hadamard matrix
+        // (same one the compressor applied to the lid rows); llama.cpp does the
+        // same with `k_rot`.  Applied to both sides it is an exact orthogonal
+        // change of basis, so this only matters for QAT/quantization alignment
+        // (V4.1's keys are stored unrotated, so its query stays unrotated too).
+        let q = if self.compressor.is_some() {
+            hadamard_rows(&q)?
+        } else {
+            q
+        };
 
         let k = lid.narrow(0, 0, n_lid)?; // [n_lid, ihd]
         let kt = k
@@ -1254,7 +1506,7 @@ impl Indexer {
         // b < (p+1)/ratio.
         let mut vals = vec![f32::NEG_INFINITY; seq * n_lid];
         for r in 0..seq {
-            let nv = (offset + r + 1) / self.compressor.ratio;
+            let nv = (offset + r + 1) / self.ratio;
             for b in 0..nv.min(n_lid) {
                 vals[r * n_lid + b] = 0.0;
             }
@@ -1265,9 +1517,24 @@ impl Indexer {
     }
 }
 
+/// DeepSeek-V4.1 index keys: a key-owner layer projects the pooled latent
+/// its compressor produced (before the rope) to the indexer's key space.
+struct IndexKey {
+    attn_k: QMatMul, // [head_dim] -> [index_head_dim]
+    k_norm: RmsNorm,
+    attn_k_out: usize,
+}
+
 struct Attention {
     q_a: QMatMul,
     q_norm: RmsNorm,
+    /// V4 re-normalizes every query head after `q_b`; V4.1 does not.
+    q_head_norm: bool,
+    index_key: Option<IndexKey>,
+    /// The layer whose compressed rows / index keys this layer reads (itself
+    /// on V4; V4.1 shares the streams a few source layers publish).
+    kv_source: usize,
+    key_source: usize,
     q_b: QMatMul,
     wkv: QMatMul,
     kv_norm: RmsNorm,
@@ -1317,7 +1584,7 @@ impl Attention {
     /// window cannot alias its own history through the ring.
     fn build_kv(
         &self,
-        kv: &KvState,
+        comp: Option<&Tensor>,
         swa_prev: &Tensor,
         kv_raw: &Tensor,
         offset: usize,
@@ -1406,7 +1673,9 @@ impl Attention {
         let k_all;
         let mask;
         if n_comp > 0 {
-            let c = kv.comp.as_ref().unwrap();
+            let c = comp.ok_or_else(|| {
+                candle_core::Error::Msg("deepseek4: compressed layer without a compressed stream".into())
+            })?;
             let k_comp = c
                 .index_select(&Tensor::from_vec(c_rows, (seq * n_comp,), dev)?, 0)?
                 .reshape((seq, n_comp, d))?;
@@ -1425,9 +1694,12 @@ impl Attention {
         Ok((k_all, mask))
     }
 
+    /// `kvs` is every layer's cache (this session's): the layer writes its
+    /// own at `layer` and reads the compressed streams of its sources.
     fn forward(
         &self,
-        kv: &mut KvState,
+        kvs: &mut [KvState],
+        layer: usize,
         x: &Tensor,
         offset: usize,
         max_seq: usize,
@@ -1448,9 +1720,13 @@ impl Attention {
             .q_b
             .forward(&qr)?
             .reshape((seq, self.n_head, self.head_dim))?;
-        let m = q.sqr()?.mean_keepdim(D::Minus1)?.affine(1.0, self.eps)?;
-        let q = q.broadcast_div(&m.sqrt()?)?.contiguous()?;
-        let q = self.rope_qkv(&q, offset)?.contiguous()?;
+        let q = if self.q_head_norm {
+            let m = q.sqr()?.mean_keepdim(D::Minus1)?.affine(1.0, self.eps)?;
+            q.broadcast_div(&m.sqrt()?)?
+        } else {
+            q
+        };
+        let q = self.rope_qkv(&q.contiguous()?, offset)?.contiguous()?;
 
         // Raw KV row (MLA has a single KV head), RoPE on the trailing slice.
         let kv_raw = self.kv_norm.forward(&self.wkv.forward(x)?)?.squeeze(0)?; // [seq, head_dim]
@@ -1471,6 +1747,7 @@ impl Attention {
         // in which case it is rebuilt from the last `window_size` keys (a
         // scatter with repeated ring slots would leave an arbitrary winner).
         let win = self.window_size;
+        let kv = &mut kvs[layer];
         let swa_prev = kv.swa.as_ref().unwrap().clone();
         kv.swa = Some(if seq >= win {
             let start = offset + seq - win;
@@ -1491,10 +1768,9 @@ impl Attention {
             swa_prev.scatter(&ridx, &kv_raw, 0)?
         });
 
-        // Main compressor (CSA / HCA).
+        // Main compressor (CSA / HCA; V4.1 source layers only).
         if let Some(c) = &self.compressor {
-            let ckv = c.wkv.forward(x)?.squeeze(0)?; // [seq, coff*head_dim]
-            let csc = c.wgate.forward(x)?.squeeze(0)?;
+            let (ckv, csc) = c.project(x)?;
             let out = c.forward(
                 &ckv,
                 &csc,
@@ -1504,51 +1780,49 @@ impl Attention {
                 self.compress_rotary.as_ref().unwrap(),
                 dev,
             )?;
-            if let Some((rows, poss)) = &out {
-                let comp = kv.comp.as_ref().unwrap();
-                // Broadcast index views are not contiguous; scatter requires
-                // a dense index tensor (same as the sliding-window ring
-                // above), so materialize it before writing the cache.
-                let pidx = poss
-                    .unsqueeze(1)?
-                    .broadcast_as((rows.dim(0)?, self.head_dim))?
-                    .contiguous()?;
-                kv.comp = Some(comp.scatter(&pidx, rows, 0)?);
+            if let Some(out) = out {
+                kv.comp = Some(scatter_rows(kv.comp.as_ref().unwrap(), &out.blocks, &out.rows)?);
+                // V4.1 key owner: index keys from the latent before its rope.
+                if let Some(ik) = &self.index_key {
+                    let k = ik.k_norm.forward(&ik.attn_k.forward(&out.pre_rope)?)?;
+                    let k = rope_tail(self.compress_rotary.as_ref().unwrap(), &k, self.rope_head_dim, &out.starts)?;
+                    kv.lid = Some(scatter_rows(kv.lid.as_ref().unwrap(), &out.blocks, &k)?);
+                }
             }
         }
 
-        // Indexer (CSA only): compress into the lid cache, then pick top-k
-        // block indices per query.
+        // Indexer: V4 compresses into its own lid cache first; then pick the
+        // top-k block indices per query.
         let lid_idx: Option<Tensor> = if let Some(ix) = &self.indexer {
-            let lkv = ix.compressor.wkv.forward(x)?.squeeze(0)?;
-            let lsc = ix.compressor.wgate.forward(x)?.squeeze(0)?;
-            let lout = ix.compressor.forward(
-                &lkv,
-                &lsc,
-                kv.lid_state.as_mut().unwrap(),
-                offset,
-                seq,
-                self.compress_rotary.as_ref().unwrap(),
-                dev,
-            )?;
-            if let Some((rows, poss)) = &lout {
-                let lid = kv.lid.as_ref().unwrap();
-                // Same contiguous-index requirement as the compressor cache:
-                // a broadcast view of the position list is not a valid
-                // scatter index.
-                let pidx = poss
-                    .unsqueeze(1)?
-                    .broadcast_as((rows.dim(0)?, ix.head_dim))?
-                    .contiguous()?;
-                kv.lid = Some(lid.scatter(&pidx, rows, 0)?);
+            if let Some(ic) = &ix.compressor {
+                let (lkv, lsc) = ic.project(x)?;
+                let lout = ic.forward(
+                    &lkv,
+                    &lsc,
+                    kv.lid_state.as_mut().unwrap(),
+                    offset,
+                    seq,
+                    self.compress_rotary.as_ref().unwrap(),
+                    dev,
+                )?;
+                if let Some(out) = lout {
+                    kv.lid = Some(scatter_rows(kv.lid.as_ref().unwrap(), &out.blocks, &out.rows)?);
+                }
             }
-            Some(ix.score(x, &qr, offset, seq, kv.lid.as_ref().unwrap(), &self.rotary)?)
+            let lid = kvs[self.key_source].lid.as_ref().ok_or_else(|| {
+                candle_core::Error::Msg(format!(
+                    "deepseek4: layer {layer} scores index keys layer {} does not publish",
+                    self.key_source
+                ))
+            })?;
+            Some(ix.score(x, &qr, offset, seq, lid, &self.rotary)?)
         } else {
             None
         };
 
         // Sparse attention with per-head sink.
-        let (k_all, mask) = self.build_kv(kv, &swa_prev, &kv_raw, offset, seq, lid_idx.as_ref())?;
+        let comp = kvs[self.kv_source].comp.clone();
+        let (k_all, mask) = self.build_kv(comp.as_ref(), &swa_prev, &kv_raw, offset, seq, lid_idx.as_ref())?;
         let scores = q.matmul(&k_all.transpose(1, 2)?)?; // [seq, h, n_kv]
         let scores = (scores * self.softmax_scale)?.broadcast_add(&mask.unsqueeze(1)?)?;
         let max = scores.max_keepdim(D::Minus1)?;
@@ -1616,31 +1890,30 @@ struct KvState {
 }
 
 impl KvState {
-    fn new(cfg: &Config, layer: usize, dev: &Device, max_seq: usize) -> Result<Self> {
-        let hd = cfg.head_dim;
-        let ihd = cfg.index_head_dim;
-        let win = cfg.window_size;
-        let ratio = *cfg.compress_ratios.get(layer).unwrap_or(&0);
-        // The indexer always compresses at the CSA ratio; the main compressor
-        // uses this layer's own ratio, so an HCA layer needs 32x fewer rows.
-        let max_blocks = max_seq / CSA_RATIO + 1;
-        let swa = Tensor::zeros((win, hd), DType::F32, dev)?;
-        let (comp, comp_state) = if ratio != 0 {
-            let coff = if ratio == CSA_RATIO { 2 } else { 1 };
-            (
-                Some(Tensor::zeros((max_seq / ratio + 1, hd), DType::F32, dev)?),
-                Some(CompressorState::new(ratio, coff, hd, dev)?),
-            )
-        } else {
-            (None, None)
+    /// The caches `attn` writes: its sliding window, plus the compressed
+    /// stream and index keys when it publishes them (every compressed V4
+    /// layer; V4.1's source layers).
+    fn new(attn: &Attention, dev: &Device, max_seq: usize) -> Result<Self> {
+        let hd = attn.head_dim;
+        let swa = Tensor::zeros((attn.window_size, hd), DType::F32, dev)?;
+        let rows = |ratio: usize, dim: usize| Tensor::zeros((max_seq / ratio + 1, dim), DType::F32, dev);
+        let (comp, comp_state) = match &attn.compressor {
+            Some(c) => (
+                Some(rows(c.ratio, hd)?),
+                Some(CompressorState::new(c.ratio, c.coff, hd, dev)?),
+            ),
+            None => (None, None),
         };
-        let (lid, lid_state) = if ratio == CSA_RATIO {
-            (
-                Some(Tensor::zeros((max_blocks, ihd), DType::F32, dev)?),
-                Some(CompressorState::new(CSA_RATIO, 2, ihd, dev)?),
-            )
-        } else {
-            (None, None)
+        // Index keys: V4's indexer compresses its own; a V4.1 key owner
+        // derives them from its compressor's rows.
+        let own_lid = attn.indexer.as_ref().and_then(|ix| ix.compressor.as_ref());
+        let (lid, lid_state) = match (own_lid, &attn.index_key, &attn.compressor) {
+            (Some(ic), _, _) => (
+                Some(rows(ic.ratio, ic.head_dim)?),
+                Some(CompressorState::new(ic.ratio, ic.coff, ic.head_dim, dev)?),
+            ),
+            (None, Some(ik), Some(c)) => (Some(rows(c.ratio, ik.attn_k_out)?), None),
+            _ => (None, None),
         };
         Ok(Self {
             swa: Some(swa),
@@ -2198,7 +2471,77 @@ impl Moe {
 
 // ─── Layer + model ───────────────────────────────────────────────────────────
 
+/// The layers whose caches one layer reads (`None` for a window-only layer)
+/// and whether it picks its own top-k compressed rows.
+struct LayerRole {
+    kv_source: Option<usize>,
+    key_source: Option<usize>,
+    index_source: bool,
+}
+
+/// Every layer's [`LayerRole`].  V4: a compressed layer is its own source
+/// and a CSA (ratio 4) layer also its own indexer.  V4.1: a layer carrying a
+/// compressor publishes the compressed stream, one carrying
+/// `indexer.attn_k` the index keys, and one carrying `indexer.attn_q_b`
+/// scores top-k; each compressed layer reads the latest publisher of each
+/// (llama.cpp `llama_model_deepseek41::load_arch_tensors`).
+fn layer_roles(cfg: &Config, has: &dyn Fn(&str) -> bool) -> Result<Vec<LayerRole>> {
+    let mut roles = Vec::with_capacity(cfg.n_layer);
+    let (mut kv_src, mut key_src) = (None, None);
+    for i in 0..cfg.n_layer {
+        let ratio = cfg.compress_ratios[i];
+        let p = format!("blk.{i}");
+        if !cfg.v41 {
+            let own = (ratio != 0).then_some(i);
+            roles.push(LayerRole {
+                kv_source: own,
+                key_source: own,
+                index_source: ratio == CSA_RATIO,
+            });
+            continue;
+        }
+        if has(&format!("{p}.attn_compressor_kv.weight")) {
+            kv_src = Some(i);
+        }
+        if has(&format!("{p}.indexer.attn_k.weight")) {
+            key_src = Some(i);
+        }
+        let index_source = has(&format!("{p}.indexer.attn_q_b.weight"));
+        if ratio == 0 {
+            roles.push(LayerRole {
+                kv_source: None,
+                key_source: None,
+                index_source: false,
+            });
+            continue;
+        }
+        let Some(src) = kv_src else {
+            candle_core::bail!("deepseek41: layer {i} reads a compressed stream before any layer publishes one");
+        };
+        if cfg.compress_ratios[src] != ratio {
+            candle_core::bail!(
+                "deepseek41: layer {i} compresses at ratio {ratio} but reads layer {src}, compressed at {}",
+                cfg.compress_ratios[src]
+            );
+        }
+        if index_source && key_src.is_none() {
+            candle_core::bail!("deepseek41: layer {i} scores index keys before any layer publishes them");
+        }
+        if src == i && ratio != 1 && !has(&format!("{p}.attn_compressor_gate.weight")) {
+            candle_core::bail!("deepseek41: layer {i} compresses {ratio} tokens per row but has no pooling gate");
+        }
+        roles.push(LayerRole {
+            kv_source: Some(src),
+            key_source: key_src,
+            index_source,
+        });
+    }
+    Ok(roles)
+}
+
 struct Layer {
+    /// V4.1 engram, added into the stream before the layer.
+    engram: Option<Engram>,
     attn_norm: RmsNorm,
     attn: Attention,
     ffn_norm: RmsNorm,
@@ -2228,6 +2571,57 @@ impl FeedForward {
     }
 }
 
+/// A layer's state between its attention and FFN halves: the normalized
+/// FFN input, and the stream + mix the FFN output is expanded back with.
+/// (The batched decode runs the FFN once over every sequence's input.)
+struct FfnInput {
+    h: Tensor, // [1, s, d]
+    stream: Stream,
+    mix: HcMix,
+}
+
+impl FfnInput {
+    fn finish(self, out: &Tensor, v41: bool) -> Result<Stream> {
+        self.stream.leave(out, self.mix, v41)
+    }
+}
+
+impl Layer {
+    /// The engram (V4.1), the attention sublayer, and entry into the FFN
+    /// sublayer for `stream` at positions `[offset, offset + s)`.
+    /// `history` holds the sequence's tokens up to `offset + s` (the engram
+    /// hashes preceding n-grams); `kvs` is every layer's cache.
+    #[allow(clippy::too_many_arguments)]
+    fn attend(
+        &self,
+        cfg: &Config,
+        kvs: &mut [KvState],
+        l: usize,
+        mut stream: Stream,
+        offset: usize,
+        history: &[u32],
+        max_seq: usize,
+    ) -> Result<FfnInput> {
+        let seq = stream.xs.dim(1)?;
+        if let (Some(eg), Some(ecfg)) = (&self.engram, &cfg.engram) {
+            if history.len() < offset + seq {
+                candle_core::bail!("deepseek41: the engram needs the token history of every input position");
+            }
+            stream.xs = eg.forward(&stream.xs, ecfg.rows(eg.index, history, offset, seq))?;
+        }
+        let (x, mix) = stream.enter(&self.hc_attn_fn, &self.hc_attn_scale, &self.hc_attn_base, cfg)?;
+        let h = self.attn_norm.forward(&x)?;
+        let h = self.attn.forward(kvs, l, &h, offset, max_seq)?;
+        let stream = stream.leave(&h, mix, cfg.v41)?;
+        let (x, mix) = stream.enter(&self.hc_ffn_fn, &self.hc_ffn_scale, &self.hc_ffn_base, cfg)?;
+        Ok(FfnInput {
+            h: self.ffn_norm.forward(&x)?,
+            stream,
+            mix,
+        })
+    }
+}
+
 /// A quantized DeepSeek-V4 model loaded from GGUF.
 /// The immutable, weight-bearing half of a DeepSeek-V4 model.
 ///
@@ -2244,9 +2638,9 @@ struct Shared {
     cfg: Config,
     norm: RmsNorm,
     output: QMatMul,
-    hc_head_fn: QMatMul,
-    hc_head_base: Tensor,
-    hc_head_scale: Tensor,
+    /// V4's learned hyper-connection head `(fn, base, scale)`; V4.1 has none
+    /// and collapses with the last sublayer's carried pre-mix.
+    hc_head: Option<(QMatMul, Tensor, Tensor)>,
     hc_mult: usize,
     hc_eps: f64,
     max_seq: usize,
@@ -2268,6 +2662,39 @@ struct Shared {
     device_pool: Option<Arc<Ds4DevicePool>>,
 }
 
+/// Fresh per-layer caches for `layers`.
+fn new_kv(layers: &[Layer], dev: &Device, max_seq: usize) -> Result<Vec<KvState>> {
+    layers.iter().map(|l| KvState::new(&l.attn, dev, max_seq)).collect()
+}
+
+impl Shared {
+    fn new_kv(&self) -> Result<Vec<KvState>> {
+        new_kv(&self.layers, &self.device, self.max_seq)
+    }
+
+    /// Collapse the final stream and project to f32 logits — for the last
+    /// position only (`last_only`), or for every row.
+    fn logits(&self, stream: &Stream, last_only: bool) -> Result<Tensor> {
+        let (_, seq, hc, d) = stream.xs.dims4()?;
+        let pre = match (&self.hc_head, &stream.pre) {
+            // pre = sigmoid(mixes * scale + base) + eps
+            (Some((hc_fn, base, scale)), _) => {
+                let flat = stream.xs.reshape((seq, hc * d))?;
+                let mixes = hc_fn.forward(&rms_rows(&flat, self.cfg.rms_eps)?)?; // [s, hc]
+                sigmoid(&mixes.broadcast_mul(scale)?.broadcast_add(base)?)?
+                    .affine(1.0, self.hc_eps)?
+                    .unsqueeze(0)?
+            }
+            (None, Some(pre)) => pre.clone(),
+            (None, None) => candle_core::bail!("deepseek4: no hyper-connection head"),
+        };
+        let y = hc_collapse(&stream.xs, &pre)?.squeeze(0)?; // [s, d]
+        let y = if last_only { y.narrow(0, seq - 1, 1)? } else { y };
+        let y = self.norm.forward(&y)?;
+        self.output.forward(&y)?.to_dtype(DType::F32)
+    }
+}
+
 /// A quantized DeepSeek-V4 model: one shared set of weights plus per-session
 /// mutable state (KV caches, batched-KV, the speculative-routing predictor and
 /// the hot-expert cache).  Sessions are derived from one template via
@@ -2278,10 +2705,15 @@ pub struct ModelWeights {
     /// Per-layer KV cache — the primary per-session tensor state.
     kv: Vec<KvState>,
     /// Per-sequence KV state for batched `forward_sequences` decode:
-    /// `[layer][seq]`.  Persistent across steps (unlike a fresh-per-call
+    /// `[seq][layer]`.  Persistent across steps (unlike a fresh-per-call
     /// cache) so multi-token batched generation keeps each sequence's
     /// attention history.  Reset via [`ModelWeights::reset_batch_kv`].
     kv_seq: Vec<Vec<KvState>>,
+    /// The tokens this session has seen, by position (the V4.1 engram
+    /// hashes each position's preceding n-grams), and the batched path's
+    /// per-sequence equivalent.
+    history: Vec<u32>,
+    history_seq: Vec<Vec<u32>>,
     /// Routed-expert ids of the most recent forward pass, per layer index
     /// (see [`ModelWeights::last_routed_experts`]).  The prediction source
     /// for the speculative decode prefetch.
@@ -2327,6 +2759,14 @@ struct Reader<R: Read + Seek> {
 }
 
 impl<R: Read + Seek> Reader<R> {
+    /// [`Reader::qtensor`] built on `device` rather than the model's.
+    fn qtensor_on(&mut self, name: &str, device: &Device) -> Result<QTensor> {
+        let model_device = std::mem::replace(&mut self.device, device.clone());
+        let qt = self.qtensor(name);
+        self.device = model_device;
+        qt
+    }
+
     fn qtensor(&mut self, name: &str) -> Result<QTensor> {
         // Tensors candle cannot represent never make it into `ct`; borrow them
         // from the mapping (or read + decode) using the raw header instead.
@@ -2653,9 +3093,15 @@ impl ModelWeights {
             None => rd.qmatmul("token_embd.weight")?,
         };
 
-        let hc_head_fn = rd.qmatmul("output_hc_fn.weight")?;
-        let hc_head_base = rd.f32_tensor("output_hc_base.weight")?;
-        let hc_head_scale = rd.f32_tensor("output_hc_scale.weight")?;
+        let hc_head = if cfg.v41 {
+            None
+        } else {
+            Some((
+                rd.qmatmul("output_hc_fn.weight")?,
+                rd.f32_tensor("output_hc_base.weight")?,
+                rd.f32_tensor("output_hc_scale.weight")?,
+            ))
+        };
 
         // Rope tables are capped at the same length as the KV caches: a 1M
         // context config would otherwise allocate ~256 MB of sin/cos tables.
@@ -2678,86 +3124,87 @@ impl ModelWeights {
             max_seq,
         )?);
 
+        // Which layer publishes the compressed stream / index keys / top-k
+        // each layer reads.  V4 compresses on every compressed layer at a
+        // fixed ratio (4 = CSA with overlap and an indexer, 128 = HCA); V4.1
+        // compresses only on the few layers that carry a compressor, and the
+        // file itself says which layer plays which role (llama.cpp
+        // `llama_model_deepseek41::load_arch_tensors`).
+        let roles = layer_roles(&cfg, &|n: &str| rd.has(n))?;
+
         let mut layers = Vec::with_capacity(cfg.n_layer);
-        for i in 0..cfg.n_layer {
+        for (i, role) in roles.iter().enumerate() {
             let p = format!("blk.{i}");
             let attn_norm = rd.rms_norm(&format!("{p}.attn_norm.weight"), cfg.rms_eps)?;
             let ffn_norm = rd.rms_norm(&format!("{p}.ffn_norm.weight"), cfg.rms_eps)?;
 
-            let q_a = rd.qmatmul(&format!("{p}.attn_q_a.weight"))?;
-            // q_lora_rank is implied by the weight shapes; validate it so a
-            // mismatched GGUF fails early instead of misbehaving later.
-            let qb_shape = rd
-                .qtensor(&format!("{p}.attn_q_b.weight"))?
-                .shape()
-                .dims()
-                .to_vec();
-            debug_assert_eq!(
-                vec![cfg.n_head * cfg.head_dim, cfg.q_lora_rank],
-                qb_shape,
-                "blk.{i}.attn_q_b"
-            );
-            let q_norm = rd.rms_norm(&format!("{p}.attn_q_a_norm.weight"), cfg.rms_eps)?;
-            let q_b = rd.qmatmul(&format!("{p}.attn_q_b.weight"))?;
-            let wkv = rd.qmatmul(&format!("{p}.attn_kv.weight"))?;
-            let kv_norm = rd.rms_norm(&format!("{p}.attn_kv_a_norm.weight"), cfg.rms_eps)?;
-            let wo_a = rd.qmatmul(&format!("{p}.attn_output_a.weight"))?;
-            let wo_b = rd.qmatmul(&format!("{p}.attn_output_b.weight"))?;
-            let attn_sinks = rd.f32_tensor(&format!("{p}.attn_sinks.weight"))?;
-
             let ratio = cfg.compress_ratios[i];
-            let rotary = if ratio != 0 {
-                rotary_compress.clone()
-            } else {
-                rotary_raw.clone()
-            };
-            let (compressor, indexer) = if ratio != 0 {
-                let comp = Compressor::load(
+            let compressor = if role.kv_source == Some(i) {
+                Some(Compressor::load(
                     &mut rd,
                     &format!("{p}.attn_compressor"),
                     ratio,
+                    !cfg.v41 && ratio == CSA_RATIO,
                     cfg.head_dim,
                     cfg.rope_head_dim,
                     cfg.rms_eps,
                     false,
-                )?;
-                if ratio == CSA_RATIO {
-                    let indexer = Indexer {
-                        proj: rd.qmatmul(&format!("{p}.indexer.proj.weight"))?,
-                        attn_q_b: rd.qmatmul(&format!("{p}.indexer.attn_q_b.weight"))?,
-                        compressor: Compressor::load(
+                )?)
+            } else {
+                None
+            };
+            let indexer = if role.index_source {
+                Some(Indexer {
+                    proj: rd.qmatmul(&format!("{p}.indexer.proj.weight"))?,
+                    attn_q_b: rd.qmatmul(&format!("{p}.indexer.attn_q_b.weight"))?,
+                    compressor: if cfg.v41 {
+                        None
+                    } else {
+                        Some(Compressor::load(
                             &mut rd,
                             &format!("{p}.indexer_compressor"),
                             ratio,
+                            true,
                             cfg.index_head_dim,
                             cfg.rope_head_dim,
                             cfg.rms_eps,
                             true,
-                        )?,
-                        n_head: cfg.index_n_head,
-                        head_dim: cfg.index_head_dim,
-                        rope_head_dim: cfg.rope_head_dim,
-                        nope_head_dim: cfg.index_head_dim - cfg.rope_head_dim,
-                        softmax_scale: (cfg.index_head_dim as f64).powf(-0.5),
-                        topk: cfg.index_topk,
-                    };
-                    (Some(comp), Some(indexer))
-                } else {
-                    (Some(comp), None)
-                }
+                        )?)
+                    },
+                    ratio,
+                    n_head: cfg.index_n_head,
+                    head_dim: cfg.index_head_dim,
+                    rope_head_dim: cfg.rope_head_dim,
+                    nope_head_dim: cfg.index_head_dim - cfg.rope_head_dim,
+                    softmax_scale: (cfg.index_head_dim as f64).powf(-0.5),
+                    topk: cfg.index_topk,
+                })
             } else {
-                (None, None)
+                None
+            };
+            let index_key = if cfg.v41 && role.key_source == Some(i) {
+                Some(IndexKey {
+                    attn_k: rd.qmatmul(&format!("{p}.indexer.attn_k.weight"))?,
+                    k_norm: rd.rms_norm(&format!("{p}.indexer.k_norm.weight"), cfg.rms_eps)?,
+                    attn_k_out: cfg.index_head_dim,
+                })
+            } else {
+                None
             };
 
             let attn = Attention {
-                q_a,
-                q_norm,
-                q_b,
-                wkv,
-                kv_norm,
-                wo_a,
-                wo_b,
-                attn_sinks,
+                q_a: rd.qmatmul(&format!("{p}.attn_q_a.weight"))?,
+                q_norm: rd.rms_norm(&format!("{p}.attn_q_a_norm.weight"), cfg.rms_eps)?,
+                q_head_norm: !cfg.v41,
+                index_key,
+                kv_source: role.kv_source.unwrap_or(i),
+                key_source: role.key_source.unwrap_or(i),
+                q_b: rd.qmatmul(&format!("{p}.attn_q_b.weight"))?,
+                wkv: rd.qmatmul(&format!("{p}.attn_kv.weight"))?,
+                kv_norm: rd.rms_norm(&format!("{p}.attn_kv_a_norm.weight"), cfg.rms_eps)?,
+                wo_a: rd.qmatmul(&format!("{p}.attn_output_a.weight"))?,
+                wo_b: rd.qmatmul(&format!("{p}.attn_output_b.weight"))?,
+                attn_sinks: rd.f32_tensor(&format!("{p}.attn_sinks.weight"))?,
                 compressor,
                 indexer,
                 ratio,
@@ -2770,30 +3217,45 @@ impl ModelWeights {
                 window_size: cfg.window_size,
                 softmax_scale: (cfg.head_dim as f64).powf(-0.5),
                 eps: cfg.rms_eps,
-                rotary: rotary.clone(),
+                rotary: if ratio != 0 { rotary_compress.clone() } else { rotary_raw.clone() },
                 compress_rotary: Some(rotary_compress.clone()),
             };
 
-            let ffn = FeedForward::Moe(load_moe(&mut rd, &p, &cfg, i, i < cfg.n_hash_layer)?);
+            let engram = match cfg.engram.as_ref().and_then(|e| e.layer_ids.iter().position(|&l| l == i)) {
+                Some(index) => {
+                    let hc = cfg.hc_mult;
+                    let table = rd.qtensor_on(&format!("{p}.engram_embd.weight"), &Device::Cpu)?;
+                    let table = crate::token_embedding::TokenEmbedding::load(table, &Device::Cpu)?;
+                    let key_len = cfg.engram.as_ref().map_or(0, |e| e.key_len);
+                    if table.hidden()? != key_len {
+                        candle_core::bail!("deepseek41: {p}.engram_embd rows are not {key_len} wide");
+                    }
+                    Some(Engram {
+                        index,
+                        table,
+                        wkv: rd.qmatmul(&format!("{p}.engram_wkv.weight"))?,
+                        q: rd.f32_tensor(&format!("{p}.engram_q.weight"))?.reshape((hc, ()))?,
+                        k: rd.f32_tensor(&format!("{p}.engram_k.weight"))?.reshape((hc, ()))?,
+                        eps: cfg.rms_eps,
+                    })
+                }
+                None => None,
+            };
 
-            let hc_attn_fn = rd.qmatmul(&format!("{p}.hc_attn_fn.weight"))?;
-            let hc_attn_base = rd.f32_tensor(&format!("{p}.hc_attn_base.weight"))?;
-            let hc_attn_scale = rd.f32_tensor(&format!("{p}.hc_attn_scale.weight"))?;
-            let hc_ffn_fn = rd.qmatmul(&format!("{p}.hc_ffn_fn.weight"))?;
-            let hc_ffn_base = rd.f32_tensor(&format!("{p}.hc_ffn_base.weight"))?;
-            let hc_ffn_scale = rd.f32_tensor(&format!("{p}.hc_ffn_scale.weight"))?;
+            let ffn = FeedForward::Moe(load_moe(&mut rd, &p, &cfg, i, i < cfg.n_hash_layer)?);
 
             layers.push(Layer {
                 attn_norm,
                 attn,
                 ffn_norm,
                 ffn,
-                hc_attn_fn,
-                hc_attn_base,
-                hc_attn_scale,
-                hc_ffn_fn,
-                hc_ffn_base,
-                hc_ffn_scale,
+                engram,
+                hc_attn_fn: rd.qmatmul(&format!("{p}.hc_attn_fn.weight"))?,
+                hc_attn_base: rd.f32_tensor(&format!("{p}.hc_attn_base.weight"))?,
+                hc_attn_scale: rd.f32_tensor(&format!("{p}.hc_attn_scale.weight"))?,
+                hc_ffn_fn: rd.qmatmul(&format!("{p}.hc_ffn_fn.weight"))?,
+                hc_ffn_base: rd.f32_tensor(&format!("{p}.hc_ffn_base.weight"))?,
+                hc_ffn_scale: rd.f32_tensor(&format!("{p}.hc_ffn_scale.weight"))?,
             });
         }
 
@@ -2805,10 +3267,7 @@ impl ModelWeights {
         if n_ctx != 0 {
             kv_cap = kv_cap.min(n_ctx);
         }
-        let mut kv_states = Vec::with_capacity(cfg.n_layer);
-        for i in 0..cfg.n_layer {
-            kv_states.push(KvState::new(&cfg, i, device, kv_cap)?);
-        }
+        let kv_states = new_kv(&layers, device, kv_cap)?;
         let hc_mult = cfg.hc_mult;
         let hc_eps = cfg.hc_eps;
 
@@ -2871,9 +3330,7 @@ impl ModelWeights {
             cfg,
             norm,
             output,
-            hc_head_fn,
-            hc_head_base,
-            hc_head_scale,
+            hc_head,
             hc_mult,
             hc_eps,
             max_seq: kv_cap,
@@ -2889,6 +3346,8 @@ impl ModelWeights {
             shared,
             kv: kv_states,
             kv_seq: Vec::new(),
+            history: Vec::new(),
+            history_seq: Vec::new(),
             last_routed: vec![Vec::new(); n_layers],
             hot_experts: crate::hot_experts::HotExpertCache::new(n_layers, n_expert, 0),
             stream_ctx: DispatchCtx {
@@ -3087,22 +3546,17 @@ impl ModelWeights {
         // so panic loudly rather than hand forward a half-built cache.  Unlike
         // qwen3moe/deepseek2 (whose KV is a lazy `Option`), deepseek4 allocates
         // its KV eagerly, so `new_session` cannot be infallible by construction.
-        let kv: Vec<KvState> = (0..self.shared.layers.len())
-            .map(|i| {
-                KvState::new(
-                    &self.shared.cfg,
-                    i,
-                    &self.shared.device,
-                    self.shared.max_seq,
-                )
-            })
-            .collect::<Result<Vec<_>>>()
+        let kv = self
+            .shared
+            .new_kv()
             .unwrap_or_else(|e| panic!("deepseek4: new-session KV cache allocation failed: {e}"));
         let prefill_timing = Arc::new(PhaseTiming::default());
         Self {
             shared: std::sync::Arc::clone(&self.shared),
             kv,
             kv_seq: Vec::new(),
+            history: Vec::new(),
+            history_seq: Vec::new(),
             last_routed: vec![Vec::new(); self.shared.layers.len()],
             hot_experts: crate::hot_experts::HotExpertCache::new(
                 self.shared.layers.len(),
@@ -3147,13 +3601,14 @@ impl ModelWeights {
         let hc = self.shared.hc_mult;
         let d = self.shared.tok_embeddings.hidden()?;
 
+        let ids = input.flatten_all()?;
+        self.note_tokens(offset, &ids.to_vec1::<u32>()?)?;
         let tok = self
             .shared
             .tok_embeddings
-            .forward(&input.flatten_all()?)?
+            .forward(&ids)?
             .reshape((1, seq_len, d))?;
-        // Expand to hc copies.
-        let mut xs = tok.unsqueeze(2)?.broadcast_as((1, seq_len, hc, d))?;
+        let mut stream = Stream::from_embeddings(&tok, hc, self.shared.cfg.v41)?;
 
         let profile = std::env::var_os("JOSHUA_PROFILE_LAYERS").is_some();
         let mut prof = if profile {
@@ -3259,40 +3714,23 @@ impl ModelWeights {
                     }
                 }
             }
-            // hc_pre with attention weights
-            let (x, post, comb) = hc_pre(
-                &xs,
-                &layer.hc_attn_fn,
-                &layer.hc_attn_scale,
-                &layer.hc_attn_base,
-                self.shared.hc_eps,
-                self.shared.cfg.hc_sinkhorn_iters,
+            let ffn_in = layer.attend(
+                &self.shared.cfg,
+                &mut self.kv,
+                i,
+                stream,
+                offset,
+                &self.history,
+                self.shared.max_seq,
             )?;
-            let residual = xs;
-            let h = layer.attn_norm.forward(&x)?;
-            let h = layer
-                .attn
-                .forward(&mut self.kv[i], &h, offset, self.shared.max_seq)?;
-            xs = hc_post(&h, &residual, &post, &comb)?;
             if let Some((a, _, _)) = prof.as_mut() {
                 a.push(t_layer.elapsed().as_secs_f64());
             }
             let t_moe = std::time::Instant::now();
-
-            let (x, post, comb) = hc_pre(
-                &xs,
-                &layer.hc_ffn_fn,
-                &layer.hc_ffn_scale,
-                &layer.hc_ffn_base,
-                self.shared.hc_eps,
-                self.shared.cfg.hc_sinkhorn_iters,
-            )?;
-            let residual = xs;
-            let h = layer.ffn_norm.forward(&x)?;
-            let (h, routed_ids) = layer.ffn.forward(&h, input, ctx.clone())?;
+            let (h, routed_ids) = layer.ffn.forward(&ffn_in.h, input, ctx.clone())?;
             last_routed[i] = routed_ids;
             self.hot_experts.record(i, &last_routed[i], step);
-            xs = hc_post(&h, &residual, &post, &comb)?;
+            stream = ffn_in.finish(&h, self.shared.cfg.v41)?;
             if let Some((_, m, _)) = prof.as_mut() {
                 m.push(t_moe.elapsed().as_secs_f64());
             }
@@ -3345,37 +3783,9 @@ impl ModelWeights {
             }
         }
 
-        // Parallel head: collapse hc copies, RMS, output matmul.
-        // pre = sigmoid(mixes * hc_head_scale + hc_head_base) + eps
-        let flat = xs.reshape((seq_len, hc * d))?;
-        let rsqrt = flat
-            .sqr()?
-            .mean_keepdim(D::Minus1)?
-            .affine(1.0, self.shared.hc_eps)?
-            .powf(-0.5)?;
-        let mixes = self
-            .shared
-            .hc_head_fn
-            .forward(&flat)?
-            .broadcast_mul(&rsqrt)?; // [s, hc]
-        let pre = sigmoid(
-            &mixes
-                .broadcast_mul(&self.shared.hc_head_scale)?
-                .broadcast_add(&self.shared.hc_head_base)?,
-        )?
-        .affine(1.0, self.shared.hc_eps)?; // + eps
-        let y = pre
-            .unsqueeze(D::Minus1)?
-            .broadcast_as((seq_len, hc, d))?
-            .mul(&xs.squeeze(0)?)?
-            .sum(D::Minus2)?; // [s, d]
-
         // Only the last position's logits are needed, and the engine's
         // `squeeze_batch_logits` requires a single row.
-        let y = y.narrow(0, seq_len - 1, 1)?;
-        let y = self.shared.norm.forward(&y)?;
-        let logits = self.shared.output.forward(&y)?; // [1, n_vocab]
-        logits.to_dtype(DType::F32)
+        self.shared.logits(&stream, true)
     }
 
     /// Forward one decode step for `n_seq` **independent** sequences at their
@@ -3414,42 +3824,23 @@ impl ModelWeights {
         // Persistent per-sequence KV: reset when the batch size changes (a new
         // batch of sequences starts), otherwise reuse the cache across steps so
         // multi-token generation keeps each sequence's attention history.
-        if self.kv_seq.len() != self.shared.layers.len()
-            || self.kv_seq.first().unwrap_or(&Vec::new()).len() != n_seq
-        {
-            self.kv_seq.clear();
-            for i in 0..self.shared.layers.len() {
-                let mut per_seq: Vec<KvState> = Vec::with_capacity(n_seq);
-                for _ in 0..n_seq {
-                    per_seq.push(KvState::new(
-                        &self.shared.cfg,
-                        i,
-                        &self.shared.device,
-                        self.shared.max_seq,
-                    )?);
-                }
-                self.kv_seq.push(per_seq);
-            }
+        if self.kv_seq.len() != n_seq {
+            self.kv_seq = (0..n_seq)
+                .map(|_| self.shared.new_kv())
+                .collect::<Result<_>>()?;
+            self.history_seq = vec![Vec::new(); n_seq];
         }
 
-        // Per-sequence embeddings -> [1, 1, hc, d].
-        let mut xs_seq: Vec<Tensor> = Vec::with_capacity(n_seq);
+        // Per-sequence embeddings -> streams of one token each.
+        let mut streams: Vec<Stream> = Vec::with_capacity(n_seq);
         let mut ids_cat: Vec<u32> = Vec::new();
-        for (input, _) in seqs {
-            let tok = self
-                .shared
-                .tok_embeddings
-                .forward(&input.flatten_all()?)?
-                .reshape((1, 1, d))?;
-            xs_seq.push(tok.unsqueeze(2)?.broadcast_as((1, 1, hc, d))?);
-            ids_cat.push(
-                input
-                    .flatten_all()?
-                    .to_vec1()?
-                    .first()
-                    .copied()
-                    .unwrap_or(0),
-            );
+        for (s, (input, off)) in seqs.iter().enumerate() {
+            let ids = input.flatten_all()?;
+            let tok = self.shared.tok_embeddings.forward(&ids)?.reshape((1, 1, d))?;
+            streams.push(Stream::from_embeddings(&tok, hc, self.shared.cfg.v41)?);
+            let ids = ids.to_vec1::<u32>()?;
+            note_tokens(&mut self.history_seq[s], *off, &ids)?;
+            ids_cat.push(ids.first().copied().unwrap_or(0));
         }
 
         let step = self.hot_experts.begin_step(true);
@@ -3465,108 +3856,43 @@ impl ModelWeights {
         }
 
         let ctx = self.ctx_whole(true);
-        for i in 0..self.shared.layers.len() {
-            let layer = &self.shared.layers[i];
-
-            // Per-sequence attention branch, then stash everything the shared
-            // MoE branch needs to hc_post back per-sequence.
-            let mut ffn_pre: Vec<Tensor> = Vec::with_capacity(n_seq); // h to feed the MoE
-            let mut ffn_residual: Vec<Tensor> = Vec::with_capacity(n_seq);
-            let mut ffn_post: Vec<Tensor> = Vec::with_capacity(n_seq);
-            let mut ffn_comb: Vec<Tensor> = Vec::with_capacity(n_seq);
-            for (s, (_, off)) in seqs.iter().enumerate() {
-                let xs_s = &xs_seq[s];
-                let (x, post, comb) = hc_pre(
-                    xs_s,
-                    &layer.hc_attn_fn,
-                    &layer.hc_attn_scale,
-                    &layer.hc_attn_base,
-                    self.shared.hc_eps,
-                    self.shared.cfg.hc_sinkhorn_iters,
-                )?;
-                let residual = xs_s;
-                let h = layer.attn_norm.forward(&x)?;
-                let h = layer.attn.forward(
-                    &mut self.kv_seq.get_mut(i).unwrap().get_mut(s).unwrap(),
-                    &h,
-                    *off,
+        let v41 = self.shared.cfg.v41;
+        let input_cat =
+            Tensor::new(ids_cat.as_slice(), &self.shared.device).and_then(|t| t.unsqueeze(0))?;
+        for (i, layer) in self.shared.layers.iter().enumerate() {
+            // Per-sequence attention branch; the MoE then runs once on the
+            // concatenation of every sequence's FFN input.
+            let mut ffn_in: Vec<FfnInput> = Vec::with_capacity(n_seq);
+            for (s, stream) in streams.drain(..).enumerate() {
+                ffn_in.push(layer.attend(
+                    &self.shared.cfg,
+                    &mut self.kv_seq[s],
+                    i,
+                    stream,
+                    seqs[s].1,
+                    &self.history_seq[s],
                     self.shared.max_seq,
-                )?;
-                let xs_s2 = hc_post(&h, &residual, &post, &comb)?;
-
-                let (x2, fpost, fcomb) = hc_pre(
-                    &xs_s2,
-                    &layer.hc_ffn_fn,
-                    &layer.hc_ffn_scale,
-                    &layer.hc_ffn_base,
-                    self.shared.hc_eps,
-                    self.shared.cfg.hc_sinkhorn_iters,
-                )?;
-                ffn_pre.push(layer.ffn_norm.forward(&x2)?);
-                ffn_residual.push(xs_s2);
-                ffn_post.push(fpost);
-                ffn_comb.push(fcomb);
+                )?);
             }
-
-            // Shared MoE: concatenate the per-seq FFN inputs + token ids.
-            let ffn_cats: Vec<Tensor> = (0..n_seq)
-                .map(|s| ffn_pre.get(s).unwrap().clone())
-                .collect();
-            let h_cat = Tensor::cat(&ffn_cats, 1)?;
-            let input_cat = Tensor::new(ids_cat.as_slice(), &self.shared.device)
-                .and_then(|t| t.unsqueeze(0))?;
+            let h_cat = Tensor::cat(&ffn_in.iter().map(|f| f.h.clone()).collect::<Vec<_>>(), 1)?;
             let (h_out, _routed) = layer.ffn.forward(&h_cat, &input_cat, ctx.clone())?;
-
-            // Split the MoE output back per-sequence and hc_post each.
-            let (_, n_tok, _) = h_out.dims3()?;
-            let per_seq = n_tok / n_seq;
-            for s in 0..n_seq {
-                let h_out_s = h_out.narrow(1, s * per_seq, per_seq)?;
-                let xs_s2 = hc_post(&h_out_s, &ffn_residual[s], &ffn_post[s], &ffn_comb[s])?;
-                xs_seq[s] = xs_s2;
+            // Split the MoE output back per sequence (one token each).
+            for (s, f) in ffn_in.into_iter().enumerate() {
+                streams.push(f.finish(&h_out.narrow(1, s, 1)?, v41)?);
             }
         }
 
-        // Logits head on the concatenated last-layer output.
-        // Concatenate xs_seq along the token dim -> [1, n_seq, hc, d].
-        let xs_cats: Vec<Tensor> = (0..n_seq).map(|s| xs_seq.get(s).unwrap().clone()).collect();
-        let xs_cat = Tensor::cat(&xs_cats, 1)?;
-        let seq_len = n_seq;
-        let flat = xs_cat.reshape((seq_len, hc * d))?;
-        let rsqrt = flat
-            .sqr()?
-            .mean_keepdim(D::Minus1)?
-            .affine(1.0, self.shared.hc_eps)?
-            .powf(-0.5)?;
-        let mixes = self
-            .shared
-            .hc_head_fn
-            .forward(&flat)?
-            .broadcast_mul(&rsqrt)?;
-        let pre = sigmoid(
-            &mixes
-                .broadcast_mul(&self.shared.hc_head_scale)?
-                .broadcast_add(&self.shared.hc_head_base)?,
-        )?
-        .affine(1.0, self.shared.hc_eps)?;
-        let y = pre
-            .unsqueeze(D::Minus1)?
-            .broadcast_as((seq_len, hc, d))?
-            .mul(&xs_cat.squeeze(0)?)?
-            .sum(D::Minus2)?; // [n_seq, d]
-        let y = self.shared.norm.forward(&y)?;
-        let logits_all = self.shared.output.forward(&y)?; // [n_seq, n_vocab]
-                                                          // Split logits per sequence (each is 1 row).
-        let mut out: Vec<Vec<f32>> = Vec::with_capacity(n_seq);
-        for s in 0..n_seq {
-            let row = logits_all
-                .narrow(0, s, 1)?
-                .squeeze(0)?
-                .to_dtype(DType::F32)?
-                .to_vec1()?;
-            out.push(row);
-        }
-        Ok(out)
+        // Logits head over every sequence's last-layer stream.
+        let stream = Stream {
+            xs: Tensor::cat(&streams.iter().map(|s| s.xs.clone()).collect::<Vec<_>>(), 1)?,
+            pre: v41
+                .then(|| Tensor::cat(&streams.iter().map(|s| s.pre.clone().unwrap()).collect::<Vec<_>>(), 1))
+                .transpose()?,
+        };
+        let logits_all = self.shared.logits(&stream, false)?; // [n_seq, n_vocab]
+        (0..n_seq)
+            .map(|s| logits_all.narrow(0, s, 1)?.squeeze(0)?.to_vec1())
+            .collect()
     }
 
     /// Routed expert bytes addressable by this rank versus the unsharded total.
@@ -3614,13 +3940,11 @@ impl ModelWeights {
 
     /// Reset the KV caches so this instance can serve an unrelated prompt.
     pub fn clear_kv_cache(&mut self) {
-        let dev = self.shared.device.clone();
-        for (i, kv) in self.kv.iter_mut().enumerate() {
-            match KvState::new(&self.shared.cfg, i, &dev, self.shared.max_seq) {
-                Ok(n) => *kv = n,
-                Err(e) => eprintln!("deepseek4: failed to reset KV state for layer {i}: {e}"),
-            }
+        match self.shared.new_kv() {
+            Ok(kv) => self.kv = kv,
+            Err(e) => eprintln!("deepseek4: failed to reset the KV state: {e}"),
         }
+        self.history.clear();
         // The batched path keeps its own per-sequence history and only
         // rebuilds it when the batch size changes, so a same-sized batch
         // after a reset would otherwise continue the previous batch's
@@ -3666,8 +3990,7 @@ impl crate::stream_prefill::StreamPrefill for ModelWeights {
             .tok_embeddings
             .forward(&Tensor::new(tokens.to_vec(), device)?.unsqueeze(0)?)?
             .reshape((1, tokens.len(), d))?;
-        // `xs` form: expand to the hc copies.
-        tok.unsqueeze(2)?.broadcast_as((1, tokens.len(), hc, d))
+        Stream::from_embeddings(&tok, hc, self.shared.cfg.v41)?.pack()
     }
 
     fn apply_layer_chunk(
@@ -3699,76 +4022,53 @@ impl ModelWeights {
         tokens: &[u32],
     ) -> Result<Tensor> {
         let layer = &self.shared.layers[l];
-        let kv = &mut self.kv[l];
-        let hc_eps = self.shared.hc_eps;
-        let sinkhorn = self.shared.cfg.hc_sinkhorn_iters;
-        let max_seq = self.shared.max_seq;
-
-        // hc_pre with attention weights.
-        let (x, post, comb) = hc_pre(
-            xs,
-            &layer.hc_attn_fn,
-            &layer.hc_attn_scale,
-            &layer.hc_attn_base,
-            hc_eps,
-            sinkhorn,
+        let v41 = self.shared.cfg.v41;
+        // Chunks arrive in order within each layer, so every earlier
+        // position is known by the time a chunk's engram looks back.
+        note_tokens(&mut self.history, pos, tokens)?;
+        let ffn_in = layer.attend(
+            &self.shared.cfg,
+            &mut self.kv,
+            l,
+            Stream::unpack(xs, v41)?,
+            pos,
+            &self.history,
+            self.shared.max_seq,
         )?;
-        let residual = xs.clone();
-        let h = layer.attn_norm.forward(&x)?;
-        let h = layer.attn.forward(kv, &h, pos, max_seq)?;
-        let xs = hc_post(&h, &residual, &post, &comb)?;
-
-        // hc_pre with FFN weights, then the MoE block.
-        let (x, post, comb) = hc_pre(
-            &xs,
-            &layer.hc_ffn_fn,
-            &layer.hc_ffn_scale,
-            &layer.hc_ffn_base,
-            hc_eps,
-            sinkhorn,
-        )?;
-        let residual = xs.clone();
-        let h = layer.ffn_norm.forward(&x)?;
         let input = Tensor::new(tokens.to_vec(), &self.shared.device)?.unsqueeze(0)?;
-        let (h, routed_ids) = layer.ffn.forward(&h, &input, self.stream_ctx.clone())?;
+        let (h, routed_ids) = layer.ffn.forward(&ffn_in.h, &input, self.stream_ctx.clone())?;
         self.last_routed[l] = routed_ids;
         // Advisory: routing recording feeds the (hot-expert) prefetch policy,
         // never the logits.  Record against a fixed step; prefilter streaming
         // does not advance the decode clock.
         let step = self.hot_experts.begin_step(false);
         self.hot_experts.record(l, &self.last_routed[l], step);
-        hc_post(&h, &residual, &post, &comb)
+        ffn_in.finish(&h, v41)?.pack()
     }
 
     fn final_logits_inner(&self, last: &Tensor) -> Result<Tensor> {
-        let (_, seq_len, hc, d) = last.dims4()?;
-        let flat = last.reshape((seq_len, hc * d))?;
-        let rsqrt = flat
-            .sqr()?
-            .mean_keepdim(D::Minus1)?
-            .affine(1.0, self.shared.hc_eps)?
-            .powf(-0.5)?;
-        let mixes = self
-            .shared
-            .hc_head_fn
-            .forward(&flat)?
-            .broadcast_mul(&rsqrt)?;
-        let pre = sigmoid(
-            &mixes
-                .broadcast_mul(&self.shared.hc_head_scale)?
-                .broadcast_add(&self.shared.hc_head_base)?,
-        )?
-        .affine(1.0, self.shared.hc_eps)?;
-        let y = pre
-            .unsqueeze(D::Minus1)?
-            .broadcast_as((seq_len, hc, d))?
-            .mul(&last.squeeze(0)?)?
-            .sum(D::Minus2)?; // [seq, d]
-        let y = y.narrow(0, seq_len - 1, 1)?;
-        let y = self.shared.norm.forward(&y)?;
-        let logits = self.shared.output.forward(&y)?.to_dtype(DType::F32)?;
-        Ok(logits)
+        self.shared.logits(&Stream::unpack(last, self.shared.cfg.v41)?, true)
     }
+
+    /// Record `tokens` at positions `[pos, pos + len)` of this session's
+    /// token history (the engram hashes preceding n-grams).
+    fn note_tokens(&mut self, pos: usize, tokens: &[u32]) -> Result<()> {
+        note_tokens(&mut self.history, pos, tokens)
+    }
+}
+
+/// Write `tokens` into `history` at `[pos, pos + len)`.  Later entries are
+/// kept (a layer-streamed prefill revisits earlier chunks per layer).  Only
+/// the engram reads the history, so positions never fed through this
+/// session (a caller starting mid-sequence) are left as token 0 rather than
+/// refused.
+fn note_tokens(history: &mut Vec<u32>, pos: usize, tokens: &[u32]) -> Result<()> {
+    let end = pos + tokens.len();
+    if history.len() < end {
+        history.resize(end, 0);
+    }
+    history[pos..end].copy_from_slice(tokens);
+    Ok(())
 }
 
 /// Slice a [`RawBlock`] expert tensor (`[n_expert, out, in]`, GGUF dims

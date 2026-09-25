@@ -17,7 +17,7 @@ framework) and [tokenizers](https://github.com/huggingface/tokenizers).
 | **Huge pages** | Transparent 2 MiB pages (`MADV_HUGEPAGE`, default on Linux) or explicit 2 MiB / 1 GiB (`MAP_HUGETLB`) backing to cut TLB misses on large models |
 | **OpenAI-compatible** | Drop-in replacement for `/v1/chat/completions`, `/v1/embeddings`, `/v1/models` |
 | **Streaming** | Server-Sent Events (SSE) for token-by-token streaming |
-| **GGUF support** | Llama/Mistral/Mixtral, Gemma 1–3, GLM-4, LFM2, Phi-2, Phi-3, every Qwen generation (Qwen 1, Qwen1.5/2/2.5 incl. MoE, Qwen2/2.5-VL and Qwen3-VL text, Qwen3, Qwen3-MoE, Qwen3-Next, Qwen3.5 dense/MoE, Qwen3.8-Flash-Next / `qwen4exp`, Bonsai 1-bit / 2-bit), DeepSeek-MoE, DeepSeek-V2/V2.5/V3/R1, DeepSeek-V4, Kimi-K2 (dense DeepSeek-LLM / Coder / R1-Distill load as `llama` / `qwen2`) |
+| **GGUF support** | Llama/Mistral/Mixtral, Gemma 1–3, GLM-4, LFM2, Phi-2, Phi-3, every Qwen generation (Qwen 1, Qwen1.5/2/2.5 incl. MoE, Qwen2/2.5-VL and Qwen3-VL text, Qwen3, Qwen3-MoE, Qwen3-Next, Qwen3.5 dense/MoE, Qwen3.8-Flash-Next / `qwen4exp`, Bonsai 1-bit / 2-bit), DeepSeek-MoE, DeepSeek-V2/V2.5/V3/R1, DeepSeek-V4 / V4-Flash, DeepSeek-V4.1-Flash, Kimi-K2 (dense DeepSeek-LLM / Coder / R1-Distill load as `llama` / `qwen2`) |
 | **Exotic quant dtypes** | In-mapping decoders for IQ2_XXS (DeepSeek-V4's 2.0625-bit expert weights), MXFP4 (Kimi-K3-class) and Q1_0 / Q2_0 (Bonsai's 1-bit and 2-bit weights), with matmuls that keep the blocks in the mmap instead of materialising f32 — one generic `RawBlock` layer, so any native loader reads any of them |
 | **Fused SIMD kernels** | AVX2 dequant+dot fusion for Q8_0/Q2_K/Q4_K and parallel SIMD quantized matmuls on x86-64 |
 | **Chat templates** | Renders the model's own `tokenizer.chat_template` from the GGUF (Jinja via pure-Rust minijinja); ChatML fallback |
@@ -673,6 +673,7 @@ the matching pure-Rust candle loader.  Currently supported architectures:
 | `deepseek` | DeepSeek-MoE 16B (GQA attention + fine-grained MoE with shared experts) |
 | `deepseek2` | DeepSeek-V2, DeepSeek-V2-Lite, DeepSeek-V2.5, DeepSeek-V3 / V3.1, DeepSeek-R1, **Kimi-K2** (MLA attention + fine-grained MoE) |
 | `deepseek4` | DeepSeek-V4 (Hyper-Connections residual mixing, alternating sliding-window / learned KV-compressor attention, Lightning-Indexer sparse attention, fine-grained MoE with IQ2_XXS experts) |
+| `deepseek41` | DeepSeek-V4.1-Flash (V4 with a one-sublayer-lagged hyper-connection mix and no learned HC head, KV compressed on a few source layers and shared by the layers after them, engram n-gram hash tables) |
 
 The `deepseek2` loader is Joshua's own (candle has no quantized DeepSeek
 path). It implements Multi-head Latent Attention with Q/KV LoRA, DeepSeek-V3 /
@@ -699,6 +700,20 @@ Sinkhorn-normalised per-token weights, CSA/HCA compressor layers pool blocks of
 `index_topk` compressed positions each query attends to. The routed experts
 stay quantized as IQ2_XXS trellis blocks decoded in-mapping during the matmul,
 so a 162 B model keeps its on-disk footprint. Activations run in f32 on CPU.
+
+DeepSeek-V4.1 (`deepseek41`) is a separate GGUF architecture served by the
+same loader.  Each sublayer collapses the hyper-connection copies with the
+mix the *previous* sublayer computed, and the last one's mix replaces V4's
+learned head.  Only the layers that carry a compressor pool KV (at ratio 1
+or 2, no overlap); the layers after each source read its rows, and index
+keys come from that shared latent rather than from a second compressor.  A
+few layers first add engram rows: each token's preceding n-grams are
+hashed (after case/accent folding) into buckets of a huge table, which stays
+paged in the mapping, and gated into every copy.  llama.cpp's own support is
+still an unmerged runtime branch (behind ggml-org/llama.cpp#28696), which
+leaves its two-level candidate mask unimplemented; that mask selects every
+block below ~16K tokens of compressed context.  Joshua follows the same
+graph, and its logits are pinned to an independent NumPy transcription of it.
 
 Every Qwen architecture except the dense `qwen2` (candle's loader) goes
 through Joshua's own `quantized_qwen` loader: one decoder layer

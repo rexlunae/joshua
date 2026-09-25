@@ -18,22 +18,15 @@
 use std::io::{Read, Seek};
 use std::sync::Arc;
 
-use candle_core::{DType, Module, Result, Tensor, D};
+use candle_core::{DType, Module, Result, Tensor};
 use candle_nn::ops::{sigmoid, silu};
 use candle_transformers::quantized_nn::RmsNorm;
 
 use super::{Reader, Weight};
 use crate::attention::Rope;
 use crate::gguf_meta::Meta;
+use crate::ngram::grouped_rms;
 use crate::token_embedding::TokenEmbedding;
-
-/// `x / sqrt(mean(x²) + eps) · w` over the last dim, with a per-stream
-/// weight `w` broadcast over `x`'s leading dims (llama.cpp's grouped
-/// `ggml_rms_norm` + `ggml_mul` on `[n_embd, hc]` gammas).
-fn grouped_rms(x: &Tensor, w: &Tensor, eps: f64) -> Result<Tensor> {
-    let rms = (x.sqr()?.mean_keepdim(D::Minus1)? + eps)?.sqrt()?;
-    x.broadcast_div(&rms)?.broadcast_mul(w)
-}
 
 /// An `[n_embd, hc]`-shaped GGUF gamma as a `[hc, n_embd]` f32 tensor.
 fn stream_gamma<R: Read + Seek>(
@@ -294,8 +287,7 @@ impl Ple {
             &self.norm_query,
             self.eps,
         )?;
-        let s = ((key * query)?.sum(D::Minus1)? / (n as f64).sqrt())?; // [b, t, hc]
-        let gate = sigmoid(&(s.sign()? * s.abs()?.maximum(1e-6)?.sqrt()?)?)?;
+        let gate = crate::ngram::keyed_gate(&key, &query)?; // [b, t, hc]
         let gated = self
             .value
             .forward(&emb)?

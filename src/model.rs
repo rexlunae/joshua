@@ -16,7 +16,7 @@
 //! | `qwen`, `qwen2moe`, `qwen2vl`, `qwen3`, `qwen3moe`, `qwen3vl`, `qwen3vlmoe`, `qwen3next`, `qwen35`, `qwen35moe`, `qwen4exp` | `quantized_qwen` (Joshua)
 //! | `deepseek` (DeepSeek-MoE)                        | `quantized_deepseek2` (Joshua)
 //! | `deepseek2` (DeepSeek-V2/V2.5/V3/V3.1/R1, Kimi-K2) | `quantized_deepseek2` (Joshua)
-//! | `deepseek4` (DeepSeek-V4)                        | `quantized_deepseek4` (Joshua)
+//! | `deepseek4` (DeepSeek-V4), `deepseek41` (DeepSeek-V4.1) | `quantized_deepseek4` (Joshua)
 //!
 //! The dense DeepSeek releases — DeepSeek-LLM, DeepSeek-Coder (V1) and the
 //! DeepSeek-R1 distills — are converted by llama.cpp as `llama` or `qwen2`
@@ -90,6 +90,10 @@ pub enum Architecture {
     /// `deepseek4` — DeepSeek-V4 (sliding-window MLA + KV compression +
     /// indexer-selected sparse attention + Hyper-Connections).
     DeepSeek4,
+    /// `deepseek41` — DeepSeek-V4.1 (V4 with a lagged hyper-connection mix,
+    /// KV compressed on a few source layers and shared, engram n-gram
+    /// tables).  Served by the `deepseek4` loader.
+    DeepSeek41,
 }
 
 /// Architecture names understood by llama.cpp but without a pure-Rust
@@ -215,6 +219,7 @@ const NAMES: &[(&str, Architecture)] = &[
     ("deepseek", Architecture::DeepSeek),
     ("deepseek2", Architecture::DeepSeek2),
     ("deepseek4", Architecture::DeepSeek4),
+    ("deepseek41", Architecture::DeepSeek41),
 ];
 
 impl Architecture {
@@ -315,7 +320,12 @@ impl Architecture {
     /// IQ2_XXS kernel (`crate::iq2xxs` OpenCL fused GEMV), so experts may
     /// target the device there.  See [`Self::experts_always_on_host_for`].
     pub fn experts_always_on_host(&self) -> bool {
-        matches!(self, Self::DeepSeek4)
+        self.is_deepseek4()
+    }
+
+    /// DeepSeek-V4 or V4.1 — the architectures the `deepseek4` loader serves.
+    pub fn is_deepseek4(&self) -> bool {
+        matches!(self, Self::DeepSeek4 | Self::DeepSeek41)
     }
 
     /// Whether the routed experts must stay in host RAM *given the active
@@ -324,10 +334,7 @@ impl Architecture {
     /// Metal, CUDA) they are host-only.  Non-MoE architectures never force
     /// host experts.
     pub fn experts_always_on_host_for(&self, device: &Device) -> bool {
-        match self {
-            Self::DeepSeek4 => !(device.is_opencl() || device.is_sycl()),
-            _ => false,
-        }
+        self.is_deepseek4() && !(device.is_opencl() || device.is_sycl())
     }
 
     /// Whether this architecture's "experts on the device" form is a bounded
@@ -337,7 +344,7 @@ impl Architecture {
     /// V4-Flash never fits), so an `ExpertPlacement::Device` request means
     /// "size that cache" (see `--vram-expert-cache`).
     pub fn device_experts_are_a_cache(&self, device: &Device) -> bool {
-        matches!(self, Self::DeepSeek4) && (device.is_opencl() || device.is_sycl())
+        self.is_deepseek4() && (device.is_opencl() || device.is_sycl())
     }
 
     pub fn is_known_llama_cpp_arch(name: &str) -> bool {
@@ -368,6 +375,7 @@ impl Architecture {
             Self::DeepSeek => "DeepSeek-MoE",
             Self::DeepSeek2 => "DeepSeek-V2 / DeepSeek-V3 / DeepSeek-R1 / Kimi-K2",
             Self::DeepSeek4 => "DeepSeek-V4",
+            Self::DeepSeek41 => "DeepSeek-V4.1",
         }
     }
 
@@ -540,9 +548,9 @@ impl QuantizedModel {
             // deterministic position.
             let _ = reader.seek(SeekFrom::Start(data_pos));
             match h {
-                Ok(h) if arch == Architecture::DeepSeek4 || h.has_unsupported_tensors() => Some(h),
+                Ok(h) if arch.is_deepseek4() || h.has_unsupported_tensors() => Some(h),
                 Ok(_) => None,
-                Err(e) if arch == Architecture::DeepSeek4 => {
+                Err(e) if arch.is_deepseek4() => {
                     return Err(candle_core::Error::Msg(format!("GGUF header re-read failed: {e}")))
                 }
                 Err(e) => {
@@ -615,7 +623,7 @@ impl QuantizedModel {
                 )
                 .map(Self::DeepSeek2)
             }
-            Architecture::DeepSeek4 => {
+            Architecture::DeepSeek4 | Architecture::DeepSeek41 => {
                 crate::quantized_deepseek4::ModelWeights::from_gguf_mmap_placed(
                     gguf,
                     raw.as_ref(),

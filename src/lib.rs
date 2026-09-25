@@ -40,6 +40,7 @@ pub mod mmap_tensor;
 pub mod moe;
 pub mod mxfp4;
 pub mod native_session;
+pub mod ngram;
 pub mod model;
 pub mod quantized_deepseek2;
 pub mod quantized_deepseek4;
