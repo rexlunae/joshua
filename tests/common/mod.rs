@@ -768,40 +768,117 @@ fn write_deepseek_family_gguf(path: &Path, gqa: bool, split_mla: bool, softmax_v
 /// half-split RoPE over a head_dim decoupled from the embedding width, plus a
 /// fine-grained MoE (softmax router, `norm_topk_prob`, no shared experts).
 pub fn write_tiny_qwen3moe_gguf(path: &Path) {
+    write_tiny_qwen_gguf(path, "qwen3moe");
+}
+
+/// Write a tiny but structurally valid GGUF for any Qwen-family
+/// architecture the native Qwen loader serves, with each architecture's
+/// distinguishing features:
+///
+/// * `qwen` — fused `attn_qkv` + bias (MHA), dense FFN.
+/// * `qwen2moe` — Q/K/V biases, MoE without top-k normalisation, a shared
+///   expert gated by `ffn_gate_inp_shexp`.
+/// * `qwen2vl` / `qwen3vl` / `qwen3vlmoe` — multi-section RoPE (sections
+///   chosen so the text mask actually freezes a frequency),
+///   Q/K norm for the Qwen3 generation.
+/// * `qwen3moe` — byte-identical to the historical `qwen3moe` fixture.
+/// * `qwen3next` / `qwen35` / `qwen35moe` — a Gated DeltaNet layer followed
+///   by a gated-attention layer with partial RoPE and `post_attention_norm`;
+///   `qwen3next` uses the fused `ssm_ba`, Qwen3.5 split `ssm_beta` /
+///   `ssm_alpha`; four value heads share two key heads.
+pub fn write_tiny_qwen_gguf(path: &Path, arch: &str) {
     const VOCAB: usize = 16;
     const EMB: usize = 8;
-    const H: usize = 2; // heads
-    const KV: usize = 1; // kv heads
-    const HD: usize = 4; // head_dim (attention.key_length)
-    const NFE: usize = 8; // expert ffn
     const NE: usize = 4; // experts
-    const NLAYER: usize = 1;
+    const NFE: usize = 8; // expert ffn
+    const NFF: usize = 16; // dense ffn
+
+    let hybrid = matches!(arch, "qwen3next" | "qwen35" | "qwen35moe");
+    let moe = matches!(
+        arch,
+        "qwen2moe" | "qwen3moe" | "qwen3vlmoe" | "qwen3next" | "qwen35moe"
+    );
+    let shared_expert = matches!(arch, "qwen2moe" | "qwen3next" | "qwen35moe");
+    let qk_norm = arch.starts_with("qwen3");
+    let biases = matches!(arch, "qwen2moe" | "qwen2vl");
+    let fused_qkv = arch == "qwen";
+    let h = 2usize;
+    let kv = if arch == "qwen" { 2 } else { 1 };
+    let hd = if arch == "qwen3moe" || arch == "qwen" || arch == "qwen2moe" {
+        4
+    } else {
+        8
+    };
+    let n_layer = if arch == "qwen3moe" { 1 } else { 2 };
+    // Gated DeltaNet dims: 2 key heads shared by 4 value heads, so the
+    // grouped (Qwen3-Next) and tiled (Qwen3.5) sharing layouts differ.
+    let (nk, nv, sd, d_conv) = (2usize, 4usize, 4usize, 4usize);
+    let conv_dim = 2 * nk * sd + nv * sd;
 
     let u32v = |v: u32| gguf_file::Value::U32(v);
     let f32v = |v: f32| gguf_file::Value::F32(v);
-    let key = |s: &str| format!("qwen3moe.{s}");
+    let key = |s: &str| format!("{arch}.{s}");
     let mut metadata: Vec<(String, gguf_file::Value)> = vec![
         (
             "general.architecture".to_string(),
-            gguf_file::Value::String("qwen3moe".to_string()),
+            gguf_file::Value::String(arch.to_string()),
         ),
-        (key("attention.head_count"), u32v(H as u32)),
-        (key("attention.head_count_kv"), u32v(KV as u32)),
-        (key("block_count"), u32v(NLAYER as u32)),
+        (key("attention.head_count"), u32v(h as u32)),
+        (key("attention.head_count_kv"), u32v(kv as u32)),
+        (key("block_count"), u32v(n_layer as u32)),
         (key("embedding_length"), u32v(EMB as u32)),
         (key("context_length"), u32v(512)),
         (key("attention.layer_norm_rms_epsilon"), f32v(1e-5)),
-        (key("attention.key_length"), u32v(HD as u32)),
+        (key("attention.key_length"), u32v(hd as u32)),
         (key("rope.freq_base"), f32v(10_000.0)),
-        (key("expert_count"), u32v(NE as u32)),
-        (key("expert_used_count"), u32v(2)),
-        (key("expert_feed_forward_length"), u32v(NFE as u32)),
-        (key("expert_shared_feed_forward_length"), u32v(0)),
-        (
+    ];
+    if moe {
+        metadata.extend([
+            (key("expert_count"), u32v(NE as u32)),
+            (key("expert_used_count"), u32v(2)),
+            (key("expert_feed_forward_length"), u32v(NFE as u32)),
+            (
+                key("expert_shared_feed_forward_length"),
+                u32v(if shared_expert { NFE as u32 } else { 0 }),
+            ),
+        ]);
+    } else {
+        // Qwen1 stores the doubled HF intermediate size (llama.cpp halves it).
+        let ff = if arch == "qwen" { 2 * NFF } else { NFF };
+        metadata.push((key("feed_forward_length"), u32v(ff as u32)));
+    }
+    if arch == "qwen3moe" {
+        metadata.push((
             key("attention.norm_topk_prob"),
             gguf_file::Value::Bool(true),
-        ),
-    ];
+        ));
+    }
+    let sections = |s: [u32; 4]| {
+        gguf_file::Value::Array(s.iter().map(|&x| gguf_file::Value::U32(x)).collect())
+    };
+    match arch {
+        // M-RoPE over 4 pairs with sections [1, 1, 0, 1]: pair 2 is frozen.
+        "qwen2vl" => metadata.push((key("rope.dimension_sections"), sections([1, 1, 0, 1]))),
+        // IM-RoPE over 4 pairs with sections [2, 1, 0, 0]: pair 2 is frozen.
+        "qwen3vl" | "qwen3vlmoe" => {
+            metadata.push((key("rope.dimension_sections"), sections([2, 1, 0, 0])))
+        }
+        "qwen35" | "qwen35moe" => {
+            metadata.push((key("rope.dimension_sections"), sections([1, 1, 0, 0])))
+        }
+        _ => {}
+    }
+    if hybrid {
+        metadata.extend([
+            (key("rope.dimension_count"), u32v((hd / 2) as u32)),
+            (key("full_attention_interval"), u32v(2)),
+            (key("ssm.conv_kernel"), u32v(d_conv as u32)),
+            (key("ssm.state_size"), u32v(sd as u32)),
+            (key("ssm.group_count"), u32v(nk as u32)),
+            (key("ssm.time_step_rank"), u32v(nv as u32)),
+            (key("ssm.inner_size"), u32v((nv * sd) as u32)),
+        ]);
+    }
     metadata.extend(tiny_tokenizer_metadata());
 
     let ones = |n: usize| vec![1.0f32; n];
@@ -818,44 +895,91 @@ pub fn write_tiny_qwen3moe_gguf(path: &Path) {
         seed = seed.wrapping_add(7).wrapping_mul(2_654_435_761) | 1;
         weights(n, seed)
     };
-    for i in 0..NLAYER {
+    let q_dim = h * hd * if hybrid { 2 } else { 1 };
+    for i in 0..n_layer {
         let p = format!("blk.{i}");
-        tensors.push((format!("{p}.attn_norm.weight"), qtensor(ones(EMB), &[EMB])));
-        tensors.push((format!("{p}.ffn_norm.weight"), qtensor(ones(EMB), &[EMB])));
-        tensors.push((
-            format!("{p}.attn_q.weight"),
-            qtensor(next(H * HD * EMB), &[H * HD, EMB]),
-        ));
-        tensors.push((
-            format!("{p}.attn_k.weight"),
-            qtensor(next(KV * HD * EMB), &[KV * HD, EMB]),
-        ));
-        tensors.push((
-            format!("{p}.attn_v.weight"),
-            qtensor(next(KV * HD * EMB), &[KV * HD, EMB]),
-        ));
-        tensors.push((
-            format!("{p}.attn_output.weight"),
-            qtensor(next(EMB * H * HD), &[EMB, H * HD]),
-        ));
-        tensors.push((format!("{p}.attn_q_norm.weight"), qtensor(ones(HD), &[HD])));
-        tensors.push((format!("{p}.attn_k_norm.weight"), qtensor(ones(HD), &[HD])));
-        tensors.push((
-            format!("{p}.ffn_gate_inp.weight"),
-            qtensor(next(NE * EMB), &[NE, EMB]),
-        ));
-        tensors.push((
-            format!("{p}.ffn_gate_exps.weight"),
-            qtensor(next(NE * NFE * EMB), &[NE, NFE, EMB]),
-        ));
-        tensors.push((
-            format!("{p}.ffn_up_exps.weight"),
-            qtensor(next(NE * NFE * EMB), &[NE, NFE, EMB]),
-        ));
-        tensors.push((
-            format!("{p}.ffn_down_exps.weight"),
-            qtensor(next(NE * EMB * NFE), &[NE, EMB, NFE]),
-        ));
+        let mut push = |name: &str, data: Vec<f32>, shape: &[usize]| {
+            tensors.push((format!("{p}.{name}"), qtensor(data, shape)));
+        };
+        push("attn_norm.weight", ones(EMB), &[EMB]);
+        push(
+            if hybrid {
+                "post_attention_norm.weight"
+            } else {
+                "ffn_norm.weight"
+            },
+            ones(EMB),
+            &[EMB],
+        );
+        if hybrid && i == 0 {
+            // Gated DeltaNet layer.
+            push("attn_qkv.weight", next(conv_dim * EMB), &[conv_dim, EMB]);
+            push("attn_gate.weight", next(nv * sd * EMB), &[nv * sd, EMB]);
+            // Conv taps scaled up so the kernel visibly mixes positions.
+            push(
+                "ssm_conv1d.weight",
+                next(conv_dim * d_conv).iter().map(|x| x * 10.0).collect(),
+                &[conv_dim, d_conv],
+            );
+            push("ssm_dt.bias", next(nv), &[nv]);
+            push(
+                "ssm_a",
+                next(nv).iter().map(|x| -1.0 - x.abs() * 10.0).collect(),
+                &[nv],
+            );
+            if arch == "qwen3next" {
+                push("ssm_ba.weight", next(2 * nv * EMB), &[2 * nv, EMB]);
+            } else {
+                push("ssm_beta.weight", next(nv * EMB), &[nv, EMB]);
+                push("ssm_alpha.weight", next(nv * EMB), &[nv, EMB]);
+            }
+            push("ssm_norm.weight", ones(sd), &[sd]);
+            push("ssm_out.weight", next(EMB * nv * sd), &[EMB, nv * sd]);
+        } else {
+            if fused_qkv {
+                let n = q_dim + 2 * kv * hd;
+                push("attn_qkv.weight", next(n * EMB), &[n, EMB]);
+                push("attn_qkv.bias", next(n), &[n]);
+            } else {
+                push("attn_q.weight", next(q_dim * EMB), &[q_dim, EMB]);
+                push("attn_k.weight", next(kv * hd * EMB), &[kv * hd, EMB]);
+                push("attn_v.weight", next(kv * hd * EMB), &[kv * hd, EMB]);
+                if biases {
+                    push("attn_q.bias", next(q_dim), &[q_dim]);
+                    push("attn_k.bias", next(kv * hd), &[kv * hd]);
+                    push("attn_v.bias", next(kv * hd), &[kv * hd]);
+                }
+            }
+            push("attn_output.weight", next(EMB * h * hd), &[EMB, h * hd]);
+            if qk_norm {
+                push("attn_q_norm.weight", ones(hd), &[hd]);
+                push("attn_k_norm.weight", ones(hd), &[hd]);
+            }
+        }
+        if moe {
+            push("ffn_gate_inp.weight", next(NE * EMB), &[NE, EMB]);
+            push(
+                "ffn_gate_exps.weight",
+                next(NE * NFE * EMB),
+                &[NE, NFE, EMB],
+            );
+            push("ffn_up_exps.weight", next(NE * NFE * EMB), &[NE, NFE, EMB]);
+            push(
+                "ffn_down_exps.weight",
+                next(NE * EMB * NFE),
+                &[NE, EMB, NFE],
+            );
+            if shared_expert {
+                push("ffn_gate_inp_shexp.weight", next(EMB), &[EMB]);
+                push("ffn_gate_shexp.weight", next(NFE * EMB), &[NFE, EMB]);
+                push("ffn_up_shexp.weight", next(NFE * EMB), &[NFE, EMB]);
+                push("ffn_down_shexp.weight", next(EMB * NFE), &[EMB, NFE]);
+            }
+        } else {
+            push("ffn_gate.weight", next(NFF * EMB), &[NFF, EMB]);
+            push("ffn_up.weight", next(NFF * EMB), &[NFF, EMB]);
+            push("ffn_down.weight", next(EMB * NFF), &[EMB, NFF]);
+        }
     }
 
     let metadata_refs: Vec<(&str, &gguf_file::Value)> =

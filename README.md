@@ -17,14 +17,14 @@ framework) and [tokenizers](https://github.com/huggingface/tokenizers).
 | **Huge pages** | Transparent 2 MiB pages (`MADV_HUGEPAGE`, default on Linux) or explicit 2 MiB / 1 GiB (`MAP_HUGETLB`) backing to cut TLB misses on large models |
 | **OpenAI-compatible** | Drop-in replacement for `/v1/chat/completions`, `/v1/embeddings`, `/v1/models` |
 | **Streaming** | Server-Sent Events (SSE) for token-by-token streaming |
-| **GGUF support** | Llama/Mistral/Mixtral, Gemma 1–3, GLM-4, LFM2, Phi-2, Phi-3, Qwen2, Qwen3, Qwen3-MoE, DeepSeek-MoE, DeepSeek-V2/V2.5/V3/R1, DeepSeek-V4, Kimi-K2 (dense DeepSeek-LLM / Coder / R1-Distill load as `llama` / `qwen2`) |
+| **GGUF support** | Llama/Mistral/Mixtral, Gemma 1–3, GLM-4, LFM2, Phi-2, Phi-3, every Qwen generation (Qwen 1, Qwen1.5/2/2.5 incl. MoE, Qwen2/2.5-VL and Qwen3-VL text, Qwen3, Qwen3-MoE, Qwen3-Next, Qwen3.5 dense/MoE), DeepSeek-MoE, DeepSeek-V2/V2.5/V3/R1, DeepSeek-V4, Kimi-K2 (dense DeepSeek-LLM / Coder / R1-Distill load as `llama` / `qwen2`) |
 | **Exotic quant dtypes** | In-mapping decoders for IQ2_XXS (DeepSeek-V4's 2.0625-bit expert weights) and MXFP4 (Kimi-K3-class), with matmuls that keep the blocks in the mmap instead of materialising f32 |
 | **Fused SIMD kernels** | AVX2 dequant+dot fusion for Q8_0/Q2_K/Q4_K and parallel SIMD quantized matmuls on x86-64 |
 | **Chat templates** | Renders the model's own `tokenizer.chat_template` from the GGUF (Jinja via pure-Rust minijinja); ChatML fallback |
 | **Tool calling** | OpenAI-compatible `tools` / `tool_calls`, parsing Hermes/Qwen, Mistral, and Llama-3 call formats |
 | **Embeddings** | Dense sentence embeddings for llama / qwen2 / qwen3 embedding models, with GGUF pooling metadata |
-| **KV-cache reuse** | Multi-turn requests continue from a warm model pool and prefill only the new suffix — including across *context edits*: when an agent harness truncates or replaces middle blocks, the pooled session's KV state is rewound to the longest common token prefix instead of being cleared (Qwen3-MoE and DeepSeek-V2/V3/K2 loaders). DeepSeek MLA caches the compressed latent (`c_kv` + `k_pe`) instead of the reconstructed per-head K/V, cutting KV memory ~70× |
-| **Speculative decoding** | `--speculative N` drafts up to N tokens per step by prompt lookup and verifies them in one forward pass, rolling the KV cache back past the first rejection — output unchanged (token-identical when greedy, same distribution when sampling), fewer weight sweeps on repetitive output (`qwen3moe`, `deepseek2` loaders) |
+| **KV-cache reuse** | Multi-turn requests continue from a warm model pool and prefill only the new suffix — including across *context edits*: when an agent harness truncates or replaces middle blocks, the pooled session's KV state is rewound to the longest common token prefix instead of being cleared (Qwen and DeepSeek-V2/V3/K2 loaders; models with recurrent layers — Qwen3-Next, Qwen3.5 — reuse extensions and re-prefill on edits). DeepSeek MLA caches the compressed latent (`c_kv` + `k_pe`) instead of the reconstructed per-head K/V, cutting KV memory ~70× |
+| **Speculative decoding** | `--speculative N` drafts up to N tokens per step by prompt lookup and verifies them in one forward pass, rolling the KV cache back past the first rejection — output unchanged (token-identical when greedy, same distribution when sampling), fewer weight sweeps on repetitive output (Qwen and `deepseek2` loaders, except recurrent models) |
 | **Speculative expert prefetch** | Decode fires `MADV_WILLNEED` for each MoE layer's *predicted* experts (the ids its router chose last step — routing is temporally local) before any layer runs, so expert pages stream in behind compute instead of faulting on demand (`deepseek4` loader) |
 | **GPU (optional)** | `--features cuda`, `metal`, `opencl`, `vulkan` or `sycl` route inference through candle's GPU backends |
 | **NPU / llama.cpp interop (optional)** | Vendor plugins run in a crash-isolated shim process; a llama.cpp adapter brings every ggml backend (Hexagon NPU, CANN, CUDA, Vulkan, …) |
@@ -253,7 +253,7 @@ of them can still run the model well: the *dense* set (embeddings, norms,
 attention, routers, shared experts, output) is what every token touches and
 what benefits from the device, while each token touches only a handful of
 experts.  `--expert-placement` chooses where the routed experts of a
-`qwen3moe` / `deepseek2` model live:
+Qwen-family MoE or `deepseek2` model live:
 
 | Value | Effect |
 |---|---|
@@ -277,7 +277,7 @@ INFO joshua: expert placement: host RAM — experts borrowed from the mapping,
 ```
 
 Two things make a second concurrent conversation cheap on the device.
-Weights of a `qwen3moe` / `deepseek2` / `deepseek4` model are loaded (and
+Weights of a Qwen-family / `deepseek2` / `deepseek4` model are loaded (and
 uploaded) once and shared by every session: a new session is one
 reference-count bump plus an empty KV cache, never a second copy.  And the token-embedding table is
 kept quantized and gathered per row instead of being dequantized to a
@@ -625,9 +625,11 @@ joshua run model.gguf "Rewrite this function with better names: ..." --speculati
 ```
 
 Library users read the same counters from `Engine::speculative_stats()`.
-Supported by the architectures whose KV cache can be rolled back —
-`qwen3moe` and `deepseek2` (DeepSeek-V2/V3, Kimi-K2); other models ignore the
-setting and decode one token at a time.
+Supported by the architectures whose KV cache can be rolled back — the Qwen
+loader's attention-only models (`qwen`, `qwen2moe`, `qwen2vl`, `qwen3moe`,
+`qwen3vl`, `qwen3vlmoe`) and `deepseek`/`deepseek2` (DeepSeek-MoE/V2/V3,
+Kimi-K2); other models — including the recurrent Qwen3-Next / Qwen3.5 —
+ignore the setting and decode one token at a time.
 
 ---
 
@@ -658,9 +660,15 @@ the matching pure-Rust candle loader.  Currently supported architectures:
 | `lfm2` | Liquid LFM2 |
 | `phi2` | Phi-1, Phi-1.5, Phi-2 |
 | `phi3` | Phi-3, Phi-3.5 |
+| `qwen` | Qwen (1) — fused QKV with bias |
 | `qwen2` | Qwen1.5, Qwen2, Qwen2.5 |
+| `qwen2moe` | Qwen1.5-MoE, Qwen2-57B-A14B (gated shared expert) |
+| `qwen2vl` | Qwen2-VL, Qwen2.5-VL (text decoder, M-RoPE) |
 | `qwen3` | Qwen3 (dense) |
-| `qwen3moe` | Qwen3 mixture-of-experts |
+| `qwen3moe` | Qwen3 mixture-of-experts, Qwen3-Coder |
+| `qwen3vl` / `qwen3vlmoe` | Qwen3-VL dense / MoE (text decoder, interleaved M-RoPE) |
+| `qwen3next` | Qwen3-Next (Gated DeltaNet + gated attention hybrid, MoE) |
+| `qwen35` / `qwen35moe` | Qwen3.5 dense / MoE (Gated DeltaNet hybrid) |
 | `deepseek` | DeepSeek-MoE 16B (GQA attention + fine-grained MoE with shared experts) |
 | `deepseek2` | DeepSeek-V2, DeepSeek-V2-Lite, DeepSeek-V2.5, DeepSeek-V3 / V3.1, DeepSeek-R1, **Kimi-K2** (MLA attention + fine-grained MoE) |
 | `deepseek4` | DeepSeek-V4 (Hyper-Connections residual mixing, alternating sliding-window / learned KV-compressor attention, Lightning-Indexer sparse attention, fine-grained MoE with IQ2_XXS experts) |
@@ -691,6 +699,22 @@ Sinkhorn-normalised per-token weights, CSA/HCA compressor layers pool blocks of
 stay quantized as IQ2_XXS trellis blocks decoded in-mapping during the matmul,
 so a 162 B model keeps its on-disk footprint. Activations run in f32 on CPU.
 
+Every Qwen architecture except the dense `qwen2` / `qwen3` (candle's
+loaders) goes through Joshua's own `quantized_qwen` loader: one decoder layer
+whose parts are optional — fused or split QKV with biases, per-head Q/K norm,
+the Qwen3-Next generation's sigmoid output gate and partial RoPE, dense or
+MoE FFN with a sigmoid-gated shared expert, and Gated DeltaNet linear
+attention (causal conv + gated delta rule) for the hybrid models.  The VL
+models' multi-section RoPE reduces, for text positions, to 1-D RoPE with the
+"extra"-section frequencies frozen, exactly as llama.cpp computes it; image
+input goes through the llama.cpp `mtmd` plugin below.  Each architecture's
+logits are pinned to an independent NumPy transcription of llama.cpp's
+graphs.  Recurrent layers cannot rewind to an arbitrary prefix, so Qwen3-Next
+and Qwen3.5 re-prefill on edited contexts instead of truncating.  Not
+loadable: `qwen4exp` (experimental Hyper-Connection / compressed-attention
+hybrid), `qwen3tts` (speech codec output) and `rwkv6qwen2` (an RWKV-6
+distillation, not a Qwen decoder).
+
 **Kimi-K3 (in progress).** The correctness-critical primitives — Kimi Delta
 Attention (per-channel decay gates), attention residuals, the `situ`
 activation, and an MXFP4 decoder — are implemented in `kimi_k3.rs` and
@@ -702,7 +726,7 @@ metadata.
 Example models:
 
 - `google/gemma-3-270m-it` / `1b-it` / `4b-it`
-- `Qwen/Qwen3-0.6B` / `1.7B`
+- `Qwen/Qwen3-0.6B` / `1.7B`, `Qwen/Qwen3-30B-A3B`, `Qwen/Qwen3-Next-80B-A3B-Instruct`, `Qwen/Qwen3.5-9B` (as GGUF)
 - `LiquidAI/LFM2-1.2B`
 - `microsoft/Phi-3-mini-4k-instruct`
 - `mistralai/Mistral-7B-Instruct-v0.3`

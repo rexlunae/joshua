@@ -40,12 +40,12 @@
 use std::io::{Read, Seek};
 use std::sync::Arc;
 
-use candle_core::quantized::{gguf_file, QMatMul, QStorage, QTensor};
-use std::borrow::Cow;
+use candle_core::quantized::{gguf_file, QMatMul, QTensor};
 use candle_core::{DType, Device, IndexOp, Module, Result, Tensor, D};
 use candle_nn::ops::{sigmoid, softmax_last_dim};
 use candle_transformers::quantized_nn::RmsNorm;
 
+use crate::attention::{cached_attention, KvCache, Rope, RopeStyle};
 use crate::gguf_meta::Meta;
 use crate::moe::{topk_indices, topk_values};
 use crate::token_embedding::TokenEmbedding;
@@ -245,51 +245,29 @@ impl Config {
 
 // ─── RoPE (YaRN-aware, applied to the qk_rope slice only) ────────────────────
 
-struct RotaryEmbedding {
-    sin: Tensor,
-    cos: Tensor,
-}
-
-impl RotaryEmbedding {
-    fn new(cfg: &Config, dev: &Device) -> Result<Self> {
-        let dim = cfg.qk_rope_head_dim;
-        let max_seq = cfg.context_length.max(1);
-        let theta = cfg.rope_theta;
-        match &cfg.yarn {
-            None => {
-                let inv_freq: Vec<f32> = (0..dim)
-                    .step_by(2)
-                    .map(|i| cfg.rope_freq_scale / theta.powf(i as f32 / dim as f32))
-                    .collect();
-                Self::from_inv_freq(inv_freq, max_seq, 1.0, dev)
-            }
-            // Interpolated vs extrapolated frequencies blended by a ramp over
-            // the YaRN correction range (see DeepSeek modeling code).
-            Some(y) => Self::from_inv_freq(crate::yarn::inv_freq(dim, theta, y), max_seq, y.mscale(), dev),
+/// Interleaved (llama.cpp `NORM`) RoPE over the `qk_rope` slice, with YaRN
+/// frequency blending and magnitude scaling when configured.
+fn rope_table(cfg: &Config, dev: &Device) -> Result<Rope> {
+    let dim = cfg.qk_rope_head_dim;
+    let max_seq = cfg.context_length;
+    let theta = cfg.rope_theta;
+    match &cfg.yarn {
+        None => {
+            let inv_freq = crate::attention::inv_freq(dim, theta)
+                .into_iter()
+                .map(|f| f * cfg.rope_freq_scale)
+                .collect();
+            Rope::from_inv_freq(inv_freq, max_seq, 1.0, RopeStyle::Interleaved, dev)
         }
-    }
-
-    fn from_inv_freq(inv_freq: Vec<f32>, max_seq: usize, mscale: f32, dev: &Device) -> Result<Self> {
-        let n = inv_freq.len();
-        let inv_freq = Tensor::from_vec(inv_freq, (1, n), dev)?;
-        let t = Tensor::arange(0u32, max_seq as u32, dev)?
-            .to_dtype(DType::F32)?
-            .reshape((max_seq, 1))?;
-        let freqs = t.matmul(&inv_freq)?;
-        let sin = (freqs.sin()? * mscale as f64)?;
-        let cos = (freqs.cos()? * mscale as f64)?;
-        Ok(Self { sin, cos })
-    }
-
-    /// Apply interleaved RoPE (llama.cpp `NORM` type) to `q`/`k`, each shaped
-    /// `[b, heads, seq, qk_rope_head_dim]`.
-    fn apply(&self, q: &Tensor, k: &Tensor, offset: usize) -> Result<(Tensor, Tensor)> {
-        let seq_len = q.dim(2)?;
-        let sin = self.sin.narrow(0, offset, seq_len)?;
-        let cos = self.cos.narrow(0, offset, seq_len)?;
-        let q = candle_nn::rotary_emb::rope_i(&q.contiguous()?, &cos, &sin)?;
-        let k = candle_nn::rotary_emb::rope_i(&k.contiguous()?, &cos, &sin)?;
-        Ok((q, k))
+        // Interpolated vs extrapolated frequencies blended by a ramp over
+        // the YaRN correction range (see DeepSeek modeling code).
+        Some(y) => Rope::from_inv_freq(
+            crate::yarn::inv_freq(dim, theta, y),
+            max_seq,
+            y.mscale(),
+            RopeStyle::Interleaved,
+            dev,
+        ),
     }
 }
 
@@ -343,75 +321,16 @@ impl QProj {
 
 // ─── Attention ───────────────────────────────────────────────────────────────
 
-/// One layer's KV cache, kept transposed — `(k [b, n_kv, dk, seq], v [b,
-/// n_kv, dv, seq])` — and appended along dim 3.  Owned by the session, not
-/// the (shared) weights (see [`ModelWeights::new_session`]).
-///
-/// MLA caches the *reconstructed* per-head K/V rather than the compressed
-/// latent.  The latent is only `kv_lora_rank + qk_rope` ≈ 576 elems/token vs
-/// `n_head·(qk_nope + v_head_dim)` ≈ 40,960 for the full per-head K/V, so
-/// caching it would save ~70x memory — but reconstructing the full K/V from
-/// it every forward is O(seq) work per step, which makes decode degrade
-/// linearly with context length.  Instead K/V is reconstructed for the *new*
-/// tokens only (a linear map over the latent) and appended: decode stays
-/// O(1) in reconstruction, at the cost of caching the ~8x larger per-head
-/// form (still far below a plain MHA model, since MLA keeps Q and the latent
-/// low-rank).
-type KvCache = crate::moe::KvCache;
-
-/// Append this step's keys/values to `kv_cache` and attend `q` over the whole
-/// cached context — the kernel shared by MLA and GQA.
-///
-/// * `q`: `[b, n_head, seq, dk]`
-/// * `k_new`: `[b, n_kv, dk, seq]`, `v_new`: `[b, n_kv, dv, seq]` (transposed,
-///   matching the cache layout)
-///
-/// `n_head` must be a multiple of `n_kv`; query head `h` reads KV head
-/// `h / (n_head / n_kv)` (MLA is the `n_kv == n_head` case).  Returns the
-/// attention context `[b, seq, n_head * dv]`, ready for the output projection.
-///
-/// The cache lives transposed so the matmuls run directly on it: `q · kᵀ`
-/// becomes `q · k_cache` and `probs · v` becomes `v_cache · probsᵀ`.  A decode
-/// step then copies only the two append cats (the accumulated context), never
-/// an extra transpose of it.  Grouped query heads are folded into the row
-/// dimension of their KV head instead of repeating K/V per query head.
-fn cached_attention(
-    kv_cache: &mut KvCache,
-    q: &Tensor,
-    k_new: Tensor,
-    v_new: Tensor,
-    mask: Option<&Tensor>,
-    softmax_scale: f64,
-) -> Result<Tensor> {
-    let (b, n_head, seq_len, dk) = q.dims4()?;
-    let n_kv = k_new.dim(1)?;
-    let dv = v_new.dim(2)?;
-    let rep = n_head / n_kv;
-
-    let (k_cache, v_cache) = match &*kv_cache {
-        None => (k_new, v_new),
-        Some((kc, vc)) => (
-            Tensor::cat(&[kc, &k_new], 3)?.contiguous()?,
-            Tensor::cat(&[vc, &v_new], 3)?.contiguous()?,
-        ),
-    };
-    *kv_cache = Some((k_cache.clone(), v_cache.clone()));
-    let seq_total = k_cache.dim(3)?;
-
-    // Scaled dot-product attention over the whole cached context.
-    let q = q.contiguous()?.reshape((b, n_kv, rep * seq_len, dk))?;
-    let scores = (q.matmul(&k_cache)? * softmax_scale)?.reshape((b, n_head, seq_len, seq_total))?;
-    let scores = match mask {
-        Some(m) => scores.broadcast_add(m)?,
-        None => scores,
-    };
-    let probs = softmax_last_dim(&scores)?.reshape((b, n_kv, rep * seq_len, seq_total))?;
-    let ctx = v_cache.matmul(&probs.transpose(2, 3)?.contiguous()?)?; // [b, n_kv, dv, rep*seq]
-    ctx.reshape((b, n_kv, dv, rep, seq_len))?
-        .permute((0, 4, 1, 3, 2))? // [b, seq, n_kv, rep, dv]
-        .contiguous()?
-        .reshape((b, seq_len, n_head * dv))
-}
+// The layer KV cache ([`KvCache`]) holds the *reconstructed* per-head K/V
+// for MLA rather than the compressed latent.  The latent is only
+// `kv_lora_rank + qk_rope` ≈ 576 elems/token vs `n_head·(qk_nope +
+// v_head_dim)` ≈ 40,960 for the full per-head K/V, so caching it would save
+// ~70x memory — but reconstructing the full K/V from it every forward is
+// O(seq) work per step, which makes decode degrade linearly with context
+// length.  Instead K/V is reconstructed for the *new* tokens only (a linear
+// map over the latent) and appended: decode stays O(1) in reconstruction, at
+// the cost of caching the ~8x larger per-head form (still far below a plain
+// MHA model, since MLA keeps Q and the latent low-rank).
 
 /// A layer's attention block: MLA (`deepseek2`) or GQA (`deepseek`).
 enum Attention {
@@ -441,7 +360,7 @@ struct GqaAttention {
     k: QMatMul,
     v: QMatMul,
     o_proj: QMatMul,
-    rotary: Arc<RotaryEmbedding>,
+    rotary: Arc<Rope>,
     n_head: usize,
     n_kv_head: usize,
     head_dim: usize,
@@ -465,15 +384,8 @@ impl GqaAttention {
         let q = heads(&self.q, self.n_head, self.head_dim)?;
         let k = heads(&self.k, self.n_kv_head, self.head_dim)?;
         let v = heads(&self.v, self.n_kv_head, self.v_head_dim)?;
-        let (q, k) = self.rotary.apply(&q, &k, offset)?;
-        let ctx = cached_attention(
-            kv_cache,
-            &q,
-            k.transpose(2, 3)?.contiguous()?,
-            v.transpose(2, 3)?.contiguous()?,
-            mask,
-            self.softmax_scale,
-        )?;
+        let (q, k) = self.rotary.apply_pair(&q, &k, offset)?;
+        let ctx = crate::attention::cached_attention_heads(kv_cache, &q, &k, &v, mask, self.softmax_scale)?;
         self.o_proj.forward(&ctx)
     }
 }
@@ -486,7 +398,7 @@ struct MlaAttention {
     /// Combined KV up-projection: kv_lora_rank → n_head*(qk_nope + v_head_dim).
     kv_b: KvB,
     o_proj: QMatMul,
-    rotary: Arc<RotaryEmbedding>,
+    rotary: Arc<Rope>,
     n_head: usize,
     kv_lora_rank: usize,
     qk_nope: usize,
@@ -545,10 +457,11 @@ impl MlaAttention {
 
         // RoPE the *_pe slices, then reassemble Q (nope ‖ rope).  The single-head
         // key is RoPE'd here too; the cached copy is already post-RoPE.
-        let (q_pe, k_pe) = self.rotary.apply(&q_pe, &k_pe, offset)?;
+        let (q_pe, k_pe) = self.rotary.apply_pair(&q_pe, &k_pe, offset)?;
         let q = Tensor::cat(&[&q_nope.contiguous()?, &q_pe.contiguous()?], D::Minus1)?;
 
-        // Reconstruct per-head K/V for the *new* tokens only (see [`KvCache`]).
+        // Reconstruct per-head K/V for the *new* tokens only (see the cache note
+        // above).
         // kv_a_norm is a per-row norm and kv_b a linear map, so applying them
         // to this step's latent is bit-identical to a whole-cache
         // reconstruction — just O(seq_len) instead of O(seq_total) per step.
@@ -788,11 +701,11 @@ struct Layer {
 }
 
 /// The immutable half of a loaded model: every weight, the expert residency
-/// backend and the device.  Sessions share one `Arc` of it (see
-/// [`ModelWeights::new_session`]) and own only their KV caches, so a second
-/// concurrent conversation costs its KV cache rather than a second copy of
-/// the weights — on an accelerator, a second upload of the whole model.
-struct Shared {
+/// backend and the device.  Sessions ([`ModelWeights`]) share one `Arc` of it
+/// and own only their KV caches, so a second concurrent conversation costs
+/// its KV cache rather than a second copy of the weights — on an
+/// accelerator, a second upload of the whole model.
+pub struct Weights {
     tok_embeddings: TokenEmbedding,
     layers: Vec<Layer>,
     norm: RmsNorm,
@@ -800,22 +713,56 @@ struct Shared {
     device: Device,
     /// Executes residency for the hot set (CPU madvise today; a device slot
     /// cache later).  Built once at load from the per-expert handles.
-    residency: std::sync::Arc<dyn crate::residency::ExpertResidency>,
+    residency: Arc<dyn crate::residency::ExpertResidency>,
     n_expert: usize,
 }
 
-/// A quantized DeepSeek-MoE / V2 / V3 / Kimi-K2 model loaded from GGUF.
-pub struct ModelWeights {
-    shared: Arc<Shared>,
-    /// Per-layer KV cache — the only per-session tensor state.
-    kv: Vec<KvCache>,
-    /// Routing-frequency LRU hot-expert cache (shared bookkeeping; budget set
-    /// after load via [`ModelWeights::set_pin_hot_experts`], CLI flag
-    /// `--pin-hot-experts`).  Records routing, re-selects the hot set every
-    /// [`crate::hot_experts::REFRESH_STEPS`] decode steps, and reports newly
-    /// hot experts for the residency backend.
-    hot_experts: crate::hot_experts::HotExpertCache,
+impl crate::native_session::LayerStack for Weights {
+    type State = KvCache;
+
+    fn n_layers(&self) -> usize {
+        self.layers.len()
+    }
+    fn n_expert(&self) -> usize {
+        self.n_expert
+    }
+    fn device(&self) -> &Device {
+        &self.device
+    }
+    fn tok_embeddings(&self) -> &TokenEmbedding {
+        &self.tok_embeddings
+    }
+    fn residency(&self) -> &Arc<dyn crate::residency::ExpertResidency> {
+        &self.residency
+    }
+
+    fn layer(
+        &self,
+        l: usize,
+        kv: &mut KvCache,
+        xs: &Tensor,
+        mask: Option<&Tensor>,
+        offset: usize,
+    ) -> Result<(Tensor, Vec<u32>)> {
+        let layer = &self.layers[l];
+        let h = layer.attn.forward(kv, &layer.attn_norm.forward(xs)?, mask, offset)?;
+        let xs = (xs + h)?;
+        let (h, routed) = layer.ffn.forward_routed(&layer.ffn_norm.forward(&xs)?)?;
+        Ok(((xs + h)?, routed))
+    }
+
+    fn head(&self, xs: &Tensor) -> Result<Tensor> {
+        self.output.forward(&self.norm.forward(xs)?)?.to_dtype(DType::F32)
+    }
+
+    fn truncate_state(kv: &mut KvCache, keep: usize) -> Result<()> {
+        crate::moe::truncate_kv(kv, keep, crate::attention::KV_SEQ_DIM)
+    }
 }
+
+/// A quantized DeepSeek-MoE / V2 / V3 / Kimi-K2 model loaded from GGUF: one
+/// session over shared [`Weights`].
+pub type ModelWeights = crate::native_session::Session<Weights>;
 
 /// Small GGUF reader over the memory-mapped file.
 struct Reader<R: Read + Seek> {
@@ -884,7 +831,7 @@ impl<R: Read + Seek> Reader<R> {
     }
 
     /// Layer `p`'s attention block, MLA or GQA per `cfg`.
-    fn attention(&mut self, p: &str, cfg: &Config, rotary: &Arc<RotaryEmbedding>) -> Result<Attention> {
+    fn attention(&mut self, p: &str, cfg: &Config, rotary: &Arc<Rope>) -> Result<Attention> {
         let o_proj = self.qmatmul(&format!("{p}.attn_output.weight"))?;
         if !cfg.is_mla() {
             return Ok(Attention::Gqa(GqaAttention {
@@ -1008,7 +955,7 @@ impl ModelWeights {
             None => rd.qmatmul("token_embd.weight")?, // tied
         };
 
-        let rotary = Arc::new(RotaryEmbedding::new(&cfg, device)?);
+        let rotary = Arc::new(rope_table(&cfg, device)?);
 
         let mut layers = Vec::with_capacity(cfg.n_layer);
         for i in 0..cfg.n_layer {
@@ -1032,7 +979,6 @@ impl ModelWeights {
             });
         }
 
-        let n_layers = layers.len();
         let residency: std::sync::Arc<dyn crate::residency::ExpertResidency> =
             std::sync::Arc::new(crate::residency::CpuResidency::new(
                 layers
@@ -1045,202 +991,15 @@ impl ModelWeights {
                     })
                     .collect(),
             ));
-        Ok(Self {
-            shared: Arc::new(Shared {
-                tok_embeddings,
-                layers,
-                norm,
-                output,
-                device: device.clone(),
-                residency,
-                n_expert: cfg.n_expert,
-            }),
-            kv: vec![None; n_layers],
-            hot_experts: crate::hot_experts::HotExpertCache::new(
-                n_layers,
-                cfg.n_expert,
-                0,
-            ),
-        })
-    }
-
-    /// A fresh session over the same weights: shares every weight tensor
-    /// (one `Arc` clone — no read, no upload) and starts with an empty KV
-    /// cache and a fresh routing record under the same hot-expert budget.
-    pub fn new_session(&self) -> Self {
-        Self {
-            shared: Arc::clone(&self.shared),
-            kv: vec![None; self.kv.len()],
-            hot_experts: crate::hot_experts::HotExpertCache::new(
-                self.kv.len(),
-                self.shared.n_expert,
-                self.hot_experts.budget(),
-            ),
-        }
-    }
-
-    /// Number of sessions (including this one) sharing these weights.
-    pub fn shared_session_count(&self) -> usize {
-        Arc::strong_count(&self.shared)
-    }
-
-    /// Whether the token-embedding table is held quantized (diagnostics).
-    pub fn embeddings_quantized(&self) -> bool {
-        self.shared.tok_embeddings.is_quantized()
-    }
-
-    /// Forward pass. `input` is `[1, seq_len]`; `offset` is the KV-cache
-    /// position of the first input token.  Returns the last position's
-    /// logits, `[1, vocab]`.
-    pub fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {
-        self.forward_impl(input, offset, false)
-    }
-
-    /// [`Self::forward`], returning the logits of **every** input position,
-    /// `[1, seq_len, vocab]` — the speculative-decoding verification pass,
-    /// which scores a whole draft in one step (see [`crate::speculative`]).
-    pub fn forward_all_logits(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {
-        self.forward_impl(input, offset, true)
-    }
-
-    fn forward_impl(&mut self, input: &Tensor, offset: usize, all_logits: bool) -> Result<Tensor> {
-        let (_b, seq_len) = input.dims2()?;
-        // A verification pass is a (multi-token) decode step, not a prefill:
-        // it advances the hot-expert cadence like a single-token step.
-        let decode = seq_len == 1 || all_logits;
-        let sh: &Shared = &self.shared;
-        let mut xs = sh
-            .tok_embeddings
-            .forward(&input.flatten_all()?)?
-            .reshape((1, seq_len, sh.tok_embeddings.hidden()?))?;
-
-        let mask = if seq_len == 1 {
-            None
-        } else {
-            Some(crate::moe::causal_mask(seq_len, offset, &sh.device)?)
-        };
-
-        // Routing-frequency hot-expert cache: every
-        // crate::hot_experts::REFRESH_STEPS decode steps, re-select the
-        // most-used experts (recency as the tie-break) and WILLNEED their
-        // pages, so the common routing path stays resident instead of
-        // faulting from disk each step.  Runs before the layer loop so the
-        // prefetch has a full step of compute to stream in behind.
-        let step = self.hot_experts.begin_step(decode);
-        if self.hot_experts.refresh_due(decode) {
-            for (l, e) in self.hot_experts.refresh() {
-                // Protect the routing-frequency hot set from LRU eviction in a
-                // device slot pool (#62), then make it resident. No-op on
-                // CPU/host residency backends.
-                sh.residency.mark_hot(l, e);
-                sh.residency.acquire(l, e);
-            }
-        }
-
-        for (i, layer) in sh.layers.iter().enumerate() {
-            let residual = &xs;
-            let h = layer.attn_norm.forward(&xs)?;
-            let h = layer.attn.forward(&mut self.kv[i], &h, mask.as_ref(), offset)?;
-            let xs2 = (residual + h)?;
-
-            let residual = &xs2;
-            let h = layer.ffn_norm.forward(&xs2)?;
-            let (h, routed) = layer.ffn.forward_routed(&h)?;
-            self.hot_experts.record(i, &routed, step);
-            xs = (residual + h)?;
-        }
-
-        if all_logits {
-            let xs = sh.norm.forward(&xs)?;
-            return sh.output.forward(&xs)?.to_dtype(DType::F32);
-        }
-        let xs = xs.narrow(1, seq_len - 1, 1)?;
-        let xs = sh.norm.forward(&xs)?;
-        sh.output.forward(&xs)?.to_dtype(DType::F32)?.squeeze(1)
-    }
-
-    /// Set the routing-frequency hot-expert cache budget (experts kept
-    /// resident).  Call once after load, before serving; routing is recorded
-    /// from the first forward pass and the pinned set is re-selected every
-    /// [`crate::hot_experts::REFRESH_STEPS`] decode steps.
-    pub fn set_pin_hot_experts(&mut self, n: usize) {
-        self.hot_experts.set_budget(n);
-    }
-
-    /// Number of experts the residency backend can hold resident
-    /// (informational on CPU; a phase-5 auto-sizing input on devices).
-    pub fn expert_residency_capacity(&self) -> usize {
-        self.shared.residency.capacity()
-    }
-
-    /// Reset the KV cache so this instance can serve an unrelated prompt.
-    pub fn clear_kv_cache(&mut self) {
-        for kv in self.kv.iter_mut() {
-            *kv = None;
-        }
-    }
-
-    /// Keep only the first `keep` fed tokens of every layer's KV cache.
-    ///
-    /// See [`Attention::truncate_kv_cache`] for the semantics; used by the
-    /// engine's edited-context prefix reuse (a follow-up prompt that shares
-    /// a prefix with the cached history after an agent harness truncated or
-    /// replaced middle blocks).
-    pub fn truncate_kv_cache(&mut self, keep: usize) -> Result<()> {
-        for kv in self.kv.iter_mut() {
-            // The cache lives transposed — [b, n_head, dim, seq] — so the
-            // sequence dimension is dim 3 (see `Attention::forward`).
-            crate::moe::truncate_kv(kv, keep, 3)?;
-        }
-        Ok(())
-    }
-}
-
-
-// ─── Layer-streaming prefill (shared framework) ──────────────────────────────
-impl crate::stream_prefill::StreamPrefill for ModelWeights {
-    fn n_layers(&self) -> usize {
-        self.shared.layers.len()
-    }
-
-    fn embed_chunk(&self, tokens: &[u32], device: &candle_core::Device) -> Result<Tensor> {
-        let sh = Arc::clone(&self.shared);
-        sh.tok_embeddings
-            .forward(&Tensor::new(tokens.to_vec(), device)?.unsqueeze(0)?)?
-            .reshape((1, tokens.len(), sh.tok_embeddings.hidden()?))
-    }
-
-    fn apply_layer_chunk(
-        &mut self,
-        l: usize,
-        xs: &Tensor,
-        pos: usize,
-        _tokens: &[u32],
-    ) -> Result<Tensor> {
-        // Chunk-local causal mask, built before any mutable field borrow.
-        let chunk_len = xs.dim(1)?;
-        let mask = crate::moe::causal_mask(chunk_len, pos, xs.device())?;
-        let sh = Arc::clone(&self.shared);
-        let layer = &sh.layers[l];
-        let kv = &mut self.kv[l];
-        let residual = &*xs;
-        let h = layer.attn_norm.forward(xs)?;
-        let h = layer.attn.forward(kv, &h, Some(&mask), pos)?;
-        let xs = (residual + h)?;
-        let residual = &xs;
-        let h = layer.ffn_norm.forward(&xs)?;
-        let (h, routed) = layer.ffn.forward_routed(&h)?;
-        let step = self.hot_experts.begin_step(false);
-        self.hot_experts.record(l, &routed, step);
-        Ok((residual + h)?)
-    }
-
-    fn final_logits(&self, last: &Tensor) -> Result<Tensor> {
-        let sh = Arc::clone(&self.shared);
-        let seq_len = last.dim(1)?;
-        let xs = last.narrow(1, seq_len - 1, 1)?;
-        let xs = sh.norm.forward(&xs)?;
-        sh.output.forward(&xs)?.to_dtype(DType::F32)?.squeeze(1)
+        Ok(Self::from_weights(Weights {
+            tok_embeddings,
+            layers,
+            norm,
+            output,
+            device: device.clone(),
+            residency,
+            n_expert: cfg.n_expert,
+        }))
     }
 }
 
@@ -1276,33 +1035,6 @@ fn load_kv_b<R: Read + Seek>(rd: &mut Reader<R>, p: &str, cfg: &Config) -> Resul
 
 /// Load a MoE feed-forward block: quantized per-expert SwiGLU experts, the f32
 /// router (+ optional bias), and any shared experts.
-/// Estimate the device (f32-dense) bytes of one routed expert (for the
-/// `DeviceResidency` capacity `per_slot`); conservative overestimate is fine.
-fn estimate_device_expert_bytes(m: &Mlp) -> u64 {
-    let _ = m; // QMatMul hides raw sizes; use a round heuristic.
-    400_000u64 * 4
-}
-
-/// Upload a quantized `QMatMul`'s blocks onto `device` (backend-generic via
-/// `QStorage::from_data` — CPU, Vulkan, Metal, OpenCL, CUDA).  `None` when
-/// the matmul is not a raw `QMatMul::QTensor` (LoRA/plain) or the upload
-/// fails; the caller then keeps the host form for that expert (#62).
-fn upload_qmatmul(q: &QMatMul, device: &Device) -> Option<QMatMul> {
-    let qt = match q {
-        QMatMul::QTensor(qt) => qt.clone(),
-        QMatMul::Tensor(_) | QMatMul::TensorF16(_) => return None,
-    };
-    if device.same_device(&qt.device()) {
-        return Some(q.clone());
-    }
-    let dtype = qt.dtype();
-    let bytes = qt.data().ok()?;
-    let shape = qt.shape().clone();
-    let storage = QStorage::from_data(Cow::Borrowed(&bytes), device, dtype).ok()?;
-    let qt = QTensor::new(storage, shape).ok()?;
-    Some(QMatMul::QTensor(std::sync::Arc::new(qt)))
-}
-
 fn load_moe<R: Read + Seek>(rd: &mut Reader<R>, p: &str, cfg: &Config) -> Result<Moe> {
     let gate = rd.f32_tensor(&format!("{p}.ffn_gate_inp.weight"))?; // [n_expert, n_embd]
     let gate_bias = rd
@@ -1350,11 +1082,7 @@ fn load_moe<R: Read + Seek>(rd: &mut Reader<R>, p: &str, cfg: &Config) -> Result
         Some(cap_bytes) if cap_bytes > 0 => {
             let host = experts.clone();
             let expert_dev = rd.expert_device.clone();
-            let per_slot = host
-                .first()
-                .map(|m| estimate_device_expert_bytes(m))
-                .unwrap_or(1024)
-                .max(1024);
+            let per_slot = crate::moe::EXPERT_SLOT_BYTES_ESTIMATE;
             let upload: std::sync::Arc<
                 dyn Fn(u32, u32) -> Option<std::sync::Arc<DeviceExpert>> + Send + Sync,
             > = std::sync::Arc::new(move |l, e| {
@@ -1367,9 +1095,9 @@ fn load_moe<R: Read + Seek>(rd: &mut Reader<R>, p: &str, cfg: &Config) -> Result
                 // runs for real on the accelerator (#62). CPU keeps sharing host
                 // weights (parity).
                 if !expert_dev.is_cpu() {
-                    let gate = upload_qmatmul(&m.gate, &expert_dev)?;
-                    let up = upload_qmatmul(&m.up, &expert_dev)?;
-                    let down = upload_qmatmul(&m.down, &expert_dev)?;
+                    let gate = crate::moe::upload_qmatmul(&m.gate, &expert_dev)?;
+                    let up = crate::moe::upload_qmatmul(&m.up, &expert_dev)?;
+                    let down = crate::moe::upload_qmatmul(&m.down, &expert_dev)?;
                     return Some(std::sync::Arc::new(DeviceExpert {
                         gate,
                         up,
@@ -1563,7 +1291,7 @@ mod tests {
             kv_a_norm: norm,
             kv_b: KvB::Dense(w.kv_b.clone()),
             o_proj: lin(w.h, w.nh * w.vh, &w.o),
-            rotary: Arc::new(RotaryEmbedding::new(&cfg, dev)?),
+            rotary: Arc::new(rope_table(&cfg, dev)?),
             n_head: w.nh,
             kv_lora_rank: w.lkv,
             qk_nope: w.np,
@@ -1648,70 +1376,6 @@ mod tests {
             .to_vec1::<f32>()?;
         let max = out_diff.into_iter().fold(0.0f32, f32::max);
         assert!(max < 1e-5, "attention outputs diverge: max diff {max}");
-        Ok(())
-    }
-
-    /// Grouped attention must equal the textbook form: K/V repeated per query
-    /// head, softmax(q·kᵀ·scale + mask)·v — over both a prefill and a decode
-    /// step appended to the cache.
-    #[test]
-    fn gqa_cached_attention_matches_repeated_kv_reference() -> Result<()> {
-        let dev = Device::Cpu;
-        let (b, n_head, n_kv, d, dv) = (1usize, 4usize, 2usize, 6usize, 5usize);
-        let rep = n_head / n_kv;
-        let scale = 0.37;
-
-        // Reference over the full sequence: q [b, h, s, d], k [b, kv, s, d].
-        let reference = |q: &Tensor, k: &Tensor, v: &Tensor, mask: Option<&Tensor>| -> Result<Tensor> {
-            let expand = |x: &Tensor| -> Result<Tensor> {
-                let (b, kv, s, d) = x.dims4()?;
-                x.unsqueeze(2)?
-                    .expand((b, kv, rep, s, d))?
-                    .reshape((b, kv * rep, s, d))
-            };
-            let (k, v) = (expand(k)?, expand(v)?);
-            let mut scores = (q.matmul(&k.t()?)? * scale)?;
-            if let Some(m) = mask {
-                scores = scores.broadcast_add(m)?;
-            }
-            let ctx = softmax_last_dim(&scores)?.matmul(&v)?; // [b, h, s, dv]
-            let s = ctx.dim(2)?;
-            ctx.transpose(1, 2)?.contiguous()?.reshape((b, s, n_head * dv))
-        };
-
-        let total = 4usize;
-        let q = Tensor::randn(0f32, 1f32, (b, n_head, total, d), &dev)?;
-        let k = Tensor::randn(0f32, 1f32, (b, n_kv, total, d), &dev)?;
-        let v = Tensor::randn(0f32, 1f32, (b, n_kv, total, dv), &dev)?;
-        let t = |x: &Tensor| x.transpose(2, 3).and_then(|x| x.contiguous());
-
-        let mut kv: KvCache = None;
-        // Prefill 3 tokens, then decode the 4th.
-        let mask = crate::moe::causal_mask(3, 0, &dev)?;
-        let pre = cached_attention(
-            &mut kv,
-            &q.narrow(2, 0, 3)?,
-            t(&k.narrow(2, 0, 3)?)?,
-            t(&v.narrow(2, 0, 3)?)?,
-            Some(&mask),
-            scale,
-        )?;
-        let dec = cached_attention(
-            &mut kv,
-            &q.narrow(2, 3, 1)?,
-            t(&k.narrow(2, 3, 1)?)?,
-            t(&v.narrow(2, 3, 1)?)?,
-            None,
-            scale,
-        )?;
-        let got = Tensor::cat(&[&pre, &dec], 1)?;
-        let want = reference(&q, &k, &v, Some(&crate::moe::causal_mask(total, 0, &dev)?))?;
-
-        let max = (got - want)?.abs()?.flatten_all()?.max(0)?.to_scalar::<f32>()?;
-        assert!(max < 1e-5, "grouped attention diverges from reference: {max}");
-        let (kc, vc) = kv.as_ref().unwrap();
-        assert_eq!(kc.dims(), &[b, n_kv, d, total], "cache keeps the un-repeated KV heads");
-        assert_eq!(vc.dims(), &[b, n_kv, dv, total]);
         Ok(())
     }
 
