@@ -34,6 +34,47 @@ pub fn qtensor_q4k(data: Vec<f32>, shape: &[usize]) -> QTensor {
     QTensor::quantize(&t, GgmlDType::Q4K).unwrap()
 }
 
+/// Load a GGUF on the CPU the way the engine does: the tolerant header (raw
+/// dtype ids) projected onto candle's `Content` — `Content::read` itself
+/// rejects a file holding a dtype candle cannot name (IQ2_XXS, Q1_0, …) —
+/// with the weights borrowed from a memory mapping when `mmap` is set, else
+/// streamed from the reader.  The loader re-reads the raw header from the
+/// reader for the tensors the projection drops.
+pub fn load_model(path: &Path, mmap: bool) -> joshua::model::QuantizedModel {
+    let bytes = std::fs::read(path).unwrap();
+    let content = joshua::gguf_ext::read_header(&mut std::io::Cursor::new(&bytes[..]))
+        .unwrap()
+        .to_candle_content()
+        .unwrap();
+    let mmap = mmap.then(|| {
+        // Safety: the file is read-only for the lifetime of the mapping.
+        std::sync::Arc::new(unsafe { memmap2::Mmap::map(&File::open(path).unwrap()) }.unwrap())
+    });
+    let mut cursor = std::io::Cursor::new(&bytes[..]);
+    joshua::model::QuantizedModel::from_gguf_mmap(content, &mut cursor, &Device::Cpu, mmap, None, 0)
+        .unwrap()
+}
+
+/// Last-position logits for `tokens` fed at `offset` (CPU).
+pub fn logits(model: &mut joshua::model::QuantizedModel, tokens: &[u32], offset: usize) -> Vec<f32> {
+    let input = Tensor::new(tokens, &Device::Cpu).unwrap().unsqueeze(0).unwrap();
+    model
+        .forward(&input, offset)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap()
+}
+
+/// Element-wise `|a - b| < tol`, naming the first diverging logit.
+pub fn assert_close(a: &[f32], b: &[f32], tol: f32, what: &str) {
+    assert_eq!(a.len(), b.len(), "{what}: length");
+    for (i, (x, y)) in a.iter().zip(b).enumerate() {
+        assert!((x - y).abs() < tol, "{what}: logit {i} diverges: {x} vs {y}");
+    }
+}
+
 /// A minimal WordLevel tokenizer with a 16-token vocabulary.
 pub const TOKENIZER_JSON: &str = r#"{
     "version": "1.0",
@@ -805,7 +846,7 @@ pub fn write_tiny_qwen_gguf(path: &Path, arch: &str) {
     let hyper = arch == "qwen4exp";
     let (hc, hc_rank) = (2usize, 3usize);
     let (idx_heads, idx_dim) = (2usize, 6usize);
-    let (ple_heads, ple_dim, ple_rows, ple_kernel) = (4usize, 2usize, 40usize, 3usize);
+    let (ple_dim, ple_rows, ple_kernel) = (2usize, 40usize, 3usize);
     let qk_norm = arch.starts_with("qwen3") || arch == "qwen4exp";
     let biases = matches!(arch, "qwen2moe" | "qwen2vl");
     let fused_qkv = arch == "qwen";
@@ -1913,6 +1954,97 @@ pub fn write_tiny_deepseek4_gguf_opts(path: &Path, opts: TinyDeepseek4Opts) {
         ));
     }
 
+    write_raw_gguf(path, &metadata, &tensors);
+}
+
+/// How [`write_tiny_bonsai_gguf`] stores its matrices.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum BonsaiWeights {
+    /// Bonsai's formats: Q1_0 embedding + attention, Q2_0 FFN + head.
+    LowBit,
+    /// The same values dequantized to F32 (a candle-readable twin).
+    Dequantized,
+}
+
+/// Write a tiny `qwen3` GGUF in the layout Bonsai models ship: Q1_0
+/// (1-bit) token embedding and attention projections, Q2_0 (2-bit) FFN and
+/// output head, F32 norms.  Widths are block multiples (128-dim embedding,
+/// 2 heads of 64, one KV head, 128-wide FFN, 2 layers).  With
+/// [`BonsaiWeights::Dequantized`] every matrix holds exactly the values its
+/// low-bit blocks decode to, stored as F32.
+pub fn write_tiny_bonsai_gguf(path: &Path, weights_as: BonsaiWeights) {
+    use joshua::low_bit::{blocks_as_bytes, quantize_q1_0, quantize_q2_0, BlockQ1_0, BlockQ2_0};
+    use joshua::raw_block::{dequantize, RawBlock};
+    const VOCAB: usize = 16;
+    const EMB: usize = 128;
+    const HD: usize = 64;
+    const NFF: usize = 128;
+    let (h, kv, n_layer) = (2usize, 1usize, 2usize);
+
+    let arch = "qwen3";
+    let key = |s: &str| format!("{arch}.{s}");
+    let u32v = gguf_file::Value::U32;
+    let metadata = vec![
+        ("general.architecture".to_string(), gguf_file::Value::String(arch.into())),
+        (key("attention.head_count"), u32v(h as u32)),
+        (key("attention.head_count_kv"), u32v(kv as u32)),
+        (key("block_count"), u32v(n_layer as u32)),
+        (key("embedding_length"), u32v(EMB as u32)),
+        (key("feed_forward_length"), u32v(NFF as u32)),
+        (key("context_length"), u32v(512)),
+        (key("attention.layer_norm_rms_epsilon"), gguf_file::Value::F32(1e-6)),
+        (key("attention.key_length"), u32v(HD as u32)),
+        (key("rope.freq_base"), gguf_file::Value::F32(1_000_000.0)),
+    ];
+
+    let mut seed = 0u32;
+    let mut tensors = Vec::new();
+    let mut matrix = |name: String, dims: &[usize], q1: bool| {
+        seed += 1;
+        let w = weights(dims.iter().product(), seed * 7919);
+        let (dtype, bytes, decoded) = if q1 {
+            let b = quantize_q1_0(&w);
+            let mut d = vec![0f32; w.len()];
+            dequantize(&b, &mut d).unwrap();
+            (BlockQ1_0::GGML_TYPE, blocks_as_bytes(&b).to_vec(), d)
+        } else {
+            let b = quantize_q2_0(&w);
+            let mut d = vec![0f32; w.len()];
+            dequantize(&b, &mut d).unwrap();
+            (BlockQ2_0::GGML_TYPE, blocks_as_bytes(&b).to_vec(), d)
+        };
+        tensors.push(match weights_as {
+            BonsaiWeights::LowBit => RawTensor {
+                name,
+                dtype,
+                dims: dims.to_vec(),
+                data: bytes,
+            },
+            BonsaiWeights::Dequantized => RawTensor::f32(&name, decoded, dims),
+        });
+    };
+    matrix("token_embd.weight".into(), &[VOCAB, EMB], true);
+    for l in 0..n_layer {
+        let p = |n: &str| format!("blk.{l}.{n}.weight");
+        matrix(p("attn_q"), &[h * HD, EMB], true);
+        matrix(p("attn_k"), &[kv * HD, EMB], true);
+        matrix(p("attn_v"), &[kv * HD, EMB], true);
+        matrix(p("attn_output"), &[EMB, h * HD], true);
+        matrix(p("ffn_gate"), &[NFF, EMB], false);
+        matrix(p("ffn_up"), &[NFF, EMB], false);
+        matrix(p("ffn_down"), &[EMB, NFF], false);
+    }
+    matrix("output.weight".into(), &[VOCAB, EMB], false);
+    let norm = |name: String, n: usize, seed: u32| {
+        RawTensor::f32(&name, weights(n, seed).iter().map(|v| 1.0 + 5.0 * v).collect(), &[n])
+    };
+    for l in 0..n_layer {
+        tensors.push(norm(format!("blk.{l}.attn_norm.weight"), EMB, 101 + l as u32));
+        tensors.push(norm(format!("blk.{l}.ffn_norm.weight"), EMB, 201 + l as u32));
+        tensors.push(norm(format!("blk.{l}.attn_q_norm.weight"), HD, 301 + l as u32));
+        tensors.push(norm(format!("blk.{l}.attn_k_norm.weight"), HD, 401 + l as u32));
+    }
+    tensors.push(norm("output_norm.weight".into(), EMB, 501));
     write_raw_gguf(path, &metadata, &tensors);
 }
 

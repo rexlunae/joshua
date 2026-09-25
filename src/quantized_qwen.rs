@@ -7,6 +7,7 @@
 //! | `qwen`       | Qwen (1)                          | fused QKV + bias          | dense |
 //! | `qwen2moe`   | Qwen1.5-MoE, Qwen2-57B-A14B       | QKV bias                  | MoE + gated shared expert |
 //! | `qwen2vl`    | Qwen2-VL, Qwen2.5-VL (text)       | QKV bias, M-RoPE          | dense |
+//! | `qwen3`      | Qwen3 dense, Bonsai (Q1_0 / Q2_0) | Q/K norm                  | dense |
 //! | `qwen3moe`   | Qwen3-30B-A3B, Qwen3-Coder        | Q/K norm                  | MoE |
 //! | `qwen3vl`    | Qwen3-VL (text)                   | Q/K norm, IM-RoPE         | dense |
 //! | `qwen3vlmoe` | Qwen3-VL-MoE (text)               | Q/K norm, IM-RoPE         | MoE |
@@ -15,7 +16,9 @@
 //! | `qwen35moe`  | Qwen3.5-MoE                       | gated / Gated DeltaNet, IM-RoPE | MoE + gated shared expert |
 //! | `qwen4exp`   | Qwen3.8-Flash-Next                | as `qwen35moe` + QSA block-sparse attention | MoE + gated shared expert |
 //!
-//! (`qwen2` and `qwen3` dense run through candle's stock loaders.)  The
+//! (`qwen2` dense runs through candle's stock loader.)  Tensors in formats
+//! candle cannot name — the 1-bit Q1_0 and 2-bit Q2_0 that Bonsai models ship
+//! in — load through the raw GGUF header (see [`TensorSource`]).  The
 //! pieces that vary are all optional parts of one decoder layer:
 //!
 //! * **Attention.**  GQA over a fused (`attn_qkv`) or split Q/K/V projection
@@ -64,6 +67,8 @@ use crate::attention::{KvCache, Rope, RopeStyle};
 mod qwen4exp;
 use qwen4exp::{HyperMix, Ple, PleConfig, Qsa, QsaConfig};
 use crate::gguf_meta::Meta;
+use crate::gguf_ext::GgufHeader;
+use crate::tensor_source::TensorSource;
 use crate::token_embedding::TokenEmbedding;
 use crate::zero_copy_metal::{ZcContext, ZcWeight};
 
@@ -148,6 +153,7 @@ pub const ARCHES: &[&str] = &[
     "qwen",
     "qwen2moe",
     "qwen2vl",
+    "qwen3",
     "qwen3moe",
     "qwen3vl",
     "qwen3vlmoe",
@@ -410,18 +416,15 @@ impl Config {
 
 /// Small GGUF reader over the (possibly memory-mapped) file.
 struct Reader<R: Read + Seek> {
-    ct: gguf_file::Content,
-    reader: R,
-    device: Device,
+    /// The tensors themselves (raw-header formats, mmap borrow, or copy),
+    /// with the dense `device` and the architecture name.
+    src: TensorSource<R>,
     /// Device the routed-expert tensors are built on.  Same as `device` for
     /// a CPU model or when the experts are uploaded; the CPU when the model
     /// runs on an accelerator that cannot hold the expert pool (see
     /// [`crate::placement::ExpertPlacement`]) — each expert is then borrowed
     /// from the mapping and [`Moe::dispatch`] hops the activations across.
     expert_device: Device,
-    /// When present, tensors are borrowed in place from this mapping instead
-    /// of being copied onto the heap (see [`crate::mmap_tensor`]).
-    mmap: Option<Arc<memmap2::Mmap>>,
     /// Bytes of the bounded VRAM expert cache (#62) to build for each MoE
     /// block (`None` / `Some(0)` disables).  `load_moe` reads this to construct
     /// the per-layer `DeviceResidency`.
@@ -435,30 +438,29 @@ struct Reader<R: Read + Seek> {
     /// present, quantized experts are kept compressed in the mmap and uploaded
     /// to the device on demand instead of being copied up front.
     gpu_cache: Option<Arc<WeightCache>>,
-    /// `general.architecture`, for error context.
-    arch: &'static str,
+}
+
+impl<R: Read + Seek> std::ops::Deref for Reader<R> {
+    type Target = TensorSource<R>;
+    fn deref(&self) -> &TensorSource<R> {
+        &self.src
+    }
+}
+
+impl<R: Read + Seek> std::ops::DerefMut for Reader<R> {
+    fn deref_mut(&mut self) -> &mut TensorSource<R> {
+        &mut self.src
+    }
 }
 
 impl<R: Read + Seek> Reader<R> {
-    fn qtensor(&mut self, name: &str) -> Result<QTensor> {
-        if let Some(mmap) = &self.mmap {
-            return crate::mmap_tensor::qtensor_from_mmap(
-                &self.ct,
-                mmap,
-                &mut self.reader,
-                name,
-                &self.device,
-            );
-        }
-        self.ct.tensor(&mut self.reader, name, &self.device)
-    }
     fn qmatmul(&mut self, name: &str) -> Result<Weight> {
         if let Some(zc) = &self.zc {
-            if let Some(w) = zc.weight(&self.ct, name)? {
+            if let Some(w) = zc.weight(&self.src.ct, name)? {
                 return Ok(Weight::Zc(Arc::new(w)));
             }
         }
-        Ok(Weight::Candle(QMatMul::from_qtensor(self.qtensor(name)?)?))
+        Ok(Weight::Candle(self.src.qmatmul(name)?))
     }
     fn qmatmul_opt(&mut self, name: &str) -> Option<Weight> {
         if self.has(name) {
@@ -466,21 +468,6 @@ impl<R: Read + Seek> Reader<R> {
         } else {
             None
         }
-    }
-    fn rms_norm(&mut self, name: &str, eps: f64) -> Result<RmsNorm> {
-        RmsNorm::from_qtensor(self.qtensor(name)?, eps)
-    }
-    fn rms_norm_opt(&mut self, name: &str, eps: f64) -> Result<Option<RmsNorm>> {
-        self.has(name).then(|| self.rms_norm(name, eps)).transpose()
-    }
-    fn f32_tensor(&mut self, name: &str) -> Result<Tensor> {
-        self.qtensor(name)?.dequantize(&self.device)?.to_dtype(DType::F32)
-    }
-    fn f32_opt(&mut self, name: &str) -> Result<Option<Tensor>> {
-        self.has(name).then(|| self.f32_tensor(name)).transpose()
-    }
-    fn has(&self, name: &str) -> bool {
-        self.ct.tensor_infos.contains_key(name)
     }
 }
 
@@ -1414,7 +1401,7 @@ fn split_experts<R: Read + Seek>(
     name: &str,
     n_expert: usize,
 ) -> Result<Vec<ExpertPart>> {
-    let et = crate::moe::ExpertTensor::lookup(&rd.ct, rd.arch, name, n_expert)?;
+    let et = rd.expert_tensor(name, n_expert)?;
     let host_experts = rd.expert_device.is_cpu();
     let candle = |qt: QTensor| -> Result<Weight> { Ok(Weight::Candle(QMatMul::from_qtensor(qt)?)) };
 
@@ -1490,7 +1477,7 @@ fn split_experts<R: Read + Seek>(
     }
 
     // No mapping (streamed load) or a tensor that cannot be sliced.
-    et.read_and_split(&rd.ct, &mut rd.reader, rd.arch, &rd.expert_device)?
+    et.read_and_split(&rd.src.ct, &mut rd.src.reader, rd.src.arch, &rd.expert_device)?
         .into_iter()
         .map(|qt| Ok((candle(qt)?, None)))
         .collect()
@@ -1615,7 +1602,7 @@ impl ModelWeights {
         device: &Device,
         mmap: Option<Arc<memmap2::Mmap>>,
     ) -> Result<Self> {
-        Self::from_gguf_mmap_placed(ct, reader, device, device, mmap, None)
+        Self::from_gguf_mmap_placed(ct, None, reader, device, device, mmap, None)
     }
 
     /// [`ModelWeights::from_gguf_mmap`] with an explicit device for the routed
@@ -1629,8 +1616,13 @@ impl ModelWeights {
     /// model larger than the device's memory (see
     /// [`crate::placement::ExpertPlacement`]).  Any other `expert_device`
     /// must equal `device`.
+    ///
+    /// `raw` is the header with raw dtype ids (see [`crate::gguf_ext`]); it
+    /// carries the tensors in formats candle cannot name (Q1_0, Q2_0, …),
+    /// which are absent from `ct`.
     pub fn from_gguf_mmap_placed<R: Read + Seek>(
         ct: gguf_file::Content,
+        raw: Option<GgufHeader>,
         reader: &mut R,
         device: &Device,
         expert_device: &Device,
@@ -1697,15 +1689,18 @@ impl ModelWeights {
         // The Content owns metadata; move it into our reader together with the
         // underlying file handle (borrowed for the lifetime of the load).
         let mut rd = Reader {
-            ct,
-            reader,
-            device: device.clone(),
+            src: TensorSource {
+                ct,
+                raw,
+                reader,
+                device: device.clone(),
+                mmap,
+                arch: cfg.arch,
+            },
             expert_device: expert_device.clone(),
-            mmap,
             device_expert_cache_bytes,
             zc,
             gpu_cache,
-            arch: cfg.arch,
         };
 
         // Kept quantized: dequantizing the table to f32 costs vocab × hidden

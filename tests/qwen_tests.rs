@@ -5,7 +5,12 @@
 mod common;
 
 use candle_core::{Device, Tensor};
-use joshua::model::{Architecture, QuantizedModel};
+use common::{assert_close, logits};
+use joshua::model::Architecture;
+
+fn load(model: &std::path::Path) -> joshua::model::QuantizedModel {
+    common::load_model(model, false)
+}
 
 /// Every architecture the Qwen loader serves, with whether its layers
 /// include recurrent (Gated DeltaNet) state.
@@ -13,6 +18,7 @@ const ARCHES: &[(&str, bool)] = &[
     ("qwen", false),
     ("qwen2moe", false),
     ("qwen2vl", false),
+    ("qwen3", false),
     ("qwen3moe", false),
     ("qwen3vl", false),
     ("qwen3vlmoe", false),
@@ -21,37 +27,6 @@ const ARCHES: &[(&str, bool)] = &[
     ("qwen35moe", true),
     ("qwen4exp", true),
 ];
-
-fn load(model: &std::path::Path) -> QuantizedModel {
-    let bytes = std::fs::read(model).unwrap();
-    let mut cursor = std::io::Cursor::new(&bytes[..]);
-    let content = candle_core::quantized::gguf_file::Content::read(&mut cursor).unwrap();
-    QuantizedModel::from_gguf(content, &mut cursor, &Device::Cpu).unwrap()
-}
-
-fn logits(model: &mut QuantizedModel, tokens: &[u32], offset: usize) -> Vec<f32> {
-    let input = Tensor::new(tokens, &Device::Cpu)
-        .unwrap()
-        .unsqueeze(0)
-        .unwrap();
-    model
-        .forward(&input, offset)
-        .unwrap()
-        .squeeze(0)
-        .unwrap()
-        .to_vec1()
-        .unwrap()
-}
-
-fn assert_close(a: &[f32], b: &[f32], tol: f32, what: &str) {
-    assert_eq!(a.len(), b.len(), "{what}: length");
-    for (i, (x, y)) in a.iter().zip(b).enumerate() {
-        assert!(
-            (x - y).abs() < tol,
-            "{what}: logit {i} diverges: {x} vs {y}"
-        );
-    }
-}
 
 #[test]
 fn every_qwen_architecture_is_supported() {

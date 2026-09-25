@@ -17,8 +17,8 @@ framework) and [tokenizers](https://github.com/huggingface/tokenizers).
 | **Huge pages** | Transparent 2 MiB pages (`MADV_HUGEPAGE`, default on Linux) or explicit 2 MiB / 1 GiB (`MAP_HUGETLB`) backing to cut TLB misses on large models |
 | **OpenAI-compatible** | Drop-in replacement for `/v1/chat/completions`, `/v1/embeddings`, `/v1/models` |
 | **Streaming** | Server-Sent Events (SSE) for token-by-token streaming |
-| **GGUF support** | Llama/Mistral/Mixtral, Gemma 1–3, GLM-4, LFM2, Phi-2, Phi-3, every Qwen generation (Qwen 1, Qwen1.5/2/2.5 incl. MoE, Qwen2/2.5-VL and Qwen3-VL text, Qwen3, Qwen3-MoE, Qwen3-Next, Qwen3.5 dense/MoE, Qwen3.8-Flash-Next / `qwen4exp`), DeepSeek-MoE, DeepSeek-V2/V2.5/V3/R1, DeepSeek-V4, Kimi-K2 (dense DeepSeek-LLM / Coder / R1-Distill load as `llama` / `qwen2`) |
-| **Exotic quant dtypes** | In-mapping decoders for IQ2_XXS (DeepSeek-V4's 2.0625-bit expert weights) and MXFP4 (Kimi-K3-class), with matmuls that keep the blocks in the mmap instead of materialising f32 |
+| **GGUF support** | Llama/Mistral/Mixtral, Gemma 1–3, GLM-4, LFM2, Phi-2, Phi-3, every Qwen generation (Qwen 1, Qwen1.5/2/2.5 incl. MoE, Qwen2/2.5-VL and Qwen3-VL text, Qwen3, Qwen3-MoE, Qwen3-Next, Qwen3.5 dense/MoE, Qwen3.8-Flash-Next / `qwen4exp`, Bonsai 1-bit / 2-bit), DeepSeek-MoE, DeepSeek-V2/V2.5/V3/R1, DeepSeek-V4, Kimi-K2 (dense DeepSeek-LLM / Coder / R1-Distill load as `llama` / `qwen2`) |
+| **Exotic quant dtypes** | In-mapping decoders for IQ2_XXS (DeepSeek-V4's 2.0625-bit expert weights), MXFP4 (Kimi-K3-class) and Q1_0 / Q2_0 (Bonsai's 1-bit and 2-bit weights), with matmuls that keep the blocks in the mmap instead of materialising f32 — one generic `RawBlock` layer, so any native loader reads any of them |
 | **Fused SIMD kernels** | AVX2 dequant+dot fusion for Q8_0/Q2_K/Q4_K and parallel SIMD quantized matmuls on x86-64 |
 | **Chat templates** | Renders the model's own `tokenizer.chat_template` from the GGUF (Jinja via pure-Rust minijinja); ChatML fallback |
 | **Tool calling** | OpenAI-compatible `tools` / `tool_calls`, parsing Hermes/Qwen, Mistral, and Llama-3 call formats |
@@ -664,7 +664,7 @@ the matching pure-Rust candle loader.  Currently supported architectures:
 | `qwen2` | Qwen1.5, Qwen2, Qwen2.5 |
 | `qwen2moe` | Qwen1.5-MoE, Qwen2-57B-A14B (gated shared expert) |
 | `qwen2vl` | Qwen2-VL, Qwen2.5-VL (text decoder, M-RoPE) |
-| `qwen3` | Qwen3 (dense) |
+| `qwen3` | Qwen3 (dense), Bonsai (Q1_0 / Q2_0 weights) |
 | `qwen3moe` | Qwen3 mixture-of-experts, Qwen3-Coder |
 | `qwen3vl` / `qwen3vlmoe` | Qwen3-VL dense / MoE (text decoder, interleaved M-RoPE) |
 | `qwen3next` | Qwen3-Next (Gated DeltaNet + gated attention hybrid, MoE) |
@@ -700,8 +700,8 @@ Sinkhorn-normalised per-token weights, CSA/HCA compressor layers pool blocks of
 stay quantized as IQ2_XXS trellis blocks decoded in-mapping during the matmul,
 so a 162 B model keeps its on-disk footprint. Activations run in f32 on CPU.
 
-Every Qwen architecture except the dense `qwen2` / `qwen3` (candle's
-loaders) goes through Joshua's own `quantized_qwen` loader: one decoder layer
+Every Qwen architecture except the dense `qwen2` (candle's loader) goes
+through Joshua's own `quantized_qwen` loader: one decoder layer
 whose parts are optional — fused or split QKV with biases, per-head Q/K norm,
 the Qwen3-Next generation's sigmoid output gate and partial RoPE, dense or
 MoE FFN with a sigmoid-gated shared expert, and Gated DeltaNet linear
@@ -716,8 +716,13 @@ and each query attends only to its best `indexer.top_k` cells plus its
 incomplete tail block — dense until the context outgrows that budget), and
 PLE n-gram hash embeddings (each token hashes its preceding n-grams into
 rows of a shared table, gated into every stream through a dilated causal
-conv).  Each architecture's logits are pinned to an independent NumPy
-transcription of llama.cpp's graphs.  Recurrent layers cannot rewind to an arbitrary prefix, so Qwen3-Next
+conv).  Bonsai models are `qwen3` GGUFs in the 1-bit Q1_0 (`±d` per
+element, 128-element blocks) and 2-bit Q2_0 (`{-1, 0, 1, 2}·d`, 64-element
+blocks) formats candle cannot parse; the native loaders read such tensors
+from the raw GGUF header, borrowing the blocks from the mapping and decoding
+them inside an f32-activation matmul (on an accelerator, or without a
+mapping, they are decoded to f32 at load).  Each architecture's logits are
+pinned to an independent NumPy transcription of llama.cpp's graphs.  Recurrent layers cannot rewind to an arbitrary prefix, so Qwen3-Next
 and Qwen3.5 re-prefill on edited contexts instead of truncating.  Not
 loadable: `qwen3tts` (speech codec output) and `rwkv6qwen2` (an RWKV-6
 distillation, not a Qwen decoder).

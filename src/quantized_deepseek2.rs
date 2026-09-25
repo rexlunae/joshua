@@ -47,6 +47,7 @@ use candle_transformers::quantized_nn::RmsNorm;
 
 use crate::attention::{cached_attention, KvCache, Rope, RopeStyle};
 use crate::gguf_meta::Meta;
+use crate::tensor_source::TensorSource;
 use crate::moe::{topk_indices, topk_values};
 use crate::token_embedding::TokenEmbedding;
 use crate::yarn::YarnConfig;
@@ -765,58 +766,41 @@ pub type ModelWeights = crate::native_session::Session<Weights>;
 
 /// Small GGUF reader over the memory-mapped file.
 struct Reader<R: Read + Seek> {
-    ct: gguf_file::Content,
-    reader: R,
-    device: Device,
+    /// The tensors themselves (raw-header formats, mmap borrow, or copy),
+    /// with the dense `device` and the architecture name (`deepseek` or
+    /// `deepseek2`).
+    src: TensorSource<R>,
     /// Device the routed-expert tensors are built on.  Same as `device` for
     /// a CPU model or when the experts are uploaded; the CPU when the model
     /// runs on an accelerator that cannot hold the expert pool (see
     /// [`crate::placement::ExpertPlacement`]) — each expert is then borrowed
     /// from the mapping and [`Moe::dispatch`] hops the activations across.
     expert_device: Device,
-    /// When present, tensors are borrowed in place from this mapping instead
-    /// of being copied onto the heap (see [`crate::mmap_tensor`]).  This is
-    /// what makes a model far larger than RAM loadable: pages fault in only
-    /// as weights are actually touched.
-    mmap: Option<std::sync::Arc<memmap2::Mmap>>,
     /// Bytes of the bounded VRAM expert cache (#62) to build for each MoE
     /// block (`None` / `Some(0)` disables); `load_moe` reads it.
     device_expert_cache_bytes: Option<u64>,
-    /// `general.architecture` (`deepseek` or `deepseek2`), for error context.
-    arch: &'static str,
+}
+
+impl<R: Read + Seek> std::ops::Deref for Reader<R> {
+    type Target = TensorSource<R>;
+    fn deref(&self) -> &TensorSource<R> {
+        &self.src
+    }
+}
+
+impl<R: Read + Seek> std::ops::DerefMut for Reader<R> {
+    fn deref_mut(&mut self) -> &mut TensorSource<R> {
+        &mut self.src
+    }
 }
 
 impl<R: Read + Seek> Reader<R> {
-    fn qtensor(&mut self, name: &str) -> Result<QTensor> {
-        if let Some(mmap) = &self.mmap {
-            return crate::mmap_tensor::qtensor_from_mmap(
-                &self.ct,
-                mmap,
-                &mut self.reader,
-                name,
-                &self.device,
-            );
-        }
-        self.ct.tensor(&mut self.reader, name, &self.device)
-    }
-    fn qmatmul(&mut self, name: &str) -> Result<QMatMul> {
-        QMatMul::from_qtensor(self.qtensor(name)?)
-    }
     fn qmatmul_opt(&mut self, name: &str) -> Option<QMatMul> {
         if self.has(name) {
             self.qmatmul(name).ok()
         } else {
             None
         }
-    }
-    fn rms_norm(&mut self, name: &str, eps: f64) -> Result<RmsNorm> {
-        RmsNorm::from_qtensor(self.qtensor(name)?, eps)
-    }
-    fn f32_tensor(&mut self, name: &str) -> Result<Tensor> {
-        self.qtensor(name)?.dequantize(&self.device)?.to_dtype(DType::F32)
-    }
-    fn has(&self, name: &str) -> bool {
-        self.ct.tensor_infos.contains_key(name)
     }
     /// A dense SwiGLU block: `{p}.ffn_{gate,up,down}{suffix}.weight`
     /// (`suffix` is `""` for a dense layer, `"_shexp"` for shared experts).
@@ -900,7 +884,7 @@ impl ModelWeights {
         device: &Device,
         mmap: Option<std::sync::Arc<memmap2::Mmap>>,
     ) -> Result<Self> {
-        Self::from_gguf_mmap_placed(ct, reader, device, device, mmap, None)
+        Self::from_gguf_mmap_placed(ct, None, reader, device, device, mmap, None)
     }
 
     /// [`ModelWeights::from_gguf_mmap`] with an explicit device for the
@@ -914,8 +898,12 @@ impl ModelWeights {
     /// model larger than the device's memory (see
     /// [`crate::placement::ExpertPlacement`]).  Any other `expert_device`
     /// must equal `device`.
+    ///
+    /// `raw` is the header with raw dtype ids (see [`crate::gguf_ext`]),
+    /// carrying the tensors in formats candle cannot name.
     pub fn from_gguf_mmap_placed<R: Read + Seek>(
         ct: gguf_file::Content,
+        raw: Option<crate::gguf_ext::GgufHeader>,
         reader: &mut R,
         device: &Device,
         expert_device: &Device,
@@ -935,13 +923,16 @@ impl ModelWeights {
         // The Content owns metadata; move it into our reader together with the
         // underlying file handle (borrowed for the lifetime of the load).
         let mut rd = Reader {
-            ct,
-            reader,
-            device: device.clone(),
+            src: TensorSource {
+                ct,
+                raw,
+                reader,
+                device: device.clone(),
+                mmap,
+                arch,
+            },
             expert_device: expert_device.clone(),
-            mmap,
             device_expert_cache_bytes,
-            arch,
         };
 
         // Kept quantized: dequantizing the table to f32 costs vocab × hidden
@@ -1153,7 +1144,7 @@ fn split_experts<R: Read + Seek>(
     name: &str,
     n_expert: usize,
 ) -> Result<Vec<ExpertWeight>> {
-    let et = crate::moe::ExpertTensor::lookup(&rd.ct, rd.arch, name, n_expert)?;
+    let et = rd.expert_tensor(name, n_expert)?;
     let host_experts = rd.expert_device.is_cpu();
     let uploaded = |qt: QTensor| -> Result<ExpertWeight> {
         Ok(ExpertWeight {
@@ -1193,7 +1184,7 @@ fn split_experts<R: Read + Seek>(
     }
 
     // No mapping (streamed load) or a tensor that cannot be sliced.
-    et.read_and_split(&rd.ct, &mut rd.reader, rd.arch, &rd.expert_device)?
+    et.read_and_split(&rd.src.ct, &mut rd.src.reader, rd.src.arch, &rd.expert_device)?
         .into_iter()
         .map(uploaded)
         .collect()

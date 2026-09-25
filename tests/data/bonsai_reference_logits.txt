@@ -1,0 +1,6 @@
+# Last-position logits for tokens [1, 4, 2, 7, 5, 9] on the tiny
+# `common::write_tiny_bonsai_gguf` fixture (qwen3 with Q1_0 / Q2_0 weights),
+# computed by an independent float64 NumPy transcription of llama.cpp's
+# src/models/qwen3.cpp graph, with the blocks decoded per ggml-quants.c's
+# dequantize_row_q1_0 / dequantize_row_q2_0.
+bonsai -1.430107480e+00 1.357177646e-01 -5.553745493e-01 -5.864555466e-01 -4.752079661e-01 -4.546346154e-01 1.104393854e+00 9.649880906e-01 -3.374403695e-01 -3.350505579e-01 -1.031464917e+00 9.582000660e-01 9.939741767e-01 7.379149788e-01 5.946755427e-02 1.171212394e+00

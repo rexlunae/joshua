@@ -33,7 +33,7 @@
 //! `llama_model_deepseek4` (`/tmp/deepseek4.cpp`, `/tmp/kv-dsv4.cpp`).
 
 use std::borrow::Cow;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek};
 use std::sync::Arc;
 
 use candle_core::quantized::{gguf_file, GgmlDType, QMatMul, QStorage, QTensor};
@@ -44,6 +44,7 @@ use candle_transformers::quantized_nn::RmsNorm;
 use crate::gguf_ext::GgufHeader;
 use crate::gguf_meta::Meta;
 use crate::yarn::YarnConfig;
+use crate::raw_block::RawBlock;
 
 const HCA_RATIO: usize = 128;
 const CSA_RATIO: usize = 4;
@@ -2329,64 +2330,33 @@ impl<R: Read + Seek> Reader<R> {
     fn qtensor(&mut self, name: &str) -> Result<QTensor> {
         // Tensors candle cannot represent never make it into `ct`; borrow them
         // from the mapping (or read + decode) using the raw header instead.
-        let raw_info = self.raw.as_ref().and_then(|r| r.tensors.get(name)).cloned();
-        if let Some(info) = raw_info {
-            if !crate::gguf_ext::is_candle_supported(info.dtype) {
-                let tensor_data_offset = self
-                    .raw
-                    .as_ref()
-                    .map(|r| r.tensor_data_offset)
-                    .unwrap_or(self.ct.tensor_data_offset);
-                // Borrowing yields CPU-backed `QStorage`, so it is only sound
-                // when the model itself lives on the CPU.
-                if let Some(mmap) = self.mmap.as_ref().filter(|_| self.device.is_cpu()) {
-                    if let Some(qt) = crate::mmap_tensor::borrowed_qtensor_raw(
-                        mmap,
-                        info.dtype,
-                        info.offset,
-                        tensor_data_offset,
-                        info.dims.clone().into(),
-                    )? {
-                        return Ok(qt);
-                    }
-                }
-                // Accelerator devices cannot borrow (the blocks are CPU
-                // storage), and decoding a routed-expert IQ2_XXS tensor to f32
-                // is an order-of-magnitude memory blow-up (the experts alone
-                // are ~40 GB of 2-bit data, ~640 GB as f32).  Routed experts
-                // therefore stay on the CPU (the design always keeps the
-                // expert pool in host RAM on an accelerator via `expert_device`).
-                // Dense (non-expert) raw-dtype tensors, in contrast, are small
-                // enough (~GiB) to dequantize onto the accelerator, so we let
-                // those fall through to the decode-to-f32-on-device path below
-                // (M4: dense set on OpenCl).
+        if let Some(raw) = &self.raw {
+            // Accelerator devices cannot borrow (the blocks are CPU storage),
+            // and decoding a routed-expert IQ2_XXS tensor to f32 is an
+            // order-of-magnitude memory blow-up (the experts alone are ~40 GB
+            // of 2-bit data, ~640 GB as f32), so routed experts stay on the
+            // CPU (the design always keeps the expert pool in host RAM on an
+            // accelerator via `expert_device`).  Dense raw-dtype tensors are
+            // small enough (~GiB) to dequantize onto the accelerator (M4:
+            // dense set on OpenCl).  A streamed CPU load decodes to f32 too —
+            // only practical for small models; the mmap path is the
+            // production one.
+            let raw_only = raw
+                .tensors
+                .get(name)
+                .filter(|i| !crate::gguf_ext::is_candle_supported(i.dtype));
+            if let Some(info) = raw_only {
                 if !self.device.is_cpu() && is_routed_expert(name) {
                     candle_core::bail!(
                         "deepseek4: tensor `{name}` has GGUF dtype {} which is only supported on the CPU device (routed expert)",
                         info.dtype
                     );
                 }
-                // No mapping (CPU): decode the weights to f32 and re-quantize
-                // as F32 so the QMatMul machinery downstream keeps working
-                // unchanged.  This is also what makes the streamed path agree
-                // with the mmap path: both end up with f32-activation matmul
-                // semantics (candle's own `k_quants::matmul` quantizes
-                // activations to Q8_0, which would diverge by ~1% per layer).
-                // Note the memory cost: a real IQ2_XXS expert tensor (~40 GB
-                // across the model) becomes ~640 GB as f32, so the streamed
-                // path is only practical for small models — the mmap path is
-                // the production one.
-                let bytes = self.raw_bytes_from(name)?;
-                if let Some(f32s) =
-                    crate::quant_matmul::decode_raw_to_f32(info.dtype, &bytes, info.elem_count())?
-                {
-                    let t = Tensor::from_vec(f32s, info.dims.clone(), &self.device)?;
-                    return QTensor::quantize(&t, GgmlDType::F32);
-                }
-                candle_core::bail!(
-                    "deepseek4: tensor `{name}` has GGUF dtype {} which has no decoder here",
-                    info.dtype
-                );
+            }
+            if let Some(qt) =
+                raw.load_raw_only(name, self.mmap.as_ref(), &mut self.reader, &self.device)?
+            {
+                return Ok(qt);
             }
         }
         if let Some(mmap) = &self.mmap {
@@ -2429,28 +2399,10 @@ impl<R: Read + Seek> Reader<R> {
     /// Read a tensor's raw bytes from the underlying reader using the raw
     /// header (works for dtypes candle cannot describe).
     fn raw_bytes_from(&mut self, name: &str) -> Result<Vec<u8>> {
-        let (offset, tensor_data_offset, size) =
-            {
-                let raw = self.raw.as_ref().ok_or_else(|| {
-                    candle_core::Error::Msg(format!("no raw header for `{name}`"))
-                })?;
-                let info = raw.tensors.get(name).ok_or_else(|| {
-                    candle_core::Error::Msg(format!("deepseek4: tensor `{name}` not in raw header"))
-                })?;
-                let size = crate::gguf_ext::type_size_bytes(info.dtype, info.elem_count())
-                    .ok_or_else(|| {
-                        candle_core::Error::Msg(format!(
-                            "deepseek4: no size known for GGUF dtype {}",
-                            info.dtype
-                        ))
-                    })?;
-                (info.offset, raw.tensor_data_offset, size)
-            };
-        self.reader
-            .seek(SeekFrom::Start(tensor_data_offset + offset))?;
-        let mut buf = vec![0u8; size];
-        self.reader.read_exact(&mut buf)?;
-        Ok(buf)
+        match &self.raw {
+            Some(raw) => raw.read_tensor_bytes(&mut self.reader, name),
+            None => candle_core::bail!("deepseek4: no raw header for `{name}`"),
+        }
     }
 
     /// Load an I32 tensor (GGUF dtype 26) as f32.  Used for the routed-expert
@@ -3819,9 +3771,10 @@ impl ModelWeights {
     }
 }
 
-/// Slice an IQ2_XXS expert tensor (`[n_expert, out, in]`, GGUF dims reversed)
-/// into per-expert [`QMatMul`]s whose blocks stay in the mapping.
-fn split_mxfp4_experts<R: Read + Seek>(
+/// Slice a [`RawBlock`] expert tensor (`[n_expert, out, in]`, GGUF dims
+/// reversed; IQ2_XXS or MXFP4 in the released GGUFs) into per-expert
+/// [`QMatMul`]s whose blocks stay in the mapping.
+fn split_raw_experts<B: RawBlock, R: Read + Seek>(
     rd: &mut Reader<R>,
     name: &str,
     info: &crate::gguf_ext::RawTensorInfo,
@@ -3835,14 +3788,13 @@ fn split_mxfp4_experts<R: Read + Seek>(
     }
     let (out, inn) = (dims[1], dims[2]);
     let per_elems = out * inn;
-    let mxfp4_block = std::mem::size_of::<crate::mxfp4::BlockMxfp4>();
-    if !per_elems.is_multiple_of(crate::mxfp4::QK_MXFP4) {
+    let Some(per_bytes) = crate::raw_block::size_bytes::<B>(per_elems) else {
         candle_core::bail!(
-            "deepseek4: MXFP4 expert `{name}` rows {out}x{inn} are not a multiple of {}",
-            crate::mxfp4::QK_MXFP4
+            "deepseek4: {} expert `{name}` rows {out}x{inn} are not a multiple of {}",
+            B::NAME,
+            B::QK
         );
-    }
-    let per_bytes = per_elems / crate::mxfp4::QK_MXFP4 * mxfp4_block;
+    };
     let tensor_data_offset = rd
         .raw
         .as_ref()
@@ -3853,115 +3805,20 @@ fn split_mxfp4_experts<R: Read + Seek>(
     // A borrow is `QStorage::Cpu` by construction, so it is only taken when
     // the experts' home device is the CPU — which it is for every mapped
     // model, including one whose dense set runs on an accelerator (see
-    // `Reader::expert_device`).  Otherwise decode to f32 and copy onto
-    // `rd.expert_device` below.
+    // `Reader::expert_device`); it is also the source the device expert
+    // cache uploads an active expert's blocks from.
     if let Some(mmap) = rd.mmap.as_ref().filter(|_| rd.expert_device.is_cpu()) {
         let base = tensor_data_offset.saturating_add(info.offset) as usize;
         let mut experts = Vec::with_capacity(n_expert);
         for e in 0..n_expert {
-            match crate::mmap_tensor::borrowed_range_mxfp4(
-                mmap,
-                base + e * per_bytes,
-                (out, inn).into(),
-            )? {
+            let at = base + e * per_bytes;
+            match crate::mmap_tensor::borrowed_range_raw::<B>(mmap, at, (out, inn).into())? {
                 Some(qt) => experts.push(ExpertTensor {
                     qmatmul: QMatMul::from_qtensor(qt)?,
-                    prefetch: crate::mmap_tensor::prefetch_handle_mxfp4(
+                    prefetch: crate::mmap_tensor::prefetch_handle_raw::<B>(
                         mmap,
-                        base + e * per_bytes,
-                        per_elems / crate::mxfp4::QK_MXFP4,
-                    ),
-                }),
-                None => {
-                    experts.clear();
-                    break;
-                }
-            }
-        }
-        if experts.len() == n_expert {
-            return Ok(experts);
-        }
-        tracing::warn!("deepseek4: could not borrow `{name}` from the mapping, decoding to f32");
-    }
-
-    // The fallback below materializes the whole stacked tensor as f32 — an
-    // order-of-magnitude blow-up for real model footprints (~9 GB of 4-bit
-    // data per stacked tensor becomes ~140 GB), and accelerator devices cannot
-    // borrow the blocks (they are CPU storage).  Refuse loudly rather than OOM.
-    if !rd.expert_device.is_cpu() {
-        candle_core::bail!(
-            "deepseek4: MXFP4 expert tensor `{name}` is only supported on the CPU device"
-        );
-    }
-
-    // No mapping (or borrow declined): decode the whole tensor to f32 and hand
-    // each expert over as an f32 QMatMul.  Only reachable in tests for the
-    // production footprint of these tensors.
-    let bytes = rd.raw_bytes_from(name)?;
-    let blocks = crate::mxfp4::blocks_from_bytes(&bytes)?;
-    let mut all = vec![0f32; info.elem_count()];
-    crate::mxfp4::dequantize(blocks, &mut all)?;
-    let mut experts = Vec::with_capacity(n_expert);
-    for e in 0..n_expert {
-        let t = Tensor::from_vec(
-            all[e * per_elems..(e + 1) * per_elems].to_vec(),
-            (out, inn),
-            &rd.expert_device,
-        )?;
-        experts.push(ExpertTensor {
-            qmatmul: QMatMul::from_qtensor(QTensor::quantize(&t, GgmlDType::F32)?)?,
-            prefetch: None,
-        });
-    }
-    Ok(experts)
-}
-
-fn split_iq2xxs_experts<R: Read + Seek>(
-    rd: &mut Reader<R>,
-    name: &str,
-    info: &crate::gguf_ext::RawTensorInfo,
-    n_expert: usize,
-) -> Result<Vec<ExpertTensor>> {
-    let dims = info.dims.clone();
-    if dims.len() != 3 || dims[0] != n_expert {
-        candle_core::bail!(
-            "deepseek4: expected expert tensor `{name}` shaped [n_expert, out, in], got {dims:?}"
-        );
-    }
-    let (out, inn) = (dims[1], dims[2]);
-    let per_elems = out * inn;
-    if !per_elems.is_multiple_of(crate::iq2xxs::QK_IQ2_XXS) {
-        candle_core::bail!(
-            "deepseek4: IQ2_XXS expert `{name}` rows {out}x{inn} are not a multiple of {}",
-            crate::iq2xxs::QK_IQ2_XXS
-        );
-    }
-    let per_bytes = per_elems / crate::iq2xxs::QK_IQ2_XXS * crate::iq2xxs::BLOCK_BYTES;
-    let tensor_data_offset = rd
-        .raw
-        .as_ref()
-        .map(|r| r.tensor_data_offset)
-        .unwrap_or(rd.ct.tensor_data_offset);
-
-    // Zero-copy: one borrowed QTensor per expert, pointing into the mapping.
-    // The borrow is `QStorage::Cpu` by construction and is the source of
-    // truth for both the host path and the device expert cache (which
-    // uploads an active expert's blocks from the same bytes).
-    if let Some(mmap) = rd.mmap.as_ref().filter(|_| rd.expert_device.is_cpu()) {
-        let base = tensor_data_offset.saturating_add(info.offset) as usize;
-        let mut experts = Vec::with_capacity(n_expert);
-        for e in 0..n_expert {
-            match crate::mmap_tensor::borrowed_range_iq2xxs(
-                mmap,
-                base + e * per_bytes,
-                (out, inn).into(),
-            )? {
-                Some(qt) => experts.push(ExpertTensor {
-                    qmatmul: QMatMul::from_qtensor(qt)?,
-                    prefetch: crate::mmap_tensor::prefetch_handle_iq2xxs(
-                        mmap,
-                        base + e * per_bytes,
-                        per_elems / crate::iq2xxs::QK_IQ2_XXS,
+                        at,
+                        per_elems / B::QK,
                     ),
                 }),
                 None => {
@@ -3982,17 +3839,15 @@ fn split_iq2xxs_experts<R: Read + Seek>(
     // blocks (they are CPU storage).  Refuse loudly rather than OOM.
     if !rd.expert_device.is_cpu() {
         candle_core::bail!(
-            "deepseek4: IQ2_XXS expert tensor `{name}` is only supported on the CPU device"
+            "deepseek4: {} expert tensor `{name}` is only supported on the CPU device",
+            B::NAME
         );
     }
 
     // No mapping (or borrow declined): decode the whole tensor to f32 and hand
     // each expert over as an f32 QMatMul.  Only reachable in tests for the
     // production footprint of these tensors.
-    let bytes = rd.raw_bytes_from(name)?;
-    let blocks = crate::iq2xxs::blocks_from_bytes(&bytes)?;
-    let mut all = vec![0f32; info.elem_count()];
-    crate::iq2xxs::dequantize(blocks, &mut all)?;
+    let all = crate::raw_block::decode_bytes::<B>(&rd.raw_bytes_from(name)?, info.elem_count())?;
     let mut experts = Vec::with_capacity(n_expert);
     for e in 0..n_expert {
         let t = Tensor::from_vec(
@@ -4287,18 +4142,16 @@ fn split_experts<R: Read + Seek>(
     name: &str,
     n_expert: usize,
 ) -> Result<Vec<ExpertTensor>> {
-    // IQ2_XXS expert tensors (how DeepSeek-V4-Flash GGUFs store gate/up):
-    // candle cannot represent the dtype, so slice per-expert block ranges
-    // straight out of the mapping and let `crate::iq2xxs` decode at matmul
-    // time.  Only falls back to a full f32 decode when there is no mapping
-    // (tests).
+    // Raw block expert tensors (IQ2_XXS is how DeepSeek-V4-Flash GGUFs store
+    // gate/up): candle cannot represent the dtype, so slice per-expert block
+    // ranges straight out of the mapping and decode at matmul time.  Only
+    // falls back to a full f32 decode when there is no mapping (tests).
     let raw_info = rd.raw.as_ref().and_then(|r| r.tensors.get(name)).cloned();
     if let Some(info) = raw_info {
-        if info.dtype == crate::iq2xxs::GGML_TYPE_IQ2_XXS {
-            return split_iq2xxs_experts(rd, name, &info, n_expert);
-        }
-        if info.dtype == crate::mxfp4::GGML_TYPE_MXFP4 {
-            return split_mxfp4_experts(rd, name, &info, n_expert);
+        if let Some(experts) = crate::with_raw_block!(info.dtype, B => {
+            split_raw_experts::<B, R>(rd, name, &info, n_expert)
+        }) {
+            return experts;
         }
     }
     // Read the shape and dtype straight from the header instead of

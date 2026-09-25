@@ -533,7 +533,8 @@ mod synthetic {
         let bytes = std::fs::read(&path).unwrap();
         let tokens: Vec<u32> = vec![1, 4, 2, 7, 5];
 
-        // Reference: candle's quantized generation model.
+        // Reference: the quantized generation model (candle's loader for
+        // llama / qwen2, Joshua's native Qwen loader for qwen3).
         let mut cursor = std::io::Cursor::new(&bytes[..]);
         let content = gguf_file::Content::read(&mut cursor).unwrap();
         let mut reference =

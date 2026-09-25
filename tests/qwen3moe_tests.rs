@@ -4,31 +4,14 @@
 
 mod common;
 
-use candle_core::{Device, Tensor};
+use common::logits;
 use joshua::model::{Architecture, QuantizedModel};
-use std::io::Cursor;
 use std::path::Path;
 
 fn load(model: &Path) -> QuantizedModel {
-    let bytes = std::fs::read(model).unwrap();
-    let mut cursor = Cursor::new(&bytes[..]);
-    let content = candle_core::quantized::gguf_file::Content::read(&mut cursor).unwrap();
-    QuantizedModel::from_gguf(content, &mut cursor, &Device::Cpu).unwrap()
+    common::load_model(model, false)
 }
 
-fn logits(model: &mut QuantizedModel, tokens: &[u32], offset: usize) -> Vec<f32> {
-    let input = Tensor::new(tokens, &Device::Cpu)
-        .unwrap()
-        .reshape((1, tokens.len()))
-        .unwrap();
-    model
-        .forward(&input, offset)
-        .unwrap()
-        .flatten_all()
-        .unwrap()
-        .to_vec1()
-        .unwrap()
-}
 
 #[test]
 fn qwen3moe_is_a_supported_architecture() {
@@ -99,25 +82,10 @@ fn qwen3moe_mmap_load_matches_heap_load() {
     common::write_tiny_qwen3moe_gguf(&model);
     let tokens = [1u32, 4, 2, 7, 5];
 
-    let bytes = std::fs::read(&model).unwrap();
-    let mut cursor = Cursor::new(&bytes[..]);
-    let content = candle_core::quantized::gguf_file::Content::read(&mut cursor).unwrap();
-    let mut heap = QuantizedModel::from_gguf(content, &mut cursor, &Device::Cpu).unwrap();
+    let mut heap = common::load_model(&model, false);
     let heap_logits = logits(&mut heap, &tokens, 0);
 
-    let mmap = unsafe { memmap2::Mmap::map(&std::fs::File::open(&model).unwrap()) }.unwrap();
-    let mut cursor = Cursor::new(&bytes[..]);
-    let content = candle_core::quantized::gguf_file::Content::read(&mut cursor).unwrap();
-    let mut mapped =
-        QuantizedModel::from_gguf_mmap(
-            content,
-            &mut cursor,
-            &Device::Cpu,
-            Some(std::sync::Arc::new(mmap)),
-            None,
-            0,
-        )
-        .unwrap();
+    let mut mapped = common::load_model(&model, true);
     let mapped_logits = logits(&mut mapped, &tokens, 0);
 
     assert_eq!(heap_logits.len(), mapped_logits.len());
@@ -166,7 +134,7 @@ fn qwen3moe_engine_detects_and_runs() {
     let mut data = Vec::new();
     use std::io::Read;
     file.read_to_end(&mut data).unwrap();
-    let mut cursor = Cursor::new(&data[..]);
+    let mut cursor = std::io::Cursor::new(&data[..]);
     let content = candle_core::quantized::gguf_file::Content::read(&mut cursor).unwrap();
     let arch = Architecture::detect(&content.metadata).unwrap();
     assert_eq!(arch, Architecture::Qwen3Moe);
