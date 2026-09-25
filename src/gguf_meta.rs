@@ -99,6 +99,13 @@ impl<'a> Meta<'a> {
         self.array(suffix, n, |v| v.to_u32().unwrap_or(0) as usize)
     }
 
+    /// A per-layer boolean array, truncated or `false`-padded to `n`
+    /// entries; `None` when the key is absent.
+    pub fn array_bool(&self, suffix: &str, n: usize) -> Option<Vec<bool>> {
+        self.contains(suffix)
+            .then(|| self.array(suffix, n, |v| v.to_bool().unwrap_or(false)))
+    }
+
     fn array<T: Default + Clone>(
         &self,
         suffix: &str,

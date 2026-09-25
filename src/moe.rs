@@ -1,6 +1,6 @@
 //! Building blocks shared by the mixture-of-experts loaders.
 //!
-//! `quantized_qwen3_moe` and `quantized_deepseek2` (and, for the parts that
+//! `quantized_qwen` and `quantized_deepseek2` (and, for the parts that
 //! apply, `quantized_deepseek4`) grew the same code side by side: the
 //! per-layer KV cache and its truncation, the causal mask, the routed
 //! expert dispatch with its host/device hop, and the slicing of a stacked
@@ -93,10 +93,43 @@ pub fn topk_indices(t: &Tensor, k: usize) -> Result<Tensor> {
         .contiguous()
 }
 
+/// Numerically stable `log(1 + exp(x))`.
+pub fn softplus(x: &Tensor) -> Result<Tensor> {
+    let e = x.abs()?.neg()?.exp()?;
+    x.maximum(0.0)?.add(&(e + 1.0)?.log()?)
+}
+
 /// Top-`k` values along the last dim (descending).
 pub fn topk_values(t: &Tensor, k: usize) -> Result<Tensor> {
     let idx = topk_indices(t, k)?;
     t.gather(&idx, D::Minus1)
+}
+
+// ─── Device expert cache helpers ─────────────────────────────────────────────
+
+/// Per-slot byte estimate for a routed expert in a
+/// [`crate::residency::DeviceResidency`] pool (the f32-dense form of a
+/// ~400k-element expert).  `QMatMul` hides the raw sizes, so this is a round
+/// heuristic; an overestimate only shrinks the reported capacity, never the
+/// correctness.
+pub const EXPERT_SLOT_BYTES_ESTIMATE: u64 = 400_000 * 4;
+
+/// Upload a quantized `QMatMul`'s blocks onto `device` (backend-generic via
+/// `QStorage::from_data` — CPU, Vulkan, Metal, OpenCL, CUDA).  `None` when
+/// the matmul is not a raw `QMatMul::QTensor` or the upload fails; the
+/// caller then keeps the host form for that expert (#62).
+pub fn upload_qmatmul(q: &candle_core::quantized::QMatMul, device: &Device) -> Option<candle_core::quantized::QMatMul> {
+    use candle_core::quantized::QMatMul;
+    let QMatMul::QTensor(qt) = q else {
+        return None;
+    };
+    if device.same_device(&qt.device()) {
+        return Some(q.clone());
+    }
+    let bytes = qt.data().ok()?;
+    let storage = QStorage::from_data(Cow::Borrowed(&bytes), device, qt.dtype()).ok()?;
+    let qt = QTensor::new(storage, qt.shape().clone()).ok()?;
+    Some(QMatMul::QTensor(Arc::new(qt)))
 }
 
 // ─── Routed-expert dispatch ──────────────────────────────────────────────────

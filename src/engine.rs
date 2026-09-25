@@ -1822,11 +1822,7 @@ impl Engine {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .as_ref()
-            .map(|m| match m {
-                QuantizedModel::Qwen3Moe(m) => m.shared_session_count(),
-                QuantizedModel::DeepSeek2(m) => m.shared_session_count(),
-                _ => 1,
-            })
+            .map(QuantizedModel::shared_session_count)
             .unwrap_or(0)
     }
 
@@ -3170,13 +3166,14 @@ fn probed_embedding_names(arch: Option<Architecture>) -> &'static [&'static str]
 
 /// Tensor-name stems (see [`tensor_stem`]) that a loader keeps as quantized
 /// `QMatMul` weights on an accelerator: the attention and feed-forward
-/// projections of the joshua-native loaders (`qwen3moe`, `deepseek2`,
-/// `deepseek4`) and the stock candle loaders (`llama` incl. Mixtral's
+/// projections of the joshua-native loaders (`quantized_qwen` incl. its
+/// Gated DeltaNet projections, `deepseek2`, `deepseek4`) and the stock
+/// candle loaders (`llama` incl. Mixtral's
 /// per-expert `ffn_gate.<i>` matrices, `gemma*`, `glm4`, `lfm2` with its
 /// `feed_forward.*` / `mlp.*_proj` / `shortconv.*_proj` aliases, `phi*`,
 /// `qwen2`, `qwen3`), and deepseek4's hyper-connection, indexer and
 /// compressor projections.
-const QUANTIZED_MATRIX_STEMS: [&str; 41] = [
+const QUANTIZED_MATRIX_STEMS: [&str; 47] = [
     "attn_q",
     "attn_k",
     "attn_v",
@@ -3218,16 +3215,24 @@ const QUANTIZED_MATRIX_STEMS: [&str; 41] = [
     "self_attn.k_proj",
     "self_attn.v_proj",
     "self_attn.out_proj",
+    "attn_gate",
+    "ssm_in",
+    "ssm_ba",
+    "ssm_beta",
+    "ssm_alpha",
+    "ssm_out",
 ];
 
 /// Tensor-name stems a loader is known to hold as dequantized f32 on an
 /// accelerator (besides norms and biases, matched by name): deepseek2's
 /// split-KV halves (folded into a dense up-projection), deepseek4's
-/// hyper-connection and compressor position vectors, lfm2's conv kernels.
+/// hyper-connection and compressor position vectors, lfm2's conv kernels,
+/// and the Qwen loader's DeltaNet conv kernels / decay rates and
+/// shared-expert gate vectors.
 /// The MoE router (`ffn_gate_inp`) is handled per architecture in
 /// [`residency`]: the joshua-native loaders read it with `f32_tensor`, the
 /// stock `llama` loader (Mixtral) keeps it a quantized `QMatMul`.
-const F32_STEMS: [&str; 11] = [
+const F32_STEMS: [&str; 14] = [
     "attn_k_b",
     "attn_v_b",
     "hc_attn_base",
@@ -3239,6 +3244,9 @@ const F32_STEMS: [&str; 11] = [
     "attn_compressor_ape",
     "indexer_compressor_ape",
     "shortconv.conv",
+    "ssm_conv1d",
+    "ssm_a",
+    "ffn_gate_inp_shexp",
 ];
 
 /// `name` without its `blk.<n>.` prefix, `.weight` suffix and any trailing
@@ -3299,7 +3307,7 @@ fn residency(
     if probed_embedding_names(Some(arch)).contains(&name) {
         // GGUF dtype ids: 0 = F32, 1 = F16, 30 = BF16.
         let float_dtype = matches!(info.dtype, 0 | 1 | 30);
-        return if arch.is_native_moe() && !float_dtype {
+        return if arch.is_native() && !float_dtype {
             Residency::Quantized
         } else {
             Residency::F32
@@ -3315,7 +3323,7 @@ fn residency(
     if stem == "ffn_gate_inp" {
         return match arch {
             Architecture::Llama => Residency::Quantized,
-            a if a.is_native_moe() => Residency::F32,
+            a if a.is_native() => Residency::F32,
             _ => Residency::Unknown,
         };
     }

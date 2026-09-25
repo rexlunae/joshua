@@ -23,7 +23,7 @@
 use std::io::{Read, Seek};
 
 use candle_core::quantized::{gguf_file, QMatMul, QTensor};
-use candle_core::{DType, Device, Module, Result, Tensor};
+use candle_core::{Device, Module, Result, Tensor};
 
 // ─── Configuration ──────────────────────────────────────────────────────────
 
@@ -100,9 +100,7 @@ pub struct EmbeddingModel {
     /// LM head, kept for logit-parity validation against candle's
     /// generation models (see [`EmbeddingModel::logits`]).
     output: QMatMul,
-    cos: Tensor,
-    sin: Tensor,
-    rope_is_neox: bool,
+    rope: crate::attention::Rope,
     qk_norm_eps: f64,
     n_head: usize,
     n_kv_head: usize,
@@ -195,7 +193,12 @@ impl EmbeddingModel {
             .map(|v| v as usize)
             .unwrap_or(4096)
             .min(32_768);
-        let (cos, sin) = precompute_freqs_cis(head_dim, rope_freq_base, max_seq, device)?;
+        let rope_style = if config.rope_is_neox {
+            crate::attention::RopeStyle::Neox
+        } else {
+            crate::attention::RopeStyle::Interleaved
+        };
+        let rope = crate::attention::Rope::new(head_dim, rope_freq_base, max_seq, rope_style, device)?;
 
         let pooling = match md
             .get(&format!("{arch}.pooling_type"))
@@ -276,9 +279,7 @@ impl EmbeddingModel {
             layers,
             output_norm,
             output,
-            cos,
-            sin,
-            rope_is_neox: config.rope_is_neox,
+            rope,
             qk_norm_eps: rms_eps,
             n_head,
             n_kv_head,
@@ -302,7 +303,7 @@ impl EmbeddingModel {
         let mut x = self.tok_embeddings.index_select(&input, 0)?.unsqueeze(0)?;
 
         let mask = if seq_len > 1 {
-            Some(causal_mask(seq_len, device)?)
+            Some(crate::moe::causal_mask(seq_len, 0, device)?)
         } else {
             None
         };
@@ -364,23 +365,11 @@ impl EmbeddingModel {
                 .reshape((b_sz, self.n_kv_head, seq_len, self.head_dim))?;
         }
 
-        let cos = self.cos.narrow(0, 0, seq_len)?;
-        let sin = self.sin.narrow(0, 0, seq_len)?;
-        let (q, k) = if self.rope_is_neox {
-            (
-                candle_nn::rotary_emb::rope(&q.contiguous()?, &cos, &sin)?,
-                candle_nn::rotary_emb::rope(&k.contiguous()?, &cos, &sin)?,
-            )
-        } else {
-            (
-                candle_nn::rotary_emb::rope_i(&q.contiguous()?, &cos, &sin)?,
-                candle_nn::rotary_emb::rope_i(&k.contiguous()?, &cos, &sin)?,
-            )
-        };
+        let (q, k) = self.rope.apply_pair(&q, &k, 0)?;
 
         // Grouped-query attention: repeat KV heads to match Q heads.
-        let k = repeat_kv(k, self.n_head / self.n_kv_head)?;
-        let v = repeat_kv(v, self.n_head / self.n_kv_head)?;
+        let k = crate::attention::repeat_kv(k, self.n_head / self.n_kv_head)?;
+        let v = crate::attention::repeat_kv(v, self.n_head / self.n_kv_head)?;
 
         let att = (q.matmul(&k.t()?)? / (self.head_dim as f64).sqrt())?;
         let att = match mask {
@@ -426,44 +415,3 @@ impl EmbeddingModel {
         self.output.forward(&last)?.squeeze(0)?.to_vec1::<f32>()
     }
 }
-
-// ─── Helpers ────────────────────────────────────────────────────────────────
-
-/// RoPE cos/sin tables, matching candle's `precomput_freqs_cis`.
-fn precompute_freqs_cis(
-    head_dim: usize,
-    freq_base: f32,
-    max_seq: usize,
-    device: &Device,
-) -> Result<(Tensor, Tensor)> {
-    let theta: Vec<f32> = (0..head_dim)
-        .step_by(2)
-        .map(|i| 1f32 / freq_base.powf(i as f32 / head_dim as f32))
-        .collect();
-    let theta = Tensor::new(theta.as_slice(), device)?;
-    let idx_theta = Tensor::arange(0, max_seq as u32, device)?
-        .to_dtype(DType::F32)?
-        .reshape((max_seq, 1))?
-        .matmul(&theta.reshape((1, theta.elem_count()))?)?;
-    Ok((idx_theta.cos()?, idx_theta.sin()?))
-}
-
-/// Additive causal mask: 0 on/below the diagonal, −∞ above.
-fn causal_mask(seq_len: usize, device: &Device) -> Result<Tensor> {
-    let mask: Vec<f32> = (0..seq_len)
-        .flat_map(|i| (0..seq_len).map(move |j| if j > i { f32::NEG_INFINITY } else { 0.0 }))
-        .collect();
-    Tensor::from_vec(mask, (1, 1, seq_len, seq_len), device)
-}
-
-/// Repeat KV heads `n_rep` times along the head axis (GQA).
-fn repeat_kv(x: Tensor, n_rep: usize) -> Result<Tensor> {
-    if n_rep == 1 {
-        return Ok(x);
-    }
-    let (b, n_kv, seq, hd) = x.dims4()?;
-    x.unsqueeze(2)?
-        .expand((b, n_kv, n_rep, seq, hd))?
-        .reshape((b, n_kv * n_rep, seq, hd))
-}
-

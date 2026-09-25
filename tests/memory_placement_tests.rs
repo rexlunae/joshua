@@ -214,12 +214,7 @@ fn derived_sessions_share_weights_and_isolate_kv() {
         assert!(template.supports_shared_weights(), "{name}");
         let mut a = template.new_session().expect("shares weights");
         let mut b = template.new_session().expect("shares weights");
-        let count = match &template {
-            QuantizedModel::Qwen3Moe(m) => m.shared_session_count(),
-            QuantizedModel::DeepSeek2(m) => m.shared_session_count(),
-            QuantizedModel::DeepSeek4(m) => m.shared_session_count(),
-            _ => unreachable!(),
-        };
+        let count = template.shared_session_count();
         assert_eq!(
             count, 3,
             "{name}: template + 2 sessions share one weight set"

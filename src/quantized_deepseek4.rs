@@ -45,13 +45,6 @@ use crate::gguf_ext::GgufHeader;
 use crate::gguf_meta::Meta;
 use crate::yarn::YarnConfig;
 
-/// Numerically stable `log(1 + exp(x))`.
-fn softplus(x: &Tensor) -> Result<Tensor> {
-    let ax = x.abs()?;
-    let e = ax.neg()?.exp()?;
-    x.maximum(0.0)?.add(&(e + 1.0)?.log()?)
-}
-
 const HCA_RATIO: usize = 128;
 const CSA_RATIO: usize = 4;
 /// Hard cap on the KV context (and rope tables) per model instance.
@@ -204,78 +197,21 @@ impl Config {
 // scaling (matches llama.cpp `build_csa_attention` and the official python,
 // which passes `original_seq_len = 0` for raw layers).
 
-struct RotaryEmbedding {
-    sin: Tensor,
-    cos: Tensor,
+type RotaryEmbedding = crate::attention::Rope;
+
+/// The interleaved RoPE table for `base`, YaRN-scaled when `yarn` (with the
+/// model's yarn config).  Table covers token positions `[0, max_seq)`.
+fn rope_table(cfg: &Config, dev: &Device, base: f32, yarn: bool, max_seq: usize) -> Result<RotaryEmbedding> {
+    let dim = cfg.rope_head_dim;
+    let (inv_freq, mscale) = match cfg.yarn.as_ref().filter(|_| yarn) {
+        Some(y) => (crate::yarn::inv_freq(dim, base, y), y.mscale()),
+        None => {
+            assert!(!yarn, "yarn rope requested without yarn config");
+            (crate::attention::inv_freq(dim, base), 1.0)
+        }
+    };
+    RotaryEmbedding::from_inv_freq(inv_freq, max_seq, mscale, crate::attention::RopeStyle::Interleaved, dev)
 }
-
-impl RotaryEmbedding {
-    /// `base`: rope base; `yarn`: enable YaRN interpolation with the model's
-    /// yarn config.  Table covers token positions `[0, max_seq)`.
-    fn new(cfg: &Config, dev: &Device, base: f32, yarn: bool, max_seq: usize) -> Result<Self> {
-        let dim = cfg.rope_head_dim;
-        let (inv_freq, mscale) = match cfg.yarn.as_ref().filter(|_| yarn) {
-            Some(y) => (crate::yarn::inv_freq(dim, base, y), y.mscale()),
-            None => {
-                assert!(!yarn, "yarn rope requested without yarn config");
-                let inv_freq = (0..dim)
-                    .step_by(2)
-                    .map(|i| 1f32 / base.powf(i as f32 / dim as f32))
-                    .collect();
-                (inv_freq, 1.0)
-            }
-        };
-        Self::from_inv_freq(inv_freq, max_seq, mscale, dev)
-    }
-
-    fn from_inv_freq(
-        inv_freq: Vec<f32>,
-        max_seq: usize,
-        mscale: f32,
-        dev: &Device,
-    ) -> Result<Self> {
-        let n = inv_freq.len();
-        let inv_freq = Tensor::from_vec(inv_freq, (1, n), dev)?;
-        let t = Tensor::arange(0u32, max_seq as u32, dev)?
-            .to_dtype(DType::F32)?
-            .reshape((max_seq, 1))?;
-        let freqs = t.matmul(&inv_freq)?;
-        let sin = (freqs.sin()? * mscale as f64)?;
-        let cos = (freqs.cos()? * mscale as f64)?;
-        Ok(Self { sin, cos })
-    }
-
-    /// Apply interleaved RoPE to a `[b, heads, seq, rope_dim]` tensor.
-    fn apply(&self, x: &Tensor, offset: usize, seq_len: usize) -> Result<Tensor> {
-        let sin = self.sin.narrow(0, offset, seq_len)?;
-        let cos = self.cos.narrow(0, offset, seq_len)?;
-        candle_nn::rotary_emb::rope_i(&x.contiguous()?, &cos, &sin)
-    }
-
-    /// Apply inverse interleaved RoPE (conjugate rotation) to a
-    /// `[b, heads, seq, rope_dim]` tensor, matching `ggml_rope_ext_back`.
-    fn apply_back(&self, x: &Tensor, offset: usize, seq_len: usize) -> Result<Tensor> {
-        let sin = self.sin.narrow(0, offset, seq_len)?;
-        let cos = self.cos.narrow(0, offset, seq_len)?;
-        candle_nn::rotary_emb::rope_i(&x.contiguous()?, &cos, &(&sin * -1.0)?)
-    }
-
-    /// Apply at explicit (compressed) positions: x is `[n, rope_dim]`,
-    /// `positions` are `[n]` u32 TOKEN positions of each row (block index
-    /// times the compression ratio), matching llama's `comp_pos` +
-    /// `ggml_rope_ext` with the compress rope.
-    fn apply_at(&self, x: &Tensor, positions: &Tensor) -> Result<Tensor> {
-        let n = x.dim(0)?;
-        let d = x.dim(1)?;
-        let x4 = x.reshape((n, 1, 1, d))?;
-        // rope_i accepts 3-D cos/sin as [b, t, d], one row per batch item.
-        let cos = self.cos.index_select(positions, 0)?.unsqueeze(1)?; // [n, 1, half]
-        let sin = self.sin.index_select(positions, 0)?.unsqueeze(1)?;
-        let out = candle_nn::rotary_emb::rope_i(&x4.contiguous()?, &cos, &sin)?;
-        out.reshape((n, d))
-    }
-}
-
 
 // ─── Linear helpers ─────────────────────────────────────────────────────────
 
@@ -1239,13 +1175,12 @@ fn rope_apply(
     offset: usize,
     back: bool,
 ) -> Result<Tensor> {
-    let seq = x4.dim(2)?;
     let nope = x4.narrow(3, 0, nope_dim)?;
     let pe = x4.narrow(3, nope_dim, rope_dim)?;
     let pe = if back {
-        rotary.apply_back(&pe, offset, seq)?
+        rotary.apply_inverse(&pe, offset)?
     } else {
-        rotary.apply(&pe, offset, seq)?
+        rotary.apply(&pe, offset)?
     };
     Tensor::cat(&[nope, pe], 3)
 }
@@ -1861,7 +1796,7 @@ impl Moe {
 
         let logits = x2.matmul(&self.gate_t)?; // [n_tokens, n_expert]
                                                // sqrt(softplus(x)) scoring; bias shifts selection only.
-        let probs = softplus(&logits)?.sqrt()?;
+        let probs = crate::moe::softplus(&logits)?.sqrt()?;
         let (weights, indices) = if self.hash {
             // Hash layers: expert *selection* comes from tid2eid[token_id], but the
             // routing *weights* still come from the gate network's softplus scores
@@ -2774,7 +2709,7 @@ impl ModelWeights {
         // context config would otherwise allocate ~256 MB of sin/cos tables.
         let max_seq = cfg.context_length.min(KV_CAP);
         // Raw (window-only) layers: plain rope_theta, no YaRN.
-        let rotary_raw = Arc::new(RotaryEmbedding::new(
+        let rotary_raw = Arc::new(rope_table(
             &cfg,
             device,
             cfg.rope_theta,
@@ -2783,7 +2718,7 @@ impl ModelWeights {
         )?);
         // Compressed layers (CSA/HCA): compress_rope_freq_base + YaRN, used for
         // both the main q/kv and the compressed-KV rows.
-        let rotary_compress = Arc::new(RotaryEmbedding::new(
+        let rotary_compress = Arc::new(rope_table(
             &cfg,
             device,
             cfg.compress_rope_base,

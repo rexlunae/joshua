@@ -304,6 +304,41 @@ mod synthetic {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A recurrent (Gated DeltaNet) model can still *extend* its cached
+    /// state: a prompt that continues the cached history — including a
+    /// follow-up turn over the generated tokens — must reuse the state and
+    /// match a fresh engine exactly.
+    #[test]
+    fn kv_prefix_reuse_matches_fresh_engine_recurrent_qwen() {
+        use joshua::{types::GenerationOptions, Engine};
+
+        let dir = model_dir("tiny-qwen35-kv");
+        write_tiny_qwen_gguf(&dir.join("model.gguf"), "qwen35");
+        let greedy = |max_tokens| GenerationOptions {
+            max_tokens,
+            temperature: 0.0,
+            repetition_penalty: 1.0,
+            ..Default::default()
+        };
+
+        let warm = Engine::with_n_ctx(&dir, 64).expect("engine should load");
+        warm.complete_raw("hello a", &greedy(0)).unwrap();
+        let (warm_text, _, _, _) = warm.complete_raw("hello a b c", &greedy(3)).unwrap();
+        assert_eq!(warm.kv_reuse_count(), 1, "extension must reuse the recurrent state");
+        let fresh = Engine::with_n_ctx(&dir, 64).expect("engine should load");
+        let (fresh_text, _, _, _) = fresh.complete_raw("hello a b c", &greedy(3)).unwrap();
+        assert_eq!(warm_text, fresh_text, "state reuse must not change output");
+
+        // Follow-up turn over the generated tokens.
+        let follow = format!("hello a b c{warm_text} d");
+        let (warm2, _, _, _) = warm.complete_raw(&follow, &greedy(3)).unwrap();
+        let fresh2_engine = Engine::with_n_ctx(&dir, 64).expect("engine should load");
+        let (fresh2, _, _, _) = fresh2_engine.complete_raw(&follow, &greedy(3)).unwrap();
+        assert_eq!(warm2, fresh2, "continuing over generated tokens must not change output");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn kv_clear_reuse_matches_fresh_engine() {
         use joshua::{types::GenerationOptions, Engine};
@@ -363,11 +398,23 @@ mod synthetic {
                 write_model = write_tiny_deepseek_gguf;
                 name = "tiny-deepseek-kvedit";
             }
+            "qwen35" => {
+                write_model = |p| write_tiny_qwen_gguf(p, "qwen35");
+                name = "tiny-qwen35-kvedit";
+            }
+            "qwen2moe" => {
+                write_model = |p| write_tiny_qwen_gguf(p, "qwen2moe");
+                name = "tiny-qwen2moe-kvedit";
+            }
             other => panic!("unsupported arch {other}"),
         }
 
         let dir = model_dir(name);
         write_model(&dir.join("model.gguf"));
+        // Recurrent (Gated DeltaNet) state cannot be rewound: every edit
+        // below falls back to a full prefill, so nothing counts as reuse —
+        // but the outputs must still match a fresh engine.
+        let rewinds = |n: u64| if arch == "qwen35" { 0 } else { n };
 
         let greedy = |max_tokens| GenerationOptions {
             max_tokens,
@@ -387,12 +434,12 @@ mod synthetic {
         let (warm_text, warm_usage, _, _) = warm.complete_raw("hello b c", &greedy(2)).unwrap();
         assert_eq!(
             warm.kv_reuse_count(),
-            1,
+            rewinds(1),
             "edited prompt must still count as KV reuse"
         );
         assert_eq!(
             warm.kv_edit_reuse_count(),
-            1,
+            rewinds(1),
             "edited prompt must take the truncation path"
         );
 
@@ -400,8 +447,8 @@ mod synthetic {
         // generated tokens diverges from the cached history again, so this
         // also rewinds (to the three shared tokens) rather than extending.
         let (_, _, _, _) = warm.complete_raw("hello b c d e", &greedy(2)).unwrap();
-        assert_eq!(warm.kv_reuse_count(), 2);
-        assert_eq!(warm.kv_edit_reuse_count(), 2);
+        assert_eq!(warm.kv_reuse_count(), rewinds(2));
+        assert_eq!(warm.kv_edit_reuse_count(), rewinds(2));
 
         // A *rollback* (regenerate/retry): the new prompt is a strict
         // PREFIX of the cached history.  Rewinding all the way to it would
@@ -411,12 +458,12 @@ mod synthetic {
         let (rb_text, rb_usage, _, _) = warm.complete_raw("hello b", &greedy(2)).unwrap();
         assert_eq!(
             warm.kv_reuse_count(),
-            3,
+            rewinds(3),
             "rollback must count as KV reuse"
         );
         assert_eq!(
             warm.kv_edit_reuse_count(),
-            3,
+            rewinds(3),
             "rollback must take the truncation path"
         );
 
@@ -452,6 +499,18 @@ mod synthetic {
     #[test]
     fn kv_edited_context_reuse_matches_fresh_engine_deepseek() {
         edited_context_reuse_matches_fresh_engine("deepseek");
+    }
+
+    #[test]
+    fn kv_edited_context_reuse_matches_fresh_engine_qwen2moe() {
+        edited_context_reuse_matches_fresh_engine("qwen2moe");
+    }
+
+    /// A recurrent (Gated DeltaNet) model cannot rewind to the shared
+    /// prefix; the engine must fall back to a full prefill and still match.
+    #[test]
+    fn kv_edited_context_reuse_matches_fresh_engine_qwen35() {
+        edited_context_reuse_matches_fresh_engine("qwen35");
     }
 
 

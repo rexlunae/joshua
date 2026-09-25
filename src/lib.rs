@@ -21,6 +21,7 @@
 //! A `tokenizer.json` from the model's HuggingFace repository must be placed
 //! alongside the `.gguf` file so the engine can tokenise prompts.
 
+pub mod attention;
 pub mod auto_placement;
 pub mod compression;
 pub mod cpu_pinning;
@@ -37,10 +38,11 @@ pub mod kimi_k3;
 pub mod mmap_tensor;
 pub mod moe;
 pub mod mxfp4;
+pub mod native_session;
 pub mod model;
 pub mod quantized_deepseek2;
 pub mod quantized_deepseek4;
-pub mod quantized_qwen3_moe;
+pub mod quantized_qwen;
 pub mod quant_matmul;
 pub mod cuda_io;
 pub mod residency;

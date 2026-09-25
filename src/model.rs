@@ -14,7 +14,7 @@
 //! | `phi3`                                          | `quantized_phi3`
 //! | `qwen2`                                         | `quantized_qwen2`
 //! | `qwen3`                                         | `quantized_qwen3`
-//! | `qwen3moe`                                      | `quantized_qwen3_moe`
+//! | `qwen`, `qwen2moe`, `qwen2vl`, `qwen3moe`, `qwen3vl`, `qwen3vlmoe`, `qwen3next`, `qwen35`, `qwen35moe` | `quantized_qwen` (Joshua)
 //! | `deepseek` (DeepSeek-MoE)                        | `quantized_deepseek2` (Joshua)
 //! | `deepseek2` (DeepSeek-V2/V2.5/V3/V3.1/R1, Kimi-K2) | `quantized_deepseek2` (Joshua)
 //! | `deepseek4` (DeepSeek-V4)                        | `quantized_deepseek4` (Joshua)
@@ -60,8 +60,24 @@ pub enum Architecture {
     Qwen2,
     /// `qwen3` — Qwen3 dense models.
     Qwen3,
+    /// `qwen` — Qwen (1).
+    Qwen,
+    /// `qwen2moe` — Qwen1.5-MoE / Qwen2-MoE.
+    Qwen2Moe,
+    /// `qwen2vl` — Qwen2-VL / Qwen2.5-VL (text decoder).
+    Qwen2Vl,
     /// `qwen3moe` — Qwen3 mixture-of-experts models.
     Qwen3Moe,
+    /// `qwen3vl` — Qwen3-VL (text decoder).
+    Qwen3Vl,
+    /// `qwen3vlmoe` — Qwen3-VL-MoE (text decoder).
+    Qwen3VlMoe,
+    /// `qwen3next` — Qwen3-Next (Gated DeltaNet + gated attention hybrid MoE).
+    Qwen3Next,
+    /// `qwen35` — Qwen3.5 dense (Gated DeltaNet hybrid).
+    Qwen35,
+    /// `qwen35moe` — Qwen3.5-MoE (Gated DeltaNet hybrid).
+    Qwen35Moe,
     /// `deepseek` — DeepSeek-MoE (GQA + fine-grained MoE with shared
     /// experts).  Loaded by the `deepseek2` loader into
     /// [`QuantizedModel::DeepSeek2`].
@@ -152,9 +168,11 @@ const KNOWN_UNSUPPORTED_ARCHS: &[&str] = &[
     "plamo",
     "plamo2",
     "plm",
-    "qwen",
-    "qwen2moe",
-    "qwen2vl",
+    // Qwen4-exp: Hyper-Connections, DeepSeek-V4-style compressed/indexed
+    // attention and n-gram hash embeddings on top of Gated DeltaNet.
+    "qwen4exp",
+    // Qwen3-TTS emits audio codec tokens, not text.
+    "qwen3tts",
     "refact",
     "rwkv6",
     "rwkv6qwen2",
@@ -172,6 +190,33 @@ const KNOWN_UNSUPPORTED_ARCHS: &[&str] = &[
     "internlm2",
 ];
 
+/// Every supported `general.architecture` name and the variant it loads as.
+const NAMES: &[(&str, Architecture)] = &[
+    ("llama", Architecture::Llama),
+    ("gemma", Architecture::Gemma),
+    ("gemma2", Architecture::Gemma),
+    ("gemma3", Architecture::Gemma),
+    ("gemma-embedding", Architecture::Gemma),
+    ("glm4", Architecture::Glm4),
+    ("lfm2", Architecture::Lfm2),
+    ("phi2", Architecture::Phi2),
+    ("phi3", Architecture::Phi3),
+    ("qwen", Architecture::Qwen),
+    ("qwen2", Architecture::Qwen2),
+    ("qwen2moe", Architecture::Qwen2Moe),
+    ("qwen2vl", Architecture::Qwen2Vl),
+    ("qwen3", Architecture::Qwen3),
+    ("qwen3moe", Architecture::Qwen3Moe),
+    ("qwen3vl", Architecture::Qwen3Vl),
+    ("qwen3vlmoe", Architecture::Qwen3VlMoe),
+    ("qwen3next", Architecture::Qwen3Next),
+    ("qwen35", Architecture::Qwen35),
+    ("qwen35moe", Architecture::Qwen35Moe),
+    ("deepseek", Architecture::DeepSeek),
+    ("deepseek2", Architecture::DeepSeek2),
+    ("deepseek4", Architecture::DeepSeek4),
+];
+
 impl Architecture {
     /// Parse an architecture from its GGUF `general.architecture` name.
     ///
@@ -179,21 +224,12 @@ impl Architecture {
     /// [`Architecture::is_known_llama_cpp_arch`] to distinguish "known to
     /// llama.cpp but unimplemented" from "never heard of it".
     pub fn from_name(name: &str) -> Option<Self> {
-        Some(match name {
-            "llama" => Self::Llama,
-            "gemma" | "gemma2" | "gemma3" | "gemma-embedding" => Self::Gemma,
-            "glm4" => Self::Glm4,
-            "lfm2" => Self::Lfm2,
-            "phi2" => Self::Phi2,
-            "phi3" => Self::Phi3,
-            "qwen2" => Self::Qwen2,
-            "qwen3" => Self::Qwen3,
-            "qwen3moe" => Self::Qwen3Moe,
-            "deepseek" => Self::DeepSeek,
-            "deepseek2" => Self::DeepSeek2,
-            "deepseek4" => Self::DeepSeek4,
-            _ => return None,
-        })
+        NAMES.iter().find(|(n, _)| *n == name).map(|&(_, a)| a)
+    }
+
+    /// Every supported `general.architecture` name.
+    pub fn supported_names() -> impl Iterator<Item = &'static str> {
+        NAMES.iter().map(|&(n, _)| n)
     }
 
     /// Parse an architecture from the GGUF `general.architecture` metadata.
@@ -247,17 +283,25 @@ impl Architecture {
     /// handle so sessions can be derived without copying them (see
     /// [`QuantizedModel::new_session`]).
     pub fn shares_weights(&self) -> bool {
-        self.is_native_moe()
+        self.is_native()
     }
 
-    /// Whether this architecture is served by one of Joshua's own sparse-MoE
-    /// loaders (`qwen3moe`, `deepseek`/`deepseek2`, `deepseek4`) rather than
-    /// a stock candle loader.  Those keep the token embedding and output head
-    /// quantized, hold the router in f32, and share weights across sessions.
-    pub fn is_native_moe(&self) -> bool {
-        matches!(
+    /// Whether this architecture is served by one of Joshua's own loaders
+    /// (`quantized_qwen`, `quantized_deepseek2`, `quantized_deepseek4`)
+    /// rather than a stock candle loader.  Those keep the token embedding
+    /// and output head quantized, hold MoE routers in f32, and share weights
+    /// across sessions.
+    pub fn is_native(&self) -> bool {
+        !matches!(
             self,
-            Self::Qwen3Moe | Self::DeepSeek | Self::DeepSeek2 | Self::DeepSeek4
+            Self::Llama
+                | Self::Gemma
+                | Self::Glm4
+                | Self::Lfm2
+                | Self::Phi2
+                | Self::Phi3
+                | Self::Qwen2
+                | Self::Qwen3
         )
     }
 
@@ -310,9 +354,17 @@ impl Architecture {
             Self::Lfm2 => "LFM2",
             Self::Phi2 => "Phi-1 / Phi-1.5 / Phi-2",
             Self::Phi3 => "Phi-3",
+            Self::Qwen => "Qwen",
             Self::Qwen2 => "Qwen2 / Qwen2.5",
+            Self::Qwen2Moe => "Qwen1.5-MoE / Qwen2-MoE",
+            Self::Qwen2Vl => "Qwen2-VL / Qwen2.5-VL (text)",
             Self::Qwen3 => "Qwen3",
             Self::Qwen3Moe => "Qwen3-MoE",
+            Self::Qwen3Vl => "Qwen3-VL (text)",
+            Self::Qwen3VlMoe => "Qwen3-VL-MoE (text)",
+            Self::Qwen3Next => "Qwen3-Next",
+            Self::Qwen35 => "Qwen3.5",
+            Self::Qwen35Moe => "Qwen3.5-MoE",
             Self::DeepSeek => "DeepSeek-MoE",
             Self::DeepSeek2 => "DeepSeek-V2 / DeepSeek-V3 / DeepSeek-R1 / Kimi-K2",
             Self::DeepSeek4 => "DeepSeek-V4",
@@ -321,8 +373,8 @@ impl Architecture {
 
     /// Comma-separated list of supported architecture names for error messages.
     pub fn list_known() -> &'static str {
-        "llama (incl. Mistral/Mixtral), gemma, gemma2, gemma3, gemma-embedding, \
-         glm4, lfm2, phi2, phi3, qwen2, qwen3, qwen3moe, deepseek, deepseek2, deepseek4"
+        static LIST: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        LIST.get_or_init(|| Self::supported_names().collect::<Vec<_>>().join(", "))
     }
 }
 
@@ -345,9 +397,53 @@ pub enum QuantizedModel {
     Phi3(quantized_phi3::ModelWeights),
     Qwen2(quantized_qwen2::ModelWeights),
     Qwen3(quantized_qwen3::ModelWeights),
-    Qwen3Moe(crate::quantized_qwen3_moe::GGUFQWenMoE),
+    /// Every architecture of the Qwen family loader (see
+    /// [`crate::quantized_qwen::ARCHES`]).
+    Qwen(crate::quantized_qwen::ModelWeights),
     DeepSeek2(crate::quantized_deepseek2::ModelWeights),
     DeepSeek4(crate::quantized_deepseek4::ModelWeights),
+}
+
+/// Evaluate `$body` with `$m` bound to the model of any Joshua-native
+/// variant (`Qwen`, `DeepSeek2`, `DeepSeek4`) and `$wrap` to that variant's
+/// constructor; `$other` for candle's stock loaders.
+macro_rules! native {
+    ($self:expr, ($m:ident, $wrap:ident) => $body:expr, _ => $other:expr) => {
+        match $self {
+            QuantizedModel::Qwen($m) => {
+                #[allow(unused_variables)]
+                let $wrap = QuantizedModel::Qwen;
+                $body
+            }
+            QuantizedModel::DeepSeek2($m) => {
+                #[allow(unused_variables)]
+                let $wrap = QuantizedModel::DeepSeek2;
+                $body
+            }
+            QuantizedModel::DeepSeek4($m) => {
+                #[allow(unused_variables)]
+                let $wrap = QuantizedModel::DeepSeek4;
+                $body
+            }
+            _ => $other,
+        }
+    };
+    ($self:expr, $m:ident => $body:expr, _ => $other:expr) => {
+        native!($self, ($m, _wrap) => $body, _ => $other)
+    };
+}
+
+/// [`native!`] over the loaders built on
+/// [`crate::native_session::Session`] (`Qwen`, `DeepSeek2`), which add
+/// all-position logits and prefix truncation.
+macro_rules! session {
+    ($self:expr, $m:ident => $body:expr, _ => $other:expr) => {
+        match $self {
+            QuantizedModel::Qwen($m) => $body,
+            QuantizedModel::DeepSeek2($m) => $body,
+            _ => $other,
+        }
+    };
 }
 
 impl QuantizedModel {
@@ -366,7 +462,7 @@ impl QuantizedModel {
     ///
     /// candle's own quantized loaders read through the `reader` and copy, so
     /// for those architectures the mapping is ignored — they are small enough
-    /// that it does not matter.  Joshua's own loaders (currently `deepseek2`)
+    /// that it does not matter.  Joshua's own loaders (Qwen family, `deepseek2`)
     /// borrow, which is what makes the very large MoE models tractable.
     pub fn from_gguf_mmap<R: Read + Seek>(
         gguf: gguf_file::Content,
@@ -483,8 +579,16 @@ impl QuantizedModel {
             Architecture::Qwen3 => {
                 quantized_qwen3::ModelWeights::from_gguf(gguf, reader, device).map(Self::Qwen3)
             }
-            Architecture::Qwen3Moe => {
-                crate::quantized_qwen3_moe::GGUFQWenMoE::from_gguf_mmap_placed(
+            Architecture::Qwen
+            | Architecture::Qwen2Moe
+            | Architecture::Qwen2Vl
+            | Architecture::Qwen3Moe
+            | Architecture::Qwen3Vl
+            | Architecture::Qwen3VlMoe
+            | Architecture::Qwen3Next
+            | Architecture::Qwen35
+            | Architecture::Qwen35Moe => {
+                crate::quantized_qwen::ModelWeights::from_gguf_mmap_placed(
                     gguf,
                     reader,
                     device,
@@ -492,7 +596,7 @@ impl QuantizedModel {
                     mmap,
                     device_expert_cache_bytes,
                 )
-                .map(Self::Qwen3Moe)
+                .map(Self::Qwen)
             }
             // One loader serves both: DeepSeek-MoE differs from V2+ only in
             // its (GQA) attention.
@@ -525,72 +629,52 @@ impl QuantizedModel {
     }
 
     /// A fresh session over this instance's weights, sharing every weight
-    /// tensor and starting with an empty KV cache — for loaders that keep
-    /// their weights behind a shared handle (`qwen3moe`, `deepseek2`).
+    /// tensor and starting with an empty cache — for Joshua's own loaders,
+    /// which keep their weights behind a shared handle.
     ///
-    /// `None` for architectures whose instances own their weights (candle's
-    /// stock loaders, `deepseek4`); those need a full load per session.
-    /// The engine keeps one loaded instance as the template and derives
-    /// every concurrent session from it, so extra sessions cost their KV
-    /// cache rather than a second copy (on an accelerator, a second upload)
-    /// of the weights.
+    /// `None` for candle's stock loaders, whose instances own their weights;
+    /// those need a full load per session.  The engine keeps one loaded
+    /// instance as the template and derives every concurrent session from
+    /// it, so extra sessions cost their cache rather than a second copy (on
+    /// an accelerator, a second upload) of the weights.
     pub fn new_session(&self) -> Option<Self> {
-        match self {
-            Self::Qwen3Moe(m) => Some(Self::Qwen3Moe(m.new_session())),
-            Self::DeepSeek2(m) => Some(Self::DeepSeek2(m.new_session())),
-            Self::DeepSeek4(m) => Some(Self::DeepSeek4(m.new_session())),
-            _ => None,
-        }
+        native!(self, (m, wrap) => Some(wrap(m.new_session())), _ => None)
     }
 
     /// Whether [`QuantizedModel::new_session`] can derive sessions from this
     /// instance without copying its weights.
     pub fn supports_shared_weights(&self) -> bool {
-        matches!(
-            self,
-            Self::Qwen3Moe(_) | Self::DeepSeek2(_) | Self::DeepSeek4(_)
-        )
+        native!(self, _m => true, _ => false)
+    }
+
+    /// Number of live sessions sharing this instance's weights (Joshua's own
+    /// loaders; 1 otherwise).
+    pub fn shared_session_count(&self) -> usize {
+        native!(self, m => m.shared_session_count(), _ => 1)
     }
 
     /// Whether the loaded token-embedding table is held quantized rather
     /// than dequantized to f32 (joshua-native loaders; diagnostics).
     pub fn embeddings_quantized(&self) -> Option<bool> {
-        match self {
-            Self::Qwen3Moe(m) => Some(m.embeddings_quantized()),
-            Self::DeepSeek2(m) => Some(m.embeddings_quantized()),
-            Self::DeepSeek4(m) => Some(m.embeddings_quantized()),
-            _ => None,
-        }
+        native!(self, m => Some(m.embeddings_quantized()), _ => None)
     }
 
-    /// Pass the routing-frequency hot-expert cache budget to loaders that
-    /// implement it (the joshua-native MoE loaders `deepseek2`, `deepseek4`
-    /// and `qwen3moe`); other architectures — including Mixtral through the
-    /// vendored candle `llama` loader — ignore the request.
+    /// Pass the routing-frequency hot-expert cache budget to Joshua's own
+    /// loaders; candle's stock loaders — including Mixtral through the
+    /// vendored `llama` loader — ignore the request.
     ///
     /// The budget is applied after load so the loader's signature stays
     /// stable for every other architecture and for tests.
     pub fn set_pin_hot_experts(&mut self, n: usize) {
-        if n == 0 {
-            return;
-        }
-        match self {
-            Self::DeepSeek2(m) => m.set_pin_hot_experts(n),
-            Self::DeepSeek4(m) => m.set_pin_hot_experts(n),
-            Self::Qwen3Moe(m) => m.set_pin_hot_experts(n),
-            _ => {}
+        if n > 0 {
+            native!(self, m => m.set_pin_hot_experts(n), _ => {})
         }
     }
 
     /// Number of experts the residency backend can hold resident (a phase-5
     /// auto-sizing input); 0 for architectures without per-expert handles.
     pub fn expert_residency_capacity(&self) -> usize {
-        match self {
-            Self::DeepSeek2(m) => m.expert_residency_capacity(),
-            Self::DeepSeek4(m) => m.expert_residency_capacity(),
-            Self::Qwen3Moe(m) => m.expert_residency_capacity(),
-            _ => 0,
-        }
+        native!(self, m => m.expert_residency_capacity(), _ => 0)
     }
 
     /// The model-wide device expert pool's budget, occupancy and counters,
@@ -620,62 +704,35 @@ impl QuantizedModel {
     }
 
     /// Clear the KV cache so the instance can serve an unrelated prompt,
-    /// where the underlying candle model supports it.
+    /// where the underlying model supports it.
     ///
     /// Returns `false` when the architecture has no reset hook — the caller
     /// must build a fresh instance instead.
     pub fn clear_kv_cache(&mut self) -> bool {
         match self {
-            Self::Llama(m) => {
-                m.clear_kv_cache();
-                true
-            }
-            Self::Qwen2(m) => {
-                m.clear_kv_cache();
-                true
-            }
-            Self::Qwen3(m) => {
-                m.clear_kv_cache();
-                true
-            }
-            Self::Qwen3Moe(m) => {
-                m.clear_kv_cache();
-                true
-            }
-            Self::DeepSeek2(m) => {
-                m.clear_kv_cache();
-                true
-            }
-            Self::DeepSeek4(m) => {
-                m.clear_kv_cache();
-                true
-            }
-            _ => false,
+            Self::Llama(m) => m.clear_kv_cache(),
+            Self::Qwen2(m) => m.clear_kv_cache(),
+            Self::Qwen3(m) => m.clear_kv_cache(),
+            other => return native!(other, m => { m.clear_kv_cache(); true }, _ => false),
         }
+        true
     }
 
     /// Whether [`QuantizedModel::clear_kv_cache`] can reset this instance.
     pub fn supports_kv_clear(&self) -> bool {
-        matches!(
-            self,
-            Self::Llama(_)
-                | Self::Qwen2(_)
-                | Self::Qwen3(_)
-                | Self::Qwen3Moe(_)
-                | Self::DeepSeek2(_)
-                | Self::DeepSeek4(_)
-        )
+        matches!(self, Self::Llama(_) | Self::Qwen2(_) | Self::Qwen3(_)) || self.supports_shared_weights()
     }
 
     /// Whether [`QuantizedModel::truncate_kv_cache`] can shorten this
     /// instance's KV cache to an arbitrary prefix length.
     ///
     /// Only the Joshua-owned loaders with plain append-only caches qualify:
-    /// candle's stock loaders keep their caches private, and `deepseek4`'s
-    /// hybrid attention keeps running compressor states that cannot be
-    /// rewound to an arbitrary past position (only cleared).
+    /// candle's stock loaders keep their caches private, and recurrent state
+    /// — `deepseek4`'s running compressors, the Gated DeltaNet layers of
+    /// Qwen3-Next / Qwen3.5 — cannot be rewound to an arbitrary past
+    /// position (only cleared).
     pub fn supports_kv_truncate(&self) -> bool {
-        matches!(self, Self::Qwen3Moe(_) | Self::DeepSeek2(_))
+        session!(self, m => m.supports_truncate(), _ => false)
     }
 
     /// Keep only the first `keep_len` fed tokens of every layer's KV cache.
@@ -692,11 +749,10 @@ impl QuantizedModel {
     /// check [`Self::supports_kv_truncate`] to distinguish that from a real
     /// error.
     pub fn truncate_kv_cache(&mut self, keep_len: usize) -> Result<bool> {
-        match self {
-            Self::Qwen3Moe(m) => m.truncate_kv_cache(keep_len).map(|_| true),
-            Self::DeepSeek2(m) => m.truncate_kv_cache(keep_len).map(|_| true),
-            _ => Ok(false),
+        if !self.supports_kv_truncate() {
+            return Ok(false);
         }
+        session!(self, m => m.truncate_kv_cache(keep_len).map(|_| true), _ => Ok(false))
     }
 
     /// Unified forward pass.
@@ -714,7 +770,7 @@ impl QuantizedModel {
             Self::Phi3(m) => m.forward(input, index_pos),
             Self::Qwen2(m) => m.forward(input, index_pos),
             Self::Qwen3(m) => m.forward(input, index_pos),
-            Self::Qwen3Moe(m) => m.forward(input, index_pos),
+            Self::Qwen(m) => m.forward(input, index_pos),
             Self::DeepSeek2(m) => m.forward(input, index_pos),
             Self::DeepSeek4(m) => m.forward(input, index_pos),
         }
@@ -730,44 +786,31 @@ impl QuantizedModel {
 
     /// Forward pass returning the logits of every input position,
     /// `[1, seq_len, vocab]` — the speculative-decoding verification pass.
-    /// Only the architectures reporting [`Self::supports_speculative`]
-    /// implement it; the rest return an unsupported error.
+    /// Only the [`crate::native_session::Session`] loaders implement it; the
+    /// rest return an unsupported error.
     pub fn forward_all_logits(&mut self, input: &Tensor, index_pos: usize) -> Result<Tensor> {
-        match self {
-            Self::Qwen3Moe(m) => m.forward_all_logits(input, index_pos),
-            Self::DeepSeek2(m) => m.forward_all_logits(input, index_pos),
-            _ => Err(candle_core::Error::Msg(
-                "all-position logits are not implemented for this architecture".into(),
-            )),
-        }
+        session!(self, m => m.forward_all_logits(input, index_pos), _ => Err(candle_core::Error::Msg(
+            "all-position logits are not implemented for this architecture".into(),
+        )))
+    }
+
+    /// Whether this architecture has a native layer-streaming prefill path.
+    /// See [`crate::stream_prefill`].  Joshua's own loaders implement it;
+    /// other architectures fall back to the standard chunked prefill.
+    pub fn supports_streaming(&self) -> bool {
+        self.supports_shared_weights()
     }
 
     /// Layer-streaming prefill over a set of bounded chunks.  See
-    /// [`crate::stream_prefill`].  Only the joshua-native MoE loaders
-    /// (qwen3moe, deepseek2, deepseek4) implement it today; other
-    /// architectures report an unsupported error and the engine falls back to
-    /// the standard chunked prefill.
-    /// Whether this architecture has a native layer-streaming prefill path.
-    pub fn supports_streaming(&self) -> bool {
-        matches!(
-            self,
-            Self::Qwen3Moe(_) | Self::DeepSeek2(_) | Self::DeepSeek4(_)
-        )
-    }
-
+    /// [`crate::stream_prefill`].
     pub fn prefill_streamed(
         &mut self,
         chunks: &[crate::stream_prefill::Chunk],
         device: &Device,
     ) -> Result<Tensor> {
-        match self {
-            Self::Qwen3Moe(m) => crate::stream_prefill::stream_prefill(m, chunks, device),
-            Self::DeepSeek2(m) => crate::stream_prefill::stream_prefill(m, chunks, device),
-            Self::DeepSeek4(m) => crate::stream_prefill::stream_prefill(m, chunks, device),
-            _ => Err(candle_core::Error::Msg(
-                "layer-streaming prefill is not implemented for this architecture".into(),
-            )),
-        }
+        native!(self, m => crate::stream_prefill::stream_prefill(m, chunks, device), _ => Err(candle_core::Error::Msg(
+            "layer-streaming prefill is not implemented for this architecture".into(),
+        )))
     }
 
     /// Batch one decode step across `seqs` independent sequences, amortizing
@@ -804,30 +847,23 @@ mod tests {
 
     #[test]
     fn supported_architectures_resolve() {
-        for (name, expected) in [
-            ("llama", Architecture::Llama),
-            ("gemma", Architecture::Gemma),
-            ("gemma2", Architecture::Gemma),
-            ("gemma3", Architecture::Gemma),
-            ("gemma-embedding", Architecture::Gemma),
-            ("glm4", Architecture::Glm4),
-            ("lfm2", Architecture::Lfm2),
-            ("phi2", Architecture::Phi2),
-            ("phi3", Architecture::Phi3),
-            ("qwen2", Architecture::Qwen2),
-            ("qwen3", Architecture::Qwen3),
-            ("qwen3moe", Architecture::Qwen3Moe),
-            ("deepseek", Architecture::DeepSeek),
-            ("deepseek2", Architecture::DeepSeek2),
-            ("deepseek4", Architecture::DeepSeek4),
-        ] {
-            assert_eq!(Architecture::from_name(name), Some(expected), "arch {name}");
+        for name in Architecture::supported_names() {
+            let expected = Architecture::from_name(name).expect("listed name resolves");
             assert_eq!(
                 Architecture::from_gguf_metadata(&metadata_with_arch(name)),
                 Some(expected),
                 "metadata arch {name}"
             );
             assert!(Architecture::is_known_llama_cpp_arch(name));
+            assert!(
+                !KNOWN_UNSUPPORTED_ARCHS.contains(&name),
+                "{name} is both supported and listed as unsupported"
+            );
+            assert!(Architecture::list_known().contains(name));
+        }
+        // Every Qwen-family loader name is routed to the Qwen loader.
+        for name in crate::quantized_qwen::ARCHES {
+            assert!(Architecture::from_name(name).is_some_and(|a| a.is_native()), "{name}");
         }
     }
 
