@@ -1061,11 +1061,61 @@ pub fn qtype_code(dtype: crate::quantized::GgmlDType) -> i32 {
     }
 }
 
-/// `C[m, n] = sum_k X[m, k] * W[n, k]` over block-quantized `W` (`[N, K]`).
+/// Which quantized-GEMV kernel a device runs (see [`glsl::k_qgemv`] and
+/// [`glsl::k_qgemv_mali`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Qgemv {
+    /// One wide work-group per output element.
+    Generic,
+    /// Arm Mali / Immortalis: small teams, several rows per decode.
+    Mali,
+}
+
+impl Qgemv {
+    /// Arm's PCI vendor id, as `VkPhysicalDeviceProperties::vendorID`.
+    pub const ARM_VENDOR_ID: u32 = 0x13B5;
+
+    /// The kernel for a device: `JOSHUA_VULKAN_QGEMV=mali|generic` when set
+    /// (to force either on any device), else the Mali kernel on Arm GPUs.
+    pub fn for_device(vendor_id: u32) -> Self {
+        match std::env::var("JOSHUA_VULKAN_QGEMV").as_deref() {
+            Ok("mali") => Self::Mali,
+            Ok("generic") => Self::Generic,
+            _ if vendor_id == Self::ARM_VENDOR_ID => Self::Mali,
+            _ => Self::Generic,
+        }
+    }
+}
+
+/// `C[m, n] = sum_k X[m, k] * W[n, k]` over block-quantized `W` (`[N, K]`),
+/// with the device's [`Qgemv`] kernel.
 pub fn run_qgemv(d: &VulkanDevice, dtype: crate::quantized::GgmlDType, x: Buf, w: Buf, out: Buf, m: usize, n: usize, k: usize, xoff: usize) -> Result<()> {
+    run_qgemv_with(d, d.limits().qgemv, dtype, x, w, out, m, n, k, xoff)
+}
+
+/// [`run_qgemv`] with an explicit kernel.
+#[allow(clippy::too_many_arguments)]
+pub fn run_qgemv_with(
+    d: &VulkanDevice,
+    kernel: Qgemv,
+    dtype: crate::quantized::GgmlDType,
+    x: Buf,
+    w: Buf,
+    out: Buf,
+    m: usize,
+    n: usize,
+    k: usize,
+    xoff: usize,
+) -> Result<()> {
     let push = Push::default().us(n)?.us(k)?.i(qtype_code(dtype)).us(dtype.block_size())?.us(dtype.type_size())?.us(xoff)?.i(0).us(m)?;
     let lim = d.limits();
-    d.launch("qgemv", glsl::k_qgemv, &[x, w, out], push, &[], row_grid(n, m, lim.max_groups_x))
+    match kernel {
+        Qgemv::Generic => d.launch("qgemv", glsl::k_qgemv, &[x, w, out], push, &[], row_grid(n, m, lim.max_groups_x)),
+        Qgemv::Mali => {
+            let groups = row_grid(n.div_ceil(glsl::QGEMV_MALI_COLS), m.div_ceil(glsl::QGEMV_MALI_ROWS), lim.max_groups_x);
+            d.launch("qgemv_mali", glsl::k_qgemv_mali, &[x, w, out], push, &[], groups)
+        }
+    }
 }
 
 /// `C[m, n] = sum_k X[m, k] * W[n, k]` over f16 / bf16 `W`.
@@ -1162,6 +1212,7 @@ mod barrier_tests {
                 glsl::k_arg_last(wg),
                 glsl::k_gemv_nt(wg),
                 glsl::k_qgemv(wg),
+                glsl::k_qgemv_mali(wg),
                 glsl::k_hgemv(wg),
                 glsl::k_gemm(wg, 8),
                 glsl::k_gemm(wg, 16),

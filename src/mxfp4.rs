@@ -152,23 +152,58 @@ const _: () = assert!(std::mem::size_of::<BlockNvfp4>() == 36);
 /// `ggml_ue4m3_to_fp32` (which returns this value halved, to pair with its
 /// doubled E2M1 table).
 pub fn ue4m3_to_f32(x: u8) -> f32 {
-    if x == 0 || x == 0x7F {
-        return 0.0;
-    }
-    let exp = ((x >> 3) & 0xF) as i32;
-    let man = (x & 0x7) as f32;
-    if exp == 0 {
-        man * 2f32.powi(-9)
-    } else {
-        (1.0 + man / 8.0) * 2f32.powi(exp - 7)
-    }
+    UE4M3[x as usize]
 }
+
+/// Every UE4M3 byte's value (see [`ue4m3_to_f32`]), built at compile time
+/// from the bit fields: exact, so a lookup rather than `powi` per scale.
+static UE4M3: [f32; 256] = {
+    let mut t = [0f32; 256];
+    let mut x = 0;
+    while x < 256 {
+        let (exp, man) = ((x >> 3) & 0xF, (x & 0x7) as u32);
+        t[x] = if x == 0 || x == 0x7F {
+            0.0
+        } else if exp == 0 {
+            man as f32 / 512.0 // man · 2^-9
+        } else {
+            // (1 + man/8) · 2^(exp − 7): biased exponent exp + 120.
+            f32::from_bits(((exp as u32 + 120) << 23) | (man << 20))
+        };
+        x += 1;
+    }
+    t
+};
 
 impl crate::raw_block::RawBlock for BlockNvfp4 {
     const GGML_TYPE: u32 = 40;
     const QK: usize = QK_NVFP4;
     const NAME: &'static str = "nvfp4";
     const CANDLE_DTYPE: candle_core::quantized::GgmlDType = candle_core::quantized::GgmlDType::Q2K;
+
+    const DECODE_AVX512: bool = true;
+
+    /// Values `[32c, 32c + 32)` are sub-blocks `2c` and `2c + 1`: each one's
+    /// 8 bytes, duplicated across 16 lanes, shifted by 0 (low nibbles,
+    /// lanes 0..8) or 4 (high, lanes 8..16), index the E2M1 table in one
+    /// `vpermps` and scale by the sub-block's UE4M3 scale.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx2,fma")]
+    #[inline]
+    unsafe fn decode_avx512(&self, c: usize) -> [std::arch::x86_64::__m512; 2] {
+        use std::arch::x86_64::*;
+        let table = _mm512_loadu_ps(E2M1.as_ptr());
+        let shifts = _mm512_setr_epi32(0, 0, 0, 0, 0, 0, 0, 0, 4, 4, 4, 4, 4, 4, 4, 4);
+        let mut w = [_mm512_setzero_ps(); 2];
+        for (i, wi) in w.iter_mut().enumerate() {
+            let s = 2 * c + i;
+            let half = _mm_loadl_epi64(self.qs[8 * s..].as_ptr() as *const __m128i);
+            let bytes = _mm512_cvtepu8_epi32(_mm_unpacklo_epi64(half, half));
+            let idx = _mm512_and_si512(_mm512_srlv_epi32(bytes, shifts), _mm512_set1_epi32(0x0F));
+            *wi = _mm512_mul_ps(_mm512_permutexvar_ps(idx, table), _mm512_set1_ps(ue4m3_to_f32(self.d[s])));
+        }
+        w
+    }
 
     fn dequantize_block(&self, out: &mut [f32]) {
         for (s, (y, qs)) in out.chunks_exact_mut(QK_NVFP4_SUB).zip(self.qs.chunks_exact(QK_NVFP4_SUB / 2)).enumerate() {
@@ -191,6 +226,7 @@ mod tests {
         assert_eq!(ue4m3_to_f32(0x3C), 1.5);
         assert_eq!(ue4m3_to_f32(0x01), 2f32.powi(-9)); // subnormal
         assert_eq!(ue4m3_to_f32(0x7F), 0.0);
+        assert_eq!(ue4m3_to_f32(0xFF), 480.0); // the sign bit is ignored
         let mut b = BlockNvfp4 { d: [0x38, 0x40, 0, 0], qs: [0; 32] };
         b.qs[0] = 0x7 | (0x1 << 4); // element 0 → +6, element 8 → +0.5
         b.qs[8] = 0xF; // first element of the second 16 → −6, scale 2
@@ -198,6 +234,18 @@ mod tests {
         crate::raw_block::RawBlock::dequantize_block(&b, &mut out);
         assert_eq!((out[0], out[8], out[16]), (6.0, 0.5, -12.0));
         crate::raw_block::testing::check_matmul(&crate::raw_block::testing::synthetic::<BlockNvfp4>(6, 5), 128);
+        crate::raw_block::testing::check_decode_avx512(&crate::raw_block::testing::synthetic::<BlockNvfp4>(16, 5));
+        // The table agrees with the field arithmetic for every byte.
+        for x in 0..=255u8 {
+            let (exp, man) = (((x >> 3) & 0xF) as i32, (x & 0x7) as f32);
+            // ggml_ue4m3_to_fp32: only 0x00 and 0x7F are zero (0xFF is 480).
+            let want = match x {
+                0 | 0x7F => 0.0,
+                _ if exp == 0 => man * 2f32.powi(-9),
+                _ => (1.0 + man / 8.0) * 2f32.powi(exp - 7),
+            };
+            assert_eq!(ue4m3_to_f32(x), want, "UE4M3 byte {x:#04x}");
+        }
         crate::raw_block::testing::check_blocks_from_bytes::<BlockNvfp4>();
     }
 

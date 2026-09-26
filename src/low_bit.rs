@@ -145,9 +145,30 @@ const _: () = assert!(std::mem::size_of::<BlockTq2_0>() == 66);
 /// to the top and `(q · 3) >> 8` extracts it (llama.cpp
 /// `dequantize_row_tq1_0`).
 fn tq1_digit(byte: u8, n: usize) -> f32 {
-    const POW3: [u8; 5] = [1, 3, 9, 27, 81];
     let q = byte.wrapping_mul(POW3[n]);
     (((q as u16 * 3) >> 8) as i16 - 1) as f32
+}
+
+const POW3: [u8; 5] = [1, 3, 9, 27, 81];
+
+/// Sixteen TQ1_0 digits as f32 lanes: lane `i` is digit `pow[i]` (as the
+/// power of three `3^n`) of byte `bytes[i]`, times `d` — [`tq1_digit`]'s
+/// integer steps per lane, so bit-identical.
+///
+/// # Safety
+/// AVX-512F must be available.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx2,fma")]
+#[inline]
+unsafe fn tq1_digits_avx512(
+    bytes: std::arch::x86_64::__m128i,
+    pow: std::arch::x86_64::__m512i,
+    d: std::arch::x86_64::__m512,
+) -> std::arch::x86_64::__m512 {
+    use std::arch::x86_64::*;
+    let q = _mm512_and_si512(_mm512_mullo_epi32(_mm512_cvtepu8_epi32(bytes), pow), _mm512_set1_epi32(0xFF));
+    let xi = _mm512_srli_epi32(_mm512_mullo_epi32(q, _mm512_set1_epi32(3)), 8);
+    _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_sub_epi32(xi, _mm512_set1_epi32(1))), d)
 }
 
 impl RawBlock for BlockTq1_0 {
@@ -155,6 +176,35 @@ impl RawBlock for BlockTq1_0 {
     const QK: usize = QK_TQ;
     const NAME: &'static str = "tq1_0";
     const CANDLE_DTYPE: GgmlDType = GgmlDType::Q2K; // placeholder, see trait docs
+
+    const DECODE_AVX512: bool = true;
+
+    /// Values `[32c, 32c + 32)` as two runs of 16: the first 160 values are
+    /// the five digits of `qs[0..32]` (16 bytes a run), the next 80 the
+    /// digits of `qs[32..48]`, and the last 16 the four digits of `qh`
+    /// (lane `4n + j`: digit `n` of `qh[j]`).
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx2,fma")]
+    #[inline]
+    unsafe fn decode_avx512(&self, c: usize) -> [std::arch::x86_64::__m512; 2] {
+        use std::arch::x86_64::*;
+        let d = _mm512_set1_ps(f16::from_le_bytes(self.d).to_f32());
+        let mut w = [_mm512_setzero_ps(); 2];
+        for (i, wi) in w.iter_mut().enumerate() {
+            let h = 2 * c + i;
+            let load = |at: usize| _mm_loadu_si128(self.qs[at..at + 16].as_ptr() as *const __m128i);
+            *wi = if h < 10 {
+                tq1_digits_avx512(load(16 * (h % 2)), _mm512_set1_epi32(POW3[h / 2] as i32), d)
+            } else if h < 15 {
+                tq1_digits_avx512(load(32), _mm512_set1_epi32(POW3[h - 10] as i32), d)
+            } else {
+                let qh = _mm_set1_epi32(i32::from_le_bytes(self.qh));
+                let pow = _mm512_setr_epi32(1, 1, 1, 1, 3, 3, 3, 3, 9, 9, 9, 9, 27, 27, 27, 27);
+                tq1_digits_avx512(qh, pow, d)
+            };
+        }
+        w
+    }
 
     fn dequantize_block(&self, out: &mut [f32]) {
         let d = f16::from_le_bytes(self.d).to_f32();
@@ -180,6 +230,27 @@ impl RawBlock for BlockTq2_0 {
     const QK: usize = QK_TQ;
     const NAME: &'static str = "tq2_0";
     const CANDLE_DTYPE: GgmlDType = GgmlDType::Q2K; // placeholder, see trait docs
+
+    const DECODE_AVX512: bool = true;
+
+    /// Values `[32c, 32c + 32)` are the 2-bit fields at bit `2·(c % 4)` of
+    /// bytes `qs[32·(c / 4)..][..32]`: shifted, masked, `(q − 1)·d`.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx2,fma")]
+    #[inline]
+    unsafe fn decode_avx512(&self, c: usize) -> [std::arch::x86_64::__m512; 2] {
+        use std::arch::x86_64::*;
+        let d = _mm512_set1_ps(f16::from_le_bytes(self.d).to_f32());
+        let shift = _mm_cvtsi32_si128(2 * (c % 4) as i32);
+        let base = 32 * (c / 4);
+        let mut w = [_mm512_setzero_ps(); 2];
+        for (i, wi) in w.iter_mut().enumerate() {
+            let bytes = _mm_loadu_si128(self.qs[base + 16 * i..].as_ptr() as *const __m128i);
+            let q = _mm512_and_si512(_mm512_srl_epi32(_mm512_cvtepu8_epi32(bytes), shift), _mm512_set1_epi32(3));
+            *wi = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_sub_epi32(q, _mm512_set1_epi32(1))), d);
+        }
+        w
+    }
 
     fn dequantize_block(&self, out: &mut [f32]) {
         let d = f16::from_le_bytes(self.d).to_f32();
@@ -341,6 +412,8 @@ mod tests {
         }
         testing::check_matmul(&testing::synthetic::<BlockTq1_0>(6, 3), 512);
         testing::check_matmul(&testing::synthetic::<BlockTq2_0>(6, 3), 512);
+        testing::check_decode_avx512(&testing::synthetic::<BlockTq1_0>(8, 3));
+        testing::check_decode_avx512(&testing::synthetic::<BlockTq2_0>(8, 3));
         testing::check_blocks_from_bytes::<BlockTq1_0>();
         testing::check_blocks_from_bytes::<BlockTq2_0>();
     }
