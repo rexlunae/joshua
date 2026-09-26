@@ -1,9 +1,15 @@
-//! Pure-Rust quantized loader for the `deepseek` and `deepseek2` GGUF
-//! architectures.
+//! Pure-Rust quantized loader for the `deepseek`, `deepseek2` and `glm-dsa`
+//! GGUF architectures.
 //!
 //! Covers DeepSeek-MoE (`deepseek`), DeepSeek-V2, DeepSeek-V2-Lite,
-//! DeepSeek-V2.5, DeepSeek-V3 / V3.1 / R1 and **Kimi-K2** — every model
-//! llama.cpp labels `general.architecture = "deepseek"` or `"deepseek2"`.
+//! DeepSeek-V2.5, DeepSeek-V3 / V3.1 / R1, **Kimi-K2** and GLM-4.7-Flash —
+//! every model llama.cpp labels `general.architecture = "deepseek"` or
+//! `"deepseek2"` — plus GLM-5 / 5.1 / 5.2 (`glm-dsa`), which add DeepSeek
+//! Sparse Attention to the same MLA + MoE stack (see [`dsa`]), and
+//! GLM-5.3-Flash (`glm5next`, also written `glm5-next`), which further swaps
+//! three in four attention layers for Kimi Delta Attention (see [`kda`]),
+//! drops RoPE, pools the indexer's keys, clamps its SwiGLUs and carries the
+//! residual as manifold-constrained hyper-connections ([`crate::mhc`]).
 //! candle ships a *full-precision* `deepseek2` model but no quantized/GGUF
 //! one, and its gate only implements DeepSeek-V2 softmax routing; this module
 //! adds the GGUF path plus the DeepSeek-V3 / Kimi-K2 sigmoid-with-bias,
@@ -42,24 +48,20 @@ use std::sync::Arc;
 
 use candle_core::quantized::{gguf_file, QMatMul, QTensor};
 use candle_core::{DType, Device, IndexOp, Module, Result, Tensor, D};
-use candle_nn::ops::{sigmoid, softmax_last_dim};
 use candle_transformers::quantized_nn::RmsNorm;
 
 use crate::attention::{cached_attention, KvCache, Rope, RopeStyle};
 use crate::gguf_meta::Meta;
 use crate::tensor_source::TensorSource;
-use crate::moe::{topk_indices, topk_values};
+use crate::moe::{topk_indices, topk_values, Gating};
 use crate::token_embedding::TokenEmbedding;
 use crate::yarn::YarnConfig;
 
-/// Expert gating (scoring) function.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Gating {
-    /// DeepSeek-V2 / V2.5: softmax over the router logits.
-    Softmax,
-    /// DeepSeek-V3 / Kimi-K2: independent sigmoid per expert.
-    Sigmoid,
-}
+mod dsa;
+mod kda;
+use dsa::{DsaConfig, IndexCache, Indexer, Selection};
+use kda::{Kda, KdaConfig, KdaState};
+use crate::mhc::HyperConnection;
 
 /// Parsed `deepseek` / `deepseek2` hyper-parameters.
 ///
@@ -95,6 +97,17 @@ struct Config {
     gating: Gating,
     n_group: usize,
     topk_group: usize,
+    /// DeepSeek Sparse Attention (`glm-dsa`, `glm5next`).
+    dsa: Option<DsaConfig>,
+    /// Per layer: Kimi Delta Attention (`glm5next`) instead of MLA.
+    recurrent: Vec<bool>,
+    kda: Option<KdaConfig>,
+    /// Hyper-connection `(streams, Sinkhorn iterations, eps)` (`glm5next`).
+    hc: Option<(usize, usize, f64)>,
+    /// Per-layer SwiGLU clamps for the routed experts and for the shared
+    /// experts / dense FFNs (`0`: none).
+    swiglu_exp: Vec<f64>,
+    swiglu_shexp: Vec<f64>,
 }
 
 impl Config {
@@ -110,7 +123,8 @@ impl Config {
 }
 
 impl Config {
-    /// Parse the hyper-parameters of a `deepseek` or `deepseek2` GGUF.
+    /// Parse the hyper-parameters of a `deepseek`, `deepseek2` or `glm-dsa`
+    /// GGUF.
     fn from_metadata(
         md: &std::collections::HashMap<String, gguf_file::Value>,
         arch: &str,
@@ -118,7 +132,14 @@ impl Config {
         let m = Meta::new(md, arch);
         let n_head = m.u32("attention.head_count")? as usize;
         let n_embd = m.u32("embedding_length")? as usize;
-        let n_layer = m.u32("block_count")? as usize;
+        // `block_count` includes any appended NextN / MTP blocks
+        // (GLM-4.7-Flash, GLM-5); those are draft heads, not trunk layers.
+        let block_count = m.u32("block_count")?;
+        let Some(n_layer) = block_count.checked_sub(m.u32_or("nextn_predict_layers", 0)) else {
+            candle_core::bail!("{arch}: nextn_predict_layers exceeds block_count {block_count}");
+        };
+        let n_layer = n_layer as usize;
+        let glm5next = matches!(arch, "glm5next" | "glm5-next");
         let rms_eps = m.f32("attention.layer_norm_rms_epsilon")? as f64;
         let context_length = m.u32("context_length")? as usize;
         if n_head == 0 {
@@ -127,7 +148,7 @@ impl Config {
 
         // MLA advertises its latent rank (required for `deepseek2`);
         // DeepSeek-MoE (`deepseek`) has none.
-        let kv_lora_rank = if arch == "deepseek2" {
+        let kv_lora_rank = if arch != "deepseek" {
             m.u32("attention.kv_lora_rank")?
         } else {
             m.u32_or("attention.kv_lora_rank", 0)
@@ -170,7 +191,8 @@ impl Config {
                 );
             }
         }
-        if qk_rope_head_dim == 0 || !qk_rope_head_dim.is_multiple_of(2) {
+        // GLM-5.3-Flash is NoPE: no rotary slice at all.
+        if (qk_rope_head_dim == 0 && !glm5next) || !qk_rope_head_dim.is_multiple_of(2) {
             candle_core::bail!(
                 "{arch}: invalid rotary dimension {qk_rope_head_dim} (must be a positive even number)"
             );
@@ -203,11 +225,9 @@ impl Config {
         let n_expert_shared = m.u32_or("expert_shared_count", 0) as usize;
         let expert_weights_scale = m.f32_or("expert_weights_scale", 0.0) as f64;
         let expert_weights_norm = m.bool_or("expert_weights_norm", false);
-        // Gating: 1=softmax, 2=sigmoid. Absent → softmax (DeepSeek-MoE / V2).
-        let gating = match m.u32_or("expert_gating_func", 1) {
-            2 => Gating::Sigmoid,
-            _ => Gating::Softmax,
-        };
+        // Absent → softmax (DeepSeek-MoE / V2); GLM-5 routes by sigmoid.
+        let glm = arch == "glm-dsa" || glm5next;
+        let gating = Gating::from_meta(&m, if glm { Gating::Sigmoid } else { Gating::Softmax });
         let n_group = m.u32_or("expert_group_count", 0) as usize;
         let topk_group = m.u32_or("expert_group_used_count", 0) as usize;
         if n_expert > 0 && (n_expert_used == 0 || n_expert_used > n_expert) {
@@ -215,6 +235,42 @@ impl Config {
                 "{arch}: expert_used_count {n_expert_used} must be in 1..=expert_count {n_expert}"
             );
         }
+
+        let dsa = if glm {
+            if q_lora_rank.is_none() {
+                candle_core::bail!("{arch}: sparse attention needs the Q LoRA projection (attention.q_lora_rank)");
+            }
+            Some(DsaConfig::from_meta(&m, n_layer, qk_rope_head_dim, context_length)?)
+        } else {
+            None
+        };
+
+        // GLM-5.3-Flash marks its KDA layers with a zero KV head count.
+        let recurrent: Vec<bool> = if glm5next {
+            m.array_u32("attention.head_count_kv", n_layer).iter().map(|&n| n == 0).collect()
+        } else {
+            vec![false; n_layer]
+        };
+        let kda = glm5next.then(|| KdaConfig::from_meta(&m, n_head)).transpose()?;
+        let hc = if glm5next {
+            let n = m.u32("hyper_connection.count")? as usize;
+            if n < 2 {
+                candle_core::bail!("{arch}: hyper_connection.count must be at least 2, got {n}");
+            }
+            Some((
+                n,
+                m.u32_or("hyper_connection.sinkhorn_iterations", 20) as usize,
+                m.f32_or("hyper_connection.epsilon", 1e-6) as f64,
+            ))
+        } else {
+            None
+        };
+        let swiglu_exp = m.array_f64("swiglu_clamp_exp", n_layer);
+        let swiglu_shexp = if m.contains("swiglu_clamp_shexp") {
+            m.array_f64("swiglu_clamp_shexp", n_layer)
+        } else {
+            swiglu_exp.clone()
+        };
 
         Ok(Self {
             n_layer,
@@ -240,6 +296,12 @@ impl Config {
             gating,
             n_group,
             topk_group,
+            dsa,
+            recurrent,
+            kda,
+            hc,
+            swiglu_exp,
+            swiglu_shexp,
         })
     }
 }
@@ -280,22 +342,29 @@ struct Mlp {
     gate: QMatMul,
     up: QMatMul,
     down: QMatMul,
+    /// SwiGLU clamp (`0`: none; see [`swiglu`]).
+    limit: f64,
     /// Per-tensor byte-range handles for best-effort page prefetch, present
     /// only when the weights are borrowed from the model mapping.
     prefetch: Option<crate::residency::ExpertHandles>,
 }
 
 /// `down(silu(gate(x)) * up(x))` — the one SwiGLU body shared by dense
-/// layers, shared experts and both forms of a routed expert.
-fn swiglu(gate: &QMatMul, up: &QMatMul, down: &QMatMul, xs: &Tensor) -> Result<Tensor> {
-    let gate = candle_nn::ops::silu(&gate.forward(xs)?)?;
-    let up = up.forward(xs)?;
-    down.forward(&(gate * up)?)
+/// layers, shared experts and both forms of a routed expert.  A positive
+/// `limit` first clamps `gate(x)` from above and `up(x)` to `±limit`
+/// (GLM-5.3-Flash, llama.cpp `ggml_swiglu_clamp`).
+fn swiglu(gate: &QMatMul, up: &QMatMul, down: &QMatMul, xs: &Tensor, limit: f64) -> Result<Tensor> {
+    let (mut gate, mut up) = (gate.forward(xs)?, up.forward(xs)?);
+    if limit > 0.0 {
+        gate = gate.clamp(f64::NEG_INFINITY, limit)?;
+        up = up.clamp(-limit, limit)?;
+    }
+    down.forward(&(candle_nn::ops::silu(&gate)? * up)?)
 }
 
 impl Mlp {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        swiglu(&self.gate, &self.up, &self.down, xs)
+        swiglu(&self.gate, &self.up, &self.down, xs, self.limit)
     }
 }
 
@@ -318,6 +387,19 @@ impl QProj {
             Self::Lora { a, norm, b } => b.forward(&norm.forward(&a.forward(xs)?)?),
         }
     }
+
+    /// The LoRA stack split at its latent `norm(a(x))` (which the sparse
+    /// attention indexer also reads): `(latent, b(latent))`.
+    fn forward_latent(&self, xs: &Tensor) -> Result<(Tensor, Tensor)> {
+        match self {
+            Self::Lora { a, norm, b } => {
+                let latent = norm.forward(&a.forward(xs)?)?;
+                let q = b.forward(&latent)?;
+                Ok((latent, q))
+            }
+            Self::Plain(_) => candle_core::bail!("sparse attention needs a LoRA Q projection"),
+        }
+    }
 }
 
 // ─── Attention ───────────────────────────────────────────────────────────────
@@ -333,10 +415,12 @@ impl QProj {
 // the cost of caching the ~8x larger per-head form (still far below a plain
 // MHA model, since MLA keeps Q and the latent low-rank).
 
-/// A layer's attention block: MLA (`deepseek2`) or GQA (`deepseek`).
+/// A layer's attention block: MLA (`deepseek2`), GQA (`deepseek`) or Kimi
+/// Delta Attention (`glm5next`'s linear layers).
 enum Attention {
     Mla(MlaAttention),
     Gqa(GqaAttention),
+    Kda(Kda),
 }
 
 impl Attention {
@@ -350,6 +434,7 @@ impl Attention {
         match self {
             Self::Mla(a) => a.forward(kv_cache, xs, mask, offset),
             Self::Gqa(a) => a.forward(kv_cache, xs, mask, offset),
+            Self::Kda(_) => unreachable!("KDA layers run through their recurrent state"),
         }
     }
 }
@@ -399,7 +484,8 @@ struct MlaAttention {
     /// Combined KV up-projection: kv_lora_rank → n_head*(qk_nope + v_head_dim).
     kv_b: KvB,
     o_proj: QMatMul,
-    rotary: Arc<Rope>,
+    /// `None` for NoPE MLA (GLM-5.3-Flash: `qk_rope == 0`).
+    rotary: Option<Arc<Rope>>,
     n_head: usize,
     kv_lora_rank: usize,
     qk_nope: usize,
@@ -434,16 +520,25 @@ impl MlaAttention {
         mask: Option<&Tensor>,
         offset: usize,
     ) -> Result<Tensor> {
+        self.forward_q(kv_cache, xs, self.q.forward(xs)?, mask, offset)
+    }
+
+    /// [`Self::forward`] with the Q projection `q` (`[b, seq, n_head ·
+    /// q_head_dim]`) already applied.
+    fn forward_q(
+        &self,
+        kv_cache: &mut KvCache,
+        xs: &Tensor,
+        q: Tensor,
+        mask: Option<&Tensor>,
+        offset: usize,
+    ) -> Result<Tensor> {
         let (b, seq_len, _) = xs.dims3()?;
 
         // Q → [b, n_head, seq, q_head_dim], split into nope/rope slices.
-        let q = self
-            .q
-            .forward(xs)?
+        let q = q
             .reshape((b, seq_len, self.n_head, self.q_head_dim))?
             .transpose(1, 2)?;
-        let q_nope = q.narrow(D::Minus1, 0, self.qk_nope)?;
-        let q_pe = q.narrow(D::Minus1, self.qk_nope, self.qk_rope)?;
 
         // Compressed KV: [b, seq, kv_lora_rank + qk_rope]; the trailing slice is
         // a single-head RoPE key shared (MQA-style) across all query heads.
@@ -451,15 +546,26 @@ impl MlaAttention {
         let kv_cmpr = compressed
             .narrow(D::Minus1, 0, self.kv_lora_rank)?
             .contiguous()?;
-        let k_pe = compressed
-            .narrow(D::Minus1, self.kv_lora_rank, self.qk_rope)?
-            .reshape((b, seq_len, 1, self.qk_rope))?
-            .transpose(1, 2)?;
-
         // RoPE the *_pe slices, then reassemble Q (nope ‖ rope).  The single-head
         // key is RoPE'd here too; the cached copy is already post-RoPE.
-        let (q_pe, k_pe) = self.rotary.apply_pair(&q_pe, &k_pe, offset)?;
-        let q = Tensor::cat(&[&q_nope.contiguous()?, &q_pe.contiguous()?], D::Minus1)?;
+        let rope = match &self.rotary {
+            Some(rotary) => {
+                let q_pe = q.narrow(D::Minus1, self.qk_nope, self.qk_rope)?;
+                let k_pe = compressed
+                    .narrow(D::Minus1, self.kv_lora_rank, self.qk_rope)?
+                    .reshape((b, seq_len, 1, self.qk_rope))?
+                    .transpose(1, 2)?;
+                Some(rotary.apply_pair(&q_pe, &k_pe, offset)?)
+            }
+            None => None,
+        };
+        let q = match &rope {
+            Some((q_pe, _)) => {
+                let q_nope = q.narrow(D::Minus1, 0, self.qk_nope)?;
+                Tensor::cat(&[&q_nope.contiguous()?, &q_pe.contiguous()?], D::Minus1)?
+            }
+            None => q.contiguous()?,
+        };
 
         // Reconstruct per-head K/V for the *new* tokens only (see the cache note
         // above).
@@ -474,8 +580,13 @@ impl MlaAttention {
         let k_nope = kv.narrow(D::Minus1, 0, self.qk_nope)?; // [b, n_head, seq_len, qk_nope]
         let v = kv.narrow(D::Minus1, self.qk_nope, self.v_head_dim)?; // [b, n_head, seq_len, v_head_dim]
         // The single-head RoPE'd key is shared (MQA-style) across query heads.
-        let k_pe = k_pe.broadcast_as((b, self.n_head, seq_len, self.qk_rope))?;
-        let k_new = Tensor::cat(&[&k_nope.contiguous()?, &k_pe], D::Minus1)?; // [b, n_head, seq_len, q_head_dim]
+        let k_new = match &rope {
+            Some((_, k_pe)) => {
+                let k_pe = k_pe.broadcast_as((b, self.n_head, seq_len, self.qk_rope))?;
+                Tensor::cat(&[&k_nope.contiguous()?, &k_pe], D::Minus1)? // [b, n_head, seq_len, q_head_dim]
+            }
+            None => k_nope.contiguous()?,
+        };
 
         let ctx = cached_attention(
             kv_cache,
@@ -499,6 +610,7 @@ struct DeviceExpert {
     gate: QMatMul,
     up: QMatMul,
     down: QMatMul,
+    limit: f64,
     bytes: u64,
 }
 
@@ -510,7 +622,7 @@ impl crate::residency::DeviceExpertSlot for DeviceExpert {
 
 impl DeviceExpert {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        swiglu(&self.gate, &self.up, &self.down, xs)
+        swiglu(&self.gate, &self.up, &self.down, xs, self.limit)
     }
 }
 
@@ -544,31 +656,17 @@ impl Moe {
         let n_tokens = b * seq_len;
         let x2 = xs.reshape((n_tokens, h))?;
 
-        // Router logits → per-expert scores.
-        let logits = x2.matmul(&self.gate_t)?; // [n_tokens, n_expert]
-        let probs = match self.gating {
-            Gating::Softmax => softmax_last_dim(&logits)?,
-            Gating::Sigmoid => sigmoid(&logits)?,
-        };
-
-        // Selection scores add the aux-loss-free bias; final weights use the
-        // *unbiased* probs.
-        let selection = match &self.gate_bias {
-            Some(bias) => probs.broadcast_add(&bias.reshape((1, ()))?)?,
-            None => probs.clone(),
-        };
-        let selection = self.group_limit(&selection, n_tokens)?;
-
-        let topk_idx = topk_indices(&selection, self.n_expert_used)?; // [n_tokens, k]
-        let mut weights = probs.gather(&topk_idx, D::Minus1)?; // [n_tokens, k]
-        if self.weights_norm {
-            // Min-clamp to the f16 epsilon, matching llama.cpp.
-            let denom = weights.sum_keepdim(D::Minus1)?.clamp(6.103_515_6e-5, f32::INFINITY)?;
-            weights = weights.broadcast_div(&denom)?;
-        }
-        if self.weights_scale != 0.0 && self.weights_scale != 1.0 {
-            weights = (weights * self.weights_scale)?;
-        }
+        // Router logits → per-expert scores; selection adds the aux-loss-free
+        // bias and the group limit, the weights use the unbiased scores.
+        let probs = self.gating.scores(&x2.matmul(&self.gate_t)?)?; // [n_tokens, n_expert]
+        let (topk_idx, weights) = crate::moe::route(
+            &probs,
+            self.gate_bias.as_ref(),
+            self.n_expert_used,
+            self.weights_norm,
+            self.weights_scale,
+            |sel| self.group_limit(&sel, n_tokens),
+        )?;
 
         // dispatch already drains the routed ids to the host for its own
         // bucketing; reuse them for the hot-expert cache instead of a second
@@ -601,8 +699,8 @@ impl Moe {
         //     so this path intentionally follows the model definition, not
         //     llama.cpp.)
         let group_score = match self.gating {
-            Gating::Sigmoid => topk_values(&grouped, 2)?.sum(D::Minus1)?,
             Gating::Softmax => grouped.max(D::Minus1)?,
+            _ => topk_values(&grouped, 2)?.sum(D::Minus1)?,
         };
         let group_idx = topk_indices(&group_score, self.topk_group)?; // [n_tokens, topk_group]
         // Mask: 1.0 for selected groups.
@@ -694,11 +792,41 @@ impl FeedForward {
     }
 }
 
+/// How a layer's attention picks its keys.
+enum Sparse {
+    /// Every causally visible key.
+    Dense,
+    /// Its own lightning indexer (`glm-dsa` full layers).  `publish` when
+    /// later layers share the selection.
+    Full { indexer: Indexer, publish: bool },
+    /// The selection published by full layer `source`; `last` for the final
+    /// layer sharing it, which retires it.
+    Shared { source: usize, last: bool },
+}
+
 struct Layer {
     attn_norm: RmsNorm,
     attn: Attention,
+    sparse: Sparse,
     ffn_norm: RmsNorm,
     ffn: FeedForward,
+    /// The attention and FFN hyper-connections (`glm5next`); `None`: a plain
+    /// pre-norm residual.
+    hyper: Option<[HyperConnection; 2]>,
+}
+
+/// One layer's per-session state.
+#[derive(Clone, Default)]
+pub struct LayerState {
+    kv: KvCache,
+    /// Sparse-attention indexer state (full layers).
+    index: IndexCache,
+    /// Kimi Delta Attention state (`glm5next` linear layers).
+    kda: Option<KdaState>,
+    /// Selections a full layer has published and its sharers have not yet
+    /// all read, oldest first (one per input chunk; see
+    /// [`crate::native_session::LayerStack::layer`]).
+    published: Vec<Selection>,
 }
 
 /// The immutable half of a loaded model: every weight, the expert residency
@@ -716,10 +844,61 @@ pub struct Weights {
     /// cache later).  Built once at load from the per-expert handles.
     residency: Arc<dyn crate::residency::ExpertResidency>,
     n_expert: usize,
+    /// Hyper-connection `(streams, Sinkhorn iterations, eps)` and the RMS
+    /// eps the mixers normalise with (`glm5next`).
+    hc: Option<(usize, usize, f64)>,
+    rms_eps: f64,
+}
+
+impl Weights {
+    /// The attention sublayer over its normalised input `x`.
+    fn attend(
+        &self,
+        l: usize,
+        states: &mut [LayerState],
+        x: &Tensor,
+        input: &crate::native_session::LayerInput<'_>,
+    ) -> Result<Tensor> {
+        let layer = &self.layers[l];
+        let offset = input.offset;
+        match (&layer.attn, &layer.sparse) {
+            (Attention::Kda(k), _) => k.forward(&mut states[l].kda, x),
+            (Attention::Mla(a), Sparse::Full { .. } | Sparse::Shared { .. }) => {
+                let (latent, q) = a.q.forward_latent(x)?;
+                let selection = match &layer.sparse {
+                    Sparse::Full { indexer, publish } => {
+                        let sel = indexer.select(&mut states[l].index, x, &latent, offset)?;
+                        if *publish {
+                            states[l].published.push(sel.clone());
+                        }
+                        sel
+                    }
+                    Sparse::Shared { source, last } => {
+                        let published = &mut states[*source].published;
+                        let Some(i) = published.iter().position(|s| s.offset == offset) else {
+                            candle_core::bail!(
+                                "layer {l} found no sparse-attention selection from layer {source} at \
+                                 position {offset}"
+                            );
+                        };
+                        if *last {
+                            published.remove(i)
+                        } else {
+                            published[i].clone()
+                        }
+                    }
+                    Sparse::Dense => unreachable!(),
+                };
+                let sparse = selection.mask(x.device())?;
+                a.forward_q(&mut states[l].kv, x, q, sparse.as_ref().or(input.mask), offset)
+            }
+            (attn, _) => attn.forward(&mut states[l].kv, x, input.mask, offset),
+        }
+    }
 }
 
 impl crate::native_session::LayerStack for Weights {
-    type State = KvCache;
+    type State = LayerState;
 
     fn n_layers(&self) -> usize {
         self.layers.len()
@@ -737,26 +916,68 @@ impl crate::native_session::LayerStack for Weights {
         &self.residency
     }
 
+    fn lift(&self, emb: Tensor) -> Result<Tensor> {
+        match self.hc {
+            // The streams start as identical copies of the embedding.
+            Some((hc, ..)) => {
+                let (b, t, n) = emb.dims3()?;
+                emb.unsqueeze(2)?.broadcast_as((b, t, hc, n))?.reshape((b, t, hc * n))
+            }
+            None => Ok(emb),
+        }
+    }
+
     fn layer(
         &self,
         l: usize,
-        kv: &mut KvCache,
+        states: &mut [LayerState],
         xs: &Tensor,
         input: &crate::native_session::LayerInput<'_>,
     ) -> Result<(Tensor, Vec<u32>)> {
         let layer = &self.layers[l];
-        let h = layer.attn.forward(kv, &layer.attn_norm.forward(xs)?, input.mask, input.offset)?;
-        let xs = (xs + h)?;
-        let (h, routed) = layer.ffn.forward_routed(&layer.ffn_norm.forward(&xs)?)?;
-        Ok(((xs + h)?, routed))
+        let (Some([hc_attn, hc_ffn]), Some((hc, iters, eps))) = (&layer.hyper, self.hc) else {
+            let h = self.attend(l, states, &layer.attn_norm.forward(xs)?, input)?;
+            let xs = (xs + h)?;
+            let (h, routed) = layer.ffn.forward_routed(&layer.ffn_norm.forward(&xs)?)?;
+            return Ok(((xs + h)?, routed));
+        };
+        // Each sublayer reads the streams collapsed by its mixer and writes
+        // back through it.
+        let (b, t, wide) = xs.dims3()?;
+        let res = xs.reshape((b, t, hc, wide / hc))?;
+        let (x, mix) = hc_attn.enter(&res, self.rms_eps, iters, eps)?;
+        let h = self.attend(l, states, &layer.attn_norm.forward(&x)?, input)?;
+        let res = crate::mhc::post(&h, &res, &mix.post, &mix.comb)?;
+        let (x, mix) = hc_ffn.enter(&res, self.rms_eps, iters, eps)?;
+        let (h, routed) = layer.ffn.forward_routed(&layer.ffn_norm.forward(&x)?)?;
+        let out = crate::mhc::post(&h, &res, &mix.post, &mix.comb)?;
+        Ok((out.reshape((b, t, wide))?, routed))
     }
 
     fn head(&self, xs: &Tensor) -> Result<Tensor> {
-        self.output.forward(&self.norm.forward(xs)?)?.to_dtype(DType::F32)
+        // GLM-5.3-Flash collapses the streams by their plain mean.
+        let xs = match self.hc {
+            Some((hc, ..)) => {
+                let (b, t, wide) = xs.dims3()?;
+                xs.reshape((b, t, hc, wide / hc))?.mean(2)?
+            }
+            None => xs.clone(),
+        };
+        self.output.forward(&self.norm.forward(&xs)?)?.to_dtype(DType::F32)
     }
 
-    fn truncate_state(kv: &mut KvCache, keep: usize) -> Result<()> {
-        crate::moe::truncate_kv(kv, keep, crate::attention::KV_SEQ_DIM)
+    fn can_truncate(&self) -> bool {
+        !self.layers.iter().any(|l| matches!(l.attn, Attention::Kda(_)))
+    }
+
+    fn truncate_state(state: &mut LayerState, keep: usize) -> Result<()> {
+        if keep == 0 {
+            *state = LayerState::default();
+            return Ok(());
+        }
+        state.published.clear();
+        state.index.truncate(keep)?;
+        crate::moe::truncate_kv(&mut state.kv, keep, crate::attention::KV_SEQ_DIM)
     }
 }
 
@@ -804,19 +1025,32 @@ impl<R: Read + Seek> Reader<R> {
     }
     /// A dense SwiGLU block: `{p}.ffn_{gate,up,down}{suffix}.weight`
     /// (`suffix` is `""` for a dense layer, `"_shexp"` for shared experts).
-    fn mlp(&mut self, p: &str, suffix: &str) -> Result<Mlp> {
+    fn mlp(&mut self, p: &str, suffix: &str, limit: f64) -> Result<Mlp> {
         Ok(Mlp {
             gate: self.qmatmul(&format!("{p}.ffn_gate{suffix}.weight"))?,
             up: self.qmatmul(&format!("{p}.ffn_up{suffix}.weight"))?,
             down: self.qmatmul(&format!("{p}.ffn_down{suffix}.weight"))?,
+            limit,
             prefetch: None,
         })
     }
 
+    /// A sublayer's hyper-connection mixer `{p}_{fn,base,scale}`.
+    fn hyper_connection(&mut self, p: &str) -> Result<HyperConnection> {
+        Ok(HyperConnection {
+            hc_fn: self.qmatmul(&format!("{p}_fn.weight"))?,
+            base: self.f32_tensor(&format!("{p}_base.weight"))?,
+            scale: self.f32_tensor(&format!("{p}_scale.weight"))?,
+        })
+    }
+
     /// Layer `p`'s attention block, MLA or GQA per `cfg`.
-    fn attention(&mut self, p: &str, cfg: &Config, rotary: &Arc<Rope>) -> Result<Attention> {
+    fn attention(&mut self, p: &str, cfg: &Config, rotary: &Option<Arc<Rope>>) -> Result<Attention> {
         let o_proj = self.qmatmul(&format!("{p}.attn_output.weight"))?;
         if !cfg.is_mla() {
+            let Some(rotary) = rotary else {
+                candle_core::bail!("{}: GQA attention needs rotary dims", self.arch);
+            };
             return Ok(Attention::Gqa(GqaAttention {
                 q: self.qmatmul(&format!("{p}.attn_q.weight"))?,
                 k: self.qmatmul(&format!("{p}.attn_k.weight"))?,
@@ -912,6 +1146,11 @@ impl ModelWeights {
     ) -> Result<Self> {
         let arch = match crate::model::Architecture::arch_name(&ct.metadata).as_deref() {
             Some("deepseek") => "deepseek",
+            Some("glm-dsa") => "glm-dsa",
+            // llama.cpp's open GLM-5.3-Flash pull requests name the
+            // architecture differently; the files are otherwise the same.
+            Some("glm5next") => "glm5next",
+            Some("glm5-next") => "glm5-next",
             _ => "deepseek2",
         };
         if !expert_device.is_cpu() && !expert_device.same_device(device) {
@@ -945,7 +1184,13 @@ impl ModelWeights {
             None => rd.qmatmul("token_embd.weight")?, // tied
         };
 
-        let rotary = Arc::new(rope_table(&cfg, device)?);
+        let rotary = (cfg.qk_rope_head_dim > 0)
+            .then(|| rope_table(&cfg, device).map(Arc::new))
+            .transpose()?;
+        // The sparse-attention role of each MLA layer: full layers run their
+        // indexer, shared ones reuse the nearest earlier full layer's
+        // selection (skipping any KDA layers in between).
+        let mla_layers: Vec<usize> = (0..cfg.n_layer).filter(|&i| !cfg.recurrent[i]).collect();
 
         let mut layers = Vec::with_capacity(cfg.n_layer);
         for i in 0..cfg.n_layer {
@@ -953,19 +1198,53 @@ impl ModelWeights {
             let attn_norm = rd.rms_norm(&format!("{p}.attn_norm.weight"), cfg.rms_eps)?;
             let ffn_norm = rd.rms_norm(&format!("{p}.ffn_norm.weight"), cfg.rms_eps)?;
 
-            let attn = rd.attention(&p, &cfg, &rotary)?;
+            let attn = match &cfg.kda {
+                Some(k) if cfg.recurrent[i] => Attention::Kda(Kda::load(&mut rd, &p, k, cfg.rms_eps)?),
+                _ => rd.attention(&p, &cfg, &rotary)?,
+            };
+            let sparse = match &cfg.dsa {
+                Some(d) if !cfg.recurrent[i] => {
+                    let at = mla_layers.iter().position(|&j| j == i).expect("an MLA layer");
+                    let next_shares = mla_layers.get(at + 1).is_some_and(|&j| !d.full[j]);
+                    if d.full[i] {
+                        Sparse::Full {
+                            indexer: Indexer::load(&mut rd, &p, d, rotary.clone())?,
+                            publish: next_shares,
+                        }
+                    } else {
+                        let Some(&source) = mla_layers[..at].iter().rev().find(|&&j| d.full[j]) else {
+                            candle_core::bail!(
+                                "{}: layer {i} shares a sparse-attention selection but no earlier layer \
+                                 makes one",
+                                rd.arch
+                            );
+                        };
+                        Sparse::Shared { source, last: !next_shares }
+                    }
+                }
+                _ => Sparse::Dense,
+            };
 
             let ffn = if cfg.n_expert > 0 && i >= cfg.leading_dense {
-                FeedForward::Moe(load_moe(&mut rd, &p, &cfg)?)
+                FeedForward::Moe(load_moe(&mut rd, &p, &cfg, i)?)
             } else {
-                FeedForward::Dense(rd.mlp(&p, "")?)
+                FeedForward::Dense(rd.mlp(&p, "", cfg.swiglu_shexp[i])?)
+            };
+            let hyper = match cfg.hc {
+                Some(_) => Some([
+                    rd.hyper_connection(&format!("{p}.hc_attn"))?,
+                    rd.hyper_connection(&format!("{p}.hc_ffn"))?,
+                ]),
+                None => None,
             };
 
             layers.push(Layer {
                 attn_norm,
                 attn,
+                sparse,
                 ffn_norm,
                 ffn,
+                hyper,
             });
         }
 
@@ -989,6 +1268,8 @@ impl ModelWeights {
             device: device.clone(),
             residency,
             n_expert: cfg.n_expert,
+            hc: cfg.hc,
+            rms_eps: cfg.rms_eps,
         }))
     }
 }
@@ -1025,7 +1306,7 @@ fn load_kv_b<R: Read + Seek>(rd: &mut Reader<R>, p: &str, cfg: &Config) -> Resul
 
 /// Load a MoE feed-forward block: quantized per-expert SwiGLU experts, the f32
 /// router (+ optional bias), and any shared experts.
-fn load_moe<R: Read + Seek>(rd: &mut Reader<R>, p: &str, cfg: &Config) -> Result<Moe> {
+fn load_moe<R: Read + Seek>(rd: &mut Reader<R>, p: &str, cfg: &Config, il: usize) -> Result<Moe> {
     let gate = rd.f32_tensor(&format!("{p}.ffn_gate_inp.weight"))?; // [n_expert, n_embd]
     let gate_bias = rd
         .has(&format!("{p}.exp_probs_b.bias"))
@@ -1044,6 +1325,7 @@ fn load_moe<R: Read + Seek>(rd: &mut Reader<R>, p: &str, cfg: &Config) -> Result
             gate: gate.qmatmul,
             up: up.qmatmul,
             down: down.qmatmul,
+            limit: cfg.swiglu_exp[il],
             prefetch: crate::residency::ExpertHandles::from_parts(
                 gate.prefetch,
                 up.prefetch,
@@ -1053,7 +1335,7 @@ fn load_moe<R: Read + Seek>(rd: &mut Reader<R>, p: &str, cfg: &Config) -> Result
         .collect();
 
     let shared = if cfg.n_expert_shared > 0 {
-        Some(rd.mlp(p, "_shexp")?)
+        Some(rd.mlp(p, "_shexp", cfg.swiglu_shexp[il])?)
     } else {
         None
     };
@@ -1092,6 +1374,7 @@ fn load_moe<R: Read + Seek>(rd: &mut Reader<R>, p: &str, cfg: &Config) -> Result
                         gate,
                         up,
                         down,
+                        limit: m.limit,
                         bytes: per_slot,
                     }));
                 }
@@ -1099,6 +1382,7 @@ fn load_moe<R: Read + Seek>(rd: &mut Reader<R>, p: &str, cfg: &Config) -> Result
                     gate: m.gate.clone(),
                     up: m.up.clone(),
                     down: m.down.clone(),
+                    limit: m.limit,
                     bytes: per_slot,
                 }))
             });
@@ -1274,6 +1558,12 @@ mod tests {
             gating: Gating::Sigmoid,
             n_group: 1,
             topk_group: 1,
+            dsa: None,
+            recurrent: vec![false],
+            kda: None,
+            hc: None,
+            swiglu_exp: vec![0.0],
+            swiglu_shexp: vec![0.0],
         };
         Ok(Attention::Mla(MlaAttention {
             q: QProj::Plain(lin(w.nh * w.qd, w.h, &w.q)),
@@ -1281,7 +1571,7 @@ mod tests {
             kv_a_norm: norm,
             kv_b: KvB::Dense(w.kv_b.clone()),
             o_proj: lin(w.h, w.nh * w.vh, &w.o),
-            rotary: Arc::new(rope_table(&cfg, dev)?),
+            rotary: Some(Arc::new(rope_table(&cfg, dev)?)),
             n_head: w.nh,
             kv_lora_rank: w.lkv,
             qk_nope: w.np,
@@ -1392,6 +1682,7 @@ mod tests {
                 gate: lin(ffn, h),
                 up: lin(ffn, h),
                 down: lin(h, ffn),
+                limit: 0.0,
                 prefetch: None,
             })
             .collect();

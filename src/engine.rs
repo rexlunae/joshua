@@ -72,7 +72,8 @@
 //! |------------------------|-------------
 //! | `llama`                | Llama 1/2/3, Mistral, Mixtral, TinyLlama, SmolLM, Yi, …
 //! | `gemma` / `gemma2` / `gemma3` / `gemma-embedding` | Gemma 1/2/3
-//! | `glm4`                 | GLM-4
+//! | `chatglm` / `glm4` / `glm4moe` | ChatGLM2/3, GLM-4, GLM-4.5 – 4.7
+//! | `glm-dsa` / `glm5next` | GLM-5 / 5.1 / 5.2, GLM-5.3-Flash
 //! | `lfm2`                 | LFM2
 //! | `phi2`                 | Phi-1, Phi-1.5, Phi-2
 //! | `phi3`                 | Phi-3 / Phi-3.5
@@ -3169,11 +3170,12 @@ fn probed_embedding_names(arch: Option<Architecture>) -> &'static [&'static str]
 /// projections of the joshua-native loaders (`quantized_qwen` incl. its
 /// Gated DeltaNet projections, `deepseek2`, `deepseek4`) and the stock
 /// candle loaders (`llama` incl. Mixtral's
-/// per-expert `ffn_gate.<i>` matrices, `gemma*`, `glm4`, `lfm2` with its
+/// per-expert `ffn_gate.<i>` matrices, `gemma*`, `lfm2` with its
 /// `feed_forward.*` / `mlp.*_proj` / `shortconv.*_proj` aliases, `phi*`,
-/// `qwen2`, `qwen3`), and deepseek4's hyper-connection, indexer and
-/// compressor projections.
-const QUANTIZED_MATRIX_STEMS: [&str; 60] = [
+/// `qwen2`, `qwen3`), deepseek4's hyper-connection, indexer and compressor
+/// projections, and GLM-5.x's indexer key and KDA low-rank gate
+/// projections.
+const QUANTIZED_MATRIX_STEMS: [&str; 65] = [
     "attn_q",
     "attn_k",
     "attn_v",
@@ -3203,6 +3205,11 @@ const QUANTIZED_MATRIX_STEMS: [&str; 60] = [
     "output_hc_fn",
     "indexer.proj",
     "indexer.attn_q_b",
+    "indexer.attn_k",
+    "ssm_f_a",
+    "ssm_f_b",
+    "ssm_g_a",
+    "ssm_g_b",
     "attn_compressor_kv",
     "attn_compressor_gate",
     "indexer_compressor_kv",
@@ -3240,12 +3247,12 @@ const QUANTIZED_MATRIX_STEMS: [&str; 60] = [
 /// accelerator (besides norms and biases, matched by name): deepseek2's
 /// split-KV halves (folded into a dense up-projection), deepseek4's
 /// hyper-connection and compressor position vectors, lfm2's conv kernels,
-/// and the Qwen loader's DeltaNet conv kernels / decay rates and
-/// shared-expert gate vectors.
+/// the Qwen loader's DeltaNet conv kernels / decay rates and shared-expert
+/// gate vectors, and GLM-5.3-Flash's per-projection KDA conv kernels.
 /// The MoE router (`ffn_gate_inp`) is handled per architecture in
 /// [`residency`]: the joshua-native loaders read it with `f32_tensor`, the
 /// stock `llama` loader (Mixtral) keeps it a quantized `QMatMul`.
-const F32_STEMS: [&str; 15] = [
+const F32_STEMS: [&str; 18] = [
     "attn_k_b",
     "attn_v_b",
     "hc_attn_base",
@@ -3258,6 +3265,9 @@ const F32_STEMS: [&str; 15] = [
     "indexer_compressor_ape",
     "shortconv.conv",
     "ssm_conv1d",
+    "ssm_conv1d_q",
+    "ssm_conv1d_k",
+    "ssm_conv1d_v",
     "ssm_a",
     "ffn_gate_inp_shexp",
     "ple_conv1d",

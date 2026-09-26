@@ -8,14 +8,16 @@
 //! |-------------------------------------------------|---------------------------
 //! | `llama` (Llama 1-3, Mistral, Mixtral, TinyLlama, SmolLM, Vicuna, Zephyr, Yi, …) | `quantized_llama`
 //! | `gemma` / `gemma2` / `gemma3` / `gemma-embedding` | `quantized_gemma3`
-//! | `glm4`                                          | `quantized_glm4`
 //! | `lfm2`                                          | `quantized_lfm2`
 //! | `phi2`                                          | `quantized_phi`
 //! | `phi3`                                          | `quantized_phi3`
 //! | `qwen2`                                         | `quantized_qwen2`
 //! | `qwen`, `qwen2moe`, `qwen2vl`, `qwen3`, `qwen3moe`, `qwen3vl`, `qwen3vlmoe`, `qwen3next`, `qwen35`, `qwen35moe`, `qwen4exp` | `quantized_qwen` (Joshua)
+//! | `chatglm` (ChatGLM2/3, GLM-4-9B-Chat), `glm4` (GLM-4-0414, GLM-4.1V, GLM-OCR), `glm4moe` (GLM-4.5/4.6/4.7, Solar-Open) | `quantized_qwen` (Joshua)
 //! | `deepseek` (DeepSeek-MoE)                        | `quantized_deepseek2` (Joshua)
-//! | `deepseek2` (DeepSeek-V2/V2.5/V3/V3.1/R1, Kimi-K2) | `quantized_deepseek2` (Joshua)
+//! | `deepseek2` (DeepSeek-V2/V2.5/V3/V3.1/R1, Kimi-K2, GLM-4.7-Flash) | `quantized_deepseek2` (Joshua)
+//! | `glm-dsa` (GLM-5 / 5.1 / 5.2)                    | `quantized_deepseek2` (Joshua)
+//! | `glm5next` / `glm5-next` (GLM-5.3-Flash)         | `quantized_deepseek2` (Joshua)
 //! | `deepseek4` (DeepSeek-V4), `deepseek41` (DeepSeek-V4.1) | `quantized_deepseek4` (Joshua)
 //!
 //! The dense DeepSeek releases — DeepSeek-LLM, DeepSeek-Coder (V1) and the
@@ -31,10 +33,10 @@ use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 
 use candle_core::quantized::gguf_file;
-use candle_core::{DType, Device, Result, Tensor};
+use candle_core::{Device, Result, Tensor};
 use candle_transformers::models::{
-    quantized_gemma3, quantized_glm4, quantized_lfm2, quantized_llama, quantized_phi,
-    quantized_phi3, quantized_qwen2,
+    quantized_gemma3, quantized_lfm2, quantized_llama, quantized_phi, quantized_phi3,
+    quantized_qwen2,
 };
 
 // ─── Architecture enum ──────────────────────────────────────────────────────
@@ -47,8 +49,15 @@ pub enum Architecture {
     Llama,
     /// `gemma`, `gemma2`, `gemma3`, `gemma-embedding`.
     Gemma,
-    /// `glm4` — GLM-4 dense models.
+    /// `chatglm` — ChatGLM2 / ChatGLM3 / GLM-4-9B-Chat (fused QKV, fused
+    /// SwiGLU).
+    ChatGlm,
+    /// `glm4` — GLM-4-0414 dense models, GLM-4.1V (text) and GLM-OCR
+    /// (sandwich norms).
     Glm4,
+    /// `glm4moe` — GLM-4.5 / 4.5-Air / 4.6 / 4.7 and Solar-Open (sigmoid-routed
+    /// MoE with a shared expert).
+    Glm4Moe,
     /// `lfm2` — Liquid LFM2 hybrid (attention + short-conv) models.
     Lfm2,
     /// `phi2` — Phi-1, Phi-1.5, Phi-2.
@@ -84,9 +93,16 @@ pub enum Architecture {
     /// experts).  Loaded by the `deepseek2` loader into
     /// [`QuantizedModel::DeepSeek2`].
     DeepSeek,
-    /// `deepseek2` — DeepSeek-V2/V2.5/V3/V3.1/R1 and Kimi-K2 (MLA +
-    /// fine-grained MoE).
+    /// `deepseek2` — DeepSeek-V2/V2.5/V3/V3.1/R1, Kimi-K2 and GLM-4.7-Flash
+    /// (MLA + fine-grained MoE).
     DeepSeek2,
+    /// `glm-dsa` — GLM-5 / 5.1 / 5.2 (the `deepseek2` stack plus DeepSeek
+    /// Sparse Attention with IndexShare).  Served by the `deepseek2` loader.
+    GlmDsa,
+    /// `glm5next` (also `glm5-next`, per llama.cpp's two open pull
+    /// requests) — GLM-5.3-Flash: KDA / sparse-MLA hybrid with
+    /// hyper-connections.  Served by the `deepseek2` loader.
+    Glm5Next,
     /// `deepseek4` — DeepSeek-V4 (sliding-window MLA + KV compression +
     /// indexer-selected sparse attention + Hyper-Connections).
     DeepSeek4,
@@ -113,7 +129,6 @@ const KNOWN_UNSUPPORTED_ARCHS: &[&str] = &[
     "bitnet",
     "bloom",
     "chameleon",
-    "chatglm",
     "codeshell",
     "cogvlm",
     "cohere2",
@@ -129,7 +144,6 @@ const KNOWN_UNSUPPORTED_ARCHS: &[&str] = &[
     "falcon",
     "falcon-h1",
     "gemma3n",
-    "glm4moe",
     "gpt2",
     "gpt-oss",
     "gptj",
@@ -200,7 +214,9 @@ const NAMES: &[(&str, Architecture)] = &[
     ("gemma2", Architecture::Gemma),
     ("gemma3", Architecture::Gemma),
     ("gemma-embedding", Architecture::Gemma),
+    ("chatglm", Architecture::ChatGlm),
     ("glm4", Architecture::Glm4),
+    ("glm4moe", Architecture::Glm4Moe),
     ("lfm2", Architecture::Lfm2),
     ("phi2", Architecture::Phi2),
     ("phi3", Architecture::Phi3),
@@ -218,6 +234,9 @@ const NAMES: &[(&str, Architecture)] = &[
     ("qwen4exp", Architecture::Qwen4Exp),
     ("deepseek", Architecture::DeepSeek),
     ("deepseek2", Architecture::DeepSeek2),
+    ("glm-dsa", Architecture::GlmDsa),
+    ("glm5next", Architecture::Glm5Next),
+    ("glm5-next", Architecture::Glm5Next),
     ("deepseek4", Architecture::DeepSeek4),
     ("deepseek41", Architecture::DeepSeek41),
 ];
@@ -301,7 +320,6 @@ impl Architecture {
             self,
             Self::Llama
                 | Self::Gemma
-                | Self::Glm4
                 | Self::Lfm2
                 | Self::Phi2
                 | Self::Phi3
@@ -356,7 +374,9 @@ impl Architecture {
         match self {
             Self::Llama => "Llama (also Mistral, Mixtral, TinyLlama, SmolLM, Yi, …)",
             Self::Gemma => "Gemma / Gemma 2 / Gemma 3",
-            Self::Glm4 => "GLM-4",
+            Self::ChatGlm => "ChatGLM2 / ChatGLM3 / GLM-4-9B-Chat",
+            Self::Glm4 => "GLM-4 / GLM-4.1V (text) / GLM-OCR",
+            Self::Glm4Moe => "GLM-4.5 / GLM-4.6 / GLM-4.7 / Solar-Open",
             Self::Lfm2 => "LFM2",
             Self::Phi2 => "Phi-1 / Phi-1.5 / Phi-2",
             Self::Phi3 => "Phi-3",
@@ -373,7 +393,9 @@ impl Architecture {
             Self::Qwen35Moe => "Qwen3.5-MoE",
             Self::Qwen4Exp => "Qwen3.8-Flash-Next (qwen4exp)",
             Self::DeepSeek => "DeepSeek-MoE",
-            Self::DeepSeek2 => "DeepSeek-V2 / DeepSeek-V3 / DeepSeek-R1 / Kimi-K2",
+            Self::DeepSeek2 => "DeepSeek-V2 / DeepSeek-V3 / DeepSeek-R1 / Kimi-K2 / GLM-4.7-Flash",
+            Self::GlmDsa => "GLM-5 / GLM-5.1 / GLM-5.2",
+            Self::Glm5Next => "GLM-5.3-Flash",
             Self::DeepSeek4 => "DeepSeek-V4",
             Self::DeepSeek41 => "DeepSeek-V4.1",
         }
@@ -399,7 +421,6 @@ impl Architecture {
 pub enum QuantizedModel {
     Llama(quantized_llama::ModelWeights),
     Gemma(quantized_gemma3::ModelWeights),
-    Glm4(quantized_glm4::ModelWeights),
     Lfm2(quantized_lfm2::ModelWeights),
     Phi2(quantized_phi::ModelWeights),
     Phi3(quantized_phi3::ModelWeights),
@@ -569,11 +590,6 @@ impl QuantizedModel {
             Architecture::Gemma => {
                 quantized_gemma3::ModelWeights::from_gguf(gguf, reader, device).map(Self::Gemma)
             }
-            Architecture::Glm4 => {
-                // F32 activations: fastest/most accurate compute dtype on CPU.
-                quantized_glm4::ModelWeights::from_gguf(gguf, reader, device, DType::F32)
-                    .map(Self::Glm4)
-            }
             Architecture::Lfm2 => {
                 quantized_lfm2::ModelWeights::from_gguf(gguf, reader, device).map(Self::Lfm2)
             }
@@ -597,7 +613,10 @@ impl QuantizedModel {
             | Architecture::Qwen3Next
             | Architecture::Qwen35
             | Architecture::Qwen35Moe
-            | Architecture::Qwen4Exp => {
+            | Architecture::Qwen4Exp
+            | Architecture::ChatGlm
+            | Architecture::Glm4
+            | Architecture::Glm4Moe => {
                 crate::quantized_qwen::ModelWeights::from_gguf_mmap_placed(
                     gguf,
                     raw,
@@ -609,9 +628,13 @@ impl QuantizedModel {
                 )
                 .map(Self::Qwen)
             }
-            // One loader serves both: DeepSeek-MoE differs from V2+ only in
-            // its (GQA) attention.
-            Architecture::DeepSeek | Architecture::DeepSeek2 => {
+            // One loader serves them all: DeepSeek-MoE differs from V2+ only
+            // in its (GQA) attention, GLM-5 in its sparse one, GLM-5.3 in
+            // that plus KDA layers and hyper-connections.
+            Architecture::DeepSeek
+            | Architecture::DeepSeek2
+            | Architecture::GlmDsa
+            | Architecture::Glm5Next => {
                 crate::quantized_deepseek2::ModelWeights::from_gguf_mmap_placed(
                     gguf,
                     raw,
@@ -775,7 +798,6 @@ impl QuantizedModel {
         match self {
             Self::Llama(m) => m.forward(input, index_pos),
             Self::Gemma(m) => m.forward(input, index_pos),
-            Self::Glm4(m) => m.forward(input, index_pos),
             Self::Lfm2(m) => m.forward(input, index_pos),
             Self::Phi2(m) => m.forward(input, index_pos),
             Self::Phi3(m) => m.forward(input, index_pos),

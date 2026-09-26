@@ -105,6 +105,76 @@ pub fn topk_values(t: &Tensor, k: usize) -> Result<Tensor> {
     t.gather(&idx, D::Minus1)
 }
 
+/// How router logits become per-expert scores (llama.cpp
+/// `expert_gating_func`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gating {
+    /// Softmax over the experts (DeepSeek-V2, the Qwen MoEs).
+    Softmax,
+    /// Independent sigmoid per expert (DeepSeek-V3, Kimi-K2, the GLM MoEs).
+    Sigmoid,
+    /// `sqrt(softplus(x))` (DeepSeek-V4).
+    SqrtSoftplus,
+}
+
+impl Gating {
+    /// Parse `expert_gating_func` (1 softmax, 2 sigmoid); `default` when the
+    /// key is absent or 0 ("none").
+    pub fn from_meta(m: &crate::gguf_meta::Meta<'_>, default: Self) -> Self {
+        match m.u32_or("expert_gating_func", 0) {
+            1 => Self::Softmax,
+            2 => Self::Sigmoid,
+            _ => default,
+        }
+    }
+
+    pub fn scores(self, logits: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::Softmax => candle_nn::ops::softmax_last_dim(logits),
+            Self::Sigmoid => candle_nn::ops::sigmoid(logits),
+            Self::SqrtSoftplus => softplus(logits)?.sqrt(),
+        }
+    }
+}
+
+/// The routing weights of the experts `idx` picked (`[n_tokens, k]`): their
+/// scores, optionally renormalised to sum to one (min-clamped to the f16
+/// epsilon, as llama.cpp does, so a degenerate routing never divides by
+/// zero) and scaled (`0` / `1`: no scaling).
+pub fn routing_weights(scores: &Tensor, idx: &Tensor, norm: bool, scale: f64) -> Result<Tensor> {
+    let mut weights = scores.gather(idx, D::Minus1)?;
+    if norm {
+        let denom = weights.sum_keepdim(D::Minus1)?.clamp(6.103_515_6e-5, f32::INFINITY)?;
+        weights = weights.broadcast_div(&denom)?;
+    }
+    if scale != 0.0 && scale != 1.0 {
+        weights = (weights * scale)?;
+    }
+    Ok(weights)
+}
+
+/// Top-`k` routing over per-expert `scores` (`[n_tokens, n_expert]`):
+/// experts are *selected* on `select(scores + bias)` — the aux-loss-free
+/// balancing bias plus any group limit — and *weighted* by their unbiased
+/// scores ([`routing_weights`]).  Returns `(ids, weights)`, both
+/// `[n_tokens, k]`.
+pub fn route(
+    scores: &Tensor,
+    bias: Option<&Tensor>,
+    k: usize,
+    norm: bool,
+    scale: f64,
+    select: impl FnOnce(Tensor) -> Result<Tensor>,
+) -> Result<(Tensor, Tensor)> {
+    let selection = match bias {
+        Some(b) => scores.broadcast_add(&b.reshape((1, ()))?)?,
+        None => scores.clone(),
+    };
+    let idx = topk_indices(&select(selection)?, k)?;
+    let weights = routing_weights(scores, &idx, norm, scale)?;
+    Ok((idx, weights))
+}
+
 // ─── Device expert cache helpers ─────────────────────────────────────────────
 
 /// Per-slot byte estimate for a routed expert in a

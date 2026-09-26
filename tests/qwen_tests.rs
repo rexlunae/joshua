@@ -1,5 +1,6 @@
 //! Native (pure-Rust) validation for the Qwen family loader
-//! (`quantized_qwen`) across every architecture it serves.  These run on the
+//! (`quantized_qwen`) across every architecture it serves, the GLM ones
+//! (`chatglm`, `glm4`, `glm4moe`) included.  These run on the
 //! default `cargo test` — no llama.cpp, no network.
 
 mod common;
@@ -26,6 +27,9 @@ const ARCHES: &[(&str, bool)] = &[
     ("qwen35", true),
     ("qwen35moe", true),
     ("qwen4exp", true),
+    ("chatglm", false),
+    ("glm4", false),
+    ("glm4moe", false),
 ];
 
 #[test]

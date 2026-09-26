@@ -17,7 +17,7 @@ framework) and [tokenizers](https://github.com/huggingface/tokenizers).
 | **Huge pages** | Transparent 2 MiB pages (`MADV_HUGEPAGE`, default on Linux) or explicit 2 MiB / 1 GiB (`MAP_HUGETLB`) backing to cut TLB misses on large models |
 | **OpenAI-compatible** | Drop-in replacement for `/v1/chat/completions`, `/v1/embeddings`, `/v1/models` |
 | **Streaming** | Server-Sent Events (SSE) for token-by-token streaming |
-| **GGUF support** | Llama/Mistral/Mixtral, Gemma 1–3, GLM-4, LFM2, Phi-2, Phi-3, every Qwen generation (Qwen 1, Qwen1.5/2/2.5 incl. MoE, Qwen2/2.5-VL and Qwen3-VL text, Qwen3, Qwen3-MoE, Qwen3-Next, Qwen3.5 dense/MoE, Qwen3.8-Flash-Next / `qwen4exp`, Bonsai 1-bit / 2-bit), DeepSeek-MoE, DeepSeek-V2/V2.5/V3/R1, DeepSeek-V4 / V4-Flash, DeepSeek-V4.1-Flash, Kimi-K2 (dense DeepSeek-LLM / Coder / R1-Distill load as `llama` / `qwen2`) |
+| **GGUF support** | Llama/Mistral/Mixtral, Gemma 1–3, every GLM generation (ChatGLM2/3, GLM-4, GLM-4.1V text, GLM-OCR, GLM-4.5/4.6/4.7 incl. Air and Flash, GLM-5/5.1/5.2, GLM-5.3-Flash), LFM2, Phi-2, Phi-3, every Qwen generation (Qwen 1, Qwen1.5/2/2.5 incl. MoE, Qwen2/2.5-VL and Qwen3-VL text, Qwen3, Qwen3-MoE, Qwen3-Next, Qwen3.5 dense/MoE, Qwen3.8-Flash-Next / `qwen4exp`, Bonsai 1-bit / 2-bit), DeepSeek-MoE, DeepSeek-V2/V2.5/V3/R1, DeepSeek-V4 / V4-Flash, DeepSeek-V4.1-Flash, Kimi-K2 (dense DeepSeek-LLM / Coder / R1-Distill load as `llama` / `qwen2`) |
 | **Exotic quant dtypes** | In-mapping decoders for IQ2_XXS (DeepSeek-V4's 2.0625-bit expert weights), MXFP4 (Kimi-K3-class) and Q1_0 / Q2_0 (Bonsai's 1-bit and 2-bit weights), with matmuls that keep the blocks in the mmap instead of materialising f32 — one generic `RawBlock` layer, so any native loader reads any of them |
 | **Fused SIMD kernels** | AVX-512 and AVX2 (x86-64) and NEON (aarch64) dequant+dot fusion — the weights decode inside the dot in registers — for Q8_0/Q2_K/Q4_K, IQ2_XXS, MXFP4 and Bonsai's Q1_0/Q2_0, plus parallel SIMD matmuls for the other k-quants; the widest ISA the CPU has is picked at startup (`JOSHUA_SIMD` overrides) |
 | **Chat templates** | Renders the model's own `tokenizer.chat_template` from the GGUF (Jinja via pure-Rust minijinja); ChatML fallback |
@@ -45,7 +45,7 @@ framework) and [tokenizers](https://github.com/huggingface/tokenizers).
            │
 ┌──────────────────────────┐
 │  candle  (pure Rust)     │  ← Tensor operations + quantized GGUF inference
-└──────────────────────────┘    Llama / Gemma / GLM-4 / LFM2 / Phi / Qwen loaders
+└──────────────────────────┘    Llama / Gemma / LFM2 / Phi / Qwen2 loaders
            │
 ┌──────────────────────────┐
 │  tokenizers (pure Rust)  │  ← BPE tokenisation from tokenizer.json
@@ -657,7 +657,9 @@ the matching pure-Rust candle loader.  Currently supported architectures:
 |---|---|
 | `llama` | Llama 1/2/3, Mistral, Mixtral, TinyLlama, SmolLM, Vicuna, Zephyr, Yi, and anything else llama.cpp's converters emit as `llama` |
 | `gemma` / `gemma2` / `gemma3` / `gemma-embedding` | Gemma 1, Gemma 2, Gemma 3 |
-| `glm4` | GLM-4 (dense) |
+| `chatglm` | ChatGLM2, ChatGLM3, GLM-4-9B-Chat (fused QKV, fused SwiGLU) |
+| `glm4` | GLM-4-0414 (dense, sandwich norms), GLM-4.1V (text decoder, M-RoPE), GLM-OCR (NextN block skipped) |
+| `glm4moe` | GLM-4.5, GLM-4.5-Air, GLM-4.6, GLM-4.7, Solar-Open (sigmoid-routed MoE with a shared expert; NextN blocks skipped) |
 | `lfm2` | Liquid LFM2 |
 | `phi2` | Phi-1, Phi-1.5, Phi-2 |
 | `phi3` | Phi-3, Phi-3.5 |
@@ -672,7 +674,9 @@ the matching pure-Rust candle loader.  Currently supported architectures:
 | `qwen35` / `qwen35moe` | Qwen3.5 dense / MoE (Gated DeltaNet hybrid) |
 | `qwen4exp` | Qwen3.8-Flash-Next (Qwen3.5-MoE plus hyper-connections, QSA block-sparse attention, PLE n-gram hash embeddings) |
 | `deepseek` | DeepSeek-MoE 16B (GQA attention + fine-grained MoE with shared experts) |
-| `deepseek2` | DeepSeek-V2, DeepSeek-V2-Lite, DeepSeek-V2.5, DeepSeek-V3 / V3.1, DeepSeek-R1, **Kimi-K2** (MLA attention + fine-grained MoE) |
+| `deepseek2` | DeepSeek-V2, DeepSeek-V2-Lite, DeepSeek-V2.5, DeepSeek-V3 / V3.1, DeepSeek-R1, **Kimi-K2**, GLM-4.7-Flash (MLA attention + fine-grained MoE) |
+| `glm-dsa` | GLM-5, GLM-5.1, GLM-5.2 (the `deepseek2` stack plus DeepSeek Sparse Attention: a lightning indexer picks each query's top-k keys, and GLM-5.2's IndexShare layers reuse an earlier layer's pick) |
+| `glm5next` / `glm5-next` | GLM-5.3-Flash (three in four layers Kimi Delta Attention, the rest NoPE MLA over a k-pool sparse indexer; manifold-constrained hyper-connections; clamped-SwiGLU MoE) — both names written by llama.cpp's open pull requests load |
 | `deepseek4` | DeepSeek-V4 (Hyper-Connections residual mixing, alternating sliding-window / learned KV-compressor attention, Lightning-Indexer sparse attention, fine-grained MoE with IQ2_XXS experts) |
 | `deepseek41` | DeepSeek-V4.1-Flash (V4 with a one-sublayer-lagged hyper-connection mix and no learned HC head, KV compressed on a few source layers and shared by the layers after them, engram n-gram hash tables) |
 
@@ -688,7 +692,17 @@ the latent. Both the legacy combined (`attn_kv_b`) and modern MLA-split
 (`attn_k_b`/`attn_v_b`) GGUF encodings load, and its logits are cross-checked
 against llama.cpp. The same loader serves `deepseek` (DeepSeek-MoE, the V1
 generation), which shares the whole MoE stack and swaps MLA for plain GQA
-attention over the same KV-cache layout.
+attention over the same KV-cache layout, and the GLM-5 generation:
+`glm-dsa` adds DeepSeek Sparse Attention (a lightning indexer restricting each
+query to its top-k keys, with GLM-5.2's IndexShare), and `glm5next`
+(GLM-5.3-Flash) further interleaves Kimi Delta Attention layers, drops RoPE,
+pools the indexer's keys and carries the residual as manifold-constrained
+hyper-connections (shared with the `deepseek4` loader). Both are checked
+against independent float64 transcriptions of llama.cpp's graph (`glm-dsa`)
+and of HF transformers' model code under llama.cpp's GGUF conventions
+(`glm5next`). The other GLMs (`chatglm`, `glm4`, `glm4moe`) run on the Qwen
+family loader, cross-checked the same way; appended NextN (MTP) blocks are
+skipped by every GLM loader.
 
 The dense DeepSeek releases — DeepSeek-LLM, DeepSeek-Coder V1 and the
 DeepSeek-R1 distills — are converted by llama.cpp as `llama` or `qwen2` and
@@ -758,7 +772,7 @@ Example models:
 - `LiquidAI/LFM2-1.2B`
 - `microsoft/Phi-3-mini-4k-instruct`
 - `mistralai/Mistral-7B-Instruct-v0.3`
-- `THUDM/GLM-4-9B-0414`
+- `THUDM/GLM-4-9B-0414`, `zai-org/GLM-4.5-Air`, `zai-org/GLM-4.7-Flash`, `zai-org/GLM-5.2`, `zai-org/GLM-5.3-Flash` (as GGUF)
 - `deepseek-ai/deepseek-moe-16b-chat`, `deepseek-ai/DeepSeek-V2-Lite`, `moonshotai/Kimi-K2-Instruct` (as GGUF)
 - `deepseek-ai/DeepSeek-V4-Flash-162B` (as GGUF)
 

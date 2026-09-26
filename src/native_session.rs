@@ -55,13 +55,19 @@ pub trait LayerStack: Send + Sync + 'static {
         Ok(emb)
     }
 
-    /// Run layer `l` over `xs` (`[1, seq, residual]`), updating `state`.
-    /// Returns the layer output and the routed expert ids this input used
-    /// (empty for a dense layer).
+    /// Run layer `l` over `xs` (`[1, seq, residual]`), updating
+    /// `states[l]`.  Returns the layer output and the routed expert ids this
+    /// input used (empty for a dense layer).
+    ///
+    /// Every layer's state is passed so a layer can read what an earlier
+    /// layer published for the same input (GLM-5.2's shared sparse-attention
+    /// selection).  Under layer-streaming prefill the earlier layer has seen
+    /// every chunk before this one sees the first, so anything published
+    /// must be keyed by position.
     fn layer(
         &self,
         l: usize,
-        state: &mut Self::State,
+        states: &mut [Self::State],
         xs: &Tensor,
         input: &LayerInput<'_>,
     ) -> Result<(Tensor, Vec<u32>)>;
@@ -214,8 +220,8 @@ impl<W: LayerStack> Session<W> {
             offset,
             tokens: if w.wants_tokens() { &self.tokens[..offset + seq_len] } else { &[] },
         };
-        for (l, state) in self.state.iter_mut().enumerate() {
-            let (out, routed) = w.layer(l, state, &xs, &layer_input)?;
+        for l in 0..self.state.len() {
+            let (out, routed) = w.layer(l, &mut self.state, &xs, &layer_input)?;
             self.hot_experts.record(l, &routed, step);
             xs = out;
         }
@@ -307,7 +313,7 @@ impl<W: LayerStack> crate::stream_prefill::StreamPrefill for Session<W> {
         let w = Arc::clone(&self.weights);
         let tokens = if w.wants_tokens() { &self.tokens[..pos + seq] } else { &[][..] };
         let input = LayerInput { mask: Some(&mask), offset: pos, tokens };
-        let (out, routed) = w.layer(l, &mut self.state[l], xs, &input)?;
+        let (out, routed) = w.layer(l, &mut self.state, xs, &input)?;
         let step = self.hot_experts.begin_step(false);
         self.hot_experts.record(l, &routed, step);
         Ok(out)
