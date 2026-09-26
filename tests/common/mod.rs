@@ -2673,3 +2673,71 @@ pub fn model_dir(name: &str) -> PathBuf {
     std::fs::write(dir.join("tokenizer.json"), TOKENIZER_JSON).unwrap();
     dir
 }
+
+/// Write a tiny `llama` (served by candle's stock loader) or `qwen3`
+/// (Joshua's native Qwen loader) GGUF whose every matrix — token embedding,
+/// attention and FFN projections, output head — is in raw block format
+/// `dtype` ([`joshua::raw_block::synthetic_bytes`]), with F32 norms.  With
+/// `decoded` each matrix instead holds exactly the values its blocks decode
+/// to, stored as F32: the same model in a format candle reads natively.
+/// Widths are 256 so every format's block divides every row.
+pub fn write_tiny_raw_format_gguf(path: &Path, arch: &str, dtype: u32, decoded: bool) {
+    const VOCAB: usize = 16;
+    const EMB: usize = 256;
+    const HD: usize = 64;
+    const NFF: usize = 256;
+    let (h, kv) = (4usize, 2usize);
+    let key = |s: &str| format!("{arch}.{s}");
+    let u32v = gguf_file::Value::U32;
+    let mut metadata = vec![
+        ("general.architecture".to_string(), gguf_file::Value::String(arch.into())),
+        (key("attention.head_count"), u32v(h as u32)),
+        (key("attention.head_count_kv"), u32v(kv as u32)),
+        (key("block_count"), u32v(1)),
+        (key("embedding_length"), u32v(EMB as u32)),
+        (key("feed_forward_length"), u32v(NFF as u32)),
+        (key("context_length"), u32v(512)),
+        (key("attention.layer_norm_rms_epsilon"), gguf_file::Value::F32(1e-5)),
+        (key("attention.key_length"), u32v(HD as u32)),
+        (key("rope.dimension_count"), u32v(HD as u32)),
+        (key("rope.freq_base"), gguf_file::Value::F32(10_000.0)),
+    ];
+    metadata.extend(tiny_tokenizer_metadata());
+
+    let (qk, _) = joshua::raw_block::layout(dtype).expect("a raw block format");
+    let mut seed = 0u32;
+    let mut matrix = |name: &str, dims: &[usize]| {
+        seed += 1;
+        let n = dims.iter().product::<usize>();
+        let bytes = joshua::raw_block::synthetic_bytes(dtype, n / qk, seed).unwrap();
+        if decoded {
+            let values =
+                joshua::with_raw_block!(dtype, B => joshua::raw_block::decode_bytes::<B>(&bytes, n).unwrap()).unwrap();
+            RawTensor::f32(name, values, dims)
+        } else {
+            RawTensor { name: name.into(), dtype, dims: dims.to_vec(), data: bytes }
+        }
+    };
+    let mut tensors = vec![
+        matrix("token_embd.weight", &[VOCAB, EMB]),
+        matrix("output.weight", &[VOCAB, EMB]),
+        matrix("blk.0.attn_q.weight", &[h * HD, EMB]),
+        matrix("blk.0.attn_k.weight", &[kv * HD, EMB]),
+        matrix("blk.0.attn_v.weight", &[kv * HD, EMB]),
+        matrix("blk.0.attn_output.weight", &[EMB, h * HD]),
+        matrix("blk.0.ffn_gate.weight", &[NFF, EMB]),
+        matrix("blk.0.ffn_up.weight", &[NFF, EMB]),
+        matrix("blk.0.ffn_down.weight", &[EMB, NFF]),
+    ];
+    let norm = |name: &str, n: usize, seed: u32| {
+        RawTensor::f32(name, weights(n, seed).iter().map(|v| 1.0 + 5.0 * v).collect(), &[n])
+    };
+    tensors.push(norm("output_norm.weight", EMB, 11));
+    tensors.push(norm("blk.0.attn_norm.weight", EMB, 12));
+    tensors.push(norm("blk.0.ffn_norm.weight", EMB, 13));
+    if arch == "qwen3" {
+        tensors.push(norm("blk.0.attn_q_norm.weight", HD, 14));
+        tensors.push(norm("blk.0.attn_k_norm.weight", HD, 15));
+    }
+    write_raw_gguf(path, &metadata, &tensors);
+}

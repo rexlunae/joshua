@@ -125,6 +125,23 @@ pub struct Content {
     pub metadata: HashMap<String, Value>,
     pub tensor_infos: HashMap<String, TensorInfo>,
     pub tensor_data_offset: u64,
+    /// Tensors in dtypes this crate has no [`GgmlDType`] for, which an
+    /// embedder decodes itself; [`Content::tensor`] falls back to them for
+    /// names missing from `tensor_infos`.  `None` from [`Content::read`].
+    pub external: Option<std::sync::Arc<dyn ExternalTensors>>,
+}
+
+/// `Read + Seek` as one object-safe trait, for [`ExternalTensors`].
+pub trait ReadSeek: std::io::Read + std::io::Seek {}
+impl<T: std::io::Read + std::io::Seek + ?Sized> ReadSeek for T {}
+
+/// A source of the tensors of a GGUF file whose dtypes candle cannot name
+/// (see [`Content::external`]).
+pub trait ExternalTensors: std::fmt::Debug + Send + Sync {
+    /// Whether `name` is one of these tensors.
+    fn contains(&self, name: &str) -> bool;
+    /// Load tensor `name` from `reader` onto `device`.
+    fn tensor(&self, reader: &mut dyn ReadSeek, name: &str, device: &Device) -> Result<QTensor>;
 }
 
 fn read_string<R: std::io::Read + std::io::Seek>(
@@ -563,6 +580,7 @@ impl Content {
             metadata,
             tensor_infos,
             tensor_data_offset,
+            external: None,
         })
     }
 
@@ -574,7 +592,10 @@ impl Content {
     ) -> Result<QTensor> {
         let tensor_info = match self.tensor_infos.get(name) {
             Some(tensor_info) => tensor_info,
-            None => crate::bail!("cannot find tensor info for {name}"),
+            None => match &self.external {
+                Some(ext) if ext.contains(name) => return ext.tensor(reader, name, device),
+                _ => crate::bail!("cannot find tensor info for {name}"),
+            },
         };
         tensor_info.read(reader, self.tensor_data_offset, device)
     }

@@ -4,8 +4,9 @@
 //! [`GgmlDType`] table, and its CPU kernels quantize activations before the
 //! dot.  Joshua instead keeps these weights as their GGUF blocks — borrowed
 //! straight from the memory mapping — and decodes a block at a time inside
-//! an f32-activation matmul.  Every such format (IQ2_XXS, MXFP4, and
-//! Bonsai's Q1_0 / Q2_0) needs the same plumbing: reinterpreting bytes as
+//! an f32-activation matmul.  Every such format (the i-quants IQ1_S …
+//! IQ4_XS, the ternary TQ1_0 / TQ2_0, MXFP4 / NVFP4, and Bonsai's Q1_0 /
+//! Q2_0) needs the same plumbing: reinterpreting bytes as
 //! blocks, bulk decode, the matmul, its f16 wrapper, byte sizes, and
 //! dispatch from a raw GGUF dtype id.  [`RawBlock`] is the per-format part
 //! (layout, id, one-block decode, optionally a faster matmul); everything
@@ -18,8 +19,8 @@ use candle_core::quantized::GgmlDType;
 use candle_core::{bail, Result};
 use half::f16;
 
-/// Largest block any [`RawBlock`] format uses (IQ2_XXS's 256), sizing the
-/// per-block decode scratch buffer.
+/// Largest block any [`RawBlock`] format uses (the 256 of IQ2_XXS and the
+/// other super-block formats), sizing the per-block decode scratch buffer.
 pub const MAX_QK: usize = 256;
 
 /// One block of a quantization format decoded by Joshua rather than candle.
@@ -324,6 +325,50 @@ macro_rules! with_raw_block {
                 type $B = $crate::low_bit::BlockQ2_0;
                 Some($body)
             }
+            <$crate::iquants::BlockIq2Xs as $crate::raw_block::RawBlock>::GGML_TYPE => {
+                type $B = $crate::iquants::BlockIq2Xs;
+                Some($body)
+            }
+            <$crate::iquants::BlockIq2S as $crate::raw_block::RawBlock>::GGML_TYPE => {
+                type $B = $crate::iquants::BlockIq2S;
+                Some($body)
+            }
+            <$crate::iquants::BlockIq3Xxs as $crate::raw_block::RawBlock>::GGML_TYPE => {
+                type $B = $crate::iquants::BlockIq3Xxs;
+                Some($body)
+            }
+            <$crate::iquants::BlockIq3S as $crate::raw_block::RawBlock>::GGML_TYPE => {
+                type $B = $crate::iquants::BlockIq3S;
+                Some($body)
+            }
+            <$crate::iquants::BlockIq1S as $crate::raw_block::RawBlock>::GGML_TYPE => {
+                type $B = $crate::iquants::BlockIq1S;
+                Some($body)
+            }
+            <$crate::iquants::BlockIq1M as $crate::raw_block::RawBlock>::GGML_TYPE => {
+                type $B = $crate::iquants::BlockIq1M;
+                Some($body)
+            }
+            <$crate::iquants::BlockIq4Nl as $crate::raw_block::RawBlock>::GGML_TYPE => {
+                type $B = $crate::iquants::BlockIq4Nl;
+                Some($body)
+            }
+            <$crate::iquants::BlockIq4Xs as $crate::raw_block::RawBlock>::GGML_TYPE => {
+                type $B = $crate::iquants::BlockIq4Xs;
+                Some($body)
+            }
+            <$crate::low_bit::BlockTq1_0 as $crate::raw_block::RawBlock>::GGML_TYPE => {
+                type $B = $crate::low_bit::BlockTq1_0;
+                Some($body)
+            }
+            <$crate::low_bit::BlockTq2_0 as $crate::raw_block::RawBlock>::GGML_TYPE => {
+                type $B = $crate::low_bit::BlockTq2_0;
+                Some($body)
+            }
+            <$crate::mxfp4::BlockNvfp4 as $crate::raw_block::RawBlock>::GGML_TYPE => {
+                type $B = $crate::mxfp4::BlockNvfp4;
+                Some($body)
+            }
             _ => None,
         }
     }};
@@ -338,6 +383,46 @@ pub fn layout(dtype: u32) -> Option<(usize, usize)> {
 /// Whether GGUF dtype id `dtype` is a [`RawBlock`] format.
 pub fn is_raw_block(dtype: u32) -> bool {
     layout(dtype).is_some()
+}
+
+/// `n_blocks` deterministic pseudo-random blocks of raw format `dtype`, as
+/// file bytes — for test fixtures and for cross-checking the decoders
+/// against llama.cpp's (whose harness generates the identical bytes: a
+/// 32-bit LCG, `s = s·1103515245 + 12345`, taking `s >> 16` per byte).
+/// Scale fields are overwritten so every block decodes to finite values:
+/// f16 scales cycle through 0.25 / 0.5 / 0.75 and MXFP4 exponents through
+/// 2^-7 … 2^0.  `None` for a dtype that is not a raw format.
+pub fn synthetic_bytes(dtype: u32, n_blocks: usize, seed: u32) -> Option<Vec<u8>> {
+    let (_, size) = layout(dtype)?;
+    let mut state = seed;
+    let mut bytes: Vec<u8> = (0..n_blocks * size)
+        .map(|_| {
+            state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            (state >> 16) as u8
+        })
+        .collect();
+    for (b, block) in bytes.chunks_exact_mut(size).enumerate() {
+        let d = f16::from_f32(0.25 * (1 + b % 3) as f32).to_bits();
+        let mut put_f16 = |at: usize| block[at..at + 2].copy_from_slice(&d.to_le_bytes());
+        match dtype {
+            // TQ1_0 / TQ2_0 keep their scale last.
+            34 => put_f16(52),
+            35 => put_f16(64),
+            // IQ1_M spreads its f16 over the top nibbles of four u16 scales.
+            29 => {
+                for i in 0..4 {
+                    let hi = &mut block[48 + 2 * i + 1];
+                    *hi = (*hi & 0x0F) | ((((d >> (4 * i)) & 0xF) as u8) << 4);
+                }
+            }
+            // MXFP4's E8M0 exponent.
+            39 => block[0] = 120 + (b % 8) as u8,
+            // NVFP4's UE4M3 scales are finite for every byte.
+            40 => {}
+            _ => put_f16(0),
+        }
+    }
+    Some(bytes)
 }
 
 #[cfg(test)]
@@ -425,6 +510,12 @@ pub(crate) mod testing {
         let _ = blocks;
     }
 
+    /// [`synthetic_bytes`] as blocks of `B`.
+    pub fn synthetic<B: RawBlock>(n_blocks: usize, seed: u32) -> Vec<B> {
+        let bytes = synthetic_bytes(B::GGML_TYPE, n_blocks, seed).expect("a raw format");
+        blocks_from_bytes::<B>(&bytes).unwrap().to_vec()
+    }
+
     /// A partial block is rejected; whole blocks reinterpret.
     pub fn check_blocks_from_bytes<B: RawBlock>() {
         let sz = block_bytes::<B>();
@@ -433,5 +524,40 @@ pub(crate) mod testing {
         assert_eq!(size_bytes::<B>(2 * B::QK), Some(2 * sz));
         assert_eq!(size_bytes::<B>(B::QK + 1), None);
         assert_eq!(layout(B::GGML_TYPE), Some((B::QK, sz)));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every raw format decodes [`synthetic_bytes`] exactly as llama.cpp's
+    /// `dequantize_row_*` does (`tests/data/raw_formats_ref.txt`, produced
+    /// by a C harness linking `ggml-quants.c`): same values, bit for bit,
+    /// up to the sign of zero.
+    #[test]
+    fn every_format_matches_llama_cpp_bit_for_bit() {
+        let golden = include_str!("../tests/data/raw_formats_ref.txt");
+        let mut seen = 0;
+        for line in golden.lines().filter(|l| !l.starts_with('#')) {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            let (id, count): (u32, usize) = (f[0].parse().unwrap(), f[1].parse().unwrap());
+            let (qk, _) = layout(id).unwrap_or_else(|| panic!("dtype {id} is not a raw format"));
+            let bytes = synthetic_bytes(id, count / qk, 1000 + id).unwrap();
+            let got = crate::with_raw_block!(id, B => decode_bytes::<B>(&bytes, count).unwrap()).unwrap();
+            for (i, want) in f[3..].iter().enumerate() {
+                assert_eq!(got[i], want.parse::<f32>().unwrap(), "dtype {id} value {i}");
+            }
+            let mut h = 0xcbf2_9ce4_8422_2325u64;
+            for v in &got {
+                let bits = if *v == 0.0 { 0 } else { v.to_bits() };
+                for b in bits.to_le_bytes() {
+                    h = (h ^ b as u64).wrapping_mul(0x0100_0000_01b3);
+                }
+            }
+            assert_eq!(format!("{h:016x}"), f[2], "dtype {id}: decode differs from llama.cpp");
+            seen += 1;
+        }
+        assert_eq!(seen, 15, "every raw format is covered");
     }
 }

@@ -3312,9 +3312,8 @@ enum Residency {
 /// The residency of tensor `name` under `arch`'s loader.
 ///
 /// * Routed experts are never dequantized.
-/// * The joshua-native loaders decode every dense tensor in a dtype candle
-///   cannot represent (IQ2_XXS, MXFP4, Q1_0, Q2_0, I32) to f32 on the
-///   device.
+/// * Every loader decodes each dense tensor in a dtype candle cannot
+///   represent (the i-quants, MXFP4, Q1_0, I32, …) to f32 on the device.
 /// * The embedding table is f32 for the stock candle loaders, and for float
 ///   dtypes on an accelerator with the joshua-native loaders
 ///   ([`crate::token_embedding::TokenEmbedding`]); quantized otherwise.
@@ -3334,7 +3333,7 @@ fn residency(
     let Some(arch) = arch else {
         return Residency::Unknown;
     };
-    if arch.is_native() && !crate::gguf_ext::is_candle_supported(info.dtype) {
+    if !crate::gguf_ext::is_candle_supported(info.dtype) {
         return Residency::F32;
     }
     if probed_embedding_names(Some(arch)).contains(&name) {
@@ -4066,18 +4065,20 @@ fn token_str_from_metadata(
 /// Those tensors are decoded by Joshua's own loaders via the raw header.
 fn read_gguf_header(mmap: &[u8]) -> Result<gguf_file::Content> {
     let header = crate::gguf_ext::read_header(&mut Cursor::new(mmap))?;
-    // Joshua's own loaders read tensors by their raw GGUF dtype id (IQ2_XXS,
-    // MXFP4, Q1_0, Q2_0, I32, …).  Candle's stock loaders only ever see the
-    // projected `Content`, so an unsupported-dtype tensor would be dropped
-    // here and surface much later as a misleading "cannot find tensor" for a
-    // required weight — or, worse, silently treated as absent by a loader
-    // probing an optional tensor, changing the model without an error.
-    // Refuse the load with the precise cause instead.  (An undetectable
-    // architecture is left alone: the load already fails with an accurate
-    // architecture error downstream.)
+    // Joshua's own loaders read tensors by their raw GGUF dtype id (the
+    // i-quants, MXFP4, Q1_0, I32, …).  Candle's stock loaders only ever see
+    // the projected `Content`, which serves the `raw_block` formats through
+    // its external-tensor hook but nothing else, so any other
+    // unsupported-dtype tensor would surface much later as a misleading
+    // "cannot find tensor" for a required weight — or, worse, be silently
+    // treated as absent by a loader probing an optional tensor, changing the
+    // model without an error.  Refuse the load with the precise cause
+    // instead.  (An undetectable architecture is left alone: the load
+    // already fails with an accurate architecture error downstream.)
     if let Ok(arch) = Architecture::detect(&header.metadata) {
         if !arch.is_native() {
-            let unsupported = header.unsupported_tensors();
+            let mut unsupported = header.unsupported_tensors();
+            unsupported.retain(|(_, d)| !crate::raw_block::is_raw_block(*d));
             if !unsupported.is_empty() {
                 let names = unsupported
                     .iter()
@@ -4087,8 +4088,8 @@ fn read_gguf_header(mmap: &[u8]) -> Result<gguf_file::Content> {
                 return Err(crate::JoshuaError::ModelLoad(format!(
                     "GGUF header: model architecture '{}' contains {} tensor(s) in a GGUF \
                      dtype the engine cannot decode: {}. Only Joshua's native loaders read \
-                     tensors by raw dtype id; re-quantize this model to a candle-supported \
-                     format (F32/F16/Q8_0/Q4_K, …) or use a loader that decodes these dtypes.",
+                     these dtypes; re-quantize this model to a supported format (F16, Q8_0, \
+                     the K-quants, the i-quants, …) or use a loader that decodes them.",
                     arch.display_name(),
                     unsupported.len(),
                     names

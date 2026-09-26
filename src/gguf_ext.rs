@@ -64,7 +64,7 @@ const MAX_VALUE_DEPTH: usize = 64;
 /// crate-private, so the set is mirrored here) — but IQ2_XXS (16) is kept
 /// on the raw-header path on purpose: `GgmlDType::Iq2Xxs` exists so device
 /// backends can hold the blocks as ordinary quantized storage, while the CPU
-/// form of an IQ2 tensor must stay [`crate::mmap_tensor::MmapRawBlocks`]
+/// form of an IQ2 tensor must stay [`crate::mmap_tensor::RawBlocks`]
 /// (the fused AVX2 matmul), never candle's reference decode.  Reporting 16
 /// as supported would route dense IQ2 tensors through candle's loader.
 pub fn is_candle_supported(dtype: u32) -> bool {
@@ -151,6 +151,79 @@ pub struct GgufHeader {
     pub tensor_data_offset: u64,
 }
 
+/// Tensor `name`'s raw bytes (`info`), read from `reader`.
+fn read_raw_bytes<R: Read + Seek + ?Sized>(
+    reader: &mut R,
+    tensor_data_offset: u64,
+    name: &str,
+    info: &RawTensorInfo,
+) -> candle_core::Result<Vec<u8>> {
+    let size = type_size_bytes(info.dtype, info.elem_count()).ok_or_else(|| {
+        candle_core::Error::Msg(format!(
+            "tensor `{name}`: no size known for GGUF dtype {}",
+            info.dtype
+        ))
+    })?;
+    reader.seek(SeekFrom::Start(tensor_data_offset + info.offset))?;
+    let mut buf = vec![0u8; size];
+    reader.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
+/// A tensor in a [`crate::raw_block`] format from its file bytes: on the
+/// CPU, its compact blocks, decoded a block at a time inside the matmul;
+/// on an accelerator (which cannot run these formats), decoded to an f32
+/// `QTensor`, so downstream `QMatMul` code is unchanged and both paths share
+/// f32-activation semantics.
+fn raw_qtensor(
+    name: &str,
+    info: &RawTensorInfo,
+    bytes: &[u8],
+    device: &candle_core::Device,
+) -> candle_core::Result<candle_core::quantized::QTensor> {
+    let shape: candle_core::Shape = info.dims.clone().into();
+    if device.is_cpu() {
+        if let Some(qt) = crate::with_raw_block!(info.dtype, B => {
+            crate::mmap_tensor::owned_qtensor_raw::<B>(bytes, shape.clone())
+        }) {
+            return qt;
+        }
+    }
+    match crate::quant_matmul::decode_raw_to_f32(info.dtype, bytes, info.elem_count())? {
+        Some(f32s) => {
+            let t = candle_core::Tensor::from_vec(f32s, shape, device)?;
+            candle_core::quantized::QTensor::quantize(&t, GgmlDType::F32)
+        }
+        None => candle_core::bail!("tensor `{name}` has GGUF dtype {} which has no decoder here", info.dtype),
+    }
+}
+
+/// The tensors in [`crate::raw_block`] formats, served to candle's stock
+/// loaders through [`gguf_file::Content::external`] (see
+/// [`GgufHeader::to_candle_content`]).
+#[derive(Debug)]
+struct RawBlockTensors {
+    tensors: HashMap<String, RawTensorInfo>,
+    tensor_data_offset: u64,
+}
+
+impl gguf_file::ExternalTensors for RawBlockTensors {
+    fn contains(&self, name: &str) -> bool {
+        self.tensors.contains_key(name)
+    }
+
+    fn tensor(
+        &self,
+        reader: &mut dyn gguf_file::ReadSeek,
+        name: &str,
+        device: &candle_core::Device,
+    ) -> candle_core::Result<candle_core::quantized::QTensor> {
+        let info = &self.tensors[name];
+        let bytes = read_raw_bytes(reader, self.tensor_data_offset, name, info)?;
+        raw_qtensor(name, info, &bytes, device)
+    }
+}
+
 impl GgufHeader {
     /// A tensor's raw bytes, read from `reader` (works for dtypes candle
     /// cannot describe).
@@ -162,16 +235,7 @@ impl GgufHeader {
         let info = self.tensors.get(name).ok_or_else(|| {
             candle_core::Error::Msg(format!("tensor `{name}` not in the GGUF header"))
         })?;
-        let size = type_size_bytes(info.dtype, info.elem_count()).ok_or_else(|| {
-            candle_core::Error::Msg(format!(
-                "tensor `{name}`: no size known for GGUF dtype {}",
-                info.dtype
-            ))
-        })?;
-        reader.seek(SeekFrom::Start(self.tensor_data_offset + info.offset))?;
-        let mut buf = vec![0u8; size];
-        reader.read_exact(&mut buf)?;
-        Ok(buf)
+        read_raw_bytes(reader, self.tensor_data_offset, name, info)
     }
 
     /// Load `name` when its dtype is one candle's `Content` cannot carry
@@ -180,10 +244,7 @@ impl GgufHeader {
     ///
     /// On a CPU model with a mapping the blocks are borrowed in place
     /// ([`crate::mmap_tensor::borrowed_qtensor_raw`]) and decoded inside the
-    /// matmul.  Otherwise — an accelerator, which cannot hold CPU-borrowed
-    /// storage, or a streamed load — the tensor is decoded to f32 and held
-    /// as an F32 `QTensor` on `device`, so downstream `QMatMul` code is
-    /// unchanged and both paths share f32-activation semantics.
+    /// matmul; otherwise see [`raw_qtensor`].
     pub fn load_raw_only<R: Read + Seek>(
         &self,
         name: &str,
@@ -206,16 +267,7 @@ impl GgufHeader {
             }
         }
         let bytes = self.read_tensor_bytes(reader, name)?;
-        match crate::quant_matmul::decode_raw_to_f32(info.dtype, &bytes, info.elem_count())? {
-            Some(f32s) => {
-                let t = candle_core::Tensor::from_vec(f32s, info.dims.clone(), device)?;
-                candle_core::quantized::QTensor::quantize(&t, GgmlDType::F32).map(Some)
-            }
-            None => candle_core::bail!(
-                "tensor `{name}` has GGUF dtype {} which has no decoder here",
-                info.dtype
-            ),
-        }
+        raw_qtensor(name, info, &bytes, device).map(Some)
     }
 
     /// `general.architecture`, if present.
@@ -317,10 +369,12 @@ impl GgufHeader {
     /// Build a candle [`gguf_file::Content`] covering only the tensors candle
     /// can represent.
     ///
-    /// Tensors whose dtype is outside candle's table (IQ2_XXS, I32, MXFP4,
-    /// …) are dropped: the header reader in candle hard-fails on the first
-    /// one, and their data is decoded by Joshua's own loaders, which consult
-    /// this raw header instead.
+    /// Tensors whose dtype is outside candle's table (the i-quants, MXFP4,
+    /// I32, …) are left out of `tensor_infos`: the header reader in candle
+    /// hard-fails on the first one.  Joshua's own loaders consult this raw
+    /// header for them instead; for candle's stock loaders, those in a
+    /// [`crate::raw_block`] format are served through
+    /// [`gguf_file::Content::external`] (see [`raw_qtensor`]).
     pub fn to_candle_content(&self) -> Result<gguf_file::Content> {
         let magic = match self.version {
             1 => VersionedMagic::GgufV1,
@@ -346,11 +400,24 @@ impl GgufHeader {
                 },
             );
         }
+        let raw_blocks: HashMap<String, RawTensorInfo> = self
+            .tensors
+            .iter()
+            .filter(|(_, i)| crate::raw_block::is_raw_block(i.dtype))
+            .map(|(n, i)| (n.clone(), i.clone()))
+            .collect();
+        let external = (!raw_blocks.is_empty()).then(|| {
+            std::sync::Arc::new(RawBlockTensors {
+                tensors: raw_blocks,
+                tensor_data_offset: self.tensor_data_offset,
+            }) as std::sync::Arc<dyn gguf_file::ExternalTensors>
+        });
         Ok(gguf_file::Content {
             magic,
             metadata: self.metadata.clone(),
             tensor_infos,
             tensor_data_offset: self.tensor_data_offset,
+            external,
         })
     }
 }
