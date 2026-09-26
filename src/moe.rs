@@ -405,6 +405,80 @@ pub struct BorrowedExpert {
     pub prefetch: Option<Arc<dyn MmapPrefetch>>,
 }
 
+/// Slice a stacked routed-expert tensor in a format candle cannot name
+/// ([`crate::raw_block::RawBlock`]: IQ2_XXS, MXFP4, …; `[n_expert, out,
+/// in]`) into per-expert weights whose blocks stay in the mapping and are
+/// decoded at matmul time.  Without a mapping (tests) the tensor is decoded
+/// to f32 once; on an accelerator expert device that would materialise the
+/// whole pool, so it is refused.
+#[allow(clippy::too_many_arguments)]
+pub fn split_raw_experts<B: crate::raw_block::RawBlock, R: Read + Seek>(
+    arch: &str,
+    raw: &crate::gguf_ext::GgufHeader,
+    reader: &mut R,
+    mmap: Option<&Arc<Mmap>>,
+    expert_device: &Device,
+    name: &str,
+    info: &crate::gguf_ext::RawTensorInfo,
+    n_expert: usize,
+) -> Result<Vec<BorrowedExpert>> {
+    let dims = info.dims.clone();
+    if dims.len() != 3 || dims[0] != n_expert {
+        candle_core::bail!("{arch}: expected expert tensor `{name}` shaped [n_expert, out, in], got {dims:?}");
+    }
+    let (out, inn) = (dims[1], dims[2]);
+    let per_elems = out * inn;
+    let Some(per_bytes) = crate::raw_block::size_bytes::<B>(per_elems) else {
+        candle_core::bail!(
+            "{arch}: {} expert `{name}` rows {out}x{inn} are not a multiple of {}",
+            B::NAME,
+            B::QK
+        );
+    };
+
+    // Zero-copy: one borrowed QTensor per expert, pointing into the mapping.
+    // A borrow is `QStorage::Cpu` by construction, so it is only taken when
+    // the experts' home device is the CPU — which it is for every mapped
+    // model, including one whose dense set runs on an accelerator; it is
+    // also the source a device expert cache uploads an active expert from.
+    if let Some(mmap) = mmap.filter(|_| expert_device.is_cpu()) {
+        let base = raw.tensor_data_offset.saturating_add(info.offset) as usize;
+        let mut experts = Vec::with_capacity(n_expert);
+        for e in 0..n_expert {
+            let at = base + e * per_bytes;
+            match crate::mmap_tensor::borrowed_range_raw::<B>(mmap, at, (out, inn).into())? {
+                Some(tensor) => experts.push(BorrowedExpert {
+                    tensor,
+                    prefetch: crate::mmap_tensor::prefetch_handle_raw::<B>(mmap, at, per_elems / B::QK),
+                }),
+                None => {
+                    experts.clear();
+                    break;
+                }
+            }
+        }
+        if experts.len() == n_expert {
+            return Ok(experts);
+        }
+        tracing::warn!("{arch}: could not borrow `{name}` from the mapping, decoding to f32");
+    }
+
+    // The fallback below materializes the whole stacked tensor as f32 — an
+    // order-of-magnitude blow-up for real model footprints — and accelerator
+    // devices cannot borrow the blocks (they are CPU storage).  Refuse
+    // loudly rather than OOM.
+    if !expert_device.is_cpu() {
+        candle_core::bail!("{arch}: {} expert tensor `{name}` is only supported on the CPU device", B::NAME);
+    }
+    let all = crate::raw_block::decode_bytes::<B>(&raw.read_tensor_bytes(reader, name)?, info.elem_count())?;
+    (0..n_expert)
+        .map(|e| {
+            let t = Tensor::from_vec(all[e * per_elems..(e + 1) * per_elems].to_vec(), (out, inn), expert_device)?;
+            Ok(BorrowedExpert { tensor: QTensor::quantize(&t, GgmlDType::F32)?, prefetch: None })
+        })
+        .collect()
+}
+
 /// A stacked routed-expert tensor `[n_expert, out, in]` as the GGUF header
 /// describes it, with the three ways of turning it into per-expert weights:
 /// borrow each expert from the mapping ([`ExpertTensor::borrow_host`]),

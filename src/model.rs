@@ -18,6 +18,7 @@
 //! | `deepseek2` (DeepSeek-V2/V2.5/V3/V3.1/R1, Kimi-K2, GLM-4.7-Flash) | `quantized_deepseek2` (Joshua)
 //! | `glm-dsa` (GLM-5 / 5.1 / 5.2)                    | `quantized_deepseek2` (Joshua)
 //! | `glm5next` / `glm5-next` (GLM-5.3-Flash)         | `quantized_deepseek2` (Joshua)
+//! | `kimi-linear` (Kimi-Linear), `kimi-k3` (Kimi K3)  | `quantized_deepseek2` (Joshua)
 //! | `deepseek4` (DeepSeek-V4), `deepseek41` (DeepSeek-V4.1) | `quantized_deepseek4` (Joshua)
 //!
 //! The dense DeepSeek releases — DeepSeek-LLM, DeepSeek-Coder (V1) and the
@@ -103,6 +104,13 @@ pub enum Architecture {
     /// requests) — GLM-5.3-Flash: KDA / sparse-MLA hybrid with
     /// hyper-connections.  Served by the `deepseek2` loader.
     Glm5Next,
+    /// `kimi-linear` — Kimi-Linear (KDA / NoPE-MLA hybrid MoE).  Served by
+    /// the `deepseek2` loader.
+    KimiLinear,
+    /// `kimi-k3` — Kimi K3 (Kimi-Linear plus attention residuals, a latent
+    /// MoE, `situ` activations and gated MLA).  Served by the `deepseek2`
+    /// loader.
+    KimiK3,
     /// `deepseek4` — DeepSeek-V4 (sliding-window MLA + KV compression +
     /// indexer-selected sparse attention + Hyper-Connections).
     DeepSeek4,
@@ -158,12 +166,6 @@ const KNOWN_UNSUPPORTED_ARCHS: &[&str] = &[
     "jais",
     "jamba",
     "jina-bert-v2",
-    // Kimi K3. The architecture primitives (KDA, attention residuals, the
-    // latent MoE) live in `crate::kimi_k3`, but the end-to-end loader is not
-    // finished, so the model is still reported as unsupported rather than
-    // half-loading.
-    "kimi-k3",
-    "kimi-linear",
     "llada",
     "llada-moe",
     "llama4",
@@ -237,6 +239,8 @@ const NAMES: &[(&str, Architecture)] = &[
     ("glm-dsa", Architecture::GlmDsa),
     ("glm5next", Architecture::Glm5Next),
     ("glm5-next", Architecture::Glm5Next),
+    ("kimi-linear", Architecture::KimiLinear),
+    ("kimi-k3", Architecture::KimiK3),
     ("deepseek4", Architecture::DeepSeek4),
     ("deepseek41", Architecture::DeepSeek41),
 ];
@@ -396,6 +400,8 @@ impl Architecture {
             Self::DeepSeek2 => "DeepSeek-V2 / DeepSeek-V3 / DeepSeek-R1 / Kimi-K2 / GLM-4.7-Flash",
             Self::GlmDsa => "GLM-5 / GLM-5.1 / GLM-5.2",
             Self::Glm5Next => "GLM-5.3-Flash",
+            Self::KimiLinear => "Kimi-Linear",
+            Self::KimiK3 => "Kimi K3",
             Self::DeepSeek4 => "DeepSeek-V4",
             Self::DeepSeek41 => "DeepSeek-V4.1",
         }
@@ -630,11 +636,14 @@ impl QuantizedModel {
             }
             // One loader serves them all: DeepSeek-MoE differs from V2+ only
             // in its (GQA) attention, GLM-5 in its sparse one, GLM-5.3 in
-            // that plus KDA layers and hyper-connections.
+            // that plus KDA layers and hyper-connections, the Kimi hybrids
+            // in their KDA layers, attention residuals and latent MoE.
             Architecture::DeepSeek
             | Architecture::DeepSeek2
             | Architecture::GlmDsa
-            | Architecture::Glm5Next => {
+            | Architecture::Glm5Next
+            | Architecture::KimiLinear
+            | Architecture::KimiK3 => {
                 crate::quantized_deepseek2::ModelWeights::from_gguf_mmap_placed(
                     gguf,
                     raw,

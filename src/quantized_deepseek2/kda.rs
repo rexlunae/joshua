@@ -1,12 +1,13 @@
-//! Kimi Delta Attention (KDA), the linear-attention layers of GLM-5.3-Flash
-//! (`glm5next`; llama.cpp `build_kda_layer`, HF
-//! `Glm5NextTextLinearAttention`).
+//! Kimi Delta Attention (KDA), the linear-attention layers of Kimi-Linear
+//! (`kimi-linear`), Kimi K3 (`kimi-k3`) and GLM-5.3-Flash (`glm5next`;
+//! llama.cpp `kimi-linear.cpp` / `kimi-k3.cpp` / `build_kda_layer`).
 //!
-//! Per layer: Q, K and V each go through their own causal depthwise conv
-//! (then SiLU); Q and K are L2-normalised per head; a per-*channel* decay
-//! gate and a per-head write strength drive the gated delta rule
-//! ([`crate::kimi_k3::kda_recurrent_head`]); the output is RMS-normalised
-//! per head, gated by `sigmoid(g_b(g_a(x)))` and projected back.  The
+//! Per layer: Q, K and V (separate or fused projections) each go through
+//! their own causal depthwise conv (then SiLU); Q and K are L2-normalised
+//! per head; a per-*channel* decay gate and a per-head write strength drive
+//! the gated delta rule ([`crate::kimi_k3::kda_recurrent_head`]); the
+//! output is RMS-normalised per head, gated by `sigmoid(g(x))` — a low-rank
+//! `g_b(g_a(x))`, or K3's full-rank `ssm_g` — and projected back.  The
 //! recurrent state is `[head_dim, head_dim]` per head plus the last
 //! `d_conv - 1` conv inputs, so the layer cannot rewind to a prefix.
 
@@ -28,12 +29,15 @@ pub(super) struct KdaConfig {
     /// `kda.gate_lower_bound`: the decay gate is `lb · σ(exp(A_log) · a)`;
     /// without it, `−exp(A_log) · softplus(a)`.
     lower_bound: Option<f32>,
+    /// The Q/K L2 norm's eps: `x / √(Σx² + eps)`.
+    l2_eps: f64,
 }
 
 impl KdaConfig {
-    pub(super) fn from_meta(m: &Meta<'_>, n_head: usize) -> Result<Self> {
+    pub(super) fn from_meta(m: &Meta<'_>, n_head: usize, l2_eps: f64) -> Result<Self> {
         let cfg = Self {
             n_head,
+            l2_eps,
             head_dim: m.u32("kda.head_dim")? as usize,
             d_conv: m.u32("ssm.conv_kernel")? as usize,
             lower_bound: m
@@ -63,9 +67,22 @@ pub(super) struct KdaState {
     s: Vec<f32>,
 }
 
+/// The Q/K/V projections: separate, or one fused `attn_qkv`.
+enum Qkv {
+    Split([QMatMul; 3]),
+    Fused(QMatMul),
+}
+
+/// The output gate's pre-activation: low-rank `g_b(g_a(x))` (Kimi-Linear,
+/// GLM-5.3-Flash) or full-rank `ssm_g` (K3).
+enum OutGate {
+    LowRank(QMatMul, QMatMul),
+    Full(QMatMul),
+}
+
 /// One KDA layer's weights.
 pub(super) struct Kda {
-    qkv: [QMatMul; 3],
+    qkv: Qkv,
     /// Depthwise conv taps per channel, `[inner, d_conv]` (oldest first).
     conv: [Tensor; 3],
     f_a: QMatMul,
@@ -74,8 +91,7 @@ pub(super) struct Kda {
     /// `exp(A_log)` per head (the GGUF stores `−exp(A_log)`).
     a_exp: Tensor,
     beta: QMatMul,
-    g_a: QMatMul,
-    g_b: QMatMul,
+    gate: OutGate,
     o_norm: RmsNorm,
     o: QMatMul,
     cfg: KdaConfig,
@@ -94,20 +110,31 @@ impl Kda {
                 .reshape((inner, cfg.d_conv))
         };
         let conv = [conv("q")?, conv("k")?, conv("v")?];
-        Ok(Self {
-            qkv: [
+        let qkv = match rd.qmatmul_if(&format!("{p}.attn_qkv.weight"))? {
+            Some(w) => Qkv::Fused(w),
+            None => Qkv::Split([
                 rd.qmatmul(&format!("{p}.attn_q.weight"))?,
                 rd.qmatmul(&format!("{p}.attn_k.weight"))?,
                 rd.qmatmul(&format!("{p}.attn_v.weight"))?,
-            ],
+            ]),
+        };
+        let gate = match rd.qmatmul_if(&format!("{p}.ssm_g.weight"))? {
+            Some(g) => OutGate::Full(g),
+            None => OutGate::LowRank(
+                rd.qmatmul(&format!("{p}.ssm_g_a.weight"))?,
+                rd.qmatmul(&format!("{p}.ssm_g_b.weight"))?,
+            ),
+        };
+        Ok(Self {
+            qkv,
             conv,
             f_a: rd.qmatmul(&format!("{p}.ssm_f_a.weight"))?,
             f_b: rd.qmatmul(&format!("{p}.ssm_f_b.weight"))?,
             dt_bias: rd.f32_tensor(&format!("{p}.ssm_dt.bias"))?,
-            a_exp: rd.f32_tensor(&format!("{p}.ssm_a"))?.neg()?,
+            // Kimi-Linear pads it to [1, n_head, 1, 1].
+            a_exp: rd.f32_tensor(&format!("{p}.ssm_a"))?.flatten_all()?.neg()?,
             beta: rd.qmatmul(&format!("{p}.ssm_beta.weight"))?,
-            g_a: rd.qmatmul(&format!("{p}.ssm_g_a.weight"))?,
-            g_b: rd.qmatmul(&format!("{p}.ssm_g_b.weight"))?,
+            gate,
             o_norm: rd.rms_norm(&format!("{p}.ssm_norm.weight"), rms_eps)?,
             o: rd.qmatmul(&format!("{p}.attn_output.weight"))?,
             cfg: cfg.clone(),
@@ -131,9 +158,17 @@ impl Kda {
         };
 
         // Causal depthwise conv over [history ‖ new], then SiLU.
+        let proj: [Tensor; 3] = match &self.qkv {
+            Qkv::Split(w) => [w[0].forward(x)?, w[1].forward(x)?, w[2].forward(x)?],
+            Qkv::Fused(w) => {
+                let y = w.forward(x)?;
+                let part = |c: usize| y.narrow(D::Minus1, c * inner, inner);
+                [part(0)?, part(1)?, part(2)?]
+            }
+        };
         let mut qkv = Vec::with_capacity(3);
-        for c in 0..3 {
-            let y = self.qkv[c].forward(x)?.reshape((t, inner))?;
+        for (c, y) in proj.iter().enumerate() {
+            let y = y.reshape((t, inner))?;
             let hist = Tensor::cat(&[&st.conv[c], &y], 0)?; // [k - 1 + t, inner]
             let mut out = hist
                 .narrow(0, 0, t)?
@@ -147,9 +182,10 @@ impl Kda {
             st.conv[c] = hist.narrow(0, t, k - 1)?.contiguous()?;
             qkv.push(silu(&out)?.reshape((t, h, d))?);
         }
-        // L2-normalise Q and K per head (FLA: x / sqrt(Σx² + 1e-6)); fold
-        // the 1/√d query scale in.
-        let l2 = |x: &Tensor| x.broadcast_div(&(x.sqr()?.sum_keepdim(D::Minus1)? + 1e-6)?.sqrt()?);
+        // L2-normalise Q and K per head (x / √(Σx² + eps)); fold the 1/√d
+        // query scale in.
+        let eps = self.cfg.l2_eps;
+        let l2 = |x: &Tensor| x.broadcast_div(&(x.sqr()?.sum_keepdim(D::Minus1)? + eps)?.sqrt()?);
         let q = (l2(&qkv[0])? / (d as f64).sqrt())?;
         let key = l2(&qkv[1])?;
         let v = &qkv[2];
@@ -192,11 +228,12 @@ impl Kda {
             .transpose(0, 1)?
             .contiguous()?; // [t, h, d]
 
-        // RMSNorm(o) · σ(g_b(g_a(x))), then the output projection.
-        let gate = self
-            .g_b
-            .forward(&self.g_a.forward(x)?)?
-            .reshape((t, h, d))?;
+        // RMSNorm(o) · σ(g(x)), then the output projection.
+        let gate = match &self.gate {
+            OutGate::LowRank(a, b) => b.forward(&a.forward(x)?)?,
+            OutGate::Full(g) => g.forward(x)?,
+        }
+        .reshape((t, h, d))?;
         let o = (self.o_norm.forward(&o)? * sigmoid(&gate)?)?.reshape((1, t, inner))?;
         self.o.forward(&o)
     }

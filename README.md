@@ -17,8 +17,8 @@ framework) and [tokenizers](https://github.com/huggingface/tokenizers).
 | **Huge pages** | Transparent 2 MiB pages (`MADV_HUGEPAGE`, default on Linux) or explicit 2 MiB / 1 GiB (`MAP_HUGETLB`) backing to cut TLB misses on large models |
 | **OpenAI-compatible** | Drop-in replacement for `/v1/chat/completions`, `/v1/embeddings`, `/v1/models` |
 | **Streaming** | Server-Sent Events (SSE) for token-by-token streaming |
-| **GGUF support** | Llama/Mistral/Mixtral, Gemma 1–3, every GLM generation (ChatGLM2/3, GLM-4, GLM-4.1V text, GLM-OCR, GLM-4.5/4.6/4.7 incl. Air and Flash, GLM-5/5.1/5.2, GLM-5.3-Flash), LFM2, Phi-2, Phi-3, every Qwen generation (Qwen 1, Qwen1.5/2/2.5 incl. MoE, Qwen2/2.5-VL and Qwen3-VL text, Qwen3, Qwen3-MoE, Qwen3-Next, Qwen3.5 dense/MoE, Qwen3.8-Flash-Next / `qwen4exp`, Bonsai 1-bit / 2-bit), DeepSeek-MoE, DeepSeek-V2/V2.5/V3/R1, DeepSeek-V4 / V4-Flash, DeepSeek-V4.1-Flash, Kimi-K2 (dense DeepSeek-LLM / Coder / R1-Distill load as `llama` / `qwen2`) |
-| **Exotic quant dtypes** | In-mapping decoders for IQ2_XXS (DeepSeek-V4's 2.0625-bit expert weights), MXFP4 (Kimi-K3-class) and Q1_0 / Q2_0 (Bonsai's 1-bit and 2-bit weights), with matmuls that keep the blocks in the mmap instead of materialising f32 — one generic `RawBlock` layer, so any native loader reads any of them |
+| **GGUF support** | Llama/Mistral/Mixtral, Gemma 1–3, every GLM generation (ChatGLM2/3, GLM-4, GLM-4.1V text, GLM-OCR, GLM-4.5/4.6/4.7 incl. Air and Flash, GLM-5/5.1/5.2, GLM-5.3-Flash), LFM2, Phi-2, Phi-3, every Qwen generation (Qwen 1, Qwen1.5/2/2.5 incl. MoE, Qwen2/2.5-VL and Qwen3-VL text, Qwen3, Qwen3-MoE, Qwen3-Next, Qwen3.5 dense/MoE, Qwen3.8-Flash-Next / `qwen4exp`, Bonsai 1-bit / 2-bit), DeepSeek-MoE, DeepSeek-V2/V2.5/V3/R1, DeepSeek-V4 / V4-Flash, DeepSeek-V4.1-Flash, every Kimi generation (Kimi-K2 / K2.5, Moonlight, Kimi-VL text, Kimi-Linear, Kimi K3) (dense DeepSeek-LLM / Coder / R1-Distill load as `llama` / `qwen2`) |
+| **Exotic quant dtypes** | In-mapping decoders for IQ2_XXS (DeepSeek-V4's 2.0625-bit expert weights), MXFP4 (Kimi K3's routed experts) and Q1_0 / Q2_0 (Bonsai's 1-bit and 2-bit weights), with matmuls that keep the blocks in the mmap instead of materialising f32 — one generic `RawBlock` layer, so any native loader reads any of them |
 | **Fused SIMD kernels** | AVX-512 and AVX2 (x86-64) and NEON (aarch64) dequant+dot fusion — the weights decode inside the dot in registers — for Q8_0/Q2_K/Q4_K, IQ2_XXS, MXFP4 and Bonsai's Q1_0/Q2_0, plus parallel SIMD matmuls for the other k-quants; the widest ISA the CPU has is picked at startup (`JOSHUA_SIMD` overrides) |
 | **Chat templates** | Renders the model's own `tokenizer.chat_template` from the GGUF (Jinja via pure-Rust minijinja); ChatML fallback |
 | **Tool calling** | OpenAI-compatible `tools` / `tool_calls`, parsing Hermes/Qwen, Mistral, and Llama-3 call formats |
@@ -674,9 +674,11 @@ the matching pure-Rust candle loader.  Currently supported architectures:
 | `qwen35` / `qwen35moe` | Qwen3.5 dense / MoE (Gated DeltaNet hybrid) |
 | `qwen4exp` | Qwen3.8-Flash-Next (Qwen3.5-MoE plus hyper-connections, QSA block-sparse attention, PLE n-gram hash embeddings) |
 | `deepseek` | DeepSeek-MoE 16B (GQA attention + fine-grained MoE with shared experts) |
-| `deepseek2` | DeepSeek-V2, DeepSeek-V2-Lite, DeepSeek-V2.5, DeepSeek-V3 / V3.1, DeepSeek-R1, **Kimi-K2**, GLM-4.7-Flash (MLA attention + fine-grained MoE) |
+| `deepseek2` | DeepSeek-V2, DeepSeek-V2-Lite, DeepSeek-V2.5, DeepSeek-V3 / V3.1, DeepSeek-R1, **Kimi-K2** / K2.5, Moonlight, Kimi-VL (text), GLM-4.7-Flash (MLA attention + fine-grained MoE) |
 | `glm-dsa` | GLM-5, GLM-5.1, GLM-5.2 (the `deepseek2` stack plus DeepSeek Sparse Attention: a lightning indexer picks each query's top-k keys, and GLM-5.2's IndexShare layers reuse an earlier layer's pick) |
 | `glm5next` / `glm5-next` | GLM-5.3-Flash (three in four layers Kimi Delta Attention, the rest NoPE MLA over a k-pool sparse indexer; manifold-constrained hyper-connections; clamped-SwiGLU MoE) — both names written by llama.cpp's open pull requests load |
+| `kimi-linear` | Kimi-Linear (three in four layers Kimi Delta Attention, the rest NoPE MLA; sigmoid-routed MoE with shared experts) |
+| `kimi-k3` | Kimi K3 (Kimi-Linear's hybrid plus attention residuals, a latent MoE with MXFP4 experts, `situ` activations and gated MLA) |
 | `deepseek4` | DeepSeek-V4 (Hyper-Connections residual mixing, alternating sliding-window / learned KV-compressor attention, Lightning-Indexer sparse attention, fine-grained MoE with IQ2_XXS experts) |
 | `deepseek41` | DeepSeek-V4.1-Flash (V4 with a one-sublayer-lagged hyper-connection mix and no learned HC head, KV compressed on a few source layers and shared by the layers after them, engram n-gram hash tables) |
 
@@ -702,7 +704,15 @@ against independent float64 transcriptions of llama.cpp's graph (`glm-dsa`)
 and of HF transformers' model code under llama.cpp's GGUF conventions
 (`glm5next`). The other GLMs (`chatglm`, `glm4`, `glm4moe`) run on the Qwen
 family loader, cross-checked the same way; appended NextN (MTP) blocks are
-skipped by every GLM loader.
+skipped by every GLM loader. The Kimi hybrids run on the same loader too:
+`kimi-linear` interleaves Kimi Delta Attention with MLA whose rope slice is
+never rotated, and `kimi-k3` adds a full-rank KDA output gate, a sigmoid
+output gate on MLA, `situ` activations, a latent MoE (routed experts in a
+narrower space, MXFP4 blocks borrowed from the mapping) and attention
+residuals (every few layers the residual stream is banked and restarted, and
+each sublayer reads a softmax mix of the bank). Both are checked against an
+independent float64 transcription of llama.cpp's `kimi-linear.cpp` /
+`kimi-k3.cpp`.
 
 The dense DeepSeek releases — DeepSeek-LLM, DeepSeek-Coder V1 and the
 DeepSeek-R1 distills — are converted by llama.cpp as `llama` or `qwen2` and
@@ -756,14 +766,6 @@ pinned to an independent NumPy transcription of llama.cpp's graphs.  Recurrent l
 and Qwen3.5 re-prefill on edited contexts instead of truncating.  Not
 loadable: `qwen3tts` (speech codec output) and `rwkv6qwen2` (an RWKV-6
 distillation, not a Qwen decoder).
-
-**Kimi-K3 (in progress).** The correctness-critical primitives — Kimi Delta
-Attention (per-channel decay gates), attention residuals, the `situ`
-activation, and an MXFP4 decoder — are implemented in `kimi_k3.rs` and
-unit-tested against the reference formulations, but a full forward pass is not
-wired up yet: no released llama.cpp runs K3, and no weights were available to
-check end-to-end logits against. It is not yet dispatchable from GGUF
-metadata.
 
 Example models:
 
@@ -1182,7 +1184,7 @@ multicast interoperability or LAN throughput.
 - [x] Vision / multimodal support (OpenAI image messages via llama.cpp `mtmd` through the plugin shim)
 - [x] Speech-to-text (Whisper — pure-Rust pipeline, `/v1/audio/transcriptions`)
 - [x] NPU backend architecture (isolated vendor-plugin shim + llama.cpp adapter for Hexagon/CANN/…)
-- [ ] Kimi-K3 full forward pass (primitives done: Kimi Delta Attention, attention residuals, `situ`, MXFP4 — see Supported models)
+- [x] Kimi-Linear and Kimi K3 (Kimi Delta Attention, attention residuals, latent MoE, `situ`, MXFP4 experts)
 
 ---
 
