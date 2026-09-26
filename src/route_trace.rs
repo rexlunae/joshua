@@ -160,6 +160,13 @@ pub fn install(tracer: Arc<Tracer>) {
     }
 }
 
+/// Remove the [`install`]ed tracer, so routing stops being recorded to it.
+pub fn uninstall() {
+    if let Ok(mut g) = GLOBAL.write() {
+        *g = None;
+    }
+}
+
 /// [`Tracer::begin_call`] on the global tracer, if any.
 pub fn begin_call(phase: Phase) {
     if let Some(t) = Tracer::global() {
