@@ -1318,6 +1318,49 @@ void main() {{
     s
 }
 
+/// Quantize activations to int8 per 32 values the way llama.cpp's
+/// `quantize_row_q8_0` does (`d = max|x| / 127`, `q = round(x / d)`, half
+/// away from zero), for the int8 GEMV (`wgsl::k_qgemv_mali_i8`): one
+/// invocation per 32-value block writes its 8 words of packed signed bytes
+/// to `XQ`, its scale to `XS` and the sums of its two halves' `q` to
+/// `XSUM`.  Push: `nblk, xoff`.  Bindings: `X, XQ, XS, XSUM`.
+pub fn k_quant_x8(wg: usize) -> String {
+    let mut s = prelude(wg, 4);
+    s += &buf(0, "float", "X", true);
+    s += &buf(1, "uint", "XQ", false);
+    s += &buf(2, "float", "XS", false);
+    s += &buf(3, "int", "XSUM", false);
+    s += r#"
+layout(push_constant) uniform PC { int nblk; int xoff; } pc;
+layout(local_size_x = WG) in;
+void main() {
+    int b = gid();
+    if (b >= pc.nblk) return;
+    int x0 = pc.xoff + 32 * b;
+    float amax = 0.0;
+    for (int i = 0; i < 32; i++) amax = max(amax, abs(X[x0 + i]));
+    float d = amax / 127.0;
+    float id = d != 0.0 ? 1.0 / d : 0.0;
+    int sum0 = 0;
+    int sum1 = 0;
+    for (int w = 0; w < 8; w++) {
+        uint word = 0u;
+        for (int e = 0; e < 4; e++) {
+            float v = X[x0 + 4 * w + e] * id;
+            int q = int(sign(v) * floor(abs(v) + 0.5));
+            word |= (uint(q) & 0xFFu) << uint(8 * e);
+            if (w < 4) sum0 += q; else sum1 += q;
+        }
+        XQ[8 * b + w] = word;
+    }
+    XS[b] = d;
+    XSUM[2 * b] = sum0;
+    XSUM[2 * b + 1] = sum1;
+}
+"#;
+    s
+}
+
 /// Half / bf16 weight GEMV: `C[m, n] = sum_k X[m, k] * W[n, k]`.
 /// Push: `N, K, is_bf16, xoff, coff, M`.
 pub fn k_hgemv(wg: usize) -> String {
