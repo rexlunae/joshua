@@ -1026,6 +1026,222 @@ pub fn write_tiny_glm5next_gguf(path: &Path, arch: &str) {
     gguf_file::write(&mut file, &metadata_refs, &tensor_refs).unwrap();
 }
 
+/// Write a tiny `kimi-linear` or `kimi-k3` GGUF.  Five layers: KDA at 0, 1
+/// and 3, NoPE MLA (with an unrotated two-wide rope slice) at 2 and 4; a
+/// leading dense FFN, then sigmoid-routed MoE with a selection bias and a
+/// shared expert.
+///
+/// * `kimi-linear` — low-rank `g_a`/`g_b` output gates, the softplus decay
+///   gate, `ssm_a` padded to 4-D, a fused `attn_qkv` on layer 3, a plain Q
+///   projection, a combined `attn_kv_b` on layer 2 and split `attn_k_b` /
+///   `attn_v_b` on layer 4, SwiGLU, and no `expert_weights_norm` key (the
+///   architecture always renormalises).
+/// * `kimi-k3` — the lower-bounded sigmoid decay gate, full-rank `ssm_g`,
+///   3-D conv kernels, a LoRA Q projection, MLA output gates, `situ`
+///   activations, a latent MoE (32 wide, `ffn_routed_norm` on the even
+///   layers only) and attention residuals checkpointed every two layers.
+///   With `mxfp4` the routed experts are MXFP4 blocks; without, their exact
+///   f32 decode — the two files describe the same model.
+pub fn write_tiny_kimi_gguf(path: &Path, arch: &str, mxfp4: bool) {
+    use joshua::mxfp4::{BlockMxfp4, GGML_TYPE_MXFP4};
+    const VOCAB: usize = 16;
+    const EMB: usize = 8;
+    const H: usize = 2;
+    const KD: usize = 4; // KDA head dim
+    const INNER: usize = H * KD;
+    const CONV: usize = 3;
+    const LQ: usize = 6; // q_lora_rank (K3)
+    const LKV: usize = 6; // kv_lora_rank
+    const NP: usize = 4; // qk_nope
+    const R: usize = 2; // the (unrotated) qk_rope slice
+    const VH: usize = 4;
+    const NFF: usize = 16;
+    const NE: usize = 4;
+    let k3 = arch == "kimi-k3";
+    assert!(k3 || !mxfp4, "only the K3 fixture has MXFP4 experts");
+    // MXFP4 blocks are 32 wide, so K3's expert dims are.
+    let (nfe, lat) = if k3 { (32, 32) } else { (8, EMB) };
+    let n_layer = 5;
+    let recurrent = |i: usize| i != 2 && i != 4;
+
+    let u32v = gguf_file::Value::U32;
+    let f32v = gguf_file::Value::F32;
+    let key = |s: &str| format!("{arch}.{s}");
+    let mut metadata: Vec<(String, gguf_file::Value)> = vec![
+        ("general.architecture".to_string(), gguf_file::Value::String(arch.to_string())),
+        (key("attention.head_count"), u32v(H as u32)),
+        (
+            key("attention.head_count_kv"),
+            gguf_file::Value::Array((0..n_layer).map(|i| u32v(if recurrent(i) { 0 } else { H as u32 })).collect()),
+        ),
+        (key("block_count"), u32v(n_layer as u32)),
+        (key("embedding_length"), u32v(EMB as u32)),
+        (key("context_length"), u32v(512)),
+        (key("attention.layer_norm_rms_epsilon"), f32v(1e-5)),
+        (key("attention.kv_lora_rank"), u32v(LKV as u32)),
+        (key("attention.key_length_mla"), u32v((NP + R) as u32)),
+        (key("attention.value_length_mla"), u32v(VH as u32)),
+        (key("rope.dimension_count"), u32v(R as u32)),
+        (key("kda.head_dim"), u32v(KD as u32)),
+        (key("ssm.conv_kernel"), u32v(CONV as u32)),
+        (key("feed_forward_length"), u32v(NFF as u32)),
+        (key("leading_dense_block_count"), u32v(1)),
+        (key("expert_count"), u32v(NE as u32)),
+        (key("expert_used_count"), u32v(2)),
+        (key("expert_feed_forward_length"), u32v(nfe as u32)),
+        (key("expert_shared_count"), u32v(1)),
+        (key("expert_gating_func"), u32v(2)),
+        (key("expert_weights_scale"), f32v(2.5)),
+    ];
+    if k3 {
+        metadata.extend([
+            (key("attention.q_lora_rank"), u32v(LQ as u32)),
+            (key("kda.gate_lower_bound"), f32v(-5.0)),
+            (key("expert_weights_norm"), gguf_file::Value::Bool(true)),
+            (key("expert_latent_length"), u32v(lat as u32)),
+            (key("attn_res.block_size"), u32v(2)),
+            (key("activation.situ_beta"), f32v(1.5)),
+            (key("activation.situ_linear_beta"), f32v(2.0)),
+        ]);
+    }
+    metadata.extend(tiny_tokenizer_metadata());
+
+    let mut seed = 40u32;
+    let mut next = |n: usize| {
+        seed = seed.wrapping_add(7).wrapping_mul(2_654_435_761) | 1;
+        weights(n, seed)
+    };
+    let gamma = |w: Vec<f32>| w.into_iter().map(|x| 1.0 + 3.0 * x).collect::<Vec<f32>>();
+    let big = |w: Vec<f32>| w.into_iter().map(|x| x * 10.0).collect::<Vec<f32>>();
+    let mut tensors = vec![
+        RawTensor::f32("token_embd.weight", weights(VOCAB * EMB, 1), &[VOCAB, EMB]),
+        RawTensor::f32("output_norm.weight", gamma(next(EMB)), &[EMB]),
+        RawTensor::f32("output.weight", next(VOCAB * EMB), &[VOCAB, EMB]),
+    ];
+    if k3 {
+        tensors.push(RawTensor::f32("output_res_score.weight", big(next(EMB)), &[EMB]));
+    }
+    // A routed-expert stack `[NE, rows, cols]`: random MXFP4 blocks, or
+    // their exact f32 decode.
+    let mut expert_seed = 900u32;
+    let mut experts = |name: String, rows: usize, cols: usize| {
+        expert_seed += 1;
+        if !k3 {
+            return RawTensor::f32(&name, weights(NE * rows * cols, expert_seed * 31), &[NE, rows, cols]);
+        }
+        let n_blocks = NE * rows * cols / 32;
+        let bytes = weights(n_blocks * 17, expert_seed * 31);
+        let blocks: Vec<BlockMxfp4> = (0..n_blocks)
+            .map(|b| {
+                let byte = |j: usize| ((bytes[b * 17 + j] + 0.1) * 1275.0) as u8;
+                BlockMxfp4 {
+                    e: 121 + byte(0) % 3,
+                    qs: std::array::from_fn(|j| byte(j + 1)),
+                }
+            })
+            .collect();
+        if mxfp4 {
+            RawTensor {
+                name,
+                dtype: GGML_TYPE_MXFP4,
+                dims: vec![NE, rows, cols],
+                data: blocks.iter().flat_map(|b| std::iter::once(b.e).chain(b.qs)).collect(),
+            }
+        } else {
+            let decoded = blocks
+                .iter()
+                .flat_map(|b| {
+                    let mut out = [0f32; 32];
+                    b.dequantize(&mut out);
+                    out
+                })
+                .collect();
+            RawTensor::f32(&name, decoded, &[NE, rows, cols])
+        }
+    };
+    for i in 0..n_layer {
+        let p = format!("blk.{i}");
+        let mut push = |name: &str, data: Vec<f32>, shape: &[usize]| {
+            tensors.push(RawTensor::f32(&format!("{p}.{name}"), data, shape));
+        };
+        push("attn_norm.weight", gamma(next(EMB)), &[EMB]);
+        push("ffn_norm.weight", gamma(next(EMB)), &[EMB]);
+        if k3 {
+            push("attn_res_score.weight", big(next(EMB)), &[EMB]);
+            push("ffn_res_score.weight", big(next(EMB)), &[EMB]);
+        }
+        if recurrent(i) {
+            if !k3 && i == 3 {
+                push("attn_qkv.weight", big(next(3 * INNER * EMB)), &[3 * INNER, EMB]);
+            } else {
+                for c in ["q", "k", "v"] {
+                    push(&format!("attn_{c}.weight"), big(next(INNER * EMB)), &[INNER, EMB]);
+                }
+            }
+            let conv: &[usize] = if k3 { &[INNER, 1, CONV] } else { &[1, INNER, 1, CONV] };
+            for c in ["q", "k", "v"] {
+                push(&format!("ssm_conv1d_{c}.weight"), big(next(INNER * CONV)), conv);
+            }
+            push("ssm_f_a.weight", big(next(KD * EMB)), &[KD, EMB]);
+            push("ssm_f_b.weight", big(next(INNER * KD)), &[INNER, KD]);
+            push("ssm_dt.bias", next(INNER), &[INNER]);
+            // −exp(A_log), as the converters store it.
+            let a: Vec<f32> = next(H).iter().map(|x| -(0.5 + 5.0 * x.abs())).collect();
+            push("ssm_a", a, if k3 { &[H] } else { &[1, 1, H, 1] });
+            push("ssm_beta.weight", big(next(H * EMB)), &[H, EMB]);
+            if k3 {
+                push("ssm_g.weight", big(next(INNER * EMB)), &[INNER, EMB]);
+            } else {
+                push("ssm_g_a.weight", big(next(KD * EMB)), &[KD, EMB]);
+                push("ssm_g_b.weight", big(next(INNER * KD)), &[INNER, KD]);
+            }
+            push("ssm_norm.weight", gamma(next(KD)), &[KD]);
+            push("attn_output.weight", next(EMB * INNER), &[EMB, INNER]);
+        } else {
+            let qd = H * (NP + R);
+            if k3 {
+                push("attn_q_a.weight", next(LQ * EMB), &[LQ, EMB]);
+                push("attn_q_a_norm.weight", gamma(next(LQ)), &[LQ]);
+                push("attn_q_b.weight", big(next(qd * LQ)), &[qd, LQ]);
+                push("attn_gate.weight", big(next(H * VH * EMB)), &[H * VH, EMB]);
+            } else {
+                push("attn_q.weight", big(next(qd * EMB)), &[qd, EMB]);
+            }
+            push("attn_kv_a_mqa.weight", big(next((LKV + R) * EMB)), &[LKV + R, EMB]);
+            push("attn_kv_a_norm.weight", gamma(next(LKV)), &[LKV]);
+            if !k3 && i == 2 {
+                push("attn_kv_b.weight", big(next(H * (NP + VH) * LKV)), &[H * (NP + VH), LKV]);
+            } else {
+                push("attn_k_b.weight", big(next(H * LKV * NP)), &[H, LKV, NP]);
+                push("attn_v_b.weight", next(H * VH * LKV), &[H, VH, LKV]);
+            }
+            push("attn_output.weight", next(EMB * H * VH), &[EMB, H * VH]);
+        }
+        if i == 0 {
+            push("ffn_gate.weight", big(next(NFF * EMB)), &[NFF, EMB]);
+            push("ffn_up.weight", big(next(NFF * EMB)), &[NFF, EMB]);
+            push("ffn_down.weight", next(EMB * NFF), &[EMB, NFF]);
+            continue;
+        }
+        push("ffn_gate_inp.weight", big(next(NE * EMB)), &[NE, EMB]);
+        push("exp_probs_b.bias", next(NE), &[NE]);
+        push("ffn_gate_shexp.weight", big(next(nfe * EMB)), &[nfe, EMB]);
+        push("ffn_up_shexp.weight", big(next(nfe * EMB)), &[nfe, EMB]);
+        push("ffn_down_shexp.weight", next(EMB * nfe), &[EMB, nfe]);
+        if k3 {
+            push("ffn_routed_down.weight", big(next(lat * EMB)), &[lat, EMB]);
+            push("ffn_routed_up.weight", next(EMB * lat), &[EMB, lat]);
+            if i % 2 == 0 {
+                push("ffn_routed_norm.weight", gamma(next(lat)), &[lat]);
+            }
+        }
+        tensors.push(experts(format!("{p}.ffn_gate_exps.weight"), nfe, lat));
+        tensors.push(experts(format!("{p}.ffn_up_exps.weight"), nfe, lat));
+        tensors.push(experts(format!("{p}.ffn_down_exps.weight"), lat, nfe));
+    }
+    write_raw_gguf(path, &metadata, &tensors);
+}
+
 /// Write a tiny but structurally valid `qwen3moe` GGUF exercising the full
 /// Qwen3-MoE feature set: GQA attention with per-head Q/K norms and a
 /// half-split RoPE over a head_dim decoupled from the embedding width, plus a

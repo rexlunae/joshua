@@ -3955,96 +3955,31 @@ fn note_tokens(history: &mut Vec<u32>, pos: usize, tokens: &[u32]) -> Result<()>
     Ok(())
 }
 
-/// Slice a [`RawBlock`] expert tensor (`[n_expert, out, in]`, GGUF dims
-/// reversed; IQ2_XXS or MXFP4 in the released GGUFs) into per-expert
-/// [`QMatMul`]s whose blocks stay in the mapping.
+/// Slice a [`RawBlock`] expert tensor (IQ2_XXS or MXFP4 in the released
+/// GGUFs) into per-expert [`QMatMul`]s whose blocks stay in the mapping (see
+/// [`crate::moe::split_raw_experts`]).
 fn split_raw_experts<B: RawBlock, R: Read + Seek>(
     rd: &mut Reader<R>,
     name: &str,
     info: &crate::gguf_ext::RawTensorInfo,
     n_expert: usize,
 ) -> Result<Vec<ExpertTensor>> {
-    let dims = info.dims.clone();
-    if dims.len() != 3 || dims[0] != n_expert {
-        candle_core::bail!(
-            "deepseek4: expected expert tensor `{name}` shaped [n_expert, out, in], got {dims:?}"
-        );
-    }
-    let (out, inn) = (dims[1], dims[2]);
-    let per_elems = out * inn;
-    let Some(per_bytes) = crate::raw_block::size_bytes::<B>(per_elems) else {
-        candle_core::bail!(
-            "deepseek4: {} expert `{name}` rows {out}x{inn} are not a multiple of {}",
-            B::NAME,
-            B::QK
-        );
+    let Some(raw) = rd.raw.as_ref() else {
+        candle_core::bail!("deepseek4: no raw header for `{name}`");
     };
-    let tensor_data_offset = rd
-        .raw
-        .as_ref()
-        .map(|r| r.tensor_data_offset)
-        .unwrap_or(rd.ct.tensor_data_offset);
-
-    // Zero-copy: one borrowed QTensor per expert, pointing into the mapping.
-    // A borrow is `QStorage::Cpu` by construction, so it is only taken when
-    // the experts' home device is the CPU — which it is for every mapped
-    // model, including one whose dense set runs on an accelerator (see
-    // `Reader::expert_device`); it is also the source the device expert
-    // cache uploads an active expert's blocks from.
-    if let Some(mmap) = rd.mmap.as_ref().filter(|_| rd.expert_device.is_cpu()) {
-        let base = tensor_data_offset.saturating_add(info.offset) as usize;
-        let mut experts = Vec::with_capacity(n_expert);
-        for e in 0..n_expert {
-            let at = base + e * per_bytes;
-            match crate::mmap_tensor::borrowed_range_raw::<B>(mmap, at, (out, inn).into())? {
-                Some(qt) => experts.push(ExpertTensor {
-                    qmatmul: QMatMul::from_qtensor(qt)?,
-                    prefetch: crate::mmap_tensor::prefetch_handle_raw::<B>(
-                        mmap,
-                        at,
-                        per_elems / B::QK,
-                    ),
-                }),
-                None => {
-                    experts.clear();
-                    break;
-                }
-            }
-        }
-        if experts.len() == n_expert {
-            return Ok(experts);
-        }
-        tracing::warn!("deepseek4: could not borrow `{name}` from the mapping, decoding to f32");
-    }
-
-    // The fallback below materializes the whole stacked tensor as f32 — an
-    // order-of-magnitude blow-up for real model footprints (~40 GB of 2-bit
-    // data becomes ~640 GB) — and accelerator devices cannot borrow the
-    // blocks (they are CPU storage).  Refuse loudly rather than OOM.
-    if !rd.expert_device.is_cpu() {
-        candle_core::bail!(
-            "deepseek4: {} expert tensor `{name}` is only supported on the CPU device",
-            B::NAME
-        );
-    }
-
-    // No mapping (or borrow declined): decode the whole tensor to f32 and hand
-    // each expert over as an f32 QMatMul.  Only reachable in tests for the
-    // production footprint of these tensors.
-    let all = crate::raw_block::decode_bytes::<B>(&rd.raw_bytes_from(name)?, info.elem_count())?;
-    let mut experts = Vec::with_capacity(n_expert);
-    for e in 0..n_expert {
-        let t = Tensor::from_vec(
-            all[e * per_elems..(e + 1) * per_elems].to_vec(),
-            (out, inn),
-            &rd.expert_device,
-        )?;
-        experts.push(ExpertTensor {
-            qmatmul: QMatMul::from_qtensor(QTensor::quantize(&t, GgmlDType::F32)?)?,
-            prefetch: None,
-        });
-    }
-    Ok(experts)
+    crate::moe::split_raw_experts::<B, R>(
+        "deepseek4",
+        raw,
+        &mut rd.reader,
+        rd.mmap.as_ref(),
+        &rd.expert_device,
+        name,
+        info,
+        n_expert,
+    )?
+    .into_iter()
+    .map(|b| Ok(ExpertTensor { qmatmul: QMatMul::from_qtensor(b.tensor)?, prefetch: b.prefetch }))
+    .collect()
 }
 
 fn load_moe<R: Read + Seek>(

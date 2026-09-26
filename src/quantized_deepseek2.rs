@@ -1,5 +1,6 @@
-//! Pure-Rust quantized loader for the `deepseek`, `deepseek2` and `glm-dsa`
-//! GGUF architectures.
+//! Pure-Rust quantized loader for the `deepseek`, `deepseek2`, GLM-5
+//! (`glm-dsa`, `glm5next`) and Kimi hybrid (`kimi-linear`, `kimi-k3`) GGUF
+//! architectures.
 //!
 //! Covers DeepSeek-MoE (`deepseek`), DeepSeek-V2, DeepSeek-V2-Lite,
 //! DeepSeek-V2.5, DeepSeek-V3 / V3.1 / R1, **Kimi-K2** and GLM-4.7-Flash —
@@ -10,6 +11,11 @@
 //! three in four attention layers for Kimi Delta Attention (see [`kda`]),
 //! drops RoPE, pools the indexer's keys, clamps its SwiGLUs and carries the
 //! residual as manifold-constrained hyper-connections ([`crate::mhc`]).
+//! Kimi-Linear (`kimi-linear`) interleaves the same KDA layers with MLA
+//! whose rope slice is kept but never rotated; Kimi K3 (`kimi-k3`) adds a
+//! full-rank KDA output gate, a sigmoid output gate on MLA, `situ`
+//! activations, a latent MoE (routed experts in a narrower space, often
+//! MXFP4) and attention residuals ([`crate::kimi_k3`]).
 //! candle ships a *full-precision* `deepseek2` model but no quantized/GGUF
 //! one, and its gate only implements DeepSeek-V2 softmax routing; this module
 //! adds the GGUF path plus the DeepSeek-V3 / Kimi-K2 sigmoid-with-bias,
@@ -63,7 +69,7 @@ use dsa::{DsaConfig, IndexCache, Indexer, Selection};
 use kda::{Kda, KdaConfig, KdaState};
 use crate::mhc::HyperConnection;
 
-/// Parsed `deepseek` / `deepseek2` hyper-parameters.
+/// Parsed hyper-parameters of every architecture this loader serves.
 ///
 /// A `deepseek` (GQA) model reuses the MLA head-dim fields with no un-rotated
 /// slice: `qk_nope_head_dim = 0`, `qk_rope_head_dim = head_dim`, and
@@ -108,6 +114,13 @@ struct Config {
     /// experts / dense FFNs (`0`: none).
     swiglu_exp: Vec<f64>,
     swiglu_shexp: Vec<f64>,
+    /// `situ` `(β, β_lin)` in place of SwiGLU everywhere (`kimi-k3`).
+    situ: Option<(f32, f32)>,
+    /// MLA keeps its `qk_rope` slice but never rotates it (Kimi-Linear, K3).
+    nope: bool,
+    /// Attention-residual checkpoint period (`kimi-k3`; `0`: plain residual).
+    attn_res_block: usize,
+    n_embd: usize,
 }
 
 impl Config {
@@ -120,11 +133,22 @@ impl Config {
     fn is_mla(&self) -> bool {
         self.kv_lora_rank > 0
     }
+
+    /// The gated activation of layer `il`'s routed experts (`routed`) or of
+    /// its shared experts / dense FFN.
+    fn act(&self, il: usize, routed: bool) -> Act {
+        match self.situ {
+            Some((beta, linear_beta)) => Act::Situ { beta, linear_beta },
+            None => Act::SwiGlu {
+                limit: if routed { self.swiglu_exp[il] } else { self.swiglu_shexp[il] },
+            },
+        }
+    }
 }
 
 impl Config {
-    /// Parse the hyper-parameters of a `deepseek`, `deepseek2` or `glm-dsa`
-    /// GGUF.
+    /// Parse the hyper-parameters of a GGUF of any architecture this loader
+    /// serves.
     fn from_metadata(
         md: &std::collections::HashMap<String, gguf_file::Value>,
         arch: &str,
@@ -140,6 +164,8 @@ impl Config {
         };
         let n_layer = n_layer as usize;
         let glm5next = matches!(arch, "glm5next" | "glm5-next");
+        let kimi = matches!(arch, "kimi-linear" | "kimi-k3");
+        let k3 = arch == "kimi-k3";
         let rms_eps = m.f32("attention.layer_norm_rms_epsilon")? as f64;
         let context_length = m.u32("context_length")? as usize;
         if n_head == 0 {
@@ -191,8 +217,10 @@ impl Config {
                 );
             }
         }
-        // GLM-5.3-Flash is NoPE: no rotary slice at all.
-        if (qk_rope_head_dim == 0 && !glm5next) || !qk_rope_head_dim.is_multiple_of(2) {
+        // GLM-5.3-Flash is NoPE with no rotary slice at all; the Kimi hybrids
+        // keep the slice but never rotate it.
+        let nope = glm5next || kimi;
+        if (qk_rope_head_dim == 0 && !nope) || !qk_rope_head_dim.is_multiple_of(2) {
             candle_core::bail!(
                 "{arch}: invalid rotary dimension {qk_rope_head_dim} (must be a positive even number)"
             );
@@ -224,10 +252,11 @@ impl Config {
         let n_expert_used = m.u32_or("expert_used_count", 0) as usize;
         let n_expert_shared = m.u32_or("expert_shared_count", 0) as usize;
         let expert_weights_scale = m.f32_or("expert_weights_scale", 0.0) as f64;
-        let expert_weights_norm = m.bool_or("expert_weights_norm", false);
-        // Absent → softmax (DeepSeek-MoE / V2); GLM-5 routes by sigmoid.
+        // Kimi-Linear always renormalises (llama.cpp hard-codes it).
+        let expert_weights_norm = arch == "kimi-linear" || m.bool_or("expert_weights_norm", false);
+        // Absent → softmax (DeepSeek-MoE / V2); GLM-5 and Kimi route by sigmoid.
         let glm = arch == "glm-dsa" || glm5next;
-        let gating = Gating::from_meta(&m, if glm { Gating::Sigmoid } else { Gating::Softmax });
+        let gating = Gating::from_meta(&m, if glm || kimi { Gating::Sigmoid } else { Gating::Softmax });
         let n_group = m.u32_or("expert_group_count", 0) as usize;
         let topk_group = m.u32_or("expert_group_used_count", 0) as usize;
         if n_expert > 0 && (n_expert_used == 0 || n_expert_used > n_expert) {
@@ -245,13 +274,17 @@ impl Config {
             None
         };
 
-        // GLM-5.3-Flash marks its KDA layers with a zero KV head count.
-        let recurrent: Vec<bool> = if glm5next {
+        // The KDA hybrids mark their linear layers with a zero KV head count.
+        let hybrid = glm5next || kimi;
+        let recurrent: Vec<bool> = if hybrid {
             m.array_u32("attention.head_count_kv", n_layer).iter().map(|&n| n == 0).collect()
         } else {
             vec![false; n_layer]
         };
-        let kda = glm5next.then(|| KdaConfig::from_meta(&m, n_head)).transpose()?;
+        // Kimi L2-normalises Q/K with the model's RMS eps (llama.cpp
+        // `build_gdn_l2_norm`), GLM-5.3 with FLA's fixed 1e-6.
+        let l2_eps = if kimi { rms_eps } else { 1e-6 };
+        let kda = hybrid.then(|| KdaConfig::from_meta(&m, n_head, l2_eps)).transpose()?;
         let hc = if glm5next {
             let n = m.u32("hyper_connection.count")? as usize;
             if n < 2 {
@@ -271,6 +304,12 @@ impl Config {
         } else {
             swiglu_exp.clone()
         };
+        let situ = if k3 {
+            Some((m.f32("activation.situ_beta")?, m.f32("activation.situ_linear_beta")?))
+        } else {
+            None
+        };
+        let attn_res_block = if k3 { m.u32_or("attn_res.block_size", 0) as usize } else { 0 };
 
         Ok(Self {
             n_layer,
@@ -302,6 +341,10 @@ impl Config {
             hc,
             swiglu_exp,
             swiglu_shexp,
+            situ,
+            nope,
+            attn_res_block,
+            n_embd,
         })
     }
 }
@@ -336,35 +379,48 @@ fn rope_table(cfg: &Config, dev: &Device) -> Result<Rope> {
 
 // ─── Linear helpers ─────────────────────────────────────────────────────────
 
-/// SwiGLU MLP over quantized weights (dense layers and shared experts).
+/// A gated FFN's activation.
+#[derive(Clone, Copy, Debug)]
+enum Act {
+    /// `silu(gate) · up`; a positive `limit` first clamps `gate` from above
+    /// and `up` to `±limit` (GLM-5.3-Flash, llama.cpp `ggml_swiglu_clamp`).
+    SwiGlu { limit: f64 },
+    /// Kimi K3's soft-clipped [`crate::kimi_k3::situ`].
+    Situ { beta: f32, linear_beta: f32 },
+}
+
+/// Gated MLP over quantized weights (dense layers and shared experts).
 #[derive(Clone)]
 struct Mlp {
     gate: QMatMul,
     up: QMatMul,
     down: QMatMul,
-    /// SwiGLU clamp (`0`: none; see [`swiglu`]).
-    limit: f64,
+    act: Act,
     /// Per-tensor byte-range handles for best-effort page prefetch, present
     /// only when the weights are borrowed from the model mapping.
     prefetch: Option<crate::residency::ExpertHandles>,
 }
 
-/// `down(silu(gate(x)) * up(x))` — the one SwiGLU body shared by dense
-/// layers, shared experts and both forms of a routed expert.  A positive
-/// `limit` first clamps `gate(x)` from above and `up(x)` to `±limit`
-/// (GLM-5.3-Flash, llama.cpp `ggml_swiglu_clamp`).
-fn swiglu(gate: &QMatMul, up: &QMatMul, down: &QMatMul, xs: &Tensor, limit: f64) -> Result<Tensor> {
+/// `down(act(gate(x), up(x)))` — the one gated-FFN body shared by dense
+/// layers, shared experts and both forms of a routed expert.
+fn glu(gate: &QMatMul, up: &QMatMul, down: &QMatMul, xs: &Tensor, act: Act) -> Result<Tensor> {
     let (mut gate, mut up) = (gate.forward(xs)?, up.forward(xs)?);
-    if limit > 0.0 {
-        gate = gate.clamp(f64::NEG_INFINITY, limit)?;
-        up = up.clamp(-limit, limit)?;
-    }
-    down.forward(&(candle_nn::ops::silu(&gate)? * up)?)
+    let h = match act {
+        Act::SwiGlu { limit } => {
+            if limit > 0.0 {
+                gate = gate.clamp(f64::NEG_INFINITY, limit)?;
+                up = up.clamp(-limit, limit)?;
+            }
+            (candle_nn::ops::silu(&gate)? * up)?
+        }
+        Act::Situ { beta, linear_beta } => crate::kimi_k3::situ(&gate, &up, beta, linear_beta)?,
+    };
+    down.forward(&h)
 }
 
 impl Mlp {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        swiglu(&self.gate, &self.up, &self.down, xs, self.limit)
+        glu(&self.gate, &self.up, &self.down, xs, self.act)
     }
 }
 
@@ -484,7 +540,11 @@ struct MlaAttention {
     /// Combined KV up-projection: kv_lora_rank → n_head*(qk_nope + v_head_dim).
     kv_b: KvB,
     o_proj: QMatMul,
-    /// `None` for NoPE MLA (GLM-5.3-Flash: `qk_rope == 0`).
+    /// Kimi K3's output gate: the heads' output is scaled by
+    /// `σ(gate(x))` of the (normalised) layer input before `o_proj`.
+    gate: Option<QMatMul>,
+    /// `None` for NoPE MLA (GLM-5.3-Flash with no `qk_rope` slice; the Kimi
+    /// hybrids, whose slice is used unrotated).
     rotary: Option<Arc<Rope>>,
     n_head: usize,
     kv_lora_rank: usize,
@@ -546,25 +606,24 @@ impl MlaAttention {
         let kv_cmpr = compressed
             .narrow(D::Minus1, 0, self.kv_lora_rank)?
             .contiguous()?;
-        // RoPE the *_pe slices, then reassemble Q (nope ‖ rope).  The single-head
-        // key is RoPE'd here too; the cached copy is already post-RoPE.
-        let rope = match &self.rotary {
-            Some(rotary) => {
-                let q_pe = q.narrow(D::Minus1, self.qk_nope, self.qk_rope)?;
-                let k_pe = compressed
-                    .narrow(D::Minus1, self.kv_lora_rank, self.qk_rope)?
-                    .reshape((b, seq_len, 1, self.qk_rope))?
-                    .transpose(1, 2)?;
-                Some(rotary.apply_pair(&q_pe, &k_pe, offset)?)
-            }
-            None => None,
-        };
-        let q = match &rope {
-            Some((q_pe, _)) => {
-                let q_nope = q.narrow(D::Minus1, 0, self.qk_nope)?;
-                Tensor::cat(&[&q_nope.contiguous()?, &q_pe.contiguous()?], D::Minus1)?
-            }
-            None => q.contiguous()?,
+        // RoPE the *_pe slices (NoPE: leave them as they are), then
+        // reassemble Q (nope ‖ rope).  The single-head key is RoPE'd here
+        // too; the cached copy is already post-RoPE.
+        let (q, k_pe) = if self.qk_rope == 0 {
+            (q.contiguous()?, None)
+        } else {
+            let q_pe = q.narrow(D::Minus1, self.qk_nope, self.qk_rope)?;
+            let k_pe = compressed
+                .narrow(D::Minus1, self.kv_lora_rank, self.qk_rope)?
+                .reshape((b, seq_len, 1, self.qk_rope))?
+                .transpose(1, 2)?;
+            let (q_pe, k_pe) = match &self.rotary {
+                Some(rotary) => rotary.apply_pair(&q_pe, &k_pe, offset)?,
+                None => (q_pe, k_pe),
+            };
+            let q_nope = q.narrow(D::Minus1, 0, self.qk_nope)?;
+            let q = Tensor::cat(&[&q_nope.contiguous()?, &q_pe.contiguous()?], D::Minus1)?;
+            (q, Some(k_pe))
         };
 
         // Reconstruct per-head K/V for the *new* tokens only (see the cache note
@@ -580,8 +639,8 @@ impl MlaAttention {
         let k_nope = kv.narrow(D::Minus1, 0, self.qk_nope)?; // [b, n_head, seq_len, qk_nope]
         let v = kv.narrow(D::Minus1, self.qk_nope, self.v_head_dim)?; // [b, n_head, seq_len, v_head_dim]
         // The single-head RoPE'd key is shared (MQA-style) across query heads.
-        let k_new = match &rope {
-            Some((_, k_pe)) => {
+        let k_new = match &k_pe {
+            Some(k_pe) => {
                 let k_pe = k_pe.broadcast_as((b, self.n_head, seq_len, self.qk_rope))?;
                 Tensor::cat(&[&k_nope.contiguous()?, &k_pe], D::Minus1)? // [b, n_head, seq_len, q_head_dim]
             }
@@ -596,6 +655,10 @@ impl MlaAttention {
             mask,
             self.softmax_scale,
         )?;
+        let ctx = match &self.gate {
+            Some(g) => (ctx * candle_nn::ops::sigmoid(&g.forward(xs)?)?)?,
+            None => ctx,
+        };
         self.o_proj.forward(&ctx)
     }
 }
@@ -610,7 +673,7 @@ struct DeviceExpert {
     gate: QMatMul,
     up: QMatMul,
     down: QMatMul,
-    limit: f64,
+    act: Act,
     bytes: u64,
 }
 
@@ -622,8 +685,16 @@ impl crate::residency::DeviceExpertSlot for DeviceExpert {
 
 impl DeviceExpert {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        swiglu(&self.gate, &self.up, &self.down, xs, self.limit)
+        glu(&self.gate, &self.up, &self.down, xs, self.act)
     }
+}
+
+/// Kimi K3's latent MoE: the routed experts run in a narrower space,
+/// entered through `down` and left through the optional `norm` then `up`.
+struct Latent {
+    down: QMatMul,
+    norm: Option<RmsNorm>,
+    up: QMatMul,
 }
 
 struct Moe {
@@ -631,6 +702,9 @@ struct Moe {
     gate_bias: Option<Tensor>, // exp_probs_b [n_expert] (f32), V3/K2 only
     experts: Vec<Mlp>,     // per-expert quantized SwiGLU
     shared: Option<Mlp>,
+    /// The routed experts' latent space (`kimi-k3`); the router and the
+    /// shared experts still read the full-width input.
+    latent: Option<Latent>,
     gating: Gating,
     n_expert_used: usize,
     n_group: usize,
@@ -672,8 +746,17 @@ impl Moe {
         // bucketing; reuse them for the hot-expert cache instead of a second
         // device-to-host sync (which would cost a synchronization per layer
         // even when the cache is disabled).
-        let (routed, ids) = self.dispatch(&x2, &topk_idx, &weights, n_tokens)?;
-        let mut out = routed;
+        let (mut out, ids) = match &self.latent {
+            None => self.dispatch(&x2, &topk_idx, &weights, n_tokens)?,
+            Some(l) => {
+                let (y, ids) = self.dispatch(&l.down.forward(&x2)?, &topk_idx, &weights, n_tokens)?;
+                let y = match &l.norm {
+                    Some(n) => n.forward(&y)?,
+                    None => y,
+                };
+                (l.up.forward(&y)?, ids)
+            }
+        };
         if let Some(shared) = &self.shared {
             out = (out + shared.forward(&x2)?)?;
         }
@@ -813,6 +896,20 @@ struct Layer {
     /// The attention and FFN hyper-connections (`glm5next`); `None`: a plain
     /// pre-norm residual.
     hyper: Option<[HyperConnection; 2]>,
+    /// The attention and FFN attention-residual scores (`kimi-k3`).
+    res_scores: Option<[Tensor; 2]>,
+}
+
+/// Kimi K3's attention residuals: every `block` layers the residual stream
+/// is banked and restarted, and each sublayer reads a softmax mix of the
+/// bank and the running stream ([`crate::kimi_k3::attn_res_mix`]).  The
+/// session carries the bank and the stream packed side by side,
+/// `[b, t, (checkpoints + 1) · n_embd]`, the stream last.
+struct AttnRes {
+    block: usize,
+    /// The final mix's scores (`output_res_score`).
+    output: Tensor,
+    n_embd: usize,
 }
 
 /// One layer's per-session state.
@@ -848,9 +945,52 @@ pub struct Weights {
     /// eps the mixers normalise with (`glm5next`).
     hc: Option<(usize, usize, f64)>,
     rms_eps: f64,
+    attn_res: Option<AttnRes>,
 }
 
 impl Weights {
+    /// The attention-residual mix of the packed candidates `xs` (`[b, t,
+    /// n · n_embd]`, see [`AttnRes`]) under `score`.
+    fn res_mix(&self, xs: &Tensor, n_embd: usize, score: &Tensor) -> Result<Tensor> {
+        let (b, t, wide) = xs.dims3()?;
+        crate::kimi_k3::attn_res_mix(&xs.reshape((b, t, wide / n_embd, n_embd))?, score, self.rms_eps)
+    }
+
+    /// Layer `l` with attention residuals (llama.cpp `kimi-k3.cpp`).
+    fn layer_attn_res(
+        &self,
+        l: usize,
+        states: &mut [LayerState],
+        xs: &Tensor,
+        input: &crate::native_session::LayerInput<'_>,
+        ar: &AttnRes,
+        [s_attn, s_ffn]: &[Tensor; 2],
+    ) -> Result<(Tensor, Vec<u32>)> {
+        let layer = &self.layers[l];
+        let d = ar.n_embd;
+        let wide = xs.dim(2)?;
+        let prefix = xs.narrow(2, wide - d, d)?;
+        // A checkpoint layer banks its raw input and restarts the stream
+        // from the attention output alone.
+        let (bank, banked) = if l.is_multiple_of(ar.block) {
+            (Some(xs.clone()), true)
+        } else {
+            ((wide > d).then(|| xs.narrow(2, 0, wide - d)).transpose()?, false)
+        };
+        let join = |prefix: &Tensor| -> Result<Tensor> {
+            match &bank {
+                Some(b) => Tensor::cat(&[b, prefix], 2),
+                None => Ok(prefix.clone()),
+            }
+        };
+        let x = self.res_mix(xs, d, s_attn)?;
+        let h = self.attend(l, states, &layer.attn_norm.forward(&x)?, input)?;
+        let prefix = if banked { h } else { (prefix + h)? };
+        let x = self.res_mix(&join(&prefix)?, d, s_ffn)?;
+        let (h, routed) = layer.ffn.forward_routed(&layer.ffn_norm.forward(&x)?)?;
+        Ok((join(&(prefix + h)?)?, routed))
+    }
+
     /// The attention sublayer over its normalised input `x`.
     fn attend(
         &self,
@@ -935,6 +1075,9 @@ impl crate::native_session::LayerStack for Weights {
         input: &crate::native_session::LayerInput<'_>,
     ) -> Result<(Tensor, Vec<u32>)> {
         let layer = &self.layers[l];
+        if let (Some(ar), Some(scores)) = (&self.attn_res, &layer.res_scores) {
+            return self.layer_attn_res(l, states, xs, input, ar, scores);
+        }
         let (Some([hc_attn, hc_ffn]), Some((hc, iters, eps))) = (&layer.hyper, self.hc) else {
             let h = self.attend(l, states, &layer.attn_norm.forward(xs)?, input)?;
             let xs = (xs + h)?;
@@ -961,7 +1104,11 @@ impl crate::native_session::LayerStack for Weights {
                 let (b, t, wide) = xs.dims3()?;
                 xs.reshape((b, t, hc, wide / hc))?.mean(2)?
             }
-            None => xs.clone(),
+            // K3 mixes its bank and stream a last time.
+            None => match &self.attn_res {
+                Some(ar) => self.res_mix(xs, ar.n_embd, &ar.output)?,
+                None => xs.clone(),
+            },
         };
         self.output.forward(&self.norm.forward(&xs)?)?.to_dtype(DType::F32)
     }
@@ -1023,14 +1170,19 @@ impl<R: Read + Seek> Reader<R> {
             None
         }
     }
+    /// An optional weight: `None` when absent, an error when present but
+    /// unreadable.
+    fn qmatmul_if(&mut self, name: &str) -> Result<Option<QMatMul>> {
+        self.has(name).then(|| self.qmatmul(name)).transpose()
+    }
     /// A dense SwiGLU block: `{p}.ffn_{gate,up,down}{suffix}.weight`
     /// (`suffix` is `""` for a dense layer, `"_shexp"` for shared experts).
-    fn mlp(&mut self, p: &str, suffix: &str, limit: f64) -> Result<Mlp> {
+    fn mlp(&mut self, p: &str, suffix: &str, act: Act) -> Result<Mlp> {
         Ok(Mlp {
             gate: self.qmatmul(&format!("{p}.ffn_gate{suffix}.weight"))?,
             up: self.qmatmul(&format!("{p}.ffn_up{suffix}.weight"))?,
             down: self.qmatmul(&format!("{p}.ffn_down{suffix}.weight"))?,
-            limit,
+            act,
             prefetch: None,
         })
     }
@@ -1080,6 +1232,7 @@ impl<R: Read + Seek> Reader<R> {
             kv_a_norm: self.rms_norm(&format!("{p}.attn_kv_a_norm.weight"), cfg.rms_eps)?,
             kv_b: load_kv_b(self, p, cfg)?,
             o_proj,
+            gate: self.qmatmul_if(&format!("{p}.attn_gate.weight"))?,
             rotary: rotary.clone(),
             n_head: cfg.n_head,
             kv_lora_rank: cfg.kv_lora_rank,
@@ -1151,6 +1304,8 @@ impl ModelWeights {
             // architecture differently; the files are otherwise the same.
             Some("glm5next") => "glm5next",
             Some("glm5-next") => "glm5-next",
+            Some("kimi-linear") => "kimi-linear",
+            Some("kimi-k3") => "kimi-k3",
             _ => "deepseek2",
         };
         if !expert_device.is_cpu() && !expert_device.same_device(device) {
@@ -1184,7 +1339,7 @@ impl ModelWeights {
             None => rd.qmatmul("token_embd.weight")?, // tied
         };
 
-        let rotary = (cfg.qk_rope_head_dim > 0)
+        let rotary = (cfg.qk_rope_head_dim > 0 && !cfg.nope)
             .then(|| rope_table(&cfg, device).map(Arc::new))
             .transpose()?;
         // The sparse-attention role of each MLA layer: full layers run their
@@ -1228,7 +1383,15 @@ impl ModelWeights {
             let ffn = if cfg.n_expert > 0 && i >= cfg.leading_dense {
                 FeedForward::Moe(load_moe(&mut rd, &p, &cfg, i)?)
             } else {
-                FeedForward::Dense(rd.mlp(&p, "", cfg.swiglu_shexp[i])?)
+                FeedForward::Dense(rd.mlp(&p, "", cfg.act(i, false))?)
+            };
+            let res_scores = if cfg.attn_res_block > 0 {
+                Some([
+                    rd.f32_tensor(&format!("{p}.attn_res_score.weight"))?,
+                    rd.f32_tensor(&format!("{p}.ffn_res_score.weight"))?,
+                ])
+            } else {
+                None
             };
             let hyper = match cfg.hc {
                 Some(_) => Some([
@@ -1245,6 +1408,7 @@ impl ModelWeights {
                 ffn_norm,
                 ffn,
                 hyper,
+                res_scores,
             });
         }
 
@@ -1270,6 +1434,15 @@ impl ModelWeights {
             n_expert: cfg.n_expert,
             hc: cfg.hc,
             rms_eps: cfg.rms_eps,
+            attn_res: if cfg.attn_res_block > 0 {
+                Some(AttnRes {
+                    block: cfg.attn_res_block,
+                    output: rd.f32_tensor("output_res_score.weight")?,
+                    n_embd: cfg.n_embd,
+                })
+            } else {
+                None
+            },
         }))
     }
 }
@@ -1325,7 +1498,7 @@ fn load_moe<R: Read + Seek>(rd: &mut Reader<R>, p: &str, cfg: &Config, il: usize
             gate: gate.qmatmul,
             up: up.qmatmul,
             down: down.qmatmul,
-            limit: cfg.swiglu_exp[il],
+            act: cfg.act(il, true),
             prefetch: crate::residency::ExpertHandles::from_parts(
                 gate.prefetch,
                 up.prefetch,
@@ -1335,9 +1508,20 @@ fn load_moe<R: Read + Seek>(rd: &mut Reader<R>, p: &str, cfg: &Config, il: usize
         .collect();
 
     let shared = if cfg.n_expert_shared > 0 {
-        Some(rd.mlp(p, "_shexp", cfg.swiglu_shexp[il])?)
+        Some(rd.mlp(p, "_shexp", cfg.act(il, false))?)
     } else {
         None
+    };
+    let latent = match rd.qmatmul_if(&format!("{p}.ffn_routed_down.weight"))? {
+        Some(down) => Some(Latent {
+            down,
+            norm: rd
+                .has(&format!("{p}.ffn_routed_norm.weight"))
+                .then(|| rd.rms_norm(&format!("{p}.ffn_routed_norm.weight"), cfg.rms_eps))
+                .transpose()?,
+            up: rd.qmatmul(&format!("{p}.ffn_routed_up.weight"))?,
+        }),
+        None => None,
     };
 
     let layer = p
@@ -1374,7 +1558,7 @@ fn load_moe<R: Read + Seek>(rd: &mut Reader<R>, p: &str, cfg: &Config, il: usize
                         gate,
                         up,
                         down,
-                        limit: m.limit,
+                        act: m.act,
                         bytes: per_slot,
                     }));
                 }
@@ -1382,7 +1566,7 @@ fn load_moe<R: Read + Seek>(rd: &mut Reader<R>, p: &str, cfg: &Config, il: usize
                     gate: m.gate.clone(),
                     up: m.up.clone(),
                     down: m.down.clone(),
-                    limit: m.limit,
+                    act: m.act,
                     bytes: per_slot,
                 }))
             });
@@ -1400,6 +1584,7 @@ fn load_moe<R: Read + Seek>(rd: &mut Reader<R>, p: &str, cfg: &Config, il: usize
         gate_bias,
         experts,
         shared,
+        latent,
         gating: cfg.gating,
         n_expert_used: cfg.n_expert_used,
         n_group: cfg.n_group,
@@ -1428,6 +1613,33 @@ fn split_experts<R: Read + Seek>(
     name: &str,
     n_expert: usize,
 ) -> Result<Vec<ExpertWeight>> {
+    // Raw-format experts (MXFP4 in Kimi-K3 conversions): borrowed per expert
+    // from the mapping, decoded at matmul time.
+    let raw_info = rd
+        .raw_dtype(name)
+        .and_then(|_| rd.raw.as_ref()?.tensors.get(name).cloned());
+    if let Some(info) = raw_info {
+        let src = &mut rd.src;
+        let raw = src.raw.as_ref().expect("raw_dtype implies a raw header");
+        let split = crate::with_raw_block!(info.dtype, B => {
+            crate::moe::split_raw_experts::<B, R>(
+                src.arch,
+                raw,
+                &mut src.reader,
+                src.mmap.as_ref(),
+                &rd.expert_device,
+                name,
+                &info,
+                n_expert,
+            )
+        });
+        if let Some(experts) = split {
+            return experts?
+                .into_iter()
+                .map(|b| Ok(ExpertWeight { qmatmul: QMatMul::from_qtensor(b.tensor)?, prefetch: b.prefetch }))
+                .collect();
+        }
+    }
     let et = rd.expert_tensor(name, n_expert)?;
     let host_experts = rd.expert_device.is_cpu();
     let uploaded = |qt: QTensor| -> Result<ExpertWeight> {
@@ -1564,6 +1776,10 @@ mod tests {
             hc: None,
             swiglu_exp: vec![0.0],
             swiglu_shexp: vec![0.0],
+            situ: None,
+            nope: false,
+            attn_res_block: 0,
+            n_embd: w.h,
         };
         Ok(Attention::Mla(MlaAttention {
             q: QProj::Plain(lin(w.nh * w.qd, w.h, &w.q)),
@@ -1571,6 +1787,7 @@ mod tests {
             kv_a_norm: norm,
             kv_b: KvB::Dense(w.kv_b.clone()),
             o_proj: lin(w.h, w.nh * w.vh, &w.o),
+            gate: None,
             rotary: Some(Arc::new(rope_table(&cfg, dev)?)),
             n_head: w.nh,
             kv_lora_rank: w.lkv,
@@ -1682,7 +1899,7 @@ mod tests {
                 gate: lin(ffn, h),
                 up: lin(ffn, h),
                 down: lin(h, ffn),
-                limit: 0.0,
+                act: Act::SwiGlu { limit: 0.0 },
                 prefetch: None,
             })
             .collect();
@@ -1691,6 +1908,7 @@ mod tests {
             gate_bias: None,
             experts,
             shared: None,
+            latent: None,
             gating: Gating::Softmax,
             n_expert_used: k,
             n_group: 1,

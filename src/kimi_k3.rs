@@ -1,8 +1,8 @@
 //! Kimi K3 (`kimi-k3`) — architecture primitives.
 //!
-//! K3 is a 2.8 T-parameter hybrid MoE and shares almost nothing with the
-//! `deepseek2` family Joshua already implements.  The pieces that differ, and
-//! that this module gets right and tests:
+//! K3 is a 2.8 T-parameter hybrid MoE built on the `deepseek2` family's MLA
+//! and fine-grained MoE.  The pieces that differ, and that this module gets
+//! right and tests:
 //!
 //! * **Hybrid layer topology.** 93 layers, most running *Kimi Delta
 //!   Attention* (a gated delta-net linear attention) and every fourth running
@@ -20,14 +20,10 @@
 //!
 //! # Status
 //!
-//! The primitives below are implemented from the published specification and
-//! unit-tested against the reference formulations.  A complete forward pass is
-//! **not** wired up: K3 needs on the order of a terabyte of weights, no
-//! released llama.cpp can run it (support is an open pull request), and no
-//! weights were available here — so there is no oracle to check end-to-end
-//! logits against, the way [`crate::quantized_deepseek2`] was checked.  What
-//! is here is the correctness-critical maths, isolated so it can be verified
-//! now and trusted later.
+//! These primitives are what [`crate::quantized_deepseek2`] runs Kimi K3
+//! (and, for KDA, Kimi-Linear and GLM-5.3-Flash) with; the end-to-end
+//! forward pass is pinned to an independent transcription of llama.cpp's
+//! `src/models/kimi-k3.cpp` on a tiny fixture (`tests/kimi_tests.rs`).
 //!
 //! Two details are called out because getting them wrong fails *silently*:
 //! the layer-type lists in the reference config are **1-indexed**, and the
@@ -213,8 +209,9 @@ pub fn kda_recurrent_head(
 /// Mix the running residual stream with the banked attention-residual
 /// checkpoints.
 ///
-/// `candidates` is `[n_candidates, hidden]` — the bank followed by the current
-/// stream — and `score` is the per-layer fused score vector `[hidden]`.
+/// `candidates` is `[.., n_candidates, hidden]` — the bank followed by the
+/// current stream, for any leading (token) dims — and `score` is the
+/// per-layer fused score vector `[hidden]`.
 ///
 /// The subtlety, and the easy way to get this wrong: scores are computed
 /// against **RMS-normalised** candidates, but the convex combination is taken
@@ -229,7 +226,7 @@ pub fn attn_res_mix(candidates: &Tensor, score: &Tensor, eps: f64) -> Result<Ten
         .sum(D::Minus1)?;
     let probs = candle_nn::ops::softmax_last_dim(&scores)?;
     // Weighted sum over the *raw* candidates.
-    raw.broadcast_mul(&probs.unsqueeze(D::Minus1)?)?.sum(0)
+    raw.broadcast_mul(&probs.unsqueeze(D::Minus1)?)?.sum(D::Minus2)
 }
 
 /// Layers at which the residual stream is checkpointed.
@@ -242,43 +239,6 @@ pub fn checkpoint_layers(n_layer: usize, block: usize) -> Vec<usize> {
         return Vec::new();
     }
     (0..n_layer).filter(|il| il % block == 0).collect()
-}
-
-/// Select experts and compute their weights.
-///
-/// Returns `(indices, weights)`, each `[n_tokens, n_used]`.
-///
-/// Order matters and differs from the DeepSeek families: the router is
-/// **sigmoid**, the `exp_probs_b` bias steers *selection only* while the
-/// weights come from the **unbiased** scores, and the selected weights are
-/// renormalised before the (unit) routed scale. K3 ships a single expert group,
-/// so no group-limited masking applies.
-pub fn route_experts(
-    logits: &Tensor,
-    bias: Option<&Tensor>,
-    n_used: usize,
-    renormalize: bool,
-    scale: f64,
-) -> Result<(Tensor, Tensor)> {
-    let scores = candle_nn::ops::sigmoid(&logits.to_dtype(candle_core::DType::F32)?)?;
-    let selection = match bias {
-        Some(b) => scores.broadcast_add(&b.reshape((1, ()))?)?,
-        None => scores.clone(),
-    };
-    let idx = selection
-        .arg_sort_last_dim(false)?
-        .narrow(D::Minus1, 0, n_used)?
-        .contiguous()?;
-    // Weights always come from the unbiased scores.
-    let mut w = scores.gather(&idx, D::Minus1)?;
-    if renormalize {
-        let denom = (w.sum_keepdim(D::Minus1)? + 1e-20)?;
-        w = w.broadcast_div(&denom)?;
-    }
-    if scale != 1.0 {
-        w = (w * scale)?;
-    }
-    Ok((idx, w))
 }
 
 #[cfg(test)]
@@ -442,6 +402,13 @@ mod tests {
         );
     }
 
+    /// K3's routing through the shared router: sigmoid scores, a bias that
+    /// steers selection only, optional renormalisation.
+    fn route_experts(logits: &Tensor, bias: Option<&Tensor>, k: usize, norm: bool) -> (Tensor, Tensor) {
+        let scores = crate::moe::Gating::Sigmoid.scores(logits).unwrap();
+        crate::moe::route(&scores, bias, k, norm, 1.0, Ok).unwrap()
+    }
+
     #[test]
     fn routing_biases_selection_but_not_weights() {
         let dev = Device::Cpu;
@@ -450,7 +417,7 @@ mod tests {
         // *unbiased* sigmoid score.
         let logits = Tensor::new(&[[1.0f32, 0.5, -5.0, -6.0]], &dev).unwrap();
         let bias = Tensor::new(&[0.0f32, 10.0, 0.0, 0.0], &dev).unwrap();
-        let (idx, w) = route_experts(&logits, Some(&bias), 1, false, 1.0).unwrap();
+        let (idx, w) = route_experts(&logits, Some(&bias), 1, false);
         let idx: Vec<u32> = idx.flatten_all().unwrap().to_vec1().unwrap();
         let w: Vec<f32> = w.flatten_all().unwrap().to_vec1().unwrap();
 
@@ -467,7 +434,7 @@ mod tests {
     fn routing_renormalises_selected_weights() {
         let dev = Device::Cpu;
         let logits = Tensor::new(&[[2.0f32, 1.0, 0.0, -1.0]], &dev).unwrap();
-        let (_, w) = route_experts(&logits, None, 2, true, 1.0).unwrap();
+        let (_, w) = route_experts(&logits, None, 2, true);
         let w: Vec<f32> = w.flatten_all().unwrap().to_vec1().unwrap();
         let sum: f32 = w.iter().sum();
         assert!((sum - 1.0).abs() < 1e-6, "renormalised weights sum to {sum}");

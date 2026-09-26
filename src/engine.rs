@@ -74,6 +74,7 @@
 //! | `gemma` / `gemma2` / `gemma3` / `gemma-embedding` | Gemma 1/2/3
 //! | `chatglm` / `glm4` / `glm4moe` | ChatGLM2/3, GLM-4, GLM-4.5 – 4.7
 //! | `glm-dsa` / `glm5next` | GLM-5 / 5.1 / 5.2, GLM-5.3-Flash
+//! | `kimi-linear` / `kimi-k3` | Kimi-Linear, Kimi K3
 //! | `lfm2`                 | LFM2
 //! | `phi2`                 | Phi-1, Phi-1.5, Phi-2
 //! | `phi3`                 | Phi-3 / Phi-3.5
@@ -3173,9 +3174,9 @@ fn probed_embedding_names(arch: Option<Architecture>) -> &'static [&'static str]
 /// per-expert `ffn_gate.<i>` matrices, `gemma*`, `lfm2` with its
 /// `feed_forward.*` / `mlp.*_proj` / `shortconv.*_proj` aliases, `phi*`,
 /// `qwen2`, `qwen3`), deepseek4's hyper-connection, indexer and compressor
-/// projections, and GLM-5.x's indexer key and KDA low-rank gate
-/// projections.
-const QUANTIZED_MATRIX_STEMS: [&str; 65] = [
+/// projections, GLM-5.x's indexer key and KDA low-rank gate projections,
+/// and Kimi K3's full-rank KDA gate and latent-MoE projections.
+const QUANTIZED_MATRIX_STEMS: [&str; 68] = [
     "attn_q",
     "attn_k",
     "attn_v",
@@ -3210,6 +3211,9 @@ const QUANTIZED_MATRIX_STEMS: [&str; 65] = [
     "ssm_f_b",
     "ssm_g_a",
     "ssm_g_b",
+    "ssm_g",
+    "ffn_routed_down",
+    "ffn_routed_up",
     "attn_compressor_kv",
     "attn_compressor_gate",
     "indexer_compressor_kv",
@@ -3248,11 +3252,12 @@ const QUANTIZED_MATRIX_STEMS: [&str; 65] = [
 /// split-KV halves (folded into a dense up-projection), deepseek4's
 /// hyper-connection and compressor position vectors, lfm2's conv kernels,
 /// the Qwen loader's DeltaNet conv kernels / decay rates and shared-expert
-/// gate vectors, and GLM-5.3-Flash's per-projection KDA conv kernels.
+/// gate vectors, the per-projection KDA conv kernels (GLM-5.3-Flash, Kimi)
+/// and Kimi K3's attention-residual scores.
 /// The MoE router (`ffn_gate_inp`) is handled per architecture in
 /// [`residency`]: the joshua-native loaders read it with `f32_tensor`, the
 /// stock `llama` loader (Mixtral) keeps it a quantized `QMatMul`.
-const F32_STEMS: [&str; 18] = [
+const F32_STEMS: [&str; 21] = [
     "attn_k_b",
     "attn_v_b",
     "hc_attn_base",
@@ -3271,6 +3276,9 @@ const F32_STEMS: [&str; 18] = [
     "ssm_a",
     "ffn_gate_inp_shexp",
     "ple_conv1d",
+    "attn_res_score",
+    "ffn_res_score",
+    "output_res_score",
 ];
 
 /// `name` without its `blk.<n>.` prefix, `.weight` suffix and any trailing
