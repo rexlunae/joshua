@@ -1976,6 +1976,9 @@ pub struct TinyDeepseek4Opts {
     pub iq2xxs_output: bool,
     /// Layer 0 is a CSA layer (compressor + lightning indexer tensors).
     pub compress: bool,
+    /// Layer 1 is an HCA layer (ratio-128 compressor, no indexer) and the
+    /// context is long enough to cross two of its blocks.
+    pub hca: bool,
     /// Emit K-quant (Q4_K) weights for the attention-KV and shared-expert
     /// projections instead of F16 — exercises the K-quant decode path on
     /// both the mmap and streamed loaders.
@@ -2042,6 +2045,20 @@ pub fn write_tiny_deepseek4_gguf_compress(path: &Path) {
     );
 }
 
+/// Like [`write_tiny_deepseek4_gguf_compress`], and layer 1 is an HCA layer
+/// (`compress_ratios = [4, 128]`); the 512-token context lets prompts
+/// cross the ratio-128 block boundary the real model crosses past 128 tokens.
+pub fn write_tiny_deepseek4_gguf_compress_hca(path: &Path) {
+    write_tiny_deepseek4_gguf_opts(
+        path,
+        TinyDeepseek4Opts {
+            compress: true,
+            hca: true,
+            ..Default::default()
+        },
+    );
+}
+
 /// Like [`write_tiny_deepseek4_gguf`], but the attention-KV projection and
 /// the shared-expert gate/up projections are Q4_K instead of F16.
 pub fn write_tiny_deepseek4_gguf_kquant(path: &Path) {
@@ -2084,6 +2101,7 @@ pub fn write_tiny_deepseek4_gguf_opts(path: &Path, opts: TinyDeepseek4Opts) {
     let TinyDeepseek4Opts {
         iq2xxs_output,
         compress,
+        hca,
         kquant_weights,
         candle_only,
         q2k_down,
@@ -2122,7 +2140,7 @@ pub fn write_tiny_deepseek4_gguf_opts(path: &Path, opts: TinyDeepseek4Opts) {
     let ratios: Vec<u32> = if v41 {
         vec![2, 2, 1, 0]
     } else {
-        vec![if compress { 4 } else { 0 }, 0]
+        vec![if compress { 4 } else { 0 }, if hca { 128 } else { 0 }]
     };
     let mut metadata: Vec<(String, gguf_file::Value)> = vec![
         (
@@ -2447,6 +2465,30 @@ pub fn write_tiny_deepseek4_gguf_opts(path: &Path, opts: TinyDeepseek4Opts) {
                 &format!("{p}.indexer_compressor_norm.weight"),
                 ones(INDEX_HD),
                 &[INDEX_HD],
+            ));
+        }
+
+        // HCA layer 1: a ratio-128 compressor (coff = 1), no indexer.
+        if hca && i == 1 {
+            tensors.push(RawTensor::f16(
+                &format!("{p}.attn_compressor_kv.weight"),
+                next(HEAD_DIM * EMB),
+                &[HEAD_DIM, EMB],
+            ));
+            tensors.push(RawTensor::f16(
+                &format!("{p}.attn_compressor_gate.weight"),
+                next(HEAD_DIM * EMB),
+                &[HEAD_DIM, EMB],
+            ));
+            tensors.push(RawTensor::f32(
+                &format!("{p}.attn_compressor_ape.weight"),
+                next(128 * HEAD_DIM),
+                &[128, HEAD_DIM],
+            ));
+            tensors.push(RawTensor::f32(
+                &format!("{p}.attn_compressor_norm.weight"),
+                ones(HEAD_DIM),
+                &[HEAD_DIM],
             ));
         }
 

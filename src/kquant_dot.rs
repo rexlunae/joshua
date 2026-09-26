@@ -1104,6 +1104,18 @@ mod tests {
         run_case(GgmlDType::Q8_0, 1, 4096, 4096);
         run_case(GgmlDType::Q8_0, 32, 4096, 4096);
     }
+    /// Prefill batches: a long prompt hands each expert up to a whole
+    /// prefill chunk of rows (512 by default), far past the decode shapes
+    /// above.  The m-tiling must stay exact for tails and many tiles.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn fused_matches_f32_gemm_at_prefill_batches() {
+        for m in [37, 300, 512] {
+            run_case(GgmlDType::Q2K, m, 512, 19);
+            run_case(GgmlDType::Q4K, m, 512, 19);
+            run_case(GgmlDType::Q8_0, m, 512, 19);
+        }
+    }
     /// Parallel and serial fused execution must agree bit-for-bit.
     #[test]
     #[cfg(target_arch = "x86_64")]
