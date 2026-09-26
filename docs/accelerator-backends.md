@@ -43,6 +43,19 @@ Both backends implement the same design:
   dequantizes the weight to an f32 scratch buffer once and runs the tiled
   GEMM.  Token embeddings are gathered by a dequantizing row kernel, so the
   table is never expanded to f32 either.
+* **Arm Mali / Immortalis (Vulkan).**  On an Arm GPU (Vulkan vendor id
+  `0x13B5` — e.g. the Immortalis-G720 of the CIX P1 in the Orange Pi 6)
+  the decode GEMV switches to `k_qgemv_mali`: it dequantizes each weight
+  sub-block once for up to four activation rows (the generic kernel
+  decodes it once per row), gives each output column a team of four lanes
+  inside a 64-invocation work-group (four 16-wide Mali warps, 16 columns)
+  and meets the partial sums in one shared-memory step instead of a
+  256-wide tree with eight barriers — Mali's shared memory is ordinary
+  cached memory, so that tree is the generic kernel's costliest part there.
+  It keeps the generic kernel's decoders, so every quantisation is covered;
+  it is checked against the CPU on every block format (forced on the test
+  device), but its speed has not yet been measured on Mali hardware.
+  `JOSHUA_VULKAN_QGEMV=mali|generic` forces either kernel on any device.
 * **Asynchronous execution.**  OpenCL launches on an in-order queue and only
   blocks on a host read-back.  Vulkan records into one command buffer per
   device and submits lazily — on a read-back, an explicit `synchronize`, or
@@ -227,6 +240,7 @@ the card for the real numbers).
 | `JOSHUA_ROUTE_TRACE=<path>` | Write the routing trace CSV for the offline cache simulator (`examples/cache_sim.rs`).  One file per process: run a single request at a time while tracing, or concurrent requests interleave their calls. |
 | `JOSHUA_PREFILL_CHUNK=<n>` | Tokens per prefill chunk (also `--prefill-chunk`). |
 | `JOSHUA_OPENCL_QGEMV=v1` | Run the expert formats through the one-row quantized GEMV instead of the multi-row kernel (bisecting). |
+| `JOSHUA_VULKAN_QGEMV=mali` / `generic` | Force the Mali-shaped quantized GEMV (the default on Arm GPUs) or the generic one on any Vulkan device. |
 
 The engine logs the device it opened, its memory model and the active paths
 at startup:

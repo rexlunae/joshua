@@ -1227,6 +1227,97 @@ void main() {
     s
 }
 
+/// Work-group size of [`k_qgemv_mali`]: four 16-wide Mali warps.
+pub const QGEMV_MALI_WG: usize = 64;
+/// Output columns per [`k_qgemv_mali`] work-group (`QGEMV_MALI_WG` / 4
+/// lanes per column).
+pub const QGEMV_MALI_COLS: usize = 16;
+/// Activation rows each [`k_qgemv_mali`] invocation carries.
+pub const QGEMV_MALI_ROWS: usize = 4;
+
+/// [`k_qgemv`] shaped for Arm Mali / Immortalis GPUs (Valhall and the 5th
+/// generation, e.g. the Immortalis-G720 of the CIX P1 in the Orange Pi 6):
+///
+/// * **Decode once for several rows.**  Each weight sub-block is
+///   dequantized once and dotted against up to four activation rows held
+///   in scalar accumulators (`k_qgemv` re-decodes it per row: `M`
+///   work-groups per column).
+/// * **Small teams, one barrier.**  Four lanes share an output column and
+///   a 64-invocation work-group (four 16-wide warps) covers 16 columns, so
+///   every warp is busy on a decode-sized `N` and the partial sums meet in
+///   one shared-memory step — Mali's shared memory is ordinary cached
+///   memory, so `k_qgemv`'s 256-wide tree (eight barriers) is its costliest
+///   part there.
+/// * **No divergent row tests in the inner loop.**  Rows past `M` read a
+///   valid row and are dropped at the store.
+///
+/// Same push constants as [`k_qgemv`]; the grid is
+/// `ceil(N / QGEMV_MALI_COLS)` groups (2-D) by `ceil(M / QGEMV_MALI_ROWS)`.
+pub fn k_qgemv_mali(_wg: usize) -> String {
+    let mut s = prelude(QGEMV_MALI_WG, 3);
+    s += &buf(0, "float", "X", true);
+    s += &buf(1, "uint", "W", true);
+    s += &buf(2, "float", "C", false);
+    s += QUANT_FN;
+    s += &format!(
+        r#"
+#define TEAM {team}
+#define COLS {cols}
+#define RB {rows}
+layout(push_constant) uniform PC {{ int N; int K; int qt; int qk; int bsz; int xoff; int coff; int M; }} pc;
+layout(local_size_x = WG) in;
+shared float sh[RB * WG];
+void main() {{
+    int t = int(gl_LocalInvocationID.x);
+    int lane = t % TEAM;
+    int n = grow() * COLS + t / TEAM;
+    int m0 = int(gl_WorkGroupID.z) * RB;
+    float a0 = 0.0; float a1 = 0.0; float a2 = 0.0; float a3 = 0.0;
+    if (n < pc.N) {{
+        int spb = pc.qk / 32;
+        int nsub = pc.K / 32;
+        uint row = uint(n) * uint(pc.K / pc.qk) * uint(pc.bsz);
+        int last = pc.M - 1 - m0;
+        int x0 = pc.xoff + m0 * pc.K;
+        int x1 = pc.xoff + (m0 + min(1, last)) * pc.K;
+        int x2 = pc.xoff + (m0 + min(2, last)) * pc.K;
+        int x3 = pc.xoff + (m0 + min(3, last)) * pc.K;
+        for (int s = lane; s < nsub; s += TEAM) {{
+            int b = s / spb;
+            int jj = s - b * spb;
+            dequant_sub(pc.qt, row + uint(b) * uint(pc.bsz), jj);
+            int o = s * 32;
+            for (int i = 0; i < 32; i++) {{
+                float w = dq[i];
+                a0 += X[x0 + o + i] * w;
+                a1 += X[x1 + o + i] * w;
+                a2 += X[x2 + o + i] * w;
+                a3 += X[x3 + o + i] * w;
+            }}
+        }}
+    }}
+    sh[t] = a0;
+    sh[WG + t] = a1;
+    sh[2 * WG + t] = a2;
+    sh[3 * WG + t] = a3;
+    barrier();
+    if (lane == 0 && n < pc.N) {{
+        for (int r = 0; r < RB; r++) {{
+            if (m0 + r < pc.M) {{
+                int h = r * WG + t;
+                C[pc.coff + (m0 + r) * pc.N + n] = (sh[h] + sh[h + 1]) + (sh[h + 2] + sh[h + 3]);
+            }}
+        }}
+    }}
+}}
+"#,
+        team = QGEMV_MALI_WG / QGEMV_MALI_COLS,
+        cols = QGEMV_MALI_COLS,
+        rows = QGEMV_MALI_ROWS,
+    );
+    s
+}
+
 /// Half / bf16 weight GEMV: `C[m, n] = sum_k X[m, k] * W[n, k]`.
 /// Push: `N, K, is_bf16, xoff, coff, M`.
 pub fn k_hgemv(wg: usize) -> String {

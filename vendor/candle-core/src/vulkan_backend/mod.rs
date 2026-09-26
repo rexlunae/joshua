@@ -47,6 +47,8 @@ pub struct Limits {
     /// Whether tensor memory is device-local as well as host-visible
     /// (unified memory: an iGPU or a software device).
     pub host_unified: bool,
+    /// The quantized-GEMV kernel for this device ([`kernels::Qgemv`]).
+    pub qgemv: kernels::Qgemv,
 }
 
 // ─── Memory sub-allocator ────────────────────────────────────────────────────
@@ -347,6 +349,7 @@ fn init_vulkan(gpu_id: usize) -> Result<VulkanDevice> {
         max_storage_range: lim.max_storage_buffer_range as u64,
         max_groups_x: lim.max_compute_work_group_count[0].max(1),
         host_unified,
+        qgemv: kernels::Qgemv::for_device(props.vendor_id),
     };
     let exec = match kernels::Exec::new(&device, queue, queue_family, mem_type) {
         Ok(e) => e,
@@ -1868,6 +1871,57 @@ mod tests {
     }
 
     /// A quantized matmul with a small, block-aligned inner dimension runs
+    /// Both quantized-GEMV kernels — the generic one and the Mali one,
+    /// forced here whatever the device — match a CPU reference for every
+    /// block format, with `N` off the Mali kernel's 16-column tiles and
+    /// every `M` up to the GEMV limit (partial 4-row slices included).
+    #[test]
+    fn vulkan_qgemv_kernels_match_cpu() -> crate::Result<()> {
+        use crate::backend::{BackendDevice, BackendStorage};
+        use crate::quantized::{GgmlDType, QTensor};
+        let Some(dev) = device() else { return Ok(()) };
+        let Device::Vulkan(vd) = &dev else { unreachable!() };
+        let cpu = Device::Cpu;
+        let (n, k) = (37usize, 512usize);
+        let w = Tensor::arange(0f32, (n * k) as f32, &cpu)?.reshape((n, k))?.affine(7e-4, -2.1)?.sin()?;
+        let x = Tensor::arange(0f32, ((QGEMV_MAX_ROWS + 1) * k) as f32, &cpu)?.affine(1.3e-3, -0.9)?.cos()?;
+        let xv: Vec<f32> = x.to_vec1()?;
+        for dtype in [
+            GgmlDType::Q8_0,
+            GgmlDType::Q8_1,
+            GgmlDType::Q4_0,
+            GgmlDType::Q4_1,
+            GgmlDType::Q5_0,
+            GgmlDType::Q5_1,
+            GgmlDType::Q2K,
+            GgmlDType::Q3K,
+            GgmlDType::Q4K,
+            GgmlDType::Q5K,
+            GgmlDType::Q6K,
+            GgmlDType::Q8K,
+        ] {
+            let q = QTensor::quantize(&w, dtype)?;
+            let wref = q.dequantize(&cpu)?;
+            let bytes = q.data()?.into_owned();
+            let wbuf = vd.storage_from_slice(&bytes)?;
+            let xbuf = vd.storage_from_slice(&xv)?;
+            for kernel in [kernels::Qgemv::Generic, kernels::Qgemv::Mali] {
+                for rows in [1usize, 2, 3, 4, 5, 7, 8, QGEMV_MAX_ROWS] {
+                    // Offset the activations by one row to exercise `xoff`.
+                    let out = vd.alloc(DType::F32, rows * n)?;
+                    kernels::run_qgemv_with(vd, kernel, dtype, xbuf.buf(), wbuf.buf(), out.buf(), rows, n, k, k)?;
+                    let got = match out.to_cpu_storage()? {
+                        crate::CpuStorage::F32(v) => Tensor::from_vec(v, (rows, n), &cpu)?,
+                        _ => unreachable!(),
+                    };
+                    let want = x.narrow(0, k, rows * k)?.reshape((rows, k))?.matmul(&wref.t()?)?;
+                    close(&got, &want, 1e-4, &format!("{kernel:?} {dtype:?} m={rows}"));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// the fused GEMV (m <= 16) and the dequantize + GEMM branch (m > 16)
     /// and matches the CPU on both.
     #[test]
