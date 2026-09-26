@@ -16,7 +16,18 @@ use joshua::model::QuantizedModel;
 use joshua::{ChatMessage, Engine, EngineOptions, ExpertPlacement, GenerationOptions};
 use std::io::Cursor;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock, RwLockReadGuard};
+
+/// The routing tracer is process-wide, so a test that installs one would
+/// collect (interleaved, out-of-order) rows from every concurrent MoE
+/// forward in this binary.  Tests that route experts hold this shared; the
+/// tracing test holds it exclusively.
+static ROUTING: RwLock<()> = RwLock::new(());
+
+/// Shared hold on [`ROUTING`] for a test that runs MoE forwards.
+fn routing_shared() -> RwLockReadGuard<'static, ()> {
+    ROUTING.read().unwrap_or_else(|e| e.into_inner())
+}
 
 /// Read the header the way the engine does: joshua's tolerant reader (raw
 /// dtype ids, so deepseek4's IQ2_XXS tensors parse) projected onto candle's
@@ -146,6 +157,7 @@ fn load_ds4(model: &std::path::Path) -> QuantizedModel {
 /// than its memory) produce the same logits as the plain load.
 #[test]
 fn host_placed_experts_match_plain_load() {
+    let _routing = routing_shared();
     for (name, write) in fixtures() {
         let dir = common::model_dir(&format!("placed-{name}"));
         let model = dir.join("model.gguf");
@@ -194,6 +206,7 @@ fn token_embeddings_stay_quantized() {
 /// instance it was derived from.
 #[test]
 fn derived_sessions_share_weights_and_isolate_kv() {
+    let _routing = routing_shared();
     for (name, write) in fixtures() {
         let dir = common::model_dir(&format!("share-{name}"));
         let model = dir.join("model.gguf");
@@ -256,6 +269,7 @@ fn derived_sessions_share_weights_and_isolate_kv() {
 /// different batch shapes and neither disturbs the other's `kv_seq`.
 #[test]
 fn deepseek4_sessions_share_weights_and_isolate_batch_kv() {
+    let _routing = routing_shared();
     let dir = common::model_dir("share-ds4-batch");
     let model = dir.join("model.gguf");
     common::write_tiny_deepseek4_gguf(&model);
@@ -306,6 +320,7 @@ fn deepseek4_sessions_share_weights_and_isolate_batch_kv() {
 /// no `DeviceResidency` is built and logits match the no-budget load.
 #[test]
 fn zero_device_expert_cache_budget_is_host_placement() {
+    let _routing = routing_shared();
     for (name, write) in fixtures() {
         let dir = common::model_dir(&format!("vram-cache0-{name}"));
         let model = dir.join("model.gguf");
@@ -331,6 +346,7 @@ fn zero_device_expert_cache_budget_is_host_placement() {
 /// load's logits exactly while the pool's counters show it all happened.
 #[test]
 fn deepseek4_expert_pool_partition_preserves_logits() {
+    let _routing = routing_shared();
     let dir = common::model_dir("vram-cache-deepseek4");
     let model = dir.join("model.gguf");
     common::write_tiny_deepseek4_gguf(&model);
@@ -385,6 +401,15 @@ fn deepseek4_expert_pool_partition_preserves_logits() {
 /// installed tracer holds one row per routed visit.
 #[test]
 fn deepseek4_expert_pool_reports_time_split_and_trace() {
+    // Exclusive: no other test's routing lands in this trace.  The guard
+    // uninstalls the tracer (even on failure) before releasing the lock.
+    struct Installed(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>);
+    impl Drop for Installed {
+        fn drop(&mut self) {
+            joshua::route_trace::uninstall();
+        }
+    }
+    let _installed = Installed(ROUTING.write().unwrap_or_else(|e| e.into_inner()));
     let dir = common::model_dir("vram-cache-stats-deepseek4");
     let model = dir.join("model.gguf");
     common::write_tiny_deepseek4_gguf(&model);
@@ -400,10 +425,10 @@ fn deepseek4_expert_pool_reports_time_split_and_trace() {
     let tokens = [1u32, 4, 2, 7, 5];
     let rows_before = tracer.rows();
     let _ = logits(&mut cached, &tokens, 0);
-    // Two layers, two experts per row, five rows (other tests in this
-    // process may add rows of their own; never fewer).
-    assert!(
-        tracer.rows() >= rows_before + 2 * 2 * 5,
+    // Two layers, two experts per row, five rows.
+    assert_eq!(
+        tracer.rows(),
+        rows_before + 2 * 2 * 5,
         "trace rows: {}",
         tracer.rows()
     );
@@ -466,6 +491,7 @@ fn deepseek4_expert_pool_reports_time_split_and_trace() {
 /// partition end-to-end through `QuantizedModel::from_gguf_mmap_placed`).
 #[test]
 fn vram_expert_cache_budget_loads_and_preserves_logits() {
+    let _routing = routing_shared();
     let dir = common::model_dir("vram-cache-qwen3moe");
     let model = dir.join("model.gguf");
     common::write_tiny_qwen3moe_gguf(&model);
@@ -501,6 +527,7 @@ fn placed_load_rejects_foreign_expert_device() {
 /// placement option.
 #[test]
 fn engine_shares_one_weight_set_across_sessions() {
+    let _routing = routing_shared();
     let dir = common::model_dir("engine-share");
     let model = dir.join("model.gguf");
     common::write_tiny_qwen3moe_gguf(&model);
@@ -545,6 +572,7 @@ fn engine_shares_one_weight_set_across_sessions() {
 /// KV accumulates in the same order across chunks).
 #[test]
 fn stream_prefill_matches_chunked_forward() {
+    let _routing = routing_shared();
     for (name, write) in fixtures() {
         let dir = common::model_dir(&format!("lsp-{name}"));
         let model = dir.join("model.gguf");
