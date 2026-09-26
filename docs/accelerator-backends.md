@@ -55,7 +55,28 @@ Both backends implement the same design:
   It keeps the generic kernel's decoders, so every quantisation is covered;
   it is checked against the CPU on every block format (forced on the test
   device), but its speed has not yet been measured on Mali hardware.
-  `JOSHUA_VULKAN_QGEMV=mali|generic` forces either kernel on any device.
+* **Int8 dot products (Mali).**  When the device offers
+  `VK_KHR_shader_integer_dot_product` (Arm's driver on the Immortalis-G720
+  does), the backend enables it and the Mali GEMV runs on packed int8 dot
+  products (`k_qgemv_mali_i8`, WGSL through naga, SPIR-V `OpSDot`): a
+  first pass quantizes the activations per 32 values exactly as llama.cpp
+  does for its Q8_0 dot products (`d = max|x|/127`, round half away from
+  zero), and every weight sub-block unpacks to packed signed bytes `q` with
+  `w = A·q + B` per 16 values, so a sub-block contributes
+  `d_x · Σ (A·Σq·x_q + B·Σx_q)` — four dot instructions per 16 weights,
+  for every block format.  The rounding of the activations is the only
+  numerical difference from the float kernel (the same trade llama.cpp's
+  CPU and GPU kernels make); against a reference with that rounding it
+  agrees within 2e-6.  Without the feature the same kernel compiles with a
+  bit-identical shift-and-multiply polyfill (used when forced on another
+  device).  Like the float Mali kernel, its speed has not been measured on
+  Mali hardware.
+* **Choosing the kernel.**  On an Arm GPU the int8 kernel is the default
+  when the dot-product feature is present, else the float Mali kernel;
+  other devices use the generic kernel.
+  `JOSHUA_VULKAN_QGEMV=mali-int8|mali|generic` forces one on any device,
+  and the startup log names the kernel and whether the int8 dot product is
+  on.
 * **Asynchronous execution.**  OpenCL launches on an in-order queue and only
   blocks on a host read-back.  Vulkan records into one command buffer per
   device and submits lazily — on a read-back, an explicit `synchronize`, or
@@ -240,14 +261,14 @@ the card for the real numbers).
 | `JOSHUA_ROUTE_TRACE=<path>` | Write the routing trace CSV for the offline cache simulator (`examples/cache_sim.rs`).  One file per process: run a single request at a time while tracing, or concurrent requests interleave their calls. |
 | `JOSHUA_PREFILL_CHUNK=<n>` | Tokens per prefill chunk (also `--prefill-chunk`). |
 | `JOSHUA_OPENCL_QGEMV=v1` | Run the expert formats through the one-row quantized GEMV instead of the multi-row kernel (bisecting). |
-| `JOSHUA_VULKAN_QGEMV=mali` / `generic` | Force the Mali-shaped quantized GEMV (the default on Arm GPUs) or the generic one on any Vulkan device. |
+| `JOSHUA_VULKAN_QGEMV=mali-int8` / `mali` / `generic` | Force the Mali GEMV on int8 dot products (the default on Arm GPUs with `shaderIntegerDotProduct`), the float Mali GEMV (the default on other Arm GPUs) or the generic one on any Vulkan device. |
 
 The engine logs the device it opened, its memory model and the active paths
 at startup:
 
 ```text
 INFO joshua: OpenCL device: Intel(R) UHD Graphics 730 (58000 MiB global memory, host-unified memory; native kernels on, zero-copy weights on)
-INFO joshua: Vulkan device: AMD Radeon Graphics (RADV RENOIR) (host-unified memory; native kernels on)
+INFO joshua: Vulkan device: AMD Radeon Graphics (RADV RENOIR) (host-unified memory; native kernels on; quantized GEMV Generic, int8 dot product on)
 ```
 
 ## Limits and fallbacks
