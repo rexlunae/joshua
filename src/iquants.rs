@@ -133,32 +133,119 @@ const _: () = assert!(std::mem::size_of::<BlockIq1M>() == 56);
 const _: () = assert!(std::mem::size_of::<BlockIq4Nl>() == 18);
 const _: () = assert!(std::mem::size_of::<BlockIq4Xs>() == 136);
 
+#[inline(always)]
 fn f16_at(b: [u8; 2]) -> f32 {
     f16::from_le_bytes(b).to_f32()
 }
 
+#[inline(always)]
 fn u16_at(b: &[u8], i: usize) -> u16 {
     u16::from_le_bytes([b[2 * i], b[2 * i + 1]])
 }
 
-/// Write `n` codebook bytes of `grid` (little-endian) scaled by `d`, each
-/// negated where bit `j` of `signs` is set.
-fn signed_grid(out: &mut [f32], grid: u64, n: usize, signs: u8, d: f32) {
-    let bytes = grid.to_le_bytes();
-    for (j, o) in out[..n].iter_mut().enumerate() {
-        let sign = if signs & KMASK_IQ2XS[j] != 0 {
-            -1.0
-        } else {
-            1.0
-        };
-        *o = d * bytes[j] as f32 * sign;
+/// One 32-value group of an IQ2 / IQ3 block, unpacked: four 8-value
+/// codebook entries of unsigned magnitudes (little-endian bytes), their
+/// sign bytes (bit `j` negates value `j`), and the scale of each 16-value
+/// half.  The scalar and AVX-512 decodes both run from it.
+struct SignedGroup {
+    grids: [u64; 4],
+    signs: [u8; 4],
+    scale: [f32; 2],
+}
+
+impl SignedGroup {
+    fn decode(&self, out: &mut [f32]) {
+        for l in 0..4 {
+            let bytes = self.grids[l].to_le_bytes();
+            for (j, o) in out[8 * l..8 * l + 8].iter_mut().enumerate() {
+                let sign = if self.signs[l] & KMASK_IQ2XS[j] != 0 {
+                    -1.0
+                } else {
+                    1.0
+                };
+                *o = self.scale[l / 2] * bytes[j] as f32 * sign;
+            }
+        }
+    }
+
+    /// Each half's two entries widen straight to f32 lanes (`vpmovzxbd`),
+    /// their sign bytes form one 16-bit mask that negates in place, then
+    /// one multiply by the half's scale — the scalar product up to the
+    /// order of an exact sign flip, so bit-identical.
+    ///
+    /// # Safety
+    /// AVX-512F/BW/VL/DQ must be available.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx2,fma")]
+    #[inline]
+    unsafe fn decode_avx512(&self) -> [std::arch::x86_64::__m512; 2] {
+        use std::arch::x86_64::*;
+        let zero = _mm512_setzero_ps();
+        let mut w = [zero; 2];
+        // (A loop rather than `array::map`: a closure cannot inline these
+        // intrinsics.)
+        for (h, wh) in w.iter_mut().enumerate() {
+            let grid = _mm_set_epi64x(self.grids[2 * h + 1] as i64, self.grids[2 * h] as i64);
+            let v = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(grid));
+            let mask = self.signs[2 * h] as u16 | (self.signs[2 * h + 1] as u16) << 8;
+            *wh = _mm512_mul_ps(
+                _mm512_mask_sub_ps(v, mask, zero, v),
+                _mm512_set1_ps(self.scale[h]),
+            );
+        }
+        w
     }
 }
 
-/// Write the 8 values of IQ1 codebook entry `idx`: `d · (grid + delta)`.
-fn iq1_group(out: &mut [f32], idx: usize, d: f32, delta: f32) {
-    for (o, g) in out[..8].iter_mut().zip(IQ1S_GRID[idx].to_le_bytes()) {
-        *o = d * (g as i8 as f32 + delta);
+/// One 32-value group of an IQ1 block, unpacked: four 8-value codebook
+/// entries of `-1 / 0 / +1` (as little-endian `i8` bytes), each entry's
+/// `±1/8` shift (bit `l` of `neg_delta` set: entry `l` shifts down), and the
+/// scale of each 16-value half.  Values are `scale · (grid + delta)`.
+struct Iq1Group {
+    grids: [u64; 4],
+    neg_delta: u8,
+    scale: [f32; 2],
+}
+
+impl Iq1Group {
+    fn decode(&self, out: &mut [f32]) {
+        for l in 0..4 {
+            let delta = if self.neg_delta >> l & 1 != 0 {
+                -IQ1_DELTA
+            } else {
+                IQ1_DELTA
+            };
+            for (o, g) in out[8 * l..8 * l + 8]
+                .iter_mut()
+                .zip(self.grids[l].to_le_bytes())
+            {
+                *o = self.scale[l / 2] * (g as i8 as f32 + delta);
+            }
+        }
+    }
+
+    /// Sign-extend each half's two entries to f32 lanes, add the per-entry
+    /// delta (a lane mask choosing `±1/8` per 8 lanes, kept in registers),
+    /// multiply by the scale — the scalar operations in the scalar order.
+    ///
+    /// # Safety
+    /// AVX-512F/BW/VL/DQ must be available.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx2,fma")]
+    #[inline]
+    unsafe fn decode_avx512(&self) -> [std::arch::x86_64::__m512; 2] {
+        use std::arch::x86_64::*;
+        let mut w = [_mm512_setzero_ps(); 2];
+        for (h, wh) in w.iter_mut().enumerate() {
+            let grid = _mm_set_epi64x(self.grids[2 * h + 1] as i64, self.grids[2 * h] as i64);
+            let v = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(grid));
+            let bits = (self.neg_delta >> (2 * h)) & 3;
+            let lanes = ((bits & 1) as u16 * 0x00FF) | ((bits >> 1) as u16 * 0xFF00);
+            let delta =
+                _mm512_mask_blend_ps(lanes, _mm512_set1_ps(IQ1_DELTA), _mm512_set1_ps(-IQ1_DELTA));
+            *wh = _mm512_mul_ps(_mm512_add_ps(v, delta), _mm512_set1_ps(self.scale[h]));
+        }
+        w
     }
 }
 
@@ -171,154 +258,158 @@ macro_rules! raw_block_consts {
     };
 }
 
-impl RawBlock for BlockIq2Xs {
-    raw_block_consts!(17, QK_K, "iq2_xs");
+/// `RawBlock` for a format whose 32-value groups unpack through
+/// `$Block::group` into a [`SignedGroup`] or [`Iq1Group`]: the scalar
+/// decode walks the groups, and the fused AVX-512 kernel decodes group `c`
+/// straight into registers.
+macro_rules! grouped_raw_block {
+    ($Block:ty, $id:expr, $name:expr) => {
+        impl RawBlock for $Block {
+            raw_block_consts!($id, QK_K, $name);
+            const DECODE_AVX512: bool = true;
 
-    fn dequantize_block(&self, out: &mut [f32]) {
-        let d = f16_at(self.d);
-        for ib32 in 0..QK_K / 32 {
-            let s = self.scales[ib32];
-            let db = [
-                d * (0.5 + (s & 0xf) as f32) * 0.25,
-                d * (0.5 + (s >> 4) as f32) * 0.25,
-            ];
-            for l in 0..4 {
-                let q = u16_at(&self.qs, 4 * ib32 + l);
-                let y = &mut out[32 * ib32 + 8 * l..];
-                signed_grid(
-                    y,
-                    IQ2XS_GRID[(q & 511) as usize],
-                    8,
-                    KSIGNS_IQ2XS[(q >> 9) as usize],
-                    db[l / 2],
-                );
+            fn dequantize_block(&self, out: &mut [f32]) {
+                for ib in 0..QK_K / 32 {
+                    self.group(ib).decode(&mut out[32 * ib..32 * ib + 32]);
+                }
             }
+
+            #[cfg(target_arch = "x86_64")]
+            #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx2,fma")]
+            #[inline]
+            unsafe fn decode_avx512(&self, c: usize) -> [std::arch::x86_64::__m512; 2] {
+                self.group(c).decode_avx512()
+            }
+        }
+    };
+}
+
+/// The two IQ2_XS / IQ2_S half scales packed in one byte.
+#[inline(always)]
+fn iq2_scales(d: f32, s: u8) -> [f32; 2] {
+    [
+        d * (0.5 + (s & 0xf) as f32) * 0.25,
+        d * (0.5 + (s >> 4) as f32) * 0.25,
+    ]
+}
+
+impl BlockIq2Xs {
+    #[inline(always)]
+    fn group(&self, ib: usize) -> SignedGroup {
+        let q: [u16; 4] = std::array::from_fn(|l| u16_at(&self.qs, 4 * ib + l));
+        SignedGroup {
+            grids: q.map(|q| IQ2XS_GRID[(q & 511) as usize]),
+            signs: q.map(|q| KSIGNS_IQ2XS[(q >> 9) as usize]),
+            scale: iq2_scales(f16_at(self.d), self.scales[ib]),
         }
     }
 }
+grouped_raw_block!(BlockIq2Xs, 17, "iq2_xs");
 
-impl RawBlock for BlockIq2S {
-    raw_block_consts!(22, QK_K, "iq2_s");
-
-    fn dequantize_block(&self, out: &mut [f32]) {
-        let d = f16_at(self.d);
+impl BlockIq2S {
+    #[inline(always)]
+    fn group(&self, ib: usize) -> SignedGroup {
         let (qs, signs) = self.qs.split_at(QK_K / 8);
-        for ib32 in 0..QK_K / 32 {
-            let s = self.scales[ib32];
-            let db = [
-                d * (0.5 + (s & 0xf) as f32) * 0.25,
-                d * (0.5 + (s >> 4) as f32) * 0.25,
-            ];
-            for l in 0..4 {
-                let hi = ((self.qh[ib32] as usize) << (8 - 2 * l)) & 0x300;
-                let idx = qs[4 * ib32 + l] as usize | hi;
-                let y = &mut out[32 * ib32 + 8 * l..];
-                signed_grid(y, IQ2S_GRID[idx], 8, signs[4 * ib32 + l], db[l / 2]);
-            }
+        let qh = self.qh[ib] as usize;
+        SignedGroup {
+            grids: std::array::from_fn(|l| {
+                IQ2S_GRID[qs[4 * ib + l] as usize | ((qh << (8 - 2 * l)) & 0x300)]
+            }),
+            signs: std::array::from_fn(|l| signs[4 * ib + l]),
+            scale: iq2_scales(f16_at(self.d), self.scales[ib]),
         }
     }
 }
+grouped_raw_block!(BlockIq2S, 22, "iq2_s");
 
-impl RawBlock for BlockIq3Xxs {
-    raw_block_consts!(18, QK_K, "iq3_xxs");
-
-    fn dequantize_block(&self, out: &mut [f32]) {
-        let d = f16_at(self.d);
+impl BlockIq3Xxs {
+    #[inline(always)]
+    fn group(&self, ib: usize) -> SignedGroup {
         let (qs, scales_and_signs) = self.qs.split_at(QK_K / 4);
-        for ib32 in 0..QK_K / 32 {
-            let a = &scales_and_signs[4 * ib32..4 * ib32 + 4];
-            let aux = u32::from_le_bytes([a[0], a[1], a[2], a[3]]);
-            let db = d * (0.5 + (aux >> 28) as f32) * 0.5;
-            for l in 0..4 {
-                let signs = KSIGNS_IQ2XS[((aux >> (7 * l)) & 127) as usize];
-                let y = &mut out[32 * ib32 + 8 * l..];
-                let g1 = IQ3XXS_GRID[qs[8 * ib32 + 2 * l] as usize] as u64;
-                let g2 = IQ3XXS_GRID[qs[8 * ib32 + 2 * l + 1] as usize] as u64;
-                signed_grid(y, g1 | (g2 << 32), 8, signs, db);
-            }
+        let a = &scales_and_signs[4 * ib..4 * ib + 4];
+        let aux = u32::from_le_bytes([a[0], a[1], a[2], a[3]]);
+        let db = f16_at(self.d) * (0.5 + (aux >> 28) as f32) * 0.5;
+        let q = &qs[8 * ib..8 * ib + 8];
+        SignedGroup {
+            grids: std::array::from_fn(|l| {
+                IQ3XXS_GRID[q[2 * l] as usize] as u64
+                    | (IQ3XXS_GRID[q[2 * l + 1] as usize] as u64) << 32
+            }),
+            signs: std::array::from_fn(|l| KSIGNS_IQ2XS[((aux >> (7 * l)) & 127) as usize]),
+            scale: [db; 2],
         }
     }
 }
+grouped_raw_block!(BlockIq3Xxs, 18, "iq3_xxs");
 
-impl RawBlock for BlockIq3S {
-    raw_block_consts!(21, QK_K, "iq3_s");
-
-    fn dequantize_block(&self, out: &mut [f32]) {
-        let d = f16_at(self.d);
-        for ib32 in 0..QK_K / 32 {
-            let s = self.scales[ib32 / 2];
-            let db = d * (1 + 2 * (if ib32 % 2 == 0 { s & 0xf } else { s >> 4 }) as u32) as f32;
-            let qh = self.qh[ib32] as usize;
-            for l in 0..4 {
-                let q = &self.qs[8 * ib32 + 2 * l..];
-                let g1 = IQ3S_GRID[q[0] as usize | ((qh << (8 - 2 * l)) & 256)] as u64;
-                let g2 = IQ3S_GRID[q[1] as usize | ((qh << (7 - 2 * l)) & 256)] as u64;
-                let y = &mut out[32 * ib32 + 8 * l..];
-                signed_grid(y, g1 | (g2 << 32), 8, self.signs[4 * ib32 + l], db);
-            }
+impl BlockIq3S {
+    #[inline(always)]
+    fn group(&self, ib: usize) -> SignedGroup {
+        let s = self.scales[ib / 2];
+        let db = f16_at(self.d)
+            * (1 + 2
+                * (if ib.is_multiple_of(2) {
+                    s & 0xf
+                } else {
+                    s >> 4
+                }) as u32) as f32;
+        let qh = self.qh[ib] as usize;
+        let q = &self.qs[8 * ib..8 * ib + 8];
+        SignedGroup {
+            grids: std::array::from_fn(|l| {
+                let g1 = IQ3S_GRID[q[2 * l] as usize | ((qh << (8 - 2 * l)) & 256)] as u64;
+                let g2 = IQ3S_GRID[q[2 * l + 1] as usize | ((qh << (7 - 2 * l)) & 256)] as u64;
+                g1 | (g2 << 32)
+            }),
+            signs: std::array::from_fn(|l| self.signs[4 * ib + l]),
+            scale: [db; 2],
         }
     }
 }
+grouped_raw_block!(BlockIq3S, 21, "iq3_s");
 
-impl RawBlock for BlockIq1S {
-    raw_block_consts!(19, QK_K, "iq1_s");
-
-    fn dequantize_block(&self, out: &mut [f32]) {
-        let d = f16_at(self.d);
-        for ib in 0..QK_K / 32 {
-            let qh = u16_at(&self.qh, ib);
-            let dl = d * (2 * ((qh >> 12) & 7) + 1) as f32;
-            let delta = if qh & 0x8000 != 0 {
-                -IQ1_DELTA
-            } else {
-                IQ1_DELTA
-            };
-            for l in 0..4 {
-                let idx = self.qs[4 * ib + l] as usize | ((((qh >> (3 * l)) & 7) as usize) << 8);
-                iq1_group(&mut out[32 * ib + 8 * l..], idx, dl, delta);
-            }
+impl BlockIq1S {
+    #[inline(always)]
+    fn group(&self, ib: usize) -> Iq1Group {
+        let qh = u16_at(&self.qh, ib);
+        let dl = f16_at(self.d) * (2 * ((qh >> 12) & 7) + 1) as f32;
+        Iq1Group {
+            grids: std::array::from_fn(|l| {
+                IQ1S_GRID[self.qs[4 * ib + l] as usize | ((((qh >> (3 * l)) & 7) as usize) << 8)]
+            }),
+            neg_delta: if qh & 0x8000 != 0 { 0xF } else { 0 },
+            scale: [dl; 2],
         }
     }
 }
+grouped_raw_block!(BlockIq1S, 19, "iq1_s");
 
-impl RawBlock for BlockIq1M {
-    raw_block_consts!(29, QK_K, "iq1_m");
-
-    fn dequantize_block(&self, out: &mut [f32]) {
+impl BlockIq1M {
+    #[inline(always)]
+    fn group(&self, ib: usize) -> Iq1Group {
         let sc: [u16; 4] = std::array::from_fn(|i| u16_at(&self.scales, i));
         let scale =
             (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) | ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000);
         let d = f16::from_bits(scale).to_f32();
-        for ib in 0..QK_K / 32 {
-            let shift = 6 * (ib % 2) as u16;
-            let dl1 = d * (2 * ((sc[ib / 2] >> shift) & 7) + 1) as f32;
-            let dl2 = d * (2 * ((sc[ib / 2] >> (shift + 3)) & 7) + 1) as f32;
-            let qs = &self.qs[4 * ib..];
-            let (h0, h1) = (self.qh[2 * ib] as usize, self.qh[2 * ib + 1] as usize);
-            let idx = [
-                qs[0] as usize | ((h0 << 8) & 0x700),
-                qs[1] as usize | ((h0 << 4) & 0x700),
-                qs[2] as usize | ((h1 << 8) & 0x700),
-                qs[3] as usize | ((h1 << 4) & 0x700),
-            ];
-            let delta = |h: usize, bit: usize| if h & bit != 0 { -IQ1_DELTA } else { IQ1_DELTA };
-            let deltas = [
-                delta(h0, 0x08),
-                delta(h0, 0x80),
-                delta(h1, 0x08),
-                delta(h1, 0x80),
-            ];
-            for l in 0..4 {
-                iq1_group(
-                    &mut out[32 * ib + 8 * l..],
-                    idx[l],
-                    if l < 2 { dl1 } else { dl2 },
-                    deltas[l],
-                );
-            }
+        let shift = 6 * (ib % 2) as u16;
+        let qs = &self.qs[4 * ib..4 * ib + 4];
+        let (h0, h1) = (self.qh[2 * ib] as usize, self.qh[2 * ib + 1] as usize);
+        Iq1Group {
+            grids: [
+                IQ1S_GRID[qs[0] as usize | ((h0 << 8) & 0x700)],
+                IQ1S_GRID[qs[1] as usize | ((h0 << 4) & 0x700)],
+                IQ1S_GRID[qs[2] as usize | ((h1 << 8) & 0x700)],
+                IQ1S_GRID[qs[3] as usize | ((h1 << 4) & 0x700)],
+            ],
+            neg_delta: (h0 >> 3 & 1 | h0 >> 6 & 2 | h1 >> 1 & 4 | h1 >> 4 & 8) as u8,
+            scale: [
+                d * (2 * ((sc[ib / 2] >> shift) & 7) + 1) as f32,
+                d * (2 * ((sc[ib / 2] >> (shift + 3)) & 7) + 1) as f32,
+            ],
         }
     }
 }
+grouped_raw_block!(BlockIq1M, 29, "iq1_m");
 
 /// Decode 16 bytes of IQ4 nibbles: low nibbles to `out[..16]`, high to
 /// `out[16..32]`.
@@ -384,6 +475,7 @@ impl RawBlock for BlockIq4Nl {
 impl BlockIq4Xs {
     /// The scale of 32-value group `ib`: the super-scale times the 6-bit
     /// sub-scale, offset by 32.
+    #[inline(always)]
     fn group_scale(&self, ib: usize) -> f32 {
         let scales_h = u16::from_le_bytes(self.scales_h);
         let lo = (self.scales_l[ib / 2] >> (4 * (ib % 2))) & 0xf;
@@ -441,7 +533,13 @@ mod tests {
     /// The AVX-512 decodes reproduce the scalar ones exactly, and the fused
     /// kernel matches the portable one.
     #[test]
-    fn iq4_avx512_decodes_match_scalar() {
+    fn avx512_decodes_match_scalar() {
+        testing::check_decode_avx512(&testing::synthetic::<BlockIq1S>(8, 11));
+        testing::check_decode_avx512(&testing::synthetic::<BlockIq1M>(8, 11));
+        testing::check_decode_avx512(&testing::synthetic::<BlockIq2Xs>(8, 11));
+        testing::check_decode_avx512(&testing::synthetic::<BlockIq2S>(8, 11));
+        testing::check_decode_avx512(&testing::synthetic::<BlockIq3Xxs>(8, 11));
+        testing::check_decode_avx512(&testing::synthetic::<BlockIq3S>(8, 11));
         testing::check_decode_avx512(&testing::synthetic::<BlockIq4Xs>(8, 11));
         testing::check_decode_avx512(&testing::synthetic::<BlockIq4Nl>(64, 11));
     }
