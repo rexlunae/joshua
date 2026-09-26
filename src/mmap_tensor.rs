@@ -361,8 +361,9 @@ impl<T: GgmlType + Send + Sync> QuantizedType for MmapBlocks<T> {
     }
 }
 
-/// Blocks of a [`RawBlock`] format (IQ2_XXS, MXFP4, Q1_0, Q2_0) borrowed
-/// from the mapping.
+/// Blocks of a [`RawBlock`] format (the i-quants, TQ1_0 / TQ2_0, MXFP4 /
+/// NVFP4, Q1_0 / Q2_0) borrowed from the mapping — or, for a tensor read
+/// through a copying reader, held on the heap in the same compact form.
 ///
 /// Deliberately not `MmapBlocks<T>`: that runs candle's `GgmlType` kernels
 /// (Q8-quantized activations; and candle has no type at all for most of
@@ -370,38 +371,50 @@ impl<T: GgmlType + Send + Sync> QuantizedType for MmapBlocks<T> {
 /// activations, a block decoded at a time.  IQ2_XXS reports its real dtype
 /// so a device upload of these bytes (`QStorage::from_data` with
 /// `qt.dtype()`) lands as IQ2_XXS device storage.
-pub struct MmapRawBlocks<B: RawBlock> {
-    /// Keeps the mapping alive; never dereferenced directly.
-    _mmap: Arc<Mmap>,
-    ptr: *const B,
-    len: usize,
+pub struct RawBlocks<B: RawBlock> {
+    backing: RawBacking<B>,
 }
 
-// SAFETY: same argument as `MmapBlocks`: read-only mapping kept alive by
-// `_mmap`, blocks never mutated or moved.
-unsafe impl<B: RawBlock> Send for MmapRawBlocks<B> {}
-unsafe impl<B: RawBlock> Sync for MmapRawBlocks<B> {}
+enum RawBacking<B> {
+    Mapped {
+        /// Keeps the mapping alive; never dereferenced directly.
+        mmap: Arc<Mmap>,
+        ptr: *const B,
+        len: usize,
+    },
+    Owned(Vec<B>),
+}
 
-impl<B: RawBlock> MmapPrefetch for MmapRawBlocks<B> {
+// SAFETY: same argument as `MmapBlocks`: a read-only mapping kept alive by
+// `mmap`, blocks never mutated or moved; the owned form is a plain `Vec`.
+unsafe impl<B: RawBlock> Send for RawBlocks<B> {}
+unsafe impl<B: RawBlock> Sync for RawBlocks<B> {}
+
+impl<B: RawBlock> MmapPrefetch for RawBlocks<B> {
     fn prefetch(&self) {
-        let base = self._mmap.as_ptr() as usize;
-        let off = self.ptr as usize - base;
-        let _ = self
-            ._mmap
-            .advise_range(memmap2::Advice::WillNeed, off, self.size());
+        if let RawBacking::Mapped { mmap, ptr, .. } = &self.backing {
+            let off = *ptr as usize - mmap.as_ptr() as usize;
+            let _ = mmap.advise_range(memmap2::Advice::WillNeed, off, self.size());
+        }
     }
 
     fn mapped_range(&self) -> Option<MappedRange> {
-        Some(MappedRange::new(&self._mmap, self.ptr as *const u8, self.size()))
+        match &self.backing {
+            RawBacking::Mapped { mmap, ptr, .. } => Some(MappedRange::new(mmap, *ptr as *const u8, self.size())),
+            RawBacking::Owned(_) => None,
+        }
     }
 }
 
-impl<B: RawBlock> MmapRawBlocks<B> {
+impl<B: RawBlock> RawBlocks<B> {
     fn blocks(&self) -> &[B] {
-        // SAFETY: bounds-checked in `borrow` (blocks are align 1, so only
-        // bounds matter) against a mapping that `_mmap` keeps alive and that
-        // is never mutated.
-        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+        match &self.backing {
+            // SAFETY: bounds-checked in `borrow` (blocks are align 1, so only
+            // bounds matter) against a mapping that `mmap` keeps alive and
+            // that is never mutated.
+            RawBacking::Mapped { ptr, len, .. } => unsafe { std::slice::from_raw_parts(*ptr, *len) },
+            RawBacking::Owned(v) => v,
+        }
     }
 
     fn borrow(mmap: &Arc<Mmap>, byte_offset: usize, n_blocks: usize) -> Option<Self> {
@@ -413,14 +426,27 @@ impl<B: RawBlock> MmapRawBlocks<B> {
         // SAFETY: `byte_offset <= end <= mmap.len()`.
         let ptr = unsafe { mmap.as_ptr().add(byte_offset) };
         Some(Self {
-            _mmap: Arc::clone(mmap),
-            ptr: ptr as *const B,
-            len: n_blocks,
+            backing: RawBacking::Mapped {
+                mmap: Arc::clone(mmap),
+                ptr: ptr as *const B,
+                len: n_blocks,
+            },
         })
     }
 }
 
-impl<B: RawBlock> QuantizedType for MmapRawBlocks<B> {
+/// A [`RawBlock`] tensor held on the heap as its file bytes (`shape`'s
+/// element count must be whole blocks).
+pub fn owned_qtensor_raw<B: RawBlock>(bytes: &[u8], shape: candle_core::Shape) -> Result<QTensor> {
+    let blocks = raw_block::blocks_from_bytes::<B>(bytes)?.to_vec();
+    if blocks.len() * B::QK != shape.elem_count() {
+        candle_core::bail!("{}: {} blocks for a tensor of shape {shape:?}", B::NAME, blocks.len());
+    }
+    let storage: Box<dyn QuantizedType> = Box::new(RawBlocks { backing: RawBacking::Owned(blocks) });
+    QTensor::new(QStorage::Cpu(storage), shape)
+}
+
+impl<B: RawBlock> QuantizedType for RawBlocks<B> {
     fn dtype(&self) -> GgmlDType {
         B::CANDLE_DTYPE
     }
@@ -473,7 +499,7 @@ impl<B: RawBlock> QuantizedType for MmapRawBlocks<B> {
     }
 
     fn as_ptr(&self) -> *const u8 {
-        self.ptr as *const u8
+        self.blocks().as_ptr() as *const u8
     }
 
     fn block_size(&self) -> usize {
@@ -481,15 +507,15 @@ impl<B: RawBlock> QuantizedType for MmapRawBlocks<B> {
     }
 
     fn size(&self) -> usize {
-        self.len * raw_block::block_bytes::<B>()
+        std::mem::size_of_val(self.blocks())
     }
 
     fn from_float(&mut self, _xs: &[f32]) {
-        panic!("cannot quantize into a read-only memory-mapped tensor")
+        panic!("cannot quantize into a raw-format tensor (decode-only)")
     }
 
     fn from_float_imatrix(&mut self, _xs: &[f32], _imatrix_weights: &[f32], _n_per_row: usize) {
-        panic!("cannot quantize into a read-only memory-mapped tensor")
+        panic!("cannot quantize into a raw-format tensor (decode-only)")
     }
 }
 
@@ -527,7 +553,7 @@ pub fn prefetch_handle(
         GgmlDType::Q5K => handle!(k_quants::BlockQ5K),
         GgmlDType::Q6K => handle!(k_quants::BlockQ6K),
         GgmlDType::Q8K => handle!(k_quants::BlockQ8K),
-        // The IQ2_XXS mmap form is `MmapRawBlocks` (`prefetch_handle_raw`).
+        // The IQ2_XXS mmap form is `RawBlocks` (`prefetch_handle_raw`).
         GgmlDType::Iq2Xxs => None,
     }
 }
@@ -538,7 +564,7 @@ pub fn prefetch_handle_raw<B: RawBlock>(
     byte_offset: usize,
     n_blocks: usize,
 ) -> Option<Arc<dyn MmapPrefetch>> {
-    MmapRawBlocks::<B>::borrow(mmap, byte_offset, n_blocks)
+    RawBlocks::<B>::borrow(mmap, byte_offset, n_blocks)
         .map(|b| Arc::new(b) as Arc<dyn MmapPrefetch>)
 }
 
@@ -583,7 +609,7 @@ pub fn borrowed_range_raw<B: RawBlock>(
     if !elem_count.is_multiple_of(B::QK) {
         return Ok(None);
     }
-    let Some(blocks) = MmapRawBlocks::<B>::borrow(mmap, offset, elem_count / B::QK) else {
+    let Some(blocks) = RawBlocks::<B>::borrow(mmap, offset, elem_count / B::QK) else {
         return Ok(None);
     };
     let storage: Box<dyn QuantizedType> = Box::new(blocks);
@@ -656,7 +682,7 @@ pub fn borrowed_range(
         GgmlDType::Q5K => Box::new(borrow!(k_quants::BlockQ5K)),
         GgmlDType::Q6K => Box::new(borrow!(k_quants::BlockQ6K)),
         GgmlDType::Q8K => Box::new(borrow!(k_quants::BlockQ8K)),
-        // The IQ2_XXS mmap form is `MmapRawBlocks` (`borrowed_range_raw`),
+        // The IQ2_XXS mmap form is `RawBlocks` (`borrowed_range_raw`),
         // which keeps the fused AVX2 matmul instead of candle's reference decode.
         GgmlDType::Iq2Xxs => candle_core::bail!(
             "IQ2_XXS tensors are borrowed with `borrowed_range_raw`, not the generic block borrow"

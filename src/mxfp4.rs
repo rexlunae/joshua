@@ -29,6 +29,13 @@
 //!
 //! Blocks are `align_of == 1`, so unlike the k-quants they are always
 //! borrowable straight out of a memory mapping regardless of file alignment.
+//!
+//! # NVFP4
+//!
+//! NVIDIA's FP4 (`GGML_TYPE_NVFP4`, id 40) uses the same E2M1 elements with
+//! a finer scale: a block covers 64 elements in 36 bytes — four UE4M3 scale
+//! bytes (unsigned, 4 exponent bits with bias 7, 3 mantissa bits; one per 16
+//! elements) then 32 bytes of codes, packed split-half within each 16.
 
 /// Elements per MXFP4 block.
 pub const QK_MXFP4: usize = 32;
@@ -125,9 +132,74 @@ impl crate::raw_block::RawBlock for BlockMxfp4 {
     }
 }
 
+/// Elements per NVFP4 block.
+pub const QK_NVFP4: usize = 64;
+/// Elements per NVFP4 scale.
+pub const QK_NVFP4_SUB: usize = 16;
+
+/// One NVFP4 block: a UE4M3 scale per 16 elements, then their E2M1 codes.
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct BlockNvfp4 {
+    pub d: [u8; QK_NVFP4 / QK_NVFP4_SUB],
+    pub qs: [u8; QK_NVFP4 / 2],
+}
+
+const _: () = assert!(std::mem::size_of::<BlockNvfp4>() == 36);
+
+/// Decode a UE4M3 scale byte.  The sign bit is ignored (the format is
+/// unsigned) and `0x7F`, E4M3's NaN, decodes to zero like llama.cpp's
+/// `ggml_ue4m3_to_fp32` (which returns this value halved, to pair with its
+/// doubled E2M1 table).
+pub fn ue4m3_to_f32(x: u8) -> f32 {
+    if x == 0 || x == 0x7F {
+        return 0.0;
+    }
+    let exp = ((x >> 3) & 0xF) as i32;
+    let man = (x & 0x7) as f32;
+    if exp == 0 {
+        man * 2f32.powi(-9)
+    } else {
+        (1.0 + man / 8.0) * 2f32.powi(exp - 7)
+    }
+}
+
+impl crate::raw_block::RawBlock for BlockNvfp4 {
+    const GGML_TYPE: u32 = 40;
+    const QK: usize = QK_NVFP4;
+    const NAME: &'static str = "nvfp4";
+    const CANDLE_DTYPE: candle_core::quantized::GgmlDType = candle_core::quantized::GgmlDType::Q2K;
+
+    fn dequantize_block(&self, out: &mut [f32]) {
+        for (s, (y, qs)) in out.chunks_exact_mut(QK_NVFP4_SUB).zip(self.qs.chunks_exact(QK_NVFP4_SUB / 2)).enumerate() {
+            let d = ue4m3_to_f32(self.d[s]);
+            for (j, &q) in qs.iter().enumerate() {
+                y[j] = E2M1[(q & 0x0F) as usize] * d;
+                y[j + QK_NVFP4_SUB / 2] = E2M1[(q >> 4) as usize] * d;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nvfp4_decodes_ue4m3_scales_per_16() {
+        assert_eq!(ue4m3_to_f32(0x38), 1.0); // exp 7, man 0
+        assert_eq!(ue4m3_to_f32(0x3C), 1.5);
+        assert_eq!(ue4m3_to_f32(0x01), 2f32.powi(-9)); // subnormal
+        assert_eq!(ue4m3_to_f32(0x7F), 0.0);
+        let mut b = BlockNvfp4 { d: [0x38, 0x40, 0, 0], qs: [0; 32] };
+        b.qs[0] = 0x7 | (0x1 << 4); // element 0 → +6, element 8 → +0.5
+        b.qs[8] = 0xF; // first element of the second 16 → −6, scale 2
+        let mut out = [0f32; QK_NVFP4];
+        crate::raw_block::RawBlock::dequantize_block(&b, &mut out);
+        assert_eq!((out[0], out[8], out[16]), (6.0, 0.5, -12.0));
+        crate::raw_block::testing::check_matmul(&crate::raw_block::testing::synthetic::<BlockNvfp4>(6, 5), 128);
+        crate::raw_block::testing::check_blocks_from_bytes::<BlockNvfp4>();
+    }
 
     #[test]
     fn e8m0_decodes_to_powers_of_two() {

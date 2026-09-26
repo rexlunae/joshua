@@ -1,5 +1,7 @@
 //! Q1_0 and Q2_0 — the 1-bit and 2-bit block formats Bonsai models ship in
-//! (`GGML_TYPE_Q1_0 = 41`, `GGML_TYPE_Q2_0 = 42`).
+//! (`GGML_TYPE_Q1_0 = 41`, `GGML_TYPE_Q2_0 = 42`) — and TQ1_0 / TQ2_0, the
+//! ternary formats of BitNet b1.58 models (`GGML_TYPE_TQ1_0 = 34`,
+//! `GGML_TYPE_TQ2_0 = 35`).
 //!
 //! Candle has no variant for either, so like MXFP4 they are decoded by
 //! Joshua through [`crate::raw_block`]: borrowed from the mapping and
@@ -108,6 +110,84 @@ impl RawBlock for BlockQ2_0 {
         for (byte, chunk) in self.qs.iter().zip(out.chunks_exact_mut(4)) {
             for (i, o) in chunk.iter_mut().enumerate() {
                 *o = ((byte >> (2 * i) & 3) as f32 - 1.0) * d;
+            }
+        }
+    }
+}
+
+/// Elements per TQ1_0 / TQ2_0 block.
+pub const QK_TQ: usize = 256;
+
+/// One TQ1_0 block (1.6875 bpw, BitNet b1.58 ternary): 48 bytes packing
+/// five base-3 digits each, 4 bytes packing four more, then the f16 scale.
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct BlockTq1_0 {
+    pub qs: [u8; (QK_TQ - 4 * QK_TQ / 64) / 5],
+    pub qh: [u8; QK_TQ / 64],
+    pub d: [u8; 2],
+}
+
+/// One TQ2_0 block (2.0625 bpw ternary): four 2-bit codes per byte, then
+/// the f16 scale.
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct BlockTq2_0 {
+    pub qs: [u8; QK_TQ / 4],
+    pub d: [u8; 2],
+}
+
+const _: () = assert!(std::mem::size_of::<BlockTq1_0>() == 54);
+const _: () = assert!(std::mem::size_of::<BlockTq2_0>() == 66);
+
+/// Digit `n` of a TQ1_0 byte: the byte stores `ceil(v · 256 / 243)` for a
+/// base-3 number `v`, so multiplying by `3^n` (mod 256) rotates digit `n`
+/// to the top and `(q · 3) >> 8` extracts it (llama.cpp
+/// `dequantize_row_tq1_0`).
+fn tq1_digit(byte: u8, n: usize) -> f32 {
+    const POW3: [u8; 5] = [1, 3, 9, 27, 81];
+    let q = byte.wrapping_mul(POW3[n]);
+    (((q as u16 * 3) >> 8) as i16 - 1) as f32
+}
+
+impl RawBlock for BlockTq1_0 {
+    const GGML_TYPE: u32 = 34;
+    const QK: usize = QK_TQ;
+    const NAME: &'static str = "tq1_0";
+    const CANDLE_DTYPE: GgmlDType = GgmlDType::Q2K; // placeholder, see trait docs
+
+    fn dequantize_block(&self, out: &mut [f32]) {
+        let d = f16::from_le_bytes(self.d).to_f32();
+        let mut y = out.iter_mut();
+        // 32 bytes, then 16, each spanning five runs of digits.
+        for (start, width) in [(0, 32), (32, 16)] {
+            for n in 0..5 {
+                for &b in &self.qs[start..start + width] {
+                    *y.next().expect("256 values") = tq1_digit(b, n) * d;
+                }
+            }
+        }
+        for n in 0..4 {
+            for &b in &self.qh {
+                *y.next().expect("256 values") = tq1_digit(b, n) * d;
+            }
+        }
+    }
+}
+
+impl RawBlock for BlockTq2_0 {
+    const GGML_TYPE: u32 = 35;
+    const QK: usize = QK_TQ;
+    const NAME: &'static str = "tq2_0";
+    const CANDLE_DTYPE: GgmlDType = GgmlDType::Q2K; // placeholder, see trait docs
+
+    fn dequantize_block(&self, out: &mut [f32]) {
+        let d = f16::from_le_bytes(self.d).to_f32();
+        for (j, chunk) in self.qs.chunks_exact(32).enumerate() {
+            for l in 0..4 {
+                for (m, &b) in chunk.iter().enumerate() {
+                    out[128 * j + 32 * l + m] = ((b >> (2 * l) & 3) as f32 - 1.0) * d;
+                }
             }
         }
     }
@@ -239,6 +319,30 @@ mod tests {
         assert_eq!(blocks_as_bytes(again), blocks_as_bytes(&blocks));
         testing::check_blocks_from_bytes::<BlockQ1_0>();
         testing::check_blocks_from_bytes::<BlockQ2_0>();
+    }
+
+    #[test]
+    fn ternary_formats_decode_llama_cpp_layout() {
+        // TQ2_0: element 32·l + m of each 128 is bits 2l.. of byte m.
+        let mut b = BlockTq2_0 { qs: [0; 64], d: f16::from_f32(0.5).to_le_bytes() };
+        b.qs[0] = 0b10_01_00_10; // elements 0, 32, 64, 96 → codes 2, 0, 1, 2
+        let mut out = [0f32; QK_TQ];
+        b.dequantize_block(&mut out);
+        assert_eq!([out[0], out[32], out[64], out[96]], [0.5, -0.5, 0.0, 0.5]);
+        // TQ1_0: a byte holding base-3 digits (d0 d1 d2 d3 d4), most
+        // significant first, stores ceil(v · 256 / 243).
+        let digits = [2u16, 0, 1, 2, 1];
+        let v = digits.iter().fold(0u16, |a, &t| a * 3 + t);
+        let byte = ((v * 256).div_ceil(243)) as u8;
+        let b = BlockTq1_0 { qs: [byte; 48], qh: [0; 4], d: f16::from_f32(1.0).to_le_bytes() };
+        b.dequantize_block(&mut out);
+        for (n, &t) in digits.iter().enumerate() {
+            assert_eq!(out[32 * n], t as f32 - 1.0, "digit {n}");
+        }
+        testing::check_matmul(&testing::synthetic::<BlockTq1_0>(6, 3), 512);
+        testing::check_matmul(&testing::synthetic::<BlockTq2_0>(6, 3), 512);
+        testing::check_blocks_from_bytes::<BlockTq1_0>();
+        testing::check_blocks_from_bytes::<BlockTq2_0>();
     }
 
     #[test]

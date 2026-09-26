@@ -640,20 +640,17 @@ mod synthetic {
 
         let dir = model_dir("unsupported-dtype-llama");
         let model = dir.join("model.gguf");
-        // A llama GGUF whose embedding table is IQ2_XXS (dtype id 16): candle
-        // cannot name the dtype, so the tolerant header would drop the tensor
-        // and the llama loader would later fail with a misleading "cannot
-        // find tensor".  The engine must instead reject the file at load time
-        // with the precise cause.
+        // A llama GGUF whose embedding table is I32 (dtype id 26): neither
+        // candle nor Joshua's raw-format decoders read it, so the tolerant
+        // header would drop the tensor and the llama loader would later fail
+        // with a misleading "cannot find tensor".  The engine must instead
+        // reject the file at load time with the precise cause.  (Raw block
+        // formats such as IQ2_XXS load; see `quant_formats_tests.rs`.)
         let metadata = vec![(
             "general.architecture".to_string(),
             gguf_file::Value::String("llama".to_string()),
         )];
-        let tensors = vec![RawTensor::iq2xxs(
-            "token_embd.weight",
-            vec![0.0f32; 256],
-            &[256],
-        )];
+        let tensors = vec![RawTensor::i32("token_embd.weight", vec![0; 256], &[256])];
         write_raw_gguf(&model, &metadata, &tensors);
 
         let msg = match Engine::new(&model) {
@@ -664,7 +661,7 @@ mod synthetic {
             msg.contains("token_embd.weight"),
             "error should name the tensor, got: {msg}"
         );
-        assert!(msg.contains("dtype id 16"), "error should give the dtype, got: {msg}");
+        assert!(msg.contains("dtype id 26"), "error should give the dtype, got: {msg}");
         assert!(
             !msg.contains("cannot find tensor"),
             "error must not be the misleading missing-weight message, got: {msg}"

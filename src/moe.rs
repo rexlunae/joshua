@@ -830,6 +830,7 @@ mod tests {
             metadata: HashMap::new(),
             tensor_infos,
             tensor_data_offset: 64,
+            external: None,
         };
         let et = ExpertTensor::lookup(&ct, "t", "blk.0.ffn_up_exps.weight", n_expert)?;
         assert_eq!(et.expert_shape(), (out, inn));

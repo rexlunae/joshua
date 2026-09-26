@@ -40,6 +40,8 @@ pub mod mmap_tensor;
 pub mod mhc;
 pub mod moe;
 pub mod mxfp4;
+pub mod iquants;
+pub mod iq_grids;
 pub mod native_session;
 pub mod ngram;
 pub mod model;
