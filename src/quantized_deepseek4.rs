@@ -295,18 +295,27 @@ impl Config {
 
 type RotaryEmbedding = crate::attention::Rope;
 
-/// The interleaved RoPE table for `base`, YaRN-scaled when `yarn` (with the
-/// model's yarn config).  Table covers token positions `[0, max_seq)`.
+/// The interleaved RoPE table for `base`, YaRN-interpolated when `yarn`
+/// (with the model's yarn config).  Table covers token positions
+/// `[0, max_seq)`.
+///
+/// The table carries no YaRN magnitude factor, and neither does the attention
+/// scale: llama.cpp's `dsv4_rope_attn_factor` passes exactly the reciprocal
+/// of ggml's built-in YaRN mscale so the rotation stays unit-norm, and its
+/// DeepSeek-V4 graph scales scores by a plain 1/sqrt(head_dim).  (DeepSeek-V2
+/// and V3 differ: they fold mscale² into the softmax scale.)  llama.cpp's
+/// converter never writes `rope.scaling.yarn_log_multiplier` for V4, so this
+/// only matters for GGUFs from other converters.
 fn rope_table(cfg: &Config, dev: &Device, base: f32, yarn: bool, max_seq: usize) -> Result<RotaryEmbedding> {
     let dim = cfg.rope_head_dim;
-    let (inv_freq, mscale) = match cfg.yarn.as_ref().filter(|_| yarn) {
-        Some(y) => (crate::yarn::inv_freq(dim, base, y), y.mscale()),
+    let inv_freq = match cfg.yarn.as_ref().filter(|_| yarn) {
+        Some(y) => crate::yarn::inv_freq(dim, base, y),
         None => {
             assert!(!yarn, "yarn rope requested without yarn config");
-            (crate::attention::inv_freq(dim, base), 1.0)
+            crate::attention::inv_freq(dim, base)
         }
     };
-    RotaryEmbedding::from_inv_freq(inv_freq, max_seq, mscale, crate::attention::RopeStyle::Interleaved, dev)
+    RotaryEmbedding::from_inv_freq(inv_freq, max_seq, 1.0, crate::attention::RopeStyle::Interleaved, dev)
 }
 
 // ─── Linear helpers ─────────────────────────────────────────────────────────
@@ -4442,6 +4451,73 @@ mod tests {
         assert!(
             msg.contains("rope"),
             "error should name the rotary-dimension metadata, got: {msg}"
+        );
+    }
+
+    /// The compressed layers' rope is YaRN-interpolated but carries no
+    /// magnitude factor, even when the GGUF sets a YaRN log multiplier:
+    /// llama.cpp cancels ggml's YaRN mscale for DeepSeek-V4 and keeps the
+    /// attention scale at 1/sqrt(head_dim).
+    #[test]
+    fn yarn_rope_is_interpolated_but_unit_norm() {
+        let mut m = md();
+        let f32v = gguf_file::Value::F32;
+        m.insert(
+            "deepseek4.rope.dimension_count".into(),
+            gguf_file::Value::U32(64),
+        );
+        m.insert(
+            "deepseek4.rope.scaling.type".into(),
+            gguf_file::Value::String("yarn".into()),
+        );
+        m.insert("deepseek4.rope.scaling.factor".into(), f32v(16.0));
+        m.insert(
+            "deepseek4.rope.scaling.original_context_length".into(),
+            gguf_file::Value::U32(65536),
+        );
+        m.insert(
+            "deepseek4.rope.scaling.yarn_log_multiplier".into(),
+            f32v(0.1),
+        );
+        let cfg = Config::from_metadata(&m).unwrap();
+        assert!(cfg.yarn.is_some());
+        let base = 160_000f32;
+        let r = rope_table(&cfg, &Device::Cpu, base, true, 4096).unwrap();
+
+        // Rotate the unit vector (1, 0) of every pair at every position: the
+        // result is (cos, sin) of the pair's angle, times any magnitude.
+        let seq = 4096;
+        let ones: Vec<f32> = (0..seq * 32).flat_map(|_| [1f32, 0.0]).collect();
+        let x = Tensor::from_vec(ones, (1, 1, seq, 64), &Device::Cpu).unwrap();
+        let y = r.apply(&x, 0).unwrap().reshape((seq, 32, 2)).unwrap();
+        let norm = y.sqr().unwrap().sum(2).unwrap();
+        let worst = (norm - 1.0)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .max(0)
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(worst < 1e-5, "rope table is not unit-norm: {worst}");
+
+        // Interpolation still applies: at position 1 the angle of the lowest
+        // frequency pair is its inverse frequency divided by the factor.
+        let want = base.powf(-62.0 / 64.0) / 16.0;
+        let got = y
+            .get(1)
+            .unwrap()
+            .get(31)
+            .unwrap()
+            .get(1)
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(
+            (got - want).abs() <= 1e-3 * want,
+            "lowest-frequency angle {got}, want {want}"
         );
     }
 }

@@ -1065,3 +1065,135 @@ fn deepseek4_long_prefill_consistency() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Largest relative difference between two logit vectors.
+fn max_rel_diff(a: &[f32], b: &[f32]) -> f32 {
+    assert_eq!(a.len(), b.len(), "vocab widths");
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).abs() / x.abs().max(y.abs()).max(1.0e-3))
+        .fold(0.0, f32::max)
+}
+
+/// A causal model gives the same last-token logits for a prompt whether it
+/// is prefilled in one pass, streamed in chunks, or fed one token at a
+/// time.  On the compressor fixture (layer 0 is a CSA layer: window 8,
+/// ratio 4, indexer top-k 2) every length up to the context limit crosses
+/// the thresholds the real model crosses at 128 (window), 512-token chunks
+/// and 2,048 tokens (the indexer starts dropping blocks).
+#[test]
+fn deepseek4_compressed_prefill_matches_decode_at_every_length() {
+    let dir = common::model_dir("deepseek4-causal-bisect");
+    let model = dir.join("model.gguf");
+    common::write_tiny_deepseek4_gguf_compress(&model);
+    // Context is 32: the longest prompt plus one decode step must fit.
+    let tokens: Vec<u32> = (0..31u32).map(|i| (i * 7 + 5) % 16).collect();
+
+    // Token-by-token: one decode step per position.
+    let mut m = load(&model, true);
+    let decode: Vec<Vec<f32>> = tokens
+        .iter()
+        .enumerate()
+        .map(|(p, t)| logits(&mut m, &[*t], p))
+        .collect();
+
+    let mut report = Vec::new();
+    let mut worst = 0.0f32;
+    for len in 1..=tokens.len() {
+        let prompt = &tokens[..len];
+        let mut m = load(&model, true);
+        let one_pass = logits(&mut m, prompt, 0);
+        let mut row = format!(
+            "len {len:2}: decode {:.2e}",
+            max_rel_diff(&one_pass, &decode[len - 1])
+        );
+        worst = worst.max(max_rel_diff(&one_pass, &decode[len - 1]));
+        for chunk in [3usize, 4, 5, 8] {
+            let chunks: Vec<joshua::stream_prefill::Chunk> = (0..len)
+                .step_by(chunk)
+                .map(|s| joshua::stream_prefill::Chunk {
+                    tokens: &prompt[s..(s + chunk).min(len)],
+                    pos: s,
+                })
+                .collect();
+            let mut m = load(&model, true);
+            let streamed: Vec<f32> = m
+                .prefill_streamed(&chunks, &Device::Cpu)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            let d = max_rel_diff(&one_pass, &streamed);
+            worst = worst.max(d);
+            row.push_str(&format!(" | chunk{chunk} {d:.2e}"));
+        }
+        report.push(row);
+    }
+    eprintln!("{}", report.join("\n"));
+    assert!(
+        worst <= 1.0e-3,
+        "prefill and decode disagree (worst {worst:.3e}):\n{}",
+        report.join("\n")
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The same consistency across the HCA layer's ratio-128 blocks: layer 1
+/// compresses every 128 tokens, which the real model's HCA layers first do
+/// past 128 tokens (a long chat prompt, not a short one).  One-pass prefill,
+/// streamed chunks landing on and off the block boundary, and
+/// token-by-token decode must agree at lengths straddling 128 and 256.
+#[test]
+fn deepseek4_hca_prefill_matches_decode_across_blocks() {
+    let dir = common::model_dir("deepseek4-hca-bisect");
+    let model = dir.join("model.gguf");
+    common::write_tiny_deepseek4_gguf_compress_hca(&model);
+    let tokens: Vec<u32> = (0..300u32).map(|i| (i * 7 + 5) % 16).collect();
+
+    let mut m = load(&model, true);
+    let decode: Vec<Vec<f32>> = tokens
+        .iter()
+        .enumerate()
+        .map(|(p, t)| logits(&mut m, &[*t], p))
+        .collect();
+
+    let mut report = Vec::new();
+    let mut worst = 0.0f32;
+    for len in [100usize, 127, 128, 129, 130, 160, 255, 256, 257, 300] {
+        let prompt = &tokens[..len];
+        let mut m = load(&model, true);
+        let one_pass = logits(&mut m, prompt, 0);
+        let d = max_rel_diff(&one_pass, &decode[len - 1]);
+        worst = worst.max(d);
+        let mut row = format!("len {len:3}: decode {d:.2e}");
+        for chunk in [64usize, 100, 128, 512] {
+            let chunks: Vec<joshua::stream_prefill::Chunk> = (0..len)
+                .step_by(chunk)
+                .map(|s| joshua::stream_prefill::Chunk {
+                    tokens: &prompt[s..(s + chunk).min(len)],
+                    pos: s,
+                })
+                .collect();
+            let mut m = load(&model, true);
+            let streamed: Vec<f32> = m
+                .prefill_streamed(&chunks, &Device::Cpu)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            let d = max_rel_diff(&one_pass, &streamed);
+            worst = worst.max(d);
+            row.push_str(&format!(" | chunk{chunk} {d:.2e}"));
+        }
+        report.push(row);
+    }
+    eprintln!("{}", report.join("\n"));
+    assert!(
+        worst <= 1.0e-3,
+        "prefill and decode disagree across HCA blocks (worst {worst:.3e}):\n{}",
+        report.join("\n")
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}

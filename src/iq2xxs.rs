@@ -377,6 +377,37 @@ mod tests {
         }
     }
 
+    /// Prefill batches: up to a whole prefill chunk of rows per expert.
+    /// Every row must match the single-row result exactly (the m-tile only
+    /// changes which rows share a weight decode, never the arithmetic).
+    #[test]
+    fn matmul_rows_independent_of_batch_size() {
+        let k = 512;
+        let n = 5;
+        let blocks = include_bytes!("../tests/data/iq2xxs_blocks.bin");
+        let n_blocks = blocks.len() / BLOCK_BYTES;
+        let rhs: Vec<BlockIq2Xxs> = (0..n * (k / QK_IQ2_XXS))
+            .map(|i| {
+                blocks_from_bytes(
+                    &blocks[(i % n_blocks) * BLOCK_BYTES..(i % n_blocks + 1) * BLOCK_BYTES],
+                )
+                .unwrap()[0]
+            })
+            .collect();
+        for m in [37usize, 300, 512] {
+            let lhs: Vec<f32> = (0..m * k)
+                .map(|i| ((i * 7919) % 1000) as f32 / 100.0 - 5.0)
+                .collect();
+            let mut batched = vec![0f32; m * n];
+            matmul_t((m, k, n), &lhs, &rhs, &mut batched).unwrap();
+            for i in 0..m {
+                let mut single = vec![0f32; n];
+                matmul_t((1, k, n), &lhs[i * k..(i + 1) * k], &rhs, &mut single).unwrap();
+                assert_eq!(&batched[i * n..(i + 1) * n], &single[..], "m={m} row {i}");
+            }
+        }
+    }
+
     /// Error paths are explicit rather than silently wrong.
     #[test]
     fn matmul_rejects_bad_shapes() {
