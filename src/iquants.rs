@@ -329,29 +329,90 @@ fn iq4_nibbles(out: &mut [f32], qs: &[u8], d: f32) {
     }
 }
 
+/// [`KVALUES_IQ4NL`] as f32, the lookup table of [`iq4_decode_avx512`].
+#[cfg(target_arch = "x86_64")]
+static KVALUES_IQ4NL_F32: [f32; 16] = {
+    let mut t = [0f32; 16];
+    let mut i = 0;
+    while i < 16 {
+        t[i] = KVALUES_IQ4NL[i] as f32;
+        i += 1;
+    }
+    t
+};
+
+/// [`iq4_nibbles`] into two 16-lane registers: the 16 bytes widen to
+/// lanes, their low and high nibbles each index the value table in one
+/// `vpermps`, then one multiply by `d` — the same product as the scalar
+/// decode, so the two agree bit for bit.
+///
+/// # Safety
+/// AVX-512F must be available and `qs` must hold at least 16 bytes.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx2,fma")]
+#[inline]
+unsafe fn iq4_decode_avx512(qs: &[u8], d: f32) -> [std::arch::x86_64::__m512; 2] {
+    use std::arch::x86_64::*;
+    debug_assert!(qs.len() >= 16);
+    let table = _mm512_loadu_ps(KVALUES_IQ4NL_F32.as_ptr());
+    let d = _mm512_set1_ps(d);
+    let bytes = _mm512_cvtepu8_epi32(_mm_loadu_si128(qs.as_ptr() as *const __m128i));
+    let lo = _mm512_and_si512(bytes, _mm512_set1_epi32(0x0F));
+    let hi = _mm512_srli_epi32(bytes, 4);
+    [
+        _mm512_mul_ps(_mm512_permutexvar_ps(lo, table), d),
+        _mm512_mul_ps(_mm512_permutexvar_ps(hi, table), d),
+    ]
+}
+
 impl RawBlock for BlockIq4Nl {
     raw_block_consts!(20, QK4_NL, "iq4_nl");
+    const DECODE_AVX512: bool = true;
 
     fn dequantize_block(&self, out: &mut [f32]) {
         iq4_nibbles(out, &self.qs, f16_at(self.d));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx2,fma")]
+    #[inline]
+    unsafe fn decode_avx512(&self, _c: usize) -> [std::arch::x86_64::__m512; 2] {
+        iq4_decode_avx512(&self.qs, f16_at(self.d))
+    }
+}
+
+impl BlockIq4Xs {
+    /// The scale of 32-value group `ib`: the super-scale times the 6-bit
+    /// sub-scale, offset by 32.
+    fn group_scale(&self, ib: usize) -> f32 {
+        let scales_h = u16::from_le_bytes(self.scales_h);
+        let lo = (self.scales_l[ib / 2] >> (4 * (ib % 2))) & 0xf;
+        let ls = lo as i32 | ((((scales_h >> (2 * ib)) & 3) as i32) << 4);
+        f16_at(self.d) * (ls - 32) as f32
     }
 }
 
 impl RawBlock for BlockIq4Xs {
     raw_block_consts!(23, QK_K, "iq4_xs");
 
+    const DECODE_AVX512: bool = true;
+
     fn dequantize_block(&self, out: &mut [f32]) {
-        let d = f16_at(self.d);
-        let scales_h = u16::from_le_bytes(self.scales_h);
         for ib in 0..QK_K / 32 {
-            let lo = (self.scales_l[ib / 2] >> (4 * (ib % 2))) & 0xf;
-            let ls = lo as i32 | ((((scales_h >> (2 * ib)) & 3) as i32) << 4);
             iq4_nibbles(
                 &mut out[32 * ib..],
                 &self.qs[16 * ib..],
-                d * (ls - 32) as f32,
+                self.group_scale(ib),
             );
         }
+    }
+
+    /// Group `c`'s 32 values: its 16 bytes of nibbles under its scale.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx2,fma")]
+    #[inline]
+    unsafe fn decode_avx512(&self, c: usize) -> [std::arch::x86_64::__m512; 2] {
+        iq4_decode_avx512(&self.qs[16 * c..16 * c + 16], self.group_scale(c))
     }
 }
 
@@ -375,6 +436,14 @@ mod tests {
         check::<BlockIq1M>();
         check::<BlockIq4Nl>();
         check::<BlockIq4Xs>();
+    }
+
+    /// The AVX-512 decodes reproduce the scalar ones exactly, and the fused
+    /// kernel matches the portable one.
+    #[test]
+    fn iq4_avx512_decodes_match_scalar() {
+        testing::check_decode_avx512(&testing::synthetic::<BlockIq4Xs>(8, 11));
+        testing::check_decode_avx512(&testing::synthetic::<BlockIq4Nl>(64, 11));
     }
 
     #[test]
