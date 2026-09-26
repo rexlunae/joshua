@@ -19,7 +19,7 @@ framework) and [tokenizers](https://github.com/huggingface/tokenizers).
 | **Streaming** | Server-Sent Events (SSE) for token-by-token streaming |
 | **GGUF support** | Llama/Mistral/Mixtral, Gemma 1–3, every GLM generation (ChatGLM2/3, GLM-4, GLM-4.1V text, GLM-OCR, GLM-4.5/4.6/4.7 incl. Air and Flash, GLM-5/5.1/5.2, GLM-5.3-Flash), LFM2, Phi-2, Phi-3, every Qwen generation (Qwen 1, Qwen1.5/2/2.5 incl. MoE, Qwen2/2.5-VL and Qwen3-VL text, Qwen3, Qwen3-MoE, Qwen3-Next, Qwen3.5 dense/MoE, Qwen3.8-Flash-Next / `qwen4exp`, Bonsai 1-bit / 2-bit), DeepSeek-MoE, DeepSeek-V2/V2.5/V3/R1, DeepSeek-V4 / V4-Flash, DeepSeek-V4.1-Flash, every Kimi generation (Kimi-K2 / K2.5, Moonlight, Kimi-VL text, Kimi-Linear, Kimi K3) (dense DeepSeek-LLM / Coder / R1-Distill load as `llama` / `qwen2`) |
 | **Quant formats** | Every GGUF weight format llama.cpp writes: F32/F16/BF16, Q4_0…Q8_1 and the k-quants (candle's kernels), plus in-mapping decoders for the i-quants small-model GGUFs use (IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS), BitNet's ternary TQ1_0 / TQ2_0, MXFP4 / NVFP4 and Bonsai's Q1_0 / Q2_0 — each bit-identical to llama.cpp's `dequantize_row_*`, with matmuls that keep the blocks in the mmap instead of materialising f32.  One generic `RawBlock` layer serves every loader, candle's stock ones (Llama, Gemma, Phi, …) included |
-| **Fused SIMD kernels** | AVX-512 and AVX2 (x86-64) and NEON (aarch64) dequant+dot fusion — the weights decode inside the dot in registers — for Q8_0/Q2_K/Q4_K, IQ2_XXS, MXFP4 and Bonsai's Q1_0/Q2_0 (and IQ4_XS / IQ4_NL on AVX-512), plus parallel SIMD matmuls for the other k-quants; the widest ISA the CPU has is picked at startup (`JOSHUA_SIMD` overrides) |
+| **Fused SIMD kernels** | AVX-512 and AVX2 (x86-64) and NEON (aarch64) dequant+dot fusion — the weights decode inside the dot in registers — for Q8_0/Q2_K/Q4_K, IQ2_XXS, MXFP4 and Bonsai's Q1_0/Q2_0 (and the other i-quants on AVX-512), plus parallel SIMD matmuls for the other k-quants; the widest ISA the CPU has is picked at startup (`JOSHUA_SIMD` overrides) |
 | **Chat templates** | Renders the model's own `tokenizer.chat_template` from the GGUF (Jinja via pure-Rust minijinja); ChatML fallback |
 | **Tool calling** | OpenAI-compatible `tools` / `tool_calls`, parsing Hermes/Qwen, Mistral, and Llama-3 call formats |
 | **Embeddings** | Dense sentence embeddings for llama / qwen2 / qwen3 embedding models, with GGUF pooling metadata |
@@ -1181,7 +1181,7 @@ multicast interoperability or LAN throughput.
 - [x] DeepSeek-V4 sparse-attention MoE loader (Hyper-Connections, CSA/HCA KV compression, Lightning Indexer, IQ2_XXS experts)
 - [x] DeepSeek-V2/V3 MLA latent cache (~70× smaller KV cache, prefill == incremental)
 - [x] Fused AVX2 k-quant kernels and SIMD quantized matmuls (CPU prefill/decode speed-ups)
-- [x] AVX-512 backend: 16-lane fused kernels for the k-quants, IQ2_XXS, IQ4_XS / IQ4_NL, MXFP4 and Q1_0/Q2_0 (the other i-quants, TQ1_0/TQ2_0 and NVFP4 decode a block at a time into the SIMD dot)
+- [x] AVX-512 backend: 16-lane fused kernels for the k-quants, every i-quant (IQ1_S … IQ4_XS), MXFP4 and Q1_0/Q2_0 (TQ1_0/TQ2_0 and NVFP4 decode a block at a time into the SIMD dot)
 - [x] Every llama.cpp weight format, including the i-quants and ternary formats, for every loader
 - [x] Sparse-MoE weight management (hot-weight pinning, mlock with memlock-limit check, prefill streaming)
 - [x] Models larger than VRAM (host-resident experts with the dense set on the GPU, weights shared across sessions, quantized embedding table)
