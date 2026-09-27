@@ -251,9 +251,29 @@ pub(super) fn create_layouts(device: &ash::Device, nbuf: u32) -> Result<Layouts>
     Ok(Layouts { dsl, layout })
 }
 
-pub(super) fn create_pipe(device: &ash::Device, layouts: &Layouts, nbuf: u32, source: &str) -> Result<Pipe> {
-    let spirv = glsl_to_spirv(source)?;
-    let module = unsafe { device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&spirv), None) }
+/// Compile a WGSL compute shader (entry point `main`) to SPIR-V — for the
+/// kernels that need what naga's GLSL front end lacks, such as the packed
+/// int8 dot product (`dot4I8Packed`, emitted as `OpSDot`).
+pub(super) fn wgsl_to_spirv(source: &str) -> Result<Vec<u32>> {
+    use naga::back::spv;
+    use naga::valid::{Capabilities, ValidationFlags, Validator};
+    let module = naga::front::wgsl::parse_str(source).map_err(|e| {
+        Error::Msg(format!("vulkan shader parse failed: {}\n--- source ---\n{source}", e.emit_to_string(source)))
+    })?;
+    let info = Validator::new(ValidationFlags::all(), Capabilities::all())
+        .validate(&module)
+        .map_err(|e| Error::Msg(format!("vulkan shader validation failed: {e:?}\n--- source ---\n{source}")))?;
+    let mut words = Vec::new();
+    let pipeline_options = spv::PipelineOptions { shader_stage: naga::ShaderStage::Compute, entry_point: "main".to_string() };
+    spv::Writer::new(&spv::Options::default())
+        .map_err(|e| Error::Msg(format!("vulkan spv writer init failed: {e:?}")))?
+        .write(&module, &info, Some(&pipeline_options), &None, &mut words)
+        .map_err(|e| Error::Msg(format!("vulkan spv write failed: {e:?}")))?;
+    Ok(words)
+}
+
+pub(super) fn create_pipe(device: &ash::Device, layouts: &Layouts, nbuf: u32, spirv: &[u32]) -> Result<Pipe> {
+    let module = unsafe { device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(spirv), None) }
         .map_err(|e| Error::Msg(format!("vulkan create_shader_module failed: {e:?}")))?;
     let entry = std::ffi::CString::new("main").unwrap();
     let stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(module).name(&entry);
@@ -602,6 +622,20 @@ fn row_grid(rows: usize, z: usize, max_x: u32) -> [u32; 3] {
 impl VulkanDevice {
     /// Launch `key` (compiling it with `src` on first use) over `groups`.
     pub(crate) fn launch(&self, key: &str, src: impl FnOnce(usize) -> String, bufs: &[Buf], push: Push, ix: &[Idx], groups: [u32; 3]) -> Result<()> {
+        self.launch_spirv(key, |wg| glsl_to_spirv(&src(wg)), bufs, push, ix, groups)
+    }
+
+    /// [`Self::launch`] for a kernel whose `src` yields SPIR-V directly
+    /// (e.g. through [`wgsl_to_spirv`]).
+    pub(crate) fn launch_spirv(
+        &self,
+        key: &str,
+        src: impl FnOnce(usize) -> Result<Vec<u32>>,
+        bufs: &[Buf],
+        push: Push,
+        ix: &[Idx],
+        groups: [u32; 3],
+    ) -> Result<()> {
         if groups.contains(&0) {
             return Ok(());
         }
@@ -630,14 +664,14 @@ impl VulkanDevice {
     }
 
     /// The cached pipeline for `key`, compiled with the device's `WG`.
-    fn pipeline(&self, key: &str, nbuf: u32, src: impl FnOnce(usize) -> String) -> Result<std::sync::Arc<Pipe>> {
+    fn pipeline(&self, key: &str, nbuf: u32, src: impl FnOnce(usize) -> Result<Vec<u32>>) -> Result<std::sync::Arc<Pipe>> {
         let mut pipes = self.pipes();
         if let Some(p) = pipes.get(key) {
             return Ok(p.clone());
         }
         let wg = self.limits().wg;
         let layouts = self.layouts(nbuf)?;
-        let pipe = create_pipe(self.ash(), &layouts, nbuf, &src(wg))?;
+        let pipe = create_pipe(self.ash(), &layouts, nbuf, &src(wg)?)?;
         let pipe = std::sync::Arc::new(pipe);
         pipes.insert(key.to_string(), pipe.clone());
         Ok(pipe)
@@ -1061,26 +1095,35 @@ pub fn qtype_code(dtype: crate::quantized::GgmlDType) -> i32 {
     }
 }
 
-/// Which quantized-GEMV kernel a device runs (see [`glsl::k_qgemv`] and
-/// [`glsl::k_qgemv_mali`]).
+/// Which quantized-GEMV kernel a device runs (see [`glsl::k_qgemv`],
+/// [`glsl::k_qgemv_mali`] and [`super::wgsl::k_qgemv_mali_i8`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Qgemv {
     /// One wide work-group per output element.
     Generic,
     /// Arm Mali / Immortalis: small teams, several rows per decode.
     Mali,
+    /// [`Qgemv::Mali`]'s shape on int8 dot products over activations
+    /// quantized per 32 (llama.cpp's Q8_0 rounding); `hw_dot` uses the
+    /// device's `OpSDot`, else a bit-identical polyfill.
+    MaliInt8 { hw_dot: bool },
 }
 
 impl Qgemv {
     /// Arm's PCI vendor id, as `VkPhysicalDeviceProperties::vendorID`.
     pub const ARM_VENDOR_ID: u32 = 0x13B5;
 
-    /// The kernel for a device: `JOSHUA_VULKAN_QGEMV=mali|generic` when set
-    /// (to force either on any device), else the Mali kernel on Arm GPUs.
-    pub fn for_device(vendor_id: u32) -> Self {
+    /// The kernel for a device with `int_dot` (the `shaderIntegerDotProduct`
+    /// feature enabled): `JOSHUA_VULKAN_QGEMV=mali-int8|mali|generic` when
+    /// set (to force one on any device), else on Arm GPUs the int8 kernel
+    /// when the device has the dot-product feature and the float one when
+    /// not.
+    pub fn for_device(vendor_id: u32, int_dot: bool) -> Self {
         match std::env::var("JOSHUA_VULKAN_QGEMV").as_deref() {
+            Ok("mali-int8") => Self::MaliInt8 { hw_dot: int_dot },
             Ok("mali") => Self::Mali,
             Ok("generic") => Self::Generic,
+            _ if vendor_id == Self::ARM_VENDOR_ID && int_dot => Self::MaliInt8 { hw_dot: true },
             _ if vendor_id == Self::ARM_VENDOR_ID => Self::Mali,
             _ => Self::Generic,
         }
@@ -1114,6 +1157,19 @@ pub fn run_qgemv_with(
         Qgemv::Mali => {
             let groups = row_grid(n.div_ceil(glsl::QGEMV_MALI_COLS), m.div_ceil(glsl::QGEMV_MALI_ROWS), lim.max_groups_x);
             d.launch("qgemv_mali", glsl::k_qgemv_mali, &[x, w, out], push, &[], groups)
+        }
+        Qgemv::MaliInt8 { hw_dot } => {
+            // Quantize the activations once, then the int8 GEMV.
+            let nblk = m * k / 32;
+            let xq = d.alloc(crate::DType::U32, m * k / 4)?;
+            let xs = d.alloc(crate::DType::F32, nblk)?;
+            let xsum = d.alloc(crate::DType::U32, 2 * nblk)?;
+            let qpush = Push::default().us(nblk)?.us(xoff)?;
+            d.launch("quant_x8", glsl::k_quant_x8, &[x, xq.buf(), xs.buf(), xsum.buf()], qpush, &[], grid(nblk, lim.wg, 1, lim.max_groups_x))?;
+            let push = Push::default().us(n)?.us(k)?.i(qtype_code(dtype)).us(dtype.block_size())?.us(dtype.type_size())?.i(0).us(m)?;
+            let groups = row_grid(n.div_ceil(glsl::QGEMV_MALI_COLS), m.div_ceil(glsl::QGEMV_MALI_ROWS), lim.max_groups_x);
+            let key = if hw_dot { "qgemv_mali_i8_hw" } else { "qgemv_mali_i8" };
+            d.launch_spirv(key, |_| wgsl_to_spirv(&super::wgsl::k_qgemv_mali_i8(hw_dot)), &[xq.buf(), xs.buf(), xsum.buf(), w, out], push, &[], groups)
         }
     }
 }
@@ -1200,6 +1256,25 @@ mod barrier_tests {
             // AcquireRelease (0x8) and WorkgroupMemory (0x100).
             assert_eq!(constants[&semantics] & 0x108, 0x108);
         }
+    }
+
+    /// The int8 GEMV compiles through naga's WGSL front end; with `hw_dot`
+    /// its dot products are `OpSDot` (opcode 4450), without it none are.
+    #[test]
+    fn wgsl_int8_gemv_emits_sdot_only_with_hw_dot() {
+        let count = |hw: bool| {
+            let words = super::wgsl_to_spirv(&super::super::wgsl::k_qgemv_mali_i8(hw)).unwrap();
+            let (mut cursor, mut n) = (5, 0);
+            while cursor < words.len() {
+                let count = (words[cursor] >> 16) as usize;
+                n += usize::from(words[cursor] & 0xffff == 4450);
+                cursor += count.max(1);
+            }
+            n
+        };
+        assert!(count(true) > 0, "hw_dot must emit OpSDot");
+        assert_eq!(count(false), 0, "the polyfill must not need the feature");
+        glsl_to_spirv(&glsl::k_quant_x8(64)).unwrap();
     }
 
     #[test]

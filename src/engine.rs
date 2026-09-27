@@ -1636,8 +1636,9 @@ impl Engine {
     #[cfg(feature = "vulkan")]
     fn log_vulkan_device(device: &Device) {
         if let Ok(vk) = device.as_vulkan_device() {
+            let lim = vk.limits();
             tracing::info!(
-                "Vulkan device: {} ({}; native kernels {})",
+                "Vulkan device: {} ({}; native kernels {}; quantized GEMV {:?}, int8 dot product {})",
                 vk.name(),
                 if vk.host_unified_memory() {
                     "host-unified memory"
@@ -1649,6 +1650,8 @@ impl Engine {
                 } else {
                     "off"
                 },
+                lim.qgemv,
+                if lim.int_dot { "on" } else { "off" },
             );
         }
     }

@@ -18,6 +18,7 @@
 
 pub mod glsl;
 pub mod kernels;
+pub mod wgsl;
 pub use kernels::{fallback_count, native_enabled, native_exec_count};
 
 use crate::backend::{BackendDevice, BackendStorage};
@@ -49,6 +50,9 @@ pub struct Limits {
     pub host_unified: bool,
     /// The quantized-GEMV kernel for this device ([`kernels::Qgemv`]).
     pub qgemv: kernels::Qgemv,
+    /// Whether the `shaderIntegerDotProduct` feature is enabled (packed
+    /// int8 dot products, SPIR-V `OpSDot`).
+    pub int_dot: bool,
 }
 
 // ─── Memory sub-allocator ────────────────────────────────────────────────────
@@ -293,7 +297,24 @@ fn init_vulkan(gpu_id: usize) -> Result<VulkanDevice> {
     let Some(queue_family) = queue_family.map(|i| i as u32) else { fail!("vulkan: device {name} has no compute queue") };
     let priorities = [1.0f32];
     let qci = [vk::DeviceQueueCreateInfo::default().queue_family_index(queue_family).queue_priorities(&priorities)];
-    let device = match unsafe { instance.create_device(physical, &vk::DeviceCreateInfo::default().queue_create_infos(&qci), None) } {
+    // Packed int8 dot products (Mali's int8 GEMV): enabled when the device
+    // offers VK_KHR_shader_integer_dot_product and its feature.
+    let int_dot_ext = unsafe { instance.enumerate_device_extension_properties(physical) }.unwrap_or_default().iter().any(|e| {
+        e.extension_name_as_c_str().is_ok_and(|n| n == ash::khr::shader_integer_dot_product::NAME)
+    });
+    let int_dot = int_dot_ext && {
+        let mut idp = vk::PhysicalDeviceShaderIntegerDotProductFeatures::default();
+        let mut f2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut idp);
+        unsafe { instance.get_physical_device_features2(physical, &mut f2) };
+        idp.shader_integer_dot_product == vk::TRUE
+    };
+    let ext_names = [ash::khr::shader_integer_dot_product::NAME.as_ptr()];
+    let mut idp_on = vk::PhysicalDeviceShaderIntegerDotProductFeatures::default().shader_integer_dot_product(true);
+    let mut dci = vk::DeviceCreateInfo::default().queue_create_infos(&qci);
+    if int_dot {
+        dci = dci.enabled_extension_names(&ext_names).push_next(&mut idp_on);
+    }
+    let device = match unsafe { instance.create_device(physical, &dci, None) } {
         Ok(d) => d,
         Err(e) => fail!("vulkan: create_device on {name} failed: {e:?}"),
     };
@@ -349,7 +370,8 @@ fn init_vulkan(gpu_id: usize) -> Result<VulkanDevice> {
         max_storage_range: lim.max_storage_buffer_range as u64,
         max_groups_x: lim.max_compute_work_group_count[0].max(1),
         host_unified,
-        qgemv: kernels::Qgemv::for_device(props.vendor_id),
+        qgemv: kernels::Qgemv::for_device(props.vendor_id, int_dot),
+        int_dot,
     };
     let exec = match kernels::Exec::new(&device, queue, queue_family, mem_type) {
         Ok(e) => e,
@@ -1871,8 +1893,22 @@ mod tests {
     }
 
     /// A quantized matmul with a small, block-aligned inner dimension runs
-    /// Both quantized-GEMV kernels — the generic one and the Mali one,
-    /// forced here whatever the device — match a CPU reference for every
+    /// `xs` quantized per 32 values as `k_quant_x8` does (llama.cpp's
+    /// `quantize_row_q8_0`) and dequantized again: `d · round(x / d)`.
+    fn q8_round_trip(xs: &[f32]) -> Vec<f32> {
+        xs.chunks(32)
+            .flat_map(|b| {
+                let amax = b.iter().fold(0f32, |a, v| a.max(v.abs()));
+                let d = amax / 127.0;
+                let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+                b.iter().map(move |v| d * (v * id).round()).collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// Every quantized-GEMV kernel — the generic one, the Mali one and its
+    /// int8 form (with the hardware dot product when the device has it, and
+    /// the polyfill), forced here whatever the device — matches a CPU reference for every
     /// block format, with `N` off the Mali kernel's 16-column tiles and
     /// every `M` up to the GEMV limit (partial 4-row slices included).
     #[test]
@@ -1905,7 +1941,12 @@ mod tests {
             let bytes = q.data()?.into_owned();
             let wbuf = vd.storage_from_slice(&bytes)?;
             let xbuf = vd.storage_from_slice(&xv)?;
-            for kernel in [kernels::Qgemv::Generic, kernels::Qgemv::Mali] {
+            let mut variants = vec![kernels::Qgemv::Generic, kernels::Qgemv::Mali, kernels::Qgemv::MaliInt8 { hw_dot: false }];
+            if vd.limits().int_dot {
+                variants.push(kernels::Qgemv::MaliInt8 { hw_dot: true });
+            }
+            let wv: Vec<f32> = wref.flatten_all()?.to_vec1()?;
+            for kernel in variants {
                 for rows in [1usize, 2, 3, 4, 5, 7, 8, QGEMV_MAX_ROWS] {
                     // Offset the activations by one row to exercise `xoff`.
                     let out = vd.alloc(DType::F32, rows * n)?;
@@ -1914,8 +1955,26 @@ mod tests {
                         crate::CpuStorage::F32(v) => Tensor::from_vec(v, (rows, n), &cpu)?,
                         _ => unreachable!(),
                     };
-                    let want = x.narrow(0, k, rows * k)?.reshape((rows, k))?.matmul(&wref.t()?)?;
-                    close(&got, &want, 1e-4, &format!("{kernel:?} {dtype:?} m={rows}"));
+                    let xr = x.narrow(0, k, rows * k)?;
+                    let want = match kernel {
+                        // The int8 kernel sees the activations as llama.cpp's
+                        // Q8_0 rounding leaves them: compare with exactly that.
+                        kernels::Qgemv::MaliInt8 { .. } => {
+                            let xq = q8_round_trip(&xr.to_vec1()?);
+                            let mut c = vec![0f32; rows * n];
+                            for r in 0..rows {
+                                for j in 0..n {
+                                    c[r * n + j] = (0..k).map(|i| xq[r * k + i] as f64 * wv[j * k + i] as f64).sum::<f64>() as f32;
+                                }
+                            }
+                            Tensor::from_vec(c, (rows, n), &cpu)?
+                        }
+                        _ => xr.reshape((rows, k))?.matmul(&wref.t()?)?,
+                    };
+                    // The int8 path is checked against its own exact
+                    // reference, so it is held tighter (it agrees within 2e-6).
+                    let tol = if matches!(kernel, kernels::Qgemv::MaliInt8 { .. }) { 1e-5 } else { 1e-4 };
+                    close(&got, &want, tol, &format!("{kernel:?} {dtype:?} m={rows}"));
                 }
             }
         }

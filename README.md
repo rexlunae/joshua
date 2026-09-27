@@ -235,7 +235,8 @@ experts of an MoE model stay on the CPU expert kernels, and
 `--dense-placement auto` measures whether the device beats the CPU on the
 quantized matmul before moving the dense set there.  On Arm Mali /
 Immortalis GPUs (e.g. the Orange Pi 6's Immortalis-G720) Vulkan runs a
-Mali-shaped quantized GEMV.  See
+Mali-shaped quantized GEMV, on packed int8 dot products when the driver
+offers them.  See
 [`docs/accelerator-backends.md`](docs/accelerator-backends.md) for the
 design, the environment variables and the limits.
 
@@ -587,7 +588,7 @@ prints the dense/expert split of any GGUF to sanity-check a new model.
 | `JOSHUA_OPENCL_CHECK_NAN` | `1` counts NaNs on the device after every native f32 launch and names the first op that produced one |
 | `JOSHUA_OPENCL_BUILD_OPTS` | Extra options for the OpenCL kernel compiler (e.g. `-cl-opt-disable`) |
 | `JOSHUA_OPENCL_QGEMV` | `v1` runs the IQ2_XXS / Q2_K matmuls through the one-row quantized GEMV instead of the multi-row kernel (bisecting) |
-| `JOSHUA_VULKAN_QGEMV` | `mali` / `generic` forces the Mali-shaped quantized GEMV (the default on Arm GPUs) or the generic one on any Vulkan device |
+| `JOSHUA_VULKAN_QGEMV` | `mali-int8` / `mali` / `generic` forces the Mali GEMV on int8 dot products (the default on Arm GPUs that have them), the float Mali GEMV or the generic one on any Vulkan device |
 | `JOSHUA_MAX_CONCURRENCY` | Cap on simultaneous generations/embeddings (same as `--max-concurrency`) |
 | `JOSHUA_MAX_OUTPUT_TOKENS` | Hard ceiling on generated tokens per request (same as `--max-output-tokens`) |
 | `JOSHUA_WHISPER_MODEL` | Whisper model directory mounted at `/v1/audio/transcriptions` (same as `--whisper-model`) |
