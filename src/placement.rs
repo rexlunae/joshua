@@ -271,6 +271,192 @@ pub fn resolve_expert_placement(
     }
 }
 
+// ─── Auto-engaged VRAM expert cache (#110) ──────────────────────────────────
+
+/// The operator's `--vram-expert-cache` setting.
+///
+/// The CLI parses `auto` (size the cache from the device's free memory at
+/// load), a fixed MiB budget, and `0`; no flag is its own state.  Unset and
+/// `0` must stay distinct now that `--expert-placement auto` may engage a
+/// partial cache by itself (#110): `0` is the explicit opt-out, while unset
+/// lets the engine decide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VramExpertCache {
+    /// No `--vram-expert-cache` flag: `--expert-placement auto` may engage a
+    /// bounded VRAM expert cache over the host pool when the routed experts
+    /// do not fit the device and the leftover memory is worth a cache
+    /// ([`auto_vram_expert_cache`]).
+    #[default]
+    Unset,
+    /// `--vram-expert-cache 0`: never build a device expert pool.
+    Disabled,
+    /// `--vram-expert-cache auto`: size the cache from the device's free
+    /// memory at load (device free − dense − headroom − scratch − KV).
+    Auto,
+    /// `--vram-expert-cache <MiB>`: a fixed byte budget.
+    Bytes(u64),
+}
+
+/// Smallest partial cache `--expert-placement auto` engages by default
+/// (#110): the byte budget must hold at least this share (numerator,
+/// denominator) of the routed-expert device footprint.
+///
+/// The Arc Pro B50 in the #110 discussion measured a 2.4 GiB budget against
+/// a ~72 GiB routed-expert pool — 3.3% residency: every decode step missed,
+/// the background uploader saturated the bus, and decode regressed hard.
+/// Below the floor the safer default is all-host placement, unchanged from
+/// before #110.
+pub const AUTO_VRAM_CACHE_MIN_RESIDENCY: (u64, u64) = (1, 10);
+
+/// Why `--expert-placement auto` kept the all-host expert placement instead
+/// of engaging a partial VRAM expert cache (#110).
+///
+/// [`AutoVramCacheDecline::NotAuto`], [`AutoVramCacheDecline::NotHost`] and
+/// [`AutoVramCacheDecline::NotCacheCapable`] mean the decision was not
+/// applicable (the caller state made it moot — nothing to log); the rest
+/// are real declines worth telling the operator about, with the lever that
+/// forces the cache anyway.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum AutoVramCacheDecline {
+    /// The expert placement was chosen explicitly (not `auto`).
+    NotAuto,
+    /// The routed experts did not fall back to the host: the whole model
+    /// fits the device (or the operator chose `device`), so they are
+    /// already on the card.
+    NotHost,
+    /// The architecture has no device form for its routed experts.
+    NotCacheCapable,
+    /// No device memory budget: no probe and no `--vram-budget`.
+    NoBudget,
+    /// The model has no routed-expert device footprint (nothing to cache).
+    NoExperts,
+    /// The device memory left after the dense set, the placement headroom,
+    /// the scratch and the KV reserve is zero.
+    ZeroLeftover,
+    /// The budget would hold less than [`AUTO_VRAM_CACHE_MIN_RESIDENCY`] of
+    /// the routed experts (the measured percent) — the cache would turn
+    /// over every step.
+    TooSmallResidency(u64),
+    /// The placement probe measured the device *decoding* slower than
+    /// CPU-BLAS (the measured speedup): resident experts would run on
+    /// slower kernels than the host's SIMD ones.
+    DeviceSlower(f64),
+}
+
+impl AutoVramCacheDecline {
+    /// Whether the decline applies to a real cache candidate (worth a log
+    /// line); `false` means the decision was simply not applicable.
+    pub fn applicable(&self) -> bool {
+        !matches!(
+            self,
+            AutoVramCacheDecline::NotAuto
+                | AutoVramCacheDecline::NotHost
+                | AutoVramCacheDecline::NotCacheCapable
+        )
+    }
+
+    /// One log-friendly clause explaining the decline.
+    pub fn describe(&self) -> String {
+        match self {
+            AutoVramCacheDecline::NotAuto => "the expert placement was not `auto`".to_string(),
+            AutoVramCacheDecline::NotHost => {
+                "the routed experts did not fall back to the host".to_string()
+            }
+            AutoVramCacheDecline::NotCacheCapable => {
+                "the architecture has no device form for its routed experts".to_string()
+            }
+            AutoVramCacheDecline::NoBudget => {
+                "no device memory budget (no probe and no --vram-budget)".to_string()
+            }
+            AutoVramCacheDecline::NoExperts => {
+                "the model has no routed experts to cache".to_string()
+            }
+            AutoVramCacheDecline::ZeroLeftover => {
+                "no device memory is left after the dense set, headroom, scratch and KV reserve"
+                    .to_string()
+            }
+            AutoVramCacheDecline::TooSmallResidency(pct) => format!(
+                "the leftover device memory holds {pct}% of the routed experts (below the {:.0}% floor); the cache would turn over every step",
+                100.0 * AUTO_VRAM_CACHE_MIN_RESIDENCY.0 as f64 / AUTO_VRAM_CACHE_MIN_RESIDENCY.1 as f64,
+            ),
+            AutoVramCacheDecline::DeviceSlower(speedup) => format!(
+                "the placement probe measured decode at {speedup:.2}x of CPU-BLAS (the device is slower than the CPU for the dense set)"
+            ),
+        }
+    }
+}
+
+/// Decide whether `--expert-placement auto` — which resolved to
+/// [`ResolvedPlacement::Host`] because the routed experts do not fit the
+/// device's memory — should still engage a *bounded* VRAM expert cache over
+/// the host pool, sized from the leftover device memory at load (#110), and
+/// if not, why not.  `Ok(())` engages (the caller sizes it as
+/// `--vram-expert-cache auto`); the error names the decline.
+///
+/// Conservative by design — the #110 discussion measured a hard decode
+/// regression on an Arc Pro B50 whose 2.4 GiB leftover held only 3.3% of
+/// the routed experts:
+///
+/// * only an `Auto` request engages (an explicit `host` is the documented
+///   opt-out; an explicit `device` is honoured elsewhere);
+/// * only a *fallback* to `Host` engages — the `Device` placement already
+///   runs the experts on the card;
+/// * only an architecture whose device expert form *is* the cache engages
+///   (`deepseek4` on OpenCL/SYCL); the caller passes that as
+///   `cache_capable`;
+/// * the leftover device budget (`cache_budget_bytes`, computed by
+///   [`device_expert_cache_bytes`] from the probe or `--vram-budget`) must
+///   be known and non-zero;
+/// * it must hold at least [`AUTO_VRAM_CACHE_MIN_RESIDENCY`] of the
+///   routed-expert device footprint (`expert_device_bytes`), so the cache
+///   does not turn over every step;
+/// * a placement probe that measured the device *decoding* slower than
+///   CPU-BLAS (`probe_decode_speedup` below 1.0) keeps the cache off — the
+///   cache only affects decode, and resident experts would run on slower
+///   kernels than the host's.  No probe (`None`) leaves the size rule in
+///   charge.
+pub fn auto_vram_expert_cache(
+    requested: ExpertPlacement,
+    resolved: ResolvedPlacement,
+    cache_capable: bool,
+    cache_budget_bytes: Option<u64>,
+    expert_device_bytes: u64,
+    probe_decode_speedup: Option<f64>,
+) -> Result<(), AutoVramCacheDecline> {
+    if requested != ExpertPlacement::Auto {
+        return Err(AutoVramCacheDecline::NotAuto);
+    }
+    if resolved != ResolvedPlacement::Host {
+        return Err(AutoVramCacheDecline::NotHost);
+    }
+    if !cache_capable {
+        return Err(AutoVramCacheDecline::NotCacheCapable);
+    }
+    let Some(budget) = cache_budget_bytes else {
+        return Err(AutoVramCacheDecline::NoBudget);
+    };
+    if expert_device_bytes == 0 {
+        return Err(AutoVramCacheDecline::NoExperts);
+    }
+    if budget == 0 {
+        return Err(AutoVramCacheDecline::ZeroLeftover);
+    }
+    let (num, den) = AUTO_VRAM_CACHE_MIN_RESIDENCY;
+    // budget/expert >= num/den  is  budget*den >= expert*num; saturating on
+    // both sides keeps a huge probe figure from wrapping into a decline.
+    if budget.saturating_mul(den) < expert_device_bytes.saturating_mul(num) {
+        // The measured percent, in u128 so a huge budget cannot overflow.
+        let pct = (100u128 * budget as u128 / expert_device_bytes as u128) as u64;
+        return Err(AutoVramCacheDecline::TooSmallResidency(pct));
+    }
+    if probe_decode_speedup.is_some_and(|s| s < 1.0) {
+        return Err(AutoVramCacheDecline::DeviceSlower(
+            probe_decode_speedup.unwrap_or(0.0),
+        ));
+    }
+    Ok(())
+}
+
 // ─── Dense placement (where the dense set lives) ─────────────────────────────
 
 /// Where a model's dense set — embeddings, norms, attention, routers, shared
@@ -614,5 +800,143 @@ mod tests {
         // Unknown instance size: no constraint.
         assert_eq!(instances_for_memory(GIB, 0, 0, 3), 3);
         assert_eq!(instances_for_memory(GIB, 0, 0, 0), 1);
+    }
+    // ── Auto-engaged VRAM expert cache (#110) ───────────────────────────
+
+    fn auto_request(
+        cache_budget: Option<u64>,
+        expert_bytes: u64,
+        probe: Option<f64>,
+    ) -> Result<(), AutoVramCacheDecline> {
+        auto_vram_expert_cache(
+            ExpertPlacement::Auto,
+            ResolvedPlacement::Host,
+            true,
+            cache_budget,
+            expert_bytes,
+            probe,
+        )
+    }
+
+    /// The engaged case: a leftover that holds well over the residency floor
+    /// on a device that decodes faster than CPU-BLAS.
+    #[test]
+    fn auto_vram_cache_engages_on_a_meaningful_budget() {
+        // 24 GiB card, 9.7 GiB dense on the device, 2 GiB headroom+scratch,
+        // 1 GiB KV → ~11.3 GiB left against a 72 GiB expert pool ≈ 15%.
+        let leftover = device_expert_cache_bytes(24 * GIB, 9_700 << 20, 2 * GIB, GIB);
+        assert_eq!(leftover, (24 * GIB) - (9_700 << 20) - 2 * GIB - GIB);
+        auto_request(Some(leftover), 72 * GIB, Some(2.0)).expect("engage");
+        // No probe verdict (the probe was skipped): the size rule decides.
+        auto_request(Some(leftover), 72 * GIB, None).expect("engage without a probe");
+        // Exactly at the floor (10%) engages, and exactly "not slower than
+        // CPU" (1.0x) engages; one expert byte short of the floor declines.
+        auto_request(Some(7_200 << 20), 72_000 << 20, Some(1.0)).expect("engage at the floor");
+        let err = auto_request(Some(7_199 << 20), 72_000 << 20, Some(1.0)).unwrap_err();
+        assert!(
+            matches!(err, AutoVramCacheDecline::TooSmallResidency(9)),
+            "one byte short of the floor: {err:?}"
+        );
+    }
+
+    /// The B50 shape from the #110 discussion: a ~2.3 GiB leftover against a
+    /// ~72 GiB expert pool (3% residency) must stay all-host, and a device
+    /// that decodes slower than CPU-BLAS stays all-host even with a large
+    /// leftover.
+    #[test]
+    fn auto_vram_cache_keeps_host_when_the_cache_is_not_worth_it() {
+        let leftover = device_expert_cache_bytes(15 * GIB + (130 << 20), 9_730 << 20, 2 * GIB, GIB);
+        let err = auto_request(Some(leftover), 72 * GIB, Some(2.0)).unwrap_err();
+        assert!(
+            matches!(err, AutoVramCacheDecline::TooSmallResidency(3)),
+            "2.3 GiB of 72 GiB is 3% residency: {err:?}"
+        );
+        // A device slower than CPU-BLAS on decode never engages, however
+        // large the leftover (the Arc dense-decode measurement was 0.39x).
+        let err = auto_request(Some(72 * GIB), 72 * GIB, Some(0.39)).unwrap_err();
+        assert!(
+            matches!(err, AutoVramCacheDecline::DeviceSlower(s) if (s - 0.39).abs() < 1e-9),
+            "{err:?}"
+        );
+    }
+
+    /// The explicit opt-outs and the not-applicable states.
+    #[test]
+    fn auto_vram_cache_honours_explicit_choices_and_states() {
+        // An explicit `host` request is the documented opt-out.
+        assert_eq!(
+            auto_vram_expert_cache(
+                ExpertPlacement::Host,
+                ResolvedPlacement::Host,
+                true,
+                Some(72 * GIB),
+                72 * GIB,
+                None,
+            ),
+            Err(AutoVramCacheDecline::NotAuto)
+        );
+        // A device placement never engages (the experts are already there).
+        assert_eq!(
+            auto_vram_expert_cache(
+                ExpertPlacement::Auto,
+                ResolvedPlacement::Device,
+                true,
+                Some(72 * GIB),
+                72 * GIB,
+                None,
+            ),
+            Err(AutoVramCacheDecline::NotHost)
+        );
+        // An architecture without a device expert form never engages.
+        assert_eq!(
+            auto_vram_expert_cache(
+                ExpertPlacement::Auto,
+                ResolvedPlacement::Host,
+                false,
+                Some(72 * GIB),
+                72 * GIB,
+                None,
+            ),
+            Err(AutoVramCacheDecline::NotCacheCapable)
+        );
+        // No budget (no probe, no --vram-budget), no experts, no leftover.
+        assert_eq!(
+            auto_request(None, 72 * GIB, None),
+            Err(AutoVramCacheDecline::NoBudget)
+        );
+        assert_eq!(
+            auto_request(Some(GIB), 0, None),
+            Err(AutoVramCacheDecline::NoExperts)
+        );
+        assert_eq!(
+            auto_request(Some(0), 72 * GIB, None),
+            Err(AutoVramCacheDecline::ZeroLeftover)
+        );
+        // Only the non-applicable declines are silent; the rest are logged.
+        assert!(!AutoVramCacheDecline::NotAuto.applicable());
+        assert!(!AutoVramCacheDecline::NotHost.applicable());
+        assert!(!AutoVramCacheDecline::NotCacheCapable.applicable());
+        assert!(AutoVramCacheDecline::TooSmallResidency(3).applicable());
+        assert!(AutoVramCacheDecline::DeviceSlower(0.39).applicable());
+        // The decline text names the measured figures.
+        assert!(AutoVramCacheDecline::TooSmallResidency(3)
+            .describe()
+            .contains("3%"));
+        assert!(AutoVramCacheDecline::DeviceSlower(0.39)
+            .describe()
+            .contains("0.39x"));
+    }
+
+    /// The residency comparison saturates instead of wrapping: a huge budget
+    /// against a small expert pool engages, never declines through overflow.
+    #[test]
+    fn auto_vram_cache_residency_handles_huge_inputs() {
+        auto_request(Some(u64::MAX), GIB, None).expect("a huge budget engages");
+        // The percent fits u64 even for the largest budgets.
+        let err = auto_request(Some(1 << 20), u64::MAX, None).unwrap_err();
+        assert!(
+            matches!(err, AutoVramCacheDecline::TooSmallResidency(0)),
+            "{err:?}"
+        );
     }
 }

@@ -25,6 +25,7 @@ mod cluster_cli;
 use joshua::{
     engine::Engine, server, types::GenerationOptions, ChatMessage, ComputeBackend, DensePlacement,
     EngineOptions, ExpertPlacement, HugePages, MlockMode, MmapMode, PageSize, SpeculativeConfig,
+    VramExpertCache,
 };
 
 /// Values for `--device` (CLI form of [`ComputeBackend`]).
@@ -251,7 +252,9 @@ enum Commands {
         /// Size the bounded VRAM expert cache (#62): upload a hot subset of the
         /// routed experts to the accelerator.  `auto` derives the device byte
         /// budget at load (device free − dense − headroom − KV); a number is a
-        /// fixed MiB budget; unset/0 disables (all experts stay on the host).
+        /// fixed MiB budget; `0` disables (all experts stay on the host).
+        /// Unset (the default), `--expert-placement auto` engages the cache
+        /// itself where the leftover device memory is worth it (#110).
         #[arg(long, env = "JOSHUA_VRAM_EXPERT_CACHE", value_parser = clap::value_parser!(VramExpertCacheArg))]
         vram_expert_cache: Option<VramExpertCacheArg>,
         /// Tokens per prefill chunk (default 512).  Bounds the per-layer
@@ -294,7 +297,11 @@ enum Commands {
         /// them (the whole model must fit), `host` keeps them in RAM borrowed
         /// from the mapping with only the dense set on the GPU (runs models
         /// larger than VRAM), `auto` picks `device` only when the model fits
-        /// the GPU's free memory with headroom.  Ignored on the CPU.
+        /// the GPU's free memory with headroom.  Ignored on the CPU.  When
+        /// `auto` falls back to `host` on an architecture that can run routed
+        /// experts from a bounded VRAM cache (deepseek4 on OpenCL/SYCL), that
+        /// cache is engaged by default where the leftover device memory is
+        /// worth it (#110); `--vram-expert-cache 0` opts out.
         #[arg(long, env = "JOSHUA_EXPERT_PLACEMENT", default_value = "auto", value_parser = clap::value_parser!(ExpertPlacement))]
         expert_placement: ExpertPlacement,
         /// GPU memory the model may use, in MiB.  Overrides the probe for the
@@ -403,7 +410,9 @@ enum Commands {
         /// Size the bounded VRAM expert cache (#62): upload a hot subset of the
         /// routed experts to the accelerator.  `auto` derives the device byte
         /// budget at load (device free − dense − headroom − KV); a number is a
-        /// fixed MiB budget; unset/0 disables (all experts stay on the host).
+        /// fixed MiB budget; `0` disables (all experts stay on the host).
+        /// Unset (the default), `--expert-placement auto` engages the cache
+        /// itself where the leftover device memory is worth it (#110).
         #[arg(long, env = "JOSHUA_VRAM_EXPERT_CACHE", value_parser = clap::value_parser!(VramExpertCacheArg))]
         vram_expert_cache: Option<VramExpertCacheArg>,
         /// Tokens per prefill chunk (default 512).  Bounds the per-layer
@@ -446,7 +455,11 @@ enum Commands {
         /// them (the whole model must fit), `host` keeps them in RAM borrowed
         /// from the mapping with only the dense set on the GPU (runs models
         /// larger than VRAM), `auto` picks `device` only when the model fits
-        /// the GPU's free memory with headroom.  Ignored on the CPU.
+        /// the GPU's free memory with headroom.  Ignored on the CPU.  When
+        /// `auto` falls back to `host` on an architecture that can run routed
+        /// experts from a bounded VRAM cache (deepseek4 on OpenCL/SYCL), that
+        /// cache is engaged by default where the leftover device memory is
+        /// worth it (#110); `--vram-expert-cache 0` opts out.
         #[arg(long, env = "JOSHUA_EXPERT_PLACEMENT", default_value = "auto", value_parser = clap::value_parser!(ExpertPlacement))]
         expert_placement: ExpertPlacement,
         /// GPU memory the model may use, in MiB.  Overrides the probe for the
@@ -567,10 +580,12 @@ async fn main() -> anyhow::Result<()> {
                 Some(ExpertCacheArg::Count(n)) => (n, false),
                 None => (pin_hot_experts, false),
             };
-            let vram_bytes: Option<u64> = match vram_expert_cache {
-                Some(VramExpertCacheArg::Auto) => Some(0), // engine sizes at load
-                Some(VramExpertCacheArg::MiB(n)) if n > 0 => Some(n as u64 * 1024 * 1024),
-                _ => None,
+            let vram_cache: VramExpertCache = match vram_expert_cache {
+                Some(VramExpertCacheArg::Auto) => VramExpertCache::Auto, // engine sizes at load
+                Some(VramExpertCacheArg::MiB(n)) => {
+                    VramExpertCache::Bytes((n as u64).saturating_mul(1024 * 1024))
+                }
+                None => VramExpertCache::Unset, // the engine may engage a partial cache (#110)
             };
             let opts = EngineOptions::with_n_ctx(n_ctx)
                 .backend(device.into())
@@ -581,7 +596,7 @@ async fn main() -> anyhow::Result<()> {
                 .pin_hot_weights(pin_hot)
                 .pin_hot_experts(pin_hot_experts)
                 .expert_cache_auto(expert_cache_auto)
-                .vram_expert_cache(vram_bytes)
+                .vram_expert_cache(vram_cache)
                 .prefill_chunk(prefill_chunk)
                 .speculative(speculative_config(speculative))
                 .mlock_hot_weights(
@@ -675,10 +690,12 @@ async fn main() -> anyhow::Result<()> {
                 Some(ExpertCacheArg::Count(n)) => (n, false),
                 None => (pin_hot_experts, false),
             };
-            let vram_bytes: Option<u64> = match vram_expert_cache {
-                Some(VramExpertCacheArg::Auto) => Some(0), // engine sizes at load
-                Some(VramExpertCacheArg::MiB(n)) if n > 0 => Some(n as u64 * 1024 * 1024),
-                _ => None,
+            let vram_cache: VramExpertCache = match vram_expert_cache {
+                Some(VramExpertCacheArg::Auto) => VramExpertCache::Auto, // engine sizes at load
+                Some(VramExpertCacheArg::MiB(n)) => {
+                    VramExpertCache::Bytes((n as u64).saturating_mul(1024 * 1024))
+                }
+                None => VramExpertCache::Unset, // the engine may engage a partial cache (#110)
             };
             let opts = EngineOptions::with_n_ctx(n_ctx)
                 .backend(device.into())
@@ -689,7 +706,7 @@ async fn main() -> anyhow::Result<()> {
                 .pin_hot_weights(pin_hot)
                 .pin_hot_experts(pin_hot_experts)
                 .expert_cache_auto(expert_cache_auto)
-                .vram_expert_cache(vram_bytes)
+                .vram_expert_cache(vram_cache)
                 .prefill_chunk(prefill_chunk)
                 .speculative(speculative_config(speculative))
                 .mlock_hot_weights(

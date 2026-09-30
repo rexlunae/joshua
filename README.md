@@ -263,7 +263,7 @@ Qwen-family MoE or `deepseek2` model live:
 
 | Value | Effect |
 |---|---|
-| `auto` (default) | `device` when `dense + experts + 1 GiB` fits the GPU's free memory (`cudaMemGetInfo` on CUDA, or `--vram-budget`), else `host`.  On OpenCL and Vulkan always `host` (the dense set is what an iGPU speeds up; the experts run on the CPU expert kernels).  With neither a probe nor a budget, `device`. |
+| `auto` (default) | `device` when `dense + experts + 1 GiB` fits the GPU's free memory (`cudaMemGetInfo` on CUDA, or `--vram-budget`), else `host`.  On OpenCL and Vulkan always `host` (the dense set is what an iGPU speeds up; the experts run on the CPU expert kernels).  With neither a probe nor a budget, `device`.  For `deepseek4` on OpenCL/SYCL, an `auto` fallback to `host` engages a bounded VRAM expert cache over the host pool when the leftover device memory holds at least 10% of the routed experts and the device decodes at least as fast as CPU-BLAS (#110); `--vram-expert-cache 0` opts out. |
 | `device` | Upload the experts too — the whole model must fit.  For `deepseek4` on OpenCL: run them from a bounded VRAM cache instead (sized as `--vram-expert-cache auto` unless a budget is given; see [`docs/accelerator-backends.md`](docs/accelerator-backends.md)). |
 | `host` | Keep the experts in host RAM, borrowed in place from the mapping and run on the CPU SIMD expert kernels (with the hot-expert cache and prefetch machinery active); only the dense set goes to the GPU.  Each MoE layer moves its activations across once in each direction. |
 
@@ -572,7 +572,7 @@ prints the dense/expert split of any GGUF to sanity-check a new model.
 | `JOSHUA_EXPERT_PLACEMENT` | Same as `--expert-placement` (`auto`, `device`, or `host`) |
 | `JOSHUA_VRAM_BUDGET` | Same as `--vram-budget` (MiB of accelerator memory the model may use) |
 | `JOSHUA_DENSE_PLACEMENT` | Same as `--dense-placement` (`auto`, `device`, or `cpu`) |
-| `JOSHUA_VRAM_EXPERT_CACHE` | Same as `--vram-expert-cache` (`auto` or MiB of device memory for the bounded expert cache) |
+| `JOSHUA_VRAM_EXPERT_CACHE` | Same as `--vram-expert-cache` (`auto` or MiB of device memory for the bounded expert cache; `0` opts out of the cache `--expert-placement auto` engages by default where it is worth it) |
 | `JOSHUA_EXPERT_MISS` | `upload` makes the VRAM expert cache upload decode misses synchronously (measurement mode; default: host run + background upload) |
 | `JOSHUA_EXPERT_HOST_PAGES` | `keep` leaves an uploaded expert's host pages in the page cache; the default releases them so RAM and VRAM hold different experts |
 | `JOSHUA_EXPERT_STATS` | `1` probes host-miss page residency for the decode time split logged with the VRAM expert cache |
