@@ -1332,7 +1332,7 @@ impl Engine {
             expert_device_bytes,
             crate::placement::DEVICE_PLACEMENT_HEADROOM,
         );
-        let expert_device = match placement {
+        let mut expert_device = match placement {
             crate::placement::ResolvedPlacement::Host => Device::Cpu,
             crate::placement::ResolvedPlacement::Device => device.clone(),
         };
@@ -1381,7 +1381,7 @@ impl Engine {
         } else {
             crate::placement::resolve_dense_placement(options.dense_placement, device.is_cpu())
         };
-        let dense_device = match resolved_dense {
+        let mut dense_device = match resolved_dense {
             crate::placement::ResolvedDense::Device => device.clone(),
             crate::placement::ResolvedDense::Cpu => Device::Cpu,
         };
@@ -1443,7 +1443,7 @@ impl Engine {
         // sizing below applies: device free − dense (only when the dense set
         // is on the device) − placement headroom − scratch − KV reserve (only
         // with the dense set on the device).
-        let (dense_term, kv_reserve, scratch) = if dense_device.is_cpu() {
+        let (mut dense_term, mut kv_reserve, mut scratch) = if dense_device.is_cpu() {
             (0, 0, DEVICE_SCRATCH_RESERVE_DENSE_ON_CPU)
         } else {
             (
@@ -1452,7 +1452,7 @@ impl Engine {
                 DEVICE_SCRATCH_RESERVE_DENSE_ON_DEVICE,
             )
         };
-        let vram_cache_leftover = device_budget.map(|free| {
+        let mut vram_cache_leftover = device_budget.map(|free| {
             crate::placement::device_expert_cache_bytes(
                 free,
                 dense_term,
@@ -1466,6 +1466,10 @@ impl Engine {
                 options.device_expert_cache,
                 crate::placement::VramExpertCache::Unset
             );
+        // #114: the auto engagement may move the dense set to CPU-BLAS to
+        // grow the cache over the residency floor (see
+        // `dense_to_cpu_for_cache`); applied to `dense_device` below.
+        let mut dense_for_cache = false;
         let mut device_expert_cache: Option<u64> = match options.device_expert_cache {
             crate::placement::VramExpertCache::Disabled => {
                 tracing::info!("vram expert cache: disabled (--vram-expert-cache 0)");
@@ -1504,17 +1508,72 @@ impl Engine {
                         Some(0)
                     }
                     Err(decline) => {
-                        if decline.applicable() {
-                            tracing::info!(
-                                "vram expert cache not engaged: {}; --vram-expert-cache auto forces it",
-                                decline.describe()
-                            );
+                        // #114: when the only decline is residency and the
+                        // dense set on the card is what squeezes the
+                        // leftover, moving dense to CPU-BLAS can grow the
+                        // cache over the floor — worth it when the device's
+                        // dense GEMM is not decisively faster (the probe).
+                        if let (Some(leftover), Some(bench)) = (vram_cache_leftover, bench.as_ref())
+                        {
+                            if let Some(freed) = crate::placement::dense_to_cpu_for_cache(
+                                &decline,
+                                cache_capable,
+                                dense_term,
+                                leftover,
+                                expert_device_bytes,
+                                Some(bench.decode_speedup()),
+                            ) {
+                                dense_for_cache = true;
+                                tracing::info!(
+                                    "vram expert cache: moving the dense set to CPU-BLAS frees \
+                                     {:.2} GiB on {device:?} and grows the auto cache over the \
+                                     residency floor (#114); the probe put the device's dense \
+                                     decode at {:.2}x CPU-BLAS, so the expert residency is the \
+                                     better use of the card",
+                                    dense_term as f64 / 2f64.powi(30),
+                                    bench.decode_speedup(),
+                                );
+                                Some(freed)
+                            } else {
+                                if decline.applicable() {
+                                    tracing::info!(
+                                        "vram expert cache not engaged: {}; --vram-expert-cache auto forces it",
+                                        decline.describe()
+                                    );
+                                }
+                                None
+                            }
+                        } else {
+                            if decline.applicable() {
+                                tracing::info!(
+                                    "vram expert cache not engaged: {}; --vram-expert-cache auto forces it",
+                                    decline.describe()
+                                );
+                            }
+                            None
                         }
-                        None
                     }
                 }
             }
         };
+        if dense_for_cache {
+            // The engagement moved dense to CPU-BLAS (#114): recompute the
+            // leftover with the dense set freed and re-derive the resolved
+            // placement, then size the cache from the new leftover below.
+            dense_device = Device::Cpu;
+            dense_term = 0;
+            kv_reserve = 0;
+            scratch = DEVICE_SCRATCH_RESERVE_DENSE_ON_CPU;
+            if let Some(free) = device_budget {
+                vram_cache_leftover = Some(crate::placement::device_expert_cache_bytes(
+                    free,
+                    0,
+                    crate::placement::DEVICE_PLACEMENT_HEADROOM + scratch,
+                    0,
+                ));
+            }
+            expert_device = Device::Cpu;
+        }
         if device_expert_cache == Some(0) {
             // `--vram-expert-cache auto` (an explicit request, implied by an
             // expert-placement `device` on a cache-capable architecture, or

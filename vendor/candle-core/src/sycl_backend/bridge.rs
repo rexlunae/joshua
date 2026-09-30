@@ -96,6 +96,7 @@ api! {
     free(usize) -> i32;
     finish(usize) -> i32;
     write(usize, usize, usize, usize, *const c_void) -> i32;
+    transfer_write(usize, usize, usize, usize, *const c_void) -> i32;
     read(usize, usize, usize, usize, *mut c_void) -> i32;
     copy(usize, usize, usize, usize, usize, usize) -> i32;
     launch(usize, *const c_char, *const Arg, usize, *const usize, *const usize) -> i32;
@@ -129,6 +130,14 @@ pub unsafe fn free(h: usize) { if h != 0 { if let Ok(a) = api() { (a.free)(h); }
 pub unsafe fn finish(h: usize) -> i32 { api().map(|a| (a.finish)(h)).unwrap_or(-1) }
 pub unsafe fn write(h: usize, b: usize, off: usize, bytes: usize, ptr: *const u8) -> Result<()> {
     if bytes > 0 && (api()?.write)(h, b, off, bytes, ptr.cast()) != 0 { return Err(error("write")); }
+    Ok(())
+}
+/// [`write`] on the transfer queue: the calling thread waits for its own
+/// memcpy but no compute-queue kernel is delayed (the uploader's path).
+pub unsafe fn transfer_write(h: usize, b: usize, off: usize, bytes: usize, ptr: *const u8) -> Result<()> {
+    if bytes > 0 && (api()?.transfer_write)(h, b, off, bytes, ptr.cast()) != 0 {
+        return Err(error("transfer_write"));
+    }
     Ok(())
 }
 pub unsafe fn read(h: usize, b: usize, off: usize, bytes: usize, ptr: *mut u8) -> Result<()> {

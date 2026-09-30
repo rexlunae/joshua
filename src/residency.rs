@@ -727,6 +727,14 @@ impl<T: DeviceExpertSlot> DeviceResidency<T> {
         st.hot.extend(hot.iter().take(cap).copied());
     }
 
+    /// Whether `(layer, expert)` is in the protected hot set right now
+    /// (the host-page release hook consults this, #114: an expert that may
+    /// be evicted and re-run on the host must keep its host pages, or every
+    /// host miss after an eviction page-faults from the model file).
+    pub fn is_hot(&self, layer: u32, expert: u32) -> bool {
+        self.lock().hot.contains(&(layer, expert))
+    }
+
     /// Number of experts resident right now.
     pub fn resident(&self) -> usize {
         self.lock().slots.len()
@@ -1220,6 +1228,15 @@ impl<T: DeviceExpertSlot> ExpertResidency for CompositeResidency<T> {
         if let Some(d) = &self.device {
             d.replace_hot_set(hot);
         }
+        // Fill the newly hot members' device slots ahead of the per-step
+        // miss churn (#114): with the hot set protected, uploads converge
+        // on a stable working set instead of chasing each step's misses,
+        // which is what makes a small partial cache mostly hit.
+        if let Some(u) = &self.uploader {
+            for &(l, e) in hot {
+                u.request(l, e);
+            }
+        }
     }
 }
 
@@ -1244,6 +1261,59 @@ mod device_pool_tests {
         DeviceResidency::new(cap, per, upload)
     }
 
+    /// `is_hot` reflects `mark_hot`/`replace_hot_set` (the release hook's
+    /// #114 consult).
+    #[test]
+    fn is_hot_tracks_the_protected_set() {
+        let r = pool(120, 30, 8, 30);
+        assert!(!r.is_hot(0, 0));
+        r.mark_hot(0, 0);
+        assert!(r.is_hot(0, 0));
+        r.replace_hot_set(&[(0, 1), (0, 2)]);
+        assert!(!r.is_hot(0, 0), "replacing drops the old set");
+        assert!(r.is_hot(0, 1) && r.is_hot(0, 2));
+        assert!(!r.is_hot(0, 3));
+    }
+
+    /// #114 acceptance, pool level: with the hot set protected and filled
+    /// ahead of the churn, a small cache converges on the hot working set —
+    /// decode churn over a wider expert set keeps hitting the hot members
+    /// (a stable hit rate), and only the one evictable slot turns over,
+    /// not the whole cache per step as #110 measured.
+    #[test]
+    fn hot_filled_cache_converges_and_hits() {
+        // 4 slots, 16 experts: a 25%-residency "small card".  The hot set
+        // caps at 3/4 of the slots = 3 members.
+        let r = pool(120, 30, 16, 30);
+        let hot = [(0u32, 0u32), (0, 1), (0, 2)];
+        r.replace_hot_set(&hot);
+        for (l, e) in hot {
+            r.acquire(l, e);
+        }
+        assert_eq!(r.resident(), 3);
+        // Decode churn over the other 13 experts: the hot three never evict,
+        // exactly one slot cycles, and every step still hits the hot set.
+        for e in 3..16u32 {
+            r.acquire(0, e);
+            assert_eq!(r.resident(), 4, "budget respected at expert {e}");
+            for (_, h) in hot {
+                assert!(r.contains(0, h), "hot expert {h} survived step {e}");
+            }
+            // The step's own hit: routing touches the hot set every step.
+            r.lookup(0, 0);
+        }
+        let s = r.stats();
+        assert_eq!(s.refused, 0);
+        // 3 hot fills + 13 churn uploads; the 4th slot starts empty (no
+        // eviction on the first churn) and then cycles 12 times
+        // (e4..e15 evict their LRU predecessor).
+        assert_eq!(s.uploads, 16);
+        assert_eq!(s.evictions, 12, "only the cycling slot turns over: {s:?}");
+        assert!(
+            s.hits >= 13,
+            "every churn step still hits the hot set: {s:?}"
+        );
+    }
     /// Churning through many more experts than fit never exceeds the budget,
     /// evicts strictly LRU, and counts every event.
     #[test]

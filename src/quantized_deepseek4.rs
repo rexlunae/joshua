@@ -836,6 +836,7 @@ fn build_device_pool(
         HostPagePolicy::Drop => {
             let host = Arc::clone(&host_handles);
             let busy = Arc::clone(&busy);
+            let hot = Arc::clone(&pool);
             Some(Arc::new(move |l: u32, e: u32| {
                 // Not while the host kernels are reading it: the uploader
                 // retries after another delay.
@@ -844,6 +845,18 @@ fn build_device_pool(
                     .unwrap_or_else(|p| p.into_inner())
                     .contains_key(&(l, e))
                 {
+                    return false;
+                }
+                // Only a *hot* expert's host pages may go (#114): hot
+                // members are protected from eviction and hit on the
+                // device from then on, so the host never needs them
+                // again.  A churn expert will be evicted and re-run on
+                // the host — releasing its pages there would turn the
+                // next host miss into a page fault on the model file,
+                // which is what stalled decode on a small-residency
+                // cache.  Returning false parks the release; the retry
+                // budget exhausts and the pages stay, as intended.
+                if !hot.is_hot(l, e) {
                     return false;
                 }
                 if let Some(Some(h)) = host.get(l as usize).and_then(|row| row.get(e as usize)) {

@@ -298,15 +298,26 @@ pub enum VramExpertCache {
 }
 
 /// Smallest partial cache `--expert-placement auto` engages by default
-/// (#110): the byte budget must hold at least this share (numerator,
-/// denominator) of the routed-expert device footprint.
+/// (#110, softened by #114): the byte budget must hold at least this share
+/// (numerator, denominator) of the routed-expert device footprint.
 ///
-/// The Arc Pro B50 in the #110 discussion measured a 2.4 GiB budget against
-/// a ~72 GiB routed-expert pool — 3.3% residency: every decode step missed,
-/// the background uploader saturated the bus, and decode regressed hard.
-/// Below the floor the safer default is all-host placement, unchanged from
-/// before #110.
-pub const AUTO_VRAM_CACHE_MIN_RESIDENCY: (u64, u64) = (1, 10);
+/// #110 measured a hard decode regression at 3.3% residency on an Arc Pro
+/// B50 — but the root cause was not the small residency itself: the
+/// churn cache's host-page releases re-faulted every host miss from disk,
+/// and (on SYCL) the uploads shared the compute queue with the kernels.
+/// With both fixed (#114: churn experts keep their host pages; uploads
+/// run on the transfer queue) and the routing-frequency hot set protected
+/// from eviction (it covers up to [`crate::residency::HOT_SET_SHARE`] of
+/// the slots and is uploaded ahead of the churn), a small cache converges
+/// on the stable hot working set and mostly hits — so the floor only
+/// guards against a budget that cannot even hold a working set (well
+/// under one decode step's routed experts).
+///
+/// The B50's ~356-slot cache protecting ~267 experts against a ~264-per-
+/// step routed set is exactly the shape that works; a full sweep of the
+/// cache once over the bus (budget ÷ PCIe bandwidth, ~4 s for 2.4 GiB)
+/// is a warm-up cost, not a per-step one.
+pub const AUTO_VRAM_CACHE_MIN_RESIDENCY: (u64, u64) = (1, 20);
 
 /// Why `--expert-placement auto` kept the all-host expert placement instead
 /// of engaging a partial VRAM expert cache (#110).
@@ -376,7 +387,8 @@ impl AutoVramCacheDecline {
                     .to_string()
             }
             AutoVramCacheDecline::TooSmallResidency(pct) => format!(
-                "the leftover device memory holds {pct}% of the routed experts (below the {:.0}% floor); the cache would turn over every step",
+                "the leftover device memory holds {pct}% of the routed experts (below the {:.0}% floor); \
+                 even with the hot set protected the cache could not hold a stable working set",
                 100.0 * AUTO_VRAM_CACHE_MIN_RESIDENCY.0 as f64 / AUTO_VRAM_CACHE_MIN_RESIDENCY.1 as f64,
             ),
             AutoVramCacheDecline::DeviceSlower(speedup) => format!(
@@ -460,6 +472,55 @@ pub fn auto_vram_expert_cache(
     }
     Ok(())
 }
+
+/// Whether the dense set should move to CPU-BLAS to grow the auto-engaged
+/// VRAM expert cache (#114), and the cache engaged with the freed memory.
+///
+/// Applies only when the plain decision declined *solely* on residency
+/// (`TooSmallResidency`): the cache candidate is otherwise sound, the dense
+/// set is on the device, and the dense bytes are what squeezes the leftover.
+/// Moving dense to CPU-BLAS frees them for the cache; it is worth its
+/// (slower or equal) dense GEMMs only when the device's dense decode is not
+/// decisively faster than CPU-BLAS (`decode_speedup` below
+/// [`DENSE_FOR_CACHE_MIN_SPEEDUP`] — below [`MIN_DEVICE_SPEEDUP`]'s 1.5 the
+/// dense recommendation itself already picks CPU, so this only bites in the
+/// 1.5–2× band where the probe is ambiguous and the cache is the better
+/// user of the card) and the freed budget clears the floor.
+///
+/// Returns `Some(freed_budget_bytes)` to engage the cache with, `None` to
+/// keep the decline.
+pub fn dense_to_cpu_for_cache(
+    decline: &AutoVramCacheDecline,
+    cache_capable: bool,
+    dense_device_bytes: u64,
+    leftover_bytes: u64,
+    expert_device_bytes: u64,
+    probe_decode_speedup: Option<f64>,
+) -> Option<u64> {
+    if !matches!(decline, AutoVramCacheDecline::TooSmallResidency(_)) {
+        return None;
+    }
+    if !cache_capable || dense_device_bytes == 0 || expert_device_bytes == 0 {
+        return None;
+    }
+    // The device must not be a GEMM liability: at <1× the dense placement
+    // recommendation already moved dense to the CPU (and this helper is
+    // only reached with dense on the device); require a clear but not
+    // overwhelming win to keep dense on the card today.
+    if probe_decode_speedup.is_some_and(|s| s < DENSE_FOR_CACHE_MIN_SPEEDUP) {
+        return None;
+    }
+    let freed = leftover_bytes.saturating_add(dense_device_bytes);
+    let (num, den) = AUTO_VRAM_CACHE_MIN_RESIDENCY;
+    if freed.saturating_mul(den) < expert_device_bytes.saturating_mul(num) {
+        return None;
+    }
+    Some(freed)
+}
+
+/// Decode speedup above which the dense set stays on the device even when
+/// moving it would grow the auto expert cache (see [`dense_to_cpu_for_cache`]).
+pub const DENSE_FOR_CACHE_MIN_SPEEDUP: f64 = 1.0;
 
 // ─── Dense placement (where the dense set lives) ─────────────────────────────
 
@@ -833,12 +894,12 @@ mod tests {
         auto_request(Some(leftover), 72 * GIB, Some(2.0)).expect("engage");
         // No probe verdict (the probe was skipped): the size rule decides.
         auto_request(Some(leftover), 72 * GIB, None).expect("engage without a probe");
-        // Exactly at the floor (10%) engages, and exactly "not slower than
-        // CPU" (1.0x) engages; one expert byte short of the floor declines.
-        auto_request(Some(7_200 << 20), 72_000 << 20, Some(1.0)).expect("engage at the floor");
-        let err = auto_request(Some(7_199 << 20), 72_000 << 20, Some(1.0)).unwrap_err();
+        // Exactly at the floor (5% since #114) engages, and exactly "not
+        // slower than CPU" (1.0x) engages; one expert byte short declines.
+        auto_request(Some(3_600 << 20), 72_000 << 20, Some(1.0)).expect("engage at the floor");
+        let err = auto_request(Some(3_599 << 20), 72_000 << 20, Some(1.0)).unwrap_err();
         assert!(
-            matches!(err, AutoVramCacheDecline::TooSmallResidency(9)),
+            matches!(err, AutoVramCacheDecline::TooSmallResidency(4)),
             "one byte short of the floor: {err:?}"
         );
     }
@@ -941,6 +1002,65 @@ mod tests {
         assert!(
             matches!(err, AutoVramCacheDecline::TooSmallResidency(0)),
             "{err:?}"
+        );
+    }
+
+    /// The #114 dense tie-in: a TooSmallResidency decline whose dense set
+    /// on the card is what squeezes the leftover moves dense to CPU-BLAS
+    /// when that clears the floor and the device's dense GEMM is not the
+    /// point of the card.
+    #[test]
+    fn dense_moves_to_cpu_to_grow_the_cache_over_the_floor() {
+        let leftover = device_expert_cache_bytes(15 * GIB + (130 << 20), 9_730 << 20, 2 * GIB, GIB);
+        let decline = auto_request(Some(leftover), 72 * GIB, Some(1.8)).unwrap_err();
+        assert!(matches!(
+            decline,
+            AutoVramCacheDecline::TooSmallResidency(3)
+        ));
+        // Freeing the 9.5 GiB dense set clears the floor (~16%): engage.
+        let freed =
+            dense_to_cpu_for_cache(&decline, true, 9_730 << 20, leftover, 72 * GIB, Some(1.8))
+                .expect("freed dense clears the floor");
+        assert_eq!(freed, leftover + (9_730 << 20));
+        // The dense recommendation itself would have picked CPU (<1.5x),
+        // so this helper is only reached at >= 1x; below 1x it stays out.
+        assert_eq!(
+            dense_to_cpu_for_cache(&decline, true, 9_730 << 20, leftover, 72 * GIB, Some(0.9)),
+            None,
+            "a device slower than CPU-BLAS must not buy the dense move"
+        );
+        // Freed memory that still misses the floor keeps the decline: the
+        // leftover itself is 2.6 GiB (3.6%), so only ~1.0 GiB more is needed
+        // to cross 5% — use a dense set small enough that even freed it
+        // cannot (the KV/headroom deductions stay).
+        assert_eq!(
+            dense_to_cpu_for_cache(
+                &decline,
+                true,
+                (400 << 20) + 1,
+                leftover,
+                72 * GIB,
+                Some(1.8)
+            ),
+            None,
+            "a sub-GiB dense set does not clear the floor even freed"
+        );
+        // Only a residency decline triggers it.
+        assert_eq!(
+            dense_to_cpu_for_cache(
+                &AutoVramCacheDecline::DeviceSlower(0.39),
+                true,
+                9_730 << 20,
+                leftover,
+                72 * GIB,
+                Some(1.8),
+            ),
+            None,
+        );
+        // And the not-cache-capable state never moves dense.
+        assert_eq!(
+            dense_to_cpu_for_cache(&decline, false, 9_730 << 20, leftover, 72 * GIB, Some(1.8)),
+            None,
         );
     }
 }
