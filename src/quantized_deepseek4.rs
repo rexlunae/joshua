@@ -1067,6 +1067,7 @@ struct Compressor {
 
 /// Streaming state of a compressor: rows of the current (partial) block plus,
 /// for CSA, the previous block kept for the overlap window.
+#[derive(Clone)]
 struct CompressorState {
     kv: Tensor,    // [coff*ratio, coff*head_dim]
     score: Tensor, // same, -inf initialized
@@ -1657,6 +1658,10 @@ impl Attention {
         let win = self.window_size;
         let kv = &mut kvs[layer];
         let swa_prev = kv.swa.as_ref().unwrap().clone();
+        if let Some(cap) = kv.capture.as_mut() {
+            cap.swa = Some(swa_prev.clone());
+            cap.kv_raw = Some(kv_raw.clone());
+        }
         kv.swa = Some(if seq >= win {
             let start = offset + seq - win;
             let rows: Vec<u32> = (0..win)
@@ -1679,6 +1684,10 @@ impl Attention {
         // Main compressor (CSA / HCA; V4.1 source layers only).
         if let Some(c) = &self.compressor {
             let (ckv, csc) = c.project(x)?;
+            if let Some(cap) = kv.capture.as_mut() {
+                cap.comp_state = kv.comp_state.clone();
+                cap.main = Some((ckv.clone(), csc.clone()));
+            }
             let out = c.forward(
                 &ckv,
                 &csc,
@@ -1689,13 +1698,7 @@ impl Attention {
                 dev,
             )?;
             if let Some(out) = out {
-                kv.comp = Some(scatter_rows(kv.comp.as_ref().unwrap(), &out.blocks, &out.rows)?);
-                // V4.1 key owner: index keys from the latent before its rope.
-                if let Some(ik) = &self.index_key {
-                    let k = ik.k_norm.forward(&ik.attn_k.forward(&out.pre_rope)?)?;
-                    let k = rope_tail(self.compress_rotary.as_ref().unwrap(), &k, self.rope_head_dim, &out.starts)?;
-                    kv.lid = Some(scatter_rows(kv.lid.as_ref().unwrap(), &out.blocks, &k)?);
-                }
+                self.publish_main(kv, &out)?;
             }
         }
 
@@ -1704,6 +1707,10 @@ impl Attention {
         let lid_idx: Option<Tensor> = if let Some(ix) = &self.indexer {
             if let Some(ic) = &ix.compressor {
                 let (lkv, lsc) = ic.project(x)?;
+                if let Some(cap) = kv.capture.as_mut() {
+                    cap.lid_state = kv.lid_state.clone();
+                    cap.index = Some((lkv.clone(), lsc.clone()));
+                }
                 let lout = ic.forward(
                     &lkv,
                     &lsc,
@@ -1781,6 +1788,147 @@ impl Attention {
             .reshape((seq, self.o_groups * self.o_lora_rank))?;
         self.wo_b.forward(&y)?.reshape((1, seq, ()))
     }
+
+    /// Publish a main compressor's freshly completed rows into the caches:
+    /// the compressed stream, plus the V4.1 key owner's index keys derived
+    /// from the rows before their rope.  Shared by the forward pass and the
+    /// verification rollback so the two cannot drift apart.
+    fn publish_main(&self, kv: &mut KvState, out: &Compressed) -> Result<()> {
+        kv.comp = Some(scatter_rows(
+            kv.comp.as_ref().unwrap(),
+            &out.blocks,
+            &out.rows,
+        )?);
+        // V4.1 key owner: index keys from the latent before its rope.
+        if let Some(ik) = &self.index_key {
+            let k = ik.k_norm.forward(&ik.attn_k.forward(&out.pre_rope)?)?;
+            let k = rope_tail(
+                self.compress_rotary.as_ref().unwrap(),
+                &k,
+                self.rope_head_dim,
+                &out.starts,
+            )?;
+            kv.lid = Some(scatter_rows(kv.lid.as_ref().unwrap(), &out.blocks, &k)?);
+        }
+        Ok(())
+    }
+
+    /// Roll a layer's caches back to `keep` after a verification pass that
+    /// ran at `[offset, offset + seq)` with `offset < keep <= offset + seq`.
+    ///
+    /// Restores the pre-pass ring and compressor states, then re-feeds the
+    /// accepted prefix `[offset, keep)` — the pass's roped keys into the ring
+    /// and its raw projections through the compressors — so the state is
+    /// exactly the one plain decoding would hold at `keep`.  Rows the pass
+    /// completed for blocks at or after `keep` are left stale in place: a
+    /// query only ever sees block `b` once `p+1 >= (b+1)*ratio` (its last
+    /// token has been fed again), which rewrites the row before it is read.
+    fn rollback(
+        &self,
+        kv: &mut KvState,
+        cap: &LayerCapture,
+        offset: usize,
+        keep: usize,
+        dev: &Device,
+    ) -> Result<()> {
+        let a = keep - offset;
+        kv.swa = cap.swa.clone();
+        if a > 0 {
+            let raw = cap
+                .kv_raw
+                .as_ref()
+                .expect("a verification capture holds the pass keys");
+            let win = self.window_size;
+            let ring: Vec<u32> = (offset..keep).map(|p| (p % win) as u32).collect();
+            let ridx = Tensor::from_vec(ring, (a, 1), dev)?
+                .broadcast_as((a, self.head_dim))?
+                .contiguous()?;
+            let swa = kv.swa.as_ref().expect("a restored window cache");
+            kv.swa = Some(swa.scatter(&ridx, &raw.narrow(0, 0, a)?, 0)?);
+        }
+        kv.comp_state = cap.comp_state.clone();
+        kv.lid_state = cap.lid_state.clone();
+        if a > 0 {
+            if let (Some(c), Some((ckv, csc))) = (&self.compressor, &cap.main) {
+                let out = c.forward(
+                    &ckv.narrow(0, 0, a)?,
+                    &csc.narrow(0, 0, a)?,
+                    kv.comp_state.as_mut().expect("a restored compressor state"),
+                    offset,
+                    a,
+                    self.compress_rotary
+                        .as_ref()
+                        .expect("a compressor implies a compress rotary"),
+                    dev,
+                )?;
+                if let Some(out) = out {
+                    self.publish_main(kv, &out)?;
+                }
+            }
+            if let (Some(ic), Some((lkv, lsc))) = (
+                self.indexer.as_ref().and_then(|ix| ix.compressor.as_ref()),
+                &cap.index,
+            ) {
+                let out = ic.forward(
+                    &lkv.narrow(0, 0, a)?,
+                    &lsc.narrow(0, 0, a)?,
+                    kv.lid_state
+                        .as_mut()
+                        .expect("an indexer compressor implies a state"),
+                    offset,
+                    a,
+                    self.compress_rotary
+                        .as_ref()
+                        .expect("a compressor implies a compress rotary"),
+                    dev,
+                )?;
+                if let Some(out) = out {
+                    kv.lid = Some(scatter_rows(
+                        kv.lid
+                            .as_ref()
+                            .expect("an indexer compressor implies index keys"),
+                        &out.blocks,
+                        &out.rows,
+                    )?);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// What one layer must remember so a multi-position (verification) pass can
+/// be rolled back to any position inside it.  A pass destroys two kinds of
+/// state: the sliding-window ring and the streaming compressor states are
+/// *overwritten* (their pre-pass contents are snapshotted here), and the
+/// pass's own raw projections are needed to replay its accepted prefix into
+/// the restored state (see [`Attention::rollback`]).
+#[derive(Default)]
+struct LayerCapture {
+    /// The ring cache as it was before the pass wrote its keys.
+    swa: Option<Tensor>,
+    /// The main compressor's streaming state before the pass.
+    comp_state: Option<CompressorState>,
+    /// The indexer compressor's streaming state before the pass.
+    lid_state: Option<CompressorState>,
+    /// The pass's roped keys `[seq, head_dim]` (the ring's write rows).
+    kv_raw: Option<Tensor>,
+    /// The main compressor's `(kv, score)` projections of the pass
+    /// `[seq, coff*head_dim]`.
+    main: Option<(Tensor, Tensor)>,
+    /// The indexer compressor's `(kv, score)` projections of the pass.
+    index: Option<(Tensor, Tensor)>,
+}
+
+/// A verification pass pending rollback: the pass's position span and every
+/// layer's capture.  Stored by [`ModelWeights::forward_all_logits`] and
+/// consumed by [`ModelWeights::truncate_kv_cache`].
+struct VerifyCheckpoint {
+    /// Absolute position of the pass's first token.
+    offset: usize,
+    /// Number of tokens the pass fed.
+    seq: usize,
+    layers: Vec<LayerCapture>,
 }
 
 // KV caches (owned by the model, reset via clear_kv_cache).
@@ -1795,6 +1943,11 @@ struct KvState {
     comp_state: Option<CompressorState>,
     /// Indexer compressor streaming state.
     lid_state: Option<CompressorState>,
+    /// Capture slot of a verification pass in progress (`None` for plain
+    /// passes): set by [`ModelWeights::forward_all_logits`], filled by
+    /// [`Attention::forward`], collected back into a
+    /// [`VerifyCheckpoint`] after the pass.
+    capture: Option<LayerCapture>,
 }
 
 impl KvState {
@@ -1829,6 +1982,7 @@ impl KvState {
             lid,
             comp_state,
             lid_state,
+            capture: None,
         })
     }
 }
@@ -2620,6 +2774,9 @@ pub struct ModelWeights {
     /// Dispatch settings for the streamed prefill in progress (set per
     /// chunk by the streaming runner; per session, never shared).
     stream_ctx: DispatchCtx,
+    /// The last multi-position pass pending rollback
+    /// ([`Self::forward_all_logits`] / [`Self::truncate_kv_cache`]).
+    verify: Option<VerifyCheckpoint>,
     /// This session's prefill time split (taken and logged at the end of
     /// each prefill).  Per session: concurrent prefills must not take each
     /// other's counters.
@@ -3241,6 +3398,7 @@ impl ModelWeights {
             kv_seq: Vec::new(),
             history: Vec::new(),
             history_seq: Vec::new(),
+            verify: None,
             last_routed: vec![Vec::new(); n_layers],
             hot_experts: crate::hot_experts::HotExpertCache::new(n_layers, n_expert, 0),
             stream_ctx: DispatchCtx {
@@ -3450,6 +3608,7 @@ impl ModelWeights {
             kv_seq: Vec::new(),
             history: Vec::new(),
             history_seq: Vec::new(),
+            verify: None,
             last_routed: vec![Vec::new(); self.shared.layers.len()],
             hot_experts: crate::hot_experts::HotExpertCache::new(
                 self.shared.layers.len(),
@@ -3477,7 +3636,7 @@ impl ModelWeights {
     pub fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {
         let t_pass = std::time::Instant::now();
         let (_b, seq_len) = input.dims2()?;
-        let logits = self.forward_inner(input, offset, seq_len)?;
+        let logits = self.forward_inner(input, offset, seq_len, true)?;
         self.note_pass(seq_len == 1, t_pass.elapsed());
         if seq_len > 1 {
             self.log_prefill_timing(Some(seq_len));
@@ -3485,7 +3644,89 @@ impl ModelWeights {
         Ok(logits)
     }
 
-    fn forward_inner(&mut self, input: &Tensor, offset: usize, seq_len: usize) -> Result<Tensor> {
+    /// Forward pass returning the logits of every input position,
+    /// `[1, seq_len, vocab]` — the speculative-decoding verification pass.
+    ///
+    /// Every position of a multi-token input is scored in one sweep (the same
+    /// multi-position path a prefill chunk takes).  The pass hands every
+    /// layer a capture slot and stores what it needs to roll the KV state
+    /// back to any position inside the pass — see [`Self::truncate_kv_cache`]
+    /// and [`Attention::rollback`] — so a rejected draft leaves a cache
+    /// exactly matching plain decoding.
+    pub fn forward_all_logits(&mut self, input: &Tensor, index_pos: usize) -> Result<Tensor> {
+        let (_b, seq_len) = input.dims2()?;
+        for state in &mut self.kv {
+            state.capture = Some(LayerCapture::default());
+        }
+        let logits = self.forward_inner(input, index_pos, seq_len, false)?;
+        let layers = self
+            .kv
+            .iter_mut()
+            .map(|state| state.capture.take().expect("capture was set above"))
+            .collect();
+        self.verify = Some(VerifyCheckpoint {
+            offset: index_pos,
+            seq: seq_len,
+            layers,
+        });
+        Ok(logits)
+    }
+
+    /// Keep only the first `keep_len` fed tokens of this instance's KV state.
+    ///
+    /// Exact for two request shapes.  A `keep_len` inside a just-run
+    /// verification pass (`forward_all_logits` fed `[offset, offset + seq)`)
+    /// rolls the caches back past the pass's rejected tail: every layer's
+    /// pre-pass ring and compressor states are restored and the accepted
+    /// prefix `[offset, keep_len)` is replayed into them, so the state
+    /// matches plain decoding that never saw the dropped tokens.
+    ///
+    /// Without a pending pass, an *arbitrary* backward truncate cannot be
+    /// served — the sliding-window ring and the streaming compressors only
+    /// remember the most recent window — so this refuses (`Err`) and callers
+    /// fall back to a fresh prefill.  `keep_len` at or beyond the fed length
+    /// is a no-op.
+    pub fn truncate_kv_cache(&mut self, keep_len: usize) -> Result<()> {
+        if keep_len >= self.history.len() {
+            self.verify = None;
+            return Ok(());
+        }
+        let checkpoint = self.verify.take().ok_or_else(|| {
+            candle_core::Error::Msg(format!(
+                "deepseek4: cannot truncate the KV cache to {keep_len} tokens: the sliding-window \
+                 ring and the running compressors only reach back over the current window; \
+                 clear the cache and prefill again instead"
+            ))
+        })?;
+        if keep_len < checkpoint.offset || keep_len > checkpoint.offset + checkpoint.seq {
+            return Err(candle_core::Error::Msg(format!(
+                "deepseek4: cannot truncate the KV cache to {keep_len} tokens: the pending \
+                 verification pass covered {}..{}",
+                checkpoint.offset,
+                checkpoint.offset + checkpoint.seq
+            )));
+        }
+        let dev = self.shared.device.clone();
+        for (i, layer) in self.shared.layers.iter().enumerate() {
+            layer.attn.rollback(
+                &mut self.kv[i],
+                &checkpoint.layers[i],
+                checkpoint.offset,
+                keep_len,
+                &dev,
+            )?;
+        }
+        self.history.truncate(keep_len);
+        Ok(())
+    }
+
+    fn forward_inner(
+        &mut self,
+        input: &Tensor,
+        offset: usize,
+        seq_len: usize,
+        last_only: bool,
+    ) -> Result<Tensor> {
         crate::route_trace::begin_call(if seq_len == 1 {
             crate::route_trace::Phase::Decode
         } else {
@@ -3676,9 +3917,11 @@ impl ModelWeights {
             }
         }
 
-        // Only the last position's logits are needed, and the engine's
-        // `squeeze_batch_logits` requires a single row.
-        self.shared.logits(&stream, true)
+        // A plain pass needs only the last position's logits (and the engine's
+        // `squeeze_batch_logits` requires a single row); the verification
+        // pass takes every row, shaped `[1, seq, vocab]` for the engine.
+        let logits = self.shared.logits(&stream, last_only)?;
+        Ok(if last_only { logits } else { logits.unsqueeze(0)? })
     }
 
     /// Forward one decode step for `n_seq` **independent** sequences at their
@@ -3838,6 +4081,9 @@ impl ModelWeights {
             Err(e) => eprintln!("deepseek4: failed to reset the KV state: {e}"),
         }
         self.history.clear();
+        // A pending verification checkpoint refers into the caches just
+        // replaced; drop it.
+        self.verify = None;
         // The batched path keeps its own per-sequence history and only
         // rebuilds it when the batch size changes, so a same-sized batch
         // after a reset would otherwise continue the previous batch's
