@@ -116,7 +116,7 @@ use crate::speculative::{
     next_draft_len, verify_token, NgramDrafter, SpeculativeConfig, SpeculativeStats, TokenDist,
     Verdict,
 };
-pub use crate::placement::{DensePlacement, ExpertPlacement};
+pub use crate::placement::{DensePlacement, ExpertPlacement, VramExpertCache};
 use crate::template::ChatTemplate;
 
 use crate::error::{JoshuaError, Result};
@@ -377,13 +377,21 @@ pub struct EngineOptions {
     /// of taking [`EngineOptions::pin_hot_experts`] verbatim.  `auto` sizing
     /// wins when set; `pin_hot_experts` remains the explicit override.
     pub expert_cache_auto: bool,
-    /// Bytes of accelerator memory for the bounded VRAM expert cache (#62):
-    /// upload a hot subset of the routed experts onto the device and run them
-    /// there, falling back to the host expert kernels for the rest.  `None`
-    /// disables (all routed experts stay on the host — today's layout);
-    /// `Some(n)` is the byte budget (from `--vram-expert-cache`), and the
-    /// engine raises it against the device's free memory when `auto`.
-    pub device_expert_cache: Option<u64>,
+    /// Bounded VRAM expert cache over the host expert pool (#62): upload a
+    /// subset of the routed experts onto the device and run them there,
+    /// falling back to the host expert kernels for the rest.
+    ///
+    /// [`VramExpertCache::Unset`] (the default) leaves the decision to the
+    /// engine: an `--expert-placement device` request on an architecture
+    /// whose device expert form *is* this cache (deepseek4 on OpenCL/SYCL)
+    /// implies it, and (#110) an `auto` placement that fell back to the host
+    /// engages it when the leftover device memory is worth a cache and the
+    /// device is not slower than CPU-BLAS on decode.
+    /// [`VramExpertCache::Auto`] (`--vram-expert-cache auto`) forces it sized
+    /// from the device's free memory, [`VramExpertCache::Bytes(n)`] fixes the
+    /// budget, and [`VramExpertCache::Disabled`] (`--vram-expert-cache 0`) is
+    /// the explicit opt-out (all routed experts stay on the host).
+    pub device_expert_cache: VramExpertCache,
     /// Tokens per prefill chunk; `0` selects [`DEFAULT_PREFILL_CHUNK`].
     ///
     /// A prompt is prefilled in chunks of this many tokens.  The chunk bounds
@@ -511,10 +519,10 @@ impl EngineOptions {
         self
     }
 
-    /// Set the bounded VRAM expert-cache byte budget.  `None` (the default)
-    /// disables the device cache.  See [`EngineOptions::device_expert_cache`].
-    pub fn vram_expert_cache(mut self, budget: Option<u64>) -> Self {
-        self.device_expert_cache = budget;
+    /// Set the bounded VRAM expert-cache setting.  See
+    /// [`EngineOptions::device_expert_cache`].
+    pub fn vram_expert_cache(mut self, setting: VramExpertCache) -> Self {
+        self.device_expert_cache = setting;
         self
     }
 
@@ -629,7 +637,7 @@ pub struct Engine {
     /// Whether the budget is sized automatically at load (see
     /// [`EngineOptions::expert_cache_auto`]).
     expert_cache_auto: bool,
-    /// Bounded VRAM expert-cache byte budget (see
+    /// Resolved bounded VRAM expert-cache byte budget the loaders get (see
     /// [`EngineOptions::device_expert_cache`]); `None` disables.
     device_expert_cache: Option<u64>,
     /// Tokens per prefill chunk (see [`EngineOptions::prefill_chunk`]),
@@ -1297,10 +1305,22 @@ impl Engine {
         // on-device; a weak iGPU / software OpenCL-Vulkan path is far slower
         // than CPU-BLAS and wants dense on the CPU.  `Auto` (the default)
         // runs a quick probe and picks by measured throughput; an explicit
-        // `Device` / `Cpu` request is honoured as-is.
-        let resolved_dense = if !device.is_cpu()
+        // `Device` / `Cpu` request is honoured as-is.  The same probe gates
+        // the auto-engaged VRAM expert cache (#110) on the device's decode
+        // throughput, so the bench runs once when either decision wants it.
+        let cache_capable = arch.is_some_and(|a| a.device_experts_are_a_cache(&device));
+        let cache_candidate = !device.is_cpu()
+            && matches!(
+                options.device_expert_cache,
+                crate::placement::VramExpertCache::Unset
+            )
+            && requested_placement == ExpertPlacement::Auto
+            && placement == crate::placement::ResolvedPlacement::Host
+            && cache_capable;
+        let dense_probe = !device.is_cpu()
             && options.dense_placement == crate::placement::DensePlacement::Auto
-            && crate::auto_placement::probe_enabled()
+            && crate::auto_placement::probe_enabled();
+        let bench = if dense_probe || (cache_candidate && crate::auto_placement::probe_enabled())
         {
             let bench = crate::auto_placement::benchmark(&device);
             tracing::info!(
@@ -1313,7 +1333,16 @@ impl Engine {
                 bench.decode_speedup(),
                 bench.prefill_speedup(),
             );
-            crate::auto_placement::recommend_dense(options.dense_placement, &bench, false)
+            Some(bench)
+        } else {
+            None
+        };
+        let resolved_dense = if dense_probe {
+            crate::auto_placement::recommend_dense(
+                options.dense_placement,
+                bench.as_ref().expect("the dense probe ran the bench"),
+                false,
+            )
         } else {
             crate::placement::resolve_dense_placement(options.dense_placement, device.is_cpu())
         };
@@ -1363,62 +1392,113 @@ impl Engine {
                 }
             }
         }
-        // Resolve `--vram-expert-cache auto` (`Some(0)` sentinel) to a concrete
-        // device byte budget: device free − dense (only when the dense set is
-        // on the device) − placement headroom − scratch − KV reserve (only
-        // when the KV cache is on the device, i.e. with the dense set).  A
-        // fixed MiB budget (Some(n>0)) passes through.  An architecture whose
-        // device expert form *is* this cache (deepseek4 on OpenCL/SYCL) treats an
-        // explicit `--expert-placement device` with no budget as `auto`, so
-        // the flag alone puts experts on the card.
-        let expert_cache_implied = arch.is_some_and(|a| a.device_experts_are_a_cache(&device))
-            && placement == crate::placement::ResolvedPlacement::Device
-            && options.device_expert_cache.is_none();
-        let mut device_expert_cache = if expert_cache_implied {
-            tracing::info!(
-                "expert placement `device` on {device:?}: the routed experts run from a bounded VRAM \
-                 cache; sizing it as --vram-expert-cache auto"
-            );
-            Some(0)
+        // Resolve the VRAM expert cache (#62, #110) to the concrete byte
+        // budget the loaders get.  An explicit setting wins: `Auto`
+        // (`--vram-expert-cache auto`, the `Some(0)` sentinel) sizes from the
+        // device's memory budget below, a fixed MiB budget passes through,
+        // and `0` is the opt-out.  With no setting, an `--expert-placement
+        // device` request on an architecture whose device expert form *is*
+        // this cache (deepseek4 on OpenCL/SYCL) implies `auto`, so the flag
+        // alone puts experts on the card; and an `auto` placement that fell
+        // back to the host engages the cache over the host pool when the
+        // leftover device memory is worth a cache and the device is not
+        // slower than CPU-BLAS on decode.
+        //
+        // The leftover is the same terms the `--vram-expert-cache auto`
+        // sizing below applies: device free − dense (only when the dense set
+        // is on the device) − placement headroom − scratch − KV reserve (only
+        // with the dense set on the device).
+        let (dense_term, kv_reserve, scratch) = if dense_device.is_cpu() {
+            (0, 0, DEVICE_SCRATCH_RESERVE_DENSE_ON_CPU)
         } else {
-            options.device_expert_cache
+            (
+                footprint.dense_upper,
+                DEVICE_KV_RESERVE_BYTES,
+                DEVICE_SCRATCH_RESERVE_DENSE_ON_DEVICE,
+            )
+        };
+        let vram_cache_leftover = device_budget.map(|free| {
+            crate::placement::device_expert_cache_bytes(
+                free,
+                dense_term,
+                crate::placement::DEVICE_PLACEMENT_HEADROOM + scratch,
+                kv_reserve,
+            )
+        });
+        let expert_cache_implied = cache_capable
+            && placement == crate::placement::ResolvedPlacement::Device
+            && matches!(
+                options.device_expert_cache,
+                crate::placement::VramExpertCache::Unset
+            );
+        let mut device_expert_cache: Option<u64> = match options.device_expert_cache {
+            crate::placement::VramExpertCache::Disabled => {
+                tracing::info!("vram expert cache: disabled (--vram-expert-cache 0)");
+                None
+            }
+            crate::placement::VramExpertCache::Bytes(0) => {
+                tracing::info!("vram expert cache: disabled (a zero byte budget)");
+                None
+            }
+            crate::placement::VramExpertCache::Bytes(n) => Some(n),
+            crate::placement::VramExpertCache::Auto => Some(0),
+            crate::placement::VramExpertCache::Unset if expert_cache_implied => {
+                tracing::info!(
+                    "expert placement `device` on {device:?}: the routed experts run from a bounded VRAM cache; sizing it as --vram-expert-cache auto"
+                );
+                Some(0)
+            }
+            crate::placement::VramExpertCache::Unset => {
+                match crate::placement::auto_vram_expert_cache(
+                    requested_placement,
+                    placement,
+                    cache_capable,
+                    vram_cache_leftover,
+                    expert_device_bytes,
+                    bench.as_ref().map(|b| b.decode_speedup()),
+                ) {
+                    Ok(()) => {
+                        tracing::info!(
+                            "expert placement `auto` fell back to the host with device memory to spare on {device:?}: engaging a bounded VRAM expert cache over the host pool, sized as --vram-expert-cache auto (#110)"
+                        );
+                        Some(0)
+                    }
+                    Err(decline) => {
+                        if decline.applicable() {
+                            tracing::info!(
+                                "vram expert cache not engaged: {}; --vram-expert-cache auto forces it",
+                                decline.describe()
+                            );
+                        }
+                        None
+                    }
+                }
+            }
         };
         if device_expert_cache == Some(0) {
-            // `--vram-expert-cache auto`: size from the device's memory
-            // budget (`--vram-budget`, else the probe), leaving room for
-            // whatever else lives there.
-            if let Some(free) = device_budget {
-                let (dense_term, kv_reserve, scratch) = if dense_device.is_cpu() {
-                    (0, 0, DEVICE_SCRATCH_RESERVE_DENSE_ON_CPU)
-                } else {
-                    (
-                        footprint.dense_upper,
-                        DEVICE_KV_RESERVE_BYTES,
-                        DEVICE_SCRATCH_RESERVE_DENSE_ON_DEVICE,
-                    )
-                };
-                let budget = crate::placement::device_expert_cache_bytes(
-                    free,
-                    dense_term,
-                    crate::placement::DEVICE_PLACEMENT_HEADROOM + scratch,
-                    kv_reserve,
-                );
-                tracing::info!(
-                    "vram-expert-cache auto: {:.2} GiB on {:?} ({:.2} GiB device memory − {:.2} GiB dense − \
-                     {:.2} GiB headroom+scratch − {:.2} GiB KV reserve)",
-                    budget as f64 / 2f64.powi(30),
-                    device,
-                    free as f64 / 2f64.powi(30),
-                    dense_term as f64 / 2f64.powi(30),
-                    (crate::placement::DEVICE_PLACEMENT_HEADROOM + scratch) as f64 / 2f64.powi(30),
-                    kv_reserve as f64 / 2f64.powi(30),
-                );
-                device_expert_cache = Some(budget);
-            } else {
-                tracing::info!(
-                    "vram-expert-cache auto: no device memory probe and no --vram-budget; disabled"
-                );
-                device_expert_cache = None;
+            // `--vram-expert-cache auto` (an explicit request, implied by an
+            // expert-placement `device` on a cache-capable architecture, or
+            // engaged by #110): size from the leftover device memory computed
+            // above.
+            match vram_cache_leftover {
+                Some(budget) => {
+                    tracing::info!(
+                        "vram-expert-cache auto: {:.2} GiB on {:?} ({:.2} GiB device memory − {:.2} GiB dense − {:.2} GiB headroom+scratch − {:.2} GiB KV reserve)",
+                        budget as f64 / 2f64.powi(30),
+                        device,
+                        device_budget.expect("a leftover implies a budget") as f64 / 2f64.powi(30),
+                        dense_term as f64 / 2f64.powi(30),
+                        (crate::placement::DEVICE_PLACEMENT_HEADROOM + scratch) as f64 / 2f64.powi(30),
+                        kv_reserve as f64 / 2f64.powi(30),
+                    );
+                    device_expert_cache = Some(budget);
+                }
+                None => {
+                    tracing::info!(
+                        "vram-expert-cache auto: no device memory probe and no --vram-budget; disabled"
+                    );
+                    device_expert_cache = None;
+                }
             }
         }
         let shares_weights = arch.is_some_and(|a| a.shares_weights());
@@ -1817,6 +1897,13 @@ impl Engine {
     /// [`EngineOptions::expert_placement`]).
     pub fn expert_device(&self) -> &Device {
         &self.expert_device
+    }
+
+    /// The resolved bounded VRAM expert-cache byte budget the loaders get:
+    /// what [`EngineOptions::device_expert_cache`] asked for, after the
+    /// `auto` sizing and the #110 engagement decision.  `None` disables.
+    pub fn device_expert_cache(&self) -> Option<u64> {
+        self.device_expert_cache
     }
 
     /// Number of sessions currently sharing the loaded weights of a

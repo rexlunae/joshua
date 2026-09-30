@@ -13,7 +13,9 @@ mod common;
 
 use candle_core::{Device, Tensor};
 use joshua::model::QuantizedModel;
-use joshua::{ChatMessage, Engine, EngineOptions, ExpertPlacement, GenerationOptions};
+use joshua::{
+    ChatMessage, Engine, EngineOptions, ExpertPlacement, GenerationOptions, VramExpertCache,
+};
 use std::io::Cursor;
 use std::path::Path;
 use std::sync::{Arc, RwLock, RwLockReadGuard};
@@ -563,6 +565,64 @@ fn engine_shares_one_weight_set_across_sessions() {
         "sessions derive from the template: {}",
         engine.shared_weight_sessions()
     );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The `--vram-expert-cache` setting reaches the loader through the engine:
+/// a fixed budget builds the device expert pool (on the CPU "device" a slot
+/// shares the host tensors), an explicit `0` — the documented opt-out — does
+/// not, and the default (`Unset`) engages nothing on a CPU build: the #110
+/// engagement needs an accelerator with a device memory probe and a
+/// placement probe.
+#[test]
+fn vram_expert_cache_settings_reach_the_loader() {
+    let _routing = routing_shared();
+    let dir = common::model_dir("vram-cache-setting-engine");
+    common::write_tiny_deepseek4_gguf(&dir.join("model.gguf"));
+    // One tiny expert: IQ2_XXS gate + up (128x256 -> 128 blocks x 66 B each)
+    // and a Q8_0 down (256x128 -> 1024 blocks x 34 B) = 51,712 bytes.
+    const SLOT_BYTES: u64 = 2 * 128 * 66 + 1024 * 34;
+
+    let budgeted = Engine::with_options(
+        &dir,
+        EngineOptions::with_n_ctx(64).vram_expert_cache(VramExpertCache::Bytes(3 * SLOT_BYTES)),
+    )
+    .expect("engine with a fixed VRAM expert-cache budget");
+    assert_eq!(
+        budgeted.device_expert_cache(),
+        Some(3 * SLOT_BYTES),
+        "a fixed budget passes through to the loader"
+    );
+
+    let off = Engine::with_options(
+        &dir,
+        EngineOptions::with_n_ctx(64).vram_expert_cache(VramExpertCache::Disabled),
+    )
+    .expect("engine with the cache explicitly disabled");
+    assert_eq!(
+        off.device_expert_cache(),
+        None,
+        "--vram-expert-cache 0 stays the opt-out"
+    );
+
+    let unset = Engine::with_options(&dir, EngineOptions::with_n_ctx(64))
+        .expect("engine with the default setting");
+    assert_eq!(
+        unset.device_expert_cache(),
+        None,
+        "auto engages nothing on the CPU device (no accelerator to cache on)"
+    );
+
+    // The budgeted engine still completes, running its pool on the CPU
+    // "device" (a hit wraps the same host weights).
+    let options = GenerationOptions {
+        max_tokens: 2,
+        temperature: 0.0,
+        ..GenerationOptions::default()
+    };
+    budgeted
+        .complete(&[ChatMessage::text("user", "hello")], &options)
+        .expect("completion with a VRAM expert-cache budget");
     std::fs::remove_dir_all(&dir).ok();
 }
 
