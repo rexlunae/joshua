@@ -1276,49 +1276,57 @@ impl crate::CustomOp1 for QTensor {
                 let slice = storage.as_slice::<f32>()?;
                 let slice =
                     &slice[layout.start_offset()..layout.start_offset() + src_shape.elem_count()];
-                let mut dst_storage = vec![0f32; dst_shape.elem_count()];
+                let dq = dst_shape.elem_count();
 
-                // Try the 8-column BlockQ4Kx8 repacked path.
-                #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
-                if self_storage.dtype() == GgmlDType::Q4K && n.is_multiple_of(8) {
-                    use zerocopy::{FromBytes, IntoBytes};
-
-                    let total_blocks =
-                        self_storage.storage_size_in_bytes() / std::mem::size_of::<BlockQ4K>();
-                    let repacked = self.repacked_qs.get_or_init(|| {
-                        let blocks = unsafe {
-                            std::slice::from_raw_parts(
-                                self_storage.as_ptr() as *const BlockQ4K,
-                                total_blocks,
-                            )
-                        };
-                        let packed = k_quants::pack_to_q4kx8(blocks, n);
-                        Some(packed.as_bytes().to_vec())
-                    });
-                    if let Some(repacked_bytes) = repacked {
-                        let block_x8: &[BlockQ4Kx8] =
-                            <[BlockQ4Kx8]>::ref_from_bytes(repacked_bytes).map_err(|_| {
-                                crate::Error::Msg(
-                                    "repacked_qs alignment invariant violated".to_string(),
-                                )
-                            })?;
-
-                        k_quants::matmul_q4k_x8(
-                            (dst_shape.elem_count() / n, k, n),
-                            slice,
-                            block_x8,
-                            &mut dst_storage,
-                        )?;
-                        return Ok((crate::CpuStorage::F32(dst_storage), dst_shape));
-                    }
+                // Reuse a warm thread-local output buffer across calls.  The
+                // matmul writes straight into it (already-resident, dirty
+                // pages), so we never pay the OS to allocate + zero a fresh
+                // vec! every call -- that per-call page zeroing
+                // (kernel_init_pages) is a measurable fraction of CPU decode
+                // cycles.  The returned storage is a fresh owned Vec cloned
+                // from the warm pages (no fault), keeping candle ownership.
+                thread_local! {
+                    static F32_SCRATCH: std::cell::RefCell<Vec<f32>> =
+                        const { std::cell::RefCell::new(Vec::new()) };
                 }
+                let dst_storage: crate::CpuStorage = F32_SCRATCH.with(|cell| {
+                    let mut sc = cell.borrow_mut();
+                    if sc.len() < dq {
+                        sc.resize(dq, 0f32);
+                    }
+                    let out = &mut sc[..dq];
 
-                self_storage.matmul_t(
-                    (dst_shape.elem_count() / n, k, n),
-                    slice,
-                    &mut dst_storage,
-                )?;
-                Ok((crate::CpuStorage::F32(dst_storage), dst_shape))
+                    #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+                    if self_storage.dtype() == GgmlDType::Q4K && n.is_multiple_of(8) {
+                        use zerocopy::{FromBytes, IntoBytes};
+                        let total_blocks = self_storage.storage_size_in_bytes()
+                            / std::mem::size_of::<BlockQ4K>();
+                        let repacked = self.repacked_qs.get_or_init(|| {
+                            let blocks = unsafe {
+                                std::slice::from_raw_parts(
+                                    self_storage.as_ptr() as *const BlockQ4K,
+                                    total_blocks,
+                                )
+                            };
+                            let packed = k_quants::pack_to_q4kx8(blocks, n);
+                            Some(packed.as_bytes().to_vec())
+                        });
+                        if let Some(repacked_bytes) = repacked {
+                            let block_x8: &[BlockQ4Kx8] =
+                                <[BlockQ4Kx8]>::ref_from_bytes(repacked_bytes).map_err(|_| {
+                                    crate::Error::Msg(
+                                        "repacked_qs alignment invariant violated".to_string(),
+                                    )
+                                })?;
+                            k_quants::matmul_q4k_x8((dq / n, k, n), slice, block_x8, out)?;
+                            return Ok(crate::CpuStorage::F32(out.to_vec()));
+                        }
+                    }
+
+                    self_storage.matmul_t((dq / n, k, n), slice, out)?;
+                    Ok::<_, crate::Error>(crate::CpuStorage::F32(out.to_vec()))
+                })?;
+                Ok((dst_storage, dst_shape))
             }
             DType::F16 => {
                 let slice = storage.as_slice::<f16>()?;
