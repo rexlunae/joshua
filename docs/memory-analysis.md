@@ -101,8 +101,10 @@ experts borrowed on the CPU on every backend; on OpenCL/SYCL `device` (or a
 `docs/accelerator-backends.md` — whose footprint is the budget, not the
 pool, so its per-session device footprint is the dense set alone.  Since
 #110 an `auto` placement that fell back to the host engages that cache
-itself when the leftover device memory holds at least 10% of the routed
-experts on a device that decodes at least as fast as CPU-BLAS.
+itself when the leftover device memory holds at least 5% of the routed
+experts on a device that decodes at least as fast as CPU-BLAS (#114
+softened #110's 10% floor — the hot set is protected and churn experts
+keep their host pages, so a small cache converges on the working set);
 The device accounting follows what each loader leaves resident rather
 than the on-disk bytes.  Only two kinds of tensor stay quantized on the
 device: the routed experts and the weight matrices every loader wraps in a

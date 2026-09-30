@@ -30,15 +30,27 @@ template<class F> int guard(F&& f) noexcept {
 }
 struct Context {
     sycl::queue queue;
+    // A second in-order queue for weight uploads (the bounded VRAM expert
+    // cache's background uploader, #114).  On the shared compute queue a
+    // large upload sits between already-enqueued kernels and delays every
+    // one of them — with a small-residency cache uploading continuously
+    // that serialized decode against the transfer stream.  On its own
+    // queue an upload only occupies the PCIe link; the uploader finishes
+    // this queue before a slot is published, so kernels never read a
+    // half-written expert.
+    sycl::queue transfer_queue;
     std::mutex mutex;
     std::vector<std::pair<void*, size_t>> retired;
     size_t retired_bytes = 0;
     size_t pending = 0;
     explicit Context(sycl::device dev) : queue(dev, [](sycl::exception_list errors) {
         for (auto error : errors) std::rethrow_exception(error);
+    }, sycl::property::queue::in_order{}), transfer_queue(dev, [](sycl::exception_list errors) {
+        for (auto error : errors) std::rethrow_exception(error);
     }, sycl::property::queue::in_order{}) {}
     void wait() {
         queue.wait_and_throw();
+        transfer_queue.wait_and_throw();
         for (auto [p, size] : retired) sycl::free(p, queue);
         retired.clear(); retired_bytes = 0; pending = 0;
     }
@@ -48,7 +60,7 @@ struct Context {
     }
     ~Context() {
         // Never free live device memory, even during unwinding.
-        try { wait(); } catch (...) { queue.wait(); }
+        try { wait(); } catch (...) { queue.wait(); transfer_queue.wait_and_throw(); }
         for (auto [p, size] : retired) sycl::free(p, queue);
     }
 };
@@ -140,6 +152,19 @@ API int joshua_sycl_write(uintptr_t h, uintptr_t dst, size_t off, size_t size, c
         require(b.owner.get() == &ctx, "SYCL buffer belongs to another context");
         std::lock_guard lock(ctx.mutex);
         ctx.queue.memcpy(static_cast<char*>(b.data) + off, src, size); ctx.wait();
+    });
+}
+API int joshua_sycl_transfer_write(uintptr_t h, uintptr_t dst, size_t off, size_t size, const void* src) noexcept {
+    return guard([&] {
+        auto& ctx = context(h); auto& b = buffer(dst); bounds(b, off, size);
+        require(b.owner.get() == &ctx, "SYCL buffer belongs to another context");
+        std::lock_guard lock(ctx.mutex);
+        // Blocking on the *transfer* queue: the calling thread (the expert
+        // uploader) waits for its own memcpy, but no compute-queue kernel
+        // is delayed and no kernel can slip ahead of the write on this
+        // in-order queue, so the storage is complete when this returns.
+        ctx.transfer_queue.memcpy(static_cast<char*>(b.data) + off, src, size);
+        ctx.transfer_queue.wait_and_throw();
     });
 }
 API int joshua_sycl_read(uintptr_t h, uintptr_t src, size_t off, size_t size, void* dst) noexcept {

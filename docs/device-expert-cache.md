@@ -17,6 +17,22 @@ tracked future work in [issue #52](https://github.com/rexlunae/joshua/issues/52)
 | 5 runtime | adaptive loop feeding measured hit-ratio/bus bytes into `adaptive_budget` | ⏳ future (with the device backend) |
 | 6 | MXFP4 deepseek4 GPU kernels (V4-Flash on GPU) | ⏳ future (long pole) |
 
+**#114 (partial-cache usability on small cards).** The OpenCL/SYCL slot pool
+is live, and the measured small-card thrash was fixed at its roots, not by
+policy: (1) the SYCL bridge gained a second in-order **transfer queue**
+(`joshua_sycl_transfer_write`) — uploads previously shared the compute queue,
+so a large memcpy delayed every enqueued kernel; (2) the host-page release
+hook keeps the pages of **non-hot** (churn) experts, so a host miss after an
+eviction re-runs from the warm page cache instead of faulting the model file;
+(3) the hot-set refresh now also **requests uploads** for its members, so the
+cache converges on the stable working set ahead of the per-step churn; and
+(4) `--expert-placement auto`'s engagement floor dropped from 10% to 5%
+residency (a hot-protected cache mostly hits even at low residency), and a
+decision that declines *only* on residency moves the dense set to CPU-BLAS
+when the freed memory clears the floor and the placement probe does not show
+a decisive device GEMM win (`dense_to_cpu_for_cache`).  The CUDA async-copy
+phase below remains future work for a CUDA slot cache.
+
 **Backend note:** the device backend must not be CUDA-only — ROCm stays an
 option.  HIP's API mirrors CUDA's (`hipMemcpyAsync` ≈ `cudaMemcpyAsync`,
 `hipStreamSynchronize` ≈ `cudaStreamSynchronize`), and candle exposes both via

@@ -1109,10 +1109,27 @@ impl QSyclStorage {
         Self::from_bytes_on(device, device.queue(), dtype, elem_count, data)
     }
 
-    /// Blocking upload. This initial backend uses the compute queue for all
-    /// transfers; returned storage is immediately safe to use.
+    /// Blocking upload on the *transfer* queue: the calling thread (the
+    /// expert uploader) waits for its own memcpy, but no compute-queue
+    /// kernel is delayed and no kernel can slip ahead of the write on this
+    /// in-order queue, so the returned storage is immediately safe to use
+    /// (#114: on the shared compute queue a large upload sat between
+    /// already-enqueued kernels and delayed every one of them).
     pub fn from_bytes_transfer(device: &SyclDevice, dtype: GgmlDType, elem_count: usize, data: &[u8]) -> Result<Self> {
-        Self::from_bytes_on(device, device.transfer_queue(), dtype, elem_count, data)
+        Self::from_bytes_transfer_on(device, dtype, elem_count, data)
+    }
+
+    fn from_bytes_transfer_on(device: &SyclDevice, dtype: GgmlDType, elem_count: usize, data: &[u8]) -> Result<Self> {
+        let bytes = Self::bytes_for(dtype, elem_count)?;
+        if data.len() < bytes {
+            return Err(Error::Msg(format!("sycl: {} bytes given for a {dtype:?} tensor needing {bytes}", data.len())));
+        }
+        let buffer = create_buffer(device.context(), bytes.max(1), 0)?;
+        if let Err(e) = unsafe { bridge::transfer_write(device.context(), buffer, 0, bytes, data.as_ptr()) } {
+            unsafe { bridge::free(buffer) };
+            return Err(e);
+        }
+        Ok(Self { buffer, byte_offset: 0, dtype, elem_count, device: device.clone(), _host: None })
     }
 
     fn from_bytes_on(device: &SyclDevice, queue: usize, dtype: GgmlDType, elem_count: usize, data: &[u8]) -> Result<Self> {
