@@ -273,8 +273,15 @@ enum Commands {
         /// of the output's trailing n-gram) and verify them in one forward
         /// pass.  Output is unchanged; repetitive output (code edits, quoted
         /// context, tool-call arguments) decodes in fewer weight sweeps.
-        /// `0` (the default) disables it.  Applies to qwen3moe and
-        /// deepseek2 (incl. V3 / Kimi-K2); other models ignore it.
+        /// `0` (the default) disables it.  Applies to the loaders that can
+        /// score every position and roll their KV cache back: the plain-
+        /// attention qwen family (qwen, qwen2moe, qwen2vl, qwen3, qwen3moe,
+        /// qwen3vl, qwen3vlmoe, chatglm, glm4, glm4moe), the deepseek2 family
+        /// (deepseek, deepseek2, glm-dsa — incl. V3 / Kimi-K2 / GLM-5), and
+        /// deepseek4 / deepseek41.  Models with recurrent DeltaNet or KDA
+        /// layers (qwen3next, qwen3.5, qwen4exp, glm5next, kimi-linear,
+        /// kimi-k3) and candle's stock loaders cannot roll their KV cache
+        /// back; there the flag is ignored with a warning.
         #[arg(
             long,
             env = "JOSHUA_SPECULATIVE",
@@ -431,8 +438,15 @@ enum Commands {
         /// of the output's trailing n-gram) and verify them in one forward
         /// pass.  Output is unchanged; repetitive output (code edits, quoted
         /// context, tool-call arguments) decodes in fewer weight sweeps.
-        /// `0` (the default) disables it.  Applies to qwen3moe and
-        /// deepseek2 (incl. V3 / Kimi-K2); other models ignore it.
+        /// `0` (the default) disables it.  Applies to the loaders that can
+        /// score every position and roll their KV cache back: the plain-
+        /// attention qwen family (qwen, qwen2moe, qwen2vl, qwen3, qwen3moe,
+        /// qwen3vl, qwen3vlmoe, chatglm, glm4, glm4moe), the deepseek2 family
+        /// (deepseek, deepseek2, glm-dsa — incl. V3 / Kimi-K2 / GLM-5), and
+        /// deepseek4 / deepseek41.  Models with recurrent DeltaNet or KDA
+        /// layers (qwen3next, qwen3.5, qwen4exp, glm5next, kimi-linear,
+        /// kimi-k3) and candle's stock loaders cannot roll their KV cache
+        /// back; there the flag is ignored with a warning.
         #[arg(
             long,
             env = "JOSHUA_SPECULATIVE",

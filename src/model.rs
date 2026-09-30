@@ -349,6 +349,50 @@ impl Architecture {
     pub fn is_deepseek4(&self) -> bool {
         matches!(self, Self::DeepSeek4 | Self::DeepSeek41)
     }
+    /// Why `--speculative` cannot run on this architecture, or `None` when
+    /// it can.  Two kinds of reason: a stock candle loader keeps its KV
+    /// cache private (no all-position logits, no rollback), and every real
+    /// model of a recurrent hybrid carries DeltaNet / KDA layers whose
+    /// state only clears, never rewinds.  Kept in step with
+    /// [`QuantizedModel::supports_speculative`], which answers for the
+    /// loaded instance.
+    pub fn unsupported_speculative_reason(&self) -> Option<&'static str> {
+        let reason = match self {
+            Self::Llama | Self::Gemma | Self::Lfm2 | Self::Phi2 | Self::Phi3 | Self::Qwen2 => {
+                "candle's stock loader keeps the KV cache private"
+            }
+            Self::Qwen3Next | Self::Qwen35 | Self::Qwen35Moe | Self::Qwen4Exp => {
+                "its Gated DeltaNet layers carry recurrent state that cannot be rewound (only cleared)"
+            }
+            Self::Glm5Next | Self::KimiLinear | Self::KimiK3 => {
+                "its KDA layers carry recurrent state that cannot be rewound (only cleared)"
+            }
+            Self::Qwen
+            | Self::Qwen2Moe
+            | Self::Qwen2Vl
+            | Self::Qwen3
+            | Self::Qwen3Moe
+            | Self::Qwen3Vl
+            | Self::Qwen3VlMoe
+            | Self::ChatGlm
+            | Self::Glm4
+            | Self::Glm4Moe
+            | Self::DeepSeek
+            | Self::DeepSeek2
+            | Self::GlmDsa
+            | Self::DeepSeek4
+            | Self::DeepSeek41 => return None,
+        };
+        Some(reason)
+    }
+
+    /// Whether this architecture can run speculative decoding: a
+    /// verification pass that scores every position in one forward sweep
+    /// plus a KV rollback past the rejected draft tokens.  See
+    /// [`crate::speculative`].
+    pub fn supports_speculative_decoding(&self) -> bool {
+        self.unsupported_speculative_reason().is_none()
+    }
 
     /// Whether the routed experts must stay in host RAM *given the active
     /// device*.  `DeepSeek4` experts may run on an OpenCL or SYCL device
@@ -769,13 +813,22 @@ impl QuantizedModel {
     /// Whether [`QuantizedModel::truncate_kv_cache`] can shorten this
     /// instance's KV cache to an arbitrary prefix length.
     ///
-    /// Only the Joshua-owned loaders with plain append-only caches qualify:
-    /// candle's stock loaders keep their caches private, and recurrent state
-    /// — `deepseek4`'s running compressors, the Gated DeltaNet layers of
-    /// Qwen3-Next / Qwen3.5 — cannot be rewound to an arbitrary past
-    /// position (only cleared).
+    /// Only the Joshua-owned loaders with rewound-able caches qualify.
+    /// candle's stock loaders keep their caches private.  The `qwen` loader's
+    /// Gated DeltaNet layers and the `deepseek2` loader's KDA layers carry
+    /// recurrent state that can only be cleared, not rewound — a loaded
+    /// instance of one of those hybrids answers `false` here even though its
+    /// plain-attention siblings answer `true`.  `deepseek4`'s sliding-window
+    /// ring and streaming compressors are rewound through the verification
+    /// pass's checkpoint (see
+    /// [`crate::quantized_deepseek4::ModelWeights::truncate_kv_cache`]), so a
+    /// just-run verification pass can always be rolled back, while an
+    /// arbitrary backward truncate without one is refused by the loader.
     pub fn supports_kv_truncate(&self) -> bool {
-        session!(self, m => m.supports_truncate(), _ => false)
+        match self {
+            Self::DeepSeek4(_) => true,
+            _ => session!(self, m => m.supports_truncate(), _ => false),
+        }
     }
 
     /// Keep only the first `keep_len` fed tokens of every layer's KV cache.
@@ -792,10 +845,15 @@ impl QuantizedModel {
     /// check [`Self::supports_kv_truncate`] to distinguish that from a real
     /// error.
     pub fn truncate_kv_cache(&mut self, keep_len: usize) -> Result<bool> {
-        if !self.supports_kv_truncate() {
-            return Ok(false);
+        match self {
+            Self::DeepSeek4(m) => m.truncate_kv_cache(keep_len).map(|_| true),
+            _ => {
+                if !self.supports_kv_truncate() {
+                    return Ok(false);
+                }
+                session!(self, m => m.truncate_kv_cache(keep_len).map(|_| true), _ => Ok(false))
+            }
         }
-        session!(self, m => m.truncate_kv_cache(keep_len).map(|_| true), _ => Ok(false))
     }
 
     /// Unified forward pass.
@@ -827,12 +885,17 @@ impl QuantizedModel {
 
     /// Forward pass returning the logits of every input position,
     /// `[1, seq_len, vocab]` — the speculative-decoding verification pass.
-    /// Only the [`crate::native_session::Session`] loaders implement it; the
-    /// rest return an unsupported error.
+    /// Only the [`crate::native_session::Session`] loaders and `deepseek4`
+    /// implement it; the rest return an unsupported error.
     pub fn forward_all_logits(&mut self, input: &Tensor, index_pos: usize) -> Result<Tensor> {
-        session!(self, m => m.forward_all_logits(input, index_pos), _ => Err(candle_core::Error::Msg(
-            "all-position logits are not implemented for this architecture".into(),
-        )))
+        match self {
+            Self::DeepSeek4(m) => m.forward_all_logits(input, index_pos),
+            _ => {
+                session!(self, m => m.forward_all_logits(input, index_pos), _ => Err(candle_core::Error::Msg(
+                    "all-position logits are not implemented for this architecture".into(),
+                )))
+            }
+        }
     }
 
     /// Whether this architecture has a native layer-streaming prefill path.

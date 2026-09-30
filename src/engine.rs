@@ -444,9 +444,11 @@ pub struct EngineOptions {
     /// output (code edits, quoted context, tool-call arguments) needs far
     /// fewer weight sweeps.  See [`crate::speculative`].
     ///
-    /// Applies to the architectures that can score every position and
-    /// truncate their KV cache (`qwen3moe`, `deepseek2`); others silently
-    /// keep one-token decoding.
+    /// Applies to the architectures whose loaders can score every position
+    /// and roll their KV cache back (`qwen3moe`, `deepseek2`, `deepseek4` —
+    /// see [`crate::model::Architecture::supports_speculative_decoding`]);
+    /// on the others — candle's stock loaders and the recurrent DeltaNet /
+    /// KDA hybrids — the request warns at load and is ignored.
     pub speculative: Option<SpeculativeConfig>,
 }
 
@@ -668,6 +670,10 @@ pub struct Engine {
     /// device's memory at load (see [`crate::placement::instances_for_memory`]).
     /// `None` leaves the pool on the RAM-adaptive rule.
     device_session_cap: Option<usize>,
+    /// The model's architecture, when candle has a loader for it (see
+    /// [`Self::arch_error`]).  Gates per-architecture capabilities at
+    /// construction time.
+    arch: Option<crate::model::Architecture>,
     /// Speculative decoding settings (see [`EngineOptions::speculative`]).
     speculative: Option<SpeculativeConfig>,
     /// Draft tokens verified by speculative decoding.
@@ -1248,6 +1254,35 @@ impl Engine {
             }
         };
 
+        // Speculative decoding is per-architecture: it needs a verification
+        // pass (all-position logits) plus a KV rollback past the rejected
+        // draft tokens.  The loaded instance is re-checked at decode time;
+        // this static check is what keeps the flag from being silently
+        // ignored — an unsupported request warns here, decoding proceeds
+        // plainly, and the effective configuration (`speculative_config`)
+        // reads back `None`.
+        let speculative = match (options.speculative, arch) {
+            (Some(config), Some(arch)) => match arch.unsupported_speculative_reason() {
+                Some(reason) => {
+                    tracing::warn!(
+                        "--speculative requested, but speculative decoding is not available on \
+                         {}: {reason}; the flag is ignored for this model",
+                        arch.display_name(),
+                    );
+                    None
+                }
+                None => Some(SpeculativeConfig::normalized(config)),
+            },
+            (Some(_), None) => {
+                tracing::warn!(
+                    "--speculative requested, but no candle loader was detected for this model \
+                     (unsupported architecture or NPU-only); the flag is ignored"
+                );
+                None
+            }
+            (None, _) => None,
+        };
+
         let eos_token_ids = extract_eos_ids(&gguf, &tokenizer);
         let chat_template = extract_chat_template(&gguf, &tokenizer);
         let device = Self::resolve_device(options.backend)?;
@@ -1620,10 +1655,11 @@ impl Engine {
             expert_device,
             weights_template: Mutex::new(None),
             device_session_cap,
-            speculative: options.speculative.map(SpeculativeConfig::normalized),
+            speculative,
             spec_drafted: AtomicU64::new(0),
             spec_accepted: AtomicU64::new(0),
             spec_verify_steps: AtomicU64::new(0),
+            arch,
             arch_error,
         })
     }
@@ -2644,15 +2680,42 @@ impl Engine {
         self.kv_edit_reuses.load(Ordering::Relaxed)
     }
 
-    /// Speculative decoding settings in effect, if enabled.
+    /// Speculative decoding settings in effect, if enabled — `None` also
+    /// when a configuration was requested but the model's architecture
+    /// cannot run speculative decoding (see
+    /// [`crate::model::Architecture::unsupported_speculative_reason`]),
+    /// rather than a setting decode time would silently skip.
     pub fn speculative_config(&self) -> Option<SpeculativeConfig> {
         self.speculative
     }
 
     /// Enable (or disable) speculative token generation after construction.
     /// See [`EngineOptions::speculative`].
+    ///
+    /// Gated on the architecture like the constructor: on a model that
+    /// cannot run speculative decoding this warns and stores `None` rather
+    /// than a configuration decode time would silently skip.
     pub fn with_speculative(mut self, config: Option<SpeculativeConfig>) -> Self {
-        self.speculative = config.map(SpeculativeConfig::normalized);
+        self.speculative = config.and_then(|config| match self.arch {
+            Some(arch) => match arch.unsupported_speculative_reason() {
+                Some(reason) => {
+                    tracing::warn!(
+                        "speculative decoding is not available on {}: {reason}; \
+                         the request is ignored for this model",
+                        arch.display_name(),
+                    );
+                    None
+                }
+                None => Some(SpeculativeConfig::normalized(config)),
+            },
+            None => {
+                tracing::warn!(
+                    "speculative decoding requested, but no candle loader was detected for this \
+                     model (unsupported architecture or NPU-only); the request is ignored"
+                );
+                None
+            }
+        });
         self
     }
 
