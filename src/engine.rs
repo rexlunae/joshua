@@ -1449,6 +1449,11 @@ impl Engine {
                 Some(0)
             }
             crate::placement::VramExpertCache::Unset => {
+                // The probe figure is the dense set's Q4_K GEMM — a proxy for
+                // the expert kernels (the cached deepseek4 experts run
+                // IQ2_XXS gate/up and Q2_K down on the device), so this gate
+                // is a coarse filter; confirm on hardware.  See
+                // `auto_vram_expert_cache`.
                 match crate::placement::auto_vram_expert_cache(
                     requested_placement,
                     placement,

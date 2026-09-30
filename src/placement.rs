@@ -380,7 +380,7 @@ impl AutoVramCacheDecline {
                 100.0 * AUTO_VRAM_CACHE_MIN_RESIDENCY.0 as f64 / AUTO_VRAM_CACHE_MIN_RESIDENCY.1 as f64,
             ),
             AutoVramCacheDecline::DeviceSlower(speedup) => format!(
-                "the placement probe measured decode at {speedup:.2}x of CPU-BLAS (the device is slower than the CPU for the dense set)"
+                "the placement probe measured decode at {speedup:.2}x of CPU-BLAS (the device is slower than the CPU for the dense set; the probe is a Q4_K proxy for the expert kernels)"
             ),
         }
     }
@@ -414,7 +414,11 @@ impl AutoVramCacheDecline {
 ///   CPU-BLAS (`probe_decode_speedup` below 1.0) keeps the cache off — the
 ///   cache only affects decode, and resident experts would run on slower
 ///   kernels than the host's.  No probe (`None`) leaves the size rule in
-///   charge.
+///   charge.  The probe is a *proxy*: it times the dense set's Q4_K GEMM,
+///   while the cached deepseek4 experts run IQ2_XXS gate/up and Q2_K down
+///   device kernels whose device-vs-CPU speedup can differ — treat this
+///   gate as a coarse filter and confirm on hardware (the decode time-split
+///   log); `--vram-expert-cache auto` overrides it either way.
 pub fn auto_vram_expert_cache(
     requested: ExpertPlacement,
     resolved: ResolvedPlacement,
