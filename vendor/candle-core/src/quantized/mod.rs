@@ -1279,17 +1279,26 @@ impl crate::CustomOp1 for QTensor {
                 let dq = dst_shape.elem_count();
 
                 // Reuse a warm thread-local output buffer across calls.  The
-                // matmul writes straight into it (already-resident, dirty
-                // pages), so we never pay the OS to allocate + zero a fresh
-                // vec! every call -- that per-call page zeroing
-                // (kernel_init_pages) is a measurable fraction of CPU decode
-                // cycles.  The returned storage is a fresh owned Vec cloned
-                // from the warm pages (no fault), keeping candle ownership.
+                // matmul writes straight into an already-resident buffer, so
+                // the per-call memset-zero of a fresh vec![0f32; dq] (OS
+                // kernel_init_pages) is avoided on the reused region.  The
+                // returned storage is a fresh owned Vec cloned out (that
+                // clone still allocates new pages), so the win is the
+                // reduced re-zero/re-fault churn on the hot reused buffer
+                // (measured ~-10% minor faults on CPU decode, not a full
+                // no-alloc path).  Bounded below so large calls don't retain
+                // peak capacity.
                 thread_local! {
                     static F32_SCRATCH: std::cell::RefCell<Vec<f32>> =
                         const { std::cell::RefCell::new(Vec::new()) };
                 }
-                let dst_storage: crate::CpuStorage = F32_SCRATCH.with(|cell| {
+                const MAX_SCRATCH_FLOATS: usize = 1 << 21; // 8 MiB / thread
+                let dst_storage: crate::CpuStorage = if dq > MAX_SCRATCH_FLOATS {
+                    let mut own = vec![0f32; dq];
+                    self_storage.matmul_t((dq / n, k, n), slice, &mut own)?;
+                    Ok(crate::CpuStorage::F32(own))
+                } else {
+                    F32_SCRATCH.with(|cell| {
                     let mut sc = cell.borrow_mut();
                     if sc.len() < dq {
                         sc.resize(dq, 0f32);
@@ -1325,7 +1334,8 @@ impl crate::CustomOp1 for QTensor {
 
                     self_storage.matmul_t((dq / n, k, n), slice, out)?;
                     Ok::<_, crate::Error>(crate::CpuStorage::F32(out.to_vec()))
-                })?;
+                    })
+                }?;
                 Ok((dst_storage, dst_shape))
             }
             DType::F16 => {
