@@ -1890,10 +1890,16 @@ mod tests {
         let k = 2usize; // n_expert_used
         let ffn = 10usize; // intermediate size
 
-        let lin = |rows: usize, cols: usize| -> QMatMul {
-            QMatMul::Tensor(Tensor::randn(0f32, 1f32, (rows, cols), &dev).unwrap())
+        // Fixed, bounded inputs avoid flaky absolute-error checks from large
+        // random outputs and ordinary batched/serial accumulation rounding.
+        use rand::{rngs::StdRng, Rng, SeedableRng};
+        let mut rng = StdRng::seed_from_u64(42);
+        let mut tensor = |rows: usize, cols: usize| -> Result<Tensor> {
+            let data: Vec<f32> = (0..rows * cols).map(|_| rng.gen_range(-1.0..1.0)).collect();
+            Tensor::from_vec(data, (rows, cols), &dev)
         };
-        let gate = Tensor::randn(0f32, 1f32, (n_expert, h), &dev)?;
+        let gate = tensor(n_expert, h)?;
+        let mut lin = |rows, cols| QMatMul::Tensor(tensor(rows, cols).unwrap());
         let experts = (0..n_expert)
             .map(|_| Mlp {
                 gate: lin(ffn, h),
@@ -1922,7 +1928,7 @@ mod tests {
         };
 
         // Batched path: 3 tokens in one forward (softmax routing per token).
-        let xs = Tensor::randn(0f32, 1f32, (1, 3, h), &dev)?;
+        let xs = tensor(3, h)?.reshape((1, 3, h))?;
         let (out_batch, _) = moe.forward(&xs)?; // [1, 3, h]
 
         // Decode path: same 3 tokens one at a time, concatenated.

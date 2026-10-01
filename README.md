@@ -1174,6 +1174,22 @@ multicast interoperability or LAN throughput.
 
 ---
 
+## CPU kernel checks
+
+IQ2_XXS and MXFP4 keep weights compressed and reuse decoded vectors across
+prompt rows on NEON and AVX2. AVX-512 remains the preferred path when available;
+`JOSHUA_SIMD=scalar` selects the portable fallback for comparison.
+
+```bash
+cargo test --release --lib iq2xxs
+cargo test --release --lib mxfp4
+cargo test --release --lib bench_ -- --ignored --nocapture --test-threads=1
+```
+
+The ignored benchmarks compare isolated, in-memory kernels with the portable
+worker using the same inputs and serial row scheduling. They do not measure
+full-model generation or disk paging. Run them separately from other workloads.
+
 ## Roadmap
 
 - [x] Chat completions (non-streaming)

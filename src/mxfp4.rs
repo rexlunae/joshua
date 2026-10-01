@@ -127,8 +127,195 @@ impl crate::raw_block::RawBlock for BlockMxfp4 {
         ]
     }
 
+    fn matmul_t(
+        mkn: (usize, usize, usize),
+        lhs: &[f32],
+        rhs: &[Self],
+        dst: &mut [f32],
+    ) -> candle_core::Result<()> {
+        matmul_t_dispatch(mkn, lhs, rhs, dst, true)
+    }
+
     fn dequantize_block(&self, out: &mut [f32]) {
         self.dequantize(out.try_into().expect("one MXFP4 block"));
+    }
+}
+
+fn matmul_t_dispatch(
+    mkn: (usize, usize, usize),
+    lhs: &[f32],
+    rhs: &[BlockMxfp4],
+    dst: &mut [f32],
+    parallel: bool,
+) -> candle_core::Result<()> {
+    let blocks_per_row = crate::raw_block::validate_matmul_t(mkn, lhs, rhs, dst)?;
+    if mkn.0 == 0 || mkn.2 == 0 {
+        return Ok(());
+    }
+    if mkn.1 == 0 {
+        dst.fill(0.0);
+        return Ok(());
+    }
+    if try_fused_matmul(mkn, blocks_per_row, lhs, rhs, dst, parallel) {
+        return Ok(());
+    }
+    }
+    if parallel {
+        crate::raw_block::matmul_t(mkn, lhs, rhs, dst)
+    } else {
+        crate::raw_block::matmul_t_serial(mkn, lhs, rhs, dst)
+    }
+}
+
+/// The fused AVX2 or NEON kernel for every row at its matching level. Returns
+/// `true` if it ran; the kernel writes each dst element exactly once, so no
+/// zero-fill is needed.
+fn try_fused_matmul(
+    mkn: (usize, usize, usize),
+    blocks_per_row: usize,
+    lhs: &[f32],
+    rhs: &[BlockMxfp4],
+    dst: &mut [f32],
+    parallel: bool,
+) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    if crate::simd::simd_level() == crate::simd::SimdLevel::Avx2 {
+        let (m, k, n) = mkn;
+        let dst_ptr = crate::simd::DstPtr::new(dst);
+        let worker = |row: usize| {
+            // SAFETY: `simd_level` only reports levels this CPU supports;
+            // row `row` writes exactly dst[i*n + row] for i in 0..m,
+            // disjoint from every other row (see `crate::simd`).
+            unsafe { matmul_row_avx2(m, k, n, lhs, rhs, blocks_per_row, row, &dst_ptr) }
+        };
+        if parallel {
+            crate::simd::for_each_row(n, worker);
+        } else {
+            (0..n).for_each(worker);
+        }
+        return true;
+    }
+    #[cfg(target_arch = "aarch64")]
+    if crate::simd::simd_level() == crate::simd::SimdLevel::Neon {
+        let (m, k, n) = mkn;
+        let dst_ptr = crate::simd::DstPtr::new(dst);
+        let worker = |row: usize| {
+            // SAFETY: NEON is available, shapes are validated, and each
+            // worker owns a disjoint output column.
+            unsafe { matmul_row_neon(m, k, n, lhs, rhs, blocks_per_row, row, &dst_ptr) }
+        };
+        if parallel {
+            crate::simd::for_each_row(n, worker);
+        } else {
+            (0..n).for_each(worker);
+        }
+        return true;
+    }
+    let _ = (mkn, blocks_per_row, lhs, rhs, dst, parallel);
+    false
+}
+
+/// Decode directly into vectors and reuse each block across four prompt
+/// rows. Low and high nibbles address separate halves of the activation block.
+///
+/// # Safety
+/// Requires avx2,fma, validated shapes, and disjoint output columns.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn matmul_row_avx2(
+    m: usize,
+    k: usize,
+    n: usize,
+    lhs: &[f32],
+    rhs: &[BlockMxfp4],
+    blocks_per_row: usize,
+    row: usize,
+    dst: &crate::simd::DstPtr,
+) {
+    use std::arch::x86_64::*;
+    const MTILE: usize = 4;
+    let blocks = &rhs[row * blocks_per_row..(row + 1) * blocks_per_row];
+    for m0 in (0..m).step_by(MTILE) {
+        let count = (m - m0).min(MTILE);
+        let mut acc = [_mm256_setzero_ps(); MTILE];
+        for (b, block) in blocks.iter().enumerate() {
+            let mut w = [_mm256_setzero_ps(); 4];
+            if let Some(scale) = e8m0_to_f32(block.e) {
+                let d = _mm256_set1_ps(scale);
+                for j in 0..2 {
+                    // Eight bytes are available even for the last group.
+                    let bytes = _mm_loadl_epi64(block.qs.as_ptr().add(j * 8).cast());
+                    let codes = _mm256_cvtepu8_epi32(bytes);
+                    let lo = _mm256_and_si256(codes, _mm256_set1_epi32(15));
+                    let hi = _mm256_srli_epi32::<4>(codes);
+                    w[j] = _mm256_mul_ps(d, _mm256_i32gather_ps::<4>(E2M1.as_ptr(), lo));
+                    w[j + 2] = _mm256_mul_ps(d, _mm256_i32gather_ps::<4>(E2M1.as_ptr(), hi));
+                }
+            }
+            for i in 0..count {
+                let a = lhs.as_ptr().add((m0 + i) * k + b * QK_MXFP4);
+                for j in 0..4 {
+                    acc[i] = _mm256_fmadd_ps(_mm256_loadu_ps(a.add(j * 8)), w[j], acc[i]);
+                }
+            }
+        }
+        for i in 0..count {
+            dst.write((m0 + i) * n + row, crate::simd::hsum256(acc[i]));
+        }
+    }
+}
+
+/// Decode directly into vectors and reuse each block across four prompt
+/// rows. Low and high nibbles address separate halves of the activation block.
+///
+/// # Safety
+/// Requires neon, validated shapes, and disjoint output columns.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn matmul_row_neon(
+    m: usize,
+    k: usize,
+    n: usize,
+    lhs: &[f32],
+    rhs: &[BlockMxfp4],
+    blocks_per_row: usize,
+    row: usize,
+    dst: &crate::simd::DstPtr,
+) {
+    use std::arch::aarch64::*;
+    const MTILE: usize = 4;
+    let blocks = &rhs[row * blocks_per_row..(row + 1) * blocks_per_row];
+    for m0 in (0..m).step_by(MTILE) {
+        let count = (m - m0).min(MTILE);
+        let mut acc = [vdupq_n_f32(0.0); MTILE];
+        for (b, block) in blocks.iter().enumerate() {
+            let mut w = [vdupq_n_f32(0.0); 8];
+            if let Some(scale) = e8m0_to_f32(block.e) {
+                let d = vdupq_n_f32(scale);
+                for j in 0..4 {
+                    let mut lo = [0.0; 4];
+                    let mut hi = [0.0; 4];
+                    for lane in 0..4 {
+                        let byte = block.qs[j * 4 + lane];
+                        lo[lane] = E2M1[(byte & 15) as usize];
+                        hi[lane] = E2M1[(byte >> 4) as usize];
+                    }
+                    w[j] = vmulq_f32(d, vld1q_f32(lo.as_ptr()));
+                    w[j + 4] = vmulq_f32(d, vld1q_f32(hi.as_ptr()));
+                }
+            }
+            for i in 0..count {
+                let a = lhs.as_ptr().add((m0 + i) * k + b * QK_MXFP4);
+                for j in 0..8 {
+                    acc[i] = vfmaq_f32(acc[i], vld1q_f32(a.add(j * 4)), w[j]);
+                }
+            }
+        }
+        for i in 0..count {
+            dst.write((m0 + i) * n + row, vaddvq_f32(acc[i]));
+        }
     }
 }
 
@@ -341,9 +528,143 @@ mod tests {
         crate::raw_block::testing::check_decode_avx512(&rows);
     }
 
+    fn varied_fixture(m: usize, k: usize, n: usize) -> (Vec<f32>, Vec<BlockMxfp4>) {
+        use rand::{rngs::StdRng, Rng, SeedableRng};
+        let mut rng = StdRng::seed_from_u64(20260914);
+        let rhs = (0..n * (k / QK_MXFP4))
+            .map(|_| {
+                let mut qs = [0u8; 16];
+                rng.fill(&mut qs);
+                BlockMxfp4 {
+                    e: rng.gen_range(120..132),
+                    qs,
+                }
+            })
+            .collect();
+        let lhs = (0..m * k).map(|_| rng.gen_range(-5.0..5.0)).collect();
+        (lhs, rhs)
+    }
+
+    #[test]
+    fn dispatched_kernel_matches_f64_reference() {
+        for (m, k, n) in [(1, 32, 3), (4, 64, 7), (5, 2048, 3), (9, 4096, 2)] {
+            let (lhs, rhs) = varied_fixture(m, k, n);
+            let mut weights = vec![0.0; n * k];
+            crate::raw_block::dequantize(&rhs, &mut weights).unwrap();
+            let mut actual = vec![f32::NAN; m * n];
+            <BlockMxfp4 as crate::raw_block::RawBlock>::matmul_t(
+                (m, k, n),
+                &lhs,
+                &rhs,
+                &mut actual,
+            )
+            .unwrap();
+            let mut serial = vec![f32::NAN; m * n];
+            matmul_t_dispatch((m, k, n), &lhs, &rhs, &mut serial, false).unwrap();
+            assert_eq!(actual, serial, "parallel and serial must agree exactly");
+            #[allow(unused_mut)]
+            let mut outputs = vec![actual];
+            // Exercise AVX2 even on hosts where dispatch prefers AVX-512.
+            #[cfg(target_arch = "x86_64")]
+            if crate::simd::avx2_fma_available() {
+                let mut avx2 = vec![f32::NAN; m * n];
+                let dst = crate::simd::DstPtr::new(&mut avx2);
+                for row in 0..n {
+                    // SAFETY: ISA checked above, valid shapes, disjoint columns.
+                    unsafe { matmul_row_avx2(m, k, n, &lhs, &rhs, k / QK_MXFP4, row, &dst) };
+                }
+                outputs.push(avx2);
+            }
+            for actual in &outputs {
+                for i in 0..m {
+                    for row in 0..n {
+                        let terms = lhs[i * k..(i + 1) * k]
+                            .iter()
+                            .zip(&weights[row * k..(row + 1) * k]);
+                        let expected: f64 = terms.clone().map(|(&a, &b)| a as f64 * b as f64).sum();
+                        let magnitude: f64 =
+                            terms.map(|(&a, &b)| (a as f64 * b as f64).abs()).sum();
+                        let tolerance = 3e-6 * magnitude.max(1.0);
+                        assert!((actual[i * n + row] as f64 - expected).abs() <= tolerance,
+                        "m={m} k={k} row={row}: actual={} expected={expected} tolerance={tolerance}", actual[i * n + row]);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dispatched_kernel_handles_scale_edges_and_empty_inner_dimension() {
+        // Positive half-values avoid overflow even at the largest scale.
+        // Their sum remains exactly representable with these activations.
+        for e in [0, 1, 127, 253, 254, 255] {
+            let rhs = [BlockMxfp4 { e, qs: [0x11; 16] }];
+            let lhs = [1.0 / 32.0; 32];
+            let mut actual = [f32::NAN];
+            <BlockMxfp4 as crate::raw_block::RawBlock>::matmul_t(
+                (1, 32, 1),
+                &lhs,
+                &rhs,
+                &mut actual,
+            )
+            .unwrap();
+            let expected = e8m0_to_f32(e).unwrap_or(0.0) * 0.5;
+            assert_eq!(actual[0], expected, "scale {e}");
+        }
+        let mut dst = [f32::NAN; 6];
+        <BlockMxfp4 as crate::raw_block::RawBlock>::matmul_t((3, 0, 2), &[], &[], &mut dst)
+            .unwrap();
+        assert_eq!(dst, [0.0; 6]);
+    }
+
     #[test]
     fn blocks_from_bytes_rejects_a_partial_block() {
         assert_eq!(crate::raw_block::block_bytes::<BlockMxfp4>(), 17);
         crate::raw_block::testing::check_blocks_from_bytes::<BlockMxfp4>();
+    }
+    #[test]
+    #[ignore = "manual in-memory kernel benchmark; use release mode and --nocapture"]
+    fn bench_dispatched_vs_scalar() {
+        use std::{hint::black_box, time::Instant};
+        for m in [1, 2, 3, 4, 8, 64] {
+            let (k, n) = (2048, 256);
+            let (lhs, rhs) = varied_fixture(m, k, n);
+            let mut dst = vec![0.0; m * n];
+            for warmup in [true, false] {
+                let repeats = if warmup { 1 } else { 10 };
+                let start = Instant::now();
+                for _ in 0..repeats {
+                    matmul_t_dispatch((m, k, n), black_box(&lhs), black_box(&rhs), &mut dst, false)
+                        .unwrap();
+                    black_box(&dst);
+                }
+                let fast = start.elapsed().as_secs_f64();
+                let start = Instant::now();
+                for _ in 0..repeats {
+                    dst.fill(0.0);
+                    let ptr = crate::simd::DstPtr::new(&mut dst);
+                    for row in 0..n {
+                        crate::raw_block::matmul_row_scalar(
+                            (m, k, n),
+                            black_box(&lhs),
+                            black_box(&rhs),
+                            k / QK_MXFP4,
+                            row,
+                            &ptr,
+                        );
+                    }
+                    black_box(&dst);
+                }
+                let scalar = start.elapsed().as_secs_f64();
+                if !warmup {
+                    eprintln!(
+                        "m={m} k={k} n={n}: SIMD {:.3}ms scalar {:.3}ms ({:.2}x)",
+                        fast * 1000.0 / repeats as f64,
+                        scalar * 1000.0 / repeats as f64,
+                        scalar / fast
+                    );
+                }
+            }
+        }
     }
 }

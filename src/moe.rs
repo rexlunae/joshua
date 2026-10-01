@@ -309,26 +309,36 @@ pub fn dispatch_prefill_with<E: Expert>(
     let out_device = x2.device().clone();
     let x2 = on_device(x2, expert_device)?;
 
-    // Bucket (token, weight) pairs by expert.
-    let mut per_expert: Vec<Vec<(u32, f32)>> = vec![Vec::new(); experts.len()];
+    // Validate routing and reserve each expert's exact token count. Keep the
+    // indices and weights separate so tensors can take ownership directly.
+    let mut counts = vec![0usize; experts.len()];
     for t in 0..n_tokens {
-        for s in 0..k {
-            let e = routing.ids[t * k + s] as usize;
-            check_expert_id(arch, e, experts.len(), t, s)?;
-            per_expert[e].push((t as u32, routing.weights[t * k + s]));
+        for slot in 0..k {
+            let e = routing.ids[t * k + slot] as usize;
+            check_expert_id(arch, e, experts.len(), t, slot)?;
+            counts[e] += 1;
+        }
+    }
+    let mut per_expert: Vec<_> = counts
+        .into_iter()
+        .map(|count| (Vec::with_capacity(count), Vec::with_capacity(count)))
+        .collect();
+    for t in 0..n_tokens {
+        for slot in 0..k {
+            let (tokens, weights) = &mut per_expert[routing.ids[t * k + slot] as usize];
+            tokens.push(t as u32);
+            weights.push(routing.weights[t * k + slot]);
         }
     }
 
     let default_fwd = |e: usize, x: &Tensor| experts[e].forward(x);
     let fwd = forward_expert.unwrap_or(&default_fwd);
     let mut y = Tensor::zeros((n_tokens, h), DType::F32, expert_device)?;
-    for (e, bucket) in per_expert.iter().enumerate() {
-        if bucket.is_empty() {
+    for (e, (token_idx, w)) in per_expert.into_iter().enumerate() {
+        let count = token_idx.len();
+        if count == 0 {
             continue;
         }
-        let token_idx: Vec<u32> = bucket.iter().map(|(t, _)| *t).collect();
-        let w: Vec<f32> = bucket.iter().map(|(_, w)| *w).collect();
-        let count = token_idx.len();
         let idx = Tensor::from_vec(token_idx, count, expert_device)?;
         let x_sel = x2.index_select(&idx, 0)?; // [count, h]
         let out = fwd(e, &x_sel)?; // [count, h]
