@@ -66,7 +66,7 @@ use crate::attention::{KvCache, Rope, RopeStyle};
 use crate::moe::Gating;
 
 mod qwen4exp;
-use qwen4exp::{HyperMix, Ple, PleConfig, Qsa, QsaConfig};
+use qwen4exp::{HyperMix, Ple, PleConfig, Qsa, QsaCache, QsaConfig};
 use crate::gguf_meta::Meta;
 use crate::gguf_ext::GgufHeader;
 use crate::tensor_source::TensorSource;
@@ -711,7 +711,7 @@ impl Attention {
         let hd = self.head_dim;
         // QSA narrows each query to its selected cells (None: dense).
         let sparse = match &self.qsa {
-            Some(q) => q.mask(&mut state.index_keys, xs, offset)?,
+            Some(q) => q.mask(&mut state.index, xs, offset)?,
             None => None,
         };
         let mask = sparse.as_ref().or(mask);
@@ -1298,15 +1298,15 @@ impl Layer {
     }
 }
 
-/// One layer's per-session state: the KV cache (and QSA indexer keys) of an
+/// One layer's per-session state: the KV cache (and QSA indexer state) of an
 /// attention layer, or the recurrent state (and PLE conv history) of a Gated
 /// DeltaNet layer.
 #[derive(Clone, Default)]
 pub struct LayerState {
     kv: KvCache,
     delta: Option<DeltaState>,
-    /// Raw QSA indexer keys, `[seq, dim]`.
-    index_keys: Option<Tensor>,
+    /// QSA indexer raw keys and pooled block keys.
+    index: QsaCache,
     /// The PLE conv's input history.
     ple_conv: Option<Tensor>,
 }
