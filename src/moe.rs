@@ -99,6 +99,14 @@ pub fn causal_mask(seq_len: usize, offset: usize, device: &Device) -> Result<Ten
 /// materialized `[seq, seq + offset]` tensors would hold Σ chunks
 /// O(position) bytes across the whole sweep — quadratic in the prompt
 /// length, against the streamed prefill's chunk-bounded memory contract.
+///
+/// The paths are dispatched by device, per `examples/bench_causal_mask.rs`
+/// (40 layers × 8 × 512 chunks, medians with `synchronize` in every timed
+/// region): on the CPU the host fill + `from_slice` is ~4.4× faster than
+/// the device-op path (1100 ms vs 252 ms per sweep — there is no upload to
+/// save), so CPU keeps the host pattern; on Metal the device path wins
+/// (244 ms vs 358 ms per sweep — it removes the per-call host pass and the
+/// ~9 MB matrix upload).
 pub struct CausalMask {
     device: Device,
     /// `arange(0..n)` as f32, `n` a power of two ≥ every width so far.
@@ -128,6 +136,20 @@ impl CausalMask {
         if seq == 0 || width >= (1 << 24) {
             return causal_mask(seq, offset, &self.device);
         }
+        // Measured (see the type docs): on the CPU the host pattern beats
+        // the device ops ~4.4× — there is no upload to save — so it stays;
+        // on accelerators the device path drops the per-call host pass and
+        // the matrix upload.
+        if self.device.is_cpu() {
+            return causal_mask(seq, offset, &self.device);
+        }
+        self.mask_device_ops(seq, offset, width)
+    }
+
+    /// The device-op path behind [`mask`]: the mask derived from the cached
+    /// position range by a broadcast compare.  Private to the accelerator
+    /// dispatch (and the tests, which check it bit-identical on CPU tensors).
+    fn mask_device_ops(&mut self, seq: usize, offset: usize, width: usize) -> Result<Tensor> {
         if self
             .positions
             .as_ref()
@@ -773,17 +795,30 @@ mod tests {
     /// every mask feeds `broadcast_add` against attention scores, so even a
     /// one-ULP difference would shift logits.  Covers the regrowth path
     /// (small mask first, then wider) and offsets past the first growth.
+    ///
+    /// Both paths are checked against the host pattern: [`CausalMask::mask`]
+    /// (the dispatch — on the CPU this *is* the host pattern) and
+    /// [`CausalMask::mask_device_ops`] (the accelerator path, exercised here
+    /// on CPU tensors so the math is verified without Metal hardware).
     #[test]
     fn causal_mask_builder_matches_host_pattern() -> Result<()> {
         let dev = Device::Cpu;
         let mut builder = CausalMask::new(&dev);
         for (seq, offset) in [(1, 0), (1, 5), (3, 0), (2, 1023), (7, 4097), (64, 63), (512, 0)] {
-            let got = builder.mask(seq, offset)?;
+            let width = seq + offset;
             let want = causal_mask(seq, offset, &dev)?;
-            assert_eq!(got.dims(), want.dims(), "dims at seq={seq} offset={offset}");
-            let got: Vec<f32> = got.flatten_all()?.to_vec1()?;
-            let want: Vec<f32> = want.flatten_all()?.to_vec1()?;
-            assert_eq!(got, want, "values at seq={seq} offset={offset}");
+            for (what, got) in [
+                ("mask", builder.mask(seq, offset)?),
+                (
+                    "mask_device_ops",
+                    builder.mask_device_ops(seq, offset, width)?,
+                ),
+            ] {
+                assert_eq!(got.dims(), want.dims(), "dims at seq={seq} offset={offset}");
+                let got: Vec<f32> = got.flatten_all()?.to_vec1()?;
+                let want: Vec<f32> = want.flatten_all()?.to_vec1()?;
+                assert_eq!(got, want, "values ({what}) at seq={seq} offset={offset}");
+            }
         }
         Ok(())
     }
