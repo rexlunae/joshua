@@ -32,6 +32,8 @@ pub mod kimi_k3;
 pub mod mmap_tensor;
 pub mod mxfp4;
 pub mod model;
+mod moe;
+mod paged_weights;
 pub mod quantized_deepseek2;
 pub mod quantized_deepseek4;
 pub mod quantized_qwen3_moe;

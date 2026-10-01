@@ -219,6 +219,21 @@ pub enum ComputeBackend {
 pub struct EngineOptions {
     /// Context-window size in tokens (0 selects the 4096 default).
     pub n_ctx: u32,
+    /// Prefer one session, bounded prefill/prefetch, and no Metal copy fallback.
+    pub low_memory: bool,
+    /// Planning budget for concurrency (not a hard process RSS limit).
+    pub memory_budget_bytes: Option<usize>,
+    /// Prompt tokens per forward pass; zero/None preserves unchunked prefill.
+    pub prefill_chunk_size: Option<usize>,
+    /// Retained idle sessions; zero drops session caches after each request.
+    pub max_cached_models: Option<usize>,
+    /// Speculative DeepSeek prefetch bytes per layer window; zero disables it.
+    pub prefetch_bytes: Option<usize>,
+    /// Refuse GPU weight uploads whose on-disk size exceeds this budget.
+    /// Does not include activation/cache memory and is not a VRAM pager.
+    pub gpu_weight_budget_bytes: Option<usize>,
+    /// Per-session Qwen3-MoE quantized GPU tile cache capacity.
+    pub gpu_cache_bytes: Option<usize>,
     /// Compute backend to run inference on.  See [`ComputeBackend`].
     pub backend: ComputeBackend,
     /// Physical-memory backing strategy for the model mapping.
@@ -341,6 +356,28 @@ impl EngineOptions {
     }
 }
 
+/// Conservative startup planning budget. Explicit options override this.
+fn memory_planning_budget() -> Option<usize> {
+    #[cfg(target_os = "linux")]
+    {
+        let info = std::fs::read_to_string("/proc/meminfo").ok()?;
+        let kb: usize = info.lines().find(|l| l.starts_with("MemAvailable:"))?
+            .split_whitespace().nth(1)?.parse().ok()?;
+        return kb.checked_mul(1024).map(|bytes| bytes / 2);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut bytes: u64 = 0;
+        let mut len = std::mem::size_of::<u64>();
+        // SAFETY: pointers refer to live, correctly sized output storage.
+        let rc = unsafe { libc::sysctlbyname(c"hw.memsize".as_ptr(),
+            (&mut bytes as *mut u64).cast(), &mut len, std::ptr::null_mut(), 0) };
+        return (rc == 0).then_some((bytes / 2) as usize);
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    { None }
+}
+
 // ─── Engine ───────────────────────────────────────────────────────────────────
 
 /// The Joshua inference engine.
@@ -388,6 +425,10 @@ pub struct Engine {
     in_flight: AtomicUsize,
     /// Maximum concurrent generations/embeddings.
     max_concurrency: usize,
+    max_cached_models: usize,
+    prefill_chunk_size: usize,
+    load_options: crate::model::ModelLoadOptions,
+    shared_deepseek4: Mutex<Option<Arc<crate::quantized_deepseek4::SharedWeights>>>,
     /// Upper bound on tokens generated per request, regardless of the
     /// client-supplied `max_tokens`.
     max_output_tokens: u32,
@@ -573,7 +614,8 @@ impl Engine {
 
     /// Load a GGUF model with full [`EngineOptions`] (context size and the
     /// huge-page backing strategy).
-    pub fn with_options(model_path: impl AsRef<Path>, options: EngineOptions) -> Result<Self> {
+    pub fn with_options(model_path: impl AsRef<Path>, mut options: EngineOptions) -> Result<Self> {
+        if options.low_memory { options.lazy_weights = true; }
         let n_ctx = if options.n_ctx == 0 {
             4096
         } else {
@@ -710,13 +752,46 @@ impl Engine {
             device
         );
 
-        // Default the concurrency cap to the machine's parallelism: running
-        // more heavyweight generations at once than the CPU can serve gains
-        // no throughput and only multiplies peak memory.  Operators tune it
-        // with `with_max_concurrency`.
-        let max_concurrency = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4);
+        let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+        let budget = options.memory_budget_bytes.or_else(|| memory_planning_budget());
+        // Conservative estimate: reserve a model-sized allowance per session.
+        // mmap sharing can make this overestimate; it is an admission heuristic.
+        let per_session = mmap.len().max(1);
+        let max_concurrency = if options.low_memory { 1 } else {
+            budget.map(|b| (b / per_session).max(1).min(cpus)).unwrap_or(cpus)
+        };
+        let max_cached_models = options.max_cached_models
+            .unwrap_or(if options.low_memory { 1 } else { MAX_CACHED_MODELS.min(max_concurrency) });
+        let prefill_chunk_size = options.prefill_chunk_size.unwrap_or(if options.low_memory { 128 } else { 0 });
+        let prefetch_bytes = options.prefetch_bytes.or_else(|| {
+            options.low_memory.then(|| budget.unwrap_or(512 * 1024 * 1024).saturating_div(16).min(64 * 1024 * 1024))
+        });
+        let qwen_zero_copy = arch.as_ref().is_some_and(|a| matches!(a, crate::model::Architecture::Qwen3Moe))
+            && matches!(&device, Device::Metal(_));
+        let qwen_paged = options.gpu_cache_bytes.is_some() && arch.as_ref().is_some_and(|a| matches!(a, crate::model::Architecture::Qwen3Moe));
+        if options.gpu_cache_bytes.is_some() && (!qwen_paged || device.is_cpu()) {
+            return Err(JoshuaError::ModelLoad("GPU weight paging currently requires Qwen3-MoE on Metal or CUDA".into()));
+        }
+        if options.low_memory && !device.is_cpu() && !qwen_zero_copy && !qwen_paged {
+            return Err(JoshuaError::ModelLoad("low-memory GPU mode currently requires Qwen3-MoE zero-copy Metal; use --device cpu for this architecture".into()));
+        }
+        if !device.is_cpu() && !qwen_zero_copy && !qwen_paged {
+            if let Some(limit) = options.gpu_weight_budget_bytes {
+                if mmap.len() > limit {
+                    return Err(JoshuaError::ModelLoad(format!("GPU weight upload estimate {} bytes exceeds budget {limit}; use CPU or a smaller model", mmap.len())));
+                }
+            }
+        }
+        let load_options = crate::model::ModelLoadOptions {
+            context_length: Some(n_ctx as usize), prefetch_bytes,
+            require_zero_copy: !qwen_paged && qwen_zero_copy && (options.low_memory || options.gpu_weight_budget_bytes.is_some()),
+            gpu_cache_bytes: options.gpu_cache_bytes,
+            gpu_copy_budget_bytes: options.gpu_weight_budget_bytes.or_else(|| {
+                (options.low_memory && qwen_zero_copy).then(|| budget.unwrap_or(1024 * 1024 * 1024) / 4)
+            }),
+        };
+        tracing::info!(max_concurrency, max_cached_models, prefill_chunk_size, ?prefetch_bytes,
+            "Native memory policy (planning limits, not a hard RSS cap)");
 
         Ok(Self {
             model_path: gguf_path,
@@ -731,6 +806,10 @@ impl Engine {
             npu: None,
             in_flight: AtomicUsize::new(0),
             max_concurrency,
+            max_cached_models,
+            prefill_chunk_size,
+            load_options,
+            shared_deepseek4: Mutex::new(None),
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             model_name,
             n_ctx,
@@ -1075,7 +1154,7 @@ impl Engine {
             .tokenizer
             .encode(prompt, add_special_tokens)
             .map_err(|e| JoshuaError::Tokenization(e.to_string()))?;
-        let prompt_tokens: Vec<u32> = encoding.get_ids().to_vec();
+        let prompt_tokens = encoding.get_ids();
         let n_prompt = prompt_tokens.len();
 
         if n_prompt >= self.n_ctx as usize {
@@ -1089,10 +1168,10 @@ impl Engine {
         // ── Acquire a session, generate, retry on CPU if the NPU fails ──────
         // Prefer a pooled instance whose state already covers a prefix of
         // this prompt; fall back to a reset instance or a fresh load.
-        let (mut session, n_reused) = self.acquire_session(&prompt_tokens, true)?;
+        let (mut session, n_reused) = self.acquire_session(prompt_tokens, true)?;
         let was_npu = session.is_npu();
 
-        let result = self.run_generation(&mut session, &prompt_tokens, n_reused, options);
+        let result = self.run_generation(&mut session, prompt_tokens, n_reused, options);
         match result {
             Ok((response, usage, prefill_tps, decode_tps, kv_tokens)) => {
                 // Park the instance for reuse by a follow-up request.
@@ -1116,8 +1195,8 @@ impl Engine {
                     return Err(e);
                 }
                 tracing::warn!("Retrying request on the candle path after NPU failure: {e}");
-                let (mut session, n_reused) = self.acquire_session(&prompt_tokens, false)?;
-                match self.run_generation(&mut session, &prompt_tokens, n_reused, options) {
+                let (mut session, n_reused) = self.acquire_session(prompt_tokens, false)?;
+                match self.run_generation(&mut session, prompt_tokens, n_reused, options) {
                     Ok((response, usage, prefill_tps, decode_tps, kv_tokens)) => {
                         self.release_model(session, kv_tokens);
                         Ok((response, usage, prefill_tps, decode_tps))
@@ -1164,7 +1243,11 @@ impl Engine {
         // Process the not-yet-cached prompt tokens in a single forward pass,
         // starting right after the reused KV prefix.
         let prefill_start = Instant::now();
-        let logits_vec = model.forward_tokens(new_tokens, n_reused, &self.device)?;
+        let chunk_size = if self.prefill_chunk_size == 0 { new_tokens.len().max(1) } else { self.prefill_chunk_size };
+        let mut logits_vec = Vec::new();
+        for (i, chunk) in new_tokens.chunks(chunk_size).enumerate() {
+            logits_vec = model.forward_tokens(chunk, n_reused + i * chunk_size, &self.device)?;
+        }
         let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
 
         // ── Repetition-penalty history ────────────────────────────────────────
@@ -1221,18 +1304,14 @@ impl Engine {
     ) -> Result<DecodeOutcome> {
         // Seed the recent-token window with the tail of the prompt (up to 64 tokens).
         const REP_WINDOW: usize = 64;
-        let mut recent_tokens: Vec<u32> = penalty_seed
-            .iter()
-            .rev()
-            .take(REP_WINDOW)
-            .copied()
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect();
+        let mut recent_tokens = penalty_seed[penalty_seed.len().saturating_sub(REP_WINDOW)..].to_vec();
 
         let mut rng = thread_rng();
+        let mut sampler = Sampler::default();
         let mut response = String::new();
+        // A token may hold only part of a UTF-8 character. Keep decoder
+        // context across tokens (also preserves context-dependent spaces).
+        let mut text_decoder = self.tokenizer.decode_stream(false);
         let mut fed_tokens: Vec<u32> = Vec::new();
         let mut n_decoded: u32 = 0;
         let mut n_cur = start_pos;
@@ -1248,7 +1327,7 @@ impl Engine {
                 break;
             }
 
-            let next_token = sample_token(&logits_vec, options, &mut rng, &recent_tokens)?;
+            let next_token = sampler.sample(&logits_vec, options, &mut rng, &recent_tokens)?;
 
             if std::env::var_os("JOSHUA_DEBUG_TOKENS").is_some() {
                 let mut order: Vec<usize> = (0..logits_vec.len()).collect();
@@ -1267,12 +1346,13 @@ impl Engine {
                 break;
             }
 
-            // Decode the new token to text.
-            let piece = self
-                .tokenizer
-                .decode(&[next_token], false)
-                .map_err(|e| JoshuaError::Inference(e.to_string()))?;
-            response.push_str(&piece);
+            // Incomplete byte sequences emit nothing until a later token
+            // completes the character. Token accounting and model advancement
+            // must still happen for those buffered tokens.
+            if let Some(piece) = text_decoder.step(next_token)
+                .map_err(|e| JoshuaError::Inference(e.to_string()))? {
+                response.push_str(&piece);
+            }
             n_decoded += 1;
 
             // Maintain sliding-window token history for repetition penalty.
@@ -1500,7 +1580,7 @@ impl Engine {
             let mut pool = self.model_pool();
             pool.push(CachedModel { session, tokens });
             // Evict oldest beyond the cap.
-            while pool.len() > MAX_CACHED_MODELS {
+            while pool.len() > self.max_cached_models {
                 pool.remove(0);
             }
         }
@@ -1526,19 +1606,30 @@ impl Engine {
             };
             return Err(JoshuaError::ModelLoad(msg));
         }
+        // Serialize first initialization and share immutable DeepSeek tensors.
+        let mut shared = self.shared_deepseek4.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(weights) = shared.as_ref() {
+            return weights.new_session().map(QuantizedModel::DeepSeek4)
+                .map_err(|e| JoshuaError::ModelLoad(format!("session init failed: {e}")));
+        }
         let mut cursor = Cursor::new(&self.mmap[..]);
         let gguf = read_gguf_header(&self.mmap)
             .map_err(|e| JoshuaError::ModelLoad(format!("GGUF read failed: {e}")))?;
         // Hand the loader the mapping so architectures Joshua implements
         // itself can borrow weights in place rather than copying them.
-        QuantizedModel::from_gguf_mmap(
+        let model = QuantizedModel::from_gguf_mmap_with_options(
             gguf,
             &mut cursor,
             &self.device,
             Some(Arc::clone(&self.mmap)),
             self.model_file.clone(),
+            &self.load_options,
         )
-        .map_err(|e| JoshuaError::ModelLoad(format!("model init failed: {e}")))
+        .map_err(|e| JoshuaError::ModelLoad(format!("model init failed: {e}")))?;
+        if let QuantizedModel::DeepSeek4(ref weights) = model {
+            *shared = Some(weights.shared_weights());
+        }
+        Ok(model)
     }
 
     /// Scan `response` for any configured stop sequence and truncate it.
@@ -2344,141 +2435,235 @@ fn squeeze_batch_logits(logits: &Tensor) -> Result<Vec<f32>> {
 
 // ─── Sampling ────────────────────────────────────────────────────────────────
 
-/// Sample the next token from a raw logit vector.
-///
-/// Implements repetition penalty, temperature scaling, top-k filtering,
-/// min-p filtering, top-p (nucleus) filtering, and weighted random sampling,
-/// all in pure Rust.
-fn sample_token(
-    logits: &[f32],
-    opts: &GenerationOptions,
-    rng: &mut impl rand::Rng,
-    recent_tokens: &[u32],
-) -> Result<u32> {
-    if logits.is_empty() {
-        return Ok(0);
-    }
+/// Scratch storage scoped to one generation, reused across sampled tokens.
+/// Greedy decoding with no repetition penalty borrows the logits directly.
+#[derive(Default)]
+struct Sampler {
+    adjusted: Vec<f32>,
+    probs: Vec<f32>,
+    indexed: Vec<(usize, f32)>,
+    sorted_idx: Vec<usize>,
+}
 
-    // ── Repetition penalty ────────────────────────────────────────────────────
-    // For tokens present in the recent window, divide positive logits and
-    // multiply negative logits by `repetition_penalty` (> 1.0 discourages
-    // repetition; 1.0 is a no-op).  Applied before temperature so the penalty
-    // is independent of the temperature scale.
-    // NOTE: at temperature 0 the penalty is skipped entirely (pure greedy),
-    // unless JOSHUA_LEGACY_REPPEN is set — matching the semantics of every
-    // other sampler where a "temperature" of 0 means "take the argmax of the
-    // raw logits".
-    let reppen = if opts.temperature <= 0.0 && std::env::var_os("JOSHUA_LEGACY_REPPEN").is_none() {
-        1.0
-    } else {
-        opts.repetition_penalty
-    };
-    let logits: Vec<f32> = if reppen != 1.0 {
-        let mut v = logits.to_vec();
-        for &token in recent_tokens {
-            if let Some(l) = v.get_mut(token as usize) {
-                if *l > 0.0 {
-                    *l /= reppen;
-                } else {
-                    *l *= reppen;
-                }
-            }
-        }
-        v
-    } else {
-        logits.to_vec()
-    };
-
-    // ── Greedy ────────────────────────────────────────────────────────────────
-    if opts.temperature <= 0.0 {
-        return Ok(logits
-            .iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(i, _)| i as u32)
-            .unwrap_or(0));
-    }
-
-    // ── Temperature scaling ───────────────────────────────────────────────────
-    let inv_temp = 1.0_f32 / opts.temperature;
-    // Subtract max for numerical stability before exp.
-    let max_logit = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let mut probs: Vec<f32> = logits
+fn greedy_token(logits: &[f32]) -> u32 {
+    logits
         .iter()
-        .map(|&l| ((l - max_logit) * inv_temp).exp())
-        .collect();
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(i, _)| i as u32)
+        .unwrap_or(0)
+}
 
-    // ── Top-k ─────────────────────────────────────────────────────────────────
-    let k = opts.top_k as usize;
-    if k > 0 && k < probs.len() {
-        let mut indexed: Vec<(usize, f32)> = probs.iter().copied().enumerate().collect();
-        indexed.sort_unstable_by(|(_, a), (_, b)| {
-            b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
-        });
-        for &(idx, _) in indexed.iter().skip(k) {
-            probs[idx] = 0.0;
+impl Sampler {
+    /// Sample the next token from a raw logit vector.
+    ///
+    /// Implements repetition penalty, temperature scaling, top-k filtering,
+    /// min-p filtering, top-p (nucleus) filtering, and weighted random sampling,
+    /// all in pure Rust.
+    fn sample(
+        &mut self,
+        logits: &[f32],
+        opts: &GenerationOptions,
+        rng: &mut impl rand::Rng,
+        recent_tokens: &[u32],
+    ) -> Result<u32> {
+        if logits.is_empty() {
+            return Ok(0);
         }
-    }
 
-    // ── Min-p ─────────────────────────────────────────────────────────────────
-    if opts.min_p > 0.0 {
-        let max_p = probs.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let threshold = max_p * opts.min_p;
-        for p in &mut probs {
-            if *p < threshold {
-                *p = 0.0;
-            }
-        }
-    }
-
-    // ── Top-p (nucleus) ───────────────────────────────────────────────────────
-    if opts.top_p < 1.0 && opts.top_p > 0.0 {
-        let sum: f32 = probs.iter().sum();
-        if sum > 0.0 {
-            let mut sorted_idx: Vec<usize> = (0..probs.len()).collect();
-            sorted_idx.sort_unstable_by(|&a, &b| {
-                probs[b]
-                    .partial_cmp(&probs[a])
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            let mut cumsum = 0.0_f32;
-            let mut cut_from = probs.len();
-            for (rank, &idx) in sorted_idx.iter().enumerate() {
-                cumsum += probs[idx] / sum;
-                if cumsum > opts.top_p {
-                    cut_from = rank + 1;
-                    break;
+        // ── Repetition penalty ────────────────────────────────────────────────────
+        // For tokens present in the recent window, divide positive logits and
+        // multiply negative logits by `repetition_penalty` (> 1.0 discourages
+        // repetition; 1.0 is a no-op).  Applied before temperature so the penalty
+        // is independent of the temperature scale.
+        // NOTE: at temperature 0 the penalty is skipped entirely (pure greedy),
+        // unless JOSHUA_LEGACY_REPPEN is set — matching the semantics of every
+        // other sampler where a "temperature" of 0 means "take the argmax of the
+        // raw logits".
+        let reppen =
+            if opts.temperature <= 0.0 && std::env::var_os("JOSHUA_LEGACY_REPPEN").is_none() {
+                1.0
+            } else {
+                opts.repetition_penalty
+            };
+        let logits = if reppen != 1.0 && !recent_tokens.is_empty() {
+            self.adjusted.clear();
+            self.adjusted.extend_from_slice(logits);
+            let v = &mut self.adjusted;
+            for &token in recent_tokens {
+                if let Some(l) = v.get_mut(token as usize) {
+                    if *l > 0.0 {
+                        *l /= reppen;
+                    } else {
+                        *l *= reppen;
+                    }
                 }
             }
-            for &idx in sorted_idx.iter().skip(cut_from) {
+            v.as_slice()
+        } else {
+            logits
+        };
+
+        // ── Greedy ────────────────────────────────────────────────────────────────
+        if opts.temperature <= 0.0 {
+            return Ok(greedy_token(logits));
+        }
+
+        // ── Temperature scaling ───────────────────────────────────────────────────
+        let inv_temp = 1.0_f32 / opts.temperature;
+        // Subtract max for numerical stability before exp.
+        let max_logit = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let probs = &mut self.probs;
+        probs.clear();
+        probs.extend(logits.iter().map(|&l| ((l - max_logit) * inv_temp).exp()));
+
+        // ── Top-k ─────────────────────────────────────────────────────────────────
+        let k = opts.top_k as usize;
+        if k > 0 && k < probs.len() {
+            let indexed = &mut self.indexed;
+            indexed.clear();
+            indexed.extend(probs.iter().copied().enumerate());
+            indexed.sort_unstable_by(|(_, a), (_, b)| {
+                b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            for &(idx, _) in indexed.iter().skip(k) {
                 probs[idx] = 0.0;
             }
         }
-    }
 
-    // ── Normalise & sample ────────────────────────────────────────────────────
-    let total: f32 = probs.iter().sum();
-    if total <= 0.0 {
-        // Fallback: greedy from original (penalty-adjusted) logits.
-        return Ok(logits
-            .iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(i, _)| i as u32)
-            .unwrap_or(0));
-    }
+        // ── Min-p ─────────────────────────────────────────────────────────────────
+        if opts.min_p > 0.0 {
+            let max_p = probs.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let threshold = max_p * opts.min_p;
+            for p in probs.iter_mut() {
+                if *p < threshold {
+                    *p = 0.0;
+                }
+            }
+        }
 
-    for p in &mut probs {
-        *p /= total;
-    }
+        // ── Top-p (nucleus) ───────────────────────────────────────────────────────
+        if opts.top_p < 1.0 && opts.top_p > 0.0 {
+            let sum: f32 = probs.iter().sum();
+            if sum > 0.0 {
+                let sorted_idx = &mut self.sorted_idx;
+                sorted_idx.clear();
+                sorted_idx.extend(0..probs.len());
+                sorted_idx.sort_unstable_by(|&a, &b| {
+                    probs[b]
+                        .partial_cmp(&probs[a])
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                let mut cumsum = 0.0_f32;
+                let mut cut_from = probs.len();
+                for (rank, &idx) in sorted_idx.iter().enumerate() {
+                    cumsum += probs[idx] / sum;
+                    if cumsum > opts.top_p {
+                        cut_from = rank + 1;
+                        break;
+                    }
+                }
+                for &idx in sorted_idx.iter().skip(cut_from) {
+                    probs[idx] = 0.0;
+                }
+            }
+        }
 
-    let dist = WeightedIndex::new(&probs).map_err(|e| JoshuaError::Inference(e.to_string()))?;
-    Ok(dist.sample(rng) as u32)
+        // ── Normalise & sample ────────────────────────────────────────────────────
+        let total: f32 = probs.iter().sum();
+        if total <= 0.0 {
+            // Fallback: greedy from original (penalty-adjusted) logits.
+            return Ok(greedy_token(logits));
+        }
+
+        for p in probs.iter_mut() {
+            *p /= total;
+        }
+
+        let dist = WeightedIndex::new(probs.iter().copied())
+            .map_err(|e| JoshuaError::Inference(e.to_string()))?;
+        Ok(dist.sample(rng) as u32)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sampler_preserves_seeded_output_and_input_logits() {
+        use rand::{rngs::StdRng, SeedableRng};
+        let mut sampler = Sampler::default();
+        let options = GenerationOptions {
+            temperature: 0.8,
+            repetition_penalty: 1.2,
+            top_k: 3,
+            top_p: 0.9,
+            min_p: 0.05,
+            ..Default::default()
+        };
+        let logits = [2., 1., 0., -1., -2.];
+        let mut rng = StdRng::seed_from_u64(42);
+        // Captured from the original sampler, including repeated history IDs.
+        let expected = [0, 0, 0, 0, 1, 1, 1, 0, 1, 0, 0, 0, 0, 1, 0, 1, 1, 0, 0, 0];
+        for token in expected {
+            assert_eq!(
+                sampler
+                    .sample(&logits, &options, &mut rng, &[0, 0, 3])
+                    .unwrap(),
+                token
+            );
+        }
+        assert_eq!(logits, [2., 1., 0., -1., -2.]);
+    }
+
+    #[test]
+    fn sampler_reuses_buffers_without_retaining_previous_distribution() {
+        use rand::{rngs::StdRng, SeedableRng};
+        let mut sampler = Sampler::default();
+        let mut rng = StdRng::seed_from_u64(42);
+        let options = GenerationOptions {
+            temperature: 1.0,
+            repetition_penalty: 1.0,
+            top_k: 1,
+            top_p: 0.9,
+            min_p: 0.0,
+            ..Default::default()
+        };
+        for (logits, expected) in [
+            (&[0., 1., 2., 3., 4.][..], 4),
+            (&[2., 1.][..], 0),
+            (&[][..], 0),
+            (&[-2., -1., 0.][..], 2),
+        ] {
+            assert_eq!(
+                sampler.sample(logits, &options, &mut rng, &[]).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn greedy_sampling_needs_no_scratch_buffers() {
+        use rand::{rngs::StdRng, SeedableRng};
+        let mut sampler = Sampler::default();
+        let mut rng = StdRng::seed_from_u64(42);
+        let options = GenerationOptions {
+            temperature: 0.0,
+            repetition_penalty: 1.0,
+            ..Default::default()
+        };
+        assert_eq!(
+            sampler
+                .sample(&[1., 3., 3.], &options, &mut rng, &[1])
+                .unwrap(),
+            2
+        );
+        assert_eq!(sampler.adjusted.capacity(), 0);
+        assert_eq!(sampler.probs.capacity(), 0);
+        assert_eq!(sampler.indexed.capacity(), 0);
+        assert_eq!(sampler.sorted_idx.capacity(), 0);
+    }
 
     #[test]
     fn sanitize_model_name_keeps_plain_names() {

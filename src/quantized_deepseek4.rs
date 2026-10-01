@@ -630,17 +630,15 @@ fn hadamard_rows(x: &Tensor) -> Result<Tensor> {
         candle_core::bail!("deepseek4: Hadamard rotation needs a power-of-two head dim, got {d}");
     }
     let n = shape[..shape.len() - 1].iter().product::<usize>();
-    let data: Vec<f32> = x.flatten_all()?.to_vec1()?;
-    let mut out = vec![0f32; data.len()];
+    let mut data: Vec<f32> = x.flatten_all()?.to_vec1()?;
     let scale = 1.0 / (d as f32).sqrt();
-    for (row, chunk) in data.chunks_exact(d).enumerate() {
-        let mut r = chunk.to_vec();
-        fast_hadamard(&mut r);
-        for (o, v) in out[row * d..row * d + d].iter_mut().zip(r.iter()) {
-            *o = v * scale;
+    for row in data.chunks_exact_mut(d) {
+        fast_hadamard(row);
+        for value in row {
+            *value *= scale;
         }
     }
-    Tensor::from_vec(out, (n, d), x.device())?.reshape(shape)
+    Tensor::from_vec(data, (n, d), x.device())?.reshape(shape)
 }
 
 struct Compressor {
@@ -1340,7 +1338,7 @@ impl KvState {
 // ─── MoE ────────────────────────────────────────────────────────────────────
 
 struct Moe {
-    gate: Tensor,              // [n_expert, n_embd] (f32)
+    gate_t: Tensor,            // [n_embd, n_expert] (f32), transposed once at load
     gate_bias: Option<Tensor>, // [n_expert]
     tid2eid: Option<Tensor>,   // [n_vocab, n_expert_used] (candle shape after gguf dim reversal)
     experts: Vec<Mlp>,
@@ -1356,7 +1354,7 @@ impl Moe {
         let n_tokens = b * seq_len;
         let x2 = xs.reshape((n_tokens, h))?;
 
-        let logits = x2.matmul(&self.gate.t()?.contiguous()?)?; // [n_tokens, n_expert]
+        let logits = x2.matmul(&self.gate_t)?; // [n_tokens, n_expert]
                                                                 // sqrt(softplus(x)) scoring; bias shifts selection only.
         let probs = softplus(&logits)?.sqrt()?;
         let (weights, indices) = if self.hash {
@@ -1420,18 +1418,6 @@ impl Moe {
         let ids: Vec<u32> = indices.flatten_all()?.to_vec1()?;
         let wts: Vec<f32> = weights.flatten_all()?.to_vec1()?;
 
-        // The gate has just told us which experts this token needs.  Each
-        // expert's weights are a contiguous run inside the model mapping, so
-        // `MADV_WILLNEED` turns the scattered page faults that would otherwise
-        // stall the expert matmuls into sequential background reads — the
-        // kernel streams the selected experts while the first matmul runs.
-        // Idempotent and best-effort (a no-op for non-mmap loads).
-        for e in &ids {
-            if let Some(exp) = self.experts.get(*e as usize) {
-                exp.prefetch();
-            }
-        }
-
         let mut per_expert: Vec<Vec<(u32, f32)>> = vec![Vec::new(); self.experts.len()];
         for t in 0..n_tokens {
             for s in 0..k {
@@ -1442,10 +1428,16 @@ impl Moe {
             }
         }
 
+        // Routing can select the same expert for many prompt tokens. Ask
+        // for its pages once per batch, in the same order as computation.
+        for (expert, bucket) in self.experts.iter().zip(&per_expert) {
+            if !bucket.is_empty() { expert.prefetch(); }
+        }
+
         let dev = x2.device();
         let mut y = Tensor::zeros((n_tokens, h), DType::F32, dev)?;
         // Select each expert's input rows once; all three phases reuse them.
-        let mut sel: Vec<Option<(Vec<u32>, Tensor)>> = Vec::with_capacity(self.experts.len());
+        let mut sel: Vec<Option<(Tensor, Tensor)>> = Vec::with_capacity(self.experts.len());
         for bucket in per_expert.iter() {
             if bucket.is_empty() {
                 sel.push(None);
@@ -1453,8 +1445,9 @@ impl Moe {
             }
             let token_idx: Vec<u32> = bucket.iter().map(|(t, _)| *t).collect();
             let count = token_idx.len();
-            let idx = Tensor::from_vec(token_idx.clone(), count, dev)?;
-            sel.push(Some((token_idx, x2.index_select(&idx, 0)?)));
+            let idx = Tensor::from_vec(token_idx, count, dev)?;
+            let x_sel = x2.index_select(&idx, 0)?;
+            sel.push(Some((idx, x_sel)));
         }
 
         // Tensor-major MoE: run every expert's gate, then every expert's up,
@@ -1477,15 +1470,14 @@ impl Moe {
             }
         }
         for (e, s) in sel.iter().enumerate() {
-            if let Some((token_idx, _)) = s {
+            if let Some((idx, _)) = s {
                 let out = self.experts[e].combine_and_down(
                     gates[e].take().expect("gate ran"),
                     ups[e].take().expect("up ran"),
                 )?;
-                let idx = Tensor::from_vec(token_idx.clone(), token_idx.len(), dev)?;
                 let w: Vec<f32> = per_expert[e].iter().map(|(_, w)| *w).collect();
-                let w = Tensor::from_vec(w, (token_idx.len(), 1), dev)?;
-                y = y.index_add(&idx, &out.broadcast_mul(&w)?, 0)?;
+                let w = Tensor::from_vec(w, (idx.elem_count(), 1), dev)?;
+                y = y.index_add(idx, &out.broadcast_mul(&w)?, 0)?;
             }
         }
         Ok(y)
@@ -1528,9 +1520,14 @@ impl FeedForward {
 
 /// A quantized DeepSeek-V4 model loaded from GGUF.
 pub struct ModelWeights {
-    tok_embeddings: Tensor,
-    layers: Vec<Layer>,
+    weights: Arc<SharedWeights>,
     kv: Vec<KvState>,
+}
+
+/// Immutable tensors shared across independent generation sessions.
+pub(crate) struct SharedWeights {
+    tok_embeddings: QTensor,
+    layers: Vec<Layer>,
     cfg: Config,
     norm: RmsNorm,
     output: QMatMul,
@@ -1540,6 +1537,7 @@ pub struct ModelWeights {
     hc_mult: usize,
     hc_eps: f64,
     max_seq: usize,
+    prefetch_bytes: Option<usize>,
     device: Device,
     /// The model mapping, retained so prefill can prefetch whole layers.
     mmap: Option<std::sync::Arc<memmap2::Mmap>>,
@@ -1748,7 +1746,24 @@ impl<R: Read + Seek> Reader<R> {
     }
 }
 
+impl SharedWeights {
+    pub(crate) fn new_session(self: &Arc<Self>) -> Result<ModelWeights> {
+        let kv = (0..self.cfg.n_layer)
+            .map(|i| KvState::new(&self.cfg, i, &self.device, self.max_seq))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(ModelWeights { weights: Arc::clone(self), kv })
+    }
+}
+
 impl ModelWeights {
+    pub(crate) fn shared_weights(&self) -> Arc<SharedWeights> { Arc::clone(&self.weights) }
+
+    /// Share immutable weights while allocating independent empty caches.
+    pub fn fork_session(&self) -> Result<Self> { self.weights.new_session() }
+
+    /// Allocated context capacity, including compressed caches and rotary tables.
+    pub fn context_capacity(&self) -> usize { self.weights.max_seq }
+
     /// Load a `deepseek4` GGUF.
     pub fn from_gguf<R: Read + Seek>(
         ct: gguf_file::Content,
@@ -1771,6 +1786,14 @@ impl ModelWeights {
         mmap: Option<std::sync::Arc<memmap2::Mmap>>,
         file: Option<std::sync::Arc<std::fs::File>>,
     ) -> Result<Self> {
+        Self::from_gguf_mmap_with_options(ct, raw, reader, device, mmap, file, &crate::model::ModelLoadOptions::default())
+    }
+
+    pub fn from_gguf_mmap_with_options<R: Read + Seek>(
+        ct: gguf_file::Content, raw: Option<&GgufHeader>, reader: &mut R,
+        device: &Device, mmap: Option<Arc<memmap2::Mmap>>,
+        file: Option<Arc<std::fs::File>>, options: &crate::model::ModelLoadOptions,
+    ) -> Result<Self> {
         let cfg = Config::from_metadata(&ct.metadata)?;
         let mut rd = Reader {
             ct,
@@ -1781,7 +1804,9 @@ impl ModelWeights {
             file,
         };
 
-        let tok_embeddings = rd.f32_tensor("token_embd.weight")?;
+        // Keep the vocabulary table in its on-disk format. The borrowed
+        // storage decodes only the token rows requested by each forward pass.
+        let tok_embeddings = rd.qtensor("token_embd.weight")?;
         let norm = rd.rms_norm("output_norm.weight", cfg.rms_eps)?;
         let output = match rd.qmatmul_opt("output.weight")? {
             Some(o) => o,
@@ -1794,7 +1819,7 @@ impl ModelWeights {
 
         // Rope tables are capped at the same length as the KV caches: a 1M
         // context config would otherwise allocate ~256 MB of sin/cos tables.
-        let max_seq = cfg.context_length.min(KV_CAP);
+        let max_seq = cfg.context_length.min(KV_CAP).min(options.context_length.unwrap_or(KV_CAP).max(1));
         // Raw (window-only) layers: plain rope_theta, no YaRN.
         let rotary_raw = Arc::new(RotaryEmbedding::new(
             &cfg,
@@ -1935,7 +1960,7 @@ impl ModelWeights {
         // KV caches are sized to the configured context, capped so a 1M-token
         // config does not silently reserve ~20 GB of CPU RAM per instance.
         // The cap is a hard limit enforced in `forward` (clear error if hit).
-        let kv_cap = cfg.context_length.min(KV_CAP);
+        let kv_cap = max_seq;
         let mut kv_states = Vec::with_capacity(cfg.n_layer);
         for i in 0..cfg.n_layer {
             kv_states.push(KvState::new(&cfg, i, device, kv_cap)?);
@@ -1952,9 +1977,10 @@ impl ModelWeights {
         let file = rd.file.clone();
 
         Ok(Self {
+            kv: kv_states,
+            weights: Arc::new(SharedWeights {
             tok_embeddings,
             layers,
-            kv: kv_states,
             cfg,
             norm,
             output,
@@ -1964,10 +1990,12 @@ impl ModelWeights {
             hc_mult,
             hc_eps,
             max_seq: kv_cap,
+            prefetch_bytes: options.prefetch_bytes,
             device: device.clone(),
             mmap,
             file,
             layer_expert_ranges,
+            }),
         })
     }
 
@@ -1975,19 +2003,16 @@ impl ModelWeights {
     /// position of the first input token.
     pub fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {
         let (_b, seq_len) = input.dims2()?;
-        let hc = self.hc_mult;
-        let d = self.tok_embeddings.dim(1)?;
+        let hc = self.weights.hc_mult;
+        let (_, d) = self.weights.tok_embeddings.shape().dims2()?;
 
-        let tok = self
-            .tok_embeddings
-            .index_select(&input.flatten_all()?, 0)?
-            .reshape((1, seq_len, d))?;
+        let tok = self.weights.tok_embeddings.embedding(input)?.to_dtype(DType::F32)?;
         // Expand to hc copies.
         let mut xs = tok.unsqueeze(2)?.broadcast_as((1, seq_len, hc, d))?;
 
         let profile = std::env::var_os("JOSHUA_PROFILE_LAYERS").is_some();
         let mut prof = if profile {
-            Some((Vec::with_capacity(self.layers.len()), Vec::with_capacity(self.layers.len()), Vec::with_capacity(self.layers.len())))
+            Some((Vec::with_capacity(self.weights.layers.len()), Vec::with_capacity(self.weights.layers.len()), Vec::with_capacity(self.weights.layers.len())))
         } else {
             None
         };
@@ -2004,28 +2029,29 @@ impl ModelWeights {
         // additionally needs the model file handle, so loads that supply a
         // mapping but no file (public `from_gguf_mmap(..., Some(mmap), None)`)
         // keep the hints and just skip the thread.
-        let prefetch_layers = seq_len >= PREFETCH_AHEAD_MIN
-            && !self.layer_expert_ranges.is_empty()
-            && self.mmap.is_some();
-        let prefetch_thread = prefetch_layers && self.file.is_some();
+        let prefetch_layers = self.weights.prefetch_bytes != Some(0) && seq_len >= PREFETCH_AHEAD_MIN
+            && !self.weights.layer_expert_ranges.is_empty()
+            && self.weights.mmap.is_some();
+        let prefetch_thread = prefetch_layers && self.weights.file.is_some();
 
         let prefetcher = if prefetch_thread {
-            Some(crate::mmap_tensor::LayerPrefetcher::spawn(
-                self.file.as_ref().expect("checked above").clone(),
-                std::sync::Arc::new(self.layer_expert_ranges.clone()),
+            Some(crate::mmap_tensor::LayerPrefetcher::spawn_bounded(
+                self.weights.file.as_ref().expect("checked above").clone(),
+                std::sync::Arc::new(self.weights.layer_expert_ranges.clone()),
                 crate::mmap_tensor::PREFETCH_AHEAD_DEPTH,
+                self.weights.prefetch_bytes.unwrap_or(usize::MAX),
             ))
         } else {
             None
         };
 
-        for (i, layer) in self.layers.iter_mut().enumerate() {
+        for (i, layer) in self.weights.layers.iter().enumerate() {
             let t_layer = std::time::Instant::now();
             if let Some(pf) = &prefetcher {
                 pf.set_current(i);
             }
-            if i == 0 && prefetch_layers {
-                if let Some(mmap) = &self.mmap {
+            if i == 0 && prefetch_layers && self.weights.prefetch_bytes.is_none() {
+                if let Some(mmap) = &self.weights.mmap {
                     // The lazy-weights path advises MADV_RANDOM over the
                     // whole mapping, which disables kernel readahead: every
                     // demand fault is a single 4 KiB page read (~175 MB/s
@@ -2036,8 +2062,8 @@ impl ModelWeights {
                     // layer loop computes.  The tensor-major MoE dispatch
                     // below then reads each expert tensor as one clean pass.
                     if let (Some(Some((b0, _))), Some(Some((_, e_n)))) = (
-                        self.layer_expert_ranges.first(),
-                        self.layer_expert_ranges.last(),
+                        self.weights.layer_expert_ranges.first(),
+                        self.weights.layer_expert_ranges.last(),
                     ) {
                         let span = e_n.saturating_sub(*b0);
                         if span > 0 && *e_n <= mmap.len() {
@@ -2052,14 +2078,14 @@ impl ModelWeights {
                 &layer.hc_attn_fn,
                 &layer.hc_attn_scale,
                 &layer.hc_attn_base,
-                self.hc_eps,
-                self.cfg.hc_sinkhorn_iters,
+                self.weights.hc_eps,
+                self.weights.cfg.hc_sinkhorn_iters,
             )?;
             let residual = xs;
             let h = layer.attn_norm.forward(&x)?;
             let h = layer
                 .attn
-                .forward(&mut self.kv[i], &h, offset, self.max_seq)?;
+                .forward(&mut self.kv[i], &h, offset, self.weights.max_seq)?;
             xs = hc_post(&h, &residual, &post, &comb)?;
             if let Some((a, _, _)) = prof.as_mut() {
                 a.push(t_layer.elapsed().as_secs_f64());
@@ -2071,8 +2097,8 @@ impl ModelWeights {
                 &layer.hc_ffn_fn,
                 &layer.hc_ffn_scale,
                 &layer.hc_ffn_base,
-                self.hc_eps,
-                self.cfg.hc_sinkhorn_iters,
+                self.weights.hc_eps,
+                self.weights.cfg.hc_sinkhorn_iters,
             )?;
             let residual = xs;
             let h = layer.ffn_norm.forward(&x)?;
@@ -2118,10 +2144,10 @@ impl ModelWeights {
         // handful of experts per layer, so SEQUENTIAL's aggressive readahead
         // would waste bandwidth pulling the wrong pages.
         if prefetch_layers {
-            if let Some(mmap) = &self.mmap {
+            if let Some(mmap) = &self.weights.mmap {
                 if let (Some(Some((b0, _))), Some(Some((_, e_n)))) = (
-                    self.layer_expert_ranges.first(),
-                    self.layer_expert_ranges.last(),
+                    self.weights.layer_expert_ranges.first(),
+                    self.weights.layer_expert_ranges.last(),
                 ) {
                     let span = e_n.saturating_sub(*b0);
                     if span > 0 && *e_n <= mmap.len() {
@@ -2133,30 +2159,30 @@ impl ModelWeights {
 
         // Parallel head: collapse hc copies, RMS, output matmul.
         // pre = sigmoid(mixes * hc_head_scale + hc_head_base) + eps
-        let flat = xs.reshape((seq_len, hc * d))?;
+        let xs = xs.narrow(1, seq_len - 1, 1)?;
+        let flat = xs.reshape((1, hc * d))?;
         let rsqrt = flat
             .sqr()?
             .mean_keepdim(D::Minus1)?
-            .affine(1.0, self.hc_eps)?
+            .affine(1.0, self.weights.hc_eps)?
             .powf(-0.5)?;
-        let mixes = self.hc_head_fn.forward(&flat)?.broadcast_mul(&rsqrt)?; // [s, hc]
+        let mixes = self.weights.hc_head_fn.forward(&flat)?.broadcast_mul(&rsqrt)?; // [s, hc]
         let pre = sigmoid(
             &mixes
-                .broadcast_mul(&self.hc_head_scale)?
-                .broadcast_add(&self.hc_head_base)?,
+                .broadcast_mul(&self.weights.hc_head_scale)?
+                .broadcast_add(&self.weights.hc_head_base)?,
         )?
-        .affine(1.0, self.hc_eps)?; // + eps
+        .affine(1.0, self.weights.hc_eps)?; // + eps
         let y = pre
             .unsqueeze(D::Minus1)?
-            .broadcast_as((seq_len, hc, d))?
+            .broadcast_as((1, hc, d))?
             .mul(&xs.squeeze(0)?)?
             .sum(D::Minus2)?; // [s, d]
 
         // Only the last position's logits are needed, and the engine's
         // `squeeze_batch_logits` requires a single row.
-        let y = y.narrow(0, seq_len - 1, 1)?;
-        let y = self.norm.forward(&y)?;
-        let logits = self.output.forward(&y)?; // [1, n_vocab]
+        let y = self.weights.norm.forward(&y)?;
+        let logits = self.weights.output.forward(&y)?; // [1, n_vocab]
         logits.to_dtype(DType::F32)
     }
 
@@ -2164,7 +2190,7 @@ impl ModelWeights {
     /// prefetchable) vs the total, for diagnostics.
     pub fn mmap_backed_experts(&self) -> (usize, usize) {
         let (mut backed, mut total) = (0, 0);
-        for layer in &self.layers {
+        for layer in &self.weights.layers {
             let FeedForward::Moe(moe) = &layer.ffn;
             for e in &moe.experts {
                 total += 1;
@@ -2178,9 +2204,9 @@ impl ModelWeights {
 
     /// Reset the KV caches so this instance can serve an unrelated prompt.
     pub fn clear_kv_cache(&mut self) {
-        let dev = self.device.clone();
+        let dev = self.weights.device.clone();
         for (i, kv) in self.kv.iter_mut().enumerate() {
-            match KvState::new(&self.cfg, i, &dev, self.max_seq) {
+            match KvState::new(&self.weights.cfg, i, &dev, self.weights.max_seq) {
                 Ok(n) => *kv = n,
                 Err(e) => eprintln!("deepseek4: failed to reset KV state for layer {i}: {e}"),
             }
@@ -2385,7 +2411,7 @@ fn load_moe<R: Read + Seek>(
     layer: usize,
     hash: bool,
 ) -> Result<Moe> {
-    let gate = rd.f32_tensor(&format!("{p}.ffn_gate_inp.weight"))?;
+    let gate_t = rd.f32_tensor(&format!("{p}.ffn_gate_inp.weight"))?.t()?.contiguous()?;
     let gate_bias = if hash {
         None
     } else {
@@ -2453,7 +2479,7 @@ fn load_moe<R: Read + Seek>(
     };
 
     Ok(Moe {
-        gate,
+        gate_t,
         gate_bias,
         tid2eid,
         experts,
@@ -2557,6 +2583,36 @@ fn split_experts<R: Read + Seek>(
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn hadamard_rows_matches_dense_transform_without_mutating_input() -> Result<()> {
+        let values: Vec<f32> = (0..64).map(|i| (i as f32 - 31.0) / 7.0).collect();
+        // Exercise multiple leading dimensions and a non-contiguous input.
+        let input = Tensor::from_vec(values, (2, 4, 8), &Device::Cpu)?.transpose(0, 1)?;
+        let original = input.flatten_all()?.to_vec1::<f32>()?;
+        let output = hadamard_rows(&input)?;
+        assert_eq!(output.dims(), input.dims());
+        let actual = output.flatten_all()?.to_vec1::<f32>()?;
+        for (row, expected_input) in actual.chunks_exact(8).zip(original.chunks_exact(8)) {
+            for (i, &value) in row.iter().enumerate() {
+                let expected: f32 = expected_input
+                    .iter()
+                    .enumerate()
+                    .map(|(j, x)| {
+                        if (i & j).count_ones() % 2 == 0 {
+                            *x
+                        } else {
+                            -*x
+                        }
+                    })
+                    .sum::<f32>()
+                    / 8f32.sqrt();
+                assert!((value - expected).abs() < 1e-5);
+            }
+        }
+        assert_eq!(input.flatten_all()?.to_vec1::<f32>()?, original);
+        Ok(())
+    }
 
     fn md() -> HashMap<String, gguf_file::Value> {
         let mut m = HashMap::new();

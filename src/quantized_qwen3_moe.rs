@@ -161,10 +161,28 @@ struct Reader<R: Read + Seek> {
     /// being uploaded.  `None` on CPU, without a mapping, or when the
     /// no-copy buffer could not be created (the loader then copies).
     zc: Option<Arc<ZcContext>>,
+    require_zero_copy: bool,
+    gpu_copy_budget_bytes: Option<usize>,
+    gpu_copy_bytes: usize,
 }
 
 impl<R: Read + Seek> Reader<R> {
     fn qtensor(&mut self, name: &str) -> Result<QTensor> {
+        if !self.device.is_cpu() {
+            if let Some(limit) = self.gpu_copy_budget_bytes {
+                let info = self.ct.tensor_infos.get(name)
+                    .ok_or_else(|| candle_core::Error::Msg(format!("missing tensor {name}")))?;
+                // Conservative allowance for both quantized storage and a
+                // dequantized f32 tensor. Zero-copy matmuls skip this method.
+                let estimate = info.shape.elem_count().checked_mul(8)
+                    .and_then(|n| self.gpu_copy_bytes.checked_add(n))
+                    .ok_or_else(|| candle_core::Error::Msg("GPU copy estimate overflow".into()))?;
+                if estimate > limit {
+                    candle_core::bail!("GPU copied-weight estimate {estimate} exceeds budget {limit} at {name}");
+                }
+                self.gpu_copy_bytes = estimate;
+            }
+        }
         if let Some(mmap) = &self.mmap {
             return crate::mmap_tensor::qtensor_from_mmap(
                 &self.ct,
@@ -184,12 +202,8 @@ impl<R: Read + Seek> Reader<R> {
         }
         Ok(Weight::Candle(QMatMul::from_qtensor(self.qtensor(name)?)?))
     }
-    fn qmatmul_opt(&mut self, name: &str) -> Option<Weight> {
-        if self.has(name) {
-            self.qmatmul(name).ok()
-        } else {
-            None
-        }
+    fn qmatmul_opt(&mut self, name: &str) -> Result<Option<Weight>> {
+        if self.has(name) { self.qmatmul(name).map(Some) } else { Ok(None) }
     }
     fn rms_norm(&mut self, name: &str, eps: f64) -> Result<RmsNorm> {
         RmsNorm::from_qtensor(self.qtensor(name)?, eps)
@@ -434,7 +448,7 @@ impl Moe {
         let n_tokens = b * seq_len;
         let x2 = xs.reshape((n_tokens, h))?;
         let (topk_idx, weights) = self.route(&x2)?;
-        let routed = self.dispatch(&x2, &topk_idx, &weights, n_tokens)?;
+        let routed = self.dispatch(&x2, &topk_idx, &weights)?;
         routed.reshape((b, seq_len, h))
     }
 
@@ -475,88 +489,16 @@ impl Moe {
         Ok((topk_idx, weights))
     }
 
-    /// Run each selected expert over its routed tokens and accumulate the
-    /// weighted outputs. Experts stay quantized.
-    ///
-    /// Prefill (`n_tokens > 1`) buckets tokens per expert and runs one batched
-    /// matmul per expert.  Decode (`n_tokens == 1`) takes the separate path
-    /// below that avoids every per-expert host round-trip.
+    /// Batch prompt tokens per expert, with a device-resident decode path.
     fn dispatch(
         &self,
         x2: &Tensor,
         topk_idx: &Tensor,
         weights: &Tensor,
-        n_tokens: usize,
     ) -> Result<Tensor> {
-        if n_tokens == 1 {
-            return self.dispatch_decode(x2, topk_idx, weights);
-        }
-        let k = self.n_expert_used;
-        let h = x2.dim(1)?;
-        let ids: Vec<u32> = topk_idx.flatten_all()?.to_vec1()?;
-        let wts: Vec<f32> = weights.flatten_all()?.to_vec1()?;
-
-        // Bucket (token, weight) pairs by expert.
-        let mut per_expert: Vec<Vec<(u32, f32)>> = vec![Vec::new(); self.experts.len()];
-        for t in 0..n_tokens {
-            for s in 0..k {
-                let e = ids[t * k + s] as usize;
-                if e >= self.experts.len() {
-                    // Defensive: a corrupt router output must fail loudly with
-                    // context instead of panicking on the slice index below.
-                    let start = t * k;
-                    let row: Vec<u32> = ids[start..start + k].to_vec();
-                    eprintln!(
-                        "ROUTER OOB: token {t} slot {s} expert id {e} ({} experts); ids row {row:?}",
-                        self.experts.len()
-                    );
-                    candle_core::bail!(
-                        "qwen3moe: router selected expert {e} out of {} (token {t}, slot {s})",
-                        self.experts.len()
-                    );
-                }
-                per_expert[e].push((t as u32, wts[t * k + s]));
-            }
-        }
-
-        let dev = x2.device();
-        let mut y = Tensor::zeros((n_tokens, h), DType::F32, dev)?;
-        for (e, bucket) in per_expert.iter().enumerate() {
-            if bucket.is_empty() {
-                continue;
-            }
-            let token_idx: Vec<u32> = bucket.iter().map(|(t, _)| *t).collect();
-            let w: Vec<f32> = bucket.iter().map(|(_, w)| *w).collect();
-            let count = token_idx.len();
-            let idx = Tensor::from_vec(token_idx, count, dev)?;
-            let x_sel = x2.index_select(&idx, 0)?; // [count, h]
-            let out = self.experts[e].forward(&x_sel)?; // [count, h]
-            let w = Tensor::from_vec(w, (count, 1), dev)?;
-            y = y.index_add(&idx, &out.broadcast_mul(&w)?, 0)?;
-        }
-        Ok(y)
-    }
-
-    /// Single-token decode dispatch.  With one token every selected expert
-    /// consumes the same input row, so there is nothing to gather: run the
-    /// `k` expert MLPs over `x2`, stack their outputs, scale by the routing
-    /// weights (still on the device — no copy back) and sum.
-    fn dispatch_decode(
-        &self,
-        x2: &Tensor,
-        topk_idx: &Tensor,
-        weights: &Tensor,
-    ) -> Result<Tensor> {
-        let k = self.n_expert_used;
-        let ids: Vec<u32> = topk_idx.flatten_all()?.to_vec1()?; // [k] — the one host sync
-        let mut outs = Vec::with_capacity(k);
-        for &e in ids.iter() {
-            outs.push(self.experts[e as usize].forward(x2)?); // [1, h] each
-        }
-        let out = Tensor::stack(&outs, 0)?; // [k, 1, h]
-        let w = weights.reshape((k, 1, 1))?; // [k, 1, 1]
-        let y = out.broadcast_mul(&w)?.sum(0)?; // [1, h]
-        Ok(y)
+        crate::moe::dispatch(x2, topk_idx, weights, self.experts.len(), |expert, x| {
+            self.experts[expert].forward(x)
+        })
     }
 }
 
@@ -624,6 +566,10 @@ fn split_experts<R: Read + Seek>(
             }
             return Ok(experts);
         }
+    }
+
+    if rd.require_zero_copy && !rd.device.is_cpu() {
+        candle_core::bail!("zero-copy required but expert tensor {name} could not be borrowed");
     }
 
     // CPU-mmap path: borrow each expert's slice of the mapping.  Building all
@@ -728,6 +674,16 @@ impl GGUFQWenMoE {
         device: &Device,
         mmap: Option<Arc<memmap2::Mmap>>,
     ) -> Result<Self> {
+        Self::from_gguf_mmap_with_options(ct, reader, device, mmap, &crate::model::ModelLoadOptions::default())
+    }
+
+    pub fn from_gguf_mmap_with_options<R: Read + Seek>(
+        ct: gguf_file::Content, reader: &mut R, device: &Device,
+        mmap: Option<Arc<memmap2::Mmap>>, options: &crate::model::ModelLoadOptions,
+    ) -> Result<Self> {
+        if options.require_zero_copy && matches!(device, Device::Metal(_)) && mmap.is_none() {
+            candle_core::bail!("zero-copy Metal required but no model mapping was supplied");
+        }
         let cfg = Config::from_metadata(&ct.metadata)?;
         // Zero-copy Metal: bind the mapped weights into no-copy GPU buffers
         // so quantized weights are never uploaded.  Best effort — if the
@@ -747,6 +703,7 @@ impl GGUFQWenMoE {
                         Some(Arc::new(zc))
                     }
                     Err(e) => {
+                        if options.require_zero_copy { return Err(e); }
                         tracing::warn!(
                             "zero-copy Metal unavailable ({}); copying weights onto the GPU",
                             e
@@ -765,11 +722,14 @@ impl GGUFQWenMoE {
             device: device.clone(),
             mmap,
             zc,
+            require_zero_copy: options.require_zero_copy,
+            gpu_copy_budget_bytes: options.gpu_copy_budget_bytes,
+            gpu_copy_bytes: 0,
         };
 
         let tok_embeddings = rd.f32_tensor("token_embd.weight")?;
         let norm = rd.rms_norm("output_norm.weight", cfg.rms_eps)?;
-        let output = match rd.qmatmul_opt("output.weight") {
+        let output = match rd.qmatmul_opt("output.weight")? {
             Some(q) => q,
             // tie_word_embeddings conversions ship no output head.
             None => rd.qmatmul("token_embd.weight")?,

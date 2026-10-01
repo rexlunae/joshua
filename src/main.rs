@@ -112,6 +112,48 @@ struct Cli {
     command: Commands,
 }
 
+#[derive(clap::Args)]
+struct MemoryArgs {
+    /// One concurrent request, 128-token prefill chunks, bounded prefetch,
+    /// and strict zero-copy Metal (native backend only).
+    #[arg(long)]
+    low_memory: bool,
+    /// Startup planning budget for native concurrency, in MiB; not an RSS cap.
+    #[arg(long)]
+    memory_budget_mib: Option<usize>,
+    /// Prompt tokens per forward pass (0 disables chunking).
+    #[arg(long)]
+    prefill_chunk_size: Option<usize>,
+    /// Idle native/plugin sessions to retain (0 releases their caches).
+    #[arg(long)]
+    max_cached_models: Option<usize>,
+    /// Maximum speculative DeepSeek prefetch MiB per layer window (0 disables).
+    #[arg(long)]
+    prefetch_mib: Option<usize>,
+    /// Reject estimated GPU weight uploads exceeding this many MiB.
+    #[arg(long)]
+    gpu_weight_budget_mib: Option<usize>,
+    /// Opt-in per-session quantized GPU weight cache for Qwen3-MoE (MiB).
+    #[arg(long)]
+    gpu_cache_mib: Option<usize>,
+}
+
+impl MemoryArgs {
+    fn apply(self, mut opts: EngineOptions) -> anyhow::Result<EngineOptions> {
+        fn bytes(mib: Option<usize>) -> anyhow::Result<Option<usize>> {
+            mib.map(|m| m.checked_mul(1024 * 1024).ok_or_else(|| anyhow::anyhow!("memory budget overflows byte count"))).transpose()
+        }
+        opts.low_memory = self.low_memory;
+        opts.memory_budget_bytes = bytes(self.memory_budget_mib)?;
+        opts.prefill_chunk_size = self.prefill_chunk_size;
+        opts.max_cached_models = self.max_cached_models;
+        opts.prefetch_bytes = bytes(self.prefetch_mib)?;
+        opts.gpu_weight_budget_bytes = bytes(self.gpu_weight_budget_mib)?;
+        opts.gpu_cache_bytes = bytes(self.gpu_cache_mib)?;
+        Ok(opts)
+    }
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Start the OpenAI-compatible HTTP API server.
@@ -127,6 +169,8 @@ enum Commands {
         /// Context window size in tokens.
         #[arg(long, default_value_t = 4096)]
         n_ctx: u32,
+        #[command(flatten)]
+        memory: MemoryArgs,
         /// Compute backend: auto, cpu, metal, or cuda.  An explicit GPU
         /// request fails the load when the backend is not built in or is
         /// unavailable at runtime.
@@ -209,6 +253,8 @@ enum Commands {
         /// Context window size in tokens.
         #[arg(long, default_value_t = 4096)]
         n_ctx: u32,
+        #[command(flatten)]
+        memory: MemoryArgs,
         /// Compute backend: auto, cpu, metal, or cuda.  An explicit GPU
         /// request fails the load when the backend is not built in or is
         /// unavailable at runtime.
@@ -292,6 +338,7 @@ async fn main() -> anyhow::Result<()> {
             model,
             addr,
             n_ctx,
+            memory,
             device,
             huge_pages,
             mmap,
@@ -324,7 +371,7 @@ async fn main() -> anyhow::Result<()> {
                 .lazy_weights(lazy_weights)
                 .pin_hot_weights(pin_hot)
                 .mlock_hot_weights(mlock_hot_weights.map(MlockMode::from).unwrap_or(MlockMode::Off));
-            let mut engine = Engine::with_options(&model, opts)?;
+            let mut engine = Engine::with_options(&model, memory.apply(opts)?)?;
             if let Some(plugin) = npu_plugin {
                 engine = engine.with_npu_backend(npu_backend(&plugin, npu_in_process)?);
             }
@@ -377,6 +424,7 @@ async fn main() -> anyhow::Result<()> {
             max_tokens,
             temperature,
             n_ctx,
+            memory,
             device,
             huge_pages,
             mmap,
@@ -394,7 +442,7 @@ async fn main() -> anyhow::Result<()> {
                 .lazy_weights(lazy_weights)
                 .pin_hot_weights(pin_hot)
                 .mlock_hot_weights(mlock_hot_weights.map(MlockMode::from).unwrap_or(MlockMode::Off));
-            let mut engine = Engine::with_options(&model, opts)?;
+            let mut engine = Engine::with_options(&model, memory.apply(opts)?)?;
             if let Some(plugin) = npu_plugin {
                 engine = engine.with_npu_backend(npu_backend(&plugin, npu_in_process)?);
             }

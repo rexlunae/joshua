@@ -751,7 +751,10 @@ pub fn write_tiny_qwen3moe_gguf(path: &Path) {
         (key("expert_used_count"), u32v(2)),
         (key("expert_feed_forward_length"), u32v(NFE as u32)),
         (key("expert_shared_feed_forward_length"), u32v(0)),
-        (key("attention.norm_topk_prob"), gguf_file::Value::Bool(true)),
+        (
+            key("attention.norm_topk_prob"),
+            gguf_file::Value::Bool(true),
+        ),
         (
             "tokenizer.ggml.eos_token_id".to_string(),
             gguf_file::Value::U32(3),
@@ -841,14 +844,8 @@ pub fn write_tiny_qwen3moe_gguf(path: &Path) {
             format!("{p}.attn_output.weight"),
             qtensor(next(EMB * H * HD), &[EMB, H * HD]),
         ));
-        tensors.push((
-            format!("{p}.attn_q_norm.weight"),
-            qtensor(ones(HD), &[HD]),
-        ));
-        tensors.push((
-            format!("{p}.attn_k_norm.weight"),
-            qtensor(ones(HD), &[HD]),
-        ));
+        tensors.push((format!("{p}.attn_q_norm.weight"), qtensor(ones(HD), &[HD])));
+        tensors.push((format!("{p}.attn_k_norm.weight"), qtensor(ones(HD), &[HD])));
         tensors.push((
             format!("{p}.ffn_gate_inp.weight"),
             qtensor(next(NE * EMB), &[NE, EMB]),
@@ -911,7 +908,10 @@ pub fn write_tiny_qwen3moe_metal_gguf(path: &Path) {
         (key("expert_used_count"), u32v(8)),
         (key("expert_feed_forward_length"), u32v(NFE as u32)),
         (key("expert_shared_feed_forward_length"), u32v(0)),
-        (key("attention.norm_topk_prob"), gguf_file::Value::Bool(true)),
+        (
+            key("attention.norm_topk_prob"),
+            gguf_file::Value::Bool(true),
+        ),
         (
             "tokenizer.ggml.eos_token_id".to_string(),
             gguf_file::Value::U32(3),
@@ -973,10 +973,7 @@ pub fn write_tiny_qwen3moe_metal_gguf(path: &Path) {
             "token_embd.weight".to_string(),
             qtensor_q4k(weights(VOCAB * EMB, 1), &[VOCAB, EMB]),
         ),
-        (
-            "output_norm.weight".to_string(),
-            qtensor(ones(EMB), &[EMB]),
-        ),
+        ("output_norm.weight".to_string(), qtensor(ones(EMB), &[EMB])),
     ];
 
     let mut seed = 10u32;
@@ -1004,14 +1001,8 @@ pub fn write_tiny_qwen3moe_metal_gguf(path: &Path) {
             format!("{p}.attn_output.weight"),
             qtensor_q4k(next(EMB * H * HD), &[EMB, H * HD]),
         ));
-        tensors.push((
-            format!("{p}.attn_q_norm.weight"),
-            qtensor(ones(HD), &[HD]),
-        ));
-        tensors.push((
-            format!("{p}.attn_k_norm.weight"),
-            qtensor(ones(HD), &[HD]),
-        ));
+        tensors.push((format!("{p}.attn_q_norm.weight"), qtensor(ones(HD), &[HD])));
+        tensors.push((format!("{p}.attn_k_norm.weight"), qtensor(ones(HD), &[HD])));
         tensors.push((
             format!("{p}.ffn_gate_inp.weight"),
             qtensor(next(NE * EMB), &[NE, EMB]),
@@ -1309,6 +1300,7 @@ pub fn write_raw_gguf(path: &Path, metadata: &[(String, gguf_file::Value)], tens
 /// Options controlling which tensors the tiny `deepseek4` writer emits.
 #[derive(Default, Clone, Copy)]
 pub struct TinyDeepseek4Opts {
+    pub long_context: bool,
     /// Also emit `output.weight` as IQ2_XXS (a dtype candle cannot name).
     pub iq2xxs_output: bool,
     /// Layer 0 is a CSA layer (compressor + lightning indexer tensors).
@@ -1381,8 +1373,9 @@ pub fn write_tiny_deepseek4_gguf_candle_only(path: &Path) {
     );
 }
 
-fn write_tiny_deepseek4_gguf_opts(path: &Path, opts: TinyDeepseek4Opts) {
+pub fn write_tiny_deepseek4_gguf_opts(path: &Path, opts: TinyDeepseek4Opts) {
     let TinyDeepseek4Opts {
+        long_context,
         iq2xxs_output,
         compress,
         kquant_weights,
@@ -1432,7 +1425,10 @@ fn write_tiny_deepseek4_gguf_opts(path: &Path, opts: TinyDeepseek4Opts) {
         (key("rope.dimension_count"), u32v(ROPE_DIM as u32)),
         (
             key("attention.compress_ratios"),
-            gguf_file::Value::Array(vec![u32v(if compress { 4 } else { 0 }), u32v(0)]),
+            gguf_file::Value::Array(vec![
+                u32v(if compress { 4 } else { 0 }),
+                u32v(if long_context { 128 } else { 0 }),
+            ]),
         ),
         (key("attention.sliding_window"), u32v(8)),
         (key("attention.output_group_count"), u32v(O_GROUPS as u32)),
@@ -1447,7 +1443,10 @@ fn write_tiny_deepseek4_gguf_opts(path: &Path, opts: TinyDeepseek4Opts) {
         (key("expert_weights_scale"), f32v(1.0)),
         (key("expert_gating_func"), u32v(2)),
         (key("rope.freq_base"), f32v(10_000.0)),
-        (key("context_length"), u32v(32)),
+        (
+            key("context_length"),
+            u32v(if long_context { 1024 } else { 32 }),
+        ),
         ("tokenizer.ggml.eos_token_id".to_string(), u32v(3)),
         ("tokenizer.ggml.bos_token_id".to_string(), u32v(3)),
         ("tokenizer.ggml.unknown_token_id".to_string(), u32v(0)),
@@ -1629,6 +1628,29 @@ fn write_tiny_deepseek4_gguf_opts(path: &Path, opts: TinyDeepseek4Opts) {
             ));
         }
 
+        if long_context && i == 1 {
+            tensors.push(RawTensor::f16(
+                &format!("{p}.attn_compressor_kv.weight"),
+                next(HEAD_DIM * EMB),
+                &[HEAD_DIM, EMB],
+            ));
+            tensors.push(RawTensor::f16(
+                &format!("{p}.attn_compressor_gate.weight"),
+                next(HEAD_DIM * EMB),
+                &[HEAD_DIM, EMB],
+            ));
+            tensors.push(RawTensor::f32(
+                &format!("{p}.attn_compressor_ape.weight"),
+                next(128 * HEAD_DIM),
+                &[128, HEAD_DIM],
+            ));
+            tensors.push(RawTensor::f32(
+                &format!("{p}.attn_compressor_norm.weight"),
+                ones(HEAD_DIM),
+                &[HEAD_DIM],
+            ));
+        }
+
         // MoE: routed experts (IQ2_XXS gate/up, Q8_0 down) + shared expert.
         tensors.push(RawTensor::f32(
             &format!("{p}.ffn_gate_inp.weight"),
@@ -1674,10 +1696,7 @@ fn write_tiny_deepseek4_gguf_opts(path: &Path, opts: TinyDeepseek4Opts) {
             &format!("{p}.ffn_gate_shexp.weight"),
             next(NFE * EMB),
         ));
-        tensors.push(shexp(
-            &format!("{p}.ffn_up_shexp.weight"),
-            next(NFE * EMB),
-        ));
+        tensors.push(shexp(&format!("{p}.ffn_up_shexp.weight"), next(NFE * EMB)));
         tensors.push(RawTensor::f16(
             &format!("{p}.ffn_down_shexp.weight"),
             next(EMB * NFE),

@@ -550,7 +550,7 @@ impl Moe {
             weights = (weights * self.weights_scale)?;
         }
 
-        let routed = self.dispatch(&x2, &topk_idx, &weights, n_tokens)?;
+        let routed = self.dispatch(&x2, &topk_idx, &weights)?;
         let mut out = routed;
         if let Some(shared) = &self.shared {
             out = (out + shared.forward(&x2)?)?;
@@ -596,78 +596,16 @@ impl Moe {
         selection.add(&penalty)
     }
 
-    /// Run each selected expert over its routed tokens and accumulate the
-    /// weighted outputs. Experts stay quantized.
-    ///
-    /// Prefill (`n_tokens > 1`) buckets tokens per expert and runs one batched
-    /// matmul per expert.  Decode (`n_tokens == 1`) takes a separate path that
-    /// avoids every per-expert host round-trip: no `to_vec1` drain on the
-    /// weights, no `Tensor::from_vec` uploads, no `index_select`/`index_add`.
-    /// Each single-token layer forward then costs one host drain (the expert
-    /// ids, needed to pick weights) plus `n_expert_used ×` the expert MLPs and
-    /// a stack–scale–sum, instead of per-expert uploads and gathers.
+    /// Batch prompt tokens per expert, with a device-resident decode path.
     fn dispatch(
         &self,
         x2: &Tensor,
         topk_idx: &Tensor,
         weights: &Tensor,
-        n_tokens: usize,
     ) -> Result<Tensor> {
-        if n_tokens == 1 {
-            return self.dispatch_decode(x2, topk_idx, weights);
-        }
-        let k = self.n_expert_used;
-        let h = x2.dim(1)?;
-        let ids: Vec<u32> = topk_idx.flatten_all()?.to_vec1()?;
-        let wts: Vec<f32> = weights.flatten_all()?.to_vec1()?;
-
-        // Bucket (token, weight) pairs by expert.
-        let mut per_expert: Vec<Vec<(u32, f32)>> = vec![Vec::new(); self.experts.len()];
-        for t in 0..n_tokens {
-            for s in 0..k {
-                let e = ids[t * k + s] as usize;
-                per_expert[e].push((t as u32, wts[t * k + s]));
-            }
-        }
-
-        let dev = x2.device();
-        let mut y = Tensor::zeros((n_tokens, h), DType::F32, dev)?;
-        for (e, bucket) in per_expert.iter().enumerate() {
-            if bucket.is_empty() {
-                continue;
-            }
-            let token_idx: Vec<u32> = bucket.iter().map(|(t, _)| *t).collect();
-            let w: Vec<f32> = bucket.iter().map(|(_, w)| *w).collect();
-            let count = token_idx.len();
-            let idx = Tensor::from_vec(token_idx, count, dev)?;
-            let x_sel = x2.index_select(&idx, 0)?; // [count, h]
-            let out = self.experts[e].forward(&x_sel)?; // [count, h]
-            let w = Tensor::from_vec(w, (count, 1), dev)?;
-            y = y.index_add(&idx, &out.broadcast_mul(&w)?, 0)?;
-        }
-        Ok(y)
-    }
-
-    /// Single-token decode dispatch.  With one token every selected expert
-    /// consumes the same input row, so there is nothing to gather: run the
-    /// `k` expert MLPs over `x2`, stack their outputs, scale by the routing
-    /// weights (still on the device — no copy back) and sum.
-    fn dispatch_decode(
-        &self,
-        x2: &Tensor,
-        topk_idx: &Tensor,
-        weights: &Tensor,
-    ) -> Result<Tensor> {
-        let k = self.n_expert_used;
-        let ids: Vec<u32> = topk_idx.flatten_all()?.to_vec1()?; // [k] — the one host sync
-        let mut outs = Vec::with_capacity(k);
-        for &e in ids.iter() {
-            outs.push(self.experts[e as usize].forward(x2)?); // [1, h] each
-        }
-        let out = Tensor::stack(&outs, 0)?; // [k, 1, h]
-        let w = weights.reshape((k, 1, 1))?; // GPU view [k, 1, 1]
-        let y = out.broadcast_mul(&w)?.sum(0)?; // [1, h]
-        Ok(y)
+        crate::moe::dispatch(x2, topk_idx, weights, self.experts.len(), |expert, x| {
+            self.experts[expert].forward(x)
+        })
     }
 }
 
@@ -1251,13 +1189,14 @@ mod tests {
         Ok(())
     }
 
-    /// The single-token decode dispatch path must agree exactly with the
-    /// batched prefill path: each token is routed to the same experts and the
-    /// per-expert MLPs are applied to the same input, just gathered/stacked
-    /// differently.
+    /// The single-token decode dispatch path must agree within floating-point
+    /// tolerance with the batched prefill path: each token is routed to the
+    /// same experts and the per-expert MLPs are applied to the same input,
+    /// just gathered/stacked differently.
     #[test]
     fn moe_decode_dispatch_matches_batched_dispatch() -> Result<()> {
         use candle_core::quantized::QMatMul;
+        use rand::{rngs::StdRng, Rng, SeedableRng};
 
         let dev = Device::Cpu;
         let h = 6usize; // n_embd
@@ -1265,10 +1204,18 @@ mod tests {
         let k = 2usize; // n_expert_used
         let ffn = 10usize; // intermediate size
 
-        let lin = |rows: usize, cols: usize| -> QMatMul {
-            QMatMul::Tensor(Tensor::randn(0f32, 1f32, (rows, cols), &dev).unwrap())
+        // Fixed, bounded inputs keep the absolute tolerance reproducible;
+        // unseeded normal weights occasionally produced large outputs whose
+        // ordinary batched/serial rounding exceeded the tolerance.
+        let mut rng = StdRng::seed_from_u64(42);
+        let mut tensor = |rows: usize, cols: usize| -> Result<Tensor> {
+            let data: Vec<f32> = (0..rows * cols)
+                .map(|_| rng.gen_range(-1.0..1.0))
+                .collect();
+            Tensor::from_vec(data, (rows, cols), &dev)
         };
-        let gate = Tensor::randn(0f32, 1f32, (n_expert, h), &dev)?;
+        let gate = tensor(n_expert, h)?;
+        let mut lin = |rows, cols| QMatMul::Tensor(tensor(rows, cols).unwrap());
         let experts = (0..n_expert)
             .map(|_| Mlp {
                 gate: lin(ffn, h),
@@ -1290,7 +1237,7 @@ mod tests {
         };
 
         // Batched path: 3 tokens in one forward (softmax routing per token).
-        let xs = Tensor::randn(0f32, 1f32, (1, 3, h), &dev)?;
+        let xs = tensor(3, h)?.reshape((1, 3, h))?;
         let out_batch = moe.forward(&xs)?; // [1, 3, h]
 
         // Decode path: same 3 tokens one at a time, concatenated.

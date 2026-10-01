@@ -168,3 +168,32 @@ fn qwen3moe_metal_routing_stays_in_range() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn metal_memory_policy_rejects_copying_before_weight_allocation() {
+    let dev = match Device::new_metal(0) {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+    let dir = common::model_dir("qwen3moe-metal-memory-policy");
+    let path = dir.join("model.gguf");
+    common::write_tiny_qwen3moe_metal_gguf(&path);
+    let bytes = std::fs::read(&path).unwrap();
+    for strict in [true, false] {
+        let mut cursor = Cursor::new(&bytes);
+        let content = gguf_file::Content::read(&mut cursor).unwrap();
+        let options = joshua::model::ModelLoadOptions {
+            require_zero_copy: strict,
+            gpu_copy_budget_bytes: Some(0),
+            ..Default::default()
+        };
+        let error = match QuantizedModel::from_gguf_mmap_with_options(
+            content, &mut cursor, &dev, None, None, &options,
+        ) {
+            Ok(_) => panic!("must reject unbudgeted GPU copies"),
+            Err(e) => e.to_string(),
+        };
+        assert!(error.contains(if strict { "no model mapping" } else { "exceeds budget" }), "{error}");
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}

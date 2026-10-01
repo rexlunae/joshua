@@ -382,3 +382,86 @@ fn deepseek4_from_gguf_without_raw_header_loads() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn context_limit_and_shared_sessions_preserve_logits() {
+    let dir = common::model_dir("deepseek4-budget-context");
+    let path = dir.join("model.gguf");
+    common::write_tiny_deepseek4_gguf_compress(&path);
+    let bytes = std::fs::read(&path).unwrap();
+    let header = joshua::gguf_ext::read_header(&mut std::io::Cursor::new(&bytes)).unwrap();
+    let content = header.to_candle_content().unwrap();
+    let options = joshua::model::ModelLoadOptions {
+        context_length: Some(8), prefetch_bytes: Some(0), ..Default::default()
+    };
+    let mut limited = QuantizedModel::from_gguf_mmap_with_options(
+        content, &mut std::io::Cursor::new(&bytes), &Device::Cpu, None, None, &options,
+    ).unwrap();
+    let fork = match &limited {
+        QuantizedModel::DeepSeek4(w) => {
+            assert_eq!(w.context_capacity(), 8);
+            w.fork_session().unwrap()
+        }
+        _ => unreachable!(),
+    };
+    let mut fork = QuantizedModel::DeepSeek4(fork);
+    let mut reference = load(&path, false);
+    let expected = logits(&mut reference, &[1, 2, 3, 4, 5], 0);
+    logits(&mut limited, &[1, 2, 3], 0);
+    // A second session uses the same tensors with independent empty caches.
+    let second = logits(&mut fork, &[1, 2, 3, 4, 5], 0);
+    let chunked = logits(&mut limited, &[4, 5], 3);
+    for ((a, b), c) in expected.iter().zip(second).zip(chunked) {
+        assert!((a - b).abs() < 1e-4);
+        assert!((a - c).abs() < 1e-4);
+    }
+    let input = Tensor::new(&[[1u32; 4]], &Device::Cpu).unwrap();
+    assert!(limited.forward(&input, 5).is_err(), "must enforce the allocated capacity");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn low_memory_engine_chunked_prefill_matches_default_and_reloads_sessions() {
+    let dir = common::model_dir("deepseek4-low-memory-engine");
+    let path = dir.join("model.gguf");
+    common::write_tiny_deepseek4_gguf_compress(&path);
+    let regular = joshua::Engine::with_options(&path, joshua::EngineOptions::with_n_ctx(16)).unwrap();
+    let mut opts = joshua::EngineOptions::with_n_ctx(16);
+    opts.low_memory = true;
+    opts.prefill_chunk_size = Some(2);
+    opts.max_cached_models = Some(0);
+    let low = joshua::Engine::with_options(&path, opts).unwrap();
+    let generation = joshua::GenerationOptions { temperature: 0.0, max_tokens: 2, ..Default::default() };
+    let (expected, usage, _, _) = regular.complete_raw("hello world a b c", &generation).unwrap();
+    // Repeated requests allocate fresh session caches but reuse shared tensors.
+    for _ in 0..2 {
+        let (actual, got_usage, _, _) = low.complete_raw("hello world a b c", &generation).unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(got_usage.prompt_tokens, usage.prompt_tokens);
+        assert_eq!(got_usage.completion_tokens, usage.completion_tokens);
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn long_prefill_matches_chunks_across_window_and_compression_boundaries() {
+    let dir = common::model_dir("deepseek4-long-prefill-boundaries");
+    let path = dir.join("model.gguf");
+    common::write_tiny_deepseek4_gguf_opts(&path, common::TinyDeepseek4Opts { compress: true, long_context: true, ..Default::default() });
+    let tokens: Vec<u32> = (0..513).map(|i| 1 + ((i * 7 + i / 3) % 15) as u32).collect();
+    let mut reference = load(&path, true);
+    let mut expected = Vec::new();
+    for (pos, &token) in tokens.iter().enumerate() {
+        expected = logits(&mut reference, &[token], pos);
+    }
+    for size in [3, 127, 128, 129, 256, 513] {
+        let mut model = load(&path, true);
+        let mut actual = Vec::new();
+        for (i, chunk) in tokens.chunks(size).enumerate() {
+            actual = logits(&mut model, chunk, i * size);
+        }
+        let diff = actual.iter().zip(&expected).map(|(a,b)| (a-b).abs()).fold(0f32, f32::max);
+        assert!(diff < 1e-3, "chunk size {size}: max logit difference {diff}");
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}

@@ -285,6 +285,21 @@ pub enum QuantizedModel {
     DeepSeek4(crate::quantized_deepseek4::ModelWeights),
 }
 
+/// Allocation controls for native model loaders. A missing limit preserves
+/// the loader's standalone defaults; the engine supplies its actual context.
+#[derive(Debug, Clone, Default)]
+pub struct ModelLoadOptions {
+    pub context_length: Option<usize>,
+    /// Maximum speculative prefetch bytes per layer window (0 disables it).
+    pub prefetch_bytes: Option<usize>,
+    /// Reject copying Metal weights when zero-copy setup fails.
+    pub require_zero_copy: bool,
+    /// Budget for estimated copied GPU tensor allocations in supported loaders.
+    pub gpu_copy_budget_bytes: Option<usize>,
+    /// Opt-in Qwen3-MoE quantized GPU tile cache; separate from copied tensors.
+    pub gpu_cache_bytes: Option<usize>,
+}
+
 impl QuantizedModel {
     /// Load a model from a GGUF file, dispatching to the correct quantized
     /// loader based on `general.architecture`.
@@ -309,6 +324,15 @@ impl QuantizedModel {
         device: &Device,
         mmap: Option<std::sync::Arc<memmap2::Mmap>>,
         file: Option<std::sync::Arc<std::fs::File>>,
+    ) -> Result<Self> {
+        Self::from_gguf_mmap_with_options(gguf, reader, device, mmap, file, &ModelLoadOptions::default())
+    }
+
+    pub fn from_gguf_mmap_with_options<R: Read + Seek>(
+        gguf: gguf_file::Content, reader: &mut R, device: &Device,
+        mmap: Option<std::sync::Arc<memmap2::Mmap>>,
+        file: Option<std::sync::Arc<std::fs::File>>,
+        options: &ModelLoadOptions,
     ) -> Result<Self> {
         let arch = Architecture::detect(&gguf.metadata).map_err(candle_core::Error::Msg)?;
 
@@ -387,15 +411,15 @@ impl QuantizedModel {
                 quantized_qwen3::ModelWeights::from_gguf(gguf, reader, device).map(Self::Qwen3)
             }
             Architecture::Qwen3Moe => {
-                crate::quantized_qwen3_moe::GGUFQWenMoE::from_gguf_mmap(gguf, reader, device, mmap)
+                crate::quantized_qwen3_moe::GGUFQWenMoE::from_gguf_mmap_with_options(gguf, reader, device, mmap, options)
                     .map(Self::Qwen3Moe)
             }
             Architecture::DeepSeek2 => {
                 crate::quantized_deepseek2::ModelWeights::from_gguf_mmap(gguf, reader, device, mmap)
                     .map(Self::DeepSeek2)
             }
-            Architecture::DeepSeek4 => crate::quantized_deepseek4::ModelWeights::from_gguf_mmap(
-                gguf, raw, reader, device, mmap, file,
+            Architecture::DeepSeek4 => crate::quantized_deepseek4::ModelWeights::from_gguf_mmap_with_options(
+                gguf, raw, reader, device, mmap, file, options,
             )
             .map(Self::DeepSeek4),
         }

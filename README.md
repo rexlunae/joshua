@@ -214,6 +214,42 @@ Whisper transcription is CPU-only.
 
 ---
 
+## Native CPU kernel performance
+
+Joshua dispatches IQ2_XXS and MXFP4 matrix multiplication to AVX2/FMA on
+x86-64 and NEON on AArch64. The x86 path checks both CPU features at runtime;
+CPUs without them retain the scalar fallback. These kernels apply to the
+native CPU backend, including supported DeepSeek-V4 quantized tensors, and
+keep weights compressed until each block is used. They do not add Metal or
+CUDA support for these formats.
+
+The SIMD paths reuse decoded weights across up to four prompt rows. Floating
+point accumulation order differs from the scalar path, so numerical agreement
+is tolerance-based; parallel and serial execution of the same kernel remain
+bit-identical.
+
+Run the focused correctness checks on each target machine:
+
+```bash
+cargo test --release --lib iq2xxs
+cargo test --release --lib mxfp4
+cargo test --release --test deepseek4_tests
+```
+
+For reproducible in-memory kernel comparisons against the scalar implementation:
+
+```bash
+cargo test --release --lib iq2xxs::tests::bench_fused_vs_scalar -- --ignored --nocapture
+cargo test --release --lib mxfp4::tests::bench_dispatched_vs_scalar -- --ignored --nocapture
+```
+
+These benchmarks exclude model loading, disk paging, and the rest of the forward
+pass. Kernel speedups are not full-model tokens-per-second speedups. AVX2/FMA
+performance must be measured on an eligible Intel/AMD CPU; an ARM run exercises
+NEON instead.
+
+---
+
 ## HTTP API
 
 All endpoints are OpenAI-compatible.
@@ -290,7 +326,7 @@ and/or TLS below.
 
 Two limits bound how much work a single client can demand, both tunable:
 
-- `--max-concurrency` (default: CPU count) caps simultaneous
+- `--max-concurrency` (default: capped by CPU count and memory planning) caps simultaneous
   generations/embeddings; requests over the cap get `503 Service Unavailable`
   instead of piling up model instances and exhausting memory.  Lower it for
   large models on small boxes.
@@ -406,6 +442,70 @@ Filesystem compression is detected from the file's on-disk allocation, so a
 model stored sparsely reports the same way — equally bad news for a mapping.
 It is not reported for `--huge-pages 2mb/1gb/huge`, which copy the model into
 anonymous memory in one pass and pay for the decompression only once.
+
+---
+
+## Low-memory execution
+
+For native DeepSeek-V4 on a small CPU machine:
+
+```bash
+cargo build --release
+./target/release/joshua serve --model /path/to/model.gguf --device cpu \
+    --n-ctx 4096 --low-memory
+```
+
+`--low-memory` selects one concurrent request, one retained idle session,
+128-token prompt chunks, random-access mmap advice, and at most 64 MiB of
+speculative layer prefetching (less under a smaller planning budget). Explicit
+huge-page copies are bypassed. Shorter prompt chunks bound temporary tensors,
+but may reread expert weights more often, so benchmark the tradeoff on your disk.
+
+DeepSeek-V4 now allocates compressed KV caches and rotary tables for the engine's
+requested context, bounded by the model context and the existing 262,144-token
+loader ceiling. Its immutable tensors are shared across native sessions; session
+KV caches remain independent. These two changes apply without `--low-memory`.
+
+DeepSeek-V4 also keeps its token embedding table in the GGUF storage format
+and decodes only the input token rows. This avoids a permanent vocabulary-sized
+f32 copy. For example, a 131,072 × 4,096 table previously required a separate
+2 GiB f32 allocation; the new path materializes only the requested rows. Actual
+resident-memory savings depend on the model format and OS page cache. Router
+matrices are transposed once at load, expert prefetch hints are deduplicated per
+batch, and final head mixing runs only for the last prompt position.
+
+The `run` and `serve` commands accept these overrides:
+
+| Option | Meaning |
+|---|---|
+| `--memory-budget-mib N` | Startup concurrency planning budget; **not** a hard RAM limit |
+| `--prefill-chunk-size N` | Prompt tokens per forward pass; `0` disables chunking |
+| `--max-cached-models N` | Idle sessions retained; `0` releases their caches after each request |
+| `--prefetch-mib N` | Speculative DeepSeek read-ahead budget per layer window; `0` disables it |
+| `--gpu-weight-budget-mib N` | Reject GPU weight copies above the loader's estimate; excludes activations and KV |
+
+The default native concurrency is capped using a model-file-size estimate and
+half of Linux's available RAM or half of macOS's physical RAM. Other systems
+retain the CPU-count default unless a planning budget or low-memory mode is
+supplied. `serve --max-concurrency` explicitly overrides this heuristic. The
+planning budget does not reserve memory, account for all other processes, or
+bound OS page-cache residency. Prefetching budgets limit speculative reads,
+not pages brought in by computation. Shared DeepSeek weights remain available
+when idle caches are released.
+
+On Metal, low-memory mode currently requires Qwen3-MoE's zero-copy loader.
+Failure to wrap the mapping is an error instead of a full-weight upload fallback.
+The remaining copied tensors (such as embeddings and norms) have a conservative
+allocation estimate checked before loading; in low-memory mode their default
+budget is one quarter of the RAM planning budget. An explicit GPU weight budget
+overrides it. For other native GPU loaders the explicit limit checks the model
+file size before loading; that is only a rough upload estimate. Low-memory mode
+rejects those GPU paths: choose `--device cpu` instead.
+
+These controls do **not** implement CUDA/Metal layer eviction, expand zero-copy
+coverage to other architectures, or constrain a vendor plugin's internal GPU
+allocations. GPU expert paging still requires backend transfer/synchronization
+support and, for DeepSeek-V4, GPU kernels for its quantization formats.
 
 ---
 

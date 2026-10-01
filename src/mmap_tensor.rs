@@ -721,6 +721,7 @@ pub struct LayerPrefetcher {
     current: Arc<AtomicUsize>,
     stop: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
+    bytes_read: Arc<AtomicUsize>,
 }
 
 #[cfg(unix)]
@@ -733,24 +734,37 @@ impl LayerPrefetcher {
         ranges: Arc<Vec<Option<(usize, usize)>>>,
         depth: usize,
     ) -> Self {
+        Self::spawn_bounded(file, ranges, depth, usize::MAX)
+    }
+
+    pub fn spawn_bounded(
+        file: Arc<File>, ranges: Arc<Vec<Option<(usize, usize)>>>,
+        depth: usize, budget_bytes: usize,
+    ) -> Self {
         let current = Arc::new(AtomicUsize::new(0));
         let stop = Arc::new(AtomicBool::new(false));
+        let bytes_read = Arc::new(AtomicUsize::new(0));
         let join = {
+            let bytes_read = Arc::clone(&bytes_read);
             let file = Arc::clone(&file);
             let ranges = Arc::clone(&ranges);
             let current = Arc::clone(&current);
             let stop = Arc::clone(&stop);
             std::thread::Builder::new()
                 .name("layer-prefetch".into())
-                .spawn(move || run_prefetch(file, ranges, current, stop, depth))
+                .spawn(move || run_prefetch(file, ranges, current, stop, depth, budget_bytes, bytes_read))
                 .ok()
         };
         Self {
             current,
             stop,
             join,
+            bytes_read,
         }
     }
+
+    /// Bytes actually read speculatively since this prefetcher started.
+    pub fn bytes_read(&self) -> usize { self.bytes_read.load(Ordering::Relaxed) }
 
     /// Tell the thread which layer the compute thread is on.  Called once per
     /// layer, at its start.
@@ -781,6 +795,8 @@ fn run_prefetch(
     current: Arc<AtomicUsize>,
     stop: Arc<AtomicBool>,
     depth: usize,
+    budget_bytes: usize,
+    bytes_read: Arc<AtomicUsize>,
 ) {
     use std::os::unix::fs::FileExt;
     let mut buf = vec![0u8; PREFETCH_CHUNK];
@@ -794,17 +810,28 @@ fn run_prefetch(
         next = next.max(cur);
         let target = cur.saturating_add(depth).min(ranges.len());
         let mut advanced = false;
-        while next < target && !stop.load(Ordering::Acquire) {
+        // Account for previously prefetched ranges still in this layer window.
+        let mut remaining = budget_bytes;
+        for range in &ranges[cur.min(ranges.len())..next.min(ranges.len())] {
+            if let Some((start, end)) = range {
+                remaining = remaining.saturating_sub(end.saturating_sub(*start));
+            }
+        }
+        while remaining > 0 && next < target && !stop.load(Ordering::Acquire) {
             if let Some((b0, e1)) = ranges[next] {
                 if b0 < e1 && e1 <= file_len {
+                    let end = b0.saturating_add(remaining).min(e1);
+                    remaining -= end - b0;
                     let mut off = b0;
                     // Best effort: on error, skip the rest of this range.
                     let mut ok = true;
-                    while ok && off < e1 && !stop.load(Ordering::Acquire) {
-                        let n = (e1 - off).min(buf.len());
+                    while ok && off < end && !stop.load(Ordering::Acquire) {
+                        // Do not keep reading an obsolete layer after compute overtakes us.
+                        if next < current.load(Ordering::Acquire) { break; }
+                        let n = (end - off).min(buf.len());
                         match file.read_at(&mut buf[..n], off as u64) {
                             Ok(0) => break,
-                            Ok(k) => off += k,
+                            Ok(k) => { off += k; bytes_read.fetch_add(k, Ordering::Relaxed); },
                             Err(_) => ok = false,
                         }
                     }
@@ -833,6 +860,11 @@ impl LayerPrefetcher {
     ) -> Self {
         Self
     }
+    pub fn spawn_bounded(
+        _file: Arc<File>, _ranges: Arc<Vec<Option<(usize, usize)>>>,
+        _depth: usize, _budget_bytes: usize,
+    ) -> Self { Self }
+    pub fn bytes_read(&self) -> usize { 0 }
     pub fn set_current(&self, _layer: usize) {}
     pub fn stop(&mut self) {}
 }
@@ -843,6 +875,60 @@ mod tests {
     use candle_core::quantized::QMatMul;
     use candle_core::quantized::QTensor as QT;
     use candle_core::{Device, Module, Tensor};
+
+    #[cfg(unix)]
+    #[test]
+    fn prefetch_respects_byte_budget_and_advances() {
+        let path = std::env::temp_dir().join(format!("joshua-prefetch-budget-{}", std::process::id()));
+        std::fs::write(&path, vec![1u8; 16384]).unwrap();
+        let file = Arc::new(File::open(&path).unwrap());
+        let ranges = Arc::new(vec![Some((0, 8192)), Some((8192, 16384))]);
+        let mut pf = LayerPrefetcher::spawn_bounded(file, ranges, 3, 1024);
+        let wait_for = |target| {
+            let start = std::time::Instant::now();
+            while pf.bytes_read() < target && start.elapsed().as_secs() < 5 {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert_eq!(pf.bytes_read(), target);
+        };
+        wait_for(1024);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        assert_eq!(pf.bytes_read(), 1024, "must not read the rest of the oversized layer");
+        pf.set_current(1);
+        wait_for(2048);
+        pf.stop();
+        assert_eq!(pf.bytes_read(), 2048);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn borrowed_embedding_decodes_selected_rows_in_order() {
+        for dtype in [GgmlDType::F16, GgmlDType::Q8_0, GgmlDType::Q4K] {
+            let (rows, hidden) = (64, 256);
+            let source = Tensor::from_vec(
+                (0..rows * hidden).map(|i| (i % 97) as f32 / 17.0 - 2.0).collect(),
+                (rows, hidden), &Device::Cpu,
+            ).unwrap();
+            let packed = QT::quantize(&source, dtype).unwrap();
+            let bytes = packed.data().unwrap();
+            let dir = std::env::temp_dir().join(format!("joshua-embedding-{}-{}", std::process::id(), dtype as u32));
+            std::fs::create_dir_all(&dir).unwrap();
+            let mmap = mmap_bytes(&dir, &bytes);
+            let borrowed = borrowed_range(&mmap, dtype, 0, (rows, hidden).into()).unwrap().unwrap();
+            // Repeated, noncontiguous IDs verify gather order and row boundaries.
+            let ids = Tensor::new(&[[63u32, 0, 17, 17]], &Device::Cpu).unwrap();
+            let selected = borrowed.embedding(&ids).unwrap();
+            let dense = packed.dequantize(&Device::Cpu).unwrap()
+                .index_select(&ids.flatten_all().unwrap(), 0).unwrap()
+                .reshape((1, 4, hidden)).unwrap();
+            assert_eq!(selected.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+                dense.flatten_all().unwrap().to_vec1::<f32>().unwrap());
+            assert_eq!(borrowed.storage_size_in_bytes(), bytes.len());
+            assert_eq!(selected.elem_count(), 4 * hidden);
+            assert!(borrowed.embedding(&Tensor::new(&[64u32], &Device::Cpu).unwrap()).is_err());
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
 
     /// Write a one-tensor GGUF and map it.
     fn gguf_with_tensor(dir: &std::path::Path, data: &[f32], shape: &[usize]) -> Arc<Mmap> {
