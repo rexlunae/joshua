@@ -563,6 +563,23 @@ impl EngineOptions {
     }
 }
 
+// ─── Env flags ───────────────────────────────────────────────────────────────
+
+/// Debug logging of every sampled token.  Read once: this sits on the
+/// per-token decode path, and an `env::var_os` lookup there would lock the
+/// environment and allocate on every sample.
+fn debug_tokens() -> bool {
+    static D: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *D.get_or_init(|| std::env::var_os("JOSHUA_DEBUG_TOKENS").is_some())
+}
+
+/// Whether temperature-0 sampling applies the repetition penalty (the
+/// pre-legacy behaviour).  Read once: this sits on the per-sample path.
+fn legacy_reppen() -> bool {
+    static L: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *L.get_or_init(|| std::env::var_os("JOSHUA_LEGACY_REPPEN").is_some())
+}
+
 // ─── Engine ───────────────────────────────────────────────────────────────────
 
 /// The Joshua inference engine.
@@ -2489,7 +2506,7 @@ impl Engine {
                 Some(t) => t,
                 None => {
                     let t = sampler.sample(&logits_vec, options, &mut rng, &text.recent_tokens)?;
-                    if std::env::var_os("JOSHUA_DEBUG_TOKENS").is_some() {
+                    if debug_tokens() {
                         let mut order: Vec<usize> = (0..logits_vec.len()).collect();
                         order.sort_by(|&a, &b| logits_vec[b].total_cmp(&logits_vec[a]));
                         let top5: Vec<(usize, f32)> = order[..5.min(order.len())]
@@ -4508,7 +4525,7 @@ fn squeeze_batch_logits(logits: &Tensor) -> Result<Vec<f32>> {
             // other sampler where a "temperature" of 0 means "take the argmax of the
             // raw logits".
             let reppen =
-                if opts.temperature <= 0.0 && std::env::var_os("JOSHUA_LEGACY_REPPEN").is_none() {
+                if opts.temperature <= 0.0 && !legacy_reppen() {
                     1.0
                 } else {
                     opts.repetition_penalty

@@ -44,6 +44,10 @@ pub struct ClusterSession {
     transport: Mutex<Transport>,
     poisoned: AtomicBool,
     model_claimed: AtomicBool,
+    /// Staging buffer reused by [`Self::exchange`]: exchanges are serialized
+    /// by the transport lock, so one scratch per session suffices. Locked
+    /// only inside `operation`, i.e. after the transport lock.
+    scratch: Mutex<Vec<f32>>,
 }
 
 impl ClusterSession {
@@ -72,6 +76,7 @@ impl ClusterSession {
             transport: Mutex::new(transport),
             poisoned: AtomicBool::new(false),
             model_claimed: AtomicBool::new(false),
+            scratch: Mutex::new(Vec::new()),
         }
     }
 
@@ -161,7 +166,16 @@ impl ClusterSession {
 
             // Commit only after every chunk succeeds. Transport frames and
             // aggregate peer storage remain bounded even for a long prefill.
-            let mut result = values.to_vec();
+            // The staging buffer is reused across calls: exchanges on a
+            // session are serialized by the transport lock, so the scratch
+            // grows to the largest activation once and is then borrowed.
+            let mut staged = self
+                .scratch
+                .lock()
+                .map_err(|_| anyhow::anyhow!("cluster scratch lock poisoned; restart every rank"))?;
+            let mut result = std::mem::take(&mut *staged);
+            result.clear();
+            result.extend_from_slice(values);
             if broadcast && self.rank != 0 {
                 result.fill(0.0);
             }
@@ -176,6 +190,7 @@ impl ClusterSession {
                 );
             }
             values.copy_from_slice(&result);
+            *staged = result;
             Ok(())
         })
     }

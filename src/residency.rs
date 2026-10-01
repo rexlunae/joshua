@@ -602,7 +602,16 @@ impl<T: DeviceExpertSlot> DeviceResidency<T> {
     /// hands over the handles it looked up once its launches are enqueued,
     /// so a concurrent eviction can never free a buffer those launches read.
     pub fn retire(&self, payload: Arc<T>) {
-        self.retire_all(vec![payload]);
+        // Same as `retire_all` for one payload, without the per-call
+        // single-element `Vec`.
+        let mut r = self.retired.lock().unwrap_or_else(|p| p.into_inner());
+        r.push(payload);
+        if r.len() > RETIRED_MAX {
+            let n = r.len() - RETIRED_MAX;
+            let overflow = r.drain(..n).collect::<Vec<_>>();
+            drop(r);
+            drop(overflow);
+        }
     }
 
     fn retire_all(&self, payloads: Vec<Arc<T>>) {
