@@ -965,26 +965,38 @@ struct DecodeOutcome {
 /// Repetition-penalty window: the last this-many tokens are penalised.
 const REP_WINDOW: usize = 64;
 
-/// Output-side state of a decode loop: the text so far and the token
-/// history the sampler penalises.
-struct DecodeText {
+/// Concrete stream decoder for the engine's tokenizer.
+type TextDecodeStream<'a> = tokenizers::tokenizer::DecodeStream<
+    'a,
+    tokenizers::models::ModelWrapper,
+    tokenizers::normalizers::NormalizerWrapper,
+    tokenizers::pre_tokenizers::PreTokenizerWrapper,
+    tokenizers::processors::PostProcessorWrapper,
+    tokenizers::decoders::DecoderWrapper,
+>;
+
+/// Output text and repetition history for one decode loop.
+struct DecodeText<'a> {
     response: String,
     /// Generated ids, for byte-level whole-buffer fallback decoding.
     decoded_ids: Vec<u32>,
     /// Incremental byte-level decode state (see [`ByteWindowDecoder`]).
     byte_window: ByteWindowDecoder,
+    /// Decoder state for ByteFallback, Metaspace and other explicit decoders.
+    stream: TextDecodeStream<'a>,
     /// Sliding repetition-penalty window.
     recent_tokens: Vec<u32>,
     n_decoded: u32,
 }
 
-impl DecodeText {
+impl<'a> DecodeText<'a> {
     /// Fresh state whose penalty window is seeded with the tail of `seed`.
-    fn new(seed: &[u32]) -> Self {
+    fn new(seed: &[u32], tokenizer: &'a tokenizers::Tokenizer) -> Self {
         Self {
             response: String::new(),
             decoded_ids: Vec::new(),
             byte_window: ByteWindowDecoder::default(),
+            stream: tokenizer.decode_stream(false),
             recent_tokens: seed[seed.len().saturating_sub(REP_WINDOW)..].to_vec(),
             n_decoded: 0,
         }
@@ -1023,7 +1035,7 @@ impl NpuState {
 /// across two tokens, so generated text must be decoded from the whole
 /// accumulated token buffer rather than one token at a time.  Detected from
 /// the `decoder.type` in `tokenizer.json`; everything else (word-level,
-/// decoder-less, BPE with explicit decoders) decodes token-by-token.
+/// decoder-less, BPE with explicit decoders) uses the fallback paths in `emit_token`.
 fn tokenizer_is_byte_level(path: &std::path::Path) -> Result<bool, JoshuaError> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| JoshuaError::ModelLoad(format!("tokenizer read failed: {e}")))?;
@@ -2246,7 +2258,7 @@ impl Engine {
             .tokenizer
             .encode(prompt, add_special_tokens)
             .map_err(|e| JoshuaError::Tokenization(e.to_string()))?;
-        let prompt_tokens: Vec<u32> = encoding.get_ids().to_vec();
+        let prompt_tokens = encoding.get_ids();
         let n_prompt = prompt_tokens.len();
 
         if n_prompt >= self.n_ctx as usize {
@@ -2260,10 +2272,10 @@ impl Engine {
         // ── Acquire a session, generate, retry on CPU if the NPU fails ──────
         // Prefer a pooled instance whose state already covers a prefix of
         // this prompt; fall back to a reset instance or a fresh load.
-        let (mut session, n_reused) = self.acquire_session(&prompt_tokens, true)?;
+        let (mut session, n_reused) = self.acquire_session(prompt_tokens, true)?;
         let was_npu = session.is_npu();
 
-        let result = self.run_generation(&mut session, &prompt_tokens, n_reused, options);
+        let result = self.run_generation(&mut session, prompt_tokens, n_reused, options);
         match result {
             Ok((response, usage, prefill_tps, decode_tps, kv_tokens)) => {
                 // Park the instance for reuse by a follow-up request.
@@ -2287,8 +2299,8 @@ impl Engine {
                     return Err(e);
                 }
                 tracing::warn!("Retrying request on the candle path after NPU failure: {e}");
-                let (mut session, n_reused) = self.acquire_session(&prompt_tokens, false)?;
-                match self.run_generation(&mut session, &prompt_tokens, n_reused, options) {
+                let (mut session, n_reused) = self.acquire_session(prompt_tokens, false)?;
+                match self.run_generation(&mut session, prompt_tokens, n_reused, options) {
                     Ok((response, usage, prefill_tps, decode_tps, kv_tokens)) => {
                         self.release_model(session, kv_tokens);
                         Ok((response, usage, prefill_tps, decode_tps))
@@ -2444,7 +2456,7 @@ impl Engine {
         penalty_seed: &[u32],
         options: &GenerationOptions,
     ) -> Result<DecodeOutcome> {
-        let mut text = DecodeText::new(penalty_seed);
+        let mut text = DecodeText::new(penalty_seed, &self.tokenizer);
         let mut rng = thread_rng();
         let mut sampler = SamplingWorkspace::default();
         let mut fed_tokens: Vec<u32> = Vec::new();
@@ -2620,7 +2632,7 @@ impl Engine {
     /// been reached (the response is trimmed to before it).
     fn emit_token(
         &self,
-        text: &mut DecodeText,
+        text: &mut DecodeText<'_>,
         token: u32,
         options: &GenerationOptions,
     ) -> Result<bool> {
@@ -2637,6 +2649,17 @@ impl Engine {
             text.response =
                 text.byte_window
                     .push(&self.tokenizer, token, response, &text.decoded_ids)?;
+        } else if self.tokenizer.get_decoder().is_some() {
+            // Explicit decoders may need multiple tokens to complete a UTF-8
+            // character or determine spacing. Only emitted (accepted) tokens
+            // reach this state, including during speculative verification.
+            if let Some(piece) = text
+                .stream
+                .step(token)
+                .map_err(|e| JoshuaError::Inference(e.to_string()))?
+            {
+                text.response.push_str(&piece);
+            }
         } else {
             // Decoder-less / word-level tokenizers: batch decoding would
             // join pieces with spaces, so decode each token and append.

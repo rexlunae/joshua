@@ -26,7 +26,7 @@ use candle_core::Result;
 pub const GGML_TYPE_IQ2_XXS: u32 = 16;
 // The block type, its decode and the trellis tables are candle-core's (the
 // dtype is `GgmlDType::Iq2Xxs` there, so device backends can hold the blocks
-// as ordinary `QStorage`); this module keeps the host-side fused AVX2 matmul
+// as ordinary `QStorage`); this module keeps the host-side fused AVX2/NEON matmul
 // and the mmap helpers around them.
 pub use candle_core::quantized::iq2xxs::{
     BlockIq2Xxs, BLOCK_BYTES, IQ2XXS_GRID, KMASK_IQ2XS, KSIGNS_IQ2XS, QK_IQ2_XXS,
@@ -89,8 +89,8 @@ impl crate::raw_block::RawBlock for BlockIq2Xxs {
 
 /// `dst[m, n] = lhs[m, k] · rhs[n, k]ᵀ`, with `rhs` held as IQ2_XXS blocks.
 ///
-/// At the AVX2 level this runs the fused AVX2 dequant+dot kernel (see
-/// `try_avx2_matmul`), spreading the independent output rows across the
+/// At the AVX2 and NEON levels this runs a fused dequant+dot kernel (see
+/// `try_fused_matmul`), spreading the independent output rows across the
 /// rayon pool; every other level goes through [`crate::raw_block::matmul_t`],
 /// whose AVX-512 form decodes with [`RawBlock::decode_avx512`].  Every path
 /// is deterministic and they agree to FMA / accumulation-order rounding.
@@ -113,7 +113,7 @@ fn matmul_t_dispatch(
     parallel: bool,
 ) -> Result<()> {
     let blocks_per_row = crate::raw_block::validate_matmul_t(mkn, lhs, rhs, dst)?;
-    if mkn.0 == 0 || mkn.2 == 0 || try_avx2_matmul(mkn, blocks_per_row, lhs, rhs, dst, parallel) {
+    if mkn.0 == 0 || mkn.2 == 0 || try_fused_matmul(mkn, blocks_per_row, lhs, rhs, dst, parallel) {
         return Ok(());
     }
     if parallel {
@@ -123,10 +123,10 @@ fn matmul_t_dispatch(
     }
 }
 
-/// The fused AVX2 kernel for every row, at the AVX2 level only.  Returns
+/// The fused AVX2 or NEON kernel for every row at its matching level. Returns
 /// `true` if it ran; the kernel writes each dst element exactly once, so no
 /// zero-fill is needed.
-fn try_avx2_matmul(
+fn try_fused_matmul(
     mkn: (usize, usize, usize),
     blocks_per_row: usize,
     lhs: &[f32],
@@ -151,19 +151,35 @@ fn try_avx2_matmul(
         }
         return true;
     }
+    #[cfg(target_arch = "aarch64")]
+    if crate::simd::simd_level() == crate::simd::SimdLevel::Neon {
+        let (m, k, n) = mkn;
+        let dst_ptr = crate::simd::DstPtr::new(dst);
+        let worker = |row: usize| {
+            // SAFETY: NEON is available, shapes are validated, and each
+            // worker owns a disjoint output column.
+            unsafe { matmul_row_neon(m, k, n, lhs, rhs, blocks_per_row, row, &dst_ptr) }
+        };
+        if parallel {
+            crate::simd::for_each_row(n, worker);
+        } else {
+            (0..n).for_each(worker);
+        }
+        return true;
+    }
     let _ = (mkn, blocks_per_row, lhs, rhs, dst, parallel);
     false
 }
 
-// ─── AVX2/FMA fused dequant+dot kernel ────────────────────────────────────
+// ─── SIMD fused dequant+dot kernels ────────────────────────────────────
 
-/// Grid values expanded to f32 lanes (8 values per code), for the AVX2
-/// kernel.  Mirrors `IQ2XXS_GRID` (one u8 value per byte) as directly
+/// Grid values expanded to f32 lanes (8 values per code), for the AVX2/NEON
+/// kernels.  Mirrors `IQ2XXS_GRID` (one u8 value per byte) as directly
 /// loadable 8-lane vectors.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 const IQ2XXS_GRID_F32: [[f32; 8]; 256] = build_grid_f32();
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 const fn build_grid_f32() -> [[f32; 8]; 256] {
     let mut out = [[0.0f32; 8]; 256];
     let mut i = 0;
@@ -179,12 +195,12 @@ const fn build_grid_f32() -> [[f32; 8]; 256] {
     out
 }
 
-/// Sign patterns expanded to ±1.0 f32 lanes, for the AVX2 kernel.  Mirrors
+/// Sign patterns expanded to ±1.0 f32 lanes, for the AVX2/NEON kernels.  Mirrors
 /// `KSIGNS_IQ2XS` (one bit per value) as directly loadable 8-lane vectors.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 const IQ2XXS_SIGNS_F32: [[f32; 8]; 128] = build_signs_f32();
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 const fn build_signs_f32() -> [[f32; 8]; 128] {
     let mut out = [[1.0f32; 8]; 128];
     let mut i = 0;
@@ -273,6 +289,85 @@ unsafe fn matmul_row_avx2(
             // SAFETY: row `row` owns dst[i*n + row] for all i; disjoint per
             // row (see `crate::simd`).
             dst.write((m0 + i) * n + row, crate::simd::hsum256(*acc_i));
+        }
+        m0 += MTILE;
+    }
+}
+
+/// Fused NEON decode and dot product, reusing decoded vectors across up
+/// to four prompt rows. Two accumulators cover each eight-value codebook entry.
+///
+/// # Safety
+/// Shapes must be validated and output columns disjoint between workers.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn matmul_row_neon(
+    m: usize,
+    k: usize,
+    n: usize,
+    lhs: &[f32],
+    rhs: &[BlockIq2Xxs],
+    blocks_per_row: usize,
+    row: usize,
+    dst: &crate::simd::DstPtr,
+) {
+    use std::arch::aarch64::*;
+
+    const MTILE: usize = 4;
+    let row_blocks = &rhs[row * blocks_per_row..(row + 1) * blocks_per_row];
+    let mut m0 = 0;
+    while m0 < m {
+        let mcnt = (m - m0).min(MTILE);
+        let mut acc_lo = [vdupq_n_f32(0.0); MTILE];
+        let mut acc_hi = [vdupq_n_f32(0.0); MTILE];
+        for (b, block) in row_blocks.iter().enumerate() {
+            let d = half::f16::from_le_bytes(block.d).to_f32();
+            for ib32 in 0..8usize {
+                let base = ib32 * 8;
+                let lo = u32::from_le_bytes([
+                    block.qs[base],
+                    block.qs[base + 1],
+                    block.qs[base + 2],
+                    block.qs[base + 3],
+                ]);
+                let hi = u32::from_le_bytes([
+                    block.qs[base + 4],
+                    block.qs[base + 5],
+                    block.qs[base + 6],
+                    block.qs[base + 7],
+                ]);
+                let dbv = vdupq_n_f32(d * (0.5 + ((hi >> 28) as f32)) * 0.25);
+                let lane = ib32 * 32;
+                for l in 0..4usize {
+                    let code = ((lo >> (8 * l)) & 0xFF) as usize;
+                    let si = ((hi >> (7 * l)) & 0x7F) as usize;
+                    let grid = IQ2XXS_GRID_F32[code].as_ptr();
+                    let signs = IQ2XXS_SIGNS_F32[si].as_ptr();
+                    let vlo = vmulq_f32(vmulq_f32(vld1q_f32(grid), vld1q_f32(signs)), dbv);
+                    let vhi = vmulq_f32(
+                        vmulq_f32(vld1q_f32(grid.add(4)), vld1q_f32(signs.add(4))),
+                        dbv,
+                    );
+                    // `b * QK_IQ2_XXS` is the block's offset within the row
+                    // (the scalar worker's `base = b * QK_IQ2_XXS`).
+                    let c = b * QK_IQ2_XXS + lane + l * 8;
+                    for i in 0..mcnt {
+                        let a = lhs[(m0 + i) * k + c..].as_ptr();
+                        acc_lo[i] = vfmaq_f32(acc_lo[i], vld1q_f32(a), vlo);
+                        acc_hi[i] = vfmaq_f32(acc_hi[i], vld1q_f32(a.add(4)), vhi);
+                    }
+                }
+            }
+        }
+        // `mcnt` can be < MTILE at the tail; iterate only the live lanes.
+        for i in 0..mcnt {
+            // SAFETY: row `row` owns dst[i*n + row] for all i; disjoint per
+            // row (see `crate::simd`).
+            dst.write(
+                (m0 + i) * n + row,
+                vaddvq_f32(vaddq_f32(acc_lo[i], acc_hi[i])),
+            );
         }
         m0 += MTILE;
     }
@@ -464,6 +559,10 @@ mod tests {
                 kernels.push(("avx2", matmul_row_avx2));
             }
         }
+        #[cfg(target_arch = "aarch64")]
+        if crate::simd::neon_available() {
+            kernels.push(("neon", matmul_row_neon));
+        }
         let mut results = Vec::new();
         for (name, kernel) in kernels {
             let mut out = vec![0f32; m * n];
@@ -487,6 +586,42 @@ mod tests {
                     fast[i],
                     scalar[i]
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn fused_matches_f64_reference_with_varied_codes() {
+        use rand::{rngs::StdRng, Rng, SeedableRng};
+        let mut rng = StdRng::seed_from_u64(20260914);
+        for (m, k, n) in [(1, 256, 3), (5, 2048, 7), (9, 4096, 2)] {
+            let rhs: Vec<BlockIq2Xxs> = (0..n * (k / QK_IQ2_XXS))
+                .map(|_| {
+                    let mut qs = [0u8; 64];
+                    rng.fill(&mut qs);
+                    BlockIq2Xxs {
+                        d: half::f16::from_f32(rng.gen_range(0.001f32..0.1)).to_le_bytes(),
+                        qs,
+                    }
+                })
+                .collect();
+            let lhs: Vec<f32> = (0..m * k).map(|_| rng.gen_range(-5.0..5.0)).collect();
+            let mut weights = vec![0.0; n * k];
+            crate::raw_block::dequantize(&rhs, &mut weights).unwrap();
+            let mut actual = vec![f32::NAN; m * n];
+            matmul_t((m, k, n), &lhs, &rhs, &mut actual).unwrap();
+            for i in 0..m {
+                for row in 0..n {
+                    let terms = lhs[i * k..(i + 1) * k]
+                        .iter()
+                        .zip(&weights[row * k..(row + 1) * k]);
+                    let expected: f64 = terms.clone().map(|(&a, &b)| a as f64 * b as f64).sum();
+                    let magnitude: f64 = terms.map(|(&a, &b)| (a as f64 * b as f64).abs()).sum();
+                    // Allow accumulation rounding, including cancellation.
+                    let tolerance = 2e-6 * magnitude.max(1.0);
+                    assert!((actual[i * n + row] as f64 - expected).abs() <= tolerance,
+                        "m={m} k={k} row={row}: actual={} expected={expected} tolerance={tolerance}", actual[i * n + row]);
+                }
             }
         }
     }
@@ -530,6 +665,56 @@ mod tests {
         b.dequantize(&mut out);
         for v in out {
             assert!(v.abs() <= 43.0 * 0.25 * 15.5 + 1e-6, "unbounded value {v}");
+        }
+    }
+    #[test]
+    #[ignore = "manual kernel benchmark; run in release mode with --nocapture"]
+    fn bench_fused_vs_scalar() {
+        use std::{hint::black_box, time::Instant};
+        for m in [1, 8, 64] {
+            let (k, n) = (2048, 256);
+            let rhs = fixture_rhs(k, n);
+            let lhs: Vec<f32> = (0..m * k)
+                .map(|i| ((i * 7919) % 1000) as f32 / 100.0 - 5.0)
+                .collect();
+            let mut dst = vec![0f32; m * n];
+            // Warm both paths, then compare serial execution so scheduling
+            // and thread counts cannot account for the difference.
+            for warmup in [true, false] {
+                let repeats = if warmup { 1 } else { 10 };
+                let start = Instant::now();
+                for _ in 0..repeats {
+                    matmul_t_dispatch((m, k, n), black_box(&lhs), black_box(&rhs), &mut dst, false)
+                        .unwrap();
+                    black_box(&dst);
+                }
+                let fused = start.elapsed().as_secs_f64();
+                let start = Instant::now();
+                for _ in 0..repeats {
+                    dst.fill(0.0);
+                    let ptr = crate::simd::DstPtr::new(&mut dst);
+                    for row in 0..n {
+                        crate::raw_block::matmul_row_scalar(
+                            (m, k, n),
+                            black_box(&lhs),
+                            black_box(&rhs),
+                            k / QK_IQ2_XXS,
+                            row,
+                            &ptr,
+                        );
+                    }
+                    black_box(&dst);
+                }
+                let scalar = start.elapsed().as_secs_f64();
+                if !warmup {
+                    eprintln!(
+                        "m={m} k={k} n={n}: fused {:.3}ms, scalar {:.3}ms, {:.2}x",
+                        fused * 1000.0 / repeats as f64,
+                        scalar * 1000.0 / repeats as f64,
+                        scalar / fused
+                    );
+                }
+            }
         }
     }
 }

@@ -4777,4 +4777,33 @@ mod tests {
             "lowest-frequency angle {got}, want {want}"
         );
     }
+    #[test]
+    fn hadamard_rows_matches_dense_transform_without_mutating_input() -> Result<()> {
+        let values: Vec<f32> = (0..64).map(|i| (i as f32 - 31.0) / 7.0).collect();
+        // Exercise multiple leading dimensions and a non-contiguous input.
+        let input = Tensor::from_vec(values, (2, 4, 8), &Device::Cpu)?.transpose(0, 1)?;
+        let original = input.flatten_all()?.to_vec1::<f32>()?;
+        let output = hadamard_rows(&input)?;
+        assert_eq!(output.dims(), input.dims());
+        let actual = output.flatten_all()?.to_vec1::<f32>()?;
+        for (row, expected_input) in actual.chunks_exact(8).zip(original.chunks_exact(8)) {
+            for (i, &value) in row.iter().enumerate() {
+                let expected: f32 = expected_input
+                    .iter()
+                    .enumerate()
+                    .map(|(j, x)| {
+                        if (i & j).count_ones() % 2 == 0 {
+                            *x
+                        } else {
+                            -*x
+                        }
+                    })
+                    .sum::<f32>()
+                    / 8f32.sqrt();
+                assert!((value - expected).abs() < 1e-5);
+            }
+        }
+        assert_eq!(input.flatten_all()?.to_vec1::<f32>()?, original);
+        Ok(())
+    }
 }
