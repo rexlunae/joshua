@@ -1,13 +1,14 @@
 //! Attention building blocks shared by Joshua's native loaders: the RoPE
 //! sin/cos table, GQA head repetition, and the cached scaled-dot-product
-//! kernel over a transposed KV cache.
+//! kernel over a per-layer KV cache.
 //!
 //! Every loader used to build its own rotary table from the same inverse
 //! frequencies and carry its own `repeat_kv`; the differences that remain
 //! (pairing style, partial rotation, M-RoPE sections, YaRN) are parameters
 //! of [`Rope`].
 
-use candle_core::{DType, Device, Result, Tensor, D};
+use candle_core::backend::BackendStorage;
+use candle_core::{bail, DType, Device, Layout, Result, Storage, Tensor, D};
 use candle_nn::ops::softmax_last_dim;
 
 /// How rotated dimensions are paired.
@@ -191,29 +192,65 @@ pub fn repeat_kv(x: Tensor, n_rep: usize) -> Result<Tensor> {
         .reshape((b, n_kv * n_rep, seq, hd))
 }
 
-/// One layer's KV cache, kept transposed — `(k [b, n_kv, dk, seq], v [b,
-/// n_kv, dv, seq])` — and appended along dim 3 ([`KV_SEQ_DIM`]).
-pub type KvCache = crate::moe::KvCache;
+/// One layer's KV cache.
+///
+/// The cache owns preallocated `[b, n_kv, cap, d]` key/value buffers plus a
+/// logical length: each step's `[b, n_kv, seq, d]` block is written into the
+/// buffers at rows `len..len + seq` (one contiguous run per batch/head
+/// through the storage backend) and attention reads `narrow(2, 0, len)`
+/// views of them.  A decode step therefore copies only its own rows instead
+/// of re-copying the whole accumulated context the way a `Tensor::cat`
+/// append did — O(seq_total) per step, O(T²) over a generation.
+///
+/// The matmuls consume the transposed `narrow` views directly (the gemm
+/// backends accept row-major and transposed operand strides), and the
+/// buffers grow geometrically, so a generation pays the O(T) total of the
+/// doubling copies instead of O(T²).
+///
+/// Clones share the `Arc`-backed buffers: a clone is a snapshot only until
+/// either side appends.  Session state is never cloned in the loaders.
+#[derive(Clone)]
+pub struct SeqKvCache {
+    k: Tensor, // [b, n_kv, dk, cap]
+    v: Tensor, // [b, n_kv, dv, cap]
+    len: usize,
+}
 
-/// The sequence axis of a [`KvCache`] (for [`crate::moe::truncate_kv`]).
-pub const KV_SEQ_DIM: usize = 3;
+/// One layer's optional KV cache, created on the layer's first forward.
+pub type KvCache = Option<SeqKvCache>;
+
+/// Capacity of a freshly created cache: enough rows for a small prefill or
+/// this many decode steps before the first doubling.
+const KV_CACHE_INITIAL_CAP: usize = 512;
+
+/// Keep only the first `keep` cached positions; `keep == 0` drops the cache.
+/// The buffers stay allocated (subsequent appends overwrite the freed tail),
+/// so truncation copies nothing.
+pub fn truncate_kv(kv_cache: &mut KvCache, keep: usize) {
+    match kv_cache {
+        Some(_) if keep == 0 => *kv_cache = None,
+        Some(cache) => cache.len = cache.len.min(keep),
+        None => {}
+    }
+}
 
 /// Append this step's keys/values to `kv_cache` and attend `q` over the whole
 /// cached context.
 ///
 /// * `q`: `[b, n_head, seq, dk]`
-/// * `k_new`: `[b, n_kv, dk, seq]`, `v_new`: `[b, n_kv, dv, seq]` (transposed,
-///   matching the cache layout)
+/// * `k_new`: `[b, n_kv, seq, dk]`, `v_new`: `[b, n_kv, seq, dv]` (head
+///   layout; the cache stores the same rows and attention reads them
+///   through transposed views)
 ///
 /// `n_head` must be a multiple of `n_kv`; query head `h` reads KV head
 /// `h / (n_head / n_kv)`.  Returns the attention context
 /// `[b, seq, n_head * dv]`, ready for the output projection.
 ///
-/// The cache lives transposed so the matmuls run directly on it: `q · kᵀ`
-/// becomes `q · k_cache` and `probs · v` becomes `v_cache · probsᵀ`.  A decode
-/// step then copies only the two append cats (the accumulated context), never
-/// an extra transpose of it.  Grouped query heads are folded into the row
-/// dimension of their KV head instead of repeating K/V per query head.
+/// The cache lives head-major so an append is one contiguous run per head;
+/// `q · k_cacheᵀ` and `v_cache · probsᵀ` read the cached rows through their
+/// transposed views, whose strides the gemm backends take directly.  Grouped
+/// query heads are folded into the row dimension of their KV head instead of
+/// repeating K/V per query head.
 pub fn cached_attention(
     kv_cache: &mut KvCache,
     q: &Tensor,
@@ -224,18 +261,20 @@ pub fn cached_attention(
 ) -> Result<Tensor> {
     let (b, n_head, seq_len, dk) = q.dims4()?;
     let n_kv = k_new.dim(1)?;
-    let dv = v_new.dim(2)?;
+    let dv = v_new.dim(3)?;
     let rep = n_head / n_kv;
 
-    let (k_cache, v_cache) = match &*kv_cache {
-        None => (k_new, v_new),
-        Some((kc, vc)) => (
-            Tensor::cat(&[kc, &k_new], KV_SEQ_DIM)?.contiguous()?,
-            Tensor::cat(&[vc, &v_new], KV_SEQ_DIM)?.contiguous()?,
-        ),
-    };
-    *kv_cache = Some((k_cache.clone(), v_cache.clone()));
-    let seq_total = k_cache.dim(KV_SEQ_DIM)?;
+    if kv_cache.is_none() {
+        *kv_cache = Some(SeqKvCache::new(&k_new, &v_new)?);
+    }
+    let cache = kv_cache.as_mut().expect("cache just built");
+    cache.append(&k_new, &v_new)?;
+    let seq_total = cache.len;
+    // Transposed views over the cached rows: [b, n_kv, dk, seq_total] and
+    // [b, n_kv, dv, seq_total].  The gemm backends take these strides
+    // directly, so no copy of the cached context is made here.
+    let k_cache = cache.k.narrow(2, 0, seq_total)?.transpose(2, 3)?;
+    let v_cache = cache.v.narrow(2, 0, seq_total)?.transpose(2, 3)?;
 
     // Scaled dot-product attention over the whole cached context.
     let q = q.contiguous()?.reshape((b, n_kv, rep * seq_len, dk))?;
@@ -252,24 +291,155 @@ pub fn cached_attention(
         .reshape((b, seq_len, n_head * dv))
 }
 
-/// [`cached_attention`] for keys/values in the usual `[b, n_kv, seq, d]`
-/// head layout: transposes them into the cache layout first.
-pub fn cached_attention_heads(
-    kv_cache: &mut KvCache,
-    q: &Tensor,
-    k: &Tensor,
-    v: &Tensor,
-    mask: Option<&Tensor>,
-    softmax_scale: f64,
-) -> Result<Tensor> {
-    cached_attention(
-        kv_cache,
-        q,
-        k.transpose(2, 3)?.contiguous()?,
-        v.transpose(2, 3)?.contiguous()?,
-        mask,
-        softmax_scale,
-    )
+impl SeqKvCache {
+    /// Create a cache sized for `k_new`/`v_new` (`[b, n_kv, seq, d]`); the
+    /// caller appends positions through [`Self::append`].
+    pub fn new(k_new: &Tensor, v_new: &Tensor) -> Result<Self> {
+        let (b, n_kv, seq, dk) = k_new.dims4()?;
+        let (_, _, _, dv) = v_new.dims4()?;
+        let dev = k_new.device();
+        let cap = seq.max(KV_CACHE_INITIAL_CAP);
+        Ok(Self {
+            k: Tensor::zeros((b, n_kv, cap, dk), k_new.dtype(), dev)?,
+            v: Tensor::zeros((b, n_kv, cap, dv), v_new.dtype(), dev)?,
+            len: 0,
+        })
+    }
+
+    /// The number of cached positions (the rows attention reads).
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// The key buffer `[b, n_kv, cap, dk]`: `cap` rows allocated, the first
+    /// [`Self::len`] holding the cached positions.
+    pub fn k(&self) -> &Tensor {
+        &self.k
+    }
+
+    /// The value buffer `[b, n_kv, cap, dv]`.
+    pub fn v(&self) -> &Tensor {
+        &self.v
+    }
+
+    /// Append `k_new`/`v_new` (`[b, n_kv, seq, d]`) at the tail, growing the
+    /// buffers geometrically when they are full.
+    pub fn append(&mut self, k_new: &Tensor, v_new: &Tensor) -> Result<()> {
+        let (b, n_kv, seq, dk) = k_new.dims4()?;
+        let (_, vn_kv, vseq, _) = v_new.dims4()?;
+        if (vn_kv, vseq) != (n_kv, seq) || self.k.dim(0)? != b || self.k.dim(1)? != n_kv {
+            bail!(
+                "KV cache shape mismatch: k {k_new:?}, v {v_new:?}, cache k {:?}",
+                self.k.dims()
+            )
+        }
+        let k_new = k_new.contiguous()?;
+        let v_new = v_new.contiguous()?;
+        if self.k.dim(3)? != dk {
+            bail!(
+                "KV cache key width mismatch: new {dk}, cache {}",
+                self.k.dim(3)?
+            )
+        }
+        let cap = self.k.dim(2)?;
+        if self.len + seq > cap {
+            self.grow(self.len + seq)?;
+        }
+        let cap = self.k.dim(2)?;
+        copy_rows(&k_new, seq, &self.k, cap, self.len, seq)?;
+        copy_rows(&v_new, seq, &self.v, cap, self.len, seq)?;
+        self.len += seq;
+        Ok(())
+    }
+
+    /// Reallocate the buffers with room for `needed` rows (geometric
+    /// growth), carrying the cached rows over.
+    fn grow(&mut self, needed: usize) -> Result<()> {
+        let (b, n_kv, old_cap, dk) = self.k.dims4()?;
+        let (_, _, _, dv) = self.v.dims4()?;
+        let cap = needed.max(old_cap * 2);
+        let dev = self.k.device();
+        let (dt_k, dt_v) = (self.k.dtype(), self.v.dtype());
+        let k = Tensor::zeros((b, n_kv, cap, dk), dt_k, dev)?;
+        let v = Tensor::zeros((b, n_kv, cap, dv), dt_v, dev)?;
+        copy_rows(&self.k, old_cap, &k, cap, 0, self.len)?;
+        copy_rows(&self.v, old_cap, &v, cap, 0, self.len)?;
+        self.k = k;
+        self.v = v;
+        Ok(())
+    }
+}
+
+/// Copy the `rows × d` block of every (batch, head) from `src` (rows pitched
+/// at `src_pitch`) into `dst` (rows pitched at `dst_pitch`) at destination
+/// row `dst_row`: one contiguous run per (batch, head) through the storage
+/// backend's copy.  `src` and `dst` must be different buffers — their read
+/// and write locks are held simultaneously.
+fn copy_rows(
+    src: &Tensor,
+    src_pitch: usize,
+    dst: &Tensor,
+    dst_pitch: usize,
+    dst_row: usize,
+    rows: usize,
+) -> Result<()> {
+    let (b, h, _, hd) = src.dims4()?;
+    let run = rows * hd;
+    if run == 0 || b * h == 0 {
+        return Ok(());
+    }
+    let (src_storage, src_layout) = src.storage_and_layout();
+    let (mut dst_storage, dst_layout) = dst.storage_mut_and_layout();
+    let src_start = src_layout.start_offset();
+    let dst_start = dst_layout.start_offset();
+    let heads = b * h;
+    match (&mut *dst_storage, &*src_storage) {
+        (Storage::Cpu(d), Storage::Cpu(s)) => {
+            copy_rows_runs(s, d, heads, src_pitch, dst_pitch, dst_row, src_start, dst_start, run, hd)
+        }
+        (Storage::Cuda(d), Storage::Cuda(s)) => {
+            copy_rows_runs(s, d, heads, src_pitch, dst_pitch, dst_row, src_start, dst_start, run, hd)
+        }
+        (Storage::Metal(d), Storage::Metal(s)) => {
+            copy_rows_runs(s, d, heads, src_pitch, dst_pitch, dst_row, src_start, dst_start, run, hd)
+        }
+        (Storage::OpenCl(d), Storage::OpenCl(s)) => {
+            copy_rows_runs(s, d, heads, src_pitch, dst_pitch, dst_row, src_start, dst_start, run, hd)
+        }
+        (Storage::Sycl(d), Storage::Sycl(s)) => {
+            copy_rows_runs(s, d, heads, src_pitch, dst_pitch, dst_row, src_start, dst_start, run, hd)
+        }
+        (Storage::Vulkan(d), Storage::Vulkan(s)) => {
+            copy_rows_runs(s, d, heads, src_pitch, dst_pitch, dst_row, src_start, dst_start, run, hd)
+        }
+        _ => bail!("unsupported storage pair for the in-place KV append"),
+    }
+}
+
+/// One contiguous copy per (batch, head): the source run sits at
+/// `src_start + bh * src_pitch * hd`, the destination run at
+/// `dst_start + bh * dst_pitch * hd + dst_row * hd`.
+fn copy_rows_runs<S: BackendStorage>(
+    src: &S,
+    dst: &mut S,
+    heads: usize,
+    src_pitch: usize,
+    dst_pitch: usize,
+    dst_row: usize,
+    src_start: usize,
+    dst_start: usize,
+    run: usize,
+    hd: usize,
+) -> Result<()> {
+    for bh in 0..heads {
+        let src_l = Layout::new(run.into(), vec![1], src_start + bh * src_pitch * hd);
+        src.copy_strided_src(
+            dst,
+            dst_start + bh * dst_pitch * hd + dst_row * hd,
+            &src_l,
+        )?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -277,8 +447,8 @@ mod tests {
     use super::*;
 
     /// Grouped attention must equal the textbook form: K/V repeated per query
-    /// head, softmax(q·kᵀ·scale + mask)·v — over both a prefill and a decode
-    /// step appended to the cache.
+    /// head, softmax(q·kᵀ·scale + mask)·v — over a prefill followed by decode
+    /// steps appended one token at a time.
     #[test]
     fn gqa_cached_attention_matches_repeated_kv_reference() -> Result<()> {
         let dev = Device::Cpu;
@@ -296,31 +466,32 @@ mod tests {
                 .reshape((b, s, n_head * dv))
         };
 
-        let total = 4usize;
+        let total = 10usize;
+        let prefill = 3usize;
         let q = Tensor::randn(0f32, 1f32, (b, n_head, total, d), &dev)?;
         let k = Tensor::randn(0f32, 1f32, (b, n_kv, total, d), &dev)?;
         let v = Tensor::randn(0f32, 1f32, (b, n_kv, total, dv), &dev)?;
 
         let mut kv: KvCache = None;
-        // Prefill 3 tokens, then decode the 4th.
-        let mask = crate::moe::causal_mask(3, 0, &dev)?;
-        let pre = cached_attention_heads(
+        let mut got = cached_attention(
             &mut kv,
-            &q.narrow(2, 0, 3)?,
-            &k.narrow(2, 0, 3)?,
-            &v.narrow(2, 0, 3)?,
-            Some(&mask),
+            &q.narrow(2, 0, prefill)?,
+            k.narrow(2, 0, prefill)?,
+            v.narrow(2, 0, prefill)?,
+            Some(&crate::moe::causal_mask(prefill, 0, &dev)?),
             scale,
         )?;
-        let dec = cached_attention_heads(
-            &mut kv,
-            &q.narrow(2, 3, 1)?,
-            &k.narrow(2, 3, 1)?,
-            &v.narrow(2, 3, 1)?,
-            None,
-            scale,
-        )?;
-        let got = Tensor::cat(&[&pre, &dec], 1)?;
+        for i in prefill..total {
+            let ctx = cached_attention(
+                &mut kv,
+                &q.narrow(2, i, 1)?,
+                k.narrow(2, i, 1)?,
+                v.narrow(2, i, 1)?,
+                None,
+                scale,
+            )?;
+            got = Tensor::cat(&[got, ctx], 1)?;
+        }
         let want = reference(&q, &k, &v, &crate::moe::causal_mask(total, 0, &dev)?)?;
 
         let max = (got - want)?
@@ -332,13 +503,63 @@ mod tests {
             max < 1e-5,
             "grouped attention diverges from reference: {max}"
         );
-        let (kc, vc) = kv.as_ref().unwrap();
+        let cache = kv.as_ref().unwrap();
+        assert_eq!(cache.len(), total, "cache tracks the appended positions");
         assert_eq!(
-            kc.dims(),
-            &[b, n_kv, d, total],
-            "cache keeps the un-repeated KV heads"
+            cache.k.dims(),
+            &[b, n_kv, KV_CACHE_INITIAL_CAP, d],
+            "the cache keeps the un-repeated KV heads in preallocated buffers"
         );
-        assert_eq!(vc.dims(), &[b, n_kv, dv, total]);
+        assert_eq!(cache.v.dims(), &[b, n_kv, KV_CACHE_INITIAL_CAP, dv]);
+        Ok(())
+    }
+
+    /// Appending past the capacity grows the buffers geometrically and
+    /// carries the cached rows over; truncation lowers the logical length
+    /// without copying, and later appends overwrite the freed tail.
+    #[test]
+    fn kv_cache_grows_and_truncates_in_place() -> Result<()> {
+        let dev = Device::Cpu;
+        let (b, n_kv, d) = (1usize, 2usize, 4usize);
+        let mut cache = SeqKvCache {
+            k: Tensor::zeros((b, n_kv, 3, d), DType::F32, &dev)?,
+            v: Tensor::zeros((b, n_kv, 3, d), DType::F32, &dev)?,
+            len: 0,
+        };
+        // Five single-row appends: capacity 3 doubles to 6 on the 4th.
+        for i in 0..5usize {
+            let row: Vec<f32> = (0..b * n_kv * d).map(|x| (i * 100 + x) as f32).collect();
+            let k = Tensor::from_vec(row.clone(), (b, n_kv, 1, d), &dev)?;
+            let v = Tensor::from_vec(row, (b, n_kv, 1, d), &dev)?;
+            cache.append(&k, &v)?;
+        }
+        assert_eq!(cache.len(), 5);
+        assert_eq!(cache.k.dims(), &[b, n_kv, 6, d], "capacity doubled past 3");
+        for i in 0..5usize {
+            let got: Vec<f32> = cache
+                .k
+                .narrow(2, i, 1)?
+                .flatten_all()?
+                .to_vec1()?;
+            let want: Vec<f32> = (0..b * n_kv * d).map(|x| (i * 100 + x) as f32).collect();
+            assert_eq!(got, want, "row {i} survived the growth");
+        }
+
+        let mut kv = Some(cache);
+        truncate_kv(&mut kv, 2);
+        let cache = kv.as_mut().unwrap();
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.k.dims(), &[b, n_kv, 6, d], "buffers stay allocated");
+
+        // The next append lands at row 2, overwriting the truncated tail.
+        let row: Vec<f32> = (0..b * n_kv * d).map(|x| (999 + x) as f32).collect();
+        let k = Tensor::from_vec(row.clone(), (b, n_kv, 1, d), &dev)?;
+        let v = Tensor::from_vec(row, (b, n_kv, 1, d), &dev)?;
+        cache.append(&k, &v)?;
+        assert_eq!(cache.len(), 3);
+        let tail: Vec<f32> = cache.k.narrow(2, 2, 1)?.flatten_all()?.to_vec1()?;
+        let want: Vec<f32> = (0..b * n_kv * d).map(|x| (999 + x) as f32).collect();
+        assert_eq!(tail, want, "the new row overwrote the freed tail");
         Ok(())
     }
 

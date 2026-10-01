@@ -527,7 +527,7 @@ impl GqaAttention {
         let k = heads(&self.k, self.n_kv_head, self.head_dim)?;
         let v = heads(&self.v, self.n_kv_head, self.v_head_dim)?;
         let (q, k) = self.rotary.apply_pair(&q, &k, offset)?;
-        let ctx = crate::attention::cached_attention_heads(kv_cache, &q, &k, &v, mask, self.softmax_scale)?;
+        let ctx = crate::attention::cached_attention(kv_cache, &q, k, v, mask, self.softmax_scale)?;
         self.o_proj.forward(&ctx)
     }
 }
@@ -647,14 +647,7 @@ impl MlaAttention {
             None => k_nope.contiguous()?,
         };
 
-        let ctx = cached_attention(
-            kv_cache,
-            &q,
-            k_new.transpose(2, 3)?.contiguous()?,
-            v.transpose(2, 3)?.contiguous()?,
-            mask,
-            self.softmax_scale,
-        )?;
+        let ctx = cached_attention(kv_cache, &q, k_new, v, mask, self.softmax_scale)?;
         let ctx = match &self.gate {
             Some(g) => (ctx * candle_nn::ops::sigmoid(&g.forward(xs)?)?)?,
             None => ctx,
@@ -1124,7 +1117,8 @@ impl crate::native_session::LayerStack for Weights {
         }
         state.published.clear();
         state.index.truncate(keep)?;
-        crate::moe::truncate_kv(&mut state.kv, keep, crate::attention::KV_SEQ_DIM)
+        crate::attention::truncate_kv(&mut state.kv, keep);
+        Ok(())
     }
 }
 
@@ -1812,20 +1806,27 @@ mod tests {
         // Prefill: 3 tokens at once.
         let xs = Tensor::randn(0f32, 1f32, (1, 3, 8), &dev)?;
         attn.forward(&mut kv, &xs, None, 0)?;
-        let (k, v) = kv.as_ref().expect("cache populated after prefill");
+        let cache = kv.as_ref().expect("cache populated after prefill");
+        assert_eq!(cache.len(), 3);
+        // Buffers are [b, n_head, cap, d] with cap = the initial capacity.
         assert_eq!(
-            k.dims(),
-            &[1, 2, 8, 3],
-            "k cache must be [b, n_head, qk_nope + qk_rope, seq]"
+            cache.k().dims(),
+            &[1, 2, 512, 8],
+            "k cache must be [b, n_head, cap, qk_nope + qk_rope]"
         );
-        assert_eq!(v.dims(), &[1, 2, 4, 3], "v cache must be [b, n_head, v_head_dim, seq]");
+        assert_eq!(
+            cache.v().dims(),
+            &[1, 2, 512, 4],
+            "v cache must be [b, n_head, cap, v_head_dim]"
+        );
 
-        // Decode: one more token appends along seq.
+        // Decode: one more token appends a row.
         let xs2 = Tensor::randn(0f32, 1f32, (1, 1, 8), &dev)?;
         attn.forward(&mut kv, &xs2, None, 3)?;
-        let (k, v) = kv.as_ref().expect("cache after decode");
-        assert_eq!(k.dims(), &[1, 2, 8, 4]);
-        assert_eq!(v.dims(), &[1, 2, 4, 4]);
+        let cache = kv.as_ref().expect("cache after decode");
+        assert_eq!(cache.len(), 4);
+        assert_eq!(cache.k().dims(), &[1, 2, 512, 8]);
+        assert_eq!(cache.v().dims(), &[1, 2, 512, 4]);
         Ok(())
     }
 
@@ -1846,7 +1847,7 @@ mod tests {
             .collect();
         let mask = Tensor::from_slice(&mask, (1, 1, 3, 3), &dev)?;
         let out_prefill = a.forward(&mut kv_a, &xs, Some(&mask), 0)?;
-        let (c_pre, k_pre) = kv_a.as_ref().unwrap();
+        let pre = kv_a.as_ref().unwrap();
 
         // Incremental path: 1 + 1 + 1 tokens with growing offset.
         let b = tiny_attention(&dev, &w)?;
@@ -1857,11 +1858,12 @@ mod tests {
             out_inc.push(b.forward(&mut kv_b, &t, None, off)?);
         }
         let out_inc = Tensor::cat(&out_inc, 1)?;
-        let (c_inc, k_inc) = kv_b.as_ref().unwrap();
+        let inc = kv_b.as_ref().unwrap();
 
-        assert_eq!(c_pre.dims(), c_inc.dims());
-        assert_eq!(k_pre.dims(), k_inc.dims());
-        let diff = (c_pre.to_dtype(DType::F32)? - c_inc.to_dtype(DType::F32)?)?
+        assert_eq!(pre.len(), inc.len());
+        assert_eq!(pre.k().dims(), inc.k().dims());
+        assert_eq!(pre.v().dims(), inc.v().dims());
+        let diff = (pre.k().to_dtype(DType::F32)? - inc.k().to_dtype(DType::F32)?)?
             .abs()?
             .flatten_all()?
             .to_vec1::<f32>()?;

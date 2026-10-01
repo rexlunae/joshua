@@ -39,33 +39,6 @@ pub fn is_routed_expert(name: &str) -> bool {
 
 // ─── Per-session state ───────────────────────────────────────────────────────
 
-/// One layer's KV cache: `(k, v)`, appended along the layer's sequence
-/// dimension.  Owned by the session, not the (shared) weights.
-pub type KvCache = Option<(Tensor, Tensor)>;
-
-/// Keep only the first `keep` positions of a layer's cache, where the
-/// sequence runs along `seq_dim` of both `k` and `v`.  `keep == 0` clears
-/// the cache; `keep` at or past the cached length is a no-op.
-pub fn truncate_kv(kv_cache: &mut KvCache, keep: usize, seq_dim: usize) -> Result<()> {
-    match kv_cache {
-        None => Ok(()),
-        Some(_) if keep == 0 => {
-            *kv_cache = None;
-            Ok(())
-        }
-        Some((k, v)) => {
-            let len = k.dim(seq_dim)?;
-            if keep >= len {
-                return Ok(());
-            }
-            let k = k.narrow(seq_dim, 0, keep)?.contiguous()?;
-            let v = v.narrow(seq_dim, 0, keep)?.contiguous()?;
-            *kv_cache = Some((k, v));
-            Ok(())
-        }
-    }
-}
-
 /// Additive causal mask `[1, 1, seq_len, seq_len + offset]` for `seq_len`
 /// new positions appended after `offset` cached ones: `0` where a query may
 /// attend, `-inf` where it may not.
@@ -887,30 +860,6 @@ mod tests {
         assert!(err.to_string().contains("expert 7 out of 2"), "{err}");
         let err = dispatch_prefill("t", &ex, &Device::Cpu, &x, &idx, &w, 1, 2).unwrap_err();
         assert!(err.to_string().contains("(token 0, slot 1)"), "{err}");
-        Ok(())
-    }
-
-    #[test]
-    fn truncate_kv_honours_the_sequence_dim() -> Result<()> {
-        let k = Tensor::zeros((1, 2, 6, 4), DType::F32, &Device::Cpu)?;
-        let mut kv = Some((k.clone(), k));
-        truncate_kv(&mut kv, 9, 2)?;
-        assert_eq!(
-            kv.as_ref().unwrap().0.dim(2)?,
-            6,
-            "keep past the end is a no-op"
-        );
-        truncate_kv(&mut kv, 3, 2)?;
-        assert_eq!(kv.as_ref().unwrap().0.dims(), &[1, 2, 3, 4]);
-        // Transposed layout: sequence on dim 3.
-        let mut kv = Some((
-            Tensor::zeros((1, 2, 4, 6), DType::F32, &Device::Cpu)?,
-            Tensor::zeros((1, 2, 4, 6), DType::F32, &Device::Cpu)?,
-        ));
-        truncate_kv(&mut kv, 2, 3)?;
-        assert_eq!(kv.as_ref().unwrap().1.dims(), &[1, 2, 4, 2]);
-        truncate_kv(&mut kv, 0, 3)?;
-        assert!(kv.is_none(), "keep 0 clears the cache");
         Ok(())
     }
 
