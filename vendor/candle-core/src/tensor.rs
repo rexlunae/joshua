@@ -2773,9 +2773,10 @@ impl Tensor {
         self.storage.write().unwrap()
     }
 
-    // If we extend the visibility of this function to be usable outside of this crate, we should
-    // make it unsafe.
-    pub(crate) fn storage_mut_and_layout(
+    // Made `pub` for joshua's in-place KV-cache append: the write lock
+    // excludes concurrent readers, and a caller must never alias `self` with
+    // the tensor it copies from (both locks on one RwLock would deadlock).
+    pub fn storage_mut_and_layout(
         &self,
     ) -> (std::sync::RwLockWriteGuard<'_, Storage>, &Layout) {
         let storage = self.storage.write().unwrap();

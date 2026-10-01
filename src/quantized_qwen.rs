@@ -738,7 +738,7 @@ impl Attention {
         let q = self.rope.apply_leading(&q, offset)?;
         let k = self.rope.apply_leading(&k, offset)?;
 
-        let mut ctx = crate::attention::cached_attention_heads(kv_cache, &q, &k, &v, mask, self.scale)?;
+        let mut ctx = crate::attention::cached_attention(kv_cache, &q, k, v, mask, self.scale)?;
         if let Some(gate) = gate {
             ctx = (ctx * sigmoid(&gate)?)?;
         }
@@ -1433,7 +1433,8 @@ impl crate::native_session::LayerStack for Weights {
             *state = LayerState::default();
             return Ok(());
         }
-        crate::moe::truncate_kv(&mut state.kv, keep, crate::attention::KV_SEQ_DIM)
+        crate::attention::truncate_kv(&mut state.kv, keep);
+        Ok(())
     }
 }
 
@@ -2076,15 +2077,22 @@ mod tests {
             let xs = Tensor::randn(0f32, 1f32, (1, 3, h), &dev)?;
             let out = attn.forward(&mut state, &xs, None, 0)?;
             assert_eq!(out.dims(), &[1, 3, h]);
-            let (k, v) = state.kv.as_ref().expect("cache after prefill");
-            assert_eq!(k.dims(), &[1, nkv, hd, 3], "k cache must be [b, n_kv_head, head_dim, seq]");
-            assert_eq!(v.dims(), &[1, nkv, hd, 3]);
+            let cache = state.kv.as_ref().expect("cache after prefill");
+            assert_eq!(cache.len(), 3);
+            // Buffers are [b, n_kv_head, cap, d] with cap = the initial capacity.
+            assert_eq!(
+                (cache.k().dim(1)?, cache.k().dim(3)?),
+                (nkv, hd),
+                "k cache must be [b, n_kv_head, cap, head_dim]"
+            );
+            assert_eq!((cache.v().dim(1)?, cache.v().dim(3)?), (nkv, hd));
 
             // Decode appends one more position.
             let _ = attn.forward(&mut state, &Tensor::randn(0f32, 1f32, (1, 1, h), &dev)?, None, 3)?;
-            let (k, v) = state.kv.as_ref().expect("cache after decode");
-            assert_eq!(k.dims(), &[1, nkv, hd, 4]);
-            assert_eq!(v.dims(), &[1, nkv, hd, 4]);
+            let cache = state.kv.as_ref().expect("cache after decode");
+            assert_eq!(cache.len(), 4);
+            assert_eq!((cache.k().dim(1)?, cache.k().dim(3)?), (nkv, hd));
+            assert_eq!((cache.v().dim(1)?, cache.v().dim(3)?), (nkv, hd));
         }
         Ok(())
     }
