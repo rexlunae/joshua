@@ -98,6 +98,11 @@ pub struct Session<W: LayerStack> {
     /// [`crate::hot_experts::REFRESH_STEPS`] decode steps, and reports newly
     /// hot experts for the residency backend.
     hot_experts: crate::hot_experts::HotExpertCache,
+    /// Causal-mask builder on the weights' device: the streamed prefill asks
+    /// for the same `(chunk, position)` mask once per layer, so the pattern is
+    /// derived on-device from cached position ranges instead of re-filled and
+    /// re-uploaded per call (see [`crate::moe::CausalMask`]).
+    mask: crate::moe::CausalMask,
 }
 
 impl<W: LayerStack> Session<W> {
@@ -109,6 +114,7 @@ impl<W: LayerStack> Session<W> {
             state: vec![W::State::default(); n],
             tokens: Vec::new(),
             hot_experts: crate::hot_experts::HotExpertCache::new(n, weights.n_expert(), 0),
+            mask: crate::moe::CausalMask::new(weights.device()),
             weights,
         }
     }
@@ -131,6 +137,7 @@ impl<W: LayerStack> Session<W> {
                 self.weights.n_expert(),
                 self.hot_experts.budget(),
             ),
+            mask: crate::moe::CausalMask::new(self.weights.device()),
         }
     }
 
@@ -195,7 +202,7 @@ impl<W: LayerStack> Session<W> {
         let mask = if seq_len == 1 {
             None
         } else {
-            Some(crate::moe::causal_mask(seq_len, offset, w.device())?)
+            Some(self.mask.mask(seq_len, offset)?)
         };
 
         // Routing-frequency hot-expert cache: every
@@ -309,7 +316,7 @@ impl<W: LayerStack> crate::stream_prefill::StreamPrefill for Session<W> {
         // positions ([chunk_len, chunk_len + pos]) — the same causal mask the
         // chunked prefill builds for the same `pos`.
         let seq = xs.dim(1)?;
-        let mask = crate::moe::causal_mask(seq, pos, xs.device())?;
+        let mask = self.mask.mask(seq, pos)?;
         let w = Arc::clone(&self.weights);
         let tokens = if w.wants_tokens() { &self.tokens[..pos + seq] } else { &[][..] };
         let input = LayerInput { mask: Some(&mask), offset: pos, tokens };

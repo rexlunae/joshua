@@ -84,6 +84,117 @@ pub fn causal_mask(seq_len: usize, offset: usize, device: &Device) -> Result<Ten
     Tensor::from_vec(mask, (1, 1, seq_len, seq_len + offset), device)
 }
 
+/// Incremental causal-mask builder for one session's device.
+///
+/// [`causal_mask`] fills the `[seq, seq + offset]` pattern in a host `Vec`
+/// and copies it to the device on every call.  The streamed prefill needs
+/// the *same* `(seq, offset)` mask once per layer per chunk, so the host
+/// fill loop and the device upload run `n_layers` times per chunk.  This
+/// builder keeps the position range as one device `arange` tensor (regrown
+/// by doubling as the context grows) and derives each mask with a broadcast
+/// compare — the same `0` / `-inf` values, with no per-call host pass and
+/// no host→device copy of the matrix.
+///
+/// Masks are still built per call and dropped after use: caching the
+/// materialized `[seq, seq + offset]` tensors would hold Σ chunks
+/// O(position) bytes across the whole sweep — quadratic in the prompt
+/// length, against the streamed prefill's chunk-bounded memory contract.
+///
+/// The paths are dispatched by device, per `examples/bench_causal_mask.rs`
+/// (40 layers × 8 × 512 chunks, medians with `synchronize` in every timed
+/// region): on the CPU the device-op path measured 1100 ms per sweep
+/// against the host pattern's 252 ms — ~4.4× slower, since there is no
+/// upload to save — so the CPU keeps the host pattern; on Metal the device
+/// path measured 244 ms per sweep against the host pattern's 358 ms — the
+/// win comes from dropping the per-call host pass and the ~9 MB matrix
+/// upload.
+pub struct CausalMask {
+    device: Device,
+    /// `arange(0..n)` as f32, `n` a power of two ≥ every width so far.
+    /// Built on first use: the session constructors are infallible.
+    positions: Option<Tensor>,
+    zero: Option<Tensor>,
+    neg_inf: Option<Tensor>,
+}
+
+impl CausalMask {
+    /// A builder on `device`, grown to fit the masks it is asked for.
+    pub fn new(device: &Device) -> Self {
+        Self {
+            device: device.clone(),
+            positions: None,
+            zero: None,
+            neg_inf: None,
+        }
+    }
+
+    /// `[1, 1, seq, seq + offset]`, bit-identical to [`causal_mask`].
+    pub fn mask(&mut self, seq: usize, offset: usize) -> Result<Tensor> {
+        let width = seq.saturating_add(offset);
+        // f32 holds integers exactly up to 2^24; beyond that (impossible
+        // under the loaders' KV caps) the compare could round — fall back
+        // to the host pattern instead of emitting a wrong mask.
+        if seq == 0 || width >= (1 << 24) {
+            return causal_mask(seq, offset, &self.device);
+        }
+        // Measured (see the type docs): on the CPU the host pattern beats
+        // the device ops ~4.4× — there is no upload to save — so it stays;
+        // on accelerators the device path drops the per-call host pass and
+        // the matrix upload.
+        if self.device.is_cpu() {
+            return causal_mask(seq, offset, &self.device);
+        }
+        self.mask_device_ops(seq, offset, width)
+    }
+
+    /// The device-op path behind [`mask`]: the mask derived from the cached
+    /// position range by a broadcast compare.  Private to the accelerator
+    /// dispatch (and the tests, which check it bit-identical on CPU tensors).
+    fn mask_device_ops(&mut self, seq: usize, offset: usize, width: usize) -> Result<Tensor> {
+        if self
+            .positions
+            .as_ref()
+            .map(|p| p.dim(0))
+            .transpose()? < Some(width)
+        {
+            let n = width.checked_next_power_of_two().unwrap_or(width);
+            self.positions = Some(Tensor::arange(0f32, n as f32, &self.device)?);
+        }
+        // Blocked ⇔ column − (row + offset) > 0.  Every value here is an
+        // integer below 2^24, so each f32 step is exact and the mask is
+        // bit-identical to the host pattern.
+        let positions = self.positions.as_ref().expect("just grown");
+        let zero = match &self.zero {
+            Some(z) => z.clone(),
+            None => {
+                let z = Tensor::new(0f32, &self.device)?;
+                self.zero = Some(z.clone());
+                z
+            }
+        };
+        let neg_inf = match &self.neg_inf {
+            Some(v) => v.clone(),
+            None => {
+                let v = Tensor::new(f32::NEG_INFINITY, &self.device)?;
+                self.neg_inf = Some(v.clone());
+                v
+            }
+        };
+        let cols = positions.narrow(0, 0, width)?.unsqueeze(0)?; // [1, width]
+        let rows = positions
+            .narrow(0, 0, seq)?
+            .affine(1.0, offset as f64)?
+            .unsqueeze(1)?; // [seq, 1]
+        let blocked = cols
+            .broadcast_sub(&rows)? // [seq, width]
+            .gt(0f32)?;
+        let shape = (seq, width);
+        blocked
+            .where_cond(&neg_inf.broadcast_as(shape)?, &zero.broadcast_as(shape)?)?
+            .reshape((1, 1, seq, width))
+    }
+}
+
 // ─── Routing helpers ─────────────────────────────────────────────────────────
 
 /// Indices of the top-`k` values along the last dim (descending), as u32.
@@ -680,6 +791,38 @@ mod tests {
     use super::*;
     use candle_core::quantized::QMatMul;
     use candle_core::Module;
+
+    /// The incremental builder must be bit-identical to the host pattern:
+    /// every mask feeds `broadcast_add` against attention scores, so even a
+    /// one-ULP difference would shift logits.  Covers the regrowth path
+    /// (small mask first, then wider) and offsets past the first growth.
+    ///
+    /// Both paths are checked against the host pattern: [`CausalMask::mask`]
+    /// (the dispatch — on the CPU this *is* the host pattern) and
+    /// [`CausalMask::mask_device_ops`] (the accelerator path, exercised here
+    /// on CPU tensors so the math is verified without Metal hardware).
+    #[test]
+    fn causal_mask_builder_matches_host_pattern() -> Result<()> {
+        let dev = Device::Cpu;
+        let mut builder = CausalMask::new(&dev);
+        for (seq, offset) in [(1, 0), (1, 5), (3, 0), (2, 1023), (7, 4097), (64, 63), (512, 0)] {
+            let width = seq + offset;
+            let want = causal_mask(seq, offset, &dev)?;
+            for (what, got) in [
+                ("mask", builder.mask(seq, offset)?),
+                (
+                    "mask_device_ops",
+                    builder.mask_device_ops(seq, offset, width)?,
+                ),
+            ] {
+                assert_eq!(got.dims(), want.dims(), "dims at seq={seq} offset={offset}");
+                let got: Vec<f32> = got.flatten_all()?.to_vec1()?;
+                let want: Vec<f32> = want.flatten_all()?.to_vec1()?;
+                assert_eq!(got, want, "values ({what}) at seq={seq} offset={offset}");
+            }
+        }
+        Ok(())
+    }
 
     /// A plain quantized MLP-free expert: one matmul, enough to exercise the
     /// dispatch bookkeeping.
