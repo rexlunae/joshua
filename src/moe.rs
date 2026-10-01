@@ -102,11 +102,12 @@ pub fn causal_mask(seq_len: usize, offset: usize, device: &Device) -> Result<Ten
 ///
 /// The paths are dispatched by device, per `examples/bench_causal_mask.rs`
 /// (40 layers × 8 × 512 chunks, medians with `synchronize` in every timed
-/// region): on the CPU the host fill + `from_slice` is ~4.4× faster than
-/// the device-op path (1100 ms vs 252 ms per sweep — there is no upload to
-/// save), so CPU keeps the host pattern; on Metal the device path wins
-/// (244 ms vs 358 ms per sweep — it removes the per-call host pass and the
-/// ~9 MB matrix upload).
+/// region): on the CPU the device-op path measured 1100 ms per sweep
+/// against the host pattern's 252 ms — ~4.4× slower, since there is no
+/// upload to save — so the CPU keeps the host pattern; on Metal the device
+/// path measured 244 ms per sweep against the host pattern's 358 ms — the
+/// win comes from dropping the per-call host pass and the ~9 MB matrix
+/// upload.
 pub struct CausalMask {
     device: Device,
     /// `arange(0..n)` as f32, `n` a power of two ≥ every width so far.
