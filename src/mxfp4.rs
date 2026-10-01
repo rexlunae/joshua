@@ -159,7 +159,6 @@ fn matmul_t_dispatch(
     if try_fused_matmul(mkn, blocks_per_row, lhs, rhs, dst, parallel) {
         return Ok(());
     }
-    }
     if parallel {
         crate::raw_block::matmul_t(mkn, lhs, rhs, dst)
     } else {
