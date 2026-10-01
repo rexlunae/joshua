@@ -363,6 +363,23 @@ pub(super) struct Qsa {
     top_k: usize,
 }
 
+/// Per-session indexer state of one QSA layer: the raw indexer keys
+/// appended so far, and the pooled block keys of every complete block.
+///
+/// Pooling a block (mean over its `ratio` raw keys, RMS norm, RoPE) only
+/// depends on that block's raw keys and its start position, so it is done
+/// once, when the block completes; forwards over later positions reuse the
+/// pooled rows. (Before the per-session caching the mask call re-derived
+/// every block from the whole raw key cache on each forward.)
+#[derive(Default, Clone)]
+pub(super) struct QsaCache {
+    /// Raw indexer keys `[0, len)`, `len` = positions appended so far.
+    /// Rewinds keep the rows beyond the new end, as before.
+    keys: Option<Tensor>,
+    /// Pooled keys of complete blocks `[len / r, d]` (post-norm, post-RoPE).
+    pooled: Option<Tensor>,
+}
+
 impl Qsa {
     /// Load layer `layer`'s indexer when it has a compress ratio (and the
     /// file ships indexer tensors; without them llama.cpp runs dense).
@@ -391,7 +408,7 @@ impl Qsa {
         }))
     }
 
-    /// Append this input's raw indexer keys to `keys` and return the
+    /// Append this input's raw indexer keys to the cache and return the
     /// attention mask `[1, 1, t, offset + t]` restricting each query to its
     /// selected cells — or `None` while the context is short enough that
     /// every query sees all of it (the selection is then dense).
@@ -406,34 +423,60 @@ impl Qsa {
     /// positions are taken.
     pub(super) fn mask(
         &self,
-        keys: &mut Option<Tensor>,
+        cache: &mut QsaCache,
         xs: &Tensor,
         offset: usize,
     ) -> Result<Option<Tensor>> {
         let (_, t, _) = xs.dims3()?;
         let (r, d, dev) = (self.ratio, self.dim, xs.device());
         let new = self.k_proj.forward(xs)?.reshape((t, d))?;
-        let all = match keys.take() {
+        let keys = cache.keys.take();
+        let pooled_prev = cache.pooled.take();
+        let all = match keys {
             Some(k) => Tensor::cat(&[&k, &new], 0)?,
             None => new,
         };
-        *keys = Some(all.clone());
 
         let len = offset + t;
+        // A rewind (positions moving backward) leaves pooled blocks beyond
+        // `len / r` stale — cut them back to the prefix the old per-forward
+        // re-pooling derived from the raw keys.
+        let pooled_prev = match pooled_prev {
+            Some(p) if p.dim(0)? > len / r => Some(p.narrow(0, 0, len / r)?),
+            other => other,
+        };
+        // Pool, RMS-norm and RoPE only the blocks this chunk completed; the
+        // earlier blocks were finished by earlier forwards (see QsaCache).
+        let n_blocks = len / r;
+        let have = match pooled_prev.as_ref() {
+            Some(p) => p.dim(0)?,
+            None => 0,
+        };
+        let pooled = if n_blocks > have {
+            let n = n_blocks - have;
+            let pooled_new = all
+                .narrow(0, have * r, n * r)?
+                .reshape((n, r, d))?
+                .mean(1)?;
+            let pooled_new = self.k_norm.forward(&pooled_new)?;
+            let starts: Vec<u32> = (have..n_blocks).map(|b| (b * r) as u32).collect();
+            let pooled_new =
+                self.rope.apply_at(&pooled_new, &Tensor::new(starts, dev)?)?; // [n, d]
+            Some(match pooled_prev {
+                Some(p) => Tensor::cat(&[&p, &pooled_new], 0)?,
+                None => pooled_new,
+            })
+        } else {
+            pooled_prev
+        };
+        cache.keys = Some(all);
+        cache.pooled = pooled;
+
         let width = self.top_k + r - 1;
         if len <= width {
             return Ok(None);
         }
-
-        // Pooled block keys for every complete block.
-        let n_blocks = len / r;
-        let pooled = all
-            .narrow(0, 0, n_blocks * r)?
-            .reshape((n_blocks, r, d))?
-            .mean(1)?;
-        let pooled = self.k_norm.forward(&pooled)?;
-        let starts: Vec<u32> = (0..n_blocks).map(|b| (b * r) as u32).collect();
-        let pooled = self.rope.apply_at(&pooled, &Tensor::new(starts, dev)?)?; // [blocks, d]
+        let pooled = cache.pooled.as_ref().expect("pooled block keys"); // [blocks, d]
 
         // Indexer queries at their own positions.
         let q = self.q_proj.forward(xs)?.reshape((1, t, self.n_heads, d))?;
@@ -485,6 +528,8 @@ impl Qsa {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle_core::Device;
+    use crate::attention::RopeStyle;
 
     /// The hash reads EOS before the sequence start and at/before an EOS in
     /// the window, never at the token itself, and wraps in u64.
@@ -512,5 +557,131 @@ mod tests {
         assert_eq!(rows, want);
         // Only the last `t` tokens get rows, still hashed against history.
         assert_eq!(h.rows(&[4, 9, 6], 1), hash([6, 9, 9]));
+    }
+
+    /// A tiny QSA: 8-dim keys, 2 heads, ratio 4, top_k 2 (width 5). f32
+    /// weights, unit RMS norms, plain RoPE over half the key width.
+    fn tiny_qsa(dev: &Device) -> Result<Qsa> {
+        use candle_core::quantized::QMatMul;
+        let lcg = |seed: &mut u64| {
+            *seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((*seed >> 33) as f32 - 8_388_608.0) / 8_388_608.0
+        };
+        let mut seed = 0xdead_beef;
+        let mat = |rows: usize, seed: &mut u64| -> Result<Tensor> {
+            let v: Vec<f32> = (0..rows * 8).map(|_| lcg(seed)).collect();
+            Tensor::from_vec(v, (rows, 8), dev)
+        };
+        let norm = || -> Result<RmsNorm> {
+            let w = Tensor::ones(8, DType::F32, dev)?;
+            RmsNorm::from_qtensor(
+                candle_core::quantized::QTensor::quantize(
+                    &w,
+                    candle_core::quantized::GgmlDType::F32,
+                )?,
+                1e-5,
+            )
+        };
+        Ok(Qsa {
+            q_proj: Weight::Candle(QMatMul::Tensor(mat(16, &mut seed)?)),
+            k_proj: Weight::Candle(QMatMul::Tensor(mat(8, &mut seed)?)),
+            q_norm: norm()?,
+            k_norm: norm()?,
+            rope: Arc::new(Rope::new(4, 10000.0, 64, RopeStyle::Neox, dev)?),
+            n_heads: 2,
+            dim: 8,
+            ratio: 4,
+            top_k: 2,
+        })
+    }
+
+    /// One-shot (a single forward over 9 positions) and token-by-token
+    /// forwards must produce the same pooled keys and the same mask rows:
+    /// pooling runs only on newly completed blocks, so a block's pooled keys
+    /// must not depend on how the cache was assembled. Also checks that a
+    /// rewind drops the pooled blocks past the new end, matching a fresh run.
+    #[test]
+    fn qsa_mask_incremental_matches_one_shot() -> Result<()> {
+        let dev = Device::Cpu;
+        let qsa = tiny_qsa(&dev)?;
+        let lcg = |seed: &mut u64| {
+            *seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((*seed >> 33) as f32 - 8_388_608.0) / 8_388_608.0
+        };
+        let mut seed = 42;
+        let xs: Vec<f32> = (0..9 * 8).map(|_| lcg(&mut seed)).collect();
+        let xs = Tensor::from_vec(xs, (1, 9, 8), &dev)?;
+        let approx_eq = |a: &[f32], b: &[f32]| -> bool {
+            a.len() == b.len()
+                && a.iter()
+                    .zip(b)
+                    .all(|(x, y)| (x - y).abs() < 1e-5)
+        };
+
+        // One shot over all 9 positions.
+        let mut one = QsaCache::default();
+        let full = qsa.mask(&mut one, &xs, 0)?.expect("mask at len 9");
+        let pooled_one = one.pooled.as_ref().expect("pooled").to_vec2::<f32>()?;
+        assert_eq!(pooled_one.len(), 9 / 4);
+        assert_eq!(pooled_one[0].len(), 8);
+
+        // Token by token: None while len <= width, else the mask row.
+        let mut inc = QsaCache::default();
+        let mut rows: Vec<Option<Vec<f32>>> = Vec::new();
+        for i in 0..9 {
+            let m = qsa.mask(&mut inc, &xs.narrow(1, i, 1)?, i)?;
+            assert_eq!(m.is_some(), i + 1 > 5, "None while len <= width");
+            let row = match m {
+                Some(m) => Some(m.flatten_all()?.to_vec1::<f32>()?),
+                None => None,
+            };
+            rows.push(row);
+        }
+        // Raw keys keep growing; pooled holds complete blocks only.
+        assert_eq!(inc.keys.as_ref().unwrap().dim(0)?, 9);
+        let pooled_inc = inc.pooled.as_ref().unwrap().to_vec2::<f32>()?;
+        for (a, b) in pooled_one.iter().zip(&pooled_inc) {
+            assert!(approx_eq(a, b), "pooled parity {a:?} vs {b:?}");
+        }
+
+        // The incremental rows equal the one-shot rows (0.0 / -inf cells, so
+        // this is exact as long as the block selection agrees).
+        let full_flat = full.flatten_all()?.to_vec1::<f32>()?;
+        for (i, row) in rows.iter().enumerate() {
+            match row {
+                None => assert!(i < 5),
+                Some(r) => {
+                    assert_eq!(r.len(), i + 1);
+                    let want = &full_flat[i * 9..(i + 1) * 9];
+                    assert_eq!(r, &want[..i + 1], "mask row {i}");
+                }
+            }
+        }
+
+        // A rewind (offset moving backward) drops pooled blocks past len/r;
+        // appending at offset 5 over the 9-position cache must give the same
+        // row and pooled keys as a fresh 6-position run.
+        let mut rewound = inc.clone();
+        let m = qsa
+            .mask(&mut rewound, &xs.narrow(1, 0, 1)?, 5)?
+            .expect("mask at len 6");
+        assert_eq!(rewound.pooled.as_ref().unwrap().dim(0)?, 1);
+        let mut fresh = QsaCache::default();
+        let mf = qsa
+            .mask(&mut fresh, &xs.narrow(1, 0, 6)?, 0)?
+            .expect("fresh mask at len 6");
+        let m = m.flatten_all()?.to_vec1::<f32>()?;
+        let mf = mf.flatten_all()?.to_vec1::<f32>()?;
+        assert_eq!(m, mf[5 * 6..6 * 6], "rewound mask row");
+        let pf = fresh.pooled.as_ref().unwrap().to_vec2::<f32>()?;
+        let pr = rewound.pooled.as_ref().unwrap().to_vec2::<f32>()?;
+        for (a, b) in pf.iter().zip(&pr) {
+            assert!(approx_eq(a, b), "rewound pooled parity");
+        }
+        Ok(())
     }
 }
