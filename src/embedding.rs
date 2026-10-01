@@ -220,10 +220,12 @@ impl EmbeddingModel {
 
         let tensor = |reader: &mut R, name: &str| ct.tensor(reader, name, device);
 
-        // The token table stays quantized through the shared `TokenEmbedding`
-        // instead of being dequantized up front; when embeddings are tied the
-        // same tensor also serves as the LM head, so both hold clones of one
-        // `Arc` rather than two copies.
+        // The token table goes through the shared `TokenEmbedding`, kept
+        // quantized wherever the device can gather quantized rows instead of
+        // being dequantized up front.  When embeddings are tied the same
+        // tensor also serves as the LM head, and both hold clones of one
+        // `Arc`: quantized tables are shared without duplication, while
+        // float tables still dequantize into the head exactly as before.
         let tok_embeddings_q = Arc::new(tensor(reader, "token_embd.weight")?);
         let tok_embeddings =
             TokenEmbedding::from_arc(Arc::clone(&tok_embeddings_q), device)?;
