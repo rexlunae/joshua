@@ -24,7 +24,7 @@ use candle_core::quantized::k_quants::{
     BlockQ6K, BlockQ8K, BlockQ8_0, BlockQ8_1, GgmlType,
 };
 use candle_core::quantized::{GgmlDType, QTensor};
-use candle_core::{bail, Device, DType, Result, Tensor};
+use candle_core::{bail, Device, DType, Result, Storage, Tensor};
 use half::f16;
 
 /// Decode raw GGUF tensor bytes to f32, for the streamed (non-mmap) load
@@ -178,12 +178,26 @@ pub fn try_fast_cpu_qmatmul(qt: &QTensor, xs: &Tensor) -> Option<Result<Tensor>>
         return None;
     }
 
-    // Committed from here on: errors are returned, not swallowed.  (`ok()?`
-    // on the flatten: a non-materializable view simply has no fast path.)
-    let lhs = match xs.flatten_all().ok()?.to_vec1::<f32>() {
-        Ok(v) => v,
+    // Committed from here on: errors are returned, not swallowed.  The
+    // activations are borrowed straight out of candle's storage instead of
+    // copied into an owned Vec: `xs` is CPU, f32 and contiguous (all checked
+    // above), so the flat rows are `buf[start..start + m * k]` — identical
+    // values with zero copies.  (`flatten_all().to_vec1()` here malloc'd and
+    // memcpy'd all m·k activations on every call; the read guard is held for
+    // the kernels below, which only read `lhs` — `dst` is a separate buffer —
+    // so no aliasing.)
+    let (storage, layout) = xs.storage_and_layout();
+    let cpu = match &*storage {
+        Storage::Cpu(cpu) => cpu,
+        // The device was checked above; this arm is unreachable.
+        _ => return None,
+    };
+    let buf = match cpu.as_slice::<f32>() {
+        Ok(b) => b,
         Err(e) => return Some(Err(e)),
     };
+    let start = layout.start_offset();
+    let lhs = &buf[start..start + m * k];
     let bytes = match qt.data() {
         Ok(b) => b,
         Err(e) => return Some(Err(e)),
