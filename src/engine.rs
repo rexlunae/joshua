@@ -106,6 +106,7 @@ use std::time::Instant;
 use candle_core::quantized::gguf_file;
 use candle_core::{Device, Tensor};
 use memmap2::Mmap;
+use rand::distributions::{Distribution, WeightedIndex};
 use rand::thread_rng;
 use tokenizers::Tokenizer;
 
@@ -2445,6 +2446,7 @@ impl Engine {
     ) -> Result<DecodeOutcome> {
         let mut text = DecodeText::new(penalty_seed);
         let mut rng = thread_rng();
+        let mut sampler = SamplingWorkspace::default();
         let mut fed_tokens: Vec<u32> = Vec::new();
         let mut n_cur = start_pos;
         let decode_start = Instant::now();
@@ -2474,7 +2476,7 @@ impl Engine {
             let next_token = match pending.take() {
                 Some(t) => t,
                 None => {
-                    let t = sample_token(&logits_vec, options, &mut rng, &text.recent_tokens)?;
+                    let t = sampler.sample(&logits_vec, options, &mut rng, &text.recent_tokens)?;
                     if std::env::var_os("JOSHUA_DEBUG_TOKENS").is_some() {
                         let mut order: Vec<usize> = (0..logits_vec.len()).collect();
                         order.sort_by(|&a, &b| logits_vec[b].total_cmp(&logits_vec[a]));
@@ -4427,137 +4429,173 @@ fn squeeze_batch_logits(logits: &Tensor) -> Result<Vec<f32>> {
 
 // ─── Sampling ────────────────────────────────────────────────────────────────
 
-/// Sample the next token from a raw logit vector.
-///
-/// Implements repetition penalty, temperature scaling, top-k filtering,
-/// min-p filtering, top-p (nucleus) filtering, and weighted random sampling,
-/// all in pure Rust.
-fn sample_token(
-    logits: &[f32],
-    opts: &GenerationOptions,
-    rng: &mut impl rand::Rng,
-    recent_tokens: &[u32],
-) -> Result<u32> {
-    token_distribution(logits, opts, recent_tokens).sample(rng)
-}
-
-/// The next-token distribution [`sample_token`] draws from: the raw logits
-/// after the repetition penalty, temperature, top-k, min-p and top-p
-/// transforms.  Speculative verification checks draft tokens against it.
-fn token_distribution(
-    logits: &[f32],
-    opts: &GenerationOptions,
-    recent_tokens: &[u32],
-) -> TokenDist {
-    if logits.is_empty() {
-        return TokenDist::Greedy(0);
+    /// Sampling buffers retained across decode steps to avoid allocating vocabulary-sized
+    /// vectors and sort workspaces for every generated token.
+    #[derive(Default)]
+    struct SamplingWorkspace {
+        adjusted: Vec<f32>,
+        probs: Vec<f32>,
+        indexed: Vec<(usize, f32)>,
+        sorted_idx: Vec<usize>,
     }
 
-    // ── Repetition penalty ────────────────────────────────────────────────────
-    // For tokens present in the recent window, divide positive logits and
-    // multiply negative logits by `repetition_penalty` (> 1.0 discourages
-    // repetition; 1.0 is a no-op).  Applied before temperature so the penalty
-    // is independent of the temperature scale.
-    // NOTE: at temperature 0 the penalty is skipped entirely (pure greedy),
-    // unless JOSHUA_LEGACY_REPPEN is set — matching the semantics of every
-    // other sampler where a "temperature" of 0 means "take the argmax of the
-    // raw logits".
-    let reppen = if opts.temperature <= 0.0 && std::env::var_os("JOSHUA_LEGACY_REPPEN").is_none() {
-        1.0
-    } else {
-        opts.repetition_penalty
-    };
-    let logits: Vec<f32> = if reppen != 1.0 {
-        let mut v = logits.to_vec();
-        for &token in recent_tokens {
-            if let Some(l) = v.get_mut(token as usize) {
-                if *l > 0.0 {
-                    *l /= reppen;
+    enum SamplingKind {
+        Greedy(u32),
+        Probs,
+    }
+
+    impl SamplingWorkspace {
+        fn sample(
+            &mut self,
+            logits: &[f32],
+            opts: &GenerationOptions,
+            rng: &mut impl rand::Rng,
+            recent_tokens: &[u32],
+        ) -> Result<u32> {
+            match self.fill(logits, opts, recent_tokens) {
+                SamplingKind::Greedy(token) => Ok(token),
+                SamplingKind::Probs => {
+                    let dist = WeightedIndex::new(self.probs.iter().copied())
+                        .map_err(|e| JoshuaError::Inference(e.to_string()))?;
+                    Ok(dist.sample(rng) as u32)
+                }
+            }
+        }
+
+        fn fill(
+            &mut self,
+            logits: &[f32],
+            opts: &GenerationOptions,
+            recent_tokens: &[u32],
+        ) -> SamplingKind {
+            if logits.is_empty() {
+                return SamplingKind::Greedy(0);
+            }
+            // ── Repetition penalty ────────────────────────────────────────────────────
+            // For tokens present in the recent window, divide positive logits and
+            // multiply negative logits by `repetition_penalty` (> 1.0 discourages
+            // repetition; 1.0 is a no-op).  Applied before temperature so the penalty
+            // is independent of the temperature scale.
+            // NOTE: at temperature 0 the penalty is skipped entirely (pure greedy),
+            // unless JOSHUA_LEGACY_REPPEN is set — matching the semantics of every
+            // other sampler where a "temperature" of 0 means "take the argmax of the
+            // raw logits".
+            let reppen =
+                if opts.temperature <= 0.0 && std::env::var_os("JOSHUA_LEGACY_REPPEN").is_none() {
+                    1.0
                 } else {
-                    *l *= reppen;
+                    opts.repetition_penalty
+                };
+            let logits = if reppen != 1.0 && !recent_tokens.is_empty() {
+                self.adjusted.clear();
+                self.adjusted.extend_from_slice(logits);
+                let v = &mut self.adjusted;
+                for &token in recent_tokens {
+                    if let Some(l) = v.get_mut(token as usize) {
+                        if *l > 0.0 {
+                            *l /= reppen;
+                        } else {
+                            *l *= reppen;
+                        }
+                    }
+                }
+                v.as_slice()
+            } else {
+                logits
+            };
+
+            // ── Greedy ────────────────────────────────────────────────────────────────
+            if opts.temperature <= 0.0 {
+                return SamplingKind::Greedy(argmax(logits));
+            }
+
+            // ── Temperature scaling ───────────────────────────────────────────────────
+            let inv_temp = 1.0_f32 / opts.temperature;
+            // Subtract max for numerical stability before exp.
+            let max_logit = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let probs = &mut self.probs;
+            probs.clear();
+            probs.extend(logits.iter().map(|&l| ((l - max_logit) * inv_temp).exp()));
+
+            // ── Top-k ─────────────────────────────────────────────────────────────────
+            let k = opts.top_k as usize;
+            if k > 0 && k < probs.len() {
+                let indexed = &mut self.indexed;
+                indexed.clear();
+                indexed.extend(probs.iter().copied().enumerate());
+                indexed.sort_unstable_by(|(_, a), (_, b)| {
+                    b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                for &(idx, _) in indexed.iter().skip(k) {
+                    probs[idx] = 0.0;
                 }
             }
-        }
-        v
-    } else {
-        logits.to_vec()
-    };
 
-    // ── Greedy ────────────────────────────────────────────────────────────────
-    if opts.temperature <= 0.0 {
-        return TokenDist::Greedy(argmax(&logits));
-    }
-
-    // ── Temperature scaling ───────────────────────────────────────────────────
-    let inv_temp = 1.0_f32 / opts.temperature;
-    // Subtract max for numerical stability before exp.
-    let max_logit = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let mut probs: Vec<f32> = logits
-        .iter()
-        .map(|&l| ((l - max_logit) * inv_temp).exp())
-        .collect();
-
-    // ── Top-k ─────────────────────────────────────────────────────────────────
-    let k = opts.top_k as usize;
-    if k > 0 && k < probs.len() {
-        let mut indexed: Vec<(usize, f32)> = probs.iter().copied().enumerate().collect();
-        indexed.sort_unstable_by(|(_, a), (_, b)| {
-            b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
-        });
-        for &(idx, _) in indexed.iter().skip(k) {
-            probs[idx] = 0.0;
-        }
-    }
-
-    // ── Min-p ─────────────────────────────────────────────────────────────────
-    if opts.min_p > 0.0 {
-        let max_p = probs.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let threshold = max_p * opts.min_p;
-        for p in &mut probs {
-            if *p < threshold {
-                *p = 0.0;
-            }
-        }
-    }
-
-    // ── Top-p (nucleus) ───────────────────────────────────────────────────────
-    if opts.top_p < 1.0 && opts.top_p > 0.0 {
-        let sum: f32 = probs.iter().sum();
-        if sum > 0.0 {
-            let mut sorted_idx: Vec<usize> = (0..probs.len()).collect();
-            sorted_idx.sort_unstable_by(|&a, &b| {
-                probs[b]
-                    .partial_cmp(&probs[a])
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            let mut cumsum = 0.0_f32;
-            let mut cut_from = probs.len();
-            for (rank, &idx) in sorted_idx.iter().enumerate() {
-                cumsum += probs[idx] / sum;
-                if cumsum > opts.top_p {
-                    cut_from = rank + 1;
-                    break;
+            // ── Min-p ─────────────────────────────────────────────────────────────────
+            if opts.min_p > 0.0 {
+                let max_p = probs.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let threshold = max_p * opts.min_p;
+                for p in probs.iter_mut() {
+                    if *p < threshold {
+                        *p = 0.0;
+                    }
                 }
             }
-            for &idx in sorted_idx.iter().skip(cut_from) {
-                probs[idx] = 0.0;
+
+            // ── Top-p (nucleus) ───────────────────────────────────────────────────────
+            if opts.top_p < 1.0 && opts.top_p > 0.0 {
+                let sum: f32 = probs.iter().sum();
+                if sum > 0.0 {
+                    let sorted_idx = &mut self.sorted_idx;
+                    sorted_idx.clear();
+                    sorted_idx.extend(0..probs.len());
+                    sorted_idx.sort_unstable_by(|&a, &b| {
+                        probs[b]
+                            .partial_cmp(&probs[a])
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    let mut cumsum = 0.0_f32;
+                    let mut cut_from = probs.len();
+                    for (rank, &idx) in sorted_idx.iter().enumerate() {
+                        cumsum += probs[idx] / sum;
+                        if cumsum > opts.top_p {
+                            cut_from = rank + 1;
+                            break;
+                        }
+                    }
+                    for &idx in sorted_idx.iter().skip(cut_from) {
+                        probs[idx] = 0.0;
+                    }
+                }
             }
+
+            // ── Normalise & sample ────────────────────────────────────────────────────
+            let total: f32 = probs.iter().sum();
+            if total <= 0.0 {
+                // Fallback: greedy from original (penalty-adjusted) logits.
+                return SamplingKind::Greedy(argmax(logits));
+            }
+
+            for p in probs.iter_mut() {
+                *p /= total;
+            }
+            SamplingKind::Probs
         }
     }
 
-    // ── Normalise & sample ────────────────────────────────────────────────────
-    let total: f32 = probs.iter().sum();
-    if total <= 0.0 {
-        // Fallback: greedy from original (penalty-adjusted) logits.
-        return TokenDist::Greedy(argmax(&logits));
+    /// Materialize an owned distribution for speculative verification. Ordinary
+    /// decode keeps scratch buffers and samples directly from them.
+    fn token_distribution(
+        logits: &[f32],
+        opts: &GenerationOptions,
+        recent_tokens: &[u32],
+    ) -> TokenDist {
+        let mut scratch = SamplingWorkspace::default();
+        match scratch.fill(logits, opts, recent_tokens) {
+            SamplingKind::Greedy(token) => TokenDist::Greedy(token),
+            SamplingKind::Probs => TokenDist::Probs(scratch.probs),
+        }
     }
-
-    for p in &mut probs {
-        *p /= total;
-    }
-
-    TokenDist::Probs(probs)
-}
 
 /// Index of the largest logit (0 for an empty vector).
 fn argmax(logits: &[f32]) -> u32 {
