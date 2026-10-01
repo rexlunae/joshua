@@ -252,6 +252,36 @@ block-quantized weights stay in their GGUF format on the device.
 On Linux, `JOSHUA_SYCL_RUNTIME` can point to `libsycl.so.9` to preload
 the oneAPI runtime when it is not on the system library path.
 
+**Linux bring-up checklist.** The most common failure is
+`sycl open: no SYCL devices visible` (previously the same condition was
+reported misleadingly as `device ordinal out of range`) when the machine has
+an Intel GPU installed. That error fires when *no* SYCL device is
+enumerable at all. The usual cause is the oneAPI UR (Unified Runtime)
+`level_zero` adapter's own dependencies being missing: the Level Zero driver
+itself (`libze_intel_gpu.so.1`, part of the NEO package) is present, but
+nothing loads it without these three:
+
+- **Level Zero loader** `libze_loader.so.1` — no distro package on some
+  releases; grab the `libze1` deb from the
+  [level-zero releases](https://github.com/oneapi-src/level-zero/releases).
+- **UMF** `libumf.so.1` — bundled under
+  `/opt/intel/oneapi/umf/<ver>/lib` but not ldconfig-indexed.
+- **hwloc** `libhwloc.so.15` — bundled under
+  `/opt/intel/oneapi/tcm/<ver>/lib`.
+
+Preflight before blaming `JOSHUA_SYCL_LIBRARY` or the runtime path:
+
+```bash
+sycl-ls --verbose   # prints every failed UR adapter with its missing .so
+export LD_LIBRARY_PATH=/opt/intel/oneapi/umf/1.1/lib:/opt/intel/oneapi/tcm/1.5/lib:$LD_LIBRARY_PATH
+source /opt/intel/oneapi/compiler/latest/env/vars.sh
+sycl-ls             # -> [level_zero:gpu] Intel Arc ...
+```
+
+Less often, `ONEAPI_DEVICE_SELECTOR` (or a restricted filter) can hide
+every device; unset it and re-run `sycl-ls` to rule that out. Once `sycl-ls`
+lists the card, joshua works unchanged.
+
 ### Models larger than VRAM
 
 A sparse MoE model is mostly routed experts, and a GPU that cannot hold all

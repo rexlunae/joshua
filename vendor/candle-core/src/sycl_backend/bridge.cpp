@@ -98,7 +98,23 @@ API int joshua_sycl_open(size_t ordinal, uintptr_t* out) noexcept {
         auto devices = sycl::device::get_devices();
         auto gpu = std::find_if(devices.begin(), devices.end(), [](auto& d) { return d.is_gpu(); });
         if (gpu != devices.end()) devices.erase(std::remove_if(devices.begin(), devices.end(), [](auto& d) { return !d.is_gpu(); }), devices.end());
-        require(ordinal < devices.size(), "SYCL device ordinal out of range (or no device available)");
+        // Two very different conditions share one error today: an empty
+        // device list (the usual failure - the oneAPI UR adapter's own deps,
+        // level-zero loader / UMF / hwloc, are missing so no device is even
+        // enumerable) and a genuinely too-large ordinal.  Give the empty
+        // case an actionable message pointing at sycl-ls, and include the
+        // visible count for the ordinal case.
+        if (devices.empty()) {
+            throw std::runtime_error(
+                "no SYCL devices visible; run `sycl-ls --verbose` and check that the Level Zero "
+                "loader (libze_loader.so.1), UMF (libumf.so.1) and hwloc (libhwloc.so.15) load -- "
+                "oneAPI bundles them under /opt/intel/oneapi/{umf,tcm}/<ver>/lib");
+        }
+        if (ordinal >= devices.size()) {
+            std::string msg = "SYCL device ordinal out of range: requested " + std::to_string(ordinal)
+                + " but only " + std::to_string(devices.size()) + " device(s) visible";
+            throw std::runtime_error(msg);
+        }
         auto dev = devices[ordinal];
         require(dev.has(sycl::aspect::usm_device_allocations), "SYCL device has no device USM support");
         require(dev.get_info<sycl::info::device::max_work_group_size>() >= 64, "SYCL backend requires workgroups of 64 invocations");

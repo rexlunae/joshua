@@ -74,11 +74,28 @@ impl Drop for ContextOpenGuard {
 pub struct SyclDevice { gpu_id: usize, inner: Arc<SyclContext> }
 fn sycl_error(_code: i32, op: &str) -> Error { bridge::error(op) }
 impl SyclDevice {
+    fn enrich_open_error(e: crate::Error) -> crate::Error {
+        // Bridge reports an empty device list (the usual Linux bring-up
+        // failure: the UR level_zero adapter's own deps are missing) with a
+        // distinctive prefix.  Surface the preflight command next to it so the
+        // user is pointed at the actual cause instead of blaming the runtime.
+        if e.to_string().contains("no SYCL devices visible") {
+            crate::Error::Msg(format!("{e}
+
+Run `sycl-ls --verbose` to see which UR adapters fail; a missing
+Level Zero loader (libze_loader.so.1), UMF (libumf.so.1) or hwloc
+(libhwloc.so.15) enumerates zero devices. oneAPI bundles UMF/hwloc
+under /opt/intel/oneapi/{{umf,tcm}}/<ver>/lib."))
+        } else {
+            e
+        }
+    }
+
     pub fn new(gpu_id: usize) -> Result<Self> {
         // build_inner guarantees the raw context handle is closed on every
         // failure path (via the open guard or the owning SyclContext Drop), so
         // a failed initialization can never leak a SYCL runtime context.
-        let context = bridge::open(gpu_id)?;
+        let context = bridge::open(gpu_id).map_err(Self::enrich_open_error)?;
         Ok(Self { gpu_id, inner: Self::build_inner(context)? })
     }
 
