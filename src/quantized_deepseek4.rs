@@ -42,7 +42,7 @@ use candle_nn::ops::{sigmoid, silu, softmax};
 use candle_transformers::quantized_nn::RmsNorm;
 
 use crate::gguf_ext::GgufHeader;
-use crate::mhc::{collapse as hc_collapse, post as hc_post, rms_rows, HcMix};
+use crate::mhc::{collapse as hc_collapse, post as hc_post, rms_rows, HcMix, HyperConnection};
 use crate::gguf_meta::Meta;
 use crate::ngram::grouped_rms;
 use crate::yarn::YarnConfig;
@@ -905,12 +905,6 @@ fn build_device_pool(
 
 // ─── HC (hyper-computation) stream mixing ───────────────────────────────────
 
-/// A sublayer's mixing coefficients from the stream `x` (`[b, s, hc, d]`)
-/// under this model's norm eps and Sinkhorn settings.
-fn hc_mixes(x: &Tensor, hc_fn: &QMatMul, hc_scale: &Tensor, hc_base: &Tensor, cfg: &Config) -> Result<HcMix> {
-    crate::mhc::mixes(x, hc_fn, hc_scale, hc_base, cfg.rms_eps, cfg.hc_sinkhorn_iters, cfg.hc_eps)
-}
-
 /// The hyper-connection stream between sublayers: the `hc` copies, plus —
 /// for DeepSeek-V4.1, whose sublayers collapse with the mix the *previous*
 /// sublayer computed — that carried pre-mix.
@@ -940,14 +934,8 @@ impl Stream {
     /// Enter a sublayer: its mixes, and the stream collapsed with the carried
     /// pre-mix (V4.1) or its own (V4).  Returns `(x, mix)`; `mix.pre` is what
     /// the next sublayer carries.
-    fn enter(
-        &self,
-        hc_fn: &QMatMul,
-        hc_scale: &Tensor,
-        hc_base: &Tensor,
-        cfg: &Config,
-    ) -> Result<(Tensor, HcMix)> {
-        let mix = hc_mixes(&self.xs, hc_fn, hc_scale, hc_base, cfg)?;
+    fn enter(&self, hc: &HyperConnection, cfg: &Config) -> Result<(Tensor, HcMix)> {
+        let mix = hc.mixes(&self.xs, cfg.rms_eps, cfg.hc_sinkhorn_iters, cfg.hc_eps)?;
         let x = hc_collapse(&self.xs, self.pre.as_ref().unwrap_or(&mix.pre))?;
         Ok((x, mix))
     }
@@ -2604,12 +2592,8 @@ struct Layer {
     attn: Attention,
     ffn_norm: RmsNorm,
     ffn: FeedForward,
-    hc_attn_fn: QMatMul,
-    hc_attn_base: Tensor,
-    hc_attn_scale: Tensor,
-    hc_ffn_fn: QMatMul,
-    hc_ffn_base: Tensor,
-    hc_ffn_scale: Tensor,
+    hc_attn: HyperConnection,
+    hc_ffn: HyperConnection,
 }
 
 enum FeedForward {
@@ -2667,11 +2651,11 @@ impl Layer {
             }
             stream.xs = eg.forward(&stream.xs, ecfg.rows(eg.index, history, offset, seq))?;
         }
-        let (x, mix) = stream.enter(&self.hc_attn_fn, &self.hc_attn_scale, &self.hc_attn_base, cfg)?;
+        let (x, mix) = stream.enter(&self.hc_attn, cfg)?;
         let h = self.attn_norm.forward(&x)?;
         let h = self.attn.forward(kvs, l, &h, offset, max_seq)?;
         let stream = stream.leave(&h, mix, cfg.v41)?;
-        let (x, mix) = stream.enter(&self.hc_ffn_fn, &self.hc_ffn_scale, &self.hc_ffn_base, cfg)?;
+        let (x, mix) = stream.enter(&self.hc_ffn, cfg)?;
         Ok(FfnInput {
             h: self.ffn_norm.forward(&x)?,
             stream,
@@ -2733,6 +2717,21 @@ impl Shared {
     /// Collapse the final stream and project to f32 logits — for the last
     /// position only (`last_only`), or for every row.
     fn logits(&self, stream: &Stream, last_only: bool) -> Result<Tensor> {
+        // Normal prefill needs only the final row. Select it before the
+        // learned head and collapse; verification still processes every row.
+        let stream = if last_only {
+            let last = stream.xs.dim(1)?.saturating_sub(1);
+            Stream {
+                xs: stream.xs.narrow(1, last, 1)?,
+                pre: stream
+                    .pre
+                    .as_ref()
+                    .map(|pre| pre.narrow(1, last, 1))
+                    .transpose()?,
+            }
+        } else {
+            stream.clone()
+        };
         let (_, seq, hc, d) = stream.xs.dims4()?;
         let pre = match (&self.hc_head, &stream.pre) {
             // pre = sigmoid(mixes * scale + base) + eps
@@ -2747,7 +2746,6 @@ impl Shared {
             (None, None) => candle_core::bail!("deepseek4: no hyper-connection head"),
         };
         let y = hc_collapse(&stream.xs, &pre)?.squeeze(0)?; // [s, d]
-        let y = if last_only { y.narrow(0, seq - 1, 1)? } else { y };
         let y = self.norm.forward(&y)?;
         self.output.forward(&y)?.to_dtype(DType::F32)
     }
@@ -2951,6 +2949,13 @@ impl<R: Read + Seek> Reader<R> {
         self.qtensor(name)?
             .dequantize(&self.device)?
             .to_dtype(DType::F32)
+    }
+    fn hyper_connection(&mut self, p: &str) -> Result<HyperConnection> {
+        HyperConnection::new(
+            self.qmatmul(&format!("{p}_fn.weight"))?,
+            self.f32_tensor(&format!("{p}_base.weight"))?,
+            &self.f32_tensor(&format!("{p}_scale.weight"))?,
+        )
     }
     fn has(&self, name: &str) -> bool {
         // `ct` only carries tensors whose dtype candle can name; the raw
@@ -3311,12 +3316,8 @@ impl ModelWeights {
                 ffn_norm,
                 ffn,
                 engram,
-                hc_attn_fn: rd.qmatmul(&format!("{p}.hc_attn_fn.weight"))?,
-                hc_attn_base: rd.f32_tensor(&format!("{p}.hc_attn_base.weight"))?,
-                hc_attn_scale: rd.f32_tensor(&format!("{p}.hc_attn_scale.weight"))?,
-                hc_ffn_fn: rd.qmatmul(&format!("{p}.hc_ffn_fn.weight"))?,
-                hc_ffn_base: rd.f32_tensor(&format!("{p}.hc_ffn_base.weight"))?,
-                hc_ffn_scale: rd.f32_tensor(&format!("{p}.hc_ffn_scale.weight"))?,
+                hc_attn: rd.hyper_connection(&format!("{p}.hc_attn"))?,
+                hc_ffn: rd.hyper_connection(&format!("{p}.hc_ffn"))?,
             });
         }
 
@@ -4138,7 +4139,7 @@ impl crate::stream_prefill::StreamPrefill for ModelWeights {
         let tok = self
             .shared
             .tok_embeddings
-            .forward(&Tensor::new(tokens.to_vec(), device)?.unsqueeze(0)?)?
+            .forward(&Tensor::new(tokens, device)?.unsqueeze(0)?)?
             .reshape((1, tokens.len(), d))?;
         Stream::from_embeddings(&tok, hc, self.shared.cfg.v41)?.pack()
     }
@@ -4185,7 +4186,7 @@ impl ModelWeights {
             &self.history,
             self.shared.max_seq,
         )?;
-        let input = Tensor::new(tokens.to_vec(), &self.shared.device)?.unsqueeze(0)?;
+        let input = Tensor::new(tokens, &self.shared.device)?.unsqueeze(0)?;
         let (h, routed_ids) = layer.ffn.forward(&ffn_in.h, &input, self.stream_ctx.clone())?;
         self.last_routed[l] = routed_ids;
         // Advisory: routing recording feeds the (hot-expert) prefetch policy,

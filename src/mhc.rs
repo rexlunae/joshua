@@ -33,10 +33,10 @@ pub fn split_sinkhorn(
     iters: usize,
     eps: f64,
 ) -> Result<HcMix> {
-    let shape = mixes.shape().dims().to_vec();
-    let n = shape[..shape.len() - 1].iter().product::<usize>();
-    let m = mixes.reshape((n, (2 + hc) * hc))?;
+    split_sinkhorn_with_scale(mixes, &read_scale(scale)?, base, hc, iters, eps)
+}
 
+fn read_scale(scale: &Tensor) -> Result<[f64; 3]> {
     let s: Vec<f32> = scale.flatten_all()?.to_vec1()?;
     if s.len() < 3 {
         candle_core::bail!(
@@ -45,20 +45,34 @@ pub fn split_sinkhorn(
         );
     }
 
+    Ok([s[0] as f64, s[1] as f64, s[2] as f64])
+}
+
+fn split_sinkhorn_with_scale(
+    mixes: &Tensor,
+    scale: &[f64; 3],
+    base: &Tensor,
+    hc: usize,
+    iters: usize,
+    eps: f64,
+) -> Result<HcMix> {
+    let shape = mixes.dims();
+    let n = shape[..shape.len() - 1].iter().product::<usize>();
+    let m = mixes.reshape((n, (2 + hc) * hc))?;
     let pre = sigmoid(
         &m.narrow(D::Minus1, 0, hc)?
-            .affine(s[0] as f64, 0.0)?
+            .affine(scale[0], 0.0)?
             .broadcast_add(&base.narrow(0, 0, hc)?)?,
     )?
     .affine(1.0, eps)?;
     let post = (sigmoid(
         &m.narrow(D::Minus1, hc, hc)?
-            .affine(s[1] as f64, 0.0)?
+            .affine(scale[1], 0.0)?
             .broadcast_add(&base.narrow(0, hc, hc)?)?,
     )? * 2.0)?;
     let comb0 = m
         .narrow(D::Minus1, 2 * hc, hc * hc)?
-        .affine(s[2] as f64, 0.0)?
+        .affine(scale[2], 0.0)?
         .broadcast_add(&base.narrow(0, 2 * hc, hc * hc)?)?;
     let comb0 = comb0.reshape((n, hc, hc))?;
 
@@ -89,11 +103,16 @@ pub fn mixes(
     iters: usize,
     eps: f64,
 ) -> Result<HcMix> {
+    let (mixes, hc) = project_mixes(x, hc_fn, rms_eps)?;
+    split_sinkhorn(&mixes, scale, base, hc, iters, eps)
+}
+
+fn project_mixes(x: &Tensor, hc_fn: &QMatMul, rms_eps: f64) -> Result<(Tensor, usize)> {
     let (b, s, hc, d) = x.dims4()?;
     let flat = x.reshape((b * s, hc * d))?;
     let mixes = hc_fn.forward(&rms_rows(&flat, rms_eps)?)?; // [b*s, (2+hc)*hc]
     let mixes = mixes.reshape((b, s, (2 + hc) * hc))?;
-    split_sinkhorn(&mixes, scale, base, hc, iters, eps)
+    Ok((mixes, hc))
 }
 
 /// Unweighted RMS norm over the last dim.
@@ -132,15 +151,31 @@ pub fn post(x: &Tensor, residual: &Tensor, post: &Tensor, comb: &Tensor) -> Resu
     (post_t * x_t)?.add(&comb_src)
 }
 
-/// One sublayer's mixer weights (`{p}_fn`, `{p}_base`, `{p}_scale`) and
-/// Sinkhorn settings.
+/// One sublayer's immutable mixer weights (`{p}_fn`, `{p}_base`, `{p}_scale`).
+/// The three scalar scales are read once at construction, avoiding a device
+/// readback (and synchronization) at every sublayer on every forward pass.
 pub struct HyperConnection {
-    pub hc_fn: QMatMul,
-    pub base: Tensor,
-    pub scale: Tensor,
+    hc_fn: QMatMul,
+    base: Tensor,
+    scale: [f64; 3],
 }
 
 impl HyperConnection {
+    pub fn new(hc_fn: QMatMul, base: Tensor, scale: &Tensor) -> Result<Self> {
+        Ok(Self {
+            hc_fn,
+            base,
+            scale: read_scale(scale)?,
+        })
+    }
+
+    /// Compute this sublayer's mixes without reading constant weights back
+    /// from the device. V4.1 carries `pre` to the next sublayer.
+    pub fn mixes(&self, x: &Tensor, rms_eps: f64, iters: usize, eps: f64) -> Result<HcMix> {
+        let (mixes, hc) = project_mixes(x, &self.hc_fn, rms_eps)?;
+        split_sinkhorn_with_scale(&mixes, &self.scale, &self.base, hc, iters, eps)
+    }
+
     /// Enter the sublayer: its mixes, and the copies `x` (`[b, s, hc, d]`)
     /// collapsed with `pre`.
     pub fn enter(
@@ -150,7 +185,7 @@ impl HyperConnection {
         iters: usize,
         eps: f64,
     ) -> Result<(Tensor, HcMix)> {
-        let mix = mixes(x, &self.hc_fn, &self.scale, &self.base, rms_eps, iters, eps)?;
+        let mix = self.mixes(x, rms_eps, iters, eps)?;
         Ok((collapse(x, &mix.pre)?, mix))
     }
 }
