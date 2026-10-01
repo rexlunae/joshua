@@ -13,11 +13,6 @@ changes out of the patch.
 - Look for work repeated per token, layer, expert, or request that depends only
   on model weights or configuration. Compute immutable values at load time;
   reuse scratch buffers when their lifetime and concurrency rules allow it.
-- Measure representative inputs and the backend being optimized. Warm up
-  kernels and page caches, alternate old/new runs where possible, and include
-  device synchronization in accelerator timings. State whether a result is a
-  microbenchmark or full-model measurement. Do not claim a throughput gain
-  from a microbenchmark alone.
 
 ## Avoid unnecessary copies and synchronization
 
