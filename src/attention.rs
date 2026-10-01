@@ -207,8 +207,11 @@ pub fn repeat_kv(x: Tensor, n_rep: usize) -> Result<Tensor> {
 /// buffers grow geometrically, so a generation pays the O(T) total of the
 /// doubling copies instead of O(T²).
 ///
-/// Clones share the `Arc`-backed buffers: a clone is a snapshot only until
-/// either side appends.  Session state is never cloned in the loaders.
+/// Clones share the `Arc`-backed buffers: a clone is a read-only snapshot
+/// only while nobody appends to it.  Appending to any clone rewrites rows
+/// the other clones still read — truncating a clone and appending then
+/// corrupts the original's history — so fork session state by building
+/// fresh caches, never by cloning; the loaders never clone layer state.
 #[derive(Clone)]
 pub struct SeqKvCache {
     k: Tensor, // [b, n_kv, dk, cap]
@@ -219,9 +222,11 @@ pub struct SeqKvCache {
 /// One layer's optional KV cache, created on the layer's first forward.
 pub type KvCache = Option<SeqKvCache>;
 
-/// Capacity of a freshly created cache: enough rows for a small prefill or
-/// this many decode steps before the first doubling.
-const KV_CACHE_INITIAL_CAP: usize = 512;
+/// Capacity floor for a freshly created cache: the first block reserves
+/// twice its length (room for the first decode steps), but at least this
+/// many rows, and growth doubles from there — so a short session does not
+/// reserve a fixed context per layer.
+const KV_CACHE_MIN_CAP: usize = 16;
 
 /// Keep only the first `keep` cached positions; `keep == 0` drops the cache.
 /// The buffers stay allocated (subsequent appends overwrite the freed tail),
@@ -298,7 +303,7 @@ impl SeqKvCache {
         let (b, n_kv, seq, dk) = k_new.dims4()?;
         let (_, _, _, dv) = v_new.dims4()?;
         let dev = k_new.device();
-        let cap = seq.max(KV_CACHE_INITIAL_CAP);
+        let cap = (seq * 2).max(KV_CACHE_MIN_CAP);
         Ok(Self {
             k: Tensor::zeros((b, n_kv, cap, dk), k_new.dtype(), dev)?,
             v: Tensor::zeros((b, n_kv, cap, dv), v_new.dtype(), dev)?,
@@ -312,35 +317,44 @@ impl SeqKvCache {
     }
 
     /// The key buffer `[b, n_kv, cap, dk]`: `cap` rows allocated, the first
-    /// [`Self::len`] holding the cached positions.
-    pub fn k(&self) -> &Tensor {
+    /// [`Self::len`] holding the cached positions.  Crate-visible for the
+    /// loader tests and diagnostics; clones share storage (see the type
+    /// docs).
+    pub(crate) fn k(&self) -> &Tensor {
         &self.k
     }
 
     /// The value buffer `[b, n_kv, cap, dv]`.
-    pub fn v(&self) -> &Tensor {
+    pub(crate) fn v(&self) -> &Tensor {
         &self.v
     }
 
     /// Append `k_new`/`v_new` (`[b, n_kv, seq, d]`) at the tail, growing the
     /// buffers geometrically when they are full.
+    ///
+    /// The inputs must not alias (a clone of) the cache's own buffers: the
+    /// copy holds a read lock on the source storage while holding the write
+    /// lock on the destination, so the same lock twice would deadlock.
+    /// Shapes are validated before any row is written, so a mismatch leaves
+    /// the cache untouched.
     pub fn append(&mut self, k_new: &Tensor, v_new: &Tensor) -> Result<()> {
         let (b, n_kv, seq, dk) = k_new.dims4()?;
-        let (_, vn_kv, vseq, _) = v_new.dims4()?;
-        if (vn_kv, vseq) != (n_kv, seq) || self.k.dim(0)? != b || self.k.dim(1)? != n_kv {
+        let (vb, vn_kv, vseq, vd) = v_new.dims4()?;
+        let (cb, cn_kv, _, ck_d) = self.k.dims4()?;
+        let (_, _, _, cv_d) = self.v.dims4()?;
+        if (vb, vn_kv, vseq) != (b, n_kv, seq)
+            || (cb, cn_kv) != (b, n_kv)
+            || ck_d != dk
+            || cv_d != vd
+        {
             bail!(
-                "KV cache shape mismatch: k {k_new:?}, v {v_new:?}, cache k {:?}",
-                self.k.dims()
+                "KV cache shape mismatch: k {k_new:?}, v {v_new:?}, cache k {:?} v {:?}",
+                self.k.dims(),
+                self.v.dims()
             )
         }
         let k_new = k_new.contiguous()?;
         let v_new = v_new.contiguous()?;
-        if self.k.dim(3)? != dk {
-            bail!(
-                "KV cache key width mismatch: new {dk}, cache {}",
-                self.k.dim(3)?
-            )
-        }
         let cap = self.k.dim(2)?;
         if self.len + seq > cap {
             self.grow(self.len + seq)?;
@@ -507,10 +521,10 @@ mod tests {
         assert_eq!(cache.len(), total, "cache tracks the appended positions");
         assert_eq!(
             cache.k.dims(),
-            &[b, n_kv, KV_CACHE_INITIAL_CAP, d],
+            &[b, n_kv, KV_CACHE_MIN_CAP, d],
             "the cache keeps the un-repeated KV heads in preallocated buffers"
         );
-        assert_eq!(cache.v.dims(), &[b, n_kv, KV_CACHE_INITIAL_CAP, dv]);
+        assert_eq!(cache.v.dims(), &[b, n_kv, KV_CACHE_MIN_CAP, dv]);
         Ok(())
     }
 
@@ -561,6 +575,104 @@ mod tests {
         let want: Vec<f32> = (0..b * n_kv * d).map(|x| (999 + x) as f32).collect();
         assert_eq!(tail, want, "the new row overwrote the freed tail");
         Ok(())
+    }
+
+    /// Append, growth, truncate, and grouped attention on a supported
+    /// accelerator — the same checks as the CPU tests, per enabled backend
+    /// feature (nothing runs on the CPU-only default build).
+    #[cfg(any(feature = "metal", feature = "cuda", feature = "vulkan"))]
+    fn device_cache_checks(dev: &Device) -> Result<()> {
+        let cpu = Device::Cpu;
+        let (b, n_head, n_kv, d, dv) = (1usize, 4usize, 2usize, 6usize, 5usize);
+        let rep = n_head / n_kv;
+        let scale = 0.37;
+        let total = 5usize;
+        let prefill = 3usize;
+        let q = Tensor::randn(0f32, 1f32, (b, n_head, total, d), &cpu)?.to_device(dev)?;
+        let k = Tensor::randn(0f32, 1f32, (b, n_kv, total, d), &cpu)?.to_device(dev)?;
+        let v = Tensor::randn(0f32, 1f32, (b, n_kv, total, dv), &cpu)?.to_device(dev)?;
+
+        let mut kv: KvCache = None;
+        let mut got = cached_attention(
+            &mut kv,
+            &q.narrow(2, 0, prefill)?,
+            k.narrow(2, 0, prefill)?,
+            v.narrow(2, 0, prefill)?,
+            Some(&crate::moe::causal_mask(prefill, 0, dev)?),
+            scale,
+        )?;
+        for i in prefill..total {
+            let ctx = cached_attention(
+                &mut kv,
+                &q.narrow(2, i, 1)?,
+                k.narrow(2, i, 1)?,
+                v.narrow(2, i, 1)?,
+                None,
+                scale,
+            )?;
+            got = Tensor::cat(&[got, ctx], 1)?;
+        }
+        let (kr, vr) = (repeat_kv(k.clone(), rep)?, repeat_kv(v.clone(), rep)?);
+        let scores = (q.matmul(&kr.t()?)? * scale)?
+            .broadcast_add(&crate::moe::causal_mask(total, 0, dev)?)?;
+        let want = softmax_last_dim(&scores)?
+            .matmul(&vr)?
+            .transpose(1, 2)?
+            .contiguous()?
+            .reshape((b, total, n_head * dv))?;
+        let max = (got - want)?
+            .abs()?
+            .flatten_all()?
+            .max(0)?
+            .to_scalar::<f32>()?;
+        assert!(max < 1e-4, "grouped attention diverges on {dev:?}: {max}");
+
+        // Growth past the initial capacity, then truncate-then-overwrite.
+        let mut cache = Some(SeqKvCache::new(&k.narrow(2, 0, 1)?, &v.narrow(2, 0, 1)?)?);
+        let c = cache.as_mut().unwrap();
+        assert_eq!(c.k().dims()[2], KV_CACHE_MIN_CAP);
+        for i in 1..KV_CACHE_MIN_CAP + 2 {
+            c.append(&k.narrow(2, i % total, 1)?, &v.narrow(2, i % total, 1)?)?;
+        }
+        assert_eq!(c.len(), KV_CACHE_MIN_CAP + 1);
+        let cap_before = c.k().dims()[2];
+        assert!(cap_before >= c.len(), "buffers grew past the initial capacity");
+        let kept: Vec<f32> = c
+            .k()
+            .narrow(2, 0, 2)?
+            .flatten_all()?
+            .to_vec1()?;
+        truncate_kv(&mut cache, 2);
+        let c = cache.as_mut().unwrap();
+        assert_eq!(c.len(), 2);
+        assert_eq!(c.k().dims()[2], cap_before, "buffers stay allocated");
+        c.append(&k.narrow(2, 0, 1)?, &v.narrow(2, 0, 1)?)?;
+        assert_eq!(c.len(), 3);
+        let kept_after: Vec<f32> = c
+            .k()
+            .narrow(2, 0, 2)?
+            .flatten_all()?
+            .to_vec1()?;
+        assert_eq!(kept, kept_after, "truncate kept the kept rows");
+        Ok(())
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn cache_ops_on_metal() -> Result<()> {
+        device_cache_checks(&Device::new_metal(0)?)
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cache_ops_on_cuda() -> Result<()> {
+        device_cache_checks(&Device::new_cuda(0)?)
+    }
+
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn cache_ops_on_vulkan() -> Result<()> {
+        device_cache_checks(&Device::new_vulkan(0)?)
     }
 
     /// Qwen3-VL sections `[24, 20, 20, 0]` over 64 frequency pairs: the

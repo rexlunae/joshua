@@ -17,23 +17,27 @@ fn main() -> candle_core::Result<()> {
     let (b, n_head, dk, dv, steps) = (1usize, 16usize, 192usize, 128usize, 2048usize);
 
     // One token's keys and values, reused for every step: the append work
-    // (and not row construction) is what is being timed.
-    let row = |d: usize| -> candle_core::Result<candle_core::Tensor> {
-        let data: Vec<f32> = (0..b * n_head * d)
+    // (and not row construction) is what is being timed.  The old arm feeds
+    // rows in the old transposed cache layout ([b, n_head, d, 1], cat along
+    // the sequence axis); the new arm feeds the same rows in head layout.
+    let data = |d: usize| -> Vec<f32> {
+        (0..b * n_head * d)
             .map(|i| ((i * 37 + d) % 251) as f32 / 7.0 - 17.0)
-            .collect();
-        candle_core::Tensor::from_vec(data, (b, n_head, 1, d), &dev)
+            .collect()
     };
-    let k_row = row(dk)?;
-    let v_row = row(dv)?;
+    let k_row = candle_core::Tensor::from_vec(data(dk), (b, n_head, 1, dk), &dev)?;
+    let v_row = candle_core::Tensor::from_vec(data(dv), (b, n_head, 1, dv), &dev)?;
+    let k_row_t = candle_core::Tensor::from_vec(data(dk), (b, n_head, dk, 1), &dev)?;
+    let v_row_t = candle_core::Tensor::from_vec(data(dv), (b, n_head, dv, 1), &dev)?;
 
-    // Old cache: exact-size tensors re-cat'd and made contiguous every step.
+    // Old cache: exact-size transposed tensors re-cat'd along the sequence
+    // axis and made contiguous every step.
     let start = Instant::now();
-    let mut k = k_row.clone();
-    let mut v = v_row.clone();
+    let mut k = k_row_t.clone();
+    let mut v = v_row_t.clone();
     for _ in 1..steps {
-        k = candle_core::Tensor::cat(&[&k, &k_row], 3)?.contiguous()?;
-        v = candle_core::Tensor::cat(&[&v, &v_row], 3)?.contiguous()?;
+        k = candle_core::Tensor::cat(&[&k, &k_row_t], 3)?.contiguous()?;
+        v = candle_core::Tensor::cat(&[&v, &v_row_t], 3)?.contiguous()?;
     }
     let cat = start.elapsed();
 
