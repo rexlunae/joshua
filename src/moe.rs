@@ -81,7 +81,7 @@ pub fn causal_mask(seq_len: usize, offset: usize, device: &Device) -> Result<Ten
             })
         })
         .collect();
-    Tensor::from_slice(&mask, (1, 1, seq_len, seq_len + offset), device)
+    Tensor::from_vec(mask, (1, 1, seq_len, seq_len + offset), device)
 }
 
 // ─── Routing helpers ─────────────────────────────────────────────────────────

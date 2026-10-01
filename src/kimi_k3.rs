@@ -144,7 +144,7 @@ pub fn kda_gate(a: &Tensor, a_log_exp: &Tensor, lower_bound: f32) -> Result<Tens
 /// Shapes: `q`,`k` `[seq, key_dim]`; `v` `[seq, value_dim]`; `g` `[seq,
 /// key_dim]`; `beta` `[seq]`; `state` `[key_dim, value_dim]`. Returns `[seq,
 /// value_dim]`.
-#[allow(clippy::needless_range_loop, clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub fn kda_recurrent_head(
     q: &[f32],
     k: &[f32],
@@ -158,52 +158,72 @@ pub fn kda_recurrent_head(
 ) -> Vec<f32> {
     let mut out = vec![0f32; seq_len * value_dim];
     let mut delta = vec![0f32; value_dim];
+    kda_recurrent_head_into(
+        q, k, v, g, beta, state, seq_len, key_dim, value_dim, &mut out, &mut delta,
+    );
+    out
+}
+
+/// The recurrence with caller-owned output and scratch. The layer reuses the
+/// scratch across heads and writes each head straight into the final buffer.
+/// Read contiguous state rows while keeping each column's accumulation order
+/// identical to the reference recurrence.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn kda_recurrent_head_into(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    g: &[f32],
+    beta: &[f32],
+    state: &mut [f32],
+    seq_len: usize,
+    key_dim: usize,
+    value_dim: usize,
+    out: &mut [f32],
+    delta: &mut [f32],
+) {
+    debug_assert_eq!(out.len(), seq_len * value_dim);
+    debug_assert_eq!(delta.len(), value_dim);
     for t in 0..seq_len {
         let (qt, kt) = (&q[t * key_dim..], &k[t * key_dim..]);
-        let vt = &v[t * value_dim..];
+        let vt = &v[t * value_dim..(t + 1) * value_dim];
         let gt = &g[t * key_dim..];
 
-        // Per-channel decay: row i of the state scales by exp(g[i]).
+        // Decay each state row, then accumulate Sᵀk in key-channel order.
+        delta.fill(0.0);
         for i in 0..key_dim {
             let decay = gt[i].exp();
+            let ki = kt[i];
             let row = &mut state[i * value_dim..(i + 1) * value_dim];
-            for s in row.iter_mut() {
+            for (s, acc) in row.iter_mut().zip(delta.iter_mut()) {
                 *s *= decay;
+                *acc += ki * *s;
             }
         }
-
-        // delta = v - Sᵀk  — the prediction error the write will correct.
-        for j in 0..value_dim {
-            let mut acc = 0f32;
-            for i in 0..key_dim {
-                acc += kt[i] * state[i * value_dim + j];
-            }
-            delta[j] = vt[j] - acc;
+        for (err, &value) in delta.iter_mut().zip(vt) {
+            *err = value - *err;
         }
 
-        // S += (β·k) ⊗ delta
+        // Update each row, then accumulate Sᵀq in the same order. Preserve
+        // the zero-write shortcut: 0 * delta need not be evaluated.
         let b = beta[t];
+        let o = &mut out[t * value_dim..(t + 1) * value_dim];
+        o.fill(0.0);
         for i in 0..key_dim {
-            let bk = b * kt[i];
-            if bk == 0.0 {
-                continue;
-            }
+            let (bk, qi) = (b * kt[i], qt[i]);
             let row = &mut state[i * value_dim..(i + 1) * value_dim];
-            for (j, s) in row.iter_mut().enumerate() {
-                *s += bk * delta[j];
+            if bk == 0.0 {
+                for (&s, acc) in row.iter().zip(o.iter_mut()) {
+                    *acc += qi * s;
+                }
+            } else {
+                for ((s, &err), acc) in row.iter_mut().zip(delta.iter()).zip(o.iter_mut()) {
+                    *s += bk * err;
+                    *acc += qi * *s;
+                }
             }
-        }
-
-        // o = Sᵀq
-        for j in 0..value_dim {
-            let mut acc = 0f32;
-            for i in 0..key_dim {
-                acc += qt[i] * state[i * value_dim + j];
-            }
-            out[t * value_dim + j] = acc;
         }
     }
-    out
 }
 
 /// Mix the running residual stream with the banked attention-residual
@@ -245,6 +265,201 @@ pub fn checkpoint_layers(n_layer: usize, block: usize) -> Vec<usize> {
 mod tests {
     use super::*;
     use candle_core::Device;
+
+    // Deliberately retain the scalar, column-wise formulation as an independent
+    // oracle for the optimized recurrence and its state updates.
+    #[allow(clippy::needless_range_loop, clippy::too_many_arguments)]
+    fn kda_reference(
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        g: &[f32],
+        beta: &[f32],
+        state: &mut [f32],
+        seq_len: usize,
+        key_dim: usize,
+        value_dim: usize,
+    ) -> Vec<f32> {
+        let mut out = vec![0f32; seq_len * value_dim];
+        let mut delta = vec![0f32; value_dim];
+        for t in 0..seq_len {
+            let (qt, kt) = (&q[t * key_dim..], &k[t * key_dim..]);
+            let vt = &v[t * value_dim..];
+            let gt = &g[t * key_dim..];
+
+            // Per-channel decay: row i of the state scales by exp(g[i]).
+            for i in 0..key_dim {
+                let decay = gt[i].exp();
+                let row = &mut state[i * value_dim..(i + 1) * value_dim];
+                for s in row.iter_mut() {
+                    *s *= decay;
+                }
+            }
+
+            // delta = v - Sᵀk  — the prediction error the write will correct.
+            for j in 0..value_dim {
+                let mut acc = 0f32;
+                for i in 0..key_dim {
+                    acc += kt[i] * state[i * value_dim + j];
+                }
+                delta[j] = vt[j] - acc;
+            }
+
+            // S += (β·k) ⊗ delta
+            let b = beta[t];
+            for i in 0..key_dim {
+                let bk = b * kt[i];
+                if bk == 0.0 {
+                    continue;
+                }
+                let row = &mut state[i * value_dim..(i + 1) * value_dim];
+                for (j, s) in row.iter_mut().enumerate() {
+                    *s += bk * delta[j];
+                }
+            }
+
+            // o = Sᵀq
+            for j in 0..value_dim {
+                let mut acc = 0f32;
+                for i in 0..key_dim {
+                    acc += qt[i] * state[i * value_dim + j];
+                }
+                out[t * value_dim + j] = acc;
+            }
+        }
+        out
+    }
+
+    struct KdaFixture {
+        q: Vec<f32>,
+        k: Vec<f32>,
+        v: Vec<f32>,
+        g: Vec<f32>,
+        beta: Vec<f32>,
+        state: Vec<f32>,
+    }
+
+    impl KdaFixture {
+        fn new(seq: usize, kd: usize, vd: usize) -> Self {
+            let values = |n, seed| {
+                (0..n)
+                    .map(|i| ((i * 17 + seed) % 101) as f32 / 300.0 - 0.15)
+                    .collect()
+            };
+            Self {
+                q: values(seq * kd, 3),
+                k: (0..seq * kd)
+                    .map(|i| {
+                        if i % 11 == 0 {
+                            0.0
+                        } else {
+                            (i % 13) as f32 / 80.0 - 0.05
+                        }
+                    })
+                    .collect(),
+                v: values(seq * vd, 19),
+                g: (0..seq * kd).map(|i| -((i % 7) as f32) / 11.0).collect(),
+                beta: (0..seq)
+                    .map(|i| if i % 4 == 3 { 0.0 } else { 0.7 })
+                    .collect(),
+                state: values(kd * vd, 47),
+            }
+        }
+    }
+
+    fn assert_same_bits(a: &[f32], b: &[f32]) {
+        assert_eq!(a.len(), b.len());
+        for (i, (a, b)) in a.iter().zip(b).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "element {i}: {a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn kda_row_traversal_preserves_outputs_and_continued_state() {
+        for (kd, vd) in [(1, 1), (3, 5), (16, 7), (128, 128)] {
+            for seq in [0, 1, 9] {
+                let f = KdaFixture::new(seq, kd, vd);
+                let mut expected_state = f.state.clone();
+                let expected = kda_reference(
+                    &f.q,
+                    &f.k,
+                    &f.v,
+                    &f.g,
+                    &f.beta,
+                    &mut expected_state,
+                    seq,
+                    kd,
+                    vd,
+                );
+                let mut state = f.state.clone();
+                let actual =
+                    kda_recurrent_head(&f.q, &f.k, &f.v, &f.g, &f.beta, &mut state, seq, kd, vd);
+                assert_same_bits(&actual, &expected);
+                assert_same_bits(&state, &expected_state);
+
+                // Reuse dirty buffers across individual decode steps. Both the
+                // outputs and the state carried to the next call must match.
+                let mut state = f.state.clone();
+                let mut out = vec![f32::NAN; seq * vd];
+                let mut scratch = vec![f32::NAN; vd];
+                for t in 0..seq {
+                    kda_recurrent_head_into(
+                        &f.q[t * kd..][..kd],
+                        &f.k[t * kd..][..kd],
+                        &f.v[t * vd..][..vd],
+                        &f.g[t * kd..][..kd],
+                        &f.beta[t..][..1],
+                        &mut state,
+                        1,
+                        kd,
+                        vd,
+                        &mut out[t * vd..][..vd],
+                        &mut scratch,
+                    );
+                }
+                assert_same_bits(&out, &expected);
+                assert_same_bits(&state, &expected_state);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "manual KDA recurrence microbenchmark"]
+    fn benchmark_kda_row_traversal() {
+        for seq in [1, 32] {
+            let (kd, vd) = (128, 128);
+            let f = KdaFixture::new(seq, kd, vd);
+            let iterations = if seq == 1 { 200 } else { 20 };
+            let mut timings = [Vec::new(), Vec::new()];
+            let mut state = f.state.clone();
+            for round in 0..9 {
+                for kind in [round % 2, 1 - round % 2] {
+                    let run = if kind == 0 {
+                        kda_reference
+                    } else {
+                        kda_recurrent_head
+                    };
+                    let start = std::time::Instant::now();
+                    for _ in 0..iterations {
+                        state.copy_from_slice(&f.state);
+                        std::hint::black_box(run(
+                            &f.q, &f.k, &f.v, &f.g, &f.beta, &mut state, seq, kd, vd,
+                        ));
+                    }
+                    if round > 0 {
+                        timings[kind].push(start.elapsed().as_secs_f64() * 1e6 / iterations as f64);
+                    }
+                }
+            }
+            for times in &mut timings {
+                times.sort_by(f64::total_cmp);
+            }
+            eprintln!(
+                "KDA {seq} tokens, {kd}x{vd} state: columns {:.1} us, rows {:.1} us",
+                timings[0][4], timings[1][4]
+            );
+        }
+    }
 
     #[test]
     fn layer_topology_matches_the_reference_pattern() {

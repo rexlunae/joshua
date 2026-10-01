@@ -38,6 +38,9 @@ changes out of the patch.
 - Avoid gathering or reordering an entire cache when the next operation needs
   only selected rows. Preserve token order, masks, and the behavior at window
   wraparound and chunk boundaries.
+- Traverse hot state and weight buffers in contiguous storage order. When
+  changing loop order for cache locality or vectorization, preserve each
+  output's accumulation order and verify the state carried across tokens.
 - Reserve vectors when the final size is known. Avoid per-expert temporary
   tensors and host allocations for a single-row decode when direct use of the
   input row is valid. Keep duplicate routes and batched paths correct.

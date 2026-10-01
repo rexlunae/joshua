@@ -288,7 +288,7 @@ impl<W: LayerStack> crate::stream_prefill::StreamPrefill for Session<W> {
 
     fn embed_chunk(&self, tokens: &[u32], device: &Device) -> Result<Tensor> {
         self.embed(
-            &Tensor::new(tokens.to_vec(), device)?.unsqueeze(0)?,
+            &Tensor::new(tokens, device)?.unsqueeze(0)?,
             tokens.len(),
         )
     }
