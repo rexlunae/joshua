@@ -203,33 +203,77 @@ impl Kda {
         };
         let beta = sigmoid(&self.beta.forward(x)?.reshape((t, h))?)?;
 
-        // The delta rule, one head at a time on the host.
-        let heads = |x: &Tensor| -> Result<Vec<f32>> {
-            x.transpose(0, 1)?.contiguous()?.flatten_all()?.to_vec1()
-        };
-        let (q, key, v, g) = (heads(&q)?, heads(&key)?, heads(v)?, heads(&g)?);
-        let beta = beta.t()?.contiguous()?.flatten_all()?.to_vec1::<f32>()?;
-        let mut o = vec![0f32; h * t * d];
+        // The delta rule, one head at a time on the host. Each tensor is
+        // read once in its natural [t, h, d] layout: for a decode step
+        // (t == 1) head `hh`'s rows are already contiguous there and the
+        // per-head slices below borrow them, while a prefill chunk gathers
+        // them into per-head scratch (the same bytes the old
+        // transpose+contiguous pass copied, without the intermediate
+        // [h, t, d] tensor). Outputs go straight into the [t, h, d] buffer,
+        // so no transpose copy follows the loop.
+        fn gather_head(src: &[f32], hh: usize, t: usize, h: usize, d: usize, buf: &mut Vec<f32>) {
+            buf.clear();
+            for tok in 0..t {
+                let base = (tok * h + hh) * d;
+                buf.extend_from_slice(&src[base..base + d]);
+            }
+        }
+        type HeadSlices<'a> =
+            (&'a [f32], &'a [f32], &'a [f32], &'a [f32], &'a [f32], &'a mut [f32]);
+        let flat = |x: &Tensor| -> Result<Vec<f32>> { x.flatten_all()?.to_vec1() };
+        let (q, key, v, g) = (flat(&q)?, flat(&key)?, flat(v)?, flat(&g)?);
+        let beta = beta.to_vec2::<f32>()?; // [t][h]
+        let mut o = vec![0f32; t * h * d]; // [t, h, d]
         let mut delta = vec![0f32; d];
+        let mut hq: Vec<f32> = Vec::new();
+        let mut hk: Vec<f32> = Vec::new();
+        let mut hv: Vec<f32> = Vec::new();
+        let mut hg: Vec<f32> = Vec::new();
+        let mut hb: Vec<f32> = Vec::new();
+        let mut ho: Vec<f32> = Vec::new();
         for hh in 0..h {
-            let r = hh * t * d..(hh + 1) * t * d;
+            let (qs, ks, vs, gs, bs, os): HeadSlices =
+                if t == 1 {
+                    (
+                        &q[hh * d..(hh + 1) * d],
+                        &key[hh * d..(hh + 1) * d],
+                        &v[hh * d..(hh + 1) * d],
+                        &g[hh * d..(hh + 1) * d],
+                        std::slice::from_ref(&beta[0][hh]),
+                        &mut o[hh * d..(hh + 1) * d],
+                    )
+                } else {
+                    gather_head(&q, hh, t, h, d, &mut hq);
+                    gather_head(&key, hh, t, h, d, &mut hk);
+                    gather_head(&v, hh, t, h, d, &mut hv);
+                    gather_head(&g, hh, t, h, d, &mut hg);
+                    hb.clear();
+                    hb.extend((0..t).map(|tok| beta[tok][hh]));
+                    ho.clear();
+                    ho.resize(t * d, 0.0);
+                    (&hq, &hk, &hv, &hg, &hb, &mut ho)
+                };
             crate::kimi_k3::kda_recurrent_head_into(
-                &q[r.clone()],
-                &key[r.clone()],
-                &v[r.clone()],
-                &g[r],
-                &beta[hh * t..(hh + 1) * t],
+                qs,
+                ks,
+                vs,
+                gs,
+                bs,
                 &mut st.s[hh * d * d..(hh + 1) * d * d],
                 t,
                 d,
                 d,
-                &mut o[hh * t * d..(hh + 1) * t * d],
+                os,
                 &mut delta,
             );
+            if t > 1 {
+                for tok in 0..t {
+                    let base = (tok * h + hh) * d;
+                    o[base..base + d].copy_from_slice(&ho[tok * d..(tok + 1) * d]);
+                }
+            }
         }
-        let o = Tensor::from_vec(o, (h, t, d), x.device())?
-            .transpose(0, 1)?
-            .contiguous()?; // [t, h, d]
+        let o = Tensor::from_vec(o, (t, h, d), x.device())?; // [t, h, d]
 
         // RMSNorm(o) · σ(g(x)), then the output projection.
         let gate = match &self.gate {

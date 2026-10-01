@@ -2504,8 +2504,11 @@ impl Moe {
         h: usize,
     ) -> Result<Tensor> {
         let dev = x_dev.device();
-        let mut idx_all: Vec<u32> = Vec::new();
-        let mut w_all: Vec<f32> = Vec::new();
+        // One packed index/weight buffer per layer: their size is the sum of
+        // the hits' per-expert rows, so reserve it up front.
+        let total: usize = hits.iter().map(|(e, _)| per_expert[*e].len()).sum();
+        let mut idx_all: Vec<u32> = Vec::with_capacity(total);
+        let mut w_all: Vec<f32> = Vec::with_capacity(total);
         let mut spans: Vec<(usize, usize)> = Vec::with_capacity(hits.len());
         for (e, _) in hits {
             let off = idx_all.len();
