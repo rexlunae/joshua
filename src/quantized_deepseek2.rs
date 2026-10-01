@@ -1808,15 +1808,16 @@ mod tests {
         attn.forward(&mut kv, &xs, None, 0)?;
         let cache = kv.as_ref().expect("cache populated after prefill");
         assert_eq!(cache.len(), 3);
-        // Buffers are [b, n_head, cap, d] with cap = the initial capacity.
+        // Buffers are [b, n_head, cap, d] with cap = twice the prefill
+        // length floored at the minimum capacity (3 -> 16).
         assert_eq!(
             cache.k().dims(),
-            &[1, 2, 512, 8],
+            &[1, 2, 16, 8],
             "k cache must be [b, n_head, cap, qk_nope + qk_rope]"
         );
         assert_eq!(
             cache.v().dims(),
-            &[1, 2, 512, 4],
+            &[1, 2, 16, 4],
             "v cache must be [b, n_head, cap, v_head_dim]"
         );
 
@@ -1825,8 +1826,8 @@ mod tests {
         attn.forward(&mut kv, &xs2, None, 3)?;
         let cache = kv.as_ref().expect("cache after decode");
         assert_eq!(cache.len(), 4);
-        assert_eq!(cache.k().dims(), &[1, 2, 512, 8]);
-        assert_eq!(cache.v().dims(), &[1, 2, 512, 4]);
+        assert_eq!(cache.k().dims(), &[1, 2, 16, 8]);
+        assert_eq!(cache.v().dims(), &[1, 2, 16, 4]);
         Ok(())
     }
 
