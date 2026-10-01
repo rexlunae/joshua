@@ -149,8 +149,16 @@ fn matmul_t_dispatch(
     parallel: bool,
 ) -> candle_core::Result<()> {
     let blocks_per_row = crate::raw_block::validate_matmul_t(mkn, lhs, rhs, dst)?;
-    if mkn.0 == 0 || mkn.2 == 0 || try_fused_matmul(mkn, blocks_per_row, lhs, rhs, dst, parallel) {
+    if mkn.0 == 0 || mkn.2 == 0 {
         return Ok(());
+    }
+    if mkn.1 == 0 {
+        dst.fill(0.0);
+        return Ok(());
+    }
+    if try_fused_matmul(mkn, blocks_per_row, lhs, rhs, dst, parallel) {
+        return Ok(());
+    }
     }
     if parallel {
         crate::raw_block::matmul_t(mkn, lhs, rhs, dst)
