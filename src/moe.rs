@@ -338,7 +338,7 @@ impl Routing {
 
 /// A router id that names no expert must fail loudly with context rather
 /// than panic on the slice index below.
-fn check_expert_id(
+pub(crate) fn check_expert_id(
     arch: &str,
     e: usize,
     n_experts: usize,

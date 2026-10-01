@@ -2096,6 +2096,31 @@ impl DistributedMoe {
     }
 }
 
+/// Bucket one MoE layer's routing into per-expert (token, weight) lists.
+/// A router id naming no expert fails loudly with context (the shared
+/// moe::check_expert_id rule) instead of silently dropping the row -- a
+/// corrupt router or an inconsistent tid2eid table then reports itself
+/// rather than degrading the output.
+fn bucket_by_expert(
+    ids: &[u32],
+    wts: &[f32],
+    k: usize,
+    n_tokens: usize,
+    n_experts: usize,
+) -> Result<Vec<Vec<(u32, f32)>>> {
+    if k == 0 || n_tokens.checked_mul(k) != Some(ids.len()) || wts.len() != ids.len() {
+        candle_core::bail!("deepseek4: invalid routing dimensions");
+    }
+    let mut per_expert: Vec<Vec<(u32, f32)>> = vec![Vec::new(); n_experts];
+    for t in 0..n_tokens {
+        for s in 0..k {
+            let e = ids[t * k + s] as usize;
+            crate::moe::check_expert_id("deepseek4", e, n_experts, t, s)?;
+            per_expert[e].push((t as u32, wts[t * k + s]));
+        }
+    }
+    Ok(per_expert)
+}
 struct Moe {
     /// Router weight, transposed to `[n_embd, n_expert]` and made contiguous
     /// once at load (it was a transpose + copy per forward call).
@@ -2212,15 +2237,7 @@ impl Moe {
             pool.pool.reclaim();
         }
 
-        let mut per_expert: Vec<Vec<(u32, f32)>> = vec![Vec::new(); self.experts.len()];
-        for t in 0..n_tokens {
-            for s in 0..k {
-                let e = ids[t * k + s] as usize;
-                if e < self.experts.len() {
-                    per_expert[e].push((t as u32, wts[t * k + s]));
-                }
-            }
-        }
+        let per_expert = bucket_by_expert(&ids, &wts, k, n_tokens, self.experts.len())?;
 
         // Routing record for the speculative next-step prefetch: during
         // decode, every id this step routed to (routing consistency makes
@@ -4674,6 +4691,30 @@ fn split_experts<R: Read + Seek>(
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    /// Routing buckets by (token, slot) into per-expert lists, and a router
+    /// id naming no expert is a loud error (it used to be silently dropped,
+    /// quietly degrading the output on corrupt routing).
+    #[test]
+    fn bucket_by_expert_buckets_and_rejects_out_of_range_ids() {
+        // 2 tokens, k = 2: ids [0, 1 | 1, 0], weights 1..4.
+        let ids = [0u32, 1, 1, 0];
+        let wts = [1.0f32, 2.0, 3.0, 4.0];
+        let buckets = bucket_by_expert(&ids, &wts, 2, 2, 2).unwrap();
+        assert_eq!(buckets[0], vec![(0, 1.0), (1, 4.0)]);
+        assert_eq!(buckets[1], vec![(0, 2.0), (1, 3.0)]);
+
+        let err = bucket_by_expert(&[0, 1, 2, 0], &wts, 2, 2, 2).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("out of 2") && msg.contains("expert 2"),
+            "error should name the expert and the expert count: {msg}"
+        );
+
+        // Dimension mismatches stay loud too.
+        assert!(bucket_by_expert(&[0, 1], &wts, 2, 2, 2).is_err());
+        assert!(bucket_by_expert(&[0, 1, 0, 0], &[1.0, 2.0, 3.0], 2, 2, 2).is_err());
+    }
 
     fn md() -> HashMap<String, gguf_file::Value> {
         let mut m = HashMap::new();
