@@ -657,22 +657,43 @@ mod tests {
         Ok(())
     }
 
+    // The engine accepts hosts whose accelerator feature is compiled in but
+    // whose device is absent (it falls back to the CPU), so these tests skip
+    // on device-creation failure instead of blocking such test runs.
     #[cfg(feature = "metal")]
     #[test]
     fn cache_ops_on_metal() -> Result<()> {
-        device_cache_checks(&Device::new_metal(0)?)
+        match Device::new_metal(0) {
+            Ok(dev) => device_cache_checks(&dev),
+            Err(e) => {
+                eprintln!("skipping cache_ops_on_metal: no device ({e})");
+                Ok(())
+            }
+        }
     }
 
     #[cfg(feature = "cuda")]
     #[test]
     fn cache_ops_on_cuda() -> Result<()> {
-        device_cache_checks(&Device::new_cuda(0)?)
+        match Device::new_cuda(0) {
+            Ok(dev) => device_cache_checks(&dev),
+            Err(e) => {
+                eprintln!("skipping cache_ops_on_cuda: no device ({e})");
+                Ok(())
+            }
+        }
     }
 
     #[cfg(feature = "vulkan")]
     #[test]
     fn cache_ops_on_vulkan() -> Result<()> {
-        device_cache_checks(&Device::new_vulkan(0)?)
+        match Device::new_vulkan(0) {
+            Ok(dev) => device_cache_checks(&dev),
+            Err(e) => {
+                eprintln!("skipping cache_ops_on_vulkan: no device ({e})");
+                Ok(())
+            }
+        }
     }
 
     /// Qwen3-VL sections `[24, 20, 20, 0]` over 64 frequency pairs: the
