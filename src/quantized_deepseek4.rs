@@ -3996,7 +3996,7 @@ impl ModelWeights {
 
         // Per-sequence embeddings -> streams of one token each.
         let mut streams: Vec<Stream> = Vec::with_capacity(n_seq);
-        let mut ids_cat: Vec<u32> = Vec::new();
+        let mut ids_cat: Vec<u32> = Vec::with_capacity(n_seq);
         for (s, (input, off)) in seqs.iter().enumerate() {
             let ids = input.flatten_all()?;
             let tok = self.shared.tok_embeddings.forward(&ids)?.reshape((1, 1, d))?;
