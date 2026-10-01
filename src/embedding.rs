@@ -22,7 +22,9 @@
 //! embeddings are L2-normalised.
 
 use std::io::{Read, Seek};
+use std::sync::Arc;
 
+use crate::token_embedding::TokenEmbedding;
 use candle_core::quantized::{gguf_file, QMatMul, QTensor};
 use candle_core::{Device, Module, Result, Tensor};
 
@@ -95,7 +97,7 @@ struct Layer {
 
 /// A decoder model evaluated for hidden states rather than logits.
 pub struct EmbeddingModel {
-    tok_embeddings: Tensor,
+    tok_embeddings: TokenEmbedding,
     layers: Vec<Layer>,
     output_norm: RmsNorm,
     /// LM head, kept for logit-parity validation against candle's
@@ -218,14 +220,19 @@ impl EmbeddingModel {
 
         let tensor = |reader: &mut R, name: &str| ct.tensor(reader, name, device);
 
-        let tok_embeddings_q = tensor(reader, "token_embd.weight")?;
-        let tok_embeddings = tok_embeddings_q.dequantize(device)?;
+        // The token table stays quantized through the shared `TokenEmbedding`
+        // instead of being dequantized up front; when embeddings are tied the
+        // same tensor also serves as the LM head, so both hold clones of one
+        // `Arc` rather than two copies.
+        let tok_embeddings_q = Arc::new(tensor(reader, "token_embd.weight")?);
+        let tok_embeddings =
+            TokenEmbedding::from_arc(Arc::clone(&tok_embeddings_q), device)?;
         let output_norm =
             RmsNorm::from_qtensor(tensor(reader, "output_norm.weight")?, rms_eps, device)?;
         // Tied embeddings when no output.weight is present, mirroring candle.
         let output = match ct.tensor(reader, "output.weight", device) {
             Ok(t) => QMatMul::from_qtensor(t)?,
-            Err(_) => QMatMul::from_qtensor(tok_embeddings_q)?,
+            Err(_) => QMatMul::from_arc(tok_embeddings_q)?,
         };
 
         let mut layers = Vec::with_capacity(block_count);
@@ -300,11 +307,11 @@ impl EmbeddingModel {
         let _ = self.qk_norm_eps; // eps lives inside each RmsNorm
         let seq_len = tokens.len();
         let device = self.tok_embeddings.device();
-        let input = Tensor::new(tokens, device)?;
-        let mut x = self.tok_embeddings.index_select(&input, 0)?.unsqueeze(0)?;
+        let input = Tensor::new(tokens, &device)?;
+        let mut x = self.tok_embeddings.forward(&input)?.unsqueeze(0)?;
 
         let mask = if seq_len > 1 {
-            Some(crate::moe::causal_mask(seq_len, 0, device)?)
+            Some(crate::moe::causal_mask(seq_len, 0, &device)?)
         } else {
             None
         };

@@ -22,13 +22,15 @@
 //! accelerators (an f32 table is no larger dense, and the GPU quantized
 //! embedding kernels are only exercised for block-quantized types).
 
+use std::sync::Arc;
+
 use candle_core::quantized::{GgmlDType, QTensor};
 use candle_core::{DType, Device, Result, Tensor};
 
 /// A `[vocab, hidden]` token-embedding table.
 pub enum TokenEmbedding {
     /// Quantized table, gathered per row through `QTensor::embedding`.
-    Quantized(QTensor),
+    Quantized(Arc<QTensor>),
     /// Dequantized f32 table, gathered with `index_select`.
     Dense(Tensor),
 }
@@ -43,6 +45,13 @@ impl TokenEmbedding {
     /// GGUF dtype), and for block-quantized dtypes on CUDA/Metal.  Dense
     /// only for float dtypes on CUDA/Metal.
     pub fn load(table: QTensor, device: &Device) -> Result<Self> {
+        Self::from_arc(Arc::new(table), device)
+    }
+
+    /// [`load`] for a table already shared as an `Arc` — a loader that also
+    /// keeps the same tensor behind a quantized matmul (tied embeddings)
+    /// clones the `Arc` instead of owning a second copy.
+    pub fn from_arc(table: Arc<QTensor>, device: &Device) -> Result<Self> {
         let float_dtype = matches!(
             table.dtype(),
             GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16
@@ -54,6 +63,14 @@ impl TokenEmbedding {
             Ok(Self::Quantized(table))
         } else {
             Ok(Self::Dense(table.dequantize(device)?.to_dtype(DType::F32)?))
+        }
+    }
+
+    /// The device the table lives on.
+    pub fn device(&self) -> Device {
+        match self {
+            Self::Quantized(q) => q.device(),
+            Self::Dense(t) => t.device().clone(),
         }
     }
 
@@ -112,6 +129,23 @@ mod tests {
             a, b,
             "quantized gather must be bit-identical to the dense path"
         );
+        Ok(())
+    }
+
+    /// `from_arc` applies the same representation rules as [`load`], for a
+    /// table a loader already shares behind an `Arc` (tied embeddings).
+    #[test]
+    fn from_arc_matches_load_on_cpu() -> Result<()> {
+        let t = Tensor::arange(0f32, 128f32, &Device::Cpu)?.reshape((4, 32))?;
+        let shared = Arc::new(QTensor::quantize(&t, GgmlDType::Q8_0)?);
+        let a = TokenEmbedding::from_arc(Arc::clone(&shared), &Device::Cpu)?;
+        let b = TokenEmbedding::load(QTensor::quantize(&t, GgmlDType::Q8_0)?, &Device::Cpu)?;
+        assert!(a.is_quantized() && b.is_quantized());
+        let ids = Tensor::new(&[2u32, 3], &Device::Cpu)?;
+        let x: Vec<f32> = a.forward(&ids)?.flatten_all()?.to_vec1()?;
+        let y: Vec<f32> = b.forward(&ids)?.flatten_all()?.to_vec1()?;
+        assert_eq!(x, y);
+        assert!(matches!(a.device(), Device::Cpu));
         Ok(())
     }
 
