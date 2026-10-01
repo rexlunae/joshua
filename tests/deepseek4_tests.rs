@@ -1296,3 +1296,60 @@ fn benchmark_deepseek4_window_gather() -> candle_core::Result<()> {
     bench(&Device::new_metal(0)?, "Metal")?;
     Ok(())
 }
+/// The grouped-output diagonal select (zero-copy narrow + cat) must be
+/// bit-identical to the per-forward index rebuild + gather it replaced, at
+/// the shapes the forward actually sees: one decode token and one 512-token
+/// prefill chunk (o_groups/o_lora_rank GGUF defaults).
+#[test]
+fn dsv4_grouped_output_diag_select_matches_index_gather() {
+    // The check itself is device-agnostic: both sequences move the same rows,
+    // so they must agree bit-for-bit on every backend that implements gather
+    // and cat.  The CPU run always happens; with the metal feature the same
+    // check runs on the GPU too (run the metal test suite on Metal-capable
+    // hardware - not executed from a development machine per the owner's
+    // policy; see AGENTS.md and examples/bench_dsv4_output_gather.rs).
+    fn check(dev: &Device, (groups, rank): (usize, usize)) {
+        for seq in [1usize, 512] {
+            let oa = Tensor::randn(0f32, 1f32, (seq, groups, groups * rank), dev).unwrap();
+            let mut idxv = Vec::with_capacity(seq * groups * rank);
+            for _ in 0..seq {
+                for g in 0..groups {
+                    for r in 0..rank {
+                        idxv.push((g * rank + r) as u32);
+                    }
+                }
+            }
+            let idx = Tensor::from_vec(idxv, (seq, groups, rank), dev).unwrap();
+            let old = oa
+                .gather(&idx, candle_core::D::Minus1)
+                .unwrap()
+                .reshape((seq, groups * rank))
+                .unwrap();
+            let blocks: Vec<Tensor> = (0..groups)
+                .map(|g| {
+                    oa.narrow(1, g, 1)
+                        .unwrap()
+                        .narrow(candle_core::D::Minus1, g * rank, rank)
+                        .unwrap()
+                        .squeeze(1)
+                        .unwrap()
+                })
+                .collect();
+            let new = Tensor::cat(&blocks, 1).unwrap().contiguous().unwrap();
+            assert_eq!(
+                old.to_vec2::<f32>().unwrap(),
+                new.to_vec2::<f32>().unwrap(),
+                "diag select diverged at seq={seq}"
+            );
+            // Same shape and no index tensor on the new path.
+            assert_eq!(new.dims(), [seq, groups * rank]);
+        }
+    }
+    // GGUF defaults for the grouped output projection.
+    let defaults = (8usize, 1024usize);
+    check(&Device::Cpu, defaults);
+    #[cfg(feature = "metal")]
+    if let Ok(dev) = Device::new_metal(0) {
+        check(&dev, defaults);
+    }
+}

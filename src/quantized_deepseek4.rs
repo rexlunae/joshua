@@ -1774,18 +1774,21 @@ impl Attention {
             .wo_a
             .forward(&og.reshape((seq * self.o_groups, o_group_dim))?)?; // [seq*g, g*r]
         let oa = oa.reshape((seq, self.o_groups, self.o_groups * self.o_lora_rank))?;
-        let mut idxv = Vec::with_capacity(seq * self.o_groups * self.o_lora_rank);
-        for _ in 0..seq {
-            for g in 0..self.o_groups {
-                for r in 0..self.o_lora_rank {
-                    idxv.push((g * self.o_lora_rank + r) as u32);
-                }
-            }
-        }
-        let idx = Tensor::from_vec(idxv, (seq, self.o_groups, self.o_lora_rank), dev)?;
-        let y = oa
-            .gather(&idx, D::Minus1)?
-            .reshape((seq, self.o_groups * self.o_lora_rank))?;
+        // Diagonal block select: y[s, g, r] = oa[s, g, g·o_lora_rank + r].
+        // The gather this used to run through refilled a host index Vec with
+        // a pattern that is identical for every sequence position and depends
+        // only on (o_groups, o_lora_rank) — configuration — then uploaded it
+        // on every forward.  Take each group's block with a zero-copy narrow
+        // and concatenate instead: the cat writes exactly the output rows in
+        // the gather's order, with no index tensor and no host fill.
+        let blocks: Vec<Tensor> = (0..self.o_groups)
+            .map(|g| {
+                oa.narrow(1, g, 1)?
+                    .narrow(D::Minus1, g * self.o_lora_rank, self.o_lora_rank)?
+                    .squeeze(1)
+            })
+            .collect::<Result<_>>()?;
+        let y = Tensor::cat(&blocks, 1)?.contiguous()?;
         self.wo_b.forward(&y)?.reshape((1, seq, ()))
     }
 
