@@ -1029,17 +1029,15 @@ fn hadamard_rows(x: &Tensor) -> Result<Tensor> {
         candle_core::bail!("deepseek4: Hadamard rotation needs a power-of-two head dim, got {d}");
     }
     let n = shape[..shape.len() - 1].iter().product::<usize>();
-    let data: Vec<f32> = x.flatten_all()?.to_vec1()?;
-    let mut out = vec![0f32; data.len()];
+    let mut data: Vec<f32> = x.flatten_all()?.to_vec1()?;
     let scale = 1.0 / (d as f32).sqrt();
-    for (row, chunk) in data.chunks_exact(d).enumerate() {
-        let mut r = chunk.to_vec();
-        fast_hadamard(&mut r);
-        for (o, v) in out[row * d..row * d + d].iter_mut().zip(r.iter()) {
-            *o = v * scale;
+    for row in data.chunks_exact_mut(d) {
+        fast_hadamard(row);
+        for value in row {
+            *value *= scale;
         }
     }
-    Tensor::from_vec(out, (n, d), x.device())?.reshape(shape)
+    Tensor::from_vec(data, (n, d), x.device())?.reshape(shape)
 }
 
 struct Compressor {
@@ -2117,15 +2115,16 @@ impl Moe {
         let dev = x2.device();
         let mut y = Tensor::zeros((n_tokens, h), DType::F32, dev)?;
         // Select each expert's input rows once; all three phases reuse them.
-        let mut sel: Vec<(usize, Vec<u32>, Tensor)> = Vec::with_capacity(active.len());
+        let mut sel: Vec<(usize, Tensor, Tensor)> = Vec::with_capacity(active.len());
         for &e in active {
             let token_idx: Vec<u32> = per_expert[e].iter().map(|(t, _)| *t).collect();
             let count = token_idx.len();
             if count == 0 {
                 continue;
             }
-            let idx = Tensor::from_vec(token_idx.clone(), count, dev)?;
-            sel.push((e, token_idx, x2.index_select(&idx, 0)?));
+            let idx = Tensor::from_vec(token_idx, count, dev)?;
+            let x_sel = x2.index_select(&idx, 0)?;
+            sel.push((e, idx, x_sel));
         }
 
         // Tensor-major MoE: run every expert's gate, then every expert's up,
@@ -2143,12 +2142,11 @@ impl Moe {
         for (e, _, x_sel) in &sel {
             ups.push(self.experts[*e].up_forward(x_sel)?);
         }
-        for (((e, token_idx, _), gate), up) in sel.iter().zip(gates).zip(ups) {
+        for (((e, idx, _), gate), up) in sel.iter().zip(gates).zip(ups) {
             let out = self.experts[*e].combine_and_down(gate, up)?;
-            let idx = Tensor::from_vec(token_idx.clone(), token_idx.len(), dev)?;
             let w: Vec<f32> = per_expert[*e].iter().map(|(_, w)| *w).collect();
-            let w = Tensor::from_vec(w, (token_idx.len(), 1), dev)?;
-            y = y.index_add(&idx, &out.broadcast_mul(&w)?, 0)?;
+            let w = Tensor::from_vec(w, (idx.elem_count(), 1), dev)?;
+            y = y.index_add(idx, &out.broadcast_mul(&w)?, 0)?;
         }
         Ok(y)
     }
