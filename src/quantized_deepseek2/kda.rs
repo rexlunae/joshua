@@ -209,10 +209,11 @@ impl Kda {
         };
         let (q, key, v, g) = (heads(&q)?, heads(&key)?, heads(v)?, heads(&g)?);
         let beta = beta.t()?.contiguous()?.flatten_all()?.to_vec1::<f32>()?;
-        let mut o = Vec::with_capacity(h * t * d);
+        let mut o = vec![0f32; h * t * d];
+        let mut delta = vec![0f32; d];
         for hh in 0..h {
             let r = hh * t * d..(hh + 1) * t * d;
-            o.extend(crate::kimi_k3::kda_recurrent_head(
+            crate::kimi_k3::kda_recurrent_head_into(
                 &q[r.clone()],
                 &key[r.clone()],
                 &v[r.clone()],
@@ -222,7 +223,9 @@ impl Kda {
                 t,
                 d,
                 d,
-            ));
+                &mut o[hh * t * d..(hh + 1) * t * d],
+                &mut delta,
+            );
         }
         let o = Tensor::from_vec(o, (h, t, d), x.device())?
             .transpose(0, 1)?
