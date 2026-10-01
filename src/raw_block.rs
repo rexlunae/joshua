@@ -23,6 +23,12 @@ use half::f16;
 /// other super-block formats), sizing the per-block decode scratch buffer.
 pub const MAX_QK: usize = 256;
 
+/// A fused worker for one weight row. The arguments are `(m, k, n)`,
+/// activations, weight blocks, blocks per row, row index, and output storage.
+/// See [`RawBlock::row_kernel`] for its safety contract.
+pub type RowKernel<B> =
+    unsafe fn(usize, usize, usize, &[f32], &[B], usize, usize, &crate::simd::DstPtr);
+
 /// One block of a quantization format decoded by Joshua rather than candle.
 pub trait RawBlock: Copy + Send + Sync + 'static {
     /// The GGUF / ggml dtype id (`GGML_TYPE_*`).
@@ -57,8 +63,18 @@ pub trait RawBlock: Copy + Send + Sync + 'static {
         unreachable!("{}: no AVX-512 decode", Self::NAME)
     }
 
+    /// Optional fused worker for the selected CPU level. Shared dispatch
+    /// handles shape validation, empty products, scheduling and AVX-512.
+    ///
+    /// The returned worker must be safe on CPUs supporting `level`, assign
+    /// every `dst[i*n + row]`, and touch no other output column. Its caller
+    /// validates all shapes and gives each row to exactly one worker.
+    fn row_kernel(_level: crate::simd::SimdLevel) -> Option<RowKernel<Self>> {
+        None
+    }
+
     /// `dst[m, n] = lhs[m, k] · rhs[n, k]ᵀ`; a format with a fused SIMD
-    /// kernel overrides the portable [`matmul_t`].
+    /// kernel supplies [`RawBlock::row_kernel`] or [`RawBlock::decode_avx512`].
     fn matmul_t(
         mkn: (usize, usize, usize),
         lhs: &[f32],
@@ -200,13 +216,19 @@ fn matmul_t_rows<B: RawBlock>(
     if n == 0 || m == 0 {
         return Ok(());
     }
+    if k == 0 {
+        dst.fill(0.0);
+        return Ok(());
+    }
+    let level = crate::simd::simd_level();
+    let kernel = B::row_kernel(level);
     #[cfg(target_arch = "x86_64")]
-    let avx512 = B::DECODE_AVX512 && crate::simd::simd_level() == crate::simd::SimdLevel::Avx512;
+    let avx512 = B::DECODE_AVX512 && level == crate::simd::SimdLevel::Avx512;
     #[cfg(not(target_arch = "x86_64"))]
     let avx512 = false;
     // The portable worker sums a row a block at a time, so the destination
     // has to start from zero (the fused kernel assigns every element).
-    if !avx512 {
+    if !avx512 && kernel.is_none() {
         dst.fill(0.0);
     }
     let dst_ptr = crate::simd::DstPtr::new(dst);
@@ -215,7 +237,14 @@ fn matmul_t_rows<B: RawBlock>(
         if avx512 {
             // SAFETY: the level check above means this CPU has AVX-512 and
             // `B` implements its decode; rows are disjoint (`crate::simd`).
-            return unsafe { matmul_row_avx512((m, k, n), lhs, rhs, blocks_per_row, row, &dst_ptr) };
+            return unsafe {
+                matmul_row_avx512((m, k, n), lhs, rhs, blocks_per_row, row, &dst_ptr)
+            };
+        }
+        if let Some(kernel) = kernel {
+            // SAFETY: the worker supports the detected/overridden level;
+            // shapes are validated and output columns are disjoint.
+            return unsafe { kernel(m, k, n, lhs, rhs, blocks_per_row, row, &dst_ptr) };
         }
         matmul_row_scalar((m, k, n), lhs, rhs, blocks_per_row, row, &dst_ptr)
     };
@@ -530,6 +559,21 @@ pub(crate) mod testing {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_products_assign_zero_and_validate_shapes_for_every_format() {
+        for id in [16, 17, 18, 19, 20, 21, 22, 23, 29, 34, 35, 39, 40, 41, 42] {
+            crate::with_raw_block!(id, B => {
+                let mut output = [f32::NAN; 6];
+                B::matmul_t((3, 0, 2), &[], &[], &mut output).unwrap();
+                assert_eq!(output, [0.0; 6], "dtype {id}");
+                assert!(B::matmul_t((3, 0, 2), &[], &[], &mut [0.0; 5]).is_err());
+                B::matmul_t((0, 0, 2), &[], &[], &mut []).unwrap();
+                B::matmul_t((3, 0, 0), &[], &[], &mut []).unwrap();
+            })
+            .unwrap();
+        }
+    }
 
     /// Every raw format decodes [`synthetic_bytes`] exactly as llama.cpp's
     /// `dequantize_row_*` does (`tests/data/raw_formats_ref.txt`, produced

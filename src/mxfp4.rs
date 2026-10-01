@@ -127,91 +127,19 @@ impl crate::raw_block::RawBlock for BlockMxfp4 {
         ]
     }
 
-    fn matmul_t(
-        mkn: (usize, usize, usize),
-        lhs: &[f32],
-        rhs: &[Self],
-        dst: &mut [f32],
-    ) -> candle_core::Result<()> {
-        matmul_t_dispatch(mkn, lhs, rhs, dst, true)
+    fn row_kernel(level: crate::simd::SimdLevel) -> Option<crate::raw_block::RowKernel<Self>> {
+        match level {
+            #[cfg(target_arch = "x86_64")]
+            crate::simd::SimdLevel::Avx2 => Some(matmul_row_avx2),
+            #[cfg(target_arch = "aarch64")]
+            crate::simd::SimdLevel::Neon => Some(matmul_row_neon),
+            _ => None,
+        }
     }
 
     fn dequantize_block(&self, out: &mut [f32]) {
         self.dequantize(out.try_into().expect("one MXFP4 block"));
     }
-}
-
-fn matmul_t_dispatch(
-    mkn: (usize, usize, usize),
-    lhs: &[f32],
-    rhs: &[BlockMxfp4],
-    dst: &mut [f32],
-    parallel: bool,
-) -> candle_core::Result<()> {
-    let blocks_per_row = crate::raw_block::validate_matmul_t(mkn, lhs, rhs, dst)?;
-    if mkn.0 == 0 || mkn.2 == 0 {
-        return Ok(());
-    }
-    if mkn.1 == 0 {
-        dst.fill(0.0);
-        return Ok(());
-    }
-    if try_fused_matmul(mkn, blocks_per_row, lhs, rhs, dst, parallel) {
-        return Ok(());
-    }
-    if parallel {
-        crate::raw_block::matmul_t(mkn, lhs, rhs, dst)
-    } else {
-        crate::raw_block::matmul_t_serial(mkn, lhs, rhs, dst)
-    }
-}
-
-/// The fused AVX2 or NEON kernel for every row at its matching level. Returns
-/// `true` if it ran; the kernel writes each dst element exactly once, so no
-/// zero-fill is needed.
-fn try_fused_matmul(
-    mkn: (usize, usize, usize),
-    blocks_per_row: usize,
-    lhs: &[f32],
-    rhs: &[BlockMxfp4],
-    dst: &mut [f32],
-    parallel: bool,
-) -> bool {
-    #[cfg(target_arch = "x86_64")]
-    if crate::simd::simd_level() == crate::simd::SimdLevel::Avx2 {
-        let (m, k, n) = mkn;
-        let dst_ptr = crate::simd::DstPtr::new(dst);
-        let worker = |row: usize| {
-            // SAFETY: `simd_level` only reports levels this CPU supports;
-            // row `row` writes exactly dst[i*n + row] for i in 0..m,
-            // disjoint from every other row (see `crate::simd`).
-            unsafe { matmul_row_avx2(m, k, n, lhs, rhs, blocks_per_row, row, &dst_ptr) }
-        };
-        if parallel {
-            crate::simd::for_each_row(n, worker);
-        } else {
-            (0..n).for_each(worker);
-        }
-        return true;
-    }
-    #[cfg(target_arch = "aarch64")]
-    if crate::simd::simd_level() == crate::simd::SimdLevel::Neon {
-        let (m, k, n) = mkn;
-        let dst_ptr = crate::simd::DstPtr::new(dst);
-        let worker = |row: usize| {
-            // SAFETY: NEON is available, shapes are validated, and each
-            // worker owns a disjoint output column.
-            unsafe { matmul_row_neon(m, k, n, lhs, rhs, blocks_per_row, row, &dst_ptr) }
-        };
-        if parallel {
-            crate::simd::for_each_row(n, worker);
-        } else {
-            (0..n).for_each(worker);
-        }
-        return true;
-    }
-    let _ = (mkn, blocks_per_row, lhs, rhs, dst, parallel);
-    false
 }
 
 /// Decode directly into vectors and reuse each block across four prompt
@@ -559,7 +487,7 @@ mod tests {
             )
             .unwrap();
             let mut serial = vec![f32::NAN; m * n];
-            matmul_t_dispatch((m, k, n), &lhs, &rhs, &mut serial, false).unwrap();
+            crate::raw_block::matmul_t_serial((m, k, n), &lhs, &rhs, &mut serial).unwrap();
             assert_eq!(actual, serial, "parallel and serial must agree exactly");
             #[allow(unused_mut)]
             let mut outputs = vec![actual];
@@ -633,8 +561,13 @@ mod tests {
                 let repeats = if warmup { 1 } else { 10 };
                 let start = Instant::now();
                 for _ in 0..repeats {
-                    matmul_t_dispatch((m, k, n), black_box(&lhs), black_box(&rhs), &mut dst, false)
-                        .unwrap();
+                    crate::raw_block::matmul_t_serial(
+                        (m, k, n),
+                        black_box(&lhs),
+                        black_box(&rhs),
+                        &mut dst,
+                    )
+                    .unwrap();
                     black_box(&dst);
                 }
                 let fast = start.elapsed().as_secs_f64();

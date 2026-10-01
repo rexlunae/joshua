@@ -1187,8 +1187,10 @@ cargo test --release --lib bench_ -- --ignored --nocapture --test-threads=1
 ```
 
 The ignored benchmarks compare isolated, in-memory kernels with the portable
-worker using the same inputs and serial row scheduling. They do not measure
-full-model generation or disk paging. Run them separately from other workloads.
+worker using the same inputs and serial row scheduling. Sampling benchmarks
+also compare full sorting with top-k selection and fresh with reused speculative
+workspaces. They do not measure full-model generation or disk paging. Run them
+separately from other workloads.
 
 ## Roadmap
 
