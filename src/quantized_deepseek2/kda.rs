@@ -222,7 +222,7 @@ impl Kda {
             (&'a [f32], &'a [f32], &'a [f32], &'a [f32], &'a [f32], &'a mut [f32]);
         let flat = |x: &Tensor| -> Result<Vec<f32>> { x.flatten_all()?.to_vec1() };
         let (q, key, v, g) = (flat(&q)?, flat(&key)?, flat(v)?, flat(&g)?);
-        let beta = beta.to_vec2::<f32>()?; // [t][h]
+        let beta = flat(&beta)?; // flat [t, h]: one read, no per-row Vecs
         let mut o = vec![0f32; t * h * d]; // [t, h, d]
         let mut delta = vec![0f32; d];
         let mut hq: Vec<f32> = Vec::new();
@@ -239,7 +239,7 @@ impl Kda {
                         &key[hh * d..(hh + 1) * d],
                         &v[hh * d..(hh + 1) * d],
                         &g[hh * d..(hh + 1) * d],
-                        std::slice::from_ref(&beta[0][hh]),
+                        std::slice::from_ref(&beta[hh]),
                         &mut o[hh * d..(hh + 1) * d],
                     )
                 } else {
@@ -248,7 +248,7 @@ impl Kda {
                     gather_head(&v, hh, t, h, d, &mut hv);
                     gather_head(&g, hh, t, h, d, &mut hg);
                     hb.clear();
-                    hb.extend((0..t).map(|tok| beta[tok][hh]));
+                    hb.extend((0..t).map(|tok| beta[tok * h + hh]));
                     ho.clear();
                     ho.resize(t * d, 0.0);
                     (&hq, &hk, &hv, &hg, &hb, &mut ho)
