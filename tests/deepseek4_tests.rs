@@ -1197,3 +1197,102 @@ fn deepseek4_hca_prefill_matches_decode_across_blocks() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Local end-to-end CPU decode measurement, including hash routing and both
+/// routed MoE blocks. Run in release mode with --ignored --nocapture.
+#[test]
+#[ignore = "manual single-token decode benchmark"]
+fn benchmark_deepseek4_single_token_decode() {
+    let dir = common::model_dir("deepseek4-decode-benchmark");
+    let model = dir.join("model.gguf");
+    common::write_tiny_deepseek4_gguf(&model);
+    let mut m = load(&model, true);
+    let input = Tensor::new(&[3u32], &Device::Cpu).unwrap().unsqueeze(0).unwrap();
+    let mut samples = Vec::new();
+    for i in 0..410 {
+        m.clear_kv_cache();
+        let start = std::time::Instant::now();
+        std::hint::black_box(m.forward(&input, 0).unwrap());
+        if i >= 10 {
+            samples.push(start.elapsed().as_secs_f64() * 1e6);
+        }
+    }
+    samples.sort_by(f64::total_cmp);
+    eprintln!(
+        "deepseek4 decode: median {:.1} us, p90 {:.1} us",
+        samples[200], samples[360]
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Isolate the ring-cache reorder removed from `Attention::build_kv`. Both
+/// paths return the same absolute-position window; time alternating runs on
+/// one device so CPU/GPU clock changes affect them equally.
+#[test]
+#[ignore = "manual attention window microbenchmark"]
+fn benchmark_deepseek4_window_gather() -> candle_core::Result<()> {
+    fn bench(dev: &Device, name: &str) -> candle_core::Result<()> {
+        let win = 256usize;
+        let d = 256usize;
+        let offset = 4 * win + 13;
+        let values: Vec<f32> = (0..win * d).map(|i| i as f32 / 1000.0).collect();
+        let ring = Tensor::from_vec(values, (win, d), dev)?;
+        let fresh = Tensor::ones((1, d), candle_core::DType::F32, dev)?;
+        let mut timings = [Vec::new(), Vec::new()];
+        for round in 0..7 {
+            for kind in [round % 2, 1 - round % 2] {
+                dev.synchronize()?;
+                let start = std::time::Instant::now();
+                for _ in 0..100 {
+                    let source = if kind == 0 {
+                        let base = offset as i64 - win as i64;
+                        let ring_rows: Vec<u32> = (0..win)
+                            .map(|j| (base + j as i64).rem_euclid(win as i64) as u32)
+                            .collect();
+                        let ordered = ring.index_select(
+                            &Tensor::from_vec(ring_rows, win, dev)?, 0)?;
+                        Tensor::cat(&[&ordered, &fresh], 0)?
+                    } else {
+                        Tensor::cat(&[&ring, &fresh], 0)?
+                    };
+                    let lo = offset + 1 - win;
+                    let mut rows = vec![0u32; win];
+                    for (j, row) in rows.iter_mut().enumerate() {
+                        let token = lo + j;
+                        *row = if kind == 0 {
+                            (token as i64 - (offset as i64 - win as i64)) as u32
+                        } else if token < offset {
+                            (token % win) as u32
+                        } else {
+                            (win + token - offset) as u32
+                        };
+                    }
+                    let out = source.index_select(&Tensor::from_vec(rows, win, dev)?, 0)?;
+                    if round == 0 {
+                        let got = out.flatten_all()?.to_vec1::<f32>()?;
+                        let first = got[0];
+                        let expected = ((lo % win) * d) as f32 / 1000.0;
+                        assert_eq!(first, expected);
+                    }
+                    std::hint::black_box(out);
+                }
+                dev.synchronize()?;
+                if round != 0 {
+                    timings[kind].push(start.elapsed().as_secs_f64() * 1e4);
+                }
+            }
+        }
+        for times in &mut timings {
+            times.sort_by(f64::total_cmp);
+        }
+        eprintln!(
+            "{name} window gather: reordered {:.1} us/call, direct {:.1} us/call",
+            timings[0][3], timings[1][3]
+        );
+        Ok(())
+    }
+    bench(&Device::Cpu, "CPU")?;
+    #[cfg(feature = "metal")]
+    bench(&Device::new_metal(0)?, "Metal")?;
+    Ok(())
+}

@@ -246,3 +246,21 @@ fn auto_resolves_to_metal_in_metal_build() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// The candle-representable V4 fixture exercises device-side hash routing
+/// and ring-cache attention without the production IQ2_XXS CPU restriction.
+#[test]
+fn deepseek4_candle_only_metal_matches_cpu() {
+    let Some(dev) = metal() else { return };
+    let dir = common::model_dir("metal-ds4-candle-only");
+    let model = dir.join("model.gguf");
+    common::write_tiny_deepseek4_gguf_candle_only(&model);
+    let mut cpu = load(&model, &Device::Cpu);
+    let mut gpu = load(&model, &dev);
+    for (tokens, offset) in [(&[1, 4, 2, 7, 5][..], 0usize), (&[3][..], 5usize)] {
+        let expected = logits(&mut cpu, tokens, offset, &Device::Cpu);
+        let got = logits(&mut gpu, tokens, offset, &dev);
+        assert_close(&expected, &got, "deepseek4 candle-only");
+    }
+    std::fs::remove_dir_all(dir).ok();
+}

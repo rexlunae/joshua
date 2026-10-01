@@ -1504,15 +1504,11 @@ impl Attention {
         let d = self.head_dim;
         let dev = kv_raw.device();
 
-        // Dense window source: row j holds token `base + j`, with the first
-        // `win` rows read out of the ring in absolute-position order.  Rows for
-        // tokens before position 0 hold stale data but are always masked out.
-        let base = offset as i64 - win as i64;
-        let ring_rows: Vec<u32> = (0..win)
-            .map(|j| (base + j as i64).rem_euclid(win as i64) as u32)
-            .collect();
-        let hist = swa_prev.index_select(&Tensor::from_vec(ring_rows, (win,), dev)?, 0)?;
-        let k_src = Tensor::cat(&[hist, kv_raw.clone()], 0)?; // [win + seq, d]
+        // Keep the ring in storage order. Gather each historical key from its
+        // physical slot and each key in this chunk from its appended row.
+        // This avoids materializing an ordered copy of the entire window on
+        // every attention pass, especially costly for single-token decode.
+        let k_src = Tensor::cat(&[swa_prev, kv_raw], 0)?; // [win + seq, d]
 
         // Window rows: token t of query p is valid iff
         // max(0, p+1-win) <= t <= p.
@@ -1523,7 +1519,12 @@ impl Attention {
             let lo = (p + 1).saturating_sub(win);
             let cnt = p + 1 - lo;
             for j in 0..cnt {
-                w_rows[r * win + j] = ((lo + j) as i64 - base) as u32;
+                let t = lo + j;
+                w_rows[r * win + j] = if t < offset {
+                    (t % win) as u32
+                } else {
+                    (win + t - offset) as u32
+                };
                 w_mask[r * win + j] = 0.0;
             }
         }
@@ -2136,14 +2137,17 @@ impl Moe {
             // Hash layers: expert *selection* comes from tid2eid[token_id], but the
             // routing *weights* still come from the gate network's softplus scores
             // (official `Gate.forward` gathers `original_scores` at the hash ids).
-            let ids = input_ids.flatten_all()?.to_vec1::<u32>()?;
-            let tid = Tensor::from_vec(ids, n_tokens, xs.device())?;
+            // Keep token IDs on their device. If the caller supplied them
+            // elsewhere, move them directly to the router's device instead
+            // of synchronizing through a host Vec on every hash layer.
+            let flat_ids = input_ids.flatten_all()?;
+            let tid = crate::moe::on_device(&flat_ids, xs.device())?;
             // tid2eid is [n_vocab, n_expert_used]: select the token-id rows.
             let idx = self
                 .tid2eid
                 .as_ref()
                 .unwrap()
-                .index_select(&tid, 0)?
+                .index_select(tid.as_ref(), 0)?
                 .to_dtype(DType::U32)?; // [n_tokens, k]
             (crate::moe::routing_weights(&probs, &idx, true, self.weights_scale)?, idx)
         } else {
@@ -2279,8 +2283,15 @@ impl Moe {
         let dev = x2.device();
         let mut y = Tensor::zeros((n_tokens, h), DType::F32, dev)?;
         // Select each expert's input rows once; all three phases reuse them.
-        let mut sel: Vec<(usize, Tensor, Tensor)> = Vec::with_capacity(active.len());
+        // A single-token route to one expert already has exactly the input
+        // row it needs, so skip the index tensor and gather. Duplicate routes
+        // still use the batched path to preserve their scatter ordering.
+        let mut sel: Vec<(usize, Option<Tensor>, Tensor)> = Vec::with_capacity(active.len());
         for &e in active {
+            if n_tokens == 1 && per_expert[e].len() == 1 {
+                sel.push((e, None, x2.clone()));
+                continue;
+            }
             let token_idx: Vec<u32> = per_expert[e].iter().map(|(t, _)| *t).collect();
             let count = token_idx.len();
             if count == 0 {
@@ -2288,7 +2299,7 @@ impl Moe {
             }
             let idx = Tensor::from_vec(token_idx, count, dev)?;
             let x_sel = x2.index_select(&idx, 0)?;
-            sel.push((e, idx, x_sel));
+            sel.push((e, Some(idx), x_sel));
         }
 
         // Tensor-major MoE: run every expert's gate, then every expert's up,
@@ -2308,9 +2319,13 @@ impl Moe {
         }
         for (((e, idx, _), gate), up) in sel.iter().zip(gates).zip(ups) {
             let out = self.experts[*e].combine_and_down(gate, up)?;
-            let w: Vec<f32> = per_expert[*e].iter().map(|(_, w)| *w).collect();
-            let w = Tensor::from_vec(w, (idx.elem_count(), 1), dev)?;
-            y = y.index_add(idx, &out.broadcast_mul(&w)?, 0)?;
+            if let Some(idx) = idx {
+                let w: Vec<f32> = per_expert[*e].iter().map(|(_, w)| *w).collect();
+                let w = Tensor::from_vec(w, (idx.elem_count(), 1), dev)?;
+                y = y.index_add(idx, &out.broadcast_mul(&w)?, 0)?;
+            } else {
+                y = (y + out.affine(per_expert[*e][0].1 as f64, 0.0)?)?;
+            }
         }
         Ok(y)
     }
