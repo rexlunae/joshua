@@ -53,7 +53,14 @@ fn check_verification_and_rollback(model_path: &Path) {
 
     let mut m = load(model_path);
     assert!(m.supports_speculative());
-    last_logits(&mut m, &prompt, 0);
+    let prefill = last_logits(&mut m, &prompt, 0);
+    let mut verifier = load(model_path);
+    let prefill_rows = all_logits(&mut verifier, &prompt, 0);
+    assert_close(
+        &prefill,
+        prefill_rows.last().unwrap(),
+        "prefill last vs all rows",
+    );
     let rows = all_logits(&mut m, &block, prompt.len());
 
     let mut reference = load(model_path);

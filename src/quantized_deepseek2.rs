@@ -1189,11 +1189,11 @@ impl<R: Read + Seek> Reader<R> {
 
     /// A sublayer's hyper-connection mixer `{p}_{fn,base,scale}`.
     fn hyper_connection(&mut self, p: &str) -> Result<HyperConnection> {
-        Ok(HyperConnection {
-            hc_fn: self.qmatmul(&format!("{p}_fn.weight"))?,
-            base: self.f32_tensor(&format!("{p}_base.weight"))?,
-            scale: self.f32_tensor(&format!("{p}_scale.weight"))?,
-        })
+        HyperConnection::new(
+            self.qmatmul(&format!("{p}_fn.weight"))?,
+            self.f32_tensor(&format!("{p}_base.weight"))?,
+            &self.f32_tensor(&format!("{p}_scale.weight"))?,
+        )
     }
 
     /// Layer `p`'s attention block, MLA or GQA per `cfg`.
