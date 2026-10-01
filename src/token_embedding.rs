@@ -18,9 +18,13 @@
 //!
 //! [`TokenEmbedding::Dense`] is the old f32 table, kept for backends whose
 //! quantized storage has no gather kernel (OpenCL holds weights as dense
-//! f32 already, so nothing is saved there) and for float dtypes on
+//! f32 already, so nothing is saved there), for float dtypes on
 //! accelerators (an f32 table is no larger dense, and the GPU quantized
-//! embedding kernels are only exercised for block-quantized types).
+//! embedding kernels are only exercised for block-quantized types), and
+//! for Q8_1/Q8_K tables on CUDA/Metal, whose get-rows kernels reject
+//! those dtypes.
+
+use std::sync::Arc;
 
 use candle_core::quantized::{GgmlDType, QTensor};
 use candle_core::{DType, Device, Result, Tensor};
@@ -28,7 +32,7 @@ use candle_core::{DType, Device, Result, Tensor};
 /// A `[vocab, hidden]` token-embedding table.
 pub enum TokenEmbedding {
     /// Quantized table, gathered per row through `QTensor::embedding`.
-    Quantized(QTensor),
+    Quantized(Arc<QTensor>),
     /// Dequantized f32 table, gathered with `index_select`.
     Dense(Tensor),
 }
@@ -40,20 +44,46 @@ impl TokenEmbedding {
     /// storage: always on the CPU (both the borrowed-mmap and heap storages
     /// implement it for every dtype), on OpenCL, Vulkan and SYCL (their block
     /// storages gather rows with an on-device dequantizing kernel for every
-    /// GGUF dtype), and for block-quantized dtypes on CUDA/Metal.  Dense
-    /// only for float dtypes on CUDA/Metal.
+    /// GGUF dtype), and for block-quantized dtypes on CUDA/Metal other than
+    /// Q8_1 and Q8_K, whose get-rows kernels those backends lack.  Dense
+    /// for float dtypes on CUDA/Metal and for Q8_1/Q8_K tables there.
     pub fn load(table: QTensor, device: &Device) -> Result<Self> {
+        Self::from_arc(Arc::new(table), device)
+    }
+
+    /// [`load`] for a table already shared as an `Arc` — a loader that also
+    /// keeps the same tensor behind a quantized matmul (tied embeddings)
+    /// clones the `Arc` instead of owning a second copy.
+    pub fn from_arc(table: Arc<QTensor>, device: &Device) -> Result<Self> {
         let float_dtype = matches!(
             table.dtype(),
             GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16
         );
         // SYCL has an on-device dequantizing row-gather kernel for every GGUF
         // dtype (like OpenCL/Vulkan), so embeddings stay block-quantized there.
-        let keep_quantized = device.is_cpu() || device.is_opencl() || device.is_vulkan() || device.is_sycl() || !float_dtype;
+        // CUDA and Metal gather rows with per-dtype get-rows kernels that
+        // cover every GGUF dtype except Q8_1 and Q8_K — those two (like the
+        // float dtypes, which are no smaller dense) fall back to a dense
+        // table, dequantized on the device as the old loader did.
+        let keep_quantized = device.is_cpu()
+            || device.is_opencl()
+            || device.is_vulkan()
+            || device.is_sycl()
+            || (!float_dtype
+                && !(matches!(table.dtype(), GgmlDType::Q8_1 | GgmlDType::Q8K)
+                    && (device.is_cuda() || device.is_metal())));
         if keep_quantized {
             Ok(Self::Quantized(table))
         } else {
             Ok(Self::Dense(table.dequantize(device)?.to_dtype(DType::F32)?))
+        }
+    }
+
+    /// The device the table lives on.
+    pub fn device(&self) -> Device {
+        match self {
+            Self::Quantized(q) => q.device(),
+            Self::Dense(t) => t.device().clone(),
         }
     }
 
@@ -112,6 +142,40 @@ mod tests {
             a, b,
             "quantized gather must be bit-identical to the dense path"
         );
+        Ok(())
+    }
+
+    /// `from_arc` applies the same representation rules as [`load`], for a
+    /// table a loader already shares behind an `Arc` (tied embeddings).
+    #[test]
+    fn from_arc_matches_load_on_cpu() -> Result<()> {
+        let t = Tensor::arange(0f32, 128f32, &Device::Cpu)?.reshape((4, 32))?;
+        let shared = Arc::new(QTensor::quantize(&t, GgmlDType::Q8_0)?);
+        let a = TokenEmbedding::from_arc(Arc::clone(&shared), &Device::Cpu)?;
+        let b = TokenEmbedding::load(QTensor::quantize(&t, GgmlDType::Q8_0)?, &Device::Cpu)?;
+        assert!(a.is_quantized() && b.is_quantized());
+        let ids = Tensor::new(&[2u32, 3], &Device::Cpu)?;
+        let x: Vec<f32> = a.forward(&ids)?.flatten_all()?.to_vec1()?;
+        let y: Vec<f32> = b.forward(&ids)?.flatten_all()?.to_vec1()?;
+        assert_eq!(x, y);
+        assert!(matches!(a.device(), Device::Cpu));
+        Ok(())
+    }
+
+    /// Q8_K tables gather on the CPU (its storage implements every GGUF
+    /// dtype); on CUDA/Metal they fall back to dense, since those get-rows
+    /// kernels reject Q8_1 and Q8_K.
+    #[test]
+    fn q8k_tables_stay_quantized_on_cpu() -> Result<()> {
+        let t = Tensor::arange(0f32, 1024f32, &Device::Cpu)?.reshape((4, 256))?;
+        let q = QTensor::quantize(&t, GgmlDType::Q8K)?;
+        let dense = TokenEmbedding::Dense(q.dequantize(&Device::Cpu)?);
+        let e = TokenEmbedding::load(q, &Device::Cpu)?;
+        assert!(e.is_quantized());
+        let ids = Tensor::new(&[0u32, 3], &Device::Cpu)?;
+        let a: Vec<f32> = e.forward(&ids)?.flatten_all()?.to_vec1()?;
+        let b: Vec<f32> = dense.forward(&ids)?.flatten_all()?.to_vec1()?;
+        assert_eq!(a, b, "quantized gather must be bit-identical to the dense path");
         Ok(())
     }
 
