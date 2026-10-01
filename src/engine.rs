@@ -106,7 +106,6 @@ use std::time::Instant;
 use candle_core::quantized::gguf_file;
 use candle_core::{Device, Tensor};
 use memmap2::Mmap;
-use rand::distributions::{Distribution, WeightedIndex};
 use rand::thread_rng;
 use tokenizers::Tokenizer;
 
@@ -114,8 +113,7 @@ use crate::embedding::EmbeddingModel;
 use crate::model::{Architecture, QuantizedModel};
 use crate::npu::{NpuBackend, NpuSession};
 use crate::speculative::{
-    next_draft_len, verify_token, NgramDrafter, SpeculativeConfig, SpeculativeStats, TokenDist,
-    Verdict,
+    next_draft_len, NgramDrafter, SpeculativeConfig, SpeculativeStats, TokenDistRef, Verdict,
 };
 pub use crate::placement::{DensePlacement, ExpertPlacement, VramExpertCache};
 use crate::template::ChatTemplate;
@@ -2474,6 +2472,8 @@ impl Engine {
         // A token already chosen by a rejected verification (the
         // correction), to emit before sampling anything new.
         let mut pending: Option<u32> = None;
+        let mut drafts = Vec::new();
+        let mut block = Vec::new();
 
         loop {
             if text.n_decoded >= options.max_tokens {
@@ -2517,14 +2517,12 @@ impl Engine {
 
             // Draft continuation tokens, bounded so that every accepted one
             // can still be emitted (max_tokens) and fed (context window).
-            let drafts = match drafter.as_mut() {
-                Some(d) => {
-                    let room = (options.max_tokens - text.n_decoded) as usize;
-                    let ctx_room = (self.n_ctx as usize).saturating_sub(n_cur + 1);
-                    d.draft(draft_len.min(room).min(ctx_room))
-                }
-                None => Vec::new(),
-            };
+            drafts.clear();
+            if let Some(d) = drafter.as_mut() {
+                let room = (options.max_tokens - text.n_decoded) as usize;
+                let ctx_room = (self.n_ctx as usize).saturating_sub(n_cur + 1);
+                d.draft_into(draft_len.min(room).min(ctx_room), &mut drafts);
+            }
 
             if drafts.is_empty() {
                 // Single-token decode step.
@@ -2538,7 +2536,8 @@ impl Engine {
             // Row i of `rows` predicts the token after block[i], so row 0
             // checks drafts[0], and the last row is the next step's logits if
             // the whole draft is accepted.
-            let mut block = Vec::with_capacity(drafts.len() + 1);
+            block.clear();
+            block.reserve(drafts.len() + 1);
             block.push(next_token);
             block.extend_from_slice(&drafts);
             let mut rows = model.forward_tokens_all(&block, n_cur, &self.dense_device)?;
@@ -2549,8 +2548,8 @@ impl Engine {
             let mut kept = 0usize;
             let mut stop = false;
             for (i, &draft) in drafts.iter().enumerate() {
-                let dist = token_distribution(&rows[i], options, &text.recent_tokens);
-                match verify_token(&dist, draft, &mut rng)? {
+                let dist = sampler.distribution(&rows[i], options, &text.recent_tokens);
+                match dist.verify(draft, &mut rng)? {
                     Verdict::Accept => {
                         accepted += 1;
                         if self.eos_token_ids.contains(&draft) {
@@ -4475,13 +4474,18 @@ fn squeeze_batch_logits(logits: &Tensor) -> Result<Vec<f32>> {
             rng: &mut impl rand::Rng,
             recent_tokens: &[u32],
         ) -> Result<u32> {
+            self.distribution(logits, opts, recent_tokens).sample(rng)
+        }
+
+        fn distribution(
+            &mut self,
+            logits: &[f32],
+            opts: &GenerationOptions,
+            recent_tokens: &[u32],
+        ) -> TokenDistRef<'_> {
             match self.fill(logits, opts, recent_tokens) {
-                SamplingKind::Greedy(token) => Ok(token),
-                SamplingKind::Probs => {
-                    let dist = WeightedIndex::new(self.probs.iter().copied())
-                        .map_err(|e| JoshuaError::Inference(e.to_string()))?;
-                    Ok(dist.sample(rng) as u32)
-                }
+                SamplingKind::Greedy(token) => TokenDistRef::Greedy(token),
+                SamplingKind::Probs => TokenDistRef::Probs(&self.probs),
             }
         }
 
@@ -4541,18 +4545,7 @@ fn squeeze_batch_logits(logits: &Tensor) -> Result<Vec<f32>> {
             probs.extend(logits.iter().map(|&l| ((l - max_logit) * inv_temp).exp()));
 
             // ── Top-k ─────────────────────────────────────────────────────────────────
-            let k = opts.top_k as usize;
-            if k > 0 && k < probs.len() {
-                let indexed = &mut self.indexed;
-                indexed.clear();
-                indexed.extend(probs.iter().copied().enumerate());
-                indexed.sort_unstable_by(|(_, a), (_, b)| {
-                    b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
-                });
-                for &(idx, _) in indexed.iter().skip(k) {
-                    probs[idx] = 0.0;
-                }
-            }
+            retain_top_k(probs, opts.top_k as usize, &mut self.indexed);
 
             // ── Min-p ─────────────────────────────────────────────────────────────────
             if opts.min_p > 0.0 {
@@ -4606,19 +4599,38 @@ fn squeeze_batch_logits(logits: &Tensor) -> Result<Vec<f32>> {
         }
     }
 
-    /// Materialize an owned distribution for speculative verification. Ordinary
-    /// decode keeps scratch buffers and samples directly from them.
-    fn token_distribution(
-        logits: &[f32],
-        opts: &GenerationOptions,
-        recent_tokens: &[u32],
-    ) -> TokenDist {
-        let mut scratch = SamplingWorkspace::default();
-        match scratch.fill(logits, opts, recent_tokens) {
-            SamplingKind::Greedy(token) => TokenDist::Greedy(token),
-            SamplingKind::Probs => TokenDist::Probs(scratch.probs),
-        }
+/// Keep the top-k probabilities without fully ordering the vocabulary.
+/// A tied cutoff uses the original sort and input order to preserve its
+/// exact choice of token IDs. Non-finite inputs also keep the old behavior.
+fn retain_top_k(probs: &mut [f32], k: usize, indexed: &mut Vec<(usize, f32)>) {
+    if k == 0 || k >= probs.len() {
+        return;
     }
+    indexed.clear();
+    indexed.extend(probs.iter().copied().enumerate());
+    let compare = |a: &(usize, f32), b: &(usize, f32)| {
+        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+    };
+    let needs_sort = if probs.iter().all(|p| p.is_finite()) {
+        let (kept, boundary, _) = indexed.select_nth_unstable_by(k, compare);
+        let tied = kept.iter().any(|(_, p)| *p == boundary.1);
+        if tied {
+            // Selection permutes the entries. Restore the original order
+            // before the fallback: unstable sorting uses it to break ties.
+            indexed.clear();
+            indexed.extend(probs.iter().copied().enumerate());
+        }
+        tied
+    } else {
+        true
+    };
+    if needs_sort {
+        indexed.sort_unstable_by(compare);
+    }
+    for &(idx, _) in indexed.iter().skip(k) {
+        probs[idx] = 0.0;
+    }
+}
 
 /// Index of the largest logit (0 for an empty vector).
 fn argmax(logits: &[f32]) -> u32 {
@@ -4633,6 +4645,207 @@ fn argmax(logits: &[f32]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sorted_top_k(probs: &mut [f32], k: usize, indexed: &mut Vec<(usize, f32)>) {
+        if k == 0 || k >= probs.len() {
+            return;
+        }
+        indexed.clear();
+        indexed.extend(probs.iter().copied().enumerate());
+        indexed.sort_unstable_by(|(_, a), (_, b)| {
+            b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        for &(i, _) in indexed.iter().skip(k) {
+            probs[i] = 0.0;
+        }
+    }
+
+    #[test]
+    fn partial_top_k_matches_full_sort_including_tied_cutoffs() {
+        use rand::{rngs::StdRng, Rng, SeedableRng};
+        let mut rng = StdRng::seed_from_u64(93);
+        let mut fixtures = vec![
+            vec![],
+            vec![1.0],
+            vec![0.0, -0.0, 0.0],
+            vec![1.0, 0.5, 0.5, 0.5, 0.1],
+            vec![f32::NAN, 1.0, 0.0],
+            vec![f32::INFINITY, 1.0, f32::NEG_INFINITY],
+        ];
+        for len in [2, 7, 17, 64, 257] {
+            fixtures.push((0..len).map(|_| rng.gen_range(0.0..1.0)).collect());
+            fixtures.push((0..len).map(|_| rng.gen_range(0..4) as f32).collect());
+            fixtures.push(vec![0.25; len]);
+        }
+        let mut selected = Vec::new();
+        let mut sorted = Vec::new();
+        for input in fixtures {
+            for k in 0..=input.len() + 1 {
+                let mut want = input.clone();
+                let mut got = input.clone();
+                sorted_top_k(&mut want, k, &mut sorted);
+                retain_top_k(&mut got, k, &mut selected);
+                assert_eq!(
+                    got.iter().map(|p| p.to_bits()).collect::<Vec<_>>(),
+                    want.iter().map(|p| p.to_bits()).collect::<Vec<_>>(),
+                    "k={k} input={input:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "manual top-k benchmark; run release mode with --nocapture"]
+    fn bench_top_k_selection() {
+        use rand::{rngs::StdRng, Rng, SeedableRng};
+        use std::{hint::black_box, time::Instant};
+        let mut rng = StdRng::seed_from_u64(31);
+        let input: Vec<f32> = (0..131_072).map(|_| rng.gen_range(0.0..1.0)).collect();
+        let mut probs = input.clone();
+        let mut indexed = Vec::new();
+        let mut timings = [0.0; 2];
+        for selection in [false, true] {
+            for warmup in [true, false] {
+                let repeats = if warmup { 2 } else { 100 };
+                let start = Instant::now();
+                for _ in 0..repeats {
+                    probs.copy_from_slice(&input);
+                    if selection {
+                        retain_top_k(black_box(&mut probs), 40, &mut indexed);
+                    } else {
+                        sorted_top_k(black_box(&mut probs), 40, &mut indexed);
+                    }
+                    black_box(&probs);
+                }
+                if !warmup {
+                    timings[selection as usize] = start.elapsed().as_secs_f64();
+                }
+            }
+        }
+        eprintln!(
+            "top-k=40 vocab=131072: full sort {:.3}ms, selection {:.3}ms ({:.2}x)",
+            timings[0] * 10.0,
+            timings[1] * 10.0,
+            timings[0] / timings[1]
+        );
+    }
+
+    /// Former speculative path: one fresh workspace and an owned distribution
+    /// per verified token. Kept here as a reference and benchmark baseline.
+    fn fresh_distribution(
+        logits: &[f32],
+        opts: &GenerationOptions,
+        recent: &[u32],
+    ) -> crate::speculative::TokenDist {
+        use crate::speculative::TokenDist;
+        let mut workspace = SamplingWorkspace::default();
+        match workspace.fill(logits, opts, recent) {
+            SamplingKind::Greedy(t) => TokenDist::Greedy(t),
+            SamplingKind::Probs => TokenDist::Probs(workspace.probs),
+        }
+    }
+
+    #[test]
+    fn reused_distributions_match_fresh_after_size_and_option_changes() {
+        use rand::{rngs::StdRng, Rng, SeedableRng};
+        let mut workspace = SamplingWorkspace::default();
+        let mut rng = StdRng::seed_from_u64(42);
+        for len in [257, 7, 1, 0, 19, 513, 7] {
+            let logits: Vec<f32> = (0..len).map(|_| rng.gen_range(-4.0..4.0)).collect();
+            for (temperature, top_k, top_p, min_p) in [
+                (0.0, 0, 1.0, 0.0),
+                (0.7, 5, 0.8, 0.05),
+                (1.0, 0, 1.0, 0.0),
+                (0.5, 0, 0.9, 0.2),
+            ] {
+                let opts = GenerationOptions {
+                    temperature,
+                    top_k,
+                    top_p,
+                    min_p,
+                    repetition_penalty: 1.2,
+                    ..Default::default()
+                };
+                let recent = [0, 3, 3, 999];
+                let expected = fresh_distribution(&logits, &opts, &recent);
+                let actual = workspace.distribution(&logits, &opts, &recent);
+                match (actual, expected.as_ref()) {
+                    (TokenDistRef::Greedy(a), TokenDistRef::Greedy(b)) => assert_eq!(a, b),
+                    (TokenDistRef::Probs(a), TokenDistRef::Probs(b)) => assert_eq!(a, b),
+                    _ => panic!("distribution kind changed"),
+                }
+                let mut a = StdRng::seed_from_u64(7);
+                let mut b = a.clone();
+                for draft in [0, 3, 999] {
+                    assert_eq!(
+                        actual.verify(draft, &mut a).unwrap(),
+                        crate::speculative::verify_token(&expected, draft, &mut b).unwrap()
+                    );
+                }
+                assert_eq!(
+                    actual.sample(&mut a).unwrap(),
+                    expected.sample(&mut b).unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "manual workspace benchmark; run release mode with --nocapture"]
+    fn bench_speculative_workspace_reuse() {
+        use rand::{rngs::StdRng, SeedableRng};
+        use std::{hint::black_box, time::Instant};
+        let logits: Vec<f32> = (0..131_072)
+            .map(|i| ((i * 7919) % 1000) as f32 / 100.0)
+            .collect();
+        for filtered in [false, true] {
+            let opts = if filtered {
+                GenerationOptions::default()
+            } else {
+                GenerationOptions {
+                    top_k: 0,
+                    top_p: 1.0,
+                    min_p: 0.0,
+                    ..Default::default()
+                }
+            };
+            let mut workspace = SamplingWorkspace::default();
+            let recent = [1, 17, 59];
+            let mut timings = [0.0; 2];
+            for reuse in [false, true] {
+                let mut rng = StdRng::seed_from_u64(7);
+                for warmup in [true, false] {
+                    let repeats = if warmup { 2 } else { 100 };
+                    let start = Instant::now();
+                    for _ in 0..repeats {
+                        let verdict = if reuse {
+                            workspace
+                                .distribution(black_box(&logits), &opts, &recent)
+                                .verify(17, &mut rng)
+                                .unwrap()
+                        } else {
+                            crate::speculative::verify_token(
+                                &fresh_distribution(black_box(&logits), &opts, &recent),
+                                17,
+                                &mut rng,
+                            )
+                            .unwrap()
+                        };
+                        black_box(verdict);
+                    }
+                    if !warmup {
+                        timings[reuse as usize] = start.elapsed().as_secs_f64();
+                    }
+                }
+            }
+            eprintln!(
+                "filtered={filtered}: fresh {:.3}ms, reused {:.3}ms per token ({:.2}x)",
+                timings[0] * 10.0,
+                timings[1] * 10.0,
+                timings[0] / timings[1]
+            );
+        }
+    }
 
     #[test]
     fn sanitize_model_name_keeps_plain_names() {

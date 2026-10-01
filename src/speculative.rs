@@ -158,8 +158,16 @@ impl NgramDrafter {
     /// Propose `max_tokens` tokens continuing the context, or none when no
     /// trailing n-gram of at least `min_ngram` tokens has occurred before.
     pub fn draft(&mut self, max_tokens: usize) -> Vec<u32> {
+        let mut draft = Vec::new();
+        self.draft_into(max_tokens, &mut draft);
+        draft
+    }
+
+    /// Replace `draft` with the next proposal, retaining its allocation.
+    pub fn draft_into(&mut self, max_tokens: usize, draft: &mut Vec<u32>) {
+        draft.clear();
         if max_tokens == 0 {
-            return Vec::new();
+            return;
         }
         self.index_pending();
         let len = self.tokens.len();
@@ -181,15 +189,14 @@ impl NgramDrafter {
             // end of the context it carries on through the draft itself, so
             // a periodic tail (`x y x y` → `x y x y …`) drafts a full run
             // instead of a single token.
-            let mut draft = Vec::with_capacity(max_tokens);
+            draft.reserve(max_tokens);
             for j in 0..max_tokens {
                 let i = end + j;
                 let t = if i < len { self.tokens[i] } else { draft[i - len] };
                 draft.push(t);
             }
-            return draft;
+            return;
         }
-        Vec::new()
     }
 
     /// Index every n-gram ending before the last context position.
@@ -240,9 +247,56 @@ pub enum TokenDist {
 impl TokenDist {
     /// Draw a token.
     pub fn sample(&self, rng: &mut impl Rng) -> Result<u32> {
+        self.as_ref().sample(rng)
+    }
+
+    pub(crate) fn as_ref(&self) -> TokenDistRef<'_> {
         match self {
-            Self::Greedy(t) => Ok(*t),
-            Self::Probs(p) => sample_probs(p, rng),
+            Self::Greedy(t) => TokenDistRef::Greedy(*t),
+            Self::Probs(p) => TokenDistRef::Probs(p),
+        }
+    }
+}
+
+/// A distribution borrowed from a reusable sampling workspace.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum TokenDistRef<'a> {
+    Greedy(u32),
+    Probs(&'a [f32]),
+}
+
+impl TokenDistRef<'_> {
+    pub(crate) fn sample(self, rng: &mut impl Rng) -> Result<u32> {
+        match self {
+            Self::Greedy(t) => Ok(t),
+            Self::Probs(p) => sample_probs(p.iter().copied(), rng),
+        }
+    }
+
+    pub(crate) fn verify(self, draft: u32, rng: &mut impl Rng) -> Result<Verdict> {
+        match self {
+            Self::Greedy(t) => Ok(if t == draft {
+                Verdict::Accept
+            } else {
+                Verdict::Reject(t)
+            }),
+            Self::Probs(p) => {
+                let p_draft = p.get(draft as usize).copied().unwrap_or(0.0);
+                if p_draft > 0.0 && rng.gen::<f32>() < p_draft {
+                    return Ok(Verdict::Accept);
+                }
+                // Mask the rejected token while iterating. Keep the target
+                // probabilities untouched and avoid a vocabulary-sized copy.
+                let residual =
+                    p.iter()
+                        .enumerate()
+                        .map(|(i, &p)| if i == draft as usize { 0.0 } else { p });
+                if residual.clone().sum::<f32>() <= 0.0 {
+                    // Only reachable through rounding when p(draft) ≈ 1.
+                    return Ok(Verdict::Accept);
+                }
+                Ok(Verdict::Reject(sample_probs(residual, rng)?))
+            }
         }
     }
 }
@@ -265,31 +319,10 @@ pub enum Verdict {
 /// the residual `max(0, p - q)` is `p` with `draft` removed.  Together they
 /// emit exactly one token distributed as `p`.
 pub fn verify_token(dist: &TokenDist, draft: u32, rng: &mut impl Rng) -> Result<Verdict> {
-    match dist {
-        TokenDist::Greedy(t) => Ok(if *t == draft {
-            Verdict::Accept
-        } else {
-            Verdict::Reject(*t)
-        }),
-        TokenDist::Probs(p) => {
-            let p_draft = p.get(draft as usize).copied().unwrap_or(0.0);
-            if p_draft > 0.0 && rng.gen::<f32>() < p_draft {
-                return Ok(Verdict::Accept);
-            }
-            let mut residual = p.clone();
-            if let Some(x) = residual.get_mut(draft as usize) {
-                *x = 0.0;
-            }
-            if residual.iter().sum::<f32>() <= 0.0 {
-                // Only reachable through rounding when p(draft) ≈ 1.
-                return Ok(Verdict::Accept);
-            }
-            Ok(Verdict::Reject(sample_probs(&residual, rng)?))
-        }
-    }
+    dist.as_ref().verify(draft, rng)
 }
 
-fn sample_probs(p: &[f32], rng: &mut impl Rng) -> Result<u32> {
+fn sample_probs(p: impl IntoIterator<Item = f32>, rng: &mut impl Rng) -> Result<u32> {
     let dist = WeightedIndex::new(p).map_err(|e| JoshuaError::Inference(e.to_string()))?;
     Ok(dist.sample(rng) as u32)
 }
@@ -434,6 +467,70 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn borrowed_verification_matches_copying_reference() {
+        fn reference(p: &[f32], draft: u32, rng: &mut impl Rng) -> Result<Verdict> {
+            let p_draft = p.get(draft as usize).copied().unwrap_or(0.0);
+            if p_draft > 0.0 && rng.gen::<f32>() < p_draft {
+                return Ok(Verdict::Accept);
+            }
+            let mut residual = p.to_vec();
+            if let Some(p) = residual.get_mut(draft as usize) {
+                *p = 0.0;
+            }
+            if residual.iter().sum::<f32>() <= 0.0 {
+                return Ok(Verdict::Accept);
+            }
+            let dist =
+                WeightedIndex::new(&residual).map_err(|e| JoshuaError::Inference(e.to_string()))?;
+            Ok(Verdict::Reject(dist.sample(rng) as u32))
+        }
+        for p in [
+            vec![],
+            vec![1.0],
+            vec![0.1, 0.6, 0.3],
+            vec![0.0, 0.5, 0.5],
+            vec![0.0, 0.0],
+            vec![f32::NAN, 0.5],
+            vec![-0.1, 1.1],
+        ] {
+            let original: Vec<_> = p.iter().map(|v| v.to_bits()).collect();
+            for draft in 0..p.len() as u32 + 2 {
+                let mut expected_rng = StdRng::seed_from_u64(19);
+                let mut actual_rng = expected_rng.clone();
+                for _ in 0..100 {
+                    let expected =
+                        reference(&p, draft, &mut expected_rng).map_err(|e| e.to_string());
+                    let actual = TokenDistRef::Probs(&p)
+                        .verify(draft, &mut actual_rng)
+                        .map_err(|e| e.to_string());
+                    assert_eq!(actual, expected, "draft {draft}, probabilities {p:?}");
+                }
+                assert_eq!(actual_rng.gen::<u64>(), expected_rng.gen::<u64>());
+            }
+            assert_eq!(p.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), original);
+        }
+    }
+
+    #[test]
+    fn draft_into_replaces_previous_proposals() {
+        let mut d = NgramDrafter::new(cfg(2, 2), &[1, 2, 1, 2]);
+        let mut out = vec![99; 8];
+        d.draft_into(5, &mut out);
+        assert_eq!(out, [1, 2, 1, 2, 1]);
+        d.draft_into(1, &mut out);
+        assert_eq!(out, [1]);
+        d.draft_into(0, &mut out);
+        assert!(out.is_empty());
+        d.draft_into(3, &mut out);
+        d.push(7);
+        d.draft_into(3, &mut out);
+        assert!(
+            out.is_empty(),
+            "a missing match must clear the old proposal"
+        );
     }
 
     #[test]
