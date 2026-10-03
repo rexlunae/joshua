@@ -66,7 +66,7 @@ use crate::yarn::YarnConfig;
 mod dsa;
 mod kda;
 use dsa::{DsaConfig, IndexCache, Indexer, Selection};
-use kda::{Kda, KdaConfig, KdaState};
+use kda::{Kda, KdaConfig, KdaSnapshot, KdaState};
 use crate::mhc::HyperConnection;
 
 /// Parsed hyper-parameters of every architecture this loader serves.
@@ -913,6 +913,11 @@ pub struct LayerState {
     index: IndexCache,
     /// Kimi Delta Attention state (`glm5next` linear layers).
     kda: Option<KdaState>,
+    /// Set by [`crate::native_session::LayerStack::begin_verify`] before a
+    /// speculative verification pass; filled in by the KDA layer and read back
+    /// to roll the pass back.  `None` outside such a pass (and on an attention
+    /// layer, whose KV cache rewinds through `truncate_state` alone).
+    capture: Option<KdaSnapshot>,
     /// Selections a full layer has published and its sharers have not yet
     /// all read, oldest first (one per input chunk; see
     /// [`crate::native_session::LayerStack::layer`]).
@@ -995,7 +1000,7 @@ impl Weights {
         let layer = &self.layers[l];
         let offset = input.offset;
         match (&layer.attn, &layer.sparse) {
-            (Attention::Kda(k), _) => k.forward(&mut states[l].kda, x),
+            (Attention::Kda(k), _) => k.forward(&mut states[l].kda, &mut states[l].capture, x),
             (Attention::Mla(a), Sparse::Full { .. } | Sparse::Shared { .. }) => {
                 let (latent, q) = a.q.forward_latent(x)?;
                 let selection = match &layer.sparse {
@@ -1032,11 +1037,11 @@ impl Weights {
 
 impl crate::native_session::LayerStack for Weights {
     type State = LayerState;
-    // This loader has no rewindable running state yet (its KDA layers are not
-    // snapshotted), so it keeps the trait defaults: `snapshot_state` reports
-    // nothing and `can_rewind` falls back to `can_truncate`, leaving this
-    // loader's behaviour exactly as before the rewind seam existed.
-    type Snapshot = ();
+    // A KDA layer's running state — its delta-rule matrices and its three conv
+    // tails — is snapshotted before a verification pass and replayed on
+    // rollback (`KdaSnapshot`); every other piece of state here is append-only
+    // or per-pass and rewinds through `truncate_state` alone.
+    type Snapshot = KdaSnapshot;
 
     fn n_layers(&self) -> usize {
         self.layers.len()
@@ -1112,6 +1117,11 @@ impl crate::native_session::LayerStack for Weights {
     }
 
     fn can_truncate(&self) -> bool {
+        // A KDA layer's running state reaches back over nothing, so an
+        // *arbitrary* backward truncate cannot serve it.  This stays false for
+        // the KDA hybrids even though `can_rewind` is true: rolling back inside
+        // the span of a verification pass (which replays the accepted prefix) is
+        // a different request from rewinding to any earlier position.
         !self.layers.iter().any(|l| matches!(l.attn, Attention::Kda(_)))
     }
 
@@ -1124,6 +1134,41 @@ impl crate::native_session::LayerStack for Weights {
         state.index.truncate(keep)?;
         crate::attention::truncate_kv(&mut state.kv, keep);
         Ok(())
+    }
+
+    fn begin_verify(state: &mut LayerState) {
+        // Arm unconditionally: before the very first forward `state.kda` is
+        // still `None`, and keying the arm off it would leave that first
+        // verification pass with nothing to roll back to.  An attention layer
+        // never fills the capture, so `restore_state` is a no-op for it and its
+        // KV cache — already truncated — is all the rollback needs.
+        state.capture = Some(KdaSnapshot::default());
+    }
+
+    fn clear_verify(state: &mut LayerState) {
+        state.capture = None;
+    }
+
+    fn snapshot_state(state: &LayerState) -> Option<KdaSnapshot> {
+        state.capture.clone()
+    }
+
+    fn restore_state(state: &mut LayerState, snap: KdaSnapshot, retained: usize) -> Result<()> {
+        // The KV cache (and the sparse-attention index keys) were already cut
+        // back by `truncate_state`; the KDA layer rewinds its own running state
+        // by restoring the pre-pass snapshot and replaying the tokens that
+        // survived.  An attention layer's snapshot is empty and this is a no-op.
+        snap.replay(&mut state.kda, retained)
+    }
+
+    fn can_rewind(&self) -> bool {
+        // Every architecture this loader serves can roll back a verification
+        // pass: the MLA/GQA caches and the sparse-attention index keys truncate
+        // exactly, and the only running state — a KDA layer's matrices and conv
+        // tails — is snapshotted before the pass and replayed on rollback.  The
+        // hyper-connection streams and Kimi K3's banked attention residuals are
+        // derived per input and hold nothing across passes.
+        true
     }
 }
 

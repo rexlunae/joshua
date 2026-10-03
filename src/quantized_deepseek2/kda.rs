@@ -9,7 +9,10 @@
 //! output is RMS-normalised per head, gated by `sigmoid(g(x))` — a low-rank
 //! `g_b(g_a(x))`, or K3's full-rank `ssm_g` — and projected back.  The
 //! recurrent state is `[head_dim, head_dim]` per head plus the last
-//! `d_conv - 1` conv inputs, so the layer cannot rewind to a prefix.
+//! `d_conv - 1` conv inputs, so the layer cannot rewind to an *arbitrary*
+//! prefix — but a speculative verification pass it has just run can be rolled
+//! back, because it snapshots that state and replays the accepted prefix into
+//! it (see [`KdaSnapshot`]).
 
 use std::io::{Read, Seek};
 
@@ -65,6 +68,141 @@ pub(super) struct KdaState {
     conv: [Tensor; 3],
     /// Per head `[head_dim (key), head_dim (value)]`, head-major.
     s: Vec<f32>,
+}
+
+/// One verification pass's worth of KDA recurrence inputs: the per-token `q`,
+/// `k`, `v`, decay `g` and write gate `beta` the gated delta rule consumed,
+/// exactly as [`crate::kimi_k3::kda_recurrent_head_into`] read them, plus the
+/// pass's *pre-conv* Q/K/V rows so the three conv tails can be rewound too.
+///
+/// Every field is token-major (`[t, head, head_dim]`, `[t, head]`), so the
+/// accepted prefix of a pass is a contiguous slice.
+#[derive(Clone, Default)]
+struct KdaInputs {
+    q: Vec<f32>,
+    key: Vec<f32>,
+    v: Vec<f32>,
+    g: Vec<f32>,
+    beta: Vec<f32>,
+    /// The pass's pre-conv Q, K and V rows, `[t, inner]` token-major — the rows
+    /// each causal conv's window was continued by.
+    conv: [Vec<f32>; 3],
+    /// Tokens the pass fed.
+    t: usize,
+}
+
+/// A KDA layer's snapshot of its recurrent state, taken before a
+/// multi-token verification pass so a rejected draft can be rolled back.
+///
+/// The recurrence is *running* state — there is no prefix to rewind to the way
+/// an append-only KV cache has one — so a pass that feeds `k + 1` tokens would
+/// otherwise leave the delta-rule matrices and the three conv tails advanced
+/// past the tokens the target model rejected.
+///
+/// Restoring the pre-pass state alone is only right when the rollback rejects
+/// *every* draft: a partial accept has to keep the tokens that survived, so the
+/// snapshot also carries the pass's own recurrence inputs and [`Self::replay`]
+/// re-runs the accepted prefix into the restored state, exactly as
+/// `quantized_qwen`'s `RecurrentSnapshot` does for its Gated DeltaNet layers.
+#[derive(Clone, Default)]
+pub struct KdaSnapshot {
+    /// The recurrent state as it was *before* the pass.
+    pre: Option<KdaState>,
+    /// The pass's recurrence inputs, token-major over its tokens.
+    inputs: Option<KdaInputs>,
+    /// The layer's KDA geometry.  Carried so the restore path — a static method
+    /// with no handle on the weights — can replay without one.
+    cfg: Option<KdaConfig>,
+}
+
+/// Copy head `hh`'s rows of a token-major `[t, h, d]` buffer into `buf`, in
+/// time order: the per-head slice the recurrence consumes.
+fn gather_head(src: &[f32], hh: usize, t: usize, h: usize, d: usize, buf: &mut Vec<f32>) {
+    buf.clear();
+    for tok in 0..t {
+        let base = (tok * h + hh) * d;
+        buf.extend_from_slice(&src[base..base + d]);
+    }
+}
+
+impl KdaSnapshot {
+    /// Roll a KDA layer's recurrent state back to `retained` tokens into the
+    /// pass that produced this snapshot.
+    ///
+    /// A no-op for an unarmed capture (an attention layer of the same model
+    /// never fills one).
+    pub(super) fn replay(&self, state: &mut Option<KdaState>, retained: usize) -> Result<()> {
+        let Some(pre) = &self.pre else {
+            return Ok(());
+        };
+        *state = Some(pre.clone());
+        let (Some(inputs), Some(cfg)) = (&self.inputs, &self.cfg) else {
+            return Ok(());
+        };
+        let kept = retained.min(inputs.t);
+        if kept == 0 {
+            return Ok(());
+        }
+        let (h, d) = (cfg.n_head, cfg.head_dim);
+        let inner = cfg.inner();
+        let slot = state.as_mut().expect("just restored");
+        // Each conv tail is the last `d_conv - 1` rows of the pre-pass window
+        // continued by the pass's rows, so rebuilding it for the kept prefix is
+        // the same window a pass of that length would have built.  Reusing a
+        // rejected row here would leak the draft into the next token's conv.
+        let k1 = cfg.d_conv.saturating_sub(1);
+        for (c, rows) in inputs.conv.iter().enumerate() {
+            let new = Tensor::from_vec(
+                rows[..kept * inner].to_vec(),
+                (kept, inner),
+                pre.conv[c].device(),
+            )?;
+            let hist = Tensor::cat(&[&pre.conv[c], &new], 0)?; // [k - 1 + kept, inner]
+            slot.conv[c] = hist.narrow(0, kept, k1)?.contiguous()?;
+        }
+        // Replay the accepted prefix through the same per-head recurrence, in
+        // the same order, so the restored state is bit-identical to plain
+        // decoding (the outputs are discarded — only the matrices matter).
+        let (mut hq, mut hk, mut hv, mut hg, mut hb) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let mut out = vec![0f32; kept * d];
+        let mut delta = vec![0f32; d];
+        type HeadSlices<'a> = (&'a [f32], &'a [f32], &'a [f32], &'a [f32], &'a [f32]);
+        for hh in 0..h {
+            let (qs, ks, vs, gs, bs): HeadSlices = if kept == 1 {
+                // One token: head `hh` is the slice the forward borrowed.
+                (
+                    &inputs.q[hh * d..(hh + 1) * d],
+                    &inputs.key[hh * d..(hh + 1) * d],
+                    &inputs.v[hh * d..(hh + 1) * d],
+                    &inputs.g[hh * d..(hh + 1) * d],
+                    std::slice::from_ref(&inputs.beta[hh]),
+                )
+            } else {
+                gather_head(&inputs.q, hh, kept, h, d, &mut hq);
+                gather_head(&inputs.key, hh, kept, h, d, &mut hk);
+                gather_head(&inputs.v, hh, kept, h, d, &mut hv);
+                gather_head(&inputs.g, hh, kept, h, d, &mut hg);
+                hb.clear();
+                hb.extend((0..kept).map(|tok| inputs.beta[tok * h + hh]));
+                (&hq, &hk, &hv, &hg, &hb)
+            };
+            crate::kimi_k3::kda_recurrent_head_into(
+                qs,
+                ks,
+                vs,
+                gs,
+                bs,
+                &mut slot.s[hh * d * d..(hh + 1) * d * d],
+                kept,
+                d,
+                d,
+                &mut out,
+                &mut delta,
+            );
+        }
+        Ok(())
+    }
 }
 
 /// The Q/K/V projections: separate, or one fused `attn_qkv`.
@@ -142,7 +280,17 @@ impl Kda {
     }
 
     /// Run the layer over `x` (`[1, t, n_embd]`), advancing `state`.
-    pub(super) fn forward(&self, state: &mut Option<KdaState>, x: &Tensor) -> Result<Tensor> {
+    ///
+    /// When `cap` is armed — a verification pass, see
+    /// [`crate::native_session::LayerStack::begin_verify`] — the state is cloned
+    /// before it advances and the pass's own recurrence inputs are recorded, so
+    /// [`KdaSnapshot::replay`] can roll the pass back.
+    pub(super) fn forward(
+        &self,
+        state: &mut Option<KdaState>,
+        cap: &mut Option<KdaSnapshot>,
+        x: &Tensor,
+    ) -> Result<Tensor> {
         let (_, t, _) = x.dims3()?;
         let (h, d, k) = (self.cfg.n_head, self.cfg.head_dim, self.cfg.d_conv);
         let inner = self.cfg.inner();
@@ -156,6 +304,16 @@ impl Kda {
                 s: vec![0f32; h * d * d],
             }),
         };
+        // An armed verification pass records what it is about to overwrite, so a
+        // rejected draft can be rolled back.  Clone *before* the conv advances
+        // the tails and the delta rule advances the matrices below: a snapshot
+        // taken afterwards would carry the rejected tokens' convolution history
+        // and re-seed it on rollback.  Unarmed (prefill, plain decode) the clone
+        // is skipped entirely.
+        let pre = cap.as_ref().map(|_| st.clone());
+        // The pre-conv Q/K/V rows of this pass, token-major `[t, inner]`, kept
+        // only while armed: a rollback rebuilds each conv tail from them.
+        let mut conv_rows: [Vec<f32>; 3] = Default::default();
 
         // Causal depthwise conv over [history ‖ new], then SiLU.
         let proj: [Tensor; 3] = match &self.qkv {
@@ -169,6 +327,9 @@ impl Kda {
         let mut qkv = Vec::with_capacity(3);
         for (c, y) in proj.iter().enumerate() {
             let y = y.reshape((t, inner))?;
+            if cap.is_some() {
+                conv_rows[c] = y.flatten_all()?.to_vec1::<f32>()?;
+            }
             let hist = Tensor::cat(&[&st.conv[c], &y], 0)?; // [k - 1 + t, inner]
             let mut out = hist
                 .narrow(0, 0, t)?
@@ -211,18 +372,28 @@ impl Kda {
         // transpose+contiguous pass copied, without the intermediate
         // [h, t, d] tensor). Outputs go straight into the [t, h, d] buffer,
         // so no transpose copy follows the loop.
-        fn gather_head(src: &[f32], hh: usize, t: usize, h: usize, d: usize, buf: &mut Vec<f32>) {
-            buf.clear();
-            for tok in 0..t {
-                let base = (tok * h + hh) * d;
-                buf.extend_from_slice(&src[base..base + d]);
-            }
-        }
         type HeadSlices<'a> =
             (&'a [f32], &'a [f32], &'a [f32], &'a [f32], &'a [f32], &'a mut [f32]);
         let flat = |x: &Tensor| -> Result<Vec<f32>> { x.flatten_all()?.to_vec1() };
         let (q, key, v, g) = (flat(&q)?, flat(&key)?, flat(v)?, flat(&g)?);
         let beta = flat(&beta)?; // flat [t, h]: one read, no per-row Vecs
+        if let (Some(pre), Some(cap)) = (pre, cap.as_mut()) {
+            // Exactly the values the rule below consumes, in the same
+            // token-major layout, so a rollback replays them bit for bit.
+            *cap = KdaSnapshot {
+                pre: Some(pre),
+                inputs: Some(KdaInputs {
+                    q: q.clone(),
+                    key: key.clone(),
+                    v: v.clone(),
+                    g: g.clone(),
+                    beta: beta.clone(),
+                    conv: std::mem::take(&mut conv_rows),
+                    t,
+                }),
+                cfg: Some(self.cfg.clone()),
+            };
+        }
         let mut o = vec![0f32; t * h * d]; // [t, h, d]
         let mut delta = vec![0f32; d];
         let mut hq: Vec<f32> = Vec::new();
