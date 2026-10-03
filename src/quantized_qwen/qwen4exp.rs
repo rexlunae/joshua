@@ -395,6 +395,16 @@ pub(super) struct QsaCache {
     keys: Option<Tensor>,
     /// Pooled keys of complete blocks `[len / r, d]` (post-norm, post-RoPE).
     pooled: Option<Tensor>,
+    /// Raw-key position the pooled blocks were built from: exactly
+    /// `pooled / r` complete blocks, covering positions `[0, pooled_to)`.
+    ///
+    /// A rollback rewinds the position but overwrites the raw keys from there
+    /// on, so every block reaching into the rewound range is stale even when
+    /// the block *count* happens to land on the same number.  Recording the
+    /// position rather than the count lets a rewind cut at
+    /// `min(pooled_to, offset) / r` — the last block that still lies entirely
+    /// inside the untouched prefix.
+    pooled_to: usize,
 }
 
 impl Qsa {
@@ -463,11 +473,16 @@ impl Qsa {
         };
 
         let len = offset + t;
-        // A rewind (positions moving backward) leaves pooled blocks beyond
-        // `len / r` stale — cut them back to the prefix the old per-forward
-        // re-pooling derived from the raw keys.
+        // A rewind (positions moving backward) leaves the pooled blocks that
+        // reach into the rewound range stale — their raw keys have just been
+        // dropped above and are about to be replaced.  Cutting by *count*
+        // (`len / r`) misses a block that stays at the same count but was
+        // pooled from rejected tokens, so cut by the position the surviving
+        // blocks were actually built from: everything from `offset` on is
+        // rewritten, so only `min(pooled_to, offset) / r` blocks stand.
+        let pooled_to = cache.pooled_to.min(offset);
         let pooled_prev = match pooled_prev {
-            Some(p) if p.dim(0)? > len / r => Some(p.narrow(0, 0, len / r)?),
+            Some(p) if p.dim(0)? > pooled_to / r => Some(p.narrow(0, 0, pooled_to / r)?),
             other => other,
         };
         // Pool, RMS-norm and RoPE only the blocks this chunk completed; the
@@ -495,6 +510,7 @@ impl Qsa {
             pooled_prev
         };
         cache.keys = Some(all);
+        cache.pooled_to = n_blocks * r;
         cache.pooled = pooled;
 
         let width = self.top_k + r - 1;

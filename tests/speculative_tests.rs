@@ -351,10 +351,36 @@ fn recurrent_hybrid_speculates_without_changing_output() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// The KDA hybrids speculate too: their recurrent state is *running*, not
+/// append-only, so the layer snapshots its delta-rule matrices and its three
+/// causal-conv tails before the pass and replays the accepted prefix on
+/// rollback.  Speculation must therefore be *enabled* here and — the part that
+/// matters — must not change a token.
+#[test]
+fn kda_hybrid_speculates_without_changing_output() {
+    // `kimi-linear` is the plain KDA+NoPE-MLA hybrid; `glm5next` adds
+    // hyper-connection streams and a k-pool sparse-attention indexer around the
+    // same KDA layers.
+    // `kimi-linear` is the plain KDA + NoPE-MLA hybrid; `glm5next` wraps the
+    // same KDA layers in hyper-connection streams and a k-pool sparse-attention
+    // indexer.
+    let dir = common::model_dir("spec-kimi-linear-engine");
+    common::write_tiny_kimi_gguf(&dir.join("model.gguf"), "kimi-linear", false);
+    check_engine_equivalence(&dir, true);
+    std::fs::remove_dir_all(&dir).ok();
+
+    let dir = common::model_dir("spec-glm5next-engine");
+    common::write_tiny_glm5next_gguf(&dir.join("model.gguf"), "glm5next");
+    check_engine_equivalence(&dir, true);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// The static per-architecture map must classify every supported name: the
 /// plain-attention qwen and deepseek2 families plus deepseek4 decode
-/// speculatively; so do the DeltaNet hybrids, which snapshot and replay.  The
-/// stock candle loaders and the KDA hybrids still do not.
+/// speculatively; so do the recurrent hybrids — the DeltaNet ones
+/// (qwen3next, qwen35), the PLE/QSA one (qwen4exp) and the KDA ones
+/// (glm5next, kimi-linear, kimi-k3), which snapshot their running state and
+/// replay the accepted prefix.  Only the stock candle loaders do not.
 #[test]
 fn architecture_speculative_map_covers_every_name() {
     use joshua::model::Architecture;
@@ -370,12 +396,17 @@ fn architecture_speculative_map_covers_every_name() {
         "qwen3next",
         "qwen35",
         "qwen35moe",
+        "qwen4exp",
         "chatglm",
         "glm4",
         "glm4moe",
         "deepseek",
         "deepseek2",
         "glm-dsa",
+        "glm5next",
+        "glm5-next",
+        "kimi-linear",
+        "kimi-k3",
         "deepseek4",
         "deepseek41",
     ];
@@ -389,11 +420,6 @@ fn architecture_speculative_map_covers_every_name() {
         "phi2",
         "phi3",
         "qwen2",
-        "qwen4exp",
-        "glm5next",
-        "glm5-next",
-        "kimi-linear",
-        "kimi-k3",
     ];
     for name in supported {
         let arch = Architecture::from_name(name).expect("listed name resolves");

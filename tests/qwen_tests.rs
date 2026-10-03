@@ -135,8 +135,15 @@ fn qwen_family_clear_resets_all_state() {
 /// then rolled back — nothing has to guess it.
 ///
 /// For each `keep` in `0..=n` the test runs one multi-position pass over `n`
-/// tokens, rolls back to `keep`, then decodes token `keep` and compares against
-/// a reference model fed the same tokens one at a time.
+/// draft tokens, rolls back to `keep`, then decodes `alt` — a token stream that
+/// shares nothing with the draft tail — and compares against a reference model
+/// fed the same tokens one at a time.  The replacement tokens matter: re-feeding
+/// the *same* token the draft held would leave every cached derived state (the
+/// QSA indexer's pooled block keys, whose blocks straddle the rewind point)
+/// numerically unchanged, so a rollback that kept them stale would still pass.
+/// Comparing several positions past the rewind does exercise them, because a
+/// stale pooled block only shows up once the indexer has to choose between
+/// blocks again.
 #[test]
 fn qwen_recurrent_verify_rollback_matches_incremental_decode() {
     for &(arch, recurrent) in ARCHES {
@@ -146,44 +153,53 @@ fn qwen_recurrent_verify_rollback_matches_incremental_decode() {
         let dir = common::model_dir(&format!("qwen-verify-rollback-{arch}"));
         let model = dir.join("model.gguf");
         common::write_tiny_qwen_gguf(&model, arch);
-        // qwen4exp is not speculating yet: its PLE conv window and QSA indexer
-        // keys are captured and replayed, but the rollback still diverges from
-        // incremental decode, so it stays off rather than shipping a silent
-        // mismatch.  See `Weights::can_rewind`.
-        if !load(&model).supports_speculative() {
-            std::fs::remove_dir_all(&dir).ok();
-            continue;
-        }
-        let toks: [u32; 5] = [1, 4, 2, 7, 3];
-        // The verification pass covers the first `n`; `toks[keep]` is the token
-        // that follows the rolled-back prefix, so it must be in range for every
-        // `keep` including `n` itself.
-        let n = 4;
+        // No capability-based skip: every recurrent architecture here rewinds,
+        // and if one ever stops, this test must fail loudly rather than quietly
+        // stop checking its rollback.  `qwen_family_truncation_support_matches_
+        // state_kind` covers the capability predicate separately.
+        assert!(
+            load(&model).supports_speculative(),
+            "{arch} must be able to roll a verification pass back"
+        );
+        // The draft the target model rejects...
+        let draft: [u32; 6] = [1, 4, 2, 7, 3, 5];
+        // ...and the continuation it actually walks after the rollback.
+        let alt: [u32; 3] = [6, 9, 1];
+        let n = draft.len();
+        // How many positions past the rewind to compare.
+        let steps = alt.len();
 
         for keep in 0..=n {
             // Reference: plain incremental decode of exactly the retained
-            // prefix, then decode the token that follows it.
+            // prefix, then of the continuation.
             let mut reference = load(&model);
-            for (i, &t) in toks.iter().take(keep).enumerate() {
+            for (i, &t) in draft.iter().take(keep).enumerate() {
                 common::logits(&mut reference, &[t], i);
             }
-            let want = common::logits(&mut reference, &[toks[keep]], keep);
+            let mut want = Vec::new();
+            for (i, &t) in alt.iter().take(steps).enumerate() {
+                want = common::logits(&mut reference, &[t], keep + i);
+            }
 
-            // Subject: one multi-position verification pass over all `n` tokens,
-            // then roll it back to `keep` and decode the same next token.
+            // Subject: one multi-position verification pass over all `n` draft
+            // tokens, roll it back to `keep`, then decode the same continuation.
             let mut m = load(&model);
-            let input = Tensor::new(&toks[..n], &Device::Cpu).unwrap().unsqueeze(0).unwrap();
+            let input = Tensor::new(&draft[..n], &Device::Cpu).unwrap().unsqueeze(0).unwrap();
             m.forward_all_logits(&input, 0).unwrap();
             assert!(
                 m.truncate_kv_cache(keep).unwrap(),
                 "{arch}: a pending verification pass must be rollable back"
             );
-            let got = common::logits(&mut m, &[toks[keep]], keep);
+            let mut got = Vec::new();
+            for (i, &t) in alt.iter().take(steps).enumerate() {
+                got = common::logits(&mut m, &[t], keep + i);
+            }
             common::assert_close(&want, &got, 1e-4, &format!("{arch} rollback to {keep}"));
         }
         std::fs::remove_dir_all(&dir).ok();
     }
 }
+
 /// reuse, speculative rollback); recurrent models report that they cannot
 /// and refuse rather than silently keeping stale state.
 ///
@@ -201,11 +217,10 @@ fn qwen_family_truncation_support_matches_state_kind() {
 
         let mut m = load(&model);
         assert_eq!(m.supports_kv_truncate(), !recurrent, "{arch}");
-        // Attention-only and snapshotting DeltaNet hybrids can roll back their
-        // own verification pass; a PLE block's convolution history is not
-        // rewound yet, so a model carrying one does not speculate.
-        let has_ple = arch == "qwen4exp";
-        assert_eq!(m.supports_speculative(), !has_ple, "{arch}");
+        // Every architecture here snapshots its running state — the DeltaNet
+        // matrices, the PLE conv window, the QSA indexer keys — so all of them
+        // can roll back their own verification pass.
+        assert!(m.supports_speculative(), "{arch}");
         let full = logits(&mut m, &[1, 4, 2, 7], 0);
         if recurrent {
             assert!(
