@@ -351,11 +351,14 @@ impl Architecture {
     }
     /// Why `--speculative` cannot run on this architecture, or `None` when
     /// it can.  Two kinds of reason: a stock candle loader keeps its KV
-    /// cache private (no all-position logits, no rollback), and every real
-    /// model of a recurrent hybrid carries DeltaNet / KDA layers whose
-    /// state only clears, never rewinds.  Kept in step with
-    /// [`QuantizedModel::supports_speculative`], which answers for the
-    /// loaded instance.
+    /// cache private (no all-position logits, no rollback), and `qwen4exp`'s
+    /// PLE blocks keep a convolution history the rollback does not rewind.
+    /// The recurrent hybrids are *not* in this list: their Gated DeltaNet
+    /// (`qwen3next`, `qwen35`) and KDA (`glm5next`, `kimi-linear`,
+    /// `kimi-k3`) running state is snapshotted before a verification pass and
+    /// replayed on rollback, which is enough to roll a rejected draft back.
+    /// Kept in step with [`QuantizedModel::supports_speculative`], which
+    /// answers for the loaded instance.
     pub fn unsupported_speculative_reason(&self) -> Option<&'static str> {
         let reason = match self {
             Self::Llama | Self::Gemma | Self::Lfm2 | Self::Phi2 | Self::Phi3 | Self::Qwen2 => {
@@ -364,9 +367,6 @@ impl Architecture {
             Self::Qwen4Exp => {
                 "its PLE blocks keep a running convolution history that a rejected \
                  draft would leave advanced"
-            }
-            Self::Glm5Next | Self::KimiLinear | Self::KimiK3 => {
-                "its KDA layers carry recurrent state that cannot be rewound (only cleared)"
             }
             Self::Qwen
             | Self::Qwen2Moe
@@ -381,6 +381,9 @@ impl Architecture {
             | Self::ChatGlm
             | Self::Glm4
             | Self::Glm4Moe
+            | Self::Glm5Next
+            | Self::KimiLinear
+            | Self::KimiK3
             | Self::DeepSeek
             | Self::DeepSeek2
             | Self::GlmDsa

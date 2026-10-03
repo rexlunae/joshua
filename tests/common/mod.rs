@@ -75,6 +75,111 @@ pub fn assert_close(a: &[f32], b: &[f32], tol: f32, what: &str) {
     }
 }
 
+/// Check a speculative *rollback* of a model whose layers carry running
+/// (recurrent) state: for each `keep`, one multi-position verification pass
+/// over `draft` is rolled back to `keep` and the session then decodes `tail`,
+/// one token per step, against a reference session that only ever decoded the
+/// retained prefix followed by that same `tail`.
+///
+/// The continuation is **disjoint** from the draft, and that is the whole
+/// point.  Re-feeding the same token at the rewound position would leave every
+/// cached derived value numerically identical, so a rollback that kept stale
+/// recurrent state could still pass; a different token makes a leftover
+/// delta-rule matrix, conv tail or KV row show up in the very next logits.
+///
+/// `keeps` must land inside the pass's span, `prompt.len()..=prompt.len() +
+/// draft.len()`.  `what` names the architecture in failure messages.
+pub fn check_recurrent_verify_rollback(
+    model: &joshua::model::QuantizedModel,
+    what: &str,
+    prompt: &[u32],
+    draft: &[u32],
+    keeps: &[usize],
+    tails: &[&[u32]],
+) {
+    assert!(
+        model.supports_speculative(),
+        "{what}: must be able to roll a verification pass back"
+    );
+    assert!(
+        !model.supports_kv_truncate(),
+        "{what}: running state cannot rewind to an arbitrary prefix"
+    );
+    for &keep in keeps {
+        assert!(
+            (prompt.len()..=prompt.len() + draft.len()).contains(&keep),
+            "{what}: keep {keep} lies outside the verification pass"
+        );
+        for tail in tails {
+            // Reference: plain incremental decode of the retained prefix only.
+            let mut reference = model.new_session().expect("native loaders share weights");
+            for (i, &t) in prompt.iter().enumerate() {
+                logits(&mut reference, &[t], i);
+            }
+            for (i, &t) in draft.iter().take(keep - prompt.len()).enumerate() {
+                logits(&mut reference, &[t], prompt.len() + i);
+            }
+            let want: Vec<Vec<f32>> = tail
+                .iter()
+                .enumerate()
+                .map(|(i, &t)| logits(&mut reference, &[t], keep + i))
+                .collect();
+
+            // Subject: one pass over the whole draft, rolled back to `keep`,
+            // then the same continuation.
+            let mut m = model.new_session().expect("native loaders share weights");
+            for (i, &t) in prompt.iter().enumerate() {
+                logits(&mut m, &[t], i);
+            }
+            let input = Tensor::new(draft, &Device::Cpu)
+                .unwrap()
+                .unsqueeze(0)
+                .unwrap();
+            m.forward_all_logits(&input, prompt.len()).unwrap();
+            assert!(
+                m.truncate_kv_cache(keep).unwrap(),
+                "{what}: a pending verification pass must be rollable back to {keep}"
+            );
+            for (i, (&t, w)) in tail.iter().zip(&want).enumerate() {
+                let got = logits(&mut m, &[t], keep + i);
+                assert_close(
+                    &got,
+                    w,
+                    1e-5,
+                    &format!("{what} rollback to {keep}, continuation step {i}"),
+                );
+            }
+        }
+    }
+    // A pass that *starts* at position 0 and is rejected outright: the layer
+    // state is reset wholesale by `truncate_state(0)`, so the restore path has
+    // to re-seed the recurrent state from its pre-pass copy instead of leaving
+    // the layer cleared.
+    for tail in tails {
+        let mut m = model.new_session().expect("native loaders share weights");
+        let input = Tensor::new(draft, &Device::Cpu)
+            .unwrap()
+            .unsqueeze(0)
+            .unwrap();
+        m.forward_all_logits(&input, 0).unwrap();
+        assert!(
+            m.truncate_kv_cache(0).unwrap(),
+            "{what}: a first-position rollback must be rollable back"
+        );
+        let mut reference = model.new_session().expect("native loaders share weights");
+        for (i, &t) in tail.iter().enumerate() {
+            let want = logits(&mut reference, &[t], i);
+            let got = logits(&mut m, &[t], i);
+            assert_close(
+                &got,
+                &want,
+                1e-5,
+                &format!("{what} rollback to 0, step {i}"),
+            );
+        }
+    }
+}
+
 /// A minimal WordLevel tokenizer with a 16-token vocabulary.
 pub const TOKENIZER_JSON: &str = r#"{
     "version": "1.0",
