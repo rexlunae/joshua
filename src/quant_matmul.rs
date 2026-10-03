@@ -824,6 +824,60 @@ mod tests {
         (qt, xs)
     }
 
+    /// The dispatch policy's documented deferrals (see
+    /// [`try_fast_cpu_qmatmul`]): on aarch64 dotprod builds Q4_K with
+    /// `n % 8 == 0` goes to candle's repacked kernel, and anything below
+    /// `m = 8` goes to candle's NEON vec_dots.  Every other input takes the
+    /// fast path on every architecture.
+    fn deferred_by_policy(dtype: GgmlDType, m: usize, n: usize) -> bool {
+        #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+        {
+            dtype == GgmlDType::Q4K && n.is_multiple_of(8) || m < 8
+        }
+        #[cfg(not(all(target_arch = "aarch64", target_feature = "dotprod")))]
+        {
+            let _ = (dtype, m, n);
+            false
+        }
+    }
+
+    /// Run the same kernel the hook runs, straight off raw weight bytes, with
+    /// `lhs` supplied by the caller.  Mirrors the hook's own dtype dispatch, so
+    /// a reference arm differs from the hook only in where `lhs` came from.
+    fn kernel_from_bytes(
+        dtype: GgmlDType,
+        (m, k, n): (usize, usize, usize),
+        lhs: &[f32],
+        dst: &mut [f32],
+        bytes: &[u8],
+    ) {
+        macro_rules! kquant {
+            ($ty:ty) => {{
+                let block_bytes = std::mem::size_of::<$ty>();
+                assert!(bytes.len().is_multiple_of(block_bytes), "{dtype:?}: bytes");
+                // SAFETY: candle's QStorage holds whole blocks, so the byte
+                // length is a multiple of the block size; every byte pattern
+                // is a valid block (the same cast candle's own reader makes).
+                let blocks = unsafe {
+                    std::slice::from_raw_parts(
+                        bytes.as_ptr() as *const $ty,
+                        bytes.len() / block_bytes,
+                    )
+                };
+                matmul_kquant::<$ty>((m, k, n), lhs, blocks, dst).unwrap();
+            }};
+        }
+        match dtype {
+            GgmlDType::Q8_0 => kquant!(BlockQ8_0),
+            GgmlDType::Q2K => kquant!(BlockQ2K),
+            GgmlDType::Q4K => kquant!(BlockQ4K),
+            GgmlDType::Q4_0 => kquant!(BlockQ4_0),
+            GgmlDType::Q5K => kquant!(BlockQ5K),
+            GgmlDType::Q6K => kquant!(BlockQ6K),
+            other => panic!("{other:?} is not in this test's dtype list"),
+        }
+    }
+
     /// The fast path must reproduce candle's dequantize-then-gemm for every
     /// dtype it accepts — including Q6_K/Q5K etc. that only have the generic
     /// dequant+NEON-dot route.  Tolerances absorb accumulation-order and FMA
@@ -835,22 +889,6 @@ mod tests {
     #[test]
     fn fast_cpu_qmatmul_matches_candle_dequantized_gemm() {
         let dev = Device::Cpu;
-        // On a dotprod build Q4K defers to candle at every m; other
-        // k-quants defer below the parallel-amortization threshold.
-        let deferred = |dtype: GgmlDType, m: usize, n: usize| -> bool {
-            #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
-            {
-                if dtype == GgmlDType::Q4K && n.is_multiple_of(8) {
-                    return true;
-                }
-                m < 8
-            }
-            #[cfg(not(all(target_arch = "aarch64", target_feature = "dotprod")))]
-            {
-                let _ = (dtype, m, n);
-                false
-            }
-        };
         for dtype in [
             GgmlDType::Q8_0,
             GgmlDType::Q2K,
@@ -861,7 +899,10 @@ mod tests {
         ] {
             let (qt, xs) = qtensor_and_xs(48, 256, dtype, 3);
             match try_fast_cpu_qmatmul(&qt, &xs) {
-                None => assert!(deferred(dtype, 3, 48), "{dtype:?}: unexpected deferral"),
+                None => assert!(
+                    deferred_by_policy(dtype, 3, 48),
+                    "{dtype:?}: unexpected deferral"
+                ),
                 Some(out) => {
                     let out = out.unwrap();
                     assert_eq!(out.dims(), &[3, 48]);
@@ -878,6 +919,111 @@ mod tests {
                         );
                     }
                 }
+            }
+        }
+    }
+
+    /// Issue #118 (candidate 1): `try_fast_cpu_qmatmul` borrows the activations
+    /// out of candle's storage instead of materializing them per call.  The
+    /// borrow must be a *strict* optimization — same bytes, same kernel, so the
+    /// hook's output must be bit-identical to the owned-copy path it replaced.
+    ///
+    /// `check` pins three things for one `(qt, xs)` pair, with `owned` holding
+    /// what the pre-borrow code handed the kernel (`flatten_all().to_vec1()`):
+    ///
+    /// 1. `buf[start..start + m·k]` is bit-identical to that copy — compared
+    ///    on `to_bits()`, so `-0.0` and `0.0` cannot pass as equal;
+    /// 2. the hook, fed `xs`, is bit-identical to the same kernel fed `owned`;
+    /// 3. a deferral is a documented policy deferral, never a silent one.
+    ///
+    /// It runs on both a plain tensor (`start_offset == 0`) and a contiguous
+    /// view *with* a non-zero `start_offset` (row 1 of a `[2, k]` tensor) —
+    /// the case the offset arithmetic exists for, and the one that would go
+    /// unnoticed if only offset-0 inputs were checked.
+    ///
+    /// Plus the load-bearing part of the gate: a strided view holds the same
+    /// element count in a different memory order, so the hook must refuse it
+    /// rather than read it row-major.
+    #[test]
+    fn borrowed_activations_are_bit_identical_to_the_owned_copy() {
+        let check = |tag: &str,
+                     qt: &QTensor,
+                     xs: &Tensor,
+                     owned: &[f32],
+                     m: usize,
+                     k: usize,
+                     n: usize| {
+            assert!(xs.is_contiguous(), "{tag}: activations must be contiguous");
+            assert_eq!(owned.len(), m * k, "{tag}: activation count");
+
+            // (1) The borrow, inlined exactly as the hook does it.
+            let (storage, layout) = xs.storage_and_layout();
+            let cpu = match &*storage {
+                Storage::Cpu(c) => c,
+                other => panic!("{tag}: expected CPU storage, got {other:?}"),
+            };
+            let buf = cpu.as_slice::<f32>().unwrap();
+            let start = layout.start_offset();
+            let borrowed = &buf[start..start + owned.len()];
+            for (i, (a, b)) in owned.iter().zip(borrowed).enumerate() {
+                assert_eq!(a.to_bits(), b.to_bits(), "{tag}: activation {i}");
+            }
+
+            // (2)+(3) The hook itself, through the same kernel fed `owned`.
+            match try_fast_cpu_qmatmul(qt, xs) {
+                Some(hook) => {
+                    let got = hook.unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                    let mut want = vec![0f32; m * n];
+                    kernel_from_bytes(qt.dtype(), (m, k, n), owned, &mut want, &qt.data().unwrap());
+                    assert_eq!(got.len(), want.len(), "{tag}");
+                    for (i, (a, b)) in got.iter().zip(&want).enumerate() {
+                        assert_eq!(a.to_bits(), b.to_bits(), "{tag}: dst[{i}]");
+                    }
+                }
+                None => assert!(
+                    deferred_by_policy(qt.dtype(), m, n),
+                    "{tag}: unexpected deferral"
+                ),
+            }
+        };
+
+        for dtype in [
+            GgmlDType::Q8_0,
+            GgmlDType::Q2K,
+            GgmlDType::Q4K,
+            GgmlDType::Q6K,
+            GgmlDType::Q5K,
+            GgmlDType::Q4_0,
+        ] {
+            // n=100 is not a multiple of 8, so Q4_K is not deferred even on a
+            // dotprod build; m sweeps the decode (1) and prefill (16) regimes.
+            for m in [1usize, 16] {
+                let (k, n) = (256usize, 100usize);
+                let (qt, xs) = qtensor_and_xs(n, k, dtype, m);
+                let owned: Vec<f32> = xs.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                check(&format!("{dtype:?} m={m}"), &qt, &xs, &owned, m, k, n);
+
+                // Contiguous view whose elements do *not* start at offset 0.
+                let wide: Vec<f32> = (0..2 * k).map(|i| i as f32 * 0.01 - 3.0).collect();
+                let wide = Tensor::from_vec(wide, (2, k), &Device::Cpu).unwrap();
+                let view = wide.narrow(0, 1, 1).unwrap();
+                {
+                    let (_storage, layout) = view.storage_and_layout();
+                    assert_ne!(layout.start_offset(), 0, "{dtype:?}: view must be offset");
+                }
+                let owned_view: Vec<f32> = view.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                check(&format!("{dtype:?} offset view"), &qt, &view, &owned_view, 1, k, n);
+
+                // The gate: same element count, different memory order.
+                let wide = Tensor::from_vec(
+                    (0..4 * k).map(|i| i as f32 * 0.01 - 3.0).collect::<Vec<_>>(),
+                    (2, 2 * k),
+                    &Device::Cpu,
+                )
+                .unwrap();
+                let strided = wide.narrow(1, k, k).unwrap();
+                assert!(!strided.is_contiguous(), "{dtype:?}: strided view");
+                assert!(try_fast_cpu_qmatmul(&qt, &strided).is_none(), "{dtype:?}");
             }
         }
     }
