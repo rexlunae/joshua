@@ -361,10 +361,6 @@ impl Architecture {
             Self::Llama | Self::Gemma | Self::Lfm2 | Self::Phi2 | Self::Phi3 | Self::Qwen2 => {
                 "candle's stock loader keeps the KV cache private"
             }
-            Self::Qwen4Exp => {
-                "its PLE blocks keep a running convolution history that a rejected \
-                 draft would leave advanced"
-            }
             Self::Glm5Next | Self::KimiLinear | Self::KimiK3 => {
                 "its KDA layers carry recurrent state that cannot be rewound (only cleared)"
             }
@@ -378,6 +374,7 @@ impl Architecture {
             | Self::Qwen35Moe
             | Self::Qwen3Vl
             | Self::Qwen3VlMoe
+            | Self::Qwen4Exp
             | Self::ChatGlm
             | Self::Glm4
             | Self::Glm4Moe
