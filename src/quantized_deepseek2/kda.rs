@@ -328,6 +328,13 @@ impl Kda {
         for (c, y) in proj.iter().enumerate() {
             let y = y.reshape((t, inner))?;
             if cap.is_some() {
+                // Armed only — an ordinary decode and every prefill skip this.
+                // It is still three device→host readbacks per KDA layer on an
+                // accelerator, on top of the five the delta rule already reads
+                // back below on *every* forward, so the extra is bounded by
+                // the pre-existing host-bound path rather than introducing a new
+                // one.  Unmeasured on a device; on CPU the tensors are already
+                // host-resident.
                 conv_rows[c] = y.flatten_all()?.to_vec1::<f32>()?;
             }
             let hist = Tensor::cat(&[&st.conv[c], &y], 0)?; // [k - 1 + t, inner]

@@ -378,9 +378,9 @@ fn kda_hybrid_speculates_without_changing_output() {
 /// The static per-architecture map must classify every supported name: the
 /// plain-attention qwen and deepseek2 families plus deepseek4 decode
 /// speculatively; so do the recurrent hybrids — the DeltaNet ones
-/// (qwen3next, qwen35) and the KDA ones (glm5next, kimi-linear, kimi-k3),
-/// which snapshot their running state and replay the accepted prefix.  The
-/// stock candle loaders and `qwen4exp` still do not.
+/// (qwen3next, qwen35), the PLE/QSA one (qwen4exp) and the KDA ones
+/// (glm5next, kimi-linear, kimi-k3), which snapshot their running state and
+/// replay the accepted prefix.  Only the stock candle loaders do not.
 #[test]
 fn architecture_speculative_map_covers_every_name() {
     use joshua::model::Architecture;

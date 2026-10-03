@@ -153,10 +153,14 @@ fn qwen_recurrent_verify_rollback_matches_incremental_decode() {
         let dir = common::model_dir(&format!("qwen-verify-rollback-{arch}"));
         let model = dir.join("model.gguf");
         common::write_tiny_qwen_gguf(&model, arch);
-        if !load(&model).supports_speculative() {
-            std::fs::remove_dir_all(&dir).ok();
-            continue;
-        }
+        // No capability-based skip: every recurrent architecture here rewinds,
+        // and if one ever stops, this test must fail loudly rather than quietly
+        // stop checking its rollback.  `qwen_family_truncation_support_matches_
+        // state_kind` covers the capability predicate separately.
+        assert!(
+            load(&model).supports_speculative(),
+            "{arch} must be able to roll a verification pass back"
+        );
         // The draft the target model rejects...
         let draft: [u32; 6] = [1, 4, 2, 7, 3, 5];
         // ...and the continuation it actually walks after the rollback.
