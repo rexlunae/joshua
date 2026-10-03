@@ -34,6 +34,7 @@
 //! must uphold this contract.
 
 use std::marker::PhantomData;
+use std::ops::Range;
 use std::sync::LazyLock;
 
 use rayon::prelude::*;
@@ -185,7 +186,7 @@ pub fn for_each_row(n: usize, f: impl Fn(usize) + Send + Sync) {
     let pool = &*POOL;
     let threads = pool.current_num_threads();
     run_chunks(pool, threads, n, |rows| {
-        for &row in rows {
+        for row in rows {
             f(row);
         }
     });
@@ -195,7 +196,15 @@ pub fn for_each_row(n: usize, f: impl Fn(usize) + Send + Sync) {
 ///
 /// Chunked variant for workers that want to allocate one scratch buffer per
 /// task (e.g. a dequantized weight row) instead of per output row.
-pub fn for_each_row_chunks(n: usize, f: impl Fn(&[usize]) + Send + Sync) {
+///
+/// `rows` is the half-open [`Range`] of row indices owned by this task:
+/// visiting it visits those rows exactly once in ascending order, and the
+/// ranges handed to `f` over one call are disjoint and cover `0..n` exactly.
+/// A range (rather than a `&[usize]`) keeps the chunking allocation-free —
+/// rayon materialises a `Vec` per chunk for `chunks()`, once per call on
+/// every quantized matmul — while still costing one `f` call (hence one
+/// scratch buffer) per chunk.
+pub fn for_each_row_chunks(n: usize, f: impl Fn(Range<usize>) + Send + Sync) {
     let pool = &*POOL;
     let threads = pool.current_num_threads();
     run_chunks(pool, threads, n, f);
@@ -205,40 +214,93 @@ pub fn for_each_row_chunks(n: usize, f: impl Fn(&[usize]) + Send + Sync) {
 /// determinism tests to prove the parallel path is bit-identical to serial.
 #[cfg(test)]
 pub fn for_each_row_with_threads(threads: usize, n: usize, f: impl Fn(usize) + Send + Sync) {
-    if threads <= 1 || n < 8 {
-        for row in 0..n {
-            f(row);
-        }
-        return;
-    }
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(threads)
-        .build()
-        .expect("test thread pool");
-    run_chunks(&pool, threads, n, |rows| {
-        for &row in rows {
+    for_each_row_chunks_with_threads(threads, n, |rows| {
+        for row in rows {
             f(row);
         }
     });
 }
 
+/// Same as [`for_each_row_chunks`] but with an explicit thread count — used by
+/// the chunking tests to pin down the split for a given `threads`.
+#[cfg(test)]
+pub fn for_each_row_chunks_with_threads(
+    threads: usize,
+    n: usize,
+    f: impl Fn(Range<usize>) + Send + Sync,
+) {
+    if is_serial(threads, n) {
+        // Same serial fast path `run_chunks` takes, without building a pool.
+        f(0..n);
+        return;
+    }
+    let pool = test_pool(threads);
+    run_chunks(&pool, threads, n, f);
+}
+
+/// A throwaway pool for the explicit-thread-count test hooks.
+#[cfg(test)]
+fn test_pool(threads: usize) -> ThreadPool {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()
+        .expect("test thread pool")
+}
+
+/// Visit `f(rows)` over contiguous chunks of `0..n`, in parallel on `pool`.
+///
+/// Chunk size, chunk count and the number of `f` calls are all deterministic
+/// functions of `(n, threads)` — see [`chunk_size`] / [`chunk_rows`] — so the
+/// split is reproducible and each task still gets exactly one scratch buffer.
+/// The parallel fast path iterates the chunk *indices* and derives each row
+/// range from its index, which is the whole point of threading a [`Range`]
+/// through: the obvious `chunks(chunk)` iterator materialises a `Vec<usize>`
+/// per chunk, and this runs on every quantized matmul.  (A `with_min_len`
+/// split over individual rows would allocate nothing either, but would hand
+/// `f` one row at a time and turn its per-task scratch back into a per-row
+/// allocation.)
 fn run_chunks(
     pool: &ThreadPool,
     threads: usize,
     n: usize,
-    f: impl Fn(&[usize]) + Send + Sync,
+    f: impl Fn(Range<usize>) + Send + Sync,
 ) {
-    if threads <= 1 || n < 8 {
-        let rows: Vec<usize> = (0..n).collect();
-        f(&rows);
+    if is_serial(threads, n) {
+        f(0..n);
         return;
     }
-    // Up to ~4 chunks per thread keeps the pool busy while bounding the
-    // per-task dispatch overhead for small n.
-    let chunk = (n / (threads * 4)).max(1);
     pool.install(|| {
-        (0..n).into_par_iter().chunks(chunk).for_each(|rows| f(&rows));
+        (0..chunk_count(n, threads)).into_par_iter().for_each(|c| {
+            f(chunk_rows(n, threads, c));
+        });
     });
+}
+
+/// Below this row count the split is not worth the rayon dispatch, so the work
+/// runs on the calling thread in a single `f(0..n)` call.
+fn is_serial(threads: usize, n: usize) -> bool {
+    threads <= 1 || n < 8
+}
+
+/// Rows per chunk for `n` rows across `threads` workers: up to ~4 chunks per
+/// thread keeps the pool busy while bounding the per-task dispatch overhead
+/// for small `n`.
+fn chunk_size(n: usize, threads: usize) -> usize {
+    (n / (threads * 4)).max(1)
+}
+
+/// How many chunks `n` rows split into — i.e. how many times `run_chunks`
+/// calls `f`, and hence how many scratch buffers the chunked caller allocates.
+fn chunk_count(n: usize, threads: usize) -> usize {
+    n.div_ceil(chunk_size(n, threads))
+}
+
+/// The half-open row range owned by chunk `c`; chunks are contiguous, in
+/// ascending order, and chunk `chunk_count - 1` is the (possibly short) tail.
+fn chunk_rows(n: usize, threads: usize, c: usize) -> Range<usize> {
+    let chunk = chunk_size(n, threads);
+    let start = (c * chunk).min(n);
+    start..start.saturating_add(chunk).min(n)
 }
 
 /// A `&mut [f32]` downgraded to a raw pointer so parallel row workers can
@@ -488,6 +550,7 @@ pub(crate) unsafe fn hsum128(v: std::arch::aarch64::float32x4_t) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
     /// The dot product agrees with a scalar f64 reference at every length
     /// (full vectors plus every tail size) on every level this CPU runs.
@@ -540,5 +603,86 @@ mod tests {
         let dst = DstPtr::new(&mut out);
         for_each_row_with_threads(8, n, |row| work(&dst, row));
         assert_eq!(serial, out, "parallel rows must match serial bit-for-bit");
+    }
+
+    /// Every row in `0..n` must be visited exactly once by the chunked
+    /// splitter: no gap, no overlap, in ascending order within a task, for
+    /// row counts below the `n < 8` serial cutoff, exactly on a chunk
+    /// boundary, and not on one.
+    #[test]
+    fn chunk_ranges_cover_every_row_exactly_once() {
+        let ns = [
+            0usize, 1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 100, 255, 256, 257, 1000, 4096,
+        ];
+        for threads in [2usize, 3, 8, 16] {
+            for n in ns {
+                let seen: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+                let ranges: Mutex<Vec<Range<usize>>> = Mutex::new(Vec::new());
+                for_each_row_chunks_with_threads(threads, n, |rows| {
+                    assert!(rows.end <= n, "threads={threads} n={n}: {rows:?} out of range");
+                    ranges.lock().unwrap().push(rows.clone());
+                    // A range hands rows out ascending by construction; the
+                    // chunks themselves must be disjoint, checked below.
+                    seen.lock().unwrap().extend(rows);
+                });
+
+                let mut visited = seen.into_inner().unwrap();
+                visited.sort_unstable();
+                assert_eq!(
+                    visited,
+                    (0..n).collect::<Vec<_>>(),
+                    "threads={threads} n={n}: rows must be covered exactly once"
+                );
+
+                // One `f` call per chunk — never per row — so a caller that
+                // allocates a scratch buffer per call keeps it per *task*.
+                // The serial fast path makes exactly one call, even for n = 0.
+                let expect = if is_serial(threads, n) {
+                    1
+                } else {
+                    chunk_count(n, threads)
+                };
+                let ranges = ranges.into_inner().unwrap();
+                assert_eq!(ranges.len(), expect, "threads={threads} n={n}");
+                let mut sorted = ranges.clone();
+                sorted.sort_unstable_by_key(|r| r.start);
+                let mut next = 0;
+                for r in sorted {
+                    assert_eq!(r.start, next, "threads={threads} n={n}: gap/overlap at {r:?}");
+                    next = r.end;
+                }
+                assert_eq!(next, n, "threads={threads} n={n}: tail not covered");
+                for r in &ranges {
+                    // Only the serial n = 0 case hands out an empty range.
+                    assert!(
+                        r.start < r.end || n == 0,
+                        "threads={threads} n={n}: empty chunk {r:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `for_each_row` is the per-row face of the same splitter: it must still
+    /// visit every row exactly once, at every thread count.
+    #[test]
+    fn for_each_row_visits_every_row_once() {
+        for threads in [1usize, 2, 8, 16] {
+            for n in [0usize, 1, 7, 8, 9, 64, 1000] {
+                let seen: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+                for_each_row_with_threads(threads, n, |row| seen.lock().unwrap().push(row));
+                let mut visited = seen.into_inner().unwrap();
+                visited.sort_unstable();
+                assert_eq!(visited, (0..n).collect::<Vec<_>>(), "threads={threads} n={n}");
+            }
+        }
+        // The global-pool entry point, at whatever this host has.
+        for n in [0usize, 1, 7, 8, 1000] {
+            let seen: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+            for_each_row(n, |row| seen.lock().unwrap().push(row));
+            let mut visited = seen.into_inner().unwrap();
+            visited.sort_unstable();
+            assert_eq!(visited, (0..n).collect::<Vec<_>>(), "for_each_row n={n}");
+        }
     }
 }
