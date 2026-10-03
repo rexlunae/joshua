@@ -1045,6 +1045,10 @@ impl GatedDeltaNet {
         let host = |x: &Tensor| -> Result<Vec<f32>> { x.flatten_all()?.to_vec1::<f32>() };
         let (q, k, v, g, beta) = (host(&q)?, host(&k)?, host(&v)?, host(&g)?, host(&beta)?);
         if let (Some(pre), Some(cap)) = (pre, cap.as_mut()) {
+            // A PLE block runs *before* this mixer and has already recorded its
+            // own conv window into the same capture; carrying those fields over
+            // keeps a combined snapshot instead of discarding them here.
+            let (ple_pre, ple_normalized) = (cap.ple_pre.clone(), cap.ple_normalized.clone());
             let inputs = DeltaInputs {
                 q: q.clone(),
                 k: k.clone(),
@@ -1062,8 +1066,8 @@ impl GatedDeltaNet {
                 pre: Some(pre),
                 inputs: Some(inputs),
                 cfg: Some(c.clone()),
-                ple_pre: None,
-                ple_normalized: None,
+                ple_pre,
+                ple_normalized,
             };
         }
         let o = gated_delta_rule(
