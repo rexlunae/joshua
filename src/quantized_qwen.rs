@@ -1649,15 +1649,11 @@ impl crate::native_session::LayerStack for Weights {
     }
 
     fn can_rewind(&self) -> bool {
-        // The PLE conv window and the QSA indexer keys are captured and
-        // replayed by `restore_state`, but the rollback still diverges from
-        // incremental decode for a model that has them, so those do not
-        // speculate yet.  Until that is resolved, refuse rather than ship a
-        // silent mismatch; the DeltaNet hybrids are unaffected.
-        !self.layers.iter().any(|l| {
-            matches!(&l.residual, Residual::Hyper { ple: Some(_), .. })
-                || matches!(&l.mixer, Mixer::Attention(a) if a.qsa.is_some())
-        })
+        // Every layer either rewinds its append-only state on its own or
+        // snapshots its running state before a verification pass and replays
+        // the retained prefix out of it (`restore_state`): the DeltaNet
+        // matrices, the PLE conv window and the QSA indexer keys all qualify.
+        true
     }
 }
 
