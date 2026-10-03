@@ -218,7 +218,8 @@ fn glm5next_matches_reference_at_every_position() {
 
 /// Token-by-token decode through the recurrent KDA state, the k-pool cache
 /// and the shared selections reproduces the prefill; the recurrent layers
-/// cannot rewind, so truncation is refused.
+/// cannot rewind to an arbitrary prefix, so truncation is refused — but a
+/// verification pass they have just run can be rolled back.
 #[test]
 fn glm5next_incremental_decode_matches_prefill() {
     for arch in GLM5NEXT_ARCHES {
@@ -232,6 +233,41 @@ fn glm5next_incremental_decode_matches_prefill() {
         assert!(
             !step.supports_kv_truncate(),
             "{arch}: KDA state cannot be truncated"
+        );
+        assert!(
+            step.supports_speculative(),
+            "{arch}: a verification pass must be rollable back"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+/// The rollback of a KDA verification pass on the *hybrid* stack: KDA layers
+/// (recurrent matrices and three conv tails), k-pool indexer keys (which
+/// `truncate_state` cuts and the next selection re-pools), a shared selection
+/// published across a KDA layer, and hyper-connection streams (which hold
+/// nothing across passes).  Each rollback is followed by a continuation
+/// **disjoint** from the draft over several positions, so stale state in any
+/// of those pieces diverges instead of reproducing an identical cache.
+#[test]
+fn glm5next_verify_rollback_matches_disjoint_decode() {
+    const PROMPT: [u32; 4] = [1, 4, 2, 7];
+    const DRAFT: [u32; 4] = [5, 9, 3, 6];
+    const TAILS: [&[u32]; 2] = [&[8, 1, 6, 11, 2], &[12, 13, 4, 15, 7]];
+    for arch in GLM5NEXT_ARCHES {
+        let (dir, m) = glm5next_model("rollback", arch);
+        common::check_recurrent_verify_rollback(
+            &m,
+            arch,
+            &PROMPT,
+            &DRAFT,
+            &[
+                PROMPT.len(),
+                PROMPT.len() + 1,
+                PROMPT.len() + 3,
+                PROMPT.len() + 4,
+            ],
+            &TAILS,
         );
         std::fs::remove_dir_all(&dir).ok();
     }

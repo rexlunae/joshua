@@ -112,7 +112,8 @@ fn kimi_k3_mxfp4_experts_match_their_decode() {
 
 /// Token-by-token decode through the recurrent KDA state, the MLA cache and
 /// K3's banked residual checkpoints reproduces the prefill; the recurrent
-/// layers cannot rewind, so truncation is refused.
+/// layers cannot rewind to an arbitrary prefix, so truncation is refused —
+/// but a verification pass they have just run can be rolled back.
 #[test]
 fn kimi_incremental_decode_matches_prefill() {
     for arch in ARCHES {
@@ -126,6 +127,44 @@ fn kimi_incremental_decode_matches_prefill() {
         assert!(
             !step.supports_kv_truncate(),
             "{arch}: KDA state cannot be truncated"
+        );
+        assert!(
+            step.supports_speculative(),
+            "{arch}: a verification pass must be rollable back"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+/// Rolling a verification pass back must leave the KDA layers in exactly the
+/// state plain incremental decoding would have produced — the delta-rule
+/// matrices *and* the three causal-conv tails, which together are all of a
+/// KDA layer's running state.
+///
+/// The continuation after each rollback is **disjoint** from the draft and
+/// spans several positions, so a rollback that left the rejected tokens folded
+/// into the recurrence (or kept a rejected conv row) diverges immediately
+/// rather than reproducing a numerically identical cache.  `keeps` covers a
+/// fully-accepted pass, partial accepts and a total rejection.
+#[test]
+fn kimi_kda_verify_rollback_matches_disjoint_decode() {
+    const PROMPT: [u32; 4] = [1, 4, 2, 7];
+    const DRAFT: [u32; 4] = [5, 9, 3, 6];
+    const TAILS: [&[u32]; 2] = [&[8, 1, 6, 11, 2], &[12, 13, 4, 15, 7]];
+    for arch in ARCHES {
+        let (dir, m) = kimi_model("rollback", arch, false);
+        common::check_recurrent_verify_rollback(
+            &m,
+            arch,
+            &PROMPT,
+            &DRAFT,
+            &[
+                PROMPT.len(),
+                PROMPT.len() + 1,
+                PROMPT.len() + 3,
+                PROMPT.len() + 4,
+            ],
+            &TAILS,
         );
         std::fs::remove_dir_all(&dir).ok();
     }
