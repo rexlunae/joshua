@@ -87,11 +87,21 @@ fn main() -> anyhow::Result<()> {
     );
 
     println!("=== VERDICT ===");
+    // This compares the *decoded text* and the token count, not the token ids:
+    // `complete` does not hand back the sequence.  Under greedy decoding an
+    // accepted draft is the target's argmax, so equal text and equal length is
+    // strong evidence — but two different id sequences can decode to the same
+    // string, so this is text parity, not a token-identity proof.  A strict
+    // check needs the ids exposed, which is the natural follow-up.
     let same_text = plain_text == spec_text;
     let same_len = plain_usage.completion_tokens == spec_usage.completion_tokens;
     if same_text && same_len {
         let speedup = if plain_dec > 0.0 { spec_dec / plain_dec } else { 0.0 };
-        println!("IDENTICAL ({} tokens)", plain_usage.completion_tokens);
+        println!(
+            "IDENTICAL TEXT ({} chars, {} tokens)",
+            plain_text.len(),
+            plain_usage.completion_tokens
+        );
         println!("decode speedup: {speedup:.2}x ({plain_dec:.2} -> {spec_dec:.2} t/s)");
         Ok(())
     } else {

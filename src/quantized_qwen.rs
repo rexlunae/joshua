@@ -839,10 +839,18 @@ impl RecurrentSnapshot {
         let kept = retained.min(inputs.t);
         // The conv tail is the last `d_conv - 1` time steps of the pass's qkv
         // window, so it is the pre-pass tail continued by the kept rows.
+        // `qkv_t` is token-major `[t, conv_dim]`, so the first `kept` tokens are
+        // a contiguous prefix and transpose to the `[conv_dim, kept]` the
+        // window expects.
         let k1 = cfg.d_conv.saturating_sub(1);
         if k1 > 0 {
             let (cd, dev) = (pre.conv.dim(0)?, pre.conv.device());
-            let qkv = Tensor::from_vec(inputs.qkv_t[..cd * kept].to_vec(), (cd, kept), dev)?;
+            let qkv = Tensor::from_vec(
+                inputs.qkv_t[..cd * kept].to_vec(),
+                (kept, cd),
+                dev,
+            )?
+            .t()?;
             let window = Tensor::cat(&[&pre.conv, &qkv], 1)?; // [conv_dim, k1 + kept]
             slot.conv = window.narrow(1, kept, k1)?.contiguous()?;
         }
@@ -993,9 +1001,11 @@ impl GatedDeltaNet {
             None => state.insert(self.fresh_state(xs.device())?),
         };
         // An armed verification pass records what it is about to overwrite, so
-        // a rejected draft can be rolled back.  Snapshot before `conv` and
-        // `gated_delta_rule` advance the state below.
-        let armed = cap.is_some();
+        // a rejected draft can be rolled back.  Clone the state *before*
+        // `conv` advances the causal tail and `gated_delta_rule` advances the
+        // matrices below: a snapshot taken afterwards would carry the rejected
+        // tokens' convolution history and re-seed it on rollback.
+        let pre = if cap.is_some() { Some(state.clone()) } else { None };
 
         let (qkv, z) = self.project(&x2)?;
         let (beta, g) = self.gates(&x2)?;
@@ -1007,19 +1017,22 @@ impl GatedDeltaNet {
 
         let host = |x: &Tensor| -> Result<Vec<f32>> { x.flatten_all()?.to_vec1::<f32>() };
         let (q, k, v, g, beta) = (host(&q)?, host(&k)?, host(&v)?, host(&g)?, host(&beta)?);
-        if armed {
-            let cap = cap.as_mut().expect("armed above");
+        if let (Some(pre), Some(cap)) = (pre, cap.as_mut()) {
             let inputs = DeltaInputs {
                 q: q.clone(),
                 k: k.clone(),
                 v: v.clone(),
                 g: g.clone(),
                 beta: beta.clone(),
-                qkv_t: qkv.t()?.contiguous()?.flatten_all()?.to_vec1::<f32>()?,
+                // Token-major `[t, conv_dim]`: the first `kept` floats are then
+                // exactly the accepted prefix of each channel once reshaped.
+                // Storing channel-major would stride every channel by the full
+                // pass length, so a flat prefix would mix in rejected tokens.
+                qkv_t: qkv.contiguous()?.flatten_all()?.to_vec1::<f32>()?,
                 t,
             };
             *cap = RecurrentSnapshot {
-                pre: Some(state.clone()),
+                pre: Some(pre),
                 inputs: Some(inputs),
                 cfg: Some(c.clone()),
             };
@@ -1558,9 +1571,12 @@ impl crate::native_session::LayerStack for Weights {
     }
 
     fn begin_verify(state: &mut LayerState) {
-        // Arm only the layers that have running state to record; an attention
-        // layer rewinds its KV cache through `truncate_state` alone.
-        state.capture = state.delta.as_ref().map(|_| RecurrentSnapshot::default());
+        // Arm unconditionally: before the very first forward `state.delta` is
+        // still `None`, and keying the arm off it would leave that first
+        // verification pass with nothing to roll back to.  An attention layer
+        // never fills the capture, so `snapshot_state` still reports nothing
+        // for it and the checkpoint stays layer-aligned.
+        state.capture = Some(RecurrentSnapshot::default());
     }
 
     fn snapshot_state(state: &LayerState) -> Option<RecurrentSnapshot> {
@@ -1578,10 +1594,16 @@ impl crate::native_session::LayerStack for Weights {
     }
 
     fn can_rewind(&self) -> bool {
-        // Every layer either rewinds its KV cache on its own or snapshots and
-        // replays its recurrence, so a rejected draft always leaves the state
-        // exactly as plain decoding would have.
-        true
+        // The PLE block keeps its own running convolution window
+        // (`LayerState::ple_conv`, the last `history_len` normalised inputs),
+        // which `restore_state` does not rebuild.  Leaving it at the end of a
+        // verification pass would feed the next token the rejected draft's
+        // history, so a model with PLE does not speculate yet.  Rewinding it
+        // means capturing the pre-pass window and the pass's normalised rows
+        // and re-slicing them, the same shape as the DeltaNet conv tail.
+        !self.layers.iter().any(|l| {
+            matches!(&l.residual, Residual::Hyper { ple: Some(_), .. })
+        })
     }
 }
 

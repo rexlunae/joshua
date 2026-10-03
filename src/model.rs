@@ -361,6 +361,10 @@ impl Architecture {
             Self::Llama | Self::Gemma | Self::Lfm2 | Self::Phi2 | Self::Phi3 | Self::Qwen2 => {
                 "candle's stock loader keeps the KV cache private"
             }
+            Self::Qwen4Exp => {
+                "its PLE blocks keep a running convolution history that a rejected \
+                 draft would leave advanced"
+            }
             Self::Glm5Next | Self::KimiLinear | Self::KimiK3 => {
                 "its KDA layers carry recurrent state that cannot be rewound (only cleared)"
             }
@@ -372,7 +376,6 @@ impl Architecture {
             | Self::Qwen3Next
             | Self::Qwen35
             | Self::Qwen35Moe
-            | Self::Qwen4Exp
             | Self::Qwen3Vl
             | Self::Qwen3VlMoe
             | Self::ChatGlm
@@ -866,11 +869,36 @@ impl QuantizedModel {
         match self {
             Self::DeepSeek4(m) => m.truncate_kv_cache(keep_len).map(|_| true),
             _ => {
-                if !self.supports_kv_truncate() {
+                // Two different requests reach here.  An *arbitrary* backward
+                // rewind (edited-context reuse) needs `supports_kv_truncate`;
+                // rolling back the verification pass that just ran only needs
+                // a pending checkpoint, which a recurrent loader has even
+                // though it cannot rewind to an arbitrary prefix.  Gating on
+                // the former alone would abort generation on the first
+                // rejected draft.
+                if !self.supports_kv_truncate() && !self.has_pending_verify() {
                     return Ok(false);
                 }
                 session!(self, m => m.truncate_kv_cache(keep_len).map(|_| true), _ => Ok(false))
             }
+        }
+    }
+
+    /// Whether a speculative verification pass is still pending rollback.
+    pub fn has_pending_verify(&self) -> bool {
+        match self {
+            Self::DeepSeek4(_) => true,
+            _ => session!(self, m => m.has_pending_verify(), _ => false),
+        }
+    }
+
+    /// Drop a pending verification checkpoint once the caller knows it will not
+    /// roll the pass back, so a pooled session does not sit on a full copy of
+    /// every recurrent layer's state.
+    pub fn discard_verify(&mut self) {
+        match self {
+            Self::DeepSeek4(m) => m.discard_verify(),
+            _ => session!(self, m => m.discard_verify(), _ => {}),
         }
     }
 

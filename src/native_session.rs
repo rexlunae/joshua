@@ -390,10 +390,26 @@ impl<W: LayerStack> Session<W> {
         self.weights.can_truncate()
     }
 
-    /// Whether a just-run verification pass can be rolled back to any earlier
-    /// position, which is what speculative decoding needs.
+    /// Whether a speculative verification pass can be rolled back — the stronger
+    /// property speculative decoding needs.
     pub fn supports_rewind(&self) -> bool {
         self.weights.can_rewind()
+    }
+
+    /// Whether a verification pass is still pending rollback.
+    pub fn has_pending_verify(&self) -> bool {
+        self.verify.is_some()
+    }
+
+    /// Drop a pending verification checkpoint.
+    ///
+    /// A pass whose drafts were all accepted needs no rollback, but its
+    /// snapshots — a full copy of every recurrent layer's state — would stay
+    /// resident until the next forward pass replaced them, including while the
+    /// session sat in the engine's warm pool.  The decode loop calls this once
+    /// it is done with the step.
+    pub fn discard_verify(&mut self) {
+        self.verify = None;
     }
 
     /// Keep only the first `keep` fed tokens of every layer's state.
