@@ -146,9 +146,10 @@ fn qwen_recurrent_verify_rollback_matches_incremental_decode() {
         let dir = common::model_dir(&format!("qwen-verify-rollback-{arch}"));
         let model = dir.join("model.gguf");
         common::write_tiny_qwen_gguf(&model, arch);
-        // qwen4exp's PLE block keeps a convolution history that is not rewound,
-        // so it does not speculate (see `Weights::can_rewind`); rolling a pass
-        // back there would leave that history advanced.
+        // qwen4exp is not speculating yet: its PLE conv window and QSA indexer
+        // keys are captured and replayed, but the rollback still diverges from
+        // incremental decode, so it stays off rather than shipping a silent
+        // mismatch.  See `Weights::can_rewind`.
         if !load(&model).supports_speculative() {
             std::fs::remove_dir_all(&dir).ok();
             continue;

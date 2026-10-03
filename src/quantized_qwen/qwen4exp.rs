@@ -265,6 +265,7 @@ impl Ple {
         res: &Tensor,
         history: &[u32],
         conv_state: &mut Option<Tensor>,
+        capture: &mut Option<super::RecurrentSnapshot>,
     ) -> Result<Tensor> {
         let (b, t, wide) = res.dims3()?;
         let n = wide / self.hc;
@@ -297,6 +298,18 @@ impl Ple {
         // Depthwise causal conv over time, dilated by the n-gram size.
         let normalized = grouped_rms(&gated, &self.norm_conv, self.eps)?.reshape((t, wide))?;
         let hist = self.history_len();
+        // A verification pass may be rolled back, so record the window it is
+        // about to overwrite together with the rows that overwrite it: the
+        // rollback re-slices this same window over the retained prefix.
+        let ple_pre = if capture.is_some() {
+            Some(conv_state.clone().unwrap_or(Tensor::zeros(
+                (hist, wide),
+                DType::F32,
+                dev,
+            )?))
+        } else {
+            None
+        };
         let prev = match conv_state.take() {
             Some(p) => p,
             None => Tensor::zeros((hist, wide), DType::F32, dev)?,
@@ -315,6 +328,10 @@ impl Ple {
             });
         }
         *conv_state = Some(padded.narrow(0, t, hist)?.contiguous()?);
+        if let (Some(pre), Some(cap)) = (ple_pre, capture.as_mut()) {
+            cap.ple_pre = Some(pre);
+            cap.ple_normalized = Some(normalized.clone());
+        }
         let conv = silu(&conv.expect("kernel >= 1"))?.reshape((b, t, wide))?;
         res + (gated.reshape((b, t, wide))? + conv)?
     }
@@ -432,6 +449,14 @@ impl Qsa {
         let new = self.k_proj.forward(xs)?.reshape((t, d))?;
         let keys = cache.keys.take();
         let pooled_prev = cache.pooled.take();
+        // A rollback (speculative rejection) rewinds the position but the raw
+        // keys are append-only, so rows for the rejected tail are still there.
+        // Keep only the `offset` rows the current position implies; without
+        // this the block pooling below would mix rejected positions back in.
+        let keys = match keys {
+            Some(k) if k.dim(0)? > offset => Some(k.narrow(0, 0, offset)?),
+            other => other,
+        };
         let all = match keys {
             Some(k) => Tensor::cat(&[&k, &new], 0)?,
             None => new,

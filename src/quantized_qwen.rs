@@ -801,6 +801,12 @@ pub struct RecurrentSnapshot {
     /// The layer's SSM geometry.  Carried so [`LayerStack::restore_state`] —
     /// a static method with no handle on the weights — can replay without one.
     cfg: Option<SsmConfig>,
+    /// The PLE block's conv window as it was *before* the pass (`[hist, wide]`).
+    ple_pre: Option<Tensor>,
+    /// The pass's per-token conv inputs, `[t, wide]` — the rows `ple_pre` is
+    /// continued by, so a rollback can rebuild the window for the retained
+    /// prefix exactly as the forward built it.
+    ple_normalized: Option<Tensor>,
 }
 
 /// One verification pass's worth of Gated DeltaNet recurrence inputs: the
@@ -866,6 +872,27 @@ impl RecurrentSnapshot {
             &mut slot.ssm,
             kept,
         );
+        Ok(())
+    }
+
+    /// Roll the PLE block's conv window back to `retained` tokens into the pass.
+    ///
+    /// The forward keeps the last `hist` rows of `cat(prev, normalized)`, so
+    /// rebuilding for a retained prefix is the same slice over a shorter
+    /// `normalized`.  Without this the window would still hold the rejected
+    /// tail and the next token would read it as history.
+    fn replay_ple(&self, state: &mut Option<Tensor>, retained: usize) -> Result<()> {
+        let (Some(pre), Some(normalized)) = (&self.ple_pre, &self.ple_normalized) else {
+            return Ok(());
+        };
+        let Some(slot) = state.as_mut() else {
+            return Ok(());
+        };
+        let kept = retained.min(normalized.dim(0)?);
+        let hist = pre.dim(0)?;
+        let padded = Tensor::cat(&[pre, &normalized.narrow(0, 0, kept)?], 0)?; // [hist + kept, wide]
+        // Same slice the forward takes: the last `hist` rows.
+        *slot = padded.narrow(0, kept, hist)?.contiguous()?;
         Ok(())
     }
 }
@@ -1035,6 +1062,8 @@ impl GatedDeltaNet {
                 pre: Some(pre),
                 inputs: Some(inputs),
                 cfg: Some(c.clone()),
+                ple_pre: None,
+                ple_normalized: None,
             };
         }
         let o = gated_delta_rule(
@@ -1532,7 +1561,12 @@ impl crate::native_session::LayerStack for Weights {
             }
             Residual::Hyper { attn, ffn, ple } => {
                 let res = match ple {
-                    Some(p) => p.forward(xs, input.tokens, &mut state.ple_conv)?,
+                    Some(p) => p.forward(
+                        xs,
+                        input.tokens,
+                        &mut state.ple_conv,
+                        &mut state.capture,
+                    )?,
                     None => xs.clone(),
                 };
                 let (h, inject) = attn.mix(&res)?;
@@ -1558,7 +1592,16 @@ impl crate::native_session::LayerStack for Weights {
     }
 
     fn can_truncate(&self) -> bool {
-        !self.layers.iter().any(|l| matches!(l.mixer, Mixer::DeltaNet(_)))
+        // Only pure attention rewinds on its own.  Every other piece of running
+        // state — the DeltaNet matrices, the PLE conv window, and the QSA
+        // indexer keys — reaches back over nothing, so an *arbitrary* backward
+        // truncate cannot serve them and must be refused rather than leave them
+        // silently out of step with the KV cache.
+        !self.layers.iter().any(|l| {
+            matches!(l.mixer, Mixer::DeltaNet(_))
+                || matches!(&l.residual, Residual::Hyper { ple: Some(_), .. })
+                || matches!(&l.mixer, Mixer::Attention(a) if a.qsa.is_some())
+        })
     }
 
     fn truncate_state(state: &mut LayerState, keep: usize) -> Result<()> {
@@ -1590,19 +1633,22 @@ impl crate::native_session::LayerStack for Weights {
         snap: RecurrentSnapshot,
         retained: usize,
     ) -> Result<()> {
-        snap.replay(&mut state.delta, retained)
+        // A recurrent layer rewinds its delta-rule matrices; a PLE layer rewinds
+        // its conv window.  A layer with neither (pure attention) has nothing
+        // here and its KV cache was already truncated.
+        snap.replay(&mut state.delta, retained)?;
+        snap.replay_ple(&mut state.ple_conv, retained)
     }
 
     fn can_rewind(&self) -> bool {
-        // The PLE block keeps its own running convolution window
-        // (`LayerState::ple_conv`, the last `history_len` normalised inputs),
-        // which `restore_state` does not rebuild.  Leaving it at the end of a
-        // verification pass would feed the next token the rejected draft's
-        // history, so a model with PLE does not speculate yet.  Rewinding it
-        // means capturing the pre-pass window and the pass's normalised rows
-        // and re-slicing them, the same shape as the DeltaNet conv tail.
+        // The PLE conv window and the QSA indexer keys are captured and
+        // replayed by `restore_state`, but the rollback still diverges from
+        // incremental decode for a model that has them, so those do not
+        // speculate yet.  Until that is resolved, refuse rather than ship a
+        // silent mismatch; the DeltaNet hybrids are unaffected.
         !self.layers.iter().any(|l| {
             matches!(&l.residual, Residual::Hyper { ple: Some(_), .. })
+                || matches!(&l.mixer, Mixer::Attention(a) if a.qsa.is_some())
         })
     }
 }
