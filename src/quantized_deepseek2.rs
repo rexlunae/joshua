@@ -1032,6 +1032,11 @@ impl Weights {
 
 impl crate::native_session::LayerStack for Weights {
     type State = LayerState;
+    // This loader has no rewindable running state yet (its KDA layers are not
+    // snapshotted), so it keeps the trait defaults: `snapshot_state` reports
+    // nothing and `can_rewind` falls back to `can_truncate`, leaving this
+    // loader's behaviour exactly as before the rewind seam existed.
+    type Snapshot = ();
 
     fn n_layers(&self) -> usize {
         self.layers.len()

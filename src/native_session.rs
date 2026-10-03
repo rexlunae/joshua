@@ -26,6 +26,14 @@ pub struct LayerInput<'a> {
     /// Every token fed so far, through this input (`offset + seq` of them)
     /// — only when [`LayerStack::wants_tokens`], else empty.
     pub tokens: &'a [u32],
+    /// Whether this input is a speculative **verification** pass (every
+    /// position scored in one sweep) rather than an ordinary prefill chunk.
+    ///
+    /// A verification pass may be rolled back past its rejected tail, so a
+    /// layer whose state is running rather than append-only snapshots what it
+    /// is about to overwrite (see [`LayerStack::snapshot_state`]).  Prefill
+    /// sets `false`: it is never partially undone.
+    pub verify: bool,
 }
 
 /// A loader's immutable weights, seen as an embedding, a stack of decoder
@@ -33,6 +41,10 @@ pub struct LayerInput<'a> {
 pub trait LayerStack: Send + Sync + 'static {
     /// One layer's per-session state (KV cache, recurrent state, …).
     type State: Clone + Default;
+
+    /// A copy of the part of `State` that a verification pass advances but an
+    /// ordinary truncate cannot rewind — see [`Self::snapshot_state`].
+    type Snapshot: Clone + Send;
 
     fn n_layers(&self) -> usize;
     /// Routed experts per MoE layer (0 for a dense model).
@@ -83,6 +95,82 @@ pub trait LayerStack: Send + Sync + 'static {
 
     /// Keep only the first `keep` positions of one layer's state.
     fn truncate_state(state: &mut Self::State, keep: usize) -> Result<()>;
+
+    /// Arm one layer's state to record what a verification pass is about to
+    /// overwrite, before that pass runs.
+    ///
+    /// The default is a no-op for append-only state (an attention layer's KV
+    /// cache rewinds through [`Self::truncate_state`] alone).  A layer with
+    /// running state installs an empty capture here; its
+    /// [`Self::snapshot_state`] then reports the filled one.
+    fn begin_verify(_state: &mut Self::State) {}
+
+    /// Copy whatever [`Self::truncate_state`] cannot rewind on its own — the
+    /// running state of a recurrent layer — so a verification pass can be
+    /// rolled back.
+    ///
+    /// Returns `None` when the loader has no such state, or when no
+    /// verification pass has been armed ([`Self::begin_verify`]).  A loader
+    /// with no restore path keeps [`Self::can_rewind`] `false`: a multi-token
+    /// verification pass would otherwise leave the tokens the target model
+    /// rejected folded permanently into the recurrence.
+    fn snapshot_state(_state: &Self::State) -> Option<Self::Snapshot> {
+        None
+    }
+
+    /// Roll this layer's state back to what it was `retained` tokens into the
+    /// verification pass that produced `snap`, discarding the pass's rejected
+    /// tail.
+    ///
+    /// `retained` is `keep - pass_offset` — the number of the pass's tokens
+    /// that survived.  An implementation that snapshots running state must
+    /// **replay** those `retained` tokens into the restored state: restoring
+    /// the pre-pass snapshot alone would also discard the tokens that were
+    /// accepted, leaving the recurrence behind plain decoding.  The snapshot
+    /// therefore carries the pass's own recurrence inputs for that replay —
+    /// the same reason `deepseek4`'s capture keeps the pass's projections
+    /// instead of recomputing them.
+    fn restore_state(
+        _state: &mut Self::State,
+        _snap: Self::Snapshot,
+        _retained: usize,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Whether a just-run verification pass can be rolled back to any earlier
+    /// position: every layer either rewinds on its own ([`Self::can_truncate`])
+    /// or exposes snapshot/restore.
+    fn can_rewind(&self) -> bool {
+        self.can_truncate()
+    }
+}
+
+/// A just-run multi-position (verification) pass that is still pending
+/// rollback: the position span it covered and each layer's snapshot.
+///
+/// The same shape `deepseek4` keeps in its own `VerifyCheckpoint`, so a
+/// rejected draft leaves both loader families in the state plain decoding
+/// would have produced.
+struct VerifyCheckpoint<S> {
+    /// Absolute position of the pass's first token.
+    offset: usize,
+    /// Number of tokens the pass fed.
+    seq: usize,
+    /// Per layer, the snapshot taken before the pass ran (`None` where the
+    /// layer rewinds on its own).  Kept layer-aligned so a rollback walks the
+    /// layers in lockstep with the state.
+    layers: Vec<Option<S>>,
+}
+
+impl<S> VerifyCheckpoint<S> {
+    /// How many of the pass's tokens survive a rollback to `keep`, or `None`
+    /// when `keep` lies outside the span this pass covered.
+    fn retained(&self, keep: usize) -> Option<usize> {
+        (self.offset..=self.offset + self.seq)
+            .contains(&keep)
+            .then_some(keep - self.offset)
+    }
 }
 
 /// A conversation over shared weights `W`: the weights behind one `Arc` plus
@@ -103,6 +191,10 @@ pub struct Session<W: LayerStack> {
     /// derived on-device from cached position ranges instead of re-filled and
     /// re-uploaded per call (see [`crate::moe::CausalMask`]).
     mask: crate::moe::CausalMask,
+    /// The last multi-position pass, pending rollback.  Only a verification
+    /// pass arms it; an ordinary prefill leaves it `None` because nothing
+    /// partially undoes a prefill.
+    verify: Option<VerifyCheckpoint<W::Snapshot>>,
 }
 
 impl<W: LayerStack> Session<W> {
@@ -115,6 +207,7 @@ impl<W: LayerStack> Session<W> {
             tokens: Vec::new(),
             hot_experts: crate::hot_experts::HotExpertCache::new(n, weights.n_expert(), 0),
             mask: crate::moe::CausalMask::new(weights.device()),
+            verify: None,
             weights,
         }
     }
@@ -138,6 +231,7 @@ impl<W: LayerStack> Session<W> {
                 self.hot_experts.budget(),
             ),
             mask: crate::moe::CausalMask::new(self.weights.device()),
+            verify: None,
         }
     }
 
@@ -226,11 +320,32 @@ impl<W: LayerStack> Session<W> {
             mask: mask.as_ref(),
             offset,
             tokens: if w.wants_tokens() { &self.tokens[..offset + seq_len] } else { &[] },
+            verify: all_logits,
         };
+        // A verification pass may be rolled back past its rejected tail, so arm
+        // every layer to record what it is about to overwrite before the loop
+        // starts.  A prefill is never partially undone, so it arms nothing and
+        // drops any checkpoint left by an earlier pass.
+        self.verify = None;
+        if all_logits {
+            for s in self.state.iter_mut() {
+                W::begin_verify(s);
+            }
+        }
         for l in 0..self.state.len() {
             let (out, routed) = w.layer(l, &mut self.state, &xs, &layer_input)?;
             self.hot_experts.record(l, &routed, step);
             xs = out;
+        }
+        if all_logits {
+            // Collect what the pass recorded, layer-aligned, and remember the
+            // span it covered so `truncate_kv_cache` can roll back inside it.
+            let layers = self.state.iter().map(W::snapshot_state).collect();
+            self.verify = Some(VerifyCheckpoint {
+                offset,
+                seq: seq_len,
+                layers,
+            });
         }
 
         if all_logits {
@@ -261,26 +376,73 @@ impl<W: LayerStack> Session<W> {
             *s = W::State::default();
         }
         self.tokens.clear();
+        // A pending checkpoint refers into the state just replaced; drop it.
+        self.verify = None;
     }
 
-    /// Whether [`Self::truncate_kv_cache`] can cut the state back to an
-    /// arbitrary prefix (false for models with recurrent layers).
+    /// Whether this instance's state can be cut back to an *arbitrary* prefix.
+    ///
+    /// True for the append-only attention loaders.  False for a model with
+    /// recurrent layers, whose running state reaches back over nothing — that
+    /// one can still roll back a just-run verification pass, which is what
+    /// [`Self::supports_rewind`] answers.
     pub fn supports_truncate(&self) -> bool {
         self.weights.can_truncate()
     }
 
+    /// Whether a just-run verification pass can be rolled back to any earlier
+    /// position, which is what speculative decoding needs.
+    pub fn supports_rewind(&self) -> bool {
+        self.weights.can_rewind()
+    }
+
     /// Keep only the first `keep` fed tokens of every layer's state.
     ///
-    /// Used by the engine's edited-context prefix reuse (a follow-up prompt
-    /// that shares a prefix with the cached history after an agent harness
-    /// truncated or replaced middle blocks) and by speculative decoding's
-    /// rollback.  Fails for models that report `!supports_truncate()`.
+    /// Two shapes are exact:
+    ///
+    /// * **Inside a pending verification pass** — `keep` lands in the span
+    ///   [`Self::forward_all_logits`] last covered.  Each layer rewinds its
+    ///   append-only state through [`LayerStack::truncate_state`], and a layer
+    ///   with running state additionally restores its pre-pass snapshot and
+    ///   replays the accepted prefix, so the result matches plain decoding
+    ///   that never saw the rejected tokens.
+    /// * **An arbitrary earlier prefix** — only when every layer rewinds on its
+    ///   own ([`Self::supports_truncate`]); this is the engine's edited-context
+    ///   reuse, which rewinds a whole conversation.  A recurrent model refuses:
+    ///   its state has no history to reach back into, and pretending otherwise
+    ///   would silently desynchronise it from the KV cache.
+    ///
+    /// Used by the engine's edited-context prefix reuse and by speculative
+    /// decoding's rollback.
     pub fn truncate_kv_cache(&mut self, keep: usize) -> Result<()> {
-        if !self.supports_truncate() {
-            candle_core::bail!("this model's recurrent layer state cannot be truncated");
-        }
-        for s in self.state.iter_mut() {
-            W::truncate_state(s, keep)?;
+        match self.verify.take() {
+            Some(mut checkpoint) => {
+                let retained = checkpoint.retained(keep).ok_or_else(|| {
+                    candle_core::Error::Msg(format!(
+                        "cannot roll back to {keep} tokens: the pending verification pass covered \
+                         {}..={}",
+                        checkpoint.offset,
+                        checkpoint.offset + checkpoint.seq
+                    ))
+                })?;
+                for (i, s) in self.state.iter_mut().enumerate() {
+                    W::truncate_state(s, keep)?;
+                    if let Some(snap) = checkpoint.layers.get_mut(i).and_then(Option::take) {
+                        W::restore_state(s, snap, retained)?;
+                    }
+                }
+            }
+            None => {
+                if !self.weights.can_truncate() {
+                    candle_core::bail!(
+                        "this model's recurrent layer state cannot be truncated; only a \
+                         speculative verification pass can be rolled back"
+                    );
+                }
+                for s in self.state.iter_mut() {
+                    W::truncate_state(s, keep)?;
+                }
+            }
         }
         self.tokens.truncate(keep);
         Ok(())
@@ -319,7 +481,13 @@ impl<W: LayerStack> crate::stream_prefill::StreamPrefill for Session<W> {
         let mask = self.mask.mask(seq, pos)?;
         let w = Arc::clone(&self.weights);
         let tokens = if w.wants_tokens() { &self.tokens[..pos + seq] } else { &[][..] };
-        let input = LayerInput { mask: Some(&mask), offset: pos, tokens };
+        // A prefill is never partially undone, so nothing here arms a rewind.
+        let input = LayerInput {
+            mask: Some(&mask),
+            offset: pos,
+            tokens,
+            verify: false,
+        };
         let (out, routed) = w.layer(l, &mut self.state, xs, &input)?;
         let step = self.hot_experts.begin_step(false);
         self.hot_experts.record(l, &routed, step);

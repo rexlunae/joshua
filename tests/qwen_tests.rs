@@ -127,6 +127,12 @@ fn qwen_family_clear_resets_all_state() {
 /// Attention-only models can rewind their cache to a prefix (edited-context
 /// reuse, speculative rollback); recurrent models report that they cannot
 /// and refuse rather than silently keeping stale state.
+///
+/// Speculative decoding is the one exception: a *just-run* verification pass
+/// is always rolled back inside its own span, and a recurrent layer snapshots
+/// its running state and replays the accepted prefix, so every architecture
+/// here can verify and reject a draft.  An *arbitrary* backward rewind is a
+/// different request and stays refused for recurrent models.
 #[test]
 fn qwen_family_truncation_support_matches_state_kind() {
     for &(arch, recurrent) in ARCHES {
@@ -136,7 +142,8 @@ fn qwen_family_truncation_support_matches_state_kind() {
 
         let mut m = load(&model);
         assert_eq!(m.supports_kv_truncate(), !recurrent, "{arch}");
-        assert_eq!(m.supports_speculative(), !recurrent, "{arch}");
+        // Every architecture can roll back its own verification pass.
+        assert!(m.supports_speculative(), "{arch}");
         let full = logits(&mut m, &[1, 4, 2, 7], 0);
         if recurrent {
             assert!(

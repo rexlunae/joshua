@@ -361,9 +361,6 @@ impl Architecture {
             Self::Llama | Self::Gemma | Self::Lfm2 | Self::Phi2 | Self::Phi3 | Self::Qwen2 => {
                 "candle's stock loader keeps the KV cache private"
             }
-            Self::Qwen3Next | Self::Qwen35 | Self::Qwen35Moe | Self::Qwen4Exp => {
-                "its Gated DeltaNet layers carry recurrent state that cannot be rewound (only cleared)"
-            }
             Self::Glm5Next | Self::KimiLinear | Self::KimiK3 => {
                 "its KDA layers carry recurrent state that cannot be rewound (only cleared)"
             }
@@ -372,6 +369,10 @@ impl Architecture {
             | Self::Qwen2Vl
             | Self::Qwen3
             | Self::Qwen3Moe
+            | Self::Qwen3Next
+            | Self::Qwen35
+            | Self::Qwen35Moe
+            | Self::Qwen4Exp
             | Self::Qwen3Vl
             | Self::Qwen3VlMoe
             | Self::ChatGlm
@@ -831,6 +832,23 @@ impl QuantizedModel {
         }
     }
 
+    /// Whether a just-run speculative verification pass can be rolled back —
+    /// the stronger property speculative decoding needs.
+    ///
+    /// Distinct from [`Self::supports_kv_truncate`], which answers the
+    /// *arbitrary* backward rewind the engine's edited-context reuse performs.
+    /// A model with recurrent layers cannot rewind to an arbitrary earlier
+    /// prefix (its running state keeps no history) but *can* roll back the pass
+    /// that just ran, by restoring a pre-pass snapshot and replaying the
+    /// accepted prefix — see
+    /// [`crate::native_session::LayerStack::can_rewind`].
+    pub fn supports_rewind(&self) -> bool {
+        match self {
+            Self::DeepSeek4(_) => true,
+            _ => session!(self, m => m.supports_rewind(), _ => false),
+        }
+    }
+
     /// Keep only the first `keep_len` fed tokens of every layer's KV cache.
     ///
     /// Positions `[0..keep_len)` stay exactly as they were produced by the
@@ -877,10 +895,15 @@ impl QuantizedModel {
 
     /// Whether this instance can run speculative decoding: score every
     /// position of a multi-token input ([`Self::forward_all_logits`]) *and*
-    /// roll the KV cache back past rejected draft tokens
+    /// roll the state back past rejected draft tokens
     /// ([`Self::truncate_kv_cache`]).  See [`crate::speculative`].
+    ///
+    /// Asks [`Self::supports_rewind`], not [`Self::supports_kv_truncate`]: a
+    /// rollback always lands inside the verification pass that just ran, which
+    /// a snapshotting model can serve even though it cannot rewind to an
+    /// arbitrary earlier prefix.
     pub fn supports_speculative(&self) -> bool {
-        self.supports_kv_truncate()
+        self.supports_rewind()
     }
 
     /// Forward pass returning the logits of every input position,
