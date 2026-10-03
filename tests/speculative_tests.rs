@@ -330,27 +330,31 @@ fn unsupported_architecture_falls_back_to_plain_decoding() {
 }
 
 #[test]
-fn recurrent_hybrid_refuses_speculative_loudly() {
-    // A Gated DeltaNet hybrid cannot roll its KV cache back (recurrent state
-    // only clears), so the engine must reflect the refusal in the effective
-    // configuration instead of holding a setting decode time would skip.
+fn recurrent_hybrid_speculates_without_changing_output() {
+    // A Gated DeltaNet hybrid's state is running, not append-only, so it can
+    // only be rewound inside the span of the verification pass that produced
+    // it: the layer snapshots its matrices and conv tail beforehand and
+    // replays the accepted prefix on rollback.  Speculation must therefore be
+    // *enabled* here, and — the part that matters — must not change a token.
     let dir = common::model_dir("spec-qwen3next-engine");
     common::write_tiny_qwen_gguf(&dir.join("model.gguf"), "qwen3next");
     let plain = engine(&dir, None);
     let spec = engine(&dir, Some(SpeculativeConfig::default()));
-    assert!(spec.speculative_config().is_none());
+    assert!(
+        spec.speculative_config().is_some(),
+        "a snapshotting hybrid must keep the speculative configuration"
+    );
     let prompt = "a b c a b c a b";
     let (want, _, _, _) = plain.complete_raw(prompt, &greedy(12)).unwrap();
     let (got, _, _, _) = spec.complete_raw(prompt, &greedy(12)).unwrap();
-    assert_eq!(got, want);
-    assert_eq!(spec.speculative_stats().drafted, 0);
+    assert_eq!(got, want, "speculation must not change the output");
     std::fs::remove_dir_all(&dir).ok();
 }
 
 /// The static per-architecture map must classify every supported name: the
 /// plain-attention qwen and deepseek2 families plus deepseek4 decode
-/// speculatively, the stock candle loaders and the recurrent DeltaNet/KDA
-/// hybrids do not.
+/// speculatively; so do the DeltaNet hybrids, which snapshot and replay.  The
+/// stock candle loaders and the KDA hybrids still do not.
 #[test]
 fn architecture_speculative_map_covers_every_name() {
     use joshua::model::Architecture;
@@ -363,6 +367,9 @@ fn architecture_speculative_map_covers_every_name() {
         "qwen3moe",
         "qwen3vl",
         "qwen3vlmoe",
+        "qwen3next",
+        "qwen35",
+        "qwen35moe",
         "chatglm",
         "glm4",
         "glm4moe",
@@ -382,9 +389,6 @@ fn architecture_speculative_map_covers_every_name() {
         "phi2",
         "phi3",
         "qwen2",
-        "qwen3next",
-        "qwen35",
-        "qwen35moe",
         "qwen4exp",
         "glm5next",
         "glm5-next",

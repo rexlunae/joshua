@@ -124,9 +124,74 @@ fn qwen_family_clear_resets_all_state() {
     }
 }
 
-/// Attention-only models can rewind their cache to a prefix (edited-context
+/// Rolling a verification pass back to `keep` must leave the recurrent layers
+/// in exactly the state plain incremental decoding would have produced.
+///
+/// This is the invariant the whole snapshot/replay path exists to protect: a
+/// DeltaNet layer's matrices *and* its causal conv tail are running state, and
+/// a rollback that restores only the pre-pass copy would also discard the
+/// tokens that were accepted.  Unlike an end-to-end generation test it forces
+/// the case deterministically, because the draft only has to be *checked* and
+/// then rolled back — nothing has to guess it.
+///
+/// For each `keep` in `0..=n` the test runs one multi-position pass over `n`
+/// tokens, rolls back to `keep`, then decodes token `keep` and compares against
+/// a reference model fed the same tokens one at a time.
+#[test]
+fn qwen_recurrent_verify_rollback_matches_incremental_decode() {
+    for &(arch, recurrent) in ARCHES {
+        if !recurrent {
+            continue;
+        }
+        let dir = common::model_dir(&format!("qwen-verify-rollback-{arch}"));
+        let model = dir.join("model.gguf");
+        common::write_tiny_qwen_gguf(&model, arch);
+        // qwen4exp is not speculating yet: its PLE conv window and QSA indexer
+        // keys are captured and replayed, but the rollback still diverges from
+        // incremental decode, so it stays off rather than shipping a silent
+        // mismatch.  See `Weights::can_rewind`.
+        if !load(&model).supports_speculative() {
+            std::fs::remove_dir_all(&dir).ok();
+            continue;
+        }
+        let toks: [u32; 5] = [1, 4, 2, 7, 3];
+        // The verification pass covers the first `n`; `toks[keep]` is the token
+        // that follows the rolled-back prefix, so it must be in range for every
+        // `keep` including `n` itself.
+        let n = 4;
+
+        for keep in 0..=n {
+            // Reference: plain incremental decode of exactly the retained
+            // prefix, then decode the token that follows it.
+            let mut reference = load(&model);
+            for (i, &t) in toks.iter().take(keep).enumerate() {
+                common::logits(&mut reference, &[t], i);
+            }
+            let want = common::logits(&mut reference, &[toks[keep]], keep);
+
+            // Subject: one multi-position verification pass over all `n` tokens,
+            // then roll it back to `keep` and decode the same next token.
+            let mut m = load(&model);
+            let input = Tensor::new(&toks[..n], &Device::Cpu).unwrap().unsqueeze(0).unwrap();
+            m.forward_all_logits(&input, 0).unwrap();
+            assert!(
+                m.truncate_kv_cache(keep).unwrap(),
+                "{arch}: a pending verification pass must be rollable back"
+            );
+            let got = common::logits(&mut m, &[toks[keep]], keep);
+            common::assert_close(&want, &got, 1e-4, &format!("{arch} rollback to {keep}"));
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
 /// reuse, speculative rollback); recurrent models report that they cannot
 /// and refuse rather than silently keeping stale state.
+///
+/// Speculative decoding is the one exception: a *just-run* verification pass
+/// is always rolled back inside its own span, and a recurrent layer snapshots
+/// its running state and replays the accepted prefix, so every architecture
+/// here can verify and reject a draft.  An *arbitrary* backward rewind is a
+/// different request and stays refused for recurrent models.
 #[test]
 fn qwen_family_truncation_support_matches_state_kind() {
     for &(arch, recurrent) in ARCHES {
@@ -136,7 +201,11 @@ fn qwen_family_truncation_support_matches_state_kind() {
 
         let mut m = load(&model);
         assert_eq!(m.supports_kv_truncate(), !recurrent, "{arch}");
-        assert_eq!(m.supports_speculative(), !recurrent, "{arch}");
+        // Attention-only and snapshotting DeltaNet hybrids can roll back their
+        // own verification pass; a PLE block's convolution history is not
+        // rewound yet, so a model carrying one does not speculate.
+        let has_ple = arch == "qwen4exp";
+        assert_eq!(m.supports_speculative(), !has_ple, "{arch}");
         let full = logits(&mut m, &[1, 4, 2, 7], 0);
         if recurrent {
             assert!(

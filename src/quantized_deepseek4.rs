@@ -4124,6 +4124,13 @@ impl ModelWeights {
         (backed, total)
     }
 
+    /// Drop the pending verification checkpoint.  A pass whose drafts were all
+    /// accepted needs no rollback, so its per-layer captures can be released
+    /// rather than held while the session sits in a pool.
+    pub fn discard_verify(&mut self) {
+        self.verify = None;
+    }
+
     /// Reset the KV caches so this instance can serve an unrelated prompt.
     pub fn clear_kv_cache(&mut self) {
         match self.shared.new_kv() {

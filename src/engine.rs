@@ -943,6 +943,16 @@ impl GenSession {
         }
     }
 
+    /// Release the pending verification checkpoint once the decode loop is done
+    /// with the step, so a pooled session does not hold a full copy of every
+    /// recurrent layer's state (see [`crate::native_session::Session::discard_verify`]).
+    fn discard_verify(&mut self) {
+        match self {
+            Self::Candle(model) => model.discard_verify(),
+            Self::Npu(_) => {}
+        }
+    }
+
     fn is_npu(&self) -> bool {
         matches!(self, Self::Npu(_))
     }
@@ -2625,6 +2635,10 @@ impl Engine {
                 acceptance = n_accepted as f64 / n_drafted as f64,
                 "Speculative decoding"
             );
+            // The step is over: the last verification pass is either already
+            // rolled back or needs no rollback, so its snapshots can go rather
+            // than linger until the next forward pass replaced them.
+            model.discard_verify();
         }
 
         let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
