@@ -105,6 +105,14 @@ pub trait LayerStack: Send + Sync + 'static {
     /// [`Self::snapshot_state`] then reports the filled one.
     fn begin_verify(_state: &mut Self::State) {}
 
+    /// Release whatever [`Self::begin_verify`] armed.
+    ///
+    /// The session keeps its own copy in the checkpoint, so the per-layer slot
+    /// can be dropped as soon as that copy is taken; otherwise a pooled session
+    /// would sit on a full copy of every recurrent layer's state — the matrices
+    /// and the verification inputs — long after decoding finished.
+    fn clear_verify(_state: &mut Self::State) {}
+
     /// Copy whatever [`Self::truncate_state`] cannot rewind on its own — the
     /// running state of a recurrent layer — so a verification pass can be
     /// rolled back.
@@ -346,6 +354,12 @@ impl<W: LayerStack> Session<W> {
                 seq: seq_len,
                 layers,
             });
+            // The checkpoint holds its own copy, so the per-layer slots are dead
+            // weight from here; dropping them keeps a pooled session from
+            // sitting on a second copy of every recurrent layer's state.
+            for s in self.state.iter_mut() {
+                W::clear_verify(s);
+            }
         }
 
         if all_logits {
@@ -410,6 +424,9 @@ impl<W: LayerStack> Session<W> {
     /// it is done with the step.
     pub fn discard_verify(&mut self) {
         self.verify = None;
+        for s in self.state.iter_mut() {
+            W::clear_verify(s);
+        }
     }
 
     /// Keep only the first `keep` fed tokens of every layer's state.

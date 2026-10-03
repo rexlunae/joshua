@@ -1622,6 +1622,10 @@ impl crate::native_session::LayerStack for Weights {
         state.capture = Some(RecurrentSnapshot::default());
     }
 
+    fn clear_verify(state: &mut LayerState) {
+        state.capture = None;
+    }
+
     fn snapshot_state(state: &LayerState) -> Option<RecurrentSnapshot> {
         // An unarmed (or attention) layer reports nothing, so the session's
         // checkpoint stays layer-aligned with `None` there.
