@@ -371,11 +371,11 @@ fn try_simd_kquant<T: GgmlType>(
         return true;
     }
     let dst_ptr = crate::simd::DstPtr::new(dst);
-    let worker = move |rows: &[usize]| {
+    let worker = move |rows: std::ops::Range<usize>| {
         // One dequantization scratch per task, reused across the task's
         // rows (the weight row is fully dequantized before the SIMD dot).
         let mut wrow = vec![0f32; k];
-        for &row in rows {
+        for row in rows {
             T::to_float(&blocks[row * blocks_per_row..(row + 1) * blocks_per_row], &mut wrow);
             // SAFETY: `simd_level` only reports levels this CPU supports and
             // `k % 8 == 0` was checked for the SIMD ones, so the
@@ -388,8 +388,7 @@ fn try_simd_kquant<T: GgmlType>(
     if parallel {
         crate::simd::for_each_row_chunks(n, worker);
     } else {
-        let rows: Vec<usize> = (0..n).collect();
-        worker(&rows);
+        worker(0..n);
     }
     true
 }
@@ -790,6 +789,47 @@ mod tests {
         matmul_kquant_serial::<BlockQ8_0>((3, 256, 24), &lhs, &blocks, &mut ser).unwrap();
 
         assert_eq!(par, ser, "parallel and serial matmul must be bit-identical");
+    }
+
+    /// The row splitter behind `crate::simd::for_each_row_chunks` must not
+    /// change a single bit of the result.  Run at every awkward row count —
+    /// below the `n < 8` serial cutoff, exactly on a chunk boundary and not
+    /// on one — for a dtype that reaches the chunked dequant+dot route
+    /// (Q6_K, Q4_0: the fused Q8_0/Q2_K/Q4_K kernels take over before it) and
+    /// for the fused route's `for_each_row` (Q8_0).
+    ///
+    /// The chunked path only engages when the pool has more than one thread
+    /// (`available_parallelism` on the test host: 16); on a single-core host
+    /// the assertions still hold, they just exercise the serial fast path.
+    #[test]
+    fn chunked_row_split_matches_serial_bit_exact_at_awkward_n() {
+        const M: usize = 3;
+        const K: usize = 256;
+        macro_rules! parity {
+            ($ty:ty, $dtype:expr) => {{
+                for n in [1usize, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 100, 129, 1000] {
+                    let blocks = quantized_blocks::<$ty>(n, K, $dtype);
+                    let lhs: Vec<f32> = (0..M * K)
+                        .map(|i| (((i * 40503) % 997) as f32 / 317.0) - 1.5)
+                        .collect();
+
+                    let mut par = vec![0f32; M * n];
+                    matmul_kquant::<$ty>((M, K, n), &lhs, &blocks, &mut par).unwrap();
+
+                    let mut ser = vec![0f32; M * n];
+                    matmul_kquant_serial::<$ty>((M, K, n), &lhs, &blocks, &mut ser).unwrap();
+
+                    assert_eq!(
+                        par, ser,
+                        "{}: parallel and serial must be bit-identical at n={n}",
+                        stringify!($dtype)
+                    );
+                }
+            }};
+        }
+        parity!(BlockQ6K, GgmlDType::Q6K);
+        parity!(BlockQ4_0, GgmlDType::Q4_0);
+        parity!(BlockQ8_0, GgmlDType::Q8_0);
     }
 
     #[test]
