@@ -896,4 +896,103 @@ mod tests {
         assert_eq!(initial.get_property_val_str("heartbeat"), Some("0"));
         assert_eq!(refresh.get_property_val_str("heartbeat"), Some("1"));
     }
+
+    /// Unregister on drop, so a failed assertion cannot leave a service
+    /// advertised and make a later run in the same process flaky.
+    struct Unregister(Option<Discovery>);
+
+    impl Unregister {
+        fn new(node: NodeInfo, port: u16) -> Self {
+            Self(Some(Discovery::new(node, port).expect("register discovery service")))
+        }
+    }
+
+    impl std::ops::Deref for Unregister {
+        type Target = Discovery;
+        fn deref(&self) -> &Discovery {
+            self.0.as_ref().expect("held until drop")
+        }
+    }
+
+    impl std::ops::DerefMut for Unregister {
+        fn deref_mut(&mut self) -> &mut Discovery {
+            self.0.as_mut().expect("held until drop")
+        }
+    }
+
+    impl Drop for Unregister {
+        fn drop(&mut self) {
+            if let Some(mut discovery) = self.0.take() {
+                let _ = discovery.shutdown();
+            }
+        }
+    }
+
+    /// Two real services on one host find each other over actual mDNS.
+    ///
+    /// Every other test here drives `PeerTable` directly, so nothing in the
+    /// suite has ever exercised `mdns-sd` itself — registration, browse,
+    /// resolve and goodbye were reachable only from an example. This drives the
+    /// real daemon: two `Discovery` instances register, browse, and must each
+    /// report the other.
+    ///
+    /// `#[ignore]`d for the same reason as the collective multicast test: it
+    /// needs the host's multicast/mDNS stack to work, which a sandbox or
+    /// container may deny. Run it explicitly with `--ignored`.
+    #[test]
+    #[ignore = "requires a working host mDNS stack; run with --ignored"]
+    fn two_discoveries_find_each_other_over_real_mdns() {
+        let (a_uuid, b_uuid) = (Uuid::new_v4(), Uuid::new_v4());
+        // Distinct advertised ports so the two advertisements differ.
+        let (mut a, mut b) = (
+            Unregister::new(NodeInfo::local(a_uuid), 40_001),
+            Unregister::new(NodeInfo::local(b_uuid), 40_002),
+        );
+
+        // Nothing is discovered before a poll, so a pass cannot be an artifact
+        // of the constructor having recorded anything locally.
+        assert!(a.peers().is_empty(), "no peer before any poll");
+        assert!(b.peers().is_empty(), "no peer before any poll");
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let (mut a_saw_b, mut b_saw_a) = (false, false);
+        while Instant::now() < deadline && !(a_saw_b && b_saw_a) {
+            a.poll(Duration::from_millis(100)).expect("poll A");
+            b.poll(Duration::from_millis(100)).expect("poll B");
+            a_saw_b |= a.peers().iter().any(|p| p.node.uuid == b_uuid);
+            b_saw_a |= b.peers().iter().any(|p| p.node.uuid == a_uuid);
+        }
+        assert!(a_saw_b, "A never discovered B over mDNS");
+        assert!(b_saw_a, "B never discovered A over mDNS");
+
+        // The remote advertisement carries the properties the RFC lists, and a
+        // node is never its own peer.
+        let remote = a
+            .peers()
+            .into_iter()
+            .find(|p| p.node.uuid == b_uuid)
+            .expect("B is in A's peer list");
+        assert_eq!(remote.port, 40_002, "advertised application port survives");
+        assert!(!remote.node.uuid.is_nil());
+        assert!(!a.peers().iter().any(|p| p.node.uuid == a_uuid), "self excluded");
+
+        // Goodbye, checked last because it removes B from A's peer list. A node
+        // that shuts down unregisters, and the survivor must drop it on the
+        // resulting removal event — not merely when the entry ages out past
+        // `PEER_TTL`. Allowing half the TTL separates the two: a working
+        // goodbye lands in well under a second, whereas expiry alone would take
+        // the full 15 s. Without this, a missing goodbye or a dropped removal
+        // event would go unnoticed.
+        b.shutdown();
+        let sees_b = |a: &Discovery| a.peers().iter().any(|p| p.node.uuid == b_uuid);
+        let gone_by = Instant::now() + PEER_TTL / 2;
+        while Instant::now() < gone_by && sees_b(&a) {
+            a.poll(Duration::from_millis(100)).expect("poll A after goodbye");
+        }
+        assert!(
+            !sees_b(&a),
+            "A still lists B {}s after B's goodbye; removal relied on TTL expiry",
+            PEER_TTL.as_secs()
+        );
+    }
 }
