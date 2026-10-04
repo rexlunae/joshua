@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Keep the build honest about feature unification: without this a
+  # `--features distributed` job can silently reuse artifacts from a job that
+  # enabled it first, or vice versa.
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  # The default pure-Rust build. This is what `cargo build` gives a user with
+  # only a Rust toolchain, so it must stay green with no extra features.
+  test:
+    name: test (default features)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the pinned toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.89.0
+      - uses: Swatinem/rust-cache@v2
+      # No `--workspace`: the workspace `members` list includes
+      # `crates/joshua-llamacpp-npu`, which compiles llama.cpp's C++ and is
+      # deliberately kept out of the default build (`default-members` in
+      # Cargo.toml). Selecting the whole workspace here would make CI require a
+      # C++ toolchain and break the "pure Rust build" guarantee this job checks.
+      - name: Check the default build
+        run: cargo check --release
+      - name: Test
+        run: cargo test --release --tests
+
+  # RFC #86's networking and sharding code — discovery, multicast, the
+  # partitioner, the shard map and the deepseek4 cluster integration tests —
+  # is all behind `--features distributed`. A plain `cargo test --tests` runs
+  # *none* of it, so without this job that work has no continuous coverage and
+  # can rot silently. It is cheap here: the feature is pure Rust and the tests
+  # use loopback.
+  test-distributed:
+    name: test (--features distributed)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the pinned toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.89.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Check
+        run: cargo check --release --features distributed
+      - name: Test
+        run: cargo test --release --features distributed --tests
+      - name: Test the cluster example's cases too
+        run: cargo test --release --features distributed --example cluster_linear
+      # The real multicast socket path. `#[ignore]`d by default because it
+      # needs loopback multicast, which not every runner provides; it passes on
+      # the hosts we have tried, so run it as its own step where it can be seen
+      # to fail rather than never being executed.
+      - name: Multicast loopback
+        run: cargo test --release --features distributed --lib -- --ignored multicast
+
+  # Reported, not gating. Both have pre-existing findings on `main` today:
+  # rustfmt drift across the tree and one clippy `error` in
+  # `src/distributed/shard.rs`. They are surfaced so a *new* violation is
+  # visible in the log, and promoted to blocking once that backlog is cleared.
+  lint:
+    name: lint (non-blocking)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.89.0
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+      - name: clippy
+        run: cargo clippy --release --all-targets --features distributed
