@@ -975,5 +975,24 @@ mod tests {
         assert_eq!(remote.port, 40_002, "advertised application port survives");
         assert!(!remote.node.uuid.is_nil());
         assert!(!a.peers().iter().any(|p| p.node.uuid == a_uuid), "self excluded");
+
+        // Goodbye, checked last because it removes B from A's peer list. A node
+        // that shuts down unregisters, and the survivor must drop it on the
+        // resulting removal event — not merely when the entry ages out past
+        // `PEER_TTL`. Allowing half the TTL separates the two: a working
+        // goodbye lands in well under a second, whereas expiry alone would take
+        // the full 15 s. Without this, a missing goodbye or a dropped removal
+        // event would go unnoticed.
+        b.shutdown();
+        let sees_b = |a: &Discovery| a.peers().iter().any(|p| p.node.uuid == b_uuid);
+        let gone_by = Instant::now() + PEER_TTL / 2;
+        while Instant::now() < gone_by && sees_b(&a) {
+            a.poll(Duration::from_millis(100)).expect("poll A after goodbye");
+        }
+        assert!(
+            !sees_b(&a),
+            "A still lists B {}s after B's goodbye; removal relied on TTL expiry",
+            PEER_TTL.as_secs()
+        );
     }
 }
