@@ -985,6 +985,13 @@ mod tests {
         // event would go unnoticed.
         b.shutdown();
         let sees_b = |a: &Discovery| a.peers().iter().any(|p| p.node.uuid == b_uuid);
+        // Non-vacuity: A must still be listing B *right now*. If B's entry had
+        // already aged out of A's table, the assertion below would pass for the
+        // wrong reason — expiry, not a goodbye.
+        assert!(
+            sees_b(&a),
+            "A already dropped B before the goodbye; the removal check would be vacuous"
+        );
         let gone_by = Instant::now() + PEER_TTL / 2;
         while Instant::now() < gone_by && sees_b(&a) {
             a.poll(Duration::from_millis(100)).expect("poll A after goodbye");
