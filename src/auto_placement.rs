@@ -75,9 +75,23 @@ impl DenseBench {
         }
     }
 
-    /// Best of the two speedups — used for the placement decision.
+    /// The speedup that decides dense placement: the **decode** ratio.
+    ///
+    /// Decode is the phase where keeping dense on the device costs the most —
+    /// one host<->device round trip per layer, paid on the critical path of
+    /// every generated token. Prefill feeds many tokens per copy, so a device
+    /// that is excellent at prefill and poor at decode still amortises the
+    /// transfers well there.
+    ///
+    /// Taking the best of the two (the old behaviour) let a prefill-only win
+    /// qualify dense for the device. Measured on an Intel Arc Pro B50 with
+    /// DeepSeek-V4-Flash (experts in host RAM): the device probed at
+    /// **0.46x** CPU-BLAS on decode but **1.68x** on prefill, so `max()` read
+    /// 1.68 and placed dense on the GPU — making decode *slower* than leaving
+    /// dense on the CPU (1.7 vs 2.0 tok/s). Decode is the tighter constraint,
+    /// so it is the one that gates.
     fn best_speedup(&self) -> f64 {
-        self.decode_speedup().max(self.prefill_speedup())
+        self.decode_speedup()
     }
 }
 
@@ -179,9 +193,12 @@ pub fn benchmark(device: &Device) -> DenseBench {
 ///
 /// * An explicit `Device` / `Cpu` request wins (the operator overrides Auto).
 /// * `Auto` keeps dense on the accelerator when it is at least
-///   [`MIN_DEVICE_SPEEDUP`] faster than CPU-BLAS on either dominant shape, and
-///   moves it to CPU-BLAS otherwise.  An unmeasurable device (0 GFLOPS) counts
-///   as "no faster" and dense goes to CPU.
+///   [`MIN_DEVICE_SPEEDUP`] faster than CPU-BLAS on the **decode** shape, and
+///   moves it to CPU-BLAS otherwise.  Decode is the gating phase because it is
+///   where the per-layer host<->device round trip sits on the critical path; a
+///   device that only wins at prefill does not qualify (see [`DenseBench`]).
+///   An unmeasurable device (0 GFLOPS) counts as "no faster" and dense goes to
+///   CPU.
 /// * On the CPU device, `Auto` is CPU.
 pub fn recommend_dense(
     requested: DensePlacement,
@@ -269,6 +286,34 @@ mod tests {
         assert_eq!(
             recommend_dense(DensePlacement::Auto, &b, false),
             ResolvedDense::Cpu
+        );
+    }
+
+    #[test]
+    fn prefill_only_win_does_not_qualify_dense_for_the_device() {
+        // The measured Intel Arc Pro B50 profile: prefill is clearly faster
+        // than CPU-BLAS, decode is clearly slower. A prefill-only win used to
+        // place dense on the GPU and cost decode throughput.
+        let b = bench(18.4, 235.4, 40.0, 140.1); // 0.46x decode, 1.68x prefill
+        assert!(
+            b.prefill_speedup() >= MIN_DEVICE_SPEEDUP,
+            "fixture must be a prefill win, else it tests nothing"
+        );
+        assert!(b.decode_speedup() < MIN_DEVICE_SPEEDUP);
+        assert_eq!(
+            recommend_dense(DensePlacement::Auto, &b, false),
+            ResolvedDense::Cpu
+        );
+    }
+
+    #[test]
+    fn decode_win_still_qualifies_dense_for_the_device() {
+        // The complementary case: fast at decode clears the bar on its own,
+        // even with a prefill ratio below the threshold.
+        let b = bench(200.0, 60.0, 40.0, 120.0); // 5.0x decode, 0.5x prefill
+        assert_eq!(
+            recommend_dense(DensePlacement::Auto, &b, false),
+            ResolvedDense::Device
         );
     }
 
