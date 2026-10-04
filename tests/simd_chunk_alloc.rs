@@ -140,7 +140,18 @@ fn pool_threads() -> usize {
     std::thread::available_parallelism().map_or(1, |n| n.get())
 }
 
+/// How many times `joshua::simd`'s splitter calls `f` for `n` rows.
+///
+/// Mirrors the splitter exactly, including its serial cutoff: with one worker
+/// thread (or below `n < 8`) it hands the whole range to a single call rather
+/// than splitting.  A host that reports `available_parallelism() == 1` therefore
+/// gets one call and one scratch buffer, not a chunk count derived from a
+/// parallel split it never takes — assuming the parallel shape there would fail
+/// on single-core CI for no production reason.
 fn chunk_count(n: usize) -> usize {
+    if pool_threads() <= 1 || n < 8 {
+        return 1;
+    }
     n.div_ceil((n / (pool_threads() * 4)).max(1))
 }
 
