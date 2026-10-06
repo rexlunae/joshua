@@ -2,7 +2,8 @@
 //!
 //! GGUF sharding and capacity planning are available without networking.
 //! The `distributed` feature also enables CPU DeepSeek V4 tensor-parallel
-//! generation, advisory mDNS discovery and authenticated UDP/TCP collectives.
+//! generation, a static CPU Qwen3 layer pipeline, advisory mDNS discovery
+//! and authenticated UDP/TCP collectives.
 //! These APIs do not change [`crate::Engine`]'s single-node execution or
 //! automatically admit discovered machines to a cluster.
 
@@ -18,3 +19,5 @@ pub mod tcp;
 pub mod session;
 #[cfg(feature = "distributed")]
 pub mod deepseek4;
+#[cfg(feature = "distributed")]
+pub mod pipeline;
