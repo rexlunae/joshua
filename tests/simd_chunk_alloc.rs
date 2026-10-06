@@ -134,6 +134,29 @@ fn count_allocs(f: impl FnOnce()) -> Census {
     }
 }
 
+/// Low-water census over `reps` runs.
+///
+/// Rayon's `Registry` grows a thread's cached job stack as a *one-time*
+/// event when the stack first needs to be deeper — that growth can land
+/// inside a measured window even after warm-up installs (observed on
+/// macOS: 6-19 small blocks at n=8/64), but it does not repeat run after
+/// run.  A real regression — a per-chunk `Vec<usize>` — allocates on
+/// *every* run.  Taking the minimum census therefore keeps the guard
+/// deterministic against one-time pool bookkeeping without loosening the
+/// bounds it actually enforces.
+fn count_allocs_min(reps: usize, mut f: impl FnMut()) -> Census {
+    let mut best: Option<Census> = None;
+    for _ in 0..reps {
+        let c = count_allocs(&mut f);
+        best = Some(match best {
+            None => c,
+            Some(b) if c.count <= b.count => c,
+            Some(b) => b,
+        });
+    }
+    best.unwrap()
+}
+
 /// The row-parallel pool's chunk count, mirroring `joshua::simd`'s
 /// ~4-chunks-per-thread split.
 fn pool_threads() -> usize {
@@ -184,11 +207,14 @@ fn baseline_chunks(n: usize, f: impl Fn(&[usize]) + Send + Sync) {
 
 // ── Tests ─────────────────────────────────────────────────────────────────
 
-/// The chunked splitter must not allocate on the chunk account: nothing at
-/// all up to 1 KiB (where every per-chunk `Vec<usize>` lands for any chunk up
-/// to 128 rows), and a total that does not grow with `n`.  Rayon's own
-/// `pool.install` bookkeeping is allowed and shows up as a small,
-/// `n`-independent constant.
+/// The chunked splitter must not allocate on the chunk account: the ≤1 KiB
+/// bands (where every per-chunk `Vec<usize>` lands for any chunk up to 128
+/// rows) may hold only a small bounded residual, and the total must not grow
+/// with `n`.  A strict zero is not a contract rayon offers: its `Registry`
+/// may re-allocate a cached job stack inside the measured window — the exact
+/// flake that motivated #153 — so this test bounds the residual the same way
+/// `for_each_row_allocates_nothing` does and relies on the baseline
+/// comparisons and the drift bound below to keep the guard real.
 ///
 /// The old `chunks()` splitter is measured in the same process for the
 /// "before" number.
@@ -202,15 +228,17 @@ fn row_chunk_split_allocates_nothing() {
 
     let mut new_totals = Vec::new();
     for n in [8usize, 64, 256, 1024, 4096, 16384] {
-        let new = count_allocs(|| for_each_row_chunks(n, |_| {}));
-        // Nothing in the ≤1 KiB bands — where every per-chunk `Vec<usize>` of
-        // up to 128 rows lands — and nothing at all once rayon's cached job
-        // stack is warm (measured: 0 on this host; the slack absorbs a
-        // `Registry` that chooses to re-allocate its stack instead of reusing
-        // the cached one).
-        assert_eq!(
-            new.small_alloc(),
-            0,
+        let new = count_allocs_min(3, || for_each_row_chunks(n, |_| {}));
+        // The ≤1 KiB bands are where a per-chunk `Vec<usize>` of up to 128
+        // rows lands.  This is the low-water mark of three runs: rayon's
+        // one-time job-stack growth can land inside any single window (see
+        // `count_allocs_min` — observed on macOS as 6-19 small blocks), but
+        // it cannot mask a regression that allocates on every rep.  The
+        // bound matches `for_each_row_allocates_nothing`'s on purpose — a
+        // strict zero here was exactly the latent flake Devin flagged on
+        // this PR: the same `Registry` behaviour threatens both tests.
+        assert!(
+            new.small_alloc() <= 4,
             "for_each_row_chunks n={n} allocated {} small blocks: {new:?}",
             new.small_alloc()
         );
@@ -219,20 +247,28 @@ fn row_chunk_split_allocates_nothing() {
 
         // Before: one `Vec<usize>` per chunk (`Vec::from_iter` over rayon's
         // chunk sequence), plus a constant handful of rayon allocations.
-        let old = count_allocs(|| baseline_chunks(n, |_| {}));
+        let old = count_allocs_min(3, || baseline_chunks(n, |_| {}));
         assert!(
             old.count >= chunk_count(n),
             "baseline n={n}: expected >= {} chunk Vecs, census {old:?}",
             chunk_count(n)
         );
-        assert!(
-            old.count > new.count,
-            "baseline n={n} ({old:?}) should allocate more than the range splitter ({new:?})"
-        );
-        assert!(
-            old.bytes > new.bytes,
-            "baseline n={n} ({old:?}) should move more bytes than the range splitter ({new:?})"
-        );
+        // The head-to-head comparisons only carry signal once the per-chunk
+        // `Vec`s outweigh the constant install bookkeeping both sides pay;
+        // at n=8/64 every chunk holds 1-8 rows (8-64-byte `Vec`s) and the
+        // two censuses legitimately interleave — that is where the old
+        // unconditional comparison flaked.  `old.count >= chunk_count(n)`
+        // above still pins the regression shape at those sizes.
+        if n >= 256 {
+            assert!(
+                old.count > new.count,
+                "baseline n={n} ({old:?}) should allocate more than the range splitter ({new:?})"
+            );
+            assert!(
+                old.bytes > new.bytes,
+                "baseline n={n} ({old:?}) should move more bytes than the range splitter ({new:?})"
+            );
+        }
     }
     // What is left is rayon's `install` machinery: a constant that must not
     // track `n`.
@@ -257,7 +293,12 @@ fn for_each_row_allocates_nothing() {
 
     let mut new_totals = Vec::new();
     for n in [8usize, 64, 256, 1024, 4096, 16384] {
-        let census = count_allocs(|| for_each_row(n, |_| {}));
+        // Low-water of three runs: a one-time job-stack growth inside a
+        // measured window is what made this census fail on macOS (observed:
+        // 8-19 small blocks at n=8/64 even after the double warm-up), while
+        // a per-chunk regression recurs every single rep — see
+        // `count_allocs_min`.
+        let census = count_allocs_min(3, || for_each_row(n, |_| {}));
         // The property is "no allocation tracks the chunk count" — that is what
         // the per-chunk `Vec<usize>` used to do, and what the range splitter
         // removed.  A *strict* zero is not a contract rayon offers: its `Registry`
@@ -315,7 +356,12 @@ fn quantized_matmul_allocates_only_per_chunk_scratch() {
     matmul_kquant::<BlockQ6K>((M, K, 512), &lhs, &blocks, &mut warm).unwrap();
 
     let mut dst = vec![0f32; M * 512];
-    let census = count_allocs(|| {
+    // Low-water of three runs: the strict equalities below are exactly the
+    // shape rayon's one-time job-stack growth breaks — the stack lands in
+    // the medium band, and this test flaked ~3/10 at the unmodified PR head
+    // on macOS — while a stray scratch buffer per chunk would recur in
+    // every rep.  See `count_allocs_min`.
+    let census = count_allocs_min(3, || {
         matmul_kquant::<BlockQ6K>((M, K, 512), &lhs, &blocks, &mut dst).unwrap()
     });
     // One `vec![0f32; k]` (4 KiB) scratch per chunk; no per-chunk `Vec<usize>`
