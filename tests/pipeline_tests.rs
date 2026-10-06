@@ -29,7 +29,16 @@ fn start(
     ends: &[usize],
     mmap: bool,
 ) -> (Pipeline, Vec<JoinHandle<anyhow::Result<()>>>) {
-    let plan = Plan::from_gguf(path, ends, &vec![64 * 1024 * 1024; ends.len()], limits()).unwrap();
+    start_with(path, ends, mmap, limits())
+}
+
+fn start_with(
+    path: &Path,
+    ends: &[usize],
+    mmap: bool,
+    limits: Limits,
+) -> (Pipeline, Vec<JoinHandle<anyhow::Result<()>>>) {
+    let plan = Plan::from_gguf(path, ends, &vec![64 * 1024 * 1024; ends.len()], limits).unwrap();
     let job = Uuid::new_v4();
     let mut handles = Vec::new();
     let mut addresses = Vec::new();
@@ -237,6 +246,39 @@ fn dropping_coordinator_invalidates_workers_and_clears_live_sessions() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+#[test]
+fn idle_sessions_outlive_the_frame_deadline() {
+    let dir = common::model_dir("pipeline-idle");
+    let path = dir.join("model.gguf");
+    common::write_tiny_qwen3_layers(&path, 3);
+    let mut limits = limits();
+    limits.timeout_ms = 100;
+    let (mut pipeline, handles) = start_with(&path, &[1, 3], true, limits);
+    let id = pipeline.open().unwrap();
+    let prefill = pipeline
+        .forward_batch(&[Input {
+            session: id,
+            offset: 0,
+            tokens: vec![1, 2],
+        }])
+        .unwrap();
+    assert_eq!(prefill.len(), 1);
+    thread::sleep(std::time::Duration::from_millis(400));
+    pipeline
+        .forward_batch(&[Input {
+            session: id,
+            offset: 2,
+            tokens: vec![3],
+        }])
+        .unwrap();
+    pipeline.close(id).unwrap();
+    pipeline.shutdown().unwrap();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// Diagnostic only: no speed assertion on shared hosts or loopback networking.
 #[test]
 #[ignore = "explicit CPU loopback microbenchmark; run in release mode with --nocapture"]
@@ -390,6 +432,28 @@ impl RawClient {
     }
 }
 
+/// Complete a valid handshake and stop, asserting a clean worker exit.
+fn stop_worker(
+    address: std::net::SocketAddr,
+    job: Uuid,
+    plan: &Plan,
+    handle: JoinHandle<anyhow::Result<()>>,
+) {
+    use serde_json::json;
+    let mut client = RawClient {
+        stream: std::net::TcpStream::connect(address).unwrap(),
+        job,
+        rank: 0,
+        tx: 0,
+        rx: 0,
+    };
+    client.send(json!({"Hello":{"plan":plan,"rank":0}}), &[]);
+    client.receive().unwrap();
+    client.send(json!("Stop"), &[]);
+    client.receive().unwrap();
+    handle.join().unwrap().unwrap();
+}
+
 #[test]
 fn worker_rejects_duplicate_out_of_order_shape_and_authentication_errors() {
     use serde_json::json;
@@ -456,7 +520,8 @@ fn worker_rejects_duplicate_out_of_order_shape_and_authentication_errors() {
     client.send(forward, &[]);
     assert!(client.receive().is_err());
     assert!(handle.join().unwrap().is_err());
-    // A valid HMAC from a different job is refused at handshake.
+    // A valid HMAC from a different job is refused at handshake without
+    // stranding the worker: the real coordinator can still connect.
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let job = Uuid::new_v4();
@@ -471,7 +536,8 @@ fn worker_rejects_duplicate_out_of_order_shape_and_authentication_errors() {
     };
     client.send(json!({"Hello":{"plan":plan,"rank":0}}), &[]);
     assert!(client.receive().is_err());
-    assert!(handle.join().unwrap().is_err());
+    assert!(!handle.is_finished());
+    stop_worker(address, job, &plan, handle);
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -862,7 +928,8 @@ fn incomplete_frame_expires_without_allocating_an_unbounded_payload() {
         let mut reply = [0; 4];
         assert!(stream.read_exact(&mut reply).is_err());
         assert!(t.elapsed().as_secs() < 2, "stalled frame did not expire");
-        assert!(handle.join().unwrap().is_err());
+        // A stalled pre-handshake peer cannot strand the worker.
+        stop_worker(address, job, &plan, handle);
     }
     std::fs::remove_dir_all(dir).unwrap();
 }

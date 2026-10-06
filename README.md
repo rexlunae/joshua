@@ -1095,7 +1095,7 @@ Every stage needs access to the identical file; physical per-stage GGUF packagin
 is future work.
 
 Worker budgets reserve compact weights (expanded norms/floating weights where
-required), loader scratch, geometric KV growth, repeated KV and attention/FFN
+required, and dense matrices under `CANDLE_DEQUANTIZE_ALL`/`_F16`), loader scratch, geometric KV growth, repeated KV and attention/FFN
 workspace, RoPE and wire buffers. The coordinator has a separate buffer budget.
 These are conservative tensor planning estimates, **not enforced RSS quotas**:
 allocator/thread overhead, file-page residency and backend-specific scratch still
@@ -1105,13 +1105,17 @@ limits; over-budget plans are rejected before loading weights.
 TCP frames bind job UUID, stage, direction and monotonic frame counter with
 HMAC-SHA256. Authentication **does not encrypt** prompts or activations: use a
 trusted private network or an encrypted tunnel. Each worker accepts exactly one
-coordinator connection and exits on shutdown/disconnect/protocol error. A partial
+authenticated coordinator connection; a connection whose first frame fails
+authentication or framing is dropped and the worker keeps listening. After the
+handshake the worker exits on shutdown/disconnect/protocol error. A partial
 forward is never retried. Worker loss invalidates the entire coordinator and all
 its sessions; restart every worker with a fresh job UUID. `Pipeline::close`
 releases an idle session, and `Pipeline::abort_handle` allows out-of-band active
 cancellation of the whole job. Frame read/write deadlines prevent a stalled or
-trickling peer from keeping transport alive indefinitely; CPU compute itself is
-not preempted by network cancellation.
+trickling peer from keeping transport alive indefinitely; the deadline starts at
+a frame's first byte, so idle sessions between commands do not expire (TCP
+keepalive detects a vanished coordinator). CPU compute itself is not preempted
+by network cancellation.
 
 Build and create a manifest (replace the layer ends and budgets for your model):
 

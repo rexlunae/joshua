@@ -109,6 +109,32 @@ fn checked_product(values: &[u64]) -> Result<u64> {
     })
 }
 
+/// Dense element width forced on quantized matrices by candle's
+/// `CANDLE_DEQUANTIZE_ALL` (f32) or `CANDLE_DEQUANTIZE_ALL_F16` (f16).
+fn dequantize_width() -> Option<u64> {
+    let set = |name| std::env::var(name).is_ok_and(|s| !s.is_empty() && s != "0");
+    if set("CANDLE_DEQUANTIZE_ALL") {
+        Some(4)
+    } else if set("CANDLE_DEQUANTIZE_ALL_F16") {
+        Some(2)
+    } else {
+        None
+    }
+}
+
+/// Bytes retained by a matrix loaded through `QMatMul::from_arc`: floating
+/// GGUF types become f32, quantized types stay compact unless forced dense.
+fn matrix_bytes(dtype: u32, elems: usize, encoded: u64, dequantize: Option<u64>) -> Result<u64> {
+    let width = if matches!(dtype, 0 | 1 | 30) {
+        4
+    } else if let Some(width) = dequantize {
+        width
+    } else {
+        return Ok(encoded);
+    };
+    Ok(encoded.max(checked_product(&[elems as u64, width])?))
+}
+
 fn checked_sum(values: &[u64]) -> Result<u64> {
     values.iter().try_fold(0u64, |a, b| {
         a.checked_add(*b).context("pipeline memory size overflow")
@@ -271,6 +297,7 @@ impl Plan {
 
     fn check_memory(&self, header: &gguf_ext::GgufHeader, rank: usize) -> Result<u64> {
         let stage = &self.stages[rank];
+        let dequantize = dequantize_width();
         let mut weights = 0u64;
         let mut load_scratch = 0u64;
         let mut intermediate = self.hidden as u64;
@@ -295,24 +322,34 @@ impl Plan {
                 let encoded = gguf_ext::type_size_bytes(tensor.dtype, elems)
                     .context("unsupported tensor storage format")?
                     as u64;
-                // Norms/biases and floating-point linear weights expand to f32;
-                // block-quantized matrices remain compact, including mmap loads.
-                let expanded = tensor.dims.len() == 1 || matches!(tensor.dtype, 0 | 1 | 30);
-                let bytes = if expanded {
-                    encoded.max(checked_product(&[elems as u64, 4])?)
+                let dense = checked_product(&[elems as u64, 4])?;
+                // Norms/biases expand to f32. CPU embedding tables stay compact
+                // (floating tables are budgeted dense); matrices, including a
+                // tied head, follow `QMatMul::from_arc`.
+                let bytes = if tensor.dims.len() == 1 {
+                    encoded.max(dense)
                 } else {
-                    encoded
+                    let embedding = stage.start == 0 && name == "token_embd.weight";
+                    let matmul = name != "token_embd.weight"
+                        || (stage.end == self.layers
+                            && !header.tensors.contains_key("output.weight"));
+                    let table = if embedding {
+                        if matches!(tensor.dtype, 0 | 1 | 30) {
+                            encoded.max(dense)
+                        } else {
+                            encoded
+                        }
+                    } else {
+                        0
+                    };
+                    let matrix = if matmul {
+                        matrix_bytes(tensor.dtype, elems, encoded, dequantize)?
+                    } else {
+                        0
+                    };
+                    checked_sum(&[table, matrix])?
                 };
-                let copies = if name == "token_embd.weight"
-                    && stage.start == 0
-                    && stage.end == self.layers
-                    && !header.tensors.contains_key("output.weight")
-                {
-                    2
-                } else {
-                    1
-                };
-                weights = checked_sum(&[weights, checked_product(&[bytes, copies])?])?;
+                weights = checked_sum(&[weights, bytes])?;
                 load_scratch = load_scratch.max(encoded);
                 if name.starts_with("blk.") {
                     intermediate = intermediate.max(*tensor.dims.iter().max().unwrap_or(&0) as u64);
@@ -545,6 +582,21 @@ impl Wire {
         Ok(Packet { command, values })
     }
 
+    /// Block without a deadline until the next frame's first byte arrives, so
+    /// an idle authenticated connection keeps its sessions; `receive` then
+    /// bounds the frame itself.
+    fn wait_for_frame(&mut self) -> Result<()> {
+        self.stream.set_read_timeout(None)?;
+        loop {
+            match self.stream.peek(&mut [0u8; 1]) {
+                Ok(0) => return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into()),
+                Ok(_) => return Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+
     fn rpc(&mut self, packet: &Packet) -> Result<Packet> {
         let t = Instant::now();
         self.send(packet)?;
@@ -646,17 +698,34 @@ impl Worker {
         })
     }
 
-    /// Serve exactly one coordinator connection. Any protocol/compute failure
-    /// closes it and drops every session; do not reuse a failed worker job.
+    /// Serve exactly one authenticated coordinator connection. Connections
+    /// whose first frame is unauthenticated, malformed or stalled are dropped
+    /// and the worker keeps listening. After the handshake, any protocol or
+    /// compute failure closes the connection and drops every session; do not
+    /// reuse a failed worker job. Idle sessions do not expire; TCP keepalive
+    /// detects a vanished coordinator.
     pub fn serve(mut self, listener: TcpListener, job: Uuid, key: &[u8]) -> Result<()> {
         ensure!(
             key.len() >= 32 && job.get_version_num() == 4,
             "use a 32-byte key and fresh v4 job UUID"
         );
-        let (stream, _) = listener.accept()?;
-        let mut wire = Wire::new(stream, key, job, self.rank, false, &self.plan)?;
+        let (mut wire, hello) = loop {
+            let (stream, _) = listener.accept()?;
+            let Ok(mut wire) = Wire::new(stream, key, job, self.rank, false, &self.plan) else {
+                continue;
+            };
+            match wire.receive() {
+                Ok(hello) => break (wire, hello),
+                Err(_) => {
+                    let _ = wire.stream.shutdown(Shutdown::Both);
+                }
+            }
+        };
         let result = (|| {
-            let hello = wire.receive()?;
+            // Best effort; keepalive idle time has one-second granularity.
+            let keepalive = wire.timeout.max(Duration::from_secs(1));
+            let _ = socket2::SockRef::from(&wire.stream)
+                .set_tcp_keepalive(&socket2::TcpKeepalive::new().with_time(keepalive));
             let Command::Hello { plan, rank } = hello.command else {
                 bail!("expected handshake");
             };
@@ -669,6 +738,7 @@ impl Worker {
                 values: Vec::new(),
             })?;
             loop {
+                wire.wait_for_frame()?;
                 let packet = wire.receive()?;
                 if matches!(packet.command, Command::Stop) {
                     ensure!(packet.values.is_empty(), "unexpected stop payload");
@@ -1057,5 +1127,21 @@ impl AbortHandle {
         for stream in &self.streams {
             let _ = stream.shutdown(Shutdown::Both);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::matrix_bytes;
+
+    #[test]
+    fn matrix_reservation_follows_qmatmul_representation() {
+        // Q8_0 (type 8): 32 values in a 34-byte block.
+        assert_eq!(matrix_bytes(8, 32, 34, None).unwrap(), 34);
+        assert_eq!(matrix_bytes(8, 32, 34, Some(4)).unwrap(), 128);
+        assert_eq!(matrix_bytes(8, 32, 34, Some(2)).unwrap(), 64);
+        // Floating types always load as f32.
+        assert_eq!(matrix_bytes(1, 32, 64, None).unwrap(), 128);
+        assert_eq!(matrix_bytes(0, 32, 128, Some(2)).unwrap(), 128);
     }
 }
