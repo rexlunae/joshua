@@ -699,8 +699,9 @@ impl Worker {
     }
 
     /// Serve exactly one authenticated coordinator connection. Connections
-    /// whose first frame is unauthenticated, malformed or stalled are dropped
-    /// and the worker keeps listening. After the handshake, any protocol or
+    /// whose first frame is not an authenticated `Hello` for this plan and
+    /// rank (including malformed or stalled frames) are dropped and the
+    /// worker keeps listening. After the handshake, any protocol or
     /// compute failure closes the connection and drops every session; do not
     /// reuse a failed worker job. Idle sessions do not expire; TCP keepalive
     /// detects a vanished coordinator.
@@ -709,14 +710,17 @@ impl Worker {
             key.len() >= 32 && job.get_version_num() == 4,
             "use a 32-byte key and fresh v4 job UUID"
         );
-        let (mut wire, hello) = loop {
+        let mut wire = loop {
             let (stream, _) = listener.accept()?;
             let Ok(mut wire) = Wire::new(stream, key, job, self.rank, false, &self.plan) else {
                 continue;
             };
             match wire.receive() {
-                Ok(hello) => break (wire, hello),
-                Err(_) => {
+                Ok(Packet {
+                    command: Command::Hello { plan, rank },
+                    values,
+                }) if plan == self.plan && rank == self.rank && values.is_empty() => break wire,
+                _ => {
                     let _ = wire.stream.shutdown(Shutdown::Both);
                 }
             }
@@ -726,13 +730,6 @@ impl Worker {
             let keepalive = wire.timeout.max(Duration::from_secs(1));
             let _ = socket2::SockRef::from(&wire.stream)
                 .set_tcp_keepalive(&socket2::TcpKeepalive::new().with_time(keepalive));
-            let Command::Hello { plan, rank } = hello.command else {
-                bail!("expected handshake");
-            };
-            ensure!(
-                plan == self.plan && rank == self.rank && hello.values.is_empty(),
-                "stage plan mismatch"
-            );
             wire.send(&Packet {
                 command: Command::Reply { compute_ns: 0 },
                 values: Vec::new(),

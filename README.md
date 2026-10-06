@@ -1105,8 +1105,9 @@ limits; over-budget plans are rejected before loading weights.
 TCP frames bind job UUID, stage, direction and monotonic frame counter with
 HMAC-SHA256. Authentication **does not encrypt** prompts or activations: use a
 trusted private network or an encrypted tunnel. Each worker accepts exactly one
-authenticated coordinator connection; a connection whose first frame fails
-authentication or framing is dropped and the worker keeps listening. After the
+authenticated coordinator connection; a connection whose first frame is not an
+authenticated handshake for that plan and stage is dropped and the worker keeps
+listening. After the
 handshake the worker exits on shutdown/disconnect/protocol error. A partial
 forward is never retried. Worker loss invalidates the entire coordinator and all
 its sessions; restart every worker with a fresh job UUID. `Pipeline::close`

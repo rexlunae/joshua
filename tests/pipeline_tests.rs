@@ -536,6 +536,18 @@ fn worker_rejects_duplicate_out_of_order_shape_and_authentication_errors() {
     };
     client.send(json!({"Hello":{"plan":plan,"rank":0}}), &[]);
     assert!(client.receive().is_err());
+    // Authenticated first frames other than a matching Hello are also dropped.
+    for first in [json!("Stop"), json!({"Hello":{"plan":plan,"rank":1}})] {
+        let mut client = RawClient {
+            stream: std::net::TcpStream::connect(address).unwrap(),
+            job,
+            rank: 0,
+            tx: 0,
+            rx: 0,
+        };
+        client.send(first, &[]);
+        assert!(client.receive().is_err());
+    }
     assert!(!handle.is_finished());
     stop_worker(address, job, &plan, handle);
     std::fs::remove_dir_all(dir).unwrap();
