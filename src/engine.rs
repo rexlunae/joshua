@@ -3360,16 +3360,106 @@ fn map_model(
         });
     }
 
-    if huge == HugePages::Transparent {
-        #[cfg(target_os = "linux")]
-        match mmap.advise(memmap2::Advice::HugePage) {
-            Ok(()) => tracing::info!("requested transparent huge pages for the model mapping"),
-            Err(e) => {
-                tracing::warn!("transparent huge pages unavailable; using normal pages: {e}")
+/// What the kernel is willing to do about transparent huge pages for the VMA
+/// at `addr`, read back from `/proc/self/smaps`.
+///
+/// `madvise(MADV_HUGEPAGE)` returns success as long as the *hint* was accepted;
+/// it says nothing about whether the VMA can ever be promoted.  For a shared
+/// file-backed mapping on a filesystem without file THP support (ext4 among
+/// them) the hint succeeds and the pages stay at base size — a silent no-op.
+/// `THPeligible` is the kernel's own answer to "can this mapping get huge
+/// pages", so it is what the load path reports instead of the return code.
+///
+/// `None` means the VMA could not be inspected (no `/proc`, the mapping moved,
+/// or an unexpected smaps layout); callers must not claim success in that case.
+#[cfg(target_os = "linux")]
+pub fn thp_eligible_for(addr: usize) -> Option<bool> {
+    use std::io::BufRead;
+    let file = std::fs::File::open("/proc/self/smaps").ok()?;
+    let reader = std::io::BufReader::new(file);
+    // Streaming, not a whole-file read: a process with many mappings has a large
+    // smaps, and this runs on the load path.  Lines before the region of interest
+    // are skipped, and iteration stops as soon as the region ends.
+    let mut in_region = false;
+    for line in reader.lines() {
+        let Ok(line) = line else { break };
+        // Header: "7f8a1c000000-7f8a1c001000 rw-p 00000000 00:00 0". Every other
+        // line belongs to the region most recently seen. The mapping pointer is
+        // only guaranteed to fall *inside* its VMA, so match by containment.
+        if let Some((lo, hi)) = line
+            .split(' ')
+            .next()
+            .and_then(|first| first.split_once('-'))
+        {
+            let parsed = (
+                usize::from_str_radix(lo, 16).ok(),
+                usize::from_str_radix(hi, 16).ok(),
+            );
+            match parsed {
+                (Some(start), Some(end)) => {
+                    if in_region {
+                        // Passed the region without reading its answer.
+                        break;
+                    }
+                    in_region = start <= addr && addr < end;
+                }
+                // Not a header (a field line never parses as two hex numbers);
+                // fall through to the field check below.
+                _ => {}
+            }
+            continue;
+        }
+        if in_region {
+            if let Some(v) = line.strip_prefix("THPeligible:") {
+                return Some(v.trim() == "1");
             }
         }
-        #[cfg(not(target_os = "linux"))]
+    }
+    // `None`, not `Some(false)`: a kernel that does not report the field has not
+    // said the mapping is ineligible, and the caller must not claim it did.
+    None
+}
+
+/// Non-Linux has no `/proc/self/smaps` and no file-backed THP to verify.
+#[cfg(not(target_os = "linux"))]
+pub fn thp_eligible_for(_addr: usize) -> Option<bool> {
+    None
+}
+
+/// Ask for transparent huge pages on the model mapping and report what the
+/// kernel will actually do, not what the hint returned.
+fn advise_transparent_huge_pages(mmap: &Mmap) {
+    #[cfg(target_os = "linux")]
+    {
+        match mmap.advise(memmap2::Advice::HugePage) {
+            Ok(()) => match thp_eligible_for(mmap.as_ptr() as usize) {
+                Some(true) => tracing::info!(
+                    "transparent huge pages are eligible for the model mapping; the kernel will \
+                     promote pages as they are touched"
+                ),
+                Some(false) => tracing::warn!(
+                    "transparent huge pages were requested but the kernel will not promote this \
+                     mapping: THPeligible=0 on a shared file-backed region. Weights stay on base \
+                     (4 KiB) pages. Use --huge-pages 2mb or 1gb for an anonymous huge-page \
+                     mapping, which does take effect."
+                ),
+                None => tracing::warn!(
+                    "transparent huge pages were requested but eligibility could not be read from \
+                     /proc/self/smaps; the mapping may still be on base pages"
+                ),
+            },
+            Err(e) => tracing::warn!("transparent huge pages unavailable; using normal pages: {e}"),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = mmap;
         tracing::warn!("transparent huge pages are Linux-only; using normal pages");
+    }
+}
+
+    if huge == HugePages::Transparent {
+        advise_transparent_huge_pages(&mmap);
     }
 
     // Prefetch the whole model into the page cache so it is resident before
@@ -4207,17 +4297,227 @@ fn check_mappable(path: &Path, file: &File, mode: MmapMode, file_backed: bool) -
     }
 }
 
+/// A huge-page size the kernel offers, and how much of it can be obtained.
+///
+/// Plain numbers so [`select_huge_page`] is unit-testable anywhere; the values
+/// come from [`read_huge_pools`] (Linux sysfs) at load time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HugePool {
+    /// Page size in bytes (2 MiB, 64 MiB, 1 GiB, ...).
+    pub page_bytes: usize,
+    /// Pages in the persistent pool not currently allocated.
+    pub free_bytes: u64,
+    /// Spare bytes from the kernel's surplus (overcommit) allowance — headroom
+    /// beyond `nr_hugepages` that the kernel will still hand out.  Zero when
+    /// overcommit is off or already fully consumed.
+    pub surplus_bytes: u64,
+}
+
+impl HugePool {
+    /// Bytes this pool could plausibly back a mapping with: persistent free
+    /// pages plus whatever surplus allowance is still unspent.  Surplus pages
+    /// are not guaranteed — the kernel may decline under fragmentation — so this
+    /// deliberately keeps the preflight permissive and leaves the final word to
+    /// `mmap`, which still reports honestly if it fails.
+    pub fn available_bytes(&self) -> u64 {
+        self.free_bytes.saturating_add(self.surplus_bytes)
+    }
+}
+
+/// `MmapOptions::huge` selector bits for a page size, or `None` when the size
+/// cannot be asked for explicitly.
+///
+/// Linux encodes the requested size as `MAP_HUGE_SHIFT`: the page size's own
+/// power of two (2 MiB -> 21, 64 MiB -> 26, 1 GiB -> 30).  Any power-of-two size
+/// at least the 2 MiB minimum is therefore encodable, not just those two.  Sizes
+/// that cannot be encoded must never be selected, because `None` means "kernel
+/// default size" rather than "this size", and would round and preflight against
+/// one size while mapping another.
+fn huge_page_bits(page_bytes: usize) -> Option<u8> {
+    if page_bytes < 2 * 1024 * 1024 || !page_bytes.is_power_of_two() {
+        return None;
+    }
+    u8::try_from(page_bytes.trailing_zeros()).ok()
+}
+
+/// Bytes needed to cover `model_len` with whole pages of `page_bytes`.
+///
+/// Each candidate size rounds to **its own** page size.  Rounding the model once
+/// up front at the *requested* size would reject a 2 MiB pool that is perfectly
+/// sufficient: a file of 2 MiB + 1 byte needs two 2 MiB pages, not one gibibyte.
+/// Returns `None` only on overflow.
+fn huge_mapping_len(model_len: u64, page_bytes: usize) -> Option<u64> {
+    let page = u64::try_from(page_bytes).ok()?;
+    if page == 0 {
+        return None;
+    }
+    model_len.div_ceil(page).checked_mul(page)
+}
+
+/// Choose which huge-page size should back a `model_len` mapping.
+///
+/// The requested size is honoured whenever its pool can actually hold the
+/// mapping.  Otherwise the **largest encodable size that fits** is chosen, so a
+/// `1gb` request degrades to 2 MiB pages rather than failing the load outright —
+/// the weights are still huge-backed, just with more (and smaller) entries.
+/// `None` means no offered size fits, and the caller must not attempt the
+/// allocation.
+///
+/// Returns the chosen pool, whether it differs from the request, and the byte
+/// length to map — always rounded to the chosen size, so the preflight, the
+/// length and the `mmap` request can never disagree.
+///
+/// Pure: no I/O, no device, no `/proc`.
+pub fn select_huge_page(
+    pools: &[HugePool],
+    requested_page_bytes: usize,
+    model_len: u64,
+) -> Option<(HugePool, bool, u64)> {
+    let fits = |p: &HugePool| -> Option<u64> {
+        huge_page_bits(p.page_bytes)?;
+        let need = huge_mapping_len(model_len, p.page_bytes)?;
+        (p.available_bytes() >= need).then_some(need)
+    };
+    // Exact request first: an available 1 GiB pool must never be silently
+    // downgraded to something smaller.
+    if let Some(exact) = pools.iter().find(|p| p.page_bytes == requested_page_bytes) {
+        if let Some(need) = fits(exact) {
+            return Some((*exact, false, need));
+        }
+    }
+    let mut best: Option<(HugePool, u64)> = None;
+    for p in pools.iter().filter(|p| p.page_bytes != requested_page_bytes) {
+        if let Some(need) = fits(p) {
+            if best.is_none() || p.page_bytes > best.unwrap().0.page_bytes {
+                best = Some((*p, need));
+            }
+        }
+    }
+    best.map(|(p, need)| (p, p.page_bytes != requested_page_bytes, need))
+}
+
+
+/// Huge-page sizes the kernel offers, with the bytes free at each.
+///
+/// Empty means "cannot tell" (non-Linux, an unexpected sysfs layout, or no
+/// huge-page support), in which case the caller attempts the requested size
+/// unmodified rather than guessing.
+#[cfg(target_os = "linux")]
+pub fn read_huge_pools() -> Vec<HugePool> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/sys/kernel/mm/hugepages") else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        // "hugepages-1048576kB" -> 1048576 KiB -> bytes.
+        let name = entry.file_name().to_string_lossy().to_string();
+        let Some(kb) = name
+            .strip_prefix("hugepages-")
+            .and_then(|s| s.strip_suffix("kB"))
+            .and_then(|s| s.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        let count = |f: &str| -> u64 {
+            std::fs::read_to_string(entry.path().join(f))
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .unwrap_or(0)
+        };
+        let page_bytes = kb * 1024;
+        // Surplus capacity is the overcommit allowance minus the surplus already
+        // handed out elsewhere; pages reserved for live mappings are not ours to
+        // take.  Counting only free_hugepages would reject a mapping the kernel
+        // could still satisfy from `nr_overcommit_hugepages`.
+        let surplus = count("nr_overcommit_hugepages")
+            .saturating_sub(count("surplus_hugepages"))
+            .saturating_mul(page_bytes);
+        out.push(HugePool {
+            page_bytes: page_bytes as usize,
+            free_bytes: count("free_hugepages").saturating_mul(page_bytes),
+            surplus_bytes: surplus,
+        });
+    }
+    out.sort_by_key(|p| std::cmp::Reverse(p.page_bytes));
+    out
+}
+
+/// Non-Linux: no sysfs huge-page inventory.
+#[cfg(not(target_os = "linux"))]
+pub fn read_huge_pools() -> Vec<HugePool> {
+    Vec::new()
+}
+
 /// Load the model into an anonymous mapping backed by explicit huge pages.
 #[cfg(target_os = "linux")]
 fn map_model_hugetlb(path: &Path, file: &File, size: PageSize) -> Result<Mmap> {
     let len = file.metadata()?.len() as usize;
-    let (page_bits, page_len) = size.params();
-    // MAP_HUGETLB requires the mapping length to be a multiple of the page
-    // size; round up (the tail is zero-filled and unused).
-    let mapped_len = len
-        .div_ceil(page_len)
-        .checked_mul(page_len)
-        .ok_or_else(|| JoshuaError::ModelLoad("model too large for huge-page mapping".into()))?;
+    let (req_bits, req_len) = size.params();
+    // The requirement for the *requested* size, for diagnostics only: each
+    // candidate in select_huge_page is measured against its own page size.
+    let need_at_request = (len as u64)
+        .div_ceil(req_len as u64)
+        .checked_mul(req_len as u64)
+        .unwrap_or(u64::MAX);
+
+    // Inspect the pool before attempting the mapping, the same way the memlock
+    // path checks the limit before locking: an impossible request degrades with
+    // one warning naming requested-vs-available instead of failing the load, and
+    // a request that is available is never silently downgraded.  An empty
+    // inventory means "cannot tell", so the request is honoured untouched.
+    let pools = read_huge_pools();
+    let req_avail = pools
+        .iter()
+        .find(|p| p.page_bytes == req_len)
+        .map(HugePool::available_bytes)
+        .unwrap_or(0);
+    let gib = |b: u64| b as f64 / 2f64.powi(30);
+    // `mapped_len` is always the chosen size's own rounding, and `page_bits`
+    // always encodes that same size, so the three can never disagree.
+    let (page_bits, page_len, mapped_len) = match select_huge_page(&pools, req_len, len as u64) {
+        Some((pool, degraded, mapped_len)) => {
+            if degraded {
+                tracing::warn!(
+                    "huge pages: cannot back a {:.2} GiB mapping with {}-byte pages ({:.2} GiB \
+                     available); using {}-byte pages instead ({:.0} entries). To keep the \
+                     requested size, enlarge the pool — 1 GiB pages must be reserved at boot \
+                     (`default_hugepagesz=1G hugepagesz=1G hugepages=N`).",
+                    gib(need_at_request),
+                    req_len,
+                    gib(req_avail),
+                    pool.page_bytes,
+                    mapped_len as f64 / pool.page_bytes as f64,
+                );
+            }
+            (
+                huge_page_bits(pool.page_bytes),
+                pool.page_bytes,
+                usize::try_from(mapped_len)
+                    .map_err(|_| JoshuaError::ModelLoad("model too large for this platform".into()))?,
+            )
+        }
+        None if pools.is_empty() => {
+            let mapped = (len as u64)
+                .div_ceil(req_len as u64)
+                .checked_mul(req_len as u64)
+                .ok_or_else(|| JoshuaError::ModelLoad("model too large for huge-page mapping".into()))?;
+            (req_bits, req_len, mapped as usize)
+        }
+        None => {
+            return Err(JoshuaError::ModelLoad(format!(
+                "no huge-page pool can back a {:.2} GiB model mapping: requested {}-byte pages \
+                 with {:.2} GiB available (free pool plus surplus allowance). Raise the pool \
+                 (`sysctl vm.nr_hugepages=N`, sized for {:.0} pages), allow overcommit \
+                 (`/sys/kernel/mm/hugepages/hugepages-{}kB/nr_overcommit_hugepages`), or load \
+                 without --huge-pages.",
+                gib(need_at_request),
+                req_len,
+                gib(req_avail),
+                need_at_request as f64 / 2097152.0,
+                req_len / 1024,
+            )))
+        }
+    };
 
     let mut anon = memmap2::MmapOptions::new()
         .len(mapped_len)
@@ -5449,6 +5749,136 @@ mod tests {
         // separated by only the 100-byte norm tensor — a sub-page gap, so the
         // two expert ranges merge into one.
         assert_eq!(experts, vec![(4196, 5243080)]);
+    }
+
+    /// A huge-page pool: page size in MiB, free megabytes, no surplus.
+    fn pool(page_mib: usize, free_mib: u64) -> HugePool {
+        HugePool {
+            page_bytes: page_mib * 1024 * 1024,
+            free_bytes: free_mib * 1024 * 1024,
+            surplus_bytes: 0,
+        }
+    }
+
+    /// The 1 GiB and 2 MiB sizes, in bytes, for readable call sites.
+    const GIB_BYTES: usize = 1024 * 1024 * 1024;
+    const MIB2_BYTES: usize = 2 * 1024 * 1024;
+    fn gib(n: u64) -> u64 { n * 1024 * 1024 * 1024 }
+
+    /// The pool preflight must honour an available 1 GiB request exactly — a
+    /// real 1 GiB mapping is the point of asking for it.
+    #[test]
+    fn select_huge_page_honours_an_available_request() {
+        let pools = [pool(1024, 60 * 1024), pool(2, 60 * 1024)];
+        let (chosen, degraded, mapped_len) =
+            select_huge_page(&pools, GIB_BYTES, gib(58) + 1).unwrap();
+        assert_eq!(chosen.page_bytes, GIB_BYTES);
+        assert!(!degraded, "an available 1 GiB pool must never be silently downgraded");
+        // 58 GiB + 1 byte needs 59 whole 1 GiB pages, not 58.
+        assert_eq!(mapped_len, gib(59), "length rounded to the chosen size");
+    }
+
+    /// 1 GiB pages exist but are fragmentation-capped below the model: the load
+    /// must fall back to 2 MiB rather than failing outright.
+    #[test]
+    fn select_huge_page_degrades_when_the_requested_size_cannot_hold_the_model() {
+        let pools = [pool(1024, 31 * 1024), pool(2, 70 * 1024)];
+        let model = 62_394_667_168u64; // the reap-150b GGUF, as measured
+        let (chosen, degraded, mapped_len) = select_huge_page(&pools, GIB_BYTES, model).unwrap();
+        assert_eq!(chosen.page_bytes, MIB2_BYTES, "must fall back to the size that fits");
+        assert!(degraded, "the caller has to warn that the request changed");
+        assert_eq!(mapped_len % MIB2_BYTES as u64, 0, "length is a whole number of chosen pages");
+        assert!(mapped_len >= model);
+    }
+
+    /// Regression: each candidate must be measured against **its own** page
+    /// size.  Rounding once at the requested 1 GiB size rejected a 2 MiB pool
+    /// that could comfortably hold the file (2 MiB + 1 byte needs two 2 MiB
+    /// pages, not one gibibyte).
+    #[test]
+    fn select_huge_page_rounds_each_candidate_to_its_own_page_size() {
+        let pools = [pool(1024, 0), pool(2, 4)];
+        let model = 2 * 1024 * 1024 + 1;
+        let (chosen, degraded, mapped_len) =
+            select_huge_page(&pools, GIB_BYTES, model).unwrap();
+        assert_eq!(chosen.page_bytes, MIB2_BYTES);
+        assert!(degraded);
+        assert_eq!(mapped_len, 4 * 1024 * 1024, "two 2 MiB pages, not one 1 GiB page");
+    }
+
+    /// Regression: Linux hands out surplus pages beyond `nr_hugepages` when
+    /// overcommit allows it.  Counting only the persistent free pool rejected
+    /// mappings the kernel would have satisfied.
+    #[test]
+    fn select_huge_page_counts_surplus_allowance_as_available() {
+        let empty_pool_with_headroom = HugePool {
+            page_bytes: MIB2_BYTES,
+            free_bytes: 0,
+            surplus_bytes: 4 * 1024 * 1024,
+        };
+        let (chosen, _, mapped_len) =
+            select_huge_page(&[empty_pool_with_headroom], MIB2_BYTES, 2 * 1024 * 1024 + 1)
+                .expect("surplus allowance must be usable");
+        assert_eq!(chosen.page_bytes, MIB2_BYTES);
+        assert_eq!(mapped_len, 4 * 1024 * 1024);
+    }
+
+    /// Surplus already consumed by other mappings is not ours to count.
+    #[test]
+    fn select_huge_page_does_not_double_count_consumed_surplus() {
+        let p = HugePool {
+            page_bytes: MIB2_BYTES,
+            free_bytes: 0,
+            surplus_bytes: 0, // allowance fully spent already
+        };
+        assert!(select_huge_page(&[p], MIB2_BYTES, gib(1)).is_none());
+    }
+
+    /// Regression: a size whose selector bits cannot be computed must never be
+    /// chosen — `None` means "kernel default size", so preflight and mapping
+    /// would disagree about which pages are actually being asked for.
+    #[test]
+    fn select_huge_page_refuses_sizes_it_cannot_encode() {
+        // 3 MiB is not a power of two: unencodable.  1 MiB is below the minimum.
+        let bad = [pool(3, 70 * 1024), pool(1, 70 * 1024)];
+        assert!(select_huge_page(&bad, GIB_BYTES, gib(8)).is_none());
+        // 64 MiB *is* encodable and must be preferred when it is the largest fit.
+        let ok = [pool(64, 70 * 1024), pool(2, 70 * 1024)];
+        let (chosen, degraded, _) = select_huge_page(&ok, GIB_BYTES, gib(8)).unwrap();
+        assert_eq!(chosen.page_bytes, 64 * 1024 * 1024);
+        assert!(degraded);
+    }
+
+    /// Nothing fits: report it instead of attempting a mapping that must fail.
+    #[test]
+    fn select_huge_page_reports_when_no_size_fits() {
+        let pools = [pool(1024, 4 * 1024), pool(2, 8 * 1024)];
+        assert!(select_huge_page(&pools, GIB_BYTES, gib(59)).is_none());
+    }
+
+    /// 4 KiB base pages are not huge pages and must never be chosen; an empty
+    /// inventory means "cannot tell", not "no way".
+    #[test]
+    fn select_huge_page_ignores_base_pages_and_empty_inventories() {
+        let base_only = [HugePool {
+            page_bytes: 4 * 1024,
+            free_bytes: gib(200),
+            surplus_bytes: 0,
+        }];
+        assert!(select_huge_page(&base_only, MIB2_BYTES, gib(1)).is_none());
+        assert!(
+            select_huge_page(&[], MIB2_BYTES, gib(10)).is_none(),
+            "no inventory must read as unknown, not as impossible"
+        );
+    }
+
+    #[test]
+    fn huge_page_bits_encodes_every_power_of_two_size_at_least_2mib() {
+        assert_eq!(huge_page_bits(2 * 1024 * 1024), Some(21));
+        assert_eq!(huge_page_bits(64 * 1024 * 1024), Some(26));
+        assert_eq!(huge_page_bits(1024 * 1024 * 1024), Some(30));
+        assert_eq!(huge_page_bits(4 * 1024), None, "below the huge-page minimum");
+        assert_eq!(huge_page_bits(3 * 1024 * 1024), None, "not a power of two");
     }
 
     #[test]
