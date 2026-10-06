@@ -1456,6 +1456,47 @@ impl Layer {
             Mixer::DeltaNet(d) => d.forward(&mut state.delta, &mut state.capture, h),
         }
     }
+
+    fn forward(
+        &self,
+        state: &mut LayerState,
+        xs: &Tensor,
+        input: &crate::native_session::LayerInput<'_>,
+    ) -> Result<(Tensor, Vec<u32>)> {
+        let (mask, offset) = (input.mask, input.offset);
+        match &self.residual {
+            Residual::PreNorm { attn_norm, ffn_norm } => {
+                let h = self.mixer_forward(state, &attn_norm.forward(xs)?, mask, offset)?;
+                let xs = (xs + h)?;
+                let (h, routed) = self.ffn.forward(&ffn_norm.forward(&xs)?)?;
+                Ok(((xs + h)?, routed))
+            }
+            Residual::Sandwich { attn_norm, attn_post_norm, ffn_norm, ffn_post_norm } => {
+                let h = self.mixer_forward(state, &attn_norm.forward(xs)?, mask, offset)?;
+                let xs = (xs + attn_post_norm.forward(&h)?)?;
+                let (h, routed) = self.ffn.forward(&ffn_norm.forward(&xs)?)?;
+                Ok(((xs + ffn_post_norm.forward(&h)?)?, routed))
+            }
+            Residual::Hyper { attn, ffn, ple } => {
+                let res = match ple {
+                    Some(p) => p.forward(
+                        xs,
+                        input.tokens,
+                        &mut state.ple_conv,
+                        &mut state.capture,
+                    )?,
+                    None => xs.clone(),
+                };
+                let (h, inject) = attn.mix(&res)?;
+                let h = self.mixer_forward(state, &h, mask, offset)?;
+                let res = attn.combine(&res, &h, &inject.expect("layer mixers inject"))?;
+                let (h, inject) = ffn.mix(&res)?;
+                let (h, routed) = self.ffn.forward(&h)?;
+                Ok((ffn.combine(&res, &h, &inject.expect("layer mixers inject"))?, routed))
+            }
+        }
+    }
+
 }
 
 /// One layer's per-session state: the KV cache (and QSA indexer state) of an
@@ -1547,40 +1588,7 @@ impl crate::native_session::LayerStack for Weights {
         xs: &Tensor,
         input: &crate::native_session::LayerInput<'_>,
     ) -> Result<(Tensor, Vec<u32>)> {
-        let state = &mut states[l];
-        let (mask, offset) = (input.mask, input.offset);
-        let layer = &self.layers[l];
-        match &layer.residual {
-            Residual::PreNorm { attn_norm, ffn_norm } => {
-                let h = layer.mixer_forward(state, &attn_norm.forward(xs)?, mask, offset)?;
-                let xs = (xs + h)?;
-                let (h, routed) = layer.ffn.forward(&ffn_norm.forward(&xs)?)?;
-                Ok(((xs + h)?, routed))
-            }
-            Residual::Sandwich { attn_norm, attn_post_norm, ffn_norm, ffn_post_norm } => {
-                let h = layer.mixer_forward(state, &attn_norm.forward(xs)?, mask, offset)?;
-                let xs = (xs + attn_post_norm.forward(&h)?)?;
-                let (h, routed) = layer.ffn.forward(&ffn_norm.forward(&xs)?)?;
-                Ok(((xs + ffn_post_norm.forward(&h)?)?, routed))
-            }
-            Residual::Hyper { attn, ffn, ple } => {
-                let res = match ple {
-                    Some(p) => p.forward(
-                        xs,
-                        input.tokens,
-                        &mut state.ple_conv,
-                        &mut state.capture,
-                    )?,
-                    None => xs.clone(),
-                };
-                let (h, inject) = attn.mix(&res)?;
-                let h = layer.mixer_forward(state, &h, mask, offset)?;
-                let res = attn.combine(&res, &h, &inject.expect("layer mixers inject"))?;
-                let (h, inject) = ffn.mix(&res)?;
-                let (h, routed) = layer.ffn.forward(&h)?;
-                Ok((ffn.combine(&res, &h, &inject.expect("layer mixers inject"))?, routed))
-            }
-        }
+        self.layers[l].forward(&mut states[l], xs, input)
     }
 
     fn head(&self, xs: &Tensor) -> Result<Tensor> {
@@ -1909,6 +1917,42 @@ impl ModelWeights {
         mmap: Option<Arc<memmap2::Mmap>>,
         device_expert_cache_bytes: Option<u64>,
     ) -> Result<Self> {
+        let parts = load_parts(ct, raw, reader, device, expert_device, mmap,
+            device_expert_cache_bytes, None)?;
+        Ok(Self::from_weights(Weights {
+            tok_embeddings: parts.tok_embeddings.expect("full-model embedding"),
+            layers: parts.layers,
+            norm: parts.norm.expect("full-model norm"),
+            output: parts.output.expect("full-model head"),
+            streams: parts.streams,
+            device: device.clone(),
+            residency: parts.residency,
+            n_expert: parts.n_expert,
+        }))
+    }
+}
+
+// A stage loads only its layer range and owns endpoints only at the edges.
+struct LoadedParts {
+    tok_embeddings: Option<TokenEmbedding>,
+    layers: Vec<Layer>,
+    norm: Option<HeadNorm>,
+    output: Option<Linear>,
+    streams: usize,
+    residency: Arc<dyn crate::residency::ExpertResidency>,
+    n_expert: usize,
+}
+
+fn load_parts<R: Read + Seek>(
+    ct: gguf_file::Content,
+    raw: Option<GgufHeader>,
+    reader: &mut R,
+    device: &Device,
+    expert_device: &Device,
+    mmap: Option<Arc<memmap2::Mmap>>,
+    device_expert_cache_bytes: Option<u64>,
+    range: Option<std::ops::Range<usize>>,
+) -> Result<LoadedParts> {
         let arch = crate::model::Architecture::arch_name(&ct.metadata).unwrap_or_default();
         let cfg = Config::from_metadata(&ct.metadata, &arch)?;
         if !expert_device.is_cpu() && !expert_device.same_device(device) {
@@ -1917,6 +1961,13 @@ impl ModelWeights {
                 cfg.arch
             );
         }
+        if let Some(r) = &range {
+            if cfg.arch != "qwen3" || !device.is_cpu() || !expert_device.is_cpu()
+                || r.start >= r.end || r.end > cfg.n_layer {
+                candle_core::bail!("pipeline: requires CPU Qwen3 dense and a nonempty valid layer range");
+            }
+        }
+        let owned = range.clone().unwrap_or(0..cfg.n_layer);
         // Zero-copy Metal: bind the mapped weights into no-copy GPU buffers
         // so quantized weights are never uploaded.  Best effort — if the
         // mapping is not page-aligned or the device refuses the buffers, fall
@@ -1985,25 +2036,34 @@ impl ModelWeights {
 
         // Kept quantized: dequantizing the table to f32 costs vocab × hidden
         // × 4 bytes of anonymous memory per instance (1.2 GiB on 30B-A3B).
-        let tok_embeddings = TokenEmbedding::load(rd.qtensor("token_embd.weight")?, device)?;
-        let n_embd = tok_embeddings.hidden()?;
-        let norm = match cfg.hyper {
-            Some(hc) => HeadNorm::Hyper(HyperMix::load(&mut rd, "output_hc", hc, n_embd, cfg.rms_eps)?),
-            None => HeadNorm::Rms(rd.rms_norm("output_norm.weight", cfg.rms_eps)?),
+        let tok_embeddings = if owned.start == 0 {
+            Some(TokenEmbedding::load(rd.qtensor("token_embd.weight")?, device)?)
+        } else { None };
+        let n_embd = match &tok_embeddings {
+            Some(t) => t.hidden()?,
+            None => crate::gguf_meta::Meta::new(&rd.src.ct.metadata, cfg.arch)
+                .u32("embedding_length")? as usize,
         };
-        let output = Linear {
-            w: match rd.qmatmul_opt("output.weight") {
-                Some(q) => q,
-                // tie_word_embeddings conversions ship no output head.
-                None => rd.qmatmul("token_embd.weight")?,
-            },
-            b: rd.f32_opt("output.bias")?,
-        };
+        let norm = if owned.end == cfg.n_layer {
+            Some(match cfg.hyper {
+                Some(hc) => HeadNorm::Hyper(HyperMix::load(&mut rd, "output_hc", hc, n_embd, cfg.rms_eps)?),
+                None => HeadNorm::Rms(rd.rms_norm("output_norm.weight", cfg.rms_eps)?),
+            })
+        } else { None };
+        let output = if owned.end == cfg.n_layer {
+            Some(Linear {
+                w: match rd.qmatmul_opt("output.weight") {
+                    Some(q) => q,
+                    None => rd.qmatmul("token_embd.weight")?,
+                },
+                b: rd.f32_opt("output.bias")?,
+            })
+        } else { None };
 
         let rope = Arc::new(cfg.rope(device)?);
 
-        let mut layers = Vec::with_capacity(cfg.n_layer);
-        for layer_idx in 0..cfg.n_layer {
+        let mut layers = Vec::with_capacity(owned.len());
+        for layer_idx in owned {
             let p = format!("blk.{layer_idx}");
             let residual = match cfg.hyper {
                 Some(hc) => Residual::Hyper {
@@ -2053,16 +2113,71 @@ impl ModelWeights {
                     })
                     .collect(),
             ));
-        Ok(Self::from_weights(Weights {
+        Ok(LoadedParts {
             tok_embeddings,
             layers,
             norm,
             output,
             streams: cfg.hyper.unwrap_or(1),
-            device: device.clone(),
             residency,
             n_expert: cfg.n_expert,
-        }))
+        })
+}
+
+/// CPU stage adapter. Only the pipeline module can construct it, and it never
+/// exposes a full-model Session with missing endpoints.
+#[cfg(feature = "distributed")]
+pub(crate) struct CpuPipelineWeights {
+    parts: LoadedParts,
+}
+
+#[cfg(feature = "distributed")]
+impl CpuPipelineWeights {
+    pub(crate) fn load<R: Read + Seek>(
+        header: GgufHeader,
+        reader: &mut R,
+        mmap: Option<Arc<memmap2::Mmap>>,
+        range: std::ops::Range<usize>,
+    ) -> Result<Self> {
+        let parts = load_parts(header.to_candle_content().map_err(candle_core::Error::wrap)?, Some(header), reader,
+            &Device::Cpu, &Device::Cpu, mmap, None, Some(range))?;
+        Ok(Self { parts })
+    }
+
+    pub(crate) fn new_state(&self) -> Vec<LayerState> {
+        vec![LayerState::default(); self.parts.layers.len()]
+    }
+
+    pub(crate) fn forward(
+        &self,
+        state: &mut [LayerState],
+        tokens: &[u32],
+        values: Vec<f32>,
+        offset: usize,
+        hidden: usize,
+    ) -> Result<Vec<f32>> {
+        let n = tokens.len();
+        let mut xs = match &self.parts.tok_embeddings {
+            Some(embedding) => embedding.forward(&Tensor::new(tokens, &Device::Cpu)?.unsqueeze(0)?)?,
+            None => Tensor::from_vec(values, (1, n, hidden), &Device::Cpu)?,
+        };
+        let mask = if n == 1 { None } else {
+            Some(crate::moe::causal_mask(n, offset, &Device::Cpu)?)
+        };
+        let input = crate::native_session::LayerInput {
+            mask: mask.as_ref(), offset, tokens: &[], verify: false,
+        };
+        for (layer, state) in self.parts.layers.iter().zip(state.iter_mut()) {
+            xs = layer.forward(state, &xs, &input)?.0;
+        }
+        if let (Some(norm), Some(output)) = (&self.parts.norm, &self.parts.output) {
+            xs = xs.narrow(1, n - 1, 1)?;
+            let HeadNorm::Rms(norm) = norm else {
+                candle_core::bail!("pipeline: unsupported residual norm");
+            };
+            xs = output.forward(&norm.forward(&xs)?)?.to_dtype(DType::F32)?;
+        }
+        xs.flatten_all()?.to_vec1::<f32>()
     }
 }
 

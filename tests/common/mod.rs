@@ -1371,11 +1371,31 @@ pub fn write_tiny_qwen3moe_gguf(path: &Path) {
 ///   `qwen3next` uses the fused `ssm_ba`, Qwen3.5 split `ssm_beta` /
 ///   `ssm_alpha`; four value heads share two key heads.
 pub fn write_tiny_qwen_gguf(path: &Path, arch: &str) {
+    write_tiny_qwen_layers::<8, 16>(path, arch, None, false);
+}
+
+/// Qwen3 fixture with enough layers to exercise two/three pipeline stages.
+pub fn write_tiny_qwen3_layers(path: &Path, layers: usize) {
+    assert!(layers > 0);
+    write_tiny_qwen_layers::<8, 16>(path, "qwen3", Some(layers), false);
+}
+
+/// Block-quantized Qwen3 fixture with 32-aligned matrix inputs.
+pub fn write_tiny_qwen3_quantized_layers(path: &Path, layers: usize) {
+    assert!(layers > 0);
+    write_tiny_qwen_layers::<32, 64>(path, "qwen3", Some(layers), true);
+}
+
+fn write_tiny_qwen_layers<const EMB: usize, const NFF: usize>(path: &Path, arch: &str, layers: Option<usize>, quantized: bool) {
+    let qtensor = |data: Vec<f32>, shape: &[usize]| {
+        if quantized && shape.len() > 1 {
+            let t = Tensor::from_vec(data, shape, &Device::Cpu).unwrap();
+            QTensor::quantize(&t, GgmlDType::Q8_0).unwrap()
+        } else { self::qtensor(data, shape) }
+    };
     const VOCAB: usize = 16;
-    const EMB: usize = 8;
     const NE: usize = 4; // experts
     const NFE: usize = 8; // expert ffn
-    const NFF: usize = 16; // dense ffn
 
     let hybrid = matches!(arch, "qwen3next" | "qwen35" | "qwen35moe" | "qwen4exp");
     let moe = matches!(
@@ -1404,12 +1424,12 @@ pub fn write_tiny_qwen_gguf(path: &Path, arch: &str) {
     let fused_qkv = arch == "qwen" || arch == "chatglm";
     let h = 2usize;
     let kv = if arch == "qwen" { 2 } else { 1 };
-    let hd = if arch == "qwen3moe" || arch == "qwen" || arch == "qwen2moe" {
+    let hd = if quantized { 32 } else if arch == "qwen3moe" || arch == "qwen" || arch == "qwen2moe" {
         4
     } else {
         8
     };
-    let n_layer = if arch == "qwen3moe" { 1 } else { 2 };
+    let n_layer = layers.unwrap_or(if arch == "qwen3moe" { 1 } else { 2 });
     // Gated DeltaNet dims: 2 key heads shared by 4 value heads, so the
     // grouped (Qwen3-Next) and tiled (Qwen3.5) sharing layouts differ.
     let (nk, nv, sd, d_conv) = (2usize, 4usize, 4usize, 4usize);

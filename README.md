@@ -929,6 +929,8 @@ unchanged. The library exposes:
 - `distributed::discovery` (feature-gated): advisory `_joshua._tcp.local.`
   discovery and coordinator selection. Discovered nodes are **not** automatically
   trusted or admitted to a collective.
+- `distributed::pipeline` (feature-gated): experimental CPU Qwen3 dense
+  contiguous-layer stages with local KV, bounded scheduling and authenticated TCP.
 - `distributed::partition`: deterministic, memory-constrained block allocation
   using caller-supplied capacity and topology observations.
 
@@ -1064,6 +1066,134 @@ bit-exact floating-point results; #90 needs real-model residency measurements;
 #91 still needs live topology measurement, runtime scheduling/repartitioning and
 wall-clock balance validation. These gaps must not be marked complete merely
 because the local inference path works.
+
+### Experimental Qwen3 layer pipeline (#158)
+
+The `distributed::pipeline` library and `pipeline_qwen3` example implement a
+**CPU-only Qwen3 dense** prototype with static, contiguous layer stages. Each
+worker loads only its assigned layers, retains its own per-session KV, and shares
+immutable weights between sessions. Stage zero owns embeddings; the final stage
+owns normalization and the output head (including tied-head fallback). Both local
+mmap borrowing and the streamed/copying loader are supported. Other architectures,
+accelerator stages, speculative all-row logits and `Engine`/HTTP integration are
+not implemented by this prototype.
+
+The coordinator forwards binary little-endian f32 residuals between workers.
+It runs one RPC at a time on each stage connection, with bounded FIFO channels
+between stages: independent requests and ordered prefill chunks overlap across
+workers, while each session's absolute position and sequence number remain
+strictly ordered. This scheduler does not batch a stage's matrix kernels or
+change the existing layer-major `stream_prefill` algorithm. Autoregressive decode
+still traverses every stage, so an isolated sequence can become slower.
+
+A versioned manifest fixes model SHA-256, tensor schema, layer ownership, context,
+chunk/session/batch/queue limits and memory reservations. Model hashing scans the
+entire local GGUF with a bounded buffer at startup; this proves weight identity
+but adds startup I/O and can warm unrelated pages. Selective weight construction
+is still lazy when mmap is enabled. Keep each local GGUF immutable while running.
+Every stage needs access to the identical file; physical per-stage GGUF packaging
+is future work.
+
+Worker budgets reserve compact weights (expanded norms/floating weights where
+required, and dense matrices under `CANDLE_DEQUANTIZE_ALL`/`_F16`), loader scratch, geometric KV growth, repeated KV and attention/FFN
+workspace, RoPE and wire buffers. The coordinator has a separate buffer budget.
+These are conservative tensor planning estimates, **not enforced RSS quotas**:
+allocator/thread overhead, file-page residency and backend-specific scratch still
+need real-model measurement. Inputs, sessions, queues and frames have hard count
+limits; over-budget plans are rejected before loading weights.
+
+TCP frames bind job UUID, stage, direction and monotonic frame counter with
+HMAC-SHA256. Authentication **does not encrypt** prompts or activations: use a
+trusted private network or an encrypted tunnel. Each worker accepts exactly one
+authenticated coordinator connection; a connection whose first frame is not an
+authenticated handshake for that plan and stage is dropped and the worker keeps
+listening. After the
+handshake the worker exits on shutdown/disconnect/protocol error. A partial
+forward is never retried. Worker loss invalidates the entire coordinator and all
+its sessions; restart every worker with a fresh job UUID. `Pipeline::close`
+releases an idle session, and `Pipeline::abort_handle` allows out-of-band active
+cancellation of the whole job. Frame read/write deadlines prevent a stalled or
+trickling peer from keeping transport alive indefinitely; the deadline starts at
+a frame's first byte, so idle sessions between commands do not expire (TCP
+keepalive detects a vanished coordinator). CPU compute itself is not preempted
+by network cancellation.
+
+Build and create a manifest (replace the layer ends and budgets for your model):
+
+```bash
+cargo build --release --features distributed --example pipeline_qwen3
+./target/release/examples/pipeline_qwen3 plan \
+  --model /models/qwen3.gguf --output /tmp/pipeline.json \
+  --ends 16,32 --budgets-mib 8192,8192 \
+  --context 4096 --chunk 128 --sessions 4 --batch 8 --queue-depth 2
+```
+
+Copy the manifest and identical model to both machines. Generate a fresh shared
+job UUID and a secret key of at least 32 bytes out of band. Export the key as
+`JOSHUA_PIPELINE_KEY` on coordinator and workers. Run each worker in its own
+terminal (addresses below are examples):
+
+```bash
+./target/release/examples/pipeline_qwen3 worker \
+  --model /models/qwen3.gguf --plan /tmp/pipeline.json --rank 0 \
+  --listen 192.168.1.10:48900 --job "$job"
+./target/release/examples/pipeline_qwen3 worker \
+  --model /models/qwen3.gguf --plan /tmp/pipeline.json --rank 1 \
+  --listen 192.168.1.11:48901 --job "$job"
+./target/release/examples/pipeline_qwen3 run \
+  --plan /tmp/pipeline.json --peers 192.168.1.10:48900,192.168.1.11:48901 \
+  --job "$job" --tokens 1,4,2,7,5 --decode 16 --requests 4
+```
+
+`run` consumes model token IDs and returns generated IDs plus prefill/decode batch
+time and per-stage compute/RPC/codec/input-wait/downstream-wait time and wire byte
+counts. It is a fixed-length greedy proof, with no tokenizer or EOS/stop handling.
+Use `worker --no-mmap` to exercise the streamed fallback. Timings exclude model
+load, hashing and session admission; RPC time includes worker compute and network
+wait, and wait counters describe this bounded scheduler rather than hardware
+utilization.
+
+Validation and reproducible diagnostics:
+
+```bash
+cargo test --features distributed --test pipeline_tests
+cargo test --release --features distributed --test pipeline_tests \
+  benchmark_pipeline_loopback -- --ignored --nocapture
+JOSHUA_PIPELINE_EXAMPLE="$PWD/target/release/examples/pipeline_qwen3" \
+  cargo test --release --features distributed --test pipeline_tests \
+  pipeline_example_runs_three_separate_worker_processes -- --ignored --nocapture
+```
+
+F32 and Q8_0 fixtures cover two/three stages, both mmap/streamed loads, uneven stage
+boundaries, interleaved sessions/chunks, causal masks, continuation through KV
+buffer growth, context exhaustion, admission/cancellation, stale/duplicate
+requests, malformed activation shapes, authentication and worker failure.
+Pipeline logits match the same local path bit for bit. Qwen3's full-attention path
+does not exercise sliding-window wraparound, and no accelerator stage is claimed.
+The separate-process test checks three actual worker processes and greedy parity.
+
+An initial release microbenchmark on an Apple M5 Pro (CPU, TCP loopback, F32 tiny
+fixture: 3 layers, hidden 8, vocab 16, 32 prompt tokens in two 16-token chunks,
+8 decode forwards per request) produced these medians after one warmup and five
+measured runs. Local execution processes requests serially; pipeline stages
+execute concurrently. Numbers are whole-batch milliseconds, not latency percentiles:
+
+| Requests | Execution | Prefill ms | Decode ms |
+|---|---|---:|---:|
+| 1 | Local | 0.923 | 1.034 |
+| 1 | 2 stages | 0.994 | 2.208 |
+| 1 | 3 stages | 1.137 | 3.020 |
+| 4 | Local | 3.557 | 4.635 |
+| 4 | 2 stages | 3.200 | 6.834 |
+| 4 | 3 stages | 2.485 | 6.790 |
+
+This demonstrates prefill overlap and decode overhead on a tiny workload. It does
+not establish a production speedup or aggregate model-capacity gain. Real LAN
+RTT/bandwidth, model-sized residency/peak RSS, larger concurrency, per-request
+TTFT/inter-token percentiles and comparisons with optimized local scheduling
+remain unmeasured. Existing tensor-sharded clustering supports DeepSeek V4, not
+Qwen3, so this is not a same-model comparison with `DeepSeekCluster`. Issue #158
+remains open for those measurements and follow-on architecture/device work.
 
 ### Run the linear-layer proof
 
