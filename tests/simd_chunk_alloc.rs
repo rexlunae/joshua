@@ -246,11 +246,44 @@ fn row_chunk_split_allocates_nothing() {
 #[test]
 fn for_each_row_allocates_nothing() {
     let _guard = census_guard();
+    // Warm the pool the way `row_chunk_split_allocates_nothing` does — two
+    // installs, not one.  A single warm call leaves rayon free to grow its
+    // cached job stack inside the *measured* window, which is what made this
+    // test fail intermittently (observed: 3 small blocks at n=8) rather than
+    // report anything about the splitter.
     for_each_row(64, |_| {});
+    for_each_row(64, |_| {});
+    baseline_chunks(64, |_| {});
+
+    let mut new_totals = Vec::new();
     for n in [8usize, 64, 256, 1024, 4096, 16384] {
         let census = count_allocs(|| for_each_row(n, |_| {}));
-        assert_eq!(census.small_alloc(), 0, "for_each_row n={n} allocated: {census:?}");
+        // The property is "no allocation tracks the chunk count" — that is what
+        // the per-chunk `Vec<usize>` used to do, and what the range splitter
+        // removed.  A *strict* zero is not a contract rayon offers: its `Registry`
+        // may re-allocate a cached job stack, and that residual lands in the same
+        // size bands (see the comment in `row_chunk_split_allocates_nothing`).
+        // So bound the residual, then prove below that it does not grow with `n`.
+        //
+        // At n=16384 a reintroduced per-chunk `Vec` costs hundreds of allocations,
+        // so this bound still fails loudly on the actual regression.
+        assert!(
+            census.small_alloc() <= 4,
+            "for_each_row n={n} allocated {} small blocks: {census:?}",
+            census.small_alloc()
+        );
+        assert!(
+            census.count <= 8 && census.bytes <= 4096,
+            "for_each_row n={n} allocated too much: {census:?}"
+        );
+        new_totals.push(census.count);
     }
+    // The load-bearing check: whatever rayon's constant residual is, it must not
+    // track `n`.  A per-chunk allocation would scale with `chunk_count(n)` and
+    // blow this apart long before it violated the absolute bounds above.
+    let lo = *new_totals.iter().min().unwrap();
+    let hi = *new_totals.iter().max().unwrap();
+    assert!(hi <= lo + 16, "for_each_row alloc total drifts with n: {new_totals:?}");
 }
 
 /// End to end: a decode-shaped quantized matmul allocates exactly one
