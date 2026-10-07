@@ -234,8 +234,8 @@ pocl is bisected without recompiling:
 4. `JOSHUA_OPENCL_BUILD_OPTS="-cl-opt-disable"` — extra options for the
    kernel compiler.  A result that changes with the optimiser is a compiler
    issue, not a kernel bug.
-5. `JOSHUA_OPENCL_QGEMV=v1` — the 256-element block formats (IQ2_XXS and
-   Q2_K..Q6_K) normally run `k_qgemv_mr`, which decodes each weight once for up to 16 rows with
+5. `JOSHUA_OPENCL_QGEMV=v1` — the 256-element block formats (IQ2_XXS, Q2_K
+   and Q4_K..Q6_K) normally run `k_qgemv_mr`, which decodes each weight once for up to 16 rows with
    every lane owning eight consecutive elements; this switches them to the
    one-row `k_qgemv` every other block format uses.
 
@@ -260,7 +260,7 @@ the card for the real numbers).
 | `JOSHUA_EXPERT_STATS=1` | Probe each host miss's page residency for the decode time split even without a `debug` log filter. |
 | `JOSHUA_ROUTE_TRACE=<path>` | Write the routing trace CSV for the offline cache simulator (`examples/cache_sim.rs`).  One file per process: run a single request at a time while tracing, or concurrent requests interleave their calls. |
 | `JOSHUA_PREFILL_CHUNK=<n>` | Tokens per prefill chunk (also `--prefill-chunk`). |
-| `JOSHUA_OPENCL_QGEMV=v1` | Run IQ2_XXS and Q2_K..Q6_K through the one-row quantized GEMV instead of the multi-row kernel (bisecting). |
+| `JOSHUA_OPENCL_QGEMV=v1` | Run IQ2_XXS, Q2_K and Q4_K..Q6_K through the one-row quantized GEMV instead of the multi-row kernel (bisecting). |
 | `JOSHUA_VULKAN_QGEMV=mali-int8` / `mali` / `generic` | Force the Mali GEMV on int8 dot products (the default on Arm GPUs with `shaderIntegerDotProduct`), the float Mali GEMV (the default on other Arm GPUs) or the generic one on any Vulkan device. |
 
 The engine logs the device it opened, its memory model and the active paths

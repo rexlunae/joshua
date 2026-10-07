@@ -664,14 +664,16 @@ fn check_block_k(k: usize, block: usize, what: &str) -> Result<()> {
 /// Rows the multi-row kernel accumulates per launch (`QGEMV_MR_MAX_ROWS`).
 pub const QGEMV_MR_MAX_ROWS: usize = 16;
 
-/// Whether `dtype` has a lane-level decoder in `k_qgemv_mr` (IQ2_XXS and the
-/// Q2_K..Q6_K k-quants).  `JOSHUA_SYCL_QGEMV=v1` forces the one-row kernel
+/// Whether `dtype` takes `k_qgemv_mr` (IQ2_XXS, Q2_K, Q4_K, Q5_K, Q6_K).  Q3_K
+/// has a lane decoder there but stays on the one-row kernel: measured on an
+/// Arc Pro B50 ([4096, 4096], one row) it ran 37.8 GFLOPS multi-row against
+/// 60.7 one-row, its per-lane 6-bit scale unpack costing more than it saves.  `JOSHUA_SYCL_QGEMV=v1` forces the one-row kernel
 /// for every dtype (a bisect switch for a wrong result on one driver).
 pub fn qgemv_multirow(dtype: crate::quantized::GgmlDType) -> bool {
     use crate::quantized::GgmlDType::*;
     static V1: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let forced_v1 = *V1.get_or_init(|| matches!(std::env::var("JOSHUA_SYCL_QGEMV"), Ok(s) if s.eq_ignore_ascii_case("v1")));
-    !forced_v1 && matches!(dtype, Iq2Xxs | Q2K | Q3K | Q4K | Q5K | Q6K)
+    !forced_v1 && matches!(dtype, Iq2Xxs | Q2K | Q4K | Q5K | Q6K)
 }
 
 /// Output columns one `k_qgemv_mr` work-group handles: enough that every
