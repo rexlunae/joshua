@@ -60,7 +60,8 @@ const BENCH_ITERS: usize = 3;
 /// Timed passes stop early once one shape has spent this long, so a slow
 /// device gives one or two samples instead of `BENCH_ITERS`.
 const BENCH_SHAPE_BUDGET: std::time::Duration = std::time::Duration::from_millis(250);
-/// Total wall-clock budget for the whole probe (all shapes, both devices).
+/// Total wall-clock budget for the whole probe, split evenly between the CPU
+/// and the accelerator (each covers both shapes).
 const BENCH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(8);
 
 /// Measured quantized-matmul throughput of the CPU vs an accelerator.
@@ -214,7 +215,6 @@ fn measure_gemm(
 /// decision logic treats as "no faster than CPU".
 pub fn benchmark(device: &Device) -> DenseBench {
     let cpu = Device::Cpu;
-    let deadline = std::time::Instant::now() + BENCH_DEADLINE;
     let Some((buf, range)) = probe_weight_bytes() else {
         return DenseBench {
             dev_decode_gflops: 0.0,
@@ -224,20 +224,25 @@ pub fn benchmark(device: &Device) -> DenseBench {
         };
     };
     let weight = &buf[range];
-    let measure = |dev: &Device, m: usize, mats: usize| {
+    // Each device gets its own half of the budget, so a slow CPU cannot use
+    // up the time the accelerator needs and leave it unmeasured (read as 0).
+    let half = BENCH_DEADLINE / 2;
+    let measure = |dev: &Device, m: usize, mats: usize, deadline| {
         measure_gemm(dev, weight, m, mats, deadline).unwrap_or(0.0)
     };
     let (cpu_dec, cpu_pre) = if device.is_cpu() {
         (0.0, 0.0)
     } else {
+        let deadline = std::time::Instant::now() + half;
         (
-            measure(&cpu, 1, BENCH_DECODE_MATS),
-            measure(&cpu, BENCH_B, BENCH_PREFILL_MATS),
+            measure(&cpu, 1, BENCH_DECODE_MATS, deadline),
+            measure(&cpu, BENCH_B, BENCH_PREFILL_MATS, deadline),
         )
     };
+    let deadline = std::time::Instant::now() + half;
     let (dev_dec, dev_pre) = (
-        measure(device, 1, BENCH_DECODE_MATS),
-        measure(device, BENCH_B, BENCH_PREFILL_MATS),
+        measure(device, 1, BENCH_DECODE_MATS, deadline),
+        measure(device, BENCH_B, BENCH_PREFILL_MATS, deadline),
     );
     DenseBench {
         dev_decode_gflops: dev_dec,
