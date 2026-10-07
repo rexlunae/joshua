@@ -24,17 +24,29 @@
 //! and keeps it on CPU, with no operator guesswork.
 //!
 //! The probe is small and bounded (see [`BENCH_H`]/[`BENCH_B`]) so startup stays
-//! fast; the CPU-vs-device ratio is stable across widths even when absolute
-//! throughput is not.
+//! fast.  [`BENCH_H`] is sized to the *kernel-throughput* regime: at tiny widths
+//! the m=1 decode probe is latency-bound and a fast discrete card measures
+//! *slower* than CPU-BLAS purely because of per-call launch+sync overhead
+//! (repro in the `BENCH_H` comment).
 
 use candle_core::quantized::{GgmlDType, QMatMul, QStorage, QTensor};
 use candle_core::{Device, Module, Tensor};
 
 use crate::placement::{DensePlacement, ResolvedDense};
 
-/// Reference hidden width for the probe GEMMs.  Kept moderate so the probe
-/// finishes in well under a second even on a slow integrated GPU.
-const BENCH_H: usize = 1024;
+/// Reference hidden width for the probe GEMMs.  Sized for the regime real
+/// decode GEMMs run in, not a latency measurement: at H=1024 the m=1 decode
+/// probe is a 2 MFLOP GEMM where fixed per-call launch+sync latency (~20-50us
+/// on both devices) decides the verdict, and a healthy discrete GPU measured
+/// at 0.2-0.5x CPU-BLAS purely because of that overhead (measured on an Intel
+/// Arc Pro B50: device 18-33 GFLOPS vs CPU 90-110 at H=1024, while the m=32
+/// prefill probe already showed the device at ~2.5x CPU).  H=4096 is a
+/// realistic dense-GEMM hidden width; the m=1 probe is then ~33 MFLOP,
+/// kernel-throughput-bound, and the ratio reflects GEMM speed rather than
+/// launch latency.  Still cheap: both shapes, both devices, 3 iterations,
+/// finish in tens of milliseconds on any real card and a couple of seconds on
+/// a software path.
+const BENCH_H: usize = 4096;
 /// Prompt-chunk length for the prefill probe (small on purpose so the probe
 /// never trips a weak GPU's ring-timeout watchdog).
 const BENCH_B: usize = 32;
