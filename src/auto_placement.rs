@@ -23,36 +23,45 @@
 //! discrete GPU scores high and keeps dense on-device, a weak iGPU scores low
 //! and keeps it on CPU, with no operator guesswork.
 //!
-//! The probe is small and bounded (see [`BENCH_H`]/[`BENCH_B`]) so startup stays
-//! fast.  [`BENCH_H`] is sized to the *kernel-throughput* regime: at tiny widths
-//! the m=1 decode probe is latency-bound and a fast discrete card measures
-//! *slower* than CPU-BLAS purely because of per-call launch+sync overhead
-//! (repro in the `BENCH_H` comment).
+//! The probe is bounded (see [`BENCH_H`]/[`BENCH_B`] and the deadline) so
+//! startup stays fast, but it runs at a real projection width over more
+//! weight than a CPU cache holds: the ratio is *not* stable across widths.
+//! A small probe matrix lives in the CPU's cache while a discrete GPU spends
+//! the whole GEMV on launch latency, which inverted the decision on an Arc
+//! Pro B50 (#164).
 
 use candle_core::quantized::{GgmlDType, QMatMul, QStorage, QTensor};
 use candle_core::{Device, Module, Tensor};
 
 use crate::placement::{DensePlacement, ResolvedDense};
 
-/// Reference hidden width for the probe GEMMs.  Sized for the regime real
-/// decode GEMMs run in, not a latency measurement: at H=1024 the m=1 decode
-/// probe is a 2 MFLOP GEMM where fixed per-call launch+sync latency (~20-50us
-/// on both devices) decides the verdict, and a healthy discrete GPU measured
-/// at 0.2-0.5x CPU-BLAS purely because of that overhead (measured on an Intel
-/// Arc Pro B50: device 18-33 GFLOPS vs CPU 90-110 at H=1024, while the m=32
-/// prefill probe already showed the device at ~2.5x CPU).  H=4096 is a
-/// realistic dense-GEMM hidden width; the m=1 probe is then ~33 MFLOP,
-/// kernel-throughput-bound, and the ratio reflects GEMM speed rather than
-/// launch latency.  Still cheap: both shapes, both devices, 3 iterations,
-/// finish in tens of milliseconds on any real card and a couple of seconds on
-/// a software path.
+/// Reference hidden width for the probe GEMMs: a real dense projection
+/// (4096 is the hidden size of most 7B-class and the DeepSeek-V4 models).
+/// At 1024 the decode GEMV is ~2 MFLOP, which a discrete GPU finishes faster
+/// than one launch-and-sync round trip and which a desktop CPU serves from
+/// its L2: the probe then measured launch latency against cache bandwidth
+/// and read 0.2-0.3x for an Arc B50 against a Ryzen 9950X (#164).
 const BENCH_H: usize = 4096;
+/// Distinct weight matrices the decode probe cycles through, launched back to
+/// back with one sync at the end, as a layer's projections are.  At ~9 MiB of
+/// Q4_K each, eight (~72 MiB) exceed any desktop CPU's last-level cache, so
+/// the CPU streams weights from DRAM as it does on a real model, and the
+/// device's per-launch overhead is amortized the way a decode step does.
+const BENCH_DECODE_MATS: usize = 8;
+/// Distinct matrices for the prefill probe.  A prompt chunk reuses each weight
+/// across its rows, so the prefill shape is compute-bound and one matrix
+/// measures it; more would only lengthen the probe on a weak GPU.
+const BENCH_PREFILL_MATS: usize = 1;
 /// Prompt-chunk length for the prefill probe (small on purpose so the probe
 /// never trips a weak GPU's ring-timeout watchdog).
 const BENCH_B: usize = 32;
-/// How many timed matmuls per shape per device.
+/// How many timed passes per shape per device.
 const BENCH_ITERS: usize = 3;
-/// Total wall-clock budget for the whole probe (all shapes, both devices).
+/// Timed passes stop early once one shape has spent this long, so a slow
+/// device gives one or two samples instead of `BENCH_ITERS`.
+const BENCH_SHAPE_BUDGET: std::time::Duration = std::time::Duration::from_millis(250);
+/// Total wall-clock budget for the whole probe (all shapes, both devices); the
+/// CPU may use at most half of it, the accelerator the rest.
 const BENCH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(8);
 
 /// Measured quantized-matmul throughput of the CPU vs an accelerator.
@@ -107,69 +116,97 @@ impl DenseBench {
     }
 }
 
-/// The quantized weight matrix every probe multiplies against, built once on
-/// the CPU (quantizing is far slower than the matmuls being timed) and
-/// re-uploaded per device.
-fn probe_weights() -> Option<&'static QTensor> {
-    static W: std::sync::OnceLock<Option<QTensor>> = std::sync::OnceLock::new();
-    W.get_or_init(|| {
-        let h = BENCH_H;
-        let w: Vec<f32> = (0..h * h).map(|i| ((i % 11) as f32 - 5.0) * 0.25).collect();
-        let w = Tensor::from_vec(w, (h, h), &Device::Cpu).ok()?;
-        QTensor::quantize(&w, GgmlDType::Q4K).ok()
-    })
-    .as_ref()
+/// Rows of the probe weight that are actually quantized; the rest of the
+/// matrix repeats them.  Quantizing a full 4096x4096 Q4_K matrix takes a
+/// large fraction of a second, which startup should not pay, and the matmul
+/// cost does not depend on the values.
+const PROBE_QUANT_ROWS: usize = 64;
+
+/// The probe weight `[BENCH_H, BENCH_H]` as raw Q4_K blocks, starting at a
+/// 2-byte boundary (the block's `f16` alignment, which the CPU storage
+/// checks).  Returns the backing buffer and the range of the blocks in it.
+fn probe_weight_bytes() -> Option<(Vec<u8>, std::ops::Range<usize>)> {
+    let h = BENCH_H;
+    let w: Vec<f32> = (0..PROBE_QUANT_ROWS * h)
+        .map(|i| ((i % 11) as f32 - 5.0) * 0.25)
+        .collect();
+    let w = Tensor::from_vec(w, (PROBE_QUANT_ROWS, h), &Device::Cpu).ok()?;
+    let slab = QTensor::quantize(&w, GgmlDType::Q4K).ok()?;
+    let slab = slab.data().ok()?;
+    let len = slab.len() * (h / PROBE_QUANT_ROWS);
+    let mut buf = vec![0u8; len + 1];
+    let off = buf.as_ptr() as usize % 2;
+    for chunk in buf[off..off + len].chunks_exact_mut(slab.len()) {
+        chunk.copy_from_slice(&slab);
+    }
+    Some((buf, off..off + len))
 }
 
-/// The probe weights as a `QMatMul` resident on `device`.
-fn probe_matmul(device: &Device) -> Option<QMatMul> {
-    let w = probe_weights()?;
-    let bytes = w.data().ok()?;
-    let storage = QStorage::from_data(bytes, device, w.dtype()).ok()?;
-    let q = QTensor::new(storage, w.shape().clone()).ok()?;
-    QMatMul::from_qtensor(q).ok()
+/// `count` separate copies of the probe weight as `QMatMul`s on `device`.
+fn probe_matmuls(device: &Device, weight: &[u8], count: usize) -> Option<Vec<QMatMul>> {
+    (0..count)
+        .map(|_| {
+            let storage =
+                QStorage::from_data(std::borrow::Cow::Borrowed(weight), device, GgmlDType::Q4K)
+                    .ok()?;
+            let q = QTensor::new(storage, (BENCH_H, BENCH_H)).ok()?;
+            QMatMul::from_qtensor(q).ok()
+        })
+        .collect()
 }
 
 /// Measure the quantized-matmul throughput (in f32-equivalent GFLOPS) for
-/// shape `(m, H) · Wᵀ` on `device`, bailing with `None` (as "unmeasurable")
-/// if `deadline` passes — a cooperative guard so a wedged GPU cannot hang
-/// startup forever.
-fn measure_gemm(device: &Device, m: usize, deadline: std::time::Instant) -> Option<f64> {
+/// shape `(m, H) · Wᵀ` on `device`, over `mats` distinct weights launched back
+/// to back with one sync per pass, bailing with `None` (as "unmeasurable") if
+/// `deadline` passes — a cooperative guard so a wedged GPU cannot hang startup
+/// forever.
+fn measure_gemm(
+    device: &Device,
+    weight: &[u8],
+    m: usize,
+    mats: usize,
+    deadline: std::time::Instant,
+) -> Option<f64> {
     let h = BENCH_H;
     let a: Vec<f32> = (0..m * h).map(|i| ((i % 17) as f32 - 8.0) * 0.5).collect();
     let a = Tensor::from_vec(a, (m, h), device).ok()?;
-    let w = probe_matmul(device)?;
+    let ws = probe_matmuls(device, weight, mats)?;
 
     // Warm-up (best-effort; a failure here means "can't probe", not 0 GFLOPS).
-    // On a device this also compiles the kernels, which must not be timed.
-    match w.forward(&a) {
-        Ok(_) => {}
-        Err(_) => return None,
+    // On a device this also compiles the kernels, which must not be timed,
+    // and faults every weight page in on the CPU.
+    for w in &ws {
+        w.forward(&a).ok()?;
     }
     let _ = candle_core::Device::synchronize(device).ok();
     let mut samples = 0usize;
     let mut total_secs = 0.0f64;
-    for _ in 0..BENCH_ITERS {
-        if std::time::Instant::now() >= deadline {
+    'passes: for _ in 0..BENCH_ITERS {
+        if std::time::Instant::now() >= deadline
+            || (samples > 0 && total_secs >= BENCH_SHAPE_BUDGET.as_secs_f64())
+        {
             break;
         }
         let start = std::time::Instant::now();
-        let c = match w.forward(&a) {
-            Ok(c) => c,
-            Err(_) => break,
-        };
+        let mut outs = Vec::with_capacity(ws.len());
+        for w in &ws {
+            match w.forward(&a) {
+                Ok(c) => outs.push(c),
+                Err(_) => break 'passes,
+            }
+        }
         if candle_core::Device::synchronize(device).is_err() {
             break;
         }
         total_secs += start.elapsed().as_secs_f64();
         samples += 1;
-        drop(c);
+        drop(outs);
     }
     if samples == 0 || total_secs <= 0.0 {
         return None;
     }
     let secs = total_secs / samples as f64;
-    Some(2.0 * m as f64 * h as f64 * h as f64 / secs / 1e9)
+    Some(2.0 * (m * mats) as f64 * h as f64 * h as f64 / secs / 1e9)
 }
 
 /// Run the quick probe: time the CPU and the accelerator on decode + prefill
@@ -178,18 +215,37 @@ fn measure_gemm(device: &Device, m: usize, deadline: std::time::Instant) -> Opti
 /// decision logic treats as "no faster than CPU".
 pub fn benchmark(device: &Device) -> DenseBench {
     let cpu = Device::Cpu;
-    let deadline = std::time::Instant::now() + BENCH_DEADLINE;
+    let Some((buf, range)) = probe_weight_bytes() else {
+        return DenseBench {
+            dev_decode_gflops: 0.0,
+            dev_prefill_gflops: 0.0,
+            cpu_decode_gflops: 0.0,
+            cpu_prefill_gflops: 0.0,
+        };
+    };
+    let weight = &buf[range];
+    // The CPU is capped at half the budget, so a slow CPU cannot use up the
+    // time the accelerator needs and leave it unmeasured (read as 0).  The
+    // accelerator gets whatever remains of the whole budget, and at least the
+    // other half: its kernel compile and weight upload come out of it too.
+    let start = std::time::Instant::now();
+    let half = BENCH_DEADLINE / 2;
+    let measure = |dev: &Device, m: usize, mats: usize, deadline| {
+        measure_gemm(dev, weight, m, mats, deadline).unwrap_or(0.0)
+    };
     let (cpu_dec, cpu_pre) = if device.is_cpu() {
         (0.0, 0.0)
     } else {
+        let deadline = start + half;
         (
-            measure_gemm(&cpu, 1, deadline).unwrap_or(0.0),
-            measure_gemm(&cpu, BENCH_B, deadline).unwrap_or(0.0),
+            measure(&cpu, 1, BENCH_DECODE_MATS, deadline),
+            measure(&cpu, BENCH_B, BENCH_PREFILL_MATS, deadline),
         )
     };
+    let deadline = (start + BENCH_DEADLINE).max(std::time::Instant::now() + half);
     let (dev_dec, dev_pre) = (
-        measure_gemm(device, 1, deadline).unwrap_or(0.0),
-        measure_gemm(device, BENCH_B, deadline).unwrap_or(0.0),
+        measure(device, 1, BENCH_DECODE_MATS, deadline),
+        measure(device, BENCH_B, BENCH_PREFILL_MATS, deadline),
     );
     DenseBench {
         dev_decode_gflops: dev_dec,
@@ -261,6 +317,45 @@ mod tests {
             cpu_decode_gflops: cpu_dec,
             cpu_prefill_gflops: cpu_pre,
         }
+    }
+
+    #[test]
+    fn probe_weight_is_a_full_aligned_q4k_matrix() {
+        let (buf, range) = probe_weight_bytes().expect("probe weight");
+        assert_eq!(range.start % 2, 0, "Q4_K blocks need f16 alignment");
+        assert_eq!(
+            range.len(),
+            BENCH_H * BENCH_H / 256 * GgmlDType::Q4K.type_size()
+        );
+        // The CPU storage accepts it (it asserts the alignment) and every
+        // copy is a separate allocation, so the decode probe really streams
+        // `BENCH_DECODE_MATS` matrices' worth of weight.
+        let ws = probe_matmuls(&Device::Cpu, &buf[range], 2).expect("cpu matmuls");
+        assert_eq!(ws.len(), 2);
+    }
+
+    #[test]
+    fn cpu_probe_measures_both_shapes_within_the_deadline() {
+        let (buf, range) = probe_weight_bytes().expect("probe weight");
+        let start = std::time::Instant::now();
+        let deadline = start + BENCH_DEADLINE;
+        let dec = measure_gemm(
+            &Device::Cpu,
+            &buf[range.clone()],
+            1,
+            BENCH_DECODE_MATS,
+            deadline,
+        );
+        let pre = measure_gemm(
+            &Device::Cpu,
+            &buf[range],
+            BENCH_B,
+            BENCH_PREFILL_MATS,
+            deadline,
+        );
+        assert!(dec.is_some_and(|g| g.is_finite() && g > 0.0), "{dec:?}");
+        assert!(pre.is_some_and(|g| g.is_finite() && g > 0.0), "{pre:?}");
+        assert!(start.elapsed() < BENCH_DEADLINE);
     }
 
     #[test]

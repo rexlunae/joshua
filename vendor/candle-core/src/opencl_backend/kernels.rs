@@ -916,14 +916,14 @@ fn check_block_k(k: usize, block: usize, what: &str) -> Result<()> {
 /// Rows the multi-row kernel accumulates per launch (`QGEMV_MR_MAX_ROWS`).
 pub const QGEMV_MR_MAX_ROWS: usize = 16;
 
-/// Whether `dtype` has a lane-level decoder in `k_qgemv_mr` (the routed
-/// experts' formats).  `JOSHUA_OPENCL_QGEMV=v1` forces the one-row kernel
+/// Whether `dtype` has a lane-level decoder in `k_qgemv_mr` (IQ2_XXS and the
+/// Q2_K..Q6_K k-quants).  `JOSHUA_OPENCL_QGEMV=v1` forces the one-row kernel
 /// for every dtype (a bisect switch for a wrong result on one driver).
 pub fn qgemv_multirow(dtype: crate::quantized::GgmlDType) -> bool {
     use crate::quantized::GgmlDType::*;
     static V1: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let forced_v1 = *V1.get_or_init(|| matches!(std::env::var("JOSHUA_OPENCL_QGEMV"), Ok(s) if s.eq_ignore_ascii_case("v1")));
-    !forced_v1 && matches!(dtype, Iq2Xxs | Q2K)
+    !forced_v1 && matches!(dtype, Iq2Xxs | Q2K | Q3K | Q4K | Q5K | Q6K)
 }
 
 /// Output columns one `k_qgemv_mr` work-group handles: enough that every
