@@ -2,8 +2,9 @@
 //! Usage: perf_decode_paging MODEL PROMPT CONTEXT TOKENS REPEATS LOCK_BYTES
 //! Run under the same RAM/swap limits for each candidate. Locking is required
 //! when LOCK_BYTES is nonzero, so a memlock failure cannot masquerade as a run
-//! with resident weights. Every completion has fresh KV state and greedy
-//! sampling; loading is timed separately. This does not evict the page cache.
+//! with resident weights. Completions use greedy sampling and the normal
+//! engine session pool. Initialization is timed separately; the first
+//! completion includes lazy model loading. This does not evict the page cache.
 
 use std::time::Instant;
 

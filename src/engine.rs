@@ -354,7 +354,7 @@ pub struct EngineOptions {
     /// dense weights exceed RAM. Whole pages are selected in file order;
     /// routed experts and an untied input embedding are excluded. Leave
     /// room outside this budget for activations, KV state and disk staging.
-    /// The cap is reduced when necessary to leave at least 1 GiB of detected
+    /// The cap is reduced when necessary to leave at least 3 GiB of detected
     /// available RAM at load; longer contexts can require more headroom.
     /// `None` preserves locking the full dense set; `Some(0)` locks nothing.
     pub mlock_weight_budget_bytes: Option<u64>,
@@ -4124,9 +4124,9 @@ fn apply_hot_weight_pinning(
         let page = base_page_size();
         let locked_ranges = lock_budget.map(|budget| {
             let effective = crate::placement::available_ram_bytes()
-                .map_or(budget, |free| budget.min(free.saturating_sub(1 << 30)));
+                .map_or(budget, |free| budget.min(free.saturating_sub(LOW_MEM_FLOOR * 2)));
             if effective < budget {
-                tracing::warn!("weight lock budget reduced from {} to {} MiB to reserve 1 GiB of available RAM", budget / (1 << 20), effective / (1 << 20));
+                tracing::warn!("weight lock budget reduced from {} to {} MiB to reserve 3 GiB of available RAM", budget / (1 << 20), effective / (1 << 20));
             }
             bounded_weight_lock_ranges(header, mmap.len(), page, effective)
         });
