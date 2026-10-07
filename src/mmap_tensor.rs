@@ -230,7 +230,7 @@ impl<T: GgmlType + 'static> MmapPrefetch for MmapBlocks<T> {
         let base = self._mmap.as_ptr() as usize;
         let off = self.ptr as usize - base;
         let len = self.len * std::mem::size_of::<T>();
-        let _ = self._mmap.advise_range(memmap2::Advice::WillNeed, off, len);
+        prefetch_weight_range(&self._mmap, off, len);
     }
 
     fn mapped_range(&self) -> Option<MappedRange> {
@@ -240,6 +240,17 @@ impl<T: GgmlType + 'static> MmapPrefetch for MmapBlocks<T> {
             self.len * std::mem::size_of::<T>(),
         ))
     }
+}
+
+/// Sparse selection is random, but the selected weight tensor is consumed
+/// as a contiguous scan. Restore normal readahead for this range before
+/// warming it: a blanket RANDOM hint otherwise keeps later demand faults
+/// at page-sized reads, even after WILLNEED. Unselected ranges retain their
+/// original advice. Neither hint changes the borrowed bytes or retains a
+/// private weight buffer.
+fn prefetch_weight_range(mmap: &Mmap, off: usize, len: usize) {
+    let _ = mmap.advise_range(memmap2::Advice::Normal, off, len);
+    let _ = mmap.advise_range(memmap2::Advice::WillNeed, off, len);
 }
 
 // SAFETY: the mapping is read-only and the file is immutable for the lifetime
@@ -394,7 +405,7 @@ impl<B: RawBlock> MmapPrefetch for RawBlocks<B> {
     fn prefetch(&self) {
         if let RawBacking::Mapped { mmap, ptr, .. } = &self.backing {
             let off = *ptr as usize - mmap.as_ptr() as usize;
-            let _ = mmap.advise_range(memmap2::Advice::WillNeed, off, self.size());
+            prefetch_weight_range(mmap, off, self.size());
         }
     }
 

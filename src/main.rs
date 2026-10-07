@@ -300,6 +300,12 @@ enum Commands {
         /// any mlock attempt, with one warning naming limit vs required size.
         #[arg(long, env = "JOSHUA_MLOCK_HOT_WEIGHTS", num_args = 0..=1, default_missing_value = "on", value_enum)]
         mlock_hot_weights: Option<MlockArg>,
+        /// Cap locked weight pages in MiB when the full dense set exceeds
+        /// RAM. Requires --mlock-hot-weights; skips untied input embeddings
+        /// and routed experts. Leave RAM for KV state and disk staging.
+        #[arg(long, value_name = "MiB", requires = "mlock_hot_weights",
+            value_parser = clap::value_parser!(u64).range(1..=u64::MAX / (1024 * 1024)))]
+        mlock_weight_budget: Option<u64>,
         /// Where a MoE model's routed experts live on a GPU: `device` uploads
         /// them (the whole model must fit), `host` keeps them in RAM borrowed
         /// from the mapping with only the dense set on the GPU (runs models
@@ -465,6 +471,12 @@ enum Commands {
         /// any mlock attempt, with one warning naming limit vs required size.
         #[arg(long, env = "JOSHUA_MLOCK_HOT_WEIGHTS", num_args = 0..=1, default_missing_value = "on", value_enum)]
         mlock_hot_weights: Option<MlockArg>,
+        /// Cap locked weight pages in MiB when the full dense set exceeds
+        /// RAM. Requires --mlock-hot-weights; skips untied input embeddings
+        /// and routed experts. Leave RAM for KV state and disk staging.
+        #[arg(long, value_name = "MiB", requires = "mlock_hot_weights",
+            value_parser = clap::value_parser!(u64).range(1..=u64::MAX / (1024 * 1024)))]
+        mlock_weight_budget: Option<u64>,
         /// Where a MoE model's routed experts live on a GPU: `device` uploads
         /// them (the whole model must fit), `host` keeps them in RAM borrowed
         /// from the mapping with only the dense set on the GPU (runs models
@@ -561,6 +573,7 @@ async fn main() -> anyhow::Result<()> {
             prefill_chunk,
             speculative,
             mlock_hot_weights,
+            mlock_weight_budget,
             expert_placement,
             dense_placement,
             skip_placement_bench,
@@ -618,6 +631,7 @@ async fn main() -> anyhow::Result<()> {
                         .map(MlockMode::from)
                         .unwrap_or(MlockMode::Off),
                 )
+                .mlock_weight_budget(mlock_weight_budget.map(|mib| mib * 1024 * 1024))
                 .expert_placement(expert_placement)
                 .dense_placement(dense_placement)
                 .device_memory_budget(vram_budget.map(|mib| mib.saturating_mul(1024 * 1024)));
@@ -686,6 +700,7 @@ async fn main() -> anyhow::Result<()> {
             prefill_chunk,
             speculative,
             mlock_hot_weights,
+            mlock_weight_budget,
             expert_placement,
             dense_placement,
             skip_placement_bench,
@@ -728,6 +743,7 @@ async fn main() -> anyhow::Result<()> {
                         .map(MlockMode::from)
                         .unwrap_or(MlockMode::Off),
                 )
+                .mlock_weight_budget(mlock_weight_budget.map(|mib| mib * 1024 * 1024))
                 .expert_placement(expert_placement)
                 .dense_placement(dense_placement)
                 .device_memory_budget(vram_budget.map(|mib| mib.saturating_mul(1024 * 1024)));
@@ -806,7 +822,8 @@ fn total_ram_bytes() -> Option<u64> {
     let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
     let line = meminfo.lines().find(|l| l.starts_with("MemTotal:"))?;
     let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
-    Some(kb * 1024)
+    let host = kb.checked_mul(1024)?;
+    Some(joshua::placement::process_memory_limit_bytes().map_or(host, |limit| host.min(limit)))
 }
 
 /// macOS: `hw.memsize` via `sysctl(3)` — physical RAM, unlike `hw.physmem`'s
@@ -924,6 +941,18 @@ fn npu_backend(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_weight_lock_cli_requires_locking_and_rejects_overflow() {
+        let run = ["joshua", "run", "--model", "model.gguf", "prompt"];
+        assert!(Cli::try_parse_from(run.into_iter().chain(["--mlock-weight-budget", "4096"])).is_err());
+        assert!(Cli::try_parse_from(run.into_iter().chain([
+            "--mlock-hot-weights=required", "--mlock-weight-budget", "4096",
+        ])).is_ok());
+        assert!(Cli::try_parse_from(run.into_iter().chain([
+            "--mlock-hot-weights=required", "--mlock-weight-budget", "18446744073709551615",
+        ])).is_err());
+    }
 
     /// A model that fits in RAM is prefetched whole; a model larger than RAM
     /// gets the dense/expert pinning split instead.

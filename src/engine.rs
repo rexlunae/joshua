@@ -349,6 +349,15 @@ pub struct EngineOptions {
     /// silently capped — apply `sudo prlimit --pid <user manager> --memlock=-1:-1`
     /// for a live fix, or re-login.
     pub mlock_hot_weights: MlockMode,
+    /// Optional byte cap on the mapped weight pages locked by
+    /// `mlock_hot_weights`. This permits a resident subset when even the
+    /// dense weights exceed RAM. Whole pages are selected in file order;
+    /// routed experts and an untied input embedding are excluded. Leave
+    /// room outside this budget for activations, KV state and disk staging.
+    /// The cap is reduced when necessary to leave at least 1 GiB of detected
+    /// available RAM at load; longer contexts can require more headroom.
+    /// `None` preserves locking the full dense set; `Some(0)` locks nothing.
+    pub mlock_weight_budget_bytes: Option<u64>,
     /// Keep the `N` most frequently routed experts resident (a
     /// routing-frequency LRU cache).
     ///
@@ -503,6 +512,13 @@ impl EngineOptions {
     /// [`EngineOptions::mlock_hot_weights`] and [`MlockMode`].
     pub fn mlock_hot_weights(mut self, mode: MlockMode) -> Self {
         self.mlock_hot_weights = mode;
+        self
+    }
+
+    /// Cap the resident mapped weight subset in bytes. See
+    /// [`EngineOptions::mlock_weight_budget_bytes`].
+    pub fn mlock_weight_budget(mut self, bytes: Option<u64>) -> Self {
+        self.mlock_weight_budget_bytes = bytes;
         self
     }
 
@@ -1259,6 +1275,7 @@ impl Engine {
                     &raw,
                     options.pin_hot_weights && !options.prefetch_whole_model,
                     options.mlock_hot_weights,
+                    options.mlock_weight_budget_bytes,
                 )?;
             }
         }
@@ -3992,6 +4009,52 @@ fn base_page_size() -> usize {
     4096
 }
 
+/// Select a byte-bounded resident subset without copying quantized weights.
+/// Skip an untied input embedding: decode reads a few rows there, whereas
+/// output projection and the other dense matrices are swept every token.
+/// Merge page overlap so shared tensor boundary pages are charged once.
+#[cfg(unix)]
+fn bounded_weight_lock_ranges(
+    header: &crate::gguf_ext::GgufHeader,
+    map_len: usize,
+    page: usize,
+    budget: u64,
+) -> Vec<ByteRange> {
+    let mut tensors: Vec<_> = header.tensors.iter().filter_map(|(name, info)| {
+        let off = header.tensor_data_offset.checked_add(info.offset)?;
+        let off = usize::try_from(off).ok()?;
+        (off < map_len).then_some((off, name.as_str()))
+    }).collect();
+    tensors.sort_by_key(|(off, _)| *off);
+    let map_end = map_len.saturating_add(page - 1) / page * page;
+    let untied = header.tensors.contains_key("output.weight");
+    let mut remaining = budget / page as u64;
+    let mut selected: Vec<ByteRange> = Vec::new();
+    let mut covered_end = 0;
+    for (i, &(off, name)) in tensors.iter().enumerate() {
+        if remaining == 0 { break; }
+        if is_routed_expert(name) || (untied && name == "token_embd.weight") {
+            continue;
+        }
+        let end = tensors.get(i + 1).map_or(map_len, |t| t.0);
+        if end <= off { continue; }
+        let start = (off / page * page).max(covered_end);
+        let end = (end.saturating_add(page - 1) / page * page).min(map_end);
+        if end <= start { continue; }
+        let pages = ((end - start) / page) as u64;
+        let pages = pages.min(remaining) as usize;
+        let len = pages * page;
+        if let Some(last) = selected.last_mut().filter(|r| r.0 + r.1 == start) {
+            last.1 += len;
+        } else {
+            selected.push((start, len));
+        }
+        remaining -= pages as u64;
+        covered_end = start + len;
+    }
+    selected
+}
+
 /// Apply hot-weight pinning to the model mapping: prefetch (`MADV_WILLNEED`)
 /// and/or `mlock(2)` the dense ranges, and advise `MADV_RANDOM` on the routed
 /// experts so sparse access does not evict the resident hot set.
@@ -4007,6 +4070,7 @@ fn apply_hot_weight_pinning(
     header: &crate::gguf_ext::GgufHeader,
     prefetch: bool,
     mlock: MlockMode,
+    lock_budget: Option<u64>,
 ) -> Result<()> {
     let (dense, experts) = weight_ranges(header, mmap.len() as u64);
     let gib =
@@ -4058,11 +4122,30 @@ fn apply_hot_weight_pinning(
 
     if mlock != MlockMode::Off {
         let page = base_page_size();
-        let required = aligned_range_bytes(&dense, page, mmap.len());
+        let locked_ranges = lock_budget.map(|budget| {
+            let effective = crate::placement::available_ram_bytes()
+                .map_or(budget, |free| budget.min(free.saturating_sub(1 << 30)));
+            if effective < budget {
+                tracing::warn!("weight lock budget reduced from {} to {} MiB to reserve 1 GiB of available RAM", budget / (1 << 20), effective / (1 << 20));
+            }
+            bounded_weight_lock_ranges(header, mmap.len(), page, effective)
+        });
+        let dense = locked_ranges.as_deref().unwrap_or(&dense);
+        let required = aligned_range_bytes(dense, page, mmap.len());
+        if required == 0 && lock_budget.is_some_and(|budget| budget > 0)
+            && mlock == MlockMode::Required
+        {
+            return Err(JoshuaError::ModelLoad(
+                "no weight pages fit the requested lock budget and available RAM headroom".into(),
+            ));
+        }
+        if let Some(budget) = lock_budget {
+            tracing::info!("bounded weight residency: {:.2} GiB selected within {:.2} GiB budget", required as f64 / 2f64.powi(30), budget as f64 / 2f64.powi(30));
+        }
         let limit = memlock_limit_bytes();
         match mlock_decision(mlock, limit, required) {
             MlockDecision::Proceed => {
-                let failed = mlock_ranges(mmap, &dense, page);
+                let failed = mlock_ranges(mmap, dense, page);
                 if failed > 0 && mlock == MlockMode::Required {
                     return Err(JoshuaError::ModelLoad(format!(
                         "mlock of the hot weight set failed ({failed}/{} ranges) despite \
@@ -4105,6 +4188,7 @@ fn apply_hot_weight_pinning(
     _header: &crate::gguf_ext::GgufHeader,
     _prefetch: bool,
     _mlock: MlockMode,
+    _lock_budget: Option<u64>,
 ) -> Result<()> {
     tracing::warn!("hot-weight pinning is unix-only; ignoring the request");
     Ok(())
@@ -5987,7 +6071,7 @@ mod tests {
             tensors: std::collections::HashMap::new(),
             tensor_data_offset: 0,
         };
-        apply_hot_weight_pinning(&mmap, &empty, true, MlockMode::On).expect("no tensors is fine");
+        apply_hot_weight_pinning(&mmap, &empty, true, MlockMode::On, None).expect("no tensors is fine");
 
         // Real split: prefetch + lock, plus the random hint on experts.
         let header = header_with_tensors(
@@ -5997,10 +6081,53 @@ mod tests {
                 ("blk.0.ffn_gate_exps.weight", 4096),
             ],
         );
-        apply_hot_weight_pinning(&mmap, &header, true, MlockMode::On)
+        apply_hot_weight_pinning(&mmap, &header, true, MlockMode::On, None)
             .expect("advice/mlock is best effort");
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_weight_residency_skips_sparse_weights_and_charges_whole_pages() {
+        let page = 4096;
+        let header = header_with_tensors(0, &[
+            ("token_embd.weight", 0),
+            ("output.weight", page as u64),
+            ("blk.0.attn_q.weight", (2 * page + 16) as u64),
+            ("blk.0.ffn_gate_inp.weight", (3 * page + 16) as u64),
+            ("blk.0.ffn_gate_exps.weight", (4 * page + 16) as u64),
+        ]);
+        let map_len = 6 * page + 7;
+        for budget in [0, 1, 4095, 4096, 8191, 8192, 8193, 16384, u64::MAX] {
+            let ranges = bounded_weight_lock_ranges(&header, map_len, page, budget);
+            let bytes = aligned_range_bytes(&ranges, page, map_len);
+            assert!(bytes <= budget);
+            assert!(ranges.iter().all(|&(off, len)| {
+                off >= page && off + len <= 5 * page && off % page == 0 && len % page == 0
+            }));
+        }
+        assert_eq!(bounded_weight_lock_ranges(&header, map_len, page, 8193), vec![(page, 2 * page)]);
+        assert_eq!(bounded_weight_lock_ranges(&header, map_len, page, u64::MAX), vec![(page, 4 * page)]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_weight_residency_keeps_a_tied_output_embedding() {
+        let header = header_with_tensors(0, &[
+            ("token_embd.weight", 0), ("blk.0.attn_q.weight", 8192),
+        ]);
+        assert_eq!(bounded_weight_lock_ranges(&header, 16384, 4096, 4096), vec![(0, 4096)]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_weight_residency_accounts_for_the_final_partial_page() {
+        let header = header_with_tensors(0, &[("output.weight", 4097)]);
+        let ranges = bounded_weight_lock_ranges(&header, 8193, 4096, 8192);
+        assert_eq!(ranges, vec![(4096, 8192)]);
+        assert_eq!(aligned_range_bytes(&ranges, 4096, 8193), 8192);
+        assert_eq!(bounded_weight_lock_ranges(&header, 8193, 4096, 4096), vec![(4096, 4096)]);
     }
 
     /// Whole-model prefetch must never fail the load: `MADV_WILLNEED` over
