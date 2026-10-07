@@ -113,7 +113,7 @@ pub fn decode_raw_to_f32(dtype: u32, bytes: &[u8], elems: usize) -> Result<Optio
 ///
 /// Dtype routing: Q8_0 / Q2_K / Q4_K go to the fused dequant-in-registers
 /// kernels ([`crate::kquant_dot::try_matmul_fused`], AVX2 on x86_64, NEON on
-/// aarch64); every other k-quant goes to [`matmul_kquant`] — candle's
+/// aarch64); Q6_K is also fused on AVX-512. Other k-quants use candle's
 /// `to_float` dequant per row plus the SIMD dot and rayon row parallelism.
 /// Both paths dot **f32 activations**, matching candle's dequantize-then-gemm
 /// semantics up to FMA rounding (the same contract as the rest of this
@@ -332,7 +332,7 @@ fn matmul_kquant_impl<T: GgmlType>(
 }
 
 /// SIMD fast path for [`matmul_kquant_impl`]: for the block types the
-/// model actually uses (Q8_0, Q2_K, Q4_K) this delegates to the *fused*
+/// model actually uses (Q8_0, Q2_K, Q4_K, Q6_K on AVX-512) this delegates to the *fused*
 /// kernels in [`crate::kquant_dot`] — the quantized blocks are decoded
 /// inside the dot in SIMD registers, so no f32 weight row is ever
 /// materialized (the same design as the IQ2_XXS path).  Other k-quant types
@@ -791,11 +791,60 @@ mod tests {
         assert_eq!(par, ser, "parallel and serial matmul must be bit-identical");
     }
 
+    #[test]
+    fn single_row_matches_batched_fused_kernel_bit_exact() {
+        let (k, n) = (1024, 17);
+        macro_rules! check {
+            ($ty:ty, $dt:expr) => {{
+                let blocks = quantized_blocks::<$ty>(n, k, $dt);
+                let mut single = vec![0.0; n];
+                for m in [2, 8, 9, 17] {
+                    let lhs: Vec<f32> = (0..m * k)
+                        .map(|i| ((i * 40503 % 1000) as f32 - 500.0) / 100.0).collect();
+                    let mut batch = vec![0.0; m * n];
+                    matmul_kquant::<$ty>((m, k, n), &lhs, &blocks, &mut batch).unwrap();
+                    for (input, got) in lhs.chunks_exact(k).zip(batch.chunks_exact(n)) {
+                        matmul_kquant::<$ty>((1, k, n), input, &blocks, &mut single).unwrap();
+                        assert_eq!(single, got, "{:?}, m={m}", $dt);
+                    }
+                }
+            }};
+        }
+        check!(BlockQ8_0, GgmlDType::Q8_0);
+        check!(BlockQ2K, GgmlDType::Q2K);
+        check!(BlockQ4K, GgmlDType::Q4K);
+    }
+
+    #[test]
+    fn fused_q6k_matches_dequantized_row_dot_bit_exact() {
+        let n = 17;
+        for k in [256, 1024, 14336] {
+            let blocks = quantized_blocks::<BlockQ6K>(n, k, GgmlDType::Q6K);
+            let mut weights = vec![0f32; n * k];
+            BlockQ6K::to_float(&blocks, &mut weights);
+            for m in [1, 3, 8, 9, 17] {
+                let lhs: Vec<f32> = (0..m * k)
+                    .map(|i| ((i * 40503 % 997) as f32 - 500.0) / 100.0).collect();
+                let mut got = vec![0f32; m * n];
+                matmul_kquant::<BlockQ6K>((m, k, n), &lhs, &blocks, &mut got).unwrap();
+                let mut want = vec![0f32; m * n];
+                let dst = crate::simd::DstPtr::new(&mut want);
+                for row in 0..n {
+                    // Reference is exactly the previous generic Q6_K path.
+                    unsafe {
+                        dot_row_simd(m, k, n, &lhs, &weights[row * k..(row + 1) * k], row, &dst);
+                    }
+                }
+                assert_eq!(got, want, "Q6_K m={m}, k={k}");
+            }
+        }
+    }
+
     /// The row splitter behind `crate::simd::for_each_row_chunks` must not
     /// change a single bit of the result.  Run at every awkward row count —
     /// below the `n < 8` serial cutoff, exactly on a chunk boundary and not
     /// on one — for a dtype that reaches the chunked dequant+dot route
-    /// (Q6_K, Q4_0: the fused Q8_0/Q2_K/Q4_K kernels take over before it) and
+    /// (Q4_0 everywhere, Q6_K on AVX2/NEON) and
     /// for the fused route's `for_each_row` (Q8_0).
     ///
     /// The chunked path only engages when the pool has more than one thread
@@ -919,7 +968,7 @@ mod tests {
     }
 
     /// The fast path must reproduce candle's dequantize-then-gemm for every
-    /// dtype it accepts — including Q6_K/Q5K etc. that only have the generic
+    /// dtype it accepts — including Q5_K and the Q6_K generic fallback
     /// dequant+NEON-dot route.  Tolerances absorb accumulation-order and FMA
     /// rounding only (same contract as `run_case` above).
     ///

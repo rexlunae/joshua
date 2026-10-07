@@ -253,9 +253,9 @@ fn for_each_row_allocates_nothing() {
     }
 }
 
-/// End to end: a decode-shaped quantized matmul allocates exactly one
-/// scratch buffer per chunk (the per-task dequantization row) and nothing
-/// else.  The count tracks the chunk split, not `n`.
+/// End to end: Q6_K decode allocates no dequant scratch on AVX-512;
+/// fallback kernels allocate exactly one scratch per chunk and nothing
+/// else. The fallback count tracks the chunk split, not `n`.
 #[test]
 fn quantized_matmul_allocates_only_per_chunk_scratch() {
     let _guard = census_guard();
@@ -285,20 +285,21 @@ fn quantized_matmul_allocates_only_per_chunk_scratch() {
     let census = count_allocs(|| {
         matmul_kquant::<BlockQ6K>((M, K, 512), &lhs, &blocks, &mut dst).unwrap()
     });
-    // One `vec![0f32; k]` (4 KiB) scratch per chunk; no per-chunk `Vec<usize>`
-    // on top of it, so the ≤1 KiB bands stay empty.
+    // Q6_K is fused on AVX-512 and needs no dequant scratch. Other SIMD
+    // levels retain one 4 KiB scratch per chunk. Neither path allocates
+    // per-chunk row-index vectors, so the ≤1 KiB bands stay empty.
     assert_eq!(
         census.small_alloc(),
         0,
         "matmul left {} small allocations: {census:?}",
         census.small_alloc()
     );
-    assert_eq!(
-        census.medium,
-        chunk_count(512),
-        "one 4 KiB dequant scratch per chunk, census {census:?} (chunks={})",
+    let expected = if joshua::simd::simd_level() == joshua::simd::SimdLevel::Avx512 {
+        0
+    } else {
         chunk_count(512)
-    );
+    };
+    assert_eq!(census.medium, expected, "dequant scratch census {census:?}, expected {expected}");
     assert!(dst.iter().any(|v| *v != 0.0), "sanity: the matmul did compute");
 }
 
