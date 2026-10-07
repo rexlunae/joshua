@@ -230,7 +230,7 @@ impl<T: GgmlType + 'static> MmapPrefetch for MmapBlocks<T> {
         let base = self._mmap.as_ptr() as usize;
         let off = self.ptr as usize - base;
         let len = self.len * std::mem::size_of::<T>();
-        let _ = self._mmap.advise_range(memmap2::Advice::WillNeed, off, len);
+        prefetch_weight_range(&self._mmap, off, len);
     }
 
     fn mapped_range(&self) -> Option<MappedRange> {
@@ -239,6 +239,23 @@ impl<T: GgmlType + 'static> MmapPrefetch for MmapBlocks<T> {
             self.ptr as *const u8,
             self.len * std::mem::size_of::<T>(),
         ))
+    }
+}
+
+/// Linux caps one `MADV_WILLNEED` at the device readahead window, so a single
+/// call warms only the head of a multi-MiB tensor. Issue it per window instead
+/// so the whole selected range is read, without changing the mapping's access
+/// advice: routed experts keep their `MADV_RANDOM` hint for later demand faults.
+/// 128 KiB is the kernel's default readahead window.
+const WILLNEED_CHUNK: usize = 128 << 10;
+
+fn prefetch_weight_range(mmap: &Mmap, off: usize, len: usize) {
+    let end = off.saturating_add(len).min(mmap.len());
+    let mut at = off;
+    while at < end {
+        let chunk = (end - at).min(WILLNEED_CHUNK);
+        let _ = mmap.advise_range(memmap2::Advice::WillNeed, at, chunk);
+        at += chunk;
     }
 }
 
@@ -394,7 +411,7 @@ impl<B: RawBlock> MmapPrefetch for RawBlocks<B> {
     fn prefetch(&self) {
         if let RawBacking::Mapped { mmap, ptr, .. } = &self.backing {
             let off = *ptr as usize - mmap.as_ptr() as usize;
-            let _ = mmap.advise_range(memmap2::Advice::WillNeed, off, self.size());
+            prefetch_weight_range(mmap, off, self.size());
         }
     }
 
@@ -1368,6 +1385,78 @@ mod tests {
         let mut probe = vec![0u8; 4096];
         let n = file.read_at(&mut probe, 0).unwrap();
         assert_eq!(n, 4096);
+
+        drop(mmap);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Expert prefetch must warm the whole selected range (one WILLNEED is
+    /// capped at the readahead window) without dropping the mapping's
+    /// `MADV_RANDOM` advice, which later demand faults still rely on.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn weight_prefetch_warms_the_range_and_keeps_random_advice() {
+        use std::io::Write;
+        use std::os::unix::io::AsRawFd;
+
+        let dir = std::env::temp_dir().join(format!("joshua-wpf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("model.bin");
+        let len = 8 * 1024 * 1024;
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(&vec![0x5au8; len]).unwrap();
+        f.sync_all().unwrap();
+        drop(f);
+        let file = std::fs::File::open(&path).unwrap();
+        let mmap = unsafe { Mmap::map(&file).unwrap() };
+        mmap.advise(memmap2::Advice::Random).unwrap();
+        let random_advice = || {
+            let start = format!("{:x}-", mmap.as_ptr() as usize);
+            let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap();
+            let entry = smaps
+                .split_once(&format!("\n{start}"))
+                .map(|(_, rest)| rest)
+                .unwrap();
+            let flags = entry
+                .lines()
+                .find_map(|l| l.strip_prefix("VmFlags:"))
+                .unwrap();
+            flags.split_whitespace().any(|f| f == "rr")
+        };
+        assert!(random_advice());
+
+        let rc = unsafe {
+            libc::posix_fadvise(
+                file.as_raw_fd(),
+                0,
+                len as libc::off_t,
+                libc::POSIX_FADV_DONTNEED,
+            )
+        };
+        assert_eq!(rc, 0, "posix_fadvise failed");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let cold = resident_fraction(&mmap);
+
+        prefetch_weight_range(&mmap, 0, len);
+        assert!(random_advice(), "prefetch replaced the RANDOM advice");
+
+        if cold < 0.5 {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            let mut resident = 0.0;
+            while std::time::Instant::now() < deadline {
+                resident = resident_fraction(&mmap);
+                if resident > 0.99 {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            assert!(
+                resident > 0.99,
+                "prefetch warmed only {resident:.3} of the range"
+            );
+        } else {
+            eprintln!("residency check skipped: pages not droppable (resident {cold:.2})");
+        }
 
         drop(mmap);
         std::fs::remove_dir_all(&dir).ok();

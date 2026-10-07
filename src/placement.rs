@@ -136,14 +136,127 @@ pub fn device_expert_slots(
 }
 
 /// Bytes of memory available for allocation, from `/proc/meminfo`'s
-/// `MemAvailable` (Linux).  `None` where unavailable; callers fall back to a
+/// `MemAvailable` (Linux), capped by cgroup v2 headroom including reclaimable
+/// inactive file pages. `None` where unavailable; callers fall back to a
 /// conservative assumption (no auto sizing).
 #[cfg(target_os = "linux")]
 pub fn available_ram_bytes() -> Option<u64> {
     let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
     let line = meminfo.lines().find(|l| l.starts_with("MemAvailable:"))?;
     let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
-    Some(kb * 1024)
+    let host = kb.checked_mul(1024)?;
+    let (_, available) = process_memory_constraints();
+    Some(available.map_or(host, |bytes| host.min(bytes)))
+}
+
+/// A finite cgroup v2 RAM limit, including limits imposed by ancestors.
+/// `None` means no detectable limit; it does not mean unlimited host RAM.
+#[cfg(target_os = "linux")]
+pub fn process_memory_limit_bytes() -> Option<u64> {
+    process_memory_constraints().0
+}
+
+#[cfg(target_os = "linux")]
+fn process_memory_constraints() -> (Option<u64>, Option<u64>) {
+    let Ok(cgroup) = std::fs::read_to_string("/proc/self/cgroup") else {
+        return (None, None);
+    };
+    let Some(path) = cgroup.lines().find_map(|line| line.strip_prefix("0::")) else {
+        return (None, None);
+    };
+    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+    let (root, path) = cgroup2_location(&mountinfo, path)
+        .unwrap_or_else(|| (std::path::PathBuf::from("/sys/fs/cgroup"), path.to_owned()));
+    cgroup_memory_constraints(&root, &path)
+}
+
+/// Locate the process's cgroup v2 directory from `/proc/self/mountinfo`
+/// rather than assuming `/sys/fs/cgroup`. Returns the mount point and the
+/// cgroup path relative to it, after removing the mount's own root within
+/// the hierarchy (bind mounts and containers without a cgroup namespace).
+/// `None` when no cgroup2 mount contains `path`.
+#[cfg(target_os = "linux")]
+fn cgroup2_location(mountinfo: &str, path: &str) -> Option<(std::path::PathBuf, String)> {
+    mountinfo.lines().find_map(|line| {
+        let (fields, fs) = line.split_once(" - ")?;
+        if fs.split_whitespace().next()? != "cgroup2" {
+            return None;
+        }
+        let mut fields = fields.split_whitespace().skip(3);
+        let mount_root = unescape_mountinfo(fields.next()?);
+        let mount_point = unescape_mountinfo(fields.next()?);
+        let relative = if mount_root == "/" {
+            path
+        } else {
+            let rest = path.strip_prefix(mount_root.as_str())?;
+            if !rest.is_empty() && !rest.starts_with('/') {
+                return None;
+            }
+            rest
+        };
+        let relative = if relative.is_empty() { "/" } else { relative };
+        Some((std::path::PathBuf::from(mount_point), relative.to_owned()))
+    })
+}
+
+/// Decode mountinfo's octal escapes (`\040` for space, etc.).
+#[cfg(target_os = "linux")]
+fn unescape_mountinfo(field: &str) -> String {
+    let bytes = field.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let octal = bytes
+            .get(i + 1..i + 4)
+            .filter(|d| bytes[i] == b'\\' && d.iter().all(|c| (b'0'..=b'7').contains(c)));
+        match octal {
+            Some(d) => {
+                out.push(
+                    d.iter()
+                        .fold(0u8, |v, c| v.wrapping_mul(8).wrapping_add(c - b'0')),
+                );
+                i += 4;
+            }
+            None => {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+#[cfg(target_os = "linux")]
+fn cgroup_memory_constraints(root: &std::path::Path, path: &str) -> (Option<u64>, Option<u64>) {
+    let relative = std::path::Path::new(path.trim_start_matches('/'));
+    if relative.components().any(|c| !matches!(c, std::path::Component::Normal(_))) {
+        return (None, None);
+    }
+    let directory = root.join(relative);
+    let mut capacity: Option<u64> = None;
+    let mut available: Option<u64> = None;
+    for dir in directory.ancestors().take_while(|dir| dir.starts_with(root)) {
+        let read_number = |name| -> Option<u64> {
+            std::fs::read_to_string(dir.join(name)).ok()?.trim().parse().ok()
+        };
+        let Some(limit) = read_number("memory.max") else { continue; };
+        capacity = Some(capacity.map_or(limit, |old| old.min(limit)));
+        let headroom = match read_number("memory.current") {
+            Some(current) => {
+                // File cache can be reclaimed without swapping activations.
+                // Count only inactive file pages, conservatively leaving the
+                // active working set and anonymous allocations charged.
+                let inactive = std::fs::read_to_string(dir.join("memory.stat")).ok()
+                    .and_then(|stat| stat.lines().find_map(|line| {
+                        line.strip_prefix("inactive_file ")?.parse::<u64>().ok()
+                    })).unwrap_or(0);
+                limit.saturating_sub(current.saturating_sub(inactive.min(current)))
+            }
+            None => limit,
+        };
+        available = Some(available.map_or(headroom, |old| old.min(headroom)));
+    }
+    (capacity, available)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -671,6 +784,58 @@ fn cuda_memory_info(dev: &candle_core::CudaDevice) -> Option<(u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cgroup_memory_limits_include_ancestors_and_reclaimable_file_cache() {
+        let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("joshua-cgroup-{}-{unique}", std::process::id()));
+        let parent = root.join("parent");
+        let child = parent.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        let write = |dir: &std::path::Path, max: &str, current: &str, inactive: &str| {
+            std::fs::write(dir.join("memory.max"), max).unwrap();
+            std::fs::write(dir.join("memory.current"), current).unwrap();
+            std::fs::write(dir.join("memory.stat"), format!("anon 10\ninactive_file {inactive}\n")).unwrap();
+        };
+        assert_eq!(cgroup_memory_constraints(&root, "/parent/child"), (None, None));
+        write(&parent, "1000", "900", "700");
+        write(&child, "max", "500", "100");
+        assert_eq!(cgroup_memory_constraints(&root, "/parent/child"), (Some(1000), Some(800)));
+        write(&child, "600", "500", "100");
+        assert_eq!(cgroup_memory_constraints(&root, "/parent/child"), (Some(600), Some(200)));
+        write(&parent, "300", "290", "10");
+        assert_eq!(cgroup_memory_constraints(&root, "/parent/child"), (Some(300), Some(20)));
+        write(&child, "600", "1000", "100");
+        assert_eq!(cgroup_memory_constraints(&root, "/parent/child"), (Some(300), Some(0)));
+        write(&parent, "max", "900", "700");
+        write(&child, "max", "500", "100");
+        assert_eq!(cgroup_memory_constraints(&root, "/parent/child"), (None, None));
+        write(&root, "100", "90", "10");
+        assert_eq!(cgroup_memory_constraints(&root, "/"), (Some(100), Some(20)));
+        assert_eq!(cgroup_memory_constraints(&root, "/../escape"), (None, None));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cgroup2_location_follows_the_mount_and_its_root() {
+        let info = "\
+22 1 0:21 / /proc rw - proc proc rw
+30 22 0:26 / /sys/fs/cgroup/memory rw - cgroup cgroup rw,memory
+31 22 0:27 / /run/my\\040cgroup rw,nosuid - cgroup2 cgroup2 rw
+";
+        assert_eq!(
+            cgroup2_location(info, "/user.slice/app"),
+            Some(("/run/my cgroup".into(), "/user.slice/app".into()))
+        );
+        let bind = "40 1 0:27 /user.slice /sys/fs/cgroup ro - cgroup2 cgroup2 rw\n";
+        assert_eq!(cgroup2_location(bind, "/user.slice/app"), Some(("/sys/fs/cgroup".into(), "/app".into())));
+        assert_eq!(cgroup2_location(bind, "/user.slice"), Some(("/sys/fs/cgroup".into(), "/".into())));
+        assert_eq!(cgroup2_location(bind, "/user.slicer/app"), None);
+        assert_eq!(cgroup2_location("22 1 0:21 / /proc rw - proc proc rw\n", "/"), None);
+    }
 
     #[test]
     fn budget_fits_available_memory() {
