@@ -4084,9 +4084,21 @@ fn apply_hot_weight_pinning(
         gib(&experts),
     );
 
+    let page = base_page_size();
+    let locked_ranges = (mlock != MlockMode::Off).then_some(lock_budget).flatten().map(|budget| {
+        let effective = crate::placement::available_ram_bytes()
+            .map_or(budget, |free| budget.min(free.saturating_sub(LOW_MEM_FLOOR * 2)));
+        if effective < budget {
+            tracing::warn!("weight lock budget reduced from {} to {} MiB to reserve 3 GiB of available RAM", budget / (1 << 20), effective / (1 << 20));
+        }
+        bounded_weight_lock_ranges(header, mmap.len(), page, effective)
+    });
+    // A lock budget also bounds the load-time prefetch to the selected pages.
+    let resident = locked_ranges.as_deref().unwrap_or(&dense);
+
     if prefetch {
         let mut failed = 0usize;
-        for &(off, len) in &dense {
+        for &(off, len) in resident {
             if mmap
                 .advise_range(memmap2::Advice::WillNeed, off, len)
                 .is_err()
@@ -4097,7 +4109,7 @@ fn apply_hot_weight_pinning(
         if failed > 0 {
             tracing::warn!(
                 "{failed}/{} dense ranges ignored the WILLNEED prefetch hint",
-                dense.len()
+                resident.len()
             );
         }
     }
@@ -4121,16 +4133,7 @@ fn apply_hot_weight_pinning(
     }
 
     if mlock != MlockMode::Off {
-        let page = base_page_size();
-        let locked_ranges = lock_budget.map(|budget| {
-            let effective = crate::placement::available_ram_bytes()
-                .map_or(budget, |free| budget.min(free.saturating_sub(LOW_MEM_FLOOR * 2)));
-            if effective < budget {
-                tracing::warn!("weight lock budget reduced from {} to {} MiB to reserve 3 GiB of available RAM", budget / (1 << 20), effective / (1 << 20));
-            }
-            bounded_weight_lock_ranges(header, mmap.len(), page, effective)
-        });
-        let dense = locked_ranges.as_deref().unwrap_or(&dense);
+        let dense = resident;
         let required = aligned_range_bytes(dense, page, mmap.len());
         if required == 0 && lock_budget.is_some_and(|budget| budget > 0)
             && mlock == MlockMode::Required

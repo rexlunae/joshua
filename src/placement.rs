@@ -164,7 +164,66 @@ fn process_memory_constraints() -> (Option<u64>, Option<u64>) {
     let Some(path) = cgroup.lines().find_map(|line| line.strip_prefix("0::")) else {
         return (None, None);
     };
-    cgroup_memory_constraints(std::path::Path::new("/sys/fs/cgroup"), path)
+    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+    let (root, path) = cgroup2_location(&mountinfo, path)
+        .unwrap_or_else(|| (std::path::PathBuf::from("/sys/fs/cgroup"), path.to_owned()));
+    cgroup_memory_constraints(&root, &path)
+}
+
+/// Locate the process's cgroup v2 directory from `/proc/self/mountinfo`
+/// rather than assuming `/sys/fs/cgroup`. Returns the mount point and the
+/// cgroup path relative to it, after removing the mount's own root within
+/// the hierarchy (bind mounts and containers without a cgroup namespace).
+/// `None` when no cgroup2 mount contains `path`.
+#[cfg(target_os = "linux")]
+fn cgroup2_location(mountinfo: &str, path: &str) -> Option<(std::path::PathBuf, String)> {
+    mountinfo.lines().find_map(|line| {
+        let (fields, fs) = line.split_once(" - ")?;
+        if fs.split_whitespace().next()? != "cgroup2" {
+            return None;
+        }
+        let mut fields = fields.split_whitespace().skip(3);
+        let mount_root = unescape_mountinfo(fields.next()?);
+        let mount_point = unescape_mountinfo(fields.next()?);
+        let relative = if mount_root == "/" {
+            path
+        } else {
+            let rest = path.strip_prefix(mount_root.as_str())?;
+            if !rest.is_empty() && !rest.starts_with('/') {
+                return None;
+            }
+            rest
+        };
+        let relative = if relative.is_empty() { "/" } else { relative };
+        Some((std::path::PathBuf::from(mount_point), relative.to_owned()))
+    })
+}
+
+/// Decode mountinfo's octal escapes (`\040` for space, etc.).
+#[cfg(target_os = "linux")]
+fn unescape_mountinfo(field: &str) -> String {
+    let bytes = field.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let octal = bytes
+            .get(i + 1..i + 4)
+            .filter(|d| bytes[i] == b'\\' && d.iter().all(|c| (b'0'..=b'7').contains(c)));
+        match octal {
+            Some(d) => {
+                out.push(
+                    d.iter()
+                        .fold(0u8, |v, c| v.wrapping_mul(8).wrapping_add(c - b'0')),
+                );
+                i += 4;
+            }
+            None => {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 #[cfg(target_os = "linux")]
@@ -757,6 +816,25 @@ mod tests {
         assert_eq!(cgroup_memory_constraints(&root, "/"), (Some(100), Some(20)));
         assert_eq!(cgroup_memory_constraints(&root, "/../escape"), (None, None));
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cgroup2_location_follows_the_mount_and_its_root() {
+        let info = "\
+22 1 0:21 / /proc rw - proc proc rw
+30 22 0:26 / /sys/fs/cgroup/memory rw - cgroup cgroup rw,memory
+31 22 0:27 / /run/my\\040cgroup rw,nosuid - cgroup2 cgroup2 rw
+";
+        assert_eq!(
+            cgroup2_location(info, "/user.slice/app"),
+            Some(("/run/my cgroup".into(), "/user.slice/app".into()))
+        );
+        let bind = "40 1 0:27 /user.slice /sys/fs/cgroup ro - cgroup2 cgroup2 rw\n";
+        assert_eq!(cgroup2_location(bind, "/user.slice/app"), Some(("/sys/fs/cgroup".into(), "/app".into())));
+        assert_eq!(cgroup2_location(bind, "/user.slice"), Some(("/sys/fs/cgroup".into(), "/".into())));
+        assert_eq!(cgroup2_location(bind, "/user.slicer/app"), None);
+        assert_eq!(cgroup2_location("22 1 0:21 / /proc rw - proc proc rw\n", "/"), None);
     }
 
     #[test]
