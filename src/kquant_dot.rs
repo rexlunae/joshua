@@ -1,5 +1,5 @@
 //! Fused SIMD dequant+dot kernels for candle's k-quant block types used by
-//! the DeepSeek-V4-Flash GGUF (Q8_0, Q2_K, Q4_K).
+//! GGUFs (Q8_0, Q2_K, Q4_K, plus Q6_K on AVX-512).
 //!
 //! The generic fast path in [`crate::quant_matmul`] dequantizes each weight
 //! row into an f32 scratch buffer (via candle's scalar `GgmlType::to_float`)
@@ -36,6 +36,9 @@
 //!   `32·(v/64) + (v mod 32)`, nibble `(v/32) mod 2`.  Each of the 8 scale
 //!   pairs (6 bits each, packed into 12 bytes) covers a 32-value group;
 //!   `y = d·sc·q − dmin·m`.
+//! * **Q6_K** — 256 signed six-bit values split across low nibbles and
+//!   two-bit high fields; each sixteen-value group has a signed scale.
+//!   Dequantization is `(d·sc)·(q−32)`, exactly as in candle's row decoder.
 //!
 //! # Safety model
 //!
@@ -97,15 +100,27 @@ pub struct BlockQ4KRaw {
     pub qs: [u8; 128],
 }
 
+/// Q6_K: 256 signed six-bit values, sixteen signed group scales and d.
+#[derive(Clone, Copy, Debug)]
+#[repr(C, packed)]
+pub struct BlockQ6KRaw {
+    pub ql: [u8; 128],
+    pub qh: [u8; 64],
+    pub scales: [i8; 16],
+    pub d: [u8; 2],
+}
+
 const _: () = {
     assert!(std::mem::size_of::<BlockQ8_0Raw>() == 34);
     assert!(std::mem::size_of::<BlockQ2KRaw>() == 84);
     assert!(std::mem::size_of::<BlockQ4KRaw>() == 144);
+    assert!(std::mem::size_of::<BlockQ6KRaw>() == 210);
     // These must stay in lockstep with candle's block structs (the GGUF
     // reader and the streamed loader size reads through these layouts).
     assert!(std::mem::size_of::<BlockQ8_0Raw>() == std::mem::size_of::<candle_core::quantized::k_quants::BlockQ8_0>());
     assert!(std::mem::size_of::<BlockQ2KRaw>() == std::mem::size_of::<candle_core::quantized::k_quants::BlockQ2K>());
     assert!(std::mem::size_of::<BlockQ4KRaw>() == std::mem::size_of::<candle_core::quantized::k_quants::BlockQ4K>());
+    assert!(std::mem::size_of::<BlockQ6KRaw>() == std::mem::size_of::<candle_core::quantized::k_quants::BlockQ6K>());
 };
 
 /// Decode scale pair `j` (0..8) of a Q4_K block's 12 packed scale bytes
@@ -165,6 +180,7 @@ pub fn try_matmul_fused_avx512(
         GgmlDType::Q8_0 => try_fused::<BlockQ8_0Raw, QK8_0>(m, k, n, lhs, block_bytes, dst, parallel, fused_row_q8_0_avx512),
         GgmlDType::Q2K => try_fused::<BlockQ2KRaw, QK_K>(m, k, n, lhs, block_bytes, dst, parallel, fused_row_q2k_avx512),
         GgmlDType::Q4K => try_fused::<BlockQ4KRaw, QK_K>(m, k, n, lhs, block_bytes, dst, parallel, fused_row_q4k_avx512),
+        GgmlDType::Q6K => try_fused::<BlockQ6KRaw, QK_K>(m, k, n, lhs, block_bytes, dst, parallel, fused_row_q6k_avx512),
         _ => false,
     }
 }
@@ -260,20 +276,33 @@ fn try_fused<B: Sync, const BLOCK_ELEMS: usize>(
         )
     };
     let dst_ptr = crate::simd::DstPtr::new(dst);
-    let worker = |row: usize| {
-        // SAFETY: the caller checked the SIMD capability of this CPU
-        // (`avx512_available()`, `avx2_fma_available()` or `neon_available()`,
-        // matching the kernel family), so the target_feature kernel may run; row `row` writes
-        // exactly dst[i*n + row] for i in 0..m, disjoint from every other
-        // row (see `crate::simd`'s safety model).
-        unsafe { row_kernel(m, k, n, lhs, blocks, blocks_per_row, row, &dst_ptr) }
+    let worker = |rows: std::ops::Range<usize>| {
+        // Visit a small activation tile across this worker's contiguous
+        // weight rows before advancing to the next tile. Otherwise every
+        // weight row scans the entire prompt's activations, which can exceed
+        // private CPU caches even at ordinary prefill sizes. Four rows bound
+        // the hot activation footprint of wide feed-forward projections and
+        // match the AVX2/NEON register tiles. Each output retains its block
+        // and accumulation order. See docs/performance-2026-10-06.md.
+        const INPUT_ROWS: usize = 4;
+        for m0 in (0..m).step_by(INPUT_ROWS) {
+            let mc = (m - m0).min(INPUT_ROWS);
+            let input = &lhs[m0 * k..(m0 + mc) * k];
+            // SAFETY: m0 < m, and kernels write i*n + row for i < mc,
+            // row < n. Rebasing by m0*n stays in the original m*n output;
+            // workers own disjoint output columns at every activation row.
+            let output = unsafe { dst_ptr.offset(m0 * n) };
+            for row in rows.clone() {
+                // SAFETY: the dispatcher checked the SIMD capability and
+                // the caller validated the shapes. Each worker owns row.
+                unsafe { row_kernel(mc, k, n, input, blocks, blocks_per_row, row, &output) }
+            }
+        }
     };
     if parallel {
-        crate::simd::for_each_row(n, worker);
+        crate::simd::for_each_row_chunks(n, worker);
     } else {
-        for row in 0..n {
-            worker(row);
-        }
+        worker(0..n);
     }
     true
 }
@@ -629,6 +658,58 @@ unsafe fn fused_row_q4k_avx512(
                 let deq = |bytes: __m128i| _mm512_fmsub_ps(_mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(bytes)), d1, m1);
                 let w = [deq(_mm256_castsi256_si128(xv)), deq(_mm256_extracti128_si256(xv, 1))];
                 crate::simd::fma_tile_avx512(acc, lhs, k, m0, mcnt, b * QK_K + 64 * c + 32 * r, &w);
+            }
+        }
+    });
+}
+
+/// Q6_K dequantization follows candle's `(d * scale) * signed_value`,
+/// with two rounded multiplications before the dot's FMA. Visit groups in
+/// contiguous value order, matching the generic dequantized-row SIMD dot.
+///
+/// # Safety
+/// AVX-512 must be available and output columns must be disjoint.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx2,fma")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn fused_row_q6k_avx512(
+    m: usize,
+    k: usize,
+    n: usize,
+    lhs: &[f32],
+    blocks: &[BlockQ6KRaw],
+    blocks_per_row: usize,
+    row: usize,
+    dst: &crate::simd::DstPtr,
+) {
+    use std::arch::x86_64::*;
+    let low_mask = _mm_set1_epi8(15);
+    let high_mask = _mm_set1_epi8(3);
+    crate::simd::row_tiles_avx512(m, n, blocks, blocks_per_row, row, dst, |b, block, acc, m0, mcnt| {
+        let d = f16::from_le_bytes(block.d).to_f32();
+        for sg in 0..2 {
+            for group in 0..8 {
+                let half = group % 2 * 16;
+                let lo_offset = sg * 64 + (group / 2 % 2) * 32 + half;
+                let lo = _mm_loadu_si128(block.ql.as_ptr().add(lo_offset) as *const __m128i);
+                let hi = _mm_loadu_si128(block.qh.as_ptr().add(sg * 32 + half) as *const __m128i);
+                let lo = if group < 4 { lo } else { _mm_srli_epi16(lo, 4) };
+                let hi = match group / 2 {
+                    0 => hi,
+                    1 => _mm_srli_epi16(hi, 2),
+                    2 => _mm_srli_epi16(hi, 4),
+                    _ => _mm_srli_epi16(hi, 6),
+                };
+                let q = _mm_or_si128(
+                    _mm_and_si128(lo, low_mask),
+                    _mm_slli_epi16(_mm_and_si128(hi, high_mask), 4),
+                );
+                let q = _mm512_sub_epi32(_mm512_cvtepu8_epi32(q), _mm512_set1_epi32(32));
+                let scale = _mm512_set1_ps(d * block.scales[sg * 8 + group] as f32);
+                let w = [_mm512_mul_ps(scale, _mm512_cvtepi32_ps(q))];
+                crate::simd::fma_tile_avx512(
+                    acc, lhs, k, m0, mcnt, b * QK_K + sg * 128 + group * 16, &w
+                );
             }
         }
     });

@@ -417,6 +417,27 @@ pub fn dispatch_prefill_with<E: Expert>(
 
     let default_fwd = |e: usize, x: &Tensor| experts[e].forward(x);
     let fwd = forward_expert.unwrap_or(&default_fwd);
+    if expert_device.is_cpu() {
+        // index_add copies the entire destination for every active expert.
+        // Accumulate only the selected rows into one owned CPU buffer, in
+        // the same expert and route order as the tensor path (including
+        // duplicate routes). Keep multiplication separate from addition.
+        let mut y = vec![0f32; n_tokens * h];
+        for (e, (token_idx, w)) in per_expert.into_iter().enumerate() {
+            let count = token_idx.len();
+            if count == 0 {
+                continue;
+            }
+            let idx = Tensor::new(token_idx.as_slice(), expert_device)?;
+            let x_sel = x2.index_select(&idx, 0)?;
+            let out = fwd(e, &x_sel)?;
+            accumulate_cpu_expert(
+                &out, h, token_idx.iter().copied().zip(w.iter().copied()), &mut y
+            )?;
+        }
+        let y = Tensor::from_vec(y, (n_tokens, h), expert_device)?;
+        return Ok((on_device(&y, &out_device)?.into_owned(), routing.ids));
+    }
     let mut y = Tensor::zeros((n_tokens, h), DType::F32, expert_device)?;
     for (e, (token_idx, w)) in per_expert.into_iter().enumerate() {
         let count = token_idx.len();
@@ -431,6 +452,41 @@ pub fn dispatch_prefill_with<E: Expert>(
     }
     let y = on_device(&y, &out_device)?.into_owned();
     Ok((y, routing.ids))
+}
+
+/// CPU equivalent of weighted output rows followed by `index_add(0)`.
+/// The destination stays owned by the dispatch for the entire expert loop.
+/// Keep each multiplication and addition separate, in route order, so
+/// duplicate destinations accumulate exactly like candle's tensor path.
+pub(crate) fn accumulate_cpu_expert(
+    out: &Tensor,
+    h: usize,
+    routes: impl ExactSizeIterator<Item = (u32, f32)>,
+    y: &mut [f32],
+) -> Result<()> {
+    let count = routes.len();
+    if out.dims() != [count, h] {
+        candle_core::bail!("CPU expert output {:?}, expected [{count}, {h}]", out.dims());
+    }
+    let out = out.contiguous()?;
+    let (storage, layout) = out.storage_and_layout();
+    let cpu = match &*storage {
+        candle_core::Storage::Cpu(cpu) => cpu,
+        _ => candle_core::bail!("CPU expert returned non-CPU output"),
+    };
+    let values = cpu.as_slice::<f32>()?;
+    let start = layout.start_offset();
+    let values = &values[start..start + count * h];
+    for ((token, weight), row) in routes.zip(values.chunks_exact(h.max(1))) {
+        let start = token as usize * h;
+        let dst = y.get_mut(start..start + h)
+            .ok_or_else(|| candle_core::Error::Msg(format!("CPU expert token {token} outside output")))?;
+        for (dst, &value) in dst.iter_mut().zip(row) {
+            let weighted = value * weight;
+            *dst += weighted;
+        }
+    }
+    Ok(())
 }
 
 /// Run a routed MoE block over one row (decode).
@@ -845,6 +901,47 @@ mod tests {
                 "prefill vs decode diverge: {x} vs {y}"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn cpu_prefill_matches_tensor_accumulation_exactly() -> Result<()> {
+        let dev = Device::Cpu;
+        let (n, h, k) = (7, 32, 3);
+        let ex = experts(5, h)?;
+        // A contiguous view with a nonzero offset, and duplicate routes
+        // with different weights, including negative and zero weights.
+        let x = Tensor::arange(0f32, ((n + 1) * h) as f32, &dev)?
+            .affine(0.03, -2.0)?.reshape((n + 1, h))?.narrow(0, 1, n)?;
+        let ids = vec![4u32, 1, 4, 0, 0, 2, 3, 1, 2, 2, 4, 2, 1, 3, 0, 4, 4, 4, 2, 0, 3];
+        let weights: Vec<f32> = (0..n * k)
+            .map(|i| (i as f32 % 5.0 - 2.0) * 0.17).collect();
+        let idx = Tensor::new(ids.as_slice(), &dev)?.reshape((n, k))?;
+        let w = Tensor::new(weights.as_slice(), &dev)?.reshape((n, k))?;
+        // Exercise the resolver, offset output views and strided outputs.
+        let resolver = |e: usize, xs: &Tensor| -> Result<Tensor> {
+            let out = ex[e].forward(xs)?;
+            let out = Tensor::cat(&[&Tensor::zeros((1, h), DType::F32, &dev)?, &out], 0)?
+                .narrow(0, 1, xs.dim(0)?)?;
+            if e % 2 == 0 { Ok(out) } else { out.t()?.contiguous()?.t() }
+        };
+        let (got, routed) = dispatch_prefill_with(
+            "test", &ex, &dev, &x, &idx, &w, n, k, Some(&resolver)
+        )?;
+        let mut want = Tensor::zeros((n, h), DType::F32, &dev)?;
+        for e in 0..ex.len() {
+            let slots: Vec<usize> = ids.iter().enumerate()
+                .filter_map(|(s, &id)| (id as usize == e).then_some(s)).collect();
+            if slots.is_empty() { continue; }
+            let indices: Vec<u32> = slots.iter().map(|s| (s / k) as u32).collect();
+            let values: Vec<f32> = slots.iter().map(|&s| weights[s]).collect();
+            let idx = Tensor::new(indices.as_slice(), &dev)?;
+            let out = resolver(e, &x.index_select(&idx, 0)?)?;
+            let w = Tensor::new(values.as_slice(), &dev)?.reshape((slots.len(), 1))?;
+            want = want.index_add(&idx, &out.broadcast_mul(&w)?, 0)?;
+        }
+        assert_eq!(routed, ids);
+        assert_eq!(got.flatten_all()?.to_vec1::<f32>()?, want.flatten_all()?.to_vec1::<f32>()?);
         Ok(())
     }
 

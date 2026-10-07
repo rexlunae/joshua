@@ -339,6 +339,16 @@ impl<'a> DstPtr<'a> {
         *self.ptr.add(idx) = val;
     }
 
+    /// Rebase writes onto an activation tile's first output row.
+    ///
+    /// # Safety
+    /// `offset` and every subsequent write must stay within the original
+    /// destination. The caller must preserve the disjoint-worker contract.
+    #[inline(always)]
+    pub(crate) unsafe fn offset(&self, offset: usize) -> Self {
+        Self { ptr: self.ptr.add(offset), _marker: PhantomData }
+    }
+
     /// Accumulate: `dst[idx] += val` (read-modify-write).
     ///
     /// # Safety
@@ -429,9 +439,31 @@ pub(crate) unsafe fn row_tiles_avx512<B>(
 ) {
     use std::arch::x86_64::*;
     let row_blocks = &blocks[row * blocks_per_row..(row + 1) * blocks_per_row];
+    if m == 1 {
+        // Decode always has one activation row. Give the inlined block
+        // kernel a constant live-row count so it can eliminate the other
+        // seven accumulators and their per-group branches. The block, FMA
+        // and horizontal reduction order is identical to the tiled path.
+        let mut acc = [_mm512_setzero_ps(); MTILE_AVX512];
+        for (b, block) in row_blocks.iter().enumerate() {
+            per_block(b, block, &mut acc, 0, 1);
+        }
+        dst.write(row, hsum512(acc[0]));
+        return;
+    }
     let mut m0 = 0;
-    while m0 < m {
-        let mcnt = (m - m0).min(MTILE_AVX512);
+    while m - m0 >= MTILE_AVX512 {
+        let mut acc = [_mm512_setzero_ps(); MTILE_AVX512];
+        for (b, block) in row_blocks.iter().enumerate() {
+            per_block(b, block, &mut acc, m0, MTILE_AVX512);
+        }
+        for (i, acc_i) in acc.iter().enumerate() {
+            dst.write((m0 + i) * n + row, hsum512(*acc_i));
+        }
+        m0 += MTILE_AVX512;
+    }
+    if m0 < m {
+        let mcnt = m - m0;
         let mut acc = [_mm512_setzero_ps(); MTILE_AVX512];
         for (b, block) in row_blocks.iter().enumerate() {
             per_block(b, block, &mut acc, m0, mcnt);
@@ -440,7 +472,6 @@ pub(crate) unsafe fn row_tiles_avx512<B>(
             // SAFETY: row `row` owns dst[i*n + row] for all i; disjoint per row.
             dst.write((m0 + i) * n + row, hsum512(*acc_i));
         }
-        m0 += MTILE_AVX512;
     }
 }
 

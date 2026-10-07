@@ -2301,7 +2301,6 @@ impl Moe {
         }
 
         let dev = x2.device();
-        let mut y = Tensor::zeros((n_tokens, h), DType::F32, dev)?;
         // Select each expert's input rows once; all three phases reuse them.
         // A single-token route to one expert already has exactly the input
         // row it needs, so skip the index tensor and gather. Duplicate routes
@@ -2337,6 +2336,17 @@ impl Moe {
         for (e, _, x_sel) in &sel {
             ups.push(self.experts[*e].up_forward(x_sel)?);
         }
+        if dev.is_cpu() && n_tokens > 1 {
+            let mut y = vec![0f32; n_tokens * h];
+            for (((e, _, _), gate), up) in sel.iter().zip(gates).zip(ups) {
+                let out = self.experts[*e].combine_and_down(gate, up)?;
+                crate::moe::accumulate_cpu_expert(
+                    &out, h, per_expert[*e].iter().copied(), &mut y
+                )?;
+            }
+            return Tensor::from_vec(y, (n_tokens, h), dev);
+        }
+        let mut y = Tensor::zeros((n_tokens, h), DType::F32, dev)?;
         for (((e, idx, _), gate), up) in sel.iter().zip(gates).zip(ups) {
             let out = self.experts[*e].combine_and_down(gate, up)?;
             if let Some(idx) = idx {
