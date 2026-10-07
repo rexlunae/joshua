@@ -60,8 +60,8 @@ const BENCH_ITERS: usize = 3;
 /// Timed passes stop early once one shape has spent this long, so a slow
 /// device gives one or two samples instead of `BENCH_ITERS`.
 const BENCH_SHAPE_BUDGET: std::time::Duration = std::time::Duration::from_millis(250);
-/// Total wall-clock budget for the whole probe, split evenly between the CPU
-/// and the accelerator (each covers both shapes).
+/// Total wall-clock budget for the whole probe (all shapes, both devices); the
+/// CPU may use at most half of it, the accelerator the rest.
 const BENCH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(8);
 
 /// Measured quantized-matmul throughput of the CPU vs an accelerator.
@@ -224,8 +224,11 @@ pub fn benchmark(device: &Device) -> DenseBench {
         };
     };
     let weight = &buf[range];
-    // Each device gets its own half of the budget, so a slow CPU cannot use
-    // up the time the accelerator needs and leave it unmeasured (read as 0).
+    // The CPU is capped at half the budget, so a slow CPU cannot use up the
+    // time the accelerator needs and leave it unmeasured (read as 0).  The
+    // accelerator gets whatever remains of the whole budget, and at least the
+    // other half: its kernel compile and weight upload come out of it too.
+    let start = std::time::Instant::now();
     let half = BENCH_DEADLINE / 2;
     let measure = |dev: &Device, m: usize, mats: usize, deadline| {
         measure_gemm(dev, weight, m, mats, deadline).unwrap_or(0.0)
@@ -233,13 +236,13 @@ pub fn benchmark(device: &Device) -> DenseBench {
     let (cpu_dec, cpu_pre) = if device.is_cpu() {
         (0.0, 0.0)
     } else {
-        let deadline = std::time::Instant::now() + half;
+        let deadline = start + half;
         (
             measure(&cpu, 1, BENCH_DECODE_MATS, deadline),
             measure(&cpu, BENCH_B, BENCH_PREFILL_MATS, deadline),
         )
     };
-    let deadline = std::time::Instant::now() + half;
+    let deadline = (start + BENCH_DEADLINE).max(std::time::Instant::now() + half);
     let (dev_dec, dev_pre) = (
         measure(device, 1, BENCH_DECODE_MATS, deadline),
         measure(device, BENCH_B, BENCH_PREFILL_MATS, deadline),
