@@ -665,9 +665,11 @@ fn check_block_k(k: usize, block: usize, what: &str) -> Result<()> {
 pub const QGEMV_MR_MAX_ROWS: usize = 16;
 
 /// Whether `dtype` takes `k_qgemv_mr` (IQ2_XXS, Q2_K, Q4_K, Q5_K, Q6_K).  Q3_K
-/// has a lane decoder there but stays on the one-row kernel: measured on an
-/// Arc Pro B50 ([4096, 4096], one row) it ran 37.8 GFLOPS multi-row against
-/// 60.7 one-row, its per-lane 6-bit scale unpack costing more than it saves.  `JOSHUA_SYCL_QGEMV=v1` forces the one-row kernel
+/// has a lane decoder there but stays on the one-row kernel, matching the
+/// OpenCL backend: with the same decoder under OpenCL on an Arc Pro B50
+/// ([4096, 4096], one row) it ran 37.8 GFLOPS multi-row against 60.7 one-row,
+/// its per-lane 6-bit scale unpack costing more than it saves (not measured
+/// under SYCL).  `JOSHUA_SYCL_QGEMV=v1` forces the one-row kernel
 /// for every dtype (a bisect switch for a wrong result on one driver).
 pub fn qgemv_multirow(dtype: crate::quantized::GgmlDType) -> bool {
     use crate::quantized::GgmlDType::*;

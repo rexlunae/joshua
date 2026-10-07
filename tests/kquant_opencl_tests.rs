@@ -1,9 +1,10 @@
 //! The k-quant weights (Q2_K..Q6_K) on an OpenCL device: a resident
 //! `QMatMul` must reproduce the f32 product with the CPU-dequantized weight
-//! for the decode GEMV (`k_qgemv_mr`, one row), the multi-row GEMV a
-//! speculative verify or short prompt chunk takes (a few rows), and the
-//! prefill dequantize-then-GEMM path (many rows).  Each format has its own
-//! lane-level decoder in `k_qgemv_mr`, so every one is checked at a shape
+//! for the decode GEMV (one row), the GEMV a speculative verify or short
+//! prompt chunk takes (a few rows), and the prefill dequantize-then-GEMM path
+//! (many rows).  Q2_K, Q4_K, Q5_K and Q6_K take `k_qgemv_mr` for the GEMV
+//! rows, each with its own lane-level decoder; Q3_K takes the one-row
+//! `k_qgemv` (see `qgemv_multirow`).  Every format is checked at a shape
 //! whose rows span several 256-element blocks.  Skips when no OpenCL device
 //! (or runtime) is available.
 
