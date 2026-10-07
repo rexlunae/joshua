@@ -642,8 +642,8 @@ inline void dequant_sub(int qt, const uchar* p, int j, float* out) {
 // sub-blocks, dequantizing each into private memory.
 
 
-// Multi-row quantized GEMV for the 256-element block formats the routed
-// experts use (IQ2_XXS, Q2_K): C[m, n] = sum_k X[m, k] * W[n, k] for every
+// Multi-row quantized GEMV for the 256-element block formats (IQ2_XXS and
+// the Q2_K..Q6_K k-quants the routed experts and dense projections use): C[m, n] = sum_k X[m, k] * W[n, k] for every
 // row m < M (M <= 16) with each weight decoded ONCE.  A work-group handles
 // `cols` output columns; the LPC = WG / cols lanes of a column each own
 // whole 8-element groups (one IQ2_XXS grid code, a quarter of a Q2_K
@@ -667,6 +667,56 @@ inline void dequant8(int qt, const uchar* blk, int j, int l, float* w) {
             char gv = (char)((g >> (8 * v)) & 0xFFUL);
             w[v] = (signs & (uchar)(1 << v)) ? -db * (float)gv : db * (float)gv;
         }
+    } else if (qt == QT_Q4_K || qt == QT_Q5_K) {
+        // Sub-block j has its own 6-bit (scale, min); the 64-element pair
+        // g = j>>1 shares 32 bytes of nibbles (low nibble for even j).  Q5_K
+        // adds bit j of qh[i] as the fifth bit.  Mirrors dequant_sub.
+        float d = f16_at(blk), dmin = f16_at(blk + 2);
+        const uchar* sc = blk + 4;
+        int g = j >> 1, nib = 4 * (j & 1);
+        uchar sc1, m1;
+        if (j < 4) { sc1 = sc[j] & 63; m1 = sc[j + 4] & 63; }
+        else { sc1 = (sc[j + 4] & 0xF) | ((sc[j - 4] >> 6) << 4); m1 = (sc[j + 4] >> 4) | ((sc[j] >> 6) << 4); }
+        float d1 = d * (float)sc1, mm1 = dmin * (float)m1;
+        if (qt == QT_Q4_K) {
+            const uchar* qs = blk + 16 + 32 * g + 8 * l;
+            for (int v = 0; v < 8; v++) w[v] = d1 * (float)((qs[v] >> nib) & 0xF) - mm1;
+        } else {
+            const uchar* qh = blk + 16 + 8 * l;
+            const uchar* ql = blk + 48 + 32 * g + 8 * l;
+            uchar u = (uchar)(1 << j);
+            for (int v = 0; v < 8; v++)
+                w[v] = d1 * (float)(((ql[v] >> nib) & 0xF) + ((qh[v] & u) ? 16 : 0)) - mm1;
+        }
+    } else if (qt == QT_Q6_K) {
+        // Sub-block j = (hh, q): q picks the ql half (q & 1) and nibble
+        // (q >> 1), and the 2-bit field 2q of qh; one i8 scale per 16.
+        int hh = j >> 2, q = j & 3;
+        const uchar* ql = blk + 64 * hh + 32 * (q & 1) + 8 * l;
+        const uchar* qh = blk + 128 + 32 * hh + 8 * l;
+        float ds = f16_at(blk + 208) * (float)((char)blk[192 + 8 * hh + 2 * q + (l >> 1)]);
+        int nib = 4 * (q >> 1), hs = 2 * q;
+        for (int v = 0; v < 8; v++) {
+            int x = ((ql[v] >> nib) & 0xF) | (((qh[v] >> hs) & 3) << 4);
+            w[v] = ds * (float)(x - 32);
+        }
+    } else if (qt == QT_Q3_K) {
+        // Sub-block j = (hh, m) like Q2_K; scale index is = 8hh + 2m + half,
+        // 6 bits split as 4 low (scales[is & 7], nibble is >> 3) and 2 high
+        // (scales[8 + (is & 3)], field is >> 2).  hmask bit (4hh + m) set
+        // means the value is not offset by -4.
+        int hh = j >> 2, m = j & 3;
+        int is = 8 * hh + 2 * m + (l >> 1);
+        const uchar* scp = blk + 96;
+        int lo = (scp[is & 7] >> (4 * (is >> 3))) & 0xF;
+        int hi = (scp[8 + (is & 3)] >> (2 * (is >> 2))) & 3;
+        float dl = f16_at(blk + 108) * (float)((lo | (hi << 4)) - 32);
+        uchar mask = (uchar)(1 << (4 * hh + m));
+        int shift = 2 * m;
+        const uchar* qs = blk + 32 + 32 * hh + 8 * l;
+        const uchar* hm = blk + 8 * l;
+        for (int v = 0; v < 8; v++)
+            w[v] = dl * (float)((int)((qs[v] >> shift) & 3) - ((hm[v] & mask) ? 0 : 4));
     } else {
         // Q2_K: sub-block j = (hh, m); its two 16-element halves have their
         // own (scale, min); group l covers qs[8l .. 8l+8) of half l>>1.
