@@ -18,7 +18,11 @@ use joshua::{
     distributed::{
         collective::{AllReduceGroup, MulticastConfig, MAX_PARTICIPANTS},
         discovery::{Discovery, NodeInfo},
-        partition::{plan_partition, LinkObservation, NodeCapacity, TensorWorkload},
+        partition::{
+            plan_partition, resolve_links, LinkDefaults, LinkObservation, NodeCapacity,
+            TensorWorkload,
+        },
+        probe::{measure_links, ProbeConfig, ProbeResponder},
         shard::{dtype_layout, ShardedTensor},
         tcp::{TcpAllReduceGroup, TcpConfig},
     },
@@ -95,10 +99,76 @@ enum Command {
         /// JSON array of NodeCapacity, including per-node runtime reservations.
         #[arg(long)]
         nodes: PathBuf,
-        /// Optional JSON array of measured LinkObservation records.
+        /// JSON arrays of measured LinkObservation records (e.g. `probe` output);
+        /// repeat for files measured from different nodes.
         #[arg(long)]
-        links: Option<PathBuf>,
+        links: Vec<PathBuf>,
+        /// JSON array of constant LinkObservation records that replace measurements.
+        #[arg(long)]
+        link_overrides: Option<PathBuf>,
+        /// Constant latency for node pairs with no measurement or override.
+        #[arg(long, requires = "default_bandwidth")]
+        default_latency_seconds: Option<f64>,
+        /// Constant bandwidth (bytes/s) for node pairs with no measurement or override.
+        #[arg(long, requires = "default_latency_seconds")]
+        default_bandwidth: Option<f64>,
     },
+    /// Answer link probes from peers (run on every node before `probe`).
+    ProbeServe {
+        #[arg(long)]
+        listen: SocketAddr,
+        /// Fresh shared v4 UUID for this probing round.
+        #[arg(long)]
+        session: Uuid,
+        /// Number of probers to serve, one at a time, before exiting.
+        #[arg(long, default_value_t = 1)]
+        connections: usize,
+        #[command(flatten)]
+        probe: ProbeArgs,
+    },
+    /// Measure latency/bandwidth to peers and print LinkObservation JSON for `plan`.
+    Probe {
+        /// This node's ID, as used in the NodeCapacity records.
+        #[arg(long)]
+        local_id: String,
+        /// Peers as ID=ADDRESS of a running `probe-serve`.
+        #[arg(long = "peer", value_parser = parse_peer)]
+        peers: Vec<(String, SocketAddr)>,
+        #[arg(long)]
+        session: Uuid,
+        #[command(flatten)]
+        probe: ProbeArgs,
+    },
+}
+
+#[derive(Args)]
+struct ProbeArgs {
+    #[arg(long, default_value_t = 16)]
+    ping_rounds: usize,
+    /// Bytes per timed bulk transfer (a responder's maximum).
+    #[arg(long, default_value_t = 8 << 20)]
+    bulk_bytes: usize,
+    #[arg(long, default_value_t = 3)]
+    bulk_rounds: usize,
+    #[arg(long, default_value_t = 30)]
+    timeout_seconds: u64,
+}
+
+impl ProbeArgs {
+    fn config(&self) -> ProbeConfig {
+        ProbeConfig {
+            ping_rounds: self.ping_rounds,
+            bulk_bytes: self.bulk_bytes,
+            bulk_rounds: self.bulk_rounds,
+            timeout: Duration::from_secs(self.timeout_seconds),
+        }
+    }
+}
+
+fn parse_peer(value: &str) -> Result<(String, SocketAddr)> {
+    let (id, address) = value.split_once('=').context("peer must be ID=ADDRESS")?;
+    ensure!(!id.is_empty(), "peer ID must not be empty");
+    Ok((id.to_owned(), address.parse()?))
 }
 
 #[derive(Args)]
@@ -194,7 +264,17 @@ fn decode_key(key: &str) -> Result<Vec<u8>> {
         .collect()
 }
 
-fn plan(matrix: &MatrixArgs, nodes: &PathBuf, links: Option<&PathBuf>) -> Result<()> {
+struct LinkInputs<'a> {
+    measured: &'a [PathBuf],
+    overrides: Option<&'a PathBuf>,
+    fallback: Option<LinkDefaults>,
+}
+
+fn read_links(path: &PathBuf) -> Result<Vec<LinkObservation>> {
+    Ok(serde_json::from_reader(BufReader::new(File::open(path)?))?)
+}
+
+fn plan(matrix: &MatrixArgs, nodes: &PathBuf, links: LinkInputs) -> Result<String> {
     let mut file = BufReader::new(File::open(&matrix.model)?);
     let header = gguf_ext::read_header(&mut file)?;
     let tensor = header
@@ -211,15 +291,21 @@ fn plan(matrix: &MatrixArgs, nodes: &PathBuf, links: Option<&PathBuf>) -> Result
         layout.block_bytes as u64,
     )?;
     let nodes: Vec<NodeCapacity> = serde_json::from_reader(BufReader::new(File::open(nodes)?))?;
-    let links: Vec<LinkObservation> = match links {
-        Some(path) => serde_json::from_reader(BufReader::new(File::open(path)?))?,
+    let mut measured = Vec::new();
+    for path in links.measured {
+        measured.extend(read_links(path)?);
+    }
+    let overrides = match links.overrides {
+        Some(path) => read_links(path)?,
         None => Vec::new(),
     };
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&plan_partition(&nodes, &[workload], &links)?)?
-    );
-    Ok(())
+    // Measured values win over the fallback; explicit overrides win over both.
+    let links = resolve_links(&nodes, &measured, &overrides, links.fallback)?;
+    Ok(serde_json::to_string_pretty(&plan_partition(
+        &nodes,
+        &[workload],
+        &links,
+    )?)?)
 }
 
 fn local(matrix: &MatrixArgs, shards: usize) -> Result<Vec<f32>> {
@@ -337,7 +423,60 @@ fn main() -> Result<()> {
             matrix,
             nodes,
             links,
-        } => plan(&matrix, &nodes, links.as_ref()),
+            link_overrides,
+            default_latency_seconds,
+            default_bandwidth,
+        } => {
+            let fallback = match (default_latency_seconds, default_bandwidth) {
+                (Some(latency_seconds), Some(bandwidth_bytes_per_second)) => Some(LinkDefaults {
+                    latency_seconds,
+                    bandwidth_bytes_per_second,
+                }),
+                _ => None,
+            };
+            let inputs = LinkInputs {
+                measured: &links,
+                overrides: link_overrides.as_ref(),
+                fallback,
+            };
+            println!("{}", plan(&matrix, &nodes, inputs)?);
+            Ok(())
+        }
+        Command::ProbeServe {
+            listen,
+            session,
+            connections,
+            probe,
+        } => {
+            ensure!(
+                (1..=1024).contains(&connections),
+                "connections must be in 1..=1024"
+            );
+            let responder =
+                ProbeResponder::bind(listen, session, &key_from_env()?, probe.config())?;
+            for _ in 0..connections {
+                let bytes = responder.serve_one()?;
+                eprintln!("served one prober ({bytes} bulk bytes)");
+            }
+            Ok(())
+        }
+        Command::Probe {
+            local_id,
+            peers,
+            session,
+            probe,
+        } => {
+            ensure!(!peers.is_empty(), "at least one --peer is required");
+            let links = measure_links(
+                &local_id,
+                &peers,
+                session,
+                &key_from_env()?,
+                &probe.config(),
+            )?;
+            println!("{}", serde_json::to_string_pretty(&links)?);
+            Ok(())
+        }
     }
 }
 
@@ -409,6 +548,152 @@ mod tests {
                 peers,
                 ..
             } if peers.len() == 2
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn probed_links_drive_the_plan_and_overrides_replace_them() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("joshua-probe-plan-{}", Uuid::new_v4()));
+        std::fs::create_dir(&dir)?;
+        let result = (|| -> Result<()> {
+            let model = dir.join("model.gguf");
+            fixture(&model)?;
+            let matrix = MatrixArgs {
+                model: model.clone(),
+                tensor: "linear.weight".into(),
+            };
+            let nodes = dir.join("nodes.json");
+            let capacities: Vec<_> = ["a", "b", "c"]
+                .into_iter()
+                .map(|id| NodeCapacity {
+                    id: id.into(),
+                    available_bytes: 1 << 20,
+                    reserved_bytes: 0,
+                    compute_weight: 1.0,
+                })
+                .collect();
+            std::fs::write(&nodes, serde_json::to_vec(&capacities)?)?;
+            let session = Uuid::new_v4();
+            let key = rand::random::<[u8; 32]>();
+            let config = ProbeConfig {
+                ping_rounds: 5,
+                bulk_bytes: 1 << 20,
+                bulk_rounds: 2,
+                timeout: Duration::from_secs(20),
+            };
+            let responders = [
+                ProbeResponder::bind("127.0.0.1:0".parse()?, session, &key, config.clone())?,
+                ProbeResponder::bind("127.0.0.1:0".parse()?, session, &key, config.clone())?,
+            ];
+            let peers = vec![
+                ("b".to_string(), responders[0].local_addr()?),
+                ("c".to_string(), responders[1].local_addr()?),
+            ];
+            let measured = std::thread::scope(|scope| {
+                for responder in &responders {
+                    scope.spawn(move || responder.serve_one().unwrap());
+                }
+                measure_links("a", &peers, session, &key, &config)
+            })?;
+            let measured_path = dir.join("links.json");
+            std::fs::write(&measured_path, serde_json::to_vec(&measured)?)?;
+            let overrides_path = dir.join("overrides.json");
+            std::fs::write(
+                &overrides_path,
+                serde_json::to_vec(&[LinkObservation {
+                    from: "b".into(),
+                    to: "c".into(),
+                    latency_seconds: 0.2,
+                    bandwidth_bytes_per_second: 1e6,
+                }])?,
+            )?;
+            let measured_files = [measured_path];
+            let planned = |overrides: Option<&PathBuf>| -> Result<Vec<u64>> {
+                let json = plan(
+                    &matrix,
+                    &nodes,
+                    LinkInputs {
+                        measured: &measured_files,
+                        overrides,
+                        fallback: None,
+                    },
+                )?;
+                let value: serde_json::Value = serde_json::from_str(&json)?;
+                Ok(value["tensors"][0]["shards"]
+                    .as_array()
+                    .context("shards")?
+                    .iter()
+                    .map(|shard| {
+                        let range = &shard["input_blocks"];
+                        range["end"].as_u64().unwrap() - range["start"].as_u64().unwrap()
+                    })
+                    .collect())
+            };
+            let with_measurements = planned(None)?;
+            assert_eq!(with_measurements.iter().sum::<u64>(), 8);
+            let overridden = planned(Some(&overrides_path))?;
+            // b and c now share a slow constant link, so a receives more blocks.
+            assert!(overridden[0] > overridden[1], "{overridden:?}");
+            Ok(())
+        })();
+        std::fs::remove_dir_all(&dir)?;
+        result
+    }
+
+    #[test]
+    fn probe_cli_parses_peers_and_fallback_pairs() -> Result<()> {
+        let session = Uuid::new_v4().to_string();
+        let parsed = Cli::try_parse_from([
+            "cluster_linear",
+            "probe",
+            "--local-id",
+            "a",
+            "--peer",
+            "b=127.0.0.1:5000",
+            "--peer",
+            "c=127.0.0.1:5001",
+            "--session",
+            &session,
+        ])?;
+        assert!(matches!(
+            parsed.command,
+            Command::Probe { peers, .. } if peers.len() == 2 && peers[1].0 == "c"
+        ));
+        assert!(Cli::try_parse_from([
+            "cluster_linear",
+            "probe",
+            "--local-id",
+            "a",
+            "--peer",
+            "127.0.0.1:5000",
+            "--session",
+            &session,
+        ])
+        .is_err());
+        let base = [
+            "cluster_linear",
+            "plan",
+            "--model",
+            "m.gguf",
+            "--nodes",
+            "n.json",
+            "--default-latency-seconds",
+            "0.001",
+        ];
+        assert!(Cli::try_parse_from(base).is_err());
+        let mut both = base.to_vec();
+        both.extend([
+            "--default-bandwidth",
+            "1e9",
+            "--links",
+            "x.json",
+            "--links",
+            "y.json",
+        ]);
+        assert!(matches!(
+            Cli::try_parse_from(&both)?.command,
+            Command::Plan { links, default_bandwidth: Some(_), .. } if links.len() == 2
         ));
         Ok(())
     }

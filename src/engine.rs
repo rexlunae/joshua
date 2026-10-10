@@ -106,7 +106,7 @@ use std::time::Instant;
 use candle_core::quantized::gguf_file;
 use candle_core::{Device, Tensor};
 use memmap2::Mmap;
-use rand::thread_rng;
+use rand::{rngs::StdRng, thread_rng, SeedableRng};
 use tokenizers::Tokenizer;
 
 use crate::embedding::EmbeddingModel;
@@ -2140,6 +2140,18 @@ impl Engine {
         &self.device
     }
 
+    /// Generations/embeddings executing right now (admitted and holding a
+    /// concurrency permit).  Reported to request routers as live load.
+    pub fn in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::Acquire)
+    }
+
+    /// The admission cap: requests beyond this many in flight are rejected
+    /// with [`JoshuaError::Overloaded`] (see [`Engine::with_max_concurrency`]).
+    pub fn max_concurrency(&self) -> usize {
+        self.max_concurrency
+    }
+
     // ─── Prompt formatting ────────────────────────────────────────────────────
 
     /// Whether the loaded GGUF ships its own chat template.
@@ -2194,9 +2206,18 @@ impl Engine {
     /// whether the tokenizer should still add special tokens: a rendered chat
     /// template already contains every special token (including BOS), so
     /// adding them again would duplicate BOS.
-    fn format_prompt(&self, messages: &[ChatMessage], tools: Option<&[Tool]>) -> (String, bool) {
+    ///
+    /// `vars` are extra template variables
+    /// ([`GenerationOptions::chat_template_kwargs`]); the ChatML fallback has
+    /// no switches and ignores them.
+    fn format_prompt(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        vars: &serde_json::Map<String, serde_json::Value>,
+    ) -> (String, bool) {
         if let Some(template) = &self.chat_template {
-            match template.render(messages, tools) {
+            match template.render_with_vars(messages, tools, vars) {
                 Ok(prompt) => return (prompt, false),
                 Err(e) => {
                     tracing::warn!("GGUF chat template unusable, falling back to ChatML: {e}");
@@ -2233,6 +2254,34 @@ impl Engine {
         tools: Option<&[Tool]>,
         options: &GenerationOptions,
     ) -> Result<(String, UsageInfo, f64, f64)> {
+        self.complete_chat_inner(messages, tools, options, None)
+    }
+
+    /// [`Engine::complete_chat`] that stops decoding once `cancel` is set.
+    ///
+    /// The flag is checked before every decoded token, so a caller whose
+    /// client has gone away (the HTTP server sets it when the request is
+    /// dropped) frees its permit and session after at most one more step
+    /// instead of generating up to `max_tokens` for nobody.  A cancelled
+    /// generation returns the text decoded so far; the pooled session is
+    /// left exactly as after a `max_tokens` stop, so it stays reusable.
+    pub fn complete_chat_cancellable(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        options: &GenerationOptions,
+        cancel: &AtomicBool,
+    ) -> Result<(String, UsageInfo, f64, f64)> {
+        self.complete_chat_inner(messages, tools, options, Some(cancel))
+    }
+
+    fn complete_chat_inner(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        options: &GenerationOptions,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<(String, UsageInfo, f64, f64)> {
         // Multimodal branch: messages carrying images go through a
         // media-capable NPU/llama.cpp plugin session.
         if messages
@@ -2240,11 +2289,13 @@ impl Engine {
             .any(|m| m.images.as_ref().is_some_and(|i| !i.is_empty()))
         {
             let (marked_messages, images) = resolve_message_media(messages)?;
-            let (prompt, _) = self.format_prompt(&marked_messages, tools);
-            return self.complete_media(&prompt, &images, options);
+            let (prompt, _) =
+                self.format_prompt(&marked_messages, tools, &options.chat_template_kwargs);
+            return self.complete_media(&prompt, &images, options, cancel);
         }
-        let (prompt, add_special_tokens) = self.format_prompt(messages, tools);
-        self.complete_with(&prompt, add_special_tokens, options)
+        let (prompt, add_special_tokens) =
+            self.format_prompt(messages, tools, &options.chat_template_kwargs);
+        self.complete_with(&prompt, add_special_tokens, options, cancel)
     }
 
     /// Run a multimodal completion: the plugin tokenises and prefills the
@@ -2254,9 +2305,11 @@ impl Engine {
         prompt: &str,
         images: &[Vec<u8>],
         options: &GenerationOptions,
+        cancel: Option<&AtomicBool>,
     ) -> Result<(String, UsageInfo, f64, f64)> {
         // Bound concurrent heavyweight generations before doing any work.
         let _permit = InFlightGuard::acquire(&self.in_flight, self.max_concurrency)?;
+        self.request_n_ctx(options)?;
         // The plugin owns tokenisation, so the prompt length is unknown here;
         // clamp only to the server ceiling. The decode loop's in-context
         // guard bounds the total length.
@@ -2283,7 +2336,8 @@ impl Engine {
             .media_prefill(prompt, images)
             .and_then(|(n_past, logits)| {
                 let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
-                let outcome = self.decode_loop(&mut session, logits, n_past, &[], options)?;
+                let outcome =
+                    self.decode_loop(&mut session, logits, n_past, &[], options, cancel)?;
                 Ok((n_past, prefill_ms, outcome))
             });
 
@@ -2323,12 +2377,36 @@ impl Engine {
         prompt: &str,
         options: &GenerationOptions,
     ) -> Result<(String, UsageInfo, f64, f64)> {
-        self.complete_with(prompt, true, options)
+        self.complete_with(prompt, true, options, None)
     }
 
-    /// Shared completion path.  `add_special_tokens` controls whether the
-    /// tokenizer wraps the prompt with its special tokens (disabled for
-    /// template-rendered prompts, which already include them).
+    /// The context window a request may use: its
+    /// [`GenerationOptions::context_window`], which must lie within the
+    /// engine's `n_ctx` (the KV cache and RoPE tables are sized at load, so a
+    /// request cannot widen it), or the whole window when unset.
+    fn request_n_ctx(&self, options: &GenerationOptions) -> Result<usize> {
+        match options.context_window {
+            None => Ok(self.n_ctx as usize),
+            Some(0) => Err(JoshuaError::InvalidRequest(
+                "context_window must be at least 1".to_string(),
+            )),
+            Some(w) if w > self.n_ctx => Err(JoshuaError::InvalidRequest(format!(
+                "context_window {w} exceeds the loaded context window of {} tokens \
+                 (raise the server's --n-ctx)",
+                self.n_ctx
+            ))),
+            Some(w) => Ok(w as usize),
+        }
+    }
+
+    /// [`Engine::request_n_ctx`] for an already-validated request: clamps
+    /// instead of failing.
+    fn effective_n_ctx(&self, options: &GenerationOptions) -> usize {
+        options
+            .context_window
+            .map_or(self.n_ctx, |w| w.clamp(1, self.n_ctx)) as usize
+    }
+
     /// Clamp a request's generation length to the server's `max_output_tokens`
     /// ceiling and, when the prompt length is known, the remaining context
     /// window — so a client-supplied `max_tokens` can't force unbounded work.
@@ -2340,18 +2418,23 @@ impl Engine {
         let mut clamped = options.clone();
         let mut cap = clamped.max_tokens.min(self.max_output_tokens);
         if let Some(n_prompt) = prompt_len {
-            let remaining = (self.n_ctx as usize).saturating_sub(n_prompt).max(1) as u32;
+            let n_ctx = self.effective_n_ctx(options);
+            let remaining = n_ctx.saturating_sub(n_prompt).max(1) as u32;
             cap = cap.min(remaining);
         }
         clamped.max_tokens = cap;
         clamped
     }
 
+    /// Shared completion path.  `add_special_tokens` controls whether the
+    /// tokenizer wraps the prompt with its special tokens (disabled for
+    /// template-rendered prompts, which already include them).
     fn complete_with(
         &self,
         prompt: &str,
         add_special_tokens: bool,
         options: &GenerationOptions,
+        cancel: Option<&AtomicBool>,
     ) -> Result<(String, UsageInfo, f64, f64)> {
         // Bound concurrent heavyweight generations before doing any work.
         let _permit = InFlightGuard::acquire(&self.in_flight, self.max_concurrency)?;
@@ -2364,8 +2447,9 @@ impl Engine {
         let prompt_tokens = encoding.get_ids();
         let n_prompt = prompt_tokens.len();
 
-        if n_prompt >= self.n_ctx as usize {
-            return Err(JoshuaError::PromptTooLong(n_prompt, self.n_ctx as usize));
+        let n_ctx = self.request_n_ctx(options)?;
+        if n_prompt >= n_ctx {
+            return Err(JoshuaError::PromptTooLong(n_prompt, n_ctx));
         }
 
         // Clamp the client-supplied generation length to the server ceiling
@@ -2378,7 +2462,7 @@ impl Engine {
         let (mut session, n_reused) = self.acquire_session(prompt_tokens, true)?;
         let was_npu = session.is_npu();
 
-        let result = self.run_generation(&mut session, prompt_tokens, n_reused, options);
+        let result = self.run_generation(&mut session, prompt_tokens, n_reused, options, cancel);
         match result {
             Ok((response, usage, prefill_tps, decode_tps, kv_tokens)) => {
                 // Park the instance for reuse by a follow-up request.
@@ -2403,7 +2487,7 @@ impl Engine {
                 }
                 tracing::warn!("Retrying request on the candle path after NPU failure: {e}");
                 let (mut session, n_reused) = self.acquire_session(prompt_tokens, false)?;
-                match self.run_generation(&mut session, prompt_tokens, n_reused, options) {
+                match self.run_generation(&mut session, prompt_tokens, n_reused, options, cancel) {
                     Ok((response, usage, prefill_tps, decode_tps, kv_tokens)) => {
                         self.release_model(session, kv_tokens);
                         Ok((response, usage, prefill_tps, decode_tps))
@@ -2438,6 +2522,7 @@ impl Engine {
         prompt_tokens: &[u32],
         n_reused: usize,
         options: &GenerationOptions,
+        cancel: Option<&AtomicBool>,
     ) -> Result<(String, UsageInfo, f64, f64, Vec<u32>)> {
         let n_prompt = prompt_tokens.len();
         let new_tokens = &prompt_tokens[n_reused..];
@@ -2501,7 +2586,8 @@ impl Engine {
         let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
 
         // ── Repetition-penalty history ────────────────────────────────────────
-        let outcome = self.decode_loop(model, logits_vec, n_prompt, prompt_tokens, options)?;
+        let outcome =
+            self.decode_loop(model, logits_vec, n_prompt, prompt_tokens, options, cancel)?;
         kv_tokens.extend_from_slice(&outcome.fed_tokens);
 
         // Throughput reflects the tokens actually processed in the prefill
@@ -2558,9 +2644,16 @@ impl Engine {
         start_pos: usize,
         penalty_seed: &[u32],
         options: &GenerationOptions,
+        cancel: Option<&AtomicBool>,
     ) -> Result<DecodeOutcome> {
         let mut text = DecodeText::new(penalty_seed, &self.tokenizer);
-        let mut rng = thread_rng();
+        let mut rng = match options.seed {
+            Some(seed) => StdRng::seed_from_u64(seed),
+            None => {
+                StdRng::from_rng(thread_rng()).map_err(|e| JoshuaError::Inference(e.to_string()))?
+            }
+        };
+        let n_ctx = self.effective_n_ctx(options);
         let mut sampler = SamplingWorkspace::default();
         let mut fed_tokens: Vec<u32> = Vec::new();
         let mut n_cur = start_pos;
@@ -2586,9 +2679,14 @@ impl Engine {
             if text.n_decoded >= options.max_tokens {
                 break;
             }
+            // The requester went away: stop as a `max_tokens` stop would, so
+            // the session's state stays consistent and reusable.
+            if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                break;
+            }
             // Never generate past the context window, regardless of
             // max_tokens — bounds KV-cache growth and matches the RoPE tables.
-            if n_cur >= self.n_ctx as usize {
+            if n_cur >= n_ctx {
                 break;
             }
 
@@ -2629,7 +2727,7 @@ impl Engine {
             drafts.clear();
             if let Some(d) = drafter.as_mut() {
                 let room = (options.max_tokens - text.n_decoded) as usize;
-                let ctx_room = (self.n_ctx as usize).saturating_sub(n_cur + 1);
+                let ctx_room = n_ctx.saturating_sub(n_cur + 1);
                 d.draft_into(draft_len.min(room).min(ctx_room), &mut drafts);
                 if !drafts.is_empty() && !gate.as_mut().is_none_or(SpeculationGate::allow) {
                     drafts.clear();
@@ -2986,7 +3084,9 @@ impl Engine {
         }
     }
 
-    fn remote_only(&self) -> bool {
+    /// Whether every forward pass runs on a remote pipeline (this host has
+    /// no weights to compute with, so embeddings are unavailable).
+    pub fn remote_only(&self) -> bool {
         self.npu.as_ref().is_some_and(|n| n.exclusive)
     }
 
@@ -5005,6 +5105,8 @@ fn squeeze_batch_logits(logits: &Tensor) -> Result<Vec<f32>> {
         probs: Vec<f32>,
         indexed: Vec<(usize, f32)>,
         sorted_idx: Vec<usize>,
+        /// Sorted copy of the penalty window, for occurrence counts.
+        window: Vec<u32>,
     }
 
     enum SamplingKind {
@@ -5059,16 +5161,36 @@ fn squeeze_batch_logits(logits: &Tensor) -> Result<Vec<f32>> {
                 } else {
                     opts.repetition_penalty
                 };
-            let logits = if reppen != 1.0 && !recent_tokens.is_empty() {
+            // OpenAI presence/frequency penalties over the same window,
+            // applied after the multiplicative penalty (llama.cpp's order).
+            // They default to 0 and are honoured at every temperature.
+            let (presence, frequency) = (opts.presence_penalty, opts.frequency_penalty);
+            let additive = presence != 0.0 || frequency != 0.0;
+            let logits = if (reppen != 1.0 || additive) && !recent_tokens.is_empty() {
                 self.adjusted.clear();
                 self.adjusted.extend_from_slice(logits);
                 let v = &mut self.adjusted;
-                for &token in recent_tokens {
-                    if let Some(l) = v.get_mut(token as usize) {
-                        if *l > 0.0 {
-                            *l /= reppen;
-                        } else {
-                            *l *= reppen;
+                if reppen != 1.0 {
+                    for &token in recent_tokens {
+                        if let Some(l) = v.get_mut(token as usize) {
+                            if *l > 0.0 {
+                                *l /= reppen;
+                            } else {
+                                *l *= reppen;
+                            }
+                        }
+                    }
+                }
+                if additive {
+                    // Count occurrences: sort a copy of the (≤ 64-token)
+                    // window and penalise each distinct token once.
+                    let window = &mut self.window;
+                    window.clear();
+                    window.extend_from_slice(recent_tokens);
+                    window.sort_unstable();
+                    for run in window.chunk_by(|a, b| a == b) {
+                        if let Some(l) = v.get_mut(run[0] as usize) {
+                            *l -= presence + frequency * run.len() as f32;
                         }
                     }
                 }
@@ -5333,6 +5455,72 @@ mod tests {
                     expected.sample(&mut b).unwrap()
                 );
             }
+        }
+    }
+
+    #[test]
+    fn presence_and_frequency_penalties_shift_logits_per_occurrence() {
+        let logits = [2.0_f32, 1.9, 1.0, -1.0];
+        // Token 0 seen twice, token 3 once; token 1 never.
+        let recent = [0, 3, 0];
+        let greedy = |presence, frequency| {
+            let opts = GenerationOptions {
+                temperature: 0.0,
+                presence_penalty: presence,
+                frequency_penalty: frequency,
+                ..Default::default()
+            };
+            match SamplingWorkspace::default().fill(&logits, &opts, &recent) {
+                SamplingKind::Greedy(t) => t,
+                SamplingKind::Probs => panic!("temperature 0 is greedy"),
+            }
+        };
+        assert_eq!(greedy(0.0, 0.0), 0, "no penalty: raw argmax");
+        // Presence: 2.0 - 0.2 = 1.8 < 1.9.
+        assert_eq!(greedy(0.2, 0.0), 1);
+        // Frequency counts occurrences: 2.0 - 2 * 0.06 = 1.88 < 1.9, while
+        // a single occurrence (2.0 - 0.06) would not flip it.
+        assert_eq!(greedy(0.0, 0.06), 1);
+        assert_eq!(greedy(0.0, 0.04), 0);
+        // Negative penalties encourage repetition.
+        assert_eq!(greedy(-1.0, 0.0), 0);
+
+        // Exact adjusted values under sampling (reppen off).
+        let opts = GenerationOptions {
+            temperature: 1.0,
+            top_k: 0,
+            top_p: 1.0,
+            min_p: 0.0,
+            repetition_penalty: 1.0,
+            presence_penalty: 0.5,
+            frequency_penalty: 0.25,
+            ..Default::default()
+        };
+        let mut ws = SamplingWorkspace::default();
+        ws.fill(&logits, &opts, &recent);
+        assert_eq!(
+            ws.adjusted,
+            vec![2.0 - 0.5 - 0.5, 1.9, 1.0, -1.0 - 0.5 - 0.25]
+        );
+    }
+
+    #[test]
+    fn zero_additive_penalties_leave_sampling_unchanged() {
+        use rand::{rngs::StdRng, Rng, SeedableRng};
+        let mut rng = StdRng::seed_from_u64(5);
+        let logits: Vec<f32> = (0..300).map(|_| rng.gen_range(-4.0..4.0)).collect();
+        let recent = [1, 2, 2, 250];
+        let base = GenerationOptions::default();
+        let explicit = GenerationOptions {
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            ..GenerationOptions::default()
+        };
+        let a = fresh_distribution(&logits, &base, &recent);
+        let b = fresh_distribution(&logits, &explicit, &recent);
+        match (a.as_ref(), b.as_ref()) {
+            (TokenDistRef::Probs(a), TokenDistRef::Probs(b)) => assert_eq!(a, b),
+            _ => panic!("expected sampled distributions"),
         }
     }
 

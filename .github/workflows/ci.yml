@@ -39,6 +39,36 @@ jobs:
       - name: Test
         run: cargo test --release --tests
 
+  # The joshua-ui web frontend (crates/joshua-ui). It is a workspace member
+  # but not a default member, so the jobs above never build it; this job
+  # checks it for both the host (where its API-client unit tests run) and
+  # the wasm32 target it actually ships on. Unlike the tree-wide lint job,
+  # its clippy and rustfmt checks are gating: the crate starts out clean.
+  ui:
+    name: joshua-ui (host + wasm32)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the pinned toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.89.0
+          targets: wasm32-unknown-unknown
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: rustfmt
+        run: cargo fmt -p joshua-ui -- --check
+      - name: Check (host)
+        run: cargo check -p joshua-ui
+      - name: Check (wasm32)
+        run: cargo check -p joshua-ui --target wasm32-unknown-unknown
+      - name: Test
+        run: cargo test -p joshua-ui
+      - name: Clippy
+        run: |
+          cargo clippy -p joshua-ui --all-targets -- -D warnings
+          cargo clippy -p joshua-ui --target wasm32-unknown-unknown -- -D warnings
+
   # RFC #86's networking and sharding code — discovery, multicast, the
   # partitioner, the shard map and the deepseek4 cluster integration tests —
   # is all behind `--features distributed`. A plain `cargo test --tests` runs

@@ -23,9 +23,11 @@ use tracing_subscriber::EnvFilter;
 mod cluster_cli;
 
 use joshua::{
-    engine::Engine, server, types::GenerationOptions, ChatMessage, ComputeBackend, DensePlacement,
-    EngineOptions, ExpertPlacement, HugePages, MlockMode, MmapMode, PageSize, SpeculativeConfig,
-    VramExpertCache,
+    engine::Engine,
+    server,
+    types::{reasoning_template_kwargs, GenerationOptions, ReasoningEffort},
+    ChatMessage, ComputeBackend, DensePlacement, EngineOptions, ExpertPlacement, HugePages,
+    MlockMode, MmapMode, PageSize, SpeculativeConfig, VramExpertCache,
 };
 
 /// Values for `--device` (CLI form of [`ComputeBackend`]).
@@ -232,8 +234,11 @@ enum Commands {
         /// unauthenticated.
         #[arg(short, long, default_value = "127.0.0.1:8080")]
         addr: String,
-        /// Context window size in tokens.
-        #[arg(long, default_value_t = 4096)]
+        /// Context window size in tokens (prompt + generated), fixed at load:
+        /// it sizes the KV cache and RoPE tables.  A request may ask for a
+        /// smaller window with `context_window` (or `num_ctx`), never a
+        /// larger one.
+        #[arg(long, env = "JOSHUA_N_CTX", default_value_t = 4096)]
         n_ctx: u32,
         /// Compute backend: auto, cpu, metal, or cuda.  An explicit GPU
         /// request fails the load when the backend is not built in or is
@@ -401,6 +406,47 @@ enum Commands {
         #[arg(long, env = "JOSHUA_SKIP_PLACEMENT_BENCH", num_args = 0..=1, default_missing_value = "true")]
         skip_placement_bench: bool,
     },
+    /// Route whole requests across independent `joshua serve` workers.
+    ///
+    /// Each chat/completion/embedding request runs entirely on one worker,
+    /// chosen by model and load; see docs/request-routing.md.
+    Route {
+        /// HTTP addresses of `joshua serve` workers, comma-separated or
+        /// repeated (e.g. `10.0.0.2:8080,10.0.0.3:8080`).
+        #[arg(
+            long = "worker",
+            env = "JOSHUA_ROUTE_WORKERS",
+            value_delimiter = ',',
+            required = true
+        )]
+        workers: Vec<std::net::SocketAddr>,
+        /// Address to listen on.
+        #[arg(short, long, default_value = "127.0.0.1:8090")]
+        addr: String,
+        /// Require this API key from clients on /v1 routes.
+        #[arg(long, env = "JOSHUA_API_KEY")]
+        api_key: Option<String>,
+        /// API key to present to workers (their --api-key).
+        #[arg(long, env = "JOSHUA_WORKER_API_KEY")]
+        worker_api_key: Option<String>,
+        /// Requests in flight per worker; defaults to each worker's reported
+        /// --max-concurrency.
+        #[arg(long)]
+        worker_slots: Option<usize>,
+        /// Requests allowed to wait for a free slot when every worker is
+        /// full; beyond this the router answers 429.
+        #[arg(long, default_value_t = 64)]
+        queue_depth: usize,
+        /// Longest a queued request waits for a slot before a 503, in ms.
+        #[arg(long, default_value_t = 30_000)]
+        queue_timeout_ms: u64,
+        /// Interval between worker health probes, in ms.
+        #[arg(long, default_value_t = 2_000)]
+        health_interval_ms: u64,
+        /// Timeout for connecting to a worker and for a health probe, in ms.
+        #[arg(long, default_value_t = 2_000)]
+        connect_timeout_ms: u64,
+    },
     /// Run a single chat completion and print the response.
     Run {
         /// Path to the GGUF model file.
@@ -414,8 +460,19 @@ enum Commands {
         /// Sampling temperature (0 = greedy).
         #[arg(long, default_value_t = 0.7)]
         temperature: f32,
-        /// Context window size in tokens.
-        #[arg(long, default_value_t = 4096)]
+        /// Sampler seed, for reproducible sampled output.
+        #[arg(long)]
+        seed: Option<u64>,
+        /// Reasoning effort for models whose chat template takes one or a
+        /// thinking switch: none, minimal, low, medium, high, xhigh.
+        #[arg(long, value_parser = parse_reasoning_effort)]
+        reasoning_effort: Option<ReasoningEffort>,
+        /// Turn thinking on or off on models with a switch (Qwen3, GLM-4.5,
+        /// DeepSeek-V3.1, …).
+        #[arg(long)]
+        enable_thinking: Option<bool>,
+        /// Context window size in tokens (prompt + generated).
+        #[arg(long, env = "JOSHUA_N_CTX", default_value_t = 4096)]
         n_ctx: u32,
         /// Compute backend: auto, cpu, metal, or cuda.  An explicit GPU
         /// request fails the load when the backend is not built in or is
@@ -767,6 +824,31 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
+        Commands::Route {
+            workers,
+            addr,
+            api_key,
+            worker_api_key,
+            worker_slots,
+            queue_depth,
+            queue_timeout_ms,
+            health_interval_ms,
+            connect_timeout_ms,
+        } => {
+            use std::time::Duration;
+            let config = joshua::coordinator::CoordinatorConfig {
+                api_key,
+                worker_api_key,
+                worker_slots,
+                queue_depth,
+                queue_timeout: Duration::from_millis(queue_timeout_ms),
+                health_interval: Duration::from_millis(health_interval_ms.max(1)),
+                connect_timeout: Duration::from_millis(connect_timeout_ms.max(1)),
+                ..joshua::coordinator::CoordinatorConfig::new(workers)
+            };
+            joshua::coordinator::serve(config, &addr).await?;
+        }
+
         Commands::Transcribe {
             model,
             audio,
@@ -785,6 +867,9 @@ async fn main() -> anyhow::Result<()> {
             prompt,
             max_tokens,
             temperature,
+            seed,
+            reasoning_effort,
+            enable_thinking,
             n_ctx,
             device,
             huge_pages,
@@ -853,6 +938,12 @@ async fn main() -> anyhow::Result<()> {
             let options = GenerationOptions {
                 max_tokens,
                 temperature,
+                seed,
+                chat_template_kwargs: reasoning_template_kwargs(
+                    reasoning_effort,
+                    enable_thinking,
+                    None,
+                ),
                 ..GenerationOptions::default()
             };
             let (text, usage, prefill_tps, decode_tps) = engine.complete(&messages, &options)?;
@@ -901,6 +992,13 @@ async fn main() -> anyhow::Result<()> {
 /// Translate the `--mmap` flag: passing it makes memory mapping an explicit
 /// request, so a model file that cannot be mapped usefully fails the load
 /// instead of merely warning.
+/// Parse a `--reasoning-effort` value with the API's spelling.
+fn parse_reasoning_effort(s: &str) -> Result<ReasoningEffort, String> {
+    serde_json::from_value(serde_json::Value::String(s.to_ascii_lowercase())).map_err(|_| {
+        format!("unknown reasoning effort `{s}` (none, minimal, low, medium, high, xhigh)")
+    })
+}
+
 fn mmap_mode(explicit: bool) -> MmapMode {
     if explicit {
         MmapMode::Required
@@ -1050,6 +1148,37 @@ mod tests {
         assert!(Cli::try_parse_from(run.into_iter().chain([
             "--mlock-hot-weights=required", "--mlock-weight-budget", "18446744073709551615",
         ])).is_err());
+    }
+
+    #[test]
+    fn route_cli_splits_the_worker_list() {
+        let cli = Cli::try_parse_from([
+            "joshua",
+            "route",
+            "--worker",
+            "10.0.0.1:1,10.0.0.2:2",
+            "--worker",
+            "10.0.0.3:3",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Route {
+                workers,
+                queue_depth,
+                ..
+            } => {
+                let expected: Vec<std::net::SocketAddr> =
+                    ["10.0.0.1:1", "10.0.0.2:2", "10.0.0.3:3"]
+                        .map(|a| a.parse().unwrap())
+                        .into();
+                assert_eq!(workers, expected);
+                assert_eq!(queue_depth, 64);
+            }
+            _ => panic!("expected the route subcommand"),
+        }
+        assert!(Cli::try_parse_from(["joshua", "route"]).is_err());
+        // Workers are addresses, like the controller's --worker list.
+        assert!(Cli::try_parse_from(["joshua", "route", "--worker", "http://a:1"]).is_err());
     }
 
     /// A model that fits in RAM is prefetched whole; a model larger than RAM

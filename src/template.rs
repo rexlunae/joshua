@@ -11,7 +11,9 @@
 //! templates routinely use, and the `raise_exception` helper they call for
 //! unsupported message sequences.
 
-use minijinja::{context, Environment, Error, ErrorKind, Value};
+use std::collections::BTreeMap;
+
+use minijinja::{Environment, Error, ErrorKind, Value};
 use serde::Serialize;
 
 use crate::types::{ChatMessage, Tool};
@@ -61,6 +63,22 @@ impl ChatTemplate {
         messages: &[ChatMessage],
         tools: Option<&[Tool]>,
     ) -> Result<String, String> {
+        self.render_with_vars(messages, tools, &serde_json::Map::new())
+    }
+
+    /// [`ChatTemplate::render`] with extra template variables — the
+    /// `chat_template_kwargs` that carry per-model switches such as Qwen3's
+    /// `enable_thinking` or gpt-oss's `reasoning_effort`.
+    ///
+    /// The engine-supplied variables (`messages`, `tools`,
+    /// `add_generation_prompt`, `bos_token`, `eos_token`) always win over a
+    /// same-named entry in `vars`.
+    pub fn render_with_vars(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        vars: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<String, String> {
         #[derive(Serialize)]
         struct Msg<'a> {
             role: &'a str,
@@ -92,27 +110,28 @@ impl ChatTemplate {
         env.add_template("chat", &self.source)
             .map_err(|e| format!("chat template failed to parse: {e}"))?;
 
+        let mut ctx: BTreeMap<String, Value> = vars
+            .iter()
+            .map(|(k, v)| (k.clone(), Value::from_serialize(v)))
+            .collect();
+        ctx.insert("messages".into(), Value::from_serialize(&msgs));
+        ctx.insert("add_generation_prompt".into(), Value::from(true));
+        ctx.insert("bos_token".into(), Value::from(self.bos_token.as_str()));
+        ctx.insert("eos_token".into(), Value::from(self.eos_token.as_str()));
         // Only define `tools` when the request supplied some: templates
         // distinguish "no tools" via both `is defined` and truthiness checks.
-        let ctx: Value = match tools {
-            Some(tools) => context! {
-                messages => msgs,
-                add_generation_prompt => true,
-                bos_token => self.bos_token,
-                eos_token => self.eos_token,
-                tools => tools,
-            },
-            None => context! {
-                messages => msgs,
-                add_generation_prompt => true,
-                bos_token => self.bos_token,
-                eos_token => self.eos_token,
-            },
-        };
+        match tools {
+            Some(tools) => {
+                ctx.insert("tools".into(), Value::from_serialize(tools));
+            }
+            None => {
+                ctx.remove("tools");
+            }
+        }
 
         env.get_template("chat")
             .expect("template was just added")
-            .render(ctx)
+            .render(Value::from(ctx))
             .map_err(|e| format!("chat template failed to render: {e}"))
     }
 }
@@ -233,5 +252,141 @@ mod tests {
             .render(&[msg("user", "go"), assistant, tool_result], None)
             .unwrap();
         assert_eq!(out, "go;calls:1;result[call_1]:42;");
+    }
+
+    // ── Reasoning switches (#144) ──────────────────────────────────────────
+
+    use crate::types::{reasoning_template_kwargs, ReasoningEffort};
+
+    /// The generation-prompt tail of Qwen3's hybrid-thinking template.
+    const QWEN3_TAIL: &str = "{%- for message in messages %}{{- '<|im_start|>' + message.role + '\\n' + message.content + '<|im_end|>' + '\\n' }}{%- endfor %}{%- if add_generation_prompt %}{{- '<|im_start|>assistant\\n' }}{%- if enable_thinking is defined and enable_thinking is false %}{{- '<think>\\n\\n</think>\\n\\n' }}{%- endif %}{%- endif %}";
+
+    /// DeepSeek-V3.1's switch: thinking defaults off unless `thinking` is set.
+    const DEEPSEEK_V31_TAIL: &str = "{% if not thinking is defined %}{% set thinking = false %}{% endif %}{% for message in messages %}<｜User｜>{{ message.content }}{% endfor %}{% if add_generation_prompt %}<｜Assistant｜>{% if thinking %}<think>{% else %}</think>{% endif %}{% endif %}";
+
+    /// gpt-oss's system header: `Reasoning: {{ reasoning_effort }}`, medium
+    /// by default.
+    const GPT_OSS_HEAD: &str = "<|start|>system<|message|>Reasoning: {% if reasoning_effort is defined %}{{ reasoning_effort }}{% else %}medium{% endif %}<|end|>{% for message in messages %}<|start|>{{ message.role }}<|message|>{{ message.content }}<|end|>{% endfor %}<|start|>assistant";
+
+    /// Seed-OSS reads an integer `thinking_budget`.
+    const SEED_OSS_BUDGET: &str = "{% if thinking_budget is defined %}budget={{ thinking_budget }}{% else %}unlimited{% endif %}";
+
+    fn kwargs(
+        effort: Option<ReasoningEffort>,
+        enabled: Option<bool>,
+    ) -> serde_json::Map<String, serde_json::Value> {
+        reasoning_template_kwargs(effort, enabled, None)
+    }
+
+    #[test]
+    fn qwen3_enable_thinking_switch() {
+        let t = ChatTemplate::new(QWEN3_TAIL, "", "<|im_end|>");
+        let m = [msg("user", "hi")];
+        let default = t.render(&m, None).unwrap();
+        let on = t
+            .render_with_vars(&m, None, &kwargs(None, Some(true)))
+            .unwrap();
+        let off = t
+            .render_with_vars(&m, None, &kwargs(None, Some(false)))
+            .unwrap();
+        let effort_none = t
+            .render_with_vars(&m, None, &kwargs(Some(ReasoningEffort::None), None))
+            .unwrap();
+        assert_eq!(
+            default,
+            "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n"
+        );
+        assert_eq!(on, default, "thinking on is the Qwen3 default");
+        assert_eq!(off, format!("{default}<think>\n\n</think>\n\n"));
+        assert_eq!(effort_none, off, "reasoning_effort=none turns thinking off");
+    }
+
+    #[test]
+    fn deepseek_v31_thinking_switch() {
+        let t = ChatTemplate::new(DEEPSEEK_V31_TAIL, "", "");
+        let m = [msg("user", "hi")];
+        assert!(t
+            .render(&m, None)
+            .unwrap()
+            .ends_with("<｜Assistant｜></think>"));
+        let high = t
+            .render_with_vars(&m, None, &kwargs(Some(ReasoningEffort::High), None))
+            .unwrap();
+        assert!(high.ends_with("<｜Assistant｜><think>"), "got: {high}");
+        let off = t
+            .render_with_vars(&m, None, &kwargs(None, Some(false)))
+            .unwrap();
+        assert!(off.ends_with("<｜Assistant｜></think>"), "got: {off}");
+    }
+
+    #[test]
+    fn gpt_oss_reasoning_effort_levels() {
+        let t = ChatTemplate::new(GPT_OSS_HEAD, "", "");
+        let m = [msg("user", "hi")];
+        let level = |vars| {
+            let out = t.render_with_vars(&m, None, &vars).unwrap();
+            out["<|start|>system<|message|>Reasoning: ".len()..]
+                .split('<')
+                .next()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(level(serde_json::Map::new()), "medium");
+        for (effort, want) in [
+            (ReasoningEffort::None, "low"),
+            (ReasoningEffort::Minimal, "low"),
+            (ReasoningEffort::Low, "low"),
+            (ReasoningEffort::Medium, "medium"),
+            (ReasoningEffort::High, "high"),
+            (ReasoningEffort::Xhigh, "high"),
+        ] {
+            assert_eq!(level(kwargs(Some(effort), None)), want, "{effort:?}");
+        }
+        // Thinking switched off without an effort: as low as gpt-oss goes.
+        assert_eq!(level(kwargs(None, Some(false))), "low");
+        // Thinking switched on without an effort keeps the template default.
+        assert_eq!(level(kwargs(None, Some(true))), "medium");
+    }
+
+    #[test]
+    fn templates_without_a_switch_ignore_reasoning_vars() {
+        let t = ChatTemplate::new(LLAMA3, "<|begin_of_text|>", "<|eot_id|>");
+        let m = [msg("user", "Hi!")];
+        let plain = t.render(&m, None).unwrap();
+        for vars in [
+            kwargs(Some(ReasoningEffort::High), None),
+            kwargs(None, Some(false)),
+            reasoning_template_kwargs(None, None, Some(512)),
+        ] {
+            assert_eq!(t.render_with_vars(&m, None, &vars).unwrap(), plain);
+        }
+    }
+
+    #[test]
+    fn thinking_budget_reaches_seed_oss_style_templates() {
+        let t = ChatTemplate::new(SEED_OSS_BUDGET, "", "");
+        let m = [msg("user", "hi")];
+        assert_eq!(t.render(&m, None).unwrap(), "unlimited");
+        let vars = reasoning_template_kwargs(None, None, Some(512));
+        assert_eq!(t.render_with_vars(&m, None, &vars).unwrap(), "budget=512");
+    }
+
+    #[test]
+    fn engine_variables_win_over_template_kwargs() {
+        let t = ChatTemplate::new(
+            "{{ bos_token }}|{{ add_generation_prompt }}|{{ messages | length }}|{{ tools is defined }}|{{ custom }}",
+            "<s>",
+            "",
+        );
+        let mut vars = serde_json::Map::new();
+        vars.insert("bos_token".into(), "X".into());
+        vars.insert("add_generation_prompt".into(), false.into());
+        vars.insert("messages".into(), serde_json::json!([]));
+        vars.insert("tools".into(), serde_json::json!([1]));
+        vars.insert("custom".into(), "ok".into());
+        let out = t
+            .render_with_vars(&[msg("user", "hi")], None, &vars)
+            .unwrap();
+        assert_eq!(out, "<s>|True|1|False|ok");
     }
 }

@@ -74,6 +74,8 @@ async fn a_server_without_a_model_loads_and_unloads_through_the_api() {
 
     let (status, body) = call(&app, "POST", "/v1/completions", completion("tiny")).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    let (status, _) = call(&app, "GET", "/v1/worker/info", serde_json::Value::Null).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
 
     let (status, body) = call(
         &app,
@@ -84,6 +86,10 @@ async fn a_server_without_a_model_loads_and_unloads_through_the_api() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["id"], "tiny");
+    // A `joshua route` coordinator sees the loaded model.
+    let (status, body) = call(&app, "GET", "/v1/worker/info", serde_json::Value::Null).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["model"], "tiny");
     let (status, _) = call(
         &app,
         "POST",
