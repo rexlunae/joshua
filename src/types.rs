@@ -331,6 +331,26 @@ pub fn reasoning_template_kwargs(
     kwargs
 }
 
+/// [`reasoning_template_kwargs`] for callers outside the HTTP request path
+/// (the CLI): rejects an `effort` and `enabled` that disagree about whether
+/// reasoning is on, as [`ChatCompletionRequest`]'s validation does, instead of
+/// rendering both and letting each template pick a different one.
+pub fn checked_reasoning_template_kwargs(
+    effort: Option<ReasoningEffort>,
+    enabled: Option<bool>,
+    budget: Option<u32>,
+) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    if let (Some(e), Some(on)) = (effort, enabled) {
+        if e.enables_thinking() != on {
+            return Err(
+                "reasoning_effort and enable_thinking disagree about whether reasoning is on"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(reasoning_template_kwargs(effort, enabled, budget))
+}
+
 // ─── Usage statistics ─────────────────────────────────────────────────────────
 
 /// Token-usage statistics returned with every response.
@@ -996,6 +1016,32 @@ mod tests {
         options(
             json!({"reasoning_effort": "low", "reasoning": {"effort": "low", "enabled": true}}),
         );
+    }
+
+    /// Regression (Devin review on #172): the CLI's `--reasoning-effort` and
+    /// `--enable-thinking` must agree, as the HTTP spellings must.
+    #[test]
+    fn checked_reasoning_kwargs_reject_contradictory_cli_flags() {
+        let err = checked_reasoning_template_kwargs(Some(ReasoningEffort::High), Some(false), None)
+            .unwrap_err();
+        assert!(err.contains("disagree"), "{err}");
+        assert!(
+            checked_reasoning_template_kwargs(Some(ReasoningEffort::None), Some(true), None)
+                .is_err()
+        );
+        // Agreeing or single flags render exactly as the unchecked helper.
+        for (effort, enabled) in [
+            (Some(ReasoningEffort::High), Some(true)),
+            (Some(ReasoningEffort::None), Some(false)),
+            (Some(ReasoningEffort::Low), None),
+            (None, Some(false)),
+            (None, None),
+        ] {
+            assert_eq!(
+                checked_reasoning_template_kwargs(effort, enabled, Some(7)).unwrap(),
+                reasoning_template_kwargs(effort, enabled, Some(7))
+            );
+        }
     }
 
     #[test]

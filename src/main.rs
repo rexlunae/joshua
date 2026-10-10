@@ -25,7 +25,7 @@ mod cluster_cli;
 use joshua::{
     engine::Engine,
     server,
-    types::{reasoning_template_kwargs, GenerationOptions, ReasoningEffort},
+    types::{checked_reasoning_template_kwargs, GenerationOptions, ReasoningEffort},
     ChatMessage, ComputeBackend, DensePlacement, EngineOptions, ExpertPlacement, HugePages,
     MlockMode, MmapMode, PageSize, SpeculativeConfig, VramExpertCache,
 };
@@ -906,6 +906,10 @@ async fn main() -> anyhow::Result<()> {
             npu_plugin,
             npu_in_process,
         } => {
+            // Reject contradictory reasoning flags before loading the model.
+            let chat_template_kwargs =
+                checked_reasoning_template_kwargs(reasoning_effort, enable_thinking, None)
+                    .map_err(anyhow::Error::msg)?;
             if skip_placement_bench {
                 std::env::set_var("JOSHUA_SKIP_PLACEMENT_BENCH", "1");
             }
@@ -954,11 +958,7 @@ async fn main() -> anyhow::Result<()> {
                 max_tokens,
                 temperature,
                 seed,
-                chat_template_kwargs: reasoning_template_kwargs(
-                    reasoning_effort,
-                    enable_thinking,
-                    None,
-                ),
+                chat_template_kwargs,
                 ..GenerationOptions::default()
             };
             let (text, usage, prefill_tps, decode_tps) = engine.complete(&messages, &options)?;

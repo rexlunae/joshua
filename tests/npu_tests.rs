@@ -326,6 +326,57 @@ fn engine_generates_from_an_image_message() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// Regression (Devin review on #172): the media prompt's length is only
+/// known after the plugin prefills it, and a prompt that already fills the
+/// request's `context_window` must be rejected rather than returning an
+/// empty "successful" completion. The session stays usable afterwards.
+#[test]
+fn media_prompt_longer_than_the_request_window_is_rejected() {
+    let dir = tiny_model_dir("npu-media-window");
+    let engine = Engine::with_n_ctx(&dir, 64)
+        .expect("engine should load")
+        .with_npu_backend(Arc::new(shim_backend()));
+
+    let image: Vec<u8> = vec![1, 2, 3, 4];
+    let mut message = joshua::ChatMessage::text("user", "look");
+    message.images = Some(vec![format!("data:image/png;base64,{}", {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(&image)
+    })]);
+    // "hello <marker>\nlook world": 3 words + 3 image positions = 6.
+    let n_prompt = mock_media_history("hello <__media__>\nlook world", &[&image]).len();
+
+    let options = GenerationOptions {
+        max_tokens: 3,
+        temperature: 0.0,
+        repetition_penalty: 1.0,
+        context_window: Some(n_prompt as u32),
+        ..Default::default()
+    };
+    let err = engine
+        .complete(std::slice::from_ref(&message), &options)
+        .map(|_| ())
+        .unwrap_err();
+    assert!(
+        matches!(err, joshua::JoshuaError::PromptTooLong(n, w) if n == n_prompt && w == n_prompt),
+        "expected PromptTooLong({n_prompt}, {n_prompt}), got: {err}"
+    );
+
+    // A window with room still generates (the rejection did not trip the
+    // backend's circuit breaker or leak the session).
+    let options = GenerationOptions {
+        context_window: Some(n_prompt as u32 + 2),
+        ..options
+    };
+    let (_, usage, _, _) = engine
+        .complete(&[message], &options)
+        .expect("completion within the window");
+    assert_eq!(usage.prompt_tokens as usize, n_prompt);
+    assert_eq!(usage.completion_tokens, 2, "decode stops at the window");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn images_without_a_media_backend_are_rejected_clearly() {
     let dir = tiny_model_dir("npu-media-none");

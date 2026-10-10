@@ -2317,10 +2317,11 @@ impl Engine {
     ) -> Result<(String, UsageInfo, f64, f64)> {
         // Bound concurrent heavyweight generations before doing any work.
         let _permit = InFlightGuard::acquire(&self.in_flight, self.max_concurrency)?;
-        self.request_n_ctx(options)?;
+        let n_ctx = self.request_n_ctx(options)?;
         // The plugin owns tokenisation, so the prompt length is unknown here;
-        // clamp only to the server ceiling. The decode loop's in-context
-        // guard bounds the total length.
+        // clamp only to the server ceiling. The prompt is checked against the
+        // request's window once prefill reports its length, and the decode
+        // loop's in-context guard bounds the total length.
         let options = &self.clamp_options(options, None);
 
         // Acquire an NPU session (never by token prefix — the plugin owns
@@ -2343,6 +2344,12 @@ impl Engine {
         let result = session
             .media_prefill(prompt, images)
             .and_then(|(n_past, logits)| {
+                // Only now is the prompt's length (text plus media positions)
+                // known: reject it as the text path does rather than
+                // returning an empty completion from a full window.
+                if n_past >= n_ctx {
+                    return Err(JoshuaError::PromptTooLong(n_past, n_ctx));
+                }
                 let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
                 let outcome =
                     self.decode_loop(&mut session, logits, n_past, &[], options, cancel)?;
@@ -2368,6 +2375,14 @@ impl Engine {
                     total_tokens: n_past as u32 + outcome.n_decoded,
                 };
                 Ok((outcome.response, usage, prefill_tps, outcome.decode_tps))
+            }
+            Err(e @ JoshuaError::PromptTooLong(..)) => {
+                // A request error, not a backend fault: keep the session and
+                // leave the circuit breaker alone.
+                if session.clear_state() {
+                    self.release_model(session, Vec::new());
+                }
+                Err(e)
             }
             Err(e) => {
                 if let Some(npu) = &self.npu {
