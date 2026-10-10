@@ -171,6 +171,11 @@ tower-http = { version = "0.6", features = ["cors"] }
 uuid = { version = "1", features = ["v4"] }
 futures-util = "0.3"
 tokio-stream = "0.1"
+# HTTP/1 client for `joshua route` (request-level routing to independent
+# workers).  Already in the tree through axum; only the client half is added.
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
 
 # HTTPS support (the optional `tls` feature). axum-server is built without
 # a crypto provider so we can pick ring (needs only a C compiler) over the

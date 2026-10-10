@@ -2124,6 +2124,18 @@ impl Engine {
         &self.device
     }
 
+    /// Generations/embeddings executing right now (admitted and holding a
+    /// concurrency permit).  Reported to request routers as live load.
+    pub fn in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::Acquire)
+    }
+
+    /// The admission cap: requests beyond this many in flight are rejected
+    /// with [`JoshuaError::Overloaded`] (see [`Engine::with_max_concurrency`]).
+    pub fn max_concurrency(&self) -> usize {
+        self.max_concurrency
+    }
+
     // ─── Prompt formatting ────────────────────────────────────────────────────
 
     /// Whether the loaded GGUF ships its own chat template.
@@ -2226,6 +2238,34 @@ impl Engine {
         tools: Option<&[Tool]>,
         options: &GenerationOptions,
     ) -> Result<(String, UsageInfo, f64, f64)> {
+        self.complete_chat_inner(messages, tools, options, None)
+    }
+
+    /// [`Engine::complete_chat`] that stops decoding once `cancel` is set.
+    ///
+    /// The flag is checked before every decoded token, so a caller whose
+    /// client has gone away (the HTTP server sets it when the request is
+    /// dropped) frees its permit and session after at most one more step
+    /// instead of generating up to `max_tokens` for nobody.  A cancelled
+    /// generation returns the text decoded so far; the pooled session is
+    /// left exactly as after a `max_tokens` stop, so it stays reusable.
+    pub fn complete_chat_cancellable(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        options: &GenerationOptions,
+        cancel: &AtomicBool,
+    ) -> Result<(String, UsageInfo, f64, f64)> {
+        self.complete_chat_inner(messages, tools, options, Some(cancel))
+    }
+
+    fn complete_chat_inner(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        options: &GenerationOptions,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<(String, UsageInfo, f64, f64)> {
         // Multimodal branch: messages carrying images go through a
         // media-capable NPU/llama.cpp plugin session.
         if messages
@@ -2235,11 +2275,11 @@ impl Engine {
             let (marked_messages, images) = resolve_message_media(messages)?;
             let (prompt, _) =
                 self.format_prompt(&marked_messages, tools, &options.chat_template_kwargs);
-            return self.complete_media(&prompt, &images, options);
+            return self.complete_media(&prompt, &images, options, cancel);
         }
         let (prompt, add_special_tokens) =
             self.format_prompt(messages, tools, &options.chat_template_kwargs);
-        self.complete_with(&prompt, add_special_tokens, options)
+        self.complete_with(&prompt, add_special_tokens, options, cancel)
     }
 
     /// Run a multimodal completion: the plugin tokenises and prefills the
@@ -2249,6 +2289,7 @@ impl Engine {
         prompt: &str,
         images: &[Vec<u8>],
         options: &GenerationOptions,
+        cancel: Option<&AtomicBool>,
     ) -> Result<(String, UsageInfo, f64, f64)> {
         // Bound concurrent heavyweight generations before doing any work.
         let _permit = InFlightGuard::acquire(&self.in_flight, self.max_concurrency)?;
@@ -2279,7 +2320,8 @@ impl Engine {
             .media_prefill(prompt, images)
             .and_then(|(n_past, logits)| {
                 let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
-                let outcome = self.decode_loop(&mut session, logits, n_past, &[], options)?;
+                let outcome =
+                    self.decode_loop(&mut session, logits, n_past, &[], options, cancel)?;
                 Ok((n_past, prefill_ms, outcome))
             });
 
@@ -2319,7 +2361,7 @@ impl Engine {
         prompt: &str,
         options: &GenerationOptions,
     ) -> Result<(String, UsageInfo, f64, f64)> {
-        self.complete_with(prompt, true, options)
+        self.complete_with(prompt, true, options, None)
     }
 
     /// The context window a request may use: its
@@ -2376,6 +2418,7 @@ impl Engine {
         prompt: &str,
         add_special_tokens: bool,
         options: &GenerationOptions,
+        cancel: Option<&AtomicBool>,
     ) -> Result<(String, UsageInfo, f64, f64)> {
         // Bound concurrent heavyweight generations before doing any work.
         let _permit = InFlightGuard::acquire(&self.in_flight, self.max_concurrency)?;
@@ -2403,7 +2446,7 @@ impl Engine {
         let (mut session, n_reused) = self.acquire_session(prompt_tokens, true)?;
         let was_npu = session.is_npu();
 
-        let result = self.run_generation(&mut session, prompt_tokens, n_reused, options);
+        let result = self.run_generation(&mut session, prompt_tokens, n_reused, options, cancel);
         match result {
             Ok((response, usage, prefill_tps, decode_tps, kv_tokens)) => {
                 // Park the instance for reuse by a follow-up request.
@@ -2428,7 +2471,7 @@ impl Engine {
                 }
                 tracing::warn!("Retrying request on the candle path after NPU failure: {e}");
                 let (mut session, n_reused) = self.acquire_session(prompt_tokens, false)?;
-                match self.run_generation(&mut session, prompt_tokens, n_reused, options) {
+                match self.run_generation(&mut session, prompt_tokens, n_reused, options, cancel) {
                     Ok((response, usage, prefill_tps, decode_tps, kv_tokens)) => {
                         self.release_model(session, kv_tokens);
                         Ok((response, usage, prefill_tps, decode_tps))
@@ -2463,6 +2506,7 @@ impl Engine {
         prompt_tokens: &[u32],
         n_reused: usize,
         options: &GenerationOptions,
+        cancel: Option<&AtomicBool>,
     ) -> Result<(String, UsageInfo, f64, f64, Vec<u32>)> {
         let n_prompt = prompt_tokens.len();
         let new_tokens = &prompt_tokens[n_reused..];
@@ -2526,7 +2570,8 @@ impl Engine {
         let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
 
         // ── Repetition-penalty history ────────────────────────────────────────
-        let outcome = self.decode_loop(model, logits_vec, n_prompt, prompt_tokens, options)?;
+        let outcome =
+            self.decode_loop(model, logits_vec, n_prompt, prompt_tokens, options, cancel)?;
         kv_tokens.extend_from_slice(&outcome.fed_tokens);
 
         // Throughput reflects the tokens actually processed in the prefill
@@ -2583,6 +2628,7 @@ impl Engine {
         start_pos: usize,
         penalty_seed: &[u32],
         options: &GenerationOptions,
+        cancel: Option<&AtomicBool>,
     ) -> Result<DecodeOutcome> {
         let mut text = DecodeText::new(penalty_seed, &self.tokenizer);
         let mut rng = match options.seed {
@@ -2615,6 +2661,11 @@ impl Engine {
 
         loop {
             if text.n_decoded >= options.max_tokens {
+                break;
+            }
+            // The requester went away: stop as a `max_tokens` stop would, so
+            // the session's state stays consistent and reusable.
+            if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
                 break;
             }
             // Never generate past the context window, regardless of

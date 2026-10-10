@@ -8,8 +8,15 @@
 //! - `POST /v1/embeddings`            — dense text embeddings
 //! - `POST /v1/audio/transcriptions`  — Whisper speech-to-text (when a
 //!   whisper model is configured)
+//! - `GET  /v1/worker/info`           — worker identity and live load for a
+//!   `joshua route` coordinator (see [`crate::coordinator`])
+//!
+//! Chat and text completions stop decoding when the HTTP request is dropped
+//! (the client, or a coordinator proxying for it, disconnected), so a
+//! cancelled request releases its concurrency permit promptly.
 
 use std::convert::Infallible;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -30,6 +37,7 @@ use tokio::net::TcpListener;
 use tower_http::cors::CorsLayer;
 use uuid::Uuid;
 
+use crate::coordinator::{WorkerCapabilities, WorkerInfo, WORKER_PROTOCOL_VERSION};
 use crate::engine::Engine;
 use crate::error::JoshuaError;
 use crate::whisper::WhisperEngine;
@@ -65,6 +73,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/v1/completions", post(completions))
         .route("/v1/embeddings", post(embeddings))
         .route("/v1/audio/transcriptions", post(transcriptions))
+        .route(crate::coordinator::WORKER_INFO_PATH, get(worker_info))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             require_api_key,
@@ -105,7 +114,7 @@ async fn require_api_key(State(state): State<AppState>, req: Request, next: Next
 /// digests are then compared with a branch-free fold.  Timing can therefore
 /// only reveal information about SHA-256 digests, which is useless without
 /// inverting the hash.
-fn api_keys_match(provided: &[u8], expected: &[u8]) -> bool {
+pub(crate) fn api_keys_match(provided: &[u8], expected: &[u8]) -> bool {
     use sha2::{Digest, Sha256};
 
     let provided = Sha256::digest(provided);
@@ -175,6 +184,63 @@ async fn health() -> Json<serde_json::Value> {
     Json(json!({"status": "ok"}))
 }
 
+/// `GET /v1/worker/info` — what a `joshua route` coordinator needs to admit
+/// requests here: protocol version, model identity, context limit, backend,
+/// and the admission cap with the current in-flight count.
+async fn worker_info(State(state): State<AppState>) -> Json<WorkerInfo> {
+    let engine = &state.engine;
+    Json(WorkerInfo {
+        protocol_version: WORKER_PROTOCOL_VERSION,
+        model: engine.model_name().to_string(),
+        n_ctx: engine.n_ctx(),
+        backend: device_label(engine.device()).to_string(),
+        max_concurrency: engine.max_concurrency(),
+        in_flight: engine.in_flight(),
+        capabilities: WorkerCapabilities {
+            chat: true,
+            completions: true,
+            embeddings: true,
+            transcriptions: state.whisper.is_some(),
+            streaming: true,
+            tools: true,
+        },
+    })
+}
+
+/// Short backend name for a candle device.
+fn device_label(device: &candle_core::Device) -> &'static str {
+    use candle_core::DeviceLocation as L;
+    match device.location() {
+        L::Cpu => "cpu",
+        L::Cuda { .. } => "cuda",
+        L::Metal { .. } => "metal",
+        L::OpenCl { .. } => "opencl",
+        L::Sycl { .. } => "sycl",
+        L::Vulkan { .. } => "vulkan",
+    }
+}
+
+/// Sets its flag when dropped.  Held by a handler across the blocking
+/// generation, so when hyper drops the handler future (the client hung up)
+/// the engine sees the flag and stops decoding.
+struct CancelOnDrop(Arc<AtomicBool>);
+
+impl CancelOnDrop {
+    fn new() -> Self {
+        Self(Arc::new(AtomicBool::new(false)))
+    }
+
+    fn flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.0)
+    }
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
 /// `GET /v1/models` — returns the single loaded model.
 async fn list_models(State(state): State<AppState>) -> Json<ModelListResponse> {
     let created = SystemTime::now()
@@ -218,10 +284,12 @@ async fn chat_completions(
         let id = format!("chatcmpl-{}", Uuid::new_v4().simple());
 
         // Run inference in a blocking thread to avoid stalling the async runtime.
+        let cancel = CancelOnDrop::new();
         let (text, usage, _, _) = tokio::task::spawn_blocking({
             let engine = Arc::clone(&engine);
             let tools = tools.clone();
-            move || engine.complete_chat(&messages, tools.as_deref(), &options)
+            let flag = cancel.flag();
+            move || engine.complete_chat_cancellable(&messages, tools.as_deref(), &options, &flag)
         })
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?
@@ -321,10 +389,12 @@ async fn chat_completions(
     }
 
     // ── Non-streaming path ────────────────────────────────────────────────────
+    let cancel = CancelOnDrop::new();
     let (text, usage, _, _) = tokio::task::spawn_blocking({
         let engine = Arc::clone(&engine);
         let tools = tools.clone();
-        move || engine.complete_chat(&messages, tools.as_deref(), &options)
+        let flag = cancel.flag();
+        move || engine.complete_chat_cancellable(&messages, tools.as_deref(), &options, &flag)
     })
     .await
     .map_err(|e| ApiError::internal(e.to_string()))?
@@ -421,9 +491,11 @@ async fn completions(
 
     let messages = vec![ChatMessage::text("user".to_string(), prompt)];
 
+    let cancel = CancelOnDrop::new();
     let (text, usage, _, _) = tokio::task::spawn_blocking({
         let engine = Arc::clone(&engine);
-        move || engine.complete(&messages, &options)
+        let flag = cancel.flag();
+        move || engine.complete_chat_cancellable(&messages, None, &options, &flag)
     })
     .await
     .map_err(|e| ApiError::internal(e.to_string()))?
