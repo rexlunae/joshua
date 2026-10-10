@@ -975,3 +975,24 @@ async fn each_model_on_a_worker_is_admitted_by_its_own_slots() {
     worker.1.notify_waiters();
     assert_eq!(held.await.unwrap().status, StatusCode::OK);
 }
+
+#[tokio::test]
+async fn a_configured_worker_slot_cap_bounds_all_its_models_together() {
+    let (worker, url) = spawn_two_model_worker().await;
+    let mut cfg = config(&[&url]);
+    cfg.queue_depth = 0;
+    cfg.worker_slots = Some(1);
+    let (_coordinator, router) = spawn_router(cfg).await;
+
+    let held = tokio::spawn({
+        let router = router.clone();
+        async move { chat(&router, json!({"model": "alpha", "messages": []})).await }
+    });
+    eventually("alpha running", || worker.0.load(Ordering::SeqCst) == 1).await;
+    // beta has a free slot of its own, but the worker's one slot is taken.
+    let res = chat(&router, json!({"model": "beta", "messages": []})).await;
+    assert_eq!(res.status, StatusCode::TOO_MANY_REQUESTS, "{}", res.text());
+
+    worker.1.notify_waiters();
+    assert_eq!(held.await.unwrap().status, StatusCode::OK);
+}

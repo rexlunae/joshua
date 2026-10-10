@@ -582,18 +582,26 @@ impl Coordinator {
                 continue;
             }
             any_eligible = true;
+            let worker_load = w.dispatched.load(Ordering::Acquire) + st.external_in_flight;
             // A model with its own figures is admitted by them; the
-            // worker's other models do not use its slots.
+            // worker's other models do not use its slots.  A configured
+            // per-worker cap still bounds the worker as a whole.
             let (slots, load) = match own {
-                Some(s) => (
-                    self.config.worker_slots.unwrap_or(s.max_concurrency).max(1),
-                    w.by_model().get(&s.id).copied().unwrap_or(0)
-                        + st.external_by_model.get(&s.id).copied().unwrap_or(0),
-                ),
-                None => (
-                    self.slots_for(info),
-                    w.dispatched.load(Ordering::Acquire) + st.external_in_flight,
-                ),
+                Some(s) => {
+                    if self
+                        .config
+                        .worker_slots
+                        .is_some_and(|cap| worker_load >= cap.max(1))
+                    {
+                        continue;
+                    }
+                    (
+                        s.max_concurrency.max(1),
+                        w.by_model().get(&s.id).copied().unwrap_or(0)
+                            + st.external_by_model.get(&s.id).copied().unwrap_or(0),
+                    )
+                }
+                None => (self.slots_for(info), worker_load),
             };
             if load >= slots {
                 continue;
