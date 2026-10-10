@@ -2922,6 +2922,29 @@ impl Engine {
     /// Like [`Engine::embed`], additionally returning the total number of
     /// input tokens processed.
     pub fn embed_with_usage(&self, texts: &[String]) -> Result<(Vec<Vec<f32>>, u32)> {
+        self.embed_inner(texts, None)
+    }
+
+    /// [`Engine::embed_with_usage`] that gives up once `cancel` is set.
+    ///
+    /// The flag is checked before each input text, so a batch whose
+    /// requester went away (an HTTP client, or a `joshua route` coordinator
+    /// that closed its connection) releases the engine's concurrency permit
+    /// after at most one more text instead of embedding the whole batch for
+    /// nobody.  A cancelled call returns [`JoshuaError::Cancelled`].
+    pub fn embed_with_usage_cancellable(
+        &self,
+        texts: &[String],
+        cancel: &AtomicBool,
+    ) -> Result<(Vec<Vec<f32>>, u32)> {
+        self.embed_inner(texts, Some(cancel))
+    }
+
+    fn embed_inner(
+        &self,
+        texts: &[String],
+        cancel: Option<&AtomicBool>,
+    ) -> Result<(Vec<Vec<f32>>, u32)> {
         if self.remote_only() {
             return Err(JoshuaError::InvalidRequest(
                 "embeddings are not available for a model served by remote workers".into(),
@@ -2933,6 +2956,9 @@ impl Engine {
         let mut vectors = Vec::with_capacity(texts.len());
         let mut total_tokens: u32 = 0;
         for text in texts {
+            if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                return Err(JoshuaError::Cancelled);
+            }
             let encoding = self
                 .tokenizer
                 .encode(text.as_str(), true)

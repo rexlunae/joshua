@@ -34,6 +34,8 @@ joshua route --worker 10.0.0.2:8081,10.0.0.3:8082 \
 | `--queue-timeout-ms` | 30000 | Longest wait in the queue. |
 | `--health-interval-ms` | 2000 | Worker probe interval. |
 | `--connect-timeout-ms` | 2000 | Connect timeout, and the whole-probe timeout. |
+| `--response-timeout-ms` | 600000 | Longest a dispatched request waits for the worker's first output (the whole JSON response, or the first stream event); `0` waits indefinitely. A joshua worker computes a completion before sending any of it, so this also bounds generation time: raise it for long CPU generations. |
+| `--max-response-bytes` | 67108864 (64 MiB) | Largest non-streaming worker response the router buffers. |
 
 ## Endpoints
 
@@ -43,6 +45,10 @@ On the router:
   — routed.  The body is forwarded byte for byte, so every parameter
   (sampling, `stop`, `max_tokens`, tools, `stream`) reaches the worker
   unchanged, and the worker's response, usage and errors come back unchanged.
+  The router reads only `model` from the body.  A response is streamed when
+  the worker answers `text/event-stream` (a joshua worker streams only chat
+  completions; `stream: true` on the other routes still gets JSON), and
+  buffered otherwise.
 * `GET /v1/models` — union of the healthy workers' models.
 * `GET /v1/workers` — registry: health, last reported info, slots, requests
   in flight from this router and from other clients, last error.
@@ -89,14 +95,26 @@ Admission and execution are kept apart, so a retry cannot duplicate output:
   `400` for an invalid request or a `500` from a failed generation.  A worker
   rejecting the router's key becomes a `502`.
 * **Never restarted**: once a stream event has reached the client, losing
-  the worker ends the stream with an error event
+  the worker — or the worker closing the stream before its `[DONE]` event —
+  ends the stream with an error event
   (`{"error":{"code":"worker_lost",...}}`) and no `[DONE]`.
+* **Deadline**: a worker that produces no first output (whole JSON response
+  or first stream event) within `--response-timeout-ms` gets a `504`
+  (`worker_timeout`), not retried: the router closes the connection, which
+  cancels the work on the worker, frees the slot, and takes the worker out
+  of rotation until its next good probe.  There is no deadline once a stream
+  has started.
+* **Too large**: a non-streaming response over `--max-response-bytes` is a
+  `502` (`response_too_large`).  The worker did answer, so it stays healthy
+  and the request is not retried.
 * If every eligible worker refused admission the client gets a `503`
-  (`workers_busy`); if
-  they all failed in transit, a `502` (`workers_failed`).
+  (`workers_busy`); if any attempt failed in transit and no untried worker
+  remains, a `502` (`workers_failed`) — also when the failed workers have
+  since been marked unhealthy.  `503` (`no_worker`) means no attempt could
+  be made at all.
 
-Streams are forwarded as whole SSE events in the worker's order; a partial
-event is never forwarded.
+Streams are forwarded as whole SSE events in the worker's order; an
+unfinished event (one cut off by the end of the stream) is never forwarded.
 
 ## Cancellation
 
@@ -104,19 +122,33 @@ Each forwarded request owns its own connection to the worker.  When the
 client disconnects, the router drops the request, closing that connection
 and freeing the slot.  The worker's handler is then dropped, which sets a
 cancel flag the engine checks before every decoded token
-(`Engine::complete_chat_cancellable`), so generation stops and the engine's
-concurrency permit and session are released.  (Prefill already in progress
-runs to its end; the check is per decoded token.)
+(`Engine::complete_chat_cancellable`) and, for embeddings, before every
+input text (`Engine::embed_with_usage_cancellable`), so the work stops and
+the engine's concurrency permit and session are released.  (Prefill, or the
+embedding of the current text, already in progress runs to its end, so the
+worker may briefly refuse a new request with a `503`; the router then tries
+another worker.)
 
 ## Records
 
 Every request has an id: the client's `x-request-id` when it is 1–128
-characters of `[A-Za-z0-9._-]`, else a generated `req-…`.  It is forwarded to
-the worker and returned with `x-joshua-worker` (the serving worker's URL).
-The router logs, per attempt, the request id, worker, path, attempt number,
-queue time, duration, status and outcome (`complete`, `worker_error`,
-`client_disconnected`, `worker_lost`).  Prompt and output text are never
-logged.
+characters of `[A-Za-z0-9._-]`, else a generated `req-…`.  It is returned on
+every response and forwarded to the worker.  Responses from a dispatched
+attempt also carry `x-joshua-worker` (the serving worker's URL); requests
+rejected before dispatch (`404`, `429`, `503`, `502 workers_failed`) carry
+no worker header.  The router logs, per attempt, the request id, worker,
+path, attempt number, queue time, duration, status and outcome (`complete`,
+`worker_error`, `client_disconnected`, `worker_lost`, `worker_timeout`,
+`response_too_large`).  Prompt and output text are never logged.
+
+## Cross-origin access
+
+The router sends CORS headers (permissive: any origin) only when `--api-key`
+is set, so browser pages on other origins can call it but must present the
+key.  Without a key the browser's same-origin policy applies, so an arbitrary
+website opened on a machine that can reach the router cannot read its model
+output or worker status.  (`joshua serve` currently sends permissive CORS
+headers with or without a key.)
 
 ## Limits of this first version
 
