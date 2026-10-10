@@ -340,3 +340,38 @@ async fn controller_places_a_model_on_model_less_workers_and_unloads_it() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_router_reaches_every_loaded_model() {
+    use joshua::coordinator::{Coordinator, CoordinatorConfig};
+
+    let dir = common::model_dir("controller-routed");
+    common::write_tiny_llama_gguf(&dir.join("tiny.gguf"));
+    let app = create_router(state(ModelRegistry::default(), Some(manager(&dir))));
+    for id in ["tiny", "second"] {
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/v1/models/load",
+            serde_json::json!({"model": "tiny.gguf", "id": id}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    let (status, info) = call(&app, "GET", "/v1/worker/info", serde_json::Value::Null).await;
+    assert_eq!(status, StatusCode::OK, "{info}");
+    assert_eq!(info["models"], serde_json::json!(["tiny", "second"]));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let coordinator = Coordinator::new(CoordinatorConfig::new(vec![addr])).unwrap();
+    coordinator.refresh().await;
+    let router = joshua::coordinator::create_router(coordinator);
+    for model in ["tiny", "second"] {
+        let (status, body) = call(&router, "POST", "/v1/completions", completion(model)).await;
+        assert_eq!(status, StatusCode::OK, "{model}: {body}");
+        assert_eq!(body["model"], model);
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}

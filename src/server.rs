@@ -161,27 +161,6 @@ impl ModelRegistry {
         }
     }
 
-    /// The only loaded model, for callers that describe a single model.
-    pub fn single(&self) -> Result<(String, Arc<Engine>), ApiError> {
-        let models = self.models.read().unwrap_or_else(|p| p.into_inner());
-        match models.as_slice() {
-            [only] => Ok((only.id.clone(), Arc::clone(&only.engine))),
-            [] => Err(ApiError::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "no model is loaded; load one with POST /v1/models/load",
-                "model_not_loaded",
-            )),
-            several => Err(ApiError::new(
-                StatusCode::CONFLICT,
-                format!(
-                    "{} models are loaded; worker info describes one",
-                    several.len()
-                ),
-                "multiple_models",
-            )),
-        }
-    }
-
     /// Reserve `id` for a load; dropping the guard releases it.
     fn reserve(&self, id: &str) -> Result<LoadGuard<'_>, ApiError> {
         let mut loading = self.loading.lock().unwrap_or_else(|p| p.into_inner());
@@ -731,21 +710,34 @@ async fn health() -> Json<serde_json::Value> {
 /// requests here: protocol version, model identity, context limit, backend,
 /// and the admission cap with the current in-flight count.
 ///
-/// The protocol describes one model, so this answers only while exactly one
-/// is loaded.
+/// With several models loaded, `model`, `n_ctx` and `backend` describe the
+/// first, `models` lists them all, and the admission figures are their sums
+/// (each model admits its own requests).
 async fn worker_info(State(state): State<AppState>) -> Result<Json<WorkerInfo>, ApiError> {
-    let (model, engine) = state.models.single()?;
+    let models = state.models.list();
+    let Some(first) = models.first() else {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no model is loaded; load one with POST /v1/models/load",
+            "model_not_loaded",
+        ));
+    };
+    let engines = || models.iter().map(|m| &m.engine);
     Ok(Json(WorkerInfo {
         protocol_version: WORKER_PROTOCOL_VERSION,
-        model,
-        n_ctx: engine.n_ctx(),
-        backend: device_label(engine.device()).to_string(),
-        max_concurrency: engine.max_concurrency(),
-        in_flight: engine.in_flight(),
+        model: first.id.clone(),
+        models: match models.len() {
+            1 => Vec::new(),
+            _ => models.iter().map(|m| m.id.clone()).collect(),
+        },
+        n_ctx: first.engine.n_ctx(),
+        backend: device_label(first.engine.device()).to_string(),
+        max_concurrency: engines().map(|e| e.max_concurrency()).sum(),
+        in_flight: engines().map(|e| e.in_flight()).sum(),
         capabilities: WorkerCapabilities {
             chat: true,
             completions: true,
-            embeddings: !engine.remote_only(),
+            embeddings: engines().any(|e| !e.remote_only()),
             transcriptions: state.whisper.is_some(),
             streaming: true,
             tools: true,

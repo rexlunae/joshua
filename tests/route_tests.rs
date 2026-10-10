@@ -86,6 +86,7 @@ async fn fake_info(State(f): State<Arc<Fake>>) -> Json<WorkerInfo> {
     Json(WorkerInfo {
         protocol_version: WORKER_PROTOCOL_VERSION,
         model: f.model.clone(),
+        models: Vec::new(),
         n_ctx: 4096,
         backend: "cpu".to_string(),
         max_concurrency: f.max_concurrency,

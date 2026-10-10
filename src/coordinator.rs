@@ -101,6 +101,10 @@ pub struct WorkerInfo {
     pub protocol_version: u32,
     /// Model identity (the id the worker reports in `/v1/models`).
     pub model: String,
+    /// Every model id the worker serves, `model` first, when it serves more
+    /// than one.  Older workers leave it out and serve only `model`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<String>,
     /// Context window in tokens.
     pub n_ctx: u32,
     /// Compute backend (`cpu`, `cuda`, `metal`, `opencl`, `sycl`, `vulkan`).
@@ -130,6 +134,13 @@ pub struct WorkerCapabilities {
     pub streaming: bool,
     /// Tool calls on the chat route.
     pub tools: bool,
+}
+
+impl WorkerInfo {
+    /// Every model id the worker serves.
+    pub fn model_ids(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.model.as_str()).chain(self.models.iter().map(String::as_str))
+    }
 }
 
 impl WorkerCapabilities {
@@ -503,7 +514,9 @@ impl Coordinator {
             let Some(info) = st.info.as_ref() else {
                 continue;
             };
-            if model.is_some_and(|m| m != info.model) || !info.capabilities.serves(path) {
+            if model.is_some_and(|m| !info.model_ids().any(|id| id == m))
+                || !info.capabilities.serves(path)
+            {
                 continue;
             }
             model_known = true;
@@ -592,11 +605,13 @@ impl Coordinator {
         let mut models: Vec<String> = self
             .workers
             .iter()
-            .filter_map(|w| {
+            .flat_map(|w| {
                 let st = w.status();
-                st.healthy
-                    .then(|| st.info.as_ref().map(|i| i.model.clone()))
-                    .flatten()
+                st.info
+                    .as_ref()
+                    .filter(|_| st.healthy)
+                    .map(|i| i.model_ids().map(str::to_string).collect::<Vec<_>>())
+                    .unwrap_or_default()
             })
             .collect();
         models.sort();
