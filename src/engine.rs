@@ -2608,12 +2608,15 @@ impl Engine {
 
             // Draft continuation tokens, bounded so that every accepted one
             // can still be emitted (max_tokens) and fed (context window).
+            // The gate is asked only when there is a draft, so steps with no
+            // match don't use up its probes.
             drafts.clear();
             if let Some(d) = drafter.as_mut() {
-                if gate.as_mut().is_none_or(SpeculationGate::allow) {
-                    let room = (options.max_tokens - text.n_decoded) as usize;
-                    let ctx_room = (self.n_ctx as usize).saturating_sub(n_cur + 1);
-                    d.draft_into(draft_len.min(room).min(ctx_room), &mut drafts);
+                let room = (options.max_tokens - text.n_decoded) as usize;
+                let ctx_room = (self.n_ctx as usize).saturating_sub(n_cur + 1);
+                d.draft_into(draft_len.min(room).min(ctx_room), &mut drafts);
+                if !drafts.is_empty() && !gate.as_mut().is_none_or(SpeculationGate::allow) {
+                    drafts.clear();
                 }
             }
 

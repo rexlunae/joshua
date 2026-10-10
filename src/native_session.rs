@@ -176,13 +176,22 @@ pub trait LayerStack: Send + Sync + 'static {
     }
 }
 
-/// Keep the final token's routed experts out of an input's `routed` ids
-/// (token-major, `k` per token — see [`crate::moe::dispatch_prefill_with`]).
+/// Token `idx`'s routed experts in an input's `routed` ids (token-major, `k`
+/// per token — see [`crate::moe::dispatch_prefill_with`]); empty when the
+/// layer is dense or `idx` is out of range.
+fn routed_at(routed: &[u32], seq_len: usize, idx: usize) -> &[u32] {
+    if idx < seq_len && !routed.is_empty() && routed.len().is_multiple_of(seq_len) {
+        let k = routed.len() / seq_len;
+        &routed[idx * k..(idx + 1) * k]
+    } else {
+        &[]
+    }
+}
+
+/// Keep the final token's routed experts out of an input's `routed` ids.
 fn record_last_routed(slot: &mut Vec<u32>, routed: &[u32], seq_len: usize) {
     slot.clear();
-    if seq_len > 0 && !routed.is_empty() && routed.len().is_multiple_of(seq_len) {
-        slot.extend_from_slice(&routed[routed.len() - routed.len() / seq_len..]);
-    }
+    slot.extend_from_slice(routed_at(routed, seq_len, seq_len.wrapping_sub(1)));
 }
 
 /// How many prefix checkpoints a session of a recurrent model keeps by
@@ -323,6 +332,10 @@ pub struct Session<W: LayerStack> {
     /// prediction for the next step.  Empty until a layer has routed (and for
     /// dense layers).
     last_routed: Vec<Vec<u32>>,
+    /// Per layer, every token's routed experts from a pending verification
+    /// pass, so a rollback can predict from the token it keeps rather than
+    /// a rejected draft.
+    verify_routed: Vec<Vec<u32>>,
 }
 
 impl<W: LayerStack> Session<W> {
@@ -339,6 +352,7 @@ impl<W: LayerStack> Session<W> {
             prefix: PrefixCheckpoints::new(DEFAULT_PREFIX_CHECKPOINTS),
             predict_experts: false,
             last_routed: vec![Vec::new(); n],
+            verify_routed: vec![Vec::new(); n],
             weights,
         }
     }
@@ -366,6 +380,7 @@ impl<W: LayerStack> Session<W> {
             prefix: PrefixCheckpoints::new(self.prefix.budget),
             predict_experts: self.predict_experts,
             last_routed: vec![Vec::new(); self.state.len()],
+            verify_routed: vec![Vec::new(); self.state.len()],
         }
     }
 
@@ -487,6 +502,10 @@ impl<W: LayerStack> Session<W> {
             self.hot_experts.record(l, &routed, step);
             if self.predict_experts {
                 record_last_routed(&mut self.last_routed[l], &routed, seq_len);
+                if all_logits {
+                    self.verify_routed[l].clear();
+                    self.verify_routed[l].extend_from_slice(&routed);
+                }
             }
             xs = out;
         }
@@ -598,6 +617,12 @@ impl<W: LayerStack> Session<W> {
         // A pending checkpoint refers into the state just replaced; drop it.
         self.verify = None;
         self.prefix.points.clear();
+        self.forget_last_routed();
+    }
+
+    /// Drop the next-step expert prediction: the token it was taken from is
+    /// gone, and the one now last was routed in a pass not kept.
+    fn forget_last_routed(&mut self) {
         for ids in self.last_routed.iter_mut() {
             ids.clear();
         }
@@ -673,11 +698,21 @@ impl<W: LayerStack> Session<W> {
                         W::restore_state(s, snap, retained)?;
                     }
                 }
+                // Predict from the last token kept, not the rejected tail.
+                if self.predict_experts && retained < checkpoint.seq {
+                    for (slot, routed) in self.last_routed.iter_mut().zip(&self.verify_routed) {
+                        slot.clear();
+                        if let Some(idx) = retained.checked_sub(1) {
+                            slot.extend_from_slice(routed_at(routed, checkpoint.seq, idx));
+                        }
+                    }
+                }
             }
             None if self.weights.can_truncate() => {
                 for s in self.state.iter_mut() {
                     W::truncate_state(s, keep)?;
                 }
+                self.forget_last_routed();
             }
             None => {
                 // Running state has no history to reach back into; only a
@@ -696,6 +731,7 @@ impl<W: LayerStack> Session<W> {
                         W::restore_checkpoint(s, cp)?;
                     }
                 }
+                self.forget_last_routed();
             }
         }
         self.prefix.invalidate_after(keep);

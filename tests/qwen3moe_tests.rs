@@ -4,6 +4,7 @@
 
 mod common;
 
+use candle_core::{Device, Tensor};
 use common::logits;
 use joshua::model::{Architecture, QuantizedModel};
 use std::path::Path;
@@ -127,6 +128,44 @@ fn qwen3moe_speculative_expert_prefetch_preserves_logits() {
         predicted.iter().any(|ids| !ids.is_empty()),
         "each MoE layer predicts the experts its last step routed to"
     );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Rolling a verification pass back leaves the prediction on the last token
+/// kept, exactly as plain decoding up to it would, not on a rejected draft.
+#[test]
+fn qwen3moe_verify_rollback_predicts_from_the_kept_token() {
+    let dir = common::model_dir("qwen3moe-predict-rollback");
+    let model = dir.join("model.gguf");
+    common::write_tiny_qwen3moe_gguf(&model);
+    const PROMPT: [u32; 5] = [1, 4, 2, 7, 5];
+
+    let mut plain = common::load_model(&model, true);
+    plain.set_speculative_expert_prefetch(true);
+    logits(&mut plain, &PROMPT, 0);
+    let mut want = Vec::new();
+    for (i, t) in [3u32, 6].into_iter().enumerate() {
+        logits(&mut plain, &[t], PROMPT.len() + i);
+        want.push(plain.predicted_experts().unwrap().to_vec());
+    }
+
+    for (kept, want) in want.iter().enumerate() {
+        let mut spec = common::load_model(&model, true);
+        spec.set_speculative_expert_prefetch(true);
+        logits(&mut spec, &PROMPT, 0);
+        let block = Tensor::new(&[3u32, 6, 9, 11][..], &Device::Cpu)
+            .unwrap()
+            .unsqueeze(0)
+            .unwrap();
+        spec.forward_all_logits(&block, PROMPT.len()).unwrap();
+        assert!(spec.truncate_kv_cache(PROMPT.len() + kept + 1).unwrap());
+        assert_eq!(
+            spec.predicted_experts().unwrap(),
+            &want[..],
+            "keeping {} verified tokens",
+            kept + 1
+        );
+    }
     std::fs::remove_dir_all(&dir).ok();
 }
 
