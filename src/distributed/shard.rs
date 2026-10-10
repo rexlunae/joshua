@@ -508,7 +508,7 @@ mod tests {
             assert_eq!(parsed.dims, vec![4, width]);
             let mmap = mapping(&bytes);
             let input = vec![0.25; width];
-            let mut actual = vec![0.0f32; 4];
+            let mut actual = [0.0f32; 4];
             for rank in 0..3 {
                 let shard = ShardedTensor::new(mmap.clone(), parsed, data_offset, rank, 3).unwrap();
                 assert_eq!(shard.input_width(), width);
@@ -592,7 +592,10 @@ mod tests {
         );
 
         let (mmap, tensor, _) = fixture(8, 3, 2);
-        for range in [0..0, 32..0, 1..32, 0..33, 0..128] {
+        // `32..0` is deliberately reversed: construction must reject it.
+        #[allow(clippy::reversed_empty_ranges)]
+        let invalid = [0..0, 32..0, 1..32, 0..33, 0..128];
+        for range in invalid {
             assert!(ShardedTensor::with_input_range(mmap.clone(), &tensor, 2, range).is_err());
         }
         let shard = ShardedTensor::with_input_range(mmap.clone(), &tensor, 2, 32..96).unwrap();
@@ -639,11 +642,16 @@ mod tests {
         drop(mmap);
         assert!(weak.upgrade().is_some());
         let expected = shard.forward(&vec![1.0; 96]).unwrap();
-        let path = format!(
-            "target/shard-fixture-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        );
+        // `target/` relative to the checkout does not exist when CARGO_TARGET_DIR
+        // points elsewhere (for example a shared build directory).
+        let path = std::env::temp_dir()
+            .join(format!(
+                "joshua-shard-fixture-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ))
+            .to_string_lossy()
+            .into_owned();
         struct RemoveFile(String);
         impl Drop for RemoveFile {
             fn drop(&mut self) {
