@@ -1132,7 +1132,43 @@ impl AbortHandle {
 
 #[cfg(test)]
 mod tests {
-    use super::matrix_bytes;
+    use super::{matrix_bytes, model_header};
+
+    /// A qwen3 GGUF holding one 8-float F32 tensor, its data cut to `data` bytes.
+    fn qwen3_gguf(data: usize) -> Vec<u8> {
+        let mut b = Vec::new();
+        let s = |b: &mut Vec<u8>, t: &[u8]| {
+            b.extend_from_slice(&(t.len() as u64).to_le_bytes());
+            b.extend_from_slice(t);
+        };
+        b.extend_from_slice(b"GGUF");
+        b.extend_from_slice(&3u32.to_le_bytes());
+        b.extend_from_slice(&1u64.to_le_bytes()); // tensors
+        b.extend_from_slice(&1u64.to_le_bytes()); // metadata
+        s(&mut b, b"general.architecture");
+        b.extend_from_slice(&8u32.to_le_bytes()); // string
+        s(&mut b, b"qwen3");
+        s(&mut b, b"w");
+        b.extend_from_slice(&1u32.to_le_bytes());
+        b.extend_from_slice(&8u64.to_le_bytes());
+        b.extend_from_slice(&0u32.to_le_bytes()); // F32
+        b.extend_from_slice(&0u64.to_le_bytes());
+        b.resize(b.len().div_ceil(32) * 32 + data, 0);
+        b
+    }
+
+    #[test]
+    fn model_header_checks_the_layout() {
+        let dir = std::env::temp_dir().join(format!("joshua-pipeline-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("m.gguf");
+        std::fs::write(&path, qwen3_gguf(32)).unwrap();
+        model_header(&path).unwrap();
+        std::fs::write(&path, qwen3_gguf(24)).unwrap();
+        let msg = model_header(&path).unwrap_err().to_string();
+        assert!(msg.contains("past the end"), "{msg}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn matrix_reservation_follows_qmatmul_representation() {
