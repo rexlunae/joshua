@@ -254,6 +254,18 @@ pub fn plan_partition(
     })
 }
 
+fn validate_link_values(link: &LinkObservation) -> Result<()> {
+    ensure!(
+        link.latency_seconds.is_finite() && link.latency_seconds >= 0.0,
+        "link latency must be finite and nonnegative"
+    );
+    ensure!(
+        link.bandwidth_bytes_per_second.is_finite() && link.bandwidth_bytes_per_second > 0.0,
+        "link bandwidth must be finite and positive"
+    );
+    Ok(())
+}
+
 fn speed_scores(
     nodes: &[&NodeCapacity],
     budget: &[u64],
@@ -273,14 +285,7 @@ fn speed_scores(
             seen.insert((from.min(to), from.max(to))),
             "duplicate link observation"
         );
-        ensure!(
-            link.latency_seconds.is_finite() && link.latency_seconds >= 0.0,
-            "link latency must be finite and nonnegative"
-        );
-        ensure!(
-            link.bandwidth_bytes_per_second.is_finite() && link.bandwidth_bytes_per_second > 0.0,
-            "link bandwidth must be finite and positive"
-        );
+        validate_link_values(link)?;
         for rank in [from, to] {
             latency[rank] = latency[rank].max(link.latency_seconds);
             bandwidth[rank] = bandwidth[rank].min(link.bandwidth_bytes_per_second);
@@ -408,7 +413,9 @@ pub struct LinkDefaults {
 /// constants that replace any measurement of the same unordered pair; duplicates
 /// there are rejected. `fallback`, when given, fills every remaining pair of
 /// `nodes`; without it unknown pairs stay unknown (the planner adds no penalty).
-/// Output is sorted by endpoint IDs; values are validated by [`plan_partition`].
+/// Every measured and overridden value is checked before merging (finite,
+/// nonnegative latency and positive bandwidth); endpoints are validated by
+/// [`plan_partition`]. Output is sorted by endpoint IDs.
 pub fn resolve_links(
     nodes: &[NodeCapacity],
     measured: &[LinkObservation],
@@ -425,6 +432,10 @@ pub fn resolve_links(
     }
     let mut links: BTreeMap<(String, String), LinkObservation> = BTreeMap::new();
     for link in measured {
+        // Validate before merging: f64 min/max would silently drop a NaN
+        // measurement in favour of a valid duplicate.
+        validate_link_values(link)
+            .with_context(|| format!("measured link {} <-> {}", link.from, link.to))?;
         let pair = key(link);
         let merged = match links.remove(&pair) {
             Some(known) => LinkObservation {
@@ -440,6 +451,8 @@ pub fn resolve_links(
     }
     let mut overridden = BTreeSet::new();
     for link in overrides {
+        validate_link_values(link)
+            .with_context(|| format!("link override {} <-> {}", link.from, link.to))?;
         let pair = key(link);
         ensure!(
             overridden.insert(pair.clone()),
@@ -514,12 +527,19 @@ impl Default for RepartitionPolicy {
 /// collective the slowest rank waits least.
 pub fn load_imbalance(timings: &[RankTiming]) -> Result<f64> {
     validate_timings(timings)?;
+    Ok(1.0 / scaled_mean_busy(timings).0 - 1.0)
+}
+
+/// `(mean(busy) / max(busy), max(busy))` of validated timings. Scaling by the
+/// maximum keeps the sum finite however large the individual (finite) times
+/// are, so a huge rank time cannot overflow the mean and hide imbalance.
+fn scaled_mean_busy(timings: &[RankTiming]) -> (f64, f64) {
     let max = timings
         .iter()
         .map(|t| t.busy_seconds)
         .fold(0.0f64, f64::max);
-    let mean = timings.iter().map(|t| t.busy_seconds).sum::<f64>() / timings.len() as f64;
-    Ok(max / mean - 1.0)
+    let scaled = timings.iter().map(|t| t.busy_seconds / max).sum::<f64>();
+    (scaled / timings.len() as f64, max)
 }
 
 fn validate_timings(timings: &[RankTiming]) -> Result<()> {
@@ -564,7 +584,7 @@ pub fn rebalance_weights(
         timings.len() == nodes.len(),
         "need exactly one timing per planned node"
     );
-    let mean = timings.iter().map(|t| t.busy_seconds).sum::<f64>() / timings.len() as f64;
+    let (scaled_mean, max) = scaled_mean_busy(timings);
     nodes
         .iter()
         .map(|node| {
@@ -572,7 +592,10 @@ pub fn rebalance_weights(
                 .iter()
                 .find(|t| t.node_id == node.id)
                 .with_context(|| format!("no timing for node {}", node.id))?;
-            let factor = (mean / timing.busy_seconds).clamp(1.0 / max_step, max_step);
+            // mean / busy, computed without forming the (possibly
+            // overflowing) unscaled mean.
+            let factor =
+                (scaled_mean * (max / timing.busy_seconds)).clamp(1.0 / max_step, max_step);
             let compute_weight = node.compute_weight * factor;
             ensure!(
                 compute_weight.is_finite() && compute_weight > 0.0,
@@ -601,6 +624,7 @@ pub struct Repartition {
 /// Advisory only: it never mutates a live plan. Feed windows in order for the
 /// participant set of the current plan. After a proposal (or any balanced
 /// window) the streak restarts, so one slow window never triggers a replan.
+/// A window whose replan fails is not recorded, so it can be resubmitted.
 #[derive(Clone, Debug)]
 pub struct RepartitionMonitor {
     policy: RepartitionPolicy,
@@ -650,29 +674,42 @@ impl RepartitionMonitor {
             self.accumulated.clear();
             return Ok(None);
         }
-        if self.accumulated.len() != timings.len()
+        // Build the updated evidence on the side and commit it only when this
+        // window is fully handled: a failed replan (say, a memory budget that
+        // cannot fit the model yet) leaves the monitor as it was, so
+        // resubmitting the window with corrected inputs proposes a plan.
+        let (mut streak, mut accumulated) = (self.streak, self.accumulated.clone());
+        if accumulated.len() != timings.len()
             || timings
                 .iter()
-                .any(|t| !self.accumulated.contains_key(&t.node_id))
+                .any(|t| !accumulated.contains_key(&t.node_id))
         {
             // First window, or the participant set changed: restart the evidence.
-            self.streak = 0;
-            self.accumulated.clear();
+            streak = 0;
+            accumulated.clear();
         }
         for timing in timings {
-            let entry = self
-                .accumulated
+            let entry = accumulated
                 .entry(timing.node_id.clone())
                 .or_insert((0.0, 0.0));
             entry.0 += timing.busy_seconds;
             entry.1 += timing.wait_seconds;
         }
-        self.streak += 1;
-        if self.streak < self.policy.sustained_windows {
+        if accumulated
+            .values()
+            .any(|&(busy, wait)| !busy.is_finite() || !wait.is_finite())
+        {
+            self.streak = 0;
+            self.accumulated.clear();
+            bail!("accumulated rank timings overflowed; imbalance evidence was reset");
+        }
+        streak += 1;
+        if streak < self.policy.sustained_windows {
+            self.streak = streak;
+            self.accumulated = accumulated;
             return Ok(None);
         }
-        let summed: Vec<_> = self
-            .accumulated
+        let summed: Vec<_> = accumulated
             .iter()
             .map(|(id, &(busy, wait))| RankTiming {
                 node_id: id.clone(),
@@ -680,11 +717,11 @@ impl RepartitionMonitor {
                 wait_seconds: wait,
             })
             .collect();
-        self.streak = 0;
-        self.accumulated.clear();
         let observed_imbalance = load_imbalance(&summed)?;
         let nodes = rebalance_weights(nodes, &summed, self.policy.max_weight_step)?;
         let plan = plan_partition(&nodes, tensors, links)?;
+        self.streak = 0;
+        self.accumulated.clear();
         Ok(Some(Repartition {
             nodes,
             plan,
@@ -1221,6 +1258,65 @@ mod tests {
         assert!(monitor.observe(&other, &other_nodes, &work, &[])?.is_none());
         assert_eq!(monitor.streak(), 1);
         assert!(monitor.observe(&other, &other_nodes, &work, &[])?.is_some());
+        Ok(())
+    }
+
+    /// Regressions (Devin review on #173).
+    #[test]
+    fn huge_rank_times_do_not_overflow_the_imbalance() -> Result<()> {
+        // The busy sum overflows f64, which used to report -1 (balanced).
+        let imbalance = load_imbalance(&[timing("a", f64::MAX), timing("b", 1.0)])?;
+        assert!((imbalance - 1.0).abs() < 1e-12, "{imbalance}");
+        let imbalance = load_imbalance(&[timing("a", f64::MAX), timing("b", f64::MAX)])?;
+        assert_eq!(imbalance, 0.0);
+        let nodes = [node("a", 100), node("b", 100)];
+        let weights = rebalance_weights(&nodes, &[timing("a", f64::MAX), timing("b", 1.0)], 4.0)?;
+        assert_eq!(weights[0].compute_weight, 0.5);
+        assert_eq!(weights[1].compute_weight, 4.0);
+        // Accumulating windows past f64::MAX is an error that resets evidence.
+        let mut monitor = RepartitionMonitor::new(RepartitionPolicy::default())?;
+        let huge = [timing("a", f64::MAX), timing("b", 1.0)];
+        let work = [tensor("w", 100, 1)];
+        assert!(monitor.observe(&huge, &nodes, &work, &[])?.is_none());
+        assert!(monitor.observe(&huge, &nodes, &work, &[]).is_err());
+        assert_eq!(monitor.streak(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn nan_duplicate_link_measurements_are_rejected() {
+        let nodes = [node("a", 100), node("b", 100)];
+        for bad in [
+            link("a", "b", f64::NAN, 1e9),
+            link("a", "b", 0.001, f64::NAN),
+            link("a", "b", -1.0, 1e9),
+            link("a", "b", 0.001, 0.0),
+        ] {
+            // A valid duplicate must not mask the invalid one, in either order.
+            let good = link("b", "a", 0.001, 1e9);
+            for measured in [[bad.clone(), good.clone()], [good, bad.clone()]] {
+                assert!(resolve_links(&nodes, &measured, &[], None).is_err());
+            }
+            assert!(resolve_links(&nodes, &[], &[bad], None).is_err());
+        }
+    }
+
+    #[test]
+    fn a_failed_replan_keeps_the_imbalance_evidence() -> Result<()> {
+        let work = [tensor("w", 100, 10)];
+        let tight = [node("a", 100), node("b", 100)]; // 1000 bytes do not fit
+        let roomy = [node("a", 1000), node("b", 1000)];
+        let mut monitor = RepartitionMonitor::new(RepartitionPolicy {
+            sustained_windows: 2,
+            ..Default::default()
+        })?;
+        let slow = [timing("a", 1.0), timing("b", 3.0)];
+        assert!(monitor.observe(&slow, &tight, &work, &[])?.is_none());
+        assert!(monitor.observe(&slow, &tight, &work, &[]).is_err());
+        assert_eq!(monitor.streak(), 1, "the failed window is not recorded");
+        // Resubmitting the same window with corrected capacity proposes a plan.
+        assert!(monitor.observe(&slow, &roomy, &work, &[])?.is_some());
+        assert_eq!(monitor.streak(), 0);
         Ok(())
     }
 

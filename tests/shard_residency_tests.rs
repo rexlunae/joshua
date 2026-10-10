@@ -270,6 +270,11 @@ fn sharded_mapping_faults_in_only_its_own_column_ranges() -> anyhow::Result<()> 
         return Ok(());
     }
     assert_eq!(lazy.rss_bytes, 0, "mapping must not populate");
+    assert_eq!(
+        lazy.shard_resident + lazy.off_resident,
+        0,
+        "mapping must not read tensor pages into the page cache: {lazy:?}"
+    );
 
     // 2. forward() touches every byte of the shard but no other column.
     let partial = shard.forward(&x)?;
@@ -430,6 +435,19 @@ fn split_gguf_shards_match_reference_and_touch_only_their_part() -> anyhow::Resu
         for file in &files {
             evict(file)?;
         }
+        // As in the main residency test: on a tmpfs or otherwise unevictable
+        // backing store the residency check below is meaningless.
+        // SAFETY: the test owns the file and never modifies it while mapped.
+        let before = unsafe { memmap2::Mmap::map(&files[other])? };
+        let pages = resident_pages(before.as_ptr() as usize, before.len())?;
+        if pages.iter().filter(|&&r| r).count() > pages.len() / 20 {
+            eprintln!(
+                "skipping: the page cache for {:?} cannot be evicted",
+                parts[other].0
+            );
+            return Ok(());
+        }
+        drop(before);
         let header = &headers[owner];
         let info = &header.tensors[*name];
         let mut sum = vec![0.0f32; SPLIT_ROWS];

@@ -224,25 +224,22 @@ impl ProbeResponder {
         })
     }
 
-    pub fn local_addr(&self) -> Result<SocketAddr> {
-        Ok(self.listener.local_addr()?)
-    }
-
-    /// Accept and serve exactly one prober within the configured timeout.
-    /// Returns the number of bulk payload bytes received.
-    pub fn serve_one(&self) -> Result<u64> {
-        let deadline = Instant::now() + self.limits.timeout;
-        let stream = loop {
+    fn accept(&self, deadline: Instant) -> Result<TcpStream> {
+        loop {
             remaining(deadline)?;
             match self.listener.accept() {
-                Ok((stream, _)) => break stream,
+                Ok((stream, _)) => return Ok(stream),
                 Err(error) if error.kind() == ErrorKind::WouldBlock => {
                     thread::sleep(remaining(deadline)?.min(Duration::from_millis(1)))
                 }
                 Err(error) if error.kind() == ErrorKind::Interrupted => continue,
                 Err(error) => return Err(error).context("accepting prober"),
             }
-        };
+        }
+    }
+
+    /// Read and verify the prober's hello, then answer with the welcome.
+    fn authenticate(&self, stream: TcpStream, deadline: Instant) -> Result<Channel> {
         stream.set_nonblocking(false)?;
         stream.set_nodelay(true)?;
         let mut channel = Channel {
@@ -278,6 +275,41 @@ impl ProbeResponder {
             },
             deadline,
         )?;
+        Ok(channel)
+    }
+
+    pub fn local_addr(&self) -> Result<SocketAddr> {
+        Ok(self.listener.local_addr()?)
+    }
+
+    /// Accept and serve exactly one authenticated prober within the configured
+    /// timeout. Returns the number of bulk payload bytes received.
+    ///
+    /// A connection that fails before authenticating (a port scan, a closed
+    /// socket, a wrong key or session) is dropped and the responder keeps
+    /// waiting for an authorized prober until the timeout, so a stray client
+    /// cannot stop it. Failures after authentication are returned.
+    pub fn serve_one(&self) -> Result<u64> {
+        let deadline = Instant::now() + self.limits.timeout;
+        let mut rejected: Option<(usize, anyhow::Error)> = None;
+        let mut channel = loop {
+            let stream = match self.accept(deadline) {
+                Ok(stream) => stream,
+                Err(error) => return Err(match rejected {
+                    Some((count, last)) => error.context(format!(
+                        "no authenticated prober; rejected {count} connection(s), last: {last:#}"
+                    )),
+                    None => error,
+                }),
+            };
+            match self.authenticate(stream, deadline) {
+                Ok(channel) => break channel,
+                Err(error) => {
+                    let count = rejected.as_ref().map_or(0, |(n, _)| *n) + 1;
+                    rejected = Some((count, error));
+                }
+            }
+        };
         let (mut pings, mut bulks, mut received) = (0usize, 0usize, 0u64);
         let mut scratch = vec![0u8; CHUNK];
         for seq in 1u64.. {
@@ -684,6 +716,48 @@ mod tests {
             .collect();
         // b and c share the slow link; a only sees fast measured loopback links.
         assert!(counts[0] > counts[1] && counts[0] > counts[2], "{counts:?}");
+        Ok(())
+    }
+
+    /// Regression (Devin review on #173): an unauthenticated connection must
+    /// not end the responder's wait for an authorized prober.
+    #[test]
+    fn unauthenticated_connections_do_not_stop_the_responder() -> Result<()> {
+        let session = Uuid::new_v4();
+        let server = responder(session);
+        let address = server.local_addr()?;
+        thread::scope(|scope| {
+            let served = scope.spawn(|| server.serve_one());
+            // A bare connect-and-close, then a prober with the wrong key.
+            drop(TcpStream::connect(address)?);
+            let other_key = b"other-probe-test-only-key-32-bytes!".as_slice();
+            assert!(probe_link(address, session, other_key, &small()).is_err());
+            // The authorized prober is still served.
+            probe_link(address, session, KEY, &small())?;
+            assert_eq!(
+                served.join().expect("responder panicked")?,
+                3 * 4 * 1024 * 1024
+            );
+            Ok::<_, anyhow::Error>(())
+        })?;
+
+        // With no authorized prober, the timeout error names the rejections.
+        let quiet = ProbeResponder {
+            limits: ProbeConfig {
+                timeout: Duration::from_millis(500),
+                ..small()
+            },
+            ..responder(session)
+        };
+        let address = quiet.local_addr()?;
+        let error = thread::scope(|scope| {
+            let served = scope.spawn(|| quiet.serve_one());
+            drop(TcpStream::connect(address).unwrap());
+            served.join().expect("responder panicked").unwrap_err()
+        });
+        let message = format!("{error:#}");
+        assert!(message.contains("rejected 1 connection"), "{message}");
+        assert!(message.contains("timed out"), "{message}");
         Ok(())
     }
 
