@@ -24,6 +24,7 @@
 pub mod attention;
 pub mod auto_placement;
 pub mod compression;
+pub mod coordinator;
 pub mod cpu_pinning;
 pub mod distributed;
 pub mod embedding;

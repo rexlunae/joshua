@@ -441,6 +441,41 @@ curl http://localhost:8080/health
 # {"status":"ok"}
 ```
 
+### `GET /v1/worker/info`
+
+Worker identity and live load for a request router (`joshua route`): protocol
+version, model id, context window, backend, `max_concurrency` and the current
+in-flight count.  Behind `--api-key` like the other `/v1` routes.
+
+## Routing requests across workers (`joshua route`)
+
+`joshua route` is a coordinator that sends each *whole* chat, completion or
+embedding request to one of several independent `joshua serve` workers —
+each request runs entirely on one worker, so this adds request throughput,
+not single-model capacity (that is the experimental cluster mode below).
+
+```bash
+# Two workers (any machines; same or different models)
+joshua serve --model qwen3-8b.gguf --addr 0.0.0.0:8081 --api-key w-key --max-concurrency 2
+joshua serve --model qwen3-8b.gguf --addr 0.0.0.0:8082 --api-key w-key --max-concurrency 2
+
+# The router clients talk to
+joshua route --worker 10.0.0.2:8081,10.0.0.3:8082 \
+  --worker-api-key w-key --api-key client-key --addr 0.0.0.0:8090
+```
+
+Requests are matched to workers by their `model` field (no `model` = any
+worker; an unknown model is a `404 model_not_found`) and go to the least
+loaded healthy worker with a free slot.  When every slot is busy, requests
+wait in a bounded queue (`--queue-depth`, `--queue-timeout-ms`); a full queue
+answers `429` and a timed-out wait `503`, both with `Retry-After`.  Streams
+are forwarded event by event, in order; a request is retried on another
+worker only if it failed before any output, and a stream that has started is
+never restarted.  A client disconnect closes the worker connection, and the
+worker stops decoding.  `GET /v1/workers` shows the registry.  See
+[docs/request-routing.md](docs/request-routing.md) for the protocol,
+admission and failure rules.
+
 ---
 
 ## Securing the server
