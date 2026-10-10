@@ -21,3 +21,5 @@ pub mod session;
 pub mod deepseek4;
 #[cfg(feature = "distributed")]
 pub mod pipeline;
+#[cfg(feature = "distributed")]
+pub mod remote;

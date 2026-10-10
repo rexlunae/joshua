@@ -1,7 +1,9 @@
 #![cfg(feature = "distributed")]
 mod common;
 
-use joshua::distributed::pipeline::{Input, Limits, Pipeline, Plan, Worker};
+use joshua::distributed::pipeline::{
+    serve_controller, AgentConfig, Deployment, Input, Limits, Pipeline, Plan, Worker,
+};
 use std::{
     net::TcpListener,
     path::Path,
@@ -943,5 +945,196 @@ fn incomplete_frame_expires_without_allocating_an_unbounded_payload() {
         // A stalled pre-handshake peer cannot strand the worker.
         stop_worker(address, job, &plan, handle);
     }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A model-less worker that serves `connections` controllers, then exits.
+fn agent(
+    config: AgentConfig,
+    connections: usize,
+) -> (std::net::SocketAddr, JoinHandle<Vec<anyhow::Result<()>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let handle = thread::spawn(move || {
+        (0..connections)
+            .map(|_| {
+                let (stream, _) = listener.accept().unwrap();
+                serve_controller(stream, KEY, &config)
+            })
+            .collect()
+    });
+    (address, handle)
+}
+
+fn assert_matches_local(pipeline: &mut Pipeline, path: &Path) {
+    let id = pipeline.open().unwrap();
+    let mut local = common::load_model(path, true);
+    let prompt = [1, 4, 2, 7, 5, 9];
+    let out = pipeline
+        .forward_batch(&[Input {
+            session: id,
+            offset: 0,
+            tokens: prompt.to_vec(),
+        }])
+        .unwrap();
+    assert_eq!(out[0], common::logits(&mut local, &prompt, 0));
+    for offset in prompt.len()..prompt.len() + 4 {
+        let tokens = vec![(offset % 16) as u32];
+        let out = pipeline
+            .forward_batch(&[Input {
+                session: id,
+                offset,
+                tokens: tokens.clone(),
+            }])
+            .unwrap();
+        assert_eq!(out[0], common::logits(&mut local, &tokens, offset));
+    }
+    pipeline.close(id).unwrap();
+}
+
+#[test]
+fn model_less_workers_load_their_stage_from_the_controller_bit_exact() {
+    let dir = common::model_dir("pipeline-deploy");
+    for quantized in [false, true] {
+        let path = dir.join(format!("model-{quantized}.gguf"));
+        if quantized {
+            common::write_tiny_qwen3_quantized_layers(&path, 3);
+        } else {
+            common::write_tiny_qwen3_layers(&path, 3);
+        }
+        for (mmap, ends) in [
+            (true, Some(vec![1, 2, 3])),
+            (false, Some(vec![2, 3])),
+            (true, None),
+        ] {
+            let workers = ends.as_ref().map_or(2, Vec::len);
+            let config = AgentConfig {
+                mmap,
+                ..AgentConfig::default()
+            };
+            let (addresses, handles): (Vec<_>, Vec<_>) =
+                (0..workers).map(|_| agent(config.clone(), 1)).unzip();
+            let mut pipeline = Pipeline::deploy(
+                &path,
+                &addresses,
+                KEY,
+                Deployment {
+                    ends: ends.clone(),
+                    limits: limits(),
+                },
+            )
+            .unwrap();
+            assert_eq!(pipeline.plan().stages.len(), workers);
+            assert_matches_local(&mut pipeline, &path);
+            pipeline.shutdown().unwrap();
+            for handle in handles {
+                for result in handle.join().unwrap() {
+                    result.unwrap();
+                }
+            }
+        }
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn cached_slices_are_reused_and_corrupt_ones_are_resent() {
+    let dir = common::model_dir("pipeline-deploy-cache");
+    let path = dir.join("model.gguf");
+    common::write_tiny_qwen3_layers(&path, 3);
+    let caches = [dir.join("cache-0"), dir.join("cache-1")];
+    let (addresses, handles): (Vec<_>, Vec<_>) = caches
+        .iter()
+        .map(|cache| {
+            agent(
+                AgentConfig {
+                    cache_dir: Some(cache.clone()),
+                    ..AgentConfig::default()
+                },
+                3,
+            )
+        })
+        .collect();
+    let deploy = || {
+        Pipeline::deploy(
+            &path,
+            &addresses,
+            KEY,
+            Deployment {
+                ends: Some(vec![1, 3]),
+                limits: limits(),
+            },
+        )
+        .unwrap()
+    };
+    let slice = |cache: &Path| {
+        std::fs::read_dir(cache)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.extension().is_some_and(|e| e == "gguf"))
+            .unwrap()
+    };
+    let mut pipeline = deploy();
+    assert_matches_local(&mut pipeline, &path);
+    pipeline.shutdown().unwrap();
+    let first: Vec<_> = caches.iter().map(|c| slice(c)).collect();
+    let modified = |p: &Path| std::fs::metadata(p).unwrap().modified().unwrap();
+    let stamps: Vec<_> = first.iter().map(|p| modified(p)).collect();
+    // Unchanged slices are reused without a transfer.
+    let mut pipeline = deploy();
+    assert_matches_local(&mut pipeline, &path);
+    pipeline.shutdown().unwrap();
+    assert_eq!(stamps, first.iter().map(|p| modified(p)).collect::<Vec<_>>());
+    // A damaged cache entry fails its checksum and is replaced.
+    let original = std::fs::read(&first[1]).unwrap();
+    let mut bytes = original.clone();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0xff;
+    std::fs::write(&first[1], bytes).unwrap();
+    let mut pipeline = deploy();
+    assert_matches_local(&mut pipeline, &path);
+    pipeline.shutdown().unwrap();
+    assert_eq!(std::fs::read(&first[1]).unwrap(), original);
+    for handle in handles {
+        for result in handle.join().unwrap() {
+            result.unwrap();
+        }
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn deploy_rejects_wrong_keys_and_impossible_splits() {
+    let dir = common::model_dir("pipeline-deploy-reject");
+    let path = dir.join("model.gguf");
+    common::write_tiny_qwen3_layers(&path, 3);
+    // A controller with another key cannot assign a stage.
+    let (address, handle) = agent(AgentConfig::default(), 1);
+    let other = b"another-pipeline-key-32-bytes-long";
+    assert!(Pipeline::deploy(&path, &[address], other, Deployment {
+        ends: None,
+        limits: limits(),
+    })
+    .is_err());
+    assert!(handle.join().unwrap()[0].is_err());
+    // More workers than layers.
+    let (addresses, handles): (Vec<_>, Vec<_>) =
+        (0..4).map(|_| agent(AgentConfig::default(), 1)).unzip();
+    assert!(Pipeline::deploy(&path, &addresses, KEY, Deployment {
+        ends: None,
+        limits: limits(),
+    })
+    .is_err());
+    for handle in handles {
+        // The controller gave up after probing; each worker saw it leave.
+        assert!(handle.join().unwrap()[0].is_err());
+    }
+    // Each stage needs its own worker.
+    let (address, _) = agent(AgentConfig::default(), 1);
+    assert!(Pipeline::deploy(&path, &[address, address], KEY, Deployment {
+        ends: None,
+        limits: limits(),
+    })
+    .is_err());
     std::fs::remove_dir_all(dir).unwrap();
 }

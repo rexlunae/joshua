@@ -194,11 +194,39 @@ enum Commands {
     /// Run CPU DeepSeek V4 generation on an explicit static cluster (experimental).
     #[cfg(feature = "distributed")]
     ClusterRun(cluster_cli::ClusterRun),
+    /// Serve pipeline stages assigned by a controller, starting without a
+    /// model (experimental, CPU Qwen3 dense). Each controller streams this
+    /// worker only its stage's tensors; set JOSHUA_CLUSTER_KEY on both.
+    #[cfg(feature = "distributed")]
+    Worker {
+        /// Address controllers connect to.
+        #[arg(long, default_value = "127.0.0.1:7070")]
+        listen: std::net::SocketAddr,
+        /// Keep received stages here and reuse them when the same model is
+        /// loaded again; by default they are deleted on unload.
+        #[arg(long, env = "JOSHUA_WORKER_CACHE")]
+        cache_dir: Option<PathBuf>,
+        /// Copy stage weights into memory instead of mapping the slice file.
+        #[arg(long)]
+        no_mmap: bool,
+    },
     /// Start the OpenAI-compatible HTTP API server.
     Serve {
-        /// Path to the GGUF model file.
-        #[arg(short, long, env = "JOSHUA_MODEL_PATH")]
-        model: PathBuf,
+        /// Path to the GGUF model file.  Optional with --model-dir, where
+        /// models are loaded later through POST /v1/models/load.
+        #[arg(short, long, env = "JOSHUA_MODEL_PATH", required_unless_present = "model_dir")]
+        model: Option<PathBuf>,
+        /// Enable POST /v1/models/load and /v1/models/unload for models in
+        /// this directory.  Protect the API with --api-key when it is not
+        /// bound to localhost.
+        #[arg(long, env = "JOSHUA_MODEL_DIR")]
+        model_dir: Option<PathBuf>,
+        /// Model-less workers (`joshua worker`) this controller may place
+        /// models on; loads go to all of them unless a request names some
+        /// or asks for a local load.  Needs JOSHUA_CLUSTER_KEY.
+        #[cfg(feature = "distributed")]
+        #[arg(long = "worker", value_delimiter = ',', requires = "model_dir")]
+        workers: Vec<std::net::SocketAddr>,
         /// Address to listen on.  Defaults to localhost; bind `0.0.0.0` only
         /// after enabling `--api-key` and/or TLS, since the API is otherwise
         /// unauthenticated.
@@ -565,8 +593,31 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         #[cfg(feature = "distributed")]
         Commands::ClusterRun(args) => args.run()?,
+        #[cfg(feature = "distributed")]
+        Commands::Worker {
+            listen,
+            cache_dir,
+            no_mmap,
+        } => {
+            let key = cluster_cli::cluster_key()?
+                .ok_or_else(|| anyhow::anyhow!("set JOSHUA_CLUSTER_KEY to 64 hex characters"))?;
+            let listener = std::net::TcpListener::bind(listen)?;
+            tracing::info!("worker waiting for a controller on {}", listener.local_addr()?);
+            let config = joshua::distributed::pipeline::AgentConfig {
+                cache_dir,
+                mmap: !no_mmap,
+                ..Default::default()
+            };
+            tokio::task::spawn_blocking(move || {
+                joshua::distributed::pipeline::serve_agent(&listener, &key, &config)
+            })
+            .await??;
+        }
         Commands::Serve {
             model,
+            model_dir,
+            #[cfg(feature = "distributed")]
+            workers,
             addr,
             n_ctx,
             device,
@@ -608,7 +659,9 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
 
-            let (auto_pin, auto_prefetch) = cache_plan(&model);
+            // Models loaded later through the API don't get the size-based
+            // cache defaults; their explicit flags still apply.
+            let (auto_pin, auto_prefetch) = model.as_deref().map_or((false, false), cache_plan);
             let pin_hot = pin_hot_weights.unwrap_or(auto_pin);
             let prefetch = prefetch_model.unwrap_or(auto_prefetch);
             let (pin_hot_experts, expert_cache_auto) = match expert_cache {
@@ -645,22 +698,47 @@ async fn main() -> anyhow::Result<()> {
                 .expert_placement(expert_placement)
                 .dense_placement(dense_placement)
                 .device_memory_budget(vram_budget.map(|mib| mib.saturating_mul(1024 * 1024)));
-            let mut engine = Engine::with_options(&model, opts)?;
-            if let Some(plugin) = npu_plugin {
-                engine = engine.with_npu_backend(npu_backend(&plugin, npu_in_process)?);
-            }
-            if let Some(max) = max_concurrency {
-                engine = engine.with_max_concurrency(max);
-            }
-            if let Some(max) = max_output_tokens {
-                engine = engine.with_max_output_tokens(max);
-            }
+            let models = match &model {
+                Some(model) => {
+                    let mut engine = Engine::with_options(model, opts.clone())?;
+                    if let Some(plugin) = &npu_plugin {
+                        engine = engine.with_npu_backend(npu_backend(plugin, npu_in_process)?);
+                    }
+                    if let Some(max) = max_concurrency {
+                        engine = engine.with_max_concurrency(max);
+                    }
+                    if let Some(max) = max_output_tokens {
+                        engine = engine.with_max_output_tokens(max);
+                    }
+                    server::ModelRegistry::with_model(Arc::new(engine))
+                }
+                None => server::ModelRegistry::default(),
+            };
+            let manager = model_dir.map(|model_dir| -> anyhow::Result<_> {
+                Ok(server::ModelManager {
+                    model_dir,
+                    engine_options: opts,
+                    max_concurrency,
+                    max_output_tokens,
+                    #[cfg(feature = "distributed")]
+                    cluster_key: if workers.is_empty() {
+                        None
+                    } else {
+                        Some(cluster_cli::cluster_key()?.ok_or_else(|| {
+                            anyhow::anyhow!("--worker needs JOSHUA_CLUSTER_KEY (64 hex characters)")
+                        })?)
+                    },
+                    #[cfg(feature = "distributed")]
+                    workers,
+                })
+            });
             let whisper = whisper_model
                 .map(joshua::whisper::WhisperEngine::new)
                 .transpose()?
                 .map(Arc::new);
             let state = Arc::new(server::ServerState {
-                engine: Arc::new(engine),
+                models,
+                manager: manager.transpose()?,
                 whisper,
                 api_key,
             });

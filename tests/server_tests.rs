@@ -22,9 +22,8 @@ fn tiny_state(dir_name: &str, api_key: Option<&str>) -> Arc<ServerState> {
     write_tiny_llama_gguf(&dir.join("model.gguf"));
     let engine = Engine::with_n_ctx(&dir, 64).expect("engine should load tiny model");
     Arc::new(ServerState {
-        engine: Arc::new(engine),
-        whisper: None,
         api_key: api_key.map(str::to_string),
+        ..ServerState::new(Arc::new(engine))
     })
 }
 

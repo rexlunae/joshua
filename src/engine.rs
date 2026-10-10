@@ -736,6 +736,9 @@ pub struct Engine {
     /// device's memory at load (see [`crate::placement::instances_for_memory`]).
     /// `None` leaves the pool on the RAM-adaptive rule.
     device_session_cap: Option<usize>,
+    /// Pooled-session cap for a remote backend, whose sessions occupy
+    /// bounded worker capacity (see [`Engine::with_remote_backend`]).
+    remote_pool_cap: Option<usize>,
     /// The model's architecture, when candle has a loader for it (see
     /// [`Self::arch_error`]).  Gates per-architecture capabilities at
     /// construction time.
@@ -1085,11 +1088,19 @@ struct NpuState {
     backend: Arc<dyn NpuBackend>,
     failures: AtomicU32,
     disabled: AtomicBool,
+    /// The only place this engine runs generations (a remote pipeline):
+    /// failures surface to the caller and never fall back to loading the
+    /// model locally.
+    exclusive: bool,
 }
 
 impl NpuState {
     /// Record a failure; disable the backend once the limit is reached.
     fn record_failure(&self, backend_name: &str, error: &str) {
+        if self.exclusive {
+            tracing::warn!("{backend_name} failure: {error}");
+            return;
+        }
         let failures = self.failures.fetch_add(1, Ordering::Relaxed) + 1;
         tracing::warn!("NPU backend {backend_name} failure {failures}/{NPU_MAX_FAILURES}: {error}");
         if failures >= NPU_MAX_FAILURES && !self.disabled.swap(true, Ordering::Relaxed) {
@@ -1101,7 +1112,7 @@ impl NpuState {
     }
 
     fn usable(&self) -> bool {
-        !self.disabled.load(Ordering::Relaxed)
+        self.exclusive || !self.disabled.load(Ordering::Relaxed)
     }
 }
 
@@ -1814,6 +1825,7 @@ impl Engine {
             expert_device,
             weights_template: Mutex::new(None),
             device_session_cap,
+            remote_pool_cap: None,
             speculative,
             spec_drafted: AtomicU64::new(0),
             spec_accepted: AtomicU64::new(0),
@@ -2369,7 +2381,7 @@ impl Engine {
                 self.release_model(session, kv_tokens);
                 Ok((response, usage, prefill_tps, decode_tps))
             }
-            Err(e) if was_npu => {
+            Err(e) if was_npu && !self.remote_only() => {
                 // Count the failure (possibly disabling the backend), drop
                 // the session unless it can prove a clean reset, and retry
                 // the whole request once on the candle path.
@@ -2808,6 +2820,11 @@ impl Engine {
     /// Like [`Engine::embed`], additionally returning the total number of
     /// input tokens processed.
     pub fn embed_with_usage(&self, texts: &[String]) -> Result<(Vec<Vec<f32>>, u32)> {
+        if self.remote_only() {
+            return Err(JoshuaError::InvalidRequest(
+                "embeddings are not available for a model served by remote workers".into(),
+            ));
+        }
         // Embeddings also load/hold a model instance — bound concurrency.
         let _permit = InFlightGuard::acquire(&self.in_flight, self.max_concurrency)?;
         let model = self.embedding_model()?;
@@ -2931,8 +2948,34 @@ impl Engine {
             backend,
             failures: AtomicU32::new(0),
             disabled: AtomicBool::new(false),
+            exclusive: false,
         });
         self
+    }
+
+    /// Run every generation on `backend` — a model whose weights live on
+    /// other machines — and never load them locally: backend failures are
+    /// returned to the caller instead of retried on the candle path, and
+    /// embeddings are refused. `capacity` is how many sessions the backend
+    /// holds at once; in-flight requests plus warm pooled sessions stay
+    /// within it.
+    pub fn with_remote_backend(mut self, backend: Arc<dyn NpuBackend>, capacity: usize) -> Self {
+        tracing::info!("remote backend configured: {}", backend.name());
+        let capacity = capacity.max(1);
+        // Keep about half the sessions warm for multi-turn KV reuse.
+        self.max_concurrency = self.max_concurrency.min(capacity.div_ceil(2));
+        self.remote_pool_cap = Some(capacity - self.max_concurrency);
+        self.npu = Some(NpuState {
+            backend,
+            failures: AtomicU32::new(0),
+            disabled: AtomicBool::new(false),
+            exclusive: true,
+        });
+        self
+    }
+
+    fn remote_only(&self) -> bool {
+        self.npu.as_ref().is_some_and(|n| n.exclusive)
     }
 
     /// Whether an NPU backend is configured and not (yet) disabled by the
@@ -3107,7 +3150,7 @@ impl Engine {
                 Ok(session) => return Ok((GenSession::Npu(session), 0)),
                 Err(e) => {
                     npu.record_failure(&npu.backend.name(), &e);
-                    if self.arch_error.is_some() {
+                    if self.arch_error.is_some() || npu.exclusive {
                         // Without a candle loader for this architecture the
                         // fallback can only report "unsupported model", which
                         // would mask the real accelerator failure.
@@ -3166,6 +3209,9 @@ impl Engine {
             if owns_weights {
                 pool_cap = pool_cap.min(cap);
             }
+        }
+        if let Some(cap) = self.remote_pool_cap {
+            pool_cap = cap;
         }
         while pool.len() > pool_cap {
             pool.remove(0);

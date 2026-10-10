@@ -542,6 +542,22 @@ impl<R: Read + Seek> Rdr<'_, R> {
     }
 }
 
+fn alignment(metadata: &HashMap<String, Value>) -> Result<u64> {
+    let alignment = match metadata.get("general.alignment") {
+        Some(Value::U8(v)) => *v as u64,
+        Some(Value::U16(v)) => *v as u64,
+        Some(Value::U32(v)) => *v as u64,
+        Some(Value::I8(v)) if *v >= 0 => *v as u64,
+        Some(Value::I16(v)) if *v >= 0 => *v as u64,
+        Some(Value::I32(v)) if *v >= 0 => *v as u64,
+        _ => DEFAULT_ALIGNMENT,
+    };
+    if alignment == 0 || !alignment.is_power_of_two() {
+        return Err(bad(format!("invalid general.alignment {alignment}")));
+    }
+    Ok(alignment)
+}
+
 /// Parse a GGUF header, preserving dtypes candle cannot represent.
 pub fn read_header<R: Read + Seek>(r: &mut R) -> Result<GgufHeader> {
     let mut magic = [0u8; 4];
@@ -599,18 +615,7 @@ pub fn read_header<R: Read + Seek>(r: &mut R) -> Result<GgufHeader> {
         );
     }
 
-    let alignment = match metadata.get("general.alignment") {
-        Some(Value::U8(v)) => *v as u64,
-        Some(Value::U16(v)) => *v as u64,
-        Some(Value::U32(v)) => *v as u64,
-        Some(Value::I8(v)) if *v >= 0 => *v as u64,
-        Some(Value::I16(v)) if *v >= 0 => *v as u64,
-        Some(Value::I32(v)) if *v >= 0 => *v as u64,
-        _ => DEFAULT_ALIGNMENT,
-    };
-    if alignment == 0 || !alignment.is_power_of_two() {
-        return Err(bad(format!("invalid general.alignment {alignment}")));
-    }
+    let alignment = alignment(&metadata)?;
     let pos = rd.r.stream_position().map_err(bad)?;
     let tensor_data_offset = pos.div_ceil(alignment) * alignment;
 
@@ -653,6 +658,119 @@ pub fn type_size_bytes(dtype: u32, elems: usize) -> Option<usize> {
         return None;
     }
     Some(elems / blck * bytes)
+}
+
+fn write_metadata_value<W: std::io::Write>(w: &mut W, value: &Value) -> std::io::Result<()> {
+    match value {
+        Value::U8(v) => w.write_all(&[*v]),
+        Value::I8(v) => w.write_all(&v.to_le_bytes()),
+        Value::U16(v) => w.write_all(&v.to_le_bytes()),
+        Value::I16(v) => w.write_all(&v.to_le_bytes()),
+        Value::U32(v) => w.write_all(&v.to_le_bytes()),
+        Value::I32(v) => w.write_all(&v.to_le_bytes()),
+        Value::U64(v) => w.write_all(&v.to_le_bytes()),
+        Value::I64(v) => w.write_all(&v.to_le_bytes()),
+        Value::F32(v) => w.write_all(&v.to_le_bytes()),
+        Value::F64(v) => w.write_all(&v.to_le_bytes()),
+        Value::Bool(v) => w.write_all(&[u8::from(*v)]),
+        Value::String(s) => {
+            w.write_all(&(s.len() as u64).to_le_bytes())?;
+            w.write_all(s.as_bytes())
+        }
+        Value::Array(items) => {
+            // An empty array's element type is not retained by the reader;
+            // any type id round-trips it.
+            let ty = items.first().map_or(0, metadata_type_id);
+            w.write_all(&ty.to_le_bytes())?;
+            w.write_all(&(items.len() as u64).to_le_bytes())?;
+            for item in items {
+                write_metadata_value(w, item)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn metadata_type_id(value: &Value) -> u32 {
+    match value {
+        Value::U8(_) => 0,
+        Value::I8(_) => 1,
+        Value::U16(_) => 2,
+        Value::I16(_) => 3,
+        Value::U32(_) => 4,
+        Value::I32(_) => 5,
+        Value::F32(_) => 6,
+        Value::Bool(_) => 7,
+        Value::String(_) => 8,
+        Value::Array(_) => 9,
+        Value::U64(_) => 10,
+        Value::I64(_) => 11,
+        Value::F64(_) => 12,
+    }
+}
+
+/// A tensor's bytes in the source file and the zero padding that follows it
+/// in a [`subset_layout`] file.
+pub type SourceRange = (std::ops::Range<u64>, usize);
+
+/// A self-contained GGUF v3 holding all of `header`'s metadata and only the
+/// tensors named in `names`, laid out compactly in the given order.
+///
+/// Returns the serialized header (padded to the alignment, so tensor data
+/// starts right after it) and, per tensor, its byte range in the source file
+/// together with the zero padding to append after it. Copying those ranges
+/// in order after the header reproduces the subset file without holding any
+/// weights in memory.
+pub fn subset_layout(
+    header: &GgufHeader,
+    names: &[String],
+) -> Result<(Vec<u8>, Vec<SourceRange>)> {
+    use std::io::Write;
+    let alignment = alignment(&header.metadata)?;
+    let mut out = Vec::new();
+    let io = |e: std::io::Error| bad(e);
+    out.write_all(&MAGIC.to_le_bytes()).map_err(io)?;
+    out.write_all(&3u32.to_le_bytes()).map_err(io)?;
+    out.write_all(&(names.len() as u64).to_le_bytes()).map_err(io)?;
+    out.write_all(&(header.metadata.len() as u64).to_le_bytes())
+        .map_err(io)?;
+    // Sorted for a deterministic byte stream: equal inputs give equal files.
+    let mut keys: Vec<_> = header.metadata.keys().collect();
+    keys.sort();
+    for key in keys {
+        let value = &header.metadata[key];
+        out.write_all(&(key.len() as u64).to_le_bytes()).map_err(io)?;
+        out.write_all(key.as_bytes()).map_err(io)?;
+        out.write_all(&metadata_type_id(value).to_le_bytes())
+            .map_err(io)?;
+        write_metadata_value(&mut out, value).map_err(io)?;
+    }
+    let mut ranges = Vec::with_capacity(names.len());
+    let mut offset = 0u64;
+    for name in names {
+        let info = header
+            .tensors
+            .get(name)
+            .ok_or_else(|| bad(format!("tensor `{name}` not in the GGUF header")))?;
+        let size = type_size_bytes(info.dtype, info.elem_count())
+            .ok_or_else(|| bad(format!("tensor `{name}` has unknown dtype {}", info.dtype)))?
+            as u64;
+        out.write_all(&(name.len() as u64).to_le_bytes()).map_err(io)?;
+        out.write_all(name.as_bytes()).map_err(io)?;
+        out.write_all(&(info.dims.len() as u32).to_le_bytes())
+            .map_err(io)?;
+        for dim in info.dims.iter().rev() {
+            out.write_all(&(*dim as u64).to_le_bytes()).map_err(io)?;
+        }
+        out.write_all(&info.dtype.to_le_bytes()).map_err(io)?;
+        out.write_all(&offset.to_le_bytes()).map_err(io)?;
+        let start = header.tensor_data_offset + info.offset;
+        let padded = size.div_ceil(alignment) * alignment;
+        ranges.push((start..start + size, (padded - size) as usize));
+        offset += padded;
+    }
+    out.resize((out.len() as u64).div_ceil(alignment) as usize * alignment as usize, 0);
+    Ok((out, ranges))
 }
 
 #[cfg(test)]
@@ -1103,3 +1221,4 @@ mod tests {
         }
     }
 }
+
