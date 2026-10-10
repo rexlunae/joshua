@@ -113,7 +113,8 @@ use crate::embedding::EmbeddingModel;
 use crate::model::{Architecture, QuantizedModel};
 use crate::npu::{NpuBackend, NpuSession};
 use crate::speculative::{
-    next_draft_len, NgramDrafter, SpeculativeConfig, SpeculativeStats, TokenDistRef, Verdict,
+    next_draft_len, NgramDrafter, SpeculationGate, SpeculativeConfig, SpeculativeStats,
+    TokenDistRef, Verdict,
 };
 pub use crate::placement::{DensePlacement, ExpertPlacement, VramExpertCache};
 use crate::template::ChatTemplate;
@@ -2556,6 +2557,8 @@ impl Engine {
             .filter(|_| !penalty_seed.is_empty() && model.supports_speculative());
         let mut drafter = spec.map(|c| NgramDrafter::new(c, penalty_seed));
         let mut draft_len = spec.map_or(0, |c| c.max_draft);
+        // Holds drafting off while it measures slower than plain decoding.
+        let mut gate = spec.filter(|c| c.cost_gate).map(|_| SpeculationGate::default());
         let (mut n_drafted, mut n_accepted, mut n_verify) = (0u64, 0u64, 0u64);
         // A token already chosen by a rejected verification (the
         // correction), to emit before sampling anything new.
@@ -2607,16 +2610,22 @@ impl Engine {
             // can still be emitted (max_tokens) and fed (context window).
             drafts.clear();
             if let Some(d) = drafter.as_mut() {
-                let room = (options.max_tokens - text.n_decoded) as usize;
-                let ctx_room = (self.n_ctx as usize).saturating_sub(n_cur + 1);
-                d.draft_into(draft_len.min(room).min(ctx_room), &mut drafts);
+                if gate.as_mut().is_none_or(SpeculationGate::allow) {
+                    let room = (options.max_tokens - text.n_decoded) as usize;
+                    let ctx_room = (self.n_ctx as usize).saturating_sub(n_cur + 1);
+                    d.draft_into(draft_len.min(room).min(ctx_room), &mut drafts);
+                }
             }
 
+            let step_start = Instant::now();
             if drafts.is_empty() {
                 // Single-token decode step.
                 logits_vec = model.forward_tokens(&[next_token], n_cur, &self.dense_device)?;
                 fed_tokens.push(next_token);
                 n_cur += 1;
+                if let Some(g) = gate.as_mut() {
+                    g.record_plain(step_start.elapsed().as_secs_f64());
+                }
                 continue;
             }
 
@@ -2676,6 +2685,10 @@ impl Engine {
                 return Err(JoshuaError::Inference(format!(
                     "speculative decoding could not roll the KV cache back to {n_cur} tokens"
                 )));
+            }
+            // The pass's cost includes its rollback.
+            if let Some(g) = gate.as_mut() {
+                g.record_verify(accepted + 1, step_start.elapsed().as_secs_f64());
             }
             if stop {
                 break;
