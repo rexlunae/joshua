@@ -207,3 +207,34 @@ fn deepseek41_runs_through_the_engine() {
     assert!(usage.completion_tokens > 0, "{usage:?}");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// A GGUF cut short inside its last tensor is refused at load (#175), even
+/// though the engine's page-rounded mapping would read the missing bytes as
+/// zeros: the layout is checked against the file's real length.
+#[test]
+fn engine_refuses_a_truncated_gguf() {
+    let (dir, model) = fixture("deepseek41-truncated");
+    // Cut 8 bytes into the tensor that ends last (the writer pads after it).
+    let h = joshua::gguf_ext::read_header(&mut std::fs::File::open(&model).unwrap()).unwrap();
+    let end = h
+        .tensors
+        .values()
+        .map(|i| {
+            let size = joshua::gguf_ext::type_size_bytes(i.dtype, i.elem_count()).unwrap();
+            h.tensor_data_offset + i.offset + size as u64
+        })
+        .max()
+        .unwrap();
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&model)
+        .unwrap();
+    f.set_len(end - 8).unwrap();
+    drop(f);
+    let msg = match joshua::Engine::new(&model) {
+        Ok(_) => panic!("a truncated GGUF must not load"),
+        Err(e) => e.to_string(),
+    };
+    assert!(msg.contains("past the end"), "{msg}");
+    std::fs::remove_dir_all(&dir).ok();
+}

@@ -48,6 +48,7 @@ impl DeepSeekCluster {
             let file = File::open(path.as_ref()).context("opening local cluster GGUF")?;
             let mut reader = BufReader::new(&file);
             let header = gguf_ext::read_header(&mut reader)?;
+            header.validate_layout(file.metadata()?.len())?;
             ensure!(
                 header.architecture().as_deref() == Some("deepseek4"),
                 "cluster inference currently supports only DeepSeek V4"

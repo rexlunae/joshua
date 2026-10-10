@@ -142,8 +142,11 @@ fn checked_sum(values: &[u64]) -> Result<u64> {
 }
 
 fn model_header(path: &Path) -> Result<(gguf_ext::GgufHeader, String)> {
-    let mut reader = BufReader::new(File::open(path)?);
+    let file = File::open(path)?;
+    let file_len = file.metadata()?.len();
+    let mut reader = BufReader::new(file);
     let header = gguf_ext::read_header(&mut reader)?;
+    header.validate_layout(file_len)?;
     ensure!(
         header.architecture().as_deref() == Some("qwen3"),
         "pipeline supports only CPU Qwen3 dense"
