@@ -14,9 +14,10 @@
 //!   model directory, locally or onto its workers (when enabled)
 //! - `POST /v1/models/unload`         — unload a model (when enabled)
 //!
-//! Chat and text completions stop decoding when the HTTP request is dropped
-//! (the client, or a coordinator proxying for it, disconnected), so a
-//! cancelled request releases its concurrency permit promptly.
+//! Chat and text completions stop decoding, and embeddings stop between
+//! input texts, when the HTTP request is dropped (the client, or a
+//! coordinator proxying for it, disconnected), so a cancelled request
+//! releases its concurrency permit promptly.
 
 use std::convert::Infallible;
 use std::path::{Path, PathBuf};
@@ -1081,9 +1082,12 @@ async fn embeddings(
     let (model, engine) = state.models.resolve(&req.model)?;
     let texts: Vec<String> = req.input.into_vec();
 
+    // Like generation, stop embedding a batch once the requester is gone.
+    let cancel = CancelOnDrop::new();
     let (vectors, prompt_tokens) = tokio::task::spawn_blocking({
         let engine = Arc::clone(&engine);
-        move || engine.embed_with_usage(&texts)
+        let flag = cancel.flag();
+        move || engine.embed_with_usage_cancellable(&texts, &flag)
     })
     .await
     .map_err(|e| ApiError::internal(e.to_string()))?

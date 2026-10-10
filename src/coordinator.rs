@@ -34,17 +34,28 @@
 //!   worker response — a `400` for a bad request, a `500` — is the request's
 //!   answer and is passed through, so a deterministic failure is not run
 //!   again elsewhere.
-//! * **Streams are never restarted.**  Once the first SSE event has been
-//!   forwarded, a lost worker ends the stream with an OpenAI-style error
-//!   event (and no `[DONE]`) instead of replaying the request elsewhere.
-//!   Events are forwarded whole and in order.
+//! * **Deadline**: a worker must produce its first output — the whole
+//!   non-streaming response, or the first SSE event — within
+//!   `response_timeout`.  Otherwise the attempt ends with a `504`, the
+//!   worker connection is closed (cancelling the work) and the worker is
+//!   taken out of rotation until its next good probe.  Once a stream has
+//!   started there is no deadline: active generation is never cut off.
+//! * **Streams are never restarted.**  A response is streamed when the
+//!   worker answers `text/event-stream`.  Once the first SSE event has been
+//!   forwarded, a lost worker — or a stream that ends without `[DONE]` —
+//!   ends the stream with an OpenAI-style error event (and no `[DONE]`)
+//!   instead of replaying the request elsewhere.  Events are forwarded whole
+//!   and in order; an unfinished event is never forwarded.
 //! * **Cancellation**: each forwarded request owns its worker connection.
 //!   When the client disconnects, the connection to the worker is closed,
-//!   and the worker stops decoding (see [`crate::server`]).
+//!   and the worker stops decoding, or stops embedding between input texts
+//!   (see [`crate::server`]).
 //! * **Records**: every request gets an `x-request-id` (the client's, when it
-//!   sends a well-formed one) that is forwarded to the worker and returned
-//!   with `x-joshua-worker`.  Logs carry the request id, worker, attempt,
-//!   queue time and outcome — never prompt or output text.
+//!   sends a well-formed one), returned on every response and forwarded to
+//!   the worker.  Responses from a worker also carry `x-joshua-worker`;
+//!   requests rejected before dispatch have none.  Logs carry the request
+//!   id, worker, attempt, queue time and outcome — never prompt or output
+//!   text.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -59,7 +70,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use http_body_util::{BodyExt, Full, Limited};
+use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
 use hyper::body::Incoming;
 use hyper_util::rt::TokioIo;
 use serde::{Deserialize, Serialize};
@@ -86,8 +97,8 @@ pub const WORKER_HEADER: &str = "x-joshua-worker";
 /// Request/response header carrying the request id.
 pub const REQUEST_ID_HEADER: &str = "x-request-id";
 
-/// Ceiling on a buffered (non-streaming) worker response.
-const MAX_BUFFERED_BODY: usize = 64 << 20;
+/// Default ceiling on a buffered (non-streaming) worker response.
+pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 64 << 20;
 
 /// Ceiling on a worker error or info body.
 const MAX_SMALL_BODY: usize = 1 << 20;
@@ -198,11 +209,20 @@ pub struct CoordinatorConfig {
     pub health_interval: Duration,
     /// Timeout for connecting to a worker (and for a whole health probe).
     pub connect_timeout: Duration,
+    /// Longest a dispatched request may wait for its first output: the
+    /// complete non-streaming response, or the first whole SSE event.
+    /// `None` waits indefinitely.  A joshua worker computes a completion
+    /// before sending any of it, so this also bounds generation time.
+    pub response_timeout: Option<Duration>,
+    /// Largest non-streaming worker response the router buffers; a larger
+    /// one is answered with a `502` (`response_too_large`).
+    pub max_response_bytes: usize,
 }
 
 impl CoordinatorConfig {
     /// Defaults for the given workers: no keys, worker-reported slots, a
-    /// 64-request queue with a 30 s wait, 2 s probes and connect timeout.
+    /// 64-request queue with a 30 s wait, 2 s probes and connect timeout, a
+    /// 10 min first-output deadline and a 64 MiB response cap.
     pub fn new(workers: Vec<SocketAddr>) -> Self {
         Self {
             workers,
@@ -213,6 +233,8 @@ impl CoordinatorConfig {
             queue_timeout: Duration::from_secs(30),
             health_interval: Duration::from_secs(2),
             connect_timeout: Duration::from_secs(2),
+            response_timeout: Some(Duration::from_secs(600)),
+            max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
         }
     }
 }
@@ -378,6 +400,29 @@ enum Failure {
     Retry { reason: String, admission: bool },
     /// The answer to send the client as-is.
     Final(Response),
+}
+
+/// A worker's first output for one attempt.
+enum FirstOutput {
+    /// A complete non-streaming response.
+    Whole(Response),
+    /// An SSE stream whose first whole events have arrived.
+    Stream {
+        body: Incoming,
+        framer: SseFramer,
+        first: Bytes,
+        done: bool,
+        conn: AbortOnDrop,
+    },
+}
+
+/// The one field the router reads from a request body.  Every other field
+/// is validated and skipped without being built, so routing a large prompt
+/// or embedding batch does not copy it into a JSON tree.
+#[derive(Deserialize)]
+struct Envelope {
+    #[serde(default)]
+    model: Option<String>,
 }
 
 impl Coordinator {
@@ -745,10 +790,78 @@ impl Coordinator {
         slot: SlotGuard,
         path: &str,
         body: Bytes,
-        stream: bool,
         log: RequestLog,
     ) -> Result<Response, Failure> {
         let w = &self.workers[slot.index];
+        // Dropping the attempt on timeout drops its connection, which
+        // cancels the work on the worker.
+        let attempt = self.first_output(w, path, body, &log);
+        let first = match self.config.response_timeout {
+            Some(limit) => match tokio::time::timeout(limit, attempt).await {
+                Ok(first) => first,
+                Err(_) => {
+                    w.mark_unhealthy(format!("no response within {} ms", limit.as_millis()));
+                    log.finish(StatusCode::GATEWAY_TIMEOUT, "worker_timeout");
+                    return Err(Failure::Final(log.decorate(error_response(
+                        StatusCode::GATEWAY_TIMEOUT,
+                        "the worker did not respond in time",
+                        "server_error",
+                        Some("worker_timeout"),
+                    ))));
+                }
+            },
+            None => attempt.await,
+        }?;
+        let (body, framer, first, done, conn) = match first {
+            FirstOutput::Whole(response) => {
+                drop(slot);
+                log.finish(response.status(), "complete");
+                return Ok(log.decorate(response));
+            }
+            FirstOutput::Stream {
+                body,
+                framer,
+                first,
+                done,
+                conn,
+            } => (body, framer, first, done, conn),
+        };
+        let headers = log.headers();
+        let state = StreamState {
+            body: Some(body),
+            framer,
+            first: Some(first),
+            done,
+            events: 0,
+            outcome: "client_disconnected",
+            log,
+            _conn: conn,
+            slot,
+        };
+        let events = futures_util::stream::unfold(state, |mut st| async move {
+            let chunk = st.next_chunk().await?;
+            Some((Ok::<Bytes, std::io::Error>(chunk), st))
+        });
+        let mut out = Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .header(header::CACHE_CONTROL, "no-cache");
+        for (name, value) in headers.iter() {
+            out = out.header(name, value);
+        }
+        Ok(out.body(Body::from_stream(events)).unwrap_or_default())
+    }
+
+    /// Send the request and wait for its first output: the whole response
+    /// when the worker answers JSON, or the first whole SSE events when it
+    /// answers `text/event-stream`.
+    async fn first_output(
+        &self,
+        w: &Worker,
+        path: &str,
+        body: Bytes,
+        log: &RequestLog,
+    ) -> Result<FirstOutput, Failure> {
         let mut extra = HeaderMap::new();
         extra.insert(
             header::CONTENT_TYPE,
@@ -768,8 +881,8 @@ impl Coordinator {
             }
         };
         let status = response.status();
+        let content_type = response.headers().get(header::CONTENT_TYPE).cloned();
         if !status.is_success() {
-            let content_type = response.headers().get(header::CONTENT_TYPE).cloned();
             let body = Limited::new(response.into_body(), MAX_SMALL_BODY)
                 .collect()
                 .await
@@ -800,13 +913,31 @@ impl Coordinator {
             return Err(Failure::Final(log.decorate(out)));
         }
 
-        if !stream {
-            let content_type = response.headers().get(header::CONTENT_TYPE).cloned();
-            let body = match Limited::new(response.into_body(), MAX_BUFFERED_BODY)
-                .collect()
-                .await
-            {
+        // Stream exactly when the worker does: only chat completions stream,
+        // and a `stream` flag on another route still gets a JSON answer.
+        let is_stream = content_type
+            .as_ref()
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|ct| {
+                ct.trim_start()
+                    .to_ascii_lowercase()
+                    .starts_with("text/event-stream")
+            });
+        if !is_stream {
+            let limit = self.config.max_response_bytes;
+            let body = match Limited::new(response.into_body(), limit).collect().await {
                 Ok(c) => c.to_bytes(),
+                Err(e) if e.downcast_ref::<LengthLimitError>().is_some() => {
+                    // The worker answered; the answer is just too large to
+                    // buffer.  Neither the worker's fault nor worth a retry.
+                    log.finish(StatusCode::BAD_GATEWAY, "response_too_large");
+                    return Err(Failure::Final(log.decorate(error_response(
+                        StatusCode::BAD_GATEWAY,
+                        &format!("the worker's response exceeds the router's {limit}-byte limit"),
+                        "server_error",
+                        Some("response_too_large"),
+                    ))));
+                }
                 Err(e) => {
                     let reason = format!("worker response lost: {e}");
                     w.mark_unhealthy(reason.clone());
@@ -817,26 +948,32 @@ impl Coordinator {
                 }
             };
             drop(conn);
-            drop(slot);
-            log.finish(status, "complete");
             let mut out = Response::builder().status(status);
             if let Some(ct) = content_type {
                 out = out.header(header::CONTENT_TYPE, ct);
             }
-            let out = out.body(Body::from(body)).unwrap_or_default();
-            return Ok(log.decorate(out));
+            return Ok(FirstOutput::Whole(
+                out.body(Body::from(body)).unwrap_or_default(),
+            ));
         }
 
         // Streaming: hold the response until the first whole event arrives,
         // so a worker lost before any output can still be retried.
         let mut body = response.into_body();
         let mut framer = SseFramer::default();
-        let first = loop {
+        loop {
             match body.frame().await {
                 Some(Ok(frame)) => {
                     if let Ok(data) = frame.into_data() {
-                        if let Some(events) = framer.push(&data) {
-                            break events;
+                        if let Some(first) = framer.push(&data) {
+                            let done = has_done_event(&first);
+                            return Ok(FirstOutput::Stream {
+                                body,
+                                framer,
+                                first,
+                                done,
+                                conn,
+                            });
                         }
                     }
                 }
@@ -848,40 +985,16 @@ impl Coordinator {
                         admission: false,
                     });
                 }
-                None => match std::mem::take(&mut framer).finish() {
-                    Some(rest) => break rest,
-                    None => {
-                        return Err(Failure::Retry {
-                            reason: "worker closed the stream before output".to_string(),
-                            admission: false,
-                        })
-                    }
-                },
+                // Ended before one whole event: nothing reached the client,
+                // and an unfinished event is dropped.
+                None => {
+                    return Err(Failure::Retry {
+                        reason: "worker closed the stream before output".to_string(),
+                        admission: false,
+                    })
+                }
             }
-        };
-        let headers = log.headers();
-        let state = StreamState {
-            body: Some(body),
-            framer,
-            first: Some(first),
-            events: 0,
-            outcome: "client_disconnected",
-            log,
-            _conn: conn,
-            slot,
-        };
-        let events = futures_util::stream::unfold(state, |mut st| async move {
-            let chunk = st.next_chunk().await?;
-            Some((Ok::<Bytes, std::io::Error>(chunk), st))
-        });
-        let mut out = Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "text/event-stream")
-            .header(header::CACHE_CONTROL, "no-cache");
-        for (name, value) in headers.iter() {
-            out = out.header(name, value);
         }
-        Ok(out.body(Body::from_stream(events)).unwrap_or_default())
     }
 
     /// Route one request: admission, forwarding, and the retry policy.
@@ -892,13 +1005,13 @@ impl Coordinator {
         body: Bytes,
     ) -> Response {
         let request_id = request_id_from(headers);
-        let parsed: serde_json::Value = match serde_json::from_slice(&body) {
-            Ok(v) => v,
+        let model = match serde_json::from_slice::<Envelope>(&body) {
+            Ok(envelope) => envelope.model.filter(|m| !m.is_empty()),
             Err(e) => {
                 return with_request_id(
                     error_response(
                         StatusCode::BAD_REQUEST,
-                        &format!("request body is not valid JSON: {e}"),
+                        &format!("request body is not a valid JSON request: {e}"),
                         "invalid_request_error",
                         None,
                     ),
@@ -906,16 +1019,6 @@ impl Coordinator {
                 )
             }
         };
-        let model = parsed
-            .get("model")
-            .and_then(|m| m.as_str())
-            .filter(|m| !m.is_empty())
-            .map(str::to_string);
-        let stream = parsed
-            .get("stream")
-            .and_then(|s| s.as_bool())
-            .unwrap_or(false);
-        drop(parsed);
 
         let arrived = Instant::now();
         let mut tried: Vec<usize> = Vec::new();
@@ -924,8 +1027,17 @@ impl Coordinator {
             let slot = match self.acquire(path, model.as_deref(), &tried).await {
                 Ok(slot) => slot,
                 Err(reject) => {
+                    // Once attempts were made, "no worker left" is about
+                    // those attempts — even when the workers that failed in
+                    // transit are now marked unhealthy.
                     let reject = match reject {
-                        Reject::Exhausted if last_admission_only => Reject::AllRefused,
+                        Reject::Exhausted | Reject::Unavailable if !tried.is_empty() => {
+                            if last_admission_only {
+                                Reject::AllRefused
+                            } else {
+                                Reject::Exhausted
+                            }
+                        }
                         other => other,
                     };
                     tracing::info!(
@@ -948,7 +1060,7 @@ impl Coordinator {
                 queue_ms: arrived.elapsed().as_millis() as u64,
                 started: Instant::now(),
             };
-            match self.forward(slot, path, body.clone(), stream, log).await {
+            match self.forward(slot, path, body.clone(), log).await {
                 Ok(response) | Err(Failure::Final(response)) => return response,
                 Err(Failure::Retry { reason, admission }) => {
                     tracing::warn!(
@@ -1015,6 +1127,8 @@ struct StreamState {
     body: Option<Incoming>,
     framer: SseFramer,
     first: Option<Bytes>,
+    /// The worker's terminal `[DONE]` event has been forwarded.
+    done: bool,
     events: usize,
     outcome: &'static str,
     log: RequestLog,
@@ -1034,10 +1148,17 @@ impl StreamState {
                 Some(Ok(frame)) => {
                     if let Ok(data) = frame.into_data() {
                         if let Some(events) = self.framer.push(&data) {
+                            self.done |= has_done_event(&events);
                             self.events += 1;
                             return Some(events);
                         }
                     }
+                }
+                // The stream already finished; nothing more is owed.
+                Some(Err(_)) | None if self.done => {
+                    self.body = None;
+                    self.outcome = "complete";
+                    return None;
                 }
                 Some(Err(e)) => {
                     // Output already reached the client: never restart.
@@ -1049,9 +1170,11 @@ impl StreamState {
                     return Some(Bytes::from_static(MID_STREAM_ERROR));
                 }
                 None => {
+                    // A clean close before `[DONE]` is still an incomplete
+                    // answer: drop any unfinished event and say so.
                     self.body = None;
-                    self.outcome = "complete";
-                    return std::mem::take(&mut self.framer).finish();
+                    self.outcome = "worker_lost";
+                    return Some(Bytes::from_static(MID_STREAM_ERROR));
                 }
             }
         }
@@ -1074,7 +1197,8 @@ impl Drop for StreamState {
     }
 }
 
-/// SSE event sent when a worker is lost after output started.
+/// SSE event sent when a worker is lost (or its stream ends without
+/// `[DONE]`) after output started.
 const MID_STREAM_ERROR: &[u8] = b"data: {\"error\":{\"message\":\"the worker serving this request was lost after output started; the response is incomplete\",\"type\":\"server_error\",\"param\":null,\"code\":\"worker_lost\"}}\n\n";
 
 /// Splits a byte stream into whole SSE events (terminated by a blank line),
@@ -1093,11 +1217,15 @@ impl SseFramer {
         let rest = self.buf.split_off(end);
         Some(Bytes::from(std::mem::replace(&mut self.buf, rest)))
     }
+}
 
-    /// Whatever is left at a clean end of stream.
-    fn finish(self) -> Option<Bytes> {
-        (!self.buf.is_empty()).then(|| Bytes::from(self.buf))
-    }
+/// Whether whole SSE events include the stream's terminal `data: [DONE]`.
+fn has_done_event(events: &[u8]) -> bool {
+    events.split(|&b| b == b'\n').any(|line| {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        line.strip_prefix(b"data:")
+            .is_some_and(|v| v.trim_ascii() == b"[DONE]")
+    })
 }
 
 /// The client's `x-request-id` when well formed, else a fresh one.
@@ -1190,6 +1318,12 @@ fn reject_response(reject: Reject) -> Response {
 /// The coordinator's router: the routed `/v1` endpoints plus `GET /health`,
 /// `GET /v1/models` (union of healthy workers' models) and `GET /v1/workers`
 /// (registry status).
+///
+/// Cross-origin (CORS) access is allowed only when a client API key is
+/// configured: browser pages from other origins can then call the router but
+/// must present the key.  Without a key, the browser's same-origin policy
+/// applies, so an arbitrary website cannot read model output or worker
+/// status from a router reachable from the visitor's machine.
 pub fn create_router(coordinator: Arc<Coordinator>) -> Router {
     let mut api = Router::new()
         .route("/v1/models", get(list_models))
@@ -1208,11 +1342,14 @@ pub fn create_router(coordinator: Arc<Coordinator>) -> Router {
         Arc::clone(&coordinator),
         require_api_key,
     ));
-    Router::new()
-        .route("/health", get(health))
-        .merge(api)
-        .layer(CorsLayer::permissive())
-        .with_state(coordinator)
+    let cors = coordinator.config.api_key.is_some();
+    let app = Router::new().route("/health", get(health)).merge(api);
+    let app = if cors {
+        app.layer(CorsLayer::permissive())
+    } else {
+        app
+    };
+    app.with_state(coordinator)
 }
 
 async fn require_api_key(State(c): State<Arc<Coordinator>>, req: Request, next: Next) -> Response {
@@ -1329,8 +1466,27 @@ mod tests {
             f.push(b"\n\ndata: e\n\ndata").as_deref(),
             Some(&b"data: d\n\ndata: e\n\n"[..])
         );
-        assert_eq!(f.finish().as_deref(), Some(&b"data"[..]));
-        assert_eq!(SseFramer::default().finish(), None);
+        assert_eq!(f.buf, b"data");
+    }
+
+    #[test]
+    fn done_events_are_recognised_whole() {
+        assert!(has_done_event(b"data: {\"i\":1}\n\ndata: [DONE]\n\n"));
+        assert!(has_done_event(b"data:[DONE]\r\n\r\n"));
+        assert!(!has_done_event(b"data: {\"text\":\"[DONE]\"}\n\n"));
+        assert!(!has_done_event(b"data: [DONE]x\n\n"));
+    }
+
+    #[test]
+    fn the_routing_envelope_reads_only_the_model() {
+        let body = br#"{"messages":[{"role":"user","content":"x"}],"model":"m","stream":true}"#;
+        let e: Envelope = serde_json::from_slice(body).unwrap();
+        assert_eq!(e.model.as_deref(), Some("m"));
+        let e: Envelope = serde_json::from_slice(br#"{"model":null}"#).unwrap();
+        assert!(e.model.is_none());
+        let e: Envelope = serde_json::from_slice(br#"{"model":"a\u0062"}"#).unwrap();
+        assert_eq!(e.model.as_deref(), Some("ab"));
+        assert!(serde_json::from_slice::<Envelope>(b"{nope").is_err());
     }
 
     #[test]
