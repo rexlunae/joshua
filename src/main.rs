@@ -659,8 +659,6 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
 
-            // Models loaded later through the API don't get the size-based
-            // cache defaults; their explicit flags still apply.
             let (auto_pin, auto_prefetch) = model.as_deref().map_or((false, false), cache_plan);
             let pin_hot = pin_hot_weights.unwrap_or(auto_pin);
             let prefetch = prefetch_model.unwrap_or(auto_prefetch);
@@ -698,11 +696,15 @@ async fn main() -> anyhow::Result<()> {
                 .expert_placement(expert_placement)
                 .dense_placement(dense_placement)
                 .device_memory_budget(vram_budget.map(|mib| mib.saturating_mul(1024 * 1024)));
+            // One backend serves the startup model and any loaded later.
+            let npu = npu_plugin
+                .map(|plugin| npu_backend(&plugin, npu_in_process))
+                .transpose()?;
             let models = match &model {
                 Some(model) => {
                     let mut engine = Engine::with_options(model, opts.clone())?;
-                    if let Some(plugin) = &npu_plugin {
-                        engine = engine.with_npu_backend(npu_backend(plugin, npu_in_process)?);
+                    if let Some(backend) = &npu {
+                        engine = engine.with_npu_backend(Arc::clone(backend));
                     }
                     if let Some(max) = max_concurrency {
                         engine = engine.with_max_concurrency(max);
@@ -717,7 +719,15 @@ async fn main() -> anyhow::Result<()> {
             let manager = model_dir.map(|model_dir| -> anyhow::Result<_> {
                 Ok(server::ModelManager {
                     model_dir,
-                    engine_options: opts,
+                    // Size-based cache defaults are per model; explicit
+                    // flags still win.
+                    engine_options: Arc::new(move |path: &Path| {
+                        let (auto_pin, auto_prefetch) = cache_plan(path);
+                        opts.clone()
+                            .pin_hot_weights(pin_hot_weights.unwrap_or(auto_pin))
+                            .prefetch_whole_model(prefetch_model.unwrap_or(auto_prefetch))
+                    }),
+                    npu_backend: npu,
                     max_concurrency,
                     max_output_tokens,
                     #[cfg(feature = "distributed")]

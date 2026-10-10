@@ -1057,7 +1057,8 @@ pub fn serve_controller(mut stream: TcpStream, key: &[u8], config: &AgentConfig)
         false,
         config.timeout,
     )?;
-    let mut loaded: Option<(Worker, Option<PathBuf>)> = None;
+    // Dropped in order: the stage's weights, then its temporary file.
+    let mut loaded: Option<(Worker, RemoveOnDrop)> = None;
     let result = (|| -> Result<()> {
         // The first frame is bounded so an unauthenticated peer cannot hold
         // this single-controller worker; an authenticated one may idle.
@@ -1103,12 +1104,7 @@ pub fn serve_controller(mut stream: TcpStream, key: &[u8], config: &AgentConfig)
         }
     })();
     let _ = wire.stream.shutdown(Shutdown::Both);
-    if let Some((worker, temporary)) = loaded {
-        drop(worker);
-        if let Some(path) = temporary {
-            let _ = std::fs::remove_file(path);
-        }
-    }
+    drop(loaded);
     result
 }
 
@@ -1162,7 +1158,7 @@ fn receive_stage(
     rank: usize,
     slice: &str,
     bytes: u64,
-) -> Result<(Worker, Option<PathBuf>)> {
+) -> Result<(Worker, RemoveOnDrop)> {
     plan.validate()?;
     ensure!(rank < plan.stages.len(), "invalid stage rank");
     ensure!(
@@ -1181,6 +1177,8 @@ fn receive_stage(
             true,
         ),
     };
+    // Owns a temporary slice from here on, through every early return.
+    let cleanup = RemoveOnDrop(temporary.then(|| path.clone()));
     let digest_path = path.with_extension("sha256");
     let cached = !temporary
         && std::fs::read_to_string(&digest_path).is_ok_and(|expected| {
@@ -1228,19 +1226,22 @@ fn receive_stage(
         }
     }
     let t = Instant::now();
-    let worker = match Worker::load_slice(&path, plan, rank, config.mmap) {
-        Ok(worker) => worker,
-        Err(error) => {
-            if temporary {
-                let _ = std::fs::remove_file(&path);
-            }
-            return Err(error);
-        }
-    };
+    let worker = Worker::load_slice(&path, plan, rank, config.mmap)?;
     wire.send(&Packet::control(Command::Reply {
         compute_ns: elapsed_ns(t),
     }))?;
-    Ok((worker, temporary.then_some(path)))
+    Ok((worker, cleanup))
+}
+
+/// Deletes a temporary stage slice when dropped.
+struct RemoveOnDrop(Option<PathBuf>);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        if let Some(path) = &self.0 {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 /// How a controller places a model on its workers (see [`Pipeline::deploy`]).

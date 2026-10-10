@@ -122,13 +122,20 @@ impl ModelRegistry {
 
     /// The model a request names. With a single model loaded, any name
     /// selects it, as when a server only ever held one model.
-    pub fn resolve(&self, requested: &str) -> Result<Arc<Engine>, ApiError> {
+    /// Returns the model's id and engine.
+    pub fn resolve(&self, requested: &str) -> Result<(String, Arc<Engine>), ApiError> {
         let models = self.models.read().unwrap_or_else(|p| p.into_inner());
-        if let Some(model) = models.iter().find(|m| m.id == requested) {
-            return Ok(Arc::clone(&model.engine));
+        let found = models
+            .iter()
+            .find(|m| m.id == requested)
+            .or(match models.as_slice() {
+                [only] => Some(only),
+                _ => None,
+            });
+        if let Some(model) = found {
+            return Ok((model.id.clone(), Arc::clone(&model.engine)));
         }
         match models.as_slice() {
-            [only] => Ok(Arc::clone(&only.engine)),
             [] => Err(ApiError::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "no model is loaded; load one with POST /v1/models/load",
@@ -204,8 +211,11 @@ pub struct ModelManager {
     /// Load requests name model files relative to this directory and cannot
     /// leave it.
     pub model_dir: PathBuf,
-    /// Settings for models run on this host.
-    pub engine_options: EngineOptions,
+    /// Settings for a model run on this host, given its file (so defaults
+    /// can depend on its size).
+    pub engine_options: Arc<dyn Fn(&Path) -> EngineOptions + Send + Sync>,
+    /// NPU backend attached to models run on this host, as at startup.
+    pub npu_backend: Option<Arc<dyn crate::npu::NpuBackend>>,
     pub max_concurrency: Option<usize>,
     pub max_output_tokens: Option<u32>,
     /// Workers started without a model that this controller may place
@@ -280,22 +290,33 @@ impl ModelManager {
     }
 
     /// Load the model described by `req` (blocking).
-    fn load(&self, req: &LoadModelRequest, path: &Path, id: String) -> crate::Result<LoadedModel> {
+    /// `busy`: workers already holding a loaded model.
+    fn load(
+        &self,
+        req: &LoadModelRequest,
+        path: &Path,
+        id: String,
+        #[cfg_attr(not(feature = "distributed"), allow(unused_variables))] busy: &[std::net::SocketAddr],
+    ) -> crate::Result<LoadedModel> {
         #[cfg(feature = "distributed")]
         if !req.local && (req.workers.is_some() || !self.workers.is_empty()) {
-            return self.load_distributed(req, path, id);
+            return self.load_distributed(req, path, id, busy);
         }
         if req.workers.is_some() || req.ends.is_some() {
             return Err(crate::JoshuaError::InvalidRequest(
                 "this server has no workers configured; omit 'workers' and 'ends'".into(),
             ));
         }
-        let mut options = self.engine_options.clone();
+        let mut options = (self.engine_options)(path);
         if let Some(n_ctx) = req.n_ctx {
             options.n_ctx = u32::try_from(n_ctx)
                 .map_err(|_| crate::JoshuaError::InvalidRequest("n_ctx too large".into()))?;
         }
-        let engine = self.finish_engine(Engine::with_options(path, options)?);
+        let mut engine = Engine::with_options(path, options)?;
+        if let Some(backend) = &self.npu_backend {
+            engine = engine.with_npu_backend(Arc::clone(backend));
+        }
+        let engine = self.finish_engine(engine);
         Ok(LoadedModel {
             id,
             engine: Arc::new(engine),
@@ -323,6 +344,7 @@ impl ModelManager {
         req: &LoadModelRequest,
         path: &Path,
         id: String,
+        busy: &[std::net::SocketAddr],
     ) -> crate::Result<LoadedModel> {
         use crate::distributed::{
             pipeline::{Deployment, Limits, Pipeline},
@@ -344,6 +366,12 @@ impl ModelManager {
         if workers.is_empty() {
             return Err(InvalidRequest("no workers to place the model on".into()));
         }
+        // A worker holds one model at a time and serves one controller.
+        if let Some(w) = workers.iter().find(|w| busy.contains(w)) {
+            return Err(InvalidRequest(format!(
+                "worker {w} already holds a loaded model; unload it first"
+            )));
+        }
         let header = crate::gguf_ext::read_header(&mut std::io::BufReader::new(
             std::fs::File::open(path)?,
         ))?;
@@ -352,7 +380,7 @@ impl ModelManager {
             .u32("context_length")
             .map_err(|e| ModelLoad(e.to_string()))? as usize;
         let defaults = Limits::default();
-        let server_ctx = match self.engine_options.n_ctx {
+        let server_ctx = match (self.engine_options)(path).n_ctx {
             0 => defaults.context,
             n => n as usize,
         };
@@ -439,8 +467,14 @@ async fn load_model(
     let loaded = tokio::task::spawn_blocking(move || {
         let manager = manager(&state)?;
         let guard = state.models.reserve(&id)?;
+        let busy: Vec<_> = state
+            .models
+            .list()
+            .into_iter()
+            .flat_map(|m| m.workers)
+            .collect();
         tracing::info!(model = %id, path = %path.display(), "loading model");
-        let model = manager.load(&req, &path, id).map_err(|e| match e {
+        let model = manager.load(&req, &path, id, &busy).map_err(|e| match e {
             // The caller asked for this load; tell them why it failed.
             crate::JoshuaError::ModelLoad(msg) => {
                 ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, msg, "model_load_failed")
@@ -470,9 +504,21 @@ async fn unload_model(
         )
     })?;
     tracing::info!(model = %model.id, "unloading model");
-    // The last request using it drops the engine, which frees its weights
-    // or tells its workers to unload their stages.
-    tokio::task::spawn_blocking(move || drop(model));
+    // New requests no longer find it. Wait for the ones already running,
+    // then drop the engine here: that frees its weights or releases its
+    // workers, so they are free for the next load once this returns.
+    tokio::task::spawn_blocking(move || {
+        let mut engine = model.engine;
+        loop {
+            match Arc::try_unwrap(engine) {
+                Ok(engine) => return drop(engine),
+                Err(shared) => engine = shared,
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    })
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?;
     Ok(Json(json!({"id": req.id, "object": "model", "unloaded": true})))
 }
 
@@ -482,8 +528,6 @@ async fn unload_model(
 pub fn create_router(state: AppState) -> Router {
     let api = Router::new()
         .route("/v1/models", get(list_models))
-        .route("/v1/models/load", post(load_model))
-        .route("/v1/models/unload", post(unload_model))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(completions))
         .route("/v1/embeddings", post(embeddings))
@@ -492,10 +536,21 @@ pub fn create_router(state: AppState) -> Router {
             Arc::clone(&state),
             require_api_key,
         ));
+    // Model management stays same-origin: without CORS headers a browser
+    // will not send these JSON requests from another site's page, even to
+    // a localhost server with no API key.
+    let manage = Router::new()
+        .route("/v1/models/load", post(load_model))
+        .route("/v1/models/unload", post(unload_model))
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            require_api_key,
+        ));
     Router::new()
         .route("/health", get(health))
         .merge(api)
         .layer(CorsLayer::permissive())
+        .merge(manage)
         .with_state(state)
 }
 
@@ -623,12 +678,11 @@ async fn chat_completions(
     State(state): State<AppState>,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Result<Response, ApiError> {
-    let engine = state.models.resolve(&req.model)?;
+    let (model, engine) = state.models.resolve(&req.model)?;
     let stream = req.stream.unwrap_or(false);
     let options = req.to_generation_options();
     let messages = req.messages.clone();
     let tools = req.tools.clone();
-    let model = engine.model_name().to_string();
 
     if stream {
         // ── Streaming path ────────────────────────────────────────────────────
@@ -815,7 +869,7 @@ async fn completions(
     State(state): State<AppState>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let engine = state
+    let (model, engine) = state
         .models
         .resolve(body.get("model").and_then(|v| v.as_str()).unwrap_or_default())?;
     let prompt = body
@@ -857,7 +911,7 @@ async fn completions(
         "id": format!("cmpl-{}", Uuid::new_v4().simple()),
         "object": "text_completion",
         "created": created,
-        "model": engine.model_name(),
+        "model": model,
         "choices": [{
             "text": text,
             "index": 0,
@@ -876,9 +930,8 @@ async fn embeddings(
     State(state): State<AppState>,
     Json(req): Json<EmbeddingRequest>,
 ) -> Result<Json<EmbeddingResponse>, ApiError> {
-    let engine = state.models.resolve(&req.model)?;
+    let (model, engine) = state.models.resolve(&req.model)?;
     let texts: Vec<String> = req.input.into_vec();
-    let model = engine.model_name().to_string();
 
     let (vectors, prompt_tokens) = tokio::task::spawn_blocking({
         let engine = Arc::clone(&engine);

@@ -42,7 +42,8 @@ async fn call(
 fn manager(dir: &std::path::Path) -> ModelManager {
     ModelManager {
         model_dir: dir.to_path_buf(),
-        engine_options: EngineOptions::with_n_ctx(64),
+        engine_options: Arc::new(|_: &std::path::Path| EngineOptions::with_n_ctx(64)),
+        npu_backend: None,
         max_concurrency: None,
         max_output_tokens: None,
         #[cfg(feature = "distributed")]
@@ -110,6 +111,8 @@ async fn a_server_without_a_model_loads_and_unloads_through_the_api() {
     assert_eq!(ids, ["tiny", "second"]);
     let (status, body) = call(&app, "POST", "/v1/completions", completion("second")).await;
     assert_eq!(status, StatusCode::OK, "{body}");
+    // Responses name the model by the id it was loaded under.
+    assert_eq!(body["model"], "second");
     // With two models loaded, a request must name one of them.
     let (status, _) = call(&app, "POST", "/v1/completions", completion("other")).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
@@ -161,6 +164,29 @@ async fn model_paths_stay_inside_the_model_directory_and_management_is_opt_in() 
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
+    // Other sites' pages may call the inference API, not model management.
+    let preflight = |uri: &str| {
+        Request::builder()
+            .method("OPTIONS")
+            .uri(uri)
+            .header(header::ORIGIN, "https://example.com")
+            .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+            .body(Body::empty())
+            .unwrap()
+    };
+    for (uri, allowed) in [
+        ("/v1/chat/completions", true),
+        ("/v1/models/load", false),
+        ("/v1/models/unload", false),
+    ] {
+        let res = app.clone().oneshot(preflight(uri)).await.unwrap();
+        assert_eq!(
+            res.headers()
+                .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            allowed,
+            "{uri}"
+        );
+    }
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -236,6 +262,17 @@ async fn controller_places_a_model_on_model_less_workers_and_unloads_it() {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+        // A worker holds one model at a time.
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/v1/models/load",
+            serde_json::json!({"model": "qwen.gguf", "id": "other", "n_ctx": 64}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        // Unload returns once the workers are free, so the next round's
+        // load reaches them immediately.
         let (status, _) = call(
             &app,
             "POST",

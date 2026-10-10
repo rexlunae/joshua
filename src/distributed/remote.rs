@@ -48,13 +48,9 @@ impl PipelineBackend {
 
 impl Drop for PipelineBackend {
     fn drop(&mut self) {
-        // Unloading the model: release the workers' stages cleanly. The last
-        // request may drop the engine on an async thread, so the bounded
-        // network round trip runs on its own thread.
-        let pipeline = Arc::clone(&self.pipeline);
-        std::thread::spawn(move || {
-            let _ = lock(&pipeline).stop();
-        });
+        // Unloading the model: release the workers' stages cleanly before
+        // returning, so they can take the next model.
+        let _ = lock(&self.pipeline).stop();
     }
 }
 

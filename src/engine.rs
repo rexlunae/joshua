@@ -739,6 +739,8 @@ pub struct Engine {
     /// Pooled-session cap for a remote backend, whose sessions occupy
     /// bounded worker capacity (see [`Engine::with_remote_backend`]).
     remote_pool_cap: Option<usize>,
+    /// Sessions a remote backend holds at once.
+    remote_capacity: Option<usize>,
     /// The model's architecture, when candle has a loader for it (see
     /// [`Self::arch_error`]).  Gates per-architecture capabilities at
     /// construction time.
@@ -1826,6 +1828,7 @@ impl Engine {
             weights_template: Mutex::new(None),
             device_session_cap,
             remote_pool_cap: None,
+            remote_capacity: None,
             speculative,
             spec_drafted: AtomicU64::new(0),
             spec_accepted: AtomicU64::new(0),
@@ -1842,6 +1845,7 @@ impl Engine {
     /// model instances.  Values below 1 are treated as 1.
     pub fn with_max_concurrency(mut self, max: usize) -> Self {
         self.max_concurrency = max.max(1);
+        self.fit_remote_capacity();
         self
     }
 
@@ -2961,10 +2965,8 @@ impl Engine {
     /// within it.
     pub fn with_remote_backend(mut self, backend: Arc<dyn NpuBackend>, capacity: usize) -> Self {
         tracing::info!("remote backend configured: {}", backend.name());
-        let capacity = capacity.max(1);
-        // Keep about half the sessions warm for multi-turn KV reuse.
-        self.max_concurrency = self.max_concurrency.min(capacity.div_ceil(2));
-        self.remote_pool_cap = Some(capacity - self.max_concurrency);
+        self.remote_capacity = Some(capacity.max(1));
+        self.fit_remote_capacity();
         self.npu = Some(NpuState {
             backend,
             failures: AtomicU32::new(0),
@@ -2972,6 +2974,16 @@ impl Engine {
             exclusive: true,
         });
         self
+    }
+
+    /// Split a remote backend's sessions between in-flight requests and the
+    /// warm pool, whichever builder ran last.
+    fn fit_remote_capacity(&mut self) {
+        if let Some(capacity) = self.remote_capacity {
+            // Keep about half the sessions warm for multi-turn KV reuse.
+            self.max_concurrency = self.max_concurrency.min(capacity.div_ceil(2));
+            self.remote_pool_cap = Some(capacity - self.max_concurrency);
+        }
     }
 
     fn remote_only(&self) -> bool {
