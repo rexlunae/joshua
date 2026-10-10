@@ -1312,6 +1312,14 @@ impl Engine {
         // drops them.
         let raw = crate::gguf_ext::read_header(&mut Cursor::new(&mmap[..]))
             .map_err(|e| JoshuaError::ModelLoad(format!("GGUF header re-read failed: {e}")))?;
+        // Check the layout against the file's own length, not the mapping's:
+        // the mapping is rounded up to a page, and a tensor cut short inside
+        // that last page would otherwise read its missing bytes as zeros.
+        let file_len = std::fs::metadata(&gguf_path)
+            .map_err(|e| JoshuaError::ModelLoad(format!("stat of GGUF file failed: {e}")))?
+            .len();
+        raw.validate_layout(file_len)
+            .map_err(|e| JoshuaError::ModelLoad(format!("GGUF layout check failed: {e}")))?;
 
         // Prefetch and/or lock the always-touched weights, and advise random
         // access on routed experts, when requested.
