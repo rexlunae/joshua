@@ -1014,9 +1014,10 @@ fn test_chat_completion_request_to_generation_options() {
         stop: Some(serde_json::json!(["<end>", "<stop>"])),
         stream: None,
         tools: None,
+        ..Default::default()
     };
 
-    let opts = req.to_generation_options();
+    let opts = req.to_generation_options().unwrap();
     assert_eq!(opts.max_tokens, 512);
     assert!((opts.temperature - 0.5).abs() < 1e-6);
     assert!((opts.top_p - 0.8).abs() < 1e-6);

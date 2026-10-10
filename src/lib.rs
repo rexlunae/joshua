@@ -84,5 +84,6 @@ pub use engine::{
 pub use error::{JoshuaError, Result};
 pub use speculative::{SpeculativeConfig, SpeculativeStats};
 pub use types::{
-    ChatMessage, EmbeddingRequest, EmbeddingResponse, GenerationOptions, UsageInfo,
+    ChatMessage, EmbeddingRequest, EmbeddingResponse, GenerationOptions, ReasoningConfig,
+    ReasoningEffort, UsageInfo,
 };

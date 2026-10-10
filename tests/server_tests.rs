@@ -116,6 +116,76 @@ async fn routes_stay_open_when_no_api_key_is_configured() {
     assert_eq!(res.status(), StatusCode::OK);
 }
 
+/// POST a chat completion body; returns the status and the response body.
+async fn chat(app: axum::Router, body: serde_json::Value) -> (StatusCode, String) {
+    let req = Request::post("/v1/chat/completions")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    let status = res.status();
+    let body = axum::body::to_bytes(res.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    (status, String::from_utf8_lossy(&body).to_string())
+}
+
+/// Reasoning, sampling and context-window settings (#144): accepted values
+/// generate, unsupported or out-of-range ones are a 400.
+#[tokio::test]
+async fn chat_request_settings_are_validated() {
+    let app = create_router(tiny_state("server-settings", None));
+    let base = |extra: serde_json::Value| {
+        let mut body = serde_json::json!({
+            "model": "model",
+            "messages": [{"role": "user", "content": "a b"}],
+            "max_tokens": 2,
+        });
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        body
+    };
+
+    let (status, body) = chat(
+        app.clone(),
+        base(serde_json::json!({
+            "reasoning_effort": "low",
+            "chat_template_kwargs": {"enable_thinking": false},
+            "seed": 3,
+            "presence_penalty": 0.5,
+            "frequency_penalty": 0.5,
+            "max_completion_tokens": 2,
+            "num_ctx": 32,
+            "tool_choice": "none",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    for (extra, needle) in [
+        (serde_json::json!({"context_window": 65}), "context window"),
+        (serde_json::json!({"n": 2}), "n = 1"),
+        (serde_json::json!({"logprobs": true}), "logprobs"),
+        (
+            serde_json::json!({"presence_penalty": 9}),
+            "presence_penalty",
+        ),
+        (
+            serde_json::json!({"reasoning_effort": "high", "enable_thinking": false}),
+            "disagree",
+        ),
+        (
+            serde_json::json!({"chat_template_kwargs": {"messages": []}}),
+            "messages",
+        ),
+    ] {
+        let (status, body) = chat(app.clone(), base(extra.clone())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{extra}: {body}");
+        assert!(body.contains(needle), "{extra}: {body}");
+    }
+}
+
 // ─── TLS (only with `cargo test --features tls`) ─────────────────────────────
 
 #[cfg(feature = "tls")]
