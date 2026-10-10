@@ -93,6 +93,10 @@ pub struct ModelRegistry {
     models: RwLock<Vec<LoadedModel>>,
     /// Ids being loaded, so concurrent loads of one id cannot both run.
     loading: Mutex<Vec<String>>,
+    /// Workers claimed by a model being loaded, loaded, or being unloaded.
+    /// A worker serves one controller connection at a time, so a claim
+    /// lasts until the model's pipeline has released it.
+    workers: Mutex<Vec<std::net::SocketAddr>>,
 }
 
 fn now() -> u64 {
@@ -178,6 +182,52 @@ impl ModelRegistry {
         let mut models = self.models.write().unwrap_or_else(|p| p.into_inner());
         let index = models.iter().position(|m| m.id == id)?;
         Some(models.remove(index))
+    }
+
+    /// Claim `workers` for a load, failing if any is claimed already.
+    /// Dropping the claim releases them unless it is kept.
+    #[cfg(feature = "distributed")]
+    fn claim_workers(&self, workers: &[std::net::SocketAddr]) -> crate::Result<WorkerClaim<'_>> {
+        let mut claimed = self.workers.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(w) = workers.iter().find(|w| claimed.contains(w)) {
+            return Err(crate::JoshuaError::InvalidRequest(format!(
+                "worker {w} is in use by another model; unload it first"
+            )));
+        }
+        claimed.extend_from_slice(workers);
+        Ok(WorkerClaim {
+            registry: self,
+            workers: workers.to_vec(),
+        })
+    }
+
+    /// Release workers a fully unloaded model held.
+    fn release_workers(&self, workers: &[std::net::SocketAddr]) {
+        self.workers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|w| !workers.contains(w));
+    }
+}
+
+#[cfg(feature = "distributed")]
+struct WorkerClaim<'a> {
+    registry: &'a ModelRegistry,
+    workers: Vec<std::net::SocketAddr>,
+}
+
+#[cfg(feature = "distributed")]
+impl WorkerClaim<'_> {
+    /// Keep the workers claimed; unloading the model releases them.
+    fn keep(mut self) {
+        self.workers.clear();
+    }
+}
+
+#[cfg(feature = "distributed")]
+impl Drop for WorkerClaim<'_> {
+    fn drop(&mut self) {
+        self.registry.release_workers(&self.workers);
     }
 }
 
@@ -290,17 +340,17 @@ impl ModelManager {
     }
 
     /// Load the model described by `req` (blocking).
-    /// `busy`: workers already holding a loaded model.
+    /// Workers it places the model on are claimed in `registry`.
     fn load(
         &self,
         req: &LoadModelRequest,
         path: &Path,
         id: String,
-        #[cfg_attr(not(feature = "distributed"), allow(unused_variables))] busy: &[std::net::SocketAddr],
+        #[cfg_attr(not(feature = "distributed"), allow(unused_variables))] registry: &ModelRegistry,
     ) -> crate::Result<LoadedModel> {
         #[cfg(feature = "distributed")]
         if !req.local && (req.workers.is_some() || !self.workers.is_empty()) {
-            return self.load_distributed(req, path, id, busy);
+            return self.load_distributed(req, path, id, registry);
         }
         if req.workers.is_some() || req.ends.is_some() {
             return Err(crate::JoshuaError::InvalidRequest(
@@ -344,7 +394,7 @@ impl ModelManager {
         req: &LoadModelRequest,
         path: &Path,
         id: String,
-        busy: &[std::net::SocketAddr],
+        registry: &ModelRegistry,
     ) -> crate::Result<LoadedModel> {
         use crate::distributed::{
             pipeline::{Deployment, Limits, Pipeline},
@@ -367,11 +417,7 @@ impl ModelManager {
             return Err(InvalidRequest("no workers to place the model on".into()));
         }
         // A worker holds one model at a time and serves one controller.
-        if let Some(w) = workers.iter().find(|w| busy.contains(w)) {
-            return Err(InvalidRequest(format!(
-                "worker {w} already holds a loaded model; unload it first"
-            )));
-        }
+        let claim = registry.claim_workers(&workers)?;
         let header = crate::gguf_ext::read_header(&mut std::io::BufReader::new(
             std::fs::File::open(path)?,
         ))?;
@@ -419,6 +465,7 @@ impl ModelManager {
         let engine = self
             .finish_engine(engine)
             .with_remote_backend(Arc::new(backend), capacity);
+        claim.keep();
         Ok(LoadedModel {
             id,
             engine: Arc::new(engine),
@@ -467,20 +514,16 @@ async fn load_model(
     let loaded = tokio::task::spawn_blocking(move || {
         let manager = manager(&state)?;
         let guard = state.models.reserve(&id)?;
-        let busy: Vec<_> = state
-            .models
-            .list()
-            .into_iter()
-            .flat_map(|m| m.workers)
-            .collect();
         tracing::info!(model = %id, path = %path.display(), "loading model");
-        let model = manager.load(&req, &path, id, &busy).map_err(|e| match e {
-            // The caller asked for this load; tell them why it failed.
-            crate::JoshuaError::ModelLoad(msg) => {
-                ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, msg, "model_load_failed")
-            }
-            e => ApiError::from(e),
-        })?;
+        let model = manager
+            .load(&req, &path, id, &state.models)
+            .map_err(|e| match e {
+                // The caller asked for this load; tell them why it failed.
+                crate::JoshuaError::ModelLoad(msg) => {
+                    ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, msg, "model_load_failed")
+                }
+                e => ApiError::from(e),
+            })?;
         let body = model_json(&model);
         guard.finish(model);
         Ok::<_, ApiError>(body)
@@ -511,11 +554,12 @@ async fn unload_model(
         let mut engine = model.engine;
         loop {
             match Arc::try_unwrap(engine) {
-                Ok(engine) => return drop(engine),
+                Ok(engine) => break drop(engine),
                 Err(shared) => engine = shared,
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
+        state.models.release_workers(&model.workers);
     })
     .await
     .map_err(|e| ApiError::internal(e.to_string()))?;
@@ -1110,5 +1154,22 @@ mod tests {
     fn api_keys_match_handles_an_empty_expected_key() {
         assert!(api_keys_match(b"", b""));
         assert!(!api_keys_match(b"a", b""));
+    }
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn workers_stay_claimed_from_load_until_unload_completes() {
+        let registry = super::ModelRegistry::default();
+        let a: std::net::SocketAddr = "127.0.0.1:7001".parse().unwrap();
+        let b: std::net::SocketAddr = "127.0.0.1:7002".parse().unwrap();
+        // A load in progress holds its workers against an overlapping load.
+        let claim = registry.claim_workers(&[a, b]).unwrap();
+        assert!(registry.claim_workers(&[b]).is_err());
+        // A failed load releases them.
+        drop(claim);
+        // A loaded model keeps them until its unload releases them.
+        registry.claim_workers(&[a, b]).unwrap().keep();
+        assert!(registry.claim_workers(&[a]).is_err());
+        registry.release_workers(&[a, b]);
+        registry.claim_workers(&[a, b]).unwrap();
     }
 }
