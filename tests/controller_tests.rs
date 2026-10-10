@@ -169,6 +169,23 @@ async fn model_paths_stay_inside_the_model_directory_and_management_is_opt_in() 
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        // A link to a model inside the root loads, with the tokenizer
+        // found beside the link.
+        let alias = inner.join("alias");
+        std::fs::create_dir_all(&alias).unwrap();
+        std::fs::create_dir_all(inner.join("weights")).unwrap();
+        std::fs::copy(dir.join("tiny.gguf"), inner.join("weights/tiny.gguf")).unwrap();
+        std::os::unix::fs::symlink(inner.join("weights/tiny.gguf"), alias.join("tiny.gguf"))
+            .unwrap();
+        std::fs::copy(dir.join("tokenizer.json"), alias.join("tokenizer.json")).unwrap();
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/v1/models/load",
+            serde_json::json!({"model": "alias"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
     }
     let app = create_router(state(ModelRegistry::default(), None));
     let (status, _) = call(

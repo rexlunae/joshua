@@ -336,8 +336,12 @@ impl ModelManager {
         };
         let path = inside(&root.join(requested))?;
         if path.is_dir() {
-            // The file picked inside a directory may itself be a symlink.
-            inside(&crate::engine::find_gguf_in_dir(&path).map_err(|_| not_found())?)
+            // The file picked inside a directory may itself be a symlink:
+            // its target must stay inside the root, but the engine gets the
+            // link so it finds the tokenizer beside it.
+            let file = crate::engine::find_gguf_in_dir(&path).map_err(|_| not_found())?;
+            inside(&file)?;
+            Ok(file)
         } else {
             Ok(path)
         }
