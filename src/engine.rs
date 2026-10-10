@@ -4892,6 +4892,7 @@ fn token_str_from_metadata(
 /// Those tensors are decoded by Joshua's own loaders via the raw header.
 fn read_gguf_header(mmap: &[u8]) -> Result<gguf_file::Content> {
     let header = crate::gguf_ext::read_header(&mut Cursor::new(mmap))?;
+    header.validate_layout(mmap.len() as u64)?;
     // Joshua's own loaders read tensors by their raw GGUF dtype id (the
     // i-quants, MXFP4, Q1_0, I32, …).  Candle's stock loaders only ever see
     // the projected `Content`, which serves the `raw_block` formats through

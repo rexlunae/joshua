@@ -225,6 +225,56 @@ impl gguf_file::ExternalTensors for RawBlockTensors {
 }
 
 impl GgufHeader {
+    /// Check the header against the file it came from (`file_len` bytes):
+    /// refuse one part of a split GGUF, and any tensor that runs past the end
+    /// of the file or into the next one.  Run before loading weights so a
+    /// truncated or badly merged file fails here, by name, instead of
+    /// decoding misframed blocks into NaN logits (#175).
+    pub fn validate_layout(&self, file_len: u64) -> Result<()> {
+        let count = |k: &str| match self.metadata.get(k) {
+            Some(Value::U16(v)) => Some(*v as u64),
+            Some(Value::U32(v)) => Some(*v as u64),
+            Some(Value::I32(v)) if *v >= 0 => Some(*v as u64),
+            _ => None,
+        };
+        if let Some(n) = count("split.count").filter(|&n| n > 1) {
+            let no = count("split.no").map_or(String::new(), |i| format!("part {} of ", i + 1));
+            return Err(bad(format!(
+                "this file is {no}a {n}-part split GGUF ({} tensors here); Joshua loads \
+                 single-file GGUFs, so merge the parts first with \
+                 `llama-gguf-split --merge <first part> <output>`",
+                self.tensors.len()
+            )));
+        }
+        let data_len = file_len.saturating_sub(self.tensor_data_offset);
+        let mut spans: Vec<(u64, u64, &str)> = self
+            .tensors
+            .iter()
+            .filter_map(|(name, i)| {
+                let size = type_size_bytes(i.dtype, i.elem_count())? as u64;
+                Some((i.offset, i.offset.saturating_add(size), name.as_str()))
+            })
+            .collect();
+        spans.sort_unstable();
+        for (k, &(start, end, name)) in spans.iter().enumerate() {
+            if end > data_len {
+                return Err(bad(format!(
+                    "tensor `{name}` spans data bytes {start}..{end}, past the end of the \
+                     {data_len}-byte data section; the file is truncated or corrupt"
+                )));
+            }
+            if let Some(&(next, _, other)) = spans.get(k + 1) {
+                if next < end {
+                    return Err(bad(format!(
+                        "tensor `{name}` (data bytes {start}..{end}) overlaps `{other}` \
+                         (starting at {next}); the file is corrupt"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// A tensor's raw bytes, read from `reader` (works for dtypes candle
     /// cannot describe).
     pub fn read_tensor_bytes<R: Read + Seek>(
@@ -610,6 +660,24 @@ pub fn read_header<R: Read + Seek>(r: &mut R) -> Result<GgufHeader> {
     };
     if alignment == 0 || !alignment.is_power_of_two() {
         return Err(bad(format!("invalid general.alignment {alignment}")));
+    }
+    // The GGUF format places every tensor on an `alignment` boundary of the
+    // data section, and the block-quantized decoders depend on it.  A header
+    // that breaks this (a hand-rolled merge of `-0000N-of-0000M` split parts
+    // that re-based offsets without re-padding, #175) points every tensor a
+    // few bytes into its neighbour: the load would succeed and every weight
+    // would decode to noise.  llama.cpp refuses such a file; so do we.
+    if let Some((name, info)) = tensors
+        .iter()
+        .filter(|(_, i)| !i.offset.is_multiple_of(alignment))
+        .min_by_key(|(_, i)| i.offset)
+    {
+        return Err(bad(format!(
+            "tensor `{name}` starts at data offset {}, which is not a multiple of the \
+             file's {alignment}-byte alignment; the file is corrupt (a GGUF merged from \
+             split parts without re-padding?)",
+            info.offset
+        )));
     }
     let pos = rd.r.stream_position().map_err(bad)?;
     let tensor_data_offset = pos.div_ceil(alignment) * alignment;
@@ -1101,5 +1169,86 @@ mod tests {
             // Not a whole number of blocks.
             assert_eq!(type_size_bytes(dtype, 128), None, "dtype {dtype}: half block");
         }
+    }
+
+    /// A v3 GGUF with `meta` (u32 values) and F32 tensors `(name, elems,
+    /// offset)`, followed by `data_len` zero bytes of padded tensor data.
+    fn layout_file(meta: &[(&str, u32)], tensors: &[(&str, u64, u64)], data_len: usize) -> Vec<u8> {
+        let mut b = Vec::new();
+        let s = |b: &mut Vec<u8>, t: &[u8]| {
+            b.extend_from_slice(&(t.len() as u64).to_le_bytes());
+            b.extend_from_slice(t);
+        };
+        b.extend_from_slice(&MAGIC.to_le_bytes());
+        b.extend_from_slice(&3u32.to_le_bytes());
+        b.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
+        b.extend_from_slice(&(meta.len() as u64).to_le_bytes());
+        for (k, v) in meta {
+            s(&mut b, k.as_bytes());
+            b.extend_from_slice(&4u32.to_le_bytes()); // u32
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        for (name, elems, offset) in tensors {
+            s(&mut b, name.as_bytes());
+            b.extend_from_slice(&1u32.to_le_bytes());
+            b.extend_from_slice(&elems.to_le_bytes());
+            b.extend_from_slice(&0u32.to_le_bytes()); // F32
+            b.extend_from_slice(&offset.to_le_bytes());
+        }
+        b.resize(b.len().div_ceil(32) * 32 + data_len, 0);
+        b
+    }
+
+    fn layout(b: &[u8]) -> Result<()> {
+        read_header(&mut Cursor::new(b))?.validate_layout(b.len() as u64)
+    }
+
+    #[test]
+    fn a_well_formed_layout_validates() {
+        let b = layout_file(&[], &[("a", 8, 0), ("b", 8, 32)], 64);
+        layout(&b).unwrap();
+    }
+
+    #[test]
+    fn a_tensor_off_the_alignment_grid_is_refused() {
+        // #175: a split merge that re-based offsets without re-padding left
+        // every later tensor a few bytes off its 32-byte boundary.
+        let b = layout_file(&[], &[("a", 8, 0), ("b", 8, 52)], 96);
+        let msg = layout(&b).unwrap_err().to_string();
+        assert!(msg.contains("`b`") && msg.contains("alignment"), "{msg}");
+        // A custom alignment is honoured.
+        let b = layout_file(
+            &[("general.alignment", 64)],
+            &[("a", 8, 0), ("b", 8, 32)],
+            96,
+        );
+        assert!(layout(&b).unwrap_err().to_string().contains("64-byte"));
+    }
+
+    #[test]
+    fn a_tensor_past_the_end_of_the_file_is_refused() {
+        let b = layout_file(&[], &[("a", 8, 0), ("b", 16, 32)], 64);
+        let msg = layout(&b).unwrap_err().to_string();
+        assert!(msg.contains("`b`") && msg.contains("past the end"), "{msg}");
+    }
+
+    #[test]
+    fn overlapping_tensors_are_refused() {
+        let b = layout_file(&[], &[("a", 16, 0), ("b", 8, 32)], 96);
+        let msg = layout(&b).unwrap_err().to_string();
+        assert!(msg.contains("overlaps"), "{msg}");
+    }
+
+    #[test]
+    fn one_part_of_a_split_gguf_is_refused_with_the_merge_command() {
+        let b = layout_file(&[("split.count", 7), ("split.no", 0)], &[("a", 8, 0)], 32);
+        let msg = layout(&b).unwrap_err().to_string();
+        assert!(
+            msg.contains("part 1 of a 7-part split") && msg.contains("llama-gguf-split --merge"),
+            "{msg}"
+        );
+        // A single-part "split" is just a file.
+        let b = layout_file(&[("split.count", 1)], &[("a", 8, 0)], 32);
+        layout(&b).unwrap();
     }
 }
