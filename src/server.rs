@@ -41,7 +41,7 @@ use tokio::net::TcpListener;
 use tower_http::cors::CorsLayer;
 use uuid::Uuid;
 
-use crate::coordinator::{WorkerCapabilities, WorkerInfo, WORKER_PROTOCOL_VERSION};
+use crate::coordinator::{ModelSlots, WorkerCapabilities, WorkerInfo, WORKER_PROTOCOL_VERSION};
 use crate::engine::{Engine, EngineOptions};
 use crate::error::JoshuaError;
 use crate::whisper::WhisperEngine;
@@ -711,8 +711,8 @@ async fn health() -> Json<serde_json::Value> {
 /// and the admission cap with the current in-flight count.
 ///
 /// With several models loaded, `model`, `n_ctx` and `backend` describe the
-/// first, `models` lists them all, and the admission figures are their sums
-/// (each model admits its own requests).
+/// first, `models` gives each one's own admission figures (each engine
+/// admits its own requests), and the worker-wide figures are their sums.
 async fn worker_info(State(state): State<AppState>) -> Result<Json<WorkerInfo>, ApiError> {
     let models = state.models.list();
     let Some(first) = models.first() else {
@@ -728,7 +728,15 @@ async fn worker_info(State(state): State<AppState>) -> Result<Json<WorkerInfo>, 
         model: first.id.clone(),
         models: match models.len() {
             1 => Vec::new(),
-            _ => models.iter().map(|m| m.id.clone()).collect(),
+            _ => models
+                .iter()
+                .map(|m| ModelSlots {
+                    id: m.id.clone(),
+                    max_concurrency: m.engine.max_concurrency(),
+                    in_flight: m.engine.in_flight(),
+                    embeddings: !m.engine.remote_only(),
+                })
+                .collect(),
         },
         n_ctx: first.engine.n_ctx(),
         backend: device_label(first.engine.device()).to_string(),

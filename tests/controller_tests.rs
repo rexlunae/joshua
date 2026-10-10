@@ -360,7 +360,13 @@ async fn a_request_router_reaches_every_loaded_model() {
     }
     let (status, info) = call(&app, "GET", "/v1/worker/info", serde_json::Value::Null).await;
     assert_eq!(status, StatusCode::OK, "{info}");
-    assert_eq!(info["models"], serde_json::json!(["tiny", "second"]));
+    let ids: Vec<_> = info["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].clone())
+        .collect();
+    assert_eq!(ids, ["tiny", "second"]);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

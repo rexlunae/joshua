@@ -24,7 +24,7 @@ use futures_util::StreamExt;
 use http_body_util::{BodyExt, Full};
 use hyper_util::rt::TokioIo;
 use joshua::coordinator::{
-    create_router, Coordinator, CoordinatorConfig, WorkerCapabilities, WorkerInfo,
+    create_router, Coordinator, CoordinatorConfig, ModelSlots, WorkerCapabilities, WorkerInfo,
     REQUEST_ID_HEADER, WORKER_HEADER, WORKER_PROTOCOL_VERSION,
 };
 use serde_json::{json, Value};
@@ -889,4 +889,89 @@ fn cancelled_generation_stops_and_leaves_the_engine_reusable() {
     let fresh = tiny_engine("route-cancel-fresh");
     let (expected, _, _, _) = fresh.complete(&messages, &greedy).unwrap();
     assert_eq!(after, expected);
+}
+
+/// A worker serving two models, each admitting one request; `alpha`'s
+/// requests wait for `release`.
+async fn spawn_two_model_worker() -> (Arc<(AtomicUsize, Notify)>, String) {
+    let shared = Arc::new((AtomicUsize::new(0), Notify::new()));
+    let info = || async {
+        Json(WorkerInfo {
+            protocol_version: WORKER_PROTOCOL_VERSION,
+            model: "alpha".to_string(),
+            models: vec![
+                ModelSlots {
+                    id: "alpha".to_string(),
+                    max_concurrency: 1,
+                    in_flight: 0,
+                    embeddings: true,
+                },
+                ModelSlots {
+                    id: "beta".to_string(),
+                    max_concurrency: 1,
+                    in_flight: 0,
+                    embeddings: false,
+                },
+            ],
+            n_ctx: 4096,
+            backend: "cpu".to_string(),
+            max_concurrency: 2,
+            in_flight: 0,
+            capabilities: WorkerCapabilities {
+                chat: true,
+                completions: true,
+                embeddings: true,
+                transcriptions: false,
+                streaming: true,
+                tools: true,
+            },
+        })
+    };
+    let generate = |State(s): State<Arc<(AtomicUsize, Notify)>>, body: Bytes| async move {
+        s.0.fetch_add(1, Ordering::SeqCst);
+        let req: Value = serde_json::from_slice(&body).unwrap();
+        if req["model"] == "alpha" {
+            s.1.notified().await;
+        }
+        Json(json!({"model": req["model"]}))
+    };
+    let app = Router::new()
+        .route("/v1/worker/info", get(info))
+        .route("/v1/chat/completions", post(generate))
+        .route("/v1/embeddings", post(generate))
+        .with_state(Arc::clone(&shared));
+    (shared, serve_app(app).await)
+}
+
+#[tokio::test]
+async fn each_model_on_a_worker_is_admitted_by_its_own_slots() {
+    let (worker, url) = spawn_two_model_worker().await;
+    let mut cfg = config(&[&url]);
+    cfg.queue_depth = 0;
+    let (_coordinator, router) = spawn_router(cfg).await;
+
+    let held = tokio::spawn({
+        let router = router.clone();
+        async move { chat(&router, json!({"model": "alpha", "messages": []})).await }
+    });
+    eventually("alpha running", || worker.0.load(Ordering::SeqCst) == 1).await;
+    // alpha's one slot is taken, though the worker has a free beta slot.
+    let res = chat(&router, json!({"model": "alpha", "messages": []})).await;
+    assert_eq!(res.status, StatusCode::TOO_MANY_REQUESTS, "{}", res.text());
+    // beta is admitted by its own slot.
+    let res = chat(&router, json!({"model": "beta", "messages": []})).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.text());
+    // beta does not serve embeddings here, so none reach the worker.
+    let res = call(
+        &router,
+        "POST",
+        "/v1/embeddings",
+        &json!({"model": "beta", "input": "x"}).to_string(),
+    )
+    .await;
+    assert_ne!(res.status, StatusCode::OK, "{}", res.text());
+    assert_eq!(worker.0.load(Ordering::SeqCst), 2);
+
+    worker.1.notify_waiters();
+    assert_eq!(held.await.unwrap().status, StatusCode::OK);
 }

@@ -318,9 +318,13 @@ fn sharded_mapping_faults_in_only_its_own_column_ranges() -> anyhow::Result<()> 
         prefetched = measure(&fixture.path.0, &rows, tensor.clone())?;
     }
     prefetched.report("after prefetch");
+    // MADV_WILLNEED is a best-effort hint: the kernel may cap or drop the
+    // readahead it schedules (a GitHub runner read 512 of 2048 shard pages),
+    // so only require that the hint started reading the shard. What this
+    // phase pins down is that the advice stays within the shard's ranges.
     assert!(
-        prefetched.shard_resident * 10 >= prefetched.shard_pages * 9,
-        "WILLNEED did not read the shard: {prefetched:?}"
+        prefetched.shard_resident > 0,
+        "WILLNEED read nothing of the shard: {prefetched:?}"
     );
     assert!(
         prefetched.off_fraction() < 0.25,
