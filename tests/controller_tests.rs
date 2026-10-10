@@ -155,6 +155,21 @@ async fn model_paths_stay_inside_the_model_directory_and_management_is_opt_in() 
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{model}: {body}");
     }
+    // A directory inside the root whose model file links outside it.
+    #[cfg(unix)]
+    {
+        let linked = inner.join("linked");
+        std::fs::create_dir_all(&linked).unwrap();
+        std::os::unix::fs::symlink(dir.join("tiny.gguf"), linked.join("tiny.gguf")).unwrap();
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/v1/models/load",
+            serde_json::json!({"model": "linked"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    }
     let app = create_router(state(ModelRegistry::default(), None));
     let (status, _) = call(
         &app,

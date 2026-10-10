@@ -325,15 +325,19 @@ impl ModelManager {
             .model_dir
             .canonicalize()
             .map_err(|e| ApiError::internal(format!("model directory: {e}")))?;
-        let path = root
-            .join(requested)
-            .canonicalize()
-            .map_err(|_| not_found())?;
-        if !path.starts_with(&root) {
-            return Err(not_found());
-        }
+        let inside = |path: &Path| -> Result<PathBuf, ApiError> {
+            // Resolve symlinks first, so none can lead outside the root.
+            let path = path.canonicalize().map_err(|_| not_found())?;
+            if path.starts_with(&root) {
+                Ok(path)
+            } else {
+                Err(not_found())
+            }
+        };
+        let path = inside(&root.join(requested))?;
         if path.is_dir() {
-            crate::engine::find_gguf_in_dir(&path).map_err(|_| not_found())
+            // The file picked inside a directory may itself be a symlink.
+            inside(&crate::engine::find_gguf_in_dir(&path).map_err(|_| not_found())?)
         } else {
             Ok(path)
         }
