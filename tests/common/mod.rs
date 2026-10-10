@@ -180,6 +180,74 @@ pub fn check_recurrent_verify_rollback(
     }
 }
 
+/// A model with recurrent layers rewinds an edited conversation to its
+/// latest **prefix checkpoint** — a copy of the running state taken at the
+/// end of a prefill — and continues exactly as a session that never saw the
+/// discarded tokens.
+///
+/// The session walks a two-turn chat: turn 1 through the layer-streaming
+/// prefill, a reply decoded token by token, turn 2 through an ordinary
+/// chunked forward.  Each prefill leaves a checkpoint at its end (5 and 11);
+/// decode steps leave none.  The subject then rewinds to each checkpoint and
+/// feeds a different continuation, and must match a reference that fed the
+/// retained prefix the same way (same chunks, so the comparison is exact)
+/// followed by that continuation.  A position without a checkpoint is
+/// refused rather than served from stale running state.
+pub fn check_prefix_checkpoint_rewind(model: &joshua::model::QuantizedModel, what: &str) {
+    use joshua::stream_prefill::Chunk;
+    const TURN1: [u32; 5] = [1, 4, 2, 7, 5];
+    const REPLY: [u32; 2] = [9, 3];
+    const TURN2: [u32; 4] = [6, 8, 4, 1];
+    const EDIT: [u32; 3] = [11, 2, 6];
+
+    assert!(!model.supports_kv_truncate(), "{what}: expected running state");
+    // Feed the conversation up to `upto` tokens the way the subject did.
+    let replay = |m: &mut joshua::model::QuantizedModel, upto: usize| {
+        m.prefill_streamed(
+            &[Chunk { tokens: &TURN1[..3], pos: 0 }, Chunk { tokens: &TURN1[3..], pos: 3 }],
+            &Device::Cpu,
+        )
+        .unwrap();
+        if upto > TURN1.len() {
+            for (i, &t) in REPLY.iter().enumerate() {
+                logits(m, &[t], TURN1.len() + i);
+            }
+            logits(m, &TURN2, TURN1.len() + REPLY.len());
+        }
+    };
+    let n2 = TURN1.len() + REPLY.len() + TURN2.len();
+
+    let mut m = model.new_session().unwrap();
+    replay(&mut m, n2);
+    logits(&mut m, &[2], n2);
+
+    assert_eq!(m.kv_rewind_target(4), 0, "{what}: nothing before the first prompt");
+    assert_eq!(m.kv_rewind_target(TURN1.len()), TURN1.len(), "{what}");
+    assert_eq!(m.kv_rewind_target(n2 - 1), TURN1.len(), "{what}: decode steps leave none");
+    assert_eq!(m.kv_rewind_target(n2), n2, "{what}");
+    assert_eq!(m.kv_rewind_target(n2 + 1), n2, "{what}");
+    assert!(
+        !m.truncate_kv_cache(n2 - 1).unwrap(),
+        "{what}: a position without a checkpoint must be refused"
+    );
+
+    for keep in [n2, TURN1.len()] {
+        assert!(m.truncate_kv_cache(keep).unwrap(), "{what}: rewind to {keep}");
+        let got = [logits(&mut m, &EDIT, keep), logits(&mut m, &[7], keep + EDIT.len())];
+
+        let mut reference = model.new_session().unwrap();
+        replay(&mut reference, keep);
+        let want = [
+            logits(&mut reference, &EDIT, keep),
+            logits(&mut reference, &[7], keep + EDIT.len()),
+        ];
+        for (w, g) in want.iter().zip(&got) {
+            assert_close(w, g, 1e-6, &format!("{what}: rewind to checkpoint {keep}"));
+        }
+    }
+}
+
+
 /// A minimal WordLevel tokenizer with a 16-token vocabulary.
 pub const TOKENIZER_JSON: &str = r#"{
     "version": "1.0",

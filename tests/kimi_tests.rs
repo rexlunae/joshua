@@ -170,6 +170,17 @@ fn kimi_kda_verify_rollback_matches_disjoint_decode() {
     }
 }
 
+/// The KDA hybrids rewind an edited conversation to a prefix checkpoint
+/// (see `common::check_prefix_checkpoint_rewind`).
+#[test]
+fn kimi_kda_prefix_checkpoint_rewind_matches_fresh() {
+    for arch in ARCHES {
+        let (dir, m) = kimi_model("prefix-checkpoint", arch, false);
+        common::check_prefix_checkpoint_rewind(&m, arch);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
 /// The layer-streaming prefill reproduces a single forward (the KDA state
 /// carries across chunks, and K3's residual bank grows layer by layer).
 #[test]

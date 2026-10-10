@@ -238,6 +238,23 @@ fn qwen_family_truncation_support_matches_state_kind() {
     }
 }
 
+/// Every recurrent architecture rewinds an edited conversation to a prefix
+/// checkpoint and continues exactly like a session that never saw the
+/// discarded tokens (see `common::check_prefix_checkpoint_rewind`).
+#[test]
+fn qwen_recurrent_prefix_checkpoint_rewind_matches_fresh() {
+    for &(arch, recurrent) in ARCHES {
+        if !recurrent {
+            continue;
+        }
+        let dir = common::model_dir(&format!("qwen-prefix-checkpoint-{arch}"));
+        let model = dir.join("model.gguf");
+        common::write_tiny_qwen_gguf(&model, arch);
+        common::check_prefix_checkpoint_rewind(&load(&model), arch);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
 /// Every architecture's logits match golden values from an independent
 /// float64 NumPy transcription of llama.cpp's `src/models/qwen*.cpp` graphs
 /// (`tests/data/qwen_family_reference_logits.txt`), run on the same tiny

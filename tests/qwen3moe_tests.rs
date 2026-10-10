@@ -99,6 +99,37 @@ fn qwen3moe_mmap_load_matches_heap_load() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// The speculative next-step expert prefetch is advice only: it records each
+/// layer's final-token routing as the next step's prediction and leaves the
+/// logits bit-identical.
+#[test]
+fn qwen3moe_speculative_expert_prefetch_preserves_logits() {
+    let dir = common::model_dir("qwen3moe-predict");
+    let model = dir.join("model.gguf");
+    common::write_tiny_qwen3moe_gguf(&model);
+
+    let run = |predict: bool| {
+        // Mapped, so the experts carry prefetch handles.
+        let mut m = common::load_model(&model, true);
+        m.set_speculative_expert_prefetch(predict);
+        let mut out = vec![logits(&mut m, &[1, 4, 2, 7, 5], 0)];
+        for (i, t) in [3u32, 6, 2].into_iter().enumerate() {
+            out.push(logits(&mut m, &[t], 5 + i));
+        }
+        let predicted = m.predicted_experts().unwrap().to_vec();
+        (out, predicted)
+    };
+    let (want, none) = run(false);
+    let (got, predicted) = run(true);
+    assert_eq!(want, got, "a prefetch hint must not change any logit");
+    assert!(none.iter().all(Vec::is_empty), "nothing recorded while off");
+    assert!(
+        predicted.iter().any(|ids| !ids.is_empty()),
+        "each MoE layer predicts the experts its last step routed to"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn qwen3moe_kv_cache_can_be_cleared() {
     let dir = common::model_dir("qwen3moe-clear");

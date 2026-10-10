@@ -268,6 +268,14 @@ enum Commands {
             hide_default_value = true
         )]
         prefill_chunk: usize,
+        /// Prefix checkpoints kept per session of a model with recurrent
+        /// layers (Qwen3-Next, Qwen3.5, Qwen3.8-Flash-Next, Kimi-Linear):
+        /// copies of the running state at each prompt boundary, so an edited
+        /// conversation resumes from the latest one instead of re-reading the
+        /// whole prompt.  Each costs one copy of that state per pooled
+        /// session; 0 turns them off (default 4).
+        #[arg(long, env = "JOSHUA_PREFIX_CHECKPOINTS")]
+        prefix_checkpoints: Option<usize>,
         /// Speculative token generation: draft up to N tokens per step by
         /// prompt lookup (the continuation of the latest earlier occurrence
         /// of the output's trailing n-gram) and verify them in one forward
@@ -571,6 +579,7 @@ async fn main() -> anyhow::Result<()> {
             expert_cache,
             vram_expert_cache,
             prefill_chunk,
+            prefix_checkpoints,
             speculative,
             mlock_hot_weights,
             mlock_weight_budget,
@@ -625,6 +634,7 @@ async fn main() -> anyhow::Result<()> {
                 .expert_cache_auto(expert_cache_auto)
                 .vram_expert_cache(vram_cache)
                 .prefill_chunk(prefill_chunk)
+                .prefix_checkpoints_opt(prefix_checkpoints)
                 .speculative(speculative_config(speculative))
                 .mlock_hot_weights(
                     mlock_hot_weights

@@ -46,6 +46,11 @@ pub trait LayerStack: Send + Sync + 'static {
     /// ordinary truncate cannot rewind — see [`Self::snapshot_state`].
     type Snapshot: Clone + Send;
 
+    /// A copy of one layer's running state at a prompt boundary, so a later
+    /// edit of the conversation can resume from there — see
+    /// [`Self::checkpoint_state`].
+    type Checkpoint: Clone + Send;
+
     fn n_layers(&self) -> usize;
     /// Routed experts per MoE layer (0 for a dense model).
     fn n_expert(&self) -> usize;
@@ -152,6 +157,110 @@ pub trait LayerStack: Send + Sync + 'static {
     fn can_rewind(&self) -> bool {
         self.can_truncate()
     }
+
+    /// Copy the running state of one layer — what [`Self::truncate_state`]
+    /// cannot rewind — as it stands after a prefill, so the session can later
+    /// rewind to exactly this position (a prefix checkpoint).
+    ///
+    /// `None` for a layer whose state is append-only (it rewinds through
+    /// [`Self::truncate_state`] alone) and for a loader without running state.
+    fn checkpoint_state(_state: &Self::State) -> Option<Self::Checkpoint> {
+        None
+    }
+
+    /// Reinstate the running state [`Self::checkpoint_state`] copied.  The
+    /// session has already cut the layer's append-only state back to the
+    /// checkpoint's position with [`Self::truncate_state`].
+    fn restore_checkpoint(_state: &mut Self::State, _checkpoint: &Self::Checkpoint) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Keep the final token's routed experts out of an input's `routed` ids
+/// (token-major, `k` per token — see [`crate::moe::dispatch_prefill_with`]).
+fn record_last_routed(slot: &mut Vec<u32>, routed: &[u32], seq_len: usize) {
+    slot.clear();
+    if seq_len > 0 && !routed.is_empty() && routed.len().is_multiple_of(seq_len) {
+        slot.extend_from_slice(&routed[routed.len() - routed.len() / seq_len..]);
+    }
+}
+
+/// How many prefix checkpoints a session of a recurrent model keeps by
+/// default (see [`Session::set_prefix_checkpoints`]).
+pub const DEFAULT_PREFIX_CHECKPOINTS: usize = 4;
+
+/// The running state of every layer as it stood after `pos` tokens: where a
+/// recurrent model can rewind to although its state keeps no history.
+struct PrefixCheckpoint<C> {
+    /// Tokens fed when the copy was taken.
+    pos: usize,
+    /// Per layer, its running state (`None` for an append-only layer).
+    layers: Vec<Option<C>>,
+}
+
+/// A bounded set of prefix checkpoints, ordered by position.
+///
+/// A model with recurrent layers cannot cut its state back to an arbitrary
+/// prefix, so an edited conversation — an agent harness replacing the last
+/// message or an old tool result — used to re-read the whole prompt.  A copy
+/// of the running state at the end of every prefill (each turn's prompt
+/// boundary) lets the edit resume from the closest boundary before it; the
+/// attention caches simply truncate to the same position.
+struct PrefixCheckpoints<C> {
+    /// Most checkpoints kept; `0` disables them.
+    budget: usize,
+    points: Vec<PrefixCheckpoint<C>>,
+}
+
+impl<C> PrefixCheckpoints<C> {
+    fn new(budget: usize) -> Self {
+        Self {
+            budget,
+            points: Vec::new(),
+        }
+    }
+
+    /// Drop every checkpoint past `pos`: those positions are about to be
+    /// rewritten (or were cut away), so a copy taken there no longer
+    /// describes this session's history.  A checkpoint at `pos` itself stays.
+    fn invalidate_after(&mut self, pos: usize) {
+        self.points.retain(|p| p.pos <= pos);
+    }
+
+    /// The latest checkpoint at or before `keep`.
+    fn best(&self, keep: usize) -> Option<&PrefixCheckpoint<C>> {
+        self.points.iter().rev().find(|p| p.pos <= keep)
+    }
+
+    /// Add a checkpoint (replacing one at the same position), then thin the
+    /// set back to the budget.
+    fn insert(&mut self, cp: PrefixCheckpoint<C>) {
+        self.points.retain(|p| p.pos != cp.pos);
+        let at = self.points.partition_point(|p| p.pos < cp.pos);
+        self.points.insert(at, cp);
+        while self.points.len() > self.budget {
+            self.thin();
+        }
+    }
+
+    /// Remove the checkpoint whose loss widens the gap to the one before it
+    /// the least — so the survivors stay spread over the conversation instead
+    /// of crowding its end — never the newest, which serves the most common
+    /// edit (the last message replaced).
+    fn thin(&mut self) {
+        let n = self.points.len();
+        if n <= 1 {
+            self.points.clear();
+            return;
+        }
+        let victim = (0..n - 1)
+            .min_by_key(|&i| {
+                let prev = if i == 0 { 0 } else { self.points[i - 1].pos };
+                self.points[i + 1].pos - prev
+            })
+            .expect("n > 1");
+        self.points.remove(victim);
+    }
 }
 
 /// A just-run multi-position (verification) pass that is still pending
@@ -203,6 +312,17 @@ pub struct Session<W: LayerStack> {
     /// pass arms it; an ordinary prefill leaves it `None` because nothing
     /// partially undoes a prefill.
     verify: Option<VerifyCheckpoint<W::Snapshot>>,
+    /// Copies of the running state at prompt boundaries, so a model with
+    /// recurrent layers can rewind an edited conversation (see
+    /// [`PrefixCheckpoints`]).  Unused when every layer truncates on its own.
+    prefix: PrefixCheckpoints<W::Checkpoint>,
+    /// Whether decode fires the speculative expert prefetch (see
+    /// [`Session::set_speculative_expert_prefetch`]).
+    predict_experts: bool,
+    /// Per layer, the experts the last input's final token routed to: the
+    /// prediction for the next step.  Empty until a layer has routed (and for
+    /// dense layers).
+    last_routed: Vec<Vec<u32>>,
 }
 
 impl<W: LayerStack> Session<W> {
@@ -216,6 +336,9 @@ impl<W: LayerStack> Session<W> {
             hot_experts: crate::hot_experts::HotExpertCache::new(n, weights.n_expert(), 0),
             mask: crate::moe::CausalMask::new(weights.device()),
             verify: None,
+            prefix: PrefixCheckpoints::new(DEFAULT_PREFIX_CHECKPOINTS),
+            predict_experts: false,
+            last_routed: vec![Vec::new(); n],
             weights,
         }
     }
@@ -240,6 +363,9 @@ impl<W: LayerStack> Session<W> {
             ),
             mask: crate::moe::CausalMask::new(self.weights.device()),
             verify: None,
+            prefix: PrefixCheckpoints::new(self.prefix.budget),
+            predict_experts: self.predict_experts,
+            last_routed: vec![Vec::new(); self.state.len()],
         }
     }
 
@@ -300,6 +426,8 @@ impl<W: LayerStack> Session<W> {
             let ids: Vec<u32> = input.flatten_all()?.to_vec1()?;
             self.record_tokens(offset, &ids)?;
         }
+        // Positions from `offset` on are rewritten by this pass.
+        self.prefix.invalidate_after(offset);
         let mut xs = self.embed(input, seq_len)?;
         let mask = if seq_len == 1 {
             None
@@ -324,6 +452,20 @@ impl<W: LayerStack> Session<W> {
             }
         }
 
+        // Speculative next-step expert prefetch: routing is temporally local,
+        // so the step about to run routes largely to the experts each layer
+        // chose last step.  Hinting them all before layer 0 gives layer `l`'s
+        // pages `l` layers of compute to stream in behind, instead of faulting
+        // one 4 KiB page at a time inside the expert matmul.  A wrong guess
+        // costs only the advice call (`deepseek4` does the same).
+        if decode && self.predict_experts {
+            for (l, ids) in self.last_routed.iter().enumerate() {
+                for &e in ids {
+                    w.residency().prefetch_hint(l as u32, e);
+                }
+            }
+        }
+
         let layer_input = LayerInput {
             mask: mask.as_ref(),
             offset,
@@ -343,6 +485,9 @@ impl<W: LayerStack> Session<W> {
         for l in 0..self.state.len() {
             let (out, routed) = w.layer(l, &mut self.state, &xs, &layer_input)?;
             self.hot_experts.record(l, &routed, step);
+            if self.predict_experts {
+                record_last_routed(&mut self.last_routed[l], &routed, seq_len);
+            }
             xs = out;
         }
         if all_logits {
@@ -360,6 +505,10 @@ impl<W: LayerStack> Session<W> {
             for s in self.state.iter_mut() {
                 W::clear_verify(s);
             }
+        } else if seq_len > 1 {
+            // A prefill chunk: its end may be where an edited conversation
+            // later diverges.
+            self.take_prefix_checkpoint(offset + seq_len);
         }
 
         if all_logits {
@@ -377,6 +526,62 @@ impl<W: LayerStack> Session<W> {
         self.hot_experts.set_budget(n);
     }
 
+    /// Set how many prefix checkpoints this session (and every session
+    /// derived from it) keeps; `0` turns them off.  Only a model with
+    /// recurrent layers takes any: each holds one copy of every recurrent
+    /// layer's running state.  Default [`DEFAULT_PREFIX_CHECKPOINTS`].
+    pub fn set_prefix_checkpoints(&mut self, n: usize) {
+        self.prefix.budget = n;
+        while self.prefix.points.len() > n {
+            self.prefix.thin();
+        }
+    }
+
+    /// Fire a `MADV_WILLNEED` for each MoE layer's predicted experts — the
+    /// ones its previous step routed to — before every decode step.  For a
+    /// model whose experts page in on demand (larger than RAM); on a model
+    /// that is already resident it would only add advice calls, so it is
+    /// off by default.  Inherited by derived sessions.
+    pub fn set_speculative_expert_prefetch(&mut self, on: bool) {
+        self.predict_experts = on;
+    }
+
+    /// Per layer, the experts the last input's final token routed to — the
+    /// speculative prefetch's prediction (diagnostics; empty unless
+    /// [`Self::set_speculative_expert_prefetch`] is on).
+    pub fn last_routed_experts(&self) -> &[Vec<u32>] {
+        &self.last_routed
+    }
+
+    /// Positions of the prefix checkpoints this session holds (diagnostics).
+    pub fn prefix_checkpoint_positions(&self) -> Vec<usize> {
+        self.prefix.points.iter().map(|p| p.pos).collect()
+    }
+
+    /// The longest prefix of at most `keep` tokens that
+    /// [`Self::truncate_kv_cache`] can rewind this session to: `keep` itself
+    /// when every layer truncates on its own, else the latest prefix
+    /// checkpoint at or before it (`0` when there is none).
+    pub fn rewind_target(&self, keep: usize) -> usize {
+        if self.weights.can_truncate() {
+            keep
+        } else {
+            self.prefix.best(keep).map_or(0, |p| p.pos)
+        }
+    }
+
+    /// Copy every layer's running state as it stands after `pos` tokens.
+    fn take_prefix_checkpoint(&mut self, pos: usize) {
+        if self.prefix.budget == 0 || self.weights.can_truncate() {
+            return;
+        }
+        let layers: Vec<_> = self.state.iter().map(W::checkpoint_state).collect();
+        if layers.iter().all(Option::is_none) {
+            return;
+        }
+        self.prefix.insert(PrefixCheckpoint { pos, layers });
+    }
+
     /// Number of experts the residency backend can hold resident
     /// (informational on CPU; a phase-5 auto-sizing input on devices).
     pub fn expert_residency_capacity(&self) -> usize {
@@ -392,6 +597,10 @@ impl<W: LayerStack> Session<W> {
         self.tokens.clear();
         // A pending checkpoint refers into the state just replaced; drop it.
         self.verify = None;
+        self.prefix.points.clear();
+        for ids in self.last_routed.iter_mut() {
+            ids.clear();
+        }
     }
 
     /// Whether this instance's state can be cut back to an *arbitrary* prefix.
@@ -465,18 +674,31 @@ impl<W: LayerStack> Session<W> {
                     }
                 }
             }
-            None => {
-                if !self.weights.can_truncate() {
-                    candle_core::bail!(
-                        "this model's recurrent layer state cannot be truncated; only a \
-                         speculative verification pass can be rolled back"
-                    );
-                }
+            None if self.weights.can_truncate() => {
                 for s in self.state.iter_mut() {
                     W::truncate_state(s, keep)?;
                 }
             }
+            None => {
+                // Running state has no history to reach back into; only a
+                // prefix checkpoint taken at exactly `keep` can serve it.
+                let Some(checkpoint) = self.prefix.points.iter().find(|p| p.pos == keep) else {
+                    candle_core::bail!(
+                        "this model's recurrent layer state cannot be truncated to {keep} \
+                         tokens: no prefix checkpoint there (see `rewind_target`), and only a \
+                         speculative verification pass can be rolled back otherwise"
+                    );
+                };
+                for (s, cp) in self.state.iter_mut().zip(&checkpoint.layers) {
+                    W::clear_verify(s);
+                    W::truncate_state(s, keep)?;
+                    if let Some(cp) = cp {
+                        W::restore_checkpoint(s, cp)?;
+                    }
+                }
+            }
         }
+        self.prefix.invalidate_after(keep);
         self.tokens.truncate(keep);
         Ok(())
     }
@@ -506,6 +728,7 @@ impl<W: LayerStack> crate::stream_prefill::StreamPrefill for Session<W> {
         // so that is when its tokens join the history.
         if l == 0 {
             self.record_tokens(pos, tokens)?;
+            self.prefix.invalidate_after(pos);
         }
         // Chunk-local causal mask: this chunk's tokens attend to all prior
         // positions ([chunk_len, chunk_len + pos]) — the same causal mask the
@@ -524,7 +747,18 @@ impl<W: LayerStack> crate::stream_prefill::StreamPrefill for Session<W> {
         let (out, routed) = w.layer(l, &mut self.state, xs, &input)?;
         let step = self.hot_experts.begin_step(false);
         self.hot_experts.record(l, &routed, step);
+        // Chunks reach a layer in order, so the last one leaves the prompt's
+        // final token as the prediction for the first decode step.
+        if self.predict_experts {
+            record_last_routed(&mut self.last_routed[l], &routed, seq);
+        }
         Ok(out)
+    }
+
+    fn end_stream(&mut self, end: usize) {
+        // Every layer has seen every chunk: the state now stands at the
+        // prompt's end, the boundary an edit of the next turn resumes from.
+        self.take_prefix_checkpoint(end);
     }
 
     fn final_logits(&self, last: &Tensor) -> Result<Tensor> {
@@ -532,5 +766,59 @@ impl<W: LayerStack> crate::stream_prefill::StreamPrefill for Session<W> {
         self.weights
             .head(&last.narrow(1, seq_len - 1, 1)?)?
             .squeeze(1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn checkpoints(budget: usize, at: &[usize]) -> PrefixCheckpoints<()> {
+        let mut c = PrefixCheckpoints::new(budget);
+        for &pos in at {
+            c.insert(PrefixCheckpoint { pos, layers: vec![Some(())] });
+        }
+        c
+    }
+
+    fn positions(c: &PrefixCheckpoints<()>) -> Vec<usize> {
+        c.points.iter().map(|p| p.pos).collect()
+    }
+
+    /// Thinning drops the checkpoint whose loss opens the smallest gap and
+    /// never the newest, so the survivors stay spread over the conversation.
+    #[test]
+    fn prefix_checkpoints_thin_to_a_spread() {
+        let c = checkpoints(4, &[100, 200, 300, 10_000, 10_100]);
+        assert_eq!(positions(&c), [200, 300, 10_000, 10_100]);
+        // Out-of-order and repeated inserts stay sorted and unique.
+        let c = checkpoints(3, &[50, 10, 50, 30]);
+        assert_eq!(positions(&c), [10, 30, 50]);
+        let c = checkpoints(1, &[10, 20, 30]);
+        assert_eq!(positions(&c), [30]);
+        assert!(checkpoints(0, &[10]).points.is_empty());
+    }
+
+    #[test]
+    fn prefix_checkpoints_lookup_and_invalidation() {
+        let mut c = checkpoints(4, &[5, 11, 20]);
+        assert_eq!(c.best(4).map(|p| p.pos), None);
+        assert_eq!(c.best(11).map(|p| p.pos), Some(11));
+        assert_eq!(c.best(19).map(|p| p.pos), Some(11));
+        c.invalidate_after(11);
+        assert_eq!(positions(&c), [5, 11]);
+    }
+
+    /// Only the final token's `k` ids are kept as the prediction.
+    #[test]
+    fn last_routed_keeps_the_final_token() {
+        let mut slot = vec![9];
+        record_last_routed(&mut slot, &[1, 2, 3, 4, 5, 6], 3);
+        assert_eq!(slot, [5, 6]);
+        record_last_routed(&mut slot, &[7, 8], 1);
+        assert_eq!(slot, [7, 8]);
+        // A dense layer (no ids) clears the prediction.
+        record_last_routed(&mut slot, &[], 1);
+        assert!(slot.is_empty());
     }
 }
