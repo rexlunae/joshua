@@ -11,9 +11,9 @@ use dioxus_bulma::prelude::*;
 use web_time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::api::{
-    format_utc_hms, normalize_base_url, parse_optional, parse_stop_list, tokens_per_second,
-    ApiError, ChatMessage, ChatRequest, Health, ModelList, Role, SamplingParams, Usage,
-    DEFAULT_BASE_URL, SERVER_ROUTES,
+    exposes_credentials, format_utc_hms, normalize_base_url, parse_optional, parse_stop_list,
+    tokens_per_second, ApiError, ChatMessage, ChatRequest, Health, LatestWins, ModelList, Role,
+    SamplingParams, Usage, DEFAULT_BASE_URL, SERVER_ROUTES,
 };
 use crate::client::JoshuaClient;
 
@@ -37,8 +37,11 @@ struct NodeStatus {
 /// Generations sent from this browser session.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct SessionStats {
+    /// Counted when sent, so a cancelled request (which the server may still
+    /// be generating) is not lost.
     requests: u32,
     failures: u32,
+    cancelled: u32,
     completion_tokens: u64,
     last_usage: Option<Usage>,
     last_elapsed_ms: Option<f64>,
@@ -50,6 +53,8 @@ struct SessionStats {
 struct AppCtx {
     client: Signal<Option<JoshuaClient>>,
     status: Signal<NodeStatus>,
+    /// Orders overlapping polls of `client` into `status`.
+    polls: Signal<LatestWins>,
     stats: Signal<SessionStats>,
     auto_refresh: Signal<bool>,
 }
@@ -85,10 +90,16 @@ async fn poll_node(client: &JoshuaClient) -> NodeStatus {
 
 fn refresh(ctx: AppCtx) {
     let mut status = ctx.status;
+    let mut polls = ctx.polls;
     if let Some(client) = ctx.client.peek().clone() {
+        let ticket = polls.write().issue();
         spawn(async move {
             let s = poll_node(&client).await;
-            status.set(s);
+            // Drop a poll that finished after a newer one, or after the user
+            // connected elsewhere.
+            if polls.write().accept(ticket) {
+                status.set(s);
+            }
         });
     }
 }
@@ -98,6 +109,7 @@ pub fn App() -> Element {
     let ctx = use_context_provider(|| AppCtx {
         client: Signal::new(None),
         status: Signal::new(NodeStatus::default()),
+        polls: Signal::new(LatestWins::default()),
         stats: Signal::new(SessionStats::default()),
         auto_refresh: Signal::new(true),
     });
@@ -148,6 +160,8 @@ fn ConnectionBar() -> Element {
             Ok(base) => {
                 let k = key.read().trim().to_string();
                 let client = JoshuaClient::new(base.clone(), (!k.is_empty()).then_some(k));
+                let mut polls = ctx.polls;
+                polls.write().invalidate();
                 let mut c = ctx.client;
                 c.set(Some(client));
                 let mut s = ctx.status;
@@ -161,6 +175,8 @@ fn ConnectionBar() -> Element {
     };
 
     let connected = ctx.client.read().as_ref().map(|c| c.base().to_string());
+    let key_exposed = !key.read().trim().is_empty()
+        && normalize_base_url(&url.read()).is_ok_and(|base| exposes_credentials(&base));
     let health_tag = match &ctx.status.read().health {
         Some(Ok((h, _))) if h.is_ok() => rsx! { Tag { color: BulmaColor::Success, "healthy" } },
         Some(Ok((h, _))) => rsx! { Tag { color: BulmaColor::Warning, "{h.status}" } },
@@ -204,6 +220,11 @@ fn ConnectionBar() -> Element {
         }
         if let Some(e) = error() {
             Notification { color: BulmaColor::Danger, light: true, "{e}" }
+        }
+        if key_exposed {
+            Notification { color: BulmaColor::Warning, light: true,
+                "This is plain http:// to a non-loopback host: the API key and your prompts will cross the network unencrypted. Use https:// (e.g. behind a TLS proxy) for remote servers."
+            }
         }
     }
 }
@@ -317,7 +338,7 @@ fn MonitorView() -> Element {
                     p { class: "help", "Measured client-side from playground requests; the server has no metrics endpoint." }
                     Table { narrow: true,
                         tbody {
-                            tr { th { "Requests" } td { "{stats.requests} ({stats.failures} failed)" } }
+                            tr { th { "Requests" } td { "{stats.requests} ({stats.failures} failed, {stats.cancelled} cancelled)" } }
                             tr { th { "Completion tokens" } td { "{stats.completion_tokens}" } }
                             tr { th { "Last request tokens" } td { "{last_tokens}" } }
                             tr { th { "Last wall time" } td { "{fmt_opt(stats.last_elapsed_ms, \"ms\")}" } }
@@ -419,6 +440,7 @@ fn PlaygroundView() -> Element {
             *stream.peek(),
         );
         let mut stats = ctx.stats;
+        stats.write().requests += 1;
         let task = spawn(async move {
             let start = Instant::now();
             let result = if req.stream {
@@ -437,7 +459,6 @@ fn PlaygroundView() -> Element {
             };
             let elapsed = start.elapsed().as_secs_f64() * 1000.0;
             let mut st = stats.write();
-            st.requests += 1;
             match result {
                 Ok((text, usage, tool_calls)) => {
                     let mut text = text;
@@ -468,6 +489,8 @@ fn PlaygroundView() -> Element {
     let cancel = move |_| {
         if let Some(t) = running.take() {
             t.cancel();
+            let mut stats = ctx.stats;
+            stats.write().cancelled += 1;
             let partial = pending.take();
             if !partial.is_empty() {
                 history.write().push(ChatMessage::new(
@@ -578,30 +601,43 @@ fn PlaygroundView() -> Element {
 
 #[derive(Clone, PartialEq)]
 struct ClusterNode {
+    /// Unique per added entry, so a poll of a removed node never lands on a
+    /// re-added one.
+    id: u64,
     base: String,
+    /// This node's own key. The connection bar's key is never sent to other
+    /// nodes: a node's operator could replay it against the main server.
+    api_key: Option<String>,
     status: NodeStatus,
+    polls: LatestWins,
 }
 
 #[component]
 fn ClusterView() -> Element {
-    let ctx = use_context::<AppCtx>();
     let mut nodes = use_signal(Vec::<ClusterNode>::new);
     let mut new_url = use_signal(String::new);
+    let mut new_key = use_signal(String::new);
+    let mut next_id = use_signal(|| 0u64);
     let mut error = use_signal(|| None::<String>);
 
     let check_all = move || {
-        let key = ctx
-            .client
-            .peek()
-            .as_ref()
-            .and_then(|c| c.api_key().map(String::from));
-        let bases: Vec<String> = nodes.peek().iter().map(|n| n.base.clone()).collect();
-        for base in bases {
-            let client = JoshuaClient::new(base.clone(), key.clone());
+        let mut nodes = nodes;
+        let targets: Vec<(u64, JoshuaClient, u64)> = nodes
+            .write()
+            .iter_mut()
+            .map(|n| {
+                let client = JoshuaClient::new(n.base.clone(), n.api_key.clone());
+                (n.id, client, n.polls.issue())
+            })
+            .collect();
+        for (id, client, ticket) in targets {
             spawn(async move {
                 let s = poll_node(&client).await;
-                if let Some(n) = nodes.write().iter_mut().find(|n| n.base == base) {
-                    n.status = s;
+                if let Some(n) = nodes.write().iter_mut().find(|n| n.id == id) {
+                    // Only the newest check of this node may land.
+                    if n.polls.accept(ticket) {
+                        n.status = s;
+                    }
                 }
             });
         }
@@ -612,12 +648,19 @@ fn ClusterView() -> Element {
         match normalize_base_url(&typed) {
             Ok(base) => {
                 if !nodes.peek().iter().any(|n| n.base == base) {
+                    let k = new_key.read().trim().to_string();
+                    let id = *next_id.peek();
+                    next_id.set(id + 1);
                     nodes.write().push(ClusterNode {
+                        id,
                         base,
+                        api_key: (!k.is_empty()).then_some(k),
                         status: NodeStatus::default(),
+                        polls: LatestWins::default(),
                     });
                 }
                 new_url.set(String::new());
+                new_key.set(String::new());
                 error.set(None);
                 check_all();
             }
@@ -637,19 +680,28 @@ fn ClusterView() -> Element {
             Control { expanded: true,
                 Input { value: new_url(), placeholder: "http://node2.lan:8080", oninput: move |e: FormEvent| new_url.set(e.value()) }
             }
+            Control {
+                Input { input_type: InputType::Password, value: new_key(), placeholder: "Node API key (optional)", oninput: move |e: FormEvent| new_key.set(e.value()) }
+            }
             Control { Button { color: BulmaColor::Primary, onclick: add, "Add node" } }
             Control { Button { onclick: move |_| check_all(), "Check all" } }
         }
         if let Some(e) = error() {
             Notification { color: BulmaColor::Danger, light: true, "{e}" }
         }
-        p { class: "help mb-3", "Nodes are checked with the API key from the connection bar (if any); /health never needs one." }
+        p { class: "help mb-3", "Each node is checked with its own API key (if given); the connection bar's key is never sent to other nodes. /health never needs one." }
         Table { fullwidth: true, striped: true,
             thead { tr { th { "Node" } th { "Health" } th { "RTT" } th { "Models" } th { "Checked" } th {} } }
             tbody {
                 for node in nodes.read().iter().cloned() {
-                    tr { key: "{node.base}",
-                        td { code { "{node.base}" } }
+                    tr { key: "{node.id}",
+                        td {
+                            code { "{node.base}" }
+                            if node.api_key.is_some() && exposes_credentials(&node.base) {
+                                " "
+                                span { title: "This node's API key is sent over plain http", Tag { color: BulmaColor::Warning, "key over http" } }
+                            }
+                        }
                         td {
                             match &node.status.health {
                                 Some(Ok((h, _))) if h.is_ok() => rsx! { Tag { color: BulmaColor::Success, "ok" } },
@@ -675,8 +727,8 @@ fn ClusterView() -> Element {
                         td {
                             Delete {
                                 onclick: {
-                                    let base = node.base.clone();
-                                    move |_| nodes.write().retain(|n| n.base != base)
+                                    let id = node.id;
+                                    move |_| nodes.write().retain(|n| n.id != id)
                                 }
                             }
                         }

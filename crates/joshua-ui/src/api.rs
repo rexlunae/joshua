@@ -145,6 +145,62 @@ pub fn bearer_header(api_key: Option<&str>) -> Option<String> {
         .map(|k| format!("Bearer {k}"))
 }
 
+/// Whether a bearer key sent to this normalised base URL would cross the
+/// network unencrypted: plain `http://` to anything but a loopback host.
+pub fn exposes_credentials(base: &str) -> bool {
+    let Some(rest) = base.strip_prefix("http://") else {
+        return false; // https (normalised URLs carry one of the two schemes)
+    };
+    let authority = rest.split('/').next().unwrap_or("");
+    let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let host = if let Some(v6) = authority.strip_prefix('[') {
+        v6.split(']').next().unwrap_or("")
+    } else {
+        authority.split(':').next().unwrap_or("")
+    };
+    let host = host.to_ascii_lowercase();
+    let loopback = host == "localhost"
+        || host.ends_with(".localhost")
+        || host == "::1"
+        || host
+            .parse::<std::net::Ipv4Addr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    !loopback
+}
+
+/// Orders the results of overlapping polls: each poll takes a ticket when it
+/// starts, and only a result newer than the last one applied, and issued
+/// since the last [`LatestWins::invalidate`], may be applied. A slow poll of
+/// a previous server (or an older poll of the same one) is thus discarded
+/// instead of overwriting fresher status.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LatestWins {
+    issued: u64,
+    applied: u64,
+}
+
+impl LatestWins {
+    /// Ticket for a poll starting now.
+    pub fn issue(&mut self) -> u64 {
+        self.issued += 1;
+        self.issued
+    }
+
+    /// Reject every ticket issued so far (the target or credentials changed).
+    pub fn invalidate(&mut self) {
+        self.applied = self.issued;
+    }
+
+    /// Whether the poll holding `ticket` may apply its result; records it.
+    pub fn accept(&mut self, ticket: u64) -> bool {
+        if ticket <= self.applied {
+            return false;
+        }
+        self.applied = ticket;
+        true
+    }
+}
+
 // ─── Responses ───────────────────────────────────────────────────────────────
 
 /// `GET /health` body.
@@ -521,6 +577,91 @@ pub fn parse_stream_data(data: &str) -> Result<StreamEvent, ApiError> {
     })
 }
 
+/// Outcome of a streamed chat completion.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct StreamSummary {
+    pub text: String,
+    pub finish_reason: Option<String>,
+    pub usage: Option<Usage>,
+    /// The model answered with tool calls, which the playground does not render.
+    pub tool_calls: bool,
+}
+
+/// Accumulates a chat-completion SSE stream into a [`StreamSummary`].
+///
+/// Every successful Joshua stream ends with `[DONE]`; a stream that closes
+/// without it was cut short (a proxy, a lost worker), so [`ChatStream::finish`]
+/// reports it as an error rather than passing partial text off as the reply.
+#[derive(Debug, Default)]
+pub struct ChatStream {
+    decoder: SseDecoder,
+    summary: StreamSummary,
+    done: bool,
+}
+
+impl ChatStream {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feed raw bytes; `on_delta` sees each piece of content. Returns `true`
+    /// once `[DONE]` has arrived (later bytes are ignored).
+    pub fn push(
+        &mut self,
+        bytes: &[u8],
+        on_delta: &mut impl FnMut(&str),
+    ) -> Result<bool, ApiError> {
+        for data in self.decoder.push(bytes) {
+            self.apply(&data, on_delta)?;
+        }
+        Ok(self.done)
+    }
+
+    /// The summary of a stream that has ended (at `[DONE]` or end of body).
+    pub fn finish(mut self, on_delta: &mut impl FnMut(&str)) -> Result<StreamSummary, ApiError> {
+        if !self.done {
+            for data in self.decoder.finish() {
+                self.apply(&data, on_delta)?;
+            }
+        }
+        if self.done {
+            Ok(self.summary)
+        } else {
+            Err(ApiError::Transport(
+                "the stream ended before [DONE]; the reply is incomplete".to_string(),
+            ))
+        }
+    }
+
+    fn apply(&mut self, data: &str, on_delta: &mut impl FnMut(&str)) -> Result<(), ApiError> {
+        if self.done {
+            return Ok(());
+        }
+        match parse_stream_data(data)? {
+            StreamEvent::Done => self.done = true,
+            StreamEvent::Chunk {
+                content,
+                finish_reason,
+                usage,
+                has_tool_calls,
+            } => {
+                if let Some(c) = content {
+                    on_delta(&c);
+                    self.summary.text.push_str(&c);
+                }
+                if finish_reason.is_some() {
+                    self.summary.finish_reason = finish_reason;
+                }
+                if usage.is_some() {
+                    self.summary.usage = usage;
+                }
+                self.summary.tool_calls |= has_tool_calls;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Generation throughput measured on the client.
 pub fn tokens_per_second(completion_tokens: u32, elapsed_ms: f64) -> Option<f64> {
     (elapsed_ms > 0.0 && completion_tokens > 0)
@@ -771,6 +912,88 @@ mod tests {
         ));
         assert_eq!(parse_stream_data(" [DONE] ").unwrap(), StreamEvent::Done);
         assert!(parse_stream_data("{").is_err());
+    }
+
+    /// Regression (Devin review on #170): a stream that closes without
+    /// `[DONE]` is an error, not a successful (truncated) reply.
+    #[test]
+    fn chat_stream_requires_done() {
+        let chunk = |c: &str| {
+            format!(
+                r#"data: {{"choices":[{{"index":0,"delta":{{"content":"{c}"}},"finish_reason":null}}]}}"#
+            ) + "\n\n"
+        };
+        let mut seen = String::new();
+        {
+            let mut on_delta = |d: &str| seen.push_str(d);
+
+            let mut stream = ChatStream::new();
+            assert!(!stream.push(chunk("Hel").as_bytes(), &mut on_delta).unwrap());
+            assert!(matches!(
+                stream.finish(&mut on_delta),
+                Err(ApiError::Transport(_))
+            ));
+
+            let mut stream = ChatStream::new();
+            assert!(!stream.push(chunk("Hel").as_bytes(), &mut on_delta).unwrap());
+            assert!(!stream.push(chunk("lo").as_bytes(), &mut on_delta).unwrap());
+            assert!(stream.push(b"data: [DONE]\n\n", &mut on_delta).unwrap());
+            let summary = stream.finish(&mut on_delta).unwrap();
+            assert_eq!(summary.text, "Hello");
+
+            // An unterminated [DONE] at end of body still completes the stream.
+            let mut stream = ChatStream::new();
+            stream.push(chunk("x").as_bytes(), &mut on_delta).unwrap();
+            stream.push(b"data: [DONE]", &mut on_delta).unwrap();
+            assert_eq!(stream.finish(&mut on_delta).unwrap().text, "x");
+        }
+        assert_eq!(seen, "HelHellox");
+    }
+
+    /// Regression (Devin review on #170): warn before a key crosses plain HTTP.
+    #[test]
+    fn credential_exposure_by_scheme_and_host() {
+        for local in [
+            "http://127.0.0.1:8080",
+            "http://127.1.2.3",
+            "http://localhost:8080/prefix",
+            "http://LOCALHOST",
+            "http://app.localhost:1",
+            "http://[::1]:8080",
+            "https://node1.lan:9000",
+            "https://203.0.113.5",
+        ] {
+            assert!(!exposes_credentials(local), "{local}");
+        }
+        for remote in [
+            "http://node1.lan:8080",
+            "http://192.168.1.10",
+            "http://[2001:db8::1]:8080",
+            "http://localhost.evil.example",
+            "http://127.0.0.1.nip.io",
+            "http://user@node1.lan",
+        ] {
+            assert!(exposes_credentials(remote), "{remote}");
+        }
+    }
+
+    /// Regression (Devin review on #170): out-of-order or pre-reconnect polls
+    /// must not overwrite fresher status.
+    #[test]
+    fn latest_wins_discards_stale_polls() {
+        let mut seq = LatestWins::default();
+        let old = seq.issue();
+        let newer = seq.issue();
+        assert!(seq.accept(newer));
+        assert!(!seq.accept(old), "an older poll finished last");
+
+        // Reconnect: polls of the previous server are all stale.
+        let before = seq.issue();
+        seq.invalidate();
+        let after = seq.issue();
+        assert!(!seq.accept(before));
+        assert!(seq.accept(after));
+        assert!(!seq.accept(after), "a ticket applies once");
     }
 
     #[test]
