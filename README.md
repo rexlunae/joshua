@@ -434,6 +434,48 @@ curl http://localhost:8080/v1/audio/transcriptions \
 curl http://localhost:8080/v1/models
 ```
 
+### `POST /v1/models/load` and `POST /v1/models/unload`
+
+Start the server with `--model-dir DIR` (and `--model` becomes optional) to
+load and unload models at runtime.  Requests name a GGUF file, or a directory
+holding one, relative to `DIR`; paths outside it are refused.  Protect these
+routes with `--api-key` when the server is reachable from other hosts.
+
+```bash
+joshua serve --model-dir ./weights
+curl -X POST localhost:8080/v1/models/load -H 'content-type: application/json' \
+  -d '{"model": "Qwen3-8B-Q4_K_M.gguf", "id": "qwen3"}'
+curl -X POST localhost:8080/v1/models/unload -H 'content-type: application/json' \
+  -d '{"id": "qwen3"}'
+```
+
+Several models can be loaded at once; requests pick one with `model` (a
+server holding a single model answers any name, as before).  Unloading waits
+for requests already running on the model.
+
+#### Model-less workers (experimental, `--features distributed`)
+
+A worker starts with no model and receives its share from a controller:
+
+```bash
+export JOSHUA_CLUSTER_KEY=$(openssl rand -hex 32)   # same on every host
+joshua worker --listen 0.0.0.0:7070 --cache-dir ~/.cache/joshua-stages   # each worker
+joshua serve --model-dir ./weights --worker 10.0.0.2:7070,10.0.0.3:7070 --api-key ...
+```
+
+A load on such a controller splits the model's layers into contiguous
+pipeline stages, sized by each worker's free memory (or `"ends": [..]`), and
+streams every worker only the tensors of its own stage over the authenticated
+connection.  Model data comes only from the controller.  The controller keeps
+the tokenizer, chat template and sampling; workers hold the weights and KV.
+Unloading releases the workers, which delete their stage unless
+`--cache-dir` keeps it for the next load of the same model (re-verified by
+checksum before reuse).  Load options: `workers` (a subset of the configured
+ones), `ends`, `n_ctx`, `sessions` (remote KV slots), `chunk` (prompt tokens
+per pipeline step) and `local: true` to load on the controller instead.  This
+path currently supports CPU Qwen3 dense models; see
+[docs/controller-model-loading.md](docs/controller-model-loading.md).
+
 ### `GET /health`
 
 ```bash

@@ -91,6 +91,14 @@ fn decode_key(key: &str) -> Result<Vec<u8>> {
         .collect()
 }
 
+/// `JOSHUA_CLUSTER_KEY`, decoded, when set.
+pub fn cluster_key() -> Result<Option<Vec<u8>>> {
+    match std::env::var("JOSHUA_CLUSTER_KEY") {
+        Ok(key) => decode_key(&key).map(Some),
+        Err(_) => Ok(None),
+    }
+}
+
 fn greedy(logits: &[f32]) -> Result<u32> {
     ensure!(!logits.is_empty(), "empty model logits");
     ensure!(
