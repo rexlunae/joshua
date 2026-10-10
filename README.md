@@ -153,9 +153,14 @@ cargo build --release
     --model ./weights/whisper-tiny \
     --language en speech.wav
 
-# Start the API server
+# Reasoning models: switch thinking off / pick an effort, reproducible sampling
+./target/release/joshua run --model ./weights/Qwen3-8B-Q4_K_M.gguf \
+    --enable-thinking false --seed 7 "What is 17 * 23?"
+
+# Start the API server (--n-ctx sets the context window; requests may narrow it)
 ./target/release/joshua serve \
     --model ./weights/gemma-3-1b-it-Q4_K_M.gguf \
+    --n-ctx 8192 \
     --addr 0.0.0.0:8080
 ```
 
@@ -349,6 +354,55 @@ curl -N http://localhost:8080/v1/chat/completions \
   -d '{"model":"gemma","messages":[{"role":"user","content":"Count to 5"}],"stream":true}'
 ```
 
+#### Request parameters
+
+Besides `model`, `messages`, `stream` and `tools`:
+
+| Field | Notes |
+|---|---|
+| `max_tokens` / `max_completion_tokens` | Generation cap (the latter wins); always clamped to `--max-output-tokens` and the remaining context |
+| `temperature`, `top_p`, `top_k`, `min_p`, `repetition_penalty`, `stop` | See [Generation options](#generation-options) |
+| `presence_penalty`, `frequency_penalty` | OpenAI penalties, `-2.0..=2.0` |
+| `seed` | Reproducible sampling; negative (llama.cpp's `-1`) means random |
+| `reasoning_effort` | `none`, `minimal`, `low`, `medium`, `high`, `xhigh` — see below |
+| `reasoning` | `{"effort": …, "enabled": bool, "max_tokens": n}` (OpenAI Responses / OpenRouter shape) |
+| `enable_thinking` | Thinking on/off (Qwen API spelling) |
+| `chat_template_kwargs` | Extra variables for the GGUF chat template (vLLM / llama.cpp convention); override the reasoning-derived ones |
+| `context_window` (alias `num_ctx`, `n_ctx`) | Per-request context window; **400** when larger than the server's `--n-ctx` (the KV cache and RoPE tables are sized at load), and the prompt must fit inside it |
+| `tool_choice` | `"none"` hides `tools`; `"required"` and named functions cannot be enforced and act like `"auto"` |
+| `stream_options` | Accepted; usage is always sent on the final chunk |
+| `n`, `logprobs`, `top_logprobs`, `response_format` | Only `n: 1`, `logprobs: false`, `top_logprobs: 0` and `{"type": "text"}` are accepted; anything else is a **400** rather than silently ignored |
+
+Other unknown fields are ignored.
+
+#### Reasoning and thinking
+
+Reasoning controls reach the model through its own chat template, so they
+work on exactly the models whose template has the switch:
+
+| Template variable | Set from | Read by |
+|---|---|---|
+| `enable_thinking` | `enable_thinking`, `reasoning.enabled`, or `reasoning_effort` (`none` → `false`, others → `true`) | Qwen3 (hybrid), GLM-4.5/4.6, SmolLM3, Hunyuan-A13B |
+| `thinking` | same as `enable_thinking` | DeepSeek-V3.1/V3.2, Granite 3.x |
+| `reasoning_effort` | `reasoning_effort` / `reasoning.effort` as `low`/`medium`/`high` (`none`, `minimal` → `low`; `xhigh` → `high`); thinking off with no effort → `low` | gpt-oss (which cannot turn reasoning off; `low` is the floor) |
+| `thinking_budget` | `reasoning.max_tokens` (advisory, not enforced by the sampler) | Seed-OSS |
+
+Contradictory spellings (e.g. `reasoning_effort: "high"` with
+`enable_thinking: false`) are a 400.  Models without a switch ignore the
+settings and render exactly as before: Llama, Gemma, Mistral, the
+always-thinking DeepSeek-R1 / Kimi-K2-Thinking / Qwen3-*-Thinking-2507, and
+the never-thinking Qwen3-*-Instruct-2507.  So does any GGUF without an
+embedded chat template (the ChatML fallback has no switches); use
+`chat_template_kwargs` for template variables not listed here.  Thinking
+text is returned in `content` as the model writes it (no separate
+`reasoning_content` field yet).
+
+Attention geometry — sliding-window size, RoPE / YaRN scaling, sparse
+attention top-k — is read from the GGUF metadata at load and is not
+adjustable per request; changing it would leave the model outside what it
+was trained on.  `context_window` is the per-request bound on how far
+attention reaches.
+
 ### `POST /v1/embeddings`
 
 ```bash
@@ -406,6 +460,9 @@ Two limits bound how much work a single client can demand, both tunable:
   large models on small boxes.
 - `--max-output-tokens` (default: 4096) caps generated tokens per request
   regardless of the client's `max_tokens`, bounding single-request CPU time.
+- `--n-ctx` (default: 4096) is the context window — prompt plus generated
+  tokens — the model is loaded with.  A request can narrow it with
+  `context_window` but never widen it.
 
 Uploaded audio is limited to ~30 minutes of 16 kHz-equivalent samples, and
 inline image data must be a base64 `data:` URL (filesystem paths and remote
@@ -592,6 +649,7 @@ prints the dense/expert split of any GGUF to sanity-check a new model.
 | Variable | Description |
 |---|---|
 | `JOSHUA_MODEL_PATH` | Default model path (overrides `--model` flag) |
+| `JOSHUA_N_CTX` | Context window in tokens (same as `--n-ctx`, default 4096); requests may only narrow it |
 | `JOSHUA_API_KEY` | API key required on `/v1` routes (same as `--api-key`) |
 | `JOSHUA_TLS_CERT` | PEM certificate chain for HTTPS (same as `--tls-cert`; needs `--features tls`) |
 | `JOSHUA_TLS_KEY` | PEM private key for HTTPS (same as `--tls-key`) |
@@ -687,7 +745,15 @@ token per pass.
 | `top_k` | `i32` | `40` | Top-k sampling (0 = disabled) |
 | `min_p` | `f32` | `0.05` | Min-p filter relative to top token |
 | `repetition_penalty` | `f32` | `1.1` | Penalise tokens seen in the last 64-token window (1.0 = disabled) |
+| `presence_penalty` | `f32` | `0.0` | OpenAI presence penalty over the same window, `-2..=2` (applied at every temperature) |
+| `frequency_penalty` | `f32` | `0.0` | OpenAI frequency penalty (per occurrence) over the same window, `-2..=2` |
+| `seed` | `Option<u64>` | `None` | Sampler seed; `None` seeds from OS entropy |
+| `context_window` | `Option<u32>` | `None` | Per-request cap on prompt + generated tokens; must be ≤ the engine's `n_ctx` |
+| `chat_template_kwargs` | `Map<String, Value>` | `{}` | Extra chat-template variables (reasoning switches; see [Reasoning and thinking](#reasoning-and-thinking)) |
 | `stop_sequences` | `Vec<String>` | `[]` | Stop on these strings |
+
+`joshua::types::reasoning_template_kwargs(effort, enabled, budget)` builds the
+`chat_template_kwargs` for a reasoning setting the same way the server does.
 
 ---
 

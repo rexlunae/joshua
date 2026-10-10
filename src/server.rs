@@ -208,9 +208,9 @@ async fn chat_completions(
 ) -> Result<Response, ApiError> {
     let engine = Arc::clone(&state.engine);
     let stream = req.stream.unwrap_or(false);
-    let options = req.to_generation_options();
+    let options = req.to_generation_options().map_err(ApiError::bad_request)?;
     let messages = req.messages.clone();
-    let tools = req.tools.clone();
+    let tools = req.offered_tools();
     let model = engine.model_name().to_string();
 
     if stream {

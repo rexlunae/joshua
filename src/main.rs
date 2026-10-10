@@ -23,9 +23,11 @@ use tracing_subscriber::EnvFilter;
 mod cluster_cli;
 
 use joshua::{
-    engine::Engine, server, types::GenerationOptions, ChatMessage, ComputeBackend, DensePlacement,
-    EngineOptions, ExpertPlacement, HugePages, MlockMode, MmapMode, PageSize, SpeculativeConfig,
-    VramExpertCache,
+    engine::Engine,
+    server,
+    types::{reasoning_template_kwargs, GenerationOptions, ReasoningEffort},
+    ChatMessage, ComputeBackend, DensePlacement, EngineOptions, ExpertPlacement, HugePages,
+    MlockMode, MmapMode, PageSize, SpeculativeConfig, VramExpertCache,
 };
 
 /// Values for `--device` (CLI form of [`ComputeBackend`]).
@@ -204,8 +206,11 @@ enum Commands {
         /// unauthenticated.
         #[arg(short, long, default_value = "127.0.0.1:8080")]
         addr: String,
-        /// Context window size in tokens.
-        #[arg(long, default_value_t = 4096)]
+        /// Context window size in tokens (prompt + generated), fixed at load:
+        /// it sizes the KV cache and RoPE tables.  A request may ask for a
+        /// smaller window with `context_window` (or `num_ctx`), never a
+        /// larger one.
+        #[arg(long, env = "JOSHUA_N_CTX", default_value_t = 4096)]
         n_ctx: u32,
         /// Compute backend: auto, cpu, metal, or cuda.  An explicit GPU
         /// request fails the load when the backend is not built in or is
@@ -386,8 +391,19 @@ enum Commands {
         /// Sampling temperature (0 = greedy).
         #[arg(long, default_value_t = 0.7)]
         temperature: f32,
-        /// Context window size in tokens.
-        #[arg(long, default_value_t = 4096)]
+        /// Sampler seed, for reproducible sampled output.
+        #[arg(long)]
+        seed: Option<u64>,
+        /// Reasoning effort for models whose chat template takes one or a
+        /// thinking switch: none, minimal, low, medium, high, xhigh.
+        #[arg(long, value_parser = parse_reasoning_effort)]
+        reasoning_effort: Option<ReasoningEffort>,
+        /// Turn thinking on or off on models with a switch (Qwen3, GLM-4.5,
+        /// DeepSeek-V3.1, …).
+        #[arg(long)]
+        enable_thinking: Option<bool>,
+        /// Context window size in tokens (prompt + generated).
+        #[arg(long, env = "JOSHUA_N_CTX", default_value_t = 4096)]
         n_ctx: u32,
         /// Compute backend: auto, cpu, metal, or cuda.  An explicit GPU
         /// request fails the load when the backend is not built in or is
@@ -697,6 +713,9 @@ async fn main() -> anyhow::Result<()> {
             prompt,
             max_tokens,
             temperature,
+            seed,
+            reasoning_effort,
+            enable_thinking,
             n_ctx,
             device,
             huge_pages,
@@ -765,6 +784,12 @@ async fn main() -> anyhow::Result<()> {
             let options = GenerationOptions {
                 max_tokens,
                 temperature,
+                seed,
+                chat_template_kwargs: reasoning_template_kwargs(
+                    reasoning_effort,
+                    enable_thinking,
+                    None,
+                ),
                 ..GenerationOptions::default()
             };
             let (text, usage, prefill_tps, decode_tps) = engine.complete(&messages, &options)?;
@@ -813,6 +838,13 @@ async fn main() -> anyhow::Result<()> {
 /// Translate the `--mmap` flag: passing it makes memory mapping an explicit
 /// request, so a model file that cannot be mapped usefully fails the load
 /// instead of merely warning.
+/// Parse a `--reasoning-effort` value with the API's spelling.
+fn parse_reasoning_effort(s: &str) -> Result<ReasoningEffort, String> {
+    serde_json::from_value(serde_json::Value::String(s.to_ascii_lowercase())).map_err(|_| {
+        format!("unknown reasoning effort `{s}` (none, minimal, low, medium, high, xhigh)")
+    })
+}
+
 fn mmap_mode(explicit: bool) -> MmapMode {
     if explicit {
         MmapMode::Required
