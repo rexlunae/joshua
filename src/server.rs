@@ -10,14 +10,18 @@
 //!   whisper model is configured)
 //! - `GET  /v1/worker/info`           — worker identity and live load for a
 //!   `joshua route` coordinator (see [`crate::coordinator`])
+//! - `POST /v1/models/load`           — load a model from the controller's
+//!   model directory, locally or onto its workers (when enabled)
+//! - `POST /v1/models/unload`         — unload a model (when enabled)
 //!
 //! Chat and text completions stop decoding when the HTTP request is dropped
 //! (the client, or a coordinator proxying for it, disconnected), so a
 //! cancelled request releases its concurrency permit promptly.
 
 use std::convert::Infallible;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
@@ -37,8 +41,8 @@ use tokio::net::TcpListener;
 use tower_http::cors::CorsLayer;
 use uuid::Uuid;
 
-use crate::coordinator::{WorkerCapabilities, WorkerInfo, WORKER_PROTOCOL_VERSION};
-use crate::engine::Engine;
+use crate::coordinator::{ModelSlots, WorkerCapabilities, WorkerInfo, WORKER_PROTOCOL_VERSION};
+use crate::engine::{Engine, EngineOptions};
 use crate::error::JoshuaError;
 use crate::whisper::WhisperEngine;
 use crate::tools::parse_tool_calls;
@@ -51,8 +55,10 @@ use crate::types::{
 
 /// Shared application state.
 pub struct ServerState {
-    /// The chat/embedding engine.
-    pub engine: Arc<Engine>,
+    /// Loaded chat/embedding models.
+    pub models: ModelRegistry,
+    /// Enables `/v1/models/load` and `/v1/models/unload` when set.
+    pub manager: Option<ModelManager>,
     /// Optional Whisper model for `/v1/audio/transcriptions`.
     pub whisper: Option<Arc<WhisperEngine>>,
     /// When set, every `/v1` request must carry this key as
@@ -62,6 +68,519 @@ pub struct ServerState {
 
 /// Shared application state handle.
 pub type AppState = Arc<ServerState>;
+
+impl ServerState {
+    /// State serving `engine` alone, without model management.
+    pub fn new(engine: Arc<Engine>) -> Self {
+        Self {
+            models: ModelRegistry::with_model(engine),
+            manager: None,
+            whisper: None,
+            api_key: None,
+        }
+    }
+}
+
+// ─── Model registry ─────────────────────────────────────────────────────────
+
+/// A loaded model and where it runs.
+#[derive(Clone)]
+pub struct LoadedModel {
+    pub id: String,
+    pub engine: Arc<Engine>,
+    /// Workers holding its pipeline stages; empty for a local model.
+    pub workers: Vec<std::net::SocketAddr>,
+    /// Each worker's layer range, in worker order.
+    pub stages: Vec<(usize, usize)>,
+    pub created: u64,
+}
+
+/// The models a server answers for, by id.
+#[derive(Default)]
+pub struct ModelRegistry {
+    models: RwLock<Vec<LoadedModel>>,
+    /// Ids being loaded, so concurrent loads of one id cannot both run.
+    loading: Mutex<Vec<String>>,
+    /// Workers claimed by a model being loaded, loaded, or being unloaded.
+    /// A worker serves one controller connection at a time, so a claim
+    /// lasts until the model's pipeline has released it.
+    workers: Mutex<Vec<std::net::SocketAddr>>,
+}
+
+fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+impl ModelRegistry {
+    /// A registry holding `engine` under its model name.
+    pub fn with_model(engine: Arc<Engine>) -> Self {
+        let registry = Self::default();
+        registry.models.write().expect("fresh lock").push(LoadedModel {
+            id: engine.model_name().to_string(),
+            engine,
+            workers: Vec::new(),
+            stages: Vec::new(),
+            created: now(),
+        });
+        registry
+    }
+
+    pub fn list(&self) -> Vec<LoadedModel> {
+        self.models.read().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// The model a request names. With a single model loaded, any name
+    /// selects it, as when a server only ever held one model.
+    /// Returns the model's id and engine.
+    pub fn resolve(&self, requested: &str) -> Result<(String, Arc<Engine>), ApiError> {
+        let models = self.models.read().unwrap_or_else(|p| p.into_inner());
+        let found = models
+            .iter()
+            .find(|m| m.id == requested)
+            .or(match models.as_slice() {
+                [only] => Some(only),
+                _ => None,
+            });
+        if let Some(model) = found {
+            return Ok((model.id.clone(), Arc::clone(&model.engine)));
+        }
+        match models.as_slice() {
+            [] => Err(ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no model is loaded; load one with POST /v1/models/load",
+                "model_not_loaded",
+            )),
+            _ => Err(ApiError::new(
+                StatusCode::NOT_FOUND,
+                format!("model '{requested}' is not loaded"),
+                "model_not_found",
+            )),
+        }
+    }
+
+    /// Reserve `id` for a load; dropping the guard releases it.
+    fn reserve(&self, id: &str) -> Result<LoadGuard<'_>, ApiError> {
+        let mut loading = self.loading.lock().unwrap_or_else(|p| p.into_inner());
+        let loaded = self
+            .models
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .any(|m| m.id == id);
+        if loaded || loading.iter().any(|l| l == id) {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                format!("model '{id}' is already loaded or loading"),
+                "model_exists",
+            ));
+        }
+        loading.push(id.to_string());
+        Ok(LoadGuard {
+            registry: self,
+            id: id.to_string(),
+        })
+    }
+
+    /// Remove a model. Requests already running on it finish first; its
+    /// memory (and, for a pipeline, its workers) is released after them.
+    pub fn remove(&self, id: &str) -> Option<LoadedModel> {
+        let mut models = self.models.write().unwrap_or_else(|p| p.into_inner());
+        let index = models.iter().position(|m| m.id == id)?;
+        Some(models.remove(index))
+    }
+
+    /// Claim `workers` for a load, failing if any is claimed already.
+    /// Dropping the claim releases them unless it is kept.
+    #[cfg(feature = "distributed")]
+    fn claim_workers(&self, workers: &[std::net::SocketAddr]) -> crate::Result<WorkerClaim<'_>> {
+        let mut claimed = self.workers.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(w) = workers.iter().find(|w| claimed.contains(w)) {
+            return Err(crate::JoshuaError::InvalidRequest(format!(
+                "worker {w} is in use by another model; unload it first"
+            )));
+        }
+        claimed.extend_from_slice(workers);
+        Ok(WorkerClaim {
+            registry: self,
+            workers: workers.to_vec(),
+        })
+    }
+
+    /// Release workers a fully unloaded model held.
+    fn release_workers(&self, workers: &[std::net::SocketAddr]) {
+        self.workers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|w| !workers.contains(w));
+    }
+}
+
+#[cfg(feature = "distributed")]
+struct WorkerClaim<'a> {
+    registry: &'a ModelRegistry,
+    workers: Vec<std::net::SocketAddr>,
+}
+
+#[cfg(feature = "distributed")]
+impl WorkerClaim<'_> {
+    /// Keep the workers claimed; unloading the model releases them.
+    fn keep(mut self) {
+        self.workers.clear();
+    }
+}
+
+#[cfg(feature = "distributed")]
+impl Drop for WorkerClaim<'_> {
+    fn drop(&mut self) {
+        self.registry.release_workers(&self.workers);
+    }
+}
+
+struct LoadGuard<'a> {
+    registry: &'a ModelRegistry,
+    id: String,
+}
+
+impl LoadGuard<'_> {
+    fn finish(self, model: LoadedModel) {
+        self.registry
+            .models
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(model);
+    }
+}
+
+impl Drop for LoadGuard<'_> {
+    fn drop(&mut self) {
+        self.registry
+            .loading
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|l| *l != self.id);
+    }
+}
+
+/// What `/v1/models/load` may load and how.
+pub struct ModelManager {
+    /// Load requests name model files relative to this directory and cannot
+    /// leave it.
+    pub model_dir: PathBuf,
+    /// Settings for a model run on this host, given its file (so defaults
+    /// can depend on its size).
+    pub engine_options: Arc<dyn Fn(&Path) -> EngineOptions + Send + Sync>,
+    /// NPU backend attached to models run on this host, as at startup.
+    pub npu_backend: Option<Arc<dyn crate::npu::NpuBackend>>,
+    pub max_concurrency: Option<usize>,
+    pub max_output_tokens: Option<u32>,
+    /// Workers started without a model that this controller may place
+    /// models on.
+    #[cfg(feature = "distributed")]
+    pub workers: Vec<std::net::SocketAddr>,
+    /// Shared key authenticating this controller to its workers.
+    #[cfg(feature = "distributed")]
+    pub cluster_key: Option<Vec<u8>>,
+}
+
+/// `POST /v1/models/load` request body.
+#[derive(Debug, serde::Deserialize)]
+pub struct LoadModelRequest {
+    /// GGUF file (or a directory holding one) under the model directory.
+    pub model: String,
+    /// Name to serve it under; defaults to the file stem.
+    #[serde(default)]
+    pub id: Option<String>,
+    /// Run the model on this host even when workers are configured.
+    #[serde(default)]
+    pub local: bool,
+    /// Configured workers to place the model on; defaults to all of them.
+    #[serde(default)]
+    pub workers: Option<Vec<std::net::SocketAddr>>,
+    /// Exclusive layer ends per worker; defaults to splitting by free memory.
+    #[serde(default)]
+    pub ends: Option<Vec<usize>>,
+    /// Context window; defaults to the server's, capped by the model.
+    #[serde(default)]
+    pub n_ctx: Option<usize>,
+    /// Concurrent remote sessions the workers reserve KV for.
+    #[serde(default)]
+    pub sessions: Option<usize>,
+    /// Prompt tokens per pipeline step.
+    #[serde(default)]
+    pub chunk: Option<usize>,
+}
+
+/// `POST /v1/models/unload` request body.
+#[derive(Debug, serde::Deserialize)]
+pub struct UnloadModelRequest {
+    pub id: String,
+}
+
+impl ModelManager {
+    /// Resolve a requested model inside `model_dir`.
+    fn resolve_path(&self, requested: &str) -> Result<PathBuf, ApiError> {
+        let not_found = || {
+            ApiError::new(
+                StatusCode::NOT_FOUND,
+                format!("model '{requested}' was not found in the model directory"),
+                "model_not_found",
+            )
+        };
+        let root = self
+            .model_dir
+            .canonicalize()
+            .map_err(|e| ApiError::internal(format!("model directory: {e}")))?;
+        let inside = |path: &Path| -> Result<PathBuf, ApiError> {
+            // Resolve symlinks first, so none can lead outside the root.
+            let path = path.canonicalize().map_err(|_| not_found())?;
+            if path.starts_with(&root) {
+                Ok(path)
+            } else {
+                Err(not_found())
+            }
+        };
+        let path = inside(&root.join(requested))?;
+        if path.is_dir() {
+            // The file picked inside a directory may itself be a symlink:
+            // its target must stay inside the root, but the engine gets the
+            // link so it finds the tokenizer beside it.
+            let file = crate::engine::find_gguf_in_dir(&path).map_err(|_| not_found())?;
+            inside(&file)?;
+            Ok(file)
+        } else {
+            Ok(path)
+        }
+    }
+
+    /// Load the model described by `req` (blocking).
+    /// Workers it places the model on are claimed in `registry`.
+    fn load(
+        &self,
+        req: &LoadModelRequest,
+        path: &Path,
+        id: String,
+        #[cfg_attr(not(feature = "distributed"), allow(unused_variables))] registry: &ModelRegistry,
+    ) -> crate::Result<LoadedModel> {
+        #[cfg(feature = "distributed")]
+        if !req.local && (req.workers.is_some() || !self.workers.is_empty()) {
+            return self.load_distributed(req, path, id, registry);
+        }
+        if req.workers.is_some() || req.ends.is_some() {
+            return Err(crate::JoshuaError::InvalidRequest(
+                "this server has no workers configured; omit 'workers' and 'ends'".into(),
+            ));
+        }
+        let mut options = (self.engine_options)(path);
+        if let Some(n_ctx) = req.n_ctx {
+            options.n_ctx = u32::try_from(n_ctx)
+                .map_err(|_| crate::JoshuaError::InvalidRequest("n_ctx too large".into()))?;
+        }
+        let mut engine = Engine::with_options(path, options)?;
+        if let Some(backend) = &self.npu_backend {
+            engine = engine.with_npu_backend(Arc::clone(backend));
+        }
+        let engine = self.finish_engine(engine);
+        Ok(LoadedModel {
+            id,
+            engine: Arc::new(engine),
+            workers: Vec::new(),
+            stages: Vec::new(),
+            created: now(),
+        })
+    }
+
+    fn finish_engine(&self, mut engine: Engine) -> Engine {
+        if let Some(max) = self.max_concurrency {
+            engine = engine.with_max_concurrency(max);
+        }
+        if let Some(max) = self.max_output_tokens {
+            engine = engine.with_max_output_tokens(max);
+        }
+        engine
+    }
+
+    /// Place the model on workers: they receive only their stages, from this
+    /// controller, and this host keeps just the tokenizer and sampling.
+    #[cfg(feature = "distributed")]
+    fn load_distributed(
+        &self,
+        req: &LoadModelRequest,
+        path: &Path,
+        id: String,
+        registry: &ModelRegistry,
+    ) -> crate::Result<LoadedModel> {
+        use crate::distributed::{
+            pipeline::{Deployment, Limits, Pipeline},
+            remote::PipelineBackend,
+        };
+        use crate::JoshuaError::{InvalidRequest, ModelLoad};
+        let key = self.cluster_key.as_deref().ok_or_else(|| {
+            InvalidRequest("set JOSHUA_CLUSTER_KEY on the controller to use workers".into())
+        })?;
+        let workers = match &req.workers {
+            Some(workers) => {
+                if let Some(w) = workers.iter().find(|w| !self.workers.contains(w)) {
+                    return Err(InvalidRequest(format!("{w} is not a configured worker")));
+                }
+                workers.clone()
+            }
+            None => self.workers.clone(),
+        };
+        if workers.is_empty() {
+            return Err(InvalidRequest("no workers to place the model on".into()));
+        }
+        // A worker holds one model at a time and serves one controller.
+        let claim = registry.claim_workers(&workers)?;
+        let header = crate::gguf_ext::read_header(&mut std::io::BufReader::new(
+            std::fs::File::open(path)?,
+        ))?;
+        let arch = header.architecture().unwrap_or_default();
+        let model_ctx = crate::gguf_meta::Meta::new(&header.metadata, &arch)
+            .u32("context_length")
+            .map_err(|e| ModelLoad(e.to_string()))? as usize;
+        let defaults = Limits::default();
+        let server_ctx = match (self.engine_options)(path).n_ctx {
+            0 => defaults.context,
+            n => n as usize,
+        };
+        let context = req.n_ctx.unwrap_or(server_ctx).min(model_ctx);
+        let limits = Limits {
+            context,
+            chunk: req.chunk.unwrap_or(defaults.chunk).min(context),
+            sessions: req.sessions.unwrap_or(defaults.sessions),
+            ..defaults
+        };
+        // The controller maps the file only to tokenize and to read slices;
+        // nothing is prefetched or loaded for compute here.
+        let options = EngineOptions::with_n_ctx(context as u32)
+            .backend(crate::engine::ComputeBackend::Cpu)
+            .lazy_weights(true)
+            .prefill_chunk(limits.chunk);
+        let engine = Engine::with_options(path, options)?;
+        let pipeline = Pipeline::deploy(
+            path,
+            &workers,
+            key,
+            Deployment {
+                ends: req.ends.clone(),
+                limits,
+            },
+        )
+        .map_err(|e| ModelLoad(format!("placing the model on workers: {e:#}")))?;
+        let stages = pipeline
+            .plan()
+            .stages
+            .iter()
+            .map(|s| (s.start, s.end))
+            .collect();
+        let backend = PipelineBackend::new(pipeline);
+        let capacity = backend.capacity();
+        let engine = self
+            .finish_engine(engine)
+            .with_remote_backend(Arc::new(backend), capacity);
+        claim.keep();
+        Ok(LoadedModel {
+            id,
+            engine: Arc::new(engine),
+            workers,
+            stages,
+            created: now(),
+        })
+    }
+}
+
+fn model_json(model: &LoadedModel) -> serde_json::Value {
+    json!({
+        "id": model.id,
+        "object": "model",
+        "created": model.created,
+        "owned_by": "joshua",
+        "workers": model.workers.iter().map(|w| w.to_string()).collect::<Vec<_>>(),
+        "stages": model.stages,
+    })
+}
+
+fn manager(state: &ServerState) -> Result<&ModelManager, ApiError> {
+    state.manager.as_ref().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::FORBIDDEN,
+            "model management is disabled; start the server with --model-dir",
+            "model_management_disabled",
+        )
+    })
+}
+
+/// `POST /v1/models/load` — load a model and serve it under its id.
+async fn load_model(
+    State(state): State<AppState>,
+    Json(req): Json<LoadModelRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let path = manager(&state)?.resolve_path(&req.model)?;
+    let id = req.id.clone().unwrap_or_else(|| {
+        path.file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    });
+    if id.is_empty() {
+        return Err(ApiError::bad_request("empty model id"));
+    }
+    let loaded = tokio::task::spawn_blocking(move || {
+        let manager = manager(&state)?;
+        let guard = state.models.reserve(&id)?;
+        tracing::info!(model = %id, path = %path.display(), "loading model");
+        let model = manager
+            .load(&req, &path, id, &state.models)
+            .map_err(|e| match e {
+                // The caller asked for this load; tell them why it failed.
+                crate::JoshuaError::ModelLoad(msg) => {
+                    ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, msg, "model_load_failed")
+                }
+                e => ApiError::from(e),
+            })?;
+        let body = model_json(&model);
+        guard.finish(model);
+        Ok::<_, ApiError>(body)
+    })
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))??;
+    Ok(Json(loaded))
+}
+
+/// `POST /v1/models/unload` — stop serving a model and release it.
+async fn unload_model(
+    State(state): State<AppState>,
+    Json(req): Json<UnloadModelRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    manager(&state)?;
+    let model = state.models.remove(&req.id).ok_or_else(|| {
+        ApiError::new(
+            StatusCode::NOT_FOUND,
+            format!("model '{}' is not loaded", req.id),
+            "model_not_found",
+        )
+    })?;
+    tracing::info!(model = %model.id, "unloading model");
+    // New requests no longer find it. Wait for the ones already running,
+    // then drop the engine here: that frees its weights or releases its
+    // workers, so they are free for the next load once this returns.
+    tokio::task::spawn_blocking(move || {
+        let mut engine = model.engine;
+        loop {
+            match Arc::try_unwrap(engine) {
+                Ok(engine) => break drop(engine),
+                Err(shared) => engine = shared,
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        state.models.release_workers(&model.workers);
+    })
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(Json(json!({"id": req.id, "object": "model", "unloaded": true})))
+}
 
 // ─── Router ───────────────────────────────────────────────────────────────────
 
@@ -78,10 +597,21 @@ pub fn create_router(state: AppState) -> Router {
             Arc::clone(&state),
             require_api_key,
         ));
+    // Model management stays same-origin: without CORS headers a browser
+    // will not send these JSON requests from another site's page, even to
+    // a localhost server with no API key.
+    let manage = Router::new()
+        .route("/v1/models/load", post(load_model))
+        .route("/v1/models/unload", post(unload_model))
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            require_api_key,
+        ));
     Router::new()
         .route("/health", get(health))
         .merge(api)
         .layer(CorsLayer::permissive())
+        .merge(manage)
         .with_state(state)
 }
 
@@ -129,15 +659,7 @@ pub(crate) fn api_keys_match(provided: &[u8], expected: &[u8]) -> bool {
 /// Start the server on `addr` (e.g. `"0.0.0.0:8080"`) with just a chat
 /// engine.  Use [`serve_with_state`] to also mount a Whisper model.
 pub async fn serve(engine: Arc<Engine>, addr: &str) -> std::io::Result<()> {
-    serve_with_state(
-        Arc::new(ServerState {
-            engine,
-            whisper: None,
-            api_key: None,
-        }),
-        addr,
-    )
-    .await
+    serve_with_state(Arc::new(ServerState::new(engine)), addr).await
 }
 
 /// Start the server with a fully configured [`ServerState`].
@@ -187,24 +709,48 @@ async fn health() -> Json<serde_json::Value> {
 /// `GET /v1/worker/info` — what a `joshua route` coordinator needs to admit
 /// requests here: protocol version, model identity, context limit, backend,
 /// and the admission cap with the current in-flight count.
-async fn worker_info(State(state): State<AppState>) -> Json<WorkerInfo> {
-    let engine = &state.engine;
-    Json(WorkerInfo {
+///
+/// With several models loaded, `model`, `n_ctx` and `backend` describe the
+/// first, `models` gives each one's own admission figures (each engine
+/// admits its own requests), and the worker-wide figures are their sums.
+async fn worker_info(State(state): State<AppState>) -> Result<Json<WorkerInfo>, ApiError> {
+    let models = state.models.list();
+    let Some(first) = models.first() else {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no model is loaded; load one with POST /v1/models/load",
+            "model_not_loaded",
+        ));
+    };
+    let engines = || models.iter().map(|m| &m.engine);
+    Ok(Json(WorkerInfo {
         protocol_version: WORKER_PROTOCOL_VERSION,
-        model: engine.model_name().to_string(),
-        n_ctx: engine.n_ctx(),
-        backend: device_label(engine.device()).to_string(),
-        max_concurrency: engine.max_concurrency(),
-        in_flight: engine.in_flight(),
+        model: first.id.clone(),
+        models: match models.len() {
+            1 => Vec::new(),
+            _ => models
+                .iter()
+                .map(|m| ModelSlots {
+                    id: m.id.clone(),
+                    max_concurrency: m.engine.max_concurrency(),
+                    in_flight: m.engine.in_flight(),
+                    embeddings: !m.engine.remote_only(),
+                })
+                .collect(),
+        },
+        n_ctx: first.engine.n_ctx(),
+        backend: device_label(first.engine.device()).to_string(),
+        max_concurrency: engines().map(|e| e.max_concurrency()).sum(),
+        in_flight: engines().map(|e| e.in_flight()).sum(),
         capabilities: WorkerCapabilities {
             chat: true,
             completions: true,
-            embeddings: true,
+            embeddings: engines().any(|e| !e.remote_only()),
             transcriptions: state.whisper.is_some(),
             streaming: true,
             tools: true,
         },
-    })
+    }))
 }
 
 /// Short backend name for a candle device.
@@ -241,18 +787,20 @@ impl Drop for CancelOnDrop {
     }
 }
 
-/// `GET /v1/models` — returns the single loaded model.
+/// `GET /v1/models` — returns the loaded models.
 async fn list_models(State(state): State<AppState>) -> Json<ModelListResponse> {
-    let created = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let mut data = vec![ModelInfo {
-        id: state.engine.model_name().to_string(),
-        object: "model".to_string(),
-        created,
-        owned_by: "joshua".to_string(),
-    }];
+    let created = now();
+    let mut data: Vec<ModelInfo> = state
+        .models
+        .list()
+        .into_iter()
+        .map(|m| ModelInfo {
+            id: m.id,
+            object: "model".to_string(),
+            created: m.created,
+            owned_by: "joshua".to_string(),
+        })
+        .collect();
     if let Some(whisper) = &state.whisper {
         data.push(ModelInfo {
             id: whisper.model_name().to_string(),
@@ -272,12 +820,11 @@ async fn chat_completions(
     State(state): State<AppState>,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Result<Response, ApiError> {
-    let engine = Arc::clone(&state.engine);
+    let (model, engine) = state.models.resolve(&req.model)?;
     let stream = req.stream.unwrap_or(false);
     let options = req.to_generation_options().map_err(ApiError::bad_request)?;
     let messages = req.messages.clone();
     let tools = req.offered_tools();
-    let model = engine.model_name().to_string();
 
     if stream {
         // ── Streaming path ────────────────────────────────────────────────────
@@ -468,7 +1015,9 @@ async fn completions(
     State(state): State<AppState>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let engine = Arc::clone(&state.engine);
+    let (model, engine) = state
+        .models
+        .resolve(body.get("model").and_then(|v| v.as_str()).unwrap_or_default())?;
     let prompt = body
         .get("prompt")
         .and_then(|v| v.as_str())
@@ -510,7 +1059,7 @@ async fn completions(
         "id": format!("cmpl-{}", Uuid::new_v4().simple()),
         "object": "text_completion",
         "created": created,
-        "model": engine.model_name(),
+        "model": model,
         "choices": [{
             "text": text,
             "index": 0,
@@ -529,9 +1078,8 @@ async fn embeddings(
     State(state): State<AppState>,
     Json(req): Json<EmbeddingRequest>,
 ) -> Result<Json<EmbeddingResponse>, ApiError> {
-    let engine = Arc::clone(&state.engine);
+    let (model, engine) = state.models.resolve(&req.model)?;
     let texts: Vec<String> = req.input.into_vec();
-    let model = engine.model_name().to_string();
 
     let (vectors, prompt_tokens) = tokio::task::spawn_blocking({
         let engine = Arc::clone(&engine);
@@ -636,6 +1184,13 @@ pub struct ApiError {
 }
 
 impl ApiError {
+    fn new(status: StatusCode, msg: impl Into<String>, error_type: &str) -> Self {
+        Self {
+            status,
+            body: ErrorResponse::new(msg, error_type),
+        }
+    }
+
     fn bad_request(msg: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
@@ -703,5 +1258,22 @@ mod tests {
     fn api_keys_match_handles_an_empty_expected_key() {
         assert!(api_keys_match(b"", b""));
         assert!(!api_keys_match(b"a", b""));
+    }
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn workers_stay_claimed_from_load_until_unload_completes() {
+        let registry = super::ModelRegistry::default();
+        let a: std::net::SocketAddr = "127.0.0.1:7001".parse().unwrap();
+        let b: std::net::SocketAddr = "127.0.0.1:7002".parse().unwrap();
+        // A load in progress holds its workers against an overlapping load.
+        let claim = registry.claim_workers(&[a, b]).unwrap();
+        assert!(registry.claim_workers(&[b]).is_err());
+        // A failed load releases them.
+        drop(claim);
+        // A loaded model keeps them until its unload releases them.
+        registry.claim_workers(&[a, b]).unwrap().keep();
+        assert!(registry.claim_workers(&[a]).is_err());
+        registry.release_workers(&[a, b]);
+        registry.claim_workers(&[a, b]).unwrap();
     }
 }

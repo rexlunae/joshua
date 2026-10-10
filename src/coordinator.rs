@@ -46,6 +46,7 @@
 //!   with `x-joshua-worker`.  Logs carry the request id, worker, attempt,
 //!   queue time and outcome — never prompt or output text.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -101,6 +102,11 @@ pub struct WorkerInfo {
     pub protocol_version: u32,
     /// Model identity (the id the worker reports in `/v1/models`).
     pub model: String,
+    /// Every model the worker serves, `model` first, with its own admission
+    /// figures, when it serves more than one.  Older workers leave it out and
+    /// serve only `model`, admitting by the worker-wide figures.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<ModelSlots>,
     /// Context window in tokens.
     pub n_ctx: u32,
     /// Compute backend (`cpu`, `cuda`, `metal`, `opencl`, `sycl`, `vulkan`).
@@ -112,6 +118,21 @@ pub struct WorkerInfo {
     /// Which request kinds the worker serves.
     #[serde(default)]
     pub capabilities: WorkerCapabilities,
+}
+
+/// One model on a worker that serves several, each admitting its own
+/// requests.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelSlots {
+    /// The model's id.
+    pub id: String,
+    /// Admission cap for this model's requests.
+    pub max_concurrency: usize,
+    /// This model's requests executing now, from every client.
+    pub in_flight: usize,
+    /// Whether this model serves `/v1/embeddings` (the worker-wide
+    /// capability says whether any of its models does).
+    pub embeddings: bool,
 }
 
 /// Request kinds a worker serves.
@@ -130,6 +151,18 @@ pub struct WorkerCapabilities {
     pub streaming: bool,
     /// Tool calls on the chat route.
     pub tools: bool,
+}
+
+impl WorkerInfo {
+    /// Every model id the worker serves.
+    pub fn model_ids(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.model.as_str()).chain(self.models.iter().map(|m| m.id.as_str()))
+    }
+
+    /// `model`'s own admission figures, when the worker reports them.
+    fn slots_of(&self, model: Option<&str>) -> Option<&ModelSlots> {
+        model.and_then(|m| self.models.iter().find(|s| s.id == m))
+    }
 }
 
 impl WorkerCapabilities {
@@ -212,6 +245,8 @@ struct WorkerStatus {
     /// Requests the worker runs for clients other than this coordinator, as
     /// of the last probe.
     external_in_flight: usize,
+    /// The same per model, for a worker that reports its models' figures.
+    external_by_model: HashMap<String, usize>,
     last_error: Option<String>,
 }
 
@@ -220,11 +255,19 @@ struct Worker {
     status: Mutex<WorkerStatus>,
     /// Requests this coordinator has in flight on the worker.
     dispatched: AtomicUsize,
+    /// The same by requested model.
+    dispatched_by_model: Mutex<HashMap<String, usize>>,
 }
 
 impl Worker {
     fn status(&self) -> MutexGuard<'_, WorkerStatus> {
         self.status.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn by_model(&self) -> MutexGuard<'_, HashMap<String, usize>> {
+        self.dispatched_by_model
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
     }
 
     fn mark_unhealthy(&self, reason: String) {
@@ -261,13 +304,19 @@ enum Pick {
 struct SlotGuard {
     coordinator: Arc<Coordinator>,
     index: usize,
+    /// The requested model, counted against its own admission figures.
+    model: Option<String>,
 }
 
 impl Drop for SlotGuard {
     fn drop(&mut self) {
-        self.coordinator.workers[self.index]
-            .dispatched
-            .fetch_sub(1, Ordering::AcqRel);
+        let w = &self.coordinator.workers[self.index];
+        if let Some(model) = &self.model {
+            if let Some(n) = w.by_model().get_mut(model) {
+                *n = n.saturating_sub(1);
+            }
+        }
+        w.dispatched.fetch_sub(1, Ordering::AcqRel);
         self.coordinator.released.notify_waiters();
     }
 }
@@ -351,6 +400,7 @@ impl Coordinator {
                 endpoint,
                 status: Mutex::new(WorkerStatus::default()),
                 dispatched: AtomicUsize::new(0),
+                dispatched_by_model: Mutex::new(HashMap::new()),
             });
         }
         Ok(Arc::new(Self {
@@ -367,11 +417,16 @@ impl Coordinator {
     pub async fn refresh(&self) {
         let probes = self.workers.iter().map(|w| async move {
             let before = w.dispatched.load(Ordering::Acquire);
+            let mut ours_by_model = w.by_model().clone();
             let result = self.probe(w).await;
             let after = w.dispatched.load(Ordering::Acquire);
-            (w, result, before.max(after))
+            for (model, n) in w.by_model().iter() {
+                let ours = ours_by_model.entry(model.clone()).or_default();
+                *ours = (*ours).max(*n);
+            }
+            (w, result, before.max(after), ours_by_model)
         });
-        for (w, result, ours) in futures_util::future::join_all(probes).await {
+        for (w, result, ours, ours_by_model) in futures_util::future::join_all(probes).await {
             let mut st = w.status();
             match result {
                 Ok(info) if info.protocol_version != WORKER_PROTOCOL_VERSION => {
@@ -400,6 +455,14 @@ impl Coordinator {
                         );
                     }
                     st.external_in_flight = info.in_flight.saturating_sub(ours);
+                    st.external_by_model = info
+                        .models
+                        .iter()
+                        .map(|m| {
+                            let ours = ours_by_model.get(&m.id).copied().unwrap_or(0);
+                            (m.id.clone(), m.in_flight.saturating_sub(ours))
+                        })
+                        .collect();
                     st.healthy = true;
                     st.last_error = None;
                     st.info = Some(info);
@@ -503,7 +566,11 @@ impl Coordinator {
             let Some(info) = st.info.as_ref() else {
                 continue;
             };
-            if model.is_some_and(|m| m != info.model) || !info.capabilities.serves(path) {
+            let own = info.slots_of(model);
+            if model.is_some_and(|m| !info.model_ids().any(|id| id == m))
+                || !info.capabilities.serves(path)
+                || (path == "/v1/embeddings" && own.is_some_and(|s| !s.embeddings))
+            {
                 continue;
             }
             model_known = true;
@@ -515,8 +582,27 @@ impl Coordinator {
                 continue;
             }
             any_eligible = true;
-            let slots = self.slots_for(info);
-            let load = w.dispatched.load(Ordering::Acquire) + st.external_in_flight;
+            let worker_load = w.dispatched.load(Ordering::Acquire) + st.external_in_flight;
+            // A model with its own figures is admitted by them; the
+            // worker's other models do not use its slots.  A configured
+            // per-worker cap still bounds the worker as a whole.
+            let (slots, load) = match own {
+                Some(s) => {
+                    if self
+                        .config
+                        .worker_slots
+                        .is_some_and(|cap| worker_load >= cap.max(1))
+                    {
+                        continue;
+                    }
+                    (
+                        s.max_concurrency.max(1),
+                        w.by_model().get(&s.id).copied().unwrap_or(0)
+                            + st.external_by_model.get(&s.id).copied().unwrap_or(0),
+                    )
+                }
+                None => (self.slots_for(info), worker_load),
+            };
             if load >= slots {
                 continue;
             }
@@ -526,12 +612,15 @@ impl Coordinator {
             }
         }
         if let Some((index, _, _)) = best {
-            self.workers[index]
-                .dispatched
-                .fetch_add(1, Ordering::AcqRel);
+            let w = &self.workers[index];
+            w.dispatched.fetch_add(1, Ordering::AcqRel);
+            if let Some(m) = model {
+                *w.by_model().entry(m.to_string()).or_default() += 1;
+            }
             return Pick::Slot(SlotGuard {
                 coordinator: Arc::clone(self),
                 index,
+                model: model.map(str::to_string),
             });
         }
         if any_eligible {
@@ -592,11 +681,13 @@ impl Coordinator {
         let mut models: Vec<String> = self
             .workers
             .iter()
-            .filter_map(|w| {
+            .flat_map(|w| {
                 let st = w.status();
-                st.healthy
-                    .then(|| st.info.as_ref().map(|i| i.model.clone()))
-                    .flatten()
+                st.info
+                    .as_ref()
+                    .filter(|_| st.healthy)
+                    .map(|i| i.model_ids().map(str::to_string).collect::<Vec<_>>())
+                    .unwrap_or_default()
             })
             .collect();
         models.sort();
