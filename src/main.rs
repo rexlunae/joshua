@@ -446,6 +446,16 @@ enum Commands {
         /// Timeout for connecting to a worker and for a health probe, in ms.
         #[arg(long, default_value_t = 2_000)]
         connect_timeout_ms: u64,
+        /// Longest a dispatched request waits for the worker's first output
+        /// (the whole JSON response, or the first stream event) before a
+        /// 504, in ms; 0 waits indefinitely.  Workers compute a completion
+        /// before sending it, so this also bounds generation time.
+        #[arg(long, default_value_t = 600_000)]
+        response_timeout_ms: u64,
+        /// Largest non-streaming worker response the router buffers, in
+        /// bytes; larger ones are answered with a 502.
+        #[arg(long, default_value_t = joshua::coordinator::DEFAULT_MAX_RESPONSE_BYTES)]
+        max_response_bytes: usize,
     },
     /// Run a single chat completion and print the response.
     Run {
@@ -834,6 +844,8 @@ async fn main() -> anyhow::Result<()> {
             queue_timeout_ms,
             health_interval_ms,
             connect_timeout_ms,
+            response_timeout_ms,
+            max_response_bytes,
         } => {
             use std::time::Duration;
             let config = joshua::coordinator::CoordinatorConfig {
@@ -844,6 +856,9 @@ async fn main() -> anyhow::Result<()> {
                 queue_timeout: Duration::from_millis(queue_timeout_ms),
                 health_interval: Duration::from_millis(health_interval_ms.max(1)),
                 connect_timeout: Duration::from_millis(connect_timeout_ms.max(1)),
+                response_timeout: (response_timeout_ms > 0)
+                    .then(|| Duration::from_millis(response_timeout_ms)),
+                max_response_bytes,
                 ..joshua::coordinator::CoordinatorConfig::new(workers)
             };
             joshua::coordinator::serve(config, &addr).await?;

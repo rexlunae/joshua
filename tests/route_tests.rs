@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use axum::body::{Body, Bytes};
 use axum::extract::State;
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -52,6 +52,15 @@ enum Behavior {
     LoseBeforeOutput,
     /// Stream two events, then lose the connection.
     LoseMidStream,
+    /// Send stream headers, then nothing; record when dropped.
+    HeadersThenHang,
+    /// Stream an event, pause `gap`, then finish normally.
+    SlowStream(Duration),
+    /// Stream two events and half of a third, then close cleanly without
+    /// `[DONE]`.
+    CloseWithoutDone,
+    /// Send half an event, then close cleanly.
+    PartialThenClose,
 }
 
 struct Fake {
@@ -102,7 +111,12 @@ async fn fake_info(State(f): State<Arc<Fake>>) -> Json<WorkerInfo> {
     })
 }
 
-async fn fake_generate(State(f): State<Arc<Fake>>, headers: HeaderMap, body: Bytes) -> Response {
+async fn fake_generate(
+    State(f): State<Arc<Fake>>,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
     f.received.fetch_add(1, Ordering::SeqCst);
     *f.last_body.lock().unwrap() = Some(body.clone());
     *f.last_request_id.lock().unwrap() = headers
@@ -110,7 +124,9 @@ async fn fake_generate(State(f): State<Arc<Fake>>, headers: HeaderMap, body: Byt
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
     let req: Value = serde_json::from_slice(&body).unwrap();
-    let stream = req["stream"].as_bool().unwrap_or(false);
+    // Like a joshua worker, only chat completions stream; the other routes
+    // answer JSON whatever `stream` says.
+    let stream = uri.path() == "/v1/chat/completions" && req["stream"].as_bool().unwrap_or(false);
     let behavior = f.behavior.lock().unwrap().clone();
     f.active.fetch_add(1, Ordering::SeqCst);
     f.dropped.store(false, Ordering::SeqCst);
@@ -202,6 +218,41 @@ async fn fake_generate(State(f): State<Arc<Fake>>, headers: HeaderMap, body: Byt
             });
             sse_response(futures_util::stream::iter(items).chain(crash).boxed())
         }
+        Behavior::HeadersThenHang => {
+            let s = futures_util::stream::once(async move {
+                let _guard = guard;
+                std::future::pending::<()>().await;
+                Ok(Bytes::new())
+            });
+            sse_response(s.boxed())
+        }
+        Behavior::SlowStream(gap) => {
+            drop(guard);
+            let mut events = events(2).into_iter();
+            let first = events.next().unwrap();
+            let rest: Vec<Result<Bytes, std::io::Error>> = events.map(Ok).collect();
+            let s = futures_util::stream::once(async { Ok(first) })
+                .chain(futures_util::stream::once(async move {
+                    tokio::time::sleep(gap).await;
+                    Ok(Bytes::new())
+                }))
+                .chain(futures_util::stream::iter(rest));
+            sse_response(s.boxed())
+        }
+        Behavior::CloseWithoutDone => {
+            drop(guard);
+            let mut items: Vec<Result<Bytes, std::io::Error>> =
+                events(2).into_iter().take(2).map(Ok).collect();
+            items.push(Ok(Bytes::from_static(b"data: {\"partial\":")));
+            sse_response(futures_util::stream::iter(items).boxed())
+        }
+        Behavior::PartialThenClose => {
+            drop(guard);
+            let s = futures_util::stream::once(async {
+                Ok(Bytes::from_static(b"data: {\"partial\":"))
+            });
+            sse_response(s.boxed())
+        }
     }
 }
 
@@ -237,6 +288,7 @@ async fn spawn_fake_handle(
         .route("/v1/worker/info", get(fake_info))
         .route("/v1/chat/completions", post(fake_generate))
         .route("/v1/completions", post(fake_generate))
+        .route("/v1/embeddings", post(fake_generate))
         .with_state(Arc::clone(&fake));
     let (url, handle) = serve_app_handle(app).await;
     (fake, url, handle)
@@ -765,6 +817,193 @@ async fn the_router_api_key_is_enforced() {
     );
 }
 
+// ─── Review fixes (#174) ─────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn a_stream_flag_on_a_json_route_gets_json() {
+    let (_, url) = spawn_fake("a", "m", 4, Behavior::Echo).await;
+    let (_, router) = spawn_router(config(&[&url])).await;
+    for (path, body) in [
+        ("/v1/completions", json!({"prompt": "x", "stream": true})),
+        ("/v1/embeddings", json!({"input": "x", "stream": true})),
+    ] {
+        let res = call(&router, "POST", path, &body.to_string()).await;
+        assert_eq!(res.status, StatusCode::OK, "{path}");
+        assert_eq!(
+            res.header("content-type"),
+            Some("application/json"),
+            "{path}"
+        );
+        assert_eq!(res.json()["worker"], "a", "{path}");
+    }
+}
+
+#[tokio::test]
+async fn every_worker_failing_in_transit_is_a_502() {
+    // One worker, lost before output: the attempt marks it unhealthy, but
+    // the answer is still that the request failed in transit.
+    let (lost, lost_url) = spawn_fake("lost", "m", 4, Behavior::LoseBeforeOutput).await;
+    let (coordinator, router) = spawn_router(config(&[&lost_url])).await;
+    for stream in [true, false] {
+        let res = chat(&router, json!({"messages": [], "stream": stream})).await;
+        assert_eq!(res.status, StatusCode::BAD_GATEWAY, "{}", res.text());
+        assert_eq!(res.json()["error"]["code"], "workers_failed");
+        assert!(!coordinator.status_report()[0].healthy);
+        coordinator.refresh().await;
+    }
+    assert_eq!(lost.received.load(Ordering::SeqCst), 2);
+
+    // Two workers: one stopped listening, one lost mid-request.
+    let (_, killed_url, server) = spawn_fake_handle("killed", "m", 4, Behavior::Echo).await;
+    let (_, lost_url) = spawn_fake("lost", "m", 4, Behavior::LoseBeforeOutput).await;
+    let (coordinator, router) = spawn_router(config(&[&killed_url, &lost_url])).await;
+    server.abort();
+    let _ = server.await;
+    let res = chat(&router, json!({"messages": []})).await;
+    assert_eq!(res.status, StatusCode::BAD_GATEWAY);
+    assert_eq!(res.json()["error"]["code"], "workers_failed");
+    assert!(coordinator.status_report().iter().all(|w| !w.healthy));
+
+    // With no attempt possible, it is still a 503.
+    let res = chat(&router, json!({"messages": []})).await;
+    assert_eq!(res.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(res.json()["error"]["code"], "no_worker");
+}
+
+#[tokio::test]
+async fn a_silent_worker_times_out_and_frees_its_slot() {
+    let (w, url) = spawn_fake("a", "m", 1, Behavior::Hang).await;
+    let mut cfg = config(&[&url]);
+    cfg.response_timeout = Some(Duration::from_millis(300));
+    let (coordinator, router) = spawn_router(cfg).await;
+
+    // No response at all, and stream headers with no event: both 504.
+    for (behavior, stream) in [(Behavior::Hang, false), (Behavior::HeadersThenHang, true)] {
+        *w.behavior.lock().unwrap() = behavior;
+        let res = chat(&router, json!({"messages": [], "stream": stream})).await;
+        assert_eq!(res.status, StatusCode::GATEWAY_TIMEOUT, "{}", res.text());
+        assert_eq!(res.json()["error"]["code"], "worker_timeout");
+        assert_eq!(res.header(WORKER_HEADER), Some(url.as_str()));
+        // The worker connection is closed (cancelling the work), the slot
+        // is free, and the worker leaves rotation until its next probe.
+        eventually("worker request dropped", || {
+            w.dropped.load(Ordering::SeqCst) && w.active.load(Ordering::SeqCst) == 0
+        })
+        .await;
+        let report = coordinator.status_report();
+        assert_eq!(report[0].dispatched, 0);
+        assert!(!report[0].healthy);
+        assert!(report[0].last_error.as_deref().unwrap().contains("300 ms"));
+        coordinator.refresh().await;
+        assert!(coordinator.status_report()[0].healthy);
+    }
+
+    // Once output flows, a pause longer than the deadline is not cut off.
+    *w.behavior.lock().unwrap() = Behavior::SlowStream(Duration::from_millis(700));
+    let res = chat(&router, json!({"messages": [], "stream": true})).await;
+    assert_eq!(res.status, StatusCode::OK);
+    let events = sse_data(&res.text());
+    assert_eq!(events.len(), 3, "{events:?}");
+    assert_eq!(events[2], "[DONE]");
+    assert!(coordinator.status_report()[0].healthy);
+}
+
+#[tokio::test]
+async fn a_stream_closed_without_done_ends_with_worker_lost() {
+    let (_, url) = spawn_fake("a", "m", 4, Behavior::CloseWithoutDone).await;
+    let (spare, spare_url) = spawn_fake("spare", "m", 1, Behavior::Echo).await;
+    let (_, router) = spawn_router(config(&[&url, &spare_url])).await;
+
+    let res = chat(&router, json!({"messages": [], "stream": true})).await;
+    assert_eq!(res.status, StatusCode::OK);
+    let text = res.text();
+    assert!(
+        !text.contains("partial"),
+        "unfinished event forwarded: {text}"
+    );
+    let events = sse_data(&text);
+    assert_eq!(events.len(), 3, "{events:?}");
+    assert_eq!(events[1], json!({"worker": "a", "i": 1}).to_string());
+    let err: Value = serde_json::from_str(&events[2]).unwrap();
+    assert_eq!(err["error"]["code"], "worker_lost");
+    assert!(!text.contains("[DONE]"));
+    assert_eq!(spare.received.load(Ordering::SeqCst), 0);
+
+    // Closed after only half an event: nothing reached the client, so the
+    // request is retried, and the half event is never forwarded.
+    let (_, partial_url) = spawn_fake("p", "m", 4, Behavior::PartialThenClose).await;
+    let (spare, spare_url) = spawn_fake("spare", "m", 1, Behavior::Echo).await;
+    let (_, router) = spawn_router(config(&[&partial_url, &spare_url])).await;
+    let res = chat(&router, json!({"messages": [], "stream": true})).await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.header(WORKER_HEADER), Some(spare_url.as_str()));
+    assert!(!res.text().contains("partial"));
+    assert_eq!(
+        sse_data(&res.text()).last().map(String::as_str),
+        Some("[DONE]")
+    );
+    assert_eq!(spare.received.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn an_oversized_response_is_a_502_without_failover() {
+    let (big, big_url) = spawn_fake("big", "m", 4, Behavior::Echo).await;
+    let (spare, spare_url) = spawn_fake("spare", "m", 4, Behavior::Echo).await;
+    let mut cfg = config(&[&big_url, &spare_url]);
+    cfg.max_response_bytes = 16;
+    let (coordinator, router) = spawn_router(cfg).await;
+    let res = call(
+        &router,
+        "POST",
+        "/v1/embeddings",
+        &json!({"input": vec!["x"; 8]}).to_string(),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_GATEWAY);
+    assert_eq!(res.json()["error"]["code"], "response_too_large");
+    assert_eq!(res.header(WORKER_HEADER), Some(big_url.as_str()));
+    assert_eq!(big.received.load(Ordering::SeqCst), 1);
+    assert_eq!(spare.received.load(Ordering::SeqCst), 0, "not retried");
+    let report = coordinator.status_report();
+    assert!(report.iter().all(|w| w.healthy && w.dispatched == 0));
+}
+
+#[tokio::test]
+async fn cross_origin_access_needs_an_api_key() {
+    let (_, url) = spawn_fake("a", "m", 1, Behavior::Echo).await;
+    let cors_get = |router: String, key: Option<&'static str>| async move {
+        let mut sender = open(&router).await;
+        let mut req = request("GET", "/v1/models", "");
+        req.headers_mut()
+            .insert(header::ORIGIN, "https://elsewhere.example".parse().unwrap());
+        if let Some(key) = key {
+            req.headers_mut().insert(
+                header::AUTHORIZATION,
+                format!("Bearer {key}").parse().unwrap(),
+            );
+        }
+        let res = sender.send_request(req).await.unwrap();
+        (
+            res.status(),
+            res.headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .cloned(),
+        )
+    };
+    // No key: no CORS headers, so browsers keep other sites from reading.
+    let (_, open_router) = spawn_router(config(&[&url])).await;
+    let (status, allow) = cors_get(open_router, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(allow, None);
+    // With a key, cross-origin clients are allowed but must present it.
+    let mut cfg = config(&[&url]);
+    cfg.api_key = Some("k".to_string());
+    let (_, keyed_router) = spawn_router(cfg).await;
+    let (status, allow) = cors_get(keyed_router, Some("k")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(allow.is_some());
+}
+
 // ─── Real worker (tiny GGUF) ─────────────────────────────────────────────────
 
 fn tiny_engine(dir_name: &str) -> joshua::Engine {
@@ -995,4 +1234,25 @@ async fn a_configured_worker_slot_cap_bounds_all_its_models_together() {
 
     worker.1.notify_waiters();
     assert_eq!(held.await.unwrap().status, StatusCode::OK);
+}
+
+/// A batch embedding whose cancel flag is set stops before the next input,
+/// releasing the engine's permit, and an uncancelled call is unchanged.
+#[test]
+fn cancelled_embedding_stops_and_releases_the_permit() {
+    let engine = tiny_engine("route-embed-cancel");
+    let texts = vec!["hello world".to_string(), "a b c".to_string()];
+    let cancelled = AtomicBool::new(true);
+    assert!(matches!(
+        engine.embed_with_usage_cancellable(&texts, &cancelled),
+        Err(joshua::JoshuaError::Cancelled)
+    ));
+    assert_eq!(engine.in_flight(), 0, "the permit is released");
+    let live = AtomicBool::new(false);
+    let (vectors, tokens) = engine.embed_with_usage_cancellable(&texts, &live).unwrap();
+    assert_eq!(
+        (vectors.clone(), tokens),
+        engine.embed_with_usage(&texts).unwrap()
+    );
+    assert_eq!(vectors.len(), 2);
 }
