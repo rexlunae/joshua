@@ -113,7 +113,8 @@ use crate::embedding::EmbeddingModel;
 use crate::model::{Architecture, QuantizedModel};
 use crate::npu::{NpuBackend, NpuSession};
 use crate::speculative::{
-    next_draft_len, NgramDrafter, SpeculativeConfig, SpeculativeStats, TokenDistRef, Verdict,
+    next_draft_len, NgramDrafter, SpeculationGate, SpeculativeConfig, SpeculativeStats,
+    TokenDistRef, Verdict,
 };
 pub use crate::placement::{DensePlacement, ExpertPlacement, VramExpertCache};
 use crate::template::ChatTemplate;
@@ -413,6 +414,18 @@ pub struct EngineOptions {
     /// chunk re-reads the whole model, so a larger chunk also means fewer
     /// passes over the weights.
     pub prefill_chunk: usize,
+    /// Prefix checkpoints each session of a model with recurrent layers
+    /// keeps (Qwen3-Next, Qwen3.5, `qwen4exp`, the KDA hybrids); `None`
+    /// selects [`crate::native_session::DEFAULT_PREFIX_CHECKPOINTS`] and
+    /// `Some(0)` turns them off.
+    ///
+    /// Such a model's running state cannot be cut back to an arbitrary
+    /// prefix, so an edited conversation (an agent replacing its last
+    /// message or an old tool result) used to re-read the whole prompt.
+    /// Each checkpoint is a copy of every recurrent layer's state at the end
+    /// of a prefill — a turn boundary — that the edit resumes from instead.
+    /// Each costs one copy of that state per pooled session.
+    pub prefix_checkpoints: Option<usize>,
     /// Where a sparse MoE model's routed experts live when inference runs on
     /// an accelerator: uploaded to the device, or kept in host RAM (borrowed
     /// from the mapping, run on the CPU expert kernels, activations hopping
@@ -550,6 +563,19 @@ impl EngineOptions {
         self
     }
 
+    /// Set how many prefix checkpoints a recurrent model's session keeps
+    /// (`0` = off).  See [`EngineOptions::prefix_checkpoints`].
+    pub fn prefix_checkpoints(mut self, n: usize) -> Self {
+        self.prefix_checkpoints = Some(n);
+        self
+    }
+
+    /// [`Self::prefix_checkpoints`] when `n` is set; `None` keeps the default.
+    pub fn prefix_checkpoints_opt(mut self, n: Option<usize>) -> Self {
+        self.prefix_checkpoints = n.or(self.prefix_checkpoints);
+        self
+    }
+
     /// Choose where the routed experts of a MoE model live on an
     /// accelerator.  See [`EngineOptions::expert_placement`].
     pub fn expert_placement(mut self, placement: ExpertPlacement) -> Self {
@@ -677,6 +703,14 @@ pub struct Engine {
     /// Tokens per prefill chunk (see [`EngineOptions::prefill_chunk`]),
     /// resolved to at least one token.
     prefill_chunk: usize,
+    /// Prefix checkpoints per recurrent-model session (see
+    /// [`EngineOptions::prefix_checkpoints`]).
+    prefix_checkpoints: usize,
+    /// Whether the routed experts page in on demand (the model was loaded as
+    /// larger than RAM: [`EngineOptions::pin_hot_weights`] or
+    /// [`EngineOptions::lazy_weights`]), so decode prefetches each layer's
+    /// predicted experts.
+    predict_experts: bool,
     /// Compute device: CUDA or Metal when built with the matching feature
     /// (falling back to CPU if unavailable at runtime), CPU otherwise.
     device: Device,
@@ -929,12 +963,14 @@ impl GenSession {
         }
     }
 
-    /// Whether this session's KV state can be truncated to a prefix length
-    /// at all (see [`GenSession::truncate_to`]).
-    fn supports_truncate(&self) -> bool {
+    /// The longest prefix of at most `keep` tokens [`Self::truncate_to`] can
+    /// rewind this session to (`0`: none).  `keep` itself for an
+    /// attention-only model; the latest prefix checkpoint at or before it
+    /// for one with recurrent layers.
+    fn rewind_target(&self, keep: usize) -> usize {
         match self {
-            Self::Candle(model) => model.supports_kv_truncate(),
-            Self::Npu(_) => false,
+            Self::Candle(model) => model.kv_rewind_target(keep),
+            Self::Npu(_) => 0,
         }
     }
 
@@ -1185,6 +1221,13 @@ impl Engine {
             0 => DEFAULT_PREFILL_CHUNK,
             n => n,
         };
+        let prefix_checkpoints = options
+            .prefix_checkpoints
+            .unwrap_or(crate::native_session::DEFAULT_PREFIX_CHECKPOINTS);
+        // A model loaded as larger than RAM faults its routed experts in on
+        // demand; only then is a speculative expert prefetch worth its advice
+        // calls (on a resident model every hint would be a no-op syscall).
+        let predict_experts = options.pin_hot_weights || options.lazy_weights;
         let raw_path = model_path.as_ref().to_path_buf();
 
         // Resolve the actual .gguf file path.
@@ -1764,6 +1807,8 @@ impl Engine {
             expert_cache_auto,
             device_expert_cache,
             prefill_chunk,
+            prefix_checkpoints,
+            predict_experts,
             device,
             dense_device,
             expert_device,
@@ -2512,6 +2557,8 @@ impl Engine {
             .filter(|_| !penalty_seed.is_empty() && model.supports_speculative());
         let mut drafter = spec.map(|c| NgramDrafter::new(c, penalty_seed));
         let mut draft_len = spec.map_or(0, |c| c.max_draft);
+        // Holds drafting off while it measures slower than plain decoding.
+        let mut gate = spec.filter(|c| c.cost_gate).map(|_| SpeculationGate::default());
         let (mut n_drafted, mut n_accepted, mut n_verify) = (0u64, 0u64, 0u64);
         // A token already chosen by a rejected verification (the
         // correction), to emit before sampling anything new.
@@ -2561,18 +2608,27 @@ impl Engine {
 
             // Draft continuation tokens, bounded so that every accepted one
             // can still be emitted (max_tokens) and fed (context window).
+            // The gate is asked only when there is a draft, so steps with no
+            // match don't use up its probes.
             drafts.clear();
             if let Some(d) = drafter.as_mut() {
                 let room = (options.max_tokens - text.n_decoded) as usize;
                 let ctx_room = (self.n_ctx as usize).saturating_sub(n_cur + 1);
                 d.draft_into(draft_len.min(room).min(ctx_room), &mut drafts);
+                if !drafts.is_empty() && !gate.as_mut().is_none_or(SpeculationGate::allow) {
+                    drafts.clear();
+                }
             }
 
+            let step_start = Instant::now();
             if drafts.is_empty() {
                 // Single-token decode step.
                 logits_vec = model.forward_tokens(&[next_token], n_cur, &self.dense_device)?;
                 fed_tokens.push(next_token);
                 n_cur += 1;
+                if let Some(g) = gate.as_mut() {
+                    g.record_plain(step_start.elapsed().as_secs_f64());
+                }
                 continue;
             }
 
@@ -2632,6 +2688,10 @@ impl Engine {
                 return Err(JoshuaError::Inference(format!(
                     "speculative decoding could not roll the KV cache back to {n_cur} tokens"
                 )));
+            }
+            // The pass's cost includes its rollback.
+            if let Some(g) = gate.as_mut() {
+                g.record_verify(accepted + 1, step_start.elapsed().as_secs_f64());
             }
             if stop {
                 break;
@@ -2960,21 +3020,29 @@ impl Engine {
             //   after the prompt are not recoverable from a cache alone, so
             //   rewind to `lcp - 1` and re-prefill just the final token.
             //   (`keep == 0` on single-token prompts degenerates to a clear.)
+            //
+            // A model with recurrent layers rewinds only to a prefix
+            // checkpoint (a copy of its running state taken at the end of an
+            // earlier prefill), so its candidate keeps the latest checkpoint
+            // at or before that point rather than the whole common prefix.
             if !want_npu {
                 let best_edit = pool
                     .iter()
                     .enumerate()
-                    .filter(|(_, c)| c.session.supports_truncate())
-                    .map(|(i, c)| (i, longest_common_prefix(&c.tokens, prompt_tokens)))
-                    .filter(|(_, lcp)| *lcp > 0 && *lcp <= prompt_tokens.len())
-                    // Longest common prefix first; pass 1's exact-prefix
+                    .filter(|(_, c)| !c.session.is_npu())
+                    .map(|(i, c)| {
+                        let lcp = longest_common_prefix(&c.tokens, prompt_tokens);
+                        // Rollback case: keep one token behind so the suffix
+                        // prefill is never empty.
+                        let keep = lcp.min(prompt_tokens.len().saturating_sub(1));
+                        (i, c.session.rewind_target(keep))
+                    })
+                    .filter(|(_, keep)| *keep > 0)
+                    // Longest reusable prefix first; pass 1's exact-prefix
                     // matches are intentionally preferred over longer edit
                     // candidates because they need no KV copy at all.
-                    .max_by_key(|(_, lcp)| *lcp);
-                if let Some((i, lcp)) = best_edit {
-                    // Rollback case: keep one token behind so the suffix
-                    // prefill is never empty.
-                    let keep = lcp.min(prompt_tokens.len() - 1);
+                    .max_by_key(|(_, keep)| *keep);
+                if let Some((i, keep)) = best_edit {
                     edit_pick = Some((pool.swap_remove(i), keep));
                 }
             }
@@ -3178,6 +3246,8 @@ impl Engine {
             }
         }
         model.set_pin_hot_experts(budget);
+        model.set_prefix_checkpoints(self.prefix_checkpoints);
+        model.set_speculative_expert_prefetch(self.predict_experts);
         match model.new_session() {
             Some(session) => {
                 tracing::info!(

@@ -875,11 +875,59 @@ impl QuantizedModel {
                 // though it cannot rewind to an arbitrary prefix.  Gating on
                 // the former alone would abort generation on the first
                 // rejected draft.
-                if !self.supports_kv_truncate() && !self.has_pending_verify() {
+                // A recurrent loader can also rewind to a prefix checkpoint it
+                // took at exactly `keep_len` (see `kv_rewind_target`).
+                if !self.supports_kv_truncate()
+                    && !self.has_pending_verify()
+                    && self.kv_rewind_target(keep_len) != keep_len
+                {
                     return Ok(false);
                 }
                 session!(self, m => m.truncate_kv_cache(keep_len).map(|_| true), _ => Ok(false))
             }
+        }
+    }
+
+    /// The longest prefix of at most `keep_len` tokens that
+    /// [`Self::truncate_kv_cache`] can rewind this instance to.
+    ///
+    /// `keep_len` itself wherever [`Self::supports_kv_truncate`] holds.  A
+    /// model with recurrent layers answers the latest *prefix checkpoint* at
+    /// or before it — a copy of its running state taken at the end of an
+    /// earlier prefill (see [`crate::native_session::Session::rewind_target`])
+    /// — and `0` when it holds none.
+    pub fn kv_rewind_target(&self, keep_len: usize) -> usize {
+        match self {
+            Self::DeepSeek4(_) => keep_len,
+            _ => session!(self, m => m.rewind_target(keep_len), _ => {
+                if self.supports_kv_truncate() { keep_len } else { 0 }
+            }),
+        }
+    }
+
+    /// Set how many prefix checkpoints a session of a recurrent model keeps
+    /// (`0` turns them off); see
+    /// [`crate::native_session::Session::set_prefix_checkpoints`].  Other
+    /// architectures ignore it.
+    pub fn set_prefix_checkpoints(&mut self, n: usize) {
+        session!(self, m => m.set_prefix_checkpoints(n), _ => {})
+    }
+
+    /// Turn on the speculative next-step expert prefetch for the Qwen-family
+    /// and `deepseek2` loaders (see
+    /// [`crate::native_session::Session::set_speculative_expert_prefetch`]).
+    /// `deepseek4` always runs its own; other architectures ignore it.
+    pub fn set_speculative_expert_prefetch(&mut self, on: bool) {
+        session!(self, m => m.set_speculative_expert_prefetch(on), _ => {})
+    }
+
+    /// Per layer, the experts the speculative prefetch predicts for the next
+    /// step (the last input's final-token routing); `None` for architectures
+    /// outside the shared session (diagnostics).
+    pub fn predicted_experts(&self) -> Option<&[Vec<u32>]> {
+        match self {
+            Self::DeepSeek4(m) => Some(m.last_routed_experts()),
+            _ => session!(self, m => Some(m.last_routed_experts()), _ => None),
         }
     }
 

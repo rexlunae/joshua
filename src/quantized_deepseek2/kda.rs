@@ -63,7 +63,7 @@ impl KdaConfig {
 
 /// One KDA layer's recurrent state.
 #[derive(Clone)]
-pub(super) struct KdaState {
+pub struct KdaState {
     /// The last `d_conv - 1` inputs of the Q, K and V convs, `[d_conv - 1, inner]`.
     conv: [Tensor; 3],
     /// Per head `[head_dim (key), head_dim (value)]`, head-major.

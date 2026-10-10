@@ -417,10 +417,18 @@ mod synthetic {
 
         let dir = model_dir(name);
         write_model(&dir.join("model.gguf"));
-        // Recurrent (Gated DeltaNet) state cannot be rewound: every edit
-        // below falls back to a full prefill, so nothing counts as reuse —
-        // but the outputs must still match a fresh engine.
-        let rewinds = |n: u64| if arch == "qwen35" { 0 } else { n };
+        // Recurrent (Gated DeltaNet) state cannot be cut back to an
+        // arbitrary prefix, only to a prefix checkpoint taken at the end of
+        // an earlier prompt.  Of the edits below only the third lands on one
+        // (the end of "hello b c"); the others fall back to a full prefill —
+        // and every output must still match a fresh engine.
+        let recurrent = arch == "qwen35";
+        // Reuses after the first `n` edits.
+        let rewinds = |n: u64| match (recurrent, n) {
+            (false, n) => n,
+            (true, 1) => 0,
+            (true, _) => 1,
+        };
 
         let greedy = |max_tokens| GenerationOptions {
             max_tokens,
@@ -452,7 +460,7 @@ mod synthetic {
         // A third request that extends the *edited* prompt but skips the two
         // generated tokens diverges from the cached history again, so this
         // also rewinds (to the three shared tokens) rather than extending.
-        let (_, _, _, _) = warm.complete_raw("hello b c d e", &greedy(2)).unwrap();
+        let (ext_text, ext_usage, _, _) = warm.complete_raw("hello b c d e", &greedy(2)).unwrap();
         assert_eq!(warm.kv_reuse_count(), rewinds(2));
         assert_eq!(warm.kv_edit_reuse_count(), rewinds(2));
 
@@ -478,6 +486,10 @@ mod synthetic {
         let fresh = Engine::with_n_ctx(&dir, 64).expect("engine should load");
         let (fresh_text, fresh_usage, _, _) = fresh.complete_raw("hello b c", &greedy(2)).unwrap();
 
+        let fresh_ext = Engine::with_n_ctx(&dir, 64).expect("engine should load");
+        let (fresh_ext_text, fresh_ext_usage, _, _) =
+            fresh_ext.complete_raw("hello b c d e", &greedy(2)).unwrap();
+
         let fresh_rb = Engine::with_n_ctx(&dir, 64).expect("engine should load");
         let (fresh_rb_text, fresh_rb_usage, _, _) =
             fresh_rb.complete_raw("hello b", &greedy(2)).unwrap();
@@ -485,6 +497,8 @@ mod synthetic {
         assert_eq!(warm_text, fresh_text, "prefix truncation must not change output");
         assert_eq!(warm_usage.prompt_tokens, fresh_usage.prompt_tokens);
         assert_eq!(warm_usage.completion_tokens, fresh_usage.completion_tokens);
+        assert_eq!(ext_text, fresh_ext_text, "rewound extension must not change output");
+        assert_eq!(ext_usage.completion_tokens, fresh_ext_usage.completion_tokens);
         assert_eq!(rb_text, fresh_rb_text, "rollback reuse must not change output");
         assert_eq!(rb_usage.prompt_tokens, fresh_rb_usage.prompt_tokens);
         assert_eq!(rb_usage.completion_tokens, fresh_rb_usage.completion_tokens);
@@ -512,8 +526,9 @@ mod synthetic {
         edited_context_reuse_matches_fresh_engine("qwen2moe");
     }
 
-    /// A recurrent (Gated DeltaNet) model cannot rewind to the shared
-    /// prefix; the engine must fall back to a full prefill and still match.
+    /// A recurrent (Gated DeltaNet) model rewinds only to a prefix checkpoint
+    /// (an earlier prompt's end); otherwise the engine falls back to a full
+    /// prefill.  Either way the output must match.
     #[test]
     fn kv_edited_context_reuse_matches_fresh_engine_qwen35() {
         edited_context_reuse_matches_fresh_engine("qwen35");

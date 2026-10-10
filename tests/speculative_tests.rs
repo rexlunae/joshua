@@ -134,10 +134,13 @@ fn engine(dir: &Path, speculative: Option<SpeculativeConfig>) -> Engine {
 fn check_engine_equivalence(dir: &Path, expect_rejections: bool) {
     // A repetitive prompt so prompt lookup has n-grams to match.
     let prompt = "a b c d a b c d a b c d a b c d a b";
+    // The cost gate is off so the verification machinery runs on every
+    // match, whatever the tiny fixture's timings say.
     let config = SpeculativeConfig {
         max_draft: 4,
         max_ngram: 3,
         min_ngram: 1,
+        cost_gate: false,
     };
 
     let plain = engine(dir, None);

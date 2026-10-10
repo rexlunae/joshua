@@ -125,6 +125,13 @@ pub trait ExpertResidency: Send + Sync + 'static {
             self.mark_hot(l, e);
         }
     }
+
+    /// Hint that `(layer, expert)` is likely to be read soon — the
+    /// speculative next-step prediction (the expert the layer routed to last
+    /// step).  Unlike [`ExpertResidency::acquire`] this commits nothing: the
+    /// CPU backend issues the same `MADV_WILLNEED`, while a device slot pool
+    /// ignores it rather than spend an upload on a guess.  Default: no-op.
+    fn prefetch_hint(&self, _layer: u32, _expert: u32) {}
 }
 
 /// CPU residency backend: best-effort `MADV_WILLNEED` over each hot expert's
@@ -158,6 +165,10 @@ impl ExpertResidency for CpuResidency {
 
     fn release(&self, _layer: u32, _expert: u32) {
         // Kernel-managed page cache: nothing to free explicitly.
+    }
+
+    fn prefetch_hint(&self, layer: u32, expert: u32) {
+        self.acquire(layer, expert);
     }
 
     fn capacity(&self) -> usize {

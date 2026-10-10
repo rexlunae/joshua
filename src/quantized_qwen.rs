@@ -1543,9 +1543,21 @@ pub struct Weights {
     n_expert: usize,
 }
 
+/// A layer's running state at a prompt boundary (see
+/// [`crate::native_session::LayerStack::checkpoint_state`]): the DeltaNet conv
+/// tail and matrices and the PLE conv window.  The QSA indexer keys need no
+/// copy — a forward at an earlier offset cuts them back itself (see
+/// [`qwen4exp`]'s `QsaCache`).
+#[derive(Clone)]
+pub struct RunningState {
+    delta: Option<DeltaState>,
+    ple_conv: Option<Tensor>,
+}
+
 impl crate::native_session::LayerStack for Weights {
     type State = LayerState;
     type Snapshot = RecurrentSnapshot;
+    type Checkpoint = RunningState;
 
     fn n_layers(&self) -> usize {
         self.layers.len()
@@ -1662,6 +1674,19 @@ impl crate::native_session::LayerStack for Weights {
         // the retained prefix out of it (`restore_state`): the DeltaNet
         // matrices, the PLE conv window and the QSA indexer keys all qualify.
         true
+    }
+
+    fn checkpoint_state(state: &LayerState) -> Option<RunningState> {
+        (state.delta.is_some() || state.ple_conv.is_some()).then(|| RunningState {
+            delta: state.delta.clone(),
+            ple_conv: state.ple_conv.clone(),
+        })
+    }
+
+    fn restore_checkpoint(state: &mut LayerState, checkpoint: &RunningState) -> Result<()> {
+        state.delta = checkpoint.delta.clone();
+        state.ple_conv = checkpoint.ple_conv.clone();
+        Ok(())
     }
 }
 

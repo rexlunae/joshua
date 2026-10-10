@@ -1042,6 +1042,8 @@ impl crate::native_session::LayerStack for Weights {
     // rollback (`KdaSnapshot`); every other piece of state here is append-only
     // or per-pass and rewinds through `truncate_state` alone.
     type Snapshot = KdaSnapshot;
+    // A prefix checkpoint needs only the KDA state: everything else truncates.
+    type Checkpoint = KdaState;
 
     fn n_layers(&self) -> usize {
         self.layers.len()
@@ -1169,6 +1171,15 @@ impl crate::native_session::LayerStack for Weights {
         // hyper-connection streams and Kimi K3's banked attention residuals are
         // derived per input and hold nothing across passes.
         true
+    }
+
+    fn checkpoint_state(state: &LayerState) -> Option<KdaState> {
+        state.kda.clone()
+    }
+
+    fn restore_checkpoint(state: &mut LayerState, checkpoint: &KdaState) -> Result<()> {
+        state.kda = Some(checkpoint.clone());
+        Ok(())
     }
 }
 

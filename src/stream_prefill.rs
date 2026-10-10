@@ -63,6 +63,11 @@ pub trait StreamPrefill {
     /// a hook for per-prefill bookkeeping such as the routing trace.
     fn begin_stream(&mut self) {}
 
+    /// Called once after every layer has seen every chunk, with the absolute
+    /// position just past the last chunk: a hook for state that is only
+    /// whole once the sweep finishes (the session's prefix checkpoints).
+    fn end_stream(&mut self, _end: usize) {}
+
     /// Called before each `apply_layer_chunk` with the chunk's index, the
     /// chunk count and the number of prompt tokens before this chunk, so a
     /// loader can tell the final prompt chunk apart (the deepseek4 device
@@ -140,7 +145,7 @@ pub fn stream_prefill<M: StreamPrefill + ?Sized>(
         }
     }
 
+    m.end_stream(last_chunk.pos + last_chunk.tokens.len());
     // The prefill prediction is the last chunk's last-token logits.
-    let _ = last_chunk;
     m.final_logits(acts.last().expect("non-empty chunks"))
 }

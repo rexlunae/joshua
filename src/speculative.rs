@@ -27,6 +27,16 @@
 //! position of a multi-token input and truncate their KV cache (see
 //! `QuantizedModel::supports_speculative`); everything else keeps the plain
 //! one-token loop.
+//!
+//! A verification pass is not free.  On a sparse MoE model the `k + 1` rows
+//! route to the union of their experts, so a pass can read several times the
+//! expert bytes of a one-token step; when the drafts are mostly rejected it
+//! produces fewer tokens per second than plain decoding.  [`SpeculationGate`]
+//! measures both — seconds per plain step and tokens per second over
+//! verification passes — and stops drafting while speculation is the slower
+//! of the two, re-probing now and then (the cost-aware back-off DwarfStar's
+//! and Strata's drafters use).  It changes only *when* drafts are tried, never
+//! which tokens are emitted.
 
 use std::collections::HashMap;
 
@@ -54,6 +64,10 @@ pub struct SpeculativeConfig {
     /// Shortest trailing n-gram accepted as a match.  `1` drafts more often
     /// at a lower acceptance rate.
     pub min_ngram: usize,
+    /// Stop drafting while measured speculation is slower than plain
+    /// decoding ([`SpeculationGate`]).  On by default; off drafts whenever
+    /// the drafter has a match, as before.
+    pub cost_gate: bool,
 }
 
 impl Default for SpeculativeConfig {
@@ -62,6 +76,7 @@ impl Default for SpeculativeConfig {
             max_draft: DEFAULT_MAX_DRAFT,
             max_ngram: DEFAULT_MAX_NGRAM,
             min_ngram: DEFAULT_MIN_NGRAM,
+            cost_gate: true,
         }
     }
 }
@@ -83,6 +98,7 @@ impl SpeculativeConfig {
             max_draft: self.max_draft.max(1),
             max_ngram: self.max_ngram.max(min_ngram),
             min_ngram,
+            cost_gate: self.cost_gate,
         }
     }
 }
@@ -327,6 +343,82 @@ fn sample_probs(p: impl IntoIterator<Item = f32>, rng: &mut impl Rng) -> Result<
     Ok(dist.sample(rng) as u32)
 }
 
+/// Weight of the newest sample in the gate's moving averages.
+const GATE_EWMA: f64 = 0.25;
+/// While the gate holds drafting off, let every this-many-th opportunity
+/// through so the speculation rate is re-measured (acceptance changes with
+/// the text: a reply that starts quoting its context pays again).
+const GATE_PROBE_EVERY: u32 = 16;
+/// While drafts keep coming, take a plain step after this many verification
+/// passes so the baseline they are compared against stays current.
+const GATE_REMEASURE_EVERY: u32 = 64;
+
+/// Cost-aware back-off for speculative decoding (see the module docs).
+///
+/// A plain step turns one fed token into one new prediction; a verification
+/// pass turns it into `accepted + 1`.  The gate keeps a moving average of the
+/// seconds per plain step and of the tokens per second over verification
+/// passes, and holds drafting off while `rate × step < 1` — speculation
+/// producing fewer tokens per second than plain decoding.  Once a pass has
+/// been measured it needs a plain baseline too, so it holds one draft back
+/// to take one (and again every [`GATE_REMEASURE_EVERY`] passes).
+///
+/// Ask it only when there is a draft to verify: every call counts as an
+/// opportunity towards the next probe.
+#[derive(Debug, Clone, Default)]
+pub struct SpeculationGate {
+    plain_secs: Option<f64>,
+    spec_rate: Option<f64>,
+    held: u32,
+    since_plain: u32,
+}
+
+impl SpeculationGate {
+    /// Whether to verify the draft on hand now.
+    pub fn allow(&mut self) -> bool {
+        match (self.plain_secs, self.spec_rate) {
+            // No baseline to compare against: measure one.
+            (None, Some(_)) => false,
+            (Some(step), Some(rate)) if rate * step < 1.0 => {
+                self.held += 1;
+                if self.held >= GATE_PROBE_EVERY {
+                    self.held = 0;
+                    true
+                } else {
+                    false
+                }
+            }
+            (Some(_), Some(_)) if self.since_plain >= GATE_REMEASURE_EVERY => false,
+            _ => {
+                self.held = 0;
+                self.since_plain += 1;
+                true
+            }
+        }
+    }
+
+    /// A plain one-token step took `secs`.
+    pub fn record_plain(&mut self, secs: f64) {
+        self.plain_secs = Some(ewma(self.plain_secs, secs));
+        self.since_plain = 0;
+    }
+
+    /// A verification pass took `secs` and yielded `tokens` predictions (the
+    /// accepted drafts plus the token after them).
+    pub fn record_verify(&mut self, tokens: usize, secs: f64) {
+        if secs > 0.0 {
+            self.spec_rate = Some(ewma(self.spec_rate, tokens as f64 / secs));
+        }
+    }
+}
+
+fn ewma(prev: Option<f64>, x: f64) -> f64 {
+    match prev {
+        Some(p) => p + GATE_EWMA * (x - p),
+        None => x,
+    }
+}
+
 /// Adapt the live draft length to the acceptance just observed: grow after a
 /// fully accepted draft, shrink after a fully rejected one.
 pub fn next_draft_len(current: usize, drafted: usize, accepted: usize, max: usize) -> usize {
@@ -352,6 +444,7 @@ mod tests {
             max_draft: 8,
             max_ngram,
             min_ngram,
+            cost_gate: true,
         }
     }
 
@@ -412,6 +505,7 @@ mod tests {
             max_draft: 0,
             max_ngram: 1,
             min_ngram: 0,
+            cost_gate: true,
         }
         .normalized();
         assert_eq!(c.max_draft, 1);
@@ -552,5 +646,55 @@ mod tests {
             verify_steps: 3,
         };
         assert!((s.acceptance_rate() - 0.7).abs() < 1e-9);
+    }
+
+    /// The gate drafts until both rates are measured, holds drafting off
+    /// while speculation is slower, re-probes periodically, and resumes once
+    /// a probe shows it paying again.
+    #[test]
+    fn speculation_gate_backs_off_and_reprobes() {
+        let mut g = SpeculationGate::default();
+        assert!(g.allow(), "unmeasured: draft");
+        g.record_plain(0.1); // 10 tokens/s plain
+        assert!(g.allow(), "speculation not measured yet");
+        // A rejected draft: one token in 0.25 s (4 tokens/s) — slower.
+        g.record_verify(1, 0.25);
+        let allowed = (0..GATE_PROBE_EVERY).filter(|_| g.allow()).count();
+        assert_eq!(allowed, 1, "only the periodic probe gets through");
+        // The probe accepts a long run: 6 tokens in 0.2 s, pulling the
+        // average above the plain rate again.
+        for _ in 0..4 {
+            g.record_verify(6, 0.2);
+        }
+        assert!(g.allow() && g.allow(), "paying again: draft every step");
+    }
+
+    /// A draft at every step still gets a plain baseline: the gate holds one
+    /// back once a pass is measured, then periodically to refresh it.
+    #[test]
+    fn speculation_gate_measures_its_baseline() {
+        let mut g = SpeculationGate::default();
+        assert!(g.allow(), "nothing measured: draft");
+        g.record_verify(1, 0.25);
+        assert!(!g.allow(), "a pass but no baseline: take a plain step");
+        g.record_plain(0.1);
+        assert!(!g.allow(), "slower than plain: held");
+        let mut g = SpeculationGate::default();
+        g.record_plain(0.1);
+        g.record_verify(4, 0.2);
+        let allowed = (0..GATE_REMEASURE_EVERY).filter(|_| g.allow()).count();
+        assert_eq!(allowed as u32, GATE_REMEASURE_EVERY);
+        assert!(!g.allow(), "baseline due for a refresh");
+        g.record_plain(0.1);
+        assert!(g.allow());
+    }
+
+    /// Speculation exactly as fast as plain decoding keeps drafting.
+    #[test]
+    fn speculation_gate_keeps_drafting_at_break_even() {
+        let mut g = SpeculationGate::default();
+        g.record_plain(0.1);
+        g.record_verify(2, 0.2);
+        assert!(g.allow());
     }
 }
