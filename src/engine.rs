@@ -3882,16 +3882,24 @@ impl Engine {
             .map_err(|e| JoshuaError::ModelLoad(format!("GGUF read failed: {e}")))?;
         // Hand the loader the mapping so architectures Joshua implements
         // itself can borrow weights in place rather than copying them.
-        let mut model = QuantizedModel::from_gguf_mmap_placed(
-            gguf,
-            &mut cursor,
-            &self.dense_device,
-            &self.expert_device,
-            Some(Arc::clone(&self.mmap)),
-            self.model_file.clone(),
-            self.n_ctx as usize,
-            self.device_expert_cache,
-        )
+        let load = || {
+            QuantizedModel::from_gguf_mmap_placed(
+                gguf,
+                &mut cursor,
+                &self.dense_device,
+                &self.expert_device,
+                Some(Arc::clone(&self.mmap)),
+                self.model_file.clone(),
+                self.n_ctx as usize,
+                self.device_expert_cache,
+            )
+        };
+        // Read the NextN block only when it will draft.
+        let mut model = if self.mtp > 0 {
+            crate::quantized_qwen::with_mtp_block(load)
+        } else {
+            load()
+        }
         .map_err(|e| JoshuaError::ModelLoad(format!("model init failed: {e}")))?;
         let mut budget = if self.expert_cache_auto {
             self.auto_expert_budget(&model)

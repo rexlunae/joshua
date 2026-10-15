@@ -1568,9 +1568,28 @@ struct Mtp {
     head_norm: Option<RmsNorm>,
 }
 
+thread_local! {
+    static LOAD_MTP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` with this thread's Qwen loads reading a GGUF's NextN (MTP) block.
+/// Off by default: the block is a whole extra layer (with a MoE model, its
+/// own routed-expert pool), so only a caller that will draft with it pays
+/// for loading it.
+pub fn with_mtp_block<T>(f: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            LOAD_MTP.set(self.0);
+        }
+    }
+    let _restore = Restore(LOAD_MTP.replace(true));
+    f()
+}
+
 impl Mtp {
-    /// The first NextN block, or `None` when the file has none (or it is
-    /// turned off with `JOSHUA_NO_MTP=1`).  Not for hyper-connection models,
+    /// The first NextN block, or `None` when the file has none or the load
+    /// is not inside [`with_mtp_block`].  Not for hyper-connection models,
     /// whose trunk hidden is several streams wide.
     fn load<R: Read + Seek>(
         rd: &mut Reader<R>,
@@ -1582,7 +1601,7 @@ impl Mtp {
         if cfg.n_nextn == 0
             || cfg.hyper.is_some()
             || !rd.has(&format!("{p}.nextn.eh_proj.weight"))
-            || std::env::var("JOSHUA_NO_MTP").is_ok_and(|v| !v.is_empty() && v != "0")
+            || !LOAD_MTP.get()
         {
             return Ok(None);
         }

@@ -790,32 +790,26 @@ impl<W: LayerStack> Session<W> {
             return Ok(Vec::new());
         }
         let emb_table = w.tok_embeddings();
-        let embed = |t: u32| -> Result<Tensor> {
-            let ids = Tensor::new(&[t], w.device())?;
-            emb_table.forward(&ids)?.reshape((1, 1, emb_table.hidden()?))
-        };
-        let mut drafts = Vec::with_capacity(n);
-        let mut token = next;
+        let hidden = emb_table.hidden()?;
+        // Each pick stays on the device and feeds the next row's embedding
+        // directly; the draft is read back once, at the end.
+        let mut ids = Tensor::new(&[next], w.device())?;
+        let mut picks = Vec::with_capacity(n);
         let mut seed = m.seed.clone();
         for d in 0..n {
-            let emb = embed(token)?;
+            let emb = emb_table.forward(&ids)?.reshape((1, 1, hidden))?;
             let s = match seed.take() {
                 Some(s) => s,
                 None => emb.zeros_like()?,
             };
             let input = LayerInput { mask: None, offset: pos + d, tokens: &[], verify: false };
             let out = w.mtp_forward(&mut m.state, &emb, &s, &input)?;
-            let logits: Vec<f32> = w.head_logits(&out)?.flatten_all()?.to_vec1()?;
-            token = logits
-                .iter()
-                .enumerate()
-                .max_by(|a, b| a.1.total_cmp(b.1))
-                .map_or(0, |(i, _)| i as u32);
-            drafts.push(token);
+            ids = w.head_logits(&out)?.flatten_all()?.argmax_keepdim(0)?;
+            picks.push(ids.clone());
             seed = Some(out);
         }
         W::truncate_state(&mut m.state, pos)?;
-        Ok(drafts)
+        Tensor::cat(&picks, 0)?.to_vec1::<u32>()
     }
 
     /// Set the routing-frequency hot-expert cache budget (experts kept

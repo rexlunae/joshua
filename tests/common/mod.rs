@@ -56,15 +56,8 @@ pub fn load_model(path: &Path, mmap: bool) -> joshua::model::QuantizedModel {
 }
 
 /// Last-position logits for `tokens` fed at `offset` (CPU).
-pub fn logits(
-    model: &mut joshua::model::QuantizedModel,
-    tokens: &[u32],
-    offset: usize,
-) -> Vec<f32> {
-    let input = Tensor::new(tokens, &Device::Cpu)
-        .unwrap()
-        .unsqueeze(0)
-        .unwrap();
+pub fn logits(model: &mut joshua::model::QuantizedModel, tokens: &[u32], offset: usize) -> Vec<f32> {
+    let input = Tensor::new(tokens, &Device::Cpu).unwrap().unsqueeze(0).unwrap();
     model
         .forward(&input, offset)
         .unwrap()
@@ -78,10 +71,7 @@ pub fn logits(
 pub fn assert_close(a: &[f32], b: &[f32], tol: f32, what: &str) {
     assert_eq!(a.len(), b.len(), "{what}: length");
     for (i, (x, y)) in a.iter().zip(b).enumerate() {
-        assert!(
-            (x - y).abs() < tol,
-            "{what}: logit {i} diverges: {x} vs {y}"
-        );
+        assert!((x - y).abs() < tol, "{what}: logit {i} diverges: {x} vs {y}");
     }
 }
 
@@ -210,23 +200,11 @@ pub fn check_prefix_checkpoint_rewind(model: &joshua::model::QuantizedModel, wha
     const TURN2: [u32; 4] = [6, 8, 4, 1];
     const EDIT: [u32; 3] = [11, 2, 6];
 
-    assert!(
-        !model.supports_kv_truncate(),
-        "{what}: expected running state"
-    );
+    assert!(!model.supports_kv_truncate(), "{what}: expected running state");
     // Feed the conversation up to `upto` tokens the way the subject did.
     let replay = |m: &mut joshua::model::QuantizedModel, upto: usize| {
         m.prefill_streamed(
-            &[
-                Chunk {
-                    tokens: &TURN1[..3],
-                    pos: 0,
-                },
-                Chunk {
-                    tokens: &TURN1[3..],
-                    pos: 3,
-                },
-            ],
+            &[Chunk { tokens: &TURN1[..3], pos: 0 }, Chunk { tokens: &TURN1[3..], pos: 3 }],
             &Device::Cpu,
         )
         .unwrap();
@@ -243,17 +221,9 @@ pub fn check_prefix_checkpoint_rewind(model: &joshua::model::QuantizedModel, wha
     replay(&mut m, n2);
     logits(&mut m, &[2], n2);
 
-    assert_eq!(
-        m.kv_rewind_target(4),
-        0,
-        "{what}: nothing before the first prompt"
-    );
+    assert_eq!(m.kv_rewind_target(4), 0, "{what}: nothing before the first prompt");
     assert_eq!(m.kv_rewind_target(TURN1.len()), TURN1.len(), "{what}");
-    assert_eq!(
-        m.kv_rewind_target(n2 - 1),
-        TURN1.len(),
-        "{what}: decode steps leave none"
-    );
+    assert_eq!(m.kv_rewind_target(n2 - 1), TURN1.len(), "{what}: decode steps leave none");
     assert_eq!(m.kv_rewind_target(n2), n2, "{what}");
     assert_eq!(m.kv_rewind_target(n2 + 1), n2, "{what}");
     assert!(
@@ -262,14 +232,8 @@ pub fn check_prefix_checkpoint_rewind(model: &joshua::model::QuantizedModel, wha
     );
 
     for keep in [n2, TURN1.len()] {
-        assert!(
-            m.truncate_kv_cache(keep).unwrap(),
-            "{what}: rewind to {keep}"
-        );
-        let got = [
-            logits(&mut m, &EDIT, keep),
-            logits(&mut m, &[7], keep + EDIT.len()),
-        ];
+        assert!(m.truncate_kv_cache(keep).unwrap(), "{what}: rewind to {keep}");
+        let got = [logits(&mut m, &EDIT, keep), logits(&mut m, &[7], keep + EDIT.len())];
 
         let mut reference = model.new_session().unwrap();
         replay(&mut reference, keep);
@@ -282,6 +246,7 @@ pub fn check_prefix_checkpoint_rewind(model: &joshua::model::QuantizedModel, wha
         }
     }
 }
+
 
 /// Check the prefix cache's snapshot round trip: a snapshot of a session's
 /// state (at its end, and — where the state allows — at an earlier prompt
@@ -299,16 +264,7 @@ pub fn check_snapshot_restore(model: &joshua::model::QuantizedModel, what: &str)
 
     let replay = |m: &mut joshua::model::QuantizedModel, upto: usize| {
         m.prefill_streamed(
-            &[
-                Chunk {
-                    tokens: &TURN1[..3],
-                    pos: 0,
-                },
-                Chunk {
-                    tokens: &TURN1[3..],
-                    pos: 3,
-                },
-            ],
+            &[Chunk { tokens: &TURN1[..3], pos: 0 }, Chunk { tokens: &TURN1[3..], pos: 3 }],
             &Device::Cpu,
         )
         .unwrap();
@@ -341,10 +297,7 @@ pub fn check_snapshot_restore(model: &joshua::model::QuantizedModel, what: &str)
         let want = continue_from(&mut reference, keep);
         for (label, snap) in [("restored", snap), ("duplicate", copy)] {
             let mut r = model.new_session().unwrap();
-            assert!(
-                r.restore_snapshot(snap).unwrap(),
-                "{what}: restore at {keep}"
-            );
+            assert!(r.restore_snapshot(snap).unwrap(), "{what}: restore at {keep}");
             let got = continue_from(&mut r, keep);
             for (w, g) in want.iter().zip(&got) {
                 assert_close(w, g, 1e-6, &format!("{what}: {label} snapshot at {keep}"));
@@ -770,59 +723,59 @@ pub fn write_tiny_llama_gguf_hd32(path: &Path) {
 /// trivial chat template shared by the tiny MoE fixtures.
 pub fn tiny_tokenizer_metadata() -> Vec<(String, gguf_file::Value)> {
     vec![
-        (
-            "tokenizer.ggml.eos_token_id".to_string(),
-            gguf_file::Value::U32(3),
+    (
+        "tokenizer.ggml.eos_token_id".to_string(),
+        gguf_file::Value::U32(3),
+    ),
+    (
+        "tokenizer.ggml.bos_token_id".to_string(),
+        gguf_file::Value::U32(3),
+    ),
+    (
+        "tokenizer.ggml.unknown_token_id".to_string(),
+        gguf_file::Value::U32(0),
+    ),
+    (
+        "tokenizer.ggml.model".to_string(),
+        gguf_file::Value::String("llama".to_string()),
+    ),
+    (
+        "tokenizer.ggml.tokens".to_string(),
+        gguf_file::Value::Array(
+            [
+                "<unk>", "hello", "world", "</s>", "a", "b", "c", "d", "e", "f", "g", "h", "i",
+                "j", "k", "l",
+            ]
+            .iter()
+            .map(|s| gguf_file::Value::String(s.to_string()))
+            .collect(),
         ),
-        (
-            "tokenizer.ggml.bos_token_id".to_string(),
-            gguf_file::Value::U32(3),
-        ),
-        (
-            "tokenizer.ggml.unknown_token_id".to_string(),
-            gguf_file::Value::U32(0),
-        ),
-        (
-            "tokenizer.ggml.model".to_string(),
-            gguf_file::Value::String("llama".to_string()),
-        ),
-        (
-            "tokenizer.ggml.tokens".to_string(),
-            gguf_file::Value::Array(
-                [
-                    "<unk>", "hello", "world", "</s>", "a", "b", "c", "d", "e", "f", "g", "h", "i",
-                    "j", "k", "l",
-                ]
-                .iter()
-                .map(|s| gguf_file::Value::String(s.to_string()))
+    ),
+    (
+        "tokenizer.ggml.scores".to_string(),
+        gguf_file::Value::Array(
+            (0..16)
+                .map(|i| gguf_file::Value::F32(-(i as f32)))
                 .collect(),
-            ),
         ),
-        (
-            "tokenizer.ggml.scores".to_string(),
-            gguf_file::Value::Array(
-                (0..16)
-                    .map(|i| gguf_file::Value::F32(-(i as f32)))
-                    .collect(),
-            ),
+    ),
+    (
+        "tokenizer.ggml.token_type".to_string(),
+        gguf_file::Value::Array(
+            [2, 1, 1, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+                .iter()
+                .map(|&t| gguf_file::Value::I32(t))
+                .collect(),
         ),
-        (
-            "tokenizer.ggml.token_type".to_string(),
-            gguf_file::Value::Array(
-                [2, 1, 1, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
-                    .iter()
-                    .map(|&t| gguf_file::Value::I32(t))
-                    .collect(),
-            ),
-        ),
-        (
-            "tokenizer.chat_template".to_string(),
-            gguf_file::Value::String(
-                "{% for message in messages %}hello {{ message.content }} \
+    ),
+    (
+        "tokenizer.chat_template".to_string(),
+        gguf_file::Value::String(
+            "{% for message in messages %}hello {{ message.content }} \
              {% endfor %}{% if add_generation_prompt %}world{% endif %}"
-                    .to_string(),
-            ),
+                .to_string(),
         ),
+    ),
     ]
 }
 
@@ -881,13 +834,7 @@ pub fn write_tiny_deepseek_gguf(path: &Path) {
 
 /// Shared body of the `deepseek` (`gqa`), `deepseek2` and `glm-dsa` (`dsa`)
 /// fixture writers.
-fn write_deepseek_family_gguf(
-    path: &Path,
-    gqa: bool,
-    split_mla: bool,
-    softmax_v2: bool,
-    dsa: bool,
-) {
+fn write_deepseek_family_gguf(path: &Path, gqa: bool, split_mla: bool, softmax_v2: bool, dsa: bool) {
     const VOCAB: usize = 16;
     const EMB: usize = 8;
     const H: usize = 2; // heads
@@ -971,11 +918,7 @@ fn write_deepseek_family_gguf(
             (key("attention.indexer.top_k"), u32v(3)),
             (
                 key("attention.indexer.types"),
-                gguf_file::Value::Array(
-                    (0..n_layer)
-                        .map(|i| gguf_file::Value::Bool(full(i)))
-                        .collect(),
-                ),
+                gguf_file::Value::Array((0..n_layer).map(|i| gguf_file::Value::Bool(full(i))).collect()),
             ),
         ]);
     }
@@ -1005,52 +948,28 @@ fn write_deepseek_family_gguf(
         let p = format!("blk.{i}");
         if i >= n_layer {
             // The NextN block: only its own inputs; never loaded.
-            tensors.push((
-                format!("{p}.nextn.eh_proj.weight"),
-                qtensor(next(EMB * 2 * EMB), &[EMB, 2 * EMB]),
-            ));
-            tensors.push((
-                format!("{p}.nextn.enorm.weight"),
-                qtensor(ones(EMB), &[EMB]),
-            ));
+            tensors.push((format!("{p}.nextn.eh_proj.weight"), qtensor(next(EMB * 2 * EMB), &[EMB, 2 * EMB])));
+            tensors.push((format!("{p}.nextn.enorm.weight"), qtensor(ones(EMB), &[EMB])));
             continue;
         }
         if dsa && full(i) {
             // Scaled up so the indexer's choice visibly moves the logits.
             let big = |w: Vec<f32>| w.into_iter().map(|x| x * 10.0).collect::<Vec<f32>>();
-            tensors.push((
-                format!("{p}.indexer.attn_q_b.weight"),
-                qtensor(big(next(IH * ID * LQ)), &[IH * ID, LQ]),
-            ));
-            tensors.push((
-                format!("{p}.indexer.attn_k.weight"),
-                qtensor(big(next(ID * EMB)), &[ID, EMB]),
-            ));
+            tensors.push((format!("{p}.indexer.attn_q_b.weight"), qtensor(big(next(IH * ID * LQ)), &[IH * ID, LQ])));
+            tensors.push((format!("{p}.indexer.attn_k.weight"), qtensor(big(next(ID * EMB)), &[ID, EMB])));
             tensors.push((
                 format!("{p}.indexer.k_norm.weight"),
                 qtensor(next(ID).iter().map(|x| 1.0 + 3.0 * x).collect(), &[ID]),
             ));
             tensors.push((format!("{p}.indexer.k_norm.bias"), qtensor(next(ID), &[ID])));
-            tensors.push((
-                format!("{p}.indexer.proj.weight"),
-                qtensor(big(next(IH * EMB)), &[IH, EMB]),
-            ));
+            tensors.push((format!("{p}.indexer.proj.weight"), qtensor(big(next(IH * EMB)), &[IH, EMB])));
         }
         tensors.push((format!("{p}.attn_norm.weight"), qtensor(ones(EMB), &[EMB])));
         tensors.push((format!("{p}.ffn_norm.weight"), qtensor(ones(EMB), &[EMB])));
         if gqa {
-            tensors.push((
-                format!("{p}.attn_q.weight"),
-                qtensor(next(H * KH * EMB), &[H * KH, EMB]),
-            ));
-            tensors.push((
-                format!("{p}.attn_k.weight"),
-                qtensor(next(KV * KH * EMB), &[KV * KH, EMB]),
-            ));
-            tensors.push((
-                format!("{p}.attn_v.weight"),
-                qtensor(next(KV * KH * EMB), &[KV * KH, EMB]),
-            ));
+            tensors.push((format!("{p}.attn_q.weight"), qtensor(next(H * KH * EMB), &[H * KH, EMB])));
+            tensors.push((format!("{p}.attn_k.weight"), qtensor(next(KV * KH * EMB), &[KV * KH, EMB])));
+            tensors.push((format!("{p}.attn_v.weight"), qtensor(next(KV * KH * EMB), &[KV * KH, EMB])));
             tensors.push((
                 format!("{p}.attn_output.weight"),
                 qtensor(next(EMB * H * KH), &[EMB, H * KH]),
@@ -1220,16 +1139,11 @@ pub fn write_tiny_glm5next_gguf(path: &Path, arch: &str) {
     let key = |s: &str| format!("{arch}.{s}");
     let arr = |v: Vec<gguf_file::Value>| gguf_file::Value::Array(v);
     let mut metadata: Vec<(String, gguf_file::Value)> = vec![
-        (
-            "general.architecture".to_string(),
-            gguf_file::Value::String(arch.to_string()),
-        ),
+        ("general.architecture".to_string(), gguf_file::Value::String(arch.to_string())),
         (key("attention.head_count"), u32v(H as u32)),
         (
             key("attention.head_count_kv"),
-            arr((0..=n_layer)
-                .map(|i| u32v(u32::from(i == n_layer || !recurrent(i))))
-                .collect()),
+            arr((0..=n_layer).map(|i| u32v(u32::from(i == n_layer || !recurrent(i)))).collect()),
         ),
         (key("block_count"), u32v(n_layer as u32 + 1)),
         (key("nextn_predict_layers"), u32v(1)),
@@ -1263,25 +1177,14 @@ pub fn write_tiny_glm5next_gguf(path: &Path, arch: &str) {
         (key("expert_weights_norm"), gguf_file::Value::Bool(true)),
         (key("expert_group_count"), u32v(2)),
         (key("expert_group_used_count"), u32v(1)),
-        (
-            key("swiglu_clamp_exp"),
-            arr((0..=n_layer).map(|_| f32v(0.1)).collect()),
-        ),
-        (
-            key("swiglu_clamp_shexp"),
-            arr((0..=n_layer).map(|_| f32v(0.15)).collect()),
-        ),
+        (key("swiglu_clamp_exp"), arr((0..=n_layer).map(|_| f32v(0.1)).collect())),
+        (key("swiglu_clamp_shexp"), arr((0..=n_layer).map(|_| f32v(0.15)).collect())),
     ];
     if with_types {
-        metadata.push((
-            key("attention.indexer.kpool_select_tail"),
-            gguf_file::Value::Bool(true),
-        ));
+        metadata.push((key("attention.indexer.kpool_select_tail"), gguf_file::Value::Bool(true)));
         metadata.push((
             key("attention.indexer.types"),
-            arr((0..n_layer)
-                .map(|i| gguf_file::Value::Bool(full(i)))
-                .collect()),
+            arr((0..n_layer).map(|i| gguf_file::Value::Bool(full(i))).collect()),
         ));
     }
     metadata.extend(tiny_tokenizer_metadata());
@@ -1294,18 +1197,9 @@ pub fn write_tiny_glm5next_gguf(path: &Path, arch: &str) {
     let gamma = |w: Vec<f32>| w.into_iter().map(|x| 1.0 + 3.0 * x).collect::<Vec<f32>>();
     let big = |w: Vec<f32>| w.into_iter().map(|x| x * 10.0).collect::<Vec<f32>>();
     let mut tensors: Vec<(String, QTensor)> = vec![
-        (
-            "token_embd.weight".to_string(),
-            qtensor(weights(VOCAB * EMB, 1), &[VOCAB, EMB]),
-        ),
-        (
-            "output_norm.weight".to_string(),
-            qtensor(gamma(next(EMB)), &[EMB]),
-        ),
-        (
-            "output.weight".to_string(),
-            qtensor(next(VOCAB * EMB), &[VOCAB, EMB]),
-        ),
+        ("token_embd.weight".to_string(), qtensor(weights(VOCAB * EMB, 1), &[VOCAB, EMB])),
+        ("output_norm.weight".to_string(), qtensor(gamma(next(EMB)), &[EMB])),
+        ("output.weight".to_string(), qtensor(next(VOCAB * EMB), &[VOCAB, EMB])),
     ];
     for i in 0..=n_layer {
         let p = format!("blk.{i}");
@@ -1320,36 +1214,20 @@ pub fn write_tiny_glm5next_gguf(path: &Path, arch: &str) {
         push("ffn_norm.weight", gamma(next(EMB)), &[EMB]);
         let mix = (2 + HC) * HC;
         for m in ["hc_attn", "hc_ffn"] {
-            push(
-                &format!("{m}_fn.weight"),
-                big(next(mix * HC * EMB)),
-                &[mix, HC * EMB],
-            );
+            push(&format!("{m}_fn.weight"), big(next(mix * HC * EMB)), &[mix, HC * EMB]);
             push(&format!("{m}_base.weight"), big(next(mix)), &[mix]);
             push(&format!("{m}_scale.weight"), gamma(next(3)), &[3]);
         }
         if recurrent(i) {
             for c in ["q", "k", "v"] {
-                push(
-                    &format!("attn_{c}.weight"),
-                    big(next(INNER * EMB)),
-                    &[INNER, EMB],
-                );
-                push(
-                    &format!("ssm_conv1d_{c}.weight"),
-                    big(next(INNER * CONV)),
-                    &[1, INNER, 1, CONV],
-                );
+                push(&format!("attn_{c}.weight"), big(next(INNER * EMB)), &[INNER, EMB]);
+                push(&format!("ssm_conv1d_{c}.weight"), big(next(INNER * CONV)), &[1, INNER, 1, CONV]);
             }
             push("ssm_f_a.weight", big(next(KD * EMB)), &[KD, EMB]);
             push("ssm_f_b.weight", big(next(INNER * KD)), &[INNER, KD]);
             push("ssm_dt.bias", next(INNER), &[INNER]);
             // −exp(A_log), as the converters store it.
-            push(
-                "ssm_a",
-                next(H).iter().map(|x| -(1.0 + 10.0 * x.abs())).collect(),
-                &[H],
-            );
+            push("ssm_a", next(H).iter().map(|x| -(1.0 + 10.0 * x.abs())).collect(), &[H]);
             push("ssm_beta.weight", big(next(H * EMB)), &[H, EMB]);
             push("ssm_g_a.weight", big(next(KD * EMB)), &[KD, EMB]);
             push("ssm_g_b.weight", big(next(INNER * KD)), &[INNER, KD]);
@@ -1365,25 +1243,13 @@ pub fn write_tiny_glm5next_gguf(path: &Path, arch: &str) {
             push("attn_v_b.weight", next(H * VH * LKV), &[H, VH, LKV]);
             push("attn_output.weight", next(EMB * H * VH), &[EMB, H * VH]);
             if full(i) {
-                push(
-                    "indexer.attn_q_b.weight",
-                    big(next(IH * ID * LQ)),
-                    &[IH * ID, LQ],
-                );
+                push("indexer.attn_q_b.weight", big(next(IH * ID * LQ)), &[IH * ID, LQ]);
                 push("indexer.attn_k.weight", big(next(ID * EMB)), &[ID, EMB]);
                 push("indexer.k_norm.weight", gamma(next(ID)), &[ID]);
                 push("indexer.k_norm.bias", next(ID), &[ID]);
                 push("indexer.proj.weight", big(next(IH * EMB)), &[IH, EMB]);
-                push(
-                    "indexer_compressor_gate.weight",
-                    big(next(ID * EMB)),
-                    &[ID, EMB],
-                );
-                push(
-                    "indexer_compressor_ape.weight",
-                    big(next(KPOOL * ID)),
-                    &[KPOOL, ID],
-                );
+                push("indexer_compressor_gate.weight", big(next(ID * EMB)), &[ID, EMB]);
+                push("indexer_compressor_ape.weight", big(next(KPOOL * ID)), &[KPOOL, ID]);
             }
         }
         if i == 0 {
@@ -1393,29 +1259,16 @@ pub fn write_tiny_glm5next_gguf(path: &Path, arch: &str) {
         } else {
             push("ffn_gate_inp.weight", next(NE * EMB), &[NE, EMB]);
             push("exp_probs_b.bias", next(NE), &[NE]);
-            push(
-                "ffn_gate_exps.weight",
-                big(next(NE * NFE * EMB)),
-                &[NE, NFE, EMB],
-            );
-            push(
-                "ffn_up_exps.weight",
-                big(next(NE * NFE * EMB)),
-                &[NE, NFE, EMB],
-            );
-            push(
-                "ffn_down_exps.weight",
-                next(NE * EMB * NFE),
-                &[NE, EMB, NFE],
-            );
+            push("ffn_gate_exps.weight", big(next(NE * NFE * EMB)), &[NE, NFE, EMB]);
+            push("ffn_up_exps.weight", big(next(NE * NFE * EMB)), &[NE, NFE, EMB]);
+            push("ffn_down_exps.weight", next(NE * EMB * NFE), &[NE, EMB, NFE]);
             push("ffn_gate_shexp.weight", big(next(NFE * EMB)), &[NFE, EMB]);
             push("ffn_up_shexp.weight", big(next(NFE * EMB)), &[NFE, EMB]);
             push("ffn_down_shexp.weight", next(EMB * NFE), &[EMB, NFE]);
         }
     }
 
-    let metadata_refs: Vec<(&str, &gguf_file::Value)> =
-        metadata.iter().map(|(k, v)| (k.as_str(), v)).collect();
+    let metadata_refs: Vec<(&str, &gguf_file::Value)> = metadata.iter().map(|(k, v)| (k.as_str(), v)).collect();
     let tensor_refs: Vec<(&str, &QTensor)> = tensors.iter().map(|(k, v)| (k.as_str(), v)).collect();
     let mut file = File::create(path).unwrap();
     gguf_file::write(&mut file, &metadata_refs, &tensor_refs).unwrap();
@@ -1463,18 +1316,11 @@ pub fn write_tiny_kimi_gguf(path: &Path, arch: &str, mxfp4: bool) {
     let f32v = gguf_file::Value::F32;
     let key = |s: &str| format!("{arch}.{s}");
     let mut metadata: Vec<(String, gguf_file::Value)> = vec![
-        (
-            "general.architecture".to_string(),
-            gguf_file::Value::String(arch.to_string()),
-        ),
+        ("general.architecture".to_string(), gguf_file::Value::String(arch.to_string())),
         (key("attention.head_count"), u32v(H as u32)),
         (
             key("attention.head_count_kv"),
-            gguf_file::Value::Array(
-                (0..n_layer)
-                    .map(|i| u32v(if recurrent(i) { 0 } else { H as u32 }))
-                    .collect(),
-            ),
+            gguf_file::Value::Array((0..n_layer).map(|i| u32v(if recurrent(i) { 0 } else { H as u32 })).collect()),
         ),
         (key("block_count"), u32v(n_layer as u32)),
         (key("embedding_length"), u32v(EMB as u32)),
@@ -1521,11 +1367,7 @@ pub fn write_tiny_kimi_gguf(path: &Path, arch: &str, mxfp4: bool) {
         RawTensor::f32("output.weight", next(VOCAB * EMB), &[VOCAB, EMB]),
     ];
     if k3 {
-        tensors.push(RawTensor::f32(
-            "output_res_score.weight",
-            big(next(EMB)),
-            &[EMB],
-        ));
+        tensors.push(RawTensor::f32("output_res_score.weight", big(next(EMB)), &[EMB]));
     }
     // A routed-expert stack `[NE, rows, cols]`: random MXFP4 blocks, or
     // their exact f32 decode.
@@ -1533,11 +1375,7 @@ pub fn write_tiny_kimi_gguf(path: &Path, arch: &str, mxfp4: bool) {
     let mut experts = |name: String, rows: usize, cols: usize| {
         expert_seed += 1;
         if !k3 {
-            return RawTensor::f32(
-                &name,
-                weights(NE * rows * cols, expert_seed * 31),
-                &[NE, rows, cols],
-            );
+            return RawTensor::f32(&name, weights(NE * rows * cols, expert_seed * 31), &[NE, rows, cols]);
         }
         let n_blocks = NE * rows * cols / 32;
         let bytes = weights(n_blocks * 17, expert_seed * 31);
@@ -1555,10 +1393,7 @@ pub fn write_tiny_kimi_gguf(path: &Path, arch: &str, mxfp4: bool) {
                 name,
                 dtype: GGML_TYPE_MXFP4,
                 dims: vec![NE, rows, cols],
-                data: blocks
-                    .iter()
-                    .flat_map(|b| std::iter::once(b.e).chain(b.qs))
-                    .collect(),
+                data: blocks.iter().flat_map(|b| std::iter::once(b.e).chain(b.qs)).collect(),
             }
         } else {
             let decoded = blocks
@@ -1585,31 +1420,15 @@ pub fn write_tiny_kimi_gguf(path: &Path, arch: &str, mxfp4: bool) {
         }
         if recurrent(i) {
             if !k3 && i == 3 {
-                push(
-                    "attn_qkv.weight",
-                    big(next(3 * INNER * EMB)),
-                    &[3 * INNER, EMB],
-                );
+                push("attn_qkv.weight", big(next(3 * INNER * EMB)), &[3 * INNER, EMB]);
             } else {
                 for c in ["q", "k", "v"] {
-                    push(
-                        &format!("attn_{c}.weight"),
-                        big(next(INNER * EMB)),
-                        &[INNER, EMB],
-                    );
+                    push(&format!("attn_{c}.weight"), big(next(INNER * EMB)), &[INNER, EMB]);
                 }
             }
-            let conv: &[usize] = if k3 {
-                &[INNER, 1, CONV]
-            } else {
-                &[1, INNER, 1, CONV]
-            };
+            let conv: &[usize] = if k3 { &[INNER, 1, CONV] } else { &[1, INNER, 1, CONV] };
             for c in ["q", "k", "v"] {
-                push(
-                    &format!("ssm_conv1d_{c}.weight"),
-                    big(next(INNER * CONV)),
-                    conv,
-                );
+                push(&format!("ssm_conv1d_{c}.weight"), big(next(INNER * CONV)), conv);
             }
             push("ssm_f_a.weight", big(next(KD * EMB)), &[KD, EMB]);
             push("ssm_f_b.weight", big(next(INNER * KD)), &[INNER, KD]);
@@ -1636,18 +1455,10 @@ pub fn write_tiny_kimi_gguf(path: &Path, arch: &str, mxfp4: bool) {
             } else {
                 push("attn_q.weight", big(next(qd * EMB)), &[qd, EMB]);
             }
-            push(
-                "attn_kv_a_mqa.weight",
-                big(next((LKV + R) * EMB)),
-                &[LKV + R, EMB],
-            );
+            push("attn_kv_a_mqa.weight", big(next((LKV + R) * EMB)), &[LKV + R, EMB]);
             push("attn_kv_a_norm.weight", gamma(next(LKV)), &[LKV]);
             if !k3 && i == 2 {
-                push(
-                    "attn_kv_b.weight",
-                    big(next(H * (NP + VH) * LKV)),
-                    &[H * (NP + VH), LKV],
-                );
+                push("attn_kv_b.weight", big(next(H * (NP + VH) * LKV)), &[H * (NP + VH), LKV]);
             } else {
                 push("attn_k_b.weight", big(next(H * LKV * NP)), &[H, LKV, NP]);
                 push("attn_v_b.weight", next(H * VH * LKV), &[H, VH, LKV]);
@@ -1726,20 +1537,12 @@ pub fn write_tiny_qwen3_quantized_layers(path: &Path, layers: usize) {
     write_tiny_qwen_layers::<32, 64>(path, "qwen3", Some(layers), true, false);
 }
 
-fn write_tiny_qwen_layers<const EMB: usize, const NFF: usize>(
-    path: &Path,
-    arch: &str,
-    layers: Option<usize>,
-    quantized: bool,
-    mtp: bool,
-) {
+fn write_tiny_qwen_layers<const EMB: usize, const NFF: usize>(path: &Path, arch: &str, layers: Option<usize>, quantized: bool, mtp: bool) {
     let qtensor = |data: Vec<f32>, shape: &[usize]| {
         if quantized && shape.len() > 1 {
             let t = Tensor::from_vec(data, shape, &Device::Cpu).unwrap();
             QTensor::quantize(&t, GgmlDType::Q8_0).unwrap()
-        } else {
-            self::qtensor(data, shape)
-        }
+        } else { self::qtensor(data, shape) }
     };
     const VOCAB: usize = 16;
     const NE: usize = 4; // experts
@@ -1757,11 +1560,7 @@ fn write_tiny_qwen_layers<const EMB: usize, const NFF: usize>(
     let glm = matches!(arch, "chatglm" | "glm4" | "glm4moe");
     let fused_ffn = matches!(arch, "chatglm" | "glm4");
     let sandwich = arch == "glm4";
-    let nextn = if mtp || matches!(arch, "glm4" | "glm4moe") {
-        1
-    } else {
-        0
-    };
+    let nextn = if mtp || matches!(arch, "glm4" | "glm4moe") { 1 } else { 0 };
     let leading_dense = if arch == "glm4moe" { 1 } else { 0 };
     let shared_expert = matches!(arch, "qwen2moe" | "qwen3next" | "qwen35moe" | "qwen4exp");
     // qwen4exp: hyper-connections (2 streams, rank 3), QSA on the attention
@@ -1776,9 +1575,7 @@ fn write_tiny_qwen_layers<const EMB: usize, const NFF: usize>(
     let fused_qkv = arch == "qwen" || arch == "chatglm";
     let h = 2usize;
     let kv = if arch == "qwen" { 2 } else { 1 };
-    let hd = if quantized {
-        32
-    } else if arch == "qwen3moe" || arch == "qwen" || arch == "qwen2moe" {
+    let hd = if quantized { 32 } else if arch == "qwen3moe" || arch == "qwen" || arch == "qwen2moe" {
         4
     } else {
         8
@@ -1845,12 +1642,8 @@ fn write_tiny_qwen_layers<const EMB: usize, const NFF: usize>(
     }
     if hyper {
         // Python int lists convert to I32 arrays; the hash constants are U64.
-        let i32s = |v: &[i32]| {
-            gguf_file::Value::Array(v.iter().map(|&x| gguf_file::Value::I32(x)).collect())
-        };
-        let u64s = |v: &[u64]| {
-            gguf_file::Value::Array(v.iter().map(|&x| gguf_file::Value::U64(x)).collect())
-        };
+        let i32s = |v: &[i32]| gguf_file::Value::Array(v.iter().map(|&x| gguf_file::Value::I32(x)).collect());
+        let u64s = |v: &[u64]| gguf_file::Value::Array(v.iter().map(|&x| gguf_file::Value::U64(x)).collect());
         metadata.extend([
             (key("hyper_connection.count"), u32v(hc as u32)),
             (key("hyper_connection.low_rank"), u32v(hc_rank as u32)),
@@ -1863,16 +1656,10 @@ fn write_tiny_qwen_layers<const EMB: usize, const NFF: usize>(
             (key("ple.heads_per_ngram"), u32v(2)),
             (key("ple.conv_kernel"), u32v(ple_kernel as u32)),
             (key("ple.eos_token_id"), u32v(3)),
-            (
-                key("ple.layer_multipliers"),
-                u64s(&[3, 1_000_003, 24_000_000_000_017]),
-            ),
+            (key("ple.layer_multipliers"), u64s(&[3, 1_000_003, 24_000_000_000_017])),
             (key("ple.head_offsets"), u64s(&[0, 10, 20, 30])),
             (key("ple.head_vocab_sizes"), u64s(&[10, 9, 10, 7])),
-            (
-                key("embedding_length_per_layer_input"),
-                u32v(ple_dim as u32),
-            ),
+            (key("embedding_length_per_layer_input"), u32v(ple_dim as u32)),
         ]);
     }
     let sections = |s: [u32; 4]| {
@@ -1927,30 +1714,12 @@ fn write_tiny_qwen_layers<const EMB: usize, const NFF: usize>(
     let q_dim = h * hd * if hybrid { 2 } else { 1 };
     if hyper {
         let wide = hc * EMB;
-        tensors.push((
-            "output_hc_norm.weight".to_string(),
-            qtensor(gamma(next(wide)), &[hc, EMB]),
-        ));
-        tensors.push((
-            "output_hc_down.weight".to_string(),
-            qtensor(
-                next(hc_rank * wide).iter().map(|x| x * 10.0).collect(),
-                &[hc_rank, wide],
-            ),
-        ));
-        tensors.push((
-            "output_hc_up.weight".to_string(),
-            qtensor(
-                next(wide * hc_rank).iter().map(|x| x * 10.0).collect(),
-                &[wide, hc_rank],
-            ),
-        ));
+        tensors.push(("output_hc_norm.weight".to_string(), qtensor(gamma(next(wide)), &[hc, EMB])));
+        tensors.push(("output_hc_down.weight".to_string(), qtensor(next(hc_rank * wide).iter().map(|x| x * 10.0).collect(), &[hc_rank, wide])));
+        tensors.push(("output_hc_up.weight".to_string(), qtensor(next(wide * hc_rank).iter().map(|x| x * 10.0).collect(), &[wide, hc_rank])));
         tensors.push((
             "per_layer_token_embd.weight".to_string(),
-            qtensor(
-                next(ple_rows * ple_dim).iter().map(|x| x * 10.0).collect(),
-                &[ple_rows, ple_dim],
-            ),
+            qtensor(next(ple_rows * ple_dim).iter().map(|x| x * 10.0).collect(), &[ple_rows, ple_dim]),
         ));
     }
     for i in 0..n_layer + nextn {
@@ -1971,65 +1740,25 @@ fn write_tiny_qwen_layers<const EMB: usize, const NFF: usize>(
             let wide = hc * EMB;
             for m in ["hc_attn", "hc_ffn"] {
                 push(&format!("{m}_norm.weight"), gamma(next(wide)), &[hc, EMB]);
-                push(
-                    &format!("{m}_down.weight"),
-                    next(hc_rank * wide).iter().map(|x| x * 10.0).collect(),
-                    &[hc_rank, wide],
-                );
-                push(
-                    &format!("{m}_up.weight"),
-                    next(wide * hc_rank).iter().map(|x| x * 10.0).collect(),
-                    &[wide, hc_rank],
-                );
-                push(
-                    &format!("{m}_inject.weight"),
-                    next(hc * wide).iter().map(|x| x * 10.0).collect(),
-                    &[hc, wide],
-                );
+                push(&format!("{m}_down.weight"), next(hc_rank * wide).iter().map(|x| x * 10.0).collect(), &[hc_rank, wide]);
+                push(&format!("{m}_up.weight"), next(wide * hc_rank).iter().map(|x| x * 10.0).collect(), &[wide, hc_rank]);
+                push(&format!("{m}_inject.weight"), next(hc * wide).iter().map(|x| x * 10.0).collect(), &[hc, wide]);
             }
             if i == 0 {
-                push(
-                    "ple_key.weight",
-                    next(wide * EMB).iter().map(|x| x * 10.0).collect(),
-                    &[wide, EMB],
-                );
-                push(
-                    "ple_value.weight",
-                    next(EMB * EMB).iter().map(|x| x * 10.0).collect(),
-                    &[EMB, EMB],
-                );
+                push("ple_key.weight", next(wide * EMB).iter().map(|x| x * 10.0).collect(), &[wide, EMB]);
+                push("ple_value.weight", next(EMB * EMB).iter().map(|x| x * 10.0).collect(), &[EMB, EMB]);
                 for n in ["ple_norm_key", "ple_norm_query", "ple_norm_conv"] {
                     push(&format!("{n}.weight"), gamma(next(wide)), &[hc, EMB]);
                 }
-                push(
-                    "ple_conv1d.weight",
-                    next(wide * ple_kernel).iter().map(|x| x * 10.0).collect(),
-                    &[wide, ple_kernel],
-                );
+                push("ple_conv1d.weight", next(wide * ple_kernel).iter().map(|x| x * 10.0).collect(), &[wide, ple_kernel]);
             } else {
-                push(
-                    "indexer.q_proj.weight",
-                    next(idx_heads * idx_dim * EMB)
-                        .iter()
-                        .map(|x| x * 10.0)
-                        .collect(),
-                    &[idx_heads * idx_dim, EMB],
-                );
-                push(
-                    "indexer.k_proj.weight",
-                    next(idx_dim * EMB).iter().map(|x| x * 10.0).collect(),
-                    &[idx_dim, EMB],
-                );
+                push("indexer.q_proj.weight", next(idx_heads * idx_dim * EMB).iter().map(|x| x * 10.0).collect(), &[idx_heads * idx_dim, EMB]);
+                push("indexer.k_proj.weight", next(idx_dim * EMB).iter().map(|x| x * 10.0).collect(), &[idx_dim, EMB]);
                 push("indexer.q_norm.weight", gamma(next(idx_dim)), &[idx_dim]);
                 push("indexer.k_norm.weight", gamma(next(idx_dim)), &[idx_dim]);
             }
         } else if sandwich {
-            for n in [
-                "attn_norm",
-                "post_attention_norm",
-                "ffn_norm",
-                "post_ffw_norm",
-            ] {
+            for n in ["attn_norm", "post_attention_norm", "ffn_norm", "post_ffw_norm"] {
                 push(&format!("{n}.weight"), gamma(next(EMB)), &[EMB]);
             }
         } else {
@@ -2092,11 +1821,7 @@ fn write_tiny_qwen_layers<const EMB: usize, const NFF: usize>(
         if moe && i >= leading_dense {
             push("ffn_gate_inp.weight", next(NE * EMB), &[NE, EMB]);
             if arch == "glm4moe" {
-                push(
-                    "exp_probs_b.bias",
-                    next(NE).iter().map(|x| x * 3.0).collect(),
-                    &[NE],
-                );
+                push("exp_probs_b.bias", next(NE).iter().map(|x| x * 3.0).collect(), &[NE]);
             }
             push(
                 "ffn_gate_exps.weight",
@@ -2784,9 +2509,7 @@ pub fn write_tiny_deepseek4_gguf_opts(path: &Path, opts: TinyDeepseek4Opts) {
     let engram_primes: [u64; 4] = [5, 7, 11, 13];
     let engram_rows = engram_primes.iter().sum::<u64>() as usize;
     if v41 {
-        let u64s = |v: &[u64]| {
-            gguf_file::Value::Array(v.iter().map(|&x| gguf_file::Value::U64(x)).collect())
-        };
+        let u64s = |v: &[u64]| gguf_file::Value::Array(v.iter().map(|&x| gguf_file::Value::U64(x)).collect());
         let offsets: Vec<u64> = engram_primes
             .iter()
             .scan(0, |acc, &p| {
@@ -2797,27 +2520,17 @@ pub fn write_tiny_deepseek4_gguf_opts(path: &Path, opts: TinyDeepseek4Opts) {
             .collect();
         metadata.extend([
             (key("attention.compress_rope_freq_base"), f32v(40_000.0)),
-            (
-                key("engram.layer_ids"),
-                gguf_file::Value::Array(vec![gguf_file::Value::I32(1)]),
-            ),
+            (key("engram.layer_ids"), gguf_file::Value::Array(vec![gguf_file::Value::I32(1)])),
             (key("engram.head_count"), u32v(2)),
             (key("engram.key_length"), u32v(ENGRAM_KEY as u32)),
             (key("engram.max_ngram_size"), u32v(3)),
-            (
-                key("engram.multipliers"),
-                u64s(&[1_000_003, 2_000_029, 3_000_017]),
-            ),
+            (key("engram.multipliers"), u64s(&[1_000_003, 2_000_029, 3_000_017])),
             (key("engram.primes"), u64s(&engram_primes)),
             (key("engram.offsets"), u64s(&offsets)),
             // Case folding: tokens 4..=15 map pairwise onto one id.
             (
                 key("engram.token_map"),
-                gguf_file::Value::Array(
-                    (0..VOCAB as i32)
-                        .map(|t| gguf_file::Value::I32(if t < 4 { t } else { 4 + (t - 4) / 2 }))
-                        .collect(),
-                ),
+                gguf_file::Value::Array((0..VOCAB as i32).map(|t| gguf_file::Value::I32(if t < 4 { t } else { 4 + (t - 4) / 2 })).collect()),
             ),
             (key("engram.pad_id"), u32v(2)),
         ]);
@@ -2829,10 +2542,7 @@ pub fn write_tiny_deepseek4_gguf_opts(path: &Path, opts: TinyDeepseek4Opts) {
     let mut ones = |n: usize| {
         norm_seed += 1;
         if v41 {
-            weights(n, norm_seed)
-                .iter()
-                .map(|w| 1.0 + 3.0 * w)
-                .collect()
+            weights(n, norm_seed).iter().map(|w| 1.0 + 3.0 * w).collect()
         } else {
             vec![1.0f32; n]
         }
@@ -2848,11 +2558,7 @@ pub fn write_tiny_deepseek4_gguf_opts(path: &Path, opts: TinyDeepseek4Opts) {
         RawTensor::f32("output_norm.weight", ones(EMB), &[EMB]),
     ];
     if v41 {
-        tensors.push(RawTensor::f16(
-            "output.weight",
-            weights(VOCAB * EMB, 2),
-            &[VOCAB, EMB],
-        ));
+        tensors.push(RawTensor::f16("output.weight", weights(VOCAB * EMB, 2), &[VOCAB, EMB]));
     } else {
         tensors.extend([
             RawTensor::f16(
@@ -2978,16 +2684,8 @@ pub fn write_tiny_deepseek4_gguf_opts(path: &Path, opts: TinyDeepseek4Opts) {
                     next((HC + 1) * EMB * n_cols * ENGRAM_KEY),
                     &[(HC + 1) * EMB, n_cols * ENGRAM_KEY],
                 ));
-                tensors.push(RawTensor::f32(
-                    &format!("{p}.engram_q.weight"),
-                    ones(HC * EMB),
-                    &[HC, EMB],
-                ));
-                tensors.push(RawTensor::f32(
-                    &format!("{p}.engram_k.weight"),
-                    ones(HC * EMB),
-                    &[HC, EMB],
-                ));
+                tensors.push(RawTensor::f32(&format!("{p}.engram_q.weight"), ones(HC * EMB), &[HC, EMB]));
+                tensors.push(RawTensor::f32(&format!("{p}.engram_k.weight"), ones(HC * EMB), &[HC, EMB]));
             }
         }
 
@@ -3160,11 +2858,7 @@ pub fn write_tiny_deepseek4_gguf_opts(path: &Path, opts: TinyDeepseek4Opts) {
             next(hc_out),
             &[hc_out],
         ));
-        let hc_scale = if v41 {
-            vec![0.7, 1.3, 0.9]
-        } else {
-            vec![1.0, 1.0, 1.0]
-        };
+        let hc_scale = if v41 { vec![0.7, 1.3, 0.9] } else { vec![1.0, 1.0, 1.0] };
         tensors.push(RawTensor::f32(
             &format!("{p}.hc_attn_scale.weight"),
             hc_scale.clone(),
@@ -3228,20 +2922,14 @@ pub fn write_tiny_bonsai_gguf(path: &Path, weights_as: BonsaiWeights) {
     let key = |s: &str| format!("{arch}.{s}");
     let u32v = gguf_file::Value::U32;
     let metadata = vec![
-        (
-            "general.architecture".to_string(),
-            gguf_file::Value::String(arch.into()),
-        ),
+        ("general.architecture".to_string(), gguf_file::Value::String(arch.into())),
         (key("attention.head_count"), u32v(h as u32)),
         (key("attention.head_count_kv"), u32v(kv as u32)),
         (key("block_count"), u32v(n_layer as u32)),
         (key("embedding_length"), u32v(EMB as u32)),
         (key("feed_forward_length"), u32v(NFF as u32)),
         (key("context_length"), u32v(512)),
-        (
-            key("attention.layer_norm_rms_epsilon"),
-            gguf_file::Value::F32(1e-6),
-        ),
+        (key("attention.layer_norm_rms_epsilon"), gguf_file::Value::F32(1e-6)),
         (key("attention.key_length"), u32v(HD as u32)),
         (key("rope.freq_base"), gguf_file::Value::F32(1_000_000.0)),
     ];
@@ -3285,33 +2973,13 @@ pub fn write_tiny_bonsai_gguf(path: &Path, weights_as: BonsaiWeights) {
     }
     matrix("output.weight".into(), &[VOCAB, EMB], false);
     let norm = |name: String, n: usize, seed: u32| {
-        RawTensor::f32(
-            &name,
-            weights(n, seed).iter().map(|v| 1.0 + 5.0 * v).collect(),
-            &[n],
-        )
+        RawTensor::f32(&name, weights(n, seed).iter().map(|v| 1.0 + 5.0 * v).collect(), &[n])
     };
     for l in 0..n_layer {
-        tensors.push(norm(
-            format!("blk.{l}.attn_norm.weight"),
-            EMB,
-            101 + l as u32,
-        ));
-        tensors.push(norm(
-            format!("blk.{l}.ffn_norm.weight"),
-            EMB,
-            201 + l as u32,
-        ));
-        tensors.push(norm(
-            format!("blk.{l}.attn_q_norm.weight"),
-            HD,
-            301 + l as u32,
-        ));
-        tensors.push(norm(
-            format!("blk.{l}.attn_k_norm.weight"),
-            HD,
-            401 + l as u32,
-        ));
+        tensors.push(norm(format!("blk.{l}.attn_norm.weight"), EMB, 101 + l as u32));
+        tensors.push(norm(format!("blk.{l}.ffn_norm.weight"), EMB, 201 + l as u32));
+        tensors.push(norm(format!("blk.{l}.attn_q_norm.weight"), HD, 301 + l as u32));
+        tensors.push(norm(format!("blk.{l}.attn_k_norm.weight"), HD, 401 + l as u32));
     }
     tensors.push(norm("output_norm.weight".into(), EMB, 501));
     write_raw_gguf(path, &metadata, &tensors);
@@ -3343,20 +3011,14 @@ pub fn write_tiny_raw_format_gguf(path: &Path, arch: &str, dtype: u32, decoded: 
     let key = |s: &str| format!("{arch}.{s}");
     let u32v = gguf_file::Value::U32;
     let mut metadata = vec![
-        (
-            "general.architecture".to_string(),
-            gguf_file::Value::String(arch.into()),
-        ),
+        ("general.architecture".to_string(), gguf_file::Value::String(arch.into())),
         (key("attention.head_count"), u32v(h as u32)),
         (key("attention.head_count_kv"), u32v(kv as u32)),
         (key("block_count"), u32v(1)),
         (key("embedding_length"), u32v(EMB as u32)),
         (key("feed_forward_length"), u32v(NFF as u32)),
         (key("context_length"), u32v(512)),
-        (
-            key("attention.layer_norm_rms_epsilon"),
-            gguf_file::Value::F32(1e-5),
-        ),
+        (key("attention.layer_norm_rms_epsilon"), gguf_file::Value::F32(1e-5)),
         (key("attention.key_length"), u32v(HD as u32)),
         (key("rope.dimension_count"), u32v(HD as u32)),
         (key("rope.freq_base"), gguf_file::Value::F32(10_000.0)),
@@ -3374,12 +3036,7 @@ pub fn write_tiny_raw_format_gguf(path: &Path, arch: &str, dtype: u32, decoded: 
                 joshua::with_raw_block!(dtype, B => joshua::raw_block::decode_bytes::<B>(&bytes, n).unwrap()).unwrap();
             RawTensor::f32(name, values, dims)
         } else {
-            RawTensor {
-                name: name.into(),
-                dtype,
-                dims: dims.to_vec(),
-                data: bytes,
-            }
+            RawTensor { name: name.into(), dtype, dims: dims.to_vec(), data: bytes }
         }
     };
     let mut tensors = vec![
@@ -3394,11 +3051,7 @@ pub fn write_tiny_raw_format_gguf(path: &Path, arch: &str, dtype: u32, decoded: 
         matrix("blk.0.ffn_down.weight", &[EMB, NFF]),
     ];
     let norm = |name: &str, n: usize, seed: u32| {
-        RawTensor::f32(
-            name,
-            weights(n, seed).iter().map(|v| 1.0 + 5.0 * v).collect(),
-            &[n],
-        )
+        RawTensor::f32(name, weights(n, seed).iter().map(|v| 1.0 + 5.0 * v).collect(), &[n])
     };
     tensors.push(norm("output_norm.weight", EMB, 11));
     tensors.push(norm("blk.0.attn_norm.weight", EMB, 12));

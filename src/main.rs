@@ -355,7 +355,7 @@ enum Commands {
         /// unchanged.  Replaces --speculative's prompt lookup on a model with
         /// the block and is ignored with a warning on one without.  Every
         /// forward pass also runs through the block (one more layer).  `0`
-        /// (the default) disables it; JOSHUA_NO_MTP=1 skips loading the block.
+        /// (the default) disables it and skips loading the block.
         #[arg(long, env = "JOSHUA_MTP", default_value_t = 0, hide_default_value = true)]
         mtp: usize,
         /// Lock the always-touched weights into RAM (mlock).  Needs the
@@ -597,7 +597,7 @@ enum Commands {
         /// unchanged.  Replaces --speculative's prompt lookup on a model with
         /// the block and is ignored with a warning on one without.  Every
         /// forward pass also runs through the block (one more layer).  `0`
-        /// (the default) disables it; JOSHUA_NO_MTP=1 skips loading the block.
+        /// (the default) disables it and skips loading the block.
         #[arg(long, env = "JOSHUA_MTP", default_value_t = 0, hide_default_value = true)]
         mtp: usize,
         /// Lock the always-touched weights into RAM (mlock).  Needs the

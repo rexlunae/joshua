@@ -23,7 +23,7 @@ fn mtp_model(arch: &str, test: &str) -> QuantizedModel {
         "glm4" | "glm4moe" => common::write_tiny_qwen_gguf(&path, arch),
         _ => common::write_tiny_qwen_mtp_gguf(&path, arch),
     }
-    let mut m = common::load_model(&path, true);
+    let mut m = joshua::quantized_qwen::with_mtp_block(|| common::load_model(&path, true));
     assert!(m.set_mtp(true), "{arch}: the NextN block loads");
     m
 }
@@ -197,4 +197,14 @@ fn models_without_a_nextn_block_do_not_draft() {
     assert!(!m.mtp_enabled());
     logits(&mut m, &PROMPT, 0);
     assert!(m.mtp_draft(NEXT, PROMPT.len(), 3).unwrap().is_empty());
+}
+
+#[test]
+fn the_nextn_block_is_not_loaded_unless_asked_for() {
+    let dir = common::model_dir("mtp-unasked-qwen3moe");
+    let path = dir.join("model.gguf");
+    common::write_tiny_qwen_mtp_gguf(&path, "qwen3moe");
+    let mut m = common::load_model(&path, true);
+    assert!(!m.set_mtp(true), "loaded outside with_mtp_block");
+    assert!(m.mtp_draft(NEXT, 0, 3).unwrap().is_empty());
 }
