@@ -1171,9 +1171,12 @@ impl StreamState {
                 }
                 None => {
                     // A clean close before `[DONE]` is still an incomplete
-                    // answer: drop any unfinished event and say so.
+                    // answer: drop any unfinished event and say so, and keep
+                    // the worker out of rotation until its next good probe.
                     self.body = None;
                     self.outcome = "worker_lost";
+                    self.slot.coordinator.workers[self.slot.index]
+                        .mark_unhealthy("stream closed before [DONE]".to_string());
                     return Some(Bytes::from_static(MID_STREAM_ERROR));
                 }
             }

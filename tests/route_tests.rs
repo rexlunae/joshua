@@ -912,7 +912,7 @@ async fn a_silent_worker_times_out_and_frees_its_slot() {
 async fn a_stream_closed_without_done_ends_with_worker_lost() {
     let (_, url) = spawn_fake("a", "m", 4, Behavior::CloseWithoutDone).await;
     let (spare, spare_url) = spawn_fake("spare", "m", 1, Behavior::Echo).await;
-    let (_, router) = spawn_router(config(&[&url, &spare_url])).await;
+    let (coordinator, router) = spawn_router(config(&[&url, &spare_url])).await;
 
     let res = chat(&router, json!({"messages": [], "stream": true})).await;
     assert_eq!(res.status, StatusCode::OK);
@@ -928,6 +928,17 @@ async fn a_stream_closed_without_done_ends_with_worker_lost() {
     assert_eq!(err["error"]["code"], "worker_lost");
     assert!(!text.contains("[DONE]"));
     assert_eq!(spare.received.load(Ordering::SeqCst), 0);
+    // The truncating worker leaves rotation: the next request goes to the
+    // spare instead of being cut short again.
+    let report = coordinator.status_report();
+    assert!(!report[0].healthy);
+    assert!(report[0].last_error.as_deref().unwrap().contains("[DONE]"));
+    let res = chat(&router, json!({"messages": [], "stream": true})).await;
+    assert_eq!(res.header(WORKER_HEADER), Some(spare_url.as_str()));
+    assert_eq!(
+        sse_data(&res.text()).last().map(String::as_str),
+        Some("[DONE]")
+    );
 
     // Closed after only half an event: nothing reached the client, so the
     // request is retried, and the half event is never forwarded.
