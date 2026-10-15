@@ -255,9 +255,10 @@ fn backend_matrix_parity() {
 }
 
 /// MTP drafting keeps each pick on the device and embeds it directly for the
-/// next draft row.  On every backend: a full-length draft of in-vocabulary
-/// tokens that is the same when drafted twice (drafting rolls the block
-/// back), with the trunk's next logits unchanged by it.
+/// next draft row.  On every backend in the matrix, plus CUDA: a full-length
+/// draft of in-vocabulary tokens that is the same when drafted twice
+/// (drafting rolls the block back), with the trunk's next logits unchanged
+/// by it.
 #[test]
 fn mtp_draft_runs_on_every_backend() {
     let dir = common::model_dir("matrix-mtp-qwen3moe");
@@ -265,7 +266,14 @@ fn mtp_draft_runs_on_every_backend() {
     common::write_tiny_qwen_mtp_gguf(&model, "qwen3moe");
     let prompt: Vec<u32> = vec![1, 4, 2, 7, 5, 9, 3, 6];
     let n = prompt.len();
-    for backend in backends() {
+    #[allow(unused_mut)]
+    let mut backends = backends();
+    #[cfg(feature = "cuda")]
+    match Device::cuda_if_available(0) {
+        Ok(d) if !d.is_cpu() => backends.push(Backend { name: "cuda", device: d }),
+        _ => eprintln!("matrix: cuda unavailable (no device)"),
+    }
+    for backend in backends {
         let what = format!("[mtp × {}]", backend.name);
         let mut m = joshua::quantized_qwen::with_mtp_block(|| load_mmap(&model, &backend.device));
         assert!(m.set_mtp(true), "{what}: the NextN block loads");
@@ -279,6 +287,10 @@ fn mtp_draft_runs_on_every_backend() {
         let mut plain = load_mmap(&model, &backend.device);
         logits(&mut plain, &prompt, 0, &backend.device);
         let want = logits(&mut plain, &[11], n, &backend.device);
-        assert_spread_close_tol(&format!("{what}: trunk after a draft"), &after, &want, 1e-3);
+        // Same backend, same kernels: only the draft could make these differ.
+        assert_eq!(after.len(), want.len(), "{what}");
+        for (i, (a, w)) in after.iter().zip(&want).enumerate() {
+            assert!((a - w).abs() <= 1e-5, "{what}: trunk logit {i} after a draft: {a} vs {w}");
+        }
     }
 }
