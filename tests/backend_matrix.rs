@@ -253,3 +253,32 @@ fn backend_matrix_parity() {
         std::fs::remove_dir_all(&dir).ok();
     }
 }
+
+/// MTP drafting keeps each pick on the device and embeds it directly for the
+/// next draft row.  On every backend: a full-length draft of in-vocabulary
+/// tokens that is the same when drafted twice (drafting rolls the block
+/// back), with the trunk's next logits unchanged by it.
+#[test]
+fn mtp_draft_runs_on_every_backend() {
+    let dir = common::model_dir("matrix-mtp-qwen3moe");
+    let model = dir.join("model.gguf");
+    common::write_tiny_qwen_mtp_gguf(&model, "qwen3moe");
+    let prompt: Vec<u32> = vec![1, 4, 2, 7, 5, 9, 3, 6];
+    let n = prompt.len();
+    for backend in backends() {
+        let what = format!("[mtp × {}]", backend.name);
+        let mut m = joshua::quantized_qwen::with_mtp_block(|| load_mmap(&model, &backend.device));
+        assert!(m.set_mtp(true), "{what}: the NextN block loads");
+        let vocab = logits(&mut m, &prompt, 0, &backend.device).len();
+        let draft = m.mtp_draft(11, n, 4).unwrap();
+        assert_eq!(draft.len(), 4, "{what}: draft length");
+        assert!(draft.iter().all(|&t| (t as usize) < vocab), "{what}: {draft:?}");
+        assert_eq!(m.mtp_draft(11, n, 4).unwrap(), draft, "{what}: drafting is side-effect free");
+
+        let after = logits(&mut m, &[11], n, &backend.device);
+        let mut plain = load_mmap(&model, &backend.device);
+        logits(&mut plain, &prompt, 0, &backend.device);
+        let want = logits(&mut plain, &[11], n, &backend.device);
+        assert_spread_close_tol(&format!("{what}: trunk after a draft"), &after, &want, 1e-3);
+    }
+}
