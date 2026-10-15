@@ -47,6 +47,9 @@ use crate::error::{JoshuaError, Result};
 
 /// Default maximum number of draft tokens verified per step.
 pub const DEFAULT_MAX_DRAFT: usize = 8;
+/// Most MTP drafts per step: each chained draft is one more sequential pass
+/// through the block, and its acceptance falls with depth.
+pub const MAX_MTP_DRAFT: usize = 7;
 /// Default longest n-gram the drafter tries to match.
 pub const DEFAULT_MAX_NGRAM: usize = 4;
 /// Default shortest n-gram the drafter accepts as a match.
