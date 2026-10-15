@@ -33,6 +33,10 @@ pub enum JoshuaError {
     #[error("Server overloaded: {0}")]
     Overloaded(String),
 
+    /// The requester went away and the work was abandoned.
+    #[error("Request cancelled")]
+    Cancelled,
+
     /// An I/O error occurred.
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
