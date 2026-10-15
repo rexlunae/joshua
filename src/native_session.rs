@@ -956,7 +956,8 @@ impl<W: LayerStack> Session<W> {
     /// Bytes this session's state holds: what a [`Self::snapshot`] of it
     /// copies at most.
     pub fn state_bytes(&self) -> u64 {
-        self.state.iter().map(W::state_bytes).sum()
+        let mtp = self.mtp.as_ref().map_or(0, |m| W::state_bytes(&m.state));
+        self.state.iter().map(W::state_bytes).sum::<u64>() + mtp
     }
 
     /// Continue from `snap`: this session's state becomes the snapshot's

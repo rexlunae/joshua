@@ -14,8 +14,10 @@ use joshua::stream_prefill::Chunk;
 /// ones, which carry one without `shared_head_norm`.
 const ARCHES: &[&str] = &["qwen3moe", "qwen35moe", "qwen3next", "glm4", "glm4moe"];
 
-fn mtp_model(arch: &str) -> QuantizedModel {
-    let dir = common::model_dir(&format!("mtp-{arch}"));
+fn mtp_model(arch: &str, test: &str) -> QuantizedModel {
+    // One file per test: tests run in parallel, and rewriting a file another
+    // test has mapped would fault it.
+    let dir = common::model_dir(&format!("mtp-{test}-{arch}"));
     let path = dir.join("model.gguf");
     match arch {
         "glm4" | "glm4moe" => common::write_tiny_qwen_gguf(&path, arch),
@@ -36,7 +38,7 @@ fn draft(m: &mut QuantizedModel, pos: usize) -> Vec<u32> {
 #[test]
 fn mtp_block_follows_the_trunk_however_it_is_fed() {
     for &arch in ARCHES {
-        let model = mtp_model(arch);
+        let model = mtp_model(arch, "fed");
         let n = PROMPT.len();
 
         let mut whole = model.new_session().unwrap();
@@ -95,7 +97,7 @@ fn mtp_block_follows_the_trunk_however_it_is_fed() {
 #[test]
 fn mtp_block_rolls_back_with_a_verification_pass() {
     for &arch in ARCHES {
-        let model = mtp_model(arch);
+        let model = mtp_model(arch, "rollback");
         let n = PROMPT.len();
         // Verify [x, d1, d2, d3] and keep x and d1.
         let block = [NEXT, 8, 10, 12];
@@ -136,7 +138,7 @@ fn mtp_block_rolls_back_with_a_verification_pass() {
 #[test]
 fn mtp_block_state_travels_with_a_snapshot() {
     for &arch in ARCHES {
-        let model = mtp_model(arch);
+        let model = mtp_model(arch, "snapshot");
         let n = PROMPT.len();
         let mut m = model.new_session().unwrap();
         logits(&mut m, &PROMPT, 0);
@@ -154,7 +156,7 @@ fn mtp_block_state_travels_with_a_snapshot() {
 #[test]
 fn mtp_leaves_the_trunk_output_unchanged() {
     for &arch in ARCHES {
-        let on = mtp_model(arch);
+        let on = mtp_model(arch, "trunk");
         let mut off = on.new_session().unwrap();
         off.set_mtp(false);
         let mut on = on.new_session().unwrap();
