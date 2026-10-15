@@ -159,6 +159,30 @@ impl IndexCache {
         self.pooled = None;
         Ok(())
     }
+
+    /// The first `keep` positions on `device`.  The indexer appends by
+    /// concatenating into new tensors, so on one device the rows are shared.
+    pub(super) fn fork(&self, keep: usize, device: &candle_core::Device) -> Result<Self> {
+        let mut out = self.clone();
+        out.truncate(keep)?;
+        let on = |t: &Option<Tensor>| -> Result<Option<Tensor>> {
+            t.as_ref().map(|t| crate::native_session::tensor_on(t, device)).transpose()
+        };
+        Ok(Self {
+            keys: on(&out.keys)?,
+            gates: on(&out.gates)?,
+            pooled: None,
+        })
+    }
+
+    /// Bytes the cached keys hold.
+    pub(super) fn bytes(&self) -> u64 {
+        use crate::attention::tensor_bytes;
+        [&self.keys, &self.gates, &self.pooled]
+            .into_iter()
+            .map(|t| t.as_ref().map_or(0, tensor_bytes))
+            .sum()
+    }
 }
 
 /// Append `new` rows to a cached `[len, d]` tensor.

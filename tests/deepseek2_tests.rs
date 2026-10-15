@@ -304,3 +304,19 @@ fn deepseek_moe_prefill_matches_incremental_decode() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// `deepseek2` (MLA) state survives the prefix cache's snapshot round trip
+/// (see `common::check_snapshot_restore`).
+#[test]
+fn deepseek2_snapshot_restore_matches_fresh() {
+    for (name, write) in [
+        ("deepseek2-snapshot", common::write_tiny_deepseek2_gguf as fn(&std::path::Path)),
+        ("deepseek2-mla-snapshot", common::write_tiny_deepseek2_mla_gguf),
+    ] {
+        let dir = common::model_dir(name);
+        let model = dir.join("model.gguf");
+        write(&model);
+        common::check_snapshot_restore(&load(&model), name);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}

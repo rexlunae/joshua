@@ -239,6 +239,28 @@ pub fn truncate_kv(kv_cache: &mut KvCache, keep: usize) {
     }
 }
 
+/// A detached copy of the first `keep` cached positions on `device`: fresh
+/// buffers sized to exactly those rows, so appends to the copy or to the
+/// original never disturb the other (a plain clone shares the buffers; see
+/// [`SeqKvCache`]).  `None` when nothing is cached or `keep == 0`.
+pub fn fork_kv(kv_cache: &KvCache, keep: usize, device: &Device) -> Result<KvCache> {
+    match kv_cache {
+        Some(cache) if keep > 0 => cache.fork(keep, device).map(Some),
+        _ => Ok(None),
+    }
+}
+
+/// Bytes the cache's buffers hold (their allocated rows, not only the cached
+/// ones).
+pub fn kv_bytes(kv_cache: &KvCache) -> u64 {
+    kv_cache.as_ref().map_or(0, |c| tensor_bytes(&c.k) + tensor_bytes(&c.v))
+}
+
+/// Bytes a tensor's elements occupy.
+pub fn tensor_bytes(t: &Tensor) -> u64 {
+    (t.elem_count() * t.dtype().size_in_bytes()) as u64
+}
+
 /// Append this step's keys/values to `kv_cache` and attend `q` over the whole
 /// cached context.
 ///
@@ -364,6 +386,33 @@ impl SeqKvCache {
         copy_rows(&v_new, seq, &self.v, cap, self.len, seq)?;
         self.len += seq;
         Ok(())
+    }
+
+    /// A cache holding a private copy of the first `keep` positions on
+    /// `device`, with buffers of exactly `keep` rows (the next append grows
+    /// them).  See [`fork_kv`].
+    fn fork(&self, keep: usize, device: &Device) -> Result<Self> {
+        let keep = keep.min(self.len);
+        let rows = |t: &Tensor| -> Result<Tensor> {
+            let rows = t.narrow(2, 0, keep)?;
+            // `contiguous` of a contiguous view (`keep` equal to the
+            // capacity) would hand back the shared buffer, not a copy.
+            let rows = if rows.is_contiguous() {
+                rows.copy()?
+            } else {
+                rows.contiguous()?
+            };
+            if rows.device().same_device(device) {
+                Ok(rows)
+            } else {
+                rows.to_device(device)
+            }
+        };
+        Ok(Self {
+            k: rows(&self.k)?,
+            v: rows(&self.v)?,
+            len: keep,
+        })
     }
 
     /// Reallocate the buffers with room for `needed` rows (geometric

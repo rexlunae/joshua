@@ -255,6 +255,19 @@ fn qwen_recurrent_prefix_checkpoint_rewind_matches_fresh() {
     }
 }
 
+/// Every architecture's state survives the prefix cache's snapshot round
+/// trip (see `common::check_snapshot_restore`).
+#[test]
+fn qwen_snapshot_restore_matches_fresh() {
+    for &(arch, _) in ARCHES {
+        let dir = common::model_dir(&format!("qwen-snapshot-{arch}"));
+        let model = dir.join("model.gguf");
+        common::write_tiny_qwen_gguf(&model, arch);
+        common::check_snapshot_restore(&load(&model), arch);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
 /// Every architecture's logits match golden values from an independent
 /// float64 NumPy transcription of llama.cpp's `src/models/qwen*.cpp` graphs
 /// (`tests/data/qwen_family_reference_logits.txt`), run on the same tiny

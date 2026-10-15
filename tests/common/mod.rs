@@ -248,6 +248,81 @@ pub fn check_prefix_checkpoint_rewind(model: &joshua::model::QuantizedModel, wha
 }
 
 
+/// Check the prefix cache's snapshot round trip: a snapshot of a session's
+/// state (at its end, and — where the state allows — at an earlier prompt
+/// boundary) restored into a fresh session continues exactly like a session
+/// that only ever saw those tokens; the session it was taken from keeps
+/// decoding exactly as if no snapshot had been taken (the copy shares no
+/// buffer either writes to); and a duplicate of the snapshot does the same.
+pub fn check_snapshot_restore(model: &joshua::model::QuantizedModel, what: &str) {
+    use joshua::stream_prefill::Chunk;
+    const TURN1: [u32; 5] = [1, 4, 2, 7, 5];
+    const REPLY: [u32; 2] = [9, 3];
+    const TURN2: [u32; 4] = [6, 8, 4, 1];
+    const NEXT: [u32; 3] = [11, 2, 6];
+    let n2 = TURN1.len() + REPLY.len() + TURN2.len();
+
+    let replay = |m: &mut joshua::model::QuantizedModel, upto: usize| {
+        m.prefill_streamed(
+            &[Chunk { tokens: &TURN1[..3], pos: 0 }, Chunk { tokens: &TURN1[3..], pos: 3 }],
+            &Device::Cpu,
+        )
+        .unwrap();
+        if upto > TURN1.len() {
+            for (i, &t) in REPLY.iter().enumerate() {
+                logits(m, &[t], TURN1.len() + i);
+            }
+            logits(m, &TURN2, TURN1.len() + REPLY.len());
+        }
+    };
+    let continue_from = |m: &mut joshua::model::QuantizedModel, at: usize| {
+        [logits(m, &NEXT, at), logits(m, &[7], at + NEXT.len())]
+    };
+
+    let mut m = model.new_session().unwrap();
+    replay(&mut m, n2);
+    // TURN1's end is a prompt boundary, so even a recurrent model holds a
+    // checkpoint there.
+    for keep in [n2, TURN1.len()] {
+        let snap = m
+            .snapshot(keep, n2, &Device::Cpu)
+            .unwrap()
+            .unwrap_or_else(|| panic!("{what}: no snapshot at {keep}"));
+        assert_eq!(snap.len(), keep, "{what}");
+        assert!(snap.bytes() > 0, "{what}");
+        let copy = snap.duplicate(&Device::Cpu).unwrap();
+
+        let mut reference = model.new_session().unwrap();
+        replay(&mut reference, keep);
+        let want = continue_from(&mut reference, keep);
+        for (label, snap) in [("restored", snap), ("duplicate", copy)] {
+            let mut r = model.new_session().unwrap();
+            assert!(r.restore_snapshot(snap).unwrap(), "{what}: restore at {keep}");
+            let got = continue_from(&mut r, keep);
+            for (w, g) in want.iter().zip(&got) {
+                assert_close(w, g, 1e-6, &format!("{what}: {label} snapshot at {keep}"));
+            }
+        }
+    }
+    if m.supports_kv_truncate() {
+        // An attention-only model is cut back anywhere.
+        assert!(m.snapshot(3, n2, &Device::Cpu).unwrap().is_some(), "{what}");
+    } else {
+        assert!(
+            m.snapshot(n2 - 1, n2, &Device::Cpu).unwrap().is_none(),
+            "{what}: no checkpoint there"
+        );
+    }
+    // The source session decodes on as if nothing happened.
+    let got = continue_from(&mut m, n2);
+    let mut reference = model.new_session().unwrap();
+    replay(&mut reference, n2);
+    let want = continue_from(&mut reference, n2);
+    for (w, g) in want.iter().zip(&got) {
+        assert_close(w, g, 1e-6, &format!("{what}: source after snapshots"));
+    }
+}
+
 /// A minimal WordLevel tokenizer with a 16-token vocabulary.
 pub const TOKENIZER_JSON: &str = r#"{
     "version": "1.0",

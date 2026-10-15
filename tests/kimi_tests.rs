@@ -181,6 +181,17 @@ fn kimi_kda_prefix_checkpoint_rewind_matches_fresh() {
     }
 }
 
+/// The KDA hybrids survive the prefix cache's snapshot round trip (see
+/// `common::check_snapshot_restore`).
+#[test]
+fn kimi_kda_snapshot_restore_matches_fresh() {
+    for arch in ARCHES {
+        let (dir, m) = kimi_model("snapshot", arch, false);
+        common::check_snapshot_restore(&m, arch);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
 /// The layer-streaming prefill reproduces a single forward (the KDA state
 /// carries across chunks, and K3's residual bank grows layer by layer).
 #[test]

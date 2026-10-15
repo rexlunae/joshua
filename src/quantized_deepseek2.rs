@@ -1181,6 +1181,25 @@ impl crate::native_session::LayerStack for Weights {
         state.kda = Some(checkpoint.clone());
         Ok(())
     }
+
+    fn fork_state(state: &LayerState, keep: usize, device: &Device) -> Result<LayerState> {
+        if keep == 0 {
+            return Ok(LayerState::default());
+        }
+        Ok(LayerState {
+            kv: crate::attention::fork_kv(&state.kv, keep, device)?,
+            index: state.index.fork(keep, device)?,
+            kda: state.kda.as_ref().map(|k| k.on(device)).transpose()?,
+            capture: None,
+            published: Vec::new(),
+        })
+    }
+
+    fn state_bytes(state: &LayerState) -> u64 {
+        crate::attention::kv_bytes(&state.kv)
+            + state.index.bytes()
+            + state.kda.as_ref().map_or(0, KdaState::bytes)
+    }
 }
 
 /// A quantized DeepSeek-MoE / V2 / V3 / Kimi-K2 model loaded from GGUF: one

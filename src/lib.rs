@@ -59,6 +59,8 @@ pub mod cache_sim;
 pub mod npu;
 pub mod paged_weights;
 pub mod placement;
+pub mod prefix_cache;
+pub mod prompt_stability;
 pub mod stream_prefill;
 pub mod server;
 pub mod simd;

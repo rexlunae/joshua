@@ -110,7 +110,7 @@ use rand::{rngs::StdRng, thread_rng, SeedableRng};
 use tokenizers::Tokenizer;
 
 use crate::embedding::EmbeddingModel;
-use crate::model::{Architecture, QuantizedModel};
+use crate::model::{Architecture, ModelSnapshot, QuantizedModel};
 use crate::npu::{NpuBackend, NpuSession};
 use crate::speculative::{
     next_draft_len, NgramDrafter, SpeculationGate, SpeculativeConfig, SpeculativeStats,
@@ -426,6 +426,26 @@ pub struct EngineOptions {
     /// of a prefill — a turn boundary — that the edit resumes from instead.
     /// Each costs one copy of that state per pooled session.
     pub prefix_checkpoints: Option<usize>,
+    /// Host RAM the prefix cache may hold, in bytes; `None` sizes it from free
+    /// RAM at start ([`auto_prefix_cache_bytes`]) and `Some(0)` turns it off.
+    ///
+    /// The cache keeps detached copies of conversation state between
+    /// requests (see [`crate::prefix_cache`]): the state at the end of each
+    /// client's system prompt, so a new chat skips re-reading it, and the
+    /// state of conversations evicted from the warm session pool, so they
+    /// resume later.  Qwen-family and `deepseek2` models only.
+    pub prefix_cache_bytes: Option<u64>,
+    /// Shortest shared prompt head, in tokens, worth keeping as a prefix-cache
+    /// root; `None` selects [`DEFAULT_PREFIX_CACHE_ROOT_MIN`].  Below it the
+    /// head is cheaper to read again than its copy costs.
+    pub prefix_cache_root_min: Option<usize>,
+    /// Move an `<env>…</env>` block (working directory, today's date — what
+    /// opencode writes near the start of its system prompt) out of the system
+    /// message into the front of the first user message.  Off by default: it
+    /// changes the prompt.  With it, a new folder or a new day leaves the
+    /// system prompt, and so the prefix cache's root, unchanged; Strata
+    /// measured opencode's first request going from 11.9 s to 1.1 s.
+    pub env_to_user: bool,
     /// Where a sparse MoE model's routed experts live when inference runs on
     /// an accelerator: uploaded to the device, or kept in host RAM (borrowed
     /// from the mapping, run on the CPU expert kernels, activations hopping
@@ -576,6 +596,41 @@ impl EngineOptions {
         self
     }
 
+    /// Set the prefix cache's byte budget (`0` = off).  See
+    /// [`EngineOptions::prefix_cache_bytes`].
+    pub fn prefix_cache_bytes(mut self, bytes: u64) -> Self {
+        self.prefix_cache_bytes = Some(bytes);
+        self
+    }
+
+    /// Set the shortest prompt head kept as a prefix-cache root.  See
+    /// [`EngineOptions::prefix_cache_root_min`].
+    pub fn prefix_cache_root_min(mut self, tokens: usize) -> Self {
+        self.prefix_cache_root_min = Some(tokens);
+        self
+    }
+
+    /// [`Self::prefix_cache_bytes`] in MiB when set; `None` keeps the default.
+    pub fn prefix_cache_mib_opt(mut self, mib: Option<u64>) -> Self {
+        if let Some(mib) = mib {
+            self.prefix_cache_bytes = Some(mib.saturating_mul(1024 * 1024));
+        }
+        self
+    }
+
+    /// [`Self::prefix_cache_root_min`] when set; `None` keeps the default.
+    pub fn prefix_cache_root_min_opt(mut self, tokens: Option<usize>) -> Self {
+        self.prefix_cache_root_min = tokens.or(self.prefix_cache_root_min);
+        self
+    }
+
+    /// Move an `<env>` block out of the system prompt.  See
+    /// [`EngineOptions::env_to_user`].
+    pub fn env_to_user(mut self, on: bool) -> Self {
+        self.env_to_user = on;
+        self
+    }
+
     /// Choose where the routed experts of a MoE model live on an
     /// accelerator.  See [`EngineOptions::expert_placement`].
     pub fn expert_placement(mut self, placement: ExpertPlacement) -> Self {
@@ -706,6 +761,16 @@ pub struct Engine {
     /// Prefix checkpoints per recurrent-model session (see
     /// [`EngineOptions::prefix_checkpoints`]).
     prefix_checkpoints: usize,
+    /// Parked conversation state (see [`EngineOptions::prefix_cache_bytes`]).
+    prefix_cache: Mutex<crate::prefix_cache::PrefixCache<ModelSnapshot>>,
+    /// Shortest prompt head kept as a prefix-cache root (see
+    /// [`EngineOptions::prefix_cache_root_min`]).
+    prefix_cache_root_min: usize,
+    /// The order each recently seen tool set first came in (see
+    /// [`crate::prompt_stability::ToolOrders`]).
+    tool_orders: crate::prompt_stability::ToolOrders,
+    /// See [`EngineOptions::env_to_user`].
+    env_to_user: bool,
     /// Whether the routed experts page in on demand (the model was loaded as
     /// larger than RAM: [`EngineOptions::pin_hot_weights`] or
     /// [`EngineOptions::lazy_weights`]), so decode prefetches each layer's
@@ -780,6 +845,31 @@ const LOW_MEM_FLOOR: u64 = 1536 * 1024 * 1024; // 1.5 GiB
 /// so often that it dominates on the architectures without a layer-streaming
 /// prefill.
 pub const DEFAULT_PREFILL_CHUNK: usize = 512;
+
+/// Default [`EngineOptions::prefix_cache_root_min`]: a shared prompt head of
+/// fewer tokens is not kept as a prefix-cache root.  Strata uses 2,048 on a
+/// GPU; a weak CPU box reads a prompt an order of magnitude slower, so a
+/// shorter head already pays for its copy.
+pub const DEFAULT_PREFIX_CACHE_ROOT_MIN: usize = 1024;
+
+/// Shortest conversation, in tokens, the prefix cache parks when the warm
+/// pool lets it go: a shorter one is cheaper to read again.  A lower
+/// [`EngineOptions::prefix_cache_root_min`] lowers it too.
+const PREFIX_CACHE_PARK_MIN: usize = 256;
+
+/// Most host RAM [`auto_prefix_cache_bytes`] gives the prefix cache.
+const PREFIX_CACHE_AUTO_MAX: u64 = 4 * 1024 * 1024 * 1024; // 4 GiB
+
+/// The prefix cache's budget when the operator sets none: an eighth of the
+/// RAM free at start, at most [`PREFIX_CACHE_AUTO_MAX`], and nothing when the
+/// box is already short of memory or cannot say.  Each store also checks the
+/// free RAM at that moment (see [`Engine::park_snapshot`]).
+fn auto_prefix_cache_bytes(free: Option<u64>) -> u64 {
+    match free {
+        Some(free) if free > LOW_MEM_FLOOR * 4 => (free / 8).min(PREFIX_CACHE_AUTO_MAX),
+        _ => 0,
+    }
+}
 
 /// Maximum number of idle model instances kept warm in the pool.
 ///
@@ -996,6 +1086,54 @@ impl GenSession {
                     false
                 }
             },
+            Self::Npu(_) => false,
+        }
+    }
+
+    /// A detached host copy of the state after `keep` of the `len` tokens fed
+    /// (see [`QuantizedModel::snapshot`]); `None` where none can be had.
+    fn snapshot(&self, keep: usize, len: usize) -> Option<ModelSnapshot> {
+        match self {
+            Self::Candle(model) => match model.snapshot(keep, len, &Device::Cpu) {
+                Ok(snap) => snap,
+                Err(e) => {
+                    tracing::debug!(error = %e, keep, "prefix cache: snapshot failed");
+                    None
+                }
+            },
+            Self::Npu(_) => None,
+        }
+    }
+
+    /// Continue from `snap`; `false` when the session cannot take it.  A
+    /// failure part-way leaves the state unknown, so the caller clears it.
+    fn restore(&mut self, snap: ModelSnapshot) -> bool {
+        match self {
+            Self::Candle(model) => match model.restore_snapshot(snap) {
+                Ok(ok) => ok,
+                Err(e) => {
+                    tracing::debug!(error = %e, "prefix cache: restore failed");
+                    false
+                }
+            },
+            Self::Npu(_) => false,
+        }
+    }
+
+    /// Take a recurrent model's prefix checkpoint at `pos` (see
+    /// [`QuantizedModel::checkpoint_prefix`]).
+    fn checkpoint_prefix(&mut self, pos: usize) {
+        if let Self::Candle(model) = self {
+            model.checkpoint_prefix(pos);
+        }
+    }
+
+    /// Whether every layer's state can be cut back to an arbitrary prefix
+    /// (an attention-only model), so a snapshot can be taken behind the
+    /// current position without a checkpoint there.
+    fn supports_truncate(&self) -> bool {
+        match self {
+            Self::Candle(model) => model.supports_kv_truncate(),
             Self::Npu(_) => false,
         }
     }
@@ -1237,6 +1375,13 @@ impl Engine {
         let prefix_checkpoints = options
             .prefix_checkpoints
             .unwrap_or(crate::native_session::DEFAULT_PREFIX_CHECKPOINTS);
+        let prefix_cache_bytes = options
+            .prefix_cache_bytes
+            .unwrap_or_else(|| auto_prefix_cache_bytes(crate::placement::available_ram_bytes()));
+        let prefix_cache_root_min = options
+            .prefix_cache_root_min
+            .unwrap_or(DEFAULT_PREFIX_CACHE_ROOT_MIN)
+            .max(1);
         // A model loaded as larger than RAM faults its routed experts in on
         // demand; only then is a speculative expert prefetch worth its advice
         // calls (on a resident model every hint would be a no-op syscall).
@@ -1829,6 +1974,10 @@ impl Engine {
             device_expert_cache,
             prefill_chunk,
             prefix_checkpoints,
+            prefix_cache: Mutex::new(crate::prefix_cache::PrefixCache::new(prefix_cache_bytes)),
+            prefix_cache_root_min,
+            tool_orders: Default::default(),
+            env_to_user: options.env_to_user,
             predict_experts,
             device,
             dense_device,
@@ -2290,6 +2439,17 @@ impl Engine {
         options: &GenerationOptions,
         cancel: Option<&AtomicBool>,
     ) -> Result<(String, UsageInfo, f64, f64)> {
+        // Keep the prompt's head byte-identical across requests where the
+        // client varies it for no semantic reason, so cached prompt state
+        // still matches (see `crate::prompt_stability`).
+        let reordered = tools.and_then(|t| self.tool_orders.stable(t));
+        let tools = reordered.as_deref().or(tools);
+        let moved = if self.env_to_user {
+            crate::prompt_stability::env_to_user(messages)
+        } else {
+            None
+        };
+        let messages = moved.as_deref().unwrap_or(messages);
         // Multimodal branch: messages carrying images go through a
         // media-capable NPU/llama.cpp plugin session.
         if messages
@@ -2303,7 +2463,8 @@ impl Engine {
         }
         let (prompt, add_special_tokens) =
             self.format_prompt(messages, tools, &options.chat_template_kwargs);
-        self.complete_with(&prompt, add_special_tokens, options, cancel)
+        let root = self.prompt_root_chars(messages, tools, options, &prompt);
+        self.complete_with(&prompt, add_special_tokens, options, cancel, root)
     }
 
     /// Run a multimodal completion: the plugin tokenises and prefills the
@@ -2400,7 +2561,7 @@ impl Engine {
         prompt: &str,
         options: &GenerationOptions,
     ) -> Result<(String, UsageInfo, f64, f64)> {
-        self.complete_with(prompt, true, options, None)
+        self.complete_with(prompt, true, options, None, None)
     }
 
     /// The context window a request may use: its
@@ -2452,12 +2613,17 @@ impl Engine {
     /// Shared completion path.  `add_special_tokens` controls whether the
     /// tokenizer wraps the prompt with its special tokens (disabled for
     /// template-rendered prompts, which already include them).
+    ///
+    /// `root_chars` is where the prompt's shared head (system prompt and
+    /// tools) ends in `prompt`, for the prefix cache's root entry; see
+    /// [`Self::prompt_root_chars`].
     fn complete_with(
         &self,
         prompt: &str,
         add_special_tokens: bool,
         options: &GenerationOptions,
         cancel: Option<&AtomicBool>,
+        root_chars: Option<usize>,
     ) -> Result<(String, UsageInfo, f64, f64)> {
         // Bound concurrent heavyweight generations before doing any work.
         let _permit = InFlightGuard::acquire(&self.in_flight, self.max_concurrency)?;
@@ -2478,6 +2644,7 @@ impl Engine {
         // Clamp the client-supplied generation length to the server ceiling
         // and the remaining context window.
         let options = &self.clamp_options(options, Some(n_prompt));
+        let root = root_chars.and_then(|c| self.root_tokens(prompt, c, add_special_tokens, prompt_tokens));
 
         // ── Acquire a session, generate, retry on CPU if the NPU fails ──────
         // Prefer a pooled instance whose state already covers a prefix of
@@ -2485,7 +2652,7 @@ impl Engine {
         let (mut session, n_reused) = self.acquire_session(prompt_tokens, true)?;
         let was_npu = session.is_npu();
 
-        let result = self.run_generation(&mut session, prompt_tokens, n_reused, options, cancel);
+        let result = self.run_generation(&mut session, prompt_tokens, n_reused, options, cancel, root);
         match result {
             Ok((response, usage, prefill_tps, decode_tps, kv_tokens)) => {
                 // Park the instance for reuse by a follow-up request.
@@ -2510,7 +2677,7 @@ impl Engine {
                 }
                 tracing::warn!("Retrying request on the candle path after NPU failure: {e}");
                 let (mut session, n_reused) = self.acquire_session(prompt_tokens, false)?;
-                match self.run_generation(&mut session, prompt_tokens, n_reused, options, cancel) {
+                match self.run_generation(&mut session, prompt_tokens, n_reused, options, cancel, root) {
                     Ok((response, usage, prefill_tps, decode_tps, kv_tokens)) => {
                         self.release_model(session, kv_tokens);
                         Ok((response, usage, prefill_tps, decode_tps))
@@ -2535,6 +2702,64 @@ impl Engine {
         }
     }
 
+    /// Feed `new_tokens` (the prompt from absolute position `base` on) and
+    /// return the last position's logits.
+    ///
+    /// Process the not-yet-cached prompt tokens in bounded chunks, starting
+    /// right after the reused KV prefix.  Feeding an arbitrarily long prompt
+    /// in one pass materializes a `[1, n_prompt, hidden]` activation tensor;
+    /// chunking caps that transient allocation (finding #4).  Positions
+    /// advance so the KV cache accumulates across pieces, and only the final
+    /// piece's last-token logits are kept (the prefill prediction).  Smaller
+    /// chunks bound memory but can re-read expert weights more often.
+    fn prefill(
+        &self,
+        model: &mut GenSession,
+        new_tokens: &[u32],
+        base: usize,
+    ) -> Result<Vec<f32>> {
+        let mut last: Vec<f32> = Vec::new();
+
+        // Layer-streaming prefill: sweep each layer once over all chunks,
+        // so every layer's weights are read once per prefill instead of
+        // once per chunk.  Falls back to the standard chunked loop for
+        // architectures without a native streaming path (or when a piece
+        // would exceed the KV cap mid-chunk; see below).
+        let chunk = self.prefill_chunk;
+        let chunks: Vec<crate::stream_prefill::Chunk> = (0..new_tokens.len())
+            .step_by(chunk)
+            .map(|piece_start| {
+                let end = (piece_start + chunk).min(new_tokens.len());
+                let piece = &new_tokens[piece_start..end];
+                crate::stream_prefill::Chunk {
+                    tokens: piece,
+                    pos: base + piece_start,
+                }
+            })
+            .collect();
+
+        // Streaming requires every layer's KV to hold the whole prompt;
+        // enforce the engine's KV cap up front (per-layer KV is written
+        // incrementally and would otherwise overrun mid-stream).  The
+        // standard forward enforces the cap inside attention, so mirror
+        // that guard here and only stream when the prompt fits.
+        let streamable = model.prefill_streamed(&chunks, &self.dense_device);
+        Ok(match streamable {
+            Ok(Some(v)) => v,
+            _ => {
+                // Streamed prefill unsupported on this architecture, or a
+                // KV-cap guard tripped — fall back to the per-chunk loop.
+                for piece_start in (0..new_tokens.len()).step_by(chunk) {
+                    let end = (piece_start + chunk).min(new_tokens.len());
+                    let piece = &new_tokens[piece_start..end];
+                    last =
+                        model.forward_tokens(piece, base + piece_start, &self.dense_device)?;
+                }
+                last
+            }
+        })
+    }
+
     /// Prefill + decode on an acquired session.
     ///
     /// Returns the generated text, usage, throughput figures, and the exact
@@ -2546,6 +2771,7 @@ impl Engine {
         n_reused: usize,
         options: &GenerationOptions,
         cancel: Option<&AtomicBool>,
+        root: Option<usize>,
     ) -> Result<(String, UsageInfo, f64, f64, Vec<u32>)> {
         let n_prompt = prompt_tokens.len();
         let new_tokens = &prompt_tokens[n_reused..];
@@ -2555,56 +2781,31 @@ impl Engine {
         let mut kv_tokens = prompt_tokens.to_vec();
 
         // ── Prefill ───────────────────────────────────────────────────────────
-        // Process the not-yet-cached prompt tokens in bounded chunks, starting
-        // right after the reused KV prefix.  Feeding an arbitrarily long prompt
-        // in one pass materializes a `[1, n_prompt, hidden]` activation tensor;
-        // chunking caps that transient allocation (finding #4).  Positions
-        // advance so the KV cache accumulates across pieces, and only the final
-        // piece's last-token logits are kept (the prefill prediction).  Smaller
-        // chunks bound memory but can re-read expert weights more often.
+        // A follow-up turn starts where the last one left off: checkpoint that
+        // boundary (a recurrent model's only way back to it), so an agent that
+        // replaces the message it is about to read resumes from here.
+        if n_reused > 0 {
+            model.checkpoint_prefix(n_reused);
+        }
+        // The prompt's shared head becomes a prefix-cache root unless one is
+        // already kept for it.  A model with recurrent layers has its state at
+        // the head's end only if the prefill stops there, so it reads the
+        // prompt in two parts; an attention-only model reads it in one and
+        // the snapshot is cut back to the head.
+        let root = root.filter(|&r| r > n_reused && r < n_prompt && self.root_wanted(&prompt_tokens[..r]));
         let prefill_start = Instant::now();
-        let logits_vec = {
-            let mut last: Vec<f32> = Vec::new();
-            let base = n_reused;
-
-            // Layer-streaming prefill: sweep each layer once over all chunks,
-            // so every layer's weights are read once per prefill instead of
-            // once per chunk.  Falls back to the standard chunked loop for
-            // architectures without a native streaming path (or when a piece
-            // would exceed the KV cap mid-chunk; see below).
-            let chunk = self.prefill_chunk;
-            let chunks: Vec<crate::stream_prefill::Chunk> = (0..new_tokens.len())
-                .step_by(chunk)
-                .map(|piece_start| {
-                    let end = (piece_start + chunk).min(new_tokens.len());
-                    let piece = &new_tokens[piece_start..end];
-                    crate::stream_prefill::Chunk {
-                        tokens: piece,
-                        pos: base + piece_start,
-                    }
-                })
-                .collect();
-
-            // Streaming requires every layer's KV to hold the whole prompt;
-            // enforce the engine's KV cap up front (per-layer KV is written
-            // incrementally and would otherwise overrun mid-stream).  The
-            // standard forward enforces the cap inside attention, so mirror
-            // that guard here and only stream when the prompt fits.
-            let streamable = model.prefill_streamed(&chunks, &self.dense_device);
-            match streamable {
-                Ok(Some(v)) => v,
-                _ => {
-                    // Streamed prefill unsupported on this architecture, or a
-                    // KV-cap guard tripped — fall back to the per-chunk loop.
-                    for piece_start in (0..new_tokens.len()).step_by(chunk) {
-                        let end = (piece_start + chunk).min(new_tokens.len());
-                        let piece = &new_tokens[piece_start..end];
-                        last =
-                            model.forward_tokens(piece, base + piece_start, &self.dense_device)?;
-                    }
-                    last
-                }
+        let logits_vec = match root {
+            Some(r) if !model.supports_truncate() => {
+                self.prefill(model, &prompt_tokens[n_reused..r], n_reused)?;
+                self.store_root(model, &prompt_tokens[..r], r);
+                self.prefill(model, &prompt_tokens[r..], r)?
             }
+            Some(r) => {
+                let logits = self.prefill(model, new_tokens, n_reused)?;
+                self.store_root(model, &prompt_tokens[..r], n_prompt);
+                logits
+            }
+            None => self.prefill(model, new_tokens, n_reused)?,
         };
         let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -3176,6 +3377,11 @@ impl Engine {
         // rewound (a potentially large KV copy) outside the critical section
         // below so concurrent acquire/release is never stalled by it.
         let mut edit_pick: Option<(CachedModel, usize)> = None;
+        // Whether the prefix cache holds a longer reusable state than any
+        // pooled session can be rewound to.
+        let mut from_cache = false;
+        // A pooled session to clear for this unrelated prompt.
+        let mut clear_pick: Option<CachedModel> = None;
 
         {
             let mut pool = self.model_pool();
@@ -3230,6 +3436,7 @@ impl Engine {
             // earlier prefill), so its candidate keeps the latest checkpoint
             // at or before that point rather than the whole common prefix.
             if !want_npu {
+                let cached = self.prefix_cache().best_len(prompt_tokens);
                 let best_edit = pool
                     .iter()
                     .enumerate()
@@ -3246,25 +3453,40 @@ impl Engine {
                     // matches are intentionally preferred over longer edit
                     // candidates because they need no KV copy at all.
                     .max_by_key(|(_, keep)| *keep);
-                if let Some((i, keep)) = best_edit {
-                    edit_pick = Some((pool.swap_remove(i), keep));
+                // A prefix-cache entry at least as long as the best rewind
+                // wins: starting from it leaves the pooled conversation whole
+                // (a new chat sharing only the system prompt would otherwise
+                // rewind, and so destroy, another chat's session).
+                match best_edit {
+                    Some((_, keep)) if cached >= keep => from_cache = true,
+                    Some((i, keep)) => edit_pick = Some((pool.swap_remove(i), keep)),
+                    None => from_cache = cached > 0,
                 }
             }
             // The clear path runs only when no rewind was picked — rewinding
             // preserves strictly more work than clearing.
-            if edit_pick.is_none() {
+            if edit_pick.is_none() && !from_cache {
                 let resettable = pool.iter().position(|c| c.session.is_npu() == want_npu);
-                if let Some(i) = resettable {
-                    let mut cached = pool.swap_remove(i);
-                    if cached.session.clear_state() {
-                        tracing::debug!(
-                            npu = want_npu,
-                            "Reusing pooled session with cleared state"
-                        );
-                        return Ok((cached.session, 0));
-                    }
-                    // Reset failed (e.g. dead shim): drop it and fall through.
-                }
+                clear_pick = resettable.map(|i| pool.swap_remove(i));
+            }
+        }
+
+        // Clearing a pooled session ends its conversation; park it first
+        // (outside the pool lock) so it can resume when its client returns —
+        // two alternating conversations would otherwise each re-read the
+        // other's history away.
+        if let Some(mut cached) = clear_pick {
+            self.park_session(&cached.session, &cached.tokens);
+            if cached.session.clear_state() {
+                tracing::debug!(npu = want_npu, "Reusing pooled session with cleared state");
+                return Ok((cached.session, 0));
+            }
+            // Reset failed (e.g. dead shim): drop it and fall through.
+        }
+
+        if from_cache {
+            if let Some(resumed) = self.resume_from_prefix_cache(prompt_tokens)? {
+                return Ok(resumed);
             }
         }
 
@@ -3328,6 +3550,138 @@ impl Engine {
         Ok((GenSession::Candle(Box::new(self.load_model()?)), 0))
     }
 
+    // ─── Prefix cache ─────────────────────────────────────────────────────────
+
+    /// Lock the prefix cache (poison is recovered for the same reason as the
+    /// pool's: its entries are plain data).
+    fn prefix_cache(&self) -> std::sync::MutexGuard<'_, crate::prefix_cache::PrefixCache<ModelSnapshot>> {
+        self.prefix_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The prefix cache's counters and occupancy.
+    pub fn prefix_cache_stats(&self) -> crate::prefix_cache::PrefixCacheStats {
+        self.prefix_cache().stats()
+    }
+
+    /// Whether free RAM leaves room to store another snapshot: the cache's
+    /// budget is a ceiling, not a reservation, so a box that has since filled
+    /// up keeps its roots but parks nothing more.
+    fn ram_allows_parking() -> bool {
+        crate::placement::available_ram_bytes().is_none_or(|free| free >= LOW_MEM_FLOOR * 3)
+    }
+
+    /// Where the shared head of a chat prompt ends, as a byte offset into the
+    /// rendered `prompt`: the start of the first non-system message, i.e. the
+    /// system prompt and the tool list every new chat of a client repeats.
+    ///
+    /// Found template-agnostically: the conversation is rendered again with
+    /// that message's text replaced, and the two renders agree exactly up to
+    /// it.  `None` with the prefix cache off or no such message.
+    fn prompt_root_chars(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        options: &GenerationOptions,
+        prompt: &str,
+    ) -> Option<usize> {
+        if !self.prefix_cache().enabled() {
+            return None;
+        }
+        let i = messages.iter().position(|m| m.role != "system")?;
+        let mut variant = messages.to_vec();
+        variant[i].content = if messages[i].content.starts_with('\u{1}') { "\u{2}" } else { "\u{1}" }.into();
+        let (other, _) = self.format_prompt(&variant, tools, &options.chat_template_kwargs);
+        let n = crate::prefix_cache::common_text_prefix(prompt, &other);
+        (n > 0).then_some(n)
+    }
+
+    /// The prompt's shared head in tokens: the longest run of `prompt_tokens`
+    /// that the text before `root_chars` tokenizes to (cutting the text can
+    /// change how its last token splits, so the common prefix is what both
+    /// agree on).  `None` below the root minimum.
+    fn root_tokens(
+        &self,
+        prompt: &str,
+        root_chars: usize,
+        add_special_tokens: bool,
+        prompt_tokens: &[u32],
+    ) -> Option<usize> {
+        let head = self
+            .tokenizer
+            .encode(prompt.get(..root_chars)?, add_special_tokens)
+            .ok()?;
+        let n = crate::prefix_cache::common_token_prefix(head.get_ids(), prompt_tokens);
+        (n >= self.prefix_cache_root_min).then_some(n)
+    }
+
+    /// Whether `head` should become a root entry: the cache is on, keeps none
+    /// for it yet, and the box has room.
+    fn root_wanted(&self, head: &[u32]) -> bool {
+        let cache = self.prefix_cache();
+        cache.enabled() && !cache.has_root(head) && Self::ram_allows_parking()
+    }
+
+    /// Keep the state after `head` (of the `len` tokens the session has been
+    /// fed) as a root entry.  Best-effort: a model outside the shared session,
+    /// or a snapshot over budget, stores nothing.
+    fn store_root(&self, model: &GenSession, head: &[u32], len: usize) {
+        if let Some(snap) = model.snapshot(head.len(), len) {
+            let stored = self.prefix_cache().insert(head.to_vec(), snap, true);
+            tracing::debug!(tokens = head.len(), stored, "prefix cache: system-prompt root");
+        }
+    }
+
+    /// Park a session the warm pool is letting go of, so its conversation can
+    /// resume later without re-reading its history.
+    fn park_session(&self, session: &GenSession, tokens: &[u32]) {
+        let min = PREFIX_CACHE_PARK_MIN.min(self.prefix_cache_root_min);
+        if tokens.len() < min || !self.prefix_cache().enabled() {
+            return;
+        }
+        if !Self::ram_allows_parking() {
+            self.prefix_cache().shed();
+            return;
+        }
+        if let Some(snap) = session.snapshot(tokens.len(), tokens.len()) {
+            let stored = self.prefix_cache().insert(tokens.to_vec(), snap, false);
+            tracing::debug!(tokens = tokens.len(), stored, "prefix cache: parked a conversation");
+        }
+    }
+
+    /// Start a session from the longest prefix-cache entry `prompt_tokens`
+    /// extends: a fresh session over the shared weights takes the entry's
+    /// state, so no pooled conversation is disturbed.  `None` when nothing
+    /// matches or the state cannot be restored.
+    fn resume_from_prefix_cache(&self, prompt_tokens: &[u32]) -> Result<Option<(GenSession, usize)>> {
+        let hit = {
+            let mut cache = self.prefix_cache();
+            match cache.take(prompt_tokens, |s| s.duplicate(&Device::Cpu)) {
+                Ok(hit) => hit,
+                Err(e) => {
+                    tracing::debug!(error = %e, "prefix cache: copying a root failed");
+                    None
+                }
+            }
+        };
+        let Some(hit) = hit else {
+            return Ok(None);
+        };
+        let mut session = GenSession::Candle(Box::new(self.load_model()?));
+        if !session.restore(hit.snap) {
+            return Ok(None);
+        }
+        self.kv_reuses.fetch_add(1, Ordering::Relaxed);
+        tracing::debug!(
+            reused_tokens = hit.len,
+            prompt_tokens = prompt_tokens.len(),
+            root = hit.root,
+            "Continuing from the prefix cache"
+        );
+        Ok(Some((session, hit.len)))
+    }
+
     /// Lock the warm-model pool, recovering the guard if a previous holder
     /// panicked.  A poisoned lock must not permanently disable reuse: the
     /// cached instances are plain data, and silently treating poison as
@@ -3374,8 +3728,13 @@ impl Engine {
         if let Some(cap) = self.remote_pool_cap {
             pool_cap = cap;
         }
-        while pool.len() > pool_cap {
-            pool.remove(0);
+        let excess = pool.len().saturating_sub(pool_cap);
+        let evicted: Vec<CachedModel> = pool.drain(..excess).collect();
+        drop(pool);
+        // Copy each evicted conversation into the prefix cache outside the
+        // pool lock (a large KV copy must not stall other requests).
+        for c in evicted {
+            self.park_session(&c.session, &c.tokens);
         }
     }
 
