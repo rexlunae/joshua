@@ -256,6 +256,34 @@ pub fn kv_bytes(kv_cache: &KvCache) -> u64 {
     kv_cache.as_ref().map_or(0, |c| tensor_bytes(&c.k) + tensor_bytes(&c.v))
 }
 
+/// A copy of `t` in a buffer of exactly its own size.  `Tensor::copy` (and
+/// `to_device`) carry a view's whole backing storage along, so a cut-down
+/// view copied that way would keep the full buffer alive.
+pub fn compact_copy(t: &Tensor) -> Result<Tensor> {
+    if !t.is_contiguous() {
+        // A strided copy into a fresh buffer of `t`'s size.
+        return t.contiguous();
+    }
+    let out = Tensor::zeros(t.shape(), t.dtype(), t.device())?;
+    out.slice_set(t, 0, 0)?;
+    Ok(out)
+}
+
+/// The first `keep` rows (dim 0) of `t` on `device`: shared when that is all
+/// of `t` and it is already there, else in a buffer of their own (see
+/// [`compact_copy`]).
+pub fn rows_on(t: &Tensor, keep: usize, device: &Device) -> Result<Tensor> {
+    if t.dim(0)? <= keep {
+        return crate::native_session::tensor_on(t, device);
+    }
+    let rows = compact_copy(&t.narrow(0, 0, keep)?)?;
+    if rows.device().same_device(device) {
+        Ok(rows)
+    } else {
+        rows.to_device(device)
+    }
+}
+
 /// Bytes a tensor's elements occupy.
 pub fn tensor_bytes(t: &Tensor) -> u64 {
     (t.elem_count() * t.dtype().size_in_bytes()) as u64
@@ -394,14 +422,9 @@ impl SeqKvCache {
     fn fork(&self, keep: usize, device: &Device) -> Result<Self> {
         let keep = keep.min(self.len);
         let rows = |t: &Tensor| -> Result<Tensor> {
-            let rows = t.narrow(2, 0, keep)?;
-            // `contiguous` of a contiguous view (`keep` equal to the
-            // capacity) would hand back the shared buffer, not a copy.
-            let rows = if rows.is_contiguous() {
-                rows.copy()?
-            } else {
-                rows.contiguous()?
-            };
+            // Fresh buffers of exactly `keep` rows, sharing nothing with the
+            // live cache, which is written in place.
+            let rows = compact_copy(&t.narrow(2, 0, keep)?)?;
             if rows.device().same_device(device) {
                 Ok(rows)
             } else {

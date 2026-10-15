@@ -413,10 +413,10 @@ impl QsaCache {
     /// replaces these tensors rather than writing into them, so the rows are
     /// shared, not copied, on the same device.
     pub(super) fn fork(&self, keep: usize, device: &Device) -> Result<Self> {
-        use crate::native_session::tensor_on;
+        use crate::attention::rows_on;
+        // Cut rows get buffers of their own (a view keeps the whole tensor).
         let keys = match &self.keys {
-            Some(k) if k.dim(0)? > keep => Some(tensor_on(&k.narrow(0, 0, keep)?, device)?),
-            Some(k) => Some(tensor_on(k, device)?),
+            Some(k) => Some(rows_on(k, keep, device)?),
             None => None,
         };
         // `pooled_to` is exactly `blocks * ratio` (see `mask`), so the ratio
@@ -429,7 +429,7 @@ impl QsaCache {
                 if n == 0 {
                     (None, 0)
                 } else {
-                    (Some(tensor_on(&p.narrow(0, 0, n)?, device)?), n * r)
+                    (Some(rows_on(p, n, device)?), n * r)
                 }
             }
             _ => (None, 0),

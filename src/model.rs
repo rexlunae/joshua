@@ -955,6 +955,18 @@ impl QuantizedModel {
         })
     }
 
+    /// Whether [`Self::snapshot`] can detach this model's state (the shared
+    /// session loaders).
+    pub fn supports_snapshot(&self) -> bool {
+        session!(self, _m => true, _ => false)
+    }
+
+    /// Bytes this session's state holds, an upper bound on a snapshot of it
+    /// (`0` outside the shared session loaders).
+    pub fn state_bytes(&self) -> u64 {
+        session!(self, m => m.state_bytes(), _ => 0)
+    }
+
     /// Continue from `snap`; `Ok(false)` (state untouched) when it was taken
     /// from another architecture or other weights.
     pub fn restore_snapshot(&mut self, snap: ModelSnapshot) -> Result<bool> {

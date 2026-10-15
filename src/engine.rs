@@ -1105,6 +1105,22 @@ impl GenSession {
         }
     }
 
+    /// Whether [`Self::snapshot`] can detach this session's state.
+    fn supports_snapshot(&self) -> bool {
+        match self {
+            Self::Candle(model) => model.supports_snapshot(),
+            Self::Npu(_) => false,
+        }
+    }
+
+    /// Bytes the session's state holds: what a snapshot copies at most.
+    fn state_bytes(&self) -> u64 {
+        match self {
+            Self::Candle(model) => model.state_bytes(),
+            Self::Npu(_) => 0,
+        }
+    }
+
     /// Continue from `snap`; `false` when the session cannot take it.  A
     /// failure part-way leaves the state unknown, so the caller clears it.
     fn restore(&mut self, snap: ModelSnapshot) -> bool {
@@ -2792,7 +2808,9 @@ impl Engine {
         // the head's end only if the prefill stops there, so it reads the
         // prompt in two parts; an attention-only model reads it in one and
         // the snapshot is cut back to the head.
-        let root = root.filter(|&r| r > n_reused && r < n_prompt && self.root_wanted(&prompt_tokens[..r]));
+        let root = root.filter(|&r| {
+            r > n_reused && r < n_prompt && model.supports_snapshot() && self.root_wanted(&prompt_tokens[..r])
+        });
         let prefill_start = Instant::now();
         let logits_vec = match root {
             Some(r) if !model.supports_truncate() => {
@@ -3403,7 +3421,12 @@ impl Engine {
                 })
                 .max_by_key(|(_, c)| c.tokens.len())
                 .map(|(i, _)| i);
-            if let Some(i) = best {
+            // A longer prefix-cache entry (a parked conversation that went
+            // further) beats continuing a shorter pooled one, which then
+            // stays pooled.
+            let cached = if want_npu { 0 } else { self.prefix_cache().best_len(prompt_tokens) };
+            from_cache = best.is_some_and(|i| cached > pool[i].tokens.len());
+            if let Some(i) = best.filter(|_| !from_cache) {
                 let cached = pool.swap_remove(i);
                 self.kv_reuses.fetch_add(1, Ordering::Relaxed);
                 tracing::debug!(
@@ -3435,8 +3458,7 @@ impl Engine {
             // checkpoint (a copy of its running state taken at the end of an
             // earlier prefill), so its candidate keeps the latest checkpoint
             // at or before that point rather than the whole common prefix.
-            if !want_npu {
-                let cached = self.prefix_cache().best_len(prompt_tokens);
+            if !want_npu && !from_cache {
                 let best_edit = pool
                     .iter()
                     .enumerate()
@@ -3569,7 +3591,27 @@ impl Engine {
     /// budget is a ceiling, not a reservation, so a box that has since filled
     /// up keeps its roots but parks nothing more.
     fn ram_allows_parking() -> bool {
-        crate::placement::available_ram_bytes().is_none_or(|free| free >= LOW_MEM_FLOOR * 3)
+        Self::ram_allows_copy(0)
+    }
+
+    /// Whether host RAM can take a `bytes` snapshot and still keep
+    /// [`Self::ram_allows_parking`]'s margin: the copy exists alongside the
+    /// live session it is taken from.
+    fn ram_allows_copy(bytes: u64) -> bool {
+        crate::placement::available_ram_bytes()
+            .is_none_or(|free| free >= LOW_MEM_FLOOR * 3 + bytes)
+    }
+
+    /// Whether a snapshot of `session` after `keep` of its `len` tokens fits
+    /// the cache and host RAM, checked before copying anything.  The size is
+    /// an upper bound: the whole state, scaled to `keep` for an attention-only
+    /// model, whose state is all KV rows.
+    fn snapshot_fits(&self, session: &GenSession, keep: usize, len: usize) -> bool {
+        let mut bytes = session.state_bytes();
+        if session.supports_truncate() && keep < len && len > 0 {
+            bytes = (bytes as u128 * keep as u128 / len as u128) as u64;
+        }
+        self.prefix_cache().fits(bytes) && Self::ram_allows_copy(bytes)
     }
 
     /// Where the shared head of a chat prompt ends, as a byte offset into the
@@ -3627,6 +3669,9 @@ impl Engine {
     /// fed) as a root entry.  Best-effort: a model outside the shared session,
     /// or a snapshot over budget, stores nothing.
     fn store_root(&self, model: &GenSession, head: &[u32], len: usize) {
+        if !self.snapshot_fits(model, head.len(), len) {
+            return;
+        }
         if let Some(snap) = model.snapshot(head.len(), len) {
             let stored = self.prefix_cache().insert(head.to_vec(), snap, true);
             tracing::debug!(tokens = head.len(), stored, "prefix cache: system-prompt root");
@@ -3642,6 +3687,9 @@ impl Engine {
         }
         if !Self::ram_allows_parking() {
             self.prefix_cache().shed();
+            return;
+        }
+        if !self.snapshot_fits(session, tokens.len(), tokens.len()) {
             return;
         }
         if let Some(snap) = session.snapshot(tokens.len(), tokens.len()) {

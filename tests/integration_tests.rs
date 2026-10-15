@@ -619,11 +619,32 @@ mod synthetic {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A parked conversation that went further than a pooled session's
+    /// history wins over continuing the pooled one.
+    fn prefix_cache_prefers_a_longer_parked_conversation(arch: &str) {
+        let dir = prefix_cache_model(arch, "longer");
+        let warm = cached_engine(&dir, 1 << 30);
+        warm.complete_raw("hello a b c d e", &greedy(0)).unwrap();
+        // Parks the first conversation.
+        warm.complete_raw("world k", &greedy(0)).unwrap();
+        // Pools a session holding a short prefix of the first conversation.
+        warm.complete_raw("hello a", &greedy(0)).unwrap();
+        assert_eq!(warm.prefix_cache_stats().hits, 0, "{arch}");
+
+        let (got, _, _, _) = warm.complete_raw("hello a b c d e f", &greedy(3)).unwrap();
+        let stats = warm.prefix_cache_stats();
+        assert_eq!((stats.hits, stats.tokens_reused), (1, 6), "{arch}: resumed the longer state");
+        let plain = cached_engine(&dir, 0);
+        assert_eq!(got, plain.complete_raw("hello a b c d e f", &greedy(3)).unwrap().0, "{arch}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn prefix_cache_matches_an_uncached_engine() {
         for arch in ["qwen3moe", "qwen35", "qwen4exp", "deepseek2"] {
             prefix_cache_parks_alternating_conversations(arch);
             prefix_cache_root_serves_a_new_chat(arch);
+            prefix_cache_prefers_a_longer_parked_conversation(arch);
         }
     }
 

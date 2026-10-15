@@ -741,6 +741,12 @@ impl<W: LayerStack> Session<W> {
         }))
     }
 
+    /// Bytes this session's state holds: what a [`Self::snapshot`] of it
+    /// copies at most.
+    pub fn state_bytes(&self) -> u64 {
+        self.state.iter().map(W::state_bytes).sum()
+    }
+
     /// Continue from `snap`: this session's state becomes the snapshot's
     /// (moved back onto the weights' device when it was parked elsewhere).
     /// Refused (`Ok(false)`, state untouched) for a snapshot taken over other
