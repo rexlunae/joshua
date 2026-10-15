@@ -175,8 +175,15 @@ fn ConnectionBar() -> Element {
     };
 
     let connected = ctx.client.read().as_ref().map(|c| c.base().to_string());
-    let key_exposed = !key.read().trim().is_empty()
-        && normalize_base_url(&url.read()).is_ok_and(|base| exposes_credentials(&base));
+    // Warn about what is typed (before Connect) and about the live client,
+    // which keeps sending its key after the fields are edited.
+    let key_exposed = (!key.read().trim().is_empty()
+        && normalize_base_url(&url.read()).is_ok_and(|base| exposes_credentials(&base)))
+        || ctx
+            .client
+            .read()
+            .as_ref()
+            .is_some_and(|c| c.api_key().is_some() && exposes_credentials(c.base()));
     let health_tag = match &ctx.status.read().health {
         Some(Ok((h, _))) if h.is_ok() => rsx! { Tag { color: BulmaColor::Success, "healthy" } },
         Some(Ok((h, _))) => rsx! { Tag { color: BulmaColor::Warning, "{h.status}" } },
@@ -688,6 +695,14 @@ fn ClusterView() -> Element {
         }
         if let Some(e) = error() {
             Notification { color: BulmaColor::Danger, light: true, "{e}" }
+        }
+        // Adding a node checks it at once, so warn while the form is filled in.
+        if !new_key.read().trim().is_empty()
+            && normalize_base_url(&new_url.read()).is_ok_and(|base| exposes_credentials(&base))
+        {
+            Notification { color: BulmaColor::Warning, light: true,
+                "This is plain http:// to a non-loopback host: adding it sends the node's API key unencrypted. Use https:// for remote nodes."
+            }
         }
         p { class: "help mb-3", "Each node is checked with its own API key (if given); the connection bar's key is never sent to other nodes. /health never needs one." }
         Table { fullwidth: true, striped: true,
