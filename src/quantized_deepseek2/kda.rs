@@ -70,6 +70,28 @@ pub struct KdaState {
     s: Vec<f32>,
 }
 
+impl KdaState {
+    /// The same state on `device` (the forward replaces these tensors rather
+    /// than writing into them, so sharing them on one device is a copy).
+    pub(super) fn on(&self, device: &candle_core::Device) -> candle_core::Result<Self> {
+        use crate::native_session::tensor_on;
+        Ok(Self {
+            conv: [
+                tensor_on(&self.conv[0], device)?,
+                tensor_on(&self.conv[1], device)?,
+                tensor_on(&self.conv[2], device)?,
+            ],
+            s: self.s.clone(),
+        })
+    }
+
+    /// Bytes the state holds.
+    pub(super) fn bytes(&self) -> u64 {
+        self.conv.iter().map(crate::attention::tensor_bytes).sum::<u64>()
+            + (self.s.len() * std::mem::size_of::<f32>()) as u64
+    }
+}
+
 /// One verification pass's worth of KDA recurrence inputs: the per-token `q`,
 /// `k`, `v`, decay `g` and write gate `beta` the gated delta rule consumed,
 /// exactly as [`crate::kimi_k3::kda_recurrent_head_into`] read them, plus the

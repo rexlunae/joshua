@@ -239,6 +239,62 @@ pub fn truncate_kv(kv_cache: &mut KvCache, keep: usize) {
     }
 }
 
+/// A detached copy of the first `keep` cached positions on `device`: fresh
+/// buffers sized to exactly those rows, so appends to the copy or to the
+/// original never disturb the other (a plain clone shares the buffers; see
+/// [`SeqKvCache`]).  `None` when nothing is cached or `keep == 0`.
+pub fn fork_kv(kv_cache: &KvCache, keep: usize, device: &Device) -> Result<KvCache> {
+    match kv_cache {
+        Some(cache) if keep > 0 => cache.fork(keep, device).map(Some),
+        _ => Ok(None),
+    }
+}
+
+/// Bytes the cache's cached rows hold: what [`fork_kv`] copies (a live cache's
+/// buffers have room for more rows, which a fork leaves behind).
+pub fn kv_bytes(kv_cache: &KvCache) -> u64 {
+    kv_cache.as_ref().map_or(0, |c| {
+        let rows = |t: &Tensor| {
+            let cap = t.dims().get(2).copied().unwrap_or(0).max(1) as u64;
+            tensor_bytes(t) * c.len.min(cap as usize) as u64 / cap
+        };
+        rows(&c.k) + rows(&c.v)
+    })
+}
+
+/// A copy of `t` in a buffer of exactly its own size.  `Tensor::copy` (and
+/// `to_device`) carry a view's whole backing storage along, so a cut-down
+/// view copied that way would keep the full buffer alive.
+pub fn compact_copy(t: &Tensor) -> Result<Tensor> {
+    if !t.is_contiguous() {
+        // A strided copy into a fresh buffer of `t`'s size.
+        return t.contiguous();
+    }
+    let out = Tensor::zeros(t.shape(), t.dtype(), t.device())?;
+    out.slice_set(t, 0, 0)?;
+    Ok(out)
+}
+
+/// The first `keep` rows (dim 0) of `t` on `device`: shared when that is all
+/// of `t` and it is already there, else in a buffer of their own (see
+/// [`compact_copy`]).
+pub fn rows_on(t: &Tensor, keep: usize, device: &Device) -> Result<Tensor> {
+    if t.dim(0)? <= keep {
+        return crate::native_session::tensor_on(t, device);
+    }
+    let rows = compact_copy(&t.narrow(0, 0, keep)?)?;
+    if rows.device().same_device(device) {
+        Ok(rows)
+    } else {
+        rows.to_device(device)
+    }
+}
+
+/// Bytes a tensor's elements occupy.
+pub fn tensor_bytes(t: &Tensor) -> u64 {
+    (t.elem_count() * t.dtype().size_in_bytes()) as u64
+}
+
 /// Append this step's keys/values to `kv_cache` and attend `q` over the whole
 /// cached context.
 ///
@@ -366,6 +422,28 @@ impl SeqKvCache {
         Ok(())
     }
 
+    /// A cache holding a private copy of the first `keep` positions on
+    /// `device`, with buffers of exactly `keep` rows (the next append grows
+    /// them).  See [`fork_kv`].
+    fn fork(&self, keep: usize, device: &Device) -> Result<Self> {
+        let keep = keep.min(self.len);
+        let rows = |t: &Tensor| -> Result<Tensor> {
+            // Fresh buffers of exactly `keep` rows, sharing nothing with the
+            // live cache, which is written in place.
+            let rows = compact_copy(&t.narrow(2, 0, keep)?)?;
+            if rows.device().same_device(device) {
+                Ok(rows)
+            } else {
+                rows.to_device(device)
+            }
+        };
+        Ok(Self {
+            k: rows(&self.k)?,
+            v: rows(&self.v)?,
+            len: keep,
+        })
+    }
+
     /// Reallocate the buffers with room for `needed` rows (geometric
     /// growth), carrying the cached rows over.
     fn grow(&mut self, needed: usize) -> Result<()> {
@@ -459,6 +537,37 @@ fn copy_rows_runs<S: BackendStorage>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bytes charged for a cache are its cached rows, and a fork holds
+    /// exactly those rows in a buffer of their own, so the two agree even
+    /// when the live cache has room for more.
+    #[test]
+    fn kv_bytes_count_cached_rows_and_forks_are_exact() -> Result<()> {
+        let dev = Device::Cpu;
+        let row = |i: usize| Tensor::full(i as f32, (1, 2, 1, 3), &dev);
+        // `new` only sizes the buffers; the rows come from `append`.
+        let mut cache = SeqKvCache::new(&row(0)?, &row(0)?)?;
+        for i in 0..5 {
+            cache.append(&row(i)?, &row(i)?)?;
+        }
+        let kv = Some(cache);
+        let cap = kv.as_ref().unwrap().k().dim(2)?;
+        assert!(cap > 5, "the buffer grew past the rows used ({cap})");
+        let per_row = 2 * 3 * 4 * 2; // heads × dim × f32 × (k and v)
+        assert_eq!(kv_bytes(&kv), 5 * per_row);
+        let fork = fork_kv(&kv, 3, &dev)?;
+        let f = fork.as_ref().unwrap();
+        assert_eq!((f.len(), f.k().dim(2)?), (3, 3));
+        assert_eq!(kv_bytes(&fork), 3 * per_row);
+        let rows: Vec<f32> = f.k().narrow(1, 0, 1)?.narrow(3, 0, 1)?.flatten_all()?.to_vec1()?;
+        assert_eq!(rows, [0.0, 1.0, 2.0]);
+        // A compact copy of a view owns only the view's elements.
+        let view = kv.as_ref().unwrap().k().narrow(2, 0, 2)?;
+        let copy = compact_copy(&view)?;
+        assert_eq!(copy.storage_and_layout().1.start_offset(), 0);
+        assert_eq!(copy.dims(), view.dims());
+        Ok(())
+    }
 
     /// Grouped attention must equal the textbook form: K/V repeated per query
     /// head, softmax(q·kᵀ·scale + mask)·v — over a prefill followed by decode

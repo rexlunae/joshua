@@ -1688,6 +1688,39 @@ impl crate::native_session::LayerStack for Weights {
         state.ple_conv = checkpoint.ple_conv.clone();
         Ok(())
     }
+
+    fn fork_state(state: &LayerState, keep: usize, device: &Device) -> Result<LayerState> {
+        use crate::native_session::tensor_on;
+        if keep == 0 {
+            return Ok(LayerState::default());
+        }
+        // The forward replaces the recurrent tensors and the indexer keys
+        // rather than writing into them, so only the KV rows need a copy.
+        let delta = match &state.delta {
+            Some(d) => Some(DeltaState {
+                conv: tensor_on(&d.conv, device)?,
+                ssm: d.ssm.clone(),
+            }),
+            None => None,
+        };
+        Ok(LayerState {
+            kv: crate::attention::fork_kv(&state.kv, keep, device)?,
+            delta,
+            index: state.index.fork(keep, device)?,
+            ple_conv: state.ple_conv.as_ref().map(|t| tensor_on(t, device)).transpose()?,
+            capture: None,
+        })
+    }
+
+    fn state_bytes(state: &LayerState) -> u64 {
+        use crate::attention::tensor_bytes;
+        crate::attention::kv_bytes(&state.kv)
+            + state.delta.as_ref().map_or(0, |d| {
+                tensor_bytes(&d.conv) + (d.ssm.len() * std::mem::size_of::<f32>()) as u64
+            })
+            + state.index.bytes()
+            + state.ple_conv.as_ref().map_or(0, tensor_bytes)
+    }
 }
 
 /// A quantized Qwen-family model loaded from GGUF: one session over shared

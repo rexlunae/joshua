@@ -535,6 +535,119 @@ mod synthetic {
     }
 
 
+    fn prefix_cache_model(arch: &str, tag: &str) -> std::path::PathBuf {
+        let dir = model_dir(&format!("tiny-{arch}-{tag}"));
+        let path = dir.join("model.gguf");
+        match arch {
+            "qwen3moe" => write_tiny_qwen3moe_gguf(&path),
+            "deepseek2" => write_tiny_deepseek2_gguf(&path),
+            other => write_tiny_qwen_gguf(&path, other),
+        }
+        dir
+    }
+
+    fn cached_engine(dir: &std::path::Path, bytes: u64) -> joshua::Engine {
+        let options = joshua::EngineOptions::with_n_ctx(128)
+            .prefix_cache_bytes(bytes)
+            .prefix_cache_root_min(1);
+        joshua::Engine::with_options(dir, options).expect("engine should load")
+    }
+
+    fn greedy(max_tokens: u32) -> joshua::types::GenerationOptions {
+        joshua::types::GenerationOptions {
+            max_tokens,
+            temperature: 0.0,
+            repetition_penalty: 1.0,
+            ..Default::default()
+        }
+    }
+
+    /// Two alternating conversations: the second clears the pooled session
+    /// of the first, which parks it in the prefix cache first; when the first
+    /// comes back it resumes from there, and the second's session is still
+    /// pooled.  Every output matches an engine without the cache.
+    fn prefix_cache_parks_alternating_conversations(arch: &str) {
+        let dir = prefix_cache_model(arch, "park");
+        let warm = cached_engine(&dir, 1 << 30);
+        warm.complete_raw("hello a b c", &greedy(0)).unwrap();
+        warm.complete_raw("world k l", &greedy(0)).unwrap();
+        assert_eq!(warm.kv_reuse_count(), 0, "{arch}");
+        let stats = warm.prefix_cache_stats();
+        assert_eq!((stats.stored, stats.entries), (1, 1), "{arch}: the first chat parked");
+
+        let (back, _, _, _) = warm.complete_raw("hello a b c d", &greedy(3)).unwrap();
+        let stats = warm.prefix_cache_stats();
+        assert_eq!((stats.hits, stats.tokens_reused), (1, 4), "{arch}: resumed from the cache");
+        assert_eq!(warm.kv_reuse_count(), 1, "{arch}");
+        let (other, _, _, _) = warm.complete_raw("world k l m", &greedy(3)).unwrap();
+        assert_eq!(warm.kv_reuse_count(), 2, "{arch}: the other chat's session stayed pooled");
+
+        let plain = cached_engine(&dir, 0);
+        assert_eq!(back, plain.complete_raw("hello a b c d", &greedy(3)).unwrap().0, "{arch}");
+        let plain = cached_engine(&dir, 0);
+        assert_eq!(other, plain.complete_raw("world k l m", &greedy(3)).unwrap().0, "{arch}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A new chat with the same system prompt starts from the root entry the
+    /// first chat left, without disturbing the first chat's pooled session,
+    /// and answers exactly as an engine without the cache.
+    fn prefix_cache_root_serves_a_new_chat(arch: &str) {
+        use joshua::types::ChatMessage;
+        let dir = prefix_cache_model(arch, "root");
+        let sys = ChatMessage::text("system", "hello a b c d e");
+        let chat = |user: &str| vec![sys.clone(), ChatMessage::text("user", user)];
+
+        let warm = cached_engine(&dir, 1 << 30);
+        warm.complete(&chat("world"), &greedy(2)).unwrap();
+        let stats = warm.prefix_cache_stats();
+        assert_eq!((stats.stored, stats.entries), (1, 1), "{arch}: root stored");
+        let (second, _, _, _) = warm.complete(&chat("k l"), &greedy(3)).unwrap();
+        let stats = warm.prefix_cache_stats();
+        assert_eq!(stats.hits, 1, "{arch}: the new chat started from the root");
+        assert_eq!(stats.entries, 1, "{arch}: the root stays");
+        assert!(stats.tokens_reused > 0, "{arch}");
+        // A third chat hits the same root again.
+        let (third, _, _, _) = warm.complete(&chat("m"), &greedy(3)).unwrap();
+        assert_eq!(warm.prefix_cache_stats().hits, 2, "{arch}");
+
+        for (user, got) in [("k l", second), ("m", third)] {
+            let plain = cached_engine(&dir, 0);
+            let (want, _, _, _) = plain.complete(&chat(user), &greedy(3)).unwrap();
+            assert_eq!(got, want, "{arch}: root reuse must not change output");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A parked conversation that went further than a pooled session's
+    /// history wins over continuing the pooled one.
+    fn prefix_cache_prefers_a_longer_parked_conversation(arch: &str) {
+        let dir = prefix_cache_model(arch, "longer");
+        let warm = cached_engine(&dir, 1 << 30);
+        warm.complete_raw("hello a b c d e", &greedy(0)).unwrap();
+        // Parks the first conversation.
+        warm.complete_raw("world k", &greedy(0)).unwrap();
+        // Pools a session holding a short prefix of the first conversation.
+        warm.complete_raw("hello a", &greedy(0)).unwrap();
+        assert_eq!(warm.prefix_cache_stats().hits, 0, "{arch}");
+
+        let (got, _, _, _) = warm.complete_raw("hello a b c d e f", &greedy(3)).unwrap();
+        let stats = warm.prefix_cache_stats();
+        assert_eq!((stats.hits, stats.tokens_reused), (1, 6), "{arch}: resumed the longer state");
+        let plain = cached_engine(&dir, 0);
+        assert_eq!(got, plain.complete_raw("hello a b c d e f", &greedy(3)).unwrap().0, "{arch}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn prefix_cache_matches_an_uncached_engine() {
+        for arch in ["qwen3moe", "qwen35", "qwen4exp", "deepseek2"] {
+            prefix_cache_parks_alternating_conversations(arch);
+            prefix_cache_root_serves_a_new_chat(arch);
+            prefix_cache_prefers_a_longer_parked_conversation(arch);
+        }
+    }
+
     /// The embedding forward pass must reproduce candle's generation-model
     /// logits exactly (same weights, same input): if the hidden states going
     /// into the LM head match, the hidden states used for pooling are right.

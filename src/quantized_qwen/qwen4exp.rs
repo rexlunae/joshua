@@ -18,7 +18,7 @@
 use std::io::{Read, Seek};
 use std::sync::Arc;
 
-use candle_core::{DType, Module, Result, Tensor};
+use candle_core::{DType, Device, Module, Result, Tensor};
 use candle_nn::ops::{sigmoid, silu};
 use candle_transformers::quantized_nn::RmsNorm;
 
@@ -405,6 +405,47 @@ pub(super) struct QsaCache {
     /// `min(pooled_to, offset) / r` — the last block that still lies entirely
     /// inside the untouched prefix.
     pooled_to: usize,
+}
+
+impl QsaCache {
+    /// The cache as of position `keep`, on `device`: raw keys cut to `keep`
+    /// rows and only the blocks pooled entirely before it.  [`Qsa::mask`]
+    /// replaces these tensors rather than writing into them, so the rows are
+    /// shared, not copied, on the same device.
+    pub(super) fn fork(&self, keep: usize, device: &Device) -> Result<Self> {
+        use crate::attention::rows_on;
+        // Cut rows get buffers of their own (a view keeps the whole tensor).
+        let keys = match &self.keys {
+            Some(k) => Some(rows_on(k, keep, device)?),
+            None => None,
+        };
+        // `pooled_to` is exactly `blocks * ratio` (see `mask`), so the ratio
+        // is recovered from the two.
+        let (pooled, pooled_to) = match &self.pooled {
+            Some(p) if p.dim(0)? > 0 => {
+                let blocks = p.dim(0)?;
+                let r = self.pooled_to / blocks;
+                let n = (self.pooled_to.min(keep) / r.max(1)).min(blocks);
+                if n == 0 {
+                    (None, 0)
+                } else {
+                    (Some(rows_on(p, n, device)?), n * r)
+                }
+            }
+            _ => (None, 0),
+        };
+        Ok(Self {
+            keys,
+            pooled,
+            pooled_to,
+        })
+    }
+
+    /// Bytes the cached keys hold.
+    pub(super) fn bytes(&self) -> u64 {
+        use crate::attention::tensor_bytes;
+        self.keys.as_ref().map_or(0, tensor_bytes) + self.pooled.as_ref().map_or(0, tensor_bytes)
+    }
 }
 
 impl Qsa {

@@ -485,6 +485,43 @@ pub enum QuantizedModel {
     DeepSeek4(crate::quantized_deepseek4::ModelWeights),
 }
 
+/// A session's state detached from its model (see [`QuantizedModel::snapshot`]).
+pub enum ModelSnapshot {
+    Qwen(crate::native_session::SessionSnapshot<crate::quantized_qwen::Weights>),
+    DeepSeek2(crate::native_session::SessionSnapshot<crate::quantized_deepseek2::Weights>),
+}
+
+impl ModelSnapshot {
+    /// Tokens the state covers.
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Qwen(s) => s.len(),
+            Self::DeepSeek2(s) => s.len(),
+        }
+    }
+
+    /// Whether it covers no tokens.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Bytes the state holds.
+    pub fn bytes(&self) -> u64 {
+        match self {
+            Self::Qwen(s) => s.bytes(),
+            Self::DeepSeek2(s) => s.bytes(),
+        }
+    }
+
+    /// An independent copy on `device`.
+    pub fn duplicate(&self, device: &Device) -> Result<Self> {
+        Ok(match self {
+            Self::Qwen(s) => Self::Qwen(s.duplicate(device)?),
+            Self::DeepSeek2(s) => Self::DeepSeek2(s.duplicate(device)?),
+        })
+    }
+}
+
 /// Evaluate `$body` with `$m` bound to the model of any Joshua-native
 /// variant (`Qwen`, `DeepSeek2`, `DeepSeek4`) and `$wrap` to that variant's
 /// constructor; `$other` for candle's stock loaders.
@@ -903,6 +940,48 @@ impl QuantizedModel {
                 if self.supports_kv_truncate() { keep_len } else { 0 }
             }),
         }
+    }
+
+    /// A detached copy of this instance's state after `keep` of the `len`
+    /// tokens it has been fed, on `device` — what the engine's prefix cache
+    /// parks.  `None` for architectures outside the shared session and where
+    /// the state cannot be had at `keep` (see
+    /// [`crate::native_session::Session::snapshot`]).
+    pub fn snapshot(&self, keep: usize, len: usize, device: &Device) -> Result<Option<ModelSnapshot>> {
+        Ok(match self {
+            Self::Qwen(m) => m.snapshot(keep, len, device)?.map(ModelSnapshot::Qwen),
+            Self::DeepSeek2(m) => m.snapshot(keep, len, device)?.map(ModelSnapshot::DeepSeek2),
+            _ => None,
+        })
+    }
+
+    /// Whether [`Self::snapshot`] can detach this model's state (the shared
+    /// session loaders).
+    pub fn supports_snapshot(&self) -> bool {
+        session!(self, _m => true, _ => false)
+    }
+
+    /// Bytes this session's state holds, an upper bound on a snapshot of it
+    /// (`0` outside the shared session loaders).
+    pub fn state_bytes(&self) -> u64 {
+        session!(self, m => m.state_bytes(), _ => 0)
+    }
+
+    /// Continue from `snap`; `Ok(false)` (state untouched) when it was taken
+    /// from another architecture or other weights.
+    pub fn restore_snapshot(&mut self, snap: ModelSnapshot) -> Result<bool> {
+        match (self, snap) {
+            (Self::Qwen(m), ModelSnapshot::Qwen(s)) => m.restore(s),
+            (Self::DeepSeek2(m), ModelSnapshot::DeepSeek2(s)) => m.restore(s),
+            _ => Ok(false),
+        }
+    }
+
+    /// Take a prefix checkpoint at `pos` (the tokens fed so far) for a model
+    /// with recurrent layers; see
+    /// [`crate::native_session::Session::checkpoint_prefix`].
+    pub fn checkpoint_prefix(&mut self, pos: usize) {
+        session!(self, m => m.checkpoint_prefix(pos), _ => {})
     }
 
     /// Set how many prefix checkpoints a session of a recurrent model keeps

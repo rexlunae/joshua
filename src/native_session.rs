@@ -174,6 +174,29 @@ pub trait LayerStack: Send + Sync + 'static {
     fn restore_checkpoint(_state: &mut Self::State, _checkpoint: &Self::Checkpoint) -> Result<()> {
         Ok(())
     }
+
+    /// A copy of one layer's state holding its first `keep` positions on
+    /// `device`, sharing nothing that a later write to either copy could
+    /// disturb: the KV cache is written in place, so its rows are copied into
+    /// fresh buffers (see [`crate::attention::fork_kv`]).  Running state is
+    /// copied as it stands; [`Session::snapshot`] reinstates a prefix
+    /// checkpoint first when `keep` lies behind it.  A pending verification
+    /// capture is not carried over.
+    fn fork_state(state: &Self::State, keep: usize, device: &Device) -> Result<Self::State>;
+
+    /// Bytes one layer's state holds, for the engine's prefix-cache budget.
+    fn state_bytes(state: &Self::State) -> u64;
+}
+
+/// `t` on `device`, sharing its storage when it is already there.  For the
+/// state a forward replaces rather than writes in place (recurrent tensors,
+/// indexer keys), sharing is a safe copy.
+pub fn tensor_on(t: &Tensor, device: &Device) -> Result<Tensor> {
+    if t.device().same_device(device) {
+        Ok(t.clone())
+    } else {
+        t.to_device(device)
+    }
 }
 
 /// Token `idx`'s routed experts in an input's `routed` ids (token-major, `k`
@@ -296,6 +319,57 @@ impl<S> VerifyCheckpoint<S> {
         (self.offset..=self.offset + self.seq)
             .contains(&keep)
             .then_some(keep - self.offset)
+    }
+}
+
+/// A conversation's state after `pos` tokens, detached from any session: what
+/// the engine's prefix cache keeps between requests ([`Session::snapshot`],
+/// [`Session::restore`]).  It shares no buffer a live session writes to.
+pub struct SessionSnapshot<W: LayerStack> {
+    /// The weights the state was computed with; a restore into a session over
+    /// other weights is refused.
+    weights: Arc<W>,
+    pos: usize,
+    state: Vec<W::State>,
+    /// The token history, when the weights [want it](LayerStack::wants_tokens).
+    tokens: Vec<u32>,
+    device: Device,
+    bytes: u64,
+}
+
+impl<W: LayerStack> SessionSnapshot<W> {
+    /// Tokens the state covers.
+    pub fn len(&self) -> usize {
+        self.pos
+    }
+
+    /// Whether the snapshot covers no tokens (never true for one
+    /// [`Session::snapshot`] returned).
+    pub fn is_empty(&self) -> bool {
+        self.pos == 0
+    }
+
+    /// Bytes the state holds.
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    /// An independent copy on `device`, for a snapshot the cache keeps while
+    /// a session continues from it.
+    pub fn duplicate(&self, device: &Device) -> Result<Self> {
+        let state = self
+            .state
+            .iter()
+            .map(|s| W::fork_state(s, self.pos, device))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            weights: Arc::clone(&self.weights),
+            pos: self.pos,
+            bytes: state.iter().map(W::state_bytes).sum(),
+            state,
+            tokens: self.tokens.clone(),
+            device: device.clone(),
+        })
     }
 }
 
@@ -599,6 +673,106 @@ impl<W: LayerStack> Session<W> {
             return;
         }
         self.prefix.insert(PrefixCheckpoint { pos, layers });
+    }
+
+    /// Take a prefix checkpoint at `pos`, the number of tokens this session
+    /// has been fed, unless one is already there.  The engine calls it before
+    /// prefilling a follow-up turn, so the boundary before the new message —
+    /// where an agent that replaces its last message diverges — can be
+    /// resumed from (Strata's message-boundary checkpoint).  A no-op for a
+    /// model whose layers all truncate on their own.
+    pub fn checkpoint_prefix(&mut self, pos: usize) {
+        if pos > 0 && self.verify.is_none() && !self.prefix.points.iter().any(|p| p.pos == pos) {
+            self.take_prefix_checkpoint(pos);
+        }
+    }
+
+    /// A detached copy of this session's state as it stood after `keep` of
+    /// the `len` tokens it has been fed, on `device` (the host, to park it
+    /// off an accelerator).
+    ///
+    /// `None` when the state cannot be had at `keep`: a model with recurrent
+    /// layers needs `keep == len` or a prefix checkpoint at exactly `keep`,
+    /// and a pending verification pass leaves the state mid-rollback.
+    pub fn snapshot(
+        &self,
+        keep: usize,
+        len: usize,
+        device: &Device,
+    ) -> Result<Option<SessionSnapshot<W>>> {
+        if keep == 0 || keep > len || self.verify.is_some() {
+            return Ok(None);
+        }
+        let checkpoint = if keep == len || self.weights.can_truncate() {
+            None
+        } else {
+            match self.prefix.points.iter().find(|p| p.pos == keep) {
+                Some(cp) => Some(cp),
+                None => return Ok(None),
+            }
+        };
+        let mut state = Vec::with_capacity(self.state.len());
+        for (i, s) in self.state.iter().enumerate() {
+            let running = checkpoint.and_then(|c| c.layers.get(i)).and_then(Option::as_ref);
+            state.push(match running {
+                Some(cp) => {
+                    // Cut a throwaway clone back (it only moves its own
+                    // length) and give it the checkpoint's running state.
+                    let mut at = s.clone();
+                    W::truncate_state(&mut at, keep)?;
+                    W::restore_checkpoint(&mut at, cp)?;
+                    W::fork_state(&at, keep, device)?
+                }
+                None => W::fork_state(s, keep, device)?,
+            });
+        }
+        let tokens = if self.weights.wants_tokens() {
+            self.tokens[..keep.min(self.tokens.len())].to_vec()
+        } else {
+            Vec::new()
+        };
+        Ok(Some(SessionSnapshot {
+            weights: Arc::clone(&self.weights),
+            pos: keep,
+            bytes: state.iter().map(W::state_bytes).sum(),
+            state,
+            tokens,
+            device: device.clone(),
+        }))
+    }
+
+    /// Bytes this session's state holds: what a [`Self::snapshot`] of it
+    /// copies at most.
+    pub fn state_bytes(&self) -> u64 {
+        self.state.iter().map(W::state_bytes).sum()
+    }
+
+    /// Continue from `snap`: this session's state becomes the snapshot's
+    /// (moved back onto the weights' device when it was parked elsewhere).
+    /// Refused (`Ok(false)`, state untouched) for a snapshot taken over other
+    /// weights.
+    pub fn restore(&mut self, snap: SessionSnapshot<W>) -> Result<bool> {
+        if !Arc::ptr_eq(&self.weights, &snap.weights) || snap.state.len() != self.state.len() {
+            return Ok(false);
+        }
+        let device = self.weights.device().clone();
+        let state = if snap.device.same_device(&device) {
+            snap.state
+        } else {
+            snap.state
+                .iter()
+                .map(|s| W::fork_state(s, snap.pos, &device))
+                .collect::<Result<Vec<_>>>()?
+        };
+        self.state = state;
+        self.tokens = snap.tokens;
+        self.verify = None;
+        self.prefix.points.clear();
+        self.forget_last_routed();
+        // A recurrent model can come back to the restored position only
+        // through a checkpoint there.
+        self.take_prefix_checkpoint(snap.pos);
+        Ok(true)
     }
 
     /// Number of experts the residency backend can hold resident

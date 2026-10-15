@@ -159,6 +159,34 @@ impl IndexCache {
         self.pooled = None;
         Ok(())
     }
+
+    /// The first `keep` positions on `device`.  The indexer appends by
+    /// concatenating into new tensors, so on one device whole rows are
+    /// shared; cut rows get buffers of their own, since a view would keep
+    /// the full tensor alive.  The pooled keys are re-pooled on demand.
+    pub(super) fn fork(&self, keep: usize, device: &candle_core::Device) -> Result<Self> {
+        let on = |t: &Option<Tensor>| -> Result<Option<Tensor>> {
+            match t {
+                Some(_) if keep == 0 => Ok(None),
+                Some(t) => crate::attention::rows_on(t, keep, device).map(Some),
+                None => Ok(None),
+            }
+        };
+        Ok(Self {
+            keys: on(&self.keys)?,
+            gates: on(&self.gates)?,
+            pooled: None,
+        })
+    }
+
+    /// Bytes the cached keys hold.
+    pub(super) fn bytes(&self) -> u64 {
+        use crate::attention::tensor_bytes;
+        [&self.keys, &self.gates, &self.pooled]
+            .into_iter()
+            .map(|t| t.as_ref().map_or(0, tensor_bytes))
+            .sum()
+    }
 }
 
 /// Append `new` rows to a cached `[len, d]` tensor.

@@ -309,6 +309,25 @@ enum Commands {
         /// session; 0 turns them off (default 4).
         #[arg(long, env = "JOSHUA_PREFIX_CHECKPOINTS")]
         prefix_checkpoints: Option<usize>,
+        /// Host RAM (MiB) for the prefix cache: the state at the end of each
+        /// client's system prompt, so a new chat skips re-reading it, and the
+        /// state of conversations the warm session pool lets go of, so they
+        /// resume without re-reading their history.  Qwen-family and
+        /// deepseek2 models.  Default: an eighth of the free RAM at start, at
+        /// most 4096; 0 turns it off.
+        #[arg(long, env = "JOSHUA_PREFIX_CACHE_MIB")]
+        prefix_cache_mib: Option<u64>,
+        /// Shortest system prompt (tokens) kept in the prefix cache; a shorter
+        /// one is cheaper to read again (default 1024).
+        #[arg(long, env = "JOSHUA_PREFIX_CACHE_ROOT_MIN")]
+        prefix_cache_root_min: Option<usize>,
+        /// Move an `<env>` block (working directory, today's date, as opencode
+        /// writes it) out of the system prompt into the first user message, so
+        /// a new folder or a new day does not change the system prompt and
+        /// the prefix cache still covers it.  The model sees the same lines,
+        /// one message later.
+        #[arg(long, env = "JOSHUA_ENV_TO_USER")]
+        env_to_user: bool,
         /// Speculative token generation: draft up to N tokens per step by
         /// prompt lookup (the continuation of the latest earlier occurrence
         /// of the output's trailing n-gram) and verify them in one forward
@@ -698,6 +717,9 @@ async fn main() -> anyhow::Result<()> {
             vram_expert_cache,
             prefill_chunk,
             prefix_checkpoints,
+            prefix_cache_mib,
+            prefix_cache_root_min,
+            env_to_user,
             speculative,
             mlock_hot_weights,
             mlock_weight_budget,
@@ -753,6 +775,9 @@ async fn main() -> anyhow::Result<()> {
                 .vram_expert_cache(vram_cache)
                 .prefill_chunk(prefill_chunk)
                 .prefix_checkpoints_opt(prefix_checkpoints)
+                .prefix_cache_mib_opt(prefix_cache_mib)
+                .prefix_cache_root_min_opt(prefix_cache_root_min)
+                .env_to_user(env_to_user)
                 .speculative(speculative_config(speculative))
                 .mlock_hot_weights(
                     mlock_hot_weights
