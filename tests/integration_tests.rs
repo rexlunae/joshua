@@ -648,6 +648,38 @@ mod synthetic {
         }
     }
 
+    /// MTP drafting from the GGUF's NextN block changes nothing a greedy
+    /// request outputs, on an attention model and a recurrent hybrid, and
+    /// actually drafts.
+    #[test]
+    fn mtp_drafting_matches_plain_decoding() {
+        for arch in ["qwen3moe", "qwen35moe", "glm4moe"] {
+            let dir = model_dir(&format!("tiny-{arch}-mtp-engine"));
+            let path = dir.join("model.gguf");
+            match arch {
+                "glm4moe" => write_tiny_qwen_gguf(&path, arch),
+                _ => write_tiny_qwen_mtp_gguf(&path, arch),
+            }
+            let plain = joshua::Engine::with_options(&dir, joshua::EngineOptions::with_n_ctx(128))
+                .expect("engine should load");
+            // The cost gate off, so every step drafts.
+            let ungated = joshua::speculative::SpeculativeConfig {
+                cost_gate: false,
+                ..Default::default()
+            };
+            let options = joshua::EngineOptions::with_n_ctx(128).mtp(3).speculative(Some(ungated));
+            let mtp = joshua::Engine::with_options(&dir, options).expect("engine should load");
+            for prompt in ["hello a b c", "world k l d e f"] {
+                let (want, ..) = plain.complete_raw(prompt, &greedy(24)).unwrap();
+                let (got, ..) = mtp.complete_raw(prompt, &greedy(24)).unwrap();
+                assert_eq!(got, want, "{arch}: {prompt}");
+            }
+            let stats = mtp.speculative_stats();
+            assert!(stats.drafted > 0 && stats.verify_steps > 0, "{arch}: {stats:?}");
+            assert_eq!(plain.speculative_stats().drafted, 0, "{arch}");
+        }
+    }
+
     /// The embedding forward pass must reproduce candle's generation-model
     /// logits exactly (same weights, same input): if the hidden states going
     /// into the LM head match, the hidden states used for pooling are right.

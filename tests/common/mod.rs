@@ -1514,22 +1514,30 @@ pub fn write_tiny_qwen3moe_gguf(path: &Path) {
 ///   `qwen3next` uses the fused `ssm_ba`, Qwen3.5 split `ssm_beta` /
 ///   `ssm_alpha`; four value heads share two key heads.
 pub fn write_tiny_qwen_gguf(path: &Path, arch: &str) {
-    write_tiny_qwen_layers::<8, 16>(path, arch, None, false);
+    write_tiny_qwen_layers::<8, 16>(path, arch, None, false, false);
+}
+
+/// [`write_tiny_qwen_gguf`] with a NextN / MTP block after the trunk
+/// (`blk.{n_layer}.nextn.*` plus an attention + FFN layer and a
+/// `shared_head_norm`), as Qwen3.5/3.6 and GLM-4.5+ GGUFs carry it.  The
+/// GLM fixtures have one already (without `shared_head_norm`).
+pub fn write_tiny_qwen_mtp_gguf(path: &Path, arch: &str) {
+    write_tiny_qwen_layers::<8, 16>(path, arch, None, false, true);
 }
 
 /// Qwen3 fixture with enough layers to exercise two/three pipeline stages.
 pub fn write_tiny_qwen3_layers(path: &Path, layers: usize) {
     assert!(layers > 0);
-    write_tiny_qwen_layers::<8, 16>(path, "qwen3", Some(layers), false);
+    write_tiny_qwen_layers::<8, 16>(path, "qwen3", Some(layers), false, false);
 }
 
 /// Block-quantized Qwen3 fixture with 32-aligned matrix inputs.
 pub fn write_tiny_qwen3_quantized_layers(path: &Path, layers: usize) {
     assert!(layers > 0);
-    write_tiny_qwen_layers::<32, 64>(path, "qwen3", Some(layers), true);
+    write_tiny_qwen_layers::<32, 64>(path, "qwen3", Some(layers), true, false);
 }
 
-fn write_tiny_qwen_layers<const EMB: usize, const NFF: usize>(path: &Path, arch: &str, layers: Option<usize>, quantized: bool) {
+fn write_tiny_qwen_layers<const EMB: usize, const NFF: usize>(path: &Path, arch: &str, layers: Option<usize>, quantized: bool, mtp: bool) {
     let qtensor = |data: Vec<f32>, shape: &[usize]| {
         if quantized && shape.len() > 1 {
             let t = Tensor::from_vec(data, shape, &Device::Cpu).unwrap();
@@ -1552,7 +1560,7 @@ fn write_tiny_qwen_layers<const EMB: usize, const NFF: usize>(path: &Path, arch:
     let glm = matches!(arch, "chatglm" | "glm4" | "glm4moe");
     let fused_ffn = matches!(arch, "chatglm" | "glm4");
     let sandwich = arch == "glm4";
-    let nextn = if matches!(arch, "glm4" | "glm4moe") { 1 } else { 0 };
+    let nextn = if mtp || matches!(arch, "glm4" | "glm4moe") { 1 } else { 0 };
     let leading_dense = if arch == "glm4moe" { 1 } else { 0 };
     let shared_expert = matches!(arch, "qwen2moe" | "qwen3next" | "qwen35moe" | "qwen4exp");
     // qwen4exp: hyper-connections (2 streams, rank 3), QSA on the attention
@@ -1724,6 +1732,9 @@ fn write_tiny_qwen_layers<const EMB: usize, const NFF: usize>(path: &Path, arch:
             push("nextn.eh_proj.weight", next(EMB * 2 * EMB), &[EMB, 2 * EMB]);
             push("nextn.enorm.weight", gamma(next(EMB)), &[EMB]);
             push("nextn.hnorm.weight", gamma(next(EMB)), &[EMB]);
+            if mtp {
+                push("nextn.shared_head_norm.weight", gamma(next(EMB)), &[EMB]);
+            }
         }
         if hyper {
             let wide = hc * EMB;

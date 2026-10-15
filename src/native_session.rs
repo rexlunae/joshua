@@ -92,6 +92,41 @@ pub trait LayerStack: Send + Sync + 'static {
     /// Final norm + output head: `[1, n, residual]` → `[1, n, vocab]` (f32).
     fn head(&self, xs: &Tensor) -> Result<Tensor>;
 
+    /// Whether the weights carry a NextN / MTP draft block (see
+    /// [`Session::mtp_draft`]).  The three methods below serve only such
+    /// weights.
+    fn has_mtp(&self) -> bool {
+        false
+    }
+
+    /// The final norm alone: `[1, n, residual]` → the normed hidden
+    /// `[1, n, hidden]` the head reads ([`Self::head`] is
+    /// `head_logits(head_norm(xs))`).
+    fn head_norm(&self, _xs: &Tensor) -> Result<Tensor> {
+        candle_core::bail!("these weights have no MTP block")
+    }
+
+    /// The output head over normed rows: `[1, n, hidden]` → `[1, n, vocab]`
+    /// (f32).
+    fn head_logits(&self, _normed: &Tensor) -> Result<Tensor> {
+        candle_core::bail!("these weights have no MTP block")
+    }
+
+    /// The MTP block over `n` rows at `input.offset..`: `emb` is the rows'
+    /// token embeddings and `seeds` the normed trunk hidden of each row's
+    /// previous position, both `[1, n, hidden]`.  Appends the block's KV to
+    /// `state` and returns each row's normed output `[1, n, hidden]` (the
+    /// head's input, and a chained draft's seed).
+    fn mtp_forward(
+        &self,
+        _state: &mut Self::State,
+        _emb: &Tensor,
+        _seeds: &Tensor,
+        _input: &LayerInput<'_>,
+    ) -> Result<Tensor> {
+        candle_core::bail!("these weights have no MTP block")
+    }
+
     /// Whether every layer's state can be cut back to an arbitrary prefix
     /// ([`Self::truncate_state`]); recurrent layers cannot.
     fn can_truncate(&self) -> bool {
@@ -197,6 +232,71 @@ pub fn tensor_on(t: &Tensor, device: &Device) -> Result<Tensor> {
     } else {
         t.to_device(device)
     }
+}
+
+/// A session's MTP block state: the block's own KV, kept in step with the
+/// trunk so a draft can start at the next position.  Every trunk pass also
+/// runs its rows through the block, seeded with the trunk's normed hidden of
+/// each row's previous position — what the block was trained on — so the
+/// block's KV holds exactly what the model's authors' decoder would.
+struct MtpState<S> {
+    state: S,
+    /// Positions the block's KV covers.
+    len: usize,
+    /// The trunk's normed hidden at position `len - 1`: the seed of the row
+    /// at `len`.  `None` when unknown (after a rewind to a checkpoint or a
+    /// restored snapshot cut short), which seeds that row with zeros — a
+    /// worse draft, never a wrong output, since drafts are verified.
+    seed: Option<Tensor>,
+    /// A pending verification pass's normed trunk rows `(offset, rows)`, so
+    /// its rollback can recover the seed at the position it keeps.
+    verify_rows: Option<(usize, Tensor)>,
+}
+
+impl<S: Default> MtpState<S> {
+    fn new() -> Self {
+        Self { state: S::default(), len: 0, seed: None, verify_rows: None }
+    }
+}
+
+/// Run the trunk rows `offset..offset + n` through the MTP block: `emb` the
+/// rows' embeddings, `normed` the trunk's normed hidden of each row.  Skipped
+/// (the block falls behind and stops drafting until the session is cleared)
+/// when the block missed earlier positions.
+fn mtp_advance<W: LayerStack>(
+    w: &W,
+    m: &mut MtpState<W::State>,
+    emb: &Tensor,
+    normed: &Tensor,
+    offset: usize,
+    mask: Option<&Tensor>,
+    verify: bool,
+) -> Result<()> {
+    if m.len < offset {
+        return Ok(());
+    }
+    if m.len > offset {
+        W::truncate_state(&mut m.state, offset)?;
+        m.len = offset;
+        m.seed = None;
+    }
+    let n = normed.dim(1)?;
+    let first = match &m.seed {
+        Some(s) => s.clone(),
+        None => normed.narrow(1, 0, 1)?.zeros_like()?,
+    };
+    let seeds = if n > 1 {
+        Tensor::cat(&[&first, &normed.narrow(1, 0, n - 1)?], 1)?
+    } else {
+        first
+    };
+    let input = LayerInput { mask, offset, tokens: &[], verify: false };
+    w.mtp_forward(&mut m.state, emb, &seeds, &input)?;
+    m.len = offset + n;
+    // A copy, so the seed does not hold a whole prefill's rows alive.
+    m.seed = Some(normed.narrow(1, n - 1, 1)?.copy()?);
+    m.verify_rows = verify.then(|| (offset, normed.clone()));
+    Ok(())
 }
 
 /// Token `idx`'s routed experts in an input's `routed` ids (token-major, `k`
@@ -333,8 +433,32 @@ pub struct SessionSnapshot<W: LayerStack> {
     state: Vec<W::State>,
     /// The token history, when the weights [want it](LayerStack::wants_tokens).
     tokens: Vec<u32>,
+    /// The MTP block's KV and seed, when the session kept one up to `pos`.
+    mtp: Option<(W::State, Option<Tensor>)>,
     device: Device,
     bytes: u64,
+}
+
+/// A copy of an MTP block's state at `keep` positions on `device`, with its
+/// seed when that is the position the seed belongs to.
+fn fork_mtp<W: LayerStack>(
+    state: &W::State,
+    seed: Option<&Tensor>,
+    seed_at: bool,
+    keep: usize,
+    device: &Device,
+) -> Result<(W::State, Option<Tensor>)> {
+    let seed = match seed.filter(|_| seed_at) {
+        Some(t) => Some(t.to_device(device)?.copy()?),
+        None => None,
+    };
+    Ok((W::fork_state(state, keep, device)?, seed))
+}
+
+fn mtp_bytes<W: LayerStack>(mtp: &Option<(W::State, Option<Tensor>)>) -> u64 {
+    mtp.as_ref().map_or(0, |(s, seed)| {
+        W::state_bytes(s) + seed.as_ref().map_or(0, crate::attention::tensor_bytes)
+    })
 }
 
 impl<W: LayerStack> SessionSnapshot<W> {
@@ -362,12 +486,17 @@ impl<W: LayerStack> SessionSnapshot<W> {
             .iter()
             .map(|s| W::fork_state(s, self.pos, device))
             .collect::<Result<Vec<_>>>()?;
+        let mtp = match &self.mtp {
+            Some((s, seed)) => Some(fork_mtp::<W>(s, seed.as_ref(), true, self.pos, device)?),
+            None => None,
+        };
         Ok(Self {
             weights: Arc::clone(&self.weights),
             pos: self.pos,
-            bytes: state.iter().map(W::state_bytes).sum(),
+            bytes: state.iter().map(W::state_bytes).sum::<u64>() + mtp_bytes::<W>(&mtp),
             state,
             tokens: self.tokens.clone(),
+            mtp,
             device: device.clone(),
         })
     }
@@ -410,6 +539,9 @@ pub struct Session<W: LayerStack> {
     /// pass, so a rollback can predict from the token it keeps rather than
     /// a rejected draft.
     verify_routed: Vec<Vec<u32>>,
+    /// The MTP block's state while MTP drafting is on (see
+    /// [`Session::set_mtp`]).
+    mtp: Option<MtpState<W::State>>,
 }
 
 impl<W: LayerStack> Session<W> {
@@ -427,6 +559,7 @@ impl<W: LayerStack> Session<W> {
             predict_experts: false,
             last_routed: vec![Vec::new(); n],
             verify_routed: vec![Vec::new(); n],
+            mtp: None,
             weights,
         }
     }
@@ -455,6 +588,7 @@ impl<W: LayerStack> Session<W> {
             predict_experts: self.predict_experts,
             last_routed: vec![Vec::new(); self.state.len()],
             verify_routed: vec![Vec::new(); self.state.len()],
+            mtp: self.mtp.as_ref().map(|_| MtpState::new()),
         }
     }
 
@@ -518,6 +652,9 @@ impl<W: LayerStack> Session<W> {
         // Positions from `offset` on are rewritten by this pass.
         self.prefix.invalidate_after(offset);
         let mut xs = self.embed(input, seq_len)?;
+        // The MTP block reads each row's embedding (the trunk carries a
+        // plain residual whenever it has the block).
+        let emb = self.mtp.is_some().then(|| xs.clone());
         let mask = if seq_len == 1 {
             None
         } else {
@@ -604,11 +741,75 @@ impl<W: LayerStack> Session<W> {
             self.take_prefix_checkpoint(offset + seq_len);
         }
 
+        if let (Some(m), Some(emb)) = (self.mtp.as_mut(), emb) {
+            // The trunk's normed rows seed the MTP block; the head reads the
+            // same rows, so the logits are those of `head`.
+            let normed = w.head_norm(&xs)?;
+            mtp_advance(&*w, m, &emb, &normed, offset, mask.as_ref(), all_logits)?;
+            return if all_logits {
+                w.head_logits(&normed)
+            } else {
+                w.head_logits(&normed.narrow(1, seq_len - 1, 1)?)?.squeeze(1)
+            };
+        }
         if all_logits {
             w.head(&xs)
         } else {
             w.head(&xs.narrow(1, seq_len - 1, 1)?)?.squeeze(1)
         }
+    }
+
+    /// Turn MTP drafting on or off for this session and every session derived
+    /// from it.  On, every forward pass also runs its rows through the
+    /// weights' NextN block (one more layer per row) so
+    /// [`Self::mtp_draft`] can draft from the next position.  Takes effect
+    /// from an empty session; returns whether the weights have the block.
+    pub fn set_mtp(&mut self, on: bool) -> bool {
+        let has = self.weights.has_mtp();
+        self.mtp = (on && has).then(MtpState::new);
+        has
+    }
+
+    /// Whether MTP drafting is on (see [`Self::set_mtp`]).
+    pub fn mtp_enabled(&self) -> bool {
+        self.mtp.is_some()
+    }
+
+    /// Draft up to `n` tokens after `next`, the token about to be fed at
+    /// `pos`, with the MTP block: the row `(next, h_{pos-1})` predicts the
+    /// first draft, and each further row chains the block's own output as
+    /// its seed.  Greedy picks.  Leaves the session as it was (the draft
+    /// rows' KV is cut back off); empty when MTP is off or the block is not
+    /// at `pos`.
+    pub fn mtp_draft(&mut self, next: u32, pos: usize, n: usize) -> Result<Vec<u32>> {
+        let w = Arc::clone(&self.weights);
+        let Some(m) = self.mtp.as_mut() else {
+            return Ok(Vec::new());
+        };
+        if n == 0 || m.len != pos {
+            return Ok(Vec::new());
+        }
+        let emb_table = w.tok_embeddings();
+        let hidden = emb_table.hidden()?;
+        // Each pick stays on the device and feeds the next row's embedding
+        // directly; the draft is read back once, at the end.
+        let mut ids = Tensor::new(&[next], w.device())?;
+        let mut picks = Vec::with_capacity(n);
+        let mut seed = m.seed.clone();
+        for d in 0..n {
+            let emb = emb_table.forward(&ids)?.reshape((1, 1, hidden))?;
+            let s = match seed.take() {
+                Some(s) => s,
+                None => emb.zeros_like()?,
+            };
+            let input = LayerInput { mask: None, offset: pos + d, tokens: &[], verify: false };
+            let out = w.mtp_forward(&mut m.state, &emb, &s, &input)?;
+            ids = w.head_logits(&out)?.flatten_all()?.argmax_keepdim(0)?;
+            picks.push(ids.clone());
+            seed = Some(out);
+        }
+        W::truncate_state(&mut m.state, pos)?;
+        Tensor::cat(&picks, 0)?.to_vec1::<u32>()
     }
 
     /// Set the routing-frequency hot-expert cache budget (experts kept
@@ -731,12 +932,17 @@ impl<W: LayerStack> Session<W> {
         } else {
             Vec::new()
         };
+        let mtp = match self.mtp.as_ref().filter(|m| m.len >= keep) {
+            Some(m) => Some(fork_mtp::<W>(&m.state, m.seed.as_ref(), m.len == keep, keep, device)?),
+            None => None,
+        };
         Ok(Some(SessionSnapshot {
             weights: Arc::clone(&self.weights),
             pos: keep,
-            bytes: state.iter().map(W::state_bytes).sum(),
+            bytes: state.iter().map(W::state_bytes).sum::<u64>() + mtp_bytes::<W>(&mtp),
             state,
             tokens,
+            mtp,
             device: device.clone(),
         }))
     }
@@ -744,7 +950,8 @@ impl<W: LayerStack> Session<W> {
     /// Bytes this session's state holds: what a [`Self::snapshot`] of it
     /// copies at most.
     pub fn state_bytes(&self) -> u64 {
-        self.state.iter().map(W::state_bytes).sum()
+        let mtp = self.mtp.as_ref().map_or(0, |m| W::state_bytes(&m.state));
+        self.state.iter().map(W::state_bytes).sum::<u64>() + mtp
     }
 
     /// Continue from `snap`: this session's state becomes the snapshot's
@@ -766,6 +973,19 @@ impl<W: LayerStack> Session<W> {
         };
         self.state = state;
         self.tokens = snap.tokens;
+        if let Some(m) = self.mtp.as_mut() {
+            // Without the block's state the conversation runs undrafted
+            // (the block stays behind) until the session is cleared.
+            *m = MtpState::new();
+            if let Some((st, seed)) = snap.mtp {
+                let (state, seed) = if snap.device.same_device(&device) {
+                    (st, seed)
+                } else {
+                    fork_mtp::<W>(&st, seed.as_ref(), true, snap.pos, &device)?
+                };
+                *m = MtpState { state, len: snap.pos, seed, verify_rows: None };
+            }
+        }
         self.verify = None;
         self.prefix.points.clear();
         self.forget_last_routed();
@@ -792,6 +1012,9 @@ impl<W: LayerStack> Session<W> {
         self.verify = None;
         self.prefix.points.clear();
         self.forget_last_routed();
+        if let Some(m) = self.mtp.as_mut() {
+            *m = MtpState::new();
+        }
     }
 
     /// Drop the next-step expert prediction: the token it was taken from is
@@ -832,6 +1055,9 @@ impl<W: LayerStack> Session<W> {
     /// it is done with the step.
     pub fn discard_verify(&mut self) {
         self.verify = None;
+        if let Some(m) = self.mtp.as_mut() {
+            m.verify_rows = None;
+        }
         for s in self.state.iter_mut() {
             W::clear_verify(s);
         }
@@ -910,6 +1136,21 @@ impl<W: LayerStack> Session<W> {
         }
         self.prefix.invalidate_after(keep);
         self.tokens.truncate(keep);
+        if let Some(m) = self.mtp.as_mut() {
+            let rows = m.verify_rows.take();
+            if m.len > keep {
+                W::truncate_state(&mut m.state, keep)?;
+                m.len = keep;
+                // Inside the verification pass just rolled back, its rows
+                // hold the trunk's hidden at the position kept.
+                m.seed = match rows {
+                    Some((off, rows)) if keep > off && keep <= off + rows.dim(1)? => {
+                        Some(rows.narrow(1, keep - off - 1, 1)?.copy()?)
+                    }
+                    _ => None,
+                };
+            }
+        }
         Ok(())
     }
 }
@@ -969,6 +1210,26 @@ impl<W: LayerStack> crate::stream_prefill::StreamPrefill for Session<W> {
         // Every layer has seen every chunk: the state now stands at the
         // prompt's end, the boundary an edit of the next turn resumes from.
         self.take_prefix_checkpoint(end);
+    }
+
+    fn finish_chunks(
+        &mut self,
+        chunks: &[crate::stream_prefill::Chunk],
+        acts: &[Tensor],
+    ) -> Result<()> {
+        if self.mtp.is_none() {
+            return Ok(());
+        }
+        let w = Arc::clone(&self.weights);
+        for (chunk, act) in chunks.iter().zip(acts) {
+            let n = chunk.tokens.len();
+            let emb = self.embed(&Tensor::new(chunk.tokens, w.device())?.unsqueeze(0)?, n)?;
+            let normed = w.head_norm(act)?;
+            let mask = if n == 1 { None } else { Some(self.mask.mask(n, chunk.pos)?) };
+            let m = self.mtp.as_mut().expect("checked above");
+            mtp_advance(&*w, m, &emb, &normed, chunk.pos, mask.as_ref(), false)?;
+        }
+        Ok(())
     }
 
     fn final_logits(&self, last: &Tensor) -> Result<Tensor> {

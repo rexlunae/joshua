@@ -491,6 +491,16 @@ pub struct EngineOptions {
     /// on the others — candle's stock loaders and the recurrent DeltaNet /
     /// KDA hybrids — the request warns at load and is ignored.
     pub speculative: Option<SpeculativeConfig>,
+    /// MTP drafting: up to this many draft tokens per decode step from the
+    /// model's own NextN / MTP block (the `blk.<n_layer>.nextn.*` tensors
+    /// GLM-4.5+ and Qwen3.5/3.6 GGUFs carry), verified like prompt-lookup
+    /// drafts, so output is unchanged.  `0` (the default) turns it off.  On a
+    /// model with the block it replaces prompt lookup; elsewhere it is
+    /// ignored with a warning.  Each forward pass also runs its rows through
+    /// the block (one more layer) to keep the block's KV current.  The cost
+    /// gate of [`Self::speculative`] (on unless that config turns it off)
+    /// holds drafting off while it measures slower than plain decoding.
+    pub mtp: usize,
 }
 
 impl EngineOptions {
@@ -658,6 +668,13 @@ impl EngineOptions {
         self.speculative = config;
         self
     }
+
+    /// Draft up to `n` tokens per step with the model's MTP block (`0`: off).
+    /// See [`EngineOptions::mtp`].
+    pub fn mtp(mut self, n: usize) -> Self {
+        self.mtp = n;
+        self
+    }
 }
 
 // ─── Env flags ───────────────────────────────────────────────────────────────
@@ -812,6 +829,8 @@ pub struct Engine {
     arch: Option<crate::model::Architecture>,
     /// Speculative decoding settings (see [`EngineOptions::speculative`]).
     speculative: Option<SpeculativeConfig>,
+    /// MTP drafts per step (see [`EngineOptions::mtp`]).
+    mtp: usize,
     /// Draft tokens verified by speculative decoding.
     spec_drafted: AtomicU64,
     /// Draft tokens the model accepted.
@@ -992,6 +1011,24 @@ impl GenSession {
             Self::Npu(_) => Err(JoshuaError::Inference(
                 "speculative verification is not supported on the NPU session".into(),
             )),
+        }
+    }
+
+    /// Whether MTP drafting is on for this session.
+    fn mtp_enabled(&self) -> bool {
+        match self {
+            Self::Candle(model) => model.mtp_enabled(),
+            Self::Npu(_) => false,
+        }
+    }
+
+    /// Up to `n` MTP drafts after `next`, the token about to be fed at `pos`.
+    fn mtp_draft(&mut self, next: u32, pos: usize, n: usize) -> Result<Vec<u32>> {
+        match self {
+            Self::Candle(model) => model
+                .mtp_draft(next, pos, n)
+                .map_err(|e| JoshuaError::Inference(e.to_string())),
+            Self::Npu(_) => Ok(Vec::new()),
         }
     }
 
@@ -2003,6 +2040,7 @@ impl Engine {
             remote_pool_cap: None,
             remote_capacity: None,
             speculative,
+            mtp: options.mtp.min(crate::speculative::MAX_MTP_DRAFT),
             spec_drafted: AtomicU64::new(0),
             spec_accepted: AtomicU64::new(0),
             spec_verify_steps: AtomicU64::new(0),
@@ -2903,13 +2941,26 @@ impl Engine {
 
         // Speculative decoding needs a text context to draft from and a
         // session that can verify and roll back.
+        // MTP drafting (the model's own NextN block) takes the place of
+        // prompt lookup where the session has it.
+        let mtp = if self.mtp > 0 && model.mtp_enabled() && model.supports_speculative() {
+            self.mtp
+        } else {
+            0
+        };
         let spec = self
             .speculative
-            .filter(|_| !penalty_seed.is_empty() && model.supports_speculative());
+            .filter(|_| mtp == 0 && !penalty_seed.is_empty() && model.supports_speculative());
         let mut drafter = spec.map(|c| NgramDrafter::new(c, penalty_seed));
-        let mut draft_len = spec.map_or(0, |c| c.max_draft);
+        let max_draft = if mtp > 0 { mtp } else { spec.map_or(1, |c| c.max_draft) };
+        let mut draft_len = if mtp > 0 { mtp } else { spec.map_or(0, |c| c.max_draft) };
         // Holds drafting off while it measures slower than plain decoding.
-        let mut gate = spec.filter(|c| c.cost_gate).map(|_| SpeculationGate::default());
+        let gated = if mtp > 0 {
+            self.speculative.is_none_or(|c| c.cost_gate)
+        } else {
+            spec.is_some_and(|c| c.cost_gate)
+        };
+        let mut gate = gated.then(SpeculationGate::default);
         let (mut n_drafted, mut n_accepted, mut n_verify) = (0u64, 0u64, 0u64);
         // A token already chosen by a rejected verification (the
         // correction), to emit before sampling anything new.
@@ -2967,16 +3018,24 @@ impl Engine {
             // The gate is asked only when there is a draft, so steps with no
             // match don't use up its probes.
             drafts.clear();
-            if let Some(d) = drafter.as_mut() {
-                let room = (options.max_tokens - text.n_decoded) as usize;
-                let ctx_room = n_ctx.saturating_sub(n_cur + 1);
+            // An MTP step's cost includes drafting, so its clock starts here.
+            let step_start = Instant::now();
+            let room = (options.max_tokens - text.n_decoded) as usize;
+            let ctx_room = n_ctx.saturating_sub(n_cur + 1);
+            if mtp > 0 {
+                // The block always has a draft, so the gate is asked first
+                // and a held step costs no draft pass.
+                let n = draft_len.min(room).min(ctx_room);
+                if n > 0 && gate.as_mut().is_none_or(SpeculationGate::allow) {
+                    drafts = model.mtp_draft(next_token, n_cur, n)?;
+                }
+            } else if let Some(d) = drafter.as_mut() {
                 d.draft_into(draft_len.min(room).min(ctx_room), &mut drafts);
                 if !drafts.is_empty() && !gate.as_mut().is_none_or(SpeculationGate::allow) {
                     drafts.clear();
                 }
             }
 
-            let step_start = Instant::now();
             if drafts.is_empty() {
                 // Single-token decode step.
                 logits_vec = model.forward_tokens(&[next_token], n_cur, &self.dense_device)?;
@@ -3036,7 +3095,6 @@ impl Engine {
             n_drafted += drafts.len() as u64;
             n_accepted += accepted as u64;
             n_verify += 1;
-            let max_draft = spec.map_or(1, |c| c.max_draft);
             draft_len = next_draft_len(draft_len, drafts.len(), accepted, max_draft);
 
             // Roll the KV cache back past every draft token not kept.
@@ -3058,7 +3116,7 @@ impl Engine {
             }
         }
 
-        if spec.is_some() && n_drafted > 0 {
+        if n_drafted > 0 {
             self.spec_drafted.fetch_add(n_drafted, Ordering::Relaxed);
             self.spec_accepted.fetch_add(n_accepted, Ordering::Relaxed);
             self.spec_verify_steps.fetch_add(n_verify, Ordering::Relaxed);
@@ -3824,16 +3882,24 @@ impl Engine {
             .map_err(|e| JoshuaError::ModelLoad(format!("GGUF read failed: {e}")))?;
         // Hand the loader the mapping so architectures Joshua implements
         // itself can borrow weights in place rather than copying them.
-        let mut model = QuantizedModel::from_gguf_mmap_placed(
-            gguf,
-            &mut cursor,
-            &self.dense_device,
-            &self.expert_device,
-            Some(Arc::clone(&self.mmap)),
-            self.model_file.clone(),
-            self.n_ctx as usize,
-            self.device_expert_cache,
-        )
+        let load = || {
+            QuantizedModel::from_gguf_mmap_placed(
+                gguf,
+                &mut cursor,
+                &self.dense_device,
+                &self.expert_device,
+                Some(Arc::clone(&self.mmap)),
+                self.model_file.clone(),
+                self.n_ctx as usize,
+                self.device_expert_cache,
+            )
+        };
+        // Read the NextN block only when it will draft.
+        let mut model = if self.mtp > 0 {
+            crate::quantized_qwen::with_mtp_block(load)
+        } else {
+            load()
+        }
         .map_err(|e| JoshuaError::ModelLoad(format!("model init failed: {e}")))?;
         let mut budget = if self.expert_cache_auto {
             self.auto_expert_budget(&model)
@@ -3862,6 +3928,12 @@ impl Engine {
         model.set_pin_hot_experts(budget);
         model.set_prefix_checkpoints(self.prefix_checkpoints);
         model.set_speculative_expert_prefetch(self.predict_experts);
+        if self.mtp > 0 && !model.set_mtp(true) {
+            tracing::warn!(
+                "--mtp requested, but this model has no NextN / MTP block the loader reads; \
+                 the flag is ignored"
+            );
+        }
         match model.new_session() {
             Some(session) => {
                 tracing::info!(

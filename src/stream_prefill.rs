@@ -68,6 +68,14 @@ pub trait StreamPrefill {
     /// whole once the sweep finishes (the session's prefix checkpoints).
     fn end_stream(&mut self, _end: usize) {}
 
+    /// Called once after the sweep with every chunk and its final-layer
+    /// activation, in prompt order: a hook for a draft head that reads the
+    /// trunk's last hidden state of every prompt row (the session's MTP
+    /// block).  Default: ignored.
+    fn finish_chunks(&mut self, _chunks: &[Chunk], _acts: &[Tensor]) -> Result<()> {
+        Ok(())
+    }
+
     /// Called before each `apply_layer_chunk` with the chunk's index, the
     /// chunk count and the number of prompt tokens before this chunk, so a
     /// loader can tell the final prompt chunk apart (the deepseek4 device
@@ -146,6 +154,7 @@ pub fn stream_prefill<M: StreamPrefill + ?Sized>(
     }
 
     m.end_stream(last_chunk.pos + last_chunk.tokens.len());
+    m.finish_chunks(chunks, &acts)?;
     // The prefill prediction is the last chunk's last-token logits.
     m.final_logits(acts.last().expect("non-empty chunks"))
 }

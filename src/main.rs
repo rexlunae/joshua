@@ -349,6 +349,15 @@ enum Commands {
             hide_default_value = true
         )]
         speculative: usize,
+        /// MTP drafting: draft up to N tokens per step (at most 7) with the
+        /// model's own NextN / MTP block, which GLM-4.5+ and Qwen3.5/3.6
+        /// GGUFs carry, and verify them in one forward pass.  Output is
+        /// unchanged.  Replaces --speculative's prompt lookup on a model with
+        /// the block and is ignored with a warning on one without.  Every
+        /// forward pass also runs through the block (one more layer).  `0`
+        /// (the default) disables it and skips loading the block.
+        #[arg(long, env = "JOSHUA_MTP", default_value_t = 0, hide_default_value = true)]
+        mtp: usize,
         /// Lock the always-touched weights into RAM (mlock).  Needs the
         /// process memlock limit to cover the hot set: `LimitMEMLOCK=infinity`
         /// (systemd), `ulimit -l unlimited`, or /etc/security/limits.conf.
@@ -582,6 +591,15 @@ enum Commands {
             hide_default_value = true
         )]
         speculative: usize,
+        /// MTP drafting: draft up to N tokens per step (at most 7) with the
+        /// model's own NextN / MTP block, which GLM-4.5+ and Qwen3.5/3.6
+        /// GGUFs carry, and verify them in one forward pass.  Output is
+        /// unchanged.  Replaces --speculative's prompt lookup on a model with
+        /// the block and is ignored with a warning on one without.  Every
+        /// forward pass also runs through the block (one more layer).  `0`
+        /// (the default) disables it and skips loading the block.
+        #[arg(long, env = "JOSHUA_MTP", default_value_t = 0, hide_default_value = true)]
+        mtp: usize,
         /// Lock the always-touched weights into RAM (mlock).  Needs the
         /// process memlock limit to cover the hot set: `LimitMEMLOCK=infinity`
         /// (systemd), `ulimit -l unlimited`, or /etc/security/limits.conf.
@@ -721,6 +739,7 @@ async fn main() -> anyhow::Result<()> {
             prefix_cache_root_min,
             env_to_user,
             speculative,
+            mtp,
             mlock_hot_weights,
             mlock_weight_budget,
             expert_placement,
@@ -779,6 +798,7 @@ async fn main() -> anyhow::Result<()> {
                 .prefix_cache_root_min_opt(prefix_cache_root_min)
                 .env_to_user(env_to_user)
                 .speculative(speculative_config(speculative))
+                .mtp(mtp)
                 .mlock_hot_weights(
                     mlock_hot_weights
                         .map(MlockMode::from)
@@ -922,6 +942,7 @@ async fn main() -> anyhow::Result<()> {
             vram_expert_cache,
             prefill_chunk,
             speculative,
+            mtp,
             mlock_hot_weights,
             mlock_weight_budget,
             expert_placement,
@@ -965,6 +986,7 @@ async fn main() -> anyhow::Result<()> {
                 .vram_expert_cache(vram_cache)
                 .prefill_chunk(prefill_chunk)
                 .speculative(speculative_config(speculative))
+                .mtp(mtp)
                 .mlock_hot_weights(
                     mlock_hot_weights
                         .map(MlockMode::from)

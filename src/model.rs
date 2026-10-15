@@ -984,6 +984,26 @@ impl QuantizedModel {
         session!(self, m => m.checkpoint_prefix(pos), _ => {})
     }
 
+    /// Turn MTP drafting on or off (see
+    /// [`crate::native_session::Session::set_mtp`]); returns whether the
+    /// model has a NextN / MTP block to draft with.  Only the Qwen-family
+    /// loader reads one today.
+    pub fn set_mtp(&mut self, on: bool) -> bool {
+        session!(self, m => m.set_mtp(on), _ => false)
+    }
+
+    /// Whether MTP drafting is on.
+    pub fn mtp_enabled(&self) -> bool {
+        session!(self, m => m.mtp_enabled(), _ => false)
+    }
+
+    /// Up to `n` MTP drafts after `next`, the token about to be fed at `pos`
+    /// (see [`crate::native_session::Session::mtp_draft`]); empty when MTP is
+    /// off.
+    pub fn mtp_draft(&mut self, next: u32, pos: usize, n: usize) -> Result<Vec<u32>> {
+        session!(self, m => m.mtp_draft(next, pos, n), _ => Ok(Vec::new()))
+    }
+
     /// Set how many prefix checkpoints a session of a recurrent model keeps
     /// (`0` turns them off); see
     /// [`crate::native_session::Session::set_prefix_checkpoints`].  Other

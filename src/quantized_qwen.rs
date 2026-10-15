@@ -211,6 +211,8 @@ impl SsmConfig {
 struct Config {
     arch: &'static str,
     n_layer: usize,
+    /// NextN / MTP blocks appended after the trunk.
+    n_nextn: usize,
     n_head: usize,
     n_kv_head: usize,
     head_dim: usize,
@@ -264,6 +266,7 @@ impl Config {
             candle_core::bail!("{arch}: nextn_predict_layers exceeds block_count {block_count}");
         };
         let n_layer = n_layer as usize;
+        let n_nextn = (block_count as usize) - n_layer;
         let n_embd = m.u32("embedding_length")? as usize;
         let context_length = m.u32("context_length")? as usize;
         let rms_eps = m.f32("attention.layer_norm_rms_epsilon")? as f64;
@@ -405,6 +408,7 @@ impl Config {
         Ok(Self {
             arch,
             n_layer,
+            n_nextn,
             n_head,
             n_kv_head,
             head_dim,
@@ -1541,6 +1545,77 @@ pub struct Weights {
     /// cache later).  Built once at load from the per-expert handles.
     residency: Arc<dyn crate::residency::ExpertResidency>,
     n_expert: usize,
+    /// The NextN / MTP draft block, when the file has one.
+    mtp: Option<Mtp>,
+}
+
+/// The NextN / MTP block a GGUF appends after the trunk (`blk.{n_layer}`;
+/// GLM-4.5+, Qwen3.5/3.6): one more attention + FFN layer that reads a
+/// token's embedding together with the trunk's final normed hidden state of
+/// the position before it, and predicts the token after it.  Joshua uses it
+/// as a speculative drafter (see [`crate::native_session::Session::mtp_draft`]).
+///
+/// Row `q` is `eh_proj([enorm(emb(t_q)) ‖ hnorm(h_{q-1})])` through the layer
+/// at position `q`, then `shared_head_norm` and the trunk's output head.  A
+/// chained draft seeds the next row with that normed output instead of a
+/// trunk hidden (Strata's `forward_mtp` / `spec_step`).
+struct Mtp {
+    enorm: RmsNorm,
+    hnorm: RmsNorm,
+    eh_proj: Linear,
+    layer: Layer,
+    /// `nextn.shared_head_norm`; the trunk's output norm when absent.
+    head_norm: Option<RmsNorm>,
+}
+
+thread_local! {
+    static LOAD_MTP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` with this thread's Qwen loads reading a GGUF's NextN (MTP) block.
+/// Off by default: the block is a whole extra layer (with a MoE model, its
+/// own routed-expert pool), so only a caller that will draft with it pays
+/// for loading it.
+pub fn with_mtp_block<T>(f: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            LOAD_MTP.set(self.0);
+        }
+    }
+    let _restore = Restore(LOAD_MTP.replace(true));
+    f()
+}
+
+impl Mtp {
+    /// The first NextN block, or `None` when the file has none or the load
+    /// is not inside [`with_mtp_block`].  Not for hyper-connection models,
+    /// whose trunk hidden is several streams wide.
+    fn load<R: Read + Seek>(
+        rd: &mut Reader<R>,
+        cfg: &Config,
+        n_embd: usize,
+        rope: &Arc<Rope>,
+    ) -> Result<Option<Self>> {
+        let p = format!("blk.{}", cfg.n_layer);
+        if cfg.n_nextn == 0
+            || cfg.hyper.is_some()
+            || !rd.has(&format!("{p}.nextn.eh_proj.weight"))
+            || !LOAD_MTP.get()
+        {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            enorm: rd.rms_norm(&format!("{p}.nextn.enorm.weight"), cfg.rms_eps)?,
+            hnorm: rd.rms_norm(&format!("{p}.nextn.hnorm.weight"), cfg.rms_eps)?,
+            eh_proj: Linear {
+                w: rd.qmatmul(&format!("{p}.nextn.eh_proj.weight"))?,
+                b: None,
+            },
+            head_norm: rd.rms_norm_opt(&format!("{p}.nextn.shared_head_norm.weight"), cfg.rms_eps)?,
+            layer: load_layer(rd, cfg, cfg.n_layer, n_embd, rope)?,
+        }))
+    }
 }
 
 /// A layer's running state at a prompt boundary (see
@@ -1613,6 +1688,40 @@ impl crate::native_session::LayerStack for Weights {
         drop(_p);
         prof::report();
         out
+    }
+
+    fn has_mtp(&self) -> bool {
+        self.mtp.is_some()
+    }
+
+    fn head_norm(&self, xs: &Tensor) -> Result<Tensor> {
+        match &self.norm {
+            HeadNorm::Rms(n) => n.forward(xs),
+            HeadNorm::Hyper(h) => Ok(h.mix(xs)?.0),
+        }
+    }
+
+    fn head_logits(&self, normed: &Tensor) -> Result<Tensor> {
+        self.output.forward(normed)?.to_dtype(DType::F32)
+    }
+
+    fn mtp_forward(
+        &self,
+        state: &mut LayerState,
+        emb: &Tensor,
+        seeds: &Tensor,
+        input: &crate::native_session::LayerInput<'_>,
+    ) -> Result<Tensor> {
+        let Some(m) = &self.mtp else {
+            candle_core::bail!("qwen loader: no MTP block loaded");
+        };
+        let x = Tensor::cat(&[m.enorm.forward(emb)?, m.hnorm.forward(seeds)?], 2)?;
+        let x = m.eh_proj.forward(&x)?;
+        let (x, _routed) = m.layer.forward(state, &x, input)?;
+        match &m.head_norm {
+            Some(n) => n.forward(&x),
+            None => self.head_norm(&x),
+        }
     }
 
     fn can_truncate(&self) -> bool {
@@ -1986,6 +2095,7 @@ impl ModelWeights {
             device: device.clone(),
             residency: parts.residency,
             n_expert: parts.n_expert,
+            mtp: parts.mtp,
         }))
     }
 }
@@ -1999,6 +2109,7 @@ struct LoadedParts {
     streams: usize,
     residency: Arc<dyn crate::residency::ExpertResidency>,
     n_expert: usize,
+    mtp: Option<Mtp>,
 }
 
 fn load_parts<R: Read + Seek>(
@@ -2122,44 +2233,9 @@ fn load_parts<R: Read + Seek>(
 
         let mut layers = Vec::with_capacity(owned.len());
         for layer_idx in owned {
-            let p = format!("blk.{layer_idx}");
-            let residual = match cfg.hyper {
-                Some(hc) => Residual::Hyper {
-                    attn: HyperMix::load(&mut rd, &format!("{p}.hc_attn"), hc, n_embd, cfg.rms_eps)?,
-                    ffn: HyperMix::load(&mut rd, &format!("{p}.hc_ffn"), hc, n_embd, cfg.rms_eps)?,
-                    ple: match &cfg.ple {
-                        Some(pc) if pc.layer == layer_idx => {
-                            Some(Ple::load(&mut rd, pc, &p, hc, n_embd, cfg.rms_eps)?)
-                        }
-                        _ => None,
-                    },
-                },
-                None if rd.has(&format!("{p}.post_ffw_norm.weight")) => Residual::Sandwich {
-                    attn_norm: rd.rms_norm(&format!("{p}.attn_norm.weight"), cfg.rms_eps)?,
-                    attn_post_norm: rd.rms_norm(&format!("{p}.post_attention_norm.weight"), cfg.rms_eps)?,
-                    ffn_norm: rd.rms_norm(&format!("{p}.ffn_norm.weight"), cfg.rms_eps)?,
-                    ffn_post_norm: rd.rms_norm(&format!("{p}.post_ffw_norm.weight"), cfg.rms_eps)?,
-                },
-                None => Residual::PreNorm {
-                    attn_norm: rd.rms_norm(&format!("{p}.attn_norm.weight"), cfg.rms_eps)?,
-                    ffn_norm: match rd.rms_norm_opt(&format!("{p}.post_attention_norm.weight"), cfg.rms_eps)? {
-                        Some(n) => n,
-                        None => rd.rms_norm(&format!("{p}.ffn_norm.weight"), cfg.rms_eps)?,
-                    },
-                },
-            };
-            let mixer = if cfg.recurrent[layer_idx] {
-                Mixer::DeltaNet(GatedDeltaNet::load(&mut rd, &p, &cfg)?)
-            } else {
-                Mixer::Attention(Attention::load(&mut rd, layer_idx, &p, &cfg, rope.clone())?)
-            };
-            let ffn = if cfg.n_expert > 0 && layer_idx >= cfg.leading_dense {
-                FeedForward::Moe(load_moe(&mut rd, &p, &cfg)?)
-            } else {
-                FeedForward::Dense(Mlp::load(&mut rd, &p, "")?)
-            };
-            layers.push(Layer { residual, mixer, ffn });
+            layers.push(load_layer(&mut rd, &cfg, layer_idx, n_embd, &rope)?);
         }
+        let mtp = if range.is_none() { Mtp::load(&mut rd, &cfg, n_embd, &rope)? } else { None };
 
         let residency: std::sync::Arc<dyn crate::residency::ExpertResidency> =
             std::sync::Arc::new(crate::residency::CpuResidency::new(
@@ -2179,7 +2255,57 @@ fn load_parts<R: Read + Seek>(
             streams: cfg.hyper.unwrap_or(1),
             residency,
             n_expert: cfg.n_expert,
+            mtp,
         })
+}
+
+/// Decoder layer `layer_idx` (`blk.{layer_idx}`): a DeltaNet layer where the
+/// config marks one recurrent, otherwise attention — the NextN block past the
+/// trunk is always attention.
+fn load_layer<R: Read + Seek>(
+    rd: &mut Reader<R>,
+    cfg: &Config,
+    layer_idx: usize,
+    n_embd: usize,
+    rope: &Arc<Rope>,
+) -> Result<Layer> {
+    let p = format!("blk.{layer_idx}");
+    let residual = match cfg.hyper {
+        Some(hc) => Residual::Hyper {
+            attn: HyperMix::load(rd, &format!("{p}.hc_attn"), hc, n_embd, cfg.rms_eps)?,
+            ffn: HyperMix::load(rd, &format!("{p}.hc_ffn"), hc, n_embd, cfg.rms_eps)?,
+            ple: match &cfg.ple {
+                Some(pc) if pc.layer == layer_idx => {
+                    Some(Ple::load(rd, pc, &p, hc, n_embd, cfg.rms_eps)?)
+                }
+                _ => None,
+            },
+        },
+        None if rd.has(&format!("{p}.post_ffw_norm.weight")) => Residual::Sandwich {
+            attn_norm: rd.rms_norm(&format!("{p}.attn_norm.weight"), cfg.rms_eps)?,
+            attn_post_norm: rd.rms_norm(&format!("{p}.post_attention_norm.weight"), cfg.rms_eps)?,
+            ffn_norm: rd.rms_norm(&format!("{p}.ffn_norm.weight"), cfg.rms_eps)?,
+            ffn_post_norm: rd.rms_norm(&format!("{p}.post_ffw_norm.weight"), cfg.rms_eps)?,
+        },
+        None => Residual::PreNorm {
+            attn_norm: rd.rms_norm(&format!("{p}.attn_norm.weight"), cfg.rms_eps)?,
+            ffn_norm: match rd.rms_norm_opt(&format!("{p}.post_attention_norm.weight"), cfg.rms_eps)? {
+                Some(n) => n,
+                None => rd.rms_norm(&format!("{p}.ffn_norm.weight"), cfg.rms_eps)?,
+            },
+        },
+    };
+    let mixer = if cfg.recurrent.get(layer_idx).copied().unwrap_or(false) {
+        Mixer::DeltaNet(GatedDeltaNet::load(rd, &p, cfg)?)
+    } else {
+        Mixer::Attention(Attention::load(rd, layer_idx, &p, cfg, rope.clone())?)
+    };
+    let ffn = if cfg.n_expert > 0 && layer_idx >= cfg.leading_dense {
+        FeedForward::Moe(load_moe(rd, &p, cfg)?)
+    } else {
+        FeedForward::Dense(Mlp::load(rd, &p, "")?)
+    };
+    Ok(Layer { residual, mixer, ffn })
 }
 
 /// CPU stage adapter. Only the pipeline module can construct it, and it never
