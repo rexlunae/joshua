@@ -250,10 +250,16 @@ pub fn fork_kv(kv_cache: &KvCache, keep: usize, device: &Device) -> Result<KvCac
     }
 }
 
-/// Bytes the cache's buffers hold (their allocated rows, not only the cached
-/// ones).
+/// Bytes the cache's cached rows hold: what [`fork_kv`] copies (a live cache's
+/// buffers have room for more rows, which a fork leaves behind).
 pub fn kv_bytes(kv_cache: &KvCache) -> u64 {
-    kv_cache.as_ref().map_or(0, |c| tensor_bytes(&c.k) + tensor_bytes(&c.v))
+    kv_cache.as_ref().map_or(0, |c| {
+        let rows = |t: &Tensor| {
+            let cap = t.dims().get(2).copied().unwrap_or(0).max(1) as u64;
+            tensor_bytes(t) * c.len.min(cap as usize) as u64 / cap
+        };
+        rows(&c.k) + rows(&c.v)
+    })
 }
 
 /// A copy of `t` in a buffer of exactly its own size.  `Tensor::copy` (and
@@ -531,6 +537,37 @@ fn copy_rows_runs<S: BackendStorage>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bytes charged for a cache are its cached rows, and a fork holds
+    /// exactly those rows in a buffer of their own, so the two agree even
+    /// when the live cache has room for more.
+    #[test]
+    fn kv_bytes_count_cached_rows_and_forks_are_exact() -> Result<()> {
+        let dev = Device::Cpu;
+        let row = |i: usize| Tensor::full(i as f32, (1, 2, 1, 3), &dev);
+        // `new` only sizes the buffers; the rows come from `append`.
+        let mut cache = SeqKvCache::new(&row(0)?, &row(0)?)?;
+        for i in 0..5 {
+            cache.append(&row(i)?, &row(i)?)?;
+        }
+        let kv = Some(cache);
+        let cap = kv.as_ref().unwrap().k().dim(2)?;
+        assert!(cap > 5, "the buffer grew past the rows used ({cap})");
+        let per_row = 2 * 3 * 4 * 2; // heads × dim × f32 × (k and v)
+        assert_eq!(kv_bytes(&kv), 5 * per_row);
+        let fork = fork_kv(&kv, 3, &dev)?;
+        let f = fork.as_ref().unwrap();
+        assert_eq!((f.len(), f.k().dim(2)?), (3, 3));
+        assert_eq!(kv_bytes(&fork), 3 * per_row);
+        let rows: Vec<f32> = f.k().narrow(1, 0, 1)?.narrow(3, 0, 1)?.flatten_all()?.to_vec1()?;
+        assert_eq!(rows, [0.0, 1.0, 2.0]);
+        // A compact copy of a view owns only the view's elements.
+        let view = kv.as_ref().unwrap().k().narrow(2, 0, 2)?;
+        let copy = compact_copy(&view)?;
+        assert_eq!(copy.storage_and_layout().1.start_offset(), 0);
+        assert_eq!(copy.dims(), view.dims());
+        Ok(())
+    }
 
     /// Grouped attention must equal the textbook form: K/V repeated per query
     /// head, softmax(q·kᵀ·scale + mask)·v — over a prefill followed by decode
