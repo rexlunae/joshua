@@ -4,10 +4,10 @@
 use futures_util::StreamExt;
 use web_time::Instant;
 
+pub use crate::api::StreamSummary;
 use crate::api::{
     bearer_header, endpoint_url, error_from_status, parse_chat_response, parse_health,
-    parse_models, parse_stream_data, ApiError, ChatRequest, ChatResponse, Endpoint, Health,
-    ModelList, SseDecoder, StreamEvent, Usage,
+    parse_models, ApiError, ChatRequest, ChatResponse, ChatStream, Endpoint, Health, ModelList,
 };
 
 /// A connection to one Joshua server.
@@ -16,16 +16,6 @@ pub struct JoshuaClient {
     base: String,
     api_key: Option<String>,
     http: reqwest::Client,
-}
-
-/// Outcome of a streamed chat completion.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct StreamSummary {
-    pub text: String,
-    pub finish_reason: Option<String>,
-    pub usage: Option<Usage>,
-    /// The model answered with tool calls, which the playground does not render.
-    pub tool_calls: bool,
 }
 
 impl JoshuaClient {
@@ -118,46 +108,14 @@ impl JoshuaClient {
             let body = resp.text().await.unwrap_or_default();
             return Err(error_from_status(status.as_u16(), &body));
         }
-        let mut summary = StreamSummary::default();
-        let mut decoder = SseDecoder::new();
+        let mut stream = ChatStream::new();
         let mut bytes = resp.bytes_stream();
-        let mut apply = |data: String, summary: &mut StreamSummary| -> Result<bool, ApiError> {
-            match parse_stream_data(&data)? {
-                StreamEvent::Done => Ok(true),
-                StreamEvent::Chunk {
-                    content,
-                    finish_reason,
-                    usage,
-                    has_tool_calls,
-                } => {
-                    if let Some(c) = content {
-                        on_delta(&c);
-                        summary.text.push_str(&c);
-                    }
-                    if finish_reason.is_some() {
-                        summary.finish_reason = finish_reason;
-                    }
-                    if usage.is_some() {
-                        summary.usage = usage;
-                    }
-                    summary.tool_calls |= has_tool_calls;
-                    Ok(false)
-                }
-            }
-        };
         while let Some(chunk) = bytes.next().await {
             let chunk = chunk.map_err(|e| ApiError::Transport(e.to_string()))?;
-            for data in decoder.push(&chunk) {
-                if apply(data, &mut summary)? {
-                    return Ok(summary);
-                }
-            }
-        }
-        for data in decoder.finish() {
-            if apply(data, &mut summary)? {
+            if stream.push(&chunk, &mut on_delta)? {
                 break;
             }
         }
-        Ok(summary)
+        stream.finish(&mut on_delta)
     }
 }

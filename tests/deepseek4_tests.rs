@@ -823,22 +823,14 @@ fn deepseek4_forward_sequences_matches_single_sequence() {
         // Batched dispatch shares the MoE's quantized matmul and index_add
         // across tokens, which reorders the f32 summation relative to a
         // single-token forward.  The math is identical; the only expected
-        // divergence is f32 sum-order rounding (~1e-6).  Use a tight relative
-        // tolerance to catch a real logic error (cross-sequence leakage, a
-        // wrong per-seq split) while allowing the expected rounding.
-        let mut max_rel = 0.0f32;
-        let mut max_abs = 0.0f32;
-        for (g, v) in got.iter().zip(want.iter()) {
-            let denom = (*g).abs().max((*v).abs()).max(1.0e-4);
-            max_rel = max_rel.max((*g - *v).abs() / denom);
-            max_abs = max_abs.max((*g - *v).abs());
-        }
-        eprintln!(
-            "seq {s}: max relative logit delta {max_rel:.3e} (abs {max_abs:.3e})",
-        );
+        // divergence is f32 sum-order rounding (~1e-6 of the logit scale).
+        // A real logic error (cross-sequence leakage, a wrong per-seq split)
+        // moves logits by a large fraction of that scale.
+        let delta = max_scaled_diff(got, want);
+        eprintln!("seq {s}: max logit delta {delta:.3e} of the logit scale");
         assert!(
-            max_rel <= 1.0e-4,
-            "batched dispatch must match single-sequence within f32 rounding (seq {s}: rel {max_rel})"
+            delta <= BATCHED_TOLERANCE,
+            "batched dispatch must match single-sequence within f32 rounding (seq {s}: {delta:.3e} of scale)"
         );
     }
 
@@ -879,15 +871,11 @@ fn deepseek4_forward_sequences_persists_kv_across_steps() {
     let got = logits.first().unwrap();
 
     assert_eq!(got.len(), ref_second.len(), "vocab sizes must match");
-    let mut max_rel = 0.0f32;
-    for (g, v) in got.iter().zip(ref_second.iter()) {
-        let denom = (*g).abs().max((*v).abs()).max(1.0e-4);
-        max_rel = max_rel.max((*g - *v).abs() / denom);
-    }
-    eprintln!("multi-step batched vs sequential: max relative logit delta {max_rel:.3e}");
+    let delta = max_scaled_diff(got, &ref_second);
+    eprintln!("multi-step batched vs sequential: max logit delta {delta:.3e} of the logit scale");
     assert!(
-        max_rel <= 1.0e-4,
-        "batched KV must persist across steps (rel {max_rel})"
+        delta <= BATCHED_TOLERANCE,
+        "batched KV must persist across steps ({delta:.3e} of scale)"
     );
 
     std::fs::remove_dir_all(&dir).ok();
@@ -933,14 +921,10 @@ fn deepseek4_clear_kv_cache_resets_batched_kv() {
     for (step, (g_step, w_step)) in got.iter().zip(&want).enumerate() {
         for (s, (g, w)) in g_step.iter().zip(w_step).enumerate() {
             assert_eq!(g.len(), w.len(), "step {step} seq {s}: vocab sizes must match");
-            let mut max_rel = 0.0f32;
-            for (x, y) in g.iter().zip(w) {
-                let denom = x.abs().max(y.abs()).max(1.0e-4);
-                max_rel = max_rel.max((x - y).abs() / denom);
-            }
+            let delta = max_scaled_diff(g, w);
             assert!(
-                max_rel <= 1.0e-4,
-                "step {step} seq {s}: batched KV must be cleared by clear_kv_cache (rel {max_rel})"
+                delta <= BATCHED_TOLERANCE,
+                "step {step} seq {s}: batched KV must be cleared by clear_kv_cache ({delta:.3e} of scale)"
             );
         }
     }
@@ -1064,6 +1048,27 @@ fn deepseek4_long_prefill_consistency() {
     );
 
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Tolerance for batched-versus-single logits, as a fraction of the logit
+/// scale (see [`max_scaled_diff`]).  Sum-order rounding measures ~1e-6 on
+/// x86-64; the bound leaves room for other SIMD paths (NEON) while staying
+/// far below the change a cross-sequence or KV bug causes.
+const BATCHED_TOLERANCE: f32 = 1.0e-5;
+
+/// Largest absolute difference between two logit vectors, divided by the
+/// largest reference logit magnitude.  Rounding error in a logit scales with
+/// the magnitudes summed into it, not with the logit itself, so dividing each
+/// element by its own value overstates rounding on logits near zero (a
+/// 1e-6 error on a 0.01 logit reads as 1e-4).
+fn max_scaled_diff(got: &[f32], want: &[f32]) -> f32 {
+    assert_eq!(got.len(), want.len(), "vocab widths");
+    let scale = want.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1.0e-6);
+    got.iter()
+        .zip(want)
+        .map(|(g, w)| (g - w).abs())
+        .fold(0.0, f32::max)
+        / scale
 }
 
 /// Largest relative difference between two logit vectors.
