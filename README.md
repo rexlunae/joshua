@@ -257,6 +257,20 @@ block-quantized weights stay in their GGUF format on the device.
 On Linux, `JOSHUA_SYCL_RUNTIME` can point to `libsycl.so.9` to preload
 the oneAPI runtime when it is not on the system library path.
 
+**SYCL decode megakernel (opt-in).** `JOSHUA_MEGAKERNEL=1` runs each
+single-token decode step of a dense Qwen-family model (`qwen3`, `qwen`,
+`qwen3vl`, `chatglm`: pre-norm attention layers with a SwiGLU MLP, every
+weight on the device) as one persistent SYCL kernel launch instead of ~30
+launches per layer; prefill, speculative verification and every other model
+keep the op-at-a-time path, and the loader logs why a model does not
+qualify.  Its GEMVs reduce each row over one sub-group, so logits agree
+with the op-at-a-time path to rounding; `tests/sycl_megakernel_tests.rs`
+checks the two paths agree step by step.  It is not yet faster than the
+op-at-a-time path on the Arc Pro B50.  The bridge must be built from the same tree.  Without a SYCL GPU,
+`vendor/candle-core/src/sycl_backend/emu/` builds the bridge against a host
+emulation of SYCL, which runs the SYCL tests (slowly) on the CPU:
+`c++ -std=c++20 -O2 -fPIC -shared -DJOSHUA_SYCL_EMU_IMPL -Iemu bridge.cpp -o libjoshua_sycl.so`.
+
 **Linux bring-up checklist.** The most common failure is
 `sycl open: no SYCL devices visible` (previously the same condition was
 reported misleadingly as `device ordinal out of range`) when the machine has

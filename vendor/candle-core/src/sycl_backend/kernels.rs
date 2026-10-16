@@ -681,7 +681,7 @@ pub fn qgemv_multirow(dtype: crate::quantized::GgmlDType) -> bool {
 /// Output columns one `k_qgemv_mr` work-group handles: enough that every
 /// lane owns at least one 8-element group of its column (`K / 8` groups per
 /// column), capped at 8 so a group never spans more than 8 columns.
-fn qgemv_mr_cols(k: usize, wg: usize) -> usize {
+pub(crate) fn qgemv_mr_cols(k: usize, wg: usize) -> usize {
     let groups = k / 8;
     let mut cols = 1;
     while cols < 8 && groups * cols < wg {
