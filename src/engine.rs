@@ -501,6 +501,21 @@ pub struct EngineOptions {
     /// gate of [`Self::speculative`] (on unless that config turns it off)
     /// holds drafting off while it measures slower than plain decoding.
     pub mtp: usize,
+    /// A separate draft model for speculative decoding: a small GGUF that
+    /// shares this model's tokenizer proposes up to [`Self::draft_max`]
+    /// tokens per step, which this model verifies in one forward pass.
+    /// Greedy output is token-identical to plain decoding; sampled output is
+    /// verified against the draft's own distribution (`min(1, p/q)`), so it
+    /// is distributed exactly as plain sampling.  The draft must be an
+    /// attention-only model one of Joshua's own loaders serves (qwen3,
+    /// qwen3moe, glm4, deepseek2, …).  Takes the place of prompt lookup and
+    /// MTP; the cost gate of [`Self::speculative`] (on unless that config
+    /// turns it off) applies.  See [`crate::draft_model`].
+    pub draft_model: Option<PathBuf>,
+    /// Most draft-model tokens per step (`0`: the default,
+    /// [`crate::draft_model::DEFAULT_DRAFT_MODEL_MAX`]).  The live length
+    /// adapts between 1 and this bound from the acceptance observed.
+    pub draft_max: usize,
 }
 
 impl EngineOptions {
@@ -675,6 +690,20 @@ impl EngineOptions {
         self.mtp = n;
         self
     }
+
+    /// Draft with a separate small model (`None`: off).  See
+    /// [`EngineOptions::draft_model`].
+    pub fn draft_model(mut self, path: Option<PathBuf>) -> Self {
+        self.draft_model = path;
+        self
+    }
+
+    /// Most draft-model tokens per step (`0`: the default).  See
+    /// [`EngineOptions::draft_max`].
+    pub fn draft_max(mut self, n: usize) -> Self {
+        self.draft_max = n;
+        self
+    }
 }
 
 // ─── Env flags ───────────────────────────────────────────────────────────────
@@ -831,6 +860,11 @@ pub struct Engine {
     speculative: Option<SpeculativeConfig>,
     /// MTP drafts per step (see [`EngineOptions::mtp`]).
     mtp: usize,
+    /// The separate draft model, when one is loaded (see
+    /// [`EngineOptions::draft_model`]).
+    draft: Option<crate::draft_model::DraftModel>,
+    /// Most draft-model tokens per step.
+    draft_max: usize,
     /// Draft tokens verified by speculative decoding.
     spec_drafted: AtomicU64,
     /// Draft tokens the model accepted.
@@ -1238,6 +1272,44 @@ struct DecodeOutcome {
 /// Repetition-penalty window: the last this-many tokens are penalised.
 const REP_WINDOW: usize = 64;
 
+/// A request's use of the separate draft model (see
+/// [`crate::draft_model`]): the session, the decode context it drafts from,
+/// and the distribution each token of the current draft was sampled from.
+struct DraftModelState {
+    session: crate::draft_model::DraftSession,
+    /// The prompt followed by every emitted token.
+    context: Vec<u32>,
+    sampler: SamplingWorkspace,
+    /// `q[i]`: the draft distribution `drafts[i]` was sampled from, unless
+    /// `q_point[i]` (a deterministic choice).  Buffers are kept across steps.
+    q: Vec<Vec<f32>>,
+    q_point: Vec<bool>,
+    /// Entries of `q` / `q_point` describing the current draft.
+    n_q: usize,
+    /// The penalty window extended with the tokens drafted so far.
+    window: Vec<u32>,
+}
+
+impl DraftModelState {
+    fn new(session: crate::draft_model::DraftSession, context: &[u32]) -> Self {
+        Self {
+            session,
+            context: context.to_vec(),
+            sampler: SamplingWorkspace::default(),
+            q: Vec::new(),
+            q_point: Vec::new(),
+            n_q: 0,
+            window: Vec::with_capacity(REP_WINDOW),
+        }
+    }
+
+    /// The distribution draft token `i` was sampled from; `None` for a
+    /// deterministic choice.
+    fn q(&self, i: usize) -> Option<&[f32]> {
+        (i < self.n_q && !self.q_point[i]).then(|| self.q[i].as_slice())
+    }
+}
+
 /// Concrete stream decoder for the engine's tokenizer.
 type TextDecodeStream<'a> = tokenizers::tokenizer::DecodeStream<
     'a,
@@ -1602,6 +1674,7 @@ impl Engine {
 
         let eos_token_ids = extract_eos_ids(&gguf, &tokenizer);
         let chat_template = extract_chat_template(&gguf, &tokenizer);
+        let target_vocab = crate::draft_model::gguf_tokens(&gguf.metadata);
         let device = Self::resolve_device(options.backend)?;
 
         // Memory placement on an accelerator: where the routed experts live,
@@ -2004,6 +2077,38 @@ impl Engine {
             _ => cpu_parallelism,
         };
 
+        // A separate draft model.  It needs a target that can verify and
+        // roll back; it replaces MTP drafting, so the NextN block is not
+        // loaded alongside it.
+        let mut mtp = options.mtp.min(crate::speculative::MAX_MTP_DRAFT);
+        let draft = match (&options.draft_model, arch) {
+            (Some(path), Some(a)) if a.supports_speculative_decoding() => {
+                let draft = crate::draft_model::DraftModel::load(
+                    path,
+                    &dense_device,
+                    n_ctx as usize,
+                    target_vocab.as_deref(),
+                )?;
+                if mtp > 0 {
+                    tracing::warn!("--mtp is ignored while --draft-model drafts");
+                    mtp = 0;
+                }
+                Some(draft)
+            }
+            (Some(_), arch) => {
+                tracing::warn!(
+                    "--draft-model requested, but {} cannot verify drafts; the flag is ignored",
+                    arch.map_or("this model", |a| a.display_name()),
+                );
+                None
+            }
+            (None, _) => None,
+        };
+        let draft_max = match options.draft_max {
+            0 => crate::draft_model::DEFAULT_DRAFT_MODEL_MAX,
+            n => n,
+        };
+
         Ok(Self {
             model_path: gguf_path,
             mmap: Arc::new(mmap),
@@ -2040,7 +2145,9 @@ impl Engine {
             remote_pool_cap: None,
             remote_capacity: None,
             speculative,
-            mtp: options.mtp.min(crate::speculative::MAX_MTP_DRAFT),
+            mtp,
+            draft,
+            draft_max,
             spec_drafted: AtomicU64::new(0),
             spec_accepted: AtomicU64::new(0),
             spec_verify_steps: AtomicU64::new(0),
@@ -2941,21 +3048,51 @@ impl Engine {
 
         // Speculative decoding needs a text context to draft from and a
         // session that can verify and roll back.
-        // MTP drafting (the model's own NextN block) takes the place of
-        // prompt lookup where the session has it.
-        let mtp = if self.mtp > 0 && model.mtp_enabled() && model.supports_speculative() {
+        // A separate draft model comes first; MTP drafting (the model's own
+        // NextN block) takes the place of prompt lookup where the session
+        // has it.
+        let mut draft_model = match &self.draft {
+            Some(d) if !penalty_seed.is_empty() && model.supports_speculative() => {
+                match self.start_draft(d, penalty_seed) {
+                    Ok(s) => Some(DraftModelState::new(s, penalty_seed)),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "draft model failed; decoding plainly");
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+        let mtp = if draft_model.is_none()
+            && self.mtp > 0
+            && model.mtp_enabled()
+            && model.supports_speculative()
+        {
             self.mtp
         } else {
             0
         };
-        let spec = self
-            .speculative
-            .filter(|_| mtp == 0 && !penalty_seed.is_empty() && model.supports_speculative());
+        let spec = self.speculative.filter(|_| {
+            draft_model.is_none()
+                && mtp == 0
+                && !penalty_seed.is_empty()
+                && model.supports_speculative()
+        });
         let mut drafter = spec.map(|c| NgramDrafter::new(c, penalty_seed));
-        let max_draft = if mtp > 0 { mtp } else { spec.map_or(1, |c| c.max_draft) };
-        let mut draft_len = if mtp > 0 { mtp } else { spec.map_or(0, |c| c.max_draft) };
+        let max_draft = if draft_model.is_some() {
+            self.draft_max
+        } else if mtp > 0 {
+            mtp
+        } else {
+            spec.map_or(1, |c| c.max_draft)
+        };
+        let mut draft_len = if draft_model.is_some() || mtp > 0 {
+            max_draft
+        } else {
+            spec.map_or(0, |c| c.max_draft)
+        };
         // Holds drafting off while it measures slower than plain decoding.
-        let gated = if mtp > 0 {
+        let gated = if draft_model.is_some() || mtp > 0 {
             self.speculative.is_none_or(|c| c.cost_gate)
         } else {
             spec.is_some_and(|c| c.cost_gate)
@@ -3012,6 +3149,9 @@ impl Engine {
             if let Some(d) = drafter.as_mut() {
                 d.push(next_token);
             }
+            if let Some(d) = draft_model.as_mut() {
+                d.context.push(next_token);
+            }
 
             // Draft continuation tokens, bounded so that every accepted one
             // can still be emitted (max_tokens) and fed (context window).
@@ -3022,7 +3162,22 @@ impl Engine {
             let step_start = Instant::now();
             let room = (options.max_tokens - text.n_decoded) as usize;
             let ctx_room = n_ctx.saturating_sub(n_cur + 1);
-            if mtp > 0 {
+            if let Some(d) = draft_model.as_mut() {
+                // Like MTP, a draft model always has a draft: ask the gate
+                // first so a held step costs no draft passes.
+                let n = draft_len.min(room).min(ctx_room);
+                if n > 0 && gate.as_mut().is_none_or(SpeculationGate::allow) {
+                    if let Err(e) =
+                        self.draft_with_model(d, n, options, &text.recent_tokens, &mut rng, &mut drafts)
+                    {
+                        // A failing draft model must not fail the request:
+                        // carry on plainly without it.
+                        tracing::warn!(error = %e, "draft model failed; decoding plainly");
+                        drafts.clear();
+                        draft_model = None;
+                    }
+                }
+            } else if mtp > 0 {
                 // The block always has a draft, so the gate is asked first
                 // and a held step costs no draft pass.
                 let n = draft_len.min(room).min(ctx_room);
@@ -3064,7 +3219,8 @@ impl Engine {
             let mut stop = false;
             for (i, &draft) in drafts.iter().enumerate() {
                 let dist = sampler.distribution(&rows[i], options, &text.recent_tokens);
-                match dist.verify(draft, &mut rng)? {
+                let q = draft_model.as_ref().and_then(|d| d.q(i));
+                match dist.verify_sampled(draft, q, &mut rng)? {
                     Verdict::Accept => {
                         accepted += 1;
                         if self.eos_token_ids.contains(&draft) {
@@ -3079,6 +3235,9 @@ impl Engine {
                         n_cur += 1;
                         if let Some(d) = drafter.as_mut() {
                             d.push(draft);
+                        }
+                        if let Some(d) = draft_model.as_mut() {
+                            d.context.push(draft);
                         }
                         if self.emit_token(&mut text, draft, options)? {
                             stop = true;
@@ -3131,6 +3290,9 @@ impl Engine {
             // than linger until the next forward pass replaced them.
             model.discard_verify();
         }
+        if let (Some(pool), Some(d)) = (self.draft.as_ref(), draft_model) {
+            pool.release(d.session);
+        }
 
         let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
         let n_decoded = text.n_decoded;
@@ -3146,6 +3308,80 @@ impl Engine {
             fed_tokens,
             decode_tps,
         })
+    }
+
+    /// A draft-model session for a request whose context is `prompt`, its
+    /// KV cache brought up to the whole prompt (outside the decode loop's
+    /// cost gate, which measures the per-step cost only).
+    fn start_draft(
+        &self,
+        draft: &crate::draft_model::DraftModel,
+        prompt: &[u32],
+    ) -> Result<crate::draft_model::DraftSession> {
+        let mut session = draft.acquire(prompt)?;
+        session.sync(prompt, draft.device())?;
+        Ok(session)
+    }
+
+    /// Draft up to `n` tokens continuing `state.context` with the draft
+    /// model, sampling each from the draft's own distribution under the
+    /// request's sampling settings (its argmax at temperature 0) and
+    /// recording that distribution for verification.  Drafting stops after
+    /// an end-of-sequence token.
+    fn draft_with_model(
+        &self,
+        state: &mut DraftModelState,
+        n: usize,
+        options: &GenerationOptions,
+        recent_tokens: &[u32],
+        rng: &mut StdRng,
+        drafts: &mut Vec<u32>,
+    ) -> Result<()> {
+        let Some(draft) = self.draft.as_ref() else {
+            return Ok(());
+        };
+        let device = draft.device();
+        let DraftModelState {
+            session,
+            context,
+            sampler,
+            q,
+            q_point,
+            n_q,
+            window,
+        } = state;
+        drafts.clear();
+        *n_q = 0;
+        let mut logits = session.sync(context, device)?;
+        window.clear();
+        window.extend_from_slice(recent_tokens);
+        for j in 0..n {
+            let dist = sampler.distribution(&logits, options, window);
+            let token = dist.sample(rng)?;
+            if q.len() <= j {
+                q.push(Vec::new());
+                q_point.push(true);
+            }
+            match dist {
+                TokenDistRef::Greedy(_) => q_point[j] = true,
+                TokenDistRef::Probs(p) => {
+                    q_point[j] = false;
+                    q[j].clear();
+                    q[j].extend_from_slice(p);
+                }
+            }
+            *n_q = j + 1;
+            drafts.push(token);
+            if j + 1 == n || self.eos_token_ids.contains(&token) {
+                break;
+            }
+            if window.len() >= REP_WINDOW {
+                window.remove(0);
+            }
+            window.push(token);
+            logits = session.push(token, device)?;
+        }
+        Ok(())
     }
 
     /// Append one generated token to the response text and the
@@ -5478,7 +5714,7 @@ fn token_str_from_metadata(
 /// Parse the GGUF header tolerantly (raw dtype ids) and project it onto
 /// candle's `Content`, dropping tensors whose dtype candle cannot name.
 /// Those tensors are decoded by Joshua's own loaders via the raw header.
-fn read_gguf_header(mmap: &[u8]) -> Result<gguf_file::Content> {
+pub(crate) fn read_gguf_header(mmap: &[u8]) -> Result<gguf_file::Content> {
     let header = crate::gguf_ext::read_header(&mut Cursor::new(mmap))?;
     // Joshua's own loaders read tensors by their raw GGUF dtype id (the
     // i-quants, MXFP4, Q1_0, I32, …).  Candle's stock loaders only ever see

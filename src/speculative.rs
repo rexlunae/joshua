@@ -318,6 +318,49 @@ impl TokenDistRef<'_> {
             }
         }
     }
+
+    /// Verify `draft`, which a draft model sampled from `q`, with speculative
+    /// sampling: accept with probability `min(1, p(x) / q(x))`, otherwise
+    /// emit a token from the residual `max(0, p - q)` (normalised).  The
+    /// emitted token is distributed exactly as `p`.
+    ///
+    /// `q` is `None` for a deterministic draft (prompt lookup, MTP, a draft
+    /// model at temperature 0 or with a degenerate distribution), which is
+    /// [`Self::verify`].  A shorter `q` (a draft vocabulary smaller than the
+    /// target's) puts no mass on the ids past its end.
+    pub(crate) fn verify_sampled(
+        self,
+        draft: u32,
+        q: Option<&[f32]>,
+        rng: &mut impl Rng,
+    ) -> Result<Verdict> {
+        let (p, q) = match (self, q) {
+            (Self::Probs(p), Some(q)) => (p, q),
+            // A point-mass target accepts exactly its own token whatever q
+            // is, and a point-mass draft is the deterministic case.
+            _ => return self.verify(draft, rng),
+        };
+        let d = draft as usize;
+        let p_draft = p.get(d).copied().unwrap_or(0.0);
+        let q_draft = q.get(d).copied().unwrap_or(0.0);
+        if q_draft <= 0.0 {
+            // The draft was not sampled from `q` after all; fall back to
+            // the rule that holds for any deterministic draft.
+            return self.verify(draft, rng);
+        }
+        if p_draft >= q_draft || rng.gen::<f32>() * q_draft < p_draft {
+            return Ok(Verdict::Accept);
+        }
+        let residual = p
+            .iter()
+            .enumerate()
+            .map(|(i, &p)| (p - q.get(i).copied().unwrap_or(0.0)).max(0.0));
+        if residual.clone().sum::<f32>() <= 0.0 {
+            // p ≈ q everywhere, so a rejection is only rounding: draw from p.
+            return Ok(Verdict::Reject(sample_probs(p.iter().copied(), rng)?));
+        }
+        Ok(Verdict::Reject(sample_probs(residual, rng)?))
+    }
 }
 
 /// Outcome of verifying one draft token against the target distribution.
@@ -339,6 +382,18 @@ pub enum Verdict {
 /// emit exactly one token distributed as `p`.
 pub fn verify_token(dist: &TokenDist, draft: u32, rng: &mut impl Rng) -> Result<Verdict> {
     dist.as_ref().verify(draft, rng)
+}
+
+/// Verify a token a draft model sampled from `q` against the target's
+/// distribution (see [`TokenDistRef::verify_sampled`]); `q = None` is
+/// [`verify_token`].
+pub fn verify_sampled_token(
+    dist: &TokenDist,
+    draft: u32,
+    q: Option<&[f32]>,
+    rng: &mut impl Rng,
+) -> Result<Verdict> {
+    dist.as_ref().verify_sampled(draft, q, rng)
 }
 
 fn sample_probs(p: impl IntoIterator<Item = f32>, rng: &mut impl Rng) -> Result<u32> {
@@ -564,6 +619,71 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn draft_model_sampling_preserves_the_distribution() {
+        // Drafts sampled from q, verified against p: the emitted token must
+        // be distributed as p, including where q is shorter than p (a draft
+        // vocabulary without the target's last id) and where q puts mass on
+        // a token p rules out.
+        let p = vec![0.1_f32, 0.5, 0.2, 0.2];
+        let d = TokenDist::Probs(p.clone());
+        let mut rng = StdRng::seed_from_u64(7);
+        let trials = 200_000;
+        for q in [
+            vec![0.25_f32, 0.25, 0.25, 0.25],
+            vec![0.7, 0.1, 0.2],
+            vec![0.0, 0.5, 0.2, 0.3],
+            p.clone(),
+        ] {
+            let q_dist = WeightedIndex::new(&q).unwrap();
+            let mut counts = [0usize; 4];
+            let mut accepted = 0usize;
+            for _ in 0..trials {
+                let draft = q_dist.sample(&mut rng) as u32;
+                let t = match verify_sampled_token(&d, draft, Some(&q), &mut rng).unwrap() {
+                    Verdict::Accept => {
+                        accepted += 1;
+                        draft
+                    }
+                    Verdict::Reject(t) => t,
+                };
+                counts[t as usize] += 1;
+            }
+            for (i, &c) in counts.iter().enumerate() {
+                let freq = c as f32 / trials as f32;
+                assert!(
+                    (freq - p[i]).abs() < 0.01,
+                    "q {q:?}: token {i} freq {freq} vs p {}",
+                    p[i]
+                );
+            }
+            // Acceptance is sum_i min(p_i, q_i), the optimum for this q.
+            let want: f32 = (0..4).map(|i| p[i].min(q.get(i).copied().unwrap_or(0.0))).sum();
+            let got = accepted as f32 / trials as f32;
+            assert!((got - want).abs() < 0.01, "q {q:?}: acceptance {got} vs {want}");
+        }
+    }
+
+    #[test]
+    fn draft_model_verification_without_q_is_the_deterministic_rule() {
+        let p = vec![0.1_f32, 0.6, 0.3];
+        for draft in 0..3u32 {
+            let mut a = StdRng::seed_from_u64(3);
+            let mut b = a.clone();
+            for _ in 0..100 {
+                let want = TokenDistRef::Probs(&p).verify(draft, &mut a).unwrap();
+                let got = TokenDistRef::Probs(&p).verify_sampled(draft, None, &mut b).unwrap();
+                assert_eq!(got, want);
+            }
+        }
+        // A point-mass target accepts its own token only, whatever q says.
+        let mut rng = StdRng::seed_from_u64(4);
+        let q = [0.5_f32, 0.5];
+        let g = TokenDistRef::Greedy(1);
+        assert_eq!(g.verify_sampled(1, Some(&q), &mut rng).unwrap(), Verdict::Accept);
+        assert_eq!(g.verify_sampled(0, Some(&q), &mut rng).unwrap(), Verdict::Reject(1));
     }
 
     #[test]
