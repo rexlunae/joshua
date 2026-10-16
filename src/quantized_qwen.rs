@@ -1547,6 +1547,9 @@ pub struct Weights {
     n_expert: usize,
     /// The NextN / MTP draft block, when the file has one.
     mtp: Option<Mtp>,
+    /// The decode megakernel, when requested and the model fits it (see
+    /// [`crate::megakernel`]).
+    mega: Option<crate::megakernel::Plan>,
 }
 
 /// The NextN / MTP block a GGUF appends after the trunk (`blk.{n_layer}`;
@@ -1688,6 +1691,14 @@ impl crate::native_session::LayerStack for Weights {
         drop(_p);
         prof::report();
         out
+    }
+
+    fn fused_decode(&self, states: &mut [LayerState], xs: &Tensor, offset: usize) -> Result<Option<Tensor>> {
+        let Some(mega) = &self.mega else {
+            return Ok(None);
+        };
+        let mut caches: Vec<&mut crate::attention::KvCache> = states.iter_mut().map(|s| &mut s.kv).collect();
+        mega.decode(&mut caches, xs, offset)
     }
 
     fn has_mtp(&self) -> bool {
@@ -2034,6 +2045,192 @@ fn load_moe<R: Read + Seek>(rd: &mut Reader<R>, p: &str, cfg: &Config) -> Result
     })
 }
 
+impl Weights {
+    /// Attach the decode megakernel when `JOSHUA_MEGAKERNEL` asks for it and
+    /// the model fits it; otherwise say why and keep the layer-by-layer path.
+    fn with_megakernel(mut self) -> Self {
+        if !crate::megakernel::requested() {
+            return self;
+        }
+        #[cfg(feature = "sycl")]
+        match mega_spec::build(&self) {
+            Ok(plan) => {
+                eprintln!(
+                    "megakernel: fused decode on (SYCL, {} layers, {} work-groups)",
+                    self.layers.len(),
+                    plan.groups()
+                );
+                self.mega = Some(plan);
+            }
+            Err(e) => eprintln!("megakernel: not used: {e}"),
+        }
+        #[cfg(not(feature = "sycl"))]
+        eprintln!("megakernel: not used: this build has no SYCL backend");
+        self
+    }
+}
+
+/// The megakernel's description of a Qwen-family model: dense pre-norm
+/// attention layers (optional Q/K/V biases and per-head Q/K norms) with a
+/// SwiGLU MLP, every weight a device-resident candle tensor.
+#[cfg(feature = "sycl")]
+mod mega_spec {
+    use super::*;
+    use candle_core::bail;
+    use candle_core::sycl_backend::mega::{weight_supported, DecodePlan, LayerSpec, ModelSpec, RowRange};
+
+    fn qm<'a>(w: &'a Weight, what: &str) -> Result<&'a QMatMul> {
+        match w {
+            Weight::Candle(q) if weight_supported(q) => Ok(q),
+            Weight::Candle(_) => bail!("{what}: weight format or placement not supported"),
+            _ => bail!("{what}: not a device-resident candle weight"),
+        }
+    }
+
+    fn all(w: &Weight, what: &str) -> Result<RowRange> {
+        RowRange::all(qm(w, what)?)
+    }
+
+    fn check_eps(norm: &RmsNorm, eps: f64, what: &str) -> Result<()> {
+        if norm.eps() != eps {
+            bail!("{what}: RMSNorm eps {} differs from the model's {eps}", norm.eps());
+        }
+        Ok(())
+    }
+
+    pub(super) fn build(w: &Weights) -> Result<crate::megakernel::Plan> {
+        if !w.device.is_sycl() {
+            bail!("the model device is not SYCL");
+        }
+        if !candle_core::sycl_backend::kernels::native_enabled() {
+            bail!("native SYCL kernels are off (JOSHUA_SYCL_NATIVE=0)");
+        }
+        if !DecodePlan::available() {
+            bail!("the SYCL bridge has no megakernel; rebuild it from this tree");
+        }
+        if w.streams != 1 {
+            bail!("hyper-connection residual streams");
+        }
+        let HeadNorm::Rms(out_norm) = &w.norm else {
+            bail!("hyper-connection output norm");
+        };
+        let eps = out_norm.eps();
+        let hidden = out_norm.weight().dim(0)?;
+        let mut rope: Option<Arc<Rope>> = None;
+        let mut heads: Option<(usize, usize, usize, f64)> = None;
+        let mut ffn = None;
+        let mut layers = Vec::with_capacity(w.layers.len());
+        for (l, layer) in w.layers.iter().enumerate() {
+            let Residual::PreNorm { attn_norm, ffn_norm } = &layer.residual else {
+                bail!("layer {l}: not a plain pre-norm residual");
+            };
+            let Mixer::Attention(a) = &layer.mixer else {
+                bail!("layer {l}: Gated DeltaNet layer");
+            };
+            if a.qsa.is_some() || a.gated {
+                bail!("layer {l}: block-sparse or gated attention");
+            }
+            let FeedForward::Dense(mlp) = &layer.ffn else {
+                bail!("layer {l}: MoE feed-forward");
+            };
+            match &rope {
+                None => rope = Some(a.rope.clone()),
+                Some(r) if Arc::ptr_eq(r, &a.rope) => {}
+                Some(_) => bail!("layer {l}: per-layer RoPE tables"),
+            }
+            let shape = (a.n_head, a.n_kv_head, a.head_dim, a.scale);
+            match heads {
+                None => heads = Some(shape),
+                Some(h) if h == shape => {}
+                Some(_) => bail!("layer {l}: per-layer attention shapes"),
+            }
+            check_eps(attn_norm, eps, "attention norm")?;
+            check_eps(ffn_norm, eps, "ffn norm")?;
+            for n in [&a.q_norm, &a.k_norm].into_iter().flatten() {
+                check_eps(n, eps, "q/k norm")?;
+            }
+            let (q, k, v, q_bias, k_bias, v_bias) = match &a.qkv {
+                Qkv::Fused { qkv, q_dim, k_dim, v_dim } => {
+                    let m = qm(&qkv.w, "attn_qkv")?;
+                    let part = |t: &Option<Tensor>, at: usize, n: usize| -> Result<Option<Tensor>> {
+                        t.as_ref().map(|b| b.narrow(0, at, n)).transpose()
+                    };
+                    (
+                        RowRange::slice(m, 0, *q_dim),
+                        RowRange::slice(m, *q_dim, *k_dim),
+                        RowRange::slice(m, q_dim + k_dim, *v_dim),
+                        part(&qkv.b, 0, *q_dim)?,
+                        part(&qkv.b, *q_dim, *k_dim)?,
+                        part(&qkv.b, q_dim + k_dim, *v_dim)?,
+                    )
+                }
+                Qkv::Split { q, k, v } => (
+                    all(&q.w, "attn_q")?,
+                    all(&k.w, "attn_k")?,
+                    all(&v.w, "attn_v")?,
+                    q.b.clone(),
+                    k.b.clone(),
+                    v.b.clone(),
+                ),
+            };
+            let (gate, up) = match &mlp.gate {
+                Some(g) => (all(g, "ffn_gate")?, all(&mlp.up, "ffn_up")?),
+                None => {
+                    let m = qm(&mlp.up, "ffn_up")?;
+                    let half = RowRange::all(m)?.rows / 2;
+                    (RowRange::slice(m, 0, half), RowRange::slice(m, half, half))
+                }
+            };
+            match ffn {
+                None => ffn = Some(gate.rows),
+                Some(f) if f == gate.rows => {}
+                Some(_) => bail!("layer {l}: per-layer FFN widths"),
+            }
+            layers.push(LayerSpec {
+                attn_norm: attn_norm.weight().clone(),
+                ffn_norm: ffn_norm.weight().clone(),
+                q,
+                k,
+                v,
+                q_bias,
+                k_bias,
+                v_bias,
+                q_norm: a.q_norm.as_ref().map(|n| n.weight().clone()),
+                k_norm: a.k_norm.as_ref().map(|n| n.weight().clone()),
+                o: all(&a.o.w, "attn_output")?,
+                o_bias: a.o.b.clone(),
+                gate,
+                up,
+                down: all(&mlp.down, "ffn_down")?,
+            });
+        }
+        let (Some(rope), Some((n_head, n_kv_head, head_dim, scale)), Some(ffn)) = (rope, heads, ffn) else {
+            bail!("no layers");
+        };
+        let (cos, sin) = rope.tables();
+        let out = all(&w.output.w, "output")?;
+        let spec = ModelSpec {
+            hidden,
+            n_head,
+            n_kv_head,
+            head_dim,
+            n_rot: rope.n_rot()?,
+            neox: rope.style() == RopeStyle::Neox,
+            ffn,
+            vocab: out.rows,
+            rms_eps: eps as f32,
+            attn_scale: scale as f32,
+            cos: cos.clone(),
+            sin: sin.clone(),
+            out_norm: out_norm.weight().clone(),
+            out,
+            out_bias: w.output.b.clone(),
+        };
+        let plan = DecodePlan::new(&w.device, spec, layers, crate::megakernel::groups())?;
+        Ok(crate::megakernel::Plan::sycl(plan))
+    }
+}
+
 impl ModelWeights {
     /// Load a Qwen-family GGUF (see [`ARCHES`]).
     pub fn from_gguf<R: Read + Seek>(
@@ -2096,7 +2293,8 @@ impl ModelWeights {
             residency: parts.residency,
             n_expert: parts.n_expert,
             mtp: parts.mtp,
-        }))
+            mega: None,
+        }.with_megakernel()))
     }
 }
 

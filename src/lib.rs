@@ -38,6 +38,7 @@ pub mod kquant_dot;
 pub mod kimi_k3;
 pub mod low_bit;
 pub mod mapping;
+pub mod megakernel;
 pub mod mmap_tensor;
 pub mod mhc;
 pub mod moe;

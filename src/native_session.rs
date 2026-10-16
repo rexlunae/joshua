@@ -92,6 +92,15 @@ pub trait LayerStack: Send + Sync + 'static {
     /// Final norm + output head: `[1, n, residual]` → `[1, n, vocab]` (f32).
     fn head(&self, xs: &Tensor) -> Result<Tensor>;
 
+    /// A single-token decode step through a fused device kernel (see
+    /// [`crate::megakernel`]): every layer plus the head over the embedded
+    /// token `xs` (`[1, 1, residual]`) at `offset`, updating `states`.
+    /// Returns the logits `[1, vocab]`, or `None` (the default) to take the
+    /// layer-by-layer path, in which case `states` must be untouched.
+    fn fused_decode(&self, _states: &mut [Self::State], _xs: &Tensor, _offset: usize) -> Result<Option<Tensor>> {
+        Ok(None)
+    }
+
     /// Whether the weights carry a NextN / MTP draft block (see
     /// [`Session::mtp_draft`]).  The three methods below serve only such
     /// weights.
@@ -706,6 +715,11 @@ impl<W: LayerStack> Session<W> {
         if all_logits {
             for s in self.state.iter_mut() {
                 W::begin_verify(s);
+            }
+        }
+        if seq_len == 1 && !all_logits && self.mtp.is_none() {
+            if let Some(logits) = w.fused_decode(&mut self.state, &xs, offset)? {
+                return Ok(logits);
             }
         }
         for l in 0..self.state.len() {
