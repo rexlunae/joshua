@@ -364,6 +364,20 @@ enum Commands {
         /// (the default) disables it and skips loading the block.
         #[arg(long, env = "JOSHUA_MTP", default_value_t = 0, hide_default_value = true)]
         mtp: usize,
+        /// Draft-model speculative decoding: a small GGUF that shares this
+        /// model's tokenizer (e.g. Qwen3-0.6B for a Qwen3 MoE) drafts up to
+        /// --draft-max tokens per step, verified in one forward pass of this
+        /// model.  Greedy output is unchanged; sampled output is verified
+        /// against the draft's own distribution, so it is distributed as
+        /// plain sampling.  The draft must be an attention-only model of a
+        /// joshua-native loader (qwen3, qwen3moe, glm4, deepseek2, …) and
+        /// runs on the dense device.  Takes the place of --speculative's
+        /// prompt lookup and of --mtp.
+        #[arg(long, env = "JOSHUA_DRAFT_MODEL")]
+        draft_model: Option<PathBuf>,
+        /// Most draft-model tokens per step (default 4).
+        #[arg(long, env = "JOSHUA_DRAFT_MAX", default_value_t = 0, hide_default_value = true)]
+        draft_max: usize,
         /// Lock the always-touched weights into RAM (mlock).  Needs the
         /// process memlock limit to cover the hot set: `LimitMEMLOCK=infinity`
         /// (systemd), `ulimit -l unlimited`, or /etc/security/limits.conf.
@@ -626,6 +640,20 @@ enum Commands {
         /// (the default) disables it and skips loading the block.
         #[arg(long, env = "JOSHUA_MTP", default_value_t = 0, hide_default_value = true)]
         mtp: usize,
+        /// Draft-model speculative decoding: a small GGUF that shares this
+        /// model's tokenizer (e.g. Qwen3-0.6B for a Qwen3 MoE) drafts up to
+        /// --draft-max tokens per step, verified in one forward pass of this
+        /// model.  Greedy output is unchanged; sampled output is verified
+        /// against the draft's own distribution, so it is distributed as
+        /// plain sampling.  The draft must be an attention-only model of a
+        /// joshua-native loader (qwen3, qwen3moe, glm4, deepseek2, …) and
+        /// runs on the dense device.  Takes the place of --speculative's
+        /// prompt lookup and of --mtp.
+        #[arg(long, env = "JOSHUA_DRAFT_MODEL")]
+        draft_model: Option<PathBuf>,
+        /// Most draft-model tokens per step (default 4).
+        #[arg(long, env = "JOSHUA_DRAFT_MAX", default_value_t = 0, hide_default_value = true)]
+        draft_max: usize,
         /// Lock the always-touched weights into RAM (mlock).  Needs the
         /// process memlock limit to cover the hot set: `LimitMEMLOCK=infinity`
         /// (systemd), `ulimit -l unlimited`, or /etc/security/limits.conf.
@@ -808,6 +836,8 @@ async fn main() -> anyhow::Result<()> {
             env_to_user,
             speculative,
             mtp,
+            draft_model,
+            draft_max,
             mlock_hot_weights,
             mlock_weight_budget,
             expert_placement,
@@ -873,6 +903,8 @@ async fn main() -> anyhow::Result<()> {
                 .env_to_user(env_to_user)
                 .speculative(speculative_config(speculative))
                 .mtp(mtp)
+                .draft_model(draft_model)
+                .draft_max(draft_max)
                 .mlock_hot_weights(
                     mlock_hot_weights
                         .map(MlockMode::from)
@@ -1194,6 +1226,8 @@ async fn main() -> anyhow::Result<()> {
             prefill_budget_ms,
             speculative,
             mtp,
+            draft_model,
+            draft_max,
             mlock_hot_weights,
             mlock_weight_budget,
             expert_placement,
@@ -1239,6 +1273,8 @@ async fn main() -> anyhow::Result<()> {
                 .prefill_budget_ms(prefill_budget_ms)
                 .speculative(speculative_config(speculative))
                 .mtp(mtp)
+                .draft_model(draft_model)
+                .draft_max(draft_max)
                 .mlock_hot_weights(
                     mlock_hot_weights
                         .map(MlockMode::from)
