@@ -212,6 +212,13 @@ API int joshua_sycl_launch(uintptr_t h, const char* name, const Arg* args, size_
 }
 
 // ─── Decode megakernel (mega.hpp) ────────────────────────────────────────────
+// The kernel's GEMVs reduce each row over one sub-group; 16 lanes is the
+// width every Intel Xe GPU offers.
+#ifdef JOSHUA_SYCL_EMU_IMPL
+#define MEGA_SG_SIZE
+#else
+#define MEGA_SG_SIZE [[sycl::reqd_sub_group_size(16)]]
+#endif
 // Optional entry points: a Rust build that predates them still loads the
 // rest of the bridge, and one that knows them reports a bridge without them.
 // Descriptors name buffers by handle; the plan resolves them to USM
@@ -460,7 +467,7 @@ API int joshua_sycl_mega_decode(uintptr_t h, uintptr_t p, const MegaKvDesc* kv, 
         size_t groups = plan.groups;
         ctx.submit([&](sycl::handler& cgh) {
             sycl::local_accessor<float, 1> local(sycl::range<1>(mega::LOCAL_FLOATS), cgh);
-            cgh.parallel_for(sycl::nd_range<1>(groups * WG, WG), [=](sycl::nd_item<1> it) {
+            cgh.parallel_for(sycl::nd_range<1>(groups * WG, WG), [=](sycl::nd_item<1> it) MEGA_SG_SIZE {
                 mega::Ctx c{it, local.template get_multi_ptr<sycl::access::decorated::no>().get()};
                 mega::run(c, model, scratch, kv_dev, xin, out, pos);
             });

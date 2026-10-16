@@ -104,9 +104,27 @@ struct group_state {
 template<int D> struct group {
     group_state* st;
 };
+// Sub-groups of EMU_SG consecutive work-items.  Collectives on them are
+// emulated with work-group barriers, so every sub-group of a work-group must
+// reach each one (true of the kernels that use them).
+constexpr size_t EMU_SG = 16;
+struct sub_group {
+    group_state* st;
+    size_t lin, size;
+    size_t get_local_linear_id() const { return lin % EMU_SG; }
+    size_t get_local_linear_range() const { return EMU_SG; }
+    size_t get_group_linear_id() const { return lin / EMU_SG; }
+    size_t get_group_linear_range() const { return (size + EMU_SG - 1) / EMU_SG; }
+};
+template<class T = void> struct plus { T operator()(T a, T b) const { return a + b; } };
 template<int D> struct nd_item {
     size_t gid[D], lid[D], grp[D], lrange[D];
     group_state* st;
+    sub_group get_sub_group() const {
+        size_t n = 1;
+        for (int i = 0; i < D; i++) n *= lrange[i];
+        return sub_group{st, get_local_linear_id(), n};
+    }
     size_t get_local_id(int d) const { return lid[d]; }
     size_t get_global_id(int d) const { return gid[d]; }
     size_t get_group(int d) const { return grp[d]; }
@@ -125,6 +143,21 @@ template<int D, class T> T group_broadcast(group<D> g, T v, size_t from) {
     g.st->barrier->arrive_and_wait();
     T r;
     std::memcpy(&r, &(*g.st->bcast)[from], sizeof(T));
+    g.st->barrier->arrive_and_wait();
+    return r;
+}
+
+template<class T, class Op> T reduce_over_group(sub_group g, T v, Op op) {
+    std::memcpy(&(*g.st->bcast)[emu_linear_id], &v, sizeof(T));
+    g.st->barrier->arrive_and_wait();
+    size_t base = emu_linear_id / EMU_SG * EMU_SG, end = std::min(base + EMU_SG, g.size);
+    T r;
+    std::memcpy(&r, &(*g.st->bcast)[base], sizeof(T));
+    for (size_t i = base + 1; i < end; i++) {
+        T x;
+        std::memcpy(&x, &(*g.st->bcast)[i], sizeof(T));
+        r = op(r, x);
+    }
     g.st->barrier->arrive_and_wait();
     return r;
 }

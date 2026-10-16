@@ -18,11 +18,11 @@
 // however many work-groups the device keeps resident (no co-residency
 // assumption, no root-group barrier).
 //
-// Numerics.  Each GEMV mirrors the op-at-a-time kernel the unfused path
-// would pick for that weight (`k_qgemv_mr` for the 256-element formats it
-// takes, `k_qgemv` for the other blocks, `k_gemv_nt` / `k_hgemv` for dense
-// weights) lane-for-lane, and the norms mirror `k_rmsnorm`, so their results
-// match the unfused path's.  Attention sums each score and context element
+// GEMVs.  One sub-group computes one output row with no work-group
+// barriers, so a work-group keeps several rows' weight loads in flight.  The
+// sums are grouped differently from the op-at-a-time kernels, so logits
+// agree with the unfused path to rounding, not bit for bit.  The norms
+// mirror `k_rmsnorm`; attention sums each score and context element
 // sequentially, as the tiled GEMM does for grouped-query heads.
 #pragma once
 #include "kernels.hpp"
@@ -59,7 +59,7 @@ struct Kv {
 
 // Stages of one layer, in order.
 enum { S_NORM1, S_QKV, S_PREP, S_ATTN, S_OPROJ, S_NORM2, S_GATEUP, S_DOWN, S_LAYER };
-// Rows one GEMV block produces; a task runs whole blocks (`Model::rpt`).
+// Granularity of GEMV tasks (`Model::rpt` is a multiple of it).
 constexpr int ROWS = 8;
 // Each sync counter sits on its own cache line, so the work-groups spinning
 // on one stage's counter do not contend with the ticket counter or with the
@@ -172,93 +172,74 @@ struct Ctx {
         barrier();
     }
 
-    // One output row of a dense or one-row-kernel weight: k_gemv_nt,
-    // k_hgemv or k_qgemv, lane-for-lane.
-    float row_dot(const W& w, int n, const float* x) const {
+    // This lane's share of row n of `w` dotted with x: the lanes of one
+    // sub-group stride across the row together, so neighbouring lanes read
+    // neighbouring blocks.
+    static float partial(const W& w, int n, const float* x, int lane, int sgs) {
         float acc = 0.0f;
         if (w.qt == QT_F32) {
             const float* r = reinterpret_cast<const float*>(w.p) + (int64_t)n * w.k;
-            for (int k = t(); k < w.k; k += WG) acc += x[k] * r[k];
+            for (int k = lane; k < w.k; k += sgs) acc += x[k] * r[k];
         } else if (w.qt == QT_F16 || w.qt == QT_BF16) {
             const uchar* row = w.p + (uint64_t)n * (uint64_t)w.k * 2ul;
-            for (int k = t(); k < w.k; k += WG) {
+            for (int k = lane; k < w.k; k += sgs) {
                 float v = w.qt == QT_BF16 ? bf16_at(row + 2 * k) : f16_at(row + 2 * k);
                 acc += x[k] * v;
+            }
+        } else if (w.cols > 0) {
+            // 256-element super-blocks, eight weights at a time.
+            const uchar* row = w.p + (uint64_t)n * (uint64_t)(w.k / 256) * (uint64_t)w.bsz;
+            float wv8[8];
+            for (int g = lane; g < w.k / 8; g += sgs) {
+                dequant8(w.qt, row + (uint64_t)(g >> 5) * w.bsz, (g >> 2) & 7, g & 3, wv8);
+                float8 wv = float8(wv8[0], wv8[1], wv8[2], wv8[3], wv8[4], wv8[5], wv8[6], wv8[7]);
+                float8 xv = vload8(0, x + g * 8);
+                acc += dot(wv.lo(), xv.lo()) + dot(wv.hi(), xv.hi());
             }
         } else {
             const uchar* row = w.p + (uint64_t)n * (uint64_t)(w.k / w.qk) * (uint64_t)w.bsz;
             int spb = w.qk / 32;
-            int nsub = w.k / 32;
             float buf[32];
-            for (int s = t(); s < nsub; s += WG) {
-                int b = s / spb;
-                int jj = s - b * spb;
-                dequant_sub(w.qt, row + (uint64_t)b * w.bsz, jj, buf);
-                const float* xb = x + s * 32;
+            for (int sb = lane; sb < w.k / 32; sb += sgs) {
+                int b = sb / spb;
+                dequant_sub(w.qt, row + (uint64_t)b * w.bsz, sb - b * spb, buf);
+                const float* xb = x + sb * 32;
                 float d = 0.0f;
                 for (int i = 0; i < 32; i++) d += xb[i] * buf[i];
                 acc += d;
             }
         }
-        return group_sum(acc);
+        return acc;
     }
 
-    // One k_qgemv_mr pass (M = 1): columns n0 .. n0 + cols, results to
-    // res()[base + c].
-    void mr_pass(const W& w, int n0, const float* x, int base) const {
-        int cols = w.cols;
-        int lpc = WG / cols;
-        int c = t() / lpc;
-        int lane = t() - c * lpc;
-        int n = n0 + c;
-        int ngroups = w.k / 8;
-        float acc = 0.0f;
-        if (n < w.n) {
-            const uchar* row = w.p + (uint64_t)n * (uint64_t)(w.k / 256) * (uint64_t)w.bsz;
-            float wv8[8];
-            for (int g = lane; g < ngroups; g += lpc) {
-                int b = g >> 5;
-                int j = (g >> 2) & 7;
-                int l = g & 3;
-                dequant8(w.qt, row + (uint64_t)b * w.bsz, j, l, wv8);
-                float8 wv = float8(wv8[0], wv8[1], wv8[2], wv8[3], wv8[4], wv8[5], wv8[6], wv8[7]);
-                float8 xv = vload8(0, x + g * 8);
-                acc += dot(wv.lo(), xv.lo()) + dot(wv.hi(), xv.hi());
-            }
-        }
-        float* s = sh();
-        s[t()] = acc;
-        barrier();
-        for (int k = lpc / 2; k > 0; k >>= 1) {
-            if (lane < k) s[t()] += s[t() + k];
-            barrier();
-        }
-        if (lane == 0 && n < w.n && base + c < ROWS) res()[base + c] = s[t()];
-        barrier();
+    // Row n of `w` @ x, reduced over the calling sub-group (every lane gets
+    // it); n < 0 contributes nothing but still joins the reduction.
+    float sg_dot(const W& w, int n, const float* x) const {
+        auto sg = it.get_sub_group();
+        int lane = (int)sg.get_local_linear_id(), sgs = (int)sg.get_local_linear_range();
+        float acc = n >= 0 ? partial(w, n, x, lane, sgs) : 0.0f;
+        return sycl::reduce_over_group(sg, acc, sycl::plus<float>());
     }
 
-    // Rows r0 .. r0 + nr (nr <= ROWS) of `w` @ x into res()[0 .. nr).
-    void rows(const W& w, int r0, int nr, const float* x) const {
-        if (w.cols > 0) {
-            for (int base = 0; base < nr; base += w.cols) mr_pass(w, r0 + base, x, base);
-        } else {
-            for (int i = 0; i < nr; i++) {
-                float v = row_dot(w, r0 + i, x);
-                if (t() == 0) res()[i] = v;
-            }
-            barrier();
+    // Rows r0 .. r0 + nr, one per sub-group at a time with no work-group
+    // barriers: value(row) computes a row through sg_dot (row -1 for a
+    // sub-group with nothing left this round, so every sub-group reduces
+    // the same number of times), emit(row, v) runs on the sub-group's lane 0.
+    template <class V, class E>
+    void each_row(int r0, int nr, V&& value, E&& emit) const {
+        auto sg = it.get_sub_group();
+        int id = (int)sg.get_group_linear_id(), nsg = (int)sg.get_group_linear_range();
+        bool lead = sg.get_local_linear_id() == 0;
+        for (int b = 0; b < nr; b += nsg) {
+            int i = b + id;
+            bool ok = i < nr;
+            float v = value(ok ? r0 + i : -1);
+            if (ok && lead) emit(r0 + i, v);
         }
     }
-
-    // Rows r0 .. r0 + nr of `w` @ x in blocks of ROWS, calling
-    // emit(row, value) on lane i < block rows for each block's row i.
-    template <class F>
-    void blocks(const W& w, int r0, int nr, const float* x, F&& emit) const {
-        for (int b = 0; b < nr; b += ROWS) {
-            int n = sycl::min(ROWS, nr - b);
-            rows(w, r0 + b, n, x);
-            if (t() < n) emit(r0 + b + t(), res()[t()]);
-        }
+    template <class E>
+    void blocks(const W& w, int r0, int nr, const float* x, E&& emit) const {
+        each_row(r0, nr, [&](int n) { return sg_dot(w, n, x); }, emit);
     }
 
     // RoPE on the leading n_rot dims of one head held in `v` (k_rope /
@@ -428,16 +409,10 @@ inline void run(const Ctx& c, const Model& m, const Scratch& s, const Kv* kv,
             c.rmsnorm(s.x, L.ffn_norm, s.xn, m.h, m.eps);
             break;
         case S_GATEUP: {
-            int r0 = sub * m.rpt[S_GATEUP], end = sycl::min(r0 + m.rpt[S_GATEUP], m.ffn);
-            for (int b = r0; b < end; b += ROWS) {
-                int nr = sycl::min(ROWS, end - b);
-                float g = 0.0f;
-                c.rows(L.gate, b, nr, s.xn);
-                if (c.t() < nr) g = c.res()[c.t()];
-                c.barrier();
-                c.rows(L.up, b, nr, s.xn);
-                if (c.t() < nr) s.act[b + c.t()] = unary_f(g, OP_SILU) * c.res()[c.t()];
-            }
+            int r0 = sub * m.rpt[S_GATEUP], nr = sycl::min(m.rpt[S_GATEUP], m.ffn - r0);
+            c.each_row(r0, nr,
+                       [&](int n) { return unary_f(c.sg_dot(L.gate, n, s.xn), OP_SILU) * c.sg_dot(L.up, n, s.xn); },
+                       [&](int r, float v) { s.act[r] = v; });
             break;
         }
         case S_DOWN: {
