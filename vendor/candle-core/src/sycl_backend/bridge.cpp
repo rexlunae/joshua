@@ -337,20 +337,37 @@ API int joshua_sycl_mega_new(uintptr_t h, const MegaModelDesc* md, const MegaLay
             L.up = mega_w(ctx, s.up, d.ffn, d.h, "ffn up");
             L.down = mega_w(ctx, s.down, d.h, d.ffn, "ffn down");
         }
-        auto tasks = [](int rows) { return (rows + mega::ROWS - 1) / mega::ROWS; };
+        auto& q = ctx.queue;
+        // One work-group per compute unit by default: more only add
+        // spinning waiters (measured on the Arc Pro B50).
+        size_t groups = d.groups > 0 ? (size_t)d.groups
+            : (size_t)q.get_device().get_info<sycl::info::device::max_compute_units>();
+        groups = std::max<size_t>(1, groups);
+        // Rows per task: about one task per work-group for each stage.
+        auto per_task = [&](int rows) {
+            size_t r = ((size_t)rows + groups - 1) / groups;
+            return (int)((r + mega::ROWS - 1) / mega::ROWS * mega::ROWS);
+        };
+        auto tasks = [](int rows, int rpt) { return (rows + rpt - 1) / rpt; };
+        int qkv_rpt = per_task(q_dim + 2 * kv_dim);
+        for (int i = 0; i < mega::S_LAYER; i++) m.rpt[i] = mega::ROWS;
+        m.rpt[mega::S_QKV] = qkv_rpt;
+        m.rpt[mega::S_OPROJ] = per_task(d.h);
+        m.rpt[mega::S_GATEUP] = per_task(d.ffn);
+        m.rpt[mega::S_DOWN] = per_task(d.h);
+        m.head_rpt = per_task(d.vocab);
         m.count[mega::S_NORM1] = 1;
-        m.count[mega::S_QKV] = tasks(q_dim) + 2 * tasks(kv_dim);
+        m.count[mega::S_QKV] = tasks(q_dim, qkv_rpt) + 2 * tasks(kv_dim, qkv_rpt);
         m.count[mega::S_PREP] = d.n_head + d.n_kv;
         m.count[mega::S_ATTN] = d.n_head;
-        m.count[mega::S_OPROJ] = tasks(d.h);
+        m.count[mega::S_OPROJ] = tasks(d.h, m.rpt[mega::S_OPROJ]);
         m.count[mega::S_NORM2] = 1;
-        m.count[mega::S_GATEUP] = tasks(d.ffn);
-        m.count[mega::S_DOWN] = tasks(d.h);
+        m.count[mega::S_GATEUP] = tasks(d.ffn, m.rpt[mega::S_GATEUP]);
+        m.count[mega::S_DOWN] = tasks(d.h, m.rpt[mega::S_DOWN]);
         m.start[0] = 0;
         for (int i = 0; i < mega::S_LAYER; i++) m.start[i + 1] = m.start[i] + m.count[i];
-        m.head_tasks = tasks(d.vocab);
+        m.head_tasks = tasks(d.vocab, m.head_rpt);
 
-        auto& q = ctx.queue;
         plan->layers_dev = sycl::malloc_device<mega::Layer>(layers.size(), q);
         require(plan->layers_dev != nullptr, "megakernel: device allocation failed");
         q.memcpy(plan->layers_dev, layers.data(), layers.size() * sizeof(mega::Layer)).wait_and_throw();
@@ -360,23 +377,22 @@ API int joshua_sycl_mega_new(uintptr_t h, const MegaModelDesc* md, const MegaLay
 
         size_t floats = (size_t)d.h * 2 + (size_t)(q_dim + 2 * kv_dim) + (size_t)q_dim * 2 + (size_t)d.ffn;
         size_t stages = (size_t)d.n_layers * mega::S_LAYER + 2;
-        plan->sync_bytes = (stages + 1) * sizeof(uint32_t);
-        plan->block = sycl::malloc_device(floats * 4 + plan->sync_bytes, q);
+        plan->sync_bytes = (stages + 1) * mega::SYNC_STRIDE * sizeof(uint32_t);
+        // Counters first, so each starts a cache line.
+        plan->block = sycl::aligned_alloc_device(256, plan->sync_bytes + floats * 4, q);
         require(plan->block != nullptr, "megakernel: device allocation failed");
-        float* f = static_cast<float*>(plan->block);
         auto& sc = plan->scratch;
+        sc.sync = static_cast<uint32_t*>(plan->block);
+        float* f = reinterpret_cast<float*>(static_cast<char*>(plan->block) + plan->sync_bytes);
         sc.x = f; f += d.h;
         sc.xn = f; f += d.h;
         sc.qkv = f; f += q_dim + 2 * kv_dim;
         sc.q = f; f += q_dim;
         sc.ctx = f; f += q_dim;
         sc.act = f; f += d.ffn;
-        sc.sync = reinterpret_cast<uint32_t*>(f);
         sc.scores = nullptr; sc.scores_cap = 0;
 
         size_t total = (size_t)d.n_layers * m.start[mega::S_LAYER] + 1 + m.head_tasks;
-        size_t groups = d.groups > 0 ? (size_t)d.groups
-            : (size_t)q.get_device().get_info<sycl::info::device::max_compute_units>() * 4;
         plan->groups = std::max<size_t>(1, std::min(groups, total));
         *out = reinterpret_cast<uintptr_t>(plan.release());
     });

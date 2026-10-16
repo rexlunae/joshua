@@ -180,6 +180,7 @@ struct queue {
 };
 inline void* malloc_device(size_t n, const queue&) { return std::calloc(1, n ? n : 1); }
 template<class T> T* malloc_device(size_t n, const queue& q) { return static_cast<T*>(malloc_device(n * sizeof(T), q)); }
+inline void* aligned_alloc_device(size_t align, size_t n, const queue&) { void* p = std::aligned_alloc(align, (n + align - 1) / align * align); if (p) std::memset(p, 0, n); return p; }
 inline void free(void* p, const queue&) { std::free(p); }
 
 // ─── Kernels ─────────────────────────────────────────────────────────────────

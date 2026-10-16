@@ -203,8 +203,8 @@ impl DecodePlan {
         bridge::mega_available()
     }
 
-    /// Build a plan.  `groups` overrides the work-groups launched (0: four
-    /// per compute unit).
+    /// Build a plan.  `groups` overrides the work-groups launched (0: one per
+    /// compute unit).
     pub fn new(device: &Device, spec: ModelSpec, layers: Vec<LayerSpec>, groups: usize) -> Result<Self> {
         let Device::Sycl(dev) = device else {
             crate::bail!("sycl megakernel: not a SYCL device");

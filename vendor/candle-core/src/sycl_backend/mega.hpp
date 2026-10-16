@@ -59,8 +59,12 @@ struct Kv {
 
 // Stages of one layer, in order.
 enum { S_NORM1, S_QKV, S_PREP, S_ATTN, S_OPROJ, S_NORM2, S_GATEUP, S_DOWN, S_LAYER };
-// Rows one GEMV task produces.
+// Rows one GEMV block produces; a task runs whole blocks (`Model::rpt`).
 constexpr int ROWS = 8;
+// Each sync counter sits on its own cache line, so the work-groups spinning
+// on one stage's counter do not contend with the ticket counter or with the
+// stage that is signalling.
+constexpr int SYNC_STRIDE = 32;
 // Largest head_dim the per-head stages hold in local memory.
 constexpr int MAX_HD = 512;
 // Local memory: reduction tree + task results + one head.
@@ -80,6 +84,12 @@ struct Model {
     int count[S_LAYER];
     int start[S_LAYER + 1];
     int head_tasks;
+    // Rows per task of each GEMV stage (QKV, OPROJ, GATEUP, DOWN) and of
+    // the head, a multiple of ROWS: sized so a stage has about one task per
+    // work-group, which keeps the per-task ticket and signal off the
+    // critical path.
+    int rpt[S_LAYER];
+    int head_rpt;
 };
 
 struct Scratch {
@@ -91,7 +101,7 @@ struct Scratch {
     float* act;     // [ffn]
     float* scores;  // [n_head, scores_cap]
     int scores_cap, pad;
-    uint* sync;     // [0] ticket, [1 + stage] completed tasks
+    uint* sync;     // [0] ticket, [(1 + stage) * SYNC_STRIDE] completed tasks
 };
 
 using atomic_u32 = sycl::atomic_ref<uint, sycl::memory_order::relaxed, sycl::memory_scope::device,
@@ -240,6 +250,17 @@ struct Ctx {
         }
     }
 
+    // Rows r0 .. r0 + nr of `w` @ x in blocks of ROWS, calling
+    // emit(row, value) on lane i < block rows for each block's row i.
+    template <class F>
+    void blocks(const W& w, int r0, int nr, const float* x, F&& emit) const {
+        for (int b = 0; b < nr; b += ROWS) {
+            int n = sycl::min(ROWS, nr - b);
+            rows(w, r0 + b, n, x);
+            if (t() < n) emit(r0 + b + t(), res()[t()]);
+        }
+    }
+
     // RoPE on the leading n_rot dims of one head held in `v` (k_rope /
     // k_rope_i for position `pos`), written to `o` (global); the remaining
     // dims pass through.
@@ -270,7 +291,7 @@ inline void run(const Ctx& c, const Model& m, const Scratch& s, const Kv* kv,
     const int total = layer_tasks + 1 + m.head_tasks;
     const int q_dim = m.n_head * m.hd, kv_dim = m.n_kv * m.hd;
     const int seq = pos + 1;
-    uint* done = s.sync + 1;
+    auto done = [&](int stage) { return s.sync + (1 + stage) * SYNC_STRIDE; };
     for (;;) {
         uint ticket = 0;
         if (c.t() == 0) ticket = atomic_u32(s.sync[0]).fetch_add(1u);
@@ -299,17 +320,16 @@ inline void run(const Ctx& c, const Model& m, const Scratch& s, const Kv* kv,
             stage = m.n_layers * S_LAYER + 1;
             need = 1;
         }
-        if (stage > 0) c.wait_for(done + stage - 1, (uint)need);
+        if (stage > 0) c.wait_for(done(stage - 1), (uint)need);
 
         if (layer == m.n_layers) {
             if (stage == m.n_layers * S_LAYER) {
                 c.rmsnorm(s.x, m.out_norm, s.xn, m.h, m.eps);
             } else {
-                int r0 = sub * ROWS, nr = sycl::min(ROWS, m.vocab - r0);
-                c.rows(m.out, r0, nr, s.xn);
-                if (c.t() < nr) logits[r0 + c.t()] = c.res()[c.t()] + (m.out_b ? m.out_b[r0 + c.t()] : 0.0f);
+                int r0 = sub * m.head_rpt, nr = sycl::min(m.head_rpt, m.vocab - r0);
+                c.blocks(m.out, r0, nr, s.xn, [&](int r, float v) { logits[r] = v + (m.out_b ? m.out_b[r] : 0.0f); });
             }
-            c.signal(done + stage);
+            c.signal(done(stage));
             continue;
         }
 
@@ -325,19 +345,17 @@ inline void run(const Ctx& c, const Model& m, const Scratch& s, const Kv* kv,
             break;
         }
         case S_QKV: {
-            // Each of the Q, K and V ranges is split into whole tasks of
-            // ROWS rows, so a task never straddles two ranges.
-            int tq = (L.qkv[0].n + ROWS - 1) / ROWS, tk = (L.qkv[1].n + ROWS - 1) / ROWS;
+            // Each of the Q, K and V ranges is split into whole tasks, so a
+            // task never straddles two ranges.
+            int rpt = m.rpt[S_QKV];
+            int tq = (L.qkv[0].n + rpt - 1) / rpt, tk = (L.qkv[1].n + rpt - 1) / rpt;
             int g = sub < tq ? 0 : sub < tq + tk ? 1 : 2;
-            int row = (g == 0 ? sub : g == 1 ? sub - tq : sub - tq - tk) * ROWS;
+            int row = (g == 0 ? sub : g == 1 ? sub - tq : sub - tq - tk) * rpt;
             const W& w = L.qkv[g];
-            int nr = sycl::min(ROWS, w.n - row);
-            c.rows(w, row, nr, s.xn);
-            if (c.t() < nr) {
-                int base = (g == 0 ? 0 : g == 1 ? q_dim : q_dim + kv_dim) + row + c.t();
-                const float* b = L.qkv_b[g];
-                s.qkv[base] = c.res()[c.t()] + (b ? b[row + c.t()] : 0.0f);
-            }
+            int base = g == 0 ? 0 : g == 1 ? q_dim : q_dim + kv_dim;
+            const float* b = L.qkv_b[g];
+            c.blocks(w, row, sycl::min(rpt, w.n - row), s.xn,
+                     [&](int r, float v) { s.qkv[base + r] = v + (b ? b[r] : 0.0f); });
             break;
         }
         case S_PREP: {
@@ -402,38 +420,33 @@ inline void run(const Ctx& c, const Model& m, const Scratch& s, const Kv* kv,
             break;
         }
         case S_OPROJ: {
-            int r0 = sub * ROWS, nr = sycl::min(ROWS, m.h - r0);
-            c.rows(L.o, r0, nr, s.ctx);
-            if (c.t() < nr) {
-                int r = r0 + c.t();
-                s.x[r] = s.x[r] + (c.res()[c.t()] + (L.o_b ? L.o_b[r] : 0.0f));
-            }
+            int r0 = sub * m.rpt[S_OPROJ], nr = sycl::min(m.rpt[S_OPROJ], m.h - r0);
+            c.blocks(L.o, r0, nr, s.ctx, [&](int r, float v) { s.x[r] = s.x[r] + (v + (L.o_b ? L.o_b[r] : 0.0f)); });
             break;
         }
         case S_NORM2:
             c.rmsnorm(s.x, L.ffn_norm, s.xn, m.h, m.eps);
             break;
         case S_GATEUP: {
-            int r0 = sub * ROWS, nr = sycl::min(ROWS, m.ffn - r0);
-            float g = 0.0f;
-            c.rows(L.gate, r0, nr, s.xn);
-            if (c.t() < nr) g = c.res()[c.t()];
-            c.barrier();
-            c.rows(L.up, r0, nr, s.xn);
-            if (c.t() < nr) s.act[r0 + c.t()] = unary_f(g, OP_SILU) * c.res()[c.t()];
-            break;
-        }
-        case S_DOWN: {
-            int r0 = sub * ROWS, nr = sycl::min(ROWS, m.h - r0);
-            c.rows(L.down, r0, nr, s.act);
-            if (c.t() < nr) {
-                int r = r0 + c.t();
-                s.x[r] = s.x[r] + c.res()[c.t()];
+            int r0 = sub * m.rpt[S_GATEUP], end = sycl::min(r0 + m.rpt[S_GATEUP], m.ffn);
+            for (int b = r0; b < end; b += ROWS) {
+                int nr = sycl::min(ROWS, end - b);
+                float g = 0.0f;
+                c.rows(L.gate, b, nr, s.xn);
+                if (c.t() < nr) g = c.res()[c.t()];
+                c.barrier();
+                c.rows(L.up, b, nr, s.xn);
+                if (c.t() < nr) s.act[b + c.t()] = unary_f(g, OP_SILU) * c.res()[c.t()];
             }
             break;
         }
+        case S_DOWN: {
+            int r0 = sub * m.rpt[S_DOWN], nr = sycl::min(m.rpt[S_DOWN], m.h - r0);
+            c.blocks(L.down, r0, nr, s.act, [&](int r, float v) { s.x[r] = s.x[r] + v; });
+            break;
         }
-        c.signal(done + stage);
+        }
+        c.signal(done(stage));
     }
 }
 

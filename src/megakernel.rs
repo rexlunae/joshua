@@ -10,7 +10,7 @@
 //! buffers, so the two paths interleave freely within a session.
 //!
 //! `JOSHUA_MEGAKERNEL_GROUPS=<n>` overrides the work-groups each launch
-//! uses (default: four per compute unit).
+//! uses (default: one per compute unit).
 //!
 //! [`SeqKvCache`]: crate::attention::SeqKvCache
 
