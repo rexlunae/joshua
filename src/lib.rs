@@ -21,6 +21,7 @@
 //! A `tokenizer.json` from the model's HuggingFace repository must be placed
 //! alongside the `.gguf` file so the engine can tokenise prompts.
 
+pub mod anthropic;
 pub mod attention;
 pub mod auto_placement;
 pub mod compression;
@@ -36,6 +37,7 @@ pub mod gguf_meta;
 pub mod hot_experts;
 pub mod iq2xxs;
 pub mod kquant_dot;
+pub mod kv_int8;
 pub mod kimi_k3;
 pub mod low_bit;
 pub mod mapping;

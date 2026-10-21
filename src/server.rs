@@ -1,9 +1,15 @@
 //! OpenAI-compatible HTTP API server for Joshua.
 //!
 //! Implements the following endpoints:
-//! - `GET  /health`                   — liveness check
+//! - `GET  /health`                   — liveness check with a load summary
+//! - `GET  /status`                   — model inventory and counters
+//! - `GET  /metrics`                  — JSON counters (`/metrics/prometheus` for text)
+//! - `GET  /props`                    — llama.cpp-compatible server properties
+//! - `GET  /slots`                    — lightweight per-model slot records
+//! - `POST /tokenize`                 — tokenize with the loaded model
 //! - `GET  /v1/models`                — list loaded model
 //! - `POST /v1/chat/completions`      — chat completion (stream or non-stream)
+//! - `POST /v1/messages`              — Anthropic Messages API
 //! - `POST /v1/completions`           — legacy text completion
 //! - `POST /v1/embeddings`            — dense text embeddings
 //! - `POST /v1/audio/transcriptions`  — Whisper speech-to-text (when a
@@ -21,13 +27,13 @@
 
 use std::convert::Infallible;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use axum::{
     extract::{Request, State},
-    http::{header, StatusCode},
+    http::{header, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{
         sse::{Event, Sse},
@@ -36,12 +42,13 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use futures_util::{stream, StreamExt};
+use futures_util::stream;
 use serde_json::json;
 use tokio::net::TcpListener;
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use uuid::Uuid;
 
+use crate::anthropic::{self, MessagesRequest};
 use crate::coordinator::{ModelSlots, WorkerCapabilities, WorkerInfo, WORKER_PROTOCOL_VERSION};
 use crate::engine::{Engine, EngineOptions};
 use crate::error::JoshuaError;
@@ -51,8 +58,113 @@ use crate::types::{
     AssistantMessage, ChatChoice, ChatCompletionChunk, ChatCompletionRequest,
     ChatCompletionResponse, ChatMessage, DeltaContent, EmbeddingData, EmbeddingRequest,
     EmbeddingResponse, ErrorResponse, FunctionCallResult, GenerationOptions, ModelInfo,
-    ModelListResponse, ToolCall, UsageInfo,
+    ModelListResponse, Tool, ToolCall, UsageInfo,
 };
+
+/// Process-lifetime counters exposed by `/status` and `/metrics`.
+///
+/// The counters are advisory: they are updated with relaxed atomics on the
+/// request path, where a lost update under extreme concurrency is less
+/// important than keeping the hot path free of locks.
+pub struct ServerMetrics {
+    started: Instant,
+    http_requests: AtomicU64,
+    http_errors: AtomicU64,
+    prompt_tokens: AtomicU64,
+    completion_tokens: AtomicU64,
+    embed_tokens: AtomicU64,
+    streamed_requests: AtomicU64,
+}
+
+impl Default for ServerMetrics {
+    fn default() -> Self {
+        Self {
+            started: Instant::now(),
+            http_requests: AtomicU64::new(0),
+            http_errors: AtomicU64::new(0),
+            prompt_tokens: AtomicU64::new(0),
+            completion_tokens: AtomicU64::new(0),
+            embed_tokens: AtomicU64::new(0),
+            streamed_requests: AtomicU64::new(0),
+        }
+    }
+}
+
+impl ServerMetrics {
+    fn record_http(&self, status: StatusCode) {
+        self.http_requests.fetch_add(1, Ordering::Relaxed);
+        if status.is_client_error() || status.is_server_error() {
+            self.http_errors.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn record_generation(&self, usage: &UsageInfo) {
+        self.prompt_tokens
+            .fetch_add(usage.prompt_tokens as u64, Ordering::Relaxed);
+        self.completion_tokens
+            .fetch_add(usage.completion_tokens as u64, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> serde_json::Value {
+        json!({
+            "uptime_seconds": self.started.elapsed().as_secs(),
+            "http_requests_total": self.http_requests.load(Ordering::Relaxed),
+            "http_errors_total": self.http_errors.load(Ordering::Relaxed),
+            "prompt_tokens_total": self.prompt_tokens.load(Ordering::Relaxed),
+            "completion_tokens_total": self.completion_tokens.load(Ordering::Relaxed),
+            "embedding_tokens_total": self.embed_tokens.load(Ordering::Relaxed),
+            "streaming_requests_total": self.streamed_requests.load(Ordering::Relaxed),
+        })
+    }
+
+    fn prometheus(&self, in_flight: usize, max_concurrency: usize, models: usize) -> String {
+        let mut out = String::new();
+        let uptime = self.started.elapsed().as_secs();
+        out.push_str("# HELP joshua_uptime_seconds Seconds since the server started.\n");
+        out.push_str("# TYPE joshua_uptime_seconds gauge\n");
+        out.push_str(&format!("joshua_uptime_seconds {uptime}\n"));
+        out.push_str("# HELP joshua_http_requests_total HTTP requests received.\n");
+        out.push_str("# TYPE joshua_http_requests_total counter\n");
+        out.push_str(&format!(
+            "joshua_http_requests_total {}\n",
+            self.http_requests.load(Ordering::Relaxed)
+        ));
+        out.push_str("# HELP joshua_http_errors_total HTTP requests answered 4xx/5xx.\n");
+        out.push_str("# TYPE joshua_http_errors_total counter\n");
+        out.push_str(&format!(
+            "joshua_http_errors_total {}\n",
+            self.http_errors.load(Ordering::Relaxed)
+        ));
+        out.push_str("# HELP joshua_prompt_tokens_total Prompt tokens processed.\n");
+        out.push_str("# TYPE joshua_prompt_tokens_total counter\n");
+        out.push_str(&format!(
+            "joshua_prompt_tokens_total {}\n",
+            self.prompt_tokens.load(Ordering::Relaxed)
+        ));
+        out.push_str("# HELP joshua_completion_tokens_total Tokens generated.\n");
+        out.push_str("# TYPE joshua_completion_tokens_total counter\n");
+        out.push_str(&format!(
+            "joshua_completion_tokens_total {}\n",
+            self.completion_tokens.load(Ordering::Relaxed)
+        ));
+        out.push_str("# HELP joshua_streaming_requests_total Requests served over SSE.\n");
+        out.push_str("# TYPE joshua_streaming_requests_total counter\n");
+        out.push_str(&format!(
+            "joshua_streaming_requests_total {}\n",
+            self.streamed_requests.load(Ordering::Relaxed)
+        ));
+        out.push_str("# HELP joshua_in_flight_requests Requests holding a generation permit.\n");
+        out.push_str("# TYPE joshua_in_flight_requests gauge\n");
+        out.push_str(&format!("joshua_in_flight_requests {in_flight}\n"));
+        out.push_str("# HELP joshua_max_concurrency Configured admission cap.\n");
+        out.push_str("# TYPE joshua_max_concurrency gauge\n");
+        out.push_str(&format!("joshua_max_concurrency {max_concurrency}\n"));
+        out.push_str("# HELP joshua_models_loaded Models currently loaded.\n");
+        out.push_str("# TYPE joshua_models_loaded gauge\n");
+        out.push_str(&format!("joshua_models_loaded {models}\n"));
+        out
+    }
+}
 
 /// Shared application state.
 pub struct ServerState {
@@ -63,8 +175,16 @@ pub struct ServerState {
     /// Optional Whisper model for `/v1/audio/transcriptions`.
     pub whisper: Option<Arc<WhisperEngine>>,
     /// When set, every `/v1` request must carry this key as
-    /// `Authorization: Bearer <key>`.  `/health` stays open for probes.
+    /// `Authorization: Bearer <key>` or `x-api-key: <key>`.  A
+    /// comma-separated list accepts any of the listed keys, which makes
+    /// rotation possible without a restart.  `/health` stays open for probes.
     pub api_key: Option<String>,
+    /// Exact origins allowed by CORS.  Empty keeps the historical
+    /// permissive policy for localhost development; set one or more
+    /// origins (or `JOSHUA_CORS_ORIGINS`) in a deployment.
+    pub cors_origins: Vec<String>,
+    /// Ops counters.
+    pub metrics: Arc<ServerMetrics>,
 }
 
 /// Shared application state handle.
@@ -78,6 +198,8 @@ impl ServerState {
             manager: None,
             whisper: None,
             api_key: None,
+            cors_origins: Vec::new(),
+            metrics: Arc::new(ServerMetrics::default()),
         }
     }
 }
@@ -590,10 +712,21 @@ pub fn create_router(state: AppState) -> Router {
     let api = Router::new()
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/messages", post(messages))
         .route("/v1/completions", post(completions))
         .route("/v1/embeddings", post(embeddings))
         .route("/v1/audio/transcriptions", post(transcriptions))
         .route(crate::coordinator::WORKER_INFO_PATH, get(worker_info))
+        // Ops endpoints sit behind the API key when one is configured:
+        // they expose model names and load figures, which are not useful to
+        // an unauthenticated caller.  `/health` below stays open for probes.
+        .route("/status", get(server_status))
+        .route("/metrics", get(metrics_json))
+        .route("/metrics/prometheus", get(metrics_prometheus))
+        .route("/props", get(props))
+        .route("/slots", get(slots))
+        .route("/tokenize", post(tokenize))
+        .route("/api/tokens", post(tokenize))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             require_api_key,
@@ -608,12 +741,44 @@ pub fn create_router(state: AppState) -> Router {
             Arc::clone(&state),
             require_api_key,
         ));
+    let cors = cors_layer(&state.cors_origins);
     Router::new()
         .route("/health", get(health))
         .merge(api)
-        .layer(CorsLayer::permissive())
+        .layer(cors)
         .merge(manage)
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            count_requests,
+        ))
         .with_state(state)
+}
+
+fn cors_layer(origins: &[String]) -> CorsLayer {
+    if origins.is_empty() {
+        // Historical behaviour: a localhost development server is callable
+        // from any browser origin.  Deployments should set --cors-origin.
+        return CorsLayer::permissive();
+    }
+    let origins: Vec<HeaderValue> = origins
+        .iter()
+        .filter_map(|origin| origin.trim().parse().ok())
+        .collect();
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::list(origins))
+        .allow_methods(Any)
+        .allow_headers(Any)
+}
+
+/// Count every response, including ones rejected by auth.
+async fn count_requests(
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let response = next.run(req).await;
+    state.metrics.record_http(response.status());
+    response
 }
 
 /// Reject `/v1` requests that lack the configured bearer API key.
@@ -626,10 +791,32 @@ async fn require_api_key(State(state): State<AppState>, req: Request, next: Next
             .headers()
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "));
-        if !provided.is_some_and(|key| api_keys_match(key.as_bytes(), expected.as_bytes())) {
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .or_else(|| {
+                req.headers()
+                    .get("x-api-key")
+                    .and_then(|v| v.to_str().ok())
+            });
+        // A comma-separated configuration supports key rotation: any listed
+        // key is accepted.  Empty entries are ignored so a trailing comma
+        // does not accidentally accept an empty key; an all-empty value is
+        // treated as "no key configured" rather than locking every caller
+        // out.
+        let expected_keys: Vec<&str> = expected
+            .split(',')
+            .map(str::trim)
+            .filter(|candidate| !candidate.is_empty())
+            .collect();
+        if !expected_keys.is_empty()
+            && !provided.is_some_and(|key| {
+                expected_keys
+                    .iter()
+                    .any(|candidate| api_keys_match(key.as_bytes(), candidate.as_bytes()))
+            })
+        {
             let body = ErrorResponse::new(
-                "invalid or missing API key — pass the key as 'Authorization: Bearer <key>'",
+                "invalid or missing API key — pass the key as \
+                 'Authorization: Bearer <key>' or 'x-api-key: <key>'",
                 "invalid_request_error",
             );
             return (StatusCode::UNAUTHORIZED, Json(body)).into_response();
@@ -702,9 +889,149 @@ pub async fn serve_with_state_tls(
 
 // ─── Handlers ────────────────────────────────────────────────────────────────
 
-/// `GET /health` — returns `{"status":"ok"}`.
-async fn health() -> Json<serde_json::Value> {
-    Json(json!({"status": "ok"}))
+/// `GET /health` — liveness plus a compact model/load summary.
+async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let models = state.models.list();
+    let in_flight: usize = models.iter().map(|m| m.engine.in_flight()).sum();
+    let max_concurrency: usize = models.iter().map(|m| m.engine.max_concurrency()).sum();
+    Json(json!({
+        "status": "ok",
+        "version": env!("CARGO_PKG_VERSION"),
+        "uptime_seconds": state.metrics.started.elapsed().as_secs(),
+        "models": models.len(),
+        "in_flight": in_flight,
+        "max_concurrency": max_concurrency,
+    }))
+}
+
+/// `GET /status` — model inventory and live load.
+async fn server_status(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let models = state.models.list();
+    let model_values: Vec<serde_json::Value> = models
+        .iter()
+        .map(|m| {
+            json!({
+                "id": m.id,
+                "n_ctx": m.engine.n_ctx(),
+                "backend": device_label(m.engine.device()),
+                "in_flight": m.engine.in_flight(),
+                "max_concurrency": m.engine.max_concurrency(),
+                "embeddings": !m.engine.remote_only(),
+                "remote": m.engine.remote_only(),
+                "workers": m.workers.iter().map(|w| w.to_string()).collect::<Vec<_>>(),
+                "stages": m.stages,
+                "created": m.created,
+                "has_chat_template": m.engine.has_chat_template(),
+            })
+        })
+        .collect();
+    let in_flight: usize = models.iter().map(|m| m.engine.in_flight()).sum();
+    let max_concurrency: usize = models.iter().map(|m| m.engine.max_concurrency()).sum();
+    Json(json!({
+        "object": "joshua.status",
+        "version": env!("CARGO_PKG_VERSION"),
+        "models": model_values,
+        "in_flight": in_flight,
+        "max_concurrency": max_concurrency,
+        "metrics": state.metrics.snapshot(),
+    }))
+}
+
+/// `GET /metrics` — JSON counters.
+async fn metrics_json(State(state): State<AppState>) -> Json<serde_json::Value> {
+    Json(state.metrics.snapshot())
+}
+
+/// `GET /metrics/prometheus` — Prometheus text exposition format.
+async fn metrics_prometheus(State(state): State<AppState>) -> Response {
+    let models = state.models.list();
+    let in_flight: usize = models.iter().map(|m| m.engine.in_flight()).sum();
+    let max_concurrency: usize = models.iter().map(|m| m.engine.max_concurrency()).sum();
+    (
+        [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        state
+            .metrics
+            .prometheus(in_flight, max_concurrency, models.len()),
+    )
+        .into_response()
+}
+
+/// `GET /props` — llama.cpp-compatible server properties.
+async fn props(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
+    let models = state.models.list();
+    let Some(first) = models.first() else {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no model is loaded",
+            "model_not_loaded",
+        ));
+    };
+    let defaults = GenerationOptions::default();
+    let total_slots: usize = models.iter().map(|m| m.engine.max_concurrency()).sum();
+    Ok(Json(json!({
+        "model_path": first.engine.model_path(),
+        "model_name": first.id,
+        "n_ctx": first.engine.n_ctx(),
+        "chat_template": first.engine.has_chat_template().then_some("<gguf chat template>"),
+        "total_slots": total_slots,
+        "default_generation_settings": {
+            "n_predict": defaults.max_tokens,
+            "temperature": defaults.temperature,
+            "top_p": defaults.top_p,
+            "top_k": defaults.top_k,
+            "min_p": defaults.min_p,
+            "repeat_penalty": defaults.repetition_penalty,
+        },
+    })))
+}
+
+/// `GET /slots` — one lightweight slot record per loaded model.
+async fn slots(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let slots: Vec<serde_json::Value> = state
+        .models
+        .list()
+        .into_iter()
+        .enumerate()
+        .map(|(id, model)| {
+            json!({
+                "id": id,
+                "model": model.id,
+                "n_ctx": model.engine.n_ctx(),
+                "in_flight": model.engine.in_flight(),
+                "max_concurrency": model.engine.max_concurrency(),
+                "state": if model.engine.in_flight() == 0 { "idle" } else { "busy" },
+            })
+        })
+        .collect();
+    Json(serde_json::Value::Array(slots))
+}
+
+/// `POST /tokenize` (also `/api/tokens`) — count a prompt with the loaded
+/// tokenizer.  Body: `{"model": "...", "prompt": "..."}` or llama.cpp's
+/// `{"content": "..."}`; `add_special_tokens` defaults to true.
+async fn tokenize(
+    State(state): State<AppState>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (_, engine) = state
+        .models
+        .resolve(body.get("model").and_then(|v| v.as_str()).unwrap_or_default())?;
+    let prompt = body
+        .get("prompt")
+        .or_else(|| body.get("content"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ApiError::bad_request("missing 'prompt' or 'content'"))?;
+    let add_special = body
+        .get("add_special_tokens")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let tokens = engine
+        .tokenize(prompt, add_special)
+        .map_err(ApiError::from)?;
+    Ok(Json(json!({
+        "tokens": tokens,
+        "count": tokens.len(),
+    })))
 }
 
 /// `GET /v1/worker/info` — what a `joshua route` coordinator needs to admit
@@ -830,114 +1157,49 @@ async fn chat_completions(
     if stream {
         // ── Streaming path ────────────────────────────────────────────────────
         let id = format!("chatcmpl-{}", Uuid::new_v4().simple());
-
-        // Run inference in a blocking thread to avoid stalling the async runtime.
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let cancel = CancelOnDrop::new();
-        let (text, usage, _, _) = tokio::task::spawn_blocking({
+        let flag = cancel.flag();
+        state.metrics.streamed_requests.fetch_add(1, Ordering::Relaxed);
+
+        // Inference runs on a blocking thread and reports text through the
+        // engine's per-token callback.  The SSE body is returned immediately;
+        // hyper pulls chunks as the channel fills.
+        tokio::task::spawn_blocking({
             let engine = Arc::clone(&engine);
+            let model = model.clone();
+            let id = id.clone();
             let tools = tools.clone();
-            let flag = cancel.flag();
-            move || engine.complete_chat_cancellable(&messages, tools.as_deref(), &options, &flag)
-        })
-        .await
-        .map_err(|e| ApiError::internal(e.to_string()))?
-        .map_err(ApiError::from)?;
-
-        // When tools were requested and the model emitted calls, send them as
-        // a single delta chunk (OpenAI wire format) instead of char-streaming
-        // the raw markup.
-        if tools.is_some() {
-            let (prose, calls) = parse_tool_calls(&text);
-            if !calls.is_empty() {
-                let delta = DeltaContent {
-                    role: Some("assistant".to_string()),
-                    content: if prose.is_empty() { None } else { Some(prose) },
-                    tool_calls: Some(tool_call_deltas(&calls)),
-                };
-                let first = ChatCompletionChunk::new(id.clone(), model.clone(), delta, None);
-                let stop = ChatCompletionChunk::new(
-                    id.clone(),
-                    model.clone(),
-                    DeltaContent::default(),
-                    Some("tool_calls".to_string()),
+            let metrics = Arc::clone(&state.metrics);
+            move || {
+                stream_chat_completion(
+                    &engine,
+                    &model,
+                    &id,
+                    &messages,
+                    tools.as_deref(),
+                    &options,
+                    &flag,
+                    tx,
+                    &metrics,
                 );
-                let events = stream::iter([first, stop].into_iter().map(|chunk| {
-                    let data = serde_json::to_string(&chunk).unwrap_or_default();
-                    Ok::<Event, Infallible>(Event::default().data(data))
-                }))
-                .chain(stream::once(async {
-                    Ok::<Event, Infallible>(Event::default().data("[DONE]"))
-                }));
-                return Ok(Sse::new(events).into_response());
             }
-        }
+        });
 
-        // Stream the response character-by-character (word-level chunks are
-        // possible too, but char chunks give the smoothest streaming experience).
-        let chunks: Vec<String> = text
-            .char_indices()
-            .map(|(_, c)| c.to_string())
-            .collect();
-
-        let id2 = id.clone();
-        let model2 = model.clone();
-        let n_chunks = chunks.len();
-
-        // Content chunks — include the role header on the very first chunk.
-        let content_events =
-            stream::iter(chunks.into_iter().enumerate().map(move |(i, chunk)| {
-                let delta = if i == 0 {
-                    DeltaContent {
-                        role: Some("assistant".to_string()),
-                        content: Some(chunk),
-                        tool_calls: None,
-                    }
-                } else {
-                    DeltaContent {
-                        role: None,
-                        content: Some(chunk),
-                        tool_calls: None,
-                    }
-                };
-                let payload =
-                    ChatCompletionChunk::new(id2.clone(), model2.clone(), delta, None);
-                let data = serde_json::to_string(&payload).unwrap_or_default();
-                Ok::<Event, Infallible>(Event::default().data(data))
-            }));
-
-        // Final "stop" chunk — includes usage statistics as per the OpenAI spec
-        // (`stream_options.include_usage`). We always include them so that clients
-        // that inspect this chunk get accurate token counts.
-        let stop_payload = {
-            let chunk =
-                ChatCompletionChunk::new(id.clone(), model.clone(), DeltaContent::default(), Some("stop".to_string()));
-            // Attach usage as an extra field via serde_json (ChatCompletionChunk
-            // doesn't have a `usage` field to keep streaming chunks lean, so we
-            // serialise it manually here and embed it).
-            let mut value = serde_json::to_value(&chunk).unwrap_or_default();
-            value["usage"] = serde_json::json!({
-                "prompt_tokens":     usage.prompt_tokens,
-                "completion_tokens": usage.completion_tokens,
-                "total_tokens":      usage.total_tokens,
-            });
-            serde_json::to_string(&value).unwrap_or_default()
-        };
-
-        let sse_stream = content_events
-            .chain(stream::once(async move {
-                Ok::<Event, Infallible>(Event::default().data(stop_payload))
-            }))
-            .chain(stream::once(async {
-                Ok::<Event, Infallible>(Event::default().data("[DONE]"))
-            }));
-
-        let _ = n_chunks; // consumed above
-
-        return Ok(Sse::new(sse_stream).into_response());
+        let events = stream::unfold(
+            (rx, cancel),
+            |(mut rx, cancel)| async move {
+                rx.recv()
+                    .await
+                    .map(|data| (Ok::<Event, Infallible>(Event::default().data(data)), (rx, cancel)))
+            },
+        );
+        return Ok(Sse::new(events).into_response());
     }
 
     // ── Non-streaming path ────────────────────────────────────────────────────
     let cancel = CancelOnDrop::new();
+    let max_tokens = options.max_tokens;
     let (text, usage, _, _) = tokio::task::spawn_blocking({
         let engine = Arc::clone(&engine);
         let tools = tools.clone();
@@ -947,12 +1209,18 @@ async fn chat_completions(
     .await
     .map_err(|e| ApiError::internal(e.to_string()))?
     .map_err(ApiError::from)?;
+    state.metrics.record_generation(&usage);
 
     // Extract tool calls from the output when the request offered tools.
     let (content, tool_calls, finish_reason) = if tools.is_some() {
         let (prose, calls) = parse_tool_calls(&text);
         if calls.is_empty() {
-            (Some(text), None, "stop")
+            let reason = if usage.completion_tokens >= max_tokens {
+                "length"
+            } else {
+                "stop"
+            };
+            (Some(text), None, reason)
         } else {
             let calls: Vec<ToolCall> = calls
                 .into_iter()
@@ -972,7 +1240,12 @@ async fn chat_completions(
             )
         }
     } else {
-        (Some(text), None, "stop")
+        let reason = if usage.completion_tokens >= max_tokens {
+            "length"
+        } else {
+            "stop"
+        };
+        (Some(text), None, reason)
     };
 
     let id = format!("chatcmpl-{}", Uuid::new_v4().simple());
@@ -993,22 +1266,569 @@ async fn chat_completions(
     Ok(Json(response).into_response())
 }
 
-/// Build the OpenAI streaming `delta.tool_calls` payload (index per entry).
-fn tool_call_deltas(calls: &[crate::tools::ParsedToolCall]) -> serde_json::Value {
-    serde_json::Value::Array(
-        calls
+/// Markers that begin a tool call in the model's textual output.  The
+/// longest marker sets how much trailing text the stream must withhold,
+/// because a marker can be split across two decoded tokens.
+const TOOL_MARKERS: [&str; 3] = ["<tool_call>", "[TOOL_CALLS]", "<function="];
+
+/// Filters decoded text for the chat SSE stream.
+///
+/// Prose is forwarded immediately.  When tools are offered, a marker that
+/// may begin a tool call (and enough trailing text to recognise it) is held
+/// back, so raw markup never reaches the client.  At the end the complete
+/// buffered text is parsed with the same parser as the non-streaming path.
+struct ChatStreamFilter {
+    tools: bool,
+    all: String,
+    emitted: usize,
+    marker_seen: bool,
+    holdback: usize,
+}
+
+impl ChatStreamFilter {
+    fn new(tools: bool) -> Self {
+        let holdback = if tools {
+            TOOL_MARKERS
+                .iter()
+                .map(|m| m.len())
+                .max()
+                .unwrap_or(0)
+                .saturating_sub(1)
+        } else {
+            0
+        };
+        Self {
+            tools,
+            all: String::new(),
+            emitted: 0,
+            marker_seen: false,
+            holdback,
+        }
+    }
+
+    /// Returns the prose that is safe to send now.
+    fn push(&mut self, delta: &str) -> Vec<String> {
+        if !self.tools {
+            return vec![delta.to_string()];
+        }
+        self.all.push_str(delta);
+        if self.marker_seen {
+            return Vec::new();
+        }
+        if let Some(pos) = TOOL_MARKERS
             .iter()
-            .enumerate()
-            .map(|(i, c)| {
-                json!({
-                    "index": i,
-                    "id": format!("call_{}", Uuid::new_v4().simple()),
-                    "type": "function",
-                    "function": {"name": c.name, "arguments": c.arguments},
+            .filter_map(|marker| self.all.find(marker))
+            .min()
+        {
+            self.marker_seen = true;
+            return self.take_until(pos);
+        }
+        let safe = floor_char_boundary(&self.all, self.all.len().saturating_sub(self.holdback));
+        self.take_until(safe)
+    }
+
+    /// Flush any withheld prose after decoding ends.
+    fn finish(&mut self, final_text: &str) -> Vec<String> {
+        if !self.tools {
+            return Vec::new();
+        }
+        if self.all.is_empty() {
+            self.all.push_str(final_text);
+        }
+        if self.marker_seen {
+            return Vec::new();
+        }
+        self.take_until(self.all.len())
+    }
+
+    /// Parse the complete output.  With tools, `all` is the exact stream the
+    /// engine reported; the return value from the engine is the fallback for
+    /// an empty stream.
+    fn parse(&self, final_text: &str) -> (String, Vec<crate::tools::ParsedToolCall>) {
+        if !self.tools {
+            // Without offered tools the model's markup is ordinary text.
+            return (final_text.to_string(), Vec::new());
+        }
+        if !self.all.is_empty() {
+            parse_tool_calls(&self.all)
+        } else {
+            parse_tool_calls(final_text)
+        }
+    }
+
+    fn take_until(&mut self, end: usize) -> Vec<String> {
+        let end = floor_char_boundary(&self.all, end.min(self.all.len()));
+        if end > self.emitted {
+            let text = self.all[self.emitted..end].to_string();
+            self.emitted = end;
+            vec![text]
+        } else {
+            Vec::new()
+        }
+    }
+}
+
+/// Largest char boundary at or below `index`.
+fn floor_char_boundary(s: &str, mut index: usize) -> usize {
+    while index > 0 && !s.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+/// Writes OpenAI streaming chunks to the SSE channel.
+struct ChatStreamEmitter {
+    id: String,
+    model: String,
+    tx: tokio::sync::mpsc::UnboundedSender<String>,
+    role_sent: bool,
+}
+
+impl ChatStreamEmitter {
+    fn new(
+        id: String,
+        model: String,
+        tx: tokio::sync::mpsc::UnboundedSender<String>,
+    ) -> Self {
+        Self {
+            id,
+            model,
+            tx,
+            role_sent: false,
+        }
+    }
+
+    fn text(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let delta = DeltaContent {
+            role: self.take_role(),
+            content: Some(text.to_string()),
+            tool_calls: None,
+        };
+        self.send(delta, None, None);
+    }
+
+    fn tool_start(&mut self, index: usize, id: &str, name: &str) {
+        let delta = DeltaContent {
+            role: self.take_role(),
+            content: None,
+            tool_calls: Some(json!([{
+                "index": index,
+                "id": id,
+                "type": "function",
+                "function": {"name": name, "arguments": ""},
+            }])),
+        };
+        self.send(delta, None, None);
+    }
+
+    fn tool_args(&mut self, index: usize, arguments: &str) {
+        let delta = DeltaContent {
+            role: None,
+            content: None,
+            tool_calls: Some(json!([{
+                "index": index,
+                "function": {"arguments": arguments},
+            }])),
+        };
+        self.send(delta, None, None);
+    }
+
+    fn finish(&mut self, reason: &str, usage: &UsageInfo) {
+        self.send(DeltaContent::default(), Some(reason.to_string()), Some(usage));
+        let _ = self.tx.send("[DONE]".to_string());
+    }
+
+    fn error(&mut self, message: &str) {
+        let payload = json!({
+            "error": {
+                "message": message,
+                "type": "server_error",
+            }
+        });
+        let _ = self.tx.send(payload.to_string());
+        let _ = self.tx.send("[DONE]".to_string());
+    }
+
+    fn take_role(&mut self) -> Option<String> {
+        if self.role_sent {
+            None
+        } else {
+            self.role_sent = true;
+            Some("assistant".to_string())
+        }
+    }
+
+    fn send(
+        &self,
+        delta: DeltaContent,
+        finish_reason: Option<String>,
+        usage: Option<&UsageInfo>,
+    ) {
+        let chunk = ChatCompletionChunk::new(
+            self.id.clone(),
+            self.model.clone(),
+            delta,
+            finish_reason,
+        );
+        let mut value = serde_json::to_value(&chunk).unwrap_or_default();
+        if let Some(usage) = usage {
+            value["usage"] = json!({
+                "prompt_tokens": usage.prompt_tokens,
+                "completion_tokens": usage.completion_tokens,
+                "total_tokens": usage.total_tokens,
+            });
+        }
+        let _ = self.tx.send(value.to_string());
+    }
+}
+
+/// Run one streaming chat completion on the blocking pool.
+fn stream_chat_completion(
+    engine: &Engine,
+    model: &str,
+    id: &str,
+    messages: &[ChatMessage],
+    tools: Option<&[Tool]>,
+    options: &GenerationOptions,
+    cancel: &AtomicBool,
+    tx: tokio::sync::mpsc::UnboundedSender<String>,
+    metrics: &ServerMetrics,
+) {
+    let mut filter = ChatStreamFilter::new(tools.is_some());
+    let mut emitter = ChatStreamEmitter::new(id.to_string(), model.to_string(), tx);
+    let result = {
+        let mut on_text = |delta: &str| {
+            for text in filter.push(delta) {
+                emitter.text(&text);
+            }
+        };
+        engine.complete_chat_streaming(messages, tools, options, cancel, &mut on_text)
+    };
+
+    match result {
+        Ok((text, usage, _, _)) => {
+            metrics.record_generation(&usage);
+            for withheld in filter.finish(&text) {
+                emitter.text(&withheld);
+            }
+            let (_, calls) = filter.parse(&text);
+            if calls.is_empty() {
+                let reason = if usage.completion_tokens >= options.max_tokens {
+                    "length"
+                } else {
+                    "stop"
+                };
+                emitter.finish(reason, &usage);
+            } else {
+                for (index, call) in calls.iter().enumerate() {
+                    let call_id = format!("call_{}", Uuid::new_v4().simple());
+                    emitter.tool_start(index, &call_id, &call.name);
+                    emitter.tool_args(index, &call.arguments);
+                }
+                emitter.finish("tool_calls", &usage);
+            }
+        }
+        Err(error) => {
+            tracing::error!("streaming completion failed: {error}");
+            emitter.error("generation failed");
+        }
+    }
+}
+
+/// One Anthropic SSE event.
+struct AnthropicSse {
+    event: &'static str,
+    data: String,
+}
+
+/// `POST /v1/messages` — Anthropic Messages API.
+async fn messages(
+    State(state): State<AppState>,
+    Json(req): Json<MessagesRequest>,
+) -> Result<Response, ApiError> {
+    let (resolved_model, engine) = state.models.resolve(&req.model)?;
+    let (messages, tools, options) =
+        anthropic::to_chat_request(&req).map_err(ApiError::bad_request)?;
+    let tools_disabled = matches!(
+        req.tool_choice
+            .as_ref()
+            .and_then(|choice| choice.get("type"))
+            .and_then(|kind| kind.as_str()),
+        Some("none")
+    );
+    let tools = if tools_disabled { None } else { tools };
+    let tools_offered = tools.is_some();
+    let max_tokens = options.max_tokens;
+    let model = if req.model.is_empty() {
+        resolved_model
+    } else {
+        req.model.clone()
+    };
+
+    if req.stream.unwrap_or(false) {
+        let id = format!("msg_{}", Uuid::new_v4().simple());
+        let input_tokens = engine
+            .count_chat_tokens(&messages, tools.as_deref(), &options)
+            .unwrap_or(0);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<AnthropicSse>();
+        let cancel = CancelOnDrop::new();
+        let flag = cancel.flag();
+        state
+            .metrics
+            .streamed_requests
+            .fetch_add(1, Ordering::Relaxed);
+        tokio::task::spawn_blocking({
+            let engine = Arc::clone(&engine);
+            let model = model.clone();
+            let id = id.clone();
+            let tools = tools.clone();
+            let metrics = Arc::clone(&state.metrics);
+            move || {
+                stream_messages(
+                    &engine,
+                    &model,
+                    &id,
+                    &messages,
+                    tools.as_deref(),
+                    &options,
+                    &flag,
+                    tx,
+                    &metrics,
+                    input_tokens,
+                );
+            }
+        });
+        let events = stream::unfold(
+            (rx, cancel),
+            |(mut rx, cancel)| async move {
+                rx.recv().await.map(|event| {
+                    (
+                        Ok::<Event, Infallible>(
+                            Event::default().event(event.event).data(event.data),
+                        ),
+                        (rx, cancel),
+                    )
                 })
-            })
-            .collect(),
-    )
+            },
+        );
+        return Ok(Sse::new(events).into_response());
+    }
+
+    let cancel = CancelOnDrop::new();
+    let (text, usage, _, _) = tokio::task::spawn_blocking({
+        let engine = Arc::clone(&engine);
+        let tools = tools.clone();
+        let flag = cancel.flag();
+        move || engine.complete_chat_cancellable(&messages, tools.as_deref(), &options, &flag)
+    })
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?
+    .map_err(ApiError::from)?;
+    state.metrics.record_generation(&usage);
+
+    let id = format!("msg_{}", Uuid::new_v4().simple());
+    let (response, _) = anthropic::response(
+        id,
+        model,
+        &text,
+        &usage,
+        tools_offered,
+        max_tokens,
+    );
+    Ok(Json(response).into_response())
+}
+
+/// Writes Anthropic streaming events to the SSE channel.
+struct AnthropicStreamEmitter {
+    id: String,
+    model: String,
+    tx: tokio::sync::mpsc::UnboundedSender<AnthropicSse>,
+    text_started: bool,
+    next_index: usize,
+}
+
+impl AnthropicStreamEmitter {
+    fn new(
+        id: String,
+        model: String,
+        tx: tokio::sync::mpsc::UnboundedSender<AnthropicSse>,
+    ) -> Self {
+        Self {
+            id,
+            model,
+            tx,
+            text_started: false,
+            next_index: 0,
+        }
+    }
+
+    fn send(&self, event: &'static str, data: serde_json::Value) {
+        let _ = self.tx.send(AnthropicSse {
+            event,
+            data: data.to_string(),
+        });
+    }
+
+    fn message_start(&mut self, input_tokens: u32) {
+        self.send(
+            "message_start",
+            json!({
+                "type": "message_start",
+                "message": {
+                    "id": self.id,
+                    "type": "message",
+                    "role": "assistant",
+                    "model": self.model,
+                    "content": [],
+                    "stop_reason": null,
+                    "stop_sequence": null,
+                    "usage": {"input_tokens": input_tokens, "output_tokens": 0},
+                }
+            }),
+        );
+    }
+
+    fn text(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        if !self.text_started {
+            self.text_started = true;
+            self.send(
+                "content_block_start",
+                json!({
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "text", "text": ""},
+                }),
+            );
+        }
+        self.send(
+            "content_block_delta",
+            json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": text},
+            }),
+        );
+    }
+
+    fn finish(
+        &mut self,
+        calls: &[crate::tools::ParsedToolCall],
+        usage: &UsageInfo,
+        max_tokens: u32,
+    ) {
+        if self.text_started {
+            self.send(
+                "content_block_stop",
+                json!({"type": "content_block_stop", "index": 0}),
+            );
+            self.next_index = 1;
+        }
+        for call in calls {
+            let index = self.next_index;
+            self.next_index += 1;
+            let id = format!("toolu_{}", Uuid::new_v4().simple());
+            self.send(
+                "content_block_start",
+                json!({
+                    "type": "content_block_start",
+                    "index": index,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": id,
+                        "name": call.name,
+                        "input": {},
+                    },
+                }),
+            );
+            self.send(
+                "content_block_delta",
+                json!({
+                    "type": "content_block_delta",
+                    "index": index,
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": call.arguments,
+                    },
+                }),
+            );
+            self.send(
+                "content_block_stop",
+                json!({"type": "content_block_stop", "index": index}),
+            );
+        }
+        let stop_reason = if !calls.is_empty() {
+            "tool_use"
+        } else if usage.completion_tokens >= max_tokens {
+            "max_tokens"
+        } else {
+            "end_turn"
+        };
+        self.send(
+            "message_delta",
+            json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": stop_reason, "stop_sequence": null},
+                "usage": {"output_tokens": usage.completion_tokens},
+            }),
+        );
+        self.send("message_stop", json!({"type": "message_stop"}));
+    }
+
+    fn error(&mut self, message: &str) {
+        self.send(
+            "error",
+            json!({
+                "type": "error",
+                "error": {"type": "api_error", "message": message},
+            }),
+        );
+    }
+}
+
+/// Run one streaming Anthropic message on the blocking pool.
+fn stream_messages(
+    engine: &Engine,
+    model: &str,
+    id: &str,
+    messages: &[ChatMessage],
+    tools: Option<&[Tool]>,
+    options: &GenerationOptions,
+    cancel: &AtomicBool,
+    tx: tokio::sync::mpsc::UnboundedSender<AnthropicSse>,
+    metrics: &ServerMetrics,
+    input_tokens: u32,
+) {
+    let mut filter = ChatStreamFilter::new(tools.is_some());
+    let mut emitter = AnthropicStreamEmitter::new(id.to_string(), model.to_string(), tx);
+    emitter.message_start(input_tokens);
+    let result = {
+        let mut on_text = |delta: &str| {
+            for text in filter.push(delta) {
+                emitter.text(&text);
+            }
+        };
+        engine.complete_chat_streaming(messages, tools, options, cancel, &mut on_text)
+    };
+    match result {
+        Ok((text, usage, _, _)) => {
+            metrics.record_generation(&usage);
+            for withheld in filter.finish(&text) {
+                emitter.text(&withheld);
+            }
+            let (_, calls) = filter.parse(&text);
+            emitter.finish(&calls, &usage, options.max_tokens);
+        }
+        Err(error) => {
+            tracing::error!("streaming Anthropic message failed: {error}");
+            emitter.error("generation failed");
+        }
+    }
 }
 
 /// `POST /v1/completions` — legacy (non-chat) text completion.
@@ -1042,6 +1862,7 @@ async fn completions(
     let messages = vec![ChatMessage::text("user".to_string(), prompt)];
 
     let cancel = CancelOnDrop::new();
+    let max_tokens = options.max_tokens;
     let (text, usage, _, _) = tokio::task::spawn_blocking({
         let engine = Arc::clone(&engine);
         let flag = cancel.flag();
@@ -1051,10 +1872,16 @@ async fn completions(
     .map_err(|e| ApiError::internal(e.to_string()))?
     .map_err(ApiError::from)?;
 
+    state.metrics.record_generation(&usage);
     let created = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
+    let finish_reason = if usage.completion_tokens >= max_tokens {
+        "length"
+    } else {
+        "stop"
+    };
 
     Ok(Json(json!({
         "id": format!("cmpl-{}", Uuid::new_v4().simple()),
@@ -1064,7 +1891,7 @@ async fn completions(
         "choices": [{
             "text": text,
             "index": 0,
-            "finish_reason": "stop"
+            "finish_reason": finish_reason
         }],
         "usage": {
             "prompt_tokens": usage.prompt_tokens,
@@ -1092,6 +1919,10 @@ async fn embeddings(
     .await
     .map_err(|e| ApiError::internal(e.to_string()))?
     .map_err(ApiError::from)?;
+    state
+        .metrics
+        .embed_tokens
+        .fetch_add(prompt_tokens as u64, Ordering::Relaxed);
 
     let data = vectors
         .into_iter()
@@ -1262,6 +2093,40 @@ mod tests {
     fn api_keys_match_handles_an_empty_expected_key() {
         assert!(api_keys_match(b"", b""));
         assert!(!api_keys_match(b"a", b""));
+    }
+
+    #[test]
+    fn stream_filter_hides_a_tool_marker_split_across_chunks() {
+        let mut filter = super::ChatStreamFilter::new(true);
+        let mut prose = String::new();
+        for piece in [
+            "I will call ",
+            "<tool",
+            "_call>{\"name\":",
+            "\"f\",\"arguments\":{}}</tool_call>",
+        ] {
+            for text in filter.push(piece) {
+                prose.push_str(&text);
+            }
+        }
+        assert_eq!(prose, "I will call ");
+        let (_, calls) = filter.parse("");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "f");
+        assert_eq!(calls[0].arguments, "{}");
+    }
+
+    #[test]
+    fn stream_filter_forwards_everything_without_tools() {
+        let mut filter = super::ChatStreamFilter::new(false);
+        let mut prose = String::new();
+        for piece in ["a ", "b ", "c"] {
+            for text in filter.push(piece) {
+                prose.push_str(&text);
+            }
+        }
+        assert_eq!(prose, "a b c");
+        assert!(filter.parse("a b c").1.is_empty());
     }
     #[cfg(feature = "distributed")]
     #[test]
