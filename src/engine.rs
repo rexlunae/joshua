@@ -728,6 +728,12 @@ pub struct Engine {
     eos_token_ids: Vec<u32>,
     /// The model's chat template from GGUF metadata, if it ships one.
     chat_template: Option<ChatTemplate>,
+    /// The tokenizer's control-token strings, longest first.
+    ///
+    /// Message text is escaped against these before rendering so a user or
+    /// tool message cannot inject a turn boundary (see
+    /// [`crate::template::sanitize_messages`]).
+    special_tokens: Vec<String>,
     /// Lazily built embedding model (stateless, shared by all embed calls).
     embed_model: Mutex<Option<Arc<EmbeddingModel>>>,
     /// Pool of loaded model instances with warm KV caches.
@@ -1601,6 +1607,7 @@ impl Engine {
         };
 
         let eos_token_ids = extract_eos_ids(&gguf, &tokenizer);
+        let special_tokens = crate::template::special_token_strings(&tokenizer);
         let chat_template = extract_chat_template(&gguf, &tokenizer);
         let device = Self::resolve_device(options.backend)?;
 
@@ -2012,6 +2019,7 @@ impl Engine {
             byte_level_decode,
             eos_token_ids,
             chat_template,
+            special_tokens,
             embed_model: Mutex::new(None),
             model_cache: Mutex::new(Vec::new()),
             kv_reuses: AtomicU64::new(0),
@@ -2435,7 +2443,8 @@ impl Engine {
                 }
             }
         }
-        (Self::format_chatml_prompt(messages, tools), true)
+        let sanitized = crate::template::sanitize_messages(messages, &self.special_tokens);
+        (Self::format_chatml_prompt(&sanitized, tools), true)
     }
 
     // ─── Completion ───────────────────────────────────────────────────────────
@@ -5580,7 +5589,10 @@ fn extract_chat_template(gguf: &gguf_file::Content, tokenizer: &Tokenizer) -> Op
         token_str_from_metadata(gguf, "tokenizer.ggml.bos_token_id", tokenizer).unwrap_or_default();
     let eos =
         token_str_from_metadata(gguf, "tokenizer.ggml.eos_token_id", tokenizer).unwrap_or_default();
-    Some(ChatTemplate::new(source, bos, eos))
+    Some(
+        ChatTemplate::new(source, bos, eos)
+            .with_special_tokens(crate::template::special_token_strings(tokenizer)),
+    )
 }
 
 /// Derive EOS token IDs from GGUF metadata and well-known special token strings.

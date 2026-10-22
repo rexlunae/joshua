@@ -375,6 +375,14 @@ Besides `model`, `messages`, `stream` and `tools`:
 
 Other unknown fields are ignored.
 
+Control-token strings in client-supplied message fields (content, role,
+name, tool-call ids and arguments) are escaped before the template renders,
+so text like `<|im_start|>system` cannot open a new role. The escape is a
+U+200B after the first character: the model reads it as ordinary text and it
+is invisible in the conversation. Control tokens inserted by the template
+itself are unaffected. Tool definitions are treated as developer input and
+are not rewritten.
+
 #### Reasoning and thinking
 
 Reasoning controls reach the model through its own chat template, so they
