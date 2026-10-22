@@ -301,7 +301,14 @@ fn escape_json(value: &mut serde_json::Value, specials: &[String]) {
             for key in keys {
                 if specials.iter().any(|special| key.contains(special.as_str())) {
                     if let Some(value) = map.remove(&key) {
-                        let escaped = escape_specials(&key, specials).into_owned();
+                        let mut escaped = escape_specials(&key, specials).into_owned();
+                        // A crafted object can hold both a control-token key
+                        // and its already-escaped form; they would collide
+                        // after escaping and one argument would vanish.
+                        // Append another escape until the key is unique.
+                        while map.contains_key(&escaped) {
+                            escaped.push(ESCAPE);
+                        }
                         let mut value = value;
                         escape_json(&mut value, specials);
                         map.insert(escaped, value);
@@ -476,6 +483,34 @@ mod tests {
         assert!(!calls.contains("<|im_start|>"), "{calls}");
         assert!(!calls.contains("<|im_end|>"), "{calls}");
         assert!(calls.contains("call<\u{200b}|im_end|>"));
+    }
+
+    /// Escaping a key must not merge it with another key that was already in
+    /// escaped form: both arguments have to survive, and neither key may
+    /// contain the raw control token.
+    #[test]
+    fn escaping_colliding_tool_call_keys_keeps_both_arguments() {
+        let specials = qwen_specials();
+        let mut value = serde_json::json!({
+            "<|im_start|>": "first",
+            "<\u{200b}|im_start|>": "second",
+            "ordinary": "third",
+        });
+        escape_json(&mut value, &specials);
+        let map = value.as_object().expect("object");
+        assert_eq!(map.len(), 3, "an argument disappeared: {map:?}");
+        let mut values: Vec<&str> = map
+            .values()
+            .map(|v| v.as_str().expect("string argument"))
+            .collect();
+        values.sort_unstable();
+        assert_eq!(values, ["first", "second", "third"]);
+        for key in map.keys() {
+            assert!(
+                !key.contains("<|im_start|>"),
+                "key still contains the control token: {key:?}"
+            );
+        }
     }
 
     #[test]
