@@ -891,6 +891,24 @@ mod synthetic {
             text_chunked, text_default,
             "chunking changed the greedy output"
         );
+        drop(chunked);
+
+        // The adaptive path chooses chunks from wall-clock measurements; it
+        // is still only a chunking knob and must not change the text.
+        let adaptive = Engine::with_options(
+            &dir,
+            EngineOptions::with_n_ctx(64)
+                .prefill_chunk(4)
+                .prefill_budget_ms(1),
+        )
+        .expect("engine should load with an adaptive prefill budget");
+        let (text_adaptive, usage_adaptive, _, _) =
+            adaptive.complete_raw(prompt, &options).unwrap();
+        assert_eq!(usage_adaptive.prompt_tokens, usage_default.prompt_tokens);
+        assert_eq!(
+            text_adaptive, text_default,
+            "adaptive chunking changed the greedy output"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

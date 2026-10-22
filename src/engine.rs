@@ -100,8 +100,8 @@ use std::fs::File;
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use candle_core::quantized::gguf_file;
 use candle_core::{Device, Tensor};
@@ -414,6 +414,33 @@ pub struct EngineOptions {
     /// chunk re-reads the whole model, so a larger chunk also means fewer
     /// passes over the weights.
     pub prefill_chunk: usize,
+    /// Target wall time for one prefill chunk, in milliseconds; `0` (the
+    /// default) keeps the fixed [`EngineOptions::prefill_chunk`] size.
+    ///
+    /// When set, architectures that prefill chunk by chunk (the ones without
+    /// a layer-streaming path) measure each completed chunk and pick the next
+    /// size from an online cost model, aiming for this budget.  Chunk sizes
+    /// chosen from wall time can change floating-point results between runs
+    /// for the same prompt and seed, so this is opt-in.  The configured
+    /// `prefill_chunk` is the ceiling and the size used for the first probe.
+    pub prefill_budget_ms: u64,
+    /// How long a request may wait for a concurrency permit before returning
+    /// the overloaded error, in milliseconds; `0` (the default) rejects
+    /// immediately.
+    ///
+    /// A short wait smooths bursts instead of failing them, but a queue only
+    /// delays the error when the engine is genuinely saturated: the wait is
+    /// bounded per request and the concurrency cap still bounds memory.
+    pub queue_timeout_ms: u64,
+    /// How many requests may wait for a concurrency permit when
+    /// [`EngineOptions::queue_timeout_ms`] is non-zero; `0` selects
+    /// [`DEFAULT_ADMISSION_QUEUE_DEPTH`].
+    ///
+    /// The concurrency cap bounds inference memory, but every parked request
+    /// occupies a server thread; a finite queue keeps a burst from exhausting
+    /// the blocking pool.  A request that finds the queue full gets the same
+    /// overloaded error as one that times out.
+    pub admission_queue_depth: usize,
     /// Prefix checkpoints each session of a model with recurrent layers
     /// keeps (Qwen3-Next, Qwen3.5, `qwen4exp`, the KDA hybrids); `None`
     /// selects [`crate::native_session::DEFAULT_PREFIX_CHECKPOINTS`] and
@@ -592,6 +619,26 @@ impl EngineOptions {
         self.prefill_chunk = tokens;
         self
     }
+    /// Set the target wall time for one prefill chunk (`0` = fixed size).
+    /// See [`EngineOptions::prefill_budget_ms`].
+    pub fn prefill_budget_ms(mut self, millis: u64) -> Self {
+        self.prefill_budget_ms = millis;
+        self
+    }
+
+    /// Set how long a request may wait for a concurrency permit (`0` =
+    /// reject immediately).  See [`EngineOptions::queue_timeout_ms`].
+    pub fn queue_timeout_ms(mut self, millis: u64) -> Self {
+        self.queue_timeout_ms = millis;
+        self
+    }
+
+    /// Set the admission queue depth (`0` = the default).  See
+    /// [`EngineOptions::admission_queue_depth`].
+    pub fn admission_queue_depth(mut self, depth: usize) -> Self {
+        self.admission_queue_depth = depth;
+        self
+    }
 
     /// Set how many prefix checkpoints a recurrent model's session keeps
     /// (`0` = off).  See [`EngineOptions::prefix_checkpoints`].
@@ -756,12 +803,16 @@ pub struct Engine {
     /// Number of generations/embeddings currently executing.
     ///
     /// Each in-flight request holds a full model instance (weights + KV
-    /// cache), so this is capped at `max_concurrency` to bound peak memory;
-    /// requests over the cap are rejected rather than piling up unbounded
-    /// heavyweight model loads.
-    in_flight: AtomicUsize,
+    /// cache), so this is capped at `max_concurrency` to bound peak memory.
+    /// A request over the cap may wait up to `queue_timeout` for a permit
+    /// and is then rejected.
+    in_flight: AdmissionGate,
     /// Maximum concurrent generations/embeddings.
     max_concurrency: usize,
+    /// How long a request waits for a permit (zero = reject immediately).
+    queue_timeout: Duration,
+    /// How many requests may wait for a permit at once.
+    admission_queue_depth: usize,
     /// Upper bound on tokens generated per request, regardless of the
     /// client-supplied `max_tokens`.
     max_output_tokens: u32,
@@ -781,6 +832,11 @@ pub struct Engine {
     /// Tokens per prefill chunk (see [`EngineOptions::prefill_chunk`]),
     /// resolved to at least one token.
     prefill_chunk: usize,
+    /// Target prefill-chunk time (see [`EngineOptions::prefill_budget_ms`]);
+    /// zero keeps the fixed chunk size.
+    prefill_budget: Duration,
+    /// Online fit used to choose adaptive prefill chunks.
+    prefill_cost: Mutex<crate::prefill_cost::PrefillCostModel>,
     /// Prefix checkpoints per recurrent-model session (see
     /// [`EngineOptions::prefix_checkpoints`]).
     prefix_checkpoints: usize,
@@ -857,6 +913,12 @@ pub struct Engine {
 // `Mutex<…>`, and `AtomicU64` are all `Send + Sync`, so Engine is
 // automatically `Send + Sync`.
 
+/// How many requests may wait for a concurrency permit when the admission
+/// queue is enabled ([`EngineOptions::queue_timeout_ms`] > 0).  Waiting
+/// requests occupy a server thread, so the queue must be finite even though
+/// the concurrency cap alone bounds inference memory.
+pub const DEFAULT_ADMISSION_QUEUE_DEPTH: usize = 64;
+
 /// Minimum free system RAM required to admit a new request (bytes).  Below
 /// this the engine refuses new generations (memory-aware admission, #2) rather
 /// than letting a heavy load push the working set into swap.  Kept well above
@@ -921,45 +983,167 @@ const NPU_MAX_FAILURES: u32 = 3;
 /// client-supplied `max_tokens`), bounding single-request CPU/time cost.
 const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 4096;
 
+/// Admission state for in-flight generations/embeddings.
+///
+/// A request takes a permit before doing any work.  When every permit is in
+/// use it may wait on [`Self::released`] for a bounded time
+/// ([`EngineOptions::queue_timeout_ms`]); with a zero timeout it fails at
+/// once.  Waiting is only about smoothing bursts — the cap still bounds peak
+/// memory, and a request that waits too long returns the same overloaded
+/// error the immediate path returns.
+#[derive(Debug)]
+struct AdmissionGate {
+    state: Mutex<AdmissionState>,
+    released: Condvar,
+}
+
+/// Active permits and parked waiters, updated under one lock so the queue
+/// bound cannot race with a permit release.
+#[derive(Debug, Default)]
+struct AdmissionState {
+    active: usize,
+    waiting: usize,
+}
+
+impl AdmissionGate {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(AdmissionState::default()),
+            released: Condvar::new(),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, AdmissionState> {
+        // A panic while holding the count cannot leave it inconsistent (the
+        // only mutation is +=/-= around a permit), so recover the guard.
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn active(&self) -> usize {
+        self.lock().active
+    }
+
+    #[cfg(test)]
+    fn waiting(&self) -> usize {
+        self.lock().waiting
+    }
+}
+
+/// Reject before admitting when the machine is critically low on RAM, so a
+/// new request cannot push a heavy model load/working set into swap.  Run it
+/// again after waiting: memory can fall while a request sits in the queue.
+fn check_admission_memory() -> Result<()> {
+    if let Some(free) = crate::placement::available_ram_bytes() {
+        if free < LOW_MEM_FLOOR {
+            return Err(JoshuaError::Overloaded(format!(
+                "low memory ({} MiB free < {} MiB floor); retry shortly",
+                free / (1024 * 1024),
+                LOW_MEM_FLOOR / (1024 * 1024),
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn at_capacity(max: usize, waited: Option<Duration>) -> JoshuaError {
+    let suffix = waited.map_or_else(String::new, |w| format!(" for {} ms", w.as_millis()));
+    JoshuaError::Overloaded(format!(
+        "at capacity ({max} concurrent requests){suffix}; retry shortly"
+    ))
+}
+
 /// RAII permit for one in-flight generation/embedding.
 ///
-/// Increments the engine's in-flight counter on acquisition (rejecting once
-/// `max_concurrency` is reached) and decrements it on drop, so the count is
-/// released even if generation errors or panics.
+/// Takes a slot from the gate on acquisition and returns it on drop, so the
+/// count is released even if generation errors or panics.
 struct InFlightGuard<'a> {
-    counter: &'a AtomicUsize,
+    gate: &'a AdmissionGate,
 }
 
 impl<'a> InFlightGuard<'a> {
-    fn acquire(counter: &'a AtomicUsize, max: usize) -> Result<Self> {
-        // Memory-aware admission (finding #2): reject before reserving a slot
-        // when the machine is critically low on RAM, so a new request cannot
-        // push a heavy model load/working set into swap.  Conservative: this
-        // only admits *fewer* than the concurrency cap under pressure.
-        if let Some(free) = crate::placement::available_ram_bytes() {
-            if free < LOW_MEM_FLOOR {
-                return Err(JoshuaError::Overloaded(format!(
-                    "low memory ({} MiB free < {} MiB floor); retry shortly",
-                    free / (1024 * 1024),
-                    LOW_MEM_FLOOR / (1024 * 1024),
-                )));
-            }
+    fn acquire(gate: &'a AdmissionGate, max: usize, wait: Duration) -> Result<Self> {
+        Self::acquire_with(gate, max, DEFAULT_ADMISSION_QUEUE_DEPTH, wait, None)
+    }
+
+    /// Take a permit, waiting at most `wait` and at most `queue_depth`
+    /// requests deep.  `cancel` is polled while parked so a disconnected
+    /// client stops occupying a thread before a slot frees.
+    fn acquire_with(
+        gate: &'a AdmissionGate,
+        max: usize,
+        queue_depth: usize,
+        wait: Duration,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<Self> {
+        check_admission_memory()?;
+        let max = max.max(1);
+        let queue_depth = queue_depth.max(1);
+        let mut state = gate.lock();
+        // Let parked requests go first: a new caller must not barge past a
+        // waiter that was woken by the permit it is about to take.
+        if state.active < max && state.waiting == 0 {
+            state.active += 1;
+            return Ok(Self { gate });
         }
-        // Reserve a slot optimistically, then bail out if we blew the cap.
-        let prev = counter.fetch_add(1, Ordering::AcqRel);
-        if prev >= max {
-            counter.fetch_sub(1, Ordering::AcqRel);
+        if wait.is_zero() {
+            return Err(at_capacity(max, None));
+        }
+        if state.waiting >= queue_depth {
             return Err(JoshuaError::Overloaded(format!(
-                "at capacity ({max} concurrent requests); retry shortly"
+                "admission queue is full ({queue_depth} waiting); retry shortly"
             )));
         }
-        Ok(Self { counter })
+        state.waiting += 1;
+        let deadline = Instant::now() + wait;
+        let outcome = loop {
+            if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                break Err(JoshuaError::Cancelled);
+            }
+            let now = Instant::now();
+            let Some(left) = deadline.checked_duration_since(now) else {
+                break Err(at_capacity(max, Some(wait)));
+            };
+            // Wake periodically even without a release so cancellation is
+            // observed promptly.
+            let slice = left.min(Duration::from_millis(20));
+            let (guard, _) = gate
+                .released
+                .wait_timeout(state, slice)
+                .unwrap_or_else(|e| e.into_inner());
+            state = guard;
+            if state.active < max {
+                if Instant::now() >= deadline {
+                    // The slot freed after the deadline; do not admit.
+                    break Err(at_capacity(max, Some(wait)));
+                }
+                state.active += 1;
+                break Ok(());
+            }
+        };
+        state.waiting -= 1;
+        drop(state);
+        // A timed-out or cancelled waiter may have left a slot free for
+        // someone else, and a new waiter may have joined; wake them all.
+        // (The queue is bounded, so this is not a storm.)
+        gate.released.notify_all();
+        outcome?;
+        if let Err(e) = check_admission_memory() {
+            let mut state = gate.lock();
+            state.active = state.active.saturating_sub(1);
+            drop(state);
+            gate.released.notify_all();
+            return Err(e);
+        }
+        Ok(Self { gate })
     }
 }
 
 impl Drop for InFlightGuard<'_> {
     fn drop(&mut self) {
-        self.counter.fetch_sub(1, Ordering::AcqRel);
+        let mut state = self.gate.lock();
+        state.active = state.active.saturating_sub(1);
+        drop(state);
+        self.gate.released.notify_all();
     }
 }
 
@@ -1431,6 +1615,11 @@ impl Engine {
             0 => DEFAULT_PREFILL_CHUNK,
             n => n,
         };
+        let prefill_budget = Duration::from_millis(options.prefill_budget_ms);
+        let prefill_cost = Mutex::new(crate::prefill_cost::PrefillCostModel::new(
+            crate::prefill_cost::MIN_CHUNK,
+            prefill_chunk,
+        ));
         let prefix_checkpoints = options
             .prefix_checkpoints
             .unwrap_or(crate::native_session::DEFAULT_PREFIX_CHECKPOINTS);
@@ -2025,8 +2214,14 @@ impl Engine {
             kv_reuses: AtomicU64::new(0),
             kv_edit_reuses: AtomicU64::new(0),
             npu: None,
-            in_flight: AtomicUsize::new(0),
+            in_flight: AdmissionGate::new(),
             max_concurrency,
+            queue_timeout: Duration::from_millis(options.queue_timeout_ms),
+            admission_queue_depth: if options.admission_queue_depth == 0 {
+                DEFAULT_ADMISSION_QUEUE_DEPTH
+            } else {
+                options.admission_queue_depth
+            },
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             model_name,
             n_ctx,
@@ -2034,6 +2229,8 @@ impl Engine {
             expert_cache_auto,
             device_expert_cache,
             prefill_chunk,
+            prefill_budget,
+            prefill_cost,
             prefix_checkpoints,
             prefix_cache: Mutex::new(crate::prefix_cache::PrefixCache::new(prefix_cache_bytes)),
             prefix_cache_root_min,
@@ -2065,6 +2262,25 @@ impl Engine {
     pub fn with_max_concurrency(mut self, max: usize) -> Self {
         self.max_concurrency = max.max(1);
         self.fit_remote_capacity();
+        self
+    }
+
+    /// Set how long a request may wait for a concurrency permit before it
+    /// returns [`JoshuaError::Overloaded`].  `Duration::ZERO` (the default)
+    /// rejects immediately.  See [`EngineOptions::queue_timeout_ms`].
+    pub fn with_queue_timeout(mut self, timeout: Duration) -> Self {
+        self.queue_timeout = timeout;
+        self
+    }
+
+    /// Set how many requests may wait for a permit (`0` = the default).  See
+    /// [`EngineOptions::admission_queue_depth`].
+    pub fn with_admission_queue_depth(mut self, depth: usize) -> Self {
+        self.admission_queue_depth = if depth == 0 {
+            DEFAULT_ADMISSION_QUEUE_DEPTH
+        } else {
+            depth
+        };
         self
     }
 
@@ -2362,7 +2578,7 @@ impl Engine {
     /// Generations/embeddings executing right now (admitted and holding a
     /// concurrency permit).  Reported to request routers as live load.
     pub fn in_flight(&self) -> usize {
-        self.in_flight.load(Ordering::Acquire)
+        self.in_flight.active()
     }
 
     /// The admission cap: requests beyond this many in flight are rejected
@@ -2540,7 +2756,18 @@ impl Engine {
         cancel: Option<&AtomicBool>,
     ) -> Result<(String, UsageInfo, f64, f64)> {
         // Bound concurrent heavyweight generations before doing any work.
-        let _permit = InFlightGuard::acquire(&self.in_flight, self.max_concurrency)?;
+        let _permit = InFlightGuard::acquire_with(
+            &self.in_flight,
+            self.max_concurrency,
+            self.admission_queue_depth,
+            self.queue_timeout,
+            cancel,
+        )?;
+        if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+            // A generation cancelled before any work is an empty completion,
+            // matching the decode loop's stop path (and the test contract).
+            return Ok((String::new(), UsageInfo::default(), 0.0, 0.0));
+        }
         let n_ctx = self.request_n_ctx(options)?;
         // The plugin owns tokenisation, so the prompt length is unknown here;
         // clamp only to the server ceiling. The prompt is checked against the
@@ -2689,7 +2916,16 @@ impl Engine {
         root_chars: Option<usize>,
     ) -> Result<(String, UsageInfo, f64, f64)> {
         // Bound concurrent heavyweight generations before doing any work.
-        let _permit = InFlightGuard::acquire(&self.in_flight, self.max_concurrency)?;
+        let _permit = InFlightGuard::acquire_with(
+            &self.in_flight,
+            self.max_concurrency,
+            self.admission_queue_depth,
+            self.queue_timeout,
+            cancel,
+        )?;
+        if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+            return Ok((String::new(), UsageInfo::default(), 0.0, 0.0));
+        }
 
         // ── Tokenise ─────────────────────────────────────────────────────────
         let encoding = self
@@ -2775,6 +3011,24 @@ impl Engine {
     /// advance so the KV cache accumulates across pieces, and only the final
     /// piece's last-token logits are kept (the prefill prediction).  Smaller
     /// chunks bound memory but can re-read expert weights more often.
+    /// Number of prompt tokens to feed in the next prefill chunk.
+    ///
+    /// With no time budget this is the configured chunk; with one, the shared
+    /// cost model picks a size from recently measured chunks.  Always at
+    /// least one token and never more than what is left.
+    fn next_prefill_chunk(&self, remaining: usize) -> usize {
+        if self.prefill_budget.is_zero() {
+            return self.prefill_chunk.min(remaining).max(1);
+        }
+        let cost = self
+            .prefill_cost
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        cost.next_chunk(remaining, self.prefill_budget, self.prefill_chunk)
+            .min(remaining)
+            .max(1)
+    }
+
     fn prefill(
         &self,
         model: &mut GenSession,
@@ -2812,11 +3066,28 @@ impl Engine {
             _ => {
                 // Streamed prefill unsupported on this architecture, or a
                 // KV-cap guard tripped — fall back to the per-chunk loop.
-                for piece_start in (0..new_tokens.len()).step_by(chunk) {
-                    let end = (piece_start + chunk).min(new_tokens.len());
-                    let piece = &new_tokens[piece_start..end];
-                    last =
-                        model.forward_tokens(piece, base + piece_start, &self.dense_device)?;
+                // With a time budget, the next chunk comes from the online
+                // cost model; otherwise it is the fixed configured size.
+                let mut piece_start = 0;
+                while piece_start < new_tokens.len() {
+                    let remaining = new_tokens.len() - piece_start;
+                    let rows = self.next_prefill_chunk(remaining);
+                    let end = piece_start + rows;
+                    let started = Instant::now();
+                    last = model.forward_tokens(
+                        &new_tokens[piece_start..end],
+                        base + piece_start,
+                        &self.dense_device,
+                    )?;
+                    if !self.prefill_budget.is_zero() {
+                        let elapsed = started.elapsed().as_secs_f64();
+                        let mut cost = self
+                            .prefill_cost
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        cost.observe(end - piece_start, elapsed);
+                    }
+                    piece_start = end;
                 }
                 last
             }
@@ -3267,7 +3538,16 @@ impl Engine {
             ));
         }
         // Embeddings also load/hold a model instance — bound concurrency.
-        let _permit = InFlightGuard::acquire(&self.in_flight, self.max_concurrency)?;
+        let _permit = InFlightGuard::acquire_with(
+            &self.in_flight,
+            self.max_concurrency,
+            self.admission_queue_depth,
+            self.queue_timeout,
+            cancel,
+        )?;
+        if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+            return Err(JoshuaError::Cancelled);
+        }
         let model = self.embedding_model()?;
         let mut vectors = Vec::with_capacity(texts.len());
         let mut total_tokens: u32 = 0;
@@ -7218,23 +7498,138 @@ mod tests {
 
     #[test]
     fn in_flight_guard_caps_and_releases() {
-        let counter = AtomicUsize::new(0);
+        let gate = AdmissionGate::new();
         // Fill to the cap of 2.
-        let a = InFlightGuard::acquire(&counter, 2).expect("first permit");
-        let b = InFlightGuard::acquire(&counter, 2).expect("second permit");
-        // Third is rejected as Overloaded, and the counter is not left inflated.
-        match InFlightGuard::acquire(&counter, 2) {
+        let a = InFlightGuard::acquire(&gate, 2, Duration::ZERO).expect("first permit");
+        let b = InFlightGuard::acquire(&gate, 2, Duration::ZERO).expect("second permit");
+        // Third is rejected as Overloaded, and the count is not left inflated.
+        match InFlightGuard::acquire(&gate, 2, Duration::ZERO) {
             Err(JoshuaError::Overloaded(_)) => {}
             Err(e) => panic!("expected Overloaded, got {e:?}"),
             Ok(_) => panic!("expected Overloaded, got a permit"),
         }
-        assert_eq!(counter.load(Ordering::Acquire), 2);
+        assert_eq!(gate.active(), 2);
         // Dropping a permit frees a slot for the next request.
         drop(a);
-        let _c = InFlightGuard::acquire(&counter, 2).expect("permit after release");
+        let _c =
+            InFlightGuard::acquire(&gate, 2, Duration::ZERO).expect("permit after release");
         drop(b);
         drop(_c);
-        assert_eq!(counter.load(Ordering::Acquire), 0);
+        assert_eq!(gate.active(), 0);
+    }
+
+    #[test]
+    fn queued_request_waits_for_a_permit() {
+        let gate = Arc::new(AdmissionGate::new());
+        let held = InFlightGuard::acquire(&gate, 1, Duration::ZERO).expect("first permit");
+        let waiter = {
+            let gate = Arc::clone(&gate);
+            std::thread::spawn(move || {
+                let started = Instant::now();
+                let permit = InFlightGuard::acquire(&gate, 1, Duration::from_secs(2))
+                    .expect("queued permit");
+                assert_eq!(gate.active(), 1);
+                drop(permit);
+                started.elapsed()
+            })
+        };
+        std::thread::sleep(Duration::from_millis(40));
+        drop(held);
+        let waited = waiter.join().expect("waiter thread");
+        assert!(waited >= Duration::from_millis(30), "waited only {waited:?}");
+        assert_eq!(gate.active(), 0);
+    }
+
+    #[test]
+    fn admission_queue_is_bounded() {
+        let gate = Arc::new(AdmissionGate::new());
+        let held = InFlightGuard::acquire(&gate, 1, Duration::ZERO).expect("first permit");
+        let waiter = {
+            let gate = Arc::clone(&gate);
+            std::thread::spawn(move || {
+                let permit = InFlightGuard::acquire_with(
+                    &gate,
+                    1,
+                    1,
+                    Duration::from_secs(2),
+                    None,
+                )
+                .expect("queued permit");
+                drop(permit);
+            })
+        };
+        // Wait until the one queue slot is occupied.
+        for _ in 0..200 {
+            if gate.waiting() == 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(gate.waiting(), 1);
+        match InFlightGuard::acquire_with(&gate, 1, 1, Duration::from_millis(10), None) {
+            Err(JoshuaError::Overloaded(msg)) => {
+                assert!(msg.contains("queue is full"), "got: {msg}");
+            }
+            Err(e) => panic!("expected Overloaded, got {e:?}"),
+            Ok(_) => panic!("expected the full queue to reject"),
+        }
+        assert_eq!(gate.active(), 1, "rejected waiter must not take a slot");
+        drop(held);
+        waiter.join().expect("waiter thread");
+        assert_eq!(gate.active(), 0);
+        assert_eq!(gate.waiting(), 0);
+    }
+
+    #[test]
+    fn cancelled_waiter_leaves_the_queue() {
+        let gate = Arc::new(AdmissionGate::new());
+        let held = InFlightGuard::acquire(&gate, 1, Duration::ZERO).expect("first permit");
+        let cancel = Arc::new(AtomicBool::new(false));
+        let waiter = {
+            let gate = Arc::clone(&gate);
+            let cancel = Arc::clone(&cancel);
+            std::thread::spawn(move || {
+                InFlightGuard::acquire_with(
+                    &gate,
+                    1,
+                    4,
+                    Duration::from_secs(5),
+                    Some(&cancel),
+                )
+                .map(|_| ())
+            })
+        };
+        for _ in 0..200 {
+            if gate.waiting() == 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(gate.waiting(), 1);
+        cancel.store(true, Ordering::Relaxed);
+        match waiter.join().expect("waiter thread") {
+            Err(JoshuaError::Cancelled) => {}
+            other => panic!("expected Cancelled, got {other:?}"),
+        }
+        assert_eq!(gate.waiting(), 0);
+        assert_eq!(gate.active(), 1);
+        drop(held);
+        assert_eq!(gate.active(), 0);
+    }
+
+    #[test]
+    fn queued_request_times_out() {
+        let gate = AdmissionGate::new();
+        let _held = InFlightGuard::acquire(&gate, 1, Duration::ZERO).expect("first permit");
+        let started = Instant::now();
+        match InFlightGuard::acquire(&gate, 1, Duration::from_millis(30)) {
+            Err(JoshuaError::Overloaded(_)) => {}
+            Err(e) => panic!("expected Overloaded, got {e:?}"),
+            Ok(_) => panic!("expected Overloaded, got a permit"),
+        }
+        assert!(started.elapsed() >= Duration::from_millis(20));
+        // The rejected waiter left the count alone.
+        assert_eq!(gate.active(), 1);
     }
 
     #[test]
