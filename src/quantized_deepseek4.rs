@@ -1977,11 +1977,6 @@ impl PrefixCheckpoints {
         self.points.iter().rev().find(|p| p.pos <= keep)
     }
 
-    fn take(&mut self, pos: usize) -> Option<PrefixCheckpoint> {
-        let i = self.points.iter().position(|p| p.pos == pos)?;
-        Some(self.points.remove(i))
-    }
-
     fn insert(&mut self, cp: PrefixCheckpoint) {
         if self.budget == 0 {
             return;
@@ -3872,18 +3867,20 @@ impl ModelWeights {
             // is still exact).
         }
         // A prefix checkpoint is a copy of the state at exactly this
-        // position; the caller prefills the divergence from here.
-        let Some(checkpoint) = self.prefix.take(keep_len) else {
+        // position; the caller prefills the divergence from here.  Restore
+        // from a borrowed checkpoint rather than removing it: an agent can
+        // edit the same boundary repeatedly, and the copy is still valid.
+        let Some(checkpoint) = self.prefix.points.iter().find(|p| p.pos == keep_len) else {
             return Err(candle_core::Error::Msg(format!(
                 "deepseek4: cannot truncate the KV cache to {keep_len} tokens: no prefix \
                  checkpoint at that position and no pending verification pass covers it; \
                  clear the cache and prefill again instead"
             )));
         };
-        for (state, memory) in self.kv.iter_mut().zip(checkpoint.layers) {
-            state.swa = Some(memory.swa);
-            state.comp_state = memory.comp_state;
-            state.lid_state = memory.lid_state;
+        for (state, memory) in self.kv.iter_mut().zip(checkpoint.layers.iter()) {
+            state.swa = Some(memory.swa.clone());
+            state.comp_state = memory.comp_state.clone();
+            state.lid_state = memory.lid_state.clone();
             state.capture = None;
         }
         self.history.truncate(keep_len);

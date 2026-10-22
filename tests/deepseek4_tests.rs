@@ -404,6 +404,20 @@ fn deepseek4_prefix_checkpoint_rewinds_to_a_prefill_boundary() {
     let want = common::logits(&mut reference, &different, 8);
     common::assert_close(&got, &want, 1e-4, "after checkpoint rewind");
 
+    // A second edit at the same boundary must still find the checkpoint:
+    // rewinding restores a copy, it does not consume it.
+    assert!(
+        session.prefix_checkpoint_positions().contains(&8),
+        "the shared checkpoint must survive the first rewind"
+    );
+    assert!(session.truncate_kv_cache(8).unwrap());
+    let third = [2u32, 9, 4, 6];
+    let got = common::logits(&mut session, &third, 8);
+    let mut reference = load(&model, true);
+    common::logits(&mut reference, &prompt[..8], 0);
+    let want = common::logits(&mut reference, &third, 8);
+    common::assert_close(&got, &want, 1e-4, "after a repeated checkpoint rewind");
+
     // The turn boundary is the other edit shape: keep the whole prompt,
     // drop the generated tail, and continue differently.
     let mut turn = load(&model, true);
