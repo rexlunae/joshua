@@ -301,6 +301,12 @@ enum Commands {
             hide_default_value = true
         )]
         prefill_chunk: usize,
+        /// Target wall time for one prefill chunk, in milliseconds.  When
+        /// non-zero, architectures that prefill chunk by chunk choose each
+        /// chunk from an online cost model; `--prefill-chunk` is the ceiling.
+        /// 0 (the default) keeps the fixed chunk size.
+        #[arg(long, env = "JOSHUA_PREFILL_BUDGET_MS", default_value_t = 0, hide_default_value = true)]
+        prefill_budget_ms: u64,
         /// Prefix checkpoints kept per session of a model with recurrent
         /// layers (Qwen3-Next, Qwen3.5, Qwen3.8-Flash-Next, Kimi-Linear):
         /// copies of the running state at each prompt boundary, so an edited
@@ -407,6 +413,10 @@ enum Commands {
         /// Defaults to the machine's parallelism.
         #[arg(long, env = "JOSHUA_MAX_CONCURRENCY")]
         max_concurrency: Option<usize>,
+        /// How long a request may wait for a free concurrency slot before a
+        /// 503, in milliseconds.  0 (the default) rejects immediately.
+        #[arg(long, env = "JOSHUA_QUEUE_TIMEOUT_MS", default_value_t = 0, hide_default_value = true)]
+        queue_timeout_ms: u64,
         /// Hard ceiling on tokens generated per request, capping the
         /// client-supplied max_tokens.
         #[arg(long, env = "JOSHUA_MAX_OUTPUT_TOKENS")]
@@ -570,6 +580,12 @@ enum Commands {
             hide_default_value = true
         )]
         prefill_chunk: usize,
+        /// Target wall time for one prefill chunk, in milliseconds.  When
+        /// non-zero, architectures that prefill chunk by chunk choose each
+        /// chunk from an online cost model; `--prefill-chunk` is the ceiling.
+        /// 0 (the default) keeps the fixed chunk size.
+        #[arg(long, env = "JOSHUA_PREFILL_BUDGET_MS", default_value_t = 0, hide_default_value = true)]
+        prefill_budget_ms: u64,
         /// Speculative token generation: draft up to N tokens per step by
         /// prompt lookup (the continuation of the latest earlier occurrence
         /// of the output's trailing n-gram) and verify them in one forward
@@ -734,6 +750,7 @@ async fn main() -> anyhow::Result<()> {
             expert_cache,
             vram_expert_cache,
             prefill_chunk,
+            prefill_budget_ms,
             prefix_checkpoints,
             prefix_cache_mib,
             prefix_cache_root_min,
@@ -750,6 +767,7 @@ async fn main() -> anyhow::Result<()> {
             npu_in_process,
             whisper_model,
             max_concurrency,
+            queue_timeout_ms,
             max_output_tokens,
             api_key,
             tls_cert,
@@ -793,6 +811,8 @@ async fn main() -> anyhow::Result<()> {
                 .expert_cache_auto(expert_cache_auto)
                 .vram_expert_cache(vram_cache)
                 .prefill_chunk(prefill_chunk)
+                .prefill_budget_ms(prefill_budget_ms)
+                .queue_timeout_ms(queue_timeout_ms)
                 .prefix_checkpoints_opt(prefix_checkpoints)
                 .prefix_cache_mib_opt(prefix_cache_mib)
                 .prefix_cache_root_min_opt(prefix_cache_root_min)
@@ -941,6 +961,7 @@ async fn main() -> anyhow::Result<()> {
             expert_cache,
             vram_expert_cache,
             prefill_chunk,
+            prefill_budget_ms,
             speculative,
             mtp,
             mlock_hot_weights,
@@ -985,6 +1006,7 @@ async fn main() -> anyhow::Result<()> {
                 .expert_cache_auto(expert_cache_auto)
                 .vram_expert_cache(vram_cache)
                 .prefill_chunk(prefill_chunk)
+                .prefill_budget_ms(prefill_budget_ms)
                 .speculative(speculative_config(speculative))
                 .mtp(mtp)
                 .mlock_hot_weights(
