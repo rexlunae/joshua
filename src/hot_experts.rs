@@ -152,10 +152,9 @@ impl HotExpertCache {
         WINDOW_STEPS
     }
 
-    /// Whether a decode-step refresh is due.  The clock only advances on
-    /// decode steps, so the interval boundary can only be reached by decode
-    /// activity.
-    /// Whether a decode-step refresh is due.  Pass `decode = seq_len == 1`.
+    /// Whether a decode-step refresh is due (`decode = seq_len == 1`).  The
+    /// clock only advances on decode steps, so the interval boundary can
+    /// only be reached by decode activity.
     ///
     /// The decode gate is load-bearing, not just an optimization: the clock
     /// only advances on decode steps, so after the 64th decode step it sits
@@ -200,11 +199,16 @@ impl HotExpertCache {
             }
         }
 
-        let incumbents = std::mem::take(&mut self.hot_set);
+        // Hash the incumbents: a linear scan of the budget for every routed
+        // expert is O(candidates × budget), which is tens of millions of
+        // comparisons on a 10k-expert model with a 2k slot budget.
+        let incumbents: std::collections::HashSet<(u32, u32)> =
+            std::mem::take(&mut self.hot_set).into_iter().collect();
         // Sort key: effective count first, true count second, recency third.
         // The hysteresis weights make an incumbent beat a challenger that is
         // only marginally more frequent; ties still go to the hotter expert.
-        let mut cand: Vec<(u64, u64, u64, u32, u32)> = Vec::new();
+        let nonzero = scores.iter().flatten().filter(|&&count| count > 0).count();
+        let mut cand: Vec<(u64, u64, u64, u32, u32)> = Vec::with_capacity(nonzero);
         for (l, layer) in scores.iter().enumerate() {
             for (e, &count) in layer.iter().enumerate() {
                 if count == 0 {
@@ -386,31 +390,33 @@ mod tests {
         assert_eq!(hot, vec![(0, 1)]);
     }
 
+    /// Run `buckets` full decode intervals, refreshing only when the normal
+    /// schedule says it is due, and recording `ids` on every step.
+    fn run_buckets(c: &mut HotExpertCache, ids: &[u32], buckets: usize) {
+        for _ in 0..buckets * REFRESH_STEPS as usize {
+            let step = c.begin_step(true);
+            c.record(0, ids, step);
+            if c.refresh_due(true) {
+                c.refresh();
+            }
+        }
+    }
+
     /// Counts cover a bounded window: after the ring wraps, an expert that
-    /// has not routed for a full window leaves the hot set.
+    /// has not routed for a full window leaves the hot set.  The refresh
+    /// cadence is the normal 64-decode-step one.
     #[test]
     fn window_forgets_a_stale_expert() {
         let mut c = HotExpertCache::new(1, 4, 2);
         c.set_budget(2);
-        for _ in 0..WINDOW_BUCKETS {
-            for _ in 0..REFRESH_STEPS {
-                let s = c.begin_step(true);
-                c.record(0, &[1], s);
-            }
-            assert!(c.refresh_due(true));
-            c.refresh();
-        }
-        assert!(c.refresh().contains(&(0, 1)));
+        run_buckets(&mut c, &[1], WINDOW_BUCKETS);
+        assert!(c.hot_set.contains(&(0, 1)));
 
-        for _ in 0..WINDOW_BUCKETS {
-            for _ in 0..REFRESH_STEPS {
-                let s = c.begin_step(true);
-                c.record(0, &[2], s);
-            }
-            c.refresh();
-        }
-        // One more refresh retires the last bucket that still held expert 1.
-        assert_eq!(c.refresh(), vec![(0, 2)]);
+        run_buckets(&mut c, &[2], WINDOW_BUCKETS);
+        assert_eq!(c.hot_set, vec![(0, 2)]);
+        // The next refresh (another full interval) cannot resurrect it.
+        run_buckets(&mut c, &[2], 1);
+        assert!(!c.hot_set.contains(&(0, 1)));
     }
 
     /// A challenger must beat an incumbent by the hysteresis margin, so two
