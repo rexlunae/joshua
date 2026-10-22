@@ -155,10 +155,12 @@ pub struct GenerationOptions {
     /// window (see [`GenerationOptions::presence_penalty`]).
     #[serde(default)]
     pub frequency_penalty: f32,
-    /// Seed for the sampler's random number generator.  `None` seeds from
-    /// OS entropy.  A fixed seed reproduces the same sample stream for the
-    /// same prompt, model, backend and options; greedy decoding never
-    /// consumes randomness.
+    /// Seed for the sampler's random draws.  `None` seeds from OS entropy.
+    /// A fixed seed reproduces the same sample stream for the same prompt,
+    /// model, backend and options.  Each draw hashes `(seed, absolute token
+    /// position, stream)`, so enabling speculative decoding, changing the
+    /// draft length, or batching requests does not change the token at a
+    /// given position; greedy decoding never consumes randomness.
     #[serde(default)]
     pub seed: Option<u64>,
     /// Per-request context window in tokens: prompt plus generated tokens

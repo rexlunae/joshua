@@ -293,22 +293,51 @@ fn deepseek4_speculative_speeds_up_repetitive_output() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// The fixed-seed contract also holds on the sampled path, including a
+/// correction after a rejected draft.  `top_k = 1` keeps the sampled token
+/// deterministic so the repetitive fixture still drafts, while the sampling
+/// workspace (and `verify_at`) takes the `Probs` path rather than the greedy
+/// shortcut.
 #[test]
-fn speculative_sampling_runs_and_respects_max_tokens() {
+fn speculative_sampling_matches_plain_for_a_fixed_seed() {
     let dir = common::model_dir("spec-qwen3moe-sampled");
     common::write_tiny_qwen3moe_gguf(&dir.join("model.gguf"));
-    let spec = engine(&dir, Some(SpeculativeConfig::with_max_draft(6)));
+    let spec = engine(
+        &dir,
+        Some(SpeculativeConfig {
+            cost_gate: false,
+            ..SpeculativeConfig::with_max_draft(6)
+        }),
+    );
+    let plain = engine(&dir, None);
     let options = GenerationOptions {
-        max_tokens: 20,
+        max_tokens: 24,
         temperature: 0.8,
+        top_k: 1,
+        seed: Some(1234),
         ..GenerationOptions::default()
     };
-    for _ in 0..4 {
-        let (_, usage, _, _) = spec
-            .complete_raw("a b c a b c a b c a b", &options)
-            .unwrap();
-        assert!(usage.completion_tokens <= 20);
-    }
+
+    // A repetitive prompt: the drafter proposes and the target accepts.
+    let repeat = "a b c a b c a b c a b c a b c";
+    let (want, _, _, _) = plain.complete_raw(repeat, &options).unwrap();
+    let (got, _, _, _) = spec.complete_raw(repeat, &options).unwrap();
+    assert_eq!(got, want, "sampled output diverged from plain decoding");
+
+    // A misleading prompt: the lookup proposes a continuation the model does
+    // not choose, so verification rejects and corrects.
+    let misleading = "a b k c d e k c d e a b";
+    let (want_m, _, _, _) = plain.complete_raw(misleading, &options).unwrap();
+    let (got_m, _, _, _) = spec.complete_raw(misleading, &options).unwrap();
+    assert_eq!(got_m, want_m, "sampled output diverged after a correction");
+
+    let stats = spec.speculative_stats();
+    assert!(stats.drafted > 0, "nothing was drafted: {stats:?}");
+    assert!(stats.accepted > 0, "nothing was accepted: {stats:?}");
+    assert!(
+        stats.accepted < stats.drafted,
+        "expected a rejected draft: {stats:?}"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 

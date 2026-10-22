@@ -106,7 +106,7 @@ use std::time::Instant;
 use candle_core::quantized::gguf_file;
 use candle_core::{Device, Tensor};
 use memmap2::Mmap;
-use rand::{rngs::StdRng, thread_rng, SeedableRng};
+use rand::{thread_rng, Rng};
 use tokenizers::Tokenizer;
 
 use crate::embedding::EmbeddingModel;
@@ -2927,12 +2927,10 @@ impl Engine {
         cancel: Option<&AtomicBool>,
     ) -> Result<DecodeOutcome> {
         let mut text = DecodeText::new(penalty_seed, &self.tokenizer);
-        let mut rng = match options.seed {
-            Some(seed) => StdRng::seed_from_u64(seed),
-            None => {
-                StdRng::from_rng(thread_rng()).map_err(|e| JoshuaError::Inference(e.to_string()))?
-            }
-        };
+        // A fixed seed makes every draw a pure function of (seed, position,
+        // stream); without one, pick a request seed once and keep the stream
+        // reproducible for the rest of this generation.
+        let seed = options.seed.unwrap_or_else(|| thread_rng().gen::<u64>());
         let n_ctx = self.effective_n_ctx(options);
         let mut sampler = SamplingWorkspace::default();
         let mut fed_tokens: Vec<u32> = Vec::new();
@@ -2986,7 +2984,13 @@ impl Engine {
             let next_token = match pending.take() {
                 Some(t) => t,
                 None => {
-                    let t = sampler.sample(&logits_vec, options, &mut rng, &text.recent_tokens)?;
+                    let t = sampler.sample_at(
+                        &logits_vec,
+                        options,
+                        &text.recent_tokens,
+                        seed,
+                        n_cur as u64,
+                    )?;
                     if debug_tokens() {
                         let mut order: Vec<usize> = (0..logits_vec.len()).collect();
                         order.sort_by(|&a, &b| logits_vec[b].total_cmp(&logits_vec[a]));
@@ -3064,7 +3068,10 @@ impl Engine {
             let mut stop = false;
             for (i, &draft) in drafts.iter().enumerate() {
                 let dist = sampler.distribution(&rows[i], options, &text.recent_tokens);
-                match dist.verify(draft, &mut rng)? {
+                // `rows[i]` decides the draft at position `n_cur + i`; the
+                // draw depends only on that position, so the outcome does not
+                // depend on how many drafts earlier steps verified.
+                match dist.verify_at(draft, seed, (n_cur + i) as u64)? {
                     Verdict::Accept => {
                         accepted += 1;
                         if self.eos_token_ids.contains(&draft) {
@@ -5643,14 +5650,17 @@ fn squeeze_batch_logits(logits: &Tensor) -> Result<Vec<f32>> {
     }
 
     impl SamplingWorkspace {
-        fn sample(
+        /// Draw the token at absolute position `pos` from `seed`.
+        fn sample_at(
             &mut self,
             logits: &[f32],
             opts: &GenerationOptions,
-            rng: &mut impl rand::Rng,
             recent_tokens: &[u32],
+            seed: u64,
+            pos: u64,
         ) -> Result<u32> {
-            self.distribution(logits, opts, recent_tokens).sample(rng)
+            self.distribution(logits, opts, recent_tokens)
+                .sample_at(seed, pos)
         }
 
         fn distribution(
@@ -5758,16 +5768,21 @@ fn squeeze_batch_logits(logits: &Tensor) -> Result<Vec<f32>> {
             if opts.top_p < 1.0 && opts.top_p > 0.0 {
                 let sum: f32 = probs.iter().sum();
                 if sum > 0.0 {
+                    // Top-k/min-p already zeroed the tail.  Sort only the
+                    // survivors: with the default top-k this is a few dozen
+                    // entries instead of the whole vocabulary.  Token id
+                    // breaks equal-probability ties so the cut is stable.
                     let sorted_idx = &mut self.sorted_idx;
                     sorted_idx.clear();
-                    sorted_idx.extend(0..probs.len());
+                    sorted_idx.extend((0..probs.len()).filter(|&i| probs[i] > 0.0));
                     sorted_idx.sort_unstable_by(|&a, &b| {
                         probs[b]
                             .partial_cmp(&probs[a])
                             .unwrap_or(std::cmp::Ordering::Equal)
+                            .then_with(|| a.cmp(&b))
                     });
                     let mut cumsum = 0.0_f32;
-                    let mut cut_from = probs.len();
+                    let mut cut_from = sorted_idx.len();
                     for (rank, &idx) in sorted_idx.iter().enumerate() {
                         cumsum += probs[idx] / sum;
                         if cumsum > opts.top_p {
@@ -5939,6 +5954,47 @@ mod tests {
             SamplingKind::Greedy(t) => TokenDist::Greedy(t),
             SamplingKind::Probs => TokenDist::Probs(workspace.probs),
         }
+    }
+
+    /// A token's draw depends only on `(seed, position)`, so verifying drafts
+    /// at earlier positions cannot shift the token emitted later.  That is
+    /// what makes `--speculative` output-preserving for a fixed seed.
+    #[test]
+    fn position_keyed_sampling_ignores_verification_history() {
+        let logits: Vec<f32> = (0..128)
+            .map(|i| ((i * 37) % 101) as f32 / 20.0)
+            .collect();
+        let opts = GenerationOptions {
+            temperature: 1.0,
+            top_k: 20,
+            top_p: 0.9,
+            ..Default::default()
+        };
+        let recent = [3u32, 7];
+
+        let mut ws = SamplingWorkspace::default();
+        let plain: Vec<u32> = (0..8)
+            .map(|pos| {
+                ws.sample_at(&logits, &opts, &recent, 1234, pos)
+                    .unwrap()
+            })
+            .collect();
+
+        let mut ws = SamplingWorkspace::default();
+        let mut with_verification = Vec::new();
+        for pos in 0..8 {
+            {
+                let dist = ws.distribution(&logits, &opts, &recent);
+                for draft in 0..3 {
+                    let _ = dist.verify_at(draft, 1234, pos).unwrap();
+                }
+            }
+            with_verification.push(
+                ws.sample_at(&logits, &opts, &recent, 1234, pos)
+                    .unwrap(),
+            );
+        }
+        assert_eq!(plain, with_verification);
     }
 
     #[test]
