@@ -417,6 +417,10 @@ enum Commands {
         /// 503, in milliseconds.  0 (the default) rejects immediately.
         #[arg(long, env = "JOSHUA_QUEUE_TIMEOUT_MS", default_value_t = 0, hide_default_value = true)]
         queue_timeout_ms: u64,
+        /// How many requests may wait for a concurrency slot when
+        /// --queue-timeout-ms is non-zero (0 selects the built-in default).
+        #[arg(long, env = "JOSHUA_ADMISSION_QUEUE_DEPTH", default_value_t = 0, hide_default_value = true)]
+        admission_queue_depth: usize,
         /// Hard ceiling on tokens generated per request, capping the
         /// client-supplied max_tokens.
         #[arg(long, env = "JOSHUA_MAX_OUTPUT_TOKENS")]
@@ -768,6 +772,7 @@ async fn main() -> anyhow::Result<()> {
             whisper_model,
             max_concurrency,
             queue_timeout_ms,
+            admission_queue_depth,
             max_output_tokens,
             api_key,
             tls_cert,
@@ -813,6 +818,7 @@ async fn main() -> anyhow::Result<()> {
                 .prefill_chunk(prefill_chunk)
                 .prefill_budget_ms(prefill_budget_ms)
                 .queue_timeout_ms(queue_timeout_ms)
+                .admission_queue_depth(admission_queue_depth)
                 .prefix_checkpoints_opt(prefix_checkpoints)
                 .prefix_cache_mib_opt(prefix_cache_mib)
                 .prefix_cache_root_min_opt(prefix_cache_root_min)

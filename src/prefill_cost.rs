@@ -82,9 +82,19 @@ impl PrefillCostModel {
             return fallback.clamp(1, cap);
         }
         if self.samples.len() < 2 {
-            // Probe small: the first chunk should not be the one that blows
-            // the budget before there is anything to fit.
-            return fallback.min(PROBE_CHUNK).clamp(self.min.min(cap), cap);
+            // Probe two *different* sizes: a fit needs two x values, and a
+            // prompt whose suffix is a multiple of one probe size would
+            // otherwise only ever see that size.  The first chunk stays
+            // small so it cannot blow the budget before there is a fit.
+            let first = fallback.min(PROBE_CHUNK).max(1);
+            let probe = match self.samples.back() {
+                None => first,
+                Some(&(rows, _)) if rows as usize == first => {
+                    (PROBE_CHUNK.saturating_mul(2)).max(first + 1)
+                }
+                Some(_) => PROBE_CHUNK,
+            };
+            return probe.min(fallback).clamp(self.min.min(cap), cap);
         }
         let Some(rows) = self.predict(budget.as_secs_f64()) else {
             return fallback.clamp(1, cap);
@@ -108,7 +118,12 @@ impl PrefillCostModel {
         }
         let denom = n * sxx - sx * sx;
         if denom.abs() < 1e-9 {
-            return None;
+            // Every observation used the same chunk size: there is no slope,
+            // but the average rate still turns a budget into a row count.
+            // (Falling back to the ceiling here would overshoot a small
+            // latency budget on every prompt with that shape.)
+            let rate = sy / sx;
+            return (rate > 0.0).then(|| budget / rate);
         }
         let slope = (n * sxy - sx * sy) / denom;
         let intercept = (sy - slope * sx) / n;
@@ -186,6 +201,39 @@ mod tests {
         model.observe(10, -1.0);
         assert_eq!(model.samples(), 0);
         assert_eq!(model.next_chunk(1000, Duration::from_millis(10), 128), 64);
+    }
+
+    #[test]
+    fn probes_two_distinct_sizes_then_fits() {
+        let mut model = PrefillCostModel::new(32, 512);
+        assert_eq!(
+            model.next_chunk(10_000, Duration::from_millis(100), 512),
+            64
+        );
+        model.observe(64, 0.064);
+        // The second probe must not repeat 64 rows.
+        assert_eq!(
+            model.next_chunk(10_000, Duration::from_millis(100), 512),
+            128
+        );
+        model.observe(128, 0.128);
+        // 1 ms/token: a 100 ms budget is 100 rows.
+        assert_eq!(
+            model.next_chunk(10_000, Duration::from_millis(100), 512),
+            100
+        );
+    }
+
+    #[test]
+    fn equal_observations_use_the_average_rate() {
+        let mut model = PrefillCostModel::new(32, 512);
+        model.observe(64, 0.064);
+        model.observe(64, 0.064);
+        // No slope is defined, but ~1000 rows/s still respects the budget.
+        assert_eq!(
+            model.next_chunk(10_000, Duration::from_millis(100), 512),
+            100
+        );
     }
 
     #[test]
