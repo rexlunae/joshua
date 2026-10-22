@@ -7,9 +7,13 @@
 //! experts carries most of the traffic.  This module records which experts
 //! each token routes through and, every [`REFRESH_STEPS`] decode steps,
 //! re-selects the `budget` most-used `(layer, expert)` pairs (recency as the
-//! tie-break) and reports the *newly-hot* pairs, so the owning loader can
-//! keep their pages resident (best-effort `MADV_WILLNEED`, or `mlock` for a
-//! hard guarantee).
+//! tie-break) and reports them, so the owning loader can keep their pages
+//! resident (best-effort `MADV_WILLNEED`, or `mlock` for a hard guarantee).
+//!
+//! Counts cover a bounded window ([`WINDOW_STEPS`]), not the lifetime of the
+//! process: a workload shift must be able to release experts that used to be
+//! hot.  A small hysteresis margin keeps a stable set from churning when a
+//! challenger is only marginally more frequent.
 //!
 //! The cache itself performs no I/O and knows nothing about weights: loaders
 //! feed it routing and prefetch the reported experts with their own
@@ -23,23 +27,45 @@
 /// interval mostly bounds `madvise`/prefetch churn rather than compute.
 pub const REFRESH_STEPS: u64 = 64;
 
+/// How many refresh buckets make up the routing-count window.
+///
+/// Four buckets of [`REFRESH_STEPS`] decode steps give a 256-step window:
+/// long enough that one token's routing does not decide the hot set, short
+/// enough that a changed workload releases stale experts.
+pub const WINDOW_BUCKETS: usize = 4;
+
+/// Decode steps covered by the routing-count window.
+pub const WINDOW_STEPS: u64 = WINDOW_BUCKETS as u64 * REFRESH_STEPS;
+
+/// Hysteresis between an incumbent hot expert and a challenger.
+///
+/// An incumbent's window count is weighted by the denominator and a
+/// challenger's by the numerator, so a challenger must be about
+/// `DEN / NUM` (14%) more frequent to take a slot.  Without this, two
+/// experts whose counts oscillate around each other would swap residency
+/// every refresh and defeat both `madvise` and the device slot cache.
+const HYSTERESIS: (u64, u64) = (7, 8);
+
 /// Loader-agnostic routing-frequency LRU bookkeeping for a hot-expert cache.
 #[derive(Debug)]
 pub struct HotExpertCache {
     /// Maximum number of `(layer, expert)` pairs kept hot.  `0` disables the
     /// cache (recording and refresh become no-ops).
     budget: usize,
-    /// Per-layer per-expert routing hit counts, `[layer][expert]`.  The
-    /// frequency side of the routing-frequency LRU.
-    hits: Vec<Vec<u64>>,
+    /// Ring of per-layer per-expert routing counts, `[bucket][layer][expert]`.
+    /// The current bucket receives this interval's routes; a refresh retires
+    /// the oldest bucket, so the sum is a bounded window rather than a
+    /// lifetime total.
+    buckets: Vec<Vec<Vec<u32>>>,
+    /// Index into [`Self::buckets`] receiving routes for the current interval.
+    current: usize,
     /// Per-layer per-expert step of the last route.  The recency clock that
     /// breaks frequency ties (the LRU side).
     last_used: Vec<Vec<u64>>,
     /// Total forward passes completed; the shared recency clock.
     step: u64,
     /// The currently hot experts, `(layer, expert)`, in priority order.
-    /// Diffed against the recomputed top set on refresh, so a stable hot set
-    /// never re-prefetches.
+    /// Re-asserted in full on every refresh.
     hot_set: Vec<(u32, u32)>,
 }
 
@@ -47,9 +73,11 @@ impl HotExpertCache {
     /// Build a cache for `n_layers` layers of `n_experts` routed experts,
     /// keeping `budget` of them hot (`0` disables).
     pub fn new(n_layers: usize, n_experts: usize, budget: usize) -> Self {
+        let shape = || vec![vec![0u32; n_experts]; n_layers];
         Self {
             budget,
-            hits: vec![vec![0u64; n_experts]; n_layers],
+            buckets: (0..WINDOW_BUCKETS).map(|_| shape()).collect(),
+            current: 0,
             last_used: vec![vec![0u64; n_experts]; n_layers],
             step: 0,
             hot_set: Vec::with_capacity(budget.min(n_layers.saturating_mul(n_experts))),
@@ -63,7 +91,7 @@ impl HotExpertCache {
 
     /// Total routed experts tracked (for diagnostics).
     pub fn total_experts(&self) -> usize {
-        self.hits.iter().map(Vec::len).sum()
+        self.last_used.iter().map(Vec::len).sum()
     }
 
     /// Change the budget (`0` disables) and drop the current hot set so the
@@ -106,16 +134,22 @@ impl HotExpertCache {
         if self.budget == 0 {
             return;
         }
-        let Some(hits) = self.hits.get_mut(layer) else {
+        let Some(bucket) = self.buckets[self.current].get_mut(layer) else {
             return;
         };
         let used = &mut self.last_used[layer];
         for &e in ids {
-            if let Some(h) = hits.get_mut(e as usize) {
+            if let Some(h) = bucket.get_mut(e as usize) {
                 *h = h.saturating_add(1);
                 used[e as usize] = step;
             }
         }
+    }
+
+    /// The decode-step window the hot set is selected over, for tests and
+    /// diagnostics.
+    pub fn window_steps(&self) -> u64 {
+        WINDOW_STEPS
     }
 
     /// Whether a decode-step refresh is due.  The clock only advances on
@@ -132,8 +166,9 @@ impl HotExpertCache {
         decode && self.budget > 0 && self.step > 0 && self.step.is_multiple_of(REFRESH_STEPS)
     }
 
-    /// Re-select the hot set from routing frequency (recency as the
-    /// tie-break) and return it in priority order for the owner to prefetch.
+    /// Re-select the hot set from routing frequency over the current window
+    /// (recency as the tie-break) and return it in priority order for the
+    /// owner to prefetch.
     ///
     /// The **whole** hot set is returned on every refresh, not just the
     /// members that changed: `MADV_WILLNEED` is an advisory hint whose effect
@@ -146,26 +181,67 @@ impl HotExpertCache {
         if self.budget == 0 {
             return Vec::new();
         }
-        // Sort key `(hits desc, last_used desc)`: frequency first, recency
-        // breaks ties — the routing-frequency LRU policy.
-        let mut cand: Vec<(u64, u64, u32, u32)> = Vec::new();
-        for (l, layer_hits) in self.hits.iter().enumerate() {
-            for (e, &h) in layer_hits.iter().enumerate() {
-                if h > 0 {
-                    cand.push((h, self.last_used[l][e], l as u32, e as u32));
+        // Sum the ring: one bounded-window count per (layer, expert).
+        let mut scores: Vec<Vec<u64>> = self
+            .last_used
+            .iter()
+            .map(|layer| vec![0u64; layer.len()])
+            .collect();
+        for bucket in &self.buckets {
+            for (l, layer) in bucket.iter().enumerate() {
+                let Some(dst) = scores.get_mut(l) else {
+                    continue;
+                };
+                for (e, &count) in layer.iter().enumerate() {
+                    if let Some(d) = dst.get_mut(e) {
+                        *d += count as u64;
+                    }
                 }
+            }
+        }
+
+        let incumbents = std::mem::take(&mut self.hot_set);
+        // Sort key: effective count first, true count second, recency third.
+        // The hysteresis weights make an incumbent beat a challenger that is
+        // only marginally more frequent; ties still go to the hotter expert.
+        let mut cand: Vec<(u64, u64, u64, u32, u32)> = Vec::new();
+        for (l, layer) in scores.iter().enumerate() {
+            for (e, &count) in layer.iter().enumerate() {
+                if count == 0 {
+                    continue;
+                }
+                let (l, e) = (l as u32, e as u32);
+                let weight = if incumbents.contains(&(l, e)) {
+                    HYSTERESIS.1
+                } else {
+                    HYSTERESIS.0
+                };
+                cand.push((
+                    count * weight,
+                    count,
+                    self.last_used[l as usize][e as usize],
+                    l,
+                    e,
+                ));
             }
         }
         cand.sort_unstable_by(|a, b| b.cmp(a));
         cand.truncate(self.budget);
-        let new_hot: Vec<(u32, u32)> = cand.into_iter().map(|(_, _, l, e)| (l, e)).collect();
-        self.hot_set = new_hot;
+        self.hot_set = cand.into_iter().map(|(_, _, _, l, e)| (l, e)).collect();
+
+        // Retire the oldest interval and clear it for the next one, so the
+        // window advances once per refresh rather than accumulating forever.
+        self.current = (self.current + 1) % WINDOW_BUCKETS;
+        for layer in &mut self.buckets[self.current] {
+            layer.fill(0);
+        }
 
         if !self.hot_set.is_empty() {
             tracing::info!(
-                "expert cache: {} hot experts (budget {}) — re-asserting residency",
+                "expert cache: {} hot experts (budget {}, window {} steps) — re-asserting residency",
                 self.hot_set.len(),
                 self.budget,
+                WINDOW_STEPS,
             );
         }
         self.hot_set.clone()
@@ -220,7 +296,11 @@ mod tests {
         let s2 = c.begin_step(true);
         c.record(0, &[1, 2], s2);
         let second = c.refresh();
-        assert_eq!(second.len(), 2, "stable hot set must be re-asserted in full");
+        assert_eq!(
+            second.len(),
+            2,
+            "stable hot set must be re-asserted in full"
+        );
         assert_eq!(second, first);
     }
 
@@ -239,13 +319,19 @@ mod tests {
             let s = c.begin_step(false);
             c.record(0, &[1, 2], s);
         }
-        assert!(!c.refresh_due(false), "prefills must not advance the decode clock");
+        assert!(
+            !c.refresh_due(false),
+            "prefills must not advance the decode clock"
+        );
         // Exactly four more decode steps reach the interval boundary.
         for _ in 0..4 {
             let s = c.begin_step(true);
             c.record(0, &[1], s);
         }
-        assert!(c.refresh_due(true), "refresh due after exactly 64 decode steps");
+        assert!(
+            c.refresh_due(true),
+            "refresh due after exactly 64 decode steps"
+        );
     }
 
     /// A prefill that arrives while the decode clock sits on the refresh
@@ -258,7 +344,10 @@ mod tests {
             let s = c.begin_step(true);
             c.record(0, &[1], s);
         }
-        assert!(c.refresh_due(true), "boundary reached after 64 decode steps");
+        assert!(
+            c.refresh_due(true),
+            "boundary reached after 64 decode steps"
+        );
         c.refresh();
         // Prefills at the boundary must not re-issue the hot-set prefetch.
         for _ in 0..5 {
@@ -295,5 +384,56 @@ mod tests {
         c.record(0, &[1], s);
         let hot = c.refresh();
         assert_eq!(hot, vec![(0, 1)]);
+    }
+
+    /// Counts cover a bounded window: after the ring wraps, an expert that
+    /// has not routed for a full window leaves the hot set.
+    #[test]
+    fn window_forgets_a_stale_expert() {
+        let mut c = HotExpertCache::new(1, 4, 2);
+        c.set_budget(2);
+        for _ in 0..WINDOW_BUCKETS {
+            for _ in 0..REFRESH_STEPS {
+                let s = c.begin_step(true);
+                c.record(0, &[1], s);
+            }
+            assert!(c.refresh_due(true));
+            c.refresh();
+        }
+        assert!(c.refresh().contains(&(0, 1)));
+
+        for _ in 0..WINDOW_BUCKETS {
+            for _ in 0..REFRESH_STEPS {
+                let s = c.begin_step(true);
+                c.record(0, &[2], s);
+            }
+            c.refresh();
+        }
+        // One more refresh retires the last bucket that still held expert 1.
+        assert_eq!(c.refresh(), vec![(0, 2)]);
+    }
+
+    /// A challenger must beat an incumbent by the hysteresis margin, so two
+    /// near-equal experts do not swap residency on every refresh.
+    #[test]
+    fn hysteresis_keeps_a_close_incumbent() {
+        let mut c = HotExpertCache::new(1, 2, 1);
+        for _ in 0..10 {
+            let s = c.begin_step(true);
+            c.record(0, &[0], s);
+        }
+        assert_eq!(c.refresh(), vec![(0, 0)]);
+
+        // 11 > 10, but within the 14% margin: the incumbent stays.
+        for _ in 0..11 {
+            let s = c.begin_step(true);
+            c.record(0, &[1], s);
+        }
+        assert_eq!(c.refresh(), vec![(0, 0)]);
+
+        // 12 vs 10 is past the margin: the challenger takes the slot.
+        let s = c.begin_step(true);
+        c.record(0, &[1], s);
+        assert_eq!(c.refresh(), vec![(0, 1)]);
     }
 }
