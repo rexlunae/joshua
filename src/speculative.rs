@@ -11,10 +11,13 @@
 //!
 //! * greedy (`temperature <= 0`) — a draft token is accepted iff it is the
 //!   target's argmax, so the text is token-for-token identical;
-//! * sampled — standard speculative sampling (Leviathan et al. 2023, Chen et
-//!   al. 2023) with a deterministic draft: accept draft token `x` with
-//!   probability `p(x)`, otherwise sample from `p` with `x` removed.  The
-//!   emitted tokens are distributed exactly as under ordinary sampling.
+//! * sampled — the target token is drawn with the same position-keyed
+//!   `(seed, position)` stream plain decoding uses; a draft is accepted only
+//!   when it matches that token, and otherwise the target token corrects it.
+//!   The emitted tokens are therefore identical to plain decoding for a fixed
+//!   seed, not merely identically distributed.  [`TokenDist::sample`] and
+//!   [`verify_token`] keep the standard distribution-preserving residual
+//!   sampler for callers that own an RNG.
 //!
 //! The drafter here is **prompt lookup** ([`NgramDrafter`]): it finds the most
 //! recent earlier occurrence of the context's trailing n-gram and proposes the
@@ -285,7 +288,12 @@ pub(crate) enum TokenDistRef<'a> {
 
 impl TokenDistRef<'_> {
     pub(crate) fn sample(self, rng: &mut impl Rng) -> Result<u32> {
-        self.sample_with(rng.gen::<f64>())
+        // A greedy draw needs no randomness; keep the caller's RNG untouched
+        // so a later sampled draw does not shift.
+        match self {
+            Self::Greedy(t) => Ok(t),
+            Self::Probs(p) => sample_slice(p, None, rng.gen::<f64>()),
+        }
     }
 
     /// Draw a token from `seed` and absolute `pos` only.
@@ -306,19 +314,43 @@ impl TokenDistRef<'_> {
     }
 
     pub(crate) fn verify(self, draft: u32, rng: &mut impl Rng) -> Result<Verdict> {
-        self.verify_with(draft, rng.gen::<f64>(), rng.gen::<f64>())
+        // As in `sample`, the deterministic path must not consume caller
+        // randomness: verifying a greedy draft costs no draw.
+        match self {
+            Self::Greedy(t) => Ok(if t == draft {
+                Verdict::Accept
+            } else {
+                Verdict::Reject(t)
+            }),
+            Self::Probs(_) => self.verify_with(draft, rng.gen::<f64>(), rng.gen::<f64>()),
+        }
     }
 
-    /// Verify and correct `draft` using uniforms derived from `(seed, pos)`.
+    /// Verify `draft` against the exact token plain sampling would emit at
+    /// `(seed, pos)`.
     ///
-    /// The accept and residual decisions use independent streams, so a
-    /// rejection does not shift the next token's draw.
+    /// Standard speculative sampling preserves the output *distribution*, but
+    /// its accept and residual streams are independent of the plain sample's
+    /// stream, so one fixed seed can take a different path.  The engine's
+    /// contract is stronger: enabling speculation must not change the tokens.
+    /// Draw the target with [`SAMPLE_STREAM`] — exactly what `sample_at` does —
+    /// accept only a matching draft, and otherwise correct to that token.
     pub(crate) fn verify_at(self, draft: u32, seed: u64, pos: u64) -> Result<Verdict> {
-        self.verify_with(
-            draft,
-            splitmix_uniform(seed, pos, ACCEPT_STREAM),
-            splitmix_uniform(seed, pos, RESIDUAL_STREAM),
-        )
+        match self {
+            Self::Greedy(t) => Ok(if t == draft {
+                Verdict::Accept
+            } else {
+                Verdict::Reject(t)
+            }),
+            Self::Probs(p) => {
+                let target = sample_slice(p, None, splitmix_uniform(seed, pos, SAMPLE_STREAM))?;
+                Ok(if target == draft {
+                    Verdict::Accept
+                } else {
+                    Verdict::Reject(target)
+                })
+            }
+        }
     }
 
     fn verify_with(self, draft: u32, u_accept: f64, u_residual: f64) -> Result<Verdict> {
@@ -345,17 +377,15 @@ impl TokenDistRef<'_> {
     }
 }
 
-/// Random streams used by a decode step.
+/// The random stream used by a decode step's plain sample (and therefore by
+/// verification, which must reproduce it exactly).
 const SAMPLE_STREAM: u64 = 0;
-const ACCEPT_STREAM: u64 = 1;
-const RESIDUAL_STREAM: u64 = 2;
 
 /// A SplitMix64 hash of `(seed, pos, stream)` mapped to `[0, 1)`.
 ///
 /// Sampling from `(seed, position)` rather than a mutable RNG makes the token
 /// stream reproducible across batch composition, backend, and speculative
-/// draft policy.  The three streams keep the sample, accept/reject, and
-/// residual draws independent while sharing the same seed.
+/// draft policy.
 pub(crate) fn splitmix_uniform(seed: u64, pos: u64, stream: u64) -> f64 {
     fn mix(mut z: u64) -> u64 {
         z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
@@ -808,13 +838,51 @@ mod tests {
         assert!(g.allow());
     }
 
+    /// Greedy sampling and verification are deterministic, so they must not
+    /// consume the caller's RNG.
+    #[test]
+    fn greedy_paths_leave_the_rng_untouched() {
+        let mut rng = StdRng::seed_from_u64(7);
+        let mut clone = rng.clone();
+        assert_eq!(TokenDistRef::Greedy(3).sample(&mut rng).unwrap(), 3);
+        assert_eq!(
+            TokenDistRef::Greedy(3).verify(3, &mut rng).unwrap(),
+            Verdict::Accept
+        );
+        assert_eq!(
+            TokenDistRef::Greedy(3).verify(4, &mut rng).unwrap(),
+            Verdict::Reject(3)
+        );
+        assert_eq!(rng.gen::<u64>(), clone.gen::<u64>());
+    }
+
+    /// Verification emits exactly the token plain sampling would at the same
+    /// `(seed, position)`, whether the draft matches or not.
+    #[test]
+    fn verification_matches_plain_sample_at_the_same_position() {
+        let p = [0.1_f32, 0.2, 0.3, 0.4];
+        let dist = TokenDistRef::Probs(&p);
+        for pos in 0..64 {
+            let plain = dist.sample_at(99, pos).unwrap();
+            for draft in 0..6 {
+                match dist.verify_at(draft, 99, pos).unwrap() {
+                    Verdict::Accept => assert_eq!(draft, plain),
+                    Verdict::Reject(correction) => {
+                        assert_ne!(draft, plain);
+                        assert_eq!(correction, plain);
+                    }
+                }
+            }
+        }
+    }
+
     /// The position hash stays in `[0, 1)`, changes with every stream, and
     /// never selects a zero-probability token.
     #[test]
     fn position_hash_is_bounded_and_stream_separated() {
         let mut seen = std::collections::HashSet::new();
         for pos in 0..512 {
-            for stream in [SAMPLE_STREAM, ACCEPT_STREAM, RESIDUAL_STREAM] {
+            for stream in [SAMPLE_STREAM, 1, 2] {
                 let u = splitmix_uniform(7, pos, stream);
                 assert!((0.0..1.0).contains(&u), "u = {u} at {pos}/{stream}");
                 assert!(seen.insert(u.to_bits()), "collision at {pos}/{stream}");

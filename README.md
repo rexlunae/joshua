@@ -24,7 +24,7 @@ framework) and [tokenizers](https://github.com/huggingface/tokenizers).
 | **Tool calling** | OpenAI-compatible `tools` / `tool_calls`, parsing Hermes/Qwen, Mistral, and Llama-3 call formats |
 | **Embeddings** | Dense sentence embeddings for llama / qwen2 / qwen3 embedding models, with GGUF pooling metadata |
 | **KV-cache reuse** | Multi-turn requests continue from a warm model pool and prefill only the new suffix — including across *context edits*: when an agent harness truncates or replaces middle blocks, the pooled session's KV state is rewound to the longest common token prefix instead of being cleared (Qwen and DeepSeek-V2/V3/K2 loaders; models with recurrent layers — Qwen3-Next, Qwen3.5 — reuse extensions and re-prefill on edits). DeepSeek MLA caches the compressed latent (`c_kv` + `k_pe`) instead of the reconstructed per-head K/V, cutting KV memory ~70× |
-| **Speculative decoding** | `--speculative N` drafts up to N tokens per step by prompt lookup and verifies them in one forward pass, rolling the KV cache back past the first rejection — output unchanged (token-identical when greedy, same distribution when sampling), fewer weight sweeps on repetitive output (qwen-family, `deepseek2`-family and `deepseek4` loaders with a rewound-able KV cache, including the recurrent DeltaNet and KDA hybrids, whose running state is snapshotted before a pass and replayed on rollback; on `qwen4exp`'s PLE convolutions and candle's stock loaders the flag warns and is ignored) |
+| **Speculative decoding** | `--speculative N` drafts up to N tokens per step by prompt lookup and verifies them in one forward pass, rolling the KV cache back past the first rejection — output unchanged (token-identical for a fixed seed, greedy or sampled), fewer weight sweeps on repetitive output (qwen-family, `deepseek2`-family and `deepseek4` loaders with a rewound-able KV cache, including the recurrent DeltaNet and KDA hybrids, whose running state is snapshotted before a pass and replayed on rollback; on `qwen4exp`'s PLE convolutions and candle's stock loaders the flag warns and is ignored) |
 | **Speculative expert prefetch** | Decode fires `MADV_WILLNEED` for each MoE layer's *predicted* experts (the ids its router chose last step — routing is temporally local) before any layer runs, so expert pages stream in behind compute instead of faulting on demand (`deepseek4` loader) |
 | **GPU (optional)** | `--features cuda`, `metal`, `opencl`, `vulkan` or `sycl` route inference through candle's GPU backends |
 | **NPU / llama.cpp interop (optional)** | Vendor plugins run in a crash-isolated shim process; a llama.cpp adapter brings every ggml backend (Hexagon NPU, CANN, CUDA, Vulkan, …) |
@@ -780,10 +780,10 @@ in one pass costs little more than scoring one.  `--speculative N` (or
    returning logits for every position.
 3. Draft tokens are checked in order against the request's own sampler
    (repetition penalty, temperature, top-k/min-p/top-p).  Greedy decoding
-   accepts a token iff it is the argmax; sampled decoding uses speculative
-   sampling (accept with probability `p(x)`, otherwise sample the
-   correction from `p` without `x`), so the output distribution is exactly
-   that of plain decoding.
+   accepts a token iff it is the argmax; sampled decoding draws the same
+   position-keyed target token plain decoding would and accepts the draft
+   only when it matches, otherwise correcting to that token.  Enabling
+   speculation therefore leaves a fixed seed's output token-identical.
 4. The KV cache is truncated back past the first rejected token, and the
    live draft length adapts (doubling after a fully accepted draft, halving
    after a fully rejected one).
