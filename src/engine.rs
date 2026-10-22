@@ -2755,7 +2755,9 @@ impl Engine {
             cancel,
         )?;
         if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
-            return Err(JoshuaError::Cancelled);
+            // A generation cancelled before any work is an empty completion,
+            // matching the decode loop's stop path (and the test contract).
+            return Ok((String::new(), UsageInfo::default(), 0.0, 0.0));
         }
         let n_ctx = self.request_n_ctx(options)?;
         // The plugin owns tokenisation, so the prompt length is unknown here;
@@ -2913,7 +2915,7 @@ impl Engine {
             cancel,
         )?;
         if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
-            return Err(JoshuaError::Cancelled);
+            return Ok((String::new(), UsageInfo::default(), 0.0, 0.0));
         }
 
         // ── Tokenise ─────────────────────────────────────────────────────────
