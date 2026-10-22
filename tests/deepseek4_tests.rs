@@ -359,6 +359,71 @@ fn load(model: &std::path::Path, mmap: bool) -> QuantizedModel {
     common::load_model(model, mmap)
 }
 
+/// A prefix checkpoint is a copy of every layer's ring and compressor state
+/// at a prefill boundary; rewinding to it and prefilling a different tail
+/// must match a fresh model that only ever saw the shared prefix.  This is
+/// the edited-context reuse the engine performs for an agent that replaces
+/// its last message.
+#[test]
+fn deepseek4_prefix_checkpoint_rewinds_to_a_prefill_boundary() {
+    let dir = common::model_dir("deepseek4-prefix-rewind");
+    let model = dir.join("model.gguf");
+    common::write_tiny_deepseek4_gguf_compress(&model);
+
+    let prompt = [1u32, 4, 2, 7, 5, 6, 9, 11, 4, 2, 7, 5];
+    let tail = [3u32, 8, 2, 6];
+
+    // Prefill four tokens at a time; every multi-token pass ends on a
+    // coherent boundary and records one checkpoint automatically.
+    let mut session = load(&model, true);
+    session.set_prefix_checkpoints(4);
+    for (i, chunk) in prompt.chunks(4).enumerate() {
+        common::logits(&mut session, chunk, i * 4);
+        session.checkpoint_prefix(i * 4 + chunk.len());
+    }
+    assert_eq!(
+        session.prefix_checkpoint_positions(),
+        vec![4, 8, 12],
+        "each prefill chunk boundary must be kept"
+    );
+
+    // Decode a divergent tail so the state to be discarded is non-trivial.
+    for (i, &token) in tail.iter().enumerate() {
+        common::logits(&mut session, &[token], prompt.len() + i);
+    }
+
+    // An edit at token 10 can resume only from the boundary at 8; the engine
+    // uses this target and then prefills 8.. onwards.
+    assert_eq!(session.kv_rewind_target(10), 8);
+    assert!(session.truncate_kv_cache(8).unwrap());
+    let different = [12u32, 5, 7, 1];
+    let got = common::logits(&mut session, &different, 8);
+
+    let mut reference = load(&model, true);
+    common::logits(&mut reference, &prompt[..8], 0);
+    let want = common::logits(&mut reference, &different, 8);
+    common::assert_close(&got, &want, 1e-4, "after checkpoint rewind");
+
+    // The turn boundary is the other edit shape: keep the whole prompt,
+    // drop the generated tail, and continue differently.
+    let mut turn = load(&model, true);
+    common::logits(&mut turn, &prompt, 0);
+    turn.checkpoint_prefix(prompt.len());
+    for (i, &token) in tail.iter().enumerate() {
+        common::logits(&mut turn, &[token], prompt.len() + i);
+    }
+    assert!(turn.truncate_kv_cache(prompt.len()).unwrap());
+    let got = common::logits(&mut turn, &different, prompt.len());
+
+    let mut reference = load(&model, true);
+    common::logits(&mut reference, &prompt, 0);
+    let want = common::logits(&mut reference, &different, prompt.len());
+    common::assert_close(&got, &want, 1e-4, "after turn-boundary rewind");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The mmap load path must wire up prefetch handles for every routed expert
 /// The mmap load path must wire up prefetch handles for every routed expert
 /// (their weights live in the mapping), and the streamed path must not.
 #[test]

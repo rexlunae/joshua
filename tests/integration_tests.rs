@@ -412,6 +412,10 @@ mod synthetic {
                 write_model = |p| write_tiny_qwen_gguf(p, "qwen2moe");
                 name = "tiny-qwen2moe-kvedit";
             }
+            "deepseek4" => {
+                write_model = write_tiny_deepseek4_gguf_compress;
+                name = "tiny-deepseek4-kvedit";
+            }
             other => panic!("unsupported arch {other}"),
         }
 
@@ -422,7 +426,7 @@ mod synthetic {
         // an earlier prompt.  Of the edits below only the third lands on one
         // (the end of "hello b c"); the others fall back to a full prefill —
         // and every output must still match a fresh engine.
-        let recurrent = arch == "qwen35";
+        let recurrent = arch == "qwen35" || arch == "deepseek4";
         // Reuses after the first `n` edits.
         let rewinds = |n: u64| match (recurrent, n) {
             (false, n) => n,
@@ -524,6 +528,10 @@ mod synthetic {
     #[test]
     fn kv_edited_context_reuse_matches_fresh_engine_qwen2moe() {
         edited_context_reuse_matches_fresh_engine("qwen2moe");
+    }
+    #[test]
+    fn kv_edited_context_reuse_matches_fresh_engine_deepseek4() {
+        edited_context_reuse_matches_fresh_engine("deepseek4");
     }
 
     /// A recurrent (Gated DeltaNet) model rewinds only to a prefix checkpoint

@@ -442,9 +442,10 @@ pub struct EngineOptions {
     /// overloaded error as one that times out.
     pub admission_queue_depth: usize,
     /// Prefix checkpoints each session of a model with recurrent layers
-    /// keeps (Qwen3-Next, Qwen3.5, `qwen4exp`, the KDA hybrids); `None`
-    /// selects [`crate::native_session::DEFAULT_PREFIX_CHECKPOINTS`] and
-    /// `Some(0)` turns them off.
+    /// keeps (Qwen3-Next, Qwen3.5, `qwen4exp`, the KDA hybrids, and
+    /// DeepSeek-V4/V4.1); `None` selects
+    /// [`crate::native_session::DEFAULT_PREFIX_CHECKPOINTS`] and `Some(0)`
+    /// turns them off.
     ///
     /// Such a model's running state cannot be cut back to an arbitrary
     /// prefix, so an edited conversation (an agent replacing its last

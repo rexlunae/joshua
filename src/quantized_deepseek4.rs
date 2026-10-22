@@ -1934,6 +1934,82 @@ struct VerifyCheckpoint {
     layers: Vec<LayerCapture>,
 }
 
+/// One layer's recurrent state at a prefill boundary.
+///
+/// The compressed rows (`comp`/`lid`) are not copied: rows written before the
+/// checkpoint are never overwritten, and a re-prefill from the checkpoint
+/// rewrites a block's row before any query can read it — the same argument
+/// the verification rollback relies on.  Only the sliding-window ring and the
+/// two streaming compressors need a copy.
+struct PrefixLayerState {
+    swa: Tensor,
+    comp_state: Option<CompressorState>,
+    lid_state: Option<CompressorState>,
+}
+
+/// A copy of every layer's recurrent state after `pos` tokens: a position an
+/// edited conversation can resume from without re-reading the prompt.
+struct PrefixCheckpoint {
+    pos: usize,
+    layers: Vec<PrefixLayerState>,
+}
+
+/// A bounded set of prefix checkpoints, ordered by position.
+struct PrefixCheckpoints {
+    /// Most checkpoints kept; `0` disables them.
+    budget: usize,
+    points: Vec<PrefixCheckpoint>,
+}
+
+impl PrefixCheckpoints {
+    fn new(budget: usize) -> Self {
+        Self {
+            budget,
+            points: Vec::new(),
+        }
+    }
+
+    fn invalidate_after(&mut self, pos: usize) {
+        self.points.retain(|p| p.pos <= pos);
+    }
+
+    fn best(&self, keep: usize) -> Option<&PrefixCheckpoint> {
+        self.points.iter().rev().find(|p| p.pos <= keep)
+    }
+
+    fn take(&mut self, pos: usize) -> Option<PrefixCheckpoint> {
+        let i = self.points.iter().position(|p| p.pos == pos)?;
+        Some(self.points.remove(i))
+    }
+
+    fn insert(&mut self, cp: PrefixCheckpoint) {
+        if self.budget == 0 {
+            return;
+        }
+        self.points.retain(|p| p.pos != cp.pos);
+        let at = self.points.partition_point(|p| p.pos < cp.pos);
+        self.points.insert(at, cp);
+        while self.points.len() > self.budget {
+            self.thin();
+        }
+    }
+
+    fn thin(&mut self) {
+        let n = self.points.len();
+        if n <= 1 {
+            self.points.clear();
+            return;
+        }
+        let victim = (0..n - 1)
+            .min_by_key(|&i| {
+                let prev = if i == 0 { 0 } else { self.points[i - 1].pos };
+                self.points[i + 1].pos - prev
+            })
+            .expect("n > 1");
+        self.points.remove(victim);
+    }
+}
+
 // KV caches (owned by the model, reset via clear_kv_cache).
 struct KvState {
     /// Sliding-window cache: [window_size, head_dim].
@@ -2834,6 +2910,10 @@ pub struct ModelWeights {
     /// The last multi-position pass pending rollback
     /// ([`Self::forward_all_logits`] / [`Self::truncate_kv_cache`]).
     verify: Option<VerifyCheckpoint>,
+    /// Recurrent-state copies at prefill/turn boundaries.  DeepSeek-V4's
+    /// ring and streaming compressors keep no history, so an edited
+    /// conversation can only resume from a boundary where a copy was taken.
+    prefix: PrefixCheckpoints,
     /// This session's prefill time split (taken and logged at the end of
     /// each prefill).  Per session: concurrent prefills must not take each
     /// other's counters.
@@ -3459,6 +3539,7 @@ impl ModelWeights {
             history: Vec::new(),
             history_seq: Vec::new(),
             verify: None,
+            prefix: PrefixCheckpoints::new(crate::native_session::DEFAULT_PREFIX_CHECKPOINTS),
             last_routed: vec![Vec::new(); n_layers],
             hot_experts: crate::hot_experts::HotExpertCache::new(n_layers, n_expert, 0),
             stream_ctx: DispatchCtx {
@@ -3669,6 +3750,7 @@ impl ModelWeights {
             history: Vec::new(),
             history_seq: Vec::new(),
             verify: None,
+            prefix: PrefixCheckpoints::new(self.prefix.budget),
             last_routed: vec![Vec::new(); self.shared.layers.len()],
             hot_experts: crate::hot_experts::HotExpertCache::new(
                 self.shared.layers.len(),
@@ -3696,10 +3778,18 @@ impl ModelWeights {
     pub fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {
         let t_pass = std::time::Instant::now();
         let (_b, seq_len) = input.dims2()?;
+        // A plain pass after a verification pass means the pending rollback
+        // no longer describes this state; drop it rather than let a later
+        // truncate restore into the middle of a different history.
+        self.verify = None;
         let logits = self.forward_inner(input, offset, seq_len, true)?;
         self.note_pass(seq_len == 1, t_pass.elapsed());
         if seq_len > 1 {
             self.log_prefill_timing(Some(seq_len));
+            // A multi-token pass ends on a chunk boundary (the engine's
+            // prefill loop calls this once per chunk), so the state is a
+            // coherent place for an edited conversation to resume.
+            self.take_prefix_checkpoint(offset + seq_len);
         }
         Ok(logits)
     }
@@ -3751,33 +3841,129 @@ impl ModelWeights {
             self.verify = None;
             return Ok(());
         }
-        let checkpoint = self.verify.take().ok_or_else(|| {
-            candle_core::Error::Msg(format!(
-                "deepseek4: cannot truncate the KV cache to {keep_len} tokens: the sliding-window \
-                 ring and the running compressors only reach back over the current window; \
-                 clear the cache and prefill again instead"
-            ))
-        })?;
-        if keep_len < checkpoint.offset || keep_len > checkpoint.offset + checkpoint.seq {
-            return Err(candle_core::Error::Msg(format!(
-                "deepseek4: cannot truncate the KV cache to {keep_len} tokens: the pending \
-                 verification pass covered {}..{}",
-                checkpoint.offset,
-                checkpoint.offset + checkpoint.seq
-            )));
+        if keep_len == 0 {
+            // Nothing is left to resume from; a reset is both cheaper and
+            // exact (the ring and compressors have no state at position 0).
+            self.clear_kv_cache();
+            return Ok(());
         }
-        let dev = self.shared.device.clone();
-        for (i, layer) in self.shared.layers.iter().enumerate() {
-            layer.attn.rollback(
-                &mut self.kv[i],
-                &checkpoint.layers[i],
-                checkpoint.offset,
-                keep_len,
-                &dev,
-            )?;
+        // A pending verification pass is the cheapest path: its captures
+        // cover every position inside the pass exactly.
+        if let Some(checkpoint) = self.verify.take() {
+            let end = checkpoint.offset + checkpoint.seq;
+            if keep_len >= checkpoint.offset && keep_len <= end {
+                let dev = self.shared.device.clone();
+                for (i, layer) in self.shared.layers.iter().enumerate() {
+                    layer.attn.rollback(
+                        &mut self.kv[i],
+                        &checkpoint.layers[i],
+                        checkpoint.offset,
+                        keep_len,
+                        &dev,
+                    )?;
+                }
+                self.history.truncate(keep_len);
+                self.prefix.invalidate_after(keep_len);
+                self.forget_last_routed();
+                return Ok(());
+            }
+            // The pass does not cover `keep_len`; fall through to a prefix
+            // checkpoint (its state is at or before the pass, so restoring it
+            // is still exact).
+        }
+        // A prefix checkpoint is a copy of the state at exactly this
+        // position; the caller prefills the divergence from here.
+        let Some(checkpoint) = self.prefix.take(keep_len) else {
+            return Err(candle_core::Error::Msg(format!(
+                "deepseek4: cannot truncate the KV cache to {keep_len} tokens: no prefix \
+                 checkpoint at that position and no pending verification pass covers it; \
+                 clear the cache and prefill again instead"
+            )));
+        };
+        for (state, memory) in self.kv.iter_mut().zip(checkpoint.layers) {
+            state.swa = Some(memory.swa);
+            state.comp_state = memory.comp_state;
+            state.lid_state = memory.lid_state;
+            state.capture = None;
         }
         self.history.truncate(keep_len);
+        self.prefix.invalidate_after(keep_len);
+        self.forget_last_routed();
         Ok(())
+    }
+
+    /// The longest prefix of at most `keep` tokens this session can resume
+    /// from: `keep` itself inside a pending verification pass or when that
+    /// many tokens are already cached, else the latest prefix checkpoint at
+    /// or before it (`0` when there is none).
+    pub fn rewind_target(&self, keep: usize) -> usize {
+        if keep >= self.history.len() {
+            return keep;
+        }
+        if let Some(v) = &self.verify {
+            if keep >= v.offset && keep <= v.offset + v.seq {
+                return keep;
+            }
+        }
+        self.prefix.best(keep).map_or(0, |p| p.pos)
+    }
+
+    /// Whether a verification pass is still pending rollback.
+    pub fn has_pending_verify(&self) -> bool {
+        self.verify.is_some()
+    }
+
+    /// Set how many prefix checkpoints this session (and every session
+    /// derived from it) keeps; `0` turns them off.  Each holds one copy of
+    /// every layer's sliding-window ring and compressor states.
+    pub fn set_prefix_checkpoints(&mut self, n: usize) {
+        self.prefix.budget = n;
+        while self.prefix.points.len() > n {
+            self.prefix.thin();
+        }
+    }
+
+    /// Positions of the prefix checkpoints this session holds (diagnostics).
+    pub fn prefix_checkpoint_positions(&self) -> Vec<usize> {
+        self.prefix.points.iter().map(|p| p.pos).collect()
+    }
+
+    /// Copy every layer's recurrent state as it stands after `pos` tokens.
+    fn take_prefix_checkpoint(&mut self, pos: usize) {
+        if self.prefix.budget == 0 || self.verify.is_some() {
+            return;
+        }
+        let mut layers = Vec::with_capacity(self.kv.len());
+        for state in &self.kv {
+            let Some(swa) = state.swa.as_ref() else {
+                return;
+            };
+            layers.push(PrefixLayerState {
+                swa: swa.clone(),
+                comp_state: state.comp_state.clone(),
+                lid_state: state.lid_state.clone(),
+            });
+        }
+        self.prefix.insert(PrefixCheckpoint { pos, layers });
+    }
+
+    /// Take a prefix checkpoint at `pos`, the number of tokens this session
+    /// has been fed.  The engine calls it before prefilling a follow-up turn,
+    /// so the boundary an agent's edit diverges from can be resumed.
+    pub fn checkpoint_prefix(&mut self, pos: usize) {
+        if pos == 0 || pos != self.history.len() {
+            return;
+        }
+        if self.prefix.points.iter().any(|p| p.pos == pos) {
+            return;
+        }
+        self.take_prefix_checkpoint(pos);
+    }
+
+    fn forget_last_routed(&mut self) {
+        for ids in &mut self.last_routed {
+            ids.clear();
+        }
     }
 
     fn forward_inner(
@@ -4149,8 +4335,10 @@ impl ModelWeights {
         }
         self.history.clear();
         // A pending verification checkpoint refers into the caches just
-        // replaced; drop it.
+        // replaced; drop it.  Prefix checkpoints hold copies of the same
+        // layers, so they are stale too.
         self.verify = None;
+        self.prefix.points.clear();
         // The batched path keeps its own per-sequence history and only
         // rebuilds it when the batch size changes, so a same-sized batch
         // after a reset would otherwise continue the previous batch's
@@ -4174,6 +4362,14 @@ impl crate::stream_prefill::StreamPrefill for ModelWeights {
 
     fn begin_stream(&mut self) {
         crate::route_trace::begin_call(crate::route_trace::Phase::Prefill);
+    }
+
+    fn end_stream(&mut self, end: usize) {
+        // Every layer has seen every chunk: the state now stands at the
+        // prompt's end, the boundary an edit of the next turn resumes from.
+        // (The layer-outer sweep cannot expose intermediate chunk boundaries:
+        // at any point inside it, some layers have not reached that chunk.)
+        self.take_prefix_checkpoint(end);
     }
 
     fn set_stream_progress(&mut self, chunk: usize, n_chunks: usize, row_base: usize) {

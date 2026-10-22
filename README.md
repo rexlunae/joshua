@@ -23,8 +23,13 @@ framework) and [tokenizers](https://github.com/huggingface/tokenizers).
 | **Chat templates** | Renders the model's own `tokenizer.chat_template` from the GGUF (Jinja via pure-Rust minijinja); ChatML fallback |
 | **Tool calling** | OpenAI-compatible `tools` / `tool_calls`, parsing Hermes/Qwen, Mistral, and Llama-3 call formats |
 | **Embeddings** | Dense sentence embeddings for llama / qwen2 / qwen3 embedding models, with GGUF pooling metadata |
+<<<<<<< HEAD
 | **KV-cache reuse** | Multi-turn requests continue from a warm model pool and prefill only the new suffix — including across *context edits*: when an agent harness truncates or replaces middle blocks, the pooled session's KV state is rewound to the longest common token prefix instead of being cleared (Qwen and DeepSeek-V2/V3/K2 loaders; models with recurrent layers — Qwen3-Next, Qwen3.5 — reuse extensions and re-prefill on edits). DeepSeek MLA caches the compressed latent (`c_kv` + `k_pe`) instead of the reconstructed per-head K/V, cutting KV memory ~70× |
 | **Speculative decoding** | `--speculative N` drafts up to N tokens per step by prompt lookup and verifies them in one forward pass, rolling the KV cache back past the first rejection — output unchanged (token-identical for a fixed seed, greedy or sampled), fewer weight sweeps on repetitive output (qwen-family, `deepseek2`-family and `deepseek4` loaders with a rewound-able KV cache, including the recurrent DeltaNet and KDA hybrids, whose running state is snapshotted before a pass and replayed on rollback; on `qwen4exp`'s PLE convolutions and candle's stock loaders the flag warns and is ignored) |
+=======
+| **KV-cache reuse** | Multi-turn requests continue from a warm model pool and prefill only the new suffix — including across *context edits*: when an agent harness truncates or replaces middle blocks, the pooled session's KV state is rewound to the longest common token prefix instead of being cleared (Qwen and DeepSeek-V2/V3/K2 loaders; models with recurrent layers — Qwen3-Next, Qwen3.5, DeepSeek-V4/V4.1 — rewind to a state checkpoint at a prefill or turn boundary and re-prefill only the divergence). DeepSeek MLA caches the compressed latent (`c_kv` + `k_pe`) instead of the reconstructed per-head K/V, cutting KV memory ~70× |
+| **Speculative decoding** | `--speculative N` drafts up to N tokens per step by prompt lookup and verifies them in one forward pass, rolling the KV cache back past the first rejection — output unchanged (token-identical when greedy, same distribution when sampling), fewer weight sweeps on repetitive output (qwen-family, `deepseek2`-family and `deepseek4` loaders with a rewound-able KV cache, including the recurrent DeltaNet and KDA hybrids, whose running state is snapshotted before a pass and replayed on rollback; on `qwen4exp`'s PLE convolutions and candle's stock loaders the flag warns and is ignored) |
+>>>>>>> a48de6c (deepseek4: prefix checkpoints for edited-context reuse (#186))
 | **Speculative expert prefetch** | Decode fires `MADV_WILLNEED` for each MoE layer's *predicted* experts (the ids its router chose last step — routing is temporally local) before any layer runs, so expert pages stream in behind compute instead of faulting on demand (`deepseek4` loader) |
 | **GPU (optional)** | `--features cuda`, `metal`, `opencl`, `vulkan` or `sycl` route inference through candle's GPU backends |
 | **NPU / llama.cpp interop (optional)** | Vendor plugins run in a crash-isolated shim process; a llama.cpp adapter brings every ggml backend (Hexagon NPU, CANN, CUDA, Vulkan, …) |
@@ -812,7 +817,8 @@ loader's plain-attention models (`qwen`, `qwen2moe`, `qwen2vl`, `qwen3`,
 `deepseek2` loader's (`deepseek`, `deepseek2`, `glm-dsa` — DeepSeek-MoE/V2/V3,
 Kimi-K2, GLM-5), and `deepseek4`/`deepseek41` (whose sliding-window ring and
 streaming compressors are rewound through the verification pass's
-checkpoint).  On the rest — candle's stock loaders (private KV caches) and
+checkpoint; for edited context reuse they keep the same kind of copy at
+prefill and turn boundaries).  On the rest — candle's stock loaders (private KV caches) and
 the recurrent DeltaNet/KDA hybrids (qwen3next, qwen3.5, qwen4exp, glm5next,
 kimi-linear, kimi-k3, whose state only clears) — the flag warns at load,
 `Engine::speculative_config()` reads back `None`, and decoding stays one
@@ -956,8 +962,9 @@ blocks) formats candle cannot parse; the native loaders read such tensors
 from the raw GGUF header, borrowing the blocks from the mapping and decoding
 them inside an f32-activation matmul (on an accelerator, or without a
 mapping, they are decoded to f32 at load).  Each architecture's logits are
-pinned to an independent NumPy transcription of llama.cpp's graphs.  Recurrent layers cannot rewind to an arbitrary prefix, so Qwen3-Next
-and Qwen3.5 re-prefill on edited contexts instead of truncating.  Not
+pinned to an independent NumPy transcription of llama.cpp's graphs.  Recurrent layers cannot rewind to an arbitrary prefix, so Qwen3-Next,
+Qwen3.5 and DeepSeek-V4/V4.1 resume edited contexts from a state checkpoint
+and re-prefill only the divergence.  Not
 loadable: `qwen3tts` (speech codec output) and `rwkv6qwen2` (an RWKV-6
 distillation, not a Qwen decoder).
 
