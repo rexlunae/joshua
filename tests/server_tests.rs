@@ -448,6 +448,9 @@ async fn anthropic_messages_supports_text_and_streaming() {
     let request = serde_json::json!({
         "model": "model",
         "max_tokens": 6,
+        // Exercise content events deterministically instead of sampling EOS
+        // before the first token and intermittently producing an empty stream.
+        "temperature": 0.0,
         "messages": [{"role": "user", "content": "a b"}],
     });
 

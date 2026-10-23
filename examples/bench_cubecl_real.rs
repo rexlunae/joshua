@@ -6,10 +6,11 @@ use candle_core::{Device, Module, Tensor, VulkanDevice};
 use clap::Parser;
 use joshua::model::QuantizedModel;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     fs::File,
-    io::{BufWriter, Write},
+    io::{BufWriter, Read, Write},
     path::PathBuf,
     sync::Arc,
     time::Instant,
@@ -85,6 +86,22 @@ struct Args {
 struct Trace {
     prompt: Vec<u32>,
     inputs: Vec<u32>,
+}
+
+// Pin the executable's identity before timing or loading the model. Results
+// from different builds cannot isolate a kernel selector, even with equal IDs.
+fn executable_sha256() -> Result<String> {
+    let mut file = File::open(std::env::current_exe()?)?;
+    let mut hash = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hash.update(&buffer[..count]);
+    }
+    Ok(format!("{:x}", hash.finalize()))
 }
 #[derive(Serialize)]
 struct MemorySample {
@@ -283,6 +300,7 @@ fn benchmark_projection(
     file: &File,
     dev: &Device,
     name: &str,
+    executable_sha256: &str,
 ) -> Result<()> {
     ensure!(
         (1..=16).contains(&args.projection_rows),
@@ -355,6 +373,7 @@ fn benchmark_projection(
     }
     dump.flush()?;
     let summary = serde_json::json!({"mode":"projection", "model":args.model,
+        "executable_sha256":executable_sha256,
         "backend":args.backend,"gpu":device_name(dev),"tensor":name,"dtype":dtype,
         "grouped":args.projection_grouped,"kernel":args.kernel,"m":args.projection_rows,"n":n,"k":k,"weight_bytes":weight_bytes,"iterations_per_pass":args.decode,
         "passes":args.passes,"ms_per_op":times,"median_ms_per_op":median,
@@ -364,6 +383,7 @@ fn benchmark_projection(
     Ok(())
 }
 fn main() -> Result<()> {
+    let executable_sha256 = executable_sha256()?;
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_writer(std::io::stderr)
@@ -385,7 +405,8 @@ fn main() -> Result<()> {
     let kernel = match args.kernel.as_str() {
         "generic" => Qgemv::Generic,
         "cubecl" => Qgemv::CubeClExpanded,
-        "production" | "cubecl-packed" => Qgemv::CubeClPacked,
+        "production" => Qgemv::CubeClProduction,
+        "cubecl-packed" => Qgemv::CubeClPacked,
         "cubecl-next" => Qgemv::CubeClNext,
         "cubecl-q6" => Qgemv::CubeClFormat(candle_core::quantized::GgmlDType::Q6K),
         "cubecl-q4" => Qgemv::CubeClFormat(candle_core::quantized::GgmlDType::Q4K),
@@ -497,7 +518,7 @@ fn main() -> Result<()> {
         "expected B50, found {gpu_name}"
     );
     if let Some(name) = &args.projection_tensor {
-        return benchmark_projection(&args, &header, &file, &dev, name);
+        return benchmark_projection(&args, &header, &file, &dev, name, &executable_sha256);
     }
     let mut dtype_elements = BTreeMap::<u32, usize>::new();
     for info in header.tensors.values() {
@@ -818,7 +839,7 @@ fn main() -> Result<()> {
         peak_rss = peak_rss.max(sample.rss_kib);
     }
     let mut summary = serde_json::json!({"model":args.model,"model_bytes":file.metadata()?.len(),"gpu":gpu_name,"kernel":args.kernel,
-        "dispatch":format!("{kernel:?}"),
+        "executable_sha256":executable_sha256,"dispatch":format!("{kernel:?}"),
         "cubecl_formats":match args.kernel.as_str() {"cubecl"=>vec![8,10,12],"production"|"cubecl-packed"|"cubecl-next"=>vec![8,10,12,14],"cubecl-q6"=>vec![14],"cubecl-q4"=>vec![12],"cubecl-q8"=>vec![8],"cubecl-q2"=>vec![10],_=>vec![]},
         "architecture":architecture,"expert_placement":if cpu_experts {"cpu-mmap"}else{"model-device"},
         "context":context,"warm_decode":args.warm_decode,"engram_disabled":std::env::var_os("JOSHUA_NO_ENGRAM").is_some(),

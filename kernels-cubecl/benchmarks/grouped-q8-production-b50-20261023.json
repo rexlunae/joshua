@@ -1,0 +1,187 @@
+{
+  "date": "2026-10-23",
+  "hardware": "Intel Arc Pro B50 PCI 8086:E212, native Vulkan",
+  "automatic_allowlist": {
+    "dtype": "Q8_0",
+    "sequence_rows": 1,
+    "groups": 8,
+    "weight_shape_n_k": [
+      8192,
+      4096
+    ],
+    "outputs_per_group": 1024
+  },
+  "paired_acceptance_evidence": "grouped-q8-followup-b50-20261023.json",
+  "production_manifest": {
+    "command": [
+      "/home/tserica/benchmark-results/grouped-q8-production-20261023/bench_cubecl_real",
+      "--model",
+      "/home/tserica/models/DSV41-REAP272E-balanced.gguf",
+      "--tokenizer",
+      "/home/tserica/models/DeepSeek-V4.1-Flash-REAP-272E/tokenizer.json",
+      "--kernel",
+      "production",
+      "--output",
+      "/home/tserica/benchmark-results/grouped-q8-production-20261023/deepseek-production",
+      "--reference",
+      "/home/tserica/benchmark-results/grouped-q8-parity-20261023/deepseek-grouped/trace.json",
+      "--prefill-chunk",
+      "32",
+      "--decode",
+      "128",
+      "--passes",
+      "2",
+      "--warm-prompt-tokens",
+      "8",
+      "--warm-decode",
+      "2",
+      "--context",
+      "249",
+      "--chat"
+    ],
+    "binary_sha256": "e21ca032e3f57c4900659088292122341f9567e6f3e95c3c33e6d78904eb10e4",
+    "base_git_head": "190951be865bcb76455160dc9c1f901a04884a5a",
+    "source_sha256": {
+      "vendor/candle-core/src/vulkan_backend/kernels.rs": "a92b68250688d849fe89c0bad52356581a2f8faee910016e218a35397e7f722a",
+      "vendor/candle-core/src/vulkan_backend/grouped_q8_cubecl.wgsl": "5d36f17957b4653483d0d47042be9e3176a143b9074969c9d5cef5d54a3961c6",
+      "src/attention.rs": "aaf40e71a2b8dfbf5b8594db73991ead6c92dee78055d59fffeabb809f5d4c07",
+      "src/quantized_deepseek4.rs": "1d43ced65f8a0556e003343e02709a5884dc42891859ca0ca69b1577b1d99e9b",
+      "examples/bench_cubecl_real.rs": "335e2c057744f572a8d1018a57e0feb02acc21978d55c75383e2b4acdbca4eb2"
+    }
+  },
+  "actual_weight_projection_probe": {
+    "mode": "projection",
+    "model": "/home/tserica/models/DSV41-REAP272E-balanced.gguf",
+    "executable_sha256": "e21ca032e3f57c4900659088292122341f9567e6f3e95c3c33e6d78904eb10e4",
+    "backend": "vulkan",
+    "gpu": "Intel(R) Arc(tm) Pro B50 Graphics (BMG G21)",
+    "tensor": "blk.0.attn_output_a.weight",
+    "dtype": "Q8_0",
+    "grouped": true,
+    "kernel": "production",
+    "m": 8,
+    "n": 8192,
+    "k": 4096,
+    "weight_bytes": 35651584,
+    "iterations_per_pass": 4,
+    "passes": 2,
+    "ms_per_op": [
+      3.31397275,
+      3.1853435
+    ],
+    "median_ms_per_op": 3.249658125,
+    "max_repeat_logit_difference": 0.0,
+    "after_session_driver_memory_bytes": [
+      {
+        "drm-resident-gtt": 2097152,
+        "drm-resident-stolen": 0,
+        "drm-resident-system": 0,
+        "drm-resident-vram0": 201977856,
+        "drm-total-gtt": 2097152,
+        "drm-total-stolen": 0,
+        "drm-total-system": 0,
+        "drm-total-vram0": 201977856
+      },
+      {
+        "drm-resident-gtt": 2097152,
+        "drm-resident-stolen": 0,
+        "drm-resident-system": 0,
+        "drm-resident-vram0": 201977856,
+        "drm-total-gtt": 2097152,
+        "drm-total-stolen": 0,
+        "drm-total-system": 0,
+        "drm-total-vram0": 201977856
+      }
+    ],
+    "after_session_reserved_live": [
+      [
+        169869312,
+        35782656
+      ],
+      [
+        169869312,
+        35782656
+      ]
+    ]
+  },
+  "raw_results_directory": "/home/tserica/benchmark-results/grouped-q8-production-20261023",
+  "post_rollout_control": {
+    "comparison_kind": "Regression replay against prior accepted trace; binaries differ, so this is not a new paired speed certification. Original pinned paired gate remains the speed evidence.",
+    "reference_directory": "/home/tserica/benchmark-results/grouped-q8-parity-20261023/deepseek-grouped",
+    "reference_executable_sha256": "dfc396a986d92e05a1eb424ad3347f42dd57c7f5a8cf96222dcbd94ae48e3ea4",
+    "protocol": {
+      "context": 249,
+      "prompt_tokens": 121,
+      "prefill_chunk": 32,
+      "decode_tokens": 128,
+      "passes": 2,
+      "warm_prompt_tokens": 8,
+      "warm_decode": 2,
+      "expert_placement": "cpu-mmap"
+    },
+    "production_dispatch": "CubeClProduction",
+    "compared_logits": 16677120,
+    "max_abs": 0.0,
+    "repeat_max_abs": 0.0,
+    "production_logits_sha256": "ab6fb262586daa5d1a3ea4baa89d1ef5b8afce4ee2b6750306357ff8f0892333",
+    "accepted_logits_sha256": "ab6fb262586daa5d1a3ea4baa89d1ef5b8afce4ee2b6750306357ff8f0892333",
+    "decode_ms_per_token": [
+      827.014832242187,
+      835.1097880156251
+    ],
+    "median_decode_ms_per_token": 831.0623101289061,
+    "prefill_ms": [
+      39029.888946,
+      38600.648540999995
+    ],
+    "peak_reserved_live": [
+      9365831680,
+      9279003648
+    ],
+    "after_session_reserved_live": [
+      [
+        9365831680,
+        9224831488
+      ],
+      [
+        9365831680,
+        9224831488
+      ]
+    ],
+    "decode_live_span_bytes": [
+      0,
+      0
+    ],
+    "private_endpoints_kib": [
+      188548,
+      188552
+    ],
+    "driver_vram_endpoints_bytes": [
+      9404608512,
+      9404608512
+    ],
+    "checks": {
+      "automatic_production_selector": true,
+      "executable_matches_manifest": true,
+      "identical_inputs": true,
+      "bit_identical": true,
+      "absolute_logits_1e_5": true,
+      "repeated_parity_1e_5": true,
+      "allocator_trajectory_identical": true,
+      "decode_live_flat": true,
+      "session_endpoints_identical": true,
+      "private_memory_stable": true,
+      "private_memory_within_1MiB": true,
+      "driver_memory_identical": true,
+      "no_fallbacks": true
+    },
+    "passed": true
+  },
+  "validation": [
+    "9 active Vulkan integration tests passed (2 synthetic timing tests ignored)",
+    "7 DeepSeek41 and 12 memory-placement tests passed",
+    "7 Python evaluator tests passed",
+    "Release benchmark build passed"
+  ],
+  "scope": "Automatic dispatch enables only the allowlisted B50 shape. Other grouped geometries remain explicit CubeClNext opt-in; cubecl-packed disables grouped dispatch. No arithmetic, copies, buffers, transfers or queues changed."
+}

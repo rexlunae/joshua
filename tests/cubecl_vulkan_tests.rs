@@ -190,9 +190,9 @@ fn logits(
 }
 
 #[test]
-fn tiny_packed_models_match_generic_prefill_decode_and_all_rows() {
+fn tiny_production_models_match_generic_prefill_decode_and_all_rows() {
     let base = Device::Vulkan(VulkanDevice::new_with_qgemv(0, Qgemv::Generic).unwrap());
-    let candidate = Device::Vulkan(VulkanDevice::new_with_qgemv(0, Qgemv::CubeClPacked).unwrap());
+    let candidate = Device::Vulkan(VulkanDevice::new_with_qgemv(0, Qgemv::CubeClProduction).unwrap());
     let dir = common::model_dir("cubecl-q4k-parity");
     type Fixture = (&'static str, fn(&std::path::Path), &'static [bool]);
     // DeepSeek4's raw IQ2_XXS experts require mmap for accelerator execution;
@@ -397,9 +397,16 @@ fn validated_adapter_enables_production_dispatch() {
     if dev.name() == "Intel(R) Arc(tm) Pro B50 Graphics (BMG G21)"
         && std::env::var_os("JOSHUA_VULKAN_QGEMV").is_none()
     {
-        assert_eq!(dev.limits().qgemv, Qgemv::CubeClPacked);
-        assert!(!kernels::grouped_q8_eligible(&dev, 8, 8192, 4096),
-            "unvalidated grouped projection must remain opt-in");
+        assert_eq!(dev.limits().qgemv, Qgemv::CubeClProduction);
+        assert!(kernels::grouped_q8_eligible(&dev, 8, 8192, 4096));
+        for (groups, n, k) in [(4, 8192, 4096), (8, 4096, 8192),
+            (8, 8200, 4096), (8, 8192, 8192)] {
+            assert!(!kernels::grouped_q8_eligible(&dev, groups, n, k),
+                "unvalidated geometry must retain its fallback");
+        }
+        assert_eq!(Qgemv::for_adapter(0x8086, 0xE20B, false), Qgemv::Generic);
+        let reference = VulkanDevice::new_with_qgemv(0, Qgemv::CubeClPacked).unwrap();
+        assert!(!kernels::grouped_q8_eligible(&reference, 8, 8192, 4096));
     }
 }
 
@@ -599,6 +606,45 @@ fn packed_gemv_preserves_generic_accumulation_order() {
 }
 
 #[test]
+fn tiny_grouped_q8_matches_packed_cache_continuation_and_all_rows() {
+    let base = Device::Vulkan(VulkanDevice::new_with_qgemv(0, Qgemv::CubeClPacked).unwrap());
+    let candidate = Device::Vulkan(VulkanDevice::new_with_qgemv(0, Qgemv::CubeClNext).unwrap());
+    let dir = common::model_dir("cubecl-grouped-parity");
+    let path = dir.join("deepseek41.gguf");
+    common::write_tiny_deepseek4_gguf_opts(
+        &path,
+        common::TinyDeepseek4Opts {
+            v41: true,
+            grouped_q8: true,
+            ..Default::default()
+        },
+    );
+    let mut a = load(&path, &base, true);
+    let mut b = load(&path, &candidate, true);
+    for (tokens, offset, all) in [
+        (&[1, 4, 2][..], 0, false),
+        (&[7][..], 3, false),
+        (&[5][..], 4, false),
+        (&[2, 3][..], 5, true),
+        (&[1][..], 7, false),
+    ] {
+        let before = kernels::fallback_count();
+        let expected = logits(&mut a, tokens, offset, &base, all);
+        let baseline_fallbacks = kernels::fallback_count() - before;
+        let before = kernels::fallback_count();
+        let got = logits(&mut b, tokens, offset, &candidate, all);
+        assert_eq!(kernels::fallback_count() - before, baseline_fallbacks);
+        common::assert_close(
+            &got,
+            &expected,
+            1e-5,
+            &format!("grouped DeepSeek offset={offset} all={all}"),
+        );
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn grouped_q8_matches_diagonal_projection_and_preserves_fallbacks() {
     use candle_core::{
         quantized::{QMatMul, QStorage},
@@ -665,6 +711,70 @@ fn grouped_q8_matches_diagonal_projection_and_preserves_fallbacks() {
                 );
             }
         }
+    }
+}
+
+#[test]
+fn grouped_q8_deepseek_shape_preserves_exact_reduction() {
+    use candle_core::{
+        quantized::{QMatMul, QStorage},
+        Module,
+    };
+    let vk = VulkanDevice::new_with_qgemv(0, Qgemv::CubeClProduction).unwrap();
+    let dev = Device::Vulkan(vk);
+    // Real DeepSeek output-A geometry; larger magnitudes make changes to
+    // FMA/reduction order visible beyond the full-model 1e-5 gate.
+    let (groups, rank, k) = (8, 1024, 4096);
+    let n = groups * rank;
+    let values = common::weights(n * k, 391)
+        .into_iter()
+        .map(|v| v * 70.)
+        .collect();
+    let cpu = Tensor::from_vec(values, (n, k), &Device::Cpu).unwrap();
+    let qt = QTensor::quantize(&cpu, GgmlDType::Q8_0).unwrap();
+    let w = QTensor::new(
+        QStorage::from_data(qt.data().unwrap(), &dev, GgmlDType::Q8_0).unwrap(),
+        (n, k),
+    )
+    .unwrap();
+    let weight = QMatMul::from_qtensor(w).unwrap();
+    for seed in [71, 193] {
+        let mut values = vec![99.; 3];
+        values.extend(
+            common::weights(groups * k, seed)
+                .into_iter()
+                .map(|v| v * 80.),
+        );
+        let x = Tensor::from_vec(values, 3 + groups * k, &dev)
+            .unwrap()
+            .narrow(0, 3, groups * k)
+            .unwrap()
+            .reshape((groups, k))
+            .unwrap();
+        let full = weight.forward(&x).unwrap();
+        let blocks: Vec<_> = (0..groups)
+            .map(|g| {
+                full.narrow(0, g, 1)
+                    .unwrap()
+                    .narrow(1, g * rank, rank)
+                    .unwrap()
+            })
+            .collect();
+        let expected = Tensor::cat(&blocks, 1)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let got = weight
+            .try_grouped_q8(&x, groups)
+            .unwrap()
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert_eq!(expected, got, "DeepSeek grouped projection seed={seed}");
     }
 }
 

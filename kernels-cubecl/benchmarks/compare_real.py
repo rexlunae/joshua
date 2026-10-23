@@ -91,7 +91,15 @@ if "after_session_host_memory_kib" in a and "after_session_host_memory_kib" in b
         "candidate_anonymous_peak_within_1_mib_of_generic": max(anon_b) <= max(anon_a) + 1024,
     })
 memory = result["memory_comparison"]
+def repeated_sessions_measured(summary):
+    return summary.get("passes", 0) >= 2 and all(
+        len(summary.get(key, [])) == summary["passes"]
+        for key in ["ms_per_token", "prefill_ms", "after_session_reserved_live",
+                    "after_session_host_memory_kib"])
+
 checks = {
+    "same_executable": bool(a.get("executable_sha256")) and a.get("executable_sha256") == b.get("executable_sha256"),
+    "repeated_sessions_measured": repeated_sessions_measured(a) and repeated_sessions_measured(b),
     "parity": result["output_comparison"]["within_absolute_1e_5"] and result["output_comparison"]["top1_ids_match"],
     "repeated_session_parity": a["max_repeat_logit_difference"] <= 1e-5 and b["max_repeat_logit_difference"] <= 1e-5,
     "faster_decode": result["speedup"] > 1.0,

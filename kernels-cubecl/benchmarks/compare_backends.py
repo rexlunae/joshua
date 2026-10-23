@@ -87,7 +87,8 @@ for folder in a.runs:
     device_stable = True if s['backend'] == 'cpu' else all(known_device_checks) if known_device_checks else None
     totals = np.asarray(s['prefill_ms']) + np.asarray(s['ms_per_token']) * s['decode_tokens']
     base_totals = np.asarray(base['prefill_ms']) + np.asarray(base['ms_per_token']) * base['decode_tokens']
-    gates = {'absolute_logits_1e_5': bool((delta <= 1e-5).all()),
+    gates = {'same_executable': bool(base.get('executable_sha256')) and base.get('executable_sha256') == s.get('executable_sha256'),
+             'absolute_logits_1e_5': bool((delta <= 1e-5).all()),
              'repeat_logits_1e_5': s['max_repeat_logit_difference'] <= 1e-5,
              'reference_repeat_logits_1e_5': base['max_repeat_logit_difference'] <= 1e-5,
              'repeated_sessions_measured': len(private) >= 2 and len(s['ms_per_token']) >= 2,
