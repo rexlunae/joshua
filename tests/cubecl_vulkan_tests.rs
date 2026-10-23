@@ -192,7 +192,7 @@ fn logits(
 #[test]
 fn tiny_packed_models_match_generic_prefill_decode_and_all_rows() {
     let base = Device::Vulkan(VulkanDevice::new_with_qgemv(0, Qgemv::Generic).unwrap());
-    let candidate = Device::Vulkan(VulkanDevice::new(0).unwrap());
+    let candidate = Device::Vulkan(VulkanDevice::new_with_qgemv(0, Qgemv::CubeClPacked).unwrap());
     let dir = common::model_dir("cubecl-q4k-parity");
     type Fixture = (&'static str, fn(&std::path::Path), &'static [bool]);
     // DeepSeek4's raw IQ2_XXS experts require mmap for accelerator execution;
