@@ -1431,6 +1431,40 @@ struct DecodeOutcome {
     /// Tokens actually fed to the model during decode (KV-state delta).
     fed_tokens: Vec<u32>,
     decode_tps: f64,
+    /// The configured stop sequence that ended generation, if any.
+    stop_sequence: Option<String>,
+}
+
+/// A completed generation, including which stop sequence ended it.
+///
+/// The tuple-returning completion helpers on [`Engine`] are thin wrappers
+/// around this type; callers that need to report Anthropic's
+/// `stop_reason`/`stop_sequence` fields use the `*_detailed` methods.
+#[derive(Debug, Clone)]
+pub struct Completion {
+    /// Generated text, with any matched stop sequence removed.
+    pub text: String,
+    /// Token accounting for the request.
+    pub usage: UsageInfo,
+    /// Prefill throughput in tokens per second.
+    pub prefill_tps: f64,
+    /// Decode throughput in tokens per second.
+    pub decode_tps: f64,
+    /// The configured stop sequence that ended generation, if any.
+    pub stop_sequence: Option<String>,
+}
+
+impl Completion {
+    /// Split into the historical `(text, usage, prefill_tps, decode_tps)`
+    /// tuple shape.
+    fn into_tuple(self) -> (String, UsageInfo, f64, f64) {
+        (
+            self.text,
+            self.usage,
+            self.prefill_tps,
+            self.decode_tps,
+        )
+    }
 }
 
 /// Repetition-penalty window: the last this-many tokens are penalised.
@@ -1472,6 +1506,77 @@ impl<'a> DecodeText<'a> {
             n_decoded: 0,
         }
     }
+}
+
+/// Reports decoded text to a streaming caller without leaking a stop
+/// sequence.  A tail as long as the longest stop sequence is withheld until
+/// the sequence either completes (and is trimmed from `response`) or
+/// decoding ends.
+struct StreamGate {
+    sent: usize,
+    holdback: usize,
+}
+
+impl StreamGate {
+    fn new(stop_sequences: &[String]) -> Self {
+        Self {
+            sent: 0,
+            holdback: stop_sequences
+                .iter()
+                .map(String::len)
+                .max()
+                .unwrap_or(0),
+        }
+    }
+
+    fn push(
+        &mut self,
+        response: &str,
+        stopped: bool,
+        on_text: Option<&mut (dyn FnMut(&str) + '_)>,
+    ) {
+        let end = if stopped {
+            response.len()
+        } else {
+            floor_char_boundary(response, response.len().saturating_sub(self.holdback))
+        };
+        self.emit_to(response, end, on_text);
+    }
+
+    fn finish(
+        &mut self,
+        response: &str,
+        on_text: Option<&mut (dyn FnMut(&str) + '_)>,
+    ) {
+        self.emit_to(response, response.len(), on_text);
+    }
+
+    fn emit_to(
+        &mut self,
+        response: &str,
+        end: usize,
+        on_text: Option<&mut (dyn FnMut(&str) + '_)>,
+    ) {
+        let end = end.min(response.len());
+        if end <= self.sent {
+            // A stop sequence can trim the response below text already sent
+            // only if it is longer than the holdback, which `new` prevents.
+            return;
+        }
+        if let Some(on_text) = on_text {
+            on_text(&response[self.sent..end]);
+        }
+        self.sent = end;
+    }
+}
+
+/// Largest char boundary at or below `index` (the standard-library
+/// `floor_char_boundary` is still unstable).
+fn floor_char_boundary(s: &str, mut index: usize) -> usize {
+    while index > 0 && !s.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
 }
 
 /// NPU backend state: the backend plus its circuit breaker.
@@ -2553,6 +2658,39 @@ impl Engine {
         self.n_ctx
     }
 
+    /// Tokenize `text` with the model's tokenizer.  `add_special_tokens`
+    /// controls the tokenizer's BOS/EOS wrapper; chat prompts formatted by
+    /// the engine already contain their special tokens.
+    pub fn tokenize(&self, text: &str, add_special_tokens: bool) -> Result<Vec<u32>> {
+        self.tokenizer
+            .encode(text, add_special_tokens)
+            .map(|encoding| encoding.get_ids().to_vec())
+            .map_err(|e| JoshuaError::Tokenization(e.to_string()))
+    }
+
+    /// Count the prompt tokens a chat request will use, without running the
+    /// model.  Useful for API usage figures and admission checks; media
+    /// messages count only their text portion.
+    pub fn count_chat_tokens(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        options: &GenerationOptions,
+    ) -> Result<u32> {
+        let reordered = tools.and_then(|t| self.tool_orders.stable(t));
+        let tools = reordered.as_deref().or(tools);
+        let moved = if self.env_to_user {
+            crate::prompt_stability::env_to_user(messages)
+        } else {
+            None
+        };
+        let messages = moved.as_deref().unwrap_or(messages);
+        let (prompt, add_special_tokens) =
+            self.format_prompt(messages, tools, &options.chat_template_kwargs);
+        self.tokenize(&prompt, add_special_tokens)
+            .map(|tokens| tokens.len() as u32)
+    }
+
     /// Device the routed-expert pool of a MoE model lives on: the compute
     /// device, or the CPU when the experts stay in host RAM (see
     /// [`EngineOptions::expert_placement`]).
@@ -2700,7 +2838,60 @@ impl Engine {
         tools: Option<&[Tool]>,
         options: &GenerationOptions,
     ) -> Result<(String, UsageInfo, f64, f64)> {
-        self.complete_chat_inner(messages, tools, options, None)
+        self.complete_chat_detailed(messages, tools, options)
+            .map(Completion::into_tuple)
+    }
+
+    /// [`Engine::complete_chat`] with the matched stop sequence included.
+    pub fn complete_chat_detailed(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        options: &GenerationOptions,
+    ) -> Result<Completion> {
+        self.complete_chat_inner(messages, tools, options, None, None)
+    }
+
+    /// [`Engine::complete_chat`] that reports text as it is decoded.
+    ///
+    /// `on_text` receives newly decoded text, not raw token ids: byte-level
+    /// tokenizers may hold back a partial UTF-8 character until the next
+    /// token completes it.  When `stop_sequences` is non-empty the engine
+    /// withholds a tail as long as the longest stop sequence, so a sequence
+    /// that spans token boundaries is never sent to the caller; the tail is
+    /// flushed when decoding ends normally.
+    ///
+    /// The callback runs on the decoding thread.  It should hand the text to
+    /// another thread or channel rather than block, because every call sits
+    /// on the per-token path.
+    pub fn complete_chat_streaming(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        options: &GenerationOptions,
+        cancel: &AtomicBool,
+        on_text: &mut dyn FnMut(&str),
+    ) -> Result<(String, UsageInfo, f64, f64)> {
+        self.complete_chat_streaming_detailed(messages, tools, options, cancel, on_text)
+            .map(Completion::into_tuple)
+    }
+
+    /// [`Engine::complete_chat_streaming`] with the matched stop sequence.
+    pub fn complete_chat_streaming_detailed(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        options: &GenerationOptions,
+        cancel: &AtomicBool,
+        on_text: &mut dyn FnMut(&str),
+    ) -> Result<Completion> {
+        self.complete_chat_inner(
+            messages,
+            tools,
+            options,
+            Some(cancel),
+            Some(on_text),
+        )
     }
 
     /// [`Engine::complete_chat`] that stops decoding once `cancel` is set.
@@ -2718,7 +2909,19 @@ impl Engine {
         options: &GenerationOptions,
         cancel: &AtomicBool,
     ) -> Result<(String, UsageInfo, f64, f64)> {
-        self.complete_chat_inner(messages, tools, options, Some(cancel))
+        self.complete_chat_cancellable_detailed(messages, tools, options, cancel)
+            .map(Completion::into_tuple)
+    }
+
+    /// [`Engine::complete_chat_cancellable`] with the matched stop sequence.
+    pub fn complete_chat_cancellable_detailed(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        options: &GenerationOptions,
+        cancel: &AtomicBool,
+    ) -> Result<Completion> {
+        self.complete_chat_inner(messages, tools, options, Some(cancel), None)
     }
 
     fn complete_chat_inner(
@@ -2727,7 +2930,8 @@ impl Engine {
         tools: Option<&[Tool]>,
         options: &GenerationOptions,
         cancel: Option<&AtomicBool>,
-    ) -> Result<(String, UsageInfo, f64, f64)> {
+        mut on_text: Option<&mut (dyn FnMut(&str) + '_)>,
+    ) -> Result<Completion> {
         // Keep the prompt's head byte-identical across requests where the
         // client varies it for no semantic reason, so cached prompt state
         // still matches (see `crate::prompt_stability`).
@@ -2748,12 +2952,25 @@ impl Engine {
             let (marked_messages, images) = resolve_message_media(messages)?;
             let (prompt, _) =
                 self.format_prompt(&marked_messages, tools, &options.chat_template_kwargs);
-            return self.complete_media(&prompt, &images, options, cancel);
+            return self.complete_media(
+                &prompt,
+                &images,
+                options,
+                cancel,
+                on_text.as_deref_mut(),
+            );
         }
         let (prompt, add_special_tokens) =
             self.format_prompt(messages, tools, &options.chat_template_kwargs);
         let root = self.prompt_root_chars(messages, tools, options, &prompt);
-        self.complete_with(&prompt, add_special_tokens, options, cancel, root)
+        self.complete_with(
+            &prompt,
+            add_special_tokens,
+            options,
+            cancel,
+            root,
+            on_text.as_deref_mut(),
+        )
     }
 
     /// Run a multimodal completion: the plugin tokenises and prefills the
@@ -2764,7 +2981,8 @@ impl Engine {
         images: &[Vec<u8>],
         options: &GenerationOptions,
         cancel: Option<&AtomicBool>,
-    ) -> Result<(String, UsageInfo, f64, f64)> {
+        on_text: Option<&mut (dyn FnMut(&str) + '_)>,
+    ) -> Result<Completion> {
         // Bound concurrent heavyweight generations before doing any work.
         let _permit = InFlightGuard::acquire_with(
             &self.in_flight,
@@ -2776,7 +2994,13 @@ impl Engine {
         if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
             // A generation cancelled before any work is an empty completion,
             // matching the decode loop's stop path (and the test contract).
-            return Ok((String::new(), UsageInfo::default(), 0.0, 0.0));
+            return Ok(Completion {
+                text: String::new(),
+                usage: UsageInfo::default(),
+                prefill_tps: 0.0,
+                decode_tps: 0.0,
+                stop_sequence: None,
+            });
         }
         let n_ctx = self.request_n_ctx(options)?;
         // The plugin owns tokenisation, so the prompt length is unknown here;
@@ -2812,8 +3036,15 @@ impl Engine {
                     return Err(JoshuaError::PromptTooLong(n_past, n_ctx));
                 }
                 let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
-                let outcome =
-                    self.decode_loop(&mut session, logits, n_past, &[], options, cancel)?;
+                let outcome = self.decode_loop(
+                    &mut session,
+                    logits,
+                    n_past,
+                    &[],
+                    options,
+                    cancel,
+                    on_text,
+                )?;
                 Ok((n_past, prefill_ms, outcome))
             });
 
@@ -2835,7 +3066,13 @@ impl Engine {
                     completion_tokens: outcome.n_decoded,
                     total_tokens: n_past as u32 + outcome.n_decoded,
                 };
-                Ok((outcome.response, usage, prefill_tps, outcome.decode_tps))
+                Ok(Completion {
+                    text: outcome.response,
+                    usage,
+                    prefill_tps,
+                    decode_tps: outcome.decode_tps,
+                    stop_sequence: outcome.stop_sequence,
+                })
             }
             Err(e @ JoshuaError::PromptTooLong(..)) => {
                 // A request error, not a backend fault: keep the session and
@@ -2861,7 +3098,8 @@ impl Engine {
         prompt: &str,
         options: &GenerationOptions,
     ) -> Result<(String, UsageInfo, f64, f64)> {
-        self.complete_with(prompt, true, options, None, None)
+        self.complete_with(prompt, true, options, None, None, None)
+            .map(Completion::into_tuple)
     }
 
     /// The context window a request may use: its
@@ -2924,7 +3162,8 @@ impl Engine {
         options: &GenerationOptions,
         cancel: Option<&AtomicBool>,
         root_chars: Option<usize>,
-    ) -> Result<(String, UsageInfo, f64, f64)> {
+        mut on_text: Option<&mut (dyn FnMut(&str) + '_)>,
+    ) -> Result<Completion> {
         // Bound concurrent heavyweight generations before doing any work.
         let _permit = InFlightGuard::acquire_with(
             &self.in_flight,
@@ -2934,7 +3173,13 @@ impl Engine {
             cancel,
         )?;
         if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
-            return Ok((String::new(), UsageInfo::default(), 0.0, 0.0));
+            return Ok(Completion {
+                text: String::new(),
+                usage: UsageInfo::default(),
+                prefill_tps: 0.0,
+                decode_tps: 0.0,
+                stop_sequence: None,
+            });
         }
 
         // ── Tokenise ─────────────────────────────────────────────────────────
@@ -2970,20 +3215,31 @@ impl Engine {
         let (mut session, n_reused) = self.acquire_session(prompt_tokens, true)?;
         let was_npu = session.is_npu();
 
-        let result = self.run_generation(&mut session, prompt_tokens, n_reused, options, cancel, root);
+        let streaming = on_text.is_some();
+        let result = self.run_generation(
+            &mut session,
+            prompt_tokens,
+            n_reused,
+            options,
+            cancel,
+            root,
+            on_text.as_deref_mut(),
+        );
         match result {
-            Ok((response, usage, prefill_tps, decode_tps, kv_tokens)) => {
+            Ok((completion, kv_tokens)) => {
                 // Park the instance for reuse by a follow-up request.
                 self.release_model(session, kv_tokens);
-                Ok((response, usage, prefill_tps, decode_tps))
+                Ok(completion)
             }
             // Client errors (`InvalidRequest`) are not backend failures: they
             // must not count against the NPU, and retrying them on the candle
             // path would only reproduce the same error.  They fall through to
-            // the plain error arm below.
+            // the plain error arm below.  A streaming request keeps its SSE
+            // channel open for the error rather than restarting on CPU.
             Err(e)
                 if was_npu
                     && !self.remote_only()
+                    && !streaming
                     && !matches!(e, JoshuaError::InvalidRequest(_)) =>
             {
                 // Count the failure (possibly disabling the backend), drop
@@ -3003,10 +3259,18 @@ impl Engine {
                 }
                 tracing::warn!("Retrying request on the candle path after NPU failure: {e}");
                 let (mut session, n_reused) = self.acquire_session(prompt_tokens, false)?;
-                match self.run_generation(&mut session, prompt_tokens, n_reused, options, cancel, root) {
-                    Ok((response, usage, prefill_tps, decode_tps, kv_tokens)) => {
+                match self.run_generation(
+                    &mut session,
+                    prompt_tokens,
+                    n_reused,
+                    options,
+                    cancel,
+                    root,
+                    None,
+                ) {
+                    Ok((completion, kv_tokens)) => {
                         self.release_model(session, kv_tokens);
-                        Ok((response, usage, prefill_tps, decode_tps))
+                        Ok(completion)
                     }
                     Err(e) => {
                         if session.clear_state() {
@@ -3133,7 +3397,8 @@ impl Engine {
         options: &GenerationOptions,
         cancel: Option<&AtomicBool>,
         root: Option<usize>,
-    ) -> Result<(String, UsageInfo, f64, f64, Vec<u32>)> {
+        on_text: Option<&mut (dyn FnMut(&str) + '_)>,
+    ) -> Result<(Completion, Vec<u32>)> {
         let n_prompt = prompt_tokens.len();
         let new_tokens = &prompt_tokens[n_reused..];
 
@@ -3173,8 +3438,15 @@ impl Engine {
         let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
 
         // ── Repetition-penalty history ────────────────────────────────────────
-        let outcome =
-            self.decode_loop(model, logits_vec, n_prompt, prompt_tokens, options, cancel)?;
+        let outcome = self.decode_loop(
+            model,
+            logits_vec,
+            n_prompt,
+            prompt_tokens,
+            options,
+            cancel,
+            on_text,
+        )?;
         kv_tokens.extend_from_slice(&outcome.fed_tokens);
 
         // Throughput reflects the tokens actually processed in the prefill
@@ -3203,10 +3475,13 @@ impl Engine {
         };
 
         Ok((
-            outcome.response,
-            usage,
-            prefill_tps,
-            outcome.decode_tps,
+            Completion {
+                text: outcome.response,
+                usage,
+                prefill_tps,
+                decode_tps: outcome.decode_tps,
+                stop_sequence: outcome.stop_sequence,
+            },
             kv_tokens,
         ))
     }
@@ -3257,8 +3532,10 @@ impl Engine {
         penalty_seed: &[u32],
         options: &GenerationOptions,
         cancel: Option<&AtomicBool>,
+        mut on_text: Option<&mut (dyn FnMut(&str) + '_)>,
     ) -> Result<DecodeOutcome> {
         let mut text = DecodeText::new(penalty_seed, &self.tokenizer);
+        let mut stream = StreamGate::new(&options.stop_sequences);
         // A fixed seed makes every draw a pure function of (seed, position,
         // stream); without one, pick a request seed once and keep the stream
         // reproducible for the rest of this generation.
@@ -3278,6 +3555,8 @@ impl Engine {
         let mut fed_tokens: Vec<u32> = Vec::new();
         let mut n_cur = start_pos;
         let decode_start = Instant::now();
+        // Which configured stop sequence ended generation, if any.
+        let mut stop_sequence: Option<String> = None;
 
         // Speculative decoding needs a text context to draft from and a
         // session that can verify and roll back.
@@ -3381,7 +3660,10 @@ impl Engine {
                     JoshuaError::Inference(format!("constrained decoding: {e}"))
                 })?;
             }
-            if self.emit_token(&mut text, next_token, options)? {
+            let stopped = self.emit_token(&mut text, next_token, options)?;
+            stream.push(&text.response, stopped.is_some(), on_text.as_deref_mut());
+            if let Some(stop) = stopped {
+                stop_sequence = Some(stop);
                 break;
             }
             if let Some(d) = drafter.as_mut() {
@@ -3461,7 +3743,10 @@ impl Engine {
                         if let Some(d) = drafter.as_mut() {
                             d.push(draft);
                         }
-                        if self.emit_token(&mut text, draft, options)? {
+                        let stopped = self.emit_token(&mut text, draft, options)?;
+                        stream.push(&text.response, stopped.is_some(), on_text.as_deref_mut());
+                        if let Some(matched) = stopped {
+                            stop_sequence = Some(matched);
                             stop = true;
                             break;
                         }
@@ -3513,6 +3798,8 @@ impl Engine {
             model.discard_verify();
         }
 
+        stream.finish(&text.response, on_text.as_deref_mut());
+
         let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
         let n_decoded = text.n_decoded;
         let decode_tps = if decode_ms > 0.0 && n_decoded > 0 {
@@ -3526,18 +3813,19 @@ impl Engine {
             n_decoded,
             fed_tokens,
             decode_tps,
+            stop_sequence,
         })
     }
 
     /// Append one generated token to the response text and the
-    /// repetition-penalty window.  Returns `true` when a stop sequence has
-    /// been reached (the response is trimmed to before it).
+    /// repetition-penalty window.  Returns the matched stop sequence, if any
+    /// (the response is trimmed to before it).
     fn emit_token(
         &self,
         text: &mut DecodeText<'_>,
         token: u32,
         options: &GenerationOptions,
-    ) -> Result<bool> {
+    ) -> Result<Option<String>> {
         if self.byte_level_decode {
             // Byte-level BPE splits multi-byte UTF-8 across token
             // boundaries — a single token can be a lone byte (e.g.
@@ -4365,17 +4653,19 @@ impl Engine {
     }
 
     /// Scan `response` for any configured stop sequence and truncate it.
-    fn check_stop_sequences(response: &mut String, stops: &[String]) -> bool {
+    /// Returns the matched sequence so the caller can report why decoding
+    /// stopped.
+    fn check_stop_sequences(response: &mut String, stops: &[String]) -> Option<String> {
         for stop in stops {
             if stop.is_empty() {
                 continue;
             }
             if response.ends_with(stop.as_str()) {
                 response.truncate(response.len() - stop.len());
-                return true;
+                return Some(stop.clone());
             }
         }
-        false
+        None
     }
 }
 
@@ -7841,6 +8131,49 @@ mod tests {
         assert!(started.elapsed() >= Duration::from_millis(20));
         // The rejected waiter left the count alone.
         assert_eq!(gate.active(), 1);
+    }
+
+    #[test]
+    fn stream_gate_withholds_a_stop_sequence_until_it_is_resolved() {
+        let seen = std::cell::RefCell::new(String::new());
+        let mut sink = |text: &str| seen.borrow_mut().push_str(text);
+        let stops = vec!["END".to_string()];
+        let mut gate = StreamGate::new(&stops);
+
+        // "EN" is a prefix of the stop sequence, so it stays withheld.
+        gate.push("hello EN", false, Some(&mut sink));
+        assert_eq!(&*seen.borrow(), "hello");
+        // The complete sequence trims the response to "hello "; nothing
+        // already sent is retracted and no stop text leaks.
+        gate.push("hello ", true, Some(&mut sink));
+        gate.finish("hello ", Some(&mut sink));
+        assert_eq!(&*seen.borrow(), "hello ");
+    }
+
+    #[test]
+    fn stream_gate_flushes_without_stop_sequences() {
+        let seen = std::cell::RefCell::new(String::new());
+        let mut sink = |text: &str| seen.borrow_mut().push_str(text);
+        let mut gate = StreamGate::new(&[]);
+        gate.push("hel", false, Some(&mut sink));
+        gate.push("lo", false, Some(&mut sink));
+        gate.finish("hello", Some(&mut sink));
+        assert_eq!(&*seen.borrow(), "hello");
+    }
+
+    #[test]
+    fn check_stop_sequences_reports_the_matched_sequence() {
+        let mut response = "hello END".to_string();
+        let stops = vec!["STOP".to_string(), "END".to_string()];
+        assert_eq!(
+            Engine::check_stop_sequences(&mut response, &stops).as_deref(),
+            Some("END")
+        );
+        assert_eq!(response, "hello ");
+
+        let mut response = "nothing here".to_string();
+        assert!(Engine::check_stop_sequences(&mut response, &stops).is_none());
+        assert_eq!(response, "nothing here");
     }
 
     #[test]

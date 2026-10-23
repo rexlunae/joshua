@@ -18,11 +18,20 @@ use common::{model_dir, write_tiny_llama_gguf};
 
 /// Build a `ServerState` around a tiny synthetic llama model.
 fn tiny_state(dir_name: &str, api_key: Option<&str>) -> Arc<ServerState> {
+    tiny_state_with_cors(dir_name, api_key, Vec::new())
+}
+
+fn tiny_state_with_cors(
+    dir_name: &str,
+    api_key: Option<&str>,
+    cors_origins: Vec<String>,
+) -> Arc<ServerState> {
     let dir = model_dir(dir_name);
     write_tiny_llama_gguf(&dir.join("model.gguf"));
     let engine = Engine::with_n_ctx(&dir, 64).expect("engine should load tiny model");
     Arc::new(ServerState {
         api_key: api_key.map(str::to_string),
+        cors_origins,
         ..ServerState::new(Arc::new(engine))
     })
 }
@@ -94,6 +103,26 @@ async fn v1_routes_require_the_configured_api_key() {
     // The right key gets through.
     let res = app.oneshot(get("/v1/models", Some("sekret"))).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn a_key_list_with_no_non_empty_entries_rejects_every_request() {
+    // A misconfigured key list must never silently disable authentication.
+    let app = create_router(tiny_state("server-empty-auth", Some(" , ,")));
+
+    let res = app
+        .clone()
+        .oneshot(get("/v1/models", None))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    // Empty credentials must not match the empty entries either.
+    let res = app
+        .oneshot(get("/v1/models", Some("")))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
 }
 
 #[tokio::test]
@@ -183,6 +212,268 @@ async fn chat_request_settings_are_validated() {
         assert_eq!(status, StatusCode::BAD_REQUEST, "{extra}: {body}");
         assert!(body.contains(needle), "{extra}: {body}");
     }
+}
+
+fn post_json(uri: &str, key: Option<&str>, body: serde_json::Value) -> Request<Body> {
+    let mut req = Request::post(uri).header(header::CONTENT_TYPE, "application/json");
+    if let Some(key) = key {
+        req = req.header(header::AUTHORIZATION, format!("Bearer {key}"));
+    }
+    req.body(Body::from(body.to_string())).unwrap()
+}
+
+async fn body_text(res: axum::response::Response) -> String {
+    let body = axum::body::to_bytes(res.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    String::from_utf8_lossy(&body).to_string()
+}
+
+#[tokio::test]
+async fn ops_endpoints_report_models_load_and_metrics() {
+    let app = create_router(tiny_state("server-ops", Some("sekret")));
+
+    // Liveness is deliberately open, but carries enough to identify a build.
+    let res = app.clone().oneshot(get("/health", None)).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let health: serde_json::Value = serde_json::from_str(&body_text(res).await).unwrap();
+    assert_eq!(health["status"], "ok");
+    assert_eq!(health["models"], 1);
+    assert!(health["version"].is_string());
+
+    // Inventory endpoints require the key.
+    let res = app.clone().oneshot(get("/status", None)).await.unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    let res = app
+        .clone()
+        .oneshot(get("/status", Some("sekret")))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let status: serde_json::Value = serde_json::from_str(&body_text(res).await).unwrap();
+    assert_eq!(status["models"][0]["n_ctx"], 64);
+    assert!(status["metrics"]["http_requests_total"].as_u64().unwrap() >= 1);
+
+    let res = app
+        .clone()
+        .oneshot(get("/metrics", Some("sekret")))
+        .await
+        .unwrap();
+    let metrics: serde_json::Value = serde_json::from_str(&body_text(res).await).unwrap();
+    assert!(metrics["uptime_seconds"].is_u64());
+    assert!(metrics["http_requests_total"].is_u64());
+
+    let res = app
+        .clone()
+        .oneshot(get("/metrics/prometheus", Some("sekret")))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let prometheus = body_text(res).await;
+    assert!(prometheus.contains("joshua_uptime_seconds"));
+    assert!(prometheus.contains("joshua_in_flight_requests"));
+
+    let res = app
+        .clone()
+        .oneshot(get("/props", Some("sekret")))
+        .await
+        .unwrap();
+    let props: serde_json::Value = serde_json::from_str(&body_text(res).await).unwrap();
+    assert_eq!(props["n_ctx"], 64);
+    assert_eq!(props["total_slots"].as_u64().unwrap() >= 1, true);
+
+    let res = app
+        .clone()
+        .oneshot(get("/slots", Some("sekret")))
+        .await
+        .unwrap();
+    let slots: serde_json::Value = serde_json::from_str(&body_text(res).await).unwrap();
+    assert_eq!(slots.as_array().unwrap().len(), 1);
+
+    let res = app
+        .clone()
+        .oneshot(post_json(
+            "/tokenize",
+            Some("sekret"),
+            serde_json::json!({"prompt": "hello world"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let tokens: serde_json::Value = serde_json::from_str(&body_text(res).await).unwrap();
+    assert_eq!(tokens["count"], tokens["tokens"].as_array().unwrap().len());
+    assert!(tokens["count"].as_u64().unwrap() > 0);
+
+    let res = app
+        .oneshot(post_json(
+            "/api/tokens",
+            Some("sekret"),
+            serde_json::json!({"content": "hello"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn x_api_key_and_rotation_keys_are_accepted() {
+    let app = create_router(tiny_state("server-key-rotation", Some("one, two")));
+
+    let res = app
+        .clone()
+        .oneshot(
+            Request::get("/v1/models")
+                .header("x-api-key", "two")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let res = app
+        .clone()
+        .oneshot(get("/v1/models", Some("one")))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let res = app
+        .oneshot(
+            Request::get("/v1/models")
+                .header("x-api-key", "three")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn configured_cors_origins_are_exact() {
+    let app = create_router(tiny_state_with_cors(
+        "server-cors",
+        None,
+        vec!["https://app.example".to_string()],
+    ));
+
+    let res = app
+        .clone()
+        .oneshot(
+            Request::get("/v1/models")
+                .header(header::ORIGIN, "https://app.example")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        res.headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .and_then(|v| v.to_str().ok()),
+        Some("https://app.example")
+    );
+
+    let res = app
+        .oneshot(
+            Request::get("/v1/models")
+                .header(header::ORIGIN, "https://elsewhere.example")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert!(res
+        .headers()
+        .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+        .is_none());
+}
+
+#[tokio::test]
+async fn streaming_chat_reconstructs_the_non_streaming_text() {
+    let app = create_router(tiny_state("server-stream", None));
+    let request = serde_json::json!({
+        "model": "model",
+        "messages": [{"role": "user", "content": "a b"}],
+        "max_tokens": 6,
+        "temperature": 0.0,
+    });
+
+    let (status, body) = chat(app.clone(), request.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let response: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let expected = response["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+
+    let mut streaming = request;
+    streaming["stream"] = serde_json::json!(true);
+    let (status, body) = chat(app, streaming).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let mut text = String::new();
+    let mut content_events = 0;
+    let mut saw_done = false;
+    let mut finish_reason = None;
+    for line in body.lines() {
+        let Some(data) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        if data == "[DONE]" {
+            saw_done = true;
+            continue;
+        }
+        let value: serde_json::Value = serde_json::from_str(data).unwrap();
+        if let Some(content) = value["choices"][0]["delta"]["content"].as_str() {
+            text.push_str(content);
+            content_events += 1;
+        }
+        if let Some(reason) = value["choices"][0]["finish_reason"].as_str() {
+            finish_reason = Some(reason.to_string());
+        }
+    }
+    assert!(saw_done);
+    assert!(content_events >= 1, "expected at least one content event");
+    assert_eq!(text, expected);
+    assert!(finish_reason.is_some());
+}
+
+#[tokio::test]
+async fn anthropic_messages_supports_text_and_streaming() {
+    let app = create_router(tiny_state("server-anthropic", None));
+    let request = serde_json::json!({
+        "model": "model",
+        "max_tokens": 6,
+        "messages": [{"role": "user", "content": "a b"}],
+    });
+
+    let res = app
+        .clone()
+        .oneshot(post_json("/v1/messages", None, request.clone()))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let response: serde_json::Value = serde_json::from_str(&body_text(res).await).unwrap();
+    assert_eq!(response["type"], "message");
+    assert_eq!(response["role"], "assistant");
+    assert!(response["content"].is_array());
+    assert!(response["usage"]["input_tokens"].as_u64().unwrap() > 0);
+
+    let mut streaming = request;
+    streaming["stream"] = serde_json::json!(true);
+    let res = app
+        .oneshot(post_json("/v1/messages", None, streaming))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = body_text(res).await;
+    assert!(body.contains("event: message_start"), "{body}");
+    assert!(body.contains("event: content_block_delta"), "{body}");
+    assert!(body.contains("event: message_stop"), "{body}");
 }
 
 // ─── TLS (only with `cargo test --features tls`) ─────────────────────────────
