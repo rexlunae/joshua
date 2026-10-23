@@ -534,7 +534,9 @@ fn engine_shares_one_weight_set_across_sessions() {
     let model = dir.join("model.gguf");
     common::write_tiny_qwen3moe_gguf(&model);
 
-    let opts = EngineOptions::with_n_ctx(64).expert_placement(ExpertPlacement::Host);
+    let opts = EngineOptions::with_n_ctx(64)
+        .backend(joshua::ComputeBackend::Cpu)
+        .expert_placement(ExpertPlacement::Host);
     let engine = Engine::with_options(&dir, opts).expect("engine should load tiny model");
     assert!(engine.device().is_cpu());
     assert!(engine.expert_device().is_cpu());
@@ -585,7 +587,9 @@ fn vram_expert_cache_settings_reach_the_loader() {
 
     let budgeted = Engine::with_options(
         &dir,
-        EngineOptions::with_n_ctx(64).vram_expert_cache(VramExpertCache::Bytes(3 * SLOT_BYTES)),
+        EngineOptions::with_n_ctx(64)
+            .backend(joshua::ComputeBackend::Cpu)
+            .vram_expert_cache(VramExpertCache::Bytes(3 * SLOT_BYTES)),
     )
     .expect("engine with a fixed VRAM expert-cache budget");
     assert_eq!(
@@ -596,7 +600,9 @@ fn vram_expert_cache_settings_reach_the_loader() {
 
     let off = Engine::with_options(
         &dir,
-        EngineOptions::with_n_ctx(64).vram_expert_cache(VramExpertCache::Disabled),
+        EngineOptions::with_n_ctx(64)
+            .backend(joshua::ComputeBackend::Cpu)
+            .vram_expert_cache(VramExpertCache::Disabled),
     )
     .expect("engine with the cache explicitly disabled");
     assert_eq!(
@@ -605,8 +611,11 @@ fn vram_expert_cache_settings_reach_the_loader() {
         "--vram-expert-cache 0 stays the opt-out"
     );
 
-    let unset = Engine::with_options(&dir, EngineOptions::with_n_ctx(64))
-        .expect("engine with the default setting");
+    let unset = Engine::with_options(
+        &dir,
+        EngineOptions::with_n_ctx(64).backend(joshua::ComputeBackend::Cpu),
+    )
+    .expect("engine with the default setting");
     assert_eq!(
         unset.device_expert_cache(),
         None,

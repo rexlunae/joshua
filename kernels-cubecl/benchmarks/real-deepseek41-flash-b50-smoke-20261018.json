@@ -1,0 +1,199 @@
+{
+  "date": "2026-10-18",
+  "generic": {
+    "after_session_reserved_live": [
+      [
+        9365831680,
+        9223257088
+      ],
+      [
+        9365831680,
+        9223257088
+      ]
+    ],
+    "after_session_rss_kib": [
+      11268796,
+      11268840
+    ],
+    "architecture": "deepseek41",
+    "context": 3,
+    "decode_cpu_fallbacks": [
+      0,
+      0
+    ],
+    "decode_tokens": 2,
+    "elements_by_ggml_dtype": {
+      "0": 515440,
+      "1": 717619200,
+      "10": 196653253120,
+      "12": 385980825600,
+      "8": 6574833664
+    },
+    "engram_disabled": false,
+    "expert_placement": "cpu-mmap",
+    "gpu": "Intel(R) Arc(tm) Pro B50 Graphics (BMG G21)",
+    "greedy_text": "\n\nReferto",
+    "kernel": "generic",
+    "load_seconds": 4.340081152,
+    "loaded_reserved_live": [
+      9365831680,
+      9223257088
+    ],
+    "logit_rows": 3,
+    "max_repeat_logit_difference": 0.0,
+    "median_ms_per_token": 5968.1464395,
+    "model": "/home/tserica/models/DSV41-REAP272E-balanced.gguf",
+    "model_bytes": 290070476416,
+    "ms_per_token": [
+      5968.1464395,
+      5702.9772219999995
+    ],
+    "passes": 2,
+    "peak_reserved_live": [
+      9365831680,
+      9233797120
+    ],
+    "peak_rss_kib": 11268840,
+    "prefill_chunk": 1,
+    "prefill_cpu_fallbacks": [
+      0,
+      0
+    ],
+    "prompt_tokens": 1,
+    "tokens_per_second": 0.16755621031372986,
+    "top1": [
+      271,
+      37842,
+      1495
+    ],
+    "vocab": 129280,
+    "warm_decode": 1,
+    "warm_reserved_live": [
+      9365831680,
+      9223257088
+    ],
+    "warm_rss_kib": 8367664
+  },
+  "cubecl": {
+    "after_session_reserved_live": [
+      [
+        9365831680,
+        9223257088
+      ],
+      [
+        9365831680,
+        9223257088
+      ]
+    ],
+    "after_session_rss_kib": [
+      11269408,
+      11269420
+    ],
+    "architecture": "deepseek41",
+    "context": 3,
+    "decode_cpu_fallbacks": [
+      0,
+      0
+    ],
+    "decode_tokens": 2,
+    "elements_by_ggml_dtype": {
+      "0": 515440,
+      "1": 717619200,
+      "10": 196653253120,
+      "12": 385980825600,
+      "8": 6574833664
+    },
+    "engram_disabled": false,
+    "expert_placement": "cpu-mmap",
+    "gpu": "Intel(R) Arc(tm) Pro B50 Graphics (BMG G21)",
+    "greedy_text": "\n\nReferto",
+    "kernel": "cubecl",
+    "load_seconds": 3.001588634,
+    "loaded_reserved_live": [
+      9365831680,
+      9223257088
+    ],
+    "logit_rows": 3,
+    "max_repeat_logit_difference": 0.0,
+    "median_ms_per_token": 3381.9998349999996,
+    "model": "/home/tserica/models/DSV41-REAP272E-balanced.gguf",
+    "model_bytes": 290070476416,
+    "ms_per_token": [
+      3352.3735079999997,
+      3381.9998349999996
+    ],
+    "passes": 2,
+    "peak_reserved_live": [
+      9365831680,
+      9233797120
+    ],
+    "peak_rss_kib": 11269420,
+    "prefill_chunk": 1,
+    "prefill_cpu_fallbacks": [
+      0,
+      0
+    ],
+    "prompt_tokens": 1,
+    "tokens_per_second": 0.2956830422199001,
+    "top1": [
+      271,
+      37842,
+      1495
+    ],
+    "vocab": 129280,
+    "warm_decode": 1,
+    "warm_reserved_live": [
+      9365831680,
+      9223257088
+    ],
+    "warm_rss_kib": 8369476
+  },
+  "prompt_ids": [
+    65106
+  ],
+  "decode_input_ids": [
+    271,
+    37842
+  ],
+  "speedup": 1.7646796956452249,
+  "output_comparison": {
+    "logits_compared": 387840,
+    "max_abs": 3.790855407714844e-05,
+    "rms_abs": 7.565446615519207e-06,
+    "absolute_difference_p50_p95_p99": [
+      5.066394805908203e-06,
+      1.4781951904296875e-05,
+      1.9788742065429688e-05
+    ],
+    "max_abs_by_row": [
+      3.4332275390625e-05,
+      3.790855407714844e-05,
+      3.0517578125e-05
+    ],
+    "top1_matching_rows": 3,
+    "rows": 3,
+    "top1_ids_match": true,
+    "greedy_text_match": true,
+    "max_softmax_kl_generic_to_cubecl": 3.363251954833175e-11,
+    "within_absolute_1e_5": false
+  },
+  "memory_comparison": {
+    "loaded_device_bytes_identical": true,
+    "warm_device_bytes_identical": true,
+    "sampled_peak_device_bytes_identical": true,
+    "after_session_device_bytes_identical": true,
+    "generic_after_sessions_stable": true,
+    "cubecl_after_sessions_stable": true
+  },
+  "notes": [
+    "Initial 64-lane Q8_0 experiment; final candidate uses 256 lanes to match generic reduction order.",
+    "One prompt token, two decode tokens, two shared-weight sessions; a smoke measurement only.",
+    "CPU mmap-backed routed experts and engram enabled; dense weights on native Vulkan B50.",
+    "Maximum logit difference exceeds strict 1e-5; this result does not qualify new formats for default dispatch."
+  ],
+  "kernel_workgroups": {
+    "Q4_K": 64,
+    "Q8_0": 64,
+    "Q2_K": 64
+  }
+}

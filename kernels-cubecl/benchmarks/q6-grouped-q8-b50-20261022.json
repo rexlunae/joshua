@@ -1,0 +1,4220 @@
+{
+  "date": "2026-10-22",
+  "pr": "https://github.com/rexlunae/joshua/pull/198",
+  "hardware": {
+    "gpu": "Intel Arc Pro B50 8086:E212",
+    "pci": "0000:03:00.0",
+    "driver": "Mesa 26.0.8-1ubuntu0.3",
+    "vulkan": "1.4.335",
+    "host_ram_note": "approximately 74 GiB; mmap I/O remains included in timings"
+  },
+  "manifest": {
+    "started_at_utc": "2026-10-23T03:05:28.800908+00:00",
+    "head": "2a2be40ee5e58a50d0d1f113fe217b1d9f355c04",
+    "baseline": "CubeClExpanded: generic Q6_K and generic grouped projection",
+    "candidate": "CubeClNext",
+    "runs": [
+      {
+        "name": "qwen8-baseline-chunk32",
+        "argv": [
+          "/home/tserica/joshua/target/release/examples/bench_cubecl_real",
+          "--model",
+          "/home/tserica/models/qwen3-dense/Qwen3-8B-Q4_K_M.gguf",
+          "--tokenizer",
+          "/home/tserica/models/qwen3-dense/tokenizer.json",
+          "--kernel",
+          "cubecl",
+          "--output",
+          "/home/tserica/benchmark-results/cubecl-b50-20261022-pr198/qwen8-baseline-chunk32",
+          "--prompt-file",
+          "/home/tserica/joshua/kernels-cubecl/benchmarks/deepseek-realistic-prompt.txt",
+          "--chat",
+          "--prefill-chunk",
+          "32",
+          "--decode",
+          "128",
+          "--passes",
+          "2",
+          "--warm-prompt-tokens",
+          "8",
+          "--warm-decode",
+          "2",
+          "--decode-text-file",
+          "/home/tserica/joshua/kernels-cubecl/benchmarks/deepseek-diverse-continuation.txt"
+        ],
+        "started_at_utc": "2026-10-23T03:05:28.817168+00:00",
+        "exit_code": 1,
+        "finished_at_utc": "2026-10-23T03:06:23.244310+00:00"
+      },
+      {
+        "name": "qwen8-baseline-chunk1",
+        "argv": [
+          "/home/tserica/joshua/target/release/examples/bench_cubecl_real",
+          "--model",
+          "/home/tserica/models/qwen3-dense/Qwen3-8B-Q4_K_M.gguf",
+          "--tokenizer",
+          "/home/tserica/models/qwen3-dense/tokenizer.json",
+          "--kernel",
+          "cubecl",
+          "--output",
+          "/home/tserica/benchmark-results/cubecl-b50-20261022-pr198/qwen8-baseline-chunk1",
+          "--prompt-file",
+          "/home/tserica/joshua/kernels-cubecl/benchmarks/deepseek-realistic-prompt.txt",
+          "--chat",
+          "--prefill-chunk",
+          "1",
+          "--decode",
+          "128",
+          "--passes",
+          "2",
+          "--warm-prompt-tokens",
+          "8",
+          "--warm-decode",
+          "2",
+          "--decode-text-file",
+          "/home/tserica/joshua/kernels-cubecl/benchmarks/deepseek-diverse-continuation.txt"
+        ],
+        "started_at_utc": "2026-10-23T03:06:23.244577+00:00",
+        "exit_code": 0,
+        "finished_at_utc": "2026-10-23T03:10:37.816959+00:00",
+        "cpu_fallbacks": [
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      {
+        "name": "qwen8-candidate-chunk1",
+        "argv": [
+          "/home/tserica/joshua/target/release/examples/bench_cubecl_real",
+          "--model",
+          "/home/tserica/models/qwen3-dense/Qwen3-8B-Q4_K_M.gguf",
+          "--tokenizer",
+          "/home/tserica/models/qwen3-dense/tokenizer.json",
+          "--kernel",
+          "cubecl-next",
+          "--output",
+          "/home/tserica/benchmark-results/cubecl-b50-20261022-pr198/qwen8-candidate-chunk1",
+          "--prompt-file",
+          "/home/tserica/joshua/kernels-cubecl/benchmarks/deepseek-realistic-prompt.txt",
+          "--chat",
+          "--prefill-chunk",
+          "1",
+          "--decode",
+          "128",
+          "--passes",
+          "2",
+          "--warm-prompt-tokens",
+          "8",
+          "--warm-decode",
+          "2",
+          "--reference",
+          "/home/tserica/benchmark-results/cubecl-b50-20261022-pr198/qwen8-baseline-chunk1/trace.json"
+        ],
+        "started_at_utc": "2026-10-23T03:10:37.819025+00:00",
+        "exit_code": 0,
+        "finished_at_utc": "2026-10-23T03:12:18.285912+00:00",
+        "cpu_fallbacks": [
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      {
+        "name": "qwen8-baseline-chunk32",
+        "argv": [
+          "/home/tserica/joshua/target/release/examples/bench_cubecl_real",
+          "--model",
+          "/home/tserica/models/qwen3-dense/Qwen3-8B-Q4_K_M.gguf",
+          "--tokenizer",
+          "/home/tserica/models/qwen3-dense/tokenizer.json",
+          "--kernel",
+          "cubecl",
+          "--output",
+          "/home/tserica/benchmark-results/cubecl-b50-20261022-pr198/qwen8-baseline-chunk32",
+          "--prompt-file",
+          "/home/tserica/joshua/kernels-cubecl/benchmarks/deepseek-realistic-prompt.txt",
+          "--chat",
+          "--prefill-chunk",
+          "32",
+          "--decode",
+          "128",
+          "--passes",
+          "2",
+          "--warm-prompt-tokens",
+          "8",
+          "--warm-decode",
+          "2",
+          "--decode-text-file",
+          "/home/tserica/joshua/kernels-cubecl/benchmarks/deepseek-diverse-continuation.txt"
+        ],
+        "started_at_utc": "2026-10-23T03:12:50.897975+00:00",
+        "exit_code": 1,
+        "finished_at_utc": "2026-10-23T03:13:44.425396+00:00"
+      },
+      {
+        "name": "deepseek41-baseline-chunk32",
+        "argv": [
+          "/home/tserica/joshua/target/release/examples/bench_cubecl_real",
+          "--model",
+          "/home/tserica/models/DSV41-REAP272E-balanced.gguf",
+          "--tokenizer",
+          "/home/tserica/models/DeepSeek-V4.1-Flash-REAP-272E/tokenizer.json",
+          "--kernel",
+          "cubecl",
+          "--output",
+          "/home/tserica/benchmark-results/cubecl-b50-20261022-pr198/deepseek41-baseline-chunk32",
+          "--prompt-file",
+          "/home/tserica/joshua/kernels-cubecl/benchmarks/deepseek-realistic-prompt.txt",
+          "--chat",
+          "--prefill-chunk",
+          "32",
+          "--decode",
+          "128",
+          "--passes",
+          "2",
+          "--warm-prompt-tokens",
+          "8",
+          "--warm-decode",
+          "2",
+          "--decode-text-file",
+          "/home/tserica/joshua/kernels-cubecl/benchmarks/deepseek-diverse-continuation.txt"
+        ],
+        "started_at_utc": "2026-10-23T03:13:44.912952+00:00",
+        "exit_code": 0,
+        "finished_at_utc": "2026-10-23T03:31:53.562686+00:00",
+        "cpu_fallbacks": [
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      {
+        "name": "deepseek41-candidate-chunk32",
+        "argv": [
+          "/home/tserica/joshua/target/release/examples/bench_cubecl_real",
+          "--model",
+          "/home/tserica/models/DSV41-REAP272E-balanced.gguf",
+          "--tokenizer",
+          "/home/tserica/models/DeepSeek-V4.1-Flash-REAP-272E/tokenizer.json",
+          "--kernel",
+          "cubecl-next",
+          "--output",
+          "/home/tserica/benchmark-results/cubecl-b50-20261022-pr198/deepseek41-candidate-chunk32",
+          "--prompt-file",
+          "/home/tserica/joshua/kernels-cubecl/benchmarks/deepseek-realistic-prompt.txt",
+          "--chat",
+          "--prefill-chunk",
+          "32",
+          "--decode",
+          "128",
+          "--passes",
+          "2",
+          "--warm-prompt-tokens",
+          "8",
+          "--warm-decode",
+          "2",
+          "--reference",
+          "/home/tserica/benchmark-results/cubecl-b50-20261022-pr198/deepseek41-baseline-chunk32/trace.json"
+        ],
+        "started_at_utc": "2026-10-23T03:31:53.578615+00:00",
+        "exit_code": 0,
+        "finished_at_utc": "2026-10-23T03:37:07.768830+00:00",
+        "cpu_fallbacks": [
+          0,
+          0,
+          0,
+          0
+        ]
+      }
+    ],
+    "source_sha256": {
+      "target/release/examples/bench_cubecl_real": "de2dfe0a99feae89a1d0299d193c6e985a7eb9185a3cfdab554992a9f117658c",
+      "examples/bench_cubecl_real.rs": "8abdac6dfae247f55f44f0dc54176a40b8659672da8027f8d17a56c2d9d44779",
+      "src/attention.rs": "66d0447beb5964247c57ed78f063ded4f026f1f1e32cbdf0ac6dc896a7361082",
+      "vendor/candle-core/src/vulkan_backend/kernels.rs": "33b49847d7c0fc2ed1fdb23ec6c12b0f7c00b2acfbacfe30ea6f226be5f60062",
+      "vendor/candle-core/src/vulkan_backend/q6k_cubecl.wgsl": "39d9ef5b1bdae58653fab4f219773a3dd540fe6ee3b4d8ed1e68e876622ba7e2",
+      "vendor/candle-core/src/vulkan_backend/grouped_q8_cubecl.wgsl": "5d36f17957b4653483d0d47042be9e3176a143b9074969c9d5cef5d54a3961c6"
+    },
+    "finished_at_utc": "2026-10-23T03:37:08.818492+00:00"
+  },
+  "raw_results_directory": "/home/tserica/benchmark-results/cubecl-b50-20261022-pr198",
+  "absolute_logit_tolerance": 1e-05,
+  "baseline_note": "Previous-production CubeClExpanded: generic Vulkan for Q6_K and grouped Q8; previously validated CubeCL Q4_K/Q8_0/Q2_K stay identical between paths.",
+  "protocol": "Complete realistic chat prompt, same 128 teacher-forced decode inputs, two sessions per path, serial separate processes. Forward, full-vocabulary logits readback and argmax included. Load/shader warmup excluded. No concurrent GPU benchmark or build.",
+  "runs": {
+    "qwen8": {
+      "date": "2026-10-22",
+      "generic": {
+        "after_session_driver_memory_bytes": [
+          {
+            "drm-resident-gtt": 2097152,
+            "drm-resident-stolen": 0,
+            "drm-resident-system": 0,
+            "drm-resident-vram0": 5268217856,
+            "drm-total-gtt": 2097152,
+            "drm-total-stolen": 0,
+            "drm-total-system": 0,
+            "drm-total-vram0": 5268217856
+          },
+          {
+            "drm-resident-gtt": 2097152,
+            "drm-resident-stolen": 0,
+            "drm-resident-system": 0,
+            "drm-resident-vram0": 5268217856,
+            "drm-total-gtt": 2097152,
+            "drm-total-stolen": 0,
+            "drm-total-system": 0,
+            "drm-total-vram0": 5268217856
+          }
+        ],
+        "after_session_expert_cache_reports": [
+          null,
+          null
+        ],
+        "after_session_host_memory_kib": [
+          {
+            "RssAnon": 165960,
+            "RssFile": 66640,
+            "RssShmem": 36,
+            "VmRSS": 232636,
+            "VmSwap": 0
+          },
+          {
+            "RssAnon": 165960,
+            "RssFile": 66640,
+            "RssShmem": 36,
+            "VmRSS": 232636,
+            "VmSwap": 0
+          }
+        ],
+        "after_session_io_counters": [
+          {
+            "cancelled_write_bytes": 0,
+            "rchar": 5047361540,
+            "read_bytes": 3321843712,
+            "syscr": 1544796,
+            "syscw": 155,
+            "wchar": 5676,
+            "write_bytes": 24576
+          },
+          {
+            "cancelled_write_bytes": 0,
+            "rchar": 5048823614,
+            "read_bytes": 3321843712,
+            "syscr": 1565718,
+            "syscw": 298,
+            "wchar": 10222,
+            "write_bytes": 45056
+          }
+        ],
+        "after_session_reserved_live": [
+          [
+            5227622400,
+            5042798592
+          ],
+          [
+            5227622400,
+            5042798592
+          ]
+        ],
+        "after_session_rss_kib": [
+          232636,
+          232636
+        ],
+        "allocator_stats_available": true,
+        "architecture": "qwen3",
+        "attention_output_a_gguf_shapes": {},
+        "attention_output_groups": null,
+        "auto_dense_cpu": false,
+        "auto_placement": false,
+        "backend": "vulkan",
+        "chat": true,
+        "context": 254,
+        "cubecl_formats": [
+          8,
+          10,
+          12
+        ],
+        "decode_cpu_fallbacks": [
+          0,
+          0
+        ],
+        "decode_text_file": "/home/tserica/joshua/kernels-cubecl/benchmarks/deepseek-diverse-continuation.txt",
+        "decode_tokens": 128,
+        "dense_device": "Intel(R) Arc(tm) Pro B50 Graphics (BMG G21)",
+        "dispatch": "CubeClExpanded",
+        "driver_memory_after": {
+          "drm-resident-gtt": 2097152,
+          "drm-resident-stolen": 0,
+          "drm-resident-system": 0,
+          "drm-resident-vram0": 5268217856,
+          "drm-total-gtt": 2097152,
+          "drm-total-stolen": 0,
+          "drm-total-system": 0,
+          "drm-total-vram0": 5268217856
+        },
+        "elements_by_ggml_dtype": {
+          "0": 308224,
+          "12": 6586630144,
+          "14": 1603796992
+        },
+        "engram_disabled": false,
+        "expert_cache_budget_bytes": null,
+        "expert_cache_report": null,
+        "expert_device": "Intel(R) Arc(tm) Pro B50 Graphics (BMG G21)",
+        "expert_placement": "model-device",
+        "explicit_dense_cpu": false,
+        "explicit_expert_cache_mib": null,
+        "gpu": "Intel(R) Arc(tm) Pro B50 Graphics (BMG G21)",
+        "greedy_text": "<think> the of of memory for the modelized weights, a it across all. Use KV has is be the layers, activation KV KV cache, and buffersspaces, and the buffer buffer model. For room for allocating new request. For the, if 16 GiB GPU can allow  1 GiB to dense weights,   GiB for KV and work.. with this exact allocation depends be from the.Theill and requests in parallel bursts, that single sequence can block others decode.. Decode a priority of pending-to and and decode decode generation in parallel separate order, and inter the to attention. steps windows steps",
+        "kernel": "cubecl",
+        "load_seconds": 2.042727245,
+        "loaded_host_memory_kib": {
+          "RssAnon": 92492,
+          "RssFile": 66320,
+          "RssShmem": 36,
+          "VmRSS": 158848,
+          "VmSwap": 0
+        },
+        "loaded_io_counters": {
+          "cancelled_write_bytes": 0,
+          "rchar": 5045731221,
+          "read_bytes": 3321831424,
+          "syscr": 1523832,
+          "syscw": 2,
+          "wchar": 210,
+          "write_bytes": 4096
+        },
+        "loaded_reserved_live": [
+          5227622400,
+          5042798592
+        ],
+        "logit_rows": 129,
+        "max_repeat_logit_difference": 0.0,
+        "median_ms_per_token": 490.6173637148439,
+        "model": "/home/tserica/models/qwen3-dense/Qwen3-8B-Q4_K_M.gguf",
+        "model_bytes": 5027783488,
+        "ms_per_token": [
+          489.91220081250026,
+          491.3225266171875
+        ],
+        "passes": 2,
+        "peak_reserved_live": [
+          5227622400,
+          5118296064
+        ],
+        "peak_rss_kib": 232636,
+        "placement_probe_skipped": false,
+        "prefill_chunk": 1,
+        "prefill_cpu_fallbacks": [
+          0,
+          0
+        ],
+        "prefill_ms": [
+          60426.723243,
+          61109.100661
+        ],
+        "prompt_file": "/home/tserica/joshua/kernels-cubecl/benchmarks/deepseek-realistic-prompt.txt",
+        "prompt_tokens": 126,
+        "reference_logits_bytes": 78398976,
+        "tokens_per_second": 2.038248284626997,
+        "top1": [
+          151667,
+          279,
+          315,
+          315,
+          4938,
+          369,
+          279,
+          1614,
+          1506,
+          14324,
+          11,
+          264,
+          432,
+          3941,
+          678,
+          13,
+          5443,
+          84648,
+          702,
+          374,
+          387,
+          279,
+          13617,
+          11,
+          15099,
+          84648,
+          84648,
+          6500,
+          11,
+          323,
+          27389,
+          44285,
+          11,
+          323,
+          279,
+          4147,
+          4147,
+          1614,
+          13,
+          1752,
+          220,
+          2966,
+          369,
+          72762,
+          501,
+          1681,
+          13,
+          1752,
+          279,
+          11,
+          421,
+          220,
+          16,
+          21,
+          15392,
+          33,
+          22670,
+          646,
+          2138,
+          220,
+          220,
+          16,
+          15392,
+          33,
+          311,
+          27950,
+          14324,
+          11,
+          220,
+          220,
+          15392,
+          33,
+          369,
+          84648,
+          323,
+          975,
+          13,
+          13,
+          448,
+          419,
+          4734,
+          23757,
+          13798,
+          387,
+          504,
+          279,
+          13,
+          785,
+          483,
+          323,
+          7388,
+          304,
+          15279,
+          65701,
+          11,
+          429,
+          3175,
+          8500,
+          646,
+          2504,
+          3800,
+          16895,
+          13,
+          13,
+          50194,
+          264,
+          10619,
+          315,
+          15280,
+          4686,
+          323,
+          323,
+          16895,
+          16895,
+          9471,
+          304,
+          15279,
+          8651,
+          1973,
+          11,
+          323,
+          946,
+          279,
+          311,
+          6529,
+          13,
+          7354,
+          11030,
+          7354
+        ],
+        "vocab": 151936,
+        "warm_decode": 2,
+        "warm_host_memory_kib": {
+          "RssAnon": 164180,
+          "RssFile": 66640,
+          "RssShmem": 36,
+          "VmRSS": 230856,
+          "VmSwap": 0
+        },
+        "warm_io_counters": {
+          "cancelled_write_bytes": 0,
+          "rchar": 5045899655,
+          "read_bytes": 3321843712,
+          "syscr": 1523874,
+          "syscw": 13,
+          "wchar": 1235,
+          "write_bytes": 8192
+        },
+        "warm_prompt_tokens": 8,
+        "warm_reserved_live": [
+          5227622400,
+          5042798592
+        ],
+        "warm_rss_kib": 230856,
+        "memory_samples_count": 508,
+        "memory_samples_sha256": "d6c7dee9dba85351169d9e86677c119b77b4260967c1191612e8b0c58b011591",
+        "sample_ranges": {
+          "prefill_pass1": {
+            "position": [
+              1,
+              126
+            ],
+            "reserved_bytes": [
+              5227622400,
+              5227622400
+            ],
+            "live_bytes": [
+              5047517184,
+              5080547328
+            ],
+            "total_anonymous_kib": [
+              165364,
+              165960
+            ],
+            "file_kib": [
+              66640,
+              66640
+            ]
+          },
+          "prefill_pass2": {
+            "position": [
+              1,
+              126
+            ],
+            "reserved_bytes": [
+              5227622400,
+              5227622400
+            ],
+            "live_bytes": [
+              5047517184,
+              5080547328
+            ],
+            "total_anonymous_kib": [
+              165960,
+              165960
+            ],
+            "file_kib": [
+              66640,
+              66640
+            ]
+          },
+          "decode_pass1": {
+            "position": [
+              127,
+              254
+            ],
+            "reserved_bytes": [
+              5227622400,
+              5227622400
+            ],
+            "live_bytes": [
+              5080547328,
+              5118296064
+            ],
+            "total_anonymous_kib": [
+              165960,
+              165960
+            ],
+            "file_kib": [
+              66640,
+              66640
+            ]
+          },
+          "decode_pass2": {
+            "position": [
+              127,
+              254
+            ],
+            "reserved_bytes": [
+              5227622400,
+              5227622400
+            ],
+            "live_bytes": [
+              5080547328,
+              5118296064
+            ],
+            "total_anonymous_kib": [
+              165960,
+              165960
+            ],
+            "file_kib": [
+              66640,
+              66640
+            ]
+          }
+        }
+      },
+      "cubecl": {
+        "after_session_driver_memory_bytes": [
+          {
+            "drm-resident-gtt": 2097152,
+            "drm-resident-stolen": 0,
+            "drm-resident-system": 0,
+            "drm-resident-vram0": 5268217856,
+            "drm-total-gtt": 2097152,
+            "drm-total-stolen": 0,
+            "drm-total-system": 0,
+            "drm-total-vram0": 5268217856
+          },
+          {
+            "drm-resident-gtt": 2097152,
+            "drm-resident-stolen": 0,
+            "drm-resident-system": 0,
+            "drm-resident-vram0": 5268217856,
+            "drm-total-gtt": 2097152,
+            "drm-total-stolen": 0,
+            "drm-total-system": 0,
+            "drm-total-vram0": 5268217856
+          }
+        ],
+        "after_session_expert_cache_reports": [
+          null,
+          null
+        ],
+        "after_session_host_memory_kib": [
+          {
+            "RssAnon": 165964,
+            "RssFile": 65592,
+            "RssShmem": 36,
+            "VmRSS": 231592,
+            "VmSwap": 0
+          },
+          {
+            "RssAnon": 165964,
+            "RssFile": 65720,
+            "RssShmem": 36,
+            "VmRSS": 231720,
+            "VmSwap": 0
+          }
+        ],
+        "after_session_io_counters": [
+          {
+            "cancelled_write_bytes": 0,
+            "rchar": 5047297463,
+            "read_bytes": 12288,
+            "syscr": 1547311,
+            "syscw": 154,
+            "wchar": 5019,
+            "write_bytes": 12288
+          },
+          {
+            "cancelled_write_bytes": 0,
+            "rchar": 5048758999,
+            "read_bytes": 12288,
+            "syscr": 1568233,
+            "syscw": 297,
+            "wchar": 9565,
+            "write_bytes": 24576
+          }
+        ],
+        "after_session_reserved_live": [
+          [
+            5227622400,
+            5042798592
+          ],
+          [
+            5227622400,
+            5042798592
+          ]
+        ],
+        "after_session_rss_kib": [
+          231592,
+          231720
+        ],
+        "allocator_stats_available": true,
+        "architecture": "qwen3",
+        "attention_output_a_gguf_shapes": {},
+        "attention_output_groups": null,
+        "auto_dense_cpu": false,
+        "auto_placement": false,
+        "backend": "vulkan",
+        "chat": true,
+        "context": 254,
+        "cubecl_formats": [
+          8,
+          10,
+          12,
+          14
+        ],
+        "decode_cpu_fallbacks": [
+          0,
+          0
+        ],
+        "decode_text_file": null,
+        "decode_tokens": 128,
+        "dense_device": "Intel(R) Arc(tm) Pro B50 Graphics (BMG G21)",
+        "dispatch": "CubeClNext",
+        "driver_memory_after": {
+          "drm-resident-gtt": 2097152,
+          "drm-resident-stolen": 0,
+          "drm-resident-system": 0,
+          "drm-resident-vram0": 5268217856,
+          "drm-total-gtt": 2097152,
+          "drm-total-stolen": 0,
+          "drm-total-system": 0,
+          "drm-total-vram0": 5268217856
+        },
+        "elements_by_ggml_dtype": {
+          "0": 308224,
+          "12": 6586630144,
+          "14": 1603796992
+        },
+        "engram_disabled": false,
+        "expert_cache_budget_bytes": null,
+        "expert_cache_report": null,
+        "expert_device": "Intel(R) Arc(tm) Pro B50 Graphics (BMG G21)",
+        "expert_placement": "model-device",
+        "explicit_dense_cpu": false,
+        "explicit_expert_cache_mib": null,
+        "gpu": "Intel(R) Arc(tm) Pro B50 Graphics (BMG G21)",
+        "greedy_text": "<think> the of of memory for the modelized weights, a it across all. Use KV has is be the layers, activation KV KV cache, and buffersspaces, and the buffer buffer model. For room for allocating new request. For the, if 16 GiB GPU can allow  1 GiB to dense weights,   GiB for KV and work.. with this exact allocation depends be from the.Theill and requests in parallel bursts, that single sequence can block others decode.. Decode a priority of pending-to and and decode decode generation in parallel separate order, and inter the to attention. steps windows steps",
+        "kernel": "cubecl-next",
+        "load_seconds": 1.30915579,
+        "loaded_host_memory_kib": {
+          "RssAnon": 92496,
+          "RssFile": 65368,
+          "RssShmem": 36,
+          "VmRSS": 157900,
+          "VmSwap": 0
+        },
+        "loaded_io_counters": {
+          "cancelled_write_bytes": 0,
+          "rchar": 5045731686,
+          "read_bytes": 0,
+          "syscr": 1526347,
+          "syscw": 2,
+          "wchar": 215,
+          "write_bytes": 4096
+        },
+        "loaded_reserved_live": [
+          5227622400,
+          5042798592
+        ],
+        "logit_rows": 129,
+        "max_repeat_logit_difference": 0.0,
+        "median_ms_per_token": 192.99781362499994,
+        "model": "/home/tserica/models/qwen3-dense/Qwen3-8B-Q4_K_M.gguf",
+        "model_bytes": 5027783488,
+        "ms_per_token": [
+          193.81486172656247,
+          192.18076552343737
+        ],
+        "passes": 2,
+        "peak_reserved_live": [
+          5227622400,
+          5118296064
+        ],
+        "peak_rss_kib": 231720,
+        "placement_probe_skipped": false,
+        "prefill_chunk": 1,
+        "prefill_cpu_fallbacks": [
+          0,
+          0
+        ],
+        "prefill_ms": [
+          23544.449624999997,
+          23674.864316
+        ],
+        "prompt_file": "/home/tserica/joshua/kernels-cubecl/benchmarks/deepseek-realistic-prompt.txt",
+        "prompt_tokens": 126,
+        "reference_logits_bytes": 78398976,
+        "tokens_per_second": 5.181405847130619,
+        "top1": [
+          151667,
+          279,
+          315,
+          315,
+          4938,
+          369,
+          279,
+          1614,
+          1506,
+          14324,
+          11,
+          264,
+          432,
+          3941,
+          678,
+          13,
+          5443,
+          84648,
+          702,
+          374,
+          387,
+          279,
+          13617,
+          11,
+          15099,
+          84648,
+          84648,
+          6500,
+          11,
+          323,
+          27389,
+          44285,
+          11,
+          323,
+          279,
+          4147,
+          4147,
+          1614,
+          13,
+          1752,
+          220,
+          2966,
+          369,
+          72762,
+          501,
+          1681,
+          13,
+          1752,
+          279,
+          11,
+          421,
+          220,
+          16,
+          21,
+          15392,
+          33,
+          22670,
+          646,
+          2138,
+          220,
+          220,
+          16,
+          15392,
+          33,
+          311,
+          27950,
+          14324,
+          11,
+          220,
+          220,
+          15392,
+          33,
+          369,
+          84648,
+          323,
+          975,
+          13,
+          13,
+          448,
+          419,
+          4734,
+          23757,
+          13798,
+          387,
+          504,
+          279,
+          13,
+          785,
+          483,
+          323,
+          7388,
+          304,
+          15279,
+          65701,
+          11,
+          429,
+          3175,
+          8500,
+          646,
+          2504,
+          3800,
+          16895,
+          13,
+          13,
+          50194,
+          264,
+          10619,
+          315,
+          15280,
+          4686,
+          323,
+          323,
+          16895,
+          16895,
+          9471,
+          304,
+          15279,
+          8651,
+          1973,
+          11,
+          323,
+          946,
+          279,
+          311,
+          6529,
+          13,
+          7354,
+          11030,
+          7354
+        ],
+        "vocab": 151936,
+        "warm_decode": 2,
+        "warm_host_memory_kib": {
+          "RssAnon": 164184,
+          "RssFile": 65592,
+          "RssShmem": 36,
+          "VmRSS": 229812,
+          "VmSwap": 0
+        },
+        "warm_io_counters": {
+          "cancelled_write_bytes": 0,
+          "rchar": 5045836374,
+          "read_bytes": 12288,
+          "syscr": 1526389,
+          "syscw": 12,
+          "wchar": 578,
+          "write_bytes": 4096
+        },
+        "warm_prompt_tokens": 8,
+        "warm_reserved_live": [
+          5227622400,
+          5042798592
+        ],
+        "warm_rss_kib": 229812,
+        "memory_samples_count": 508,
+        "memory_samples_sha256": "121f436427dc54d4aaa23d6fa68bb04f81c8e4b054f77121a31dcb541f76166f",
+        "sample_ranges": {
+          "prefill_pass1": {
+            "position": [
+              1,
+              126
+            ],
+            "reserved_bytes": [
+              5227622400,
+              5227622400
+            ],
+            "live_bytes": [
+              5047517184,
+              5080547328
+            ],
+            "total_anonymous_kib": [
+              165372,
+              165964
+            ],
+            "file_kib": [
+              65592,
+              65592
+            ]
+          },
+          "prefill_pass2": {
+            "position": [
+              1,
+              126
+            ],
+            "reserved_bytes": [
+              5227622400,
+              5227622400
+            ],
+            "live_bytes": [
+              5047517184,
+              5080547328
+            ],
+            "total_anonymous_kib": [
+              165964,
+              165964
+            ],
+            "file_kib": [
+              65720,
+              65720
+            ]
+          },
+          "decode_pass1": {
+            "position": [
+              127,
+              254
+            ],
+            "reserved_bytes": [
+              5227622400,
+              5227622400
+            ],
+            "live_bytes": [
+              5080547328,
+              5118296064
+            ],
+            "total_anonymous_kib": [
+              165964,
+              165964
+            ],
+            "file_kib": [
+              65592,
+              65592
+            ]
+          },
+          "decode_pass2": {
+            "position": [
+              127,
+              254
+            ],
+            "reserved_bytes": [
+              5227622400,
+              5227622400
+            ],
+            "live_bytes": [
+              5080547328,
+              5118296064
+            ],
+            "total_anonymous_kib": [
+              165964,
+              165964
+            ],
+            "file_kib": [
+              65720,
+              65720
+            ]
+          }
+        }
+      },
+      "prompt_ids": [
+        151644,
+        872,
+        198,
+        20470,
+        264,
+        33789,
+        4128,
+        28244,
+        13480,
+        4712,
+        369,
+        264,
+        95891,
+        448,
+        220,
+        21,
+        19,
+        15392,
+        33,
+        315,
+        1849,
+        22038,
+        323,
+        264,
+        220,
+        16,
+        21,
+        15392,
+        33,
+        22670,
+        13,
+        1084,
+        1969,
+        8683,
+        3040,
+        34035,
+        7388,
+        448,
+        6094,
+        10272,
+        1506,
+        70866,
+        14324,
+        323,
+        61115,
+        84648,
+        53588,
+        13,
+        81917,
+        1246,
+        855,
+        7559,
+        323,
+        16895,
+        1265,
+        387,
+        13537,
+        11,
+        979,
+        84256,
+        8609,
+        11,
+        323,
+        1246,
+        311,
+        5648,
+        15099,
+        10993,
+        323,
+        57912,
+        13,
+        20678,
+        264,
+        14175,
+        4938,
+        8039,
+        11,
+        7512,
+        1128,
+        8573,
+        979,
+        279,
+        2266,
+        3241,
+        40587,
+        11,
+        323,
+        4263,
+        39270,
+        19041,
+        63762,
+        13,
+        29734,
+        7901,
+        13351,
+        323,
+        264,
+        2805,
+        8129,
+        52573,
+        13,
+        9645,
+        264,
+        11682,
+        4226,
+        315,
+        911,
+        220,
+        19,
+        15,
+        15,
+        4244,
+        448,
+        2797,
+        3772,
+        9201,
+        323,
+        14976,
+        6559,
+        32483,
+        624,
+        151645,
+        198,
+        151644,
+        77091,
+        198
+      ],
+      "decode_input_ids": [
+        10253,
+        825,
+        1349,
+        15382,
+        12731,
+        369,
+        279,
+        10272,
+        1506,
+        14324,
+        323,
+        4332,
+        432,
+        3941,
+        15704,
+        13,
+        576,
+        22670,
+        8039,
+        1969,
+        2924,
+        27950,
+        14324,
+        11,
+        279,
+        4541,
+        84648,
+        53588,
+        11,
+        13340,
+        975,
+        44285,
+        11,
+        323,
+        264,
+        61115,
+        6203,
+        6500,
+        13,
+        24785,
+        1968,
+        2966,
+        1573,
+        54589,
+        2441,
+        1681,
+        13,
+        1752,
+        3110,
+        11,
+        264,
+        220,
+        16,
+        21,
+        15392,
+        33,
+        3671,
+        2578,
+        73604,
+        17267,
+        220,
+        24,
+        15392,
+        33,
+        311,
+        27950,
+        14324,
+        11,
+        9380,
+        3807,
+        15392,
+        33,
+        369,
+        53588,
+        323,
+        18778,
+        27389,
+        11,
+        714,
+        279,
+        4734,
+        6718,
+        1969,
+        2525,
+        504,
+        21595,
+        382,
+        29978,
+        483,
+        3807,
+        7388,
+        304,
+        2805,
+        26757,
+        773,
+        264,
+        1293,
+        9934,
+        4157,
+        2504,
+        1449,
+        16895,
+        3019,
+        13,
+        86377,
+        264,
+        7177,
+        315,
+        5527,
+        15704,
+        11,
+        7050,
+        862,
+        3950,
+        975,
+        304,
+        264,
+        44107,
+        1973,
+        11,
+        323,
+        21129,
+        26135,
+        323,
+        9892,
+        3941,
+        33832,
+        41766
+      ],
+      "speedup": 2.5420876770559016,
+      "output_comparison": {
+        "bit_identical": true,
+        "generic_logits_sha256": "5df07d29d36eff47ed742339f485b22574ba0766a3c02a165edb5fd13d98c408",
+        "cubecl_logits_sha256": "5df07d29d36eff47ed742339f485b22574ba0766a3c02a165edb5fd13d98c408",
+        "logits_compared": 19599744,
+        "max_abs": 0.0,
+        "rms_abs": 0.0,
+        "absolute_difference_p50_p95_p99": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "max_abs_by_row": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "top1_matching_rows": 129,
+        "rows": 129,
+        "top1_ids_match": true,
+        "greedy_text_match": true,
+        "max_softmax_kl_generic_to_cubecl": 0.0,
+        "within_absolute_1e_5": true
+      },
+      "memory_comparison": {
+        "loaded_device_bytes_identical": true,
+        "warm_device_bytes_identical": true,
+        "sampled_peak_device_bytes_identical": true,
+        "after_session_device_bytes_identical": true,
+        "generic_after_sessions_stable": true,
+        "cubecl_after_sessions_stable": true,
+        "anonymous_accounting": "resident plus swapped anonymous pages",
+        "generic_anonymous_growth_kib": 0,
+        "cubecl_anonymous_growth_kib": 0,
+        "anonymous_memory_bounded_within_1_mib": true,
+        "candidate_anonymous_peak_within_1_mib_of_generic": true,
+        "generic_decode_live_span_bytes_by_pass": [
+          37748736,
+          37748736
+        ],
+        "cubecl_decode_live_span_bytes_by_pass": [
+          37748736,
+          37748736
+        ],
+        "device_memory_trajectory_identical": true,
+        "candidate_allocations_no_larger": {
+          "loaded_reserved_live": true,
+          "warm_reserved_live": true,
+          "peak_reserved_live": true,
+          "after_session_reserved_live": true
+        },
+        "candidate_device_trajectory_no_larger": true,
+        "driver_vram_endpoints": {
+          "generic": [
+            5268217856,
+            5268217856
+          ],
+          "cubecl": [
+            5268217856,
+            5268217856
+          ]
+        }
+      },
+      "prefill_comparison": {
+        "generic_ms": [
+          60426.723243,
+          61109.100661
+        ],
+        "cubecl_ms": [
+          23544.449624999997,
+          23674.864316
+        ],
+        "speedup": 2.5738583168713047
+      },
+      "end_to_end_comparison": {
+        "generic_session_ms": [
+          123135.48494700003,
+          123998.384068
+        ],
+        "cubecl_session_ms": [
+          48352.751926,
+          48274.00230299999
+        ],
+        "speedup": 2.5576132716753235
+      },
+      "acceptance": {
+        "parity": true,
+        "repeated_session_parity": true,
+        "faster_decode": true,
+        "all_decode_samples_faster": true,
+        "device_memory": true,
+        "host_memory": true,
+        "no_extra_fallbacks": true,
+        "faster_end_to_end": true,
+        "all_session_samples_faster": true,
+        "device_memory_trajectory": true,
+        "driver_memory": true,
+        "passed": true
+      },
+      "zero_cpu_fallbacks": true
+    },
+    "deepseek41": {
+      "date": "2026-10-22",
+      "generic": {
+        "after_session_driver_memory_bytes": [
+          {
+            "drm-resident-gtt": 2097152,
+            "drm-resident-stolen": 0,
+            "drm-resident-system": 0,
+            "drm-resident-vram0": 9538830336,
+            "drm-total-gtt": 2097152,
+            "drm-total-stolen": 0,
+            "drm-total-system": 0,
+            "drm-total-vram0": 9538830336
+          },
+          {
+            "drm-resident-gtt": 2097152,
+            "drm-resident-stolen": 0,
+            "drm-resident-system": 0,
+            "drm-resident-vram0": 9538830336,
+            "drm-total-gtt": 2097152,
+            "drm-total-stolen": 0,
+            "drm-total-system": 0,
+            "drm-total-vram0": 9538830336
+          }
+        ],
+        "after_session_expert_cache_reports": [
+          null,
+          null
+        ],
+        "after_session_host_memory_kib": [
+          {
+            "RssAnon": 54412,
+            "RssFile": 72657336,
+            "RssShmem": 24,
+            "VmRSS": 72711772,
+            "VmSwap": 135716
+          },
+          {
+            "RssAnon": 22084,
+            "RssFile": 73391828,
+            "RssShmem": 24,
+            "VmRSS": 73413936,
+            "VmSwap": 168068
+          }
+        ],
+        "after_session_io_counters": [
+          {
+            "cancelled_write_bytes": 0,
+            "rchar": 206857369324,
+            "read_bytes": 294617686016,
+            "syscr": 1878691,
+            "syscw": 28,
+            "wchar": 12140,
+            "write_bytes": 81920
+          },
+          {
+            "cancelled_write_bytes": 0,
+            "rchar": 325732343773,
+            "read_bytes": 429880868864,
+            "syscr": 1918080,
+            "syscw": 49,
+            "wchar": 13032,
+            "write_bytes": 135168
+          }
+        ],
+        "after_session_reserved_live": [
+          [
+            9500049408,
+            9224831488
+          ],
+          [
+            9500049408,
+            9224831488
+          ]
+        ],
+        "after_session_rss_kib": [
+          72711772,
+          73413936
+        ],
+        "allocator_stats_available": true,
+        "architecture": "deepseek41",
+        "attention_output_a_gguf_shapes": {
+          "blk.0.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.1.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.10.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.11.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.12.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.13.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.14.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.15.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.16.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.17.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.18.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.19.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.2.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.20.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.21.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.22.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.23.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.24.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.25.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.26.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.27.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.28.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.29.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.3.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.30.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.31.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.32.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.33.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.34.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.35.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.36.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.37.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.38.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.39.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.4.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.5.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.6.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.7.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.8.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.9.attn_output_a.weight": [
+            8192,
+            4096
+          ]
+        },
+        "attention_output_groups": 8,
+        "auto_dense_cpu": false,
+        "auto_placement": false,
+        "backend": "vulkan",
+        "chat": true,
+        "context": 249,
+        "cubecl_formats": [
+          8,
+          10,
+          12
+        ],
+        "decode_cpu_fallbacks": [
+          0,
+          0
+        ],
+        "decode_text_file": "/home/tserica/joshua/kernels-cubecl/benchmarks/deepseek-diverse-continuation.txt",
+        "decode_tokens": 128,
+        "dense_device": "Intel(R) Arc(tm) Pro B50 Graphics (BMG G21)",
+        "dispatch": "CubeClExpanded",
+        "driver_memory_after": {
+          "drm-resident-gtt": 2097152,
+          "drm-resident-stolen": 0,
+          "drm-resident-system": 0,
+          "drm-resident-vram0": 9538830336,
+          "drm-total-gtt": 2097152,
+          "drm-total-stolen": 0,
+          "drm-total-system": 0,
+          "drm-total-vram0": 9538830336
+        },
+        "elements_by_ggml_dtype": {
+          "0": 515440,
+          "1": 717619200,
+          "10": 196653253120,
+          "12": 385980825600,
+          "8": 6574833664
+        },
+        "engram_disabled": false,
+        "expert_cache_budget_bytes": null,
+        "expert_cache_report": null,
+        "expert_device": "CPU",
+        "expert_placement": "cpu-mmap",
+        "explicit_dense_cpu": false,
+        "explicit_expert_cache_mib": null,
+        "gpu": "Intel(R) Arc(tm) Pro B50 Graphics (BMG G21)",
+        "greedy_text": " to a of and, of a ized,, the the's the,  ., the a and and and  and cc. and  of, and the   of. The the,, the the  to The the of the 16 B . to a 4.B  the,, the the ofB to the , a.. and the ing of the a the. ing and , the,, the  .,, ,, s  of  to, and a ,, the  , the the the to a, the to",
+        "kernel": "cubecl",
+        "load_seconds": 4.282575131,
+        "loaded_host_memory_kib": {
+          "RssAnon": 183668,
+          "RssFile": 66780,
+          "RssShmem": 36,
+          "VmRSS": 250484,
+          "VmSwap": 0
+        },
+        "loaded_io_counters": {
+          "cancelled_write_bytes": 0,
+          "rchar": 8986479337,
+          "read_bytes": 8979927040,
+          "syscr": 1820357,
+          "syscw": 2,
+          "wchar": 246,
+          "write_bytes": 4096
+        },
+        "loaded_reserved_live": [
+          9365831680,
+          9224831488
+        ],
+        "logit_rows": 129,
+        "max_repeat_logit_difference": 0.0,
+        "median_ms_per_token": 3739.5668410390626,
+        "model": "/home/tserica/models/DSV41-REAP272E-balanced.gguf",
+        "model_bytes": 290070476416,
+        "ms_per_token": [
+          3769.6150134375,
+          3709.518668640625
+        ],
+        "passes": 2,
+        "peak_reserved_live": [
+          9500049408,
+          9236945920
+        ],
+        "peak_rss_kib": 73441068,
+        "placement_probe_skipped": false,
+        "prefill_chunk": 32,
+        "prefill_cpu_fallbacks": [
+          0,
+          0
+        ],
+        "prefill_ms": [
+          50965.878062,
+          40570.886523
+        ],
+        "prompt_file": "/home/tserica/joshua/kernels-cubecl/benchmarks/deepseek-realistic-prompt.txt",
+        "prompt_tokens": 121,
+        "reference_logits_bytes": 66708480,
+        "tokens_per_second": 0.26741065008538356,
+        "top1": [
+          304,
+          260,
+          294,
+          305,
+          14,
+          294,
+          260,
+          223,
+          1766,
+          14,
+          14,
+          270,
+          270,
+          734,
+          270,
+          14,
+          223,
+          223,
+          16,
+          14,
+          270,
+          260,
+          305,
+          305,
+          305,
+          223,
+          305,
+          274,
+          69,
+          16,
+          305,
+          223,
+          294,
+          14,
+          305,
+          270,
+          223,
+          223,
+          294,
+          16,
+          455,
+          270,
+          14,
+          14,
+          270,
+          270,
+          223,
+          304,
+          455,
+          270,
+          294,
+          270,
+          223,
+          926,
+          223,
+          36,
+          223,
+          16,
+          304,
+          260,
+          223,
+          22,
+          16,
+          36,
+          223,
+          270,
+          14,
+          14,
+          270,
+          270,
+          294,
+          36,
+          304,
+          270,
+          223,
+          14,
+          260,
+          16,
+          16,
+          305,
+          270,
+          223,
+          288,
+          294,
+          270,
+          260,
+          270,
+          16,
+          223,
+          288,
+          305,
+          223,
+          14,
+          270,
+          14,
+          14,
+          270,
+          223,
+          223,
+          16,
+          14,
+          14,
+          223,
+          14,
+          14,
+          223,
+          85,
+          223,
+          294,
+          223,
+          304,
+          14,
+          305,
+          260,
+          223,
+          14,
+          14,
+          270,
+          223,
+          223,
+          14,
+          270,
+          270,
+          270,
+          304,
+          260,
+          14,
+          270,
+          304
+        ],
+        "vocab": 129280,
+        "warm_decode": 2,
+        "warm_host_memory_kib": {
+          "RssAnon": 189868,
+          "RssFile": 24598556,
+          "RssShmem": 36,
+          "VmRSS": 24788460,
+          "VmSwap": 0
+        },
+        "warm_io_counters": {
+          "cancelled_write_bytes": 0,
+          "rchar": 80919712124,
+          "read_bytes": 100174553088,
+          "syscr": 1837618,
+          "syscw": 8,
+          "wchar": 11356,
+          "write_bytes": 28672
+        },
+        "warm_prompt_tokens": 8,
+        "warm_reserved_live": [
+          9365831680,
+          9224831488
+        ],
+        "warm_rss_kib": 24788460,
+        "memory_samples_count": 264,
+        "memory_samples_sha256": "c53491fbe997a97cb6ceba503d499dae0ca316dbcc2744feff3cea74c60ff0dd",
+        "sample_ranges": {
+          "prefill_pass1": {
+            "position": [
+              32,
+              121
+            ],
+            "reserved_bytes": [
+              9500049408,
+              9500049408
+            ],
+            "live_bytes": [
+              9236945920,
+              9236945920
+            ],
+            "total_anonymous_kib": [
+              190072,
+              190088
+            ],
+            "file_kib": [
+              45224980,
+              68264280
+            ]
+          },
+          "prefill_pass2": {
+            "position": [
+              32,
+              121
+            ],
+            "reserved_bytes": [
+              9500049408,
+              9500049408
+            ],
+            "live_bytes": [
+              9236945920,
+              9236945920
+            ],
+            "total_anonymous_kib": [
+              190128,
+              190128
+            ],
+            "file_kib": [
+              67570588,
+              71324720
+            ]
+          },
+          "decode_pass1": {
+            "position": [
+              122,
+              249
+            ],
+            "reserved_bytes": [
+              9500049408,
+              9500049408
+            ],
+            "live_bytes": [
+              9236945920,
+              9236945920
+            ],
+            "total_anonymous_kib": [
+              190088,
+              190128
+            ],
+            "file_kib": [
+              68580508,
+              72741472
+            ]
+          },
+          "decode_pass2": {
+            "position": [
+              122,
+              249
+            ],
+            "reserved_bytes": [
+              9500049408,
+              9500049408
+            ],
+            "live_bytes": [
+              9236945920,
+              9236945920
+            ],
+            "total_anonymous_kib": [
+              190128,
+              190152
+            ],
+            "file_kib": [
+              71427616,
+              73391756
+            ]
+          }
+        }
+      },
+      "cubecl": {
+        "after_session_driver_memory_bytes": [
+          {
+            "drm-resident-gtt": 2097152,
+            "drm-resident-stolen": 0,
+            "drm-resident-system": 0,
+            "drm-resident-vram0": 9538830336,
+            "drm-total-gtt": 2097152,
+            "drm-total-stolen": 0,
+            "drm-total-system": 0,
+            "drm-total-vram0": 9538830336
+          },
+          {
+            "drm-resident-gtt": 2097152,
+            "drm-resident-stolen": 0,
+            "drm-resident-system": 0,
+            "drm-resident-vram0": 9538830336,
+            "drm-total-gtt": 2097152,
+            "drm-total-stolen": 0,
+            "drm-total-system": 0,
+            "drm-total-vram0": 9538830336
+          }
+        ],
+        "after_session_expert_cache_reports": [
+          null,
+          null
+        ],
+        "after_session_host_memory_kib": [
+          {
+            "RssAnon": 24992,
+            "RssFile": 73652312,
+            "RssShmem": 24,
+            "VmRSS": 73677328,
+            "VmSwap": 164292
+          },
+          {
+            "RssAnon": 95184,
+            "RssFile": 72859400,
+            "RssShmem": 24,
+            "VmRSS": 72954608,
+            "VmSwap": 94120
+          }
+        ],
+        "after_session_io_counters": [
+          {
+            "cancelled_write_bytes": 0,
+            "rchar": 208895822451,
+            "read_bytes": 208665419776,
+            "syscr": 1881670,
+            "syscw": 25,
+            "wchar": 1194,
+            "write_bytes": 36864
+          },
+          {
+            "cancelled_write_bytes": 0,
+            "rchar": 328349348623,
+            "read_bytes": 334550216704,
+            "syscr": 1921197,
+            "syscw": 46,
+            "wchar": 2069,
+            "write_bytes": 61440
+          }
+        ],
+        "after_session_reserved_live": [
+          [
+            9500049408,
+            9224831488
+          ],
+          [
+            9500049408,
+            9224831488
+          ]
+        ],
+        "after_session_rss_kib": [
+          73677328,
+          72954608
+        ],
+        "allocator_stats_available": true,
+        "architecture": "deepseek41",
+        "attention_output_a_gguf_shapes": {
+          "blk.0.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.1.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.10.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.11.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.12.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.13.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.14.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.15.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.16.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.17.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.18.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.19.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.2.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.20.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.21.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.22.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.23.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.24.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.25.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.26.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.27.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.28.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.29.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.3.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.30.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.31.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.32.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.33.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.34.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.35.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.36.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.37.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.38.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.39.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.4.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.5.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.6.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.7.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.8.attn_output_a.weight": [
+            8192,
+            4096
+          ],
+          "blk.9.attn_output_a.weight": [
+            8192,
+            4096
+          ]
+        },
+        "attention_output_groups": 8,
+        "auto_dense_cpu": false,
+        "auto_placement": false,
+        "backend": "vulkan",
+        "chat": true,
+        "context": 249,
+        "cubecl_formats": [
+          8,
+          10,
+          12,
+          14
+        ],
+        "decode_cpu_fallbacks": [
+          0,
+          0
+        ],
+        "decode_text_file": null,
+        "decode_tokens": 128,
+        "dense_device": "Intel(R) Arc(tm) Pro B50 Graphics (BMG G21)",
+        "dispatch": "CubeClNext",
+        "driver_memory_after": {
+          "drm-resident-gtt": 2097152,
+          "drm-resident-stolen": 0,
+          "drm-resident-system": 0,
+          "drm-resident-vram0": 9538830336,
+          "drm-total-gtt": 2097152,
+          "drm-total-stolen": 0,
+          "drm-total-system": 0,
+          "drm-total-vram0": 9538830336
+        },
+        "elements_by_ggml_dtype": {
+          "0": 515440,
+          "1": 717619200,
+          "10": 196653253120,
+          "12": 385980825600,
+          "8": 6574833664
+        },
+        "engram_disabled": false,
+        "expert_cache_budget_bytes": null,
+        "expert_cache_report": null,
+        "expert_device": "CPU",
+        "expert_placement": "cpu-mmap",
+        "explicit_dense_cpu": false,
+        "explicit_expert_cache_mib": null,
+        "gpu": "Intel(R) Arc(tm) Pro B50 Graphics (BMG G21)",
+        "greedy_text": " to a of and, of a ized,, the the's the,  ., the a and and and  and cc. and  of, and the   of. The the,, the the  to The the of the 16 B . to a 4.B  the,, the the ofB to the , a.. and the ing of the a the. ing and , the,, the  .,, ,, s  of  to, and a ,, the  , the the the to a, the to",
+        "kernel": "cubecl-next",
+        "load_seconds": 4.690439701,
+        "loaded_host_memory_kib": {
+          "RssAnon": 183252,
+          "RssFile": 62032,
+          "RssShmem": 36,
+          "VmRSS": 245320,
+          "VmSwap": 0
+        },
+        "loaded_io_counters": {
+          "cancelled_write_bytes": 0,
+          "rchar": 8986479778,
+          "read_bytes": 9039564800,
+          "syscr": 1822846,
+          "syscw": 2,
+          "wchar": 251,
+          "write_bytes": 4096
+        },
+        "loaded_reserved_live": [
+          9365831680,
+          9224831488
+        ],
+        "logit_rows": 129,
+        "max_repeat_logit_difference": 0.0,
+        "median_ms_per_token": 803.8472134218748,
+        "model": "/home/tserica/models/DSV41-REAP272E-balanced.gguf",
+        "model_bytes": 290070476416,
+        "ms_per_token": [
+          806.661021015625,
+          801.0334058281247
+        ],
+        "passes": 2,
+        "peak_reserved_live": [
+          9500049408,
+          9236945920
+        ],
+        "peak_rss_kib": 73677164,
+        "placement_probe_skipped": false,
+        "prefill_chunk": 32,
+        "prefill_cpu_fallbacks": [
+          0,
+          0
+        ],
+        "prefill_ms": [
+          39178.138604,
+          39265.911781
+        ],
+        "prompt_file": "/home/tserica/joshua/kernels-cubecl/benchmarks/deepseek-realistic-prompt.txt",
+        "prompt_tokens": 121,
+        "reference_logits_bytes": 66708480,
+        "tokens_per_second": 1.244017498976115,
+        "top1": [
+          304,
+          260,
+          294,
+          305,
+          14,
+          294,
+          260,
+          223,
+          1766,
+          14,
+          14,
+          270,
+          270,
+          734,
+          270,
+          14,
+          223,
+          223,
+          16,
+          14,
+          270,
+          260,
+          305,
+          305,
+          305,
+          223,
+          305,
+          274,
+          69,
+          16,
+          305,
+          223,
+          294,
+          14,
+          305,
+          270,
+          223,
+          223,
+          294,
+          16,
+          455,
+          270,
+          14,
+          14,
+          270,
+          270,
+          223,
+          304,
+          455,
+          270,
+          294,
+          270,
+          223,
+          926,
+          223,
+          36,
+          223,
+          16,
+          304,
+          260,
+          223,
+          22,
+          16,
+          36,
+          223,
+          270,
+          14,
+          14,
+          270,
+          270,
+          294,
+          36,
+          304,
+          270,
+          223,
+          14,
+          260,
+          16,
+          16,
+          305,
+          270,
+          223,
+          288,
+          294,
+          270,
+          260,
+          270,
+          16,
+          223,
+          288,
+          305,
+          223,
+          14,
+          270,
+          14,
+          14,
+          270,
+          223,
+          223,
+          16,
+          14,
+          14,
+          223,
+          14,
+          14,
+          223,
+          85,
+          223,
+          294,
+          223,
+          304,
+          14,
+          305,
+          260,
+          223,
+          14,
+          14,
+          270,
+          223,
+          223,
+          14,
+          270,
+          270,
+          270,
+          304,
+          260,
+          14,
+          270,
+          304
+        ],
+        "vocab": 129280,
+        "warm_decode": 2,
+        "warm_host_memory_kib": {
+          "RssAnon": 189032,
+          "RssFile": 24530040,
+          "RssShmem": 36,
+          "VmRSS": 24719108,
+          "VmSwap": 0
+        },
+        "warm_io_counters": {
+          "cancelled_write_bytes": 0,
+          "rchar": 84857922896,
+          "read_bytes": 74944585728,
+          "syscr": 1841050,
+          "syscw": 5,
+          "wchar": 426,
+          "write_bytes": 4096
+        },
+        "warm_prompt_tokens": 8,
+        "warm_reserved_live": [
+          9365831680,
+          9224831488
+        ],
+        "warm_rss_kib": 24719108,
+        "memory_samples_count": 264,
+        "memory_samples_sha256": "0aa3be55807646c85c4cc633c54d9caea73d272ae8b713e085707220f4b9f644",
+        "sample_ranges": {
+          "prefill_pass1": {
+            "position": [
+              32,
+              121
+            ],
+            "reserved_bytes": [
+              9500049408,
+              9500049408
+            ],
+            "live_bytes": [
+              9236945920,
+              9236945920
+            ],
+            "total_anonymous_kib": [
+              189232,
+              189260
+            ],
+            "file_kib": [
+              47069736,
+              68548180
+            ]
+          },
+          "prefill_pass2": {
+            "position": [
+              32,
+              121
+            ],
+            "reserved_bytes": [
+              9500049408,
+              9500049408
+            ],
+            "live_bytes": [
+              9236945920,
+              9236945920
+            ],
+            "total_anonymous_kib": [
+              189288,
+              189292
+            ],
+            "file_kib": [
+              64653572,
+              72622972
+            ]
+          },
+          "decode_pass1": {
+            "position": [
+              122,
+              249
+            ],
+            "reserved_bytes": [
+              9500049408,
+              9500049408
+            ],
+            "live_bytes": [
+              9236945920,
+              9236945920
+            ],
+            "total_anonymous_kib": [
+              189260,
+              189284
+            ],
+            "file_kib": [
+              68684632,
+              73652284
+            ]
+          },
+          "decode_pass2": {
+            "position": [
+              122,
+              249
+            ],
+            "reserved_bytes": [
+              9500049408,
+              9500049408
+            ],
+            "live_bytes": [
+              9236945920,
+              9236945920
+            ],
+            "total_anonymous_kib": [
+              189292,
+              189304
+            ],
+            "file_kib": [
+              64877624,
+              73190052
+            ]
+          }
+        }
+      },
+      "prompt_ids": [
+        0,
+        128803,
+        31151,
+        260,
+        58408,
+        4063,
+        65020,
+        14914,
+        5466,
+        362,
+        260,
+        120980,
+        418,
+        223,
+        2892,
+        14850,
+        36,
+        294,
+        1487,
+        36357,
+        305,
+        260,
+        223,
+        926,
+        14850,
+        36,
+        54186,
+        16,
+        983,
+        2231,
+        8463,
+        2689,
+        37196,
+        16649,
+        418,
+        8900,
+        5059,
+        1766,
+        6667,
+        630,
+        23997,
+        305,
+        37465,
+        126664,
+        274,
+        5813,
+        16,
+        28231,
+        1192,
+        852,
+        27472,
+        305,
+        64285,
+        1531,
+        366,
+        21145,
+        14,
+        1082,
+        291,
+        19468,
+        7531,
+        14,
+        305,
+        1192,
+        304,
+        5789,
+        16277,
+        21974,
+        305,
+        55276,
+        16,
+        19825,
+        260,
+        15360,
+        6464,
+        9296,
+        14,
+        9734,
+        1205,
+        11396,
+        1082,
+        270,
+        5148,
+        8667,
+        49665,
+        14,
+        305,
+        3502,
+        52636,
+        14842,
+        62027,
+        16,
+        52480,
+        8977,
+        12138,
+        305,
+        260,
+        3107,
+        9963,
+        53715,
+        16,
+        15361,
+        260,
+        10659,
+        3287,
+        294,
+        943,
+        223,
+        5126,
+        3345,
+        418,
+        4521,
+        4868,
+        22377,
+        305,
+        10200,
+        7629,
+        32931,
+        603,
+        128804,
+        128822
+      ],
+      "decode_input_ids": [
+        14885,
+        834,
+        1733,
+        38593,
+        19627,
+        362,
+        270,
+        5059,
+        1766,
+        23997,
+        305,
+        4863,
+        436,
+        3881,
+        17819,
+        16,
+        455,
+        54186,
+        9296,
+        2231,
+        3394,
+        27091,
+        23997,
+        14,
+        270,
+        6690,
+        126664,
+        274,
+        5813,
+        14,
+        18658,
+        2984,
+        71703,
+        14,
+        305,
+        260,
+        37465,
+        8739,
+        23809,
+        16,
+        27686,
+        2578,
+        5638,
+        1936,
+        78548,
+        2658,
+        5118,
+        16,
+        1884,
+        2511,
+        14,
+        260,
+        223,
+        926,
+        14850,
+        36,
+        5291,
+        2786,
+        89837,
+        22349,
+        223,
+        27,
+        14850,
+        36,
+        304,
+        27091,
+        23997,
+        14,
+        10981,
+        3586,
+        14850,
+        36,
+        362,
+        274,
+        5813,
+        305,
+        37154,
+        84152,
+        14,
+        790,
+        270,
+        6319,
+        14241,
+        2231,
+        2822,
+        538,
+        13453,
+        339,
+        43676,
+        475,
+        3586,
+        16649,
+        295,
+        3107,
+        56601,
+        832,
+        260,
+        1606,
+        12275,
+        4800,
+        5603,
+        1750,
+        64285,
+        3132,
+        16,
+        47322,
+        260,
+        18505,
+        294,
+        7692,
+        17819,
+        14,
+        15020,
+        786,
+        17840,
+        1116,
+        295,
+        260,
+        47773,
+        2496,
+        14,
+        305,
+        23950,
+        40186,
+        305,
+        11788,
+        3881,
+        38400
+      ],
+      "speedup": 4.652086588843425,
+      "output_comparison": {
+        "bit_identical": true,
+        "generic_logits_sha256": "ab6fb262586daa5d1a3ea4baa89d1ef5b8afce4ee2b6750306357ff8f0892333",
+        "cubecl_logits_sha256": "ab6fb262586daa5d1a3ea4baa89d1ef5b8afce4ee2b6750306357ff8f0892333",
+        "logits_compared": 16677120,
+        "max_abs": 0.0,
+        "rms_abs": 0.0,
+        "absolute_difference_p50_p95_p99": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "max_abs_by_row": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "top1_matching_rows": 129,
+        "rows": 129,
+        "top1_ids_match": true,
+        "greedy_text_match": true,
+        "max_softmax_kl_generic_to_cubecl": 0.0,
+        "within_absolute_1e_5": true
+      },
+      "memory_comparison": {
+        "loaded_device_bytes_identical": true,
+        "warm_device_bytes_identical": true,
+        "sampled_peak_device_bytes_identical": true,
+        "after_session_device_bytes_identical": true,
+        "generic_after_sessions_stable": true,
+        "cubecl_after_sessions_stable": true,
+        "anonymous_accounting": "resident plus swapped anonymous pages",
+        "generic_anonymous_growth_kib": 24,
+        "cubecl_anonymous_growth_kib": 20,
+        "anonymous_memory_bounded_within_1_mib": true,
+        "candidate_anonymous_peak_within_1_mib_of_generic": true,
+        "generic_decode_live_span_bytes_by_pass": [
+          0,
+          0
+        ],
+        "cubecl_decode_live_span_bytes_by_pass": [
+          0,
+          0
+        ],
+        "device_memory_trajectory_identical": true,
+        "candidate_allocations_no_larger": {
+          "loaded_reserved_live": true,
+          "warm_reserved_live": true,
+          "peak_reserved_live": true,
+          "after_session_reserved_live": true
+        },
+        "candidate_device_trajectory_no_larger": true,
+        "driver_vram_endpoints": {
+          "generic": [
+            9538830336,
+            9538830336
+          ],
+          "cubecl": [
+            9538830336,
+            9538830336
+          ]
+        }
+      },
+      "prefill_comparison": {
+        "generic_ms": [
+          50965.878062,
+          40570.886523
+        ],
+        "cubecl_ms": [
+          39178.138604,
+          39265.911781
+        ],
+        "speedup": 1.166905127103222
+      },
+      "end_to_end_comparison": {
+        "generic_session_ms": [
+          533476.599782,
+          515389.276109
+        ],
+        "cubecl_session_ms": [
+          142430.749294,
+          141798.18772699998
+        ],
+        "speedup": 3.6902149615171154
+      },
+      "acceptance": {
+        "parity": true,
+        "repeated_session_parity": true,
+        "faster_decode": true,
+        "all_decode_samples_faster": true,
+        "device_memory": true,
+        "host_memory": true,
+        "no_extra_fallbacks": true,
+        "faster_end_to_end": true,
+        "all_session_samples_faster": true,
+        "device_memory_trajectory": true,
+        "driver_memory": true,
+        "passed": true
+      },
+      "zero_cpu_fallbacks": true
+    }
+  },
+  "failed_baseline_attempts": [
+    {
+      "name": "qwen8-baseline-chunk32",
+      "exit_code": 1,
+      "started_at_utc": "2026-10-23T03:05:28.817168+00:00",
+      "log_tail": [
+        "architecture=qwen3 context=254 routed_experts=model-device",
+        "GPU=Intel(R) Arc(tm) Pro B50 Graphics (BMG G21) kernel=cubecl file_bytes=5027783488 elements_by_ggml_dtype={0: 308224, 12: 6586630144, 14: 1603796992}",
+        "loaded in 1.33s, reserved/live=(5227622400, 5042798592), RSS=159024 KiB",
+        "prompt_tokens=126 prefill_chunk=32 decode=128 passes=2 warm_prompt_tokens=8",
+        "prefill tokens=8/8 batch=8",
+        "intel: the execbuf ioctl keeps returning ENOMEM",
+        "Error: vulkan queue_submit failed: ERROR_DEVICE_LOST"
+      ],
+      "log_sha256": "0529c4d73cfa04d2777eec492dbbc32620adb09a7b159334a4f5e44ab3e55412"
+    },
+    {
+      "name": "qwen8-baseline-chunk32",
+      "exit_code": 1,
+      "started_at_utc": "2026-10-23T03:12:50.897975+00:00",
+      "log_tail": [
+        "architecture=qwen3 context=254 routed_experts=model-device",
+        "GPU=Intel(R) Arc(tm) Pro B50 Graphics (BMG G21) kernel=cubecl file_bytes=5027783488 elements_by_ggml_dtype={0: 308224, 12: 6586630144, 14: 1603796992}",
+        "loaded in 1.33s, reserved/live=(5227622400, 5042798592), RSS=159024 KiB",
+        "prompt_tokens=126 prefill_chunk=32 decode=128 passes=2 warm_prompt_tokens=8",
+        "prefill tokens=8/8 batch=8",
+        "intel: the execbuf ioctl keeps returning ENOMEM",
+        "Error: vulkan queue_submit failed: ERROR_DEVICE_LOST"
+      ],
+      "log_sha256": "0529c4d73cfa04d2777eec492dbbc32620adb09a7b159334a4f5e44ab3e55412"
+    }
+  ],
+  "all_candidates_passed": true,
+  "production_verification": {
+    "binary_sha256": "6cbf7a29061b10aa147a988127df86842f739ac0dc06e1abe78d89aa049701aa",
+    "source_sha256": {
+      "examples/bench_cubecl_real.rs": "af3e23eb261c1268234f9a42a213db6c1fc5ed2b3026afdf80fe3d459585c1f9",
+      "vendor/candle-core/src/vulkan_backend/kernels.rs": "8983d806af3f5f6223be26b4ea72ba985e0c8bb81d95a66e1aa979db39389f5d"
+    },
+    "runs": [
+      {
+        "name": "qwen8",
+        "argv": [
+          "/home/tserica/joshua/target/release/examples/bench_cubecl_real",
+          "--model",
+          "/home/tserica/models/qwen3-dense/Qwen3-8B-Q4_K_M.gguf",
+          "--tokenizer",
+          "/home/tserica/models/qwen3-dense/tokenizer.json",
+          "--kernel",
+          "production",
+          "--output",
+          "/home/tserica/benchmark-results/cubecl-b50-20261022-pr198/qwen8-production",
+          "--reference",
+          "/home/tserica/benchmark-results/cubecl-b50-20261022-pr198/qwen8-candidate-chunk1/trace.json",
+          "--prefill-chunk",
+          "1",
+          "--decode",
+          "128",
+          "--passes",
+          "1",
+          "--warm-prompt-tokens",
+          "8",
+          "--warm-decode",
+          "2",
+          "--prompt-file",
+          "/home/tserica/joshua/kernels-cubecl/benchmarks/deepseek-realistic-prompt.txt",
+          "--chat"
+        ],
+        "started_at_utc": "2026-10-23T03:39:24.552111+00:00",
+        "summary": {
+          "after_session_driver_memory_bytes": [
+            {
+              "drm-resident-gtt": 2097152,
+              "drm-resident-stolen": 0,
+              "drm-resident-system": 0,
+              "drm-resident-vram0": 5268217856,
+              "drm-total-gtt": 2097152,
+              "drm-total-stolen": 0,
+              "drm-total-system": 0,
+              "drm-total-vram0": 5268217856
+            }
+          ],
+          "after_session_expert_cache_reports": [
+            null
+          ],
+          "after_session_host_memory_kib": [
+            {
+              "RssAnon": 165964,
+              "RssFile": 60932,
+              "RssShmem": 36,
+              "VmRSS": 226932,
+              "VmSwap": 0
+            }
+          ],
+          "after_session_io_counters": [
+            {
+              "cancelled_write_bytes": 0,
+              "rchar": 5047298517,
+              "read_bytes": 5040001024,
+              "syscr": 1547311,
+              "syscw": 154,
+              "wchar": 5018,
+              "write_bytes": 12288
+            }
+          ],
+          "after_session_reserved_live": [
+            [
+              5227622400,
+              5042798592
+            ]
+          ],
+          "after_session_rss_kib": [
+            226932
+          ],
+          "allocator_stats_available": true,
+          "architecture": "qwen3",
+          "attention_output_a_gguf_shapes": {},
+          "attention_output_groups": null,
+          "auto_dense_cpu": false,
+          "auto_placement": false,
+          "backend": "vulkan",
+          "chat": true,
+          "context": 254,
+          "cubecl_formats": [
+            8,
+            10,
+            12,
+            14
+          ],
+          "decode_cpu_fallbacks": [
+            0
+          ],
+          "decode_text_file": null,
+          "decode_tokens": 128,
+          "dense_device": "Intel(R) Arc(tm) Pro B50 Graphics (BMG G21)",
+          "dispatch": "CubeClNext",
+          "driver_memory_after": {
+            "drm-resident-gtt": 2097152,
+            "drm-resident-stolen": 0,
+            "drm-resident-system": 0,
+            "drm-resident-vram0": 5268217856,
+            "drm-total-gtt": 2097152,
+            "drm-total-stolen": 0,
+            "drm-total-system": 0,
+            "drm-total-vram0": 5268217856
+          },
+          "elements_by_ggml_dtype": {
+            "0": 308224,
+            "12": 6586630144,
+            "14": 1603796992
+          },
+          "engram_disabled": false,
+          "expert_cache_budget_bytes": null,
+          "expert_cache_report": null,
+          "expert_device": "Intel(R) Arc(tm) Pro B50 Graphics (BMG G21)",
+          "expert_placement": "model-device",
+          "explicit_dense_cpu": false,
+          "explicit_expert_cache_mib": null,
+          "gpu": "Intel(R) Arc(tm) Pro B50 Graphics (BMG G21)",
+          "greedy_text": "<think> the of of memory for the modelized weights, a it across all. Use KV has is be the layers, activation KV KV cache, and buffersspaces, and the buffer buffer model. For room for allocating new request. For the, if 16 GiB GPU can allow  1 GiB to dense weights,   GiB for KV and work.. with this exact allocation depends be from the.Theill and requests in parallel bursts, that single sequence can block others decode.. Decode a priority of pending-to and and decode decode generation in parallel separate order, and inter the to attention. steps windows steps",
+          "kernel": "production",
+          "load_seconds": 2.500466288,
+          "loaded_host_memory_kib": {
+            "RssAnon": 92496,
+            "RssFile": 63716,
+            "RssShmem": 36,
+            "VmRSS": 156248,
+            "VmSwap": 0
+          },
+          "loaded_io_counters": {
+            "cancelled_write_bytes": 0,
+            "rchar": 5045731689,
+            "read_bytes": 5039300608,
+            "syscr": 1526347,
+            "syscw": 2,
+            "wchar": 214,
+            "write_bytes": 4096
+          },
+          "loaded_reserved_live": [
+            5227622400,
+            5042798592
+          ],
+          "logit_rows": 129,
+          "max_repeat_logit_difference": 0.0,
+          "median_ms_per_token": 182.2809708515624,
+          "model": "/home/tserica/models/qwen3-dense/Qwen3-8B-Q4_K_M.gguf",
+          "model_bytes": 5027783488,
+          "ms_per_token": [
+            182.2809708515624
+          ],
+          "passes": 1,
+          "peak_reserved_live": [
+            5227622400,
+            5118296064
+          ],
+          "peak_rss_kib": 226932,
+          "placement_probe_skipped": false,
+          "prefill_chunk": 1,
+          "prefill_cpu_fallbacks": [
+            0
+          ],
+          "prefill_ms": [
+            22532.002615
+          ],
+          "prompt_file": "/home/tserica/joshua/kernels-cubecl/benchmarks/deepseek-realistic-prompt.txt",
+          "prompt_tokens": 126,
+          "reference_logits_bytes": 78398976,
+          "tokens_per_second": 5.486036174419622,
+          "top1": [
+            151667,
+            279,
+            315,
+            315,
+            4938,
+            369,
+            279,
+            1614,
+            1506,
+            14324,
+            11,
+            264,
+            432,
+            3941,
+            678,
+            13,
+            5443,
+            84648,
+            702,
+            374,
+            387,
+            279,
+            13617,
+            11,
+            15099,
+            84648,
+            84648,
+            6500,
+            11,
+            323,
+            27389,
+            44285,
+            11,
+            323,
+            279,
+            4147,
+            4147,
+            1614,
+            13,
+            1752,
+            220,
+            2966,
+            369,
+            72762,
+            501,
+            1681,
+            13,
+            1752,
+            279,
+            11,
+            421,
+            220,
+            16,
+            21,
+            15392,
+            33,
+            22670,
+            646,
+            2138,
+            220,
+            220,
+            16,
+            15392,
+            33,
+            311,
+            27950,
+            14324,
+            11,
+            220,
+            220,
+            15392,
+            33,
+            369,
+            84648,
+            323,
+            975,
+            13,
+            13,
+            448,
+            419,
+            4734,
+            23757,
+            13798,
+            387,
+            504,
+            279,
+            13,
+            785,
+            483,
+            323,
+            7388,
+            304,
+            15279,
+            65701,
+            11,
+            429,
+            3175,
+            8500,
+            646,
+            2504,
+            3800,
+            16895,
+            13,
+            13,
+            50194,
+            264,
+            10619,
+            315,
+            15280,
+            4686,
+            323,
+            323,
+            16895,
+            16895,
+            9471,
+            304,
+            15279,
+            8651,
+            1973,
+            11,
+            323,
+            946,
+            279,
+            311,
+            6529,
+            13,
+            7354,
+            11030,
+            7354
+          ],
+          "vocab": 151936,
+          "warm_decode": 2,
+          "warm_host_memory_kib": {
+            "RssAnon": 164184,
+            "RssFile": 60756,
+            "RssShmem": 36,
+            "VmRSS": 224976,
+            "VmSwap": 0
+          },
+          "warm_io_counters": {
+            "cancelled_write_bytes": 0,
+            "rchar": 5045836395,
+            "read_bytes": 5040001024,
+            "syscr": 1526389,
+            "syscw": 12,
+            "wchar": 577,
+            "write_bytes": 4096
+          },
+          "warm_prompt_tokens": 8,
+          "warm_reserved_live": [
+            5227622400,
+            5042798592
+          ],
+          "warm_rss_kib": 224976,
+          "memory_samples_count": 254,
+          "memory_samples_sha256": "12925e6962831942d47244366ee0c067adeab612dc17000798234e2c48d6c6c0",
+          "sample_ranges": {
+            "prefill_pass1": {
+              "position": [
+                1,
+                126
+              ],
+              "reserved_bytes": [
+                5227622400,
+                5227622400
+              ],
+              "live_bytes": [
+                5047517184,
+                5080547328
+              ],
+              "total_anonymous_kib": [
+                165372,
+                165964
+              ],
+              "file_kib": [
+                60820,
+                60868
+              ]
+            },
+            "decode_pass1": {
+              "position": [
+                127,
+                254
+              ],
+              "reserved_bytes": [
+                5227622400,
+                5227622400
+              ],
+              "live_bytes": [
+                5080547328,
+                5118296064
+              ],
+              "total_anonymous_kib": [
+                165964,
+                165964
+              ],
+              "file_kib": [
+                60932,
+                60932
+              ]
+            }
+          }
+        },
+        "logits_sha256": "5df07d29d36eff47ed742339f485b22574ba0766a3c02a165edb5fd13d98c408",
+        "candidate_logits_sha256": "5df07d29d36eff47ed742339f485b22574ba0766a3c02a165edb5fd13d98c408",
+        "bit_identical": true,
+        "same_allocator_trajectory": true,
+        "finished_at_utc": "2026-10-23T03:40:15.358529+00:00"
+      },
+      {
+        "name": "deepseek41",
+        "argv": [
+          "/home/tserica/joshua/target/release/examples/bench_cubecl_real",
+          "--model",
+          "/home/tserica/models/DSV41-REAP272E-balanced.gguf",
+          "--tokenizer",
+          "/home/tserica/models/DeepSeek-V4.1-Flash-REAP-272E/tokenizer.json",
+          "--kernel",
+          "production",
+          "--output",
+          "/home/tserica/benchmark-results/cubecl-b50-20261022-pr198/deepseek41-production",
+          "--reference",
+          "/home/tserica/benchmark-results/cubecl-b50-20261022-pr198/deepseek41-candidate-chunk32/trace.json",
+          "--prefill-chunk",
+          "32",
+          "--decode",
+          "128",
+          "--passes",
+          "1",
+          "--warm-prompt-tokens",
+          "8",
+          "--warm-decode",
+          "2",
+          "--prompt-file",
+          "/home/tserica/joshua/kernels-cubecl/benchmarks/deepseek-realistic-prompt.txt",
+          "--chat"
+        ],
+        "started_at_utc": "2026-10-23T03:40:15.360305+00:00",
+        "summary": {
+          "after_session_driver_memory_bytes": [
+            {
+              "drm-resident-gtt": 2097152,
+              "drm-resident-stolen": 0,
+              "drm-resident-system": 0,
+              "drm-resident-vram0": 9538830336,
+              "drm-total-gtt": 2097152,
+              "drm-total-stolen": 0,
+              "drm-total-system": 0,
+              "drm-total-vram0": 9538830336
+            }
+          ],
+          "after_session_expert_cache_reports": [
+            null
+          ],
+          "after_session_host_memory_kib": [
+            {
+              "RssAnon": 26904,
+              "RssFile": 72920428,
+              "RssShmem": 24,
+              "VmRSS": 72947356,
+              "VmSwap": 162388
+            }
+          ],
+          "after_session_io_counters": [
+            {
+              "cancelled_write_bytes": 0,
+              "rchar": 209885678984,
+              "read_bytes": 217699106816,
+              "syscr": 1881905,
+              "syscw": 25,
+              "wchar": 1193,
+              "write_bytes": 45056
+            }
+          ],
+          "after_session_reserved_live": [
+            [
+              9500049408,
+              9224831488
+            ]
+          ],
+          "after_session_rss_kib": [
+            72947356
+          ],
+          "allocator_stats_available": true,
+          "architecture": "deepseek41",
+          "attention_output_a_gguf_shapes": {
+            "blk.0.attn_output_a.weight": [
+              8192,
+              4096
+            ],
+            "blk.1.attn_output_a.weight": [
+              8192,
+              4096
+            ],
+            "blk.10.attn_output_a.weight": [
+              8192,
+              4096
+            ],
+            "blk.11.attn_output_a.weight": [
+              8192,
+              4096
+            ],
+            "blk.12.attn_output_a.weight": [
+              8192,
+              4096
+            ],
+            "blk.13.attn_output_a.weight": [
+              8192,
+              4096
+            ],
+            "blk.14.attn_output_a.weight": [
+              8192,
+              4096
+            ],
+            "blk.15.attn_output_a.weight": [
+              8192,
+              4096
+            ],
+            "blk.16.attn_output_a.weight": [
+              8192,
+              4096
+            ],
+            "blk.17.attn_output_a.weight": [
+              8192,
+              4096
+            ],
+            "blk.18.attn_output_a.weight": [
+              8192,
+              4096
+            ],
+            "blk.19.attn_output_a.weight": [
+              8192,
+              4096
+            ],
+            "blk.2.attn_output_a.weight": [
+              8192,
+              4096
+            ],
+            "blk.20.attn_output_a.weight": [
+              8192,
+              4096
+            ],
+            "blk.21.attn_output_a.weight": [
+              8192,
+              4096
+            ],
+            "blk.22.attn_output_a.weight": [
+              8192,
+              4096
+            ],
+            "blk.23.attn_output_a.weight": [
+              8192,
+              4096
+            ],
+            "blk.24.attn_output_a.weight": [
+              8192,
+              4096
+            ],
+            "blk.25.attn_output_a.weight": [
+              8192,
+              4096
+            ],
+            "blk.26.attn_output_a.weight": [
+              8192,
+              4096
+            ],
+            "blk.27.attn_output_a.weight": [
+              8192,
+              4096
+            ],
+            "blk.28.attn_output_a.weight": [
+              8192,
+              4096
+            ],
+            "blk.29.attn_output_a.weight": [
+              8192,
+              4096
+            ],
+            "blk.3.attn_output_a.weight": [
+              8192,
+              4096
+            ],
+            "blk.30.attn_output_a.weight": [
+              8192,
+              4096
+            ],
+            "blk.31.attn_output_a.weight": [
+              8192,
+              4096
+            ],
+            "blk.32.attn_output_a.weight": [
+              8192,
+              4096
+            ],
+            "blk.33.attn_output_a.weight": [
+              8192,
+              4096
+            ],
+            "blk.34.attn_output_a.weight": [
+              8192,
+              4096
+            ],
+            "blk.35.attn_output_a.weight": [
+              8192,
+              4096
+            ],
+            "blk.36.attn_output_a.weight": [
+              8192,
+              4096
+            ],
+            "blk.37.attn_output_a.weight": [
+              8192,
+              4096
+            ],
+            "blk.38.attn_output_a.weight": [
+              8192,
+              4096
+            ],
+            "blk.39.attn_output_a.weight": [
+              8192,
+              4096
+            ],
+            "blk.4.attn_output_a.weight": [
+              8192,
+              4096
+            ],
+            "blk.5.attn_output_a.weight": [
+              8192,
+              4096
+            ],
+            "blk.6.attn_output_a.weight": [
+              8192,
+              4096
+            ],
+            "blk.7.attn_output_a.weight": [
+              8192,
+              4096
+            ],
+            "blk.8.attn_output_a.weight": [
+              8192,
+              4096
+            ],
+            "blk.9.attn_output_a.weight": [
+              8192,
+              4096
+            ]
+          },
+          "attention_output_groups": 8,
+          "auto_dense_cpu": false,
+          "auto_placement": false,
+          "backend": "vulkan",
+          "chat": true,
+          "context": 249,
+          "cubecl_formats": [
+            8,
+            10,
+            12,
+            14
+          ],
+          "decode_cpu_fallbacks": [
+            0
+          ],
+          "decode_text_file": null,
+          "decode_tokens": 128,
+          "dense_device": "Intel(R) Arc(tm) Pro B50 Graphics (BMG G21)",
+          "dispatch": "CubeClNext",
+          "driver_memory_after": {
+            "drm-resident-gtt": 2097152,
+            "drm-resident-stolen": 0,
+            "drm-resident-system": 0,
+            "drm-resident-vram0": 9538830336,
+            "drm-total-gtt": 2097152,
+            "drm-total-stolen": 0,
+            "drm-total-system": 0,
+            "drm-total-vram0": 9538830336
+          },
+          "elements_by_ggml_dtype": {
+            "0": 515440,
+            "1": 717619200,
+            "10": 196653253120,
+            "12": 385980825600,
+            "8": 6574833664
+          },
+          "engram_disabled": false,
+          "expert_cache_budget_bytes": null,
+          "expert_cache_report": null,
+          "expert_device": "CPU",
+          "expert_placement": "cpu-mmap",
+          "explicit_dense_cpu": false,
+          "explicit_expert_cache_mib": null,
+          "gpu": "Intel(R) Arc(tm) Pro B50 Graphics (BMG G21)",
+          "greedy_text": " to a of and, of a ized,, the the's the,  ., the a and and and  and cc. and  of, and the   of. The the,, the the  to The the of the 16 B . to a 4.B  the,, the the ofB to the , a.. and the ing of the a the. ing and , the,, the  .,, ,, s  of  to, and a ,, the  , the the the to a, the to",
+          "kernel": "production",
+          "load_seconds": 4.385041539,
+          "loaded_host_memory_kib": {
+            "RssAnon": 183248,
+            "RssFile": 63888,
+            "RssShmem": 36,
+            "VmRSS": 247172,
+            "VmSwap": 0
+          },
+          "loaded_io_counters": {
+            "cancelled_write_bytes": 0,
+            "rchar": 8986479779,
+            "read_bytes": 8980324352,
+            "syscr": 1822846,
+            "syscw": 2,
+            "wchar": 250,
+            "write_bytes": 4096
+          },
+          "loaded_reserved_live": [
+            9365831680,
+            9224831488
+          ],
+          "logit_rows": 129,
+          "max_repeat_logit_difference": 0.0,
+          "median_ms_per_token": 824.7297762812502,
+          "model": "/home/tserica/models/DSV41-REAP272E-balanced.gguf",
+          "model_bytes": 290070476416,
+          "ms_per_token": [
+            824.7297762812502
+          ],
+          "passes": 1,
+          "peak_reserved_live": [
+            9500049408,
+            9236945920
+          ],
+          "peak_rss_kib": 73178524,
+          "placement_probe_skipped": false,
+          "prefill_chunk": 32,
+          "prefill_cpu_fallbacks": [
+            0
+          ],
+          "prefill_ms": [
+            42741.468111
+          ],
+          "prompt_file": "/home/tserica/joshua/kernels-cubecl/benchmarks/deepseek-realistic-prompt.txt",
+          "prompt_tokens": 121,
+          "reference_logits_bytes": 66708480,
+          "tokens_per_second": 1.2125183651171811,
+          "top1": [
+            304,
+            260,
+            294,
+            305,
+            14,
+            294,
+            260,
+            223,
+            1766,
+            14,
+            14,
+            270,
+            270,
+            734,
+            270,
+            14,
+            223,
+            223,
+            16,
+            14,
+            270,
+            260,
+            305,
+            305,
+            305,
+            223,
+            305,
+            274,
+            69,
+            16,
+            305,
+            223,
+            294,
+            14,
+            305,
+            270,
+            223,
+            223,
+            294,
+            16,
+            455,
+            270,
+            14,
+            14,
+            270,
+            270,
+            223,
+            304,
+            455,
+            270,
+            294,
+            270,
+            223,
+            926,
+            223,
+            36,
+            223,
+            16,
+            304,
+            260,
+            223,
+            22,
+            16,
+            36,
+            223,
+            270,
+            14,
+            14,
+            270,
+            270,
+            294,
+            36,
+            304,
+            270,
+            223,
+            14,
+            260,
+            16,
+            16,
+            305,
+            270,
+            223,
+            288,
+            294,
+            270,
+            260,
+            270,
+            16,
+            223,
+            288,
+            305,
+            223,
+            14,
+            270,
+            14,
+            14,
+            270,
+            223,
+            223,
+            16,
+            14,
+            14,
+            223,
+            14,
+            14,
+            223,
+            85,
+            223,
+            294,
+            223,
+            304,
+            14,
+            305,
+            260,
+            223,
+            14,
+            14,
+            270,
+            223,
+            223,
+            14,
+            270,
+            270,
+            270,
+            304,
+            260,
+            14,
+            270,
+            304
+          ],
+          "vocab": 129280,
+          "warm_decode": 2,
+          "warm_host_memory_kib": {
+            "RssAnon": 189040,
+            "RssFile": 24992268,
+            "RssShmem": 36,
+            "VmRSS": 25181344,
+            "VmSwap": 0
+          },
+          "warm_io_counters": {
+            "cancelled_write_bytes": 0,
+            "rchar": 86883771725,
+            "read_bytes": 69852577792,
+            "syscr": 1841532,
+            "syscw": 5,
+            "wchar": 425,
+            "write_bytes": 4096
+          },
+          "warm_prompt_tokens": 8,
+          "warm_reserved_live": [
+            9365831680,
+            9224831488
+          ],
+          "warm_rss_kib": 25181344,
+          "memory_samples_count": 132,
+          "memory_samples_sha256": "c72904b44d8aceab62b19f922e1b6a0f676e2ef7e02b4b4e9112c76ac4ac6502",
+          "sample_ranges": {
+            "prefill_pass1": {
+              "position": [
+                32,
+                121
+              ],
+              "reserved_bytes": [
+                9500049408,
+                9500049408
+              ],
+              "live_bytes": [
+                9236945920,
+                9236945920
+              ],
+              "total_anonymous_kib": [
+                189240,
+                189252
+              ],
+              "file_kib": [
+                45889572,
+                69853268
+              ]
+            },
+            "decode_pass1": {
+              "position": [
+                122,
+                249
+              ],
+              "reserved_bytes": [
+                9500049408,
+                9500049408
+              ],
+              "live_bytes": [
+                9236945920,
+                9236945920
+              ],
+              "total_anonymous_kib": [
+                189252,
+                189292
+              ],
+              "file_kib": [
+                70239536,
+                73112484
+              ]
+            }
+          }
+        },
+        "logits_sha256": "ab6fb262586daa5d1a3ea4baa89d1ef5b8afce4ee2b6750306357ff8f0892333",
+        "candidate_logits_sha256": "ab6fb262586daa5d1a3ea4baa89d1ef5b8afce4ee2b6750306357ff8f0892333",
+        "bit_identical": true,
+        "same_allocator_trajectory": true,
+        "finished_at_utc": "2026-10-23T03:43:12.676349+00:00"
+      }
+    ]
+  },
+  "production_policy": {
+    "enabled": true,
+    "vendor_id": "8086",
+    "device_id": "E212",
+    "dispatch": "CubeClNext",
+    "other_adapters": "unchanged",
+    "generic_override": "JOSHUA_VULKAN_QGEMV=generic"
+  },
+  "validation": {
+    "native_vulkan_tests": {
+      "passed": 7,
+      "ignored_timing_tests": 2,
+      "command": "cargo test --features vulkan --test cubecl_vulkan_tests -- --test-threads=1"
+    },
+    "candle_vulkan_tests": {
+      "passed": 11,
+      "filtered_other_tests": 20,
+      "command": "cargo test -p candle-core --features vulkan --lib vulkan_backend -- --test-threads=1"
+    },
+    "release_build": "cargo build --release --features vulkan --example bench_cubecl_real"
+  },
+  "report_tool_notes": "Cast the NumPy session-speed comparison to a JSON-serializable Python bool and date reports using America/Los_Angeles; acceptance thresholds were not changed."
+}

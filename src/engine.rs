@@ -2011,6 +2011,11 @@ impl Engine {
             crate::placement::ResolvedDense::Device => device.clone(),
             crate::placement::ResolvedDense::Cpu => Device::Cpu,
         };
+        // Dense-only loaders still validate the expert-device argument. Keep
+        // it with dense when there is no routed pool to place separately.
+        if expert_bytes == 0 {
+            expert_device = dense_device.clone();
+        }
         if !device.is_cpu() && dense_device.is_cpu() {
             tracing::info!(
                 "dense placement: cpu — keeping the dense set on CPU-BLAS (requested {:?}); \
@@ -2122,7 +2127,11 @@ impl Engine {
                 match crate::placement::auto_vram_expert_cache(
                     requested_placement,
                     placement,
-                    cache_capable,
+                    // V4.1's CPU software cache changes the mixed expert path
+                    // without accelerating it. Auto requires an actual device
+                    // consumer; explicit cache requests remain explicit.
+                    cache_capable && (arch != Some(Architecture::DeepSeek41)
+                        || !dense_device.is_cpu() || !expert_device.is_cpu()),
                     vram_cache_leftover,
                     expert_device_bytes,
                     bench.as_ref().map(|b| b.decode_speedup()),
@@ -2143,7 +2152,10 @@ impl Engine {
                         {
                             if let Some(freed) = crate::placement::dense_to_cpu_for_cache(
                                 &decline,
-                                cache_capable,
+                                // Moving dense must leave an accelerator for
+                                // the V4.1 cache, not silently build it on CPU.
+                                cache_capable && (arch != Some(Architecture::DeepSeek41)
+                                    || !expert_device.is_cpu()),
                                 dense_term,
                                 leftover,
                                 expert_device_bytes,
@@ -2408,9 +2420,9 @@ impl Engine {
 
     /// Pick the compute device for [`ComputeBackend::Auto`].
     ///
-    /// With the `cuda` or `metal` cargo feature enabled this tries the GPU
-    /// first and falls back to CPU (with a warning) when no usable device is
-    /// present at runtime.  Without those features it is always CPU.
+    /// Tries compiled backends in CUDA, Metal, OpenCL, Vulkan, SYCL order,
+    /// then CPU. This selects an available backend; dense placement is
+    /// measured separately after opening it.
     fn default_device() -> Device {
         #[cfg(feature = "cuda")]
         {
@@ -2696,6 +2708,11 @@ impl Engine {
     /// [`EngineOptions::expert_placement`]).
     pub fn expert_device(&self) -> &Device {
         &self.expert_device
+    }
+
+    /// Device holding the dense projections after automatic placement.
+    pub fn dense_device(&self) -> &Device {
+        &self.dense_device
     }
 
     /// The resolved bounded VRAM expert-cache byte budget the loaders get:
@@ -5116,6 +5133,8 @@ fn tensor_stem(name: &str) -> &str {
 /// How a loader keeps a tensor resident on an accelerator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Residency {
+    /// Borrowed or loaded on CPU even when dense projections use a GPU.
+    Host,
     /// In its quantized blocks (a `QMatMul` weight, a routed expert).
     Quantized,
     /// Dequantized to f32 (norms, biases, dequantized tables, …).
@@ -5126,6 +5145,7 @@ enum Residency {
 
 /// The residency of tensor `name` under `arch`'s loader.
 ///
+/// * DeepSeek-V4.1 Engram tables stay on CPU; only gathered rows transfer.
 /// * Routed experts are never dequantized.
 /// * Every loader decodes each dense tensor in a dtype candle cannot
 ///   represent (the i-quants, MXFP4, Q1_0, I32, …) to f32 on the device.
@@ -5148,6 +5168,16 @@ fn residency(
     let Some(arch) = arch else {
         return Residency::Unknown;
     };
+    let stem = tensor_stem(name);
+    if arch == Architecture::DeepSeek41 {
+        match stem {
+            // The DeepSeek loader keeps this table on CPU; only selected
+            // rows cross to the accelerator before the wkv projection.
+            "engram_embd" => return Residency::Host,
+            "engram_q" | "engram_k" => return Residency::F32,
+            _ => {}
+        }
+    }
     if !crate::gguf_ext::is_candle_supported(info.dtype) {
         return Residency::F32;
     }
@@ -5166,7 +5196,6 @@ fn residency(
     if name.ends_with(".bias") || name.contains("norm") {
         return Residency::F32;
     }
-    let stem = tensor_stem(name);
     if stem == "ffn_gate_inp" {
         return match arch {
             Architecture::Llama => Residency::Quantized,
@@ -5174,7 +5203,9 @@ fn residency(
             _ => Residency::Unknown,
         };
     }
-    if QUANTIZED_MATRIX_STEMS.contains(&stem) {
+    if QUANTIZED_MATRIX_STEMS.contains(&stem)
+        || (arch == Architecture::DeepSeek41 && stem == "engram_wkv")
+    {
         Residency::Quantized
     } else if F32_STEMS.contains(&stem) {
         Residency::F32
@@ -5198,6 +5229,7 @@ fn resident_tensor_bounds(
         .map(|b| b as u64)
         .unwrap_or(f32_bytes);
     match residency(arch, name, info) {
+        Residency::Host => (0, 0),
         Residency::Quantized => (quantized, quantized),
         Residency::F32 => (f32_bytes, f32_bytes),
         Residency::Unknown => (quantized, f32_bytes),
@@ -7041,6 +7073,48 @@ mod tests {
                 .mlock_hot_weights(MlockMode::Required)
                 .mlock_hot_weights,
             MlockMode::Required
+        );
+    }
+
+    #[test]
+    fn deepseek41_engram_table_stays_out_of_device_weight_budget() {
+        use crate::gguf_ext::{GgufHeader, RawTensorInfo};
+        use std::collections::HashMap;
+        let table = RawTensorInfo {
+            dtype: 10,
+            dims: vec![256, 1_000_000],
+            offset: 0,
+        };
+        let projection = RawTensorInfo {
+            dtype: 12,
+            dims: vec![256, 1],
+            offset: 0,
+        };
+        let arch = Some(Architecture::DeepSeek41);
+        let host_name = "blk.7.engram_embd.weight";
+        let header = GgufHeader {
+            version: 3,
+            metadata: HashMap::new(),
+            tensors: HashMap::from([
+                (host_name.into(), table.clone()),
+                ("blk.7.engram_wkv.weight".into(), projection.clone()),
+                ("blk.7.engram_q.weight".into(), projection.clone()),
+                ("blk.7.engram_k.weight".into(), projection.clone()),
+            ]),
+            tensor_data_offset: 0,
+        };
+        let footprint = device_weight_bytes(&header, arch);
+        // Packed wkv plus the two f32 norm vectors; no device table copy.
+        assert_eq!(footprint.dense_lower, 144 + 2 * 256 * 4);
+        assert_eq!(footprint.dense_upper, footprint.dense_lower);
+        assert_eq!(footprint.experts, 0);
+        assert_eq!(resident_tensor_bounds(arch, host_name, &table), (0, 0));
+        // Restrict the exception to the architecture whose loader guarantees it.
+        assert!(resident_tensor_bounds(Some(Architecture::DeepSeek4), host_name, &table).0 > 0);
+        assert!(resident_tensor_bounds(None, host_name, &table).0 > 0);
+        assert_eq!(
+            resident_tensor_bounds(arch, "blk.7.engram_future.weight", &projection),
+            (144, 1024)
         );
     }
 

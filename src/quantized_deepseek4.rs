@@ -116,6 +116,9 @@ struct EngramConfig {
 
 impl EngramConfig {
     fn from_meta(m: &Meta, n_layer: usize) -> Result<Option<Self>> {
+        if std::env::var_os("JOSHUA_NO_ENGRAM").is_some() {
+            return Ok(None);
+        }
         let Some(layer_ids) = m.array_u64("engram.layer_ids") else {
             return Ok(None);
         };
@@ -1764,31 +1767,13 @@ impl Attention {
         )?;
         let o = o4.transpose(1, 2)?.squeeze(0)?; // [seq, h, d]
 
-        // Grouped output projection.  `wo_a` is [o_group_dim, o_groups*o_lora_rank]:
-        // per group g the block of columns [g*r, (g+1)*r) applies to the g-th
-        // group of heads.  A single matmul produces all groups; the diagonal
-        // gather extracts y[s, g, r] = oa[s, g, g*o_lora_rank + r].
+        // Each group uses only its diagonal block of wo_a. Native Q8 decode
+        // computes those outputs directly; prefill retains the original GEMM.
         let o_group_dim = (self.n_head / self.o_groups) * self.head_dim;
         let og = o.reshape((seq, self.o_groups, o_group_dim))?;
-        let oa = self
-            .wo_a
-            .forward(&og.reshape((seq * self.o_groups, o_group_dim))?)?; // [seq*g, g*r]
-        let oa = oa.reshape((seq, self.o_groups, self.o_groups * self.o_lora_rank))?;
-        // Diagonal block select: y[s, g, r] = oa[s, g, g·o_lora_rank + r].
-        // The gather this used to run through refilled a host index Vec with
-        // a pattern that is identical for every sequence position and depends
-        // only on (o_groups, o_lora_rank) — configuration — then uploaded it
-        // on every forward.  Take each group's block with a zero-copy narrow
-        // and concatenate instead: the cat writes exactly the output rows in
-        // the gather's order, with no index tensor and no host fill.
-        let blocks: Vec<Tensor> = (0..self.o_groups)
-            .map(|g| {
-                oa.narrow(1, g, 1)?
-                    .narrow(D::Minus1, g * self.o_lora_rank, self.o_lora_rank)?
-                    .squeeze(1)
-            })
-            .collect::<Result<_>>()?;
-        let y = Tensor::cat(&blocks, 1)?.contiguous()?;
+        let y = crate::attention::grouped_output_projection(
+            &self.wo_a, &og, self.o_groups, self.o_lora_rank,
+        )?;
         self.wo_b.forward(&y)?.reshape((1, seq, ()))
     }
 

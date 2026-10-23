@@ -183,6 +183,14 @@ impl Allocator {
 
 // ─── Device ──────────────────────────────────────────────────────────────────
 
+/// One private, reusable dequantization target. It deliberately owns no
+/// VulkanDevice/Arc: storing a VulkanStorage in its device would form a cycle.
+struct QuantGemmScratch {
+    buffer: vk::Buffer,
+    alloc: Alloc,
+    capacity: u64,
+}
+
 /// One Vulkan logical device with everything the storage and the kernels
 /// share, behind an `Arc` so every clone keeps the handles alive.
 struct VulkanContext {
@@ -195,6 +203,10 @@ struct VulkanContext {
     limits: Limits,
     buffer_align: u64,
     mem: Mutex<Allocator>,
+    // Lock order: quant_gemm_scratch -> exec -> mem. Hold this guard through
+    // both dispatches so concurrent requests cannot overwrite another GEMM's
+    // weights between dequantization and use.
+    quant_gemm_scratch: Mutex<Option<QuantGemmScratch>>,
     exec: std::mem::ManuallyDrop<Mutex<kernels::Exec>>,
     pipes: Mutex<kernels::PipeMap>,
     layouts: Mutex<HashMap<u32, Arc<kernels::Layouts>>>,
@@ -210,6 +222,9 @@ impl Drop for VulkanContext {
             // The recorder owns its command pool / fence / ring: destroy it
             // before the device.
             std::mem::ManuallyDrop::drop(&mut self.exec);
+            if let Some(scratch) = self.quant_gemm_scratch.get_mut().unwrap_or_else(|p| p.into_inner()).take() {
+                self.device.destroy_buffer(scratch.buffer, None);
+            }
             for (_, p) in self.pipes.lock().unwrap_or_else(|p| p.into_inner()).drain() {
                 self.device.destroy_pipeline(p.pipeline, None);
             }
@@ -260,7 +275,7 @@ const TENSOR_USAGE: vk::BufferUsageFlags = vk::BufferUsageFlags::from_raw(
 /// concurrent instance creation).
 static INIT: Mutex<()> = Mutex::new(());
 
-fn init_vulkan(gpu_id: usize) -> Result<VulkanDevice> {
+fn init_vulkan(gpu_id: usize, qgemv: Option<kernels::Qgemv>) -> Result<VulkanDevice> {
     let _guard = INIT.lock().unwrap_or_else(|p| p.into_inner());
     let entry = unsafe { ash::Entry::load() }
         .map_err(|e| Error::Msg(format!("vulkan: failed to load libvulkan.so ({e}); is a Vulkan loader + ICD installed?")))?;
@@ -370,7 +385,7 @@ fn init_vulkan(gpu_id: usize) -> Result<VulkanDevice> {
         max_storage_range: lim.max_storage_buffer_range as u64,
         max_groups_x: lim.max_compute_work_group_count[0].max(1),
         host_unified,
-        qgemv: kernels::Qgemv::for_device(props.vendor_id, int_dot),
+        qgemv: qgemv.unwrap_or_else(|| kernels::Qgemv::for_adapter(props.vendor_id, props.device_id, int_dot)),
         int_dot,
     };
     let exec = match kernels::Exec::new(&device, queue, queue_family, mem_type) {
@@ -390,6 +405,7 @@ fn init_vulkan(gpu_id: usize) -> Result<VulkanDevice> {
             limits,
             buffer_align: req.alignment.max(16),
             mem: Mutex::new(Allocator { blocks: Vec::new(), chunk: CHUNK_BYTES, mem_type }),
+            quant_gemm_scratch: Mutex::new(None),
             exec: std::mem::ManuallyDrop::new(Mutex::new(exec)),
             pipes: Mutex::new(HashMap::new()),
             layouts: Mutex::new(HashMap::new()),
@@ -411,7 +427,26 @@ fn init_vulkan(gpu_id: usize) -> Result<VulkanDevice> {
 
 impl VulkanDevice {
     pub fn new(gpu_id: usize) -> Result<Self> {
-        init_vulkan(gpu_id)
+        init_vulkan(gpu_id, None)
+    }
+
+    /// Explicit kernel selection for parity tests and device benchmarks.
+    pub fn new_with_qgemv(gpu_id: usize, kernel: kernels::Qgemv) -> Result<Self> {
+        init_vulkan(gpu_id, Some(kernel))
+    }
+
+    /// Current sub-allocator usage, including allocations awaiting batch
+    /// completion. Synchronize first for a quiescent snapshot. The command
+    /// ring and driver-owned pipeline memory are fixed/separate from this pool.
+    pub fn memory_stats(&self) -> (u64, u64) {
+        let mem = self.inner.mem.lock().unwrap_or_else(|p| p.into_inner());
+        let mut reserved = 0;
+        let mut used = 0;
+        for b in mem.blocks.iter().flatten() {
+            reserved += b.size;
+            used += b.size - b.free.iter().map(|(_, size)| size).sum::<u64>();
+        }
+        (reserved, used)
     }
 
     pub fn new_with_stream(gpu_id: usize) -> Result<Self> {
@@ -479,7 +514,16 @@ impl VulkanDevice {
     /// Submit and wait for the pending batch, then release the buffers it
     /// referenced.
     pub fn flush(&self) -> Result<()> {
-        let garbage = self.exec().flush()?;
+        // Exclude another dequantize/GEMM pair until this batch has completed
+        // and its scratch has been retired. Ordinary decode never creates it.
+        let mut scratch = self.inner.quant_gemm_scratch.lock().unwrap_or_else(|p| p.into_inner());
+        let mut exec = self.exec();
+        let mut garbage = exec.flush()?;
+        exec.batch_limit = kernels::MAX_LAUNCHES;
+        drop(exec);
+        if let Some(s) = scratch.take() {
+            garbage.push(kernels::Garbage { buffer: s.buffer, alloc: s.alloc });
+        }
         self.free_garbage(garbage);
         Ok(())
     }
@@ -1517,6 +1561,26 @@ impl QVulkanStorage {
         Ok(out)
     }
 
+    pub fn grouped_q8_eligible(&self, groups: usize, n: usize, k: usize) -> bool {
+        self.dtype == GgmlDType::Q8_0 && kernels::grouped_q8_eligible(self.device(), groups, n, k)
+    }
+
+    pub fn grouped_q8_fwd(&self, shape: &Shape, storage: &VulkanStorage,
+        layout: &Layout, groups: usize) -> Result<(VulkanStorage, Shape)> {
+        let (n, k) = shape.dims2()?;
+        let dev = self.device();
+        if storage.dtype != DType::F32 || !dev.same_device(&storage.device)
+            || layout.shape().dims() != [groups, k] || !self.grouped_q8_eligible(groups, n, k) {
+            return Err(Error::Msg("vulkan grouped Q8: incompatible input".into()));
+        }
+        let Some((offset, _)) = layout.contiguous_offsets() else {
+            return Err(Error::Msg("vulkan grouped Q8: noncontiguous input".into()));
+        };
+        let out = dev.alloc(DType::F32, n)?;
+        kernels::run_grouped_q8(dev, storage.buf(), self.inner.buf(), out.buf(), groups, n, k, offset)?;
+        Ok((out, Shape::from((1, n))))
+    }
+
     /// `x @ W^T` for `x` on the device (f32, contiguous) and this `[n, k]` weight.
     pub fn fwd(&self, self_shape: &Shape, storage: &VulkanStorage, layout: &Layout) -> Result<(VulkanStorage, Shape)> {
         if storage.dtype != DType::F32 {
@@ -1554,10 +1618,28 @@ impl QVulkanStorage {
                 kernels::run_qgemv(dev, self.dtype, storage.buf(), w, out.buf(), m, n, k, o1)?;
             }
             _ => {
-                let wf = self.dequantize(n * k)?;
+                let bytes = n.checked_mul(k).and_then(|v| v.checked_mul(4))
+                    .ok_or_else(|| Error::Msg("vulkan qgemm scratch size overflow".into()))?.max(4) as u64;
+                let mut scratch = dev.inner.quant_gemm_scratch.lock().unwrap_or_else(|p| p.into_inner());
+                // Bound queued activations as well as expanded weights. Keep
+                // submission in the recorder, after complete dispatch recording.
+                dev.exec().batch_limit = kernels::PREFILL_MAX_LAUNCHES;
+                if scratch.as_ref().is_none_or(|s| s.capacity < bytes) {
+                    let (buffer, alloc, _) = dev.alloc_raw(bytes)?;
+                    if let Some(old) = scratch.replace(QuantGemmScratch { buffer, alloc, capacity: bytes }) {
+                        // The previous capacity may still be read by queued work.
+                        dev.release(old.buffer, old.alloc);
+                    }
+                }
+                let s = scratch.as_ref().unwrap();
+                let wf = Buf { buffer: s.buffer, bytes: s.capacity };
+                // The existing compute->compute barrier orders the previous
+                // GEMM's reads before this overwrite, then makes the new
+                // dequantized weights visible to GEMM. The recorder still governs submission; no additional copy.
+                kernels::run_dequant(dev, self.dtype, w, wf, n * k)?;
                 let sa = MatStrides { row: k, col: 1, offset: o1, batch: 0 };
                 let sb = MatStrides { row: 1, col: k, offset: 0, batch: 0 };
-                kernels::run_matmul(dev, storage.buf(), wf.buf(), out.buf(), (1, m, n, k), sa, sb)?;
+                kernels::run_matmul(dev, storage.buf(), wf, out.buf(), (1, m, n, k), sa, sb)?;
             }
         }
         Ok((out, dst_shape))
@@ -1827,6 +1909,106 @@ mod tests {
         Ok(())
     }
 
+    /// Repeated prefill GEMMs must not retain one f32 weight matrix per
+    /// dispatch. Alternate weights and grow scratch while old work is queued.
+    #[test]
+    fn vulkan_quantized_gemm_reuses_bounded_scratch() -> crate::Result<()> {
+        use crate::quantized::{QMatMul, QStorage, QTensor};
+        use crate::Module;
+        let vk = VulkanDevice::new(0)?;
+        let weak = Arc::downgrade(&vk.inner);
+        {
+            let dev = Device::Vulkan(vk.clone());
+            let x = Tensor::arange(0f32, (192 * 512) as f32, &Device::Cpu)?
+                .affine(0.003, -1.0)?.sin()?.reshape((192, 512))?.to_device(&dev)?;
+            let mut matrices = Vec::new();
+            let mut expected = Vec::new();
+            for (n, scale) in [(513, 0.002), (1024, 0.005)] {
+                let w = Tensor::arange(0f32, (n * 512) as f32, &Device::Cpu)?
+                    .affine(scale, -0.5)?.cos()?.reshape((n, 512))?;
+                let q = QTensor::quantize(&w, GgmlDType::Q8_0)?;
+                let q = QTensor::new(QStorage::from_data(q.data()?, &dev, GgmlDType::Q8_0)?, (n, 512))?;
+                expected.push(x.matmul(&q.dequantize(&dev)?.t()?)?.flatten_all()?.to_vec1::<f32>()?);
+                matrices.push(QMatMul::from_qtensor(q)?);
+            }
+            vk.flush()?;
+            let before = vk.memory_stats();
+            let mut retained = Vec::new();
+            // 512 dispatches: exercise the bounded prefill submission limit.
+            // The old path retains 384 MiB of expanded matrices here.
+            for i in 0..256 {
+                let out = matrices[i % 2].forward(&x)?;
+                if i < 2 || i >= 254 { retained.push((i % 2, out)); }
+            }
+            let queued = vk.memory_stats();
+            assert_eq!(vk.exec().batch_limit, kernels::PREFILL_MAX_LAUNCHES);
+            assert!(queued.0 <= before.0 + CHUNK_BYTES, "unbounded reservations: {before:?} -> {queued:?}");
+            assert!(queued.1 <= before.1 + (192 << 20), "expanded matrices retained: {before:?} -> {queued:?}");
+            for (which, out) in retained {
+                let actual = out.flatten_all()?.to_vec1::<f32>()?;
+                assert_eq!(actual, expected[which], "scratch overwrite changed queued output");
+            }
+            vk.flush()?;
+            assert_eq!(before, vk.memory_stats(), "scratch must retire at host readback");
+            assert_eq!(vk.exec().batch_limit, kernels::MAX_LAUNCHES, "readback must restore decode batching");
+            // Leave scratch queued again: dropping the device must not leak a
+            // self-owning VulkanStorage through the cache.
+            drop(matrices[0].forward(&x)?);
+        }
+        drop(vk);
+        assert!(weak.upgrade().is_none(), "scratch owns its device in an Arc cycle");
+        Ok(())
+    }
+
+    #[test]
+    fn vulkan_allocation_keeps_pending_arguments_alive() -> crate::Result<()> {
+        let vk = VulkanDevice::new(0)?;
+        let temporary = vk.alloc(DType::F32, 1)?;
+        kernels::run_fill(&vk, 4, temporary.buf(), 1, &Layout::contiguous(1), 0)?;
+        drop(temporary);
+        // Allocation can happen after raw arguments have been prepared. It
+        // must not submit and destroy their deferred owners at chunk pressure.
+        for _ in 0..33 {
+            drop(vk.alloc(DType::U8, 4 << 20)?);
+        }
+        assert!(vk.exec().recording, "allocation submitted pending arguments");
+        assert_eq!(vk.exec().garbage.len(), 34, "allocation retired prepared buffers");
+        vk.flush()?;
+        Ok(())
+    }
+
+    #[test]
+    fn vulkan_quantized_gemm_scratch_is_shared_safely_between_threads() -> crate::Result<()> {
+        use crate::quantized::{QMatMul, QStorage, QTensor};
+        use crate::Module;
+        let dev = Device::Vulkan(VulkanDevice::new(0)?);
+        let x = Tensor::arange(0f32, (32 * 512) as f32, &Device::Cpu)?
+            .affine(0.001, -0.5)?.sin()?.reshape((32, 512))?.to_device(&dev)?;
+        let mut jobs = Vec::new();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        for scale in [0.002, 0.005] {
+            let w = Tensor::arange(0f32, (512 * 512) as f32, &Device::Cpu)?
+                .affine(scale, -1.0)?.cos()?.reshape((512, 512))?;
+            let q = QTensor::quantize(&w, GgmlDType::Q8_0)?;
+            let q = QTensor::new(QStorage::from_data(q.data()?, &dev, GgmlDType::Q8_0)?, (512, 512))?;
+            let expected = x.matmul(&q.dequantize(&dev)?.t()?)?.flatten_all()?.to_vec1::<f32>()?;
+            jobs.push((QMatMul::from_qtensor(q)?, expected));
+        }
+        let threads: Vec<_> = jobs.into_iter().map(|(mm, expected)| {
+            let x = x.clone(); let barrier = barrier.clone();
+            std::thread::spawn(move || -> crate::Result<()> {
+                barrier.wait();
+                for _ in 0..32 {
+                    let out = mm.forward(&x)?.flatten_all()?.to_vec1::<f32>()?;
+                    assert_eq!(out, expected, "concurrent projection overwrote scratch");
+                }
+                Ok(())
+            })
+        }).collect();
+        for t in threads { t.join().unwrap()?; }
+        Ok(())
+    }
+
     /// Importance-weighted quantization on the device yields the CPU's blocks.
     #[test]
     fn vulkan_imatrix_quantize() -> crate::Result<()> {
@@ -1941,7 +2123,7 @@ mod tests {
             let bytes = q.data()?.into_owned();
             let wbuf = vd.storage_from_slice(&bytes)?;
             let xbuf = vd.storage_from_slice(&xv)?;
-            let mut variants = vec![kernels::Qgemv::Generic, kernels::Qgemv::Mali, kernels::Qgemv::MaliInt8 { hw_dot: false }];
+            let mut variants = vec![kernels::Qgemv::Generic, kernels::Qgemv::CubeCl, kernels::Qgemv::CubeClExpanded, kernels::Qgemv::Mali, kernels::Qgemv::MaliInt8 { hw_dot: false }];
             if vd.limits().int_dot {
                 variants.push(kernels::Qgemv::MaliInt8 { hw_dot: true });
             }

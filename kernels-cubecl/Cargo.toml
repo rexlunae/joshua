@@ -1,0 +1,16 @@
+[package]
+name = "joshua-kernels-cubecl"
+version = "0.0.1"
+edition = "2024"
+publish = false
+
+# Isolate the experiment and its toolchain/dependencies from Joshua's default build.
+[workspace]
+
+[dependencies]
+cubecl = { version = "=0.11.0", default-features = false, features = ["std", "wgpu"] }
+[dev-dependencies]
+naga = { version = "27", features = ["wgsl-in", "spv-out"] }
+half = "2"
+pollster = "0.4"
+candle-core = { path = "../vendor/candle-core", features = ["vulkan"] }

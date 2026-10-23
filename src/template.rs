@@ -757,7 +757,7 @@ mod tests {
     #[test]
     fn engine_variables_win_over_template_kwargs() {
         let t = ChatTemplate::new(
-            "{{ bos_token }}|{{ add_generation_prompt }}|{{ messages | length }}|{{ tools is defined }}|{{ custom }}",
+            "{{ bos_token }}|{% if add_generation_prompt %}generation{% else %}no_generation{% endif %}|{{ messages | length }}|{% if tools is defined %}tools{% else %}no_tools{% endif %}|{{ custom }}",
             "<s>",
             "",
         );
@@ -770,6 +770,8 @@ mod tests {
         let out = t
             .render_with_vars(&[msg("user", "hi")], None, &vars)
             .unwrap();
-        assert_eq!(out, "<s>|True|1|False|ok");
+        // Assert context precedence without depending on the renderer's
+        // feature-dependent spelling of boolean values.
+        assert_eq!(out, "<s>|generation|1|no_tools|ok");
     }
 }

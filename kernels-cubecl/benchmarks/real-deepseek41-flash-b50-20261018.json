@@ -1,0 +1,275 @@
+{
+  "date": "2026-10-18",
+  "generic": {
+    "after_session_reserved_live": [
+      [
+        9365831680,
+        9223318528
+      ],
+      [
+        9365831680,
+        9223318528
+      ],
+      [
+        9365831680,
+        9223318528
+      ]
+    ],
+    "after_session_rss_kib": [
+      21410428,
+      22014916,
+      22063576
+    ],
+    "architecture": "deepseek41",
+    "context": 12,
+    "cubecl_formats": [],
+    "decode_cpu_fallbacks": [
+      0,
+      0,
+      0
+    ],
+    "decode_tokens": 8,
+    "elements_by_ggml_dtype": {
+      "0": 515440,
+      "1": 717619200,
+      "10": 196653253120,
+      "12": 385980825600,
+      "8": 6574833664
+    },
+    "engram_disabled": false,
+    "expert_placement": "cpu-mmap",
+    "gpu": "Intel(R) Arc(tm) Pro B50 Graphics (BMG G21)",
+    "greedy_text": " of a a a a a a a a",
+    "kernel": "generic",
+    "load_seconds": 2.960310258,
+    "loaded_reserved_live": [
+      9365831680,
+      9223318528
+    ],
+    "logit_rows": 9,
+    "max_repeat_logit_difference": 0.0,
+    "median_ms_per_token": 5436.971529125,
+    "model": "/home/tserica/models/DSV41-REAP272E-balanced.gguf",
+    "model_bytes": 290070476416,
+    "ms_per_token": [
+      5665.476914125,
+      5436.971529125,
+      5415.252967125
+    ],
+    "passes": 3,
+    "peak_reserved_live": [
+      9365831680,
+      9233920000
+    ],
+    "peak_rss_kib": 22063576,
+    "prefill_chunk": 1,
+    "prefill_cpu_fallbacks": [
+      0,
+      0,
+      0
+    ],
+    "prompt_tokens": 4,
+    "tokens_per_second": 0.18392592174580233,
+    "top1": [
+      294,
+      260,
+      260,
+      260,
+      260,
+      260,
+      260,
+      260,
+      260
+    ],
+    "vocab": 129280,
+    "warm_decode": 2,
+    "warm_reserved_live": [
+      9365831680,
+      9223318528
+    ],
+    "warm_rss_kib": 16557824
+  },
+  "cubecl": {
+    "after_session_reserved_live": [
+      [
+        9365831680,
+        9223318528
+      ],
+      [
+        9365831680,
+        9223318528
+      ],
+      [
+        9365831680,
+        9223318528
+      ]
+    ],
+    "after_session_rss_kib": [
+      22062932,
+      22062960,
+      22062972
+    ],
+    "architecture": "deepseek41",
+    "context": 12,
+    "cubecl_formats": [
+      8,
+      10,
+      12
+    ],
+    "decode_cpu_fallbacks": [
+      0,
+      0,
+      0
+    ],
+    "decode_tokens": 8,
+    "elements_by_ggml_dtype": {
+      "0": 515440,
+      "1": 717619200,
+      "10": 196653253120,
+      "12": 385980825600,
+      "8": 6574833664
+    },
+    "engram_disabled": false,
+    "expert_placement": "cpu-mmap",
+    "gpu": "Intel(R) Arc(tm) Pro B50 Graphics (BMG G21)",
+    "greedy_text": " of a a a a a a a a",
+    "kernel": "cubecl",
+    "load_seconds": 2.914277493,
+    "loaded_reserved_live": [
+      9365831680,
+      9223318528
+    ],
+    "logit_rows": 9,
+    "max_repeat_logit_difference": 0.0,
+    "median_ms_per_token": 3449.971645125,
+    "model": "/home/tserica/models/DSV41-REAP272E-balanced.gguf",
+    "model_bytes": 290070476416,
+    "ms_per_token": [
+      3449.971645125,
+      3469.134136875,
+      3442.9691209999996
+    ],
+    "passes": 3,
+    "peak_reserved_live": [
+      9365831680,
+      9233920000
+    ],
+    "peak_rss_kib": 22062972,
+    "prefill_chunk": 1,
+    "prefill_cpu_fallbacks": [
+      0,
+      0,
+      0
+    ],
+    "prompt_tokens": 4,
+    "tokens_per_second": 0.2898574547454774,
+    "top1": [
+      294,
+      260,
+      260,
+      260,
+      260,
+      260,
+      260,
+      260,
+      260
+    ],
+    "vocab": 129280,
+    "warm_decode": 2,
+    "warm_reserved_live": [
+      9365831680,
+      9223318528
+    ],
+    "warm_rss_kib": 16788968
+  },
+  "prompt_ids": [
+    65106,
+    1192,
+    260,
+    19657
+  ],
+  "decode_input_ids": [
+    294,
+    260,
+    260,
+    260,
+    260,
+    260,
+    260,
+    260
+  ],
+  "speedup": 1.575946728955799,
+  "output_comparison": {
+    "logits_compared": 1163520,
+    "max_abs": 6.103515625e-05,
+    "rms_abs": 7.01285950274311e-06,
+    "absolute_difference_p50_p95_p99": [
+      4.410743713378906e-06,
+      1.33514404296875e-05,
+      2.086162567138672e-05
+    ],
+    "max_abs_by_row": [
+      2.8133392333984375e-05,
+      6.103515625e-05,
+      1.919269561767578e-05,
+      1.895427703857422e-05,
+      1.811981201171875e-05,
+      4.76837158203125e-05,
+      2.1457672119140625e-05,
+      3.647804260253906e-05,
+      3.8623809814453125e-05
+    ],
+    "top1_matching_rows": 9,
+    "rows": 9,
+    "top1_ids_match": true,
+    "greedy_text_match": true,
+    "max_softmax_kl_generic_to_cubecl": 1.2526208720799127e-11,
+    "within_absolute_1e_5": false
+  },
+  "memory_comparison": {
+    "loaded_device_bytes_identical": true,
+    "warm_device_bytes_identical": true,
+    "sampled_peak_device_bytes_identical": true,
+    "after_session_device_bytes_identical": true,
+    "generic_after_sessions_stable": true,
+    "cubecl_after_sessions_stable": true
+  },
+  "worst_logit": {
+    "row": 1,
+    "vocab_id": 389,
+    "generic": -5.024600028991699,
+    "cubecl": -5.024661064147949
+  },
+  "kernel_workgroups": {
+    "Q4_K": 64,
+    "Q8_0": 256,
+    "Q2_K": 64
+  },
+  "notes": [
+    "Local checkpoint is DeepSeek-V4.1 Flash REAP-272E, not original unpruned V4 Flash.",
+    "Dense weights on B50 native Vulkan; routed experts and engram tables borrowed from CPU mmap. Engram enabled.",
+    "Four raw prompt tokens, eight teacher-forced decode tokens, three shared-weight sessions per mode, two warmup decode tokens. Load and prefill excluded from decode timing; forward and host logits included.",
+    "Modes run serially in separate processes, generic first; median of three sessions. No competing GPU benchmark.",
+    "Q2_K projections with fewer than 64 output rows retain generic dispatch after a measured regression; the real model hyper-connection shape uses this fallback.",
+    "Expanded formats remain opt-in: maximum full-logit difference exceeds strict 1e-5 despite all greedy choices matching. No tolerance loosened.",
+    "Device allocator use is identical and stable. Generic host RSS increases while mmap pages warm; CubeCL after-session RSS spans only 40 KiB. Neither mode materializes the full expert pool.",
+    "The short raw prompt produced a repetitive continuation in both modes; parity is not a model-quality evaluation.",
+    "Sampled device peaks are at token boundaries; driver-private pipeline memory is outside allocator counters."
+  ],
+  "host_memory_sample": {
+    "generic_during_run_kib": {
+      "rss": 21996776,
+      "anonymous": 184912,
+      "file": 21811828
+    },
+    "cubecl_during_run_kib": {
+      "rss": 16788980,
+      "anonymous": 184556,
+      "file": 16604388
+    }
+  },
+  "model_stat": {
+    "size": 290070476416,
+    "mtime_ns": 1791489779497917185
+  }
+}
