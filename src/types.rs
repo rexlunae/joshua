@@ -500,13 +500,19 @@ fn parse_response_format(format: &serde_json::Value) -> Result<Option<Constraint
                 "response_format type `json_schema` requires `json_schema`".to_string()
             })?;
             // OpenAI wraps the schema as `{name, strict, schema}`; also
-            // accept a bare schema document for convenience.
-            let schema = if wrapper.get("type").is_some() {
-                wrapper
-            } else {
-                wrapper.get("schema").ok_or_else(|| {
-                    "response_format.json_schema requires `schema`".to_string()
-                })?
+            // accept a bare schema document for convenience.  JSON Schema
+            // does not require a top-level `type` (`properties`, `allOf`,
+            // `$ref`, `enum`, … are valid on their own), so the wrapper's
+            // `schema` key — not the presence of `type` — discriminates the
+            // two shapes.
+            let schema = match wrapper.get("schema") {
+                Some(schema) => schema,
+                // Wrapper-shaped but with no schema body: report the missing
+                // key rather than compiling `{name, strict}` as a schema.
+                None if wrapper.get("name").is_some() || wrapper.get("strict").is_some() => {
+                    return Err("response_format.json_schema requires `schema`".to_string());
+                }
+                None => wrapper,
             };
             if !schema.is_object() {
                 return Err("response_format.json_schema must be a JSON object".to_string());
@@ -1024,6 +1030,39 @@ mod tests {
         assert!(rejected(json!({"presence_penalty": 2.5})).contains("presence_penalty"));
         assert!(rejected(json!({"frequency_penalty": -3})).contains("frequency_penalty"));
         assert!(rejected(json!({"context_window": 0})).contains("context_window"));
+    }
+
+    #[test]
+    fn bare_schemas_need_no_top_level_type() {
+        // JSON Schema allows `properties`, `allOf`, `$ref` … without `type`.
+        let bare = json!({"properties": {"a": {"type": "integer"}}});
+        assert_eq!(
+            options(json!({
+                "response_format": {"type": "json_schema", "json_schema": bare}
+            }))
+            .constraint,
+            Some(ConstraintSpec::JsonSchema { schema: bare.clone() }),
+            "a bare schema without `type` must be accepted"
+        );
+        let all_of = json!({"allOf": [{"type": "object"}]});
+        assert_eq!(
+            options(json!({
+                "response_format": {"type": "json_schema", "json_schema": all_of}
+            }))
+            .constraint,
+            Some(ConstraintSpec::JsonSchema { schema: all_of.clone() })
+        );
+        // A wrapper that carries `name`/`strict` but no schema body is still
+        // an error rather than an empty schema.
+        assert!(
+            rejected(json!({
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {"name": "answer", "strict": true}
+                }
+            }))
+            .contains("schema")
+        );
     }
 
     #[test]

@@ -90,17 +90,24 @@ impl ConstraintEngine {
             .copied()
             .filter(|&id| (id as usize) < vocab_size)
             .collect();
-        let first_eos = eos.first().copied().unwrap_or(0);
-        if first_eos as usize >= vocab_size {
-            return Err("EOS token is outside the vocabulary".to_string());
+        // The grammar can only finish a document with an EOS token.  Falling
+        // back to token 0 (the old behaviour) made completion depend on a
+        // token the decode loop does not treat as EOS, so a finished document
+        // kept generating until `max_tokens`.  Reject the request instead: a
+        // tokenizer without an EOS cannot bound structured output at all.
+        if eos.is_empty() {
+            return Err(
+                "the tokenizer declares no EOS token, so a constrained document \
+                 could never finish; structured output needs a model EOS"
+                    .to_string(),
+            );
         }
+        let first_eos = eos[0];
         let mut trie = TokTrie::from(
             &TokRxInfo::new(vocab_size as u32, first_eos),
             &token_bytes,
         );
-        if !eos.is_empty() {
-            trie = trie.with_eos_tokens(&eos);
-        }
+        trie = trie.with_eos_tokens(&eos);
         let env: TokEnv = std::sync::Arc::new(ApproximateTokEnv::new(trie));
         let mut factory =
             ParserFactory::new_simple(&env).map_err(|e| format!("parser factory: {e}"))?;
@@ -316,6 +323,24 @@ mod tests {
         assert!(mask.is_allowed(1), "`{{` must be legal");
         assert!(!mask.is_allowed(4), "`a` cannot start an object");
         assert!(!mask.is_allowed(6), "`1` cannot start an object");
+    }
+
+    /// Without an EOS the grammar has no stop symbol the decode loop
+    /// recognises; token 0 used to stand in for it, so a finished document
+    /// kept generating.  Such a tokenizer must be rejected up front.
+    #[test]
+    fn a_tokenizer_without_eos_cannot_constrain() {
+        let err = match ConstraintEngine::from_path(&tokenizer_path(), &[]) {
+            Ok(_) => panic!("a null EOS must be rejected"),
+            Err(e) => e,
+        };
+        assert!(err.contains("no EOS"), "got: {err}");
+        // An EOS outside the vocabulary is just as unusable.
+        let err = match ConstraintEngine::from_path(&tokenizer_path(), &[999]) {
+            Ok(_) => panic!("an out-of-vocabulary EOS must be rejected"),
+            Err(e) => e,
+        };
+        assert!(err.contains("no EOS"), "got: {err}");
     }
 
     #[test]

@@ -2954,6 +2954,15 @@ impl Engine {
         let options = &self.clamp_options(options, Some(n_prompt));
         let root = root_chars.and_then(|c| self.root_tokens(prompt, c, add_special_tokens, prompt_tokens));
 
+        // ── Validate the structured-output constraint before any backend work ─
+        // A malformed `response_format` (or a tokenizer that cannot support
+        // one) is the client's error, not the backend's.  Compiling the
+        // grammar here keeps such a request away from the NPU health counter
+        // altogether; the decode loop then hits the cached matcher.
+        if options.constraint.is_some() {
+            self.constraint_matcher(options)?;
+        }
+
         // ── Acquire a session, generate, retry on CPU if the NPU fails ──────
         // Prefer a pooled instance whose state already covers a prefix of
         // this prompt; fall back to a reset instance or a fresh load.
@@ -2967,7 +2976,15 @@ impl Engine {
                 self.release_model(session, kv_tokens);
                 Ok((response, usage, prefill_tps, decode_tps))
             }
-            Err(e) if was_npu && !self.remote_only() => {
+            // Client errors (`InvalidRequest`) are not backend failures: they
+            // must not count against the NPU, and retrying them on the candle
+            // path would only reproduce the same error.  They fall through to
+            // the plain error arm below.
+            Err(e)
+                if was_npu
+                    && !self.remote_only()
+                    && !matches!(e, JoshuaError::InvalidRequest(_)) =>
+            {
                 // Count the failure (possibly disabling the backend), drop
                 // the session unless it can prove a clean reset, and retry
                 // the whole request once on the candle path.
@@ -6115,8 +6132,20 @@ fn squeeze_batch_logits(logits: &Tensor) -> Result<Vec<f32>> {
 
             // ── Temperature scaling ───────────────────────────────────────────────────
             let inv_temp = 1.0_f32 / opts.temperature;
-            // Subtract max for numerical stability before exp.
-            let max_logit = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            // Subtract the largest legal logit for numerical stability before
+            // exp.  The vocabulary-wide maximum is wrong under a grammar mask:
+            // one dominant forbidden token would push every permitted logit
+            // far below zero, their exponentials would underflow to zero, and
+            // a sampled request would silently fall back to greedy decoding.
+            let max_logit = match mask {
+                Some(mask) => logits
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| mask.is_allowed(*i as u32))
+                    .map(|(_, &l)| l)
+                    .fold(f32::NEG_INFINITY, f32::max),
+                None => logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max),
+            };
             let probs = &mut self.probs;
             probs.clear();
             probs.extend(logits.iter().map(|&l| ((l - max_logit) * inv_temp).exp()));
@@ -6485,6 +6514,33 @@ mod tests {
                 assert_eq!(probs[3], 0.0);
             }
             TokenDistRef::Greedy(_) => panic!("temperature 1 is not greedy"),
+        }
+    }
+
+    #[test]
+    fn a_dominant_forbidden_logit_does_not_starve_permitted_tokens() {
+        use crate::constraints::SimpleVob;
+
+        // Token 0 is a forbidden argmax far above the legal ones.  Scaling by
+        // the vocabulary maximum would underflow 0.0 and 1.0 to zero, leaving
+        // an empty distribution and a silent greedy fallback.
+        let logits = [1000.0_f32, 0.0, 1.0];
+        let mask = SimpleVob::from_slice(&[false, true, true]);
+        let opts = GenerationOptions {
+            temperature: 0.01,
+            top_k: 0,
+            top_p: 1.0,
+            min_p: 0.0,
+            ..Default::default()
+        };
+        let mut workspace = SamplingWorkspace::default();
+        match workspace.distribution(&logits, &opts, &[], Some(&mask)) {
+            TokenDistRef::Probs(probs) => {
+                assert_eq!(probs[0], 0.0, "the forbidden token stays masked");
+                assert!(probs[1] > 0.0, "a permitted token must survive: {probs:?}");
+                assert_eq!(probs[2], 1.0, "the legal argmax is the mode");
+            }
+            TokenDistRef::Greedy(_) => panic!("a sampled request must not become greedy"),
         }
     }
 
