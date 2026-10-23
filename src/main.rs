@@ -463,8 +463,9 @@ enum Commands {
         /// and picks by measured throughput.  Ignored on the CPU.
         #[arg(long, env = "JOSHUA_DENSE_PLACEMENT", default_value = "auto", value_parser = clap::value_parser!(DensePlacement))]
         dense_placement: DensePlacement,
-        /// Skip the `--dense auto` startup probe (fast launch; `auto` then keeps
-        /// the dense set on the device).
+        /// Skip the `--dense auto` startup probe (fast launch).  `auto` then keeps
+        /// its historical on-device default, still gated on the dense set fitting
+        /// the device memory budget (#176).
         #[arg(long, env = "JOSHUA_SKIP_PLACEMENT_BENCH", num_args = 0..=1, default_missing_value = "true")]
         skip_placement_bench: bool,
     },
@@ -703,8 +704,9 @@ enum Commands {
         /// and picks by measured throughput.  Ignored on the CPU.
         #[arg(long, env = "JOSHUA_DENSE_PLACEMENT", default_value = "auto", value_parser = clap::value_parser!(DensePlacement))]
         dense_placement: DensePlacement,
-        /// Skip the `--dense auto` startup probe (fast launch; `auto` then keeps
-        /// the dense set on the device).
+        /// Skip the `--dense auto` startup probe (fast launch).  `auto` then keeps
+        /// its historical on-device default, still gated on the dense set fitting
+        /// the device memory budget (#176).
         #[arg(long, env = "JOSHUA_SKIP_PLACEMENT_BENCH", num_args = 0..=1, default_missing_value = "true")]
         skip_placement_bench: bool,
     },
