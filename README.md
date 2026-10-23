@@ -24,7 +24,7 @@ framework) and [tokenizers](https://github.com/huggingface/tokenizers).
 | **Tool calling** | OpenAI-compatible `tools` / `tool_calls`, parsing Hermes/Qwen, Mistral, and Llama-3 call formats |
 | **Embeddings** | Dense sentence embeddings for llama / qwen2 / qwen3 embedding models, with GGUF pooling metadata |
 | **KV-cache reuse** | Multi-turn requests continue from a warm model pool and prefill only the new suffix — including across *context edits*: when an agent harness truncates or replaces middle blocks, the pooled session's KV state is rewound to the longest common token prefix instead of being cleared (Qwen and DeepSeek-V2/V3/K2 loaders; models with recurrent layers — Qwen3-Next, Qwen3.5, DeepSeek-V4/V4.1 — rewind to a state checkpoint at a prefill or turn boundary and re-prefill only the divergence). DeepSeek MLA caches the compressed latent (`c_kv` + `k_pe`) instead of the reconstructed per-head K/V, cutting KV memory ~70× |
-| **Speculative decoding** | `--speculative N` drafts up to N tokens per step by prompt lookup and verifies them in one forward pass, rolling the KV cache back past the first rejection — output unchanged (token-identical when greedy, same distribution when sampling), fewer weight sweeps on repetitive output (qwen-family, `deepseek2`-family and `deepseek4` loaders with a rewound-able KV cache, including the recurrent DeltaNet and KDA hybrids, whose running state is snapshotted before a pass and replayed on rollback; on `qwen4exp`'s PLE convolutions and candle's stock loaders the flag warns and is ignored) |
+| **Speculative decoding** | `--speculative N` drafts up to N tokens per step by prompt lookup and verifies them in one forward pass, rolling the KV cache back past the first rejection — output unchanged (token-identical when greedy, same distribution when sampling), fewer weight sweeps on repetitive output; `--draft-model PATH` drafts with a small model sharing the tokenizer instead (qwen-family, `deepseek2`-family and `deepseek4` loaders with a rewound-able KV cache, including the recurrent DeltaNet and KDA hybrids, whose running state is snapshotted before a pass and replayed on rollback; on `qwen4exp`'s PLE convolutions and candle's stock loaders the flag warns and is ignored) |
 | **Speculative expert prefetch** | Decode fires `MADV_WILLNEED` for each MoE layer's *predicted* experts (the ids its router chose last step — routing is temporally local) before any layer runs, so expert pages stream in behind compute instead of faulting on demand (`deepseek4` loader) |
 | **GPU (optional)** | `--features cuda`, `metal`, `opencl`, `vulkan` or `sycl` route inference through candle's GPU backends |
 | **NPU / llama.cpp interop (optional)** | Vendor plugins run in a crash-isolated shim process; a llama.cpp adapter brings every ggml backend (Hexagon NPU, CANN, CUDA, Vulkan, …) |
@@ -863,6 +863,8 @@ prints the dense/expert split of any GGUF to sanity-check a new model.
 | `JOSHUA_ROUTE_TRACE` | Path of a routing-trace CSV to write, for `cargo run --example cache_sim` |
 | `JOSHUA_PREFILL_CHUNK` | Tokens per prefill chunk (default 512; also `--prefill-chunk`) |
 | `JOSHUA_SPECULATIVE` | Max draft tokens per speculative decode step (default 0 = off; also `--speculative`) |
+| `JOSHUA_DRAFT_MODEL` | Draft GGUF for draft-model speculative decoding (also `--draft-model`) |
+| `JOSHUA_DRAFT_MAX` | Most draft-model tokens per step (default 4; also `--draft-max`) |
 | `JOSHUA_SIMD` | Force a lower CPU kernel family: `avx512`, `avx2`, `neon` or `scalar` (default: the widest the CPU supports).  Every level computes the same f32-activation math, so this bisects a numerical difference or a slowdown to one family |
 | `JOSHUA_SKIP_PLACEMENT_BENCH` | Skip the startup quantized-matmul probe that `auto` dense placement uses |
 | `JOSHUA_OPENCL_NATIVE` / `JOSHUA_VULKAN_NATIVE` | `0` runs every operator through the CPU round-trip instead of the device kernels (default on) |
@@ -929,6 +931,35 @@ the recurrent DeltaNet/KDA hybrids (qwen3next, qwen3.5, qwen4exp, glm5next,
 kimi-linear, kimi-k3, whose state only clears) — the flag warns at load,
 `Engine::speculative_config()` reads back `None`, and decoding stays one
 token per pass.
+
+### Draft model
+
+`--draft-model PATH` (or [`EngineOptions::draft_model`]) drafts with a
+separate small model that shares the target's tokenizer, e.g. Qwen3-0.6B for
+Qwen3-30B-A3B.  Each step the draft model proposes up to `--draft-max` tokens
+(default 4, adapted to the acceptance it sees) one cheap pass at a time, and
+the target verifies them in one forward pass as above.  Verification is
+position-keyed: a draft is kept only when it equals the token plain decoding
+would emit at that position (the target's argmax at temperature 0, its seeded
+draw otherwise), and a rejection emits that token instead.  Output is
+therefore token-identical to plain decoding whatever the draft model
+proposes; the draft's own distribution decides only how often it agrees.
+
+The draft keeps its own KV cache.  Before each draft it is cut back to the
+prefix it shares with the decode context and fed the rest, so it must be an
+attention-only model one of Joshua's own loaders serves (qwen3, qwen3moe,
+glm4, deepseek2, …); the load refuses others, and refuses a draft whose
+vocabulary disagrees with the target's on any shared id.  It runs on the
+target's dense device, loads once, and shares its weights across sessions,
+which are pooled with the tokens they hold.  When the target's dense set plus
+the draft's weights do not fit the device memory budget, the draft is ignored
+with a warning instead of leaving the target unable to upload.  It takes the
+place of prompt lookup and `--mtp`, and the cost gate (on by default) stops
+drafting while it measures slower than plain decoding.
+
+```bash
+joshua run Qwen3-30B-A3B-Q4_K_M.gguf "Explain ..." --draft-model Qwen3-0.6B-Q8_0.gguf --draft-max 4
+```
 
 ---
 
