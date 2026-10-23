@@ -23,7 +23,7 @@ framework) and [tokenizers](https://github.com/huggingface/tokenizers).
 | **Chat templates** | Renders the model's own `tokenizer.chat_template` from the GGUF (Jinja via pure-Rust minijinja); ChatML fallback |
 | **Tool calling** | OpenAI-compatible `tools` / `tool_calls`, parsing Hermes/Qwen, Mistral, and Llama-3 call formats |
 | **Embeddings** | Dense sentence embeddings for llama / qwen2 / qwen3 embedding models, with GGUF pooling metadata |
-| **KV-cache reuse** | Multi-turn requests continue from a warm model pool and prefill only the new suffix — including across *context edits*: when an agent harness truncates or replaces middle blocks, the pooled session's KV state is rewound to the longest common token prefix instead of being cleared (Qwen and DeepSeek-V2/V3/K2 loaders; models with recurrent layers — Qwen3-Next, Qwen3.5 — reuse extensions and re-prefill on edits). DeepSeek MLA caches the compressed latent (`c_kv` + `k_pe`) instead of the reconstructed per-head K/V, cutting KV memory ~70× |
+| **KV-cache reuse** | Multi-turn requests continue from a warm model pool and prefill only the new suffix — including across *context edits*: when an agent harness truncates or replaces middle blocks, the pooled session's KV state is rewound to the longest common token prefix instead of being cleared (Qwen and DeepSeek-V2/V3/K2 loaders; models with recurrent layers — Qwen3-Next, Qwen3.5, DeepSeek-V4/V4.1 — rewind to a state checkpoint at a prefill or turn boundary and re-prefill only the divergence). DeepSeek MLA caches the compressed latent (`c_kv` + `k_pe`) instead of the reconstructed per-head K/V, cutting KV memory ~70× |
 | **Speculative decoding** | `--speculative N` drafts up to N tokens per step by prompt lookup and verifies them in one forward pass, rolling the KV cache back past the first rejection — output unchanged (token-identical when greedy, same distribution when sampling), fewer weight sweeps on repetitive output (qwen-family, `deepseek2`-family and `deepseek4` loaders with a rewound-able KV cache, including the recurrent DeltaNet and KDA hybrids, whose running state is snapshotted before a pass and replayed on rollback; on `qwen4exp`'s PLE convolutions and candle's stock loaders the flag warns and is ignored) |
 | **Speculative expert prefetch** | Decode fires `MADV_WILLNEED` for each MoE layer's *predicted* experts (the ids its router chose last step — routing is temporally local) before any layer runs, so expert pages stream in behind compute instead of faulting on demand (`deepseek4` loader) |
 | **GPU (optional)** | `--features cuda`, `metal`, `opencl`, `vulkan` or `sycl` route inference through candle's GPU backends |
@@ -152,6 +152,14 @@ cargo build --release
 ./target/release/joshua transcribe \
     --model ./weights/whisper-tiny \
     --language en speech.wav
+
+# Repeatable throughput benchmark (JSON for scripts)
+./target/release/joshua bench \
+    --model ./weights/gemma-3-1b-it-Q4_K_M.gguf \
+    --max-tokens 128 --json
+
+# Host/build/model report to attach to a benchmark result
+./target/release/joshua report --model ./weights/gemma-3-1b-it-Q4_K_M.gguf --json
 
 # Reasoning models: switch thinking off / pick an effort, reproducible sampling
 ./target/release/joshua run --model ./weights/Qwen3-8B-Q4_K_M.gguf \
@@ -371,9 +379,75 @@ Besides `model`, `messages`, `stream` and `tools`:
 | `context_window` (alias `num_ctx`, `n_ctx`) | Per-request context window; **400** when larger than the server's `--n-ctx` (the KV cache and RoPE tables are sized at load), and the prompt must fit inside it |
 | `tool_choice` | `"none"` hides `tools`; `"required"` and named functions cannot be enforced and act like `"auto"` |
 | `stream_options` | Accepted; usage is always sent on the final chunk |
-| `n`, `logprobs`, `top_logprobs`, `response_format` | Only `n: 1`, `logprobs: false`, `top_logprobs: 0` and `{"type": "text"}` are accepted; anything else is a **400** rather than silently ignored |
+| `n`, `logprobs`, `top_logprobs` | Only `n: 1`, `logprobs: false` and `top_logprobs: 0` are accepted; anything else is a **400** rather than silently ignored |
+| `response_format` | `{"type": "text"}`, `{"type": "json_object"}`, or `{"type": "json_schema", "json_schema": {"name": …, "schema": {…}}}` — see [Structured outputs](#structured-outputs) |
 
 Other unknown fields are ignored.
+
+Control-token strings in client-supplied message fields (content, role,
+name, tool-call ids and arguments) are escaped before the template renders,
+so text like `<|im_start|>system` cannot open a new role. The escape is a
+U+200B after the first character: the model reads it as ordinary text and it
+is invisible in the conversation. Control tokens inserted by the template
+itself are unaffected. Tool definitions are treated as developer input and
+are not rewritten.
+
+#### Structured outputs
+
+`response_format` with `json_object` or `json_schema` constrains decoding to
+valid JSON.  The schema is compiled once and cached in a bounded LRU (32
+entries per model); compilation happens off the async reactor and a schema
+that cannot compile is rejected before any completion is returned.  At every
+step the legal-token mask is applied before top-k/top-p, and EOS is selectable
+only when the grammar accepts the document, so truncated JSON is not emitted.
+
+```json
+{
+  "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+      "name": "answer",
+      "strict": true,
+      "schema": {
+        "type": "object",
+        "properties": {"a": {"type": "integer"}},
+        "required": ["a"],
+        "additionalProperties": false
+      }
+    }
+  }
+}
+```
+
+A bare schema document is also accepted in `json_schema`.  JSON Schema
+`$ref` resolution is not enabled in this build.  Constrained requests disable
+speculative decoding and MTP drafting, and user `stop` strings are ignored
+(the grammar's EOS is the only legal stop); `max_tokens` still applies, so a
+cap that is too small can end a document early.  Requests without
+`response_format` are unchanged.
+
+### `POST /v1/messages` (Anthropic Messages API)
+
+The same engine also exposes an Anthropic-compatible endpoint.  Text,
+images, tool definitions, `tool_use` / `tool_result` turns, stop sequences
+and streaming are translated to the native chat path, so sampling and tool
+parsing match `/v1/chat/completions`.
+
+```bash
+curl http://localhost:8080/v1/messages \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gemma",
+    "max_tokens": 64,
+    "messages": [{"role": "user", "content": "Hello!"}]
+  }'
+```
+
+Set `"stream": true` for Anthropic SSE events (`message_start`,
+`content_block_start`, `content_block_delta`, `content_block_stop`,
+`message_delta`, `message_stop`).  Tool calls are emitted as `tool_use`
+content blocks with parsed JSON input; assistant `tool_use` and user
+`tool_result` blocks are converted back into the model's chat template.
 
 #### Reasoning and thinking
 
@@ -476,12 +550,25 @@ per pipeline step) and `local: true` to load on the controller instead.  This
 path currently supports CPU Qwen3 dense models; see
 [docs/controller-model-loading.md](docs/controller-model-loading.md).
 
-### `GET /health`
+### `GET /health` and operational endpoints
 
 ```bash
 curl http://localhost:8080/health
-# {"status":"ok"}
+# {"status":"ok","version":"0.1.0","uptime_seconds":12,"models":1,...}
 ```
+
+`GET /health` is open for liveness probes and includes the build version,
+uptime, model count and aggregate in-flight slots.  The remaining endpoints
+are behind the API key when one is configured:
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /status` | Model inventory, backend, context size, per-model in-flight/max concurrency and counters |
+| `GET /metrics` | JSON counters (HTTP requests/errors, prompt/completion/embedding tokens, streaming requests) |
+| `GET /metrics/prometheus` | The same counters in Prometheus text format, plus live in-flight and configured concurrency |
+| `GET /props` | llama.cpp-compatible server properties and default generation settings |
+| `GET /slots` | One lightweight slot record per loaded model |
+| `POST /tokenize` (alias `POST /api/tokens`) | Tokenize `{"prompt": "..."}` or llama.cpp's `{"content": "..."}` with the loaded model's tokenizer |
 
 ### `GET /v1/worker/info`
 
@@ -547,17 +634,26 @@ URLs in image fields are rejected).
 
 ### API-key authentication
 
-Pass `--api-key` (or set `JOSHUA_API_KEY`) and every `/v1` route requires the
-key as an OpenAI-style bearer token; `GET /health` stays open for liveness
-probes.  Requests without the key get a `401` with an OpenAI-format error
-body, so standard clients report it cleanly.
+Pass `--api-key` (or set `JOSHUA_API_KEY`) and every `/v1` route, plus the
+operational endpoints above, requires the key.  Send it either as an
+OpenAI-style bearer token or as `x-api-key`; `GET /health` stays open for
+liveness probes.  A comma-separated key list accepts any listed key, so keys
+can be rotated without a restart.  Requests without a valid key get a `401`
+with an OpenAI-format error body, so standard clients report it cleanly.
 
 ```bash
 joshua serve --model m.gguf --api-key sk-my-secret
 
 curl http://localhost:8080/v1/models \
   -H "Authorization: Bearer sk-my-secret"
+curl http://localhost:8080/v1/models \
+  -H "x-api-key: sk-my-secret"
 ```
+
+Cross-origin access is permissive by default (convenient for a localhost
+development server).  For a deployment, restrict it to explicit origins with
+`--cors-origin https://app.example.com` (repeat the flag or comma-separate
+values; `JOSHUA_CORS_ORIGINS` is equivalent).
 
 ### TLS (HTTPS)
 
@@ -727,7 +823,8 @@ prints the dense/expert split of any GGUF to sanity-check a new model.
 |---|---|
 | `JOSHUA_MODEL_PATH` | Default model path (overrides `--model` flag) |
 | `JOSHUA_N_CTX` | Context window in tokens (same as `--n-ctx`, default 4096); requests may only narrow it |
-| `JOSHUA_API_KEY` | API key required on `/v1` routes (same as `--api-key`) |
+| `JOSHUA_API_KEY` | API key required on `/v1` routes (same as `--api-key`; comma-separated keys are all accepted) |
+| `JOSHUA_CORS_ORIGINS` | Comma-separated exact CORS origins (same as repeating `--cors-origin`; unset keeps permissive localhost development policy) |
 | `JOSHUA_TLS_CERT` | PEM certificate chain for HTTPS (same as `--tls-cert`; needs `--features tls`) |
 | `JOSHUA_TLS_KEY` | PEM private key for HTTPS (same as `--tls-key`) |
 | `JOSHUA_LAZY_WEIGHTS` | Same as `--lazy-weights` |
@@ -780,10 +877,10 @@ in one pass costs little more than scoring one.  `--speculative N` (or
    returning logits for every position.
 3. Draft tokens are checked in order against the request's own sampler
    (repetition penalty, temperature, top-k/min-p/top-p).  Greedy decoding
-   accepts a token iff it is the argmax; sampled decoding uses speculative
-   sampling (accept with probability `p(x)`, otherwise sample the
-   correction from `p` without `x`), so the output distribution is exactly
-   that of plain decoding.
+   accepts a token iff it is the argmax; sampled decoding draws the same
+   position-keyed target token plain decoding would and accepts the draft
+   only when it matches, otherwise correcting to that token.  Enabling
+   speculation therefore leaves a fixed seed's output token-identical.
 4. The KV cache is truncated back past the first rejected token, and the
    live draft length adapts (doubling after a fully accepted draft, halving
    after a fully rejected one).
@@ -804,7 +901,8 @@ loader's plain-attention models (`qwen`, `qwen2moe`, `qwen2vl`, `qwen3`,
 `deepseek2` loader's (`deepseek`, `deepseek2`, `glm-dsa` — DeepSeek-MoE/V2/V3,
 Kimi-K2, GLM-5), and `deepseek4`/`deepseek41` (whose sliding-window ring and
 streaming compressors are rewound through the verification pass's
-checkpoint).  On the rest — candle's stock loaders (private KV caches) and
+checkpoint; for edited context reuse they keep the same kind of copy at
+prefill and turn boundaries).  On the rest — candle's stock loaders (private KV caches) and
 the recurrent DeltaNet/KDA hybrids (qwen3next, qwen3.5, qwen4exp, glm5next,
 kimi-linear, kimi-k3, whose state only clears) — the flag warns at load,
 `Engine::speculative_config()` reads back `None`, and decoding stays one
@@ -948,8 +1046,9 @@ blocks) formats candle cannot parse; the native loaders read such tensors
 from the raw GGUF header, borrowing the blocks from the mapping and decoding
 them inside an f32-activation matmul (on an accelerator, or without a
 mapping, they are decoded to f32 at load).  Each architecture's logits are
-pinned to an independent NumPy transcription of llama.cpp's graphs.  Recurrent layers cannot rewind to an arbitrary prefix, so Qwen3-Next
-and Qwen3.5 re-prefill on edited contexts instead of truncating.  Not
+pinned to an independent NumPy transcription of llama.cpp's graphs.  Recurrent layers cannot rewind to an arbitrary prefix, so Qwen3-Next,
+Qwen3.5 and DeepSeek-V4/V4.1 resume edited contexts from a state checkpoint
+and re-prefill only the divergence.  Not
 loadable: `qwen3tts` (speech codec output) and `rwkv6qwen2` (an RWKV-6
 distillation, not a Qwen decoder).
 
@@ -1499,6 +1598,10 @@ separately from other workloads.
 
 - [x] Chat completions (non-streaming)
 - [x] Chat completions (SSE streaming)
+- [x] Anthropic Messages API (`/v1/messages`, streaming and tool use)
+- [x] Operational endpoints (`/status`, `/metrics`, `/props`, `/slots`, `/tokenize`)
+- [x] Repeatable `bench` and `report` commands
+- [ ] INT8 KV attention integration (device-tensor prototype and parity tests in `src/kv_int8.rs`; not wired to a loader yet)
 - [x] Legacy text completions
 - [x] OpenAI-compatible model list
 - [x] mmap-based model loading

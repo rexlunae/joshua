@@ -345,6 +345,30 @@ pub const TOKENIZER_JSON: &str = r#"{
     }
 }"#;
 
+/// A WordLevel tokenizer whose vocabulary is the characters of `{"a":1}`
+/// plus a few fillers.  Id 3 is EOS, matching the tiny GGUF fixture; the
+/// absence of whitespace tokens makes a constrained JSON document exact.
+pub const JSON_TOKENIZER_JSON: &str = r#"{
+    "version": "1.0",
+    "truncation": null,
+    "padding": null,
+    "added_tokens": [
+        {"id": 3, "content": "</s>", "single_word": false, "lstrip": false,
+         "rstrip": false, "normalized": false, "special": true}
+    ],
+    "normalizer": null,
+    "pre_tokenizer": {"type": "Whitespace"},
+    "post_processor": null,
+    "decoder": null,
+    "model": {
+        "type": "WordLevel",
+        "vocab": {"<unk>": 0, "{": 1, "\"": 2, "</s>": 3,
+                  "a": 4, ":": 5, "1": 6, "}": 7, ",": 8, "[": 9,
+                  "]": 10, "b": 11, "2": 12, "x": 13, "true": 14, "null": 15},
+        "unk_token": "<unk>"
+    }
+}"#;
+
 /// Write a tiny but structurally valid GGUF for the given architecture:
 /// 16-token vocab, 8-dim embedding, 2 heads, 1 transformer block, tied
 /// output head.  Per-arch quirks are exercised deliberately: qwen2 uses

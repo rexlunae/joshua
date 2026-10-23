@@ -21,6 +21,7 @@
 //! A `tokenizer.json` from the model's HuggingFace repository must be placed
 //! alongside the `.gguf` file so the engine can tokenise prompts.
 
+pub mod anthropic;
 pub mod attention;
 pub mod auto_placement;
 pub mod compression;
@@ -28,6 +29,7 @@ pub mod coordinator;
 pub mod cpu_pinning;
 pub mod distributed;
 pub mod embedding;
+pub mod constraints;
 pub mod engine;
 pub mod error;
 pub mod gguf_ext;
@@ -35,6 +37,7 @@ pub mod gguf_meta;
 pub mod hot_experts;
 pub mod iq2xxs;
 pub mod kquant_dot;
+pub mod kv_int8;
 pub mod kimi_k3;
 pub mod low_bit;
 pub mod mapping;
@@ -59,6 +62,7 @@ pub mod cache_sim;
 pub mod npu;
 pub mod paged_weights;
 pub mod placement;
+pub mod prefill_cost;
 pub mod prefix_cache;
 pub mod prompt_stability;
 pub mod stream_prefill;

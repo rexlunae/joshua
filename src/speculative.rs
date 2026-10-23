@@ -11,10 +11,13 @@
 //!
 //! * greedy (`temperature <= 0`) — a draft token is accepted iff it is the
 //!   target's argmax, so the text is token-for-token identical;
-//! * sampled — standard speculative sampling (Leviathan et al. 2023, Chen et
-//!   al. 2023) with a deterministic draft: accept draft token `x` with
-//!   probability `p(x)`, otherwise sample from `p` with `x` removed.  The
-//!   emitted tokens are distributed exactly as under ordinary sampling.
+//! * sampled — the target token is drawn with the same position-keyed
+//!   `(seed, position)` stream plain decoding uses; a draft is accepted only
+//!   when it matches that token, and otherwise the target token corrects it.
+//!   The emitted tokens are therefore identical to plain decoding for a fixed
+//!   seed, not merely identically distributed.  [`TokenDist::sample`] and
+//!   [`verify_token`] keep the standard distribution-preserving residual
+//!   sampler for callers that own an RNG.
 //!
 //! The drafter here is **prompt lookup** ([`NgramDrafter`]): it finds the most
 //! recent earlier occurrence of the context's trailing n-gram and proposes the
@@ -40,7 +43,6 @@
 
 use std::collections::HashMap;
 
-use rand::distributions::{Distribution, WeightedIndex};
 use rand::Rng;
 
 use crate::error::{JoshuaError, Result};
@@ -286,13 +288,54 @@ pub(crate) enum TokenDistRef<'a> {
 
 impl TokenDistRef<'_> {
     pub(crate) fn sample(self, rng: &mut impl Rng) -> Result<u32> {
+        // A greedy draw needs no randomness; keep the caller's RNG untouched
+        // so a later sampled draw does not shift.
         match self {
             Self::Greedy(t) => Ok(t),
-            Self::Probs(p) => sample_probs(p.iter().copied(), rng),
+            Self::Probs(p) => sample_slice(p, None, rng.gen::<f64>()),
+        }
+    }
+
+    /// Draw a token from `seed` and absolute `pos` only.
+    ///
+    /// Unlike a sequential RNG, the stream does not depend on how many drafts
+    /// were verified before this position — enabling speculation, changing
+    /// the draft length, or batching requests leaves the token at `pos`
+    /// unchanged.  This is the engine's decode-time entry point.
+    pub(crate) fn sample_at(self, seed: u64, pos: u64) -> Result<u32> {
+        self.sample_with(splitmix_uniform(seed, pos, SAMPLE_STREAM))
+    }
+
+    fn sample_with(self, u: f64) -> Result<u32> {
+        match self {
+            Self::Greedy(t) => Ok(t),
+            Self::Probs(p) => sample_slice(p, None, u),
         }
     }
 
     pub(crate) fn verify(self, draft: u32, rng: &mut impl Rng) -> Result<Verdict> {
+        // As in `sample`, the deterministic path must not consume caller
+        // randomness: verifying a greedy draft costs no draw.
+        match self {
+            Self::Greedy(t) => Ok(if t == draft {
+                Verdict::Accept
+            } else {
+                Verdict::Reject(t)
+            }),
+            Self::Probs(_) => self.verify_with(draft, rng.gen::<f64>(), rng.gen::<f64>()),
+        }
+    }
+
+    /// Verify `draft` against the exact token plain sampling would emit at
+    /// `(seed, pos)`.
+    ///
+    /// Standard speculative sampling preserves the output *distribution*, but
+    /// its accept and residual streams are independent of the plain sample's
+    /// stream, so one fixed seed can take a different path.  The engine's
+    /// contract is stronger: enabling speculation must not change the tokens.
+    /// Draw the target with [`SAMPLE_STREAM`] — exactly what `sample_at` does —
+    /// accept only a matching draft, and otherwise correct to that token.
+    pub(crate) fn verify_at(self, draft: u32, seed: u64, pos: u64) -> Result<Verdict> {
         match self {
             Self::Greedy(t) => Ok(if t == draft {
                 Verdict::Accept
@@ -300,24 +343,108 @@ impl TokenDistRef<'_> {
                 Verdict::Reject(t)
             }),
             Self::Probs(p) => {
-                let p_draft = p.get(draft as usize).copied().unwrap_or(0.0);
-                if p_draft > 0.0 && rng.gen::<f32>() < p_draft {
-                    return Ok(Verdict::Accept);
-                }
-                // Mask the rejected token while iterating. Keep the target
-                // probabilities untouched and avoid a vocabulary-sized copy.
-                let residual =
-                    p.iter()
-                        .enumerate()
-                        .map(|(i, &p)| if i == draft as usize { 0.0 } else { p });
-                if residual.clone().sum::<f32>() <= 0.0 {
-                    // Only reachable through rounding when p(draft) ≈ 1.
-                    return Ok(Verdict::Accept);
-                }
-                Ok(Verdict::Reject(sample_probs(residual, rng)?))
+                let target = sample_slice(p, None, splitmix_uniform(seed, pos, SAMPLE_STREAM))?;
+                Ok(if target == draft {
+                    Verdict::Accept
+                } else {
+                    Verdict::Reject(target)
+                })
             }
         }
     }
+
+    fn verify_with(self, draft: u32, u_accept: f64, u_residual: f64) -> Result<Verdict> {
+        match self {
+            Self::Greedy(t) => Ok(if t == draft {
+                Verdict::Accept
+            } else {
+                Verdict::Reject(t)
+            }),
+            Self::Probs(p) => {
+                let p_draft = p.get(draft as usize).copied().unwrap_or(0.0) as f64;
+                if p_draft > 0.0 && u_accept < p_draft {
+                    return Ok(Verdict::Accept);
+                }
+                // Reject: sample proportional to `p` with `draft` removed,
+                // without allocating a vocabulary-sized residual vector.
+                if residual_total(p, draft) <= 0.0 {
+                    // Only reachable through rounding when p(draft) ≈ 1.
+                    return Ok(Verdict::Accept);
+                }
+                Ok(Verdict::Reject(sample_slice(p, Some(draft), u_residual)?))
+            }
+        }
+    }
+}
+
+/// The random stream used by a decode step's plain sample (and therefore by
+/// verification, which must reproduce it exactly).
+const SAMPLE_STREAM: u64 = 0;
+
+/// A SplitMix64 hash of `(seed, pos, stream)` mapped to `[0, 1)`.
+///
+/// Sampling from `(seed, position)` rather than a mutable RNG makes the token
+/// stream reproducible across batch composition, backend, and speculative
+/// draft policy.
+pub(crate) fn splitmix_uniform(seed: u64, pos: u64, stream: u64) -> f64 {
+    fn mix(mut z: u64) -> u64 {
+        z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+    // Mix sequentially rather than xor-ing three independent hashes: xor is
+    // commutative, so `(pos=0, stream=1)` and `(pos=1, stream=0)` would
+    // collide.  Each step is a bijection for a fixed previous value, so the
+    // whole map is injective in `(pos, stream)` for a fixed seed.
+    let z = mix(mix(seed ^ pos.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+        ^ stream.wrapping_mul(0xBF58_476D_1CE4_E5B9));
+    // 53 bits is the full precision of an f64 mantissa; the result is in
+    // [0, 1), so a zero-probability token is never selected at u = 1.
+    (z >> 11) as f64 * (1.0 / (1u64 << 53) as f64)
+}
+
+/// Sum of `p` excluding `skip`.
+fn residual_total(p: &[f32], skip: u32) -> f64 {
+    p.iter()
+        .enumerate()
+        .filter(|(i, _)| *i != skip as usize)
+        .map(|(_, &x)| x as f64)
+        .sum()
+}
+
+/// Inverse-CDF draw over `p`, optionally skipping one index.
+///
+/// `p` is already filtered and normalized by the sampler; this scans it
+/// without allocating a cumulative vector or a `WeightedIndex`.  Returns the
+/// last positive index on rounding overshoot.
+fn sample_slice(p: &[f32], skip: Option<u32>, u: f64) -> Result<u32> {
+    let skip = skip.map(|s| s as usize);
+    let total: f64 = p
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| Some(*i) != skip)
+        .map(|(_, &x)| x as f64)
+        .sum();
+    if !(total > 0.0) {
+        return Err(JoshuaError::Inference(
+            "sampling from an empty distribution".to_string(),
+        ));
+    }
+    let target = u * total;
+    let mut acc = 0.0;
+    let mut last = None;
+    for (i, &x) in p.iter().enumerate() {
+        if Some(i) == skip || x <= 0.0 {
+            continue;
+        }
+        acc += x as f64;
+        last = Some(i as u32);
+        if acc > target {
+            return Ok(i as u32);
+        }
+    }
+    last.ok_or_else(|| JoshuaError::Inference("sampling from an empty distribution".to_string()))
 }
 
 /// Outcome of verifying one draft token against the target distribution.
@@ -339,11 +466,6 @@ pub enum Verdict {
 /// emit exactly one token distributed as `p`.
 pub fn verify_token(dist: &TokenDist, draft: u32, rng: &mut impl Rng) -> Result<Verdict> {
     dist.as_ref().verify(draft, rng)
-}
-
-fn sample_probs(p: impl IntoIterator<Item = f32>, rng: &mut impl Rng) -> Result<u32> {
-    let dist = WeightedIndex::new(p).map_err(|e| JoshuaError::Inference(e.to_string()))?;
-    Ok(dist.sample(rng) as u32)
 }
 
 /// Weight of the newest sample in the gate's moving averages.
@@ -568,21 +690,38 @@ mod tests {
 
     #[test]
     fn borrowed_verification_matches_copying_reference() {
-        fn reference(p: &[f32], draft: u32, rng: &mut impl Rng) -> Result<Verdict> {
-            let p_draft = p.get(draft as usize).copied().unwrap_or(0.0);
-            if p_draft > 0.0 && rng.gen::<f32>() < p_draft {
+        /// Straightforward implementation over owned residuals, parameterised
+        /// by the same uniforms as the borrowed path.
+        fn reference(p: &[f32], draft: u32, u_accept: f64, u_residual: f64) -> Result<Verdict> {
+            let p_draft = p.get(draft as usize).copied().unwrap_or(0.0) as f64;
+            if p_draft > 0.0 && u_accept < p_draft {
                 return Ok(Verdict::Accept);
             }
             let mut residual = p.to_vec();
             if let Some(p) = residual.get_mut(draft as usize) {
                 *p = 0.0;
             }
-            if residual.iter().sum::<f32>() <= 0.0 {
+            let total: f64 = residual.iter().map(|&x| x as f64).sum();
+            if total == 0.0 {
+                // Same rounding path as the borrowed implementation: a
+                // distribution with no residual mass accepts the draft.
                 return Ok(Verdict::Accept);
             }
-            let dist =
-                WeightedIndex::new(&residual).map_err(|e| JoshuaError::Inference(e.to_string()))?;
-            Ok(Verdict::Reject(dist.sample(rng) as u32))
+            if !(total > 0.0) {
+                return Err(JoshuaError::Inference("empty residual".to_string()));
+            }
+            let target = u_residual * total;
+            let mut acc = 0.0;
+            for (i, &x) in residual.iter().enumerate() {
+                if x <= 0.0 {
+                    continue;
+                }
+                acc += x as f64;
+                if acc > target {
+                    return Ok(Verdict::Reject(i as u32));
+                }
+            }
+            Err(JoshuaError::Inference("empty residual".to_string()))
         }
         for p in [
             vec![],
@@ -595,17 +734,15 @@ mod tests {
         ] {
             let original: Vec<_> = p.iter().map(|v| v.to_bits()).collect();
             for draft in 0..p.len() as u32 + 2 {
-                let mut expected_rng = StdRng::seed_from_u64(19);
-                let mut actual_rng = expected_rng.clone();
-                for _ in 0..100 {
-                    let expected =
-                        reference(&p, draft, &mut expected_rng).map_err(|e| e.to_string());
-                    let actual = TokenDistRef::Probs(&p)
-                        .verify(draft, &mut actual_rng)
-                        .map_err(|e| e.to_string());
-                    assert_eq!(actual, expected, "draft {draft}, probabilities {p:?}");
+                for u_accept in [0.0, 0.05, 0.5, 0.95] {
+                    for u_residual in [0.0, 0.25, 0.5, 0.99] {
+                        let expected = reference(&p, draft, u_accept, u_residual).map_err(|_| ());
+                        let actual = TokenDistRef::Probs(&p)
+                            .verify_with(draft, u_accept, u_residual)
+                            .map_err(|_| ());
+                        assert_eq!(actual, expected, "draft {draft}, probabilities {p:?}");
+                    }
                 }
-                assert_eq!(actual_rng.gen::<u64>(), expected_rng.gen::<u64>());
             }
             assert_eq!(p.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), original);
         }
@@ -699,5 +836,80 @@ mod tests {
         g.record_plain(0.1);
         g.record_verify(2, 0.2);
         assert!(g.allow());
+    }
+
+    /// Greedy sampling and verification are deterministic, so they must not
+    /// consume the caller's RNG.
+    #[test]
+    fn greedy_paths_leave_the_rng_untouched() {
+        let mut rng = StdRng::seed_from_u64(7);
+        let mut clone = rng.clone();
+        assert_eq!(TokenDistRef::Greedy(3).sample(&mut rng).unwrap(), 3);
+        assert_eq!(
+            TokenDistRef::Greedy(3).verify(3, &mut rng).unwrap(),
+            Verdict::Accept
+        );
+        assert_eq!(
+            TokenDistRef::Greedy(3).verify(4, &mut rng).unwrap(),
+            Verdict::Reject(3)
+        );
+        assert_eq!(rng.gen::<u64>(), clone.gen::<u64>());
+    }
+
+    /// Verification emits exactly the token plain sampling would at the same
+    /// `(seed, position)`, whether the draft matches or not.
+    #[test]
+    fn verification_matches_plain_sample_at_the_same_position() {
+        let p = [0.1_f32, 0.2, 0.3, 0.4];
+        let dist = TokenDistRef::Probs(&p);
+        for pos in 0..64 {
+            let plain = dist.sample_at(99, pos).unwrap();
+            for draft in 0..6 {
+                match dist.verify_at(draft, 99, pos).unwrap() {
+                    Verdict::Accept => assert_eq!(draft, plain),
+                    Verdict::Reject(correction) => {
+                        assert_ne!(draft, plain);
+                        assert_eq!(correction, plain);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The position hash stays in `[0, 1)`, changes with every stream, and
+    /// never selects a zero-probability token.
+    #[test]
+    fn position_hash_is_bounded_and_stream_separated() {
+        let mut seen = std::collections::HashSet::new();
+        for pos in 0..512 {
+            for stream in [SAMPLE_STREAM, 1, 2] {
+                let u = splitmix_uniform(7, pos, stream);
+                assert!((0.0..1.0).contains(&u), "u = {u} at {pos}/{stream}");
+                assert!(seen.insert(u.to_bits()), "collision at {pos}/{stream}");
+            }
+        }
+        let p = [0.0_f32, 0.0, 1.0];
+        let dist = TokenDistRef::Probs(&p);
+        for pos in 0..256 {
+            assert_eq!(dist.sample_at(123, pos).unwrap(), 2);
+        }
+    }
+
+    /// `sample_at` is a pure function of `(seed, position, distribution)`;
+    /// a different position may share the seed without changing the outcome
+    /// of the earlier one.
+    #[test]
+    fn sample_at_is_position_keyed() {
+        let p = [0.05_f32, 0.15, 0.3, 0.5];
+        let dist = TokenDistRef::Probs(&p);
+        let a: Vec<u32> = (0..64)
+            .map(|pos| dist.sample_at(99, pos).unwrap())
+            .collect();
+        let b: Vec<u32> = (0..64)
+            .rev()
+            .map(|pos| dist.sample_at(99, pos).unwrap())
+            .collect();
+        assert_eq!(a, b.into_iter().rev().collect::<Vec<_>>());
+        assert!(a.iter().all(|&t| (t as usize) < p.len()));
     }
 }

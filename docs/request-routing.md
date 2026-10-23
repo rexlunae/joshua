@@ -147,8 +147,8 @@ The router sends CORS headers (permissive: any origin) only when `--api-key`
 is set, so browser pages on other origins can call it but must present the
 key.  Without a key the browser's same-origin policy applies, so an arbitrary
 website opened on a machine that can reach the router cannot read its model
-output or worker status.  (`joshua serve` currently sends permissive CORS
-headers with or without a key.)
+output or worker status.  (`joshua serve` sends permissive CORS headers by
+default; set `--cors-origin` to restrict it to explicit browser origins.)
 
 ## Limits of this first version
 
@@ -158,7 +158,7 @@ headers with or without a key.)
   estimate per-request work (prompt length, `max_tokens`), check a
   request's length against a worker's `n_ctx`, compare tokenizers beyond the
   model id, or prefer a worker holding a reusable KV prefix.
-* A joshua worker computes the whole completion before streaming it, so a
-  worker lost mid-generation is usually lost before output (and retried).
+* A worker streams chat completions token by token, so a worker lost after
+  the first event ends the client stream rather than retrying it.
 * Throughput, tail latency and per-request overhead have not been measured;
   that needs real multi-host hardware.

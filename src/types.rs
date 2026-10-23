@@ -155,10 +155,12 @@ pub struct GenerationOptions {
     /// window (see [`GenerationOptions::presence_penalty`]).
     #[serde(default)]
     pub frequency_penalty: f32,
-    /// Seed for the sampler's random number generator.  `None` seeds from
-    /// OS entropy.  A fixed seed reproduces the same sample stream for the
-    /// same prompt, model, backend and options; greedy decoding never
-    /// consumes randomness.
+    /// Seed for the sampler's random draws.  `None` seeds from OS entropy.
+    /// A fixed seed reproduces the same sample stream for the same prompt,
+    /// model, backend and options.  Each draw hashes `(seed, absolute token
+    /// position, stream)`, so enabling speculative decoding, changing the
+    /// draft length, or batching requests does not change the token at a
+    /// given position; greedy decoding never consumes randomness.
     #[serde(default)]
     pub seed: Option<u64>,
     /// Per-request context window in tokens: prompt plus generated tokens
@@ -184,6 +186,29 @@ pub struct GenerationOptions {
     /// Strings that will terminate generation when encountered.
     #[serde(default)]
     pub stop_sequences: Vec<String>,
+    /// A structured-output constraint applied while sampling.
+    ///
+    /// Parsed from the request's `response_format`; `None` leaves decoding
+    /// unconstrained and byte-identical to earlier releases.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub constraint: Option<ConstraintSpec>,
+}
+
+/// A syntax constraint for generated tokens.
+///
+/// Only JSON is supported: `json_object` accepts any object, and
+/// `json_schema` accepts documents valid under the given schema.  The
+/// constraint is compiled once per schema and cached by the engine.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ConstraintSpec {
+    /// Any JSON object (`response_format: {"type": "json_object"}`).
+    JsonObject,
+    /// A JSON document matching this schema.
+    JsonSchema {
+        /// The JSON Schema document.
+        schema: serde_json::Value,
+    },
 }
 
 impl GenerationOptions {
@@ -222,6 +247,7 @@ impl Default for GenerationOptions {
             context_window: None,
             chat_template_kwargs: serde_json::Map::new(),
             stop_sequences: vec![],
+            constraint: None,
         }
     }
 }
@@ -371,7 +397,8 @@ pub struct UsageInfo {
 /// Unknown fields are ignored.  Fields that are accepted but cannot be
 /// honoured are rejected by [`ChatCompletionRequest::to_generation_options`]
 /// rather than silently dropped: `n > 1`, `logprobs: true`,
-/// `top_logprobs > 0` and a `response_format` other than `text`.
+/// `top_logprobs > 0`, and `response_format` types other than `text`,
+/// `json_object`, or `json_schema`.
 #[derive(Debug, Default, Deserialize)]
 pub struct ChatCompletionRequest {
     /// Model identifier (e.g. `"joshua"` or path-derived name).
@@ -459,6 +486,48 @@ pub struct ChatCompletionRequest {
     pub context_window: Option<u32>,
 }
 
+/// Parse the OpenAI `response_format` value into a decoding constraint.
+fn parse_response_format(format: &serde_json::Value) -> Result<Option<ConstraintSpec>, String> {
+    let kind = format
+        .get("type")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "response_format requires a string `type`".to_string())?;
+    match kind {
+        "text" => Ok(None),
+        "json_object" => Ok(Some(ConstraintSpec::JsonObject)),
+        "json_schema" => {
+            let wrapper = format.get("json_schema").ok_or_else(|| {
+                "response_format type `json_schema` requires `json_schema`".to_string()
+            })?;
+            // OpenAI wraps the schema as `{name, strict, schema}`; also
+            // accept a bare schema document for convenience.  JSON Schema
+            // does not require a top-level `type` (`properties`, `allOf`,
+            // `$ref`, `enum`, … are valid on their own), so the wrapper's
+            // `schema` key — not the presence of `type` — discriminates the
+            // two shapes.
+            let schema = match wrapper.get("schema") {
+                Some(schema) => schema,
+                // Wrapper-shaped but with no schema body: report the missing
+                // key rather than compiling `{name, strict}` as a schema.
+                None if wrapper.get("name").is_some() || wrapper.get("strict").is_some() => {
+                    return Err("response_format.json_schema requires `schema`".to_string());
+                }
+                None => wrapper,
+            };
+            if !schema.is_object() {
+                return Err("response_format.json_schema must be a JSON object".to_string());
+            }
+            Ok(Some(ConstraintSpec::JsonSchema {
+                schema: schema.clone(),
+            }))
+        }
+        other => Err(format!(
+            "response_format type `{other}` is not supported; use `text`, \
+             `json_object`, or `json_schema`"
+        )),
+    }
+}
+
 impl ChatCompletionRequest {
     /// Derive [`GenerationOptions`] from the request, applying defaults for
     /// missing fields.
@@ -473,16 +542,10 @@ impl ChatCompletionRequest {
         if self.logprobs == Some(true) || self.top_logprobs.is_some_and(|n| n > 0) {
             return Err("logprobs are not supported".to_string());
         }
-        if let Some(format) = &self.response_format {
-            let kind = format.get("type").and_then(|t| t.as_str());
-            if kind != Some("text") {
-                return Err(format!(
-                    "response_format {} is not supported (no constrained decoding); \
-                     only {{\"type\": \"text\"}} is accepted",
-                    kind.unwrap_or("<missing type>")
-                ));
-            }
-        }
+        let constraint = match &self.response_format {
+            Some(format) => parse_response_format(format)?,
+            None => None,
+        };
         for (name, value) in [
             ("presence_penalty", self.presence_penalty),
             ("frequency_penalty", self.frequency_penalty),
@@ -559,6 +622,7 @@ impl ChatCompletionRequest {
             context_window: self.context_window,
             chat_template_kwargs,
             stop_sequences,
+            constraint,
         })
     }
 
@@ -940,12 +1004,65 @@ mod tests {
         assert!(rejected(json!({"n": 2})).contains("n = 1"));
         assert!(rejected(json!({"logprobs": true})).contains("logprobs"));
         assert!(rejected(json!({"top_logprobs": 3})).contains("logprobs"));
+        assert_eq!(
+            options(json!({"response_format": {"type": "json_object"}})).constraint,
+            Some(ConstraintSpec::JsonObject)
+        );
+        let schema = json!({
+            "type": "object",
+            "properties": {"a": {"type": "integer"}},
+            "required": ["a"]
+        });
+        assert_eq!(
+            options(json!({
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {"name": "answer", "strict": true, "schema": schema}
+                }
+            }))
+            .constraint,
+            Some(ConstraintSpec::JsonSchema { schema })
+        );
         assert!(
-            rejected(json!({"response_format": {"type": "json_object"}})).contains("json_object")
+            rejected(json!({"response_format": {"type": "xml"}})).contains("xml"),
+            "unknown response_format types are rejected"
         );
         assert!(rejected(json!({"presence_penalty": 2.5})).contains("presence_penalty"));
         assert!(rejected(json!({"frequency_penalty": -3})).contains("frequency_penalty"));
         assert!(rejected(json!({"context_window": 0})).contains("context_window"));
+    }
+
+    #[test]
+    fn bare_schemas_need_no_top_level_type() {
+        // JSON Schema allows `properties`, `allOf`, `$ref` … without `type`.
+        let bare = json!({"properties": {"a": {"type": "integer"}}});
+        assert_eq!(
+            options(json!({
+                "response_format": {"type": "json_schema", "json_schema": bare}
+            }))
+            .constraint,
+            Some(ConstraintSpec::JsonSchema { schema: bare.clone() }),
+            "a bare schema without `type` must be accepted"
+        );
+        let all_of = json!({"allOf": [{"type": "object"}]});
+        assert_eq!(
+            options(json!({
+                "response_format": {"type": "json_schema", "json_schema": all_of}
+            }))
+            .constraint,
+            Some(ConstraintSpec::JsonSchema { schema: all_of.clone() })
+        );
+        // A wrapper that carries `name`/`strict` but no schema body is still
+        // an error rather than an empty schema.
+        assert!(
+            rejected(json!({
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {"name": "answer", "strict": true}
+                }
+            }))
+            .contains("schema")
+        );
     }
 
     #[test]

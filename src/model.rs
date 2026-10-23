@@ -935,7 +935,7 @@ impl QuantizedModel {
     /// — and `0` when it holds none.
     pub fn kv_rewind_target(&self, keep_len: usize) -> usize {
         match self {
-            Self::DeepSeek4(_) => keep_len,
+            Self::DeepSeek4(m) => m.rewind_target(keep_len),
             _ => session!(self, m => m.rewind_target(keep_len), _ => {
                 if self.supports_kv_truncate() { keep_len } else { 0 }
             }),
@@ -981,7 +981,10 @@ impl QuantizedModel {
     /// with recurrent layers; see
     /// [`crate::native_session::Session::checkpoint_prefix`].
     pub fn checkpoint_prefix(&mut self, pos: usize) {
-        session!(self, m => m.checkpoint_prefix(pos), _ => {})
+        match self {
+            Self::DeepSeek4(m) => m.checkpoint_prefix(pos),
+            _ => session!(self, m => m.checkpoint_prefix(pos), _ => {}),
+        }
     }
 
     /// Turn MTP drafting on or off (see
@@ -1009,7 +1012,18 @@ impl QuantizedModel {
     /// [`crate::native_session::Session::set_prefix_checkpoints`].  Other
     /// architectures ignore it.
     pub fn set_prefix_checkpoints(&mut self, n: usize) {
-        session!(self, m => m.set_prefix_checkpoints(n), _ => {})
+        match self {
+            Self::DeepSeek4(m) => m.set_prefix_checkpoints(n),
+            _ => session!(self, m => m.set_prefix_checkpoints(n), _ => {}),
+        }
+    }
+
+    /// Positions of the prefix checkpoints this session holds (diagnostics).
+    pub fn prefix_checkpoint_positions(&self) -> Vec<usize> {
+        match self {
+            Self::DeepSeek4(m) => m.prefix_checkpoint_positions(),
+            _ => session!(self, m => m.prefix_checkpoint_positions(), _ => Vec::new()),
+        }
     }
 
     /// Turn on the speculative next-step expert prefetch for the Qwen-family
@@ -1033,7 +1047,7 @@ impl QuantizedModel {
     /// Whether a speculative verification pass is still pending rollback.
     pub fn has_pending_verify(&self) -> bool {
         match self {
-            Self::DeepSeek4(_) => true,
+            Self::DeepSeek4(m) => m.has_pending_verify(),
             _ => session!(self, m => m.has_pending_verify(), _ => false),
         }
     }

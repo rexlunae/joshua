@@ -301,6 +301,12 @@ enum Commands {
             hide_default_value = true
         )]
         prefill_chunk: usize,
+        /// Target wall time for one prefill chunk, in milliseconds.  When
+        /// non-zero, architectures that prefill chunk by chunk choose each
+        /// chunk from an online cost model; `--prefill-chunk` is the ceiling.
+        /// 0 (the default) keeps the fixed chunk size.
+        #[arg(long, env = "JOSHUA_PREFILL_BUDGET_MS", default_value_t = 0, hide_default_value = true)]
+        prefill_budget_ms: u64,
         /// Prefix checkpoints kept per session of a model with recurrent
         /// layers (Qwen3-Next, Qwen3.5, Qwen3.8-Flash-Next, Kimi-Linear):
         /// copies of the running state at each prompt boundary, so an edited
@@ -407,13 +413,27 @@ enum Commands {
         /// Defaults to the machine's parallelism.
         #[arg(long, env = "JOSHUA_MAX_CONCURRENCY")]
         max_concurrency: Option<usize>,
+        /// How long a request may wait for a free concurrency slot before a
+        /// 503, in milliseconds.  0 (the default) rejects immediately.
+        #[arg(long, env = "JOSHUA_QUEUE_TIMEOUT_MS", default_value_t = 0, hide_default_value = true)]
+        queue_timeout_ms: u64,
+        /// How many requests may wait for a concurrency slot when
+        /// --queue-timeout-ms is non-zero (0 selects the built-in default).
+        #[arg(long, env = "JOSHUA_ADMISSION_QUEUE_DEPTH", default_value_t = 0, hide_default_value = true)]
+        admission_queue_depth: usize,
         /// Hard ceiling on tokens generated per request, capping the
         /// client-supplied max_tokens.
         #[arg(long, env = "JOSHUA_MAX_OUTPUT_TOKENS")]
         max_output_tokens: Option<u32>,
-        /// Require this API key on /v1 routes (Authorization: Bearer <key>).
+        /// Require this API key on /v1 routes (Authorization: Bearer <key>
+        /// or x-api-key: <key>).  A comma-separated list accepts any key.
         #[arg(long, env = "JOSHUA_API_KEY")]
         api_key: Option<String>,
+        /// Exact CORS origin(s) allowed to call the API, for example
+        /// `https://app.example.com`.  Repeat the flag or comma-separate
+        /// values.  Unset keeps the permissive localhost-development policy.
+        #[arg(long, env = "JOSHUA_CORS_ORIGINS", value_delimiter = ',')]
+        cors_origin: Vec<String>,
         /// Serve HTTPS with this PEM certificate chain (needs --tls-key and
         /// a build with the `tls` cargo feature).
         #[arg(long, env = "JOSHUA_TLS_CERT", requires = "tls_key")]
@@ -570,6 +590,12 @@ enum Commands {
             hide_default_value = true
         )]
         prefill_chunk: usize,
+        /// Target wall time for one prefill chunk, in milliseconds.  When
+        /// non-zero, architectures that prefill chunk by chunk choose each
+        /// chunk from an online cost model; `--prefill-chunk` is the ceiling.
+        /// 0 (the default) keeps the fixed chunk size.
+        #[arg(long, env = "JOSHUA_PREFILL_BUDGET_MS", default_value_t = 0, hide_default_value = true)]
+        prefill_budget_ms: u64,
         /// Speculative token generation: draft up to N tokens per step by
         /// prompt lookup (the continuation of the latest earlier occurrence
         /// of the output's trailing n-gram) and verify them in one forward
@@ -654,6 +680,47 @@ enum Commands {
         #[arg(long, env = "JOSHUA_SKIP_PLACEMENT_BENCH", num_args = 0..=1, default_missing_value = "true")]
         skip_placement_bench: bool,
     },
+    /// Run a repeatable generation benchmark and print throughput.
+    Bench {
+        /// Path to the GGUF model file.
+        #[arg(short, long, env = "JOSHUA_MODEL_PATH")]
+        model: PathBuf,
+        /// Maximum tokens generated per prompt.
+        #[arg(long, default_value_t = 128)]
+        max_tokens: u32,
+        /// Repeats per prompt. With more than one run, the first is a warmup
+        /// and is excluded from the reported throughput means.
+        #[arg(long, default_value_t = 1)]
+        runs: u32,
+        /// Sampling temperature (0 = greedy, the most comparable setting).
+        #[arg(long, default_value_t = 0.0)]
+        temperature: f32,
+        /// Sampler seed.
+        #[arg(long)]
+        seed: Option<u64>,
+        /// Context window in tokens.
+        #[arg(long, env = "JOSHUA_N_CTX", default_value_t = 4096)]
+        n_ctx: u32,
+        /// Compute backend: auto, cpu, metal, or cuda.
+        #[arg(long, env = "JOSHUA_DEVICE", value_enum, default_value_t = DeviceArg::Auto)]
+        device: DeviceArg,
+        /// Prompt to run; repeat for several.  Defaults to a small built-in
+        /// mix of prose and code.
+        #[arg(long = "prompt")]
+        prompts: Vec<String>,
+        /// Emit one JSON object instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print host, model, and build information for a benchmark report.
+    Report {
+        /// Optional GGUF model whose size and header describe the run.
+        #[arg(short, long, env = "JOSHUA_MODEL_PATH")]
+        model: Option<PathBuf>,
+        /// Emit one JSON object instead of text.
+        #[arg(long)]
+        json: bool,
+    },
     /// Transcribe a WAV file with a Whisper model.
     Transcribe {
         /// Whisper model directory (model.safetensors + config.json + tokenizer.json).
@@ -734,6 +801,7 @@ async fn main() -> anyhow::Result<()> {
             expert_cache,
             vram_expert_cache,
             prefill_chunk,
+            prefill_budget_ms,
             prefix_checkpoints,
             prefix_cache_mib,
             prefix_cache_root_min,
@@ -750,8 +818,11 @@ async fn main() -> anyhow::Result<()> {
             npu_in_process,
             whisper_model,
             max_concurrency,
+            queue_timeout_ms,
+            admission_queue_depth,
             max_output_tokens,
             api_key,
+            cors_origin,
             tls_cert,
             tls_key,
         } => {
@@ -793,6 +864,9 @@ async fn main() -> anyhow::Result<()> {
                 .expert_cache_auto(expert_cache_auto)
                 .vram_expert_cache(vram_cache)
                 .prefill_chunk(prefill_chunk)
+                .prefill_budget_ms(prefill_budget_ms)
+                .queue_timeout_ms(queue_timeout_ms)
+                .admission_queue_depth(admission_queue_depth)
                 .prefix_checkpoints_opt(prefix_checkpoints)
                 .prefix_cache_mib_opt(prefix_cache_mib)
                 .prefix_cache_root_min_opt(prefix_cache_root_min)
@@ -863,6 +937,8 @@ async fn main() -> anyhow::Result<()> {
                 manager: manager.transpose()?,
                 whisper,
                 api_key,
+                cors_origins: cors_origin,
+                metrics: Arc::new(server::ServerMetrics::default()),
             });
             match (tls_cert, tls_key) {
                 (Some(cert), Some(key)) => {
@@ -909,6 +985,180 @@ async fn main() -> anyhow::Result<()> {
             joshua::coordinator::serve(config, &addr).await?;
         }
 
+        Commands::Bench {
+            model,
+            max_tokens,
+            runs,
+            temperature,
+            seed,
+            n_ctx,
+            device,
+            prompts,
+            json,
+        } => {
+            let prompts = if prompts.is_empty() {
+                default_bench_prompts()
+            } else {
+                prompts
+            };
+            let opts = EngineOptions::with_n_ctx(n_ctx).backend(device.into());
+            let engine = Engine::with_options(&model, opts)?;
+            let runs = runs.max(1);
+            let started = std::time::Instant::now();
+            let mut rows = Vec::new();
+            let mut decode_tps = Vec::new();
+            let mut prefill_tps = Vec::new();
+            let mut total_completion = 0u64;
+            let mut total_prompt = 0u64;
+            for prompt in &prompts {
+                for run in 0..runs {
+                    let messages = vec![ChatMessage::text("user", prompt.clone())];
+                    let options = GenerationOptions {
+                        max_tokens,
+                        temperature,
+                        seed,
+                        ..GenerationOptions::default()
+                    };
+                    let start = std::time::Instant::now();
+                    let (text, usage, prefill, decode) =
+                        engine.complete(&messages, &options)?;
+                    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+                    total_prompt += usage.prompt_tokens as u64;
+                    total_completion += usage.completion_tokens as u64;
+                    // The first repeat warms the page cache and allocator;
+                    // exclude it from the throughput means when a later run
+                    // is available so the report describes warmed decoding.
+                    let warmup = runs > 1 && run == 0;
+                    if !warmup {
+                        prefill_tps.push(prefill);
+                        decode_tps.push(decode);
+                    }
+                    rows.push(serde_json::json!({
+                        "prompt_index": rows.len() / runs as usize,
+                        "run": run,
+                        "warmup": warmup,
+                        "latency_ms": elapsed_ms,
+                        "prompt_tokens": usage.prompt_tokens,
+                        "completion_tokens": usage.completion_tokens,
+                        "prefill_tps": prefill,
+                        "decode_tps": decode,
+                        "output": text,
+                    }));
+                }
+            }
+            let wall_s = started.elapsed().as_secs_f64();
+            let mean = |values: &[f64]| {
+                if values.is_empty() {
+                    0.0
+                } else {
+                    values.iter().sum::<f64>() / values.len() as f64
+                }
+            };
+            let report = serde_json::json!({
+                "object": "joshua.bench",
+                "version": env!("CARGO_PKG_VERSION"),
+                "model": engine.model_name(),
+                "model_path": engine.model_path(),
+                "backend": format!("{:?}", engine.device()),
+                "n_ctx": engine.n_ctx(),
+                "max_tokens": max_tokens,
+                "runs": runs,
+                "warmup_runs": if runs > 1 { 1 } else { 0 },
+                "prompts": prompts.len(),
+                "wall_seconds": wall_s,
+                "prompt_tokens": total_prompt,
+                "completion_tokens": total_completion,
+                "mean_prefill_tps": mean(&prefill_tps),
+                "mean_decode_tps": mean(&decode_tps),
+                "results": rows,
+            });
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "model={} backend={:?} n_ctx={} max_tokens={} runs={} prompts={}",
+                    engine.model_name(),
+                    engine.device(),
+                    engine.n_ctx(),
+                    max_tokens,
+                    runs,
+                    prompts.len()
+                );
+                println!(
+                    "prompt_tokens={} completion_tokens={} wall={wall_s:.2}s \
+                     mean_prefill={:.1}t/s mean_decode={:.1}t/s",
+                    total_prompt,
+                    total_completion,
+                    mean(&prefill_tps),
+                    mean(&decode_tps)
+                );
+                println!(
+                    "{:>4} {:>4} {:>10} {:>8} {:>10} {:>10}",
+                    "p", "run", "latency_ms", "prompt", "prefill", "decode"
+                );
+                for row in &rows {
+                    println!(
+                        "{:>4} {:>4} {:>10.1} {:>8} {:>10.1} {:>10.1}",
+                        row["prompt_index"].as_u64().unwrap_or(0),
+                        row["run"].as_u64().unwrap_or(0),
+                        row["latency_ms"].as_f64().unwrap_or(0.0),
+                        row["prompt_tokens"].as_u64().unwrap_or(0),
+                        row["prefill_tps"].as_f64().unwrap_or(0.0),
+                        row["decode_tps"].as_f64().unwrap_or(0.0),
+                    );
+                }
+            }
+        }
+
+        Commands::Report { model, json } => {
+            let cpu = cpu_model().unwrap_or_else(|| "unknown".to_string());
+            let ram = total_ram_bytes().map(|b| b as f64 / (1024.0 * 1024.0 * 1024.0));
+            let model_info = model.as_ref().and_then(|path| {
+                std::fs::metadata(path).ok().map(|metadata| {
+                    serde_json::json!({
+                        "path": path,
+                        "bytes": metadata.len(),
+                        "gib": metadata.len() as f64 / (1024.0 * 1024.0 * 1024.0),
+                    })
+                })
+            });
+            let report = serde_json::json!({
+                "object": "joshua.report",
+                "version": env!("CARGO_PKG_VERSION"),
+                "os": std::env::consts::OS,
+                "arch": std::env::consts::ARCH,
+                "cpu": cpu,
+                "logical_cpus": std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(0),
+                "ram_bytes": total_ram_bytes(),
+                "ram_gib": ram,
+                "model": model_info,
+            });
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("joshua {} ({} {})", env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::consts::ARCH);
+                println!("cpu: {cpu}");
+                println!(
+                    "logical_cpus: {}",
+                    std::thread::available_parallelism()
+                        .map(|n| n.get())
+                        .unwrap_or(0)
+                );
+                if let Some(ram) = ram {
+                    println!("ram: {ram:.1} GiB");
+                }
+                if let Some(model) = &model_info {
+                    println!(
+                        "model: {} ({:.1} GiB)",
+                        model["path"].as_str().unwrap_or("?"),
+                        model["gib"].as_f64().unwrap_or(0.0)
+                    );
+                }
+            }
+        }
+
         Commands::Transcribe {
             model,
             audio,
@@ -941,6 +1191,7 @@ async fn main() -> anyhow::Result<()> {
             expert_cache,
             vram_expert_cache,
             prefill_chunk,
+            prefill_budget_ms,
             speculative,
             mtp,
             mlock_hot_weights,
@@ -985,6 +1236,7 @@ async fn main() -> anyhow::Result<()> {
                 .expert_cache_auto(expert_cache_auto)
                 .vram_expert_cache(vram_cache)
                 .prefill_chunk(prefill_chunk)
+                .prefill_budget_ms(prefill_budget_ms)
                 .speculative(speculative_config(speculative))
                 .mtp(mtp)
                 .mlock_hot_weights(
@@ -1054,6 +1306,14 @@ async fn main() -> anyhow::Result<()> {
 /// Translate the `--mmap` flag: passing it makes memory mapping an explicit
 /// request, so a model file that cannot be mapped usefully fails the load
 /// instead of merely warning.
+fn mmap_mode(explicit: bool) -> MmapMode {
+    if explicit {
+        MmapMode::Required
+    } else {
+        MmapMode::Auto
+    }
+}
+
 /// Parse a `--reasoning-effort` value with the API's spelling.
 fn parse_reasoning_effort(s: &str) -> Result<ReasoningEffort, String> {
     serde_json::from_value(serde_json::Value::String(s.to_ascii_lowercase())).map_err(|_| {
@@ -1061,12 +1321,23 @@ fn parse_reasoning_effort(s: &str) -> Result<ReasoningEffort, String> {
     })
 }
 
-fn mmap_mode(explicit: bool) -> MmapMode {
-    if explicit {
-        MmapMode::Required
-    } else {
-        MmapMode::Auto
-    }
+fn default_bench_prompts() -> Vec<String> {
+    vec![
+        "Write a haiku about memory-mapped model weights.".to_string(),
+        "Explain in one paragraph why reusing a KV cache matters for chat latency."
+            .to_string(),
+        "Complete this Python function and explain the invariant it relies on:\n\n\
+         def fibonacci(n):"
+            .to_string(),
+    ]
+}
+
+fn cpu_model() -> Option<String> {
+    let text = std::fs::read_to_string("/proc/cpuinfo").ok()?;
+    text.lines()
+        .find_map(|line| line.strip_prefix("model name"))
+        .and_then(|rest| rest.split_once(':'))
+        .map(|(_, value)| value.trim().to_string())
 }
 
 /// Total physical RAM in bytes; `None` when unreadable.
@@ -1213,8 +1484,53 @@ mod tests {
     }
 
     #[test]
-    fn route_cli_splits_the_worker_list() {
+    fn bench_and_report_cli_parse_repeatable_prompts_and_origins() {
         let cli = Cli::try_parse_from([
+            "joshua",
+            "bench",
+            "--model",
+            "m.gguf",
+            "--max-tokens",
+            "8",
+            "--prompt",
+            "one",
+            "--prompt",
+            "two",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Bench {
+                max_tokens,
+                prompts,
+                ..
+            } => {
+                assert_eq!(max_tokens, 8);
+                assert_eq!(prompts, vec!["one".to_string(), "two".to_string()]);
+            }
+            _ => panic!("expected the bench subcommand"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "joshua",
+            "serve",
+            "--model",
+            "m.gguf",
+            "--cors-origin",
+            "https://a.example,https://b.example",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Serve { cors_origin, .. } => {
+                assert_eq!(cors_origin, vec!["https://a.example", "https://b.example"]);
+            }
+            _ => panic!("expected the serve subcommand"),
+        }
+
+        assert!(Cli::try_parse_from(["joshua", "report", "--json"]).is_ok());
+    }
+
+    #[test]
+    fn route_cli_splits_the_worker_list() {        let cli = Cli::try_parse_from([
             "joshua",
             "route",
             "--worker",

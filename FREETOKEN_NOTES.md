@@ -221,9 +221,13 @@ replayed offline exactly as FreeToken's Figure 4b does.
   caches make an in-place rewind sound, and the prefix is materialised so the old buffer
   actually frees). The LCP of an edited conversation ends exactly at the harness's edit
   point — i.e. on FreeToken's semantic anchor by construction. Counted separately as
-  `Engine::kv_edit_reuse_count`. `deepseek4` is deliberately excluded: its hybrid
-  attention keeps running compressor states that cannot be rewound to an arbitrary past
-  position — that architecture still needs true state checkpoints (FreeToken §3.1).
+  `Engine::kv_edit_reuse_count`. `deepseek4` now also uses state checkpoints (`prefix_checkpoints`,
+  default 4): a copy of every layer's sliding-window ring and compressor states at the end of
+  each prefill chunk and at each turn boundary. The layer-streaming prefill exposes only the
+  prompt end (at any point inside the sweep some layers have not reached a given chunk), while
+  the non-streamed fallback checkpoints every chunk; an edit rewinds to the latest checkpoint
+  at or before it and prefills only the divergence. Compressed rows are not copied — the
+  same stale-row argument as the verification rollback.
 - **C — shipped** for `deepseek4`: each MoE layer's routed ids are recorded per forward
   (`ModelWeights::last_routed_experts`, seeded from prefill's final row), and decode
   fires their prefetch before any layer runs, giving the pages a full step of compute to

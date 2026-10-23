@@ -100,18 +100,20 @@ use std::fs::File;
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use candle_core::quantized::gguf_file;
 use candle_core::{Device, Tensor};
+use llguidance::Matcher;
 use memmap2::Mmap;
-use rand::{rngs::StdRng, thread_rng, SeedableRng};
+use rand::{thread_rng, Rng};
 use tokenizers::Tokenizer;
 
 use crate::embedding::EmbeddingModel;
 use crate::model::{Architecture, ModelSnapshot, QuantizedModel};
 use crate::npu::{NpuBackend, NpuSession};
+use crate::constraints::{ConstraintEngine, SimpleVob};
 use crate::speculative::{
     next_draft_len, NgramDrafter, SpeculationGate, SpeculativeConfig, SpeculativeStats,
     TokenDistRef, Verdict,
@@ -414,10 +416,38 @@ pub struct EngineOptions {
     /// chunk re-reads the whole model, so a larger chunk also means fewer
     /// passes over the weights.
     pub prefill_chunk: usize,
+    /// Target wall time for one prefill chunk, in milliseconds; `0` (the
+    /// default) keeps the fixed [`EngineOptions::prefill_chunk`] size.
+    ///
+    /// When set, architectures that prefill chunk by chunk (the ones without
+    /// a layer-streaming path) measure each completed chunk and pick the next
+    /// size from an online cost model, aiming for this budget.  Chunk sizes
+    /// chosen from wall time can change floating-point results between runs
+    /// for the same prompt and seed, so this is opt-in.  The configured
+    /// `prefill_chunk` is the ceiling and the size used for the first probe.
+    pub prefill_budget_ms: u64,
+    /// How long a request may wait for a concurrency permit before returning
+    /// the overloaded error, in milliseconds; `0` (the default) rejects
+    /// immediately.
+    ///
+    /// A short wait smooths bursts instead of failing them, but a queue only
+    /// delays the error when the engine is genuinely saturated: the wait is
+    /// bounded per request and the concurrency cap still bounds memory.
+    pub queue_timeout_ms: u64,
+    /// How many requests may wait for a concurrency permit when
+    /// [`EngineOptions::queue_timeout_ms`] is non-zero; `0` selects
+    /// [`DEFAULT_ADMISSION_QUEUE_DEPTH`].
+    ///
+    /// The concurrency cap bounds inference memory, but every parked request
+    /// occupies a server thread; a finite queue keeps a burst from exhausting
+    /// the blocking pool.  A request that finds the queue full gets the same
+    /// overloaded error as one that times out.
+    pub admission_queue_depth: usize,
     /// Prefix checkpoints each session of a model with recurrent layers
-    /// keeps (Qwen3-Next, Qwen3.5, `qwen4exp`, the KDA hybrids); `None`
-    /// selects [`crate::native_session::DEFAULT_PREFIX_CHECKPOINTS`] and
-    /// `Some(0)` turns them off.
+    /// keeps (Qwen3-Next, Qwen3.5, `qwen4exp`, the KDA hybrids, and
+    /// DeepSeek-V4/V4.1); `None` selects
+    /// [`crate::native_session::DEFAULT_PREFIX_CHECKPOINTS`] and `Some(0)`
+    /// turns them off.
     ///
     /// Such a model's running state cannot be cut back to an arbitrary
     /// prefix, so an edited conversation (an agent replacing its last
@@ -592,6 +622,26 @@ impl EngineOptions {
         self.prefill_chunk = tokens;
         self
     }
+    /// Set the target wall time for one prefill chunk (`0` = fixed size).
+    /// See [`EngineOptions::prefill_budget_ms`].
+    pub fn prefill_budget_ms(mut self, millis: u64) -> Self {
+        self.prefill_budget_ms = millis;
+        self
+    }
+
+    /// Set how long a request may wait for a concurrency permit (`0` =
+    /// reject immediately).  See [`EngineOptions::queue_timeout_ms`].
+    pub fn queue_timeout_ms(mut self, millis: u64) -> Self {
+        self.queue_timeout_ms = millis;
+        self
+    }
+
+    /// Set the admission queue depth (`0` = the default).  See
+    /// [`EngineOptions::admission_queue_depth`].
+    pub fn admission_queue_depth(mut self, depth: usize) -> Self {
+        self.admission_queue_depth = depth;
+        self
+    }
 
     /// Set how many prefix checkpoints a recurrent model's session keeps
     /// (`0` = off).  See [`EngineOptions::prefix_checkpoints`].
@@ -715,6 +765,11 @@ pub struct Engine {
     model_file: Option<Arc<File>>,
     /// Stateless tokenizer, shared across all inference calls.
     tokenizer: Arc<Tokenizer>,
+    /// The `tokenizer.json` this engine was loaded from; used to build the
+    /// structured-output grammar environment lazily.
+    tokenizer_path: PathBuf,
+    /// Compiled JSON grammars, built on first constrained request.
+    constraints: std::sync::OnceLock<Result<ConstraintEngine, String>>,
     /// Whether the tokenizer uses a byte-level decoder (`ByteLevel`).
     ///
     /// Byte-level BPE tokenizers (DeepSeek-V2/V3, Kimi-K2, Qwen, ...) store
@@ -728,6 +783,12 @@ pub struct Engine {
     eos_token_ids: Vec<u32>,
     /// The model's chat template from GGUF metadata, if it ships one.
     chat_template: Option<ChatTemplate>,
+    /// The tokenizer's control-token strings, longest first.
+    ///
+    /// Message text is escaped against these before rendering so a user or
+    /// tool message cannot inject a turn boundary (see
+    /// [`crate::template::sanitize_messages`]).
+    special_tokens: Vec<String>,
     /// Lazily built embedding model (stateless, shared by all embed calls).
     embed_model: Mutex<Option<Arc<EmbeddingModel>>>,
     /// Pool of loaded model instances with warm KV caches.
@@ -750,12 +811,16 @@ pub struct Engine {
     /// Number of generations/embeddings currently executing.
     ///
     /// Each in-flight request holds a full model instance (weights + KV
-    /// cache), so this is capped at `max_concurrency` to bound peak memory;
-    /// requests over the cap are rejected rather than piling up unbounded
-    /// heavyweight model loads.
-    in_flight: AtomicUsize,
+    /// cache), so this is capped at `max_concurrency` to bound peak memory.
+    /// A request over the cap may wait up to `queue_timeout` for a permit
+    /// and is then rejected.
+    in_flight: AdmissionGate,
     /// Maximum concurrent generations/embeddings.
     max_concurrency: usize,
+    /// How long a request waits for a permit (zero = reject immediately).
+    queue_timeout: Duration,
+    /// How many requests may wait for a permit at once.
+    admission_queue_depth: usize,
     /// Upper bound on tokens generated per request, regardless of the
     /// client-supplied `max_tokens`.
     max_output_tokens: u32,
@@ -775,6 +840,11 @@ pub struct Engine {
     /// Tokens per prefill chunk (see [`EngineOptions::prefill_chunk`]),
     /// resolved to at least one token.
     prefill_chunk: usize,
+    /// Target prefill-chunk time (see [`EngineOptions::prefill_budget_ms`]);
+    /// zero keeps the fixed chunk size.
+    prefill_budget: Duration,
+    /// Online fit used to choose adaptive prefill chunks.
+    prefill_cost: Mutex<crate::prefill_cost::PrefillCostModel>,
     /// Prefix checkpoints per recurrent-model session (see
     /// [`EngineOptions::prefix_checkpoints`]).
     prefix_checkpoints: usize,
@@ -851,6 +921,12 @@ pub struct Engine {
 // `Mutex<…>`, and `AtomicU64` are all `Send + Sync`, so Engine is
 // automatically `Send + Sync`.
 
+/// How many requests may wait for a concurrency permit when the admission
+/// queue is enabled ([`EngineOptions::queue_timeout_ms`] > 0).  Waiting
+/// requests occupy a server thread, so the queue must be finite even though
+/// the concurrency cap alone bounds inference memory.
+pub const DEFAULT_ADMISSION_QUEUE_DEPTH: usize = 64;
+
 /// Minimum free system RAM required to admit a new request (bytes).  Below
 /// this the engine refuses new generations (memory-aware admission, #2) rather
 /// than letting a heavy load push the working set into swap.  Kept well above
@@ -915,45 +991,167 @@ const NPU_MAX_FAILURES: u32 = 3;
 /// client-supplied `max_tokens`), bounding single-request CPU/time cost.
 const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 4096;
 
+/// Admission state for in-flight generations/embeddings.
+///
+/// A request takes a permit before doing any work.  When every permit is in
+/// use it may wait on [`Self::released`] for a bounded time
+/// ([`EngineOptions::queue_timeout_ms`]); with a zero timeout it fails at
+/// once.  Waiting is only about smoothing bursts — the cap still bounds peak
+/// memory, and a request that waits too long returns the same overloaded
+/// error the immediate path returns.
+#[derive(Debug)]
+struct AdmissionGate {
+    state: Mutex<AdmissionState>,
+    released: Condvar,
+}
+
+/// Active permits and parked waiters, updated under one lock so the queue
+/// bound cannot race with a permit release.
+#[derive(Debug, Default)]
+struct AdmissionState {
+    active: usize,
+    waiting: usize,
+}
+
+impl AdmissionGate {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(AdmissionState::default()),
+            released: Condvar::new(),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, AdmissionState> {
+        // A panic while holding the count cannot leave it inconsistent (the
+        // only mutation is +=/-= around a permit), so recover the guard.
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn active(&self) -> usize {
+        self.lock().active
+    }
+
+    #[cfg(test)]
+    fn waiting(&self) -> usize {
+        self.lock().waiting
+    }
+}
+
+/// Reject before admitting when the machine is critically low on RAM, so a
+/// new request cannot push a heavy model load/working set into swap.  Run it
+/// again after waiting: memory can fall while a request sits in the queue.
+fn check_admission_memory() -> Result<()> {
+    if let Some(free) = crate::placement::available_ram_bytes() {
+        if free < LOW_MEM_FLOOR {
+            return Err(JoshuaError::Overloaded(format!(
+                "low memory ({} MiB free < {} MiB floor); retry shortly",
+                free / (1024 * 1024),
+                LOW_MEM_FLOOR / (1024 * 1024),
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn at_capacity(max: usize, waited: Option<Duration>) -> JoshuaError {
+    let suffix = waited.map_or_else(String::new, |w| format!(" for {} ms", w.as_millis()));
+    JoshuaError::Overloaded(format!(
+        "at capacity ({max} concurrent requests){suffix}; retry shortly"
+    ))
+}
+
 /// RAII permit for one in-flight generation/embedding.
 ///
-/// Increments the engine's in-flight counter on acquisition (rejecting once
-/// `max_concurrency` is reached) and decrements it on drop, so the count is
-/// released even if generation errors or panics.
+/// Takes a slot from the gate on acquisition and returns it on drop, so the
+/// count is released even if generation errors or panics.
 struct InFlightGuard<'a> {
-    counter: &'a AtomicUsize,
+    gate: &'a AdmissionGate,
 }
 
 impl<'a> InFlightGuard<'a> {
-    fn acquire(counter: &'a AtomicUsize, max: usize) -> Result<Self> {
-        // Memory-aware admission (finding #2): reject before reserving a slot
-        // when the machine is critically low on RAM, so a new request cannot
-        // push a heavy model load/working set into swap.  Conservative: this
-        // only admits *fewer* than the concurrency cap under pressure.
-        if let Some(free) = crate::placement::available_ram_bytes() {
-            if free < LOW_MEM_FLOOR {
-                return Err(JoshuaError::Overloaded(format!(
-                    "low memory ({} MiB free < {} MiB floor); retry shortly",
-                    free / (1024 * 1024),
-                    LOW_MEM_FLOOR / (1024 * 1024),
-                )));
-            }
+    fn acquire(gate: &'a AdmissionGate, max: usize, wait: Duration) -> Result<Self> {
+        Self::acquire_with(gate, max, DEFAULT_ADMISSION_QUEUE_DEPTH, wait, None)
+    }
+
+    /// Take a permit, waiting at most `wait` and at most `queue_depth`
+    /// requests deep.  `cancel` is polled while parked so a disconnected
+    /// client stops occupying a thread before a slot frees.
+    fn acquire_with(
+        gate: &'a AdmissionGate,
+        max: usize,
+        queue_depth: usize,
+        wait: Duration,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<Self> {
+        check_admission_memory()?;
+        let max = max.max(1);
+        let queue_depth = queue_depth.max(1);
+        let mut state = gate.lock();
+        // Let parked requests go first: a new caller must not barge past a
+        // waiter that was woken by the permit it is about to take.
+        if state.active < max && state.waiting == 0 {
+            state.active += 1;
+            return Ok(Self { gate });
         }
-        // Reserve a slot optimistically, then bail out if we blew the cap.
-        let prev = counter.fetch_add(1, Ordering::AcqRel);
-        if prev >= max {
-            counter.fetch_sub(1, Ordering::AcqRel);
+        if wait.is_zero() {
+            return Err(at_capacity(max, None));
+        }
+        if state.waiting >= queue_depth {
             return Err(JoshuaError::Overloaded(format!(
-                "at capacity ({max} concurrent requests); retry shortly"
+                "admission queue is full ({queue_depth} waiting); retry shortly"
             )));
         }
-        Ok(Self { counter })
+        state.waiting += 1;
+        let deadline = Instant::now() + wait;
+        let outcome = loop {
+            if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                break Err(JoshuaError::Cancelled);
+            }
+            let now = Instant::now();
+            let Some(left) = deadline.checked_duration_since(now) else {
+                break Err(at_capacity(max, Some(wait)));
+            };
+            // Wake periodically even without a release so cancellation is
+            // observed promptly.
+            let slice = left.min(Duration::from_millis(20));
+            let (guard, _) = gate
+                .released
+                .wait_timeout(state, slice)
+                .unwrap_or_else(|e| e.into_inner());
+            state = guard;
+            if state.active < max {
+                if Instant::now() >= deadline {
+                    // The slot freed after the deadline; do not admit.
+                    break Err(at_capacity(max, Some(wait)));
+                }
+                state.active += 1;
+                break Ok(());
+            }
+        };
+        state.waiting -= 1;
+        drop(state);
+        // A timed-out or cancelled waiter may have left a slot free for
+        // someone else, and a new waiter may have joined; wake them all.
+        // (The queue is bounded, so this is not a storm.)
+        gate.released.notify_all();
+        outcome?;
+        if let Err(e) = check_admission_memory() {
+            let mut state = gate.lock();
+            state.active = state.active.saturating_sub(1);
+            drop(state);
+            gate.released.notify_all();
+            return Err(e);
+        }
+        Ok(Self { gate })
     }
 }
 
 impl Drop for InFlightGuard<'_> {
     fn drop(&mut self) {
-        self.counter.fetch_sub(1, Ordering::AcqRel);
+        let mut state = self.gate.lock();
+        state.active = state.active.saturating_sub(1);
+        drop(state);
+        self.gate.released.notify_all();
     }
 }
 
@@ -1233,6 +1431,40 @@ struct DecodeOutcome {
     /// Tokens actually fed to the model during decode (KV-state delta).
     fed_tokens: Vec<u32>,
     decode_tps: f64,
+    /// The configured stop sequence that ended generation, if any.
+    stop_sequence: Option<String>,
+}
+
+/// A completed generation, including which stop sequence ended it.
+///
+/// The tuple-returning completion helpers on [`Engine`] are thin wrappers
+/// around this type; callers that need to report Anthropic's
+/// `stop_reason`/`stop_sequence` fields use the `*_detailed` methods.
+#[derive(Debug, Clone)]
+pub struct Completion {
+    /// Generated text, with any matched stop sequence removed.
+    pub text: String,
+    /// Token accounting for the request.
+    pub usage: UsageInfo,
+    /// Prefill throughput in tokens per second.
+    pub prefill_tps: f64,
+    /// Decode throughput in tokens per second.
+    pub decode_tps: f64,
+    /// The configured stop sequence that ended generation, if any.
+    pub stop_sequence: Option<String>,
+}
+
+impl Completion {
+    /// Split into the historical `(text, usage, prefill_tps, decode_tps)`
+    /// tuple shape.
+    fn into_tuple(self) -> (String, UsageInfo, f64, f64) {
+        (
+            self.text,
+            self.usage,
+            self.prefill_tps,
+            self.decode_tps,
+        )
+    }
 }
 
 /// Repetition-penalty window: the last this-many tokens are penalised.
@@ -1274,6 +1506,77 @@ impl<'a> DecodeText<'a> {
             n_decoded: 0,
         }
     }
+}
+
+/// Reports decoded text to a streaming caller without leaking a stop
+/// sequence.  A tail as long as the longest stop sequence is withheld until
+/// the sequence either completes (and is trimmed from `response`) or
+/// decoding ends.
+struct StreamGate {
+    sent: usize,
+    holdback: usize,
+}
+
+impl StreamGate {
+    fn new(stop_sequences: &[String]) -> Self {
+        Self {
+            sent: 0,
+            holdback: stop_sequences
+                .iter()
+                .map(String::len)
+                .max()
+                .unwrap_or(0),
+        }
+    }
+
+    fn push(
+        &mut self,
+        response: &str,
+        stopped: bool,
+        on_text: Option<&mut (dyn FnMut(&str) + '_)>,
+    ) {
+        let end = if stopped {
+            response.len()
+        } else {
+            floor_char_boundary(response, response.len().saturating_sub(self.holdback))
+        };
+        self.emit_to(response, end, on_text);
+    }
+
+    fn finish(
+        &mut self,
+        response: &str,
+        on_text: Option<&mut (dyn FnMut(&str) + '_)>,
+    ) {
+        self.emit_to(response, response.len(), on_text);
+    }
+
+    fn emit_to(
+        &mut self,
+        response: &str,
+        end: usize,
+        on_text: Option<&mut (dyn FnMut(&str) + '_)>,
+    ) {
+        let end = end.min(response.len());
+        if end <= self.sent {
+            // A stop sequence can trim the response below text already sent
+            // only if it is longer than the holdback, which `new` prevents.
+            return;
+        }
+        if let Some(on_text) = on_text {
+            on_text(&response[self.sent..end]);
+        }
+        self.sent = end;
+    }
+}
+
+/// Largest char boundary at or below `index` (the standard-library
+/// `floor_char_boundary` is still unstable).
+fn floor_char_boundary(s: &str, mut index: usize) -> usize {
+    while index > 0 && !s.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
 }
 
 /// NPU backend state: the backend plus its circuit breaker.
@@ -1425,6 +1728,11 @@ impl Engine {
             0 => DEFAULT_PREFILL_CHUNK,
             n => n,
         };
+        let prefill_budget = Duration::from_millis(options.prefill_budget_ms);
+        let prefill_cost = Mutex::new(crate::prefill_cost::PrefillCostModel::new(
+            crate::prefill_cost::MIN_CHUNK,
+            prefill_chunk,
+        ));
         let prefix_checkpoints = options
             .prefix_checkpoints
             .unwrap_or(crate::native_session::DEFAULT_PREFIX_CHECKPOINTS);
@@ -1601,6 +1909,7 @@ impl Engine {
         };
 
         let eos_token_ids = extract_eos_ids(&gguf, &tokenizer);
+        let special_tokens = crate::template::special_token_strings(&tokenizer);
         let chat_template = extract_chat_template(&gguf, &tokenizer);
         let device = Self::resolve_device(options.backend)?;
 
@@ -2021,16 +2330,25 @@ impl Engine {
             mmap: Arc::new(mmap),
             model_file,
             tokenizer: Arc::new(tokenizer),
+            tokenizer_path,
+            constraints: std::sync::OnceLock::new(),
             byte_level_decode,
             eos_token_ids,
             chat_template,
+            special_tokens,
             embed_model: Mutex::new(None),
             model_cache: Mutex::new(Vec::new()),
             kv_reuses: AtomicU64::new(0),
             kv_edit_reuses: AtomicU64::new(0),
             npu: None,
-            in_flight: AtomicUsize::new(0),
+            in_flight: AdmissionGate::new(),
             max_concurrency,
+            queue_timeout: Duration::from_millis(options.queue_timeout_ms),
+            admission_queue_depth: if options.admission_queue_depth == 0 {
+                DEFAULT_ADMISSION_QUEUE_DEPTH
+            } else {
+                options.admission_queue_depth
+            },
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             model_name,
             n_ctx,
@@ -2038,6 +2356,8 @@ impl Engine {
             expert_cache_auto,
             device_expert_cache,
             prefill_chunk,
+            prefill_budget,
+            prefill_cost,
             prefix_checkpoints,
             prefix_cache: Mutex::new(crate::prefix_cache::PrefixCache::new(prefix_cache_bytes)),
             prefix_cache_root_min,
@@ -2069,6 +2389,25 @@ impl Engine {
     pub fn with_max_concurrency(mut self, max: usize) -> Self {
         self.max_concurrency = max.max(1);
         self.fit_remote_capacity();
+        self
+    }
+
+    /// Set how long a request may wait for a concurrency permit before it
+    /// returns [`JoshuaError::Overloaded`].  `Duration::ZERO` (the default)
+    /// rejects immediately.  See [`EngineOptions::queue_timeout_ms`].
+    pub fn with_queue_timeout(mut self, timeout: Duration) -> Self {
+        self.queue_timeout = timeout;
+        self
+    }
+
+    /// Set how many requests may wait for a permit (`0` = the default).  See
+    /// [`EngineOptions::admission_queue_depth`].
+    pub fn with_admission_queue_depth(mut self, depth: usize) -> Self {
+        self.admission_queue_depth = if depth == 0 {
+            DEFAULT_ADMISSION_QUEUE_DEPTH
+        } else {
+            depth
+        };
         self
     }
 
@@ -2331,6 +2670,39 @@ impl Engine {
         self.n_ctx
     }
 
+    /// Tokenize `text` with the model's tokenizer.  `add_special_tokens`
+    /// controls the tokenizer's BOS/EOS wrapper; chat prompts formatted by
+    /// the engine already contain their special tokens.
+    pub fn tokenize(&self, text: &str, add_special_tokens: bool) -> Result<Vec<u32>> {
+        self.tokenizer
+            .encode(text, add_special_tokens)
+            .map(|encoding| encoding.get_ids().to_vec())
+            .map_err(|e| JoshuaError::Tokenization(e.to_string()))
+    }
+
+    /// Count the prompt tokens a chat request will use, without running the
+    /// model.  Useful for API usage figures and admission checks; media
+    /// messages count only their text portion.
+    pub fn count_chat_tokens(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        options: &GenerationOptions,
+    ) -> Result<u32> {
+        let reordered = tools.and_then(|t| self.tool_orders.stable(t));
+        let tools = reordered.as_deref().or(tools);
+        let moved = if self.env_to_user {
+            crate::prompt_stability::env_to_user(messages)
+        } else {
+            None
+        };
+        let messages = moved.as_deref().unwrap_or(messages);
+        let (prompt, add_special_tokens) =
+            self.format_prompt(messages, tools, &options.chat_template_kwargs);
+        self.tokenize(&prompt, add_special_tokens)
+            .map(|tokens| tokens.len() as u32)
+    }
+
     /// Device the routed-expert pool of a MoE model lives on: the compute
     /// device, or the CPU when the experts stay in host RAM (see
     /// [`EngineOptions::expert_placement`]).
@@ -2371,7 +2743,7 @@ impl Engine {
     /// Generations/embeddings executing right now (admitted and holding a
     /// concurrency permit).  Reported to request routers as live load.
     pub fn in_flight(&self) -> usize {
-        self.in_flight.load(Ordering::Acquire)
+        self.in_flight.active()
     }
 
     /// The admission cap: requests beyond this many in flight are rejected
@@ -2452,7 +2824,8 @@ impl Engine {
                 }
             }
         }
-        (Self::format_chatml_prompt(messages, tools), true)
+        let sanitized = crate::template::sanitize_messages(messages, &self.special_tokens);
+        (Self::format_chatml_prompt(&sanitized, tools), true)
     }
 
     // ─── Completion ───────────────────────────────────────────────────────────
@@ -2482,7 +2855,60 @@ impl Engine {
         tools: Option<&[Tool]>,
         options: &GenerationOptions,
     ) -> Result<(String, UsageInfo, f64, f64)> {
-        self.complete_chat_inner(messages, tools, options, None)
+        self.complete_chat_detailed(messages, tools, options)
+            .map(Completion::into_tuple)
+    }
+
+    /// [`Engine::complete_chat`] with the matched stop sequence included.
+    pub fn complete_chat_detailed(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        options: &GenerationOptions,
+    ) -> Result<Completion> {
+        self.complete_chat_inner(messages, tools, options, None, None)
+    }
+
+    /// [`Engine::complete_chat`] that reports text as it is decoded.
+    ///
+    /// `on_text` receives newly decoded text, not raw token ids: byte-level
+    /// tokenizers may hold back a partial UTF-8 character until the next
+    /// token completes it.  When `stop_sequences` is non-empty the engine
+    /// withholds a tail as long as the longest stop sequence, so a sequence
+    /// that spans token boundaries is never sent to the caller; the tail is
+    /// flushed when decoding ends normally.
+    ///
+    /// The callback runs on the decoding thread.  It should hand the text to
+    /// another thread or channel rather than block, because every call sits
+    /// on the per-token path.
+    pub fn complete_chat_streaming(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        options: &GenerationOptions,
+        cancel: &AtomicBool,
+        on_text: &mut dyn FnMut(&str),
+    ) -> Result<(String, UsageInfo, f64, f64)> {
+        self.complete_chat_streaming_detailed(messages, tools, options, cancel, on_text)
+            .map(Completion::into_tuple)
+    }
+
+    /// [`Engine::complete_chat_streaming`] with the matched stop sequence.
+    pub fn complete_chat_streaming_detailed(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        options: &GenerationOptions,
+        cancel: &AtomicBool,
+        on_text: &mut dyn FnMut(&str),
+    ) -> Result<Completion> {
+        self.complete_chat_inner(
+            messages,
+            tools,
+            options,
+            Some(cancel),
+            Some(on_text),
+        )
     }
 
     /// [`Engine::complete_chat`] that stops decoding once `cancel` is set.
@@ -2500,7 +2926,19 @@ impl Engine {
         options: &GenerationOptions,
         cancel: &AtomicBool,
     ) -> Result<(String, UsageInfo, f64, f64)> {
-        self.complete_chat_inner(messages, tools, options, Some(cancel))
+        self.complete_chat_cancellable_detailed(messages, tools, options, cancel)
+            .map(Completion::into_tuple)
+    }
+
+    /// [`Engine::complete_chat_cancellable`] with the matched stop sequence.
+    pub fn complete_chat_cancellable_detailed(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        options: &GenerationOptions,
+        cancel: &AtomicBool,
+    ) -> Result<Completion> {
+        self.complete_chat_inner(messages, tools, options, Some(cancel), None)
     }
 
     fn complete_chat_inner(
@@ -2509,7 +2947,8 @@ impl Engine {
         tools: Option<&[Tool]>,
         options: &GenerationOptions,
         cancel: Option<&AtomicBool>,
-    ) -> Result<(String, UsageInfo, f64, f64)> {
+        mut on_text: Option<&mut (dyn FnMut(&str) + '_)>,
+    ) -> Result<Completion> {
         // Keep the prompt's head byte-identical across requests where the
         // client varies it for no semantic reason, so cached prompt state
         // still matches (see `crate::prompt_stability`).
@@ -2530,12 +2969,25 @@ impl Engine {
             let (marked_messages, images) = resolve_message_media(messages)?;
             let (prompt, _) =
                 self.format_prompt(&marked_messages, tools, &options.chat_template_kwargs);
-            return self.complete_media(&prompt, &images, options, cancel);
+            return self.complete_media(
+                &prompt,
+                &images,
+                options,
+                cancel,
+                on_text.as_deref_mut(),
+            );
         }
         let (prompt, add_special_tokens) =
             self.format_prompt(messages, tools, &options.chat_template_kwargs);
         let root = self.prompt_root_chars(messages, tools, options, &prompt);
-        self.complete_with(&prompt, add_special_tokens, options, cancel, root)
+        self.complete_with(
+            &prompt,
+            add_special_tokens,
+            options,
+            cancel,
+            root,
+            on_text.as_deref_mut(),
+        )
     }
 
     /// Run a multimodal completion: the plugin tokenises and prefills the
@@ -2546,9 +2998,27 @@ impl Engine {
         images: &[Vec<u8>],
         options: &GenerationOptions,
         cancel: Option<&AtomicBool>,
-    ) -> Result<(String, UsageInfo, f64, f64)> {
+        on_text: Option<&mut (dyn FnMut(&str) + '_)>,
+    ) -> Result<Completion> {
         // Bound concurrent heavyweight generations before doing any work.
-        let _permit = InFlightGuard::acquire(&self.in_flight, self.max_concurrency)?;
+        let _permit = InFlightGuard::acquire_with(
+            &self.in_flight,
+            self.max_concurrency,
+            self.admission_queue_depth,
+            self.queue_timeout,
+            cancel,
+        )?;
+        if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+            // A generation cancelled before any work is an empty completion,
+            // matching the decode loop's stop path (and the test contract).
+            return Ok(Completion {
+                text: String::new(),
+                usage: UsageInfo::default(),
+                prefill_tps: 0.0,
+                decode_tps: 0.0,
+                stop_sequence: None,
+            });
+        }
         let n_ctx = self.request_n_ctx(options)?;
         // The plugin owns tokenisation, so the prompt length is unknown here;
         // clamp only to the server ceiling. The prompt is checked against the
@@ -2583,8 +3053,15 @@ impl Engine {
                     return Err(JoshuaError::PromptTooLong(n_past, n_ctx));
                 }
                 let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
-                let outcome =
-                    self.decode_loop(&mut session, logits, n_past, &[], options, cancel)?;
+                let outcome = self.decode_loop(
+                    &mut session,
+                    logits,
+                    n_past,
+                    &[],
+                    options,
+                    cancel,
+                    on_text,
+                )?;
                 Ok((n_past, prefill_ms, outcome))
             });
 
@@ -2606,7 +3083,13 @@ impl Engine {
                     completion_tokens: outcome.n_decoded,
                     total_tokens: n_past as u32 + outcome.n_decoded,
                 };
-                Ok((outcome.response, usage, prefill_tps, outcome.decode_tps))
+                Ok(Completion {
+                    text: outcome.response,
+                    usage,
+                    prefill_tps,
+                    decode_tps: outcome.decode_tps,
+                    stop_sequence: outcome.stop_sequence,
+                })
             }
             Err(e @ JoshuaError::PromptTooLong(..)) => {
                 // A request error, not a backend fault: keep the session and
@@ -2632,7 +3115,8 @@ impl Engine {
         prompt: &str,
         options: &GenerationOptions,
     ) -> Result<(String, UsageInfo, f64, f64)> {
-        self.complete_with(prompt, true, options, None, None)
+        self.complete_with(prompt, true, options, None, None, None)
+            .map(Completion::into_tuple)
     }
 
     /// The context window a request may use: its
@@ -2695,9 +3179,25 @@ impl Engine {
         options: &GenerationOptions,
         cancel: Option<&AtomicBool>,
         root_chars: Option<usize>,
-    ) -> Result<(String, UsageInfo, f64, f64)> {
+        mut on_text: Option<&mut (dyn FnMut(&str) + '_)>,
+    ) -> Result<Completion> {
         // Bound concurrent heavyweight generations before doing any work.
-        let _permit = InFlightGuard::acquire(&self.in_flight, self.max_concurrency)?;
+        let _permit = InFlightGuard::acquire_with(
+            &self.in_flight,
+            self.max_concurrency,
+            self.admission_queue_depth,
+            self.queue_timeout,
+            cancel,
+        )?;
+        if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+            return Ok(Completion {
+                text: String::new(),
+                usage: UsageInfo::default(),
+                prefill_tps: 0.0,
+                decode_tps: 0.0,
+                stop_sequence: None,
+            });
+        }
 
         // ── Tokenise ─────────────────────────────────────────────────────────
         let encoding = self
@@ -2717,20 +3217,48 @@ impl Engine {
         let options = &self.clamp_options(options, Some(n_prompt));
         let root = root_chars.and_then(|c| self.root_tokens(prompt, c, add_special_tokens, prompt_tokens));
 
+        // ── Validate the structured-output constraint before any backend work ─
+        // A malformed `response_format` (or a tokenizer that cannot support
+        // one) is the client's error, not the backend's.  Compiling the
+        // grammar here keeps such a request away from the NPU health counter
+        // altogether; the decode loop then hits the cached matcher.
+        if options.constraint.is_some() {
+            self.constraint_matcher(options)?;
+        }
+
         // ── Acquire a session, generate, retry on CPU if the NPU fails ──────
         // Prefer a pooled instance whose state already covers a prefix of
         // this prompt; fall back to a reset instance or a fresh load.
         let (mut session, n_reused) = self.acquire_session(prompt_tokens, true)?;
         let was_npu = session.is_npu();
 
-        let result = self.run_generation(&mut session, prompt_tokens, n_reused, options, cancel, root);
+        let streaming = on_text.is_some();
+        let result = self.run_generation(
+            &mut session,
+            prompt_tokens,
+            n_reused,
+            options,
+            cancel,
+            root,
+            on_text.as_deref_mut(),
+        );
         match result {
-            Ok((response, usage, prefill_tps, decode_tps, kv_tokens)) => {
+            Ok((completion, kv_tokens)) => {
                 // Park the instance for reuse by a follow-up request.
                 self.release_model(session, kv_tokens);
-                Ok((response, usage, prefill_tps, decode_tps))
+                Ok(completion)
             }
-            Err(e) if was_npu && !self.remote_only() => {
+            // Client errors (`InvalidRequest`) are not backend failures: they
+            // must not count against the NPU, and retrying them on the candle
+            // path would only reproduce the same error.  They fall through to
+            // the plain error arm below.  A streaming request keeps its SSE
+            // channel open for the error rather than restarting on CPU.
+            Err(e)
+                if was_npu
+                    && !self.remote_only()
+                    && !streaming
+                    && !matches!(e, JoshuaError::InvalidRequest(_)) =>
+            {
                 // Count the failure (possibly disabling the backend), drop
                 // the session unless it can prove a clean reset, and retry
                 // the whole request once on the candle path.
@@ -2748,10 +3276,18 @@ impl Engine {
                 }
                 tracing::warn!("Retrying request on the candle path after NPU failure: {e}");
                 let (mut session, n_reused) = self.acquire_session(prompt_tokens, false)?;
-                match self.run_generation(&mut session, prompt_tokens, n_reused, options, cancel, root) {
-                    Ok((response, usage, prefill_tps, decode_tps, kv_tokens)) => {
+                match self.run_generation(
+                    &mut session,
+                    prompt_tokens,
+                    n_reused,
+                    options,
+                    cancel,
+                    root,
+                    None,
+                ) {
+                    Ok((completion, kv_tokens)) => {
                         self.release_model(session, kv_tokens);
-                        Ok((response, usage, prefill_tps, decode_tps))
+                        Ok(completion)
                     }
                     Err(e) => {
                         if session.clear_state() {
@@ -2783,6 +3319,24 @@ impl Engine {
     /// advance so the KV cache accumulates across pieces, and only the final
     /// piece's last-token logits are kept (the prefill prediction).  Smaller
     /// chunks bound memory but can re-read expert weights more often.
+    /// Number of prompt tokens to feed in the next prefill chunk.
+    ///
+    /// With no time budget this is the configured chunk; with one, the shared
+    /// cost model picks a size from recently measured chunks.  Always at
+    /// least one token and never more than what is left.
+    fn next_prefill_chunk(&self, remaining: usize) -> usize {
+        if self.prefill_budget.is_zero() {
+            return self.prefill_chunk.min(remaining).max(1);
+        }
+        let cost = self
+            .prefill_cost
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        cost.next_chunk(remaining, self.prefill_budget, self.prefill_chunk)
+            .min(remaining)
+            .max(1)
+    }
+
     fn prefill(
         &self,
         model: &mut GenSession,
@@ -2820,11 +3374,28 @@ impl Engine {
             _ => {
                 // Streamed prefill unsupported on this architecture, or a
                 // KV-cap guard tripped — fall back to the per-chunk loop.
-                for piece_start in (0..new_tokens.len()).step_by(chunk) {
-                    let end = (piece_start + chunk).min(new_tokens.len());
-                    let piece = &new_tokens[piece_start..end];
-                    last =
-                        model.forward_tokens(piece, base + piece_start, &self.dense_device)?;
+                // With a time budget, the next chunk comes from the online
+                // cost model; otherwise it is the fixed configured size.
+                let mut piece_start = 0;
+                while piece_start < new_tokens.len() {
+                    let remaining = new_tokens.len() - piece_start;
+                    let rows = self.next_prefill_chunk(remaining);
+                    let end = piece_start + rows;
+                    let started = Instant::now();
+                    last = model.forward_tokens(
+                        &new_tokens[piece_start..end],
+                        base + piece_start,
+                        &self.dense_device,
+                    )?;
+                    if !self.prefill_budget.is_zero() {
+                        let elapsed = started.elapsed().as_secs_f64();
+                        let mut cost = self
+                            .prefill_cost
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        cost.observe(end - piece_start, elapsed);
+                    }
+                    piece_start = end;
                 }
                 last
             }
@@ -2843,7 +3414,8 @@ impl Engine {
         options: &GenerationOptions,
         cancel: Option<&AtomicBool>,
         root: Option<usize>,
-    ) -> Result<(String, UsageInfo, f64, f64, Vec<u32>)> {
+        on_text: Option<&mut (dyn FnMut(&str) + '_)>,
+    ) -> Result<(Completion, Vec<u32>)> {
         let n_prompt = prompt_tokens.len();
         let new_tokens = &prompt_tokens[n_reused..];
 
@@ -2883,8 +3455,15 @@ impl Engine {
         let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
 
         // ── Repetition-penalty history ────────────────────────────────────────
-        let outcome =
-            self.decode_loop(model, logits_vec, n_prompt, prompt_tokens, options, cancel)?;
+        let outcome = self.decode_loop(
+            model,
+            logits_vec,
+            n_prompt,
+            prompt_tokens,
+            options,
+            cancel,
+            on_text,
+        )?;
         kv_tokens.extend_from_slice(&outcome.fed_tokens);
 
         // Throughput reflects the tokens actually processed in the prefill
@@ -2913,10 +3492,13 @@ impl Engine {
         };
 
         Ok((
-            outcome.response,
-            usage,
-            prefill_tps,
-            outcome.decode_tps,
+            Completion {
+                text: outcome.response,
+                usage,
+                prefill_tps,
+                decode_tps: outcome.decode_tps,
+                stop_sequence: outcome.stop_sequence,
+            },
             kv_tokens,
         ))
     }
@@ -2934,6 +3516,31 @@ impl Engine {
     /// verifies the draft against the per-position logits (see
     /// [`crate::speculative`]); otherwise — or whenever the drafter has
     /// nothing to propose — it is the plain one-token loop.
+    /// Build (or fetch from the cache) the grammar matcher for this request.
+    ///
+    /// The tokenizer trie is compiled lazily, once per engine.  A schema that
+    /// cannot compile is an invalid request: the client gets a 400 instead of
+    /// a prefilled prompt and a garbage completion.
+    fn constraint_matcher(&self, options: &GenerationOptions) -> Result<Option<Matcher>> {
+        let Some(spec) = options.constraint.as_ref() else {
+            return Ok(None);
+        };
+        let engine = match self.constraints.get_or_init(|| {
+            ConstraintEngine::from_path(&self.tokenizer_path, &self.eos_token_ids)
+        }) {
+            Ok(engine) => engine,
+            Err(e) => {
+                return Err(JoshuaError::InvalidRequest(format!(
+                    "response_format is not available for this tokenizer: {e}"
+                )));
+            }
+        };
+        engine
+            .matcher(spec)
+            .map(Some)
+            .map_err(|e| JoshuaError::InvalidRequest(format!("response_format: {e}")))
+    }
+
     fn decode_loop(
         &self,
         model: &mut GenSession,
@@ -2942,32 +3549,51 @@ impl Engine {
         penalty_seed: &[u32],
         options: &GenerationOptions,
         cancel: Option<&AtomicBool>,
+        mut on_text: Option<&mut (dyn FnMut(&str) + '_)>,
     ) -> Result<DecodeOutcome> {
         let mut text = DecodeText::new(penalty_seed, &self.tokenizer);
-        let mut rng = match options.seed {
-            Some(seed) => StdRng::seed_from_u64(seed),
-            None => {
-                StdRng::from_rng(thread_rng()).map_err(|e| JoshuaError::Inference(e.to_string()))?
-            }
-        };
+        let mut stream = StreamGate::new(&options.stop_sequences);
+        // A fixed seed makes every draw a pure function of (seed, position,
+        // stream); without one, pick a request seed once and keep the stream
+        // reproducible for the rest of this generation.
+        let seed = options.seed.unwrap_or_else(|| thread_rng().gen::<u64>());
         let n_ctx = self.effective_n_ctx(options);
         let mut sampler = SamplingWorkspace::default();
+        let mut constraint = self.constraint_matcher(options)?;
+        // A user stop string could truncate the document before the grammar
+        // completes, producing invalid JSON.  The grammar's own EOS is the
+        // only legal stop in constrained mode.
+        let constrained_options = constraint.as_ref().map(|_| {
+            let mut options = options.clone();
+            options.stop_sequences.clear();
+            options
+        });
+        let options = constrained_options.as_ref().unwrap_or(options);
         let mut fed_tokens: Vec<u32> = Vec::new();
         let mut n_cur = start_pos;
         let decode_start = Instant::now();
+        // Which configured stop sequence ended generation, if any.
+        let mut stop_sequence: Option<String> = None;
 
         // Speculative decoding needs a text context to draft from and a
         // session that can verify and roll back.
         // MTP drafting (the model's own NextN block) takes the place of
         // prompt lookup where the session has it.
-        let mtp = if self.mtp > 0 && model.mtp_enabled() && model.supports_speculative() {
+        let mtp = if constraint.is_none()
+            && self.mtp > 0
+            && model.mtp_enabled()
+            && model.supports_speculative()
+        {
             self.mtp
         } else {
             0
         };
-        let spec = self
-            .speculative
-            .filter(|_| mtp == 0 && !penalty_seed.is_empty() && model.supports_speculative());
+        let spec = self.speculative.filter(|_| {
+            constraint.is_none()
+                && mtp == 0
+                && !penalty_seed.is_empty()
+                && model.supports_speculative()
+        });
         let mut drafter = spec.map(|c| NgramDrafter::new(c, penalty_seed));
         let max_draft = if mtp > 0 { mtp } else { spec.map_or(1, |c| c.max_draft) };
         let mut draft_len = if mtp > 0 { mtp } else { spec.map_or(0, |c| c.max_draft) };
@@ -3000,10 +3626,31 @@ impl Engine {
                 break;
             }
 
+            let mask = match constraint.as_mut() {
+                Some(matcher) => {
+                    let mask = matcher.compute_mask_or_eos().map_err(|e| {
+                        JoshuaError::Inference(format!("constrained decoding: {e}"))
+                    })?;
+                    if mask.num_set() == 0 {
+                        return Err(JoshuaError::Inference(
+                            "constrained decoding reached a dead end".to_string(),
+                        ));
+                    }
+                    Some(mask)
+                }
+                None => None,
+            };
             let next_token = match pending.take() {
                 Some(t) => t,
                 None => {
-                    let t = sampler.sample(&logits_vec, options, &mut rng, &text.recent_tokens)?;
+                    let t = sampler.sample_at(
+                        &logits_vec,
+                        options,
+                        &text.recent_tokens,
+                        mask.as_ref(),
+                        seed,
+                        n_cur as u64,
+                    )?;
                     if debug_tokens() {
                         let mut order: Vec<usize> = (0..logits_vec.len()).collect();
                         order.sort_by(|&a, &b| logits_vec[b].total_cmp(&logits_vec[a]));
@@ -3023,7 +3670,17 @@ impl Engine {
             if self.eos_token_ids.contains(&next_token) {
                 break;
             }
-            if self.emit_token(&mut text, next_token, options)? {
+            if let Some(matcher) = constraint.as_mut() {
+                // The sampler chose a token the mask allowed; advance the
+                // grammar before requesting the next mask.
+                matcher.consume_token(next_token).map_err(|e| {
+                    JoshuaError::Inference(format!("constrained decoding: {e}"))
+                })?;
+            }
+            let stopped = self.emit_token(&mut text, next_token, options)?;
+            stream.push(&text.response, stopped.is_some(), on_text.as_deref_mut());
+            if let Some(stop) = stopped {
+                stop_sequence = Some(stop);
                 break;
             }
             if let Some(d) = drafter.as_mut() {
@@ -3080,8 +3737,14 @@ impl Engine {
             let mut kept = 0usize;
             let mut stop = false;
             for (i, &draft) in drafts.iter().enumerate() {
-                let dist = sampler.distribution(&rows[i], options, &text.recent_tokens);
-                match dist.verify(draft, &mut rng)? {
+                // Speculation is only enabled when no grammar mask is active
+                // (`constraint.is_none()` gates both the n-gram drafter and
+                // MTP), so verification never needs a mask.
+                let dist = sampler.distribution(&rows[i], options, &text.recent_tokens, None);
+                // `rows[i]` decides the draft at position `n_cur + i`; the
+                // draw depends only on that position, so the outcome does not
+                // depend on how many drafts earlier steps verified.
+                match dist.verify_at(draft, seed, (n_cur + i) as u64)? {
                     Verdict::Accept => {
                         accepted += 1;
                         if self.eos_token_ids.contains(&draft) {
@@ -3097,7 +3760,10 @@ impl Engine {
                         if let Some(d) = drafter.as_mut() {
                             d.push(draft);
                         }
-                        if self.emit_token(&mut text, draft, options)? {
+                        let stopped = self.emit_token(&mut text, draft, options)?;
+                        stream.push(&text.response, stopped.is_some(), on_text.as_deref_mut());
+                        if let Some(matched) = stopped {
+                            stop_sequence = Some(matched);
                             stop = true;
                             break;
                         }
@@ -3149,6 +3815,8 @@ impl Engine {
             model.discard_verify();
         }
 
+        stream.finish(&text.response, on_text.as_deref_mut());
+
         let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
         let n_decoded = text.n_decoded;
         let decode_tps = if decode_ms > 0.0 && n_decoded > 0 {
@@ -3162,18 +3830,19 @@ impl Engine {
             n_decoded,
             fed_tokens,
             decode_tps,
+            stop_sequence,
         })
     }
 
     /// Append one generated token to the response text and the
-    /// repetition-penalty window.  Returns `true` when a stop sequence has
-    /// been reached (the response is trimmed to before it).
+    /// repetition-penalty window.  Returns the matched stop sequence, if any
+    /// (the response is trimmed to before it).
     fn emit_token(
         &self,
         text: &mut DecodeText<'_>,
         token: u32,
         options: &GenerationOptions,
-    ) -> Result<bool> {
+    ) -> Result<Option<String>> {
         if self.byte_level_decode {
             // Byte-level BPE splits multi-byte UTF-8 across token
             // boundaries — a single token can be a lone byte (e.g.
@@ -3268,7 +3937,16 @@ impl Engine {
             ));
         }
         // Embeddings also load/hold a model instance — bound concurrency.
-        let _permit = InFlightGuard::acquire(&self.in_flight, self.max_concurrency)?;
+        let _permit = InFlightGuard::acquire_with(
+            &self.in_flight,
+            self.max_concurrency,
+            self.admission_queue_depth,
+            self.queue_timeout,
+            cancel,
+        )?;
+        if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+            return Err(JoshuaError::Cancelled);
+        }
         let model = self.embedding_model()?;
         let mut vectors = Vec::with_capacity(texts.len());
         let mut total_tokens: u32 = 0;
@@ -3992,17 +4670,19 @@ impl Engine {
     }
 
     /// Scan `response` for any configured stop sequence and truncate it.
-    fn check_stop_sequences(response: &mut String, stops: &[String]) -> bool {
+    /// Returns the matched sequence so the caller can report why decoding
+    /// stopped.
+    fn check_stop_sequences(response: &mut String, stops: &[String]) -> Option<String> {
         for stop in stops {
             if stop.is_empty() {
                 continue;
             }
             if response.ends_with(stop.as_str()) {
                 response.truncate(response.len() - stop.len());
-                return true;
+                return Some(stop.clone());
             }
         }
-        false
+        None
     }
 }
 
@@ -5605,7 +6285,10 @@ fn extract_chat_template(gguf: &gguf_file::Content, tokenizer: &Tokenizer) -> Op
         token_str_from_metadata(gguf, "tokenizer.ggml.bos_token_id", tokenizer).unwrap_or_default();
     let eos =
         token_str_from_metadata(gguf, "tokenizer.ggml.eos_token_id", tokenizer).unwrap_or_default();
-    Some(ChatTemplate::new(source, bos, eos))
+    Some(
+        ChatTemplate::new(source, bos, eos)
+            .with_special_tokens(crate::template::special_token_strings(tokenizer)),
+    )
 }
 
 /// Derive EOS token IDs from GGUF metadata and well-known special token strings.
@@ -5675,14 +6358,18 @@ fn squeeze_batch_logits(logits: &Tensor) -> Result<Vec<f32>> {
     }
 
     impl SamplingWorkspace {
-        fn sample(
+        /// Draw the token at absolute position `pos` from `seed`.
+        fn sample_at(
             &mut self,
             logits: &[f32],
             opts: &GenerationOptions,
-            rng: &mut impl rand::Rng,
             recent_tokens: &[u32],
+            mask: Option<&SimpleVob>,
+            seed: u64,
+            pos: u64,
         ) -> Result<u32> {
-            self.distribution(logits, opts, recent_tokens).sample(rng)
+            self.distribution(logits, opts, recent_tokens, mask)
+                .sample_at(seed, pos)
         }
 
         fn distribution(
@@ -5690,8 +6377,9 @@ fn squeeze_batch_logits(logits: &Tensor) -> Result<Vec<f32>> {
             logits: &[f32],
             opts: &GenerationOptions,
             recent_tokens: &[u32],
+            mask: Option<&SimpleVob>,
         ) -> TokenDistRef<'_> {
-            match self.fill(logits, opts, recent_tokens) {
+            match self.fill(logits, opts, recent_tokens, mask) {
                 SamplingKind::Greedy(token) => TokenDistRef::Greedy(token),
                 SamplingKind::Probs => TokenDistRef::Probs(&self.probs),
             }
@@ -5702,6 +6390,7 @@ fn squeeze_batch_logits(logits: &Tensor) -> Result<Vec<f32>> {
             logits: &[f32],
             opts: &GenerationOptions,
             recent_tokens: &[u32],
+            mask: Option<&SimpleVob>,
         ) -> SamplingKind {
             if logits.is_empty() {
                 return SamplingKind::Greedy(0);
@@ -5761,16 +6450,40 @@ fn squeeze_batch_logits(logits: &Tensor) -> Result<Vec<f32>> {
 
             // ── Greedy ────────────────────────────────────────────────────────────────
             if opts.temperature <= 0.0 {
-                return SamplingKind::Greedy(argmax(logits));
+                return SamplingKind::Greedy(argmax_allowed(logits, mask));
             }
 
             // ── Temperature scaling ───────────────────────────────────────────────────
             let inv_temp = 1.0_f32 / opts.temperature;
-            // Subtract max for numerical stability before exp.
-            let max_logit = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            // Subtract the largest legal logit for numerical stability before
+            // exp.  The vocabulary-wide maximum is wrong under a grammar mask:
+            // one dominant forbidden token would push every permitted logit
+            // far below zero, their exponentials would underflow to zero, and
+            // a sampled request would silently fall back to greedy decoding.
+            let max_logit = match mask {
+                Some(mask) => logits
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| mask.is_allowed(*i as u32))
+                    .map(|(_, &l)| l)
+                    .fold(f32::NEG_INFINITY, f32::max),
+                None => logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max),
+            };
             let probs = &mut self.probs;
             probs.clear();
             probs.extend(logits.iter().map(|&l| ((l - max_logit) * inv_temp).exp()));
+
+            // ── Grammar mask ──────────────────────────────────────────────────────────
+            // Applied before top-k/min-p/top-p so those filters only ever
+            // consider legal tokens (and never re-normalize an illegal one
+            // back into the distribution).
+            if let Some(mask) = mask {
+                for (i, p) in probs.iter_mut().enumerate() {
+                    if !mask.is_allowed(i as u32) {
+                        *p = 0.0;
+                    }
+                }
+            }
 
             // ── Top-k ─────────────────────────────────────────────────────────────────
             retain_top_k(probs, opts.top_k as usize, &mut self.indexed);
@@ -5790,16 +6503,21 @@ fn squeeze_batch_logits(logits: &Tensor) -> Result<Vec<f32>> {
             if opts.top_p < 1.0 && opts.top_p > 0.0 {
                 let sum: f32 = probs.iter().sum();
                 if sum > 0.0 {
+                    // Top-k/min-p already zeroed the tail.  Sort only the
+                    // survivors: with the default top-k this is a few dozen
+                    // entries instead of the whole vocabulary.  Token id
+                    // breaks equal-probability ties so the cut is stable.
                     let sorted_idx = &mut self.sorted_idx;
                     sorted_idx.clear();
-                    sorted_idx.extend(0..probs.len());
+                    sorted_idx.extend((0..probs.len()).filter(|&i| probs[i] > 0.0));
                     sorted_idx.sort_unstable_by(|&a, &b| {
                         probs[b]
                             .partial_cmp(&probs[a])
                             .unwrap_or(std::cmp::Ordering::Equal)
+                            .then_with(|| a.cmp(&b))
                     });
                     let mut cumsum = 0.0_f32;
-                    let mut cut_from = probs.len();
+                    let mut cut_from = sorted_idx.len();
                     for (rank, &idx) in sorted_idx.iter().enumerate() {
                         cumsum += probs[idx] / sum;
                         if cumsum > opts.top_p {
@@ -5817,7 +6535,7 @@ fn squeeze_batch_logits(logits: &Tensor) -> Result<Vec<f32>> {
             let total: f32 = probs.iter().sum();
             if total <= 0.0 {
                 // Fallback: greedy from original (penalty-adjusted) logits.
-                return SamplingKind::Greedy(argmax(logits));
+                return SamplingKind::Greedy(argmax_allowed(logits, mask));
             }
 
             for p in probs.iter_mut() {
@@ -5861,6 +6579,23 @@ fn retain_top_k(probs: &mut [f32], k: usize, indexed: &mut Vec<(usize, f32)>) {
 }
 
 /// Index of the largest logit (0 for an empty vector).
+/// `argmax`, restricted to the grammar-legal tokens when a mask is active.
+fn argmax_allowed(logits: &[f32], mask: Option<&SimpleVob>) -> u32 {
+    let Some(mask) = mask else {
+        return argmax(logits);
+    };
+    let mut best: Option<(usize, f32)> = None;
+    for (i, &logit) in logits.iter().enumerate() {
+        if !mask.is_allowed(i as u32) {
+            continue;
+        }
+        if best.is_none_or(|(_, b)| logit > b) {
+            best = Some((i, logit));
+        }
+    }
+    best.map(|(i, _)| i as u32).unwrap_or_else(|| argmax(logits))
+}
+
 fn argmax(logits: &[f32]) -> u32 {
     logits
         .iter()
@@ -5967,10 +6702,51 @@ mod tests {
     ) -> crate::speculative::TokenDist {
         use crate::speculative::TokenDist;
         let mut workspace = SamplingWorkspace::default();
-        match workspace.fill(logits, opts, recent) {
+        match workspace.fill(logits, opts, recent, None) {
             SamplingKind::Greedy(t) => TokenDist::Greedy(t),
             SamplingKind::Probs => TokenDist::Probs(workspace.probs),
         }
+    }
+
+    /// A token's draw depends only on `(seed, position)`, so verifying drafts
+    /// at earlier positions cannot shift the token emitted later.  That is
+    /// what makes `--speculative` output-preserving for a fixed seed.
+    #[test]
+    fn position_keyed_sampling_ignores_verification_history() {
+        let logits: Vec<f32> = (0..128)
+            .map(|i| ((i * 37) % 101) as f32 / 20.0)
+            .collect();
+        let opts = GenerationOptions {
+            temperature: 1.0,
+            top_k: 20,
+            top_p: 0.9,
+            ..Default::default()
+        };
+        let recent = [3u32, 7];
+
+        let mut ws = SamplingWorkspace::default();
+        let plain: Vec<u32> = (0..8)
+            .map(|pos| {
+                ws.sample_at(&logits, &opts, &recent, None, 1234, pos)
+                    .unwrap()
+            })
+            .collect();
+
+        let mut ws = SamplingWorkspace::default();
+        let mut with_verification = Vec::new();
+        for pos in 0..8 {
+            {
+                let dist = ws.distribution(&logits, &opts, &recent, None);
+                for draft in 0..3 {
+                    let _ = dist.verify_at(draft, 1234, pos).unwrap();
+                }
+            }
+            with_verification.push(
+                ws.sample_at(&logits, &opts, &recent, None, 1234, pos)
+                    .unwrap(),
+            );
+        }
+        assert_eq!(plain, with_verification);
     }
 
     #[test]
@@ -5996,7 +6772,7 @@ mod tests {
                 };
                 let recent = [0, 3, 3, 999];
                 let expected = fresh_distribution(&logits, &opts, &recent);
-                let actual = workspace.distribution(&logits, &opts, &recent);
+                let actual = workspace.distribution(&logits, &opts, &recent, None);
                 match (actual, expected.as_ref()) {
                     (TokenDistRef::Greedy(a), TokenDistRef::Greedy(b)) => assert_eq!(a, b),
                     (TokenDistRef::Probs(a), TokenDistRef::Probs(b)) => assert_eq!(a, b),
@@ -6019,6 +6795,79 @@ mod tests {
     }
 
     #[test]
+    fn grammar_mask_filters_before_selection() {
+        use crate::constraints::SimpleVob;
+
+        let logits = [1.0_f32, 5.0, 3.0, 4.0];
+        let opts = GenerationOptions {
+            temperature: 0.0,
+            ..Default::default()
+        };
+        // The raw argmax is token 1; the grammar allows 1 and 3, so greedy
+        // must still agree with the raw argmax here.
+        let mask = SimpleVob::from_slice(&[false, true, false, true]);
+        let got = SamplingWorkspace::default()
+            .sample_at(&logits, &opts, &[], Some(&mask), 0, 0)
+            .unwrap();
+        assert_eq!(got, 1);
+
+        // Excluding token 1 leaves token 3, even though it is not the raw
+        // argmax.
+        let mask = SimpleVob::from_slice(&[false, false, false, true, false]);
+        let got = SamplingWorkspace::default()
+            .sample_at(&logits, &opts, &[], Some(&mask), 0, 0)
+            .unwrap();
+        assert_eq!(got, 3);
+
+        // With probabilities, illegal tokens are zeroed before top-k/top-p.
+        let opts = GenerationOptions {
+            temperature: 1.0,
+            top_k: 0,
+            top_p: 1.0,
+            min_p: 0.0,
+            ..Default::default()
+        };
+        let mask = SimpleVob::from_slice(&[false, false, true, false]);
+        let mut workspace = SamplingWorkspace::default();
+        match workspace.distribution(&logits, &opts, &[], Some(&mask)) {
+            TokenDistRef::Probs(probs) => {
+                assert_eq!(probs[2], 1.0);
+                assert_eq!(probs[0], 0.0);
+                assert_eq!(probs[1], 0.0);
+                assert_eq!(probs[3], 0.0);
+            }
+            TokenDistRef::Greedy(_) => panic!("temperature 1 is not greedy"),
+        }
+    }
+
+    #[test]
+    fn a_dominant_forbidden_logit_does_not_starve_permitted_tokens() {
+        use crate::constraints::SimpleVob;
+
+        // Token 0 is a forbidden argmax far above the legal ones.  Scaling by
+        // the vocabulary maximum would underflow 0.0 and 1.0 to zero, leaving
+        // an empty distribution and a silent greedy fallback.
+        let logits = [1000.0_f32, 0.0, 1.0];
+        let mask = SimpleVob::from_slice(&[false, true, true]);
+        let opts = GenerationOptions {
+            temperature: 0.01,
+            top_k: 0,
+            top_p: 1.0,
+            min_p: 0.0,
+            ..Default::default()
+        };
+        let mut workspace = SamplingWorkspace::default();
+        match workspace.distribution(&logits, &opts, &[], Some(&mask)) {
+            TokenDistRef::Probs(probs) => {
+                assert_eq!(probs[0], 0.0, "the forbidden token stays masked");
+                assert!(probs[1] > 0.0, "a permitted token must survive: {probs:?}");
+                assert_eq!(probs[2], 1.0, "the legal argmax is the mode");
+            }
+            TokenDistRef::Greedy(_) => panic!("a sampled request must not become greedy"),
+        }
+    }
+
+    #[test]
     fn presence_and_frequency_penalties_shift_logits_per_occurrence() {
         let logits = [2.0_f32, 1.9, 1.0, -1.0];
         // Token 0 seen twice, token 3 once; token 1 never.
@@ -6030,7 +6879,7 @@ mod tests {
                 frequency_penalty: frequency,
                 ..Default::default()
             };
-            match SamplingWorkspace::default().fill(&logits, &opts, &recent) {
+            match SamplingWorkspace::default().fill(&logits, &opts, &recent, None) {
                 SamplingKind::Greedy(t) => t,
                 SamplingKind::Probs => panic!("temperature 0 is greedy"),
             }
@@ -6057,7 +6906,7 @@ mod tests {
             ..Default::default()
         };
         let mut ws = SamplingWorkspace::default();
-        ws.fill(&logits, &opts, &recent);
+        ws.fill(&logits, &opts, &recent, None);
         assert_eq!(
             ws.adjusted,
             vec![2.0 - 0.5 - 0.5, 1.9, 1.0, -1.0 - 0.5 - 0.25]
@@ -6114,7 +6963,7 @@ mod tests {
                     for _ in 0..repeats {
                         let verdict = if reuse {
                             workspace
-                                .distribution(black_box(&logits), &opts, &recent)
+                                .distribution(black_box(&logits), &opts, &recent, None)
                                 .verify(17, &mut rng)
                                 .unwrap()
                         } else {
@@ -7224,23 +8073,181 @@ mod tests {
 
     #[test]
     fn in_flight_guard_caps_and_releases() {
-        let counter = AtomicUsize::new(0);
+        let gate = AdmissionGate::new();
         // Fill to the cap of 2.
-        let a = InFlightGuard::acquire(&counter, 2).expect("first permit");
-        let b = InFlightGuard::acquire(&counter, 2).expect("second permit");
-        // Third is rejected as Overloaded, and the counter is not left inflated.
-        match InFlightGuard::acquire(&counter, 2) {
+        let a = InFlightGuard::acquire(&gate, 2, Duration::ZERO).expect("first permit");
+        let b = InFlightGuard::acquire(&gate, 2, Duration::ZERO).expect("second permit");
+        // Third is rejected as Overloaded, and the count is not left inflated.
+        match InFlightGuard::acquire(&gate, 2, Duration::ZERO) {
             Err(JoshuaError::Overloaded(_)) => {}
             Err(e) => panic!("expected Overloaded, got {e:?}"),
             Ok(_) => panic!("expected Overloaded, got a permit"),
         }
-        assert_eq!(counter.load(Ordering::Acquire), 2);
+        assert_eq!(gate.active(), 2);
         // Dropping a permit frees a slot for the next request.
         drop(a);
-        let _c = InFlightGuard::acquire(&counter, 2).expect("permit after release");
+        let _c =
+            InFlightGuard::acquire(&gate, 2, Duration::ZERO).expect("permit after release");
         drop(b);
         drop(_c);
-        assert_eq!(counter.load(Ordering::Acquire), 0);
+        assert_eq!(gate.active(), 0);
+    }
+
+    #[test]
+    fn queued_request_waits_for_a_permit() {
+        let gate = Arc::new(AdmissionGate::new());
+        let held = InFlightGuard::acquire(&gate, 1, Duration::ZERO).expect("first permit");
+        let waiter = {
+            let gate = Arc::clone(&gate);
+            std::thread::spawn(move || {
+                let started = Instant::now();
+                let permit = InFlightGuard::acquire(&gate, 1, Duration::from_secs(2))
+                    .expect("queued permit");
+                assert_eq!(gate.active(), 1);
+                drop(permit);
+                started.elapsed()
+            })
+        };
+        std::thread::sleep(Duration::from_millis(40));
+        drop(held);
+        let waited = waiter.join().expect("waiter thread");
+        assert!(waited >= Duration::from_millis(30), "waited only {waited:?}");
+        assert_eq!(gate.active(), 0);
+    }
+
+    #[test]
+    fn admission_queue_is_bounded() {
+        let gate = Arc::new(AdmissionGate::new());
+        let held = InFlightGuard::acquire(&gate, 1, Duration::ZERO).expect("first permit");
+        let waiter = {
+            let gate = Arc::clone(&gate);
+            std::thread::spawn(move || {
+                let permit = InFlightGuard::acquire_with(
+                    &gate,
+                    1,
+                    1,
+                    Duration::from_secs(2),
+                    None,
+                )
+                .expect("queued permit");
+                drop(permit);
+            })
+        };
+        // Wait until the one queue slot is occupied.
+        for _ in 0..200 {
+            if gate.waiting() == 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(gate.waiting(), 1);
+        match InFlightGuard::acquire_with(&gate, 1, 1, Duration::from_millis(10), None) {
+            Err(JoshuaError::Overloaded(msg)) => {
+                assert!(msg.contains("queue is full"), "got: {msg}");
+            }
+            Err(e) => panic!("expected Overloaded, got {e:?}"),
+            Ok(_) => panic!("expected the full queue to reject"),
+        }
+        assert_eq!(gate.active(), 1, "rejected waiter must not take a slot");
+        drop(held);
+        waiter.join().expect("waiter thread");
+        assert_eq!(gate.active(), 0);
+        assert_eq!(gate.waiting(), 0);
+    }
+
+    #[test]
+    fn cancelled_waiter_leaves_the_queue() {
+        let gate = Arc::new(AdmissionGate::new());
+        let held = InFlightGuard::acquire(&gate, 1, Duration::ZERO).expect("first permit");
+        let cancel = Arc::new(AtomicBool::new(false));
+        let waiter = {
+            let gate = Arc::clone(&gate);
+            let cancel = Arc::clone(&cancel);
+            std::thread::spawn(move || {
+                InFlightGuard::acquire_with(
+                    &gate,
+                    1,
+                    4,
+                    Duration::from_secs(5),
+                    Some(&cancel),
+                )
+                .map(|_| ())
+            })
+        };
+        for _ in 0..200 {
+            if gate.waiting() == 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(gate.waiting(), 1);
+        cancel.store(true, Ordering::Relaxed);
+        match waiter.join().expect("waiter thread") {
+            Err(JoshuaError::Cancelled) => {}
+            other => panic!("expected Cancelled, got {other:?}"),
+        }
+        assert_eq!(gate.waiting(), 0);
+        assert_eq!(gate.active(), 1);
+        drop(held);
+        assert_eq!(gate.active(), 0);
+    }
+
+    #[test]
+    fn queued_request_times_out() {
+        let gate = AdmissionGate::new();
+        let _held = InFlightGuard::acquire(&gate, 1, Duration::ZERO).expect("first permit");
+        let started = Instant::now();
+        match InFlightGuard::acquire(&gate, 1, Duration::from_millis(30)) {
+            Err(JoshuaError::Overloaded(_)) => {}
+            Err(e) => panic!("expected Overloaded, got {e:?}"),
+            Ok(_) => panic!("expected Overloaded, got a permit"),
+        }
+        assert!(started.elapsed() >= Duration::from_millis(20));
+        // The rejected waiter left the count alone.
+        assert_eq!(gate.active(), 1);
+    }
+
+    #[test]
+    fn stream_gate_withholds_a_stop_sequence_until_it_is_resolved() {
+        let seen = std::cell::RefCell::new(String::new());
+        let mut sink = |text: &str| seen.borrow_mut().push_str(text);
+        let stops = vec!["END".to_string()];
+        let mut gate = StreamGate::new(&stops);
+
+        // "EN" is a prefix of the stop sequence, so it stays withheld.
+        gate.push("hello EN", false, Some(&mut sink));
+        assert_eq!(&*seen.borrow(), "hello");
+        // The complete sequence trims the response to "hello "; nothing
+        // already sent is retracted and no stop text leaks.
+        gate.push("hello ", true, Some(&mut sink));
+        gate.finish("hello ", Some(&mut sink));
+        assert_eq!(&*seen.borrow(), "hello ");
+    }
+
+    #[test]
+    fn stream_gate_flushes_without_stop_sequences() {
+        let seen = std::cell::RefCell::new(String::new());
+        let mut sink = |text: &str| seen.borrow_mut().push_str(text);
+        let mut gate = StreamGate::new(&[]);
+        gate.push("hel", false, Some(&mut sink));
+        gate.push("lo", false, Some(&mut sink));
+        gate.finish("hello", Some(&mut sink));
+        assert_eq!(&*seen.borrow(), "hello");
+    }
+
+    #[test]
+    fn check_stop_sequences_reports_the_matched_sequence() {
+        let mut response = "hello END".to_string();
+        let stops = vec!["STOP".to_string(), "END".to_string()];
+        assert_eq!(
+            Engine::check_stop_sequences(&mut response, &stops).as_deref(),
+            Some("END")
+        );
+        assert_eq!(response, "hello ");
+
+        let mut response = "nothing here".to_string();
+        assert!(Engine::check_stop_sequences(&mut response, &stops).is_none());
+        assert_eq!(response, "nothing here");
     }
 
     #[test]
