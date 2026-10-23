@@ -248,17 +248,28 @@ impl DraftSession {
     }
 }
 
-/// Size of the draft GGUF `path` names (a directory's `.gguf`), in bytes.
+/// Bytes the draft GGUF `path` names (a directory's `.gguf`) occupies on the
+/// device, using the same per-tensor residency rules as the target's fit
+/// check: float embeddings dequantized to f32 on CUDA/Metal, quantized
+/// weights kept in their block storage elsewhere.
 ///
-/// Used before loading to budget the draft's weights against the target's;
-/// `0` when the path cannot be resolved (the load itself reports the error).
-pub(crate) fn gguf_bytes(path: &Path) -> Result<u64> {
+/// Used before loading to budget the draft's weights against the target's.
+pub(crate) fn resident_bytes(path: &Path) -> Result<u64> {
     let path = if path.is_dir() {
         crate::find_gguf_in_dir(path)?
     } else {
         path.to_path_buf()
     };
-    Ok(std::fs::metadata(&path)?.len())
+    let file = File::open(&path)
+        .map_err(|e| JoshuaError::ModelLoad(format!("draft model {}: {e}", path.display())))?;
+    let file_len = file.metadata()?.len();
+    // SAFETY: the mapping is read-only; see [`DraftModel::load`].
+    let mmap = unsafe { Mmap::map(&file) }?;
+    let header = crate::gguf_ext::read_header(&mut Cursor::new(&mmap[..]))?;
+    header.validate_layout(file_len)?;
+    let arch = crate::model::Architecture::from_gguf_metadata(&header.metadata);
+    let footprint = crate::engine::device_weight_bytes(&header, arch);
+    Ok(footprint.dense_upper.saturating_add(footprint.experts))
 }
 
 /// A GGUF's `tokenizer.ggml.tokens` list.
