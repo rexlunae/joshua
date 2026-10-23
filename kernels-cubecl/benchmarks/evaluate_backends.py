@@ -55,8 +55,16 @@ for backend, policy in runs:
             archived = folder.with_name(
                 f"{folder.name}-incomplete-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}")
             folder.rename(archived)
+            # The subprocess log is a sibling, not part of the run folder. Move
+            # it too, or the rerun would truncate the failure it explains.
+            log_path = folder.with_suffix('.log')
+            archived_log = archived.with_suffix('.log')
+            if log_path.exists():
+                log_path.rename(archived_log)
             entry['status'] = 'retrying_incomplete_result'
             entry['archived_incomplete_folder'] = str(archived)
+            if archived_log.exists():
+                entry['archived_incomplete_log'] = str(archived_log)
             should_run = True
         else:
             entry['status'] = 'existing_incomplete_result'
