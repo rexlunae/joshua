@@ -105,6 +105,7 @@ use std::time::{Duration, Instant};
 
 use candle_core::quantized::gguf_file;
 use candle_core::{Device, Tensor};
+use llguidance::Matcher;
 use memmap2::Mmap;
 use rand::{thread_rng, Rng};
 use tokenizers::Tokenizer;
@@ -112,6 +113,7 @@ use tokenizers::Tokenizer;
 use crate::embedding::EmbeddingModel;
 use crate::model::{Architecture, ModelSnapshot, QuantizedModel};
 use crate::npu::{NpuBackend, NpuSession};
+use crate::constraints::{ConstraintEngine, SimpleVob};
 use crate::speculative::{
     next_draft_len, NgramDrafter, SpeculationGate, SpeculativeConfig, SpeculativeStats,
     TokenDistRef, Verdict,
@@ -763,6 +765,11 @@ pub struct Engine {
     model_file: Option<Arc<File>>,
     /// Stateless tokenizer, shared across all inference calls.
     tokenizer: Arc<Tokenizer>,
+    /// The `tokenizer.json` this engine was loaded from; used to build the
+    /// structured-output grammar environment lazily.
+    tokenizer_path: PathBuf,
+    /// Compiled JSON grammars, built on first constrained request.
+    constraints: std::sync::OnceLock<Result<ConstraintEngine, String>>,
     /// Whether the tokenizer uses a byte-level decoder (`ByteLevel`).
     ///
     /// Byte-level BPE tokenizers (DeepSeek-V2/V3, Kimi-K2, Qwen, ...) store
@@ -2206,6 +2213,8 @@ impl Engine {
             mmap: Arc::new(mmap),
             model_file,
             tokenizer: Arc::new(tokenizer),
+            tokenizer_path,
+            constraints: std::sync::OnceLock::new(),
             byte_level_decode,
             eos_token_ids,
             chat_template,
@@ -2946,6 +2955,15 @@ impl Engine {
         let options = &self.clamp_options(options, Some(n_prompt));
         let root = root_chars.and_then(|c| self.root_tokens(prompt, c, add_special_tokens, prompt_tokens));
 
+        // ── Validate the structured-output constraint before any backend work ─
+        // A malformed `response_format` (or a tokenizer that cannot support
+        // one) is the client's error, not the backend's.  Compiling the
+        // grammar here keeps such a request away from the NPU health counter
+        // altogether; the decode loop then hits the cached matcher.
+        if options.constraint.is_some() {
+            self.constraint_matcher(options)?;
+        }
+
         // ── Acquire a session, generate, retry on CPU if the NPU fails ──────
         // Prefer a pooled instance whose state already covers a prefix of
         // this prompt; fall back to a reset instance or a fresh load.
@@ -2959,7 +2977,15 @@ impl Engine {
                 self.release_model(session, kv_tokens);
                 Ok((response, usage, prefill_tps, decode_tps))
             }
-            Err(e) if was_npu && !self.remote_only() => {
+            // Client errors (`InvalidRequest`) are not backend failures: they
+            // must not count against the NPU, and retrying them on the candle
+            // path would only reproduce the same error.  They fall through to
+            // the plain error arm below.
+            Err(e)
+                if was_npu
+                    && !self.remote_only()
+                    && !matches!(e, JoshuaError::InvalidRequest(_)) =>
+            {
                 // Count the failure (possibly disabling the backend), drop
                 // the session unless it can prove a clean reset, and retry
                 // the whole request once on the candle path.
@@ -3198,6 +3224,31 @@ impl Engine {
     /// verifies the draft against the per-position logits (see
     /// [`crate::speculative`]); otherwise — or whenever the drafter has
     /// nothing to propose — it is the plain one-token loop.
+    /// Build (or fetch from the cache) the grammar matcher for this request.
+    ///
+    /// The tokenizer trie is compiled lazily, once per engine.  A schema that
+    /// cannot compile is an invalid request: the client gets a 400 instead of
+    /// a prefilled prompt and a garbage completion.
+    fn constraint_matcher(&self, options: &GenerationOptions) -> Result<Option<Matcher>> {
+        let Some(spec) = options.constraint.as_ref() else {
+            return Ok(None);
+        };
+        let engine = match self.constraints.get_or_init(|| {
+            ConstraintEngine::from_path(&self.tokenizer_path, &self.eos_token_ids)
+        }) {
+            Ok(engine) => engine,
+            Err(e) => {
+                return Err(JoshuaError::InvalidRequest(format!(
+                    "response_format is not available for this tokenizer: {e}"
+                )));
+            }
+        };
+        engine
+            .matcher(spec)
+            .map(Some)
+            .map_err(|e| JoshuaError::InvalidRequest(format!("response_format: {e}")))
+    }
+
     fn decode_loop(
         &self,
         model: &mut GenSession,
@@ -3214,6 +3265,16 @@ impl Engine {
         let seed = options.seed.unwrap_or_else(|| thread_rng().gen::<u64>());
         let n_ctx = self.effective_n_ctx(options);
         let mut sampler = SamplingWorkspace::default();
+        let mut constraint = self.constraint_matcher(options)?;
+        // A user stop string could truncate the document before the grammar
+        // completes, producing invalid JSON.  The grammar's own EOS is the
+        // only legal stop in constrained mode.
+        let constrained_options = constraint.as_ref().map(|_| {
+            let mut options = options.clone();
+            options.stop_sequences.clear();
+            options
+        });
+        let options = constrained_options.as_ref().unwrap_or(options);
         let mut fed_tokens: Vec<u32> = Vec::new();
         let mut n_cur = start_pos;
         let decode_start = Instant::now();
@@ -3222,14 +3283,21 @@ impl Engine {
         // session that can verify and roll back.
         // MTP drafting (the model's own NextN block) takes the place of
         // prompt lookup where the session has it.
-        let mtp = if self.mtp > 0 && model.mtp_enabled() && model.supports_speculative() {
+        let mtp = if constraint.is_none()
+            && self.mtp > 0
+            && model.mtp_enabled()
+            && model.supports_speculative()
+        {
             self.mtp
         } else {
             0
         };
-        let spec = self
-            .speculative
-            .filter(|_| mtp == 0 && !penalty_seed.is_empty() && model.supports_speculative());
+        let spec = self.speculative.filter(|_| {
+            constraint.is_none()
+                && mtp == 0
+                && !penalty_seed.is_empty()
+                && model.supports_speculative()
+        });
         let mut drafter = spec.map(|c| NgramDrafter::new(c, penalty_seed));
         let max_draft = if mtp > 0 { mtp } else { spec.map_or(1, |c| c.max_draft) };
         let mut draft_len = if mtp > 0 { mtp } else { spec.map_or(0, |c| c.max_draft) };
@@ -3262,6 +3330,20 @@ impl Engine {
                 break;
             }
 
+            let mask = match constraint.as_mut() {
+                Some(matcher) => {
+                    let mask = matcher.compute_mask_or_eos().map_err(|e| {
+                        JoshuaError::Inference(format!("constrained decoding: {e}"))
+                    })?;
+                    if mask.num_set() == 0 {
+                        return Err(JoshuaError::Inference(
+                            "constrained decoding reached a dead end".to_string(),
+                        ));
+                    }
+                    Some(mask)
+                }
+                None => None,
+            };
             let next_token = match pending.take() {
                 Some(t) => t,
                 None => {
@@ -3269,6 +3351,7 @@ impl Engine {
                         &logits_vec,
                         options,
                         &text.recent_tokens,
+                        mask.as_ref(),
                         seed,
                         n_cur as u64,
                     )?;
@@ -3290,6 +3373,13 @@ impl Engine {
 
             if self.eos_token_ids.contains(&next_token) {
                 break;
+            }
+            if let Some(matcher) = constraint.as_mut() {
+                // The sampler chose a token the mask allowed; advance the
+                // grammar before requesting the next mask.
+                matcher.consume_token(next_token).map_err(|e| {
+                    JoshuaError::Inference(format!("constrained decoding: {e}"))
+                })?;
             }
             if self.emit_token(&mut text, next_token, options)? {
                 break;
@@ -3348,7 +3438,10 @@ impl Engine {
             let mut kept = 0usize;
             let mut stop = false;
             for (i, &draft) in drafts.iter().enumerate() {
-                let dist = sampler.distribution(&rows[i], options, &text.recent_tokens);
+                // Speculation is only enabled when no grammar mask is active
+                // (`constraint.is_none()` gates both the n-gram drafter and
+                // MTP), so verification never needs a mask.
+                let dist = sampler.distribution(&rows[i], options, &text.recent_tokens, None);
                 // `rows[i]` decides the draft at position `n_cur + i`; the
                 // draw depends only on that position, so the outcome does not
                 // depend on how many drafts earlier steps verified.
@@ -5949,10 +6042,11 @@ fn squeeze_batch_logits(logits: &Tensor) -> Result<Vec<f32>> {
             logits: &[f32],
             opts: &GenerationOptions,
             recent_tokens: &[u32],
+            mask: Option<&SimpleVob>,
             seed: u64,
             pos: u64,
         ) -> Result<u32> {
-            self.distribution(logits, opts, recent_tokens)
+            self.distribution(logits, opts, recent_tokens, mask)
                 .sample_at(seed, pos)
         }
 
@@ -5961,8 +6055,9 @@ fn squeeze_batch_logits(logits: &Tensor) -> Result<Vec<f32>> {
             logits: &[f32],
             opts: &GenerationOptions,
             recent_tokens: &[u32],
+            mask: Option<&SimpleVob>,
         ) -> TokenDistRef<'_> {
-            match self.fill(logits, opts, recent_tokens) {
+            match self.fill(logits, opts, recent_tokens, mask) {
                 SamplingKind::Greedy(token) => TokenDistRef::Greedy(token),
                 SamplingKind::Probs => TokenDistRef::Probs(&self.probs),
             }
@@ -5973,6 +6068,7 @@ fn squeeze_batch_logits(logits: &Tensor) -> Result<Vec<f32>> {
             logits: &[f32],
             opts: &GenerationOptions,
             recent_tokens: &[u32],
+            mask: Option<&SimpleVob>,
         ) -> SamplingKind {
             if logits.is_empty() {
                 return SamplingKind::Greedy(0);
@@ -6032,16 +6128,40 @@ fn squeeze_batch_logits(logits: &Tensor) -> Result<Vec<f32>> {
 
             // ── Greedy ────────────────────────────────────────────────────────────────
             if opts.temperature <= 0.0 {
-                return SamplingKind::Greedy(argmax(logits));
+                return SamplingKind::Greedy(argmax_allowed(logits, mask));
             }
 
             // ── Temperature scaling ───────────────────────────────────────────────────
             let inv_temp = 1.0_f32 / opts.temperature;
-            // Subtract max for numerical stability before exp.
-            let max_logit = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            // Subtract the largest legal logit for numerical stability before
+            // exp.  The vocabulary-wide maximum is wrong under a grammar mask:
+            // one dominant forbidden token would push every permitted logit
+            // far below zero, their exponentials would underflow to zero, and
+            // a sampled request would silently fall back to greedy decoding.
+            let max_logit = match mask {
+                Some(mask) => logits
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| mask.is_allowed(*i as u32))
+                    .map(|(_, &l)| l)
+                    .fold(f32::NEG_INFINITY, f32::max),
+                None => logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max),
+            };
             let probs = &mut self.probs;
             probs.clear();
             probs.extend(logits.iter().map(|&l| ((l - max_logit) * inv_temp).exp()));
+
+            // ── Grammar mask ──────────────────────────────────────────────────────────
+            // Applied before top-k/min-p/top-p so those filters only ever
+            // consider legal tokens (and never re-normalize an illegal one
+            // back into the distribution).
+            if let Some(mask) = mask {
+                for (i, p) in probs.iter_mut().enumerate() {
+                    if !mask.is_allowed(i as u32) {
+                        *p = 0.0;
+                    }
+                }
+            }
 
             // ── Top-k ─────────────────────────────────────────────────────────────────
             retain_top_k(probs, opts.top_k as usize, &mut self.indexed);
@@ -6093,7 +6213,7 @@ fn squeeze_batch_logits(logits: &Tensor) -> Result<Vec<f32>> {
             let total: f32 = probs.iter().sum();
             if total <= 0.0 {
                 // Fallback: greedy from original (penalty-adjusted) logits.
-                return SamplingKind::Greedy(argmax(logits));
+                return SamplingKind::Greedy(argmax_allowed(logits, mask));
             }
 
             for p in probs.iter_mut() {
@@ -6137,6 +6257,23 @@ fn retain_top_k(probs: &mut [f32], k: usize, indexed: &mut Vec<(usize, f32)>) {
 }
 
 /// Index of the largest logit (0 for an empty vector).
+/// `argmax`, restricted to the grammar-legal tokens when a mask is active.
+fn argmax_allowed(logits: &[f32], mask: Option<&SimpleVob>) -> u32 {
+    let Some(mask) = mask else {
+        return argmax(logits);
+    };
+    let mut best: Option<(usize, f32)> = None;
+    for (i, &logit) in logits.iter().enumerate() {
+        if !mask.is_allowed(i as u32) {
+            continue;
+        }
+        if best.is_none_or(|(_, b)| logit > b) {
+            best = Some((i, logit));
+        }
+    }
+    best.map(|(i, _)| i as u32).unwrap_or_else(|| argmax(logits))
+}
+
 fn argmax(logits: &[f32]) -> u32 {
     logits
         .iter()
@@ -6243,7 +6380,7 @@ mod tests {
     ) -> crate::speculative::TokenDist {
         use crate::speculative::TokenDist;
         let mut workspace = SamplingWorkspace::default();
-        match workspace.fill(logits, opts, recent) {
+        match workspace.fill(logits, opts, recent, None) {
             SamplingKind::Greedy(t) => TokenDist::Greedy(t),
             SamplingKind::Probs => TokenDist::Probs(workspace.probs),
         }
@@ -6268,7 +6405,7 @@ mod tests {
         let mut ws = SamplingWorkspace::default();
         let plain: Vec<u32> = (0..8)
             .map(|pos| {
-                ws.sample_at(&logits, &opts, &recent, 1234, pos)
+                ws.sample_at(&logits, &opts, &recent, None, 1234, pos)
                     .unwrap()
             })
             .collect();
@@ -6277,13 +6414,13 @@ mod tests {
         let mut with_verification = Vec::new();
         for pos in 0..8 {
             {
-                let dist = ws.distribution(&logits, &opts, &recent);
+                let dist = ws.distribution(&logits, &opts, &recent, None);
                 for draft in 0..3 {
                     let _ = dist.verify_at(draft, 1234, pos).unwrap();
                 }
             }
             with_verification.push(
-                ws.sample_at(&logits, &opts, &recent, 1234, pos)
+                ws.sample_at(&logits, &opts, &recent, None, 1234, pos)
                     .unwrap(),
             );
         }
@@ -6313,7 +6450,7 @@ mod tests {
                 };
                 let recent = [0, 3, 3, 999];
                 let expected = fresh_distribution(&logits, &opts, &recent);
-                let actual = workspace.distribution(&logits, &opts, &recent);
+                let actual = workspace.distribution(&logits, &opts, &recent, None);
                 match (actual, expected.as_ref()) {
                     (TokenDistRef::Greedy(a), TokenDistRef::Greedy(b)) => assert_eq!(a, b),
                     (TokenDistRef::Probs(a), TokenDistRef::Probs(b)) => assert_eq!(a, b),
@@ -6336,6 +6473,79 @@ mod tests {
     }
 
     #[test]
+    fn grammar_mask_filters_before_selection() {
+        use crate::constraints::SimpleVob;
+
+        let logits = [1.0_f32, 5.0, 3.0, 4.0];
+        let opts = GenerationOptions {
+            temperature: 0.0,
+            ..Default::default()
+        };
+        // The raw argmax is token 1; the grammar allows 1 and 3, so greedy
+        // must still agree with the raw argmax here.
+        let mask = SimpleVob::from_slice(&[false, true, false, true]);
+        let got = SamplingWorkspace::default()
+            .sample_at(&logits, &opts, &[], Some(&mask), 0, 0)
+            .unwrap();
+        assert_eq!(got, 1);
+
+        // Excluding token 1 leaves token 3, even though it is not the raw
+        // argmax.
+        let mask = SimpleVob::from_slice(&[false, false, false, true, false]);
+        let got = SamplingWorkspace::default()
+            .sample_at(&logits, &opts, &[], Some(&mask), 0, 0)
+            .unwrap();
+        assert_eq!(got, 3);
+
+        // With probabilities, illegal tokens are zeroed before top-k/top-p.
+        let opts = GenerationOptions {
+            temperature: 1.0,
+            top_k: 0,
+            top_p: 1.0,
+            min_p: 0.0,
+            ..Default::default()
+        };
+        let mask = SimpleVob::from_slice(&[false, false, true, false]);
+        let mut workspace = SamplingWorkspace::default();
+        match workspace.distribution(&logits, &opts, &[], Some(&mask)) {
+            TokenDistRef::Probs(probs) => {
+                assert_eq!(probs[2], 1.0);
+                assert_eq!(probs[0], 0.0);
+                assert_eq!(probs[1], 0.0);
+                assert_eq!(probs[3], 0.0);
+            }
+            TokenDistRef::Greedy(_) => panic!("temperature 1 is not greedy"),
+        }
+    }
+
+    #[test]
+    fn a_dominant_forbidden_logit_does_not_starve_permitted_tokens() {
+        use crate::constraints::SimpleVob;
+
+        // Token 0 is a forbidden argmax far above the legal ones.  Scaling by
+        // the vocabulary maximum would underflow 0.0 and 1.0 to zero, leaving
+        // an empty distribution and a silent greedy fallback.
+        let logits = [1000.0_f32, 0.0, 1.0];
+        let mask = SimpleVob::from_slice(&[false, true, true]);
+        let opts = GenerationOptions {
+            temperature: 0.01,
+            top_k: 0,
+            top_p: 1.0,
+            min_p: 0.0,
+            ..Default::default()
+        };
+        let mut workspace = SamplingWorkspace::default();
+        match workspace.distribution(&logits, &opts, &[], Some(&mask)) {
+            TokenDistRef::Probs(probs) => {
+                assert_eq!(probs[0], 0.0, "the forbidden token stays masked");
+                assert!(probs[1] > 0.0, "a permitted token must survive: {probs:?}");
+                assert_eq!(probs[2], 1.0, "the legal argmax is the mode");
+            }
+            TokenDistRef::Greedy(_) => panic!("a sampled request must not become greedy"),
+        }
+    }
+
+    #[test]
     fn presence_and_frequency_penalties_shift_logits_per_occurrence() {
         let logits = [2.0_f32, 1.9, 1.0, -1.0];
         // Token 0 seen twice, token 3 once; token 1 never.
@@ -6347,7 +6557,7 @@ mod tests {
                 frequency_penalty: frequency,
                 ..Default::default()
             };
-            match SamplingWorkspace::default().fill(&logits, &opts, &recent) {
+            match SamplingWorkspace::default().fill(&logits, &opts, &recent, None) {
                 SamplingKind::Greedy(t) => t,
                 SamplingKind::Probs => panic!("temperature 0 is greedy"),
             }
@@ -6374,7 +6584,7 @@ mod tests {
             ..Default::default()
         };
         let mut ws = SamplingWorkspace::default();
-        ws.fill(&logits, &opts, &recent);
+        ws.fill(&logits, &opts, &recent, None);
         assert_eq!(
             ws.adjusted,
             vec![2.0 - 0.5 - 0.5, 1.9, 1.0, -1.0 - 0.5 - 0.25]
@@ -6431,7 +6641,7 @@ mod tests {
                     for _ in 0..repeats {
                         let verdict = if reuse {
                             workspace
-                                .distribution(black_box(&logits), &opts, &recent)
+                                .distribution(black_box(&logits), &opts, &recent, None)
                                 .verify(17, &mut rng)
                                 .unwrap()
                         } else {

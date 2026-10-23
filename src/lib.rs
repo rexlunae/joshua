@@ -28,6 +28,7 @@ pub mod coordinator;
 pub mod cpu_pinning;
 pub mod distributed;
 pub mod embedding;
+pub mod constraints;
 pub mod engine;
 pub mod error;
 pub mod gguf_ext;

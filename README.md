@@ -371,7 +371,8 @@ Besides `model`, `messages`, `stream` and `tools`:
 | `context_window` (alias `num_ctx`, `n_ctx`) | Per-request context window; **400** when larger than the server's `--n-ctx` (the KV cache and RoPE tables are sized at load), and the prompt must fit inside it |
 | `tool_choice` | `"none"` hides `tools`; `"required"` and named functions cannot be enforced and act like `"auto"` |
 | `stream_options` | Accepted; usage is always sent on the final chunk |
-| `n`, `logprobs`, `top_logprobs`, `response_format` | Only `n: 1`, `logprobs: false`, `top_logprobs: 0` and `{"type": "text"}` are accepted; anything else is a **400** rather than silently ignored |
+| `n`, `logprobs`, `top_logprobs` | Only `n: 1`, `logprobs: false` and `top_logprobs: 0` are accepted; anything else is a **400** rather than silently ignored |
+| `response_format` | `{"type": "text"}`, `{"type": "json_object"}`, or `{"type": "json_schema", "json_schema": {"name": …, "schema": {…}}}` — see [Structured outputs](#structured-outputs) |
 
 Other unknown fields are ignored.
 
@@ -382,6 +383,40 @@ U+200B after the first character: the model reads it as ordinary text and it
 is invisible in the conversation. Control tokens inserted by the template
 itself are unaffected. Tool definitions are treated as developer input and
 are not rewritten.
+
+#### Structured outputs
+
+`response_format` with `json_object` or `json_schema` constrains decoding to
+valid JSON.  The schema is compiled once and cached in a bounded LRU (32
+entries per model); compilation happens off the async reactor and a schema
+that cannot compile is rejected before any completion is returned.  At every
+step the legal-token mask is applied before top-k/top-p, and EOS is selectable
+only when the grammar accepts the document, so truncated JSON is not emitted.
+
+```json
+{
+  "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+      "name": "answer",
+      "strict": true,
+      "schema": {
+        "type": "object",
+        "properties": {"a": {"type": "integer"}},
+        "required": ["a"],
+        "additionalProperties": false
+      }
+    }
+  }
+}
+```
+
+A bare schema document is also accepted in `json_schema`.  JSON Schema
+`$ref` resolution is not enabled in this build.  Constrained requests disable
+speculative decoding and MTP drafting, and user `stop` strings are ignored
+(the grammar's EOS is the only legal stop); `max_tokens` still applies, so a
+cap that is too small can end a document early.  Requests without
+`response_format` are unchanged.
 
 #### Reasoning and thinking
 
