@@ -2396,7 +2396,7 @@ impl Engine {
                 // fit together; the target's own check ran before the draft
                 // existed.  A pairing that cannot fit falls back to plain
                 // decoding instead of leaving the target unable to upload.
-                let draft_bytes = crate::draft_model::gguf_bytes(path).unwrap_or(0);
+                let draft_bytes = crate::draft_model::resident_bytes(path).unwrap_or(0);
                 let fits = dense_device.is_cpu()
                     || device_budget.is_none_or(|budget| {
                         crate::placement::dense_set_fits(
@@ -5488,17 +5488,17 @@ fn resident_tensor_bounds(
 
 /// Device footprint of a model's weights as the loader leaves them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct DeviceFootprint {
+pub(crate) struct DeviceFootprint {
     /// Dense set, assuming every tensor of unknown residency stays
     /// quantized — the least the loader can allocate.  A load is refused
     /// only when this does not fit.
-    dense_lower: u64,
+    pub(crate) dense_lower: u64,
     /// Dense set, assuming every tensor of unknown residency is f32 — the
     /// most the loader can allocate.  Drives the placement decision and the
     /// per-session caps.
-    dense_upper: u64,
+    pub(crate) dense_upper: u64,
     /// Routed experts (always quantized).
-    experts: u64,
+    pub(crate) experts: u64,
 }
 
 /// Bytes the dense and routed-expert weights occupy on the device once the
@@ -5508,7 +5508,7 @@ struct DeviceFootprint {
 /// tensor the scan counted is replaced by the one head the loader ends up
 /// resident with, which for a tied head is a second, quantized copy of the
 /// embedding table (see [`resident_head_bytes`]).
-fn device_weight_bytes(
+pub(crate) fn device_weight_bytes(
     header: &crate::gguf_ext::GgufHeader,
     arch: Option<Architecture>,
 ) -> DeviceFootprint {
