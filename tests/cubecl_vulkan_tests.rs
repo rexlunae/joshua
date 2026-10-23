@@ -397,7 +397,7 @@ fn validated_adapter_enables_production_dispatch() {
     if dev.name() == "Intel(R) Arc(tm) Pro B50 Graphics (BMG G21)"
         && std::env::var_os("JOSHUA_VULKAN_QGEMV").is_none()
     {
-        assert_eq!(dev.limits().qgemv, Qgemv::CubeClExpanded);
+        assert_eq!(dev.limits().qgemv, Qgemv::CubeClNext);
     }
 }
 

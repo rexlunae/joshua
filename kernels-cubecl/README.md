@@ -3,69 +3,103 @@
 The kernel is authored in `src/lib.rs` using CubeCL 0.11.0. Its generated WGSL
 is checked in under `vendor/candle-core/src/vulkan_backend/` as
 `q4k_cubecl.wgsl`, `q8_0_cubecl.wgsl` and `q2k_cubecl.wgsl`.
-The opt-in candidates also provide `q6k_cubecl.wgsl` and
+The additional kernels also provide `q6k_cubecl.wgsl` and
 `grouped_q8_cubecl.wgsl`.
 Candle compiles that artifact with its existing Naga dependency and runs it
 through its existing Vulkan runtime. **Production does not use wgpu, link
 CubeCL, require its toolchain, import buffers, or create a second queue.**
 This standalone development crate remains outside Joshua's workspace.
 
-## Candidate checkpoint (2026-10-22)
+## Full-model B50 acceptance (2026-10-22)
 
-The latest Q6_K and grouped Q8_0 implementations are preserved as **opt-in
-candidates**. `CubeClExpanded` remains the previously validated B50 default;
-this checkpoint does not enable either new kernel in production. Select
-`JOSHUA_VULKAN_QGEMV=cubecl-next` or the benchmark's `--kernel cubecl-next`
-to evaluate both candidates. `--kernel cubecl-q6` isolates Q6_K.
+Q6_K and grouped Q8_0 passed the full-model gates and are now included in the
+**B50-only** default, `CubeClNext`. The absolute tolerance remains **1e-5**.
+[The saved report](benchmarks/q6-grouped-q8-b50-20261022.json) includes commands,
+source/binary hashes, full-logit hashes, timings, memory bounds and failures.
+
+Both paths used the complete realistic chat prompt and the same 128
+teacher-forced decode inputs, with two serial sessions per path and host
+logits readback included. Baseline `CubeClExpanded` retains generic Vulkan
+for the two tested operations; the earlier Q4_K/Q8_0/Q2_K kernels are identical
+between paths. Qwen's only newly selected operation is Q6_K; DeepSeek has no
+Q6_K tensors, so its comparison isolates grouped Q8. No other benchmark or
+build ran during timed forwards.
+
+| Model / new kernel | Prompt / prefill chunk | Baseline decode | New decode | Decode speedup | Prefill + decode speedup |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Qwen3-8B Q4_K_M / Q6_K | 126 tokens / 1 | 490.617 ms/token | 192.998 ms/token | **2.542x** | **2.558x** |
+| DeepSeek-V4.1 Flash REAP-272E / grouped Q8 | 121 tokens / 32 | 3739.567 ms/token | 803.847 ms/token | **4.652x** | **3.690x** |
+
+All **19,599,744 Qwen logits** and **16,677,120 DeepSeek logits** are
+bit-identical between paths (maximum difference **0**); repeated-session
+logits are also identical. Every candidate decode/session timing sample beat
+every baseline sample. There were zero CPU fallbacks. Engram stayed enabled
+and DeepSeek experts remained compact CPU-mmap weights, shared across sessions.
+
+Allocator trajectories and loaded/warm/peak/after-session counts match exactly.
+Driver-resident VRAM endpoints are flat at **5,268,217,856 bytes** for Qwen
+and **9,538,830,336 bytes** for DeepSeek, for both paths and both sessions.
+Qwen private-memory growth is 0 KiB in each path. DeepSeek private growth is
+24 KiB baseline and 20 KiB candidate, including swapped anonymous pages.
+The candidate's private-memory footprint stays within the existing 1 MiB
+bound against baseline. DeepSeek physical reads were 194.44/135.26 GB
+for the baseline sessions and 133.72/125.88 GB for candidate sessions; these
+are workload timings including I/O, not isolated GPU compute measurements. File-backed RSS is reported separately; this test ran
+on a roughly 74 GiB host and includes physical mmap I/O, not a 64 GiB host
+acceptance claim. The paths are serial separate processes, not interleaved
+passes, and HTTP serving/concurrent requests were not measured.
+
+Qwen's baseline 32-token prefill attempt failed with `ENOMEM` followed by
+`ERROR_DEVICE_LOST` (repeated while resuming the comparison tool). The
+successful Qwen comparison uses single-token prefill for the full prompt;
+this does not validate batched Qwen prefill. DeepSeek completed batches
+32/32/32/25. The failed baseline is retained in the report. No prefill policy
+or backend priority changed.
 
 Q6_K reads the original 210-byte blocks and preserves generic Vulkan's
-256-lane reduction and dequantization multiplication order. Grouped Q8_0
-computes only the diagonal output blocks of DeepSeek's attention projection:
-output row `r` reads activation group `r / rows_per_group`. It writes the final
-projection directly, avoiding off-diagonal results and their concatenation.
-Only single-token decode with at most 16 groups is eligible; other paths keep
-the existing matmul and diagonal selection. Buffers, queue, parameter ring
-and deferred release are shared with the native runtime.
+256-lane reduction and multiplication order. Grouped Q8_0 computes only the
+diagonal output blocks: output row `r` reads activation group
+`r / rows_per_group`, and writes the final projection directly. It avoids
+off-diagonal results and their concatenation. Single-token projection with
+at most 16 groups is eligible; other paths retain the existing arithmetic.
+Buffers, queue, parameter ring and deferred release stay in the native runtime.
 
-The interrupted real-model rerun did not leave surviving benchmark artifacts.
-Its projection observations are not treated as production acceptance. The
-full-model absolute **1e-5** parity, speed and stable-memory checks must pass
-before changing default dispatch. Earlier completed reports below cover only
-the earlier implementations, not these candidates.
+`--kernel cubecl` retains the previous three-format baseline;
+`--kernel cubecl-next` explicitly selects the newly validated set, and
+`--kernel production` verifies the actual adapter default. Other adapters
+retain their defaults until separately validated. For actual-weight grouped
+microbenchmarks, use `--projection-tensor blk.0.attn_output_a.weight
+--projection-rows 8 --projection-grouped`. Full outputs and raw memory samples
+are retained outside `/tmp` at
+`/home/tserica/benchmark-results/cubecl-b50-20261022-pr198`.
 
-On the B50, the checkpoint's seven native tests passed again (two timing tests
-ignored), covering Q6_K, grouped outputs, packed tails, offsets, queue batch
-boundaries, tiny-model prefill/decode/cache continuation and all-row logits.
-The benchmark example builds. Generated-source freshness, native binding
-reflection and SPIR-V validation are checked by `tests/native_shader.rs` in
-this development crate.
+After enabling B50 dispatch, another full-prompt/128-token session per model
+through `--kernel production` reproduced the candidate's full-logit hash and
+exact allocator trajectory, with zero CPU fallbacks. The seven native Vulkan
+tests (two timing tests ignored), eleven focused Candle Vulkan tests and
+release benchmark build passed after the dispatch change. The production
+replays verify routing; repeated-memory acceptance comes from the two-session
+matched comparisons above.
 
-For a selected-group actual-weight microbenchmark, add
-`--projection-tensor blk.0.attn_output_a.weight --projection-rows 8
---projection-grouped` to `bench_cubecl_real`, comparing `--kernel generic`
-with `--kernel cubecl-next`. Use identical traces for full-model comparisons.
-`compare_real.py --allow-reduced-memory` permits smaller candidate allocations
-while rejecting increases, and checks repeated-session driver memory too.
-
-The diagnostic `JOSHUA_NO_ENGRAM` environment variable explicitly disables
-Engram and changes model behavior; accepted full-model comparisons must keep
-it unset. `examples/dump_compressors.rs` inspects conversion metadata and
-filtered tensor names without loading model weights.
+`JOSHUA_NO_ENGRAM` is a diagnostic opt-out that changes model behavior; it
+was unset for these comparisons. `examples/dump_compressors.rs` inspects
+conversion metadata and filtered tensor names without loading weights.
 
 ## Dispatch and interoperability
 
 On the validated Intel Arc Pro B50 (PCI vendor/device 8086:E212), the default
-Vulkan QGEMV selection is now **`CubeClExpanded`**: native Q4_K/Q8_0/Q2_K,
-all with generic's 256-lane accumulation order. This passed
-[exact real DeepSeek parity, speed and memory gates](benchmarks/real-deepseek41-flash-b50-fixed-20261018.json).
+Vulkan QGEMV selection is now **`CubeClNext`**: native Q4_K/Q6_K/Q8_0/Q2_K
+and grouped Q8, all with generic's 256-lane accumulation order. The full-model
+checks above passed parity, speed and memory gates.
 `JOSHUA_VULKAN_QGEMV=generic` forces the baseline; `cubecl` keeps a Q4_K-only
-compatibility selection and `cubecl-expanded` explicitly selects production.
+compatibility selection; `cubecl-expanded` selects the previous three-format
+baseline, and `cubecl-next` explicitly selects the current production set.
 Small Q2_K projections (fewer than 64 output rows) retain generic dispatch
 after a measured regression at DeepSeek’s 24-row shape.
 Other formats, batched rows, unsupported widths, excessive dispatch
 counts, and devices with insufficient workgroup limits retain the generic
 kernel. Other adapters retain their previous defaults. For comparison or
-explicit experimentation, `JOSHUA_VULKAN_QGEMV=generic|cubecl|cubecl-expanded` selects a
+explicit experimentation, `JOSHUA_VULKAN_QGEMV=generic|cubecl|cubecl-expanded|cubecl-next` selects a
 path; existing `mali` and `mali-int8` selectors remain available.
 
 The native launcher binds the **same** packed weight buffer, activation
@@ -75,7 +109,7 @@ It records into the same command buffer, uses the same compute barriers and
 batch limit, and inherits deferred buffer release. One cached pipeline per format
 handles every supported N/K; there is no per-shape or per-session pipeline
 cache growth. Weight blocks retain their original GGUF layouts: Q4_K 144 bytes/256 values,
-Q8_0 34 bytes/32 values and Q2_K 84 bytes/256 values.
+Q8_0 34 bytes/32 values, Q6_K 210 bytes/256 values and Q2_K 84 bytes/256 values.
 Scratch is 1,024 bytes of workgroup memory per workgroup; there is no f32 weight matrix,
 weight repacking, tensor copy, readback, or additional fence in the launcher.
 

@@ -3,6 +3,8 @@ Usage: python3 compare_real.py GENERIC_DIR CUBECL_DIR OUTPUT_JSON [--require-pas
 Requires NumPy; binary dumps remain outside the source tree.
 """
 import argparse
+from datetime import datetime
+from zoneinfo import ZoneInfo
 import json
 import hashlib
 from pathlib import Path
@@ -46,7 +48,7 @@ def sha256_file(path):
 hash_a = sha256_file(base_dir / "logits.f32")
 hash_b = sha256_file(candidate_dir / "logits.f32")
 result = {
-    "date": "2026-10-18",
+    "date": datetime.now(ZoneInfo("America/Los_Angeles")).date().isoformat(),
     "generic": a, "cubecl": b,
     "prompt_ids": trace_a["prompt"], "decode_input_ids": trace_a["inputs"],
     "speedup": a["median_ms_per_token"] / b["median_ms_per_token"],
@@ -100,7 +102,7 @@ checks = {
 }
 if "end_to_end_comparison" in result:
     checks["faster_end_to_end"] = result["end_to_end_comparison"]["speedup"] > 1.0
-    checks["all_session_samples_faster"] = max(total_b) < min(total_a)
+    checks["all_session_samples_faster"] = bool(max(total_b) < min(total_a))
 if "memory_samples" in a and "memory_samples" in b:
     def decode_spans(summary):
         spans = []

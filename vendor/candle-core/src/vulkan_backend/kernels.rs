@@ -1116,9 +1116,9 @@ pub enum Qgemv {
     /// Q4_K-only compatibility selection, with generic accumulation order.
     CubeCl,
     /// Validated native Q4_K/Q8_0/Q2_K GEMVs with generic accumulation order.
-    /// Default on B50 after exact real-model parity, speed and memory checks.
+    /// Previous B50 dispatch, retained for matched baseline comparisons.
     CubeClExpanded,
-    /// Candidate Q6_K and selected-group Q8 projection; gated separately.
+    /// Q6_K and selected-group Q8, validated on B50 with full-model gates.
     CubeClNext,
     /// Diagnostic ablation: use CubeCL for exactly one weight format.
     CubeClFormat(crate::quantized::GgmlDType),
@@ -1140,14 +1140,14 @@ impl Qgemv {
     pub fn for_adapter(vendor_id: u32, device_id: u32, int_dot: bool) -> Self {
         if vendor_id == 0x8086 && device_id == 0xE212
             && std::env::var_os("JOSHUA_VULKAN_QGEMV").is_none() {
-            Self::CubeClExpanded // Intel Arc Pro B50 (BMG G21).
+            Self::CubeClNext // Intel Arc Pro B50; full-model acceptance 2026-10-22.
         } else {
             Self::for_device(vendor_id, int_dot)
         }
     }
 
     /// The kernel for a device with `int_dot` (the `shaderIntegerDotProduct`
-    /// feature enabled): `JOSHUA_VULKAN_QGEMV=cubecl-expanded|cubecl|mali-int8|mali|generic` when
+    /// feature enabled): `JOSHUA_VULKAN_QGEMV=cubecl-next|cubecl-expanded|cubecl|mali-int8|mali|generic` when
     /// set (to force one on any device), else on Arm GPUs the int8 kernel
     /// when the device has the dot-product feature and the float one when
     /// not.
