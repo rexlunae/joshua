@@ -639,6 +639,22 @@ impl VulkanDevice {
         if groups.contains(&0) {
             return Ok(());
         }
+        let mut params = Vec::with_capacity(2 * std::mem::size_of::<Idx>());
+        let unit = Idx::unit();
+        params.extend_from_slice(ix.first().unwrap_or(&unit).bytes());
+        params.extend_from_slice(ix.get(1).unwrap_or(&unit).bytes());
+        self.launch_spirv_params(key, src, bufs, push, &params, groups)
+    }
+
+    // Custom parameter ABI in the existing ring: no additional device buffer
+    // or queue submission. All barriers and deferred frees remain shared.
+    fn launch_spirv_params(
+        &self, key: &str, src: impl FnOnce(usize) -> Result<Vec<u32>>,
+        bufs: &[Buf], push: Push, params: &[u8], groups: [u32; 3],
+    ) -> Result<()> {
+        if groups.contains(&0) {
+            return Ok(());
+        }
         let max_range = self.limits().max_storage_range;
         for b in bufs {
             if b.bytes > max_range {
@@ -650,12 +666,8 @@ impl VulkanDevice {
         }
         let nbuf = bufs.len() as u32;
         let pipe = self.pipeline(key, nbuf, src)?;
-        let mut params = Vec::with_capacity(2 * std::mem::size_of::<Idx>());
-        let unit = Idx::unit();
-        params.extend_from_slice(ix.first().unwrap_or(&unit).bytes());
-        params.extend_from_slice(ix.get(1).unwrap_or(&unit).bytes());
         let mut exec = self.exec();
-        let full = exec.record(&pipe, bufs, &push.0, &params, groups)?;
+        let full = exec.record(&pipe, bufs, &push.0, params, groups)?;
         if full {
             let garbage = exec.flush()?;
             self.free_garbage(garbage);
@@ -1101,6 +1113,15 @@ pub fn qtype_code(dtype: crate::quantized::GgmlDType) -> i32 {
 pub enum Qgemv {
     /// One wide work-group per output element.
     Generic,
+    /// Q4_K-only compatibility selection, with generic accumulation order.
+    CubeCl,
+    /// Validated native Q4_K/Q8_0/Q2_K GEMVs with generic accumulation order.
+    /// Default on B50 after exact real-model parity, speed and memory checks.
+    CubeClExpanded,
+    /// Candidate Q6_K and selected-group Q8 projection; gated separately.
+    CubeClNext,
+    /// Diagnostic ablation: use CubeCL for exactly one weight format.
+    CubeClFormat(crate::quantized::GgmlDType),
     /// Arm Mali / Immortalis: small teams, several rows per decode.
     Mali,
     /// [`Qgemv::Mali`]'s shape on int8 dot products over activations
@@ -1113,8 +1134,20 @@ impl Qgemv {
     /// Arm's PCI vendor id, as `VkPhysicalDeviceProperties::vendorID`.
     pub const ARM_VENDOR_ID: u32 = 0x13B5;
 
+    /// Default to the Rust-authored kernel only on the adapter validated by
+    /// tiny-model parity, decode timing and memory checks. Other adapters keep
+    /// their existing selection; an explicit environment override wins.
+    pub fn for_adapter(vendor_id: u32, device_id: u32, int_dot: bool) -> Self {
+        if vendor_id == 0x8086 && device_id == 0xE212
+            && std::env::var_os("JOSHUA_VULKAN_QGEMV").is_none() {
+            Self::CubeClExpanded // Intel Arc Pro B50 (BMG G21).
+        } else {
+            Self::for_device(vendor_id, int_dot)
+        }
+    }
+
     /// The kernel for a device with `int_dot` (the `shaderIntegerDotProduct`
-    /// feature enabled): `JOSHUA_VULKAN_QGEMV=mali-int8|mali|generic` when
+    /// feature enabled): `JOSHUA_VULKAN_QGEMV=cubecl-expanded|cubecl|mali-int8|mali|generic` when
     /// set (to force one on any device), else on Arm GPUs the int8 kernel
     /// when the device has the dot-product feature and the float one when
     /// not.
@@ -1123,6 +1156,9 @@ impl Qgemv {
             Ok("mali-int8") => Self::MaliInt8 { hw_dot: int_dot },
             Ok("mali") => Self::Mali,
             Ok("generic") => Self::Generic,
+            Ok("cubecl") => Self::CubeCl,
+            Ok("cubecl-expanded") => Self::CubeClExpanded,
+            Ok("cubecl-next") => Self::CubeClNext,
             _ if vendor_id == Self::ARM_VENDOR_ID && int_dot => Self::MaliInt8 { hw_dot: true },
             _ if vendor_id == Self::ARM_VENDOR_ID => Self::Mali,
             _ => Self::Generic,
@@ -1150,10 +1186,46 @@ pub fn run_qgemv_with(
     k: usize,
     xoff: usize,
 ) -> Result<()> {
-    let push = Push::default().us(n)?.us(k)?.i(qtype_code(dtype)).us(dtype.block_size())?.us(dtype.type_size())?.us(xoff)?.i(0).us(m)?;
     let lim = d.limits();
+    let cubecl = match dtype {
+        crate::quantized::GgmlDType::Q4K => Some((256, 144, "q4k_cubecl_256", include_str!("q4k_cubecl.wgsl"), false)),
+        crate::quantized::GgmlDType::Q8_0 => Some((32, 34, "q8_0_cubecl_256", include_str!("q8_0_cubecl.wgsl"), true)),
+        crate::quantized::GgmlDType::Q2K => Some((256, 84, "q2k_cubecl_256", include_str!("q2k_cubecl.wgsl"), true)),
+        crate::quantized::GgmlDType::Q6K => Some((256, 210, "q6k_cubecl_256", include_str!("q6k_cubecl.wgsl"), true)),
+        _ => None,
+    };
+    let selected = match kernel {
+        Qgemv::CubeCl => dtype == crate::quantized::GgmlDType::Q4K,
+        Qgemv::CubeClExpanded => dtype != crate::quantized::GgmlDType::Q6K,
+        Qgemv::CubeClNext => true,
+        Qgemv::CubeClFormat(format) => dtype == format,
+        _ => false,
+    };
+    if let Some((block, bytes, name, source, tiled)) = cubecl.filter(|_| selected) {
+        // Packed shaders use one workgroup per output row. Q8_0/Q2_K also
+        // guard the final tiled row, so the large DeepSeek output head fits.
+        // Keep both lane assignment and reduction order equal to generic.
+        if m == 1 && lim.wg == 256 && n > 0 && k > 0 && k % block == 0
+            // Small hyper-connection projections benchmark faster with generic.
+            && (dtype != crate::quantized::GgmlDType::Q2K || n >= 64)
+            && (tiled || n <= lim.max_groups_x as usize)
+            && n <= (lim.max_groups_x as usize).saturating_mul(lim.max_groups_x as usize)
+            && (bytes % 4 == 0 || (k / block) % 2 == 0 || n % 2 == 0) {
+            let weight_bytes = n.checked_mul(k / block).and_then(|v| v.checked_mul(bytes));
+            let input_bytes = xoff.checked_add(k).and_then(|v| v.checked_mul(4));
+            if weight_bytes.is_none_or(|v| v as u64 > w.bytes || v > u32::MAX as usize)
+                || input_bytes.is_none_or(|v| v as u64 > x.bytes || v > u32::MAX as usize)
+                || n as u64 * 4 > out.bytes {
+                return Err(Error::Msg("vulkan CubeCL GEMV: invalid buffer range".into()));
+            }
+            let params = Push::default().us(k)?.us(n)?.us(xoff)?.i(0);
+            return d.launch_spirv_params(name, |_| wgsl_to_spirv(source),
+                &[w, x, out], Push::default(), &params.0, row_grid(n, 1, lim.max_groups_x));
+        }
+    }
+    let push = Push::default().us(n)?.us(k)?.i(qtype_code(dtype)).us(dtype.block_size())?.us(dtype.type_size())?.us(xoff)?.i(0).us(m)?;
     match kernel {
-        Qgemv::Generic => d.launch("qgemv", glsl::k_qgemv, &[x, w, out], push, &[], row_grid(n, m, lim.max_groups_x)),
+        Qgemv::CubeCl | Qgemv::CubeClExpanded | Qgemv::CubeClNext | Qgemv::CubeClFormat(_) | Qgemv::Generic => d.launch("qgemv", glsl::k_qgemv, &[x, w, out], push, &[], row_grid(n, m, lim.max_groups_x)),
         Qgemv::Mali => {
             let groups = row_grid(n.div_ceil(glsl::QGEMV_MALI_COLS), m.div_ceil(glsl::QGEMV_MALI_ROWS), lim.max_groups_x);
             d.launch("qgemv_mali", glsl::k_qgemv_mali, &[x, w, out], push, &[], groups)
@@ -1172,6 +1244,35 @@ pub fn run_qgemv_with(
             d.launch_spirv(key, |_| wgsl_to_spirv(&super::wgsl::k_qgemv_mali_i8(hw_dot)), &[xq.buf(), xs.buf(), xsum.buf(), w, out], push, &[], groups)
         }
     }
+}
+
+/// Selected diagonal blocks of `X[groups,K] @ W[N,K]^T` in group order.
+/// Same 256-lane reduction as the generic multi-row GEMV, without off-diagonals.
+#[allow(clippy::too_many_arguments)]
+pub fn run_grouped_q8(d: &VulkanDevice, x: Buf, w: Buf, out: Buf,
+    groups: usize, n: usize, k: usize, xoff: usize) -> Result<()> {
+    let lim = d.limits();
+    let weights = n.checked_mul(k / 32).and_then(|v| v.checked_mul(34));
+    let inputs = groups.checked_mul(k).and_then(|v| v.checked_add(xoff)).and_then(|v| v.checked_mul(4));
+    if !grouped_q8_eligible(d, groups, n, k)
+        || weights.is_none_or(|v| v as u64 > w.bytes || v > u32::MAX as usize)
+        || inputs.is_none_or(|v| v as u64 > x.bytes || v > u32::MAX as usize)
+        || n as u64 * 4 > out.bytes {
+        return Err(Error::Msg("vulkan grouped Q8: invalid geometry or buffer range".into()));
+    }
+    let params = Push::default().us(k)?.us(n)?.us(xoff)?.us(n / groups)?;
+    d.launch_spirv_params("grouped_q8_cubecl_256",
+        |_| wgsl_to_spirv(include_str!("grouped_q8_cubecl.wgsl")),
+        &[w, x, out], Push::default(), &params.0, row_grid(n, 1, lim.max_groups_x))
+}
+
+pub fn grouped_q8_eligible(d: &VulkanDevice, groups: usize, n: usize, k: usize) -> bool {
+    let lim = d.limits();
+    // Larger original batches use GEMM, whose reduction order differs.
+    matches!(lim.qgemv, Qgemv::CubeClNext) && lim.wg == 256
+        && (1..=super::QGEMV_MAX_ROWS).contains(&groups) && n > 0 && n % groups == 0
+        && k > 0 && k % 32 == 0 && (k / 32 % 2 == 0 || n % 2 == 0)
+        && n <= (lim.max_groups_x as usize).saturating_mul(lim.max_groups_x as usize)
 }
 
 /// `C[m, n] = sum_k X[m, k] * W[n, k]` over f16 / bf16 `W`.

@@ -1,0 +1,199 @@
+{
+  "date": "2026-10-18",
+  "model": "DeepSeek-V4.1 Flash REAP-272E",
+  "workload": {
+    "prompt_tokens": 4,
+    "decode_tokens": 2,
+    "context": 12,
+    "warm_decode": 0,
+    "reference": "First three logit rows of real-deepseek41-flash-b50-20261018.json baseline; identical saved inputs."
+  },
+  "before_fix_format_ablations": {
+    "q4": {
+      "max_abs": 6.103515625e-05,
+      "different_logits": 381149,
+      "max_abs_by_row": [
+        2.8133392333984375e-05,
+        6.103515625e-05,
+        1.919269561767578e-05
+      ],
+      "identical_to_original_expanded": true
+    },
+    "q8": {
+      "max_abs": 0.0,
+      "different_logits": 0,
+      "max_abs_by_row": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "identical_to_original_expanded": false
+    },
+    "q2": {
+      "max_abs": 0.0,
+      "different_logits": 0,
+      "max_abs_by_row": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "identical_to_original_expanded": false
+    }
+  },
+  "before_fix_projection_stress": [
+    {
+      "format": "Q4K",
+      "k": 1280,
+      "max_abs": 0.0,
+      "different_outputs": 0,
+      "rows": 65
+    },
+    {
+      "format": "Q4K",
+      "k": 5120,
+      "max_abs": 1.5258789e-05,
+      "different_outputs": 36,
+      "rows": 65
+    },
+    {
+      "format": "Q4K",
+      "k": 8192,
+      "max_abs": 3.0517578e-05,
+      "different_outputs": 44,
+      "rows": 65
+    },
+    {
+      "format": "Q4K",
+      "k": 20480,
+      "max_abs": 6.1035156e-05,
+      "different_outputs": 47,
+      "rows": 65
+    },
+    {
+      "format": "Q8_0",
+      "k": 1280,
+      "max_abs": 0.0,
+      "different_outputs": 0,
+      "rows": 65
+    },
+    {
+      "format": "Q8_0",
+      "k": 5120,
+      "max_abs": 0.0,
+      "different_outputs": 0,
+      "rows": 65
+    },
+    {
+      "format": "Q8_0",
+      "k": 8192,
+      "max_abs": 0.0,
+      "different_outputs": 0,
+      "rows": 65
+    },
+    {
+      "format": "Q8_0",
+      "k": 20480,
+      "max_abs": 0.0,
+      "different_outputs": 0,
+      "rows": 65
+    },
+    {
+      "format": "Q2K",
+      "k": 1280,
+      "max_abs": 0.0,
+      "different_outputs": 0,
+      "rows": 65
+    },
+    {
+      "format": "Q2K",
+      "k": 5120,
+      "max_abs": 1.5258789e-05,
+      "different_outputs": 32,
+      "rows": 65
+    },
+    {
+      "format": "Q2K",
+      "k": 8192,
+      "max_abs": 2.2888184e-05,
+      "different_outputs": 40,
+      "rows": 65
+    },
+    {
+      "format": "Q2K",
+      "k": 20480,
+      "max_abs": 4.5776367e-05,
+      "different_outputs": 50,
+      "rows": 65
+    }
+  ],
+  "cause": "Q4_K GPU GEMV uses 64 lanes, changing the per-lane partial sums and reduction tree relative to generic 256 lanes. Only shared-expert gate/up Q4_K projections run on Vulkan in this checkpoint; routed experts remain CPU mmap. Q2_K has the same issue at larger widths but real-model small Q2_K projections fall back to generic. Q8_0 already uses 256 lanes and is bit-identical.",
+  "fix": "Generate Q4_K and Q2_K native shaders with 256 lanes; require generic workgroup size 256, otherwise retain generic dispatch. No tolerance change, repacking, new buffer, transfer or queue.",
+  "regression_test": "packed_gemv_preserves_generic_accumulation_order requires bit-identical results for Q4_K/Q8_0/Q2_K at widths 1280, 5120, 8192, 20480 with larger-magnitude weights/inputs.",
+  "after_fix_projection_stress": {
+    "max_abs": 0.0,
+    "bit_identical": true,
+    "formats": [
+      "Q4K",
+      "Q8_0",
+      "Q2K"
+    ],
+    "widths": [
+      1280,
+      5120,
+      8192,
+      20480
+    ],
+    "rows_per_case": 65
+  },
+  "after_fix_real_model_result": "real-deepseek41-flash-b50-fixed-20261018.json",
+  "fixed_projection_timings": [
+    {
+      "format": "Q4K",
+      "n": 2304,
+      "k": 5120,
+      "generic_ms": 2.495993,
+      "cubecl_ms": 0.161873,
+      "speedup": 15.419
+    },
+    {
+      "format": "Q8_0",
+      "n": 1280,
+      "k": 5120,
+      "generic_ms": 1.500398,
+      "cubecl_ms": 0.111562,
+      "speedup": 13.449
+    },
+    {
+      "format": "Q8_0",
+      "n": 32768,
+      "k": 1280,
+      "generic_ms": 28.863191,
+      "cubecl_ms": 2.239353,
+      "speedup": 12.889
+    },
+    {
+      "format": "Q8_0",
+      "n": 129280,
+      "k": 5120,
+      "generic_ms": 143.743215,
+      "cubecl_ms": 11.798295,
+      "speedup": 12.183
+    },
+    {
+      "format": "Q2K",
+      "n": 24,
+      "k": 20480,
+      "generic_ms": 0.045422,
+      "cubecl_ms": 0.045602,
+      "speedup": 0.996
+    },
+    {
+      "format": "Q2K",
+      "n": 512,
+      "k": 4096,
+      "generic_ms": 0.424381,
+      "cubecl_ms": 0.063558,
+      "speedup": 6.677
+    }
+  ]
+}

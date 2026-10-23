@@ -847,3 +847,33 @@ mod tests {
         Ok(())
     }
 }
+
+/// Project each head group with its diagonal block of a packed weight matrix.
+/// The native decode path reads the original input/weights and writes only the
+/// selected outputs. Prefill and unsupported backends keep matmul's arithmetic.
+pub fn grouped_output_projection(
+    weight: &candle_core::quantized::QMatMul,
+    x: &Tensor,
+    groups: usize,
+    rank: usize,
+) -> Result<Tensor> {
+    use candle_core::Module;
+    let (seq, actual_groups, k) = x.dims3()?;
+    if groups == 0 || actual_groups != groups || rank == 0 {
+        bail!("invalid grouped projection shape {:?}", x.shape());
+    }
+    if seq == 1 {
+        if let Some(y) = weight.try_grouped_q8(&x.reshape((groups, k))?, groups)? {
+            if y.dims() != [1, groups * rank] {
+                bail!("grouped projection weight/output shape mismatch");
+            }
+            return Ok(y);
+        }
+    }
+    let oa = weight.forward(&x.reshape((seq * groups, k))?)?
+        .reshape((seq, groups, groups * rank))?;
+    let blocks: Vec<Tensor> = (0..groups).map(|g| {
+        oa.narrow(1, g, 1)?.narrow(D::Minus1, g * rank, rank)?.squeeze(1)
+    }).collect::<Result<_>>()?;
+    Tensor::cat(&blocks, 1)?.contiguous()
+}

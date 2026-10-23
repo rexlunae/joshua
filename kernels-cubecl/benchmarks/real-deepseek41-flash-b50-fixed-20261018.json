@@ -1,0 +1,348 @@
+{
+  "date": "2026-10-18",
+  "generic": {
+    "after_session_host_memory_kib": [
+      {
+        "RssAnon": 184928,
+        "RssFile": 21878468,
+        "RssShmem": 36,
+        "VmRSS": 22063432
+      },
+      {
+        "RssAnon": 184952,
+        "RssFile": 21878468,
+        "RssShmem": 36,
+        "VmRSS": 22063456
+      },
+      {
+        "RssAnon": 184956,
+        "RssFile": 21878468,
+        "RssShmem": 36,
+        "VmRSS": 22063460
+      }
+    ],
+    "after_session_reserved_live": [
+      [
+        9365831680,
+        9223318528
+      ],
+      [
+        9365831680,
+        9223318528
+      ],
+      [
+        9365831680,
+        9223318528
+      ]
+    ],
+    "after_session_rss_kib": [
+      22063432,
+      22063456,
+      22063460
+    ],
+    "architecture": "deepseek41",
+    "context": 12,
+    "cubecl_formats": [],
+    "decode_cpu_fallbacks": [
+      0,
+      0,
+      0
+    ],
+    "decode_tokens": 8,
+    "dispatch": "Generic",
+    "elements_by_ggml_dtype": {
+      "0": 515440,
+      "1": 717619200,
+      "10": 196653253120,
+      "12": 385980825600,
+      "8": 6574833664
+    },
+    "engram_disabled": false,
+    "expert_placement": "cpu-mmap",
+    "gpu": "Intel(R) Arc(tm) Pro B50 Graphics (BMG G21)",
+    "greedy_text": " of a a a a a a a a",
+    "kernel": "generic",
+    "load_seconds": 3.057301143,
+    "loaded_host_memory_kib": {
+      "RssAnon": 183420,
+      "RssFile": 64904,
+      "RssShmem": 36,
+      "VmRSS": 248360
+    },
+    "loaded_reserved_live": [
+      9365831680,
+      9223318528
+    ],
+    "logit_rows": 9,
+    "max_repeat_logit_difference": 0.0,
+    "median_ms_per_token": 5435.1287475,
+    "model": "/home/tserica/models/DSV41-REAP272E-balanced.gguf",
+    "model_bytes": 290070476416,
+    "ms_per_token": [
+      5467.38459225,
+      5420.186017125,
+      5435.1287475
+    ],
+    "passes": 3,
+    "peak_reserved_live": [
+      9365831680,
+      9233920000
+    ],
+    "peak_rss_kib": 22063460,
+    "prefill_chunk": 1,
+    "prefill_cpu_fallbacks": [
+      0,
+      0,
+      0
+    ],
+    "prompt_tokens": 4,
+    "tokens_per_second": 0.18398828187096225,
+    "top1": [
+      294,
+      260,
+      260,
+      260,
+      260,
+      260,
+      260,
+      260,
+      260
+    ],
+    "vocab": 129280,
+    "warm_decode": 2,
+    "warm_host_memory_kib": {
+      "RssAnon": 184884,
+      "RssFile": 16604540,
+      "RssShmem": 36,
+      "VmRSS": 16789460
+    },
+    "warm_reserved_live": [
+      9365831680,
+      9223318528
+    ],
+    "warm_rss_kib": 16789460
+  },
+  "cubecl": {
+    "after_session_host_memory_kib": [
+      {
+        "RssAnon": 184584,
+        "RssFile": 21878524,
+        "RssShmem": 36,
+        "VmRSS": 22063144
+      },
+      {
+        "RssAnon": 184612,
+        "RssFile": 21878524,
+        "RssShmem": 36,
+        "VmRSS": 22063172
+      },
+      {
+        "RssAnon": 184620,
+        "RssFile": 21878524,
+        "RssShmem": 36,
+        "VmRSS": 22063180
+      }
+    ],
+    "after_session_reserved_live": [
+      [
+        9365831680,
+        9223318528
+      ],
+      [
+        9365831680,
+        9223318528
+      ],
+      [
+        9365831680,
+        9223318528
+      ]
+    ],
+    "after_session_rss_kib": [
+      22063144,
+      22063172,
+      22063180
+    ],
+    "architecture": "deepseek41",
+    "context": 12,
+    "cubecl_formats": [
+      8,
+      10,
+      12
+    ],
+    "decode_cpu_fallbacks": [
+      0,
+      0,
+      0
+    ],
+    "decode_tokens": 8,
+    "dispatch": "CubeClExpanded",
+    "elements_by_ggml_dtype": {
+      "0": 515440,
+      "1": 717619200,
+      "10": 196653253120,
+      "12": 385980825600,
+      "8": 6574833664
+    },
+    "engram_disabled": false,
+    "expert_placement": "cpu-mmap",
+    "gpu": "Intel(R) Arc(tm) Pro B50 Graphics (BMG G21)",
+    "greedy_text": " of a a a a a a a a",
+    "kernel": "cubecl",
+    "load_seconds": 3.024727775,
+    "loaded_host_memory_kib": {
+      "RssAnon": 183096,
+      "RssFile": 64928,
+      "RssShmem": 36,
+      "VmRSS": 248060
+    },
+    "loaded_reserved_live": [
+      9365831680,
+      9223318528
+    ],
+    "logit_rows": 9,
+    "max_repeat_logit_difference": 0.0,
+    "median_ms_per_token": 3454.9398257500006,
+    "model": "/home/tserica/models/DSV41-REAP272E-balanced.gguf",
+    "model_bytes": 290070476416,
+    "ms_per_token": [
+      3468.128338125,
+      3424.1027096249995,
+      3454.9398257500006
+    ],
+    "passes": 3,
+    "peak_reserved_live": [
+      9365831680,
+      9233920000
+    ],
+    "peak_rss_kib": 22063180,
+    "prefill_chunk": 1,
+    "prefill_cpu_fallbacks": [
+      0,
+      0,
+      0
+    ],
+    "prompt_tokens": 4,
+    "tokens_per_second": 0.28944064164212163,
+    "top1": [
+      294,
+      260,
+      260,
+      260,
+      260,
+      260,
+      260,
+      260,
+      260
+    ],
+    "vocab": 129280,
+    "warm_decode": 2,
+    "warm_host_memory_kib": {
+      "RssAnon": 184560,
+      "RssFile": 16604596,
+      "RssShmem": 36,
+      "VmRSS": 16789192
+    },
+    "warm_reserved_live": [
+      9365831680,
+      9223318528
+    ],
+    "warm_rss_kib": 16789192
+  },
+  "prompt_ids": [
+    65106,
+    1192,
+    260,
+    19657
+  ],
+  "decode_input_ids": [
+    294,
+    260,
+    260,
+    260,
+    260,
+    260,
+    260,
+    260
+  ],
+  "speedup": 1.5731471520839406,
+  "output_comparison": {
+    "bit_identical": true,
+    "generic_logits_sha256": "5611fc4987b6d240b1c9f7fea76683f423fc9887088fe4532edba064e46d34bf",
+    "cubecl_logits_sha256": "5611fc4987b6d240b1c9f7fea76683f423fc9887088fe4532edba064e46d34bf",
+    "logits_compared": 1163520,
+    "max_abs": 0.0,
+    "rms_abs": 0.0,
+    "absolute_difference_p50_p95_p99": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "max_abs_by_row": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "top1_matching_rows": 9,
+    "rows": 9,
+    "top1_ids_match": true,
+    "greedy_text_match": true,
+    "max_softmax_kl_generic_to_cubecl": 0.0,
+    "within_absolute_1e_5": true
+  },
+  "memory_comparison": {
+    "loaded_device_bytes_identical": true,
+    "warm_device_bytes_identical": true,
+    "sampled_peak_device_bytes_identical": true,
+    "after_session_device_bytes_identical": true,
+    "generic_after_sessions_stable": true,
+    "cubecl_after_sessions_stable": true,
+    "generic_anonymous_growth_kib": 28,
+    "cubecl_anonymous_growth_kib": 36,
+    "anonymous_memory_bounded_within_1_mib": true,
+    "candidate_anonymous_peak_within_1_mib_of_generic": true
+  },
+  "acceptance": {
+    "parity": true,
+    "faster_decode": true,
+    "device_memory": true,
+    "host_memory": true,
+    "no_extra_fallbacks": true,
+    "passed": true
+  },
+  "kernel_workgroups": {
+    "Q4_K": 256,
+    "Q8_0": 256,
+    "Q2_K": 256
+  },
+  "notes": [
+    "Same local DeepSeek-V4.1 Flash REAP-272E checkpoint and saved benchmark design as prior run: four prompt tokens, eight decode tokens, three sessions, two warmup decode tokens, context 12, engram enabled.",
+    "Q4_K 64-lane accumulation was isolated as the source of the original drift. Q8_0-only and small-Q2_K-only model controls were bit-identical to generic. See deepseek-drift-isolation-20261018.json.",
+    "Fixed Q4_K/Q2_K native workgroups use generic's 256-lane assignment and reduction tree. No tolerance change, new weight copies, device buffer, transfer, synchronization or queue.",
+    "Full logits and repeated sessions are bit-identical. Model gate remains absolute 1e-5; projection regression requires bit-identical results.",
+    "Device memory snapshots are sampled at token boundaries; driver-private pipeline memory is excluded. Anonymous and file-backed host RSS are reported separately.",
+    "All production acceptance checks passed. Expanded native dispatch is now the default only for validated B50 PCI 8086:E212, preserving environment overrides and other adapters' defaults.",
+    "Raw truncated prompt quality is outside this throughput/parity benchmark; routed experts and engram tables remain CPU mmap-backed."
+  ],
+  "verification": {
+    "native_integration_passed": 5,
+    "deepseek41_integration_passed": 7,
+    "deepseek4_integration_passed": 21,
+    "vulkan_model_integration_passed": 5,
+    "candle_core_library_passed": 31,
+    "production_b50_selector_passed": true,
+    "standalone_cubecl_tests_and_clippy": "passed",
+    "cpu_library_and_vulkan_example_checks": "passed",
+    "joshua_library": {
+      "passed": 362,
+      "ignored": 5,
+      "failed": 1,
+      "failure": "template::tests::engine_variables_win_over_template_kwargs, src/template.rs:390; actual lowercase true/false versus expected True/False. Exact failure previously reproduced on unchanged base 661d808 with same lockfile."
+    }
+  }
+}

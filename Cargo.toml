@@ -29,6 +29,10 @@ name = "joshua"
 path = "src/main.rs"
 
 [[example]]
+name = "bench_cubecl_real"
+required-features = ["vulkan"]
+
+[[example]]
 name = "cluster_linear"
 required-features = ["distributed"]
 

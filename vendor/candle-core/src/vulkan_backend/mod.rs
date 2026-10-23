@@ -260,7 +260,7 @@ const TENSOR_USAGE: vk::BufferUsageFlags = vk::BufferUsageFlags::from_raw(
 /// concurrent instance creation).
 static INIT: Mutex<()> = Mutex::new(());
 
-fn init_vulkan(gpu_id: usize) -> Result<VulkanDevice> {
+fn init_vulkan(gpu_id: usize, qgemv: Option<kernels::Qgemv>) -> Result<VulkanDevice> {
     let _guard = INIT.lock().unwrap_or_else(|p| p.into_inner());
     let entry = unsafe { ash::Entry::load() }
         .map_err(|e| Error::Msg(format!("vulkan: failed to load libvulkan.so ({e}); is a Vulkan loader + ICD installed?")))?;
@@ -370,7 +370,7 @@ fn init_vulkan(gpu_id: usize) -> Result<VulkanDevice> {
         max_storage_range: lim.max_storage_buffer_range as u64,
         max_groups_x: lim.max_compute_work_group_count[0].max(1),
         host_unified,
-        qgemv: kernels::Qgemv::for_device(props.vendor_id, int_dot),
+        qgemv: qgemv.unwrap_or_else(|| kernels::Qgemv::for_adapter(props.vendor_id, props.device_id, int_dot)),
         int_dot,
     };
     let exec = match kernels::Exec::new(&device, queue, queue_family, mem_type) {
@@ -411,7 +411,26 @@ fn init_vulkan(gpu_id: usize) -> Result<VulkanDevice> {
 
 impl VulkanDevice {
     pub fn new(gpu_id: usize) -> Result<Self> {
-        init_vulkan(gpu_id)
+        init_vulkan(gpu_id, None)
+    }
+
+    /// Explicit kernel selection for parity tests and device benchmarks.
+    pub fn new_with_qgemv(gpu_id: usize, kernel: kernels::Qgemv) -> Result<Self> {
+        init_vulkan(gpu_id, Some(kernel))
+    }
+
+    /// Current sub-allocator usage, including allocations awaiting batch
+    /// completion. Synchronize first for a quiescent snapshot. The command
+    /// ring and driver-owned pipeline memory are fixed/separate from this pool.
+    pub fn memory_stats(&self) -> (u64, u64) {
+        let mem = self.inner.mem.lock().unwrap_or_else(|p| p.into_inner());
+        let mut reserved = 0;
+        let mut used = 0;
+        for b in mem.blocks.iter().flatten() {
+            reserved += b.size;
+            used += b.size - b.free.iter().map(|(_, size)| size).sum::<u64>();
+        }
+        (reserved, used)
     }
 
     pub fn new_with_stream(gpu_id: usize) -> Result<Self> {
@@ -1517,6 +1536,26 @@ impl QVulkanStorage {
         Ok(out)
     }
 
+    pub fn grouped_q8_eligible(&self, groups: usize, n: usize, k: usize) -> bool {
+        self.dtype == GgmlDType::Q8_0 && kernels::grouped_q8_eligible(self.device(), groups, n, k)
+    }
+
+    pub fn grouped_q8_fwd(&self, shape: &Shape, storage: &VulkanStorage,
+        layout: &Layout, groups: usize) -> Result<(VulkanStorage, Shape)> {
+        let (n, k) = shape.dims2()?;
+        let dev = self.device();
+        if storage.dtype != DType::F32 || !dev.same_device(&storage.device)
+            || layout.shape().dims() != [groups, k] || !self.grouped_q8_eligible(groups, n, k) {
+            return Err(Error::Msg("vulkan grouped Q8: incompatible input".into()));
+        }
+        let Some((offset, _)) = layout.contiguous_offsets() else {
+            return Err(Error::Msg("vulkan grouped Q8: noncontiguous input".into()));
+        };
+        let out = dev.alloc(DType::F32, n)?;
+        kernels::run_grouped_q8(dev, storage.buf(), self.inner.buf(), out.buf(), groups, n, k, offset)?;
+        Ok((out, Shape::from((1, n))))
+    }
+
     /// `x @ W^T` for `x` on the device (f32, contiguous) and this `[n, k]` weight.
     pub fn fwd(&self, self_shape: &Shape, storage: &VulkanStorage, layout: &Layout) -> Result<(VulkanStorage, Shape)> {
         if storage.dtype != DType::F32 {
@@ -1941,7 +1980,7 @@ mod tests {
             let bytes = q.data()?.into_owned();
             let wbuf = vd.storage_from_slice(&bytes)?;
             let xbuf = vd.storage_from_slice(&xv)?;
-            let mut variants = vec![kernels::Qgemv::Generic, kernels::Qgemv::Mali, kernels::Qgemv::MaliInt8 { hw_dot: false }];
+            let mut variants = vec![kernels::Qgemv::Generic, kernels::Qgemv::CubeCl, kernels::Qgemv::CubeClExpanded, kernels::Qgemv::Mali, kernels::Qgemv::MaliInt8 { hw_dot: false }];
             if vd.limits().int_dot {
                 variants.push(kernels::Qgemv::MaliInt8 { hw_dot: true });
             }

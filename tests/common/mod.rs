@@ -1537,6 +1537,51 @@ pub fn write_tiny_qwen3_quantized_layers(path: &Path, layers: usize) {
     write_tiny_qwen_layers::<32, 64>(path, "qwen3", Some(layers), true, false);
 }
 
+/// Q4_K fixture for accelerator decode tests. Non-block-aligned projections
+/// retain F32; all aligned matrices (including the head) stay packed on load.
+pub fn write_tiny_qwen3_q4k_layers(path: &Path, layers: usize) {
+    write_tiny_qwen_layers::<256, 512>(path, "qwen3", Some(layers), false, false);
+    requantize_aligned_q4k(path);
+}
+
+/// A small synthetic model for end-to-end Q4_K decode timing (not a real-model
+/// throughput claim). Uses the same inference code and GGUF loader as serving.
+pub fn write_small_qwen3_q4k_layers(path: &Path, layers: usize) {
+    write_tiny_qwen_layers::<512, 1536>(path, "qwen3", Some(layers), false, false);
+    requantize_aligned_q4k(path);
+}
+
+fn requantize_aligned_q4k(path: &Path) {
+    requantize_aligned(path, GgmlDType::Q4K);
+}
+
+pub fn write_tiny_qwen3_q6k_layers(path: &Path, layers: usize) {
+    write_tiny_qwen_layers::<256, 512>(path, "qwen3", Some(layers), false, false);
+    requantize_aligned(path, GgmlDType::Q6K);
+}
+
+fn requantize_aligned(path: &Path, dtype: GgmlDType) {
+    let mut file = File::open(path).unwrap();
+    let content = gguf_file::Content::read(&mut file).unwrap();
+    let mut tensors = Vec::new();
+    for name in content.tensor_infos.keys() {
+        let qt = content.tensor(&mut file, name, &Device::Cpu).unwrap();
+        let qt = if qt.shape().rank() == 2 && qt.shape().dims()[1] % 256 == 0 {
+            QTensor::quantize(&qt.dequantize(&Device::Cpu).unwrap(), dtype).unwrap()
+        } else {
+            qt
+        };
+        tensors.push((name.as_str(), qt));
+    }
+    let refs: Vec<_> = tensors.iter().map(|(name, qt)| (*name, qt)).collect();
+    let metadata: Vec<_> = content
+        .metadata
+        .iter()
+        .map(|(key, value)| (key.as_str(), value))
+        .collect();
+    gguf_file::write(&mut File::create(path).unwrap(), &metadata, &refs).unwrap();
+}
+
 fn write_tiny_qwen_layers<const EMB: usize, const NFF: usize>(path: &Path, arch: &str, layers: Option<usize>, quantized: bool, mtp: bool) {
     let qtensor = |data: Vec<f32>, shape: &[usize]| {
         if quantized && shape.len() > 1 {
@@ -2279,6 +2324,8 @@ pub struct TinyDeepseek4Opts {
     /// source owning its keys, layer 3 window-only — no hyper-connection
     /// head, no hash layers, randomized norms.
     pub v41: bool,
+    /// Packed attention output for native grouped projection coverage.
+    pub grouped_q8: bool,
 }
 
 pub fn write_tiny_deepseek4_gguf(path: &Path) {
@@ -2382,6 +2429,7 @@ pub fn write_tiny_deepseek4_gguf_opts(path: &Path, opts: TinyDeepseek4Opts) {
         compress,
         hca,
         kquant_weights,
+        grouped_q8,
         candle_only,
         q2k_down,
         expert_width,
@@ -2611,11 +2659,12 @@ pub fn write_tiny_deepseek4_gguf_opts(path: &Path, opts: TinyDeepseek4Opts) {
             ones(HEAD_DIM),
             &[HEAD_DIM],
         ));
-        tensors.push(RawTensor::f16(
-            &format!("{p}.attn_output_a.weight"),
-            next(O_GROUPS * O_LORA * o_group_dim),
-            &[O_GROUPS * O_LORA, o_group_dim],
-        ));
+        let oa = next(O_GROUPS * O_LORA * o_group_dim);
+        tensors.push(if grouped_q8 {
+            RawTensor::q8_0(&format!("{p}.attn_output_a.weight"), oa, &[O_GROUPS * O_LORA, o_group_dim])
+        } else {
+            RawTensor::f16(&format!("{p}.attn_output_a.weight"), oa, &[O_GROUPS * O_LORA, o_group_dim])
+        });
         tensors.push(RawTensor::f16(
             &format!("{p}.attn_output_b.weight"),
             next(EMB * O_GROUPS * O_LORA),

@@ -1,0 +1,349 @@
+{
+  "date": "2026-10-18",
+  "generic": {
+    "after_session_reserved_live": [
+      [
+        5227622400,
+        5042798592
+      ],
+      [
+        5227622400,
+        5042798592
+      ],
+      [
+        5227622400,
+        5042798592
+      ]
+    ],
+    "after_session_rss_kib": [
+      174492,
+      175676,
+      175676
+    ],
+    "decode_cpu_fallbacks": [
+      0,
+      0,
+      0
+    ],
+    "decode_tokens": 32,
+    "elements_by_ggml_dtype": {
+      "0": 308224,
+      "12": 6586630144,
+      "14": 1603796992
+    },
+    "gpu": "Intel(R) Arc(tm) Pro B50 Graphics (BMG G21)",
+    "greedy_text": " and the time complexity of operations. Also, explain the difference between a hash table and a hash map. Provide an example of a hash table implementation in Python. A",
+    "kernel": "generic",
+    "load_seconds": 1.379471361,
+    "loaded_reserved_live": [
+      5227622400,
+      5042798592
+    ],
+    "logit_rows": 33,
+    "max_repeat_logit_difference": 0.0,
+    "median_ms_per_token": 1730.1624332812498,
+    "model": "/home/tserica/models/qwen3-dense/Qwen3-8B-Q4_K_M.gguf",
+    "model_bytes": 5027783488,
+    "ms_per_token": [
+      1730.1624332812498,
+      1730.063295875,
+      1730.3249220937498
+    ],
+    "passes": 3,
+    "peak_reserved_live": [
+      5227622400,
+      5061672960
+    ],
+    "peak_rss_kib": 175676,
+    "prefill_chunk": 1,
+    "prefill_cpu_fallbacks": [
+      0,
+      0,
+      0
+    ],
+    "prompt_tokens": 16,
+    "tokens_per_second": 0.5779804143033564,
+    "top1": [
+      323,
+      279,
+      882,
+      23094,
+      315,
+      7525,
+      13,
+      7281,
+      11,
+      10339,
+      279,
+      6672,
+      1948,
+      264,
+      5175,
+      1965,
+      323,
+      264,
+      5175,
+      2415,
+      13,
+      39565,
+      458,
+      3110,
+      315,
+      264,
+      5175,
+      1965,
+      8129,
+      304,
+      13027,
+      13,
+      362
+    ],
+    "vocab": 151936,
+    "warm_reserved_live": [
+      5227622400,
+      5042798592
+    ],
+    "warm_rss_kib": 159188
+  },
+  "cubecl": {
+    "after_session_reserved_live": [
+      [
+        5227622400,
+        5042798592
+      ],
+      [
+        5227622400,
+        5042798592
+      ],
+      [
+        5227622400,
+        5042798592
+      ]
+    ],
+    "after_session_rss_kib": [
+      172276,
+      173464,
+      173464
+    ],
+    "decode_cpu_fallbacks": [
+      0,
+      0,
+      0
+    ],
+    "decode_tokens": 32,
+    "elements_by_ggml_dtype": {
+      "0": 308224,
+      "12": 6586630144,
+      "14": 1603796992
+    },
+    "gpu": "Intel(R) Arc(tm) Pro B50 Graphics (BMG G21)",
+    "greedy_text": " and the time complexity of operations. Also, explain the difference between a hash table and a hash map. Provide an example of a hash table implementation in Python. A",
+    "kernel": "cubecl",
+    "load_seconds": 1.400542013,
+    "loaded_reserved_live": [
+      5227622400,
+      5042798592
+    ],
+    "logit_rows": 33,
+    "max_repeat_logit_difference": 0.0,
+    "median_ms_per_token": 437.81469534375,
+    "model": "/home/tserica/models/qwen3-dense/Qwen3-8B-Q4_K_M.gguf",
+    "model_bytes": 5027783488,
+    "ms_per_token": [
+      432.3043116562501,
+      437.81469534375,
+      437.82495534374993
+    ],
+    "passes": 3,
+    "peak_reserved_live": [
+      5227622400,
+      5061672960
+    ],
+    "peak_rss_kib": 173464,
+    "prefill_chunk": 1,
+    "prefill_cpu_fallbacks": [
+      0,
+      0,
+      0
+    ],
+    "prompt_tokens": 16,
+    "tokens_per_second": 2.2840713448753713,
+    "top1": [
+      323,
+      279,
+      882,
+      23094,
+      315,
+      7525,
+      13,
+      7281,
+      11,
+      10339,
+      279,
+      6672,
+      1948,
+      264,
+      5175,
+      1965,
+      323,
+      264,
+      5175,
+      2415,
+      13,
+      39565,
+      458,
+      3110,
+      315,
+      264,
+      5175,
+      1965,
+      8129,
+      304,
+      13027,
+      13,
+      362
+    ],
+    "vocab": 151936,
+    "warm_reserved_live": [
+      5227622400,
+      5042798592
+    ],
+    "warm_rss_kib": 157564
+  },
+  "prompt_ids": [
+    840,
+    20772,
+    1246,
+    264,
+    5175,
+    1965,
+    10533,
+    323,
+    70671,
+    6894,
+    13,
+    65279,
+    47353,
+    11,
+    86243,
+    11
+  ],
+  "decode_input_ids": [
+    323,
+    279,
+    882,
+    23094,
+    315,
+    7525,
+    13,
+    7281,
+    11,
+    10339,
+    279,
+    6672,
+    1948,
+    264,
+    5175,
+    1965,
+    323,
+    264,
+    5175,
+    2415,
+    13,
+    39565,
+    458,
+    3110,
+    315,
+    264,
+    5175,
+    1965,
+    8129,
+    304,
+    13027,
+    13
+  ],
+  "speedup": 3.9518144358375493,
+  "output_comparison": {
+    "logits_compared": 5013888,
+    "max_abs": 1.9073486328125e-05,
+    "rms_abs": 1.829184257028829e-06,
+    "absolute_difference_p50_p95_p99": [
+      1.0728836059570312e-06,
+      3.4570693969726562e-06,
+      5.7220458984375e-06
+    ],
+    "max_abs_by_row": [
+      7.62939453125e-06,
+      7.62939453125e-06,
+      5.7220458984375e-06,
+      6.67572021484375e-06,
+      7.867813110351562e-06,
+      9.5367431640625e-06,
+      6.67572021484375e-06,
+      8.58306884765625e-06,
+      5.7220458984375e-06,
+      1.621246337890625e-05,
+      1.049041748046875e-05,
+      7.152557373046875e-06,
+      5.7220458984375e-06,
+      8.106231689453125e-06,
+      7.867813110351562e-06,
+      9.775161743164062e-06,
+      6.67572021484375e-06,
+      9.5367431640625e-06,
+      1.0371208190917969e-05,
+      1.9073486328125e-05,
+      7.152557373046875e-06,
+      7.62939453125e-06,
+      7.62939453125e-06,
+      6.67572021484375e-06,
+      5.7220458984375e-06,
+      5.7220458984375e-06,
+      7.152557373046875e-06,
+      1.1444091796875e-05,
+      5.7220458984375e-06,
+      6.198883056640625e-06,
+      5.7220458984375e-06,
+      4.76837158203125e-06,
+      7.62939453125e-06
+    ],
+    "top1_matching_rows": 33,
+    "rows": 33,
+    "top1_ids_match": true,
+    "greedy_text_match": true,
+    "max_softmax_kl_generic_to_cubecl": 3.68042980456657e-12,
+    "within_absolute_1e_5": false,
+    "worst_difference": {
+      "row": 19,
+      "vocab_index": 25871,
+      "generic": -19.41694450378418,
+      "cubecl": -19.41692543029785
+    }
+  },
+  "memory_comparison": {
+    "loaded_device_bytes_identical": true,
+    "warm_device_bytes_identical": true,
+    "sampled_peak_device_bytes_identical": true,
+    "after_session_device_bytes_identical": true,
+    "generic_after_sessions_stable": true,
+    "cubecl_after_sessions_stable": true
+  },
+  "model_sha256": "d98cdcbd03e17ce47681435b5150e34c1417f50b5c0019dd560e4882c5745785",
+  "environment": {
+    "rust": "1.98.1",
+    "linux": "7.0.0-38-generic",
+    "mesa_vulkan_drivers": "26.0.8-1ubuntu0.3",
+    "vulkan_loader": "1.4.341.0-1",
+    "backend": "native Vulkan, same Candle queue and buffer allocator",
+    "order": "generic, then CubeCL; three warmed passes per process, one model per process"
+  },
+  "measurement_notes": [
+    "16-token natural-language prompt, prefilled in one-token chunks; 32 decode tokens per pass.",
+    "Decode timing includes token tensor creation, full model forward, logits to host, finite check and greedy argmax; excludes loading, prefill, statistics, repeat-logit comparison, and output-file writes.",
+    "Candidate uses baseline-generated input tokens. Full-vocabulary logits compared for prefill and all 32 decode steps.",
+    "Memory peak is sampled at completed token boundaries, not a continuous high-water measurement. Driver-private pipeline memory is not included in Vulkan allocator stats.",
+    "Host RSS includes full-vocabulary reference logits retained by the benchmark (20,055,552 bytes of float data); later passes test session reuse.",
+    "Diagnostic large-batch prefills were excluded: 64-token batched prefill triggered ERROR_OUT_OF_DEVICE_MEMORY and CPU fallbacks; one initial run returned nonfinite logits. A 16-token batched attempt returned ERROR_DEVICE_LOST. The completed one-token-chunk runs had zero prefill/decode CPU fallbacks.",
+    "Real-model logit maximum exceeds the previous tiny-fixture 1e-5 absolute threshold; no test tolerance or production kernel was changed."
+  ]
+}
