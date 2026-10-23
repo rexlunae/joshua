@@ -1125,8 +1125,8 @@ pub enum Qgemv {
     CubeClExpanded,
     /// Validated packed formats including Q6_K; grouped Q8 stays opt-in.
     CubeClPacked,
-    /// Experimental packed formats plus selected-group Q8. The integrated
-    /// DeepSeek workload fails full-model parity; never select automatically.
+    /// Opt-in packed formats plus selected-group Q8. Consult the pinned
+    /// full-model benchmark reports before changing automatic dispatch.
     CubeClNext,
     /// Diagnostic ablation: use CubeCL for exactly one weight format.
     CubeClFormat(crate::quantized::GgmlDType),

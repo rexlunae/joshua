@@ -10,7 +10,56 @@ through its existing Vulkan runtime. **Production does not use wgpu, link
 CubeCL, require its toolchain, import buffers, or create a second queue.**
 This standalone development crate remains outside Joshua's workspace.
 
-## Merge review: current production policy (2026-10-22)
+## Grouped Q8 follow-up (2026-10-23)
+
+**Grouped Q8 remains opt-in; the B50 default is still `CubeClPacked`.**
+The current grouped shader has no reproduced numerical defect, and no kernel
+arithmetic or tolerance has been changed. The archived failing reference is
+inconsistent with subsequent reference-only runs: its prefill logits already
+differ by 0.08808470, although the 32/32/32/25-token prefill chunks do not use
+the selected-group kernel. The original processes did not record executable
+fingerprints, so their difference cannot establish a grouped-kernel cause.
+The original 0.16960466 failure is preserved in the historical report below.
+Replaying its one-decode-token probe with either one or two measured sessions
+also gives bit-identical outputs; changing session count does not reproduce it.
+
+A fresh, pinned executable compares explicit `cubecl-packed` against
+`cubecl-next` with the full 121-token serving-engine prompt, batch-32 prefill,
+128 identical diverse decode inputs, context 249, and **two sessions per
+selector**. All **16,677,120 logits are bit-identical**, including the final
+prefill row; repeated-session maximum difference is also zero. Every DeepSeek
+parity, decode speed, complete-session speed, and memory gate passes:
+
+| DeepSeek-V4.1 Flash REAP-272E | Packed reference | Grouped Q8 | Speedup |
+| --- | ---: | ---: | ---: |
+| Median decode | 3780.725 ms/token | 820.436 ms/token | **4.608x** |
+| Median prefill + 128-token decode | 525.707 s | 143.338 s | **3.668x** |
+
+Allocator trajectories and peak reserved/live bytes match exactly. Decode
+live-byte spans are zero; session-end reserved/live bytes are always
+9,365,831,680 / 9,224,831,488. Driver VRAM remains 9,404,608,512 bytes at every
+session endpoint. Private host memory (resident plus swapped pages) has zero
+endpoint growth on both paths; the candidate's footprint is only 44 KiB above
+the reference. CPU fallback counts are zero, and the native buffer/queue path
+is unchanged.
+
+The Qwen3-8B Q4_K_M regression control also uses batch-32 prefill and 128 decode
+tokens, with two sessions per selector. Its **19,599,744 logits are
+bit-identical**, repeat difference is zero, and memory trajectories match.
+Decode is 192.894 versus 193.576 ms/token: its speed gate fails, correctly,
+and no Qwen speedup or automatic dispatch promotion is claimed. Qwen does not
+use the grouped projection, so both selectors run the same packed kernels.
+
+Benchmark summaries now record the executable SHA-256 before loading weights;
+both comparators reject missing or different fingerprints. Kernel acceptance
+also requires at least two measured sessions. New regression coverage checks
+the real DeepSeek grouped projection geometry with amplified values and
+nonzero input offsets, plus tiny-model grouped decode, cache continuation,
+and all-row verification. See [the pinned follow-up evidence](benchmarks/grouped-q8-followup-b50-20261023.json)
+for commands, hashes, gates, memory accounting and the remaining attribution
+limit. Raw traces, complete logits and logs remain outside the repository.
+
+## Merge-review checkpoint (2026-10-22)
 
 B50 now defaults to **`CubeClPacked`**: Q4_K/Q6_K/Q8_0/Q2_K. **Grouped Q8
 remains opt-in** through `--kernel cubecl-next` or

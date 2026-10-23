@@ -1,0 +1,643 @@
+{
+  "date": "2026-10-23",
+  "hardware": "Intel Arc Pro B50 8086:E212, native Vulkan",
+  "raw_results_directory": "/home/tserica/benchmark-results/grouped-q8-parity-20261023",
+  "source_manifest": {
+    "git_head": "6483ca91cb4b6addad5b33db74e10d100a8d4401",
+    "binary_sha256": "dfc396a986d92e05a1eb424ad3347f42dd57c7f5a8cf96222dcbd94ae48e3ea4",
+    "source_sha256": {
+      "examples/bench_cubecl_real.rs": "065e420c8ec84feec5a16773548be6c8b7d08b24d431c8c54a7359ae2158693a",
+      "vendor/candle-core/src/vulkan_backend/kernels.rs": "03040dd23c7daa56bfb6eb4da97e66e8122eac42b8059bb3c4a2bf87312c557b",
+      "vendor/candle-core/src/vulkan_backend/grouped_q8_cubecl.wgsl": "5d36f17957b4653483d0d47042be9e3176a143b9074969c9d5cef5d54a3961c6",
+      "src/attention.rs": "66d0447beb5964247c57ed78f063ded4f026f1f1e32cbdf0ac6dc896a7361082",
+      "src/quantized_deepseek4.rs": "1d43ced65f8a0556e003343e02709a5884dc42891859ca0ca69b1577b1d99e9b",
+      "kernels-cubecl/src/lib.rs": "85ecf6ded1727aab6aa5aa3acc3a3fa17351007c5d812672fe9b481be92866fa"
+    }
+  },
+  "commands": [
+    {
+      "name": "deepseek-baseline",
+      "argv": [
+        "/home/tserica/benchmark-results/grouped-q8-parity-20261023/bench_cubecl_real",
+        "--model",
+        "/home/tserica/models/DSV41-REAP272E-balanced.gguf",
+        "--tokenizer",
+        "/home/tserica/models/DeepSeek-V4.1-Flash-REAP-272E/tokenizer.json",
+        "--kernel",
+        "cubecl-packed",
+        "--output",
+        "/home/tserica/benchmark-results/grouped-q8-parity-20261023/deepseek-baseline",
+        "--reference",
+        "/home/tserica/benchmark-results/pr198-review-20261022/deepseek/trace.json",
+        "--prefill-chunk",
+        "32",
+        "--decode",
+        "128",
+        "--passes",
+        "2",
+        "--warm-prompt-tokens",
+        "8",
+        "--warm-decode",
+        "2",
+        "--context",
+        "249",
+        "--chat"
+      ],
+      "started_utc": "2026-10-23T07:00:20.579598+00:00",
+      "exit_code": 0,
+      "finished_utc": "2026-10-23T07:18:32.325210+00:00"
+    },
+    {
+      "name": "deepseek-grouped",
+      "argv": [
+        "/home/tserica/benchmark-results/grouped-q8-parity-20261023/bench_cubecl_real",
+        "--model",
+        "/home/tserica/models/DSV41-REAP272E-balanced.gguf",
+        "--tokenizer",
+        "/home/tserica/models/DeepSeek-V4.1-Flash-REAP-272E/tokenizer.json",
+        "--kernel",
+        "cubecl-next",
+        "--output",
+        "/home/tserica/benchmark-results/grouped-q8-parity-20261023/deepseek-grouped",
+        "--reference",
+        "/home/tserica/benchmark-results/grouped-q8-parity-20261023/deepseek-baseline/trace.json",
+        "--prefill-chunk",
+        "32",
+        "--decode",
+        "128",
+        "--passes",
+        "2",
+        "--warm-prompt-tokens",
+        "8",
+        "--warm-decode",
+        "2",
+        "--context",
+        "249",
+        "--chat"
+      ],
+      "started_utc": "2026-10-23T07:18:32.355320+00:00",
+      "exit_code": 0,
+      "finished_utc": "2026-10-23T07:23:48.187232+00:00"
+    },
+    {
+      "name": "qwen-baseline",
+      "argv": [
+        "/home/tserica/benchmark-results/grouped-q8-parity-20261023/bench_cubecl_real",
+        "--model",
+        "/home/tserica/models/qwen3-dense/Qwen3-8B-Q4_K_M.gguf",
+        "--tokenizer",
+        "/home/tserica/models/qwen3-dense/tokenizer.json",
+        "--kernel",
+        "cubecl-packed",
+        "--output",
+        "/home/tserica/benchmark-results/grouped-q8-parity-20261023/qwen-baseline",
+        "--reference",
+        "/home/tserica/benchmark-results/pr198-review-20261022/qwen/trace.json",
+        "--prefill-chunk",
+        "32",
+        "--decode",
+        "128",
+        "--passes",
+        "2",
+        "--warm-prompt-tokens",
+        "32",
+        "--warm-decode",
+        "2",
+        "--context",
+        "254",
+        "--chat"
+      ],
+      "started_utc": "2026-10-23T07:23:48.289925+00:00",
+      "exit_code": 0,
+      "finished_utc": "2026-10-23T07:25:03.019285+00:00"
+    },
+    {
+      "name": "qwen-grouped",
+      "argv": [
+        "/home/tserica/benchmark-results/grouped-q8-parity-20261023/bench_cubecl_real",
+        "--model",
+        "/home/tserica/models/qwen3-dense/Qwen3-8B-Q4_K_M.gguf",
+        "--tokenizer",
+        "/home/tserica/models/qwen3-dense/tokenizer.json",
+        "--kernel",
+        "cubecl-next",
+        "--output",
+        "/home/tserica/benchmark-results/grouped-q8-parity-20261023/qwen-grouped",
+        "--reference",
+        "/home/tserica/benchmark-results/grouped-q8-parity-20261023/qwen-baseline/trace.json",
+        "--prefill-chunk",
+        "32",
+        "--decode",
+        "128",
+        "--passes",
+        "2",
+        "--warm-prompt-tokens",
+        "32",
+        "--warm-decode",
+        "2",
+        "--context",
+        "254",
+        "--chat"
+      ],
+      "started_utc": "2026-10-23T07:25:03.031091+00:00",
+      "exit_code": 0,
+      "finished_utc": "2026-10-23T07:26:17.594545+00:00"
+    }
+  ],
+  "short_isolation": {
+    "max_abs": 0.0,
+    "different_logits": 0,
+    "compared_logits": 258560,
+    "reference_repeat_max_abs": 0.0,
+    "candidate_repeat_max_abs": 0.0,
+    "reference_ms_per_token": 3784.2725044999997,
+    "candidate_ms_per_token": 859.1198565,
+    "note": "Same initial binary, short isolation only; full gates use fingerprinted pinned build."
+  },
+  "models": {
+    "deepseek": {
+      "model": "/home/tserica/models/DSV41-REAP272E-balanced.gguf",
+      "gpu": "Intel(R) Arc(tm) Pro B50 Graphics (BMG G21)",
+      "executable_sha256": "dfc396a986d92e05a1eb424ad3347f42dd57c7f5a8cf96222dcbd94ae48e3ea4",
+      "reference_dispatch": "CubeClPacked",
+      "candidate_dispatch": "CubeClNext",
+      "protocol": {
+        "prompt_tokens": 121,
+        "prefill_chunk": 32,
+        "decode_tokens": 128,
+        "passes": 2,
+        "context": 249,
+        "warm_prompt_tokens": 8,
+        "warm_decode": 2,
+        "expert_placement": "cpu-mmap"
+      },
+      "output_comparison": {
+        "bit_identical": true,
+        "generic_logits_sha256": "ab6fb262586daa5d1a3ea4baa89d1ef5b8afce4ee2b6750306357ff8f0892333",
+        "cubecl_logits_sha256": "ab6fb262586daa5d1a3ea4baa89d1ef5b8afce4ee2b6750306357ff8f0892333",
+        "logits_compared": 16677120,
+        "max_abs": 0.0,
+        "rms_abs": 0.0,
+        "absolute_difference_p50_p95_p99": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "top1_matching_rows": 129,
+        "rows": 129,
+        "top1_ids_match": true,
+        "greedy_text_match": true,
+        "max_softmax_kl_generic_to_cubecl": 0.0,
+        "within_absolute_1e_5": true
+      },
+      "reference_repeat_max_abs": 0.0,
+      "candidate_repeat_max_abs": 0.0,
+      "reference_decode_ms_per_token": [
+        3802.205089890624,
+        3759.2442599453125
+      ],
+      "candidate_decode_ms_per_token": [
+        826.0120139687497,
+        814.8609689687503
+      ],
+      "decode_speedup": 4.60818687885237,
+      "prefill_comparison": {
+        "generic_ms": [
+          44171.431263000006,
+          39376.936966
+        ],
+        "cubecl_ms": [
+          37783.774299000004,
+          38860.733492
+        ],
+        "speedup": 1.0900763882106983
+      },
+      "end_to_end_comparison": {
+        "generic_session_ms": [
+          530853.6827689998,
+          520560.202239
+        ],
+        "cubecl_session_ms": [
+          143513.31208699997,
+          143162.93752000004
+        ],
+        "speedup": 3.6676002509777725
+      },
+      "reference_memory": {
+        "loaded_reserved_live": [
+          9365831680,
+          9224831488
+        ],
+        "peak_reserved_live": [
+          9365831680,
+          9279003648
+        ],
+        "after_session_reserved_live": [
+          [
+            9365831680,
+            9224831488
+          ],
+          [
+            9365831680,
+            9224831488
+          ]
+        ],
+        "private_endpoints_kib": [
+          188548,
+          188548
+        ],
+        "private_endpoint_span_kib": 0,
+        "driver_vram_endpoints_bytes": [
+          9404608512,
+          9404608512
+        ]
+      },
+      "candidate_memory": {
+        "loaded_reserved_live": [
+          9365831680,
+          9224831488
+        ],
+        "peak_reserved_live": [
+          9365831680,
+          9279003648
+        ],
+        "after_session_reserved_live": [
+          [
+            9365831680,
+            9224831488
+          ],
+          [
+            9365831680,
+            9224831488
+          ]
+        ],
+        "private_endpoints_kib": [
+          188592,
+          188592
+        ],
+        "private_endpoint_span_kib": 0,
+        "driver_vram_endpoints_bytes": [
+          9404608512,
+          9404608512
+        ]
+      },
+      "memory_comparison": {
+        "loaded_device_bytes_identical": true,
+        "warm_device_bytes_identical": true,
+        "sampled_peak_device_bytes_identical": true,
+        "after_session_device_bytes_identical": true,
+        "generic_after_sessions_stable": true,
+        "cubecl_after_sessions_stable": true,
+        "anonymous_accounting": "resident plus swapped anonymous pages",
+        "generic_anonymous_growth_kib": 0,
+        "cubecl_anonymous_growth_kib": 0,
+        "anonymous_memory_bounded_within_1_mib": true,
+        "candidate_anonymous_peak_within_1_mib_of_generic": true,
+        "generic_decode_live_span_bytes_by_pass": [
+          0,
+          0
+        ],
+        "cubecl_decode_live_span_bytes_by_pass": [
+          0,
+          0
+        ],
+        "device_memory_trajectory_identical": true,
+        "candidate_allocations_no_larger": {
+          "loaded_reserved_live": true,
+          "warm_reserved_live": true,
+          "peak_reserved_live": true,
+          "after_session_reserved_live": true
+        },
+        "candidate_device_trajectory_no_larger": true,
+        "driver_vram_endpoints": {
+          "generic": [
+            9404608512,
+            9404608512
+          ],
+          "cubecl": [
+            9404608512,
+            9404608512
+          ]
+        }
+      },
+      "acceptance": {
+        "same_executable": true,
+        "repeated_sessions_measured": true,
+        "parity": true,
+        "repeated_session_parity": true,
+        "faster_decode": true,
+        "all_decode_samples_faster": true,
+        "device_memory": true,
+        "host_memory": true,
+        "no_extra_fallbacks": true,
+        "faster_end_to_end": true,
+        "all_session_samples_faster": true,
+        "device_memory_trajectory": true,
+        "driver_memory": true,
+        "passed": true
+      },
+      "reference_fallbacks": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "candidate_fallbacks": [
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    "qwen": {
+      "model": "/home/tserica/models/qwen3-dense/Qwen3-8B-Q4_K_M.gguf",
+      "gpu": "Intel(R) Arc(tm) Pro B50 Graphics (BMG G21)",
+      "executable_sha256": "dfc396a986d92e05a1eb424ad3347f42dd57c7f5a8cf96222dcbd94ae48e3ea4",
+      "reference_dispatch": "CubeClPacked",
+      "candidate_dispatch": "CubeClNext",
+      "protocol": {
+        "prompt_tokens": 126,
+        "prefill_chunk": 32,
+        "decode_tokens": 128,
+        "passes": 2,
+        "context": 254,
+        "warm_prompt_tokens": 32,
+        "warm_decode": 2,
+        "expert_placement": "model-device"
+      },
+      "output_comparison": {
+        "bit_identical": true,
+        "generic_logits_sha256": "6dc8975c3f955815fdbb88c4488bb37deced0ffcea5fb052b2b7f0e4b7c87c88",
+        "cubecl_logits_sha256": "6dc8975c3f955815fdbb88c4488bb37deced0ffcea5fb052b2b7f0e4b7c87c88",
+        "logits_compared": 19599744,
+        "max_abs": 0.0,
+        "rms_abs": 0.0,
+        "absolute_difference_p50_p95_p99": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "top1_matching_rows": 129,
+        "rows": 129,
+        "top1_ids_match": true,
+        "greedy_text_match": true,
+        "max_softmax_kl_generic_to_cubecl": 0.0,
+        "within_absolute_1e_5": true
+      },
+      "reference_repeat_max_abs": 0.0,
+      "candidate_repeat_max_abs": 0.0,
+      "reference_decode_ms_per_token": [
+        192.91206825781268,
+        192.87576285156246
+      ],
+      "candidate_decode_ms_per_token": [
+        192.11016928124994,
+        195.04183232031244
+      ],
+      "decode_speedup": 0.9964763956106544,
+      "prefill_comparison": {
+        "generic_ms": [
+          9605.274344,
+          9866.931512000001
+        ],
+        "cubecl_ms": [
+          9552.596537,
+          9613.778197
+        ],
+        "speedup": 1.015956649405246
+      },
+      "end_to_end_comparison": {
+        "generic_session_ms": [
+          34298.01908100002,
+          34555.029157
+        ],
+        "cubecl_session_ms": [
+          34142.69820499999,
+          34579.13273399999
+        ],
+        "speedup": 1.0019093975990907
+      },
+      "reference_memory": {
+        "loaded_reserved_live": [
+          5227622400,
+          5042798592
+        ],
+        "peak_reserved_live": [
+          5227622400,
+          5118296584
+        ],
+        "after_session_reserved_live": [
+          [
+            5227622400,
+            5042798592
+          ],
+          [
+            5227622400,
+            5042798592
+          ]
+        ],
+        "private_endpoints_kib": [
+          164788,
+          164788
+        ],
+        "private_endpoint_span_kib": 0,
+        "driver_vram_endpoints_bytes": [
+          5268217856,
+          5268217856
+        ]
+      },
+      "candidate_memory": {
+        "loaded_reserved_live": [
+          5227622400,
+          5042798592
+        ],
+        "peak_reserved_live": [
+          5227622400,
+          5118296584
+        ],
+        "after_session_reserved_live": [
+          [
+            5227622400,
+            5042798592
+          ],
+          [
+            5227622400,
+            5042798592
+          ]
+        ],
+        "private_endpoints_kib": [
+          164788,
+          164788
+        ],
+        "private_endpoint_span_kib": 0,
+        "driver_vram_endpoints_bytes": [
+          5268217856,
+          5268217856
+        ]
+      },
+      "memory_comparison": {
+        "loaded_device_bytes_identical": true,
+        "warm_device_bytes_identical": true,
+        "sampled_peak_device_bytes_identical": true,
+        "after_session_device_bytes_identical": true,
+        "generic_after_sessions_stable": true,
+        "cubecl_after_sessions_stable": true,
+        "anonymous_accounting": "resident plus swapped anonymous pages",
+        "generic_anonymous_growth_kib": 0,
+        "cubecl_anonymous_growth_kib": 0,
+        "anonymous_memory_bounded_within_1_mib": true,
+        "candidate_anonymous_peak_within_1_mib_of_generic": true,
+        "generic_decode_live_span_bytes_by_pass": [
+          37748736,
+          37748736
+        ],
+        "cubecl_decode_live_span_bytes_by_pass": [
+          37748736,
+          37748736
+        ],
+        "device_memory_trajectory_identical": true,
+        "candidate_allocations_no_larger": {
+          "loaded_reserved_live": true,
+          "warm_reserved_live": true,
+          "peak_reserved_live": true,
+          "after_session_reserved_live": true
+        },
+        "candidate_device_trajectory_no_larger": true,
+        "driver_vram_endpoints": {
+          "generic": [
+            5268217856,
+            5268217856
+          ],
+          "cubecl": [
+            5268217856,
+            5268217856
+          ]
+        }
+      },
+      "acceptance": {
+        "same_executable": true,
+        "repeated_sessions_measured": true,
+        "parity": true,
+        "repeated_session_parity": true,
+        "faster_decode": false,
+        "all_decode_samples_faster": false,
+        "device_memory": true,
+        "host_memory": true,
+        "no_extra_fallbacks": true,
+        "faster_end_to_end": true,
+        "all_session_samples_faster": false,
+        "device_memory_trajectory": true,
+        "driver_memory": true,
+        "passed": false
+      },
+      "reference_fallbacks": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "candidate_fallbacks": [
+        0,
+        0,
+        0,
+        0
+      ]
+    }
+  },
+  "one_pass_isolation": {
+    "protocol": "Full 121-token prompt, chunks 32/32/32/25, decode 1, context 249, warm prefix 8 + decode 2; one session per selector, diagnostic only.",
+    "commands": [
+      [
+        "/home/tserica/benchmark-results/grouped-q8-parity-20261023/bench_cubecl_real",
+        "--model",
+        "/home/tserica/models/DSV41-REAP272E-balanced.gguf",
+        "--tokenizer",
+        "/home/tserica/models/DeepSeek-V4.1-Flash-REAP-272E/tokenizer.json",
+        "--kernel",
+        "cubecl-packed",
+        "--output",
+        "/home/tserica/benchmark-results/grouped-q8-parity-20261023/baseline-single",
+        "--reference",
+        "/home/tserica/benchmark-results/pr198-review-20261022/deepseek-one-token-trace.json",
+        "--prefill-chunk",
+        "32",
+        "--decode",
+        "1",
+        "--passes",
+        "1",
+        "--warm-prompt-tokens",
+        "8",
+        "--warm-decode",
+        "2",
+        "--context",
+        "249",
+        "--chat"
+      ],
+      [
+        "/home/tserica/benchmark-results/grouped-q8-parity-20261023/bench_cubecl_real",
+        "--model",
+        "/home/tserica/models/DSV41-REAP272E-balanced.gguf",
+        "--tokenizer",
+        "/home/tserica/models/DeepSeek-V4.1-Flash-REAP-272E/tokenizer.json",
+        "--kernel",
+        "cubecl-next",
+        "--output",
+        "/home/tserica/benchmark-results/grouped-q8-parity-20261023/candidate-single",
+        "--reference",
+        "/home/tserica/benchmark-results/pr198-review-20261022/deepseek-one-token-trace.json",
+        "--prefill-chunk",
+        "32",
+        "--decode",
+        "1",
+        "--passes",
+        "1",
+        "--warm-prompt-tokens",
+        "8",
+        "--warm-decode",
+        "2",
+        "--context",
+        "249",
+        "--chat"
+      ]
+    ],
+    "executable_sha256": [
+      "dfc396a986d92e05a1eb424ad3347f42dd57c7f5a8cf96222dcbd94ae48e3ea4",
+      "dfc396a986d92e05a1eb424ad3347f42dd57c7f5a8cf96222dcbd94ae48e3ea4"
+    ],
+    "max_abs": 0.0,
+    "compared_logits": 258560,
+    "reference_sha256": "63af23dda6b5386fe55ff77aa224477e57e6f799ae270756bf1d48d79ad60e8e",
+    "candidate_sha256": "63af23dda6b5386fe55ff77aa224477e57e6f799ae270756bf1d48d79ad60e8e"
+  },
+  "attribution": {
+    "archived_max_abs": 0.16960465908050537,
+    "archived_prefill_max_abs_before_grouped_dispatch": 0.08808469772338867,
+    "current_short_two_session_max_abs": 0.0,
+    "current_short_one_session_max_abs": 0.0,
+    "current_full_two_session_max_abs": 0.0,
+    "kernel_arithmetic_changed": false,
+    "conclusion": "No grouped Q8 drift reproduced on current main. The archived reference differs even before grouped dispatch and is inconsistent with later reference-only runs. Its executable identity was not captured, so its exact numerical cause cannot be reconstructed. Do not claim an arithmetic fix; pin benchmark executable identities and preserve the original failure."
+  },
+  "rollout": {
+    "B50_default": "CubeClPacked",
+    "grouped_Q8": "CubeClNext explicit opt-in; unchanged",
+    "deepseek_full_model_gates_pass": true,
+    "qwen_control_speed_gate_pass": false,
+    "note": "Qwen has no grouped projection and both selectors use identical packed kernels. Its parity and memory gates pass; timing does not establish a speedup. No automatic dispatch or tolerance change."
+  },
+  "validation": [
+    {
+      "command": "cargo build --release --features vulkan --example bench_cubecl_real",
+      "result": "passed; pinned executable recorded in source_manifest; subsequent production-source edit changes only the CubeClNext doc comment."
+    },
+    {
+      "command": "python3 -m unittest discover -s kernels-cubecl/benchmarks -p 'test_*.py' -v",
+      "result": "7 passed"
+    },
+    {
+      "command": "cargo test --features vulkan --test cubecl_vulkan_tests --test deepseek41_tests --test memory_placement_tests -- --test-threads=1",
+      "result": "9 Vulkan, 7 DeepSeek41 and 12 memory-placement tests passed; two synthetic timing tests intentionally ignored; real-model timing measured separately."
+    }
+  ],
+  "remaining_scope": "The exact origin of the unfingerprinted archived failure remains unknown. Current same-build probes and full-model DeepSeek gates pass without changing kernel arithmetic. Qwen does not establish a speedup. Grouped Q8 stays opt-in; other adapters, additional prompts and concurrency are not certified by this workload."
+}
