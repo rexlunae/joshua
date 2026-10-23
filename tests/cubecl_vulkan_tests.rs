@@ -190,9 +190,9 @@ fn logits(
 }
 
 #[test]
-fn tiny_packed_models_match_generic_prefill_decode_and_all_rows() {
+fn tiny_production_models_match_generic_prefill_decode_and_all_rows() {
     let base = Device::Vulkan(VulkanDevice::new_with_qgemv(0, Qgemv::Generic).unwrap());
-    let candidate = Device::Vulkan(VulkanDevice::new_with_qgemv(0, Qgemv::CubeClPacked).unwrap());
+    let candidate = Device::Vulkan(VulkanDevice::new_with_qgemv(0, Qgemv::CubeClProduction).unwrap());
     let dir = common::model_dir("cubecl-q4k-parity");
     type Fixture = (&'static str, fn(&std::path::Path), &'static [bool]);
     // DeepSeek4's raw IQ2_XXS experts require mmap for accelerator execution;
@@ -397,9 +397,16 @@ fn validated_adapter_enables_production_dispatch() {
     if dev.name() == "Intel(R) Arc(tm) Pro B50 Graphics (BMG G21)"
         && std::env::var_os("JOSHUA_VULKAN_QGEMV").is_none()
     {
-        assert_eq!(dev.limits().qgemv, Qgemv::CubeClPacked);
-        assert!(!kernels::grouped_q8_eligible(&dev, 8, 8192, 4096),
-            "grouped projection must remain opt-in");
+        assert_eq!(dev.limits().qgemv, Qgemv::CubeClProduction);
+        assert!(kernels::grouped_q8_eligible(&dev, 8, 8192, 4096));
+        for (groups, n, k) in [(4, 8192, 4096), (8, 4096, 8192),
+            (8, 8200, 4096), (8, 8192, 8192)] {
+            assert!(!kernels::grouped_q8_eligible(&dev, groups, n, k),
+                "unvalidated geometry must retain its fallback");
+        }
+        assert_eq!(Qgemv::for_adapter(0x8086, 0xE20B, false), Qgemv::Generic);
+        let reference = VulkanDevice::new_with_qgemv(0, Qgemv::CubeClPacked).unwrap();
+        assert!(!kernels::grouped_q8_eligible(&reference, 8, 8192, 4096));
     }
 }
 
@@ -713,11 +720,11 @@ fn grouped_q8_deepseek_shape_preserves_exact_reduction() {
         quantized::{QMatMul, QStorage},
         Module,
     };
-    let vk = VulkanDevice::new_with_qgemv(0, Qgemv::CubeClNext).unwrap();
+    let vk = VulkanDevice::new_with_qgemv(0, Qgemv::CubeClProduction).unwrap();
     let dev = Device::Vulkan(vk);
     // Real DeepSeek output-A geometry; larger magnitudes make changes to
     // FMA/reduction order visible beyond the full-model 1e-5 gate.
-    let (groups, rank, k) = (8, 512, 8192);
+    let (groups, rank, k) = (8, 1024, 4096);
     let n = groups * rank;
     let values = common::weights(n * k, 391)
         .into_iter()

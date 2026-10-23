@@ -405,7 +405,8 @@ fn main() -> Result<()> {
     let kernel = match args.kernel.as_str() {
         "generic" => Qgemv::Generic,
         "cubecl" => Qgemv::CubeClExpanded,
-        "production" | "cubecl-packed" => Qgemv::CubeClPacked,
+        "production" => Qgemv::CubeClProduction,
+        "cubecl-packed" => Qgemv::CubeClPacked,
         "cubecl-next" => Qgemv::CubeClNext,
         "cubecl-q6" => Qgemv::CubeClFormat(candle_core::quantized::GgmlDType::Q6K),
         "cubecl-q4" => Qgemv::CubeClFormat(candle_core::quantized::GgmlDType::Q4K),

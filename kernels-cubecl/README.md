@@ -10,9 +10,36 @@ through its existing Vulkan runtime. **Production does not use wgpu, link
 CubeCL, require its toolchain, import buffers, or create a second queue.**
 This standalone development crate remains outside Joshua's workspace.
 
-## Grouped Q8 follow-up (2026-10-23)
+## Grouped Q8 production rollout (2026-10-23)
 
-**Grouped Q8 remains opt-in; the B50 default is still `CubeClPacked`.**
+B50 PCI **8086:E212** now defaults to `CubeClProduction`: the existing packed
+Q4_K/Q6_K/Q8_0/Q2_K kernels plus grouped Q8 for the validated DeepSeek decode
+geometry only: **one token, 8 groups, W[8192,4096], 1024 outputs per group**.
+The existing Q8_0 dtype, contiguous-input, workgroup-size and buffer-range
+guards still apply. Prefill and every other grouped geometry keep their
+ordinary matmul/gather path. Other adapters and automatic backend priority
+are unchanged; Qwen runs the same packed kernels as before.
+
+`--kernel production` benchmarks the adapter's production selection.
+`--kernel cubecl-packed` or `JOSHUA_VULKAN_QGEMV=cubecl-packed` explicitly
+disables grouped dispatch for a reference/control. `cubecl-next` remains the
+explicit opt-in for experimenting with grouped geometries outside the
+production allowlist. No shader arithmetic, buffers, transfers or queues
+change in this rollout. The full-model **1e-5** gate and pinned benchmark
+results below are the basis for enabling this one geometry.
+
+After integrating current `main`, a two-session replay through the actual
+automatic production selector again produces the identical full-logit hash,
+zero repeat drift, matching allocator trajectories and flat driver VRAM.
+Observed decode is 831.062 ms/token; private-memory endpoint growth is 4 KiB,
+within the unchanged 1 MiB budget. This is a rollout regression control, not
+a new paired speed comparison across builds. See the
+[production-selector replay](benchmarks/grouped-q8-production-b50-20261023.json).
+
+## Grouped Q8 pre-rollout evaluation (2026-10-23)
+
+At this evaluation checkpoint grouped Q8 was opt-in and the B50 default was
+`CubeClPacked`; the subsequent allowlisted rollout is described above.
 The current grouped shader has no reproduced numerical defect, and no kernel
 arithmetic or tolerance has been changed. The archived failing reference is
 inconsistent with subsequent reference-only runs: its prefill logits already
@@ -47,7 +74,7 @@ The Qwen3-8B Q4_K_M regression control also uses batch-32 prefill and 128 decode
 tokens, with two sessions per selector. Its **19,599,744 logits are
 bit-identical**, repeat difference is zero, and memory trajectories match.
 Decode is 192.894 versus 193.576 ms/token: its speed gate fails, correctly,
-and no Qwen speedup or automatic dispatch promotion is claimed. Qwen does not
+and no Qwen speedup is claimed. Qwen does not
 use the grouped projection, so both selectors run the same packed kernels.
 
 Benchmark summaries now record the executable SHA-256 before loading weights;

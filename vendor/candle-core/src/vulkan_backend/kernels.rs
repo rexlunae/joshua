@@ -1123,8 +1123,10 @@ pub enum Qgemv {
     /// Validated native Q4_K/Q8_0/Q2_K GEMVs with generic accumulation order.
     /// Previous B50 dispatch, retained for matched baseline comparisons.
     CubeClExpanded,
-    /// Validated packed formats including Q6_K; grouped Q8 stays opt-in.
+    /// Packed formats including Q6_K, without grouped projection (A/B reference).
     CubeClPacked,
+    /// B50 default: packed formats and the validated DeepSeek grouped Q8 shape.
+    CubeClProduction,
     /// Opt-in packed formats plus selected-group Q8. Consult the pinned
     /// full-model benchmark reports before changing automatic dispatch.
     CubeClNext,
@@ -1148,7 +1150,7 @@ impl Qgemv {
     pub fn for_adapter(vendor_id: u32, device_id: u32, int_dot: bool) -> Self {
         if vendor_id == 0x8086 && device_id == 0xE212
             && std::env::var_os("JOSHUA_VULKAN_QGEMV").is_none() {
-            Self::CubeClPacked // B50: grouped Q8 is opt-in after integration parity failure.
+            Self::CubeClProduction
         } else {
             Self::for_device(vendor_id, int_dot)
         }
@@ -1206,7 +1208,7 @@ pub fn run_qgemv_with(
     let selected = match kernel {
         Qgemv::CubeCl => dtype == crate::quantized::GgmlDType::Q4K,
         Qgemv::CubeClExpanded => dtype != crate::quantized::GgmlDType::Q6K,
-        Qgemv::CubeClPacked | Qgemv::CubeClNext => true,
+        Qgemv::CubeClPacked | Qgemv::CubeClProduction | Qgemv::CubeClNext => true,
         Qgemv::CubeClFormat(format) => dtype == format,
         _ => false,
     };
@@ -1234,7 +1236,7 @@ pub fn run_qgemv_with(
     }
     let push = Push::default().us(n)?.us(k)?.i(qtype_code(dtype)).us(dtype.block_size())?.us(dtype.type_size())?.us(xoff)?.i(0).us(m)?;
     match kernel {
-        Qgemv::CubeCl | Qgemv::CubeClExpanded | Qgemv::CubeClPacked | Qgemv::CubeClNext | Qgemv::CubeClFormat(_) | Qgemv::Generic => d.launch("qgemv", glsl::k_qgemv, &[x, w, out], push, &[], row_grid(n, m, lim.max_groups_x)),
+        Qgemv::CubeCl | Qgemv::CubeClExpanded | Qgemv::CubeClPacked | Qgemv::CubeClProduction | Qgemv::CubeClNext | Qgemv::CubeClFormat(_) | Qgemv::Generic => d.launch("qgemv", glsl::k_qgemv, &[x, w, out], push, &[], row_grid(n, m, lim.max_groups_x)),
         Qgemv::Mali => {
             let groups = row_grid(n.div_ceil(glsl::QGEMV_MALI_COLS), m.div_ceil(glsl::QGEMV_MALI_ROWS), lim.max_groups_x);
             d.launch("qgemv_mali", glsl::k_qgemv_mali, &[x, w, out], push, &[], groups)
@@ -1278,7 +1280,15 @@ pub fn run_grouped_q8(d: &VulkanDevice, x: Buf, w: Buf, out: Buf,
 pub fn grouped_q8_eligible(d: &VulkanDevice, groups: usize, n: usize, k: usize) -> bool {
     let lim = d.limits();
     // Larger original batches use GEMM, whose reduction order differs.
-    matches!(lim.qgemv, Qgemv::CubeClNext) && lim.wg == 256
+    // Production is restricted to the geometry measured in the full-model
+    // B50 gate: X[8,4096], W[8192,4096], 1024 selected outputs per group.
+    // Other geometries remain available only through the explicit Next opt-in.
+    let selected = match lim.qgemv {
+        Qgemv::CubeClProduction => (groups, n, k) == (8, 8192, 4096),
+        Qgemv::CubeClNext => true,
+        _ => false,
+    };
+    selected && lim.wg == 256
         && (1..=super::QGEMV_MAX_ROWS).contains(&groups) && n > 0 && n % groups == 0
         && k > 0 && k % 32 == 0 && (k / 32 % 2 == 0 || n % 2 == 0)
         && n <= (lim.max_groups_x as usize).saturating_mul(lim.max_groups_x as usize)
