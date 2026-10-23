@@ -26,6 +26,27 @@ def digest(path):
     return h.hexdigest()
 
 base_hash = digest(a.reference / 'logits.f32')
+# An unstable reference cannot certify another backend: without this, a
+# baseline that happened to be faster once (or whose memory was still
+# settling) would still make a candidate eligible for automatic preference.
+base_sessions = base.get('after_session_reserved_live', [])
+base_allocator_stable = (len(set(map(tuple, base_sessions))) == 1
+                         if base.get('allocator_stats_available') and base_sessions else None)
+base_samples = base.get('memory_samples', [])
+base_vram_keys = sorted({k for sample in base_samples
+                         for k in sample.get('driver_memory_bytes', {})
+                         if k.startswith('drm-resident-vram')})
+base_endpoint_vram = [sum(sample.get(k, 0) for k in base_vram_keys)
+                      for sample in base.get('after_session_driver_memory_bytes', [])]
+if not base_endpoint_vram and base_vram_keys:
+    base_endpoint_vram = [sum(sample['driver_memory_bytes'].get(k, 0) for k in base_vram_keys)
+                          for sample in base_samples
+                          if sample.get('phase') == 'decode' and sample.get('position') == base['context']]
+base_driver_stable = (max(base_endpoint_vram) - base_endpoint_vram[0] <= 1024**2
+                      if base_vram_keys and len(base_endpoint_vram) >= 2 else None)
+base_known_checks = [v for v in (base_allocator_stable, base_driver_stable) if v is not None]
+base_device_stable = (True if base.get('backend') == 'cpu'
+                      else all(base_known_checks) if base_known_checks else None)
 results = []
 for folder in a.runs:
     if not (folder / 'summary.json').exists():
@@ -66,6 +87,7 @@ for folder in a.runs:
              'same_greedy_choices': s['top1'] == base['top1'],
              'private_memory_growth_le_1MiB': private_growth <= 1024,
              'device_memory_stable': device_stable,
+             'reference_memory_stable': base_device_stable,
              'no_cpu_fallbacks': not any(s['decode_cpu_fallbacks'] + s['prefill_cpu_fallbacks'])}
     run_hash = digest(folder / 'logits.f32')
     r = {'run': str(folder), 'logits_sha256': run_hash, 'bit_identical': run_hash == base_hash, 'backend': s['backend'], 'auto_placement': s['auto_placement'],

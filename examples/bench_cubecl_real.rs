@@ -505,8 +505,8 @@ fn main() -> Result<()> {
     }
     header.validate_layout(file.metadata()?.len())?;
     ensure!(
-        dtype_elements.keys().any(|t| matches!(t, 8 | 10 | 12)),
-        "model has no CubeCL-supported Q8_0, Q2_K or Q4_K tensors"
+        dtype_elements.keys().any(|t| matches!(t, 8 | 10 | 12 | 14)),
+        "model has no CubeCL-supported Q8_0, Q2_K, Q4_K or Q6_K tensors"
     );
     let architecture = header
         .metadata

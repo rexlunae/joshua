@@ -590,9 +590,13 @@ inference performance and full-logit parity, rather than free-running language
 quality. Each process warms eight prompt tokens and two decode steps first;
 all timed passes use the full prompt. Kernels run serially across APIs.
 The evaluator records failed or unavailable configurations and preserves
-existing results. `compare_backends.py` retains the absolute **1e-5** logit
-and repeatability gates. A fast configuration that fails parity does not
-qualify for a new automatic selection preference.
+existing complete results. A folder left without `summary.json` is quarantined
+with `--retry-incomplete` and rerun instead of requiring manual cleanup.
+`compare_backends.py` retains the absolute **1e-5** logit and repeatability
+gates, and a candidate is eligible for automatic preference only when the
+reference baseline's own allocator and driver memory are stable. A fast
+configuration that fails parity does not qualify for a new automatic selection
+preference.
 
 Device statistics have different meanings across APIs. Vulkan allocator
 reserved/live bytes remain available. The harness additionally samples Linux

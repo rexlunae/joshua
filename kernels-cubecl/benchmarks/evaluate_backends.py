@@ -1,7 +1,9 @@
 """Serial B50 real-model evaluation. Build bench_cubecl_real with vulkan,opencl,sycl first.
 Each API gets identical teacher-forced tokens. Fixed means device dense/CPU
 DeepSeek experts/no expert cache; auto uses the Engine's actual placement.
-Existing results are never overwritten. A failed backend does not hide others.
+Existing complete results are never overwritten; --retry-incomplete moves a
+folder without summary.json aside and reruns it. A failed backend does not hide
+others.
 """
 import argparse
 import json
@@ -24,6 +26,8 @@ p.add_argument('--prefill-chunk', type=int, default=8)
 p.add_argument('--timeout', type=int, default=3600)
 p.add_argument('--policies', nargs='+', choices=['fixed', 'auto'], default=['fixed', 'auto'])
 p.add_argument('--backends', nargs='+', choices=['vulkan', 'cpu', 'opencl', 'sycl'], default=['vulkan', 'cpu', 'opencl', 'sycl'])
+p.add_argument('--retry-incomplete', action='store_true',
+               help='quarantine an existing folder without summary.json and rerun it')
 a = p.parse_args()
 a.output.mkdir(parents=True, exist_ok=True)
 base = a.output / 'vulkan-fixed'
@@ -40,13 +44,27 @@ for backend, policy in runs:
     if not ready(base) and folder != base and (ready(folder) or not folder.exists()):
         base = folder
         entry['reference_fallback'] = True
+    should_run = False
     if (folder / 'summary.json').exists():
         entry['status'] = 'existing_result'
     elif folder.exists():
-        entry['status'] = 'existing_incomplete_result'
+        if a.retry_incomplete:
+            # Quarantine the partial output instead of overwriting it, then
+            # rerun. Without the flag an incomplete folder still needs an
+            # explicit decision, so a transient failure is never hidden.
+            archived = folder.with_name(
+                f"{folder.name}-incomplete-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}")
+            folder.rename(archived)
+            entry['status'] = 'retrying_incomplete_result'
+            entry['archived_incomplete_folder'] = str(archived)
+            should_run = True
+        else:
+            entry['status'] = 'existing_incomplete_result'
     elif folder != base and not ready(base):
         entry['status'] = 'reference_unavailable'
     else:
+        should_run = True
+    if should_run:
         cmd = [str(a.binary.resolve()), '--model', str(a.model.resolve()), '--tokenizer', str(a.tokenizer.resolve()),
                '--backend', backend, '--kernel', 'production', '--output', str(folder.resolve()),
                '--prompt-tokens', str(a.prompt_tokens), '--prefill-chunk', str(a.prefill_chunk),
