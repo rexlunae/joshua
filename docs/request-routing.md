@@ -188,7 +188,10 @@ would need a TLS client in the router and is not implemented.
 * Routing uses model id, slots and reported in-flight count.  It does not
   estimate per-request work (prompt length, `max_tokens`), check a
   request's length against a worker's `n_ctx`, compare tokenizers beyond the
-  model id, or prefer a worker holding a reusable KV prefix.
+  model id, or prefer a worker holding a reusable KV prefix.  The last of
+  those is designed in `docs/distributed-kv-cache.md` (#201): a chunk-hashed
+  directory of which worker holds which prefix, consulted without an extra
+  round trip.
 * A worker streams chat completions token by token, so a worker lost after
   the first event ends the client stream rather than retrying it.
 * Throughput, tail latency and per-request overhead have not been measured;
