@@ -9,9 +9,10 @@
 //! # Worker protocol (version [`WORKER_PROTOCOL_VERSION`])
 //!
 //! The data plane is the worker's existing OpenAI HTTP API
-//! (`/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`); request
-//! bodies are forwarded byte-for-byte, so every request parameter, streaming
-//! event, stop behaviour, error body and usage figure is the worker's own.
+//! (`/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`,
+//! `/v1/audio/transcriptions`); request bodies are forwarded byte-for-byte,
+//! so every request parameter, streaming event, stop behaviour, error body
+//! and usage figure is the worker's own.
 //! The control plane is one endpoint, [`WORKER_INFO_PATH`], returning a
 //! [`WorkerInfo`]: protocol version, model identity, context limit, backend,
 //! admission cap and live in-flight count.
@@ -103,8 +104,18 @@ pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 64 << 20;
 /// Ceiling on a worker error or info body.
 const MAX_SMALL_BODY: usize = 1 << 20;
 
+/// Whisper speech-to-text.  Its body is a multipart upload with no JSON
+/// `model` field to read, so it is routed on the worker's capability alone
+/// (#157).
+const TRANSCRIPTIONS_PATH: &str = "/v1/audio/transcriptions";
+
 /// Paths routed to workers.
-const ROUTED_PATHS: [&str; 3] = ["/v1/chat/completions", "/v1/completions", "/v1/embeddings"];
+const ROUTED_PATHS: [&str; 4] = [
+    "/v1/chat/completions",
+    "/v1/completions",
+    "/v1/embeddings",
+    TRANSCRIPTIONS_PATH,
+];
 
 /// What a worker reports at [`WORKER_INFO_PATH`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -156,7 +167,8 @@ pub struct WorkerCapabilities {
     pub completions: bool,
     /// `/v1/embeddings`.
     pub embeddings: bool,
-    /// `/v1/audio/transcriptions` (not routed by the coordinator).
+    /// `/v1/audio/transcriptions`.  The router picks only workers reporting
+    /// it; a worker whose Whisper model is not loaded answers `400` without it.
     pub transcriptions: bool,
     /// SSE streaming on the chat route.
     pub streaming: bool,
@@ -182,6 +194,7 @@ impl WorkerCapabilities {
             "/v1/chat/completions" => self.chat,
             "/v1/completions" => self.completions,
             "/v1/embeddings" => self.embeddings,
+            TRANSCRIPTIONS_PATH => self.transcriptions,
             _ => false,
         }
     }
@@ -790,12 +803,13 @@ impl Coordinator {
         slot: SlotGuard,
         path: &str,
         body: Bytes,
+        content_type: Option<HeaderValue>,
         log: RequestLog,
     ) -> Result<Response, Failure> {
         let w = &self.workers[slot.index];
         // Dropping the attempt on timeout drops its connection, which
         // cancels the work on the worker.
-        let attempt = self.first_output(w, path, body, &log);
+        let attempt = self.first_output(w, path, body, content_type.as_ref(), &log);
         let first = match self.config.response_timeout {
             Some(limit) => match tokio::time::timeout(limit, attempt).await {
                 Ok(first) => first,
@@ -860,12 +874,15 @@ impl Coordinator {
         w: &Worker,
         path: &str,
         body: Bytes,
+        content_type: Option<&HeaderValue>,
         log: &RequestLog,
     ) -> Result<FirstOutput, Failure> {
         let mut extra = HeaderMap::new();
         extra.insert(
             header::CONTENT_TYPE,
-            HeaderValue::from_static("application/json"),
+            content_type
+                .cloned()
+                .unwrap_or_else(|| HeaderValue::from_static("application/json")),
         );
         if let Ok(id) = HeaderValue::from_str(&log.request_id) {
             extra.insert(REQUEST_ID_HEADER, id);
@@ -1005,18 +1022,35 @@ impl Coordinator {
         body: Bytes,
     ) -> Response {
         let request_id = request_id_from(headers);
-        let model = match serde_json::from_slice::<Envelope>(&body) {
-            Ok(envelope) => envelope.model.filter(|m| !m.is_empty()),
-            Err(e) => {
-                return with_request_id(
-                    error_response(
-                        StatusCode::BAD_REQUEST,
-                        &format!("request body is not a valid JSON request: {e}"),
-                        "invalid_request_error",
-                        None,
-                    ),
-                    &request_id,
-                )
+        // A transcription upload is multipart, and the boundary lives in the
+        // client's `Content-Type`, not in the body.  The worker cannot parse
+        // the upload without it, so it is forwarded on that route.  Every
+        // other route is JSON with a fixed type (#157).
+        let content_type = if path == TRANSCRIPTIONS_PATH {
+            headers.get(header::CONTENT_TYPE).cloned()
+        } else {
+            None
+        };
+        let model = if path == TRANSCRIPTIONS_PATH {
+            // A transcription body is a multipart upload, not JSON, so there
+            // is no `model` field to read and no JSON to validate.  The
+            // worker's advertised `transcriptions` capability is the only
+            // routing constraint (#157).
+            None
+        } else {
+            match serde_json::from_slice::<Envelope>(&body) {
+                Ok(envelope) => envelope.model.filter(|m| !m.is_empty()),
+                Err(e) => {
+                    return with_request_id(
+                        error_response(
+                            StatusCode::BAD_REQUEST,
+                            &format!("request body is not a valid JSON request: {e}"),
+                            "invalid_request_error",
+                            None,
+                        ),
+                        &request_id,
+                    )
+                }
             }
         };
 
@@ -1060,7 +1094,10 @@ impl Coordinator {
                 queue_ms: arrived.elapsed().as_millis() as u64,
                 started: Instant::now(),
             };
-            match self.forward(slot, path, body.clone(), log).await {
+            match self
+                .forward(slot, path, body.clone(), content_type.clone(), log)
+                .await
+            {
                 Ok(response) | Err(Failure::Final(response)) => return response,
                 Err(Failure::Retry { reason, admission }) => {
                     tracing::warn!(

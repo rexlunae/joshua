@@ -76,6 +76,11 @@ struct Fake {
     dropped: AtomicBool,
     last_body: Mutex<Option<Bytes>>,
     last_request_id: Mutex<Option<String>>,
+    /// Whether the fake advertises `/v1/audio/transcriptions` (a real worker
+    /// does so only when a Whisper model is loaded).
+    transcriptions: AtomicBool,
+    /// The `Content-Type` of the last transcription upload.
+    last_content_type: Mutex<Option<String>>,
 }
 
 struct ActiveGuard(Arc<Fake>);
@@ -104,11 +109,31 @@ async fn fake_info(State(f): State<Arc<Fake>>) -> Json<WorkerInfo> {
             chat: true,
             completions: true,
             embeddings: true,
-            transcriptions: false,
+            transcriptions: f.transcriptions.load(Ordering::SeqCst),
             streaming: true,
             tools: true,
         },
     })
+}
+
+/// `POST /v1/audio/transcriptions` on a fake worker: record the raw upload
+/// and the `Content-Type` it arrived with, then answer like Whisper does.
+async fn fake_transcribe(
+    State(f): State<Arc<Fake>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    f.received.fetch_add(1, Ordering::SeqCst);
+    *f.last_body.lock().unwrap() = Some(body.clone());
+    *f.last_request_id.lock().unwrap() = headers
+        .get(REQUEST_ID_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    *f.last_content_type.lock().unwrap() = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    Json(json!({"text": format!("from {}", f.name), "worker": f.name})).into_response()
 }
 
 async fn fake_generate(
@@ -283,12 +308,15 @@ async fn spawn_fake_handle(
         dropped: AtomicBool::new(false),
         last_body: Mutex::new(None),
         last_request_id: Mutex::new(None),
+        transcriptions: AtomicBool::new(false),
+        last_content_type: Mutex::new(None),
     });
     let app = Router::new()
         .route("/v1/worker/info", get(fake_info))
         .route("/v1/chat/completions", post(fake_generate))
         .route("/v1/completions", post(fake_generate))
         .route("/v1/embeddings", post(fake_generate))
+        .route("/v1/audio/transcriptions", post(fake_transcribe))
         .with_state(Arc::clone(&fake));
     let (url, handle) = serve_app_handle(app).await;
     (fake, url, handle)
@@ -490,6 +518,65 @@ async fn routes_by_model_and_forwards_the_request_unchanged() {
     // Malformed JSON is rejected at the router.
     let res = call(&router, "POST", "/v1/chat/completions", "{nope").await;
     assert_eq!(res.status, StatusCode::BAD_REQUEST);
+}
+
+/// `POST /v1/audio/transcriptions` reaches only a worker that advertises
+/// Whisper, and the multipart upload is forwarded untouched, boundary and
+/// all (#157).
+#[tokio::test]
+async fn transcriptions_go_to_a_whisper_worker_with_the_upload_unchanged() {
+    let (plain, plain_url) = spawn_fake("a", "m", 4, Behavior::Echo).await;
+    let (whisper, whisper_url) = spawn_fake("w", "m", 4, Behavior::Echo).await;
+    whisper.transcriptions.store(true, Ordering::SeqCst);
+    let (_, router) = spawn_router(config(&[&plain_url, &whisper_url])).await;
+
+    let boundary = "----joshua-boundary-1234";
+    let content_type = format!("multipart/form-data; boundary={boundary}");
+    // A WAV-ish upload with a JSON-looking field and a `model` field: none of
+    // it may be parsed or rewritten by the router.
+    let body = format!(
+        "--{boundary}\r\n\
+         Content-Disposition: form-data; name=\"model\"\r\n\r\n\
+         whisper-1\r\n\
+         --{boundary}\r\n\
+         Content-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\n\
+         Content-Type: audio/wav\r\n\r\n\
+         RIFF\x00\x00\x00\x00WAVE\r\n\
+         --{boundary}--\r\n"
+    );
+    let mut sender = open(&router).await;
+    let mut req = request("POST", "/v1/audio/transcriptions", &body);
+    req.headers_mut()
+        .insert(header::CONTENT_TYPE, content_type.parse().unwrap());
+    let res = sender.send_request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.headers()[WORKER_HEADER], whisper_url.as_str());
+    let out: Value =
+        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(out["worker"], "w");
+    // The upload arrived byte for byte, with the client's boundary.
+    assert_eq!(
+        whisper.last_body.lock().unwrap().as_deref(),
+        Some(body.as_bytes())
+    );
+    assert_eq!(
+        whisper.last_content_type.lock().unwrap().as_deref(),
+        Some(content_type.as_str())
+    );
+    assert_eq!(plain.received.load(Ordering::SeqCst), 0);
+
+    // No worker advertises Whisper: a definite 503, not a bad request.
+    let (_, other_router) = spawn_router(config(&[&plain_url])).await;
+    let mut sender = open(&other_router).await;
+    let mut req = request("POST", "/v1/audio/transcriptions", &body);
+    req.headers_mut()
+        .insert(header::CONTENT_TYPE, content_type.parse().unwrap());
+    let res = sender.send_request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let out: Value =
+        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(out["error"]["code"], "no_worker");
+    assert_eq!(plain.received.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

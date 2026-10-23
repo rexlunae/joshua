@@ -54,7 +54,14 @@ On the router:
   in flight from this router and from other clients, last error.
 * `GET /health` — `200` while at least one worker is healthy, else `503`.
 
-`/v1/audio/transcriptions` is not routed.
+* `POST /v1/audio/transcriptions` — routed to a worker reporting the
+  `transcriptions` capability.  The upload is forwarded byte for byte
+  together with the client's `Content-Type` (the multipart boundary the
+  worker needs); the body is never parsed as JSON and no `model` field is
+  read, so the whole audio job runs on one worker.  A worker without a
+  loaded Whisper model does not advertise the capability and never receives
+  the request; with no such worker the router answers `503`
+  (`code: "no_worker"`).
 
 On each worker, `GET /v1/worker/info` (protocol version 1):
 
