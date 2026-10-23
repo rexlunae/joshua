@@ -297,6 +297,9 @@ const PARAMS_BYTES: usize = 2 << 20;
 const PARAM_SLOT: usize = 512;
 /// Launches recorded before a batch is submitted on its own.
 pub(super) const MAX_LAUNCHES: usize = 1024;
+// Expanded-weight scratch bounds weight memory; this bounds queued prefill
+// activations. Submission stays at the existing post-dispatch boundary.
+pub(super) const PREFILL_MAX_LAUNCHES: usize = 64;
 
 /// A device buffer that must outlive the batch that references it.
 pub struct Garbage {
@@ -325,6 +328,7 @@ pub struct Exec {
     fault_map: *mut u8,
     pub(super) recording: bool,
     launches: usize,
+    pub(super) batch_limit: usize,
     pub(super) garbage: Vec<Garbage>,
 }
 
@@ -392,6 +396,7 @@ impl Exec {
             fault_map,
             recording: false,
             launches: 0,
+            batch_limit: MAX_LAUNCHES,
             garbage: Vec::new(),
         })
     }
@@ -504,7 +509,7 @@ impl Exec {
         }
         self.launches += 1;
         note_native_exec();
-        Ok(self.launches >= MAX_LAUNCHES)
+        Ok(self.launches >= self.batch_limit)
     }
 }
 

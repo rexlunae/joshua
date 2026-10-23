@@ -10,6 +10,89 @@ through its existing Vulkan runtime. **Production does not use wgpu, link
 CubeCL, require its toolchain, import buffers, or create a second queue.**
 This standalone development crate remains outside Joshua's workspace.
 
+## Qwen batch-32 prefill OOM fix (2026-10-22)
+
+The failure was reproduced on unchanged `04d542d`: batched quantized GEMM
+(`m > 16`) retained a full f32 weight matrix for every queued operation. The
+last diagnostic sample had **11.87 GB of deferred buffers** plus the compact
+model. Sampled driver VRAM reached **17.06 GB**, followed by `ENOMEM` and
+`ERROR_DEVICE_LOST`.
+
+Batched GEMMs now reuse one growable dequantization scratch buffer. A mutex
+covers recording dequantization and GEMM across requests; existing compute
+barriers protect reuse. Grown buffers use normal deferred release, and
+scratch retires at explicit readback/flush. While scratch is active, the
+existing recorder submits after **64 dispatches**, bounding queued activations
+as well as expanded weights. Explicit readback restores the normal **1024**
+limit. There are **no allocator changes, pressure-triggered submissions,
+new copies, repacking, expanded weight cache, runtime or queue**. Prefill
+can submit more batches through the existing recorder; decode retains its
+normal batching and packed kernels. Shaders, strides and accumulation order
+are unchanged. The scratch binding covers its allocated capacity; existing N/K shader bounds retain each
+operation's logical matrix dimensions, including odd-width tiles.
+
+[The saved report](benchmarks/qwen-batch32-oom-b50-20261022.json) contains the
+failure, reference patch, commands, full-logit hashes, memory bounds and
+rejected diagnostics. The unmodified batch-32 program crashes, so the safe
+reference adds only a flush after each batched GEMM. The primary repair
+comparison uses the **same B50 production kernel selector** in both paths.
+These speedups are relative to that serialized workaround.
+
+Two sessions used the complete **126-token realistic chat prompt**, prefill
+batches **32/32/32/30**, and **128 identical decode inputs**, with 32 prompt
+tokens and two decode tokens warmed per process. No concurrent builds, GPU
+tests or profiles ran during timed forwards.
+
+| Measurement | OOM-safe production reference | Fixed production |
+| --- | ---: | ---: |
+| Median prefill | 10,171.55 ms | 9,637.71 ms |
+| Median decode | 187.276 ms/token | 183.352 ms/token |
+| Prefill + 128 decode | 34,142.94 ms | 33,106.82 ms |
+
+Every unchanged acceptance gate passes: **5.5% faster prefill**,
+**2.1% faster decode**, and **3.1% faster overall**. Every candidate
+decode/session sample beats every reference sample. All **19,599,744 logits
+are bit-identical**, maximum difference **0**, including both repeated
+sessions; the absolute gate remains **1e-5**. There are zero CPU fallbacks.
+Allocator trajectories match exactly, ending at **5,227,622,400 reserved /
+5,042,798,592 live bytes** each session. Driver VRAM endpoints are flat at
+**5,268,217,856 reference / 5,268,221,952 candidate bytes**, a 4 KiB difference
+within the unchanged 1 MiB gate. Private-memory session growth is **0 KiB**
+in both paths. A separate full-prompt/one-decode diagnostic samples peak
+VRAM at **5,536,657,408 bytes**, down from 17,064,996,864 bytes.
+
+The earlier three-format `cubecl` selector with generic Q6_K and the same
+serialized prefill workaround is **504.736 ms/token** versus
+**183.352 ms/token**, or **2.753x decode / 2.289x overall**.
+That existing kernel-set gate also passes. This repair adds no new kernel
+dispatch, adapter preference or prefill batching policy.
+
+Earlier pressure-triggered submission attempts were rejected: allocation-time
+submission drifted on DeepSeek, and moving it to GEMM entry passed short
+checks but failed full repeated Qwen parity by up to **0.003621**. They are
+absent from the final patch. Their failed gates remain in the report.
+
+Changing prefill from one row to 32 rows already changes reduction arithmetic:
+the safe reference differs from historical one-row prefill by up to
+**0.0002412796**. Cross-batch parity is not established. Acceptance compares
+the same batched arithmetic without relaxing **1e-5**.
+
+Validation includes the bounded-memory regression failing on unchanged
+source, **14 focused Candle Vulkan tests**, **7 native integration tests**
+(two timing tests ignored), and the release benchmark build. Tests cover
+queued scratch growth/reuse, odd widths, concurrent requests, allocation
+retaining prepared arguments, batching restoration, scratch release, and
+avoiding an Arc ownership cycle. Full-prompt/128-token production replays
+of Qwen one-row prefill and DeepSeek batched prefill reproduce all previous
+accepted logits; their device-memory trajectories do not increase. These
+are regression replays, not repeated DeepSeek performance acceptance.
+After preserving the concurrent benchmark-format/evaluator-gate commit, the
+integrated binary rebuilt successfully and another Qwen batch-32/128-token
+production replay matched the full-logit hash and allocator trajectory. The
+repeated acceptance measurements above retain their original artifact hashes.
+Raw results remain in
+`/home/tserica/benchmark-results/qwen-prefill-oom-20261022`.
+
 ## Full-model B50 acceptance (2026-10-22)
 
 Q6_K and grouped Q8_0 passed the full-model gates and are now included in the
@@ -49,10 +132,10 @@ on a roughly 74 GiB host and includes physical mmap I/O, not a 64 GiB host
 acceptance claim. The paths are serial separate processes, not interleaved
 passes, and HTTP serving/concurrent requests were not measured.
 
-Qwen's baseline 32-token prefill attempt failed with `ENOMEM` followed by
-`ERROR_DEVICE_LOST` (repeated while resuming the comparison tool). The
-successful Qwen comparison uses single-token prefill for the full prompt;
-this does not validate batched Qwen prefill. DeepSeek completed batches
+In this earlier evaluation, Qwen's baseline 32-token prefill failed with
+`ENOMEM` followed by `ERROR_DEVICE_LOST`. The successful comparison below
+uses single-token prefill for the full prompt; the subsequent batch-32 repair
+and evaluation are documented above. DeepSeek completed batches
 32/32/32/25. The failed baseline is retained in the report. No prefill policy
 or backend priority changed.
 
