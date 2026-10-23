@@ -18,6 +18,7 @@ enum Op {
     Rope,
     Matmul,
     RmsRowsFused,
+    RouterSelection,
 }
 #[derive(Parser)]
 struct Args {
@@ -47,6 +48,14 @@ struct Args {
     #[arg(long)]
     output: PathBuf,
 }
+fn fallbacks(dev: &Device) -> usize {
+    match dev {
+        Device::Vulkan(_) => candle_core::vulkan_backend::kernels::fallback_count(),
+        Device::Sycl(_) => candle_core::sycl_backend::fallback_count(),
+        Device::OpenCl(_) => candle_core::opencl_backend::fallback_count(),
+        _ => 0,
+    }
+}
 fn main() -> Result<()> {
     let a = Args::parse();
     std::fs::create_dir_all(&a.output)?;
@@ -72,6 +81,14 @@ fn main() -> Result<()> {
             _ => anyhow::bail!("unknown backend {backend}"),
         };
         let x = Tensor::from_vec(data.clone(), (data.len() / a.cols, a.cols), &dev)?;
+        let native = match &dev {
+            Device::Vulkan(_) => candle_core::vulkan_backend::kernels::native_enabled(),
+            Device::Sycl(_) => candle_core::sycl_backend::kernels::native_enabled(),
+            Device::OpenCl(_) => candle_core::opencl_backend::native_enabled(),
+            _ => true,
+        };
+        ensure!(native, "{backend}: native kernels are disabled");
+        let before_fallbacks = fallbacks(&dev);
         let weight = || -> Result<_> {
             let mut file = File::open(
                 a.model
@@ -95,6 +112,10 @@ fn main() -> Result<()> {
                 &Tensor::ones(a.cols, candle_core::DType::F32, &dev)?,
                 a.eps,
             )?,
+            Op::RouterSelection => {
+                let scores = joshua::moe::Gating::SqrtSoftplus.scores(&x)?;
+                scores.broadcast_add(&weight()?.dequantize(&dev)?.reshape((1, ()))?)?
+            }
             Op::Silu => candle_nn::ops::silu(&x)?,
             Op::Softmax => candle_nn::ops::softmax_last_dim(&x)?,
             Op::Cos => x.cos()?,
@@ -140,6 +161,11 @@ fn main() -> Result<()> {
         }
         .flatten_all()?
         .to_vec1::<f32>()?;
+        let cpu_fallbacks = fallbacks(&dev) - before_fallbacks;
+        ensure!(
+            cpu_fallbacks == 0,
+            "{backend}: {cpu_fallbacks} CPU fallbacks invalidate GPU arithmetic replay"
+        );
         ensure!(
             y.iter().all(|v| v.is_finite()),
             "{backend}: nonfinite output"
@@ -164,7 +190,7 @@ fn main() -> Result<()> {
             "{backend}: max_abs={max_abs:e} changed={changed}/{}",
             y.len()
         );
-        results.push(serde_json::json!({"backend":backend,"max_abs":max_abs,"different_bits":changed,"elements":y.len(),"absolute_1e_5":max_abs<=1e-5}));
+        results.push(serde_json::json!({"backend":backend,"max_abs":max_abs,"different_bits":changed,"elements":y.len(),"cpu_fallbacks":cpu_fallbacks,"absolute_1e_5":max_abs<=1e-5}));
     }
     let rhs_sha256 = a
         .rhs

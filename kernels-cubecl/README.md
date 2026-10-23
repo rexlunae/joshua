@@ -878,6 +878,17 @@ and normalization/transcendental rounding carried through cached prefill keys.
 The independent float64 checks cover tables and tiny-model outputs; a full
 float64 trace of the 290 GB real model was not generated.
 
+Further eight-token diagnostics isolate a prefill arithmetic transition at more
+than 16 rows and a router selection tie. Matching the GEMM reduction order makes
+the same-input batch-32 Q8 KV projection bit-identical. Native FP64 scalar RMS
+refinement then makes the first-layer cached keys and dot scores bit-identical;
+the first remaining difference is attention's exponential. These prototypes still
+fail end-to-end parity and were removed. At position 124, layer 3's CPU router
+selects expert 88 instead of 245: a large common bias rounds the selection pair
+to a tie, while independent float64 scoring of either captured input selects 245.
+The report retains these failures and source snapshots. Replay tooling now
+rejects CPU fallbacks, which invalidated an earlier unsupported GLSL shader trial.
+
 For diagnosis, set `JOSHUA_ACTIVATION_TRACE` to a fresh capture directory and
 optionally `JOSHUA_ACTIVATION_TRACE_LIMIT` (default 512). For a DeepSeek decode
 position, set `JOSHUA_ACTIVATION_TRACE_POSITION` to the absolute token offset.

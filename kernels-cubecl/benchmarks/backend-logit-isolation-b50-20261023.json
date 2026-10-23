@@ -4688,5 +4688,443 @@
       "driver_vram_growth_bytes": 1048576
     },
     "sycl_zero_allocator_counters": "Unavailable placeholders; driver/private memory, not zeros, determine eligibility"
+  },
+  "post_checkpoint_diagnostics": {
+    "raw_source_patch": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/post-checkpoint-arithmetic-experiments.patch",
+    "production_arithmetic_changes_retained": false,
+    "full_model_gate_or_auto_decision_changed": false,
+    "notes": [
+      "Opt-in CPU Q8 and 20480-wide HC arithmetic replay modes, fused HC RMS, CPU RoPE FMA and refined Vulkan scalar RMS were investigated and removed after failing strict model parity.",
+      "Vulkan quantized projections switch above 16 rows from 32-element dot/tree GEMV to sequential GEMM. Replaying this order makes the same-input batch-32 Q8 KV projection bit-identical.",
+      "The original precise-rms shader used unsupported GLSL precise syntax and fell back to CPU. Those results are invalid GPU arithmetic evidence. The initial fp64-rms literal was also rejected; trace-probe.log records that error. The corrected FP64 shader subsequently ran with zero CPU fallbacks.",
+      "Native FP64 scalar RMS refinement plus matching prefill order makes the first-layer cached keys and dot scores bit-identical; the next difference is the attention exponential, maximum 5.96046448e-8. Subsequent CPU and Vulkan reduction/elementwise differences still violate full-model parity.",
+      "At decode position 124 layer 3, CPU selected expert 88 instead of Vulkan expert 245. FP64 dot/scoring from either captured input selects 245; adding the large common router bias in FP32 collapses the CPU selection pair to a tie. No router bias normalization or routing change was enabled.",
+      "All captures and prototype timings are diagnostic, with some reused references and builds running concurrently. None are speed or memory certification."
+    ],
+    "trials": [
+      {
+        "name": "prefill-order",
+        "reference": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/precise-rms-native/eight-vulkan",
+        "candidate": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/prefill-order/eight-cpu",
+        "diagnostic_only": true,
+        "decode_tokens": 8,
+        "prefill_chunk": 32,
+        "same_executable": false,
+        "max_abs": 2.5459799766540527,
+        "per_logit_row_max_abs": [
+          2.8908252716064453e-05,
+          2.5987625122070312e-05,
+          2.3365020751953125e-05,
+          5.7220458984375e-05,
+          0.6334309577941895,
+          0.5734734535217285,
+          2.5459799766540527,
+          1.0600695312023163,
+          1.1449089050292969
+        ],
+        "absolute_1e_5": false,
+        "first_different_bits": {
+          "checkpoint": "00014-ds-k-all",
+          "label": "ds-k-all",
+          "shape": [
+            1,
+            128,
+            512
+          ],
+          "elements": 65536,
+          "different_bits": 9054,
+          "max_abs_finite": 4.76837158203125e-07,
+          "nonfinite_mismatch": false,
+          "absolute_1e_5": true
+        },
+        "first_exceeding_1e_5": {
+          "checkpoint": "00015-ds-dot-scores",
+          "label": "ds-dot-scores",
+          "shape": [
+            1,
+            64,
+            128
+          ],
+          "elements": 8192,
+          "different_bits": 1008,
+          "max_abs_finite": 4.57763671875e-05,
+          "nonfinite_mismatch": false,
+          "absolute_1e_5": false
+        },
+        "reference_cpu_fallbacks": {
+          "prefill": [
+            0
+          ],
+          "decode": [
+            0
+          ]
+        },
+        "performance_or_memory_qualification": false
+      },
+      {
+        "name": "moe-route",
+        "reference": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/moe-route/eight-vulkan",
+        "candidate": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/moe-route/eight-cpu",
+        "diagnostic_only": true,
+        "decode_tokens": 8,
+        "prefill_chunk": 32,
+        "same_executable": true,
+        "max_abs": 2.5459799766540527,
+        "per_logit_row_max_abs": [
+          2.8908252716064453e-05,
+          2.5987625122070312e-05,
+          2.3365020751953125e-05,
+          5.7220458984375e-05,
+          0.6334309577941895,
+          0.5734734535217285,
+          2.5459799766540527,
+          1.0600695312023163,
+          1.1449089050292969
+        ],
+        "absolute_1e_5": false,
+        "first_different_bits": {
+          "checkpoint": "00014-ds-k-all",
+          "label": "ds-k-all",
+          "shape": [
+            1,
+            128,
+            512
+          ],
+          "elements": 65536,
+          "different_bits": 9054,
+          "max_abs_finite": 4.76837158203125e-07,
+          "nonfinite_mismatch": false,
+          "absolute_1e_5": true
+        },
+        "first_exceeding_1e_5": {
+          "checkpoint": "00015-ds-dot-scores",
+          "label": "ds-dot-scores",
+          "shape": [
+            1,
+            64,
+            128
+          ],
+          "elements": 8192,
+          "different_bits": 1008,
+          "max_abs_finite": 4.57763671875e-05,
+          "nonfinite_mismatch": false,
+          "absolute_1e_5": false
+        },
+        "reference_cpu_fallbacks": {
+          "prefill": [
+            0
+          ],
+          "decode": [
+            0
+          ]
+        },
+        "performance_or_memory_qualification": false
+      },
+      {
+        "name": "fp64-rms",
+        "reference": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/fp64-rms/eight-vulkan",
+        "candidate": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/moe-route/eight-cpu",
+        "diagnostic_only": true,
+        "decode_tokens": 8,
+        "prefill_chunk": 32,
+        "same_executable": false,
+        "max_abs": 2.546006679534912,
+        "per_logit_row_max_abs": [
+          2.8252601623535156e-05,
+          1.9669532775878906e-05,
+          1.8358230590820312e-05,
+          3.4332275390625e-05,
+          0.6334309577941895,
+          0.5734786987304688,
+          2.546006679534912,
+          1.0600988566875458,
+          1.1449265480041504
+        ],
+        "absolute_1e_5": false,
+        "first_different_bits": {
+          "checkpoint": "00016-ds-exponential",
+          "label": "ds-exponential",
+          "shape": [
+            1,
+            64,
+            128
+          ],
+          "elements": 8192,
+          "different_bits": 5614,
+          "max_abs_finite": 5.960464477539063e-08,
+          "nonfinite_mismatch": false,
+          "absolute_1e_5": true
+        },
+        "first_exceeding_1e_5": {
+          "checkpoint": "00026-hc-projection",
+          "label": "hc-projection",
+          "shape": [
+            1,
+            24
+          ],
+          "elements": 24,
+          "different_bits": 15,
+          "max_abs_finite": 1.52587890625e-05,
+          "nonfinite_mismatch": false,
+          "absolute_1e_5": false
+        },
+        "reference_cpu_fallbacks": {
+          "prefill": [
+            0
+          ],
+          "decode": [
+            0
+          ]
+        },
+        "performance_or_memory_qualification": false
+      }
+    ],
+    "router_independent_f64": {
+      "vulkan": {
+        "f64_top8": [
+          249,
+          116,
+          201,
+          78,
+          271,
+          245,
+          88,
+          226
+        ],
+        "f64_margin": 2.0970239500428534e-06,
+        "f64_scores": [
+          11.174398388126749,
+          11.152993150704464,
+          11.143316188853023,
+          11.127788398965063,
+          11.119576844629751,
+          11.114837048866317,
+          11.114834951842367,
+          11.114763717895208
+        ],
+        "actual_logits_f64_scores_top8": [
+          249,
+          116,
+          201,
+          78,
+          271,
+          245,
+          88,
+          226
+        ],
+        "router_max_error": 1.3187283380844406e-05
+      },
+      "cpu": {
+        "f64_top8": [
+          249,
+          116,
+          201,
+          78,
+          271,
+          245,
+          88,
+          226
+        ],
+        "f64_margin": 2.0509142562019633e-06,
+        "f64_scores": [
+          11.17439839715529,
+          11.152993133057532,
+          11.143316173866172,
+          11.127788409736413,
+          11.119576894515923,
+          11.114837010858956,
+          11.1148349599447,
+          11.114763647324317
+        ],
+        "actual_logits_f64_scores_top8": [
+          249,
+          116,
+          201,
+          78,
+          271,
+          245,
+          88,
+          226
+        ],
+        "router_max_error": 1.750205529837956e-05
+      }
+    },
+    "micro_batch32_q8_kv": {
+      "op": "Projection",
+      "model": "/home/tserica/models/DSV41-REAP272E-balanced.gguf",
+      "weight": "blk.0.attn_kv.weight",
+      "cols": 5120,
+      "eps": 9.999999974752427e-07,
+      "input": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/precise-rms-native/repeated-input32.f32",
+      "input_sha256": "1f6af60cf5e0dbfec2a7f53dbce54a733a854ba56c7d2530153a3be5a6b7d36b",
+      "rhs": null,
+      "rhs_sha256": null,
+      "rope_dim": null,
+      "rope_theta": 10000.0,
+      "position": 0,
+      "reference_backend": "vulkan",
+      "runs": [
+        {
+          "backend": "vulkan",
+          "max_abs": 0.0,
+          "different_bits": 0,
+          "elements": 16384,
+          "cpu_fallbacks": 0,
+          "absolute_1e_5": true
+        },
+        {
+          "backend": "cpu",
+          "max_abs": 0.0,
+          "different_bits": 0,
+          "elements": 16384,
+          "cpu_fallbacks": 0,
+          "absolute_1e_5": true
+        }
+      ]
+    },
+    "micro_native_fp64_rms": {
+      "op": "Rms",
+      "model": "/home/tserica/models/DSV41-REAP272E-balanced.gguf",
+      "weight": "blk.0.attn_kv_a_norm.weight",
+      "cols": 512,
+      "eps": 9.999999682655225e-21,
+      "input": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/accurate-rope/short-vulkan/activations/00012-ds-kv-proj.f32",
+      "input_sha256": "04f34b2b6a8b51ba916867f4ee36d79ef8d211033fca42072628bf64defc5ea1",
+      "rhs": null,
+      "rhs_sha256": null,
+      "rope_dim": null,
+      "rope_theta": 10000.0,
+      "position": 0,
+      "reference_backend": "vulkan",
+      "runs": [
+        {
+          "backend": "vulkan",
+          "max_abs": 0.0,
+          "different_bits": 0,
+          "elements": 4096,
+          "cpu_fallbacks": 0,
+          "absolute_1e_5": true
+        },
+        {
+          "backend": "cpu",
+          "max_abs": 0.0,
+          "different_bits": 0,
+          "elements": 4096,
+          "cpu_fallbacks": 0,
+          "absolute_1e_5": true
+        }
+      ]
+    },
+    "invalid_gpu_trial": {
+      "path": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/precise-rms",
+      "reason": "GLSL precise qualifier rejected; CPU fallback invalidates GPU comparison"
+    },
+    "retained_tooling": [
+      "GPU arithmetic replay now rejects disabled native execution and CPU fallbacks.",
+      "Off-by-default DeepSeek activation tracing includes MoE input, logits, weights and selected experts."
+    ],
+    "native_router_selection_replay": {
+      "cpu": {
+        "score245": 11.114836692810059,
+        "score88": 11.114836692810059,
+        "exact_tie": true,
+        "summary": {
+          "op": "RouterSelection",
+          "model": "/home/tserica/models/DSV41-REAP272E-balanced.gguf",
+          "weight": "blk.3.exp_probs_b.bias",
+          "cols": 272,
+          "eps": 9.999999974752427e-07,
+          "input": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/moe-route/eight-cpu/activations/00125-ds-moe-logits.f32",
+          "input_sha256": "19f15a307fde8c18c7f5bb33c528550470b2711b73ec0a093d457c11ea933a4c",
+          "rhs": null,
+          "rhs_sha256": null,
+          "rope_dim": null,
+          "rope_theta": 10000.0,
+          "position": 0,
+          "reference_backend": "cpu",
+          "runs": [
+            {
+              "backend": "cpu",
+              "max_abs": 0.0,
+              "different_bits": 0,
+              "elements": 272,
+              "cpu_fallbacks": 0,
+              "absolute_1e_5": true
+            }
+          ]
+        }
+      },
+      "vulkan": {
+        "score245": 11.114837646484375,
+        "score88": 11.114836692810059,
+        "exact_tie": false,
+        "summary": {
+          "op": "RouterSelection",
+          "model": "/home/tserica/models/DSV41-REAP272E-balanced.gguf",
+          "weight": "blk.3.exp_probs_b.bias",
+          "cols": 272,
+          "eps": 9.999999974752427e-07,
+          "input": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/moe-route/eight-vulkan/activations/00125-ds-moe-logits.f32",
+          "input_sha256": "9992467cc476414671bbbeed17dad15171bba5ebdccfc506f35f9c4bb56ee3c8",
+          "rhs": null,
+          "rhs_sha256": null,
+          "rope_dim": null,
+          "rope_theta": 10000.0,
+          "position": 0,
+          "reference_backend": "vulkan",
+          "runs": [
+            {
+              "backend": "vulkan",
+              "max_abs": 0.0,
+              "different_bits": 0,
+              "elements": 272,
+              "cpu_fallbacks": 0,
+              "absolute_1e_5": true
+            }
+          ]
+        }
+      },
+      "disabled_native_rejected": true,
+      "binary_sha256": "b4b06ba2aff56b1d095f2966fd3cd4da05539345856e65df5995f7b4446235c6"
+    },
+    "verification": {
+      "rope_reference": "final-rope-reference.log: 1 passed; CPU/Vulkan/SYCL",
+      "deepseek41_reference": "final-deepseek41-reference.log: 8 passed, including independent float64 reference at 1e-5",
+      "replay_build": "final-numerics-build.log: succeeded",
+      "disabled_native_guard": "final-replay-guards/disabled-native.log: expected rejection",
+      "rope_replay": {
+        "op": "Rope",
+        "model": null,
+        "weight": null,
+        "cols": 512,
+        "eps": 9.999999974752427e-07,
+        "input": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/accurate-rope/short-vulkan/activations/00012-ds-kv-proj.f32",
+        "input_sha256": "04f34b2b6a8b51ba916867f4ee36d79ef8d211033fca42072628bf64defc5ea1",
+        "rhs": null,
+        "rhs_sha256": null,
+        "rope_dim": 64,
+        "rope_theta": 10000.0,
+        "position": 124,
+        "reference_backend": "vulkan",
+        "runs": [
+          {
+            "backend": "vulkan",
+            "max_abs": 0.0,
+            "different_bits": 0,
+            "elements": 4096,
+            "cpu_fallbacks": 0,
+            "absolute_1e_5": true
+          },
+          {
+            "backend": "cpu",
+            "max_abs": 1.4901161193847656e-08,
+            "different_bits": 118,
+            "elements": 4096,
+            "cpu_fallbacks": 0,
+            "absolute_1e_5": true
+          }
+        ]
+      }
+    }
   }
 }

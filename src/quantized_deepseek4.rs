@@ -2235,8 +2235,10 @@ impl Moe {
         let n_tokens = b * seq_len;
         let x2 = xs.reshape((n_tokens, h))?;
 
+        crate::activation_trace::record("ds-moe-input", &x2)?;
         let logits = x2.matmul(&self.gate_t)?; // [n_tokens, n_expert]
-                                               // sqrt(softplus(x)) scoring; bias shifts selection only.
+        crate::activation_trace::record("ds-moe-logits", &logits)?;
+        // sqrt(softplus(x)) scoring; bias shifts selection only.
         let probs = crate::moe::Gating::SqrtSoftplus.scores(&logits)?;
         let (weights, indices) = if self.hash {
             // Hash layers: expert *selection* comes from tid2eid[token_id], but the
@@ -2266,6 +2268,9 @@ impl Moe {
             )?;
             (weights, idx)
         };
+
+        crate::activation_trace::record("ds-moe-weights", &weights)?;
+        crate::activation_trace::record("ds-moe-indices", &indices)?;
 
         // A decode step (one token per sequence, batched or not) warms the
         // pool from its routing; a prefill only reads the pool.
