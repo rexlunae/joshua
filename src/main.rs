@@ -519,6 +519,14 @@ enum Commands {
         /// bytes; larger ones are answered with a 502.
         #[arg(long, default_value_t = joshua::coordinator::DEFAULT_MAX_RESPONSE_BYTES)]
         max_response_bytes: usize,
+        /// Serve HTTPS with this PEM certificate chain (needs --tls-key and
+        /// a build with the `tls` cargo feature).  Only the client-facing
+        /// hop is encrypted; worker connections stay plain HTTP.
+        #[arg(long, env = "JOSHUA_TLS_CERT", requires = "tls_key")]
+        tls_cert: Option<PathBuf>,
+        /// PEM private key for --tls-cert.
+        #[arg(long, env = "JOSHUA_TLS_KEY", requires = "tls_cert")]
+        tls_key: Option<PathBuf>,
     },
     /// Run a single chat completion and print the response.
     Run {
@@ -1001,8 +1009,16 @@ async fn main() -> anyhow::Result<()> {
             connect_timeout_ms,
             response_timeout_ms,
             max_response_bytes,
+            tls_cert,
+            tls_key,
         } => {
             use std::time::Duration;
+            #[cfg(not(feature = "tls"))]
+            if tls_cert.is_some() || tls_key.is_some() {
+                anyhow::bail!(
+                    "this build has no TLS support — rebuild with `cargo build --features tls`"
+                );
+            }
             let config = joshua::coordinator::CoordinatorConfig {
                 api_key,
                 worker_api_key,
@@ -1016,7 +1032,19 @@ async fn main() -> anyhow::Result<()> {
                 max_response_bytes,
                 ..joshua::coordinator::CoordinatorConfig::new(workers)
             };
-            joshua::coordinator::serve(config, &addr).await?;
+            match (tls_cert, tls_key) {
+                (Some(cert), Some(key)) => {
+                    #[cfg(feature = "tls")]
+                    joshua::coordinator::serve_tls(config, &addr, &cert, &key).await?;
+                    #[cfg(not(feature = "tls"))]
+                    {
+                        let _ = (cert, key, config);
+                        unreachable!("rejected above");
+                    }
+                }
+                // clap's `requires` rejects one flag without the other.
+                _ => joshua::coordinator::serve(config, &addr).await?,
+            }
         }
 
         Commands::Bench {

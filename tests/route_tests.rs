@@ -1354,3 +1354,162 @@ fn cancelled_embedding_stops_and_releases_the_permit() {
     );
     assert_eq!(vectors.len(), 2);
 }
+
+// ─── TLS (only with `cargo test --features tls`) ─────────────────────────────
+
+#[cfg(feature = "tls")]
+mod tls {
+    use super::*;
+    use joshua::rustls;
+
+    /// Self-signed ECDSA P-256 certificate for `localhost` / `127.0.0.1`,
+    /// valid for 100 years.  Test fixture only — the key is public.
+    const CERT_PEM: &str = "-----BEGIN CERTIFICATE-----
+MIIBpjCCAUugAwIBAgIUQtfwrB59vzm5SX8cDi9lvDDD3ZUwCgYIKoZIzj0EAwIw
+FDESMBAGA1UEAwwJbG9jYWxob3N0MCAXDTI2MDcwNzA0MzcxMFoYDzIxMjYwNjEz
+MDQzNzEwWjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjO
+PQMBBwNCAARZekIrwPUM1Wk7oq843hLDcXB7btwevAAgG105dwYP0yuZkqDAzaPJ
+A2jHb6cV4BcMkMIMtyb4dWcn+I8bcnwIo3kwdzAdBgNVHQ4EFgQUU+jI5KG2ZY85
+4lCBs3YuN/DTT/UwHwYDVR0jBBgwFoAUU+jI5KG2ZY854lCBs3YuN/DTT/UwGgYD
+VR0RBBMwEYIJbG9jYWxob3N0hwR/AAABMAwGA1UdEwEB/wQCMAAwCwYDVR0PBAQD
+AgeAMAoGCCqGSM49BAMCA0kAMEYCIQDIzu89kXXI3eb1SkPW2/qvW8H9r4BwGOp8
+ecN8+G8rbQIhAKTKCRCf+CmzDkexWKQMy/bbFL2HI1rFluCMgWE0ZGiB
+-----END CERTIFICATE-----
+";
+    const KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgPECih+wbHTjOIFNr
+x1PL8bSQJI9KVrDmHx7F+RjRKsGhRANCAARZekIrwPUM1Wk7oq843hLDcXB7btwe
+vAAgG105dwYP0yuZkqDAzaPJA2jHb6cV4BcMkMIMtyb4dWcn+I8bcnwI
+-----END PRIVATE KEY-----
+";
+
+    fn pem_to_der(pem: &str) -> Vec<u8> {
+        use base64::Engine as _;
+        let b64: String = pem
+            .lines()
+            .filter(|line| !line.starts_with("-----"))
+            .collect();
+        base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .expect("test PEM should decode")
+    }
+
+    /// One request over TLS to `127.0.0.1:port`, trusting only `CERT_PEM`.
+    fn tls_request(port: u16, request: &str) -> std::io::Result<String> {
+        use std::io::{Read, Write};
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(rustls::pki_types::CertificateDer::from(pem_to_der(
+                CERT_PEM,
+            )))
+            .unwrap();
+        let config = Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let sock = std::net::TcpStream::connect(("127.0.0.1", port))?;
+        sock.set_read_timeout(Some(Duration::from_secs(10)))?;
+        let conn = rustls::ClientConnection::new(config, server_name)
+            .map_err(std::io::Error::other)?;
+        let mut tls = rustls::StreamOwned::new(conn, sock);
+        tls.write_all(request.as_bytes())?;
+        tls.flush()?;
+        let mut buf = Vec::new();
+        tls.read_to_end(&mut buf)?;
+        Ok(String::from_utf8_lossy(&buf).into_owned())
+    }
+
+    /// `tls_request`, retried until the router's listener is up.
+    async fn request_until_up(port: u16, request: String) -> String {
+        for _ in 0..100 {
+            let request = request.clone();
+            let answer = tokio::task::spawn_blocking(move || tls_request(port, &request))
+                .await
+                .unwrap();
+            if let Ok(answer) = answer {
+                if !answer.is_empty() {
+                    return answer;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("router never answered over TLS");
+    }
+
+    /// `serve_tls` terminates TLS in-process: the same routes answer over
+    /// HTTPS, and the port does not serve them in the clear.
+    #[tokio::test]
+    async fn https_router_round_trip() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (_fake, worker, _handle) = spawn_fake_handle("w", "tiny", 2, Behavior::Echo).await;
+
+        let dir = common::model_dir("route-tls");
+        let cert_path = dir.join("cert.pem");
+        let key_path = dir.join("key.pem");
+        std::fs::write(&cert_path, CERT_PEM).unwrap();
+        std::fs::write(&key_path, KEY_PEM).unwrap();
+
+        // Racy in theory (the probe listener is dropped before the router
+        // rebinds) but reliable in a test process, as in server_tests.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let addr = format!("127.0.0.1:{port}");
+        let server = tokio::spawn({
+            let addr = addr.clone();
+            let cfg = config(&[&worker]);
+            let cert_path = cert_path.clone();
+            let key_path = key_path.clone();
+            async move { joshua::coordinator::serve_tls(cfg, &addr, &cert_path, &key_path).await }
+        });
+
+        let answer = request_until_up(
+            port,
+            "GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n".to_string(),
+        )
+        .await;
+        assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+        assert!(answer.contains("\"status\":\"ok\""), "{answer}");
+
+        // The routed chat request crosses the TLS hop and comes back with the
+        // worker's answer.
+        let body = json!({"model": "tiny", "messages": [{"role": "user", "content": "hi"}]});
+        let body = body.to_string();
+        let answer = request_until_up(
+            port,
+            format!(
+                "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\n\
+                 Content-Type: application/json\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n{body}",
+                body.len()
+            ),
+        )
+        .await;
+        assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+        assert!(answer.contains("tiny"), "worker answer missing: {answer}");
+
+        // A plaintext request to the TLS port gets nothing usable.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut plain = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        plain
+            .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = [0u8; 32];
+        let read = tokio::time::timeout(Duration::from_secs(2), plain.read(&mut buf)).await;
+        if let Ok(Ok(n)) = read {
+            assert!(
+                !String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200"),
+                "the TLS port served a plaintext request"
+            );
+        }
+
+        server.abort();
+    }
+}
+

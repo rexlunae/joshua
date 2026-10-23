@@ -623,7 +623,11 @@ answers `429` and a timed-out wait `503`, both with `Retry-After`.  Streams
 are forwarded event by event, in order; a request is retried on another
 worker only if it failed before any output, and a stream that has started is
 never restarted.  A client disconnect closes the worker connection, and the
-worker stops decoding.  `GET /v1/workers` shows the registry.  See
+worker stops decoding.  `GET /v1/workers` shows the registry.  Audio
+transcription uploads (`/v1/audio/transcriptions`) go to a worker that
+reports the capability.  With `--tls-cert`/`--tls-key` (and a
+`--features tls` build) the router serves HTTPS itself; worker connections
+stay plain HTTP.  See
 [docs/request-routing.md](docs/request-routing.md) for the protocol,
 admission and failure rules.
 
@@ -847,8 +851,8 @@ prints the dense/expert split of any GGUF to sanity-check a new model.
 | `JOSHUA_N_CTX` | Context window in tokens (same as `--n-ctx`, default 4096); requests may only narrow it |
 | `JOSHUA_API_KEY` | API key required on `/v1` routes (same as `--api-key`; comma-separated keys are all accepted) |
 | `JOSHUA_CORS_ORIGINS` | Comma-separated exact CORS origins (same as repeating `--cors-origin`; unset keeps permissive localhost development policy) |
-| `JOSHUA_TLS_CERT` | PEM certificate chain for HTTPS (same as `--tls-cert`; needs `--features tls`) |
-| `JOSHUA_TLS_KEY` | PEM private key for HTTPS (same as `--tls-key`) |
+| `JOSHUA_TLS_CERT` | PEM certificate chain for HTTPS (same as `--tls-cert` on `serve` and `route`; needs `--features tls`) |
+| `JOSHUA_TLS_KEY` | PEM private key for HTTPS (same as `--tls-key` on `serve` and `route`) |
 | `JOSHUA_LAZY_WEIGHTS` | Same as `--lazy-weights` |
 | `JOSHUA_PREFETCH_MODEL` | Same as `--prefetch-model` (`true`/`false`, or the flag with no value) |
 | `JOSHUA_PIN_HOT_WEIGHTS` | Same as `--pin-hot-weights` (`true`/`false`, or the flag with no value) |

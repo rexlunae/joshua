@@ -1452,9 +1452,9 @@ async fn list_workers(State(c): State<Arc<Coordinator>>) -> Json<serde_json::Val
     Json(json!({ "object": "list", "data": c.status_report() }))
 }
 
-/// Run a coordinator on `addr`: probe the workers once, keep probing in the
-/// background, and serve until the listener fails.
-pub async fn serve(config: CoordinatorConfig, addr: &str) -> std::io::Result<()> {
+/// Build the coordinator, probe the workers once, and start the background
+/// health loop.  The returned guard must live as long as the server.
+async fn startup(config: CoordinatorConfig) -> std::io::Result<(Arc<Coordinator>, AbortOnDrop)> {
     let coordinator = Coordinator::new(config)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     coordinator.refresh().await;
@@ -1467,10 +1467,50 @@ pub async fn serve(config: CoordinatorConfig, addr: &str) -> std::io::Result<()>
         "joshua route: {healthy}/{} workers healthy",
         coordinator.workers.len()
     );
-    let _health = AbortOnDrop(coordinator.spawn_health_loop());
+    let health = AbortOnDrop(coordinator.spawn_health_loop());
+    Ok((coordinator, health))
+}
+
+/// Run a coordinator on `addr`: probe the workers once, keep probing in the
+/// background, and serve until the listener fails.
+pub async fn serve(config: CoordinatorConfig, addr: &str) -> std::io::Result<()> {
+    let (coordinator, _health) = startup(config).await?;
     let listener = TcpListener::bind(addr).await?;
     tracing::info!("Joshua request router listening on http://{}", addr);
     axum::serve(listener, create_router(coordinator)).await
+}
+
+/// Run a coordinator over HTTPS (the `tls` cargo feature).
+///
+/// `cert` and `key` are paths to a PEM-encoded certificate chain and
+/// PKCS#8/RSA/SEC1 private key.  TLS is terminated in-process by rustls, so
+/// worker connections stay plain HTTP: this protects the client-facing hop,
+/// which is the one that crosses an untrusted network when the router is the
+/// only externally reachable process.  See docs/request-routing.md.
+#[cfg(feature = "tls")]
+pub async fn serve_tls(
+    config: CoordinatorConfig,
+    addr: &str,
+    cert: &std::path::Path,
+    key: &std::path::Path,
+) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+
+    // axum-server is built without a default crypto provider; install ring
+    // process-wide.  Err means a provider is already installed — fine.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let (coordinator, _health) = startup(config).await?;
+    let addr: SocketAddr = addr
+        .parse()
+        .map_err(|e| Error::new(ErrorKind::InvalidInput, format!("invalid address: {e}")))?;
+    // Read the key before binding, so a bad path fails without a half-open
+    // listener.
+    let config = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key).await?;
+    tracing::info!("Joshua request router listening on https://{}", addr);
+    axum_server::bind_rustls(addr, config)
+        .serve(create_router(coordinator).into_make_service())
+        .await
 }
 
 #[cfg(test)]

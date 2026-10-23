@@ -36,6 +36,8 @@ joshua route --worker 10.0.0.2:8081,10.0.0.3:8082 \
 | `--connect-timeout-ms` | 2000 | Connect timeout, and the whole-probe timeout. |
 | `--response-timeout-ms` | 600000 | Longest a dispatched request waits for the worker's first output (the whole JSON response, or the first stream event); `0` waits indefinitely. A joshua worker computes a completion before sending any of it, so this also bounds generation time: raise it for long CPU generations. |
 | `--max-response-bytes` | 67108864 (64 MiB) | Largest non-streaming worker response the router buffers. |
+| `--tls-cert` (`JOSHUA_TLS_CERT`) | none | Serve HTTPS with this PEM certificate chain; needs `--tls-key` and a build with `--features tls`. |
+| `--tls-key` (`JOSHUA_TLS_KEY`) | none | PEM private key for `--tls-cert`. |
 
 ## Endpoints
 
@@ -157,10 +159,32 @@ website opened on a machine that can reach the router cannot read its model
 output or worker status.  (`joshua serve` sends permissive CORS headers by
 default; set `--cors-origin` to restrict it to explicit browser origins.)
 
+## HTTPS
+
+The client-facing hop can be encrypted in-process, the same way as
+`joshua serve`:
+
+```bash
+joshua route --worker 10.0.0.2:8081,10.0.0.3:8082 --api-key client-key \
+  --tls-cert /etc/joshua/fullchain.pem --tls-key /etc/joshua/key.pem
+```
+
+`--tls-cert` takes a PEM certificate chain and `--tls-key` a PKCS#8/RSA/SEC1
+private key; both flags (or `JOSHUA_TLS_CERT`/`JOSHUA_TLS_KEY`) are required
+together, and the binary must be built with `--features tls`, which pulls in
+`rustls` + `axum-server` (ring provider).  Without the feature the router
+refuses to start rather than silently serving plain HTTP.
+
+TLS is terminated at the router, so *worker* connections stay plain HTTP: the
+router authenticates to them with `--worker-api-key`.  That means the
+router–worker network still has to be trusted (or tunnelled); encrypting it
+would need a TLS client in the router and is not implemented.
+
 ## Limits of this first version
 
 * Plain HTTP to workers (no TLS client); run workers on a trusted network or
-  behind a TLS-terminating tunnel.  The router itself serves plain HTTP.
+  behind a TLS-terminating tunnel.  The router itself serves plain HTTP
+  unless `--tls-cert`/`--tls-key` are given (see above).
 * Routing uses model id, slots and reported in-flight count.  It does not
   estimate per-request work (prompt length, `max_tokens`), check a
   request's length against a worker's `n_ctx`, compare tokenizers beyond the
