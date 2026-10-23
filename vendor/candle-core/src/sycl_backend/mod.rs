@@ -6,6 +6,7 @@
 #![allow(clippy::missing_safety_doc)]
 mod bridge;
 pub mod kernels;
+pub mod mega;
 pub use kernels::{fallback_count, native_enabled, native_exec_count};
 use crate::backend::{BackendDevice, BackendStorage};
 use crate::op::{BinaryOpT, CmpOp, ReduceOp, UnaryOpT};

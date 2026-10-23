@@ -911,6 +911,12 @@ impl QTensor {
         })
     }
 
+    /// The block storage (backend kernels outside this module, e.g. the
+    /// SYCL decode megakernel, address the weights directly).
+    pub fn storage(&self) -> &QStorage {
+        &self.storage
+    }
+
     pub fn dtype(&self) -> GgmlDType {
         self.storage.dtype()
     }

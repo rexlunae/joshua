@@ -484,3 +484,201 @@ fn architecture_speculative_map_covers_every_name() {
         }
     }
 }
+
+// ─── Draft-model speculative decoding ───────────────────────────────────────
+
+fn draft_engine(dir: &Path, draft: &Path, draft_max: usize) -> Engine {
+    // The cost gate is off so every step drafts, whatever the timings.
+    let gate_off = SpeculativeConfig {
+        cost_gate: false,
+        ..SpeculativeConfig::default()
+    };
+    Engine::with_options(
+        dir,
+        EngineOptions::with_n_ctx(128)
+            .speculative(Some(gate_off))
+            .draft_model(Some(draft.to_path_buf()))
+            .draft_max(draft_max),
+    )
+    .expect("engine should load tiny model with a draft model")
+}
+
+/// Greedy draft-model decoding must be token-for-token identical to plain
+/// decoding, including a follow-up turn that continues the pooled target and
+/// draft caches.  `expect_rejections` asserts the rollback path ran.
+fn check_draft_model_equivalence(dir: &Path, draft: &Path, expect_rejections: bool) {
+    let plain = engine(dir, None);
+    let spec = draft_engine(dir, draft, 4);
+    for prompt in ["a b c d e f", "hello world k j i", "a a a a"] {
+        let (want, want_usage, _, _) = plain.complete_raw(prompt, &greedy(24)).unwrap();
+        let (got, got_usage, _, _) = spec.complete_raw(prompt, &greedy(24)).unwrap();
+        assert_eq!(got, want, "draft-model output diverged from plain decoding on {prompt:?}");
+        assert_eq!(got_usage.completion_tokens, want_usage.completion_tokens);
+
+        let follow = format!("{prompt} {got} c d");
+        let (want2, _, _, _) = plain.complete_raw(&follow, &greedy(16)).unwrap();
+        let (got2, _, _, _) = spec.complete_raw(&follow, &greedy(16)).unwrap();
+        assert_eq!(got2, want2, "follow-up diverged after draft-model decoding");
+    }
+    let stats = spec.speculative_stats();
+    assert!(stats.drafted > 0, "nothing was drafted: {stats:?}");
+    assert!(stats.verify_steps > 0);
+    if expect_rejections {
+        assert!(stats.accepted < stats.drafted, "nothing was rejected: {stats:?}");
+    } else {
+        assert_eq!(stats.accepted, stats.drafted, "a self-draft must always be accepted");
+    }
+}
+
+#[test]
+fn draft_model_greedy_matches_plain_decoding_qwen3moe() {
+    let dir = common::model_dir("draft-qwen3moe");
+    common::write_tiny_qwen3moe_gguf(&dir.join("model.gguf"));
+    let draft_dir = common::model_dir("draft-qwen3moe-draft");
+    let draft = draft_dir.join("draft.gguf");
+    common::write_tiny_qwen_gguf(&draft, "qwen3");
+    check_draft_model_equivalence(&dir, &draft, true);
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(&draft_dir).ok();
+}
+
+#[test]
+fn draft_model_greedy_matches_plain_decoding_deepseek2() {
+    let dir = common::model_dir("draft-deepseek2");
+    common::write_tiny_deepseek2_gguf(&dir.join("model.gguf"));
+    let draft_dir = common::model_dir("draft-deepseek2-draft");
+    let draft = draft_dir.join("draft.gguf");
+    common::write_tiny_qwen_gguf(&draft, "qwen3");
+    check_draft_model_equivalence(&dir, &draft, true);
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(&draft_dir).ok();
+}
+
+#[test]
+fn self_draft_is_always_accepted() {
+    // The target drafting for itself predicts every token exactly.
+    let dir = common::model_dir("draft-self");
+    let model = dir.join("model.gguf");
+    common::write_tiny_qwen3moe_gguf(&model);
+    check_draft_model_equivalence(&dir, &model, false);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn draft_model_sampling_matches_plain_sampling_distribution() {
+    // Over many seeds, the tokens a sampled draft-model run emits after the
+    // first (the first comes straight from the prefill logits) must be
+    // distributed as plain sampling's.  Each run emits 3 tokens; compare the
+    // per-position token histograms.  The low temperature sharpens the tiny
+    // fixtures' near-flat logits until target and draft disagree: accepting
+    // every draft instead of verifying it moves position 1's top token from
+    // ~0.77 to ~0.92, which this check catches.
+    let dir = common::model_dir("draft-sampled");
+    common::write_tiny_qwen3moe_gguf(&dir.join("model.gguf"));
+    let draft_dir = common::model_dir("draft-sampled-draft");
+    let draft = draft_dir.join("draft.gguf");
+    common::write_tiny_qwen_gguf(&draft, "qwen3");
+    let plain = engine(&dir, None);
+    let spec = draft_engine(&dir, &draft, 3);
+    // The fixture's word-level tokenizer decodes token by token with no
+    // separator; its multi-letter words contain letters that are not tokens
+    // of their own, so the text splits back into ids unambiguously.
+    let vocab = [
+        "<unk>", "hello", "world", "</s>", "a", "b", "c", "d", "e", "f", "g", "h", "i", "j",
+        "k", "l",
+    ];
+    let split = |mut text: &str| {
+        let mut ids = Vec::new();
+        while !text.is_empty() {
+            let (id, word) = vocab
+                .iter()
+                .enumerate()
+                .filter(|(_, w)| text.starts_with(**w))
+                .max_by_key(|(_, w)| w.len())
+                .unwrap_or_else(|| panic!("cannot split {text:?}"));
+            ids.push(id);
+            text = &text[word.len()..];
+        }
+        ids
+    };
+
+    let runs = 600u64;
+    let histogram = |engine: &Engine, seed_base: u64| {
+        let mut counts = vec![[0usize; 16]; 3];
+        for i in 0..runs {
+            let options = GenerationOptions {
+                max_tokens: 3,
+                temperature: 0.03,
+                seed: Some(seed_base + i),
+                ..GenerationOptions::default()
+            };
+            let (text, _, _, _) = engine.complete_raw("a b c", &options).unwrap();
+            for (pos, id) in split(&text).into_iter().take(3).enumerate() {
+                counts[pos][id] += 1;
+            }
+        }
+        counts
+    };
+    let want = histogram(&plain, 1_000);
+    let got = histogram(&spec, 50_000);
+    let stats = spec.speculative_stats();
+    assert!(stats.drafted > 0, "nothing was drafted: {stats:?}");
+    for pos in 0..3 {
+        for t in 0..16 {
+            let (a, b) = (want[pos][t] as f64 / runs as f64, got[pos][t] as f64 / runs as f64);
+            // ~5 standard deviations of a 600-sample frequency difference.
+            let sd = ((a * (1.0 - a) + b * (1.0 - b)) / runs as f64).sqrt();
+            assert!(
+                (a - b).abs() <= 5.0 * sd + 0.02,
+                "position {pos} token {t}: plain {a:.3} vs draft-model {b:.3}"
+            );
+        }
+    }
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(&draft_dir).ok();
+}
+
+#[test]
+fn draft_model_on_a_stock_loader_is_refused() {
+    let dir = common::model_dir("draft-refused");
+    common::write_tiny_qwen3moe_gguf(&dir.join("model.gguf"));
+    let draft_dir = common::model_dir("draft-refused-draft");
+    let draft = draft_dir.join("draft.gguf");
+    common::write_tiny_llama_gguf(&draft);
+    let err = Engine::with_options(
+        &dir,
+        EngineOptions::with_n_ctx(128).draft_model(Some(draft.clone())),
+    )
+    .err()
+    .expect("a llama draft model cannot cut its KV cache back");
+    assert!(err.to_string().contains("draft model"), "{err}");
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(&draft_dir).ok();
+}
+
+#[test]
+fn sampled_self_draft_matches_plain_token_for_token() {
+    // Accepted drafts advance the verification position; emitting a later
+    // draft must still be checked against the target's draw for *its* position,
+    // not one shifted by the number of earlier acceptances.  A self-draft at a
+    // non-zero temperature exercises that with a fixed seed.
+    let dir = common::model_dir("draft-sampled-exact");
+    let model = dir.join("model.gguf");
+    common::write_tiny_qwen3moe_gguf(&model);
+    let plain = engine(&dir, None);
+    let spec = draft_engine(&dir, &model, 4);
+    for seed in 1..=24u64 {
+        let options = GenerationOptions {
+            max_tokens: 8,
+            temperature: 0.8,
+            seed: Some(seed),
+            ..GenerationOptions::default()
+        };
+        let (want, _, _, _) = plain.complete_raw("a b c", &options).unwrap();
+        let (got, _, _, _) = spec.complete_raw("a b c", &options).unwrap();
+        assert_eq!(got, want, "seed {seed}: sampled self-draft diverged from plain decoding");
+    }
+    let stats = spec.speculative_stats();
+    assert!(stats.drafted > 0, "nothing was drafted: {stats:?}");
+    std::fs::remove_dir_all(&dir).ok();
+}
