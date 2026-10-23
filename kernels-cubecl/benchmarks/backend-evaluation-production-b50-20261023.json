@@ -1,0 +1,1823 @@
+{
+  "date": "2026-10-23",
+  "source_manifest": {
+    "git_head": "9a4a9d6b5d14c5867aa00fa544c39ba7c820be06",
+    "features": [
+      "vulkan",
+      "opencl",
+      "sycl"
+    ],
+    "binary_sha256": "d70b8a10490a3b22af2293c0a417a4ec30a9413b1167c57b1d50c5b0e6adfc87",
+    "sycl_bridge_sha256": "400c4d2d13e1ab7f6db6b747f456e7ba5890b3257c028b4468a6df69ad311457",
+    "sycl_runtime_sha256": "07fe6d52f3350f6e30f4bdcdf3c7def120736dbe440e046e51ab3df9fd166055",
+    "environment": {
+      "RUST_LOG": "warn",
+      "JOSHUA_SYCL_LIBRARY": "/home/tserica/benchmark-results/backends-production-b50-20261023/libjoshua_sycl.so",
+      "JOSHUA_SYCL_RUNTIME": "/opt/intel/oneapi/compiler/latest/lib/libsycl.so.9",
+      "JOSHUA_VULKAN_QGEMV": null,
+      "JOSHUA_MEGAKERNEL": null,
+      "JOSHUA_SKIP_PLACEMENT_BENCH": null,
+      "OMP_NUM_THREADS": null,
+      "RAYON_NUM_THREADS": null,
+      "MKL_NUM_THREADS": null,
+      "ONEAPI_DEVICE_SELECTOR": null,
+      "SYCL_DEVICE_FILTER": null
+    },
+    "source_sha256": {
+      "kernels-cubecl/benchmarks/evaluate_backends.py": "8d497cc9ba4ce868fa0fb3f336dc2d7b82a0fb06065b2a9f642f7343ca6f338a",
+      "kernels-cubecl/benchmarks/compare_backends.py": "9b9e2a8221491c96325385eadc07aac77accc0903454df6b0de300a0e07c0caf",
+      "examples/bench_cubecl_real.rs": "335e2c057744f572a8d1018a57e0feb02acc21978d55c75383e2b4acdbca4eb2",
+      "src/engine.rs": "40e7b178a1c43fdf180f41b54fadcbcbf29fe9ea5be4d872e886a4cda231b586",
+      "src/auto_placement.rs": "7c2809593e0928b8b517f15ca92ecf660fa00ec274683e747ed3eb59e094e5a5",
+      "vendor/candle-core/src/vulkan_backend/kernels.rs": "a92b68250688d849fe89c0bad52356581a2f8faee910016e218a35397e7f722a",
+      "vendor/candle-core/src/sycl_backend/bridge.cpp": "d22fefd9895348c30fed9296582b2ec2dd35ab4e7cafd364cb0fb6ed358dda55",
+      "vendor/candle-core/src/sycl_backend/mega.hpp": "4ec99d9ac598774e9b5d9a8b7836c4ef8df7c6e3e03ee421777db2f190c1bacb"
+    }
+  },
+  "raw_results_directory": "/home/tserica/benchmark-results/backends-production-b50-20261023",
+  "reference_policy": "Fixed-placement Vulkan with CubeClProduction; all candidates replay the same complete prompt and 128 decode inputs, with two measured sessions.",
+  "policy_definition": "fixed: dense on requested backend, compact CPU-mmap DeepSeek experts, no expert cache; auto: requested backend with Engine automatic dense/expert/cache placement. Overall Auto uses OpenCL first with this feature build.",
+  "protocol": {
+    "prefill_chunk": 32,
+    "decode_tokens": 128,
+    "passes": 2,
+    "qwen_prompt_tokens": 126,
+    "qwen_warm_prompt_tokens": 32,
+    "deepseek_prompt_tokens": 121,
+    "deepseek_warm_prompt_tokens": 8,
+    "warm_decode": 2
+  },
+  "models": {
+    "qwen": {
+      "reference": "/home/tserica/benchmark-results/backends-production-b50-20261023/qwen/vulkan-fixed",
+      "reference_logits_sha256": "6dc8975c3f955815fdbb88c4488bb37deced0ffcea5fb052b2b7f0e4b7c87c88",
+      "comparison_tolerance": 1e-05,
+      "runs": [
+        {
+          "backend": "vulkan",
+          "auto_placement": false,
+          "bit_identical": true,
+          "max_abs_logit_difference": 0.0,
+          "rms_logit_difference": 0.0,
+          "matching_top1_rows": 129,
+          "logits_compared": 19599744,
+          "decode_speedup_vs_reference": 1.0,
+          "prefill_median_ms": 9577.195574000001,
+          "session_median_ms": 33246.8009665,
+          "session_speedup_vs_reference": 1.0,
+          "private_growth_kib": 0,
+          "peak_driver_vram_bytes": 5268217856,
+          "decode_endpoint_driver_vram_bytes": [
+            5268217856,
+            5268217856
+          ],
+          "driver_vram_growth_bytes": 0,
+          "gates": {
+            "same_executable": true,
+            "absolute_logits_1e_5": true,
+            "repeat_logits_1e_5": true,
+            "reference_repeat_logits_1e_5": true,
+            "repeated_sessions_measured": true,
+            "reference_repeated_sessions_measured": true,
+            "reference_private_memory_growth_le_1MiB": true,
+            "same_greedy_choices": true,
+            "private_memory_growth_le_1MiB": true,
+            "device_memory_stable": true,
+            "reference_memory_stable": true,
+            "no_cpu_fallbacks": true
+          },
+          "eligible_for_auto": true,
+          "performance_gates": {
+            "all_decode_samples_faster": false,
+            "all_session_samples_faster": false
+          },
+          "eligible_for_auto_preference": false,
+          "model": "/home/tserica/models/qwen3-dense/Qwen3-8B-Q4_K_M.gguf",
+          "gpu": "Intel(R) Arc(tm) Pro B50 Graphics (BMG G21)",
+          "executable_sha256": "d70b8a10490a3b22af2293c0a417a4ec30a9413b1167c57b1d50c5b0e6adfc87",
+          "dispatch": "CubeClProduction",
+          "dense_device": "Intel(R) Arc(tm) Pro B50 Graphics (BMG G21)",
+          "expert_device": "Intel(R) Arc(tm) Pro B50 Graphics (BMG G21)",
+          "expert_cache_budget_bytes": null,
+          "expert_cache_report": null,
+          "loaded_reserved_live": [
+            5227622400,
+            5042798592
+          ],
+          "peak_reserved_live": [
+            5227622400,
+            5118296584
+          ],
+          "after_session_reserved_live": [
+            [
+              5227622400,
+              5042798592
+            ],
+            [
+              5227622400,
+              5042798592
+            ]
+          ],
+          "allocator_stats_available": true,
+          "max_repeat_logit_difference": 0.0,
+          "median_ms_per_token": 184.9187921289062,
+          "ms_per_token": [
+            179.50656928906244,
+            190.33101496874997
+          ],
+          "prefill_ms": [
+            9433.875626000001,
+            9720.515522
+          ],
+          "prefill_cpu_fallbacks": [
+            0,
+            0
+          ],
+          "decode_cpu_fallbacks": [
+            0,
+            0
+          ],
+          "private_endpoints_kib": [
+            167440,
+            167440
+          ],
+          "full_logits_sha256": "6dc8975c3f955815fdbb88c4488bb37deced0ffcea5fb052b2b7f0e4b7c87c88",
+          "failed_gates": [
+            "all_decode_samples_faster",
+            "all_session_samples_faster"
+          ],
+          "private_endpoint_delta_kib": 0,
+          "private_endpoint_span_kib": 0,
+          "physical_read_bytes_per_session": [
+            0,
+            0
+          ],
+          "after_session_expert_cache_reports": [
+            null,
+            null
+          ]
+        },
+        {
+          "backend": "cpu",
+          "auto_placement": false,
+          "bit_identical": false,
+          "max_abs_logit_difference": 0.00046825408935546875,
+          "rms_logit_difference": 3.230119460597598e-05,
+          "matching_top1_rows": 129,
+          "logits_compared": 19599744,
+          "decode_speedup_vs_reference": 1.133176257121102,
+          "prefill_median_ms": 2546.034374,
+          "session_median_ms": 23433.875293499987,
+          "session_speedup_vs_reference": 1.4187495900740708,
+          "private_growth_kib": 24,
+          "peak_driver_vram_bytes": null,
+          "decode_endpoint_driver_vram_bytes": null,
+          "driver_vram_growth_bytes": 0,
+          "gates": {
+            "same_executable": true,
+            "absolute_logits_1e_5": false,
+            "repeat_logits_1e_5": true,
+            "reference_repeat_logits_1e_5": true,
+            "repeated_sessions_measured": true,
+            "reference_repeated_sessions_measured": true,
+            "reference_private_memory_growth_le_1MiB": true,
+            "same_greedy_choices": true,
+            "private_memory_growth_le_1MiB": true,
+            "device_memory_stable": true,
+            "reference_memory_stable": true,
+            "no_cpu_fallbacks": true
+          },
+          "eligible_for_auto": false,
+          "performance_gates": {
+            "all_decode_samples_faster": true,
+            "all_session_samples_faster": true
+          },
+          "eligible_for_auto_preference": false,
+          "model": "/home/tserica/models/qwen3-dense/Qwen3-8B-Q4_K_M.gguf",
+          "gpu": "CPU",
+          "executable_sha256": "d70b8a10490a3b22af2293c0a417a4ec30a9413b1167c57b1d50c5b0e6adfc87",
+          "dispatch": "backend-native",
+          "dense_device": "CPU",
+          "expert_device": "CPU",
+          "expert_cache_budget_bytes": null,
+          "expert_cache_report": null,
+          "loaded_reserved_live": [
+            0,
+            0
+          ],
+          "peak_reserved_live": [
+            0,
+            0
+          ],
+          "after_session_reserved_live": [
+            [
+              0,
+              0
+            ],
+            [
+              0,
+              0
+            ]
+          ],
+          "allocator_stats_available": false,
+          "max_repeat_logit_difference": 0.0,
+          "median_ms_per_token": 163.18625718359368,
+          "ms_per_token": [
+            163.30826389843747,
+            163.06425046874986
+          ],
+          "prefill_ms": [
+            2535.646663,
+            2556.4220849999997
+          ],
+          "prefill_cpu_fallbacks": [
+            0,
+            0
+          ],
+          "decode_cpu_fallbacks": [
+            0,
+            0
+          ],
+          "private_endpoints_kib": [
+            202092,
+            202116
+          ],
+          "full_logits_sha256": "d7b2d80cc46e4c2614f999da70300e2a1fc34cdb214296b8cb598ec4497ae4f8",
+          "failed_gates": [
+            "absolute_logits_1e_5"
+          ],
+          "private_endpoint_delta_kib": 24,
+          "private_endpoint_span_kib": 24,
+          "physical_read_bytes_per_session": [
+            0,
+            0
+          ],
+          "after_session_expert_cache_reports": [
+            null,
+            null
+          ]
+        },
+        {
+          "backend": "opencl",
+          "auto_placement": false,
+          "bit_identical": false,
+          "max_abs_logit_difference": 0.0004730224609375,
+          "rms_logit_difference": 3.3549711797443544e-05,
+          "matching_top1_rows": 129,
+          "logits_compared": 19599744,
+          "decode_speedup_vs_reference": 0.9480165524275551,
+          "prefill_median_ms": 3907.5123405,
+          "session_median_ms": 28875.014576499998,
+          "session_speedup_vs_reference": 1.1514037812316116,
+          "private_growth_kib": 0,
+          "peak_driver_vram_bytes": 6029336576,
+          "decode_endpoint_driver_vram_bytes": [
+            5990330368,
+            5990404096
+          ],
+          "driver_vram_growth_bytes": 73728,
+          "gates": {
+            "same_executable": true,
+            "absolute_logits_1e_5": false,
+            "repeat_logits_1e_5": true,
+            "reference_repeat_logits_1e_5": true,
+            "repeated_sessions_measured": true,
+            "reference_repeated_sessions_measured": true,
+            "reference_private_memory_growth_le_1MiB": true,
+            "same_greedy_choices": true,
+            "private_memory_growth_le_1MiB": true,
+            "device_memory_stable": true,
+            "reference_memory_stable": true,
+            "no_cpu_fallbacks": true
+          },
+          "eligible_for_auto": false,
+          "performance_gates": {
+            "all_decode_samples_faster": false,
+            "all_session_samples_faster": true
+          },
+          "eligible_for_auto_preference": false,
+          "model": "/home/tserica/models/qwen3-dense/Qwen3-8B-Q4_K_M.gguf",
+          "gpu": "Intel(R) Arc(TM) Pro B50 Graphics",
+          "executable_sha256": "d70b8a10490a3b22af2293c0a417a4ec30a9413b1167c57b1d50c5b0e6adfc87",
+          "dispatch": "backend-native",
+          "dense_device": "Intel(R) Arc(TM) Pro B50 Graphics",
+          "expert_device": "Intel(R) Arc(TM) Pro B50 Graphics",
+          "expert_cache_budget_bytes": null,
+          "expert_cache_report": null,
+          "loaded_reserved_live": [
+            0,
+            0
+          ],
+          "peak_reserved_live": [
+            0,
+            0
+          ],
+          "after_session_reserved_live": [
+            [
+              0,
+              0
+            ],
+            [
+              0,
+              0
+            ]
+          ],
+          "allocator_stats_available": false,
+          "max_repeat_logit_difference": 0.0,
+          "median_ms_per_token": 195.05861121875,
+          "ms_per_token": [
+            192.269113796875,
+            197.848108640625
+          ],
+          "prefill_ms": [
+            3898.095281,
+            3916.9294
+          ],
+          "prefill_cpu_fallbacks": [
+            0,
+            0
+          ],
+          "decode_cpu_fallbacks": [
+            0,
+            0
+          ],
+          "private_endpoints_kib": [
+            208004,
+            208004
+          ],
+          "full_logits_sha256": "c7a3a39534a13b7b8291e4c24a7aad03cd85dfe7e79186f26ec5ced5396503cd",
+          "failed_gates": [
+            "absolute_logits_1e_5",
+            "all_decode_samples_faster"
+          ],
+          "private_endpoint_delta_kib": 0,
+          "private_endpoint_span_kib": 0,
+          "physical_read_bytes_per_session": [
+            131072,
+            0
+          ],
+          "after_session_expert_cache_reports": [
+            null,
+            null
+          ]
+        },
+        {
+          "backend": "sycl",
+          "auto_placement": false,
+          "bit_identical": false,
+          "max_abs_logit_difference": 0.00020265579223632812,
+          "rms_logit_difference": 5.45715559629535e-06,
+          "matching_top1_rows": 129,
+          "logits_compared": 19599744,
+          "decode_speedup_vs_reference": 1.2612724542369858,
+          "prefill_median_ms": 3691.246355,
+          "session_median_ms": 22457.695517499997,
+          "session_speedup_vs_reference": 1.4804190813163653,
+          "private_growth_kib": 8,
+          "peak_driver_vram_bytes": 5800763392,
+          "decode_endpoint_driver_vram_bytes": [
+            5668802560,
+            5666705408
+          ],
+          "driver_vram_growth_bytes": 0,
+          "gates": {
+            "same_executable": true,
+            "absolute_logits_1e_5": false,
+            "repeat_logits_1e_5": true,
+            "reference_repeat_logits_1e_5": true,
+            "repeated_sessions_measured": true,
+            "reference_repeated_sessions_measured": true,
+            "reference_private_memory_growth_le_1MiB": true,
+            "same_greedy_choices": true,
+            "private_memory_growth_le_1MiB": true,
+            "device_memory_stable": true,
+            "reference_memory_stable": true,
+            "no_cpu_fallbacks": true
+          },
+          "eligible_for_auto": false,
+          "performance_gates": {
+            "all_decode_samples_faster": true,
+            "all_session_samples_faster": true
+          },
+          "eligible_for_auto_preference": false,
+          "model": "/home/tserica/models/qwen3-dense/Qwen3-8B-Q4_K_M.gguf",
+          "gpu": "Intel(R) Arc(TM) Pro B50 Graphics",
+          "executable_sha256": "d70b8a10490a3b22af2293c0a417a4ec30a9413b1167c57b1d50c5b0e6adfc87",
+          "dispatch": "backend-native",
+          "dense_device": "Intel(R) Arc(TM) Pro B50 Graphics",
+          "expert_device": "Intel(R) Arc(TM) Pro B50 Graphics",
+          "expert_cache_budget_bytes": null,
+          "expert_cache_report": null,
+          "loaded_reserved_live": [
+            0,
+            0
+          ],
+          "peak_reserved_live": [
+            0,
+            0
+          ],
+          "after_session_reserved_live": [
+            [
+              0,
+              0
+            ],
+            [
+              0,
+              0
+            ]
+          ],
+          "allocator_stats_available": false,
+          "max_repeat_logit_difference": 0.0,
+          "median_ms_per_token": 146.6128840820312,
+          "ms_per_token": [
+            146.07459686718747,
+            147.15117129687494
+          ],
+          "prefill_ms": [
+            3721.4496160000003,
+            3661.043094
+          ],
+          "prefill_cpu_fallbacks": [
+            0,
+            0
+          ],
+          "decode_cpu_fallbacks": [
+            0,
+            0
+          ],
+          "private_endpoints_kib": [
+            279856,
+            279864
+          ],
+          "full_logits_sha256": "f455df5fdba4155b8b93db2fe318686796ffd45d26a86fc2b65ea8bd03499ed2",
+          "failed_gates": [
+            "absolute_logits_1e_5"
+          ],
+          "private_endpoint_delta_kib": 8,
+          "private_endpoint_span_kib": 8,
+          "physical_read_bytes_per_session": [
+            0,
+            0
+          ],
+          "after_session_expert_cache_reports": [
+            null,
+            null
+          ]
+        },
+        {
+          "backend": "vulkan",
+          "auto_placement": true,
+          "bit_identical": false,
+          "max_abs_logit_difference": 0.00046825408935546875,
+          "rms_logit_difference": 3.230119460597598e-05,
+          "matching_top1_rows": 129,
+          "logits_compared": 19599744,
+          "decode_speedup_vs_reference": 1.1269449401285396,
+          "prefill_median_ms": 2515.2073394999998,
+          "session_median_ms": 23518.545257499998,
+          "session_speedup_vs_reference": 1.41364189844598,
+          "private_growth_kib": 380,
+          "peak_driver_vram_bytes": 166326272,
+          "decode_endpoint_driver_vram_bytes": [
+            166326272,
+            166326272
+          ],
+          "driver_vram_growth_bytes": 0,
+          "gates": {
+            "same_executable": true,
+            "absolute_logits_1e_5": false,
+            "repeat_logits_1e_5": true,
+            "reference_repeat_logits_1e_5": true,
+            "repeated_sessions_measured": true,
+            "reference_repeated_sessions_measured": true,
+            "reference_private_memory_growth_le_1MiB": true,
+            "same_greedy_choices": true,
+            "private_memory_growth_le_1MiB": true,
+            "device_memory_stable": true,
+            "reference_memory_stable": true,
+            "no_cpu_fallbacks": true
+          },
+          "eligible_for_auto": false,
+          "performance_gates": {
+            "all_decode_samples_faster": true,
+            "all_session_samples_faster": true
+          },
+          "eligible_for_auto_preference": false,
+          "model": "/home/tserica/models/qwen3-dense/Qwen3-8B-Q4_K_M.gguf",
+          "gpu": "Intel(R) Arc(tm) Pro B50 Graphics (BMG G21)",
+          "executable_sha256": "d70b8a10490a3b22af2293c0a417a4ec30a9413b1167c57b1d50c5b0e6adfc87",
+          "dispatch": "CubeClProduction",
+          "dense_device": "CPU",
+          "expert_device": "CPU",
+          "expert_cache_budget_bytes": null,
+          "expert_cache_report": null,
+          "loaded_reserved_live": [
+            134217728,
+            0
+          ],
+          "peak_reserved_live": [
+            134217728,
+            0
+          ],
+          "after_session_reserved_live": [
+            [
+              134217728,
+              0
+            ],
+            [
+              134217728,
+              0
+            ]
+          ],
+          "allocator_stats_available": true,
+          "max_repeat_logit_difference": 0.0,
+          "median_ms_per_token": 164.08857748437498,
+          "ms_per_token": [
+            164.01778148437504,
+            164.15937348437492
+          ],
+          "prefill_ms": [
+            2527.042236,
+            2503.3724429999997
+          ],
+          "prefill_cpu_fallbacks": [
+            0,
+            0
+          ],
+          "decode_cpu_fallbacks": [
+            0,
+            0
+          ],
+          "private_endpoints_kib": [
+            276488,
+            276868
+          ],
+          "full_logits_sha256": "d7b2d80cc46e4c2614f999da70300e2a1fc34cdb214296b8cb598ec4497ae4f8",
+          "failed_gates": [
+            "absolute_logits_1e_5"
+          ],
+          "private_endpoint_delta_kib": 380,
+          "private_endpoint_span_kib": 380,
+          "physical_read_bytes_per_session": [
+            0,
+            0
+          ],
+          "after_session_expert_cache_reports": [
+            null,
+            null
+          ]
+        },
+        {
+          "backend": "cpu",
+          "auto_placement": true,
+          "bit_identical": false,
+          "max_abs_logit_difference": 0.00046825408935546875,
+          "rms_logit_difference": 3.230119460597598e-05,
+          "matching_top1_rows": 129,
+          "logits_compared": 19599744,
+          "decode_speedup_vs_reference": 1.1322857646116153,
+          "prefill_median_ms": 2527.869706,
+          "session_median_ms": 23432.137985499998,
+          "session_speedup_vs_reference": 1.4188547791530333,
+          "private_growth_kib": 45932,
+          "peak_driver_vram_bytes": null,
+          "decode_endpoint_driver_vram_bytes": null,
+          "driver_vram_growth_bytes": 0,
+          "gates": {
+            "same_executable": true,
+            "absolute_logits_1e_5": false,
+            "repeat_logits_1e_5": true,
+            "reference_repeat_logits_1e_5": true,
+            "repeated_sessions_measured": true,
+            "reference_repeated_sessions_measured": true,
+            "reference_private_memory_growth_le_1MiB": true,
+            "same_greedy_choices": true,
+            "private_memory_growth_le_1MiB": false,
+            "device_memory_stable": true,
+            "reference_memory_stable": true,
+            "no_cpu_fallbacks": true
+          },
+          "eligible_for_auto": false,
+          "performance_gates": {
+            "all_decode_samples_faster": true,
+            "all_session_samples_faster": true
+          },
+          "eligible_for_auto_preference": false,
+          "model": "/home/tserica/models/qwen3-dense/Qwen3-8B-Q4_K_M.gguf",
+          "gpu": "CPU",
+          "executable_sha256": "d70b8a10490a3b22af2293c0a417a4ec30a9413b1167c57b1d50c5b0e6adfc87",
+          "dispatch": "backend-native",
+          "dense_device": "CPU",
+          "expert_device": "CPU",
+          "expert_cache_budget_bytes": null,
+          "expert_cache_report": null,
+          "loaded_reserved_live": [
+            0,
+            0
+          ],
+          "peak_reserved_live": [
+            0,
+            0
+          ],
+          "after_session_reserved_live": [
+            [
+              0,
+              0
+            ],
+            [
+              0,
+              0
+            ]
+          ],
+          "allocator_stats_available": false,
+          "max_repeat_logit_difference": 0.0,
+          "median_ms_per_token": 163.31459593359375,
+          "ms_per_token": [
+            163.26725196874997,
+            163.3619398984375
+          ],
+          "prefill_ms": [
+            2499.556081,
+            2556.1833309999997
+          ],
+          "prefill_cpu_fallbacks": [
+            0,
+            0
+          ],
+          "decode_cpu_fallbacks": [
+            0,
+            0
+          ],
+          "private_endpoints_kib": [
+            271272,
+            225340
+          ],
+          "full_logits_sha256": "d7b2d80cc46e4c2614f999da70300e2a1fc34cdb214296b8cb598ec4497ae4f8",
+          "failed_gates": [
+            "absolute_logits_1e_5",
+            "private_memory_growth_le_1MiB"
+          ],
+          "private_endpoint_delta_kib": -45932,
+          "private_endpoint_span_kib": 45932,
+          "physical_read_bytes_per_session": [
+            0,
+            0
+          ],
+          "after_session_expert_cache_reports": [
+            null,
+            null
+          ]
+        },
+        {
+          "backend": "opencl",
+          "auto_placement": true,
+          "bit_identical": false,
+          "max_abs_logit_difference": 0.00046825408935546875,
+          "rms_logit_difference": 3.230119460597598e-05,
+          "matching_top1_rows": 129,
+          "logits_compared": 19599744,
+          "decode_speedup_vs_reference": 1.1308955622435133,
+          "prefill_median_ms": 2555.3424059999998,
+          "session_median_ms": 23485.308163,
+          "session_speedup_vs_reference": 1.4156425257761263,
+          "private_growth_kib": 28,
+          "peak_driver_vram_bytes": 166191104,
+          "decode_endpoint_driver_vram_bytes": [
+            166191104,
+            166191104
+          ],
+          "driver_vram_growth_bytes": 0,
+          "gates": {
+            "same_executable": true,
+            "absolute_logits_1e_5": false,
+            "repeat_logits_1e_5": true,
+            "reference_repeat_logits_1e_5": true,
+            "repeated_sessions_measured": true,
+            "reference_repeated_sessions_measured": true,
+            "reference_private_memory_growth_le_1MiB": true,
+            "same_greedy_choices": true,
+            "private_memory_growth_le_1MiB": true,
+            "device_memory_stable": true,
+            "reference_memory_stable": true,
+            "no_cpu_fallbacks": true
+          },
+          "eligible_for_auto": false,
+          "performance_gates": {
+            "all_decode_samples_faster": true,
+            "all_session_samples_faster": true
+          },
+          "eligible_for_auto_preference": false,
+          "model": "/home/tserica/models/qwen3-dense/Qwen3-8B-Q4_K_M.gguf",
+          "gpu": "Intel(R) Arc(TM) Pro B50 Graphics",
+          "executable_sha256": "d70b8a10490a3b22af2293c0a417a4ec30a9413b1167c57b1d50c5b0e6adfc87",
+          "dispatch": "backend-native",
+          "dense_device": "CPU",
+          "expert_device": "CPU",
+          "expert_cache_budget_bytes": null,
+          "expert_cache_report": null,
+          "loaded_reserved_live": [
+            0,
+            0
+          ],
+          "peak_reserved_live": [
+            0,
+            0
+          ],
+          "after_session_reserved_live": [
+            [
+              0,
+              0
+            ],
+            [
+              0,
+              0
+            ]
+          ],
+          "allocator_stats_available": false,
+          "max_repeat_logit_difference": 0.0,
+          "median_ms_per_token": 163.51535747656249,
+          "ms_per_token": [
+            163.54036497656256,
+            163.49034997656244
+          ],
+          "prefill_ms": [
+            2557.430268,
+            2553.254544
+          ],
+          "prefill_cpu_fallbacks": [
+            0,
+            0
+          ],
+          "decode_cpu_fallbacks": [
+            0,
+            0
+          ],
+          "private_endpoints_kib": [
+            263128,
+            263156
+          ],
+          "full_logits_sha256": "d7b2d80cc46e4c2614f999da70300e2a1fc34cdb214296b8cb598ec4497ae4f8",
+          "failed_gates": [
+            "absolute_logits_1e_5"
+          ],
+          "private_endpoint_delta_kib": 28,
+          "private_endpoint_span_kib": 28,
+          "physical_read_bytes_per_session": [
+            0,
+            0
+          ],
+          "after_session_expert_cache_reports": [
+            null,
+            null
+          ]
+        },
+        {
+          "backend": "sycl",
+          "auto_placement": true,
+          "bit_identical": false,
+          "max_abs_logit_difference": 0.00020265579223632812,
+          "rms_logit_difference": 5.45715559629535e-06,
+          "matching_top1_rows": 129,
+          "logits_compared": 19599744,
+          "decode_speedup_vs_reference": 1.2760435096088192,
+          "prefill_median_ms": 3714.7110599999996,
+          "session_median_ms": 22263.926047000008,
+          "session_speedup_vs_reference": 1.4933036022629036,
+          "private_growth_kib": 20,
+          "peak_driver_vram_bytes": 5799714816,
+          "decode_endpoint_driver_vram_bytes": [
+            5668016128,
+            5670125568
+          ],
+          "driver_vram_growth_bytes": 2109440,
+          "gates": {
+            "same_executable": true,
+            "absolute_logits_1e_5": false,
+            "repeat_logits_1e_5": true,
+            "reference_repeat_logits_1e_5": true,
+            "repeated_sessions_measured": true,
+            "reference_repeated_sessions_measured": true,
+            "reference_private_memory_growth_le_1MiB": true,
+            "same_greedy_choices": true,
+            "private_memory_growth_le_1MiB": true,
+            "device_memory_stable": false,
+            "reference_memory_stable": true,
+            "no_cpu_fallbacks": true
+          },
+          "eligible_for_auto": false,
+          "performance_gates": {
+            "all_decode_samples_faster": true,
+            "all_session_samples_faster": true
+          },
+          "eligible_for_auto_preference": false,
+          "model": "/home/tserica/models/qwen3-dense/Qwen3-8B-Q4_K_M.gguf",
+          "gpu": "Intel(R) Arc(TM) Pro B50 Graphics",
+          "executable_sha256": "d70b8a10490a3b22af2293c0a417a4ec30a9413b1167c57b1d50c5b0e6adfc87",
+          "dispatch": "backend-native",
+          "dense_device": "Intel(R) Arc(TM) Pro B50 Graphics",
+          "expert_device": "Intel(R) Arc(TM) Pro B50 Graphics",
+          "expert_cache_budget_bytes": null,
+          "expert_cache_report": null,
+          "loaded_reserved_live": [
+            0,
+            0
+          ],
+          "peak_reserved_live": [
+            0,
+            0
+          ],
+          "after_session_reserved_live": [
+            [
+              0,
+              0
+            ],
+            [
+              0,
+              0
+            ]
+          ],
+          "allocator_stats_available": false,
+          "max_repeat_logit_difference": 0.0,
+          "median_ms_per_token": 144.91574208593755,
+          "ms_per_token": [
+            144.06643182812508,
+            145.76505234375003
+          ],
+          "prefill_ms": [
+            3600.37113,
+            3829.0509899999997
+          ],
+          "prefill_cpu_fallbacks": [
+            0,
+            0
+          ],
+          "decode_cpu_fallbacks": [
+            0,
+            0
+          ],
+          "private_endpoints_kib": [
+            315028,
+            315048
+          ],
+          "full_logits_sha256": "f455df5fdba4155b8b93db2fe318686796ffd45d26a86fc2b65ea8bd03499ed2",
+          "failed_gates": [
+            "absolute_logits_1e_5",
+            "device_memory_stable"
+          ],
+          "private_endpoint_delta_kib": 20,
+          "private_endpoint_span_kib": 20,
+          "physical_read_bytes_per_session": [
+            0,
+            0
+          ],
+          "after_session_expert_cache_reports": [
+            null,
+            null
+          ]
+        }
+      ],
+      "trace_file": "qwen-backend-trace-b50-20261023.json",
+      "trace_sha256": "160354544de6a58facd49ee7c3e5a74f8b0600266e21611769a23999da283930",
+      "commands_recorded_in": "/home/tserica/benchmark-results/backends-production-b50-20261023/qwen/evaluation-state.json"
+    },
+    "deepseek": {
+      "reference": "/home/tserica/benchmark-results/backends-production-b50-20261023/deepseek/vulkan-fixed",
+      "reference_logits_sha256": "ab6fb262586daa5d1a3ea4baa89d1ef5b8afce4ee2b6750306357ff8f0892333",
+      "comparison_tolerance": 1e-05,
+      "runs": [
+        {
+          "backend": "vulkan",
+          "auto_placement": false,
+          "bit_identical": true,
+          "max_abs_logit_difference": 0.0,
+          "rms_logit_difference": 0.0,
+          "matching_top1_rows": 129,
+          "logits_compared": 16677120,
+          "decode_speedup_vs_reference": 1.0,
+          "prefill_median_ms": 45903.7103165,
+          "session_median_ms": 150955.15994500002,
+          "session_speedup_vs_reference": 1.0,
+          "private_growth_kib": 36,
+          "peak_driver_vram_bytes": 9404608512,
+          "decode_endpoint_driver_vram_bytes": [
+            9404608512,
+            9404608512
+          ],
+          "driver_vram_growth_bytes": 0,
+          "gates": {
+            "same_executable": true,
+            "absolute_logits_1e_5": true,
+            "repeat_logits_1e_5": true,
+            "reference_repeat_logits_1e_5": true,
+            "repeated_sessions_measured": true,
+            "reference_repeated_sessions_measured": true,
+            "reference_private_memory_growth_le_1MiB": true,
+            "same_greedy_choices": true,
+            "private_memory_growth_le_1MiB": true,
+            "device_memory_stable": true,
+            "reference_memory_stable": true,
+            "no_cpu_fallbacks": true
+          },
+          "eligible_for_auto": true,
+          "performance_gates": {
+            "all_decode_samples_faster": false,
+            "all_session_samples_faster": false
+          },
+          "eligible_for_auto_preference": false,
+          "model": "/home/tserica/models/DSV41-REAP272E-balanced.gguf",
+          "gpu": "Intel(R) Arc(tm) Pro B50 Graphics (BMG G21)",
+          "executable_sha256": "d70b8a10490a3b22af2293c0a417a4ec30a9413b1167c57b1d50c5b0e6adfc87",
+          "dispatch": "CubeClProduction",
+          "dense_device": "Intel(R) Arc(tm) Pro B50 Graphics (BMG G21)",
+          "expert_device": "CPU",
+          "expert_cache_budget_bytes": null,
+          "expert_cache_report": null,
+          "loaded_reserved_live": [
+            9365831680,
+            9224831488
+          ],
+          "peak_reserved_live": [
+            9365831680,
+            9279003648
+          ],
+          "after_session_reserved_live": [
+            [
+              9365831680,
+              9224831488
+            ],
+            [
+              9365831680,
+              9224831488
+            ]
+          ],
+          "allocator_stats_available": true,
+          "max_repeat_logit_difference": 0.0,
+          "median_ms_per_token": 820.7144502226563,
+          "ms_per_token": [
+            834.2530238828126,
+            807.1758765625001
+          ],
+          "prefill_ms": [
+            50030.547357,
+            41776.873276000006
+          ],
+          "prefill_cpu_fallbacks": [
+            0,
+            0
+          ],
+          "decode_cpu_fallbacks": [
+            0,
+            0
+          ],
+          "private_endpoints_kib": [
+            189672,
+            189708
+          ],
+          "full_logits_sha256": "ab6fb262586daa5d1a3ea4baa89d1ef5b8afce4ee2b6750306357ff8f0892333",
+          "failed_gates": [
+            "all_decode_samples_faster",
+            "all_session_samples_faster"
+          ],
+          "private_endpoint_delta_kib": 36,
+          "private_endpoint_span_kib": 36,
+          "physical_read_bytes_per_session": [
+            187288653824,
+            138428907520
+          ],
+          "after_session_expert_cache_reports": [
+            null,
+            null
+          ]
+        },
+        {
+          "backend": "cpu",
+          "auto_placement": false,
+          "bit_identical": false,
+          "max_abs_logit_difference": 0.00031375885009765625,
+          "rms_logit_difference": 2.4775590018555757e-05,
+          "matching_top1_rows": 129,
+          "logits_compared": 16677120,
+          "decode_speedup_vs_reference": 1.2243219237248613,
+          "prefill_median_ms": 33282.67209,
+          "session_median_ms": 119086.45260949999,
+          "session_speedup_vs_reference": 1.2676098467724257,
+          "private_growth_kib": 52,
+          "peak_driver_vram_bytes": null,
+          "decode_endpoint_driver_vram_bytes": null,
+          "driver_vram_growth_bytes": 0,
+          "gates": {
+            "same_executable": true,
+            "absolute_logits_1e_5": false,
+            "repeat_logits_1e_5": true,
+            "reference_repeat_logits_1e_5": true,
+            "repeated_sessions_measured": true,
+            "reference_repeated_sessions_measured": true,
+            "reference_private_memory_growth_le_1MiB": true,
+            "same_greedy_choices": true,
+            "private_memory_growth_le_1MiB": true,
+            "device_memory_stable": true,
+            "reference_memory_stable": true,
+            "no_cpu_fallbacks": true
+          },
+          "eligible_for_auto": false,
+          "performance_gates": {
+            "all_decode_samples_faster": true,
+            "all_session_samples_faster": true
+          },
+          "eligible_for_auto_preference": false,
+          "model": "/home/tserica/models/DSV41-REAP272E-balanced.gguf",
+          "gpu": "CPU",
+          "executable_sha256": "d70b8a10490a3b22af2293c0a417a4ec30a9413b1167c57b1d50c5b0e6adfc87",
+          "dispatch": "backend-native",
+          "dense_device": "CPU",
+          "expert_device": "CPU",
+          "expert_cache_budget_bytes": null,
+          "expert_cache_report": null,
+          "loaded_reserved_live": [
+            0,
+            0
+          ],
+          "peak_reserved_live": [
+            0,
+            0
+          ],
+          "after_session_reserved_live": [
+            [
+              0,
+              0
+            ],
+            [
+              0,
+              0
+            ]
+          ],
+          "allocator_stats_available": false,
+          "max_repeat_logit_difference": 0.0,
+          "median_ms_per_token": 670.3420353085937,
+          "ms_per_token": [
+            674.0204405781251,
+            666.6636300390622
+          ],
+          "prefill_ms": [
+            33317.41192,
+            33247.93226
+          ],
+          "prefill_cpu_fallbacks": [
+            0,
+            0
+          ],
+          "decode_cpu_fallbacks": [
+            0,
+            0
+          ],
+          "private_endpoints_kib": [
+            629052,
+            629104
+          ],
+          "full_logits_sha256": "0d49ebe3431065cd36c32d589da1beb095158b02878f5df05f69fa3296fb54ff",
+          "failed_gates": [
+            "absolute_logits_1e_5"
+          ],
+          "private_endpoint_delta_kib": 52,
+          "private_endpoint_span_kib": 52,
+          "physical_read_bytes_per_session": [
+            120183562240,
+            111556976640
+          ],
+          "after_session_expert_cache_reports": [
+            null,
+            null
+          ]
+        },
+        {
+          "backend": "opencl",
+          "auto_placement": false,
+          "bit_identical": false,
+          "max_abs_logit_difference": 0.00026607513427734375,
+          "rms_logit_difference": 1.9754408906622183e-05,
+          "matching_top1_rows": 129,
+          "logits_compared": 16677120,
+          "decode_speedup_vs_reference": 0.854101925939167,
+          "prefill_median_ms": 27057.112736,
+          "session_median_ms": 150053.49810649996,
+          "session_speedup_vs_reference": 1.0060089358120803,
+          "private_growth_kib": 32,
+          "peak_driver_vram_bytes": 9939202048,
+          "decode_endpoint_driver_vram_bytes": [
+            9922424832,
+            9939202048
+          ],
+          "driver_vram_growth_bytes": 16777216,
+          "gates": {
+            "same_executable": true,
+            "absolute_logits_1e_5": false,
+            "repeat_logits_1e_5": true,
+            "reference_repeat_logits_1e_5": true,
+            "repeated_sessions_measured": true,
+            "reference_repeated_sessions_measured": true,
+            "reference_private_memory_growth_le_1MiB": true,
+            "same_greedy_choices": true,
+            "private_memory_growth_le_1MiB": true,
+            "device_memory_stable": false,
+            "reference_memory_stable": true,
+            "no_cpu_fallbacks": true
+          },
+          "eligible_for_auto": false,
+          "performance_gates": {
+            "all_decode_samples_faster": false,
+            "all_session_samples_faster": false
+          },
+          "eligible_for_auto_preference": false,
+          "model": "/home/tserica/models/DSV41-REAP272E-balanced.gguf",
+          "gpu": "Intel(R) Arc(TM) Pro B50 Graphics",
+          "executable_sha256": "d70b8a10490a3b22af2293c0a417a4ec30a9413b1167c57b1d50c5b0e6adfc87",
+          "dispatch": "backend-native",
+          "dense_device": "Intel(R) Arc(TM) Pro B50 Graphics",
+          "expert_device": "CPU",
+          "expert_cache_budget_bytes": null,
+          "expert_cache_report": null,
+          "loaded_reserved_live": [
+            0,
+            0
+          ],
+          "peak_reserved_live": [
+            0,
+            0
+          ],
+          "after_session_reserved_live": [
+            [
+              0,
+              0
+            ],
+            [
+              0,
+              0
+            ]
+          ],
+          "allocator_stats_available": false,
+          "max_repeat_logit_difference": 0.0,
+          "median_ms_per_token": 960.909260707031,
+          "ms_per_token": [
+            966.1914270624997,
+            955.6270943515623
+          ],
+          "prefill_ms": [
+            27631.590079999998,
+            26482.635392
+          ],
+          "prefill_cpu_fallbacks": [
+            0,
+            0
+          ],
+          "decode_cpu_fallbacks": [
+            0,
+            0
+          ],
+          "private_endpoints_kib": [
+            231752,
+            231784
+          ],
+          "full_logits_sha256": "c35cca1b70af345a9b313b5067c246ebbee8fd98501bd09377434072557159ca",
+          "failed_gates": [
+            "absolute_logits_1e_5",
+            "device_memory_stable",
+            "all_decode_samples_faster",
+            "all_session_samples_faster"
+          ],
+          "private_endpoint_delta_kib": 32,
+          "private_endpoint_span_kib": 32,
+          "physical_read_bytes_per_session": [
+            97833295872,
+            83059007488
+          ],
+          "after_session_expert_cache_reports": [
+            null,
+            null
+          ]
+        },
+        {
+          "backend": "sycl",
+          "auto_placement": false,
+          "bit_identical": false,
+          "max_abs_logit_difference": 6.4849853515625e-05,
+          "rms_logit_difference": 4.614244393339867e-06,
+          "matching_top1_rows": 129,
+          "logits_compared": 16677120,
+          "decode_speedup_vs_reference": 0.9886837103989061,
+          "prefill_median_ms": 27192.5863685,
+          "session_median_ms": 133446.435323,
+          "session_speedup_vs_reference": 1.1312041387963723,
+          "private_growth_kib": 88,
+          "peak_driver_vram_bytes": 10110038016,
+          "decode_endpoint_driver_vram_bytes": [
+            9907761152,
+            9906618368
+          ],
+          "driver_vram_growth_bytes": 0,
+          "gates": {
+            "same_executable": true,
+            "absolute_logits_1e_5": false,
+            "repeat_logits_1e_5": true,
+            "reference_repeat_logits_1e_5": true,
+            "repeated_sessions_measured": true,
+            "reference_repeated_sessions_measured": true,
+            "reference_private_memory_growth_le_1MiB": true,
+            "same_greedy_choices": true,
+            "private_memory_growth_le_1MiB": true,
+            "device_memory_stable": true,
+            "reference_memory_stable": true,
+            "no_cpu_fallbacks": true
+          },
+          "eligible_for_auto": false,
+          "performance_gates": {
+            "all_decode_samples_faster": false,
+            "all_session_samples_faster": true
+          },
+          "eligible_for_auto_preference": false,
+          "model": "/home/tserica/models/DSV41-REAP272E-balanced.gguf",
+          "gpu": "Intel(R) Arc(TM) Pro B50 Graphics",
+          "executable_sha256": "d70b8a10490a3b22af2293c0a417a4ec30a9413b1167c57b1d50c5b0e6adfc87",
+          "dispatch": "backend-native",
+          "dense_device": "Intel(R) Arc(TM) Pro B50 Graphics",
+          "expert_device": "CPU",
+          "expert_cache_budget_bytes": null,
+          "expert_cache_report": null,
+          "loaded_reserved_live": [
+            0,
+            0
+          ],
+          "peak_reserved_live": [
+            0,
+            0
+          ],
+          "after_session_reserved_live": [
+            [
+              0,
+              0
+            ],
+            [
+              0,
+              0
+            ]
+          ],
+          "allocator_stats_available": false,
+          "max_repeat_logit_difference": 0.0,
+          "median_ms_per_token": 830.1081949570314,
+          "ms_per_token": [
+            834.3209548750004,
+            825.8954350390625
+          ],
+          "prefill_ms": [
+            27330.685162,
+            27054.487575
+          ],
+          "prefill_cpu_fallbacks": [
+            0,
+            0
+          ],
+          "decode_cpu_fallbacks": [
+            0,
+            0
+          ],
+          "private_endpoints_kib": [
+            277132,
+            277220
+          ],
+          "full_logits_sha256": "43ff13e5247b438d62b9177931e456adfc2350db1a429da42b6fb12b6bb2543f",
+          "failed_gates": [
+            "absolute_logits_1e_5",
+            "all_decode_samples_faster"
+          ],
+          "private_endpoint_delta_kib": 88,
+          "private_endpoint_span_kib": 88,
+          "physical_read_bytes_per_session": [
+            89169383424,
+            88477622272
+          ],
+          "after_session_expert_cache_reports": [
+            null,
+            null
+          ]
+        },
+        {
+          "backend": "vulkan",
+          "auto_placement": true,
+          "bit_identical": false,
+          "max_abs_logit_difference": 0.00031375885009765625,
+          "rms_logit_difference": 2.4775590018555757e-05,
+          "matching_top1_rows": 129,
+          "logits_compared": 16677120,
+          "decode_speedup_vs_reference": 1.2674424727368254,
+          "prefill_median_ms": 31900.924707,
+          "session_median_ms": 114785.5146495,
+          "session_speedup_vs_reference": 1.3151063564592171,
+          "private_growth_kib": 44976,
+          "peak_driver_vram_bytes": 166326272,
+          "decode_endpoint_driver_vram_bytes": [
+            166326272,
+            166326272
+          ],
+          "driver_vram_growth_bytes": 0,
+          "gates": {
+            "same_executable": true,
+            "absolute_logits_1e_5": false,
+            "repeat_logits_1e_5": true,
+            "reference_repeat_logits_1e_5": true,
+            "repeated_sessions_measured": true,
+            "reference_repeated_sessions_measured": true,
+            "reference_private_memory_growth_le_1MiB": true,
+            "same_greedy_choices": true,
+            "private_memory_growth_le_1MiB": false,
+            "device_memory_stable": true,
+            "reference_memory_stable": true,
+            "no_cpu_fallbacks": true
+          },
+          "eligible_for_auto": false,
+          "performance_gates": {
+            "all_decode_samples_faster": true,
+            "all_session_samples_faster": true
+          },
+          "eligible_for_auto_preference": false,
+          "model": "/home/tserica/models/DSV41-REAP272E-balanced.gguf",
+          "gpu": "Intel(R) Arc(tm) Pro B50 Graphics (BMG G21)",
+          "executable_sha256": "d70b8a10490a3b22af2293c0a417a4ec30a9413b1167c57b1d50c5b0e6adfc87",
+          "dispatch": "CubeClProduction",
+          "dense_device": "CPU",
+          "expert_device": "CPU",
+          "expert_cache_budget_bytes": null,
+          "expert_cache_report": null,
+          "loaded_reserved_live": [
+            134217728,
+            0
+          ],
+          "peak_reserved_live": [
+            134217728,
+            0
+          ],
+          "after_session_reserved_live": [
+            [
+              134217728,
+              0
+            ],
+            [
+              134217728,
+              0
+            ]
+          ],
+          "allocator_stats_available": true,
+          "max_repeat_logit_difference": 0.0,
+          "median_ms_per_token": 647.5358589257812,
+          "ms_per_token": [
+            652.1886915,
+            642.8830263515624
+          ],
+          "prefill_ms": [
+            32553.864986,
+            31247.984428
+          ],
+          "prefill_cpu_fallbacks": [
+            0,
+            0
+          ],
+          "decode_cpu_fallbacks": [
+            0,
+            0
+          ],
+          "private_endpoints_kib": [
+            632064,
+            587088
+          ],
+          "full_logits_sha256": "0d49ebe3431065cd36c32d589da1beb095158b02878f5df05f69fa3296fb54ff",
+          "failed_gates": [
+            "absolute_logits_1e_5",
+            "private_memory_growth_le_1MiB"
+          ],
+          "private_endpoint_delta_kib": -44976,
+          "private_endpoint_span_kib": 44976,
+          "physical_read_bytes_per_session": [
+            114316316672,
+            100227489792
+          ],
+          "after_session_expert_cache_reports": [
+            null,
+            null
+          ]
+        },
+        {
+          "backend": "cpu",
+          "auto_placement": true,
+          "bit_identical": false,
+          "max_abs_logit_difference": 0.00031375885009765625,
+          "rms_logit_difference": 2.4775590018555757e-05,
+          "matching_top1_rows": 129,
+          "logits_compared": 16677120,
+          "decode_speedup_vs_reference": 1.2814756026026295,
+          "prefill_median_ms": 30754.843741999997,
+          "session_median_ms": 112731.7845555,
+          "session_speedup_vs_reference": 1.339064759244381,
+          "private_growth_kib": 404,
+          "peak_driver_vram_bytes": null,
+          "decode_endpoint_driver_vram_bytes": null,
+          "driver_vram_growth_bytes": 0,
+          "gates": {
+            "same_executable": true,
+            "absolute_logits_1e_5": false,
+            "repeat_logits_1e_5": true,
+            "reference_repeat_logits_1e_5": true,
+            "repeated_sessions_measured": true,
+            "reference_repeated_sessions_measured": true,
+            "reference_private_memory_growth_le_1MiB": true,
+            "same_greedy_choices": true,
+            "private_memory_growth_le_1MiB": true,
+            "device_memory_stable": true,
+            "reference_memory_stable": true,
+            "no_cpu_fallbacks": true
+          },
+          "eligible_for_auto": false,
+          "performance_gates": {
+            "all_decode_samples_faster": true,
+            "all_session_samples_faster": true
+          },
+          "eligible_for_auto_preference": false,
+          "model": "/home/tserica/models/DSV41-REAP272E-balanced.gguf",
+          "gpu": "CPU",
+          "executable_sha256": "d70b8a10490a3b22af2293c0a417a4ec30a9413b1167c57b1d50c5b0e6adfc87",
+          "dispatch": "backend-native",
+          "dense_device": "CPU",
+          "expert_device": "CPU",
+          "expert_cache_budget_bytes": null,
+          "expert_cache_report": null,
+          "loaded_reserved_live": [
+            0,
+            0
+          ],
+          "peak_reserved_live": [
+            0,
+            0
+          ],
+          "after_session_reserved_live": [
+            [
+              0,
+              0
+            ],
+            [
+              0,
+              0
+            ]
+          ],
+          "allocator_stats_available": false,
+          "max_repeat_logit_difference": 0.0,
+          "median_ms_per_token": 640.4448501054687,
+          "ms_per_token": [
+            642.61064021875,
+            638.2790599921875
+          ],
+          "prefill_ms": [
+            31434.194446999998,
+            30075.493037
+          ],
+          "prefill_cpu_fallbacks": [
+            0,
+            0
+          ],
+          "decode_cpu_fallbacks": [
+            0,
+            0
+          ],
+          "private_endpoints_kib": [
+            629480,
+            629884
+          ],
+          "full_logits_sha256": "0d49ebe3431065cd36c32d589da1beb095158b02878f5df05f69fa3296fb54ff",
+          "failed_gates": [
+            "absolute_logits_1e_5"
+          ],
+          "private_endpoint_delta_kib": 404,
+          "private_endpoint_span_kib": 404,
+          "physical_read_bytes_per_session": [
+            101957611520,
+            96968966144
+          ],
+          "after_session_expert_cache_reports": [
+            null,
+            null
+          ]
+        },
+        {
+          "backend": "opencl",
+          "auto_placement": true,
+          "bit_identical": false,
+          "max_abs_logit_difference": 0.00031375885009765625,
+          "rms_logit_difference": 2.4775590018555757e-05,
+          "matching_top1_rows": 129,
+          "logits_compared": 16677120,
+          "decode_speedup_vs_reference": 1.2534584431955575,
+          "prefill_median_ms": 31049.257227000002,
+          "session_median_ms": 114858.53722249999,
+          "session_speedup_vs_reference": 1.3142702631897087,
+          "private_growth_kib": 2104,
+          "peak_driver_vram_bytes": 166195200,
+          "decode_endpoint_driver_vram_bytes": [
+            166195200,
+            166195200
+          ],
+          "driver_vram_growth_bytes": 0,
+          "gates": {
+            "same_executable": true,
+            "absolute_logits_1e_5": false,
+            "repeat_logits_1e_5": true,
+            "reference_repeat_logits_1e_5": true,
+            "repeated_sessions_measured": true,
+            "reference_repeated_sessions_measured": true,
+            "reference_private_memory_growth_le_1MiB": true,
+            "same_greedy_choices": true,
+            "private_memory_growth_le_1MiB": false,
+            "device_memory_stable": true,
+            "reference_memory_stable": true,
+            "no_cpu_fallbacks": true
+          },
+          "eligible_for_auto": false,
+          "performance_gates": {
+            "all_decode_samples_faster": true,
+            "all_session_samples_faster": true
+          },
+          "eligible_for_auto_preference": false,
+          "model": "/home/tserica/models/DSV41-REAP272E-balanced.gguf",
+          "gpu": "Intel(R) Arc(TM) Pro B50 Graphics",
+          "executable_sha256": "d70b8a10490a3b22af2293c0a417a4ec30a9413b1167c57b1d50c5b0e6adfc87",
+          "dispatch": "backend-native",
+          "dense_device": "CPU",
+          "expert_device": "CPU",
+          "expert_cache_budget_bytes": null,
+          "expert_cache_report": null,
+          "loaded_reserved_live": [
+            0,
+            0
+          ],
+          "peak_reserved_live": [
+            0,
+            0
+          ],
+          "after_session_reserved_live": [
+            [
+              0,
+              0
+            ],
+            [
+              0,
+              0
+            ]
+          ],
+          "allocator_stats_available": false,
+          "max_repeat_logit_difference": 0.0,
+          "median_ms_per_token": 654.7599999648437,
+          "ms_per_token": [
+            655.7863506640626,
+            653.7336492656249
+          ],
+          "prefill_ms": [
+            30572.625646999997,
+            31525.888807000003
+          ],
+          "prefill_cpu_fallbacks": [
+            0,
+            0
+          ],
+          "decode_cpu_fallbacks": [
+            0,
+            0
+          ],
+          "private_endpoints_kib": [
+            682748,
+            684852
+          ],
+          "full_logits_sha256": "0d49ebe3431065cd36c32d589da1beb095158b02878f5df05f69fa3296fb54ff",
+          "failed_gates": [
+            "absolute_logits_1e_5",
+            "private_memory_growth_le_1MiB"
+          ],
+          "private_endpoint_delta_kib": 2104,
+          "private_endpoint_span_kib": 2104,
+          "physical_read_bytes_per_session": [
+            97623162880,
+            96160026624
+          ],
+          "after_session_expert_cache_reports": [
+            null,
+            null
+          ]
+        },
+        {
+          "backend": "sycl",
+          "auto_placement": true,
+          "bit_identical": false,
+          "max_abs_logit_difference": 6.4849853515625e-05,
+          "rms_logit_difference": 4.614244393339867e-06,
+          "matching_top1_rows": 129,
+          "logits_compared": 16677120,
+          "decode_speedup_vs_reference": 0.9841858478985465,
+          "prefill_median_ms": 26910.1420795,
+          "session_median_ms": 133649.5855015,
+          "session_speedup_vs_reference": 1.1294846847340638,
+          "private_growth_kib": 20,
+          "peak_driver_vram_bytes": 10128392192,
+          "decode_endpoint_driver_vram_bytes": [
+            9926184960,
+            9924861952
+          ],
+          "driver_vram_growth_bytes": 0,
+          "gates": {
+            "same_executable": true,
+            "absolute_logits_1e_5": false,
+            "repeat_logits_1e_5": true,
+            "reference_repeat_logits_1e_5": true,
+            "repeated_sessions_measured": true,
+            "reference_repeated_sessions_measured": true,
+            "reference_private_memory_growth_le_1MiB": true,
+            "same_greedy_choices": true,
+            "private_memory_growth_le_1MiB": true,
+            "device_memory_stable": true,
+            "reference_memory_stable": true,
+            "no_cpu_fallbacks": true
+          },
+          "eligible_for_auto": false,
+          "performance_gates": {
+            "all_decode_samples_faster": false,
+            "all_session_samples_faster": true
+          },
+          "eligible_for_auto_preference": false,
+          "model": "/home/tserica/models/DSV41-REAP272E-balanced.gguf",
+          "gpu": "Intel(R) Arc(TM) Pro B50 Graphics",
+          "executable_sha256": "d70b8a10490a3b22af2293c0a417a4ec30a9413b1167c57b1d50c5b0e6adfc87",
+          "dispatch": "backend-native",
+          "dense_device": "Intel(R) Arc(TM) Pro B50 Graphics",
+          "expert_device": "CPU",
+          "expert_cache_budget_bytes": null,
+          "expert_cache_report": null,
+          "loaded_reserved_live": [
+            0,
+            0
+          ],
+          "peak_reserved_live": [
+            0,
+            0
+          ],
+          "after_session_reserved_live": [
+            [
+              0,
+              0
+            ],
+            [
+              0,
+              0
+            ]
+          ],
+          "allocator_stats_available": false,
+          "max_repeat_logit_difference": 0.0,
+          "median_ms_per_token": 833.9019017343751,
+          "ms_per_token": [
+            836.3609591874999,
+            831.4428442812501
+          ],
+          "prefill_ms": [
+            27729.430008000003,
+            26090.854151
+          ],
+          "prefill_cpu_fallbacks": [
+            0,
+            0
+          ],
+          "decode_cpu_fallbacks": [
+            0,
+            0
+          ],
+          "private_endpoints_kib": [
+            289192,
+            289212
+          ],
+          "full_logits_sha256": "43ff13e5247b438d62b9177931e456adfc2350db1a429da42b6fb12b6bb2543f",
+          "failed_gates": [
+            "absolute_logits_1e_5",
+            "all_decode_samples_faster"
+          ],
+          "private_endpoint_delta_kib": 20,
+          "private_endpoint_span_kib": 20,
+          "physical_read_bytes_per_session": [
+            95556919296,
+            81567703040
+          ],
+          "after_session_expert_cache_reports": [
+            null,
+            null
+          ]
+        }
+      ],
+      "trace_file": "deepseek-backend-trace-b50-20261023.json",
+      "trace_sha256": "ed4f15d4af072478db90219e2721a55ce575ad7ffe83a0973bb557506b8df3c0",
+      "commands_recorded_in": "/home/tserica/benchmark-results/backends-production-b50-20261023/deepseek/evaluation-state.json"
+    }
+  },
+  "automatic_choices_updated": false,
+  "decision": "No alternate configuration passes all parity, repeatability, speed and memory gates against the corresponding production Vulkan reference. Keep backend priority, automatic dense placement, expert placement and caching choices unchanged.",
+  "eligible_configurations": [],
+  "model_evaluations": [
+    {
+      "model": "qwen",
+      "command": [
+        "python3",
+        "kernels-cubecl/benchmarks/evaluate_backends.py",
+        "--binary",
+        "/home/tserica/benchmark-results/backends-production-b50-20261023/bench_cubecl_real",
+        "--model",
+        "/home/tserica/models/qwen3-dense/Qwen3-8B-Q4_K_M.gguf",
+        "--tokenizer",
+        "/home/tserica/models/qwen3-dense/tokenizer.json",
+        "--output",
+        "/home/tserica/benchmark-results/backends-production-b50-20261023/qwen",
+        "--reference",
+        "/home/tserica/benchmark-results/grouped-q8-parity-20261023/qwen-baseline/trace.json",
+        "--prompt-tokens",
+        "126",
+        "--prefill-chunk",
+        "32",
+        "--decode",
+        "128",
+        "--passes",
+        "2",
+        "--warm-prompt-tokens",
+        "32",
+        "--policies",
+        "fixed",
+        "auto",
+        "--backends",
+        "vulkan",
+        "cpu",
+        "opencl",
+        "sycl",
+        "--timeout",
+        "3600"
+      ],
+      "started_utc": "2026-10-23T08:40:33.624850+00:00",
+      "exit_code": 0,
+      "finished_utc": "2026-10-23T08:47:41.293276+00:00"
+    },
+    {
+      "model": "deepseek",
+      "command": [
+        "python3",
+        "kernels-cubecl/benchmarks/evaluate_backends.py",
+        "--binary",
+        "/home/tserica/benchmark-results/backends-production-b50-20261023/bench_cubecl_real",
+        "--model",
+        "/home/tserica/models/DSV41-REAP272E-balanced.gguf",
+        "--tokenizer",
+        "/home/tserica/models/DeepSeek-V4.1-Flash-REAP-272E/tokenizer.json",
+        "--output",
+        "/home/tserica/benchmark-results/backends-production-b50-20261023/deepseek",
+        "--reference",
+        "/home/tserica/benchmark-results/grouped-q8-parity-20261023/deepseek-baseline/trace.json",
+        "--prompt-tokens",
+        "121",
+        "--prefill-chunk",
+        "32",
+        "--decode",
+        "128",
+        "--passes",
+        "2",
+        "--warm-prompt-tokens",
+        "8",
+        "--policies",
+        "fixed",
+        "auto",
+        "--backends",
+        "vulkan",
+        "cpu",
+        "opencl",
+        "sycl",
+        "--timeout",
+        "3600"
+      ],
+      "started_utc": "2026-10-23T08:47:41.305508+00:00",
+      "exit_code": 0,
+      "finished_utc": "2026-10-23T09:23:58.527743+00:00"
+    }
+  ],
+  "memory_gate_definition": "Private memory uses max-minus-min of resident plus swapped anonymous endpoint pages, at most 1 MiB; driver memory permits at most 1 MiB endpoint growth; allocator endpoints must be stable where supported. A private-memory span can reflect release, not a leak. Existing gates are unchanged.",
+  "native_toolchain": {
+    "sycl_compiler": "Intel oneAPI icpx 2026.2",
+    "sycl_compiler_flags": "-fsycl; --gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/15 (select installed C++ headers)",
+    "sycl_device_inventory": [
+      "[opencl:cpu][opencl:0] Intel(R) OpenCL, AMD Ryzen 9 9950X 16-Core Processor             OpenCL 3.1 (Build 0) [2026.22.10.0.01_160000]",
+      "[opencl:gpu][opencl:1] Intel(R) OpenCL Graphics, Intel(R) Arc(TM) Pro B50 Graphics OpenCL 3.0 NEO  [26.05.037020]",
+      "[level_zero:gpu][level_zero:0] Intel(R) oneAPI Unified Runtime over Level-Zero V2, Intel(R) Arc(TM) Pro B50 Graphics 20.1.0 [1.14.37020]"
+    ],
+    "sycl_megakernel_requested": false
+  },
+  "validation": [
+    "Release benchmark build with vulkan,opencl,sycl passed",
+    "Native SYCL bridge built from the same source tree",
+    "7 evaluator regression tests passed",
+    "All 16 configurations completed with two measured sessions and 128 decode tokens each",
+    "Both production Vulkan reference hashes match the previously accepted full-model traces"
+  ]
+}

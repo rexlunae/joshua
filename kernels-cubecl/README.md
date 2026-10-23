@@ -780,6 +780,9 @@ same token sequence even when their logits differ. This measures conditional
 inference performance and full-logit parity, rather than free-running language
 quality. Each process warms eight prompt tokens and two decode steps first;
 all timed passes use the full prompt. Kernels run serially across APIs.
+`--reference saved-trace.json` replays a complete saved prompt and continuation
+on the reference backend too. `--warm-prompt-tokens` sets the warmup prefix
+(default 8; the Qwen rerun below uses 32).
 The evaluator records failed or unavailable configurations and preserves
 existing complete results. A folder left without `summary.json` is quarantined
 with `--retry-incomplete` and rerun instead of requiring manual cleanup.
@@ -804,6 +807,70 @@ separate. New runs also record process I/O counters and expert-cache reports
 at session boundaries. Cache warming and mmap page faults can affect timing,
 so compare repeated sessions and read bytes before attributing differences to
 kernel execution alone.
+
+### Production-dispatch rerun, 2026-10-23
+
+[Pinned results and all gates](benchmarks/backend-evaluation-production-b50-20261023.json)
+cover **16 configurations / 32 measured sessions**: CPU, OpenCL, SYCL and
+production Vulkan, each with fixed placement and the engine's automatic
+dense/expert/cache placement, for both real models. One executable includes
+all three accelerator features; a freshly rebuilt SYCL bridge and runtime
+are recorded by hash. Processes run serially without megakernel overrides.
+
+DeepSeek uses the complete 121-token prompt and Qwen the complete 126-token
+prompt, both with batch-32 prefill, 128 identical diverse decode inputs and
+two measured sessions per configuration. Warmup is 8 prompt tokens for
+DeepSeek and 32 for Qwen, plus two decode steps. Contexts are 249 and 254.
+Timings include model forward and host logits; model loading and placement
+probes are outside the inference timer. Fixed-placement results:
+
+| Backend | DeepSeek decode ms/token | DeepSeek prefill + decode s | Qwen8 decode ms/token | Qwen8 prefill + decode s |
+| --- | ---: | ---: | ---: | ---: |
+| CPU | **670.342** | **119.086** | 163.186 | 23.434 |
+| OpenCL | 960.909 | 150.053 | 195.059 | 28.875 |
+| SYCL | 830.108 | 133.446 | **146.613** | **22.458** |
+| Vulkan `CubeClProduction` | 820.714 | 150.955 | 184.919 | 33.247 |
+
+Vulkan now has the lowest measured **GPU decode** latency on DeepSeek, while
+SYCL has a shorter GPU prefill-plus-decode session and CPU is fastest overall.
+SYCL is fastest on Qwen. Neither result supports a universal backend reorder.
+
+**No automatic choices change.** Every alternative fails the unchanged
+absolute **1e-5** logit gate against its production Vulkan reference:
+
+| Fixed backend | DeepSeek max absolute difference | Qwen8 max absolute difference |
+| --- | ---: | ---: |
+| CPU | 0.000313759 | 0.000468254 |
+| OpenCL | 0.000266075 | 0.000473022 |
+| SYCL | 0.000064850 | 0.000202656 |
+
+All greedy choices match and all measured repeated-session logit differences
+are zero; these do not replace the full-logit gate. The production Vulkan
+hashes still match the accepted traces: DeepSeek `ab6fb262...` and Qwen
+`6dc8975c...`, with stable allocator and driver endpoints.
+
+Automatic placement selects CPU dense weights for CPU/OpenCL/Vulkan on both
+models; SYCL selects GPU dense weights. DeepSeek experts stay CPU-mmap and
+all automatic expert-cache budgets are `None`. Automatic decode medians are
+647.536 / 640.445 / 654.760 / 833.902 ms/token for DeepSeek Vulkan / CPU /
+OpenCL / SYCL, and 164.089 / 163.315 / 163.515 / 144.916 for Qwen. Backend
+labels alone must not be read as the device executing the dense set.
+
+The existing memory gates also reject Qwen CPU-auto (44.9 MiB private-memory
+increase) and SYCL-auto (2.01 MiB driver VRAM growth), DeepSeek fixed OpenCL
+(16 MiB driver growth), and DeepSeek OpenCL-auto (2.05 MiB private increase).
+DeepSeek Vulkan-auto has a 43.9 MiB private-memory span caused by a decrease;
+this fails the stability gate but is not evidence of a leak. Full signed
+endpoint changes and per-session I/O counters are retained in the report.
+No thresholds are relaxed and no warm sessions are discarded.
+
+Exact saved inputs are included as
+[DeepSeek trace](benchmarks/deepseek-backend-trace-b50-20261023.json) and
+[Qwen trace](benchmarks/qwen-backend-trace-b50-20261023.json). To reproduce,
+pass the appropriate trace with `--reference`, `--prefill-chunk 32`,
+`--decode 128`, `--passes 2`, and `--warm-prompt-tokens 8` (DeepSeek) or `32`
+(Qwen) to the evaluator above. Raw logs, complete logits and memory timelines
+remain in `/home/tserica/benchmark-results/backends-production-b50-20261023`.
 
 ### Measured backend results, 2026-10-18
 
