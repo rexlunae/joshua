@@ -1266,6 +1266,9 @@ async fn main() -> anyhow::Result<()> {
                 "\n[tokens: prompt={} completion={} | prefill={:.1}t/s decode={:.1}t/s]",
                 usage.prompt_tokens, usage.completion_tokens, prefill_tps, decode_tps
             );
+            if joshua::megakernel::requested() {
+                eprintln!("[megakernel: {} fused decode steps]", joshua::megakernel::fused_steps());
+            }
             let spec = engine.speculative_stats();
             if spec.drafted > 0 {
                 eprintln!(

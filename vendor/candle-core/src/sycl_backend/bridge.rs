@@ -56,11 +56,14 @@ fn bridge_candidates() -> Vec<PathBuf> {
 pub struct Arg { pub data: *const c_void, pub size: usize }
 
 macro_rules! api {
-    ($($name:ident($($arg:ty),*) -> $ret:ty;)+) => {
+    (required { $($name:ident($($arg:ty),*) -> $ret:ty;)+ }
+     optional { $($oname:ident($($oarg:ty),*) -> $oret:ty;)* }) => {
         struct Api {
             _library: libloading::Library,
             _runtime: Option<libloading::Library>,
             $($name: unsafe extern "C" fn($($arg),*) -> $ret,)+
+            // Entry points a bridge built before them lacks; `None` there.
+            $($oname: Option<unsafe extern "C" fn($($oarg),*) -> $oret>,)*
         }
         impl Api {
             unsafe fn load() -> std::result::Result<Self, String> {
@@ -80,7 +83,8 @@ macro_rules! api {
                 let version = library.get::<unsafe extern "C" fn() -> u32>(b"joshua_sycl_abi_version\0").map_err(|e| e.to_string())?;
                 if version() != 1 { return Err("SYCL bridge ABI version mismatch (expected 1)".into()); }
                 $(let $name = *library.get(concat!("joshua_sycl_", stringify!($name), "\0").as_bytes()).map_err(|e| e.to_string())?;)+
-                Ok(Self { _library: library, _runtime: runtime, $($name,)+ })
+                $(let $oname = library.get(concat!("joshua_sycl_", stringify!($oname), "\0").as_bytes()).ok().map(|f| *f);)*
+                Ok(Self { _library: library, _runtime: runtime, $($name,)+ $($oname,)* })
             }
         }
     }
@@ -88,6 +92,7 @@ macro_rules! api {
 // The public wrappers below name arguments explicitly; keep function pointers
 // private so the library is retained for the lifetime of every device.
 api! {
+    required {
     open(usize, *mut usize) -> i32;
     close(usize) -> i32;
     info(usize, *mut c_char, usize, *mut u64) -> i32;
@@ -100,6 +105,13 @@ api! {
     read(usize, usize, usize, usize, *mut c_void) -> i32;
     copy(usize, usize, usize, usize, usize, usize) -> i32;
     launch(usize, *const c_char, *const Arg, usize, *const usize, *const usize) -> i32;
+    }
+    optional {
+        mega_new(usize, *const MegaModelDesc, *const MegaLayerDesc, *mut usize) -> i32;
+        mega_free(usize) -> i32;
+        mega_groups(usize) -> i32;
+        mega_decode(usize, usize, *const MegaKvDesc, usize, i32, MegaVDesc, MegaVDesc) -> i32;
+    }
 }
 fn api() -> Result<&'static Api> {
     static API: std::sync::OnceLock<std::result::Result<Api, String>> = std::sync::OnceLock::new();
@@ -149,5 +161,84 @@ pub unsafe fn copy(h: usize, a: usize, b: usize, ao: usize, bo: usize, bytes: us
 }
 pub unsafe fn launch(h: usize, name: &CStr, args: &[Arg], global: &[usize; 3], local: &[usize; 3]) -> Result<()> {
     if (api()?.launch)(h, name.as_ptr(), args.as_ptr(), args.len(), global.as_ptr(), local.as_ptr()) != 0 { return Err(error("launch")); }
+    Ok(())
+}
+
+// ─── Decode megakernel (mega.hpp) ────────────────────────────────────────────
+// Layouts must match the `Mega*Desc` structs in bridge.cpp.
+
+/// An f32 vector: buffer handle (0 = absent) and byte offset.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MegaVDesc { pub buf: usize, pub off: u64 }
+
+/// A `[n, k]` weight: GGUF type code, block elements / bytes, and the
+/// `k_qgemv_mr` columns per pass (0 = the one-row kernel's layout).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MegaWDesc { pub buf: usize, pub off: u64, pub qt: i32, pub qk: i32, pub bsz: i32, pub n: i32, pub k: i32, pub cols: i32 }
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MegaLayerDesc {
+    pub attn_norm: MegaVDesc,
+    pub ffn_norm: MegaVDesc,
+    pub qkv: [MegaWDesc; 3],
+    pub qkv_b: [MegaVDesc; 3],
+    pub q_norm: MegaVDesc,
+    pub k_norm: MegaVDesc,
+    pub o: MegaWDesc,
+    pub o_b: MegaVDesc,
+    pub gate: MegaWDesc,
+    pub up: MegaWDesc,
+    pub down: MegaWDesc,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MegaModelDesc {
+    pub n_layers: i32, pub h: i32, pub n_head: i32, pub n_kv: i32, pub hd: i32, pub n_rot: i32,
+    pub neox: i32, pub ffn: i32, pub vocab: i32, pub max_pos: i32, pub groups: i32, pub pad: i32,
+    pub eps: f32, pub scale: f32,
+    pub cos: MegaVDesc, pub sin: MegaVDesc, pub out_norm: MegaVDesc, pub out_b: MegaVDesc,
+    pub out: MegaWDesc,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MegaKvDesc { pub k: MegaVDesc, pub v: MegaVDesc, pub cap: i32, pub pad: i32 }
+
+fn mega_missing() -> Error {
+    Error::Msg("sycl: this SYCL bridge has no decode megakernel; rebuild it from this tree".into())
+}
+
+/// Whether the loaded bridge has the megakernel entry points.
+pub fn mega_available() -> bool {
+    api().map(|a| a.mega_new.is_some() && a.mega_free.is_some() && a.mega_decode.is_some()).unwrap_or(false)
+}
+
+pub fn mega_new(h: usize, model: &MegaModelDesc, layers: &[MegaLayerDesc]) -> Result<usize> {
+    let f = api()?.mega_new.ok_or_else(mega_missing)?;
+    if layers.len() != model.n_layers as usize { crate::bail!("sycl megakernel: {} layer descriptors for {} layers", layers.len(), model.n_layers); }
+    let mut out = 0;
+    if unsafe { f(h, model, layers.as_ptr(), &mut out) } != 0 { return Err(error("mega_new")); }
+    Ok(out)
+}
+
+pub unsafe fn mega_free(plan: usize) {
+    if let Ok(Some(f)) = api().map(|a| a.mega_free) { f(plan); }
+}
+
+/// Work-groups the plan launches (diagnostics).
+pub fn mega_groups(plan: usize) -> usize {
+    match api().map(|a| a.mega_groups) {
+        Ok(Some(f)) => unsafe { f(plan) }.max(0) as usize,
+        _ => 0,
+    }
+}
+
+pub fn mega_decode(h: usize, plan: usize, kv: &[MegaKvDesc], pos: i32, x_in: MegaVDesc, logits: MegaVDesc) -> Result<()> {
+    let f = api()?.mega_decode.ok_or_else(mega_missing)?;
+    if unsafe { f(h, plan, kv.as_ptr(), kv.len(), pos, x_in, logits) } != 0 { return Err(error("mega_decode")); }
     Ok(())
 }

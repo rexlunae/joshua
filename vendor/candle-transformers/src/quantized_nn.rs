@@ -116,6 +116,15 @@ impl RmsNorm {
         let weight = weight.dequantize(&weight.device())?;
         Ok(Self { weight, eps, span })
     }
+
+    /// The scale vector (f32, on the model device).
+    pub fn weight(&self) -> &Tensor {
+        &self.weight
+    }
+
+    pub fn eps(&self) -> f64 {
+        self.eps
+    }
 }
 
 impl Module for RmsNorm {

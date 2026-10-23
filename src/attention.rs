@@ -114,6 +114,16 @@ impl Rope {
         Self::from_inv_freq(inv_freq(n_rot, theta), max_seq, 1.0, style, dev)
     }
 
+    /// The `[max_seq, n_rot / 2]` cos and sin tables (for fused kernels
+    /// that apply the rotation themselves).
+    pub fn tables(&self) -> (&Tensor, &Tensor) {
+        (&self.cos, &self.sin)
+    }
+
+    pub fn style(&self) -> RopeStyle {
+        self.style
+    }
+
     /// Width of the rotated slice.
     pub fn n_rot(&self) -> Result<usize> {
         Ok(self.sin.dim(1)? * 2)
@@ -420,6 +430,22 @@ impl SeqKvCache {
         copy_rows(&v_new, seq, &self.v, cap, self.len, seq)?;
         self.len += seq;
         Ok(())
+    }
+
+    /// Make room for `n` more rows past [`Self::len`] without writing them,
+    /// for a kernel that writes the rows itself (the decode megakernel);
+    /// [`Self::advance`] then counts them.
+    pub(crate) fn reserve(&mut self, n: usize) -> Result<()> {
+        let cap = self.k.dim(2)?;
+        if self.len + n > cap {
+            self.grow(self.len + n)?;
+        }
+        Ok(())
+    }
+
+    /// Count `n` rows past [`Self::len`] that were written in place.
+    pub(crate) fn advance(&mut self, n: usize) {
+        self.len += n;
     }
 
     /// A cache holding a private copy of the first `keep` positions on
