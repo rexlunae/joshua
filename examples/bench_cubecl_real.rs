@@ -385,14 +385,14 @@ fn main() -> Result<()> {
     let kernel = match args.kernel.as_str() {
         "generic" => Qgemv::Generic,
         "cubecl" => Qgemv::CubeClExpanded,
-        "production" => Qgemv::CubeClNext,
+        "production" | "cubecl-packed" => Qgemv::CubeClPacked,
         "cubecl-next" => Qgemv::CubeClNext,
         "cubecl-q6" => Qgemv::CubeClFormat(candle_core::quantized::GgmlDType::Q6K),
         "cubecl-q4" => Qgemv::CubeClFormat(candle_core::quantized::GgmlDType::Q4K),
         "cubecl-q8" => Qgemv::CubeClFormat(candle_core::quantized::GgmlDType::Q8_0),
         "cubecl-q2" => Qgemv::CubeClFormat(candle_core::quantized::GgmlDType::Q2K),
         _ => anyhow::bail!(
-            "kernel must be generic, production, cubecl, cubecl-next, cubecl-q6, cubecl-q4, cubecl-q8 or cubecl-q2"
+            "kernel must be generic, production, cubecl, cubecl-packed, cubecl-next, cubecl-q6, cubecl-q4, cubecl-q8 or cubecl-q2"
         ),
     };
     let tokenizer =
@@ -819,7 +819,7 @@ fn main() -> Result<()> {
     }
     let mut summary = serde_json::json!({"model":args.model,"model_bytes":file.metadata()?.len(),"gpu":gpu_name,"kernel":args.kernel,
         "dispatch":format!("{kernel:?}"),
-        "cubecl_formats":match args.kernel.as_str() {"cubecl"=>vec![8,10,12],"production"|"cubecl-next"=>vec![8,10,12,14],"cubecl-q6"=>vec![14],"cubecl-q4"=>vec![12],"cubecl-q8"=>vec![8],"cubecl-q2"=>vec![10],_=>vec![]},
+        "cubecl_formats":match args.kernel.as_str() {"cubecl"=>vec![8,10,12],"production"|"cubecl-packed"|"cubecl-next"=>vec![8,10,12,14],"cubecl-q6"=>vec![14],"cubecl-q4"=>vec![12],"cubecl-q8"=>vec![8],"cubecl-q2"=>vec![10],_=>vec![]},
         "architecture":architecture,"expert_placement":if cpu_experts {"cpu-mmap"}else{"model-device"},
         "context":context,"warm_decode":args.warm_decode,"engram_disabled":std::env::var_os("JOSHUA_NO_ENGRAM").is_some(),
         "elements_by_ggml_dtype":dtype_elements,"prompt_tokens":trace.prompt.len(),"prefill_chunk":args.prefill_chunk,"decode_tokens":args.decode,"passes":args.passes,

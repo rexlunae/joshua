@@ -10,6 +10,35 @@ through its existing Vulkan runtime. **Production does not use wgpu, link
 CubeCL, require its toolchain, import buffers, or create a second queue.**
 This standalone development crate remains outside Joshua's workspace.
 
+## Merge review: current production policy (2026-10-22)
+
+B50 now defaults to **`CubeClPacked`**: Q4_K/Q6_K/Q8_0/Q2_K. **Grouped Q8
+remains opt-in** through `--kernel cubecl-next` or
+`JOSHUA_VULKAN_QGEMV=cubecl-next`. The existing grouped matmul/gather remains
+the production path. `cubecl-packed` explicitly selects the current packed
+kernel set; other adapters and automatic backend priority are unchanged.
+
+After integrating current `main`, a matched DeepSeek check using the complete
+121-token prompt, batch-32 prefill, one decode token, context 249 and identical
+warmup found **0.16960466 maximum logit difference** between the earlier
+three-format path and experimental grouped Q8. This **fails 1e-5**. A single
+pass suffices to reject promotion, not to establish repeatability. Grouped Q8
+must pass full-model parity, speed and memory gates on the integrated engine
+before another production rollout. Its earlier acceptance and speedups below
+are historical and do not certify the current integrated engine.
+
+The prefix-checkpoint feature already on `main` retains four bounded snapshots,
+adding **42,057,728 live bytes** to this DeepSeek workload compared with the
+older report. The checkpoint-enabled baseline and experimental path have
+identical allocator trajectories; live bytes are flat throughout 128 decode
+steps and return to the same post-session footprint. This intentional cache
+must be matched when comparing memory; it is not kernel scratch growth.
+
+The Qwen OOM repair and validated packed Q6_K path are retained. The merge
+review also requires two measured sessions and checks reference repeated
+logits and private-memory span before certifying another backend. See
+[the integrated review evidence](benchmarks/pr198-integration-review-b50-20261022.json).
+
 ## Qwen batch-32 prefill OOM fix (2026-10-22)
 
 The failure was reproduced on unchanged `04d542d`: batched quantized GEMM
@@ -95,8 +124,9 @@ Raw results remain in
 
 ## Full-model B50 acceptance (2026-10-22)
 
-Q6_K and grouped Q8_0 passed the full-model gates and are now included in the
-**B50-only** default, `CubeClNext`. The absolute tolerance remains **1e-5**.
+At this earlier checkpoint Q6_K and grouped Q8_0 passed the full-model gates
+and were enabled in the B50 default. The integrated review above subsequently
+keeps grouped Q8 opt-in; Q6_K remains enabled. The absolute tolerance remains **1e-5**.
 [The saved report](benchmarks/q6-grouped-q8-b50-20261022.json) includes commands,
 source/binary hashes, full-logit hashes, timings, memory bounds and failures.
 
@@ -148,8 +178,9 @@ at most 16 groups is eligible; other paths retain the existing arithmetic.
 Buffers, queue, parameter ring and deferred release stay in the native runtime.
 
 `--kernel cubecl` retains the previous three-format baseline;
-`--kernel cubecl-next` explicitly selects the newly validated set, and
-`--kernel production` verifies the actual adapter default. Other adapters
+`--kernel cubecl-next` selects the experimental grouped-Q8 set, and
+`--kernel production` verifies the actual adapter default (packed formats,
+without experimental grouped Q8). Other adapters
 retain their defaults until separately validated. For actual-weight grouped
 microbenchmarks, use `--projection-tensor blk.0.attn_output_a.weight
 --projection-rows 8 --projection-grouped`. Full outputs and raw memory samples
@@ -171,12 +202,13 @@ conversion metadata and filtered tensor names without loading weights.
 ## Dispatch and interoperability
 
 On the validated Intel Arc Pro B50 (PCI vendor/device 8086:E212), the default
-Vulkan QGEMV selection is now **`CubeClNext`**: native Q4_K/Q6_K/Q8_0/Q2_K
-and grouped Q8, all with generic's 256-lane accumulation order. The full-model
-checks above passed parity, speed and memory gates.
+Vulkan QGEMV selection is **`CubeClPacked`**: native Q4_K/Q6_K/Q8_0/Q2_K.
+Grouped Q8 stays opt-in after the integrated parity failure documented above.
+Packed kernels retain generic's 256-lane accumulation order.
 `JOSHUA_VULKAN_QGEMV=generic` forces the baseline; `cubecl` keeps a Q4_K-only
 compatibility selection; `cubecl-expanded` selects the previous three-format
-baseline, and `cubecl-next` explicitly selects the current production set.
+baseline, and `cubecl-packed` selects the current production set; `cubecl-next` opts into
+experimental grouped Q8.
 Small Q2_K projections (fewer than 64 output rows) retain generic dispatch
 after a measured regression at DeepSeek’s 24-row shape.
 Other formats, batched rows, unsupported widths, excessive dispatch

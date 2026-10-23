@@ -1,0 +1,56 @@
+{
+  "date": "2026-10-22",
+  "pr": 198,
+  "reviewed_integration_head": "38b8a232416cc7ff3a44ea46eeb1db863b5c256a",
+  "main_integrated": "dd7988b4c90d82f2e019afe6131ee250a5b45109",
+  "raw_results_directory": "/home/tserica/benchmark-results/pr198-review-20261022",
+  "hardware": "Intel Arc Pro B50 8086:E212, native Vulkan",
+  "model": "/home/tserica/models/DSV41-REAP272E-balanced.gguf",
+  "protocol": {
+    "context": 249,
+    "prompt_tokens": 121,
+    "prefill_chunk": 32,
+    "decode_tokens": 1,
+    "warm_prompt_tokens": 8,
+    "warm_decode": 2,
+    "passes": 1,
+    "expert_placement": "cpu-mmap",
+    "engram_disabled": false
+  },
+  "baseline_selector": "cubecl / CubeClExpanded (generic grouped output projection)",
+  "experimental_selector_at_review_head": "production / CubeClNext (grouped Q8 enabled); current explicit equivalent is cubecl-next",
+  "output_comparison": {
+    "absolute_tolerance": 1e-05,
+    "max_abs": 0.16960465908050537,
+    "logits_compared": 258560,
+    "within_absolute_1e_5": false,
+    "baseline_sha256": "b620eec07b1c79d94043952b560d577c71b27358f0b5578a2f850fc576ec78f8",
+    "experimental_sha256": "63af23dda6b5386fe55ff77aa224477e57e6f799ae270756bf1d48d79ad60e8e"
+  },
+  "memory": {
+    "matched_allocator_trajectory_identical": true,
+    "after_session_reserved_live": [
+      [
+        9365831680,
+        9224831488
+      ]
+    ],
+    "main_prefix_checkpoint_budget": 4,
+    "historical_to_current_live_delta_bytes": 42057728,
+    "current_full_128_token_decode_live_bytes": [
+      9279003648,
+      9279003648
+    ],
+    "note": "Current main retains bounded prefix checkpoint state. Baseline and experimental paths have the same checkpoint-enabled memory trajectory; comparing with the older no-checkpoint report is not a matched feature configuration."
+  },
+  "rollout_decision": {
+    "B50_default": "CubeClPacked: Q4_K/Q6_K/Q8_0/Q2_K, existing grouped projection fallback",
+    "grouped_Q8": "opt-in CubeClNext only; parity fails, not eligible for production promotion",
+    "gate_policy": "A single matched run suffices to reject parity; at least two sessions plus parity, speed and memory gates are required to promote. No tolerance relaxed. The root numerical cause of grouped drift remains unresolved; it is quarantined from automatic dispatch."
+  },
+  "full_model_replays_at_review_head": {
+    "qwen_batch32_decode128": "matches prior full-logit hash, allocator trajectory no larger",
+    "deepseek_batch32_decode128": "experimental path matches historical experimental full-logit hash; does not establish parity against current reference; live bytes are flat during decode"
+  },
+  "remaining_validation_scope": "The grouped candidate must pass full-model parity, speed and memory on the integrated engine before promotion. Older successful grouped measurements are historical, not current production acceptance."
+}

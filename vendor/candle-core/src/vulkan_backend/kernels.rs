@@ -1123,7 +1123,10 @@ pub enum Qgemv {
     /// Validated native Q4_K/Q8_0/Q2_K GEMVs with generic accumulation order.
     /// Previous B50 dispatch, retained for matched baseline comparisons.
     CubeClExpanded,
-    /// Q6_K and selected-group Q8, validated on B50 with full-model gates.
+    /// Validated packed formats including Q6_K; grouped Q8 stays opt-in.
+    CubeClPacked,
+    /// Experimental packed formats plus selected-group Q8. The integrated
+    /// DeepSeek workload fails full-model parity; never select automatically.
     CubeClNext,
     /// Diagnostic ablation: use CubeCL for exactly one weight format.
     CubeClFormat(crate::quantized::GgmlDType),
@@ -1145,14 +1148,14 @@ impl Qgemv {
     pub fn for_adapter(vendor_id: u32, device_id: u32, int_dot: bool) -> Self {
         if vendor_id == 0x8086 && device_id == 0xE212
             && std::env::var_os("JOSHUA_VULKAN_QGEMV").is_none() {
-            Self::CubeClNext // Intel Arc Pro B50; full-model acceptance 2026-10-22.
+            Self::CubeClPacked // B50: grouped Q8 is opt-in after integration parity failure.
         } else {
             Self::for_device(vendor_id, int_dot)
         }
     }
 
     /// The kernel for a device with `int_dot` (the `shaderIntegerDotProduct`
-    /// feature enabled): `JOSHUA_VULKAN_QGEMV=cubecl-next|cubecl-expanded|cubecl|mali-int8|mali|generic` when
+    /// feature enabled): `JOSHUA_VULKAN_QGEMV=cubecl-next|cubecl-packed|cubecl-expanded|cubecl|mali-int8|mali|generic` when
     /// set (to force one on any device), else on Arm GPUs the int8 kernel
     /// when the device has the dot-product feature and the float one when
     /// not.
@@ -1164,6 +1167,7 @@ impl Qgemv {
             Ok("cubecl") => Self::CubeCl,
             Ok("cubecl-expanded") => Self::CubeClExpanded,
             Ok("cubecl-next") => Self::CubeClNext,
+            Ok("cubecl-packed") => Self::CubeClPacked,
             _ if vendor_id == Self::ARM_VENDOR_ID && int_dot => Self::MaliInt8 { hw_dot: true },
             _ if vendor_id == Self::ARM_VENDOR_ID => Self::Mali,
             _ => Self::Generic,
@@ -1202,7 +1206,7 @@ pub fn run_qgemv_with(
     let selected = match kernel {
         Qgemv::CubeCl => dtype == crate::quantized::GgmlDType::Q4K,
         Qgemv::CubeClExpanded => dtype != crate::quantized::GgmlDType::Q6K,
-        Qgemv::CubeClNext => true,
+        Qgemv::CubeClPacked | Qgemv::CubeClNext => true,
         Qgemv::CubeClFormat(format) => dtype == format,
         _ => false,
     };
@@ -1230,7 +1234,7 @@ pub fn run_qgemv_with(
     }
     let push = Push::default().us(n)?.us(k)?.i(qtype_code(dtype)).us(dtype.block_size())?.us(dtype.type_size())?.us(xoff)?.i(0).us(m)?;
     match kernel {
-        Qgemv::CubeCl | Qgemv::CubeClExpanded | Qgemv::CubeClNext | Qgemv::CubeClFormat(_) | Qgemv::Generic => d.launch("qgemv", glsl::k_qgemv, &[x, w, out], push, &[], row_grid(n, m, lim.max_groups_x)),
+        Qgemv::CubeCl | Qgemv::CubeClExpanded | Qgemv::CubeClPacked | Qgemv::CubeClNext | Qgemv::CubeClFormat(_) | Qgemv::Generic => d.launch("qgemv", glsl::k_qgemv, &[x, w, out], push, &[], row_grid(n, m, lim.max_groups_x)),
         Qgemv::Mali => {
             let groups = row_grid(n.div_ceil(glsl::QGEMV_MALI_COLS), m.div_ceil(glsl::QGEMV_MALI_ROWS), lim.max_groups_x);
             d.launch("qgemv_mali", glsl::k_qgemv_mali, &[x, w, out], push, &[], groups)

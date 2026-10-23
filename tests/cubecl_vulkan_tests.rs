@@ -192,7 +192,7 @@ fn logits(
 #[test]
 fn tiny_packed_models_match_generic_prefill_decode_and_all_rows() {
     let base = Device::Vulkan(VulkanDevice::new_with_qgemv(0, Qgemv::Generic).unwrap());
-    let candidate = Device::Vulkan(VulkanDevice::new_with_qgemv(0, Qgemv::CubeClNext).unwrap());
+    let candidate = Device::Vulkan(VulkanDevice::new(0).unwrap());
     let dir = common::model_dir("cubecl-q4k-parity");
     type Fixture = (&'static str, fn(&std::path::Path), &'static [bool]);
     // DeepSeek4's raw IQ2_XXS experts require mmap for accelerator execution;
@@ -397,7 +397,9 @@ fn validated_adapter_enables_production_dispatch() {
     if dev.name() == "Intel(R) Arc(tm) Pro B50 Graphics (BMG G21)"
         && std::env::var_os("JOSHUA_VULKAN_QGEMV").is_none()
     {
-        assert_eq!(dev.limits().qgemv, Qgemv::CubeClNext);
+        assert_eq!(dev.limits().qgemv, Qgemv::CubeClPacked);
+        assert!(!kernels::grouped_q8_eligible(&dev, 8, 8192, 4096),
+            "unvalidated grouped projection must remain opt-in");
     }
 }
 
