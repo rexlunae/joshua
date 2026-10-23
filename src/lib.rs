@@ -22,6 +22,7 @@
 //! alongside the `.gguf` file so the engine can tokenise prompts.
 
 mod activation_trace;
+mod precise;
 pub mod anthropic;
 pub mod attention;
 pub mod auto_placement;

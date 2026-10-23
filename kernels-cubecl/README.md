@@ -882,11 +882,51 @@ Further eight-token diagnostics isolate a prefill arithmetic transition at more
 than 16 rows and a router selection tie. Matching the GEMM reduction order makes
 the same-input batch-32 Q8 KV projection bit-identical. Native FP64 scalar RMS
 refinement then makes the first-layer cached keys and dot scores bit-identical;
-the first remaining difference is attention's exponential. These prototypes still
-fail end-to-end parity and were removed. At position 124, layer 3's CPU router
+the first remaining difference is attention's exponential. Those initial prototypes
+failed end-to-end parity. At position 124, layer 3's CPU router
 selects expert 88 instead of 245: a large common bias rounds the selection pair
 to a tie, while independent float64 scoring of either captured input selects 245.
-The report retains these failures and source snapshots. Replay tooling now
+The follow-up centers the selection bias once at load time, removing its common
+offset before scoring; unbiased routing weights are unchanged. The opt-in
+precision path also aligns dense Q4_K/Q8/Q2_K accumulation, interleaved rotation,
+RMS, reductions, attention, MHC, and nonlinear arithmetic across CPU and Vulkan.
+Weights remain compact and borrowed. CPU selected-group Q8 reads only each
+group's input row and writes one output, avoiding a full group-by-output temporary.
+Independent float64 primitive and tiny-model checks retain the **1e-5** gate.
+
+Set `JOSHUA_CPU_DOT_F64=1` for the CPU precision path (AVX2/FMA; dense Q4_K also
+requires AVX-512). For its native Vulkan reference, set
+`JOSHUA_VULKAN_RMS_F64=1 JOSHUA_VULKAN_DOT_F64=1`; the device must support
+`shaderFloat64`. These modes are opt-in and do not change automatic placement.
+The aligned eight-token replay is bit-identical across all 1,163,520 logits and
+1,400 captured layer checkpoints. This short diagnostic does not qualify speed
+or memory; full runs must disable capture and include a fast production control.
+
+The [full follow-up and gate results](benchmarks/deepseek-cpu-parity-b50-20261023.json)
+use the saved 121-token realistic prompt, prefill chunks of 32, **128 teacher-forced
+decode tokens**, context 249, and **two sessions** per path, with capture disabled.
+All three paths use the same frozen executable and tokens.
+
+| Path | Median decode ms/token | Median prefill ms | Max logit difference vs precision reference | Private growth | VRAM growth |
+|---|---:|---:|---:|---:|---:|
+| CPU precision, opt-in | 708.390 | 43,924.8 | **0 (bit-identical)** | 384 KiB | n/a |
+| Native Vulkan precision, opt-in | 1,182.018 | 85,868.6 | 0 | 200 KiB | 0 |
+| Fast production Vulkan control | 811.253 | 40,458.9 | **1.43051e-4 (fails)** | 32 KiB | 0 |
+
+CPU matches all **16,677,120 logits** of the precision reference, with zero
+repeat drift and identical greedy choices. Both precision paths pass repeated
+memory checks; native fallback counters remain zero (routed CPU-mmap experts
+remain intentional). CPU decode is **1.145×** faster and total session time is
+**1.072×** faster than the fast control; prefill alone is slightly slower.
+Every CPU decode and total-session sample beats every fast-control sample.
+
+Automatic choices remain unchanged: the fast production numerical contract
+still differs by more than **1e-5**, despite matching all 129 greedy choices.
+The precision paths remain opt-in. This is cross-backend full-model parity
+supported by independent primitive/tiny-model float64 checks, not an independent
+full-float64 execution of the 290 GB model.
+
+The report retains the failed trials and source snapshots. Replay tooling now
 rejects CPU fallbacks, which invalidated an earlier unsupported GLSL shader trial.
 
 For diagnosis, set `JOSHUA_ACTIVATION_TRACE` to a fresh capture directory and

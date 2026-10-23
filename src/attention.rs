@@ -573,6 +573,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn interleaved_rope_rotation_matches_f64_and_cache_chunks() -> Result<()> {
+        let (batch, heads, seq, dim, offset) = (2, 4, 33, 64, 17);
+        let data: Vec<f32> = (0..batch*heads*seq*dim)
+            .map(|i| ((i%251) as f32-125.)*0.25).collect();
+        let mut devices = vec![Device::Cpu];
+        #[cfg(feature = "vulkan")]
+        if let Ok(dev) = Device::new_vulkan(0) { devices.push(dev); }
+        for dev in devices {
+            let rope = Rope::new(dim, 10000., offset+seq, RopeStyle::Interleaved, &dev)?;
+            let (cos,sin) = rope.tables();
+            let cos = cos.to_vec2::<f32>()?;
+            let sin = sin.to_vec2::<f32>()?;
+            let x = Tensor::from_vec(data.clone(), (batch,heads,seq,dim), &dev)?;
+            let whole = rope.apply(&x, offset)?.flatten_all()?.to_vec1::<f32>()?;
+            let mut chunks = Vec::with_capacity(seq);
+            for t in 0..seq {
+                chunks.push(rope.apply(&x.narrow(2,t,1)?.contiguous()?, offset+t)?);
+            }
+            let chunked = Tensor::cat(&chunks,2)?.flatten_all()?.to_vec1::<f32>()?;
+            assert_eq!(whole, chunked, "{dev:?} prefill/decode");
+            let wide = if dev.is_cpu() {
+                std::env::var("JOSHUA_CPU_DOT_F64").is_ok_and(|v| v=="1")
+            } else {
+                std::env::var("JOSHUA_VULKAN_DOT_F64").is_ok_and(|v| v=="1")
+            };
+            for bh in 0..batch*heads { for t in 0..seq { for pair in 0..dim/2 {
+                let i = (bh*seq+t)*dim+2*pair;
+                let (a,b,c,s) = (data[i] as f64, data[i+1] as f64,
+                    cos[offset+t][pair] as f64, sin[offset+t][pair] as f64);
+                for (got,want) in [(whole[i],(a*c-b*s) as f32),(whole[i+1],(a*s+b*c) as f32)] {
+                    if wide { assert_eq!(got,want,"{dev:?} bh={bh} t={t} pair={pair}"); }
+                    else { assert!((got-want).abs()<=1e-5); }
+                }
+            }}}
+        }
+        Ok(())
+    }
+
+    #[test]
     fn rope_tables_match_independent_high_precision_reference() -> Result<()> {
         // 80-decimal-digit mpmath evaluation of position * exact f32 frequency.
         // Include B50's small-angle failure and phases where f32 multiplication

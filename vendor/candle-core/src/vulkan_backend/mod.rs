@@ -325,7 +325,14 @@ fn init_vulkan(gpu_id: usize, qgemv: Option<kernels::Qgemv>) -> Result<VulkanDev
     };
     let ext_names = [ash::khr::shader_integer_dot_product::NAME.as_ptr()];
     let mut idp_on = vk::PhysicalDeviceShaderIntegerDotProductFeatures::default().shader_integer_dot_product(true);
-    let mut dci = vk::DeviceCreateInfo::default().queue_create_infos(&qci);
+    let f64_rms = kernels::f64_rms_enabled() || kernels::f64_dot_enabled();
+    let supported = unsafe { instance.get_physical_device_features(physical) };
+    if f64_rms && supported.shader_float64 != vk::TRUE {
+        fail!("vulkan: float64 RMS requires shaderFloat64");
+    }
+    let features = vk::PhysicalDeviceFeatures::default().shader_float64(f64_rms);
+    let mut dci = vk::DeviceCreateInfo::default().queue_create_infos(&qci)
+        .enabled_features(&features);
     if int_dot {
         dci = dci.enabled_extension_names(&ext_names).push_next(&mut idp_on);
     }
@@ -1605,11 +1612,20 @@ impl QVulkanStorage {
         let dev = &self.inner.device;
         let out = dev.alloc(DType::F32, m * n)?;
         let w = self.inner.buf();
+        let wide_dot = kernels::f64_dot_enabled() && (matches!(self.dtype,GgmlDType::Q8_0|GgmlDType::Q4K)
+            || (self.dtype == GgmlDType::Q2K && n == 24 && k == 20480));
+        if wide_dot {
+            if m > QGEMV_MAX_ROWS {
+                dev.exec().batch_limit = kernels::PREFILL_MAX_LAUNCHES;
+            }
+            kernels::run_qgemv_f64(dev, self.dtype, storage.buf(), w, out.buf(), m, n, k, o1, 1)?;
+            return Ok((out, dst_shape));
+        }
         match self.dtype {
             GgmlDType::F32 => {
                 let sa = MatStrides { row: k, col: 1, offset: o1, batch: 0 };
                 let sb = MatStrides { row: 1, col: k, offset: 0, batch: 0 };
-                kernels::run_matmul(dev, storage.buf(), w, out.buf(), (1, m, n, k), sa, sb)?;
+                kernels::run_matmul_with_precision(dev, storage.buf(), w, out.buf(), (1,m,n,k),sa,sb,kernels::f64_dot_enabled())?;
             }
             GgmlDType::F16 | GgmlDType::BF16 if m <= QGEMV_MAX_ROWS => {
                 kernels::run_hgemv(dev, self.dtype == GgmlDType::BF16, storage.buf(), w, out.buf(), m, n, k, o1)?;
@@ -1639,7 +1655,7 @@ impl QVulkanStorage {
                 kernels::run_dequant(dev, self.dtype, w, wf, n * k)?;
                 let sa = MatStrides { row: k, col: 1, offset: o1, batch: 0 };
                 let sb = MatStrides { row: 1, col: k, offset: 0, batch: 0 };
-                kernels::run_matmul(dev, storage.buf(), wf, out.buf(), (1, m, n, k), sa, sb)?;
+                kernels::run_matmul_with_precision(dev, storage.buf(), wf, out.buf(), (1,m,n,k), sa,sb,wide_dot)?;
             }
         }
         Ok((out, dst_shape))

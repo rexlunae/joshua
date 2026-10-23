@@ -38,7 +38,7 @@ use std::sync::Arc;
 
 use candle_core::quantized::{gguf_file, GgmlDType, QMatMul, QStorage, QTensor};
 use candle_core::{DType, Device, Module, Result, Tensor, D};
-use candle_nn::ops::{sigmoid, silu, softmax};
+use crate::precise::{sigmoid, silu, softmax};
 use candle_transformers::quantized_nn::RmsNorm;
 
 use crate::gguf_ext::GgufHeader;
@@ -1210,7 +1210,7 @@ impl Compressor {
                     (bkv, bsc)
                 };
                 let w = softmax(&bsc, 1)?;
-                rows.push((bkv * w)?.sum(1)?); // [nb, hd]
+                rows.push(crate::precise::sum(&(bkv*w)?,1)?); // [nb, hd]
                 poss.extend(0..nb as u32);
             }
         } else {
@@ -1246,7 +1246,7 @@ impl Compressor {
                             0,
                         )?;
                         let w = softmax(&sc_state, 0)?;
-                        rows.push((kv_state * w)?.sum_keepdim(0)?); // [1, hd]
+                        rows.push(crate::precise::sum_keepdim(&(kv_state*w)?,0)?); // [1, hd]
                         poss.push((pos / ratio) as u32);
                         // slide the window: current block becomes the previous one
                         state.kv = state.kv.slice_scatter(
@@ -1267,7 +1267,7 @@ impl Compressor {
                         .slice_scatter(&s.unsqueeze(0)?, 0, pos % ratio)?;
                     if (pos + 1).is_multiple_of(ratio) {
                         let w = softmax(&state.score, 0)?;
-                        rows.push(state.kv.mul(&w)?.sum_keepdim(0)?); // [1, hd]
+                        rows.push(crate::precise::sum_keepdim(&state.kv.mul(&w)?,0)?); // [1, hd]
                         poss.push((pos / ratio) as u32);
                     }
                 }
@@ -1407,11 +1407,11 @@ impl Indexer {
             .t()?
             .unsqueeze(0)?
             .broadcast_as((seq, self.head_dim, n_lid))?;
-        let sc = q.matmul(&kt)?; // [seq, ih, n_lid]
+        let sc = crate::precise::matmul(&q,&kt)?; // [seq, ih, n_lid]
         let sc = sc.relu()?;
         let w = self.proj.forward(x)?.squeeze(0)?; // [seq, ih]
         let w = ((w * self.softmax_scale)? * (self.n_head as f64).powf(-0.5))?;
-        let sc = sc.broadcast_mul(&w.unsqueeze(D::Minus1)?)?.sum(1)?; // [seq, n_lid]
+        let sc = crate::precise::sum(&sc.broadcast_mul(&w.unsqueeze(D::Minus1)?)?,1)?; // [seq, n_lid]
 
         // Causal mask: block b is visible to the query at absolute pos p iff
         // b < (p+1)/ratio.
@@ -1755,21 +1755,20 @@ impl Attention {
         let comp = kvs[self.kv_source].comp.clone();
         let (k_all, mask) = self.build_kv(comp.as_ref(), &swa_prev, &kv_raw, offset, seq, lid_idx.as_ref())?;
         crate::activation_trace::record("ds-k-all", &k_all)?;
-        let scores = q.matmul(&k_all.transpose(1, 2)?)?; // [seq, h, n_kv]
+        let scores = crate::precise::matmul(&q, &k_all.transpose(1,2)?)?; // [seq, h, n_kv]
         crate::activation_trace::record("ds-dot-scores", &scores)?;
         let scores = (scores * self.softmax_scale)?.broadcast_add(&mask.unsqueeze(1)?)?;
         let max = scores.max_keepdim(D::Minus1)?;
-        let e = scores.broadcast_sub(&max)?.exp()?;
+        let e = crate::precise::exp(&scores.broadcast_sub(&max)?)?;
         crate::activation_trace::record("ds-exponential", &e)?;
         let sink = self.attn_sinks.unsqueeze(0)?.unsqueeze(2)?; // [1, h, 1]
-        let den = e
-            .sum_keepdim(D::Minus1)?
-            .add(&sink.broadcast_sub(&max)?.exp()?)?; // [seq, h, 1]
+        let den = crate::precise::sum_keepdim(&e,D::Minus1)?
+            .add(&crate::precise::exp(&sink.broadcast_sub(&max)?)?)?; // [seq, h, 1]
         crate::activation_trace::record("ds-denominator", &den)?;
 
         // Batched over `seq`; a broadcast_matmul here would materialize the
         // whole key block once per head.
-        let num = e.contiguous()?.matmul(&k_all)?; // [seq, h, n_kv] @ [seq, n_kv, d] → [seq, h, d]
+        let num = crate::precise::matmul(&e.contiguous()?, &k_all)?; // [seq, h, n_kv] @ [seq, n_kv, d] → [seq, h, d]
         crate::activation_trace::record("ds-numerator", &num)?;
         let o = num.broadcast_div(&den)?; // [seq, h, d]
         crate::activation_trace::record("ds-context", &o)?;
@@ -2236,10 +2235,10 @@ impl Moe {
         let x2 = xs.reshape((n_tokens, h))?;
 
         crate::activation_trace::record("ds-moe-input", &x2)?;
-        let logits = x2.matmul(&self.gate_t)?; // [n_tokens, n_expert]
+        let logits = crate::precise::matmul(&x2, &self.gate_t)?; // [n_tokens, n_expert]
         crate::activation_trace::record("ds-moe-logits", &logits)?;
         // sqrt(softplus(x)) scoring; bias shifts selection only.
-        let probs = crate::moe::Gating::SqrtSoftplus.scores(&logits)?;
+        let probs = crate::precise::sqrt_softplus(&logits)?;
         let (weights, indices) = if self.hash {
             // Hash layers: expert *selection* comes from tid2eid[token_id], but the
             // routing *weights* still come from the gate network's softplus scores
@@ -2276,10 +2275,14 @@ impl Moe {
         // pool from its routing; a prefill only reads the pool.
         let decode = ctx.decode;
         let (routed, routed_ids) = self.dispatch(&x2, &indices, &weights, n_tokens, decode, ctx)?;
+        crate::activation_trace::record("ds-moe-routed", &routed)?;
         let mut out = routed;
         if let Some(shared) = &self.shared {
-            out = (out + shared.forward(&x2)?)?;
+            let shared = shared.forward(&x2)?;
+            crate::activation_trace::record("ds-moe-shared", &shared)?;
+            out = (out + shared)?;
         }
+        crate::activation_trace::record("ds-ffn-out", &out)?;
         Ok((out.reshape((b, seq_len, h))?, routed_ids))
     }
 
@@ -3072,7 +3075,7 @@ impl<R: Read + Seek> Reader<R> {
         Tensor::from_vec(vals, dims, &self.device)
     }
     fn qmatmul(&mut self, name: &str) -> Result<QMatMul> {
-        QMatMul::from_qtensor(self.qtensor(name)?)
+        crate::precise::qmatmul(self.qtensor(name)?)
     }
     fn qmatmul_opt(&mut self, name: &str) -> Result<Option<QMatMul>> {
         // Distinguish "absent" from "present but failed to load": a tensor
@@ -4533,7 +4536,8 @@ fn load_moe<R: Read + Seek>(
         None
     } else {
         rd.has(&format!("{p}.exp_probs_b.bias"))
-            .then(|| rd.f32_tensor(&format!("{p}.exp_probs_b.bias")))
+            .then(|| rd.f32_tensor(&format!("{p}.exp_probs_b.bias"))
+                .and_then(|b| crate::moe::center_selection_bias(&b)))
             .transpose()?
     };
     // A hash layer routes through the table on every token, so a missing one is

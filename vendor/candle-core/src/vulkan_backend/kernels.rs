@@ -764,6 +764,9 @@ fn unary_launch(d: &VulkanDevice, op: i32, f0: f32, f1: f32, x: Buf, out: Buf, n
     };
     let push = Push::default().us(n)?.i(contig).us(off)?.i(op).f(f0).f(f1);
     let lim = d.limits();
+    if f64_dot_enabled() {
+        return d.launch("unary_precise",glsl::k_unary_precise,&[x,out],push,&[ix],grid(n,lim.wg,1,lim.max_groups_x));
+    }
     d.launch("unary", glsl::k_unary, &[x, out], push, &[ix], grid(n, lim.wg, 1, lim.max_groups_x))
 }
 
@@ -791,6 +794,9 @@ pub fn run_binary(d: &VulkanDevice, op: i32, a: Buf, b: Buf, out: Buf, n: usize,
     };
     let push = Push::default().us(n)?.i(contig).us(oa)?.us(ob)?.i(op);
     let lim = d.limits();
+    if !u32 && f64_dot_enabled() {
+        return d.launch("binary_precise",glsl::k_binary_precise,&[a,b,out],push,&[ix],grid(n,lim.wg,1,lim.max_groups_x));
+    }
     let key = if u32 { "binary_u32" } else { "binary_f32" };
     d.launch(key, |wg| glsl::k_binary(wg, u32), &[a, b, out], push, &[ix], grid(n, lim.wg, 1, lim.max_groups_x))
 }
@@ -1019,7 +1025,11 @@ pub struct MatStrides {
 
 /// `C[bz] = A[bz] @ B[bz]` for `batch` matrices of `(m, k) @ (k, n)`; C is
 /// written contiguous `[batch, m, n]`.  Picks the GEMV kernels for `m == 1`.
-pub fn run_matmul(d: &VulkanDevice, a: Buf, b: Buf, out: Buf, (batch, m, n, k): (usize, usize, usize, usize), sa: MatStrides, sb: MatStrides) -> Result<()> {
+pub fn run_matmul(d: &VulkanDevice, a: Buf, b: Buf, out: Buf, dims: (usize, usize, usize, usize), sa: MatStrides, sb: MatStrides) -> Result<()> {
+    run_matmul_with_precision(d, a, b, out, dims, sa, sb, false)
+}
+
+pub fn run_matmul_with_precision(d: &VulkanDevice, a: Buf, b: Buf, out: Buf, (batch, m, n, k): (usize, usize, usize, usize), sa: MatStrides, sb: MatStrides, wide: bool) -> Result<()> {
     if batch == 0 || m == 0 || n == 0 {
         return Ok(());
     }
@@ -1030,7 +1040,7 @@ pub fn run_matmul(d: &VulkanDevice, a: Buf, b: Buf, out: Buf, (batch, m, n, k): 
         return run_fill(d, 4, out, n_out, &Layout::contiguous(n_out), 0);
     }
     let lim = d.limits();
-    if m == 1 && sa.col == 1 {
+    if !wide && m == 1 && sa.col == 1 {
         let push = |sbx: usize| -> Result<Push> {
             Push::default().us(n)?.us(k)?.us(sbx)?.us(sa.offset)?.us(sb.offset)?.i(0).us(sa.batch)?.us(sb.batch)?.us(n)
         };
@@ -1060,6 +1070,9 @@ pub fn run_matmul(d: &VulkanDevice, a: Buf, b: Buf, out: Buf, (batch, m, n, k): 
         .i((sb.row == 1) as i32);
     let gx = n.div_ceil(tile) as u32;
     let gy = m.div_ceil(tile) as u32;
+    if wide {
+        return d.launch("gemm_f64", |wg| glsl::k_gemm_f64(wg, tx), &[a,b,out], push, &[], [gx,gy,batch as u32]);
+    }
     d.launch("gemm", |wg| glsl::k_gemm(wg, tx), &[a, b, out], push, &[], [gx, gy, batch as u32])
 }
 
@@ -1071,9 +1084,23 @@ pub fn run_softmax_last(d: &VulkanDevice, x: Buf, out: Buf, rows: usize, cols: u
     d.launch("softmax_last", glsl::k_softmax_last, &[x, out], push, &[], row_grid(rows, 1, lim.max_groups_x))
 }
 
+pub fn f64_rms_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("JOSHUA_VULKAN_RMS_F64").is_ok_and(|v| v == "1"))
+}
+
+pub fn run_rms_rows_f64(d: &VulkanDevice, x: Buf, out: Buf, rows: usize, cols: usize, off: usize, eps: f32) -> Result<()> {
+    let push = Push::default().us(rows)?.us(cols)?.us(off)?.i(0).f(eps);
+    let lim = d.limits();
+    d.launch("rms_rows_f64", |_| glsl::k_rmsnorm_f64(64, false), &[x, x, out], push, &[], row_grid(rows, 1, lim.max_groups_x))
+}
+
 pub fn run_rmsnorm(d: &VulkanDevice, x: Buf, alpha: Buf, out: Buf, rows: usize, cols: usize, off: usize, aoff: usize, eps: f32) -> Result<()> {
     let push = Push::default().us(rows)?.us(cols)?.us(off)?.us(aoff)?.f(eps);
     let lim = d.limits();
+    if f64_rms_enabled() {
+        return d.launch("rmsnorm_f64", |_| glsl::k_rmsnorm_f64(64, true), &[x, alpha, out], push, &[], row_grid(rows, 1, lim.max_groups_x));
+    }
     d.launch("rmsnorm", glsl::k_rmsnorm, &[x, alpha, out], push, &[], row_grid(rows, 1, lim.max_groups_x))
 }
 
@@ -1083,6 +1110,9 @@ pub fn run_rope(d: &VulkanDevice, interleaved: bool, x: Buf, cos: Buf, sin: Buf,
     let n_pairs = b * h * t * (dd / 2);
     let push = Push::default().us(n_pairs)?.us(h)?.us(t)?.us(dd)?.us(xoff)?.us(coff)?.us(soff)?.i(cs_batched as i32);
     let lim = d.limits();
+    if interleaved && f64_dot_enabled() {
+        return d.launch("rope_i_f64", glsl::k_rope_i_f64, &[x,cos,sin,out], push, &[], grid(n_pairs,lim.wg,1,lim.max_groups_x));
+    }
     let key = if interleaved { "rope_i" } else { "rope" };
     d.launch(key, |wg| glsl::k_rope(wg, interleaved), &[x, cos, sin, out], push, &[], grid(n_pairs, lim.wg, 1, lim.max_groups_x))
 }
@@ -1179,6 +1209,18 @@ impl Qgemv {
 
 /// `C[m, n] = sum_k X[m, k] * W[n, k]` over block-quantized `W` (`[N, K]`),
 /// with the device's [`Qgemv`] kernel.
+pub fn f64_dot_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("JOSHUA_VULKAN_DOT_F64").is_ok_and(|v| v == "1"))
+}
+
+pub fn run_qgemv_f64(d: &VulkanDevice, dtype: crate::quantized::GgmlDType, x: Buf, w: Buf, out: Buf, m: usize, n: usize, k: usize, off: usize, groups: usize) -> Result<()> {
+    let p = Push::default().us(n)?.us(k)?.i(qtype_code(dtype)).us(dtype.block_size())?.us(dtype.type_size())?.us(off)?.i(0).us(m)?;
+    let lim=d.limits();let lanes=if dtype==crate::quantized::GgmlDType::Q8_0{4}else{8};
+    let name=match(lanes,groups){(4,1)=>std::borrow::Cow::Borrowed("qgemv_f64_l4"),(8,1)=>std::borrow::Cow::Borrowed("qgemv_f64_l8"),(4,8)=>std::borrow::Cow::Borrowed("grouped_q8_f64_l4_g8"),_=>std::borrow::Cow::Owned(format!("qgemv_f64_l{lanes}_g{groups}"))};
+    d.launch(&name, |_|glsl::k_qgemv_f64(64,groups,lanes),&[x,w,out],p,&[],row_grid(n.div_ceil(64/lanes),m,lim.max_groups_x))
+}
+
 pub fn run_qgemv(d: &VulkanDevice, dtype: crate::quantized::GgmlDType, x: Buf, w: Buf, out: Buf, m: usize, n: usize, k: usize, xoff: usize) -> Result<()> {
     run_qgemv_with(d, d.limits().qgemv, dtype, x, w, out, m, n, k, xoff)
 }
@@ -1270,6 +1312,9 @@ pub fn run_grouped_q8(d: &VulkanDevice, x: Buf, w: Buf, out: Buf,
         || inputs.is_none_or(|v| v as u64 > x.bytes || v > u32::MAX as usize)
         || n as u64 * 4 > out.bytes {
         return Err(Error::Msg("vulkan grouped Q8: invalid geometry or buffer range".into()));
+    }
+    if f64_dot_enabled() {
+        return run_qgemv_f64(d, crate::quantized::GgmlDType::Q8_0, x, w, out, 1, n, k, xoff, groups);
     }
     let params = Push::default().us(k)?.us(n)?.us(xoff)?.us(n / groups)?;
     d.launch_spirv_params("grouped_q8_cubecl_256",
@@ -1434,4 +1479,13 @@ void main() {
 "#,
         );
     }
+}
+
+pub fn run_precise_unary(d:&VulkanDevice,x:Buf,out:Buf,n:usize,off:usize,op:u32)->Result<()> {
+ let p=Push::default().us(n)?.us(off)?.i(op as i32);let lim=d.limits();
+ d.launch("precise_unary",glsl::k_precise_unary,&[x,out],p,&[],grid(n,lim.wg,1,lim.max_groups_x))
+}
+pub fn run_precise_rows(d:&VulkanDevice,x:Buf,out:Buf,rows:usize,cols:usize,inner:usize,off:usize,soft:bool)->Result<()> {
+ let p=Push::default().us(rows)?.us(cols)?.us(inner)?.us(off)?.i(soft as i32);let lim=d.limits();
+ d.launch("precise_rows", |_|glsl::k_precise_rows(64),&[x,out],p,&[],grid(rows,64,1,lim.max_groups_x))
 }

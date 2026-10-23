@@ -11,7 +11,7 @@
 
 use candle_core::quantized::QMatMul;
 use candle_core::{Module, Result, Tensor, D};
-use candle_nn::ops::{sigmoid, softmax_last_dim};
+use crate::precise::{sigmoid, softmax_last_dim};
 
 /// One sublayer's mixing weights.
 pub struct HcMix {
@@ -77,10 +77,10 @@ fn split_sinkhorn_with_scale(
     let comb0 = comb0.reshape((n, hc, hc))?;
 
     let mut comb = softmax_last_dim(&comb0)?.affine(1.0, eps)?;
-    comb = comb.broadcast_div(&comb.sum_keepdim(1)?.affine(1.0, eps)?)?;
+    comb = comb.broadcast_div(&crate::precise::sum_keepdim(&comb,1)?.affine(1.0, eps)?)?;
     for _ in 0..iters.saturating_sub(1) {
-        comb = comb.broadcast_div(&comb.sum_keepdim(2)?.affine(1.0, eps)?)?;
-        comb = comb.broadcast_div(&comb.sum_keepdim(1)?.affine(1.0, eps)?)?;
+        comb = comb.broadcast_div(&crate::precise::sum_keepdim(&comb,2)?.affine(1.0, eps)?)?;
+        comb = comb.broadcast_div(&crate::precise::sum_keepdim(&comb,1)?.affine(1.0, eps)?)?;
     }
 
     let lead = &shape[..shape.len() - 1];
@@ -121,8 +121,51 @@ fn project_mixes(x: &Tensor, hc_fn: &QMatMul, rms_eps: f64) -> Result<(Tensor, u
     Ok((mixes, hc))
 }
 
+#[cfg(feature = "vulkan")]
+struct VulkanRmsRowsF64(f32);
+#[cfg(feature = "vulkan")]
+impl candle_core::CustomOp1 for VulkanRmsRowsF64 {
+    fn name(&self) -> &'static str {
+        "rms-rows-f64"
+    }
+    fn cpu_fwd(
+        &self,
+        _: &candle_core::CpuStorage,
+        _: &candle_core::Layout,
+    ) -> Result<(candle_core::CpuStorage, candle_core::Shape)> {
+        candle_core::bail!("rms-rows-f64 requires Vulkan")
+    }
+    fn vulkan_fwd(
+        &self,
+        x: &candle_core::VulkanStorage,
+        l: &candle_core::Layout,
+    ) -> Result<(candle_core::VulkanStorage, candle_core::Shape)> {
+        let cols = l.dims().last().copied().unwrap_or(0);
+        let rows = l.shape().elem_count() / cols;
+        let out = x.device.alloc(candle_core::DType::F32, rows * cols)?;
+        candle_core::vulkan_backend::kernels::run_rms_rows_f64(
+            &x.device,
+            x.buf(),
+            out.buf(),
+            rows,
+            cols,
+            l.start_offset(),
+            self.0,
+        )?;
+        Ok((out, l.shape().clone()))
+    }
+}
+
 /// Unweighted RMS norm over the last dim.
 pub fn rms_rows(x: &Tensor, eps: f64) -> Result<Tensor> {
+    #[cfg(feature = "vulkan")]
+    if matches!(x.device(), candle_core::Device::Vulkan(_))
+        && x.dtype() == candle_core::DType::F32 && x.is_contiguous()
+        && x.dim(D::Minus1)? != 0
+        && candle_core::vulkan_backend::kernels::f64_rms_enabled()
+    {
+        return x.apply_op1_no_bwd(&VulkanRmsRowsF64(eps as f32));
+    }
     // A flattened hyper-connection row can be 20,480 elements wide. The
     // generic CPU f32 sum loses enough low bits to move the normalized row
     // by >1e-5. Borrow the input and accumulate in f64, using only the output
@@ -187,10 +230,8 @@ mod rms_tests {
 /// Collapse the `hc` copies of `x` (`[b, s, hc, d]`) to one stream with the
 /// weights `pre` (`[b, s, hc]`).
 pub fn collapse(x: &Tensor, pre: &Tensor) -> Result<Tensor> {
-    pre.unsqueeze(D::Minus1)?
-        .broadcast_as(x.shape())?
-        .mul(x)?
-        .sum(D::Minus2)
+    let weighted = pre.unsqueeze(D::Minus1)?.broadcast_as(x.shape())?.mul(x)?;
+    crate::precise::sum(&weighted, D::Minus2)
 }
 
 /// `hc_post`: expand one stream back to `hc` copies.
@@ -203,10 +244,7 @@ pub fn post(x: &Tensor, residual: &Tensor, post: &Tensor, comb: &Tensor) -> Resu
     let post_t = post.unsqueeze(D::Minus1)?.broadcast_as((b, s, hc, d))?;
     let x_t = x.unsqueeze(2)?.broadcast_as((b, s, hc, d))?;
     // [b, s, dst, src] · [b, s, src, d] → [b, s, dst, d]
-    let comb_src = comb
-        .transpose(2, 3)?
-        .contiguous()?
-        .matmul(&residual.contiguous()?)?;
+    let comb_src = crate::precise::matmul(&comb.transpose(2,3)?.contiguous()?, &residual.contiguous()?)?;
     (post_t * x_t)?.add(&comb_src)
 }
 

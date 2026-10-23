@@ -138,6 +138,15 @@ impl candle::CustomOp3 for RotaryEmbI {
             sin: &[T],
             l_sin: &Layout,
         ) -> Result<(CpuStorage, Shape)> {
+            static WIDE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let wide = T::DTYPE == candle::DType::F32 && *WIDE.get_or_init(||
+                std::env::var("JOSHUA_CPU_DOT_F64").is_ok_and(|v| v == "1"));
+            let rotate = |x0: T, x1: T, c: T, s: T| -> (T,T) {
+                if wide {
+                    let (a,b,c,s) = (x0.to_f64(), x1.to_f64(), c.to_f64(), s.to_f64());
+                    (num_traits::cast(a*c-b*s).unwrap(), num_traits::cast(a*s+b*c).unwrap())
+                } else { (x0*c-x1*s, x0*s+x1*c) }
+            };
             let src = match l_src.contiguous_offsets() {
                 None => candle::bail!("input src has to be contiguous"),
                 Some((o1, o2)) => &src[o1..o2],
@@ -165,8 +174,7 @@ impl candle::CustomOp3 for RotaryEmbI {
                         } else {
                             i_over_2
                         };
-                        dst[i] = src[i] * cos[rope_i] - src[i + 1] * sin[rope_i];
-                        dst[i + 1] = src[i] * sin[rope_i] + src[i + 1] * cos[rope_i];
+                        (dst[i], dst[i+1]) = rotate(src[i], src[i+1], cos[rope_i], sin[rope_i]);
                     }
                 }
             } else {
@@ -182,8 +190,7 @@ impl candle::CustomOp3 for RotaryEmbI {
                             } else {
                                 i_over_2
                             };
-                            dst[i] = src[i] * cos[rope_i] - src[i + 1] * sin[rope_i];
-                            dst[i + 1] = src[i] * sin[rope_i] + src[i + 1] * cos[rope_i];
+                            (dst[i], dst[i+1]) = rotate(src[i], src[i+1], cos[rope_i], sin[rope_i]);
                         }
                     });
             }

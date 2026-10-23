@@ -849,6 +849,13 @@ void main() {{
     s
 }
 
+pub fn k_gemm_f64(wg: usize, tx: usize) -> String {
+    k_gemm(wg, tx).replace("float acc[16];", "double acc[16];")
+        .replace("acc[i] = 0.0;", "acc[i] = double(0.0);")
+        .replace("float a", "double a").replace("float b", "double b")
+        .replace("= acc[r * 4 + c];", "= float(acc[r * 4 + c]);")
+}
+
 /// GEMV for a transposed weight (B contiguous along k): one work-group per
 /// `n` (2-D grid) with the batch on z.  Push: `N, K, sbn, oa, ob, oc, ba, bb, bc`.
 pub fn k_gemv_nt(wg: usize) -> String {
@@ -980,6 +987,26 @@ void main() {
     s
 }
 
+/// Diagnostic accurate wide-row RMS: f64 accumulation and scaling, f32 storage.
+pub fn k_rmsnorm_f64(wg: usize, weighted: bool) -> String {
+    let mut s=prelude(wg,3);s+=&buf(0,"float","x",true);s+=&buf(1,"float","alpha",true);s+=&buf(2,"float","o",false);
+    s+=r#"
+layout(push_constant) uniform PC {int rows;int cols;int off;int aoff;float eps;} pc;
+layout(local_size_x=WG) in;
+shared double sh[8];
+void main(){
+ int row=grow();int t=int(gl_LocalInvocationID.x);if(row>=pc.rows)return;
+ int r=pc.off+row*pc.cols;int w=row*pc.cols;
+ if(t<8){double ss=double(0.0);for(int c=t;c<pc.cols;c+=8){double v=double(x[r+c]);ss+=v*v;}sh[t]=ss;}
+ barrier();
+ if(t==0){double sum=double(0.0);for(int i=0;i<8;i++)sum+=sh[i];sh[0]=double(1.0)/sqrt(sum/double(pc.cols)+double(pc.eps));}
+ barrier();double scale=sh[0];
+ for(int c=t;c<pc.cols;c+=WG){
+"#;
+    s+=if weighted{"o[w+c]=float(double(x[r+c])*scale*double(alpha[pc.aoff+c]));"}else{"o[w+c]=float(double(x[r+c])*scale);"};
+    s+="\n}\n}\n";s
+}
+
 /// RoPE over `x [b, h, t, d]` with `cos`/`sin` `[t, d/2]` (or `[b, t, d/2]`
 /// when `cs_b`); `interleaved` selects candle's `rope_i` pairing.
 /// Push: `n_pairs, h, t, d, xoff, coff, soff, cs_b`.
@@ -1027,6 +1054,16 @@ void main() {{
 "#
     );
     s
+}
+
+pub fn k_rope_i_f64(wg: usize) -> String {
+    k_rope(wg, true)
+        .replace("float x1 = x[pc.xoff + base];", "double x1 = double(x[pc.xoff + base]);")
+        .replace("float x2 = x[pc.xoff + base + 1];", "double x2 = double(x[pc.xoff + base + 1]);")
+        .replace("float c = cs[pc.coff + ci];", "double c = double(cs[pc.coff + ci]);")
+        .replace("float s = sn[pc.soff + ci];", "double s = double(sn[pc.soff + ci]);")
+        .replace("o[base] = x1 * c - x2 * s;", "o[base] = float(x1 * c - x2 * s);")
+        .replace("o[base + 1] = x1 * s + x2 * c;", "o[base + 1] = float(x1 * s + x2 * c);")
 }
 
 /// Byte-addressed helpers over the packed weight buffer `W` and the
@@ -1225,6 +1262,45 @@ void main() {
 }
 "#;
     s
+}
+
+// Match the CPU's 4-lane Q8 / 8-lane Q4,Q2 accumulation exactly in
+// prefill as well as decode. Several output rows share one workgroup.
+pub fn k_qgemv_f64(wg: usize, groups: usize, lanes: usize) -> String {
+    let mut s=prelude(wg,3);s+=&buf(0,"float","X",true);s+=&buf(1,"uint","W",true);s+=&buf(2,"float","C",false);s+=QUANT_FN;
+    s+=&format!("\n#define LANES {lanes}\n#define GROUPS {groups}\n");
+    s+=r#"
+layout(push_constant) uniform PC {int N;int K;int qt;int qk;int bsz;int xoff;int coff;int M;} pc;
+layout(local_size_x=WG) in;
+shared double partial[WG];
+void main(){
+ int t=int(gl_LocalInvocationID.x);int lane=t%LANES;int local_row=t/LANES;
+ int n=grow()*(WG/LANES)+local_row;int m=int(gl_WorkGroupID.z);
+ if(m>=pc.M)return;
+ double acc=double(0.0);
+ if(n<pc.N){
+  int xr=GROUPS>1?n/(pc.N/GROUPS):m;int x=pc.xoff+xr*pc.K;
+  int nb=pc.K/pc.qk;
+  for(int b=0;b<nb;b++){
+   uint p=uint(n*nb+b)*uint(pc.bsz);float d;float dm;
+   if(pc.qt==8){d=f16_at(p);dm=0.0;}else if(pc.qt==12){d=f16_at(p);dm=f16_at(p+2u);}else{d=f16_at(p+80u);dm=f16_at(p+82u);}
+   for(int sg=0;sg<pc.qk/32;sg++){
+    uint sc=0u;uint mn=0u;
+    if(pc.qt==12)k4_scale(p+4u,sg,sc,mn);
+    for(int i=lane;i<32;i+=LANES){
+     float w;
+     if(pc.qt==8){w=d*float(i8_at(p+2u+uint(i)));}
+     else if(pc.qt==12){uint q=byte_at(p+16u+uint(sg/2*32+i));q=(q>>uint((sg%2)*4))&15u;w=(d*float(sc))*float(q)-dm*float(mn);}
+     else{int hh=sg/4;uint sh=uint(2*(sg%4));uint scale=byte_at(p+uint(8*hh+2*(sg%4)+i/16));uint q=(byte_at(p+16u+uint(32*hh+i))>>sh)&3u;w=(d*float(scale&15u))*float(q)-dm*float(scale>>4u);}
+     acc=fma(double(X[x+b*pc.qk+sg*32+i]),double(w),acc);
+    }
+   }
+  }
+ }
+ partial[t]=acc;barrier();
+ if(lane==0&&n<pc.N){double sum=double(0.0);for(int i=0;i<LANES;i++)sum+=partial[local_row*LANES+i];C[pc.coff+m*pc.N+n]=float(sum);}
+}
+"#;s
 }
 
 /// Work-group size of [`k_qgemv_mali`]: four 16-wide Mali warps.
@@ -1500,4 +1576,97 @@ void main() {
 }
 "#;
     s
+}
+
+const PRECISE_MATH: &str = r#"
+double wide_exp(double x) {
+    if (isnan(x)) return x;
+    if (x < double(-208.0)) return double(0.0);
+    if (x > double(89.0)) return double(uintBitsToFloat(0x7f800000u));
+    double inv = double(uintBitsToFloat(0x3fb8aa3bu)) + double(uintBitsToFloat(0x32a57060u));
+    int n = int(floor(fma(x,inv,double(0.5))));
+    double r = fma(-double(n),double(uintBitsToFloat(0x3f317218u)),x);
+    r = fma(-double(n),double(uintBitsToFloat(0xb102e308u)),r);
+    r = fma(-double(n),double(uintBitsToFloat(0xa4ca86c4u)),r);
+    double p = double(1.0)/(double(6227020800.0)*double(14.0));
+    p = fma(p,r,double(1.0)/double(6227020800.0));
+    p = fma(p,r,double(1.0)/double(479001600.0));
+    p = fma(p,r,double(1.0)/double(39916800.0));
+    p = fma(p,r,double(1.0)/double(3628800.0));
+    p = fma(p,r,double(1.0)/double(362880.0));
+    p = fma(p,r,double(1.0)/double(40320.0));
+    p = fma(p,r,double(1.0)/double(5040.0));
+    p = fma(p,r,double(1.0)/double(720.0));
+    p = fma(p,r,double(1.0)/double(120.0));
+    p = fma(p,r,double(1.0)/double(24.0));
+    p = fma(p,r,double(1.0)/double(6.0));
+    p = fma(p,r,double(1.0)/double(2.0));
+    p = fma(p,r,double(1.0)/double(1.0));
+    p = fma(p,r,double(1.0)/double(1.0));
+    int h = n/3;
+    return p*double(uintBitsToFloat(uint(h+127)<<23u))*double(uintBitsToFloat(uint(h+127)<<23u))*double(uintBitsToFloat(uint(n-2*h+127)<<23u));
+}
+float wide_unary(float x,int op) {
+    double v = double(x);
+    if (op == 0) return float(wide_exp(v));
+    double e = wide_exp(-abs(v));
+    if (op == 3) {
+        double z = e/(double(2.0)+e);
+        double zz = z*z;
+        double p = double(1.0)/double(31.0);
+        p = fma(p,zz,double(1.0)/double(29.0));
+        p = fma(p,zz,double(1.0)/double(27.0));
+        p = fma(p,zz,double(1.0)/double(25.0));
+        p = fma(p,zz,double(1.0)/double(23.0));
+        p = fma(p,zz,double(1.0)/double(21.0));
+        p = fma(p,zz,double(1.0)/double(19.0));
+        p = fma(p,zz,double(1.0)/double(17.0));
+        p = fma(p,zz,double(1.0)/double(15.0));
+        p = fma(p,zz,double(1.0)/double(13.0));
+        p = fma(p,zz,double(1.0)/double(11.0));
+        p = fma(p,zz,double(1.0)/double(9.0));
+        p = fma(p,zz,double(1.0)/double(7.0));
+        p = fma(p,zz,double(1.0)/double(5.0));
+        p = fma(p,zz,double(1.0)/double(3.0));
+        p = fma(p,zz,double(1.0)/double(1.0));
+        return float(sqrt(max(v,double(0.0))+double(2.0)*z*p));
+    }
+    double sigmoid = v >= double(0.0) ? double(1.0)/(double(1.0)+e) : e/(double(1.0)+e);
+    return float(op == 1 ? sigmoid : v*sigmoid);
+}
+"#;
+
+pub fn k_precise_unary(wg: usize) -> String {
+    let mut s=prelude(wg,2);s+=&buf(0,"float","X",true);s+=&buf(1,"float","O",false);s+=PRECISE_MATH;
+    s+=r#"
+layout(push_constant) uniform PC { int n; int off; int op; } pc;
+layout(local_size_x=WG) in;
+void main(){int i=gid();if(i<pc.n)O[i]=wide_unary(X[pc.off+i],pc.op);}
+"#;s
+}
+pub fn k_precise_rows(wg:usize)->String {
+    let mut s=prelude(wg,2);s+=&buf(0,"float","X",true);s+=&buf(1,"float","O",false);s+=PRECISE_MATH;
+    s+=r#"
+layout(push_constant) uniform PC {int rows;int cols;int inner;int off;int soft;} pc;
+layout(local_size_x=WG) in;
+void main(){
+ int row=gid();if(row>=pc.rows)return;
+ int base=(row/pc.inner)*pc.cols*pc.inner+row%pc.inner;
+ if(pc.soft==0){double sum=double(0.0);for(int c=0;c<pc.cols;c++)sum+=double(X[pc.off+base+c*pc.inner]);O[row]=float(sum);}
+ else{
+  float m=-uintBitsToFloat(0x7f800000u);for(int c=0;c<pc.cols;c++)m=max(m,X[pc.off+base+c*pc.inner]);
+  double sum=double(0.0);for(int c=0;c<pc.cols;c++)sum+=wide_exp(double(X[pc.off+base+c*pc.inner])-double(m));
+  for(int c=0;c<pc.cols;c++)O[base+c*pc.inner]=float(wide_exp(double(X[pc.off+base+c*pc.inner])-double(m))/sum);
+ }
+}
+"#;s
+}
+pub fn k_unary_precise(wg:usize)->String {
+    k_unary(wg)
+      .replace("case 6: return 1.0 / v;","case 6: return float(double(1.0)/double(v));")
+      .replace("case 8: return sqrt(v);","case 8: return float(sqrt(double(v)));")
+      .replace("case 20: return v * f0 + f1;","case 20: { float product=float(double(v)*double(f0)); return product+f1; }")
+}
+pub fn k_binary_precise(wg:usize)->String {
+    k_binary(wg,false).replace("case 3: return a / b;","case 3: return float(double(a)/double(b));")
 }
