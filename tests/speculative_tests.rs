@@ -680,5 +680,8 @@ fn sampled_self_draft_matches_plain_token_for_token() {
     }
     let stats = spec.speculative_stats();
     assert!(stats.drafted > 0, "nothing was drafted: {stats:?}");
+    // The position shift only appears after an accepted draft advances
+    // `n_cur`; without an acceptance the test would pass on the broken code.
+    assert!(stats.accepted > 0, "no draft was accepted: {stats:?}");
     std::fs::remove_dir_all(&dir).ok();
 }

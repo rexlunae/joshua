@@ -260,6 +260,9 @@ pub fn benchmark(device: &Device) -> DenseBench {
 /// part that touches a device).
 ///
 /// * An explicit `Device` / `Cpu` request wins (the operator overrides Auto).
+/// * `Auto` first checks feasibility: a dense set the device cannot hold is
+///   never chosen, however fast the device measures, because the load would
+///   be refused outright (#176).  `dense_fits` is that gate.
 /// * `Auto` keeps dense on the accelerator when it is at least
 ///   [`MIN_DEVICE_SPEEDUP`] faster than CPU-BLAS on the **decode** shape, and
 ///   moves it to CPU-BLAS otherwise.  Decode is the gating phase because it is
@@ -272,12 +275,13 @@ pub fn recommend_dense(
     requested: DensePlacement,
     bench: &DenseBench,
     is_cpu_device: bool,
+    dense_fits: bool,
 ) -> ResolvedDense {
     match requested {
         DensePlacement::Device => ResolvedDense::Device,
         DensePlacement::Cpu => ResolvedDense::Cpu,
         DensePlacement::Auto => {
-            if is_cpu_device {
+            if is_cpu_device || !dense_fits {
                 return ResolvedDense::Cpu;
             }
             if bench.best_speedup() >= MIN_DEVICE_SPEEDUP {
@@ -286,6 +290,25 @@ pub fn recommend_dense(
                 ResolvedDense::Cpu
             }
         }
+    }
+}
+
+/// The same decision without a measurement, for a startup that skips the
+/// probe (`JOSHUA_SKIP_PLACEMENT_BENCH`).  `Auto` keeps its historical
+/// on-device default, but the feasibility gate still applies: a dense set
+/// that does not fit the device can only fail the load (#176).  An explicit
+/// request is honoured as-is, so `--dense-placement device` still gets the
+/// error that explains why the model does not fit.
+pub fn resolve_dense_without_probe(
+    requested: DensePlacement,
+    is_cpu_device: bool,
+    dense_fits: bool,
+) -> ResolvedDense {
+    match crate::placement::resolve_dense_placement(requested, is_cpu_device) {
+        ResolvedDense::Device if requested == DensePlacement::Auto && !dense_fits => {
+            ResolvedDense::Cpu
+        }
+        other => other,
     }
 }
 
@@ -363,7 +386,7 @@ mod tests {
         // A8070-class device: ~30x faster decode, ~15x faster prefill.
         let b = bench(1200.0, 900.0, 40.0, 60.0);
         assert_eq!(
-            recommend_dense(DensePlacement::Auto, &b, false),
+            recommend_dense(DensePlacement::Auto, &b, false, true),
             ResolvedDense::Device
         );
     }
@@ -373,7 +396,7 @@ mod tests {
         // Renoir-class device: far slower than CPU-BLAS.
         let b = bench(5.0, 8.0, 40.0, 120.0);
         assert_eq!(
-            recommend_dense(DensePlacement::Auto, &b, false),
+            recommend_dense(DensePlacement::Auto, &b, false, true),
             ResolvedDense::Cpu
         );
     }
@@ -382,7 +405,7 @@ mod tests {
     fn auto_is_cpu_on_cpu_device() {
         let b = bench(0.0, 0.0, 40.0, 120.0);
         assert_eq!(
-            recommend_dense(DensePlacement::Auto, &b, true),
+            recommend_dense(DensePlacement::Auto, &b, true, true),
             ResolvedDense::Cpu
         );
     }
@@ -391,7 +414,7 @@ mod tests {
     fn unmeasurable_device_falls_back_to_cpu() {
         let b = bench(0.0, 0.0, 40.0, 120.0);
         assert_eq!(
-            recommend_dense(DensePlacement::Auto, &b, false),
+            recommend_dense(DensePlacement::Auto, &b, false, true),
             ResolvedDense::Cpu
         );
     }
@@ -408,7 +431,7 @@ mod tests {
         );
         assert!(b.decode_speedup() < MIN_DEVICE_SPEEDUP);
         assert_eq!(
-            recommend_dense(DensePlacement::Auto, &b, false),
+            recommend_dense(DensePlacement::Auto, &b, false, true),
             ResolvedDense::Cpu
         );
     }
@@ -419,7 +442,7 @@ mod tests {
         // even with a prefill ratio below the threshold.
         let b = bench(200.0, 60.0, 40.0, 120.0); // 5.0x decode, 0.5x prefill
         assert_eq!(
-            recommend_dense(DensePlacement::Auto, &b, false),
+            recommend_dense(DensePlacement::Auto, &b, false, true),
             ResolvedDense::Device
         );
     }
@@ -429,12 +452,12 @@ mod tests {
         let weak = bench(5.0, 8.0, 40.0, 120.0);
         // Operator can still force the device even when Auto would pick CPU.
         assert_eq!(
-            recommend_dense(DensePlacement::Device, &weak, false),
+            recommend_dense(DensePlacement::Device, &weak, false, true),
             ResolvedDense::Device
         );
         let strong = bench(1200.0, 900.0, 40.0, 60.0);
         assert_eq!(
-            recommend_dense(DensePlacement::Cpu, &strong, false),
+            recommend_dense(DensePlacement::Cpu, &strong, false, true),
             ResolvedDense::Cpu
         );
     }
@@ -444,13 +467,53 @@ mod tests {
         // Exactly at the threshold keeps dense on the device.
         let b = bench(MIN_DEVICE_SPEEDUP * 40.0, 1.0, 40.0, 120.0);
         assert_eq!(
-            recommend_dense(DensePlacement::Auto, &b, false),
+            recommend_dense(DensePlacement::Auto, &b, false, true),
             ResolvedDense::Device
         );
         // Just under the threshold on every shape moves dense to CPU.
         let b = bench(MIN_DEVICE_SPEEDUP * 40.0 - 1.0, 1.0, 40.0, 120.0);
         assert_eq!(
-            recommend_dense(DensePlacement::Auto, &b, false),
+            recommend_dense(DensePlacement::Auto, &b, false, true),
+            ResolvedDense::Cpu
+        );
+    }
+
+    #[test]
+    fn dense_that_does_not_fit_never_goes_on_the_device() {
+        // #176: a fast card with too little free memory cannot hold the dense
+        // set.  Measuring faster than CPU is irrelevant when the load would be
+        // refused, so Auto must fall back instead of picking `Device`.
+        let b = bench(1200.0, 900.0, 40.0, 60.0);
+        assert_eq!(
+            recommend_dense(DensePlacement::Auto, &b, false, false),
+            ResolvedDense::Cpu
+        );
+        // ...and without a probe.
+        assert_eq!(
+            resolve_dense_without_probe(DensePlacement::Auto, false, false),
+            ResolvedDense::Cpu
+        );
+        // A set that fits keeps the measured answer.
+        assert_eq!(
+            resolve_dense_without_probe(DensePlacement::Auto, false, true),
+            ResolvedDense::Device
+        );
+    }
+
+    #[test]
+    fn explicit_dense_request_ignores_the_fit_gate() {
+        // The operator's explicit choice wins so the load fails with the
+        // error that states the numbers, rather than silently running on CPU.
+        assert_eq!(
+            recommend_dense(DensePlacement::Device, &bench(0.0, 0.0, 40.0, 120.0), false, false),
+            ResolvedDense::Device
+        );
+        assert_eq!(
+            resolve_dense_without_probe(DensePlacement::Device, false, false),
+            ResolvedDense::Device
+        );
+        assert_eq!(
+            resolve_dense_without_probe(DensePlacement::Cpu, false, true),
             ResolvedDense::Cpu
         );
     }
