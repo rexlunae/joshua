@@ -1989,6 +1989,21 @@ impl Engine {
         // lower bound; the soft decisions (expert placement, per-session
         // caps) err on the safe side with the upper bound.
         let footprint = device_weight_bytes(&raw, arch);
+        // Whether the dense set can live on the device at all.  It is the
+        // same test the hard refusal below applies, so an `Auto` placement
+        // can never pick a device that would then reject the model: expert
+        // placement cannot shrink the dense set, and `--expert-placement
+        // cpu` is the documented remedy for a model too large for the card
+        // (#176).  Without a budget or a candle loader nothing is known, and
+        // the gate stays open.
+        let dense_fits = match (device_budget, arch) {
+            (Some(budget), Some(_)) => crate::placement::dense_set_fits(
+                footprint.dense_lower,
+                crate::placement::DEVICE_PLACEMENT_HEADROOM,
+                budget,
+            ),
+            _ => true,
+        };
         let dense_device_bytes = footprint.dense_upper;
         let expert_device_bytes = footprint.experts;
         let expert_bytes = expert_device_bytes;
@@ -2064,9 +2079,14 @@ impl Engine {
                 options.dense_placement,
                 bench.as_ref().expect("the dense probe ran the bench"),
                 false,
+                dense_fits,
             )
         } else {
-            crate::placement::resolve_dense_placement(options.dense_placement, device.is_cpu())
+            crate::auto_placement::resolve_dense_without_probe(
+                options.dense_placement,
+                device.is_cpu(),
+                dense_fits,
+            )
         };
         let mut dense_device = match resolved_dense {
             crate::placement::ResolvedDense::Device => device.clone(),
@@ -2078,12 +2098,25 @@ impl Engine {
             expert_device = dense_device.clone();
         }
         if !device.is_cpu() && dense_device.is_cpu() {
-            tracing::info!(
-                "dense placement: cpu — keeping the dense set on CPU-BLAS (requested {:?}); \
-                 the {:?} accelerator is reserved but unused for weights",
-                options.dense_placement,
-                device,
-            );
+            if !dense_fits && options.dense_placement == crate::placement::DensePlacement::Auto {
+                tracing::info!(
+                    "dense placement: cpu — the dense set (at least {:.2} GiB plus {:.1} GiB \
+                     headroom) does not fit the device memory budget of {:.2} GiB, so the model \
+                     cannot be held on the {:?} accelerator; expert placement does not change \
+                     this. Running with the dense set on CPU-BLAS.",
+                    footprint.dense_lower as f64 / 2f64.powi(30),
+                    crate::placement::DEVICE_PLACEMENT_HEADROOM as f64 / 2f64.powi(30),
+                    device_budget.unwrap_or(0) as f64 / 2f64.powi(30),
+                    device,
+                );
+            } else {
+                tracing::info!(
+                    "dense placement: cpu — keeping the dense set on CPU-BLAS (requested {:?}); \
+                     the {:?} accelerator is reserved but unused for weights",
+                    options.dense_placement,
+                    device,
+                );
+            }
         } else {
             tracing::info!("dense placement: device ({device:?})",);
         }
