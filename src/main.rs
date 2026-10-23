@@ -688,7 +688,8 @@ enum Commands {
         /// Maximum tokens generated per prompt.
         #[arg(long, default_value_t = 128)]
         max_tokens: u32,
-        /// Repeats per prompt (the first repeat warms the page cache).
+        /// Repeats per prompt. With more than one run, the first is a warmup
+        /// and is excluded from the reported throughput means.
         #[arg(long, default_value_t = 1)]
         runs: u32,
         /// Sampling temperature (0 = greedy, the most comparable setting).
@@ -1024,11 +1025,18 @@ async fn main() -> anyhow::Result<()> {
                     let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
                     total_prompt += usage.prompt_tokens as u64;
                     total_completion += usage.completion_tokens as u64;
-                    prefill_tps.push(prefill);
-                    decode_tps.push(decode);
+                    // The first repeat warms the page cache and allocator;
+                    // exclude it from the throughput means when a later run
+                    // is available so the report describes warmed decoding.
+                    let warmup = runs > 1 && run == 0;
+                    if !warmup {
+                        prefill_tps.push(prefill);
+                        decode_tps.push(decode);
+                    }
                     rows.push(serde_json::json!({
                         "prompt_index": rows.len() / runs as usize,
                         "run": run,
+                        "warmup": warmup,
                         "latency_ms": elapsed_ms,
                         "prompt_tokens": usage.prompt_tokens,
                         "completion_tokens": usage.completion_tokens,
@@ -1055,6 +1063,7 @@ async fn main() -> anyhow::Result<()> {
                 "n_ctx": engine.n_ctx(),
                 "max_tokens": max_tokens,
                 "runs": runs,
+                "warmup_runs": if runs > 1 { 1 } else { 0 },
                 "prompts": prompts.len(),
                 "wall_seconds": wall_s,
                 "prompt_tokens": total_prompt,

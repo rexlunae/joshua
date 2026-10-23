@@ -242,14 +242,14 @@ fn user_messages(message: &Message, out: &mut Vec<ChatMessage>) -> Result<(), St
                                 tool_call_id: None,
                             });
                         }
-                        let mut result = content_to_text(content);
+                        let (mut result, images) = content_to_message(content);
                         if is_error == &Some(true) {
                             result = format!("Error: {result}");
                         }
                         out.push(ChatMessage {
                             role: "tool".to_string(),
                             content: result,
-                            images: None,
+                            images: (!images.is_empty()).then_some(images),
                             name: None,
                             tool_calls: None,
                             tool_call_id: Some(tool_use_id.clone()),
@@ -320,16 +320,59 @@ fn assistant_message(message: &Message) -> Result<ChatMessage, String> {
     }
 }
 
-fn content_to_text(content: &Value) -> String {
+/// Normalise a parsed tool call's arguments to the `Value` used by the
+/// Anthropic non-streaming `tool_use.input` field.
+///
+/// The model normally emits a JSON object, but a malformed call can carry a
+/// bare string.  Treating that string as the input value keeps the response
+/// valid JSON; the streaming emitter uses [`tool_arguments_json`] so both
+/// paths describe the same input.
+pub fn tool_input(arguments: &str) -> Value {
+    serde_json::from_str(arguments).unwrap_or_else(|_| Value::String(arguments.to_string()))
+}
+
+/// Serialise [`tool_input`] for Anthropic's `input_json_delta.partial_json`.
+pub fn tool_arguments_json(arguments: &str) -> String {
+    tool_input(arguments).to_string()
+}
+
+/// Extract text and supported image blocks from an Anthropic content value.
+///
+/// Tool results may carry either a plain string or an array of blocks.  Text
+/// blocks are joined as prose; base64 image blocks become `data:` URLs so
+/// the engine's normal media path can attach them to the tool message.
+fn content_to_message(content: &Value) -> (String, Vec<String>) {
     match content {
-        Value::String(text) => text.clone(),
-        Value::Array(blocks) => blocks
-            .iter()
-            .filter_map(|block| block.get("text").and_then(|text| text.as_str()))
-            .collect::<Vec<_>>()
-            .join("\n"),
-        Value::Null => String::new(),
-        other => other.to_string(),
+        Value::String(text) => (text.clone(), Vec::new()),
+        Value::Array(blocks) => {
+            let mut parts = Vec::new();
+            let mut images = Vec::new();
+            for block in blocks {
+                match block.get("type").and_then(Value::as_str) {
+                    Some("image") => {
+                        if let Some(source) = block.get("source") {
+                            let is_base64 =
+                                source.get("type").and_then(Value::as_str) == Some("base64");
+                            if let (true, Some(media_type), Some(data)) = (
+                                is_base64,
+                                source.get("media_type").and_then(Value::as_str),
+                                source.get("data").and_then(Value::as_str),
+                            ) {
+                                images.push(format!("data:{media_type};base64,{data}"));
+                            }
+                        }
+                    }
+                    _ => {
+                        if let Some(text) = block.get("text").and_then(Value::as_str) {
+                            parts.push(text);
+                        }
+                    }
+                }
+            }
+            (parts.join("\n"), images)
+        }
+        Value::Null => (String::new(), Vec::new()),
+        other => (other.to_string(), Vec::new()),
     }
 }
 
@@ -392,6 +435,7 @@ pub fn response(
     usage: &UsageInfo,
     tools_offered: bool,
     max_tokens: u32,
+    stop_sequence: Option<&str>,
 ) -> (MessagesResponse, Vec<ParsedToolCall>) {
     let (prose, calls) = if tools_offered {
         crate::tools::parse_tool_calls(text)
@@ -406,12 +450,13 @@ pub fn response(
         content.push(ResponseBlock::ToolUse {
             id: format!("toolu_{}", uuid::Uuid::new_v4().simple()),
             name: call.name.clone(),
-            input: serde_json::from_str(&call.arguments)
-                .unwrap_or_else(|_| Value::String(call.arguments.clone())),
+            input: tool_input(&call.arguments),
         });
     }
     let stop_reason = if !calls.is_empty() {
         "tool_use"
+    } else if stop_sequence.is_some() {
+        "stop_sequence"
     } else if usage.completion_tokens >= max_tokens {
         "max_tokens"
     } else {
@@ -424,7 +469,7 @@ pub fn response(
         model,
         content,
         stop_reason: stop_reason.to_string(),
-        stop_sequence: None,
+        stop_sequence: stop_sequence.map(str::to_string),
         usage: MessagesUsage {
             input_tokens: usage.prompt_tokens,
             output_tokens: usage.completion_tokens,
@@ -486,6 +531,7 @@ mod tests {
             &usage,
             true,
             16,
+            None,
         );
         assert_eq!(calls.len(), 1);
         assert_eq!(response.stop_reason, "tool_use");
@@ -493,5 +539,74 @@ mod tests {
             &response.content[0],
             ResponseBlock::ToolUse { .. }
         ));
+    }
+
+    #[test]
+    fn tool_result_images_are_attached_to_the_tool_message() {
+        let value = json!({
+            "model": "m",
+            "max_tokens": 8,
+            "messages": [
+                {"role": "user", "content": "what is this?"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_1", "name": "screenshot", "input": {}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": [
+                        {"type": "text", "text": "captured"},
+                        {"type": "image", "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": "AQID"
+                        }}
+                    ]}
+                ]}
+            ]
+        });
+        let request: MessagesRequest = serde_json::from_value(value).unwrap();
+        let (messages, _, _) = to_chat_request(&request).unwrap();
+        assert_eq!(messages[2].role, "tool");
+        assert_eq!(messages[2].content, "captured");
+        assert_eq!(
+            messages[2].images.as_deref(),
+            Some(&["data:image/png;base64,AQID".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn malformed_tool_arguments_are_normalised_for_streaming_and_json() {
+        assert_eq!(
+            tool_input("not-json"),
+            Value::String("not-json".to_string())
+        );
+        assert_eq!(tool_input("{\"a\":1}"), json!({"a": 1}));
+
+        let streamed = tool_arguments_json("not-json");
+        assert_eq!(streamed, "\"not-json\"");
+        assert!(
+            serde_json::from_str::<Value>(&streamed).is_ok(),
+            "partial_json must be valid JSON: {streamed}"
+        );
+    }
+
+    #[test]
+    fn response_reports_the_matched_stop_sequence() {
+        let usage = UsageInfo {
+            prompt_tokens: 5,
+            completion_tokens: 3,
+            total_tokens: 8,
+        };
+        let (response, calls) = response(
+            "msg_1".to_string(),
+            "m".to_string(),
+            "hello ",
+            &usage,
+            false,
+            16,
+            Some("END"),
+        );
+        assert!(calls.is_empty());
+        assert_eq!(response.stop_reason, "stop_sequence");
+        assert_eq!(response.stop_sequence.as_deref(), Some("END"));
     }
 }

@@ -147,6 +147,12 @@ impl ServerMetrics {
             "joshua_completion_tokens_total {}\n",
             self.completion_tokens.load(Ordering::Relaxed)
         ));
+        out.push_str("# HELP joshua_embedding_tokens_total Tokens embedded.\n");
+        out.push_str("# TYPE joshua_embedding_tokens_total counter\n");
+        out.push_str(&format!(
+            "joshua_embedding_tokens_total {}\n",
+            self.embed_tokens.load(Ordering::Relaxed)
+        ));
         out.push_str("# HELP joshua_streaming_requests_total Requests served over SSE.\n");
         out.push_str("# TYPE joshua_streaming_requests_total counter\n");
         out.push_str(&format!(
@@ -177,7 +183,9 @@ pub struct ServerState {
     /// When set, every `/v1` request must carry this key as
     /// `Authorization: Bearer <key>` or `x-api-key: <key>`.  A
     /// comma-separated list accepts any of the listed keys, which makes
-    /// rotation possible without a restart.  `/health` stays open for probes.
+    /// rotation possible without a restart.  Empty entries are ignored; a
+    /// value with no non-empty keys rejects every request as a configuration
+    /// error.  `/health` stays open for probes.
     pub api_key: Option<String>,
     /// Exact origins allowed by CORS.  Empty keeps the historical
     /// permissive policy for localhost development; set one or more
@@ -798,22 +806,27 @@ async fn require_api_key(State(state): State<AppState>, req: Request, next: Next
                     .and_then(|v| v.to_str().ok())
             });
         // A comma-separated configuration supports key rotation: any listed
-        // key is accepted.  Empty entries are ignored so a trailing comma
-        // does not accidentally accept an empty key; an all-empty value is
-        // treated as "no key configured" rather than locking every caller
-        // out.
+        // key is accepted.  Empty entries are ignored so a trailing comma or
+        // a stray space does not accidentally accept an empty key.  A value
+        // that contains no non-empty key is a configuration error: refuse
+        // every request rather than silently disabling authentication.
         let expected_keys: Vec<&str> = expected
             .split(',')
             .map(str::trim)
             .filter(|candidate| !candidate.is_empty())
             .collect();
-        if !expected_keys.is_empty()
-            && !provided.is_some_and(|key| {
-                expected_keys
-                    .iter()
-                    .any(|candidate| api_keys_match(key.as_bytes(), candidate.as_bytes()))
-            })
-        {
+        if expected_keys.is_empty() {
+            let body = ErrorResponse::new(
+                "server misconfigured: --api-key contains no non-empty keys",
+                "server_error",
+            );
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response();
+        }
+        if !provided.is_some_and(|key| {
+            expected_keys
+                .iter()
+                .any(|candidate| api_keys_match(key.as_bytes(), candidate.as_bytes()))
+        }) {
             let body = ErrorResponse::new(
                 "invalid or missing API key — pass the key as \
                  'Authorization: Bearer <key>' or 'x-api-key: <key>'",
@@ -1273,16 +1286,42 @@ const TOOL_MARKERS: [&str; 3] = ["<tool_call>", "[TOOL_CALLS]", "<function="];
 
 /// Filters decoded text for the chat SSE stream.
 ///
-/// Prose is forwarded immediately.  When tools are offered, a marker that
-/// may begin a tool call (and enough trailing text to recognise it) is held
-/// back, so raw markup never reaches the client.  At the end the complete
-/// buffered text is parsed with the same parser as the non-streaming path.
+/// Prose is forwarded as soon as it is safe.  A marker that may begin a tool
+/// call (or a prefix of one split across decoded tokens) is held back, and
+/// the text between a call's opening and closing marker is never emitted as
+/// prose.  Once the closing marker arrives the filter resumes streaming the
+/// prose that follows it.  Malformed markers are forwarded as ordinary text
+/// instead of swallowing the rest of the response, and a bare JSON tool call
+/// (which has no marker) is buffered until the parser can tell it apart from
+/// ordinary JSON prose.
 struct ChatStreamFilter {
     tools: bool,
     all: String,
-    emitted: usize,
-    marker_seen: bool,
+    /// Next byte of `all` that has not been scanned/emitted.
+    pos: usize,
     holdback: usize,
+    /// A leading `{` may be a bare JSON tool call; hold the whole response
+    /// until the final parse decides.
+    bare_json: bool,
+}
+
+/// How a tool-call marker is terminated.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ToolMarkerKind {
+    /// `<tool_call> … </tool_call>`
+    Tagged,
+    /// `[TOOL_CALLS][…]` — consumes the rest of the output.
+    Mistral,
+    /// `<function=…> … </function>` without a wrapper.
+    Function,
+}
+
+fn tool_marker_kind(marker: &str) -> ToolMarkerKind {
+    match marker {
+        "<tool_call>" => ToolMarkerKind::Tagged,
+        "[TOOL_CALLS]" => ToolMarkerKind::Mistral,
+        _ => ToolMarkerKind::Function,
+    }
 }
 
 impl ChatStreamFilter {
@@ -1300,9 +1339,9 @@ impl ChatStreamFilter {
         Self {
             tools,
             all: String::new(),
-            emitted: 0,
-            marker_seen: false,
+            pos: 0,
             holdback,
+            bare_json: false,
         }
     }
 
@@ -1312,19 +1351,10 @@ impl ChatStreamFilter {
             return vec![delta.to_string()];
         }
         self.all.push_str(delta);
-        if self.marker_seen {
-            return Vec::new();
+        if self.pos == 0 && self.all.trim_start().starts_with('{') {
+            self.bare_json = true;
         }
-        if let Some(pos) = TOOL_MARKERS
-            .iter()
-            .filter_map(|marker| self.all.find(marker))
-            .min()
-        {
-            self.marker_seen = true;
-            return self.take_until(pos);
-        }
-        let safe = floor_char_boundary(&self.all, self.all.len().saturating_sub(self.holdback));
-        self.take_until(safe)
+        self.drain(false)
     }
 
     /// Flush any withheld prose after decoding ends.
@@ -1335,10 +1365,22 @@ impl ChatStreamFilter {
         if self.all.is_empty() {
             self.all.push_str(final_text);
         }
-        if self.marker_seen {
-            return Vec::new();
+        if self.pos == 0 && self.all.trim_start().starts_with('{') {
+            self.bare_json = true;
         }
-        self.take_until(self.all.len())
+        let calls = parse_tool_calls(&self.all).1;
+        if !calls.is_empty() {
+            // A bare JSON call consumes the whole response; there is no prose
+            // to flush.  Marked calls were already skipped while streaming.
+            if self.bare_json {
+                return Vec::new();
+            }
+            return self.drain(true);
+        }
+        // No call was recognised, so any marker-like text is ordinary prose:
+        // release everything that is still buffered.
+        self.bare_json = false;
+        self.drain(true)
     }
 
     /// Parse the complete output.  With tools, `all` is the exact stream the
@@ -1356,14 +1398,85 @@ impl ChatStreamFilter {
         }
     }
 
-    fn take_until(&mut self, end: usize) -> Vec<String> {
-        let end = floor_char_boundary(&self.all, end.min(self.all.len()));
-        if end > self.emitted {
-            let text = self.all[self.emitted..end].to_string();
-            self.emitted = end;
-            vec![text]
-        } else {
+    fn drain(&mut self, flushing: bool) -> Vec<String> {
+        if self.bare_json {
+            return Vec::new();
+        }
+        let mut out = String::new();
+        loop {
+            let rest = &self.all[self.pos..];
+            let next = TOOL_MARKERS
+                .iter()
+                .filter_map(|marker| rest.find(marker).map(|at| (at, *marker)))
+                .min_by_key(|(at, _)| *at);
+            let Some((at, marker)) = next else {
+                let end = if flushing {
+                    self.all.len()
+                } else {
+                    floor_char_boundary(
+                        &self.all,
+                        self.all.len().saturating_sub(self.holdback),
+                    )
+                };
+                if end > self.pos {
+                    out.push_str(&self.all[self.pos..end]);
+                    self.pos = end;
+                }
+                break;
+            };
+
+            let marker_start = self.pos + at;
+            if marker_start > self.pos {
+                out.push_str(&self.all[self.pos..marker_start]);
+                self.pos = marker_start;
+            }
+
+            match tool_marker_kind(marker) {
+                ToolMarkerKind::Mistral => {
+                    // The payload runs to the end of the response, so there
+                    // is no prose after it to stream.
+                    if flushing {
+                        let region = &self.all[marker_start..];
+                        if parse_tool_calls(region).1.is_empty() {
+                            out.push_str(region);
+                        }
+                        self.pos = self.all.len();
+                    }
+                    break;
+                }
+                kind => {
+                    let terminator = if kind == ToolMarkerKind::Tagged {
+                        "</tool_call>"
+                    } else {
+                        "</function>"
+                    };
+                    let body_start = marker_start + marker.len();
+                    if let Some(found) = self.all[body_start..].find(terminator) {
+                        let end = body_start + found + terminator.len();
+                        let region = &self.all[marker_start..end];
+                        if parse_tool_calls(region).1.is_empty() {
+                            // Not a call: forward the marker text as prose.
+                            out.push_str(region);
+                        }
+                        self.pos = end;
+                        continue;
+                    }
+                    if flushing {
+                        let region = &self.all[marker_start..];
+                        if parse_tool_calls(region).1.is_empty() {
+                            out.push_str(region);
+                        }
+                        self.pos = self.all.len();
+                    }
+                    // Otherwise wait for the closing marker to arrive.
+                    break;
+                }
+            }
+        }
+        if out.is_empty() {
             Vec::new()
+        } else {
+            vec![out]
         }
     }
 }
@@ -1618,25 +1731,26 @@ async fn messages(
     }
 
     let cancel = CancelOnDrop::new();
-    let (text, usage, _, _) = tokio::task::spawn_blocking({
+    let completion = tokio::task::spawn_blocking({
         let engine = Arc::clone(&engine);
         let tools = tools.clone();
         let flag = cancel.flag();
-        move || engine.complete_chat_cancellable(&messages, tools.as_deref(), &options, &flag)
+        move || engine.complete_chat_cancellable_detailed(&messages, tools.as_deref(), &options, &flag)
     })
     .await
     .map_err(|e| ApiError::internal(e.to_string()))?
     .map_err(ApiError::from)?;
-    state.metrics.record_generation(&usage);
+    state.metrics.record_generation(&completion.usage);
 
     let id = format!("msg_{}", Uuid::new_v4().simple());
     let (response, _) = anthropic::response(
         id,
         model,
-        &text,
-        &usage,
+        &completion.text,
+        &completion.usage,
         tools_offered,
         max_tokens,
+        completion.stop_sequence.as_deref(),
     );
     Ok(Json(response).into_response())
 }
@@ -1721,6 +1835,7 @@ impl AnthropicStreamEmitter {
         calls: &[crate::tools::ParsedToolCall],
         usage: &UsageInfo,
         max_tokens: u32,
+        stop_sequence: Option<&str>,
     ) {
         if self.text_started {
             self.send(
@@ -1753,7 +1868,10 @@ impl AnthropicStreamEmitter {
                     "index": index,
                     "delta": {
                         "type": "input_json_delta",
-                        "partial_json": call.arguments,
+                        // Must be valid JSON text even when the model emitted
+                        // malformed arguments; the non-streaming response
+                        // normalises the same value to a JSON string.
+                        "partial_json": anthropic::tool_arguments_json(&call.arguments),
                     },
                 }),
             );
@@ -1764,6 +1882,8 @@ impl AnthropicStreamEmitter {
         }
         let stop_reason = if !calls.is_empty() {
             "tool_use"
+        } else if stop_sequence.is_some() {
+            "stop_sequence"
         } else if usage.completion_tokens >= max_tokens {
             "max_tokens"
         } else {
@@ -1773,7 +1893,10 @@ impl AnthropicStreamEmitter {
             "message_delta",
             json!({
                 "type": "message_delta",
-                "delta": {"stop_reason": stop_reason, "stop_sequence": null},
+                "delta": {
+                    "stop_reason": stop_reason,
+                    "stop_sequence": stop_sequence,
+                },
                 "usage": {"output_tokens": usage.completion_tokens},
             }),
         );
@@ -1813,16 +1936,21 @@ fn stream_messages(
                 emitter.text(&text);
             }
         };
-        engine.complete_chat_streaming(messages, tools, options, cancel, &mut on_text)
+        engine.complete_chat_streaming_detailed(messages, tools, options, cancel, &mut on_text)
     };
     match result {
-        Ok((text, usage, _, _)) => {
-            metrics.record_generation(&usage);
-            for withheld in filter.finish(&text) {
+        Ok(completion) => {
+            metrics.record_generation(&completion.usage);
+            for withheld in filter.finish(&completion.text) {
                 emitter.text(&withheld);
             }
-            let (_, calls) = filter.parse(&text);
-            emitter.finish(&calls, &usage, options.max_tokens);
+            let (_, calls) = filter.parse(&completion.text);
+            emitter.finish(
+                &calls,
+                &completion.usage,
+                options.max_tokens,
+                completion.stop_sequence.as_deref(),
+            );
         }
         Err(error) => {
             tracing::error!("streaming Anthropic message failed: {error}");
@@ -2128,6 +2256,96 @@ mod tests {
         assert_eq!(prose, "a b c");
         assert!(filter.parse("a b c").1.is_empty());
     }
+
+    #[test]
+    fn stream_filter_resumes_prose_after_a_tool_call() {
+        let mut filter = super::ChatStreamFilter::new(true);
+        let mut prose = String::new();
+        for piece in [
+            "Checking ",
+            "<tool_call>{\"name\":\"f\",\"arguments\":{}}</tool_call>",
+            " Done",
+        ] {
+            for text in filter.push(piece) {
+                prose.push_str(&text);
+            }
+        }
+        for text in filter.finish("") {
+            prose.push_str(&text);
+        }
+        assert_eq!(prose, "Checking  Done");
+        let (parsed_prose, calls) = filter.parse("");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(parsed_prose, "Checking  Done");
+    }
+
+    #[test]
+    fn stream_filter_does_not_duplicate_a_bare_json_tool_call() {
+        let mut filter = super::ChatStreamFilter::new(true);
+        let mut prose = String::new();
+        for piece in ["{\"name\":\"lookup\",", "\"arguments\":{\"q\":\"rust\"}}"] {
+            for text in filter.push(piece) {
+                prose.push_str(&text);
+            }
+        }
+        for text in filter.finish("") {
+            prose.push_str(&text);
+        }
+        assert_eq!(prose, "");
+        let (parsed_prose, calls) = filter.parse("");
+        assert_eq!(parsed_prose, "");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "lookup");
+    }
+
+    #[test]
+    fn stream_filter_releases_plain_json_instead_of_dropping_it() {
+        let mut filter = super::ChatStreamFilter::new(true);
+        let mut prose = String::new();
+        for piece in ["{\"answer\":", "42}"] {
+            for text in filter.push(piece) {
+                prose.push_str(&text);
+            }
+        }
+        for text in filter.finish("") {
+            prose.push_str(&text);
+        }
+        assert_eq!(prose, "{\"answer\":42}");
+        assert!(filter.parse("").1.is_empty());
+    }
+
+    #[test]
+    fn stream_filter_does_not_swallow_prose_after_an_invalid_marker() {
+        let mut filter = super::ChatStreamFilter::new(true);
+        let mut prose = String::new();
+        for piece in [
+            "before ",
+            "<tool_call>not a call</tool_call>",
+            " after",
+        ] {
+            for text in filter.push(piece) {
+                prose.push_str(&text);
+            }
+        }
+        for text in filter.finish("") {
+            prose.push_str(&text);
+        }
+        assert_eq!(prose, "before <tool_call>not a call</tool_call> after");
+        assert!(filter.parse("").1.is_empty());
+    }
+
+    #[test]
+    fn prometheus_exports_embedding_usage() {
+        use std::sync::atomic::Ordering;
+        let metrics = super::ServerMetrics::default();
+        metrics.embed_tokens.fetch_add(7, Ordering::Relaxed);
+        let text = metrics.prometheus(0, 0, 0);
+        assert!(
+            text.contains("joshua_embedding_tokens_total 7"),
+            "missing embedding counter:\n{text}"
+        );
+    }
+
     #[cfg(feature = "distributed")]
     #[test]
     fn workers_stay_claimed_from_load_until_unload_completes() {

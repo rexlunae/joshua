@@ -106,6 +106,26 @@ async fn v1_routes_require_the_configured_api_key() {
 }
 
 #[tokio::test]
+async fn a_key_list_with_no_non_empty_entries_rejects_every_request() {
+    // A misconfigured key list must never silently disable authentication.
+    let app = create_router(tiny_state("server-empty-auth", Some(" , ,")));
+
+    let res = app
+        .clone()
+        .oneshot(get("/v1/models", None))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    // Empty credentials must not match the empty entries either.
+    let res = app
+        .oneshot(get("/v1/models", Some("")))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[tokio::test]
 async fn routes_stay_open_when_no_api_key_is_configured() {
     let app = create_router(tiny_state("server-noauth", None));
 
