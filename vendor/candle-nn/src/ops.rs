@@ -661,6 +661,26 @@ impl candle::CustomOp2 for RmsNorm {
                 eps: f32,
                 dst: &mut [T],
             ) {
+                if T::DTYPE == DType::F32 {
+                    // Wide f32 rows need a wider accumulator: a sequential
+                    // f32 sum can lose several ulps in the normalization
+                    // factor before low-rank attention expands the result.
+                    let mut sums = [0f64; 8];
+                    for chunk in src.chunks(8) {
+                        for (sum, v) in sums.iter_mut().zip(chunk) {
+                            let v: f32 = (*v).as_();
+                            *sum += (v as f64) * (v as f64);
+                        }
+                    }
+                    let inv = (sums.iter().sum::<f64>() / n as f64 + eps as f64)
+                        .sqrt().recip();
+                    for ((d, v), a) in dst.iter_mut().zip(src).zip(alpha) {
+                        let v: f32 = (*v).as_();
+                        let a: f32 = (*a).as_();
+                        *d = T::from_f32((v as f64 * inv * a as f64) as f32).unwrap();
+                    }
+                    return;
+                }
                 let sum2 = src
                     .iter()
                     .map(|&v| {

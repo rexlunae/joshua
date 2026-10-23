@@ -28,10 +28,12 @@ p.add_argument('--prefill-chunk', type=int, default=8)
 p.add_argument('--warm-prompt-tokens', type=int, default=8)
 p.add_argument('--timeout', type=int, default=3600)
 p.add_argument('--policies', nargs='+', choices=['fixed', 'auto'], default=['fixed', 'auto'])
-p.add_argument('--backends', nargs='+', choices=['vulkan', 'cpu', 'opencl', 'sycl'], default=['vulkan', 'cpu', 'opencl', 'sycl'])
+p.add_argument('--backends', nargs='+', choices=['vulkan', 'cpu', 'opencl', 'sycl', 'auto'], default=['vulkan', 'cpu', 'opencl', 'sycl'])
 p.add_argument('--retry-incomplete', action='store_true',
                help='quarantine an existing folder without summary.json and rerun it')
 a = p.parse_args()
+if 'auto' in a.backends and 'fixed' in a.policies:
+    p.error('backend auto requires --policies auto')
 a.output.mkdir(parents=True, exist_ok=True)
 base = a.output / 'vulkan-fixed'
 runs = [(b, policy) for policy in a.policies for b in a.backends]

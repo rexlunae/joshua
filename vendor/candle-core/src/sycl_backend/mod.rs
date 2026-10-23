@@ -25,6 +25,7 @@ struct SyclContext {
     context: usize,
     fault: usize,
     name: String,
+    canonical_quantized: bool,
     memory: u64,
     scratch: std::sync::Mutex<Scratch>,
 }
@@ -109,7 +110,10 @@ under /opt/intel/oneapi/{{umf,tcm}}/<ver>/lib."))
         let mut guard = ContextOpenGuard { context, active: true };
         let (name, memory) = bridge::info(context)?;
         let fault = bridge::alloc(context, crate::fault_slot::BYTES)?;
-        let inner = Arc::new(SyclContext { context, fault, name, memory, scratch: Default::default() });
+        // Negotiate the numerical contract with ABI-1 bridges. Older
+        // bridges retain their original quantized dispatch.
+        let canonical_quantized = bridge::numerics_version() == 1 && bridge::canonical_quantized(context);
+        let inner = Arc::new(SyclContext { context, fault, name, canonical_quantized, memory, scratch: Default::default() });
         guard.active = false;
         let zeros = vec![0u8; crate::fault_slot::BYTES];
         unsafe { write_buffer(context, fault, zeros.len(), zeros.as_ptr()) }?;
@@ -129,7 +133,7 @@ under /opt/intel/oneapi/{{umf,tcm}}/<ver>/lib."))
     pub(crate) fn context(&self) -> usize { self.inner.context }
     pub(crate) fn queue(&self) -> usize { self.inner.context }
     pub(crate) fn transfer_queue(&self) -> usize { self.inner.context }
-    pub fn ctx(&self) -> Ctx { Ctx { context: self.context(), device: self.context(), queue: self.queue(), fault: self.inner.fault, fslot: crate::fault_slot::current() as i32 } }
+    pub fn ctx(&self) -> Ctx { Ctx { context: self.context(), device: self.context(), queue: self.queue(), canonical_quantized: self.inner.canonical_quantized, fault: self.inner.fault, fslot: crate::fault_slot::current() as i32 } }
     pub fn check_fault(&self) -> Result<()> {
         let slot = crate::fault_slot::current() * 4;
         let mut value = 0u32;

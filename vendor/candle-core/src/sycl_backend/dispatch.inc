@@ -984,7 +984,7 @@
         auto a3 = arg<int>(args, count, 3);
         auto a4 = arg<int>(args, count, 4);
         ctx.submit([&](sycl::handler& h) {
-            sycl::local_accessor<uint64_t, 1> local(sycl::range<1>((sizeof(float) * (WG) + 7) / 8), h);
+            sycl::local_accessor<uint64_t, 1> local(sycl::range<1>((sizeof(float) * (REDUCTION_LANES) + 7) / 8), h);
             h.parallel_for(sycl::nd_range<3>(global, local_size), [=](sycl::nd_item<3> item) {
                 auto scratch = reinterpret_cast<uchar*>(local.template get_multi_ptr<sycl::access::decorated::no>().get());
                 Kernels{item, scratch}.k_softmax_last(a0, a1, a2, a3, a4);
@@ -1003,7 +1003,7 @@
         auto a6 = arg<int>(args, count, 6);
         auto a7 = arg<float>(args, count, 7);
         ctx.submit([&](sycl::handler& h) {
-            sycl::local_accessor<uint64_t, 1> local(sycl::range<1>((sizeof(float) * (WG) + 7) / 8), h);
+            sycl::local_accessor<uint64_t, 1> local(sycl::range<1>((sizeof(float) * (REDUCTION_LANES) + 7) / 8), h);
             h.parallel_for(sycl::nd_range<3>(global, local_size), [=](sycl::nd_item<3> item) {
                 auto scratch = reinterpret_cast<uchar*>(local.template get_multi_ptr<sycl::access::decorated::no>().get());
                 Kernels{item, scratch}.k_rmsnorm(a0, a1, a2, a3, a4, a5, a6, a7);
@@ -1072,7 +1072,7 @@
         auto a10 = arg<int>(args, count, 10);
         auto a11 = arg<int>(args, count, 11);
         ctx.submit([&](sycl::handler& h) {
-            sycl::local_accessor<uint64_t, 1> local(sycl::range<1>((sizeof(float) * (WG) + 7) / 8), h);
+            sycl::local_accessor<uint64_t, 1> local(sycl::range<1>((sizeof(float) * (REDUCTION_LANES) + 7) / 8), h);
             h.parallel_for(sycl::nd_range<3>(global, local_size), [=](sycl::nd_item<3> item) {
                 auto scratch = reinterpret_cast<uchar*>(local.template get_multi_ptr<sycl::access::decorated::no>().get());
                 Kernels{item, scratch}.k_qgemv(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);

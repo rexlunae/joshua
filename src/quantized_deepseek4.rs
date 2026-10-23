@@ -1627,21 +1627,34 @@ impl Attention {
         }
 
         // Q: [seq, n_head, head_dim], RMS per head, then RoPE.
-        let qr = self.q_norm.forward(&self.q_a.forward(x)?)?; // [1, seq, q_lora_rank]
+        let qr = {
+            let qa = self.q_a.forward(x)?;
+            crate::activation_trace::record("ds-q-a", &qa)?;
+            self.q_norm.forward(&qa)?
+        };
+        crate::activation_trace::record("ds-q-a-norm", &qr)?;
         let q = self
             .q_b
             .forward(&qr)?
             .reshape((seq, self.n_head, self.head_dim))?;
+        crate::activation_trace::record("ds-q-b", &q)?;
         let q = if self.q_head_norm {
             let m = q.sqr()?.mean_keepdim(D::Minus1)?.affine(1.0, self.eps)?;
             q.broadcast_div(&m.sqrt()?)?
         } else {
             q
         };
+        crate::activation_trace::record("ds-q-head-norm", &q)?;
         let q = self.rope_qkv(&q.contiguous()?, offset)?.contiguous()?;
+        crate::activation_trace::record("ds-q-rope", &q)?;
 
         // Raw KV row (MLA has a single KV head), RoPE on the trailing slice.
-        let kv_raw = self.kv_norm.forward(&self.wkv.forward(x)?)?.squeeze(0)?; // [seq, head_dim]
+        let kv_raw = {
+            let kv_proj = self.wkv.forward(x)?;
+            crate::activation_trace::record("ds-kv-proj", &kv_proj)?;
+            self.kv_norm.forward(&kv_proj)?.squeeze(0)?
+        };
+        crate::activation_trace::record("ds-kv-norm", &kv_raw)?;
         let kv4 = kv_raw.unsqueeze(0)?.unsqueeze(0)?; // [1, 1, seq, d]
         let kv4 = rope_apply(
             &self.rotary,
@@ -1741,19 +1754,25 @@ impl Attention {
         // Sparse attention with per-head sink.
         let comp = kvs[self.kv_source].comp.clone();
         let (k_all, mask) = self.build_kv(comp.as_ref(), &swa_prev, &kv_raw, offset, seq, lid_idx.as_ref())?;
+        crate::activation_trace::record("ds-k-all", &k_all)?;
         let scores = q.matmul(&k_all.transpose(1, 2)?)?; // [seq, h, n_kv]
+        crate::activation_trace::record("ds-dot-scores", &scores)?;
         let scores = (scores * self.softmax_scale)?.broadcast_add(&mask.unsqueeze(1)?)?;
         let max = scores.max_keepdim(D::Minus1)?;
         let e = scores.broadcast_sub(&max)?.exp()?;
+        crate::activation_trace::record("ds-exponential", &e)?;
         let sink = self.attn_sinks.unsqueeze(0)?.unsqueeze(2)?; // [1, h, 1]
         let den = e
             .sum_keepdim(D::Minus1)?
             .add(&sink.broadcast_sub(&max)?.exp()?)?; // [seq, h, 1]
+        crate::activation_trace::record("ds-denominator", &den)?;
 
         // Batched over `seq`; a broadcast_matmul here would materialize the
         // whole key block once per head.
         let num = e.contiguous()?.matmul(&k_all)?; // [seq, h, n_kv] @ [seq, n_kv, d] → [seq, h, d]
+        crate::activation_trace::record("ds-numerator", &num)?;
         let o = num.broadcast_div(&den)?; // [seq, h, d]
+        crate::activation_trace::record("ds-context", &o)?;
 
         // Derope the output's trailing slice.
         let o4 = o.unsqueeze(0)?.transpose(1, 2)?; // [1, h, seq, d]
@@ -1766,6 +1785,7 @@ impl Attention {
             true,
         )?;
         let o = o4.transpose(1, 2)?.squeeze(0)?; // [seq, h, d]
+        crate::activation_trace::record("ds-derope", &o)?;
 
         // Each group uses only its diagonal block of wo_a. Native Q8 decode
         // computes those outputs directly; prefill retains the original GEMM.
@@ -1774,6 +1794,7 @@ impl Attention {
         let y = crate::attention::grouped_output_projection(
             &self.wo_a, &og, self.o_groups, self.o_lora_rank,
         )?;
+        crate::activation_trace::record("ds-grouped-out", &y)?;
         self.wo_b.forward(&y)?.reshape((1, seq, ()))
     }
 
@@ -2748,6 +2769,8 @@ impl Layer {
         history: &[u32],
         max_seq: usize,
     ) -> Result<FfnInput> {
+        crate::activation_trace::position(offset);
+        crate::activation_trace::record("ds-input", &stream.xs)?;
         let seq = stream.xs.dim(1)?;
         if let (Some(eg), Some(ecfg)) = (&self.engram, &cfg.engram) {
             if history.len() < offset + seq {
@@ -2755,11 +2778,17 @@ impl Layer {
             }
             stream.xs = eg.forward(&stream.xs, ecfg.rows(eg.index, history, offset, seq))?;
         }
+        crate::activation_trace::record("ds-engram", &stream.xs)?;
         let (x, mix) = stream.enter(&self.hc_attn, cfg)?;
+        crate::activation_trace::record("ds-attn-enter", &x)?;
         let h = self.attn_norm.forward(&x)?;
+        crate::activation_trace::record("ds-attn-norm", &h)?;
         let h = self.attn.forward(kvs, l, &h, offset, max_seq)?;
+        crate::activation_trace::record("ds-attn-out", &h)?;
         let stream = stream.leave(&h, mix, cfg.v41)?;
+        crate::activation_trace::record("ds-attn-leave", &stream.xs)?;
         let (x, mix) = stream.enter(&self.hc_ffn, cfg)?;
+        crate::activation_trace::record("ds-ffn-enter", &x)?;
         Ok(FfnInput {
             h: self.ffn_norm.forward(&x)?,
             stream,

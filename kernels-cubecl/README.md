@@ -808,6 +808,102 @@ at session boundaries. Cache warming and mmap page faults can affect timing,
 so compare repeated sessions and read bytes before attributing differences to
 kernel execution alone.
 
+### Strict-parity follow-up, 2026-10-23
+
+The [numerical investigation and full-model gates](benchmarks/backend-logit-isolation-b50-20261023.json)
+trace SYCL Qwen's drift to RMSNorm reduction/scaling order, softmax's exponential,
+and the eight-element Q4_K/Q6_K multirow dots. The corrected path uses ordered
+32-element FMA dots and 256 logical reduction lanes over **64 physical threads**.
+Before the RoPE correction below, this is bit-identical to the production Vulkan
+reference on the complete Qwen replay. Adapter qualification uses
+PCI **8086:E212**, negotiated through optional ABI-1 bridge capabilities; older
+bridges keep their existing quantized dispatch.
+
+The report retains every measured candidate, including a rejected 256-physical-thread
+trial whose repeated-session VRAM growth exceeded the unchanged 1 MiB gate.
+No failed measured sessions are discarded and the absolute logit tolerance stays
+**1e-5**. Final measurements and automatic-choice decisions are recorded below.
+
+DeepSeek CPU first diverges in the 20,480-wide hyperconnection RMS reduction.
+CPU f32 norms now borrow their input and accumulate in float64. The unweighted
+path allocates only its output, replacing the square/mean/power intermediates;
+weighted norms also retain float64 through scaling. Closed-form float64 tests
+cover wide rows, storage offsets, and sequential/parallel batches.
+
+The original CPU reduction-tree experiment was rejected after large downstream
+errors. Subsequent opt-in Q8/HC accumulation and RoPE FMA replays matched isolated
+operations, but still failed the complete eight-token diagnostic replay. Those
+experimental modes were removed from the patch and retained as raw evidence.
+No DeepSeek CPU preference is enabled.
+
+A direct same-input probe confirms that B50 Vulkan and SYCL return
+`cos(0.008001127) = 1.0`, while CPU returns `0.999967992`. With the user's
+explicit approval to correct the reference, shared RoPE tables now evaluate
+position × stored inverse frequency, sine/cosine, and magnitude scale in
+**float64 on the CPU**, then round once to f32 and upload each immutable table
+at load time. This adds no per-token transfers. This intentionally changes the
+old Vulkan logits; the old reference is retained in the investigation report.
+
+Table regression tests compare CPU, Vulkan, and SYCL against independently
+computed 80-decimal-digit values, including small angles and position 65,535.
+The tiny DeepSeek-V4.1 independent NumPy float64 reference test now uses **1e-5**
+(previously 2e-5). Both reference checks pass. Full-model cross-backend parity,
+speed, and repeated-session memory remain separate gates.
+
+Full runs use realistic saved prompts, prefill chunks of 32, 128 teacher-forced
+decode tokens, and repeated sessions. Each comparison uses one executable and
+the same tokens, with capture disabled. The absolute tolerance remains **1e-5**.
+
+| Workload/path | Decode ms/token | Speedup vs paired Vulkan | Max logit difference | Private growth | VRAM growth | Gates |
+|---|---:|---:|---:|---:|---:|---|
+| Qwen SYCL fixed, 5 sessions | 162.683 | 1.150× | 0 (bit-identical) | 8 KiB | 24 KiB | pass |
+| Qwen fully automatic, 3 sessions | 163.153 | 1.139× | 0 (bit-identical) | 8 KiB | 16 KiB | pass |
+| DeepSeek CPU, float64 norms, 2 sessions | 657.231 | 1.222× | 7.03335e-5 | 44 KiB | n/a (CPU) | parity fails |
+
+The automatic Qwen path also improves total session time by **1.355×**. Before
+this preference, SYCL's generic startup probe placed Qwen on CPU: 200.171 ms/token
+and `2.52008e-4` drift. The new preference is limited to native SYCL on PCI
+**8086:E212**, bridge numerical contract **1**, the qualified Qwen3-8B Q4_K_M
+metadata and tensor formats, **context ≤254**, and **prefill chunks ≤32**. It
+honors explicit backend/CPU placement, budget feasibility, and the probe opt-out.
+Other contexts, quantizations, adapters, and architectures retain existing policy.
+The benchmark now accepts `--backend auto --auto-placement` and records the
+resolved backend, so the full automatic path is measured rather than inferred.
+
+DeepSeek's corrected-table control reduced CPU drift from `3.13759e-4` to
+`1.25170e-4`; float64 CPU norms reduce it further to `7.03335e-5`. That is still
+above **1e-5**, despite passing speed, repeatability, greedy-choice and memory
+gates. Remaining differences include FP32 accumulation, rotation contraction,
+and normalization/transcendental rounding carried through cached prefill keys.
+The independent float64 checks cover tables and tiny-model outputs; a full
+float64 trace of the 290 GB real model was not generated.
+
+For diagnosis, set `JOSHUA_ACTIVATION_TRACE` to a fresh capture directory and
+optionally `JOSHUA_ACTIVATION_TRACE_LIMIT` (default 512). For a DeepSeek decode
+position, set `JOSHUA_ACTIVATION_TRACE_POSITION` to the absolute token offset.
+Selected Qwen/DeepSeek checkpoints are written as shape/label JSON plus little-endian f32 data. The
+disabled path does not read or copy tensor data, and normalization scratch keeps
+its original lifetime. Compare two identical-input captures with:
+
+```bash
+python3 kernels-cubecl/benchmarks/compare_activations.py \
+  /path/to/reference-captures /path/to/candidate-captures /tmp/activation-diff.json
+```
+
+Replay one captured operation with `backend_numerics` (build with
+`--features vulkan,opencl,sycl`):
+
+```bash
+target/release/examples/backend_numerics \
+  --model /path/to/Qwen3-8B-Q4_K_M.gguf \
+  --input /path/to/00000-qwen-input.f32 --cols 4096 \
+  --op rms --weight blk.0.attn_norm.weight --eps 1e-6 \
+  --output /tmp/rms-replay
+```
+
+The operation replay is diagnostic and performs readbacks; leave activation
+capture disabled for parity, timing and memory certification runs.
+
 ### Production-dispatch rerun, 2026-10-23
 
 [Pinned results and all gates](benchmarks/backend-evaluation-production-b50-20261023.json)

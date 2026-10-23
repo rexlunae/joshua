@@ -110,19 +110,78 @@ pub fn mixes(
 fn project_mixes(x: &Tensor, hc_fn: &QMatMul, rms_eps: f64) -> Result<(Tensor, usize)> {
     let (b, s, hc, d) = x.dims4()?;
     let flat = x.reshape((b * s, hc * d))?;
-    let mixes = hc_fn.forward(&rms_rows(&flat, rms_eps)?)?; // [b*s, (2+hc)*hc]
+    crate::activation_trace::record("hc-flat", &flat)?;
+    let mixes = {
+        let norm = rms_rows(&flat, rms_eps)?;
+        crate::activation_trace::record("hc-rms", &norm)?;
+        hc_fn.forward(&norm)? // [b*s, (2+hc)*hc]
+    };
+    crate::activation_trace::record("hc-projection", &mixes)?;
     let mixes = mixes.reshape((b, s, (2 + hc) * hc))?;
     Ok((mixes, hc))
 }
 
 /// Unweighted RMS norm over the last dim.
 pub fn rms_rows(x: &Tensor, eps: f64) -> Result<Tensor> {
+    // A flattened hyper-connection row can be 20,480 elements wide. The
+    // generic CPU f32 sum loses enough low bits to move the normalized row
+    // by >1e-5. Borrow the input and accumulate in f64, using only the output
+    // allocation rather than materializing square/mean/power intermediates.
+    if x.device().is_cpu() && x.dtype() == candle_core::DType::F32 && x.is_contiguous() {
+        let cols = x.dim(D::Minus1)?;
+        if cols != 0 {
+            let (storage, layout) = x.storage_and_layout();
+            let candle_core::Storage::Cpu(cpu) = &*storage else { unreachable!() };
+            let values = cpu.as_slice::<f32>()?;
+            let values = &values[layout.start_offset()..layout.start_offset() + x.elem_count()];
+            let mut out = Vec::with_capacity(values.len());
+            for row in values.chunks_exact(cols) {
+                let mut sums = [0f64; 8];
+                for chunk in row.chunks(8) {
+                    for (sum, &v) in sums.iter_mut().zip(chunk) {
+                        *sum += (v as f64) * (v as f64);
+                    }
+                }
+                let inv = (sums.iter().sum::<f64>() / cols as f64 + eps).sqrt().recip();
+                out.extend(row.iter().map(|&v| (v as f64 * inv) as f32));
+            }
+            return Tensor::from_vec(out, x.shape(), x.device());
+        }
+    }
     x.broadcast_mul(
         &x.sqr()?
             .mean_keepdim(D::Minus1)?
             .affine(1.0, eps)?
             .powf(-0.5)?,
     )
+}
+
+#[cfg(test)]
+mod rms_tests {
+    use super::*;
+
+    #[test]
+    fn wide_cpu_rows_match_analytic_f64_norm_with_storage_offset() -> Result<()> {
+        // A closed-form sum checks the 20K-element cancellation regression
+        // independently of either implementation's reduction order.
+        let cols = 20481;
+        let mut data = vec![0.1f32; 3 * cols];
+        data[cols] = 0.6;
+        data[2 * cols] = -0.6;
+        let input = Tensor::from_vec(data, (3, cols), &candle_core::Device::Cpu)?;
+        let x = input.narrow(0, 1, 2)?;
+        for eps in [1e-20, 1e-6] {
+            let y = rms_rows(&x, eps)?.to_vec2::<f32>()?;
+            let a = 0.1f32 as f64;
+            let b = 0.6f32 as f64;
+            let denom = (((cols - 1) as f64 * a * a + b * b) / cols as f64 + eps).sqrt();
+            for (row, sign) in y.iter().zip([1., -1.]) {
+                assert!((row[0] as f64 - sign * b / denom).abs() < 1e-6);
+                assert!(row[1..].iter().all(|&v| (v as f64 - a / denom).abs() < 1e-6));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Collapse the `hc` copies of `x` (`[b, s, hc, d]`) to one stream with the

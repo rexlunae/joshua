@@ -91,6 +91,21 @@ void dispatch(Context& ctx, const std::string& name, const Arg* args, size_t cou
 }
 }
 API uint32_t joshua_sycl_abi_version() noexcept { return 1; }
+// Optional ABI-1 capability: ordered 256-lane reductions executed by
+// 64 physical work-items. Older bridges omit it.
+API uint32_t joshua_sycl_numerics_version() noexcept { return 1; }
+// Identify the validated adapter by PCI IDs, not runtime-specific names.
+API uint32_t joshua_sycl_canonical_quantized(uintptr_t h) noexcept {
+#if defined(SYCL_EXT_INTEL_DEVICE_INFO)
+    try {
+        std::lock_guard lock(runtime_mutex);
+        auto dev = context(h).queue.get_device();
+        if (dev.get_info<sycl::info::device::vendor_id>() == 0x8086
+            && dev.get_info<sycl::ext::intel::info::device::device_id>() == 0xe212) return 1;
+    } catch (...) { /* unsupported device-info extension: retain legacy dispatch */ }
+#endif
+    return 0;
+}
 API const char* joshua_sycl_error() noexcept { return last_error.c_str(); }
 API int joshua_sycl_open(size_t ordinal, uintptr_t* out) noexcept {
     return guard([&] {
