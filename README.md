@@ -263,10 +263,18 @@ single-token decode step of a dense Qwen-family model (`qwen3`, `qwen`,
 weight on the device) as one persistent SYCL kernel launch instead of ~30
 launches per layer; prefill, speculative verification and every other model
 keep the op-at-a-time path, and the loader logs why a model does not
-qualify.  Its GEMVs reduce each row over one sub-group, so logits agree
-with the op-at-a-time path to rounding; `tests/sycl_megakernel_tests.rs`
-checks the two paths agree step by step.  It is not yet faster than the
-op-at-a-time path on the Arc Pro B50.  The bridge must be built from the same tree.  Without a SYCL GPU,
+qualify.  Its GEMVs reduce each row over one sub-group instead of the
+op-at-a-time kernels' work-group tree, so logits agree to rounding, not bit
+for bit; `tests/sycl_megakernel_tests.rs` checks the two paths step by step
+through prefill, KV-cache growth, a multi-token chunk and a rollback.  The
+f32 fixtures use a 1e-5 absolute tolerance and the block-quantized fixture
+1e-3; set `JOSHUA_MEGAKERNEL_GGUF=/path/model.gguf` (and optionally
+`JOSHUA_MEGAKERNEL_GGUF_TOL`) to run the same comparison on a real model and
+log the largest logit difference.  The persistent kernel's cross-work-group
+ticket/counter synchronization has only been exercised under host emulation;
+run `scripts/sycl-megakernel-hw-check.sh` on a SYCL GPU to validate it
+there.  It is not yet faster than the op-at-a-time path on the Arc Pro B50.
+The bridge must be built from the same tree.  Without a SYCL GPU,
 `vendor/candle-core/src/sycl_backend/emu/` builds the bridge against a host
 emulation of SYCL, which runs the SYCL tests (slowly) on the CPU:
 `c++ -std=c++20 -O2 -fPIC -shared -DJOSHUA_SYCL_EMU_IMPL -Iemu bridge.cpp -o libjoshua_sycl.so`.

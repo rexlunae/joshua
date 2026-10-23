@@ -53,6 +53,21 @@ fn sycl_megakernel_parity() {
         check(&path, &device, name, tol);
         eprintln!("{name} OK");
     }
+
+    // Tiny fixtures do not exercise real weight shapes or logit spreads. Run
+    // the same prefill / cache-growth / chunk / rollback comparison on a real
+    // dense Qwen-family GGUF when one is supplied:
+    //   JOSHUA_MEGAKERNEL_GGUF=/models/qwen3.gguf \
+    //   JOSHUA_MEGAKERNEL_GGUF_TOL=1e-3 (optional, default 1e-3)
+    if let Ok(path) = std::env::var("JOSHUA_MEGAKERNEL_GGUF") {
+        let tol = std::env::var("JOSHUA_MEGAKERNEL_GGUF_TOL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1e-3);
+        eprintln!("real model {path} (tol {tol:e})...");
+        check(Path::new(&path), &device, "real model", tol);
+        eprintln!("real model OK");
+    }
 }
 
 fn load(path: &Path, device: &Device, mega: bool) -> joshua::model::QuantizedModel {
