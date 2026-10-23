@@ -26,6 +26,11 @@ def digest(path):
     return h.hexdigest()
 
 base_hash = digest(a.reference / 'logits.f32')
+base_private = [v['RssAnon'] + v.get('VmSwap', 0)
+                for v in base.get('after_session_host_memory_kib', [])]
+base_repeated = len(base_private) >= 2 and len(base['ms_per_token']) >= 2
+base_private_stable = (max(base_private) - min(base_private) <= 1024
+                       if base_repeated else False)
 # An unstable reference cannot certify another backend: without this, a
 # baseline that happened to be faster once (or whose memory was still
 # settling) would still make a candidate eligible for automatic preference.
@@ -65,7 +70,7 @@ for folder in a.runs:
     delta = np.abs(x.astype(np.float64) - y.astype(np.float64))
     sessions = s['after_session_host_memory_kib']
     private = [v['RssAnon'] + v.get('VmSwap', 0) for v in sessions]
-    private_growth = max(private) - private[0]
+    private_growth = max(private) - min(private)
     samples = s['memory_samples']
     driver = [v['driver_memory_bytes'] for v in samples]
     vram_keys = sorted({k for v in driver for k in v if k.startswith('drm-resident-vram')})
@@ -84,6 +89,10 @@ for folder in a.runs:
     base_totals = np.asarray(base['prefill_ms']) + np.asarray(base['ms_per_token']) * base['decode_tokens']
     gates = {'absolute_logits_1e_5': bool((delta <= 1e-5).all()),
              'repeat_logits_1e_5': s['max_repeat_logit_difference'] <= 1e-5,
+             'reference_repeat_logits_1e_5': base['max_repeat_logit_difference'] <= 1e-5,
+             'repeated_sessions_measured': len(private) >= 2 and len(s['ms_per_token']) >= 2,
+             'reference_repeated_sessions_measured': base_repeated,
+             'reference_private_memory_growth_le_1MiB': base_private_stable,
              'same_greedy_choices': s['top1'] == base['top1'],
              'private_memory_growth_le_1MiB': private_growth <= 1024,
              'device_memory_stable': device_stable,

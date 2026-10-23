@@ -677,7 +677,11 @@ existing complete results. A folder left without `summary.json` is quarantined
 with `--retry-incomplete` and rerun instead of requiring manual cleanup.
 `compare_backends.py` retains the absolute **1e-5** logit and repeatability
 gates, and a candidate is eligible for automatic preference only when the
-reference baseline's own allocator and driver memory are stable. A fast
+reference baseline's repeated logits, private memory, allocator and driver
+memory are stable. Both paths need at least two measured sessions; one pass
+cannot establish repeatability. Private-memory stability uses the full
+session span, including swapped pages. Run the evaluator regressions with
+`python3 -m unittest discover -s kernels-cubecl/benchmarks -p 'test_*.py'`. A fast
 configuration that fails parity does not qualify for a new automatic selection
 preference.
 
