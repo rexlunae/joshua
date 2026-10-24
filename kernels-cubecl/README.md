@@ -895,7 +895,12 @@ group's input row and writes one output, avoiding a full group-by-output tempora
 Independent float64 primitive and tiny-model checks retain the **1e-5** gate.
 
 Set `JOSHUA_CPU_DOT_F64=1` for the CPU precision path (AVX2/FMA; dense Q4_K also
-requires AVX-512). For its native Vulkan reference, set
+requires AVX-512). This is a **process-wide diagnostic override**, not a
+DeepSeek-only production option: shared CPU Q8_0/matching Q2_K projections and
+interleaved RoPE in other architectures also observe it and may change logits.
+Keep it unset for ordinary execution; it does not qualify other models for
+automatic dispatch. The scoped Vulkan policy does not set this flag.
+For its native Vulkan reference, set
 `JOSHUA_VULKAN_RMS_F64=1 JOSHUA_VULKAN_DOT_F64=1`; the device must support
 `shaderFloat64`. These modes are opt-in and do not change automatic placement.
 The aligned eight-token replay is bit-identical across all 1,163,520 logits and
@@ -931,7 +936,7 @@ The report retains the failed trials and source snapshots. Replay tooling now
 rejects CPU fallbacks, which invalidated an earlier unsupported GLSL shader trial.
 
 For diagnosis, set `JOSHUA_ACTIVATION_TRACE` to a fresh capture directory and
-optionally `JOSHUA_ACTIVATION_TRACE_LIMIT` (default 512). For a DeepSeek decode
+optionally `JOSHUA_ACTIVATION_TRACE_LIMIT` (default 512). For a Qwen or DeepSeek decode
 position, set `JOSHUA_ACTIVATION_TRACE_POSITION` to the absolute token offset.
 Selected Qwen/DeepSeek checkpoints are written as shape/label JSON plus little-endian f32 data. The
 disabled path does not read or copy tensor data, and normalization scratch keeps

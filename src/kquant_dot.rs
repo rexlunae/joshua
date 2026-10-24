@@ -154,6 +154,8 @@ pub fn try_matmul_fused(
     use crate::simd::SimdLevel;
     #[cfg(target_arch = "x86_64")]
     {
+        // Explicit process-wide diagnostic override, including callers from
+        // other architectures. Production model qualification does not set it.
         static WIDE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if crate::simd::avx2_fma_available() && *WIDE.get_or_init(||
             std::env::var("JOSHUA_CPU_DOT_F64").is_ok_and(|v| v == "1")) {

@@ -1,5 +1,8 @@
 //! Opt-in accurate arithmetic for isolating cross-backend DeepSeek drift.
 //! Activations and weights stay f32; only register/small row accumulators widen.
+//! JOSHUA_CPU_DOT_F64 is a process-wide diagnostic override: shared CPU Q8/Q2
+//! projections and interleaved RoPE in other architectures also observe it.
+//! Automatic Vulkan qualification uses an immutable model policy instead.
 use candle_core::{CpuStorage, CustomOp1, CustomOp2, DType, Device, Layout, Result, Shape, Tensor};
 use rayon::prelude::*;
 use std::{cell::RefCell, sync::OnceLock};

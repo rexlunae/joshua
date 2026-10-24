@@ -1482,6 +1482,7 @@ impl Layer {
         input: &crate::native_session::LayerInput<'_>,
     ) -> Result<(Tensor, Vec<u32>)> {
         let (mask, offset) = (input.mask, input.offset);
+        crate::activation_trace::position(offset);
         match &self.residual {
             Residual::PreNorm { attn_norm, ffn_norm } => {
                 crate::activation_trace::record("qwen-input", xs)?;
