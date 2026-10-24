@@ -216,8 +216,9 @@ pub(crate) fn grouped_q8_f64(
         || k % 32 != 0
         || n == 0
         || n % groups != 0
-        || groups.checked_mul(k) != Some(lhs.len())
-        || dst.len() != n
+        || dst.is_empty()
+        || dst.len() % n != 0
+        || groups.checked_mul(k).and_then(|v| v.checked_mul(dst.len() / n)) != Some(lhs.len())
     {
         return false;
     }
@@ -232,13 +233,23 @@ pub(crate) fn grouped_q8_f64(
     // for this whole call, and each worker writes disjoint output rows.
     let blocks =
         unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const BlockQ8_0Raw, n * bpr) };
+    let dst_rows=dst.len()/n;
     let output = crate::simd::DstPtr::new(dst);
     let rank = n / groups;
     crate::simd::for_each_row_chunks(n, |rows| {
         for row in rows {
             let g = row / rank;
-            let x = &lhs[g * k..(g + 1) * k];
-            unsafe { fused_row_q8_0_f64(1, k, n, x, blocks, bpr, row, &output) }
+            // Keep four independent temporal rows in registers, with the
+            // original four-lane K streams. Inputs stay in [seq,groups,k]
+            // order; only the selected diagonal outputs are written.
+            for t in (0..dst_rows).step_by(4) {
+                let count=(dst_rows-t).min(4);
+                let x=&lhs[(t*groups+g)*k..];
+                unsafe {
+                    let out=output.offset(t*n);
+                    fused_row_q8_0_f64_strided(count,k,n,x,groups*k,blocks,bpr,row,&out);
+                }
+            }
         }
     });
     true
@@ -329,6 +340,17 @@ unsafe fn fused_row_q8_0_f64(
     row: usize,
     dst: &crate::simd::DstPtr,
 ) {
+    fused_row_q8_0_f64_strided(m,k,n,lhs,k,blocks,bpr,row,dst)
+}
+
+// Same arithmetic for dense and selected-group projections; the latter's
+// consecutive temporal rows are separated by groups*K activation elements.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn fused_row_q8_0_f64_strided(
+    m: usize, _k: usize, n: usize, lhs: &[f32], row_stride: usize,
+    blocks: &[BlockQ8_0Raw], bpr: usize, row: usize, dst: &crate::simd::DstPtr,
+) {
     use std::arch::x86_64::*;
     let mut acc = [_mm256_setzero_pd(); 4];
     for (bi, b) in blocks[row * bpr..(row + 1) * bpr].iter().enumerate() {
@@ -340,7 +362,7 @@ unsafe fn fused_row_q8_0_f64(
                 scale,
             ));
             for i in 0..m {
-                let x = _mm256_cvtps_pd(_mm_loadu_ps(lhs.as_ptr().add(i * k + bi * 32 + off)));
+                let x = _mm256_cvtps_pd(_mm_loadu_ps(lhs.as_ptr().add(i * row_stride + bi * 32 + off)));
                 acc[i] = _mm256_fmadd_pd(x, w, acc[i]);
             }
         }

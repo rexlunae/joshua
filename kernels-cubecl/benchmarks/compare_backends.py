@@ -25,6 +25,24 @@ def digest(path):
             h.update(block)
     return h.hexdigest()
 
+def session_totals(summary):
+    if summary.get('host_heap_cleanup_method') not in (None, 'unavailable'):
+        assert 'session_cleanup_ms' in summary, 'missing session cleanup cost'
+    cleanup = summary.get('session_cleanup_ms', [0.] * len(summary['ms_per_token']))
+    assert len(cleanup) == len(summary['ms_per_token'])
+    assert all(np.isfinite(v) and v >= 0 for v in cleanup)
+    return (np.asarray(summary['prefill_ms'])
+            + np.asarray(summary['ms_per_token']) * summary['decode_tokens']
+            + np.asarray(cleanup))
+
+def heap_live_stable(summary):
+    stats = summary.get('after_session_heap_stats')
+    if (not stats or len(stats) < 2 or len(stats) != len(summary['ms_per_token'])
+            or any(v is None for v in stats)):
+        return None
+    live = [v['live_bytes'] for v in stats]
+    return max(live) - min(live) <= 1024**2
+
 base_hash = digest(a.reference / 'logits.f32')
 base_private = [v['RssAnon'] + v.get('VmSwap', 0)
                 for v in base.get('after_session_host_memory_kib', [])]
@@ -65,6 +83,7 @@ for folder in a.runs:
         if key == 'prefill_chunk' and a.allow_prefill_chunk_difference:
             continue
         assert s[key] == base[key], (key, s[key], base[key])
+    assert s.get('host_heap_cleanup_method') == base.get('host_heap_cleanup_method'), 'different session cleanup protocol'
     y = np.fromfile(folder / 'logits.f32', dtype='<f4').reshape(x.shape)
     assert np.isfinite(y).all()
     delta = np.abs(x.astype(np.float64) - y.astype(np.float64))
@@ -85,8 +104,8 @@ for folder in a.runs:
     allocator_stable = len(set(map(tuple, s['after_session_reserved_live']))) == 1 if s['allocator_stats_available'] else None
     known_device_checks = [v for v in [allocator_stable, driver_stable] if v is not None]
     device_stable = True if s['backend'] == 'cpu' else all(known_device_checks) if known_device_checks else None
-    totals = np.asarray(s['prefill_ms']) + np.asarray(s['ms_per_token']) * s['decode_tokens']
-    base_totals = np.asarray(base['prefill_ms']) + np.asarray(base['ms_per_token']) * base['decode_tokens']
+    totals = session_totals(s)
+    base_totals = session_totals(base)
     gates = {'same_executable': bool(base.get('executable_sha256')) and base.get('executable_sha256') == s.get('executable_sha256'),
              'absolute_logits_1e_5': bool((delta <= 1e-5).all()),
              'repeat_logits_1e_5': s['max_repeat_logit_difference'] <= 1e-5,
@@ -99,6 +118,9 @@ for folder in a.runs:
              'device_memory_stable': device_stable,
              'reference_memory_stable': base_device_stable,
              'no_cpu_fallbacks': not any(s['decode_cpu_fallbacks'] + s['prefill_cpu_fallbacks'])}
+    if 'after_session_heap_stats' in base or 'after_session_heap_stats' in s:
+        gates['reference_live_heap_stable_le_1MiB'] = heap_live_stable(base)
+        gates['live_heap_stable_le_1MiB'] = heap_live_stable(s)
     run_hash = digest(folder / 'logits.f32')
     r = {'run': str(folder), 'logits_sha256': run_hash, 'bit_identical': run_hash == base_hash, 'backend': s['backend'], 'auto_placement': s['auto_placement'],
          'summary': s, 'max_abs_logit_difference': float(delta.max()),

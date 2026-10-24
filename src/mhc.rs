@@ -311,10 +311,17 @@ mod rms_tests {
 /// Collapse the `hc` copies of `x` (`[b, s, hc, d]`) to one stream with the
 /// weights `pre` (`[b, s, hc]`).
 pub fn collapse(x: &Tensor, pre: &Tensor) -> Result<Tensor> {
-    #[cfg(feature = "vulkan")]
-    if let (candle_core::Device::Vulkan(d), [b, seq, 4, width]) = (x.device(), x.dims()) {
+    if let [b, seq, 4, width] = x.dims() {
         let (b, seq, width) = (*b, *seq, *width);
-        if candle_core::vulkan_backend::kernels::precise_prefill_optimized(d, b * seq)
+        let enabled = match x.device() {
+            candle_core::Device::Cpu => crate::precise::active(x),
+            #[cfg(feature = "vulkan")]
+            candle_core::Device::Vulkan(d) => {
+                candle_core::vulkan_backend::kernels::precise_prefill_optimized(d, b * seq)
+            }
+            _ => false,
+        };
+        if enabled
             && x.dtype() == candle_core::DType::F32
             && pre.dtype() == candle_core::DType::F32
             && x.is_contiguous()
@@ -337,25 +344,41 @@ pub fn collapse(x: &Tensor, pre: &Tensor) -> Result<Tensor> {
     crate::precise::sum(&weighted, D::Minus2)
 }
 
-#[cfg(feature = "vulkan")]
 struct FusedCollapse {
     rows: usize,
     width: usize,
 }
-#[cfg(feature = "vulkan")]
 impl candle_core::CustomOp2 for FusedCollapse {
     fn name(&self) -> &'static str {
         "mhc-collapse-f64"
     }
     fn cpu_fwd(
         &self,
-        _: &candle_core::CpuStorage,
-        _: &candle_core::Layout,
-        _: &candle_core::CpuStorage,
-        _: &candle_core::Layout,
+        x: &candle_core::CpuStorage,
+        lx: &candle_core::Layout,
+        pre: &candle_core::CpuStorage,
+        lp: &candle_core::Layout,
     ) -> Result<(candle_core::CpuStorage, candle_core::Shape)> {
-        candle_core::bail!("fused HC collapse requires native Vulkan")
+        let x = x.as_slice::<f32>()?;
+        let pre = pre.as_slice::<f32>()?;
+        let mut out = vec![0f32; self.rows * self.width];
+        for (i, value) in out.iter_mut().enumerate() {
+            let row = i / self.width;
+            let col = i % self.width;
+            let mut sum = 0f64;
+            for h in 0..4 {
+                let product = x[lx.start_offset() + (row * 4 + h) * self.width + col]
+                    * pre[lp.start_offset() + row * 4 + h];
+                sum += product as f64;
+            }
+            *value = sum as f32;
+        }
+        Ok((
+            candle_core::CpuStorage::F32(out),
+            candle_core::Shape::from((self.rows, self.width)),
+        ))
     }
+    #[cfg(feature = "vulkan")]
     fn vulkan_fwd(
         &self,
         x: &candle_core::VulkanStorage,
@@ -431,6 +454,69 @@ impl HyperConnection {
     ) -> Result<(Tensor, HcMix)> {
         let mix = self.mixes(x, rms_eps, iters, eps)?;
         Ok((collapse(x, &mix.pre)?, mix))
+    }
+}
+
+#[cfg(test)]
+mod cpu_collapse_tests {
+    use super::*;
+    use candle_core::{DType, Device};
+
+    #[test]
+    #[ignore = "requires JOSHUA_CPU_DOT_F64=1"]
+    fn cpu_fused_collapse_preserves_products_reduction_and_offsets() -> Result<()> {
+        assert!(crate::precise::cpu_enabled());
+        for (rows, width) in [(1usize, 7usize), (2, 13), (25, 5120), (32, 5120)] {
+            let values: Vec<f32> = (0..(rows + 1) * 4 * width)
+                .map(|i| ((i * 17 % 251) as f32 - 125.) / 11.7)
+                .collect();
+            let coefficients: Vec<f32> = (0..(rows + 1) * 4)
+                .map(|i| ((i * 31 % 53) as f32 - 26.) / 11.3)
+                .collect();
+            let mut expected = Vec::new();
+            for row in 0..rows {
+                for col in 0..width {
+                    let mut sum = 0f64;
+                    for h in 0..4 {
+                        let product = values[((row + 1) * 4 + h) * width + col]
+                            * coefficients[(row + 1) * 4 + h];
+                        sum += product as f64;
+                    }
+                    expected.push(sum as f32);
+                }
+            }
+            let x = Tensor::from_vec(values, (rows + 1, 4, width), &Device::Cpu)?
+                .narrow(0, 1, rows)?
+                .unsqueeze(0)?;
+            let p = Tensor::from_vec(coefficients, (rows + 1, 4), &Device::Cpu)?
+                .narrow(0, 1, rows)?
+                .unsqueeze(0)?;
+            let weighted = p.unsqueeze(D::Minus1)?.broadcast_as(x.shape())?.mul(&x)?;
+            assert_eq!(
+                crate::precise::sum(&weighted, D::Minus2)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?,
+                expected
+            );
+            assert_eq!(collapse(&x, &p)?.flatten_all()?.to_vec1::<f32>()?, expected);
+            assert_eq!(
+                collapse(&x.squeeze(0)?, &p.squeeze(0)?)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?,
+                expected
+            );
+        }
+        let ordinary = Tensor::ones((1, 1, 3, 4), DType::F32, &Device::Cpu)?;
+        assert_eq!(
+            collapse(
+                &ordinary,
+                &Tensor::ones((1, 1, 3), DType::F32, &Device::Cpu)?
+            )?
+            .flatten_all()?
+            .to_vec1::<f32>()?,
+            vec![3.; 4]
+        );
+        Ok(())
     }
 }
 
