@@ -849,6 +849,62 @@ void main() {{
     s
 }
 
+pub fn k_gemm_f64(wg: usize, tx: usize) -> String {
+    k_gemm(wg, tx).replace("float acc[16];", "double acc[16];")
+        .replace("acc[i] = 0.0;", "acc[i] = double(0.0);")
+        .replace("float a", "double a").replace("float b", "double b")
+        .replace("= acc[r * 4 + c];", "= float(acc[r * 4 + c]);")
+}
+
+/// Small-row precise matmul: no padded GEMM rows, shared tiles or barriers.
+/// Each output retains the CPU's sequential K-order FP64 FMA accumulation.
+/// Push layout is shared with GEMM, including batch/broadcast strides.
+pub fn k_small_matmul_f64(wg: usize) -> String {
+    let mut s = prelude(wg, 3);
+    s += &buf(0, "float", "A", true);
+    s += &buf(1, "float", "B", true);
+    s += &buf(2, "float", "C", false);
+    s += r#"
+layout(push_constant) uniform PC { int M; int N; int K; int sam; int sak; int sbk; int sbn; int oa; int ob; int oc; int ba; int bb; int bc; int b_kc; } pc;
+layout(local_size_x=WG) in;
+void main() {
+    int i=gid();
+    int bz=int(gl_WorkGroupID.z);
+    if(i>=pc.M*pc.N)return;
+    int m=i/pc.N;
+    int n=i%pc.N;
+    int ao=pc.oa+bz*pc.ba+m*pc.sam;
+    int bo=pc.ob+bz*pc.bb+n*pc.sbn;
+    double acc=double(0.0);
+    for(int k=0;k<pc.K;k++)acc=fma(double(A[ao+k*pc.sak]),double(B[bo+k*pc.sbk]),acc);
+    C[pc.oc+bz*pc.bc+i]=float(acc);
+}
+"#;
+    s
+}
+
+/// Parallel contraction for long, small-row matmuls. FP64 partials avoid
+/// the FP32 reduction drift while making enough independent work for the GPU.
+pub fn k_small_matmul_reduce_f64(_wg: usize) -> String {
+    let mut s=prelude(64,3);
+    s+=&buf(0,"float","A",true);s+=&buf(1,"float","B",true);s+=&buf(2,"float","C",false);
+    s+=r#"
+layout(push_constant) uniform PC {int M;int N;int K;int sam;int sak;int sbk;int sbn;int oa;int ob;int oc;int ba;int bb;int bc;int b_kc;} pc;
+layout(local_size_x=64) in;
+shared double partial[64];
+void main(){
+ int i=grow();int t=int(gl_LocalInvocationID.x);int bz=int(gl_WorkGroupID.z);
+ if(i>=pc.M*pc.N)return;
+ int ao=pc.oa+bz*pc.ba+(i/pc.N)*pc.sam;
+ int bo=pc.ob+bz*pc.bb+(i%pc.N)*pc.sbn;
+ double acc=double(0.0);
+ for(int k=t;k<pc.K;k+=64)acc=fma(double(A[ao+k*pc.sak]),double(B[bo+k*pc.sbk]),acc);
+ partial[t]=acc;barrier();
+ if(t==0){double sum=double(0.0);for(int j=0;j<64;j++)sum+=partial[j];C[pc.oc+bz*pc.bc+i]=float(sum);}
+}
+"#;s
+}
+
 /// GEMV for a transposed weight (B contiguous along k): one work-group per
 /// `n` (2-D grid) with the batch on z.  Push: `N, K, sbn, oa, ob, oc, ba, bb, bc`.
 pub fn k_gemv_nt(wg: usize) -> String {
@@ -980,6 +1036,26 @@ void main() {
     s
 }
 
+/// Diagnostic accurate wide-row RMS: f64 accumulation and scaling, f32 storage.
+pub fn k_rmsnorm_f64(wg: usize, weighted: bool) -> String {
+    let mut s=prelude(wg,3);s+=&buf(0,"float","x",true);s+=&buf(1,"float","alpha",true);s+=&buf(2,"float","o",false);
+    s+=r#"
+layout(push_constant) uniform PC {int rows;int cols;int off;int aoff;float eps;} pc;
+layout(local_size_x=WG) in;
+shared double sh[8];
+void main(){
+ int row=grow();int t=int(gl_LocalInvocationID.x);if(row>=pc.rows)return;
+ int r=pc.off+row*pc.cols;int w=row*pc.cols;
+ if(t<8){double ss=double(0.0);for(int c=t;c<pc.cols;c+=8){double v=double(x[r+c]);ss+=v*v;}sh[t]=ss;}
+ barrier();
+ if(t==0){double sum=double(0.0);for(int i=0;i<8;i++)sum+=sh[i];sh[0]=double(1.0)/sqrt(sum/double(pc.cols)+double(pc.eps));}
+ barrier();double scale=sh[0];
+ for(int c=t;c<pc.cols;c+=WG){
+"#;
+    s+=if weighted{"o[w+c]=float(double(x[r+c])*scale*double(alpha[pc.aoff+c]));"}else{"o[w+c]=float(double(x[r+c])*scale);"};
+    s+="\n}\n}\n";s
+}
+
 /// RoPE over `x [b, h, t, d]` with `cos`/`sin` `[t, d/2]` (or `[b, t, d/2]`
 /// when `cs_b`); `interleaved` selects candle's `rope_i` pairing.
 /// Push: `n_pairs, h, t, d, xoff, coff, soff, cs_b`.
@@ -1027,6 +1103,16 @@ void main() {{
 "#
     );
     s
+}
+
+pub fn k_rope_i_f64(wg: usize) -> String {
+    k_rope(wg, true)
+        .replace("float x1 = x[pc.xoff + base];", "double x1 = double(x[pc.xoff + base]);")
+        .replace("float x2 = x[pc.xoff + base + 1];", "double x2 = double(x[pc.xoff + base + 1]);")
+        .replace("float c = cs[pc.coff + ci];", "double c = double(cs[pc.coff + ci]);")
+        .replace("float s = sn[pc.soff + ci];", "double s = double(sn[pc.soff + ci]);")
+        .replace("o[base] = x1 * c - x2 * s;", "o[base] = float(x1 * c - x2 * s);")
+        .replace("o[base + 1] = x1 * s + x2 * c;", "o[base + 1] = float(x1 * s + x2 * c);")
 }
 
 /// Byte-addressed helpers over the packed weight buffer `W` and the
@@ -1224,6 +1310,149 @@ void main() {
     if (t == 0) C[pc.coff + m * pc.N + n] = sh[0];
 }
 "#;
+    s
+}
+
+// Match the CPU's 4-lane Q8 / 8-lane Q4,Q2 accumulation exactly in
+// prefill as well as decode. Several output rows share one workgroup.
+pub fn k_qgemv_f64(wg: usize, groups: usize, lanes: usize, rows: usize) -> String {
+    let mut s=prelude(wg,3);s+=&buf(0,"float","X",true);s+=&buf(1,"uint","W",true);s+=&buf(2,"float","C",false);s+=QUANT_FN;
+    s+=&format!("\n#define LANES {lanes}\n#define GROUPS {groups}\n#define ROWS {rows}\n");
+    s+=r#"
+layout(push_constant) uniform PC {int N;int K;int qt;int qk;int bsz;int xoff;int coff;int M;} pc;
+layout(local_size_x=WG) in;
+shared double partial[WG*ROWS];
+void main(){
+ int t=int(gl_LocalInvocationID.x);int lane=t%LANES;int local_row=t/LANES;
+ int n=grow()*(WG/LANES)+local_row;int m=int(gl_WorkGroupID.z)*ROWS;
+ if(m>=pc.M)return;
+ double acc[ROWS];for(int r=0;r<ROWS;r++)acc[r]=double(0.0);
+ if(n<pc.N){
+  int xr=GROUPS>1?n/(pc.N/GROUPS):m;int x=pc.xoff+xr*pc.K;
+  int nb=pc.K/pc.qk;
+  for(int b=0;b<nb;b++){
+   uint p=uint(n*nb+b)*uint(pc.bsz);float d;float dm;
+   if(pc.qt==8){d=f16_at(p);dm=0.0;}else if(pc.qt==12){d=f16_at(p);dm=f16_at(p+2u);}else{d=f16_at(p+80u);dm=f16_at(p+82u);}
+   for(int sg=0;sg<pc.qk/32;sg++){
+    uint sc=0u;uint mn=0u;
+    if(pc.qt==12)k4_scale(p+4u,sg,sc,mn);
+    for(int i=lane;i<32;i+=LANES){
+     float w;
+     if(pc.qt==8){w=d*float(i8_at(p+2u+uint(i)));}
+     else if(pc.qt==12){uint q=byte_at(p+16u+uint(sg/2*32+i));q=(q>>uint((sg%2)*4))&15u;w=(d*float(sc))*float(q)-dm*float(mn);}
+     else{int hh=sg/4;uint sh=uint(2*(sg%4));uint scale=byte_at(p+uint(8*hh+2*(sg%4)+i/16));uint q=(byte_at(p+16u+uint(32*hh+i))>>sh)&3u;w=(d*float(scale&15u))*float(q)-dm*float(scale>>4u);}
+     for(int r=0;r<ROWS;r++){
+      if(m+r<pc.M)acc[r]=fma(double(X[x+r*pc.K+b*pc.qk+sg*32+i]),double(w),acc[r]);
+     }
+    }
+    // JOSHUA_QDOT_SUBBLOCK_END
+   }
+  }
+ }
+ for(int r=0;r<ROWS;r++)partial[r*WG+t]=acc[r];barrier();
+ if(lane==0&&n<pc.N){
+  for(int r=0;r<ROWS;r++){
+   if(m+r<pc.M){double sum=double(0.0);for(int i=0;i<LANES;i++)sum+=partial[r*WG+local_row*LANES+i];C[pc.coff+(m+r)*pc.N+n]=float(sum);}
+  }
+ }
+}
+"#;s
+}
+
+#[cfg(test)]
+pub fn k_qgemv_compensated(wg: usize, groups: usize, lanes: usize, rows: usize) -> String {
+    let s = k_qgemv_f64(wg, groups, lanes, rows)
+        .replace("double acc[ROWS];for(int r=0;r<ROWS;r++)acc[r]=double(0.0);", "float hi[ROWS];float lo[ROWS];for(int r=0;r<ROWS;r++){hi[r]=0.0;lo[r]=0.0;}")
+        .replace("if(m+r<pc.M)acc[r]=fma(double(X[x+r*pc.K+b*pc.qk+sg*32+i]),double(w),acc[r]);", r#"
+      if(m+r<pc.M){
+       float a=X[x+r*pc.K+b*pc.qk+sg*32+i];
+       float product=a*w;
+       float pe=fma(a,w,-product);
+       float sum=hi[r]+product;
+       float bb=sum-hi[r];
+       float se=(hi[r]-(sum-bb))+(product-bb);
+       float correction=lo[r]+(se+pe);
+       float next=sum+correction;
+       lo[r]=correction-(next-sum);
+       hi[r]=next;
+      }
+"#)
+        .replace("partial[r*WG+t]=acc[r];", "partial[r*WG+t]=double(hi[r])+double(lo[r]);");
+    format!("// JOSHUA_NO_CONTRACTION\n{s}")
+}
+
+/// Defer the high/low renormalization to each 32-value quantized sub-block.
+/// Product and addition residuals are still retained for every input term.
+#[cfg(test)]
+pub fn k_qgemv_compensated_block(wg: usize, groups: usize, lanes: usize, rows: usize) -> String {
+    k_qgemv_compensated(wg,groups,lanes,rows)
+        .replace("float correction=lo[r]+(se+pe);\n       float next=sum+correction;\n       lo[r]=correction-(next-sum);\n       hi[r]=next;", "lo[r]=lo[r]+(se+pe);\n       hi[r]=sum;")
+        .replace("// JOSHUA_QDOT_SUBBLOCK_END", r#"
+    for(int r=0;r<ROWS;r++){
+     float next=hi[r]+lo[r];
+     float bb=next-hi[r];
+     lo[r]=(hi[r]-(next-bb))+(lo[r]-bb);
+     hi[r]=next;
+    }
+"#)
+}
+
+/// Q8-only precise projection. Fixed block geometry and named accumulators
+/// remove generic quantization branches, indirect private arrays, and row
+/// loops from the inner dot. The CPU's four partial accumulation streams
+/// and their final reduction order are unchanged.
+pub fn k_q8_precise(wg:usize,groups:usize,rows:usize,comp:bool)->String {
+    let mut s=prelude(wg,3);
+    if comp{s+="// JOSHUA_NO_CONTRACTION\n";}
+    s+=&buf(0,"float","X",true);s+=&buf(1,"uint","W",true);s+=&buf(2,"float","C",false);
+    s+=&format!("\n#define ROWS {rows}\n#define GROUPS {groups}\n");
+    s+=r#"
+layout(push_constant) uniform PC {int N;int K;int qt;int qk;int bsz;int xoff;int coff;int M;} pc;
+layout(local_size_x=WG) in;
+shared double partial[WG*ROWS];
+void main(){
+ int t=int(gl_LocalInvocationID.x);int lane=t%4;
+ int n=grow()*(WG/4)+t/4;int m=int(gl_WorkGroupID.z)*ROWS;
+ if(m>=pc.M)return;
+"#;
+    for r in 0..rows {
+        s+=&if comp{format!("float hi{r}=0.0;float lo{r}=0.0;\n")}else{format!("double acc{r}=double(0.0);\n")};
+    }
+    s+=r#"
+ if(n<pc.N){
+  int x=pc.xoff+(GROUPS>1?n/(pc.N/GROUPS):m)*pc.K;
+  int nb=pc.K/32;
+  for(int b=0;b<nb;b++){
+   uint p=uint(n*nb+b)*34u;
+   float d=unpackHalf2x16(W[p>>2u]>>((p&3u)*8u)).x;
+"#;
+    for j in 0..8 {
+        s+=&format!("{{int k=b*32+lane+{};uint qp=p+2u+uint(lane)+{}u;int qi=int(W[qp>>2u]<<((3u-(qp&3u))*8u))>>24;float w=d*float(qi);\n",j*4,j*4);
+        for r in 0..rows {
+            s+=&format!("if(m+{r}<pc.M){{\n");
+            if comp {
+                s+=&format!(r#"
+ float a=X[x+{r}*pc.K+k];float product=a*w;float pe=fma(a,w,-product);
+ float sum=hi{r}+product;float bb=sum-hi{r};float se=(hi{r}-(sum-bb))+(product-bb);
+ float correction=lo{r}+(se+pe);float next=sum+correction;
+ lo{r}=correction-(next-sum);hi{r}=next;
+"#);
+            } else {
+                s+=&format!("acc{r}=fma(double(X[x+{r}*pc.K+k]),double(w),acc{r});\n");
+            }
+            s+="}\n";
+        }
+        s+="}\n";
+    }
+    s+="  }\n }\n";
+    for r in 0..rows {
+        s+=&if comp{format!("partial[{r}*WG+t]=double(hi{r})+double(lo{r});\n")}else{format!("partial[{r}*WG+t]=acc{r};\n")};
+    }
+    s+="barrier();\nif(lane==0&&n<pc.N){\n";
+    for r in 0..rows {
+        s+=&format!("if(m+{r}<pc.M){{double sum=double(0.0);for(int i=0;i<4;i++)sum+=partial[{r}*WG+(t/4)*4+i];C[pc.coff+(m+{r})*pc.N+n]=float(sum);}}\n");
+    }
+    s+="}\n}\n";
     s
 }
 
@@ -1500,4 +1729,198 @@ void main() {
 }
 "#;
     s
+}
+
+const PRECISE_MATH: &str = r#"
+double wide_exp(double x) {
+    if (isnan(x)) return x;
+    if (x < double(-208.0)) return double(0.0);
+    if (x > double(89.0)) return double(uintBitsToFloat(0x7f800000u));
+    double inv = double(uintBitsToFloat(0x3fb8aa3bu)) + double(uintBitsToFloat(0x32a57060u));
+    int n = int(floor(fma(x,inv,double(0.5))));
+    double r = fma(-double(n),double(uintBitsToFloat(0x3f317218u)),x);
+    r = fma(-double(n),double(uintBitsToFloat(0xb102e308u)),r);
+    r = fma(-double(n),double(uintBitsToFloat(0xa4ca86c4u)),r);
+    double p = double(1.0)/(double(6227020800.0)*double(14.0));
+    p = fma(p,r,double(1.0)/double(6227020800.0));
+    p = fma(p,r,double(1.0)/double(479001600.0));
+    p = fma(p,r,double(1.0)/double(39916800.0));
+    p = fma(p,r,double(1.0)/double(3628800.0));
+    p = fma(p,r,double(1.0)/double(362880.0));
+    p = fma(p,r,double(1.0)/double(40320.0));
+    p = fma(p,r,double(1.0)/double(5040.0));
+    p = fma(p,r,double(1.0)/double(720.0));
+    p = fma(p,r,double(1.0)/double(120.0));
+    p = fma(p,r,double(1.0)/double(24.0));
+    p = fma(p,r,double(1.0)/double(6.0));
+    p = fma(p,r,double(1.0)/double(2.0));
+    p = fma(p,r,double(1.0)/double(1.0));
+    p = fma(p,r,double(1.0)/double(1.0));
+    int h = n/3;
+    return p*double(uintBitsToFloat(uint(h+127)<<23u))*double(uintBitsToFloat(uint(h+127)<<23u))*double(uintBitsToFloat(uint(n-2*h+127)<<23u));
+}
+float wide_unary(float x,int op) {
+    double v = double(x);
+    if (op == 0) return float(wide_exp(v));
+    double e = wide_exp(-abs(v));
+    if (op == 3) {
+        double z = e/(double(2.0)+e);
+        double zz = z*z;
+        double p = double(1.0)/double(31.0);
+        p = fma(p,zz,double(1.0)/double(29.0));
+        p = fma(p,zz,double(1.0)/double(27.0));
+        p = fma(p,zz,double(1.0)/double(25.0));
+        p = fma(p,zz,double(1.0)/double(23.0));
+        p = fma(p,zz,double(1.0)/double(21.0));
+        p = fma(p,zz,double(1.0)/double(19.0));
+        p = fma(p,zz,double(1.0)/double(17.0));
+        p = fma(p,zz,double(1.0)/double(15.0));
+        p = fma(p,zz,double(1.0)/double(13.0));
+        p = fma(p,zz,double(1.0)/double(11.0));
+        p = fma(p,zz,double(1.0)/double(9.0));
+        p = fma(p,zz,double(1.0)/double(7.0));
+        p = fma(p,zz,double(1.0)/double(5.0));
+        p = fma(p,zz,double(1.0)/double(3.0));
+        p = fma(p,zz,double(1.0)/double(1.0));
+        return float(sqrt(max(v,double(0.0))+double(2.0)*z*p));
+    }
+    double sigmoid = v >= double(0.0) ? double(1.0)/(double(1.0)+e) : e/(double(1.0)+e);
+    return float(op == 1 ? sigmoid : v*sigmoid);
+}
+"#;
+
+pub fn k_precise_unary(wg: usize) -> String {
+    let mut s=prelude(wg,2);s+=&buf(0,"float","X",true);s+=&buf(1,"float","O",false);s+=PRECISE_MATH;
+    s+=r#"
+layout(push_constant) uniform PC { int n; int off; int op; } pc;
+layout(local_size_x=WG) in;
+void main(){int i=gid();if(i<pc.n)O[i]=wide_unary(X[pc.off+i],pc.op);}
+"#;s
+}
+
+/// One invocation owns a complete HC=4 row. Float temporaries deliberately
+/// retain all the storage-rounding boundaries of the unfused implementation.
+/// Output has three contiguous sections so consumers receive borrowed views.
+pub fn k_fused_mhc_serial(_wg: usize) -> String {
+    let mut s=prelude(64,3);
+    s+="// JOSHUA_NO_CONTRACTION\n";
+    s+=&buf(0,"float","X",true);s+=&buf(1,"float","B",true);s+=&buf(2,"float","O",false);s+=PRECISE_MATH;
+    s+=r#"
+layout(push_constant) uniform PC {int rows;int xoff;int boff;int iters;float eps;float s0;float s1;float s2;} pc;
+layout(local_size_x=64) in;
+void main(){
+ int row=gid();if(row>=pc.rows)return;
+ int x=pc.xoff+row*24;
+ for(int c=0;c<4;c++){
+  float pre=float(double(X[x+c])*double(pc.s0))+0.0;
+  pre=pre+B[pc.boff+c];
+  O[row*4+c]=wide_unary(pre,1)+pc.eps;
+  float post=float(double(X[x+4+c])*double(pc.s1))+0.0;
+  post=post+B[pc.boff+4+c];
+  O[pc.rows*4+row*4+c]=wide_unary(post,1)*2.0+0.0;
+ }
+ float v[16];
+ for(int i=0;i<16;i++){float scaled=float(double(X[x+8+i])*double(pc.s2))+0.0;v[i]=scaled+B[pc.boff+8+i];}
+ for(int r=0;r<4;r++){
+  float m=-uintBitsToFloat(0x7f800000u);for(int c=0;c<4;c++)m=max(m,v[r*4+c]);
+  double e[4];double sum=double(0.0);
+  for(int c=0;c<4;c++){e[c]=wide_exp(double(v[r*4+c])-double(m));sum+=e[c];}
+  for(int c=0;c<4;c++)v[r*4+c]=float(e[c]/sum)+pc.eps;
+ }
+ // Initial column normalization is required even for iters=0.
+ for(int iteration=0;iteration<max(pc.iters,1);iteration++){
+  if(iteration>0){
+   for(int r=0;r<4;r++){
+    double sum=double(0.0);for(int c=0;c<4;c++)sum+=double(v[r*4+c]);
+    float den=float(sum)+pc.eps;
+    for(int c=0;c<4;c++)v[r*4+c]=float(double(v[r*4+c])/double(den));
+   }
+  }
+  for(int c=0;c<4;c++){
+   double sum=double(0.0);for(int r=0;r<4;r++)sum+=double(v[r*4+c]);
+   float den=float(sum)+pc.eps;
+   for(int r=0;r<4;r++)v[r*4+c]=float(double(v[r*4+c])/double(den));
+  }
+ }
+ for(int i=0;i<16;i++)O[pc.rows*8+row*16+i]=v[i];
+}
+"#;s
+}
+/// Keep the 16 coefficients in shared storage and normalize them in parallel.
+/// Ping-pong buffers preserve each unfused normalization's simultaneous reads.
+pub fn k_fused_mhc(_wg: usize) -> String {
+    let mut s=prelude(64,3);
+    s+="// JOSHUA_NO_CONTRACTION\n";
+    s+=&buf(0,"float","X",true);s+=&buf(1,"float","B",true);s+=&buf(2,"float","O",false);s+=PRECISE_MATH;
+    s+=r#"
+layout(push_constant) uniform PC {int rows;int xoff;int boff;int iters;float eps;float s0;float s1;float s2;} pc;
+layout(local_size_x=64) in;
+shared float V[32];
+shared double E[16];
+void balance_hc(bool row_axis,int src,int dst){
+ int t=int(gl_LocalInvocationID.x);
+ if(t<16){
+  int r=t/4;int c=t%4;double sum=double(0.0);
+  for(int j=0;j<4;j++)sum+=double(V[src+(row_axis?r*4+j:j*4+c)]);
+  float den=float(sum)+pc.eps;
+  V[dst+t]=float(double(V[src+t])/double(den));
+ }
+ barrier();
+}
+void main(){
+ int row=grow();int t=int(gl_LocalInvocationID.x);if(row>=pc.rows)return;
+ int x=pc.xoff+row*24;
+ if(t<4){
+  float pre=float(double(X[x+t])*double(pc.s0))+0.0;pre=pre+B[pc.boff+t];
+  O[row*4+t]=wide_unary(pre,1)+pc.eps;
+  float post=float(double(X[x+4+t])*double(pc.s1))+0.0;post=post+B[pc.boff+4+t];
+  O[pc.rows*4+row*4+t]=wide_unary(post,1)*2.0+0.0;
+ }
+ if(t<16){float scaled=float(double(X[x+8+t])*double(pc.s2))+0.0;V[t]=scaled+B[pc.boff+8+t];}
+ barrier();
+ if(t<16){
+  int r=t/4;float m=-uintBitsToFloat(0x7f800000u);
+  for(int c=0;c<4;c++)m=max(m,V[r*4+c]);
+  E[t]=wide_exp(double(V[t])-double(m));
+ }
+ barrier();
+ if(t<16){
+  int r=t/4;double sum=double(0.0);for(int c=0;c<4;c++)sum+=E[r*4+c];
+  V[t]=float(E[t]/sum)+pc.eps;
+ }
+ barrier();
+ balance_hc(false,0,16);
+ for(int iteration=1;iteration<max(pc.iters,1);iteration++){
+  balance_hc(true,16,0);
+  balance_hc(false,0,16);
+ }
+ if(t<16)O[pc.rows*8+row*16+t]=V[16+t];
+}
+"#;s
+}
+pub fn k_precise_rows(wg:usize)->String {
+    let mut s=prelude(wg,2);s+=&buf(0,"float","X",true);s+=&buf(1,"float","O",false);s+=PRECISE_MATH;
+    s+=r#"
+layout(push_constant) uniform PC {int rows;int cols;int inner;int off;int soft;} pc;
+layout(local_size_x=WG) in;
+void main(){
+ int row=gid();if(row>=pc.rows)return;
+ int base=(row/pc.inner)*pc.cols*pc.inner+row%pc.inner;
+ if(pc.soft==0){double sum=double(0.0);for(int c=0;c<pc.cols;c++)sum+=double(X[pc.off+base+c*pc.inner]);O[row]=float(sum);}
+ else{
+  float m=-uintBitsToFloat(0x7f800000u);for(int c=0;c<pc.cols;c++)m=max(m,X[pc.off+base+c*pc.inner]);
+  double sum=double(0.0);for(int c=0;c<pc.cols;c++)sum+=wide_exp(double(X[pc.off+base+c*pc.inner])-double(m));
+  for(int c=0;c<pc.cols;c++)O[base+c*pc.inner]=float(wide_exp(double(X[pc.off+base+c*pc.inner])-double(m))/sum);
+ }
+}
+"#;s
+}
+pub fn k_unary_precise(wg:usize)->String {
+    k_unary(wg)
+      .replace("case 6: return 1.0 / v;","case 6: return float(double(1.0)/double(v));")
+      .replace("case 8: return sqrt(v);","case 8: return float(sqrt(double(v)));")
+      .replace("case 20: return v * f0 + f1;","case 20: { float product=float(double(v)*double(f0)); return product+f1; }")
+}
+pub fn k_binary_precise(wg:usize)->String {
+    k_binary(wg,false).replace("case 3: return a / b;","case 3: return float(double(a)/double(b));")
 }

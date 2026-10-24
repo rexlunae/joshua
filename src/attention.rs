@@ -87,19 +87,25 @@ impl Rope {
     ) -> Result<Self> {
         let max_seq = max_seq.max(1);
         let n = inv_freq.len();
-        let inv_freq = Tensor::from_vec(inv_freq, (1, n), dev)?;
-        let t = Tensor::arange(0u32, max_seq as u32, dev)?
-            .to_dtype(DType::F32)?
-            .reshape((max_seq, 1))?;
-        let freqs = t.matmul(&inv_freq)?;
-        let (sin, cos) = if mscale == 1.0 {
-            (freqs.sin()?, freqs.cos()?)
-        } else {
-            (
-                (freqs.sin()? * mscale as f64)?,
-                (freqs.cos()? * mscale as f64)?,
-            )
-        };
+        // These are immutable load-time constants. GPU native trig can round
+        // small nonzero angles to cos=1 (including on B50), which changes
+        // attention scores. Evaluate the phase and trig in f64 on the host,
+        // round once to the storage dtype, and upload each completed table.
+        let len = max_seq.checked_mul(n).ok_or_else(|| {
+            candle_core::Error::Msg("RoPE table size overflow".into())
+        })?;
+        let mut sin = Vec::with_capacity(len);
+        let mut cos = Vec::with_capacity(len);
+        for position in 0..max_seq {
+            for &frequency in &inv_freq {
+                let phase = position as f64 * frequency as f64;
+                let (s, c) = phase.sin_cos();
+                sin.push((s * mscale as f64) as f32);
+                cos.push((c * mscale as f64) as f32);
+            }
+        }
+        let sin = Tensor::from_vec(sin, (max_seq, n), dev)?;
+        let cos = Tensor::from_vec(cos, (max_seq, n), dev)?;
         Ok(Self { sin, cos, style })
     }
 
@@ -354,7 +360,9 @@ pub fn cached_attention(
         Some(m) => scores.broadcast_add(m)?,
         None => scores,
     };
+    crate::activation_trace::record("attn-scores", &scores)?;
     let probs = softmax_last_dim(&scores)?.reshape((b, n_kv, rep * seq_len, seq_total))?;
+    crate::activation_trace::record("attn-probs", &probs)?;
     let ctx = v_cache.matmul(&probs.transpose(2, 3)?.contiguous()?)?; // [b, n_kv, dv, rep*seq]
     ctx.reshape((b, n_kv, dv, rep, seq_len))?
         .permute((0, 4, 1, 3, 2))? // [b, seq, n_kv, rep, dv]
@@ -563,6 +571,84 @@ fn copy_rows_runs<S: BackendStorage>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interleaved_rope_rotation_matches_f64_and_cache_chunks() -> Result<()> {
+        let (batch, heads, seq, dim, offset) = (2, 4, 33, 64, 17);
+        let data: Vec<f32> = (0..batch*heads*seq*dim)
+            .map(|i| ((i%251) as f32-125.)*0.25).collect();
+        let mut devices = vec![Device::Cpu];
+        #[cfg(feature = "vulkan")]
+        if let Ok(dev) = Device::new_vulkan(0) { devices.push(dev); }
+        for dev in devices {
+            let rope = Rope::new(dim, 10000., offset+seq, RopeStyle::Interleaved, &dev)?;
+            let (cos,sin) = rope.tables();
+            let cos = cos.to_vec2::<f32>()?;
+            let sin = sin.to_vec2::<f32>()?;
+            let x = Tensor::from_vec(data.clone(), (batch,heads,seq,dim), &dev)?;
+            let whole = rope.apply(&x, offset)?.flatten_all()?.to_vec1::<f32>()?;
+            let mut chunks = Vec::with_capacity(seq);
+            for t in 0..seq {
+                chunks.push(rope.apply(&x.narrow(2,t,1)?.contiguous()?, offset+t)?);
+            }
+            let chunked = Tensor::cat(&chunks,2)?.flatten_all()?.to_vec1::<f32>()?;
+            assert_eq!(whole, chunked, "{dev:?} prefill/decode");
+            let wide = if dev.is_cpu() {
+                std::env::var("JOSHUA_CPU_DOT_F64").is_ok_and(|v| v=="1")
+            } else {
+                std::env::var("JOSHUA_VULKAN_DOT_F64").is_ok_and(|v| v=="1")
+            };
+            for bh in 0..batch*heads { for t in 0..seq { for pair in 0..dim/2 {
+                let i = (bh*seq+t)*dim+2*pair;
+                let (a,b,c,s) = (data[i] as f64, data[i+1] as f64,
+                    cos[offset+t][pair] as f64, sin[offset+t][pair] as f64);
+                for (got,want) in [(whole[i],(a*c-b*s) as f32),(whole[i+1],(a*s+b*c) as f32)] {
+                    if wide { assert_eq!(got,want,"{dev:?} bh={bh} t={t} pair={pair}"); }
+                    else { assert!((got-want).abs()<=1e-5); }
+                }
+            }}}
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rope_tables_match_independent_high_precision_reference() -> Result<()> {
+        // 80-decimal-digit mpmath evaluation of position * exact f32 frequency.
+        // Include B50's small-angle failure and phases where f32 multiplication
+        // loses enough precision to affect a long-context rotation.
+        let cases = [
+            (1, 0, 0.008001041911156768, 0.9999679911518847),
+            (249, 0, 0.9124826688588965, -0.4091153615206173),
+            (65535, 0, 0.2879608746577615, -0.9576421746489328),
+            (65535, 1, 0.9813275592311402, 0.19234401860586398),
+            (65535, 2, 0.06548809955881085, 0.9978533503557401),
+        ];
+        let mut devices = vec![Device::Cpu];
+        #[cfg(feature = "vulkan")]
+        if let Ok(dev) = Device::new_vulkan(0) {
+            devices.push(dev);
+        }
+        #[cfg(feature = "sycl")]
+        if let Ok(dev) = Device::new_sycl(0) {
+            devices.push(dev);
+        }
+        for dev in &devices {
+            for scale in [1f32, 1.25] {
+                let rope = Rope::from_inv_freq(
+                    vec![0.008001127280294895f32, 1., 1e-6],
+                    65536, scale, RopeStyle::Interleaved, dev,
+                )?;
+                let (cos, sin) = rope.tables();
+                let sin = sin.to_vec2::<f32>()?;
+                let cos = cos.to_vec2::<f32>()?;
+                for &(pos, freq, s, c) in &cases {
+                    assert_eq!(sin[pos][freq], (s * scale as f64) as f32);
+                    assert_eq!(cos[pos][freq], (c * scale as f64) as f32);
+                }
+            }
+        }
+        Ok(())
+    }
 
     /// The bytes charged for a cache are its cached rows, and a fork holds
     /// exactly those rows in a buffer of their own, so the two agree even

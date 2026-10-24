@@ -1973,6 +1973,25 @@ impl Engine {
         let chat_template = extract_chat_template(&gguf, &tokenizer);
         let target_vocab = crate::draft_model::gguf_tokens(&gguf.metadata);
         let device = Self::resolve_device(options.backend)?;
+        #[cfg(feature = "sycl")]
+        let qwen_b50_shape = crate::auto_placement::validated_b50_qwen_shape(&raw, n_ctx as usize, prefill_chunk);
+        #[cfg(feature = "sycl")]
+        let profile_budget_fits = options.device_memory_budget.is_none_or(|budget| {
+            crate::placement::dense_set_fits(device_weight_bytes(&raw, arch).dense_lower,
+                crate::placement::DEVICE_PLACEMENT_HEADROOM, budget)
+        });
+        #[cfg(feature = "sycl")]
+        let device = if qwen_b50_shape && matches!(options.backend, ComputeBackend::Auto)
+            && profile_budget_fits
+            && options.dense_placement != crate::placement::DensePlacement::Cpu
+            && (options.dense_placement != crate::placement::DensePlacement::Auto
+                || crate::auto_placement::probe_enabled()) {
+            Self::prefer_validated_qwen_sycl(device)
+        } else { device };
+        #[cfg(feature = "sycl")]
+        let validated_sycl_qwen = qwen_b50_shape && Self::validated_b50_sycl(&device);
+        #[cfg(not(feature = "sycl"))]
+        let validated_sycl_qwen = false;
 
         // Memory placement on an accelerator: where the routed experts live,
         // and how many full weight copies the device can hold for the
@@ -2054,7 +2073,10 @@ impl Engine {
             && requested_placement == ExpertPlacement::Auto
             && placement == crate::placement::ResolvedPlacement::Host
             && cache_capable;
-        let dense_probe = !device.is_cpu()
+        let validated_dense = validated_sycl_qwen && dense_fits
+            && options.dense_placement == crate::placement::DensePlacement::Auto
+            && crate::auto_placement::probe_enabled();
+        let dense_probe = !validated_dense && !device.is_cpu()
             && options.dense_placement == crate::placement::DensePlacement::Auto
             && crate::auto_placement::probe_enabled();
         let bench = if dense_probe || (cache_candidate && crate::auto_placement::probe_enabled())
@@ -2074,7 +2096,10 @@ impl Engine {
         } else {
             None
         };
-        let resolved_dense = if dense_probe {
+        let resolved_dense = if validated_dense {
+            tracing::info!("dense placement: validated B50 Qwen3-8B Q4_K_M SYCL profile");
+            crate::placement::ResolvedDense::Device
+        } else if dense_probe {
             crate::auto_placement::recommend_dense(
                 options.dense_placement,
                 bench.as_ref().expect("the dense probe ran the bench"),
@@ -2569,11 +2594,12 @@ impl Engine {
         self
     }
 
-    /// Pick the compute device for [`ComputeBackend::Auto`].
+    /// Baseline availability order for [`ComputeBackend::Auto`].
     ///
     /// Tries compiled backends in CUDA, Metal, OpenCL, Vulkan, SYCL order,
     /// then CPU. This selects an available backend; dense placement is
-    /// measured separately after opening it.
+    /// measured separately after opening it. Qualified model preferences
+    /// are applied by the constructor within their benchmarked bounds.
     fn default_device() -> Device {
         #[cfg(feature = "cuda")]
         {
@@ -2620,6 +2646,34 @@ impl Engine {
             }
         }
         Device::Cpu
+    }
+
+    #[cfg(feature = "sycl")]
+    fn validated_b50_sycl(device: &Device) -> bool {
+        device.as_sycl_device().is_ok_and(|d| d.ctx().canonical_quantized)
+            && candle_core::sycl_backend::kernels::native_enabled()
+    }
+
+    #[cfg(feature = "sycl")]
+    fn prefer_validated_qwen_sycl(current: Device) -> Device {
+        // Only replace a backend already targeting B50. CUDA, Metal, CPU,
+        // other adapters, and explicit backend requests keep their policy.
+        let current_b50 = match &current {
+            #[cfg(feature = "vulkan")]
+            Device::Vulkan(d) => d.name().to_ascii_lowercase().contains("pro b50"),
+            #[cfg(feature = "opencl")]
+            Device::OpenCl(d) => d.name().to_ascii_lowercase().contains("pro b50"),
+            _ => false,
+        };
+        if current_b50 {
+            if let Ok(device) = Device::new_sycl(0) {
+                if Self::validated_b50_sycl(&device) {
+                    Self::log_sycl_device(&device);
+                    return device;
+                }
+            }
+        }
+        current
     }
 
     /// Log which OpenCL device was opened and how it holds weights, so a

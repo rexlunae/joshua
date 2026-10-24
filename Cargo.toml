@@ -33,6 +33,10 @@ name = "bench_cubecl_real"
 required-features = ["vulkan"]
 
 [[example]]
+name = "backend_numerics"
+required-features = ["vulkan", "sycl", "opencl"]
+
+[[example]]
 name = "cluster_linear"
 required-features = ["distributed"]
 

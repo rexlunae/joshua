@@ -780,6 +780,9 @@ same token sequence even when their logits differ. This measures conditional
 inference performance and full-logit parity, rather than free-running language
 quality. Each process warms eight prompt tokens and two decode steps first;
 all timed passes use the full prompt. Kernels run serially across APIs.
+`--reference saved-trace.json` replays a complete saved prompt and continuation
+on the reference backend too. `--warm-prompt-tokens` sets the warmup prefix
+(default 8; the Qwen rerun below uses 32).
 The evaluator records failed or unavailable configurations and preserves
 existing complete results. A folder left without `summary.json` is quarantined
 with `--retry-incomplete` and rerun instead of requiring manual cleanup.
@@ -804,6 +807,223 @@ separate. New runs also record process I/O counters and expert-cache reports
 at session boundaries. Cache warming and mmap page faults can affect timing,
 so compare repeated sessions and read bytes before attributing differences to
 kernel execution alone.
+
+### Strict-parity follow-up, 2026-10-23
+
+The [numerical investigation and full-model gates](benchmarks/backend-logit-isolation-b50-20261023.json)
+trace SYCL Qwen's drift to RMSNorm reduction/scaling order, softmax's exponential,
+and the eight-element Q4_K/Q6_K multirow dots. The corrected path uses ordered
+32-element FMA dots and 256 logical reduction lanes over **64 physical threads**.
+Before the RoPE correction below, this is bit-identical to the production Vulkan
+reference on the complete Qwen replay. Adapter qualification uses
+PCI **8086:E212**, negotiated through optional ABI-1 bridge capabilities; older
+bridges keep their existing quantized dispatch.
+
+The report retains every measured candidate, including a rejected 256-physical-thread
+trial whose repeated-session VRAM growth exceeded the unchanged 1 MiB gate.
+No failed measured sessions are discarded and the absolute logit tolerance stays
+**1e-5**. Final measurements and automatic-choice decisions are recorded below.
+
+DeepSeek CPU first diverges in the 20,480-wide hyperconnection RMS reduction.
+CPU f32 norms now borrow their input and accumulate in float64. The unweighted
+path allocates only its output, replacing the square/mean/power intermediates;
+weighted norms also retain float64 through scaling. Closed-form float64 tests
+cover wide rows, storage offsets, and sequential/parallel batches.
+
+The original CPU reduction-tree experiment was rejected after large downstream
+errors. Subsequent opt-in Q8/HC accumulation and RoPE FMA replays matched isolated
+operations, but still failed the complete eight-token diagnostic replay. Those
+experimental modes were removed from the patch and retained as raw evidence.
+No DeepSeek CPU preference is enabled.
+
+A direct same-input probe confirms that B50 Vulkan and SYCL return
+`cos(0.008001127) = 1.0`, while CPU returns `0.999967992`. With the user's
+explicit approval to correct the reference, shared RoPE tables now evaluate
+position × stored inverse frequency, sine/cosine, and magnitude scale in
+**float64 on the CPU**, then round once to f32 and upload each immutable table
+at load time. This adds no per-token transfers. This intentionally changes the
+old Vulkan logits; the old reference is retained in the investigation report.
+
+Table regression tests compare CPU, Vulkan, and SYCL against independently
+computed 80-decimal-digit values, including small angles and position 65,535.
+The tiny DeepSeek-V4.1 independent NumPy float64 reference test now uses **1e-5**
+(previously 2e-5). Both reference checks pass. Full-model cross-backend parity,
+speed, and repeated-session memory remain separate gates.
+
+Full runs use realistic saved prompts, prefill chunks of 32, 128 teacher-forced
+decode tokens, and repeated sessions. Each comparison uses one executable and
+the same tokens, with capture disabled. The absolute tolerance remains **1e-5**.
+
+| Workload/path | Decode ms/token | Speedup vs paired Vulkan | Max logit difference | Private growth | VRAM growth | Gates |
+|---|---:|---:|---:|---:|---:|---|
+| Qwen SYCL fixed, 5 sessions | 162.683 | 1.150× | 0 (bit-identical) | 8 KiB | 24 KiB | pass |
+| Qwen fully automatic, 3 sessions | 163.153 | 1.139× | 0 (bit-identical) | 8 KiB | 16 KiB | pass |
+| DeepSeek CPU, float64 norms, 2 sessions | 657.231 | 1.222× | 7.03335e-5 | 44 KiB | n/a (CPU) | parity fails |
+
+The automatic Qwen path also improves total session time by **1.355×**. Before
+this preference, SYCL's generic startup probe placed Qwen on CPU: 200.171 ms/token
+and `2.52008e-4` drift. The new preference is limited to native SYCL on PCI
+**8086:E212**, bridge numerical contract **1**, the qualified Qwen3-8B Q4_K_M
+metadata and tensor formats, **context ≤254**, and **prefill chunks ≤32**. It
+honors explicit backend/CPU placement, budget feasibility, and the probe opt-out.
+Other contexts, quantizations, adapters, and architectures retain existing policy.
+The benchmark now accepts `--backend auto --auto-placement` and records the
+resolved backend, so the full automatic path is measured rather than inferred.
+
+DeepSeek's corrected-table control reduced CPU drift from `3.13759e-4` to
+`1.25170e-4`; float64 CPU norms reduce it further to `7.03335e-5`. That is still
+above **1e-5**, despite passing speed, repeatability, greedy-choice and memory
+gates. Remaining differences include FP32 accumulation, rotation contraction,
+and normalization/transcendental rounding carried through cached prefill keys.
+The independent float64 checks cover tables and tiny-model outputs; a full
+float64 trace of the 290 GB real model was not generated.
+
+Further eight-token diagnostics isolate a prefill arithmetic transition at more
+than 16 rows and a router selection tie. Matching the GEMM reduction order makes
+the same-input batch-32 Q8 KV projection bit-identical. Native FP64 scalar RMS
+refinement then makes the first-layer cached keys and dot scores bit-identical;
+the first remaining difference is attention's exponential. Those initial prototypes
+failed end-to-end parity. At position 124, layer 3's CPU router
+selects expert 88 instead of 245: a large common bias rounds the selection pair
+to a tie, while independent float64 scoring of either captured input selects 245.
+The follow-up centers the selection bias once at load time, removing its common
+offset before scoring; unbiased routing weights are unchanged. The opt-in
+precision path also aligns dense Q4_K/Q8/Q2_K accumulation, interleaved rotation,
+RMS, reductions, attention, MHC, and nonlinear arithmetic across CPU and Vulkan.
+Weights remain compact and borrowed. CPU selected-group Q8 reads only each
+group's input row and writes one output, avoiding a full group-by-output temporary.
+Independent float64 primitive and tiny-model checks retain the **1e-5** gate.
+
+Set `JOSHUA_CPU_DOT_F64=1` for the CPU precision path (AVX2/FMA; dense Q4_K also
+requires AVX-512). This is a **process-wide diagnostic override**, not a
+DeepSeek-only production option: shared CPU Q8_0/matching Q2_K projections and
+interleaved RoPE in other architectures also observe it and may change logits.
+Keep it unset for ordinary execution; it does not qualify other models for
+automatic dispatch. The scoped Vulkan policy does not set this flag.
+For its native Vulkan reference, set
+`JOSHUA_VULKAN_RMS_F64=1 JOSHUA_VULKAN_DOT_F64=1`; the device must support
+`shaderFloat64`. These modes are opt-in and do not change automatic placement.
+The aligned eight-token replay is bit-identical across all 1,163,520 logits and
+1,400 captured layer checkpoints. This short diagnostic does not qualify speed
+or memory; full runs must disable capture and include a fast production control.
+
+The [full follow-up and gate results](benchmarks/deepseek-cpu-parity-b50-20261023.json)
+use the saved 121-token realistic prompt, prefill chunks of 32, **128 teacher-forced
+decode tokens**, context 249, and **two sessions** per path, with capture disabled.
+All three paths use the same frozen executable and tokens.
+
+| Path | Median decode ms/token | Median prefill ms | Max logit difference vs precision reference | Private growth | VRAM growth |
+|---|---:|---:|---:|---:|---:|
+| CPU precision, opt-in | 708.390 | 43,924.8 | **0 (bit-identical)** | 384 KiB | n/a |
+| Native Vulkan precision, opt-in | 1,182.018 | 85,868.6 | 0 | 200 KiB | 0 |
+| Fast production Vulkan control | 811.253 | 40,458.9 | **1.43051e-4 (fails)** | 32 KiB | 0 |
+
+CPU matches all **16,677,120 logits** of the precision reference, with zero
+repeat drift and identical greedy choices. Both precision paths pass repeated
+memory checks; native fallback counters remain zero (routed CPU-mmap experts
+remain intentional). CPU decode is **1.145×** faster and total session time is
+**1.072×** faster than the fast control; prefill alone is slightly slower.
+Every CPU decode and total-session sample beats every fast-control sample.
+
+These measurements left automatic choices unchanged: the fast production
+numerical contract differed by more than **1e-5**, despite matching all 129 greedy
+choices. The precision paths remained opt-in at this stage; the fast Vulkan
+follow-up below qualifies a scoped Vulkan profile. This is cross-backend full-model parity
+supported by independent primitive/tiny-model float64 checks, not an independent
+full-float64 execution of the 290 GB model.
+
+The report retains the failed trials and source snapshots. Replay tooling now
+rejects CPU fallbacks, which invalidated an earlier unsupported GLSL shader trial.
+
+For diagnosis, set `JOSHUA_ACTIVATION_TRACE` to a fresh capture directory and
+optionally `JOSHUA_ACTIVATION_TRACE_LIMIT` (default 512). For a Qwen or DeepSeek decode
+position, set `JOSHUA_ACTIVATION_TRACE_POSITION` to the absolute token offset.
+Selected Qwen/DeepSeek checkpoints are written as shape/label JSON plus little-endian f32 data. The
+disabled path does not read or copy tensor data, and normalization scratch keeps
+its original lifetime. Compare two identical-input captures with:
+
+```bash
+python3 kernels-cubecl/benchmarks/compare_activations.py \
+  /path/to/reference-captures /path/to/candidate-captures /tmp/activation-diff.json
+```
+
+Replay one captured operation with `backend_numerics` (build with
+`--features vulkan,opencl,sycl`):
+
+```bash
+target/release/examples/backend_numerics \
+  --model /path/to/Qwen3-8B-Q4_K_M.gguf \
+  --input /path/to/00000-qwen-input.f32 --cols 4096 \
+  --op rms --weight blk.0.attn_norm.weight --eps 1e-6 \
+  --output /tmp/rms-replay
+```
+
+The operation replay is diagnostic and performs readbacks; leave activation
+capture disabled for parity, timing and memory certification runs.
+
+### Production-dispatch rerun, 2026-10-23
+
+[Pinned results and all gates](benchmarks/backend-evaluation-production-b50-20261023.json)
+cover **16 configurations / 32 measured sessions**: CPU, OpenCL, SYCL and
+production Vulkan, each with fixed placement and the engine's automatic
+dense/expert/cache placement, for both real models. One executable includes
+all three accelerator features; a freshly rebuilt SYCL bridge and runtime
+are recorded by hash. Processes run serially without megakernel overrides.
+
+DeepSeek uses the complete 121-token prompt and Qwen the complete 126-token
+prompt, both with batch-32 prefill, 128 identical diverse decode inputs and
+two measured sessions per configuration. Warmup is 8 prompt tokens for
+DeepSeek and 32 for Qwen, plus two decode steps. Contexts are 249 and 254.
+Timings include model forward and host logits; model loading and placement
+probes are outside the inference timer. Fixed-placement results:
+
+| Backend | DeepSeek decode ms/token | DeepSeek prefill + decode s | Qwen8 decode ms/token | Qwen8 prefill + decode s |
+| --- | ---: | ---: | ---: | ---: |
+| CPU | **670.342** | **119.086** | 163.186 | 23.434 |
+| OpenCL | 960.909 | 150.053 | 195.059 | 28.875 |
+| SYCL | 830.108 | 133.446 | **146.613** | **22.458** |
+| Vulkan `CubeClProduction` | 820.714 | 150.955 | 184.919 | 33.247 |
+
+Vulkan now has the lowest measured **GPU decode** latency on DeepSeek, while
+SYCL has a shorter GPU prefill-plus-decode session and CPU is fastest overall.
+SYCL is fastest on Qwen. Neither result supports a universal backend reorder.
+
+**No automatic choices change.** Every alternative fails the unchanged
+absolute **1e-5** logit gate against its production Vulkan reference:
+
+| Fixed backend | DeepSeek max absolute difference | Qwen8 max absolute difference |
+| --- | ---: | ---: |
+| CPU | 0.000313759 | 0.000468254 |
+| OpenCL | 0.000266075 | 0.000473022 |
+| SYCL | 0.000064850 | 0.000202656 |
+
+All greedy choices match and all measured repeated-session logit differences
+are zero; these do not replace the full-logit gate. The production Vulkan
+hashes still match the accepted traces: DeepSeek `ab6fb262...` and Qwen
+`6dc8975c...`, with stable allocator and driver endpoints.
+
+Automatic placement selects CPU dense weights for CPU/OpenCL/Vulkan on both
+models; SYCL selects GPU dense weights. DeepSeek experts stay CPU-mmap and
+all automatic expert-cache budgets are `None`. Automatic decode medians are
+647.536 / 640.445 / 654.760 / 833.902 ms/token for DeepSeek Vulkan / CPU /
+OpenCL / SYCL, and 164.089 / 163.315 / 163.515 / 144.916 for Qwen. Backend
+labels alone must not be read as the device executing the dense set.
+
+The existing memory gates also reject Qwen CPU-auto (44.9 MiB private-memory
+increase) and SYCL-auto (2.01 MiB driver VRAM growth), DeepSeek fixed OpenCL
+(16 MiB driver growth), and DeepSeek OpenCL-auto (2.05 MiB private increase).
+DeepSeek Vulkan-auto has a 43.9 MiB private-memory span caused by a decrease;
+this fails the stability gate but is not evidence of a leak. Full signed
+endpoint changes and per-session I/O counters are retained in the report.
+No thresholds are relaxed and no warm sessions are discarded.
+
+Exact saved inputs are included as
+[DeepSeek trace](benchmarks/deepseek-backend-trace-b50-20261023.json) and
+[Qwen trace](benchmarks/qwen-backend-trace-b50-20261023.json). To reproduce,
+pass the appropriate trace with `--reference`, `--prefill-chunk 32`,
+`--decode 128`, `--passes 2`, and `--warm-prompt-tokens 8` (DeepSeek) or `32`
+(Qwen) to the evaluator above. Raw logs, complete logits and memory timelines
+remain in `/home/tserica/benchmark-results/backends-production-b50-20261023`.
 
 ### Measured backend results, 2026-10-18
 
@@ -942,3 +1162,69 @@ that failure was reproduced on unchanged base, then the CPU fixtures were
 made explicit. Raw logits and full memory timelines remain in
 `/tmp/joshua-backends-20261018`; the saved report retains hashes, bounds,
 endpoints, timings and the failed configurations.
+
+## Fast Vulkan precision follow-up (B50, 2026-10-23)
+
+The [full qualification report](benchmarks/deepseek-fast-vulkan-parity-b50-20261023.json)
+compares the corrected **no-flag production dispatch**, CPU precision reference,
+and fast Vulkan control using one frozen executable. It replays the saved
+121-token prompt in batches of 32, then **128 teacher-forced decode tokens**,
+with context 249, two independent sessions per path, and activation capture off.
+
+| Path | Median decode ms/token | Median prefill ms | Private endpoint spread |
+|---|---:|---:|---:|
+| Corrected default Vulkan | 729.167 | 41,602.9 | 80 KiB |
+| CPU precision reference | 689.721 | 44,423.0 | 180 KiB |
+| Fast Vulkan control | 816.855 | 38,538.2 | 16 KiB |
+
+Corrected Vulkan's maximum absolute error is **8.5830688e-06**
+across **16,677,120 logits**, under the unchanged **1e-5** gate;
+all 129 greedy choices match the CPU reference, and repeat drift is zero.
+Decode throughput is **1.120×**, and total-session
+speed is **1.060×**, relative to fast Vulkan.
+Prefill alone is **8.0% slower**;
+the established speed gates require every decode and total-session sample to beat
+every fast-control sample. Prefill timing is reported separately.
+
+Specialized compensated Q8 projections, parallel small-row FP64 matmul and
+fused HC4 Sinkhorn retain the corrected reference's arithmetic contract while
+removing generic quantization overhead and thousands of launches. Tagged
+compensation/fusion shaders receive SPIR-V `NoContraction` decorations because
+Naga drops GLSL `precise`. Grouped Q8 retains exact FP64 accumulation; Q2_K/Q4_K
+use wider FP64 reductions. Native tests include partial rows, nonzero offsets,
+multiple batches, cache continuation and independent float64 references.
+
+Model-scoped Vulkan handles share the existing context, buffers, queue and
+allocator. No private weight copy or full expert dequantization was added.
+After the first complete session, allocator/live and driver-VRAM endpoints are
+stable. Corrected Vulkan retains one additional **128 MiB** allocator block;
+this is a bounded reservation increase, not identical memory footprint.
+Tracked native fallback counters are zero; intentional CPU-mmap experts and
+existing host routing remain part of the workload. Memory gates include private
+`RssAnon + VmSwap`, keeping file-backed mmap RSS separate.
+
+All final parity, speed and memory gates passed. Automatic Vulkan arithmetic dispatch is enabled only for the qualified signature.
+Qualification requires native `CubeClProduction` Vulkan on **B50 (8086:E212)**,
+`shaderFloat64`, an AVX-512 host, the compatible 40-layer DeepSeek41/272-expert/
+six-route/HC4 tensor and quantization signature, local mmap loading, no device
+expert cache, and **context at most 249**. Other model signatures, larger
+contexts and streamed/distributed loads remain outside this qualification.
+Backend automatic preferences are unchanged; CPU precision decode remains faster.
+
+Explicit numerical diagnostic flags bypass model automatic qualification. For
+the opt-in profile set all five to `1`; use all five `0` for the matched old fast
+control: `JOSHUA_CPU_DOT_F64`, `JOSHUA_VULKAN_DOT_F64`,
+`JOSHUA_VULKAN_RMS_F64`, `JOSHUA_VULKAN_COMPENSATED_DOT`, and
+`JOSHUA_VULKAN_FUSED_MHC`. CPU precision continues to use
+`JOSHUA_CPU_DOT_F64=1`.
+
+Validation: **427 library tests passed** (10 ignored), **40 architecture
+integration tests passed** (3 ignored), five precision tests including native
+GPU checks, the fused HC test, model signature/context boundary tests, and native
+device-policy isolation. Default/feature library checks and the feature release
+build passed. The unrelated core
+`quantized_tests` integration target still fails to compile at three
+non-exhaustive `Iq2Xxs` matches; this was reproduced on unchanged base `646140b`.
+The report preserves rejected speed trials and the earlier 1,060-KiB CPU
+reference memory-gate failure. Independent float64 evidence covers primitives
+and tiny models; a separate full-290GB float64 oracle was not generated.

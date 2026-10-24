@@ -1,4 +1,6 @@
 //! Startup micro-benchmark that picks the dense-set placement automatically.
+//! A full-model-qualified B50 Qwen profile takes precedence within its tested
+//! context and prefill bounds; other workloads use this startup probe.
 //!
 //! The right place to run the dense set depends on the *actual hardware*, so an
 //! `Auto` dense-placement (the default) probes the accelerator once, briefly,
@@ -34,6 +36,41 @@ use candle_core::quantized::{GgmlDType, QMatMul, QStorage, QTensor};
 use candle_core::{Device, Module, Tensor};
 
 use crate::placement::{DensePlacement, ResolvedDense};
+
+/// Full-model qualification, narrower than a generic projection probe.
+/// B50 results: benchmarks/backend-logit-isolation-b50-20261023.json.
+/// Longer contexts and larger prefill chunks retain the measured startup policy.
+#[cfg(any(feature = "sycl", test))]
+pub(crate) fn validated_b50_qwen_shape(
+    raw: &crate::gguf_ext::GgufHeader,
+    context: usize,
+    prefill_chunk: usize,
+) -> bool {
+    if context == 0 || context > 254 || prefill_chunk == 0 || prefill_chunk > 32 {
+        return false;
+    }
+    let general = crate::gguf_meta::Meta::new(&raw.metadata, "general");
+    let model = crate::gguf_meta::Meta::new(&raw.metadata, "qwen3");
+    if general.string("architecture").as_deref() != Some("qwen3")
+        || general.u32("file_type").ok() != Some(15) // Q4_K_M
+        || [
+            ("block_count", 36), ("context_length", 40960), ("embedding_length", 4096),
+            ("feed_forward_length", 12288), ("attention.head_count", 32),
+            ("attention.head_count_kv", 8), ("attention.key_length", 128),
+            ("attention.value_length", 128),
+        ].iter().any(|&(key, value)| model.u32(key).ok() != Some(value))
+        || model.f32("rope.freq_base").ok() != Some(1_000_000.)
+        || model.f32("attention.layer_norm_rms_epsilon").ok() != Some(1e-6)
+        || model.contains("rope.scaling.type") || model.contains("rope.scaling.factor")
+        || model.u32_opt("rope.dimension_count").is_some_and(|n| n != 128)
+        || !raw.tensors.values().all(|t| matches!(t.dtype, 0 | 12 | 14))
+    {
+        return false;
+    }
+    [("token_embd.weight", 12), ("output.weight", 14)].iter().all(|&(name, dtype)| {
+        raw.tensors.get(name).is_some_and(|t| t.dtype == dtype && t.dims == [151936, 4096])
+    })
+}
 
 /// Reference hidden width for the probe GEMMs: a real dense projection
 /// (4096 is the hidden size of most 7B-class and the DeepSeek-V4 models).
@@ -332,6 +369,45 @@ pub fn probe_enabled() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn full_model_profile_rejects_unmeasured_shapes_and_formats() {
+        use candle_core::quantized::gguf_file::Value;
+        use crate::gguf_ext::{GgufHeader, RawTensorInfo};
+        let mut raw = GgufHeader {
+            version: 3, metadata: Default::default(), tensors: Default::default(),
+            tensor_data_offset: 0,
+        };
+        raw.metadata.insert("general.architecture".into(), Value::String("qwen3".into()));
+        raw.metadata.insert("general.file_type".into(), Value::U32(15));
+        for (key, value) in [
+            ("block_count", 36), ("context_length", 40960), ("embedding_length", 4096),
+            ("feed_forward_length", 12288), ("attention.head_count", 32),
+            ("attention.head_count_kv", 8), ("attention.key_length", 128),
+            ("attention.value_length", 128),
+        ] { raw.metadata.insert(format!("qwen3.{key}"), Value::U32(value)); }
+        raw.metadata.insert("qwen3.rope.freq_base".into(), Value::F32(1_000_000.));
+        raw.metadata.insert("qwen3.attention.layer_norm_rms_epsilon".into(), Value::F32(1e-6));
+        for (name, dtype) in [("token_embd.weight", 12), ("output.weight", 14)] {
+            raw.tensors.insert(name.into(), RawTensorInfo { dtype, dims: vec![151936, 4096], offset: 0 });
+        }
+        assert!(validated_b50_qwen_shape(&raw, 254, 32));
+        for (ctx, chunk) in [(255, 32), (254, 33), (0, 32), (254, 0)] {
+            assert!(!validated_b50_qwen_shape(&raw, ctx, chunk));
+        }
+        for (key, value) in [
+            ("general.architecture", Value::String("deepseek41".into())),
+            ("general.file_type", Value::U32(14)),
+            ("qwen3.embedding_length", Value::U32(5120)),
+            ("qwen3.rope.scaling.type", Value::String("yarn".into())),
+        ] {
+            let mut changed = raw.clone();
+            changed.metadata.insert(key.into(), value);
+            assert!(!validated_b50_qwen_shape(&changed, 254, 32), "{key}");
+        }
+        raw.tensors.get_mut("output.weight").unwrap().dtype = 8;
+        assert!(!validated_b50_qwen_shape(&raw, 254, 32));
+    }
 
     fn bench(dev_dec: f64, dev_pre: f64, cpu_dec: f64, cpu_pre: f64) -> DenseBench {
         DenseBench {

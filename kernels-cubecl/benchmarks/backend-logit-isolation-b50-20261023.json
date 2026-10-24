@@ -1,0 +1,5130 @@
+{
+  "schema_version": 2,
+  "date": "2026-10-23",
+  "hardware": "Intel Arc Pro B50 (8086:E212), AMD Ryzen 9 9950X",
+  "absolute_tolerance": 1e-05,
+  "raw_results": "/home/tserica/benchmark-results/backend-logit-isolation-20261023",
+  "reference_policy": {
+    "user_approved": "Correct RoPE tables and validate against an independent CPU/float64 reference, keeping 1e-5",
+    "table_arithmetic": "position * exact stored f32 frequency, sin/cos, and magnitude scale evaluated in f64; one rounding to f32; one load-time upload per table",
+    "independent_references": [
+      "80-decimal-digit mpmath table constants, including position 65535",
+      "existing independent NumPy float64 DeepSeek-V4.1 fixture, now checked at 1e-5 on CPU/Vulkan/SYCL for decode and chunked all-row prefill"
+    ],
+    "full_model_reference": "production Vulkan with corrected tables; full real-model float64 logits were not generated",
+    "deepseek_vulkan_shift_vs_original": {
+      "max_abs_vs_original_reference": 0.000274658203125,
+      "max_abs_by_row": [
+        7.891654968261719e-05,
+        5.602836608886719e-05,
+        5.14984130859375e-05,
+        6.985664367675781e-05,
+        6.723403930664062e-05,
+        6.270408630371094e-05,
+        5.1975250244140625e-05,
+        6.699562072753906e-05,
+        9.623169898986816e-05,
+        6.771087646484375e-05,
+        6.175041198730469e-05,
+        9.047985076904297e-05,
+        8.13603401184082e-05,
+        0.0001010894775390625,
+        7.522106170654297e-05,
+        0.00013756752014160156,
+        6.347894668579102e-05,
+        0.00014740228652954102,
+        8.058547973632812e-05,
+        0.0001347064971923828,
+        0.00018167495727539062,
+        0.00010633468627929688,
+        8.821487426757812e-05,
+        7.128715515136719e-05,
+        8.925795555114746e-05,
+        0.00011134147644042969,
+        7.724761962890625e-05,
+        8.26120376586914e-05,
+        6.747245788574219e-05,
+        8.130073547363281e-05,
+        0.00010204315185546875,
+        7.62939453125e-05,
+        0.00011539459228515625,
+        7.736682891845703e-05,
+        7.724761962890625e-05,
+        0.00014591217041015625,
+        5.626678466796875e-05,
+        0.00010776519775390625,
+        0.00011348724365234375,
+        0.00013637542724609375,
+        8.034706115722656e-05,
+        6.020069122314453e-05,
+        0.00010800361633300781,
+        0.0001010894775390625,
+        7.009506225585938e-05,
+        9.965896606445312e-05,
+        0.000148773193359375,
+        0.0001392364501953125,
+        0.00012040138244628906,
+        0.00011348724365234375,
+        6.914138793945312e-05,
+        7.450580596923828e-05,
+        0.00013065338134765625,
+        5.054473876953125e-05,
+        5.030632019042969e-05,
+        0.00010514259338378906,
+        6.222724914550781e-05,
+        6.031990051269531e-05,
+        4.38690185546875e-05,
+        5.710124969482422e-05,
+        6.318092346191406e-05,
+        9.703636169433594e-05,
+        0.00010663270950317383,
+        8.654594421386719e-05,
+        6.139278411865234e-05,
+        5.3882598876953125e-05,
+        8.654594421386719e-05,
+        7.49826431274414e-05,
+        7.891654968261719e-05,
+        5.066394805908203e-05,
+        0.00014162063598632812,
+        6.115436553955078e-05,
+        6.0558319091796875e-05,
+        9.250640869140625e-05,
+        9.72747802734375e-05,
+        0.0001323223114013672,
+        0.00017642974853515625,
+        0.00011014938354492188,
+        9.632110595703125e-05,
+        9.942054748535156e-05,
+        0.00017690658569335938,
+        0.00019788742065429688,
+        9.512901306152344e-05,
+        0.00013637542724609375,
+        0.0001239776611328125,
+        0.00016117095947265625,
+        0.00014066696166992188,
+        9.584426879882812e-05,
+        5.030632019042969e-05,
+        5.5789947509765625e-05,
+        6.556510925292969e-05,
+        6.318092346191406e-05,
+        0.0001316070556640625,
+        0.0001010894775390625,
+        0.00010013580322265625,
+        9.703636169433594e-05,
+        8.916854858398438e-05,
+        7.867813110351562e-05,
+        0.0001468658447265625,
+        9.441375732421875e-05,
+        9.85860824584961e-05,
+        0.00012254714965820312,
+        0.00010514259338378906,
+        7.915496826171875e-05,
+        6.67572021484375e-05,
+        0.00010824203491210938,
+        5.125999450683594e-05,
+        0.00012600421905517578,
+        0.00014221668243408203,
+        9.131431579589844e-05,
+        9.810924530029297e-05,
+        0.0001919269561767578,
+        0.00011944770812988281,
+        0.00011274218559265137,
+        7.578730583190918e-05,
+        0.00014495849609375,
+        0.00014856457710266113,
+        7.87973403930664e-05,
+        5.5849552154541016e-05,
+        5.1975250244140625e-05,
+        8.440017700195312e-05,
+        8.869171142578125e-05,
+        0.00011497735977172852,
+        9.72747802734375e-05,
+        0.00015497207641601562,
+        0.00011932849884033203,
+        0.000274658203125,
+        0.00016355514526367188,
+        0.00020647048950195312
+      ],
+      "matching_top1": 129,
+      "authorized_reference_change": true
+    }
+  },
+  "automatic_choices_updated": [
+    {
+      "backend": "SYCL",
+      "model": "Qwen3-8B Q4_K_M",
+      "max_context": 254,
+      "max_prefill_chunk": 32,
+      "adapter": "8086:E212",
+      "bridge_numerics_version": 1,
+      "conditions": "native SYCL; exact qualified dimensions/types/metadata; memory feasibility; explicit CPU/backend requests and probe opt-out respected",
+      "unqualified_workloads": "existing policy retained; DeepSeek CPU is not promoted"
+    }
+  ],
+  "final_qwen_automatic_path": {
+    "reference": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/profile/qwen/vulkan-fixed",
+    "reference_logits_sha256": "41222d1f0675dde85b2b3e5e590960875e653eacd51c894e5680a880032a5d9d",
+    "tolerance": 1e-05,
+    "runs": [
+      {
+        "run": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/profile/qwen/vulkan-fixed",
+        "logits_sha256": "41222d1f0675dde85b2b3e5e590960875e653eacd51c894e5680a880032a5d9d",
+        "bit_identical": true,
+        "backend": "vulkan",
+        "auto_placement": false,
+        "max_abs_logit_difference": 0.0,
+        "rms_logit_difference": 0.0,
+        "matching_top1_rows": 129,
+        "logits_compared": 19599744,
+        "decode_speedup_vs_reference": 1.0,
+        "prefill_median_ms": 9317.126267000001,
+        "session_median_ms": 33096.06699400001,
+        "session_speedup_vs_reference": 1.0,
+        "private_growth_kib": 0,
+        "private_last_two_session_growth_kib": 0,
+        "peak_driver_vram_bytes": 5268221952,
+        "decode_endpoint_driver_vram_bytes": [
+          5268221952,
+          5268221952,
+          5268221952
+        ],
+        "driver_vram_growth_bytes": 0,
+        "gates": {
+          "same_executable": true,
+          "absolute_logits_1e_5": true,
+          "repeat_logits_1e_5": true,
+          "reference_repeat_logits_1e_5": true,
+          "repeated_sessions_measured": true,
+          "reference_repeated_sessions_measured": true,
+          "reference_private_memory_growth_le_1MiB": true,
+          "same_greedy_choices": true,
+          "private_memory_growth_le_1MiB": true,
+          "device_memory_stable": true,
+          "reference_memory_stable": true,
+          "no_cpu_fallbacks": true
+        },
+        "eligible_for_auto": true,
+        "performance_gates": {
+          "all_decode_samples_faster": false,
+          "all_session_samples_faster": false
+        },
+        "eligible_for_auto_preference": false,
+        "decode_ms_per_token": [
+          184.4497688984375,
+          185.86148015625008,
+          187.18673435937498
+        ],
+        "median_decode_ms_per_token": 185.86148015625008,
+        "prefill_ms": [
+          9317.126267000001,
+          9305.797534,
+          9370.099611000001
+        ],
+        "source_summary": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/profile/qwen/vulkan-fixed/summary.json",
+        "protocol": {
+          "architecture": "qwen3",
+          "prompt_tokens": 126,
+          "prefill_chunk": 32,
+          "decode_tokens": 128,
+          "passes": 3,
+          "warm_prompt_tokens": 32,
+          "warm_decode": 2,
+          "context": 254,
+          "backend": "vulkan",
+          "resolved_backend": "vulkan",
+          "auto_placement": false,
+          "dense_device": "Intel(R) Arc(tm) Pro B50 Graphics (BMG G21)",
+          "expert_device": "Intel(R) Arc(tm) Pro B50 Graphics (BMG G21)"
+        },
+        "executable_sha256": "5d37260d3762d0e5920d8a5ed37fae0761f0fff2cda9e0bfe5f3dd84f0db6ce2",
+        "after_session_host_memory_kib": [
+          {
+            "RssAnon": 165984,
+            "RssFile": 68736,
+            "RssShmem": 36,
+            "VmRSS": 234756,
+            "VmSwap": 0
+          },
+          {
+            "RssAnon": 165984,
+            "RssFile": 68800,
+            "RssShmem": 36,
+            "VmRSS": 234820,
+            "VmSwap": 0
+          },
+          {
+            "RssAnon": 165984,
+            "RssFile": 66468,
+            "RssShmem": 36,
+            "VmRSS": 232488,
+            "VmSwap": 0
+          }
+        ],
+        "after_session_driver_memory_bytes": [
+          {
+            "drm-resident-gtt": 2097152,
+            "drm-resident-stolen": 0,
+            "drm-resident-system": 0,
+            "drm-resident-vram0": 5268221952,
+            "drm-total-gtt": 2097152,
+            "drm-total-stolen": 0,
+            "drm-total-system": 0,
+            "drm-total-vram0": 5268221952
+          },
+          {
+            "drm-resident-gtt": 2097152,
+            "drm-resident-stolen": 0,
+            "drm-resident-system": 0,
+            "drm-resident-vram0": 5268221952,
+            "drm-total-gtt": 2097152,
+            "drm-total-stolen": 0,
+            "drm-total-system": 0,
+            "drm-total-vram0": 5268221952
+          },
+          {
+            "drm-resident-gtt": 2097152,
+            "drm-resident-stolen": 0,
+            "drm-resident-system": 0,
+            "drm-resident-vram0": 5268221952,
+            "drm-total-gtt": 2097152,
+            "drm-total-stolen": 0,
+            "drm-total-system": 0,
+            "drm-total-vram0": 5268221952
+          }
+        ],
+        "allocator_stats_available": true,
+        "after_session_reserved_live": [
+          [
+            5227622400,
+            5042798592
+          ],
+          [
+            5227622400,
+            5042798592
+          ],
+          [
+            5227622400,
+            5042798592
+          ]
+        ],
+        "max_repeat_logit_difference": 0.0,
+        "decode_cpu_fallbacks": [
+          0,
+          0,
+          0
+        ],
+        "prefill_cpu_fallbacks": [
+          0,
+          0,
+          0
+        ]
+      },
+      {
+        "run": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/profile/qwen/sycl-auto",
+        "logits_sha256": "41222d1f0675dde85b2b3e5e590960875e653eacd51c894e5680a880032a5d9d",
+        "bit_identical": true,
+        "backend": "sycl",
+        "auto_placement": true,
+        "max_abs_logit_difference": 0.0,
+        "rms_logit_difference": 0.0,
+        "matching_top1_rows": 129,
+        "logits_compared": 19599744,
+        "decode_speedup_vs_reference": 1.1434592551080802,
+        "prefill_median_ms": 3554.33876,
+        "session_median_ms": 24358.539367999998,
+        "session_speedup_vs_reference": 1.3587049081226343,
+        "private_growth_kib": 8,
+        "private_last_two_session_growth_kib": 0,
+        "peak_driver_vram_bytes": 5801234432,
+        "decode_endpoint_driver_vram_bytes": [
+          5669007360,
+          5666910208,
+          5666914304
+        ],
+        "driver_vram_growth_bytes": 0,
+        "gates": {
+          "same_executable": true,
+          "absolute_logits_1e_5": true,
+          "repeat_logits_1e_5": true,
+          "reference_repeat_logits_1e_5": true,
+          "repeated_sessions_measured": true,
+          "reference_repeated_sessions_measured": true,
+          "reference_private_memory_growth_le_1MiB": true,
+          "same_greedy_choices": true,
+          "private_memory_growth_le_1MiB": true,
+          "device_memory_stable": true,
+          "reference_memory_stable": true,
+          "no_cpu_fallbacks": true
+        },
+        "eligible_for_auto": true,
+        "performance_gates": {
+          "all_decode_samples_faster": true,
+          "all_session_samples_faster": true
+        },
+        "eligible_for_auto_preference": true,
+        "decode_ms_per_token": [
+          161.8559444296875,
+          162.97145649218749,
+          162.5431595625
+        ],
+        "median_decode_ms_per_token": 162.5431595625,
+        "prefill_ms": [
+          3554.33876,
+          3559.3215750000004,
+          3553.014944
+        ],
+        "source_summary": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/profile/qwen/sycl-auto/summary.json",
+        "protocol": {
+          "architecture": "qwen3",
+          "prompt_tokens": 126,
+          "prefill_chunk": 32,
+          "decode_tokens": 128,
+          "passes": 3,
+          "warm_prompt_tokens": 32,
+          "warm_decode": 2,
+          "context": 254,
+          "backend": "sycl",
+          "resolved_backend": "sycl",
+          "auto_placement": true,
+          "dense_device": "Intel(R) Arc(TM) Pro B50 Graphics",
+          "expert_device": "Intel(R) Arc(TM) Pro B50 Graphics"
+        },
+        "executable_sha256": "5d37260d3762d0e5920d8a5ed37fae0761f0fff2cda9e0bfe5f3dd84f0db6ce2",
+        "after_session_host_memory_kib": [
+          {
+            "RssAnon": 343384,
+            "RssFile": 197416,
+            "RssShmem": 0,
+            "VmRSS": 540800,
+            "VmSwap": 0
+          },
+          {
+            "RssAnon": 343392,
+            "RssFile": 197544,
+            "RssShmem": 0,
+            "VmRSS": 540936,
+            "VmSwap": 0
+          },
+          {
+            "RssAnon": 343392,
+            "RssFile": 197544,
+            "RssShmem": 0,
+            "VmRSS": 540936,
+            "VmSwap": 0
+          }
+        ],
+        "after_session_driver_memory_bytes": [
+          {
+            "drm-resident-gtt": 29442048,
+            "drm-resident-stolen": 0,
+            "drm-resident-system": 0,
+            "drm-resident-vram0": 5669007360,
+            "drm-total-gtt": 29442048,
+            "drm-total-stolen": 0,
+            "drm-total-system": 0,
+            "drm-total-vram0": 5669007360
+          },
+          {
+            "drm-resident-gtt": 29442048,
+            "drm-resident-stolen": 0,
+            "drm-resident-system": 0,
+            "drm-resident-vram0": 5666910208,
+            "drm-total-gtt": 29442048,
+            "drm-total-stolen": 0,
+            "drm-total-system": 0,
+            "drm-total-vram0": 5666910208
+          },
+          {
+            "drm-resident-gtt": 29442048,
+            "drm-resident-stolen": 0,
+            "drm-resident-system": 0,
+            "drm-resident-vram0": 5666914304,
+            "drm-total-gtt": 29442048,
+            "drm-total-stolen": 0,
+            "drm-total-system": 0,
+            "drm-total-vram0": 5666914304
+          }
+        ],
+        "allocator_stats_available": false,
+        "after_session_reserved_live": [
+          [
+            0,
+            0
+          ],
+          [
+            0,
+            0
+          ],
+          [
+            0,
+            0
+          ]
+        ],
+        "max_repeat_logit_difference": 0.0,
+        "decode_cpu_fallbacks": [
+          0,
+          0,
+          0
+        ],
+        "prefill_cpu_fallbacks": [
+          0,
+          0,
+          0
+        ]
+      },
+      {
+        "run": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/profile/qwen/auto-auto",
+        "logits_sha256": "41222d1f0675dde85b2b3e5e590960875e653eacd51c894e5680a880032a5d9d",
+        "bit_identical": true,
+        "backend": "auto",
+        "auto_placement": true,
+        "max_abs_logit_difference": 0.0,
+        "rms_logit_difference": 0.0,
+        "matching_top1_rows": 129,
+        "logits_compared": 19599744,
+        "decode_speedup_vs_reference": 1.139184693712176,
+        "prefill_median_ms": 3572.596809,
+        "session_median_ms": 24428.807565,
+        "session_speedup_vs_reference": 1.354796663977078,
+        "private_growth_kib": 8,
+        "private_last_two_session_growth_kib": 0,
+        "peak_driver_vram_bytes": 5800181760,
+        "decode_endpoint_driver_vram_bytes": [
+          5667954688,
+          5666910208,
+          5667971072
+        ],
+        "driver_vram_growth_bytes": 16384,
+        "gates": {
+          "same_executable": true,
+          "absolute_logits_1e_5": true,
+          "repeat_logits_1e_5": true,
+          "reference_repeat_logits_1e_5": true,
+          "repeated_sessions_measured": true,
+          "reference_repeated_sessions_measured": true,
+          "reference_private_memory_growth_le_1MiB": true,
+          "same_greedy_choices": true,
+          "private_memory_growth_le_1MiB": true,
+          "device_memory_stable": true,
+          "reference_memory_stable": true,
+          "no_cpu_fallbacks": true
+        },
+        "eligible_for_auto": true,
+        "performance_gates": {
+          "all_decode_samples_faster": true,
+          "all_session_samples_faster": true
+        },
+        "eligible_for_auto_preference": true,
+        "decode_ms_per_token": [
+          162.6934730234375,
+          163.18615428125,
+          163.15307007031248
+        ],
+        "median_decode_ms_per_token": 163.15307007031248,
+        "prefill_ms": [
+          3587.476083,
+          3540.9798170000004,
+          3572.596809
+        ],
+        "source_summary": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/profile/qwen/auto-auto/summary.json",
+        "protocol": {
+          "architecture": "qwen3",
+          "prompt_tokens": 126,
+          "prefill_chunk": 32,
+          "decode_tokens": 128,
+          "passes": 3,
+          "warm_prompt_tokens": 32,
+          "warm_decode": 2,
+          "context": 254,
+          "backend": "auto",
+          "resolved_backend": "sycl",
+          "auto_placement": true,
+          "dense_device": "Intel(R) Arc(TM) Pro B50 Graphics",
+          "expert_device": "Intel(R) Arc(TM) Pro B50 Graphics"
+        },
+        "executable_sha256": "5d37260d3762d0e5920d8a5ed37fae0761f0fff2cda9e0bfe5f3dd84f0db6ce2",
+        "after_session_host_memory_kib": [
+          {
+            "RssAnon": 292024,
+            "RssFile": 197196,
+            "RssShmem": 0,
+            "VmRSS": 489220,
+            "VmSwap": 0
+          },
+          {
+            "RssAnon": 292032,
+            "RssFile": 197324,
+            "RssShmem": 0,
+            "VmRSS": 489356,
+            "VmSwap": 0
+          },
+          {
+            "RssAnon": 292032,
+            "RssFile": 197324,
+            "RssShmem": 0,
+            "VmRSS": 489356,
+            "VmSwap": 0
+          }
+        ],
+        "after_session_driver_memory_bytes": [
+          {
+            "drm-resident-gtt": 29442048,
+            "drm-resident-stolen": 0,
+            "drm-resident-system": 0,
+            "drm-resident-vram0": 5667954688,
+            "drm-total-gtt": 29442048,
+            "drm-total-stolen": 0,
+            "drm-total-system": 0,
+            "drm-total-vram0": 5667954688
+          },
+          {
+            "drm-resident-gtt": 29442048,
+            "drm-resident-stolen": 0,
+            "drm-resident-system": 0,
+            "drm-resident-vram0": 5666910208,
+            "drm-total-gtt": 29442048,
+            "drm-total-stolen": 0,
+            "drm-total-system": 0,
+            "drm-total-vram0": 5666910208
+          },
+          {
+            "drm-resident-gtt": 29442048,
+            "drm-resident-stolen": 0,
+            "drm-resident-system": 0,
+            "drm-resident-vram0": 5667971072,
+            "drm-total-gtt": 29442048,
+            "drm-total-stolen": 0,
+            "drm-total-system": 0,
+            "drm-total-vram0": 5667971072
+          }
+        ],
+        "allocator_stats_available": false,
+        "after_session_reserved_live": [
+          [
+            0,
+            0
+          ],
+          [
+            0,
+            0
+          ],
+          [
+            0,
+            0
+          ]
+        ],
+        "max_repeat_logit_difference": 0.0,
+        "decode_cpu_fallbacks": [
+          0,
+          0,
+          0
+        ],
+        "prefill_cpu_fallbacks": [
+          0,
+          0,
+          0
+        ]
+      }
+    ]
+  },
+  "five_session_qwen_qualification": {
+    "reference": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/qwen-confirm/fixed/vulkan-fixed",
+    "reference_logits_sha256": "41222d1f0675dde85b2b3e5e590960875e653eacd51c894e5680a880032a5d9d",
+    "tolerance": 1e-05,
+    "runs": [
+      {
+        "run": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/qwen-confirm/fixed/vulkan-fixed",
+        "logits_sha256": "41222d1f0675dde85b2b3e5e590960875e653eacd51c894e5680a880032a5d9d",
+        "bit_identical": true,
+        "backend": "vulkan",
+        "auto_placement": false,
+        "max_abs_logit_difference": 0.0,
+        "rms_logit_difference": 0.0,
+        "matching_top1_rows": 129,
+        "logits_compared": 19599744,
+        "decode_speedup_vs_reference": 1.0,
+        "prefill_median_ms": 9295.254375,
+        "session_median_ms": 33220.936627,
+        "session_speedup_vs_reference": 1.0,
+        "private_growth_kib": 0,
+        "private_last_two_session_growth_kib": 0,
+        "peak_driver_vram_bytes": 5268221952,
+        "decode_endpoint_driver_vram_bytes": [
+          5268221952,
+          5268221952,
+          5268221952,
+          5268221952,
+          5268221952
+        ],
+        "driver_vram_growth_bytes": 0,
+        "gates": {
+          "same_executable": true,
+          "absolute_logits_1e_5": true,
+          "repeat_logits_1e_5": true,
+          "reference_repeat_logits_1e_5": true,
+          "repeated_sessions_measured": true,
+          "reference_repeated_sessions_measured": true,
+          "reference_private_memory_growth_le_1MiB": true,
+          "same_greedy_choices": true,
+          "private_memory_growth_le_1MiB": true,
+          "device_memory_stable": true,
+          "reference_memory_stable": true,
+          "no_cpu_fallbacks": true
+        },
+        "eligible_for_auto": true,
+        "performance_gates": {
+          "all_decode_samples_faster": false,
+          "all_session_samples_faster": false
+        },
+        "eligible_for_auto_preference": false,
+        "decode_ms_per_token": [
+          184.9749287734375,
+          186.43410995312502,
+          187.01418834375005,
+          187.5529478906251,
+          188.17675666406245
+        ],
+        "median_decode_ms_per_token": 187.01418834375005,
+        "prefill_ms": [
+          9361.650096,
+          9295.254375,
+          9283.120519,
+          9318.226028,
+          9293.180643
+        ],
+        "source_summary": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/qwen-confirm/fixed/vulkan-fixed/summary.json",
+        "protocol": {
+          "architecture": "qwen3",
+          "prompt_tokens": 126,
+          "prefill_chunk": 32,
+          "decode_tokens": 128,
+          "passes": 5,
+          "warm_prompt_tokens": 32,
+          "warm_decode": 2,
+          "context": 254,
+          "backend": "vulkan",
+          "resolved_backend": null,
+          "auto_placement": false,
+          "dense_device": "Intel(R) Arc(tm) Pro B50 Graphics (BMG G21)",
+          "expert_device": "Intel(R) Arc(tm) Pro B50 Graphics (BMG G21)"
+        },
+        "executable_sha256": "761ce4dacb63c986def85623e067a98a88d20ba07fd166fad72309e11e26ad8d",
+        "after_session_host_memory_kib": [
+          {
+            "RssAnon": 166572,
+            "RssFile": 68888,
+            "RssShmem": 36,
+            "VmRSS": 235496,
+            "VmSwap": 0
+          },
+          {
+            "RssAnon": 166572,
+            "RssFile": 67384,
+            "RssShmem": 36,
+            "VmRSS": 233992,
+            "VmSwap": 0
+          },
+          {
+            "RssAnon": 166572,
+            "RssFile": 67460,
+            "RssShmem": 36,
+            "VmRSS": 234068,
+            "VmSwap": 0
+          },
+          {
+            "RssAnon": 166572,
+            "RssFile": 67460,
+            "RssShmem": 36,
+            "VmRSS": 234068,
+            "VmSwap": 0
+          },
+          {
+            "RssAnon": 166572,
+            "RssFile": 67460,
+            "RssShmem": 36,
+            "VmRSS": 234068,
+            "VmSwap": 0
+          }
+        ],
+        "after_session_driver_memory_bytes": [
+          {
+            "drm-resident-gtt": 2097152,
+            "drm-resident-stolen": 0,
+            "drm-resident-system": 0,
+            "drm-resident-vram0": 5268221952,
+            "drm-total-gtt": 2097152,
+            "drm-total-stolen": 0,
+            "drm-total-system": 0,
+            "drm-total-vram0": 5268221952
+          },
+          {
+            "drm-resident-gtt": 2097152,
+            "drm-resident-stolen": 0,
+            "drm-resident-system": 0,
+            "drm-resident-vram0": 5268221952,
+            "drm-total-gtt": 2097152,
+            "drm-total-stolen": 0,
+            "drm-total-system": 0,
+            "drm-total-vram0": 5268221952
+          },
+          {
+            "drm-resident-gtt": 2097152,
+            "drm-resident-stolen": 0,
+            "drm-resident-system": 0,
+            "drm-resident-vram0": 5268221952,
+            "drm-total-gtt": 2097152,
+            "drm-total-stolen": 0,
+            "drm-total-system": 0,
+            "drm-total-vram0": 5268221952
+          },
+          {
+            "drm-resident-gtt": 2097152,
+            "drm-resident-stolen": 0,
+            "drm-resident-system": 0,
+            "drm-resident-vram0": 5268221952,
+            "drm-total-gtt": 2097152,
+            "drm-total-stolen": 0,
+            "drm-total-system": 0,
+            "drm-total-vram0": 5268221952
+          },
+          {
+            "drm-resident-gtt": 2097152,
+            "drm-resident-stolen": 0,
+            "drm-resident-system": 0,
+            "drm-resident-vram0": 5268221952,
+            "drm-total-gtt": 2097152,
+            "drm-total-stolen": 0,
+            "drm-total-system": 0,
+            "drm-total-vram0": 5268221952
+          }
+        ],
+        "allocator_stats_available": true,
+        "after_session_reserved_live": [
+          [
+            5227622400,
+            5042798592
+          ],
+          [
+            5227622400,
+            5042798592
+          ],
+          [
+            5227622400,
+            5042798592
+          ],
+          [
+            5227622400,
+            5042798592
+          ],
+          [
+            5227622400,
+            5042798592
+          ]
+        ],
+        "max_repeat_logit_difference": 0.0,
+        "decode_cpu_fallbacks": [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "prefill_cpu_fallbacks": [
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      {
+        "run": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/qwen-confirm/fixed/sycl-fixed",
+        "logits_sha256": "41222d1f0675dde85b2b3e5e590960875e653eacd51c894e5680a880032a5d9d",
+        "bit_identical": true,
+        "backend": "sycl",
+        "auto_placement": false,
+        "max_abs_logit_difference": 0.0,
+        "rms_logit_difference": 0.0,
+        "matching_top1_rows": 129,
+        "logits_compared": 19599744,
+        "decode_speedup_vs_reference": 1.1495645742808884,
+        "prefill_median_ms": 3567.7565950000003,
+        "session_median_ms": 24390.08996699999,
+        "session_speedup_vs_reference": 1.3620669981926359,
+        "private_growth_kib": 8,
+        "private_last_two_session_growth_kib": 0,
+        "peak_driver_vram_bytes": 5799915520,
+        "decode_endpoint_driver_vram_bytes": [
+          5667688448,
+          5666643968,
+          5667704832,
+          5665607680,
+          5667713024
+        ],
+        "driver_vram_growth_bytes": 24576,
+        "gates": {
+          "same_executable": true,
+          "absolute_logits_1e_5": true,
+          "repeat_logits_1e_5": true,
+          "reference_repeat_logits_1e_5": true,
+          "repeated_sessions_measured": true,
+          "reference_repeated_sessions_measured": true,
+          "reference_private_memory_growth_le_1MiB": true,
+          "same_greedy_choices": true,
+          "private_memory_growth_le_1MiB": true,
+          "device_memory_stable": true,
+          "reference_memory_stable": true,
+          "no_cpu_fallbacks": true
+        },
+        "eligible_for_auto": true,
+        "performance_gates": {
+          "all_decode_samples_faster": true,
+          "all_session_samples_faster": true
+        },
+        "eligible_for_auto_preference": true,
+        "decode_ms_per_token": [
+          162.05511471093754,
+          162.45135633593748,
+          162.68263003906242,
+          163.103714125,
+          165.30257242187508
+        ],
+        "median_decode_ms_per_token": 162.68263003906242,
+        "prefill_ms": [
+          3567.7565950000003,
+          3564.47758,
+          3566.713322,
+          3573.730726,
+          3587.6801619999997
+        ],
+        "source_summary": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/qwen-confirm/fixed/sycl-fixed/summary.json",
+        "protocol": {
+          "architecture": "qwen3",
+          "prompt_tokens": 126,
+          "prefill_chunk": 32,
+          "decode_tokens": 128,
+          "passes": 5,
+          "warm_prompt_tokens": 32,
+          "warm_decode": 2,
+          "context": 254,
+          "backend": "sycl",
+          "resolved_backend": null,
+          "auto_placement": false,
+          "dense_device": "Intel(R) Arc(TM) Pro B50 Graphics",
+          "expert_device": "Intel(R) Arc(TM) Pro B50 Graphics"
+        },
+        "executable_sha256": "761ce4dacb63c986def85623e067a98a88d20ba07fd166fad72309e11e26ad8d",
+        "after_session_host_memory_kib": [
+          {
+            "RssAnon": 254324,
+            "RssFile": 197296,
+            "RssShmem": 0,
+            "VmRSS": 451620,
+            "VmSwap": 0
+          },
+          {
+            "RssAnon": 254332,
+            "RssFile": 197424,
+            "RssShmem": 0,
+            "VmRSS": 451756,
+            "VmSwap": 0
+          },
+          {
+            "RssAnon": 254332,
+            "RssFile": 197424,
+            "RssShmem": 0,
+            "VmRSS": 451756,
+            "VmSwap": 0
+          },
+          {
+            "RssAnon": 254332,
+            "RssFile": 197424,
+            "RssShmem": 0,
+            "VmRSS": 451756,
+            "VmSwap": 0
+          },
+          {
+            "RssAnon": 254332,
+            "RssFile": 197424,
+            "RssShmem": 0,
+            "VmRSS": 451756,
+            "VmSwap": 0
+          }
+        ],
+        "after_session_driver_memory_bytes": [
+          {
+            "drm-resident-gtt": 29442048,
+            "drm-resident-stolen": 0,
+            "drm-resident-system": 0,
+            "drm-resident-vram0": 5667688448,
+            "drm-total-gtt": 29442048,
+            "drm-total-stolen": 0,
+            "drm-total-system": 0,
+            "drm-total-vram0": 5667688448
+          },
+          {
+            "drm-resident-gtt": 29442048,
+            "drm-resident-stolen": 0,
+            "drm-resident-system": 0,
+            "drm-resident-vram0": 5666643968,
+            "drm-total-gtt": 29442048,
+            "drm-total-stolen": 0,
+            "drm-total-system": 0,
+            "drm-total-vram0": 5666643968
+          },
+          {
+            "drm-resident-gtt": 29442048,
+            "drm-resident-stolen": 0,
+            "drm-resident-system": 0,
+            "drm-resident-vram0": 5667704832,
+            "drm-total-gtt": 29442048,
+            "drm-total-stolen": 0,
+            "drm-total-system": 0,
+            "drm-total-vram0": 5667704832
+          },
+          {
+            "drm-resident-gtt": 29442048,
+            "drm-resident-stolen": 0,
+            "drm-resident-system": 0,
+            "drm-resident-vram0": 5665607680,
+            "drm-total-gtt": 29442048,
+            "drm-total-stolen": 0,
+            "drm-total-system": 0,
+            "drm-total-vram0": 5665607680
+          },
+          {
+            "drm-resident-gtt": 29442048,
+            "drm-resident-stolen": 0,
+            "drm-resident-system": 0,
+            "drm-resident-vram0": 5667713024,
+            "drm-total-gtt": 29442048,
+            "drm-total-stolen": 0,
+            "drm-total-system": 0,
+            "drm-total-vram0": 5667713024
+          }
+        ],
+        "allocator_stats_available": false,
+        "after_session_reserved_live": [
+          [
+            0,
+            0
+          ],
+          [
+            0,
+            0
+          ],
+          [
+            0,
+            0
+          ],
+          [
+            0,
+            0
+          ],
+          [
+            0,
+            0
+          ]
+        ],
+        "max_repeat_logit_difference": 0.0,
+        "decode_cpu_fallbacks": [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "prefill_cpu_fallbacks": [
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      }
+    ]
+  },
+  "previous_automatic_placement": {
+    "reference": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/qwen-confirm/auto/vulkan-fixed",
+    "reference_logits_sha256": "41222d1f0675dde85b2b3e5e590960875e653eacd51c894e5680a880032a5d9d",
+    "tolerance": 1e-05,
+    "runs": [
+      {
+        "run": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/qwen-confirm/auto/vulkan-fixed",
+        "logits_sha256": "41222d1f0675dde85b2b3e5e590960875e653eacd51c894e5680a880032a5d9d",
+        "bit_identical": true,
+        "backend": "vulkan",
+        "auto_placement": false,
+        "max_abs_logit_difference": 0.0,
+        "rms_logit_difference": 0.0,
+        "matching_top1_rows": 129,
+        "logits_compared": 19599744,
+        "decode_speedup_vs_reference": 1.0,
+        "prefill_median_ms": 9357.041187499999,
+        "session_median_ms": 33639.71069199999,
+        "session_speedup_vs_reference": 1.0,
+        "private_growth_kib": 0,
+        "private_last_two_session_growth_kib": 0,
+        "peak_driver_vram_bytes": 5268221952,
+        "decode_endpoint_driver_vram_bytes": [
+          5268221952,
+          5268221952
+        ],
+        "driver_vram_growth_bytes": 0,
+        "gates": {
+          "same_executable": true,
+          "absolute_logits_1e_5": true,
+          "repeat_logits_1e_5": true,
+          "reference_repeat_logits_1e_5": true,
+          "repeated_sessions_measured": true,
+          "reference_repeated_sessions_measured": true,
+          "reference_private_memory_growth_le_1MiB": true,
+          "same_greedy_choices": true,
+          "private_memory_growth_le_1MiB": true,
+          "device_memory_stable": true,
+          "reference_memory_stable": true,
+          "no_cpu_fallbacks": true
+        },
+        "eligible_for_auto": true,
+        "performance_gates": {
+          "all_decode_samples_faster": false,
+          "all_session_samples_faster": false
+        },
+        "eligible_for_auto_preference": false,
+        "decode_ms_per_token": [
+          188.62828666406247,
+          190.78842434374997
+        ],
+        "median_decode_ms_per_token": 189.7083555039062,
+        "prefill_ms": [
+          9371.97166,
+          9342.110715
+        ],
+        "source_summary": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/qwen-confirm/auto/vulkan-fixed/summary.json",
+        "protocol": {
+          "architecture": "qwen3",
+          "prompt_tokens": 126,
+          "prefill_chunk": 32,
+          "decode_tokens": 128,
+          "passes": 2,
+          "warm_prompt_tokens": 32,
+          "warm_decode": 2,
+          "context": 254,
+          "backend": "vulkan",
+          "resolved_backend": null,
+          "auto_placement": false,
+          "dense_device": "Intel(R) Arc(tm) Pro B50 Graphics (BMG G21)",
+          "expert_device": "Intel(R) Arc(tm) Pro B50 Graphics (BMG G21)"
+        },
+        "executable_sha256": "761ce4dacb63c986def85623e067a98a88d20ba07fd166fad72309e11e26ad8d",
+        "after_session_host_memory_kib": [
+          {
+            "RssAnon": 166576,
+            "RssFile": 68308,
+            "RssShmem": 36,
+            "VmRSS": 234920,
+            "VmSwap": 0
+          },
+          {
+            "RssAnon": 166576,
+            "RssFile": 68436,
+            "RssShmem": 36,
+            "VmRSS": 235048,
+            "VmSwap": 0
+          }
+        ],
+        "after_session_driver_memory_bytes": [
+          {
+            "drm-resident-gtt": 2097152,
+            "drm-resident-stolen": 0,
+            "drm-resident-system": 0,
+            "drm-resident-vram0": 5268221952,
+            "drm-total-gtt": 2097152,
+            "drm-total-stolen": 0,
+            "drm-total-system": 0,
+            "drm-total-vram0": 5268221952
+          },
+          {
+            "drm-resident-gtt": 2097152,
+            "drm-resident-stolen": 0,
+            "drm-resident-system": 0,
+            "drm-resident-vram0": 5268221952,
+            "drm-total-gtt": 2097152,
+            "drm-total-stolen": 0,
+            "drm-total-system": 0,
+            "drm-total-vram0": 5268221952
+          }
+        ],
+        "allocator_stats_available": true,
+        "after_session_reserved_live": [
+          [
+            5227622400,
+            5042798592
+          ],
+          [
+            5227622400,
+            5042798592
+          ]
+        ],
+        "max_repeat_logit_difference": 0.0,
+        "decode_cpu_fallbacks": [
+          0,
+          0
+        ],
+        "prefill_cpu_fallbacks": [
+          0,
+          0
+        ]
+      },
+      {
+        "run": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/qwen-confirm/auto/sycl-auto",
+        "logits_sha256": "5d81c6fdfc4bd40001a1cfdd0ab496f11a4682cf6e4d0b734f157e61a3d2fe60",
+        "bit_identical": false,
+        "backend": "sycl",
+        "auto_placement": true,
+        "max_abs_logit_difference": 0.00025200843811035156,
+        "rms_logit_difference": 8.140474944595571e-06,
+        "matching_top1_rows": 129,
+        "logits_compared": 19599744,
+        "decode_speedup_vs_reference": 0.9477337419893825,
+        "prefill_median_ms": 2578.979176,
+        "session_median_ms": 28200.805675,
+        "session_speedup_vs_reference": 1.1928634621180905,
+        "private_growth_kib": 24,
+        "private_last_two_session_growth_kib": 24,
+        "peak_driver_vram_bytes": 498216960,
+        "decode_endpoint_driver_vram_bytes": [
+          422686720,
+          422686720
+        ],
+        "driver_vram_growth_bytes": 0,
+        "gates": {
+          "same_executable": true,
+          "absolute_logits_1e_5": false,
+          "repeat_logits_1e_5": true,
+          "reference_repeat_logits_1e_5": true,
+          "repeated_sessions_measured": true,
+          "reference_repeated_sessions_measured": true,
+          "reference_private_memory_growth_le_1MiB": true,
+          "same_greedy_choices": true,
+          "private_memory_growth_le_1MiB": true,
+          "device_memory_stable": true,
+          "reference_memory_stable": true,
+          "no_cpu_fallbacks": true
+        },
+        "eligible_for_auto": false,
+        "performance_gates": {
+          "all_decode_samples_faster": false,
+          "all_session_samples_faster": true
+        },
+        "eligible_for_auto_preference": false,
+        "decode_ms_per_token": [
+          199.72795360937505,
+          200.61308543749996
+        ],
+        "median_decode_ms_per_token": 200.17051952343752,
+        "prefill_ms": [
+          2600.930833,
+          2557.027519
+        ],
+        "source_summary": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/qwen-confirm/auto/sycl-auto/summary.json",
+        "protocol": {
+          "architecture": "qwen3",
+          "prompt_tokens": 126,
+          "prefill_chunk": 32,
+          "decode_tokens": 128,
+          "passes": 2,
+          "warm_prompt_tokens": 32,
+          "warm_decode": 2,
+          "context": 254,
+          "backend": "sycl",
+          "resolved_backend": null,
+          "auto_placement": true,
+          "dense_device": "CPU",
+          "expert_device": "CPU"
+        },
+        "executable_sha256": "761ce4dacb63c986def85623e067a98a88d20ba07fd166fad72309e11e26ad8d",
+        "after_session_host_memory_kib": [
+          {
+            "RssAnon": 364952,
+            "RssFile": 4773012,
+            "RssShmem": 0,
+            "VmRSS": 5137964,
+            "VmSwap": 0
+          },
+          {
+            "RssAnon": 364976,
+            "RssFile": 4773140,
+            "RssShmem": 0,
+            "VmRSS": 5138116,
+            "VmSwap": 0
+          }
+        ],
+        "after_session_driver_memory_bytes": [
+          {
+            "drm-resident-gtt": 27344896,
+            "drm-resident-stolen": 0,
+            "drm-resident-system": 0,
+            "drm-resident-vram0": 422686720,
+            "drm-total-gtt": 27344896,
+            "drm-total-stolen": 0,
+            "drm-total-system": 0,
+            "drm-total-vram0": 422686720
+          },
+          {
+            "drm-resident-gtt": 27344896,
+            "drm-resident-stolen": 0,
+            "drm-resident-system": 0,
+            "drm-resident-vram0": 422686720,
+            "drm-total-gtt": 27344896,
+            "drm-total-stolen": 0,
+            "drm-total-system": 0,
+            "drm-total-vram0": 422686720
+          }
+        ],
+        "allocator_stats_available": false,
+        "after_session_reserved_live": [
+          [
+            0,
+            0
+          ],
+          [
+            0,
+            0
+          ]
+        ],
+        "max_repeat_logit_difference": 0.0,
+        "decode_cpu_fallbacks": [
+          0,
+          0
+        ],
+        "prefill_cpu_fallbacks": [
+          0,
+          0
+        ]
+      }
+    ]
+  },
+  "deepseek_cpu_f64_norms": {
+    "reference": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/cpu-f64/deepseek/vulkan-fixed",
+    "reference_logits_sha256": "5bccde4e8e3c85d91be204501ec06665087e939987fc5cbdb400641d96eb3b4b",
+    "tolerance": 1e-05,
+    "runs": [
+      {
+        "run": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/cpu-f64/deepseek/vulkan-fixed",
+        "logits_sha256": "5bccde4e8e3c85d91be204501ec06665087e939987fc5cbdb400641d96eb3b4b",
+        "bit_identical": true,
+        "backend": "vulkan",
+        "auto_placement": false,
+        "max_abs_logit_difference": 0.0,
+        "rms_logit_difference": 0.0,
+        "matching_top1_rows": 129,
+        "logits_compared": 16677120,
+        "decode_speedup_vs_reference": 1.0,
+        "prefill_median_ms": 39157.098196,
+        "session_median_ms": 141998.97343250003,
+        "session_speedup_vs_reference": 1.0,
+        "private_growth_kib": 16,
+        "private_last_two_session_growth_kib": 16,
+        "peak_driver_vram_bytes": 9404608512,
+        "decode_endpoint_driver_vram_bytes": [
+          9404608512,
+          9404608512
+        ],
+        "driver_vram_growth_bytes": 0,
+        "gates": {
+          "same_executable": true,
+          "absolute_logits_1e_5": true,
+          "repeat_logits_1e_5": true,
+          "reference_repeat_logits_1e_5": true,
+          "repeated_sessions_measured": true,
+          "reference_repeated_sessions_measured": true,
+          "reference_private_memory_growth_le_1MiB": true,
+          "same_greedy_choices": true,
+          "private_memory_growth_le_1MiB": true,
+          "device_memory_stable": true,
+          "reference_memory_stable": true,
+          "no_cpu_fallbacks": true
+        },
+        "eligible_for_auto": true,
+        "performance_gates": {
+          "all_decode_samples_faster": false,
+          "all_session_samples_faster": false
+        },
+        "eligible_for_auto_preference": false,
+        "decode_ms_per_token": [
+          804.7502970546878,
+          802.154003515625
+        ],
+        "median_decode_ms_per_token": 803.4521502851564,
+        "prefill_ms": [
+          40037.536431,
+          38276.659961
+        ],
+        "source_summary": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/cpu-f64/deepseek/vulkan-fixed/summary.json",
+        "protocol": {
+          "architecture": "deepseek41",
+          "prompt_tokens": 121,
+          "prefill_chunk": 32,
+          "decode_tokens": 128,
+          "passes": 2,
+          "warm_prompt_tokens": 8,
+          "warm_decode": 2,
+          "context": 249,
+          "backend": "vulkan",
+          "resolved_backend": null,
+          "auto_placement": false,
+          "dense_device": "Intel(R) Arc(tm) Pro B50 Graphics (BMG G21)",
+          "expert_device": "CPU"
+        },
+        "executable_sha256": "26e9ecf4de8c1e96c0278128fd20b90c80d6f9f050e0cefe5d58bb6dbeb861e3",
+        "after_session_host_memory_kib": [
+          {
+            "RssAnon": 94588,
+            "RssFile": 72814428,
+            "RssShmem": 36,
+            "VmRSS": 72909052,
+            "VmSwap": 94960
+          },
+          {
+            "RssAnon": 74676,
+            "RssFile": 72701892,
+            "RssShmem": 24,
+            "VmRSS": 72776592,
+            "VmSwap": 114888
+          }
+        ],
+        "after_session_driver_memory_bytes": [
+          {
+            "drm-resident-gtt": 2097152,
+            "drm-resident-stolen": 0,
+            "drm-resident-system": 0,
+            "drm-resident-vram0": 9404608512,
+            "drm-total-gtt": 2097152,
+            "drm-total-stolen": 0,
+            "drm-total-system": 0,
+            "drm-total-vram0": 9404608512
+          },
+          {
+            "drm-resident-gtt": 2097152,
+            "drm-resident-stolen": 0,
+            "drm-resident-system": 0,
+            "drm-resident-vram0": 9404608512,
+            "drm-total-gtt": 2097152,
+            "drm-total-stolen": 0,
+            "drm-total-system": 0,
+            "drm-total-vram0": 9404608512
+          }
+        ],
+        "allocator_stats_available": true,
+        "after_session_reserved_live": [
+          [
+            9365831680,
+            9224831488
+          ],
+          [
+            9365831680,
+            9224831488
+          ]
+        ],
+        "max_repeat_logit_difference": 0.0,
+        "decode_cpu_fallbacks": [
+          0,
+          0
+        ],
+        "prefill_cpu_fallbacks": [
+          0,
+          0
+        ]
+      },
+      {
+        "run": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/cpu-f64/deepseek/cpu-fixed",
+        "logits_sha256": "6ab25ad94f076dcb2912b52c1109c820ebd10fed9f1fe862fe52ef7ce164a8f2",
+        "bit_identical": false,
+        "backend": "cpu",
+        "auto_placement": false,
+        "max_abs_logit_difference": 7.033348083496094e-05,
+        "rms_logit_difference": 5.293878016446366e-06,
+        "matching_top1_rows": 129,
+        "logits_compared": 16677120,
+        "decode_speedup_vs_reference": 1.2224798654065916,
+        "prefill_median_ms": 34958.7137465,
+        "session_median_ms": 119084.332619,
+        "session_speedup_vs_reference": 1.1924236405372775,
+        "private_growth_kib": 44,
+        "private_last_two_session_growth_kib": 44,
+        "peak_driver_vram_bytes": null,
+        "decode_endpoint_driver_vram_bytes": null,
+        "driver_vram_growth_bytes": 0,
+        "gates": {
+          "same_executable": true,
+          "absolute_logits_1e_5": false,
+          "repeat_logits_1e_5": true,
+          "reference_repeat_logits_1e_5": true,
+          "repeated_sessions_measured": true,
+          "reference_repeated_sessions_measured": true,
+          "reference_private_memory_growth_le_1MiB": true,
+          "same_greedy_choices": true,
+          "private_memory_growth_le_1MiB": true,
+          "device_memory_stable": true,
+          "reference_memory_stable": true,
+          "no_cpu_fallbacks": true
+        },
+        "eligible_for_auto": false,
+        "performance_gates": {
+          "all_decode_samples_faster": true,
+          "all_session_samples_faster": true
+        },
+        "eligible_for_auto_preference": false,
+        "decode_ms_per_token": [
+          665.7024938984376,
+          648.7603009843749
+        ],
+        "median_decode_ms_per_token": 657.2313974414062,
+        "prefill_ms": [
+          37611.110913,
+          32306.316580000002
+        ],
+        "source_summary": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/cpu-f64/deepseek/cpu-fixed/summary.json",
+        "protocol": {
+          "architecture": "deepseek41",
+          "prompt_tokens": 121,
+          "prefill_chunk": 32,
+          "decode_tokens": 128,
+          "passes": 2,
+          "warm_prompt_tokens": 8,
+          "warm_decode": 2,
+          "context": 249,
+          "backend": "cpu",
+          "resolved_backend": null,
+          "auto_placement": false,
+          "dense_device": "CPU",
+          "expert_device": "CPU"
+        },
+        "executable_sha256": "26e9ecf4de8c1e96c0278128fd20b90c80d6f9f050e0cefe5d58bb6dbeb861e3",
+        "after_session_host_memory_kib": [
+          {
+            "RssAnon": 354572,
+            "RssFile": 72388696,
+            "RssShmem": 0,
+            "VmRSS": 72743268,
+            "VmSwap": 229124
+          },
+          {
+            "RssAnon": 359788,
+            "RssFile": 72708348,
+            "RssShmem": 0,
+            "VmRSS": 73068136,
+            "VmSwap": 223952
+          }
+        ],
+        "after_session_driver_memory_bytes": [
+          {},
+          {}
+        ],
+        "allocator_stats_available": false,
+        "after_session_reserved_live": [
+          [
+            0,
+            0
+          ],
+          [
+            0,
+            0
+          ]
+        ],
+        "max_repeat_logit_difference": 0.0,
+        "decode_cpu_fallbacks": [
+          0,
+          0
+        ],
+        "prefill_cpu_fallbacks": [
+          0,
+          0
+        ]
+      }
+    ]
+  },
+  "corrected_table_controls": {
+    "deepseek": {
+      "reference": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/accurate-rope/deepseek/vulkan-fixed",
+      "reference_logits_sha256": "5bccde4e8e3c85d91be204501ec06665087e939987fc5cbdb400641d96eb3b4b",
+      "tolerance": 1e-05,
+      "runs": [
+        {
+          "run": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/accurate-rope/deepseek/vulkan-fixed",
+          "logits_sha256": "5bccde4e8e3c85d91be204501ec06665087e939987fc5cbdb400641d96eb3b4b",
+          "bit_identical": true,
+          "backend": "vulkan",
+          "auto_placement": false,
+          "max_abs_logit_difference": 0.0,
+          "rms_logit_difference": 0.0,
+          "matching_top1_rows": 129,
+          "logits_compared": 16677120,
+          "decode_speedup_vs_reference": 1.0,
+          "prefill_median_ms": 40770.001917,
+          "session_median_ms": 143577.28963,
+          "session_speedup_vs_reference": 1.0,
+          "private_growth_kib": 28,
+          "private_last_two_session_growth_kib": 28,
+          "peak_driver_vram_bytes": 9404608512,
+          "decode_endpoint_driver_vram_bytes": [
+            9404608512,
+            9404608512
+          ],
+          "driver_vram_growth_bytes": 0,
+          "gates": {
+            "same_executable": true,
+            "absolute_logits_1e_5": true,
+            "repeat_logits_1e_5": true,
+            "reference_repeat_logits_1e_5": true,
+            "repeated_sessions_measured": true,
+            "reference_repeated_sessions_measured": true,
+            "reference_private_memory_growth_le_1MiB": true,
+            "same_greedy_choices": true,
+            "private_memory_growth_le_1MiB": true,
+            "device_memory_stable": true,
+            "reference_memory_stable": true,
+            "no_cpu_fallbacks": true
+          },
+          "eligible_for_auto": true,
+          "performance_gates": {
+            "all_decode_samples_faster": false,
+            "all_session_samples_faster": false
+          },
+          "eligible_for_auto_preference": false,
+          "decode_ms_per_token": [
+            810.307635515625,
+            796.0562350000002
+          ],
+          "median_decode_ms_per_token": 803.1819352578126,
+          "prefill_ms": [
+            42272.242363,
+            39267.761471
+          ],
+          "source_summary": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/accurate-rope/deepseek/vulkan-fixed/summary.json",
+          "protocol": {
+            "architecture": "deepseek41",
+            "prompt_tokens": 121,
+            "prefill_chunk": 32,
+            "decode_tokens": 128,
+            "passes": 2,
+            "warm_prompt_tokens": 8,
+            "warm_decode": 2,
+            "context": 249,
+            "backend": "vulkan",
+            "resolved_backend": null,
+            "auto_placement": false,
+            "dense_device": "Intel(R) Arc(tm) Pro B50 Graphics (BMG G21)",
+            "expert_device": "CPU"
+          },
+          "executable_sha256": "5daad9e7bf01f8bbab1e9d096e7fa7bc2c1815bf7b42b004cc7126f2d142a4a4",
+          "after_session_host_memory_kib": [
+            {
+              "RssAnon": 76292,
+              "RssFile": 71001056,
+              "RssShmem": 36,
+              "VmRSS": 71077384,
+              "VmSwap": 113164
+            },
+            {
+              "RssAnon": 58380,
+              "RssFile": 72450488,
+              "RssShmem": 24,
+              "VmRSS": 72508892,
+              "VmSwap": 131104
+            }
+          ],
+          "after_session_driver_memory_bytes": [
+            {
+              "drm-resident-gtt": 2097152,
+              "drm-resident-stolen": 0,
+              "drm-resident-system": 0,
+              "drm-resident-vram0": 9404608512,
+              "drm-total-gtt": 2097152,
+              "drm-total-stolen": 0,
+              "drm-total-system": 0,
+              "drm-total-vram0": 9404608512
+            },
+            {
+              "drm-resident-gtt": 2097152,
+              "drm-resident-stolen": 0,
+              "drm-resident-system": 0,
+              "drm-resident-vram0": 9404608512,
+              "drm-total-gtt": 2097152,
+              "drm-total-stolen": 0,
+              "drm-total-system": 0,
+              "drm-total-vram0": 9404608512
+            }
+          ],
+          "allocator_stats_available": true,
+          "after_session_reserved_live": [
+            [
+              9365831680,
+              9224831488
+            ],
+            [
+              9365831680,
+              9224831488
+            ]
+          ],
+          "max_repeat_logit_difference": 0.0,
+          "decode_cpu_fallbacks": [
+            0,
+            0
+          ],
+          "prefill_cpu_fallbacks": [
+            0,
+            0
+          ]
+        },
+        {
+          "run": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/accurate-rope/deepseek/cpu-fixed",
+          "logits_sha256": "86159b982f3cc6e69e5e1f36c42b9672a86af64e360567946be4e0e2ef75492e",
+          "bit_identical": false,
+          "backend": "cpu",
+          "auto_placement": false,
+          "max_abs_logit_difference": 0.0001251697540283203,
+          "rms_logit_difference": 9.128545042670607e-06,
+          "matching_top1_rows": 129,
+          "logits_compared": 16677120,
+          "decode_speedup_vs_reference": 1.184816779513281,
+          "prefill_median_ms": 32595.0123515,
+          "session_median_ms": 119365.6333375,
+          "session_speedup_vs_reference": 1.2028360727919303,
+          "private_growth_kib": 1784,
+          "private_last_two_session_growth_kib": 1784,
+          "peak_driver_vram_bytes": null,
+          "decode_endpoint_driver_vram_bytes": null,
+          "driver_vram_growth_bytes": 0,
+          "gates": {
+            "same_executable": true,
+            "absolute_logits_1e_5": false,
+            "repeat_logits_1e_5": true,
+            "reference_repeat_logits_1e_5": true,
+            "repeated_sessions_measured": true,
+            "reference_repeated_sessions_measured": true,
+            "reference_private_memory_growth_le_1MiB": true,
+            "same_greedy_choices": true,
+            "private_memory_growth_le_1MiB": false,
+            "device_memory_stable": true,
+            "reference_memory_stable": true,
+            "no_cpu_fallbacks": true
+          },
+          "eligible_for_auto": false,
+          "performance_gates": {
+            "all_decode_samples_faster": true,
+            "all_session_samples_faster": true
+          },
+          "eligible_for_auto_preference": false,
+          "decode_ms_per_token": [
+            682.7664186796875,
+            673.0245342265624
+          ],
+          "median_decode_ms_per_token": 677.895476453125,
+          "prefill_ms": [
+            32543.125459000003,
+            32646.899243999997
+          ],
+          "source_summary": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/accurate-rope/deepseek/cpu-fixed/summary.json",
+          "protocol": {
+            "architecture": "deepseek41",
+            "prompt_tokens": 121,
+            "prefill_chunk": 32,
+            "decode_tokens": 128,
+            "passes": 2,
+            "warm_prompt_tokens": 8,
+            "warm_decode": 2,
+            "context": 249,
+            "backend": "cpu",
+            "resolved_backend": null,
+            "auto_placement": false,
+            "dense_device": "CPU",
+            "expert_device": "CPU"
+          },
+          "executable_sha256": "5daad9e7bf01f8bbab1e9d096e7fa7bc2c1815bf7b42b004cc7126f2d142a4a4",
+          "after_session_host_memory_kib": [
+            {
+              "RssAnon": 359484,
+              "RssFile": 72549184,
+              "RssShmem": 0,
+              "VmRSS": 72908668,
+              "VmSwap": 270120
+            },
+            {
+              "RssAnon": 370272,
+              "RssFile": 72958372,
+              "RssShmem": 0,
+              "VmRSS": 73328644,
+              "VmSwap": 261116
+            }
+          ],
+          "after_session_driver_memory_bytes": [
+            {},
+            {}
+          ],
+          "allocator_stats_available": false,
+          "after_session_reserved_live": [
+            [
+              0,
+              0
+            ],
+            [
+              0,
+              0
+            ]
+          ],
+          "max_repeat_logit_difference": 0.0,
+          "decode_cpu_fallbacks": [
+            0,
+            0
+          ],
+          "prefill_cpu_fallbacks": [
+            0,
+            0
+          ]
+        }
+      ]
+    },
+    "qwen": {
+      "reference": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/accurate-rope/qwen/vulkan-fixed",
+      "reference_logits_sha256": "41222d1f0675dde85b2b3e5e590960875e653eacd51c894e5680a880032a5d9d",
+      "tolerance": 1e-05,
+      "runs": [
+        {
+          "run": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/accurate-rope/qwen/vulkan-fixed",
+          "logits_sha256": "41222d1f0675dde85b2b3e5e590960875e653eacd51c894e5680a880032a5d9d",
+          "bit_identical": true,
+          "backend": "vulkan",
+          "auto_placement": false,
+          "max_abs_logit_difference": 0.0,
+          "rms_logit_difference": 0.0,
+          "matching_top1_rows": 129,
+          "logits_compared": 19599744,
+          "decode_speedup_vs_reference": 1.0,
+          "prefill_median_ms": 9333.319663999999,
+          "session_median_ms": 33540.752272499994,
+          "session_speedup_vs_reference": 1.0,
+          "private_growth_kib": 0,
+          "private_last_two_session_growth_kib": 0,
+          "peak_driver_vram_bytes": 5268221952,
+          "decode_endpoint_driver_vram_bytes": [
+            5268221952,
+            5268221952
+          ],
+          "driver_vram_growth_bytes": 0,
+          "gates": {
+            "same_executable": true,
+            "absolute_logits_1e_5": true,
+            "repeat_logits_1e_5": true,
+            "reference_repeat_logits_1e_5": true,
+            "repeated_sessions_measured": true,
+            "reference_repeated_sessions_measured": true,
+            "reference_private_memory_growth_le_1MiB": true,
+            "same_greedy_choices": true,
+            "private_memory_growth_le_1MiB": true,
+            "device_memory_stable": true,
+            "reference_memory_stable": true,
+            "no_cpu_fallbacks": true
+          },
+          "eligible_for_auto": true,
+          "performance_gates": {
+            "all_decode_samples_faster": false,
+            "all_session_samples_faster": false
+          },
+          "eligible_for_auto_preference": false,
+          "decode_ms_per_token": [
+            188.24052308593744,
+            190.000611421875
+          ],
+          "median_decode_ms_per_token": 189.12056725390622,
+          "prefill_ms": [
+            9338.070973,
+            9328.568355
+          ],
+          "source_summary": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/accurate-rope/qwen/vulkan-fixed/summary.json",
+          "protocol": {
+            "architecture": "qwen3",
+            "prompt_tokens": 126,
+            "prefill_chunk": 32,
+            "decode_tokens": 128,
+            "passes": 2,
+            "warm_prompt_tokens": 32,
+            "warm_decode": 2,
+            "context": 254,
+            "backend": "vulkan",
+            "resolved_backend": null,
+            "auto_placement": false,
+            "dense_device": "Intel(R) Arc(tm) Pro B50 Graphics (BMG G21)",
+            "expert_device": "Intel(R) Arc(tm) Pro B50 Graphics (BMG G21)"
+          },
+          "executable_sha256": "5daad9e7bf01f8bbab1e9d096e7fa7bc2c1815bf7b42b004cc7126f2d142a4a4",
+          "after_session_host_memory_kib": [
+            {
+              "RssAnon": 166844,
+              "RssFile": 64492,
+              "RssShmem": 36,
+              "VmRSS": 231372,
+              "VmSwap": 0
+            },
+            {
+              "RssAnon": 166844,
+              "RssFile": 62608,
+              "RssShmem": 36,
+              "VmRSS": 229488,
+              "VmSwap": 0
+            }
+          ],
+          "after_session_driver_memory_bytes": [
+            {
+              "drm-resident-gtt": 2097152,
+              "drm-resident-stolen": 0,
+              "drm-resident-system": 0,
+              "drm-resident-vram0": 5268221952,
+              "drm-total-gtt": 2097152,
+              "drm-total-stolen": 0,
+              "drm-total-system": 0,
+              "drm-total-vram0": 5268221952
+            },
+            {
+              "drm-resident-gtt": 2097152,
+              "drm-resident-stolen": 0,
+              "drm-resident-system": 0,
+              "drm-resident-vram0": 5268221952,
+              "drm-total-gtt": 2097152,
+              "drm-total-stolen": 0,
+              "drm-total-system": 0,
+              "drm-total-vram0": 5268221952
+            }
+          ],
+          "allocator_stats_available": true,
+          "after_session_reserved_live": [
+            [
+              5227622400,
+              5042798592
+            ],
+            [
+              5227622400,
+              5042798592
+            ]
+          ],
+          "max_repeat_logit_difference": 0.0,
+          "decode_cpu_fallbacks": [
+            0,
+            0
+          ],
+          "prefill_cpu_fallbacks": [
+            0,
+            0
+          ]
+        },
+        {
+          "run": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/accurate-rope/qwen/sycl-fixed",
+          "logits_sha256": "41222d1f0675dde85b2b3e5e590960875e653eacd51c894e5680a880032a5d9d",
+          "bit_identical": true,
+          "backend": "sycl",
+          "auto_placement": false,
+          "max_abs_logit_difference": 0.0,
+          "rms_logit_difference": 0.0,
+          "matching_top1_rows": 129,
+          "logits_compared": 19599744,
+          "decode_speedup_vs_reference": 1.14835492021733,
+          "prefill_median_ms": 3580.9012700000003,
+          "session_median_ms": 24660.99783449999,
+          "session_speedup_vs_reference": 1.3600727958208363,
+          "private_growth_kib": 8,
+          "private_last_two_session_growth_kib": 8,
+          "peak_driver_vram_bytes": 5799915520,
+          "decode_endpoint_driver_vram_bytes": [
+            5667688448,
+            5666643968
+          ],
+          "driver_vram_growth_bytes": 0,
+          "gates": {
+            "same_executable": true,
+            "absolute_logits_1e_5": true,
+            "repeat_logits_1e_5": true,
+            "reference_repeat_logits_1e_5": true,
+            "repeated_sessions_measured": true,
+            "reference_repeated_sessions_measured": true,
+            "reference_private_memory_growth_le_1MiB": true,
+            "same_greedy_choices": true,
+            "private_memory_growth_le_1MiB": true,
+            "device_memory_stable": true,
+            "reference_memory_stable": true,
+            "no_cpu_fallbacks": true
+          },
+          "eligible_for_auto": true,
+          "performance_gates": {
+            "all_decode_samples_faster": true,
+            "all_session_samples_faster": true
+          },
+          "eligible_for_auto_preference": true,
+          "decode_ms_per_token": [
+            164.72857164843742,
+            164.64793717187493
+          ],
+          "median_decode_ms_per_token": 164.68825441015616,
+          "prefill_ms": [
+            3567.384713,
+            3594.417827
+          ],
+          "source_summary": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/accurate-rope/qwen/sycl-fixed/summary.json",
+          "protocol": {
+            "architecture": "qwen3",
+            "prompt_tokens": 126,
+            "prefill_chunk": 32,
+            "decode_tokens": 128,
+            "passes": 2,
+            "warm_prompt_tokens": 32,
+            "warm_decode": 2,
+            "context": 254,
+            "backend": "sycl",
+            "resolved_backend": null,
+            "auto_placement": false,
+            "dense_device": "Intel(R) Arc(TM) Pro B50 Graphics",
+            "expert_device": "Intel(R) Arc(TM) Pro B50 Graphics"
+          },
+          "executable_sha256": "5daad9e7bf01f8bbab1e9d096e7fa7bc2c1815bf7b42b004cc7126f2d142a4a4",
+          "after_session_host_memory_kib": [
+            {
+              "RssAnon": 254916,
+              "RssFile": 190380,
+              "RssShmem": 0,
+              "VmRSS": 445296,
+              "VmSwap": 0
+            },
+            {
+              "RssAnon": 254924,
+              "RssFile": 179120,
+              "RssShmem": 0,
+              "VmRSS": 434044,
+              "VmSwap": 0
+            }
+          ],
+          "after_session_driver_memory_bytes": [
+            {
+              "drm-resident-gtt": 29442048,
+              "drm-resident-stolen": 0,
+              "drm-resident-system": 0,
+              "drm-resident-vram0": 5667688448,
+              "drm-total-gtt": 29442048,
+              "drm-total-stolen": 0,
+              "drm-total-system": 0,
+              "drm-total-vram0": 5667688448
+            },
+            {
+              "drm-resident-gtt": 29442048,
+              "drm-resident-stolen": 0,
+              "drm-resident-system": 0,
+              "drm-resident-vram0": 5666643968,
+              "drm-total-gtt": 29442048,
+              "drm-total-stolen": 0,
+              "drm-total-system": 0,
+              "drm-total-vram0": 5666643968
+            }
+          ],
+          "allocator_stats_available": false,
+          "after_session_reserved_live": [
+            [
+              0,
+              0
+            ],
+            [
+              0,
+              0
+            ]
+          ],
+          "max_repeat_logit_difference": 0.0,
+          "decode_cpu_fallbacks": [
+            0,
+            0
+          ],
+          "prefill_cpu_fallbacks": [
+            0,
+            0
+          ]
+        }
+      ]
+    }
+  },
+  "diagnosis": {
+    "sycl_qwen": [
+      "RMSNorm logical reduction width and compiler scaling reassociation",
+      "softmax precise exp versus Vulkan native exp",
+      "Q4_K/Q6_K eight-element multirow dots versus ordered 32-element FMA dots"
+    ],
+    "final_sycl_geometry": {
+      "physical_threads": 64,
+      "logical_reduction_lanes": 256
+    },
+    "cpu_deepseek_first_difference": {
+      "checkpoint": "00003-hc-rms",
+      "label": "hc-rms",
+      "shape": [
+        8,
+        20480
+      ],
+      "elements": 163840,
+      "different_bits": 163840,
+      "max_abs_finite": 6.389617919921875e-05,
+      "nonfinite_mismatch": false,
+      "absolute_1e_5": false
+    },
+    "weighted_cpu_norms_vs_float64": [
+      {
+        "label": "ds-attn-norm",
+        "weight": "blk.0.attn_norm.weight",
+        "shape": [
+          8,
+          5120
+        ],
+        "errors": {
+          "vulkan": {
+            "own_input_f64_max_abs": 1.8367647194872383e-08,
+            "vs_vulkan_input_f64_max_abs": 1.8367647194872383e-08
+          },
+          "cpu": {
+            "own_input_f64_max_abs": 7.466419540413938e-07,
+            "vs_vulkan_input_f64_max_abs": 7.466419540413938e-07
+          }
+        }
+      },
+      {
+        "label": "ds-q-a-norm",
+        "weight": "blk.0.attn_q_a_norm.weight",
+        "shape": [
+          8,
+          1280
+        ],
+        "errors": {
+          "vulkan": {
+            "own_input_f64_max_abs": 6.215595593772605e-07,
+            "vs_vulkan_input_f64_max_abs": 6.215595593772605e-07
+          },
+          "cpu": {
+            "own_input_f64_max_abs": 3.6900719155852357e-06,
+            "vs_vulkan_input_f64_max_abs": 4.649212415941406e-06
+          }
+        }
+      },
+      {
+        "label": "ds-kv-norm",
+        "weight": "blk.0.attn_kv_a_norm.weight",
+        "shape": [
+          8,
+          512
+        ],
+        "errors": {
+          "vulkan": {
+            "own_input_f64_max_abs": 2.3621354428016161e-07,
+            "vs_vulkan_input_f64_max_abs": 2.3621354428016161e-07
+          },
+          "cpu": {
+            "own_input_f64_max_abs": 4.981788812585819e-07,
+            "vs_vulkan_input_f64_max_abs": 4.6149017984831175e-07
+          }
+        }
+      }
+    ],
+    "direct_cosine_probe": {
+      "op": "Cos",
+      "model": null,
+      "weight": null,
+      "cols": 8,
+      "eps": 9.999999974752427e-07,
+      "input": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/trig-input.f32",
+      "input_sha256": "33b1922bc1c5dba68d9fbc4ff8b7bd23a80bd0e0a4b952696361ea5d462b2798",
+      "reference_backend": "vulkan",
+      "runs": [
+        {
+          "backend": "vulkan",
+          "max_abs": 0.0,
+          "different_bits": 0,
+          "elements": 8,
+          "absolute_1e_5": true
+        },
+        {
+          "backend": "sycl",
+          "max_abs": 0.0,
+          "different_bits": 0,
+          "elements": 8,
+          "absolute_1e_5": true
+        },
+        {
+          "backend": "cpu",
+          "max_abs": 3.2007694244384766e-05,
+          "different_bits": 5,
+          "elements": 8,
+          "absolute_1e_5": false
+        }
+      ]
+    },
+    "cosine_example": {
+      "input_f32": 0.008001127280294895,
+      "old_vulkan": 1.0,
+      "old_sycl": 1.0,
+      "correct_f32": 0.9999679923057556
+    },
+    "q8_same_input_compatibility_probe": {
+      "op": "Projection",
+      "model": "/home/tserica/models/DSV41-REAP272E-balanced.gguf",
+      "weight": "blk.0.attn_q_b.weight",
+      "cols": 1280,
+      "eps": 9.999999974752427e-07,
+      "input": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/cpu-f64/eight-vulkan/activations/00008-ds-q-a-norm.f32",
+      "input_sha256": "883f42700d63f59fb84620154f66caf503a06e4b37ccc7f573f2959aa7f644a2",
+      "reference_backend": "vulkan",
+      "runs": [
+        {
+          "backend": "vulkan",
+          "max_abs": 0.0,
+          "different_bits": 0,
+          "elements": 32768,
+          "absolute_1e_5": true
+        },
+        {
+          "backend": "cpu",
+          "max_abs": 0.0,
+          "different_bits": 0,
+          "elements": 32768,
+          "absolute_1e_5": true
+        }
+      ]
+    },
+    "rope_multiply_add_rounding": {
+      "separate": {
+        "different_bits": 937,
+        "max_abs_vs_vulkan": 1.9073486328125e-06,
+        "max_abs_vs_rounded_f64": 3.814697265625e-06
+      },
+      "fma-first": {
+        "different_bits": 0,
+        "max_abs_vs_vulkan": 0.0,
+        "max_abs_vs_rounded_f64": 3.814697265625e-06
+      },
+      "fma-second": {
+        "different_bits": 1267,
+        "max_abs_vs_vulkan": 3.814697265625e-06,
+        "max_abs_vs_rounded_f64": 1.9073486328125e-06
+      }
+    },
+    "rope_same_input_compatibility_probe": {
+      "op": "Rope",
+      "model": null,
+      "weight": null,
+      "cols": 512,
+      "eps": 9.999999974752427e-07,
+      "input": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/cpu-f64/eight-vulkan/activations/00010-ds-q-head-norm.f32",
+      "input_sha256": "57805396b7553f32575d6883e08f5bea776625ebbe33a6640e816096c99adb17",
+      "reference_backend": "vulkan",
+      "runs": [
+        {
+          "backend": "vulkan",
+          "max_abs": 0.0,
+          "different_bits": 0,
+          "elements": 32768,
+          "absolute_1e_5": true
+        },
+        {
+          "backend": "cpu",
+          "max_abs": 0.0,
+          "different_bits": 0,
+          "elements": 32768,
+          "absolute_1e_5": true
+        }
+      ]
+    },
+    "same_input_projection_float64_checks": [
+      {
+        "checkpoint": "00004-hc-projection",
+        "weight": "blk.0.hc_attn_fn.weight",
+        "output_index": 0,
+        "k": 20480,
+        "weight_dtype": 10,
+        "cross_backend_difference": 3.0517578125e-05,
+        "backends": {
+          "vulkan": {
+            "f64_reference_on_own_input": -89.36363694670725,
+            "got": -89.36363220214844,
+            "error_vs_f64": 4.744558808056354e-06,
+            "error_vs_rounded_f64": 7.62939453125e-06
+          },
+          "cpu": {
+            "f64_reference_on_own_input": -89.36363163846187,
+            "got": -89.36360168457031,
+            "error_vs_f64": 2.9953891555578593e-05,
+            "error_vs_rounded_f64": 3.0517578125e-05
+          }
+        }
+      },
+      {
+        "checkpoint": "00007-ds-q-a",
+        "weight": "blk.0.attn_q_a.weight",
+        "output_index": 949,
+        "k": 5120,
+        "weight_dtype": 8,
+        "cross_backend_difference": 4.470348358154297e-08,
+        "backends": {
+          "vulkan": {
+            "f64_reference_on_own_input": -0.24944527590920706,
+            "got": -0.24944528937339783,
+            "error_vs_f64": -1.3464190762313422e-08,
+            "error_vs_rounded_f64": -1.4901161193847656e-08
+          },
+          "cpu": {
+            "f64_reference_on_own_input": -0.24944525977952858,
+            "got": -0.24944524466991425,
+            "error_vs_f64": 1.5109614337482924e-08,
+            "error_vs_rounded_f64": 1.4901161193847656e-08
+          }
+        }
+      },
+      {
+        "checkpoint": "00009-ds-q-b",
+        "weight": "blk.0.attn_q_b.weight",
+        "output_index": 23488,
+        "k": 1280,
+        "weight_dtype": 8,
+        "cross_backend_difference": 7.62939453125e-06,
+        "backends": {
+          "vulkan": {
+            "f64_reference_on_own_input": 48.75194439849197,
+            "got": 48.75194549560547,
+            "error_vs_f64": 1.097113496939528e-06,
+            "error_vs_rounded_f64": 0.0
+          },
+          "cpu": {
+            "f64_reference_on_own_input": 48.751943819291355,
+            "got": 48.75193786621094,
+            "error_vs_f64": -5.9530804179530605e-06,
+            "error_vs_rounded_f64": -7.62939453125e-06
+          }
+        }
+      }
+    ],
+    "same_input_attention_score_matmul": {
+      "op": "Matmul",
+      "model": null,
+      "weight": null,
+      "cols": 512,
+      "eps": 9.999999974752427e-07,
+      "input": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/rope-fma/eight-vulkan/activations/00011-ds-q-rope.f32",
+      "input_sha256": "d6829fd73606afa9cd9d2e0522c00c5ef84e91b2a08fdc65fb242a191460c8a5",
+      "rhs": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/rope-fma/eight-vulkan/activations/00014-ds-k-all.f32",
+      "rhs_sha256": "1cda7c03f7ab38471ad34ff3a627fbe5a579d05d680166da5f7d5264c4a5cefc",
+      "rope_dim": null,
+      "rope_theta": 10000.0,
+      "position": 0,
+      "reference_backend": "vulkan",
+      "runs": [
+        {
+          "backend": "vulkan",
+          "max_abs": 0.0,
+          "different_bits": 0,
+          "elements": 8192,
+          "absolute_1e_5": true
+        },
+        {
+          "backend": "cpu",
+          "max_abs": 0.0,
+          "different_bits": 0,
+          "elements": 8192,
+          "absolute_1e_5": true
+        }
+      ]
+    },
+    "remaining_drift": "Corrected CPU norms reduce the real-model maximum from 3.1376e-4 to 7.03335e-5. CPU/Vulkan differences remain in FP32 accumulation, RoPE contraction and normalization/transcendental rounding. Cached prefill KV differences persist even when the current token projections agree. Full-model 1e-5 is not certified for DeepSeek CPU."
+  },
+  "rejected_trials": {
+    "pre_table_correction_qwen64": {
+      "reference": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/final/qwen/vulkan-fixed",
+      "reference_logits_sha256": "6dc8975c3f955815fdbb88c4488bb37deced0ffcea5fb052b2b7f0e4b7c87c88",
+      "tolerance": 1e-05,
+      "runs": [
+        {
+          "run": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/final/qwen/vulkan-fixed",
+          "logits_sha256": "6dc8975c3f955815fdbb88c4488bb37deced0ffcea5fb052b2b7f0e4b7c87c88",
+          "bit_identical": true,
+          "backend": "vulkan",
+          "auto_placement": false,
+          "max_abs_logit_difference": 0.0,
+          "rms_logit_difference": 0.0,
+          "matching_top1_rows": 129,
+          "logits_compared": 19599744,
+          "decode_speedup_vs_reference": 1.0,
+          "prefill_median_ms": 9396.5707215,
+          "session_median_ms": 33495.8848265,
+          "session_speedup_vs_reference": 1.0,
+          "private_growth_kib": 0,
+          "private_last_two_session_growth_kib": 0,
+          "peak_driver_vram_bytes": 5268217856,
+          "decode_endpoint_driver_vram_bytes": [
+            5268217856,
+            5268217856
+          ],
+          "driver_vram_growth_bytes": 0,
+          "gates": {
+            "same_executable": true,
+            "absolute_logits_1e_5": true,
+            "repeat_logits_1e_5": true,
+            "reference_repeat_logits_1e_5": true,
+            "repeated_sessions_measured": true,
+            "reference_repeated_sessions_measured": true,
+            "reference_private_memory_growth_le_1MiB": true,
+            "same_greedy_choices": true,
+            "private_memory_growth_le_1MiB": true,
+            "device_memory_stable": true,
+            "reference_memory_stable": true,
+            "no_cpu_fallbacks": true
+          },
+          "eligible_for_auto": true,
+          "performance_gates": {
+            "all_decode_samples_faster": false,
+            "all_session_samples_faster": false
+          },
+          "eligible_for_auto_preference": false,
+          "decode_ms_per_token": [
+            186.1601191953125,
+            190.3916636953125
+          ],
+          "median_decode_ms_per_token": 188.27589144531248,
+          "prefill_ms": [
+            9308.044243,
+            9485.0972
+          ],
+          "source_summary": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/final/qwen/vulkan-fixed/summary.json",
+          "protocol": {
+            "architecture": "qwen3",
+            "prompt_tokens": 126,
+            "prefill_chunk": 32,
+            "decode_tokens": 128,
+            "passes": 2,
+            "warm_prompt_tokens": 32,
+            "warm_decode": 2,
+            "context": 254,
+            "backend": "vulkan",
+            "resolved_backend": null,
+            "auto_placement": false,
+            "dense_device": "Intel(R) Arc(tm) Pro B50 Graphics (BMG G21)",
+            "expert_device": "Intel(R) Arc(tm) Pro B50 Graphics (BMG G21)"
+          },
+          "executable_sha256": "e572c4d75d0c4ecaa000e85b0189ec35ed952f5ec2cdfd9206cf4218f9e63146",
+          "after_session_host_memory_kib": [
+            {
+              "RssAnon": 166844,
+              "RssFile": 60692,
+              "RssShmem": 36,
+              "VmRSS": 227572,
+              "VmSwap": 0
+            },
+            {
+              "RssAnon": 166844,
+              "RssFile": 61140,
+              "RssShmem": 36,
+              "VmRSS": 228020,
+              "VmSwap": 0
+            }
+          ],
+          "after_session_driver_memory_bytes": [
+            {
+              "drm-resident-gtt": 2097152,
+              "drm-resident-stolen": 0,
+              "drm-resident-system": 0,
+              "drm-resident-vram0": 5268217856,
+              "drm-total-gtt": 2097152,
+              "drm-total-stolen": 0,
+              "drm-total-system": 0,
+              "drm-total-vram0": 5268217856
+            },
+            {
+              "drm-resident-gtt": 2097152,
+              "drm-resident-stolen": 0,
+              "drm-resident-system": 0,
+              "drm-resident-vram0": 5268217856,
+              "drm-total-gtt": 2097152,
+              "drm-total-stolen": 0,
+              "drm-total-system": 0,
+              "drm-total-vram0": 5268217856
+            }
+          ],
+          "allocator_stats_available": true,
+          "after_session_reserved_live": [
+            [
+              5227622400,
+              5042798592
+            ],
+            [
+              5227622400,
+              5042798592
+            ]
+          ],
+          "max_repeat_logit_difference": 0.0,
+          "decode_cpu_fallbacks": [
+            0,
+            0
+          ],
+          "prefill_cpu_fallbacks": [
+            0,
+            0
+          ]
+        },
+        {
+          "run": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/final/qwen/sycl-fixed",
+          "logits_sha256": "6dc8975c3f955815fdbb88c4488bb37deced0ffcea5fb052b2b7f0e4b7c87c88",
+          "bit_identical": true,
+          "backend": "sycl",
+          "auto_placement": false,
+          "max_abs_logit_difference": 0.0,
+          "rms_logit_difference": 0.0,
+          "matching_top1_rows": 129,
+          "logits_compared": 19599744,
+          "decode_speedup_vs_reference": 1.1368014970450449,
+          "prefill_median_ms": 3643.5699795,
+          "session_median_ms": 24842.7979605,
+          "session_speedup_vs_reference": 1.348313699598507,
+          "private_growth_kib": 8,
+          "private_last_two_session_growth_kib": 8,
+          "peak_driver_vram_bytes": 5797810176,
+          "decode_endpoint_driver_vram_bytes": [
+            5666635776,
+            5668745216
+          ],
+          "driver_vram_growth_bytes": 2109440,
+          "gates": {
+            "same_executable": true,
+            "absolute_logits_1e_5": true,
+            "repeat_logits_1e_5": true,
+            "reference_repeat_logits_1e_5": true,
+            "repeated_sessions_measured": true,
+            "reference_repeated_sessions_measured": true,
+            "reference_private_memory_growth_le_1MiB": true,
+            "same_greedy_choices": true,
+            "private_memory_growth_le_1MiB": true,
+            "device_memory_stable": false,
+            "reference_memory_stable": true,
+            "no_cpu_fallbacks": true
+          },
+          "eligible_for_auto": false,
+          "performance_gates": {
+            "all_decode_samples_faster": true,
+            "all_session_samples_faster": true
+          },
+          "eligible_for_auto_preference": false,
+          "decode_ms_per_token": [
+            165.2950436328125,
+            165.94289357031246
+          ],
+          "median_decode_ms_per_token": 165.61896860156247,
+          "prefill_ms": [
+            3647.910895,
+            3639.229064
+          ],
+          "source_summary": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/final/qwen/sycl-fixed/summary.json",
+          "protocol": {
+            "architecture": "qwen3",
+            "prompt_tokens": 126,
+            "prefill_chunk": 32,
+            "decode_tokens": 128,
+            "passes": 2,
+            "warm_prompt_tokens": 32,
+            "warm_decode": 2,
+            "context": 254,
+            "backend": "sycl",
+            "resolved_backend": null,
+            "auto_placement": false,
+            "dense_device": "Intel(R) Arc(TM) Pro B50 Graphics",
+            "expert_device": "Intel(R) Arc(TM) Pro B50 Graphics"
+          },
+          "executable_sha256": "e572c4d75d0c4ecaa000e85b0189ec35ed952f5ec2cdfd9206cf4218f9e63146",
+          "after_session_host_memory_kib": [
+            {
+              "RssAnon": 254324,
+              "RssFile": 198216,
+              "RssShmem": 0,
+              "VmRSS": 452540,
+              "VmSwap": 0
+            },
+            {
+              "RssAnon": 254332,
+              "RssFile": 198176,
+              "RssShmem": 0,
+              "VmRSS": 452508,
+              "VmSwap": 0
+            }
+          ],
+          "after_session_driver_memory_bytes": [
+            {
+              "drm-resident-gtt": 29442048,
+              "drm-resident-stolen": 0,
+              "drm-resident-system": 0,
+              "drm-resident-vram0": 5666635776,
+              "drm-total-gtt": 29442048,
+              "drm-total-stolen": 0,
+              "drm-total-system": 0,
+              "drm-total-vram0": 5666635776
+            },
+            {
+              "drm-resident-gtt": 29442048,
+              "drm-resident-stolen": 0,
+              "drm-resident-system": 0,
+              "drm-resident-vram0": 5668745216,
+              "drm-total-gtt": 29442048,
+              "drm-total-stolen": 0,
+              "drm-total-system": 0,
+              "drm-total-vram0": 5668745216
+            }
+          ],
+          "allocator_stats_available": false,
+          "after_session_reserved_live": [
+            [
+              0,
+              0
+            ],
+            [
+              0,
+              0
+            ]
+          ],
+          "max_repeat_logit_difference": 0.0,
+          "decode_cpu_fallbacks": [
+            0,
+            0
+          ],
+          "prefill_cpu_fallbacks": [
+            0,
+            0
+          ]
+        },
+        {
+          "run": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/final/qwen/opencl-auto",
+          "logits_sha256": "d7b2d80cc46e4c2614f999da70300e2a1fc34cdb214296b8cb598ec4497ae4f8",
+          "bit_identical": false,
+          "backend": "opencl",
+          "auto_placement": true,
+          "max_abs_logit_difference": 0.00046825408935546875,
+          "rms_logit_difference": 3.230119460597598e-05,
+          "matching_top1_rows": 129,
+          "logits_compared": 19599744,
+          "decode_speedup_vs_reference": 0.9695654484847889,
+          "prefill_median_ms": 2567.5353704999998,
+          "session_median_ms": 27423.324263,
+          "session_speedup_vs_reference": 1.2214377989065752,
+          "private_growth_kib": 28,
+          "private_last_two_session_growth_kib": 28,
+          "peak_driver_vram_bytes": 166191104,
+          "decode_endpoint_driver_vram_bytes": [
+            166191104,
+            166191104
+          ],
+          "driver_vram_growth_bytes": 0,
+          "gates": {
+            "same_executable": true,
+            "absolute_logits_1e_5": false,
+            "repeat_logits_1e_5": true,
+            "reference_repeat_logits_1e_5": true,
+            "repeated_sessions_measured": true,
+            "reference_repeated_sessions_measured": true,
+            "reference_private_memory_growth_le_1MiB": true,
+            "same_greedy_choices": true,
+            "private_memory_growth_le_1MiB": true,
+            "device_memory_stable": true,
+            "reference_memory_stable": true,
+            "no_cpu_fallbacks": true
+          },
+          "eligible_for_auto": false,
+          "performance_gates": {
+            "all_decode_samples_faster": false,
+            "all_session_samples_faster": true
+          },
+          "eligible_for_auto_preference": false,
+          "decode_ms_per_token": [
+            194.28054987500002,
+            194.09115157031246
+          ],
+          "median_decode_ms_per_token": 194.18585072265626,
+          "prefill_ms": [
+            2566.632513,
+            2568.438228
+          ],
+          "source_summary": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/final/qwen/opencl-auto/summary.json",
+          "protocol": {
+            "architecture": "qwen3",
+            "prompt_tokens": 126,
+            "prefill_chunk": 32,
+            "decode_tokens": 128,
+            "passes": 2,
+            "warm_prompt_tokens": 32,
+            "warm_decode": 2,
+            "context": 254,
+            "backend": "opencl",
+            "resolved_backend": null,
+            "auto_placement": true,
+            "dense_device": "CPU",
+            "expert_device": "CPU"
+          },
+          "executable_sha256": "e572c4d75d0c4ecaa000e85b0189ec35ed952f5ec2cdfd9206cf4218f9e63146",
+          "after_session_host_memory_kib": [
+            {
+              "RssAnon": 263116,
+              "RssFile": 4718516,
+              "RssShmem": 0,
+              "VmRSS": 4981632,
+              "VmSwap": 0
+            },
+            {
+              "RssAnon": 263144,
+              "RssFile": 4718596,
+              "RssShmem": 0,
+              "VmRSS": 4981740,
+              "VmSwap": 0
+            }
+          ],
+          "after_session_driver_memory_bytes": [
+            {
+              "drm-resident-gtt": 6332416,
+              "drm-resident-stolen": 0,
+              "drm-resident-system": 0,
+              "drm-resident-vram0": 166191104,
+              "drm-total-gtt": 6332416,
+              "drm-total-stolen": 0,
+              "drm-total-system": 0,
+              "drm-total-vram0": 166191104
+            },
+            {
+              "drm-resident-gtt": 6332416,
+              "drm-resident-stolen": 0,
+              "drm-resident-system": 0,
+              "drm-resident-vram0": 166191104,
+              "drm-total-gtt": 6332416,
+              "drm-total-stolen": 0,
+              "drm-total-system": 0,
+              "drm-total-vram0": 166191104
+            }
+          ],
+          "allocator_stats_available": false,
+          "after_session_reserved_live": [
+            [
+              0,
+              0
+            ],
+            [
+              0,
+              0
+            ]
+          ],
+          "max_repeat_logit_difference": 0.0,
+          "decode_cpu_fallbacks": [
+            0,
+            0
+          ],
+          "prefill_cpu_fallbacks": [
+            0,
+            0
+          ]
+        },
+        {
+          "run": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/final/qwen/sycl-auto",
+          "logits_sha256": "d7b2d80cc46e4c2614f999da70300e2a1fc34cdb214296b8cb598ec4497ae4f8",
+          "bit_identical": false,
+          "backend": "sycl",
+          "auto_placement": true,
+          "max_abs_logit_difference": 0.00046825408935546875,
+          "rms_logit_difference": 3.230119460597598e-05,
+          "matching_top1_rows": 129,
+          "logits_compared": 19599744,
+          "decode_speedup_vs_reference": 0.9618683537684221,
+          "prefill_median_ms": 2594.7293205,
+          "session_median_ms": 27649.42002799999,
+          "session_speedup_vs_reference": 1.2114498167621388,
+          "private_growth_kib": 44,
+          "private_last_two_session_growth_kib": 44,
+          "peak_driver_vram_bytes": 498208768,
+          "decode_endpoint_driver_vram_bytes": [
+            422678528,
+            422678528
+          ],
+          "driver_vram_growth_bytes": 0,
+          "gates": {
+            "same_executable": true,
+            "absolute_logits_1e_5": false,
+            "repeat_logits_1e_5": true,
+            "reference_repeat_logits_1e_5": true,
+            "repeated_sessions_measured": true,
+            "reference_repeated_sessions_measured": true,
+            "reference_private_memory_growth_le_1MiB": true,
+            "same_greedy_choices": true,
+            "private_memory_growth_le_1MiB": true,
+            "device_memory_stable": true,
+            "reference_memory_stable": true,
+            "no_cpu_fallbacks": true
+          },
+          "eligible_for_auto": false,
+          "performance_gates": {
+            "all_decode_samples_faster": false,
+            "all_session_samples_faster": true
+          },
+          "eligible_for_auto_preference": false,
+          "decode_ms_per_token": [
+            195.14592266406237,
+            196.333619640625
+          ],
+          "median_decode_ms_per_token": 195.73977115234368,
+          "prefill_ms": [
+            2591.742236,
+            2597.716405
+          ],
+          "source_summary": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/final/qwen/sycl-auto/summary.json",
+          "protocol": {
+            "architecture": "qwen3",
+            "prompt_tokens": 126,
+            "prefill_chunk": 32,
+            "decode_tokens": 128,
+            "passes": 2,
+            "warm_prompt_tokens": 32,
+            "warm_decode": 2,
+            "context": 254,
+            "backend": "sycl",
+            "resolved_backend": null,
+            "auto_placement": true,
+            "dense_device": "CPU",
+            "expert_device": "CPU"
+          },
+          "executable_sha256": "e572c4d75d0c4ecaa000e85b0189ec35ed952f5ec2cdfd9206cf4218f9e63146",
+          "after_session_host_memory_kib": [
+            {
+              "RssAnon": 364932,
+              "RssFile": 4776468,
+              "RssShmem": 0,
+              "VmRSS": 5141400,
+              "VmSwap": 0
+            },
+            {
+              "RssAnon": 364976,
+              "RssFile": 4776588,
+              "RssShmem": 0,
+              "VmRSS": 5141564,
+              "VmSwap": 0
+            }
+          ],
+          "after_session_driver_memory_bytes": [
+            {
+              "drm-resident-gtt": 27344896,
+              "drm-resident-stolen": 0,
+              "drm-resident-system": 0,
+              "drm-resident-vram0": 422678528,
+              "drm-total-gtt": 27344896,
+              "drm-total-stolen": 0,
+              "drm-total-system": 0,
+              "drm-total-vram0": 422678528
+            },
+            {
+              "drm-resident-gtt": 27344896,
+              "drm-resident-stolen": 0,
+              "drm-resident-system": 0,
+              "drm-resident-vram0": 422678528,
+              "drm-total-gtt": 27344896,
+              "drm-total-stolen": 0,
+              "drm-total-system": 0,
+              "drm-total-vram0": 422678528
+            }
+          ],
+          "allocator_stats_available": false,
+          "after_session_reserved_live": [
+            [
+              0,
+              0
+            ],
+            [
+              0,
+              0
+            ]
+          ],
+          "max_repeat_logit_difference": 0.0,
+          "decode_cpu_fallbacks": [
+            0,
+            0
+          ],
+          "prefill_cpu_fallbacks": [
+            0,
+            0
+          ]
+        }
+      ]
+    },
+    "physical256_qwen": {
+      "reference": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/phase3/qwen/vulkan-fixed",
+      "reference_logits_sha256": "6dc8975c3f955815fdbb88c4488bb37deced0ffcea5fb052b2b7f0e4b7c87c88",
+      "tolerance": 1e-05,
+      "runs": [
+        {
+          "run": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/phase3/qwen/vulkan-fixed",
+          "logits_sha256": "6dc8975c3f955815fdbb88c4488bb37deced0ffcea5fb052b2b7f0e4b7c87c88",
+          "bit_identical": true,
+          "backend": "vulkan",
+          "auto_placement": false,
+          "max_abs_logit_difference": 0.0,
+          "rms_logit_difference": 0.0,
+          "matching_top1_rows": 129,
+          "logits_compared": 19599744,
+          "decode_speedup_vs_reference": 1.0,
+          "prefill_median_ms": 9467.6009525,
+          "session_median_ms": 33340.45036399999,
+          "session_speedup_vs_reference": 1.0,
+          "private_growth_kib": 0,
+          "private_last_two_session_growth_kib": 0,
+          "peak_driver_vram_bytes": 5268217856,
+          "decode_endpoint_driver_vram_bytes": [
+            5268217856,
+            5268217856
+          ],
+          "driver_vram_growth_bytes": 0,
+          "gates": {
+            "same_executable": true,
+            "absolute_logits_1e_5": true,
+            "repeat_logits_1e_5": true,
+            "reference_repeat_logits_1e_5": true,
+            "repeated_sessions_measured": true,
+            "reference_repeated_sessions_measured": true,
+            "reference_private_memory_growth_le_1MiB": true,
+            "same_greedy_choices": true,
+            "private_memory_growth_le_1MiB": true,
+            "device_memory_stable": true,
+            "reference_memory_stable": true,
+            "no_cpu_fallbacks": true
+          },
+          "eligible_for_auto": true,
+          "performance_gates": {
+            "all_decode_samples_faster": false,
+            "all_session_samples_faster": false
+          },
+          "eligible_for_auto_preference": false,
+          "decode_ms_per_token": [
+            183.7815188906249,
+            189.2317531640624
+          ],
+          "median_decode_ms_per_token": 186.50663602734366,
+          "prefill_ms": [
+            9326.371334,
+            9608.830571
+          ],
+          "source_summary": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/phase3/qwen/vulkan-fixed/summary.json",
+          "protocol": {
+            "architecture": "qwen3",
+            "prompt_tokens": 126,
+            "prefill_chunk": 32,
+            "decode_tokens": 128,
+            "passes": 2,
+            "warm_prompt_tokens": 32,
+            "warm_decode": 2,
+            "context": 254,
+            "backend": "vulkan",
+            "resolved_backend": null,
+            "auto_placement": false,
+            "dense_device": "Intel(R) Arc(tm) Pro B50 Graphics (BMG G21)",
+            "expert_device": "Intel(R) Arc(tm) Pro B50 Graphics (BMG G21)"
+          },
+          "executable_sha256": "3071e50d272fe4a61fad5b25eafc0339acb258d1a1b0d119562adb143eb4a48a",
+          "after_session_host_memory_kib": [
+            {
+              "RssAnon": 166840,
+              "RssFile": 68664,
+              "RssShmem": 36,
+              "VmRSS": 235540,
+              "VmSwap": 0
+            },
+            {
+              "RssAnon": 166840,
+              "RssFile": 66248,
+              "RssShmem": 36,
+              "VmRSS": 233124,
+              "VmSwap": 0
+            }
+          ],
+          "after_session_driver_memory_bytes": [
+            {
+              "drm-resident-gtt": 2097152,
+              "drm-resident-stolen": 0,
+              "drm-resident-system": 0,
+              "drm-resident-vram0": 5268217856,
+              "drm-total-gtt": 2097152,
+              "drm-total-stolen": 0,
+              "drm-total-system": 0,
+              "drm-total-vram0": 5268217856
+            },
+            {
+              "drm-resident-gtt": 2097152,
+              "drm-resident-stolen": 0,
+              "drm-resident-system": 0,
+              "drm-resident-vram0": 5268217856,
+              "drm-total-gtt": 2097152,
+              "drm-total-stolen": 0,
+              "drm-total-system": 0,
+              "drm-total-vram0": 5268217856
+            }
+          ],
+          "allocator_stats_available": true,
+          "after_session_reserved_live": [
+            [
+              5227622400,
+              5042798592
+            ],
+            [
+              5227622400,
+              5042798592
+            ]
+          ],
+          "max_repeat_logit_difference": 0.0,
+          "decode_cpu_fallbacks": [
+            0,
+            0
+          ],
+          "prefill_cpu_fallbacks": [
+            0,
+            0
+          ]
+        },
+        {
+          "run": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/phase3/qwen/sycl-fixed",
+          "logits_sha256": "6dc8975c3f955815fdbb88c4488bb37deced0ffcea5fb052b2b7f0e4b7c87c88",
+          "bit_identical": true,
+          "backend": "sycl",
+          "auto_placement": false,
+          "max_abs_logit_difference": 0.0,
+          "rms_logit_difference": 0.0,
+          "matching_top1_rows": 129,
+          "logits_compared": 19599744,
+          "decode_speedup_vs_reference": 1.0531989006544613,
+          "prefill_median_ms": 3677.927869,
+          "session_median_ms": 26344.918308000004,
+          "session_speedup_vs_reference": 1.2655362971414374,
+          "private_growth_kib": 8,
+          "private_last_two_session_growth_kib": 8,
+          "peak_driver_vram_bytes": 5797875712,
+          "decode_endpoint_driver_vram_bytes": [
+            5666701312,
+            5668810752
+          ],
+          "driver_vram_growth_bytes": 2109440,
+          "gates": {
+            "same_executable": true,
+            "absolute_logits_1e_5": true,
+            "repeat_logits_1e_5": true,
+            "reference_repeat_logits_1e_5": true,
+            "repeated_sessions_measured": true,
+            "reference_repeated_sessions_measured": true,
+            "reference_private_memory_growth_le_1MiB": true,
+            "same_greedy_choices": true,
+            "private_memory_growth_le_1MiB": true,
+            "device_memory_stable": false,
+            "reference_memory_stable": true,
+            "no_cpu_fallbacks": true
+          },
+          "eligible_for_auto": false,
+          "performance_gates": {
+            "all_decode_samples_faster": true,
+            "all_session_samples_faster": true
+          },
+          "eligible_for_auto_preference": false,
+          "decode_ms_per_token": [
+            177.04342955468758,
+            177.1282960546875
+          ],
+          "median_decode_ms_per_token": 177.08586280468754,
+          "prefill_ms": [
+            3722.690182,
+            3633.165556
+          ],
+          "source_summary": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/phase3/qwen/sycl-fixed/summary.json",
+          "protocol": {
+            "architecture": "qwen3",
+            "prompt_tokens": 126,
+            "prefill_chunk": 32,
+            "decode_tokens": 128,
+            "passes": 2,
+            "warm_prompt_tokens": 32,
+            "warm_decode": 2,
+            "context": 254,
+            "backend": "sycl",
+            "resolved_backend": null,
+            "auto_placement": false,
+            "dense_device": "Intel(R) Arc(TM) Pro B50 Graphics",
+            "expert_device": "Intel(R) Arc(TM) Pro B50 Graphics"
+          },
+          "executable_sha256": "3071e50d272fe4a61fad5b25eafc0339acb258d1a1b0d119562adb143eb4a48a",
+          "after_session_host_memory_kib": [
+            {
+              "RssAnon": 254920,
+              "RssFile": 198908,
+              "RssShmem": 0,
+              "VmRSS": 453828,
+              "VmSwap": 0
+            },
+            {
+              "RssAnon": 254928,
+              "RssFile": 198992,
+              "RssShmem": 0,
+              "VmRSS": 453920,
+              "VmSwap": 0
+            }
+          ],
+          "after_session_driver_memory_bytes": [
+            {
+              "drm-resident-gtt": 29442048,
+              "drm-resident-stolen": 0,
+              "drm-resident-system": 0,
+              "drm-resident-vram0": 5666701312,
+              "drm-total-gtt": 29442048,
+              "drm-total-stolen": 0,
+              "drm-total-system": 0,
+              "drm-total-vram0": 5666701312
+            },
+            {
+              "drm-resident-gtt": 29442048,
+              "drm-resident-stolen": 0,
+              "drm-resident-system": 0,
+              "drm-resident-vram0": 5668810752,
+              "drm-total-gtt": 29442048,
+              "drm-total-stolen": 0,
+              "drm-total-system": 0,
+              "drm-total-vram0": 5668810752
+            }
+          ],
+          "allocator_stats_available": false,
+          "after_session_reserved_live": [
+            [
+              0,
+              0
+            ],
+            [
+              0,
+              0
+            ]
+          ],
+          "max_repeat_logit_difference": 0.0,
+          "decode_cpu_fallbacks": [
+            0,
+            0
+          ],
+          "prefill_cpu_fallbacks": [
+            0,
+            0
+          ]
+        },
+        {
+          "run": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/phase3/qwen/opencl-auto",
+          "logits_sha256": "d7b2d80cc46e4c2614f999da70300e2a1fc34cdb214296b8cb598ec4497ae4f8",
+          "bit_identical": false,
+          "backend": "opencl",
+          "auto_placement": true,
+          "max_abs_logit_difference": 0.00046825408935546875,
+          "rms_logit_difference": 3.230119460597598e-05,
+          "matching_top1_rows": 129,
+          "logits_compared": 19599744,
+          "decode_speedup_vs_reference": 0.9063039755923004,
+          "prefill_median_ms": 2549.2543505000003,
+          "session_median_ms": 28890.1400295,
+          "session_speedup_vs_reference": 1.154042532502637,
+          "private_growth_kib": 36,
+          "private_last_two_session_growth_kib": 36,
+          "peak_driver_vram_bytes": 166182912,
+          "decode_endpoint_driver_vram_bytes": [
+            166182912,
+            166182912
+          ],
+          "driver_vram_growth_bytes": 0,
+          "gates": {
+            "same_executable": true,
+            "absolute_logits_1e_5": false,
+            "repeat_logits_1e_5": true,
+            "reference_repeat_logits_1e_5": true,
+            "repeated_sessions_measured": true,
+            "reference_repeated_sessions_measured": true,
+            "reference_private_memory_growth_le_1MiB": true,
+            "same_greedy_choices": true,
+            "private_memory_growth_le_1MiB": true,
+            "device_memory_stable": true,
+            "reference_memory_stable": true,
+            "no_cpu_fallbacks": true
+          },
+          "eligible_for_auto": false,
+          "performance_gates": {
+            "all_decode_samples_faster": false,
+            "all_session_samples_faster": true
+          },
+          "eligible_for_auto_preference": false,
+          "decode_ms_per_token": [
+            205.56967676562502,
+            206.00666196874994
+          ],
+          "median_decode_ms_per_token": 205.7881693671875,
+          "prefill_ms": [
+            2556.506432,
+            2542.002269
+          ],
+          "source_summary": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/phase3/qwen/opencl-auto/summary.json",
+          "protocol": {
+            "architecture": "qwen3",
+            "prompt_tokens": 126,
+            "prefill_chunk": 32,
+            "decode_tokens": 128,
+            "passes": 2,
+            "warm_prompt_tokens": 32,
+            "warm_decode": 2,
+            "context": 254,
+            "backend": "opencl",
+            "resolved_backend": null,
+            "auto_placement": true,
+            "dense_device": "CPU",
+            "expert_device": "CPU"
+          },
+          "executable_sha256": "3071e50d272fe4a61fad5b25eafc0339acb258d1a1b0d119562adb143eb4a48a",
+          "after_session_host_memory_kib": [
+            {
+              "RssAnon": 263144,
+              "RssFile": 4713540,
+              "RssShmem": 0,
+              "VmRSS": 4976684,
+              "VmSwap": 0
+            },
+            {
+              "RssAnon": 263180,
+              "RssFile": 4713624,
+              "RssShmem": 0,
+              "VmRSS": 4976804,
+              "VmSwap": 0
+            }
+          ],
+          "after_session_driver_memory_bytes": [
+            {
+              "drm-resident-gtt": 6332416,
+              "drm-resident-stolen": 0,
+              "drm-resident-system": 0,
+              "drm-resident-vram0": 166182912,
+              "drm-total-gtt": 6332416,
+              "drm-total-stolen": 0,
+              "drm-total-system": 0,
+              "drm-total-vram0": 166182912
+            },
+            {
+              "drm-resident-gtt": 6332416,
+              "drm-resident-stolen": 0,
+              "drm-resident-system": 0,
+              "drm-resident-vram0": 166182912,
+              "drm-total-gtt": 6332416,
+              "drm-total-stolen": 0,
+              "drm-total-system": 0,
+              "drm-total-vram0": 166182912
+            }
+          ],
+          "allocator_stats_available": false,
+          "after_session_reserved_live": [
+            [
+              0,
+              0
+            ],
+            [
+              0,
+              0
+            ]
+          ],
+          "max_repeat_logit_difference": 0.0,
+          "decode_cpu_fallbacks": [
+            0,
+            0
+          ],
+          "prefill_cpu_fallbacks": [
+            0,
+            0
+          ]
+        },
+        {
+          "run": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/phase3/qwen/sycl-auto",
+          "logits_sha256": "d7b2d80cc46e4c2614f999da70300e2a1fc34cdb214296b8cb598ec4497ae4f8",
+          "bit_identical": false,
+          "backend": "sycl",
+          "auto_placement": true,
+          "max_abs_logit_difference": 0.00046825408935546875,
+          "rms_logit_difference": 3.230119460597598e-05,
+          "matching_top1_rows": 129,
+          "logits_compared": 19599744,
+          "decode_speedup_vs_reference": 0.9073261216038422,
+          "prefill_median_ms": 2563.9490800000003,
+          "session_median_ms": 28875.160498999994,
+          "session_speedup_vs_reference": 1.1546412136879598,
+          "private_growth_kib": 48,
+          "private_last_two_session_growth_kib": 48,
+          "peak_driver_vram_bytes": 479924224,
+          "decode_endpoint_driver_vram_bytes": [
+            404393984,
+            404393984
+          ],
+          "driver_vram_growth_bytes": 0,
+          "gates": {
+            "same_executable": true,
+            "absolute_logits_1e_5": false,
+            "repeat_logits_1e_5": true,
+            "reference_repeat_logits_1e_5": true,
+            "repeated_sessions_measured": true,
+            "reference_repeated_sessions_measured": true,
+            "reference_private_memory_growth_le_1MiB": true,
+            "same_greedy_choices": true,
+            "private_memory_growth_le_1MiB": true,
+            "device_memory_stable": true,
+            "reference_memory_stable": true,
+            "no_cpu_fallbacks": true
+          },
+          "eligible_for_auto": false,
+          "performance_gates": {
+            "all_decode_samples_faster": false,
+            "all_session_samples_faster": true
+          },
+          "eligible_for_auto_preference": false,
+          "decode_ms_per_token": [
+            205.94073285156247,
+            205.17194557031243
+          ],
+          "median_decode_ms_per_token": 205.55633921093744,
+          "prefill_ms": [
+            2562.379038,
+            2565.519122
+          ],
+          "source_summary": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/phase3/qwen/sycl-auto/summary.json",
+          "protocol": {
+            "architecture": "qwen3",
+            "prompt_tokens": 126,
+            "prefill_chunk": 32,
+            "decode_tokens": 128,
+            "passes": 2,
+            "warm_prompt_tokens": 32,
+            "warm_decode": 2,
+            "context": 254,
+            "backend": "sycl",
+            "resolved_backend": null,
+            "auto_placement": true,
+            "dense_device": "CPU",
+            "expert_device": "CPU"
+          },
+          "executable_sha256": "3071e50d272fe4a61fad5b25eafc0339acb258d1a1b0d119562adb143eb4a48a",
+          "after_session_host_memory_kib": [
+            {
+              "RssAnon": 364952,
+              "RssFile": 4771508,
+              "RssShmem": 0,
+              "VmRSS": 5136460,
+              "VmSwap": 0
+            },
+            {
+              "RssAnon": 365000,
+              "RssFile": 4771612,
+              "RssShmem": 0,
+              "VmRSS": 5136612,
+              "VmSwap": 0
+            }
+          ],
+          "after_session_driver_memory_bytes": [
+            {
+              "drm-resident-gtt": 27344896,
+              "drm-resident-stolen": 0,
+              "drm-resident-system": 0,
+              "drm-resident-vram0": 404393984,
+              "drm-total-gtt": 27344896,
+              "drm-total-stolen": 0,
+              "drm-total-system": 0,
+              "drm-total-vram0": 404393984
+            },
+            {
+              "drm-resident-gtt": 27344896,
+              "drm-resident-stolen": 0,
+              "drm-resident-system": 0,
+              "drm-resident-vram0": 404393984,
+              "drm-total-gtt": 27344896,
+              "drm-total-stolen": 0,
+              "drm-total-system": 0,
+              "drm-total-vram0": 404393984
+            }
+          ],
+          "allocator_stats_available": false,
+          "after_session_reserved_live": [
+            [
+              0,
+              0
+            ],
+            [
+              0,
+              0
+            ]
+          ],
+          "max_repeat_logit_difference": 0.0,
+          "decode_cpu_fallbacks": [
+            0,
+            0
+          ],
+          "prefill_cpu_fallbacks": [
+            0,
+            0
+          ]
+        }
+      ]
+    },
+    "legacy_multirow_qwen": {
+      "reference": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/phase2/qwen/vulkan-fixed",
+      "reference_logits_sha256": "6dc8975c3f955815fdbb88c4488bb37deced0ffcea5fb052b2b7f0e4b7c87c88",
+      "tolerance": 1e-05,
+      "runs": [
+        {
+          "run": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/phase2/qwen/vulkan-fixed",
+          "logits_sha256": "6dc8975c3f955815fdbb88c4488bb37deced0ffcea5fb052b2b7f0e4b7c87c88",
+          "bit_identical": true,
+          "backend": "vulkan",
+          "auto_placement": false,
+          "max_abs_logit_difference": 0.0,
+          "rms_logit_difference": 0.0,
+          "matching_top1_rows": 129,
+          "logits_compared": 19599744,
+          "decode_speedup_vs_reference": 1.0,
+          "prefill_median_ms": 9621.746052499999,
+          "session_median_ms": 33053.12267299999,
+          "session_speedup_vs_reference": 1.0,
+          "private_growth_kib": 0,
+          "private_last_two_session_growth_kib": 0,
+          "peak_driver_vram_bytes": 5268217856,
+          "decode_endpoint_driver_vram_bytes": [
+            5268217856,
+            5268217856
+          ],
+          "driver_vram_growth_bytes": 0,
+          "gates": {
+            "same_executable": true,
+            "absolute_logits_1e_5": true,
+            "repeat_logits_1e_5": true,
+            "reference_repeat_logits_1e_5": true,
+            "repeated_sessions_measured": true,
+            "reference_repeated_sessions_measured": true,
+            "reference_private_memory_growth_le_1MiB": true,
+            "same_greedy_choices": true,
+            "private_memory_growth_le_1MiB": true,
+            "device_memory_stable": true,
+            "reference_memory_stable": true,
+            "no_cpu_fallbacks": true
+          },
+          "eligible_for_auto": true,
+          "performance_gates": {
+            "all_decode_samples_faster": false,
+            "all_session_samples_faster": false
+          },
+          "eligible_for_auto_preference": false,
+          "decode_ms_per_token": [
+            182.0733465546875,
+            184.04191314062487
+          ],
+          "median_decode_ms_per_token": 183.0576298476562,
+          "prefill_ms": [
+            9613.957245,
+            9629.53486
+          ],
+          "source_summary": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/phase2/qwen/vulkan-fixed/summary.json",
+          "protocol": {
+            "architecture": "qwen3",
+            "prompt_tokens": 126,
+            "prefill_chunk": 32,
+            "decode_tokens": 128,
+            "passes": 2,
+            "warm_prompt_tokens": 32,
+            "warm_decode": 2,
+            "context": 254,
+            "backend": "vulkan",
+            "resolved_backend": null,
+            "auto_placement": false,
+            "dense_device": "Intel(R) Arc(tm) Pro B50 Graphics (BMG G21)",
+            "expert_device": "Intel(R) Arc(tm) Pro B50 Graphics (BMG G21)"
+          },
+          "executable_sha256": "d1005a71c61b42d2dcb09f480fb08198985a1fb96ee7241063babd83294c111b",
+          "after_session_host_memory_kib": [
+            {
+              "RssAnon": 166568,
+              "RssFile": 68528,
+              "RssShmem": 36,
+              "VmRSS": 235132,
+              "VmSwap": 0
+            },
+            {
+              "RssAnon": 166568,
+              "RssFile": 68656,
+              "RssShmem": 36,
+              "VmRSS": 235260,
+              "VmSwap": 0
+            }
+          ],
+          "after_session_driver_memory_bytes": [
+            {
+              "drm-resident-gtt": 2097152,
+              "drm-resident-stolen": 0,
+              "drm-resident-system": 0,
+              "drm-resident-vram0": 5268217856,
+              "drm-total-gtt": 2097152,
+              "drm-total-stolen": 0,
+              "drm-total-system": 0,
+              "drm-total-vram0": 5268217856
+            },
+            {
+              "drm-resident-gtt": 2097152,
+              "drm-resident-stolen": 0,
+              "drm-resident-system": 0,
+              "drm-resident-vram0": 5268217856,
+              "drm-total-gtt": 2097152,
+              "drm-total-stolen": 0,
+              "drm-total-system": 0,
+              "drm-total-vram0": 5268217856
+            }
+          ],
+          "allocator_stats_available": true,
+          "after_session_reserved_live": [
+            [
+              5227622400,
+              5042798592
+            ],
+            [
+              5227622400,
+              5042798592
+            ]
+          ],
+          "max_repeat_logit_difference": 0.0,
+          "decode_cpu_fallbacks": [
+            0,
+            0
+          ],
+          "prefill_cpu_fallbacks": [
+            0,
+            0
+          ]
+        },
+        {
+          "run": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/phase2/qwen/sycl-fixed",
+          "logits_sha256": "55bb654e8b1d3eb88b79e2e7f28fed800e0ae40eca771896c341d635b6ede92c",
+          "bit_identical": false,
+          "backend": "sycl",
+          "auto_placement": false,
+          "max_abs_logit_difference": 2.6702880859375e-05,
+          "rms_logit_difference": 1.8854438501224482e-06,
+          "matching_top1_rows": 129,
+          "logits_compared": 19599744,
+          "decode_speedup_vs_reference": 1.262117487748593,
+          "prefill_median_ms": 3676.2282575,
+          "session_median_ms": 22241.359355000008,
+          "session_speedup_vs_reference": 1.4861107248631107,
+          "private_growth_kib": 8,
+          "private_last_two_session_growth_kib": 8,
+          "peak_driver_vram_bytes": 5801549824,
+          "decode_endpoint_driver_vram_bytes": [
+            5668794368,
+            5667753984
+          ],
+          "driver_vram_growth_bytes": 0,
+          "gates": {
+            "same_executable": true,
+            "absolute_logits_1e_5": false,
+            "repeat_logits_1e_5": true,
+            "reference_repeat_logits_1e_5": true,
+            "repeated_sessions_measured": true,
+            "reference_repeated_sessions_measured": true,
+            "reference_private_memory_growth_le_1MiB": true,
+            "same_greedy_choices": true,
+            "private_memory_growth_le_1MiB": true,
+            "device_memory_stable": true,
+            "reference_memory_stable": true,
+            "no_cpu_fallbacks": true
+          },
+          "eligible_for_auto": false,
+          "performance_gates": {
+            "all_decode_samples_faster": true,
+            "all_session_samples_faster": true
+          },
+          "eligible_for_auto_preference": false,
+          "decode_ms_per_token": [
+            145.10703139843756,
+            144.97314200000005
+          ],
+          "median_decode_ms_per_token": 145.04008669921882,
+          "prefill_ms": [
+            3687.363742,
+            3665.092773
+          ],
+          "source_summary": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/phase2/qwen/sycl-fixed/summary.json",
+          "protocol": {
+            "architecture": "qwen3",
+            "prompt_tokens": 126,
+            "prefill_chunk": 32,
+            "decode_tokens": 128,
+            "passes": 2,
+            "warm_prompt_tokens": 32,
+            "warm_decode": 2,
+            "context": 254,
+            "backend": "sycl",
+            "resolved_backend": null,
+            "auto_placement": false,
+            "dense_device": "Intel(R) Arc(TM) Pro B50 Graphics",
+            "expert_device": "Intel(R) Arc(TM) Pro B50 Graphics"
+          },
+          "executable_sha256": "d1005a71c61b42d2dcb09f480fb08198985a1fb96ee7241063babd83294c111b",
+          "after_session_host_memory_kib": [
+            {
+              "RssAnon": 254108,
+              "RssFile": 196204,
+              "RssShmem": 0,
+              "VmRSS": 450312,
+              "VmSwap": 0
+            },
+            {
+              "RssAnon": 254116,
+              "RssFile": 196332,
+              "RssShmem": 0,
+              "VmRSS": 450448,
+              "VmSwap": 0
+            }
+          ],
+          "after_session_driver_memory_bytes": [
+            {
+              "drm-resident-gtt": 29442048,
+              "drm-resident-stolen": 0,
+              "drm-resident-system": 0,
+              "drm-resident-vram0": 5668794368,
+              "drm-total-gtt": 29442048,
+              "drm-total-stolen": 0,
+              "drm-total-system": 0,
+              "drm-total-vram0": 5668794368
+            },
+            {
+              "drm-resident-gtt": 29442048,
+              "drm-resident-stolen": 0,
+              "drm-resident-system": 0,
+              "drm-resident-vram0": 5667753984,
+              "drm-total-gtt": 29442048,
+              "drm-total-stolen": 0,
+              "drm-total-system": 0,
+              "drm-total-vram0": 5667753984
+            }
+          ],
+          "allocator_stats_available": false,
+          "after_session_reserved_live": [
+            [
+              0,
+              0
+            ],
+            [
+              0,
+              0
+            ]
+          ],
+          "max_repeat_logit_difference": 0.0,
+          "decode_cpu_fallbacks": [
+            0,
+            0
+          ],
+          "prefill_cpu_fallbacks": [
+            0,
+            0
+          ]
+        },
+        {
+          "run": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/phase2/qwen/opencl-auto",
+          "logits_sha256": "d7b2d80cc46e4c2614f999da70300e2a1fc34cdb214296b8cb598ec4497ae4f8",
+          "bit_identical": false,
+          "backend": "opencl",
+          "auto_placement": true,
+          "max_abs_logit_difference": 0.00046825408935546875,
+          "rms_logit_difference": 3.230119460597598e-05,
+          "matching_top1_rows": 129,
+          "logits_compared": 19599744,
+          "decode_speedup_vs_reference": 0.876733235682153,
+          "prefill_median_ms": 2638.6843165,
+          "session_median_ms": 29364.460945999992,
+          "session_speedup_vs_reference": 1.1256165312819224,
+          "private_growth_kib": 58356,
+          "private_last_two_session_growth_kib": 58356,
+          "peak_driver_vram_bytes": 166187008,
+          "decode_endpoint_driver_vram_bytes": [
+            166187008,
+            166187008
+          ],
+          "driver_vram_growth_bytes": 0,
+          "gates": {
+            "same_executable": true,
+            "absolute_logits_1e_5": false,
+            "repeat_logits_1e_5": true,
+            "reference_repeat_logits_1e_5": true,
+            "repeated_sessions_measured": true,
+            "reference_repeated_sessions_measured": true,
+            "reference_private_memory_growth_le_1MiB": true,
+            "same_greedy_choices": true,
+            "private_memory_growth_le_1MiB": false,
+            "device_memory_stable": true,
+            "reference_memory_stable": true,
+            "no_cpu_fallbacks": true
+          },
+          "eligible_for_auto": false,
+          "performance_gates": {
+            "all_decode_samples_faster": false,
+            "all_session_samples_faster": true
+          },
+          "eligible_for_auto_preference": false,
+          "decode_ms_per_token": [
+            209.08732842187487,
+            208.5029314140625
+          ],
+          "median_decode_ms_per_token": 208.79512991796867,
+          "prefill_ms": [
+            2695.636219,
+            2581.732414
+          ],
+          "source_summary": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/phase2/qwen/opencl-auto/summary.json",
+          "protocol": {
+            "architecture": "qwen3",
+            "prompt_tokens": 126,
+            "prefill_chunk": 32,
+            "decode_tokens": 128,
+            "passes": 2,
+            "warm_prompt_tokens": 32,
+            "warm_decode": 2,
+            "context": 254,
+            "backend": "opencl",
+            "resolved_backend": null,
+            "auto_placement": true,
+            "dense_device": "CPU",
+            "expert_device": "CPU"
+          },
+          "executable_sha256": "d1005a71c61b42d2dcb09f480fb08198985a1fb96ee7241063babd83294c111b",
+          "after_session_host_memory_kib": [
+            {
+              "RssAnon": 263128,
+              "RssFile": 4712532,
+              "RssShmem": 0,
+              "VmRSS": 4975660,
+              "VmSwap": 12
+            },
+            {
+              "RssAnon": 321484,
+              "RssFile": 4711812,
+              "RssShmem": 0,
+              "VmRSS": 5033296,
+              "VmSwap": 12
+            }
+          ],
+          "after_session_driver_memory_bytes": [
+            {
+              "drm-resident-gtt": 6307840,
+              "drm-resident-stolen": 0,
+              "drm-resident-system": 0,
+              "drm-resident-vram0": 166187008,
+              "drm-total-gtt": 6307840,
+              "drm-total-stolen": 0,
+              "drm-total-system": 24576,
+              "drm-total-vram0": 166187008
+            },
+            {
+              "drm-resident-gtt": 6307840,
+              "drm-resident-stolen": 0,
+              "drm-resident-system": 0,
+              "drm-resident-vram0": 166187008,
+              "drm-total-gtt": 6307840,
+              "drm-total-stolen": 0,
+              "drm-total-system": 24576,
+              "drm-total-vram0": 166187008
+            }
+          ],
+          "allocator_stats_available": false,
+          "after_session_reserved_live": [
+            [
+              0,
+              0
+            ],
+            [
+              0,
+              0
+            ]
+          ],
+          "max_repeat_logit_difference": 0.0,
+          "decode_cpu_fallbacks": [
+            0,
+            0
+          ],
+          "prefill_cpu_fallbacks": [
+            0,
+            0
+          ]
+        },
+        {
+          "run": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/phase2/qwen/sycl-auto",
+          "logits_sha256": "d7b2d80cc46e4c2614f999da70300e2a1fc34cdb214296b8cb598ec4497ae4f8",
+          "bit_identical": false,
+          "backend": "sycl",
+          "auto_placement": true,
+          "max_abs_logit_difference": 0.00046825408935546875,
+          "rms_logit_difference": 3.230119460597598e-05,
+          "matching_top1_rows": 129,
+          "logits_compared": 19599744,
+          "decode_speedup_vs_reference": 0.8899114141813278,
+          "prefill_median_ms": 2622.705123,
+          "session_median_ms": 28952.715332000003,
+          "session_speedup_vs_reference": 1.1416242757883235,
+          "private_growth_kib": 52,
+          "private_last_two_session_growth_kib": 52,
+          "peak_driver_vram_bytes": 479928320,
+          "decode_endpoint_driver_vram_bytes": [
+            404398080,
+            404398080
+          ],
+          "driver_vram_growth_bytes": 0,
+          "gates": {
+            "same_executable": true,
+            "absolute_logits_1e_5": false,
+            "repeat_logits_1e_5": true,
+            "reference_repeat_logits_1e_5": true,
+            "repeated_sessions_measured": true,
+            "reference_repeated_sessions_measured": true,
+            "reference_private_memory_growth_le_1MiB": true,
+            "same_greedy_choices": true,
+            "private_memory_growth_le_1MiB": true,
+            "device_memory_stable": true,
+            "reference_memory_stable": true,
+            "no_cpu_fallbacks": true
+          },
+          "eligible_for_auto": false,
+          "performance_gates": {
+            "all_decode_samples_faster": false,
+            "all_session_samples_faster": true
+          },
+          "eligible_for_auto_preference": false,
+          "decode_ms_per_token": [
+            205.39398543749996,
+            206.0124240781251
+          ],
+          "median_decode_ms_per_token": 205.70320475781253,
+          "prefill_ms": [
+            2618.0638630000003,
+            2627.346383
+          ],
+          "source_summary": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/phase2/qwen/sycl-auto/summary.json",
+          "protocol": {
+            "architecture": "qwen3",
+            "prompt_tokens": 126,
+            "prefill_chunk": 32,
+            "decode_tokens": 128,
+            "passes": 2,
+            "warm_prompt_tokens": 32,
+            "warm_decode": 2,
+            "context": 254,
+            "backend": "sycl",
+            "resolved_backend": null,
+            "auto_placement": true,
+            "dense_device": "CPU",
+            "expert_device": "CPU"
+          },
+          "executable_sha256": "d1005a71c61b42d2dcb09f480fb08198985a1fb96ee7241063babd83294c111b",
+          "after_session_host_memory_kib": [
+            {
+              "RssAnon": 364952,
+              "RssFile": 4769644,
+              "RssShmem": 0,
+              "VmRSS": 5134596,
+              "VmSwap": 0
+            },
+            {
+              "RssAnon": 365004,
+              "RssFile": 4769708,
+              "RssShmem": 0,
+              "VmRSS": 5134712,
+              "VmSwap": 0
+            }
+          ],
+          "after_session_driver_memory_bytes": [
+            {
+              "drm-resident-gtt": 27344896,
+              "drm-resident-stolen": 0,
+              "drm-resident-system": 0,
+              "drm-resident-vram0": 404398080,
+              "drm-total-gtt": 27344896,
+              "drm-total-stolen": 0,
+              "drm-total-system": 0,
+              "drm-total-vram0": 404398080
+            },
+            {
+              "drm-resident-gtt": 27344896,
+              "drm-resident-stolen": 0,
+              "drm-resident-system": 0,
+              "drm-resident-vram0": 404398080,
+              "drm-total-gtt": 27344896,
+              "drm-total-stolen": 0,
+              "drm-total-system": 0,
+              "drm-total-vram0": 404398080
+            }
+          ],
+          "allocator_stats_available": false,
+          "after_session_reserved_live": [
+            [
+              0,
+              0
+            ],
+            [
+              0,
+              0
+            ]
+          ],
+          "max_repeat_logit_difference": 0.0,
+          "decode_cpu_fallbacks": [
+            0,
+            0
+          ],
+          "prefill_cpu_fallbacks": [
+            0,
+            0
+          ]
+        }
+      ]
+    },
+    "first_ordered64_qwen": {
+      "reference": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/full/qwen/vulkan-fixed",
+      "reference_logits_sha256": "6dc8975c3f955815fdbb88c4488bb37deced0ffcea5fb052b2b7f0e4b7c87c88",
+      "tolerance": 1e-05,
+      "runs": [
+        {
+          "run": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/full/qwen/vulkan-fixed",
+          "logits_sha256": "6dc8975c3f955815fdbb88c4488bb37deced0ffcea5fb052b2b7f0e4b7c87c88",
+          "bit_identical": true,
+          "backend": "vulkan",
+          "auto_placement": false,
+          "max_abs_logit_difference": 0.0,
+          "rms_logit_difference": 0.0,
+          "matching_top1_rows": 129,
+          "logits_compared": 19599744,
+          "decode_speedup_vs_reference": 1.0,
+          "prefill_median_ms": 9899.8379825,
+          "session_median_ms": 34921.509604000006,
+          "session_speedup_vs_reference": 1.0,
+          "private_growth_kib": 0,
+          "private_last_two_session_growth_kib": 0,
+          "peak_driver_vram_bytes": 5268217856,
+          "decode_endpoint_driver_vram_bytes": [
+            5268217856,
+            5268217856
+          ],
+          "driver_vram_growth_bytes": 0,
+          "gates": {
+            "same_executable": true,
+            "absolute_logits_1e_5": true,
+            "repeat_logits_1e_5": true,
+            "reference_repeat_logits_1e_5": true,
+            "repeated_sessions_measured": true,
+            "reference_repeated_sessions_measured": true,
+            "reference_private_memory_growth_le_1MiB": true,
+            "same_greedy_choices": true,
+            "private_memory_growth_le_1MiB": true,
+            "device_memory_stable": true,
+            "reference_memory_stable": true,
+            "no_cpu_fallbacks": true
+          },
+          "eligible_for_auto": true,
+          "performance_gates": {
+            "all_decode_samples_faster": false,
+            "all_session_samples_faster": false
+          },
+          "eligible_for_auto_preference": false,
+          "decode_ms_per_token": [
+            193.68612460937504,
+            197.27749447656254
+          ],
+          "median_decode_ms_per_token": 195.4818095429688,
+          "prefill_ms": [
+            9830.291435,
+            9969.38453
+          ],
+          "source_summary": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/full/qwen/vulkan-fixed/summary.json",
+          "protocol": {
+            "architecture": "qwen3",
+            "prompt_tokens": 126,
+            "prefill_chunk": 32,
+            "decode_tokens": 128,
+            "passes": 2,
+            "warm_prompt_tokens": 32,
+            "warm_decode": 2,
+            "context": 254,
+            "backend": "vulkan",
+            "resolved_backend": null,
+            "auto_placement": false,
+            "dense_device": "Intel(R) Arc(tm) Pro B50 Graphics (BMG G21)",
+            "expert_device": "Intel(R) Arc(tm) Pro B50 Graphics (BMG G21)"
+          },
+          "executable_sha256": "24a93bdaa66b44901599d5a2a269cdfde8c7c309eab654f35fb2270ea9bb3156",
+          "after_session_host_memory_kib": [
+            {
+              "RssAnon": 166252,
+              "RssFile": 68952,
+              "RssShmem": 36,
+              "VmRSS": 235240,
+              "VmSwap": 0
+            },
+            {
+              "RssAnon": 166252,
+              "RssFile": 69080,
+              "RssShmem": 36,
+              "VmRSS": 235368,
+              "VmSwap": 0
+            }
+          ],
+          "after_session_driver_memory_bytes": [
+            {
+              "drm-resident-gtt": 2097152,
+              "drm-resident-stolen": 0,
+              "drm-resident-system": 0,
+              "drm-resident-vram0": 5268217856,
+              "drm-total-gtt": 2097152,
+              "drm-total-stolen": 0,
+              "drm-total-system": 0,
+              "drm-total-vram0": 5268217856
+            },
+            {
+              "drm-resident-gtt": 2097152,
+              "drm-resident-stolen": 0,
+              "drm-resident-system": 0,
+              "drm-resident-vram0": 5268217856,
+              "drm-total-gtt": 2097152,
+              "drm-total-stolen": 0,
+              "drm-total-system": 0,
+              "drm-total-vram0": 5268217856
+            }
+          ],
+          "allocator_stats_available": true,
+          "after_session_reserved_live": [
+            [
+              5227622400,
+              5042798592
+            ],
+            [
+              5227622400,
+              5042798592
+            ]
+          ],
+          "max_repeat_logit_difference": 0.0,
+          "decode_cpu_fallbacks": [
+            0,
+            0
+          ],
+          "prefill_cpu_fallbacks": [
+            0,
+            0
+          ]
+        },
+        {
+          "run": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/full/qwen/sycl-fixed",
+          "logits_sha256": "6dc8975c3f955815fdbb88c4488bb37deced0ffcea5fb052b2b7f0e4b7c87c88",
+          "bit_identical": true,
+          "backend": "sycl",
+          "auto_placement": false,
+          "max_abs_logit_difference": 0.0,
+          "rms_logit_difference": 0.0,
+          "matching_top1_rows": 129,
+          "logits_compared": 19599744,
+          "decode_speedup_vs_reference": 1.1608463998208185,
+          "prefill_median_ms": 3730.5951925,
+          "session_median_ms": 25285.274283000006,
+          "session_speedup_vs_reference": 1.3811006838663684,
+          "private_growth_kib": 20,
+          "private_last_two_session_growth_kib": 20,
+          "peak_driver_vram_bytes": 5801492480,
+          "decode_endpoint_driver_vram_bytes": [
+            5668737024,
+            5667696640
+          ],
+          "driver_vram_growth_bytes": 0,
+          "gates": {
+            "same_executable": true,
+            "absolute_logits_1e_5": true,
+            "repeat_logits_1e_5": true,
+            "reference_repeat_logits_1e_5": true,
+            "repeated_sessions_measured": true,
+            "reference_repeated_sessions_measured": true,
+            "reference_private_memory_growth_le_1MiB": true,
+            "same_greedy_choices": true,
+            "private_memory_growth_le_1MiB": true,
+            "device_memory_stable": true,
+            "reference_memory_stable": true,
+            "no_cpu_fallbacks": true
+          },
+          "eligible_for_auto": true,
+          "performance_gates": {
+            "all_decode_samples_faster": true,
+            "all_session_samples_faster": true
+          },
+          "eligible_for_auto_preference": true,
+          "decode_ms_per_token": [
+            168.92257497656252,
+            167.86928581250007
+          ],
+          "median_decode_ms_per_token": 168.3959303945313,
+          "prefill_ms": [
+            3791.041356,
+            3670.149029
+          ],
+          "source_summary": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/full/qwen/sycl-fixed/summary.json",
+          "protocol": {
+            "architecture": "qwen3",
+            "prompt_tokens": 126,
+            "prefill_chunk": 32,
+            "decode_tokens": 128,
+            "passes": 2,
+            "warm_prompt_tokens": 32,
+            "warm_decode": 2,
+            "context": 254,
+            "backend": "sycl",
+            "resolved_backend": null,
+            "auto_placement": false,
+            "dense_device": "Intel(R) Arc(TM) Pro B50 Graphics",
+            "expert_device": "Intel(R) Arc(TM) Pro B50 Graphics"
+          },
+          "executable_sha256": "24a93bdaa66b44901599d5a2a269cdfde8c7c309eab654f35fb2270ea9bb3156",
+          "after_session_host_memory_kib": [
+            {
+              "RssAnon": 254316,
+              "RssFile": 199496,
+              "RssShmem": 0,
+              "VmRSS": 453812,
+              "VmSwap": 0
+            },
+            {
+              "RssAnon": 254336,
+              "RssFile": 199576,
+              "RssShmem": 0,
+              "VmRSS": 453912,
+              "VmSwap": 0
+            }
+          ],
+          "after_session_driver_memory_bytes": [
+            {
+              "drm-resident-gtt": 25182208,
+              "drm-resident-stolen": 0,
+              "drm-resident-system": 0,
+              "drm-resident-vram0": 5668737024,
+              "drm-total-gtt": 25182208,
+              "drm-total-stolen": 0,
+              "drm-total-system": 4259840,
+              "drm-total-vram0": 5668737024
+            },
+            {
+              "drm-resident-gtt": 25182208,
+              "drm-resident-stolen": 0,
+              "drm-resident-system": 0,
+              "drm-resident-vram0": 5667696640,
+              "drm-total-gtt": 25182208,
+              "drm-total-stolen": 0,
+              "drm-total-system": 4259840,
+              "drm-total-vram0": 5667696640
+            }
+          ],
+          "allocator_stats_available": false,
+          "after_session_reserved_live": [
+            [
+              0,
+              0
+            ],
+            [
+              0,
+              0
+            ]
+          ],
+          "max_repeat_logit_difference": 0.0,
+          "decode_cpu_fallbacks": [
+            0,
+            0
+          ],
+          "prefill_cpu_fallbacks": [
+            0,
+            0
+          ]
+        }
+      ]
+    },
+    "cpu_rms_tree_and_original_cpu_control": {
+      "reference": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/full/deepseek/vulkan-fixed",
+      "reference_logits_sha256": "ab6fb262586daa5d1a3ea4baa89d1ef5b8afce4ee2b6750306357ff8f0892333",
+      "tolerance": 1e-05,
+      "runs": [
+        {
+          "run": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/full/deepseek/vulkan-fixed",
+          "logits_sha256": "ab6fb262586daa5d1a3ea4baa89d1ef5b8afce4ee2b6750306357ff8f0892333",
+          "bit_identical": true,
+          "backend": "vulkan",
+          "auto_placement": false,
+          "max_abs_logit_difference": 0.0,
+          "rms_logit_difference": 0.0,
+          "matching_top1_rows": 129,
+          "logits_compared": 16677120,
+          "decode_speedup_vs_reference": 1.0,
+          "prefill_median_ms": 46468.181329499996,
+          "session_median_ms": 153311.24418049998,
+          "session_speedup_vs_reference": 1.0,
+          "private_growth_kib": 32,
+          "private_last_two_session_growth_kib": 32,
+          "peak_driver_vram_bytes": 9404608512,
+          "decode_endpoint_driver_vram_bytes": [
+            9404608512,
+            9404608512
+          ],
+          "driver_vram_growth_bytes": 0,
+          "gates": {
+            "same_executable": true,
+            "absolute_logits_1e_5": true,
+            "repeat_logits_1e_5": true,
+            "reference_repeat_logits_1e_5": true,
+            "repeated_sessions_measured": true,
+            "reference_repeated_sessions_measured": true,
+            "reference_private_memory_growth_le_1MiB": true,
+            "same_greedy_choices": true,
+            "private_memory_growth_le_1MiB": true,
+            "device_memory_stable": true,
+            "reference_memory_stable": true,
+            "no_cpu_fallbacks": true
+          },
+          "eligible_for_auto": true,
+          "performance_gates": {
+            "all_decode_samples_faster": false,
+            "all_session_samples_faster": false
+          },
+          "eligible_for_auto_preference": false,
+          "decode_ms_per_token": [
+            852.1943015546874,
+            817.2285554921875
+          ],
+          "median_decode_ms_per_token": 834.7114285234375,
+          "prefill_ms": [
+            49145.702385,
+            43790.660273999994
+          ],
+          "source_summary": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/full/deepseek/vulkan-fixed/summary.json",
+          "protocol": {
+            "architecture": "deepseek41",
+            "prompt_tokens": 121,
+            "prefill_chunk": 32,
+            "decode_tokens": 128,
+            "passes": 2,
+            "warm_prompt_tokens": 8,
+            "warm_decode": 2,
+            "context": 249,
+            "backend": "vulkan",
+            "resolved_backend": null,
+            "auto_placement": false,
+            "dense_device": "Intel(R) Arc(tm) Pro B50 Graphics (BMG G21)",
+            "expert_device": "CPU"
+          },
+          "executable_sha256": "24a93bdaa66b44901599d5a2a269cdfde8c7c309eab654f35fb2270ea9bb3156",
+          "after_session_host_memory_kib": [
+            {
+              "RssAnon": 75464,
+              "RssFile": 64113068,
+              "RssShmem": 24,
+              "VmRSS": 64188556,
+              "VmSwap": 114228
+            },
+            {
+              "RssAnon": 90816,
+              "RssFile": 70668596,
+              "RssShmem": 24,
+              "VmRSS": 70759436,
+              "VmSwap": 98908
+            }
+          ],
+          "after_session_driver_memory_bytes": [
+            {
+              "drm-resident-gtt": 2097152,
+              "drm-resident-stolen": 0,
+              "drm-resident-system": 0,
+              "drm-resident-vram0": 9404608512,
+              "drm-total-gtt": 2097152,
+              "drm-total-stolen": 0,
+              "drm-total-system": 0,
+              "drm-total-vram0": 9404608512
+            },
+            {
+              "drm-resident-gtt": 2097152,
+              "drm-resident-stolen": 0,
+              "drm-resident-system": 0,
+              "drm-resident-vram0": 9404608512,
+              "drm-total-gtt": 2097152,
+              "drm-total-stolen": 0,
+              "drm-total-system": 0,
+              "drm-total-vram0": 9404608512
+            }
+          ],
+          "allocator_stats_available": true,
+          "after_session_reserved_live": [
+            [
+              9365831680,
+              9224831488
+            ],
+            [
+              9365831680,
+              9224831488
+            ]
+          ],
+          "max_repeat_logit_difference": 0.0,
+          "decode_cpu_fallbacks": [
+            0,
+            0
+          ],
+          "prefill_cpu_fallbacks": [
+            0,
+            0
+          ]
+        },
+        {
+          "run": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/full/deepseek/cpu-fixed",
+          "logits_sha256": "be41f6930b24ace51421b57bb9f7ee399ed28a668786a3fd9c3f62d55d5f9023",
+          "bit_identical": false,
+          "backend": "cpu",
+          "auto_placement": false,
+          "max_abs_logit_difference": 3.752955913543701,
+          "rms_logit_difference": 0.1830332630233574,
+          "matching_top1_rows": 123,
+          "logits_compared": 16677120,
+          "decode_speedup_vs_reference": 1.1873658579273163,
+          "prefill_median_ms": 31987.166804,
+          "session_median_ms": 121970.43702999997,
+          "session_speedup_vs_reference": 1.2569541268659339,
+          "private_growth_kib": 388,
+          "private_last_two_session_growth_kib": 388,
+          "peak_driver_vram_bytes": null,
+          "decode_endpoint_driver_vram_bytes": null,
+          "driver_vram_growth_bytes": 0,
+          "gates": {
+            "same_executable": true,
+            "absolute_logits_1e_5": false,
+            "repeat_logits_1e_5": true,
+            "reference_repeat_logits_1e_5": true,
+            "repeated_sessions_measured": true,
+            "reference_repeated_sessions_measured": true,
+            "reference_private_memory_growth_le_1MiB": true,
+            "same_greedy_choices": false,
+            "private_memory_growth_le_1MiB": true,
+            "device_memory_stable": true,
+            "reference_memory_stable": true,
+            "no_cpu_fallbacks": true
+          },
+          "eligible_for_auto": false,
+          "performance_gates": {
+            "all_decode_samples_faster": true,
+            "all_session_samples_faster": true
+          },
+          "eligible_for_auto_preference": false,
+          "decode_ms_per_token": [
+            707.2003804218749,
+            698.7882168593748
+          ],
+          "median_decode_ms_per_token": 702.9942986406248,
+          "prefill_ms": [
+            32124.569071,
+            31849.764537
+          ],
+          "source_summary": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/full/deepseek/cpu-fixed/summary.json",
+          "protocol": {
+            "architecture": "deepseek41",
+            "prompt_tokens": 121,
+            "prefill_chunk": 32,
+            "decode_tokens": 128,
+            "passes": 2,
+            "warm_prompt_tokens": 8,
+            "warm_decode": 2,
+            "context": 249,
+            "backend": "cpu",
+            "resolved_backend": null,
+            "auto_placement": false,
+            "dense_device": "CPU",
+            "expert_device": "CPU"
+          },
+          "executable_sha256": "24a93bdaa66b44901599d5a2a269cdfde8c7c309eab654f35fb2270ea9bb3156",
+          "after_session_host_memory_kib": [
+            {
+              "RssAnon": 297716,
+              "RssFile": 73101288,
+              "RssShmem": 0,
+              "VmRSS": 73399004,
+              "VmSwap": 330768
+            },
+            {
+              "RssAnon": 310496,
+              "RssFile": 72959844,
+              "RssShmem": 0,
+              "VmRSS": 73270340,
+              "VmSwap": 318376
+            }
+          ],
+          "after_session_driver_memory_bytes": [
+            {},
+            {}
+          ],
+          "allocator_stats_available": false,
+          "after_session_reserved_live": [
+            [
+              0,
+              0
+            ],
+            [
+              0,
+              0
+            ]
+          ],
+          "max_repeat_logit_difference": 0.0,
+          "decode_cpu_fallbacks": [
+            0,
+            0
+          ],
+          "prefill_cpu_fallbacks": [
+            0,
+            0
+          ]
+        },
+        {
+          "run": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/full/deepseek/cpu-baseline",
+          "logits_sha256": "0d49ebe3431065cd36c32d589da1beb095158b02878f5df05f69fa3296fb54ff",
+          "bit_identical": false,
+          "backend": "cpu",
+          "auto_placement": false,
+          "max_abs_logit_difference": 0.00031375885009765625,
+          "rms_logit_difference": 2.4775590018555757e-05,
+          "matching_top1_rows": 129,
+          "logits_compared": 16677120,
+          "decode_speedup_vs_reference": 1.1821177654612043,
+          "prefill_median_ms": 35491.986833999996,
+          "session_median_ms": 125874.74392700002,
+          "session_speedup_vs_reference": 1.2179666817786063,
+          "private_growth_kib": 2084,
+          "private_last_two_session_growth_kib": 2084,
+          "peak_driver_vram_bytes": null,
+          "decode_endpoint_driver_vram_bytes": null,
+          "driver_vram_growth_bytes": 0,
+          "gates": {
+            "same_executable": true,
+            "absolute_logits_1e_5": false,
+            "repeat_logits_1e_5": true,
+            "reference_repeat_logits_1e_5": true,
+            "repeated_sessions_measured": true,
+            "reference_repeated_sessions_measured": true,
+            "reference_private_memory_growth_le_1MiB": true,
+            "same_greedy_choices": true,
+            "private_memory_growth_le_1MiB": false,
+            "device_memory_stable": true,
+            "reference_memory_stable": true,
+            "no_cpu_fallbacks": true
+          },
+          "eligible_for_auto": false,
+          "performance_gates": {
+            "all_decode_samples_faster": true,
+            "all_session_samples_faster": true
+          },
+          "eligible_for_auto_preference": false,
+          "decode_ms_per_token": [
+            716.6829476093751,
+            695.5476319687502
+          ],
+          "median_decode_ms_per_token": 706.1152897890627,
+          "prefill_ms": [
+            38231.463444,
+            32752.510223999998
+          ],
+          "source_summary": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/full/deepseek/cpu-baseline/summary.json",
+          "protocol": {
+            "architecture": "deepseek41",
+            "prompt_tokens": 121,
+            "prefill_chunk": 32,
+            "decode_tokens": 128,
+            "passes": 2,
+            "warm_prompt_tokens": 8,
+            "warm_decode": 2,
+            "context": 249,
+            "backend": "cpu",
+            "resolved_backend": null,
+            "auto_placement": false,
+            "dense_device": "CPU",
+            "expert_device": "CPU"
+          },
+          "executable_sha256": "24a93bdaa66b44901599d5a2a269cdfde8c7c309eab654f35fb2270ea9bb3156",
+          "after_session_host_memory_kib": [
+            {
+              "RssAnon": 315944,
+              "RssFile": 69776256,
+              "RssShmem": 0,
+              "VmRSS": 70092200,
+              "VmSwap": 313040
+            },
+            {
+              "RssAnon": 305620,
+              "RssFile": 72783028,
+              "RssShmem": 0,
+              "VmRSS": 73088648,
+              "VmSwap": 325448
+            }
+          ],
+          "after_session_driver_memory_bytes": [
+            {},
+            {}
+          ],
+          "allocator_stats_available": false,
+          "after_session_reserved_live": [
+            [
+              0,
+              0
+            ],
+            [
+              0,
+              0
+            ]
+          ],
+          "max_repeat_logit_difference": 0.0,
+          "decode_cpu_fallbacks": [
+            0,
+            0
+          ],
+          "prefill_cpu_fallbacks": [
+            0,
+            0
+          ]
+        }
+      ]
+    },
+    "compatibility_modes_eight_tokens": [
+      {
+        "folder": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/canonical-q8-fma/eight-cpu",
+        "max_abs": 4.5299530029296875e-05,
+        "absolute_1e_5": false,
+        "canonical_q8": true,
+        "canonical_hc": false,
+        "canonical_rms": false
+      },
+      {
+        "folder": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/canonical-q8-fma/eight-hc",
+        "max_abs": 4.4226646423339844e-05,
+        "absolute_1e_5": false,
+        "canonical_q8": true,
+        "canonical_hc": true,
+        "canonical_rms": false
+      },
+      {
+        "folder": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/canonical-q8-fma/eight-rms",
+        "max_abs": 5.054473876953125e-05,
+        "absolute_1e_5": false,
+        "canonical_q8": true,
+        "canonical_hc": false,
+        "canonical_rms": true
+      },
+      {
+        "folder": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/canonical-q8-fma/eight-hc-rms",
+        "max_abs": 4.1961669921875e-05,
+        "absolute_1e_5": false,
+        "canonical_q8": true,
+        "canonical_hc": true,
+        "canonical_rms": true
+      }
+    ],
+    "rope_fma_eight_tokens": {
+      "max_abs": 4.124641418457031e-05,
+      "absolute_1e_5": false,
+      "raw": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/rope-fma/eight-cpu"
+    },
+    "fused_hc_rms_eight_tokens": {
+      "max_abs": 3.8623809814453125e-05,
+      "absolute_1e_5": false,
+      "raw": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/rope-fma/eight-cpu-fused"
+    },
+    "compatibility_modes_in_production": false,
+    "raw_experimental_patch": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/all-cpu-compatibility-experiments.patch",
+    "scalar_libm_replay_aborted": {
+      "diagnostic_only": true,
+      "reason": "Scalar replay emits one library FMA call per element; stop before performance certification and rebuild with a checked hardware FMA target. Isolated same-input Q8 projection was bit-identical across 32768 outputs.",
+      "discarded_measured_certification_sessions": 0
+    },
+    "diagnostic_capture_timings": "Excluded from speed/memory certification; no failed measured certification sessions discarded"
+  },
+  "manifests": {
+    "profile": {
+      "binary_sha256": "5d37260d3762d0e5920d8a5ed37fae0761f0fff2cda9e0bfe5f3dd84f0db6ce2",
+      "bridge_sha256": "abc40f833217381b88202c668aa04aa0b798ff65422d2ccafd6186506b945fb0",
+      "shape_profile": {
+        "model": "Qwen3-8B Q4_K_M",
+        "max_context": 254,
+        "max_prefill_chunk": 32,
+        "pci_id": "8086:E212",
+        "numerics_version": 1
+      }
+    },
+    "clean_math": {
+      "binary_sha256": "761ce4dacb63c986def85623e067a98a88d20ba07fd166fad72309e11e26ad8d",
+      "bridge_sha256": "abc40f833217381b88202c668aa04aa0b798ff65422d2ccafd6186506b945fb0",
+      "cpu_compatibility_experiments_removed": true,
+      "rope": "host f64 phase and trigonometry; round once to f32",
+      "cpu_rms": "f64 accumulation, variance and scaling"
+    },
+    "deepseek_f64": {
+      "binary_sha256": "26e9ecf4de8c1e96c0278128fd20b90c80d6f9f050e0cefe5d58bb6dbeb861e3",
+      "source_sha256": {
+        "src/attention.rs": "602f8faa752344a1384c7ce0d8bfba76bb11aff23a9bd014629203ab60b1319e",
+        "src/mhc.rs": "916ce28765e9172bd1e4bb122d716b7325d0eba53e3e5295c1cd055cc33a6377",
+        "src/activation_trace.rs": "4d11c185a97572083cd10e5cfa02039c724f504fe17a2b0eb7e6f376dd23b158",
+        "vendor/candle-nn/src/ops.rs": "2046af87c6111ca8416ba3d0a499277814c301b057e7a40ec8a791b3dcd2f49c"
+      }
+    },
+    "original_reference": {
+      "git_head": "6e5da96bab730147ab9844ddba425310d288c0e6",
+      "binary_sha256": "e572c4d75d0c4ecaa000e85b0189ec35ed952f5ec2cdfd9206cf4218f9e63146",
+      "bridge_sha256": "abc40f833217381b88202c668aa04aa0b798ff65422d2ccafd6186506b945fb0",
+      "probe_sha256": "a1465d6683479fb979aa4b0b78faff7b7102ac58ccfcef108944acd5d5f03ef9",
+      "source_sha256": {
+        "src/attention.rs": "d8a16f62799902752fad9cff5774ec29d41c3f8218a02443145d400859dfeaca",
+        "src/mhc.rs": "6932f74ae18206396afa86373f508b8a00977ed678c70028d65630e73a54ef06",
+        "src/activation_trace.rs": "809fb014cccb472af009239d8239f3f3ec4f7955d9dcecc8e9335a62350d7620",
+        "src/quantized_qwen.rs": "a326a1bb25c02a2728f2cac472441d38ddf1bbd458362e3646d20e6d3f0d1b7e",
+        "src/quantized_deepseek4.rs": "4ab9db0be99a8e530727743819cc0d266eb723c724fe331d9a335b702ef82e69",
+        "src/engine.rs": "40e7b178a1c43fdf180f41b54fadcbcbf29fe9ea5be4d872e886a4cda231b586",
+        "src/auto_placement.rs": "7c2809593e0928b8b517f15ca92ecf660fa00ec274683e747ed3eb59e094e5a5",
+        "vendor/candle-core/src/sycl_backend/kernels.hpp": "a3c5e60af2b761ee6249be33150a2e2711678f76414afe40ab536fdbd4b7d72c",
+        "vendor/candle-core/src/sycl_backend/bridge.rs": "4908b4dc7df686cc1856330f149b05f5baf0ab64b4984745885b13124148042f",
+        "vendor/candle-core/src/sycl_backend/bridge.cpp": "51769537e33c9419f3d57ef38746b02289b2a173acec4d8483d2508c873fe53f",
+        "vendor/candle-core/src/sycl_backend/dispatch.inc": "367b2cb499a742a44af092bbf8482382ac0c057f699e8ab5693cc308c10708be",
+        "vendor/candle-core/src/sycl_backend/mod.rs": "60f6bc73d29fd72829bc66d97599dd239d3f2cf1c58d92a7dff13b8305bf92e0",
+        "vendor/candle-core/src/sycl_backend/kernels.rs": "01e2f8cb79b0925758a2966e1d6a2ecd261015b48e26ebed4fd3f2afbdf06f7c",
+        "vendor/candle-nn/src/ops.rs": "4dbdfdb10b03c7d22f040f8278286ea6bc4aeddba1b4589d822426eb81374995",
+        "tests/sycl_vulkan_parity_tests.rs": "282adf0f5f978a5fbf007c401d984b7e63bac3ba5c05caa655f895b12994f208",
+        "examples/bench_cubecl_real.rs": "335e2c057744f572a8d1018a57e0feb02acc21978d55c75383e2b4acdbca4eb2",
+        "examples/backend_numerics.rs": "f1b5ab42c348f20f1b2e9f421e19388dad3f8e3621f34054ae1540550739ac9e"
+      },
+      "activation_capture": false,
+      "cpu_experiments_enabled": false,
+      "sycl_physical_threads": 64,
+      "logical_reduction_lanes": 256,
+      "compiler_default_optimization": "icpx -### reports -O2"
+    }
+  },
+  "verification": {
+    "logs": {
+      "cleanup-attention": {
+        "path": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/cleanup-attention.log",
+        "summaries": [
+          "test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 418 filtered out; finished in 0.50s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+        ],
+        "failure_marker": false
+      },
+      "cleanup-integration": {
+        "path": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/cleanup-integration.log",
+        "summaries": [
+          "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.51s",
+          "test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.65s",
+          "test result: ok. 22 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 9.01s",
+          "test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.49s",
+          "test result: ok. 2 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.01s",
+          "test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s",
+          "test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.58s",
+          "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s"
+        ],
+        "failure_marker": false
+      },
+      "cleanup-bridge-tests": {
+        "path": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/cleanup-bridge-tests.log",
+        "summaries": [
+          "test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.59s",
+          "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s",
+          "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s"
+        ],
+        "failure_marker": false
+      },
+      "profile-unit": {
+        "path": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/profile-unit.log",
+        "summaries": [
+          "test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 413 filtered out; finished in 0.06s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+        ],
+        "failure_marker": false
+      },
+      "profile-engine-tests": {
+        "path": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/profile-engine-tests.log",
+        "summaries": [
+          "test result: ok. 54 passed; 0 failed; 2 ignored; 0 measured; 370 filtered out; finished in 0.10s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+        ],
+        "failure_marker": false
+      },
+      "profile-integration": {
+        "path": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/profile-integration.log",
+        "summaries": [
+          "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.62s",
+          "test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.55s",
+          "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s",
+          "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s"
+        ],
+        "failure_marker": false
+      },
+      "profile-budget-tests": {
+        "path": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/profile-budget-tests.log",
+        "summaries": [
+          "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s",
+          "test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.53s"
+        ],
+        "failure_marker": false
+      },
+      "final-legacy-bridge": {
+        "path": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/final-legacy-bridge.log",
+        "summaries": [
+          "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s"
+        ],
+        "failure_marker": false
+      }
+    },
+    "cpu_compatibility_experiments_removed": true,
+    "emulator_build": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/cleanup-emu.log",
+    "default_build_check": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/default-build-check.log",
+    "same_executable_for_each_full_model_comparison": true,
+    "same_teacher_forced_inputs": true,
+    "memory_limits": {
+      "private_endpoint_spread_kib": 1024,
+      "driver_vram_growth_bytes": 1048576
+    },
+    "sycl_zero_allocator_counters": "Unavailable placeholders; driver/private memory, not zeros, determine eligibility"
+  },
+  "post_checkpoint_diagnostics": {
+    "raw_source_patch": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/post-checkpoint-arithmetic-experiments.patch",
+    "production_arithmetic_changes_retained": false,
+    "full_model_gate_or_auto_decision_changed": false,
+    "notes": [
+      "Opt-in CPU Q8 and 20480-wide HC arithmetic replay modes, fused HC RMS, CPU RoPE FMA and refined Vulkan scalar RMS were investigated and removed after failing strict model parity.",
+      "Vulkan quantized projections switch above 16 rows from 32-element dot/tree GEMV to sequential GEMM. Replaying this order makes the same-input batch-32 Q8 KV projection bit-identical.",
+      "The original precise-rms shader used unsupported GLSL precise syntax and fell back to CPU. Those results are invalid GPU arithmetic evidence. The initial fp64-rms literal was also rejected; trace-probe.log records that error. The corrected FP64 shader subsequently ran with zero CPU fallbacks.",
+      "Native FP64 scalar RMS refinement plus matching prefill order makes the first-layer cached keys and dot scores bit-identical; the next difference is the attention exponential, maximum 5.96046448e-8. Subsequent CPU and Vulkan reduction/elementwise differences still violate full-model parity.",
+      "At decode position 124 layer 3, CPU selected expert 88 instead of Vulkan expert 245. FP64 dot/scoring from either captured input selects 245; adding the large common router bias in FP32 collapses the CPU selection pair to a tie. No router bias normalization or routing change was enabled.",
+      "All captures and prototype timings are diagnostic, with some reused references and builds running concurrently. None are speed or memory certification."
+    ],
+    "trials": [
+      {
+        "name": "prefill-order",
+        "reference": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/precise-rms-native/eight-vulkan",
+        "candidate": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/prefill-order/eight-cpu",
+        "diagnostic_only": true,
+        "decode_tokens": 8,
+        "prefill_chunk": 32,
+        "same_executable": false,
+        "max_abs": 2.5459799766540527,
+        "per_logit_row_max_abs": [
+          2.8908252716064453e-05,
+          2.5987625122070312e-05,
+          2.3365020751953125e-05,
+          5.7220458984375e-05,
+          0.6334309577941895,
+          0.5734734535217285,
+          2.5459799766540527,
+          1.0600695312023163,
+          1.1449089050292969
+        ],
+        "absolute_1e_5": false,
+        "first_different_bits": {
+          "checkpoint": "00014-ds-k-all",
+          "label": "ds-k-all",
+          "shape": [
+            1,
+            128,
+            512
+          ],
+          "elements": 65536,
+          "different_bits": 9054,
+          "max_abs_finite": 4.76837158203125e-07,
+          "nonfinite_mismatch": false,
+          "absolute_1e_5": true
+        },
+        "first_exceeding_1e_5": {
+          "checkpoint": "00015-ds-dot-scores",
+          "label": "ds-dot-scores",
+          "shape": [
+            1,
+            64,
+            128
+          ],
+          "elements": 8192,
+          "different_bits": 1008,
+          "max_abs_finite": 4.57763671875e-05,
+          "nonfinite_mismatch": false,
+          "absolute_1e_5": false
+        },
+        "reference_cpu_fallbacks": {
+          "prefill": [
+            0
+          ],
+          "decode": [
+            0
+          ]
+        },
+        "performance_or_memory_qualification": false
+      },
+      {
+        "name": "moe-route",
+        "reference": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/moe-route/eight-vulkan",
+        "candidate": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/moe-route/eight-cpu",
+        "diagnostic_only": true,
+        "decode_tokens": 8,
+        "prefill_chunk": 32,
+        "same_executable": true,
+        "max_abs": 2.5459799766540527,
+        "per_logit_row_max_abs": [
+          2.8908252716064453e-05,
+          2.5987625122070312e-05,
+          2.3365020751953125e-05,
+          5.7220458984375e-05,
+          0.6334309577941895,
+          0.5734734535217285,
+          2.5459799766540527,
+          1.0600695312023163,
+          1.1449089050292969
+        ],
+        "absolute_1e_5": false,
+        "first_different_bits": {
+          "checkpoint": "00014-ds-k-all",
+          "label": "ds-k-all",
+          "shape": [
+            1,
+            128,
+            512
+          ],
+          "elements": 65536,
+          "different_bits": 9054,
+          "max_abs_finite": 4.76837158203125e-07,
+          "nonfinite_mismatch": false,
+          "absolute_1e_5": true
+        },
+        "first_exceeding_1e_5": {
+          "checkpoint": "00015-ds-dot-scores",
+          "label": "ds-dot-scores",
+          "shape": [
+            1,
+            64,
+            128
+          ],
+          "elements": 8192,
+          "different_bits": 1008,
+          "max_abs_finite": 4.57763671875e-05,
+          "nonfinite_mismatch": false,
+          "absolute_1e_5": false
+        },
+        "reference_cpu_fallbacks": {
+          "prefill": [
+            0
+          ],
+          "decode": [
+            0
+          ]
+        },
+        "performance_or_memory_qualification": false
+      },
+      {
+        "name": "fp64-rms",
+        "reference": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/fp64-rms/eight-vulkan",
+        "candidate": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/moe-route/eight-cpu",
+        "diagnostic_only": true,
+        "decode_tokens": 8,
+        "prefill_chunk": 32,
+        "same_executable": false,
+        "max_abs": 2.546006679534912,
+        "per_logit_row_max_abs": [
+          2.8252601623535156e-05,
+          1.9669532775878906e-05,
+          1.8358230590820312e-05,
+          3.4332275390625e-05,
+          0.6334309577941895,
+          0.5734786987304688,
+          2.546006679534912,
+          1.0600988566875458,
+          1.1449265480041504
+        ],
+        "absolute_1e_5": false,
+        "first_different_bits": {
+          "checkpoint": "00016-ds-exponential",
+          "label": "ds-exponential",
+          "shape": [
+            1,
+            64,
+            128
+          ],
+          "elements": 8192,
+          "different_bits": 5614,
+          "max_abs_finite": 5.960464477539063e-08,
+          "nonfinite_mismatch": false,
+          "absolute_1e_5": true
+        },
+        "first_exceeding_1e_5": {
+          "checkpoint": "00026-hc-projection",
+          "label": "hc-projection",
+          "shape": [
+            1,
+            24
+          ],
+          "elements": 24,
+          "different_bits": 15,
+          "max_abs_finite": 1.52587890625e-05,
+          "nonfinite_mismatch": false,
+          "absolute_1e_5": false
+        },
+        "reference_cpu_fallbacks": {
+          "prefill": [
+            0
+          ],
+          "decode": [
+            0
+          ]
+        },
+        "performance_or_memory_qualification": false
+      }
+    ],
+    "router_independent_f64": {
+      "vulkan": {
+        "f64_top8": [
+          249,
+          116,
+          201,
+          78,
+          271,
+          245,
+          88,
+          226
+        ],
+        "f64_margin": 2.0970239500428534e-06,
+        "f64_scores": [
+          11.174398388126749,
+          11.152993150704464,
+          11.143316188853023,
+          11.127788398965063,
+          11.119576844629751,
+          11.114837048866317,
+          11.114834951842367,
+          11.114763717895208
+        ],
+        "actual_logits_f64_scores_top8": [
+          249,
+          116,
+          201,
+          78,
+          271,
+          245,
+          88,
+          226
+        ],
+        "router_max_error": 1.3187283380844406e-05
+      },
+      "cpu": {
+        "f64_top8": [
+          249,
+          116,
+          201,
+          78,
+          271,
+          245,
+          88,
+          226
+        ],
+        "f64_margin": 2.0509142562019633e-06,
+        "f64_scores": [
+          11.17439839715529,
+          11.152993133057532,
+          11.143316173866172,
+          11.127788409736413,
+          11.119576894515923,
+          11.114837010858956,
+          11.1148349599447,
+          11.114763647324317
+        ],
+        "actual_logits_f64_scores_top8": [
+          249,
+          116,
+          201,
+          78,
+          271,
+          245,
+          88,
+          226
+        ],
+        "router_max_error": 1.750205529837956e-05
+      }
+    },
+    "micro_batch32_q8_kv": {
+      "op": "Projection",
+      "model": "/home/tserica/models/DSV41-REAP272E-balanced.gguf",
+      "weight": "blk.0.attn_kv.weight",
+      "cols": 5120,
+      "eps": 9.999999974752427e-07,
+      "input": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/precise-rms-native/repeated-input32.f32",
+      "input_sha256": "1f6af60cf5e0dbfec2a7f53dbce54a733a854ba56c7d2530153a3be5a6b7d36b",
+      "rhs": null,
+      "rhs_sha256": null,
+      "rope_dim": null,
+      "rope_theta": 10000.0,
+      "position": 0,
+      "reference_backend": "vulkan",
+      "runs": [
+        {
+          "backend": "vulkan",
+          "max_abs": 0.0,
+          "different_bits": 0,
+          "elements": 16384,
+          "cpu_fallbacks": 0,
+          "absolute_1e_5": true
+        },
+        {
+          "backend": "cpu",
+          "max_abs": 0.0,
+          "different_bits": 0,
+          "elements": 16384,
+          "cpu_fallbacks": 0,
+          "absolute_1e_5": true
+        }
+      ]
+    },
+    "micro_native_fp64_rms": {
+      "op": "Rms",
+      "model": "/home/tserica/models/DSV41-REAP272E-balanced.gguf",
+      "weight": "blk.0.attn_kv_a_norm.weight",
+      "cols": 512,
+      "eps": 9.999999682655225e-21,
+      "input": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/accurate-rope/short-vulkan/activations/00012-ds-kv-proj.f32",
+      "input_sha256": "04f34b2b6a8b51ba916867f4ee36d79ef8d211033fca42072628bf64defc5ea1",
+      "rhs": null,
+      "rhs_sha256": null,
+      "rope_dim": null,
+      "rope_theta": 10000.0,
+      "position": 0,
+      "reference_backend": "vulkan",
+      "runs": [
+        {
+          "backend": "vulkan",
+          "max_abs": 0.0,
+          "different_bits": 0,
+          "elements": 4096,
+          "cpu_fallbacks": 0,
+          "absolute_1e_5": true
+        },
+        {
+          "backend": "cpu",
+          "max_abs": 0.0,
+          "different_bits": 0,
+          "elements": 4096,
+          "cpu_fallbacks": 0,
+          "absolute_1e_5": true
+        }
+      ]
+    },
+    "invalid_gpu_trial": {
+      "path": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/precise-rms",
+      "reason": "GLSL precise qualifier rejected; CPU fallback invalidates GPU comparison"
+    },
+    "retained_tooling": [
+      "GPU arithmetic replay now rejects disabled native execution and CPU fallbacks.",
+      "Off-by-default DeepSeek activation tracing includes MoE input, logits, weights and selected experts."
+    ],
+    "native_router_selection_replay": {
+      "cpu": {
+        "score245": 11.114836692810059,
+        "score88": 11.114836692810059,
+        "exact_tie": true,
+        "summary": {
+          "op": "RouterSelection",
+          "model": "/home/tserica/models/DSV41-REAP272E-balanced.gguf",
+          "weight": "blk.3.exp_probs_b.bias",
+          "cols": 272,
+          "eps": 9.999999974752427e-07,
+          "input": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/moe-route/eight-cpu/activations/00125-ds-moe-logits.f32",
+          "input_sha256": "19f15a307fde8c18c7f5bb33c528550470b2711b73ec0a093d457c11ea933a4c",
+          "rhs": null,
+          "rhs_sha256": null,
+          "rope_dim": null,
+          "rope_theta": 10000.0,
+          "position": 0,
+          "reference_backend": "cpu",
+          "runs": [
+            {
+              "backend": "cpu",
+              "max_abs": 0.0,
+              "different_bits": 0,
+              "elements": 272,
+              "cpu_fallbacks": 0,
+              "absolute_1e_5": true
+            }
+          ]
+        }
+      },
+      "vulkan": {
+        "score245": 11.114837646484375,
+        "score88": 11.114836692810059,
+        "exact_tie": false,
+        "summary": {
+          "op": "RouterSelection",
+          "model": "/home/tserica/models/DSV41-REAP272E-balanced.gguf",
+          "weight": "blk.3.exp_probs_b.bias",
+          "cols": 272,
+          "eps": 9.999999974752427e-07,
+          "input": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/moe-route/eight-vulkan/activations/00125-ds-moe-logits.f32",
+          "input_sha256": "9992467cc476414671bbbeed17dad15171bba5ebdccfc506f35f9c4bb56ee3c8",
+          "rhs": null,
+          "rhs_sha256": null,
+          "rope_dim": null,
+          "rope_theta": 10000.0,
+          "position": 0,
+          "reference_backend": "vulkan",
+          "runs": [
+            {
+              "backend": "vulkan",
+              "max_abs": 0.0,
+              "different_bits": 0,
+              "elements": 272,
+              "cpu_fallbacks": 0,
+              "absolute_1e_5": true
+            }
+          ]
+        }
+      },
+      "disabled_native_rejected": true,
+      "binary_sha256": "b4b06ba2aff56b1d095f2966fd3cd4da05539345856e65df5995f7b4446235c6"
+    },
+    "verification": {
+      "rope_reference": "final-rope-reference.log: 1 passed; CPU/Vulkan/SYCL",
+      "deepseek41_reference": "final-deepseek41-reference.log: 8 passed, including independent float64 reference at 1e-5",
+      "replay_build": "final-numerics-build.log: succeeded",
+      "disabled_native_guard": "final-replay-guards/disabled-native.log: expected rejection",
+      "rope_replay": {
+        "op": "Rope",
+        "model": null,
+        "weight": null,
+        "cols": 512,
+        "eps": 9.999999974752427e-07,
+        "input": "/home/tserica/benchmark-results/backend-logit-isolation-20261023/accurate-rope/short-vulkan/activations/00012-ds-kv-proj.f32",
+        "input_sha256": "04f34b2b6a8b51ba916867f4ee36d79ef8d211033fca42072628bf64defc5ea1",
+        "rhs": null,
+        "rhs_sha256": null,
+        "rope_dim": 64,
+        "rope_theta": 10000.0,
+        "position": 124,
+        "reference_backend": "vulkan",
+        "runs": [
+          {
+            "backend": "vulkan",
+            "max_abs": 0.0,
+            "different_bits": 0,
+            "elements": 4096,
+            "cpu_fallbacks": 0,
+            "absolute_1e_5": true
+          },
+          {
+            "backend": "cpu",
+            "max_abs": 1.4901161193847656e-08,
+            "different_bits": 118,
+            "elements": 4096,
+            "cpu_fallbacks": 0,
+            "absolute_1e_5": true
+          }
+        ]
+      }
+    }
+  }
+}

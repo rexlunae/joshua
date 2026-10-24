@@ -107,6 +107,8 @@ api! {
     launch(usize, *const c_char, *const Arg, usize, *const usize, *const usize) -> i32;
     }
     optional {
+        numerics_version() -> u32;
+        canonical_quantized(usize) -> u32;
         mega_new(usize, *const MegaModelDesc, *const MegaLayerDesc, *mut usize) -> i32;
         mega_free(usize) -> i32;
         mega_groups(usize) -> i32;
@@ -117,6 +119,15 @@ fn api() -> Result<&'static Api> {
     static API: std::sync::OnceLock<std::result::Result<Api, String>> = std::sync::OnceLock::new();
     API.get_or_init(|| unsafe { Api::load() }).as_ref().map_err(|e| Error::Msg(e.clone()))
 }
+pub fn numerics_version() -> u32 {
+    api().ok().and_then(|a| a.numerics_version).map(|f| unsafe { f() }).unwrap_or(0)
+}
+
+pub fn canonical_quantized(context: usize) -> bool {
+    api().ok().and_then(|a| a.canonical_quantized)
+        .is_some_and(|f| unsafe { f(context) == 1 })
+}
+
 pub fn error(op: &str) -> Error {
     let detail = api().map(|a| unsafe { CStr::from_ptr((a.error)()).to_string_lossy().into_owned() })
         .unwrap_or_else(|e| e.to_string());

@@ -18,17 +18,22 @@ p.add_argument('--tokenizer', type=Path, required=True)
 p.add_argument('--output', type=Path, required=True)
 p.add_argument('--binary', type=Path, default=Path('target/release/examples/bench_cubecl_real'))
 p.add_argument('--prompt-file', type=Path)
-p.add_argument('--decode-text-file', type=Path)
+inputs = p.add_mutually_exclusive_group()
+inputs.add_argument('--decode-text-file', type=Path)
+inputs.add_argument('--reference', type=Path, help='replay a saved prompt/decode trace for the first backend too')
 p.add_argument('--prompt-tokens', type=int, default=16)
 p.add_argument('--decode', type=int, default=32)
 p.add_argument('--passes', type=int, default=2)
 p.add_argument('--prefill-chunk', type=int, default=8)
+p.add_argument('--warm-prompt-tokens', type=int, default=8)
 p.add_argument('--timeout', type=int, default=3600)
 p.add_argument('--policies', nargs='+', choices=['fixed', 'auto'], default=['fixed', 'auto'])
-p.add_argument('--backends', nargs='+', choices=['vulkan', 'cpu', 'opencl', 'sycl'], default=['vulkan', 'cpu', 'opencl', 'sycl'])
+p.add_argument('--backends', nargs='+', choices=['vulkan', 'cpu', 'opencl', 'sycl', 'auto'], default=['vulkan', 'cpu', 'opencl', 'sycl'])
 p.add_argument('--retry-incomplete', action='store_true',
                help='quarantine an existing folder without summary.json and rerun it')
 a = p.parse_args()
+if 'auto' in a.backends and 'fixed' in a.policies:
+    p.error('backend auto requires --policies auto')
 a.output.mkdir(parents=True, exist_ok=True)
 base = a.output / 'vulkan-fixed'
 runs = [(b, policy) for policy in a.policies for b in a.backends]
@@ -76,13 +81,16 @@ for backend, policy in runs:
         cmd = [str(a.binary.resolve()), '--model', str(a.model.resolve()), '--tokenizer', str(a.tokenizer.resolve()),
                '--backend', backend, '--kernel', 'production', '--output', str(folder.resolve()),
                '--prompt-tokens', str(a.prompt_tokens), '--prefill-chunk', str(a.prefill_chunk),
-               '--decode', str(a.decode), '--passes', str(a.passes), '--warm-prompt-tokens', '8', '--warm-decode', '2']
+               '--decode', str(a.decode), '--passes', str(a.passes),
+               '--warm-prompt-tokens', str(a.warm_prompt_tokens), '--warm-decode', '2']
         if a.prompt_file:
             cmd += ['--prompt-file', str(a.prompt_file.resolve()), '--chat']
         if policy == 'auto':
             cmd += ['--auto-placement']
         if folder != base:
             cmd += ['--reference', str((base / 'trace.json').resolve())]
+        elif a.reference:
+            cmd += ['--reference', str(a.reference.resolve())]
         elif a.decode_text_file:
             cmd += ['--decode-text-file', str(a.decode_text_file.resolve())]
         entry['command'] = cmd

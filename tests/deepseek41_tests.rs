@@ -49,12 +49,84 @@ fn deepseek41_matches_llama_cpp_reference_at_every_position() {
             assert_close(
                 &got,
                 w,
-                2e-5,
+                1e-5,
                 &format!("deepseek41 (mmap={mmap}) position {pos}"),
             );
         }
     }
     std::fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(any(feature = "vulkan", feature = "sycl"))]
+#[test]
+fn deepseek41_accelerators_match_independent_float64_reference() {
+    let want: Vec<Vec<f32>> = include_str!("data/deepseek41_reference_logits.txt")
+        .lines()
+        .filter(|l| !l.starts_with('#') && !l.is_empty())
+        .map(|l| l.split_whitespace().map(|v| v.parse().unwrap()).collect())
+        .collect();
+    let mut devices = Vec::new();
+    #[cfg(feature = "vulkan")]
+    if let Ok(dev) = Device::new_vulkan(0) {
+        devices.push(dev);
+    }
+    #[cfg(feature = "sycl")]
+    if let Ok(dev) = Device::new_sycl(0) {
+        devices.push(dev);
+    }
+    let (dir, path) = fixture("deepseek41-accelerator-f64-ref");
+    for dev in devices {
+        let mut file = std::fs::File::open(&path).unwrap();
+        let content = joshua::gguf_ext::read_header(&mut file)
+            .unwrap()
+            .to_candle_content()
+            .unwrap();
+        let mmap = std::sync::Arc::new(unsafe { memmap2::Mmap::map(&file).unwrap() });
+        let mut model = QuantizedModel::from_gguf_mmap_placed(
+            content,
+            &mut file,
+            &dev,
+            &Device::Cpu,
+            Some(mmap),
+            None,
+            0,
+            None,
+        )
+        .unwrap();
+        for (pos, (&token, expected)) in TOKENS.iter().zip(&want).enumerate() {
+            let input = Tensor::new(&[[token]], &dev).unwrap();
+            let got = model
+                .forward(&input, pos)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            assert_close(&got, expected, 1e-5, &format!("{dev:?} decode {pos}"));
+        }
+        assert!(model.clear_kv_cache());
+        for (offset, end) in [(0, 5), (5, TOKENS.len())] {
+            let input = Tensor::new(&TOKENS[offset..end], &dev)
+                .unwrap()
+                .unsqueeze(0)
+                .unwrap();
+            let got = model
+                .forward_all_logits(&input, offset)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let expected: Vec<f32> = want[offset..end].iter().flatten().copied().collect();
+            assert_close(
+                &got,
+                &expected,
+                1e-5,
+                &format!("{dev:?} prefill {offset}..{end}"),
+            );
+        }
+    }
+    std::fs::remove_dir_all(dir).ok();
 }
 
 /// A whole-prompt prefill, a chunked prefill and the layer-streamed prefill

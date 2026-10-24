@@ -221,6 +221,22 @@ impl Gating {
     }
 }
 
+/// Remove the irrelevant common offset before adding a router's selection bias.
+/// Call once at load time: a large common offset otherwise rounds distinct
+/// scores into ties. Routing weights still use the original unbiased scores.
+pub(crate) fn center_selection_bias(bias: &Tensor) -> Result<Tensor> {
+    let values = bias.flatten_all()?.to_vec1::<f32>()?;
+    if values.is_empty() || values.iter().any(|v| !v.is_finite()) {
+        candle_core::bail!("router selection bias must be nonempty and finite");
+    }
+    let lo = values.iter().copied().fold(f32::INFINITY, f32::min);
+    let hi = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let center = ((lo as f64 + hi as f64) * 0.5) as f32;
+    let centered: Vec<f32> = values.into_iter()
+        .map(|v| (v as f64 - center as f64) as f32).collect();
+    Tensor::from_vec(centered, bias.shape(), bias.device())
+}
+
 /// The routing weights of the experts `idx` picked (`[n_tokens, k]`): their
 /// scores, optionally renormalised to sum to one (min-clamped to the f16
 /// epsilon, as llama.cpp does, so a degenerate routing never divides by
@@ -228,7 +244,7 @@ impl Gating {
 pub fn routing_weights(scores: &Tensor, idx: &Tensor, norm: bool, scale: f64) -> Result<Tensor> {
     let mut weights = scores.gather(idx, D::Minus1)?;
     if norm {
-        let denom = weights.sum_keepdim(D::Minus1)?.clamp(6.103_515_6e-5, f32::INFINITY)?;
+        let denom = crate::precise::sum_keepdim(&weights,D::Minus1)?.clamp(6.103_515_6e-5, f32::INFINITY)?;
         weights = weights.broadcast_div(&denom)?;
     }
     if scale != 0.0 && scale != 1.0 {
@@ -820,6 +836,39 @@ mod tests {
     use super::*;
     use candle_core::quantized::QMatMul;
     use candle_core::Module;
+
+    #[test]
+    fn centered_router_bias_preserves_independent_f64_selection() -> Result<()> {
+        // Real layer-3 boundary: adding the common offset in f32 collapses
+        // distinct scores into a tie, incorrectly preferring expert 88.
+        let logits = [-2.7240965366363525f32, -2.550832509994507];
+        let biases = [f32::from_bits(0x412d_cddd), f32::from_bits(0x412d_73b7)];
+        let scores: Vec<f32> = logits.iter().map(|&v| {
+            let x = v as f64;
+            (x.max(0.) + (-x.abs()).exp().ln_1p()).sqrt() as f32
+        }).collect();
+        let exact: Vec<f64> = logits.iter().zip(biases).map(|(&v, b)| {
+            let x = v as f64;
+            (x.max(0.) + (-x.abs()).exp().ln_1p()).sqrt() + b as f64
+        }).collect();
+        assert!(exact[0] > exact[1]);
+        let mut devices = vec![Device::Cpu];
+        #[cfg(feature = "vulkan")]
+        if let Ok(d) = Device::new_vulkan(0) { devices.push(d); }
+        #[cfg(feature = "sycl")]
+        if let Ok(d) = Device::new_sycl(0) { devices.push(d); }
+        for dev in devices {
+            let bias = Tensor::new(&biases, &dev)?;
+            let centered = center_selection_bias(&bias)?;
+            let x = Tensor::from_vec(scores.repeat(3), (3, 2), &dev)?;
+            let (ids, weights) = route(&x, Some(&centered), 1, false, 1., Ok)?;
+            assert_eq!(ids.to_vec2::<u32>()?, vec![vec![0]; 3]);
+            assert_eq!(weights.to_vec2::<f32>()?, vec![vec![scores[0]]; 3]);
+            assert_eq!(centered.dtype(), bias.dtype());
+            assert!(centered.device().same_device(bias.device()));
+        }
+        Ok(())
+    }
 
     /// The incremental builder must be bit-identical to the host pattern:
     /// every mask feeds `broadcast_add` against attention scores, so even a

@@ -35,7 +35,7 @@ using half = _Float16;
 template<class To, class From> To bit_cast(const From& f) { return std::bit_cast<To>(f); }
 using std::exp; using std::log; using std::sin; using std::cos; using std::tanh; using std::sqrt;
 using std::erf; using std::fabs; using std::ceil; using std::floor; using std::round; using std::pow;
-using std::fmax; using std::fmin; using std::isnan;
+using std::fmax; using std::fmin; using std::isnan; using std::fma;
 inline float rsqrt(float x) { return 1.0f / std::sqrt(x); }
 template<class T> T min(T a, T b) { return a < b ? a : b; }
 template<class T> T max(T a, T b) { return a > b ? a : b; }
@@ -46,6 +46,7 @@ inline float sin(float x) { return std::sin(x); }
 inline float cos(float x) { return std::cos(x); }
 inline float sqrt(float x) { return std::sqrt(x); }
 inline float recip(float x) { return 1.0f / x; }
+inline float rsqrt(float x) { return 1.0f / std::sqrt(x); }
 }
 
 template<class T, int N> struct vec {

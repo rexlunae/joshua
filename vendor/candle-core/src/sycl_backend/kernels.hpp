@@ -19,6 +19,7 @@ using sycl::ceil; using sycl::floor; using sycl::round; using sycl::pow;
 using sycl::fmax; using sycl::fmin; using sycl::rsqrt; using sycl::isnan;
 using sycl::min; using sycl::max; using sycl::dot;
 constexpr int WG = 64;
+constexpr int REDUCTION_LANES = 256;
 inline float as_float(uint v) { return sycl::bit_cast<float>(v); }
 inline float vload_half(size_t i, const half* p) { return static_cast<float>(p[i]); }
 inline void vstore_half(float v, size_t i, half* p) { p[i] = half(v); }
@@ -1271,57 +1272,62 @@ struct Kernels {
 
     }
     void k_softmax_last(const float* x, float* o, int rows, int cols, int off) const {
-    auto &sh = *reinterpret_cast<float (*)[WG]>(scratch + (0));
-    int row = item.get_group(2 - 0);
-    int t = item.get_local_id(2 - 0);
+    #pragma clang fp reassociate(off) contract(off)
+    auto &sh = *reinterpret_cast<float (*)[REDUCTION_LANES]>(scratch);
+    int row = item.get_group(2);
+    int t = item.get_local_id(2);
     if (row >= rows) return;
     const float* r = x + off + (int64_t)row * cols;
     float* w = o + (int64_t)row * cols;
-    float m = -std::numeric_limits<float>::infinity();
-    for (int c = t; c < cols; c += WG) m = fmax(m, r[c]);
-    sh[t] = m;
+    for (int lane = t; lane < REDUCTION_LANES; lane += WG) {
+        float m = -std::numeric_limits<float>::infinity();
+        for (int c = lane; c < cols; c += REDUCTION_LANES) m = fmax(m, r[c]);
+        sh[lane] = m;
+    }
     sycl::group_barrier(item.get_group());
-    for (int s = WG / 2; s > 0; s >>= 1) {
-        if (t < s) sh[t] = fmax(sh[t], sh[t + s]);
+    for (int s = REDUCTION_LANES / 2; s > 0; s >>= 1) {
+        for (int lane = t; lane < s; lane += WG) sh[lane] = fmax(sh[lane], sh[lane + s]);
         sycl::group_barrier(item.get_group());
     }
-    m = sh[0];
+    float m = sh[0];
     sycl::group_barrier(item.get_group());
-    float sum = 0.0f;
-    for (int c = t; c < cols; c += WG) {
-        float e = exp(r[c] - m);
-        w[c] = e;
-        sum += e;
+    for (int lane = t; lane < REDUCTION_LANES; lane += WG) {
+        float sum = 0.0f;
+        for (int c = lane; c < cols; c += REDUCTION_LANES) sum += sycl::native::exp(r[c] - m);
+        sh[lane] = sum;
     }
-    sh[t] = sum;
     sycl::group_barrier(item.get_group());
-    for (int s = WG / 2; s > 0; s >>= 1) {
-        if (t < s) sh[t] += sh[t + s];
+    for (int s = REDUCTION_LANES / 2; s > 0; s >>= 1) {
+        for (int lane = t; lane < s; lane += WG) sh[lane] += sh[lane + s];
         sycl::group_barrier(item.get_group());
     }
     float inv = 1.0f / sh[0];
-    for (int c = t; c < cols; c += WG) w[c] *= inv;
-
+    for (int c = t; c < cols; c += WG) w[c] = sycl::native::exp(r[c] - m) * inv;
     }
     void k_rmsnorm(const float* x, const float* alpha, float* o,
                int rows, int cols, int off, int aoff, float eps) const {
-    auto &sh = *reinterpret_cast<float (*)[WG]>(scratch + (0));
-    int row = item.get_group(2 - 0);
-    int t = item.get_local_id(2 - 0);
+    #pragma clang fp reassociate(off) contract(off)
+    // Match the 256-lane Vulkan reduction using four logical lanes per
+    // physical lane, retaining the SYCL backend's bounded 64-thread group.
+    constexpr int lanes = REDUCTION_LANES;
+    auto &sh = *reinterpret_cast<float (*)[lanes]>(scratch);
+    int row = item.get_group(2);
+    int t = item.get_local_id(2);
     if (row >= rows) return;
     const float* r = x + off + (int64_t)row * cols;
     float* w = o + (int64_t)row * cols;
-    float ss = 0.0f;
-    for (int c = t; c < cols; c += WG) { float v = r[c]; ss += v * v; }
-    sh[t] = ss;
+    for (int lane = t; lane < lanes; lane += WG) {
+        float ss = 0.0f;
+        for (int c = lane; c < cols; c += lanes) { float v = r[c]; ss = sycl::fma(v, v, ss); }
+        sh[lane] = ss;
+    }
     sycl::group_barrier(item.get_group());
-    for (int s = WG / 2; s > 0; s >>= 1) {
-        if (t < s) sh[t] += sh[t + s];
+    for (int s = lanes / 2; s > 0; s >>= 1) {
+        for (int lane = t; lane < s; lane += WG) sh[lane] += sh[lane + s];
         sycl::group_barrier(item.get_group());
     }
-    float scale = 1.0f / sqrt(sh[0] / (float)cols + eps);
+    float scale = sycl::native::rsqrt(sh[0] / (float)cols + eps);
     for (int c = t; c < cols; c += WG) w[c] = r[c] * scale * alpha[aoff + c];
-
     }
     void k_rope_i(const float* x, const float* cs, const float* sn,
                        float* o, int n_pairs, int h, int t, int d, int xoff, int coff, int soff, int cs_b) const {
@@ -1361,7 +1367,8 @@ struct Kernels {
     }
     void k_qgemv(const float* X, const uchar* W, float* C,
              int N, int K, int qt, int qk, int bsz, uint64_t woff, int xoff, int coff, int M) const {
-    auto &sh = *reinterpret_cast<float (*)[WG]>(scratch + (0));
+    #pragma clang fp reassociate(off) contract(off)
+    auto &sh = *reinterpret_cast<float (*)[REDUCTION_LANES]>(scratch + (0));
     int n = item.get_group(2 - 0);
     int m = item.get_group(2 - 1);
     int t = item.get_local_id(2 - 0);
@@ -1370,21 +1377,23 @@ struct Kernels {
     const uchar* row = W + woff + (uint64_t)n * (uint64_t)(K / qk) * (uint64_t)bsz;
     int spb = qk / 32;
     int nsub = K / 32;
-    float acc = 0.0f;
-    float buf[32];
-    for (int s = t; s < nsub; s += WG) {
-        int b = s / spb;
-        int jj = s - b * spb;
-        dequant_sub(qt, row + (uint64_t)b * bsz, jj, buf);
-        const float* xb = x + s * 32;
-        float d = 0.0f;
-        for (int i = 0; i < 32; i++) d += xb[i] * buf[i];
-        acc += d;
+    for (int lane = t; lane < REDUCTION_LANES; lane += WG) {
+        float acc = 0.0f;
+        float buf[32];
+        for (int s = lane; s < nsub; s += REDUCTION_LANES) {
+            int b = s / spb;
+            int jj = s - b * spb;
+            dequant_sub(qt, row + (uint64_t)b * bsz, jj, buf);
+            const float* xb = x + s * 32;
+            float d = 0.0f;
+            for (int i = 0; i < 32; i++) d = sycl::fma(xb[i], buf[i], d);
+            acc += d;
+        }
+        sh[lane] = acc;
     }
-    sh[t] = acc;
     sycl::group_barrier(item.get_group());
-    for (int s = WG / 2; s > 0; s >>= 1) {
-        if (t < s) sh[t] += sh[t + s];
+    for (int s = REDUCTION_LANES / 2; s > 0; s >>= 1) {
+        for (int lane = t; lane < s; lane += WG) sh[lane] += sh[lane + s];
         sycl::group_barrier(item.get_group());
     }
     if (t == 0) C[coff + (int64_t)m * N + n] = sh[0];

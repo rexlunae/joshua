@@ -152,6 +152,21 @@ pub fn try_matmul_fused(
     parallel: bool,
 ) -> bool {
     use crate::simd::SimdLevel;
+    #[cfg(target_arch = "x86_64")]
+    {
+        // Explicit process-wide diagnostic override, including callers from
+        // other architectures. Production model qualification does not set it.
+        static WIDE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if crate::simd::avx2_fma_available() && *WIDE.get_or_init(||
+            std::env::var("JOSHUA_CPU_DOT_F64").is_ok_and(|v| v == "1")) {
+            if dtype == GgmlDType::Q8_0 {
+                return try_fused::<BlockQ8_0Raw, QK8_0>(m, k, n, lhs, block_bytes, dst, parallel, fused_row_q8_0_f64);
+            }
+            if dtype == GgmlDType::Q2K && n == 24 && k == 20480 {
+                return try_fused::<BlockQ2KRaw, QK_K>(m, k, n, lhs, block_bytes, dst, parallel, fused_row_hc_f64);
+            }
+        }
+    }
     match crate::simd::simd_level() {
         #[cfg(target_arch = "x86_64")]
         SimdLevel::Avx512 => try_matmul_fused_avx512(dtype, (m, k, n), lhs, block_bytes, dst, parallel),
@@ -160,6 +175,214 @@ pub fn try_matmul_fused(
         #[cfg(target_arch = "aarch64")]
         SimdLevel::Neon => try_matmul_fused_neon(dtype, (m, k, n), lhs, block_bytes, dst, parallel),
         _ => false,
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn try_matmul_dense_f64(
+    dtype: GgmlDType,
+    dims: (usize, usize, usize),
+    lhs: &[f32],
+    bytes: &[u8],
+    dst: &mut [f32],
+) -> bool {
+    if !crate::simd::avx2_fma_available() {
+        return false;
+    }
+    let (m, k, n) = dims;
+    match dtype {
+        GgmlDType::Q8_0 => {
+            try_fused::<BlockQ8_0Raw, QK8_0>(m, k, n, lhs, bytes, dst, true, fused_row_q8_0_f64)
+        }
+        GgmlDType::Q2K => {
+            try_fused::<BlockQ2KRaw, QK_K>(m, k, n, lhs, bytes, dst, true, fused_row_hc_f64)
+        }
+        GgmlDType::Q4K => try_matmul_q4_f64(dims, lhs, bytes, dst),
+        _ => false,
+    }
+}
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn grouped_q8_f64(
+    groups: usize,
+    k: usize,
+    n: usize,
+    lhs: &[f32],
+    bytes: &[u8],
+    dst: &mut [f32],
+) -> bool {
+    if !crate::simd::avx2_fma_available()
+        || groups == 0
+        || k == 0
+        || k % 32 != 0
+        || n == 0
+        || n % groups != 0
+        || groups.checked_mul(k) != Some(lhs.len())
+        || dst.len() != n
+    {
+        return false;
+    }
+    let bpr = k / 32;
+    if n.checked_mul(bpr)
+        .and_then(|v| v.checked_mul(std::mem::size_of::<BlockQ8_0Raw>()))
+        != Some(bytes.len())
+    {
+        return false;
+    }
+    // Q8_0Raw has byte alignment. Storage is owned by the immutable QTensor
+    // for this whole call, and each worker writes disjoint output rows.
+    let blocks =
+        unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const BlockQ8_0Raw, n * bpr) };
+    let output = crate::simd::DstPtr::new(dst);
+    let rank = n / groups;
+    crate::simd::for_each_row_chunks(n, |rows| {
+        for row in rows {
+            let g = row / rank;
+            let x = &lhs[g * k..(g + 1) * k];
+            unsafe { fused_row_q8_0_f64(1, k, n, x, blocks, bpr, row, &output) }
+        }
+    });
+    true
+}
+
+/// Wide dot for a dense Q4_K tensor, retaining compact read-only blocks.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn try_matmul_q4_f64(
+    (m, k, n): (usize, usize, usize),
+    lhs: &[f32],
+    bytes: &[u8],
+    dst: &mut [f32],
+) -> bool {
+    if crate::simd::simd_level() != crate::simd::SimdLevel::Avx512 {
+        return false;
+    }
+    try_fused::<BlockQ4KRaw, QK_K>(m, k, n, lhs, bytes, dst, true, fused_row_q4k_f64)
+}
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx2,fma")]
+unsafe fn fused_row_q4k_f64(
+    m: usize,
+    k: usize,
+    n: usize,
+    lhs: &[f32],
+    blocks: &[BlockQ4KRaw],
+    bpr: usize,
+    row: usize,
+    dst: &crate::simd::DstPtr,
+) {
+    use std::arch::x86_64::*;
+    let mut acc = [_mm512_setzero_pd(); 4];
+    let mask = _mm256_set1_epi8(15);
+    for (bi, b) in blocks[row * bpr..(row + 1) * bpr].iter().enumerate() {
+        let d = f16::from_le_bytes(b.d).to_f32();
+        let dm = f16::from_le_bytes(b.dmin).to_f32();
+        for c in 0..4 {
+            let q = _mm256_loadu_si256(b.qs.as_ptr().add(32 * c) as *const __m256i);
+            let halves = [
+                _mm256_and_si256(q, mask),
+                _mm256_and_si256(_mm256_srli_epi16(q, 4), mask),
+            ];
+            for (r, bytes) in halves.into_iter().enumerate() {
+                let (sc, mn) = q4k_scale_min(&b.scales, 2 * c + r);
+                for h in 0..2 {
+                    let raw = if h == 0 {
+                        _mm256_castsi256_si128(bytes)
+                    } else {
+                        _mm256_extracti128_si256(bytes, 1)
+                    };
+                    let w = _mm512_fmsub_ps(
+                        _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(raw)),
+                        _mm512_set1_ps(d * sc as f32),
+                        _mm512_set1_ps(dm * mn as f32),
+                    );
+                    let lo = _mm512_cvtps_pd(_mm512_castps512_ps256(w));
+                    let hi =
+                        _mm512_cvtps_pd(_mm512_castps512_ps256(_mm512_shuffle_f32x4(w, w, 0xee)));
+                    let off = bi * 256 + c * 64 + r * 32 + h * 16;
+                    for i in 0..m {
+                        let x = lhs.as_ptr().add(i * k + off);
+                        acc[i] = _mm512_fmadd_pd(_mm512_cvtps_pd(_mm256_loadu_ps(x)), lo, acc[i]);
+                        acc[i] =
+                            _mm512_fmadd_pd(_mm512_cvtps_pd(_mm256_loadu_ps(x.add(8))), hi, acc[i]);
+                    }
+                }
+            }
+        }
+    }
+    for i in 0..m {
+        let mut lanes = [0f64; 8];
+        _mm512_storeu_pd(lanes.as_mut_ptr(), acc[i]);
+        dst.write(i * n + row, lanes.iter().sum::<f64>() as f32);
+    }
+}
+
+// Diagnostic wide accumulation over compact, borrowed weights. No f64
+// weight copy: only the four activation rows and register accumulators widen.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn fused_row_q8_0_f64(
+    m: usize,
+    k: usize,
+    n: usize,
+    lhs: &[f32],
+    blocks: &[BlockQ8_0Raw],
+    bpr: usize,
+    row: usize,
+    dst: &crate::simd::DstPtr,
+) {
+    use std::arch::x86_64::*;
+    let mut acc = [_mm256_setzero_pd(); 4];
+    for (bi, b) in blocks[row * bpr..(row + 1) * bpr].iter().enumerate() {
+        let scale = _mm_set1_ps(f16::from_le_bytes(b.d).to_f32());
+        for off in (0..32).step_by(4) {
+            let bytes = std::ptr::read_unaligned(b.qs.as_ptr().add(off) as *const i32);
+            let w = _mm256_cvtps_pd(_mm_mul_ps(
+                _mm_cvtepi32_ps(_mm_cvtepi8_epi32(_mm_cvtsi32_si128(bytes))),
+                scale,
+            ));
+            for i in 0..m {
+                let x = _mm256_cvtps_pd(_mm_loadu_ps(lhs.as_ptr().add(i * k + bi * 32 + off)));
+                acc[i] = _mm256_fmadd_pd(x, w, acc[i]);
+            }
+        }
+    }
+    for i in 0..m {
+        let mut lanes = [0f64; 4];
+        _mm256_storeu_pd(lanes.as_mut_ptr(), acc[i]);
+        dst.write(i * n + row, lanes.iter().sum::<f64>() as f32);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn fused_row_hc_f64(
+    m: usize,
+    k: usize,
+    n: usize,
+    lhs: &[f32],
+    blocks: &[BlockQ2KRaw],
+    bpr: usize,
+    row: usize,
+    dst: &crate::simd::DstPtr,
+) {
+    for input in 0..m {
+        let x = &lhs[input * k..(input + 1) * k];
+        let mut sums = [0f64; 8];
+        for (bi, b) in blocks[row * bpr..(row + 1) * bpr].iter().enumerate() {
+            let d = f16::from_le_bytes(b.d).to_f32();
+            let dm = f16::from_le_bytes(b.dmin).to_f32();
+            for sub in 0..8 {
+                let hh = sub / 4;
+                let shift = 2 * (sub % 4);
+                for lane in 0..32 {
+                    let sc = b.scales[8 * hh + 2 * (sub % 4) + lane / 16];
+                    let q = (b.qs[32 * hh + lane] >> shift) & 3;
+                    let w = (d * (sc & 15) as f32) * q as f32 - dm * (sc >> 4) as f32;
+                    let v = x[bi * 256 + sub * 32 + lane] as f64;
+                    sums[lane % 8] = v.mul_add(w as f64, sums[lane % 8]);
+                }
+            }
+        }
+        dst.write(input * n + row, sums.iter().sum::<f64>() as f32);
     }
 }
 
@@ -1155,6 +1378,40 @@ mod tests {
         let len = bytes.len() / size;
         let blocks = unsafe { std::slice::from_raw_parts(ptr, len) };
         blocks.to_vec()
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn wide_q8_and_hc_dots_match_independent_f64_dequantized_reference() {
+        if !crate::simd::avx2_fma_available() { return; }
+        for (dtype, k, n) in [(GgmlDType::Q8_0, 1280, 17), (GgmlDType::Q2K, 20480, 24), (GgmlDType::Q4K, 5120, 17)] {
+            if dtype==GgmlDType::Q4K&&crate::simd::simd_level()!=crate::simd::SimdLevel::Avx512{continue;}
+            let bytes = quantized_block_bytes(n, k, dtype);
+            let mut weights = vec![0f32; n*k];
+            match dtype {
+                GgmlDType::Q8_0 => BlockQ8_0::to_float(&blocks_of::<BlockQ8_0>(&bytes), &mut weights),
+                GgmlDType::Q2K => BlockQ2K::to_float(&blocks_of::<BlockQ2K>(&bytes), &mut weights),
+                GgmlDType::Q4K => BlockQ4K::to_float(&blocks_of::<BlockQ4K>(&bytes), &mut weights),
+                _ => unreachable!(),
+            }
+            for m in [1, 2, 4, 5, 16, 33] {
+                let lhs: Vec<f32> = (0..m*k).map(|i| ((i*31%127) as f32 - 63.)/16.).collect();
+                let mut got = vec![0f32; m*n];
+                let ran = if dtype == GgmlDType::Q8_0 {
+                    try_fused::<BlockQ8_0Raw, QK8_0>(m,k,n,&lhs,&bytes,&mut got,true,fused_row_q8_0_f64)
+                } else if dtype==GgmlDType::Q4K {
+                    try_matmul_q4_f64((m,k,n),&lhs,&bytes,&mut got)
+                } else {
+                    try_fused::<BlockQ2KRaw, QK_K>(m,k,n,&lhs,&bytes,&mut got,true,fused_row_hc_f64)
+                };
+                assert!(ran);
+                for i in 0..m { for j in 0..n {
+                    let reference = lhs[i*k..(i+1)*k].iter().zip(&weights[j*k..(j+1)*k])
+                        .map(|(&x,&w)| x as f64*w as f64).sum::<f64>() as f32;
+                    assert_eq!(got[i*n+j],reference,"{dtype:?} M={m} output ({i},{j})");
+                }}
+            }
+        }
     }
 
     #[test]

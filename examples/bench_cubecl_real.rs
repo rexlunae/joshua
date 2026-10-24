@@ -25,7 +25,7 @@ struct Args {
     tokenizer: PathBuf,
     #[arg(long, default_value = "production")]
     kernel: String,
-    /// cpu, opencl, sycl, or vulkan; Vulkan remains the default for legacy A/B runs.
+    /// cpu, opencl, sycl, vulkan, or auto (requires --auto-placement).
     #[arg(long, default_value = "vulkan")]
     backend: String,
     /// Use the engine's actual dense/expert/cache placement policy.
@@ -397,6 +397,8 @@ fn main() -> Result<()> {
         !args.auto_placement || args.kernel == "production",
         "auto placement requires production dispatch"
     );
+    ensure!(args.backend != "auto" || (args.auto_placement && args.projection_tensor.is_none()),
+        "auto backend requires --auto-placement and a full-model workload");
     ensure!(
         !args.output.join("summary.json").exists(),
         "refusing to overwrite completed run"
@@ -493,6 +495,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let mut dev = match args.backend.as_str() {
+        "auto" => Device::Cpu, // Engine resolves the backend before weights load.
         "cpu" => Device::Cpu,
         "vulkan" => {
             let vk = if args.kernel == "production" {
@@ -512,7 +515,7 @@ fn main() -> Result<()> {
         "sycl" => Device::new_sycl(0)?,
         _ => anyhow::bail!("backend unavailable: {} (build its feature)", args.backend),
     };
-    let gpu_name = device_name(&dev);
+    let mut gpu_name = device_name(&dev);
     ensure!(
         dev.is_cpu() || (gpu_name.contains("Arc") && gpu_name.contains("B50")),
         "expected B50, found {gpu_name}"
@@ -568,6 +571,7 @@ fn main() -> Result<()> {
             "vulkan" => joshua::engine::ComputeBackend::Vulkan,
             "opencl" => joshua::engine::ComputeBackend::OpenCl,
             "sycl" => joshua::engine::ComputeBackend::Sycl,
+            "auto" => joshua::engine::ComputeBackend::Auto,
             _ => unreachable!(),
         };
         let engine = joshua::engine::Engine::with_options(
@@ -589,6 +593,7 @@ fn main() -> Result<()> {
             "policy resolution loaded weights"
         );
         dev = engine.device().clone();
+        gpu_name = device_name(&dev);
         model_dev = engine.dense_device().clone();
         expert_dev = engine.expert_device().clone();
         cache_bytes = engine.device_expert_cache();
@@ -597,6 +602,11 @@ fn main() -> Result<()> {
             device_name(&model_dev),
             device_name(&expert_dev)
         );
+    }
+    ensure!(dev.is_cpu() || (gpu_name.contains("Arc") && gpu_name.contains("B50")),
+        "expected B50, found {gpu_name}");
+    if let Device::Vulkan(vk) = &dev {
+        ensure!(vk.limits().qgemv == kernel, "production selector overridden");
     }
     ensure!(
         !args.auto_placement
@@ -868,6 +878,15 @@ fn main() -> Result<()> {
     summary["expert_cache_report"] =
         serde_json::to_value(model.device_expert_cache().map(|r| format!("{r:?}")))?;
     summary["backend"] = args.backend.clone().into();
+    summary["resolved_backend"] = match &dev {
+        Device::Cpu => "cpu",
+        Device::Vulkan(_) => "vulkan",
+        #[cfg(feature = "opencl")]
+        Device::OpenCl(_) => "opencl",
+        #[cfg(feature = "sycl")]
+        Device::Sycl(_) => "sycl",
+        _ => "other",
+    }.into();
     summary["allocator_stats_available"] = dev.is_vulkan().into();
     summary["after_session_driver_memory_bytes"] = serde_json::to_value(driver_after)?;
     summary["after_session_expert_cache_reports"] = serde_json::to_value(cache_after)?;

@@ -38,7 +38,7 @@ use std::sync::Arc;
 
 use candle_core::quantized::{gguf_file, GgmlDType, QMatMul, QStorage, QTensor};
 use candle_core::{DType, Device, Module, Result, Tensor, D};
-use candle_nn::ops::{sigmoid, silu, softmax};
+use crate::precise::{sigmoid, silu, softmax};
 use candle_transformers::quantized_nn::RmsNorm;
 
 use crate::gguf_ext::GgufHeader;
@@ -94,6 +94,109 @@ struct Config {
     rope_theta: f32,
     context_length: usize,
     yarn: Option<YarnConfig>,
+}
+
+/// Only the real-model signature qualified on B50 enters the automatic
+/// precision contract. Explicit diagnostic flags keep their existing meaning.
+fn validated_vulkan_device(
+    ct: &gguf_file::Content,
+    cfg: &Config,
+    device: &Device,
+    n_ctx: usize,
+    mapped: bool,
+    cache_bytes: u64,
+) -> Result<Device> {
+    #[cfg(all(feature = "vulkan", target_arch = "x86_64"))]
+    if candle_core::vulkan_backend::VALIDATED_B50_PRECISE_MATH
+        && qualified_precision_workload(n_ctx, mapped, cache_bytes)
+        && crate::simd::simd_level() == crate::simd::SimdLevel::Avx512
+        && candle_core::vulkan_backend::kernels::native_enabled()
+        && ![
+            "JOSHUA_CPU_DOT_F64",
+            "JOSHUA_VULKAN_DOT_F64",
+            "JOSHUA_VULKAN_RMS_F64",
+            "JOSHUA_VULKAN_COMPENSATED_DOT",
+            "JOSHUA_VULKAN_FUSED_MHC",
+        ]
+        .iter()
+        .any(|k| std::env::var_os(k).is_some())
+    {
+        if let Device::Vulkan(d) = device {
+            if d.adapter_id() == (0x8086, 0xE212)
+                && d.supports_precise_math()
+                && d.limits().qgemv == candle_core::vulkan_backend::kernels::Qgemv::CubeClProduction
+                && qualified_precision_signature(ct, cfg)
+            {
+                tracing::info!("deepseek41: validated B50 precision kernels (context {n_ctx})");
+                return Ok(Device::Vulkan(d.with_precise_math()?));
+            }
+        }
+    }
+    let _ = (ct, cfg, n_ctx, mapped, cache_bytes);
+    Ok(device.clone())
+}
+
+#[cfg(any(all(feature = "vulkan", target_arch = "x86_64"), test))]
+fn qualified_precision_workload(n_ctx: usize, mapped: bool, cache_bytes: u64) -> bool {
+    mapped && cache_bytes == 0 && n_ctx > 0 && n_ctx <= 249
+}
+
+#[cfg(any(all(feature = "vulkan", target_arch = "x86_64"), test))]
+fn qualified_precision_signature(ct: &gguf_file::Content, cfg: &Config) -> bool {
+    if !(cfg.v41
+        && cfg.engram.is_some()
+        && cfg.n_layer == 40
+        && cfg.n_head == 64
+        && cfg.head_dim == 512
+        && cfg.rope_head_dim == 64
+        && cfg.hc_mult == 4
+        && cfg.hc_sinkhorn_iters == 20
+        && cfg.n_expert == 272
+        && cfg.n_expert_used == 6
+        && cfg.o_groups == 8)
+    {
+        return false;
+    }
+    let tensor = |name: &str, dtype: GgmlDType, dims: &[usize]| {
+        ct.tensor_infos
+            .get(name)
+            .is_some_and(|v| v.ggml_dtype == dtype && v.shape.dims() == dims)
+    };
+    if !tensor("token_embd.weight", GgmlDType::F16, &[129280, 5120])
+        || !tensor("output_norm.weight", GgmlDType::F32, &[5120])
+        || !tensor("output.weight", GgmlDType::Q8_0, &[129280, 5120])
+    {
+        return false;
+    }
+    (0..40).all(|i| {
+        let p = format!("blk.{i}");
+        [
+            ("attn_q_a.weight", GgmlDType::Q8_0, vec![1280, 5120]),
+            ("attn_q_b.weight", GgmlDType::Q8_0, vec![32768, 1280]),
+            ("attn_kv.weight", GgmlDType::Q8_0, vec![512, 5120]),
+            ("attn_output_a.weight", GgmlDType::Q8_0, vec![8192, 4096]),
+            ("attn_output_b.weight", GgmlDType::Q8_0, vec![5120, 8192]),
+            ("hc_attn_fn.weight", GgmlDType::Q2K, vec![24, 20480]),
+            ("hc_ffn_fn.weight", GgmlDType::Q2K, vec![24, 20480]),
+            ("ffn_gate_shexp.weight", GgmlDType::Q4K, vec![2304, 5120]),
+            ("ffn_up_shexp.weight", GgmlDType::Q4K, vec![2304, 5120]),
+            ("ffn_down_shexp.weight", GgmlDType::Q8_0, vec![5120, 2304]),
+            ("ffn_gate_inp.weight", GgmlDType::F16, vec![272, 5120]),
+            (
+                "ffn_gate_exps.weight",
+                GgmlDType::Q4K,
+                vec![272, 2304, 5120],
+            ),
+            ("ffn_up_exps.weight", GgmlDType::Q4K, vec![272, 2304, 5120]),
+            (
+                "ffn_down_exps.weight",
+                GgmlDType::Q4K,
+                vec![272, 5120, 2304],
+            ),
+        ]
+        .iter()
+        .all(|(n, d, s)| tensor(&format!("{p}.{n}"), *d, s))
+    })
 }
 
 /// DeepSeek-V4.1 engram n-gram tables (`{arch}.engram.*`): each engram
@@ -328,6 +431,7 @@ struct Mlp {
     up: QMatMul,
     down: QMatMul,
     clamp: f64,
+    precise_cpu_silu: bool,
     /// When the weights are borrowed from the model mapping, handles that
     /// can `MADV_WILLNEED` the gate/up/down byte ranges ahead of a matmul.
     /// `None` for streamed/fallback loads (weights are plain memory then).
@@ -377,7 +481,7 @@ impl Mlp {
 
     /// Combine `silu(gate) * up` and run the down projection.
     fn combine_and_down(&self, gate: Tensor, up: Tensor) -> Result<Tensor> {
-        let h = (silu(&gate)? * up)?;
+        let h = (crate::precise::silu_with_policy(&gate, self.precise_cpu_silu)? * up)?;
         self.down.forward(&h)
     }
 
@@ -1210,7 +1314,7 @@ impl Compressor {
                     (bkv, bsc)
                 };
                 let w = softmax(&bsc, 1)?;
-                rows.push((bkv * w)?.sum(1)?); // [nb, hd]
+                rows.push(crate::precise::sum(&(bkv*w)?,1)?); // [nb, hd]
                 poss.extend(0..nb as u32);
             }
         } else {
@@ -1246,7 +1350,7 @@ impl Compressor {
                             0,
                         )?;
                         let w = softmax(&sc_state, 0)?;
-                        rows.push((kv_state * w)?.sum_keepdim(0)?); // [1, hd]
+                        rows.push(crate::precise::sum_keepdim(&(kv_state*w)?,0)?); // [1, hd]
                         poss.push((pos / ratio) as u32);
                         // slide the window: current block becomes the previous one
                         state.kv = state.kv.slice_scatter(
@@ -1267,7 +1371,7 @@ impl Compressor {
                         .slice_scatter(&s.unsqueeze(0)?, 0, pos % ratio)?;
                     if (pos + 1).is_multiple_of(ratio) {
                         let w = softmax(&state.score, 0)?;
-                        rows.push(state.kv.mul(&w)?.sum_keepdim(0)?); // [1, hd]
+                        rows.push(crate::precise::sum_keepdim(&state.kv.mul(&w)?,0)?); // [1, hd]
                         poss.push((pos / ratio) as u32);
                     }
                 }
@@ -1407,11 +1511,11 @@ impl Indexer {
             .t()?
             .unsqueeze(0)?
             .broadcast_as((seq, self.head_dim, n_lid))?;
-        let sc = q.matmul(&kt)?; // [seq, ih, n_lid]
+        let sc = crate::precise::matmul(&q,&kt)?; // [seq, ih, n_lid]
         let sc = sc.relu()?;
         let w = self.proj.forward(x)?.squeeze(0)?; // [seq, ih]
         let w = ((w * self.softmax_scale)? * (self.n_head as f64).powf(-0.5))?;
-        let sc = sc.broadcast_mul(&w.unsqueeze(D::Minus1)?)?.sum(1)?; // [seq, n_lid]
+        let sc = crate::precise::sum(&sc.broadcast_mul(&w.unsqueeze(D::Minus1)?)?,1)?; // [seq, n_lid]
 
         // Causal mask: block b is visible to the query at absolute pos p iff
         // b < (p+1)/ratio.
@@ -1627,21 +1731,34 @@ impl Attention {
         }
 
         // Q: [seq, n_head, head_dim], RMS per head, then RoPE.
-        let qr = self.q_norm.forward(&self.q_a.forward(x)?)?; // [1, seq, q_lora_rank]
+        let qr = {
+            let qa = self.q_a.forward(x)?;
+            crate::activation_trace::record("ds-q-a", &qa)?;
+            self.q_norm.forward(&qa)?
+        };
+        crate::activation_trace::record("ds-q-a-norm", &qr)?;
         let q = self
             .q_b
             .forward(&qr)?
             .reshape((seq, self.n_head, self.head_dim))?;
+        crate::activation_trace::record("ds-q-b", &q)?;
         let q = if self.q_head_norm {
             let m = q.sqr()?.mean_keepdim(D::Minus1)?.affine(1.0, self.eps)?;
             q.broadcast_div(&m.sqrt()?)?
         } else {
             q
         };
+        crate::activation_trace::record("ds-q-head-norm", &q)?;
         let q = self.rope_qkv(&q.contiguous()?, offset)?.contiguous()?;
+        crate::activation_trace::record("ds-q-rope", &q)?;
 
         // Raw KV row (MLA has a single KV head), RoPE on the trailing slice.
-        let kv_raw = self.kv_norm.forward(&self.wkv.forward(x)?)?.squeeze(0)?; // [seq, head_dim]
+        let kv_raw = {
+            let kv_proj = self.wkv.forward(x)?;
+            crate::activation_trace::record("ds-kv-proj", &kv_proj)?;
+            self.kv_norm.forward(&kv_proj)?.squeeze(0)?
+        };
+        crate::activation_trace::record("ds-kv-norm", &kv_raw)?;
         let kv4 = kv_raw.unsqueeze(0)?.unsqueeze(0)?; // [1, 1, seq, d]
         let kv4 = rope_apply(
             &self.rotary,
@@ -1741,19 +1858,24 @@ impl Attention {
         // Sparse attention with per-head sink.
         let comp = kvs[self.kv_source].comp.clone();
         let (k_all, mask) = self.build_kv(comp.as_ref(), &swa_prev, &kv_raw, offset, seq, lid_idx.as_ref())?;
-        let scores = q.matmul(&k_all.transpose(1, 2)?)?; // [seq, h, n_kv]
+        crate::activation_trace::record("ds-k-all", &k_all)?;
+        let scores = crate::precise::matmul(&q, &k_all.transpose(1,2)?)?; // [seq, h, n_kv]
+        crate::activation_trace::record("ds-dot-scores", &scores)?;
         let scores = (scores * self.softmax_scale)?.broadcast_add(&mask.unsqueeze(1)?)?;
         let max = scores.max_keepdim(D::Minus1)?;
-        let e = scores.broadcast_sub(&max)?.exp()?;
+        let e = crate::precise::exp(&scores.broadcast_sub(&max)?)?;
+        crate::activation_trace::record("ds-exponential", &e)?;
         let sink = self.attn_sinks.unsqueeze(0)?.unsqueeze(2)?; // [1, h, 1]
-        let den = e
-            .sum_keepdim(D::Minus1)?
-            .add(&sink.broadcast_sub(&max)?.exp()?)?; // [seq, h, 1]
+        let den = crate::precise::sum_keepdim(&e,D::Minus1)?
+            .add(&crate::precise::exp(&sink.broadcast_sub(&max)?)?)?; // [seq, h, 1]
+        crate::activation_trace::record("ds-denominator", &den)?;
 
         // Batched over `seq`; a broadcast_matmul here would materialize the
         // whole key block once per head.
-        let num = e.contiguous()?.matmul(&k_all)?; // [seq, h, n_kv] @ [seq, n_kv, d] → [seq, h, d]
+        let num = crate::precise::matmul(&e.contiguous()?, &k_all)?; // [seq, h, n_kv] @ [seq, n_kv, d] → [seq, h, d]
+        crate::activation_trace::record("ds-numerator", &num)?;
         let o = num.broadcast_div(&den)?; // [seq, h, d]
+        crate::activation_trace::record("ds-context", &o)?;
 
         // Derope the output's trailing slice.
         let o4 = o.unsqueeze(0)?.transpose(1, 2)?; // [1, h, seq, d]
@@ -1766,6 +1888,7 @@ impl Attention {
             true,
         )?;
         let o = o4.transpose(1, 2)?.squeeze(0)?; // [seq, h, d]
+        crate::activation_trace::record("ds-derope", &o)?;
 
         // Each group uses only its diagonal block of wo_a. Native Q8 decode
         // computes those outputs directly; prefill retains the original GEMM.
@@ -1774,6 +1897,7 @@ impl Attention {
         let y = crate::attention::grouped_output_projection(
             &self.wo_a, &og, self.o_groups, self.o_lora_rank,
         )?;
+        crate::activation_trace::record("ds-grouped-out", &y)?;
         self.wo_b.forward(&y)?.reshape((1, seq, ()))
     }
 
@@ -2214,9 +2338,11 @@ impl Moe {
         let n_tokens = b * seq_len;
         let x2 = xs.reshape((n_tokens, h))?;
 
-        let logits = x2.matmul(&self.gate_t)?; // [n_tokens, n_expert]
-                                               // sqrt(softplus(x)) scoring; bias shifts selection only.
-        let probs = crate::moe::Gating::SqrtSoftplus.scores(&logits)?;
+        crate::activation_trace::record("ds-moe-input", &x2)?;
+        let logits = crate::precise::matmul(&x2, &self.gate_t)?; // [n_tokens, n_expert]
+        crate::activation_trace::record("ds-moe-logits", &logits)?;
+        // sqrt(softplus(x)) scoring; bias shifts selection only.
+        let probs = crate::precise::sqrt_softplus(&logits)?;
         let (weights, indices) = if self.hash {
             // Hash layers: expert *selection* comes from tid2eid[token_id], but the
             // routing *weights* still come from the gate network's softplus scores
@@ -2246,14 +2372,21 @@ impl Moe {
             (weights, idx)
         };
 
+        crate::activation_trace::record("ds-moe-weights", &weights)?;
+        crate::activation_trace::record("ds-moe-indices", &indices)?;
+
         // A decode step (one token per sequence, batched or not) warms the
         // pool from its routing; a prefill only reads the pool.
         let decode = ctx.decode;
         let (routed, routed_ids) = self.dispatch(&x2, &indices, &weights, n_tokens, decode, ctx)?;
+        crate::activation_trace::record("ds-moe-routed", &routed)?;
         let mut out = routed;
         if let Some(shared) = &self.shared {
-            out = (out + shared.forward(&x2)?)?;
+            let shared = shared.forward(&x2)?;
+            crate::activation_trace::record("ds-moe-shared", &shared)?;
+            out = (out + shared)?;
         }
+        crate::activation_trace::record("ds-ffn-out", &out)?;
         Ok((out.reshape((b, seq_len, h))?, routed_ids))
     }
 
@@ -2748,6 +2881,8 @@ impl Layer {
         history: &[u32],
         max_seq: usize,
     ) -> Result<FfnInput> {
+        crate::activation_trace::position(offset);
+        crate::activation_trace::record("ds-input", &stream.xs)?;
         let seq = stream.xs.dim(1)?;
         if let (Some(eg), Some(ecfg)) = (&self.engram, &cfg.engram) {
             if history.len() < offset + seq {
@@ -2755,11 +2890,17 @@ impl Layer {
             }
             stream.xs = eg.forward(&stream.xs, ecfg.rows(eg.index, history, offset, seq))?;
         }
+        crate::activation_trace::record("ds-engram", &stream.xs)?;
         let (x, mix) = stream.enter(&self.hc_attn, cfg)?;
+        crate::activation_trace::record("ds-attn-enter", &x)?;
         let h = self.attn_norm.forward(&x)?;
+        crate::activation_trace::record("ds-attn-norm", &h)?;
         let h = self.attn.forward(kvs, l, &h, offset, max_seq)?;
+        crate::activation_trace::record("ds-attn-out", &h)?;
         let stream = stream.leave(&h, mix, cfg.v41)?;
+        crate::activation_trace::record("ds-attn-leave", &stream.xs)?;
         let (x, mix) = stream.enter(&self.hc_ffn, cfg)?;
+        crate::activation_trace::record("ds-ffn-enter", &x)?;
         Ok(FfnInput {
             h: self.ffn_norm.forward(&x)?,
             stream,
@@ -3038,7 +3179,7 @@ impl<R: Read + Seek> Reader<R> {
         Tensor::from_vec(vals, dims, &self.device)
     }
     fn qmatmul(&mut self, name: &str) -> Result<QMatMul> {
-        QMatMul::from_qtensor(self.qtensor(name)?)
+        crate::precise::qmatmul(self.qtensor(name)?)
     }
     fn qmatmul_opt(&mut self, name: &str) -> Result<Option<QMatMul>> {
         // Distinguish "absent" from "present but failed to load": a tensor
@@ -3198,6 +3339,23 @@ impl ModelWeights {
         >,
     ) -> Result<Self> {
         let cfg = Config::from_metadata(&ct.metadata)?;
+        #[cfg(feature = "distributed")]
+        let local_model = cluster.is_none();
+        #[cfg(not(feature = "distributed"))]
+        let local_model = true;
+        let selected_device = if local_model {
+            validated_vulkan_device(
+                &ct,
+                &cfg,
+                device,
+                n_ctx,
+                mmap.is_some(),
+                device_expert_cache_bytes.unwrap_or(0),
+            )?
+        } else {
+            device.clone()
+        };
+        let device = &selected_device;
         if !(expert_device.is_cpu()
             || expert_device.is_opencl()
             || expert_device.is_sycl()
@@ -4499,7 +4657,8 @@ fn load_moe<R: Read + Seek>(
         None
     } else {
         rd.has(&format!("{p}.exp_probs_b.bias"))
-            .then(|| rd.f32_tensor(&format!("{p}.exp_probs_b.bias")))
+            .then(|| rd.f32_tensor(&format!("{p}.exp_probs_b.bias"))
+                .and_then(|b| crate::moe::center_selection_bias(&b)))
             .transpose()?
     };
     // A hash layer routes through the table on every token, so a missing one is
@@ -4563,6 +4722,7 @@ fn load_moe<R: Read + Seek>(
                     up: up.qmatmul,
                     down: down.qmatmul,
                     clamp,
+                    precise_cpu_silu: crate::precise::precise_vulkan_device(&rd.device),
                     prefetch,
                 }
             })
@@ -4576,6 +4736,7 @@ fn load_moe<R: Read + Seek>(
             down: rd.qmatmul(&format!("{p}.ffn_down_shexp.weight"))?,
             clamp: cfg.swiglu_clamp_shexp.get(layer).copied().unwrap_or(0.0),
             prefetch: None,
+            precise_cpu_silu: crate::precise::precise_vulkan_device(&rd.device),
         })
     } else {
         None
@@ -4886,6 +5047,46 @@ fn split_experts<R: Read + Seek>(
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn b50_precision_workload_stays_within_qualification() {
+        assert!(qualified_precision_workload(249, true, 0));
+        assert!(!qualified_precision_workload(250, true, 0));
+        assert!(!qualified_precision_workload(0, true, 0));
+        assert!(!qualified_precision_workload(249, false, 0));
+        assert!(!qualified_precision_workload(249, true, 1));
+    }
+
+    #[test]
+    #[ignore = "manual B50 model header check; requires JOSHUA_B50_MODEL"]
+    fn b50_precision_real_model_signature() -> Result<()> {
+        let path = std::env::var("JOSHUA_B50_MODEL").expect("JOSHUA_B50_MODEL");
+        let mut f = std::fs::File::open(path)?;
+        let mut ct = gguf_file::Content::read(&mut f)?;
+        let mut cfg = Config::from_metadata(&ct.metadata)?;
+        assert!(qualified_precision_signature(&ct, &cfg));
+        #[cfg(all(feature = "vulkan", target_arch = "x86_64"))]
+        if let Ok(expected) = std::env::var("JOSHUA_EXPECT_B50_PRECISION") {
+            let device = Device::new_vulkan(0)?;
+            let selected = validated_vulkan_device(&ct, &cfg, &device, 249, true, 0)?;
+            assert_eq!(crate::precise::precise_vulkan_device(&selected), expected == "1");
+            assert!(device.same_device(&selected));
+            assert!(!crate::precise::precise_vulkan_device(&device));
+            let outside = validated_vulkan_device(&ct, &cfg, &device, 250, true, 0)?;
+            assert!(!crate::precise::precise_vulkan_device(&outside));
+        }
+        cfg.n_expert_used += 1;
+        assert!(!qualified_precision_signature(&ct, &cfg));
+        cfg.n_expert_used -= 1;
+        // A later layer with a different quantization must not inherit
+        // another model's validated CPU expert arithmetic contract.
+        ct.tensor_infos
+            .get_mut("blk.39.ffn_down_exps.weight")
+            .unwrap()
+            .ggml_dtype = GgmlDType::Q6K;
+        assert!(!qualified_precision_signature(&ct, &cfg));
+        Ok(())
+    }
 
     /// Routing buckets by (token, slot) into per-expert lists, and a router
     /// id naming no expert is a loud error (it used to be silently dropped,

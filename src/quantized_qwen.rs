@@ -721,6 +721,9 @@ impl Attention {
         let mask = sparse.as_ref().or(mask);
         let kv_cache = &mut state.kv;
         let (q, k, v) = self.qkv.forward(xs)?;
+        crate::activation_trace::record("qwen-q-proj", &q)?;
+        crate::activation_trace::record("qwen-k-proj", &k)?;
+        crate::activation_trace::record("qwen-v-proj", &v)?;
 
         let (q, gate) = if self.gated {
             let q = q.reshape((b, seq_len, self.n_head, 2 * hd))?;
@@ -739,10 +742,15 @@ impl Attention {
         if let Some(n) = &self.k_norm {
             k = per_head_norm(n, &k)?;
         }
+        crate::activation_trace::record("qwen-q-norm", &q)?;
+        crate::activation_trace::record("qwen-k-norm", &k)?;
         let q = self.rope.apply_leading(&q, offset)?;
         let k = self.rope.apply_leading(&k, offset)?;
 
+        crate::activation_trace::record("qwen-q-rope", &q)?;
+        crate::activation_trace::record("qwen-k-rope", &k)?;
         let mut ctx = crate::attention::cached_attention(kv_cache, &q, k, v, mask, self.scale)?;
+        crate::activation_trace::record("qwen-attn-ctx", &ctx)?;
         if let Some(gate) = gate {
             ctx = (ctx * sigmoid(&gate)?)?;
         }
@@ -1224,7 +1232,13 @@ impl Mlp {
                 (y.narrow(D::Minus1, 0, half)?, y.narrow(D::Minus1, half, half)?)
             }
         };
-        self.down.forward(&(silu(&w1)? * w3)?)
+        crate::activation_trace::record("qwen-ffn-gate", &w1)?;
+        crate::activation_trace::record("qwen-ffn-up", &w3)?;
+        let act = silu(&w1)?;
+        crate::activation_trace::record("qwen-ffn-silu", &act)?;
+        let act = (act * w3)?;
+        crate::activation_trace::record("qwen-ffn-product", &act)?;
+        self.down.forward(&act)
     }
 
     /// This expert with every weight re-uploaded onto `device` (see
@@ -1468,12 +1482,27 @@ impl Layer {
         input: &crate::native_session::LayerInput<'_>,
     ) -> Result<(Tensor, Vec<u32>)> {
         let (mask, offset) = (input.mask, input.offset);
+        crate::activation_trace::position(offset);
         match &self.residual {
             Residual::PreNorm { attn_norm, ffn_norm } => {
-                let h = self.mixer_forward(state, &attn_norm.forward(xs)?, mask, offset)?;
+                crate::activation_trace::record("qwen-input", xs)?;
+                let h = {
+                    let norm = attn_norm.forward(xs)?;
+                    crate::activation_trace::record("qwen-attn-norm", &norm)?;
+                    self.mixer_forward(state, &norm, mask, offset)?
+                };
+                crate::activation_trace::record("qwen-attn-out", &h)?;
                 let xs = (xs + h)?;
-                let (h, routed) = self.ffn.forward(&ffn_norm.forward(&xs)?)?;
-                Ok(((xs + h)?, routed))
+                crate::activation_trace::record("qwen-attn-residual", &xs)?;
+                let (h, routed) = {
+                    let norm = ffn_norm.forward(&xs)?;
+                    crate::activation_trace::record("qwen-ffn-norm", &norm)?;
+                    self.ffn.forward(&norm)?
+                };
+                crate::activation_trace::record("qwen-ffn-out", &h)?;
+                let out = (xs + h)?;
+                crate::activation_trace::record("qwen-output", &out)?;
+                Ok((out, routed))
             }
             Residual::Sandwich { attn_norm, attn_post_norm, ffn_norm, ffn_post_norm } => {
                 let h = self.mixer_forward(state, &attn_norm.forward(xs)?, mask, offset)?;

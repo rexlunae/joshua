@@ -245,6 +245,8 @@ pub struct Ctx {
     pub context: usize,
     pub device: usize,
     pub queue: usize,
+    /// This adapter/bridge supports the validated 256-lane numerical contract.
+    pub canonical_quantized: bool,
     /// The device's fault buffer (see `kernels.hpp`): indexing kernels set
     /// the calling thread's slot on an out-of-range id; the host reports
     /// and clears it at the next read-back.
@@ -694,7 +696,11 @@ pub(crate) fn qgemv_mr_cols(k: usize, wg: usize) -> usize {
 #[allow(clippy::too_many_arguments)]
 pub fn run_qgemv(c: &Ctx, dtype: crate::quantized::GgmlDType, x: usize, w: usize, out: usize, m: usize, n: usize, k: usize, woff: u64, xoff: usize) -> Result<()> {
     check_block_k(k, dtype.block_size(), "qgemv")?;
-    if m <= QGEMV_MR_MAX_ROWS && qgemv_multirow(dtype) {
+    // Qwen's B50 parity contract needs ordered 32-element FMA chunks and
+    // the 256-lane tree. The eight-element MR dots change accumulation
+    // order; only keep them on the legacy/unvalidated adapter path.
+    if m <= QGEMV_MR_MAX_ROWS && qgemv_multirow(dtype)
+        && !(c.canonical_quantized && matches!(dtype, crate::quantized::GgmlDType::Q4K | crate::quantized::GgmlDType::Q6K)) {
         let mut kn = c.kernel("k_qgemv_mr")?;
         let wg = kn.wg;
         let cols = qgemv_mr_cols(k, wg);
