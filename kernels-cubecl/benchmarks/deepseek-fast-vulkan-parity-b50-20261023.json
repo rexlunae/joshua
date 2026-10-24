@@ -1,0 +1,371 @@
+{
+  "status": "qualified",
+  "date": "2026-10-23 America/Los_Angeles",
+  "base_head": "646140b9183df8ee83436c7c82ec11fab4096989",
+  "raw_root": "/home/tserica/benchmark-results/fast-vulkan-parity-b50-20261023",
+  "manifest": "/home/tserica/benchmark-results/fast-vulkan-parity-b50-20261023/production/manifest.json",
+  "source_patch_sha256": "639c4b6beb320fd95a54481c2305e5bbfa099a8a5054b46120c198ab532e1cc1",
+  "hardware": {
+    "gpu": "Intel Arc Pro B50 8086:E212",
+    "cpu": "AMD Ryzen 9 9950X, 32 logical CPUs, AVX-512"
+  },
+  "model": {
+    "path": "/home/tserica/models/DSV41-REAP272E-balanced.gguf",
+    "bytes": 290070476416,
+    "architecture": "deepseek41",
+    "layers": 40,
+    "experts": 272,
+    "selected_experts": 6,
+    "routed_experts": "borrowed CPU mmap Q4_K; unchanged compact storage",
+    "dense_formats": [
+      "Q8_0",
+      "Q4_K",
+      "Q2_K",
+      "F16",
+      "F32"
+    ]
+  },
+  "protocol": {
+    "prompt_trace": "deepseek-backend-trace-b50-20261023.json",
+    "prompt_tokens": 121,
+    "prefill_chunk": 32,
+    "decode_tokens": 128,
+    "context": 249,
+    "sessions": 2,
+    "warm_prompt_tokens": 8,
+    "warm_decode_tokens": 2,
+    "teacher_forced": true,
+    "activation_capture": false,
+    "identical_executable": true,
+    "serial_runs_without_builds_or_other_benchmarks": true,
+    "logit_rows": "Final prefill row plus 128 decode rows; all-row prefill/verification and cache continuation also covered by tiny-model tests."
+  },
+  "reference": {
+    "accuracy": "CPU precision arithmetic; correct host-float64 RoPE tables",
+    "independent_checks": "Float64 primitive and tiny-model references, including native tests. No independent full-290GB float64 oracle was generated.",
+    "performance": "same-executable all-five-precision-flags=0 fast Vulkan. Its former output drift is expected and is not the accuracy anchor."
+  },
+  "isolation_and_fix": [
+    "Fresh fast capture first crossed 1e-5 at the Q2_K HC projection (1.52587890625e-5); preceding HC RMS first differed by 2.384185791015625e-7. Dense dot, RMS, RoPE, reductions and nonlinear roundings all needed the corrected reference contract.",
+    "Specialized Q8 projections use four compensated FP32 streams, explicit FMA product residuals and TwoSum renormalization, with FP64 final reduction. Grouped Q8 retains exact four-stream FP64 accumulation; Q2_K/Q4_K use 32 FP64 lanes.",
+    "Naga GLSL precise was insufficient: tagged shaders receive SPIR-V NoContraction decorations. Untagged shaders are untouched.",
+    "Parallel small-row FP64 matmul avoids padded GEMM for decode; four-row quantized prefill kernels reuse block decoding and handle partial rows.",
+    "Fused HC4 Sinkhorn removes thousands of launches while preserving original float32 rounding boundaries and ordered float64 sums/divisions. Serial decode and parallel prefill variants expose pre/post/comb as borrowed views of one buffer.",
+    "Model-scoped immutable Vulkan handles share the original context, allocator and queue. Routed CPU expert SiLU inherits the model contract at load time; no process-wide environment mutation or thread-local policy is used."
+  ],
+  "production_default_vulkan": {
+    "backend": "vulkan",
+    "executable_sha256": "614e90710351348402628819359a15c9f01d89334fa563b08762e98e062b1519",
+    "median_ms_per_token": 729.166768234375,
+    "ms_per_token": [
+      730.3436334531247,
+      727.9899030156253
+    ],
+    "prefill_ms": [
+      42528.533845,
+      40677.247657
+    ],
+    "loaded_reserved_live": [
+      9365831680,
+      9224831488
+    ],
+    "peak_reserved_live": [
+      9500049408,
+      9279003648
+    ],
+    "after_session_reserved_live": [
+      [
+        9500049408,
+        9224831488
+      ],
+      [
+        9500049408,
+        9224831488
+      ]
+    ],
+    "after_session_driver_memory_bytes": [
+      {
+        "drm-resident-gtt": 2097152,
+        "drm-resident-stolen": 0,
+        "drm-resident-system": 0,
+        "drm-resident-vram0": 9534631936,
+        "drm-total-gtt": 2097152,
+        "drm-total-stolen": 0,
+        "drm-total-system": 0,
+        "drm-total-vram0": 9534631936
+      },
+      {
+        "drm-resident-gtt": 2097152,
+        "drm-resident-stolen": 0,
+        "drm-resident-system": 0,
+        "drm-resident-vram0": 9534631936,
+        "drm-total-gtt": 2097152,
+        "drm-total-stolen": 0,
+        "drm-total-system": 0,
+        "drm-total-vram0": 9534631936
+      }
+    ],
+    "max_repeat_logit_difference": 0.0,
+    "prefill_cpu_fallbacks": [
+      0,
+      0
+    ],
+    "decode_cpu_fallbacks": [
+      0,
+      0
+    ],
+    "load_seconds": 4.752187038,
+    "reference_logits_bytes": 66708480,
+    "private_endpoints_kib": [
+      185432,
+      185512
+    ],
+    "private_spread_kib": 80
+  },
+  "cpu_precision_reference": {
+    "backend": "cpu",
+    "executable_sha256": "614e90710351348402628819359a15c9f01d89334fa563b08762e98e062b1519",
+    "median_ms_per_token": 689.7205555859372,
+    "ms_per_token": [
+      704.2857279453121,
+      675.1553832265622
+    ],
+    "prefill_ms": [
+      45058.247347,
+      43787.764451
+    ],
+    "loaded_reserved_live": [
+      0,
+      0
+    ],
+    "peak_reserved_live": [
+      0,
+      0
+    ],
+    "after_session_reserved_live": [
+      [
+        0,
+        0
+      ],
+      [
+        0,
+        0
+      ]
+    ],
+    "after_session_driver_memory_bytes": [
+      {},
+      {}
+    ],
+    "max_repeat_logit_difference": 0.0,
+    "prefill_cpu_fallbacks": [
+      0,
+      0
+    ],
+    "decode_cpu_fallbacks": [
+      0,
+      0
+    ],
+    "load_seconds": 0.638653488,
+    "reference_logits_bytes": 66708480,
+    "private_endpoints_kib": [
+      626412,
+      626592
+    ],
+    "private_spread_kib": 180
+  },
+  "fast_vulkan_control": {
+    "backend": "vulkan",
+    "executable_sha256": "614e90710351348402628819359a15c9f01d89334fa563b08762e98e062b1519",
+    "median_ms_per_token": 816.8549886562499,
+    "ms_per_token": [
+      819.6781136875002,
+      814.0318636249997
+    ],
+    "prefill_ms": [
+      38783.17423,
+      38293.207907
+    ],
+    "loaded_reserved_live": [
+      9365831680,
+      9224831488
+    ],
+    "peak_reserved_live": [
+      9365831680,
+      9279003648
+    ],
+    "after_session_reserved_live": [
+      [
+        9365831680,
+        9224831488
+      ],
+      [
+        9365831680,
+        9224831488
+      ]
+    ],
+    "after_session_driver_memory_bytes": [
+      {
+        "drm-resident-gtt": 2097152,
+        "drm-resident-stolen": 0,
+        "drm-resident-system": 0,
+        "drm-resident-vram0": 9404608512,
+        "drm-total-gtt": 2097152,
+        "drm-total-stolen": 0,
+        "drm-total-system": 0,
+        "drm-total-vram0": 9404608512
+      },
+      {
+        "drm-resident-gtt": 2097152,
+        "drm-resident-stolen": 0,
+        "drm-resident-system": 0,
+        "drm-resident-vram0": 9404608512,
+        "drm-total-gtt": 2097152,
+        "drm-total-stolen": 0,
+        "drm-total-system": 0,
+        "drm-total-vram0": 9404608512
+      }
+    ],
+    "max_repeat_logit_difference": 0.0,
+    "prefill_cpu_fallbacks": [
+      0,
+      0
+    ],
+    "decode_cpu_fallbacks": [
+      0,
+      0
+    ],
+    "load_seconds": 4.085621348,
+    "reference_logits_bytes": 66708480,
+    "private_endpoints_kib": [
+      183316,
+      183332
+    ],
+    "private_spread_kib": 16
+  },
+  "accuracy": {
+    "max_abs_logit_difference": 8.58306884765625e-06,
+    "rms_logit_difference": 7.507342947435399e-07,
+    "matching_top1_rows": 129,
+    "logits_compared": 16677120,
+    "gates": {
+      "same_executable": true,
+      "absolute_logits_1e_5": true,
+      "repeat_logits_1e_5": true,
+      "reference_repeat_logits_1e_5": true,
+      "repeated_sessions_measured": true,
+      "reference_repeated_sessions_measured": true,
+      "reference_private_memory_growth_le_1MiB": true,
+      "same_greedy_choices": true,
+      "private_memory_growth_le_1MiB": true,
+      "device_memory_stable": true,
+      "reference_memory_stable": true,
+      "no_cpu_fallbacks": true
+    },
+    "default_vs_optin_bit_identical": true,
+    "default_logits_sha256": "f9e4004cb6fe5fc8e126f2a6075b8d79b201403b9b58da226b8e1396994d3c48"
+  },
+  "performance": {
+    "decode_speedup_vs_reference": 1.1202581141131893,
+    "prefill_median_ms": 41602.890751,
+    "session_median_ms": 134936.23708499997,
+    "session_speedup_vs_reference": 1.06046850503442,
+    "performance_gates": {
+      "all_decode_samples_faster": true,
+      "all_session_samples_faster": true
+    }
+  },
+  "memory": {
+    "private_limit_kib": 1024,
+    "driver_vram_growth_limit_bytes": 1048576,
+    "allocator_endpoint_growth_allowed": false,
+    "additional_fixed_vulkan_reservation_bytes": 134217728,
+    "weights_copied_or_dequantized_for_new_policy": false,
+    "note": "One additional 128-MiB allocator block fills during the first complete session, then reservation/live and driver VRAM endpoints remain stable. File-backed mmap RSS is separate from private RssAnon+VmSwap. Fallback counts cover tracked native round trips, not intentional CPU-mmap experts or existing host routing."
+  },
+  "dispatch": {
+    "qualified": true,
+    "vulkan_numeric_dispatch_enabled": true,
+    "backend_auto_preference_changed": false,
+    "reason_no_backend_preference_change": "Corrected CPU decode remains faster; this change qualifies Vulkan arithmetic, not a new cross-backend automatic preference.",
+    "scope": "Native CubeClProduction Vulkan on B50 with shaderFloat64, AVX-512 host, local mmap compatible 40-layer DeepSeek41/272-expert/six-route/HC4 tensor signature, no expert cache, context <=249. Explicit numerical diagnostic flags bypass model automatic qualification. Other models/quantizations/contexts remain unqualified."
+  },
+  "validation": {
+    "default_library": {
+      "passed": 427,
+      "ignored": 10
+    },
+    "architecture_integration": {
+      "passed": 40,
+      "ignored": 3,
+      "targets": [
+        "deepseek41_tests",
+        "deepseek4_tests",
+        "mhc_tests",
+        "glm_tests"
+      ]
+    },
+    "native_precision": 5,
+    "native_fused_sinkhorn": 1,
+    "native_policy_isolation": 1,
+    "model_signature_and_context_boundaries": 2,
+    "core_barrier_shaders": "passed; includes small-row reduction, specialized Q8, fused HC variants",
+    "default_build": "passed",
+    "release_feature_build": "vulkan,opencl,sycl passed",
+    "pre_existing_core_integration_build_failure": {
+      "target": "candle-core quantized_tests",
+      "failure": "three non-exhaustive matches missing GgmlDType::Iq2Xxs",
+      "reproduced_base": "646140b",
+      "log": "/home/tserica/benchmark-results/fast-vulkan-parity-b50-20261023/base-core-quantized-test-build.log"
+    },
+    "final_qualification_guard": {
+      "passed": true,
+      "finished": "2026-10-23T19:52:35.622006",
+      "post_benchmark_change": "Qualification now requires effective AVX-512 dispatch, respecting JOSHUA_SIMD overrides; the measured host used AVX-512. Arithmetic kernels are unchanged from the frozen benchmark source.",
+      "tests": [
+        "real-header noflag B50 policy active",
+        "forced AVX2 policy inactive",
+        "explicit all-zero control policy inactive",
+        "context250 policy inactive",
+        "default and feature library build checks"
+      ]
+    }
+  },
+  "retained_trials": [
+    {
+      "path": "compensated-native.log",
+      "outcome": "initial compensation failed by ~0.18 because precise was dropped; rejected; fixed with NoContraction"
+    },
+    {
+      "path": "full-fused",
+      "max_abs": 8.58306884765625e-06,
+      "median_decode_ms": 1103.124,
+      "outcome": "full parity and memory passed, speed failed; rejected"
+    },
+    {
+      "path": "hybrid",
+      "decode_tokens": 16,
+      "max_abs": 7.152557373046875e-06,
+      "median_decode_ms": 921.355,
+      "outcome": "diagnostic only; insufficient speed"
+    },
+    {
+      "path": "specialized",
+      "decode_tokens": 16,
+      "max_abs": 7.152557373046875e-06,
+      "median_decode_ms": 728.316,
+      "outcome": "diagnostic passed; followed by full trials"
+    },
+    {
+      "path": "full-specialized",
+      "max_abs": 8.58306884765625e-06,
+      "median_decode_ms": 729.229,
+      "vulkan_private_growth_kib": 180,
+      "cpu_reference_private_growth_kib": 1060,
+      "outcome": "Vulkan parity/speed/memory passed; CPU reference failed 1024-KiB private-memory gate by 36 KiB; not used to enable dispatch"
+    },
+    {
+      "path": "production",
+      "outcome": "final no-flag dispatch and fresh same-executable controls; decision derives from every final gate"
+    }
+  ]
+}

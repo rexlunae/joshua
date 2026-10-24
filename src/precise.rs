@@ -24,8 +24,8 @@ pub(crate) fn active(x: &Tensor) -> bool {
     match x.device() {
         Device::Cpu => cpu_enabled(),
         #[cfg(feature = "vulkan")]
-        Device::Vulkan(_) => {
-            candle_core::vulkan_backend::kernels::f64_dot_enabled()
+        Device::Vulkan(d) => {
+            candle_core::vulkan_backend::kernels::f64_dot_enabled_on(d)
                 && candle_core::vulkan_backend::kernels::native_enabled()
         }
         _ => false,
@@ -159,6 +159,32 @@ pub(crate) fn silu(x: &Tensor) -> Result<Tensor> {
         candle_nn::ops::silu(x)
     }
 }
+
+/// Routed CPU experts inherit the owning model's arithmetic policy without
+/// process-wide environment changes or thread-local state leaking to Rayon.
+pub(crate) fn silu_with_policy(x: &Tensor, precise_cpu: bool) -> Result<Tensor> {
+    #[cfg(target_arch = "x86_64")]
+    if precise_cpu
+        && x.device().is_cpu()
+        && x.dtype() == DType::F32
+        && x.is_contiguous()
+        && crate::simd::avx2_fma_available()
+    {
+        return x.apply_op1_no_bwd(&Unary(2));
+    }
+    let _ = precise_cpu;
+    silu(x)
+}
+
+pub(crate) fn precise_vulkan_device(device: &Device) -> bool {
+    #[cfg(feature = "vulkan")]
+    if let Device::Vulkan(d) = device {
+        return d.precise_math();
+    }
+    let _ = device;
+    false
+}
+
 pub(crate) fn sqrt_softplus(x: &Tensor) -> Result<Tensor> {
     if active(x) && x.is_contiguous() {
         x.apply_op1_no_bwd(&Unary(3))
@@ -615,11 +641,10 @@ pub(crate) fn qmatmul(
         return Ok(QMatMul::QTensor(std::sync::Arc::new(q)));
     }
     #[cfg(feature = "vulkan")]
-    if matches!(q.device(), Device::Vulkan(_))
-        && candle_core::vulkan_backend::kernels::f64_dot_enabled()
-        && dtype == GgmlDType::F32
-    {
-        return Ok(QMatMul::QTensor(std::sync::Arc::new(q)));
+    if let Device::Vulkan(d) = q.device() {
+        if candle_core::vulkan_backend::kernels::f64_dot_enabled_on(&d) && dtype == GgmlDType::F32 {
+            return Ok(QMatMul::QTensor(std::sync::Arc::new(q)));
+        }
     }
     QMatMul::from_qtensor(q)
 }
@@ -627,6 +652,20 @@ pub(crate) fn qmatmul(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_scoped_cpu_silu_matches_float64() -> Result<()> {
+        if !crate::simd::avx2_fma_available() {
+            return Ok(());
+        }
+        let values: Vec<f32> = (-127..128).map(|i| i as f32 / 7.3).collect();
+        let x = Tensor::from_vec(values.clone(), values.len(), &Device::Cpu)?;
+        let got = silu_with_policy(&x, true)?.to_vec1::<f32>()?;
+        let want: Vec<f32> = values.into_iter().map(|v| reference(v, 2)).collect();
+        assert_eq!(got, want);
+        Ok(())
+    }
+
     fn reference(x: f32, op: u32) -> f32 {
         let x = x as f64;
         let e = (-x.abs()).exp();
@@ -829,7 +868,7 @@ mod tests {
             }
             assert_eq!(outputs[0], outputs[1], "softmax axis {axis}");
         }
-        for m in [1, 5, 33] {
+        for m in [1, 2, 4, 5, 33] {
             let (batch, k, n) = (2, 257, 17);
             let av: Vec<f32> = (0..batch * (m + 2) * k)
                 .map(|i| ((i * 31 % 127) as f32 - 63.) / 32.)
@@ -855,8 +894,11 @@ mod tests {
                 let b = Tensor::from_vec(bv.clone(), (batch, n + 2, k), dev)?
                     .narrow(1, 1, n)?
                     .transpose(1, 2)?;
-                let got = matmul(&a, &b)?.flatten_all()?.to_vec1::<f32>()?;
-                assert_eq!(got, want, "{dev:?} M={m}");
+                for contiguous_rhs in [false, true] {
+                    let rhs = if contiguous_rhs { b.contiguous()? } else { b.clone() };
+                    let got = matmul(&a, &rhs)?.flatten_all()?.to_vec1::<f32>()?;
+                    assert_eq!(got, want, "{dev:?} M={m} contiguous_rhs={contiguous_rhs}");
+                }
             }
         }
         for cols in [512, 1280, 5120, 20480] {
@@ -914,7 +956,7 @@ mod tests {
                 let qs = [qmatmul(q)?, qmatmul(v)?];
                 for m in [1, 2, 16, 32, 33] {
                     let input: Vec<f32> = (0..(m + 2) * k)
-                        .map(|i| ((i * 17 % 127) as f32 - 63.) / 32.)
+                        .map(|i| (((i * 17 % 127) as f32 - 63.) / 31.7).sin())
                         .collect();
                     let mut want = vec![0f32; m * n];
                     for i in 0..m {
@@ -959,7 +1001,7 @@ mod tests {
             let cpu_q = qmatmul(cpu_q)?;
             let gpu_q = qmatmul(gpu_q)?;
             let input: Vec<f32> = (0..groups * k)
-                .map(|i| ((i * 17 % 127) as f32 - 63.) / 32.)
+                .map(|i| (((i * 17 % 127) as f32 - 63.) / 31.7).sin())
                 .collect();
             let x = Tensor::from_vec(input.clone(), (groups, k), &cpu)?;
             let full = cpu_q.forward(&x)?.to_vec2::<f32>()?;

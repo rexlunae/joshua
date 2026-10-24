@@ -920,9 +920,10 @@ remain intentional). CPU decode is **1.145×** faster and total session time is
 **1.072×** faster than the fast control; prefill alone is slightly slower.
 Every CPU decode and total-session sample beats every fast-control sample.
 
-Automatic choices remain unchanged: the fast production numerical contract
-still differs by more than **1e-5**, despite matching all 129 greedy choices.
-The precision paths remain opt-in. This is cross-backend full-model parity
+These measurements left automatic choices unchanged: the fast production
+numerical contract differed by more than **1e-5**, despite matching all 129 greedy
+choices. The precision paths remained opt-in at this stage; the fast Vulkan
+follow-up below qualifies a scoped Vulkan profile. This is cross-backend full-model parity
 supported by independent primitive/tiny-model float64 checks, not an independent
 full-float64 execution of the 290 GB model.
 
@@ -1156,3 +1157,69 @@ that failure was reproduced on unchanged base, then the CPU fixtures were
 made explicit. Raw logits and full memory timelines remain in
 `/tmp/joshua-backends-20261018`; the saved report retains hashes, bounds,
 endpoints, timings and the failed configurations.
+
+## Fast Vulkan precision follow-up (B50, 2026-10-23)
+
+The [full qualification report](benchmarks/deepseek-fast-vulkan-parity-b50-20261023.json)
+compares the corrected **no-flag production dispatch**, CPU precision reference,
+and fast Vulkan control using one frozen executable. It replays the saved
+121-token prompt in batches of 32, then **128 teacher-forced decode tokens**,
+with context 249, two independent sessions per path, and activation capture off.
+
+| Path | Median decode ms/token | Median prefill ms | Private endpoint spread |
+|---|---:|---:|---:|
+| Corrected default Vulkan | 729.167 | 41,602.9 | 80 KiB |
+| CPU precision reference | 689.721 | 44,423.0 | 180 KiB |
+| Fast Vulkan control | 816.855 | 38,538.2 | 16 KiB |
+
+Corrected Vulkan's maximum absolute error is **8.5830688e-06**
+across **16,677,120 logits**, under the unchanged **1e-5** gate;
+all 129 greedy choices match the CPU reference, and repeat drift is zero.
+Decode throughput is **1.120×**, and total-session
+speed is **1.060×**, relative to fast Vulkan.
+Prefill alone is **8.0% slower**;
+the established speed gates require every decode and total-session sample to beat
+every fast-control sample. Prefill timing is reported separately.
+
+Specialized compensated Q8 projections, parallel small-row FP64 matmul and
+fused HC4 Sinkhorn retain the corrected reference's arithmetic contract while
+removing generic quantization overhead and thousands of launches. Tagged
+compensation/fusion shaders receive SPIR-V `NoContraction` decorations because
+Naga drops GLSL `precise`. Grouped Q8 retains exact FP64 accumulation; Q2_K/Q4_K
+use wider FP64 reductions. Native tests include partial rows, nonzero offsets,
+multiple batches, cache continuation and independent float64 references.
+
+Model-scoped Vulkan handles share the existing context, buffers, queue and
+allocator. No private weight copy or full expert dequantization was added.
+After the first complete session, allocator/live and driver-VRAM endpoints are
+stable. Corrected Vulkan retains one additional **128 MiB** allocator block;
+this is a bounded reservation increase, not identical memory footprint.
+Tracked native fallback counters are zero; intentional CPU-mmap experts and
+existing host routing remain part of the workload. Memory gates include private
+`RssAnon + VmSwap`, keeping file-backed mmap RSS separate.
+
+All final parity, speed and memory gates passed. Automatic Vulkan arithmetic dispatch is enabled only for the qualified signature.
+Qualification requires native `CubeClProduction` Vulkan on **B50 (8086:E212)**,
+`shaderFloat64`, an AVX-512 host, the compatible 40-layer DeepSeek41/272-expert/
+six-route/HC4 tensor and quantization signature, local mmap loading, no device
+expert cache, and **context at most 249**. Other model signatures, larger
+contexts and streamed/distributed loads remain outside this qualification.
+Backend automatic preferences are unchanged; CPU precision decode remains faster.
+
+Explicit numerical diagnostic flags bypass model automatic qualification. For
+the opt-in profile set all five to `1`; use all five `0` for the matched old fast
+control: `JOSHUA_CPU_DOT_F64`, `JOSHUA_VULKAN_DOT_F64`,
+`JOSHUA_VULKAN_RMS_F64`, `JOSHUA_VULKAN_COMPENSATED_DOT`, and
+`JOSHUA_VULKAN_FUSED_MHC`. CPU precision continues to use
+`JOSHUA_CPU_DOT_F64=1`.
+
+Validation: **427 library tests passed** (10 ignored), **40 architecture
+integration tests passed** (3 ignored), five precision tests including native
+GPU checks, the fused HC test, model signature/context boundary tests, and native
+device-policy isolation. Default/feature library checks and the feature release
+build passed. The unrelated core
+`quantized_tests` integration target still fails to compile at three
+non-exhaustive `Iq2Xxs` matches; this was reproduced on unchanged base `646140b`.
+The report preserves rejected speed trials and the earlier 1,060-KiB CPU
+reference memory-gate failure. Independent float64 evidence covers primitives
+and tiny models; a separate full-290GB float64 oracle was not generated.

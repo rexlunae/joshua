@@ -214,7 +214,34 @@ fn glsl_to_spirv(source: &str) -> Result<Vec<u32>> {
     writer
         .write(&module, &info, Some(&pipeline_options), &None, &mut words)
         .map_err(|e| Error::Msg(format!("vulkan spv write failed: {e:?}")))?;
+    if source.contains("// JOSHUA_NO_CONTRACTION") {
+        words = no_contraction(words);
+    }
     Ok(words)
+}
+
+// Naga's GLSL front end currently drops `precise`. Error-free transforms
+// require the individual rounded adds/multiplies to survive driver fusion.
+// SPIR-V annotations may refer forward to result IDs; no IDs are allocated.
+fn no_contraction(words: Vec<u32>) -> Vec<u32> {
+    let mut decorations = Vec::new();
+    let mut types = words.len();
+    let mut pos = 5;
+    while pos < words.len() {
+        let count = (words[pos] >> 16) as usize;
+        let op = words[pos] & 0xffff;
+        if (19..=39).contains(&op) { types = types.min(pos); }
+        // OpFAdd, OpFSub, OpFMul, OpFDiv. The result ID is operand two.
+        if matches!(op, 129 | 131 | 133 | 136) {
+            decorations.extend_from_slice(&[(3 << 16) | 71, words[pos + 2], 42]);
+        }
+        pos += count;
+    }
+    let mut out = Vec::with_capacity(words.len() + decorations.len());
+    out.extend_from_slice(&words[..types]);
+    out.extend(decorations);
+    out.extend_from_slice(&words[types..]);
+    out
 }
 
 /// The descriptor-set + pipeline layouts for `nbuf` tensor bindings plus
@@ -764,7 +791,7 @@ fn unary_launch(d: &VulkanDevice, op: i32, f0: f32, f1: f32, x: Buf, out: Buf, n
     };
     let push = Push::default().us(n)?.i(contig).us(off)?.i(op).f(f0).f(f1);
     let lim = d.limits();
-    if f64_dot_enabled() {
+    if f64_dot_enabled_on(d) {
         return d.launch("unary_precise",glsl::k_unary_precise,&[x,out],push,&[ix],grid(n,lim.wg,1,lim.max_groups_x));
     }
     d.launch("unary", glsl::k_unary, &[x, out], push, &[ix], grid(n, lim.wg, 1, lim.max_groups_x))
@@ -794,7 +821,7 @@ pub fn run_binary(d: &VulkanDevice, op: i32, a: Buf, b: Buf, out: Buf, n: usize,
     };
     let push = Push::default().us(n)?.i(contig).us(oa)?.us(ob)?.i(op);
     let lim = d.limits();
-    if !u32 && f64_dot_enabled() {
+    if !u32 && f64_dot_enabled_on(d) {
         return d.launch("binary_precise",glsl::k_binary_precise,&[a,b,out],push,&[ix],grid(n,lim.wg,1,lim.max_groups_x));
     }
     let key = if u32 { "binary_u32" } else { "binary_f32" };
@@ -1071,6 +1098,12 @@ pub fn run_matmul_with_precision(d: &VulkanDevice, a: Buf, b: Buf, out: Buf, (ba
     let gx = n.div_ceil(tile) as u32;
     let gy = m.div_ceil(tile) as u32;
     if wide {
+        if m <= 4 {
+            if k >= 256 {
+                return d.launch("small_matmul_reduce_f64", glsl::k_small_matmul_reduce_f64, &[a,b,out], push, &[], row_grid(m*n,batch,lim.max_groups_x));
+            }
+            return d.launch("small_matmul_f64", glsl::k_small_matmul_f64, &[a,b,out], push, &[], grid(m*n,lim.wg,batch,lim.max_groups_x));
+        }
         return d.launch("gemm_f64", |wg| glsl::k_gemm_f64(wg, tx), &[a,b,out], push, &[], [gx,gy,batch as u32]);
     }
     d.launch("gemm", |wg| glsl::k_gemm(wg, tx), &[a, b, out], push, &[], [gx, gy, batch as u32])
@@ -1088,6 +1121,7 @@ pub fn f64_rms_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("JOSHUA_VULKAN_RMS_F64").is_ok_and(|v| v == "1"))
 }
+pub fn f64_rms_enabled_on(d:&VulkanDevice)->bool { f64_rms_enabled() || d.precise_math() }
 
 pub fn run_rms_rows_f64(d: &VulkanDevice, x: Buf, out: Buf, rows: usize, cols: usize, off: usize, eps: f32) -> Result<()> {
     let push = Push::default().us(rows)?.us(cols)?.us(off)?.i(0).f(eps);
@@ -1098,7 +1132,7 @@ pub fn run_rms_rows_f64(d: &VulkanDevice, x: Buf, out: Buf, rows: usize, cols: u
 pub fn run_rmsnorm(d: &VulkanDevice, x: Buf, alpha: Buf, out: Buf, rows: usize, cols: usize, off: usize, aoff: usize, eps: f32) -> Result<()> {
     let push = Push::default().us(rows)?.us(cols)?.us(off)?.us(aoff)?.f(eps);
     let lim = d.limits();
-    if f64_rms_enabled() {
+    if f64_rms_enabled_on(d) {
         return d.launch("rmsnorm_f64", |_| glsl::k_rmsnorm_f64(64, true), &[x, alpha, out], push, &[], row_grid(rows, 1, lim.max_groups_x));
     }
     d.launch("rmsnorm", glsl::k_rmsnorm, &[x, alpha, out], push, &[], row_grid(rows, 1, lim.max_groups_x))
@@ -1110,7 +1144,7 @@ pub fn run_rope(d: &VulkanDevice, interleaved: bool, x: Buf, cos: Buf, sin: Buf,
     let n_pairs = b * h * t * (dd / 2);
     let push = Push::default().us(n_pairs)?.us(h)?.us(t)?.us(dd)?.us(xoff)?.us(coff)?.us(soff)?.i(cs_batched as i32);
     let lim = d.limits();
-    if interleaved && f64_dot_enabled() {
+    if interleaved && f64_dot_enabled_on(d) {
         return d.launch("rope_i_f64", glsl::k_rope_i_f64, &[x,cos,sin,out], push, &[], grid(n_pairs,lim.wg,1,lim.max_groups_x));
     }
     let key = if interleaved { "rope_i" } else { "rope" };
@@ -1213,12 +1247,65 @@ pub fn f64_dot_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("JOSHUA_VULKAN_DOT_F64").is_ok_and(|v| v == "1"))
 }
+pub fn f64_dot_enabled_on(d:&VulkanDevice)->bool { f64_dot_enabled() || d.precise_math() }
+
+pub fn compensated_dot_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("JOSHUA_VULKAN_COMPENSATED_DOT").is_ok_and(|v| v == "1"))
+}
+pub fn compensated_dot_enabled_on(d:&VulkanDevice)->bool { compensated_dot_enabled() || d.precise_math() }
+
+pub fn fused_mhc_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("JOSHUA_VULKAN_FUSED_MHC").is_ok_and(|v| v == "1"))
+}
+pub fn fused_mhc_enabled_on(d:&VulkanDevice)->bool { fused_mhc_enabled() || d.precise_math() }
+
+pub fn run_fused_mhc(d:&VulkanDevice,x:Buf,base:Buf,out:Buf,rows:usize,xoff:usize,boff:usize,iters:usize,eps:f32,scale:[f32;3])->Result<()> {
+    let p=Push::default().us(rows)?.us(xoff)?.us(boff)?.us(iters)?.f(eps).f(scale[0]).f(scale[1]).f(scale[2]);
+    let lim=d.limits();
+    if rows==1 {
+        return d.launch("fused_mhc_f64_serial",glsl::k_fused_mhc_serial,&[x,base,out],p,&[],grid(rows,64,1,lim.max_groups_x));
+    }
+    d.launch("fused_mhc_f64_parallel",glsl::k_fused_mhc,&[x,base,out],p,&[],row_grid(rows,1,lim.max_groups_x))
+}
 
 pub fn run_qgemv_f64(d: &VulkanDevice, dtype: crate::quantized::GgmlDType, x: Buf, w: Buf, out: Buf, m: usize, n: usize, k: usize, off: usize, groups: usize) -> Result<()> {
     let p = Push::default().us(n)?.us(k)?.i(qtype_code(dtype)).us(dtype.block_size())?.us(dtype.type_size())?.us(off)?.i(0).us(m)?;
-    let lim=d.limits();let lanes=if dtype==crate::quantized::GgmlDType::Q8_0{4}else{8};
+    let lim=d.limits();
+    let rows=if m>1 && groups==1 {4}else{1};
+    if compensated_dot_enabled_on(d) {
+        // B50 measurements favor 32 lanes for Q2/Q4 and four for Q8.
+        // Wide FP64 is both accurate and competitive for the former, while
+        // selected-group Q8 retains its exact four-lane FP64 reduction.
+        let q8=dtype==crate::quantized::GgmlDType::Q8_0;
+        let lanes=if q8{4}else{32};
+        let comp=q8 && groups==1;
+        let name=match(lanes,comp,groups,rows) {
+            (4,true,1,1)=>std::borrow::Cow::Borrowed("q8_precise_compensated"),
+            (4,true,1,4)=>std::borrow::Cow::Borrowed("q8_precise_compensated_r4"),
+            (4,false,8,1)=>std::borrow::Cow::Borrowed("grouped_q8_precise_f64_g8"),
+            (32,false,1,1)=>std::borrow::Cow::Borrowed("qgemv_f64_l32_fast"),
+            (32,false,1,4)=>std::borrow::Cow::Borrowed("qgemv_f64_l32_r4_fast"),
+            _=>std::borrow::Cow::Owned(format!("qgemv_fast_l{lanes}_g{groups}_r{rows}_comp{comp}")),
+        };
+        return d.launch(&name, |_|if q8 {glsl::k_q8_precise(64,groups,rows,comp)}else{glsl::k_qgemv_f64(64,groups,lanes,rows)},&[x,w,out],p,&[],row_grid(n.div_ceil(64/lanes),m.div_ceil(rows),lim.max_groups_x));
+    }
+    if dtype==crate::quantized::GgmlDType::Q8_0 {
+        let name=match(groups,rows) {
+            (1,1)=>std::borrow::Cow::Borrowed("q8_precise_f64"),
+            (1,4)=>std::borrow::Cow::Borrowed("q8_precise_f64_r4"),
+            (8,1)=>std::borrow::Cow::Borrowed("grouped_q8_precise_f64_g8"),
+            _=>std::borrow::Cow::Owned(format!("q8_precise_f64_g{groups}_r{rows}")),
+        };
+        return d.launch(&name, |_|glsl::k_q8_precise(64,groups,rows,false),&[x,w,out],p,&[],row_grid(n.div_ceil(16),m.div_ceil(rows),lim.max_groups_x));
+    }
+    let lanes=8;
     let name=match(lanes,groups){(4,1)=>std::borrow::Cow::Borrowed("qgemv_f64_l4"),(8,1)=>std::borrow::Cow::Borrowed("qgemv_f64_l8"),(4,8)=>std::borrow::Cow::Borrowed("grouped_q8_f64_l4_g8"),_=>std::borrow::Cow::Owned(format!("qgemv_f64_l{lanes}_g{groups}"))};
-    d.launch(&name, |_|glsl::k_qgemv_f64(64,groups,lanes),&[x,w,out],p,&[],row_grid(n.div_ceil(64/lanes),m,lim.max_groups_x))
+    // Reuse compact block decoding across four prefill rows. The per-output
+    // lane assignment and K-order are unchanged, including partial tails.
+    let name=if rows==1{name}else{std::borrow::Cow::Owned(format!("{name}_r{rows}"))};
+    d.launch(&name, |_|glsl::k_qgemv_f64(64,groups,lanes,rows),&[x,w,out],p,&[],row_grid(n.div_ceil(64/lanes),m.div_ceil(rows),lim.max_groups_x))
 }
 
 pub fn run_qgemv(d: &VulkanDevice, dtype: crate::quantized::GgmlDType, x: Buf, w: Buf, out: Buf, m: usize, n: usize, k: usize, xoff: usize) -> Result<()> {
@@ -1313,7 +1400,7 @@ pub fn run_grouped_q8(d: &VulkanDevice, x: Buf, w: Buf, out: Buf,
         || n as u64 * 4 > out.bytes {
         return Err(Error::Msg("vulkan grouped Q8: invalid geometry or buffer range".into()));
     }
-    if f64_dot_enabled() {
+    if f64_dot_enabled_on(d) {
         return run_qgemv_f64(d, crate::quantized::GgmlDType::Q8_0, x, w, out, 1, n, k, xoff, groups);
     }
     let params = Push::default().us(k)?.us(n)?.us(xoff)?.us(n / groups)?;
@@ -1460,6 +1547,17 @@ mod barrier_tests {
                 assert_workgroup_barriers(&source);
             }
         }
+        for source in [
+            glsl::k_small_matmul_reduce_f64(64),
+            glsl::k_qgemv_f64(64,1,4,4),
+            glsl::k_qgemv_f64(64,1,8,4),
+            glsl::k_qgemv_compensated(64,1,32,4),
+            glsl::k_q8_precise(64,1,4,true),
+            glsl::k_q8_precise(64,8,1,false),
+            glsl::k_fused_mhc(64),
+        ] {
+            assert_workgroup_barriers(&source);
+        }
         // Cover helper functions and nested control flow as well as the
         // reduction loops in the actual kernels above.
         assert_workgroup_barriers(
@@ -1488,4 +1586,88 @@ pub fn run_precise_unary(d:&VulkanDevice,x:Buf,out:Buf,n:usize,off:usize,op:u32)
 pub fn run_precise_rows(d:&VulkanDevice,x:Buf,out:Buf,rows:usize,cols:usize,inner:usize,off:usize,soft:bool)->Result<()> {
  let p=Push::default().us(rows)?.us(cols)?.us(inner)?.us(off)?.i(soft as i32);let lim=d.limits();
  d.launch("precise_rows", |_|glsl::k_precise_rows(64),&[x,out],p,&[],grid(rows,64,1,lim.max_groups_x))
+}
+
+#[cfg(test)]
+mod precise_perf_tests {
+    use super::*;
+    use crate::{backend::{BackendDevice,BackendStorage}, CpuStorage, DType, VulkanStorage};
+    use std::time::Instant;
+
+    #[test]
+    #[ignore = "manual native B50 kernel comparison; requires JOSHUA_VULKAN_DOT_F64=1"]
+    fn native_precise_kernel_comparison() -> Result<()> {
+        let d=VulkanDevice::new(0)?;
+        assert!(f64_dot_enabled());
+        let before=fallback_count();
+        let (m,n,k)=(1,272,5120);
+        let av:Vec<f32>=(0..k).map(|i|((i*17%127) as f32/31.7).sin()).collect();
+        let bv:Vec<f32>=(0..n*k).map(|i|((i*31%251) as f32/63.7).cos()).collect();
+        let a=VulkanStorage::from_slice(&av,&d)?;
+        let b=VulkanStorage::from_slice(&bv,&d)?;
+        let out=d.alloc(DType::F32,m*n)?;
+        let p=||->Result<Push>{Ok(Push::default().us(m)?.us(n)?.us(k)?.us(k)?.i(1).us(n)?.i(1).i(0).i(0).i(0).i(0).i(0).us(m*n)?.i(0))};
+        let lim=d.limits();let tile=4*lim.gemm_tx;
+        let mut reference=None::<Vec<f32>>;
+        for method in ["direct","reduce","tiled"] {
+            let call=||->Result<()> {
+                match method {
+                    "direct"=>d.launch("micro_direct",glsl::k_small_matmul_f64,&[a.buf(),b.buf(),out.buf()],p()?,&[],grid(m*n,lim.wg,1,lim.max_groups_x)),
+                    "reduce"=>d.launch("micro_reduce",glsl::k_small_matmul_reduce_f64,&[a.buf(),b.buf(),out.buf()],p()?,&[],row_grid(m*n,1,lim.max_groups_x)),
+                    _=>d.launch("micro_tiled",|wg|glsl::k_gemm_f64(wg,lim.gemm_tx),&[a.buf(),b.buf(),out.buf()],p()?,&[],[n.div_ceil(tile) as u32,1,1]),
+                }
+            };
+            for _ in 0..3 {call()?;d.synchronize()?;}
+            let start=Instant::now();for _ in 0..30 {call()?;d.synchronize()?;}
+            let ms=start.elapsed().as_secs_f64()*1000./30.;
+            let CpuStorage::F32(values)=out.to_cpu_storage()? else{unreachable!()};
+            let delta=reference.as_ref().map(|r|r.iter().zip(&values).map(|(&x,&y)|(x-y).abs()).fold(0.,f32::max)).unwrap_or(0.);
+            if reference.is_none(){reference=Some(values);}
+            println!("MICRO router {method} ms={ms:.6} max_abs={delta:e}");
+        }
+        use crate::quantized::{GgmlDType,QTensor};
+        for (dtype,n,k,groups) in [(GgmlDType::Q2K,24,20480,1),(GgmlDType::Q4K,2304,5120,1),(GgmlDType::Q8_0,5120,8192,1),(GgmlDType::Q8_0,8192,4096,8)] {
+            let weights:Vec<f32>=(0..n*k).map(|i|((i*31%251) as f32-125.)/63.7).collect();
+            let q=QTensor::quantize(&crate::Tensor::from_vec(weights,(n,k),&crate::Device::Cpu)?,dtype)?;
+            let data=q.data()?;
+            let w=VulkanStorage::from_slice(data.as_ref(),&d)?;
+            let xv:Vec<f32>=(0..groups*k).map(|i|((i*17%127) as f32/31.7).sin()).collect();
+            let x=VulkanStorage::from_slice(&xv,&d)?;
+            let out=d.alloc(DType::F32,n)?;
+            let p=||->Result<Push>{Ok(Push::default().us(n)?.us(k)?.i(qtype_code(dtype)).us(dtype.block_size())?.us(dtype.type_size())?.i(0).i(0).i(1))};
+            let mut reference=None::<Vec<f32>>;
+            for (method,lanes) in [(0,if dtype==GgmlDType::Q8_0{4}else{8}),(0,32),(1,if dtype==GgmlDType::Q8_0{4}else{8}),(1,32),(2,if dtype==GgmlDType::Q8_0{4}else{8}),(2,32),(3,4),(4,4)] {
+                if method>=3 && dtype!=GgmlDType::Q8_0{continue;}
+                let name=format!("micro_q_{dtype:?}_{groups}_{method}_{lanes}");
+                let call=||d.launch(&name,|_|match method {0=>glsl::k_qgemv_f64(64,groups,lanes,1),1=>glsl::k_qgemv_compensated(64,groups,lanes,1),2=>glsl::k_qgemv_compensated_block(64,groups,lanes,1),_=>glsl::k_q8_precise(64,groups,1,method==4)},&[x.buf(),w.buf(),out.buf()],p()?,&[],row_grid(n.div_ceil(64/lanes),1,lim.max_groups_x));
+                for _ in 0..3{call()?;d.synchronize()?;}
+                let start=Instant::now();for _ in 0..20{call()?;d.synchronize()?;}
+                let ms=start.elapsed().as_secs_f64()*1000./20.;
+                let CpuStorage::F32(values)=out.to_cpu_storage()? else{unreachable!()};
+                let delta=reference.as_ref().map(|r|r.iter().zip(&values).map(|(&x,&y)|(x-y).abs()).fold(0.,f32::max)).unwrap_or(0.);
+                if reference.is_none(){reference=Some(values);}
+                println!("MICRO quant {dtype:?} groups={groups} method={method} lanes={lanes} ms={ms:.6} max_abs={delta:e}");
+            }
+        }
+        for rows in [1,32] {
+            let xv:Vec<f32>=(0..rows*24).map(|i|((i*17%251) as f32-125.)/11.7).collect();
+            let bv:Vec<f32>=(0..24).map(|i|((i*31%53) as f32-26.)/11.3).collect();
+            let x=VulkanStorage::from_slice(&xv,&d)?;let b=VulkanStorage::from_slice(&bv,&d)?;
+            let out=d.alloc(DType::F32,rows*24)?;
+            let p=||->Result<Push>{Ok(Push::default().us(rows)?.i(0).i(0).i(20).f(1e-6).f(0.173).f(-0.37).f(0.61))};
+            let mut reference=None::<Vec<f32>>;
+            for parallel in [false,true] {
+                let key=if parallel{"micro_mhc_parallel"}else{"micro_mhc_serial"};
+                let call=||d.launch(key,|wg|if parallel{glsl::k_fused_mhc(wg)}else{glsl::k_fused_mhc_serial(wg)},&[x.buf(),b.buf(),out.buf()],p()?,&[],if parallel{row_grid(rows,1,lim.max_groups_x)}else{grid(rows,64,1,lim.max_groups_x)});
+                for _ in 0..3{call()?;d.synchronize()?;}
+                let start=Instant::now();for _ in 0..30{call()?;d.synchronize()?;}
+                let ms=start.elapsed().as_secs_f64()*1000./30.;
+                let CpuStorage::F32(values)=out.to_cpu_storage()? else{unreachable!()};
+                if let Some(r)=reference.as_ref(){assert_eq!(r,&values);}else{reference=Some(values);}
+                println!("MICRO mhc rows={rows} parallel={parallel} ms={ms:.6}");
+            }
+        }
+        assert_eq!(fallback_count(),before);
+        Ok(())
+    }
 }

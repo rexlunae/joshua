@@ -96,6 +96,109 @@ struct Config {
     yarn: Option<YarnConfig>,
 }
 
+/// Only the real-model signature qualified on B50 enters the automatic
+/// precision contract. Explicit diagnostic flags keep their existing meaning.
+fn validated_vulkan_device(
+    ct: &gguf_file::Content,
+    cfg: &Config,
+    device: &Device,
+    n_ctx: usize,
+    mapped: bool,
+    cache_bytes: u64,
+) -> Result<Device> {
+    #[cfg(all(feature = "vulkan", target_arch = "x86_64"))]
+    if candle_core::vulkan_backend::VALIDATED_B50_PRECISE_MATH
+        && qualified_precision_workload(n_ctx, mapped, cache_bytes)
+        && crate::simd::simd_level() == crate::simd::SimdLevel::Avx512
+        && candle_core::vulkan_backend::kernels::native_enabled()
+        && ![
+            "JOSHUA_CPU_DOT_F64",
+            "JOSHUA_VULKAN_DOT_F64",
+            "JOSHUA_VULKAN_RMS_F64",
+            "JOSHUA_VULKAN_COMPENSATED_DOT",
+            "JOSHUA_VULKAN_FUSED_MHC",
+        ]
+        .iter()
+        .any(|k| std::env::var_os(k).is_some())
+    {
+        if let Device::Vulkan(d) = device {
+            if d.adapter_id() == (0x8086, 0xE212)
+                && d.supports_precise_math()
+                && d.limits().qgemv == candle_core::vulkan_backend::kernels::Qgemv::CubeClProduction
+                && qualified_precision_signature(ct, cfg)
+            {
+                tracing::info!("deepseek41: validated B50 precision kernels (context {n_ctx})");
+                return Ok(Device::Vulkan(d.with_precise_math()?));
+            }
+        }
+    }
+    let _ = (ct, cfg, n_ctx, mapped, cache_bytes);
+    Ok(device.clone())
+}
+
+#[cfg(any(all(feature = "vulkan", target_arch = "x86_64"), test))]
+fn qualified_precision_workload(n_ctx: usize, mapped: bool, cache_bytes: u64) -> bool {
+    mapped && cache_bytes == 0 && n_ctx > 0 && n_ctx <= 249
+}
+
+#[cfg(any(all(feature = "vulkan", target_arch = "x86_64"), test))]
+fn qualified_precision_signature(ct: &gguf_file::Content, cfg: &Config) -> bool {
+    if !(cfg.v41
+        && cfg.engram.is_some()
+        && cfg.n_layer == 40
+        && cfg.n_head == 64
+        && cfg.head_dim == 512
+        && cfg.rope_head_dim == 64
+        && cfg.hc_mult == 4
+        && cfg.hc_sinkhorn_iters == 20
+        && cfg.n_expert == 272
+        && cfg.n_expert_used == 6
+        && cfg.o_groups == 8)
+    {
+        return false;
+    }
+    let tensor = |name: &str, dtype: GgmlDType, dims: &[usize]| {
+        ct.tensor_infos
+            .get(name)
+            .is_some_and(|v| v.ggml_dtype == dtype && v.shape.dims() == dims)
+    };
+    if !tensor("token_embd.weight", GgmlDType::F16, &[129280, 5120])
+        || !tensor("output_norm.weight", GgmlDType::F32, &[5120])
+        || !tensor("output.weight", GgmlDType::Q8_0, &[129280, 5120])
+    {
+        return false;
+    }
+    (0..40).all(|i| {
+        let p = format!("blk.{i}");
+        [
+            ("attn_q_a.weight", GgmlDType::Q8_0, vec![1280, 5120]),
+            ("attn_q_b.weight", GgmlDType::Q8_0, vec![32768, 1280]),
+            ("attn_kv.weight", GgmlDType::Q8_0, vec![512, 5120]),
+            ("attn_output_a.weight", GgmlDType::Q8_0, vec![8192, 4096]),
+            ("attn_output_b.weight", GgmlDType::Q8_0, vec![5120, 8192]),
+            ("hc_attn_fn.weight", GgmlDType::Q2K, vec![24, 20480]),
+            ("hc_ffn_fn.weight", GgmlDType::Q2K, vec![24, 20480]),
+            ("ffn_gate_shexp.weight", GgmlDType::Q4K, vec![2304, 5120]),
+            ("ffn_up_shexp.weight", GgmlDType::Q4K, vec![2304, 5120]),
+            ("ffn_down_shexp.weight", GgmlDType::Q8_0, vec![5120, 2304]),
+            ("ffn_gate_inp.weight", GgmlDType::F16, vec![272, 5120]),
+            (
+                "ffn_gate_exps.weight",
+                GgmlDType::Q4K,
+                vec![272, 2304, 5120],
+            ),
+            ("ffn_up_exps.weight", GgmlDType::Q4K, vec![272, 2304, 5120]),
+            (
+                "ffn_down_exps.weight",
+                GgmlDType::Q4K,
+                vec![272, 5120, 2304],
+            ),
+        ]
+        .iter()
+        .all(|(n, d, s)| tensor(&format!("{p}.{n}"), *d, s))
+    })
+}
+
 /// DeepSeek-V4.1 engram n-gram tables (`{arch}.engram.*`): each engram
 /// layer hashes every token's preceding n-grams into rows of its table.
 struct EngramConfig {
@@ -328,6 +431,7 @@ struct Mlp {
     up: QMatMul,
     down: QMatMul,
     clamp: f64,
+    precise_cpu_silu: bool,
     /// When the weights are borrowed from the model mapping, handles that
     /// can `MADV_WILLNEED` the gate/up/down byte ranges ahead of a matmul.
     /// `None` for streamed/fallback loads (weights are plain memory then).
@@ -377,7 +481,7 @@ impl Mlp {
 
     /// Combine `silu(gate) * up` and run the down projection.
     fn combine_and_down(&self, gate: Tensor, up: Tensor) -> Result<Tensor> {
-        let h = (silu(&gate)? * up)?;
+        let h = (crate::precise::silu_with_policy(&gate, self.precise_cpu_silu)? * up)?;
         self.down.forward(&h)
     }
 
@@ -3235,6 +3339,23 @@ impl ModelWeights {
         >,
     ) -> Result<Self> {
         let cfg = Config::from_metadata(&ct.metadata)?;
+        #[cfg(feature = "distributed")]
+        let local_model = cluster.is_none();
+        #[cfg(not(feature = "distributed"))]
+        let local_model = true;
+        let selected_device = if local_model {
+            validated_vulkan_device(
+                &ct,
+                &cfg,
+                device,
+                n_ctx,
+                mmap.is_some(),
+                device_expert_cache_bytes.unwrap_or(0),
+            )?
+        } else {
+            device.clone()
+        };
+        let device = &selected_device;
         if !(expert_device.is_cpu()
             || expert_device.is_opencl()
             || expert_device.is_sycl()
@@ -4601,6 +4722,7 @@ fn load_moe<R: Read + Seek>(
                     up: up.qmatmul,
                     down: down.qmatmul,
                     clamp,
+                    precise_cpu_silu: crate::precise::precise_vulkan_device(&rd.device),
                     prefetch,
                 }
             })
@@ -4614,6 +4736,7 @@ fn load_moe<R: Read + Seek>(
             down: rd.qmatmul(&format!("{p}.ffn_down_shexp.weight"))?,
             clamp: cfg.swiglu_clamp_shexp.get(layer).copied().unwrap_or(0.0),
             prefetch: None,
+            precise_cpu_silu: crate::precise::precise_vulkan_device(&rd.device),
         })
     } else {
         None
@@ -4924,6 +5047,46 @@ fn split_experts<R: Read + Seek>(
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn b50_precision_workload_stays_within_qualification() {
+        assert!(qualified_precision_workload(249, true, 0));
+        assert!(!qualified_precision_workload(250, true, 0));
+        assert!(!qualified_precision_workload(0, true, 0));
+        assert!(!qualified_precision_workload(249, false, 0));
+        assert!(!qualified_precision_workload(249, true, 1));
+    }
+
+    #[test]
+    #[ignore = "manual B50 model header check; requires JOSHUA_B50_MODEL"]
+    fn b50_precision_real_model_signature() -> Result<()> {
+        let path = std::env::var("JOSHUA_B50_MODEL").expect("JOSHUA_B50_MODEL");
+        let mut f = std::fs::File::open(path)?;
+        let mut ct = gguf_file::Content::read(&mut f)?;
+        let mut cfg = Config::from_metadata(&ct.metadata)?;
+        assert!(qualified_precision_signature(&ct, &cfg));
+        #[cfg(all(feature = "vulkan", target_arch = "x86_64"))]
+        if let Ok(expected) = std::env::var("JOSHUA_EXPECT_B50_PRECISION") {
+            let device = Device::new_vulkan(0)?;
+            let selected = validated_vulkan_device(&ct, &cfg, &device, 249, true, 0)?;
+            assert_eq!(crate::precise::precise_vulkan_device(&selected), expected == "1");
+            assert!(device.same_device(&selected));
+            assert!(!crate::precise::precise_vulkan_device(&device));
+            let outside = validated_vulkan_device(&ct, &cfg, &device, 250, true, 0)?;
+            assert!(!crate::precise::precise_vulkan_device(&outside));
+        }
+        cfg.n_expert_used += 1;
+        assert!(!qualified_precision_signature(&ct, &cfg));
+        cfg.n_expert_used -= 1;
+        // A later layer with a different quantization must not inherit
+        // another model's validated CPU expert arithmetic contract.
+        ct.tensor_infos
+            .get_mut("blk.39.ffn_down_exps.weight")
+            .unwrap()
+            .ggml_dtype = GgmlDType::Q6K;
+        assert!(!qualified_precision_signature(&ct, &cfg));
+        Ok(())
+    }
 
     /// Routing buckets by (token, slot) into per-expert lists, and a router
     /// id naming no expert is a loud error (it used to be silently dropped,

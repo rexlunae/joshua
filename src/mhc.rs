@@ -58,6 +58,39 @@ fn split_sinkhorn_with_scale(
 ) -> Result<HcMix> {
     let shape = mixes.dims();
     let n = shape[..shape.len() - 1].iter().product::<usize>();
+    #[cfg(feature = "vulkan")]
+    if hc == 4
+        && mixes.dtype() == candle_core::DType::F32
+        && crate::precise::active(mixes)
+        && matches!(mixes.device(), candle_core::Device::Vulkan(_))
+        && matches!(mixes.device(),candle_core::Device::Vulkan(d) if candle_core::vulkan_backend::kernels::fused_mhc_enabled_on(d))
+        && mixes.is_contiguous()
+        && shape.last() == Some(&24)
+        && base.dtype() == candle_core::DType::F32
+        && base.is_contiguous()
+        && base.dims() == [24]
+        && mixes.device().same_device(base.device())
+    {
+        let packed = mixes.apply_op2_no_bwd(
+            base,
+            &FusedSinkhorn {
+                rows: n,
+                scale: scale.map(|v| v as f32),
+                iters,
+                eps: eps as f32,
+            },
+        )?;
+        let lead = &shape[..shape.len() - 1];
+        return Ok(HcMix {
+            pre: packed.narrow(0, 0, n * 4)?.reshape([lead, &[4]].concat())?,
+            post: packed
+                .narrow(0, n * 4, n * 4)?
+                .reshape([lead, &[4]].concat())?,
+            comb: packed
+                .narrow(0, n * 8, n * 16)?
+                .reshape([lead, &[4, 4]].concat())?,
+        });
+    }
     let m = mixes.reshape((n, (2 + hc) * hc))?;
     let pre = sigmoid(
         &m.narrow(D::Minus1, 0, hc)?
@@ -77,10 +110,10 @@ fn split_sinkhorn_with_scale(
     let comb0 = comb0.reshape((n, hc, hc))?;
 
     let mut comb = softmax_last_dim(&comb0)?.affine(1.0, eps)?;
-    comb = comb.broadcast_div(&crate::precise::sum_keepdim(&comb,1)?.affine(1.0, eps)?)?;
+    comb = comb.broadcast_div(&crate::precise::sum_keepdim(&comb, 1)?.affine(1.0, eps)?)?;
     for _ in 0..iters.saturating_sub(1) {
-        comb = comb.broadcast_div(&crate::precise::sum_keepdim(&comb,2)?.affine(1.0, eps)?)?;
-        comb = comb.broadcast_div(&crate::precise::sum_keepdim(&comb,1)?.affine(1.0, eps)?)?;
+        comb = comb.broadcast_div(&crate::precise::sum_keepdim(&comb, 2)?.affine(1.0, eps)?)?;
+        comb = comb.broadcast_div(&crate::precise::sum_keepdim(&comb, 1)?.affine(1.0, eps)?)?;
     }
 
     let lead = &shape[..shape.len() - 1];
@@ -88,6 +121,54 @@ fn split_sinkhorn_with_scale(
     let post = post.reshape([lead, &[hc]].concat())?;
     let comb = comb.reshape([lead, &[hc, hc]].concat())?;
     Ok(HcMix { pre, post, comb })
+}
+
+#[cfg(feature = "vulkan")]
+struct FusedSinkhorn {
+    rows: usize,
+    scale: [f32; 3],
+    iters: usize,
+    eps: f32,
+}
+#[cfg(feature = "vulkan")]
+impl candle_core::CustomOp2 for FusedSinkhorn {
+    fn name(&self) -> &'static str {
+        "fused-sinkhorn"
+    }
+    fn cpu_fwd(
+        &self,
+        _: &candle_core::CpuStorage,
+        _: &candle_core::Layout,
+        _: &candle_core::CpuStorage,
+        _: &candle_core::Layout,
+    ) -> Result<(candle_core::CpuStorage, candle_core::Shape)> {
+        candle_core::bail!("fused-sinkhorn requires native Vulkan")
+    }
+    fn vulkan_fwd(
+        &self,
+        x: &candle_core::VulkanStorage,
+        lx: &candle_core::Layout,
+        base: &candle_core::VulkanStorage,
+        lb: &candle_core::Layout,
+    ) -> Result<(candle_core::VulkanStorage, candle_core::Shape)> {
+        let shape = candle_core::Shape::from(self.rows * 24);
+        let out = x
+            .device
+            .alloc(candle_core::DType::F32, shape.elem_count())?;
+        candle_core::vulkan_backend::kernels::run_fused_mhc(
+            &x.device,
+            x.buf(),
+            base.buf(),
+            out.buf(),
+            self.rows,
+            lx.start_offset(),
+            lb.start_offset(),
+            self.iters,
+            self.eps,
+            self.scale,
+        )?;
+        Ok((out, shape))
+    }
 }
 
 /// A sublayer's mixing coefficients, from the stream `x` (`[b, s, hc, d]`):
@@ -162,7 +243,7 @@ pub fn rms_rows(x: &Tensor, eps: f64) -> Result<Tensor> {
     if matches!(x.device(), candle_core::Device::Vulkan(_))
         && x.dtype() == candle_core::DType::F32 && x.is_contiguous()
         && x.dim(D::Minus1)? != 0
-        && candle_core::vulkan_backend::kernels::f64_rms_enabled()
+        && matches!(x.device(),candle_core::Device::Vulkan(d) if candle_core::vulkan_backend::kernels::f64_rms_enabled_on(d))
     {
         return x.apply_op1_no_bwd(&VulkanRmsRowsF64(eps as f32));
     }
@@ -284,5 +365,77 @@ impl HyperConnection {
     ) -> Result<(Tensor, HcMix)> {
         let mix = self.mixes(x, rms_eps, iters, eps)?;
         Ok((collapse(x, &mix.pre)?, mix))
+    }
+}
+
+#[cfg(all(test, feature = "vulkan"))]
+mod fused_sinkhorn_tests {
+    use super::*;
+    use candle_core::{Device, Storage};
+
+    #[test]
+    #[ignore = "requires native Vulkan and CPU/Vulkan precision plus JOSHUA_VULKAN_FUSED_MHC=1"]
+    fn fused_sinkhorn_matches_unfused_cpu_with_borrowed_outputs() -> Result<()> {
+        assert!(crate::precise::cpu_enabled());
+        assert!(candle_core::vulkan_backend::kernels::fused_mhc_enabled());
+        let gpu = Device::new_vulkan(0)?;
+        assert!(crate::precise::active(&Tensor::zeros(
+            1,
+            candle_core::DType::F32,
+            &gpu
+        )?));
+        let before = candle_core::vulkan_backend::kernels::fallback_count();
+        let scale = [0.173_f32 as f64, -0.37_f32 as f64, 0.61_f32 as f64];
+        let buffer = |x: &Tensor| {
+            let (s, _) = x.storage_and_layout();
+            match &*s {
+                Storage::Vulkan(s) => s.buffer,
+                _ => unreachable!(),
+            }
+        };
+        for rows in [0, 1, 2, 32, 33] {
+            let data: Vec<f32> = (0..(rows + 2) * 24)
+                .map(|i| ((i * 17 % 251) as f32 - 125.) / 11.7)
+                .collect();
+            let bias: Vec<f32> = (0..26)
+                .map(|i| ((i * 31 % 53) as f32 - 26.) / 11.3)
+                .collect();
+            for batches in [1, 2] {
+                if rows % batches != 0 {
+                    continue;
+                }
+                for iters in [0, 1, 3, 20] {
+                    for eps in [0., 1e-6, 1e-4] {
+                        let mut values = Vec::new();
+                        for dev in [&Device::Cpu, &gpu] {
+                            let x = Tensor::from_vec(data.clone(), (rows + 2, 24), dev)?
+                                .narrow(0, 1, rows)?
+                                .reshape((batches, rows / batches, 24))?;
+                            let b = Tensor::from_vec(bias.clone(), 26, dev)?.narrow(0, 1, 24)?;
+                            let v = split_sinkhorn_with_scale(&x, &scale, &b, 4, iters, eps)?;
+                            if matches!(dev, Device::Vulkan(_)) {
+                                assert_eq!(buffer(&v.pre), buffer(&v.post));
+                                assert_eq!(buffer(&v.pre), buffer(&v.comb));
+                            }
+                            values.push(
+                                [v.pre, v.post, v.comb]
+                                    .map(|x| x.flatten_all()?.to_vec1::<f32>())
+                                    .into_iter()
+                                    .collect::<Result<Vec<_>>>()?,
+                            );
+                        }
+                        assert_eq!(
+                            values[0], values[1],
+                            "rows={rows} batches={batches} iters={iters} eps={eps}"
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            candle_core::vulkan_backend::kernels::fallback_count(),
+            before
+        );
+        Ok(())
     }
 }

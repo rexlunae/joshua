@@ -21,6 +21,9 @@ pub mod kernels;
 pub mod wgsl;
 pub use kernels::{fallback_count, native_enabled, native_exec_count};
 
+/// Enabled only after the end-to-end B50 model qualification is complete.
+pub const VALIDATED_B50_PRECISE_MATH: bool = true;
+
 use crate::backend::{BackendDevice, BackendStorage};
 use crate::op::{BinaryOpT, CmpOp, ReduceOp, UnaryOpT};
 use crate::quantized::GgmlDType;
@@ -200,6 +203,8 @@ struct VulkanContext {
     instance: ash::Instance,
     device: ash::Device,
     name: String,
+    adapter_id: (u32,u32),
+    shader_float64: bool,
     limits: Limits,
     buffer_align: u64,
     mem: Mutex<Allocator>,
@@ -247,11 +252,14 @@ impl Drop for VulkanContext {
 pub struct VulkanDevice {
     gpu_id: usize,
     inner: Arc<VulkanContext>,
+    // Per-handle policy, not shared mutable device state. Models may share
+    // buffers/queues without changing each other's arithmetic dispatch.
+    precise_math: bool,
 }
 
 impl Clone for VulkanDevice {
     fn clone(&self) -> Self {
-        VulkanDevice { gpu_id: self.gpu_id, inner: self.inner.clone() }
+        VulkanDevice { gpu_id: self.gpu_id, inner: self.inner.clone(), precise_math: self.precise_math }
     }
 }
 
@@ -330,7 +338,10 @@ fn init_vulkan(gpu_id: usize, qgemv: Option<kernels::Qgemv>) -> Result<VulkanDev
     if f64_rms && supported.shader_float64 != vk::TRUE {
         fail!("vulkan: float64 RMS requires shaderFloat64");
     }
-    let features = vk::PhysicalDeviceFeatures::default().shader_float64(f64_rms);
+    let shader_float64 = f64_rms || (VALIDATED_B50_PRECISE_MATH
+        && props.vendor_id==0x8086 && props.device_id==0xE212
+        && supported.shader_float64==vk::TRUE);
+    let features = vk::PhysicalDeviceFeatures::default().shader_float64(shader_float64);
     let mut dci = vk::DeviceCreateInfo::default().queue_create_infos(&qci)
         .enabled_features(&features);
     if int_dot {
@@ -404,11 +415,14 @@ fn init_vulkan(gpu_id: usize, qgemv: Option<kernels::Qgemv>) -> Result<VulkanDev
     };
     let device = VulkanDevice {
         gpu_id,
+        precise_math: false,
         inner: Arc::new(VulkanContext {
             entry,
             instance,
             device,
             name,
+            adapter_id: (props.vendor_id,props.device_id),
+            shader_float64,
             limits,
             buffer_align: req.alignment.max(16),
             mem: Mutex::new(Allocator { blocks: Vec::new(), chunk: CHUNK_BYTES, mem_type }),
@@ -422,7 +436,7 @@ fn init_vulkan(gpu_id: usize, qgemv: Option<kernels::Qgemv>) -> Result<VulkanDev
     crate::fault_slot::register_drain(Box::new(move |slot| match weak.upgrade() {
         Some(inner) => {
             // A throwaway handle: flush the pending batch, then clear the slot.
-            let d = VulkanDevice { gpu_id: 0, inner };
+            let d = VulkanDevice { gpu_id: 0, inner, precise_math: false };
             let _ = d.flush();
             d.exec().clear_fault(slot);
             true
@@ -433,6 +447,18 @@ fn init_vulkan(gpu_id: usize, qgemv: Option<kernels::Qgemv>) -> Result<VulkanDev
 }
 
 impl VulkanDevice {
+    pub fn adapter_id(&self) -> (u32,u32) { self.inner.adapter_id }
+    pub fn precise_math(&self) -> bool { self.precise_math }
+    pub fn supports_precise_math(&self) -> bool { self.inner.shader_float64 }
+
+    /// A model-scoped arithmetic handle over the same logical device and
+    /// allocator. Existing handles and tensors retain their original policy.
+    pub fn with_precise_math(&self) -> Result<Self> {
+        if !self.inner.shader_float64 {
+            return Err(Error::Msg("precise Vulkan arithmetic requires shaderFloat64".into()));
+        }
+        Ok(Self { gpu_id:self.gpu_id,inner:self.inner.clone(),precise_math:true })
+    }
     pub fn new(gpu_id: usize) -> Result<Self> {
         init_vulkan(gpu_id, None)
     }
@@ -1612,7 +1638,7 @@ impl QVulkanStorage {
         let dev = &self.inner.device;
         let out = dev.alloc(DType::F32, m * n)?;
         let w = self.inner.buf();
-        let wide_dot = kernels::f64_dot_enabled() && (matches!(self.dtype,GgmlDType::Q8_0|GgmlDType::Q4K)
+        let wide_dot = kernels::f64_dot_enabled_on(dev) && (matches!(self.dtype,GgmlDType::Q8_0|GgmlDType::Q4K)
             || (self.dtype == GgmlDType::Q2K && n == 24 && k == 20480));
         if wide_dot {
             if m > QGEMV_MAX_ROWS {
@@ -1625,7 +1651,7 @@ impl QVulkanStorage {
             GgmlDType::F32 => {
                 let sa = MatStrides { row: k, col: 1, offset: o1, batch: 0 };
                 let sb = MatStrides { row: 1, col: k, offset: 0, batch: 0 };
-                kernels::run_matmul_with_precision(dev, storage.buf(), w, out.buf(), (1,m,n,k),sa,sb,kernels::f64_dot_enabled())?;
+                kernels::run_matmul_with_precision(dev, storage.buf(), w, out.buf(), (1,m,n,k),sa,sb,kernels::f64_dot_enabled_on(dev))?;
             }
             GgmlDType::F16 | GgmlDType::BF16 if m <= QGEMV_MAX_ROWS => {
                 kernels::run_hgemv(dev, self.dtype == GgmlDType::BF16, storage.buf(), w, out.buf(), m, n, k, o1)?;
@@ -1709,6 +1735,36 @@ mod tests {
             let scale = x.abs().max(y.abs()).max(1.0);
             assert!(d <= tol * scale, "{what}: element {i} differs: device {x} vs cpu {y}");
         }
+    }
+
+    #[test]
+    fn vulkan_model_scoped_precision_policy() -> crate::Result<()> {
+        let Some(Device::Vulkan(fast)) = device() else {
+            return Ok(());
+        };
+        if !fast.inner.shader_float64 {
+            return Ok(());
+        }
+        let accurate = fast.with_precise_math()?;
+        assert!(!fast.precise_math());
+        assert!(accurate.precise_math());
+        assert!(Arc::ptr_eq(&fast.inner, &accurate.inner));
+        let fast_device = Device::Vulkan(fast.clone());
+        let accurate_device = Device::Vulkan(accurate);
+        assert!(fast_device.same_device(&accurate_device));
+        let values: Vec<f32> = (0..64).map(|i| i as f32 / 31.).collect();
+        let table = Tensor::from_vec(values, (2, 32), &accurate_device)?;
+        let table = crate::quantized::QTensor::quantize(&table, GgmlDType::Q8_0)?;
+        // Caller IDs may use the original device handle. The gathered
+        // activation must inherit the owning model's policy from its storage.
+        let ids = Tensor::new(&[1u32], &fast_device)?;
+        let rows = table.embedding(&ids)?;
+        let Device::Vulkan(rows_device) = rows.device() else {
+            panic!("device transfer")
+        };
+        assert!(rows_device.precise_math());
+        assert!(!fast.precise_math());
+        Ok(())
     }
 
     /// Write f32 to a device buffer and read it back.

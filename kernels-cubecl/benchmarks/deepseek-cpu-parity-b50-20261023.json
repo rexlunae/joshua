@@ -1081,11 +1081,11 @@
       "ignored": 8
     },
     "default_integration": {
-      "passed": 69,
+      "passed": 59,
       "ignored": 3
     },
     "precision_integration": {
-      "passed": 69,
+      "passed": 59,
       "ignored": 3
     },
     "native_precision": {
