@@ -1219,6 +1219,8 @@ impl QMatMul {
 
     /// Try a native selected-group projection. None preserves the caller's
     /// ordinary matmul/gather path on other backends, dtypes and batch sizes.
+    /// Inputs are [groups,k] for decode or [rows,groups,k] for qualified
+    /// precise Vulkan prefill; both produce [rows,n] selected outputs.
     pub fn try_grouped_q8(&self, xs: &Tensor, groups: usize) -> Result<Option<Tensor>> {
         if let Self::QTensor(t) = self {
             if let QStorage::Cpu(w) = &t.storage {
@@ -1235,8 +1237,9 @@ impl QMatMul {
             if let QStorage::Vulkan(w) = &t.storage {
                 let (n, k) = t.shape.dims2()?;
                 if vulkan_native() && xs.dtype() == DType::F32 && xs.is_contiguous()
-                    && xs.dims() == [groups, k] && xs.device().same_device(&t.device())
-                    && w.grouped_q8_eligible(groups, n, k) {
+                    && (xs.dims() == [groups, k] || matches!(xs.dims(), [rows,g,width]
+                        if (*g,*width)==(groups,k) && crate::vulkan_backend::kernels::precise_prefill_optimized(w.device(),*rows)))
+                    && xs.device().same_device(&t.device()) && w.grouped_q8_eligible(groups, n, k) {
                     return xs.apply_op1_no_bwd(&GroupedQ8 { tensor: t, groups }).map(Some);
                 }
             }

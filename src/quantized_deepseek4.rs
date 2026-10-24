@@ -1891,7 +1891,8 @@ impl Attention {
         crate::activation_trace::record("ds-derope", &o)?;
 
         // Each group uses only its diagonal block of wo_a. Native Q8 decode
-        // computes those outputs directly; prefill retains the original GEMM.
+        // computes those outputs directly; precise prefill can do the same while
+        // retaining its compensated accumulation order.
         let o_group_dim = (self.n_head / self.o_groups) * self.head_dim;
         let og = o.reshape((seq, self.o_groups, o_group_dim))?;
         let y = crate::attention::grouped_output_projection(

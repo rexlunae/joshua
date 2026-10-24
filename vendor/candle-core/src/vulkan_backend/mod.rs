@@ -1602,16 +1602,26 @@ impl QVulkanStorage {
         layout: &Layout, groups: usize) -> Result<(VulkanStorage, Shape)> {
         let (n, k) = shape.dims2()?;
         let dev = self.device();
+        let rows = match layout.dims() {
+            [g, width] if (*g, *width) == (groups, k) => 1,
+            [rows, g, width] if (*g, *width) == (groups, k)
+                && kernels::precise_prefill_optimized(dev, *rows) => *rows,
+            _ => return Err(Error::Msg("vulkan grouped Q8: incompatible shape".into())),
+        };
         if storage.dtype != DType::F32 || !dev.same_device(&storage.device)
-            || layout.shape().dims() != [groups, k] || !self.grouped_q8_eligible(groups, n, k) {
+            || !self.grouped_q8_eligible(groups, n, k) {
             return Err(Error::Msg("vulkan grouped Q8: incompatible input".into()));
         }
         let Some((offset, _)) = layout.contiguous_offsets() else {
             return Err(Error::Msg("vulkan grouped Q8: noncontiguous input".into()));
         };
-        let out = dev.alloc(DType::F32, n)?;
-        kernels::run_grouped_q8(dev, storage.buf(), self.inner.buf(), out.buf(), groups, n, k, offset)?;
-        Ok((out, Shape::from((1, n))))
+        let out = dev.alloc(DType::F32, rows * n)?;
+        if rows == 1 {
+            kernels::run_grouped_q8(dev, storage.buf(), self.inner.buf(), out.buf(), groups, n, k, offset)?;
+        } else {
+            kernels::run_grouped_q8_prefill(dev, storage.buf(), self.inner.buf(), out.buf(), rows, groups, n, k, offset)?;
+        }
+        Ok((out, Shape::from((rows, n))))
     }
 
     /// `x @ W^T` for `x` on the device (f32, contiguous) and this `[n, k]` weight.

@@ -1228,3 +1228,78 @@ non-exhaustive `Iq2Xxs` matches; this was reproduced on unchanged base `646140b`
 The report preserves rejected speed trials and the earlier 1,060-KiB CPU
 reference memory-gate failure. Independent float64 evidence covers primitives
 and tiny models; a separate full-290GB float64 oracle was not generated.
+
+## B50 DeepSeek precise prefill: opt-in, memory gate still blocks promotion
+
+The [prefill/memory report](benchmarks/deepseek-prefill-memory-b50-20261024.json)
+uses the same 290-GB DeepSeek41 REAP model, 121-token realistic prompt,
+prefill batches of 32 (final batch 25), context 249, and **128 teacher-forced
+decode tokens**. Each path ran two independent sessions from one frozen
+executable, with activation capture off and no concurrent builds or tests.
+
+| Vulkan path | Median prefill ms | Median decode ms/token | Allocator reservation after sessions |
+|---|---:|---:|---:|
+| New opt-in prefill | 33,985.9 | 743.547 | 9,365,831,680 bytes |
+| Current corrected production | 41,088.7 | 739.040 | 9,500,049,408 bytes |
+| Old fast control | 40,875.4 | 825.114 | 9,365,831,680 bytes |
+
+The opt-in reduces prefill time **17.3%** versus current production and
+**16.9%** versus the fast control, removing the previously measured prefill
+regression in this paired cohort. Decode is **1.110×** the fast control;
+its median is 0.6% slower than current corrected Vulkan, with overlapping
+samples. Every candidate total-session sample beats every sample from both
+Vulkan controls; total-session speed is **1.134×** the fast control.
+
+Batched output-A projection now computes only the selected diagonal Q8 groups,
+skipping seven unused blocks per group while keeping the existing compensated
+dot streams. Fused HC4 collapse keeps each f32 product and the ordered f64 sum,
+without allocating the four-copy weighted activation. The diagnostic allocation
+trace showed that activation triggering a new pool block under queued-buffer
+pressure. The new path adds no weight copies, expanded expert pools, transfers,
+queue fences, or allocator-policy changes.
+
+Both candidate sessions finish at the load/warmup allocator reservation and live
+bytes. The extra **128 MiB** pool reservation is eliminated; driver VRAM is
+**9,400,414,208 bytes** at both endpoints, also 128 MiB below current production.
+Candidate private `RssAnon + VmSwap` endpoint spread is **144 KiB**, tracked
+native fallbacks are zero, and repeats are bit-identical. Sampled live peaks are
+unchanged; these endpoint results do not assert an exhaustive allocation peak.
+
+Parity passes the unchanged absolute **1e-5** gate: maximum error
+**8.58306884765625e-6** against the corrected CPU reference across
+**16,677,120 logits** (last prefill row plus 128 decode rows), with all 129 greedy
+choices matching. Candidate outputs are bit-identical to current corrected
+Vulkan. Independent native tests cover partial row/column tiles, activation
+storage offsets, unsupported row counts, and rounded-product collapse against
+an independent CPU calculation. Existing tiny-model integration tests cover
+prefill, cache continuation, routing, and all-row verification.
+
+**Automatic dispatch remains unchanged.** The initial CPU reference's private
+endpoints were 623,460 / 585,112 KiB (37.45 MiB decrease); an exact-protocol,
+same-executable confirmation measured 619,684 / 623,828 KiB (**4.05 MiB growth**).
+Both fail the unchanged **1 MiB stability gate**, despite identical reference
+logits and passing candidate GPU gates. Both failed runs are retained in the
+report; a passing candidate alone does not permit promotion.
+
+On the already-qualified B50 model, set `JOSHUA_VULKAN_PREFILL_OPT=1` to try the
+new path; unset it or set it to `0` to retain current production behavior. It
+requires native precise compensated Vulkan and contiguous f32 inputs with
+2–32 rows. Grouped projection keeps the existing Q8 geometry checks. This does
+not bypass the model/signature/context qualification or change backend
+preference. The five numerical diagnostic flags described above still select
+the corrected or old fast control; the new flag controls only these prefill
+optimizations. Larger contexts/batches and other model signatures remain
+outside the real-model qualification.
+
+Validation: 427 library tests passed (11 ignored), 51 architecture integration
+tests passed (4 ignored), five native precision tests, the two new native parity
+tests, two shader-barrier checks, device-policy isolation, default library check,
+and feature release build. The new code also preserves the existing collapse
+fallback for non-4D input layouts. The earlier unrelated core integration-target
+compile limitation remains documented in the previous report.
+
+Final source verification repeated both new native tests, passed nine existing
+CubeCL/Vulkan regressions (three ignored), and passed default/feature library
+checks and the release build. A final 121-token batched-prefill plus two-decode
+replay is bit-identical to the corresponding full-qualification rows and again
+avoids the extra reservation; this short replay is not used as timing evidence.

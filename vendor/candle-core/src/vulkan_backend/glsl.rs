@@ -1420,7 +1420,7 @@ void main(){
     }
     s+=r#"
  if(n<pc.N){
-  int x=pc.xoff+(GROUPS>1?n/(pc.N/GROUPS):m)*pc.K;
+  int x=pc.xoff+(m*GROUPS+(GROUPS>1?n/(pc.N/GROUPS):0))*pc.K;
   int nb=pc.K/32;
   for(int b=0;b<nb;b++){
    uint p=uint(n*nb+b)*34u;
@@ -1432,13 +1432,13 @@ void main(){
             s+=&format!("if(m+{r}<pc.M){{\n");
             if comp {
                 s+=&format!(r#"
- float a=X[x+{r}*pc.K+k];float product=a*w;float pe=fma(a,w,-product);
+ float a=X[x+{r}*GROUPS*pc.K+k];float product=a*w;float pe=fma(a,w,-product);
  float sum=hi{r}+product;float bb=sum-hi{r};float se=(hi{r}-(sum-bb))+(product-bb);
  float correction=lo{r}+(se+pe);float next=sum+correction;
  lo{r}=correction-(next-sum);hi{r}=next;
 "#);
             } else {
-                s+=&format!("acc{r}=fma(double(X[x+{r}*pc.K+k]),double(w),acc{r});\n");
+                s+=&format!("acc{r}=fma(double(X[x+{r}*GROUPS*pc.K+k]),double(w),acc{r});\n");
             }
             s+="}\n";
         }
@@ -1898,6 +1898,29 @@ void main(){
 }
 "#;s
 }
+/// Fuse HC4 collapse while preserving the f32 product before the ordered
+/// f64 reduction. No hc-times-expanded weighted activation is allocated.
+pub fn k_mhc_collapse(wg: usize) -> String {
+    let mut s=prelude(wg,3);
+    s+="// JOSHUA_NO_CONTRACTION\n";
+    s+=&buf(0,"float","X",true);s+=&buf(1,"float","P",true);s+=&buf(2,"float","O",false);
+    s+=r#"
+layout(push_constant) uniform PC {int len;int width;int xoff;int poff;} pc;
+layout(local_size_x=WG) in;
+void main(){
+ int i=gid();if(i>=pc.len)return;
+ int row=i/pc.width;int col=i%pc.width;
+ double sum=double(0.0);
+ for(int h=0;h<4;h++){
+  float product=X[pc.xoff+(row*4+h)*pc.width+col]*P[pc.poff+row*4+h];
+  sum+=double(product);
+ }
+ O[i]=float(sum);
+}
+"#;
+    s
+}
+
 pub fn k_precise_rows(wg:usize)->String {
     let mut s=prelude(wg,2);s+=&buf(0,"float","X",true);s+=&buf(1,"float","O",false);s+=PRECISE_MATH;
     s+=r#"
