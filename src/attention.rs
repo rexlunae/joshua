@@ -962,7 +962,8 @@ mod tests {
 
 /// Project each head group with its diagonal block of a packed weight matrix.
 /// The native decode path reads the original input/weights and writes only the
-/// selected outputs. Prefill and unsupported backends keep matmul's arithmetic.
+/// selected outputs. Qualified precise prefill uses the same compensated
+/// streams as its full projection; unsupported paths retain matmul/gather.
 pub fn grouped_output_projection(
     weight: &candle_core::quantized::QMatMul,
     x: &Tensor,
@@ -981,6 +982,11 @@ pub fn grouped_output_projection(
             }
             return Ok(y);
         }
+    } else if let Some(y) = weight.try_grouped_q8(x, groups)? {
+        if y.dims() != [seq, groups * rank] {
+            bail!("grouped projection weight/output shape mismatch");
+        }
+        return Ok(y);
     }
     let oa = weight.forward(&x.reshape((seq * groups, k))?)?
         .reshape((seq, groups, groups * rank))?;

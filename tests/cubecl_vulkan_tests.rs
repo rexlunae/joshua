@@ -804,3 +804,87 @@ fn grouped_q8_queued_buffers_are_released_across_batch_boundary() {
     vk.synchronize().unwrap();
     assert_eq!(before, vk.memory_stats());
 }
+
+#[test]
+#[ignore = "requires B50/native float64 Vulkan and JOSHUA_VULKAN_PREFILL_OPT=1"]
+fn precise_batched_grouped_q8_preserves_selected_outputs_and_bounds() {
+    use candle_core::{
+        quantized::{QMatMul, QStorage},
+        Module,
+    };
+    let vk = VulkanDevice::new_with_qgemv(0, Qgemv::CubeClNext)
+        .unwrap()
+        .with_precise_math()
+        .unwrap();
+    let dev = Device::Vulkan(vk.clone());
+    assert!(kernels::precise_prefill_optimized(&vk, 32));
+    let before = kernels::fallback_count();
+    // Odd output tiles and partial four-row tails, with an activation offset.
+    for (groups, rank, k) in [(3, 7, 256), (8, 1024, 4096)] {
+        let n = groups * rank;
+        let cpu = Tensor::from_vec(
+            common::weights(n * k, 391)
+                .into_iter()
+                .map(|v| v * 70.)
+                .collect::<Vec<_>>(),
+            (n, k),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let qt = QTensor::quantize(&cpu, GgmlDType::Q8_0).unwrap();
+        let weight = QMatMul::from_qtensor(
+            QTensor::new(
+                QStorage::from_data(qt.data().unwrap(), &dev, GgmlDType::Q8_0).unwrap(),
+                (n, k),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        for rows in [2usize, 4, 25, 32] {
+            let count = rows * groups * k;
+            let mut values = vec![99.; 3];
+            values.extend(common::weights(count, 193).into_iter().map(|v| v * 80.));
+            let x = Tensor::from_vec(values, count + 3, &dev)
+                .unwrap()
+                .narrow(0, 3, count)
+                .unwrap()
+                .reshape((rows, groups, k))
+                .unwrap();
+            let full = weight
+                .forward(&x.reshape((rows * groups, k)).unwrap())
+                .unwrap()
+                .reshape((rows, groups, n))
+                .unwrap();
+            let blocks: Vec<_> = (0..groups)
+                .map(|g| {
+                    full.narrow(1, g, 1)
+                        .unwrap()
+                        .narrow(2, g * rank, rank)
+                        .unwrap()
+                        .squeeze(1)
+                        .unwrap()
+                })
+                .collect();
+            let expected = Tensor::cat(&blocks, 1)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let got = weight
+                .try_grouped_q8(&x, groups)
+                .unwrap()
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            assert_eq!(expected, got, "groups={groups}, rows={rows}");
+        }
+        for rows in [0usize, 1, 33] {
+            let x = Tensor::zeros((rows, groups, k), DType::F32, &dev).unwrap();
+            assert!(weight.try_grouped_q8(&x, groups).unwrap().is_none());
+        }
+    }
+    assert_eq!(before, kernels::fallback_count());
+}

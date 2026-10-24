@@ -232,6 +232,42 @@ fn io_counters() -> BTreeMap<String, u64> {
         })
         .collect()
 }
+/// The serial benchmark measures a quiescent session boundary. glibc can
+/// retain (or unpredictably release) freed session pages in its arenas, so
+/// explicitly return those pages and report both footprints and the cost.
+/// This is benchmark cleanup, not an inference hot-path allocator policy.
+#[derive(Serialize)]
+struct HostHeapStats {
+    live_bytes: usize,
+    arena_bytes: usize,
+    free_arena_bytes: usize,
+    mmap_bytes: usize,
+}
+fn host_heap_stats() -> Option<HostHeapStats> {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        let m = unsafe { libc::mallinfo2() };
+        return Some(HostHeapStats {
+            live_bytes: m.uordblks + m.hblkhd,
+            arena_bytes: m.arena,
+            free_arena_bytes: m.fordblks,
+            mmap_bytes: m.hblkhd,
+        });
+    }
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    None
+}
+fn release_unused_host_heap() -> (f64, Option<HostHeapStats>, Option<HostHeapStats>) {
+    let start = Instant::now();
+    let before = host_heap_stats();
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    unsafe {
+        libc::malloc_trim(0);
+    }
+    let after = host_heap_stats();
+    (start.elapsed().as_secs_f64() * 1e3, before, after)
+}
+
 fn host_memory_kib() -> BTreeMap<String, u64> {
     std::fs::read_to_string("/proc/self/status")
         .unwrap()
@@ -712,6 +748,7 @@ fn main() -> Result<()> {
         trace.inputs.reserve(args.decode);
     }
     dev.synchronize()?;
+    let (warm_heap_cleanup_ms, warm_heap_before, warm_heap_after) = release_unused_host_heap();
     let warm_memory = device_memory(&dev);
     let warm_rss = rss_kib();
     let warm_host_memory = host_memory_kib();
@@ -720,6 +757,10 @@ fn main() -> Result<()> {
     let mut memory_after = Vec::new();
     let mut rss_after = Vec::new();
     let mut host_after = Vec::new();
+    let mut host_before_cleanup = Vec::with_capacity(args.passes);
+    let mut heap_before_cleanup = Vec::with_capacity(args.passes);
+    let mut heap_after_cleanup = Vec::with_capacity(args.passes);
+    let mut session_cleanup_ms = Vec::with_capacity(args.passes);
     let mut driver_after = Vec::new();
     let mut cache_after = Vec::new();
     let mut io_after = Vec::new();
@@ -821,6 +862,11 @@ fn main() -> Result<()> {
         fallback_counts.push(fallback_count(&dev) - before);
         drop(session);
         dev.synchronize()?;
+        host_before_cleanup.push(host_memory_kib());
+        let (cleanup_ms, heap_before, heap_after) = release_unused_host_heap();
+        session_cleanup_ms.push(cleanup_ms);
+        heap_before_cleanup.push(heap_before);
+        heap_after_cleanup.push(heap_after);
         memory_after.push(device_memory(&dev));
         rss_after.push(rss_kib());
         host_after.push(host_memory_kib());
@@ -865,6 +911,16 @@ fn main() -> Result<()> {
     }
     summary["decode_text_file"] = serde_json::to_value(&args.decode_text_file)?;
     summary["loaded_io_counters"] = serde_json::to_value(loaded_io)?;
+    summary["warm_heap_cleanup_ms"] = serde_json::json!(warm_heap_cleanup_ms);
+    summary["warm_before_cleanup_heap_stats"] = serde_json::to_value(&warm_heap_before)?;
+    summary["warm_after_cleanup_heap_stats"] = serde_json::to_value(&warm_heap_after)?;
+    summary["before_cleanup_host_memory_kib"] = serde_json::to_value(&host_before_cleanup)?;
+    summary["before_cleanup_heap_stats"] = serde_json::to_value(&heap_before_cleanup)?;
+    summary["after_session_heap_stats"] = serde_json::to_value(&heap_after_cleanup)?;
+    summary["session_cleanup_ms"] = serde_json::to_value(&session_cleanup_ms)?;
+    summary["host_heap_cleanup_method"] = serde_json::json!(
+        if cfg!(all(target_os = "linux", target_env = "gnu")) { "glibc_malloc_trim_warmup_and_session" } else { "unavailable" }
+    );
     summary["warm_io_counters"] = serde_json::to_value(warm_io)?;
     summary["after_session_io_counters"] = serde_json::to_value(io_after)?;
     summary["explicit_dense_cpu"] = args.dense_cpu.into();

@@ -1,0 +1,657 @@
+{
+  "date_utc": "2026-10-24",
+  "base_commit": "a0ec8a21c0816512f808e96824e45aa16b64a38b",
+  "qualification_executable_sha256": "d9a231454cde3d2215fe0777f510adc9df8c5a8d0eb417b2d9d5c718a1262a99",
+  "model": "DSV41-REAP272E-balanced.gguf",
+  "model_bytes": 290070476416,
+  "backend": "Vulkan CubeClProduction precise profile on Intel Arc Pro B50 (8086:E212), Ryzen 9 9950X AVX-512 CPU-mmap routed experts",
+  "workload": {
+    "trace": "deepseek-backend-trace-b50-20261023.json",
+    "trace_sha256": "ed4f15d4af072478db90219e2721a55ce575ad7ffe83a0973bb557506b8df3c0",
+    "prompt_tokens": 121,
+    "prefill_chunk": 32,
+    "last_prefill_chunk": 25,
+    "decode_tokens": 128,
+    "context": 249,
+    "independent_sessions_per_run": 2,
+    "warm_prompt_tokens": 8,
+    "warm_decode": 2,
+    "activation_capture": false,
+    "captured_logit_rows": "last prefill row plus all 128 teacher-forced decode rows"
+  },
+  "changes": [
+    "Compute only diagonal output-A groups during batched precise Q8 projection; preserve compensated four-lane dot streams.",
+    "Fuse HC4 collapse, rounding each product to f32 before the same ordered f64 sum; remove the expanded weighted activation.",
+    "Borrow existing native buffers and queue; no weight copies, dequantized expert pools, allocator changes, extra transfers, or forced synchronization."
+  ],
+  "dispatch": {
+    "automatic_new_prefill_dispatch": false,
+    "opt_in_environment": {
+      "JOSHUA_VULKAN_PREFILL_OPT": "1"
+    },
+    "requirements": "native precise compensated Vulkan, contiguous f32 activations, rows 2..32; grouped Q8 retains existing format/geometry eligibility. Existing model-scoped B50 precision qualification is unchanged.",
+    "reason": "Both CPU reference runs failed the unchanged 1 MiB private endpoint stability gate. No automatic arithmetic/backend choices were changed.",
+    "outside_qualification": "Other model signatures, context >249, prefill >32, other accelerators, streamed/distributed loading, and device expert caching remain unqualified."
+  },
+  "initial_qualification": {
+    "paths": {
+      "candidate": {
+        "executable_sha256": "d9a231454cde3d2215fe0777f510adc9df8c5a8d0eb417b2d9d5c718a1262a99",
+        "decode_ms_per_token": [
+          748.3765619921874,
+          738.7178531015622
+        ],
+        "median_decode_ms_per_token": 743.5472075468748,
+        "prefill_ms": [
+          34265.44575,
+          33706.393640999995
+        ],
+        "median_prefill_ms": 33985.91969549999,
+        "median_session_ms": 129159.96226149998,
+        "loaded_reserved_live": [
+          9365831680,
+          9224831488
+        ],
+        "warm_reserved_live": [
+          9365831680,
+          9224831488
+        ],
+        "after_session_reserved_live": [
+          [
+            9365831680,
+            9224831488
+          ],
+          [
+            9365831680,
+            9224831488
+          ]
+        ],
+        "sampled_peak_reserved_live": [
+          9365831680,
+          9279003648
+        ],
+        "private_endpoint_kib": [
+          185404,
+          185548
+        ],
+        "private_spread_kib": 144,
+        "tracked_prefill_fallbacks": [
+          0,
+          0
+        ],
+        "tracked_decode_fallbacks": [
+          0,
+          0
+        ],
+        "repeat_max_abs": 0.0,
+        "logits_sha256": "f9e4004cb6fe5fc8e126f2a6075b8d79b201403b9b58da226b8e1396994d3c48"
+      },
+      "current": {
+        "executable_sha256": "d9a231454cde3d2215fe0777f510adc9df8c5a8d0eb417b2d9d5c718a1262a99",
+        "decode_ms_per_token": [
+          739.3792509531254,
+          738.7007988593753
+        ],
+        "median_decode_ms_per_token": 739.0400249062503,
+        "prefill_ms": [
+          40564.429613,
+          41612.998195
+        ],
+        "median_prefill_ms": 41088.713904000004,
+        "median_session_ms": 135685.83709200006,
+        "loaded_reserved_live": [
+          9365831680,
+          9224831488
+        ],
+        "warm_reserved_live": [
+          9365831680,
+          9224831488
+        ],
+        "after_session_reserved_live": [
+          [
+            9500049408,
+            9224831488
+          ],
+          [
+            9500049408,
+            9224831488
+          ]
+        ],
+        "sampled_peak_reserved_live": [
+          9500049408,
+          9279003648
+        ],
+        "private_endpoint_kib": [
+          185272,
+          185468
+        ],
+        "private_spread_kib": 196,
+        "tracked_prefill_fallbacks": [
+          0,
+          0
+        ],
+        "tracked_decode_fallbacks": [
+          0,
+          0
+        ],
+        "repeat_max_abs": 0.0,
+        "logits_sha256": "f9e4004cb6fe5fc8e126f2a6075b8d79b201403b9b58da226b8e1396994d3c48"
+      },
+      "cpu-reference": {
+        "executable_sha256": "d9a231454cde3d2215fe0777f510adc9df8c5a8d0eb417b2d9d5c718a1262a99",
+        "decode_ms_per_token": [
+          680.5912201796876,
+          671.6756103671871
+        ],
+        "median_decode_ms_per_token": 676.1334152734373,
+        "prefill_ms": [
+          43917.407946,
+          43390.231505
+        ],
+        "median_prefill_ms": 43653.8197255,
+        "median_session_ms": 130198.89688049999,
+        "loaded_reserved_live": [
+          0,
+          0
+        ],
+        "warm_reserved_live": [
+          0,
+          0
+        ],
+        "after_session_reserved_live": [
+          [
+            0,
+            0
+          ],
+          [
+            0,
+            0
+          ]
+        ],
+        "sampled_peak_reserved_live": [
+          0,
+          0
+        ],
+        "private_endpoint_kib": [
+          623460,
+          585112
+        ],
+        "private_spread_kib": 38348,
+        "tracked_prefill_fallbacks": [
+          0,
+          0
+        ],
+        "tracked_decode_fallbacks": [
+          0,
+          0
+        ],
+        "repeat_max_abs": 0.0,
+        "logits_sha256": "f05471228d174c8ed2d76e5b5c008aaad3e7f714dddafe251bb422dd4b1ad56c"
+      },
+      "fast-control": {
+        "executable_sha256": "d9a231454cde3d2215fe0777f510adc9df8c5a8d0eb417b2d9d5c718a1262a99",
+        "decode_ms_per_token": [
+          826.3557615625002,
+          823.8732300078125
+        ],
+        "median_decode_ms_per_token": 825.1144957851564,
+        "prefill_ms": [
+          42681.121285,
+          39069.672028
+        ],
+        "median_prefill_ms": 40875.3966565,
+        "median_session_ms": 146490.052117,
+        "loaded_reserved_live": [
+          9365831680,
+          9224831488
+        ],
+        "warm_reserved_live": [
+          9365831680,
+          9224831488
+        ],
+        "after_session_reserved_live": [
+          [
+            9365831680,
+            9224831488
+          ],
+          [
+            9365831680,
+            9224831488
+          ]
+        ],
+        "sampled_peak_reserved_live": [
+          9365831680,
+          9279003648
+        ],
+        "private_endpoint_kib": [
+          183284,
+          183316
+        ],
+        "private_spread_kib": 32,
+        "tracked_prefill_fallbacks": [
+          0,
+          0
+        ],
+        "tracked_decode_fallbacks": [
+          0,
+          0
+        ],
+        "repeat_max_abs": 0.0,
+        "logits_sha256": "5bccde4e8e3c85d91be204501ec06665087e939987fc5cbdb400641d96eb3b4b"
+      }
+    },
+    "absolute_tolerance": 1e-05,
+    "accuracy_gates": {
+      "same_executable": true,
+      "absolute_logits_1e_5": true,
+      "repeat_logits_1e_5": true,
+      "reference_repeat_logits_1e_5": true,
+      "repeated_sessions_measured": true,
+      "reference_repeated_sessions_measured": true,
+      "reference_private_memory_growth_le_1MiB": false,
+      "same_greedy_choices": true,
+      "private_memory_growth_le_1MiB": true,
+      "device_memory_stable": true,
+      "reference_memory_stable": true,
+      "no_cpu_fallbacks": true
+    },
+    "max_abs_logit_difference": 8.58306884765625e-06,
+    "rms_logit_difference": 7.507342947435399e-07,
+    "matching_top1_rows": 129,
+    "logits_compared": 16677120,
+    "speed_vs_fast_control": {
+      "all_decode_samples_faster": true,
+      "all_session_samples_faster": true
+    },
+    "memory_reference_fast_control": {
+      "reference_private_memory_growth_le_1MiB": true,
+      "private_memory_growth_le_1MiB": true,
+      "device_memory_stable": true,
+      "reference_memory_stable": true
+    },
+    "candidate_vs_current_bit_identical": true,
+    "current_accuracy_memory_gates": {
+      "same_executable": true,
+      "absolute_logits_1e_5": true,
+      "repeat_logits_1e_5": true,
+      "reference_repeat_logits_1e_5": true,
+      "repeated_sessions_measured": true,
+      "reference_repeated_sessions_measured": true,
+      "reference_private_memory_growth_le_1MiB": true,
+      "same_greedy_choices": true,
+      "private_memory_growth_le_1MiB": true,
+      "device_memory_stable": true,
+      "reference_memory_stable": true,
+      "no_cpu_fallbacks": true
+    },
+    "additional_gates": {
+      "all_prefill_samples_faster_than_current": true,
+      "all_prefill_samples_faster_than_fast_control": true,
+      "no_extra_reservation_vs_fast_control": true,
+      "no_reservation_increase_after_warmup": true
+    },
+    "eligible": false,
+    "prefill_speedup_vs_current": 1.2089922612699069,
+    "prefill_speedup_vs_fast": 1.2027156252567803,
+    "decode_speedup_vs_fast": 1.109700214606938,
+    "session_speedup_vs_fast": 1.1341754019749029,
+    "reserved_reduction_bytes": 134217728
+  },
+  "cpu_reference_confirmation": {
+    "cpu_reference_run": "cpu-reference-confirmation",
+    "paths": {
+      "candidate": {
+        "executable_sha256": "d9a231454cde3d2215fe0777f510adc9df8c5a8d0eb417b2d9d5c718a1262a99",
+        "decode_ms_per_token": [
+          748.3765619921874,
+          738.7178531015622
+        ],
+        "median_decode_ms_per_token": 743.5472075468748,
+        "prefill_ms": [
+          34265.44575,
+          33706.393640999995
+        ],
+        "median_prefill_ms": 33985.91969549999,
+        "median_session_ms": 129159.96226149998,
+        "loaded_reserved_live": [
+          9365831680,
+          9224831488
+        ],
+        "warm_reserved_live": [
+          9365831680,
+          9224831488
+        ],
+        "after_session_reserved_live": [
+          [
+            9365831680,
+            9224831488
+          ],
+          [
+            9365831680,
+            9224831488
+          ]
+        ],
+        "sampled_peak_reserved_live": [
+          9365831680,
+          9279003648
+        ],
+        "private_endpoint_kib": [
+          185404,
+          185548
+        ],
+        "private_spread_kib": 144,
+        "tracked_prefill_fallbacks": [
+          0,
+          0
+        ],
+        "tracked_decode_fallbacks": [
+          0,
+          0
+        ],
+        "repeat_max_abs": 0.0,
+        "logits_sha256": "f9e4004cb6fe5fc8e126f2a6075b8d79b201403b9b58da226b8e1396994d3c48"
+      },
+      "current": {
+        "executable_sha256": "d9a231454cde3d2215fe0777f510adc9df8c5a8d0eb417b2d9d5c718a1262a99",
+        "decode_ms_per_token": [
+          739.3792509531254,
+          738.7007988593753
+        ],
+        "median_decode_ms_per_token": 739.0400249062503,
+        "prefill_ms": [
+          40564.429613,
+          41612.998195
+        ],
+        "median_prefill_ms": 41088.713904000004,
+        "median_session_ms": 135685.83709200006,
+        "loaded_reserved_live": [
+          9365831680,
+          9224831488
+        ],
+        "warm_reserved_live": [
+          9365831680,
+          9224831488
+        ],
+        "after_session_reserved_live": [
+          [
+            9500049408,
+            9224831488
+          ],
+          [
+            9500049408,
+            9224831488
+          ]
+        ],
+        "sampled_peak_reserved_live": [
+          9500049408,
+          9279003648
+        ],
+        "private_endpoint_kib": [
+          185272,
+          185468
+        ],
+        "private_spread_kib": 196,
+        "tracked_prefill_fallbacks": [
+          0,
+          0
+        ],
+        "tracked_decode_fallbacks": [
+          0,
+          0
+        ],
+        "repeat_max_abs": 0.0,
+        "logits_sha256": "f9e4004cb6fe5fc8e126f2a6075b8d79b201403b9b58da226b8e1396994d3c48"
+      },
+      "cpu-reference": {
+        "executable_sha256": "d9a231454cde3d2215fe0777f510adc9df8c5a8d0eb417b2d9d5c718a1262a99",
+        "decode_ms_per_token": [
+          675.8054134765623,
+          670.6033975546877
+        ],
+        "median_decode_ms_per_token": 673.204405515625,
+        "prefill_ms": [
+          46822.229176999994,
+          44283.531746
+        ],
+        "median_prefill_ms": 45552.8804615,
+        "median_session_ms": 131723.0443675,
+        "loaded_reserved_live": [
+          0,
+          0
+        ],
+        "warm_reserved_live": [
+          0,
+          0
+        ],
+        "after_session_reserved_live": [
+          [
+            0,
+            0
+          ],
+          [
+            0,
+            0
+          ]
+        ],
+        "sampled_peak_reserved_live": [
+          0,
+          0
+        ],
+        "private_endpoint_kib": [
+          619684,
+          623828
+        ],
+        "private_spread_kib": 4144,
+        "tracked_prefill_fallbacks": [
+          0,
+          0
+        ],
+        "tracked_decode_fallbacks": [
+          0,
+          0
+        ],
+        "repeat_max_abs": 0.0,
+        "logits_sha256": "f05471228d174c8ed2d76e5b5c008aaad3e7f714dddafe251bb422dd4b1ad56c"
+      },
+      "fast-control": {
+        "executable_sha256": "d9a231454cde3d2215fe0777f510adc9df8c5a8d0eb417b2d9d5c718a1262a99",
+        "decode_ms_per_token": [
+          826.3557615625002,
+          823.8732300078125
+        ],
+        "median_decode_ms_per_token": 825.1144957851564,
+        "prefill_ms": [
+          42681.121285,
+          39069.672028
+        ],
+        "median_prefill_ms": 40875.3966565,
+        "median_session_ms": 146490.052117,
+        "loaded_reserved_live": [
+          9365831680,
+          9224831488
+        ],
+        "warm_reserved_live": [
+          9365831680,
+          9224831488
+        ],
+        "after_session_reserved_live": [
+          [
+            9365831680,
+            9224831488
+          ],
+          [
+            9365831680,
+            9224831488
+          ]
+        ],
+        "sampled_peak_reserved_live": [
+          9365831680,
+          9279003648
+        ],
+        "private_endpoint_kib": [
+          183284,
+          183316
+        ],
+        "private_spread_kib": 32,
+        "tracked_prefill_fallbacks": [
+          0,
+          0
+        ],
+        "tracked_decode_fallbacks": [
+          0,
+          0
+        ],
+        "repeat_max_abs": 0.0,
+        "logits_sha256": "5bccde4e8e3c85d91be204501ec06665087e939987fc5cbdb400641d96eb3b4b"
+      }
+    },
+    "absolute_tolerance": 1e-05,
+    "accuracy_gates": {
+      "same_executable": true,
+      "absolute_logits_1e_5": true,
+      "repeat_logits_1e_5": true,
+      "reference_repeat_logits_1e_5": true,
+      "repeated_sessions_measured": true,
+      "reference_repeated_sessions_measured": true,
+      "reference_private_memory_growth_le_1MiB": false,
+      "same_greedy_choices": true,
+      "private_memory_growth_le_1MiB": true,
+      "device_memory_stable": true,
+      "reference_memory_stable": true,
+      "no_cpu_fallbacks": true
+    },
+    "max_abs_logit_difference": 8.58306884765625e-06,
+    "rms_logit_difference": 7.507342947435399e-07,
+    "matching_top1_rows": 129,
+    "logits_compared": 16677120,
+    "speed_vs_fast_control": {
+      "all_decode_samples_faster": true,
+      "all_session_samples_faster": true
+    },
+    "memory_reference_fast_control": {
+      "reference_private_memory_growth_le_1MiB": true,
+      "private_memory_growth_le_1MiB": true,
+      "device_memory_stable": true,
+      "reference_memory_stable": true
+    },
+    "candidate_vs_current_bit_identical": true,
+    "current_accuracy_memory_gates": {
+      "same_executable": true,
+      "absolute_logits_1e_5": true,
+      "repeat_logits_1e_5": true,
+      "reference_repeat_logits_1e_5": true,
+      "repeated_sessions_measured": true,
+      "reference_repeated_sessions_measured": true,
+      "reference_private_memory_growth_le_1MiB": true,
+      "same_greedy_choices": true,
+      "private_memory_growth_le_1MiB": true,
+      "device_memory_stable": true,
+      "reference_memory_stable": true,
+      "no_cpu_fallbacks": true
+    },
+    "additional_gates": {
+      "all_prefill_samples_faster_than_current": true,
+      "all_prefill_samples_faster_than_fast_control": true,
+      "no_extra_reservation_vs_fast_control": true,
+      "no_reservation_increase_after_warmup": true
+    },
+    "eligible": false,
+    "prefill_speedup_vs_current": 1.2089922612699069,
+    "prefill_speedup_vs_fast": 1.2027156252567803,
+    "decode_speedup_vs_fast": 1.109700214606938,
+    "session_speedup_vs_fast": 1.1341754019749029,
+    "reserved_reduction_bytes": 134217728
+  },
+  "confirmation_cpu_logits_bit_identical_to_initial": true,
+  "reference_failures": {
+    "initial_private_endpoints_kib": [
+      623460,
+      585112
+    ],
+    "initial_private_change_kib": -38348,
+    "confirmation_private_endpoints_kib": [
+      619684,
+      623828
+    ],
+    "confirmation_private_change_kib": 4144,
+    "allowed_spread_kib": 1024,
+    "interpretation": "Initial private decommit occurred at the second session final prefill chunk. The exact-protocol confirmation instead grew; reference memory has not qualified as stable. Neither run was discarded."
+  },
+  "decode_vs_current_percent": 0.609869897262505,
+  "prefill_time_reduction_vs_current_percent": 17.28648461739405,
+  "measurement_limits": [
+    "Two complete sessions per run; one realistic prompt and fixed teacher-forced continuation, not an open-ended generation or longer-context qualification.",
+    "Sampled live-memory peaks are not per-allocation peak telemetry. Allocator and driver endpoint reservations are measured directly.",
+    "CPU is the corrected precision reference backed by independent primitive/tiny float64 tests; there is no separate full-290GB float64 oracle.",
+    "Tracked native fallback counters exclude intentional CPU-mmap experts and existing host routing.",
+    "Production retains the prior corrected profile and its reservation until every qualification gate passes."
+  ],
+  "raw_results": "/home/tserica/benchmark-results/deepseek-prefill-b50-20261024",
+  "flags": {
+    "candidate": {
+      "JOSHUA_VULKAN_PREFILL_OPT": "1"
+    },
+    "current": {
+      "JOSHUA_VULKAN_PREFILL_OPT": "0"
+    },
+    "cpu": {
+      "JOSHUA_VULKAN_PREFILL_OPT": "0",
+      "JOSHUA_CPU_DOT_F64": "1",
+      "JOSHUA_VULKAN_DOT_F64": "1",
+      "JOSHUA_VULKAN_RMS_F64": "1",
+      "JOSHUA_VULKAN_COMPENSATED_DOT": "1",
+      "JOSHUA_VULKAN_FUSED_MHC": "1"
+    },
+    "fast": {
+      "JOSHUA_VULKAN_PREFILL_OPT": "0",
+      "JOSHUA_CPU_DOT_F64": "0",
+      "JOSHUA_VULKAN_DOT_F64": "0",
+      "JOSHUA_VULKAN_RMS_F64": "0",
+      "JOSHUA_VULKAN_COMPENSATED_DOT": "0",
+      "JOSHUA_VULKAN_FUSED_MHC": "0"
+    }
+  },
+  "validation": {
+    "library": {
+      "passed": 427,
+      "ignored": 11
+    },
+    "architecture_integrations": {
+      "passed": 51,
+      "ignored": 4
+    },
+    "native_precision_tests_passed": 5,
+    "new_native_grouped_and_collapse_tests_passed": 2,
+    "shader_barrier_tests_passed": 2,
+    "model_scoped_policy_tests_passed": 1,
+    "default_library_check": true,
+    "feature_release_build": true,
+    "final_native_and_build_checks": {
+      "new_native_grouped_passed": 1,
+      "new_native_collapse_passed": 1,
+      "existing_cubecl_regressions_passed": 9,
+      "existing_cubecl_regressions_ignored": 3,
+      "default_library_check": true,
+      "feature_library_check": true,
+      "feature_release_build": true,
+      "non_4D_collapse_fallback_test": true
+    }
+  },
+  "final_release_verification": {
+    "executable_sha256": "228acc57549defdd082b7448583bac706154597880d958794908d67cd56c23dc",
+    "rows_compared": 3,
+    "bit_identical_to_full_qualification": true,
+    "warm_reserved_live": [
+      9365831680,
+      9224831488
+    ],
+    "after_session_reserved_live": [
+      [
+        9365831680,
+        9224831488
+      ]
+    ],
+    "source_patch_sha256": "16a2c2c003083a42be95fb60feb5d5bf10068b7d1e4be884f846e70a3c895b2a",
+    "note": "Final review only preserves unsupported-rank collapse fallback and formats new Rust; full-model 4D algorithm is unchanged."
+  }
+}

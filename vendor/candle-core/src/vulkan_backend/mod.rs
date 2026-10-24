@@ -1602,16 +1602,26 @@ impl QVulkanStorage {
         layout: &Layout, groups: usize) -> Result<(VulkanStorage, Shape)> {
         let (n, k) = shape.dims2()?;
         let dev = self.device();
+        let rows = match layout.dims() {
+            [g, width] if (*g, *width) == (groups, k) => 1,
+            [rows, g, width] if (*g, *width) == (groups, k)
+                && kernels::precise_prefill_optimized(dev, *rows) => *rows,
+            _ => return Err(Error::Msg("vulkan grouped Q8: incompatible shape".into())),
+        };
         if storage.dtype != DType::F32 || !dev.same_device(&storage.device)
-            || layout.shape().dims() != [groups, k] || !self.grouped_q8_eligible(groups, n, k) {
+            || !self.grouped_q8_eligible(groups, n, k) {
             return Err(Error::Msg("vulkan grouped Q8: incompatible input".into()));
         }
         let Some((offset, _)) = layout.contiguous_offsets() else {
             return Err(Error::Msg("vulkan grouped Q8: noncontiguous input".into()));
         };
-        let out = dev.alloc(DType::F32, n)?;
-        kernels::run_grouped_q8(dev, storage.buf(), self.inner.buf(), out.buf(), groups, n, k, offset)?;
-        Ok((out, Shape::from((1, n))))
+        let out = dev.alloc(DType::F32, rows * n)?;
+        if rows == 1 {
+            kernels::run_grouped_q8(dev, storage.buf(), self.inner.buf(), out.buf(), groups, n, k, offset)?;
+        } else {
+            kernels::run_grouped_q8_prefill(dev, storage.buf(), self.inner.buf(), out.buf(), rows, groups, n, k, offset)?;
+        }
+        Ok((out, Shape::from((rows, n))))
     }
 
     /// `x @ W^T` for `x` on the device (f32, contiguous) and this `[n, k]` weight.
@@ -1749,6 +1759,17 @@ mod tests {
         assert!(!fast.precise_math());
         assert!(accurate.precise_math());
         assert!(Arc::ptr_eq(&fast.inner, &accurate.inner));
+        if std::env::var_os("JOSHUA_VULKAN_PREFILL_OPT").is_none() && kernels::native_enabled() {
+            // An automatic compact-prefill choice belongs to this model's
+            // handle; sharing its queue/allocator must not enable callers.
+            assert!(!kernels::precise_prefill_optimized(&fast, 32));
+            for rows in [2, 25, 32] {
+                assert!(kernels::precise_prefill_optimized(&accurate, rows));
+            }
+            for rows in [0, 1, 33] {
+                assert!(!kernels::precise_prefill_optimized(&accurate, rows));
+            }
+        }
         let fast_device = Device::Vulkan(fast.clone());
         let accurate_device = Device::Vulkan(accurate);
         assert!(fast_device.same_device(&accurate_device));
