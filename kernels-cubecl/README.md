@@ -1303,3 +1303,96 @@ CubeCL/Vulkan regressions (three ignored), and passed default/feature library
 checks and the release build. A final 121-token batched-prefill plus two-decode
 replay is bit-identical to the corresponding full-qualification rows and again
 avoids the extra reservation; this short replay is not used as timing evidence.
+
+## B50 DeepSeek CPU-reference stability and compact-prefill production qualification
+
+The [CPU-reference memory report](benchmarks/deepseek-cpu-reference-memory-b50-20261024.json)
+supersedes the previous opt-in decision. The same 290-GB model and realistic
+121-token prompt were replayed in batches of 32 (final batch 25), followed by
+**128 teacher-forced decode tokens**, with context 249 and **three independent
+sessions per path**. The four qualification paths used one frozen executable;
+no builds, tests, or profiling overlapped certified timing.
+
+The CPU instability came from glibc retaining or releasing unused arena pages
+when request state was freed, rather than growing live model allocations.
+Large avoidable temporaries amplified the churn: the diagnostic baseline
+allocated **2.62 GB** cumulatively for full grouped-Q8 projection results across
+its prefills, with an **8 MiB** result and retained scratch. Precise CPU prefill
+now computes only the selected groups, reusing weights across four temporal
+rows while preserving every dot's accumulation order. CPU HC4 collapse also
+keeps the f32 product and ordered f64 sum without the expanded weighted tensor.
+An explicit batched capability leaves decode-only CPU adapters unchanged.
+
+Compacting kernels alone preserved all logits and improved prefill but still
+failed the residency gate (611,324 / 565,032 / 565,156 KiB); that failed trial is
+retained in the report. The serial benchmark now explicitly returns unused
+glibc pages at its existing warmup and post-session quiescent boundaries. It
+records **pre-release residency, post-release residency, live allocations,
+free arena bytes, and cleanup latency**. This is benchmark-only cleanup:
+production inference does not acquire a new allocator/trim policy. Every
+session's cleanup cost is charged to the total-session speed comparison, and
+mixed cleanup protocols or missing costs cannot certify a run.
+
+The original **1 MiB `RssAnon + VmSwap` stability gate** remains, with an added
+**1 MiB live-heap stability gate** so releasing pages cannot hide a live leak.
+The fixed CPU reference measured 513,664 / 513,836 / 514,012 KiB after release:
+**348 KiB spread**. Live allocations grew only **7,728 bytes** across the three
+endpoints, and release did not change live allocation bytes within any session.
+CPU cleanup cost **3.82–4.36 ms/session**, charged to the total-session
+comparisons below.
+
+| Paired qualification path | Median prefill ms | Median decode ms/token |
+|---|---:|---:|
+| Compact Vulkan candidate | 34,859.3 | 740.403 |
+| Current corrected Vulkan control | 41,228.8 | 724.824 |
+| CPU precision reference | 36,984.6 | 658.088 |
+| Old fast Vulkan control | 38,747.5 | 807.978 |
+
+Candidate prefill time is **15.4% lower** than current corrected Vulkan and
+**10.0% lower** than the fast control. Decode throughput is **1.091×** the fast
+control, and total-session speed including cleanup is **1.096×**. Candidate
+median decode is **2.1% slower** than the current corrected control in this
+paired cohort; every candidate total-session sample nevertheless beats every
+sample from **both** controls. These per-run observations are retained rather
+than treating unchanged decode arithmetic as proof of identical timing.
+
+Parity passes the unchanged absolute **1e-5** gate: maximum error
+**8.58306884765625e-6**, all **129 greedy choices** matching, across
+**16,677,120 logits** (last prefill output and all 128 decode outputs).
+The fixed CPU reference is byte-identical to the previous correct CPU
+reference, and candidate Vulkan is byte-identical to current corrected Vulkan.
+Repeats have zero drift. Candidate private residency spread is **336 KiB**
+after cleanup and **424 KiB before cleanup**; the added live-heap gate passes.
+Allocator/live endpoints equal load/warmup after all three sessions, driver
+VRAM is stable, and the extra **128 MiB** reservation is eliminated. No private
+weight copies, expanded expert pools, transfers, or GPU queue fences were added.
+Tracked native fallbacks are zero; intentional CPU-mmap experts and host routing
+remain part of this hybrid workload.
+
+**All qualification gates passed before automatic enablement.** Compact precise
+Vulkan prefill now inherits only the existing qualified model-owned B50 device
+policy, for **2–32 activation rows**. The B50 PCI ID, shaderFloat64, effective
+AVX-512 host, compatible DeepSeek41/40-layer/272-expert/six-route/HC4 signature,
+local mmap/no expert-cache restrictions, and **context <=249** are unchanged.
+Unqualified handles sharing the same allocator/queue remain unaffected.
+`JOSHUA_VULKAN_PREFILL_OPT=0` restores the previous corrected path; `1` remains
+an explicit opt-in. Missing override follows the owning model's policy.
+Backend automatic preferences remain unchanged: CPU precision decode is still
+faster, and other models/contexts/batches/backends remain unqualified.
+
+Final-source default dispatch was then replayed for **three more complete
+sessions without the opt-in flag**. All logits are byte-identical to the
+qualified candidate, and every final parity, memory, and speed check passes.
+Default medians were **32,914.8 ms prefill / 721.866 ms/token decode**. This is a
+separate-build policy verification, not a replacement for the paired timing
+cohort above. Full raw results, source/build fingerprints, cleanup costs,
+failed trials, and the final default gate verdicts are in the report.
+
+Validation: **427 library tests passed** (13 ignored), **51 architecture
+integration tests passed** (4 ignored), six explicit precision checks, CPU/GPU
+collapse parity, batched native grouped-Q8 parity, nine existing native
+CubeCL/Vulkan regressions, model-scoped policy/row-bound checks, and **11
+benchmark-comparison regressions**. Default library checks and the feature
+release build passed. Independent float64 evidence covers primitives and tiny
+models; no separate full-290GB float64 oracle or longer-context qualification
+was generated. Sampled working-memory curves are not exhaustive allocation peaks.

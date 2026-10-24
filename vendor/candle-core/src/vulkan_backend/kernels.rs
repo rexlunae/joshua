@@ -1418,11 +1418,12 @@ pub fn run_grouped_q8(d: &VulkanDevice, x: Buf, w: Buf, out: Buf,
         &[w, x, out], Push::default(), &params.0, row_grid(n, 1, lim.max_groups_x))
 }
 
-/// Precise grouped projection and HC collapse remain opt-in: GPU gates
-/// passed, but the full-model CPU reference failed private-memory stability.
+/// Compact precise prefill inherits the validated model's immutable device
+/// policy. Explicit overrides retain the matched old/candidate controls.
 pub fn precise_prefill_optimized(d: &VulkanDevice, rows: usize) -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let enabled = *ON.get_or_init(|| std::env::var("JOSHUA_VULKAN_PREFILL_OPT").is_ok_and(|v| v == "1"));
+    static OVERRIDE: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    let enabled = OVERRIDE.get_or_init(|| std::env::var_os("JOSHUA_VULKAN_PREFILL_OPT").map(|v| v == "1"))
+        .unwrap_or(d.precise_math());
     enabled && native_enabled() && (2..=32).contains(&rows) && compensated_dot_enabled_on(d) && f64_dot_enabled_on(d)
 }
 

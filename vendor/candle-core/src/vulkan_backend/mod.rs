@@ -1759,6 +1759,17 @@ mod tests {
         assert!(!fast.precise_math());
         assert!(accurate.precise_math());
         assert!(Arc::ptr_eq(&fast.inner, &accurate.inner));
+        if std::env::var_os("JOSHUA_VULKAN_PREFILL_OPT").is_none() && kernels::native_enabled() {
+            // An automatic compact-prefill choice belongs to this model's
+            // handle; sharing its queue/allocator must not enable callers.
+            assert!(!kernels::precise_prefill_optimized(&fast, 32));
+            for rows in [2, 25, 32] {
+                assert!(kernels::precise_prefill_optimized(&accurate, rows));
+            }
+            for rows in [0, 1, 33] {
+                assert!(!kernels::precise_prefill_optimized(&accurate, rows));
+            }
+        }
         let fast_device = Device::Vulkan(fast.clone());
         let accurate_device = Device::Vulkan(accurate);
         assert!(fast_device.same_device(&accurate_device));

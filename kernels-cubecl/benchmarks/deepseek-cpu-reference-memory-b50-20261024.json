@@ -1,0 +1,810 @@
+{
+  "date": "2026-10-24",
+  "base_commit": "5a597eb83770ae6b0643dcf376cb4abcf5a6b94a",
+  "model": "DSV41-REAP272E-balanced.gguf",
+  "model_bytes": 290070476416,
+  "hardware": "Intel Arc Pro B50 (8086:E212), Ryzen 9 9950X AVX-512",
+  "workload": {
+    "trace": "deepseek-backend-trace-b50-20261023.json",
+    "trace_sha256": "ed4f15d4af072478db90219e2721a55ce575ad7ffe83a0973bb557506b8df3c0",
+    "prompt_tokens": 121,
+    "prefill_batch": 32,
+    "last_prefill_batch": 25,
+    "decode_tokens": 128,
+    "context": 249,
+    "independent_sessions_per_run": 3,
+    "warm_prompt_tokens": 8,
+    "warm_decode": 2,
+    "activation_trace": false,
+    "logit_rows": "last prefill output plus all 128 teacher-forced decode outputs"
+  },
+  "root_cause": {
+    "finding": "glibc retained/released unused arena pages after request-state destruction; changing RSS was not evidence of growing live model allocations. Large avoidable precise CPU temporaries amplified allocator churn.",
+    "allocation_evidence": "Unchanged baseline interposer profile: 360 grouped output allocations requested 2,621,440,000 bytes cumulatively, peak 8,388,608 bytes, plus an 8 MiB retained output scratch; weighted HC4 activation peak 2,621,440 bytes. Profiling timings are excluded from certification.",
+    "runtime_changes": [
+      "CPU precise grouped Q8 computes selected diagonal outputs directly in four temporal-row tiles, preserving four-lane K accumulation and compact borrowed weights.",
+      "CPU precise HC4 collapse rounds each product to f32 and performs the original ordered f64 sum without the expanded weighted activation.",
+      "A separate CPU batched-group capability preserves decode-only adapters."
+    ],
+    "benchmark_changes": [
+      "At the existing serial warmup/session quiescent boundaries, explicitly release unused glibc pages. This is benchmark-only cleanup, not a production per-token/session allocator policy.",
+      "Record pre-release private footprints, allocator live/arena/free bytes before and after release, and cleanup latency.",
+      "Charge cleanup latency to every total-session speed comparison. Reject different cleanup protocols or missing costs.",
+      "Retain the original 1 MiB RssAnon+VmSwap stability and 1e-5 absolute parity gates; additionally require live-heap stability within 1 MiB. The candidate also passes private-memory stability before cleanup."
+    ]
+  },
+  "preserved_failed_trial": {
+    "description": "Compacting CPU kernels alone preserved all logits and improved prefill but did not stabilize quiescent RSS; GPU certification was correctly blocked.",
+    "result": {
+      "private_kib": [
+        611324,
+        565032,
+        565156
+      ],
+      "gates": {
+        "private_spread_le_1MiB": false,
+        "repeat_logits_le_1e_5": true,
+        "bit_identical_to_prior_cpu_reference": true
+      }
+    },
+    "raw_directory": "/home/tserica/benchmark-results/cpu-reference-memory-b50-20261024/fixed"
+  },
+  "qualification": {
+    "cpu_reference_run": "cpu-reference",
+    "paths": {
+      "candidate": {
+        "executable_sha256": "c63465ce785e4c4b64a43d6d8c527dbf15cd2cb829ac9cfb15366c137ed5502d",
+        "decode_ms_per_token": [
+          740.40263584375,
+          741.6809470234373,
+          731.0651795000002
+        ],
+        "median_decode_ms_per_token": 740.40263584375,
+        "prefill_ms": [
+          34687.042181000004,
+          35648.118642999994,
+          34859.316598
+        ],
+        "median_prefill_ms": 34859.316598,
+        "median_session_ms": 129461.46852,
+        "loaded_reserved_live": [
+          9365831680,
+          9224831488
+        ],
+        "warm_reserved_live": [
+          9365831680,
+          9224831488
+        ],
+        "after_session_reserved_live": [
+          [
+            9365831680,
+            9224831488
+          ],
+          [
+            9365831680,
+            9224831488
+          ],
+          [
+            9365831680,
+            9224831488
+          ]
+        ],
+        "sampled_peak_reserved_live": [
+          9365831680,
+          9279003648
+        ],
+        "private_endpoint_kib": [
+          155812,
+          156020,
+          156148
+        ],
+        "untrimmed_private_endpoint_kib": [
+          166688,
+          166780,
+          167112
+        ],
+        "session_cleanup_ms": [
+          2.888951,
+          2.6616589999999998,
+          2.7217439999999997
+        ],
+        "before_cleanup_heap_stats": [
+          {
+            "live_bytes": 147470112,
+            "arena_bytes": 170258432,
+            "free_arena_bytes": 31443408,
+            "mmap_bytes": 8655088
+          },
+          {
+            "live_bytes": 147554640,
+            "arena_bytes": 170258432,
+            "free_arena_bytes": 31358880,
+            "mmap_bytes": 8655088
+          },
+          {
+            "live_bytes": 147642592,
+            "arena_bytes": 170258432,
+            "free_arena_bytes": 31270928,
+            "mmap_bytes": 8655088
+          }
+        ],
+        "after_session_heap_stats": [
+          {
+            "live_bytes": 147470112,
+            "arena_bytes": 170258432,
+            "free_arena_bytes": 31443408,
+            "mmap_bytes": 8655088
+          },
+          {
+            "live_bytes": 147554640,
+            "arena_bytes": 170258432,
+            "free_arena_bytes": 31358880,
+            "mmap_bytes": 8655088
+          },
+          {
+            "live_bytes": 147642592,
+            "arena_bytes": 170258432,
+            "free_arena_bytes": 31270928,
+            "mmap_bytes": 8655088
+          }
+        ],
+        "warm_heap_cleanup_ms": 1.722227,
+        "host_heap_cleanup_method": "glibc_malloc_trim_warmup_and_session",
+        "private_spread_kib": 336,
+        "tracked_prefill_fallbacks": [
+          0,
+          0,
+          0
+        ],
+        "tracked_decode_fallbacks": [
+          0,
+          0,
+          0
+        ],
+        "repeat_max_abs": 0.0,
+        "logits_sha256": "f9e4004cb6fe5fc8e126f2a6075b8d79b201403b9b58da226b8e1396994d3c48"
+      },
+      "current": {
+        "executable_sha256": "c63465ce785e4c4b64a43d6d8c527dbf15cd2cb829ac9cfb15366c137ed5502d",
+        "decode_ms_per_token": [
+          730.8699334921873,
+          709.8201802187498,
+          724.8244115937499
+        ],
+        "median_decode_ms_per_token": 724.8244115937499,
+        "prefill_ms": [
+          43195.030076,
+          41228.753810999995,
+          40967.408444999994
+        ],
+        "median_prefill_ms": 41228.753810999995,
+        "median_session_ms": 133747.617462,
+        "loaded_reserved_live": [
+          9365831680,
+          9224831488
+        ],
+        "warm_reserved_live": [
+          9365831680,
+          9224831488
+        ],
+        "after_session_reserved_live": [
+          [
+            9500049408,
+            9224831488
+          ],
+          [
+            9500049408,
+            9224831488
+          ],
+          [
+            9500049408,
+            9224831488
+          ]
+        ],
+        "sampled_peak_reserved_live": [
+          9500049408,
+          9279003648
+        ],
+        "private_endpoint_kib": [
+          155660,
+          155948,
+          156096
+        ],
+        "untrimmed_private_endpoint_kib": [
+          166568,
+          166748,
+          166788
+        ],
+        "session_cleanup_ms": [
+          2.8857739999999996,
+          1.904493,
+          2.684333
+        ],
+        "before_cleanup_heap_stats": [
+          {
+            "live_bytes": 147409952,
+            "arena_bytes": 170258432,
+            "free_arena_bytes": 31503568,
+            "mmap_bytes": 8655088
+          },
+          {
+            "live_bytes": 147495504,
+            "arena_bytes": 170258432,
+            "free_arena_bytes": 31418016,
+            "mmap_bytes": 8655088
+          },
+          {
+            "live_bytes": 147583056,
+            "arena_bytes": 170258432,
+            "free_arena_bytes": 31330464,
+            "mmap_bytes": 8655088
+          }
+        ],
+        "after_session_heap_stats": [
+          {
+            "live_bytes": 147409952,
+            "arena_bytes": 170258432,
+            "free_arena_bytes": 31503568,
+            "mmap_bytes": 8655088
+          },
+          {
+            "live_bytes": 147495504,
+            "arena_bytes": 170258432,
+            "free_arena_bytes": 31418016,
+            "mmap_bytes": 8655088
+          },
+          {
+            "live_bytes": 147583056,
+            "arena_bytes": 170258432,
+            "free_arena_bytes": 31330464,
+            "mmap_bytes": 8655088
+          }
+        ],
+        "warm_heap_cleanup_ms": 1.455932,
+        "host_heap_cleanup_method": "glibc_malloc_trim_warmup_and_session",
+        "private_spread_kib": 436,
+        "tracked_prefill_fallbacks": [
+          0,
+          0,
+          0
+        ],
+        "tracked_decode_fallbacks": [
+          0,
+          0,
+          0
+        ],
+        "repeat_max_abs": 0.0,
+        "logits_sha256": "f9e4004cb6fe5fc8e126f2a6075b8d79b201403b9b58da226b8e1396994d3c48"
+      },
+      "cpu-reference": {
+        "executable_sha256": "c63465ce785e4c4b64a43d6d8c527dbf15cd2cb829ac9cfb15366c137ed5502d",
+        "decode_ms_per_token": [
+          664.9644576015629,
+          656.0196013281248,
+          658.0880224609373
+        ],
+        "median_decode_ms_per_token": 658.0880224609373,
+        "prefill_ms": [
+          37064.08412399999,
+          35089.125271,
+          36984.5843
+        ],
+        "median_prefill_ms": 36984.5843,
+        "median_session_ms": 121224.21310199998,
+        "loaded_reserved_live": [
+          0,
+          0
+        ],
+        "warm_reserved_live": [
+          0,
+          0
+        ],
+        "after_session_reserved_live": [
+          [
+            0,
+            0
+          ],
+          [
+            0,
+            0
+          ],
+          [
+            0,
+            0
+          ]
+        ],
+        "sampled_peak_reserved_live": [
+          0,
+          0
+        ],
+        "private_endpoint_kib": [
+          513664,
+          513836,
+          514012
+        ],
+        "untrimmed_private_endpoint_kib": [
+          561868,
+          561972,
+          562136
+        ],
+        "session_cleanup_ms": [
+          4.222111,
+          3.821882,
+          4.361927
+        ],
+        "before_cleanup_heap_stats": [
+          {
+            "live_bytes": 519171904,
+            "arena_bytes": 438394880,
+            "free_arena_bytes": 62112176,
+            "mmap_bytes": 142889200
+          },
+          {
+            "live_bytes": 519178544,
+            "arena_bytes": 438394880,
+            "free_arena_bytes": 62105536,
+            "mmap_bytes": 142889200
+          },
+          {
+            "live_bytes": 519179632,
+            "arena_bytes": 438394880,
+            "free_arena_bytes": 62104448,
+            "mmap_bytes": 142889200
+          }
+        ],
+        "after_session_heap_stats": [
+          {
+            "live_bytes": 519171904,
+            "arena_bytes": 438263808,
+            "free_arena_bytes": 61981104,
+            "mmap_bytes": 142889200
+          },
+          {
+            "live_bytes": 519178544,
+            "arena_bytes": 438263808,
+            "free_arena_bytes": 61974464,
+            "mmap_bytes": 142889200
+          },
+          {
+            "live_bytes": 519179632,
+            "arena_bytes": 438263808,
+            "free_arena_bytes": 61973376,
+            "mmap_bytes": 142889200
+          }
+        ],
+        "warm_heap_cleanup_ms": 1.039202,
+        "host_heap_cleanup_method": "glibc_malloc_trim_warmup_and_session",
+        "private_spread_kib": 348,
+        "tracked_prefill_fallbacks": [
+          0,
+          0,
+          0
+        ],
+        "tracked_decode_fallbacks": [
+          0,
+          0,
+          0
+        ],
+        "repeat_max_abs": 0.0,
+        "logits_sha256": "f05471228d174c8ed2d76e5b5c008aaad3e7f714dddafe251bb422dd4b1ad56c"
+      },
+      "fast-control": {
+        "executable_sha256": "c63465ce785e4c4b64a43d6d8c527dbf15cd2cb829ac9cfb15366c137ed5502d",
+        "decode_ms_per_token": [
+          812.2832435000003,
+          807.97823571875,
+          805.8328639296869
+        ],
+        "median_decode_ms_per_token": 807.97823571875,
+        "prefill_ms": [
+          40916.205377,
+          38503.665124,
+          38747.457242000004
+        ],
+        "median_prefill_ms": 38747.457242000004,
+        "median_session_ms": 141927.291753,
+        "loaded_reserved_live": [
+          9365831680,
+          9224831488
+        ],
+        "warm_reserved_live": [
+          9365831680,
+          9224831488
+        ],
+        "after_session_reserved_live": [
+          [
+            9365831680,
+            9224831488
+          ],
+          [
+            9365831680,
+            9224831488
+          ],
+          [
+            9365831680,
+            9224831488
+          ]
+        ],
+        "sampled_peak_reserved_live": [
+          9365831680,
+          9279003648
+        ],
+        "private_endpoint_kib": [
+          153720,
+          153908,
+          154028
+        ],
+        "untrimmed_private_endpoint_kib": [
+          164644,
+          164688,
+          164708
+        ],
+        "session_cleanup_ms": [
+          3.018536,
+          2.412457,
+          1.576962
+        ],
+        "before_cleanup_heap_stats": [
+          {
+            "live_bytes": 147466240,
+            "arena_bytes": 170262528,
+            "free_arena_bytes": 31451376,
+            "mmap_bytes": 8655088
+          },
+          {
+            "live_bytes": 147555632,
+            "arena_bytes": 170262528,
+            "free_arena_bytes": 31361984,
+            "mmap_bytes": 8655088
+          },
+          {
+            "live_bytes": 147643168,
+            "arena_bytes": 170262528,
+            "free_arena_bytes": 31274448,
+            "mmap_bytes": 8655088
+          }
+        ],
+        "after_session_heap_stats": [
+          {
+            "live_bytes": 147466240,
+            "arena_bytes": 170262528,
+            "free_arena_bytes": 31451376,
+            "mmap_bytes": 8655088
+          },
+          {
+            "live_bytes": 147555632,
+            "arena_bytes": 170262528,
+            "free_arena_bytes": 31361984,
+            "mmap_bytes": 8655088
+          },
+          {
+            "live_bytes": 147643168,
+            "arena_bytes": 170262528,
+            "free_arena_bytes": 31274448,
+            "mmap_bytes": 8655088
+          }
+        ],
+        "warm_heap_cleanup_ms": 1.613632,
+        "host_heap_cleanup_method": "glibc_malloc_trim_warmup_and_session",
+        "private_spread_kib": 308,
+        "tracked_prefill_fallbacks": [
+          0,
+          0,
+          0
+        ],
+        "tracked_decode_fallbacks": [
+          0,
+          0,
+          0
+        ],
+        "repeat_max_abs": 0.0,
+        "logits_sha256": "5bccde4e8e3c85d91be204501ec06665087e939987fc5cbdb400641d96eb3b4b"
+      }
+    },
+    "absolute_tolerance": 1e-05,
+    "accuracy_gates": {
+      "same_executable": true,
+      "absolute_logits_1e_5": true,
+      "repeat_logits_1e_5": true,
+      "reference_repeat_logits_1e_5": true,
+      "repeated_sessions_measured": true,
+      "reference_repeated_sessions_measured": true,
+      "reference_private_memory_growth_le_1MiB": true,
+      "same_greedy_choices": true,
+      "private_memory_growth_le_1MiB": true,
+      "device_memory_stable": true,
+      "reference_memory_stable": true,
+      "no_cpu_fallbacks": true,
+      "reference_live_heap_stable_le_1MiB": true,
+      "live_heap_stable_le_1MiB": true
+    },
+    "max_abs_logit_difference": 8.58306884765625e-06,
+    "rms_logit_difference": 7.507342947435399e-07,
+    "matching_top1_rows": 129,
+    "logits_compared": 16677120,
+    "speed_vs_fast_control": {
+      "all_decode_samples_faster": true,
+      "all_session_samples_faster": true
+    },
+    "memory_reference_fast_control": {
+      "reference_private_memory_growth_le_1MiB": true,
+      "private_memory_growth_le_1MiB": true,
+      "device_memory_stable": true,
+      "reference_memory_stable": true,
+      "reference_live_heap_stable_le_1MiB": true,
+      "live_heap_stable_le_1MiB": true
+    },
+    "candidate_vs_current_bit_identical": true,
+    "current_accuracy_memory_gates": {
+      "same_executable": true,
+      "absolute_logits_1e_5": true,
+      "repeat_logits_1e_5": true,
+      "reference_repeat_logits_1e_5": true,
+      "repeated_sessions_measured": true,
+      "reference_repeated_sessions_measured": true,
+      "reference_private_memory_growth_le_1MiB": true,
+      "same_greedy_choices": true,
+      "private_memory_growth_le_1MiB": true,
+      "device_memory_stable": true,
+      "reference_memory_stable": true,
+      "no_cpu_fallbacks": true,
+      "reference_live_heap_stable_le_1MiB": true,
+      "live_heap_stable_le_1MiB": true
+    },
+    "additional_gates": {
+      "all_prefill_samples_faster_than_current": true,
+      "all_prefill_samples_faster_than_fast_control": true,
+      "no_extra_reservation_vs_fast_control": true,
+      "no_reservation_increase_after_warmup": true,
+      "all_session_samples_faster_than_current": true,
+      "untrimmed_candidate_private_spread_le_1MiB": true
+    },
+    "eligible": true,
+    "prefill_speedup_vs_current": 1.1827183615345298,
+    "prefill_speedup_vs_fast": 1.1115380628036489,
+    "decode_speedup_vs_fast": 1.091268718672229,
+    "session_speedup_vs_fast": 1.0962898333806108,
+    "reserved_reduction_bytes": 134217728
+  },
+  "default_dispatch_verification": {
+    "gates": {
+      "bit_identical_to_qualified_opt_in": true,
+      "absolute_cpu_parity_1e_5": true,
+      "repeat_1e_5": true,
+      "private_spread_le_1MiB": true,
+      "untrimmed_private_spread_le_1MiB": true,
+      "live_heap_spread_le_1MiB": true,
+      "allocator_unchanged_after_warmup": true,
+      "driver_memory_stable_le_1MiB": true,
+      "zero_tracked_fallbacks": true,
+      "all_decode_samples_faster_than_fast_control": true,
+      "all_total_samples_faster_than_fast_control": true,
+      "all_total_samples_faster_than_current": true,
+      "all_prefill_samples_faster_than_current": true
+    },
+    "passed": true,
+    "max_abs_cpu_logit_difference": 8.58306884765625e-06,
+    "logits_compared": 16677120,
+    "private_kib": [
+      155640,
+      155896,
+      156076
+    ],
+    "untrimmed_private_kib": [
+      166536,
+      167292,
+      167356
+    ],
+    "heap_live_bytes": [
+      147461888,
+      147552512,
+      147640128
+    ],
+    "driver_vram_bytes": [
+      9400414208,
+      9400414208,
+      9400414208
+    ],
+    "qualification_build": "c63465ce785e4c4b64a43d6d8c527dbf15cd2cb829ac9cfb15366c137ed5502d",
+    "verification_build": "06dcc823c66413503057e532daf2a5c9ca7dd837e732007cf3620e6702c76fc0",
+    "note": "Same-executable four-path qualification passed before promotion. Final source only changes model-scoped default policy and its test; full default logits prove equality to the qualified opt-in path."
+  },
+  "production_default": {
+    "decode_ms_per_token": [
+      725.0724193437499,
+      715.06733075,
+      721.8659020546875
+    ],
+    "median_decode_ms_per_token": 721.8659020546875,
+    "prefill_ms": [
+      35016.525701,
+      32303.599902,
+      32914.751511
+    ],
+    "median_prefill_ms": 32914.751511,
+    "session_cleanup_ms": [
+      2.5550680000000003,
+      2.396387,
+      1.696379
+    ],
+    "median_session_ms_including_cleanup": 125315.283353,
+    "loaded_reserved_live": [
+      9365831680,
+      9224831488
+    ],
+    "warm_reserved_live": [
+      9365831680,
+      9224831488
+    ],
+    "after_session_reserved_live": [
+      [
+        9365831680,
+        9224831488
+      ],
+      [
+        9365831680,
+        9224831488
+      ],
+      [
+        9365831680,
+        9224831488
+      ]
+    ],
+    "private_endpoint_kib": [
+      155640,
+      155896,
+      156076
+    ],
+    "untrimmed_private_endpoint_kib": [
+      166536,
+      167292,
+      167356
+    ],
+    "before_cleanup_heap_stats": [
+      {
+        "live_bytes": 147461888,
+        "arena_bytes": 170258432,
+        "free_arena_bytes": 31451632,
+        "mmap_bytes": 8655088
+      },
+      {
+        "live_bytes": 147552512,
+        "arena_bytes": 170258432,
+        "free_arena_bytes": 31361008,
+        "mmap_bytes": 8655088
+      },
+      {
+        "live_bytes": 147640128,
+        "arena_bytes": 170258432,
+        "free_arena_bytes": 31273392,
+        "mmap_bytes": 8655088
+      }
+    ],
+    "after_session_heap_stats": [
+      {
+        "live_bytes": 147461888,
+        "arena_bytes": 170258432,
+        "free_arena_bytes": 31451632,
+        "mmap_bytes": 8655088
+      },
+      {
+        "live_bytes": 147552512,
+        "arena_bytes": 170258432,
+        "free_arena_bytes": 31361008,
+        "mmap_bytes": 8655088
+      },
+      {
+        "live_bytes": 147640128,
+        "arena_bytes": 170258432,
+        "free_arena_bytes": 31273392,
+        "mmap_bytes": 8655088
+      }
+    ],
+    "driver_endpoints": [
+      {
+        "drm-resident-gtt": 2097152,
+        "drm-resident-stolen": 0,
+        "drm-resident-system": 0,
+        "drm-resident-vram0": 9400414208,
+        "drm-total-gtt": 2097152,
+        "drm-total-stolen": 0,
+        "drm-total-system": 0,
+        "drm-total-vram0": 9400414208
+      },
+      {
+        "drm-resident-gtt": 2097152,
+        "drm-resident-stolen": 0,
+        "drm-resident-system": 0,
+        "drm-resident-vram0": 9400414208,
+        "drm-total-gtt": 2097152,
+        "drm-total-stolen": 0,
+        "drm-total-system": 0,
+        "drm-total-vram0": 9400414208
+      },
+      {
+        "drm-resident-gtt": 2097152,
+        "drm-resident-stolen": 0,
+        "drm-resident-system": 0,
+        "drm-resident-vram0": 9400414208,
+        "drm-total-gtt": 2097152,
+        "drm-total-stolen": 0,
+        "drm-total-system": 0,
+        "drm-total-vram0": 9400414208
+      }
+    ],
+    "repeat_max_abs": 0.0,
+    "tracked_prefill_fallbacks": [
+      0,
+      0,
+      0
+    ],
+    "tracked_decode_fallbacks": [
+      0,
+      0,
+      0
+    ]
+  },
+  "decision": {
+    "enabled": true,
+    "scope": "Additional precise Vulkan grouped-Q8 prefill and HC4 collapse inherit only the existing qualified B50 model-owned device policy, for 2..32 activation rows.",
+    "unchanged_qualification": "Native CubeClProduction, B50 8086:E212, shaderFloat64, AVX-512 host, compatible DeepSeek41/40-layer/272-expert/six-route/HC4 tensor signature, local mmap, no device expert cache, context <=249.",
+    "override": "JOSHUA_VULKAN_PREFILL_OPT=0 retains the previous corrected path; 1 remains explicit opt-in. Missing override follows the owning model policy, not every handle sharing its queue.",
+    "backend_preferences": "Unchanged. CPU precision decode remains faster; these results do not qualify other models, larger contexts/batches, accelerators, or streamed/distributed loads."
+  },
+  "decode_regression_vs_current_in_qualification_percent": 2.1492411128574584,
+  "prefill_time_reduction_vs_current_percent": 15.449017067551063,
+  "timing_provenance": {
+    "qualification_executable_sha256": "c63465ce785e4c4b64a43d6d8c527dbf15cd2cb829ac9cfb15366c137ed5502d",
+    "production_executable_sha256": "06dcc823c66413503057e532daf2a5c9ca7dd837e732007cf3620e6702c76fc0",
+    "comparator_sha256": "eec9f5feff044dff71a0420e354c5bf50f9774d7cc80db441cbd9c58472bab79",
+    "flags": {
+      "candidate": {
+        "JOSHUA_VULKAN_PREFILL_OPT": "1"
+      },
+      "current": {
+        "JOSHUA_VULKAN_PREFILL_OPT": "0"
+      },
+      "cpu": {
+        "JOSHUA_VULKAN_PREFILL_OPT": "0",
+        "JOSHUA_CPU_DOT_F64": "1",
+        "JOSHUA_VULKAN_DOT_F64": "1",
+        "JOSHUA_VULKAN_RMS_F64": "1",
+        "JOSHUA_VULKAN_COMPENSATED_DOT": "1",
+        "JOSHUA_VULKAN_FUSED_MHC": "1"
+      },
+      "fast": {
+        "JOSHUA_VULKAN_PREFILL_OPT": "0",
+        "JOSHUA_CPU_DOT_F64": "0",
+        "JOSHUA_VULKAN_DOT_F64": "0",
+        "JOSHUA_VULKAN_RMS_F64": "0",
+        "JOSHUA_VULKAN_COMPENSATED_DOT": "0",
+        "JOSHUA_VULKAN_FUSED_MHC": "0"
+      }
+    },
+    "same_executable_four_path_qualification": true,
+    "production_policy_verification": "Full logits equal the qualified opt-in path byte for byte; all final-source parity, speed and memory checks pass. No benchmark builds/tests overlapped certified timing."
+  },
+  "validation": {
+    "library_passed": 427,
+    "library_ignored": 13,
+    "architecture_integrations_passed": 51,
+    "architecture_integrations_ignored": 4,
+    "precision_tests_passed": 6,
+    "cpu_collapse_passed": 1,
+    "gpu_collapse_passed": 1,
+    "native_grouped_q8_passed": 1,
+    "cubecl_native_regressions_passed": 9,
+    "cubecl_native_regressions_ignored": 3,
+    "comparison_gate_regressions_passed": 11,
+    "model_scoped_policy_with_prefill_bounds": true,
+    "default_library_check": true,
+    "feature_release_build": true
+  },
+  "limits": [
+    "One realistic prompt and fixed continuation. Independent float64 evidence covers primitives/tiny models; no separate full-290GB float64 oracle was generated.",
+    "The benchmark reports quiescent post-release host residency separately from raw pre-release footprint and live allocations. Production inference does not call malloc_trim.",
+    "Sampled working memory curves are not exhaustive per-allocation peaks. Native fallback counters exclude intentional CPU-mmap experts and existing host routing.",
+    "Decode is slower than the current corrected Vulkan median in this cohort; every candidate total-session sample still beats both controls."
+  ],
+  "raw_results": "/home/tserica/benchmark-results/cpu-reference-memory-b50-20261024"
+}
