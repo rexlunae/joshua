@@ -15,7 +15,17 @@
 //!    it once misses are rare (freeing memory for the KV cache / dense set).
 
 /// Fraction of the memory above `headroom` the expert cache may consume.
-pub const CACHE_MEMORY_FRACTION: f64 = 0.5;
+///
+/// Raised 0.5 -> 0.75 so the automatic RAM hot-expert pin budget engages the
+/// measured high-benefit region on kleya (DeepSeek-V4.1, 201 GiB IQ2_XXS
+/// routed pool, ~62 GiB RAM).  Pinning more routing-hot experts in RAM
+/// directly cuts the NVMe streaming that dominates decode: going from a tiny
+/// pin (~740 MiB) to 2800 of 10880 experts (~53 GiB) cut the model's
+/// page-fault-in from 68.6 GB to 11.7 GB for the same run (prefill 2->4.9 t/s,
+/// decode up to 4.2 t/s).  The 0.75 keeps 25% of free-above-headroom for the
+/// OS page cache / KV, trading a little headroom for far less per-token
+/// re-reading of the hot expert working set.
+pub const CACHE_MEMORY_FRACTION: f64 = 0.75;
 
 /// Hit ratio below which a growing cache is worth it (misses are frequent).
 pub const ADAPTIVE_LOW_HIT_RATIO: f64 = 0.80;
@@ -851,9 +861,9 @@ mod tests {
 
     #[test]
     fn budget_fits_available_memory() {
-        // 8 GiB free, 1 MiB experts, half usable → 4096 experts.
+        // 8 GiB free, 1 MiB experts, 3/4 usable → 6144 experts.
         let b = expert_budget_for_memory(8 << 30, 1 << 20, 10_000, 0);
-        assert_eq!(b, 4096);
+        assert_eq!(b, 6144);
     }
 
     #[test]
@@ -878,9 +888,9 @@ mod tests {
 
     #[test]
     fn budget_reserves_headroom_and_respects_capacity() {
-        // 8 GiB free, 2 GiB headroom → 3 GiB usable → 3072 experts of 1 MiB.
+        // 8 GiB free, 2 GiB headroom → 4.5 GiB usable → 4608 experts of 1 MiB.
         let b = expert_budget_for_memory(8 << 30, 1 << 20, 10_000, 2 << 30);
-        assert_eq!(b, 3072);
+        assert_eq!(b, 4608);
         // Capacity caps the budget.
         let b = expert_budget_for_memory(8 << 30, 1 << 20, 100, 0);
         assert_eq!(b, 100);
