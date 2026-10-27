@@ -114,6 +114,40 @@ class CertificationTests(unittest.TestCase):
             'after_session_host_memory_kib': [{'RssAnon': 2176}, {'RssAnon': 128}],
         })['eligible_for_auto'])
 
+    def test_cleanup_is_charged_to_session_speed(self):
+        common = {'host_heap_cleanup_method': 'fixture-release',
+                  'session_cleanup_ms': [0., 0.]}
+        result = self.compare(base_changes=common, candidate_changes={
+            **common, 'session_cleanup_ms': [20., 20.]})
+        self.assertTrue(result['performance_gates']['all_decode_samples_faster'])
+        self.assertFalse(result['performance_gates']['all_session_samples_faster'])
+        self.assertFalse(result['eligible_for_auto_preference'])
+
+    def test_released_pages_cannot_hide_live_heap_growth(self):
+        common = {'host_heap_cleanup_method': 'fixture-release',
+                  'session_cleanup_ms': [0., 0.],
+                  'after_session_heap_stats': [{'live_bytes': 100_000}] * 2}
+        result = self.compare(base_changes=common, candidate_changes={
+            **common, 'after_session_heap_stats': [
+                {'live_bytes': 100_000}, {'live_bytes': 4_000_000}]})
+        self.assertTrue(result['gates']['private_memory_growth_le_1MiB'])
+        self.assertFalse(result['gates']['live_heap_stable_le_1MiB'])
+        self.assertFalse(result['eligible_for_auto'])
+
+    def test_rejects_mixed_cleanup_protocols(self):
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.compare(base_changes={'host_heap_cleanup_method': 'fixture-release'},
+                         candidate_changes={'host_heap_cleanup_method': 'different'})
+
+    def test_incomplete_live_heap_samples_cannot_certify(self):
+        common = {'host_heap_cleanup_method': 'fixture-release',
+                  'session_cleanup_ms': [0., 0.],
+                  'after_session_heap_stats': [{'live_bytes': 100_000}] * 2}
+        result = self.compare(base_changes=common, candidate_changes={
+            **common, 'after_session_heap_stats': [{'live_bytes': 100_000}]})
+        self.assertIsNone(result['gates']['live_heap_stable_le_1MiB'])
+        self.assertFalse(result['eligible_for_auto'])
+
 
 if __name__ == '__main__':
     unittest.main()

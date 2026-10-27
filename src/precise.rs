@@ -534,6 +534,9 @@ impl candle_core::quantized::QuantizedType for WideCpu {
     fn supports_grouped_q8(&self) -> bool {
         self.inner().dtype() == candle_core::quantized::GgmlDType::Q8_0
     }
+    fn supports_grouped_q8_prefill(&self) -> bool {
+        self.supports_grouped_q8()
+    }
     fn grouped_q8_matmul(
         &self,
         g: usize,
@@ -748,6 +751,31 @@ mod tests {
         assert!(ordinary
             .try_grouped_q8(&Tensor::ones((3, 32), DType::F32, &Device::Cpu)?, 3)?
             .is_none());
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires JOSHUA_CPU_DOT_F64=1"]
+    fn batched_selected_group_q8_preserves_all_rows_and_offsets() -> Result<()> {
+        use candle_core::{quantized::{GgmlDType,QTensor},Module};
+        assert!(cpu_enabled());
+        for (groups,k,rank) in [(1usize,32usize,7usize),(3,96,17),(8,4096,17)] {
+            let n=groups*rank;
+            let w:Vec<f32>=(0..n*k).map(|i|((i*31%251) as f32-125.)/64.).collect();
+            let weight=qmatmul(QTensor::quantize(&Tensor::from_vec(w,(n,k),&Device::Cpu)?,GgmlDType::Q8_0)?)?;
+            for rows in [1usize,2,3,4,5,25,32,33] {
+                let count=rows*groups*k;
+                let x:Vec<f32>=(0..count+k).map(|i|((i*17%127) as f32-63.)/32.).collect();
+                let x=Tensor::from_vec(x,count+k,&Device::Cpu)?.narrow(0,k,count)?.reshape((rows,groups,k))?;
+                let full=weight.forward(&x.reshape((rows*groups,k))?)?.reshape((rows,groups,n))?;
+                let blocks:Vec<_>=(0..groups).map(|g|full.narrow(1,g,1)?.narrow(2,g*rank,rank)?.squeeze(1)).collect::<Result<_>>()?;
+                let expected=Tensor::cat(&blocks,1)?.flatten_all()?.to_vec1::<f32>()?;
+                let selected=weight.try_grouped_q8(&x,groups)?.expect("CPU precise prefill");
+                assert_eq!(selected.dims(),[rows,n]);
+                assert_eq!(selected.flatten_all()?.to_vec1::<f32>()?,expected,"groups={groups}, rows={rows}");
+                assert_eq!(crate::attention::grouped_output_projection(&weight,&x,groups,rank)?.flatten_all()?.to_vec1::<f32>()?,expected);
+            }
+        }
         Ok(())
     }
 

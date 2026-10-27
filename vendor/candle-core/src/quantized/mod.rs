@@ -662,6 +662,8 @@ pub trait QuantizedType: Send + Sync {
     /// Optional selected-group contract. Ordinary owned/borrowed storage keeps
     /// its existing activation and accumulation semantics unless it opts in.
     fn supports_grouped_q8(&self) -> bool { false }
+    /// Separate capability: decode-only adapters retain their original input contract.
+    fn supports_grouped_q8_prefill(&self) -> bool { false }
     fn grouped_q8_matmul(&self, _groups: usize, _k: usize, _n: usize, _lhs: &[f32], _dst: &mut [f32]) -> Result<()> {
         crate::bail!("selected-group CPU Q8 is unsupported by this storage")
     }
@@ -1219,13 +1221,16 @@ impl QMatMul {
 
     /// Try a native selected-group projection. None preserves the caller's
     /// ordinary matmul/gather path on other backends, dtypes and batch sizes.
+    /// Inputs are [groups,k] for decode or [rows,groups,k] for qualified
+    /// precise CPU/Vulkan prefill; both produce [rows,n] selected outputs.
     pub fn try_grouped_q8(&self, xs: &Tensor, groups: usize) -> Result<Option<Tensor>> {
         if let Self::QTensor(t) = self {
             if let QStorage::Cpu(w) = &t.storage {
                 let (n,k) = t.shape.dims2()?;
                 if groups>0 && n>0 && k>0 && n%groups==0 && w.supports_grouped_q8()
                     && t.dtype()==GgmlDType::Q8_0 && xs.dtype()==DType::F32
-                    && xs.is_contiguous() && xs.dims()==[groups,k] && xs.device().same_device(&t.device()) {
+                    && xs.is_contiguous() && (xs.dims()==[groups,k] || matches!(xs.dims(),[rows,g,width] if *rows>0 && (*g,*width)==(groups,k) && w.supports_grouped_q8_prefill()))
+                    && xs.device().same_device(&t.device()) {
                     return xs.apply_op1_no_bwd(&GroupedQ8{tensor:t,groups}).map(Some);
                 }
             }
@@ -1235,8 +1240,9 @@ impl QMatMul {
             if let QStorage::Vulkan(w) = &t.storage {
                 let (n, k) = t.shape.dims2()?;
                 if vulkan_native() && xs.dtype() == DType::F32 && xs.is_contiguous()
-                    && xs.dims() == [groups, k] && xs.device().same_device(&t.device())
-                    && w.grouped_q8_eligible(groups, n, k) {
+                    && (xs.dims() == [groups, k] || matches!(xs.dims(), [rows,g,width]
+                        if (*g,*width)==(groups,k) && crate::vulkan_backend::kernels::precise_prefill_optimized(w.device(),*rows)))
+                    && xs.device().same_device(&t.device()) && w.grouped_q8_eligible(groups, n, k) {
                     return xs.apply_op1_no_bwd(&GroupedQ8 { tensor: t, groups }).map(Some);
                 }
             }
@@ -1289,10 +1295,15 @@ impl crate::CustomOp1 for GroupedQ8<'_> {
         let QStorage::Cpu(w)=&self.tensor.storage else{crate::bail!("grouped_q8 requires CPU weights")};
         let(n,k)=self.tensor.shape.dims2()?;
         let Some((lo,hi))=l.contiguous_offsets() else{crate::bail!("grouped_q8 requires contiguous activations")};
-        if self.groups==0 || n%self.groups!=0 || l.dims()!=[self.groups,k] || !w.supports_grouped_q8(){crate::bail!("invalid grouped_q8 geometry")}
-        let mut out=vec![0f32;n];
+        let rows=match l.dims() {
+            [g,width] if (*g,*width)==(self.groups,k)=>1,
+            [rows,g,width] if *rows>0 && (*g,*width)==(self.groups,k) && w.supports_grouped_q8_prefill()=>*rows,
+            _=>crate::bail!("invalid grouped_q8 geometry"),
+        };
+        if self.groups==0 || n%self.groups!=0 || !w.supports_grouped_q8(){crate::bail!("invalid grouped_q8 geometry")}
+        let mut out=vec![0f32;rows*n];
         w.grouped_q8_matmul(self.groups,k,n,&s.as_slice::<f32>()?[lo..hi],&mut out)?;
-        Ok((crate::CpuStorage::F32(out),Shape::from((1,n))))
+        Ok((crate::CpuStorage::F32(out),Shape::from((rows,n))))
     }
     #[cfg(feature = "vulkan")]
     fn vulkan_fwd(&self, storage: &crate::VulkanStorage, layout: &crate::Layout)

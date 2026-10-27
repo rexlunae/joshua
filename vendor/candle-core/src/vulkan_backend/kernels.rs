@@ -1261,6 +1261,13 @@ pub fn fused_mhc_enabled() -> bool {
 }
 pub fn fused_mhc_enabled_on(d:&VulkanDevice)->bool { fused_mhc_enabled() || d.precise_math() }
 
+pub fn run_mhc_collapse(d: &VulkanDevice, x: Buf, pre: Buf, out: Buf,
+    rows: usize, width: usize, xoff: usize, poff: usize) -> Result<()> {
+    let len=rows.checked_mul(width).ok_or_else(||Error::Msg("HC collapse size overflow".into()))?;
+    let p=Push::default().us(len)?.us(width)?.us(xoff)?.us(poff)?;
+    d.launch("mhc_collapse_f64",glsl::k_mhc_collapse,&[x,pre,out],p,&[],grid(len,d.limits().wg,1,d.limits().max_groups_x))
+}
+
 pub fn run_fused_mhc(d:&VulkanDevice,x:Buf,base:Buf,out:Buf,rows:usize,xoff:usize,boff:usize,iters:usize,eps:f32,scale:[f32;3])->Result<()> {
     let p=Push::default().us(rows)?.us(xoff)?.us(boff)?.us(iters)?.f(eps).f(scale[0]).f(scale[1]).f(scale[2]);
     let lim=d.limits();
@@ -1273,14 +1280,16 @@ pub fn run_fused_mhc(d:&VulkanDevice,x:Buf,base:Buf,out:Buf,rows:usize,xoff:usiz
 pub fn run_qgemv_f64(d: &VulkanDevice, dtype: crate::quantized::GgmlDType, x: Buf, w: Buf, out: Buf, m: usize, n: usize, k: usize, off: usize, groups: usize) -> Result<()> {
     let p = Push::default().us(n)?.us(k)?.i(qtype_code(dtype)).us(dtype.block_size())?.us(dtype.type_size())?.us(off)?.i(0).us(m)?;
     let lim=d.limits();
-    let rows=if m>1 && groups==1 {4}else{1};
+    let rows=if m>1 {4}else{1};
     if compensated_dot_enabled_on(d) {
         // B50 measurements favor 32 lanes for Q2/Q4 and four for Q8.
         // Wide FP64 is both accurate and competitive for the former, while
-        // selected-group Q8 retains its exact four-lane FP64 reduction.
+        // selected-group Q8 decode retains its exact four-lane FP64 reduction.
+        // Batched selected groups use the same compensated streams as the
+        // original full prefill projection, skipping only unused outputs.
         let q8=dtype==crate::quantized::GgmlDType::Q8_0;
         let lanes=if q8{4}else{32};
-        let comp=q8 && groups==1;
+        let comp=q8 && (groups==1 || m>1);
         let name=match(lanes,comp,groups,rows) {
             (4,true,1,1)=>std::borrow::Cow::Borrowed("q8_precise_compensated"),
             (4,true,1,4)=>std::borrow::Cow::Borrowed("q8_precise_compensated_r4"),
@@ -1407,6 +1416,31 @@ pub fn run_grouped_q8(d: &VulkanDevice, x: Buf, w: Buf, out: Buf,
     d.launch_spirv_params("grouped_q8_cubecl_256",
         |_| wgsl_to_spirv(include_str!("grouped_q8_cubecl.wgsl")),
         &[w, x, out], Push::default(), &params.0, row_grid(n, 1, lim.max_groups_x))
+}
+
+/// Compact precise prefill inherits the validated model's immutable device
+/// policy. Explicit overrides retain the matched old/candidate controls.
+pub fn precise_prefill_optimized(d: &VulkanDevice, rows: usize) -> bool {
+    static OVERRIDE: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    let enabled = OVERRIDE.get_or_init(|| std::env::var_os("JOSHUA_VULKAN_PREFILL_OPT").map(|v| v == "1"))
+        .unwrap_or(d.precise_math());
+    enabled && native_enabled() && (2..=32).contains(&rows) && compensated_dot_enabled_on(d) && f64_dot_enabled_on(d)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_grouped_q8_prefill(d: &VulkanDevice, x: Buf, w: Buf, out: Buf,
+    rows: usize, groups: usize, n: usize, k: usize, xoff: usize) -> Result<()> {
+    let weights = n.checked_mul(k / 32).and_then(|v| v.checked_mul(34));
+    let inputs = rows.checked_mul(groups).and_then(|v| v.checked_mul(k)).and_then(|v| v.checked_add(xoff)).and_then(|v| v.checked_mul(4));
+    let outputs = rows.checked_mul(n).and_then(|v|v.checked_mul(4));
+    if !precise_prefill_optimized(d, rows) || !grouped_q8_eligible(d, groups, n, k)
+        || weights.is_none_or(|v| v as u64 > w.bytes || v > u32::MAX as usize)
+        || inputs.is_none_or(|v| v as u64 > x.bytes || v > u32::MAX as usize)
+        || outputs.is_none_or(|v| v as u64 > out.bytes || v > u32::MAX as usize) {
+        return Err(Error::Msg("vulkan grouped Q8 prefill: invalid geometry or buffer range".into()));
+    }
+    d.exec().batch_limit = PREFILL_MAX_LAUNCHES;
+    run_qgemv_f64(d, crate::quantized::GgmlDType::Q8_0, x, w, out, rows, n, k, xoff, groups)
 }
 
 pub fn grouped_q8_eligible(d: &VulkanDevice, groups: usize, n: usize, k: usize) -> bool {
@@ -1554,6 +1588,7 @@ mod barrier_tests {
             glsl::k_qgemv_compensated(64,1,32,4),
             glsl::k_q8_precise(64,1,4,true),
             glsl::k_q8_precise(64,8,1,false),
+            glsl::k_q8_precise(64,8,4,true),
             glsl::k_fused_mhc(64),
         ] {
             assert_workgroup_barriers(&source);

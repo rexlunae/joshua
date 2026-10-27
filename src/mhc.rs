@@ -311,8 +311,97 @@ mod rms_tests {
 /// Collapse the `hc` copies of `x` (`[b, s, hc, d]`) to one stream with the
 /// weights `pre` (`[b, s, hc]`).
 pub fn collapse(x: &Tensor, pre: &Tensor) -> Result<Tensor> {
+    if let [b, seq, 4, width] = x.dims() {
+        let (b, seq, width) = (*b, *seq, *width);
+        let enabled = match x.device() {
+            candle_core::Device::Cpu => crate::precise::active(x),
+            #[cfg(feature = "vulkan")]
+            candle_core::Device::Vulkan(d) => {
+                candle_core::vulkan_backend::kernels::precise_prefill_optimized(d, b * seq)
+            }
+            _ => false,
+        };
+        if enabled
+            && x.dtype() == candle_core::DType::F32
+            && pre.dtype() == candle_core::DType::F32
+            && x.is_contiguous()
+            && pre.is_contiguous()
+            && pre.dims() == [b, seq, 4]
+            && x.device().same_device(pre.device())
+        {
+            return x
+                .apply_op2_no_bwd(
+                    pre,
+                    &FusedCollapse {
+                        rows: b * seq,
+                        width,
+                    },
+                )?
+                .reshape((b, seq, width));
+        }
+    }
     let weighted = pre.unsqueeze(D::Minus1)?.broadcast_as(x.shape())?.mul(x)?;
     crate::precise::sum(&weighted, D::Minus2)
+}
+
+struct FusedCollapse {
+    rows: usize,
+    width: usize,
+}
+impl candle_core::CustomOp2 for FusedCollapse {
+    fn name(&self) -> &'static str {
+        "mhc-collapse-f64"
+    }
+    fn cpu_fwd(
+        &self,
+        x: &candle_core::CpuStorage,
+        lx: &candle_core::Layout,
+        pre: &candle_core::CpuStorage,
+        lp: &candle_core::Layout,
+    ) -> Result<(candle_core::CpuStorage, candle_core::Shape)> {
+        let x = x.as_slice::<f32>()?;
+        let pre = pre.as_slice::<f32>()?;
+        let mut out = vec![0f32; self.rows * self.width];
+        for (i, value) in out.iter_mut().enumerate() {
+            let row = i / self.width;
+            let col = i % self.width;
+            let mut sum = 0f64;
+            for h in 0..4 {
+                let product = x[lx.start_offset() + (row * 4 + h) * self.width + col]
+                    * pre[lp.start_offset() + row * 4 + h];
+                sum += product as f64;
+            }
+            *value = sum as f32;
+        }
+        Ok((
+            candle_core::CpuStorage::F32(out),
+            candle_core::Shape::from((self.rows, self.width)),
+        ))
+    }
+    #[cfg(feature = "vulkan")]
+    fn vulkan_fwd(
+        &self,
+        x: &candle_core::VulkanStorage,
+        lx: &candle_core::Layout,
+        pre: &candle_core::VulkanStorage,
+        lp: &candle_core::Layout,
+    ) -> Result<(candle_core::VulkanStorage, candle_core::Shape)> {
+        let shape = candle_core::Shape::from((self.rows, self.width));
+        let out = x
+            .device
+            .alloc(candle_core::DType::F32, shape.elem_count())?;
+        candle_core::vulkan_backend::kernels::run_mhc_collapse(
+            &x.device,
+            x.buf(),
+            pre.buf(),
+            out.buf(),
+            self.rows,
+            self.width,
+            lx.start_offset(),
+            lp.start_offset(),
+        )?;
+        Ok((out, shape))
+    }
 }
 
 /// `hc_post`: expand one stream back to `hc` copies.
@@ -368,10 +457,126 @@ impl HyperConnection {
     }
 }
 
+#[cfg(test)]
+mod cpu_collapse_tests {
+    use super::*;
+    use candle_core::{DType, Device};
+
+    #[test]
+    #[ignore = "requires JOSHUA_CPU_DOT_F64=1"]
+    fn cpu_fused_collapse_preserves_products_reduction_and_offsets() -> Result<()> {
+        assert!(crate::precise::cpu_enabled());
+        for (rows, width) in [(1usize, 7usize), (2, 13), (25, 5120), (32, 5120)] {
+            let values: Vec<f32> = (0..(rows + 1) * 4 * width)
+                .map(|i| ((i * 17 % 251) as f32 - 125.) / 11.7)
+                .collect();
+            let coefficients: Vec<f32> = (0..(rows + 1) * 4)
+                .map(|i| ((i * 31 % 53) as f32 - 26.) / 11.3)
+                .collect();
+            let mut expected = Vec::new();
+            for row in 0..rows {
+                for col in 0..width {
+                    let mut sum = 0f64;
+                    for h in 0..4 {
+                        let product = values[((row + 1) * 4 + h) * width + col]
+                            * coefficients[(row + 1) * 4 + h];
+                        sum += product as f64;
+                    }
+                    expected.push(sum as f32);
+                }
+            }
+            let x = Tensor::from_vec(values, (rows + 1, 4, width), &Device::Cpu)?
+                .narrow(0, 1, rows)?
+                .unsqueeze(0)?;
+            let p = Tensor::from_vec(coefficients, (rows + 1, 4), &Device::Cpu)?
+                .narrow(0, 1, rows)?
+                .unsqueeze(0)?;
+            let weighted = p.unsqueeze(D::Minus1)?.broadcast_as(x.shape())?.mul(&x)?;
+            assert_eq!(
+                crate::precise::sum(&weighted, D::Minus2)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?,
+                expected
+            );
+            assert_eq!(collapse(&x, &p)?.flatten_all()?.to_vec1::<f32>()?, expected);
+            assert_eq!(
+                collapse(&x.squeeze(0)?, &p.squeeze(0)?)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?,
+                expected
+            );
+        }
+        let ordinary = Tensor::ones((1, 1, 3, 4), DType::F32, &Device::Cpu)?;
+        assert_eq!(
+            collapse(
+                &ordinary,
+                &Tensor::ones((1, 1, 3), DType::F32, &Device::Cpu)?
+            )?
+            .flatten_all()?
+            .to_vec1::<f32>()?,
+            vec![3.; 4]
+        );
+        Ok(())
+    }
+}
+
 #[cfg(all(test, feature = "vulkan"))]
 mod fused_sinkhorn_tests {
     use super::*;
     use candle_core::{Device, Storage};
+
+    #[test]
+    #[ignore = "requires native Vulkan and JOSHUA_VULKAN_PREFILL_OPT=1"]
+    fn fused_collapse_preserves_f32_products_and_ordered_f64_sum() -> Result<()> {
+        let vk = candle_core::VulkanDevice::new(0)?.with_precise_math()?;
+        assert!(candle_core::vulkan_backend::kernels::precise_prefill_optimized(&vk, 32));
+        let dev = Device::Vulkan(vk.clone());
+        let before = candle_core::vulkan_backend::kernels::fallback_count();
+        for (b, seq, width) in [(1usize, 2usize, 7usize), (1, 25, 5120), (2, 16, 13)] {
+            let rows = b * seq;
+            let data: Vec<f32> = (0..(rows + 1) * 4 * width)
+                .map(|i| ((i * 17 % 251) as f32 - 125.) / 11.7)
+                .collect();
+            let weights: Vec<f32> = (0..(rows + 1) * 4)
+                .map(|i| ((i * 31 % 53) as f32 - 26.) / 11.3)
+                .collect();
+            let mut expected = Vec::new();
+            for r in 0..rows {
+                for col in 0..width {
+                    let mut sum = 0f64;
+                    for h in 0..4 {
+                        let product =
+                            data[((r + 1) * 4 + h) * width + col] * weights[(r + 1) * 4 + h];
+                        sum += product as f64;
+                    }
+                    expected.push(sum as f32);
+                }
+            }
+            let x = Tensor::from_vec(data, ((rows + 1) * 4 * width,), &dev)?
+                .narrow(0, 4 * width, rows * 4 * width)?
+                .reshape((b, seq, 4, width))?;
+            let pre = Tensor::from_vec(weights, ((rows + 1) * 4,), &dev)?
+                .narrow(0, 4, rows * 4)?
+                .reshape((b, seq, 4))?;
+            assert_eq!(
+                collapse(&x, &pre)?.flatten_all()?.to_vec1::<f32>()?,
+                expected
+            );
+            if b == 1 {
+                // Non-4D layouts must retain the existing broadcast/reduce
+                // fallback rather than failing the fused shape check.
+                assert_eq!(
+                    collapse(&x.squeeze(0)?, &pre.squeeze(0)?)?.flatten_all()?.to_vec1::<f32>()?,
+                    expected
+                );
+            }
+        }
+        assert_eq!(
+            before,
+            candle_core::vulkan_backend::kernels::fallback_count()
+        );
+        Ok(())
+    }
 
     #[test]
     #[ignore = "requires native Vulkan and CPU/Vulkan precision plus JOSHUA_VULKAN_FUSED_MHC=1"]
