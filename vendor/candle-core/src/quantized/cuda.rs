@@ -131,6 +131,7 @@ fn dequantize_f32(
         GgmlDType::Q5K => ("dequantize_block_q5_K_f32", true, 64, nb),
         GgmlDType::Q6K => ("dequantize_block_q6_K_f32", true, 64, nb),
         GgmlDType::Q8K => ("dequantize_block_q8_K_f32", true, 32, nb),
+        GgmlDType::Iq2Xxs => ("dequantize_block_iq2_xxs_f32", true, 32, nb),
         _ => crate::bail!("unsupported dtype for dequantize {dtype:?}"),
     };
     let func = dev.get_or_load_func(kernel_name, &candle_kernels::QUANTIZED)?;
@@ -191,6 +192,7 @@ fn dequantize_f16(
         GgmlDType::Q5K => ("dequantize_block_q5_K_f16", true, 64, nb),
         GgmlDType::Q6K => ("dequantize_block_q6_K_f16", true, 64, nb),
         GgmlDType::Q8K => ("dequantize_block_q8_K_f16", true, 32, nb),
+        GgmlDType::Iq2Xxs => ("dequantize_block_iq2_xxs_f16", true, 32, nb),
         _ => crate::bail!("unsupported dtype for dequantize {dtype:?}"),
     };
     let func = dev.get_or_load_func(kernel_name, &candle_kernels::QUANTIZED)?;
@@ -283,6 +285,7 @@ fn get_rows(
         GgmlDType::Q4K => ("get_rows_q4_K", 32, hidden / dtype.block_size(), false),
         GgmlDType::Q5K => ("get_rows_q5_K", 64, hidden / dtype.block_size(), false),
         GgmlDType::Q6K => ("get_rows_q6_K", 64, hidden / dtype.block_size(), false),
+        GgmlDType::Iq2Xxs => ("get_rows_iq2_xxs", 32, hidden / dtype.block_size(), false),
         _ => crate::bail!("unsupported dtype for CUDA quantized embedding {dtype:?}"),
     };
     let func = dev.get_or_load_func(kernel_name, &candle_kernels::QUANTIZED)?;
@@ -341,6 +344,7 @@ fn dequantize_mul_mat_vec(
         GgmlDType::Q4K => "dequantize_mul_mat_vec_q4_k",
         GgmlDType::Q5K => "dequantize_mul_mat_vec_q5_k",
         GgmlDType::Q6K => "dequantize_mul_mat_vec_q6_k",
+        GgmlDType::Iq2Xxs => "dequantize_mul_mat_vec_iq2_xxs_cuda",
         _ => crate::bail!("unsupported dtype for quantized matmul {dtype:?}"),
     };
     let func = dev.get_or_load_func(kernel_name, &candle_kernels::QUANTIZED)?;
@@ -398,6 +402,7 @@ fn mul_mat_vec_via_q8_1(
         GgmlDType::Q4K => "mul_mat_vec_q4_K_q8_1_cuda",
         GgmlDType::Q5K => "mul_mat_vec_q5_K_q8_1_cuda",
         GgmlDType::Q6K => "mul_mat_vec_q6_K_q8_1_cuda",
+        GgmlDType::Iq2Xxs => "mul_mat_vec_iq2_xxs_q8_1_cuda",
         _ => crate::bail!("unsupported dtype for quantized matmul {dtype:?}"),
     };
     let kernel_name = format!("{kernel_name}{b_size}");
@@ -1126,6 +1131,121 @@ mod test {
         )?;
         let vs = cuda_storage.as_cuda_slice::<f32>()?;
         let _vs = dev.clone_dtoh(&vs.as_view())?;
+        Ok(())
+    }
+
+    #[test]
+    fn cuda_iq2xxs_dmmv_and_mmvq_match_cpu() -> Result<()> {
+        use crate::quantized::iq2xxs::BlockIq2Xxs;
+        use crate::quantized::iq2xxs::QK_IQ2_XXS;
+        let dev = CudaDevice::new(0)?;
+
+        let nrows = 5usize;
+        let blocks_per_row = 4usize;
+        let k = blocks_per_row * QK_IQ2_XXS;
+        let n_blocks = nrows * blocks_per_row;
+        let mut blocks: Vec<BlockIq2Xxs> = Vec::with_capacity(n_blocks);
+        for b in 0..n_blocks {
+            let d = half::f16::from_f32(b as f32 + 1.0);
+            let d_bytes = d.to_le_bytes();
+            let mut qs = [0u8; 64];
+            for sb in 0..8 {
+                let base = sb * 8;
+                // 4 grid codes (bytes base..base+4)
+                for k in 0..4 {
+                    qs[base + k] = ((b * 11 + sb * 4 + k) % 256) as u8;
+                }
+                // sign indices (7-bit each) + 4-bit scale in the high word.
+                let s2 = ((b * 13 + sb) % 128) as u32;
+                let s3 = ((b * 17 + sb) % 128) as u32;
+                let scale = (b % 8) as u32;
+                // aux32 = s2 | (s3 << 7) | (scale << 28);  (bits 14..27 unused)
+                let aux32 = s2 | (s3 << 7) | (scale << 28);
+                qs[base + 4] = (aux32 & 0xff) as u8;
+                qs[base + 5] = ((aux32 >> 8) & 0xff) as u8;
+                qs[base + 6] = ((aux32 >> 16) & 0xff) as u8;
+                qs[base + 7] = ((aux32 >> 24) & 0xff) as u8;
+            }
+            blocks.push(BlockIq2Xxs { d: [d_bytes[0], d_bytes[1]], qs });
+        }
+
+        let mut weight_bytes = Vec::with_capacity(n_blocks * 66);
+        for blk in &blocks {
+            weight_bytes.extend_from_slice(&blk.d);
+            weight_bytes.extend_from_slice(&blk.qs);
+        }
+        let padded_len = weight_bytes.len()
+            + MATRIX_ROW_PADDING * GgmlDType::Iq2Xxs.type_size() / GgmlDType::Iq2Xxs.block_size();
+        let mut inner = unsafe { dev.alloc::<u8>(padded_len)? };
+        dev.memcpy_htod(&weight_bytes, &mut inner.slice_mut(..weight_bytes.len()))?;
+        let data = PaddedCudaSlice { inner, len: weight_bytes.len() };
+
+        // Full tensor dequant check (isolate decode before GEMV reduction).
+        let deq = dequantize_f32(&data, GgmlDType::Iq2Xxs, nrows * k, &dev)?;
+        let dq_slice = deq.as_cuda_slice::<f32>()?;
+        let dq = dev.clone_dtoh(&dq_slice.as_view())?;
+        for j in 0..nrows {
+            for r in 0..blocks_per_row {
+                let mut vals = [0f32; QK_IQ2_XXS];
+                blocks[j * blocks_per_row + r].dequantize(&mut vals);
+                for t in 0..QK_IQ2_XXS {
+                    let idx = j * k + r * QK_IQ2_XXS + t;
+                    let tol = 1e-4 * vals[t].abs().max(1e-3);
+                    assert!(
+                        (dq[idx] - vals[t]).abs() <= tol,
+                        "DEQUANT mismatch idx={idx}: {} vs {}",
+                        dq[idx],
+                        vals[t]
+                    );
+                }
+            }
+        }
+        let x: Vec<f32> = (0..k).map(|i| ((i as i64 * 7919) % 1000) as f32 / 100.0 - 5.0).collect();
+        let y = dev.clone_htod(&x)?;
+
+        let mut want = vec![0f32; nrows];
+        for j in 0..nrows {
+            let mut acc = 0f32;
+            for r in 0..blocks_per_row {
+                let mut vals = [0f32; QK_IQ2_XXS];
+                blocks[j * blocks_per_row + r].dequantize(&mut vals);
+                for t in 0..QK_IQ2_XXS {
+                    acc += x[r * QK_IQ2_XXS + t] * vals[t];
+                }
+            }
+            want[j] = acc;
+        }
+
+        let out_d = dequantize_mul_mat_vec(&data, &y.as_view(), GgmlDType::Iq2Xxs, k, nrows, &dev)?;
+        let out_slice = out_d.as_cuda_slice::<f32>()?;
+        let got_d = dev.clone_dtoh(&out_slice.as_view())?;
+        for j in 0..nrows {
+            let tol = 2e-3 * want[j].abs().max(1.0) + 2e-3;
+            assert!(
+                (got_d[j] - want[j]).abs() <= tol,
+                "DMMV mismatch j={j}: {} vs {}",
+                got_d[j],
+                want[j]
+            );
+        }
+
+        // MMVQ is the q8_1-quantized-activation path: it must track the exact
+        // DMMV result (got_d) to within Q8_1's ~1/256 relative precision.  A
+        // larger tolerance here only reflects that intentional quantization of
+        // the activations, not kernel correctness.
+        let out_m = mul_mat_vec_via_q8_1(&data, &y.as_view(), GgmlDType::Iq2Xxs, k, nrows, 1, &dev)?;
+        let out_slice2 = out_m.as_cuda_slice::<f32>()?;
+        let got_m = dev.clone_dtoh(&out_slice2.as_view())?;
+        for j in 0..nrows {
+            let rel = got_m[j].abs().max(got_d[j].abs());
+            let tol = 5e-2 * rel.max(1.0) + 64.0;
+            assert!(
+                (got_m[j] - got_d[j]).abs() <= tol,
+                "MMVQ vs DMMV mismatch j={j}: {} vs {} (tol {tol})",
+                got_m[j],
+                got_d[j]
+            );
+        }
         Ok(())
     }
 }

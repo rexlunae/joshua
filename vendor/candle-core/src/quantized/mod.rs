@@ -244,7 +244,7 @@ impl QStorage {
                 GgmlDType::Q5K => cuda::load_quantized(d, as_t_slice::<BlockQ5K>(data)),
                 GgmlDType::Q6K => cuda::load_quantized(d, as_t_slice::<BlockQ6K>(data)),
                 GgmlDType::Q8K => cuda::load_quantized(d, as_t_slice::<BlockQ8K>(data)),
-                GgmlDType::Iq2Xxs => crate::bail!("IQ2_XXS weights are not supported on CUDA"),
+                GgmlDType::Iq2Xxs => cuda::load_quantized(d, as_t_slice::<BlockIq2Xxs>(data)),
                 GgmlDType::BF16 => cuda::load_quantized(d, as_t_slice::<bf16>(data)),
             },
             Device::OpenCl(d) => {

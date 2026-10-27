@@ -88,14 +88,11 @@ candle-core = { path = "vendor/candle-core" }
 # candle-nn patched to the rexlunae/candle-nn fork (device-native CustomOp
 # `vulkan_fwd` for softmax/RMSNorm), so it doesn't wait on upstream either.
 candle-nn = { path = "vendor/candle-nn" }
-# candle-kernels is patched to a tiny fork (rexlunae/candle-kernels) carrying
-# two CUDA-12.4 compatibility fixes, instead of vendoring the crate's ~21K
-# lines of C kernels into this tree: (1) compatibility.cuh redefines
-# __hmax_nan/__hmin_nan for __half, which the 12.4 toolkit already declares on
-# every architecture, and (2) build.rs omits the WMMA (tensor-core) MoE kernels
-# on compute capability < 7.0 where load_matrix_sync does not exist. Both are
-# needed to build against CUDA 12.4 for Maxwell (sm_52).
-candle-kernels = { git = "https://github.com/rexlunae/candle-kernels.git", rev = "a9427cc" }
+# candle-kernels is now vendored into this tree (vendor/candle-kernels) so the
+# project can carry its own CUDA kernels (starting with the IQ2_XXS dequant +
+# GEMV for the DeepSeek-V4 routed experts) and the CUDA-12.4 compatibility
+# fixes.  It was formerly a tiny git fork (rexlunae/candle-kernels @ a9427cc).
+candle-kernels = { path = "vendor/candle-kernels" }
 candle-metal-kernels = { path = "vendor/candle-metal-kernels" }
 # Vendored so joshua can fix upstream gaps — currently: quantized_llama must
 # honour the GGUF head_dim (`llama.attention.key_length` / rope dimension)
