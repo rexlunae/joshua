@@ -3360,10 +3360,12 @@ impl ModelWeights {
         if !(expert_device.is_cpu()
             || expert_device.is_opencl()
             || expert_device.is_sycl()
+            || expert_device.is_vulkan()
+            || expert_device.is_cuda()
             || expert_device.same_device(device))
         {
             candle_core::bail!(
-                "deepseek4: routed experts must live on the model device, an OpenCL, SYCL or CPU device, \
+                "deepseek4: routed experts must live on the model device, an OpenCL, SYCL, Vulkan, CUDA or CPU device, \
                  not {expert_device:?}"
             );
         }
@@ -3375,18 +3377,22 @@ impl ModelWeights {
         let pool_device: Option<Device> = if mmap.is_none() {
             None
         } else if cache_bytes == 0 {
-            if expert_device.is_opencl() || expert_device.is_sycl() {
+            if expert_device.is_opencl() || expert_device.is_sycl() || expert_device.is_vulkan() || expert_device.is_cuda() {
                 tracing::warn!(
                     "deepseek4: expert placement `device` requested without a VRAM expert-cache budget \
                      (--vram-expert-cache); the routed experts stay on the host"
                 );
             }
             None
-        } else if expert_device.is_opencl() || expert_device.is_sycl() {
+        } else if expert_device.is_opencl()
+            || expert_device.is_sycl()
+            || expert_device.is_vulkan()
+            || expert_device.is_cuda()
+        {
             // The B50 configuration: dense set on the CPU (or the device),
             // routed experts cached on the card.
             Some(expert_device.clone())
-        } else if device.is_opencl() || device.is_sycl() {
+        } else if device.is_opencl() || device.is_sycl() || device.is_vulkan() || device.is_cuda() {
             Some(device.clone())
         } else if device.is_cpu() && expert_device.is_cpu() {
             Some(Device::Cpu)

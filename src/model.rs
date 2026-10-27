@@ -398,22 +398,25 @@ Self::Qwen
     }
 
     /// Whether the routed experts must stay in host RAM *given the active
-    /// device*.  `DeepSeek4` experts may run on an OpenCL or SYCL device
-    /// (both have the IQ2_XXS kernel); on every other device (CPU, Vulkan,
-    /// Metal, CUDA) they are host-only.  Non-MoE architectures never force
-    /// host experts.
+    /// device*.  `DeepSeek4` experts may run on an OpenCL, SYCL, Vulkan or
+    /// CUDA device (all four have wired the IQ2_XXS kernel); on every other
+    /// device (CPU, Metal) they are host-only.  Non-MoE architectures never
+    /// force host experts.
     pub fn experts_always_on_host_for(&self, device: &Device) -> bool {
-        self.is_deepseek4() && !(device.is_opencl() || device.is_sycl())
+        self.is_deepseek4()
+            && !(device.is_opencl() || device.is_sycl() || device.is_vulkan() || device.is_cuda())
     }
 
     /// Whether this architecture's "experts on the device" form is a bounded
     /// VRAM cache over the host pool rather than an upload of the whole pool:
-    /// `deepseek4` on OpenCL or SYCL keeps every routed expert borrowed from the
-    /// mapping and caches a budgeted subset on the card (the ~72 GiB pool of
-    /// V4-Flash never fits), so an `ExpertPlacement::Device` request means
-    /// "size that cache" (see `--vram-expert-cache`).
+    /// `deepseek4` on OpenCL, SYCL, Vulkan or CUDA keeps every routed expert
+    /// borrowed from the mapping and caches a budgeted subset on the card
+    /// (the ~72 GiB pool of V4-Flash never fits), so an
+    /// `ExpertPlacement::Device` request means "size that cache"
+    /// (see `--vram-expert-cache`).
     pub fn device_experts_are_a_cache(&self, device: &Device) -> bool {
-        self.is_deepseek4() && (device.is_opencl() || device.is_sycl())
+        self.is_deepseek4()
+            && (device.is_opencl() || device.is_sycl() || device.is_vulkan() || device.is_cuda())
     }
 
     pub fn is_known_llama_cpp_arch(name: &str) -> bool {

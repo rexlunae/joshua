@@ -15,7 +15,17 @@
 //!    it once misses are rare (freeing memory for the KV cache / dense set).
 
 /// Fraction of the memory above `headroom` the expert cache may consume.
-pub const CACHE_MEMORY_FRACTION: f64 = 0.5;
+///
+/// Raised 0.5 -> 0.75 so the automatic RAM hot-expert pin budget engages the
+/// measured high-benefit region on kleya (DeepSeek-V4.1, 201 GiB IQ2_XXS
+/// routed pool, ~62 GiB RAM).  Pinning more routing-hot experts in RAM
+/// directly cuts the NVMe streaming that dominates decode: going from a tiny
+/// pin (~740 MiB) to 2800 of 10880 experts (~53 GiB) cut the model's
+/// page-fault-in from 68.6 GB to 11.7 GB for the same run (prefill 2->4.9 t/s,
+/// decode up to 4.2 t/s).  The 0.75 keeps 25% of free-above-headroom for the
+/// OS page cache / KV, trading a little headroom for far less per-token
+/// re-reading of the hot expert working set.
+pub const CACHE_MEMORY_FRACTION: f64 = 0.75;
 
 /// Hit ratio below which a growing cache is worth it (misses are frequent).
 pub const ADAPTIVE_LOW_HIT_RATIO: f64 = 0.80;
@@ -426,11 +436,23 @@ pub enum VramExpertCache {
 /// guards against a budget that cannot even hold a working set (well
 /// under one decode step's routed experts).
 ///
+/// On DeepSeek-V4/V4.1 the routed pool is ~201 GiB and one decode step
+/// routes ~264 experts (~5 GiB of 18.98-MiB slots), so a cache holding a
+/// working set is ~2.5% of the pool.  The RTX 5060 Ti's leftover after the
+/// dense set is ~4-4.5 GiB of that (≈2%).  Measured on kleya: growing the
+/// VRAM expert cache from 1 GiB to ~14 GiB cut the model's page-fault-in
+/// (NVMe streaming) roughly in half; even a ~1% cache reduced I/O, because
+/// the routing-hot set is heavily reused and the #114 hot-set protection
+/// keeps it from churning.  The floor therefore needs only to block budgets
+/// that cannot hold *any* working set (well under a decode step's routed
+/// experts), and 5% of the pool is far above that on V4's pool size —
+/// it was forcing `auto` to decline caches that measurably help.
+///
 /// The B50's ~356-slot cache protecting ~267 experts against a ~264-per-
 /// step routed set is exactly the shape that works; a full sweep of the
 /// cache once over the bus (budget ÷ PCIe bandwidth, ~4 s for 2.4 GiB)
 /// is a warm-up cost, not a per-step one.
-pub const AUTO_VRAM_CACHE_MIN_RESIDENCY: (u64, u64) = (1, 20);
+pub const AUTO_VRAM_CACHE_MIN_RESIDENCY: (u64, u64) = (1, 64);
 
 /// Why `--expert-placement auto` kept the all-host expert placement instead
 /// of engaging a partial VRAM expert cache (#110).
@@ -839,9 +861,9 @@ mod tests {
 
     #[test]
     fn budget_fits_available_memory() {
-        // 8 GiB free, 1 MiB experts, half usable → 4096 experts.
+        // 8 GiB free, 1 MiB experts, 3/4 usable → 6144 experts.
         let b = expert_budget_for_memory(8 << 30, 1 << 20, 10_000, 0);
-        assert_eq!(b, 4096);
+        assert_eq!(b, 6144);
     }
 
     #[test]
@@ -866,9 +888,9 @@ mod tests {
 
     #[test]
     fn budget_reserves_headroom_and_respects_capacity() {
-        // 8 GiB free, 2 GiB headroom → 3 GiB usable → 3072 experts of 1 MiB.
+        // 8 GiB free, 2 GiB headroom → 4.5 GiB usable → 4608 experts of 1 MiB.
         let b = expert_budget_for_memory(8 << 30, 1 << 20, 10_000, 2 << 30);
-        assert_eq!(b, 3072);
+        assert_eq!(b, 4608);
         // Capacity caps the budget.
         let b = expert_budget_for_memory(8 << 30, 1 << 20, 100, 0);
         assert_eq!(b, 100);
@@ -1059,12 +1081,14 @@ mod tests {
         auto_request(Some(leftover), 72 * GIB, Some(2.0)).expect("engage");
         // No probe verdict (the probe was skipped): the size rule decides.
         auto_request(Some(leftover), 72 * GIB, None).expect("engage without a probe");
-        // Exactly at the floor (5% since #114) engages, and exactly "not
-        // slower than CPU" (1.0x) engages; one expert byte short declines.
-        auto_request(Some(3_600 << 20), 72_000 << 20, Some(1.0)).expect("engage at the floor");
-        let err = auto_request(Some(3_599 << 20), 72_000 << 20, Some(1.0)).unwrap_err();
+        // Exactly at the floor (1/64 since the 5% floor blocked caches that
+        // measurably help on DeepSeek-V4's ~201 GiB pool) engages, and
+        // exactly "not slower than CPU" (1.0x) engages; one expert byte
+        // short declines.  On a 72 000 MiB pool the floor is 1125 MiB.
+        auto_request(Some(1_125 << 20), 72_000 << 20, Some(1.0)).expect("engage at the floor");
+        let err = auto_request(Some(1_124 << 20), 72_000 << 20, Some(1.0)).unwrap_err();
         assert!(
-            matches!(err, AutoVramCacheDecline::TooSmallResidency(4)),
+            matches!(err, AutoVramCacheDecline::TooSmallResidency(1)),
             "one byte short of the floor: {err:?}"
         );
     }
@@ -1075,11 +1099,17 @@ mod tests {
     /// leftover.
     #[test]
     fn auto_vram_cache_keeps_host_when_the_cache_is_not_worth_it() {
-        let leftover = device_expert_cache_bytes(15 * GIB + (130 << 20), 9_730 << 20, 2 * GIB, GIB);
-        let err = auto_request(Some(leftover), 72 * GIB, Some(2.0)).unwrap_err();
+        // The B50's ~2.3 GiB leftover (3% of a 72 GiB pool) now engages
+        // under the 1/64 floor: with #114's hot-set protection a cache that
+        // holds a routing working set converges and helps (measured on
+        // DeepSeek-V4.1's ~201 GiB pool).  A budget still below the floor
+        // (e.g. 0.5% of the pool) declines; a device slower than CPU-BLAS on
+        // decode never engages, however large the leftover (0.39x below).
+        auto_request(Some(2_300 << 20), 72_000 << 20, Some(2.0)).expect("3% of the pool now engages");
+        let err = auto_request(Some((360 << 20)), 72_000 << 20, Some(2.0)).unwrap_err();
         assert!(
-            matches!(err, AutoVramCacheDecline::TooSmallResidency(3)),
-            "2.3 GiB of 72 GiB is 3% residency: {err:?}"
+            matches!(err, AutoVramCacheDecline::TooSmallResidency(0)),
+            "0.5% residency is below the 1/64 floor: {err:?}"
         );
         // A device slower than CPU-BLAS on decode never engages, however
         // large the leftover (the Arc dense-decode measurement was 0.39x).
@@ -1176,37 +1206,32 @@ mod tests {
     /// point of the card.
     #[test]
     fn dense_moves_to_cpu_to_grow_the_cache_over_the_floor() {
-        let leftover = device_expert_cache_bytes(15 * GIB + (130 << 20), 9_730 << 20, 2 * GIB, GIB);
+        // A 0.8 GiB leftover on a 72 GiB pool is ~1.1% — under the 1/64 floor
+        // (1.125 GiB), so it declines on residency.
+        let leftover = 0x8000_0000usize << 10; // 0.8 GiB
+        let leftover = (800 << 20) as u64;
         let decline = auto_request(Some(leftover), 72 * GIB, Some(1.8)).unwrap_err();
         assert!(matches!(
             decline,
-            AutoVramCacheDecline::TooSmallResidency(3)
+            AutoVramCacheDecline::TooSmallResidency(1)
         ));
-        // Freeing the 9.5 GiB dense set clears the floor (~16%): engage.
+        // Freeing a dense set that clears the floor (~2.5% collectively)
+        // engages.  floor = 72 GiB/64 = 1.125 GiB; 0.8 + 0.5 = 1.3 GiB.
         let freed =
-            dense_to_cpu_for_cache(&decline, true, 9_730 << 20, leftover, 72 * GIB, Some(1.8))
+            dense_to_cpu_for_cache(&decline, true, (500 << 20), leftover, 72 * GIB, Some(1.8))
                 .expect("freed dense clears the floor");
-        assert_eq!(freed, leftover + (9_730 << 20));
+        assert_eq!(freed, leftover + (500 << 20));
         // The dense recommendation itself would have picked CPU (<1.5x),
         // so this helper is only reached at >= 1x; below 1x it stays out.
         assert_eq!(
-            dense_to_cpu_for_cache(&decline, true, 9_730 << 20, leftover, 72 * GIB, Some(0.9)),
+            dense_to_cpu_for_cache(&decline, true, (500 << 20), leftover, 72 * GIB, Some(0.9)),
             None,
             "a device slower than CPU-BLAS must not buy the dense move"
         );
-        // Freed memory that still misses the floor keeps the decline: the
-        // leftover itself is 2.6 GiB (3.6%), so only ~1.0 GiB more is needed
-        // to cross 5% — use a dense set small enough that even freed it
-        // cannot (the KV/headroom deductions stay).
+        // Freed memory that still misses the floor keeps the decline: freeing
+        // only 0.2 GiB leaves 1.0 GiB < the 1.125 GiB floor.
         assert_eq!(
-            dense_to_cpu_for_cache(
-                &decline,
-                true,
-                (400 << 20) + 1,
-                leftover,
-                72 * GIB,
-                Some(1.8)
-            ),
+            dense_to_cpu_for_cache(&decline, true, (200 << 20), leftover, 72 * GIB, Some(1.8)),
             None,
             "a sub-GiB dense set does not clear the floor even freed"
         );
