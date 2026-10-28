@@ -2457,11 +2457,26 @@ impl Engine {
                 // that cannot fit falls back to plain decoding instead of
                 // leaving the target unable to upload.
                 let draft_bytes = crate::draft_model::resident_bytes(path).unwrap_or(0);
+                // Where the target's experts really live: the Qwen and
+                // deepseek2 loaders upload the pool to a non-CPU expert
+                // device and build any cache there too (a CPU expert device
+                // keeps both on the host); deepseek4 keeps the pool mapped on
+                // the host and puts only a non-empty cache on an accelerator
+                // with its IQ2_XXS kernels.
+                let accel = |d: &Device| d.is_opencl() || d.is_sycl() || d.is_vulkan() || d.is_cuda();
+                let ds4 = a.is_deepseek4();
+                let cache = device_expert_cache.filter(|&b| b > 0);
+                let pool_on_device = !ds4 && !expert_device.is_cpu();
+                let cache_on_device = if ds4 {
+                    cache.filter(|_| accel(&expert_device) || accel(&dense_device))
+                } else {
+                    cache.filter(|_| !expert_device.is_cpu())
+                };
                 let target_bytes = crate::placement::target_device_weight_bytes(
                     footprint.dense_upper,
                     expert_device_bytes,
-                    !expert_device.is_cpu(),
-                    device_expert_cache,
+                    pool_on_device,
+                    cache_on_device,
                 );
                 let fits = dense_device.is_cpu()
                     || device_budget.is_none_or(|budget| {
