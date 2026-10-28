@@ -163,6 +163,7 @@ fn load(path: &std::path::Path, dev: &Device, mmap: bool) -> joshua::model::Quan
         None,
         0,
         None,
+        joshua::EngramTier::Auto,
     )
     .unwrap()
 }

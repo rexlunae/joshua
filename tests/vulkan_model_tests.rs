@@ -75,6 +75,7 @@ fn load_mmap_with_cache(model: &Path, device: &Device, cache_bytes: u64) -> Quan
         None,
         0,
         Some(cache_bytes),
+        joshua::EngramTier::Auto,
     )
     .unwrap()
 }

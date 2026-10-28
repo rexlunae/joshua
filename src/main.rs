@@ -26,8 +26,8 @@ use joshua::{
     engine::Engine,
     server,
     types::{checked_reasoning_template_kwargs, GenerationOptions, ReasoningEffort},
-    ChatMessage, ComputeBackend, DensePlacement, EngineOptions, ExpertPlacement, HugePages,
-    MlockMode, MmapMode, PageSize, SpeculativeConfig, VramExpertCache,
+    ChatMessage, ComputeBackend, DensePlacement, EngineOptions, EngramTier, ExpertPlacement,
+    HugePages, MlockMode, MmapMode, PageSize, SpeculativeConfig, VramExpertCache,
 };
 
 /// Values for `--device` (CLI form of [`ComputeBackend`]).
@@ -455,6 +455,15 @@ enum Commands {
         /// PEM private key for --tls-cert.
         #[arg(long, env = "JOSHUA_TLS_KEY", requires = "tls_cert")]
         tls_key: Option<PathBuf>,
+        /// Where a DeepSeek-V4.1 model's Engram n-gram tables are resident
+        /// (a separate policy from the routed experts): `auto` resolves them
+        /// straight from the mmap mapping (disk-pinned) and promotes a working
+        /// subset into RAM only when free RAM is ample (>~192 GiB), `ram`
+        /// always promotes the working subset into RAM, `disk` always pins
+        /// them to storage.  The tables never consume a Tier-1 VRAM or Tier-2
+        /// host-slot budget under any tier.
+        #[arg(long, env = "JOSHUA_ENGRAM_TIER", default_value = "auto", value_parser = clap::value_parser!(EngramTier))]
+        engram_tier: EngramTier,
         /// Where the dense set (embeddings, norms, attention, routers, shared
         /// experts, output) runs on a GPU: `device` offloads it (right for a
         /// real GPU whose GEMM beats CPU-BLAS), `cpu` keeps it on CPU-BLAS
@@ -704,6 +713,15 @@ enum Commands {
         /// (lower overhead; a plugin crash takes the server down).
         #[arg(long, default_value_t = false)]
         npu_in_process: bool,
+        /// Where a DeepSeek-V4.1 model's Engram n-gram tables are resident
+        /// (a separate policy from the routed experts): `auto` resolves them
+        /// straight from the mmap mapping (disk-pinned) and promotes a working
+        /// subset into RAM only when free RAM is ample (>~192 GiB), `ram`
+        /// always promotes the working subset into RAM, `disk` always pins
+        /// them to storage.  The tables never consume a Tier-1 VRAM or Tier-2
+        /// host-slot budget under any tier.
+        #[arg(long, env = "JOSHUA_ENGRAM_TIER", default_value = "auto", value_parser = clap::value_parser!(EngramTier))]
+        engram_tier: EngramTier,
         /// Where the dense set (embeddings, norms, attention, routers, shared
         /// experts, output) runs on a GPU: `device` offloads it (right for a
         /// real GPU whose GEMM beats CPU-BLAS), `cpu` keeps it on CPU-BLAS
@@ -852,6 +870,7 @@ async fn main() -> anyhow::Result<()> {
             mlock_weight_budget,
             expert_placement,
             dense_placement,
+            engram_tier,
             skip_placement_bench,
             vram_budget,
             npu_plugin,
@@ -923,6 +942,7 @@ async fn main() -> anyhow::Result<()> {
                 .mlock_weight_budget(mlock_weight_budget.map(|mib| mib * 1024 * 1024))
                 .expert_placement(expert_placement)
                 .dense_placement(dense_placement)
+                .engram_tier(engram_tier)
                 .device_memory_budget(vram_budget.map(|mib| mib.saturating_mul(1024 * 1024)));
             // One backend serves the startup model and any loaded later.
             let npu = npu_plugin
@@ -1262,6 +1282,7 @@ async fn main() -> anyhow::Result<()> {
             mlock_weight_budget,
             expert_placement,
             dense_placement,
+            engram_tier,
             skip_placement_bench,
             vram_budget,
             npu_plugin,
@@ -1313,6 +1334,7 @@ async fn main() -> anyhow::Result<()> {
                 .mlock_weight_budget(mlock_weight_budget.map(|mib| mib * 1024 * 1024))
                 .expert_placement(expert_placement)
                 .dense_placement(dense_placement)
+                .engram_tier(engram_tier)
                 .device_memory_budget(vram_budget.map(|mib| mib.saturating_mul(1024 * 1024)));
             let mut engine = Engine::with_options(&model, opts)?;
             if let Some(plugin) = npu_plugin {

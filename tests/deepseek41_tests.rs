@@ -8,6 +8,7 @@ mod common;
 use candle_core::{Device, Tensor};
 use common::{assert_close, load_model, logits};
 use joshua::model::{Architecture, QuantizedModel};
+use joshua::placement::{EngramResidency, EngramTier};
 
 const TOKENS: [u32; 14] = [1, 4, 2, 7, 5, 9, 3, 6, 8, 4, 1, 12, 13, 5];
 
@@ -91,6 +92,7 @@ fn deepseek41_accelerators_match_independent_float64_reference() {
             None,
             0,
             None,
+            joshua::EngramTier::Auto,
         )
         .unwrap();
         for (pos, (&token, expected)) in TOKENS.iter().zip(&want).enumerate() {
@@ -308,5 +310,68 @@ fn engine_refuses_a_truncated_gguf() {
         Err(e) => e.to_string(),
     };
     assert!(msg.contains("past the end"), "{msg}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Load the tiny V4.1 fixture through `from_gguf_mmap_placed` with an
+/// explicit engram tier, so the placement policy (a separate one from the
+/// routed-expert cache) can be observed in isolation.
+fn load_engram_tier(path: &std::path::Path, tier: joshua::EngramTier) -> QuantizedModel {
+    let bytes = std::fs::read(path).unwrap();
+    let content = joshua::gguf_ext::read_header(&mut std::io::Cursor::new(&bytes[..]))
+        .unwrap()
+        .to_candle_content()
+        .unwrap();
+    let mmap = std::sync::Arc::new(
+        unsafe { memmap2::Mmap::map(&std::fs::File::open(path).unwrap()) }.unwrap(),
+    );
+    let mut cursor = std::io::Cursor::new(&bytes[..]);
+    QuantizedModel::from_gguf_mmap_placed(
+        content,
+        &mut cursor,
+        &Device::Cpu,
+        &Device::Cpu,
+        Some(mmap),
+        None,
+        0,
+        None,
+        tier,
+    )
+    .unwrap()
+}
+
+/// The engram tables are resolved straight from the mapping under every tier
+/// and their residency is reported separately from the routed-expert cache.
+#[test]
+fn engram_placement_is_reported_separately_and_resolves_from_mmap() {
+    // Build the fixture once; the tiny model's engram range is mmap-backed.
+    let (dir, model) = fixture("deepseek41-engram-tier");
+    // Default (`auto`, no ample RAM probe on this host) and explicit `disk`
+    // both pin the engram to storage (no promotion).
+    for tier in [joshua::EngramTier::Auto, joshua::EngramTier::Disk] {
+        let m = load_engram_tier(&model, tier);
+        let report = m.engram_residency().expect("fixture has an engram layer");
+        assert_eq!(report.layers, 1, "one engram layer in the tiny model");
+        assert!(
+            report.bytes_total > 0,
+            "the mmap-borrowed table reports mapped bytes"
+        );
+        assert_eq!(
+            report.tier,
+            EngramResidency::ResolveFromMmap,
+            "tier {tier:?} resolves to the mmap/disk residency"
+        );
+        drop(m);
+    }
+    // `ram` forces promotion (the mapped range is prefetched); the report
+    // still resolves from the mapping but records the promoted tier.
+    let m = load_engram_tier(&model, joshua::EngramTier::Ram);
+    let report = m.engram_residency().expect("engram layer present");
+    assert_eq!(
+        report.tier,
+        EngramResidency::PromoteToRam,
+        "`ram` forces promote-to-RAM"
+    );
+    drop(m);
     std::fs::remove_dir_all(&dir).ok();
 }

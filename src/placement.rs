@@ -730,6 +730,93 @@ pub fn resolve_dense_placement(
     }
 }
 
+// ─── Engram placement (DeepSeek-V4.1) ───────────────────────────────────────
+
+/// Where the DeepSeek-V4.1 Engram n-gram tables live.
+///
+/// The Engram tables are latency-tolerant hash gathers — a separate residency
+/// policy from the ordinary routed experts, which keep their own VRAM/RAM
+/// placement.  The tables are always *resolved straight from the mmap mapping*
+/// (never folded into a Tier-1 VRAM slot or a Tier-2 host hot-expert slot);
+/// the tier here only controls whether a working subset is additionally
+/// promoted into RAM (prefixed into the OS page cache so the gather reads
+/// resident pages) or left pinned to storage (disk) so pages fault lazily.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EngramTier {
+    /// [`EngramResidency::ResolveFromMmap`] by default (disk-pinned); promote a
+    /// working subset to RAM only when the available RAM is ample — above
+    /// [`ENGRAM_PROMOTE_RAM_FLOOR`].
+    #[default]
+    Auto,
+    /// Always promote the engram working subset to RAM (prefetch the mapped
+    /// range at load).
+    Ram,
+    /// Always pin the engram tables to storage (disk): no promotion, pages
+    /// fault in only as the gathers touch them.
+    Disk,
+}
+
+impl std::str::FromStr for EngramTier {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "ram" | "host" | "cpu" => Ok(Self::Ram),
+            "disk" | "storage" | "mmap" => Ok(Self::Disk),
+            other => Err(format!(
+                "unknown engram tier `{other}` (expected auto, ram or disk)"
+            )),
+        }
+    }
+}
+
+/// A resolved engram residency: [`EngramTier`] minus `Auto`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EngramResidency {
+    /// Resolve the engram tables straight from the mmap mapping; no slot-pool
+    /// budget and no RAM promotion.  This is the storage/disk(default) tier.
+    ResolveFromMmap,
+    /// The tables are still resolved from the mapping, but the working subset
+    /// is promoted into RAM (the mapped range is prefetched at load) because
+    /// the operator forced it or the RAM budget is ample.
+    PromoteToRam,
+}
+
+/// Host RAM, in bytes, above which the *default* engran tier (`auto`) treats
+/// the budget as "ample" and promotes a working subset of the engram tables
+/// into RAM.  DeepSeek-V4.1's engram tables are ~189 GiB; with less than this
+/// much free RAM leaving the tables to read lazily from disk is the right
+/// default, so promoting only above the floor keeps much of the system's RAM
+/// for the OS page cache and routine inference state.
+pub const ENGRAM_PROMOTE_RAM_FLOOR: u64 = 192 << 30; // 192 GiB
+
+/// Decide how the engram tables should be resident.  Pure: every input is a
+/// number, so the rule is unit-testable without a device or a live process.
+///
+/// The engram tables are *always* resolved straight from the mapping — this
+/// function only answers whether to additionally promote a working subset to
+/// RAM:
+///
+/// * `Ram` always promotes (`PromoteToRam`).
+/// * `Disk` never promotes (`ResolveFromMmap`).
+/// * `Auto` promotes only when the measured available RAM is above
+///   [`ENGRAM_PROMOTE_RAM_FLOOR`]; a `None` RAM figure (no probe) stays on
+///   disk so memory is never assumed ample without evidence.
+pub fn resolve_engram_residency(
+    requested: EngramTier,
+    available_ram_bytes: Option<u64>,
+) -> EngramResidency {
+    match requested {
+        EngramTier::Ram => EngramResidency::PromoteToRam,
+        EngramTier::Disk => EngramResidency::ResolveFromMmap,
+        EngramTier::Auto => match available_ram_bytes {
+            Some(free) if free > ENGRAM_PROMOTE_RAM_FLOOR => EngramResidency::PromoteToRam,
+            _ => EngramResidency::ResolveFromMmap,
+        },
+    }
+}
+
 /// Whether the dense set — which, when not forced to the CPU, goes to the
 /// compute device — fits the device's memory with headroom.  Expert placement
 /// can only move the routed experts; a budget below this cannot be honoured by
@@ -1252,5 +1339,75 @@ mod tests {
             dense_to_cpu_for_cache(&decline, false, 9_730 << 20, leftover, 72 * GIB, Some(1.8)),
             None,
         );
+    }
+
+    // ── Engram placement ─────────────────────────────────────────────────
+
+    #[test]
+    fn engram_tier_parses_and_rejects() {
+        assert_eq!("auto".parse::<EngramTier>().unwrap(), EngramTier::Auto);
+        assert_eq!("Auto".parse::<EngramTier>().unwrap(), EngramTier::Auto);
+        assert_eq!("ram".parse::<EngramTier>().unwrap(), EngramTier::Ram);
+        assert_eq!("host".parse::<EngramTier>().unwrap(), EngramTier::Ram);
+        assert_eq!("disk".parse::<EngramTier>().unwrap(), EngramTier::Disk);
+        assert_eq!("storage".parse::<EngramTier>().unwrap(), EngramTier::Disk);
+        assert!("sideways".parse::<EngramTier>().is_err());
+    }
+
+    /// Default (auto) keeps the engram tables on the slot-free mmap mapping
+    /// (disk-pinned) and never promotes without ample RAM.
+    #[test]
+    fn engram_auto_resolves_from_mmap_default_and_without_ample_ram() {
+        // No RAM figure (no probe): stay on disk — never assume ample.
+        assert_eq!(
+            resolve_engram_residency(EngramTier::Auto, None),
+            EngramResidency::ResolveFromMmap
+        );
+        // Below the ample floor: disk-pinned default.
+        assert_eq!(
+            resolve_engram_residency(EngramTier::Auto, Some(ENGRAM_PROMOTE_RAM_FLOOR)),
+            EngramResidency::ResolveFromMmap
+        );
+        assert_eq!(
+            resolve_engram_residency(EngramTier::Auto, Some(16 << 30)),
+            EngramResidency::ResolveFromMmap
+        );
+    }
+
+    /// `auto` promotes to RAM only when the measured RAM is above the ample
+    /// floor (~192 GiB).
+    #[test]
+    fn engram_auto_promotes_only_when_ram_is_ample() {
+        assert_eq!(
+            resolve_engram_residency(EngramTier::Auto, Some(ENGRAM_PROMOTE_RAM_FLOOR + 1)),
+            EngramResidency::PromoteToRam
+        );
+        assert_eq!(
+            resolve_engram_residency(EngramTier::Auto, Some(256 << 30)),
+            EngramResidency::PromoteToRam
+        );
+        // The floor itself is "not ample": promotion needs to be strictly above.
+        assert_eq!(
+            resolve_engram_residency(EngramTier::Auto, Some(ENGRAM_PROMOTE_RAM_FLOOR)),
+            EngramResidency::ResolveFromMmap
+        );
+    }
+
+    /// `ram` forces RAM promotion (without needing ample RAM) and `disk`
+    /// always pins to storage regardless of the RAM budget.
+    #[test]
+    fn engram_ram_and_disk_force_residency() {
+        for ram in [None, Some(0), Some(1 << 30), Some(ENGRAM_PROMOTE_RAM_FLOOR + (1 << 30))] {
+            assert_eq!(
+                resolve_engram_residency(EngramTier::Ram, ram),
+                EngramResidency::PromoteToRam,
+                "ram forces promotion regardless of {ram:?}"
+            );
+            assert_eq!(
+                resolve_engram_residency(EngramTier::Disk, ram),
+                EngramResidency::ResolveFromMmap,
+                "disk always pins to storage regardless of {ram:?}"
+            );
+        }
     }
 }

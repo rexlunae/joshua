@@ -119,7 +119,7 @@ use crate::speculative::{
     next_draft_len, NgramDrafter, SpeculationGate, SpeculativeConfig, SpeculativeStats,
     TokenDistRef, Verdict,
 };
-pub use crate::placement::{DensePlacement, ExpertPlacement, VramExpertCache};
+pub use crate::placement::{DensePlacement, EngramTier, ExpertPlacement, VramExpertCache};
 use crate::template::ChatTemplate;
 
 use crate::error::{JoshuaError, Result};
@@ -497,6 +497,14 @@ pub struct EngineOptions {
     /// host (the routed-expert placement is unaffected).  Ignored on the CPU
     /// device.
     pub dense_placement: DensePlacement,
+    /// Where the DeepSeek-V4.1 Engram n-gram tables are resident.  A separate
+    /// placement policy from the routed experts (see
+    /// [`crate::placement::EngramTier`]): the tables are always resolved
+    /// straight from the mmap mapping — never a Tier-1 VRAM slot or a Tier-2
+    /// host hot-expert slot — and this only controls whether a working subset
+    /// is additionally promoted to RAM (`--engram-tier ram` / ample RAM on
+    /// `auto`) or pinned to disk (the default, `--engram-tier disk`).
+    pub engram_tier: EngramTier,
     /// Bytes of accelerator memory the model may use, overriding the probe
     /// for the [`ExpertPlacement::Auto`] decision and the per-device session
     /// cap.  `None` uses the probe where one exists.  This is the knob for
@@ -723,6 +731,13 @@ impl EngineOptions {
         self
     }
 
+    /// Choose where the DeepSeek-V4.1 Engram n-gram tables are resident.  See
+    /// [`EngineOptions::engram_tier`].
+    pub fn engram_tier(mut self, tier: EngramTier) -> Self {
+        self.engram_tier = tier;
+        self
+    }
+
     /// Cap the accelerator memory the model may use (bytes).  See
     /// [`EngineOptions::device_memory_budget`].
     pub fn device_memory_budget(mut self, bytes: Option<u64>) -> Self {
@@ -869,6 +884,10 @@ pub struct Engine {
     /// Resolved bounded VRAM expert-cache byte budget the loaders get (see
     /// [`EngineOptions::device_expert_cache`]); `None` disables.
     device_expert_cache: Option<u64>,
+    /// Where a DeepSeek-V4.1 model's Engram n-gram tables are resident (a
+    /// separate placement policy from the routed experts; see
+    /// [`EngineOptions::engram_tier`]).
+    engram_tier: EngramTier,
     /// Tokens per prefill chunk (see [`EngineOptions::prefill_chunk`]),
     /// resolved to at least one token.
     prefill_chunk: usize,
@@ -2529,6 +2548,7 @@ impl Engine {
             pin_hot_experts,
             expert_cache_auto,
             device_expert_cache,
+            engram_tier: options.engram_tier,
             prefill_chunk,
             prefill_budget,
             prefill_cost,
@@ -4924,6 +4944,7 @@ impl Engine {
                 self.model_file.clone(),
                 self.n_ctx as usize,
                 self.device_expert_cache,
+                self.engram_tier,
             )
         };
         // Read the NextN block only when it will draft.
@@ -4960,6 +4981,31 @@ impl Engine {
         model.set_pin_hot_experts(budget);
         model.set_prefix_checkpoints(self.prefix_checkpoints);
         model.set_speculative_expert_prefetch(self.predict_experts);
+
+        // Engram residency is reported separately from the routed-expert cache:
+        // the engram tables are an independent placement policy, always
+        // resolved straight from the mapping, never a Tier-1/2 slot.
+        if let Some(eg) = model.engram_residency() {
+            use crate::placement::EngramResidency;
+            let tier = match eg.tier {
+                EngramResidency::PromoteToRam => "ram",
+                EngramResidency::ResolveFromMmap => "disk",
+            };
+            match eg.resident_bytes {
+                Some(resident) => tracing::info!(
+                    "engram residency [separate from expert cache]: tier={tier} layers={} mapped={:.2} GiB resident={:.2} GiB",
+                    eg.layers,
+                    eg.bytes_total as f64 / 2f64.powi(30),
+                    resident as f64 / 2f64.powi(30),
+                ),
+                None => tracing::info!(
+                    "engram residency [separate from expert cache]: tier={tier} layers={} mapped={:.2} GiB (resident unmeasurable)",
+                    eg.layers,
+                    eg.bytes_total as f64 / 2f64.powi(30),
+                ),
+            }
+        }
+
         if self.mtp > 0 && !model.set_mtp(true) {
             tracing::warn!(
                 "--mtp requested, but this model has no NextN / MTP block the loader reads; \
