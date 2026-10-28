@@ -91,6 +91,11 @@ impl Default for ServerMetrics {
 }
 
 impl ServerMetrics {
+    /// Count a streaming response (shared by the OpenAI and Ollama routes).
+    pub(crate) fn record_stream(&self) {
+        self.streamed_requests.fetch_add(1, Ordering::Relaxed);
+    }
+
     fn record_http(&self, status: StatusCode) {
         self.http_requests.fetch_add(1, Ordering::Relaxed);
         if status.is_client_error() || status.is_server_error() {
@@ -745,6 +750,14 @@ pub fn create_router(state: AppState) -> Router {
     let manage = Router::new()
         .route("/v1/models/load", post(load_model))
         .route("/v1/models/unload", post(unload_model))
+        .route("/api/version", get(crate::ollama::version))
+        .route("/api/tags", get(crate::ollama::tags))
+        .route("/api/ps", get(crate::ollama::ps))
+        .route("/api/show", post(crate::ollama::show))
+        .route("/api/chat", post(crate::ollama::chat))
+        .route("/api/generate", post(crate::ollama::generate))
+        .route("/api/embed", post(crate::ollama::embed))
+        .route("/api/embeddings", post(crate::ollama::embed))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             require_api_key,
@@ -1110,14 +1123,14 @@ fn device_label(device: &candle_core::Device) -> &'static str {
 /// Sets its flag when dropped.  Held by a handler across the blocking
 /// generation, so when hyper drops the handler future (the client hung up)
 /// the engine sees the flag and stops decoding.
-struct CancelOnDrop(Arc<AtomicBool>);
+pub(crate) struct CancelOnDrop(Arc<AtomicBool>);
 
 impl CancelOnDrop {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self(Arc::new(AtomicBool::new(false)))
     }
 
-    fn flag(&self) -> Arc<AtomicBool> {
+    pub(crate) fn flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.0)
     }
 }
@@ -1149,6 +1162,18 @@ async fn list_models(State(state): State<AppState>) -> Json<ModelListResponse> {
             created,
             owned_by: "joshua".to_string(),
         });
+    }
+    // Unloaded models in the model directory are listed too, so a
+    // serving-directory deployment advertises everything it can load.
+    for m in crate::ollama::AvailableModel::discover(&state) {
+        if !m.loaded && !data.iter().any(|d| d.id == m.id) {
+            data.push(ModelInfo {
+                id: m.id,
+                object: "model".to_string(),
+                created,
+                owned_by: "joshua".to_string(),
+            });
+        }
     }
     Json(ModelListResponse {
         object: "list".to_string(),
@@ -2147,14 +2172,14 @@ pub struct ApiError {
 }
 
 impl ApiError {
-    fn new(status: StatusCode, msg: impl Into<String>, error_type: &str) -> Self {
+    pub(crate) fn new(status: StatusCode, msg: impl Into<String>, error_type: &str) -> Self {
         Self {
             status,
             body: ErrorResponse::new(msg, error_type),
         }
     }
 
-    fn bad_request(msg: impl Into<String>) -> Self {
+    pub(crate) fn bad_request(msg: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
             body: ErrorResponse::invalid_request(msg),
@@ -2163,7 +2188,7 @@ impl ApiError {
 
     /// Internal failure: the detail is logged server-side, and the client
     /// receives only a generic message (no internal strings / panic text).
-    fn internal(msg: impl Into<String>) -> Self {
+    pub(crate) fn internal(msg: impl Into<String>) -> Self {
         tracing::error!("internal error serving request: {}", msg.into());
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
