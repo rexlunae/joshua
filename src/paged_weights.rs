@@ -34,6 +34,13 @@ pub(crate) struct PagedWeight {
     dtype: GgmlDType,
 }
 
+/// The configured `JOSHUA_GPU_WEIGHT_CACHE` budget in bytes, or `None` when
+/// the cache is off (unset, empty, `0` or not a number of MiB).
+pub(crate) fn configured_budget() -> Option<u64> {
+    let mib = std::env::var("JOSHUA_GPU_WEIGHT_CACHE").ok()?.parse::<u64>().ok()?;
+    (mib > 0).then(|| mib.saturating_mul(1024 * 1024))
+}
+
 impl WeightCache {
     pub(crate) fn new(mmap: Arc<memmap2::Mmap>, device: Device, capacity: usize) -> Result<Arc<Self>> {
         if capacity == 0 { candle_core::bail!("GPU weight cache must have a positive byte budget"); }

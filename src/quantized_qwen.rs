@@ -2395,23 +2395,20 @@ fn load_parts<R: Read + Seek>(
         // Opt-in bounded GPU weight cache.  Heed the env budget (MiB); 0/unset
         // disables.  Only meaningful with an mmap-backed model on a device that
         // can hold quantized blocks; building it is best-effort.
-        let gpu_cache = match std::env::var("JOSHUA_GPU_WEIGHT_CACHE") {
-            Ok(v) if !v.is_empty() && v != "0" => {
-                let mib = v.parse::<usize>().unwrap_or(0);
-                if mib == 0 {
-                    None
-                } else if let Some(m) = mmap.clone() {
+        let gpu_cache = match crate::paged_weights::configured_budget() {
+            Some(bytes) => {
+                if let Some(m) = mmap.clone() {
                     crate::paged_weights::WeightCache::new(
                         m.clone(),
                         device.clone(),
-                        mib * 1024 * 1024,
+                        bytes as usize,
                     ).ok()
                 } else {
                     tracing::warn!("JOSHUA_GPU_WEIGHT_CACHE set but no mmap-backed model; disabled");
                     None
                 }
             }
-            _ => None,
+            None => None,
         };
         // The Content owns metadata; move it into our reader together with the
         // underlying file handle (borrowed for the lifetime of the load).

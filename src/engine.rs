@@ -2462,20 +2462,33 @@ impl Engine {
                 // device and build any cache there too (a CPU expert device
                 // keeps both on the host); deepseek4 keeps the pool mapped on
                 // the host and puts only a non-empty cache on an accelerator
-                // with its IQ2_XXS kernels.
+                // with its IQ2_XXS kernels.  Two Qwen modes upload no pool:
+                // on Metal the experts are bound in place from the mapping,
+                // and with `JOSHUA_GPU_WEIGHT_CACHE` they page through that
+                // bounded cache, so only its budget is charged.  Neither
+                // kind of expert can feed the VRAM expert cache.
                 let accel = |d: &Device| d.is_opencl() || d.is_sycl() || d.is_vulkan() || d.is_cuda();
                 let ds4 = a.is_deepseek4();
+                let qwen = !ds4 && a != Architecture::DeepSeek2;
                 let cache = device_expert_cache.filter(|&b| b > 0);
-                let pool_on_device = !ds4 && !expert_device.is_cpu();
+                let device_experts = !ds4 && !expert_device.is_cpu();
+                let zero_copy = device_experts && qwen && dense_device.is_metal();
+                let paged = (device_experts && qwen && !zero_copy)
+                    .then(crate::paged_weights::configured_budget)
+                    .flatten();
+                let pool_bytes = match paged {
+                    Some(budget) => expert_device_bytes.min(budget),
+                    None => expert_device_bytes,
+                };
                 let cache_on_device = if ds4 {
                     cache.filter(|_| accel(&expert_device) || accel(&dense_device))
                 } else {
-                    cache.filter(|_| !expert_device.is_cpu())
+                    cache.filter(|_| device_experts && !zero_copy && paged.is_none())
                 };
                 let target_bytes = crate::placement::target_device_weight_bytes(
                     footprint.dense_upper,
-                    expert_device_bytes,
-                    pool_on_device,
+                    pool_bytes,
+                    device_experts && !zero_copy,
                     cache_on_device,
                 );
                 let fits = dense_device.is_cpu()
