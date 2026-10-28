@@ -2341,6 +2341,10 @@ pub struct TinyDeepseek4Opts {
     pub q2k_down: bool,
     /// Override routed intermediate width for multi-block shard fixtures.
     pub expert_width: Option<usize>,
+    /// Emit a `deepseek41` file with **no `output.weight`** — the head is tied to
+    /// `token_embd` exactly as DeepSeek-V4.1-Flash ships.  Only meaningful with
+    /// `v41: true`.
+    pub v41_tied_head: bool,
     /// Write a `deepseek41` (DeepSeek-V4.1) file instead: 4 layers with
     /// compress ratios [2, 2, 1, 0] — layer 0 a gated ratio-2 source that
     /// owns the index keys and scores top-k, layer 1 a reader that scores
@@ -2362,6 +2366,19 @@ pub fn write_tiny_deepseek41_gguf(path: &Path) {
         path,
         TinyDeepseek4Opts {
             v41: true,
+            ..Default::default()
+        },
+    );
+}
+
+/// The tiny `deepseek41` fixture with **no `output.weight`** — the head tied to
+/// `token_embd`, which is how DeepSeek-V4.1-Flash actually ships.
+pub fn write_tiny_deepseek41_gguf_tied(path: &Path) {
+    write_tiny_deepseek4_gguf_opts(
+        path,
+        TinyDeepseek4Opts {
+            v41: true,
+            v41_tied_head: true,
             ..Default::default()
         },
     );
@@ -2449,6 +2466,7 @@ pub fn write_tiny_deepseek4_gguf_candle_only(path: &Path) {
 
 pub fn write_tiny_deepseek4_gguf_opts(path: &Path, opts: TinyDeepseek4Opts) {
     let TinyDeepseek4Opts {
+        v41_tied_head,
         iq2xxs_output,
         compress,
         hca,
@@ -2630,7 +2648,12 @@ pub fn write_tiny_deepseek4_gguf_opts(path: &Path, opts: TinyDeepseek4Opts) {
         RawTensor::f32("output_norm.weight", ones(EMB), &[EMB]),
     ];
     if v41 {
-        tensors.push(RawTensor::f16("output.weight", weights(VOCAB * EMB, 2), &[VOCAB, EMB]));
+        // DeepSeek-V4.1-Flash ships no output.weight: the head is the tied
+        // embedding.  When asked for that shape, omit it here so the loader's
+        // tied-head path is what gets exercised.
+        if !v41_tied_head {
+            tensors.push(RawTensor::f16("output.weight", weights(VOCAB * EMB, 2), &[VOCAB, EMB]));
+        }
     } else {
         tensors.extend([
             RawTensor::f16(
