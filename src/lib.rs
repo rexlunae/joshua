@@ -64,6 +64,7 @@ pub mod residency;
 pub mod route_trace;
 pub mod cache_sim;
 pub mod npu;
+pub mod ollama;
 pub mod paged_weights;
 pub mod placement;
 pub mod prefill_cost;
