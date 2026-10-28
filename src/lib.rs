@@ -90,7 +90,7 @@ pub use rustls;
 
 pub use engine::{
     find_gguf_in_dir, ComputeBackend, Engine, EngineOptions, DensePlacement, EngramTier,
-    ExpertPlacement, HugePages, MlockMode, MmapMode, PageSize, VramExpertCache,
+    ExpertPlacement, HugePages, MlockMode, MmapMode, PageSize, SsdExpertCache, VramExpertCache,
 };
 pub use error::{JoshuaError, Result};
 pub use speculative::{SpeculativeConfig, SpeculativeStats};

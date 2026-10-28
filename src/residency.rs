@@ -5,12 +5,15 @@
 //! module is the *executor* — it makes a named expert's weights resident on
 //! the active compute device.
 //!
-//! Two backends exist: **CPU** ([`CpuResidency`], best-effort `MADV_WILLNEED`
+//! Three backends exist: **CPU** ([`CpuResidency`], best-effort `MADV_WILLNEED`
 //! over each expert's borrowed mmap ranges — the historical
-//! `--pin-hot-experts` behavior) and a **device slot pool**
-//! ([`DeviceResidency`], a byte-budgeted LRU of experts uploaded to the
-//! expert device, with the hot set protected from eviction).  Policy names
-//! experts, `acquire`/`release` move bytes, `capacity` sizes the budget.
+//! `--pin-hot-experts` behavior), a **device slot pool** ([`DeviceResidency`],
+//! a byte-budgeted LRU of experts uploaded to the expert device, with the hot
+//! set protected from eviction), and an **NVMe/SSD staging slab**
+//! ([`NvmeResidency`], a byte-budgeted LRU of experts `pread(2)`-streamed into a
+//! bounded host-RAM slab through the model file's own descriptor — the explicit
+//! Tier-3 residency).  Policy names experts, `acquire`/`release` move bytes,
+//! `capacity` sizes the budget.
 
 use std::sync::Arc;
 
@@ -1260,6 +1263,269 @@ impl<T: DeviceExpertSlot> ExpertResidency for CompositeResidency<T> {
     }
 }
 
+// ─── Tier-3 NVMe / SSD staging slab ────────────────────────────────────────
+
+/// A staged expert's host-RAM form for the NVMe staging slab ([`NvmeResidency`]).
+///
+/// The loader stages an expert by streaming its
+/// [`crate::mmap_tensor::MappedRange`]s out of the model file with `pread(2)`
+/// through the file's own descriptor — distinct from `CpuResidency`, whose
+/// `MADV_WILLNEED` leaves the kernel page cache as the transport.  This backend
+/// pulls the bytes into a *bounded* host-RAM slab the process owns, so the
+/// resident set is a hard budget rather than a hint.  [`NvmeStaged::staged_bytes`]
+/// is what the slab's byte budget is accounted against.
+#[cfg(unix)]
+pub trait NvmeStaged: Send + Sync + 'static {
+    /// Bytes this staged payload occupies in the host-RAM slab.
+    fn staged_bytes(&self) -> u64;
+}
+
+/// Interior slot type that lets the staging slab reuse the byte-budgeted LRU
+/// pool machinery of [`DeviceResidency`].  The pool only needs a sized carrier
+/// ([`DeviceExpertSlot::device_bytes`]) to reserve/evict; `NvmeStaged` is the
+/// real payload behind it.
+#[cfg(unix)]
+struct NvmeSlot<T: NvmeStaged> {
+    payload: Arc<T>,
+}
+
+#[cfg(unix)]
+impl<T: NvmeStaged> DeviceExpertSlot for NvmeSlot<T> {
+    fn device_bytes(&self) -> u64 {
+        self.payload.staged_bytes()
+    }
+}
+
+/// Tier-3 expert residency: a bounded **host-RAM staging slab** that pulls hot
+/// experts off the SSD into the process via `pread(2)`.
+///
+/// In the tiers-as-designed layout this is the explicit NVMe/SSD residency tier:
+/// where `CpuResidency` is an advisory `MADV_WILLNEED` over the page cache and
+/// [`DeviceResidency`] is a VRAM slot pool, `NvmeResidency` holds a *hard* byte
+/// budget of staged experts in host RAM, streamed in by the loader's `stage`
+/// closure (a `pread(2)` run over the expert's
+/// [`crate::mmap_tensor::MappedRange`]s through its own file descriptor,
+/// mirroring `LayerPrefetcher`'s readahead) instead of advising the page cache.
+///
+/// [`ExpertResidency::acquire`] is **non-blocking**: it only enqueues a stage
+/// request on a background stager thread ([`ExpertUploader`]) and returns, so a
+/// cold expert's SSD read never stalls the decode thread — a host miss runs the
+/// demand-faulted page-cache baseline while the slab warms it.  The pool is
+/// LRU-evictable with the routing-frequency hot set protected
+/// (`mark_hot`/`replace_hot_set`), `capacity()` = `budget_bytes /
+/// per_expert_bytes`, and an optional host-page release hook drops a staged
+/// expert's now-redundant page-cache pages once its stage settles (exclusive
+/// tiers: the slab and the page cache hold different experts).
+///
+/// Best-effort like every residency backend: a failed or refused stage degrades
+/// that expert to the host path (the caller's `lookup` returns `None`), never to
+/// a wrong result.
+#[cfg(unix)]
+pub struct NvmeResidency<T: NvmeStaged> {
+    pool: Arc<DeviceResidency<NvmeSlot<T>>>,
+    stager: Option<Arc<ExpertUploader<NvmeSlot<T>>>>,
+}
+
+#[cfg(unix)]
+impl<T: NvmeStaged> NvmeResidency<T> {
+    /// `capacity_bytes` is the host-RAM staging budget; `per_expert_bytes`
+    /// feeds [`NvmeResidency::capacity`] and the pre-stage reservation;
+    /// `stage(layer, expert)` returns that expert's staged host-RAM form (a
+    /// `pread(2)` stream of its mapped ranges through the model file's fd) or
+    /// `None` on failure.  Spawns the background stager thread.
+    pub fn new(
+        capacity_bytes: u64,
+        per_expert_bytes: u64,
+        stage: Arc<dyn Fn(u32, u32) -> Option<Arc<T>> + Send + Sync>,
+    ) -> Self {
+        Self::new_with_release(capacity_bytes, per_expert_bytes, stage, None, HOST_RELEASE_DELAY)
+    }
+
+    /// [`NvmeResidency::new`] with a **release hook**: `delay` after an expert's
+    /// stage settles the stager runs `release(layer, expert)`.  The staged
+    /// host-RAM copy makes the expert's page-cache pages redundant, so a loader
+    /// uses this to drop a staged expert's pages; the pool's generation guard
+    /// makes each deadline target the upload it was scheduled for (#114-style),
+    /// so an expert evicted and re-staged gets its own deadline.
+    pub fn new_with_release(
+        capacity_bytes: u64,
+        per_expert_bytes: u64,
+        stage: Arc<dyn Fn(u32, u32) -> Option<Arc<T>> + Send + Sync>,
+        release: Option<ReleaseHook>,
+        delay: std::time::Duration,
+    ) -> Self {
+        let upload: Arc<dyn Fn(u32, u32) -> Option<Arc<NvmeSlot<T>>> + Send + Sync> =
+            Arc::new(move |l, e| (stage)(l, e).map(|p| Arc::new(NvmeSlot { payload: p })));
+        let pool = Arc::new(DeviceResidency::new(capacity_bytes, per_expert_bytes, upload));
+        let stager =
+            Arc::new(ExpertUploader::spawn_with_release(Arc::clone(&pool), release, delay));
+        Self { pool, stager: Some(stager) }
+    }
+
+    /// The byte budget this slab was built with.
+    pub fn capacity_bytes(&self) -> u64 {
+        self.pool.capacity_bytes()
+    }
+
+    /// Ask for `(layer, expert)` to be staged in the background.  Returns
+    /// immediately: the stager thread runs the `pread(2)` stage and the call
+    /// never blocks the decode path.  A stage request for an expert that is
+    /// resident, in flight, or already queued is a no-op.
+    pub fn acquire(&self, layer: u32, expert: u32) {
+        if let Some(s) = &self.stager {
+            s.request(layer, expert);
+        }
+    }
+
+    /// Stage `(layer, expert)` *now*, blocking on the SSD read (the pool's
+    /// synchronous operation; dispatch backends that need the slot immediately,
+    /// and tests, use this instead of the background [`NvmeResidency::acquire`]).
+    pub fn stage(&self, layer: u32, expert: u32) {
+        self.pool.acquire(layer, expert);
+    }
+
+    /// A speculative `(layer, expert)` read-ahead: like
+    /// [`NvmeResidency::acquire`], a background, deduplicated, best-effort stage
+    /// request — the staged-slab counterpart of an `MADV_WILLNEED` hint.
+    pub fn prefetch_hint(&self, layer: u32, expert: u32) {
+        if let Some(s) = &self.stager {
+            s.request(layer, expert);
+        }
+    }
+
+    /// Release the staged form of `(layer, expert)` (free its slab bytes; the
+    /// host path — and its page cache — takes over).
+    pub fn release(&self, layer: u32, expert: u32) {
+        self.pool.release(layer, expert);
+    }
+
+    /// Tell the stager that the caller staged `(layer, expert)` itself (a
+    /// synchronous `stage`), so the release hook runs for it as it would for a
+    /// background stage.  A no-op when the expert is not resident or there is no
+    /// release hook.
+    pub fn note_resident(&self, layer: u32, expert: u32) {
+        if let Some(s) = &self.stager {
+            s.note_resident(layer, expert);
+        }
+    }
+
+    /// Block until every queued stage request is processed (tests, shutdown).
+    pub fn wait_idle(&self) {
+        if let Some(s) = &self.stager {
+            s.wait_idle();
+        }
+    }
+
+    /// The staged host-RAM form of `(layer, expert)`, or `None` (run the host
+    /// path).  A hit refreshes the slot's recency.
+    pub fn lookup(&self, layer: u32, expert: u32) -> Option<Arc<T>> {
+        self.pool.lookup(layer, expert).map(|s| s.payload.clone())
+    }
+
+    /// Whether `(layer, expert)` is staged, without touching recency.
+    pub fn contains(&self, layer: u32, expert: u32) -> bool {
+        self.pool.contains(layer, expert)
+    }
+
+    /// Whether `(layer, expert)` is in the protected hot set right now.
+    pub fn is_hot(&self, layer: u32, expert: u32) -> bool {
+        self.pool.is_hot(layer, expert)
+    }
+
+    /// Protect `(layer, expert)` from LRU eviction (it is in the hot set).
+    pub fn mark_hot(&self, layer: u32, expert: u32) {
+        self.pool.mark_hot(layer, expert);
+    }
+
+    /// Stop protecting `(layer, expert)` (it left the hot set).
+    pub fn unmark_hot(&self, layer: u32, expert: u32) {
+        self.pool.unmark_hot(layer, expert);
+    }
+
+    /// Replace the wholesale protected set; the pool caps it to a share of the
+    /// slab's slots so evictable slots always exist.
+    pub fn replace_hot_set(&self, hot: &[(u32, u32)]) {
+        self.pool.replace_hot_set(hot);
+    }
+
+    /// Number of experts staged right now.
+    pub fn resident(&self) -> usize {
+        self.pool.resident()
+    }
+
+    /// Current staged bytes (reservations of stages in flight included).
+    pub fn resident_bytes(&self) -> u64 {
+        self.pool.resident_bytes()
+    }
+
+    /// Hit/miss/stage/eviction counters (a [`DeviceResidencyStats`] snapshot).
+    pub fn stats(&self) -> DeviceResidencyStats {
+        self.pool.stats()
+    }
+
+    /// Stage requests the stager has accepted.
+    pub fn requested(&self) -> u64 {
+        if let Some(s) = &self.stager {
+            s.requested()
+        } else {
+            0
+        }
+    }
+
+    /// Stage requests dropped on a full queue.
+    pub fn dropped(&self) -> u64 {
+        if let Some(s) = &self.stager {
+            s.dropped()
+        } else {
+            0
+        }
+    }
+
+    /// Experts the release hook has run for (`0` without a hook).
+    pub fn released(&self) -> u64 {
+        if let Some(s) = &self.stager {
+            s.released()
+        } else {
+            0
+        }
+    }
+}
+
+#[cfg(unix)]
+impl<T: NvmeStaged> ExpertResidency for NvmeResidency<T> {
+    fn acquire(&self, layer: u32, expert: u32) {
+        NvmeResidency::acquire(self, layer, expert);
+    }
+    fn release(&self, layer: u32, expert: u32) {
+        NvmeResidency::release(self, layer, expert);
+    }
+    fn capacity(&self) -> usize {
+        self.pool.capacity()
+    }
+    fn mark_hot(&self, layer: u32, expert: u32) {
+        NvmeResidency::mark_hot(self, layer, expert);
+    }
+    fn unmark_hot(&self, layer: u32, expert: u32) {
+        NvmeResidency::unmark_hot(self, layer, expert);
+    }
+    fn replace_hot_set(&self, hot: &[(u32, u32)]) {
+        NvmeResidency::replace_hot_set(self, hot);
+    }
+    fn prefetch_hint(&self, layer: u32, expert: u32) {
+        NvmeResidency::prefetch_hint(self, layer, expert);
+    }
+}
+
+#[cfg(unix)]
+impl<T: NvmeStaged> Drop for NvmeResidency<T> {
+    fn drop(&mut self) {
+        // Close the stager's channel and join it (it drains queued stages),
+        // then release the pool.
+        drop(self.stager.take());
+        drop(self.pool.clone());
+    }
+}
+
 #[cfg(test)]
 mod device_pool_tests {
     use super::*;
@@ -1765,5 +2031,141 @@ mod device_pool_tests {
             big.contains(0, 1) && !big.contains(0, 0),
             "…and cycles it out for the next"
         );
+    }
+}
+
+/// The NVMe staging slab (Tier 3): byte-budget respect, LRU eviction,
+/// hot-set-never-evicts, and a zero budget being a no-op.  These mirror the
+/// `DeviceResidency` pool acceptance tests; the pool's own tests in
+/// `device_pool_tests` cover the shared LRU/lease/reclaim machinery.
+#[cfg(all(test, unix))]
+mod nvme_residency_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    /// A fake staged payload — the loader's `pread(2)`-streamed host-RAM form,
+    /// `CountingPrefetch`-style so a stage is observable without real I/O.
+    struct FakeStaged(u64);
+    impl NvmeStaged for FakeStaged {
+        fn staged_bytes(&self) -> u64 {
+            self.0
+        }
+    }
+
+    /// A staging slab whose `stage` closure returns a `bytes`-sized payload for
+    /// any `(layer, expert)` with `layer, expert < n` (others fail → no-op).
+    fn slab(cap: u64, per: u64, n: usize, bytes: u64) -> NvmeResidency<FakeStaged> {
+        let stage: Arc<dyn Fn(u32, u32) -> Option<Arc<FakeStaged>> + Send + Sync> =
+            Arc::new(move |l, e| {
+                ((l as usize) < n && (e as usize) < n)
+                    .then(|| Arc::new(FakeStaged(bytes)))
+            });
+        NvmeResidency::new(cap, per, stage)
+    }
+
+    /// Acquires through the background stager (`acquire` must never block), then
+    /// waits for them to settle before asserting on `lookup`/`resident`.
+    fn drain(r: &NvmeResidency<FakeStaged>) {
+        r.wait_idle();
+    }
+
+    /// `capacity()` = `budget_bytes / per_expert_bytes`; LRU eviction keeps the
+    /// resident byte count within the budget.
+    #[test]
+    fn nvme_slab_respects_byte_budget_and_lru() {
+        let r = slab(90, 30, 8, 30); // 3 slots
+        assert_eq!(r.capacity(), 3);
+        r.acquire(0, 0);
+        r.acquire(0, 1);
+        r.acquire(0, 2);
+        drain(&r);
+        assert_eq!(r.resident(), 3);
+        assert_eq!(r.resident_bytes(), 90);
+        // A fourth stage evicts the LRU (0,0).
+        r.acquire(0, 3);
+        drain(&r);
+        assert_eq!(r.resident(), 3);
+        assert_eq!(r.resident_bytes(), 90);
+        assert!(r.lookup(0, 0).is_none(), "LRU victim evicted");
+        assert!(r.lookup(0, 3).is_some(), "new expert staged");
+        // release frees a slot
+        r.release(0, 3);
+        assert!(r.lookup(0, 3).is_none());
+        assert_eq!(r.resident(), 2);
+        drop(r);
+    }
+
+    /// The routing-frequency hot set is protected from LRU eviction, and
+    /// replacing it frees the members that dropped out.
+    #[test]
+    fn nvme_slab_never_evicts_hot_experts() {
+        let r = slab(90, 30, 8, 30);
+        r.acquire(0, 0);
+        r.acquire(0, 1);
+        r.acquire(0, 2);
+        drain(&r);
+        r.mark_hot(0, 0);
+        r.mark_hot(0, 1);
+        r.acquire(0, 3); // evicts (0,2)
+        r.acquire(0, 4);
+        drain(&r);
+        // `contains`/`is_hot` inspect without refreshing recency, so the LRU
+        // order below stays deterministic.
+        assert!(r.contains(0, 0) && r.contains(0, 1), "hot expert never evicted");
+        assert!(r.resident() <= 3, "byte budget never exceeded");
+        assert!(r.is_hot(0, 0) && r.is_hot(0, 1));
+
+        // (0,0) was the oldest (initial) member: once it is dropped from the
+        // protected set it is the LRU non-hot slot, so the next churn evicts it
+        // while the still-hot (0,1) survives.
+        r.replace_hot_set(&[(0, 1)]);
+        assert_eq!(r.is_hot(0, 0), false, "(0,0) dropped from the hot set");
+        r.acquire(0, 5);
+        drain(&r);
+        assert!(!r.contains(0, 0), "dropped from the hot set: evictable");
+        assert!(r.contains(0, 1), "still-hot expert never evicted");
+        assert!(r.contains(0, 5), "new expert staged");
+        assert!(r.resident() <= 3, "byte budget never exceeded");
+        drop(r);
+    }
+
+    /// A zero byte budget is a no-op: nothing is ever staged.
+    #[test]
+    fn nvme_slab_zero_budget_is_a_noop() {
+        let r = slab(0, 30, 8, 30);
+        assert_eq!(r.capacity(), 0);
+        r.acquire(0, 0);
+        r.acquire(0, 1);
+        drain(&r);
+        assert_eq!(r.resident(), 0);
+        assert_eq!(r.resident_bytes(), 0);
+        assert!(r.lookup(0, 0).is_none());
+        drop(r);
+    }
+
+    /// A failed stage (out of range) degrades to `None` and never exceeds the
+    /// budget or panics: best-effort like every residency backend.
+    #[test]
+    fn nvme_slab_stage_failure_is_best_effort() {
+        let r = slab(30, 30, 2, 30);
+        r.acquire(9, 9); // out of range -> stage None
+        drain(&r);
+        assert!(r.lookup(9, 9).is_none());
+        assert_eq!(r.resident(), 0);
+        assert_eq!(r.resident_bytes(), 0);
+        assert_eq!(r.stats().upload_failures, 1);
+        drop(r);
+    }
+
+    /// `prefetch_hint` is a non-blocking speculative stage: it requests in the
+    /// background and completes like an `acquire`, never blocking its caller.
+    #[test]
+    fn nvme_slab_prefetch_hint_stages_in_the_background() {
+        let r = slab(30, 30, 4, 30);
+        r.prefetch_hint(0, 1);
+        drain(&r);
+        assert!(r.lookup(0, 1).is_some(), "prefetch hint staged the expert");
+        drop(r);
     }
 }

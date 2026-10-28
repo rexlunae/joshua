@@ -420,6 +420,30 @@ pub enum VramExpertCache {
     Bytes(u64),
 }
 
+/// The `--ssd-expert-cache` NVMe/SSD staging-slab setting (Tier 3).
+///
+/// Mirrors [`VramExpertCache`]: `auto` (size the host-RAM staging slab from the
+/// machine's available RAM at load), a fixed byte budget, and `0` (disabled);
+/// no flag is its own state.  Where `--vram-expert-cache` sizes a VRAM slot
+/// pool on the accelerator, this sizes the bounded host-RAM staging slab that
+/// `pread(2)`-streams hot experts off the SSD (see
+/// [`crate::residency::NvmeResidency`]).  Unset and `0` stay distinct: `0` is
+/// the explicit opt-out, unset leaves the decision to the engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SsdExpertCache {
+    /// No `--ssd-expert-cache` flag: the engine decides whether a host-RAM
+    /// staging slab is worth it.
+    #[default]
+    Unset,
+    /// `--ssd-expert-cache 0`: never build the staging slab.
+    Disabled,
+    /// `--ssd-expert-cache auto`: size the slab from the host's available RAM
+    /// at load.
+    Auto,
+    /// `--ssd-expert-cache <MiB>`: a fixed host-RAM staging budget.
+    Bytes(u64),
+}
+
 /// Smallest partial cache `--expert-placement auto` engages by default
 /// (#110, softened by #114): the byte budget must hold at least this share
 /// (numerator, denominator) of the routed-expert device footprint.
