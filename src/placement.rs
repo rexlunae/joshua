@@ -853,6 +853,25 @@ pub fn dense_set_fits(dense_device_bytes: u64, headroom_bytes: u64, budget_bytes
         .is_some_and(|need| need <= budget_bytes)
 }
 
+/// Weight bytes the target model keeps on the accelerator a draft model would
+/// share: its dense set, the whole routed-expert pool when the loader uploads
+/// it there (`pool_on_device`), and a VRAM expert cache's budget when that
+/// cache lives on the card (`cache_on_device`).  The two are additive: the
+/// Qwen and `deepseek2` loaders build their cache on the expert device next
+/// to an uploaded pool, while `deepseek4` never uploads its pool and runs only
+/// the cache there.  The draft's fit check adds its own weights to this.
+pub fn target_device_weight_bytes(
+    dense_bytes: u64,
+    expert_bytes: u64,
+    pool_on_device: bool,
+    cache_on_device: Option<u64>,
+) -> u64 {
+    let pool = if pool_on_device { expert_bytes } else { 0 };
+    dense_bytes
+        .saturating_add(pool)
+        .saturating_add(cache_on_device.unwrap_or(0))
+}
+
 /// How many full copies of `instance_bytes` fit in `free_bytes` once
 /// `headroom_bytes` is set aside — the number of model sessions an
 /// accelerator can hold when each session carries its own weight copy.
@@ -916,6 +935,24 @@ fn cuda_memory_info(dev: &candle_core::CudaDevice) -> Option<(u64, u64)> {
 
 #[cfg(test)]
 mod tests {
+    use super::target_device_weight_bytes;
+
+    #[test]
+    fn target_device_weights_count_device_experts() {
+        const G: u64 = 1 << 30;
+        // Experts and any cache on the host: only the dense set is on the card.
+        assert_eq!(target_device_weight_bytes(2 * G, 8 * G, false, None), 2 * G);
+        // Experts on the card: the whole pool counts (Devin's 12 GiB case
+        // needs 2 + 8 + draft + headroom, not 2 + draft + headroom).
+        assert_eq!(target_device_weight_bytes(2 * G, 8 * G, true, None), 10 * G);
+        // A Qwen / deepseek2 cache sits next to the uploaded pool, not in
+        // place of it.
+        assert_eq!(target_device_weight_bytes(2 * G, 8 * G, true, Some(G)), 11 * G);
+        // deepseek4: the pool stays on the host, only the cache is on the card.
+        assert_eq!(target_device_weight_bytes(2 * G, 8 * G, false, Some(3 * G)), 5 * G);
+        assert_eq!(target_device_weight_bytes(u64::MAX, 1, true, Some(1)), u64::MAX);
+    }
+
     use super::*;
 
     #[cfg(target_os = "linux")]
