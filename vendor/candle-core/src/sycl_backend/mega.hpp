@@ -90,6 +90,11 @@ struct Model {
     // critical path.
     int rpt[S_LAYER];
     int head_rpt;
+    // Profiling only (JOSHUA_MEGAKERNEL_SKIP): bit k set skips the work of
+    // every stage of kind k (the S_* stages, then 8 = final norm, 9 = head)
+    // but keeps its synchronization, so the step time without a stage kind
+    // shows what that kind costs.  The logits are garbage when nonzero.
+    int skip;
 };
 
 struct Scratch {
@@ -302,6 +307,13 @@ inline void run(const Ctx& c, const Model& m, const Scratch& s, const Kv* kv,
             need = 1;
         }
         if (stage > 0) c.wait_for(done(stage - 1), (uint)need);
+        if (m.skip) {
+            int kind = layer < m.n_layers ? stage - layer * S_LAYER : stage == m.n_layers * S_LAYER ? 8 : 9;
+            if ((m.skip >> kind) & 1) {
+                c.signal(done(stage));
+                continue;
+            }
+        }
 
         if (layer == m.n_layers) {
             if (stage == m.n_layers * S_LAYER) {

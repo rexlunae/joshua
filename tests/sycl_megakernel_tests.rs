@@ -219,3 +219,64 @@ fn write_quantized_qwen3(path: &Path) {
     let mut file = std::fs::File::create(path).unwrap();
     gguf_file::write(&mut file, &md, &ts).unwrap();
 }
+
+/// Where a fused decode step's time goes, on a real model:
+///   JOSHUA_MEGAKERNEL_GGUF=/models/qwen3.gguf \
+///     cargo test --release --features sycl --test sycl_megakernel_tests \
+///     -- --ignored --nocapture sycl_megakernel_profile
+/// Prints ms per step op-at-a-time, fused, fused with each stage kind's work
+/// skipped (`JOSHUA_MEGAKERNEL_SKIP`; the difference is that kind's cost),
+/// and fused with every stage skipped (synchronization alone).
+#[test]
+#[ignore]
+fn sycl_megakernel_profile() {
+    let Ok(path) = std::env::var("JOSHUA_MEGAKERNEL_GGUF") else {
+        eprintln!("SKIP: set JOSHUA_MEGAKERNEL_GGUF");
+        return;
+    };
+    let path = Path::new(&path);
+    let device = Device::new_sycl(0).expect("SYCL device");
+    let steps: usize = std::env::var("JOSHUA_MEGAKERNEL_PROFILE_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(64);
+    let prompt: Vec<u32> = (1..=32).collect();
+
+    // Average ms per decode step from position prompt.len(), after a warm-up.
+    let time = |model: &mut joshua::model::QuantizedModel| -> f64 {
+        assert!(model.truncate_kv_cache(prompt.len()).unwrap());
+        let mut pos = prompt.len();
+        for _ in 0..4 {
+            step(model, &device, &[7], pos);
+            pos += 1;
+        }
+        assert!(model.truncate_kv_cache(prompt.len()).unwrap());
+        pos = prompt.len();
+        let t = std::time::Instant::now();
+        for _ in 0..steps {
+            step(model, &device, &[7], pos);
+            pos += 1;
+        }
+        t.elapsed().as_secs_f64() * 1e3 / steps as f64
+    };
+
+    let mut reference = load(path, &device, false);
+    step(&mut reference, &device, &prompt, 0);
+    let base = time(&mut reference);
+    drop(reference);
+    eprintln!("op-at-a-time          {base:8.2} ms/step");
+
+    let mut fused = load(path, &device, true);
+    step(&mut fused, &device, &prompt, 0);
+    let before = joshua::megakernel::fused_steps();
+    let full = time(&mut fused);
+    assert!(joshua::megakernel::fused_steps() > before, "the megakernel did not run");
+    eprintln!("fused                 {full:8.2} ms/step");
+    let kinds = ["norm1", "qkv", "q/k prep", "attention", "out proj", "norm2", "gate/up", "down", "final norm", "head"];
+    for (k, name) in kinds.iter().enumerate() {
+        std::env::set_var("JOSHUA_MEGAKERNEL_SKIP", (1u32 << k).to_string());
+        let t = time(&mut fused);
+        eprintln!("fused without {name:<10} {t:8.2} ms/step   ({:+.2} ms)", full - t);
+    }
+    std::env::set_var("JOSHUA_MEGAKERNEL_SKIP", ((1u32 << kinds.len()) - 1).to_string());
+    let sync = time(&mut fused);
+    std::env::remove_var("JOSHUA_MEGAKERNEL_SKIP");
+    eprintln!("fused, every stage skipped {sync:8.2} ms/step (synchronization, launch, host)");
+}

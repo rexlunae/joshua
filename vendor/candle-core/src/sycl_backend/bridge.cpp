@@ -3,6 +3,7 @@
 // incompatible change to argument layouts or kernel dispatch.
 #include "kernels.hpp"
 #include "mega.hpp"
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -477,6 +478,8 @@ API int joshua_sycl_mega_decode(uintptr_t h, uintptr_t p, const MegaKvDesc* kv, 
         float* out = const_cast<float*>(mega_vec(ctx, logits, m.vocab, false, "logits"));
         ctx.queue.memset(plan.scratch.sync, 0, plan.sync_bytes);
         auto model = m;
+        // Profiling: skip stage kinds (see mega::Model::skip).
+        if (const char* v = std::getenv("JOSHUA_MEGAKERNEL_SKIP")) model.skip = (int)std::strtol(v, nullptr, 0);
         auto scratch = plan.scratch;
         auto* kv_dev = plan.kv_dev;
         size_t groups = plan.groups;
