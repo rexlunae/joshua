@@ -41,6 +41,7 @@ fn load(
         None,
         0,
         cache_bytes,
+        joshua::EngramTier::Auto,
     )
     .unwrap()
 }

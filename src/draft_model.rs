@@ -107,6 +107,7 @@ impl DraftModel {
             None,
             n_ctx,
             None,
+            crate::placement::EngramTier::Auto,
         )
         .map_err(|e| JoshuaError::ModelLoad(format!("draft model init failed: {e}")))?;
         if !template.supports_shared_weights() || !template.supports_kv_truncate() {

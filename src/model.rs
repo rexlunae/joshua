@@ -596,7 +596,17 @@ impl QuantizedModel {
         // engine will actually serve instead of the model's context length.
         n_ctx: usize,
     ) -> Result<Self> {
-        Self::from_gguf_mmap_placed(gguf, reader, device, device, mmap, file, n_ctx, None)
+        Self::from_gguf_mmap_placed(
+            gguf,
+            reader,
+            device,
+            device,
+            mmap,
+            file,
+            n_ctx,
+            None,
+            crate::placement::EngramTier::Auto,
+        )
     }
 
     /// [`QuantizedModel::from_gguf_mmap`] with an explicit device for the
@@ -623,6 +633,10 @@ impl QuantizedModel {
         file: Option<std::sync::Arc<std::fs::File>>,
         n_ctx: usize,
         device_expert_cache_bytes: Option<u64>,
+        // Where a DeepSeek-V4.1 model's Engram n-gram tables are resident (a
+        // separate policy from the routed experts).  Ignored by every other
+        // architecture.
+        engram_tier: crate::placement::EngramTier,
     ) -> Result<Self> {
         let arch = Architecture::detect(&gguf.metadata).map_err(candle_core::Error::Msg)?;
 
@@ -753,6 +767,7 @@ impl QuantizedModel {
                     file,
                     n_ctx,
                     device_expert_cache_bytes,
+                    engram_tier,
                 )
                 .map(Self::DeepSeek4)
             }
@@ -813,6 +828,15 @@ impl QuantizedModel {
     pub fn device_expert_cache(&self) -> Option<crate::residency::DeviceCacheReport> {
         match self {
             Self::DeepSeek4(m) => m.device_expert_cache(),
+            _ => None,
+        }
+    }
+
+    /// Engram table residency, reported separately from the routed-expert
+    /// cache (`deepseek4`); `None` for models without engram tables.
+    pub fn engram_residency(&self) -> Option<crate::quantized_deepseek4::EngramResidencyReport> {
+        match self {
+            Self::DeepSeek4(m) => m.engram_residency(),
             _ => None,
         }
     }

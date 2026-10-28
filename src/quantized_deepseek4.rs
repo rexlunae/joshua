@@ -1093,6 +1093,12 @@ struct Engram {
     q: Tensor,     // [hc, d] query norm weight
     k: Tensor,     // [hc, d] key norm weight
     eps: f64,
+    /// The byte range of this layer's table inside the model mapping, when
+    /// the table is mmap-borrowed.  Promoting the Engram working subset into
+    /// RAM (`PromoteToRam`) issues a prefetch over it at load; `Disk` leaves
+    /// it to demand-fault lazily.  Always `None` on the slot-free resolve
+    /// path of a streamed (non-mmap) load.
+    prefetch: Option<Arc<dyn crate::mmap_tensor::MmapPrefetch>>,
 }
 
 impl Engram {
@@ -1114,6 +1120,46 @@ impl Engram {
         )?; // [b, s, hc]
         xs + value.broadcast_mul(&gate.unsqueeze(D::Minus1)?)?
     }
+
+    /// Promote this engram layer's mapped table bytes into RAM (best-effort
+    /// `MADV_WILLNEED`).  A no-op for a streamed (non-mmap) load or a
+    /// `Disk`-resolved layer that carries no prefetch handle.
+    fn promote_to_ram(&self) {
+        if let Some(p) = &self.prefetch {
+            p.prefetch();
+        }
+    }
+
+    /// Bytes of this layer's mapped table, from its prefetch handle's mapped
+    /// range (0 for a non-mmap / unborrowable load).  Used by the separate
+    /// engram residency report.
+    fn mapped_bytes(&self) -> u64 {
+        self.prefetch
+            .as_ref()
+            .and_then(|p| p.mapped_range())
+            .map_or(0, |r| r.len as u64)
+    }
+}
+
+/// Engram residency, reported **separately** from the routed-expert cache.
+///
+/// The engram tables are latency-tolerant hash gathers an independent
+/// placement policy runs, so their residency is never folded into the
+/// expert-cache residency numbers.  They are always resolved straight from the
+/// mmap mapping (no Tier-1 VRAM slot, no Tier-2 host-slot budget); `tier`
+/// records whether a working subset was promoted to RAM (`PromoteToRam`) or
+/// pinned to storage (`ResolveFromMmap`, the default).
+#[derive(Debug, Clone)]
+pub struct EngramResidencyReport {
+    /// The resolved residency for this model (see
+    /// [`crate::placement::EngramResidency`]).
+    pub tier: crate::placement::EngramResidency,
+    /// Number of engram layers (each with its own mapped table).
+    pub layers: usize,
+    /// Total mapped bytes of every engram table (0 when not mmap-backed).
+    pub bytes_total: u64,
+    /// Memory resident now, when the kernel reports it (`None` off Linux).
+    pub resident_bytes: Option<u64>,
 }
 
 // ─── Quantized-rotation helpers ─────────────────────────────────────────────
@@ -2945,6 +2991,9 @@ struct Shared {
     /// pool's uploader when one exists.  Built once at load from the
     /// per-expert handles.
     residency: std::sync::Arc<dyn crate::residency::ExpertResidency>,
+    /// The resolved Engram residency (a separate policy from the routed
+    /// experts), for the separate engram residency metric/event.
+    engram_residency: crate::placement::EngramResidency,
     /// The device expert pool (see [`ModelWeights::from_gguf_mmap_placed`]),
     /// kept for diagnostics; the MoE blocks hold their own handles.
     device_pool: Option<Arc<Ds4DevicePool>>,
@@ -3074,6 +3123,32 @@ impl<R: Read + Seek> Reader<R> {
         let qt = self.qtensor(name);
         self.device = model_device;
         qt
+    }
+
+    /// A byte-range prefetch (`MADV_WILLNEED`) handle over `name`'s mapped
+    /// data, used to promote the Engram n-gram table into RAM at load when
+    /// the placement policy asks for it.  `None` when the weights are not
+    /// mmap-backed (a streamed CPU load has no mapping to prefetch) or the
+    /// range cannot be borrowed.
+    fn engram_prefetch_handle(
+        &self,
+        name: &str,
+        dtype: candle_core::quantized::GgmlDType,
+    ) -> Option<Arc<dyn crate::mmap_tensor::MmapPrefetch>> {
+        let mmap = self.mmap.as_ref()?;
+        let raw = self.raw.as_ref()?;
+        let info = raw.tensors.get(name)?;
+        let byte_offset = raw.tensor_data_offset.saturating_add(info.offset) as usize;
+        let (block_size, type_size) = (dtype.block_size(), dtype.type_size());
+        let n_blocks = if block_size > 0 {
+            info.elem_count() / block_size
+        } else {
+            0
+        };
+        if n_blocks == 0 || type_size == 0 {
+            return None;
+        }
+        crate::mmap_tensor::prefetch_handle(mmap, dtype, byte_offset, n_blocks)
     }
 
     fn qtensor(&mut self, name: &str) -> Result<QTensor> {
@@ -3245,7 +3320,18 @@ impl ModelWeights {
         file: Option<std::sync::Arc<std::fs::File>>,
         n_ctx: usize,
     ) -> Result<Self> {
-        Self::from_gguf_mmap_placed(ct, raw, reader, device, device, mmap, file, n_ctx, None)
+        Self::from_gguf_mmap_placed(
+            ct,
+            raw,
+            reader,
+            device,
+            device,
+            mmap,
+            file,
+            n_ctx,
+            None,
+            crate::placement::EngramTier::Auto,
+        )
     }
 
     /// [`ModelWeights::from_gguf_mmap`] with an explicit expert placement and
@@ -3285,6 +3371,9 @@ impl ModelWeights {
         file: Option<std::sync::Arc<std::fs::File>>,
         n_ctx: usize,
         device_expert_cache_bytes: Option<u64>,
+        // Where the Engram n-gram tables are resident (a separate policy from
+        // the routed experts).  See [`crate::placement::EngramTier`].
+        engram_tier: crate::placement::EngramTier,
     ) -> Result<Self> {
         Self::load_gguf(
             ct,
@@ -3296,6 +3385,7 @@ impl ModelWeights {
             file,
             n_ctx,
             device_expert_cache_bytes,
+            engram_tier,
             #[cfg(feature = "distributed")]
             None,
         )
@@ -3320,6 +3410,7 @@ impl ModelWeights {
             None,
             n_ctx,
             None,
+            crate::placement::EngramTier::Auto,
             Some(cluster),
         )
     }
@@ -3335,6 +3426,7 @@ impl ModelWeights {
         file: Option<Arc<std::fs::File>>,
         n_ctx: usize,
         device_expert_cache_bytes: Option<u64>,
+        engram_tier: crate::placement::EngramTier,
         #[cfg(feature = "distributed")] cluster: Option<
             Arc<crate::distributed::session::ClusterSession>,
         >,
@@ -3471,6 +3563,17 @@ impl ModelWeights {
         // `llama_model_deepseek41::load_arch_tensors`).
         let roles = layer_roles(&cfg, &|n: &str| rd.has(n))?;
 
+        // Engram placement: a separate policy from the routed experts.  The
+        // engram tables are always resolved straight from the mapping (never a
+        // Tier-1 VRAM or Tier-2 host-slot budget); a resolved `PromoteToRam`
+        // additionally prefetches the mapped table range into RAM at load, and
+        // `ResolveFromMmap` pins the tables to disk (pages fault lazily).
+        let engram_residency = crate::placement::resolve_engram_residency(
+            engram_tier,
+            crate::placement::available_ram_bytes(),
+        );
+        let promote_engram = engram_residency == crate::placement::EngramResidency::PromoteToRam;
+
         let mut layers = Vec::with_capacity(cfg.n_layer);
         for (i, role) in roles.iter().enumerate() {
             let p = format!("blk.{i}");
@@ -3563,20 +3666,35 @@ impl ModelWeights {
             let engram = match cfg.engram.as_ref().and_then(|e| e.layer_ids.iter().position(|&l| l == i)) {
                 Some(index) => {
                     let hc = cfg.hc_mult;
-                    let table = rd.qtensor_on(&format!("{p}.engram_embd.weight"), &Device::Cpu)?;
-                    let table = crate::token_embedding::TokenEmbedding::load(table, &Device::Cpu)?;
+                    let name = format!("{p}.engram_embd.weight");
+                    let table_qt = rd.qtensor_on(&name, &Device::Cpu)?;
+                    let engram_dtype = table_qt.dtype();
+                    // The mmap byte-range of this layer's table, for optional
+                    // RAM promotion at load and reported disk residency.  `None`
+                    // on a streamed (non-mmap) load.
+                    let prefetch = rd.engram_prefetch_handle(&name, engram_dtype);
+                    let table =
+                        crate::token_embedding::TokenEmbedding::from_arc(Arc::new(table_qt), &Device::Cpu)?;
                     let key_len = cfg.engram.as_ref().map_or(0, |e| e.key_len);
                     if table.hidden()? != key_len {
                         candle_core::bail!("deepseek41: {p}.engram_embd rows are not {key_len} wide");
                     }
-                    Some(Engram {
+                    let engram = Engram {
                         index,
                         table,
                         wkv: rd.qmatmul(&format!("{p}.engram_wkv.weight"))?,
                         q: rd.f32_tensor(&format!("{p}.engram_q.weight"))?.reshape((hc, ()))?,
                         k: rd.f32_tensor(&format!("{p}.engram_k.weight"))?.reshape((hc, ()))?,
                         eps: cfg.rms_eps,
-                    })
+                        prefetch,
+                    };
+                    // `ram` tier / ample-RAM `auto`: promote this layer's
+                    // working subset into RAM.  `disk`/default leaves the
+                    // table pinned to storage (lazy demand faults).
+                    if promote_engram {
+                        engram.promote_to_ram();
+                    }
+                    Some(engram)
                 }
                 None => None,
             };
@@ -3674,6 +3792,7 @@ impl ModelWeights {
             file,
             layer_expert_ranges,
             residency,
+            engram_residency,
             device_pool,
         });
         let prefill_timing = Arc::new(PhaseTiming::default());
@@ -3770,6 +3889,50 @@ impl ModelWeights {
             .device_pool
             .as_ref()
             .map(|p| crate::residency::DeviceCacheReport::of(&p.pool, Some(&p.uploader)))
+    }
+
+    /// Engram table residency, reported as a metric line **separate from** the
+    /// routed-expert cache.  `None` for a model with no engram layers.
+    pub fn engram_residency(&self) -> Option<EngramResidencyReport> {
+        let layers = self
+            .shared
+            .layers
+            .iter()
+            .filter(|l| l.engram.is_some())
+            .count();
+        if layers == 0 {
+            return None;
+        }
+        let mut bytes_total = 0u64;
+        for layer in &self.shared.layers {
+            if let Some(eg) = &layer.engram {
+                bytes_total = bytes_total.saturating_add(eg.mapped_bytes());
+            }
+        }
+        // Resident bytes of the (representative) first engram table's mapped
+        // range, estimated from the kernel's `mincore` page counts when it
+        // reports them (propagating the measured resident fraction across the
+        // mapped bytes).  All layers share one placement decision, so a single
+        // range stands in for the model's engram residency.
+        let resident_bytes = self
+            .shared
+            .layers
+            .iter()
+            .find_map(|l| l.engram.as_ref())
+            .and_then(|eg| eg.prefetch.as_ref())
+            .and_then(|p| p.mapped_range())
+            .and_then(|r| r.resident_pages())
+            .and_then(|(resident, total)| (total > 0).then(|| {
+                // bytes_total * resident / total, without overflow on the
+                // in-between multiply.
+                ((bytes_total as u128) * (resident as u128) / (total as u128)) as u64
+            }));
+        Some(EngramResidencyReport {
+            tier: self.shared.engram_residency,
+            layers,
+            bytes_total,
+            resident_bytes,
+        })
     }
 
     /// The decode-step time split of the device expert pool (launch / host

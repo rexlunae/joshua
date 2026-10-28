@@ -61,6 +61,7 @@ fn load_placed(model: &Path, expert_device: &Device) -> QuantizedModel {
         None,
         0,
         None,
+        joshua::EngramTier::Auto,
     )
     .unwrap()
 }
@@ -81,6 +82,7 @@ fn load_placed_with_cache(model: &Path, cache_bytes: u64) -> QuantizedModel {
         None,
         0,
         Some(cache_bytes),
+        joshua::EngramTier::Auto,
     )
     .unwrap()
 }
