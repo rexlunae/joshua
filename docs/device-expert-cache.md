@@ -3,19 +3,22 @@
 **Status:** draft (not implemented). Builds on `--pin-hot-experts` / `HotExpertCache`
 (merged in #48).
 
-**Status:** design + phased implementation.  Phase 1 (residency seam) and
-phase 5 core (placement math) are merged; the CUDA/ROCm-dependent phases are
-tracked future work in [issue #52](https://github.com/rexlunae/joshua/issues/52).
+**Status:** design + phased implementation.  Phases 1, 2, 3, 5-core and 6 are merged
+(CUDA + Vulkan IQ2_XXS; see the table below); the device-validation and remaining runtime
+items are tracked in [issue #52](https://github.com/rexlunae/joshua/issues/52).  The
+CPU-testable Tier-3 (SSD/Engram) additions live in
+[`docs/multilevel-weight-cache.md`](multilevel-weight-cache.md) §H.
 
 | Phase | What | Status |
 |---|---|---|
 | 1 | `ExpertResidency` seam + `CpuResidency` (dedupe `MlpPrefetch`) | ✅ merged (#49) |
 | 5 core | placement math (`--expert-cache auto`) + `adaptive_budget` | ✅ merged (#50) |
-| 2 | CUDA/ROCm residency: VRAM slot pool + async copy + event sync | ⏳ future — needs a GPU to build/test |
-| 3 | device-backed expert `QStorage` + matmul dispatch | ⏳ future |
-| 4 | layer offload (dense models) + KV placement | ⏳ future |
-| 5 runtime | adaptive loop feeding measured hit-ratio/bus bytes into `adaptive_budget` | ⏳ future (with the device backend) |
-| 6 | MXFP4 deepseek4 GPU kernels (V4-Flash on GPU) | ⏳ future (long pole) |
+| 2 | VRAM slot pool + async copy + event sync | ✅ merged — `residency::DeviceResidency` + `ExpertUploader`, CUDA; `--vram-expert-cache auto`; see `docs/multilevel-weight-cache.md` §H |
+| 3 | device-backed expert storage + matmul dispatch | ✅ CUDA/Vulkan IQ2_XXS experts (`cf0c938`, `0e953af`); `Ds4DeviceExpert` |
+| 4 | layer offload (dense models) + KV placement | ⚠️ partial — `--expert-placement host` keeps experts CPU-side; no explicit KV-tier placement |
+| 5 runtime | adaptive loop feeding measured hit-ratio/bus bytes into `adaptive_budget` | ⚠️ partial — budget sizing is static/`auto`, not a live feedback loop |
+| 6 | IQ2_XXS / MXFP4 deepseek4 GPU kernels (V4-Flash on GPU) | ✅ merged (`cf0c938` CUDA, `0e953af` Vulkan) |
+| 7 | explicit SSD (NVMe/SATA) residency tier + Engram-aware tier | ✅ `NvmeResidency` (`--ssd-expert-cache`), `--engram-tier` — see `docs/multilevel-weight-cache.md` §H |
 
 **#114 (partial-cache usability on small cards).** The OpenCL/SYCL slot pool
 is live, and the measured small-card thrash was fixed at its roots, not by
