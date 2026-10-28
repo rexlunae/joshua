@@ -1163,18 +1163,6 @@ async fn list_models(State(state): State<AppState>) -> Json<ModelListResponse> {
             owned_by: "joshua".to_string(),
         });
     }
-    // Unloaded models in the model directory are listed too, so a
-    // serving-directory deployment advertises everything it can load.
-    for m in crate::ollama::AvailableModel::discover(&state) {
-        if !m.loaded && !data.iter().any(|d| d.id == m.id) {
-            data.push(ModelInfo {
-                id: m.id,
-                object: "model".to_string(),
-                created,
-                owned_by: "joshua".to_string(),
-            });
-        }
-    }
     Json(ModelListResponse {
         object: "list".to_string(),
         data,
