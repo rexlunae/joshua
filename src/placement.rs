@@ -742,6 +742,25 @@ pub fn dense_set_fits(dense_device_bytes: u64, headroom_bytes: u64, budget_bytes
         .is_some_and(|need| need <= budget_bytes)
 }
 
+/// Weight bytes the target model keeps on the accelerator a draft model would
+/// share: its dense set, plus the routed experts wherever they live on the
+/// card — a bounded VRAM expert cache (`device_expert_cache`) when one is
+/// engaged, otherwise the whole pool when the experts are placed on the
+/// device.  The draft's fit check adds its own weights to this.
+pub fn target_device_weight_bytes(
+    dense_bytes: u64,
+    expert_bytes: u64,
+    experts_on_device: bool,
+    device_expert_cache: Option<u64>,
+) -> u64 {
+    let experts = match device_expert_cache {
+        Some(cache) => cache,
+        None if experts_on_device => expert_bytes,
+        None => 0,
+    };
+    dense_bytes.saturating_add(experts)
+}
+
 /// How many full copies of `instance_bytes` fit in `free_bytes` once
 /// `headroom_bytes` is set aside — the number of model sessions an
 /// accelerator can hold when each session carries its own weight copy.
@@ -805,6 +824,22 @@ fn cuda_memory_info(dev: &candle_core::CudaDevice) -> Option<(u64, u64)> {
 
 #[cfg(test)]
 mod tests {
+    use super::target_device_weight_bytes;
+
+    #[test]
+    fn target_device_weights_count_device_experts() {
+        const G: u64 = 1 << 30;
+        // Experts on the host: only the dense set is on the card.
+        assert_eq!(target_device_weight_bytes(2 * G, 8 * G, false, None), 2 * G);
+        // Experts on the card: the whole pool counts (Devin's 12 GiB case
+        // needs 2 + 8 + draft + headroom, not 2 + draft + headroom).
+        assert_eq!(target_device_weight_bytes(2 * G, 8 * G, true, None), 10 * G);
+        // A VRAM expert cache counts its budget, wherever the pool lives.
+        assert_eq!(target_device_weight_bytes(2 * G, 8 * G, false, Some(3 * G)), 5 * G);
+        assert_eq!(target_device_weight_bytes(2 * G, 8 * G, true, Some(3 * G)), 5 * G);
+        assert_eq!(target_device_weight_bytes(u64::MAX, 1, true, None), u64::MAX);
+    }
+
     use super::*;
 
     #[cfg(target_os = "linux")]
