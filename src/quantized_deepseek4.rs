@@ -540,6 +540,31 @@ struct HostExpert {
     bytes: u64,
 }
 
+/// One routed expert staged in the Tier-3 NVMe slab: the expert's block bytes
+/// copied out of the model file by `pread(2)` into heap buffers the process
+/// owns, rebuilt as the same three borrowed-format tensors as its host
+/// [`Mlp`].
+///
+/// This is the host form, not a device form: the payload is a from-storage
+/// *copy* handed to candle's CPU quantized kernels, so a dispatch that prefers
+/// it computes exactly what the demand-faulted host path computes — byte
+/// identical weights, same accumulation order — and only the transport (a
+/// pread into a bounded slab, instead of a fault into the page cache) differs.
+pub(crate) struct Ds4StagedExpert {
+    gate: QMatMul,
+    up: QMatMul,
+    down: QMatMul,
+    clamp: f64,
+    /// Bytes of the three staged weight buffers (what the slab charges).
+    bytes: u64,
+}
+
+impl crate::residency::NvmeStaged for Ds4StagedExpert {
+    fn staged_bytes(&self) -> u64 {
+        self.bytes
+    }
+}
+
 /// How a routed expert that is *not* resident in the device pool runs
 /// during decode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -820,19 +845,14 @@ fn qtensor_of(m: &QMatMul) -> Option<Arc<QTensor>> {
     }
 }
 
-/// Build the device expert pool over every layer's routed experts.
+/// Every layer's routed experts as the pool builders see them: the borrowed
+/// block tensors, their prefetch handles, the clamp and the byte size.
 ///
-/// `None` (with a log line) when the experts are not block-quantized
-/// tensors (a streamed load decoded them to f32) or the budget holds no
-/// expert.  On a CPU "device" (tests, `--device cpu` with a budget) a slot
-/// shares the host tensors — a hit is numerically the host path — so the
-/// partition can be exercised without an accelerator.
-fn build_device_pool(
-    layers: &[Layer],
-    dev: &Device,
-    budget: u64,
-    file: Option<Arc<std::fs::File>>,
-) -> Option<Arc<Ds4DevicePool>> {
+/// One walk serves both the VRAM pool ([`build_device_pool`]) and the Tier-3
+/// NVMe slab ([`build_nvme_pool`]) — they key experts the same way
+/// (`(layer, expert)`) and must agree on which experts exist and how big they
+/// are.
+fn collect_host_experts(layers: &[Layer]) -> Option<Vec<Vec<HostExpert>>> {
     let mut host: Vec<Vec<HostExpert>> = Vec::with_capacity(layers.len());
     for layer in layers {
         // Every layer of this architecture carries an MoE block.
@@ -842,10 +862,6 @@ fn build_device_pool(
             let (Some(gate), Some(up), Some(down)) =
                 (qtensor_of(&m.gate), qtensor_of(&m.up), qtensor_of(&m.down))
             else {
-                tracing::warn!(
-                    "deepseek4: the routed experts are not block-quantized tensors (streamed load); \
-                     VRAM expert cache disabled"
-                );
                 return None;
             };
             let bytes = (gate.storage_size_in_bytes()
@@ -862,6 +878,32 @@ fn build_device_pool(
         }
         host.push(row);
     }
+    Some(host)
+}
+
+/// Build the device expert pool over every layer's routed experts.
+///
+/// `None` (with a log line) when the experts are not block-quantized
+/// tensors (a streamed load decoded them to f32) or the budget holds no
+/// expert.  On a CPU "device" (tests, `--device cpu` with a budget) a slot
+/// shares the host tensors — a hit is numerically the host path — so the
+/// partition can be exercised without an accelerator.
+fn build_device_pool(
+    layers: &[Layer],
+    dev: &Device,
+    budget: u64,
+    file: Option<Arc<std::fs::File>>,
+) -> Option<Arc<Ds4DevicePool>> {
+    let host = match collect_host_experts(layers) {
+        Some(host) => host,
+        None => {
+            tracing::warn!(
+                "deepseek4: the routed experts are not block-quantized tensors (streamed load); \
+                 VRAM expert cache disabled"
+            );
+            return None;
+        }
+    };
     let per_slot = host.first().and_then(|r| r.first()).map_or(0, |h| h.bytes);
     let n_experts: usize = host.iter().map(Vec::len).sum();
     if per_slot == 0 || n_experts == 0 {
@@ -1009,6 +1051,346 @@ fn build_device_pool(
         busy,
     }))
 }
+
+// ─── Tier-3 NVMe staging slab ───────────────────────────────────────────────
+
+/// Resolve the `--ssd-expert-cache` / [`crate::placement::SsdExpertCache`]
+/// setting to a Tier-3 slab budget in bytes (`None` = off).
+///
+/// Mirrors how `--vram-expert-cache` resolves ([`VramExpertCache`] →
+/// bytes in the engine): `Bytes(0)` and `Disabled` are off, `Bytes(n)` is
+/// `n`, and `Auto` is [`AUTO_SSD_CACHE_RAM_SHARE`] of the host RAM available
+/// at load — never more than the routed expert pool itself, since a slab
+/// larger than the pool can only hold experts it already has.
+///
+/// `Unset` is off here: unlike the VRAM cache there is no `--expert-placement
+/// auto` style decision that engages a Tier-3 slab by itself, so no flag
+/// keeps the historical all-host path (and costs no RAM).
+///
+/// [`VramExpertCache`]: crate::placement::VramExpertCache
+pub(crate) fn resolve_ssd_expert_cache_bytes(
+    setting: crate::placement::SsdExpertCache,
+    available_ram: Option<u64>,
+    pool_bytes: u64,
+) -> Option<u64> {
+    use crate::placement::SsdExpertCache;
+    let budget = match setting {
+        SsdExpertCache::Disabled => return None,
+        SsdExpertCache::Bytes(0) => return None,
+        SsdExpertCache::Bytes(n) => n,
+        SsdExpertCache::Unset => return None,
+        SsdExpertCache::Auto => available_ram? / AUTO_SSD_CACHE_RAM_SHARE,
+    };
+    if budget == 0 {
+        return None;
+    }
+    // A slab bigger than the whole routed-expert pool cannot cache more than
+    // the pool holds; cap it so `Auto` on a small model does not reserve
+    // RAM for copies the model has no use for.
+    Some(if pool_bytes > 0 { budget.min(pool_bytes) } else { budget })
+}
+
+/// The share of the host's available RAM `--ssd-expert-cache auto` may claim
+/// for the staged-expert slab.
+///
+/// The slab is an *extra* host-RAM copy of experts that the page cache could
+/// otherwise hold, so it must not crowd out the demand-faulted host path: half
+/// of what is free at load leaves the rest for the page cache, the KV cache
+/// and scratch buffers, and keeps a decode step's working set in the slab when
+/// the model's routed pool is far larger than RAM (the V4-Flash case this tier
+/// exists for).
+pub const AUTO_SSD_CACHE_RAM_SHARE: u64 = 2;
+
+/// The Tier-3 slab, as the loader keeps it.
+///
+/// The slab a loader names is its payload type (`NvmeResidency<Ds4StagedExpert>`);
+/// the model's residency handle and every dispatch lookup go through the
+/// [erased](crate::residency::NvmeExpertSlot) view, because the same composite
+/// may also carry a device pool of another payload type.  Both are the *same*
+/// slab (one pool, one stager), so a stage requested by the composite is what
+/// dispatch reads back.
+#[cfg(unix)]
+struct Ds4NvmePool {
+    /// The object-safe slab view every lookup and stage request goes through.
+    slab: Arc<crate::residency::NvmeResidency<crate::residency::ErasedNvmeSlot>>,
+}
+
+#[cfg(unix)]
+impl Ds4NvmePool {
+    /// The staged expert of `(layer, expert)`, or `None` (run the host path).
+    /// A hit refreshes the slot's recency.  Only this loader's `stage` closure
+    /// produces payloads for this slab, so the downcast always succeeds.
+    fn lookup(&self, layer: u32, expert: u32) -> Option<Arc<Ds4StagedExpert>> {
+        let slot = self.slab.lookup(layer, expert)?;
+        let any: std::sync::Arc<dyn std::any::Any + Send + Sync> = slot.payload();
+        any.downcast::<Ds4StagedExpert>().ok()
+    }
+
+    /// Ask the background stager for `(layer, expert)` (non-blocking).
+    fn acquire(&self, layer: u32, expert: u32) {
+        self.slab.acquire(layer, expert);
+    }
+
+    /// Whether the slab holds `(layer, expert)`.
+    fn contains(&self, layer: u32, expert: u32) -> bool {
+        self.slab.contains(layer, expert)
+    }
+
+    /// The slab's byte budget, occupancy and counters (diagnostics).
+    fn report(&self) -> SsdCacheReport {
+        SsdCacheReport {
+            budget_bytes: self.slab.capacity_bytes(),
+            slots: crate::residency::ExpertResidency::capacity(self.slab.as_ref()),
+            resident: self.slab.resident(),
+            resident_bytes: self.slab.resident_bytes(),
+            stats: self.slab.stats(),
+            stage_requests: self.slab.requested(),
+            stage_drops: self.slab.dropped(),
+            host_releases: self.slab.released(),
+        }
+    }
+
+    /// Block until every queued stage settles (tests, shutdown).
+    fn wait_idle(&self) {
+        self.slab.wait_idle();
+    }
+}
+
+/// A snapshot of the Tier-3 SSD staging slab, mirroring
+/// [`crate::residency::DeviceCacheReport`] for the NVMe tier.
+#[derive(Debug, Clone)]
+pub struct SsdCacheReport {
+    /// The byte budget the slab was built with.
+    pub budget_bytes: u64,
+    /// Experts the budget holds (`capacity()`).
+    pub slots: usize,
+    /// Experts staged now.
+    pub resident: usize,
+    /// Bytes staged now (stages in flight included).
+    pub resident_bytes: u64,
+    /// Hit/miss/stage/eviction counters.
+    pub stats: crate::residency::DeviceResidencyStats,
+    /// Background stage requests accepted.
+    pub stage_requests: u64,
+    /// Stage requests dropped on a full queue.
+    pub stage_drops: u64,
+    /// Experts whose page-cache pages were released after their stage.
+    pub host_releases: u64,
+}
+
+/// Stage one expert: copy its three weight tensors' bytes out of the model
+/// file with `pread(2)` (mirroring [`crate::mmap_tensor::LayerPrefetcher`]'s
+/// readahead, but *keeping* the bytes) and rebuild them as the same
+/// borrowed-format block tensors the host [`Mlp`] runs.
+///
+/// `Ok(None)` when the format cannot be staged from storage (a dtype candle
+/// knows but that the routing experts are not stored as here): the caller
+/// falls back to the host path, exactly as if the slab had missed.
+#[cfg(unix)]
+fn stage_expert(
+    file: &std::fs::File,
+    source: &HostExpert,
+    ranges: [crate::mmap_tensor::MappedRange; 3],
+) -> Result<Option<Ds4StagedExpert>> {
+    use std::os::unix::fs::FileExt;
+    let mut staged: Vec<Vec<u8>> = Vec::with_capacity(3);
+    for range in ranges {
+        // From-storage staging: for every format the routed experts use
+        // (IQ2_XXS, Q2_K, Q8_0, …) the file bytes *are* the block layout, so a
+        // straight `pread(2)` of the mapped range is the staged payload.  A
+        // short read is an error, not a partial payload.
+        let mut buf = vec![0u8; range.len];
+        match file.read_exact_at(&mut buf, range.offset as u64) {
+            Ok(()) => staged.push(buf),
+            Err(err) => {
+                tracing::warn!(
+                    "deepseek4: staging expert bytes at file offset {} ({} bytes) failed: {err}",
+                    range.offset,
+                    range.len,
+                );
+                return Ok(None);
+            }
+        }
+    }
+    // Rebuild each tensor from its staged bytes.  The dtype comes from the
+    // *borrowed* tensor the host path already holds, so a gate/up/down triple
+    // with mixed formats (IQ2_XXS gate/up, Q2_K down on the real model; Q8_0 on
+    // the test fixture) is rebuilt exactly.
+    let build = |bytes: Vec<u8>, qt: &Arc<QTensor>| -> Option<QMatMul> {
+        let shape = qt.shape().clone();
+        let dtype = qt.dtype();
+        // Formats Joshua decodes itself: reinterpret the bytes as their GGUF
+        // blocks, exactly as the mapping-backed borrow does.
+        let raw = crate::with_raw_block!(crate::gguf_ext::ggml_id_from_dtype(dtype), B => {
+            crate::mmap_tensor::owned_qtensor_raw::<B>(&bytes, shape.clone())
+        });
+        if let Some(Ok(qt)) = raw {
+            return QMatMul::from_qtensor(qt).ok();
+        }
+        // A candle-known block format: candle owns its byte layout, so hand it
+        // the same bytes its own `from_data` would have sliced.
+        let storage = QStorage::from_data(Cow::Owned(bytes), &Device::Cpu, dtype).ok()?;
+        QMatMul::from_qtensor(QTensor::new(storage, shape).ok()?).ok()
+    };
+    let [gate_bytes, up_bytes, down_bytes]: [Vec<u8>; 3] =
+        staged.try_into().map_err(|_| {
+            candle_core::Error::Msg("deepseek4: staged expert did not yield three tensors".into())
+        })?;
+    let (Some(gate), Some(up), Some(down)) = (
+        build(gate_bytes, &source.gate),
+        build(up_bytes, &source.up),
+        build(down_bytes, &source.down),
+    ) else {
+        return Ok(None);
+    };
+    Ok(Some(Ds4StagedExpert {
+        gate,
+        up,
+        down,
+        clamp: source.clamp,
+        bytes: source.bytes,
+    }))
+}
+
+/// Build the Tier-3 NVMe staging slab over every layer's routed experts.
+///
+/// `None` (with a log line) when the model has no file descriptor to
+/// `pread(2)` through — a streamed load, or one of the public loaders that
+/// pass a mapping without the file — the experts are not staged from storage
+/// (they were decoded to f32), or the budget holds no expert.
+///
+/// The slab is a byte-budgeted LRU of [`Ds4StagedExpert`] payloads keyed by
+/// `(layer, expert)`, filled by a background stager thread (`acquire` never
+/// blocks the decode path) and protected the same way the VRAM pool is: the
+/// routing-frequency hot set is staged ahead of the miss churn and cannot be
+/// evicted.  A staged expert's page-cache pages are dropped once its stage
+/// settles (its own copy is now the one dispatch runs), mirroring
+/// `build_device_pool`'s host-page release.
+fn build_nvme_pool(
+    layers: &[Layer],
+    file: Option<Arc<std::fs::File>>,
+    budget: u64,
+) -> Option<Arc<Ds4NvmePool>> {
+    let file = file?;
+    let host = collect_host_experts(layers)?;
+    let per_expert = host.first().and_then(|r| r.first()).map_or(0, |h| h.bytes);
+    let n_experts: usize = host.iter().map(Vec::len).sum();
+    if per_expert == 0 || n_experts == 0 {
+        return None;
+    }
+    let slots = (budget / per_expert) as usize;
+    if slots == 0 {
+        tracing::warn!(
+            "deepseek4: SSD expert cache budget of {:.1} MiB holds no expert ({:.2} MiB each); cache disabled",
+            budget as f64 / 2f64.powi(20),
+            per_expert as f64 / 2f64.powi(20),
+        );
+        return None;
+    }
+    // Per-expert byte ranges and the block dtype, resolved once at load: the
+    // stage closure only runs `pread(2)` over them.
+    let mut ranges: Vec<Vec<[crate::mmap_tensor::MappedRange; 3]>> =
+        Vec::with_capacity(host.len());
+    for row in &host {
+        let mut layer_ranges = Vec::with_capacity(row.len());
+        for ex in row {
+            let Some(handles) = ex.prefetch.as_ref() else {
+                tracing::warn!(
+                    "deepseek4: the routed experts carry no mapping ranges (streamed load); \
+                     SSD expert cache disabled"
+                );
+                return None;
+            };
+            let (Some(gate), Some(up), Some(down)) = (
+                handles.gate.mapped_range(),
+                handles.up.mapped_range(),
+                handles.down.mapped_range(),
+            ) else {
+                tracing::warn!(
+                    "deepseek4: a routed-expert weight tensor is not mmap-backed; \
+                     SSD expert cache disabled"
+                );
+                return None;
+            };
+            layer_ranges.push([gate, up, down]);
+        }
+        ranges.push(layer_ranges);
+    }
+    let ranges = Arc::new(ranges);
+    let host: Arc<Vec<Vec<HostExpert>>> = Arc::new(host);
+    let source_table = Arc::clone(&host);
+    let file2 = Arc::clone(&file);
+    let stage: Arc<dyn Fn(u32, u32) -> Option<Arc<Ds4StagedExpert>> + Send + Sync> =
+        Arc::new(move |l: u32, e: u32| {
+            let Some(source) = source_table.get(l as usize).and_then(|row| row.get(e as usize))
+            else {
+                return None;
+            };
+            // `ranges` is built from the same table, so the lookup cannot
+            // miss; `clone` copies three small (offset, len) descriptors.
+            let Some(three) = ranges
+                .get(l as usize)
+                .and_then(|row| row.get(e as usize))
+                .cloned()
+            else {
+                return None;
+            };
+            match stage_expert(&file2, source, three) {
+                Ok(staged) => staged.map(Arc::new),
+                Err(err) => {
+                    tracing::warn!(
+                        "deepseek4: expert ({l}, {e}) stage into the SSD cache failed: {err}"
+                    );
+                    None
+                }
+            }
+        });
+    // Drop a staged expert's now-redundant page-cache pages once its stage
+    // settles: the slab owns those bytes now, and the host path would only
+    // refault them out of the file (see `release_host_pages`).  Always on —
+    // unlike the VRAM pool there is no `share_host` case, since a staged copy
+    // is never the host tensor itself.
+    let host_handles = Arc::new(
+        host.iter()
+            .map(|row| row.iter().map(|h| h.prefetch.clone()).collect::<Vec<_>>())
+            .collect::<Vec<_>>(),
+    );
+    let file3 = Arc::clone(&file);
+    // Do NOT gate the release on the hot set: unlike a device slot, a staged
+    // expert's host pages are exactly what the slab duplicates, so they go as
+    // soon as the staged copy exists.  A release declines only while a host
+    // run is reading them — there is no such guard on this path (the staged
+    // copy, not the pages, is what dispatch reads), so `true` unconditionally.
+    let release: Option<crate::residency::ReleaseHook> = Some(Arc::new(move |l: u32, e: u32| {
+        if let Some(Some(h)) = host_handles
+            .get(l as usize)
+            .and_then(|row| row.get(e as usize))
+        {
+            h.release_host_pages(Some(file3.as_ref()));
+        }
+        true
+    }));
+    // One slab, two handles: the typed one owns the stager thread (which runs
+    // the `pread(2)` stages) and the object-safe view is what the composite
+    // and dispatch hold.  See `DeviceResidency::erased_view`.
+    let slab = crate::residency::NvmeResidency::<Ds4StagedExpert>::new_erased(
+        budget,
+        per_expert,
+        stage,
+        release,
+        crate::residency::HOST_RELEASE_DELAY,
+    );
+    tracing::info!(
+        "deepseek4: SSD expert cache (Tier 3): {:.2} GiB staged-RAM budget = {slots} experts of \
+         {:.2} MiB ({n_experts} routed experts in the model, {:.1}% resident at most); hot/staged \
+         experts are pread(2)-streamed from the model file and staged experts' page-cache pages are released",
+        budget as f64 / 2f64.powi(30),
+        per_expert as f64 / 2f64.powi(20),
+        100.0 * slots.min(n_experts) as f64 / n_experts as f64,
+    );
+    Some(Arc::new(Ds4NvmePool { slab }))
+}
+
 
 // ─── HC (hyper-computation) stream mixing ───────────────────────────────────
 
@@ -2372,6 +2754,11 @@ struct Moe {
     /// The device expert pool, when a VRAM cache budget was given: routed
     /// experts resident there run on the device, the rest on the host.
     device_pool: Option<Arc<Ds4DevicePool>>,
+    /// The Tier-3 SSD staging slab, when an `--ssd-expert-cache` budget was
+    /// given: routed experts staged there run from the staged host copy, the
+    /// rest on the demand-faulted host path.
+    #[cfg(unix)]
+    nvme_pool: Option<Arc<Ds4NvmePool>>,
 }
 
 impl Moe {
@@ -2507,7 +2894,7 @@ impl Moe {
                 let active: Vec<usize> = (0..self.experts.len())
                     .filter(|e| !per_expert[*e].is_empty())
                     .collect();
-                self.host_experts(&x2, &per_expert, &active, n_tokens, h)?
+                self.host_or_staged(&x2, &per_expert, &active, n_tokens, h, decode, &routed_ids)?
             }
         };
         // …and hand the block's output back to the model's device.
@@ -2585,6 +2972,141 @@ impl Moe {
         let mut y = Tensor::zeros((n_tokens, h), DType::F32, dev)?;
         for (((e, idx, _), gate), up) in sel.iter().zip(gates).zip(ups) {
             let out = self.experts[*e].combine_and_down(gate, up)?;
+            if let Some(idx) = idx {
+                let w: Vec<f32> = per_expert[*e].iter().map(|(_, w)| *w).collect();
+                let w = Tensor::from_vec(w, (idx.elem_count(), 1), dev)?;
+                y = y.index_add(idx, &out.broadcast_mul(&w)?, 0)?;
+            } else {
+                y = (y + out.affine(per_expert[*e][0].1 as f64, 0.0)?)?;
+            }
+        }
+        Ok(y)
+    }
+
+    /// The routed experts of a layer with no device pool, preferring the
+    /// Tier-3 SSD staging slab: an expert staged there runs from its staged
+    /// host copy (the `pread(2)`-streamed blocks), every other expert runs the
+    /// demand-faulted host path.
+    ///
+    /// Output-preserving by construction: a staged expert is the *same* block
+    /// bytes rebuilt as the same block format, run through the same CPU
+    /// quantized kernels in the same tensor-major order — only the transport
+    /// differs (a copy the slab owns instead of a page fault).  A slab miss or
+    /// a staging refusal is simply "not staged", so the host path runs.
+    #[allow(clippy::too_many_arguments)]
+    fn host_or_staged(
+        &self,
+        x2: &Tensor,
+        per_expert: &[Vec<(u32, f32)>],
+        active: &[usize],
+        n_tokens: usize,
+        h: usize,
+        decode: bool,
+        last_row_ids: &[u32],
+    ) -> Result<Tensor> {
+        #[cfg(unix)]
+        if let Some(slab) = &self.nvme_pool {
+            // Stage requests for what this step routes to (decode), or for the
+            // routing a following decode step is likely to repeat (the last
+            // prefill row).  Non-blocking: the stager thread does the reads.
+            if decode {
+                for &e in active {
+                    slab.acquire(self.layer, e as u32);
+                }
+            } else {
+                for &e in last_row_ids {
+                    slab.acquire(self.layer, e);
+                }
+            }
+            let mut staged: Vec<(usize, Arc<Ds4StagedExpert>)> = Vec::new();
+            let mut host: Vec<usize> = Vec::new();
+            for &e in active {
+                // `contains` first: a miss is the common case on a cold slab
+                // and this keeps it to a hash probe (no recency bump, no
+                // payload handle) before the lookup that dispatches.
+                if !slab.contains(self.layer, e as u32) {
+                    host.push(e);
+                    continue;
+                }
+                match slab.lookup(self.layer, e as u32) {
+                    Some(expert) => staged.push((e, expert)),
+                    // Evicted between the two calls: the host path runs.
+                    None => host.push(e),
+                }
+            }
+            if !staged.is_empty() {
+                // Only the host runs are recorded as busy for the VRAM pool's
+                // release hook; a staged run reads the slab's own copy, which
+                // is never released while this handle exists.
+                let y_staged = self.run_staged(x2, per_expert, &staged, n_tokens, h)?;
+                if host.is_empty() {
+                    return Ok(y_staged);
+                }
+                let y_host = self.host_experts(x2, per_expert, &host, n_tokens, h)?;
+                return Ok((y_staged + y_host)?);
+            }
+        }
+        let _ = (decode, last_row_ids);
+        self.host_experts(x2, per_expert, active, n_tokens, h)
+    }
+
+    /// Run `staged` experts over their token buckets and return the weighted
+    /// sum `[n_tokens, h]` — the same arithmetic as [`Moe::host_experts`], so
+    /// the two can be added for the experts each tier covers.
+    fn run_staged(
+        &self,
+        x2: &Tensor,
+        per_expert: &[Vec<(u32, f32)>],
+        staged: &[(usize, Arc<Ds4StagedExpert>)],
+        n_tokens: usize,
+        h: usize,
+    ) -> Result<Tensor> {
+        let dev = x2.device();
+        let mut gates: Vec<Tensor> = Vec::with_capacity(staged.len());
+        let mut ups: Vec<Tensor> = Vec::with_capacity(staged.len());
+        let mut sel: Vec<(usize, Option<Tensor>, Tensor)> = Vec::with_capacity(staged.len());
+        for (e, _) in staged {
+            if n_tokens == 1 && per_expert[*e].len() == 1 {
+                sel.push((*e, None, x2.clone()));
+                continue;
+            }
+            let token_idx: Vec<u32> = per_expert[*e].iter().map(|(t, _)| *t).collect();
+            let count = token_idx.len();
+            if count == 0 {
+                continue;
+            }
+            let idx = Tensor::from_vec(token_idx, count, dev)?;
+            let x_sel = x2.index_select(&idx, 0)?;
+            sel.push((*e, Some(idx), x_sel));
+        }
+        // The staged expert for each surviving selection, in `sel` order.
+        let by_expert: std::collections::HashMap<usize, &Arc<Ds4StagedExpert>> =
+            staged.iter().map(|(e, x)| (*e, x)).collect();
+        for (e, _, x_sel) in &sel {
+            let expert = by_expert[e];
+            gates.push(clamp_gate(expert.gate.forward(x_sel)?, expert.clamp)?);
+        }
+        for (e, _, x_sel) in &sel {
+            let expert = by_expert[e];
+            ups.push(clamp_up(expert.up.forward(x_sel)?, expert.clamp)?);
+        }
+        if dev.is_cpu() && n_tokens > 1 {
+            let mut y = vec![0f32; n_tokens * h];
+            for (((e, _, _), gate), up) in sel.iter().zip(gates).zip(ups) {
+                let expert = by_expert[e];
+                let gg = (crate::precise::silu_with_policy(&gate, false)? * up)?;
+                let out = expert.down.forward(&gg)?;
+                crate::moe::accumulate_cpu_expert(
+                    &out, h, per_expert[*e].iter().copied(), &mut y
+                )?;
+            }
+            return Tensor::from_vec(y, (n_tokens, h), dev);
+        }
+        let mut y = Tensor::zeros((n_tokens, h), DType::F32, dev)?;
+        for (((e, idx, _), gate), up) in sel.iter().zip(gates).zip(ups) {
+            let expert = by_expert[e];
+            let gg = (crate::precise::silu_with_policy(&gate, false)? * up)?;
+            let out = expert.down.forward(&gg)?;
             if let Some(idx) = idx {
                 let w: Vec<f32> = per_expert[*e].iter().map(|(_, w)| *w).collect();
                 let w = Tensor::from_vec(w, (idx.elem_count(), 1), dev)?;
@@ -2997,6 +3519,11 @@ struct Shared {
     /// The device expert pool (see [`ModelWeights::from_gguf_mmap_placed`]),
     /// kept for diagnostics; the MoE blocks hold their own handles.
     device_pool: Option<Arc<Ds4DevicePool>>,
+    /// The Tier-3 SSD staging slab (see
+    /// [`ModelWeights::from_gguf_mmap_placed`]), kept for diagnostics; the MoE
+    /// blocks hold their own handles.
+    #[cfg(unix)]
+    nvme_pool: Option<Arc<Ds4NvmePool>>,
 }
 
 /// Fresh per-layer caches for `layers`.
@@ -3331,6 +3858,7 @@ impl ModelWeights {
             n_ctx,
             None,
             crate::placement::EngramTier::Auto,
+            crate::placement::SsdExpertCache::Unset,
         )
     }
 
@@ -3374,6 +3902,9 @@ impl ModelWeights {
         // Where the Engram n-gram tables are resident (a separate policy from
         // the routed experts).  See [`crate::placement::EngramTier`].
         engram_tier: crate::placement::EngramTier,
+        // The Tier-3 SSD staging slab's budget policy (see
+        // [`resolve_ssd_expert_cache_bytes`]).
+        ssd_expert_cache: crate::placement::SsdExpertCache,
     ) -> Result<Self> {
         Self::load_gguf(
             ct,
@@ -3388,6 +3919,7 @@ impl ModelWeights {
             engram_tier,
             #[cfg(feature = "distributed")]
             None,
+            ssd_expert_cache,
         )
     }
 
@@ -3430,6 +3962,7 @@ impl ModelWeights {
         #[cfg(feature = "distributed")] cluster: Option<
             Arc<crate::distributed::session::ClusterSession>,
         >,
+        ssd_expert_cache: crate::placement::SsdExpertCache,
     ) -> Result<Self> {
         let cfg = Config::from_metadata(&ct.metadata)?;
         #[cfg(feature = "distributed")]
@@ -3763,18 +4296,78 @@ impl ModelWeights {
                 })
                 .collect(),
         );
-        let residency: std::sync::Arc<dyn crate::residency::ExpertResidency> = match &device_pool {
-            Some(pool) => std::sync::Arc::new(
-                crate::residency::CompositeResidency::with_device_pool(
-                    cpu_residency,
-                    Arc::clone(&pool.pool),
-                    Arc::clone(&pool.uploader),
-                )
-                // Keeping host pages means the inclusive layout: advise
-                // device-resident experts too.
-                .advise_device_resident(pool.host_pages == HostPagePolicy::Keep),
-            ),
-            None => std::sync::Arc::new(cpu_residency),
+        // Tier 3: the SSD staging slab, engaged only by an explicit
+        // `--ssd-expert-cache` budget (`Auto` sized from available RAM; see
+        // `resolve_ssd_expert_cache_bytes`).  Built before the residency handle
+        // so one composite can carry host + NVMe + device.
+        #[cfg(unix)]
+        let nvme_pool: Option<Arc<Ds4NvmePool>> = {
+            let available = crate::placement::available_ram_bytes();
+            let pool_bytes: u64 = layers
+                .iter()
+                .map(|layer| {
+                    let FeedForward::Moe(moe) = &layer.ffn;
+                    moe.experts
+                        .iter()
+                        .map(|m| {
+                            [&m.gate, &m.up, &m.down]
+                                .into_iter()
+                                .filter_map(qtensor_of)
+                                .map(|q| q.storage_size_in_bytes() as u64)
+                                .sum::<u64>()
+                        })
+                        .sum::<u64>()
+                })
+                .sum();
+            match resolve_ssd_expert_cache_bytes(ssd_expert_cache, available, pool_bytes) {
+                Some(budget) => build_nvme_pool(&layers, file.clone(), budget),
+                None => {
+                    if matches!(ssd_expert_cache, crate::placement::SsdExpertCache::Disabled)
+                        || matches!(ssd_expert_cache, crate::placement::SsdExpertCache::Bytes(0))
+                    {
+                        tracing::info!("ssd expert cache: disabled (--ssd-expert-cache 0)");
+                    }
+                    None
+                }
+            }
+        };
+        #[cfg(unix)]
+        if let Some(pool) = &nvme_pool {
+            for layer in layers.iter_mut() {
+                let FeedForward::Moe(moe) = &mut layer.ffn;
+                moe.nvme_pool = Some(Arc::clone(pool));
+            }
+        }
+        // One residency handle covers every tier that engaged: host advice,
+        // the Tier-3 slab's background stages and the device pool's uploads are
+        // all driven off `acquire`/`replace_hot_set`, so dispatch and the
+        // hot-expert policy keep a single handle.
+        let make_composite = || crate::residency::CompositeResidency::<Ds4DeviceExpert>::host(
+            crate::residency::CpuResidency::new(Vec::new()),
+        );
+        let residency: std::sync::Arc<dyn crate::residency::ExpertResidency> = {
+            let mut composite = match &device_pool {
+                Some(pool) => make_composite()
+                    .device_pool(Arc::clone(&pool.pool), Arc::clone(&pool.uploader))
+                    // Keeping host pages means the inclusive layout: advise
+                    // device-resident experts too.
+                    .advise_device_resident(pool.host_pages == HostPagePolicy::Keep),
+                None => make_composite(),
+            };
+            #[cfg(unix)]
+            if let Some(slab) = &nvme_pool {
+                composite = composite.with_nvme(Arc::clone(&slab.slab));
+            }
+            // Host residency always applies (it is what a staged or device
+            // miss falls back to): the composite is built with an empty CPU
+            // backend above only so `with_device_pool`/`with_nvme` can be
+            // chained, and the real per-expert handles are attached here.
+            match composite.with_cpu(cpu_residency) {
+                Some(composite) => std::sync::Arc::new(composite)
+                    as std::sync::Arc<dyn crate::residency::ExpertResidency>,
+                None => std::sync::Arc::new(crate::residency::CpuResidency::new(Vec::new()))
+                    as std::sync::Arc<dyn crate::residency::ExpertResidency>,
+            }
         };
         let n_layers = layers.len();
         let shared = std::sync::Arc::new(Shared {
@@ -3794,6 +4387,8 @@ impl ModelWeights {
             residency,
             engram_residency,
             device_pool,
+            #[cfg(unix)]
+            nvme_pool,
         });
         let prefill_timing = Arc::new(PhaseTiming::default());
         let model = Self {
@@ -3889,6 +4484,13 @@ impl ModelWeights {
             .device_pool
             .as_ref()
             .map(|p| crate::residency::DeviceCacheReport::of(&p.pool, Some(&p.uploader)))
+    }
+
+    /// The Tier-3 SSD staging slab's budget, occupancy and counters, when an
+    /// `--ssd-expert-cache` budget engaged one.
+    #[cfg(unix)]
+    pub fn ssd_expert_cache(&self) -> Option<SsdCacheReport> {
+        self.shared.nvme_pool.as_ref().map(|p| p.report())
     }
 
     /// Engram table residency, reported as a metric line **separate from** the
@@ -3997,6 +4599,10 @@ impl ModelWeights {
         if let Some(p) = &self.shared.device_pool {
             p.uploader.wait_idle();
         }
+        #[cfg(unix)]
+        if let Some(p) = &self.shared.nvme_pool {
+            p.wait_idle();
+        }
     }
 
     /// A periodic `debug` line with the device pool's state (every
@@ -4026,6 +4632,27 @@ impl ModelWeights {
                     t.describe("decode step")
                 );
             }
+        }
+        #[cfg(unix)]
+        if let Some(r) = self.ssd_expert_cache() {
+            tracing::debug!(
+                "deepseek4 ssd expert cache @step {step}: {}/{} experts ({:.2}/{:.2} GiB), hits {} \
+                 misses {} stages {} evictions {} refused {} failed {}; stage requests {} (dropped {}), \
+                 page-cache releases {}",
+                r.resident,
+                r.slots,
+                r.resident_bytes as f64 / 2f64.powi(30),
+                r.budget_bytes as f64 / 2f64.powi(30),
+                r.stats.hits,
+                r.stats.misses,
+                r.stats.uploads,
+                r.stats.evictions,
+                r.stats.refused,
+                r.stats.upload_failures,
+                r.stage_requests,
+                r.stage_drops,
+                r.host_releases,
+            );
         }
     }
 
@@ -4926,6 +5553,8 @@ fn load_moe<R: Read + Seek>(
         expert_device: rd.expert_device.clone(),
         layer: layer as u32,
         device_pool: None,
+        #[cfg(unix)]
+        nvme_pool: None,
     })
 }
 
@@ -5217,6 +5846,55 @@ fn split_experts<R: Read + Seek>(
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    /// `--ssd-expert-cache` resolves the same way `--vram-expert-cache` does:
+    /// `Disabled`/`Bytes(0)` and an absent flag are off, `Bytes(n)` is exactly
+    /// `n`, and `Auto` is a share of the RAM free at load — capped by the
+    /// routed pool so a small model never reserves RAM for copies it cannot use.
+    #[test]
+    fn ssd_expert_cache_budget_resolution() {
+        use crate::placement::SsdExpertCache as S;
+        const GIB: u64 = 1 << 30;
+        const POOL: u64 = 200 * GIB;
+
+        // Off.
+        assert_eq!(resolve_ssd_expert_cache_bytes(S::Unset, Some(64 * GIB), POOL), None);
+        assert_eq!(resolve_ssd_expert_cache_bytes(S::Disabled, Some(64 * GIB), POOL), None);
+        assert_eq!(resolve_ssd_expert_cache_bytes(S::Bytes(0), Some(64 * GIB), POOL), None);
+
+        // An explicit budget is honoured exactly, `Bytes(1)` included (one byte
+        // is not a working budget but is not the "off" spelling either).
+        assert_eq!(
+            resolve_ssd_expert_cache_bytes(S::Bytes(3 * GIB), Some(64 * GIB), POOL),
+            Some(3 * GIB)
+        );
+        assert_eq!(resolve_ssd_expert_cache_bytes(S::Bytes(1), None, POOL), Some(1));
+
+        // `Auto` sizes from available RAM (never more than the routed pool).
+        assert_eq!(
+            resolve_ssd_expert_cache_bytes(S::Auto, Some(64 * GIB), POOL),
+            Some(64 * GIB / AUTO_SSD_CACHE_RAM_SHARE)
+        );
+        assert_eq!(
+            resolve_ssd_expert_cache_bytes(S::Auto, Some(4 * GIB), POOL),
+            Some(4 * GIB / AUTO_SSD_CACHE_RAM_SHARE),
+            "a small machine still gets a slab"
+        );
+        // Capped by the pool: no slab larger than what it could ever stage.
+        assert_eq!(
+            resolve_ssd_expert_cache_bytes(S::Auto, Some(64 * GIB), 2 * GIB),
+            Some(2 * GIB)
+        );
+        // No RAM probe (non-Linux, or a failed read): `Auto` declines rather
+        // than guess a budget.
+        assert_eq!(resolve_ssd_expert_cache_bytes(S::Auto, None, POOL), None);
+
+        // The engaged budget always holds at least one expert once it is at
+        // least one expert wide (the `build_nvme_pool` slot check is separate).
+        let per_expert = 19 * 1_048_576u64; // 19 MiB: the V4-Flash expert size
+        let auto = resolve_ssd_expert_cache_bytes(S::Auto, Some(8 * GIB), POOL).unwrap();
+        assert!(auto / per_expert > 0);
+    }
 
     #[test]
     fn b50_precision_workload_stays_within_qualification() {
