@@ -375,3 +375,70 @@ fn engram_placement_is_reported_separately_and_resolves_from_mmap() {
     drop(m);
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// DeepSeek-V4.1-Flash ships **no `output.weight`**: the LM head is tied to
+/// `token_embd`.  The other tests all use the fixture's own `output.weight`,
+/// so without this one the tied path — the one the real GGUFs take — is
+/// never exercised by a parity check.
+///
+/// The fixture writes a *distinct* `output.weight` (seed 2) from
+/// `token_embd` (seed 1) precisely so the two heads can be told apart: if the
+/// loader ignored the tie (or silently used the embedding when a real head
+/// exists), these logits would coincide.
+#[test]
+fn deepseek41_tied_head_loads_and_differs_from_an_explicit_head() {
+    let (dir_own, own) = fixture("deepseek41-own-head");
+
+    let dir_tied = common::model_dir("deepseek41-tied-head");
+    let tied = dir_tied.join("model.gguf");
+    common::write_tiny_deepseek41_gguf_tied(&tied);
+
+    for mmap in [true, false] {
+        let mut with_head = load_model(&own, mmap);
+        let mut without_head = load_model(&tied, mmap);
+
+        let a = logits(&mut with_head, &TOKENS[..1], 0);
+        let b = logits(&mut without_head, &TOKENS[..1], 0);
+
+        assert!(
+            b.iter().all(|v| v.is_finite()),
+            "tied-head logits must be finite (mmap={mmap}): {b:?}"
+        );
+
+        // The tied head projects through token_embd (seed 1); the explicit
+        // head uses seed 2.  Different weights, so the logits must differ.
+        let max_diff = a
+            .iter()
+            .zip(&b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff > 1e-4,
+            "tied head must not silently equal the explicit output.weight \
+             (mmap={mmap}, max |diff| = {max_diff:e})"
+        );
+
+        // Decode must also stay finite and deterministic across a run.
+        let mut prev = b;
+        for pos in 1..4 {
+            let cur = logits(&mut without_head, &TOKENS[pos..=pos], pos);
+            assert!(
+                cur.iter().all(|v| v.is_finite()),
+                "tied-head decode went non-finite at position {pos} (mmap={mmap}): {cur:?}"
+            );
+            let drift = cur
+                .iter()
+                .zip(&prev)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                drift.is_finite(),
+                "tied-head decode produced a non-finite delta at position {pos}"
+            );
+            prev = cur;
+        }
+    }
+
+    std::fs::remove_dir_all(&dir_own).ok();
+    std::fs::remove_dir_all(&dir_tied).ok();
+}
