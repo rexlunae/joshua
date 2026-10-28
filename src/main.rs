@@ -27,7 +27,7 @@ use joshua::{
     server,
     types::{checked_reasoning_template_kwargs, GenerationOptions, ReasoningEffort},
     ChatMessage, ComputeBackend, DensePlacement, EngineOptions, EngramTier, ExpertPlacement,
-    HugePages, MlockMode, MmapMode, PageSize, SpeculativeConfig, VramExpertCache,
+    HugePages, MlockMode, MmapMode, PageSize, SpeculativeConfig, SsdExpertCache, VramExpertCache,
 };
 
 /// Values for `--device` (CLI form of [`ComputeBackend`]).
@@ -183,6 +183,28 @@ impl std::str::FromStr for VramExpertCacheArg {
     }
 }
 
+/// `--ssd-expert-cache` value: `auto` (size the Tier-3 NVMe/SSD staging slab
+/// from the host's available RAM at load) or a fixed MiB budget.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SsdExpertCacheArg {
+    Auto,
+    MiB(usize),
+}
+
+impl std::str::FromStr for SsdExpertCacheArg {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.eq_ignore_ascii_case("auto") {
+            Ok(Self::Auto)
+        } else {
+            s.parse::<usize>()
+                .map(Self::MiB)
+                .map_err(|_| "expected `auto` or a MiB byte budget".to_string())
+        }
+    }
+}
+
 /// An mmap-based LLM inference engine — a Rust clone of Cactus.
 #[derive(Parser)]
 #[command(name = "joshua", version, about, long_about = None)]
@@ -290,6 +312,14 @@ enum Commands {
         /// itself where the leftover device memory is worth it (#110).
         #[arg(long, env = "JOSHUA_VRAM_EXPERT_CACHE", value_parser = clap::value_parser!(VramExpertCacheArg))]
         vram_expert_cache: Option<VramExpertCacheArg>,
+        /// Size the Tier-3 NVMe/SSD expert staging slab (`--ssd-expert-cache`):
+        /// a bounded host-RAM slab that `pread(2)`-streams a hot subset of the
+        /// routed experts off the SSD (see `NvmeResidency`).  `auto` derives the
+        /// host-RAM byte budget from the machine's available RAM at load; a
+        /// number is a fixed MiB budget; `0` disables (experts keep their
+        /// ordinary host page-cache residency).
+        #[arg(long, env = "JOSHUA_SSD_EXPERT_CACHE", value_parser = clap::value_parser!(SsdExpertCacheArg))]
+        ssd_expert_cache: Option<SsdExpertCacheArg>,
         /// Tokens per prefill chunk (default 512).  Bounds the per-layer
         /// prefill workspace and sets how many prompt rows each routed expert
         /// sees per matmul; the joshua-native MoE loaders read each layer's
@@ -611,6 +641,14 @@ enum Commands {
         /// itself where the leftover device memory is worth it (#110).
         #[arg(long, env = "JOSHUA_VRAM_EXPERT_CACHE", value_parser = clap::value_parser!(VramExpertCacheArg))]
         vram_expert_cache: Option<VramExpertCacheArg>,
+        /// Size the Tier-3 NVMe/SSD expert staging slab (`--ssd-expert-cache`):
+        /// a bounded host-RAM slab that `pread(2)`-streams a hot subset of the
+        /// routed experts off the SSD (see `NvmeResidency`).  `auto` derives the
+        /// host-RAM byte budget from the machine's available RAM at load; a
+        /// number is a fixed MiB budget; `0` disables (experts keep their
+        /// ordinary host page-cache residency).
+        #[arg(long, env = "JOSHUA_SSD_EXPERT_CACHE", value_parser = clap::value_parser!(SsdExpertCacheArg))]
+        ssd_expert_cache: Option<SsdExpertCacheArg>,
         /// Tokens per prefill chunk (default 512).  Bounds the per-layer
         /// prefill workspace and sets how many prompt rows each routed expert
         /// sees per matmul; the joshua-native MoE loaders read each layer's
@@ -856,6 +894,7 @@ async fn main() -> anyhow::Result<()> {
             pin_hot_experts,
             expert_cache,
             vram_expert_cache,
+            ssd_expert_cache,
             prefill_chunk,
             prefill_budget_ms,
             prefix_checkpoints,
@@ -912,6 +951,13 @@ async fn main() -> anyhow::Result<()> {
                 }
                 None => VramExpertCache::Unset, // the engine may engage a partial cache (#110)
             };
+            let ssd_cache: SsdExpertCache = match ssd_expert_cache {
+                Some(SsdExpertCacheArg::Auto) => SsdExpertCache::Auto, // engine sizes at load
+                Some(SsdExpertCacheArg::MiB(n)) => {
+                    SsdExpertCache::Bytes((n as u64).saturating_mul(1024 * 1024))
+                }
+                None => SsdExpertCache::Unset, // the engine decides
+            };
             let opts = EngineOptions::with_n_ctx(n_ctx)
                 .backend(device.into())
                 .huge_pages(huge_pages.into())
@@ -922,6 +968,7 @@ async fn main() -> anyhow::Result<()> {
                 .pin_hot_experts(pin_hot_experts)
                 .expert_cache_auto(expert_cache_auto)
                 .vram_expert_cache(vram_cache)
+                .ssd_expert_cache(ssd_cache)
                 .prefill_chunk(prefill_chunk)
                 .prefill_budget_ms(prefill_budget_ms)
                 .queue_timeout_ms(queue_timeout_ms)
@@ -1272,6 +1319,7 @@ async fn main() -> anyhow::Result<()> {
             pin_hot_experts,
             expert_cache,
             vram_expert_cache,
+            ssd_expert_cache,
             prefill_chunk,
             prefill_budget_ms,
             speculative,
@@ -1310,6 +1358,13 @@ async fn main() -> anyhow::Result<()> {
                 }
                 None => VramExpertCache::Unset, // the engine may engage a partial cache (#110)
             };
+            let ssd_cache: SsdExpertCache = match ssd_expert_cache {
+                Some(SsdExpertCacheArg::Auto) => SsdExpertCache::Auto, // engine sizes at load
+                Some(SsdExpertCacheArg::MiB(n)) => {
+                    SsdExpertCache::Bytes((n as u64).saturating_mul(1024 * 1024))
+                }
+                None => SsdExpertCache::Unset, // the engine decides
+            };
             let opts = EngineOptions::with_n_ctx(n_ctx)
                 .backend(device.into())
                 .huge_pages(huge_pages.into())
@@ -1320,6 +1375,7 @@ async fn main() -> anyhow::Result<()> {
                 .pin_hot_experts(pin_hot_experts)
                 .expert_cache_auto(expert_cache_auto)
                 .vram_expert_cache(vram_cache)
+                .ssd_expert_cache(ssd_cache)
                 .prefill_chunk(prefill_chunk)
                 .prefill_budget_ms(prefill_budget_ms)
                 .speculative(speculative_config(speculative))

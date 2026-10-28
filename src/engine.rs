@@ -119,7 +119,7 @@ use crate::speculative::{
     next_draft_len, NgramDrafter, SpeculationGate, SpeculativeConfig, SpeculativeStats,
     TokenDistRef, Verdict,
 };
-pub use crate::placement::{DensePlacement, EngramTier, ExpertPlacement, VramExpertCache};
+pub use crate::placement::{DensePlacement, EngramTier, ExpertPlacement, SsdExpertCache, VramExpertCache};
 use crate::template::ChatTemplate;
 
 use crate::error::{JoshuaError, Result};
@@ -404,6 +404,16 @@ pub struct EngineOptions {
     /// budget, and [`VramExpertCache::Disabled`] (`--vram-expert-cache 0`) is
     /// the explicit opt-out (all routed experts stay on the host).
     pub device_expert_cache: VramExpertCache,
+    /// Tier-3 NVMe/SSD staging slab over the routed experts (`--ssd-expert-cache`):
+    /// a bounded host-RAM slab that `pread(2)`-streams a hot subset of the
+    /// routed experts off the SSD (see [`crate::residency::NvmeResidency`]).
+    ///
+    /// [`SsdExpertCache::Unset`] (the default) leaves the decision to the
+    /// engine; [`SsdExpertCache::Auto`] (`--ssd-expert-cache auto`) sizes the
+    /// slab from the host's available RAM at load, [`SsdExpertCache::Bytes(n)`]
+    /// fixes the budget, and [`SsdExpertCache::Disabled`] (`--ssd-expert-cache 0`)
+    /// is the explicit opt-out.
+    pub ssd_expert_cache: SsdExpertCache,
     /// Tokens per prefill chunk; `0` selects [`DEFAULT_PREFILL_CHUNK`].
     ///
     /// A prompt is prefilled in chunks of this many tokens.  The chunk bounds
@@ -639,6 +649,13 @@ impl EngineOptions {
     /// [`EngineOptions::device_expert_cache`].
     pub fn vram_expert_cache(mut self, setting: VramExpertCache) -> Self {
         self.device_expert_cache = setting;
+        self
+    }
+
+    /// Set the Tier-3 NVMe/SSD staging-slab setting.  See
+    /// [`EngineOptions::ssd_expert_cache`].
+    pub fn ssd_expert_cache(mut self, setting: SsdExpertCache) -> Self {
+        self.ssd_expert_cache = setting;
         self
     }
 
