@@ -172,13 +172,14 @@ fn ssd_cache_stages_experts_and_preserves_outputs() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
-/// The split path: a slab budgeted for a *single* expert forces a step's
-/// routing to run partly from the SSD slab and partly from the host, then add
-/// the two partial sums (`y_staged + y_host`).  That addition is the one place
-/// parity could break on floating-point associativity, so assert exact equality
-/// against the all-host run here too.
+/// A slab too small to hold a step's whole routing must fall back to the host
+/// for that step rather than split the routed sum between two buffers.  The
+/// split would reorder the per-expert accumulation, and since the staged-vs-host
+/// partition depends on background stager timing the output would then vary
+/// step-to-step within float-associativity noise.  Assert the fallback is exact
+/// and deterministic across repeated runs.
 #[test]
-fn ssd_cache_partial_residency_preserves_outputs() {
+fn ssd_cache_undersized_slab_falls_back_deterministically() {
     let dir = common::model_dir("ssd-cache-partial");
     let path = dir.join("model.gguf");
     common::write_tiny_deepseek4_gguf(&path);
@@ -189,26 +190,33 @@ fn ssd_cache_partial_residency_preserves_outputs() {
     let expected_next = logits(&mut host, &[9], prompt.len());
 
     // Discover the per-expert byte size from a full-pool slab, then budget for
-    // exactly one expert so a multi-expert step must split across tiers.
+    // exactly one expert so a multi-expert step cannot be fully staged.
     let probe = load(&path, SsdExpertCache::Bytes(SLAB_BUDGET));
     let report = probe.ssd_expert_cache().unwrap();
     let per_expert = report.budget_bytes / report.slots as u64;
     drop(probe);
 
-    let mut cached = load(&path, SsdExpertCache::Bytes(per_expert));
-    let report = cached.ssd_expert_cache().unwrap();
-    assert_eq!(report.slots, 1, "the probe must leave room for one expert");
+    // Repeat on fresh loads: the result must never drift with stager timing.
+    for attempt in 0..3 {
+        let mut cached = load(&path, SsdExpertCache::Bytes(per_expert));
+        let report = cached.ssd_expert_cache().unwrap();
+        assert_eq!(report.slots, 1, "the probe must leave room for one expert");
 
-    assert_eq!(
-        logits(&mut cached, &prompt, 0),
-        expected,
-        "split (staged+host) prefill logits must be identical to all-host"
-    );
-    cached.wait_for_expert_uploads();
-    assert_eq!(
-        logits(&mut cached, &[9], prompt.len()),
-        expected_next,
-        "split (staged+host) decode logits must be identical to all-host"
-    );
+        assert_eq!(
+            logits(&mut cached, &prompt, 0),
+            expected,
+            "an undersized slab must fall back to the exact all-host prefill (attempt {attempt})"
+        );
+        cached.wait_for_expert_uploads();
+        assert!(
+            cached.ssd_expert_cache().unwrap().resident > 0,
+            "the slab is still populated by the routing (attempt {attempt})"
+        );
+        assert_eq!(
+            logits(&mut cached, &[9], prompt.len()),
+            expected_next,
+            "an undersized slab must fall back to the exact all-host decode (attempt {attempt})"
+        );
+    }
     std::fs::remove_dir_all(dir).unwrap();
 }

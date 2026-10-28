@@ -3034,16 +3034,19 @@ impl Moe {
                     None => host.push(e),
                 }
             }
-            if !staged.is_empty() {
-                // Only the host runs are recorded as busy for the VRAM pool's
-                // release hook; a staged run reads the slab's own copy, which
-                // is never released while this handle exists.
-                let y_staged = self.run_staged(x2, per_expert, &staged, n_tokens, h)?;
-                if host.is_empty() {
-                    return Ok(y_staged);
-                }
-                let y_host = self.host_experts(x2, per_expert, &host, n_tokens, h)?;
-                return Ok((y_staged + y_host)?);
+            if !staged.is_empty() && host.is_empty() {
+                // Run the whole step from the slab only when *every* routed
+                // expert of this step is staged.  A partly-staged step runs
+                // entirely on the host instead: splitting the routed sum
+                // between two buffers and adding them would reorder the
+                // per-expert accumulation, and because the staged-vs-host
+                // split depends on background stager timing the output would
+                // then vary step-to-step within float-associativity noise.
+                // Whole-step gating keeps the logits bit-identical to the
+                // all-host path (the historical behaviour) while still taking
+                // the SSD path whenever the slab holds the working set — the
+                // steady-state case the tier exists for.
+                return self.run_staged(x2, per_expert, &staged, n_tokens, h);
             }
         }
         let _ = (decode, last_row_ids);
