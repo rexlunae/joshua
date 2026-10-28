@@ -3944,6 +3944,9 @@ impl ModelWeights {
             None,
             crate::placement::EngramTier::Auto,
             Some(cluster),
+            // The distributed path keeps the routed experts on the CPU host
+            // pool, so the Tier-3 SSD slab is not engaged there.
+            crate::placement::SsdExpertCache::Unset,
         )
     }
 
