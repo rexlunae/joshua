@@ -2499,6 +2499,12 @@ mod composite_nvme_tests {
         // expert advises the host pages and stages it.
         comp.release(0, 0);
         assert!(!slab.contains(0, 0) && !comp.nvme_contains(0, 0));
+        // Quiesce both background threads before sampling the counter: a
+        // still-settling upload/stage from the release path would otherwise
+        // land its host advice inside the measurement window and race the
+        // exact delta asserted below (it did on CI).
+        comp.uploader().unwrap().wait_idle();
+        slab.wait_idle();
         let advised_before = advised.load(Ordering::Relaxed);
         comp.acquire(0, 1);
         assert_eq!(
