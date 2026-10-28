@@ -22,8 +22,8 @@
 // barriers, so a work-group keeps several rows' weight loads in flight.  The
 // sums are grouped differently from the op-at-a-time kernels, so logits
 // agree with the unfused path to rounding, not bit for bit.  The norms
-// mirror `k_rmsnorm`; attention sums each score and context element
-// sequentially, as the tiled GEMM does for grouped-query heads.
+// mirror `k_rmsnorm`; attention reduces each score over a sub-group and sums
+// each context element sequentially.
 #pragma once
 #include "kernels.hpp"
 
@@ -35,7 +35,8 @@ namespace mega {
 // columns per pass.
 struct W {
     const uchar* p;
-    int qt, qk, bsz, n, k, cols, pad;
+    int qt, qk, bsz, n, k, cols;
+    int al16;                // p is 16-byte aligned (wide-load paths)
 };
 
 struct Layer {
@@ -57,8 +58,11 @@ struct Kv {
     int cap, pad;
 };
 
-// Stages of one layer, in order.
-enum { S_NORM1, S_QKV, S_PREP, S_ATTN, S_OPROJ, S_NORM2, S_GATEUP, S_DOWN, S_LAYER };
+// Stages of one layer, in order.  The RMSNorms are not stages of their
+// own: every QKV, gate/up and head task norms the residual into its local
+// memory first (the same sum in every work-group, so the same values), which
+// saves a one-work-group stage and its synchronization each time.
+enum { S_QKV, S_PREP, S_ATTN, S_OPROJ, S_GATEUP, S_DOWN, S_LAYER };
 // Granularity of GEMV tasks (`Model::rpt` is a multiple of it).
 constexpr int ROWS = 8;
 // Each sync counter sits on its own cache line, so the work-groups spinning
@@ -67,8 +71,9 @@ constexpr int ROWS = 8;
 constexpr int SYNC_STRIDE = 32;
 // Largest head_dim the per-head stages hold in local memory.
 constexpr int MAX_HD = 512;
-// Local memory: reduction tree + task results + one head.
-constexpr int LOCAL_FLOATS = WG + ROWS + MAX_HD;
+// Local memory: reduction tree + one head, then the normed input of the
+// current projection ([h], sized at launch).
+constexpr int LOCAL_FIXED = WG + MAX_HD;
 
 struct Model {
     int n_layers, h, n_head, n_kv, hd, n_rot, neox, ffn, vocab;
@@ -80,7 +85,7 @@ struct Model {
     const float* out_b;
     const Layer* layers;     // device copy, n_layers entries
     // Tasks per stage of one layer, and the prefix sums (`start[S_LAYER]`
-    // tasks per layer); then the final norm (1 task) and the head.
+    // tasks per layer); then the head.
     int count[S_LAYER];
     int start[S_LAYER + 1];
     int head_tasks;
@@ -91,7 +96,7 @@ struct Model {
     int rpt[S_LAYER];
     int head_rpt;
     // Profiling only (JOSHUA_MEGAKERNEL_SKIP): bit k set skips the work of
-    // every stage of kind k (the S_* stages, then 8 = final norm, 9 = head)
+    // every stage of kind k (the S_* stages, then S_LAYER = head)
     // but keeps its synchronization, so the step time without a stage kind
     // shows what that kind costs.  The logits are garbage when nonzero.
     int skip;
@@ -99,7 +104,6 @@ struct Model {
 
 struct Scratch {
     float* x;       // [h] residual
-    float* xn;      // [h] normed input of the current projection
     float* qkv;     // [n_head*hd + 2*n_kv*hd]
     float* q;       // [n_head*hd] normed, rotated queries
     float* ctx;     // [n_head*hd] attention output
@@ -114,19 +118,32 @@ using atomic_u32 = sycl::atomic_ref<uint, sycl::memory_order::relaxed, sycl::mem
 
 struct Ctx {
     sycl::nd_item<1> it;
-    float* local;   // LOCAL_FLOATS
+    float* local;   // LOCAL_FIXED + h
     int t() const { return (int)it.get_local_id(0); }
     void barrier() const { sycl::group_barrier(it.get_group()); }
     float* sh() const { return local; }
-    float* res() const { return local + WG; }
-    float* head() const { return local + WG + ROWS; }
+    float* head() const { return local + WG; }
+    float* xn() const { return local + LOCAL_FIXED; }
 
     // Block until `*ctr` reaches `need`, then make the other work-groups'
-    // writes visible to every lane.
+    // writes visible to every lane.  The spin polls relaxed: an acquire load
+    // per poll invalidates the compute unit's L1 each time, which the
+    // work-groups sharing it pay for in re-fetched weights and activations
+    // (on the Arc Pro B50 an 8B step took 1.5x as long).  One acquire load
+    // after the spin synchronizes with the signals; the fence below alone
+    // does not make their writes visible there.  Each poll is an L3 atomic
+    // on the counter's line, so a waiter backs off between polls (a short
+    // dependent chain in registers, kept by a local store) rather than
+    // queueing ahead of the signals it waits for.
     void wait_for(uint* ctr, uint need) const {
         if (t() == 0) {
             atomic_u32 a(*ctr);
-            while (a.load(sycl::memory_order::acquire) < need) {}
+            float spin = 0.0f;
+            for (int backoff = 8; a.load(sycl::memory_order::relaxed) < need; backoff = sycl::min(2 * backoff, 256)) {
+                for (int i = 0; i < backoff; i++) spin = spin * 0.5f + 1.0f;
+            }
+            sh()[0] = spin;
+            (void)a.load(sycl::memory_order::acquire);
         }
         barrier();
         sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::device);
@@ -190,6 +207,71 @@ struct Ctx {
             for (int k = lane; k < w.k; k += sgs) {
                 float v = w.qt == QT_BF16 ? bf16_at(row + 2 * k) : f16_at(row + 2 * k);
                 acc += x[k] * v;
+            }
+        } else if (w.qt == QT_Q8_0) {
+            // A quarter of a block (f16 scale, 32 i8) per lane, so four
+            // neighbouring lanes read one block's bytes together.
+            const uchar* row = w.p + (uint64_t)n * (uint64_t)(w.k / 32) * (uint64_t)w.bsz;
+            for (int g = lane; g < w.k / 8; g += sgs) {
+                const uchar* b = row + (uint64_t)(g >> 2) * w.bsz;
+                float d = f16_at(b);
+                const uchar* qs = b + 2 + 8 * (g & 3);
+                float8 wv = float8(d * (float)(char)qs[0], d * (float)(char)qs[1], d * (float)(char)qs[2],
+                                   d * (float)(char)qs[3], d * (float)(char)qs[4], d * (float)(char)qs[5],
+                                   d * (float)(char)qs[6], d * (float)(char)qs[7]);
+                float8 xv = vload8(0, x + g * 8);
+                acc += dot(wv.lo(), xv.lo()) + dot(wv.hi(), xv.hi());
+            }
+        } else if (w.qt == QT_Q4_K && w.al16) {
+            // dequant8's Q4_K lanes with wide loads: the block header (d,
+            // dmin and the 12 scale bytes) in one 16-byte load and the lane's
+            // 8 nibble bytes in one 8-byte load, instead of a load per byte.
+            const uchar* row = w.p + (uint64_t)n * (uint64_t)(w.k / 256) * 144ul;
+            for (int g = lane; g < w.k / 8; g += sgs) {
+                const uchar* blk = row + (uint64_t)(g >> 5) * 144ul;
+                int j = (g >> 2) & 7, l = g & 3;
+                sycl::vec<uint, 4> hd = *reinterpret_cast<const sycl::vec<uint, 4>*>(blk);
+                sycl::vec<uint, 2> qv = *reinterpret_cast<const sycl::vec<uint, 2>*>(blk + 16 + 32 * (j >> 1) + 8 * l);
+                float d = (float)sycl::bit_cast<half>((ushort)(hd.x() & 0xFFFFu));
+                float dmin = (float)sycl::bit_cast<half>((ushort)(hd.x() >> 16));
+                int sb = 8 * (j & 3);
+                uint b1 = (hd.y() >> sb) & 0xFFu, b2 = (hd.z() >> sb) & 0xFFu, b3 = (hd.w() >> sb) & 0xFFu;
+                uint sc1 = j < 4 ? (b1 & 63u) : ((b3 & 0xFu) | ((b1 >> 6) << 4));
+                uint m1 = j < 4 ? (b2 & 63u) : ((b3 >> 4) | ((b2 >> 6) << 4));
+                float d1 = d * (float)sc1, mm1 = dmin * (float)m1;
+                int nib = 4 * (j & 1);
+                uint lo = qv.x() >> nib, hi = qv.y() >> nib;
+                float8 wv = float8(d1 * (float)(lo & 0xFu) - mm1, d1 * (float)((lo >> 8) & 0xFu) - mm1,
+                                   d1 * (float)((lo >> 16) & 0xFu) - mm1, d1 * (float)((lo >> 24) & 0xFu) - mm1,
+                                   d1 * (float)(hi & 0xFu) - mm1, d1 * (float)((hi >> 8) & 0xFu) - mm1,
+                                   d1 * (float)((hi >> 16) & 0xFu) - mm1, d1 * (float)((hi >> 24) & 0xFu) - mm1);
+                float8 xv = vload8(0, x + g * 8);
+                acc += dot(wv.lo(), xv.lo()) + dot(wv.hi(), xv.hi());
+            }
+        } else if (w.qt == QT_Q6_K) {
+            // dequant8's Q6_K lanes with the lane's 8 low-nibble and 8
+            // high-bit bytes read as halfwords (210-byte blocks are only
+            // 2-byte aligned), half the loads of a byte at a time.
+            const uchar* row = w.p + (uint64_t)n * (uint64_t)(w.k / 256) * 210ul;
+            for (int g = lane; g < w.k / 8; g += sgs) {
+                const uchar* blk = row + (uint64_t)(g >> 5) * 210ul;
+                int j = (g >> 2) & 7, l = g & 3;
+                int hh = j >> 2, q = j & 3;
+                const ushort* ql = reinterpret_cast<const ushort*>(blk + 64 * hh + 32 * (q & 1) + 8 * l);
+                const ushort* qh = reinterpret_cast<const ushort*>(blk + 128 + 32 * hh + 8 * l);
+                float ds = f16_at(blk + 208) * (float)((char)blk[192 + 8 * hh + 2 * q + (l >> 1)]);
+                int nib = 4 * (q >> 1), hs = 2 * q;
+                float wv8[8];
+                for (int v = 0; v < 4; v++) {
+                    uint lo = ql[v], hi = qh[v];
+                    int x0 = (int)(((lo >> nib) & 0xFu) | (((hi >> hs) & 3u) << 4));
+                    int x1 = (int)(((lo >> (8 + nib)) & 0xFu) | (((hi >> (8 + hs)) & 3u) << 4));
+                    wv8[2 * v] = ds * (float)(x0 - 32);
+                    wv8[2 * v + 1] = ds * (float)(x1 - 32);
+                }
+                float8 wv = float8(wv8[0], wv8[1], wv8[2], wv8[3], wv8[4], wv8[5], wv8[6], wv8[7]);
+                float8 xv = vload8(0, x + g * 8);
+                acc += dot(wv.lo(), xv.lo()) + dot(wv.hi(), xv.hi());
             }
         } else if (w.cols > 0) {
             // 256-element super-blocks, eight weights at a time.
@@ -274,7 +356,7 @@ inline void run(const Ctx& c, const Model& m, const Scratch& s, const Kv* kv,
                 const float* x_in, float* logits, int pos) {
     const int per_layer = m.start[S_LAYER];
     const int layer_tasks = m.n_layers * per_layer;
-    const int total = layer_tasks + 1 + m.head_tasks;
+    const int total = layer_tasks + m.head_tasks;
     const int q_dim = m.n_head * m.hd, kv_dim = m.n_kv * m.hd;
     const int seq = pos + 1;
     auto done = [&](int stage) { return s.sync + (1 + stage) * SYNC_STRIDE; };
@@ -295,20 +377,15 @@ inline void run(const Ctx& c, const Model& m, const Scratch& s, const Kv* kv,
             sub = r - m.start[st];
             stage = layer * S_LAYER + st;
             need = st > 0 ? m.count[st - 1] : m.count[S_LAYER - 1];
-        } else if (task == layer_tasks) {
-            layer = m.n_layers;
-            sub = 0;
-            stage = m.n_layers * S_LAYER;
-            need = m.count[S_LAYER - 1];
         } else {
             layer = m.n_layers;
-            sub = task - layer_tasks - 1;
-            stage = m.n_layers * S_LAYER + 1;
-            need = 1;
+            sub = task - layer_tasks;
+            stage = m.n_layers * S_LAYER;
+            need = m.count[S_LAYER - 1];
         }
         if (stage > 0) c.wait_for(done(stage - 1), (uint)need);
         if (m.skip) {
-            int kind = layer < m.n_layers ? stage - layer * S_LAYER : stage == m.n_layers * S_LAYER ? 8 : 9;
+            int kind = layer < m.n_layers ? stage - layer * S_LAYER : S_LAYER;
             if ((m.skip >> kind) & 1) {
                 c.signal(done(stage));
                 continue;
@@ -316,12 +393,9 @@ inline void run(const Ctx& c, const Model& m, const Scratch& s, const Kv* kv,
         }
 
         if (layer == m.n_layers) {
-            if (stage == m.n_layers * S_LAYER) {
-                c.rmsnorm(s.x, m.out_norm, s.xn, m.h, m.eps);
-            } else {
-                int r0 = sub * m.head_rpt, nr = sycl::min(m.head_rpt, m.vocab - r0);
-                c.blocks(m.out, r0, nr, s.xn, [&](int r, float v) { logits[r] = v + (m.out_b ? m.out_b[r] : 0.0f); });
-            }
+            c.rmsnorm(s.x, m.out_norm, c.xn(), m.h, m.eps);
+            int r0 = sub * m.head_rpt, nr = sycl::min(m.head_rpt, m.vocab - r0);
+            c.blocks(m.out, r0, nr, c.xn(), [&](int r, float v) { logits[r] = v + (m.out_b ? m.out_b[r] : 0.0f); });
             c.signal(done(stage));
             continue;
         }
@@ -329,15 +403,9 @@ inline void run(const Ctx& c, const Model& m, const Scratch& s, const Kv* kv,
         const Layer& L = m.layers[layer];
         const Kv& cache = kv[layer];
         switch (stage - layer * S_LAYER) {
-        case S_NORM1: {
-            const float* src = layer == 0 ? x_in : s.x;
-            if (layer == 0) {
-                for (int i = c.t(); i < m.h; i += WG) s.x[i] = x_in[i];
-            }
-            c.rmsnorm(src, L.attn_norm, s.xn, m.h, m.eps);
-            break;
-        }
         case S_QKV: {
+            // Layer 0 reads the embedding; its output projection adds to it.
+            c.rmsnorm(layer == 0 ? x_in : s.x, L.attn_norm, c.xn(), m.h, m.eps);
             // Each of the Q, K and V ranges is split into whole tasks, so a
             // task never straddles two ranges.
             int rpt = m.rpt[S_QKV];
@@ -347,7 +415,7 @@ inline void run(const Ctx& c, const Model& m, const Scratch& s, const Kv* kv,
             const W& w = L.qkv[g];
             int base = g == 0 ? 0 : g == 1 ? q_dim : q_dim + kv_dim;
             const float* b = L.qkv_b[g];
-            c.blocks(w, row, sycl::min(rpt, w.n - row), s.xn,
+            c.blocks(w, row, sycl::min(rpt, w.n - row), c.xn(),
                      [&](int r, float v) { s.qkv[base + r] = v + (b ? b[r] : 0.0f); });
             break;
         }
@@ -384,15 +452,32 @@ inline void run(const Ctx& c, const Model& m, const Scratch& s, const Kv* kv,
             const float* kc = cache.k + (int64_t)kh * cache.cap * m.hd;
             const float* vc = cache.v + (int64_t)kh * cache.cap * m.hd;
             float* sc = s.scores + (int64_t)h * s.scores_cap;
-            float mx = -std::numeric_limits<float>::infinity();
-            for (int p = c.t(); p < seq; p += WG) {
-                const float* kr = kc + (int64_t)p * m.hd;
-                float acc = 0.0f;
-                for (int d = 0; d < m.hd; d++) acc += q[d] * kr[d];
-                float v = acc * m.scale;
-                sc[p] = v;
-                mx = fmax(mx, v);
+            // One sub-group per position, its lanes across the head
+            // dimension (coalesced key reads), with the query in local memory.
+            float* qv = c.head();
+            for (int d = c.t(); d < m.hd; d += WG) qv[d] = q[d];
+            c.barrier();
+            {
+                auto sg = c.it.get_sub_group();
+                int lane = (int)sg.get_local_linear_id(), sgs = (int)sg.get_local_linear_range();
+                int id = (int)sg.get_group_linear_id(), nsg = (int)sg.get_group_linear_range();
+                // Every sub-group reduces the same number of times (past
+                // the end it contributes nothing), as in each_row.
+                for (int b = 0; b < seq; b += nsg) {
+                    int p = b + id;
+                    float acc = 0.0f;
+                    if (p < seq) {
+                        const float* kr = kc + (int64_t)p * m.hd;
+                        for (int d = lane; d < m.hd; d += sgs) acc += qv[d] * kr[d];
+                    }
+                    acc = sycl::reduce_over_group(sg, acc, sycl::plus<float>());
+                    if (p < seq && lane == 0) sc[p] = acc * m.scale;
+                }
             }
+            sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::work_group);
+            c.barrier();
+            float mx = -std::numeric_limits<float>::infinity();
+            for (int p = c.t(); p < seq; p += WG) mx = fmax(mx, sc[p]);
             mx = c.group_max(mx);
             float sum = 0.0f;
             for (int p = c.t(); p < seq; p += WG) {
@@ -407,6 +492,8 @@ inline void run(const Ctx& c, const Model& m, const Scratch& s, const Kv* kv,
             c.barrier();
             for (int d = c.t(); d < m.hd; d += WG) {
                 float acc = 0.0f;
+                // Unrolled so the value loads overlap; the sum stays in order.
+                #pragma unroll 8
                 for (int p = 0; p < seq; p++) acc += vc[(int64_t)p * m.hd + d] * sc[p];
                 s.ctx[h * m.hd + d] = acc;
             }
@@ -414,16 +501,15 @@ inline void run(const Ctx& c, const Model& m, const Scratch& s, const Kv* kv,
         }
         case S_OPROJ: {
             int r0 = sub * m.rpt[S_OPROJ], nr = sycl::min(m.rpt[S_OPROJ], m.h - r0);
-            c.blocks(L.o, r0, nr, s.ctx, [&](int r, float v) { s.x[r] = s.x[r] + (v + (L.o_b ? L.o_b[r] : 0.0f)); });
+            const float* res = layer == 0 ? x_in : s.x;
+            c.blocks(L.o, r0, nr, s.ctx, [&](int r, float v) { s.x[r] = res[r] + (v + (L.o_b ? L.o_b[r] : 0.0f)); });
             break;
         }
-        case S_NORM2:
-            c.rmsnorm(s.x, L.ffn_norm, s.xn, m.h, m.eps);
-            break;
         case S_GATEUP: {
+            c.rmsnorm(s.x, L.ffn_norm, c.xn(), m.h, m.eps);
             int r0 = sub * m.rpt[S_GATEUP], nr = sycl::min(m.rpt[S_GATEUP], m.ffn - r0);
             c.each_row(r0, nr,
-                       [&](int n) { return unary_f(c.sg_dot(L.gate, n, s.xn), OP_SILU) * c.sg_dot(L.up, n, s.xn); },
+                       [&](int n) { return unary_f(c.sg_dot(L.gate, n, c.xn()), OP_SILU) * c.sg_dot(L.up, n, c.xn()); },
                        [&](int r, float v) { s.act[r] = v; });
             break;
         }

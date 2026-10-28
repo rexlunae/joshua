@@ -9,8 +9,8 @@
 //! writes its keys and values into the same per-layer [`SeqKvCache`]
 //! buffers, so the two paths interleave freely within a session.
 //!
-//! `JOSHUA_MEGAKERNEL_GROUPS=<n>` overrides the work-groups each launch
-//! uses (default: one per compute unit).
+//! `JOSHUA_MEGAKERNEL_GROUPS=<n>` lowers the work-groups each launch
+//! uses (default and maximum: one per compute unit).
 //!
 //! [`SeqKvCache`]: crate::attention::SeqKvCache
 

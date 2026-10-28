@@ -269,7 +269,7 @@ fn sycl_megakernel_profile() {
     let full = time(&mut fused);
     assert!(joshua::megakernel::fused_steps() > before, "the megakernel did not run");
     eprintln!("fused                 {full:8.2} ms/step");
-    let kinds = ["norm1", "qkv", "q/k prep", "attention", "out proj", "norm2", "gate/up", "down", "final norm", "head"];
+    let kinds = ["qkv", "q/k prep", "attention", "out proj", "gate/up", "down", "head"];
     for (k, name) in kinds.iter().enumerate() {
         std::env::set_var("JOSHUA_MEGAKERNEL_SKIP", (1u32 << k).to_string());
         let t = time(&mut fused);

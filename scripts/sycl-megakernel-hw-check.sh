@@ -16,7 +16,8 @@
 #   CXX                     SYCL compiler for the bridge (default: icpx)
 #   JOSHUA_SYCL_LIBRARY     use an existing bridge instead of building one
 #   JOSHUA_MEGAKERNEL_GGUF  real model for the real-shape parity check
-#   GROUPS                  work-group counts to try (default: "64 256 0")
+#   GROUPS                  work-group counts to try (default: "64 256 0";
+#                           counts above the compute units are clamped to them)
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

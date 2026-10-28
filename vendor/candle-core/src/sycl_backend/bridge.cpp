@@ -311,6 +311,7 @@ joshua_sycl::mega::W mega_w(Context& ctx, const MegaWDesc& d, int n, int k, cons
     mega::W w{};
     w.p = static_cast<const uchar*>(b.data) + d.off;
     w.qt = d.qt; w.qk = d.qk; w.bsz = d.bsz; w.n = n; w.k = k; w.cols = d.cols;
+    w.al16 = reinterpret_cast<uintptr_t>(w.p) % 16 == 0;
     return w;
 }
 }
@@ -327,6 +328,8 @@ API int joshua_sycl_mega_new(uintptr_t h, const MegaModelDesc* md, const MegaLay
         require(d.hd > 0 && d.hd <= mega::MAX_HD && d.n_rot > 0 && d.n_rot <= d.hd && d.n_rot % 2 == 0,
                 "megakernel: unsupported head size");
         require(d.ffn > 0 && d.vocab > 0 && d.max_pos > 0, "megakernel: bad model shape");
+        require((mega::LOCAL_FIXED + (size_t)d.h) * sizeof(float) <= ctx.queue.get_device().get_info<sycl::info::device::local_mem_size>(),
+                "megakernel: hidden size exceeds local memory");
         auto plan = std::make_unique<MegaPlan>();
         plan->owner = owner;
         plan->max_pos = d.max_pos;
@@ -361,10 +364,11 @@ API int joshua_sycl_mega_new(uintptr_t h, const MegaModelDesc* md, const MegaLay
             L.down = mega_w(ctx, s.down, d.h, d.ffn, "ffn down");
         }
         auto& q = ctx.queue;
-        // One work-group per compute unit by default: more only add
-        // spinning waiters (measured on the Arc Pro B50).
-        size_t groups = d.groups > 0 ? (size_t)d.groups
-            : (size_t)q.get_device().get_info<sycl::info::device::max_compute_units>();
+        // One work-group per compute unit by default, and never more: more
+        // only add spinning waiters (measured on the Arc Pro B50), and a
+        // 192-group launch there hung the GPU until the driver was reset.
+        size_t cus = (size_t)q.get_device().get_info<sycl::info::device::max_compute_units>();
+        size_t groups = d.groups > 0 ? std::min((size_t)d.groups, cus) : cus;
         groups = std::max<size_t>(1, groups);
         // Rows per task: about one task per work-group for each stage.
         auto per_task = [&](int rows) {
@@ -372,19 +376,20 @@ API int joshua_sycl_mega_new(uintptr_t h, const MegaModelDesc* md, const MegaLay
             return (int)((r + mega::ROWS - 1) / mega::ROWS * mega::ROWS);
         };
         auto tasks = [](int rows, int rpt) { return (rows + rpt - 1) / rpt; };
+        // Q, K and V are split into whole tasks each, so round up until the
+        // three together still fit one round of work-groups.
         int qkv_rpt = per_task(q_dim + 2 * kv_dim);
+        while ((size_t)(tasks(q_dim, qkv_rpt) + 2 * tasks(kv_dim, qkv_rpt)) > groups && qkv_rpt < q_dim) qkv_rpt += mega::ROWS;
         for (int i = 0; i < mega::S_LAYER; i++) m.rpt[i] = mega::ROWS;
         m.rpt[mega::S_QKV] = qkv_rpt;
         m.rpt[mega::S_OPROJ] = per_task(d.h);
         m.rpt[mega::S_GATEUP] = per_task(d.ffn);
         m.rpt[mega::S_DOWN] = per_task(d.h);
         m.head_rpt = per_task(d.vocab);
-        m.count[mega::S_NORM1] = 1;
         m.count[mega::S_QKV] = tasks(q_dim, qkv_rpt) + 2 * tasks(kv_dim, qkv_rpt);
         m.count[mega::S_PREP] = d.n_head + d.n_kv;
         m.count[mega::S_ATTN] = d.n_head;
         m.count[mega::S_OPROJ] = tasks(d.h, m.rpt[mega::S_OPROJ]);
-        m.count[mega::S_NORM2] = 1;
         m.count[mega::S_GATEUP] = tasks(d.ffn, m.rpt[mega::S_GATEUP]);
         m.count[mega::S_DOWN] = tasks(d.h, m.rpt[mega::S_DOWN]);
         m.start[0] = 0;
@@ -398,8 +403,8 @@ API int joshua_sycl_mega_new(uintptr_t h, const MegaModelDesc* md, const MegaLay
         plan->kv_dev = sycl::malloc_device<mega::Kv>(d.n_layers, q);
         require(plan->kv_dev != nullptr, "megakernel: device allocation failed");
 
-        size_t floats = (size_t)d.h * 2 + (size_t)(q_dim + 2 * kv_dim) + (size_t)q_dim * 2 + (size_t)d.ffn;
-        size_t stages = (size_t)d.n_layers * mega::S_LAYER + 2;
+        size_t floats = (size_t)d.h + (size_t)(q_dim + 2 * kv_dim) + (size_t)q_dim * 2 + (size_t)d.ffn;
+        size_t stages = (size_t)d.n_layers * mega::S_LAYER + 1;
         plan->sync_bytes = (stages + 1) * mega::SYNC_STRIDE * sizeof(uint32_t);
         // Counters first, so each starts a cache line.
         plan->block = sycl::aligned_alloc_device(256, plan->sync_bytes + floats * 4, q);
@@ -408,14 +413,13 @@ API int joshua_sycl_mega_new(uintptr_t h, const MegaModelDesc* md, const MegaLay
         sc.sync = static_cast<uint32_t*>(plan->block);
         float* f = reinterpret_cast<float*>(static_cast<char*>(plan->block) + plan->sync_bytes);
         sc.x = f; f += d.h;
-        sc.xn = f; f += d.h;
         sc.qkv = f; f += q_dim + 2 * kv_dim;
         sc.q = f; f += q_dim;
         sc.ctx = f; f += q_dim;
         sc.act = f; f += d.ffn;
         sc.scores = nullptr; sc.scores_cap = 0;
 
-        size_t total = (size_t)d.n_layers * m.start[mega::S_LAYER] + 1 + m.head_tasks;
+        size_t total = (size_t)d.n_layers * m.start[mega::S_LAYER] + m.head_tasks;
         plan->groups = std::max<size_t>(1, std::min(groups, total));
         *out = reinterpret_cast<uintptr_t>(plan.release());
     });
@@ -484,7 +488,7 @@ API int joshua_sycl_mega_decode(uintptr_t h, uintptr_t p, const MegaKvDesc* kv, 
         auto* kv_dev = plan.kv_dev;
         size_t groups = plan.groups;
         ctx.submit([&](sycl::handler& cgh) {
-            sycl::local_accessor<float, 1> local(sycl::range<1>(mega::LOCAL_FLOATS), cgh);
+            sycl::local_accessor<float, 1> local(sycl::range<1>(mega::LOCAL_FIXED + (size_t)m.h), cgh);
             cgh.parallel_for(sycl::nd_range<1>(groups * WG, WG), [=](sycl::nd_item<1> it) MEGA_SG_SIZE {
                 mega::Ctx c{it, local.template get_multi_ptr<sycl::access::decorated::no>().get()};
                 mega::run(c, model, scratch, kv_dev, xin, out, pos);
