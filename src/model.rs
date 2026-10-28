@@ -638,6 +638,35 @@ impl QuantizedModel {
         // architecture.
         engram_tier: crate::placement::EngramTier,
     ) -> Result<Self> {
+        Self::from_gguf_mmap_placed_with_ssd(
+            gguf,
+            reader,
+            device,
+            expert_device,
+            mmap,
+            file,
+            n_ctx,
+            device_expert_cache_bytes,
+            engram_tier,
+            crate::placement::SsdExpertCache::Unset,
+        )
+    }
+
+    /// [`QuantizedModel::from_gguf_mmap_placed`] plus the Tier-3
+    /// `--ssd-expert-cache` policy, which only `deepseek4` consumes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_gguf_mmap_placed_with_ssd<R: Read + Seek>(
+        gguf: gguf_file::Content,
+        reader: &mut R,
+        device: &Device,
+        expert_device: &Device,
+        mmap: Option<std::sync::Arc<memmap2::Mmap>>,
+        file: Option<std::sync::Arc<std::fs::File>>,
+        n_ctx: usize,
+        device_expert_cache_bytes: Option<u64>,
+        engram_tier: crate::placement::EngramTier,
+        ssd_expert_cache: crate::placement::SsdExpertCache,
+    ) -> Result<Self> {
         let arch = Architecture::detect(&gguf.metadata).map_err(candle_core::Error::Msg)?;
 
         tracing::info!("Detected model architecture: {}", arch.display_name());
@@ -768,6 +797,7 @@ impl QuantizedModel {
                     n_ctx,
                     device_expert_cache_bytes,
                     engram_tier,
+                    ssd_expert_cache,
                 )
                 .map(Self::DeepSeek4)
             }
@@ -829,6 +859,20 @@ impl QuantizedModel {
         match self {
             Self::DeepSeek4(m) => m.device_expert_cache(),
             _ => None,
+        }
+    }
+
+    /// The Tier-3 SSD staging slab's budget, occupancy and counters
+    /// (`deepseek4` when `--ssd-expert-cache` engaged one), for diagnostics.
+    pub fn ssd_expert_cache(&self) -> Option<crate::quantized_deepseek4::SsdCacheReport> {
+        #[cfg(unix)]
+        match self {
+            Self::DeepSeek4(m) => m.ssd_expert_cache(),
+            _ => None,
+        }
+        #[cfg(not(unix))]
+        {
+            None
         }
     }
 

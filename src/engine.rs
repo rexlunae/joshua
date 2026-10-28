@@ -901,6 +901,9 @@ pub struct Engine {
     /// Resolved bounded VRAM expert-cache byte budget the loaders get (see
     /// [`EngineOptions::device_expert_cache`]); `None` disables.
     device_expert_cache: Option<u64>,
+    /// The Tier-3 `--ssd-expert-cache` policy the loader resolves into an NVMe
+    /// staging-slab budget at load (see [`EngineOptions::ssd_expert_cache`]).
+    ssd_expert_cache: crate::placement::SsdExpertCache,
     /// Where a DeepSeek-V4.1 model's Engram n-gram tables are resident (a
     /// separate placement policy from the routed experts; see
     /// [`EngineOptions::engram_tier`]).
@@ -2589,6 +2592,7 @@ impl Engine {
             pin_hot_experts,
             expert_cache_auto,
             device_expert_cache,
+            ssd_expert_cache: options.ssd_expert_cache,
             engram_tier: options.engram_tier,
             prefill_chunk,
             prefill_budget,
@@ -4976,7 +4980,7 @@ impl Engine {
         // Hand the loader the mapping so architectures Joshua implements
         // itself can borrow weights in place rather than copying them.
         let load = || {
-            QuantizedModel::from_gguf_mmap_placed(
+            QuantizedModel::from_gguf_mmap_placed_with_ssd(
                 gguf,
                 &mut cursor,
                 &self.dense_device,
@@ -4986,6 +4990,7 @@ impl Engine {
                 self.n_ctx as usize,
                 self.device_expert_cache,
                 self.engram_tier,
+                self.ssd_expert_cache,
             )
         };
         // Read the NextN block only when it will draft.
@@ -5018,6 +5023,16 @@ impl Engine {
                 budget = cache.slots * crate::residency::HOT_SET_SHARE.0
                     / crate::residency::HOT_SET_SHARE.1;
             }
+        }
+        // Tier 3: the SSD staging slab's engaged budget, alongside the VRAM
+        // cache line above.  Only a deepseek4 load can have one.
+        if let Some(cache) = model.ssd_expert_cache() {
+            tracing::info!(
+                "ssd expert cache (Tier 3): {} experts ({:.2} GiB staged-RAM budget); \
+                 hot/staged experts are pread(2)-streamed from the model file",
+                cache.slots,
+                cache.budget_bytes as f64 / 2f64.powi(30),
+            );
         }
         model.set_pin_hot_experts(budget);
         model.set_prefix_checkpoints(self.prefix_checkpoints);

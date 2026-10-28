@@ -356,6 +356,7 @@ mod tests {
 /// gate/up/down]` or deepseek4's IQ2/Q2_K device experts).  The slot pool
 /// treats it as an opaque, byte-sized payload.
 pub trait DeviceExpertSlot: Send + Sync + 'static {
+
     /// Bytes this slot occupies on the device (for LRU byte accounting).
     fn device_bytes(&self) -> u64;
 }
@@ -1102,21 +1103,28 @@ impl<T: DeviceExpertSlot> Drop for ExpertUploader<T> {
     }
 }
 
-/// Host residency plus an optional device slot pool, behind the one
-/// [`ExpertResidency`] handle a loader stores.
+/// Host residency plus optional Tier-3 (NVMe staging slab) and device slot
+/// pool, behind the one [`ExpertResidency`] handle a loader stores.
 ///
-/// `acquire` advises the host pages (the CPU backend) — unless the expert
-/// is already resident on the device, whose copy is the one that runs — *and*
-/// asks the uploader for a device slot in the background; `capacity` stays the host
-/// count (it sizes the host hot-expert budget, a different unit from device
-/// slots — those are reported through [`CompositeResidency::device`]).  The
-/// hot set is advisory and model-wide: sessions sharing the weights replace
-/// it in turn, last writer wins.
+/// `acquire` asks the NVMe stager for a background stage *and* advises the
+/// host pages (the CPU backend) — unless the expert is already resident on the
+/// device or staged in the NVMe slab, whose copy is the one that runs — *and*
+/// asks the uploader for a device slot in the background; `capacity` stays the
+/// host count (it sizes the host hot-expert budget, a different unit from
+/// device slots — reported through [`CompositeResidency::device`] — and from the
+/// slab's byte budget — reported through [`CompositeResidency::nvme`]).  The
+/// hot set is advisory and model-wide: sessions sharing the weights replace it
+/// in turn, last writer wins.
 pub struct CompositeResidency<T: DeviceExpertSlot> {
     cpu: CpuResidency,
     device: Option<Arc<DeviceResidency<T>>>,
     uploader: Option<Arc<ExpertUploader<T>>>,
-    /// Advise the host pages of device-resident experts too (inclusive
+    /// Tier 3: the NVMe staging slab, when `--ssd-expert-cache` engaged one.
+    /// Its payload is the object-safe [`NvmeExpertSlot`] view, so it composes
+    /// with a device pool of a different payload type.
+    #[cfg(unix)]
+    nvme: Option<Arc<NvmeResidency<ErasedNvmeSlot>>>,
+    /// Advise the host pages of staged/device-resident experts too (inclusive
     /// tiers).  Off by default: see `acquire`.
     advise_device_resident: bool,
 }
@@ -1128,6 +1136,8 @@ impl<T: DeviceExpertSlot> CompositeResidency<T> {
             cpu,
             device: None,
             uploader: None,
+            #[cfg(unix)]
+            nvme: None,
             advise_device_resident: false,
         }
     }
@@ -1140,12 +1150,40 @@ impl<T: DeviceExpertSlot> CompositeResidency<T> {
         pool: Arc<DeviceResidency<T>>,
         uploader: Arc<ExpertUploader<T>>,
     ) -> Self {
-        Self {
-            cpu,
-            device: Some(pool),
-            uploader: Some(uploader),
-            advise_device_resident: false,
-        }
+        Self::host(cpu).device_pool(pool, uploader)
+    }
+
+    /// [`CompositeResidency::with_device_pool`] as a builder step (a loader may
+    /// attach the optional tiers before the host backend; see
+    /// [`CompositeResidency::with_cpu`]).
+    pub fn device_pool(
+        mut self,
+        pool: Arc<DeviceResidency<T>>,
+        uploader: Arc<ExpertUploader<T>>,
+    ) -> Self {
+        self.device = Some(pool);
+        self.uploader = Some(uploader);
+        self
+    }
+
+    /// Attach the host backend.  The host tier is always wanted (it is the
+    /// fallback every miss runs on), so this always yields `Some`; it exists so
+    /// a loader that does not yet know which optional tiers engaged can build
+    /// them first and supply the host handles last.
+    pub fn with_cpu(mut self, cpu: CpuResidency) -> Option<Self> {
+        self.cpu = cpu;
+        Some(self)
+    }
+
+    /// Attach the Tier-3 NVMe staging slab (see [`NvmeResidency`]): `acquire`
+    /// then also queues a background stage, the hot set follows through to it,
+    /// and `release` frees the staged copy.  Exclusive tiers: host advice skips
+    /// experts the slab already holds (and the slab's own release hook drops a
+    /// staged expert's page-cache pages once its stage settles).
+    #[cfg(unix)]
+    pub fn with_nvme(mut self, nvme: Arc<NvmeResidency<ErasedNvmeSlot>>) -> Self {
+        self.nvme = Some(nvme);
+        self
     }
 
     /// Advise the host pages of device-resident experts as well (the
@@ -1163,6 +1201,34 @@ impl<T: DeviceExpertSlot> CompositeResidency<T> {
     /// The background uploader, when a device pool exists.
     pub fn uploader(&self) -> Option<&Arc<ExpertUploader<T>>> {
         self.uploader.as_ref()
+    }
+
+    /// The Tier-3 NVMe staging slab, when one exists.
+    #[cfg(unix)]
+    pub fn nvme(&self) -> Option<&Arc<NvmeResidency<ErasedNvmeSlot>>> {
+        self.nvme.as_ref()
+    }
+
+    /// The staged payload of `(layer, expert)` from the Tier-3 slab, or `None`
+    /// (run the host path).  A hit refreshes the slot's recency; see
+    /// [`NvmeExpertSlot`].
+    #[cfg(unix)]
+    pub fn nvme_lookup(&self, layer: u32, expert: u32) -> Option<Arc<dyn NvmeExpertSlot>> {
+        self.nvme
+            .as_ref()
+            .and_then(|slab| slab.lookup(layer, expert))
+            .map(|slot| slot.payload())
+    }
+
+    /// Whether the Tier-3 slab holds `(layer, expert)` (without touching
+    /// recency).  Always `false` without a slab.
+    pub fn nvme_contains(&self, layer: u32, expert: u32) -> bool {
+        #[cfg(unix)]
+        if let Some(slab) = &self.nvme {
+            return slab.contains(layer, expert);
+        }
+        let _ = (layer, expert);
+        false
     }
 }
 
@@ -1209,15 +1275,24 @@ impl DeviceCacheReport {
 
 impl<T: DeviceExpertSlot> ExpertResidency for CompositeResidency<T> {
     fn acquire(&self, layer: u32, expert: u32) {
-        // An expert resident on the device runs there: advising its host
-        // pages would only duplicate the card's contents in the page cache,
-        // evicting experts the host still has to run (the two tiers are
-        // exclusive; see `ExpertUploader::spawn_with_release`).
+        // Tier 3 first: queue a background stage (non-blocking — the stager
+        // thread does the pread), so the slab can serve this expert on a later
+        // step.  It commits nothing now, so it is safe even when the expert is
+        // also wanted on the host this step.
+        #[cfg(unix)]
+        if let Some(slab) = &self.nvme {
+            slab.acquire(layer, expert);
+        }
+        // An expert resident on the device — or staged in the NVMe slab — runs
+        // from there: advising its host pages would only duplicate that copy in
+        // the page cache, evicting experts the host still has to run (the tiers
+        // are exclusive; see `ExpertUploader::spawn_with_release` and
+        // `NvmeResidency`'s release hook).
         let on_device = self
             .device
             .as_ref()
             .is_some_and(|d| d.contains(layer, expert));
-        if self.advise_device_resident || !on_device {
+        if self.advise_device_resident || (!on_device && !self.nvme_contains(layer, expert)) {
             self.cpu.acquire(layer, expert);
         }
         if let Some(u) = &self.uploader {
@@ -1229,6 +1304,10 @@ impl<T: DeviceExpertSlot> ExpertResidency for CompositeResidency<T> {
         if let Some(d) = &self.device {
             d.release(layer, expert);
         }
+        #[cfg(unix)]
+        if let Some(slab) = &self.nvme {
+            slab.release(layer, expert);
+        }
     }
 
     fn capacity(&self) -> usize {
@@ -1236,18 +1315,37 @@ impl<T: DeviceExpertSlot> ExpertResidency for CompositeResidency<T> {
     }
 
     fn mark_hot(&self, layer: u32, expert: u32) {
+        #[cfg(unix)]
+        if let Some(slab) = &self.nvme {
+            slab.mark_hot(layer, expert);
+        }
         if let Some(d) = &self.device {
             d.mark_hot(layer, expert);
         }
     }
 
     fn unmark_hot(&self, layer: u32, expert: u32) {
+        #[cfg(unix)]
+        if let Some(slab) = &self.nvme {
+            slab.unmark_hot(layer, expert);
+        }
         if let Some(d) = &self.device {
             d.unmark_hot(layer, expert);
         }
     }
 
     fn replace_hot_set(&self, hot: &[(u32, u32)]) {
+        // The Tier-3 slab follows the same hot set: protected from LRU
+        // eviction, and staged ahead of the per-step miss churn — the device
+        // pool's reasoning, which is what makes a small partial cache mostly
+        // hit rather than chase each step's misses.
+        #[cfg(unix)]
+        if let Some(slab) = &self.nvme {
+            slab.replace_hot_set(hot);
+            for &(l, e) in hot {
+                slab.acquire(l, e);
+            }
+        }
         if let Some(d) = &self.device {
             d.replace_hot_set(hot);
         }
@@ -1260,6 +1358,18 @@ impl<T: DeviceExpertSlot> ExpertResidency for CompositeResidency<T> {
                 u.request(l, e);
             }
         }
+    }
+
+    fn prefetch_hint(&self, layer: u32, expert: u32) {
+        // The speculative next-step expert is a pure hint for the slab too:
+        // `NvmeResidency::prefetch_hint` enqueues a deduplicated background
+        // stage — the slab's counterpart of the CPU backend's `MADV_WILLNEED`
+        // this default forwards to.
+        #[cfg(unix)]
+        if let Some(slab) = &self.nvme {
+            slab.prefetch_hint(layer, expert);
+        }
+        self.cpu.acquire(layer, expert);
     }
 }
 
@@ -1284,14 +1394,75 @@ pub trait NvmeStaged: Send + Sync + 'static {
 /// pool machinery of [`DeviceResidency`].  The pool only needs a sized carrier
 /// ([`DeviceExpertSlot::device_bytes`]) to reserve/evict; `NvmeStaged` is the
 /// real payload behind it.
+///
+/// Public (with a private field) only so the slab's type can be named outside
+/// this module.  A loader's slab is the erased spelling
+/// `NvmeResidency<ErasedNvmeSlot>` (see [`NvmeResidency::new_erased`]),
+/// because the [`CompositeResidency`] that stores it may also hold a device
+/// pool of a different payload type.
 #[cfg(unix)]
-struct NvmeSlot<T: NvmeStaged> {
+pub struct NvmeSlot<T: NvmeStaged> {
     payload: Arc<T>,
+}
+
+/// A sized carrier for the object-safe payload, so the erased slab is a normal
+/// `NvmeResidency<ErasedNvmeSlot>` over a `Sized` type (its inner payload is the
+/// `Arc<dyn NvmeExpertSlot>`).
+#[cfg(unix)]
+#[derive(Clone)]
+pub struct ErasedNvmeSlot {
+    payload: Arc<dyn NvmeExpertSlot>,
+}
+
+#[cfg(unix)]
+impl ErasedNvmeSlot {
+    /// The staged payload behind this carrier.
+    pub fn payload(&self) -> Arc<dyn NvmeExpertSlot> {
+        Arc::clone(&self.payload)
+    }
+}
+
+#[cfg(unix)]
+impl NvmeStaged for ErasedNvmeSlot {
+    fn staged_bytes(&self) -> u64 {
+        NvmeExpertSlot::staged_bytes(&*self.payload)
+    }
+}
+
+/// The object-safe view of a staged expert, for
+/// [`CompositeResidency::with_nvme`].
+///
+/// A composite may carry an NVMe slab *and* a device pool, whose payload types
+/// differ, so it has to name exactly one object-safe payload type for the slab.
+/// This is that name: every [`NvmeStaged`] payload implements it, and
+/// [`NvmeResidency::new_erased`] builds the slab over it.  A loader's dispatch
+/// then downcasts a [`CompositeResidency::nvme_lookup`] hit back to its own
+/// expert type — which always succeeds, because only that loader's `stage`
+/// closure produces the slab's payloads.
+#[cfg(unix)]
+pub trait NvmeExpertSlot: NvmeStaged + std::any::Any + Send + Sync + 'static {
+    /// Bytes this staged payload occupies in the host-RAM slab (the same value
+    /// as [`NvmeStaged::staged_bytes`]).
+    fn staged_bytes(&self) -> u64;
+}
+
+#[cfg(unix)]
+impl<T: NvmeStaged + std::any::Any + Send + Sync + 'static> NvmeExpertSlot for T {
+    fn staged_bytes(&self) -> u64 {
+        NvmeStaged::staged_bytes(self)
+    }
 }
 
 #[cfg(unix)]
 impl<T: NvmeStaged> DeviceExpertSlot for NvmeSlot<T> {
     fn device_bytes(&self) -> u64 {
+        self.payload.staged_bytes()
+    }
+}
+
+#[cfg(unix)]
+impl<T: NvmeStaged> NvmeStaged for NvmeSlot<T> {
+    fn staged_bytes(&self) -> u64 {
         self.payload.staged_bytes()
     }
 }
@@ -1322,7 +1493,7 @@ impl<T: NvmeStaged> DeviceExpertSlot for NvmeSlot<T> {
 /// a wrong result.
 #[cfg(unix)]
 pub struct NvmeResidency<T: NvmeStaged> {
-    pool: Arc<DeviceResidency<NvmeSlot<T>>>,
+    pool: Option<Arc<DeviceResidency<NvmeSlot<T>>>>,
     stager: Option<Arc<ExpertUploader<NvmeSlot<T>>>>,
 }
 
@@ -1359,12 +1530,59 @@ impl<T: NvmeStaged> NvmeResidency<T> {
         let pool = Arc::new(DeviceResidency::new(capacity_bytes, per_expert_bytes, upload));
         let stager =
             Arc::new(ExpertUploader::spawn_with_release(Arc::clone(&pool), release, delay));
-        Self { pool, stager: Some(stager) }
+        NvmeResidency {
+            pool: Some(pool),
+            stager: Some(stager),
+        }
+    }
+
+    /// [`NvmeResidency::new_with_release`] built *directly* over the
+    /// [object-safe](NvmeExpertSlot) payload type, so one handle is both the
+    /// stager's fill target and the [`CompositeResidency`]'s view — the only
+    /// form a composite that also carries a device pool can hold.
+    ///
+    /// `stage` returns the loader's own staged expert (`T`); the slab stores it
+    /// behind `dyn NvmeExpertSlot`, and the loader's `lookup` downcasts it back
+    /// (see [`CompositeResidency::nvme_lookup`]).  Building it erased up front
+    /// (rather than converting a typed slab) keeps one pool and one stager, so
+    /// what `acquire` queues is exactly what `lookup` reads.
+    pub fn new_erased(
+        capacity_bytes: u64,
+        per_expert_bytes: u64,
+        stage: Arc<dyn Fn(u32, u32) -> Option<Arc<T>> + Send + Sync>,
+        release: Option<ReleaseHook>,
+        delay: std::time::Duration,
+    ) -> Arc<NvmeResidency<ErasedNvmeSlot>>
+    where
+        T: NvmeExpertSlot + Sized,
+    {
+        let upload: Arc<
+            dyn Fn(u32, u32) -> Option<Arc<NvmeSlot<ErasedNvmeSlot>>> + Send + Sync,
+        > = Arc::new(move |l, e| {
+            (stage)(l, e).map(|payload| {
+                Arc::new(NvmeSlot {
+                    payload: Arc::new(ErasedNvmeSlot { payload }),
+                })
+            })
+        });
+        let pool = Arc::new(DeviceResidency::new(capacity_bytes, per_expert_bytes, upload));
+        let stager =
+            Arc::new(ExpertUploader::spawn_with_release(Arc::clone(&pool), release, delay));
+        Arc::new(NvmeResidency {
+            pool: Some(pool),
+            stager: Some(stager),
+        })
+    }
+
+    fn pool(&self) -> &Arc<DeviceResidency<NvmeSlot<T>>> {
+        self.pool
+            .as_ref()
+            .expect("an NvmeResidency always owns its pool")
     }
 
     /// The byte budget this slab was built with.
     pub fn capacity_bytes(&self) -> u64 {
-        self.pool.capacity_bytes()
+        self.pool().capacity_bytes()
     }
 
     /// Ask for `(layer, expert)` to be staged in the background.  Returns
@@ -1381,7 +1599,7 @@ impl<T: NvmeStaged> NvmeResidency<T> {
     /// synchronous operation; dispatch backends that need the slot immediately,
     /// and tests, use this instead of the background [`NvmeResidency::acquire`]).
     pub fn stage(&self, layer: u32, expert: u32) {
-        self.pool.acquire(layer, expert);
+        self.pool().acquire(layer, expert);
     }
 
     /// A speculative `(layer, expert)` read-ahead: like
@@ -1396,7 +1614,7 @@ impl<T: NvmeStaged> NvmeResidency<T> {
     /// Release the staged form of `(layer, expert)` (free its slab bytes; the
     /// host path — and its page cache — takes over).
     pub fn release(&self, layer: u32, expert: u32) {
-        self.pool.release(layer, expert);
+        self.pool().release(layer, expert);
     }
 
     /// Tell the stager that the caller staged `(layer, expert)` itself (a
@@ -1419,48 +1637,48 @@ impl<T: NvmeStaged> NvmeResidency<T> {
     /// The staged host-RAM form of `(layer, expert)`, or `None` (run the host
     /// path).  A hit refreshes the slot's recency.
     pub fn lookup(&self, layer: u32, expert: u32) -> Option<Arc<T>> {
-        self.pool.lookup(layer, expert).map(|s| s.payload.clone())
+        self.pool().lookup(layer, expert).map(|s| Arc::clone(&s.payload))
     }
 
     /// Whether `(layer, expert)` is staged, without touching recency.
     pub fn contains(&self, layer: u32, expert: u32) -> bool {
-        self.pool.contains(layer, expert)
+        self.pool().contains(layer, expert)
     }
 
     /// Whether `(layer, expert)` is in the protected hot set right now.
     pub fn is_hot(&self, layer: u32, expert: u32) -> bool {
-        self.pool.is_hot(layer, expert)
+        self.pool().is_hot(layer, expert)
     }
 
     /// Protect `(layer, expert)` from LRU eviction (it is in the hot set).
     pub fn mark_hot(&self, layer: u32, expert: u32) {
-        self.pool.mark_hot(layer, expert);
+        self.pool().mark_hot(layer, expert);
     }
 
     /// Stop protecting `(layer, expert)` (it left the hot set).
     pub fn unmark_hot(&self, layer: u32, expert: u32) {
-        self.pool.unmark_hot(layer, expert);
+        self.pool().unmark_hot(layer, expert);
     }
 
     /// Replace the wholesale protected set; the pool caps it to a share of the
     /// slab's slots so evictable slots always exist.
     pub fn replace_hot_set(&self, hot: &[(u32, u32)]) {
-        self.pool.replace_hot_set(hot);
+        self.pool().replace_hot_set(hot);
     }
 
     /// Number of experts staged right now.
     pub fn resident(&self) -> usize {
-        self.pool.resident()
+        self.pool().resident()
     }
 
     /// Current staged bytes (reservations of stages in flight included).
     pub fn resident_bytes(&self) -> u64 {
-        self.pool.resident_bytes()
+        self.pool().resident_bytes()
     }
 
     /// Hit/miss/stage/eviction counters (a [`DeviceResidencyStats`] snapshot).
     pub fn stats(&self) -> DeviceResidencyStats {
-        self.pool.stats()
+        self.pool().stats()
     }
 
     /// Stage requests the stager has accepted.
@@ -1500,7 +1718,7 @@ impl<T: NvmeStaged> ExpertResidency for NvmeResidency<T> {
         NvmeResidency::release(self, layer, expert);
     }
     fn capacity(&self) -> usize {
-        self.pool.capacity()
+        self.pool().capacity()
     }
     fn mark_hot(&self, layer: u32, expert: u32) {
         NvmeResidency::mark_hot(self, layer, expert);
@@ -1522,7 +1740,7 @@ impl<T: NvmeStaged> Drop for NvmeResidency<T> {
         // Close the stager's channel and join it (it drains queued stages),
         // then release the pool.
         drop(self.stager.take());
-        drop(self.pool.clone());
+        drop(self.pool.take());
     }
 }
 
@@ -2167,5 +2385,177 @@ mod nvme_residency_tests {
         drain(&r);
         assert!(r.lookup(0, 1).is_some(), "prefetch hint staged the expert");
         drop(r);
+    }
+}
+
+/// The [`CompositeResidency`] composition with a Tier-3 slab attached: one
+/// handle drives host advice, NVMe stages and (when one exists) device uploads,
+/// and a staged expert's copy is reachable through `nvme_lookup`.  The payload
+/// types differ between the two tiers, which is what the erased slab is for.
+#[cfg(all(test, unix))]
+mod composite_nvme_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A fake staged payload with an identifying byte size (a loader's staged
+    /// expert in miniature).
+    struct FakeStaged(u64);
+    impl NvmeStaged for FakeStaged {
+        fn staged_bytes(&self) -> u64 {
+            self.0
+        }
+    }
+
+    /// A device-slot payload type that *differs* from the staged one.
+    struct FakeSlot(u64);
+    impl DeviceExpertSlot for FakeSlot {
+        fn device_bytes(&self) -> u64 {
+            self.0
+        }
+    }
+
+    fn handles(advised: &Arc<AtomicUsize>) -> super::ExpertHandles {
+        super::ExpertHandles {
+            gate: Arc::new(super::tests::CountingPrefetch(Arc::clone(advised))),
+            up: Arc::new(super::tests::CountingPrefetch(Arc::clone(advised))),
+            down: Arc::new(super::tests::CountingPrefetch(Arc::clone(advised))),
+        }
+    }
+
+    /// A slab as a loader builds it: `stage` counts its calls and returns a
+    /// `bytes`-sized payload for `(l, e)` with `l, e < n`.
+    fn staged_slab(
+        cap: u64,
+        per: u64,
+        n: usize,
+        bytes: u64,
+        stages: Arc<AtomicUsize>,
+    ) -> Arc<NvmeResidency<ErasedNvmeSlot>> {
+        let stage: Arc<dyn Fn(u32, u32) -> Option<Arc<FakeStaged>> + Send + Sync> =
+            Arc::new(move |l, e| {
+                ((l as usize) < n && (e as usize) < n).then(|| {
+                    stages.fetch_add(1, Ordering::Relaxed);
+                    Arc::new(FakeStaged(bytes))
+                })
+            });
+        NvmeResidency::new_erased(cap, per, stage, None, HOST_RELEASE_DELAY)
+    }
+
+    /// `acquire` queues a background stage and `nvme_lookup` hands it back as
+    /// the loader's own payload type; a staged expert is not re-advised on the
+    /// host; `capacity()` stays the host count.
+    #[test]
+    fn composite_drives_host_nvme_and_device_tiers() {
+        let advised = Arc::new(AtomicUsize::new(0));
+        let cpu = CpuResidency::new(vec![
+            vec![Some(handles(&advised)), Some(handles(&advised))],
+        ]);
+        let stages = Arc::new(AtomicUsize::new(0));
+        let slab = staged_slab(120, 30, 8, 30, Arc::clone(&stages));
+        let uploads = Arc::new(AtomicUsize::new(0));
+        let uploads2 = Arc::clone(&uploads);
+        let upload: Arc<dyn Fn(u32, u32) -> Option<Arc<FakeSlot>> + Send + Sync> =
+            Arc::new(move |_l, _e| {
+                uploads2.fetch_add(1, Ordering::Relaxed);
+                Some(Arc::new(FakeSlot(10)))
+            });
+        let pool = Arc::new(DeviceResidency::new(1000, 10, upload));
+        let uploader = Arc::new(ExpertUploader::spawn(Arc::clone(&pool)));
+        let comp = CompositeResidency::with_device_pool(cpu, Arc::clone(&pool), uploader)
+            .with_nvme(Arc::clone(&slab));
+
+        // `capacity()` is the host count — the unit the hot-expert budget is
+        // sized in — not slab or device slots.
+        assert_eq!(comp.capacity(), 2, "host count, not slab/device slots");
+
+        comp.acquire(0, 0);
+        comp.uploader().unwrap().wait_idle();
+        slab.wait_idle();
+        assert_eq!(stages.load(Ordering::Relaxed), 1, "the slab staged it");
+        assert!(comp.nvme_contains(0, 0));
+        assert!(!comp.nvme_contains(0, 1));
+        assert!(pool.contains(0, 0), "the device pool uploaded it too");
+        assert_eq!(uploads.load(Ordering::Relaxed), 1);
+
+        // The staged payload comes back as the loader's own type.
+        let staged = comp.nvme_lookup(0, 0).expect("staged hit");
+        assert_eq!(NvmeExpertSlot::staged_bytes(&*staged), 30);
+        assert!(comp.nvme_lookup(0, 1).is_none());
+
+        // Already staged: no re-advice, no re-stage.
+        let before = (
+            advised.load(Ordering::Relaxed),
+            stages.load(Ordering::Relaxed),
+        );
+        comp.acquire(0, 0);
+        slab.wait_idle();
+        assert_eq!(
+            (advised.load(Ordering::Relaxed), stages.load(Ordering::Relaxed)),
+            before,
+            "a staged expert is neither re-advised nor re-staged"
+        );
+
+        // Releasing frees the staged copy; a fresh acquire of a non-staged
+        // expert advises the host pages and stages it.
+        comp.release(0, 0);
+        assert!(!slab.contains(0, 0) && !comp.nvme_contains(0, 0));
+        // Quiesce both background threads before sampling the counter: a
+        // still-settling upload/stage from the release path would otherwise
+        // land its host advice inside the measurement window and race the
+        // exact delta asserted below (it did on CI).
+        comp.uploader().unwrap().wait_idle();
+        slab.wait_idle();
+        let advised_before = advised.load(Ordering::Relaxed);
+        comp.acquire(0, 1);
+        assert_eq!(
+            advised.load(Ordering::Relaxed),
+            advised_before + 3,
+            "a non-staged expert's host pages are advised"
+        );
+        slab.wait_idle();
+        assert_eq!(stages.load(Ordering::Relaxed), before.1 + 1);
+        assert!(comp.nvme_contains(0, 1));
+    }
+
+    /// The hot set reaches the slab: `replace_hot_set` stages it *and* protects
+    /// it from eviction, so a slab smaller than the hot set converges on it
+    /// instead of churning it away.
+    #[test]
+    fn composite_hot_set_stages_and_protects_the_slab() {
+        let stages = Arc::new(AtomicUsize::new(0));
+        let slab = staged_slab(120, 30, 8, 30, Arc::clone(&stages));
+        let comp: CompositeResidency<FakeSlot> =
+            CompositeResidency::host(CpuResidency::new(vec![])).with_nvme(Arc::clone(&slab));
+        comp.replace_hot_set(&[(0, 1), (0, 2), (0, 3)]);
+        slab.wait_idle();
+        assert!(slab.contains(0, 1) && slab.contains(0, 2) && slab.contains(0, 3));
+        assert!(slab.is_hot(0, 1) && slab.is_hot(0, 3));
+        // Churn past the budget: the protected members survive.
+        for e in 4..8u32 {
+            comp.acquire(0, e);
+        }
+        slab.wait_idle();
+        assert!(
+            slab.contains(0, 1) && slab.contains(0, 2) && slab.contains(0, 3),
+            "the protected hot set stays staged"
+        );
+        comp.replace_hot_set(&[]);
+        assert!(!slab.is_hot(0, 1));
+    }
+
+    /// Without a slab the composite behaves exactly as before: host advice
+    /// only, `nvme_lookup` always `None`.
+    #[test]
+    fn composite_without_a_slab_is_unchanged() {
+        let advised = Arc::new(AtomicUsize::new(0));
+        let comp: CompositeResidency<FakeSlot> = CompositeResidency::host(CpuResidency::new(
+            vec![vec![Some(handles(&advised))]],
+        ));
+        comp.acquire(0, 0);
+        comp.prefetch_hint(0, 0);
+        assert_eq!(advised.load(Ordering::Relaxed), 6);
+        assert!(comp.nvme().is_none());
+        assert!(comp.nvme_lookup(0, 0).is_none());
+        assert!(!comp.nvme_contains(0, 0));
     }
 }
