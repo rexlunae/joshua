@@ -3277,11 +3277,16 @@ pub fn write_nemotron_h_gguf(path: &Path, opts: NemotronTiny) {
             if opts.scalar_metadata {
                 // The single value a uniform file declares; must agree with the
                 // layer kind it actually writes.
-                gguf_file::Value::U32(if opts.uniform_kind == "attention" {
-                    KV_HEADS as u32
-                } else {
-                    0
-                })
+                // A file with a NextN block must declare a usable KV head
+                // count even when its trunk has no attention rows: the block
+                // always has an attention sub-layer.
+                gguf_file::Value::U32(
+                    if opts.uniform_kind == "attention" || opts.mtp_block {
+                        KV_HEADS as u32
+                    } else {
+                        0
+                    },
+                )
             } else {
                 gguf_file::Value::Array(kv)
             },
@@ -3298,7 +3303,16 @@ pub fn write_nemotron_h_gguf(path: &Path, opts: NemotronTiny) {
                 gguf_file::Value::Array(nff)
             },
         ),
-        (key("block_count"), gguf_file::Value::U32(kinds.len() as u32)),
+        // `block_count` includes the appended NextN block; the trunk is
+        // `block_count - nextn_predict_layers`.
+        (
+            key("block_count"),
+            gguf_file::Value::U32((kinds.len() + usize::from(opts.mtp_block)) as u32),
+        ),
+        (
+            key("nextn_predict_layers"),
+            gguf_file::Value::U32(u32::from(opts.mtp_block)),
+        ),
         (key("embedding_length"), gguf_file::Value::U32(EMB as u32)),
         (key("context_length"), gguf_file::Value::U32(512)),
         (

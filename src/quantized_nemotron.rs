@@ -152,6 +152,7 @@ struct LayerSpec {
 /// The model geometry.
 #[derive(Debug, Clone)]
 struct Config {
+    /// Trunk layers (excludes the appended NextN block).
     n_layer: usize,
     n_embd: usize,
     n_head: usize,
@@ -180,7 +181,20 @@ impl Config {
         if !ARCHES.contains(&m.arch()) {
             return Ok(None);
         }
-        let n_layer = m.u32("block_count")? as usize;
+        // `block_count` **includes** any appended NextN / MTP blocks (llama.cpp
+        // `num_nextn_predict_layers`), so the trunk is the remainder.  Reading
+        // it raw would try to load the draft block as an ordinary layer.
+        let block_count = m.u32("block_count")? as usize;
+        let n_nextn = m.u32_or("nextn_predict_layers", 0) as usize;
+        let n_layer = block_count.checked_sub(n_nextn).ok_or_else(|| {
+            candle_core::Error::Msg(format!(
+                "{}: block_count {block_count} is smaller than nextn_predict_layers {n_nextn}",
+                m.arch()
+            ))
+        })?;
+        if n_layer == 0 {
+            candle_core::bail!("{}: no trunk layers (block_count {block_count})", m.arch());
+        }
         let n_embd = m.u32("embedding_length")? as usize;
         let n_head = m.u32("attention.head_count")? as usize;
         let head_dim = m
@@ -250,13 +264,22 @@ impl Config {
             .count();
         // The uniform scalar `head_count_kv` is the only one present for the
         // attention rows; take it from the first attention layer.
-        let n_head_kv = layers
-            .iter()
-            .find(|l| l.kind == LayerKind::Attention)
-            .map(|l| l.n_head_kv)
-            .unwrap_or_else(|| m.u32_or("attention.head_count_kv", 0) as usize);
-        if n_attn > 0 && n_head_kv == 0 {
-            candle_core::bail!("{}: attention layers declare 0 kv heads", m.arch());
+        // The KV head count normally comes from the trunk's attention rows, but
+        // the appended NextN block *always* has an attention sub-layer, so an
+        // attention-free trunk still needs a usable value.  Two sources, in
+        // order: the first attention row's `head_count_kv`, then the scalar
+        // form (which covers a file whose arrays are all zeros).
+        let kv_from_array = kv.iter().copied().find(|&k| k > 0);
+        let kv_from_scalar = m.u32_opt("attention.head_count_kv").filter(|&k| k > 0);
+        let n_head_kv = kv_from_array
+            .or_else(|| kv_from_scalar.map(|k| k as usize))
+            .unwrap_or(0);
+        if (n_attn > 0 || m.u32_opt("nextn_predict_layers").unwrap_or(0) > 0) && n_head_kv == 0 {
+            candle_core::bail!(
+                "{}: attention layers (or the NextN block) need a nonzero \
+                 attention.head_count_kv, found none",
+                m.arch()
+            );
         }
 
         Ok(Some(Self {
@@ -1016,6 +1039,7 @@ impl MtpBlock {
         state: &mut LayerState,
         emb: &Tensor,
         seeds: &Tensor,
+        trunk_norm: &RmsNorm,
         input: &LayerInput<'_>,
     ) -> Result<Tensor> {
         // eh_proj([enorm(emb) ‖ hnorm(seed)])
@@ -1030,7 +1054,12 @@ impl MtpBlock {
         x = x.add(&self.moe.forward(&m)?)?;
         match &self.head_norm {
             Some(n) => n.forward(&x),
-            None => Ok(x),
+            // No `shared_head_norm`: the *trunk's* output norm is the
+            // fallback, not "no norm" — `mtp_draft` treats this tensor as
+            // already normed (it goes straight through the output head and
+            // seeds the next draft), so returning a raw residual would skew
+            // both the logits and every chained draft.
+            None => trunk_norm.forward(&x),
         }
     }
 }
@@ -1281,7 +1310,7 @@ impl LayerStack for Weights {
         let Some(m) = &self.mtp else {
             candle_core::bail!("{}: no MTP block loaded", ARCHES[0]);
         };
-        m.forward(state, emb, seeds, input)
+        m.forward(state, emb, seeds, &self.norm, input)
     }
 
     /// The scan state is running rather than append-only, so a verification

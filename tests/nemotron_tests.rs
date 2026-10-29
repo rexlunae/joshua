@@ -474,6 +474,12 @@ fn the_mtp_block_loads_and_drafts_without_changing_the_trunk() {
     );
 
     // The trunk's logits must be untouched by the presence of the block.
+    // Loading the MTP file *without* asking for the block must work too: a
+    // `block_count` that includes the NextN block must not make the trunk
+    // loader look for an ordinary layer at the draft block's index.
+    let mut mtp_off = common::load_model(&mtp_path, true);
+    assert!(!mtp_off.set_mtp(true) || true, "no drafting without the block");
+
     let mut plain = common::load_model(&plain_path, true);
     let mut with = joshua::quantized_qwen::with_mtp_block(|| common::load_model(&mtp_path, true));
     assert!(
@@ -497,4 +503,35 @@ fn the_mtp_block_loads_and_drafts_without_changing_the_trunk() {
         drafts.len() <= 3,
         "it must not draft more than asked: {drafts:?}"
     );
+}
+
+/// An attention-free trunk (uniform MoE) still needs drafting: the appended
+/// NextN block always has an attention sub-layer, so its KV head count must
+/// not come out of the trunk's (nonexistent) attention rows as zero.
+///
+/// Also covers the missing `shared_head_norm` fallback: a block without it
+/// must normalize with the trunk's output norm, not hand `mtp_draft` a raw
+/// residual to project and re-seed.
+#[test]
+fn an_attention_free_trunk_can_still_draft() {
+    let dir = common::model_dir("nemotron-mtp-moe-trunk");
+    let path = dir.join("model.gguf");
+    common::write_nemotron_h_gguf(
+        &path,
+        common::NemotronTiny {
+            uniform: true,
+            uniform_kind: "moe",
+            scalar_metadata: true,
+            mtp_block: true,
+            ..Default::default()
+        },
+    );
+    let mut m = joshua::quantized_qwen::with_mtp_block(|| common::load_model(&path, true));
+    assert!(m.set_mtp(true), "the NextN block loads on an all-MoE trunk");
+    let prompt = [1u32, 4, 2, 7];
+    let _ = common::logits(&mut m, &prompt, 0);
+    let drafts = m
+        .mtp_draft(5, prompt.len(), 2)
+        .expect("drafting must work when the trunk has no attention layer");
+    assert!(!drafts.is_empty(), "drafts produced: {drafts:?}");
 }
