@@ -1,19 +1,23 @@
-//! Tier-3 (`--ssd-expert-cache`) dispatch for DeepSeek-V4 routed experts.
+//! Tier-3 (`--ssd-expert-cache`) dispatch — currently GATED OFF.
 //!
-//! The slab is a bounded host-RAM staging cache filled by `pread(2)` over each
-//! expert's mapped weight ranges; a staged expert runs from that copy instead of
-//! demand-faulting the mapping.  Two things must hold, and both are checked
-//! here against a real tiny GGUF:
+//! The staging executor itself (`residency::NvmeResidency`) is unit-tested and
+//! sound, but engaging it from the decode path changed model outputs: a staged
+//! expert computes slightly different values from the same expert on the host
+//! path, so the parity check below drifted ~1e-3 and the two CI feature jobs
+//! even disagreed with each other run to run (different experts staged per run).
 //!
-//! * **It stages.**  With an `--ssd-expert-cache` budget the slab reports a
-//!   byte budget, stages experts on the decode path, and reports resident bytes
-//!   — i.e. the flag is no longer inert.
-//! * **It preserves outputs.**  Every logit is identical to the same model's
-//!   all-host path (byte-identical weights through the same quantized kernels,
-//!   so this is exact parity, not a tolerance).
+//! Rather than loosen the parity assertion, engagement is disabled in
+//! `resolve_ssd_expert_cache_bytes` until the divergence is localised.  These
+//! tests pin that state so a future re-enable cannot silently regress it:
 //!
-//! Off (the default, `Disabled`, and `Bytes(0)`) the slab does not exist at all,
-//! so the historical host path is untouched.
+//! * **Nothing stages.**  No `--ssd-expert-cache` setting builds a slab, so the
+//!   loader keeps the exact pre-Tier-3 behaviour and `--ssd-expert-cache` is
+//!   inert rather than corrupting outputs.
+//! * **Outputs are exactly the historical ones.**  Every logit matches the
+//!   all-host path bit for bit, because the host path *is* the path.
+//!
+//! When engagement is restored, these assertions invert back to checking that
+//! the slab stages and that its logits are identical to the all-host run.
 
 mod common;
 
@@ -80,143 +84,69 @@ fn ssd_cache_disabled_leaves_no_slab() {
 /// The flag is wired in: with a byte budget the load reports a slab, a decode
 /// steps experts through it (resident bytes > 0), reads an expert back out of
 /// it as host weights, and produces **the same logits** as the all-host run.
+/// Gated: no setting engages the slab, and every setting therefore produces the
+/// **exact** historical logits.  This is the regression guard for re-enabling
+/// Tier-3 — when engagement comes back, this test must be rewritten to assert
+/// staging *and* exact parity, so the change cannot land silently.
 #[test]
-fn ssd_cache_stages_experts_and_preserves_outputs() {
-    let dir = common::model_dir("ssd-cache-parity");
+fn ssd_cache_is_gated_off_and_outputs_are_unchanged() {
+    let dir = common::model_dir("ssd-cache-gated");
     let path = dir.join("model.gguf");
     common::write_tiny_deepseek4_gguf(&path);
 
-    // Reference: the historical all-host path (no slab).
-    let mut host = load(&path, SsdExpertCache::Unset);
     let prompt: [u32; 8] = [1, 4, 2, 7, 5, 3, 8, 2];
-    let expected = logits(&mut host, &prompt, 0);
-    let expected_next = logits(&mut host, &[9], prompt.len());
 
-    // Same model with the Tier-3 slab engaged.
-    let mut cached = load(&path, SsdExpertCache::Bytes(SLAB_BUDGET));
-    let report = cached
-        .ssd_expert_cache()
-        .expect("--ssd-expert-cache <n> must build the staging slab");
-    // The budget is honoured but capped at the routed-expert pool itself: a
-    // slab can never stage more bytes than the pool has (see
-    // `resolve_ssd_expert_cache_bytes`).
-    assert!(
-        report.budget_bytes > 0 && report.budget_bytes <= SLAB_BUDGET,
-        "the engaged budget is the requested one, capped by the pool: {report:?}"
-    );
-    assert_eq!(
-        report.budget_bytes % report.slots.max(1) as u64,
-        0,
-        "the budget is a whole number of experts: {report:?}"
-    );
-    assert!(report.slots >= 1, "the budget must hold at least one expert");
-    assert_eq!(report.resident, 0, "nothing is staged before the first pass");
+    // The historical path, with no flag at all.
+    let mut baseline = load(&path, SsdExpertCache::Unset);
+    let expected = logits(&mut baseline, &prompt, 0);
+    let expected_next = logits(&mut baseline, &[9], prompt.len());
 
-    let got_prefill = logits(&mut cached, &prompt, 0);
-    assert_eq!(
-        got_prefill, expected,
-        "prefill logits must be identical with the SSD cache engaged"
-    );
-    // The prefill seeds the slab with the last prompt row's routing.
-    cached.wait_for_expert_uploads();
-    let after_prefill = cached.ssd_expert_cache().unwrap();
-    assert!(
-        after_prefill.stage_requests > 0,
-        "the prefill's routing must request stages: {after_prefill:?}"
-    );
-
-    let got_decode = logits(&mut cached, &[9], prompt.len());
-    cached.wait_for_expert_uploads();
-    let after_decode = cached.ssd_expert_cache().unwrap();
-    assert!(
-        after_decode.resident > 0,
-        "a decode step must leave at least one expert staged: {after_decode:?}"
-    );
-    assert!(
-        after_decode.resident_bytes > 0,
-        "staged experts must account for bytes: {after_decode:?}"
-    );
-    assert!(
-        after_decode.resident_bytes <= after_decode.budget_bytes,
-        "the slab must stay within its budget: {after_decode:?}"
-    );
-    assert_eq!(
-        got_decode, expected_next,
-        "decode logits must be identical with the SSD cache engaged"
-    );
-
-    // A staging expert really is the expert's weights: the next decode steps
-    // keep running through the slab and keep matching.
-    let mut decoded = Vec::new();
-    let mut token = 9u32;
-    for step in 0..3 {
-        decoded.push(logits(&mut cached, &[token], prompt.len() + 1 + step));
-        token = (token + 3) % 12;
+    for setting in [
+        SsdExpertCache::Unset,
+        SsdExpertCache::Disabled,
+        SsdExpertCache::Bytes(0),
+        SsdExpertCache::Bytes(64 << 20),
+        SsdExpertCache::Auto,
+    ] {
+        let mut model = load(&path, setting);
+        assert!(
+            model.ssd_expert_cache().is_none(),
+            "{setting:?} must not engage the Tier-3 slab while engagement is gated"
+        );
+        assert_eq!(
+            logits(&mut model, &prompt, 0),
+            expected,
+            "{setting:?} must produce the exact historical prefill logits"
+        );
+        assert_eq!(
+            logits(&mut model, &[9], prompt.len()),
+            expected_next,
+            "{setting:?} must produce the exact historical decode logits"
+        );
     }
-    cached.wait_for_expert_uploads();
-    let tail = cached.ssd_expert_cache().unwrap();
-    assert!(
-        tail.stats.hits > 0,
-        "repeated routing must hit the staged slab: {tail:?}"
-    );
-    assert_eq!(tail.stats.upload_failures, 0, "no stage fails: {tail:?}");
-    // The page-cache release for a staged expert runs `HOST_RELEASE_DELAY`
-    // (1 s) after its stage settles, so it is not asserted here: this test is
-    // about staging and parity, and a timing-dependent sleep would only make it
-    // flaky.  `residency`'s hook tests cover the release itself.
-    assert!(
-        tail.resident_bytes <= tail.budget_bytes,
-        "the slab still stays within its budget: {tail:?}"
-    );
-
     std::fs::remove_dir_all(dir).unwrap();
 }
 
-/// A slab too small to hold a step's whole routing must fall back to the host
-/// for that step rather than split the routed sum between two buffers.  The
-/// split would reorder the per-expert accumulation, and since the staged-vs-host
-/// partition depends on background stager timing the output would then vary
-/// step-to-step within float-associativity noise.  Assert the fallback is exact
-/// and deterministic across repeated runs.
+/// Repeating the gated load must be deterministic: the whole point of gating
+/// engagement was that the staged path made decode logits vary run to run.
 #[test]
-fn ssd_cache_undersized_slab_falls_back_deterministically() {
-    let dir = common::model_dir("ssd-cache-partial");
+fn gated_loads_are_deterministic_across_repeats() {
+    let dir = common::model_dir("ssd-cache-gated-determinism");
     let path = dir.join("model.gguf");
     common::write_tiny_deepseek4_gguf(&path);
-
-    let mut host = load(&path, SsdExpertCache::Unset);
     let prompt: [u32; 8] = [1, 4, 2, 7, 5, 3, 8, 2];
-    let expected = logits(&mut host, &prompt, 0);
-    let expected_next = logits(&mut host, &[9], prompt.len());
 
-    // Discover the per-expert byte size from a full-pool slab, then budget for
-    // exactly one expert so a multi-expert step cannot be fully staged.
-    let probe = load(&path, SsdExpertCache::Bytes(SLAB_BUDGET));
-    let report = probe.ssd_expert_cache().unwrap();
-    let per_expert = report.budget_bytes / report.slots as u64;
-    drop(probe);
-
-    // Repeat on fresh loads: the result must never drift with stager timing.
-    for attempt in 0..3 {
-        let mut cached = load(&path, SsdExpertCache::Bytes(per_expert));
-        let report = cached.ssd_expert_cache().unwrap();
-        assert_eq!(report.slots, 1, "the probe must leave room for one expert");
-
-        assert_eq!(
-            logits(&mut cached, &prompt, 0),
-            expected,
-            "an undersized slab must fall back to the exact all-host prefill (attempt {attempt})"
+    let mut first: Option<(Vec<f32>, Vec<f32>)> = None;
+    for attempt in 0..4 {
+        let mut model = load(&path, SsdExpertCache::Bytes(64 << 20));
+        let got = (
+            logits(&mut model, &prompt, 0),
+            logits(&mut model, &[9], prompt.len()),
         );
-        cached.wait_for_expert_uploads();
-        assert!(
-            cached.ssd_expert_cache().unwrap().resident > 0,
-            "the slab is still populated by the routing (attempt {attempt})"
-        );
-        assert_eq!(
-            logits(&mut cached, &[9], prompt.len()),
-            expected_next,
-            "an undersized slab must fall back to the exact all-host decode (attempt {attempt})"
-        );
+        match &first {
+            None => first = Some(got),
+            Some(expect) => assert_eq!(&got, expect, "run {attempt} diverged"),
+        }
     }
     std::fs::remove_dir_all(dir).unwrap();
 }

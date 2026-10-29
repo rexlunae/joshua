@@ -1069,25 +1069,36 @@ fn build_device_pool(
 ///
 /// [`VramExpertCache`]: crate::placement::VramExpertCache
 pub(crate) fn resolve_ssd_expert_cache_bytes(
-    setting: crate::placement::SsdExpertCache,
-    available_ram: Option<u64>,
-    pool_bytes: u64,
+    _setting: crate::placement::SsdExpertCache,
+    _available_ram: Option<u64>,
+    _pool_bytes: u64,
 ) -> Option<u64> {
-    use crate::placement::SsdExpertCache;
-    let budget = match setting {
-        SsdExpertCache::Disabled => return None,
-        SsdExpertCache::Bytes(0) => return None,
-        SsdExpertCache::Bytes(n) => n,
-        SsdExpertCache::Unset => return None,
-        SsdExpertCache::Auto => available_ram? / AUTO_SSD_CACHE_RAM_SHARE,
-    };
-    if budget == 0 {
-        return None;
-    }
-    // A slab bigger than the whole routed-expert pool cannot cache more than
-    // the pool holds; cap it so `Auto` on a small model does not reserve
-    // RAM for copies the model has no use for.
-    Some(if pool_bytes > 0 { budget.min(pool_bytes) } else { budget })
+    // Tier-3 engagement is DISABLED pending a correctness fix.
+    //
+    // The staging executor (`residency::NvmeResidency`) and its unit tests are
+    // sound, but wiring it into the decode path changed model outputs: a
+    // staged expert computes slightly different values from the same expert on
+    // the host path, so `ssd_cache_stages_experts_and_preserves_outputs` saw
+    // logits drift ~1e-3 and the two feature jobs even disagreed with each
+    // other run to run (different experts staged).
+    //
+    // Inspection has ruled out accumulation order, the mixed staged+host sum,
+    // clamping, requantisation (`QStorage::from_data` preserves block bytes on
+    // CPU) and the SiLU precision policy (fixed separately).  The divergence
+    // reproduces on the x86_64 CI runners and not on arm64, where the
+    // precise-SIMD branch it implicates cannot execute, so it has not been
+    // localised yet.
+    //
+    // Until it is, no setting builds a slab: the loader keeps the exact
+    // pre-Tier-3 behaviour, and `--ssd-expert-cache` is inert rather than
+    // silently corrupting outputs.  Re-enable by restoring the match below.
+    //
+    // Previously:
+    //   Disabled | Bytes(0) | Unset => None
+    //   Bytes(n)                   => Some(n.min(pool_bytes))
+    //   Auto                       => Some(available_ram / AUTO_SSD_CACHE_RAM_SHARE)
+    //                                 capped at the pool size
+    None
 }
 
 /// The share of the host's available RAM `--ssd-expert-cache auto` may claim
@@ -5853,53 +5864,42 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    /// `--ssd-expert-cache` resolves the same way `--vram-expert-cache` does:
-    /// `Disabled`/`Bytes(0)` and an absent flag are off, `Bytes(n)` is exactly
-    /// `n`, and `Auto` is a share of the RAM free at load — capped by the
-    /// routed pool so a small model never reserves RAM for copies it cannot use.
+    /// Tier-3 engagement is **gated off**: no `--ssd-expert-cache` setting
+    /// resolves to a budget, so no loader builds a slab and the historical
+    /// all-host path is what runs.
+    ///
+    /// Engagement was disabled because a *staged* expert computed slightly
+    /// different values from the same expert on the host path, drifting decode
+    /// logits ~1e-3 (and differently per run).  The executor and its unit tests
+    /// remain; this test pins the gate so re-enabling Tier-3 cannot happen
+    /// without deliberately rewriting it to assert the resolver's real budget
+    /// (and the parity test in `tests/ssd_expert_cache_tests.rs` to assert
+    /// identical outputs through the staged path).
     #[test]
-    fn ssd_expert_cache_budget_resolution() {
+    fn ssd_expert_cache_is_gated_off() {
         use crate::placement::SsdExpertCache as S;
         const GIB: u64 = 1 << 30;
         const POOL: u64 = 200 * GIB;
 
-        // Off.
-        assert_eq!(resolve_ssd_expert_cache_bytes(S::Unset, Some(64 * GIB), POOL), None);
-        assert_eq!(resolve_ssd_expert_cache_bytes(S::Disabled, Some(64 * GIB), POOL), None);
-        assert_eq!(resolve_ssd_expert_cache_bytes(S::Bytes(0), Some(64 * GIB), POOL), None);
-
-        // An explicit budget is honoured exactly, `Bytes(1)` included (one byte
-        // is not a working budget but is not the "off" spelling either).
-        assert_eq!(
-            resolve_ssd_expert_cache_bytes(S::Bytes(3 * GIB), Some(64 * GIB), POOL),
-            Some(3 * GIB)
-        );
-        assert_eq!(resolve_ssd_expert_cache_bytes(S::Bytes(1), None, POOL), Some(1));
-
-        // `Auto` sizes from available RAM (never more than the routed pool).
-        assert_eq!(
-            resolve_ssd_expert_cache_bytes(S::Auto, Some(64 * GIB), POOL),
-            Some(64 * GIB / AUTO_SSD_CACHE_RAM_SHARE)
-        );
-        assert_eq!(
-            resolve_ssd_expert_cache_bytes(S::Auto, Some(4 * GIB), POOL),
-            Some(4 * GIB / AUTO_SSD_CACHE_RAM_SHARE),
-            "a small machine still gets a slab"
-        );
-        // Capped by the pool: no slab larger than what it could ever stage.
-        assert_eq!(
-            resolve_ssd_expert_cache_bytes(S::Auto, Some(64 * GIB), 2 * GIB),
-            Some(2 * GIB)
-        );
-        // No RAM probe (non-Linux, or a failed read): `Auto` declines rather
-        // than guess a budget.
-        assert_eq!(resolve_ssd_expert_cache_bytes(S::Auto, None, POOL), None);
-
-        // The engaged budget always holds at least one expert once it is at
-        // least one expert wide (the `build_nvme_pool` slot check is separate).
-        let per_expert = 19 * 1_048_576u64; // 19 MiB: the V4-Flash expert size
-        let auto = resolve_ssd_expert_cache_bytes(S::Auto, Some(8 * GIB), POOL).unwrap();
-        assert!(auto / per_expert > 0);
+        for setting in [
+            S::Unset,
+            S::Disabled,
+            S::Bytes(0),
+            S::Bytes(1),
+            S::Bytes(3 * GIB),
+            S::Auto,
+        ] {
+            assert_eq!(
+                resolve_ssd_expert_cache_bytes(setting, Some(64 * GIB), POOL),
+                None,
+                "{setting:?} must not resolve a Tier-3 budget while engagement is gated"
+            );
+            assert_eq!(
+                resolve_ssd_expert_cache_bytes(setting, None, POOL),
+                None,
+                "{setting:?} must stay off without a RAM probe too"
+            );
+        }
     }
 
     #[test]
