@@ -452,3 +452,49 @@ fn a_device_model_forward_matches_the_cpu() {
     let want = common::logits(&mut cpu_model, &prompt, 0);
     common::assert_close(&got, &want, 5e-3, "device vs CPU whole-model forward");
 }
+
+/// The NextN / MTP draft block must load and draft, and must not change what
+/// the trunk outputs.
+///
+/// This is the same contract the other recurrent loaders are held to: the
+/// block's state follows the trunk however the trunk was fed, and merely
+/// having it loaded leaves the model's logits alone.
+#[test]
+fn the_mtp_block_loads_and_drafts_without_changing_the_trunk() {
+    let dir = common::model_dir("nemotron-mtp");
+    let plain_path = dir.join("plain.gguf");
+    let mtp_path = dir.join("mtp.gguf");
+    common::write_tiny_nemotron_h_gguf(&plain_path);
+    common::write_nemotron_h_gguf(
+        &mtp_path,
+        common::NemotronTiny {
+            mtp_block: true,
+            ..Default::default()
+        },
+    );
+
+    // The trunk's logits must be untouched by the presence of the block.
+    let mut plain = common::load_model(&plain_path, true);
+    let mut with = joshua::quantized_qwen::with_mtp_block(|| common::load_model(&mtp_path, true));
+    assert!(
+        with.set_mtp(true),
+        "the NextN block in the file must load for drafting"
+    );
+    let prompt = [1u32, 4, 2, 7];
+    let a = common::logits(&mut plain, &prompt, 0);
+    let b = common::logits(&mut with, &prompt, 0);
+    assert_close(&a, &b, 1e-5, "MTP block must not change trunk logits");
+
+    // And it must produce draft tokens.
+    let drafts = with
+        .mtp_draft(5, prompt.len(), 3)
+        .expect("drafting from the NextN block");
+    assert!(
+        !drafts.is_empty(),
+        "the MTP block must draft at least one token"
+    );
+    assert!(
+        drafts.len() <= 3,
+        "it must not draft more than asked: {drafts:?}"
+    );
+}

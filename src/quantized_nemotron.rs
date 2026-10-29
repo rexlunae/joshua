@@ -953,6 +953,88 @@ impl MoeBlock {
     }
 }
 
+// ─── MTP / NextN draft block ─────────────────────────────────────────────────
+
+/// The NextN / MTP draft block Nemotron 3.5 appends after the trunk
+/// (`num_nextn_predict_layers = 1`; `blk.{n_layer}.*`).
+///
+/// The block folds an **attention** sub-layer and a **MoE** sub-layer into one
+/// trailing block, and reads a token's embedding together with the trunk's
+/// normed hidden of the *previous* position:
+///
+/// ```text
+/// row q = eh_proj([enorm(emb(t_q)) ‖ hnorm(h_{q-1})]) → attn → MoE
+/// ```
+///
+/// then `shared_head_norm` and the trunk's output head.  A chained draft seeds
+/// the next row with that normed output instead of a trunk hidden.  Used as a
+/// speculative drafter (see [`crate::native_session::Session::mtp_draft`]); the
+/// state is the pair of sub-layer states this struct keeps.
+struct MtpBlock {
+    enorm: RmsNorm,
+    hnorm: RmsNorm,
+    eh_proj: Weight,
+    attn_norm: RmsNorm,
+    attn: AttentionBlock,
+    post_norm: RmsNorm,
+    moe: MoeBlock,
+    /// `nextn.shared_head_norm`; the trunk's output norm when absent.
+    head_norm: Option<RmsNorm>,
+}
+
+impl MtpBlock {
+    fn load<R: Read + Seek>(
+        src: &mut TensorSource<R>,
+        cfg: &Config,
+        rope: Arc<Rope>,
+        expert_device: &Device,
+    ) -> Result<Option<Self>> {
+        let p = format!("blk.{}", cfg.n_layer);
+        if !src.has(&format!("{p}.nextn.eh_proj.weight")) {
+            return Ok(None);
+        }
+        let device = src.device.clone();
+        Ok(Some(Self {
+            enorm: src.rms_norm(&format!("{p}.nextn.enorm.weight"), cfg.rms_eps)?,
+            hnorm: src.rms_norm(&format!("{p}.nextn.hnorm.weight"), cfg.rms_eps)?,
+            eh_proj: load_weight(src, &format!("{p}.nextn.eh_proj.weight"))?,
+            attn_norm: src.rms_norm(&format!("{p}.attn_norm.weight"), cfg.rms_eps)?,
+            attn: AttentionBlock::load(src, &p, cfg, rope)?,
+            post_norm: src.rms_norm(&format!("{p}.attn_post_norm.weight"), cfg.rms_eps)?,
+            moe: MoeBlock::load(src, &p, cfg, expert_device)?,
+            head_norm: src.rms_norm_opt(
+                &format!("{p}.nextn.shared_head_norm.weight"),
+                cfg.rms_eps,
+            )?,
+        }))
+    }
+
+    /// The block's normed output for `n` rows (`[1, n, hidden]`), advancing
+    /// `state` (its attention KV).
+    fn forward(
+        &self,
+        state: &mut LayerState,
+        emb: &Tensor,
+        seeds: &Tensor,
+        input: &LayerInput<'_>,
+    ) -> Result<Tensor> {
+        // eh_proj([enorm(emb) ‖ hnorm(seed)])
+        let e = self.enorm.forward(emb)?;
+        let h = self.hnorm.forward(seeds)?;
+        let merged = Tensor::cat(&[&e, &h], D::Minus1)?;
+        let mut x = self.eh_proj.forward(&merged)?;
+        // attention sub-layer, then the MoE sub-layer, each pre-normed.
+        let a = self.attn_norm.forward(&x)?;
+        x = x.add(&self.attn.forward(&mut state.kv, &a, input.mask, input.offset)?)?;
+        let m = self.post_norm.forward(&x)?;
+        x = x.add(&self.moe.forward(&m)?)?;
+        match &self.head_norm {
+            Some(n) => n.forward(&x),
+            None => Ok(x),
+        }
+    }
+}
+
 // ─── Layers ──────────────────────────────────────────────────────────────────
 
 /// One decoder layer: a pre-norm residual around exactly one sub-block.
@@ -1048,6 +1130,9 @@ pub struct Weights {
     residency: Arc<dyn crate::residency::ExpertResidency>,
     n_expert: usize,
     cfg: Config,
+    /// The NextN / MTP draft block, when the file has one and the caller
+    /// asked for it (see [`crate::quantized_qwen::with_mtp_block`]).
+    mtp: Option<MtpBlock>,
 }
 
 impl Weights {
@@ -1114,6 +1199,13 @@ impl Weights {
             // Tied embeddings: reuse the (quantized) embedding table.
             Weight::Quant(src.qmatmul("token_embd.weight")?)
         };
+        // The MTP block is a whole extra attention + MoE layer, so it is only
+        // loaded when a caller says it will draft with it.
+        let mtp = if crate::quantized_qwen::mtp_wanted() {
+            MtpBlock::load(&mut src, &cfg, rope, &expert_device)?
+        } else {
+            None
+        };
         Ok(Self {
             tok_embeddings,
             layers,
@@ -1123,6 +1215,7 @@ impl Weights {
             residency: Arc::new(crate::residency::NoopResidency),
             n_expert: cfg.n_expert,
             cfg,
+            mtp,
         })
     }
 }
@@ -1163,8 +1256,32 @@ impl LayerStack for Weights {
     }
 
     fn head(&self, xs: &Tensor) -> Result<Tensor> {
-        let normed = self.norm.forward(xs)?;
-        self.output.forward(&normed)?.to_dtype(DType::F32)
+        self.head_logits(&self.head_norm(xs)?)
+    }
+
+    fn has_mtp(&self) -> bool {
+        self.mtp.is_some()
+    }
+
+    fn head_norm(&self, xs: &Tensor) -> Result<Tensor> {
+        self.norm.forward(xs)
+    }
+
+    fn head_logits(&self, normed: &Tensor) -> Result<Tensor> {
+        self.output.forward(normed)?.to_dtype(DType::F32)
+    }
+
+    fn mtp_forward(
+        &self,
+        state: &mut LayerState,
+        emb: &Tensor,
+        seeds: &Tensor,
+        input: &LayerInput<'_>,
+    ) -> Result<Tensor> {
+        let Some(m) = &self.mtp else {
+            candle_core::bail!("{}: no MTP block loaded", ARCHES[0]);
+        };
+        m.forward(state, emb, seeds, input)
     }
 
     /// The scan state is running rather than append-only, so a verification

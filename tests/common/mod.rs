@@ -3204,6 +3204,8 @@ pub struct NemotronTiny {
     /// `group_norm_weight[g]`.  Distinct values prove the loader keeps every
     /// group's own column instead of collapsing to column 0.
     pub group_norm_weight: [f32; 2],
+    /// Also write the NextN / MTP draft block at `blk.{n_layer}`.
+    pub mtp_block: bool,
 }
 
 impl Default for NemotronTiny {
@@ -3213,6 +3215,7 @@ impl Default for NemotronTiny {
             uniform: false,
             uniform_kind: "moe",
             group_norm_weight: [1.0, 1.0],
+            mtp_block: false,
         }
     }
 }
@@ -3489,6 +3492,74 @@ pub fn write_nemotron_h_gguf(path: &Path, opts: NemotronTiny) {
             }
             other => panic!("unknown tiny nemotron-h layer kind {other}"),
         }
+    }
+
+    if opts.mtp_block {
+        // The NextN / MTP draft block at `blk.{n_layer}`: input fusion, then an
+        // attention sub-layer and a MoE sub-layer in one trailing block.
+        let i = kinds.len();
+        let seed = 200usize;
+        tensors.push((
+            format!("blk.{i}.nextn.enorm.weight"),
+            qtensor(ones(EMB), &[EMB]),
+        ));
+        tensors.push((
+            format!("blk.{i}.nextn.hnorm.weight"),
+            qtensor(ones(EMB), &[EMB]),
+        ));
+        tensors.push((
+            format!("blk.{i}.nextn.eh_proj.weight"),
+            qtensor(w(EMB * 2 * EMB, seed), &[EMB, 2 * EMB]),
+        ));
+        tensors.push((
+            format!("blk.{i}.nextn.shared_head_norm.weight"),
+            qtensor(ones(EMB), &[EMB]),
+        ));
+        tensors.push((
+            format!("blk.{i}.attn_norm.weight"),
+            qtensor(ones(EMB), &[EMB]),
+        ));
+        for (name, dims, s) in [
+            ("attn_q", (HEADS * HEAD_DIM, EMB), seed + 1),
+            ("attn_k", (KV_HEADS * HEAD_DIM, EMB), seed + 2),
+            ("attn_v", (KV_HEADS * HEAD_DIM, EMB), seed + 3),
+            ("attn_output", (EMB, HEADS * HEAD_DIM), seed + 4),
+        ] {
+            tensors.push((
+                format!("blk.{i}.{name}.weight"),
+                qtensor(w(dims.0 * dims.1, s), &[dims.0, dims.1]),
+            ));
+        }
+        tensors.push((
+            format!("blk.{i}.attn_post_norm.weight"),
+            qtensor(ones(EMB), &[EMB]),
+        ));
+        tensors.push((
+            format!("blk.{i}.ffn_gate_inp.weight"),
+            qtensor(w(N_EXPERT * EMB, seed + 5), &[N_EXPERT, EMB]),
+        ));
+        let mut up: Vec<f32> = Vec::with_capacity(N_EXPERT * FFN * EMB);
+        let mut down: Vec<f32> = Vec::with_capacity(N_EXPERT * EMB * FFN);
+        for e in 0..N_EXPERT {
+            up.extend(w(FFN * EMB, seed + 10 + e));
+            down.extend(w(EMB * FFN, seed + 20 + e));
+        }
+        tensors.push((
+            format!("blk.{i}.ffn_up_exps.weight"),
+            qtensor(up, &[N_EXPERT, FFN, EMB]),
+        ));
+        tensors.push((
+            format!("blk.{i}.ffn_down_exps.weight"),
+            qtensor(down, &[N_EXPERT, EMB, FFN]),
+        ));
+        tensors.push((
+            format!("blk.{i}.ffn_up_shexp.weight"),
+            qtensor(w(SHEXP * EMB, seed + 30), &[SHEXP, EMB]),
+        ));
+        tensors.push((
+            format!("blk.{i}.ffn_down_shexp.weight"),
+            qtensor(w(EMB * SHEXP, seed + 31), &[EMB, SHEXP]),
+        ));
     }
 
     let metadata_refs: Vec<(&str, &gguf_file::Value)> =
