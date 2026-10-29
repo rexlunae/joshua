@@ -347,13 +347,23 @@ fn decode_step_and_empty_tail() {
 /// The device path: parity on the whole matrix, and **zero** CPU round trips.
 #[test]
 fn device_matches_cpu_without_falling_back() {
-    // OpenCL only.  The Vulkan dispatch is unverified here (see
-    // `vulkan_dispatch_is_native`): this host's RADV device cannot execute
-    // compute, so submitting 144 cases against it hangs rather than failing.
-    // A device that *can* run Vulkan is covered by the opt-in test.
-    let Some(dev) = opencl_device() else {
-        eprintln!("conv1d: no OpenCL device, skipping the device test");
-        return;
+    // OpenCL always; Vulkan behind the same opt-in as
+    // `vulkan_dispatch_is_native`, because a driver that cannot run the shader
+    // makes 144 submissions hang rather than fail.  On a device that can, the
+    // whole matrix runs and the counts are reported.
+    let dev = match opencl_device() {
+        Some(d) => d,
+        None if std::env::var_os("JOSHUA_CONV1D_VULKAN").is_some() => match vulkan_device() {
+            Some(d) => d,
+            None => {
+                eprintln!("conv1d: no OpenCL/Vulkan device, skipping the device test");
+                return;
+            }
+        },
+        None => {
+            eprintln!("conv1d: no OpenCL device, skipping the device test");
+            return;
+        }
     };
     let name = device_name(&dev);
     let mut native_cases = 0usize;
@@ -429,7 +439,7 @@ fn kill_switch_falls_back_correctly() {
     // each other), the switch is driven through a test-only flag that
     // `Conv1d::native_enabled` consults *before* the environment, and the lock
     // is held for the whole measurement.
-    let _guard = counter_guard();
+    let guard = counter_guard();
 
     let native_before = Conv1d::native_enabled();
     assert!(native_before, "the native path is on by default");
@@ -452,6 +462,13 @@ fn kill_switch_falls_back_correctly() {
     assert_eq!(y.dims(), &[case.t, case.c]);
     assert!(n1 > n0, "the default (switch on) path launches natively");
     assert_eq!(f1, f0, "the default path does not fall back");
+
+    // Drop the counter lock **before** spawning: the child is this same test
+    // binary, and its own `COUNTER_LOCK` is a different process's mutex only in
+    // name — if the child ever touches that lock while the parent holds it, the
+    // spawn deadlocks and the test hangs rather than failing.  The measurements
+    // this lock protects are already taken.
+    drop(guard);
 
     // `JOSHUA_CONV1D_NATIVE=0` is honoured when set: checked through the same
     // predicate the op uses, without touching the environment of other tests.
@@ -688,19 +705,21 @@ fn vulkan_dispatch_is_native() {
     let case = Case { t: 64, c: 256, d_conv: 4, silu: true, bias: true };
     run_case(&dev, case, 0x7a11); // warm the pipeline
 
-    let _guard = counter_guard();
-    let (launch0, fb0) = (kernels::native_exec_count(), kernels::fallback_count());
-    let y = run_case(&dev, case, 0x7a11);
-    let (launch1, fb1) = (kernels::native_exec_count(), kernels::fallback_count());
-    assert!(y.is_some(), "the native path must report a launch count");
-    assert!(
-        launch1 > launch0,
-        "the Vulkan conv must submit a kernel (launches {launch0} -> {launch1})"
-    );
+    // `run_case` takes `COUNTER_LOCK` internally and reports whether the case
+    // launched natively, so this must NOT hold the lock itself: `Mutex` is not
+    // reentrant, and taking it here deadlocks the test rather than failing it
+    // (which is exactly how it presented — a 60 s+ hang).
+    let launched = run_case(&dev, case, 0x7a11);
     assert_eq!(
-        fb1, fb0,
-        "the Vulkan conv must not record a fallback ({} -> {})",
-        fb0, fb1
+        launched,
+        Some(1),
+        "the Vulkan conv must submit exactly one native kernel"
+    );
+    // Launches are still counted by the backend; `run_case` has already
+    // asserted no `conv1d` fallback row appeared while it measured.
+    assert!(
+        kernels::native_exec_count() > 0,
+        "the backend must report native executions after a conv"
     );
 }
 
