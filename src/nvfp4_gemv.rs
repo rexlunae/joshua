@@ -520,7 +520,7 @@ fn opencl_launch(
         return Ok((s1.device.storage_from_cpu_storage(&out)?, shape));
     }
     let out = s1.device.alloc(DType::F32, g.out_len())?;
-    opencl_backend::launch_nvfp4(
+    match opencl_backend::launch_nvfp4(
         &s1.device,
         s2.buffer,
         s1.buffer,
@@ -528,8 +528,22 @@ fn opencl_launch(
         g.out_dim,
         g.in_dim,
         g.rows,
-    )?;
-    Ok((out, g.shape()))
+    ) {
+        Ok(()) => Ok((out, g.shape())),
+        // A native launch that cannot compile or enqueue is not a reason to
+        // fail the inference: the op has a working CPU implementation, so take
+        // the same round trip the opt-out path uses and record it.  `out` is
+        // dropped here, so no buffer is left in use by a failed enqueue.
+        Err(e) => {
+            candle_core::opencl_backend::kernels::note_fallback("nvfp4-matmul-qt", Some(&e));
+            drop(out);
+            use candle_core::backend::{BackendDevice as _, BackendStorage as _};
+            let c1 = s1.to_cpu_storage()?;
+            let c2 = s2.to_cpu_storage()?;
+            let (out, shape) = g.cpu_fwd(&c1, l1, &c2, l2)?;
+            Ok((s1.device.storage_from_cpu_storage(&out)?, shape))
+        }
+    }
 }
 
 /// The vendored OpenCL backend has no hook to launch a kernel outside its
