@@ -535,3 +535,36 @@ fn an_attention_free_trunk_can_still_draft() {
         .expect("drafting must work when the trunk has no attention layer");
     assert!(!drafts.is_empty(), "drafts produced: {drafts:?}");
 }
+
+/// The router's per-expert selection bias must steer top-k.
+///
+/// Nemotron 3.5 ships `mixer.gate.e_score_correction_bias` (GGUF
+/// `ffn_exp_probs_b`), and the loader did not read it at all: every tensor
+/// would load and the model would route to the wrong experts on real weights.
+/// This is the defect that only turned up when the actual checkpoint's tensor
+/// list was inspected, which is exactly why it is worth a test.
+#[test]
+fn the_router_selection_bias_changes_routing() {
+    let dir = common::model_dir("nemotron-gate-bias");
+    let plain = dir.join("plain.gguf");
+    let biased = dir.join("biased.gguf");
+    common::write_tiny_nemotron_h_gguf(&plain);
+    common::write_nemotron_h_gguf(
+        &biased,
+        common::NemotronTiny {
+            gate_bias: true,
+            ..Default::default()
+        },
+    );
+
+    let mut a = common::load_model(&plain, true);
+    let mut b = common::load_model(&biased, true);
+    let la = common::logits(&mut a, &[1, 4, 2], 0);
+    let lb = common::logits(&mut b, &[1, 4, 2], 0);
+
+    assert!(
+        la.iter().zip(&lb).any(|(x, y)| (x - y).abs() > 1e-6),
+        "a strong per-expert selection bias must change which experts run, \
+         so the logits must differ; identical output means the bias was ignored"
+    );
+}

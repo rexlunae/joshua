@@ -825,6 +825,10 @@ fn expert_parts<R: Read + Seek>(
 /// optional latent projection, plus an always-on shared expert.
 struct MoeBlock {
     router: Tensor, // [n_embd, n_expert] transposed for matmul
+    /// `ffn_exp_probs_b` — a per-expert bias that steers *selection* only.
+    /// Nemotron 3.5 ships one (`mixer.gate.e_score_correction_bias`); the
+    /// routing weights still come from the unbiased scores.
+    gate_bias: Option<Tensor>,
     experts: Vec<Expert>,
     shared_up: Weight,
     shared_down: Weight,
@@ -854,6 +858,10 @@ impl MoeBlock {
             .f32_tensor(&format!("{p}.ffn_gate_inp.weight"))? // [n_expert, n_embd]
             .t()?
             .contiguous()?; // [n_embd, n_expert]
+        // The router's selection bias.  llama.cpp reads this as
+        // `ffn_exp_probs_b`; without it the top-k picks differ on the real
+        // model even though every tensor loads.
+        let gate_bias = src.f32_opt(&format!("{p}.exp_probs_b.bias"))?;
         let up = src.expert_tensor(&format!("{p}.ffn_up_exps.weight"), cfg.n_expert)?;
         let down = src.expert_tensor(&format!("{p}.ffn_down_exps.weight"), cfg.n_expert)?;
         let candle = |qt: QTensor| -> Result<Weight> { Ok(Weight::Quant(QMatMul::from_qtensor(qt)?)) };
@@ -894,6 +902,7 @@ impl MoeBlock {
             .collect();
         Ok(Self {
             router,
+            gate_bias,
             experts,
             shared_up: load_weight(src, &format!("{p}.ffn_up_shexp.weight"))?,
             shared_down: load_weight(src, &format!("{p}.ffn_down_shexp.weight"))?,
@@ -922,8 +931,16 @@ impl MoeBlock {
         let logits = x2.matmul(&self.router)?; // [n, n_expert]
                                                // Nemotron-H routes with an independent sigmoid per expert.
         let scores = Gating::Sigmoid.scores(&logits)?;
-        let idx = crate::moe::topk_indices(&scores, self.k)?;
-        let weights = crate::moe::routing_weights(&scores, &idx, self.norm_weights, self.scale)?;
+        // `moe::route` selects on `scores + bias` and weights by the unbiased
+        // scores, which is llama.cpp's contract for `ffn_exp_probs_b`.
+        let (idx, weights) = crate::moe::route(
+            &scores,
+            self.gate_bias.as_ref(),
+            self.k,
+            self.norm_weights,
+            self.scale,
+            Ok,
+        )?;
 
         // The routed experts read the (optionally latent) block input.
         let routed_in = match &self.latent_down {
