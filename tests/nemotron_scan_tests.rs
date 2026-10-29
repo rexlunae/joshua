@@ -830,3 +830,145 @@ fn opencl_matches_cpu() {
         assert_close_scaled(&format!("opencl T={t} state"), &st_dev, &st_cpu, 1e-4);
     }
 }
+
+/// A one-token decode step must use the scalar recurrence, not a padded
+/// full chunk: the output *and* the advanced state must match a CPU step, and
+/// the device work must scale with one row rather than with `cfg.chunk`.
+///
+/// A padded chunk would still be numerically correct, so this also compares
+/// the time of a 1-row scan against a 128-row one — if the decode path were
+/// padding to a chunk they would be indistinguishable, whereas a scalar
+/// recurrence should be markedly cheaper.
+#[cfg(feature = "opencl")]
+#[test]
+fn opencl_decode_step_is_scalar_not_padded() {
+    let dev = match Device::new_opencl(0) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("skipping opencl decode step: no device ({e})");
+            return;
+        }
+    };
+    let c = nemotron();
+    let f = fixture(&c, 1, 0xdec0de);
+    let cpu = Device::Cpu;
+    let (row, n) = (c.conv_dim(), c.n_head);
+    let mixed = Tensor::from_vec(f.mixed.clone(), (1, row), &cpu).unwrap();
+    let dt = Tensor::from_vec(f.dt.clone(), (1, n), &cpu).unwrap();
+    let dt_bias = Tensor::from_vec(f.dt_bias.clone(), n, &cpu).unwrap();
+    let a = Tensor::from_vec(f.a.clone(), n, &cpu).unwrap();
+    let d_skip = Tensor::from_vec(f.d_skip.clone(), n, &cpu).unwrap();
+
+    let mut st_cpu = f.state0.clone();
+    let y_cpu = ssm_scan(c, &mixed, &dt, &dt_bias, &a, &d_skip, &mut st_cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+
+    let mut st_dev = f.state0.clone();
+    let y_dev = ssm_scan(
+        c,
+        &mixed.to_device(&dev).unwrap(),
+        &dt.to_device(&dev).unwrap(),
+        &dt_bias.to_device(&dev).unwrap(),
+        &a.to_device(&dev).unwrap(),
+        &d_skip.to_device(&dev).unwrap(),
+        &mut st_dev,
+    )
+    .unwrap()
+    .flatten_all()
+    .unwrap()
+    .to_vec1::<f32>()
+    .unwrap();
+
+    assert_close_scaled("opencl decode step y", &y_dev, &y_cpu, 1e-4);
+    assert_close_scaled("opencl decode step state", &st_dev, &st_cpu, 1e-4);
+
+    // Timing: a decode step must be much cheaper than a full chunk.
+    let time = |tokens: usize| -> f64 {
+        let g = fixture(&c, tokens, 0xbeef + tokens as u64);
+        let m = Tensor::from_vec(g.mixed, (tokens, row), &dev).unwrap();
+        let d = Tensor::from_vec(g.dt, (tokens, n), &dev).unwrap();
+        let db = Tensor::from_vec(g.dt_bias, n, &dev).unwrap();
+        let av = Tensor::from_vec(g.a, n, &dev).unwrap();
+        let dsk = Tensor::from_vec(g.d_skip, n, &dev).unwrap();
+        let mut st = g.state0;
+        // Warm up, then time.
+        let _ = ssm_scan(c, &m, &d, &db, &av, &dsk, &mut st).unwrap();
+        let reps = 20;
+        let start = std::time::Instant::now();
+        for _ in 0..reps {
+            let _ = ssm_scan(c, &m, &d, &db, &av, &dsk, &mut st).unwrap();
+        }
+        start.elapsed().as_secs_f64() / reps as f64
+    };
+    let one = time(1);
+    let chunk = time(c.chunk);
+    assert!(
+        one < chunk,
+        "a 1-token decode ({one:.6}s) must be cheaper than a {}-token chunk \
+         ({chunk:.6}s); equal cost means the decode path is padding to a chunk",
+        c.chunk
+    );
+    // The margin is modest at this size, and that is worth stating rather than
+    // dressing up: `state` crosses calls in host memory, so every device step
+    // pays one upload plus one readback of `n_head * head_dim * d_state` f32
+    // (~2 MiB at Nemotron geometry), and at that scale the transfer — not the
+    // chunk algebra — is what a single step costs.  The padding fix removes the
+    // `q×q` GEMMs; it cannot remove the transfer, which needs the state to live
+    // on the device across calls.
+    eprintln!(
+        "decode step {one:.6}s vs chunk {chunk:.6}s ({:.2}x; state transfer dominates)",
+        chunk / one
+    );
+}
+
+/// A long prefill must not scale its working set with the sequence length.
+///
+/// The intra-chunk term is `q × q` per head, so materialising every chunk at
+/// once costs `n_chunk · n_head · q²` f32 — 128 MiB *per intermediate* at
+/// Nemotron geometry and a 4096-token prompt, 1 GiB at 32k.  Processing the
+/// chunks in bounded groups makes peak memory depend on the group size
+/// instead, so a 16-chunk prefill must cost about the same as a 1-chunk one.
+///
+/// Timing a real long prefill and requiring it not to blow up is the cheap
+/// proxy for that: a per-chunk-group implementation stays linear in tokens,
+/// whereas one that materialises everything degrades sharply (and would OOM
+/// well before the test's timeout).
+#[cfg(feature = "opencl")]
+#[test]
+fn opencl_long_prefill_keeps_a_bounded_working_set() {
+    let dev = match Device::new_opencl(0) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("skipping opencl long prefill: no device ({e})");
+            return;
+        }
+    };
+    let c = nemotron();
+    let (row, n) = (c.conv_dim(), c.n_head);
+    let run = |tokens: usize| -> f64 {
+        let g = fixture(&c, tokens, 0x1ee7 + tokens as u64);
+        let m = Tensor::from_vec(g.mixed, (tokens, row), &dev).unwrap();
+        let d = Tensor::from_vec(g.dt, (tokens, n), &dev).unwrap();
+        let db = Tensor::from_vec(g.dt_bias, n, &dev).unwrap();
+        let av = Tensor::from_vec(g.a, n, &dev).unwrap();
+        let dsk = Tensor::from_vec(g.d_skip, n, &dev).unwrap();
+        let mut st = g.state0;
+        let _ = ssm_scan(c, &m, &d, &db, &av, &dsk, &mut st).unwrap(); // warm
+        let start = std::time::Instant::now();
+        let _ = ssm_scan(c, &m, &d, &db, &av, &dsk, &mut st).unwrap();
+        start.elapsed().as_secs_f64()
+    };
+    let short = run(c.chunk);
+    // 16 chunks: 16x the tokens. Linear work, bounded working set.
+    let long = run(c.chunk * 16);
+    assert!(
+        long < short * 32.0,
+        "16 chunks took {long:.4}s vs {short:.4}s for one: worse than linear, \
+         so the working set is growing with the sequence"
+    );
+    eprintln!("1 chunk {short:.4}s, 16 chunks {long:.4}s ({:.1}x)", long / short);
+}

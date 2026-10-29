@@ -495,6 +495,13 @@ pub fn ssm_scan(
     // so they are interchangeable across calls (prefill on one, decode on the
     // other) and the tests assert device == CPU.
     if !dev.is_cpu() {
+        // A single-token decode step is one scalar recurrence per head, not a
+        // chunk GEMM: padding one row to a 128-row chunk and building
+        // 128x128 matrices for every head would make each generated token cost
+        // as much as a full chunk.  Dispatch to a dedicated step instead.
+        if t == 1 {
+            return scan_device_step(&cfg, mixed, dt, dt_bias, a, d_skip, state);
+        }
         return scan_device(&cfg, mixed, dt, dt_bias, a, d_skip, state, t);
     }
 
@@ -581,6 +588,75 @@ pub fn ssm_scan_step(
 /// built from exponent differences), so the only difference between the two is
 /// backend rounding.
 #[allow(clippy::too_many_arguments)]
+/// One token on a device: `y = C·h + D·x` with `h ← exp(dt·A)·h + dt·B⊗x`.
+///
+/// This is the incremental-decode path.  It runs the recurrence directly on the
+/// token's `[n_head, head_dim]` activation and the carried state, so a generated
+/// token pays one small elementwise update rather than a padded full chunk of
+/// `q×q` GEMMs.  The state layout and update are exactly the CPU step's, so the
+/// two paths are interchangeable across calls.
+///
+/// `state` is `[n_head, head_dim, d_state]` on the host; it is uploaded once and
+/// read back once, because it crosses calls in host memory.
+fn scan_device_step(
+    cfg: &ScanConfig,
+    mixed: &Tensor,
+    dt: &Tensor,
+    dt_bias: &Tensor,
+    a: &Tensor,
+    d_skip: &Tensor,
+    state: &mut [f32],
+) -> Result<Tensor> {
+    let (n, hd, ds, ng) = (cfg.n_head, cfg.head_dim(), cfg.d_state, cfg.n_group);
+    let dev = mixed.device();
+    if mixed.dims() != [1, cfg.conv_dim()] {
+        candle_core::bail!(
+            "ssm_scan step: mixed must be [1, {}], got {:?}",
+            cfg.conv_dim(),
+            mixed.dims()
+        );
+    }
+    let row = mixed.flatten_all()?; // [conv_dim]
+
+    let x = row.narrow(0, 0, cfg.d_inner)?.reshape((n, hd))?; // [n, hd]
+    // Each group's B/C broadcast to its heads: [n, ds].
+    let gh = cfg.head_group();
+    let b = row
+        .narrow(0, cfg.d_inner, ng * ds)?
+        .reshape((ng, 1, ds))?
+        .broadcast_as((ng, gh, ds))?
+        .reshape((n, ds))?;
+    let c = row
+        .narrow(0, cfg.d_inner + ng * ds, ng * ds)?
+        .reshape((ng, 1, ds))?
+        .broadcast_as((ng, gh, ds))?
+        .reshape((n, ds))?;
+
+    // dt = softplus(raw + bias) in ggml's threshold form, then the decay.
+    let shifted = dt.flatten_all()?.reshape((n,))?.broadcast_add(&dt_bias.flatten_all()?.reshape((n,))?)?;
+    let dt_sp = {
+        let hi = shifted.gt(20.0)?;
+        let lo = (shifted.exp()? + 1.0)?.log()?;
+        hi.where_cond(&shifted, &lo)?
+    };
+    let decay = dt_sp.broadcast_mul(&a.flatten_all()?.reshape((n,))?)?.exp()?; // [n]
+
+    let s0 = Tensor::from_vec(state.to_vec(), (n, hd, ds), dev)?;
+    // h ← decay·h + dt·B⊗x   (outer product per head)
+    let xdt = x.broadcast_mul(&dt_sp.reshape((n, 1))?)?; // [n, hd]
+    let write = xdt.unsqueeze(2)?.broadcast_mul(&b.unsqueeze(1)?)?; // [n, hd, ds]
+    let s = s0.broadcast_mul(&decay.reshape((n, 1, 1))?)?;
+    let s = (s + write)?;
+    // y = Σ_s C·h + D·x
+    let y = s
+        .broadcast_mul(&c.reshape((n, 1, ds))?)?
+        .sum(candle_core::D::Minus1)? // [n, hd]
+        .broadcast_add(&x.broadcast_mul(&d_skip.flatten_all()?.reshape((n, 1))?)?)?;
+
+    state.copy_from_slice(&s.flatten_all()?.to_vec1::<f32>()?);
+    y.reshape((1, cfg.d_inner))
+}
+
 fn scan_device(
     cfg: &ScanConfig,
     mixed: &Tensor,
@@ -701,27 +777,47 @@ fn scan_device(
     // 0, so masked-out entries are set to −inf before `exp` (→ exactly 0).
     let idx = Tensor::arange(0u32, q as u32, dev)?;
     let lower = idx.reshape((q, 1))?.broadcast_ge(&idx.reshape((1, q))?)?; // j <= i
-    let lower4 = lower.broadcast_as((n_chunk, n, q, q))?;
-    let ci = cum.unsqueeze(3)?; // [nc, n, q, 1]
-    let cj = cum.unsqueeze(2)?; // [nc, n, 1, q]
-    let diff = ci.broadcast_sub(&cj)?; // [nc, n, q, q]
     // Construct `-inf` directly rather than as `zeros.affine(0.0, -inf)`: any
     // implementation that scales before biasing turns that into `0 · -inf =
     // NaN`, which is exactly the failure mode this mask exists to prevent.
-    let neg_inf = Tensor::full(f32::NEG_INFINITY, diff.dims(), diff.device())?;
-    let diff = lower4.where_cond(&diff, &neg_inf)?;
-    let dt_col = dt_c.unsqueeze(2)?.broadcast_as((n_chunk, n, q, q))?;
-    let lmat = diff.exp()?.mul(&dt_col)?;
-    // Also clear entries whose `dt[j]` is zero (padding), so they contribute
-    // nothing even where the exponent underflowed to exactly 1.
-    let mask_f = lower.to_dtype(DType::F32)?.broadcast_as((n_chunk, n, q, q))?;
-    let lmat = lmat.mul(&mask_f)?;
-    chk("lmat", &lmat)?;
+    let neg_inf = Tensor::full(f32::NEG_INFINITY, lower.dims(), dev)?;
+    let mask_f = lower.to_dtype(DType::F32)?;
+    let cb_src = c_c.matmul(&b_c.transpose(2, 3)?.contiguous()?)?; // [nc, n, q, q]
 
-    // y_intra = (L ⊙ C·Bᵀ) @ x, batched over every chunk and head at once.
-    let cb = c_c.matmul(&b_c.transpose(2, 3)?.contiguous()?)?; // [nc, n, q, q]
-    let y_intra = lmat.mul(&cb)?.matmul(&x_c)?; // [nc, n, q, hd]
-    chk("y_intra", &y_intra)?;
+    // `y_intra = (L ⊙ C·Bᵀ) @ x`.  Every per-chunk term above is `q × q` per
+    // head, so materialising all chunks at once costs
+    // `n_chunk · n_head · q²` f32 — 128 MiB per matrix at Nemotron geometry and
+    // a 4096-token prompt, and 1 GiB at 32k tokens, times the handful of
+    // intermediates alive together.  Chunks are independent here (the
+    // sequential carry is applied later), so they are processed in bounded
+    // groups: peak memory is set by `GROUP` rather than by prompt length.
+    const GROUP: usize = 8;
+    let mut y_intra_chunks: Vec<Tensor> = Vec::with_capacity(n_chunk);
+    let mut start = 0;
+    while start < n_chunk {
+        let g = GROUP.min(n_chunk - start);
+        let cum_g = cum.narrow(0, start, g)?; // [g, n, q]
+        let dt_g = dt_c.narrow(0, start, g)?;
+        let cb_g = cb_src.narrow(0, start, g)?; // [g, n, q, q]
+
+        let ci = cum_g.unsqueeze(3)?; // [g, n, q, 1]
+        let cj = cum_g.unsqueeze(2)?; // [g, n, 1, q]
+        let diff = ci.broadcast_sub(&cj)?; // [g, n, q, q]
+        let diff = lower.broadcast_as((g, n, q, q))?.where_cond(
+            &diff,
+            &neg_inf.broadcast_as((g, n, q, q))?,
+        )?;
+        let dt_col = dt_g.unsqueeze(2)?.broadcast_as((g, n, q, q))?;
+        // Mask the exponent *before* `exp` (above) and clear zero-`dt`
+        // padding after, so neither can produce `inf · 0`.
+        let lmat = diff.exp()?.mul(&dt_col)?.mul(&mask_f.broadcast_as((g, n, q, q))?)?;
+        chk("lmat", &lmat)?;
+        let yi = lmat.mul(&cb_g)?.matmul(&x_c.narrow(0, start, g)?)?; // [g, n, q, hd]
+        chk("y_intra", &yi)?;
+        y_intra_chunks.push(yi);
+        start += g;
+    }
+    let y_intra = Tensor::cat(&y_intra_chunks, 0)?; // [nc, n, q, hd]
 
     // ── the short sequential carry over chunks ──
     // `y_inter` reads the chunk-entry state, so the per-chunk output and the
