@@ -406,13 +406,14 @@ fn the_mamba_conv_runs_natively_on_a_device() {
     assert!(worst < 1e-5, "device vs CPU conv relative error {worst:e}");
 }
 
-/// A device model forward must say *why* it cannot run yet, rather than
-/// silently falling back to the CPU for the whole model (which would report
-/// the dense set as accelerated while every step round-tripped).
+/// A whole-model device forward must now complete: with the device scan in
+/// place, nothing in the Mamba-2 layer needs the host, so the model runs end
+/// to end on the accelerator and must agree with the CPU.
 #[cfg(feature = "opencl")]
 #[test]
-fn a_device_forward_reports_the_scan_limitation() {
-    let Ok(dev) = candle_core::Device::new_opencl(0) else {
+fn a_device_model_forward_matches_the_cpu() {
+    let Ok(dev) = Device::new_opencl(0) else {
+        eprintln!("nemotron: no OpenCL device, skipping the device-forward check");
         return;
     };
     let dir = common::model_dir("nemotron-device-forward");
@@ -427,7 +428,7 @@ fn a_device_forward_reports_the_scan_limitation() {
         let f = std::fs::File::open(&path).unwrap();
         std::sync::Arc::new(unsafe { memmap2::Mmap::map(&f).unwrap() })
     };
-    let mut model = joshua::model::QuantizedModel::from_gguf_mmap(
+    let mut device_model = joshua::model::QuantizedModel::from_gguf_mmap(
         content,
         &mut std::io::Cursor::new(&bytes[..]),
         &dev,
@@ -436,14 +437,18 @@ fn a_device_forward_reports_the_scan_limitation() {
         0,
     )
     .expect("load on the device");
-    let err = common::logits_dev(&mut model, &[1, 4, 2], 0, &dev)
-        .err()
-        .map(|e| e.to_string())
-        .unwrap_or_default();
-    // Either the scan bail or a successful forward once the device scan lands;
-    // what must not happen is a silent whole-model CPU fallback.
+
+    let prompt = [1u32, 4, 2, 7, 5];
+    let before = candle_core::opencl_backend::kernels::native_exec_count();
+    let got = common::logits_dev(&mut device_model, &prompt, 0, &dev)
+        .expect("a device forward completes now that the scan runs on the device");
+    let launched = candle_core::opencl_backend::kernels::native_exec_count() - before;
     assert!(
-        err.contains("CPU-only") || err.is_empty(),
-        "a device forward must either work or name the scan limitation, got: {err}"
+        launched > 0,
+        "a device forward must launch native kernels, not quietly run on the host"
     );
+
+    let mut cpu_model = common::load_model(&path, true);
+    let want = common::logits(&mut cpu_model, &prompt, 0);
+    common::assert_close(&got, &want, 5e-3, "device vs CPU whole-model forward");
 }
