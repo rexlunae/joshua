@@ -68,6 +68,22 @@ pub fn logits(model: &mut joshua::model::QuantizedModel, tokens: &[u32], offset:
 }
 
 /// Element-wise `|a - b| < tol`, naming the first diverging logit.
+/// [`logits`] on an explicit device — for the tests that load a model onto a
+/// GPU and compare it with the CPU reference.
+pub fn logits_dev(
+    model: &mut joshua::model::QuantizedModel,
+    tokens: &[u32],
+    offset: usize,
+    device: &Device,
+) -> candle_core::Result<Vec<f32>> {
+    let input = Tensor::new(tokens, device)?.unsqueeze(0)?;
+    model
+        .forward(&input, offset)?
+        .to_device(&Device::Cpu)?
+        .flatten_all()?
+        .to_vec1()
+}
+
 pub fn assert_close(a: &[f32], b: &[f32], tol: f32, what: &str) {
     assert_eq!(a.len(), b.len(), "{what}: length");
     for (i, (x, y)) in a.iter().zip(b).enumerate() {

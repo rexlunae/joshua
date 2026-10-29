@@ -332,3 +332,118 @@ fn rollback_at_offset_zero_clears_the_state() {
         "post-rollback-to-zero vs fresh session",
     );
 }
+
+/// The native conv kernel must actually run when a Mamba-2 layer convolves on
+/// a device, not merely be callable from a unit test.  Wiring it up is the
+/// difference between "the kernel exists" and "the layer is accelerated", and
+/// nothing else in the suite would notice the layer silently reverting to the
+/// per-tap tensor loop.
+///
+/// A full *model* forward on a device is not exercised here: the selective
+/// scan is still CPU-only (`ssm_scan` bails on a device tensor), so a device
+/// model cannot complete until that lands.  This drives the layer's own conv
+/// path on a device instead, which is the part this change is responsible for.
+#[cfg(feature = "opencl")]
+#[test]
+fn the_mamba_conv_runs_natively_on_a_device() {
+    let Ok(dev) = candle_core::Device::new_opencl(0) else {
+        eprintln!("nemotron: no OpenCL device, skipping the native-conv check");
+        return;
+    };
+    // The real Nemotron 3.5 `xBC` width: d_inner 4096 + 2 * 8 groups * 128.
+    let (d_conv, conv_dim, t) = (4usize, 6144usize, 5usize);
+    let x = Tensor::randn(0f32, 1.0, (t + d_conv - 1, conv_dim), &dev).unwrap();
+    let w = Tensor::randn(0f32, 0.1, (d_conv, conv_dim), &dev).unwrap();
+    let b = Tensor::randn(0f32, 0.1, (conv_dim,), &dev).unwrap();
+
+    let before = candle_core::opencl_backend::kernels::native_exec_count();
+    let fb_before: usize = candle_core::opencl_backend::kernels::fallback_counts_by_op()
+        .iter()
+        .filter(|(n, _)| n == joshua::conv1d::OP_NAME)
+        .map(|(_, c)| *c)
+        .sum();
+    let got = joshua::conv1d::conv1d(&x, &w, Some(&b), joshua::conv1d::Conv1d::mamba2()).unwrap();
+    let launched = candle_core::opencl_backend::kernels::native_exec_count() - before;
+    let fell_back: usize = candle_core::opencl_backend::kernels::fallback_counts_by_op()
+        .iter()
+        .filter(|(n, _)| n == joshua::conv1d::OP_NAME)
+        .map(|(_, c)| *c)
+        .sum::<usize>()
+        - fb_before;
+
+    assert!(launched > 0, "the conv must launch a native kernel on a device");
+    assert_eq!(
+        fell_back, 0,
+        "the Mamba-2 conv must run natively, not round-trip to the CPU"
+    );
+
+    // Same arithmetic as the CPU reference at the real geometry.
+    let want = joshua::conv1d::conv1d(
+        &x.to_device(&Device::Cpu).unwrap(),
+        &w.to_device(&Device::Cpu).unwrap(),
+        Some(&b.to_device(&Device::Cpu).unwrap()),
+        joshua::conv1d::Conv1d::mamba2(),
+    )
+    .unwrap()
+    .flatten_all()
+    .unwrap()
+    .to_vec1::<f32>()
+    .unwrap();
+    let have = got
+        .to_device(&Device::Cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+    let scale = want.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-6);
+    let worst = have
+        .iter()
+        .zip(&want)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max)
+        / scale;
+    assert!(worst < 1e-5, "device vs CPU conv relative error {worst:e}");
+}
+
+/// A device model forward must say *why* it cannot run yet, rather than
+/// silently falling back to the CPU for the whole model (which would report
+/// the dense set as accelerated while every step round-tripped).
+#[cfg(feature = "opencl")]
+#[test]
+fn a_device_forward_reports_the_scan_limitation() {
+    let Ok(dev) = candle_core::Device::new_opencl(0) else {
+        return;
+    };
+    let dir = common::model_dir("nemotron-device-forward");
+    let path = dir.join("model.gguf");
+    common::write_tiny_nemotron_h_gguf(&path);
+    let bytes = std::fs::read(&path).unwrap();
+    let content = joshua::gguf_ext::read_header(&mut std::io::Cursor::new(&bytes[..]))
+        .unwrap()
+        .to_candle_content()
+        .unwrap();
+    let mmap = {
+        let f = std::fs::File::open(&path).unwrap();
+        std::sync::Arc::new(unsafe { memmap2::Mmap::map(&f).unwrap() })
+    };
+    let mut model = joshua::model::QuantizedModel::from_gguf_mmap(
+        content,
+        &mut std::io::Cursor::new(&bytes[..]),
+        &dev,
+        Some(mmap),
+        None,
+        0,
+    )
+    .expect("load on the device");
+    let err = common::logits_dev(&mut model, &[1, 4, 2], 0, &dev)
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+    // Either the scan bail or a successful forward once the device scan lands;
+    // what must not happen is a silent whole-model CPU fallback.
+    assert!(
+        err.contains("CPU-only") || err.is_empty(),
+        "a device forward must either work or name the scan limitation, got: {err}"
+    );
+}

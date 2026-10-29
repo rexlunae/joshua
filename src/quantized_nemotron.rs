@@ -353,7 +353,12 @@ impl Mamba2 {
     fn load<R: Read + Seek>(src: &mut TensorSource<R>, p: &str, cfg: &SsmConfig) -> Result<Self> {
         let conv_w = src
             .f32_tensor(&format!("{p}.ssm_conv1d.weight"))?
-            .reshape((cfg.conv_dim(), cfg.d_conv))?;
+            // ggml stores `ssm_conv1d` as `[d_conv, conv_dim]` (tap-major,
+            // `w[k*C + c]`), which is exactly what `conv1d` and its reference
+            // tap ladder expect, so keep it and make it contiguous once here
+            // rather than slicing/reshaping a tap column per token.
+            .reshape((cfg.d_conv, cfg.conv_dim()))?
+            .contiguous()?;
         let conv_b = src.f32_opt(&format!("{p}.ssm_conv1d.bias"))?;
         // `ssm_a` ships as the raw log-rate `[1, n_head]`; the block wants
         // `-exp(a)` (llama.cpp negates at load).
@@ -400,6 +405,15 @@ impl Mamba2 {
     /// Returns `[t, conv_dim]`.  Delegates to [`crate::conv1d`] when that
     /// module provides a native device kernel; the CPU path here is the
     /// reference it is validated against.
+    /// The fused causal depthwise conv + bias + SiLU, continuing from the
+    /// state's stored tail.
+    ///
+    /// Delegates to [`crate::conv1d::conv1d`], which runs one native kernel on
+    /// an OpenCL device (bias and SiLU folded into the same launch, where
+    /// llama.cpp runs `ggml_ssm_conv`/`ggml_add`/`ggml_silu` separately) and
+    /// the same arithmetic on the CPU.  The per-tap tensor loop this replaced
+    /// ran `d_conv` broadcast multiplies plus a bias add plus a SiLU per layer
+    /// per token, all of them host round trips on a device.
     fn conv(&self, state: &mut SsmState, xbc: &Tensor) -> Result<Tensor> {
         let c = &self.cfg;
         let dev = xbc.device();
@@ -410,23 +424,18 @@ impl Mamba2 {
         let t = xbc.dim(0)?;
         // `[d_conv-1 + t, conv_dim]`: the previous tokens' tail then this chunk.
         let inp = Tensor::cat(&[&tail, xbc], 0)?.contiguous()?;
-        // y[t,c] = sum_k w[c,k] * inp[t+k, c]
-        let mut acc: Option<Tensor> = None;
-        for k in 0..c.d_conv {
-            let slice = inp.narrow(0, k, t)?;
-            let tap = self.conv_w.narrow(1, k, 1)?.reshape((1, c.conv_dim()))?;
-            let term = slice.broadcast_mul(&tap)?;
-            acc = Some(match acc {
-                Some(a) => (a + term)?,
-                None => term,
-            });
-        }
-        let mut y = acc.expect("d_conv >= 1");
-        if let Some(b) = &self.conv_b {
-            y = y.broadcast_add(&b.reshape((1, c.conv_dim()))?)?;
-        }
+        let bias = match &self.conv_b {
+            Some(b) => Some(b.reshape((c.conv_dim(),))?),
+            None => None,
+        };
+        let y = crate::conv1d::conv1d(
+            &inp,
+            &self.conv_w,
+            bias.as_ref(),
+            crate::conv1d::Conv1d::mamba2(),
+        )?;
         state.conv = Some(inp.narrow(0, t, c.d_conv - 1)?.contiguous()?);
-        silu(&y)
+        Ok(y)
     }
 
     /// Grouped RMS norm over blocks of `g` consecutive values: each block of
