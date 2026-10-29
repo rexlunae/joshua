@@ -288,13 +288,128 @@ impl Config {
 
 // ─── Weights ─────────────────────────────────────────────────────────────────
 
-/// A quantized linear weight, in candle's own form.
+/// Load a linear weight, preferring NVFP4 blocks when the file stores them.
+///
+/// NVFP4 is kept as blocks (see [`Weight::Nvfp4`]); every other dtype goes
+/// through candle's quantized matmul, which covers the formats it can name and
+/// decodes the rest on the host.
+fn load_weight<R: Read + Seek>(src: &mut TensorSource<R>, name: &str) -> Result<Weight> {
+    // Own the device up front so the immutable borrow of `src.device` does not
+    // overlap the mutable borrow the loader needs.
+    let device = src.device.clone();
+    if let Some(w) = Weight::nvfp4(src, name, &device)? {
+        return Ok(w);
+    }
+    Ok(Weight::Quant(src.qmatmul(name)?))
+}
+
+/// A linear weight: either candle's quantized matmul, or an **NVFP4** matrix
+/// kept as its raw blocks so the device GEMV decodes it in-kernel.
+///
+/// Nemotron 3.5 ships NVFP4 checkpoints.  candle has no NVFP4 dtype
+/// (`GgmlDType::from_u32` rejects id 40), so the only alternatives were to
+/// decode the whole matrix to f32 at load — 8x the bytes streamed per token,
+/// and the model no longer fits its intended footprint — or to keep the 36-byte
+/// blocks and let [`crate::nvfp4_gemv::nvfp4_matmul_qt`] decode them where they
+/// are used.  This is the second.
 #[derive(Clone)]
-struct Weight(QMatMul);
+enum Weight {
+    /// candle's own quantized matmul (every dtype it can name).
+    Quant(QMatMul),
+    /// NVFP4 blocks, `[out_dim, 36 * blocks_per_row]` u8, plus the logical
+    /// `[out_dim, in_dim]` shape the caller sees.
+    Nvfp4 { blocks: Tensor, out_dim: usize, in_dim: usize },
+}
 
 impl Weight {
+    /// Load `name` as an NVFP4 weight when the file stores it as
+    /// `GGML_TYPE_NVFP4` blocks, else `None`.
+    ///
+    /// The blocks are kept verbatim (36 bytes per 64 elements) and placed on
+    /// `device`, so a device GEMV decodes them where they are used and the
+    /// weights stream at their on-disk size instead of as f32.
+    fn nvfp4<R: Read + Seek>(
+        src: &mut TensorSource<R>,
+        name: &str,
+        device: &Device,
+    ) -> Result<Option<Self>> {
+        let Some(info) = src.raw.as_ref().and_then(|r| r.tensors.get(name)) else {
+            return Ok(None);
+        };
+        if info.dtype != <crate::mxfp4::BlockNvfp4 as crate::raw_block::RawBlock>::GGML_TYPE {
+            return Ok(None);
+        }
+        // `RawTensorInfo.dims` is already in row-major order — `read_header`
+        // reverses GGUF's fastest-varying-first order — so it is `[out, in]`
+        // exactly as the op wants.  Swapping here would reinterpret the same
+        // block bytes as the transposed matrix.
+        let (out_dim, in_dim) = match info.dims.as_slice() {
+            [o, i] => (*o, *i),
+            d => candle_core::bail!(
+                "{}: NVFP4 tensor `{name}` must be 2-D, got dims {d:?}",
+                src.arch
+            ),
+        };
+        let row_bytes = crate::nvfp4_gemv::row_bytes(in_dim)?;
+        let bytes = src.raw.as_ref().unwrap().read_tensor_bytes(&mut src.reader, name)?;
+        let blocks = Tensor::from_vec(bytes, (out_dim, row_bytes), device)?;
+        Ok(Some(Self::Nvfp4 { blocks, out_dim, in_dim }))
+    }
+
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        self.0.forward(xs)
+        match self {
+            Self::Quant(q) => q.forward(xs),
+            Self::Nvfp4 { blocks, .. } => {
+                // The op takes `[in]` or `[rows, in]` with `rows <= MAX_ROWS`.
+                // This loader always runs with a leading batch of one, so a
+                // `[1, t, hidden]` activation is flattened to `[t, hidden]` and
+                // the batch axis restored after.
+                let dims = xs.dims().to_vec();
+                let flat = if dims.len() == 3 {
+                    xs.reshape((dims[1], dims[2]))?
+                } else {
+                    xs.clone()
+                };
+                let rows = flat.dim(0)?;
+                // A prefill chunk is up to `--prefill-chunk` tokens (512 by
+                // default), far past the op's row limit, so the rows are
+                // processed in batches and concatenated in token order.  The
+                // split is on the *token* axis, so every output row still
+                // corresponds to the input row at the same index.
+                let mut y = if rows <= crate::nvfp4_gemv::MAX_ROWS {
+                    crate::nvfp4_gemv::nvfp4_matmul_qt(blocks, &flat)?
+                } else {
+                    let mut parts = Vec::with_capacity(rows.div_ceil(crate::nvfp4_gemv::MAX_ROWS));
+                    let mut start = 0;
+                    while start < rows {
+                        let n = (rows - start).min(crate::nvfp4_gemv::MAX_ROWS);
+                        let chunk = flat.narrow(0, start, n)?.contiguous()?;
+                        parts.push(crate::nvfp4_gemv::nvfp4_matmul_qt(blocks, &chunk)?);
+                        start += n;
+                    }
+                    Tensor::cat(&parts, 0)?
+                };
+                if dims.len() == 3 {
+                    let c = y.dim(1)?;
+                    y = y.reshape((1, dims[1], c))?;
+                }
+                Ok(y)
+            }
+        }
+    }
+
+    /// The logical weight shape, for load-time validation.
+    fn shape(&self) -> Option<(usize, usize)> {
+        match self {
+            Self::Quant(q) => match q {
+                QMatMul::QTensor(t) => t.shape().dims().first().map(|_| ()).and_then(|_| {
+                    let d = t.shape().dims();
+                    (d.len() == 2).then(|| (d[0], d[1]))
+                }),
+                _ => None,
+            },
+            Self::Nvfp4 { out_dim, in_dim, .. } => Some((*out_dim, *in_dim)),
+        }
     }
 }
 
@@ -387,7 +502,7 @@ impl Mamba2 {
             .contiguous()?
             .reshape((1, cfg.n_group, cfg.d_inner / cfg.n_group))?;
         Ok(Self {
-            in_proj: Weight(src.qmatmul(&format!("{p}.ssm_in.weight"))?),
+            in_proj: load_weight(src, &format!("{p}.ssm_in.weight"))?,
             conv_w,
             conv_b,
             dt_b,
@@ -395,7 +510,7 @@ impl Mamba2 {
             d_skip,
             norm_w,
             eps: 1e-5,
-            out: Weight(src.qmatmul(&format!("{p}.ssm_out.weight"))?),
+            out: load_weight(src, &format!("{p}.ssm_out.weight"))?,
             cfg: cfg.clone(),
         })
     }
@@ -571,19 +686,19 @@ impl AttentionBlock {
         let _ = dim(cfg.n_embd);
         Ok(Self {
             q: Linear {
-                w: Weight(src.qmatmul(&format!("{p}.attn_q.weight"))?),
+                w: load_weight(src, &format!("{p}.attn_q.weight"))?,
                 b: src.f32_opt(&format!("{p}.attn_q.bias"))?,
             },
             k: Linear {
-                w: Weight(src.qmatmul(&format!("{p}.attn_k.weight"))?),
+                w: load_weight(src, &format!("{p}.attn_k.weight"))?,
                 b: src.f32_opt(&format!("{p}.attn_k.bias"))?,
             },
             v: Linear {
-                w: Weight(src.qmatmul(&format!("{p}.attn_v.weight"))?),
+                w: load_weight(src, &format!("{p}.attn_v.weight"))?,
                 b: src.f32_opt(&format!("{p}.attn_v.bias"))?,
             },
             o: Linear {
-                w: Weight(src.qmatmul(&format!("{p}.attn_output.weight"))?),
+                w: load_weight(src, &format!("{p}.attn_output.weight"))?,
                 b: src.f32_opt(&format!("{p}.attn_output.bias"))?,
             },
             rope,
@@ -718,7 +833,7 @@ impl MoeBlock {
             .contiguous()?; // [n_embd, n_expert]
         let up = src.expert_tensor(&format!("{p}.ffn_up_exps.weight"), cfg.n_expert)?;
         let down = src.expert_tensor(&format!("{p}.ffn_down_exps.weight"), cfg.n_expert)?;
-        let candle = |qt: QTensor| -> Result<Weight> { Ok(Weight(QMatMul::from_qtensor(qt)?)) };
+        let candle = |qt: QTensor| -> Result<Weight> { Ok(Weight::Quant(QMatMul::from_qtensor(qt)?)) };
         // Borrow each expert's slice of the mapping when there is one, exactly
         // as `quantized_qwen::split_experts` prefers: an expert then costs a
         // pointer and a length until tokens route to it, and the pool keeps its
@@ -757,15 +872,15 @@ impl MoeBlock {
         Ok(Self {
             router,
             experts,
-            shared_up: Weight(src.qmatmul(&format!("{p}.ffn_up_shexp.weight"))?),
-            shared_down: Weight(src.qmatmul(&format!("{p}.ffn_down_shexp.weight"))?),
+            shared_up: load_weight(src, &format!("{p}.ffn_up_shexp.weight"))?,
+            shared_down: load_weight(src, &format!("{p}.ffn_down_shexp.weight"))?,
             latent_down: if src.has(&format!("{p}.ffn_latent_down.weight")) {
-                Some(Weight(src.qmatmul(&format!("{p}.ffn_latent_down.weight"))?))
+                Some(load_weight(src, &format!("{p}.ffn_latent_down.weight"))?)
             } else {
                 None
             },
             latent_up: if src.has(&format!("{p}.ffn_latent_up.weight")) {
-                Some(Weight(src.qmatmul(&format!("{p}.ffn_latent_up.weight"))?))
+                Some(load_weight(src, &format!("{p}.ffn_latent_up.weight"))?)
             } else {
                 None
             },
@@ -994,10 +1109,10 @@ impl Weights {
         }
         let norm = src.rms_norm("output_norm.weight", cfg.rms_eps)?;
         let output = if src.has("output.weight") {
-            Weight(src.qmatmul("output.weight")?)
+            Weight::Quant(src.qmatmul("output.weight")?)
         } else {
             // Tied embeddings: reuse the (quantized) embedding table.
-            Weight(src.qmatmul("token_embd.weight")?)
+            Weight::Quant(src.qmatmul("token_embd.weight")?)
         };
         Ok(Self {
             tok_embeddings,
@@ -1221,14 +1336,141 @@ impl LayerStack for Weights {
 /// A Nemotron-H session over shared [`Weights`].
 pub type ModelWeights = crate::native_session::Session<Weights>;
 
-#[cfg(all(test, feature = "opencl"))]
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An NVFP4 `Weight` must decode in-kernel and agree with the reference
+    /// decoder — routing NVFP4 through this loader must not change what the
+    /// matmul computes, only where the decoding happens.
+    #[test]
+    fn an_nvfp4_weight_matches_the_reference_matmul() {
+        use crate::mxfp4::{BlockNvfp4, QK_NVFP4};
+        use crate::raw_block::RawBlock;
+        let dev = Device::Cpu;
+        let (out_dim, in_dim) = (16usize, 128usize);
+        let blocks_per_row = in_dim / QK_NVFP4;
+        let row_bytes = blocks_per_row * std::mem::size_of::<BlockNvfp4>();
+        // Deterministic pseudo-random blocks; every byte pattern is a valid
+        // NVFP4 block (all 4-bit codes are in range, all scales finite).
+        let mut state = 0x1234_5678u32;
+        let raw: Vec<u8> = (0..out_dim * row_bytes)
+            .map(|_| {
+                state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                (state >> 16) as u8
+            })
+            .collect();
+        let blocks = Tensor::from_vec(raw.clone(), (out_dim, row_bytes), &dev).unwrap();
+        let w = Weight::Nvfp4 { blocks: blocks.clone(), out_dim, in_dim };
+
+        let acts = Tensor::randn(0f32, 1.0, (4, in_dim), &dev).unwrap();
+        let got = w.forward(&acts).unwrap();
+
+        // The reference: the same block bytes through the scalar decoder.
+        let act_host = acts.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let mut want = vec![0f32; 4 * out_dim];
+        crate::nvfp4_gemv::matmul_t(&raw, &act_host, &mut want, 4, out_dim, in_dim).unwrap();
+
+        let a = got.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert_eq!(got.dims(), &[4, out_dim]);
+        // Compare against a reference computed from the same bytes; both are
+        // the same decode, so this is exact up to summation order.
+        let scale = want.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-6);
+        let worst = a.iter().zip(&want).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max) / scale;
+        assert!(worst < 1e-6, "NVFP4 weight vs reference matmul: rel {worst:e}");
+        let _ = <BlockNvfp4 as RawBlock>::GGML_TYPE;
+    }
+
+    /// A **non-square** NVFP4 projection must be read with `out_dim` from the
+    /// first (already row-major) dimension.
+    ///
+    /// `RawTensorInfo.dims` is `[out, in]` because `read_header` reverses
+    /// GGUF's fastest-varying-first order.  Reading it as disk order and
+    /// swapping back transposes the matrix: the same bytes become a different
+    /// shape, and the GEMV then rejects ordinary activations.  A square matrix
+    /// cannot tell the two apart, so this uses one where out != in and checks
+    /// both the accepted activation width and the values.
+    #[test]
+    fn a_non_square_nvfp4_weight_keeps_its_orientation() {
+        use crate::mxfp4::{BlockNvfp4, QK_NVFP4};
+        let dev = Device::Cpu;
+        let (out_dim, in_dim) = (48usize, 128usize); // deliberately non-square
+        let row_bytes = (in_dim / QK_NVFP4) * std::mem::size_of::<BlockNvfp4>();
+        let mut state = 0xdead_beefu32;
+        let raw: Vec<u8> = (0..out_dim * row_bytes)
+            .map(|_| {
+                state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                (state >> 16) as u8
+            })
+            .collect();
+        let blocks = Tensor::from_vec(raw.clone(), (out_dim, row_bytes), &dev).unwrap();
+        let w = Weight::Nvfp4 { blocks, out_dim, in_dim };
+        assert_eq!(w.shape(), Some((out_dim, in_dim)), "shape is [out, in]");
+
+        // An activation of the declared input width must be accepted and give
+        // `[rows, out_dim]`.
+        let acts = Tensor::randn(0f32, 1.0, (3, in_dim), &dev).unwrap();
+        let got = w.forward(&acts).unwrap();
+        assert_eq!(got.dims(), &[3, out_dim], "out_dim, not in_dim, is the width");
+
+        // And it must equal the reference over the same bytes.
+        let act_host = acts.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let mut want = vec![0f32; 3 * out_dim];
+        crate::nvfp4_gemv::matmul_t(&raw, &act_host, &mut want, 3, out_dim, in_dim).unwrap();
+        let a = got.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let scale = want.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-6);
+        let worst = a.iter().zip(&want).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max) / scale;
+        assert!(worst < 1e-6, "non-square NVFP4 weight: rel {worst:e}");
+
+        // The transposed reading would have demanded `out_dim`-wide input.
+        let wrong = Tensor::randn(0f32, 1.0, (3, out_dim), &dev).unwrap();
+        assert!(
+            w.forward(&wrong).is_err(),
+            "an activation of the wrong width must be rejected, not reinterpreted"
+        );
+    }
+
+    /// A prefill chunk is far longer than the op's 16-row limit, so the
+    /// wrapper must batch the rows rather than hand the whole chunk over.  The
+    /// default chunk is 512 tokens, i.e. 32 batches — a prompt of 17 tokens is
+    /// enough to fail without this.
+    #[test]
+    fn an_nvfp4_weight_handles_a_full_prefill_chunk() {
+        use crate::mxfp4::{BlockNvfp4, QK_NVFP4};
+        let dev = Device::Cpu;
+        let (out_dim, in_dim, tokens) = (24usize, 128usize, 37usize);
+        assert!(tokens > crate::nvfp4_gemv::MAX_ROWS, "exceeds the op's row limit");
+        let row_bytes = (in_dim / QK_NVFP4) * std::mem::size_of::<BlockNvfp4>();
+        let mut state = 0x5eed_u32;
+        let raw: Vec<u8> = (0..out_dim * row_bytes)
+            .map(|_| {
+                state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                (state >> 16) as u8
+            })
+            .collect();
+        let blocks = Tensor::from_vec(raw.clone(), (out_dim, row_bytes), &dev).unwrap();
+        let w = Weight::Nvfp4 { blocks, out_dim, in_dim };
+
+        let acts = Tensor::randn(0f32, 1.0, (1, tokens, in_dim), &dev).unwrap();
+        let got = w.forward(&acts).expect("a 37-token chunk must be batched, not rejected");
+        assert_eq!(got.dims(), &[1, tokens, out_dim]);
+
+        // Batched must equal the single-pass reference over all rows: the split
+        // is on the token axis, so no row may be reordered or dropped.
+        let act_host = acts.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let mut want = vec![0f32; tokens * out_dim];
+        crate::nvfp4_gemv::matmul_t(&raw, &act_host, &mut want, tokens, out_dim, in_dim).unwrap();
+        let a = got.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let scale = want.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-6);
+        let worst = a.iter().zip(&want).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max) / scale;
+        assert!(worst < 1e-6, "batched prefill vs single-pass: rel {worst:e}");
+    }
 
     /// `Mamba2::conv` must dispatch the native kernel, not fall back to a
     /// per-tap tensor loop.  The op has its own unit tests, but only this
     /// reaches the layer's call site: a layer that stopped calling
     /// `crate::conv1d::conv1d` would still pass those.
+    #[cfg(feature = "opencl")]
     #[test]
     fn the_mamba_layer_convolves_natively() {
         let Ok(dev) = Device::new_opencl(0) else {
@@ -1247,7 +1489,7 @@ mod tests {
         // never touched and can be trivial.
         let conv_dim = cfg.conv_dim();
         let layer = Mamba2 {
-            in_proj: Weight(candle_core::quantized::QMatMul::QTensor(std::sync::Arc::new(
+            in_proj: Weight::Quant(candle_core::quantized::QMatMul::QTensor(std::sync::Arc::new(
                 candle_core::quantized::QTensor::quantize(
                     &Tensor::zeros((1, 1), DType::F32, &dev).unwrap(),
                     candle_core::quantized::GgmlDType::F32,
@@ -1262,7 +1504,7 @@ mod tests {
             norm_w: Tensor::ones((1, cfg.n_group, cfg.d_inner / cfg.n_group), DType::F32, &dev)
                 .unwrap(),
             eps: 1e-5,
-            out: Weight(candle_core::quantized::QMatMul::QTensor(std::sync::Arc::new(
+            out: Weight::Quant(candle_core::quantized::QMatMul::QTensor(std::sync::Arc::new(
                 candle_core::quantized::QTensor::quantize(
                     &Tensor::zeros((1, 1), DType::F32, &dev).unwrap(),
                     candle_core::quantized::GgmlDType::F32,
