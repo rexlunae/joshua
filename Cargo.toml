@@ -204,3 +204,8 @@ hound = "3.5"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 tower = { version = "0.5", features = ["util"] }
 base64 = "0.22"
+# The shader-compiler front end the Vulkan backend uses, kept in lockstep with
+# the vendored candle-core's `naga` dependency.  Integration tests parse the
+# GLSL an op emits to prove it is valid input; candle-core does not re-export
+# the front end, and a dev-dependency pulls it into the test runtime only.
+naga = { version = "27", default-features = false, features = ["glsl-in", "spv-out"] }
