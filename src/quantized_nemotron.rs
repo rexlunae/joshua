@@ -1669,12 +1669,20 @@ mod tests {
         put("expert_used_count", Value::U32(6));
         put("expert_weights_scale", Value::F32(2.5));
         put("expert_weights_norm", Value::Bool(true));
-        // Per-layer arrays: mamba layers have kv = 0 and ffn = 0.
+        // The released `layers_block_type`: 23 `mamba`, 23 `moe`, 6
+        // `attention`, at exactly these indexes.  Each is a *single* kind, so a
+        // `mamba` layer has both `head_count_kv` and `feed_forward_length` zero
+        // — that pair is llama.cpp's whole recurrent test.
+        const ATTN: [u32; 6] = [5, 12, 19, 26, 33, 42];
+        const MOE: [u32; 23] = [
+            1, 3, 6, 8, 10, 13, 15, 17, 20, 22, 24, 27, 29, 31, 34, 36, 38, 40, 43, 45, 47, 49,
+            51,
+        ];
         let kv: Vec<Value> = (0..52u32)
-            .map(|i| Value::U32(if matches!(i, 5 | 12 | 19 | 26 | 34 | 43) { 2 } else { 0 }))
+            .map(|i| Value::U32(if ATTN.contains(&i) { 2 } else { 0 }))
             .collect();
         let ff: Vec<Value> = (0..52u32)
-            .map(|i| Value::U32(if matches!(i, 5 | 12 | 19 | 26 | 34 | 43) { 0 } else { 1856 }))
+            .map(|i| Value::U32(if MOE.contains(&i) { 1856 } else { 0 }))
             .collect();
         put("attention.head_count_kv", Value::Array(kv));
         put("feed_forward_length", Value::Array(ff));
@@ -1704,8 +1712,16 @@ mod tests {
         // the kv/ffn rule.
         let attn = cfg.layers.iter().filter(|l| l.kind == LayerKind::Attention).count();
         let mamba = cfg.layers.iter().filter(|l| l.kind == LayerKind::Mamba).count();
-        assert_eq!(attn, 6, "six attention layers in the released pattern");
-        assert_eq!(mamba, 0, "this pattern's recurrent layers carry an FFN");
+        let moe = cfg.layers.iter().filter(|l| l.kind == LayerKind::Moe).count();
+        assert_eq!((attn, mamba, moe), (6, 23, 23), "the released layer pattern");
+        // Spot-check the classification at the boundaries rather than trusting
+        // the counts alone.
+        assert_eq!(cfg.layers[0].kind, LayerKind::Mamba);
+        assert_eq!(cfg.layers[1].kind, LayerKind::Moe);
+        assert_eq!(cfg.layers[5].kind, LayerKind::Attention);
+        assert_eq!(cfg.layers[33].kind, LayerKind::Attention);
+        assert_eq!(cfg.layers[42].kind, LayerKind::Attention);
+        assert_eq!(cfg.layers[51].kind, LayerKind::Moe);
 
         // And the MTP block is addressed past the trunk.
         assert_eq!(format!("blk.{}", cfg.n_layer), "blk.52");
