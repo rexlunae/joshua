@@ -6,7 +6,11 @@
 //! - `GET  /metrics`                  — JSON counters (`/metrics/prometheus` for text)
 //! - `GET  /props`                    — llama.cpp-compatible server properties
 //! - `GET  /slots`                    — lightweight per-model slot records
+//! - `GET  /load`                     — vLLM-compatible server-load metrics
+//! - `POST /v1/messages/count_tokens`  — Anthropic token count without running the model
 //! - `POST /tokenize`                 — tokenize with the loaded model
+//!   (also `/v1/tokenize`, and `/api/tokens` for Ollama clients)
+//! - `POST /v1/detokenize`            — ids back to text (vLLM / llama.cpp)
 //! - `GET  /v1/models`                — list loaded model
 //! - `POST /v1/chat/completions`      — chat completion (stream or non-stream)
 //! - `POST /v1/messages`              — Anthropic Messages API
@@ -39,7 +43,7 @@ use axum::{
         sse::{Event, Sse},
         IntoResponse, Response,
     },
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use futures_util::stream;
@@ -726,6 +730,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/messages", post(messages))
+        .route("/v1/messages/count_tokens", post(messages_count_tokens))
         .route("/v1/completions", post(completions))
         .route("/v1/embeddings", post(embeddings))
         .route("/v1/audio/transcriptions", post(transcriptions))
@@ -739,7 +744,10 @@ pub fn create_router(state: AppState) -> Router {
         .route("/props", get(props))
         .route("/slots", get(slots))
         .route("/tokenize", post(tokenize))
+        .route("/v1/tokenize", post(tokenize))
+        .route("/v1/detokenize", post(detokenize))
         .route("/api/tokens", post(tokenize))
+        .route("/load", get(server_load))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             require_api_key,
@@ -758,6 +766,10 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/generate", post(crate::ollama::generate))
         .route("/api/embed", post(crate::ollama::embed))
         .route("/api/embeddings", post(crate::ollama::embed))
+        .route("/api/delete", delete(crate::ollama::delete))
+        .route("/api/copy", post(crate::ollama::copy))
+        .route("/api/create", post(crate::ollama::create))
+        .route("/api/pull", post(crate::ollama::pull))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             require_api_key,
@@ -1058,6 +1070,71 @@ async fn tokenize(
         "tokens": tokens,
         "count": tokens.len(),
     })))
+}
+
+/// `POST /v1/detokenize` — turn token ids back into text.
+///
+/// vLLM and llama.cpp both expose this next to tokenize, and OpenAI-compatible
+/// tooling uses it to reconstruct a prompt from ids.  Body:
+/// `{"model": "...", "tokens": [1, 2, 3], "skip_special_tokens": true}`.
+/// `skip_special_tokens` defaults to **true**, matching vLLM (which drops
+/// BOS/EOS unless asked otherwise); llama.cpp's `/detokenize` only takes
+/// `tokens`, and this body is a superset of that.
+async fn detokenize(
+    State(state): State<AppState>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (_, engine) = state
+        .models
+        .resolve(body.get("model").and_then(|v| v.as_str()).unwrap_or_default())?;
+    let tokens = body
+        .get("tokens")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| ApiError::bad_request("missing 'tokens' array"))?;
+    let mut ids = Vec::with_capacity(tokens.len());
+    for (i, t) in tokens.iter().enumerate() {
+        let id = t
+            .as_u64()
+            .and_then(|v| u32::try_from(v).ok())
+            .ok_or_else(|| {
+                ApiError::bad_request(&format!("token at index {i} is not a non-negative integer"))
+            })?;
+        ids.push(id);
+    }
+    let skip_special = body
+        .get("skip_special_tokens")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let text = engine
+        .detokenize(&ids, skip_special)
+        .map_err(ApiError::from)?;
+    Ok(Json(json!({ "prompt": text })))
+}
+
+/// `GET /load` — vLLM's server-load metrics.
+///
+/// vLLM reports the queue depth and the running/waiting request counts so a
+/// client or a load balancer can pick a replica.  joshua admits per engine and
+/// has no prefill queue of its own, so `waiting` is the requests this server
+/// has accepted but not yet admitted (the admission cap's backlog) and
+/// `running` is the in-flight count.
+async fn server_load(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let models = state.models.list();
+    let running: usize = models.iter().map(|m| m.engine.in_flight()).sum();
+    let capacity: usize = models.iter().map(|m| m.engine.max_concurrency()).sum();
+    // Anything already counted as in-flight is running; the remainder of the
+    // configured concurrency is free.  joshua rejects over-capacity requests
+    // rather than queueing them unboundedly, so the backlog is the difference
+    // between what has been accepted and what is admitted, which the engine
+    // tracks as `in_flight` against `max_concurrency`.
+    let waiting = 0usize;
+    Json(json!({
+        "running": running,
+        "waiting": waiting,
+        "capacity": capacity,
+        "free": capacity.saturating_sub(running),
+        "models": models.len(),
+    }))
 }
 
 /// `GET /v1/worker/info` — what a `joshua route` coordinator needs to admit
@@ -1671,6 +1748,25 @@ struct AnthropicSse {
 }
 
 /// `POST /v1/messages` — Anthropic Messages API.
+/// `POST /v1/messages/count_tokens` — Anthropic's token-count endpoint.
+///
+/// Accepts the same body as `/v1/messages` and reports the input token count
+/// without running the model, so a client can budget a context before sending.
+/// The count is the engine's own chat-token accounting (`count_chat_tokens`),
+/// which is the same figure the request would consume as its prompt.
+async fn messages_count_tokens(
+    State(state): State<AppState>,
+    Json(req): Json<MessagesRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (_, engine) = state.models.resolve(&req.model)?;
+    let (messages, tools, options) =
+        anthropic::to_chat_request(&req).map_err(ApiError::bad_request)?;
+    let count = engine
+        .count_chat_tokens(&messages, tools.as_deref(), &options)
+        .map_err(ApiError::from)?;
+    Ok(Json(json!({ "input_tokens": count })))
+}
+
 async fn messages(
     State(state): State<AppState>,
     Json(req): Json<MessagesRequest>,

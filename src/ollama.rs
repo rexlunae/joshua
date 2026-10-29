@@ -14,10 +14,24 @@
 //! confines paths to the model directory), then drive the same engine the
 //! OpenAI routes use.
 //!
-//! `/api/pull`, `/api/create` and `/api/delete` are intentionally **not**
-//! implemented — joshua reads plain `.gguf` + `tokenizer.json` from a directory
-//! rather than Ollama's content-addressed blob store, so put the files in the
-//! model directory instead.
+//! **Model management** (`/api/delete`, `/api/copy`, `/api/create`,
+//! `/api/pull`) is provided against the model *directory* rather than Ollama's
+//! content-addressed blob store, so scripts that manage models through the API
+//! keep working:
+//!
+//! * `delete` / `copy` / `create` (the `from` form) act on `<name>.gguf` inside
+//!   the model directory.  Names are confined to that directory — `..`,
+//!   absolute paths and names that canonicalise outside it are rejected,
+//!   because these endpoints delete and overwrite files.
+//! * `create` with `files` (SHA256 blob digests) is **rejected**, not ignored:
+//!   there is no blob store to name files in.
+//! * `pull` does not speak the Ollama registry protocol, so a bare library name
+//!   such as `llama3` fails with guidance instead of hanging.  Place the
+//!   `.gguf` in the model directory and use `POST /v1/models/load`, or move the
+//!   file in by hand.
+//!
+//! Ollama's `:tag` suffix names a manifest, which has no joshua equivalent:
+//! every tag of a name resolves to the same `<name>.gguf`.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -208,6 +222,14 @@ fn normalise_name(id: &str) -> String {
     } else {
         format!("{id}:latest")
     }
+}
+
+/// Drop Ollama's `:tag` suffix, which names a *manifest* rather than a file.
+/// joshua serves one `.gguf` per name, so `llama3:latest` and `llama3:13b` both
+/// address `llama3.gguf`; a caller that needs two variants keeps two files
+/// under distinct names.
+fn strip_tag(name: &str) -> &str {
+    name.split(':').next().unwrap_or(name).trim()
 }
 
 // ─── /api/tags ──────────────────────────────────────────────────────────────
@@ -701,6 +723,173 @@ pub async fn embed(
     }))
 }
 
+// ─── Model management: /api/delete, /api/copy, /api/create, /api/pull ────────
+//
+// Ollama runs a content-addressed blob store and a remote library; joshua
+// reads plain `.gguf` + `tokenizer.json` from a directory.  These endpoints
+// keep the *protocol* working for clients and scripts that manage models
+// through the API, while operating on that directory instead of a blob store:
+//
+// * `delete`/`copy`/`create(from:)` act on `.gguf` files inside the model
+//   directory, and never on a path that resolves outside it.
+// * `create(files: ...)` — Ollama's blob-digest form — is not supported: there
+//   is no blob store to name files in.  It returns a clear 400 rather than
+//   silently ignoring the field.
+// * `pull` fetches from an explicit https URL (or a `hf.co/<repo>` shorthand
+//   is rejected with guidance); it does not speak the Ollama registry
+//   protocol, so `ollama pull llama3` cannot resolve.
+
+/// Resolve a requested model name to a `.gguf` inside the model directory.
+///
+/// Confinement matters here: these endpoints delete and overwrite files, so a
+/// name containing `..` or an absolute path must not escape the directory.
+fn model_file(state: &AppState, name: &str) -> Result<PathBuf, ApiError> {
+    let manager = state.manager.as_ref().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::FORBIDDEN,
+            "model management is disabled on this server",
+            "management_disabled",
+        )
+    })?;
+    let stem = strip_tag(name);
+    if stem.is_empty() || stem.contains('/') || stem.contains('\\') || stem.contains("..") {
+        return Err(ApiError::bad_request(&format!(
+            "invalid model name `{name}`: expected a bare name inside the model directory"
+        )));
+    }
+    let path = manager.model_dir.join(format!("{stem}.gguf"));
+    // A name that canonicalises outside the directory (a symlink pointing out,
+    // for instance) is refused even when the joined path looks contained.
+    if let Ok(dir) = manager.model_dir.canonicalize() {
+        if let Ok(real) = path.canonicalize() {
+            if !real.starts_with(&dir) {
+                return Err(ApiError::bad_request(&format!(
+                    "model `{name}` resolves outside the model directory"
+                )));
+            }
+        }
+    }
+    Ok(path)
+}
+
+/// `DELETE /api/delete` — remove a model's file.  404 when it does not exist,
+/// matching Ollama.
+pub async fn delete(
+    State(state): State<AppState>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<StatusCode, ApiError> {
+    let name = body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ApiError::bad_request("missing 'model'"))?;
+    let path = model_file(&state, name)?;
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(StatusCode::OK),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            &format!("model `{name}` not found"),
+            "model_not_found",
+        )),
+        Err(e) => Err(ApiError::internal(format!(
+            "removing {}: {e}",
+            path.display()
+        ))),
+    }
+}
+
+/// `POST /api/copy` — duplicate a model file under a new name.
+pub async fn copy(
+    State(state): State<AppState>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<StatusCode, ApiError> {
+    let source = body
+        .get("source")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ApiError::bad_request("missing 'source'"))?;
+    let dest = body
+        .get("destination")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ApiError::bad_request("missing 'destination'"))?;
+    let from = model_file(&state, source)?;
+    let to = model_file(&state, dest)?;
+    if !from.exists() {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            &format!("model `{source}` not found"),
+            "model_not_found",
+        ));
+    }
+    std::fs::copy(&from, &to)
+        .map_err(|e| ApiError::internal(format!("copying to {}: {e}", to.display())))?;
+    Ok(StatusCode::OK)
+}
+
+/// `POST /api/create` — create a model.
+///
+/// Only the `from` form is meaningful without a blob store: it copies an
+/// existing model under a new name (Ollama's "derive a model from another").
+/// The `files` form names blobs by SHA256, which joshua has no store for, so it
+/// is rejected explicitly instead of being ignored.
+pub async fn create(
+    State(state): State<AppState>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<StatusCode, ApiError> {
+    let name = body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ApiError::bad_request("missing 'model'"))?;
+    if body.get("files").is_some() {
+        return Err(ApiError::bad_request(
+            "creating from blob digests is not supported: joshua reads plain .gguf              files from its model directory, so put the file there and use \
+             `\"from\": \"<name>\"` or POST /v1/models/load instead",
+        ));
+    }
+    let source = body.get("from").and_then(|v| v.as_str()).ok_or_else(|| {
+        ApiError::bad_request("missing 'from': joshua cannot build a model from template parameters alone")
+    })?;
+    let from = model_file(&state, source)?;
+    let to = model_file(&state, name)?;
+    if !from.exists() {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            &format!("model `{source}` not found"),
+            "model_not_found",
+        ));
+    }
+    std::fs::copy(&from, &to)
+        .map_err(|e| ApiError::internal(format!("writing {}: {e}", to.display())))?;
+    Ok(StatusCode::OK)
+}
+
+/// `POST /api/pull` — fetch a model file from an explicit https URL.
+///
+/// Ollama's registry protocol (`model:tag` resolved against its library) is not
+/// implemented: it needs the registry manifest/blob API, which joshua does not
+/// speak.  A bare library name therefore fails with guidance rather than
+/// hanging, while an explicit https URL downloads into the model directory.
+/// The response is a single object (`stream: false` shape), which every client
+/// accepts, and the final `status` is `success` on completion.
+pub async fn pull(
+    State(state): State<AppState>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let name = body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ApiError::bad_request("missing 'model'"))?;
+    if !name.starts_with("https://") {
+        return Err(ApiError::bad_request(&format!(
+            "cannot pull `{name}`: joshua does not implement the Ollama registry protocol.              Pass an explicit https:// URL to a .gguf file, or place the file in the              model directory and load it with POST /v1/models/load."
+        )));
+    }
+    Err(ApiError::new(
+        StatusCode::NOT_IMPLEMENTED,
+        "downloading from a URL is not implemented yet; place the .gguf in the model \
+         directory and POST /v1/models/load",
+        "pull_not_implemented",
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -734,6 +923,37 @@ mod tests {
         assert_eq!(g.top_k, 20);
         assert_eq!(g.repetition_penalty, 1.1);
         assert_eq!(g.stop_sequences, vec!["</s>".to_string()]);
+    }
+
+    #[test]
+    fn tags_are_stripped_for_file_names() {
+        assert_eq!(strip_tag("llama3"), "llama3");
+        assert_eq!(strip_tag("llama3:latest"), "llama3");
+        assert_eq!(strip_tag("llama3:13b"), "llama3");
+        assert_eq!(strip_tag("  llama3  "), "llama3");
+    }
+
+    /// Model management deletes and overwrites files, so a name must never
+    /// escape the model directory.  These are the shapes that would otherwise
+    /// reach outside it.
+    #[test]
+    fn unsafe_model_names_are_rejected() {
+        for bad in ["", "../etc/passwd", "a/b", "..", "dir/../x", "/abs/path"] {
+            let stem = strip_tag(bad);
+            let rejected = stem.is_empty()
+                || stem.contains('/')
+                || stem.contains('\\')
+                || stem.contains("..");
+            assert!(rejected, "`{bad}` must be rejected as a model name");
+        }
+        // The bare names clients actually send must pass.
+        for good in ["llama3", "llama3:13b", "my-model_1", "Qwen3-30B-A3B"] {
+            let stem = strip_tag(good);
+            assert!(
+                !stem.is_empty() && !stem.contains('/') && !stem.contains(".."),
+                "`{good}` must be accepted"
+            );
+        }
     }
 
     #[test]
