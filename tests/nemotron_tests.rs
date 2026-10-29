@@ -213,36 +213,50 @@ fn a_second_session_shares_the_weights() {
 /// same model as the array form.  Reading a scalar through the array accessor
 /// yields zeros, which would make *every* layer recurrent and then demand
 /// `ssm_in` tensors the file does not have.
+///
+/// The comparison is against the *same* uniform model written both ways, so a
+/// classification difference shows up as a logit difference rather than being
+/// masked by comparing two different architectures.
 #[test]
 fn scalar_layer_metadata_matches_array_metadata() {
-    let dir = common::model_dir("nemotron-scalar-meta");
-    let array_path = dir.join("array.gguf");
-    let scalar_path = dir.join("scalar.gguf");
-    common::write_tiny_nemotron_h_gguf(&array_path);
-    common::write_nemotron_h_gguf(
-        &scalar_path,
-        common::NemotronTiny {
-            scalar_metadata: true,
-            ..Default::default()
-        },
-    );
+    for kind in ["attention", "moe"] {
+        let dir = common::model_dir(&format!("nemotron-scalar-meta-{kind}"));
+        let array_path = dir.join("array.gguf");
+        let scalar_path = dir.join("scalar.gguf");
+        // Same layers, same weights; only the metadata encoding differs.
+        common::write_nemotron_h_gguf(
+            &array_path,
+            common::NemotronTiny {
+                uniform: true,
+                uniform_kind: kind,
+                ..Default::default()
+            },
+        );
+        common::write_nemotron_h_gguf(
+            &scalar_path,
+            common::NemotronTiny {
+                scalar_metadata: true,
+                uniform: true,
+                uniform_kind: kind,
+                ..Default::default()
+            },
+        );
 
-    // Both files must load: the scalar form must not send the loader looking
-    // for `blk.*.ssm_in`.
-    let mut a = common::load_model(&array_path, true);
-    let mut b = common::load_model(&scalar_path, true);
-    let la = common::logits(&mut a, &[1, 4, 2], 0);
-    let lb = common::logits(&mut b, &[1, 4, 2], 0);
-    // The array fixture is the hybrid (mamba/moe/attention); the scalar one is
-    // uniform, so the *logits* differ by design.  What must hold is that the
-    // scalar file loaded and produced finite logits rather than an error
-    // about a missing SSM tensor.
-    assert_eq!(lb.len(), 16, "the scalar-metadata model loads");
-    assert!(
-        lb.iter().all(|v| v.is_finite()),
-        "scalar metadata yields finite logits: {lb:?}"
-    );
-    assert_eq!(la.len(), lb.len());
+        let mut a = common::load_model(&array_path, true);
+        let mut b = common::load_model(&scalar_path, true);
+        let la = common::logits(&mut a, &[1, 4, 2], 0);
+        let lb = common::logits(&mut b, &[1, 4, 2], 0);
+        assert_close(
+            &la,
+            &lb,
+            1e-5,
+            &format!("uniform `{kind}`: scalar vs array metadata encode the same layers"),
+        );
+        assert!(
+            la.iter().all(|v| v.is_finite()),
+            "uniform `{kind}` logits are finite: {la:?}"
+        );
+    }
 }
 
 /// Each `ssm_norm` group column is its own weight.  Collapsing to column 0

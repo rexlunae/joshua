@@ -3175,9 +3175,15 @@ pub fn write_tiny_nemotron_h_gguf(path: &Path) {
 /// may use (scalar per-layer metadata, distinct per-group norm weights).
 #[derive(Clone, Copy, Debug)]
 pub struct NemotronTiny {
-    /// Write `attention.head_count_kv` / `feed_forward_length` as scalars for
-    /// an all-attention / all-MoE model instead of per-layer arrays.
+    /// Write `attention.head_count_kv` / `feed_forward_length` as scalars
+    /// instead of per-layer arrays.  Only meaningful together with `uniform`:
+    /// scalars cannot express the hybrid layer pattern.
     pub scalar_metadata: bool,
+    /// Write a uniform stack instead of the hybrid one, so the same model can
+    /// be emitted with either metadata encoding and compared.
+    pub uniform: bool,
+    /// The single layer kind of a uniform stack: `"moe"` or `"attention"`.
+    pub uniform_kind: &'static str,
     /// `ssm_norm` value per group column: group `g` is weighted by
     /// `group_norm_weight[g]`.  Distinct values prove the loader keeps every
     /// group's own column instead of collapsing to column 0.
@@ -3188,6 +3194,8 @@ impl Default for NemotronTiny {
     fn default() -> Self {
         Self {
             scalar_metadata: false,
+            uniform: false,
+            uniform_kind: "moe",
             group_norm_weight: [1.0, 1.0],
         }
     }
@@ -3216,8 +3224,12 @@ pub fn write_nemotron_h_gguf(path: &Path, opts: NemotronTiny) {
     // With scalar metadata a file declares one layer shape for all layers, so
     // the fixture must be uniform too: scalars cannot express the hybrid
     // pattern.  `moe` is the case that also exercises the expert path.
-    let kinds: Vec<&str> = if opts.scalar_metadata {
-        vec!["moe"; 5]
+    // With scalar metadata a file declares one layer shape for all layers, so
+    // either encoding is written for a *uniform* stack; the hybrid pattern is
+    // array-only, since scalars cannot express it.  `uniform` lets a test write
+    // the same model both ways and compare.
+    let kinds: Vec<&str> = if opts.uniform {
+        vec![opts.uniform_kind; 5]
     } else {
         vec!["mamba", "moe", "mamba", "attention", "moe"]
     };
@@ -3244,7 +3256,13 @@ pub fn write_nemotron_h_gguf(path: &Path, opts: NemotronTiny) {
         (
             key("attention.head_count_kv"),
             if opts.scalar_metadata {
-                gguf_file::Value::U32(KV_HEADS as u32)
+                // The single value a uniform file declares; must agree with the
+                // layer kind it actually writes.
+                gguf_file::Value::U32(if opts.uniform_kind == "attention" {
+                    KV_HEADS as u32
+                } else {
+                    0
+                })
             } else {
                 gguf_file::Value::Array(kv)
             },
@@ -3256,7 +3274,7 @@ pub fn write_nemotron_h_gguf(path: &Path, opts: NemotronTiny) {
         (
             key("feed_forward_length"),
             if opts.scalar_metadata {
-                gguf_file::Value::U32(FFN as u32)
+                gguf_file::Value::U32(if opts.uniform_kind == "moe" { FFN as u32 } else { 0 })
             } else {
                 gguf_file::Value::Array(nff)
             },
