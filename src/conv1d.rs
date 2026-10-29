@@ -371,9 +371,14 @@ impl CustomOp1 for Conv1dOp {
         use candle_core::backend::{BackendDevice, BackendStorage};
         use candle_core::opencl_backend::kernels;
         let shape = Shape::from(self.out_dims(layout)?);
+        // Every buffer the shader reads is declared `float`, so *all* of the
+        // participating tensors must be f32 — an f16 weight or bias would be
+        // reinterpreted as pairs of f32 and read past its range.
         let native = Conv1d::native_enabled()
             && kernels::native_enabled()
-            && storage.dtype == DType::F32;
+            && storage.dtype == DType::F32
+            && self.w.dtype() == DType::F32
+            && self.b.as_ref().is_none_or(|b| b.dtype() == DType::F32);
         if native {
             match self.opencl_native(storage, layout) {
                 Ok(Some(out)) => return Ok((out, shape)),
@@ -394,23 +399,86 @@ impl CustomOp1 for Conv1dOp {
         storage: &candle_core::VulkanStorage,
         layout: &Layout,
     ) -> Result<(candle_core::VulkanStorage, Shape)> {
-        // No native dispatch yet: `VulkanDevice::launch` is `pub(crate)` in
-        // the vendored backend.  Still count it, so `fallback_count()` and
-        // `fallback_counts_by_op()` tell a caller the truth.
-        use candle_core::backend::BackendStorage;
-        candle_core::vulkan_backend::kernels::note_fallback(
-            OP_NAME,
-            Some(&candle_core::Error::Msg(
-                "conv1d: no Vulkan launch entry point exported by the backend".into(),
-            )),
-        );
-        let cpu = storage.to_cpu_storage()?;
-        let (out, shape) = self.cpu_result(&cpu, layout)?;
-        Ok((
-            candle_core::backend::BackendDevice::storage_from_cpu_storage(&storage.device, &out)?,
-            shape,
-        ))
+        use candle_core::backend::{BackendDevice as _, BackendStorage as _};
+        use candle_core::vulkan_backend::kernels::{self, Buf, Idx, Push};
+        let shape = Shape::from(self.out_dims(layout)?);
+        // Every buffer the shader reads is declared `float`, so *all* of the
+        // participating tensors must be f32 — an f16 weight or bias would be
+        // reinterpreted as pairs of f32 and read past its range.
+        let native = Conv1d::native_enabled()
+            && kernels::native_enabled()
+            && storage.dtype == DType::F32
+            && self.w.dtype() == DType::F32
+            && self.b.as_ref().is_none_or(|b| b.dtype() == DType::F32);
+        let args = if native {
+            self.native_args(layout).ok().flatten()
+        } else {
+            None
+        };
+        if let Some(a) = args {
+            if let (Some(w), w_ok) = (as_vulkan_buf(&self.w), true) {
+                let _ = w_ok;
+                let bias = match self.b.as_ref() {
+                    None => Some(None),
+                    Some(t) => as_vulkan_buf(t).map(Some),
+                };
+                if let Some(bias) = bias {
+                    let out = storage.device.alloc(DType::F32, a.t * a.c)?;
+                    // `b_on` decides whether the bias buffer is read, so a
+                    // missing bias can bind any live buffer.
+                    let b_bind = bias.unwrap_or(Buf {
+                        buffer: out.buffer,
+                        bytes: 4,
+                    });
+                    let rows = a.t + self.cfg.d_conv - 1;
+                    let bufs = [
+                        Buf {
+                            buffer: storage.buffer,
+                            bytes: (a.x_off + rows * a.c) as u64 * 4,
+                        },
+                        w,
+                        b_bind,
+                        Buf {
+                            buffer: out.buffer,
+                            bytes: (a.t * a.c) as u64 * 4,
+                        },
+                    ];
+                    let push = Push::default()
+                        .i(a.t as i32)
+                        .i(a.c as i32)
+                        .i(a.x_off as i32)
+                        .i(a.w_off as i32)
+                        .i(a.b_off.unwrap_or(0) as i32)
+                        .i(i32::from(bias.is_some()))
+                        .i(i32::from(self.cfg.silu));
+                    let wg = VULKAN_WG;
+                    let groups = vulkan_groups(a.t * a.c, wg, 65535);
+                    let ix = [Idx::unit(), Idx::unit()];
+                    match storage.device.launch(
+                        &format!("{OP_NAME}-v{}-{}", self.cfg.d_conv, u8::from(self.cfg.bias)),
+                        |_wg| vulkan_source(self.cfg.d_conv, wg),
+                        &bufs,
+                        push,
+                        &ix,
+                        groups,
+                    ) {
+                        Ok(()) => return Ok((out, shape)),
+                        // A device that rejects the shader must not fail the
+                        // call: the op has a correct CPU implementation.
+                        Err(e) => kernels::note_fallback(OP_NAME, Some(&e)),
+                    }
+                } else {
+                    kernels::note_fallback(OP_NAME, None);
+                }
+            } else {
+                kernels::note_fallback(OP_NAME, None);
+            }
+        } else {
+            kernels::note_fallback(OP_NAME, None);
+        }
+        self.vulkan_fallback(storage, layout, shape)
     }
+
 }
 
 #[cfg(feature = "opencl")]
@@ -466,6 +534,41 @@ impl Conv1dOp {
 /// The kernel symbol [`opencl_source`] defines.
 pub const CONV1D_KERNEL: &str = "k_conv1d";
 
+/// Work-group size for the Vulkan shader (one lane per output element).
+#[cfg(feature = "vulkan")]
+pub const VULKAN_WG: usize = 64;
+
+/// A tensor's Vulkan buffer, when it is one and its whole allocation is
+/// addressable from the shader.
+impl Conv1dOp {
+    /// The reference path shared by every "cannot go native" branch.
+    #[cfg(feature = "vulkan")]
+    fn vulkan_fallback(
+        &self,
+        storage: &candle_core::VulkanStorage,
+        layout: &Layout,
+        shape: Shape,
+    ) -> Result<(candle_core::VulkanStorage, Shape)> {
+        use candle_core::backend::{BackendDevice as _, BackendStorage as _};
+        let cpu = storage.to_cpu_storage()?;
+        let (out, _) = self.cpu_result(&cpu, layout)?;
+        Ok((storage.device.storage_from_cpu_storage(&out)?, shape))
+    }
+}
+
+#[cfg(feature = "vulkan")]
+fn as_vulkan_buf(t: &Tensor) -> Option<candle_core::vulkan_backend::kernels::Buf> {
+    use candle_core::Storage;
+    let (storage, _) = t.storage_and_layout();
+    match &*storage {
+        Storage::Vulkan(s) => Some(candle_core::vulkan_backend::kernels::Buf {
+            buffer: s.buffer,
+            bytes: s.capacity_bytes as u64,
+        }),
+        _ => None,
+    }
+}
+
 const TAP_LADDER: &str = r#"#if D_CONV == 1
         sum += X[0] * W[0];
     #elif D_CONV == 2
@@ -506,7 +609,10 @@ pub fn opencl_source(d_conv: usize) -> String {
          \x20   const long S = c_n;\n\
          \x20   const __global float* X = x + x_off + (long)t * c_n + c;\n\
          \x20   const __global float* W = w + w_off + c;\n\
-         \x20   float sum = b_on ? bp[b_off + c] : 0.0f;\n",
+         // Taps accumulate from zero, bias is added after — the CPU
+         // reference's order.  Leading with the bias changes rounding and
+         // cancellation can erase it.
+         \x20   float sum = 0.0f;\n",
     );
     for line in TAP_LADDER.lines() {
         if line.trim().starts_with("sum +=") || line.trim().starts_with("for (int k") {
@@ -516,7 +622,8 @@ pub fn opencl_source(d_conv: usize) -> String {
         }
     }
     s.push_str(
-        "\x20   if (silu_on) sum = sum / (1.0f + exp(-sum));\n\
+        "\x20   if (b_on) sum += bp[b_off + c];\n\
+         \x20   if (silu_on) sum = sum / (1.0f + exp(-sum));\n\
          \x20   y[i] = sum;\n\
          }\n",
     );
@@ -542,7 +649,11 @@ pub fn vulkan_source(d_conv: usize, wg: usize) -> String {
          \x20   int S = pc.c_n;\n\
          \x20   int xb = pc.x_off + t * S + c;\n\
          \x20   int wb = pc.w_off + c;\n\
-         \x20   float sum = pc.b_on != 0 ? bp[pc.b_off + c] : 0.0;\n",
+         // Accumulate the taps from zero and add the bias *after*, in the
+         // same order as the CPU reference: starting from the bias changes the
+         // rounding, and cancellation can erase it entirely (taps 1e20, -1e20
+         // and bias 1 give 1 on the CPU but 0 here if the bias leads).
+         \x20   float sum = 0.0;\n",
     );
     let ladder = TAP_LADDER
         .replace("X[0]", "x[xb]")
@@ -563,7 +674,8 @@ pub fn vulkan_source(d_conv: usize, wg: usize) -> String {
         }
     }
     s.push_str(
-        "\x20   if (pc.silu_on != 0) sum = sum / (1.0 + exp(-sum));\n\
+        "\x20   if (pc.b_on != 0) sum += bp[pc.b_off + c];\n\
+         \x20   if (pc.silu_on != 0) sum = sum / (1.0 + exp(-sum));\n\
          \x20   y[i] = sum;\n\
          }\n",
     );
@@ -920,10 +1032,24 @@ pub use opencl_kernel::run as run_conv1d_opencl;
 // `PC` order, one invocation per `(t, c)`, `D_CONV` compiled in, and
 // `x`/`w`/`b`/`y` on bindings 0..3 exactly like `k_fused_mhc`.
 
-/// Whether a Vulkan device can run [`vulkan_source`] natively.  Always false
-/// in this tree: see the module comment above.
+/// Whether this build can dispatch [`vulkan_source`] natively.
+///
+/// `vulkan_fwd` submits the shader through the backend's own launcher, so this
+/// is true whenever the `vulkan` feature is compiled in.  It is a *build*
+/// capability check, not a device one: a particular driver may still reject
+/// the launch, in which case the op records a counted fallback and returns the
+/// reference result.  A caller deciding whether to prefer a fast path should
+/// therefore treat `false` as "definitely not accelerated" and `true` as
+/// "will try, and is correct either way".
 pub fn vulkan_native_available() -> bool {
-    false
+    #[cfg(feature = "vulkan")]
+    {
+        candle_core::vulkan_backend::kernels::native_enabled()
+    }
+    #[cfg(not(feature = "vulkan"))]
+    {
+        false
+    }
 }
 
 /// Group counts for `n` invocations of `WG` lanes, spread over x and y — the
