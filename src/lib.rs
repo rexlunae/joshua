@@ -29,6 +29,7 @@ pub mod auto_placement;
 pub mod compression;
 pub mod coordinator;
 pub mod cpu_pinning;
+pub mod profile;
 pub mod draft_model;
 pub mod distributed;
 pub mod embedding;
