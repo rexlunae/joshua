@@ -111,6 +111,19 @@ pub const QK_NVFP4_SUB: usize = crate::mxfp4::QK_NVFP4_SUB;
 /// Bytes per NVFP4 block: four scale bytes then 32 code bytes.
 pub const BLOCK_BYTES: usize = std::mem::size_of::<crate::mxfp4::BlockNvfp4>();
 
+/// Bytes one row of an `[out_dim, in_dim]` NVFP4 matrix occupies on disk.
+///
+/// The block is `BLOCK_BYTES` for `QK_NVFP4` elements, so a row is a whole
+/// number of blocks and `in_dim` must be a multiple of `QK_NVFP4`.
+pub fn row_bytes(in_dim: usize) -> Result<usize> {
+    if in_dim == 0 || in_dim % QK_NVFP4 != 0 {
+        candle_core::bail!(
+            "nvfp4: in_dim {in_dim} is not a positive multiple of {QK_NVFP4}"
+        );
+    }
+    Ok((in_dim / QK_NVFP4) * BLOCK_BYTES)
+}
+
 /// `GGML_TYPE_NVFP4` — the dtype id written in GGUF tensor info.
 pub const GGML_TYPE_NVFP4: u32 = 40;
 
