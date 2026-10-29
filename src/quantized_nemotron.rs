@@ -338,8 +338,11 @@ struct Mamba2 {
     a: Tensor,
     /// `[n_head]` skip weight.
     d_skip: Tensor,
-    /// Grouped RMS-norm weight, `[d_inner / n_group]` (llama.cpp stores it
-    /// as `[d_inner/n_group, n_group]`, normalised over dim 0).
+    /// Grouped RMS-norm weight, pre-transposed at load to
+    /// `[1, n_group, d_inner / n_group]` so `grouped_rms_norm` broadcasts it
+    /// with no per-token transpose or copy.  llama.cpp stores it as
+    /// `[d_inner/n_group, n_group]`, normalised over dim 0, with column `g`
+    /// weighting group `g`.
     norm_w: Tensor,
     eps: f64,
     out: Weight,
@@ -368,9 +371,16 @@ impl Mamba2 {
         // `(i, g)` weighs element `i` of group `g`'s block.  The whole matrix
         // is kept — each group has its own column, and collapsing to column 0
         // would silently scale every group by the first one's weights.
+        // Stored already transposed into the `[1, n_group, d_inner/n_group]`
+        // form `grouped_rms_norm` broadcasts, so the hot path does no transpose
+        // or copy per token — one layout change at load instead of one per
+        // layer per token.
         let norm_w = src
             .f32_tensor(&format!("{p}.ssm_norm.weight"))?
-            .reshape((cfg.d_inner / cfg.n_group, cfg.n_group))?;
+            .reshape((cfg.d_inner / cfg.n_group, cfg.n_group))?
+            .t()?
+            .contiguous()?
+            .reshape((1, cfg.n_group, cfg.d_inner / cfg.n_group))?;
         Ok(Self {
             in_proj: Weight(src.qmatmul(&format!("{p}.ssm_in.weight"))?),
             conv_w,
@@ -432,10 +442,9 @@ impl Mamba2 {
         let ms = (rows.sqr()?.sum(D::Minus1)? / n as f64)?; // [t, n_group]
         let inv = (ms + self.eps)?.powf(-0.5)?.reshape((t, c.n_group, 1))?;
         let x = rows.broadcast_mul(&inv)?;
-        // `norm_w` is `[n, n_group]`; transpose to `[n_group, n]` so each
-        // group is weighted by its own column.
-        let w = self.norm_w.t()?.contiguous()?.reshape((1, c.n_group, n))?;
-        (x.broadcast_mul(&w)?).reshape((t, c.d_inner))
+        // `norm_w` is pre-transposed to `[1, n_group, n]` at load; broadcast it
+        // directly.
+        (x.broadcast_mul(&self.norm_w)?).reshape((t, c.d_inner))
     }
 
     fn fresh_state(&self, dev: &Device) -> Result<SsmState> {
@@ -637,23 +646,32 @@ fn expert_parts<R: Read + Seek>(
     src: &mut TensorSource<R>,
     et: &crate::moe::ExpertTensor,
     name: &str,
+    split_device: &Device,
     candle: &impl Fn(QTensor) -> Result<Weight>,
-) -> Result<Vec<Weight>> {
+) -> Result<(Vec<Weight>, Device)> {
+    // Borrowed experts are CPU-resident slices of the mapping, whatever the
+    // dense set's device: report that so the MoE dispatch moves the block's
+    // input to the CPU rather than handing accelerator tensors to CPU
+    // weights.
     if let Some(mmap) = src.mmap.clone() {
         if let Some(borrowed) = et.borrow_host(&mmap)? {
-            return borrowed.into_iter().map(|b| candle(b.tensor)).collect();
+            let parts = borrowed.into_iter().map(|b| candle(b.tensor)).collect::<Result<Vec<_>>>()?;
+            return Ok((parts, Device::Cpu));
         }
     }
     // No mapping, or a tensor the mmap slicer cannot borrow (streamed load).
+    // Not borrowable: split onto `split_device`, which the caller chose to
+    // match where it will dispatch (the CPU for a mapped-but-unaligned tensor,
+    // the model device for a streamed load).
     let parts = et
-        .read_and_split(&src.ct, &mut src.reader, src.arch, &src.device)
+        .read_and_split(&src.ct, &mut src.reader, src.arch, split_device)
         .map_err(|e| {
             candle_core::Error::Msg(format!(
                 "{}: routed-expert tensor `{name}` could be neither borrowed nor split: {e}",
                 src.arch
             ))
         })?;
-    parts.into_iter().map(candle).collect()
+    Ok((parts.into_iter().map(candle).collect::<Result<Vec<_>>>()?, split_device.clone()))
 }
 
 /// The MoE FFN of a `moe` layer: sigmoid-routed top-k experts over an
@@ -699,8 +717,29 @@ impl MoeBlock {
         // (a streamed load, see `QuantizedModel::from_gguf`) read and split the
         // stacked tensor instead — refusing here would make the public
         // no-mmap loader unusable for every Nemotron MoE model.
-        let ups = expert_parts(src, &up, &format!("{p}.ffn_up_exps.weight"), &candle)?;
-        let downs = expert_parts(src, &down, &format!("{p}.ffn_down_exps.weight"), &candle)?;
+        let split_device = expert_device;
+        let (ups, up_dev) = expert_parts(
+            src,
+            &up,
+            &format!("{p}.ffn_up_exps.weight"),
+            split_device,
+            &candle,
+        )?;
+        let (downs, down_dev) = expert_parts(
+            src,
+            &down,
+            &format!("{p}.ffn_down_exps.weight"),
+            split_device,
+            &candle,
+        )?;
+        // Both halves of an expert must live together, or neither the gate/up
+        // nor the down matmul could run.
+        if !up_dev.same_device(&down_dev) {
+            candle_core::bail!(
+                "{}: `{p}` routed experts resolved to two different devices ({up_dev:?}, {down_dev:?})",
+                src.arch
+            );
+        }
         let experts = ups
             .into_iter()
             .zip(downs)
@@ -726,7 +765,7 @@ impl MoeBlock {
             scale: cfg.expert_weights_scale,
             norm_weights: cfg.expert_weights_norm,
             n_embd: cfg.n_embd,
-            expert_device: expert_device.clone(),
+            expert_device: up_dev,
         })
     }
 
