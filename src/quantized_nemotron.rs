@@ -1220,3 +1220,77 @@ impl LayerStack for Weights {
 
 /// A Nemotron-H session over shared [`Weights`].
 pub type ModelWeights = crate::native_session::Session<Weights>;
+
+#[cfg(all(test, feature = "opencl"))]
+mod tests {
+    use super::*;
+
+    /// `Mamba2::conv` must dispatch the native kernel, not fall back to a
+    /// per-tap tensor loop.  The op has its own unit tests, but only this
+    /// reaches the layer's call site: a layer that stopped calling
+    /// `crate::conv1d::conv1d` would still pass those.
+    #[test]
+    fn the_mamba_layer_convolves_natively() {
+        let Ok(dev) = Device::new_opencl(0) else {
+            eprintln!("no OpenCL device; skipping");
+            return;
+        };
+        let cfg = SsmConfig {
+            d_conv: 4,
+            d_state: 8,
+            d_inner: 32,
+            n_head: 4,
+            n_group: 2,
+            time_step_min: 0.0,
+        };
+        // Only the conv fields are exercised, so the projection weights are
+        // never touched and can be trivial.
+        let conv_dim = cfg.conv_dim();
+        let layer = Mamba2 {
+            in_proj: Weight(candle_core::quantized::QMatMul::QTensor(std::sync::Arc::new(
+                candle_core::quantized::QTensor::quantize(
+                    &Tensor::zeros((1, 1), DType::F32, &dev).unwrap(),
+                    candle_core::quantized::GgmlDType::F32,
+                )
+                .unwrap(),
+            ))),
+            conv_w: Tensor::randn(0f32, 0.1, (cfg.d_conv, conv_dim), &dev).unwrap(),
+            conv_b: Some(Tensor::randn(0f32, 0.1, (conv_dim,), &dev).unwrap()),
+            dt_b: Tensor::zeros((cfg.n_head,), DType::F32, &dev).unwrap(),
+            a: Tensor::zeros((cfg.n_head,), DType::F32, &dev).unwrap(),
+            d_skip: Tensor::zeros((cfg.n_head,), DType::F32, &dev).unwrap(),
+            norm_w: Tensor::ones((1, cfg.n_group, cfg.d_inner / cfg.n_group), DType::F32, &dev)
+                .unwrap(),
+            eps: 1e-5,
+            out: Weight(candle_core::quantized::QMatMul::QTensor(std::sync::Arc::new(
+                candle_core::quantized::QTensor::quantize(
+                    &Tensor::zeros((1, 1), DType::F32, &dev).unwrap(),
+                    candle_core::quantized::GgmlDType::F32,
+                )
+                .unwrap(),
+            ))),
+            cfg,
+        };
+        let mut state = Some(layer.fresh_state(&dev).unwrap());
+        let xbc = Tensor::randn(0f32, 1.0, (5, conv_dim), &dev).unwrap();
+
+        let before = candle_core::opencl_backend::kernels::native_exec_count();
+        let fb_before: usize = candle_core::opencl_backend::kernels::fallback_counts_by_op()
+            .iter()
+            .filter(|(n, _)| n == crate::conv1d::OP_NAME)
+            .map(|(_, c)| *c)
+            .sum();
+        let y = layer.conv(state.as_mut().unwrap(), &xbc).unwrap();
+        let launched = candle_core::opencl_backend::kernels::native_exec_count() - before;
+        let fell_back: usize = candle_core::opencl_backend::kernels::fallback_counts_by_op()
+            .iter()
+            .filter(|(n, _)| n == crate::conv1d::OP_NAME)
+            .map(|(_, c)| *c)
+            .sum::<usize>()
+            - fb_before;
+
+        assert_eq!(y.dims(), &[5, conv_dim]);
+        assert!(launched > 0, "the layer's conv must launch a native kernel");
+        assert_eq!(fell_back, 0, "the layer's conv must not round-trip");
+    }
+}
