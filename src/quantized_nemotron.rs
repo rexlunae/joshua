@@ -109,6 +109,26 @@ impl SsmConfig {
     }
 }
 
+/// A per-layer key that may also be a single scalar applying to every layer.
+///
+/// llama.cpp accepts both encodings for `attention.head_count_kv` and
+/// `feed_forward_length`; a uniform model writes one `U32`, Nemotron-H writes
+/// an array.  Reading a scalar through [`Meta::array_u32`] yields zeros, which
+/// would classify every layer as recurrent, so the scalar is replicated here.
+fn per_layer_or_scalar(m: &Meta<'_>, suffix: &str, n: usize) -> Result<Vec<usize>> {
+    match m.get(suffix) {
+        Some(gguf_file::Value::Array(_)) => Ok(m.array_u32(suffix, n)),
+        Some(_) => match m.u32_opt(suffix) {
+            Some(scalar) => Ok(vec![scalar as usize; n]),
+            None => candle_core::bail!(
+                "{}: `{suffix}` must be an integer or an integer array",
+                m.arch()
+            ),
+        },
+        None => Ok(vec![0; n]),
+    }
+}
+
 /// How a layer advances the residual stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LayerKind {
@@ -199,8 +219,13 @@ impl Config {
         // Per-layer `head_count_kv` / `feed_forward_length` may be scalars (the
         // uniform case) or arrays (Nemotron-H's default, and "Puzzle" models
         // that vary the expert FFN per layer).
-        let kv = m.array_u32("attention.head_count_kv", n_layer);
-        let n_ff = m.array_u32("feed_forward_length", n_layer);
+        // Either key may be a **scalar** (a uniform model) or a per-layer
+        // array (what Nemotron-H ships, and the only form that can express
+        // `Puzzle`'s heterogeneous layers).  `Meta::array_u32` reads arrays
+        // only and returns zeros for a scalar, which would silently make
+        // every layer recurrent, so the scalar case is handled explicitly.
+        let kv = per_layer_or_scalar(m, "attention.head_count_kv", n_layer)?;
+        let n_ff = per_layer_or_scalar(m, "feed_forward_length", n_layer)?;
         let mut layers = Vec::with_capacity(n_layer);
         for i in 0..n_layer {
             let n_head_kv_i = kv.get(i).copied().unwrap_or(0);
@@ -339,13 +364,13 @@ impl Mamba2 {
         let dt_b = src
             .f32_tensor(&format!("{p}.ssm_dt.bias"))?
             .reshape((cfg.n_head,))?;
-        // `[d_inner/n_group, n_group]` -> the `d_inner/n_group` weights the
-        // grouped norm applies to each group's block.
+        // llama.cpp stores `ssm_norm` as `[d_inner/n_group, n_group]`: entry
+        // `(i, g)` weighs element `i` of group `g`'s block.  The whole matrix
+        // is kept — each group has its own column, and collapsing to column 0
+        // would silently scale every group by the first one's weights.
         let norm_w = src
             .f32_tensor(&format!("{p}.ssm_norm.weight"))?
-            .reshape((cfg.d_inner / cfg.n_group, cfg.n_group))?
-            .narrow(1, 0, 1)?
-            .reshape((cfg.d_inner / cfg.n_group,))?;
+            .reshape((cfg.d_inner / cfg.n_group, cfg.n_group))?;
         Ok(Self {
             in_proj: Weight(src.qmatmul(&format!("{p}.ssm_in.weight"))?),
             conv_w,
@@ -403,11 +428,13 @@ impl Mamba2 {
         // `n` values per group; the row splits into `n_group` such blocks.
         let n = c.d_inner / c.n_group;
         let rows = x.reshape((t, c.n_group, n))?; // [t, n_group, n]
-                                                  // mean of squares over the block, then 1/sqrt(ms + eps)
+                                                  // mean of squares over each group's block, then 1/sqrt(ms + eps)
         let ms = (rows.sqr()?.sum(D::Minus1)? / n as f64)?; // [t, n_group]
         let inv = (ms + self.eps)?.powf(-0.5)?.reshape((t, c.n_group, 1))?;
         let x = rows.broadcast_mul(&inv)?;
-        let w = self.norm_w.reshape((1, 1, n))?;
+        // `norm_w` is `[n, n_group]`; transpose to `[n_group, n]` so each
+        // group is weighted by its own column.
+        let w = self.norm_w.t()?.contiguous()?.reshape((1, c.n_group, n))?;
         (x.broadcast_mul(&w)?).reshape((t, c.d_inner))
     }
 
@@ -599,6 +626,36 @@ fn relu2(x: &Tensor) -> Result<Tensor> {
     r.sqr()
 }
 
+/// Each expert of a stacked `[n_expert, out, in]` tensor, borrowed from the
+/// mapping when there is one and read-and-split otherwise.
+///
+/// Borrowing keeps the pool at its on-disk footprint; the read path is the
+/// streamed-load fallback `QuantizedModel::from_gguf` needs (it passes no
+/// mapping), and it copies each expert onto the device rather than expanding
+/// the whole tensor.
+fn expert_parts<R: Read + Seek>(
+    src: &mut TensorSource<R>,
+    et: &crate::moe::ExpertTensor,
+    name: &str,
+    candle: &impl Fn(QTensor) -> Result<Weight>,
+) -> Result<Vec<Weight>> {
+    if let Some(mmap) = src.mmap.clone() {
+        if let Some(borrowed) = et.borrow_host(&mmap)? {
+            return borrowed.into_iter().map(|b| candle(b.tensor)).collect();
+        }
+    }
+    // No mapping, or a tensor the mmap slicer cannot borrow (streamed load).
+    let parts = et
+        .read_and_split(&src.ct, &mut src.reader, src.arch, &src.device)
+        .map_err(|e| {
+            candle_core::Error::Msg(format!(
+                "{}: routed-expert tensor `{name}` could be neither borrowed nor split: {e}",
+                src.arch
+            ))
+        })?;
+    parts.into_iter().map(candle).collect()
+}
+
 /// The MoE FFN of a `moe` layer: sigmoid-routed top-k experts over an
 /// optional latent projection, plus an always-on shared expert.
 struct MoeBlock {
@@ -613,10 +670,21 @@ struct MoeBlock {
     scale: f64,
     norm_weights: bool,
     n_embd: usize,
+    /// The device the routed experts actually live on.  They are borrowed
+    /// from the mapping, so this is the CPU even when the activations run on
+    /// an accelerator; the shared dispatch moves the block input across once
+    /// and the result back once, instead of feeding GPU activations to
+    /// CPU-resident weights.
+    expert_device: Device,
 }
 
 impl MoeBlock {
-    fn load<R: Read + Seek>(src: &mut TensorSource<R>, p: &str, cfg: &Config) -> Result<Self> {
+    fn load<R: Read + Seek>(
+        src: &mut TensorSource<R>,
+        p: &str,
+        cfg: &Config,
+        expert_device: &Device,
+    ) -> Result<Self> {
         let router = src
             .f32_tensor(&format!("{p}.ffn_gate_inp.weight"))? // [n_expert, n_embd]
             .t()?
@@ -624,28 +692,15 @@ impl MoeBlock {
         let up = src.expert_tensor(&format!("{p}.ffn_up_exps.weight"), cfg.n_expert)?;
         let down = src.expert_tensor(&format!("{p}.ffn_down_exps.weight"), cfg.n_expert)?;
         let candle = |qt: QTensor| -> Result<Weight> { Ok(Weight(QMatMul::from_qtensor(qt)?)) };
-        // Borrow each expert's slice of the mapping, exactly as
-        // `quantized_qwen::split_experts` prefers: an expert then costs a
-        // pointer and a length until tokens route to it, and the pool keeps
-        // its on-disk footprint instead of expanding to f32.
-        let mmap = src.mmap.clone();
-        let borrow = |et: &crate::moe::ExpertTensor, name: &str| -> Result<Vec<Weight>> {
-            let Some(mmap) = mmap.as_ref() else {
-                candle_core::bail!(
-                    "{}: Nemotron-H routed experts ({name}) need a memory-mapped model",
-                    src.arch
-                );
-            };
-            let borrowed = et.borrow_host(mmap)?.ok_or_else(|| {
-                candle_core::Error::Msg(format!(
-                    "{}: routed-expert tensor `{name}` cannot be borrowed from the mapping",
-                    src.arch
-                ))
-            })?;
-            borrowed.into_iter().map(|b| candle(b.tensor)).collect()
-        };
-        let ups = borrow(&up, &format!("{p}.ffn_up_exps.weight"))?;
-        let downs = borrow(&down, &format!("{p}.ffn_down_exps.weight"))?;
+        // Borrow each expert's slice of the mapping when there is one, exactly
+        // as `quantized_qwen::split_experts` prefers: an expert then costs a
+        // pointer and a length until tokens route to it, and the pool keeps its
+        // on-disk footprint instead of expanding to f32.  Without a mapping
+        // (a streamed load, see `QuantizedModel::from_gguf`) read and split the
+        // stacked tensor instead — refusing here would make the public
+        // no-mmap loader unusable for every Nemotron MoE model.
+        let ups = expert_parts(src, &up, &format!("{p}.ffn_up_exps.weight"), &candle)?;
+        let downs = expert_parts(src, &down, &format!("{p}.ffn_down_exps.weight"), &candle)?;
         let experts = ups
             .into_iter()
             .zip(downs)
@@ -671,6 +726,7 @@ impl MoeBlock {
             scale: cfg.expert_weights_scale,
             norm_weights: cfg.expert_weights_norm,
             n_embd: cfg.n_embd,
+            expert_device: expert_device.clone(),
         })
     }
 
@@ -692,7 +748,7 @@ impl MoeBlock {
             crate::moe::dispatch_decode(
                 "nemotron_h",
                 &self.experts,
-                &x2.device().clone(),
+                &self.expert_device,
                 &routed_in,
                 &idx,
                 &weights,
@@ -702,7 +758,7 @@ impl MoeBlock {
             crate::moe::dispatch_prefill(
                 "nemotron_h",
                 &self.experts,
-                &x2.device().clone(),
+                &self.expert_device,
                 &routed_in,
                 &idx,
                 &weights,
@@ -841,6 +897,16 @@ impl Weights {
         mmap: Option<Arc<memmap2::Mmap>>,
         arch: &'static str,
     ) -> Result<Self> {
+        // Where the routed experts actually live.  On the borrowed path they
+        // are CPU-resident regardless of the dense set's device; on the
+        // streamed path `expert_parts` materialises them on `device`.  Both
+        // are recorded so the shared MoE dispatch moves the block input to
+        // the experts' device instead of assuming it is the activations'.
+        let expert_device = if mmap.is_some() {
+            Device::Cpu
+        } else {
+            device.clone()
+        };
         let meta = Meta::new(&ct.metadata, arch);
         let cfg = Config::from_meta(&meta)?.ok_or_else(|| {
             candle_core::Error::Msg(format!("{arch} is not a Nemotron-H architecture"))
@@ -869,7 +935,12 @@ impl Weights {
                     &cfg,
                     rope.clone(),
                 )?)),
-                LayerKind::Moe => SubBlock::Moe(Box::new(MoeBlock::load(&mut src, &p, &cfg)?)),
+                LayerKind::Moe => SubBlock::Moe(Box::new(MoeBlock::load(
+                    &mut src,
+                    &p,
+                    &cfg,
+                    &expert_device,
+                )?)),
             };
             layers.push(Layer { norm, block });
         }
@@ -952,12 +1023,17 @@ impl LayerStack for Weights {
     }
 
     fn begin_verify(state: &mut LayerState) {
-        if state.ssm.is_some() {
-            state.capture = Some(RecurrentSnapshot {
-                armed: true,
-                ..Default::default()
-            });
-        }
+        // Arm unconditionally.  A fresh Mamba layer has `ssm == None` until its
+        // first forward creates the state, so keying this off `ssm.is_some()`
+        // would leave a verification pass at offset 0 with nothing to roll
+        // back to — the rejected tokens would stay folded into the recurrence.
+        // An attention layer never fills the capture (it has no `ssm`), so
+        // `snapshot_state` still reports nothing for it and the checkpoint
+        // stays layer-aligned.
+        state.capture = Some(RecurrentSnapshot {
+            armed: true,
+            ..Default::default()
+        });
     }
 
     fn clear_verify(state: &mut LayerState) {
@@ -976,6 +1052,14 @@ impl LayerStack for Weights {
         let Some(st) = state.ssm.as_mut() else {
             return Ok(());
         };
+        // A fresh layer (verification at offset 0) had no running state before
+        // the pass: rolling all the way back means there is nothing to keep, so
+        // dropping the state is the correct "empty" result — otherwise the
+        // rejected tokens stay folded into a state that never existed.
+        if retained == 0 && snap.pre_conv.is_none() && snap.pre_scan.is_empty() {
+            state.ssm = None;
+            return Ok(());
+        }
         // Back to the pre-pass state first, discarding the whole pass...
         st.conv = snap.pre_conv.clone();
         st.scan = snap.pre_scan.clone();

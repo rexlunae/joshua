@@ -206,3 +206,115 @@ fn a_second_session_shares_the_weights() {
     let a = common::logits(&mut m, &[1, 4], 0);
     assert_eq!(a.len(), 16);
 }
+
+// ─── Regressions from the Devin review of the loader ───────────────────────
+
+/// Scalar `attention.head_count_kv` / `feed_forward_length` must classify the
+/// same model as the array form.  Reading a scalar through the array accessor
+/// yields zeros, which would make *every* layer recurrent and then demand
+/// `ssm_in` tensors the file does not have.
+#[test]
+fn scalar_layer_metadata_matches_array_metadata() {
+    let dir = common::model_dir("nemotron-scalar-meta");
+    let array_path = dir.join("array.gguf");
+    let scalar_path = dir.join("scalar.gguf");
+    common::write_tiny_nemotron_h_gguf(&array_path);
+    common::write_nemotron_h_gguf(
+        &scalar_path,
+        common::NemotronTiny {
+            scalar_metadata: true,
+            ..Default::default()
+        },
+    );
+
+    // Both files must load: the scalar form must not send the loader looking
+    // for `blk.*.ssm_in`.
+    let mut a = common::load_model(&array_path, true);
+    let mut b = common::load_model(&scalar_path, true);
+    let la = common::logits(&mut a, &[1, 4, 2], 0);
+    let lb = common::logits(&mut b, &[1, 4, 2], 0);
+    // The array fixture is the hybrid (mamba/moe/attention); the scalar one is
+    // uniform, so the *logits* differ by design.  What must hold is that the
+    // scalar file loaded and produced finite logits rather than an error
+    // about a missing SSM tensor.
+    assert_eq!(lb.len(), 16, "the scalar-metadata model loads");
+    assert!(
+        lb.iter().all(|v| v.is_finite()),
+        "scalar metadata yields finite logits: {lb:?}"
+    );
+    assert_eq!(la.len(), lb.len());
+}
+
+/// Each `ssm_norm` group column is its own weight.  Collapsing to column 0
+/// scales every group by the first group's weights, which changes the logits.
+#[test]
+fn every_group_uses_its_own_norm_column() {
+    let dir = common::model_dir("nemotron-group-norm");
+    let uniform = dir.join("uniform.gguf");
+    let varied = dir.join("varied.gguf");
+    common::write_tiny_nemotron_h_gguf(&uniform);
+    common::write_nemotron_h_gguf(
+        &varied,
+        common::NemotronTiny {
+            group_norm_weight: [1.0, 3.0],
+            ..Default::default()
+        },
+    );
+
+    let mut u = common::load_model(&uniform, true);
+    let mut v = common::load_model(&varied, true);
+    let lu = common::logits(&mut u, &[1, 4, 2], 0);
+    let lv = common::logits(&mut v, &[1, 4, 2], 0);
+
+    assert!(
+        lu.iter().zip(&lv).any(|(a, b)| (a - b).abs() > 1e-6),
+        "giving group 1 a different norm weight must change the output; \
+         identical logits mean only one column was read"
+    );
+}
+
+/// The public no-mapping loader must work too.  `QuantizedModel::from_gguf`
+/// passes no `mmap`, so the routed experts have to be read and split rather
+/// than refused.
+#[test]
+fn loads_without_a_mapping() {
+    let dir = common::model_dir("nemotron-streamed");
+    let path = dir.join("model.gguf");
+    common::write_tiny_nemotron_h_gguf(&path);
+
+    let mut streamed = common::load_model(&path, false);
+    let mut mapped = common::load_model(&path, true);
+    let a = common::logits(&mut streamed, &[1, 4, 2], 0);
+    let b = common::logits(&mut mapped, &[1, 4, 2], 0);
+    assert_close(&a, &b, 1e-5, "streamed vs mapped load");
+}
+
+/// A verification pass at offset 0 has no pre-pass state to return to.  Rolling
+/// it back must leave the layer empty, not keep the rejected tokens folded into
+/// a recurrence that never existed.
+#[test]
+fn rollback_at_offset_zero_clears_the_state() {
+    let mut m = nemotron("rollback_zero");
+    let drafts = [1u32, 4, 2];
+    let _ = m
+        .forward_all_logits(
+            &Tensor::new(drafts.as_slice(), &Device::Cpu)
+                .unwrap()
+                .unsqueeze(0)
+                .unwrap(),
+            0,
+        )
+        .expect("verification at offset 0");
+    m.truncate_kv_cache(0).expect("roll back to the start");
+
+    // After a full rollback the model must behave like a fresh one.
+    let after = common::logits(&mut m, &[7, 5], 0);
+    let mut fresh = nemotron("rollback_zero_fresh");
+    let want = common::logits(&mut fresh, &[7, 5], 0);
+    assert_close(
+        &after,
+        &want,
+        1e-5,
+        "post-rollback-to-zero vs fresh session",
+    );
+}

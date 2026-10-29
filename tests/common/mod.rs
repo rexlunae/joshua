@@ -3167,6 +3167,33 @@ pub fn write_tiny_raw_format_gguf(path: &Path, arch: &str, dtype: u32, decoded: 
 /// smallest that keep the real arithmetic meaningful: `d_state` 4, `d_conv` 4,
 /// `n_group` 2, 4 SSM heads of width 4, 4 routed experts with top-2.
 pub fn write_tiny_nemotron_h_gguf(path: &Path) {
+    write_nemotron_h_gguf(path, NemotronTiny::default())
+}
+
+/// Exactly which Nemotron-H fixture to write.  The defaults are the shipped
+/// tiny model; the knobs exist so tests can build the variants a real GGUF
+/// may use (scalar per-layer metadata, distinct per-group norm weights).
+#[derive(Clone, Copy, Debug)]
+pub struct NemotronTiny {
+    /// Write `attention.head_count_kv` / `feed_forward_length` as scalars for
+    /// an all-attention / all-MoE model instead of per-layer arrays.
+    pub scalar_metadata: bool,
+    /// `ssm_norm` value per group column: group `g` is weighted by
+    /// `group_norm_weight[g]`.  Distinct values prove the loader keeps every
+    /// group's own column instead of collapsing to column 0.
+    pub group_norm_weight: [f32; 2],
+}
+
+impl Default for NemotronTiny {
+    fn default() -> Self {
+        Self {
+            scalar_metadata: false,
+            group_norm_weight: [1.0, 1.0],
+        }
+    }
+}
+
+pub fn write_nemotron_h_gguf(path: &Path, opts: NemotronTiny) {
     const VOCAB: usize = 16;
     const EMB: usize = 16;
     const HEADS: usize = 2;
@@ -3186,7 +3213,14 @@ pub fn write_tiny_nemotron_h_gguf(path: &Path) {
     let key = |suffix: &str| format!("{arch}.{suffix}");
     // Per-layer `head_count_kv` / `feed_forward_length`: 0 marks the sub-block
     // a layer does *not* have (recurrent iff both are 0).
-    let kinds = ["mamba", "moe", "mamba", "attention", "moe"];
+    // With scalar metadata a file declares one layer shape for all layers, so
+    // the fixture must be uniform too: scalars cannot express the hybrid
+    // pattern.  `moe` is the case that also exercises the expert path.
+    let kinds: Vec<&str> = if opts.scalar_metadata {
+        vec!["moe"; 5]
+    } else {
+        vec!["mamba", "moe", "mamba", "attention", "moe"]
+    };
     let kv: Vec<gguf_file::Value> = kinds
         .iter()
         .map(|k| {
@@ -3209,7 +3243,11 @@ pub fn write_tiny_nemotron_h_gguf(path: &Path) {
         ),
         (
             key("attention.head_count_kv"),
-            gguf_file::Value::Array(kv),
+            if opts.scalar_metadata {
+                gguf_file::Value::U32(KV_HEADS as u32)
+            } else {
+                gguf_file::Value::Array(kv)
+            },
         ),
         (
             key("attention.key_length"),
@@ -3217,7 +3255,11 @@ pub fn write_tiny_nemotron_h_gguf(path: &Path) {
         ),
         (
             key("feed_forward_length"),
-            gguf_file::Value::Array(nff),
+            if opts.scalar_metadata {
+                gguf_file::Value::U32(FFN as u32)
+            } else {
+                gguf_file::Value::Array(nff)
+            },
         ),
         (key("block_count"), gguf_file::Value::U32(kinds.len() as u32)),
         (key("embedding_length"), gguf_file::Value::U32(EMB as u32)),
@@ -3349,9 +3391,18 @@ pub fn write_tiny_nemotron_h_gguf(path: &Path) {
                     qtensor(w(SSM_HEAD, seed + 5), &[1, SSM_HEAD]),
                 ));
                 // ssm_norm is [d_inner/n_group, n_group], normalised over dim 0.
+                // Column g holds group g's weights, so the fixture can give
+                // each group a different value.
+                let mut norm = Vec::with_capacity(D_INNER);
+                for row in 0..(D_INNER / N_GROUP) {
+                    let _ = row;
+                    for g in 0..N_GROUP {
+                        norm.push(opts.group_norm_weight[g]);
+                    }
+                }
                 tensors.push((
                     format!("blk.{i}.ssm_norm.weight"),
-                    qtensor(ones(D_INNER / N_GROUP * N_GROUP), &[D_INNER / N_GROUP, N_GROUP]),
+                    qtensor(norm, &[D_INNER / N_GROUP, N_GROUP]),
                 ));
                 tensors.push((
                     format!("blk.{i}.ssm_out.weight"),

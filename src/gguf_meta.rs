@@ -34,7 +34,10 @@ impl<'a> Meta<'a> {
         format!("{}.{suffix}", self.arch)
     }
 
-    fn get(&self, suffix: &str) -> Option<&'a gguf_file::Value> {
+    /// The raw value behind `suffix`, when present.  Loaders use this for the
+    /// keys that accept more than one encoding (a scalar or a per-layer
+    /// array), which the typed accessors cannot express.
+    pub fn get(&self, suffix: &str) -> Option<&'a gguf_file::Value> {
         self.md.get(&self.key(suffix))
     }
 
