@@ -1032,10 +1032,24 @@ pub use opencl_kernel::run as run_conv1d_opencl;
 // `PC` order, one invocation per `(t, c)`, `D_CONV` compiled in, and
 // `x`/`w`/`b`/`y` on bindings 0..3 exactly like `k_fused_mhc`.
 
-/// Whether a Vulkan device can run [`vulkan_source`] natively.  Always false
-/// in this tree: see the module comment above.
+/// Whether this build can dispatch [`vulkan_source`] natively.
+///
+/// `vulkan_fwd` submits the shader through the backend's own launcher, so this
+/// is true whenever the `vulkan` feature is compiled in.  It is a *build*
+/// capability check, not a device one: a particular driver may still reject
+/// the launch, in which case the op records a counted fallback and returns the
+/// reference result.  A caller deciding whether to prefer a fast path should
+/// therefore treat `false` as "definitely not accelerated" and `true` as
+/// "will try, and is correct either way".
 pub fn vulkan_native_available() -> bool {
-    false
+    #[cfg(feature = "vulkan")]
+    {
+        candle_core::vulkan_backend::kernels::native_enabled()
+    }
+    #[cfg(not(feature = "vulkan"))]
+    {
+        false
+    }
 }
 
 /// Group counts for `n` invocations of `WG` lanes, spread over x and y — the

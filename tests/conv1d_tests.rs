@@ -808,3 +808,27 @@ fn native_dispatch_refuses_half_precision_weights() {
     // reading raw bytes: the widened values differ slightly from f32.
     assert_eq!(got.len(), want.len());
 }
+
+/// The published capability check must agree with what the build can do.
+///
+/// It used to return `false` unconditionally, which was true only while the
+/// Vulkan path was a stub; a caller using it to pick a fast path would have
+/// skipped a working native dispatch.
+#[test]
+fn the_vulkan_capability_flag_matches_the_build() {
+    #[cfg(feature = "vulkan")]
+    {
+        assert_eq!(
+            joshua::conv1d::vulkan_native_available(),
+            candle_core::vulkan_backend::kernels::native_enabled(),
+            "with the vulkan feature the flag must follow the backend"
+        );
+    }
+    #[cfg(not(feature = "vulkan"))]
+    {
+        assert!(
+            !joshua::conv1d::vulkan_native_available(),
+            "without the vulkan feature there is no native path"
+        );
+    }
+}
