@@ -371,9 +371,14 @@ impl CustomOp1 for Conv1dOp {
         use candle_core::backend::{BackendDevice, BackendStorage};
         use candle_core::opencl_backend::kernels;
         let shape = Shape::from(self.out_dims(layout)?);
+        // Every buffer the shader reads is declared `float`, so *all* of the
+        // participating tensors must be f32 — an f16 weight or bias would be
+        // reinterpreted as pairs of f32 and read past its range.
         let native = Conv1d::native_enabled()
             && kernels::native_enabled()
-            && storage.dtype == DType::F32;
+            && storage.dtype == DType::F32
+            && self.w.dtype() == DType::F32
+            && self.b.as_ref().is_none_or(|b| b.dtype() == DType::F32);
         if native {
             match self.opencl_native(storage, layout) {
                 Ok(Some(out)) => return Ok((out, shape)),
@@ -397,9 +402,14 @@ impl CustomOp1 for Conv1dOp {
         use candle_core::backend::{BackendDevice as _, BackendStorage as _};
         use candle_core::vulkan_backend::kernels::{self, Buf, Idx, Push};
         let shape = Shape::from(self.out_dims(layout)?);
+        // Every buffer the shader reads is declared `float`, so *all* of the
+        // participating tensors must be f32 — an f16 weight or bias would be
+        // reinterpreted as pairs of f32 and read past its range.
         let native = Conv1d::native_enabled()
             && kernels::native_enabled()
-            && storage.dtype == DType::F32;
+            && storage.dtype == DType::F32
+            && self.w.dtype() == DType::F32
+            && self.b.as_ref().is_none_or(|b| b.dtype() == DType::F32);
         let args = if native {
             self.native_args(layout).ok().flatten()
         } else {
@@ -599,7 +609,10 @@ pub fn opencl_source(d_conv: usize) -> String {
          \x20   const long S = c_n;\n\
          \x20   const __global float* X = x + x_off + (long)t * c_n + c;\n\
          \x20   const __global float* W = w + w_off + c;\n\
-         \x20   float sum = b_on ? bp[b_off + c] : 0.0f;\n",
+         // Taps accumulate from zero, bias is added after — the CPU
+         // reference's order.  Leading with the bias changes rounding and
+         // cancellation can erase it.
+         \x20   float sum = 0.0f;\n",
     );
     for line in TAP_LADDER.lines() {
         if line.trim().starts_with("sum +=") || line.trim().starts_with("for (int k") {
@@ -609,7 +622,8 @@ pub fn opencl_source(d_conv: usize) -> String {
         }
     }
     s.push_str(
-        "\x20   if (silu_on) sum = sum / (1.0f + exp(-sum));\n\
+        "\x20   if (b_on) sum += bp[b_off + c];\n\
+         \x20   if (silu_on) sum = sum / (1.0f + exp(-sum));\n\
          \x20   y[i] = sum;\n\
          }\n",
     );
@@ -635,7 +649,11 @@ pub fn vulkan_source(d_conv: usize, wg: usize) -> String {
          \x20   int S = pc.c_n;\n\
          \x20   int xb = pc.x_off + t * S + c;\n\
          \x20   int wb = pc.w_off + c;\n\
-         \x20   float sum = pc.b_on != 0 ? bp[pc.b_off + c] : 0.0;\n",
+         // Accumulate the taps from zero and add the bias *after*, in the
+         // same order as the CPU reference: starting from the bias changes the
+         // rounding, and cancellation can erase it entirely (taps 1e20, -1e20
+         // and bias 1 give 1 on the CPU but 0 here if the bias leads).
+         \x20   float sum = 0.0;\n",
     );
     let ladder = TAP_LADDER
         .replace("X[0]", "x[xb]")
@@ -656,7 +674,8 @@ pub fn vulkan_source(d_conv: usize, wg: usize) -> String {
         }
     }
     s.push_str(
-        "\x20   if (pc.silu_on != 0) sum = sum / (1.0 + exp(-sum));\n\
+        "\x20   if (pc.b_on != 0) sum += bp[pc.b_off + c];\n\
+         \x20   if (pc.silu_on != 0) sum = sum / (1.0 + exp(-sum));\n\
          \x20   y[i] = sum;\n\
          }\n",
     );

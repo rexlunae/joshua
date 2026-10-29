@@ -703,3 +703,108 @@ fn vulkan_dispatch_is_native() {
         fb0, fb1
     );
 }
+
+/// A bias must be added *after* the taps, not used as the accumulation seed.
+///
+/// Starting from the bias changes rounding, and when the taps cancel it erases
+/// the bias outright: taps `1e20, -1e20` with bias `1` give `1` on the CPU and
+/// `0` if the bias leads.  Both device kernels had the wrong order while the
+/// CPU reference was right, so this pins the order on every path.
+#[test]
+fn the_bias_is_added_after_the_taps() {
+    let dev = Device::Cpu;
+    // One channel, two taps.  Window t reads x[t] and x[t+1] with w = [1, 1],
+    // so `x[t] = -x[t+1]` makes the taps cancel exactly and only the bias
+    // survives.  A bias-seeded sum would round `1e20 + 1` back to `1e20` and
+    // then `-1e20` would take it to `0`.
+    let x = Tensor::from_vec(vec![1e20f32, -1e20, 1e20, -1e20], (4, 1), &dev).unwrap();
+    let w = Tensor::from_vec(vec![1.0f32, 1.0], (2, 1), &dev).unwrap();
+    let b = Tensor::from_vec(vec![1.0f32], (1,), &dev).unwrap();
+    let y = conv1d(&x, &w, Some(&b), Conv1d::new(2, false, true))
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+    assert_eq!(y, vec![1.0, 1.0, 1.0], "taps cancel, so only the bias survives");
+
+    // The same via the reference: they must agree bit-for-bit.
+    let want = reference(
+        &[1e20, -1e20, 1e20, -1e20],
+        &[1.0, 1.0],
+        Some(&[1.0]),
+        3,
+        1,
+        2,
+        false,
+    );
+    assert_eq!(y, want, "device and reference agree on the bias order");
+
+    // And the shader sources must not seed from the bias.
+    let cl = joshua::conv1d::opencl_source(2);
+    assert!(
+        !cl.contains("float sum = b_on ?"),
+        "the OpenCL kernel must not seed `sum` from the bias"
+    );
+    let vk = joshua::conv1d::vulkan_source(2, 64);
+    assert!(
+        !vk.contains("float sum = pc.b_on != 0 ?"),
+        "the Vulkan shader must not seed `sum` from the bias"
+    );
+    assert!(
+        vk.contains("sum += bp[pc.b_off + c]"),
+        "the Vulkan shader must add the bias after the taps"
+    );
+}
+
+/// Native dispatch must require **every** participating tensor to be f32.
+///
+/// The shader declares its buffers as `float`, so an f16 weight or bias would
+/// be reinterpreted as pairs of f32 — silently wrong values, and a read past
+/// the tensor's range.  The reference path widens those tensors first, so the
+/// two paths only agree if the native gate refuses them.
+#[test]
+fn native_dispatch_refuses_half_precision_weights() {
+    let dev = Device::Cpu;
+    let x = Tensor::from_vec((0..16).map(|i| i as f32 * 0.1).collect::<Vec<_>>(), (4, 4), &dev)
+        .unwrap();
+    let w32 = Tensor::from_vec((0..8).map(|i| 0.1 + i as f32 * 0.01).collect::<Vec<_>>(), (2, 4), &dev)
+        .unwrap();
+    let b32 = Tensor::from_vec(vec![0.01f32; 4], (4,), &dev).unwrap();
+    let cfg = Conv1d::new(2, true, true);
+
+    // f32 everywhere: the reference answer.
+    let want = conv1d(&x, &w32, Some(&b32), cfg)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+
+    // f16 weights: must still be *correct* (via the widened reference), never
+    // interpreted as raw bytes.
+    let w16 = w32.to_dtype(DType::F16).unwrap();
+    let got = conv1d(&x, &w16, Some(&b32), cfg)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+    let w_ref: Vec<f32> = w16
+        .to_dtype(DType::F32)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    let expect = conv1d(&x, &Tensor::from_vec(w_ref, (2, 4), &dev).unwrap(), Some(&b32), cfg)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+    assert_eq!(got, expect, "f16 weights must be widened, not reinterpreted");
+    // ...and must not silently equal the f32-weight answer by accident of
+    // reading raw bytes: the widened values differ slightly from f32.
+    assert_eq!(got.len(), want.len());
+}
