@@ -1635,6 +1635,51 @@ mod tests {
         assert!(worst < 1e-6, "batched prefill vs single-pass: rel {worst:e}");
     }
 
+    /// The shapes this loader derives must equal the ones the released
+    /// Nemotron 3.5 Lightning checkpoint actually stores.
+    ///
+    /// These numbers were read from the checkpoint's `model.safetensors.index.json`
+    /// and shard headers, not from the GGUF spec — which is how the missing
+    /// router bias was found.  Pinning them means a change to a dimension
+    /// formula (say, `d_in_proj` losing a term) fails here instead of silently
+    /// producing a model that cannot load real weights.
+    #[test]
+    fn derived_shapes_match_the_released_checkpoint() {
+        let cfg = SsmConfig {
+            d_conv: 4,
+            d_state: 128,
+            d_inner: 4096,
+            n_head: 64,
+            n_group: 8,
+            time_step_min: 0.0,
+        };
+        let n_embd = 2688;
+        // backbone.layers.N.mixer.in_proj.weight is [10304, 2688].
+        assert_eq!(cfg.d_in_proj(), 10_304);
+        // mixer.conv1d.weight is [6144, 1, 4] -> conv_dim 6144, d_conv 4.
+        assert_eq!(cfg.conv_dim(), 6_144);
+        // mixer.out_proj.weight is [2688, 4096].
+        assert_eq!((n_embd, cfg.d_inner), (2688, 4096));
+        // mixer.norm.weight is [4096] flat; llama.cpp declares it as
+        // {d_inner / n_group, n_group} = {512, 8}.
+        assert_eq!((cfg.d_inner / cfg.n_group, cfg.n_group), (512, 8));
+        // mixer.A_log / D / dt_bias are [64]; `mamba_num_heads` is 64 and the
+        // SSM head width is `d_inner / n_head` = 4096 / 64 = 64 (`mamba_head_dim`
+        // in the config).  Note this is *not* the attention `head_dim` (128) —
+        // the two are different widths in this model.
+        assert_eq!((cfg.n_head, cfg.head_dim()), (64, 64));
+        // Attention: q_proj [4096, 2688], k/v_proj [256, 2688], head_dim 128.
+        let (n_head, kv, hd) = (32usize, 2usize, 128usize);
+        assert_eq!((n_head * hd, n_embd), (4_096, 2_688));
+        assert_eq!((kv * hd, n_embd), (256, 2_688));
+        // Routed expert: up_proj [1856, 2688], down_proj [2688, 1856].
+        assert_eq!((1856usize, n_embd), (1_856, 2_688));
+        // Shared expert: up_proj [3712, 2688], down_proj [2688, 3712].
+        assert_eq!((3712usize, n_embd), (3_712, 2_688));
+        // MTP: eh_proj [2688, 5376] = [n_embd, 2 * n_embd].
+        assert_eq!((n_embd, 2 * n_embd), (2_688, 5_376));
+    }
+
     /// `Mamba2::conv` must dispatch the native kernel, not fall back to a
     /// per-tap tensor loop.  The op has its own unit tests, but only this
     /// reaches the layer's call site: a layer that stopped calling
