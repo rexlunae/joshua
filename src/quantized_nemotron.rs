@@ -1635,49 +1635,96 @@ mod tests {
         assert!(worst < 1e-6, "batched prefill vs single-pass: rel {worst:e}");
     }
 
-    /// The shapes this loader derives must equal the ones the released
-    /// Nemotron 3.5 Lightning checkpoint actually stores.
+    /// The loader must derive the released checkpoint's dimensions from that
+    /// checkpoint's own metadata.
     ///
-    /// These numbers were read from the checkpoint's `model.safetensors.index.json`
-    /// and shard headers, not from the GGUF spec — which is how the missing
-    /// router bias was found.  Pinning them means a change to a dimension
-    /// formula (say, `d_in_proj` losing a term) fails here instead of silently
-    /// producing a model that cannot load real weights.
+    /// This drives `Config::from_meta` with the real GGUF hyperparameters
+    /// (taken from `NVIDIA-Nemotron-3.5-Lightning-30B-A3B`'s config, converted
+    /// the way llama.cpp's `nemotron-h.cpp` reads them) and asserts every
+    /// derived width against the shape the checkpoint actually stores.  That
+    /// matters because the identity comparisons an earlier version used —
+    /// literal against literal — could not catch a change to `from_meta`;
+    /// reading a real checkpoint is also how the missing router bias surfaced.
     #[test]
-    fn derived_shapes_match_the_released_checkpoint() {
-        let cfg = SsmConfig {
-            d_conv: 4,
-            d_state: 128,
-            d_inner: 4096,
-            n_head: 64,
-            n_group: 8,
-            time_step_min: 0.0,
+    fn config_derives_the_released_checkpoint_shapes() {
+        use candle_core::quantized::gguf_file::Value;
+        let mut md: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+        let k = |s: &str| format!("nemotron_h.{s}");
+        let mut put = |s: &str, v: Value| {
+            md.insert(k(s), v);
         };
-        let n_embd = 2688;
-        // backbone.layers.N.mixer.in_proj.weight is [10304, 2688].
-        assert_eq!(cfg.d_in_proj(), 10_304);
-        // mixer.conv1d.weight is [6144, 1, 4] -> conv_dim 6144, d_conv 4.
-        assert_eq!(cfg.conv_dim(), 6_144);
-        // mixer.out_proj.weight is [2688, 4096].
-        assert_eq!((n_embd, cfg.d_inner), (2688, 4096));
-        // mixer.norm.weight is [4096] flat; llama.cpp declares it as
-        // {d_inner / n_group, n_group} = {512, 8}.
-        assert_eq!((cfg.d_inner / cfg.n_group, cfg.n_group), (512, 8));
-        // mixer.A_log / D / dt_bias are [64]; `mamba_num_heads` is 64 and the
-        // SSM head width is `d_inner / n_head` = 4096 / 64 = 64 (`mamba_head_dim`
-        // in the config).  Note this is *not* the attention `head_dim` (128) —
-        // the two are different widths in this model.
-        assert_eq!((cfg.n_head, cfg.head_dim()), (64, 64));
-        // Attention: q_proj [4096, 2688], k/v_proj [256, 2688], head_dim 128.
-        let (n_head, kv, hd) = (32usize, 2usize, 128usize);
-        assert_eq!((n_head * hd, n_embd), (4_096, 2_688));
-        assert_eq!((kv * hd, n_embd), (256, 2_688));
-        // Routed expert: up_proj [1856, 2688], down_proj [2688, 1856].
-        assert_eq!((1856usize, n_embd), (1_856, 2_688));
-        // Shared expert: up_proj [3712, 2688], down_proj [2688, 3712].
-        assert_eq!((3712usize, n_embd), (3_712, 2_688));
-        // MTP: eh_proj [2688, 5376] = [n_embd, 2 * n_embd].
-        assert_eq!((n_embd, 2 * n_embd), (2_688, 5_376));
+        put("block_count", Value::U32(53)); // 52 trunk + 1 NextN
+        put("nextn_predict_layers", Value::U32(1));
+        put("embedding_length", Value::U32(2688));
+        put("attention.head_count", Value::U32(32));
+        put("attention.key_length", Value::U32(128));
+        put("attention.layer_norm_rms_epsilon", Value::F32(1e-5));
+        put("rope.freq_base", Value::F32(10_000.0));
+        put("ssm.conv_kernel", Value::U32(4));
+        put("ssm.inner_size", Value::U32(4096));
+        put("ssm.state_size", Value::U32(128));
+        put("ssm.time_step_rank", Value::U32(64));
+        put("ssm.group_count", Value::U32(8));
+        put("expert_count", Value::U32(128));
+        put("expert_used_count", Value::U32(6));
+        put("expert_weights_scale", Value::F32(2.5));
+        put("expert_weights_norm", Value::Bool(true));
+        // The released `layers_block_type`: 23 `mamba`, 23 `moe`, 6
+        // `attention`, at exactly these indexes.  Each is a *single* kind, so a
+        // `mamba` layer has both `head_count_kv` and `feed_forward_length` zero
+        // — that pair is llama.cpp's whole recurrent test.
+        const ATTN: [u32; 6] = [5, 12, 19, 26, 33, 42];
+        const MOE: [u32; 23] = [
+            1, 3, 6, 8, 10, 13, 15, 17, 20, 22, 24, 27, 29, 31, 34, 36, 38, 40, 43, 45, 47, 49,
+            51,
+        ];
+        let kv: Vec<Value> = (0..52u32)
+            .map(|i| Value::U32(if ATTN.contains(&i) { 2 } else { 0 }))
+            .collect();
+        let ff: Vec<Value> = (0..52u32)
+            .map(|i| Value::U32(if MOE.contains(&i) { 1856 } else { 0 }))
+            .collect();
+        put("attention.head_count_kv", Value::Array(kv));
+        put("feed_forward_length", Value::Array(ff));
+
+        let meta = Meta::new(&md, "nemotron_h");
+        let cfg = Config::from_meta(&meta)
+            .expect("metadata parses")
+            .expect("recognised architecture");
+
+        // Trunk excludes the NextN block.
+        assert_eq!(cfg.n_layer, 52, "block_count 53 - nextn 1");
+        // What the checkpoint stores, per its index.json and shard headers.
+        assert_eq!(cfg.ssm.d_in_proj(), 10_304); // in_proj [10304, 2688]
+        assert_eq!(cfg.ssm.conv_dim(), 6_144); // conv1d [6144, 1, 4]
+        assert_eq!(cfg.ssm.d_inner, 4_096); // out_proj [2688, 4096]
+        assert_eq!(
+            (cfg.ssm.d_inner / cfg.ssm.n_group, cfg.ssm.n_group),
+            (512, 8) // norm [4096] -> {512, 8}
+        );
+        assert_eq!(cfg.ssm.n_head, 64); // A_log/D/dt_bias [64]
+        assert_eq!(cfg.ssm.head_dim(), 64); // mamba_head_dim, not attention's 128
+        // Attention: q [4096, 2688], k/v [256, 2688].
+        assert_eq!((cfg.n_head, cfg.head_dim, cfg.n_embd), (32, 128, 2688));
+        assert_eq!(cfg.n_head * cfg.head_dim, 4_096);
+        assert_eq!(cfg.n_head_kv * cfg.head_dim, 256);
+        // Layer kinds: 6 attention, MoE for the rest, none left as mamba by
+        // the kv/ffn rule.
+        let attn = cfg.layers.iter().filter(|l| l.kind == LayerKind::Attention).count();
+        let mamba = cfg.layers.iter().filter(|l| l.kind == LayerKind::Mamba).count();
+        let moe = cfg.layers.iter().filter(|l| l.kind == LayerKind::Moe).count();
+        assert_eq!((attn, mamba, moe), (6, 23, 23), "the released layer pattern");
+        // Spot-check the classification at the boundaries rather than trusting
+        // the counts alone.
+        assert_eq!(cfg.layers[0].kind, LayerKind::Mamba);
+        assert_eq!(cfg.layers[1].kind, LayerKind::Moe);
+        assert_eq!(cfg.layers[5].kind, LayerKind::Attention);
+        assert_eq!(cfg.layers[33].kind, LayerKind::Attention);
+        assert_eq!(cfg.layers[42].kind, LayerKind::Attention);
+        assert_eq!(cfg.layers[51].kind, LayerKind::Moe);
+
+        // And the MTP block is addressed past the trunk.
+        assert_eq!(format!("blk.{}", cfg.n_layer), "blk.52");
     }
 
     /// `Mamba2::conv` must dispatch the native kernel, not fall back to a
