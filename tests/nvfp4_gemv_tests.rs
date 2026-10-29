@@ -585,7 +585,7 @@ fn opencl_cpu_round_trip_matches_the_native_kernel() {
 /// assertion is what would need revisiting, and doing so is the signal that the
 /// native path landed.
 #[test]
-fn vulkan_native_gemv_uses_the_fallback() {
+fn vulkan_native_gemv_matches_the_reference() {
     #[cfg(not(feature = "vulkan"))]
     {
         println!("skipping: built without the vulkan feature");
@@ -600,7 +600,9 @@ fn vulkan_native_gemv_uses_the_fallback() {
             }
         };
         let dev = Device::Vulkan(vk);
-        let (out_dim, in_dim) = (6usize, 384usize);
+        // 128 columns spans several work-groups; a narrow matrix would fit in
+        // one and could hide a grid-size mistake (it did once).
+        let (out_dim, in_dim) = (128usize, 384usize);
         let blocks = edge_case_blocks(out_dim * (in_dim / QK_NVFP4));
         let acts: Vec<f32> = (0..in_dim).map(|i| ((i * 5 % 23) as f32 - 11.0) / 3.0).collect();
         let bytes = block_bytes(&blocks);
@@ -623,15 +625,24 @@ fn vulkan_native_gemv_uses_the_fallback() {
             .into_iter()
             .map(|v| v as f32)
             .collect();
-        assert_eq!(
-            got, want,
-            "the Vulkan path is documented as the CPU round-trip, so it must be \
-             bit-identical to it; a difference means a native path appeared (good, \
-             but now re-check this test) or the fallback broke (bad)"
+        // A native Vulkan kernel sums in a different order than the scalar
+        // decoder, so the two agree to rounding rather than bit-for-bit.  This
+        // used to be `assert_eq!` because the path was the CPU round-trip; the
+        // loosening is the signal that the native kernel landed, exactly as the
+        // doc comment above anticipated.
+        let scale = want.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-6);
+        let worst = got
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max)
+            / scale;
+        assert!(
+            worst < 1e-5,
+            "vulkan NVFP4 vs the reference decode: worst relative error {worst:e}"
         );
         println!(
-            "vulkan: float-GEMM path through the fallback, bit-identical to the CPU decode \
-             ({} values)",
+            "vulkan: native NVFP4 GEMV, worst relative error {worst:e} over {} values",
             got.len()
         );
     }

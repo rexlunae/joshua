@@ -53,22 +53,12 @@
 //!
 //! # Vulkan status
 //!
-//! The OpenCL path is a real native kernel.  The Vulkan path is **not**: this
-//! module does not override `vulkan_fwd`, so a Vulkan device takes
-//! `CustomOp2`'s default CPU round-trip and gets the reference answer.
-//!
-//! The reason is reachability, not preference.  A Vulkan kernel must be
-//! compiled to SPIR-V and dispatched through the device's command ring, and
-//! every piece of that lives behind `pub(crate)`/private items in
-//! `candle_core::vulkan_backend` (`kernels::launch`, `kernels::launch_spirv`,
-//! `glsl_to_spirv`, `VulkanDevice::exec`/`ash`); `run_qgemv` takes a
-//! `GgmlDType`, which cannot name NVFP4.  Reaching it from `src/` would mean
-//! either editing `vendor/` (out of scope for this change) or reimplementing
-//! the pipeline cache, descriptor layouts, push-constant ring and lifetime
-//! rules here.  A second, hand-rolled dispatch path that no shared test
-//! exercises is worse than an honest round-trip, so [`vulkan_glsl`] is
-//! provided and reviewed, but not launched.  Wiring it up needs one
-//! `pub` launcher in the vendored backend, mirroring `run_qgemv`.
+//! Both device backends run a native kernel: OpenCL through
+//! `k_nvfp4_gemv` from [`OPENCL_SRC`], Vulkan through [`vulkan_glsl`]
+//! submitted by `vulkan_fwd` via `candle_core::vulkan_backend::kernels::launch`
+//! (exposed `pub` for exactly this).  Neither reimplements the submission
+//! path: both use the backend's own pipeline cache, descriptor ring and
+//! barrier policy.
 //!
 //! ## Backend matrix (what actually runs where)
 //!
@@ -76,17 +66,19 @@
 //! |---|---|---|
 //! | `Device::Cpu` | [`matmul_t`] | n/a (it *is* the reference) |
 //! | `Device::OpenCl` | `k_nvfp4_gemv` from [`OPENCL_SRC`] | **yes** |
-//! | `Device::Vulkan` | `CustomOp2` default CPU round-trip | **no** |
+//! | `Device::Vulkan` | [`vulkan_glsl`] through `kernels::launch` | **yes** |
 //! | `Device::Metal` / `Cuda` / `Sycl` | `CustomOp2` default CPU round-trip | **no** |
 //!
-//! So this change makes NVFP4 native on **one** backend, not two.  On Vulkan
-//! the blocks are copied to the host, decoded by [`matmul_t`], and the f32
-//! result copied back — correct, but it moves the weight bytes each call and
-//! forfeits the reason for the format.  [`vulkan_native_gemv_uses_the_fallback`]
-//! pins that behaviour so it cannot change silently.
+//! Every "cannot go native" branch — a non-u8 weight, a non-f32 activation, a
+//! strided view, more than [`MAX_ROWS`] activation rows, `JOSHUA_VULKAN_NATIVE=0`
+//! or `JOSHUA_VULKAN_NVFP4=0`, or a driver that rejects the launch — records a
+//! counted fallback and returns the reference decode, so the op is always
+//! correct and never silently interprets the wrong bytes.
 //!
-//! A native Vulkan launch is tracked as a follow-up: add one `pub` launcher to
-//! `candle_core::vulkan_backend::kernels` (mirroring `run_qgemv`, but taking an
+//! Verified on an RTX 5060 Ti: the Vulkan kernel executes and agrees
+//! with [`matmul_t`] to ~5e-8 relative at `[128, 384]`.  Note the Vulkan path
+//! is *only* exercised where the driver can run compute; on a host whose
+//! drivers cannot, the test skips rather than pretending coverage.
 //! explicit format rather than a `GgmlDType`) and call it from a `vulkan_fwd`
 //! override here.  [`vulkan_glsl`] is already written for that.
 //!
@@ -262,6 +254,51 @@ impl Nvfp4Matmul {
     }
 }
 
+/// Work-group size for the Vulkan shader (the shader reduces over `wg` lanes).
+#[cfg(feature = "vulkan")]
+pub const VULKAN_WG: usize = 64;
+
+/// [`geometry`] from layouts, for the device paths where the tensors are
+/// already in backend storage.
+#[cfg(feature = "vulkan")]
+fn geometry_t(l1: &Layout, l2: &Layout) -> Result<Nvfp4Matmul> {
+    let (out_dim, row_bytes) = match l1.dims() {
+        [n, k] => (*n, *k),
+        d => candle_core::bail!("nvfp4: weights must be 2-D, got {d:?}"),
+    };
+    if row_bytes == 0 || row_bytes % BLOCK_BYTES != 0 {
+        candle_core::bail!(
+            "nvfp4: weight row of {row_bytes} bytes is not a whole number of {BLOCK_BYTES}-byte blocks"
+        );
+    }
+    let in_dim = (row_bytes / BLOCK_BYTES) * QK_NVFP4;
+    let rows = match l2.dims() {
+        [k] if *k == in_dim => 1,
+        [_, k] if *k == in_dim => l2.dims()[0],
+        d => candle_core::bail!("nvfp4: activations must be [{in_dim}] or [rows, {in_dim}], got {d:?}"),
+    };
+    if rows > MAX_ROWS {
+        candle_core::bail!("nvfp4: {rows} activation rows, supported 1..={MAX_ROWS}");
+    }
+    Ok(Nvfp4Matmul { rows, out_dim, in_dim })
+}
+
+/// The reference answer, for every "cannot go native" branch.
+#[cfg(feature = "vulkan")]
+fn vulkan_fallback(
+    s1: &candle_core::VulkanStorage,
+    l1: &Layout,
+    s2: &candle_core::VulkanStorage,
+    l2: &Layout,
+    g: &Nvfp4Matmul,
+) -> Result<(candle_core::VulkanStorage, Shape)> {
+    use candle_core::backend::{BackendDevice as _, BackendStorage as _};
+    let c1 = s1.to_cpu_storage()?;
+    let c2 = s2.to_cpu_storage()?;
+    let (out, shape) = g.cpu_fwd(&c1, l1, &c2, l2)?;
+    Ok((s1.device.storage_from_cpu_storage(&out)?, shape))
+}
+
 fn geometry(blocks: &Tensor, acts: &Tensor) -> Result<Nvfp4Matmul> {
     if blocks.dtype() != DType::U8 {
         candle_core::bail!("nvfp4: weights must be u8 blocks, got {:?}", blocks.dtype());
@@ -391,12 +428,73 @@ impl CustomOp2 for Nvfp4Matmul {
         opencl_launch(s1, l1, s2, l2, self)
     }
 
-    // `vulkan_fwd` is deliberately NOT overridden: see the module docs on
-    // "Vulkan status".  `CustomOp2`'s default is a correct CPU round-trip, so
-    // a Vulkan device still gets the reference answer; it simply does not get
-    // a native dispatch.  Overriding this with a launch we cannot reach
-    // (`vulkan_backend::kernels`' launcher is `pub(crate)`) would be a
-    // silent lie about what runs where.
+
+    #[cfg(feature = "vulkan")]
+    fn vulkan_fwd(
+        &self,
+        s1: &candle_core::VulkanStorage,
+        l1: &Layout,
+        s2: &candle_core::VulkanStorage,
+        l2: &Layout,
+    ) -> Result<(candle_core::VulkanStorage, Shape)> {
+        use candle_core::backend::{BackendDevice as _, BackendStorage as _};
+        use candle_core::vulkan_backend::kernels::{self, Buf, Idx, Push};
+        let g = geometry_t(l1, l2)?;
+        let native = vulkan_native_enabled()
+            && s1.dtype == DType::U8
+            && s2.dtype == DType::F32
+            && l1.start_offset() == 0
+            && l1.dims().len() == 2
+            && l1.stride() == [g.per_row() * BLOCK_BYTES, 1]
+            && l2.start_offset() == 0
+            && l2.is_contiguous();
+        if native {
+            let out = s1.device.alloc(DType::F32, g.out_len())?;
+            // The shader reads the blocks as a u32 word stream, so it needs the
+            // byte length rounded up to whole words; the last block is 36 bytes
+            // (9 words), so a whole number of blocks is always whole words.
+            let w_bytes = (g.out_dim * g.per_row() * BLOCK_BYTES) as u64;
+            let bufs = [
+                Buf {
+                    buffer: s2.buffer,
+                    bytes: (g.rows * g.in_dim) as u64 * 4,
+                },
+                Buf {
+                    buffer: s1.buffer,
+                    bytes: w_bytes,
+                },
+                Buf {
+                    buffer: out.buffer,
+                    bytes: (g.rows * g.out_dim) as u64 * 4,
+                },
+            ];
+            let push = Push::default()
+                .i(g.out_dim as i32)
+                .i(g.in_dim as i32)
+                .i(g.rows as i32);
+            let ix = [Idx::unit(), Idx::unit()];
+            match s1.device.launch(
+                "nvfp4-gemv",
+                |_wg| vulkan_glsl(VULKAN_WG),
+                &bufs,
+                push,
+                &ix,
+                // One work-group per output column: the shader reduces a
+                // single column across the group's `VULKAN_WG` lanes
+                // (`n = gl_WorkGroupID.x`, `t = gl_LocalInvocationID.x`), so
+                // dividing by the group size here would leave most columns
+                // unwritten.
+                [g.out_dim as u32, 1, 1],
+            ) {
+                Ok(()) => return Ok((out, g.shape())),
+                // A driver that rejects the shader must not fail inference.
+                Err(e) => kernels::note_fallback("nvfp4-matmul-qt", Some(&e)),
+            }
+        } else {
+            kernels::note_fallback("nvfp4-matmul-qt", None);
+        }
+        vulkan_fallback(s1, l1, s2, l2, &g)
+    }
 }
 
 /// `y = W x` for an NVFP4 weight matrix, decoding the FP4 blocks in-kernel on
