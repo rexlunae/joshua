@@ -568,3 +568,44 @@ fn the_router_selection_bias_changes_routing() {
          so the logits must differ; identical output means the bias was ignored"
     );
 }
+
+/// The MTP block's own router bias must be read too.
+///
+/// The real checkpoint's draft block (`mtp.layers.1`) carries its own
+/// `mixer.gate.e_score_correction_bias`, separate from the trunk's.  The
+/// fixture used to bias only trunk layers, so drafting never exercised
+/// selection bias at all.
+#[test]
+fn the_mtp_block_reads_its_own_selection_bias() {
+    let dir = common::model_dir("nemotron-mtp-bias");
+    let plain = dir.join("plain.gguf");
+    let biased = dir.join("biased.gguf");
+    common::write_nemotron_h_gguf(
+        &plain,
+        common::NemotronTiny {
+            mtp_block: true,
+            ..Default::default()
+        },
+    );
+    common::write_nemotron_h_gguf(
+        &biased,
+        common::NemotronTiny {
+            mtp_block: true,
+            gate_bias: true,
+            ..Default::default()
+        },
+    );
+
+    let mut a = joshua::quantized_qwen::with_mtp_block(|| common::load_model(&plain, true));
+    let mut b = joshua::quantized_qwen::with_mtp_block(|| common::load_model(&biased, true));
+    assert!(a.set_mtp(true) && b.set_mtp(true), "both files carry the block");
+    let prompt = [1u32, 4, 2, 7];
+    let _ = common::logits(&mut a, &prompt, 0);
+    let _ = common::logits(&mut b, &prompt, 0);
+    let da = a.mtp_draft(5, prompt.len(), 2).expect("drafting");
+    let db = b.mtp_draft(5, prompt.len(), 2).expect("drafting");
+    assert!(
+        da != db,
+        "a bias on the draft block's own router must change the draft: {da:?} vs {db:?}"
+    );
+}

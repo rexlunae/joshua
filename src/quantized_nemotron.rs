@@ -861,7 +861,13 @@ impl MoeBlock {
         // The router's selection bias.  llama.cpp reads this as
         // `ffn_exp_probs_b`; without it the top-k picks differ on the real
         // model even though every tensor loads.
-        let gate_bias = src.f32_opt(&format!("{p}.exp_probs_b.bias"))?;
+        // Centred at load, as the other MoE loaders do: the bias only steers
+        // *selection*, so a large common offset carries no information but can
+        // round distinct scores into ties in f32.
+        let gate_bias = match src.f32_opt(&format!("{p}.exp_probs_b.bias"))? {
+            Some(b) => Some(crate::moe::center_selection_bias(&b)?),
+            None => None,
+        };
         let up = src.expert_tensor(&format!("{p}.ffn_up_exps.weight"), cfg.n_expert)?;
         let down = src.expert_tensor(&format!("{p}.ffn_down_exps.weight"), cfg.n_expert)?;
         let candle = |qt: QTensor| -> Result<Weight> { Ok(Weight::Quant(QMatMul::from_qtensor(qt)?)) };

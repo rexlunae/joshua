@@ -3562,6 +3562,16 @@ pub fn write_nemotron_h_gguf(path: &Path, opts: NemotronTiny) {
             format!("blk.{i}.ffn_gate_inp.weight"),
             qtensor(w(N_EXPERT * EMB, seed + 5), &[N_EXPERT, EMB]),
         ));
+        // The MTP block's own router bias, so drafting exercises selection
+        // bias too (the real `mtp.layers.1` layer carries one).
+        if opts.gate_bias {
+            let mut b = vec![0.0f32; N_EXPERT];
+            b[0] = 12.0;
+            tensors.push((
+                format!("blk.{i}.exp_probs_b.bias"),
+                qtensor(b, &[N_EXPERT]),
+            ));
+        }
         let mut up: Vec<f32> = Vec::with_capacity(N_EXPERT * FFN * EMB);
         let mut down: Vec<f32> = Vec::with_capacity(N_EXPERT * EMB * FFN);
         for e in 0..N_EXPERT {
