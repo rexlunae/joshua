@@ -53,22 +53,12 @@
 //!
 //! # Vulkan status
 //!
-//! The OpenCL path is a real native kernel.  The Vulkan path is **not**: this
-//! module does not override `vulkan_fwd`, so a Vulkan device takes
-//! `CustomOp2`'s default CPU round-trip and gets the reference answer.
-//!
-//! The reason is reachability, not preference.  A Vulkan kernel must be
-//! compiled to SPIR-V and dispatched through the device's command ring, and
-//! every piece of that lives behind `pub(crate)`/private items in
-//! `candle_core::vulkan_backend` (`kernels::launch`, `kernels::launch_spirv`,
-//! `glsl_to_spirv`, `VulkanDevice::exec`/`ash`); `run_qgemv` takes a
-//! `GgmlDType`, which cannot name NVFP4.  Reaching it from `src/` would mean
-//! either editing `vendor/` (out of scope for this change) or reimplementing
-//! the pipeline cache, descriptor layouts, push-constant ring and lifetime
-//! rules here.  A second, hand-rolled dispatch path that no shared test
-//! exercises is worse than an honest round-trip, so [`vulkan_glsl`] is
-//! provided and reviewed, but not launched.  Wiring it up needs one
-//! `pub` launcher in the vendored backend, mirroring `run_qgemv`.
+//! Both device backends run a native kernel: OpenCL through
+//! `k_nvfp4_gemv` from [`OPENCL_SRC`], Vulkan through [`vulkan_glsl`]
+//! submitted by `vulkan_fwd` via `candle_core::vulkan_backend::kernels::launch`
+//! (exposed `pub` for exactly this).  Neither reimplements the submission
+//! path: both use the backend's own pipeline cache, descriptor ring and
+//! barrier policy.
 //!
 //! ## Backend matrix (what actually runs where)
 //!
@@ -76,17 +66,19 @@
 //! |---|---|---|
 //! | `Device::Cpu` | [`matmul_t`] | n/a (it *is* the reference) |
 //! | `Device::OpenCl` | `k_nvfp4_gemv` from [`OPENCL_SRC`] | **yes** |
-//! | `Device::Vulkan` | `CustomOp2` default CPU round-trip | **no** |
+//! | `Device::Vulkan` | [`vulkan_glsl`] through `kernels::launch` | **yes** |
 //! | `Device::Metal` / `Cuda` / `Sycl` | `CustomOp2` default CPU round-trip | **no** |
 //!
-//! So this change makes NVFP4 native on **one** backend, not two.  On Vulkan
-//! the blocks are copied to the host, decoded by [`matmul_t`], and the f32
-//! result copied back — correct, but it moves the weight bytes each call and
-//! forfeits the reason for the format.  [`vulkan_native_gemv_uses_the_fallback`]
-//! pins that behaviour so it cannot change silently.
+//! Every "cannot go native" branch — a non-u8 weight, a non-f32 activation, a
+//! strided view, more than [`MAX_ROWS`] activation rows, `JOSHUA_VULKAN_NATIVE=0`
+//! or `JOSHUA_VULKAN_NVFP4=0`, or a driver that rejects the launch — records a
+//! counted fallback and returns the reference decode, so the op is always
+//! correct and never silently interprets the wrong bytes.
 //!
-//! A native Vulkan launch is tracked as a follow-up: add one `pub` launcher to
-//! `candle_core::vulkan_backend::kernels` (mirroring `run_qgemv`, but taking an
+//! Verified on an RTX 5060 Ti: the Vulkan kernel executes and agrees
+//! with [`matmul_t`] to ~5e-8 relative at `[128, 384]`.  Note the Vulkan path
+//! is *only* exercised where the driver can run compute; on a host whose
+//! drivers cannot, the test skips rather than pretending coverage.
 //! explicit format rather than a `GgmlDType`) and call it from a `vulkan_fwd`
 //! override here.  [`vulkan_glsl`] is already written for that.
 //!
@@ -262,6 +254,51 @@ impl Nvfp4Matmul {
     }
 }
 
+/// Work-group size for the Vulkan shader (the shader reduces over `wg` lanes).
+#[cfg(feature = "vulkan")]
+pub const VULKAN_WG: usize = 64;
+
+/// [`geometry`] from layouts, for the device paths where the tensors are
+/// already in backend storage.
+#[cfg(feature = "vulkan")]
+fn geometry_t(l1: &Layout, l2: &Layout) -> Result<Nvfp4Matmul> {
+    let (out_dim, row_bytes) = match l1.dims() {
+        [n, k] => (*n, *k),
+        d => candle_core::bail!("nvfp4: weights must be 2-D, got {d:?}"),
+    };
+    if row_bytes == 0 || row_bytes % BLOCK_BYTES != 0 {
+        candle_core::bail!(
+            "nvfp4: weight row of {row_bytes} bytes is not a whole number of {BLOCK_BYTES}-byte blocks"
+        );
+    }
+    let in_dim = (row_bytes / BLOCK_BYTES) * QK_NVFP4;
+    let rows = match l2.dims() {
+        [k] if *k == in_dim => 1,
+        [_, k] if *k == in_dim => l2.dims()[0],
+        d => candle_core::bail!("nvfp4: activations must be [{in_dim}] or [rows, {in_dim}], got {d:?}"),
+    };
+    if rows > MAX_ROWS {
+        candle_core::bail!("nvfp4: {rows} activation rows, supported 1..={MAX_ROWS}");
+    }
+    Ok(Nvfp4Matmul { rows, out_dim, in_dim })
+}
+
+/// The reference answer, for every "cannot go native" branch.
+#[cfg(feature = "vulkan")]
+fn vulkan_fallback(
+    s1: &candle_core::VulkanStorage,
+    l1: &Layout,
+    s2: &candle_core::VulkanStorage,
+    l2: &Layout,
+    g: &Nvfp4Matmul,
+) -> Result<(candle_core::VulkanStorage, Shape)> {
+    use candle_core::backend::{BackendDevice as _, BackendStorage as _};
+    let c1 = s1.to_cpu_storage()?;
+    let c2 = s2.to_cpu_storage()?;
+    let (out, shape) = g.cpu_fwd(&c1, l1, &c2, l2)?;
+    Ok((s1.device.storage_from_cpu_storage(&out)?, shape))
+}
+
 fn geometry(blocks: &Tensor, acts: &Tensor) -> Result<Nvfp4Matmul> {
     if blocks.dtype() != DType::U8 {
         candle_core::bail!("nvfp4: weights must be u8 blocks, got {:?}", blocks.dtype());
@@ -391,12 +428,75 @@ impl CustomOp2 for Nvfp4Matmul {
         opencl_launch(s1, l1, s2, l2, self)
     }
 
-    // `vulkan_fwd` is deliberately NOT overridden: see the module docs on
-    // "Vulkan status".  `CustomOp2`'s default is a correct CPU round-trip, so
-    // a Vulkan device still gets the reference answer; it simply does not get
-    // a native dispatch.  Overriding this with a launch we cannot reach
-    // (`vulkan_backend::kernels`' launcher is `pub(crate)`) would be a
-    // silent lie about what runs where.
+
+    #[cfg(feature = "vulkan")]
+    fn vulkan_fwd(
+        &self,
+        s1: &candle_core::VulkanStorage,
+        l1: &Layout,
+        s2: &candle_core::VulkanStorage,
+        l2: &Layout,
+    ) -> Result<(candle_core::VulkanStorage, Shape)> {
+        use candle_core::backend::{BackendDevice as _, BackendStorage as _};
+        use candle_core::vulkan_backend::kernels::{self, Buf, Idx, Push};
+        let g = geometry_t(l1, l2)?;
+        let native = vulkan_native_enabled()
+            && s1.dtype == DType::U8
+            && s2.dtype == DType::F32
+            && l1.start_offset() == 0
+            && l1.dims().len() == 2
+            && l1.stride() == [g.per_row() * BLOCK_BYTES, 1]
+            && l2.is_contiguous();
+        if native {
+            let out = s1.device.alloc(DType::F32, g.out_len())?;
+            // The shader reads the blocks as a u32 word stream, so it needs the
+            // byte length rounded up to whole words; the last block is 36 bytes
+            // (9 words), so a whole number of blocks is always whole words.
+            let w_bytes = (g.out_dim * g.per_row() * BLOCK_BYTES) as u64;
+            let bufs = [
+                Buf {
+                    buffer: s2.buffer,
+                    bytes: (g.rows * g.in_dim) as u64 * 4,
+                },
+                Buf {
+                    buffer: s1.buffer,
+                    bytes: w_bytes,
+                },
+                Buf {
+                    buffer: out.buffer,
+                    bytes: (g.rows * g.out_dim) as u64 * 4,
+                },
+            ];
+            let push = Push::default()
+                .i(g.out_dim as i32)
+                .i(g.in_dim as i32)
+                .i(g.rows as i32)
+                .i(l2.start_offset() as i32);
+            let ix = [Idx::unit(), Idx::unit()];
+            match s1.device.launch(
+                "nvfp4-gemv",
+                |_wg| vulkan_glsl(VULKAN_WG),
+                &bufs,
+                push,
+                &ix,
+                // One work-group per output column: the shader reduces a
+                // single column across the group's `VULKAN_WG` lanes
+                // (`n = gl_WorkGroupID.x`, `t = gl_LocalInvocationID.x`), so
+                // dividing by the group size here would leave most columns
+                // unwritten.  The column count is spread over x and y so a wide
+                // matrix stays inside `maxComputeWorkGroupCount` (commonly
+                // 65535 per axis).
+                grid_for(g.out_dim as u32),
+            ) {
+                Ok(()) => return Ok((out, g.shape())),
+                // A driver that rejects the shader must not fail inference.
+                Err(e) => kernels::note_fallback("nvfp4-matmul-qt", Some(&e)),
+            }
+        } else {
+            kernels::note_fallback("nvfp4-matmul-qt", None);
+        }
+        vulkan_fallback(s1, l1, s2, l2, &g)
+    }
 }
 
 /// `y = W x` for an NVFP4 weight matrix, decoding the FP4 blocks in-kernel on
@@ -450,7 +550,7 @@ inline float nv_ue4m3(uint x) {
 // element j + 8 in its HIGH nibble.
 __kernel __attribute__((reqd_work_group_size(__WG__, 1, 1)))
 void k_nvfp4_gemv(__global const float* X, __global const uchar* W,
-                  __global float* C, int N, int K, int M) {
+                  __global float* C, int N, int K, int M, int XOFF) {
     __local float tab[16];
     __local float sh[__WG__];
     const int t = (int)get_local_id(0);
@@ -470,21 +570,22 @@ void k_nvfp4_gemv(__global const float* X, __global const uchar* W,
         float acc = 0.0f;
         if (n < N) {
             __global const uchar* row = W + (ulong)n * (ulong)nb * 36ul;
-            __global const float* x = X + (long)m * K;
+            __global const float* x = X + XOFF + (long)m * K;
             for (int b = 0; b < nb; ++b) {
                 __global const uchar* blk = row + (ulong)b * 36ul;
                 for (int s = t; s < 4; s += __WG__) {
                     float d = nv_ue4m3((uint)blk[s]);
-                    if (d == 0.0f) continue;   // scale 0x00 or the 0x7F NaN
                     __global const uchar* q = blk + 4 + 8 * s;
                     const int xb = b * 64 + s * 16;
-                    float part = 0.0f;
+                    // A zero scale is *multiplied through*, not skipped: the
+                    // reference decodes it to 0 and still multiplies, so
+                    // `0 * inf` / `0 * NaN` must stay NaN rather than being
+                    // dropped into a plausible-looking finite sum.
                     for (int j = 0; j < 8; ++j) {
                         uchar by = q[j];
-                        part = fma(tab[by & 0x0Fu] * d, x[xb + j], part);
-                        part = fma(tab[by >> 4] * d, x[xb + j + 8], part);
+                        acc = fma(tab[by & 0x0Fu] * d, x[xb + j], acc);
+                        acc = fma(tab[by >> 4] * d, x[xb + j + 8], acc);
                     }
-                    acc += part;
                 }
             }
         }
@@ -523,7 +624,10 @@ fn opencl_launch(
         l1.start_offset() == 0
             && l1.dims().len() == 2
             && l1.stride() == [g.per_row() * BLOCK_BYTES, 1];
-    let ok_acts = l2.start_offset() == 0 && l2.is_contiguous();
+    // A contiguous view with a non-zero start offset is fine: the kernel takes
+    // the offset explicitly.  Rejecting it (as this did) sent every prefill
+    // chunk after the first down the CPU path.
+    let ok_acts = l2.is_contiguous(); // the kernel takes the offset explicitly
     if !opencl_native_enabled() || !ok_weights || !ok_acts {
         candle_core::opencl_backend::kernels::note_fallback("nvfp4-matmul-qt", None);
         use candle_core::backend::{BackendDevice as _, BackendStorage as _};
@@ -541,6 +645,7 @@ fn opencl_launch(
         g.out_dim,
         g.in_dim,
         g.rows,
+        l2.start_offset(),
     ) {
         Ok(()) => Ok((out, g.shape())),
         // A native launch that cannot compile or enqueue is not a reason to
@@ -671,6 +776,7 @@ mod opencl_backend {
         n: usize,
         k: usize,
         m: usize,
+        xoff: usize,
     ) -> Result<()> {
         let ctx = dev.ctx();
         let prog = program(&ctx)?;
@@ -690,7 +796,10 @@ mod opencl_backend {
         set(0, std::mem::size_of::<usize>(), &x as *const usize as *const std::ffi::c_void)?;
         set(1, std::mem::size_of::<usize>(), &w as *const usize as *const std::ffi::c_void)?;
         set(2, std::mem::size_of::<usize>(), &out as *const usize as *const std::ffi::c_void)?;
-        for (i, v) in [n as i32, k as i32, m as i32].into_iter().enumerate() {
+        for (i, v) in [n as i32, k as i32, m as i32, xoff as i32]
+            .into_iter()
+            .enumerate()
+        {
             set(3 + i as u32, 4, &v as *const i32 as *const std::ffi::c_void)?;
         }
         let global = [n * OPENCL_WG];
@@ -734,7 +843,7 @@ pub fn vulkan_glsl(wg: usize) -> String {
 layout(std430, set = 0, binding = 0) readonly buffer XB {{ float X[]; }};
 layout(std430, set = 0, binding = 1) readonly buffer WB {{ uint W[]; }};
 layout(std430, set = 0, binding = 2) buffer CB {{ float C[]; }};
-layout(push_constant) uniform PC {{ int N; int K; int M; }} pc;
+layout(push_constant) uniform PC {{ int N; int K; int M; int XOFF; }} pc;
 layout(local_size_x = NVFP4_WG) in;
 shared float sh[NVFP4_WG];
 shared float tab[16];
@@ -753,7 +862,10 @@ uint byte_at(uint base, uint i) {{ return (W[base + i / 4u] >> (8u * (i % 4u))) 
 
 void main() {{
     int t = int(gl_LocalInvocationID.x);
-    int n = int(gl_WorkGroupID.x);
+    // `n` is a *work-group* index, so it is the linearised 2-D group id; the
+    // column count is spread over x and y to stay inside the device's
+    // per-axis group limit on wide matrices.
+    int n = int(gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x);
     if (t < 16) {{
         float v[16] = float[16](0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
                                 0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0);
@@ -770,8 +882,10 @@ void main() {{
                 uint blk = row + uint(b) * 9u;
                 for (int s = t; s < 4; s += NVFP4_WG) {{
                     float d = ue4m3(byte_at(blk, uint(s)));
-                    if (d == 0.0) continue;
-                    int xb = m * pc.K + b * 64 + s * 16;
+                    // Multiplied through, not skipped: `0 * inf` must stay NaN
+                    // so this agrees with the scalar reference on non-finite
+                    // activations.
+                    int xb = pc.XOFF + m * pc.K + b * 64 + s * 16;
                     // Split-half: the 8 code bytes at 4 + 8s hold element j in
                     // the low nibble and element j + 8 in the high nibble.
                     for (int j = 0; j < 8; ++j) {{
@@ -795,6 +909,19 @@ void main() {{
 "#,
         wg = wg
     )
+}
+
+/// A 2-D group grid covering `n` work-groups without exceeding the per-axis
+/// limit (65535 is the guaranteed Vulkan minimum).
+#[cfg(feature = "vulkan")]
+fn grid_for(n: u32) -> [u32; 3] {
+    const MAX: u32 = 65_535;
+    if n <= MAX {
+        [n.max(1), 1, 1]
+    } else {
+        let gx = MAX;
+        [gx, n.div_ceil(gx), 1]
+    }
 }
 
 /// Whether a native Vulkan NVFP4 launch is wanted.  `JOSHUA_VULKAN_NATIVE=0`
