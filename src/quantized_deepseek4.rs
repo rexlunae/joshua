@@ -536,6 +536,9 @@ struct HostExpert {
     up: Arc<QTensor>,
     down: Arc<QTensor>,
     clamp: f64,
+    /// The SiLU precision policy, so a staged copy of this expert can apply
+    /// the same one (see [`Ds4StagedExpert::precise_cpu_silu`]).
+    precise_cpu_silu: bool,
     prefetch: Option<crate::residency::ExpertHandles>,
     bytes: u64,
 }
@@ -555,6 +558,13 @@ pub(crate) struct Ds4StagedExpert {
     up: QMatMul,
     down: QMatMul,
     clamp: f64,
+    /// The same SiLU precision policy the host expert carries
+    /// ([`HostExpert::precise_cpu_silu`]).  The staged path must apply it too:
+    /// hardcoding `false` made a staged expert's activation differ from the
+    /// host path's on the precision-sensitive SIMD/Vulkan devices, so the
+    /// logits were only *approximately* equal (it passed on one CPU and failed
+    /// on another).
+    precise_cpu_silu: bool,
     /// Bytes of the three staged weight buffers (what the slab charges).
     bytes: u64,
 }
@@ -872,6 +882,7 @@ fn collect_host_experts(layers: &[Layer]) -> Option<Vec<Vec<HostExpert>>> {
                 up,
                 down,
                 clamp: m.clamp,
+                precise_cpu_silu: m.precise_cpu_silu,
                 prefetch: m.prefetch.clone(),
                 bytes,
             });
@@ -1248,6 +1259,7 @@ fn stage_expert(
         up,
         down,
         clamp: source.clamp,
+        precise_cpu_silu: source.precise_cpu_silu,
         bytes: source.bytes,
     }))
 }
@@ -3097,7 +3109,7 @@ impl Moe {
             let mut y = vec![0f32; n_tokens * h];
             for (((e, _, _), gate), up) in sel.iter().zip(gates).zip(ups) {
                 let expert = by_expert[e];
-                let gg = (crate::precise::silu_with_policy(&gate, false)? * up)?;
+                let gg = (crate::precise::silu_with_policy(&gate, expert.precise_cpu_silu)? * up)?;
                 let out = expert.down.forward(&gg)?;
                 crate::moe::accumulate_cpu_expert(
                     &out, h, per_expert[*e].iter().copied(), &mut y
