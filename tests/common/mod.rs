@@ -3158,3 +3158,326 @@ pub fn write_tiny_raw_format_gguf(path: &Path, arch: &str, dtype: u32, decoded: 
     }
     write_raw_gguf(path, &metadata, &tensors);
 }
+
+/// A tiny `nemotron_h` GGUF — the hybrid Mamba-2 / Transformer-MoE shape of
+/// NVIDIA Nemotron 3.5, in miniature.
+///
+/// Five layers, one of each kind the loader has to dispatch on:
+/// `mamba`, `moe`, `mamba`, `attention`, `moe`.  The dimensions are the
+/// smallest that keep the real arithmetic meaningful: `d_state` 4, `d_conv` 4,
+/// `n_group` 2, 4 SSM heads of width 4, 4 routed experts with top-2.
+pub fn write_tiny_nemotron_h_gguf(path: &Path) {
+    write_nemotron_h_gguf(path, NemotronTiny::default())
+}
+
+/// Exactly which Nemotron-H fixture to write.  The defaults are the shipped
+/// tiny model; the knobs exist so tests can build the variants a real GGUF
+/// may use (scalar per-layer metadata, distinct per-group norm weights).
+#[derive(Clone, Copy, Debug)]
+pub struct NemotronTiny {
+    /// Write `attention.head_count_kv` / `feed_forward_length` as scalars
+    /// instead of per-layer arrays.  Only meaningful together with `uniform`:
+    /// scalars cannot express the hybrid layer pattern.
+    pub scalar_metadata: bool,
+    /// Write a uniform stack instead of the hybrid one, so the same model can
+    /// be emitted with either metadata encoding and compared.
+    pub uniform: bool,
+    /// The single layer kind of a uniform stack: `"moe"` or `"attention"`.
+    pub uniform_kind: &'static str,
+    /// `ssm_norm` value per group column: group `g` is weighted by
+    /// `group_norm_weight[g]`.  Distinct values prove the loader keeps every
+    /// group's own column instead of collapsing to column 0.
+    pub group_norm_weight: [f32; 2],
+}
+
+impl Default for NemotronTiny {
+    fn default() -> Self {
+        Self {
+            scalar_metadata: false,
+            uniform: false,
+            uniform_kind: "moe",
+            group_norm_weight: [1.0, 1.0],
+        }
+    }
+}
+
+pub fn write_nemotron_h_gguf(path: &Path, opts: NemotronTiny) {
+    const VOCAB: usize = 16;
+    const EMB: usize = 16;
+    const HEADS: usize = 2;
+    const HEAD_DIM: usize = 8;
+    const KV_HEADS: usize = 1;
+    const FFN: usize = 8;
+    const D_STATE: usize = 4;
+    const D_CONV: usize = 4;
+    const N_GROUP: usize = 2;
+    const SSM_HEAD: usize = 4;
+    const D_INNER: usize = 16; // SSM_HEAD * head_dim(4)
+    const N_EXPERT: usize = 4;
+    const N_USED: usize = 2;
+    const SHEXP: usize = 8;
+
+    let arch = "nemotron_h";
+    let key = |suffix: &str| format!("{arch}.{suffix}");
+    // Per-layer `head_count_kv` / `feed_forward_length`: 0 marks the sub-block
+    // a layer does *not* have (recurrent iff both are 0).
+    // With scalar metadata a file declares one layer shape for all layers, so
+    // the fixture must be uniform too: scalars cannot express the hybrid
+    // pattern.  `moe` is the case that also exercises the expert path.
+    // With scalar metadata a file declares one layer shape for all layers, so
+    // either encoding is written for a *uniform* stack; the hybrid pattern is
+    // array-only, since scalars cannot express it.  `uniform` lets a test write
+    // the same model both ways and compare.
+    let kinds: Vec<&str> = if opts.uniform {
+        vec![opts.uniform_kind; 5]
+    } else {
+        vec!["mamba", "moe", "mamba", "attention", "moe"]
+    };
+    let kv: Vec<gguf_file::Value> = kinds
+        .iter()
+        .map(|k| {
+            gguf_file::Value::U32(if *k == "attention" { KV_HEADS as u32 } else { 0 })
+        })
+        .collect();
+    let nff: Vec<gguf_file::Value> = kinds
+        .iter()
+        .map(|k| gguf_file::Value::U32(if *k == "moe" { FFN as u32 } else { 0 }))
+        .collect();
+
+    let mut metadata: Vec<(String, gguf_file::Value)> = vec![
+        (
+            "general.architecture".to_string(),
+            gguf_file::Value::String(arch.to_string()),
+        ),
+        (
+            key("attention.head_count"),
+            gguf_file::Value::U32(HEADS as u32),
+        ),
+        (
+            key("attention.head_count_kv"),
+            if opts.scalar_metadata {
+                // The single value a uniform file declares; must agree with the
+                // layer kind it actually writes.
+                gguf_file::Value::U32(if opts.uniform_kind == "attention" {
+                    KV_HEADS as u32
+                } else {
+                    0
+                })
+            } else {
+                gguf_file::Value::Array(kv)
+            },
+        ),
+        (
+            key("attention.key_length"),
+            gguf_file::Value::U32(HEAD_DIM as u32),
+        ),
+        (
+            key("feed_forward_length"),
+            if opts.scalar_metadata {
+                gguf_file::Value::U32(if opts.uniform_kind == "moe" { FFN as u32 } else { 0 })
+            } else {
+                gguf_file::Value::Array(nff)
+            },
+        ),
+        (key("block_count"), gguf_file::Value::U32(kinds.len() as u32)),
+        (key("embedding_length"), gguf_file::Value::U32(EMB as u32)),
+        (key("context_length"), gguf_file::Value::U32(512)),
+        (
+            key("attention.layer_norm_rms_epsilon"),
+            gguf_file::Value::F32(1e-5),
+        ),
+        (key("rope.freq_base"), gguf_file::Value::F32(10_000.0)),
+        (
+            key("rope.dimension_count"),
+            gguf_file::Value::U32(HEAD_DIM as u32),
+        ),
+        (key("ssm.conv_kernel"), gguf_file::Value::U32(D_CONV as u32)),
+        (key("ssm.inner_size"), gguf_file::Value::U32(D_INNER as u32)),
+        (key("ssm.state_size"), gguf_file::Value::U32(D_STATE as u32)),
+        (
+            key("ssm.time_step_rank"),
+            gguf_file::Value::U32(SSM_HEAD as u32),
+        ),
+        (key("ssm.group_count"), gguf_file::Value::U32(N_GROUP as u32)),
+        (key("expert_count"), gguf_file::Value::U32(N_EXPERT as u32)),
+        (key("expert_used_count"), gguf_file::Value::U32(N_USED as u32)),
+        (key("expert_weights_scale"), gguf_file::Value::F32(2.5)),
+        (
+            key("expert_weights_norm"),
+            gguf_file::Value::Bool(true),
+        ),
+        (
+            "tokenizer.ggml.eos_token_id".to_string(),
+            gguf_file::Value::U32(3),
+        ),
+        (
+            "tokenizer.ggml.bos_token_id".to_string(),
+            gguf_file::Value::U32(3),
+        ),
+        (
+            "tokenizer.ggml.unknown_token_id".to_string(),
+            gguf_file::Value::U32(0),
+        ),
+        (
+            "tokenizer.ggml.model".to_string(),
+            gguf_file::Value::String("llama".to_string()),
+        ),
+        (
+            "tokenizer.ggml.tokens".to_string(),
+            gguf_file::Value::Array(
+                [
+                    "<unk>", "hello", "world", "</s>", "a", "b", "c", "d", "e", "f", "g", "h", "i",
+                    "j", "k", "l",
+                ]
+                .iter()
+                .map(|s| gguf_file::Value::String(s.to_string()))
+                .collect(),
+            ),
+        ),
+        (
+            "tokenizer.ggml.token_type".to_string(),
+            gguf_file::Value::Array(
+                [2, 1, 1, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+                    .iter()
+                    .map(|&t| gguf_file::Value::I32(t))
+                    .collect(),
+            ),
+        ),
+    ];
+    metadata.extend(tiny_tokenizer_metadata());
+
+    // Deterministic small values: they quantise almost exactly in F32 blocks
+    // and keep the logits well separated across accumulation orders.
+    let w = |n: usize, seed: usize| {
+        (0..n)
+            .map(|i| ((((seed + 1) * 37 + i * 13) % 17) as i32 - 8) as f32 * 0.0625)
+            .collect::<Vec<f32>>()
+    };
+    let ones = |n: usize| vec![1.0f32; n];
+
+    let conv_dim = D_INNER + 2 * N_GROUP * D_STATE;
+    let d_in_proj = 2 * D_INNER + conv_dim + SSM_HEAD;
+    let head_dim = D_INNER / SSM_HEAD;
+
+    let mut tensors: Vec<(String, QTensor)> = vec![
+        (
+            "token_embd.weight".to_string(),
+            qtensor(w(VOCAB * EMB, 1), &[VOCAB, EMB]),
+        ),
+        (
+            "output_norm.weight".to_string(),
+            qtensor(ones(EMB), &[EMB]),
+        ),
+        (
+            "output.weight".to_string(),
+            qtensor(w(VOCAB * EMB, 4), &[VOCAB, EMB]),
+        ),
+    ];
+
+    for (i, kind) in kinds.iter().enumerate() {
+        let seed = 20 + i * 13;
+        tensors.push((
+            format!("blk.{i}.attn_norm.weight"),
+            qtensor(ones(EMB), &[EMB]),
+        ));
+        match *kind {
+            "mamba" => {
+                tensors.push((
+                    format!("blk.{i}.ssm_in.weight"),
+                    qtensor(w(d_in_proj * EMB, seed), &[d_in_proj, EMB]),
+                ));
+                tensors.push((
+                    format!("blk.{i}.ssm_conv1d.weight"),
+                    qtensor(w(D_CONV * conv_dim, seed + 1), &[D_CONV, conv_dim]),
+                ));
+                tensors.push((
+                    format!("blk.{i}.ssm_conv1d.bias"),
+                    qtensor(w(conv_dim, seed + 2), &[conv_dim]),
+                ));
+                tensors.push((
+                    format!("blk.{i}.ssm_dt.bias"),
+                    qtensor(w(SSM_HEAD, seed + 3), &[SSM_HEAD]),
+                ));
+                // ssm_a is the raw log rate; small negatives keep the decay
+                // finite and the recurrence non-degenerate.
+                tensors.push((
+                    format!("blk.{i}.ssm_a"),
+                    qtensor(vec![-0.5f32; SSM_HEAD], &[1, SSM_HEAD]),
+                ));
+                tensors.push((
+                    format!("blk.{i}.ssm_d"),
+                    qtensor(w(SSM_HEAD, seed + 5), &[1, SSM_HEAD]),
+                ));
+                // ssm_norm is [d_inner/n_group, n_group], normalised over dim 0.
+                // Column g holds group g's weights, so the fixture can give
+                // each group a different value.
+                let mut norm = Vec::with_capacity(D_INNER);
+                for row in 0..(D_INNER / N_GROUP) {
+                    let _ = row;
+                    for g in 0..N_GROUP {
+                        norm.push(opts.group_norm_weight[g]);
+                    }
+                }
+                tensors.push((
+                    format!("blk.{i}.ssm_norm.weight"),
+                    qtensor(norm, &[D_INNER / N_GROUP, N_GROUP]),
+                ));
+                tensors.push((
+                    format!("blk.{i}.ssm_out.weight"),
+                    qtensor(w(EMB * D_INNER, seed + 6), &[EMB, D_INNER]),
+                ));
+            }
+            "attention" => {
+                for (name, dims, s) in [
+                    ("attn_q", (HEADS * HEAD_DIM, EMB), seed),
+                    ("attn_k", (KV_HEADS * HEAD_DIM, EMB), seed + 1),
+                    ("attn_v", (KV_HEADS * HEAD_DIM, EMB), seed + 2),
+                    ("attn_output", (EMB, HEADS * HEAD_DIM), seed + 3),
+                ] {
+                    tensors.push((
+                        format!("blk.{i}.{name}.weight"),
+                        qtensor(w(dims.0 * dims.1, s), &[dims.0, dims.1]),
+                    ));
+                }
+            }
+            "moe" => {
+                tensors.push((
+                    format!("blk.{i}.ffn_gate_inp.weight"),
+                    qtensor(w(N_EXPERT * EMB, seed), &[N_EXPERT, EMB]),
+                ));
+                // Ungated experts, *stacked* in one tensor per projection —
+                // the loader slices each expert out of `[n_expert, out, in]`
+                // (llama.cpp `ffn_up_exps` / `ffn_down_exps`).
+                let mut up: Vec<f32> = Vec::with_capacity(N_EXPERT * FFN * EMB);
+                let mut down: Vec<f32> = Vec::with_capacity(N_EXPERT * EMB * FFN);
+                for e in 0..N_EXPERT {
+                    up.extend(w(FFN * EMB, seed + 10 + e));
+                    down.extend(w(EMB * FFN, seed + 20 + e));
+                }
+                tensors.push((
+                    format!("blk.{i}.ffn_up_exps.weight"),
+                    qtensor(up, &[N_EXPERT, FFN, EMB]),
+                ));
+                tensors.push((
+                    format!("blk.{i}.ffn_down_exps.weight"),
+                    qtensor(down, &[N_EXPERT, EMB, FFN]),
+                ));
+                tensors.push((
+                    format!("blk.{i}.ffn_up_shexp.weight"),
+                    qtensor(w(SHEXP * EMB, seed + 30), &[SHEXP, EMB]),
+                ));
+                tensors.push((
+                    format!("blk.{i}.ffn_down_shexp.weight"),
+                    qtensor(w(EMB * SHEXP, seed + 31), &[EMB, SHEXP]),
+                ));
+            }
+            other => panic!("unknown tiny nemotron-h layer kind {other}"),
+        }
+    }
+
+    let metadata_refs: Vec<(&str, &gguf_file::Value)> =
+        metadata.iter().map(|(k, v)| (k.as_str(), v)).collect();
+    let tensor_refs: Vec<(&str, &QTensor)> = tensors.iter().map(|(k, v)| (k.as_str(), v)).collect();
+    let mut file = File::create(path).unwrap();
+    gguf_file::write(&mut file, &metadata_refs, &tensor_refs).unwrap();
+}

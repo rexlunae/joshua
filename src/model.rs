@@ -90,6 +90,11 @@ pub enum Architecture {
     /// `qwen4exp` — Qwen3.8-Flash-Next (Qwen3.5-MoE plus hyper-connections,
     /// QSA block-sparse attention and PLE n-gram hash embeddings).
     Qwen4Exp,
+    /// `nemotron_h` / `nemotron_h_moe` — NVIDIA Nemotron 3.5 (Lightning
+    /// 30B-A3B, Super 120B-A12B): a hybrid **Mamba-2 + Transformer MoE**
+    /// whose layers are recurrent SSM, GQA or MoE blocks rather than a
+    /// uniform stack.  Loaded by [`crate::quantized_nemotron`].
+    NemotronH,
     /// `deepseek` — DeepSeek-MoE (GQA + fine-grained MoE with shared
     /// experts).  Loaded by the `deepseek2` loader into
     /// [`QuantizedModel::DeepSeek2`].
@@ -176,8 +181,6 @@ const KNOWN_UNSUPPORTED_ARCHS: &[&str] = &[
     "minicpm3",
     "minimax-m2",
     "mpt",
-    "nemotron",
-    "nemotron-h",
     "neo-bert",
     "nomic-bert",
     "nomic-bert-moe",
@@ -234,6 +237,8 @@ const NAMES: &[(&str, Architecture)] = &[
     ("qwen35", Architecture::Qwen35),
     ("qwen35moe", Architecture::Qwen35Moe),
     ("qwen4exp", Architecture::Qwen4Exp),
+    ("nemotron_h", Architecture::NemotronH),
+    ("nemotron_h_moe", Architecture::NemotronH),
     ("deepseek", Architecture::DeepSeek),
     ("deepseek2", Architecture::DeepSeek2),
     ("glm-dsa", Architecture::GlmDsa),
@@ -384,7 +389,8 @@ Self::Qwen
             | Self::DeepSeek2
             | Self::GlmDsa
             | Self::DeepSeek4
-            | Self::DeepSeek41 => return None,
+            | Self::DeepSeek41
+            | Self::NemotronH => return None,
         };
         Some(reason)
     }
@@ -442,6 +448,7 @@ Self::Qwen
             Self::Qwen3Moe => "Qwen3-MoE",
             Self::Qwen3Vl => "Qwen3-VL (text)",
             Self::Qwen3VlMoe => "Qwen3-VL-MoE (text)",
+            Self::NemotronH => "Nemotron-H (Nemotron 3.5 Super / Lightning)",
             Self::Qwen3Next => "Qwen3-Next",
             Self::Qwen35 => "Qwen3.5",
             Self::Qwen35Moe => "Qwen3.5-MoE",
@@ -486,12 +493,16 @@ pub enum QuantizedModel {
     Qwen(crate::quantized_qwen::ModelWeights),
     DeepSeek2(crate::quantized_deepseek2::ModelWeights),
     DeepSeek4(crate::quantized_deepseek4::ModelWeights),
+    /// Nemotron-H (`nemotron_h` / `nemotron_h_moe`): hybrid Mamba-2 /
+    /// Transformer MoE.
+    NemotronH(crate::quantized_nemotron::ModelWeights),
 }
 
 /// A session's state detached from its model (see [`QuantizedModel::snapshot`]).
 pub enum ModelSnapshot {
     Qwen(crate::native_session::SessionSnapshot<crate::quantized_qwen::Weights>),
     DeepSeek2(crate::native_session::SessionSnapshot<crate::quantized_deepseek2::Weights>),
+    NemotronH(crate::native_session::SessionSnapshot<crate::quantized_nemotron::Weights>),
 }
 
 impl ModelSnapshot {
@@ -500,6 +511,7 @@ impl ModelSnapshot {
         match self {
             Self::Qwen(s) => s.len(),
             Self::DeepSeek2(s) => s.len(),
+            Self::NemotronH(s) => s.len(),
         }
     }
 
@@ -513,6 +525,7 @@ impl ModelSnapshot {
         match self {
             Self::Qwen(s) => s.bytes(),
             Self::DeepSeek2(s) => s.bytes(),
+            Self::NemotronH(s) => s.bytes(),
         }
     }
 
@@ -521,6 +534,7 @@ impl ModelSnapshot {
         Ok(match self {
             Self::Qwen(s) => Self::Qwen(s.duplicate(device)?),
             Self::DeepSeek2(s) => Self::DeepSeek2(s.duplicate(device)?),
+            Self::NemotronH(s) => Self::NemotronH(s.duplicate(device)?),
         })
     }
 }
@@ -546,6 +560,11 @@ macro_rules! native {
                 let $wrap = QuantizedModel::DeepSeek4;
                 $body
             }
+            QuantizedModel::NemotronH($m) => {
+                #[allow(unused_variables)]
+                let $wrap = QuantizedModel::NemotronH;
+                $body
+            }
             _ => $other,
         }
     };
@@ -562,6 +581,7 @@ macro_rules! session {
         match $self {
             QuantizedModel::Qwen($m) => $body,
             QuantizedModel::DeepSeek2($m) => $body,
+            QuantizedModel::NemotronH($m) => $body,
             _ => $other,
         }
     };
@@ -763,6 +783,24 @@ impl QuantizedModel {
                     device_expert_cache_bytes,
                 )
                 .map(Self::Qwen)
+            }
+            Architecture::NemotronH => {
+                // The loader keeps the literal `general.architecture` string
+                // for error messages; it must outlive the load, so leak the
+                // one-per-process name (the set is bounded by the registry).
+                let name = Architecture::arch_name(&gguf.metadata)
+                    .and_then(|n| crate::quantized_nemotron::ARCHES.iter().find(|a| **a == n))
+                    .copied()
+                    .unwrap_or("nemotron_h");
+                crate::quantized_nemotron::Weights::load(
+                    gguf,
+                    raw,
+                    reader,
+                    device,
+                    mmap,
+                    name,
+                )
+                .map(|w| Self::NemotronH(crate::native_session::Session::from_weights(w)))
             }
             // One loader serves them all: DeepSeek-MoE differs from V2+ only
             // in its (GQA) attention, GLM-5 in its sparse one, GLM-5.3 in
@@ -1022,6 +1060,9 @@ impl QuantizedModel {
         Ok(match self {
             Self::Qwen(m) => m.snapshot(keep, len, device)?.map(ModelSnapshot::Qwen),
             Self::DeepSeek2(m) => m.snapshot(keep, len, device)?.map(ModelSnapshot::DeepSeek2),
+            Self::NemotronH(m) => {
+                m.snapshot(keep, len, device)?.map(ModelSnapshot::NemotronH)
+            }
             _ => None,
         })
     }
@@ -1044,6 +1085,7 @@ impl QuantizedModel {
         match (self, snap) {
             (Self::Qwen(m), ModelSnapshot::Qwen(s)) => m.restore(s),
             (Self::DeepSeek2(m), ModelSnapshot::DeepSeek2(s)) => m.restore(s),
+            (Self::NemotronH(m), ModelSnapshot::NemotronH(s)) => m.restore(s),
             _ => Ok(false),
         }
     }
@@ -1149,6 +1191,7 @@ impl QuantizedModel {
             Self::Qwen(m) => m.forward(input, index_pos),
             Self::DeepSeek2(m) => m.forward(input, index_pos),
             Self::DeepSeek4(m) => m.forward(input, index_pos),
+            Self::NemotronH(m) => m.forward(input, index_pos),
         }
     }
 
