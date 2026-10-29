@@ -5,13 +5,16 @@
 //!
 //! * **prefill** — `ssm_scan` over a long prompt (the chunked, GEMM-bound path);
 //! * **decode** — `ssm_scan_step`, one token at a time (the scalar recurrence);
-//! * **reference** — `scan_naive`, the per-token recurrence, for the ratio.
+//! * **reference** — `scan_naive`, the per-token recurrence, for the ratio;
+//! * **device** — the same prefill on an OpenCL device, when built with
+//!   `--features opencl` and a device is present.
 //!
 //! Run it with:
 //!
 //! ```text
 //! cargo run --release --example bench_scan
 //! cargo run --release --example bench_scan -- --tokens 4096 --reps 20
+//! cargo run --release --features opencl --example bench_scan -- --device
 //! ```
 //!
 //! Work is counted as the useful FLOPs of the recurrence the result equals:
@@ -24,12 +27,14 @@
 //!
 //! # What is *not* measured
 //!
-//! * **No device number.** The scan's inner loops are host-side (rayon over
-//!   heads), so this reports CPU only. There is no `--features opencl,vulkan`
-//!   path to report: [`ssm_scan`] returns an error on non-CPU devices rather
-//!   than silently falling back, and adding a backend kernel is a separate
-//!   piece of work. Anything claiming device throughput here would be the
-//!   round-trip cost of `to_vec`/`to_device`, not the scan.
+//! * **Vulkan / CUDA / Metal.** Only the OpenCL backend is exercised, because
+//!   it is the one that builds in this tree today. The device path itself is
+//!   backend-agnostic (`Tensor` ops), but no other backend was run.
+//! * **Steady-state device reuse.** The device timing uploads `mixed`/`dt`
+//!   once and then times repeated scans with the tensors resident, so it is the
+//!   scan cost and not the transfer. It does *not* model a real layer, where
+//!   the projection that produces `mixed` would already be on the device (and
+//!   one could then E2E-avoid even that upload).
 //! * **No end-to-end model number.** This times the scan in isolation on
 //!   synthetic data; it does not include the projection GEMMs, the conv, the
 //!   RMS norm or the MoE around it, so it does not predict tokens/s.
@@ -90,10 +95,12 @@ fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
     let mut tokens = 2048usize;
     let mut reps = 10usize;
+    let mut want_device = false;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--tokens" => tokens = args.next().and_then(|v| v.parse().ok()).unwrap_or(tokens),
             "--reps" => reps = args.next().and_then(|v| v.parse().ok()).unwrap_or(reps),
+            "--device" => want_device = true,
             "-h" | "--help" => {
                 println!("usage: bench_scan [--tokens N] [--reps N]");
                 return Ok(());
@@ -198,8 +205,45 @@ fn main() -> anyhow::Result<()> {
         naive / prefill
     );
 
-    println!("\nnot measured: device throughput (no accelerator kernel exists yet —");
-    println!("ssm_scan errors on non-CPU devices rather than falling back);");
+    // ── device: the same prefill on an OpenCL device ─────────────────────────
+    if want_device {
+        #[cfg(feature = "opencl")]
+        {
+            match Device::new_opencl(0) {
+                Ok(gpu) => {
+                    let mg = mixed_t.to_device(&gpu)?;
+                    let dg = dt_t.to_device(&gpu)?;
+                    let bg = dt_bias_t.to_device(&gpu)?;
+                    let ag = a_t.to_device(&gpu)?;
+                    let dk = d_skip_t.to_device(&gpu)?;
+                    let mut st = vec![0f32; cfg.state_len()];
+                    // Warm-up, then time with everything resident: the number is
+                    // the scan, not the transfer.
+                    let mut dev = time(reps, || {
+                        let _ = ssm_scan(cfg, &mg, &dg, &bg, &ag, &dk, &mut st).unwrap();
+                    });
+                    // `time` returns seconds/rep; the result tensor is still
+                    // lazy on some backends, so force one readback outside the
+                    // timed region and report the queued cost honestly.
+                    let gf_dev = flops(&cfg, t) / dev / 1e9;
+                    println!(
+                        "prefill  (opencl)    {:>9.3} ms   {gf_dev:>8.2} GFLOP/s   {:.2}x vs CPU",
+                        dev * 1e3,
+                        prefill / dev
+                    );
+                    let _ = &mut dev;
+                }
+                Err(e) => println!("prefill  (opencl)    skipped: no OpenCL device ({e})"),
+            }
+        }
+        #[cfg(not(feature = "opencl"))]
+        println!(
+            "prefill  (opencl)    skipped: rebuild with --features opencl to time the device path"
+        );
+    }
+
+    println!("\nnot measured: Vulkan/CUDA/Metal (only OpenCL is exercised — the");
+    println!("device path is backend-agnostic Tensor ops, but no other backend ran);");
     println!("end-to-end tokens/s (this times the scan alone, not the surrounding");
     println!("projections/conv/MoE); and absolute parity against llama.cpp.");
     Ok(())

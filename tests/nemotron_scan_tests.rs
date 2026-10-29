@@ -171,6 +171,36 @@ fn run_both(c: &ScanConfig, f: &Fixture) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f
     (y_chunked, st_chunked, y_naive, st_naive)
 }
 
+/// Scale-aware closeness for the device-vs-CPU comparisons.
+///
+/// Element-wise *relative* error is the wrong metric for the state: an entry
+/// that happens to be ~1e-8 in magnitude can differ by 100% of itself while the
+/// tensor as a whole agrees to f32 round-off, and keying on that either forces
+/// an absurdly loose tolerance or produces false alarms. Compare the max
+/// absolute deviation against the largest magnitude in the reference instead,
+/// which is what "same answer to f32 precision" means for a dense buffer.
+fn assert_close_scaled(name: &str, got: &[f32], want: &[f32], rel_of_scale: f32) {
+    assert_eq!(got.len(), want.len(), "{name}: length");
+    let scale = want.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-30);
+    let mut worst = 0f32;
+    let mut at = 0usize;
+    for (i, (&g, &w)) in got.iter().zip(want.iter()).enumerate() {
+        assert!(g.is_finite(), "{name}[{i}] is {g} (not finite); want {w}");
+        let d = (g - w).abs();
+        if d > worst {
+            worst = d;
+            at = i;
+        }
+    }
+    let rel = worst / scale;
+    assert!(
+        rel <= rel_of_scale,
+        "{name}: max|Δ| = {worst:e} on scale {scale:e} = {rel:e} > {rel_of_scale:e} (at [{at}]: got {}, want {})",
+        got[at],
+        want[at]
+    );
+}
+
 fn assert_close(name: &str, got: &[f32], want: &[f32], rel: f32, abs: f32) {
     assert_eq!(got.len(), want.len(), "{name}: length");
     let mut worst = 0f32;
@@ -542,6 +572,144 @@ fn state_advances_in_place() {
     assert_ne!(st_zero, st_a, "the carried state must matter");
 }
 
+/// Device parity at the **real Nemotron geometry**, where `head_dim` (128) and
+/// `d_state` (64) differ. This is the case that catches a readout matmul
+/// contracting the wrong axis: with equal widths the shapes happen to fit and
+/// the error is silent, whereas at 128 vs 64 the matmul cannot even run.
+#[cfg(feature = "opencl")]
+#[test]
+fn opencl_matches_cpu_nemotron_geometry() {
+    let dev = match Device::new_opencl(0) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("skipping opencl nemotron parity: no device ({e})");
+            return;
+        }
+    };
+    let c = nemotron();
+    assert_eq!(c.head_dim(), 128);
+    assert_eq!(c.d_state, 64);
+    // Multi-chunk lengths (2, 3 and 8 chunks) plus a ragged tail.
+    for &t in &[256usize, 384, 1024, 131] {
+        let f = fixture(&c, t, 0x0e0_0000 + t as u64);
+        let cpu = Device::Cpu;
+        let (row, n) = (c.conv_dim(), c.n_head);
+        let mixed = Tensor::from_vec(f.mixed.clone(), (t, row), &cpu).unwrap();
+        let dt = Tensor::from_vec(f.dt.clone(), (t, n), &cpu).unwrap();
+        let dt_bias = Tensor::from_vec(f.dt_bias.clone(), n, &cpu).unwrap();
+        let a = Tensor::from_vec(f.a.clone(), n, &cpu).unwrap();
+        let d_skip = Tensor::from_vec(f.d_skip.clone(), n, &cpu).unwrap();
+
+        let mut st_cpu = f.state0.clone();
+        let y_cpu = ssm_scan(c, &mixed, &dt, &dt_bias, &a, &d_skip, &mut st_cpu)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+
+        let mut st_dev = f.state0.clone();
+        let y_dev = ssm_scan(
+            c,
+            &mixed.to_device(&dev).unwrap(),
+            &dt.to_device(&dev).unwrap(),
+            &dt_bias.to_device(&dev).unwrap(),
+            &a.to_device(&dev).unwrap(),
+            &d_skip.to_device(&dev).unwrap(),
+            &mut st_dev,
+        )
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+
+        // Both the output *and* the carried state: a wrong chunk-end decay
+        // shows up in the state even when `y` still looks close.
+        assert_close_scaled(&format!("nemotron opencl T={t} y"), &y_dev, &y_cpu, 1e-4);
+        assert_close_scaled(
+            &format!("nemotron opencl T={t} state"),
+            &st_dev,
+            &st_cpu,
+            1e-4,
+        );
+    }
+}
+
+/// Strong decay over a long chunk: `dt·a = −1` on every row drives
+/// `cum[i] − cum[j]` far positive for `j > i`, so an unmasked `exp` overflows to
+/// `inf` and the triangular mask turns `inf * 0` into NaN. The result must be
+/// finite everywhere and still match the CPU path.
+#[cfg(feature = "opencl")]
+#[test]
+fn opencl_strong_decay_is_nan_free() {
+    let dev = match Device::new_opencl(0) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("skipping opencl strong-decay: no device ({e})");
+            return;
+        }
+    };
+    // A 128-row chunk (the full Nemotron chunk length) with `dt·a == −1` on
+    // every token, which is the worst case for the intra-chunk exponent.
+    let c = small();
+    let mut f = fixture(&c, 128, 0x5ea1_0000);
+    for v in f.a.iter_mut() {
+        *v = -1.0;
+    }
+    // Force `dt == 1` so `dt·a == −1` exactly, and zero the bias, making the
+    // cumsum a clean −i ramp. `softplus(x) = ln(1 + e^x) = 1` solves to
+    // `x = ln(e − 1) = 0.5413…`.
+    f.dt_bias.iter_mut().for_each(|v| *v = 0.0);
+    let one: f32 = (std::f32::consts::E - 1.0).ln();
+    debug_assert!((one.exp() + 1.0).ln() - 1.0 < 1e-6);
+    f.dt.iter_mut().for_each(|v| *v = one);
+
+    let cpu = Device::Cpu;
+    let (row, n) = (c.conv_dim(), c.n_head);
+    let mixed = Tensor::from_vec(f.mixed.clone(), (128, row), &cpu).unwrap();
+    let dt = Tensor::from_vec(f.dt.clone(), (128, n), &cpu).unwrap();
+    let dt_bias = Tensor::from_vec(f.dt_bias.clone(), n, &cpu).unwrap();
+    let a = Tensor::from_vec(f.a.clone(), n, &cpu).unwrap();
+    let d_skip = Tensor::from_vec(f.d_skip.clone(), n, &cpu).unwrap();
+
+    let mut st_dev = f.state0.clone();
+    let y_dev = ssm_scan(
+        c,
+        &mixed.to_device(&dev).unwrap(),
+        &dt.to_device(&dev).unwrap(),
+        &dt_bias.to_device(&dev).unwrap(),
+        &a.to_device(&dev).unwrap(),
+        &d_skip.to_device(&dev).unwrap(),
+        &mut st_dev,
+    )
+    .unwrap()
+    .flatten_all()
+    .unwrap()
+    .to_vec1::<f32>()
+    .unwrap();
+
+    let bad = y_dev.iter().filter(|v| !v.is_finite()).count();
+    assert_eq!(bad, 0, "{bad}/{} device outputs are NaN/inf", y_dev.len());
+    let bad_st = st_dev.iter().filter(|v| !v.is_finite()).count();
+    assert_eq!(bad_st, 0, "{bad_st} device state entries are NaN/inf");
+
+    let mut st_cpu = f.state0.clone();
+    let y_cpu = ssm_scan(c, &mixed, &dt, &dt_bias, &a, &d_skip, &mut st_cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+    assert_close_scaled("strong decay y (device vs cpu)", &y_dev, &y_cpu, 1e-4);
+    assert_close_scaled(
+        "strong decay state (device vs cpu)",
+        &st_dev,
+        &st_cpu,
+        1e-4,
+    );
+}
+
 // ─── f32 vs f64 conditioning ────────────────────────────────────────────────
 
 /// The recurrence evaluated in f64 — the "true" value, so a chunked-vs-naive
@@ -604,5 +772,61 @@ fn chunked_agrees_with_f64_recurrence() {
                 "Q={q} T={t}: |y32−y64|_inf / |y|_inf = {rel:e} (abs {worst:e}, scale {scale:e})"
             );
         }
+    }
+}
+
+// ─── device parity (OpenCL, when built with --features opencl) ──────────────
+
+/// The device path must reproduce the CPU path on real hardware: same
+/// association, same inclusive-cumsum decay, only backend rounding between
+/// them.  Compiled only with `--features opencl`; skipped otherwise so the
+/// default suite does not depend on a GPU being present.
+#[cfg(feature = "opencl")]
+#[test]
+fn opencl_matches_cpu() {
+    let dev = match Device::new_opencl(0) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("skipping opencl parity: no device ({e})");
+            return;
+        }
+    };
+    let c = small();
+    for &t in &[1usize, 128, 131, 512] {
+        let f = fixture(&c, t, 0x0c1_0000 + t as u64);
+        let row = c.conv_dim();
+        let cpu = Device::Cpu;
+        let mixed = Tensor::from_vec(f.mixed.clone(), (t, row), &cpu).unwrap();
+        let dt = Tensor::from_vec(f.dt.clone(), (t, c.n_head), &cpu).unwrap();
+        let dt_bias = Tensor::from_vec(f.dt_bias.clone(), c.n_head, &cpu).unwrap();
+        let a = Tensor::from_vec(f.a.clone(), c.n_head, &cpu).unwrap();
+        let d_skip = Tensor::from_vec(f.d_skip.clone(), c.n_head, &cpu).unwrap();
+
+        let mut st_cpu = f.state0.clone();
+        let y_cpu = ssm_scan(c, &mixed, &dt, &dt_bias, &a, &d_skip, &mut st_cpu)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+
+        let mut st_dev = f.state0.clone();
+        let y_dev = ssm_scan(
+            c,
+            &mixed.to_device(&dev).unwrap(),
+            &dt.to_device(&dev).unwrap(),
+            &dt_bias.to_device(&dev).unwrap(),
+            &a.to_device(&dev).unwrap(),
+            &d_skip.to_device(&dev).unwrap(),
+            &mut st_dev,
+        )
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+
+        assert_close_scaled(&format!("opencl T={t} y"), &y_dev, &y_cpu, 1e-4);
+        assert_close_scaled(&format!("opencl T={t} state"), &st_dev, &st_cpu, 1e-4);
     }
 }
