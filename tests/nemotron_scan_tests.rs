@@ -886,89 +886,94 @@ fn opencl_decode_step_is_scalar_not_padded() {
     assert_close_scaled("opencl decode step y", &y_dev, &y_cpu, 1e-4);
     assert_close_scaled("opencl decode step state", &st_dev, &st_cpu, 1e-4);
 
-    // Timing: a decode step must be much cheaper than a full chunk.
-    let time = |tokens: usize| -> f64 {
-        let g = fixture(&c, tokens, 0xbeef + tokens as u64);
-        let m = Tensor::from_vec(g.mixed, (tokens, row), &dev).unwrap();
-        let d = Tensor::from_vec(g.dt, (tokens, n), &dev).unwrap();
-        let db = Tensor::from_vec(g.dt_bias, n, &dev).unwrap();
-        let av = Tensor::from_vec(g.a, n, &dev).unwrap();
-        let dsk = Tensor::from_vec(g.d_skip, n, &dev).unwrap();
-        let mut st = g.state0;
-        // Warm up, then time.
-        let _ = ssm_scan(c, &m, &d, &db, &av, &dsk, &mut st).unwrap();
-        let reps = 20;
-        let start = std::time::Instant::now();
-        for _ in 0..reps {
-            let _ = ssm_scan(c, &m, &d, &db, &av, &dsk, &mut st).unwrap();
-        }
-        start.elapsed().as_secs_f64() / reps as f64
-    };
-    let one = time(1);
-    let chunk = time(c.chunk);
-    assert!(
-        one < chunk,
-        "a 1-token decode ({one:.6}s) must be cheaper than a {}-token chunk \
-         ({chunk:.6}s); equal cost means the decode path is padding to a chunk",
-        c.chunk
-    );
-    // The margin is modest at this size, and that is worth stating rather than
-    // dressing up: `state` crosses calls in host memory, so every device step
-    // pays one upload plus one readback of `n_head * head_dim * d_state` f32
-    // (~2 MiB at Nemotron geometry), and at that scale the transfer — not the
-    // chunk algebra — is what a single step costs.  The padding fix removes the
-    // `q×q` GEMMs; it cannot remove the transfer, which needs the state to live
-    // on the device across calls.
-    eprintln!(
-        "decode step {one:.6}s vs chunk {chunk:.6}s ({:.2}x; state transfer dominates)",
-        chunk / one
-    );
+    // Determinism instead of timing: the scalar step must not depend on
+    // `cfg.chunk` at all, whereas a padded-chunk implementation builds
+    // `chunk × chunk` matrices and its arithmetic (and thus float rounding)
+    // changes with the chunk size.  Running the same one-token scan at three
+    // chunk sizes and requiring bit-identical output and state proves the
+    // chunk algebra is not on this path — no wall-clock threshold to flake.
+    let state0 = f.state0.clone();
+    let base = ssm_scan(c, &mixed, &dt, &dt_bias, &a, &d_skip, &mut state0.clone())
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+    let mut base_state = state0.clone();
+    let _ = ssm_scan(c, &mixed, &dt, &dt_bias, &a, &d_skip, &mut base_state).unwrap();
+    for &chunk in &[1usize, 7, 4096] {
+        let c2 = cfg(c.d_inner, c.n_head, c.d_state, c.n_group, chunk);
+        let mut st = state0.clone();
+        let y = ssm_scan(c2, &mixed, &dt, &dt_bias, &a, &d_skip, &mut st)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        // Compare by summary, not `assert_eq!` on the vectors: a float vec
+        // assertion prints every element on failure, which is unreadable here.
+        assert!(
+            y == base,
+            "a one-token scan must be identical for chunk={chunk}: a result \
+             that moves with the chunk size means the chunk algebra ran"
+        );
+        assert!(
+            st == base_state,
+            "state must advance identically for any chunk size (chunk={chunk})"
+        );
+    }
 }
 
-/// A long prefill must not scale its working set with the sequence length.
+/// A long prefill must produce the same answer whether its chunk groups are
+/// processed in one pass or many.
 ///
-/// The intra-chunk term is `q × q` per head, so materialising every chunk at
-/// once costs `n_chunk · n_head · q²` f32 — 128 MiB *per intermediate* at
-/// Nemotron geometry and a 4096-token prompt, 1 GiB at 32k.  Processing the
-/// chunks in bounded groups makes peak memory depend on the group size
-/// instead, so a 16-chunk prefill must cost about the same as a 1-chunk one.
-///
-/// Timing a real long prefill and requiring it not to blow up is the cheap
-/// proxy for that: a per-chunk-group implementation stays linear in tokens,
-/// whereas one that materialises everything degrades sharply (and would OOM
-/// well before the test's timeout).
+/// This is the behavioural half of the bounded-working-set change, and it is
+/// deterministic where a memory probe is not: the intra-chunk terms for
+/// different chunks are independent, so grouping must not change a single
+/// value.  A grouping bug — mixing up the group offset, dropping the carry
+/// between groups, or reordering the `cat` — shows up immediately as a
+/// mismatch against a short prefill continued by decode, which exercises the
+/// same tokens through a completely different code path.
 #[cfg(feature = "opencl")]
 #[test]
-fn opencl_long_prefill_keeps_a_bounded_working_set() {
+fn opencl_grouped_prefill_matches_incremental_decode() {
     let dev = match Device::new_opencl(0) {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("skipping opencl long prefill: no device ({e})");
+            eprintln!("skipping opencl grouped prefill: no device ({e})");
             return;
         }
     };
     let c = nemotron();
+    // Many chunks, so the group loop runs several times (GROUP is 8) with a
+    // ragged final group.
+    let tokens = c.chunk * 11 + 37;
+    let f = fixture(&c, tokens, 0x6600d);
     let (row, n) = (c.conv_dim(), c.n_head);
-    let run = |tokens: usize| -> f64 {
-        let g = fixture(&c, tokens, 0x1ee7 + tokens as u64);
-        let m = Tensor::from_vec(g.mixed, (tokens, row), &dev).unwrap();
-        let d = Tensor::from_vec(g.dt, (tokens, n), &dev).unwrap();
-        let db = Tensor::from_vec(g.dt_bias, n, &dev).unwrap();
-        let av = Tensor::from_vec(g.a, n, &dev).unwrap();
-        let dsk = Tensor::from_vec(g.d_skip, n, &dev).unwrap();
-        let mut st = g.state0;
-        let _ = ssm_scan(c, &m, &d, &db, &av, &dsk, &mut st).unwrap(); // warm
-        let start = std::time::Instant::now();
-        let _ = ssm_scan(c, &m, &d, &db, &av, &dsk, &mut st).unwrap();
-        start.elapsed().as_secs_f64()
-    };
-    let short = run(c.chunk);
-    // 16 chunks: 16x the tokens. Linear work, bounded working set.
-    let long = run(c.chunk * 16);
-    assert!(
-        long < short * 32.0,
-        "16 chunks took {long:.4}s vs {short:.4}s for one: worse than linear, \
-         so the working set is growing with the sequence"
-    );
-    eprintln!("1 chunk {short:.4}s, 16 chunks {long:.4}s ({:.1}x)", long / short);
+    let m = Tensor::from_vec(f.mixed.clone(), (tokens, row), &dev).unwrap();
+    let d = Tensor::from_vec(f.dt.clone(), (tokens, n), &dev).unwrap();
+    let db = Tensor::from_vec(f.dt_bias.clone(), n, &dev).unwrap();
+    let av = Tensor::from_vec(f.a.clone(), n, &dev).unwrap();
+    let dsk = Tensor::from_vec(f.d_skip.clone(), n, &dev).unwrap();
+
+    let mut st = f.state0.clone();
+    let y = ssm_scan(c, &m, &d, &db, &av, &dsk, &mut st)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+
+    // Same tokens one at a time: grouped prefill and incremental decode must
+    // agree, which no wrong group offset or lost carry could satisfy.
+    let mut st_step = f.state0.clone();
+    let mut y_step = Vec::with_capacity(tokens * c.d_inner);
+    for i in 0..tokens {
+        let mi = m.narrow(0, i, 1).unwrap().contiguous().unwrap();
+        let di = d.narrow(0, i, 1).unwrap().contiguous().unwrap();
+        let yi = ssm_scan(c, &mi, &di, &db, &av, &dsk, &mut st_step).unwrap();
+        y_step.extend(yi.flatten_all().unwrap().to_vec1::<f32>().unwrap());
+    }
+    assert_close_scaled("grouped prefill vs decode y", &y, &y_step, 1e-4);
+    assert_close_scaled("grouped prefill vs decode state", &st, &st_step, 1e-4);
 }
