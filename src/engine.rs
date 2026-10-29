@@ -2950,6 +2950,26 @@ impl Engine {
             .map_err(|e| JoshuaError::Tokenization(e.to_string()))
     }
 
+    /// Detokenize `tokens` back to text — the inverse of
+    /// [`Engine::tokenize`], and what a vLLM / llama.cpp client expects from
+    /// `POST /v1/detokenize`.
+    ///
+    /// `skip_special_tokens` matches the convention of the same name on the
+    /// tokenizer: `true` drops BOS/EOS/padding, `false` keeps whatever the
+    /// ids decode to.  Ids outside the vocabulary are rejected by the
+    /// tokenizer rather than silently skipped, so a caller that passed the
+    /// wrong model gets an error instead of plausible-looking text.
+    pub fn detokenize(&self, tokens: &[u32], skip_special_tokens: bool) -> Result<String> {
+        self.tokenizer
+            .decode(tokens, skip_special_tokens)
+            .map_err(|e| JoshuaError::Tokenization(e.to_string()))
+    }
+
+    /// The vocabulary size, for the tokenizer endpoints that report it.
+    pub fn vocab_size(&self) -> usize {
+        self.tokenizer.get_vocab_size(true)
+    }
+
     /// Count the prompt tokens a chat request will use, without running the
     /// model.  Useful for API usage figures and admission checks; media
     /// messages count only their text portion.
