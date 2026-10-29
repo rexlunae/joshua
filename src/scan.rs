@@ -43,6 +43,16 @@
 //! difference is exact to the ulp of `cum` and is `≤ 0` for `j ≤ i`, so `L` is
 //! bounded by 1 and no chunk length can overflow it.
 //!
+//! # Scope
+//!
+//! This module is **CPU-only**.  The chunked form is derived so that a backend
+//! could execute it as a short sequence of batched GEMMs, and an experimental
+//! device path exists on a separate branch, but nothing here dispatches to a
+//! device: [`ssm_scan`] rejects a non-CPU tensor rather than copying it to the
+//! host, because that round trip is slower than simply running the scan on the
+//! CPU.  A device implementation is a tracked follow-up and needs a clean
+//! cold-build run on hardware before it can be trusted.
+//!
 //! # Execution
 //!
 //! Inputs stay borrowed: the prefill path never calls `.to_vec()` or
@@ -465,11 +475,19 @@ pub fn ssm_scan(
             dt.dtype()
         );
     }
-    // A device backend runs the same chunk algebra as queued `Tensor` ops
-    // (below); the CPU runs the hand-tiled host kernels. Both advance the
-    // caller's `state`, so the two are interchangeable across calls.
+    // CPU-only, deliberately. An accelerator implementation of this scan is a
+    // tracked follow-up: the chunked form is derived so a backend *can* run it
+    // as queued `Tensor` ops, but that path is not merged, and silently copying
+    // a device tensor to the host and back would be slower than having run the
+    // scan on the CPU in the first place — a pure loss on unified memory, and
+    // dominated by the transfer on discrete memory for a layer this small. So a
+    // non-CPU tensor is an explicit error, never a hidden round trip.
     if !dev.is_cpu() {
-        return scan_device(&cfg, mixed, dt, dt_bias, a, d_skip, state, t);
+        candle_core::bail!(
+            "ssm_scan: the scan is CPU-only; got a tensor on {dev:?}. A device \
+             implementation is tracked separately — this is a deliberate \
+             limitation, not a missing input check"
+        );
     }
 
     // Borrowed flattened views: no copy of `mixed`/`dt` beyond what the
@@ -537,197 +555,6 @@ pub fn ssm_scan_step(
 ) -> Result<Vec<f32>> {
     let out = ssm_scan(cfg, mixed_row, dt_row, dt_bias, a, d_skip, state)?;
     out.flatten_all()?.to_vec1::<f32>()
-}
-
-/// The scan as queued `Tensor` ops, so a backend runs it natively.
-///
-/// The whole sequence is expressed as batched GEMMs over
-/// `[n_chunk, n_head, q, ...]` tensors and only the final output is
-/// materialised, so the device sees one queued op graph instead of a
-/// host round trip per chunk.  `state` still crosses calls on the host: the
-/// entry state is uploaded once and the chunk-end state read back once.
-///
-/// The math is identical to the CPU path — both are the inclusive-cumsum
-/// associative form — and the tests assert device == CPU for the backends
-/// available in CI.
-#[allow(clippy::too_many_arguments)]
-fn scan_device(
-    cfg: &ScanConfig,
-    mixed: &Tensor,
-    dt: &Tensor,
-    dt_bias: &Tensor,
-    a: &Tensor,
-    d_skip: &Tensor,
-    state: &mut [f32],
-    t: usize,
-) -> Result<Tensor> {
-    let (n, hd, ds, ng) = (cfg.n_head, cfg.head_dim(), cfg.d_state, cfg.n_group);
-    let dev = mixed.device();
-    let q = cfg.chunk;
-    // Pad up to whole chunks so every chunk is the same shape and the batched
-    // GEMMs need no ragged handling. Padded rows are zeros with `dt = 0`, so
-    // `softplus(0 + bias) > 0` would still write them; instead they are masked
-    // out of `y` after the fact and `dt` is forced to a large negative value so
-    // their decay is 1 and their write contribution is ~0.
-    let t_pad = t.div_ceil(q) * q;
-    let n_chunk = t_pad / q;
-
-    // Split the fused row into x / B / C views, each `[t, ...]`.
-    let x = mixed.narrow(1, 0, cfg.d_inner)?;
-    let bm = mixed.narrow(1, cfg.d_inner, ng * ds)?;
-    let cm = mixed.narrow(1, cfg.d_inner + ng * ds, ng * ds)?;
-
-    // Broadcast each head's group's B/C up to per-head: `[t, n_head, ds]`.
-    // Group layout is `head_group()` consecutive heads per slot.
-    let gh = cfg.head_group();
-    let b_all = bm
-        .reshape((t, ng, 1, ds))?
-        .broadcast_as((t, ng, gh, ds))?
-        .reshape((t, n, ds))?;
-    let c_all = cm
-        .reshape((t, ng, 1, ds))?
-        .broadcast_as((t, ng, gh, ds))?
-        .reshape((t, n, ds))?;
-    let x_all = x.reshape((t, n, hd))?;
-
-    // ---- dt: softplus(dt + bias), then the per-token decay `dt·a` ----
-    // `dt` is `[t, n]` raw; `dt_bias`/`a` are `[n]`.
-    // The caller's per-head vectors are already resident on this device; using
-    // them directly avoids uploading fresh host copies on every prefill.
-    let dt_bias_v = dt_bias.flatten_all()?;
-    let a_v = a.flatten_all()?;
-    let dskip_v = d_skip.flatten_all()?;
-    let shifted = dt.broadcast_add(&dt_bias_v.reshape((1, n))?)?;
-    // ggml's threshold form: `x > 20 ? x : ln(1+exp(x))`.
-    let dt_sp = {
-        let hi = shifted.gt(20.0)?;
-        let lo = (shifted.exp()? + 1.0)?.log()?;
-        hi.where_cond(&shifted, &lo)?
-    };
-    let d_tok = dt_sp.broadcast_mul(&a_v.reshape((1, n))?)?; // [t, n]
-
-    // Pad to whole chunks on the token axis.
-    if t_pad != t {
-        let pad = t_pad - t;
-        let d_tok = d_tok.pad_with_zeros(0, 0, pad)?;
-        let xp = x_all.pad_with_zeros(0, 0, pad)?;
-        let bp = b_all.pad_with_zeros(0, 0, pad)?;
-        let cp = c_all.pad_with_zeros(0, 0, pad)?;
-        let dtp = dt_sp.pad_with_zeros(0, 0, pad)?;
-        return scan_device_chunks(
-            cfg, &d_tok, &xp, &bp, &cp, &dtp, dskip_v, state, t, t_pad, n_chunk, q,
-        );
-    }
-    scan_device_chunks(
-        cfg, &d_tok, &x_all, &b_all, &c_all, &dt_sp, dskip_v, state, t, t_pad, n_chunk, q,
-    )
-}
-
-/// Chunked body shared by the padded and unpadded device cases.
-#[allow(clippy::too_many_arguments)]
-fn scan_device_chunks(
-    cfg: &ScanConfig,
-    d_tok: &Tensor, // [t_pad, n_head]
-    x: &Tensor,     // [t_pad, n_head, head_dim]
-    bm: &Tensor,    // [t_pad, n_head, d_state]
-    cm: &Tensor,    // [t_pad, n_head, d_state]
-    dt_sp: &Tensor, // [t_pad, n_head] softplus'd
-    dskip_v: Tensor,
-    state: &mut [f32],
-    t: usize,
-    t_pad: usize,
-    n_chunk: usize,
-    q: usize,
-) -> Result<Tensor> {
-    let (n, hd, ds) = (cfg.n_head, cfg.head_dim(), cfg.d_state);
-    let dev = d_tok.device();
-
-    // [t_pad, n] -> [n_chunk, q, n] -> [n_chunk, n, q] so the chunk axis leads
-    // the batch and the head axis is the middle, matching `state`'s layout.
-    let to_chunks = |v: &Tensor, w: usize| -> Result<Tensor> {
-        v.reshape((n_chunk, q, n, w))?.transpose(1, 2)?.contiguous()
-    };
-    let d_c = to_chunks(d_tok, 1)?.squeeze(3)?; // [n_chunk, n, q]
-    let x_c = to_chunks(x, hd)?; // [n_chunk, n, q, hd]
-    let b_c = to_chunks(bm, ds)?; // [n_chunk, n, q, ds]
-    let c_c = to_chunks(cm, ds)?; // [n_chunk, n, q, ds]
-
-    // Inclusive cumsum of `d` along the chunk axis -> [n_chunk, n, q].
-    let cum = d_c.cumsum(2)?;
-
-    // L[i,j] = exp(cum[i] - cum[j]) · dt[j], zero above the diagonal.
-    // Built as a difference of prefixes, never a quotient: `cum[i]-cum[j] <= 0`
-    // so `L <= 1` and no chunk length can overflow it.
-    let ci = cum.unsqueeze(3)?; // [.., q, 1]
-    let cj = cum.unsqueeze(2)?; // [.., 1, q]
-    let dt_col = dt_sp
-        .reshape((n_chunk, q, n))?
-        .transpose(1, 2)?
-        .contiguous()?
-        .unsqueeze(2)?; // [n_chunk, n, 1, q]
-    let lmat = ((ci.broadcast_sub(&cj))?.exp()? * dt_col.broadcast_as((n_chunk, n, q, q))?)?;
-
-    // Strictly-lower-triangular mask (j <= i) as f32 via arange compare.
-    let idx = Tensor::arange(0u32, q as u32, dev)?;
-    let lower = idx.reshape((q, 1))?.broadcast_ge(&idx.reshape((1, q))?)?; // i >= j
-    let mask = lower
-        .to_dtype(DType::F32)?
-        .broadcast_as((n_chunk, n, q, q))?;
-    let lmat = lmat.mul(&mask)?;
-
-    // (C·Bᵀ) elementwise into L', then y_intra = L' @ x.
-    let cb = c_c.matmul(&b_c.transpose(2, 3)?.contiguous()?)?; // [n_chunk, n, q, q]
-    let m = lmat.mul(&cb)?;
-    let y_intra = m.matmul(&x_c)?; // [n_chunk, n, q, hd]
-
-    // Entry state per chunk: chunk k starts from the state carried out of k-1.
-    // `exp(cum_end)` is the per-chunk total decay.
-    let cum_end = cum.narrow(2, q - 1, 1)?; // [n_chunk, n, 1]
-    let decay_total = cum_end.exp()?;
-
-    // Scan the short carry over chunks in the cheapest way that stays on the
-    // device: the chunks are few (`t/q`), so a per-chunk loop of small ops is
-    // still a queued graph — nothing is read back until the end.
-    let state0 = Tensor::from_vec(state.to_vec(), (n, hd, ds), dev)?;
-    let mut s = state0;
-    let mut y_chunks: Vec<Tensor> = Vec::with_capacity(n_chunk);
-    for k in 0..n_chunk {
-        let dec = decay_total.narrow(0, k, 1)?.squeeze(0)?; // [n, 1]
-        let dec = dec.unsqueeze(2)?; // [n, 1, 1]
-                                     // y_inter = exp(cum) · (C·S), per token.
-        let ck = c_c.narrow(0, k, 1)?.squeeze(0)?; // [n, q, ds]
-        let cumk = cum.narrow(0, k, 1)?.squeeze(0)?.unsqueeze(2)?; // [n, q, 1]
-        let cs = ck.matmul(&s)?; // [n, q, ds] · [n, ds, hd] -> [n, q, hd]
-        let y_inter = cs.broadcast_mul(&cumk.exp()?)?;
-        let yk = (y_intra.narrow(0, k, 1)?.squeeze(0)? + y_inter)?;
-        y_chunks.push(yk);
-        // S ← exp(cum_end)·S + Σ_i dt_i·exp(cum_end−cum_i)·x_i ⊗ B_i
-        let xk = x_c.narrow(0, k, 1)?.squeeze(0)?; // [n, q, hd]
-        let bk = b_c.narrow(0, k, 1)?.squeeze(0)?; // [n, q, ds]
-        let dk = d_c.narrow(0, k, 1)?.squeeze(0)?; // [n, q]
-        let back = (cum_end.narrow(0, k, 1)?.squeeze(0)?.broadcast_sub(&dk)?).exp()?; // [n, q]
-        let w = (back * dk)?; // [n, q]
-        let xw = xk.broadcast_mul(&w.unsqueeze(2)?)?; // [n, q, hd]
-        let contrib = bk.transpose(1, 2)?.contiguous()?.matmul(&xw)?; // [n, ds, hd]
-        s = (s.broadcast_mul(&dec)? + contrib.transpose(1, 2)?.contiguous()?)?;
-    }
-    let _ = t;
-
-    // [n_chunk, n] of [q, hd] back to `[t_pad, n_head, head_dim]` -> [t, d_inner].
-    let y = Tensor::stack(&y_chunks, 0)?; // [n_chunk, n, q, hd]
-    let y = y.transpose(1, 2)?.contiguous()?.reshape((t_pad, n, hd))?;
-    // D·x epilogue.
-    let y = y.broadcast_add(&x.broadcast_mul(&dskip_v.reshape((1, n, 1))?)?)?;
-    let y = y
-        .reshape((t_pad, cfg.d_inner))?
-        .narrow(0, 0, t)?
-        .contiguous()?;
-
-    // One readback of the final state, and it goes back into the caller's
-    // buffer so the next call (decode) continues from it.
-    let s_host = s.flatten_all()?.to_vec1::<f32>()?;
-    state.copy_from_slice(&s_host);
-    Ok(y)
 }
 
 #[cfg(test)]
