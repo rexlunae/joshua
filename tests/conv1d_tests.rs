@@ -585,3 +585,65 @@ fn vulkan_group_math_covers_all_elements() {
         }
     }
 }
+
+/// A narrowed f16 input must read the elements the view exposes, not the
+/// start of the backing storage.
+///
+/// The half-precision fallback rebuilds a tensor over the storage, which only
+/// produces contiguous strides — so a view's `start_offset`/`stride` were
+/// discarded and the convolution consumed unrelated rows.  Comparing a
+/// narrowed view against the equivalent contiguous copy is what catches that.
+#[test]
+fn narrowed_half_views_read_the_right_elements() {
+    let n = 8usize;
+    // [n, 2n] f16, then the last n channels.
+    let (t, wide) = (3usize, 2 * n);
+    let data: Vec<f32> = (0..(t + 3) * wide).map(|i| i as f32 * 0.125).collect();
+    let full = Tensor::from_vec(data, ((t + 3), wide), &Device::Cpu)
+        .unwrap()
+        .to_dtype(DType::F16)
+        .unwrap();
+    // [rows, n] view of the high channels, and its contiguous twin.
+    let view = full.narrow(1, n, n).unwrap();
+    let twin = view.contiguous().unwrap();
+    assert_ne!(view.layout().start_offset(), 0, "the view really is offset");
+
+    let w = Tensor::from_vec(
+        (0..4 * n).map(|i| 0.1 + (i as f32) * 0.01).collect::<Vec<_>>(),
+        (4usize, n),
+        &Device::Cpu,
+    )
+    .unwrap();
+    let cfg = Conv1d::mamba2();
+    let bias = Tensor::from_vec(vec![0.05f32; n], (n,), &Device::Cpu).unwrap();
+    let got = conv1d(&view, &w, Some(&bias), cfg)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+    let want = conv1d(&twin, &w, Some(&bias), cfg)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+    assert_eq!(
+        worst_rel(&got, &want),
+        0.0,
+        "a narrowed f16 view must conv the same values as its contiguous copy"
+    );
+
+    // And it must not equal the naive "read from storage offset 0" answer.
+    let first = full.narrow(1, 0, n).unwrap();
+    let wrong = conv1d(&first, &w, Some(&bias), cfg)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+    assert!(
+        worst_rel(&got, &wrong) > 1e-3,
+        "the high-channel view must differ from the low-channel one"
+    );
+}

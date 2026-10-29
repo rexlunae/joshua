@@ -292,16 +292,48 @@ impl Conv1dOp {
                 }
                 x
             }
-            // f16 / bf16 / f64: widen through candle, which honours the
-            // layout on its own convert path.
+            // f16 / bf16: gather the elements this layout exposes, then widen.
+            //
+            // `Tensor::from_storage` can only build a contiguous tensor, so a
+            // narrowed or transposed input would be re-read from the start of
+            // the backing storage and the convolution would consume unrelated
+            // rows.  Walk the caller's `start_offset`/`stride` — the same way
+            // the f32 arm does — and convert each selected element.
             _ => {
-                let wide = Tensor::from_storage(
-                    Storage::Cpu(storage.clone()),
-                    Shape::from(layout.dims()),
-                    candle_core::op::BackpropOp::none(),
-                    false,
-                );
-                wide.contiguous()?.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?
+                let (rows, cols) = (layout.dims()[0], layout.dims()[1]);
+                let (s0, s1) = (layout.stride()[0], layout.stride()[1]);
+                let base = layout.start_offset();
+                let mut x = Vec::with_capacity(rows * cols);
+                match storage {
+                    CpuStorage::F16(data) => {
+                        for r in 0..rows {
+                            for c in 0..cols {
+                                x.push(data[base + r * s0 + c * s1].to_f32());
+                            }
+                        }
+                    }
+                    CpuStorage::BF16(data) => {
+                        for r in 0..rows {
+                            for c in 0..cols {
+                                x.push(data[base + r * s0 + c * s1].to_f32());
+                            }
+                        }
+                    }
+                    CpuStorage::F64(data) => {
+                        for r in 0..rows {
+                            for c in 0..cols {
+                                x.push(data[base + r * s0 + c * s1] as f32);
+                            }
+                        }
+                    }
+                    // `CpuStorage::dtype` is not reachable from here, but the
+                    // match arms that fall through are exactly the integer
+                    // and 4-bit storages, so name them instead of reading it.
+                    _ => candle_core::bail!(
+                        "conv1d: only f32/f16/bf16/f64 inputs are supported on the CPU path"
+                    ),
+                }
+                x
             }
         };
         self.reference_storage(&x, t, c)
