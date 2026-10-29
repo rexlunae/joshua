@@ -653,13 +653,19 @@ fn row_grid(rows: usize, z: usize, max_x: u32) -> [u32; 3] {
 
 impl VulkanDevice {
     /// Launch `key` (compiling it with `src` on first use) over `groups`.
-    pub(crate) fn launch(&self, key: &str, src: impl FnOnce(usize) -> String, bufs: &[Buf], push: Push, ix: &[Idx], groups: [u32; 3]) -> Result<()> {
+    ///
+    /// Public so an operator living outside this crate — Joshua's `conv1d`
+    /// and NVFP4 GEMV — can submit its own kernel through the backend's
+    /// pipeline cache and descriptor ring instead of taking a CPU round trip
+    /// or reimplementing the submission path.  Additive: nothing internal
+    /// changes, and no existing caller's behaviour is affected.
+    pub fn launch(&self, key: &str, src: impl FnOnce(usize) -> String, bufs: &[Buf], push: Push, ix: &[Idx], groups: [u32; 3]) -> Result<()> {
         self.launch_spirv(key, |wg| glsl_to_spirv(&src(wg)), bufs, push, ix, groups)
     }
 
     /// [`Self::launch`] for a kernel whose `src` yields SPIR-V directly
     /// (e.g. through [`wgsl_to_spirv`]).
-    pub(crate) fn launch_spirv(
+    pub fn launch_spirv(
         &self,
         key: &str,
         src: impl FnOnce(usize) -> Result<Vec<u32>>,

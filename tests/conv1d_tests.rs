@@ -347,8 +347,12 @@ fn decode_step_and_empty_tail() {
 /// The device path: parity on the whole matrix, and **zero** CPU round trips.
 #[test]
 fn device_matches_cpu_without_falling_back() {
-    let Some(dev) = opencl_device().or_else(vulkan_device) else {
-        eprintln!("conv1d: no OpenCL/Vulkan device, skipping the device test");
+    // OpenCL only.  The Vulkan dispatch is unverified here (see
+    // `vulkan_dispatch_is_native`): this host's RADV device cannot execute
+    // compute, so submitting 144 cases against it hangs rather than failing.
+    // A device that *can* run Vulkan is covered by the opt-in test.
+    let Some(dev) = opencl_device() else {
+        eprintln!("conv1d: no OpenCL device, skipping the device test");
         return;
     };
     let name = device_name(&dev);
@@ -645,5 +649,57 @@ fn narrowed_half_views_read_the_right_elements() {
     assert!(
         worst_rel(&got, &wrong) > 1e-3,
         "the high-channel view must differ from the low-channel one"
+    );
+}
+
+/// Vulkan's native conv1d dispatch is gated behind an explicit opt-in.
+///
+/// On this development host the Vulkan build links and the GLSL validates
+/// through naga (`vulkan_glsl_validates_through_naga`), but the RADV device
+/// cannot execute compute jobs — every dispatch prints
+/// `MESA: error: Unknown kernel mode driver` and never completes.  A test that
+/// submits work there hangs forever, so the dispatch test runs only when
+/// `JOSHUA_CONV1D_VULKAN=1` says the device really can run kernels.
+///
+/// Parities are therefore *unverified on hardware* for Vulkan; the CPU
+/// round-trip is the verified path.  Say so rather than implying coverage.
+#[cfg(feature = "vulkan")]
+#[test]
+fn vulkan_dispatch_is_native() {
+    if std::env::var_os("JOSHUA_CONV1D_VULKAN").is_none() {
+        eprintln!(
+            "conv1d: Vulkan dispatch not exercised (set JOSHUA_CONV1D_VULKAN=1 on a device \
+             that can run compute; RADV reports 'Unknown kernel mode driver' here)"
+        );
+        return;
+    }
+    let dev = match Device::new_vulkan(0) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("conv1d: no Vulkan device, skipping ({e})");
+            return;
+        }
+    };
+    use candle_core::vulkan_backend::kernels;
+    if !kernels::native_enabled() {
+        eprintln!("conv1d: Vulkan reports native kernels off; nothing to assert");
+        return;
+    }
+    let case = Case { t: 64, c: 256, d_conv: 4, silu: true, bias: true };
+    run_case(&dev, case, 0x7a11); // warm the pipeline
+
+    let _guard = counter_guard();
+    let (launch0, fb0) = (kernels::native_exec_count(), kernels::fallback_count());
+    let y = run_case(&dev, case, 0x7a11);
+    let (launch1, fb1) = (kernels::native_exec_count(), kernels::fallback_count());
+    assert!(y.is_some(), "the native path must report a launch count");
+    assert!(
+        launch1 > launch0,
+        "the Vulkan conv must submit a kernel (launches {launch0} -> {launch1})"
+    );
+    assert_eq!(
+        fb1, fb0,
+        "the Vulkan conv must not record a fallback ({} -> {})",
+        fb0, fb1
     );
 }

@@ -394,23 +394,81 @@ impl CustomOp1 for Conv1dOp {
         storage: &candle_core::VulkanStorage,
         layout: &Layout,
     ) -> Result<(candle_core::VulkanStorage, Shape)> {
-        // No native dispatch yet: `VulkanDevice::launch` is `pub(crate)` in
-        // the vendored backend.  Still count it, so `fallback_count()` and
-        // `fallback_counts_by_op()` tell a caller the truth.
-        use candle_core::backend::BackendStorage;
-        candle_core::vulkan_backend::kernels::note_fallback(
-            OP_NAME,
-            Some(&candle_core::Error::Msg(
-                "conv1d: no Vulkan launch entry point exported by the backend".into(),
-            )),
-        );
-        let cpu = storage.to_cpu_storage()?;
-        let (out, shape) = self.cpu_result(&cpu, layout)?;
-        Ok((
-            candle_core::backend::BackendDevice::storage_from_cpu_storage(&storage.device, &out)?,
-            shape,
-        ))
+        use candle_core::backend::{BackendDevice as _, BackendStorage as _};
+        use candle_core::vulkan_backend::kernels::{self, Buf, Idx, Push};
+        let shape = Shape::from(self.out_dims(layout)?);
+        let native = Conv1d::native_enabled()
+            && kernels::native_enabled()
+            && storage.dtype == DType::F32;
+        let args = if native {
+            self.native_args(layout).ok().flatten()
+        } else {
+            None
+        };
+        if let Some(a) = args {
+            if let (Some(w), w_ok) = (as_vulkan_buf(&self.w), true) {
+                let _ = w_ok;
+                let bias = match self.b.as_ref() {
+                    None => Some(None),
+                    Some(t) => as_vulkan_buf(t).map(Some),
+                };
+                if let Some(bias) = bias {
+                    let out = storage.device.alloc(DType::F32, a.t * a.c)?;
+                    // `b_on` decides whether the bias buffer is read, so a
+                    // missing bias can bind any live buffer.
+                    let b_bind = bias.unwrap_or(Buf {
+                        buffer: out.buffer,
+                        bytes: 4,
+                    });
+                    let rows = a.t + self.cfg.d_conv - 1;
+                    let bufs = [
+                        Buf {
+                            buffer: storage.buffer,
+                            bytes: (a.x_off + rows * a.c) as u64 * 4,
+                        },
+                        w,
+                        b_bind,
+                        Buf {
+                            buffer: out.buffer,
+                            bytes: (a.t * a.c) as u64 * 4,
+                        },
+                    ];
+                    let push = Push::default()
+                        .i(a.t as i32)
+                        .i(a.c as i32)
+                        .i(a.x_off as i32)
+                        .i(a.w_off as i32)
+                        .i(a.b_off.unwrap_or(0) as i32)
+                        .i(i32::from(bias.is_some()))
+                        .i(i32::from(self.cfg.silu));
+                    let wg = VULKAN_WG;
+                    let groups = vulkan_groups(a.t * a.c, wg, 65535);
+                    let ix = [Idx::unit(), Idx::unit()];
+                    match storage.device.launch(
+                        &format!("{OP_NAME}-v{}-{}", self.cfg.d_conv, u8::from(self.cfg.bias)),
+                        |_wg| vulkan_source(self.cfg.d_conv, wg),
+                        &bufs,
+                        push,
+                        &ix,
+                        groups,
+                    ) {
+                        Ok(()) => return Ok((out, shape)),
+                        // A device that rejects the shader must not fail the
+                        // call: the op has a correct CPU implementation.
+                        Err(e) => kernels::note_fallback(OP_NAME, Some(&e)),
+                    }
+                } else {
+                    kernels::note_fallback(OP_NAME, None);
+                }
+            } else {
+                kernels::note_fallback(OP_NAME, None);
+            }
+        } else {
+            kernels::note_fallback(OP_NAME, None);
+        }
+        self.vulkan_fallback(storage, layout, shape)
     }
+
 }
 
 #[cfg(feature = "opencl")]
@@ -465,6 +523,41 @@ impl Conv1dOp {
 /// stride.  The tap order matches [`Conv1d::reference`].
 /// The kernel symbol [`opencl_source`] defines.
 pub const CONV1D_KERNEL: &str = "k_conv1d";
+
+/// Work-group size for the Vulkan shader (one lane per output element).
+#[cfg(feature = "vulkan")]
+pub const VULKAN_WG: usize = 64;
+
+/// A tensor's Vulkan buffer, when it is one and its whole allocation is
+/// addressable from the shader.
+impl Conv1dOp {
+    /// The reference path shared by every "cannot go native" branch.
+    #[cfg(feature = "vulkan")]
+    fn vulkan_fallback(
+        &self,
+        storage: &candle_core::VulkanStorage,
+        layout: &Layout,
+        shape: Shape,
+    ) -> Result<(candle_core::VulkanStorage, Shape)> {
+        use candle_core::backend::{BackendDevice as _, BackendStorage as _};
+        let cpu = storage.to_cpu_storage()?;
+        let (out, _) = self.cpu_result(&cpu, layout)?;
+        Ok((storage.device.storage_from_cpu_storage(&out)?, shape))
+    }
+}
+
+#[cfg(feature = "vulkan")]
+fn as_vulkan_buf(t: &Tensor) -> Option<candle_core::vulkan_backend::kernels::Buf> {
+    use candle_core::Storage;
+    let (storage, _) = t.storage_and_layout();
+    match &*storage {
+        Storage::Vulkan(s) => Some(candle_core::vulkan_backend::kernels::Buf {
+            buffer: s.buffer,
+            bytes: s.capacity_bytes as u64,
+        }),
+        _ => None,
+    }
+}
 
 const TAP_LADDER: &str = r#"#if D_CONV == 1
         sum += X[0] * W[0];
