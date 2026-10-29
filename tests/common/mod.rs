@@ -3208,6 +3208,9 @@ pub struct NemotronTiny {
     pub mtp_block: bool,
     /// Write `exp_probs_b.bias`, the router's per-expert selection bias.
     pub gate_bias: bool,
+    /// Declare `rope.dimension_count` below `head_dim`, as the released model
+    /// does (`partial_rotary_factor`).
+    pub partial_rotary: bool,
 }
 
 impl Default for NemotronTiny {
@@ -3219,6 +3222,7 @@ impl Default for NemotronTiny {
             group_norm_weight: [1.0, 1.0],
             mtp_block: false,
             gate_bias: false,
+            partial_rotary: false,
         }
     }
 }
@@ -3325,7 +3329,13 @@ pub fn write_nemotron_h_gguf(path: &Path, opts: NemotronTiny) {
         (key("rope.freq_base"), gguf_file::Value::F32(10_000.0)),
         (
             key("rope.dimension_count"),
-            gguf_file::Value::U32(HEAD_DIM as u32),
+            // The released checkpoint uses *partial* rotary (84 of 128 dims,
+            // `partial_rotary_factor`), so the fixture can declare it too.
+            gguf_file::Value::U32(if opts.partial_rotary {
+                (HEAD_DIM / 2) as u32
+            } else {
+                HEAD_DIM as u32
+            }),
         ),
         (key("ssm.conv_kernel"), gguf_file::Value::U32(D_CONV as u32)),
         (key("ssm.inner_size"), gguf_file::Value::U32(D_INNER as u32)),
@@ -3601,4 +3611,34 @@ pub fn write_nemotron_h_gguf(path: &Path, opts: NemotronTiny) {
     let tensor_refs: Vec<(&str, &QTensor)> = tensors.iter().map(|(k, v)| (k.as_str(), v)).collect();
     let mut file = File::create(path).unwrap();
     gguf_file::write(&mut file, &metadata_refs, &tensor_refs).unwrap();
+}
+
+/// Load a GGUF **by mapping it**, without reading it into a `Vec`.
+///
+/// [`load_model`] slurps the file, which is fine for the tiny fixtures and
+/// impossible for a real checkpoint.  This negotiates the header through a
+/// `File` and hands the mapping to the loader, so a multi-gigabyte model costs
+/// page cache rather than anonymous memory.
+pub fn load_model_mapped(path: &Path) -> joshua::model::QuantizedModel {
+    let file = File::open(path).unwrap();
+    let mmap = std::sync::Arc::new(unsafe { memmap2::Mmap::map(&file) }.unwrap());
+    // The header parse borrows the mapping, so it is scoped: the cursor must be
+    // gone before the `Arc<Mmap>` is handed to the loader.
+    let content = {
+        let mut cur = std::io::Cursor::new(&mmap[..]);
+        joshua::gguf_ext::read_header(&mut cur)
+            .unwrap()
+            .to_candle_content()
+            .unwrap()
+    };
+    let mut cur = std::io::Cursor::new(&mmap[..]);
+    joshua::model::QuantizedModel::from_gguf_mmap(
+        content,
+        &mut cur,
+        &Device::Cpu,
+        Some(std::sync::Arc::clone(&mmap)),
+        None,
+        0,
+    )
+    .unwrap()
 }

@@ -609,3 +609,97 @@ fn the_mtp_block_reads_its_own_selection_bias() {
         "a bias on the draft block's own router must change the draft: {da:?} vs {db:?}"
     );
 }
+
+/// End-to-end validation against a **real** Nemotron 3.5 Lightning checkpoint.
+///
+/// Everything else in this file runs on synthetic fixtures in the declared
+/// GGUF layout.  This is the only test that loads actual published weights,
+/// which is the check that catches a loader that resolves every tensor and
+/// still produces nonsense.
+///
+/// Skipped unless `JOSHUA_NEMOTRON_GGUF` names a real file, because the
+/// checkpoint is 9.5 GB and not something CI can fetch.
+#[test]
+fn a_real_nemotron_checkpoint_loads_and_generates() {
+    let Ok(path) = std::env::var("JOSHUA_NEMOTRON_GGUF") else {
+        eprintln!("skipping: set JOSHUA_NEMOTRON_GGUF to a real nemotron_h GGUF");
+        return;
+    };
+    let path = std::path::Path::new(&path);
+    assert!(path.exists(), "JOSHUA_NEMOTRON_GGUF does not exist: {path:?}");
+
+    let mut m = common::load_model_mapped(path);
+    eprintln!("loaded {path:?}");
+
+    // A prompt the tokenizer-independent path can still exercise: raw ids.
+    // Ids 1/2 are BOS/EOS in this vocabulary, so this stays in range.
+    let prompt = [1u32, 100, 200, 300, 400];
+    let logits = common::logits(&mut m, &prompt, 0);
+    eprintln!("vocab {}", logits.len());
+    assert!(
+        logits.iter().all(|v| v.is_finite()),
+        "a real checkpoint must produce finite logits, got {} non-finite",
+        logits.iter().filter(|v| !v.is_finite()).count()
+    );
+
+    // Non-degenerate: a real 30B model has a peaked distribution, not a flat
+    // one.  A loader that mis-splices the projection would give a flat spread.
+    let hi = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let lo = logits.iter().cloned().fold(f32::INFINITY, f32::min);
+    eprintln!("logit range {lo:.3}..{hi:.3}");
+    assert!(
+        hi - lo > 1e-2,
+        "a real model's logits should not be flat (range {:.6})",
+        hi - lo
+    );
+
+    // And a second forward must advance the recurrent state rather than
+    // repeating: the Mamba scan's state has to carry across calls.
+    let next = common::logits(&mut m, &[500], prompt.len());
+    assert!(next.iter().all(|v| v.is_finite()), "decode step stays finite");
+    assert!(
+        next.iter().zip(&logits).any(|(a, b)| (a - b).abs() > 1e-6),
+        "the decode step must see a different context than the prefill"
+    );
+}
+
+/// Partial rotary must work: the released Nemotron 3.5 declares
+/// `rope.dimension_count` 84 against `head_dim` 128, so only the leading 84
+/// dims rotate.
+///
+/// Every fixture used full-width rotary, so the loader's `apply_pair` — which
+/// assumes the rope table covers the whole head — passed all of them and then
+/// failed on the real checkpoint with
+/// `inconsistent last dim size in rope [1, 32, 5, 128] [5, 42]`.  This fixture
+/// declares partial rotary so CI catches a regression without needing the
+/// 9.5 GB file.
+#[test]
+fn partial_rotary_matches_full_width_handling() {
+    let dir = common::model_dir("nemotron-partial-rotary");
+    let full = dir.join("full.gguf");
+    let partial = dir.join("partial.gguf");
+    common::write_tiny_nemotron_h_gguf(&full);
+    common::write_nemotron_h_gguf(
+        &partial,
+        common::NemotronTiny {
+            partial_rotary: true,
+            ..Default::default()
+        },
+    );
+
+    // Loading and forwarding must work.  The two models differ (rotation covers
+    // fewer dims), so the logits are not compared — the point is that the
+    // partial case does not *fail*.
+    let mut p = common::load_model(&partial, true);
+    let lp = common::logits(&mut p, &[1, 4, 2], 0);
+    assert!(
+        lp.iter().all(|v| v.is_finite()),
+        "partial rotary must produce finite logits: {lp:?}"
+    );
+    let mut f = common::load_model(&full, true);
+    let lf = common::logits(&mut f, &[1, 4, 2], 0);
+    assert!(
+        lp.iter().zip(&lf).any(|(a, b)| (a - b).abs() > 1e-6),
+        "rotating fewer dims must change the result, or the flag was ignored"
+    );
+}

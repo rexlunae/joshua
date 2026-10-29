@@ -756,7 +756,12 @@ impl AttentionBlock {
             .forward(xs)?
             .reshape((b, t, nkv, hd))?
             .transpose(1, 2)?;
-        let (q, k) = self.rope.apply_pair(&q, &k, offset)?;
+        // The released Nemotron 3.5 RoPE is **partial**: the GGUF declares
+        // `rope.dimension_count` 84 against `head_dim` 128, so only the leading
+        // 84 dims rotate (`partial_rotary_factor`).  `apply_pair` assumes the
+        // full width and rejects the mismatch; `apply_leading` rotates the first
+        // `n_rot` and passes the rest through.
+        let (q, k) = (self.rope.apply_leading(&q, offset)?, self.rope.apply_leading(&k, offset)?);
         let ctx = crate::attention::cached_attention(kv, &q, k, v, mask, self.scale)?;
         self.o.forward(&ctx.reshape((b, t, nh * hd))?)
     }
@@ -789,6 +794,60 @@ fn relu2(x: &Tensor) -> Result<Tensor> {
 /// streamed-load fallback `QuantizedModel::from_gguf` needs (it passes no
 /// mapping), and it copies each expert onto the device rather than expanding
 /// the whole tensor.
+/// Each expert of a stacked `[n_expert, out, in]` tensor.
+///
+/// Three cases, in order:
+///
+/// 1. **A raw block format candle cannot name** (Q2_0, Q1_0, IQ2_XXS, MXFP4,
+///    NVFP4, …): borrowed per expert from the mapping and decoded at matmul
+///    time.  This is not optional — a real Nemotron 3.5 conversion uses Q2_0
+///    for its routed experts, and refusing it would make the model unloadable.
+/// 2. **A candle-typed tensor with a mapping**: borrowed in place, so the pool
+///    keeps its on-disk footprint.
+/// 3. **A streamed load**: read and split onto `split_device`.
+fn expert_parts_raw<R: Read + Seek>(
+    src: &mut TensorSource<R>,
+    name: &str,
+    n_expert: usize,
+    split_device: &Device,
+    candle: &impl Fn(QTensor) -> Result<Weight>,
+) -> Result<Option<(Vec<Weight>, Device)>> {
+    let Some(info) = src
+        .raw_dtype(name)
+        .and_then(|_| src.raw.as_ref()?.tensors.get(name).cloned())
+    else {
+        return Ok(None);
+    };
+    let raw = src.raw.as_ref().expect("raw_dtype implies a raw header");
+    let map = |b: crate::moe::BorrowedExpert| -> Result<Weight> { candle(b.tensor) };
+    let split = crate::with_raw_block!(info.dtype, B => {
+        crate::moe::split_raw_experts::<B, R>(
+            src.arch,
+            raw,
+            &mut src.reader,
+            src.mmap.as_ref(),
+            split_device,
+            name,
+            &info,
+            n_expert,
+        )
+    });
+    match split {
+        Some(experts) => {
+            let parts = experts?.into_iter().map(map).collect::<Result<Vec<_>>>()?;
+            // Raw blocks are borrowed from the mapping when one exists, and
+            // decoded on the split device otherwise.
+            let dev = if src.mmap.is_some() { Device::Cpu } else { split_device.clone() };
+            Ok(Some((parts, dev)))
+        }
+        None => candle_core::bail!(
+            "{}: routed-expert tensor `{name}` has GGUF dtype {}, which has no decoder here",
+            src.arch,
+            info.dtype
+        ),
+    }
+}
+
 fn expert_parts<R: Read + Seek>(
     src: &mut TensorSource<R>,
     et: &crate::moe::ExpertTensor,
@@ -868,8 +927,13 @@ impl MoeBlock {
             Some(b) => Some(crate::moe::center_selection_bias(&b)?),
             None => None,
         };
-        let up = src.expert_tensor(&format!("{p}.ffn_up_exps.weight"), cfg.n_expert)?;
-        let down = src.expert_tensor(&format!("{p}.ffn_down_exps.weight"), cfg.n_expert)?;
+        // A real conversion may store the routed experts in a raw block format
+        // (Q2_0 in the published Lightning GGUF), so the stacked-tensor lookup
+        // is only needed for the candle-typed path; `expert_parts` handles the
+        // raw case itself.  A placeholder keeps the borrow simple.
+        let up_name = format!("{p}.ffn_up_exps.weight");
+        let down_name = format!("{p}.ffn_down_exps.weight");
+
         let candle = |qt: QTensor| -> Result<Weight> { Ok(Weight::Quant(QMatMul::from_qtensor(qt)?)) };
         // Borrow each expert's slice of the mapping when there is one, exactly
         // as `quantized_qwen::split_experts` prefers: an expert then costs a
@@ -878,21 +942,25 @@ impl MoeBlock {
         // (a streamed load, see `QuantizedModel::from_gguf`) read and split the
         // stacked tensor instead — refusing here would make the public
         // no-mmap loader unusable for every Nemotron MoE model.
+        // `expert_parts` needs the `ExpertTensor` descriptor only for the
+        // candle-typed path; a raw-format stack (Q2_0 in the published
+        // Lightning GGUF) takes the borrowed-block path and never uses it, so a
+        // failed lookup is passed through and only reported if it is needed.
         let split_device = expert_device;
-        let (ups, up_dev) = expert_parts(
-            src,
-            &up,
-            &format!("{p}.ffn_up_exps.weight"),
-            split_device,
-            &candle,
-        )?;
-        let (downs, down_dev) = expert_parts(
-            src,
-            &down,
-            &format!("{p}.ffn_down_exps.weight"),
-            split_device,
-            &candle,
-        )?;
+        let (ups, up_dev) = match expert_parts_raw(src, &up_name, cfg.n_expert, split_device, &candle)? {
+            Some(parts) => parts,
+            None => {
+                let et = src.expert_tensor(&up_name, cfg.n_expert)?;
+                expert_parts(src, &et, &up_name, split_device, &candle)?
+            }
+        };
+        let (downs, down_dev) = match expert_parts_raw(src, &down_name, cfg.n_expert, split_device, &candle)? {
+            Some(parts) => parts,
+            None => {
+                let et = src.expert_tensor(&down_name, cfg.n_expert)?;
+                expert_parts(src, &et, &down_name, split_device, &candle)?
+            }
+        };
         // Both halves of an expert must live together, or neither the gate/up
         // nor the down matmul could run.
         if !up_dev.same_device(&down_dev) {
