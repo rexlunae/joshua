@@ -446,7 +446,6 @@ impl CustomOp2 for Nvfp4Matmul {
             && l1.start_offset() == 0
             && l1.dims().len() == 2
             && l1.stride() == [g.per_row() * BLOCK_BYTES, 1]
-            && l2.start_offset() == 0
             && l2.is_contiguous();
         if native {
             let out = s1.device.alloc(DType::F32, g.out_len())?;
@@ -471,7 +470,8 @@ impl CustomOp2 for Nvfp4Matmul {
             let push = Push::default()
                 .i(g.out_dim as i32)
                 .i(g.in_dim as i32)
-                .i(g.rows as i32);
+                .i(g.rows as i32)
+                .i(l2.start_offset() as i32);
             let ix = [Idx::unit(), Idx::unit()];
             match s1.device.launch(
                 "nvfp4-gemv",
@@ -483,8 +483,10 @@ impl CustomOp2 for Nvfp4Matmul {
                 // single column across the group's `VULKAN_WG` lanes
                 // (`n = gl_WorkGroupID.x`, `t = gl_LocalInvocationID.x`), so
                 // dividing by the group size here would leave most columns
-                // unwritten.
-                [g.out_dim as u32, 1, 1],
+                // unwritten.  The column count is spread over x and y so a wide
+                // matrix stays inside `maxComputeWorkGroupCount` (commonly
+                // 65535 per axis).
+                grid_for(g.out_dim as u32),
             ) {
                 Ok(()) => return Ok((out, g.shape())),
                 // A driver that rejects the shader must not fail inference.
@@ -548,7 +550,7 @@ inline float nv_ue4m3(uint x) {
 // element j + 8 in its HIGH nibble.
 __kernel __attribute__((reqd_work_group_size(__WG__, 1, 1)))
 void k_nvfp4_gemv(__global const float* X, __global const uchar* W,
-                  __global float* C, int N, int K, int M) {
+                  __global float* C, int N, int K, int M, int XOFF) {
     __local float tab[16];
     __local float sh[__WG__];
     const int t = (int)get_local_id(0);
@@ -568,21 +570,22 @@ void k_nvfp4_gemv(__global const float* X, __global const uchar* W,
         float acc = 0.0f;
         if (n < N) {
             __global const uchar* row = W + (ulong)n * (ulong)nb * 36ul;
-            __global const float* x = X + (long)m * K;
+            __global const float* x = X + XOFF + (long)m * K;
             for (int b = 0; b < nb; ++b) {
                 __global const uchar* blk = row + (ulong)b * 36ul;
                 for (int s = t; s < 4; s += __WG__) {
                     float d = nv_ue4m3((uint)blk[s]);
-                    if (d == 0.0f) continue;   // scale 0x00 or the 0x7F NaN
                     __global const uchar* q = blk + 4 + 8 * s;
                     const int xb = b * 64 + s * 16;
-                    float part = 0.0f;
+                    // A zero scale is *multiplied through*, not skipped: the
+                    // reference decodes it to 0 and still multiplies, so
+                    // `0 * inf` / `0 * NaN` must stay NaN rather than being
+                    // dropped into a plausible-looking finite sum.
                     for (int j = 0; j < 8; ++j) {
                         uchar by = q[j];
-                        part = fma(tab[by & 0x0Fu] * d, x[xb + j], part);
-                        part = fma(tab[by >> 4] * d, x[xb + j + 8], part);
+                        acc = fma(tab[by & 0x0Fu] * d, x[xb + j], acc);
+                        acc = fma(tab[by >> 4] * d, x[xb + j + 8], acc);
                     }
-                    acc += part;
                 }
             }
         }
@@ -621,7 +624,10 @@ fn opencl_launch(
         l1.start_offset() == 0
             && l1.dims().len() == 2
             && l1.stride() == [g.per_row() * BLOCK_BYTES, 1];
-    let ok_acts = l2.start_offset() == 0 && l2.is_contiguous();
+    // A contiguous view with a non-zero start offset is fine: the kernel takes
+    // the offset explicitly.  Rejecting it (as this did) sent every prefill
+    // chunk after the first down the CPU path.
+    let ok_acts = l2.is_contiguous(); // the kernel takes the offset explicitly
     if !opencl_native_enabled() || !ok_weights || !ok_acts {
         candle_core::opencl_backend::kernels::note_fallback("nvfp4-matmul-qt", None);
         use candle_core::backend::{BackendDevice as _, BackendStorage as _};
@@ -639,6 +645,7 @@ fn opencl_launch(
         g.out_dim,
         g.in_dim,
         g.rows,
+        l2.start_offset(),
     ) {
         Ok(()) => Ok((out, g.shape())),
         // A native launch that cannot compile or enqueue is not a reason to
@@ -769,6 +776,7 @@ mod opencl_backend {
         n: usize,
         k: usize,
         m: usize,
+        xoff: usize,
     ) -> Result<()> {
         let ctx = dev.ctx();
         let prog = program(&ctx)?;
@@ -788,7 +796,10 @@ mod opencl_backend {
         set(0, std::mem::size_of::<usize>(), &x as *const usize as *const std::ffi::c_void)?;
         set(1, std::mem::size_of::<usize>(), &w as *const usize as *const std::ffi::c_void)?;
         set(2, std::mem::size_of::<usize>(), &out as *const usize as *const std::ffi::c_void)?;
-        for (i, v) in [n as i32, k as i32, m as i32].into_iter().enumerate() {
+        for (i, v) in [n as i32, k as i32, m as i32, xoff as i32]
+            .into_iter()
+            .enumerate()
+        {
             set(3 + i as u32, 4, &v as *const i32 as *const std::ffi::c_void)?;
         }
         let global = [n * OPENCL_WG];
@@ -832,7 +843,7 @@ pub fn vulkan_glsl(wg: usize) -> String {
 layout(std430, set = 0, binding = 0) readonly buffer XB {{ float X[]; }};
 layout(std430, set = 0, binding = 1) readonly buffer WB {{ uint W[]; }};
 layout(std430, set = 0, binding = 2) buffer CB {{ float C[]; }};
-layout(push_constant) uniform PC {{ int N; int K; int M; }} pc;
+layout(push_constant) uniform PC {{ int N; int K; int M; int XOFF; }} pc;
 layout(local_size_x = NVFP4_WG) in;
 shared float sh[NVFP4_WG];
 shared float tab[16];
@@ -851,7 +862,10 @@ uint byte_at(uint base, uint i) {{ return (W[base + i / 4u] >> (8u * (i % 4u))) 
 
 void main() {{
     int t = int(gl_LocalInvocationID.x);
-    int n = int(gl_WorkGroupID.x);
+    // `n` is a *work-group* index, so it is the linearised 2-D group id; the
+    // column count is spread over x and y to stay inside the device's
+    // per-axis group limit on wide matrices.
+    int n = int(gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x);
     if (t < 16) {{
         float v[16] = float[16](0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
                                 0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0);
@@ -868,8 +882,10 @@ void main() {{
                 uint blk = row + uint(b) * 9u;
                 for (int s = t; s < 4; s += NVFP4_WG) {{
                     float d = ue4m3(byte_at(blk, uint(s)));
-                    if (d == 0.0) continue;
-                    int xb = m * pc.K + b * 64 + s * 16;
+                    // Multiplied through, not skipped: `0 * inf` must stay NaN
+                    // so this agrees with the scalar reference on non-finite
+                    // activations.
+                    int xb = pc.XOFF + m * pc.K + b * 64 + s * 16;
                     // Split-half: the 8 code bytes at 4 + 8s hold element j in
                     // the low nibble and element j + 8 in the high nibble.
                     for (int j = 0; j < 8; ++j) {{
@@ -893,6 +909,19 @@ void main() {{
 "#,
         wg = wg
     )
+}
+
+/// A 2-D group grid covering `n` work-groups without exceeding the per-axis
+/// limit (65535 is the guaranteed Vulkan minimum).
+#[cfg(feature = "vulkan")]
+fn grid_for(n: u32) -> [u32; 3] {
+    const MAX: u32 = 65_535;
+    if n <= MAX {
+        [n.max(1), 1, 1]
+    } else {
+        let gx = MAX;
+        [gx, n.div_ceil(gx), 1]
+    }
 }
 
 /// Whether a native Vulkan NVFP4 launch is wanted.  `JOSHUA_VULKAN_NATIVE=0`

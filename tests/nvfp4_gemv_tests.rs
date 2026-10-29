@@ -647,3 +647,128 @@ fn vulkan_native_gemv_matches_the_reference() {
         );
     }
 }
+
+/// Every prefill chunk after the first must stay on the device.
+///
+/// The Nemotron wrapper splits >16 activation rows with `narrow(..).contiguous()`,
+/// which keeps the parent's storage offset for a contiguous view.  The native
+/// gate used to require offset 0, so *only the first* chunk ran natively and
+/// every later one fell back — reading the whole weight matrix back to the host
+/// each time, on the prefill hot path.
+///
+/// The kernels take the activation offset explicitly now, so this checks a
+/// non-zero-offset view is still dispatched natively and gives the same answer.
+#[cfg(feature = "opencl")]
+#[test]
+fn a_nonzero_offset_view_stays_native() {
+    let Some(dev) = opencl_device() else {
+        println!("skipping: no OpenCL device");
+        return;
+    };
+    use candle_core::opencl_backend::kernels;
+    if !kernels::native_enabled() {
+        println!("skipping: native kernels disabled");
+        return;
+    }
+    let (out_dim, in_dim, rows) = (24usize, 128usize, 32usize);
+    let per_row = in_dim / QK_NVFP4;
+    let blocks = edge_case_blocks(out_dim * per_row);
+    let w = Tensor::from_vec(
+        block_bytes(&blocks),
+        (out_dim, per_row * BLOCK_BYTES),
+        &dev,
+    )
+    .unwrap();
+    // One [rows, in_dim] activation; rows 16.. is the second chunk view.
+    let acts: Vec<f32> = (0..rows * in_dim)
+        .map(|i| ((i * 7 % 29) as f32 - 14.0) / 4.0)
+        .collect();
+    let x_all = Tensor::from_vec(acts.clone(), (rows, in_dim), &dev).unwrap();
+    let second = x_all.narrow(0, 16, 16).unwrap();
+    assert_ne!(
+        second.layout().start_offset(),
+        0,
+        "the test needs a view with a non-zero offset"
+    );
+
+    let (n0, f0) = (kernels::native_exec_count(), nvfp4_fallback_count());
+    let got = joshua::nvfp4_gemv::nvfp4_matmul_qt(&w, &second)
+        .unwrap()
+        .to_device(&Device::Cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+    let (n1, f1) = (kernels::native_exec_count(), nvfp4_fallback_count());
+
+    assert!(n1 > n0, "a non-zero-offset view must still dispatch natively");
+    assert_eq!(f1, f0, "and must not record a fallback");
+
+    let chunk: Vec<f32> = acts[16 * in_dim..].to_vec();
+    let weights = reference_decode(&blocks);
+    let want: Vec<f32> = reference_gemv(&weights, &chunk, out_dim, in_dim)
+        .0
+        .into_iter()
+        .map(|v| v as f32)
+        .collect();
+    let scale = want.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-6);
+    let worst = got
+        .iter()
+        .zip(&want)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max)
+        / scale;
+    assert!(worst < 1e-5, "offset view vs reference: rel {worst:e}");
+}
+
+/// `nvfp4`'s own fallback counter (the backend aggregate includes other ops).
+#[cfg(feature = "opencl")]
+fn nvfp4_fallback_count() -> usize {
+    candle_core::opencl_backend::kernels::fallback_counts_by_op()
+        .iter()
+        .filter(|(n, _)| n == "nvfp4-matmul-qt")
+        .map(|(_, c)| *c)
+        .sum()
+}
+
+/// A zero scale must not swallow a non-finite activation.
+///
+/// The kernels used to `continue` past a zero-scale sub-block, which drops the
+/// `0 * inf` / `0 * NaN` products the reference still performs — a non-finite
+/// input came back as a plausible finite number instead of NaN.  Silent
+/// disagreement on a corrupt input is exactly the kind of thing that hides
+/// until a model produces garbage.
+#[test]
+fn zero_scales_do_not_swallow_nonfinite_activations() {
+    let dev = Device::Cpu;
+    let (out_dim, in_dim) = (2usize, 128usize);
+    let per_row = in_dim / QK_NVFP4;
+    // All scales 0x00 (decode to 0.0), codes arbitrary.
+    let mut bytes = vec![0u8; out_dim * per_row * BLOCK_BYTES];
+    for blk in bytes.chunks_exact_mut(BLOCK_BYTES) {
+        for s in 0..4 {
+            blk[s] = 0x00;
+        }
+        for i in 4..BLOCK_BYTES {
+            blk[i] = (i as u8).wrapping_mul(7);
+        }
+    }
+    let w = Tensor::from_vec(bytes, (out_dim, per_row * BLOCK_BYTES), &dev).unwrap();
+
+    for bad in [f32::NAN, f32::INFINITY] {
+        let mut acts = vec![0f32; in_dim];
+        acts[3] = bad;
+        let x = Tensor::from_vec(acts, (in_dim,), &dev).unwrap();
+        let got = joshua::nvfp4_gemv::nvfp4_matmul_qt(&w, &x)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert!(
+            got.iter().all(|v| v.is_nan()),
+            "a zero-scale weight times {bad:?} must yield NaN, got {got:?}"
+        );
+    }
+}
