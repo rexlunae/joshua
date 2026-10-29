@@ -152,6 +152,7 @@ struct LayerSpec {
 /// The model geometry.
 #[derive(Debug, Clone)]
 struct Config {
+    /// Trunk layers (excludes the appended NextN block).
     n_layer: usize,
     n_embd: usize,
     n_head: usize,
@@ -180,7 +181,20 @@ impl Config {
         if !ARCHES.contains(&m.arch()) {
             return Ok(None);
         }
-        let n_layer = m.u32("block_count")? as usize;
+        // `block_count` **includes** any appended NextN / MTP blocks (llama.cpp
+        // `num_nextn_predict_layers`), so the trunk is the remainder.  Reading
+        // it raw would try to load the draft block as an ordinary layer.
+        let block_count = m.u32("block_count")? as usize;
+        let n_nextn = m.u32_or("nextn_predict_layers", 0) as usize;
+        let n_layer = block_count.checked_sub(n_nextn).ok_or_else(|| {
+            candle_core::Error::Msg(format!(
+                "{}: block_count {block_count} is smaller than nextn_predict_layers {n_nextn}",
+                m.arch()
+            ))
+        })?;
+        if n_layer == 0 {
+            candle_core::bail!("{}: no trunk layers (block_count {block_count})", m.arch());
+        }
         let n_embd = m.u32("embedding_length")? as usize;
         let n_head = m.u32("attention.head_count")? as usize;
         let head_dim = m
@@ -250,13 +264,22 @@ impl Config {
             .count();
         // The uniform scalar `head_count_kv` is the only one present for the
         // attention rows; take it from the first attention layer.
-        let n_head_kv = layers
-            .iter()
-            .find(|l| l.kind == LayerKind::Attention)
-            .map(|l| l.n_head_kv)
-            .unwrap_or_else(|| m.u32_or("attention.head_count_kv", 0) as usize);
-        if n_attn > 0 && n_head_kv == 0 {
-            candle_core::bail!("{}: attention layers declare 0 kv heads", m.arch());
+        // The KV head count normally comes from the trunk's attention rows, but
+        // the appended NextN block *always* has an attention sub-layer, so an
+        // attention-free trunk still needs a usable value.  Two sources, in
+        // order: the first attention row's `head_count_kv`, then the scalar
+        // form (which covers a file whose arrays are all zeros).
+        let kv_from_array = kv.iter().copied().find(|&k| k > 0);
+        let kv_from_scalar = m.u32_opt("attention.head_count_kv").filter(|&k| k > 0);
+        let n_head_kv = kv_from_array
+            .or_else(|| kv_from_scalar.map(|k| k as usize))
+            .unwrap_or(0);
+        if (n_attn > 0 || m.u32_opt("nextn_predict_layers").unwrap_or(0) > 0) && n_head_kv == 0 {
+            candle_core::bail!(
+                "{}: attention layers (or the NextN block) need a nonzero \
+                 attention.head_count_kv, found none",
+                m.arch()
+            );
         }
 
         Ok(Some(Self {
@@ -953,6 +976,94 @@ impl MoeBlock {
     }
 }
 
+// ─── MTP / NextN draft block ─────────────────────────────────────────────────
+
+/// The NextN / MTP draft block Nemotron 3.5 appends after the trunk
+/// (`num_nextn_predict_layers = 1`; `blk.{n_layer}.*`).
+///
+/// The block folds an **attention** sub-layer and a **MoE** sub-layer into one
+/// trailing block, and reads a token's embedding together with the trunk's
+/// normed hidden of the *previous* position:
+///
+/// ```text
+/// row q = eh_proj([enorm(emb(t_q)) ‖ hnorm(h_{q-1})]) → attn → MoE
+/// ```
+///
+/// then `shared_head_norm` and the trunk's output head.  A chained draft seeds
+/// the next row with that normed output instead of a trunk hidden.  Used as a
+/// speculative drafter (see [`crate::native_session::Session::mtp_draft`]); the
+/// state is the pair of sub-layer states this struct keeps.
+struct MtpBlock {
+    enorm: RmsNorm,
+    hnorm: RmsNorm,
+    eh_proj: Weight,
+    attn_norm: RmsNorm,
+    attn: AttentionBlock,
+    post_norm: RmsNorm,
+    moe: MoeBlock,
+    /// `nextn.shared_head_norm`; the trunk's output norm when absent.
+    head_norm: Option<RmsNorm>,
+}
+
+impl MtpBlock {
+    fn load<R: Read + Seek>(
+        src: &mut TensorSource<R>,
+        cfg: &Config,
+        rope: Arc<Rope>,
+        expert_device: &Device,
+    ) -> Result<Option<Self>> {
+        let p = format!("blk.{}", cfg.n_layer);
+        if !src.has(&format!("{p}.nextn.eh_proj.weight")) {
+            return Ok(None);
+        }
+        let device = src.device.clone();
+        Ok(Some(Self {
+            enorm: src.rms_norm(&format!("{p}.nextn.enorm.weight"), cfg.rms_eps)?,
+            hnorm: src.rms_norm(&format!("{p}.nextn.hnorm.weight"), cfg.rms_eps)?,
+            eh_proj: load_weight(src, &format!("{p}.nextn.eh_proj.weight"))?,
+            attn_norm: src.rms_norm(&format!("{p}.attn_norm.weight"), cfg.rms_eps)?,
+            attn: AttentionBlock::load(src, &p, cfg, rope)?,
+            post_norm: src.rms_norm(&format!("{p}.attn_post_norm.weight"), cfg.rms_eps)?,
+            moe: MoeBlock::load(src, &p, cfg, expert_device)?,
+            head_norm: src.rms_norm_opt(
+                &format!("{p}.nextn.shared_head_norm.weight"),
+                cfg.rms_eps,
+            )?,
+        }))
+    }
+
+    /// The block's normed output for `n` rows (`[1, n, hidden]`), advancing
+    /// `state` (its attention KV).
+    fn forward(
+        &self,
+        state: &mut LayerState,
+        emb: &Tensor,
+        seeds: &Tensor,
+        trunk_norm: &RmsNorm,
+        input: &LayerInput<'_>,
+    ) -> Result<Tensor> {
+        // eh_proj([enorm(emb) ‖ hnorm(seed)])
+        let e = self.enorm.forward(emb)?;
+        let h = self.hnorm.forward(seeds)?;
+        let merged = Tensor::cat(&[&e, &h], D::Minus1)?;
+        let mut x = self.eh_proj.forward(&merged)?;
+        // attention sub-layer, then the MoE sub-layer, each pre-normed.
+        let a = self.attn_norm.forward(&x)?;
+        x = x.add(&self.attn.forward(&mut state.kv, &a, input.mask, input.offset)?)?;
+        let m = self.post_norm.forward(&x)?;
+        x = x.add(&self.moe.forward(&m)?)?;
+        match &self.head_norm {
+            Some(n) => n.forward(&x),
+            // No `shared_head_norm`: the *trunk's* output norm is the
+            // fallback, not "no norm" — `mtp_draft` treats this tensor as
+            // already normed (it goes straight through the output head and
+            // seeds the next draft), so returning a raw residual would skew
+            // both the logits and every chained draft.
+            None => trunk_norm.forward(&x),
+        }
+    }
+}
+
 // ─── Layers ──────────────────────────────────────────────────────────────────
 
 /// One decoder layer: a pre-norm residual around exactly one sub-block.
@@ -1048,6 +1159,9 @@ pub struct Weights {
     residency: Arc<dyn crate::residency::ExpertResidency>,
     n_expert: usize,
     cfg: Config,
+    /// The NextN / MTP draft block, when the file has one and the caller
+    /// asked for it (see [`crate::quantized_qwen::with_mtp_block`]).
+    mtp: Option<MtpBlock>,
 }
 
 impl Weights {
@@ -1114,6 +1228,13 @@ impl Weights {
             // Tied embeddings: reuse the (quantized) embedding table.
             Weight::Quant(src.qmatmul("token_embd.weight")?)
         };
+        // The MTP block is a whole extra attention + MoE layer, so it is only
+        // loaded when a caller says it will draft with it.
+        let mtp = if crate::quantized_qwen::mtp_wanted() {
+            MtpBlock::load(&mut src, &cfg, rope, &expert_device)?
+        } else {
+            None
+        };
         Ok(Self {
             tok_embeddings,
             layers,
@@ -1123,6 +1244,7 @@ impl Weights {
             residency: Arc::new(crate::residency::NoopResidency),
             n_expert: cfg.n_expert,
             cfg,
+            mtp,
         })
     }
 }
@@ -1163,8 +1285,32 @@ impl LayerStack for Weights {
     }
 
     fn head(&self, xs: &Tensor) -> Result<Tensor> {
-        let normed = self.norm.forward(xs)?;
-        self.output.forward(&normed)?.to_dtype(DType::F32)
+        self.head_logits(&self.head_norm(xs)?)
+    }
+
+    fn has_mtp(&self) -> bool {
+        self.mtp.is_some()
+    }
+
+    fn head_norm(&self, xs: &Tensor) -> Result<Tensor> {
+        self.norm.forward(xs)
+    }
+
+    fn head_logits(&self, normed: &Tensor) -> Result<Tensor> {
+        self.output.forward(normed)?.to_dtype(DType::F32)
+    }
+
+    fn mtp_forward(
+        &self,
+        state: &mut LayerState,
+        emb: &Tensor,
+        seeds: &Tensor,
+        input: &LayerInput<'_>,
+    ) -> Result<Tensor> {
+        let Some(m) = &self.mtp else {
+            candle_core::bail!("{}: no MTP block loaded", ARCHES[0]);
+        };
+        m.forward(state, emb, seeds, &self.norm, input)
     }
 
     /// The scan state is running rather than append-only, so a verification

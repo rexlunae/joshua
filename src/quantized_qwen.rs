@@ -1608,6 +1608,14 @@ thread_local! {
 /// Off by default: the block is a whole extra layer (with a MoE model, its
 /// own routed-expert pool), so only a caller that will draft with it pays
 /// for loading it.
+/// Whether the current thread's load should read a NextN (MTP) block.
+///
+/// Shared with the other loaders that serve architectures with one, so a
+/// single [`with_mtp_block`] scope covers whichever loader runs inside it.
+pub fn mtp_wanted() -> bool {
+    LOAD_MTP.get()
+}
+
 pub fn with_mtp_block<T>(f: impl FnOnce() -> T) -> T {
     struct Restore(bool);
     impl Drop for Restore {
