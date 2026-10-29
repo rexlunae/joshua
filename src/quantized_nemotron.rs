@@ -339,9 +339,12 @@ impl Weight {
         if info.dtype != <crate::mxfp4::BlockNvfp4 as crate::raw_block::RawBlock>::GGML_TYPE {
             return Ok(None);
         }
-        // GGUF dims are [in, out]; the op wants [out_dim, 36*blocks_per_row].
+        // `RawTensorInfo.dims` is already in row-major order — `read_header`
+        // reverses GGUF's fastest-varying-first order — so it is `[out, in]`
+        // exactly as the op wants.  Swapping here would reinterpret the same
+        // block bytes as the transposed matrix.
         let (out_dim, in_dim) = match info.dims.as_slice() {
-            [i, o] => (*o, *i),
+            [o, i] => (*o, *i),
             d => candle_core::bail!(
                 "{}: NVFP4 tensor `{name}` must be 2-D, got dims {d:?}",
                 src.arch
@@ -357,22 +360,40 @@ impl Weight {
         match self {
             Self::Quant(q) => q.forward(xs),
             Self::Nvfp4 { blocks, .. } => {
-                // `nvfp4_matmul_qt` handles `[in]` and `[rows, in]`; a
-                // `[1, t, hidden]` activation is flattened and restored, since
-                // this loader always runs with a leading batch of one.
+                // The op takes `[in]` or `[rows, in]` with `rows <= MAX_ROWS`.
+                // This loader always runs with a leading batch of one, so a
+                // `[1, t, hidden]` activation is flattened to `[t, hidden]` and
+                // the batch axis restored after.
                 let dims = xs.dims().to_vec();
                 let flat = if dims.len() == 3 {
                     xs.reshape((dims[1], dims[2]))?
                 } else {
                     xs.clone()
                 };
-                let y = crate::nvfp4_gemv::nvfp4_matmul_qt(blocks, &flat)?;
+                let rows = flat.dim(0)?;
+                // A prefill chunk is up to `--prefill-chunk` tokens (512 by
+                // default), far past the op's row limit, so the rows are
+                // processed in batches and concatenated in token order.  The
+                // split is on the *token* axis, so every output row still
+                // corresponds to the input row at the same index.
+                let mut y = if rows <= crate::nvfp4_gemv::MAX_ROWS {
+                    crate::nvfp4_gemv::nvfp4_matmul_qt(blocks, &flat)?
+                } else {
+                    let mut parts = Vec::with_capacity(rows.div_ceil(crate::nvfp4_gemv::MAX_ROWS));
+                    let mut start = 0;
+                    while start < rows {
+                        let n = (rows - start).min(crate::nvfp4_gemv::MAX_ROWS);
+                        let chunk = flat.narrow(0, start, n)?.contiguous()?;
+                        parts.push(crate::nvfp4_gemv::nvfp4_matmul_qt(blocks, &chunk)?);
+                        start += n;
+                    }
+                    Tensor::cat(&parts, 0)?
+                };
                 if dims.len() == 3 {
                     let c = y.dim(1)?;
-                    y.reshape((1, dims[1], c))
-                } else {
-                    Ok(y)
+                    y = y.reshape((1, dims[1], c))?;
                 }
+                Ok(y)
             }
         }
     }
@@ -1358,6 +1379,91 @@ mod tests {
         let worst = a.iter().zip(&want).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max) / scale;
         assert!(worst < 1e-6, "NVFP4 weight vs reference matmul: rel {worst:e}");
         let _ = <BlockNvfp4 as RawBlock>::GGML_TYPE;
+    }
+
+    /// A **non-square** NVFP4 projection must be read with `out_dim` from the
+    /// first (already row-major) dimension.
+    ///
+    /// `RawTensorInfo.dims` is `[out, in]` because `read_header` reverses
+    /// GGUF's fastest-varying-first order.  Reading it as disk order and
+    /// swapping back transposes the matrix: the same bytes become a different
+    /// shape, and the GEMV then rejects ordinary activations.  A square matrix
+    /// cannot tell the two apart, so this uses one where out != in and checks
+    /// both the accepted activation width and the values.
+    #[test]
+    fn a_non_square_nvfp4_weight_keeps_its_orientation() {
+        use crate::mxfp4::{BlockNvfp4, QK_NVFP4};
+        let dev = Device::Cpu;
+        let (out_dim, in_dim) = (48usize, 128usize); // deliberately non-square
+        let row_bytes = (in_dim / QK_NVFP4) * std::mem::size_of::<BlockNvfp4>();
+        let mut state = 0xdead_beefu32;
+        let raw: Vec<u8> = (0..out_dim * row_bytes)
+            .map(|_| {
+                state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                (state >> 16) as u8
+            })
+            .collect();
+        let blocks = Tensor::from_vec(raw.clone(), (out_dim, row_bytes), &dev).unwrap();
+        let w = Weight::Nvfp4 { blocks, out_dim, in_dim };
+        assert_eq!(w.shape(), Some((out_dim, in_dim)), "shape is [out, in]");
+
+        // An activation of the declared input width must be accepted and give
+        // `[rows, out_dim]`.
+        let acts = Tensor::randn(0f32, 1.0, (3, in_dim), &dev).unwrap();
+        let got = w.forward(&acts).unwrap();
+        assert_eq!(got.dims(), &[3, out_dim], "out_dim, not in_dim, is the width");
+
+        // And it must equal the reference over the same bytes.
+        let act_host = acts.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let mut want = vec![0f32; 3 * out_dim];
+        crate::nvfp4_gemv::matmul_t(&raw, &act_host, &mut want, 3, out_dim, in_dim).unwrap();
+        let a = got.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let scale = want.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-6);
+        let worst = a.iter().zip(&want).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max) / scale;
+        assert!(worst < 1e-6, "non-square NVFP4 weight: rel {worst:e}");
+
+        // The transposed reading would have demanded `out_dim`-wide input.
+        let wrong = Tensor::randn(0f32, 1.0, (3, out_dim), &dev).unwrap();
+        assert!(
+            w.forward(&wrong).is_err(),
+            "an activation of the wrong width must be rejected, not reinterpreted"
+        );
+    }
+
+    /// A prefill chunk is far longer than the op's 16-row limit, so the
+    /// wrapper must batch the rows rather than hand the whole chunk over.  The
+    /// default chunk is 512 tokens, i.e. 32 batches — a prompt of 17 tokens is
+    /// enough to fail without this.
+    #[test]
+    fn an_nvfp4_weight_handles_a_full_prefill_chunk() {
+        use crate::mxfp4::{BlockNvfp4, QK_NVFP4};
+        let dev = Device::Cpu;
+        let (out_dim, in_dim, tokens) = (24usize, 128usize, 37usize);
+        assert!(tokens > crate::nvfp4_gemv::MAX_ROWS, "exceeds the op's row limit");
+        let row_bytes = (in_dim / QK_NVFP4) * std::mem::size_of::<BlockNvfp4>();
+        let mut state = 0x5eed_u32;
+        let raw: Vec<u8> = (0..out_dim * row_bytes)
+            .map(|_| {
+                state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                (state >> 16) as u8
+            })
+            .collect();
+        let blocks = Tensor::from_vec(raw.clone(), (out_dim, row_bytes), &dev).unwrap();
+        let w = Weight::Nvfp4 { blocks, out_dim, in_dim };
+
+        let acts = Tensor::randn(0f32, 1.0, (1, tokens, in_dim), &dev).unwrap();
+        let got = w.forward(&acts).expect("a 37-token chunk must be batched, not rejected");
+        assert_eq!(got.dims(), &[1, tokens, out_dim]);
+
+        // Batched must equal the single-pass reference over all rows: the split
+        // is on the token axis, so no row may be reordered or dropped.
+        let act_host = acts.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let mut want = vec![0f32; tokens * out_dim];
+        crate::nvfp4_gemv::matmul_t(&raw, &act_host, &mut want, tokens, out_dim, in_dim).unwrap();
+        let a = got.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let scale = want.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-6);
+        let worst = a.iter().zip(&want).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max) / scale;
+        assert!(worst < 1e-6, "batched prefill vs single-pass: rel {worst:e}");
     }
 
     /// `Mamba2::conv` must dispatch the native kernel, not fall back to a
