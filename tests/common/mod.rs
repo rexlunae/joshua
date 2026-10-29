@@ -3206,6 +3206,8 @@ pub struct NemotronTiny {
     pub group_norm_weight: [f32; 2],
     /// Also write the NextN / MTP draft block at `blk.{n_layer}`.
     pub mtp_block: bool,
+    /// Write `exp_probs_b.bias`, the router's per-expert selection bias.
+    pub gate_bias: bool,
 }
 
 impl Default for NemotronTiny {
@@ -3216,6 +3218,7 @@ impl Default for NemotronTiny {
             uniform_kind: "moe",
             group_norm_weight: [1.0, 1.0],
             mtp_block: false,
+            gate_bias: false,
         }
     }
 }
@@ -3478,6 +3481,13 @@ pub fn write_nemotron_h_gguf(path: &Path, opts: NemotronTiny) {
                     format!("blk.{i}.ffn_gate_inp.weight"),
                     qtensor(w(N_EXPERT * EMB, seed), &[N_EXPERT, EMB]),
                 ));
+                // The router's selection bias (`ffn_exp_probs_b`).
+                if opts.gate_bias {
+                    let mut b = vec![0.0f32; N_EXPERT];
+                    // Strongly favour the last expert so routing visibly moves.
+                    b[N_EXPERT - 1] = 12.0;
+                    tensors.push((format!("blk.{i}.exp_probs_b.bias"), qtensor(b, &[N_EXPERT])));
+                }
                 // Ungated experts, *stacked* in one tensor per projection —
                 // the loader slices each expert out of `[n_expert, out, in]`
                 // (llama.cpp `ffn_up_exps` / `ffn_down_exps`).
@@ -3552,6 +3562,16 @@ pub fn write_nemotron_h_gguf(path: &Path, opts: NemotronTiny) {
             format!("blk.{i}.ffn_gate_inp.weight"),
             qtensor(w(N_EXPERT * EMB, seed + 5), &[N_EXPERT, EMB]),
         ));
+        // The MTP block's own router bias, so drafting exercises selection
+        // bias too (the real `mtp.layers.1` layer carries one).
+        if opts.gate_bias {
+            let mut b = vec![0.0f32; N_EXPERT];
+            b[0] = 12.0;
+            tensors.push((
+                format!("blk.{i}.exp_probs_b.bias"),
+                qtensor(b, &[N_EXPERT]),
+            ));
+        }
         let mut up: Vec<f32> = Vec::with_capacity(N_EXPERT * FFN * EMB);
         let mut down: Vec<f32> = Vec::with_capacity(N_EXPERT * EMB * FFN);
         for e in 0..N_EXPERT {
