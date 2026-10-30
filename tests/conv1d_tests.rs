@@ -351,16 +351,18 @@ fn device_matches_cpu_without_falling_back() {
     // `vulkan_dispatch_is_native`, because a driver that cannot run the shader
     // makes 144 submissions hang rather than fail.  On a device that can, the
     // whole matrix runs and the counts are reported.
-    let dev = match opencl_device() {
-        Some(d) => d,
-        None if std::env::var_os("JOSHUA_CONV1D_VULKAN").is_some() => match vulkan_device() {
-            Some(d) => d,
-            None => {
-                eprintln!("conv1d: no OpenCL/Vulkan device, skipping the device test");
-                return;
-            }
-        },
-        None => {
+    // The opt-in *selects* Vulkan rather than merely permitting it: OpenCL is
+    // present on most hosts that have both, so falling back to it first would
+    // silently keep running the OpenCL case and never cover Vulkan.
+    let want_vulkan = std::env::var_os("JOSHUA_CONV1D_VULKAN").is_some();
+    let dev = match (want_vulkan, vulkan_device(), opencl_device()) {
+        (true, Some(d), _) => d,
+        (true, None, _) => {
+            eprintln!("conv1d: JOSHUA_CONV1D_VULKAN set but no Vulkan device; skipping");
+            return;
+        }
+        (false, _, Some(d)) => d,
+        (false, _, None) => {
             eprintln!("conv1d: no OpenCL device, skipping the device test");
             return;
         }
