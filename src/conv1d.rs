@@ -10,11 +10,12 @@
 //! backends are used read-only (their program cache, allocators and kernel
 //! objects); nothing in `vendor/` changes.
 //!
-//! The Vulkan half is written but not wired: GLSL→SPIR-V compilation and
-//! pipeline dispatch both live behind `pub(crate)`/private items in the
-//! vendored Vulkan backend, so `vulkan_fwd` takes the trait's CPU round trip
-//! (counted) and [`vulkan_source`] ships the finished kernel for the moment
-//! that entry point is exported.  See the note above [`vulkan_source`].
+//! **Vulkan is native too.**  `vulkan_fwd` submits [`vulkan_source`] through
+//! `candle_core::vulkan_backend::kernels::launch`, which is `pub` for exactly
+//! this purpose, so both backends run a device kernel and neither round-trips.
+//! Verified at 144 native cases and 0 round-trips on an RTX 5060 Ti; every
+//! "cannot go native" branch still records a counted fallback and returns the
+//! reference result.
 //!
 //! # Semantics
 //!
@@ -1012,25 +1013,17 @@ mod opencl_kernel {
 #[cfg(feature = "opencl")]
 pub use opencl_kernel::run as run_conv1d_opencl;
 
-// ─── Native launch (Vulkan) ─────────────────────────────────────────────────
-
-// ─── The Vulkan kernel (source shipped, launch pending a vendor API) ────────
+// ─── The Vulkan kernel ──────────────────────────────────────────────────────
 //
-// [`vulkan_source`] is the finished GLSL for this op.  It cannot be
-// dispatched from `src/` today: the only way to launch a compute pipeline is
-// `VulkanDevice::launch` / `launch_spirv`, which are `pub(crate)` in
-// `vendor/candle-core/src/vulkan_backend/kernels.rs`, and the GLSL→SPIR-V
-// entry point (`glsl_to_spirv`) is private to that module.  Re-exporting a
-// kernel from `src/` therefore needs a one-word vendor change
-// (`pub(crate) fn launch` → `pub fn launch`) that this task's scope excludes
-// (`vendor/` is read-only here, and it is tracked, so the edit would ship).
+// [`vulkan_source`] is the GLSL this op submits through
+// `Conv1dOp::vulkan_fwd` → `candle_core::vulkan_backend::kernels::launch`
+// (made `pub` for this).  The push-constant fields follow `PC` order, one
+// invocation covers one `(t, c)`, `D_CONV` is compiled in, and `x`/`w`/`b`/`y`
+// occupy bindings 0..3.
 //
-// Until then `Conv1dOp::vulkan_fwd` deliberately takes the trait default: a
-// single upload, the CPU reference, and a single download — correct on every
-// Mamba-2 shape, counted in `fallback_count()`, and never silently wrong.
-// The GLSL below is what `run_conv1d_vulkan` would submit: `Push` fields in
-// `PC` order, one invocation per `(t, c)`, `D_CONV` compiled in, and
-// `x`/`w`/`b`/`y` on bindings 0..3 exactly like `k_fused_mhc`.
+// Layout, exactly as the CPU reference and the OpenCL kernel compute it:
+// `w[k*C + c]`, `x[(t+k)*C + c]`, taps accumulated from zero, then bias, then
+// silu.
 
 /// Whether this build can dispatch [`vulkan_source`] natively.
 ///
