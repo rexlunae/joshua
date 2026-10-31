@@ -2496,17 +2496,17 @@ impl Engine {
                 // that cannot fit falls back to plain decoding instead of
                 // leaving the target unable to upload.
                 let draft_bytes = crate::draft_model::resident_bytes(path).unwrap_or(0);
-                // Where the target's experts really live: the Qwen and
-                // deepseek2 loaders upload the pool to a non-CPU expert
-                // device and build any cache there too (a CPU expert device
-                // keeps both on the host); deepseek4 keeps the pool mapped on
-                // the host and puts only a non-empty cache on an accelerator
-                // with its IQ2_XXS kernels.
+                // Native bounded-cache loaders keep their source experts on
+                // the host, with the cache on the expert or dense device.
                 let accel = |d: &Device| d.is_opencl() || d.is_sycl() || d.is_vulkan() || d.is_cuda();
                 let ds4 = a.is_deepseek4();
                 let cache = device_expert_cache.filter(|&b| b > 0);
-                let pool_on_device = !ds4 && !expert_device.is_cpu();
-                let cache_on_device = if ds4 {
+                let bounded = ds4
+                    || (a.is_native()
+                        && a != Architecture::NemotronH
+                        && device_expert_cache.is_some());
+                let pool_on_device = !bounded && !expert_device.is_cpu();
+                let cache_on_device = if bounded {
                     cache.filter(|_| accel(&expert_device) || accel(&dense_device))
                 } else {
                     cache.filter(|_| !expert_device.is_cpu())
@@ -5044,8 +5044,7 @@ impl Engine {
                 // With a device pool the hot set is what stays resident
                 // under churn; size it to the pool's protected share so the
                 // frequency policy runs without an explicit host budget.
-                budget = cache.slots * crate::residency::HOT_SET_SHARE.0
-                    / crate::residency::HOT_SET_SHARE.1;
+                budget = cache.automatic_hot_budget();
             }
         }
         // Tier 3: the SSD staging slab's engaged budget, alongside the VRAM
@@ -5104,10 +5103,12 @@ impl Engine {
         }
     }
 
-    /// Phase-5 automatic sizing: pick the hot-expert budget from available
-    /// memory, the per-expert byte size (model file / residency capacity) and
-    /// a fixed headroom for the KV cache and the OS.
+    /// Size the protected hot set from the resolved device pool when one
+    /// exists; otherwise use available RAM minus KV/OS headroom.
     fn auto_expert_budget(&self, model: &QuantizedModel) -> usize {
+        if let Some(cache) = model.device_expert_cache() {
+            return cache.automatic_hot_budget();
+        }
         let Some(free) = crate::placement::available_ram_bytes() else {
             tracing::info!("expert cache auto: no memory probe — leaving the budget 0");
             return 0;

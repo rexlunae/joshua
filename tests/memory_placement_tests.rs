@@ -489,7 +489,7 @@ fn deepseek4_expert_pool_reports_time_split_and_trace() {
 }
 
 /// Loading a qwen3moe model with a non-zero `device_expert_cache_bytes`
-/// budget threads a per-layer `DeviceResidency` into every MoE block; on the
+/// budget threads a shared `DeviceResidency` into every MoE block; on the
 /// CPU the device form wraps the same host weights, so a mixed-residency run
 /// must produce exactly the no-cache logits (proves the budget plumbing +
 /// partition end-to-end through `QuantizedModel::from_gguf_mmap_placed`).
@@ -511,6 +511,69 @@ fn vram_expert_cache_budget_loads_and_preserves_logits() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+#[test]
+fn older_loaders_share_one_compact_budget_and_upload_in_background() {
+    let _routing = routing_shared();
+    const SLOT: u64 = 3 * 256 * 256 / 256 * 144;
+    for (name, write) in [
+        (
+            "qwen",
+            common::write_tiny_qwen3moe_quantized_gguf as fn(&Path),
+        ),
+        (
+            "deepseek2",
+            common::write_tiny_deepseek2_quantized_gguf as fn(&Path),
+        ),
+    ] {
+        let dir = common::model_dir(&format!("bounded-old-{name}"));
+        let path = dir.join("model.gguf");
+        write(&path);
+        let template = load_placed_with_cache(&path, 3 * SLOT);
+        let report = template.device_expert_cache().expect(name);
+        assert_eq!(report.slots, 3, "{name}: {report:?}");
+        assert_eq!(report.budget_bytes, 3 * SLOT);
+        let mut cached = template.new_session().unwrap();
+        let mut host = load_placed(&path, &Device::Cpu);
+        cached.set_pin_hot_experts(3);
+        assert_eq!(
+            logits(&mut cached, &[1, 4, 2], 0),
+            logits(&mut host, &[1, 4, 2], 0)
+        );
+        for offset in 3..73 {
+            assert_eq!(
+                logits(&mut cached, &[3], offset),
+                logits(&mut host, &[3], offset)
+            );
+            cached.wait_for_expert_uploads();
+            let report = cached.device_expert_cache().unwrap();
+            assert!(report.resident_bytes <= 3 * SLOT, "{name}: {report:?}");
+        }
+        let report = template.device_expert_cache().unwrap();
+        assert!(
+            report.stats.uploads > 0 && report.stats.hits > 0,
+            "{name}: {report:?}"
+        );
+        assert_eq!(report.stats.upload_failures, 0, "{name}: {report:?}");
+        assert_eq!(report.stats, cached.device_expert_cache().unwrap().stats);
+        assert_eq!(
+            logits(&mut cached, &[3, 8, 3], 73),
+            logits(&mut host, &[3, 8, 3], 73),
+        );
+        assert!(load_placed_with_cache(&path, SLOT - 1)
+            .device_expert_cache()
+            .is_none());
+        assert!(load_placed_with_cache(&path, 0)
+            .device_expert_cache()
+            .is_none());
+        let all = load_placed_with_cache(&path, u64::MAX)
+            .device_expert_cache()
+            .unwrap();
+        let count = if name == "qwen" { 8 } else { 4 };
+        assert_eq!(all.slots, count);
+        assert_eq!(all.budget_bytes, count as u64 * SLOT);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
 /// Explicit placement requests other than the model device or the CPU are
 /// rejected at load rather than silently ignored.
 #[test]

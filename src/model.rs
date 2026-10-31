@@ -892,10 +892,12 @@ impl QuantizedModel {
     }
 
     /// The model-wide device expert pool's budget, occupancy and counters,
-    /// for the loaders that build one from a VRAM cache budget (`deepseek4`).
+    /// for the native Qwen, DeepSeek2 and DeepSeek4 loaders.
     pub fn device_expert_cache(&self) -> Option<crate::residency::DeviceCacheReport> {
         match self {
             Self::DeepSeek4(m) => m.device_expert_cache(),
+            Self::Qwen(m) => m.device_expert_cache(),
+            Self::DeepSeek2(m) => m.device_expert_cache(),
             _ => None,
         }
     }
@@ -935,8 +937,11 @@ impl QuantizedModel {
     /// Block until the device expert pool's background uploads have drained
     /// (tests, diagnostics); a no-op without a pool.
     pub fn wait_for_expert_uploads(&self) {
-        if let Self::DeepSeek4(m) = self {
-            m.wait_for_expert_uploads();
+        match self {
+            Self::DeepSeek4(m) => m.wait_for_expert_uploads(),
+            Self::Qwen(m) => m.wait_for_expert_uploads(),
+            Self::DeepSeek2(m) => m.wait_for_expert_uploads(),
+            _ => (),
         }
     }
 

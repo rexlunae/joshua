@@ -678,11 +678,9 @@ impl<W: LayerStack> Session<W> {
         // prefetch has a full step of compute to stream in behind.
         let step = self.hot_experts.begin_step(decode);
         if self.hot_experts.refresh_due(decode) {
-            for (l, e) in self.hot_experts.refresh() {
-                // Protect the routing-frequency hot set from LRU eviction in a
-                // device slot pool (#62), then make it resident.  No-op on
-                // CPU/host residency backends.
-                w.residency().mark_hot(l, e);
+            let hot = self.hot_experts.refresh();
+            w.residency().replace_hot_set(&hot);
+            for (l, e) in hot {
                 w.residency().acquire(l, e);
             }
         }
@@ -1013,6 +1011,14 @@ impl<W: LayerStack> Session<W> {
     /// (informational on CPU; a phase-5 auto-sizing input on devices).
     pub fn expert_residency_capacity(&self) -> usize {
         self.weights.residency().capacity()
+    }
+
+    pub fn device_expert_cache(&self) -> Option<crate::residency::DeviceCacheReport> {
+        self.weights.residency().device_cache_report()
+    }
+
+    pub fn wait_for_expert_uploads(&self) {
+        self.weights.residency().wait_for_uploads();
     }
 
     /// Reset every layer's state so this instance can serve an unrelated

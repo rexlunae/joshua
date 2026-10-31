@@ -1,7 +1,7 @@
 # Joshua device expert cache — design sketch
 
-**Status:** design + phased implementation.  Phases 1, 2, 3, 5-core and 6 are merged
-(CUDA + Vulkan IQ2_XXS; see the table below); the device-validation and remaining runtime
+**Status:** design + phased implementation. Phases 1 and 5-core, device-pool
+primitives, and CUDA/Vulkan IQ2_XXS dispatch are merged; the device-validation and remaining runtime
 items are tracked in [issue #52](https://github.com/rexlunae/joshua/issues/52).  The
 CPU-testable Tier-3 (SSD/Engram) additions live in
 [`docs/multilevel-weight-cache.md`](multilevel-weight-cache.md) §H.
@@ -14,7 +14,7 @@ CPU-testable Tier-3 (SSD/Engram) additions live in
 | 3 | device-backed expert storage + matmul dispatch | ✅ CUDA/Vulkan IQ2_XXS experts (`cf0c938`, `0e953af`); `Ds4DeviceExpert` |
 | 4 | layer offload (dense models) + KV placement | ⚠️ partial — `--expert-placement host` keeps experts CPU-side; no explicit KV-tier placement |
 | 5 runtime | adaptive loop feeding measured hit-ratio/bus bytes into `adaptive_budget` | ⚠️ partial — budget sizing is static/`auto`, not a live feedback loop |
-| 6 | IQ2_XXS / MXFP4 deepseek4 GPU kernels (V4-Flash on GPU) | ✅ merged (`cf0c938` CUDA, `0e953af` Vulkan) |
+| 6 | IQ2_XXS / MXFP4 deepseek4 GPU kernels (V4-Flash on GPU) | Partial — IQ2_XXS merged (`cf0c938` CUDA, `0e953af` Vulkan); not evidence of MXFP4 or full-model GPU coverage |
 | 7 | explicit SSD (NVMe/SATA) residency tier + Engram-aware tier | ✅ `NvmeResidency` (`--ssd-expert-cache`), `--engram-tier` — see `docs/multilevel-weight-cache.md` §H |
 
 **#114 (partial-cache usability on small cards).** The OpenCL/SYCL slot pool
@@ -33,7 +33,7 @@ when the freed memory clears the floor and the placement probe does not show
 a decisive device GEMM win (`dense_to_cpu_for_cache`).  The CUDA async-copy
 pending-slot/event handoff below remains future work.
 
-### CUDA audit (2026-10-30, issues #62 / #52)
+### CUDA audit (2026-10-31, issues #62 / #52)
 
 DeepSeek4 has a model-wide bounded pool, a background `ExpertUploader`, and
 lookup-only dispatch with host fallback. Its mmap-backed gate/up/down blocks
@@ -57,19 +57,79 @@ parity. The cache logit tolerance is the existing accelerator-cache tolerance (5
 logit spread), not a claim of CPU/CUDA bit parity. Kernel padding is additional
 to the pool's existing logical-payload accounting.
 
-The older qwen3moe/deepseek2 paths are **not** equivalent: they build per-layer
-`DeviceResidency` objects, but the session's `LayerStack::residency()` is a
-`CpuResidency`, so refresh/acquire does not fill those device pools. Their upload
-closures also target `expert_device`, which is either the CPU fallback or the
-already-loaded expert device, rather than an independent cache destination.
-They need a separate, model-wide host-source/device-destination wiring change,
-exact slot accounting, and real CUDA regression tests. A nonzero budget and
-matching logits alone do not establish that these caches upload or hit.
+This change wires qwen3moe/deepseek2 to one model-wide `CompositeResidency` and
+background uploader rather than unreachable per-layer pools behind a CPU-only
+session residency. With an explicit cache option, compact source experts remain
+on the host (mmap or streamed loading); the destination is the requested expert
+device, or the dense device when experts are host-placed. Uploads use the shared
+transfer path; dispatch looks up the device payload, moves activations to its
+actual device, and retires the payload after enqueueing its work. Misses retain
+host execution. No full expert-pool f32 materialization or per-session weight
+copy is introduced.
 
-Still unvalidated: PCIe traffic, pinned-memory/event-based overlap, throughput
-versus all-host/all-device, no-thrash hot-set behavior across sessions with
-different routing histories, and streamed-load CUDA cache fallback. Tiny-model
-correctness tests do not establish a real-model hit-rate or performance target.
+Slots reserve the largest compact gate/up/down payload, with the total budget
+capped at that reservation times the actual expert count. Auto hot-set sizing
+uses three quarters of resolved slots instead of host RAM (at least one tracked
+expert for a nonempty single-slot pool, so uploads are not disabled); refresh replaces the
+capped protected set instead of accumulating stale protected members. Sessions
+share the pool and uploader, but their frequency histories remain independent:
+one session can still replace another's protected set. **Disjoint-session
+no-thrash policy is not solved.** Logical payload accounting excludes backend
+padding, transient activations, and retired in-flight payloads; it is not a hard
+bound on all CUDA allocations.
+
+On kleya's RTX 5060 Ti (16,311 MiB), existing services were preserved; the initial
+probe showed 3,371 MiB used and 12,477 MiB free. Only tiny fixtures were loaded.
+Release CUDA tests pass twice on the final dispatch-lifetime implementation
+(3 passed, 1 explicitly ignored timing probe): compact transfers, DeepSeek4,
+and Qwen/DeepSeek2 shared-cache prefill, 70 decode steps per concurrent session,
+all-row continuation, streamed-source fallback, and exact budget-zero host-expert
+parity. The older-loader destination is explicitly CUDA (dense CUDA, experts
+CPU), not an OpenCL request whose cache actually runs on CPU. Each older pool
+has three slots / 331,776 logical bytes, positive upload/hit counts and no upload
+failures. Qwen maximum absolute logit error was 0.020814; DeepSeek2 0.027171;
+all tested greedy winners match. These use the existing 5%-of-spread accelerator
+tolerance, not bitwise CPU/CUDA parity. An earlier release attempt failed parity
+before explicit dispatched-payload retirement was added; unchanged-main's
+existing two CUDA tests passed in a separate source archive.
+
+The explicit release timing probe uses a 3-token prefill, 70 warm-up decode
+tokens and three trials of 64 timed decode tokens, synchronizing through logits
+readback. Dense weights stay CUDA in every mode. Median tokens/s:
+
+| Tiny fixture | Host experts, cache disabled | Three-slot CUDA cache | All experts CUDA |
+|---|---:|---:|---:|
+| Qwen3MoE Q4_K | 329.659 | 258.441 | 790.479 |
+| DeepSeek2 Q4_K | 627.408 | 794.826 | 939.931 |
+
+The Qwen partial cache **regresses** in this bounded workload. The host-expert
+baseline is not all-host inference; services were running and samples varied.
+These figures do not establish production throughput, a real-model hit-rate
+target, or no-regression acceptance. Reproduce with:
+
+```sh
+CARGO_BUILD_JOBS=2 cargo test --release --features cuda --test cuda_expert_cache_tests -- --nocapture --test-threads=1
+CARGO_BUILD_JOBS=2 cargo test --release --features cuda --test cuda_expert_cache_tests cuda_older_loaders_decode_measurement -- --ignored --nocapture --test-threads=1
+```
+
+Broader CUDA-feature validation passed 490 library tests (10 ignored), 12
+DeepSeek2, 13 memory-placement and 8 Qwen3MoE tests. The added single-slot
+automatic-budget unit test also passes. With `CUDA_VISIBLE_DEVICES=''`, the
+CUDA-feature speculative suite passes all 22 tests on the CPU fallback. Final
+`cargo check --features cuda --all-targets` passes. The CUDA-visible speculative
+suite failed 12 of 22 tests, reproduced with the same failure set on unchanged
+`99d2ddb` in a separate source archive: ten model-load errors rejecting a foreign
+CUDA expert device and two DeepSeek4 `unsupported dtype for quantized matmul
+Iq2Xxs` errors. These broader engine-placement/dtype failures are not silently
+counted as passes or fixed by this cache change.
+
+Remaining acceptance: real-model all-host/all-device no-regression comparisons,
+measured PCIe traffic, pinned-memory/pending-event overlap, aggregate hot-set
+policy for disjoint concurrent sessions, physical-allocation-aware sizing and
+live adaptive placement. Existing older-loader foreign-device validation also
+still restricts CPU-dense/accelerator-expert placement. Keep #62 and umbrella
+#52 open. OpenCL-with-CPU-cache evidence (including #244) is CPU/fallback evidence,
+not a replacement for the actual CUDA tests above.
 
 **Backend note:** the device backend must not be CUDA-only — ROCm stays an
 option.  HIP's API mirrors CUDA's (`hipMemcpyAsync` ≈ `cudaMemcpyAsync`,
@@ -178,15 +238,12 @@ one piece that is not a "policy" or "copy" change:
 
 - The loader needs a `QStorage::Cuda` (or Metal) variant for the expert tensors, so
   `QMatMul::forward` dispatches to a device kernel reading the slot buffer.
-- **Blocker for V4-Flash specifically:** `deepseek4`'s IQ2_XXS experts have no
-  CUDA/Metal kernel (the loader today refuses a GPU — "would materialise ~16× f32").
-  The proven path is **MXFP4** weights + a deepseek4 GPU matmul (FreeToken's choice),
-  plus GPU kernels for the deepseek4 attention/indexer/compressor. That is the real
-  work, not the cache.
-- **Unblocked today:** `deepseek2`, `qwen3moe`, and the dense/candle architectures use
-  standard k-quants (Q4_K/Q6_K/…) that candle's GPU kernels already cover. So the
-  first shippable version is a GPU box serving e.g. DeepSeek-V2/V3 or Qwen3-MoE in
-  Q4_K with a device expert cache — not V4-Flash.
+- **DeepSeek4:** compact CUDA/Vulkan IQ2_XXS expert dispatch exists. MXFP4 and
+  full attention/indexer/compressor coverage are separate claims requiring their
+  own evidence, not consequences of the expert-cache wiring.
+- **Older loaders:** `deepseek2` and `qwen3moe` use standard k-quants
+  (Q4_K/Q6_K/…) covered by candle's GPU kernels. The audit above records the
+  bounded-cache integration and the remaining performance acceptance.
 
 ### 3.4 Layer offload (second strategy — for dense models and KV)
 
@@ -249,8 +306,9 @@ budget (what we have today on CPU).
 - **Host-side pinned memory** for `cudaMemcpyAsync`: the mmap pages are not pinned;
   copy throughput to/from pageable memory is lower and may need `cudaMemcpyAsync`
   on non-default streams or staging buffers. This affects the PCIe numbers above.
-- **IQ2_XXS has no GPU kernel** — the V4-Flash path is blocked on kernels, not on the
-  cache. MXFP4 is the known-good alternative (FreeToken).
+- **Full-model GPU coverage remains distinct from expert kernels** — CUDA/Vulkan
+  IQ2_XXS expert kernels exist; that does not establish MXFP4 or every V4-Flash
+  attention/indexer/compressor path.
 - **Concurrent sessions** share one expert cache; the `HotExpertCache` counters are
   per model instance today, so a multi-session warm pool needs the policy lifted to
   be engine-shared (a known follow-up from #48).

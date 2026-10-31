@@ -875,11 +875,20 @@ pub fn write_tiny_deepseek_gguf(path: &Path) {
     write_deepseek_family_gguf(path, true, false, true, false);
 }
 
+pub fn write_tiny_deepseek2_quantized_gguf(path: &Path) {
+    write_deepseek_family_sized::<256, 256, 256>(path, false, false, false, false);
+}
+
 /// Shared body of the `deepseek` (`gqa`), `deepseek2` and `glm-dsa` (`dsa`)
 /// fixture writers.
 fn write_deepseek_family_gguf(path: &Path, gqa: bool, split_mla: bool, softmax_v2: bool, dsa: bool) {
+    write_deepseek_family_sized::<8, 16, 8>(path, gqa, split_mla, softmax_v2, dsa);
+}
+
+fn write_deepseek_family_sized<const EMB: usize, const NFF: usize, const NFE: usize>(
+    path: &Path, gqa: bool, split_mla: bool, softmax_v2: bool, dsa: bool,
+) {
     const VOCAB: usize = 16;
-    const EMB: usize = 8;
     const H: usize = 2; // heads
     const R: usize = 4; // qk_rope_head_dim
     const NP: usize = 4; // qk_nope_head_dim
@@ -887,9 +896,7 @@ fn write_deepseek_family_gguf(path: &Path, gqa: bool, split_mla: bool, softmax_v
     const VH: usize = 4; // v_head_dim
     const LQ: usize = 6; // q_lora_rank
     const LKV: usize = 6; // kv_lora_rank
-    const NFF: usize = 16; // dense ffn
     const NE: usize = 4; // experts
-    const NFE: usize = 8; // expert ffn
     const KV: usize = 1; // GQA kv heads (`deepseek` only)
     const IH: usize = 2; // indexer heads (`glm-dsa`)
     const ID: usize = 6; // indexer head dim
@@ -1113,15 +1120,15 @@ fn write_deepseek_family_gguf(path: &Path, gqa: bool, split_mla: bool, softmax_v
             }
             tensors.push((
                 format!("{p}.ffn_gate_exps.weight"),
-                qtensor(next(NE * NFE * EMB), &[NE, NFE, EMB]),
+                (if EMB == 256 { qtensor_q4k } else { qtensor })(next(NE * NFE * EMB), &[NE, NFE, EMB]),
             ));
             tensors.push((
                 format!("{p}.ffn_up_exps.weight"),
-                qtensor(next(NE * NFE * EMB), &[NE, NFE, EMB]),
+                (if EMB == 256 { qtensor_q4k } else { qtensor })(next(NE * NFE * EMB), &[NE, NFE, EMB]),
             ));
             tensors.push((
                 format!("{p}.ffn_down_exps.weight"),
-                qtensor(next(NE * EMB * NFE), &[NE, EMB, NFE]),
+                (if EMB == 256 { qtensor_q4k } else { qtensor })(next(NE * EMB * NFE), &[NE, EMB, NFE]),
             ));
             tensors.push((
                 format!("{p}.ffn_gate_shexp.weight"),

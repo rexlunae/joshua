@@ -109,6 +109,12 @@ pub trait ExpertResidency: Send + Sync + 'static {
     /// budget stays operator-set via `--pin-hot-experts`).
     fn capacity(&self) -> usize;
 
+    fn device_cache_report(&self) -> Option<DeviceCacheReport> {
+        None
+    }
+
+    fn wait_for_uploads(&self) {}
+
     /// Protect `(layer, expert)` from LRU eviction: it is in the routing-
     /// frequency hot set, so a device slot cache must keep it resident.
     /// Backends without a fixed-size device pool (CPU madvise, no-op) ignore
@@ -1255,6 +1261,10 @@ pub struct DeviceCacheReport {
 }
 
 impl DeviceCacheReport {
+    pub(crate) fn automatic_hot_budget(&self) -> usize {
+        (self.slots * HOT_SET_SHARE.0 / HOT_SET_SHARE.1).max(usize::from(self.slots > 0))
+    }
+
     /// Snapshot `pool` (and its uploader's counters, when given).
     pub fn of<T: DeviceExpertSlot>(
         pool: &DeviceResidency<T>,
@@ -1274,6 +1284,18 @@ impl DeviceCacheReport {
 }
 
 impl<T: DeviceExpertSlot> ExpertResidency for CompositeResidency<T> {
+    fn device_cache_report(&self) -> Option<DeviceCacheReport> {
+        self.device
+            .as_ref()
+            .map(|pool| DeviceCacheReport::of(pool, self.uploader.as_deref()))
+    }
+
+    fn wait_for_uploads(&self) {
+        if let Some(uploader) = &self.uploader {
+            uploader.wait_idle();
+        }
+    }
+
     fn acquire(&self, layer: u32, expert: u32) {
         // Tier 3 first: queue a background stage (non-blocking — the stager
         // thread does the pread), so the slab can serve this expert on a later
@@ -1913,6 +1935,14 @@ mod device_pool_tests {
         assert!(r.contains(0, 6) && !r.contains(0, 5) && !r.contains(0, 4));
         assert_eq!(r.stats().refused, 0);
         assert!(r.resident_bytes() <= 120);
+    }
+
+    #[test]
+    fn automatic_hot_budget_keeps_single_slot_uploads_enabled() {
+        for (slots, expected) in [(0, 0), (1, 1), (2, 1), (3, 2), (4, 3), (16, 12)] {
+            let residency = pool(slots * 30, 30, 16, 30);
+            assert_eq!(DeviceCacheReport::of(&residency, None).automatic_hot_budget(), expected);
+        }
     }
 
     /// The background uploader fills the pool off the caller's thread,

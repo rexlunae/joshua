@@ -277,15 +277,11 @@ pub fn route(
 
 // ─── Device expert cache helpers ─────────────────────────────────────────────
 
-/// Per-slot byte estimate for a routed expert in a
-/// [`crate::residency::DeviceResidency`] pool (the f32-dense form of a
-/// ~400k-element expert).  `QMatMul` hides the raw sizes, so this is a round
-/// heuristic; an overestimate only shrinks the reported capacity, never the
-/// correctness.
+/// Legacy estimate retained for callers; loaders use compact storage sizes.
 pub const EXPERT_SLOT_BYTES_ESTIMATE: u64 = 400_000 * 4;
 
 /// Upload a quantized `QMatMul`'s blocks onto `device` (backend-generic via
-/// `QStorage::from_data` — CPU, Vulkan, Metal, OpenCL, CUDA).  `None` when
+/// `QStorage::from_data_transfer` — CPU, Vulkan, Metal, OpenCL, CUDA). `None` when
 /// the matmul is not a raw `QMatMul::QTensor` or the upload fails; the
 /// caller then keeps the host form for that expert (#62).
 pub fn upload_qmatmul(q: &candle_core::quantized::QMatMul, device: &Device) -> Option<candle_core::quantized::QMatMul> {
@@ -297,9 +293,61 @@ pub fn upload_qmatmul(q: &candle_core::quantized::QMatMul, device: &Device) -> O
         return Some(q.clone());
     }
     let bytes = qt.data().ok()?;
-    let storage = QStorage::from_data(Cow::Borrowed(&bytes), device, qt.dtype()).ok()?;
+    let storage = QStorage::from_data_transfer(Cow::Borrowed(&bytes), device, qt.dtype()).ok()?;
     let qt = QTensor::new(storage, qt.shape().clone()).ok()?;
     Some(QMatMul::QTensor(Arc::new(qt)))
+}
+
+pub(crate) fn qmatmul_bytes(weight: &candle_core::quantized::QMatMul) -> Option<u64> {
+    match weight {
+        candle_core::quantized::QMatMul::QTensor(weight) => {
+            Some(weight.storage_size_in_bytes() as u64)
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn device_cache<E, T>(
+    experts: Vec<Vec<E>>,
+    cpu: crate::residency::CpuResidency,
+    budget: Option<u64>,
+    device: &Device,
+    bytes: fn(&E) -> Option<u64>,
+    upload: fn(&E, &Device) -> Option<T>,
+) -> (
+    Arc<dyn crate::residency::ExpertResidency>,
+    Option<Arc<crate::residency::DeviceResidency<T>>>,
+)
+where
+    E: Send + Sync + 'static,
+    T: crate::residency::DeviceExpertSlot,
+{
+    let count = experts.iter().map(Vec::len).sum::<usize>() as u64;
+    let slot = experts
+        .iter()
+        .flatten()
+        .try_fold(0, |largest, expert| Some(largest.max(bytes(expert)?)))
+        .unwrap_or(0);
+    let budget = budget.unwrap_or(0).min(slot.saturating_mul(count));
+    if slot == 0 || budget < slot {
+        return (Arc::new(cpu), None);
+    }
+    tracing::info!(
+        "device expert cache: target={device:?}, {} slots, {budget} compact payload bytes",
+        budget / slot
+    );
+    let device = device.clone();
+    let pool = Arc::new(crate::residency::DeviceResidency::new(
+        budget,
+        slot,
+        Arc::new(move |layer, expert| {
+            upload(experts.get(layer as usize)?.get(expert as usize)?, &device).map(Arc::new)
+        }),
+    ));
+    let uploader = Arc::new(crate::residency::ExpertUploader::spawn(Arc::clone(&pool)));
+    let residency =
+        crate::residency::CompositeResidency::with_device_pool(cpu, Arc::clone(&pool), uploader);
+    (Arc::new(residency), Some(pool))
 }
 
 // ─── Routed-expert dispatch ──────────────────────────────────────────────────

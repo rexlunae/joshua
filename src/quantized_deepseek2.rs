@@ -419,6 +419,24 @@ fn glu(gate: &QMatMul, up: &QMatMul, down: &QMatMul, xs: &Tensor, act: Act) -> R
 }
 
 impl Mlp {
+    fn device_bytes(&self) -> Option<u64> {
+        Some(
+            crate::moe::qmatmul_bytes(&self.gate)?
+                + crate::moe::qmatmul_bytes(&self.up)?
+                + crate::moe::qmatmul_bytes(&self.down)?,
+        )
+    }
+
+    fn upload(&self, device: &Device) -> Option<DeviceExpert> {
+        Some(DeviceExpert {
+            gate: crate::moe::upload_qmatmul(&self.gate, device)?,
+            up: crate::moe::upload_qmatmul(&self.up, device)?,
+            down: crate::moe::upload_qmatmul(&self.down, device)?,
+            act: self.act,
+            bytes: self.device_bytes()?,
+            device: device.clone(),
+        })
+    }
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         glu(&self.gate, &self.up, &self.down, xs, self.act)
     }
@@ -668,6 +686,7 @@ struct DeviceExpert {
     down: QMatMul,
     act: Act,
     bytes: u64,
+    device: Device,
 }
 
 impl crate::residency::DeviceExpertSlot for DeviceExpert {
@@ -811,12 +830,17 @@ impl Moe {
         // Residency-aware per-expert forward: on a `DeviceResidency` hit run the
         // uploaded weights on the expert device; on a miss run the host form.
         // `None` residency keeps today's single-device path byte-for-byte.
+        if let Some(pool) = &self.residency {
+            pool.reclaim();
+        }
         let fwd: crate::moe::ResidencyForward<'_> = match &self.residency {
             Some(res) => Some(&(|e: usize, x: &Tensor| {
                 if let Some(dev) = res.lookup(self.layer, e as u32) {
-                    let xd = crate::moe::on_device(x, &self.expert_device)?;
+                    let xd = crate::moe::on_device(x, &dev.device)?;
                     let out = dev.forward(&xd)?;
-                    crate::moe::on_device(&out, x.device()).map(|c| c.into_owned())
+                    let out = crate::moe::on_device(&out, x.device()).map(|c| c.into_owned());
+                    res.retire(dev);
+                    out
                 } else {
                     self.experts[e].forward(x)
                 }
@@ -1218,9 +1242,6 @@ struct Reader<R: Read + Seek> {
     /// [`crate::placement::ExpertPlacement`]) — each expert is then borrowed
     /// from the mapping and [`Moe::dispatch`] hops the activations across.
     expert_device: Device,
-    /// Bytes of the bounded VRAM expert cache (#62) to build for each MoE
-    /// block (`None` / `Some(0)` disables); `load_moe` reads it.
-    device_expert_cache_bytes: Option<u64>,
 }
 
 impl<R: Read + Seek> std::ops::Deref for Reader<R> {
@@ -1399,8 +1420,11 @@ impl ModelWeights {
                 mmap,
                 arch,
             },
-            expert_device: expert_device.clone(),
-            device_expert_cache_bytes,
+            expert_device: if device_expert_cache_bytes.is_some() {
+                Device::Cpu
+            } else {
+                expert_device.clone()
+            },
         };
 
         // Kept quantized: dequantizing the table to f32 costs vocab × hidden
@@ -1486,18 +1510,40 @@ impl ModelWeights {
             });
         }
 
-        let residency: std::sync::Arc<dyn crate::residency::ExpertResidency> =
-            std::sync::Arc::new(crate::residency::CpuResidency::new(
-                layers
-                    .iter()
-                    .map(|layer| match &layer.ffn {
-                        FeedForward::Moe(moe) => {
-                            moe.experts.iter().map(|m| m.prefetch.clone()).collect()
-                        }
-                        FeedForward::Dense(_) => Vec::new(),
-                    })
-                    .collect(),
-            ));
+        let cpu = crate::residency::CpuResidency::new(
+            layers
+                .iter()
+                .map(|layer| match &layer.ffn {
+                    FeedForward::Moe(moe) => moe.experts.iter().map(|m| m.prefetch.clone()).collect(),
+                    FeedForward::Dense(_) => Vec::new(),
+                })
+                .collect(),
+        );
+        let host = layers
+            .iter()
+            .map(|layer| match &layer.ffn {
+                FeedForward::Moe(moe) => moe.experts.clone(),
+                FeedForward::Dense(_) => Vec::new(),
+            })
+            .collect();
+        let target = if expert_device.is_cpu() {
+            device
+        } else {
+            expert_device
+        };
+        let (residency, pool) = crate::moe::device_cache(
+            host,
+            cpu,
+            device_expert_cache_bytes,
+            target,
+            Mlp::device_bytes,
+            Mlp::upload,
+        );
+        for layer in &mut layers {
+            if let FeedForward::Moe(moe) = &mut layer.ffn {
+                moe.residency = pool.clone();
+            }
+        }
         Ok(Self::from_weights(Weights {
             tok_embeddings,
             layers,
@@ -1604,54 +1650,7 @@ fn load_moe<R: Read + Seek>(rd: &mut Reader<R>, p: &str, cfg: &Config, il: usize
         .and_then(|id| id.parse::<u32>().ok())
         .unwrap_or(0);
 
-    // Build the bounded VRAM expert cache (#62) when a byte budget is given.
-    // See qwen3moe::load_moe: on the CPU (this box) the "device form" wraps the
-    // already-loaded host weights (identical numbers) so a hit == the host path;
-    // on a real accelerator the device branch uploads the expert's bytes.
-    let residency = match rd.device_expert_cache_bytes {
-        Some(cap_bytes) if cap_bytes > 0 => {
-            let host = experts.clone();
-            let expert_dev = rd.expert_device.clone();
-            let per_slot = crate::moe::EXPERT_SLOT_BYTES_ESTIMATE;
-            let upload: std::sync::Arc<
-                dyn Fn(u32, u32) -> Option<std::sync::Arc<DeviceExpert>> + Send + Sync,
-            > = std::sync::Arc::new(move |l, e| {
-                if l != layer {
-                    return None;
-                }
-                let m: &Mlp = host.get(e as usize)?;
-                // Non-CPU expert device: upload each expert's quantized blocks
-                // onto it (backend-generic via QStorage::from_data) so a hit
-                // runs for real on the accelerator (#62). CPU keeps sharing host
-                // weights (parity).
-                if !expert_dev.is_cpu() {
-                    let gate = crate::moe::upload_qmatmul(&m.gate, &expert_dev)?;
-                    let up = crate::moe::upload_qmatmul(&m.up, &expert_dev)?;
-                    let down = crate::moe::upload_qmatmul(&m.down, &expert_dev)?;
-                    return Some(std::sync::Arc::new(DeviceExpert {
-                        gate,
-                        up,
-                        down,
-                        act: m.act,
-                        bytes: per_slot,
-                    }));
-                }
-                Some(std::sync::Arc::new(DeviceExpert {
-                    gate: m.gate.clone(),
-                    up: m.up.clone(),
-                    down: m.down.clone(),
-                    act: m.act,
-                    bytes: per_slot,
-                }))
-            });
-            Some(std::sync::Arc::new(crate::residency::DeviceResidency::<DeviceExpert>::new(
-                cap_bytes,
-                per_slot,
-                upload,
-            )))
-        }
-        _ => None,
-    };
+    let residency = None;
 
     Ok(Moe {
         gate_t: gate.t()?.contiguous()?,

@@ -82,6 +82,10 @@ fn cuda_transfer_preserves_blocks_and_compute_visibility() {
         let source = Tensor::from_vec(values, (2, 256), &Device::Cpu).unwrap();
         let host = QTensor::quantize(&source, dtype).unwrap();
         let expected_bytes = host.data().unwrap().into_owned();
+        let helper_upload = joshua::moe::upload_qmatmul(&QMatMul::QTensor(Arc::new(host)), &device).unwrap();
+        let QMatMul::QTensor(helper_upload) = helper_upload else { panic!("compact upload required") };
+        assert!(helper_upload.device().is_cuda());
+        assert_eq!(helper_upload.data().unwrap().as_ref(), expected_bytes);
         let regular = QTensor::new(
             QStorage::from_data(Cow::Borrowed(&expected_bytes), &device, dtype).unwrap(),
             (2, 256),
@@ -189,4 +193,226 @@ fn cuda_tiny_cache_prefill_decode_and_shared_sessions() {
         logits(&mut host, &[1, 4, 2], 0)
     );
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+fn load_older(path: &Path, device: &Device, budget: Option<u64>) -> QuantizedModel {
+    load_older_placed(path, device, &Device::Cpu, budget)
+}
+
+fn load_older_placed(
+    path: &Path,
+    device: &Device,
+    experts: &Device,
+    budget: Option<u64>,
+) -> QuantizedModel {
+    load_older_source(path, device, experts, budget, true)
+}
+
+fn load_older_source(
+    path: &Path,
+    device: &Device,
+    experts: &Device,
+    budget: Option<u64>,
+    mapped: bool,
+) -> QuantizedModel {
+    let bytes = std::fs::read(path).unwrap();
+    let mut cursor = Cursor::new(&bytes);
+    let header = joshua::gguf_ext::read_header(&mut cursor).unwrap();
+    let mapping = mapped.then(|| {
+        Arc::new(unsafe { memmap2::Mmap::map(&std::fs::File::open(path).unwrap()) }.unwrap())
+    });
+    QuantizedModel::from_gguf_mmap_placed(
+        header.to_candle_content().unwrap(),
+        &mut cursor,
+        device,
+        experts,
+        mapping,
+        None,
+        0,
+        budget,
+        joshua::EngramTier::Auto,
+    )
+    .unwrap()
+}
+
+fn older_logits(
+    model: &mut QuantizedModel,
+    device: &Device,
+    tokens: &[u32],
+    offset: usize,
+) -> Vec<f32> {
+    let input = Tensor::new(tokens, device)
+        .unwrap()
+        .reshape((1, tokens.len()))
+        .unwrap();
+    model
+        .forward_all_logits(&input, offset)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_device(&Device::Cpu)
+        .unwrap()
+        .to_vec1()
+        .unwrap()
+}
+
+fn older_error(actual: &[f32], expected: &[f32]) -> f32 {
+    assert_close(actual, expected);
+    let mut error = 0.0f32;
+    for (actual, expected) in actual.chunks_exact(16).zip(expected.chunks_exact(16)) {
+        let winner = |row: &[f32]| {
+            row.iter()
+                .enumerate()
+                .max_by(|left, right| left.1.total_cmp(right.1))
+                .unwrap()
+                .0
+        };
+        assert_eq!(winner(actual), winner(expected));
+        for (actual, expected) in actual.iter().zip(expected) {
+            error = error.max((actual - expected).abs());
+        }
+    }
+    error
+}
+
+#[test]
+fn cuda_older_loaders_bounded_shared_cache() {
+    const SLOT: u64 = 3 * 256 * 256 / 256 * 144;
+    let device = cuda();
+    assert!(device.is_cuda());
+    eprintln!("older-loader dense/cache destination: {device:?}; source experts: Cpu");
+    for (name, write) in [
+        (
+            "qwen",
+            common::write_tiny_qwen3moe_quantized_gguf as fn(&Path),
+        ),
+        (
+            "deepseek2",
+            common::write_tiny_deepseek2_quantized_gguf as fn(&Path),
+        ),
+    ] {
+        let dir = common::model_dir(&format!("cuda-old-{name}"));
+        let path = dir.join("model.gguf");
+        write(&path);
+        let template = load_older(&path, &device, Some(3 * SLOT));
+        assert_eq!(template.device_expert_cache().unwrap().slots, 3);
+        let mut first = template.new_session().unwrap();
+        let mut second = template.new_session().unwrap();
+        std::thread::scope(|scope| {
+            for (cached, prompt) in [(&mut first, [1, 4, 2]), (&mut second, [5, 7, 1])] {
+                let device = &device;
+                let path = &path;
+                scope.spawn(move || {
+                    let mut host = load_older(path, device, Some(0));
+                    cached.set_pin_hot_experts(3);
+                    let mut error = older_error(
+                        &older_logits(cached, device, &prompt, 0),
+                        &older_logits(&mut host, device, &prompt, 0),
+                    );
+                    for offset in 3..73 {
+                        error = error.max(older_error(
+                            &older_logits(cached, device, &[3], offset),
+                            &older_logits(&mut host, device, &[3], offset),
+                        ));
+                        cached.wait_for_expert_uploads();
+                        let report = cached.device_expert_cache().unwrap();
+                        assert!(
+                            report.resident_bytes <= 3 * SLOT && report.resident <= 3,
+                            "{name}: {report:?}"
+                        );
+                    }
+                    error = error.max(older_error(
+                        &older_logits(cached, device, &[3, 8, 3], 73),
+                        &older_logits(&mut host, device, &[3, 8, 3], 73),
+                    ));
+                    eprintln!("CUDA {name} prompt={prompt:?}: max_abs_logit_error={error}");
+                });
+            }
+        });
+        template.wait_for_expert_uploads();
+        let report = template.device_expert_cache().unwrap();
+        eprintln!("CUDA {name} shared bounded cache: {report:?}");
+        assert!(
+            report.stats.uploads > 0 && report.stats.hits > 0,
+            "{report:?}"
+        );
+        assert_eq!(report.stats.upload_failures, 0, "{report:?}");
+        assert_eq!(report.stats, first.device_expert_cache().unwrap().stats);
+        assert_eq!(report.stats, second.device_expert_cache().unwrap().stats);
+        let mut zero = load_older(&path, &device, Some(0));
+        let mut host = load_older(&path, &device, None);
+        assert!(zero.device_expert_cache().is_none());
+        assert_eq!(
+            older_logits(&mut zero, &device, &[1, 4, 2], 0),
+            older_logits(&mut host, &device, &[1, 4, 2], 0)
+        );
+        assert_eq!(
+            older_logits(&mut zero, &device, &[3], 3),
+            older_logits(&mut host, &device, &[3], 3)
+        );
+        let mut streamed = load_older_source(&path, &device, &Device::Cpu, Some(3 * SLOT), false);
+        let mut host = load_older(&path, &device, Some(0));
+        streamed.set_pin_hot_experts(3);
+        for offset in 0..70 {
+            older_error(
+                &older_logits(&mut streamed, &device, &[3], offset),
+                &older_logits(&mut host, &device, &[3], offset),
+            );
+            streamed.wait_for_expert_uploads();
+        }
+        let report = streamed.device_expert_cache().unwrap();
+        assert!(
+            report.stats.uploads > 0 && report.stats.hits > 0,
+            "{report:?}"
+        );
+        assert_eq!(report.stats.upload_failures, 0);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[test]
+#[ignore = "bounded timing probe; run explicitly on an idle-enough CUDA device"]
+fn cuda_older_loaders_decode_measurement() {
+    const SLOT: u64 = 3 * 256 * 256 / 256 * 144;
+    let device = cuda();
+    for (name, write) in [
+        (
+            "qwen",
+            common::write_tiny_qwen3moe_quantized_gguf as fn(&Path),
+        ),
+        (
+            "deepseek2",
+            common::write_tiny_deepseek2_quantized_gguf as fn(&Path),
+        ),
+    ] {
+        let dir = common::model_dir(&format!("cuda-timing-{name}"));
+        let path = dir.join("model.gguf");
+        write(&path);
+        for (mode, experts, budget) in [
+            ("host-experts", &Device::Cpu, Some(0)),
+            ("partial-cache", &Device::Cpu, Some(3 * SLOT)),
+            ("all-device", &device, None),
+        ] {
+            let mut model = load_older_placed(&path, &device, experts, budget);
+            model.set_pin_hot_experts(3);
+            let mut samples = Vec::with_capacity(3);
+            for _trial in 0..3 {
+                model.clear_kv_cache();
+                older_logits(&mut model, &device, &[1, 4, 2], 0);
+                for offset in 3..73 {
+                    older_logits(&mut model, &device, &[3], offset);
+                }
+                model.wait_for_expert_uploads();
+                let start = std::time::Instant::now();
+                for offset in 73..137 {
+                    older_logits(&mut model, &device, &[3], offset);
+                }
+                samples.push(start.elapsed().as_secs_f64());
+            }
+            samples.sort_by(f64::total_cmp);
+            eprintln!("CUDA bounded decode {name} {mode}: 64 tokens, seconds={samples:?}, median_tok_s={:.3}, cache={:?}",
+                64.0 / samples[1], model.device_expert_cache());
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }
