@@ -76,7 +76,9 @@ talking to its owner, and two components agree without negotiating:
 ```rust
 // h_0 is a fixed constant so independent processes agree (as in vLLM APC).
 let mut h = H(salt, NONE_HASH);
-for chunk in tokens.chunks(HASH_CHUNK) {
+// Only complete chunks are keyed: a short trailing chunk would let one key
+// stand for fewer than HASH_CHUNK tokens.
+for chunk in tokens.chunks_exact(HASH_CHUNK) {
     h = H(&h, chunk);          // 32-byte digest
     keys.push(h);
 }
@@ -93,8 +95,22 @@ for chunk in tokens.chunks(HASH_CHUNK) {
   tensor/metadata identity, not the file bytes, so a re-download does not
   invalidate the cache.
 * A shared *key prefix* of length `c` means the first `16c` tokens are
-  identical — exactly the condition the local `starts_with` check already
-  enforces. This equivalence is the phase-1 property test.
+  identical. The tokens after the last complete chunk are never keyed, so a
+  chain says nothing about them.
+* The local check is stricter than a shared prefix. `PrefixCache::best_len`
+  takes an entry only when it is a **strict** prefix of the prompt
+  (`entry.len() < prompt.len()`), so at least one prompt token is left to
+  produce logits. An entry the length of the whole prompt never matches. The
+  phase-1 property test therefore states the equivalence the cache uses:
+  for an entry `E` ending on a chunk boundary and a prompt `P`,
+  `keys(E)` is a prefix of `keys(P)` and `E.len() < P.len()` ⟺
+  `P.starts_with(E)` and `E.len() < P.len()`. The usable overlap for a
+  prompt of `n` tokens is capped at `⌊(n − 1) / 16⌋` chunks.
+* An advertised key promises a servable entry that ends exactly at that
+  chunk boundary. `chunk`-granularity workers can cut one there (§4).
+  A `snapshot`-granularity entry ends wherever its conversation ended, so
+  it is reusable only by prompts that contain its whole token sequence. Its
+  last complete chunk key alone would over-promise. See open question 2.
 * Keys are over **post-template** prompt tokens (what `Engine::tokenize`
   yields), not raw request text.
 
@@ -149,17 +165,30 @@ promise differs.
 The router already sees every request, so the index is fed by the data
 plane rather than by polling:
 
-* **Request**: the router computes `h_1..h_k` (§8) and forwards them in a
-  small header (`x-joshua-prefix`, base64 of the last few keys — the chain
-  makes the earlier ones implied). The worker does not need them to serve
-  the request; they let it report without re-deriving.
-* **Response**: the worker adds `x-joshua-cache: had=17 produced=32` — how
-  many chunks it already held for this chain, and how many it holds after
-  the request. One header on a response already crossing the wire, arriving
-  with the first byte, before decode. **Zero extra round trips.**
-* The router folds it into `HashMap<Key, Entry { worker, last_seen }>` under
-  one mutex or a sharded set of them, read on the pick path. No RPC, no
-  `.await`, no Redis.
+* **Request**: the router computes `h_1..h_k` (§8) and forwards only the
+  count and the tip: `x-joshua-prefix: k=32 tip=<base64 h_k>`. The chain
+  cannot be run backwards, so the earlier keys are not recoverable from the
+  tip. The worker does not need them: it tokenizes the prompt itself (§8)
+  and derives its own `h_1..h_k` under its own salt. The tip is a drift
+  check. If the worker's `h_k` differs, the two sides tokenized or templated
+  differently. The worker then reports `had=0` and counts a drift, rather
+  than reporting a count against a chain the router does not share.
+* **Response header**: `x-joshua-cache: had=17`, the number of chunks of
+  this chain the worker reused. That count is known at admission, when the
+  worker's `best_len` lookup runs, so it is available before the first byte
+  even on a streamed response. **Zero extra round trips.**
+* **After the response**: what the worker holds *after* the request is not
+  known when headers go out. A stream's headers precede decode, and parking
+  happens when the session ends. So it does not ride the header. When a
+  request completes successfully, the router inserts an optimistic positive
+  for the prompt's usable chunks on that worker, since a finished session
+  is parked by default. The probe-driven deltas (§6) then confirm it or
+  tombstone it. A wrong optimistic entry is a stale positive: it costs one
+  recompute, never a wrong output (see below).
+* The router maps the counts onto its own key list. `had=17` means
+  `h_1..h_17` are held by that worker. The router folds this into
+  `HashMap<Key, Entry { worker, last_seen }>` under one mutex or a sharded
+  set of them, read on the pick path. No RPC, no `.await`, no Redis.
 
 Sizing, at 10k chunks per worker: 480 KB of index per worker, 3.8 MB for
 eight — less than one 16-token block of Qwen3-4B's f32 KV. A 2k-token prompt
@@ -199,10 +228,14 @@ updates rather than diffs keep re-application idempotent.
 Longest matching chain wins, but only when it pays:
 
 ```text
-gain(node) = min(overlap_chunks(node), k) × STORAGE_CHUNK × prefill_s_per_token
+k          = ⌊(prompt_tokens − 1) / HASH_CHUNK⌋     // strict-prefix cap, §3
+gain(node) = min(overlap_chunks(node), k) × HASH_CHUNK × prefill_s_per_token
            − queue_wait_delta(node)
            − misroute_penalty
 ```
+
+`overlap_chunks` counts hash chunks. A worker advertises at storage-chunk
+granularity, so the overlap moves in steps of four.
 
 `try_pick` keeps its existing eligibility filter (model, capability,
 health, slots) and adds this term to its load comparison: a worker with a
@@ -220,8 +253,26 @@ long overlap may accept a longer queue and still win. Two guards:
 Fallback ladder when there is no exact information:
 
 1. exact chunk index (§5);
-2. deterministic affinity, `hash(salt, prefix_tokens) % eligible_workers`
-   — the CARP pattern, no state and no traffic, shared with #156's handle;
+2. deterministic affinity, `hash(affinity_key) % eligible_workers`. This
+   is the CARP pattern: no state and no traffic, shared with #156's handle.
+   Use rendezvous hashing rather than a plain modulus, so a worker joining
+   or leaving moves only its own share. The key depends on what the router
+   has:
+   * **with a tokenizer**: `H(salt, h_c)`, where `h_c` is the chain key at
+     the last complete storage chunk of the shared head (system prompt and
+     tools). It is the same identity as step 1, just coarser.
+   * **without a tokenizer**: there are no post-template tokens to hash,
+     so the key is taken from the request body instead:
+     `H(model, tenant_id, canon(tools), canon(leading system/developer
+     messages))` for chat requests, and `H(model, tenant_id, first 4 KiB
+     of prompt)` for completions. `canon` is a canonical JSON
+     serialisation (sorted keys, no insignificant whitespace). It is
+     cruder than tokens: a whitespace edit inside a system prompt changes
+     the key, and two templates that render the same text get different
+     keys. That only costs locality. The worker's own `best_len` still
+     authorizes every reuse.
+   * an explicit #156 conversation handle, when the client sends one, takes
+     precedence over both.
 3. least-loaded (`try_pick` today).
 
 
@@ -241,9 +292,9 @@ needs a tokenizer — but only a tokenizer: `tokenizer.json` (a few MB, pure
   hit. The salt in §3 is the second guard, catching the case where both
   sides mis-tokenize identically.
 * Without a configured tokenizer, the router runs the affinity ladder
-  (§7, steps 2–3), which needs no tokenization at all. This is also why
-  phase 5 is worth landing on its own: it requires no keys, no index, and no
-  new traffic.
+  (§7, steps 2–3) on the body-derived key defined in §7. That needs no
+  tokenization at all. This is also why phase 5 is worth landing on its own:
+  it requires no chunk keys, no index, and no new traffic.
 
 ## 9. What this deliberately does not do
 
@@ -282,6 +333,8 @@ attempt, which already carries queue time and outcome):
   worker (`had=` in the response);
 * `prefix_index_hits`, `prefix_index_misses`, `prefix_index_stale` — where
   the winner's `had=` was 0 despite a positive directory entry;
+* `prefix_drift` — requests whose `tip` the worker did not reproduce
+  (router and worker tokenization or template disagree);
 * `prefix_affinity_fallbacks` — picks made by ladder step 2 or 3;
 * `prefix_delta_bytes`, `prefix_probe_bytes` — directory traffic;
 * per-worker `cache.chunks`, `cache.bytes`, `cache.epoch`.
@@ -323,9 +376,14 @@ that eviction is not the confounder; 3 and 4 need the real deployment.
    chunk, so nothing is parkable and nothing is advertised. Options: keep a
    trailing partial chunk keyed with its true length, or let `tokens < 64`
    fall through to affinity. Leaning to the latter until measured.
-3. **Header vs SSE event** for `had=`/`produced=`. A header is free and
-   arrives at the first byte, which is when the router wants it; an SSE
-   event would also work for non-HTTP transports later.
+3. **Reporting what was produced.** §5 takes `produced` off the request path:
+   `had=` rides a header, and occupancy after the request comes from an
+   optimistic insert corrected by deltas. If the optimistic entries prove
+   noisy, the alternatives are an HTTP trailer, which streaming clients and
+   proxies often drop, or a final SSE comment line (`: joshua-cache
+   produced=32`). Clients ignore SSE comments, but the router would have to
+   parse the stream it now forwards byte for byte. Decide after phase 3
+   measures how often an optimistic positive turns out stale.
 4. **Detecting template drift.** A digest over `tokenizer.json` plus the
    resolved template string should be enough, but a worker could also report
    the hash of its first rendered chunk so a mismatch shows up as a
