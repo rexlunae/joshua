@@ -81,15 +81,56 @@ On each worker, `GET /v1/worker/info` (protocol version 1):
   with protocol version 1; a transport failure during a request also takes it
   out of rotation until the next good probe.
 * A request names its model in `model`.  It goes to a healthy worker
-  reporting exactly that id; with no `model`, any worker serves it.  An
+  reporting exactly that id; with no `model`, only single-model workers are
+  eligible (the server registry requires an explicit id with multiple models).
+  The router never rewrites the request to insert a model. An
   unknown model is a `404` with `code: "model_not_found"` listing the served
   models; a known model with no healthy worker is a `503` (`no_worker`).
-* Each worker gets at most `slots` requests from the router, minus requests
-  it reported running for other clients at the last probe.  The router picks
-  the matching worker with the lowest load ratio; ties rotate.
+* Each model gets at most its advertised `max_concurrency` requests, minus
+  requests reported running for other clients at the last probe. Legacy
+  single-model workers use the worker-wide figures. `--worker-slots` remains
+  an additional worker-wide cap when per-model figures are present.
+* Chat `context_window` (including `num_ctx` / `n_ctx` aliases) is matched
+  against the selected model's loaded window, not another model's window.
+  Workers can add optional `n_ctx` to each entry in `models` without changing
+  protocol version 1. Missing secondary-model context is **unknown** on old
+  workers; the top-level `n_ctx` describes only the primary model. Unknown
+  context remains eligible as a legacy fallback, with known-fitting free
+  slots preferred. Missing or zero context metadata is not a fit guarantee.
+  When all matching workers have reported known, insufficient windows,
+  admission returns `400 context_window_exceeded` without dispatch or queuing.
+  An unprobed or potentially fitting unhealthy worker prevents this definitive
+  rejection (`503 no_worker` instead). Busy fitting workers use the normal
+  queue even when smaller incompatible workers have free slots.
+* Among available, equally context-qualified candidates, the router ranks
+  outstanding estimated work plus the incoming request, divided by that
+  model's slots; ties use request count, then rotate. Work hints are serialized
+  bytes of `messages`, `prompt`, or embedding `input`, plus four work units per
+  requested output token (chat `max_completion_tokens` wins over `max_tokens`).
+  The fallback output hint is 256 for generation and zero for embeddings.
+  Each request's hint is capped at 16,777,216 units. Hints stay reserved until
+  its response/stream ends or is dropped; external requests, whose sizes are
+  unknown, are assigned the incoming request's hint. This is a scheduling
+  heuristic, **not exact tokens, remaining work, or predicted latency**.
+  Prompt JSON is borrowed from the bounded HTTP body without constructing a
+  JSON tree or decoding/copying its strings. Accounting has one entry per
+  active model and is released on all existing guard/drop paths.
 * When every slot is busy the request waits in the queue.  A full queue is a
   `429` (`queue_full`), a wait past `--queue-timeout-ms` a `503`
   (`queue_timeout`); both carry `Retry-After: 1`.
+
+### Context-fit limits
+
+The only hard context constraint added here is the explicit chat window the
+engine already validates. Completion and embedding routes do not interpret
+that option, so the router does not enforce it there. The router does not
+load weights or tokenizers, create private model copies, count rendered chat
+template/media tokens, or reject a prompt based on byte size. Exact prompt
+fit, invalid generation options, and output-token clamping remain worker
+decisions. In particular, `max_tokens` is a ceiling the engine may clamp,
+not a minimum context reservation. Omitted windows still require worker-side
+tokenization to validate prompt fit. This slice supplies neither affinity nor
+real-host 1/2/4-worker throughput/latency benchmarks; issue #155 remains open.
 
 ## Failure and retry rules
 

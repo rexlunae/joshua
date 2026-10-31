@@ -67,6 +67,8 @@ struct Fake {
     name: String,
     model: String,
     max_concurrency: usize,
+    n_ctx: AtomicUsize,
+    models: Mutex<Vec<ModelSlots>>,
     behavior: Mutex<Behavior>,
     /// Requests received on the routed endpoints.
     received: AtomicUsize,
@@ -100,8 +102,8 @@ async fn fake_info(State(f): State<Arc<Fake>>) -> Json<WorkerInfo> {
     Json(WorkerInfo {
         protocol_version: WORKER_PROTOCOL_VERSION,
         model: f.model.clone(),
-        models: Vec::new(),
-        n_ctx: 4096,
+        models: f.models.lock().unwrap().clone(),
+        n_ctx: f.n_ctx.load(Ordering::SeqCst) as u32,
         backend: "cpu".to_string(),
         max_concurrency: f.max_concurrency,
         in_flight: f.active.load(Ordering::SeqCst),
@@ -301,6 +303,8 @@ async fn spawn_fake_handle(
         name: name.to_string(),
         model: model.to_string(),
         max_concurrency,
+        n_ctx: AtomicUsize::new(4096),
+        models: Mutex::new(Vec::new()),
         behavior: Mutex::new(behavior),
         received: AtomicUsize::new(0),
         active: AtomicUsize::new(0),
@@ -1239,12 +1243,14 @@ async fn spawn_two_model_worker() -> (Arc<(AtomicUsize, Notify)>, String) {
             models: vec![
                 ModelSlots {
                     id: "alpha".to_string(),
+                    n_ctx: Some(4096),
                     max_concurrency: 1,
                     in_flight: 0,
                     embeddings: true,
                 },
                 ModelSlots {
                     id: "beta".to_string(),
+                    n_ctx: Some(8192),
                     max_concurrency: 1,
                     in_flight: 0,
                     embeddings: false,
@@ -1332,6 +1338,283 @@ async fn a_configured_worker_slot_cap_bounds_all_its_models_together() {
 
     worker.1.notify_waiters();
     assert_eq!(held.await.unwrap().status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn context_fit_uses_each_models_window_and_refreshes_registry() {
+    let (worker, url) = spawn_fake("registry", "alpha", 3, Behavior::Echo).await;
+    worker.n_ctx.store(64, Ordering::SeqCst);
+    *worker.models.lock().unwrap() = vec![
+        ModelSlots {
+            id: "alpha".into(),
+            n_ctx: Some(64),
+            max_concurrency: 1,
+            in_flight: 0,
+            embeddings: true,
+        },
+        ModelSlots {
+            id: "beta".into(),
+            n_ctx: Some(8192),
+            max_concurrency: 2,
+            in_flight: 0,
+            embeddings: false,
+        },
+    ];
+    let (coordinator, router) = spawn_router(config(&[&url])).await;
+    for alias in ["context_window", "num_ctx", "n_ctx"] {
+        let body = json!({"model": "beta", "messages": [], alias: 8192});
+        let res = chat(&router, body.clone()).await;
+        assert_eq!(res.status, StatusCode::OK, "{}", res.text());
+        assert_eq!(
+            worker.last_body.lock().unwrap().as_deref(),
+            Some(body.to_string().as_bytes())
+        );
+    }
+    let res = chat(&router, json!({"model": "alpha", "context_window": 65})).await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST);
+    assert_eq!(res.json()["error"]["code"], "context_window_exceeded");
+    assert!(res.header(WORKER_HEADER).is_none());
+    assert!(res.header(REQUEST_ID_HEADER).is_some());
+    assert_eq!(worker.received.load(Ordering::SeqCst), 3);
+
+    worker.models.lock().unwrap()[1].n_ctx = Some(128);
+    coordinator.refresh().await;
+    let res = chat(&router, json!({"model": "beta", "context_window": 129})).await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST);
+    worker.models.lock().unwrap().pop();
+    coordinator.refresh().await;
+    let res = chat(&router, json!({"model": "beta", "messages": []})).await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn old_secondary_context_is_unknown_not_the_primary_context() {
+    let (worker, url) = spawn_fake("old", "alpha", 2, Behavior::Echo).await;
+    worker.n_ctx.store(64, Ordering::SeqCst);
+    *worker.models.lock().unwrap() = vec![
+        ModelSlots {
+            id: "alpha".into(),
+            n_ctx: None,
+            max_concurrency: 1,
+            in_flight: 0,
+            embeddings: true,
+        },
+        ModelSlots {
+            id: "beta".into(),
+            n_ctx: None,
+            max_concurrency: 1,
+            in_flight: 0,
+            embeddings: true,
+        },
+    ];
+    let (coordinator, router) = spawn_router(config(&[&url])).await;
+    let res = chat(&router, json!({"model": "beta", "context_window": 8192})).await;
+    assert_eq!(res.status, StatusCode::OK);
+    let res = chat(&router, json!({"model": "alpha", "context_window": 65})).await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST);
+    let res = chat(&router, json!({"messages": []})).await;
+    assert_eq!(res.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(worker.received.load(Ordering::SeqCst), 1);
+
+    worker.models.lock().unwrap().clear();
+    coordinator.refresh().await;
+    let res = chat(&router, json!({"messages": [], "context_window": 64})).await;
+    assert_eq!(res.status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn fitting_workers_saturate_even_when_small_context_slots_are_free() {
+    let (small, small_url) = spawn_fake("small", "m", 4, Behavior::Echo).await;
+    small.n_ctx.store(64, Ordering::SeqCst);
+    let (large, large_url) = spawn_fake("large", "m", 1, Behavior::Gate).await;
+    let mut cfg = config(&[&small_url, &large_url]);
+    cfg.queue_depth = 1;
+    cfg.queue_timeout = Duration::from_millis(100);
+    let (coordinator, router) = spawn_router(cfg).await;
+    let held = tokio::spawn({
+        let router = router.clone();
+        async move { chat(&router, json!({"model": "m", "context_window": 4096})).await }
+    });
+    eventually("large context slot held", || {
+        large.active.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    let queued = tokio::spawn({
+        let router = router.clone();
+        async move { chat(&router, json!({"model": "m", "context_window": 4096})).await }
+    });
+    let res = queued.await.unwrap();
+    assert_eq!(res.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(res.json()["error"]["code"], "queue_timeout");
+    assert_eq!(res.header("retry-after"), Some("1"));
+
+    let mut cfg = config(&[&small_url, &large_url]);
+    cfg.queue_depth = 0;
+    let (_, saturated_router) = spawn_router(cfg).await;
+    let res = chat(
+        &saturated_router,
+        json!({"model": "m", "context_window": 4096}),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(res.header("retry-after"), Some("1"));
+    let res = chat(&router, json!({"model": "m", "context_window": 4097})).await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST);
+    assert_eq!(small.received.load(Ordering::SeqCst), 0);
+    large.release.notify_waiters();
+    assert_eq!(held.await.unwrap().status, StatusCode::OK);
+    eventually("context slot released", || {
+        coordinator
+            .status_report()
+            .iter()
+            .all(|worker| worker.dispatched == 0)
+    })
+    .await;
+    *large.behavior.lock().unwrap() = Behavior::Echo;
+    assert_eq!(
+        chat(&router, json!({"model": "m", "context_window": 4096}))
+            .await
+            .status,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn outstanding_work_breaks_equal_request_count_ties_and_is_released() {
+    let (heavy, heavy_url) = spawn_fake("heavy", "m", 3, Behavior::Gate).await;
+    let (light, light_url) = spawn_fake("light", "m", 3, Behavior::Gate).await;
+    let (coordinator, router) = spawn_router(config(&[&heavy_url, &light_url])).await;
+    let first = tokio::spawn({
+        let router = router.clone();
+        async move {
+            chat(
+                &router,
+                json!({"model": "m", "messages": [{"content": "x".repeat(32768)}]}),
+            )
+            .await
+        }
+    });
+    eventually("heavy work admitted", || {
+        heavy.active.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    let second = tokio::spawn({
+        let router = router.clone();
+        async move { chat(&router, json!({"model": "m", "messages": []})).await }
+    });
+    eventually("light work admitted", || {
+        light.active.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    *heavy.behavior.lock().unwrap() = Behavior::Echo;
+    *light.behavior.lock().unwrap() = Behavior::Echo;
+    let res = chat(&router, json!({"model": "m", "messages": []})).await;
+    assert_eq!(res.header(WORKER_HEADER), Some(light_url.as_str()));
+    heavy.release.notify_waiters();
+    light.release.notify_waiters();
+    assert_eq!(first.await.unwrap().status, StatusCode::OK);
+    assert_eq!(second.await.unwrap().status, StatusCode::OK);
+    eventually("all work released", || {
+        coordinator
+            .status_report()
+            .iter()
+            .all(|worker| worker.dispatched == 0)
+    })
+    .await;
+    let res = chat(&router, json!({"model": "m", "messages": []})).await;
+    assert_eq!(res.header(WORKER_HEADER), Some(light_url.as_str()));
+    let res = chat(&router, json!({"model": "m", "messages": []})).await;
+    assert_eq!(res.header(WORKER_HEADER), Some(heavy_url.as_str()));
+}
+
+#[tokio::test]
+async fn context_hints_do_not_reject_unmeasured_prompts_or_ignored_route_fields() {
+    let (worker, url) = spawn_fake("small", "m", 1, Behavior::Echo).await;
+    worker.n_ctx.store(8, Ordering::SeqCst);
+    let (_, router) = spawn_router(config(&[&url])).await;
+    let body =
+        json!({"model": "m", "messages": [{"content": "x".repeat(32768)}], "max_tokens": u32::MAX});
+    assert_eq!(chat(&router, body).await.status, StatusCode::OK);
+    for path in ["/v1/completions", "/v1/embeddings"] {
+        let res = call(
+            &router,
+            "POST",
+            path,
+            r#"{"model":"m","prompt":"x","input":"x","context_window":99999,"num_ctx":88888}"#,
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::OK, "{}", res.text());
+    }
+}
+
+#[tokio::test]
+async fn heterogeneous_model_slots_are_independent_of_the_primary_window() {
+    let (worker, url) = spawn_fake("multi", "alpha", 3, Behavior::Gate).await;
+    worker.n_ctx.store(64, Ordering::SeqCst);
+    *worker.models.lock().unwrap() = vec![
+        ModelSlots {
+            id: "alpha".into(),
+            n_ctx: Some(64),
+            max_concurrency: 1,
+            in_flight: 0,
+            embeddings: true,
+        },
+        ModelSlots {
+            id: "beta".into(),
+            n_ctx: Some(8192),
+            max_concurrency: 2,
+            in_flight: 0,
+            embeddings: true,
+        },
+    ];
+    let mut cfg = config(&[&url]);
+    cfg.queue_depth = 0;
+    let (coordinator, router) = spawn_router(cfg).await;
+    let mut held = Vec::new();
+    for active in 1..=2 {
+        held.push(tokio::spawn({
+            let router = router.clone();
+            async move { chat(&router, json!({"model": "beta", "context_window": 8192})).await }
+        }));
+        eventually("beta slot held", || {
+            worker.active.load(Ordering::SeqCst) == active
+        })
+        .await;
+    }
+    coordinator.refresh().await;
+    let res = chat(&router, json!({"model": "beta", "context_window": 8192})).await;
+    assert_eq!(res.status, StatusCode::TOO_MANY_REQUESTS);
+    *worker.behavior.lock().unwrap() = Behavior::Echo;
+    let res = chat(&router, json!({"model": "alpha", "context_window": 64})).await;
+    assert_eq!(res.status, StatusCode::OK);
+    worker.release.notify_waiters();
+    for request in held {
+        assert_eq!(request.await.unwrap().status, StatusCode::OK);
+    }
+}
+
+#[tokio::test]
+async fn context_unavailability_is_not_misreported_as_an_invalid_window() {
+    let (small, small_url) = spawn_fake("small", "m", 1, Behavior::Echo).await;
+    small.n_ctx.store(64, Ordering::SeqCst);
+    let (_, large_url, handle) = spawn_fake_handle("large", "m", 1, Behavior::Echo).await;
+    let (coordinator, router) = spawn_router(config(&[&small_url, &large_url])).await;
+    handle.abort();
+    let _ = handle.await;
+    coordinator.refresh().await;
+    let res = chat(&router, json!({"model": "m", "context_window": 4096})).await;
+    assert_eq!(
+        res.status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "{}",
+        res.text()
+    );
+    assert_eq!(res.json()["error"]["code"], "no_worker");
+    let dead = dead_url().await;
+    let (_, router) = spawn_router(config(&[&small_url, &dead])).await;
+    let res = chat(&router, json!({"model": "m", "context_window": 4096})).await;
+    assert_eq!(res.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(small.received.load(Ordering::SeqCst), 0);
 }
 
 /// A batch embedding whose cancel flag is set stops before the next input,
@@ -1512,4 +1795,3 @@ vAAgG105dwYP0yuZkqDAzaPJA2jHb6cV4BcMkMIMtyb4dWcn+I8bcnwI
         server.abort();
     }
 }
-

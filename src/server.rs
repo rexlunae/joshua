@@ -1163,6 +1163,7 @@ async fn worker_info(State(state): State<AppState>) -> Result<Json<WorkerInfo>, 
                 .iter()
                 .map(|m| ModelSlots {
                     id: m.id.clone(),
+                    n_ctx: Some(m.engine.n_ctx()),
                     max_concurrency: m.engine.max_concurrency(),
                     in_flight: m.engine.in_flight(),
                     embeddings: !m.engine.remote_only(),
