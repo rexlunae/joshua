@@ -25,8 +25,11 @@ cover, and a lookup matches an entry whose tokens are a strict prefix of the
 prompt (`PrefixCache::best_len` scans for the longest one). Two kinds of
 entry: **root** entries at the end of a prompt's shared head (a system
 prompt and tool list), kept until everything else has been evicted, and
-**parked conversations**. The cache is per process, so on a routed cluster
-it is per worker, and nothing outside the worker can see it.
+**parked conversations**. A finished conversation reaches the cache only
+after the warm session pool lets it go (`Engine::release_model`). Until
+then it is reused straight from the pool by longest common prefix. Both
+tiers are per process, so on a routed cluster they are per worker, and
+nothing outside the worker can see them.
 
 `docs/request-routing.md` states the routing limit plainly: routing uses
 model id, slots and reported in-flight count, and "does not … prefer a
@@ -143,7 +146,17 @@ worker simply omits it and is routed as today.
   own stale entries.
 * `chunks` / `tokens` — what the worker can serve **now**, after its own
   LRU has run, not a high-water mark. This is what makes a replica
-  self-correcting.
+  self-correcting. The servable set has two tiers, and both count:
+  * the **warm session pool**. `Engine::release_model` returns a finished
+    session there. A new prompt reuses it by longest common prefix, and
+    rewinds through `rewind_target` where the architecture allows it.
+  * the **`PrefixCache`**. A pooled session is parked here only when the
+    pool evicts it, and only if it is at least `PREFIX_CACHE_PARK_MIN`
+    (256) tokens; shorter ones are dropped.
+
+  A key is held when either tier can serve it. Moving a session from the
+  pool into the cache is not an event. Dropping a session, or evicting one
+  from the cache, emits a tombstone.
 * `root` — 8-byte XOR (or Merkle) sketch over the sorted chunk keys, for
   anti-entropy (§6).
 * `watermark` — the last delta sequence number the worker has emitted.
@@ -180,11 +193,15 @@ plane rather than by polling:
 * **After the response**: what the worker holds *after* the request is not
   known when headers go out. A stream's headers precede decode, and parking
   happens when the session ends. So it does not ride the header. When a
-  request completes successfully, the router inserts an optimistic positive
-  for the prompt's usable chunks on that worker, since a finished session
-  is parked by default. The probe-driven deltas (§6) then confirm it or
-  tombstone it. A wrong optimistic entry is a stale positive: it costs one
-  recompute, never a wrong output (see below).
+  request completes successfully, the router records a **provisional**
+  positive for the prompt's usable chunks on that worker, because a finished
+  session normally stays in its warm pool (§4). Provisional entries are kept
+  apart from the replica (§6). A worker can never tombstone something it
+  never held, such as a session the pool dropped under memory pressure. So
+  a provisional entry is confirmed by an insert delta (or a full snapshot)
+  that names it, or it expires on its own after two probe intervals. Until
+  then it is a possible stale positive: it costs one recompute, never a
+  wrong output (see below).
 * The router maps the counts onto its own key list. `had=17` means
   `h_1..h_17` are held by that worker. The router folds this into
   `HashMap<Key, Entry { worker, last_seen }>` under one mutex or a sharded
@@ -216,6 +233,14 @@ Eight workers at 2 s is 4 probes/s, so steady-state directory traffic is a
 few hundred bytes per second — independent of cache size, because the sketch
 compresses it. This is Merkle/XOR anti-entropy as used in Cassandra and
 Dynamo: cheap comparison in the common case, real data only on divergence.
+
+The replica holds only what the worker reported, through a snapshot or a
+delta. The router's provisional entries (§5) live in a separate map with a
+TTL of two probe intervals. They are consulted on the pick path, but they are
+never folded into the replica or the sketch comparison, so they cannot cause
+a resync. An insert delta for the same key promotes one into the replica.
+Expiry removes one without any message from the worker. Reconciliation
+therefore never needs a tombstone for state the worker never held.
 
 Workers keep a bounded ring of recent deltas (say, 10 minutes or 100k
 entries); a router that falls further behind than that takes a full
