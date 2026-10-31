@@ -527,6 +527,19 @@ curl http://localhost:8080/v1/audio/transcriptions \
   -F file=@speech.wav -F language=en
 ```
 
+Whisper jobs use a separate one-slot, per-model admission gate before entering
+the blocking pool; queued HTTP requests do not occupy blocking threads or
+allocate decoded audio/mel buffers. The multipart file buffer is moved into
+the job without a whole-upload copy. There are no temporary upload files.
+Dropping the request cancels queued work and signals an active job to stop;
+the job retains its permit until it exits, including on errors or panics.
+WAV ingest/resampling checks cancellation every 1,024 samples/frames, model
+mutex waits poll every 20 ms, and decoding checks each segment and token step.
+Candle's whole-audio mel computation and individual encoder/decoder calls are
+not preemptible: cancellation is checked around them, not within a kernel.
+No partial transcription is returned. This does not add upload/queue-byte
+budgets or change coordinator admission/routing limits.
+
 ### `GET /v1/models`
 
 ```bash

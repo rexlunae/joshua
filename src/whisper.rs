@@ -23,7 +23,9 @@
 
 use std::io::Cursor;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
+use std::time::Duration;
 
 use candle_core::{Device, IndexOp, Tensor};
 use candle_nn::VarBuilder;
@@ -64,6 +66,7 @@ pub struct Transcription {
 /// expected of a sidecar STT model.
 pub struct WhisperEngine {
     model: Mutex<Whisper>,
+    pub(crate) admission: Arc<tokio::sync::Semaphore>,
     tokenizer: Tokenizer,
     config: Config,
     mel_filters: Vec<f32>,
@@ -133,6 +136,7 @@ impl WhisperEngine {
 
         Ok(Self {
             model: Mutex::new(model),
+            admission: Arc::new(tokio::sync::Semaphore::new(1)),
             transcribe_token: token(wm::TRANSCRIBE_TOKEN),
             translate_token: token(wm::TRANSLATE_TOKEN),
             no_timestamps_token: token(wm::NO_TIMESTAMPS_TOKEN),
@@ -158,8 +162,19 @@ impl WhisperEngine {
         language: Option<&str>,
         translate: bool,
     ) -> Result<Transcription> {
-        let samples = wav_to_pcm16k(wav_bytes)?;
-        self.transcribe(&samples, language, translate)
+        self.transcribe_wav_cancellable(wav_bytes, language, translate, &AtomicBool::new(false))
+    }
+
+    /// Transcribe a WAV upload, abandoning work when the requester goes away.
+    pub fn transcribe_wav_cancellable(
+        &self,
+        wav_bytes: &[u8],
+        language: Option<&str>,
+        translate: bool,
+        cancel: &AtomicBool,
+    ) -> Result<Transcription> {
+        let samples = wav_to_pcm16k_cancellable(wav_bytes, cancel)?;
+        self.transcribe_cancellable(&samples, language, translate, cancel)
     }
 
     /// Transcribe raw 16 kHz mono PCM samples in `[-1, 1]`.
@@ -169,6 +184,20 @@ impl WhisperEngine {
         language: Option<&str>,
         translate: bool,
     ) -> Result<Transcription> {
+        self.transcribe_cancellable(pcm, language, translate, &AtomicBool::new(false))
+    }
+
+    /// Cancellable PCM transcription. Checks bracket the non-preemptible candle
+    /// mel/encoder calls and run at every decoder step and segment boundary.
+    /// A cancelled call never returns a partial transcription.
+    pub fn transcribe_cancellable(
+        &self,
+        pcm: &[f32],
+        language: Option<&str>,
+        translate: bool,
+        cancel: &AtomicBool,
+    ) -> Result<Transcription> {
+        check_cancel(cancel)?;
         if pcm.is_empty() {
             return Err(JoshuaError::InvalidRequest("empty audio".to_string()));
         }
@@ -181,6 +210,7 @@ impl WhisperEngine {
         let duration = pcm.len() as f64 / wm::SAMPLE_RATE as f64;
 
         let mel = audio::pcm_to_mel(&self.config, pcm, &self.mel_filters);
+        check_cancel(cancel)?;
         let n_frames = mel.len() / self.config.num_mel_bins;
         let mel = Tensor::from_vec(mel, (1, self.config.num_mel_bins, n_frames), &self.device)
             .map_err(|e| JoshuaError::Inference(e.to_string()))?;
@@ -196,23 +226,23 @@ impl WhisperEngine {
         // Recover from poisoning rather than failing permanently: the KV
         // cache is flushed per segment below, so a prior panic leaves no
         // state that would corrupt this transcription.
-        let mut model = self
-            .model
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut model = lock_cancellable(&self.model, cancel)?;
 
         let mut text = String::new();
         let mut seek = 0;
         while seek < n_frames {
+            check_cancel(cancel)?;
             let segment_len = usize::min(n_frames - seek, wm::N_FRAMES);
             let segment = mel
                 .narrow(2, seek, segment_len)
                 .map_err(|e| JoshuaError::Inference(e.to_string()))?;
-            let piece = self.decode_segment(&mut model, &segment, language_token, translate)?;
+            let piece =
+                self.decode_segment(&mut model, &segment, language_token, translate, cancel)?;
             text.push_str(&piece);
             seek += segment_len;
         }
 
+        check_cancel(cancel)?;
         Ok(Transcription {
             text: text.trim().to_string(),
             duration,
@@ -227,11 +257,14 @@ impl WhisperEngine {
         mel: &Tensor,
         language_token: Option<u32>,
         translate: bool,
+        cancel: &AtomicBool,
     ) -> Result<String> {
+        check_cancel(cancel)?;
         let features = model
             .encoder
             .forward(mel, true)
             .map_err(|e| JoshuaError::Inference(e.to_string()))?;
+        check_cancel(cancel)?;
 
         let mut tokens: Vec<u32> = vec![self.sot_token];
         if let Some(lang) = language_token {
@@ -252,6 +285,7 @@ impl WhisperEngine {
 
         let sample_len = self.config.max_target_positions / 2;
         for i in 0..sample_len {
+            check_cancel(cancel)?;
             let input = Tensor::new(tokens.as_slice(), &self.device)
                 .and_then(|t| t.unsqueeze(0))
                 .map_err(|e| JoshuaError::Inference(e.to_string()))?;
@@ -272,6 +306,7 @@ impl WhisperEngine {
                 .map_err(|e| JoshuaError::Inference(e.to_string()))?;
 
             let next = self.argmax_suppressed(&logits);
+            check_cancel(cancel)?;
             if next == self.eot_token || tokens.len() >= self.config.max_target_positions {
                 break;
             }
@@ -321,6 +356,36 @@ impl WhisperEngine {
 /// Channels are averaged; other sample rates are linearly resampled — fine
 /// for speech (Whisper's mel front-end low-passes well below Nyquist).
 pub fn wav_to_pcm16k(bytes: &[u8]) -> Result<Vec<f32>> {
+    wav_to_pcm16k_cancellable(bytes, &AtomicBool::new(false))
+}
+
+fn check_cancel(cancel: &AtomicBool) -> Result<()> {
+    if cancel.load(Ordering::Relaxed) {
+        Err(JoshuaError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
+fn lock_cancellable<'a, T>(mutex: &'a Mutex<T>, cancel: &AtomicBool) -> Result<MutexGuard<'a, T>> {
+    loop {
+        check_cancel(cancel)?;
+        match mutex.try_lock() {
+            Ok(guard) => {
+                check_cancel(cancel)?;
+                return Ok(guard);
+            }
+            Err(TryLockError::Poisoned(poisoned)) => {
+                check_cancel(cancel)?;
+                return Ok(poisoned.into_inner());
+            }
+            Err(TryLockError::WouldBlock) => std::thread::sleep(Duration::from_millis(20)),
+        }
+    }
+}
+
+fn wav_to_pcm16k_cancellable(bytes: &[u8], cancel: &AtomicBool) -> Result<Vec<f32>> {
+    check_cancel(cancel)?;
     let mut reader = hound::WavReader::new(Cursor::new(bytes))
         .map_err(|e| JoshuaError::InvalidRequest(format!("invalid WAV: {e}")))?;
     let spec = reader.spec();
@@ -346,24 +411,44 @@ pub fn wav_to_pcm16k(bytes: &[u8]) -> Result<Vec<f32>> {
     let interleaved: Vec<f32> = match spec.sample_format {
         hound::SampleFormat::Float => reader
             .samples::<f32>()
-            .collect::<std::result::Result<_, _>>()
-            .map_err(|e| JoshuaError::InvalidRequest(format!("WAV read: {e}")))?,
+            .enumerate()
+            .map(|(index, sample)| {
+                if index % 1024 == 0 {
+                    check_cancel(cancel)?;
+                }
+                sample.map_err(|e| JoshuaError::InvalidRequest(format!("WAV read: {e}")))
+            })
+            .collect::<std::result::Result<_, _>>()?,
         hound::SampleFormat::Int => {
             // Safe now that bits_per_sample is validated to 8/16/24/32.
             let max = (1i64 << (spec.bits_per_sample - 1)) as f32;
             reader
                 .samples::<i32>()
-                .map(|s| s.map(|v| v as f32 / max))
-                .collect::<std::result::Result<_, _>>()
-                .map_err(|e| JoshuaError::InvalidRequest(format!("WAV read: {e}")))?
+                .enumerate()
+                .map(|(index, sample)| {
+                    if index % 1024 == 0 {
+                        check_cancel(cancel)?;
+                    }
+                    sample
+                        .map(|value| value as f32 / max)
+                        .map_err(|e| JoshuaError::InvalidRequest(format!("WAV read: {e}")))
+                })
+                .collect::<std::result::Result<_, _>>()?
         }
     };
 
     // Mix down to mono.
     let mono: Vec<f32> = interleaved
         .chunks(channels)
-        .map(|frame| frame.iter().sum::<f32>() / channels as f32)
-        .collect();
+        .enumerate()
+        .map(|(index, frame)| {
+            if index % 1024 == 0 {
+                check_cancel(cancel)?;
+            }
+            Ok(frame.iter().sum::<f32>() / channels as f32)
+        })
+        .collect::<Result<_>>()?;
+    check_cancel(cancel)?;
 
     // Resample to 16 kHz.
     let src_rate = spec.sample_rate as usize;
@@ -381,14 +466,18 @@ pub fn wav_to_pcm16k(bytes: &[u8]) -> Result<Vec<f32>> {
     }
     let resampled = (0..out_len)
         .map(|i| {
+            if i % 1024 == 0 {
+                check_cancel(cancel)?;
+            }
             let pos = i as f64 * ratio;
             let idx = pos as usize;
             let frac = (pos - idx as f64) as f32;
             let a = mono[idx.min(mono.len() - 1)];
             let b = mono[(idx + 1).min(mono.len() - 1)];
-            a * (1.0 - frac) + b * frac
+            Ok(a * (1.0 - frac) + b * frac)
         })
-        .collect();
+        .collect::<Result<_>>()?;
+    check_cancel(cancel)?;
     Ok(resampled)
 }
 
@@ -460,6 +549,60 @@ fn find_safetensors(dir: &Path) -> Result<std::path::PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cancellation_precedes_ingest_and_mutex_acquisition() {
+        let cancel = super::AtomicBool::new(true);
+        assert!(matches!(
+            super::wav_to_pcm16k_cancellable(b"not a WAV", &cancel),
+            Err(crate::error::JoshuaError::Cancelled)
+        ));
+        let mutex = super::Mutex::new(());
+        assert!(matches!(
+            super::lock_cancellable(&mutex, &cancel),
+            Err(crate::error::JoshuaError::Cancelled)
+        ));
+        assert!(mutex.try_lock().is_ok());
+    }
+
+    #[test]
+    fn cancelled_mutex_waiter_exits_before_holder_releases() {
+        let mutex = super::Arc::new(super::Mutex::new(()));
+        let holder = mutex.lock().unwrap();
+        let cancel = super::Arc::new(super::AtomicBool::new(false));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn({
+            let mutex = mutex.clone();
+            let cancel = cancel.clone();
+            move || {
+                started_tx.send(()).unwrap();
+                let result = super::lock_cancellable(&mutex, &cancel);
+                done_tx
+                    .send(matches!(result, Err(crate::error::JoshuaError::Cancelled)))
+                    .unwrap();
+            }
+        });
+        started_rx.recv().unwrap();
+        cancel.store(true, super::Ordering::Relaxed);
+        assert!(done_rx.recv_timeout(super::Duration::from_secs(2)).unwrap());
+        waiter.join().unwrap();
+        drop(holder);
+        assert!(super::lock_cancellable(&mutex, &super::AtomicBool::new(false)).is_ok());
+    }
+
+    #[test]
+    fn poisoned_mutex_remains_reusable() {
+        let mutex = super::Mutex::new(());
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = mutex.lock().unwrap();
+            panic!("simulate decoder panic");
+        });
+        assert!(super::lock_cancellable(&mutex, &super::AtomicBool::new(false)).is_ok());
+        assert!(matches!(
+            super::lock_cancellable(&mutex, &super::AtomicBool::new(true)),
+            Err(crate::error::JoshuaError::Cancelled)
+        ));
+    }
     use super::*;
 
     #[test]
