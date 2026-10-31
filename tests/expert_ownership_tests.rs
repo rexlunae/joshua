@@ -38,24 +38,38 @@ impl Expert for LocalExpert {
     }
 }
 
-fn local_experts(path: &Path) -> Vec<LocalExpert> {
+fn local_experts(path: &Path, mapped: bool) -> Vec<LocalExpert> {
     let mut file = File::open(path).unwrap();
     let content = gguf_file::Content::read(&mut file).unwrap();
+    let mapping = mapped.then(|| {
+        let bytes = std::fs::read(path).unwrap();
+        let mut mapping = memmap2::MmapMut::map_anon(bytes.len()).unwrap();
+        mapping.copy_from_slice(&bytes);
+        Arc::new(mapping.make_read_only().unwrap())
+    });
     let mut projections: Vec<Vec<QMatMul>> = ["gate", "up", "down"]
         .iter()
         .map(|name| {
-            ExpertTensor::lookup(
+            let descriptor = ExpertTensor::lookup(
                 &content,
                 "qwen3moe",
                 &format!("blk.0.ffn_{name}_exps.weight"),
                 4,
             )
-            .unwrap()
-            .read_and_split(&content, &mut file, "qwen3moe", &Device::Cpu)
-            .unwrap()
-            .into_iter()
-            .map(|weight| QMatMul::from_qtensor(weight).unwrap())
-            .collect()
+            .unwrap();
+            let borrowed = mapping
+                .as_ref()
+                .and_then(|mapping| descriptor.borrow_host(mapping).unwrap());
+            let weights = match borrowed {
+                Some(experts) => experts.into_iter().map(|expert| expert.tensor).collect(),
+                None => descriptor
+                    .read_and_split(&content, &mut file, "qwen3moe", &Device::Cpu)
+                    .unwrap(),
+            };
+            weights
+                .into_iter()
+                .map(|weight| QMatMul::from_qtensor(weight).unwrap())
+                .collect()
         })
         .collect();
     let down = projections.pop().unwrap();
@@ -178,8 +192,8 @@ fn actual_gguf_experts_match_local_decode_prefill_sessions_duplicates_and_ties()
         } else {
             common::write_tiny_qwen3moe_gguf(&path);
         }
-        let local = local_experts(&path);
         for mapped in [false, true] {
+            let local = local_experts(&path, mapped);
             let (mut coordinator, handles) = start(&path, mapped);
             let hidden = if quantized { 256 } else { 8 };
             for (batch, offset) in [(1, 0), (5, 1), (1, 6), (3, 7)] {

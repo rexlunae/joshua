@@ -104,6 +104,20 @@ malformed/oversized/nonfinite frames, route and session bounds, identity and
 sequence mismatches, wrong authentication, disconnects, and fail-stop reuse.
 Admission tests also reject insufficient budgets and shared-expert models.
 
+Each reference uses the corresponding established local loader path:
+`ExpertTensor::borrow_host` for mapped experts and `read_and_split` for streamed
+experts, not the new owner's single-expert reader. On x86, the borrowed k-quant
+kernel uses F32 activations whereas Candle's streamed kernel can quantize
+activations. Cross-path outputs are therefore not assumed bit-identical. The
+original test incorrectly used a streamed reference for both modes and failed
+the mapped Q4_K duplicate-route case in Linux release CI; this is corrected
+without changing production kernels, remote execution, or exact assertions.
+On erskin's x86 Linux CPU, the pre-fix release test reproduces the CI failure;
+after correction all four expert tests, 12 memory-placement tests, and eight
+Qwen3-MoE tests pass with `--release --features distributed`. All four expert
+tests also pass on the local macOS CPU. These are backend-matched correctness
+checks, not cross-backend bit-equivalence or throughput measurements.
+
 Local validation on macOS CPU: seven protocol unit tests and four complete-expert
 integration tests pass. The default library suite passes (480 tests, 10 ignored),
 as do the Qwen (10), Qwen3-MoE (8), and memory-placement (12) suites. The
