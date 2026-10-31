@@ -123,6 +123,9 @@ impl ChatMessage {
 /// Parameters that control the token-generation process.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GenerationOptions {
+    /// Trusted caller's cache namespace; never accepted from request JSON.
+    #[serde(skip)]
+    pub cache_scope: Option<[u8; 32]>,
     /// Maximum number of tokens to generate.
     #[serde(default = "GenerationOptions::default_max_tokens")]
     pub max_tokens: u32,
@@ -212,6 +215,10 @@ pub enum ConstraintSpec {
 }
 
 impl GenerationOptions {
+    pub(crate) fn cache_namespace(&self) -> Option<[u8; 32]> {
+        crate::affinity::namespace(self.cache_scope, self.context_window)
+    }
+
     fn default_max_tokens() -> u32 {
         256
     }
@@ -235,6 +242,7 @@ impl GenerationOptions {
 impl Default for GenerationOptions {
     fn default() -> Self {
         Self {
+            cache_scope: None,
             max_tokens: Self::default_max_tokens(),
             temperature: Self::default_temperature(),
             top_p: Self::default_top_p(),
@@ -607,6 +615,7 @@ impl ChatCompletionRequest {
             _ => vec![],
         };
         Ok(GenerationOptions {
+            cache_scope: None,
             max_tokens: self
                 .max_completion_tokens
                 .or(self.max_tokens)

@@ -236,6 +236,45 @@ fn engine_generates_through_the_shim_backend() {
 
 // ─── Multimodal (media prefill) ─────────────────────────────────────────────
 
+#[test]
+fn scoped_npu_continuation_and_reset_match_fresh_sessions() {
+    let dir = tiny_model_dir("npu-affinity");
+    let warm = Engine::with_n_ctx(&dir, 64)
+        .unwrap()
+        .with_npu_backend(Arc::new(shim_backend()));
+    let fresh = Engine::with_n_ctx(&dir, 64)
+        .unwrap()
+        .with_npu_backend(Arc::new(shim_backend()));
+    let mut options = GenerationOptions {
+        cache_scope: Some([1; 32]),
+        max_tokens: 0,
+        temperature: 0.0,
+        repetition_penalty: 1.0,
+        ..Default::default()
+    };
+    warm.complete_raw("hello a b", &options).unwrap();
+    options.max_tokens = 3;
+    let continuation = "hello a b c";
+    assert_eq!(
+        warm.complete_raw(continuation, &options).unwrap().0,
+        fresh.complete_raw(continuation, &options).unwrap().0
+    );
+    assert_eq!(warm.kv_reuse_count(), 1);
+    assert_eq!(
+        warm.complete_raw("hello a world", &options).unwrap().0,
+        fresh.complete_raw("hello a world", &options).unwrap().0
+    );
+    assert_eq!(warm.kv_edit_reuse_count(), 0);
+    options.cache_scope = Some([2; 32]);
+    assert_eq!(
+        warm.complete_raw(continuation, &options).unwrap().0,
+        fresh.complete_raw(continuation, &options).unwrap().0
+    );
+    assert_eq!(warm.kv_reuse_count(), 1);
+    assert!(warm.cache_residency(128).complete);
+    assert_eq!(warm.prefix_cache_stats().bytes, 0);
+}
+
 /// Replicate the mock's media tokenisation: one pseudo-token per prompt
 /// word, three per image (see joshua-mock-npu docs).
 fn mock_media_history(prompt: &str, images: &[&[u8]]) -> Vec<u32> {
