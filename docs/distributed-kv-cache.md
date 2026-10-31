@@ -1,13 +1,13 @@
 # Chunk-addressed cross-node prefix cache
 
-**Status:** design only, nothing implemented. Tracked in
+**Status:** phase 1 implemented; remaining phases are design only. Tracked in
 [issue #201](https://github.com/rexlunae/joshua/issues/201). Phase 0
 (measurement) gates phases 3–5; phase 1 is useful on its own.
 
 | Phase | What | Status |
 |---|---|---|
 | 0 | Measurement: prefill s/token, cluster-wide prefix overlap, misroute cost | ⏳ not started |
-| 1 | `src/prefix_key.rs`: chunk hash chain, salt, coarsening | ⏳ not started |
+| 1 | `src/prefix_key.rs`: chunk hash chain, salt, coarsening | ✅ implemented |
 | 2 | Worker advertises cache residency in `WorkerInfo` | ⏳ not started |
 | 3 | Coordinator advisory index + overlap term in `try_pick` | ⏳ depends on 0–2 |
 | 4 | Deltas, tombstones, TTL, anti-entropy sketch | ⏳ depends on 3 |

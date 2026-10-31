@@ -74,6 +74,7 @@ pub mod paged_weights;
 pub mod placement;
 pub mod prefill_cost;
 pub mod prefix_cache;
+pub mod prefix_key;
 pub mod prompt_stability;
 pub mod stream_prefill;
 pub mod server;
