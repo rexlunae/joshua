@@ -3239,6 +3239,8 @@ pub fn write_tiny_nemotron_h_gguf(path: &Path) {
 /// may use (scalar per-layer metadata, distinct per-group norm weights).
 #[derive(Clone, Copy, Debug)]
 pub struct NemotronTiny {
+    pub conv_taps: usize,
+    pub conv_bias: bool,
     /// Write `attention.head_count_kv` / `feed_forward_length` as scalars
     /// instead of per-layer arrays.  Only meaningful together with `uniform`:
     /// scalars cannot express the hybrid layer pattern.
@@ -3264,6 +3266,8 @@ pub struct NemotronTiny {
 impl Default for NemotronTiny {
     fn default() -> Self {
         Self {
+            conv_taps: 4,
+            conv_bias: true,
             scalar_metadata: false,
             uniform: false,
             uniform_kind: "moe",
@@ -3283,7 +3287,6 @@ pub fn write_nemotron_h_gguf(path: &Path, opts: NemotronTiny) {
     const KV_HEADS: usize = 1;
     const FFN: usize = 8;
     const D_STATE: usize = 4;
-    const D_CONV: usize = 4;
     const N_GROUP: usize = 2;
     const SSM_HEAD: usize = 4;
     const D_INNER: usize = 16; // SSM_HEAD * head_dim(4)
@@ -3385,7 +3388,10 @@ pub fn write_nemotron_h_gguf(path: &Path, opts: NemotronTiny) {
                 HEAD_DIM as u32
             }),
         ),
-        (key("ssm.conv_kernel"), gguf_file::Value::U32(D_CONV as u32)),
+        (
+            key("ssm.conv_kernel"),
+            gguf_file::Value::U32(opts.conv_taps as u32),
+        ),
         (key("ssm.inner_size"), gguf_file::Value::U32(D_INNER as u32)),
         (key("ssm.state_size"), gguf_file::Value::U32(D_STATE as u32)),
         (
@@ -3482,12 +3488,17 @@ pub fn write_nemotron_h_gguf(path: &Path, opts: NemotronTiny) {
                 ));
                 tensors.push((
                     format!("blk.{i}.ssm_conv1d.weight"),
-                    qtensor(w(D_CONV * conv_dim, seed + 1), &[D_CONV, conv_dim]),
+                    qtensor(
+                        w(opts.conv_taps * conv_dim, seed + 1),
+                        &[opts.conv_taps, conv_dim],
+                    ),
                 ));
-                tensors.push((
-                    format!("blk.{i}.ssm_conv1d.bias"),
-                    qtensor(w(conv_dim, seed + 2), &[conv_dim]),
-                ));
+                if opts.conv_bias {
+                    tensors.push((
+                        format!("blk.{i}.ssm_conv1d.bias"),
+                        qtensor(w(conv_dim, seed + 2), &[conv_dim]),
+                    ));
+                }
                 tensors.push((
                     format!("blk.{i}.ssm_dt.bias"),
                     qtensor(w(SSM_HEAD, seed + 3), &[SSM_HEAD]),

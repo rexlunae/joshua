@@ -28,6 +28,83 @@ fn argmax(v: &[f32]) -> usize {
         .unwrap()
 }
 
+fn conv_geometry_model(taps: usize, bias: bool, mmap: bool, name: &str) -> QuantizedModel {
+    let dir = common::model_dir(&format!("nemotron-conv-{taps}-{bias}-{mmap}-{name}"));
+    let path = dir.join("model.gguf");
+    common::write_nemotron_h_gguf(
+        &path,
+        common::NemotronTiny {
+            conv_taps: taps,
+            conv_bias: bias,
+            ..Default::default()
+        },
+    );
+    common::load_model(&path, mmap)
+}
+
+#[test]
+fn metadata_conv_geometry_runs_prefill_and_decode() {
+    let prompt = [1u32, 4, 2, 7, 5, 9, 3, 6];
+    for taps in [1, 2, 3, 4, 5] {
+        for bias in [false, true] {
+            for mmap in [false, true] {
+                let model = conv_geometry_model(taps, bias, mmap, "continuation");
+                let mut single = model.new_session().unwrap();
+                let mut incremental = model.new_session().unwrap();
+                let mut chunked = model.new_session().unwrap();
+                let expected = common::logits(&mut single, &prompt, 0);
+                assert!(expected.iter().all(|value| value.is_finite()));
+                let mut step = Vec::new();
+                for (offset, token) in prompt.iter().enumerate() {
+                    step = common::logits(&mut incremental, &[*token], offset);
+                }
+                common::logits(&mut chunked, &prompt[..2], 0);
+                let chunk = common::logits(&mut chunked, &prompt[2..], 2);
+                let context = format!("taps={taps}, bias={bias}, mmap={mmap}");
+                assert_close(&expected, &step, 2e-4, &context);
+                assert_close(&expected, &chunk, 2e-4, &context);
+                assert_eq!(argmax(&expected), argmax(&step), "{context}");
+                for (offset, token) in [11, 13, 8].iter().enumerate() {
+                    let expected = common::logits(&mut single, &[*token], prompt.len() + offset);
+                    let step = common::logits(&mut incremental, &[*token], prompt.len() + offset);
+                    let chunk = common::logits(&mut chunked, &[*token], prompt.len() + offset);
+                    assert_close(&expected, &step, 2e-4, &context);
+                    assert_close(&expected, &chunk, 2e-4, &context);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn metadata_conv_geometry_rollback_matches_plain_decode() {
+    for taps in [1, 2, 3, 4, 5] {
+        for bias in [false, true] {
+            let model = conv_geometry_model(taps, bias, true, "rollback");
+            common::check_recurrent_verify_rollback(
+                &model,
+                &format!("conv taps={taps}, bias={bias}"),
+                &[1, 4, 2, 7, 5, 9],
+                &[3, 6, 11, 8, 10, 12],
+                &[6, 7, 8, 11, 12],
+                &[&[13, 14, 15]],
+            );
+        }
+    }
+}
+
+#[test]
+fn a_loaded_conv_bias_changes_the_output() {
+    let mut with_bias = conv_geometry_model(4, true, true, "bias-present");
+    let mut without_bias = conv_geometry_model(4, false, true, "bias-absent");
+    let biased = common::logits(&mut with_bias, &[1, 4, 2, 7], 0);
+    let unbiased = common::logits(&mut without_bias, &[1, 4, 2, 7], 0);
+    assert!(biased
+        .iter()
+        .zip(&unbiased)
+        .any(|(left, right)| (left - right).abs() > 1e-5));
+}
+
 #[test]
 fn loads_the_hybrid_layer_stack() {
     let mut m = nemotron("loads");
@@ -416,41 +493,63 @@ fn a_device_model_forward_matches_the_cpu() {
         eprintln!("nemotron: no OpenCL device, skipping the device-forward check");
         return;
     };
-    let dir = common::model_dir("nemotron-device-forward");
-    let path = dir.join("model.gguf");
-    common::write_tiny_nemotron_h_gguf(&path);
-    let bytes = std::fs::read(&path).unwrap();
-    let content = joshua::gguf_ext::read_header(&mut std::io::Cursor::new(&bytes[..]))
-        .unwrap()
-        .to_candle_content()
-        .unwrap();
-    let mmap = {
-        let f = std::fs::File::open(&path).unwrap();
-        std::sync::Arc::new(unsafe { memmap2::Mmap::map(&f).unwrap() })
-    };
-    let mut device_model = joshua::model::QuantizedModel::from_gguf_mmap(
-        content,
-        &mut std::io::Cursor::new(&bytes[..]),
-        &dev,
-        Some(mmap),
-        None,
-        0,
-    )
-    .expect("load on the device");
+    for (taps, bias) in [
+        (4, true),
+        (4, false),
+        (3, true),
+        (3, false),
+        (5, true),
+        (5, false),
+    ] {
+        let dir = common::model_dir(&format!("nemotron-device-forward-{taps}-{bias}"));
+        let path = dir.join("model.gguf");
+        common::write_nemotron_h_gguf(
+            &path,
+            common::NemotronTiny {
+                conv_taps: taps,
+                conv_bias: bias,
+                ..Default::default()
+            },
+        );
+        let bytes = std::fs::read(&path).unwrap();
+        let content = joshua::gguf_ext::read_header(&mut std::io::Cursor::new(&bytes[..]))
+            .unwrap()
+            .to_candle_content()
+            .unwrap();
+        let mmap = {
+            let f = std::fs::File::open(&path).unwrap();
+            std::sync::Arc::new(unsafe { memmap2::Mmap::map(&f).unwrap() })
+        };
+        let mut device_model = joshua::model::QuantizedModel::from_gguf_mmap(
+            content,
+            &mut std::io::Cursor::new(&bytes[..]),
+            &dev,
+            Some(mmap),
+            None,
+            0,
+        )
+        .expect("load on the device");
 
-    let prompt = [1u32, 4, 2, 7, 5];
-    let before = candle_core::opencl_backend::kernels::native_exec_count();
-    let got = common::logits_dev(&mut device_model, &prompt, 0, &dev)
-        .expect("a device forward completes now that the scan runs on the device");
-    let launched = candle_core::opencl_backend::kernels::native_exec_count() - before;
-    assert!(
-        launched > 0,
-        "a device forward must launch native kernels, not quietly run on the host"
-    );
+        let prompt = [1u32, 4, 2, 7, 5];
+        let before = candle_core::opencl_backend::kernels::native_exec_count();
+        let got = common::logits_dev(&mut device_model, &prompt, 0, &dev)
+            .expect("a device forward completes now that the scan runs on the device");
+        let launched = candle_core::opencl_backend::kernels::native_exec_count() - before;
+        assert!(
+            launched > 0,
+            "a device forward must launch native kernels, not quietly run on the host"
+        );
 
-    let mut cpu_model = common::load_model(&path, true);
-    let want = common::logits(&mut cpu_model, &prompt, 0);
-    common::assert_close(&got, &want, 5e-3, "device vs CPU whole-model forward");
+        let mut cpu_model = common::load_model(&path, true);
+        let want = common::logits(&mut cpu_model, &prompt, 0);
+        common::assert_close(&got, &want, 5e-3, "device vs CPU whole-model forward");
+        for (offset, token) in [9, 3, 6].iter().enumerate() {
+            let got = common::logits_dev(&mut device_model, &[*token], prompt.len() + offset, &dev)
+                .unwrap();
+            let want = common::logits(&mut cpu_model, &[*token], prompt.len() + offset);
+            common::assert_close(&got, &want, 5e-3, "device vs CPU decode continuation");
+        }
+    }
 }
 
 /// The NextN / MTP draft block must load and draft, and must not change what
