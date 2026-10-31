@@ -25,3 +25,5 @@ pub mod deepseek4;
 pub mod pipeline;
 #[cfg(feature = "distributed")]
 pub mod remote;
+#[cfg(feature = "distributed")]
+pub mod expert;

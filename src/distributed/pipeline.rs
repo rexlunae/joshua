@@ -537,6 +537,40 @@ struct Wire {
     metrics: Metrics,
 }
 
+/// Bounded byte RPCs sharing the pipeline's authenticated, deadline-limited
+/// framing, with a separate protocol domain. Not the pipeline agent protocol.
+pub(super) struct ExpertChannel(Wire);
+
+impl ExpertChannel {
+    pub(super) fn new(
+        stream: TcpStream, key: &[u8], job: Uuid, owner: usize,
+        client: bool, timeout: Duration, bytes_limit: usize,
+    ) -> Result<Self> {
+        ensure!(job.get_version_num() == 4, "use a fresh v4 job UUID");
+        ensure!((1..=64 * 1024 * 1024).contains(&bytes_limit), "invalid expert frame bound");
+        ensure!(!timeout.is_zero() && timeout <= Duration::from_secs(120), "invalid expert timeout");
+        let mut wire = Wire::agent(stream, key, job, client, timeout)?;
+        wire.domain = b"joshua-complete-expert-v1";
+        wire.rank = owner;
+        wire.bytes_limit = bytes_limit;
+        Ok(Self(wire))
+    }
+
+    pub(super) fn send(&mut self, bytes: Vec<u8>) -> Result<()> {
+        self.0.send(&Packet { command: Command::Chunk, values: Vec::new(), bytes })
+    }
+
+    pub(super) fn receive(&mut self) -> Result<Vec<u8>> {
+        let packet = self.0.receive()?;
+        ensure!(matches!(packet.command, Command::Chunk), "expected expert byte frame");
+        Ok(packet.bytes)
+    }
+
+    pub(super) fn shutdown(&self) {
+        let _ = self.0.stream.shutdown(Shutdown::Both);
+    }
+}
+
 impl Wire {
     fn new(
         stream: TcpStream,
