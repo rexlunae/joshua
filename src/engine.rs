@@ -2935,6 +2935,23 @@ impl Engine {
         &self.model_path
     }
 
+    pub(crate) fn embedding_revision(&self) -> Option<String> {
+        use sha2::{Digest, Sha256};
+        let tokenizer = self.tokenizer.to_string(false).ok()?;
+        let mut digest = Sha256::new();
+        digest.update(b"joshua-embedding-v1");
+        digest.update(&self.mmap[..]);
+        digest.update(tokenizer.as_bytes());
+        digest.update(self.n_ctx.to_le_bytes());
+        Some(format!("{:x}", digest.finalize()))
+    }
+
+    pub(crate) fn supports_embeddings(&self) -> bool {
+        use crate::model::Architecture;
+        !self.remote_only()
+            && matches!(self.arch, Some(Architecture::Llama | Architecture::Qwen2 | Architecture::Qwen3))
+    }
+
     /// Context-window size in tokens.
     pub fn n_ctx(&self) -> u32 {
         self.n_ctx

@@ -39,8 +39,8 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use axum::{
-    extract::{Request, State},
-    http::{header, HeaderValue, StatusCode},
+    extract::{Extension, Request, State},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{
         sse::{Event, Sse},
@@ -56,7 +56,7 @@ use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use uuid::Uuid;
 
 use crate::anthropic::{self, MessagesRequest};
-use crate::coordinator::{ModelSlots, WorkerCapabilities, WorkerInfo, WORKER_PROTOCOL_VERSION};
+use crate::coordinator::{JobModel, ModelSlots, WorkerCapabilities, WorkerInfo, JOB_OWNER_HEADER, WORKER_PROTOCOL_VERSION};
 use crate::engine::{Engine, EngineOptions};
 use crate::error::JoshuaError;
 use crate::whisper::WhisperEngine;
@@ -229,6 +229,7 @@ impl ServerState {
 /// A loaded model and where it runs.
 #[derive(Clone)]
 pub struct LoadedModel {
+    pub embedding_job: JobModel,
     pub id: String,
     pub engine: Arc<Engine>,
     /// Workers holding its pipeline stages; empty for a local model.
@@ -262,6 +263,7 @@ impl ModelRegistry {
     pub fn with_model(engine: Arc<Engine>) -> Self {
         let registry = Self::default();
         registry.models.write().expect("fresh lock").push(LoadedModel {
+            embedding_job: embedding_job(&engine, engine.model_name()),
             id: engine.model_name().to_string(),
             engine,
             workers: Vec::new(),
@@ -527,6 +529,7 @@ impl ModelManager {
         }
         let engine = self.finish_engine(engine);
         Ok(LoadedModel {
+            embedding_job: embedding_job(&engine, &id),
             id,
             engine: Arc::new(engine),
             workers: Vec::new(),
@@ -626,6 +629,7 @@ impl ModelManager {
             .with_remote_backend(Arc::new(backend), capacity);
         claim.keep();
         Ok(LoadedModel {
+            embedding_job: embedding_job(&engine, &id),
             id,
             engine: Arc::new(engine),
             workers,
@@ -644,6 +648,19 @@ fn model_json(model: &LoadedModel) -> serde_json::Value {
         "workers": model.workers.iter().map(|w| w.to_string()).collect::<Vec<_>>(),
         "stages": model.stages,
     })
+}
+
+fn embedding_job(engine: &Engine, model: &str) -> JobModel {
+    JobModel {
+        model: model.to_string(),
+        backend: device_label(engine.device()).to_string(),
+        input_format: "text".to_string(),
+        owner: Uuid::new_v4().to_string(),
+        revision: if engine.supports_embeddings() { engine.embedding_revision() } else { None },
+        max_inputs: 32,
+        max_input_bytes: 256 << 10,
+        max_output_bytes: 2 << 20,
+    }
 }
 
 fn manager(state: &ServerState) -> Result<&ModelManager, ApiError> {
@@ -746,6 +763,10 @@ pub fn create_router(state: AppState) -> Router {
         .route("/metrics/prometheus", get(metrics_prometheus))
         .route("/props", get(props))
         .route("/slots", get(slots))
+        .layer(middleware::from_fn_with_state(
+            crate::job_admission::Admission::default(),
+            crate::job_admission::admit,
+        ))
         .route("/tokenize", post(tokenize))
         .route("/v1/tokenize", post(tokenize))
         .route("/v1/detokenize", post(detokenize))
@@ -957,7 +978,7 @@ async fn server_status(State(state): State<AppState>) -> Json<serde_json::Value>
                 "backend": device_label(m.engine.device()),
                 "in_flight": m.engine.in_flight(),
                 "max_concurrency": m.engine.max_concurrency(),
-                "embeddings": !m.engine.remote_only(),
+                "embeddings": m.engine.supports_embeddings(),
                 "remote": m.engine.remote_only(),
                 "workers": m.workers.iter().map(|w| w.to_string()).collect::<Vec<_>>(),
                 "stages": m.stages,
@@ -1149,41 +1170,51 @@ async fn server_load(State(state): State<AppState>) -> Json<serde_json::Value> {
 /// admits its own requests), and the worker-wide figures are their sums.
 async fn worker_info(State(state): State<AppState>) -> Result<Json<WorkerInfo>, ApiError> {
     let models = state.models.list();
-    let Some(first) = models.first() else {
+    let first = models.first();
+    if first.is_none() && state.whisper.is_none() {
         return Err(ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "no model is loaded; load one with POST /v1/models/load",
             "model_not_loaded",
         ));
-    };
+    }
     let engines = || models.iter().map(|m| &m.engine);
     Ok(Json(WorkerInfo {
+        transcription_job: state.whisper.as_ref().map(|whisper| JobModel {
+            model: whisper.model_name().to_string(), owner: whisper.job_owner.clone(),
+            backend: device_label(whisper.device()).to_string(), input_format: "wav".to_string(),
+            revision: None, max_inputs: 1, max_input_bytes: crate::job_admission::AUDIO_BYTES,
+            max_output_bytes: 2 << 20,
+        }),
+        transcription_in_flight: state.whisper.as_ref().map_or(0, |whisper| {
+            1usize.saturating_sub(whisper.admission.available_permits())
+        }),
+        embedding_jobs: models.iter().filter(|model| model.engine.supports_embeddings())
+            .map(|model| model.embedding_job.clone()).collect(),
         protocol_version: WORKER_PROTOCOL_VERSION,
-        model: first.id.clone(),
-        models: match models.len() {
-            1 => Vec::new(),
-            _ => models
+        model: first.map(|model| model.id.clone()).unwrap_or_else(|| state.whisper.as_ref().unwrap().model_name().to_string()),
+        models: models
                 .iter()
                 .map(|m| ModelSlots {
                     id: m.id.clone(),
                     n_ctx: Some(m.engine.n_ctx()),
                     max_concurrency: m.engine.max_concurrency(),
                     in_flight: m.engine.in_flight(),
-                    embeddings: !m.engine.remote_only(),
+                    embeddings: m.engine.supports_embeddings(),
                 })
                 .collect(),
-        },
-        n_ctx: first.engine.n_ctx(),
-        backend: device_label(first.engine.device()).to_string(),
-        max_concurrency: engines().map(|e| e.max_concurrency()).sum(),
+        n_ctx: first.map_or(0, |model| model.engine.n_ctx()),
+        backend: first.map(|model| device_label(model.engine.device()))
+            .unwrap_or_else(|| device_label(state.whisper.as_ref().unwrap().device())).to_string(),
+        max_concurrency: engines().map(|e| e.max_concurrency()).sum::<usize>().max(1),
         in_flight: engines().map(|e| e.in_flight()).sum(),
         capabilities: WorkerCapabilities {
-            chat: true,
-            completions: true,
-            embeddings: engines().any(|e| !e.remote_only()),
+            chat: first.is_some(),
+            completions: first.is_some(),
+            embeddings: engines().any(|e| e.supports_embeddings()),
             transcriptions: state.whisper.is_some(),
-            streaming: true,
-            tools: true,
+            streaming: first.is_some(),
+            tools: first.is_some(),
         },
     }))
 }
@@ -2145,17 +2176,37 @@ async fn completions(
 /// `POST /v1/embeddings` — dense text embeddings.
 async fn embeddings(
     State(state): State<AppState>,
+    Extension(lease): Extension<Arc<crate::job_admission::JobLease>>,
+    headers: HeaderMap,
     Json(req): Json<EmbeddingRequest>,
-) -> Result<Json<EmbeddingResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     let (model, engine) = state.models.resolve(&req.model)?;
+    if let Some(owner) = headers.get(JOB_OWNER_HEADER) {
+        let matches = state.models.list().iter().any(|loaded| {
+            Arc::ptr_eq(&loaded.engine, &engine)
+                && owner.as_bytes() == loaded.embedding_job.owner.as_bytes()
+        });
+        if !matches {
+            return Err(ApiError::new(StatusCode::CONFLICT, "job model ownership changed", "job_owner_changed"));
+        }
+    }
     let texts: Vec<String> = req.input.into_vec();
+    if texts.len() > 2048 {
+        return Err(ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "too many embedding inputs", "job_input_limit"));
+    }
+    if headers.contains_key(JOB_OWNER_HEADER) && texts.len() > 32 {
+        return Err(ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "too many inputs in embedding subbatch", "job_input_limit"));
+    }
 
     // Like generation, stop embedding a batch once the requester is gone.
     let cancel = CancelOnDrop::new();
     let (vectors, prompt_tokens) = tokio::task::spawn_blocking({
         let engine = Arc::clone(&engine);
         let flag = cancel.flag();
-        move || engine.embed_with_usage_cancellable(&texts, &flag)
+        move || {
+            let _lease = lease;
+            engine.embed_with_usage_cancellable(&texts, &flag)
+        }
     })
     .await
     .map_err(|e| ApiError::internal(e.to_string()))?
@@ -2175,7 +2226,7 @@ async fn embeddings(
         })
         .collect();
 
-    Ok(Json(EmbeddingResponse {
+    let response = EmbeddingResponse {
         object: "list".to_string(),
         data,
         model,
@@ -2184,7 +2235,11 @@ async fn embeddings(
             completion_tokens: 0,
             total_tokens: prompt_tokens,
         },
-    }))
+    };
+    let limit = if headers.contains_key(JOB_OWNER_HEADER) { 2 << 20 } else { 8 << 20 };
+    crate::job_admission::json_response(&response, limit).map_err(|_| {
+        ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "embedding response exceeds job buffer limit", "job_response_limit")
+    })
 }
 
 /// `POST /v1/audio/transcriptions` — OpenAI-compatible Whisper STT.
@@ -2194,6 +2249,8 @@ async fn embeddings(
 /// `model` (accepted and ignored — the loaded whisper model is used).
 async fn transcriptions(
     State(state): State<AppState>,
+    Extension(lease): Extension<Arc<crate::job_admission::JobLease>>,
+    headers: HeaderMap,
     mut multipart: axum::extract::Multipart,
 ) -> Result<Response, ApiError> {
     let Some(whisper) = state.whisper.clone() else {
@@ -2201,6 +2258,9 @@ async fn transcriptions(
             "no whisper model is loaded — start the server with --whisper-model",
         ));
     };
+    if headers.get(JOB_OWNER_HEADER).is_some_and(|owner| owner.as_bytes() != whisper.job_owner.as_bytes()) {
+        return Err(ApiError::new(StatusCode::CONFLICT, "job model ownership changed", "job_owner_changed"));
+    }
 
     let mut file: Option<axum::body::Bytes> = None;
     let mut language: Option<String> = None;
@@ -2208,44 +2268,49 @@ async fn transcriptions(
     while let Some(field) = multipart
         .next_field()
         .await
-        .map_err(|e| ApiError::bad_request(format!("invalid multipart body: {e}")))?
+        .map_err(|e| ApiError::new(e.status(), format!("invalid multipart body: {e}"), "invalid_request_error"))?
     {
         match field.name().unwrap_or_default() {
             "file" => {
                 let bytes = field
                     .bytes()
                     .await
-                    .map_err(|e| ApiError::bad_request(format!("file upload failed: {e}")))?;
+                    .map_err(|e| ApiError::new(e.status(), format!("file upload failed: {e}"), "invalid_request_error"))?;
                 file = Some(bytes);
             }
             "language" => {
-                language = Some(field.text().await.unwrap_or_default());
+                language = Some(field.text().await.map_err(|e| ApiError::new(e.status(), format!("invalid language field: {e}"), "invalid_request_error"))?);
             }
             "response_format" => {
-                response_format = field.text().await.unwrap_or_default();
+                response_format = field.text().await.map_err(|e| ApiError::new(e.status(), format!("invalid response_format field: {e}"), "invalid_request_error"))?;
             }
             // `model`, `prompt`, `temperature`, … accepted and ignored.
             _ => {
-                let _ = field.bytes().await;
+                field.bytes().await.map_err(|e| ApiError::new(e.status(), format!("invalid multipart field: {e}"), "invalid_request_error"))?;
             }
         }
     }
     let file = file.ok_or_else(|| ApiError::bad_request("missing required field 'file'"))?;
 
     let transcription = run_transcription_job(whisper.admission.clone(), move |cancel| {
+        let _lease = lease;
         whisper.transcribe_wav_cancellable(&file, language.as_deref(), false, cancel)
     })
     .await?;
 
     if response_format == "text" {
+        if transcription.text.len() > 2 << 20 {
+            return Err(ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "transcription response exceeds job buffer limit", "job_response_limit"));
+        }
         return Ok(transcription.text.into_response());
     }
-    Ok(Json(json!({
+    crate::job_admission::json_response(&json!({
         "text": transcription.text,
         "duration": transcription.duration,
         "language": transcription.language,
-    }))
-    .into_response())
+    }), 2 << 20).map_err(|_| {
+        ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "transcription response exceeds job buffer limit", "job_response_limit")
+    })
 }
 
 async fn run_transcription_job<T, F>(

@@ -24,7 +24,7 @@ use futures_util::StreamExt;
 use http_body_util::{BodyExt, Full};
 use hyper_util::rt::TokioIo;
 use joshua::coordinator::{
-    create_router, Coordinator, CoordinatorConfig, ModelSlots, WorkerCapabilities, WorkerInfo,
+    create_router, Coordinator, CoordinatorConfig, JobModel, ModelSlots, WorkerCapabilities, WorkerInfo,
     REQUEST_ID_HEADER, WORKER_HEADER, WORKER_PROTOCOL_VERSION,
 };
 use serde_json::{json, Value};
@@ -48,6 +48,7 @@ enum Behavior {
     Reject503,
     /// Fail with a 500 (an execution error).
     Fail500,
+    LoseJsonBody,
     /// Start a 200 stream and lose the connection before any event.
     LoseBeforeOutput,
     /// Stream two events, then lose the connection.
@@ -64,6 +65,9 @@ enum Behavior {
 }
 
 struct Fake {
+    embedding_jobs: Mutex<Vec<JobModel>>,
+    completed: Mutex<Vec<(String, std::time::Instant)>>,
+    bad_indexes: AtomicBool,
     name: String,
     model: String,
     max_concurrency: usize,
@@ -100,6 +104,9 @@ fn sse(data: &str) -> Bytes {
 
 async fn fake_info(State(f): State<Arc<Fake>>) -> Json<WorkerInfo> {
     Json(WorkerInfo {
+        transcription_job: None,
+        transcription_in_flight: 0,
+        embedding_jobs: f.embedding_jobs.lock().unwrap().clone(),
         protocol_version: WORKER_PROTOCOL_VERSION,
         model: f.model.clone(),
         models: f.models.lock().unwrap().clone(),
@@ -135,6 +142,14 @@ async fn fake_transcribe(
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
+    f.active.fetch_add(1, Ordering::SeqCst);
+    let _guard = ActiveGuard(f.clone());
+    let behavior = f.behavior.lock().unwrap().clone();
+    match behavior {
+        Behavior::Hang => std::future::pending::<()>().await,
+        Behavior::Gate => f.release.notified().await,
+        _ => {},
+    }
     Json(json!({"text": format!("from {}", f.name), "worker": f.name})).into_response()
 }
 
@@ -151,6 +166,12 @@ async fn fake_generate(
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
     let req: Value = serde_json::from_slice(&body).unwrap();
+    if let Some(expected) = f.embedding_jobs.lock().unwrap().first() {
+        if headers.get(joshua::coordinator::JOB_OWNER_HEADER)
+            .is_some_and(|owner| owner.as_bytes() != expected.owner.as_bytes()) {
+            return StatusCode::CONFLICT.into_response();
+        }
+    }
     // Like a joshua worker, only chat completions stream; the other routes
     // answer JSON whatever `stream` says.
     let stream = uri.path() == "/v1/chat/completions" && req["stream"].as_bool().unwrap_or(false);
@@ -189,6 +210,21 @@ async fn fake_generate(
                     .collect();
                 sse_response(futures_util::stream::iter(chunks).boxed())
             } else {
+                if uri.path() == "/v1/embeddings" && !f.embedding_jobs.lock().unwrap().is_empty() {
+                    let inputs = req["input"].as_array().unwrap();
+                    if inputs[0].as_str().unwrap().starts_with("slow") {
+                        tokio::time::sleep(Duration::from_millis(80)).await;
+                    }
+                    let data: Vec<_> = inputs.iter().enumerate().rev().map(|(index, input)| {
+                        let text = input.as_str().unwrap();
+                        json!({"object": "embedding", "index": if f.bad_indexes.load(Ordering::SeqCst) { 0 } else { index },
+                            "embedding": [text.len() as f32, text.bytes().map(u64::from).sum::<u64>() as f32]})
+                    }).collect();
+                    f.completed.lock().unwrap().push((inputs[0].as_str().unwrap().to_string(), std::time::Instant::now()));
+                    let tokens: usize = inputs.iter().map(|input| input.as_str().unwrap().len()).sum();
+                    return Json(json!({"object": "list", "model": f.model, "data": data,
+                        "usage": {"prompt_tokens": tokens, "completion_tokens": 0, "total_tokens": tokens}})).into_response();
+                }
                 Json(json!({
                     "worker": f.name,
                     "echo": req,
@@ -225,6 +261,16 @@ async fn fake_generate(
                 Json(json!({"error": {"message": "internal error", "type": "server_error"}})),
             )
                 .into_response()
+        }
+        Behavior::LoseJsonBody => {
+            drop(guard);
+            let first = futures_util::stream::once(async { Ok::<_, std::io::Error>(Bytes::from_static(b"{\"data\":")) });
+            let last = futures_util::stream::once(async {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                Err::<Bytes, _>(std::io::Error::other("worker crashed after execution"))
+            });
+            Response::builder().header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from_stream(first.chain(last))).unwrap()
         }
         Behavior::LoseBeforeOutput => {
             drop(guard);
@@ -300,6 +346,9 @@ async fn spawn_fake_handle(
     behavior: Behavior,
 ) -> (Arc<Fake>, String, tokio::task::JoinHandle<()>) {
     let fake = Arc::new(Fake {
+        embedding_jobs: Mutex::new(Vec::new()),
+        completed: Mutex::new(Vec::new()),
+        bad_indexes: AtomicBool::new(false),
         name: name.to_string(),
         model: model.to_string(),
         max_concurrency,
@@ -1244,6 +1293,9 @@ async fn spawn_two_model_worker() -> (Arc<(AtomicUsize, Notify)>, String) {
     let shared = Arc::new((AtomicUsize::new(0), Notify::new()));
     let info = || async {
         Json(WorkerInfo {
+            transcription_job: None,
+            transcription_in_flight: 0,
+            embedding_jobs: Vec::new(),
             protocol_version: WORKER_PROTOCOL_VERSION,
             model: "alpha".to_string(),
             models: vec![
@@ -1642,6 +1694,280 @@ fn cancelled_embedding_stops_and_releases_the_permit() {
         engine.embed_with_usage(&texts).unwrap()
     );
     assert_eq!(vectors.len(), 2);
+}
+
+fn enable_embedding_jobs(worker: &Fake, revision: Option<&str>) {
+    *worker.embedding_jobs.lock().unwrap() = vec![JobModel {
+        model: worker.model.clone(), owner: format!("{}-owner", worker.name),
+        backend: "cpu".to_string(), input_format: "text".to_string(), max_output_bytes: 2 << 20,
+        revision: revision.map(str::to_string), max_inputs: 2, max_input_bytes: 256 << 10,
+    }];
+}
+
+#[tokio::test]
+async fn embedding_jobs_reconstruct_reordered_batches_and_preserve_options() {
+    let (first, first_url) = spawn_fake("first", "m", 2, Behavior::Echo).await;
+    let (second, second_url) = spawn_fake("second", "m", 2, Behavior::Echo).await;
+    enable_embedding_jobs(&first, Some("same-weights"));
+    enable_embedding_jobs(&second, Some("same-weights"));
+    let (_, router) = spawn_router(config(&[&first_url, &second_url])).await;
+    let texts = ["slow", "", "fast", "longer text", "last"];
+    let response = call(&router, "POST", "/v1/embeddings", &json!({
+        "model": "m", "input": texts, "encoding_format": "float", "normalize": false,
+    }).to_string()).await;
+    assert_eq!(response.status, StatusCode::OK, "{}", response.text());
+    let result = response.json();
+    for (index, text) in texts.iter().enumerate() {
+        assert_eq!(result["data"][index]["index"], index);
+        assert_eq!(result["data"][index]["embedding"][0], json!(text.len() as f32));
+    }
+    let tokens: usize = texts.iter().map(|text| text.len()).sum();
+    assert_eq!(result["usage"]["prompt_tokens"], tokens);
+    assert_eq!(result["usage"]["total_tokens"], tokens);
+    assert_eq!(first.received.load(Ordering::SeqCst) + second.received.load(Ordering::SeqCst), 3);
+    assert!(first.received.load(Ordering::SeqCst) > 0 && second.received.load(Ordering::SeqCst) > 0);
+    for worker in [&first, &second] {
+        let body: Value = serde_json::from_slice(worker.last_body.lock().unwrap().as_ref().unwrap()).unwrap();
+        assert_eq!(body["normalize"], false);
+        assert_eq!(body["encoding_format"], "float");
+        assert!(worker.last_request_id.lock().unwrap().as_ref().unwrap().starts_with("job-"));
+    }
+    let mut completions: Vec<_> = first.completed.lock().unwrap().iter().cloned()
+        .chain(second.completed.lock().unwrap().iter().cloned()).collect();
+    assert_eq!(completions.len(), 3);
+    completions.sort_by_key(|completion| completion.1);
+    assert_ne!(completions[0].0, "slow");
+    assert_eq!(completions[2].0, "slow");
+}
+
+#[tokio::test]
+async fn embedding_jobs_never_mix_unknown_or_incompatible_revisions() {
+    for (revision, backend) in [(None, "cpu"), (Some("different-weights"), "cpu"), (Some("weights"), "metal")] {
+        let (first, first_url) = spawn_fake("first", "m", 1, Behavior::Echo).await;
+        let (second, second_url) = spawn_fake("second", "m", 1, Behavior::Echo).await;
+        enable_embedding_jobs(&first, Some("weights"));
+        enable_embedding_jobs(&second, revision);
+        second.embedding_jobs.lock().unwrap()[0].backend = backend.to_string();
+        let (_, router) = spawn_router(config(&[&first_url, &second_url])).await;
+        let response = call(&router, "POST", "/v1/embeddings", &json!({
+            "model": "m", "input": ["one", "two", "three", "four", "five"],
+        }).to_string()).await;
+        assert_eq!(response.status, StatusCode::OK, "{}", response.text());
+        let counts = [first.received.load(Ordering::SeqCst), second.received.load(Ordering::SeqCst)];
+        assert!(counts == [3, 0] || counts == [0, 3], "{counts:?}");
+    }
+}
+
+#[tokio::test]
+async fn embedding_jobs_reject_duplicate_indexes_and_aggregate_overflow() {
+    let (worker, url) = spawn_fake("worker", "m", 1, Behavior::Echo).await;
+    enable_embedding_jobs(&worker, Some("weights"));
+    worker.bad_indexes.store(true, Ordering::SeqCst);
+    let (_, router) = spawn_router(config(&[&url])).await;
+    let body = json!({"model": "m", "input": ["a", "b"]}).to_string();
+    assert_eq!(call(&router, "POST", "/v1/embeddings", &body).await.status, StatusCode::BAD_GATEWAY);
+    worker.bad_indexes.store(false, Ordering::SeqCst);
+    let mut cfg = config(&[&url]);
+    cfg.max_response_bytes = 300;
+    let (_, router) = spawn_router(cfg).await;
+    let body = json!({"model": "m", "input": ["a", "b", "c", "d"]}).to_string();
+    assert_eq!(call(&router, "POST", "/v1/embeddings", &body).await.status, StatusCode::BAD_GATEWAY);
+}
+
+#[tokio::test]
+async fn embedding_jobs_honor_worker_output_limit_and_skip_zero_budget_peers() {
+    let (first, first_url) = spawn_fake("first", "m", 1, Behavior::Echo).await;
+    let (second, second_url) = spawn_fake("second", "m", 1, Behavior::Echo).await;
+    enable_embedding_jobs(&first, Some("weights"));
+    enable_embedding_jobs(&second, Some("weights"));
+    second.embedding_jobs.lock().unwrap()[0].max_inputs = 0;
+    let (_, router) = spawn_router(config(&[&first_url, &second_url])).await;
+    let body = json!({"model": "m", "input": ["a", "b", "c"]}).to_string();
+    assert_eq!(call(&router, "POST", "/v1/embeddings", &body).await.status, StatusCode::OK);
+    assert_eq!(second.received.load(Ordering::SeqCst), 0);
+    first.embedding_jobs.lock().unwrap()[0].max_output_bytes = 1;
+    let (_, router) = spawn_router(config(&[&first_url])).await;
+    assert_eq!(call(&router, "POST", "/v1/embeddings", &body).await.status, StatusCode::BAD_GATEWAY);
+}
+
+#[tokio::test]
+async fn embedding_jobs_bound_inputs_and_do_not_retry_execution_errors() {
+    let (worker, url) = spawn_fake("worker", "m", 1, Behavior::Fail500).await;
+    enable_embedding_jobs(&worker, Some("weights"));
+    let (_, router) = spawn_router(config(&[&url])).await;
+    let response = call(&router, "POST", "/v1/embeddings", &json!({
+        "model": "m", "input": ["x".repeat(256 << 10)],
+    }).to_string()).await;
+    assert_eq!(response.status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(worker.received.load(Ordering::SeqCst), 0);
+    let response = call(&router, "POST", "/v1/embeddings", &json!({
+        "model": "m", "input": vec!["x"; 2049],
+    }).to_string()).await;
+    assert_eq!(response.status, StatusCode::PAYLOAD_TOO_LARGE);
+    let response = call(&router, "POST", "/v1/embeddings", r#"{"model":"m","input":["x"]}"#).await;
+    assert_eq!(response.status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(worker.received.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn embedding_jobs_cancel_all_dispatched_batches_on_disconnect() {
+    let (worker, url) = spawn_fake("worker", "m", 4, Behavior::Hang).await;
+    enable_embedding_jobs(&worker, Some("weights"));
+    let (coordinator, router) = spawn_router(config(&[&url])).await;
+    let client = tokio::spawn(async move {
+        call(&router, "POST", "/v1/embeddings", &json!({"model": "m", "input": vec!["x"; 12]}).to_string()).await
+    });
+    eventually("four bounded subbatches running", || worker.active.load(Ordering::SeqCst) == 4).await;
+    assert_eq!(worker.received.load(Ordering::SeqCst), 4);
+    client.abort();
+    eventually("all subbatches cancelled", || worker.active.load(Ordering::SeqCst) == 0).await;
+    eventually("all slots released", || coordinator.status_report()[0].dispatched == 0).await;
+    assert_eq!(worker.received.load(Ordering::SeqCst), 4);
+}
+
+#[tokio::test]
+async fn embedding_jobs_match_direct_real_worker_and_enforce_owner() {
+    let worker = spawn_real_worker("route-job-parity", Some("worker-secret")).await;
+    let second = spawn_real_worker("route-job-parity-second", Some("worker-secret")).await;
+    let info: WorkerInfo = {
+        let mut sender = open(&worker).await;
+        let mut req = request("GET", "/v1/worker/info", "");
+        req.headers_mut().insert(header::AUTHORIZATION, "Bearer worker-secret".parse().unwrap());
+        let response = sender.send_request(req).await.unwrap();
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap()
+    };
+    assert!(info.embedding_jobs[0].revision.is_some());
+    let mut cfg = config(&[&worker, &second]);
+    cfg.worker_api_key = Some("worker-secret".to_string());
+    let (coordinator, router) = spawn_router(cfg).await;
+    let reports = coordinator.status_report();
+    assert_eq!(reports[0].info.as_ref().unwrap().embedding_jobs[0].revision,
+        reports[1].info.as_ref().unwrap().embedding_jobs[0].revision);
+    let body = json!({"model": info.model, "input": vec!["hello world"; 67], "encoding_format": "base64"}).to_string();
+    let routed = call(&router, "POST", "/v1/embeddings", &body).await;
+    let mut sender = open(&worker).await;
+    let mut req = request("POST", "/v1/embeddings", &body);
+    req.headers_mut().insert(header::AUTHORIZATION, "Bearer worker-secret".parse().unwrap());
+    let response = sender.send_request(req).await.unwrap();
+    let direct: Value = serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(routed.status, StatusCode::OK, "{}", routed.text());
+    assert_eq!(routed.json(), direct);
+    let mut req = request("POST", "/v1/embeddings", &body);
+    req.headers_mut().insert(header::AUTHORIZATION, "Bearer worker-secret".parse().unwrap());
+    req.headers_mut().insert(joshua::coordinator::JOB_OWNER_HEADER, "stale-owner".parse().unwrap());
+    assert_eq!(sender.send_request(req).await.unwrap().status(), StatusCode::CONFLICT);
+    let invalid = call(&router, "POST", "/v1/embeddings", &json!({"model": info.model, "input": [1]}).to_string()).await;
+    assert_eq!(invalid.status, StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn embedding_jobs_retry_admission_but_never_reexecute_a_lost_result() {
+    for lost in [false, true] {
+        let (first, first_url) = spawn_fake("first", "m", 1,
+            if lost { Behavior::LoseJsonBody } else { Behavior::Reject503 }).await;
+        let (second, second_url) = spawn_fake("second", "m", 1, Behavior::Echo).await;
+        enable_embedding_jobs(&first, Some("same"));
+        enable_embedding_jobs(&second, Some("same"));
+        let (_, router) = spawn_router(config(&[&first_url, &second_url])).await;
+        let response = call(&router, "POST", "/v1/embeddings", r#"{"model":"m","input":["x"]}"#).await;
+        assert_eq!(first.received.load(Ordering::SeqCst), 1);
+        if lost {
+            assert_eq!(response.status, StatusCode::BAD_GATEWAY);
+            assert_eq!(second.received.load(Ordering::SeqCst), 0);
+        } else {
+            assert_eq!(response.status, StatusCode::OK, "{}", response.text());
+            assert_eq!(response.json()["usage"]["prompt_tokens"], 1);
+            assert_eq!(second.received.load(Ordering::SeqCst), 1);
+        }
+    }
+}
+
+#[tokio::test]
+async fn embedding_jobs_fail_closed_after_resident_owner_changes() {
+    let (worker, url) = spawn_fake("worker", "m", 1, Behavior::Echo).await;
+    enable_embedding_jobs(&worker, Some("weights"));
+    let (_, router) = spawn_router(config(&[&url])).await;
+    worker.embedding_jobs.lock().unwrap()[0].owner = "replacement-model".to_string();
+    let response = call(&router, "POST", "/v1/embeddings", r#"{"model":"m","input":["x"]}"#).await;
+    assert_eq!(response.status, StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn embedding_subbatches_do_not_overload_their_own_zero_depth_queue() {
+    let (worker, url) = spawn_fake("worker", "m", 1, Behavior::Echo).await;
+    enable_embedding_jobs(&worker, Some("weights"));
+    let mut cfg = config(&[&url]);
+    cfg.queue_depth = 0;
+    let (_, router) = spawn_router(cfg).await;
+    let response = call(&router, "POST", "/v1/embeddings", r#"{"model":"m","input":["one","two","three","four","five"]}"#).await;
+    assert_eq!(response.status, StatusCode::OK, "{}", response.text());
+    assert_eq!(worker.received.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn whole_audio_has_its_own_slot_and_does_not_block_embeddings() {
+    let (worker, url) = spawn_fake("worker", "m", 1, Behavior::Hang).await;
+    worker.transcriptions.store(true, Ordering::SeqCst);
+    *worker.models.lock().unwrap() = vec![ModelSlots { id: "m".to_string(), n_ctx: Some(4096),
+        max_concurrency: 1, in_flight: 0, embeddings: true }];
+    enable_embedding_jobs(&worker, Some("weights"));
+    let (coordinator, router) = spawn_router(config(&[&url])).await;
+    let audio = tokio::spawn({
+        let router = router.clone();
+        async move { call(&router, "POST", "/v1/audio/transcriptions", "unmodified multipart").await }
+    });
+    eventually("audio admitted", || worker.active.load(Ordering::SeqCst) == 1).await;
+    *worker.behavior.lock().unwrap() = Behavior::Echo;
+    let embedding = tokio::time::timeout(Duration::from_secs(2),
+        call(&router, "POST", "/v1/embeddings", r#"{"model":"m","input":["x"]}"#)).await.unwrap();
+    assert_eq!(embedding.status, StatusCode::OK, "{}", embedding.text());
+    assert_eq!(coordinator.status_report()[0].dispatched, 1);
+    audio.abort();
+    eventually("audio lease released", || coordinator.status_report()[0].dispatched == 0).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn benchmark_embedding_jobs_loopback_acceptance_matrix() {
+    for workers in [1, 2, 4] {
+        let mut urls = Vec::new();
+        for index in 0..workers {
+            urls.push(spawn_real_worker(&format!("route-bench-{workers}-{index}"), None).await);
+        }
+        let info = call(&urls[0], "GET", "/v1/worker/info", "").await.json();
+        let refs: Vec<_> = urls.iter().collect();
+        let (_, router) = spawn_router(config(&refs)).await;
+        for inputs in [1, 32, 128] {
+            for words in [1, 8] {
+                let body = json!({"model": info["model"], "input": vec!["hello ".repeat(words); inputs]}).to_string();
+                for concurrency in [1, 4] {
+                    for (mode, endpoint) in [("direct", &urls[0]), ("routed", &router)] {
+                        let warm = call(endpoint, "POST", "/v1/embeddings", &body).await;
+                        assert_eq!(warm.status, StatusCode::OK, "{}", warm.text());
+                        let start = std::time::Instant::now();
+                        let mut latencies: Vec<_> = futures_util::stream::iter(0..8).map(|_| {
+                            let body = &body;
+                            async move {
+                                let start = std::time::Instant::now();
+                                let result = call(endpoint, "POST", "/v1/embeddings", body).await;
+                                assert_eq!(result.status, StatusCode::OK, "{}", result.text());
+                                assert_eq!(result.json()["data"].as_array().unwrap().len(), inputs);
+                                start.elapsed().as_secs_f64() * 1000.0
+                            }
+                        }).buffer_unordered(concurrency).collect().await;
+                        let elapsed = start.elapsed().as_secs_f64();
+                        latencies.sort_by(f64::total_cmp);
+                        println!("{}", json!({"benchmark": "embedding-jobs-loopback", "backend": "cpu",
+                            "fixture": "tiny-synthetic-llama", "workers": workers, "inputs": inputs,
+                            "words": words, "concurrency": concurrency, "mode": mode,
+                            "requests": 8, "documents_per_second": (8 * inputs) as f64 / elapsed,
+                            "p50_ms": latencies[4], "p95_ms": latencies[7],
+                            "client_upload_bytes": body.len() * 8}));
+                    }
+                }
+            }
+        }
+    }
 }
 
 // ─── TLS (only with `cargo test --features tls`) ─────────────────────────────

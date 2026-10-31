@@ -84,6 +84,22 @@ use uuid::Uuid;
 
 use crate::types::{ErrorResponse, ModelInfo, ModelListResponse};
 
+mod jobs;
+
+pub const JOB_OWNER_HEADER: &str = "x-joshua-job-owner";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobModel {
+    pub model: String,
+    pub backend: String,
+    pub input_format: String,
+    pub owner: String,
+    pub revision: Option<String>,
+    pub max_inputs: usize,
+    pub max_input_bytes: usize,
+    pub max_output_bytes: usize,
+}
+
 /// Version of the worker protocol this build speaks.  Bumped on any
 /// incompatible change to [`WorkerInfo`] or to how requests are forwarded;
 /// a worker reporting another version is never routed to.
@@ -120,6 +136,12 @@ const ROUTED_PATHS: [&str; 4] = [
 /// What a worker reports at [`WORKER_INFO_PATH`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcription_job: Option<JobModel>,
+    #[serde(default)]
+    pub transcription_in_flight: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub embedding_jobs: Vec<JobModel>,
     /// The worker's [`WORKER_PROTOCOL_VERSION`].
     pub protocol_version: u32,
     /// Model identity (the id the worker reports in `/v1/models`).
@@ -297,6 +319,7 @@ struct WorkerStatus {
 }
 
 struct Worker {
+    audio_dispatched: AtomicUsize,
     endpoint: Endpoint,
     status: Mutex<WorkerStatus>,
     /// Requests this coordinator has in flight on the worker.
@@ -350,6 +373,7 @@ enum Pick {
 
 /// One reserved worker slot; released (and queued requests woken) on drop.
 struct SlotGuard {
+    audio: bool,
     coordinator: Arc<Coordinator>,
     index: usize,
     /// The requested model, counted against its own admission figures.
@@ -360,6 +384,9 @@ struct SlotGuard {
 impl Drop for SlotGuard {
     fn drop(&mut self) {
         let w = &self.coordinator.workers[self.index];
+        if self.audio {
+            w.audio_dispatched.fetch_sub(1, Ordering::AcqRel);
+        }
         if let Some(model) = &self.model {
             let mut counts = w.by_model();
             if let Some(n) = counts.get_mut(model) {
@@ -436,7 +463,7 @@ pub struct WorkerStatusReport {
 enum Failure {
     /// Nothing reached the client and the worker did not (or can no longer)
     /// run the request: try another worker.
-    Retry { reason: String, admission: bool },
+    Retry { reason: String, admission: bool, safe: bool },
     /// The answer to send the client as-is.
     Final(Response),
 }
@@ -585,6 +612,7 @@ impl Coordinator {
                 return Err(format!("worker '{}' is listed twice", endpoint.base));
             }
             workers.push(Worker {
+                audio_dispatched: AtomicUsize::new(0),
                 endpoint,
                 status: Mutex::new(WorkerStatus::default()),
                 dispatched: AtomicUsize::new(0),
@@ -643,7 +671,7 @@ impl Coordinator {
                             "worker healthy"
                         );
                     }
-                    st.external_in_flight = info.in_flight.saturating_sub(ours);
+                    st.external_in_flight = info.in_flight.saturating_add(info.transcription_in_flight).saturating_sub(ours);
                     st.external_by_model = info
                         .models
                         .iter()
@@ -746,6 +774,9 @@ impl Coordinator {
         work: &RequestWork,
         exclude: &[usize],
     ) -> Pick {
+        if path == TRANSCRIPTIONS_PATH {
+            return self.try_pick_audio(exclude);
+        }
         let _lock = self.pick_lock.lock().unwrap_or_else(|p| p.into_inner());
         let n = self.workers.len();
         let start = self.rotation.fetch_add(1, Ordering::Relaxed) % n;
@@ -864,6 +895,7 @@ impl Coordinator {
                     .or_default() += work.units;
             }
             return Pick::Slot(SlotGuard {
+                audio: false,
                 coordinator: Arc::clone(self),
                 index,
                 model,
@@ -1000,6 +1032,8 @@ impl Coordinator {
         log: RequestLog,
     ) -> Result<Response, Failure> {
         let w = &self.workers[slot.index];
+        tracing::debug!(request_id = %log.request_id, worker = %w.endpoint.base,
+            upload_bytes = body.len(), attempt = log.attempt, "dispatching request payload");
         // Dropping the attempt on timeout drops its connection, which
         // cancels the work on the worker.
         let attempt = self.first_output(w, path, body, content_type.as_ref(), &log);
@@ -1070,6 +1104,14 @@ impl Coordinator {
         content_type: Option<&HeaderValue>,
         log: &RequestLog,
     ) -> Result<FirstOutput, Failure> {
+        if matches!(path, "/v1/embeddings" | TRANSCRIPTIONS_PATH)
+            && !w.endpoint.authority.parse::<SocketAddr>().is_ok_and(|address| address.ip().is_loopback()) {
+            return Err(Failure::Final(error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "text/audio jobs require a loopback worker or an encrypted tunnel; native worker TLS is not implemented",
+                "server_error", Some("secure_transport_required"),
+            )));
+        }
         let mut extra = HeaderMap::new();
         extra.insert(
             header::CONTENT_TYPE,
@@ -1080,13 +1122,19 @@ impl Coordinator {
         if let Ok(id) = HeaderValue::from_str(&log.request_id) {
             extra.insert(REQUEST_ID_HEADER, id);
         }
+        if let Some(owner) = &log.owner {
+            if let Ok(owner) = HeaderValue::from_str(owner) {
+                extra.insert(JOB_OWNER_HEADER, owner);
+            }
+        }
         let (response, conn) = match self.send(w, Method::POST, path, &extra, body).await {
             Ok(ok) => ok,
-            Err((_, reason)) => {
+            Err((sent, reason)) => {
                 w.mark_unhealthy(reason.clone());
                 return Err(Failure::Retry {
                     reason,
                     admission: false,
+                    safe: !sent,
                 });
             }
         };
@@ -1103,6 +1151,7 @@ impl Coordinator {
                 return Err(Failure::Retry {
                     reason: "worker at capacity".to_string(),
                     admission: true,
+                    safe: true,
                 });
             }
             if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
@@ -1133,8 +1182,14 @@ impl Coordinator {
                     .to_ascii_lowercase()
                     .starts_with("text/event-stream")
             });
+        if log.owner.is_some() && is_stream {
+            return Err(Failure::Final(error_response(StatusCode::BAD_GATEWAY,
+                "job worker returned an unexpected stream", "server_error", Some("invalid_job_result"))));
+        }
         if !is_stream {
-            let limit = self.config.max_response_bytes;
+            let limit = if log.owner.is_some() {
+                self.config.max_response_bytes.min(log.response_limit)
+            } else { self.config.max_response_bytes };
             let body = match Limited::new(response.into_body(), limit).collect().await {
                 Ok(c) => c.to_bytes(),
                 Err(e) if e.downcast_ref::<LengthLimitError>().is_some() => {
@@ -1154,6 +1209,7 @@ impl Coordinator {
                     return Err(Failure::Retry {
                         reason,
                         admission: false,
+                        safe: false,
                     });
                 }
             };
@@ -1193,6 +1249,7 @@ impl Coordinator {
                     return Err(Failure::Retry {
                         reason,
                         admission: false,
+                        safe: false,
                     });
                 }
                 // Ended before one whole event: nothing reached the client,
@@ -1201,6 +1258,7 @@ impl Coordinator {
                     return Err(Failure::Retry {
                         reason: "worker closed the stream before output".to_string(),
                         admission: false,
+                        safe: false,
                     })
                 }
             }
@@ -1215,6 +1273,11 @@ impl Coordinator {
         body: Bytes,
     ) -> Response {
         let request_id = request_id_from(headers);
+        if path == "/v1/embeddings" {
+            if let Some(response) = self.embedding_jobs(headers, &body).await {
+                return response;
+            }
+        }
         // A transcription upload is multipart, and the boundary lives in the
         // client's `Content-Type`, not in the body.  The worker cannot parse
         // the upload without it, so it is forwarded on that route.  Every
@@ -1282,20 +1345,29 @@ impl Coordinator {
                 }
             };
             let index = slot.index;
+            let owner = if path == TRANSCRIPTIONS_PATH {
+                self.workers[index].status().info.as_ref()
+                    .and_then(|info| info.transcription_job.as_ref().map(|job| job.owner.clone()))
+            } else { None };
             let log = RequestLog {
+                response_limit: 2 << 20,
                 request_id: request_id.clone(),
                 worker: self.workers[index].endpoint.base.clone(),
                 path,
                 attempt: tried.len() + 1,
                 queue_ms: arrived.elapsed().as_millis() as u64,
                 started: Instant::now(),
+                owner,
             };
             match self
                 .forward(slot, path, body.clone(), content_type.clone(), log)
                 .await
             {
                 Ok(response) | Err(Failure::Final(response)) => return response,
-                Err(Failure::Retry { reason, admission }) => {
+                Err(Failure::Retry { reason, admission, safe }) => {
+                    if matches!(path, TRANSCRIPTIONS_PATH | "/v1/embeddings") && !safe {
+                        return with_request_id(reject_response(Reject::Exhausted), &request_id);
+                    }
                     tracing::warn!(
                         request_id = %request_id,
                         worker = %self.workers[index].endpoint.base,
@@ -1313,6 +1385,8 @@ impl Coordinator {
 
 /// Per-attempt record for logs and response headers (no request content).
 struct RequestLog {
+    response_limit: usize,
+    owner: Option<String>,
     request_id: String,
     worker: String,
     path: &'static str,
@@ -1581,6 +1655,9 @@ pub fn create_router(coordinator: Arc<Coordinator>) -> Router {
         );
     }
     let api = api.layer(middleware::from_fn_with_state(
+        crate::job_admission::Admission::default(),
+        crate::job_admission::admit,
+    )).layer(middleware::from_fn_with_state(
         Arc::clone(&coordinator),
         require_api_key,
     ));
