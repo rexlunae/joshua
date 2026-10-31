@@ -27,7 +27,10 @@
 //! Chat and text completions stop decoding, and embeddings stop between
 //! input texts, when the HTTP request is dropped (the client, or a
 //! coordinator proxying for it, disconnected), so a cancelled request
-//! releases its concurrency permit promptly.
+//! releases its concurrency permit promptly. Transcription admission waits
+//! asynchronously; dropped requests cancel WAV ingest and Whisper decoding.
+//! Candle mel/encoder calls are non-preemptible, with cancellation checks on
+//! either side. The blocking job owns its permit until it actually exits.
 
 use std::convert::Infallible;
 use std::path::{Path, PathBuf};
@@ -2198,7 +2201,7 @@ async fn transcriptions(
         ));
     };
 
-    let mut file: Option<Vec<u8>> = None;
+    let mut file: Option<axum::body::Bytes> = None;
     let mut language: Option<String> = None;
     let mut response_format = "json".to_string();
     while let Some(field) = multipart
@@ -2212,7 +2215,7 @@ async fn transcriptions(
                     .bytes()
                     .await
                     .map_err(|e| ApiError::bad_request(format!("file upload failed: {e}")))?;
-                file = Some(bytes.to_vec());
+                file = Some(bytes);
             }
             "language" => {
                 language = Some(field.text().await.unwrap_or_default());
@@ -2228,13 +2231,10 @@ async fn transcriptions(
     }
     let file = file.ok_or_else(|| ApiError::bad_request("missing required field 'file'"))?;
 
-    let transcription = tokio::task::spawn_blocking({
-        let language = language.clone();
-        move || whisper.transcribe_wav(&file, language.as_deref(), false)
+    let transcription = run_transcription_job(whisper.admission.clone(), move |cancel| {
+        whisper.transcribe_wav_cancellable(&file, language.as_deref(), false, cancel)
     })
-    .await
-    .map_err(|e| ApiError::internal(e.to_string()))?
-    .map_err(ApiError::from)?;
+    .await?;
 
     if response_format == "text" {
         return Ok(transcription.text.into_response());
@@ -2247,6 +2247,251 @@ async fn transcriptions(
     .into_response())
 }
 
+async fn run_transcription_job<T, F>(
+    admission: Arc<tokio::sync::Semaphore>,
+    job: F,
+) -> Result<T, ApiError>
+where
+    T: Send + 'static,
+    F: FnOnce(&AtomicBool) -> crate::error::Result<T> + Send + 'static,
+{
+    let cancel = CancelOnDrop::new();
+    let permit = admission
+        .acquire_owned()
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let flag = cancel.flag();
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        if flag.load(Ordering::Relaxed) {
+            return Err(JoshuaError::Cancelled);
+        }
+        job(&flag)
+    })
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?
+    .map_err(ApiError::from)
+}
+
+#[cfg(test)]
+mod transcription_cancellation_tests {
+    use super::*;
+    use tokio::sync::{oneshot, Semaphore};
+    use tokio::time::{timeout, Duration};
+
+    struct Payload(Option<oneshot::Sender<()>>);
+
+    impl Drop for Payload {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn transcription_cancelled_while_waiting_drops_payload_without_running() {
+        let admission = Arc::new(Semaphore::new(1));
+        let holder = admission.clone().acquire_owned().await.unwrap();
+        let ran = Arc::new(AtomicBool::new(false));
+        let job_ran = ran.clone();
+        let (dropped_tx, dropped_rx) = oneshot::channel();
+        let payload = Payload(Some(dropped_tx));
+        let mut request = Box::pin(run_transcription_job(admission.clone(), move |_| {
+            let _payload = payload;
+            job_ran.store(true, Ordering::Relaxed);
+            Ok(())
+        }));
+        assert!(futures_util::poll!(request.as_mut()).is_pending());
+        drop(request);
+        timeout(Duration::from_secs(2), dropped_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(admission.available_permits(), 0);
+        assert!(!ran.load(Ordering::Relaxed));
+        drop(holder);
+        assert_eq!(admission.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn transcription_drop_cancels_active_job_but_keeps_permit_until_exit() {
+        let admission = Arc::new(Semaphore::new(1));
+        let (started_tx, started_rx) = oneshot::channel();
+        let (cancelled_tx, cancelled_rx) = oneshot::channel();
+        let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+        let (dropped_tx, dropped_rx) = oneshot::channel();
+        let payload = Payload(Some(dropped_tx));
+        let request = tokio::spawn(run_transcription_job(admission.clone(), move |cancel| {
+            let _payload = payload;
+            started_tx.send(()).unwrap();
+            while !cancel.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            cancelled_tx.send(()).unwrap();
+            finish_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            Err::<(), _>(JoshuaError::Cancelled)
+        }));
+        timeout(Duration::from_secs(2), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        request.abort();
+        assert!(matches!(request.await, Err(error) if error.is_cancelled()));
+        timeout(Duration::from_secs(2), cancelled_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(admission.available_permits(), 0);
+        finish_tx.send(()).unwrap();
+        timeout(Duration::from_secs(2), dropped_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(run_transcription_job(admission, |_| Ok(())).await.is_ok());
+    }
+
+    #[test]
+    fn transcription_cancelled_in_blocking_queue_never_starts() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (started_tx, started_rx) = oneshot::channel();
+            let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                started_tx.send(()).unwrap();
+                finish_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            });
+            started_rx.await.unwrap();
+            let admission = Arc::new(Semaphore::new(1));
+            let ran = Arc::new(AtomicBool::new(false));
+            let job_ran = ran.clone();
+            let (dropped_tx, dropped_rx) = oneshot::channel();
+            let payload = Payload(Some(dropped_tx));
+            let mut request = Box::pin(run_transcription_job(admission.clone(), move |_| {
+                let _payload = payload;
+                job_ran.store(true, Ordering::Relaxed);
+                Ok(())
+            }));
+            assert!(futures_util::poll!(request.as_mut()).is_pending());
+            assert_eq!(admission.available_permits(), 0);
+            drop(request);
+            assert_eq!(admission.available_permits(), 0);
+            finish_tx.send(()).unwrap();
+            blocker.await.unwrap();
+            timeout(Duration::from_secs(2), dropped_rx)
+                .await
+                .unwrap()
+                .unwrap();
+            let _permit = timeout(Duration::from_secs(2), admission.acquire())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!ran.load(Ordering::Relaxed));
+        });
+    }
+
+    #[tokio::test]
+    async fn transcription_success_error_and_panic_release_permit_and_payload() {
+        let admission = Arc::new(Semaphore::new(1));
+        for outcome in 0..3 {
+            let (dropped_tx, dropped_rx) = oneshot::channel();
+            let payload = Payload(Some(dropped_tx));
+            let result = run_transcription_job(admission.clone(), move |_| {
+                let _payload = payload;
+                match outcome {
+                    0 => Ok("complete"),
+                    1 => Err(JoshuaError::InvalidRequest("invalid WAV".into())),
+                    _ => panic!("simulate decoder panic"),
+                }
+            })
+            .await;
+            match outcome {
+                0 => assert_eq!(result.ok(), Some("complete")),
+                1 => assert_eq!(result.unwrap_err().status, StatusCode::BAD_REQUEST),
+                _ => assert_eq!(
+                    result.unwrap_err().status,
+                    StatusCode::INTERNAL_SERVER_ERROR
+                ),
+            }
+            dropped_rx.await.unwrap();
+            assert_eq!(admission.available_permits(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn transcription_http_disconnect_cancels_blocking_job() {
+        use tokio::io::AsyncWriteExt;
+
+        let admission = Arc::new(Semaphore::new(1));
+        let (started_tx, started_rx) = oneshot::channel();
+        let started = Arc::new(Mutex::new(Some(started_tx)));
+        let (cancelled_tx, cancelled_rx) = oneshot::channel();
+        let cancelled = Arc::new(Mutex::new(Some(cancelled_tx)));
+        let (dropped_tx, dropped_rx) = oneshot::channel();
+        let payload = Arc::new(Mutex::new(Some(Payload(Some(dropped_tx)))));
+        let app = Router::new().route(
+            "/transcription",
+            post({
+                let admission = admission.clone();
+                move || {
+                    let admission = admission.clone();
+                    let started = started.clone();
+                    let cancelled = cancelled.clone();
+                    let payload = payload.clone();
+                    async move {
+                        run_transcription_job(admission, move |cancel| {
+                            let _payload = payload.lock().unwrap().take().unwrap();
+                            started.lock().unwrap().take().unwrap().send(()).unwrap();
+                            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                            while !cancel.load(Ordering::Relaxed) {
+                                assert!(
+                                    std::time::Instant::now() < deadline,
+                                    "HTTP disconnect did not cancel job"
+                                );
+                                std::thread::sleep(Duration::from_millis(1));
+                            }
+                            cancelled.lock().unwrap().take().unwrap().send(()).unwrap();
+                            Err::<String, _>(JoshuaError::Cancelled)
+                        })
+                        .await
+                    }
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+        client
+            .write_all(
+                b"POST /transcription HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(2), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(client);
+        timeout(Duration::from_secs(3), cancelled_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        timeout(Duration::from_secs(3), dropped_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let _permit = timeout(Duration::from_secs(2), admission.acquire())
+            .await
+            .unwrap()
+            .unwrap();
+        server.abort();
+    }
+}
 // ─── API error type ───────────────────────────────────────────────────────────
 
 /// Internal helper that maps [`JoshuaError`] to HTTP responses.

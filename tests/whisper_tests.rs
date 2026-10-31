@@ -16,6 +16,7 @@ use candle_core::{DType, Device};
 use candle_nn::{VarBuilder, VarMap};
 use candle_transformers::models::whisper::{model::Whisper, Config};
 use joshua::whisper::{wav_to_pcm16k, WhisperEngine};
+use std::sync::atomic::AtomicBool;
 
 /// Whisper-style tokenizer: a few text tokens plus the control tokens the
 /// decoder prompt needs.
@@ -127,6 +128,28 @@ fn whisper_transcribes_wav_end_to_end() {
     let result = engine
         .transcribe_wav(&wav, Some("en"), false)
         .expect("transcription should run");
+    let repeated = engine
+        .transcribe_wav_cancellable(&wav, Some("en"), false, &AtomicBool::new(false))
+        .expect("uncancelled transcription should match");
+    assert_eq!(result.text, repeated.text);
+    assert_eq!(result.duration, repeated.duration);
+    assert_eq!(result.language, repeated.language);
+    assert!(matches!(
+        engine.transcribe_wav_cancellable(&wav, Some("en"), false, &AtomicBool::new(true)),
+        Err(joshua::JoshuaError::Cancelled)
+    ));
+    assert!(matches!(
+        engine.transcribe_cancellable(&[0.0; 160], Some("en"), false, &AtomicBool::new(true)),
+        Err(joshua::JoshuaError::Cancelled)
+    ));
+    let recovered = engine.transcribe_wav(&wav, Some("en"), false).unwrap();
+    let fresh = WhisperEngine::new(&dir)
+        .unwrap()
+        .transcribe_wav(&wav, Some("en"), false)
+        .unwrap();
+    assert_eq!(recovered.text, fresh.text);
+    assert_eq!(recovered.duration, fresh.duration);
+    assert_eq!(recovered.language, fresh.language);
 
     // Random weights produce arbitrary text — the pipeline mechanics are
     // what is under test: duration bookkeeping, decode-loop termination,
@@ -145,6 +168,75 @@ fn whisper_transcribes_wav_end_to_end() {
         .expect("second transcription");
 
     std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn transcription_http_preserves_formats_validation_and_no_model_errors() {
+    use axum::body::{to_bytes, Body};
+    use axum::http::{Request, StatusCode};
+    use joshua::server::{create_router, ServerState};
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    let dir = common::model_dir("whisper-http-synth");
+    write_tiny_whisper(&dir);
+    let whisper = Arc::new(WhisperEngine::new(&dir).unwrap());
+    let wav = tone_wav();
+    let expected = whisper.transcribe_wav(&wav, Some("en"), false).unwrap();
+    let llama_dir = common::model_dir("whisper-http-llama");
+    common::write_tiny_llama_gguf(&llama_dir.join("model.gguf"));
+    let engine = Arc::new(joshua::Engine::with_n_ctx(&llama_dir, 64).unwrap());
+    let app = create_router(Arc::new(ServerState {
+        whisper: Some(whisper),
+        ..ServerState::new(engine.clone())
+    }));
+    let request = |audio: Option<&[u8]>, format: &str| {
+        let mut body = Vec::new();
+        if let Some(audio) = audio {
+            body.extend_from_slice(b"--audio\r\nContent-Disposition: form-data; name=\"file\"; filename=\"tone.wav\"\r\nContent-Type: audio/wav\r\n\r\n");
+            body.extend_from_slice(audio);
+            body.extend_from_slice(b"\r\n");
+        }
+        body.extend_from_slice(format!("--audio\r\nContent-Disposition: form-data; name=\"language\"\r\n\r\nen\r\n--audio\r\nContent-Disposition: form-data; name=\"response_format\"\r\n\r\n{format}\r\n--audio--\r\n").as_bytes());
+        Request::post("/v1/audio/transcriptions")
+            .header("content-type", "multipart/form-data; boundary=audio")
+            .body(Body::from(body))
+            .unwrap()
+    };
+    for format in ["json", "text"] {
+        let response = app
+            .clone()
+            .oneshot(request(Some(&wav), format))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 65536).await.unwrap();
+        if format == "text" {
+            assert_eq!(body.as_ref(), expected.text.as_bytes());
+        } else {
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["text"], expected.text);
+            assert_eq!(json["duration"], expected.duration);
+            assert_eq!(json["language"], "en");
+        }
+    }
+    for audio in [None, Some(b"not a WAV".as_slice())] {
+        let response = app.clone().oneshot(request(audio, "json")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), 65536).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"]["type"], "invalid_request_error");
+    }
+    let response = app.oneshot(request(Some(&wav), "text")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let no_whisper = create_router(Arc::new(ServerState::new(engine)));
+    let response = no_whisper
+        .oneshot(request(Some(&wav), "json"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), 65536).await.unwrap();
+    assert!(String::from_utf8_lossy(&body).contains("no whisper model is loaded"));
 }
 
 #[test]
