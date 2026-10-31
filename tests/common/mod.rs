@@ -41,6 +41,10 @@ pub fn qtensor_q4k(data: Vec<f32>, shape: &[usize]) -> QTensor {
 /// streamed from the reader.  The loader re-reads the raw header from the
 /// reader for the tensors the projection drops.
 pub fn load_model(path: &Path, mmap: bool) -> joshua::model::QuantizedModel {
+    try_load_model(path, mmap).unwrap()
+}
+
+pub fn try_load_model(path: &Path, mmap: bool) -> candle_core::Result<joshua::model::QuantizedModel> {
     let bytes = std::fs::read(path).unwrap();
     let content = joshua::gguf_ext::read_header(&mut std::io::Cursor::new(&bytes[..]))
         .unwrap()
@@ -52,7 +56,6 @@ pub fn load_model(path: &Path, mmap: bool) -> joshua::model::QuantizedModel {
     });
     let mut cursor = std::io::Cursor::new(&bytes[..]);
     joshua::model::QuantizedModel::from_gguf_mmap(content, &mut cursor, &Device::Cpu, mmap, None, 0)
-        .unwrap()
 }
 
 /// Last-position logits for `tokens` fed at `offset` (CPU).
@@ -2068,9 +2071,12 @@ const DTYPE_F32: u32 = 0;
 const DTYPE_F16: u32 = 1;
 const DTYPE_Q8_0: u32 = 8;
 const DTYPE_Q2_K: u32 = 10;
+const DTYPE_Q3_K: u32 = 11;
 const DTYPE_Q4_K: u32 = 12;
+const DTYPE_Q6_K: u32 = 14;
 const DTYPE_IQ2_XXS: u32 = 16;
 const DTYPE_I32: u32 = 26;
+const DTYPE_BF16: u32 = 30;
 
 /// A raw tensor for the hand-rolled writer: dtype id + candle-order dims +
 /// exact file bytes (block layout included).
@@ -2361,6 +2367,10 @@ pub struct TinyDeepseek4Opts {
     /// `token_embd` exactly as DeepSeek-V4.1-Flash ships.  Only meaningful with
     /// `v41: true`.
     pub v41_tied_head: bool,
+    pub router_shape: Option<[usize; 2]>,
+    pub router_bias_shape: Option<&'static [usize]>,
+    pub router_nonfinite: Option<f32>,
+    pub ref41_dtype_mix: bool,
     /// Write a `deepseek41` (DeepSeek-V4.1) file instead: 4 layers with
     /// compress ratios [2, 2, 1, 0] — layer 0 a gated ratio-2 source that
     /// owns the index keys and scores top-k, layer 1 a reader that scores
@@ -2482,6 +2492,10 @@ pub fn write_tiny_deepseek4_gguf_candle_only(path: &Path) {
 
 pub fn write_tiny_deepseek4_gguf_opts(path: &Path, opts: TinyDeepseek4Opts) {
     let TinyDeepseek4Opts {
+        router_shape,
+        router_bias_shape,
+        router_nonfinite,
+        ref41_dtype_mix,
         v41_tied_head,
         iq2xxs_output,
         compress,
@@ -2510,7 +2524,7 @@ pub fn write_tiny_deepseek4_gguf_opts(path: &Path, opts: TinyDeepseek4Opts) {
     const NE: usize = 8;
     // Expert ffn width (out of gate/up, in of down): 256 so a Q2_K down
     // projection has a block-aligned contraction dim, 128 otherwise.
-    let nfe: usize = expert_width.unwrap_or(if q2k_down { 256 } else { 128 });
+    let nfe: usize = expert_width.unwrap_or(if q2k_down || ref41_dtype_mix { 256 } else { 128 });
     const NUSED: usize = 2;
     const N_SHARED: usize = 1;
     const HC: usize = 2;
@@ -2660,7 +2674,18 @@ pub fn write_tiny_deepseek4_gguf_opts(path: &Path, opts: TinyDeepseek4Opts) {
     };
 
     let mut tensors: Vec<RawTensor> = vec![
-        RawTensor::f16("token_embd.weight", weights(VOCAB * EMB, 1), &[VOCAB, EMB]),
+        if ref41_dtype_mix {
+            let tensor = Tensor::from_vec(weights(VOCAB * EMB, 1), (VOCAB, EMB), &Device::Cpu).unwrap();
+            let quantized = QTensor::quantize(&tensor, GgmlDType::Q6K).unwrap();
+            RawTensor {
+                name: "token_embd.weight".into(),
+                dtype: DTYPE_Q6_K,
+                dims: vec![VOCAB, EMB],
+                data: quantized.data().unwrap().to_vec(),
+            }
+        } else {
+            RawTensor::f16("token_embd.weight", weights(VOCAB * EMB, 1), &[VOCAB, EMB])
+        },
         RawTensor::f32("output_norm.weight", ones(EMB), &[EMB]),
     ];
     if v41 {
@@ -2884,16 +2909,30 @@ pub fn write_tiny_deepseek4_gguf_opts(path: &Path, opts: TinyDeepseek4Opts) {
         }
 
         // MoE: routed experts (IQ2_XXS gate/up, Q8_0 down) + shared expert.
-        tensors.push(RawTensor::f32(
-            &format!("{p}.ffn_gate_inp.weight"),
-            next(NE * EMB),
-            &[NE, EMB],
-        ));
+        let shape = router_shape.unwrap_or([NE, EMB]);
+        let mut router = next(shape.iter().product());
+        if i == 1 {
+            if let Some(value) = router_nonfinite {
+                router.fill(value);
+            }
+        }
+        let name = format!("{p}.ffn_gate_inp.weight");
+        tensors.push(if ref41_dtype_mix {
+            RawTensor {
+                name,
+                dtype: DTYPE_BF16,
+                dims: shape.to_vec(),
+                data: router.iter().flat_map(|value| half::bf16::from_f32(*value).to_le_bytes()).collect(),
+            }
+        } else {
+            RawTensor::f32(&name, router, &shape)
+        });
         if i >= n_hash {
+            let shape = router_bias_shape.as_deref().unwrap_or(&[NE]);
             tensors.push(RawTensor::f32(
                 &format!("{p}.exp_probs_b.bias"),
-                next(NE),
-                &[NE],
+                next(shape.iter().product()),
+                shape,
             ));
         }
         let gate_up = next(NE * nfe * EMB);
@@ -2903,7 +2942,16 @@ pub fn write_tiny_deepseek4_gguf_opts(path: &Path, opts: TinyDeepseek4Opts) {
         // stays loadable without the raw header (IQ2_XXS is not a dtype
         // candle's `Content` can carry).
         let exps = |name: &str, data: Vec<f32>| {
-            if candle_only {
+            if ref41_dtype_mix {
+                let tensor = Tensor::from_vec(data, (NE, nfe, EMB), &Device::Cpu).unwrap();
+                let quantized = QTensor::quantize(&tensor, GgmlDType::Q3K).unwrap();
+                RawTensor {
+                    name: name.into(),
+                    dtype: DTYPE_Q3_K,
+                    dims: vec![NE, nfe, EMB],
+                    data: quantized.data().unwrap().to_vec(),
+                }
+            } else if candle_only {
                 RawTensor::q8_0(name, data, &[NE, nfe, EMB])
             } else {
                 RawTensor::iq2xxs(name, data, &[NE, nfe, EMB])
@@ -2911,7 +2959,7 @@ pub fn write_tiny_deepseek4_gguf_opts(path: &Path, opts: TinyDeepseek4Opts) {
         };
         tensors.push(exps(&format!("{p}.ffn_gate_exps.weight"), gate_up));
         tensors.push(exps(&format!("{p}.ffn_up_exps.weight"), up));
-        tensors.push(if q2k_down {
+        tensors.push(if q2k_down || ref41_dtype_mix {
             RawTensor::q2k(&format!("{p}.ffn_down_exps.weight"), down, &[NE, EMB, nfe])
         } else {
             RawTensor::q8_0(&format!("{p}.ffn_down_exps.weight"), down, &[NE, EMB, nfe])

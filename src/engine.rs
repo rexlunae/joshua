@@ -4091,7 +4091,9 @@ impl Engine {
                 // Speculation is only enabled when no grammar mask is active
                 // (`constraint.is_none()` gates the n-gram drafter, MTP and
                 // the draft model), so verification never needs a mask.
-                let dist = sampler.distribution(&rows[i], options, &text.recent_tokens, None);
+                let dist = sampler.distribution(
+                    &rows[i], options, &text.recent_tokens, None, (draft_pos + i) as u64,
+                )?;
                 // `rows[i]` decides the draft at `draft_pos + i`; the draw
                 // depends only on that position, so the outcome does not
                 // depend on how many earlier drafts this pass accepted.
@@ -4235,7 +4237,9 @@ impl Engine {
         window.clear();
         window.extend_from_slice(recent_tokens);
         for j in 0..n {
-            let dist = sampler.distribution(&logits, options, window, None);
+            let dist = sampler.distribution(
+                &logits, options, window, None, (context.len() + j) as u64,
+            )?;
             let token = dist.sample(rng)?;
             if token as usize >= target_vocab {
                 // The draft vocabulary may be longer than the target's; such an
@@ -6827,7 +6831,7 @@ fn squeeze_batch_logits(logits: &Tensor) -> Result<Vec<f32>> {
             seed: u64,
             pos: u64,
         ) -> Result<u32> {
-            self.distribution(logits, opts, recent_tokens, mask)
+            self.distribution(logits, opts, recent_tokens, mask, pos)?
                 .sample_at(seed, pos)
         }
 
@@ -6837,11 +6841,17 @@ fn squeeze_batch_logits(logits: &Tensor) -> Result<Vec<f32>> {
             opts: &GenerationOptions,
             recent_tokens: &[u32],
             mask: Option<&SimpleVob>,
-        ) -> TokenDistRef<'_> {
-            match self.fill(logits, opts, recent_tokens, mask) {
+            pos: u64,
+        ) -> Result<TokenDistRef<'_>> {
+            if let Some(id) = logits.iter().position(|logit| !logit.is_finite()) {
+                return Err(JoshuaError::Inference(format!(
+                    "non-finite logits at position {pos}, first at id {id}"
+                )));
+            }
+            Ok(match self.fill(logits, opts, recent_tokens, mask) {
                 SamplingKind::Greedy(token) => TokenDistRef::Greedy(token),
                 SamplingKind::Probs => TokenDistRef::Probs(&self.probs),
-            }
+            })
         }
 
         fn fill(
@@ -7068,6 +7078,32 @@ fn argmax(logits: &[f32]) -> u32 {
 mod tests {
     use super::*;
 
+    #[test]
+    fn non_finite_logits_are_an_error_not_last_token() {
+        let mask = SimpleVob::from_slice(&[false, true, true]);
+        let mut workspace = SamplingWorkspace::default();
+        for temperature in [0.0, 0.8] {
+            let options = GenerationOptions { temperature, ..Default::default() };
+            for logits in [
+                [f32::NAN; 3],
+                [0.0, f32::NAN, 1.0],
+                [0.0, 1.0, f32::NAN],
+                [f32::INFINITY, 0.0, 1.0],
+                [0.0, f32::NEG_INFINITY, 1.0],
+            ] {
+                let id = logits.iter().position(|value| !value.is_finite()).unwrap();
+                for mask in [None, Some(&mask)] {
+                    let error = workspace.sample_at(&logits, &options, &[], mask, 7, 42).unwrap_err();
+                    assert!(matches!(error, JoshuaError::Inference(_)));
+                    assert_eq!(error.to_string(), format!("Inference failed: non-finite logits at position 42, first at id {id}"));
+                    assert!(workspace.distribution(&logits, &options, &[], mask, 42).is_err());
+                }
+            }
+            assert!(workspace.sample_at(&[0.0, 3.0, 1.0], &options, &[], None, 7, 43).is_ok());
+        }
+        assert_eq!(argmax(&[1.0, 3.0, 3.0]), 2);
+    }
+
     fn sorted_top_k(probs: &mut [f32], k: usize, indexed: &mut Vec<(usize, f32)>) {
         if k == 0 || k >= probs.len() {
             return;
@@ -7195,7 +7231,7 @@ mod tests {
         let mut with_verification = Vec::new();
         for pos in 0..8 {
             {
-                let dist = ws.distribution(&logits, &opts, &recent, None);
+                let dist = ws.distribution(&logits, &opts, &recent, None, pos).unwrap();
                 for draft in 0..3 {
                     let _ = dist.verify_at(draft, 1234, pos).unwrap();
                 }
@@ -7231,7 +7267,7 @@ mod tests {
                 };
                 let recent = [0, 3, 3, 999];
                 let expected = fresh_distribution(&logits, &opts, &recent);
-                let actual = workspace.distribution(&logits, &opts, &recent, None);
+                let actual = workspace.distribution(&logits, &opts, &recent, None, 0).unwrap();
                 match (actual, expected.as_ref()) {
                     (TokenDistRef::Greedy(a), TokenDistRef::Greedy(b)) => assert_eq!(a, b),
                     (TokenDistRef::Probs(a), TokenDistRef::Probs(b)) => assert_eq!(a, b),
@@ -7288,7 +7324,7 @@ mod tests {
         };
         let mask = SimpleVob::from_slice(&[false, false, true, false]);
         let mut workspace = SamplingWorkspace::default();
-        match workspace.distribution(&logits, &opts, &[], Some(&mask)) {
+        match workspace.distribution(&logits, &opts, &[], Some(&mask), 0).unwrap() {
             TokenDistRef::Probs(probs) => {
                 assert_eq!(probs[2], 1.0);
                 assert_eq!(probs[0], 0.0);
@@ -7316,7 +7352,7 @@ mod tests {
             ..Default::default()
         };
         let mut workspace = SamplingWorkspace::default();
-        match workspace.distribution(&logits, &opts, &[], Some(&mask)) {
+        match workspace.distribution(&logits, &opts, &[], Some(&mask), 0).unwrap() {
             TokenDistRef::Probs(probs) => {
                 assert_eq!(probs[0], 0.0, "the forbidden token stays masked");
                 assert!(probs[1] > 0.0, "a permitted token must survive: {probs:?}");
@@ -7422,7 +7458,8 @@ mod tests {
                     for _ in 0..repeats {
                         let verdict = if reuse {
                             workspace
-                                .distribution(black_box(&logits), &opts, &recent, None)
+                                .distribution(black_box(&logits), &opts, &recent, None, 0)
+                                .unwrap()
                                 .verify(17, &mut rng)
                                 .unwrap()
                         } else {

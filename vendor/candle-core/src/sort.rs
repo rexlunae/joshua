@@ -1,10 +1,67 @@
 use crate::{Result, Tensor};
 use rayon::prelude::*;
 
+#[cfg(test)]
+mod tests {
+    use crate::{DType, Device, Result, Tensor};
+
+    #[test]
+    fn arg_sort_nan_is_total() -> Result<()> {
+        let mut state = 175u32;
+        for row in 0..2000 {
+            let len = 1 + row % 384;
+            let values: Vec<f32> = (0..len).map(|_| {
+                state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                match state % 13 {
+                    0 | 1 => f32::NAN,
+                    2 => f32::INFINITY,
+                    3 => f32::NEG_INFINITY,
+                    4 => -0.0,
+                    5 => 0.0,
+                    _ => (state % 17) as f32 - 8.0,
+                }
+            }).collect();
+            for asc in [true, false] {
+                let mut expected: Vec<u32> = (0..len as u32).filter(|&index| !values[index as usize].is_nan()).collect();
+                expected.sort_by(|&left, &right| {
+                    let order = values[left as usize].partial_cmp(&values[right as usize]).unwrap();
+                    if asc { order } else { order.reverse() }
+                });
+                expected.extend((0..len as u32).filter(|&index| values[index as usize].is_nan()));
+                let tensor = Tensor::from_vec(values.clone(), (1, len), &Device::Cpu)?;
+                let actual = tensor.arg_sort_last_dim(asc)?.flatten_all()?.to_vec1::<u32>()?;
+                assert_eq!(actual, expected, "row {row}, asc={asc}");
+                let mut permutation = actual;
+                permutation.sort_unstable();
+                assert_eq!(permutation, (0..len as u32).collect::<Vec<_>>());
+            }
+        }
+        for dtype in [DType::F16, DType::BF16, DType::F32, DType::F64] {
+            let tensor = Tensor::new(&[[f32::NAN, 0.0, -0.0, f32::NAN]], &Device::Cpu)?.to_dtype(dtype)?;
+            for asc in [true, false] {
+                assert_eq!(tensor.arg_sort_last_dim(asc)?.to_vec2::<u32>()?, vec![vec![1, 2, 0, 3]]);
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ArgSort {
     asc: bool,
     last_dim: usize,
+}
+
+fn compare_nan_last<T: PartialOrd>(left: &T, right: &T, asc: bool) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match left.partial_cmp(right) {
+        Some(order) => if asc { order } else { order.reverse() },
+        None => match (left.partial_cmp(left), right.partial_cmp(right)) {
+            (None, None) => Ordering::Equal,
+            (None, Some(_)) => Ordering::Greater,
+            _ => Ordering::Less,
+        },
+    }
 }
 
 impl ArgSort {
@@ -27,9 +84,7 @@ impl ArgSort {
                         .enumerate()
                         .for_each(|(i, v)| *v = i as u32);
                     indexes.sort_by(|&i, &j| {
-                        vs[i as usize]
-                            .partial_cmp(&vs[j as usize])
-                            .unwrap_or(std::cmp::Ordering::Greater)
+                        compare_nan_last(&vs[i as usize], &vs[j as usize], true)
                     })
                 });
         } else {
@@ -41,10 +96,8 @@ impl ArgSort {
                         .iter_mut()
                         .enumerate()
                         .for_each(|(i, v)| *v = i as u32);
-                    indexes.sort_by(|&j, &i| {
-                        vs[i as usize]
-                            .partial_cmp(&vs[j as usize])
-                            .unwrap_or(std::cmp::Ordering::Greater)
+                    indexes.sort_by(|&i, &j| {
+                        compare_nan_last(&vs[i as usize], &vs[j as usize], false)
                     })
                 });
         }
