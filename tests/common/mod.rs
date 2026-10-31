@@ -1955,13 +1955,20 @@ fn write_tiny_qwen_layers<const EMB: usize, const NFF: usize>(path: &Path, arch:
 /// experts with top-8 routing like the real Qwen3-30B-A3B.  Norms are F32
 /// (they are not multiples of 256, so they cannot be Q4_K).
 pub fn write_tiny_qwen3moe_metal_gguf(path: &Path) {
+    write_quantized_qwen3moe::<128>(path);
+}
+
+pub fn write_tiny_qwen3moe_quantized_gguf(path: &Path) {
+    write_quantized_qwen3moe::<4>(path);
+}
+
+fn write_quantized_qwen3moe<const NE: usize>(path: &Path) {
     const VOCAB: usize = 16;
     const EMB: usize = 256;
     const H: usize = 2; // heads (H*HD = 256)
     const KV: usize = 1; // kv heads
     const HD: usize = 128; // head_dim: real Qwen3-30B-A3B uses 128
     const NFE: usize = 256; // expert ffn (mult of 256 for Q4K)
-    const NE: usize = 128; // experts — match real Qwen3-30B-A3B
     const NLAYER: usize = 2;
 
     let u32v = |v: u32| gguf_file::Value::U32(v);
@@ -1981,7 +1988,7 @@ pub fn write_tiny_qwen3moe_metal_gguf(path: &Path) {
         (key("attention.key_length"), u32v(HD as u32)),
         (key("rope.freq_base"), f32v(10_000.0)),
         (key("expert_count"), u32v(NE as u32)),
-        (key("expert_used_count"), u32v(8)),
+        (key("expert_used_count"), u32v(NE.min(8) as u32)),
         (key("expert_feed_forward_length"), u32v(NFE as u32)),
         (key("expert_shared_feed_forward_length"), u32v(0)),
         (

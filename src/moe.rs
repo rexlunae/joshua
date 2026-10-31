@@ -662,6 +662,34 @@ pub struct ExpertTensor {
 }
 
 impl ExpertTensor {
+    /// Load only one complete projection, retaining packed blocks. A supplied
+    /// mapping is borrowed when supported; otherwise read just this expert.
+    pub fn read_expert<R: Read + Seek>(
+        &self,
+        reader: &mut R,
+        expert: usize,
+        mmap: Option<&Arc<Mmap>>,
+    ) -> Result<QTensor> {
+        if expert >= self.n_expert {
+            candle_core::bail!("expert {expert} outside {}", self.n_expert);
+        }
+        let offset = self.expert_offset(expert)
+            .ok_or_else(|| candle_core::Error::Msg("unsliceable expert projection".into()))?;
+        let bytes = self.bytes_per_expert()
+            .ok_or_else(|| candle_core::Error::Msg("expert size overflow".into()))?;
+        if let Some(mmap) = mmap {
+            if let Some(tensor) = crate::mmap_tensor::borrowed_range(
+                mmap, self.dtype, offset, self.expert_shape().into(),
+            )? {
+                return Ok(tensor);
+            }
+        }
+        reader.seek(std::io::SeekFrom::Start(offset as u64))?;
+        let mut data = vec![0; bytes];
+        reader.read_exact(&mut data)?;
+        self.expert_from_bytes(&data, &Device::Cpu)
+    }
+
     /// Describe tensor `name`, which must be `[n_expert, out, in]`.
     pub fn lookup(
         ct: &gguf_file::Content,
