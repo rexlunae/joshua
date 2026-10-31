@@ -162,14 +162,22 @@ worker simply omits it and is routed as today.
   different keys. A warm attention-only session can rewind to any chunk
   boundary of its chain, so it serves every key along it. A parked snapshot
   covers its whole conversation, and `best_len` takes it only as a strict
-  prefix of a new prompt, so it serves no intermediate key. So **every tier
-  transition is an event**. When a session moves from pool to cache, the
-  worker recomputes the session's servable keys. It emits tombstones for the
-  keys the parked entry cannot serve and inserts for any it newly can, and
-  stays silent only when the set is unchanged. Dropping a session, or
-  evicting one from the cache, tombstones its remaining keys. A
-  `chunk`-granularity worker can shrink that loss by parking at the last
-  storage boundary instead of the whole conversation
+  prefix of a new prompt, so it serves no intermediate key.
+
+  The advertised set is therefore defined by the worker's **state**, not by
+  per-session events: it is the union, over every holder (each pooled
+  session and each cache entry), of the keys that holder can serve. Many
+  holders can serve the same key, because two conversations that open with
+  the same system prompt share its chain. So the worker keeps a holder count
+  per key. Any change to a holder recomputes that holder's servable keys and
+  adjusts the counts: a new session, a rewind, a pool-to-cache move, a drop,
+  or a cache eviction. A key whose count goes from 0 to 1 emits an insert. A
+  key whose count drops to 0 emits a tombstone. Every other change is silent.
+  Parking one of two sessions that share a head therefore tombstones nothing
+  the other session still serves.
+
+  A `chunk`-granularity worker can shrink what parking loses by parking at
+  the last storage boundary instead of the whole conversation
   (`snapshot(64·⌊len/64⌋, len)`), so the parked entry still ends on a key.
 * `root` — 8-byte XOR (or Merkle) sketch over the sorted chunk keys, for
   anti-entropy (§6).
@@ -241,7 +249,7 @@ Extend the probe body instead of adding a channel:
 | Probe, replica agrees (`epoch`, `chunks`, `root` match) | ~64 B per probe |
 | Probe, drift (`root` or `chunks` differ) | + `GET /v1/worker/cache?since=watermark` |
 | Epoch change (restart, reload) | full snapshot, then normal deltas |
-| Eviction | one tombstone in the delta stream |
+| Eviction or park | tombstones only for keys whose holder count reaches 0 (§4) |
 
 Eight workers at 2 s is 4 probes/s, so steady-state directory traffic is a
 few hundred bytes per second — independent of cache size, because the sketch
@@ -411,10 +419,15 @@ that eviction is not the confounder; 3 and 4 need the real deployment.
    scoped to authenticated ownership. Phase 5 here wants a *content*-derived
    affinity. They should share one implementation, so one of the two issues
    should own it — probably #156, with this issue consuming it.
-2. **Small prompts.** A 40-token prompt has no complete 64-token storage
-   chunk, so nothing is parkable and nothing is advertised. Options: keep a
-   trailing partial chunk keyed with its true length, or let `tokens < 64`
-   fall through to affinity. Leaning to the latter until measured.
+2. **Small prompts.** A session shorter than one 64-token storage chunk
+   has no key to advertise. With the defaults it is not parked either: the
+   park threshold is 256 tokens. An operator who lowers
+   `prefix_cache_root_min` below 64 makes such sessions parkable, though
+   still not advertisable, so they serve local follow-ups only. Likewise a
+   pooled session's trailing tokens past its last complete chunk are never
+   keyed. Options: key a trailing partial chunk with its true length, so
+   short entries become routable, or let anything under 64 tokens fall
+   through to affinity (§7). Leaning to the latter until measured.
 3. **Reporting what was produced.** §5 takes `produced` off the request path:
    `had=` rides a header, and occupancy after the request comes from an
    optimistic insert corrected by deltas. If the optimistic entries prove
