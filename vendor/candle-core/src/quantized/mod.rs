@@ -268,10 +268,13 @@ impl QStorage {
     /// [`QStorage::from_data`] for a background uploader: on an OpenCL
     /// device the bytes go through the device's transfer queue
     /// (`QOpenClStorage::from_bytes_transfer`), so the blocking write neither
-    /// waits for nor delays the compute queue's kernels; every other backend
-    /// is the plain `from_data`.
+    /// waits for nor delays the compute queue's kernels. CUDA uses a lazily
+    /// shared transfer stream and completes its writes before returning;
+    /// other backends retain their existing transfer path.
     pub fn from_data_transfer(data: Cow<'_, [u8]>, device: &Device, dtype: GgmlDType) -> Result<Self> {
         match device {
+            #[cfg(feature = "cuda")]
+            Device::Cuda(d) => cuda::load_quantized_transfer(d, &data, dtype),
             Device::OpenCl(d) => {
                 let data: &[u8] = &data;
                 let elem_count = data.len() / dtype.type_size() * dtype.block_size();
