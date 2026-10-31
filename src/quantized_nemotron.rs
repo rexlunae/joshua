@@ -214,6 +214,9 @@ impl Config {
             n_group: m.u32("ssm.group_count")? as usize,
             time_step_min: 0.0,
         };
+        if ssm.d_conv == 0 {
+            candle_core::bail!("{}: ssm.conv_kernel must be positive", m.arch());
+        }
         if ssm.n_head == 0 || ssm.n_head % ssm.n_group != 0 {
             candle_core::bail!(
                 "{}: ssm.time_step_rank {} must be a positive multiple of ssm.group_count {}",
@@ -466,7 +469,7 @@ struct SsmState {
 struct Mamba2 {
     /// Fused `[z ‖ xBC ‖ dt]` projection.
     in_proj: Weight,
-    /// Depthwise conv taps, `[conv_dim, d_conv]`.
+    /// Depthwise conv taps, `[d_conv, conv_dim]`.
     conv_w: Tensor,
     /// `[conv_dim]`, optional (`use_conv_bias`).
     conv_b: Option<Tensor>,
@@ -497,7 +500,10 @@ impl Mamba2 {
             // rather than slicing/reshaping a tap column per token.
             .reshape((cfg.d_conv, cfg.conv_dim()))?
             .contiguous()?;
-        let conv_b = src.f32_opt(&format!("{p}.ssm_conv1d.bias"))?;
+        let conv_b = src
+            .f32_opt(&format!("{p}.ssm_conv1d.bias"))?
+            .map(|bias| bias.reshape((cfg.conv_dim(),)))
+            .transpose()?;
         // `ssm_a` ships as the raw log-rate `[1, n_head]`; the block wants
         // `-exp(a)` (llama.cpp negates at load).
         let a_raw = src
@@ -538,11 +544,6 @@ impl Mamba2 {
         })
     }
 
-    /// The fused conv + bias + SiLU, continuing from the state's tail.
-    ///
-    /// Returns `[t, conv_dim]`.  Delegates to [`crate::conv1d`] when that
-    /// module provides a native device kernel; the CPU path here is the
-    /// reference it is validated against.
     /// The fused causal depthwise conv + bias + SiLU, continuing from the
     /// state's stored tail.
     ///
@@ -562,15 +563,11 @@ impl Mamba2 {
         let t = xbc.dim(0)?;
         // `[d_conv-1 + t, conv_dim]`: the previous tokens' tail then this chunk.
         let inp = Tensor::cat(&[&tail, xbc], 0)?.contiguous()?;
-        let bias = match &self.conv_b {
-            Some(b) => Some(b.reshape((c.conv_dim(),))?),
-            None => None,
-        };
         let y = crate::conv1d::conv1d(
             &inp,
             &self.conv_w,
-            bias.as_ref(),
-            crate::conv1d::Conv1d::mamba2(),
+            self.conv_b.as_ref(),
+            crate::conv1d::Conv1d::new(c.d_conv, true, self.conv_b.is_some()),
         )?;
         state.conv = Some(inp.narrow(0, t, c.d_conv - 1)?.contiguous()?);
         Ok(y)
@@ -1713,8 +1710,7 @@ mod tests {
     /// matters because the identity comparisons an earlier version used —
     /// literal against literal — could not catch a change to `from_meta`;
     /// reading a real checkpoint is also how the missing router bias surfaced.
-    #[test]
-    fn config_derives_the_released_checkpoint_shapes() {
+    fn released_checkpoint_metadata() -> std::collections::HashMap<String, gguf_file::Value> {
         use candle_core::quantized::gguf_file::Value;
         let mut md: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
         let k = |s: &str| format!("nemotron_h.{s}");
@@ -1754,7 +1750,30 @@ mod tests {
             .collect();
         put("attention.head_count_kv", Value::Array(kv));
         put("feed_forward_length", Value::Array(ff));
+        md
+    }
 
+    #[test]
+    fn config_rejects_a_zero_conv_kernel() {
+        let mut md = released_checkpoint_metadata();
+        md.insert(
+            "nemotron_h.ssm.conv_kernel".into(),
+            gguf_file::Value::U32(0),
+        );
+        let error = Config::from_meta(&Meta::new(&md, "nemotron_h"))
+            .err()
+            .unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("ssm.conv_kernel must be positive"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn config_derives_the_released_checkpoint_shapes() {
+        let md = released_checkpoint_metadata();
         let meta = Meta::new(&md, "nemotron_h");
         let cfg = Config::from_meta(&meta)
             .expect("metadata parses")
@@ -1795,10 +1814,149 @@ mod tests {
         assert_eq!(format!("blk.{}", cfg.n_layer), "blk.52");
     }
 
-    /// `Mamba2::conv` must dispatch the native kernel, not fall back to a
-    /// per-tap tensor loop.  The op has its own unit tests, but only this
-    /// reaches the layer's call site: a layer that stopped calling
-    /// `crate::conv1d::conv1d` would still pass those.
+    fn conv_test_layer(dev: &Device, taps: usize, bias: bool) -> Mamba2 {
+        let cfg = SsmConfig {
+            d_conv: taps,
+            d_state: 8,
+            d_inner: 32,
+            n_head: 4,
+            n_group: 2,
+            time_step_min: 0.0,
+        };
+        let channels = cfg.conv_dim();
+        let unused = || {
+            Weight::Quant(candle_core::quantized::QMatMul::Tensor(
+                Tensor::zeros((1, 1), DType::F32, &Device::Cpu).unwrap(),
+            ))
+        };
+        Mamba2 {
+            in_proj: unused(),
+            conv_w: Tensor::from_vec(
+                (0..taps * channels)
+                    .map(|index| (index % 19) as f32 * 0.017 - 0.13)
+                    .collect(),
+                (taps, channels),
+                dev,
+            )
+            .unwrap(),
+            conv_b: bias.then(|| {
+                Tensor::from_vec(
+                    (0..channels)
+                        .map(|index| index as f32 * 0.003 - 0.1)
+                        .collect(),
+                    channels,
+                    dev,
+                )
+                .unwrap()
+            }),
+            dt_b: Tensor::zeros(cfg.n_head, DType::F32, dev).unwrap(),
+            a: Tensor::zeros(cfg.n_head, DType::F32, dev).unwrap(),
+            d_skip: Tensor::zeros(cfg.n_head, DType::F32, dev).unwrap(),
+            norm_w: Tensor::ones((1, cfg.n_group, cfg.d_inner / cfg.n_group), DType::F32, dev)
+                .unwrap(),
+            eps: 1e-5,
+            out: unused(),
+            cfg,
+        }
+    }
+
+    fn check_layer_conv(dev: &Device, taps: usize, bias: bool) {
+        let layer = conv_test_layer(dev, taps, bias);
+        let channels = layer.cfg.conv_dim();
+        let weights = layer
+            .conv_w
+            .to_device(&Device::Cpu)
+            .unwrap()
+            .to_vec2::<f32>()
+            .unwrap();
+        let bias_values = layer.conv_b.as_ref().map(|values| {
+            values
+                .to_device(&Device::Cpu)
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        });
+        let schedule = [2, 1, 6, 1, 3];
+        let tokens = schedule.iter().sum::<usize>();
+        let input: Vec<f32> = (0..tokens * channels)
+            .map(|index| ((index * 7 % 37) as f32 - 18.0) * 0.07)
+            .collect();
+        for fresh in [false, true] {
+            let mut state = if fresh {
+                layer.fresh_state(dev).unwrap()
+            } else {
+                SsmState {
+                    conv: None,
+                    scan: Vec::new(),
+                }
+            };
+            let mut offset = 0;
+            for chunk in schedule {
+                let xbc = Tensor::from_slice(
+                    &input[offset * channels..(offset + chunk) * channels],
+                    (chunk, channels),
+                    dev,
+                )
+                .unwrap();
+                let got = layer
+                    .conv(&mut state, &xbc)
+                    .unwrap()
+                    .to_device(&Device::Cpu)
+                    .unwrap()
+                    .to_vec2::<f32>()
+                    .unwrap();
+                for row in 0..chunk {
+                    for channel in 0..channels {
+                        let mut expected = 0.0f32;
+                        for tap in 0..taps {
+                            let position = offset + row + tap;
+                            if position >= taps - 1 {
+                                expected += input[(position - (taps - 1)) * channels + channel]
+                                    * weights[tap][channel];
+                            }
+                        }
+                        expected += bias_values.as_ref().map_or(0.0, |values| values[channel]);
+                        expected /= 1.0 + (-expected).exp();
+                        assert!((got[row][channel] - expected).abs() < 1e-5 * expected.abs().max(1.0),
+                            "taps={taps}, bias={bias}, fresh={fresh}, offset={offset}, row={row}, channel={channel}: {} vs {expected}",
+                            got[row][channel]);
+                    }
+                }
+                offset += chunk;
+                let tail = state.conv.as_ref().unwrap();
+                assert_eq!(tail.dims(), &[taps - 1, channels]);
+                let tail = tail
+                    .to_device(&Device::Cpu)
+                    .unwrap()
+                    .to_vec2::<f32>()
+                    .unwrap();
+                for row in 0..taps - 1 {
+                    for channel in 0..channels {
+                        let position = offset + row;
+                        let expected = if position < taps - 1 {
+                            0.0
+                        } else {
+                            input[(position - (taps - 1)) * channels + channel]
+                        };
+                        assert_eq!(
+                            tail[row][channel], expected,
+                            "carried tail: taps={taps}, offset={offset}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_mamba_layer_uses_its_conv_geometry() {
+        for taps in [1, 2, 3, 4, 5] {
+            for bias in [false, true] {
+                check_layer_conv(&Device::Cpu, taps, bias);
+            }
+        }
+    }
+
     #[cfg(feature = "opencl")]
     #[test]
     fn the_mamba_layer_convolves_natively() {
@@ -1806,62 +1964,25 @@ mod tests {
             eprintln!("no OpenCL device; skipping");
             return;
         };
-        let cfg = SsmConfig {
-            d_conv: 4,
-            d_state: 8,
-            d_inner: 32,
-            n_head: 4,
-            n_group: 2,
-            time_step_min: 0.0,
-        };
-        // Only the conv fields are exercised, so the projection weights are
-        // never touched and can be trivial.
-        let conv_dim = cfg.conv_dim();
-        let layer = Mamba2 {
-            in_proj: Weight::Quant(candle_core::quantized::QMatMul::QTensor(std::sync::Arc::new(
-                candle_core::quantized::QTensor::quantize(
-                    &Tensor::zeros((1, 1), DType::F32, &dev).unwrap(),
-                    candle_core::quantized::GgmlDType::F32,
-                )
-                .unwrap(),
-            ))),
-            conv_w: Tensor::randn(0f32, 0.1, (cfg.d_conv, conv_dim), &dev).unwrap(),
-            conv_b: Some(Tensor::randn(0f32, 0.1, (conv_dim,), &dev).unwrap()),
-            dt_b: Tensor::zeros((cfg.n_head,), DType::F32, &dev).unwrap(),
-            a: Tensor::zeros((cfg.n_head,), DType::F32, &dev).unwrap(),
-            d_skip: Tensor::zeros((cfg.n_head,), DType::F32, &dev).unwrap(),
-            norm_w: Tensor::ones((1, cfg.n_group, cfg.d_inner / cfg.n_group), DType::F32, &dev)
-                .unwrap(),
-            eps: 1e-5,
-            out: Weight::Quant(candle_core::quantized::QMatMul::QTensor(std::sync::Arc::new(
-                candle_core::quantized::QTensor::quantize(
-                    &Tensor::zeros((1, 1), DType::F32, &dev).unwrap(),
-                    candle_core::quantized::GgmlDType::F32,
-                )
-                .unwrap(),
-            ))),
-            cfg,
-        };
-        let mut state = Some(layer.fresh_state(&dev).unwrap());
-        let xbc = Tensor::randn(0f32, 1.0, (5, conv_dim), &dev).unwrap();
-
         let before = candle_core::opencl_backend::kernels::native_exec_count();
-        let fb_before: usize = candle_core::opencl_backend::kernels::fallback_counts_by_op()
-            .iter()
-            .filter(|(n, _)| n == crate::conv1d::OP_NAME)
-            .map(|(_, c)| *c)
-            .sum();
-        let y = layer.conv(state.as_mut().unwrap(), &xbc).unwrap();
-        let launched = candle_core::opencl_backend::kernels::native_exec_count() - before;
-        let fell_back: usize = candle_core::opencl_backend::kernels::fallback_counts_by_op()
-            .iter()
-            .filter(|(n, _)| n == crate::conv1d::OP_NAME)
-            .map(|(_, c)| *c)
-            .sum::<usize>()
-            - fb_before;
-
-        assert_eq!(y.dims(), &[5, conv_dim]);
-        assert!(launched > 0, "the layer's conv must launch a native kernel");
-        assert_eq!(fell_back, 0, "the layer's conv must not round-trip");
+        let fallbacks = || {
+            candle_core::opencl_backend::kernels::fallback_counts_by_op()
+                .iter()
+                .filter(|(name, _)| name == crate::conv1d::OP_NAME)
+                .map(|(_, count)| *count)
+                .sum::<usize>()
+        };
+        let fb_before = fallbacks();
+        for taps in [2, 3, 4, 5] {
+            for bias in [false, true] {
+                check_layer_conv(&dev, taps, bias);
+            }
+        }
+        assert!(candle_core::opencl_backend::kernels::native_exec_count() > before);
+        assert_eq!(
+            fallbacks(),
+            fb_before,
+            "the layer's conv must not round-trip"
+        );
     }
 }
