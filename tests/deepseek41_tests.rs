@@ -12,6 +12,93 @@ use joshua::placement::{EngramResidency, EngramTier};
 
 const TOKENS: [u32; 14] = [1, 4, 2, 7, 5, 9, 3, 6, 8, 4, 1, 12, 13, 5];
 
+#[test]
+fn router_dimensions_are_checked_on_every_load_path() {
+    for v41 in [false, true] {
+        for (router_shape, router_bias_shape, tensor) in [
+            (Some([9, 256]), None, "ffn_gate_inp.weight"),
+            (Some([7, 256]), None, "ffn_gate_inp.weight"),
+            (Some([8, 255]), None, "ffn_gate_inp.weight"),
+            (None, Some(&[7][..]), "exp_probs_b.bias"),
+            (None, Some(&[9][..]), "exp_probs_b.bias"),
+            (None, Some(&[2, 4][..]), "exp_probs_b.bias"),
+        ] {
+            let dir = common::model_dir("router-dimensions");
+            let path = dir.join("model.gguf");
+            common::write_tiny_deepseek4_gguf_opts(&path, common::TinyDeepseek4Opts {
+                v41, router_shape, router_bias_shape, ..Default::default()
+            });
+            for mmap in [false, true] {
+                let error = common::try_load_model(&path, mmap).err().expect("invalid router must fail to load");
+                let message = error.to_string();
+                assert!(message.contains(tensor) && message.contains("n_expert=8") && message.contains("got"), "{message}");
+            }
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+}
+
+#[test]
+fn non_finite_routing_fails_with_layer_and_token_context() {
+    for v41 in [false, true] {
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let dir = common::model_dir("router-nonfinite");
+            let path = dir.join("model.gguf");
+            common::write_tiny_deepseek4_gguf_opts(&path, common::TinyDeepseek4Opts {
+                v41, router_nonfinite: Some(value), ..Default::default()
+            });
+            for mmap in [false, true] {
+                for tokens in [&TOKENS[..1], &TOKENS[..3]] {
+                    let input = Tensor::new(tokens, &Device::Cpu).unwrap().unsqueeze(0).unwrap();
+                    for all_rows in [false, true] {
+                        let mut model = load_model(&path, mmap);
+                        let result = if all_rows {
+                            model.forward_all_logits(&input, 0)
+                        } else {
+                            model.forward(&input, 0)
+                        };
+                        let message = result.unwrap_err().to_string();
+                        assert!(message.contains("non-finite routing weight at layer 1, token 0, slot 0"), "{message}");
+                    }
+                }
+            }
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+}
+
+#[test]
+fn ref41_dtype_mix_is_finite_and_preserves_prefill_decode_parity() {
+    let dir = common::model_dir("ref41-dtype-mix");
+    let path = dir.join("model.gguf");
+    common::write_tiny_deepseek4_gguf_opts(&path, common::TinyDeepseek4Opts {
+        v41: true, v41_tied_head: true, ref41_dtype_mix: true, ..Default::default()
+    });
+    for mmap in [false, true] {
+        let mut decode = load_model(&path, mmap);
+        let mut expected_rows = Vec::new();
+        for position in 0..TOKENS.len() {
+            let got = logits(&mut decode, &TOKENS[position..=position], position);
+            assert!(got.iter().all(|value| value.is_finite()));
+            let mut prefill = load_model(&path, mmap);
+            let expected = logits(&mut prefill, &TOKENS[..=position], 0);
+            assert_close(&got, &expected, 1e-5, "ref41 dtype mix");
+            expected_rows.push(got);
+        }
+        let mut verification = load_model(&path, mmap);
+        for (offset, end) in [(0, 5), (5, TOKENS.len())] {
+            let input = Tensor::new(&TOKENS[offset..end], &Device::Cpu).unwrap().unsqueeze(0).unwrap();
+            let output = verification.forward_all_logits(&input, offset).unwrap();
+            assert_eq!(output.dims(), [1, end - offset, 16]);
+            let rows = output.squeeze(0).unwrap().to_vec2::<f32>().unwrap();
+            for (actual, expected) in rows.iter().zip(&expected_rows[offset..end]) {
+                assert_close(actual, expected, 1e-5, "ref41 all-row logits");
+            }
+        }
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 fn fixture(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
     let dir = common::model_dir(name);
     let model = dir.join("model.gguf");

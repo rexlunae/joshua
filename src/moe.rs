@@ -838,6 +838,22 @@ mod tests {
     use candle_core::Module;
 
     #[test]
+    fn topk_never_selects_nan_when_finite_available() -> Result<()> {
+        let scores = Tensor::new(&[
+            [f32::NAN, 2.0f32, 1.0, f32::NAN],
+            [3.0, f32::NAN, f32::NAN, 4.0],
+        ], &Device::Cpu)?;
+        let ids = topk_indices(&scores, 2)?;
+        assert_eq!(ids.to_vec2::<u32>()?, vec![vec![1, 2], vec![3, 0]]);
+        assert_eq!(ids.dims(), [2, 2]);
+        assert_eq!(ids.dtype(), candle_core::DType::U32);
+        let (routed, weights) = route(&scores, None, 2, true, 1.0, Ok)?;
+        assert_eq!(routed.to_vec2::<u32>()?, ids.to_vec2::<u32>()?);
+        assert!(weights.flatten_all()?.to_vec1::<f32>()?.iter().all(|value| value.is_finite()));
+        Ok(())
+    }
+
+    #[test]
     fn centered_router_bias_preserves_independent_f64_selection() -> Result<()> {
         // Real layer-3 boundary: adding the common offset in f32 collapses
         // distinct scores into a tie, incorrectly preferring expert 88.

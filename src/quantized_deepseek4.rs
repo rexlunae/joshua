@@ -62,6 +62,7 @@ struct Config {
     v41: bool,
     engram: Option<EngramConfig>,
     n_layer: usize,
+    n_embd: usize,
     n_head: usize,
     rms_eps: f64,
     // MLA dims.
@@ -297,7 +298,7 @@ impl Config {
         let a = m.arch();
         let n_layer = m.u32("block_count")? as usize;
         let n_head = m.u32("attention.head_count")? as usize;
-        let _n_embd = m.u32("embedding_length")? as usize;
+        let n_embd = m.u32("embedding_length")? as usize;
         let rms_eps = m.f32("attention.layer_norm_rms_epsilon")? as f64;
 
         // Implied by the weight shapes; required so a malformed file fails early.
@@ -361,6 +362,7 @@ impl Config {
             v41: arch == "deepseek41",
             engram: EngramConfig::from_meta(&m, n_layer)?,
             n_layer,
+            n_embd,
             n_head,
             rms_eps,
             head_dim,
@@ -2856,6 +2858,12 @@ impl Moe {
             }
             (ids, wts)
         };
+        if let Some(slot) = wts.iter().position(|weight| !weight.is_finite()) {
+            candle_core::bail!(
+                "deepseek4: non-finite routing weight at layer {}, token {}, slot {}",
+                self.layer, slot / k, slot % k
+            );
+        }
         crate::route_trace::record(self.layer, &ids, k, ctx.trace_row_base, ctx.trace_chunk);
         #[cfg(feature = "distributed")]
         if let Some(distributed) = &self.distributed {
@@ -5463,16 +5471,30 @@ fn load_moe<R: Read + Seek>(
 ) -> Result<Moe> {
     // Router weight `[n_expert, n_embd]`, kept transposed + contiguous for
     // the per-call `x @ Wᵀ` (numerically identical to transposing per call).
-    let gate_t = rd
-        .f32_tensor(&format!("{p}.ffn_gate_inp.weight"))?
-        .t()?
-        .contiguous()?;
+    let gate_name = format!("{p}.ffn_gate_inp.weight");
+    let gate = rd.f32_tensor(&gate_name)?;
+    if gate.dims() != [cfg.n_expert, cfg.n_embd] {
+        candle_core::bail!(
+            "deepseek4: `{gate_name}` should be [n_expert={}, n_embd={}], got {:?}",
+            cfg.n_expert, cfg.n_embd, gate.dims()
+        );
+    }
+    let gate_t = gate.t()?.contiguous()?;
     let gate_bias = if hash {
         None
     } else {
         rd.has(&format!("{p}.exp_probs_b.bias"))
-            .then(|| rd.f32_tensor(&format!("{p}.exp_probs_b.bias"))
-                .and_then(|b| crate::moe::center_selection_bias(&b)))
+            .then(|| {
+                let name = format!("{p}.exp_probs_b.bias");
+                let bias = rd.f32_tensor(&name)?;
+                if bias.dims() != [cfg.n_expert] {
+                    candle_core::bail!(
+                        "deepseek4: `{name}` should be [n_expert={}], got {:?}",
+                        cfg.n_expert, bias.dims()
+                    );
+                }
+                crate::moe::center_selection_bias(&bias)
+            })
             .transpose()?
     };
     // A hash layer routes through the table on every token, so a missing one is
