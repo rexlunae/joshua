@@ -6,7 +6,7 @@
 
 | Phase | What | Status |
 |---|---|---|
-| 0 | Measurement: prefill s/token, cluster-wide prefix overlap, misroute cost | ⏳ not started |
+| 0 | Measurement: prefill s/token, cluster-wide prefix overlap, misroute cost | Partial: [repeatable synthetic harness and evidence](prefix-locality-measurement.md); realistic traffic/wire-cost gates remain |
 | 1 | `src/prefix_key.rs`: chunk hash chain, salt, coarsening | ✅ implemented |
 | 2 | Worker advertises cache residency in `WorkerInfo` | ⏳ not started |
 | 3 | Coordinator advisory index + overlap term in `try_pick` | ⏳ depends on 0–2 |
@@ -392,6 +392,12 @@ delta stream and the sketch can be cross-checked.
 
 ## 11. Phase 0: what to measure before building phases 3–5
 
+The client-only [phase-0 harness](prefix-locality-measurement.md) compares the
+ordinary load/work-aware router with oracle rendezvous placement on known
+synthetic heads, using fresh workers, identical requests and checked outputs.
+It also provides a direct warm/cold control. It does not implement phases 2–5
+or replace the realistic-traffic and directory-wire-cost evidence below.
+
 1. **Prefill seconds per token**, per model and backend, on the target host.
    Needed twice: to convert an overlap into a time saving, and to evaluate
    the transfer break-even in §2.
@@ -459,4 +465,3 @@ that eviction is not the confounder; 3 and 4 need the real deployment.
 * DeepSeek context caching — 64-token units, per-user isolation.
 * Squid ICP → Summary Cache (Fan et al., SIGCOMM '00) → CARP — the same
   ladder from fan-out probes to gossiped digests to computable placement.
-

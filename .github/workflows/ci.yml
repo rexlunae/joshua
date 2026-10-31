@@ -42,6 +42,8 @@ jobs:
         run: python -m pip install numpy
       - name: Test certification against unstable references and single passes
         run: python -m unittest discover -s kernels-cubecl/benchmarks -p 'test_*.py' -v
+      - name: Test prefix locality measurement accounting
+        run: python -m unittest discover -s scripts -p 'test_prefix_locality.py' -v
 
   # The default pure-Rust build. This is what `cargo build` gives a user with
   # only a Rust toolchain, so it must stay green with no extra features.
