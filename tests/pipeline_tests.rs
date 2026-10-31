@@ -992,6 +992,177 @@ fn assert_matches_local(pipeline: &mut Pipeline, path: &Path) {
     pipeline.close(id).unwrap();
 }
 
+fn assert_chunk_schedules_match_full_prefix(
+    pipeline: &mut Pipeline,
+    path: &Path,
+    same_chunk_tolerance: Option<f32>,
+) {
+    let prompts = [
+        vec![1, 4, 2, 7, 5, 9, 3, 8, 6],
+        vec![7, 5, 1, 8, 3, 2, 9, 4, 6],
+        vec![1, 4, 2, 7, 5, 9, 3, 8, 6],
+    ];
+    let chunks = [9, 3, 1];
+    let ids: Vec<_> = (0..3).map(|_| pipeline.open().unwrap()).collect();
+    let mut locals: Vec<_> = (0..3).map(|_| common::load_model(path, true)).collect();
+    let mut positions = [0; 3];
+    let mut max_delta = 0.0f32;
+    let mut max_same_chunk_delta = 0.0f32;
+    let mut check_same_chunk = |output: &[f32], expected: &[f32]| {
+        let greedy = |row: &[f32]| {
+            row.iter()
+                .enumerate()
+                .fold((0, f32::NEG_INFINITY), |best, (index, &value)| {
+                    if value > best.1 {
+                        (index, value)
+                    } else {
+                        best
+                    }
+                })
+                .0
+        };
+        assert_eq!(greedy(output), greedy(expected), "greedy token order");
+        if let Some(tolerance) = same_chunk_tolerance {
+            common::assert_close(output, expected, tolerance, "cross-host same-chunk logits");
+        } else {
+            assert_eq!(output, expected, "same-chunk logits");
+        }
+        for (&actual, &reference) in output.iter().zip(expected) {
+            max_same_chunk_delta = max_same_chunk_delta.max((actual - reference).abs());
+        }
+    };
+    for round in 0..9 {
+        let order: Vec<_> = (0..3)
+            .map(|index| (index + round) % 3)
+            .filter(|&index| positions[index] < prompts[index].len())
+            .collect();
+        let inputs: Vec<_> = order
+            .iter()
+            .map(|&index| {
+                let offset = positions[index];
+                let end = (offset + chunks[index]).min(prompts[index].len());
+                Input {
+                    session: ids[index],
+                    offset,
+                    tokens: prompts[index][offset..end].to_vec(),
+                }
+            })
+            .collect();
+        let outputs = pipeline.forward_batch(&inputs).unwrap();
+        for ((&index, input), output) in order.iter().zip(&inputs).zip(outputs) {
+            let expected = common::logits(&mut locals[index], &input.tokens, input.offset);
+            check_same_chunk(&output, &expected);
+            positions[index] += input.tokens.len();
+            let mut full = common::load_model(path, true);
+            let prefix = common::logits(&mut full, &prompts[index][..positions[index]], 0);
+            common::assert_close(
+                &output,
+                &prefix,
+                1e-4,
+                "pipeline vs full-prefix causal mask",
+            );
+            for (&actual, &reference) in output.iter().zip(&prefix) {
+                max_delta = max_delta.max((actual - reference).abs());
+            }
+        }
+    }
+    for offset in 9..33 {
+        let order = [2, 0, 1];
+        let inputs: Vec<_> = order
+            .iter()
+            .map(|&index| Input {
+                session: ids[index],
+                offset,
+                tokens: vec![(offset % 16) as u32],
+            })
+            .collect();
+        let outputs = pipeline.forward_batch(&inputs).unwrap();
+        for ((&index, input), output) in order.iter().zip(&inputs).zip(outputs) {
+            let expected = common::logits(&mut locals[index], &input.tokens, offset);
+            check_same_chunk(&output, &expected);
+        }
+    }
+    for id in ids {
+        pipeline.close(id).unwrap();
+    }
+    assert_eq!(pipeline.session_count(), 0);
+    eprintln!(
+        "same_chunk_max_absolute_delta={max_same_chunk_delta} full_prefix_max_absolute_delta={max_delta} stages={:?}",
+        pipeline.metrics()
+    );
+}
+
+#[test]
+fn mixed_chunk_schedules_match_full_prefix_across_stage_boundaries() {
+    let dir = common::model_dir("pipeline-causal-schedules");
+    for quantized in [false, true] {
+        let path = dir.join(format!("model-{quantized}.gguf"));
+        if quantized {
+            common::write_tiny_qwen3_quantized_layers(&path, 3);
+        } else {
+            common::write_tiny_qwen3_layers(&path, 3);
+        }
+        for mmap in [false, true] {
+            for ends in [&[1, 3][..], &[2, 3][..], &[1, 2, 3][..]] {
+                let (mut pipeline, handles) = start(&path, ends, mmap);
+                assert_chunk_schedules_match_full_prefix(&mut pipeline, &path, None);
+                pipeline.shutdown().unwrap();
+                for handle in handles {
+                    handle.join().unwrap().unwrap();
+                }
+            }
+        }
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+#[ignore = "requires three dedicated joshua workers on two hosts; see docs/pipeline-validation.md"]
+fn two_host_deployment_matches_full_prefix_and_cache_continuation() {
+    let peers: Vec<std::net::SocketAddr> = std::env::var("JOSHUA_PIPELINE_PEERS")
+        .expect("set JOSHUA_PIPELINE_PEERS to three comma-separated IP:port addresses")
+        .split(',')
+        .map(|address| address.parse().unwrap())
+        .collect();
+    assert_eq!(peers.len(), 3);
+    assert!(
+        peers
+            .iter()
+            .map(|peer| peer.ip())
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            >= 2
+    );
+    let dir = common::model_dir("pipeline-two-host");
+    for quantized in [false, true] {
+        let path = dir.join(format!("model-{quantized}.gguf"));
+        if quantized {
+            common::write_tiny_qwen3_quantized_layers(&path, 3);
+        } else {
+            common::write_tiny_qwen3_layers(&path, 3);
+        }
+        for ends in [vec![1, 3], vec![2, 3], vec![1, 2, 3]] {
+            eprintln!("two_host quantized={quantized} ends={ends:?} peers={peers:?}");
+            let mut pipeline = Pipeline::deploy(
+                &path,
+                &peers[..ends.len()],
+                &[0x15; 32],
+                Deployment {
+                    ends: Some(ends),
+                    limits: Limits {
+                        timeout_ms: 10_000,
+                        ..limits()
+                    },
+                },
+            )
+            .unwrap();
+            assert_chunk_schedules_match_full_prefix(&mut pipeline, &path, Some(1e-6));
+            pipeline.shutdown().unwrap();
+        }
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 #[test]
 fn model_less_workers_load_their_stage_from_the_controller_bit_exact() {
     let dir = common::model_dir("pipeline-deploy");
