@@ -36,6 +36,9 @@ framework) and [tokenizers](https://github.com/huggingface/tokenizers).
 
 ---
 
+For read-only GGUF versus HF safetensors diagnostics (including DeepSeek-V4.1
+FP4 adjacent-column checks), see [GGUF source parity](docs/gguf-source-parity.md).
+
 ## Architecture
 
 ```

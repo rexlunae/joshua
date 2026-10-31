@@ -17,6 +17,19 @@ env:
   CARGO_INCREMENTAL: 0
 
 jobs:
+  source-parity-tools:
+    name: GGUF source parity diagnostic
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install diagnostic dependencies
+        run: python -m pip install -r scripts/gguf_source_parity_requirements.txt
+      - name: Test independent tensor fixtures and bounded reads
+        run: python -m unittest discover -s scripts -p 'test_gguf_source_parity.py' -v
+
   benchmark-tools:
     name: benchmark evaluation gates
     runs-on: ubuntu-latest
