@@ -1013,9 +1013,57 @@ pub fn load_quantized<T: super::GgmlType + Send + Sync + 'static>(
     }))
 }
 
+/// Upload compact blocks on the background transfer stream, completing the
+/// write before returning storage that another thread can publish to compute.
+pub fn load_quantized_transfer(
+    device: &CudaDevice,
+    data: &[u8],
+    dtype: GgmlDType,
+) -> Result<QStorage> {
+    let stream = device.cuda_transfer_stream()?;
+    let padded_len = data.len() + MATRIX_ROW_PADDING * dtype.type_size() / dtype.block_size();
+    let mut inner = stream.alloc_zeros::<u8>(padded_len).w()?;
+    stream.memcpy_htod(data, &mut inner.slice_mut(..data.len())).w()?;
+    stream.synchronize().w()?;
+    Ok(QStorage::Cuda(QCudaStorage {
+        data: PaddedCudaSlice {
+            inner,
+            len: data.len(),
+        },
+        device: device.clone(),
+        dtype,
+    }))
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn cuda_transfer_storage_uses_transfer_stream() -> Result<()> {
+        let device = crate::Device::new_cuda(0)?;
+        let crate::Device::Cuda(cuda) = &device else {
+            unreachable!()
+        };
+        let bytes = vec![0u8; GgmlDType::Q4K.type_size()];
+        let storage = QStorage::from_data_transfer(
+            std::borrow::Cow::Borrowed(&bytes),
+            &device,
+            GgmlDType::Q4K,
+        )?;
+        let QStorage::Cuda(storage) = storage else {
+            unreachable!()
+        };
+        assert!(std::sync::Arc::ptr_eq(
+            storage.data.inner.stream(),
+            &cuda.cuda_transfer_stream()?,
+        ));
+        assert!(!std::sync::Arc::ptr_eq(
+            storage.data.inner.stream(),
+            &cuda.cuda_stream(),
+        ));
+        Ok(())
+    }
 
     #[test]
     fn cuda_quantize_q8_1() -> Result<()> {

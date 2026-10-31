@@ -1,8 +1,5 @@
 # Joshua device expert cache — design sketch
 
-**Status:** draft (not implemented). Builds on `--pin-hot-experts` / `HotExpertCache`
-(merged in #48).
-
 **Status:** design + phased implementation.  Phases 1, 2, 3, 5-core and 6 are merged
 (CUDA + Vulkan IQ2_XXS; see the table below); the device-validation and remaining runtime
 items are tracked in [issue #52](https://github.com/rexlunae/joshua/issues/52).  The
@@ -13,7 +10,7 @@ CPU-testable Tier-3 (SSD/Engram) additions live in
 |---|---|---|
 | 1 | `ExpertResidency` seam + `CpuResidency` (dedupe `MlpPrefetch`) | ✅ merged (#49) |
 | 5 core | placement math (`--expert-cache auto`) + `adaptive_budget` | ✅ merged (#50) |
-| 2 | VRAM slot pool + async copy + event sync | ✅ merged — `residency::DeviceResidency` + `ExpertUploader`, CUDA; `--vram-expert-cache auto`; see `docs/multilevel-weight-cache.md` §H |
+| 2 | VRAM slot pool + background upload | Partial — `DeviceResidency` + `ExpertUploader`; CUDA transfer-stream completion before publication, not a pending-slot/event handoff; see the audit below |
 | 3 | device-backed expert storage + matmul dispatch | ✅ CUDA/Vulkan IQ2_XXS experts (`cf0c938`, `0e953af`); `Ds4DeviceExpert` |
 | 4 | layer offload (dense models) + KV placement | ⚠️ partial — `--expert-placement host` keeps experts CPU-side; no explicit KV-tier placement |
 | 5 runtime | adaptive loop feeding measured hit-ratio/bus bytes into `adaptive_budget` | ⚠️ partial — budget sizing is static/`auto`, not a live feedback loop |
@@ -34,7 +31,45 @@ residency (a hot-protected cache mostly hits even at low residency), and a
 decision that declines *only* on residency moves the dense set to CPU-BLAS
 when the freed memory clears the floor and the placement probe does not show
 a decisive device GEMM win (`dense_to_cpu_for_cache`).  The CUDA async-copy
-phase below remains future work for a CUDA slot cache.
+pending-slot/event handoff below remains future work.
+
+### CUDA audit (2026-10-30, issues #62 / #52)
+
+DeepSeek4 has a model-wide bounded pool, a background `ExpertUploader`, and
+lookup-only dispatch with host fallback. Its mmap-backed gate/up/down blocks
+reach `QStorage::from_data_transfer`. CUDA previously routed that call through
+ordinary `from_data`, allocating and copying on the compute stream. It now uses
+one lazily created non-blocking transfer stream per `CudaDevice` (shared by its
+clones). The worker completes that stream before returning the storage; only
+then may `DeviceResidency` publish it. Compact blocks and existing kernel padding
+are preserved. No pinned staging allocation, raw FFI, pending-slot readiness
+state, or change to cache eviction/hot-set policy is introduced.
+Cudarc can synchronize the context once when the first owned stream is created
+to enter multi-stream mode; the per-upload completion wait is stream-local.
+
+`tests/cuda_expert_cache_tests.rs` requires a working CUDA device and covers
+Q2_K/Q4_K/Q6_K/Q8_0 byte preservation and bit-identical matmul versus the normal
+CUDA upload, plus a tiny mmap-backed DeepSeek4 IQ2_XXS/Q8_0 cache. Two sessions
+share a three-expert, 155,136-byte logical payload budget, with concurrent prefill,
+70 decode steps each (crossing the hot-set refresh interval), all-row logits,
+hits/uploads, bounded occupancy, and exact budget-zero/too-small-budget host
+parity. The cache logit tolerance is the existing accelerator-cache tolerance (5% of the reference
+logit spread), not a claim of CPU/CUDA bit parity. Kernel padding is additional
+to the pool's existing logical-payload accounting.
+
+The older qwen3moe/deepseek2 paths are **not** equivalent: they build per-layer
+`DeviceResidency` objects, but the session's `LayerStack::residency()` is a
+`CpuResidency`, so refresh/acquire does not fill those device pools. Their upload
+closures also target `expert_device`, which is either the CPU fallback or the
+already-loaded expert device, rather than an independent cache destination.
+They need a separate, model-wide host-source/device-destination wiring change,
+exact slot accounting, and real CUDA regression tests. A nonzero budget and
+matching logits alone do not establish that these caches upload or hit.
+
+Still unvalidated: PCIe traffic, pinned-memory/event-based overlap, throughput
+versus all-host/all-device, no-thrash hot-set behavior across sessions with
+different routing histories, and streamed-load CUDA cache fallback. Tiny-model
+correctness tests do not establish a real-model hit-rate or performance target.
 
 **Backend note:** the device backend must not be CUDA-only — ROCm stays an
 option.  HIP's API mirrors CUDA's (`hipMemcpyAsync` ≈ `cudaMemcpyAsync`,

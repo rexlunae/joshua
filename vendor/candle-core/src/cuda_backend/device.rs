@@ -62,6 +62,7 @@ pub struct CudaDevice {
     modules: Arc<std::sync::RwLock<ModuleStore>>,
     custom_modules: Arc<std::sync::RwLock<HashMap<String, Arc<cudarc::driver::CudaModule>>>>,
     stream: Arc<cudarc::driver::CudaStream>,
+    transfer_stream: Arc<Mutex<Option<Arc<cudarc::driver::CudaStream>>>>,
     pub(crate) blas: Arc<cudarc::cublas::CudaBlas>,
     curand: Arc<Mutex<CudaRng>>,
     seed_value: Arc<RwLock<u64>>,
@@ -289,6 +290,19 @@ impl CudaDevice {
         self.stream.clone()
     }
 
+    /// Lazily create the non-blocking stream shared by background weight uploads.
+    pub fn cuda_transfer_stream(&self) -> Result<Arc<cudarc::driver::CudaStream>> {
+        let mut stream = self.transfer_stream.lock().map_err(|_| {
+            crate::Error::Msg("CUDA transfer stream lock poisoned".into())
+        })?;
+        if let Some(stream) = stream.as_ref() {
+            return Ok(stream.clone());
+        }
+        let created = self.context.new_stream().w()?;
+        *stream = Some(created.clone());
+        Ok(created)
+    }
+
     /// When turned on, all cuda tensors **created after calling this function** will
     /// not track uses via cuda events.
     ///
@@ -403,6 +417,7 @@ impl CudaDevice {
             id: DeviceId::new(),
             context,
             stream,
+            transfer_stream: Arc::new(Mutex::new(None)),
             blas: Arc::new(blas),
             curand: Arc::new(Mutex::new(CudaRng(curand))),
             modules: Arc::new(std::sync::RwLock::new(module_store)),
