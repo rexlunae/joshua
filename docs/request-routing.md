@@ -226,10 +226,12 @@ would need a TLS client in the router and is not implemented.
 * Plain HTTP to workers (no TLS client); run workers on a trusted network or
   behind a TLS-terminating tunnel.  The router itself serves plain HTTP
   unless `--tls-cert`/`--tls-key` are given (see above).
-* Routing uses model id, slots and reported in-flight count.  It does not
-  estimate per-request work (prompt length, `max_tokens`), check a
-  request's length against a worker's `n_ctx`, compare tokenizers beyond the
-  model id, or prefer a worker holding a reusable KV prefix.  The last of
+* Routing uses model id, slots, reported in-flight count and bounded work
+  hints from input bytes and output budgets. Explicit chat context windows
+  are checked against known per-model limits, with legacy fallback when
+  limits are unknown. It does not count rendered prompt tokens or guarantee
+  exact prompt fit, compare tokenizers beyond the model id, or prefer a
+  worker holding a reusable KV prefix. The last of
   those is designed in `docs/distributed-kv-cache.md` (#201): a chunk-hashed
   directory of which worker holds which prefix, consulted without an extra
   round trip.

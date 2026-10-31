@@ -456,26 +456,73 @@ enum FirstOutput {
 }
 
 /// Borrow prompt JSON without decoding strings or constructing a JSON tree.
-#[derive(Deserialize)]
+#[derive(Default)]
 struct Envelope<'a> {
-    #[serde(default)]
     model: Option<String>,
-    #[serde(borrow)]
     messages: Option<&'a serde_json::value::RawValue>,
-    #[serde(borrow)]
     prompt: Option<&'a serde_json::value::RawValue>,
-    #[serde(borrow)]
     input: Option<&'a serde_json::value::RawValue>,
-    #[serde(borrow)]
     max_tokens: Option<&'a serde_json::value::RawValue>,
-    #[serde(borrow)]
     max_completion_tokens: Option<&'a serde_json::value::RawValue>,
-    #[serde(borrow)]
     context_window: Option<&'a serde_json::value::RawValue>,
-    #[serde(borrow)]
     num_ctx: Option<&'a serde_json::value::RawValue>,
-    #[serde(borrow)]
     n_ctx: Option<&'a serde_json::value::RawValue>,
+}
+
+impl<'de> Deserialize<'de> for Envelope<'de> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(field_identifier, rename_all = "snake_case")]
+        enum Field {
+            Model, Messages, Prompt, Input, MaxTokens, MaxCompletionTokens,
+            ContextWindow, NumCtx, NCtx,
+            #[serde(other)]
+            Ignore,
+        }
+
+        struct EnvelopeVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for EnvelopeVisitor {
+            type Value = Envelope<'de>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a request object")
+            }
+
+            fn visit_map<M: serde::de::MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
+                let mut envelope = Envelope::default();
+                let mut seen_model = false;
+                while let Some(field) = map.next_key::<Field>()? {
+                    let target = match field {
+                        Field::Model => {
+                            if seen_model {
+                                return Err(serde::de::Error::duplicate_field("model"));
+                            }
+                            seen_model = true;
+                            envelope.model = map.next_value()?;
+                            continue;
+                        }
+                        Field::Messages => &mut envelope.messages,
+                        Field::Prompt => &mut envelope.prompt,
+                        Field::Input => &mut envelope.input,
+                        Field::MaxTokens => &mut envelope.max_tokens,
+                        Field::MaxCompletionTokens => &mut envelope.max_completion_tokens,
+                        Field::ContextWindow => &mut envelope.context_window,
+                        Field::NumCtx => &mut envelope.num_ctx,
+                        Field::NCtx => &mut envelope.n_ctx,
+                        Field::Ignore => {
+                            map.next_value::<serde::de::IgnoredAny>()?;
+                            continue;
+                        }
+                    };
+                    *target = map.next_value()?;
+                }
+                Ok(envelope)
+            }
+        }
+
+        deserializer.deserialize_map(EnvelopeVisitor)
+    }
 }
 
 #[derive(Default)]
@@ -1737,6 +1784,39 @@ mod tests {
         let e: Envelope =
             serde_json::from_slice(br#"{"context_window":"invalid","max_tokens":{}}"#).unwrap();
         assert_eq!(e.work("/v1/chat/completions").context, None);
+    }
+
+    #[test]
+    fn routing_hints_use_last_duplicate_values_without_rewriting_the_body() {
+        let body = br#"{"model":"m","prompt":"old","prompt":"new","input":[],"input":[1,2],"max_tokens":1,"max_tokens":100,"unknown":{},"unknown":[]}"#;
+        let envelope: Envelope = serde_json::from_slice(body).unwrap();
+        assert_eq!(envelope.prompt.unwrap().get(), "\"new\"");
+        assert_eq!(envelope.input.unwrap().get(), "[1,2]");
+        assert_eq!(envelope.work("/v1/completions").units, 405);
+        let escaped: Envelope = serde_json::from_slice(br#"{"pro\u006dpt":"last"}"#).unwrap();
+        assert_eq!(escaped.prompt.unwrap().get(), "\"last\"");
+        assert!(serde_json::from_slice::<Envelope>(br#"{"model":null,"model":"m"}"#).is_err());
+    }
+
+    #[test]
+    fn null_output_budget_uses_the_legacy_fallback() {
+        #[derive(Deserialize)]
+        struct OriginalBudget<'a> {
+            #[serde(borrow)]
+            max_completion_tokens: Option<&'a serde_json::value::RawValue>,
+        }
+        let original: OriginalBudget = serde_json::from_slice(
+            br#"{"max_completion_tokens":null}"#,
+        ).unwrap();
+        assert!(original.max_completion_tokens.is_none());
+        let envelope: Envelope = serde_json::from_slice(
+            br#"{"max_completion_tokens":null,"max_tokens":4096}"#,
+        ).unwrap();
+        assert_eq!(envelope.work("/v1/chat/completions").units, 4096 * 4);
+        let envelope: Envelope = serde_json::from_slice(
+            br#"{"max_completion_tokens":7,"max_tokens":4096}"#,
+        ).unwrap();
+        assert_eq!(envelope.work("/v1/chat/completions").units, 7 * 4);
     }
 
     #[test]

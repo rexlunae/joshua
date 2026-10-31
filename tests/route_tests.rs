@@ -501,6 +501,12 @@ async fn routes_by_model_and_forwards_the_request_unchanged() {
     assert_eq!(res.json()["worker"], "a");
     assert!(res.header(REQUEST_ID_HEADER).unwrap().starts_with("req-"));
 
+    let duplicated = r#"{"model":"alpha","prompt":"old","prompt":"new","max_tokens":1,"max_tokens":2}"#;
+    let res = call(&router, "POST", "/v1/completions", duplicated).await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.json()["echo"]["prompt"], "new");
+    assert_eq!(alpha.last_body.lock().unwrap().as_deref(), Some(duplicated.as_bytes()));
+
     // A model nobody serves is a 404 naming what is available.
     let res = chat(&router, json!({"model": "gamma", "messages": []})).await;
     assert_eq!(res.status, StatusCode::NOT_FOUND);
