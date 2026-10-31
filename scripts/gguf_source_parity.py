@@ -215,7 +215,8 @@ class Source:
                 raise ValueError('quantized source needs --scale or a name ending in weight')
             scale_name = name[:-6] + 'scale'
         shape = self.meta(name)[3]
-        expected = ((shape[0] + block_rows - 1) // block_rows,
+        total_rows = shape[0] if len(shape) == 2 else 1
+        expected = ((total_rows + block_rows - 1) // block_rows,
                     (values.shape[1] + block_cols - 1) // block_cols)
         if tuple(self.meta(scale_name)[3]) != expected:
             raise ValueError(f'scale shape must be {expected} for blocks {block_rows}x{block_cols}')
@@ -234,36 +235,52 @@ class Metrics:
     def __init__(self):
         self.count = self.nonfinite = 0
         self.error2 = self.reference2 = self.actual2 = self.dot = 0.
-        self.reference_sum = self.actual_sum = self.max_abs = 0.
+        self.max_abs = 0.
+        self.actual_origin = self.reference_origin = 0.
+        self.actual_mean = self.reference_mean = 0.
+        self.actual_variance = self.reference_variance = self.covariance = 0.
 
     def add(self, actual, reference):
         finite = np.isfinite(actual) & np.isfinite(reference)
         self.nonfinite += int(finite.size - np.count_nonzero(finite))
-        actual, reference = actual[finite], reference[finite]
-        self.count += actual.size
+        actual = actual[finite].astype(np.float64)
+        reference = reference[finite].astype(np.float64)
         if not actual.size:
             return
+        if not self.count:
+            self.actual_origin, self.reference_origin = float(actual[0]), float(reference[0])
+        actual_shifted = actual - self.actual_origin
+        reference_shifted = reference - self.reference_origin
+        actual_mean = float(np.mean(actual_shifted))
+        reference_mean = float(np.mean(reference_shifted))
+        actual_centered = actual_shifted - actual_mean
+        reference_centered = reference_shifted - reference_mean
+        actual_delta = actual_mean - self.actual_mean
+        reference_delta = reference_mean - self.reference_mean
+        total = self.count + actual.size
+        merge_weight = self.count * actual.size / total
+        self.actual_variance += float(np.sum(actual_centered ** 2)) + actual_delta ** 2 * merge_weight
+        self.reference_variance += float(np.sum(reference_centered ** 2)) + reference_delta ** 2 * merge_weight
+        self.covariance += float(np.sum(actual_centered * reference_centered)) + actual_delta * reference_delta * merge_weight
+        self.actual_mean += actual_delta * actual.size / total
+        self.reference_mean += reference_delta * actual.size / total
+        self.count = total
         difference = actual - reference
         self.error2 += float(np.sum(difference * difference))
         self.reference2 += float(np.sum(reference * reference))
         self.actual2 += float(np.sum(actual * actual))
         self.dot += float(np.sum(actual * reference))
-        self.reference_sum += float(np.sum(reference))
-        self.actual_sum += float(np.sum(actual))
         self.max_abs = max(self.max_abs, float(np.max(np.abs(difference))))
 
     def result(self):
         def ratio(numerator, denominator):
             return numerator / denominator if denominator > 0 else None
-        covariance = self.dot - self.actual_sum * self.reference_sum / max(1, self.count)
-        actual_variance = max(0., self.actual2 - self.actual_sum ** 2 / max(1, self.count))
-        reference_variance = max(0., self.reference2 - self.reference_sum ** 2 / max(1, self.count))
         return {'finite_pairs': self.count, 'nonfinite_pairs': self.nonfinite,
                 'rmse': math.sqrt(self.error2 / self.count) if self.count else None,
                 'max_abs': self.max_abs if self.count else None,
                 'relative_l2': ratio(math.sqrt(self.error2), math.sqrt(self.reference2)),
                 'cosine': ratio(self.dot, math.sqrt(self.actual2 * self.reference2)),
-                'pearson': ratio(covariance, math.sqrt(actual_variance * reference_variance))}
+                'pearson': ratio(self.covariance, math.sqrt(self.actual_variance * self.reference_variance))}
 
 
 def compare(gguf, source, gguf_name, hf_name, args):

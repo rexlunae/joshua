@@ -25,6 +25,9 @@ FP8 E4M3FN/E8M0 (including tail blocks and per-row scales), and low-first FP4
 E2M1/E8M0. They cover Q8_0, a known Q4_K block, expert selection, swapped-column
 detection, invalid shapes/scales, truncated files, non-finite values, chunk-size
 invariance, bounded read sizes, and a sparse multi-GB table at row 12,345,678.
+Quantized vectors use a single scale row. Pearson accumulation uses merged
+centered moments relative to fixed origins, keeping constant inputs undefined
+and avoiding raw-moment cancellation for large offsets across chunk sizes.
 The `GGUF source parity diagnostic` CI job runs these tests without real models.
 
 ## Explicit selections

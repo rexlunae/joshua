@@ -114,6 +114,22 @@ class ParityTests(unittest.TestCase):
         report = self.compare(self.args(fp8_block_rows=1, row_start=1))
         self.assertEqual(report['direct']['max_abs'], 0)
 
+    def test_quantized_vectors_have_one_scale_row(self):
+        for fp4 in (False, True):
+            with self.subTest(fp4=fp4):
+                raw = np.full(48 if fp4 else 96, 0x21 if fp4 else 0x38, dtype='u1')
+                scales = np.array([[127, 128, 126]], dtype='u1')
+                write_source(self.directory, {
+                    'test.weight': ('I8' if fp4 else 'F8_E4M3', raw),
+                    'test.scale': ('F8_E8M0', scales),
+                })
+                values = np.tile([.5, 1.], 48) if fp4 else np.ones(96)
+                expected = (values * np.repeat([1., 2., .5], 32)).astype('<f4')
+                write_gguf(self.gguf_path, [('test', (96,), Quant.F32, expected.tobytes())])
+                report = self.compare(self.args(fp4=fp4, rows=1))
+                self.assertEqual(report['direct']['max_abs'], 0)
+                self.assertEqual(report['direct']['finite_pairs'], 96)
+
     def test_fp4_known_answer_scales_expert_and_swapped_detection(self):
         raw = np.tile(np.array([0x21, 0x98, 0x7f, 0x35], dtype='u1'), (3, 32))
         scales = np.tile(np.array([127, 128, 126, 129, 127, 128, 126, 129], dtype='u1'), (3, 1))
@@ -172,6 +188,25 @@ class ParityTests(unittest.TestCase):
         self.assertIsNone(result['cosine'])
         self.assertIsNone(result['pearson'])
         json.dumps(result, allow_nan=False)
+
+    def test_constant_pearson_is_undefined_across_chunk_sizes(self):
+        for chunk_size in (1, 2, 3, 10, 100):
+            for constant_actual, constant_reference in ((True, True), (True, False), (False, True)):
+                actual = np.full(100, .1) if constant_actual else np.arange(100, dtype=float)
+                reference = np.full(100, .2) if constant_reference else np.arange(100, dtype=float)
+                stats = parity.Metrics()
+                for start in range(0, 100, chunk_size):
+                    stats.add(actual[start:start + chunk_size], reference[start:start + chunk_size])
+                self.assertIsNone(stats.result()['pearson'])
+
+    def test_pearson_is_stable_for_large_offsets(self):
+        actual = 1e12 + np.arange(100, dtype=float) / 8
+        reference = -1e12 + np.arange(100, dtype=float) / 4
+        for chunk_size in (1, 3, 10, 100):
+            stats = parity.Metrics()
+            for start in range(0, 100, chunk_size):
+                stats.add(actual[start:start + chunk_size], reference[start:start + chunk_size])
+            self.assertAlmostEqual(stats.result()['pearson'], 1., places=14)
 
     def test_sparse_large_table_reads_only_selected_rows(self):
         start, cols = 12345678, 32
