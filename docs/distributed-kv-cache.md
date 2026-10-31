@@ -151,12 +151,26 @@ worker simply omits it and is routed as today.
     session there. A new prompt reuses it by longest common prefix, and
     rewinds through `rewind_target` where the architecture allows it.
   * the **`PrefixCache`**. A pooled session is parked here only when the
-    pool evicts it, and only if it is at least `PREFIX_CACHE_PARK_MIN`
-    (256) tokens; shorter ones are dropped.
+    pool evicts it, and only if it is at least
+    `min(PREFIX_CACHE_PARK_MIN, prefix_cache_root_min)` tokens (256 by
+    default; lower when the operator lowers the root minimum, see
+    `Engine::park_session`). Shorter sessions are dropped. A parked entry
+    shorter than one 64-token storage chunk is held but never advertised,
+    because it has no complete storage chunk to key (open question 2).
 
-  A key is held when either tier can serve it. Moving a session from the
-  pool into the cache is not an event. Dropping a session, or evicting one
-  from the cache, emits a tombstone.
+  A key is held when either tier can serve it, and the two tiers serve
+  different keys. A warm attention-only session can rewind to any chunk
+  boundary of its chain, so it serves every key along it. A parked snapshot
+  covers its whole conversation, and `best_len` takes it only as a strict
+  prefix of a new prompt, so it serves no intermediate key. So **every tier
+  transition is an event**. When a session moves from pool to cache, the
+  worker recomputes the session's servable keys. It emits tombstones for the
+  keys the parked entry cannot serve and inserts for any it newly can, and
+  stays silent only when the set is unchanged. Dropping a session, or
+  evicting one from the cache, tombstones its remaining keys. A
+  `chunk`-granularity worker can shrink that loss by parking at the last
+  storage boundary instead of the whole conversation
+  (`snapshot(64·⌊len/64⌋, len)`), so the parked entry still ends on a key.
 * `root` — 8-byte XOR (or Merkle) sketch over the sorted chunk keys, for
   anti-entropy (§6).
 * `watermark` — the last delta sequence number the worker has emitted.
