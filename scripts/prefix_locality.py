@@ -101,12 +101,12 @@ def stream_request(address, body, timeout):
                     raise ValueError("response exceeds 16 MiB")
                 if not line:
                     break
-                if not line.startswith(b"data:"):
+                if done or not line.startswith(b"data:"):
                     continue
                 data = line[5:].strip()
                 if data == b"[DONE]":
                     done = True
-                    break
+                    continue
                 event = json.loads(data)
                 if "error" in event:
                     raise ValueError(f"stream error: {event['error']}")
@@ -439,9 +439,12 @@ def positive(value):
 
 def numbers(value):
     try:
-        return [positive(item) for item in value.split(",")]
+        values = [positive(item) for item in value.split(",")]
     except (ValueError, argparse.ArgumentTypeError) as error:
         raise argparse.ArgumentTypeError("expected comma-separated positive integers") from error
+    if len(set(values)) != len(values):
+        raise argparse.ArgumentTypeError("sweep values must be unique; use --repeats for repeated runs")
+    return values
 
 
 def interrupted(signum, frame):

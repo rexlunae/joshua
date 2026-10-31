@@ -13,6 +13,13 @@ import prefix_locality as locality
 
 
 class LocalityTests(unittest.TestCase):
+    def test_sweeps_reject_duplicate_values_before_starting(self):
+        self.assertEqual(locality.numbers("2,6,12"), [2, 6, 12])
+        for value in ["1,1", "2,2", "2,6,2", "1,01"]:
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(argparse.ArgumentTypeError, "unique"):
+                    locality.numbers(value)
+
     def test_trace_identity_and_prefix_placement(self):
         args = argparse.Namespace(seed=201156, rounds=3, prefix_words=8,
                                   model_id="tiny", max_tokens=4)
@@ -154,6 +161,41 @@ class LocalityTests(unittest.TestCase):
             server.broken = True
             result = locality.stream_request(f"127.0.0.1:{server.server_port}", b"{}", 2)
             self.assertIn("incomplete stream", result["error"])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+    def test_stream_counts_entire_body_after_done(self):
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *_):
+                pass
+
+            def do_POST(self):
+                self.rfile.read(int(self.headers["Content-Length"]))
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Content-Length", str(len(self.server.payload)))
+                self.end_headers()
+                self.wfile.write(self.server.payload)
+                self.wfile.flush()
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever)
+        thread.start()
+        try:
+            for newline in [b"\n", b"\r\n"]:
+                with self.subTest(newline=newline):
+                    server.payload = (
+                        b'data: {"choices":[{"delta":{"content":"hello"}}]}\n\n'
+                        b'data: {"choices":[{"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1}}\n\n'
+                        b'data: [DONE]\n\n: trailing comment\n\n'
+                    ).replace(b"\n", newline)
+                    result = locality.stream_request(f"127.0.0.1:{server.server_port}", b"{}", 2)
+                    self.assertIsNone(result["error"])
+                    self.assertEqual(result["response_body_bytes"], len(server.payload))
         finally:
             server.shutdown()
             server.server_close()

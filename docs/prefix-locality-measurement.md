@@ -284,8 +284,12 @@ bound on unique physical memory. Configured snapshot/context/session/queue
 caps are the boundedness mechanism; directory growth is not tested because
 there is no directory.
 
-Across 840 policy requests the reports count **580,440 request-body bytes** and
-**973,092 response-body bytes**, not NIC traffic. No directory or KV-transfer
+Across 840 policy requests the saved reports count **580,440 request-body bytes**
+and **973,092 response-body bytes**, not NIC traffic. Those historical response
+counts omit the final SSE separator after `[DONE]`; they are undercounts, not
+exact complete-body totals. The corrected harness drains the bounded response
+through EOF and counts the separator and any trailing body bytes. The saved
+reports have not been rewritten or relabelled as corrected reruns. No directory or KV-transfer
 bytes were measured; their fraction cannot be asserted zero or below the RFC's
 0.1% target. All logged prefilled tokens in these saved cells had positive
 logged prefill rates, but rates vary with concurrency and remaining suffix size;
@@ -324,7 +328,9 @@ real-qwen-1w/report.json
 ```
 
 The final script differs from the saved later script by bounding oracle
-admission wait and releasing its slot even on an unexpected request exception.
+admission wait, releasing its slot even on an unexpected request exception,
+rejecting duplicate sweep values before starting, and counting response-body
+bytes through EOF rather than stopping at the `[DONE]` data line.
 Saved runs had no admission timeout; their timing/output evidence is retained
 as measured, not relabelled as a rerun of the final script. The earlier script
 also predates completion markers and richer root/pool event accounting.
@@ -332,7 +338,8 @@ also predates completion markers and richer root/pool event accounting.
 Final local validation on Darwin arm64, default CPU backend, Rust
 `1.99.0-nightly (d453bdd8f 2026-08-14)` and Python 3.15.0:
 
-- Python accounting/transport tests: 9 passed.
+- Python accounting/transport tests: 11 passed after review fixes, including
+  exact LF/CRLF response lengths with trailing bytes and duplicate sweep values.
 - Expanded tiny Qwen process fixture: 18 paired cells, both policy orders,
   2/6/12 prefixes × concurrency 1/2/4, and two warm/cold calibrations; passed.
 - `route_tests`: 29 passed; `integration_tests`: 41 passed (including existing
