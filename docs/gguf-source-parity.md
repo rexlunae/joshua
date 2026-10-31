@@ -147,13 +147,14 @@ of every possible inference failure.
 
 Converter PR `rexlunae/ds4-convert#1` has merged with the FP4 nibble fix.
 At the time of the October 30 sampling, the corrected GGUF was still regenerating at
-`/home/tserica/models/DSV41-REAP272E-balanced-fp4fix.gguf` during this sampling;
+`/home/tserica/models/DSV41-REAP272E-balanced-fp4fix.gguf`;
 it was **not** used, interrupted, or replaced. Original `/tank` files were
-untouched. After regeneration completes, rerun identical selections against
-that new path, then separately validate Joshua's raw/chat prompt decoding and
-relevant backends end to end. No performance measurements, corrected-model
-parity, full-model coverage, or issue-closure claim is made here. #175 remains
-open pending that validation; this tool changes no loader or inference path.
+untouched. This historical sample covered only the original artifact, not
+corrected-model parity or generation. The October 31 results below supersede
+that pending status with completed corrected-artifact sampling and CPU raw/chat
+generation, while distinguishing the remaining backend and coverage gaps.
+No performance or issue-closure claim is made; this tool changes no loader or
+inference path.
 
 ### October 31: corrected artifact and CPU generation
 
