@@ -69,7 +69,15 @@ fn local_experts(path: &Path) -> Vec<LocalExpert> {
 }
 
 fn start(path: &Path, mapped: bool) -> (Coordinator, Vec<thread::JoinHandle<anyhow::Result<()>>>) {
-    let placement = Placement::from_gguf(path, 0, vec![1, 0, 1, 0], limits()).unwrap();
+    start_with_limits(path, mapped, limits())
+}
+
+fn start_with_limits(
+    path: &Path,
+    mapped: bool,
+    bounds: Limits,
+) -> (Coordinator, Vec<thread::JoinHandle<anyhow::Result<()>>>) {
+    let placement = Placement::from_gguf(path, 0, vec![1, 0, 1, 0], bounds).unwrap();
     let mapping = if mapped {
         let bytes = std::fs::read(path).unwrap();
         let mut mapping = memmap2::MmapMut::map_anon(bytes.len()).unwrap();
@@ -96,6 +104,68 @@ fn start(path: &Path, mapped: bool) -> (Coordinator, Vec<thread::JoinHandle<anyh
         Coordinator::connect(placement, &addresses, job, KEY).unwrap(),
         handles,
     )
+}
+
+#[test]
+fn idle_workers_survive_a_pause_longer_than_the_frame_timeout() {
+    let dir = common::model_dir("expert-ownership-idle");
+    let path = dir.join("model.gguf");
+    common::write_tiny_qwen3moe_gguf(&path);
+    let mut bounds = limits();
+    bounds.timeout_ms = 250;
+    let (mut coordinator, handles) = start_with_limits(&path, false, bounds);
+    let input = Tensor::new(&[[0.25f32; 8]], &Device::Cpu).unwrap();
+    let ids = Tensor::new(&[[3u32, 1, 3]], &Device::Cpu).unwrap();
+    let weights = Tensor::new(&[[0.25f32, -0.5, 0.125]], &Device::Cpu).unwrap();
+    let row = [RowId {
+        session: 1,
+        token: 0,
+    }];
+    let expected = coordinator.forward(&row, &input, &ids, &weights).unwrap();
+    thread::sleep(std::time::Duration::from_millis(600));
+    let actual = coordinator.forward(&row, &input, &ids, &weights).unwrap();
+    assert_eq!(
+        actual.to_vec2::<f32>().unwrap(),
+        expected.to_vec2::<f32>().unwrap()
+    );
+    drop(coordinator);
+    for handle in handles {
+        assert!(handle.join().unwrap().is_err());
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn frame_admission_and_owner_load_identity_are_checked_before_serving() {
+    let dir = common::model_dir("expert-ownership-frame-and-identity");
+    let path = dir.join("model.gguf");
+    common::write_tiny_qwen3moe_gguf(&path);
+    for frame_bytes in [1, 1024] {
+        let mut bounds = limits();
+        bounds.frame_bytes = frame_bytes;
+        assert!(Placement::from_gguf(&path, 0, vec![0; 4], bounds)
+            .unwrap_err()
+            .to_string()
+            .contains("frame budget"));
+    }
+    let plan = Placement::from_gguf(&path, 0, vec![0; 4], limits()).unwrap();
+    let mut bytes = std::fs::read(&path).unwrap();
+    let mut mapping = memmap2::MmapMut::map_anon(bytes.len()).unwrap();
+    *bytes.last_mut().unwrap() ^= 1;
+    mapping.copy_from_slice(&bytes);
+    let mapping = Arc::new(mapping.make_read_only().unwrap());
+    assert!(ExpertSet::load(&path, plan.clone(), 0, Some(&mapping))
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("mapping identity mismatch"));
+    std::fs::write(&path, bytes).unwrap();
+    assert!(ExpertSet::load(&path, plan, 0, None)
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("model identity mismatch"));
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]

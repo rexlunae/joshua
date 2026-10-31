@@ -39,13 +39,18 @@ then expert and original route ID. Duplicate expert selections remain separate
 routes. Single-row decode evaluates each selection separately and reconstructs
 local slot-order weighting/reduction; multi-row prefill retains local
 expert-major accumulation. Owner reply order never determines summation order.
+All decode selections on one owner borrow the same input tensor; inconsistent
+copies of a single position's activation are rejected before computation.
 
 Malformed frames, nonfinite activations/results/weights, identity or sequence
 mismatches, invalid routes, socket failures, and computation errors fail the
 whole forward. The coordinator then closes all channels and refuses reuse;
 create a fresh job, not a partial-output retry. Dropping a coordinator closes its
 channels. A worker exits when its connection closes. Connections and framed I/O
-have configured timeouts; tensor computation is not preemptible.
+have configured timeouts; tensor computation is not preemptible. Idle workers
+wait for the first byte without an idle timeout, so healthy jobs survive pauses
+between forwards. Once a frame starts, its entire receive remains deadline-bound;
+coordinators also retain their bounded response wait.
 
 ## Memory, formats, and security
 
@@ -57,9 +62,21 @@ Accepted formats are F32, Q2_K, Q4_K, Q6_K, and Q8_0; only F32 and Q4_K have
 fixture parity coverage in this slice. No entire quantized expert pool is
 expanded to F32 and no weights are copied per session.
 
+Selective expert residency does **not** imply selective startup I/O.
+`Placement::from_gguf` scans the entire file to establish its SHA-256 identity.
+Each `ExpertSet::load` verifies that same full-file digest once through the
+handle used for loading, then parses its header once and reads only owned
+projections. A separately supplied mapping requires an additional digest scan
+to verify its bytes too. File and mapping inputs must remain immutable. Skipping
+verification based only on file path, size, or timestamps would weaken the
+exact-revision guarantee; a reusable verified-model handle is future work.
+
 Admission validates owned projection bytes and reserves conservative frame,
 activation/output, metadata, and dense CPU temporary workspace. These are
 algorithmic admission bounds, not an OS RSS quota or a measured memory peak.
+Placement also rejects frame budgets that cannot hold the worst-case admitted
+route payload and JSON metadata (including maximum-width identifiers). The same
+bound covers requests and unweighted responses, including fully skewed routing.
 There is no unbounded application queue, timed cross-request batcher, expert
 replication, migration, or fallback. A second forward waits at its caller.
 
@@ -87,7 +104,7 @@ malformed/oversized/nonfinite frames, route and session bounds, identity and
 sequence mismatches, wrong authentication, disconnects, and fail-stop reuse.
 Admission tests also reject insufficient budgets and shared-expert models.
 
-Local validation on macOS CPU: four protocol unit tests and both complete-expert
+Local validation on macOS CPU: seven protocol unit tests and four complete-expert
 integration tests pass. The default library suite passes (480 tests, 10 ignored),
 as do the Qwen (10), Qwen3-MoE (8), and memory-placement (12) suites. The
 `cargo check --all-targets --features tls,distributed` build passes with existing
@@ -101,12 +118,20 @@ base `22e02672a5655806e2eff488a0be6a79cdb61877`: `completion_ack_prevents_leavin
 `mismatched_lengths_cannot_succeed`, and
 `rank_order_is_deterministic_despite_reordered_arrival`. Serial execution does
 not resolve the host's multicast bind behavior. No multicast code is changed.
-The distributed library result is 527 passed, five failed, and 12 ignored.
+After the review follow-up, the distributed library result is 530 passed,
+five failed, and 12 ignored (the same five multicast bind failures).
 The pipeline suite also reproduces two unchanged-base exact-logit failures:
 `model_less_workers_load_their_stage_from_the_controller_bit_exact` and
 `mixed_chunk_schedules_match_full_prefix_across_stage_boundaries` (13 passed,
 two failed, three ignored). Assertions and tolerances are unchanged; this
 prototype does not modify pipeline tensor execution.
+
+The review regressions reproduce all three reported bugs when the fixes are
+removed: healthy forwards fail after a 600 ms idle gap with a 250 ms frame
+timeout, 1-byte/1 KiB budgets admit incompatible routes, and decode route inputs
+have different Tensor identities. They pass with the fixes applied. A partial
+frame still times out, worst-case metadata/payload reaches the computed bound
+exactly, and modified source or mapping bytes still fail identity verification.
 
 Still required for #159: architecture/Engine integration, shared experts,
 cross-host validation, real-model all-row logits and generation parity,

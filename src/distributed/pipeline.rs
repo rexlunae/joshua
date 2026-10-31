@@ -566,6 +566,10 @@ impl ExpertChannel {
         Ok(packet.bytes)
     }
 
+    pub(super) fn wait_for_frame(&mut self) -> Result<()> {
+        self.0.wait_for_frame()
+    }
+
     pub(super) fn shutdown(&self) {
         let _ = self.0.stream.shutdown(Shutdown::Both);
     }

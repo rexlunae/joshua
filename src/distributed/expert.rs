@@ -11,7 +11,7 @@
 use std::{
     collections::{BTreeMap, HashSet},
     fs::File,
-    io::{Read, Seek, SeekFrom},
+    io::{Read, Seek},
     net::{SocketAddr, TcpStream},
     path::Path,
     sync::Arc,
@@ -208,10 +208,40 @@ impl Placement {
             limits,
         };
         ensure!(
+            result.frame_reservation()? <= result.limits.frame_bytes,
+            "frame budget cannot hold admitted routes"
+        );
+        ensure!(
             result.scratch_reservation()? <= result.limits.scratch_bytes,
             "scratch budget exceeded"
         );
         Ok(result)
+    }
+
+    fn frame_reservation(&self) -> Result<usize> {
+        let header = serde_json::to_vec(&Message {
+            identity: [u8::MAX; 32],
+            forward: u64::MAX,
+            decode: false,
+            rows: Vec::new(),
+        })?
+        .len();
+        let row = serde_json::to_vec(&RouteRow {
+            route: usize::MAX,
+            row: RowId {
+                session: u64::MAX,
+                token: u64::MAX,
+            },
+            expert: usize::MAX,
+        })?
+        .len();
+        let metadata = product(&[self.limits.routes, row + 1])?;
+        let payload = product(&[self.limits.routes, self.hidden, 4])?;
+        header
+            .checked_add(metadata - 1)
+            .and_then(|size| size.checked_add(payload))
+            .and_then(|size| size.checked_add(4))
+            .context("frame bound overflow")
     }
 
     fn scratch_reservation(&self) -> Result<usize> {
@@ -281,14 +311,12 @@ impl ExpertSet {
         mmap: Option<&Arc<Mmap>>,
     ) -> Result<Self> {
         ensure!(owner < placement.owner_count(), "unknown owner");
-        let actual = Placement::from_gguf(
-            path,
-            placement.layer,
-            placement.owners.clone(),
-            placement.limits.clone(),
-        )?;
-        ensure!(actual == placement, "model identity mismatch");
         let mut file = File::open(path)?;
+        ensure!(
+            digest(&mut file)? == placement.model_sha256,
+            "model identity mismatch"
+        );
+        file.rewind()?;
         if let Some(mmap) = mmap {
             let size = file.metadata()?.len() as usize;
             ensure!(mmap.len() >= size, "mapping truncated");
@@ -346,6 +374,7 @@ impl ExpertSet {
         let mut channel = channel(stream, key, job, self.owner, false, &self.placement)?;
         let mut sequence = 0u64;
         loop {
+            channel.wait_for_frame()?;
             let bytes = channel.receive()?;
             let (request, values): (Message, _) = decode(&bytes, &self.placement)?;
             ensure!(
@@ -368,36 +397,59 @@ impl ExpertSet {
                 request.rows.len() * self.placement.hidden == values.len(),
                 "input shape mismatch"
             );
-            let mut output = Vec::with_capacity(values.len());
-            let mut start = 0;
-            while start < request.rows.len() {
-                let expert = request.rows[start].expert;
-                let mut end = start + 1;
-                while !request.decode
-                    && end < request.rows.len()
-                    && request.rows[end].expert == expert
-                {
-                    end += 1;
-                }
-                let input = Tensor::from_slice(
-                    &values[start * self.placement.hidden..end * self.placement.hidden],
-                    (end - start, self.placement.hidden),
-                    &Device::Cpu,
-                )?;
-                output.extend(
-                    self.experts
-                        .get(&expert)
-                        .context("unowned expert")?
-                        .forward(&input)?
-                        .flatten_all()?
-                        .to_vec1::<f32>()?,
-                );
-                start = end;
-            }
+            let output = execute_rows(&self.experts, &request, &values, self.placement.hidden)?;
             channel.send(encode(&request, &output, &self.placement)?)?;
             sequence = sequence.checked_add(1).context("forward exhausted")?;
         }
     }
+}
+
+fn execute_rows<E: Expert>(
+    experts: &BTreeMap<usize, E>,
+    request: &Message,
+    values: &[f32],
+    hidden: usize,
+) -> Result<Vec<f32>> {
+    let decode_input = if request.decode && !values.is_empty() {
+        let activation = &values[..hidden];
+        ensure!(
+            values.chunks_exact(hidden).all(|row| row
+                .iter()
+                .zip(activation)
+                .all(|(value, reference)| value.to_bits() == reference.to_bits())),
+            "inconsistent decode activations"
+        );
+        Some(Tensor::from_slice(activation, (1, hidden), &Device::Cpu)?)
+    } else {
+        None
+    };
+    let mut output = Vec::with_capacity(values.len());
+    let mut start = 0;
+    while start < request.rows.len() {
+        let expert = request.rows[start].expert;
+        let mut end = start + 1;
+        while !request.decode && end < request.rows.len() && request.rows[end].expert == expert {
+            end += 1;
+        }
+        let input = match &decode_input {
+            Some(input) => input.clone(),
+            None => Tensor::from_slice(
+                &values[start * hidden..end * hidden],
+                (end - start, hidden),
+                &Device::Cpu,
+            )?,
+        };
+        output.extend(
+            experts
+                .get(&expert)
+                .context("unowned expert")?
+                .forward(&input)?
+                .flatten_all()?
+                .to_vec1::<f32>()?,
+        );
+        start = end;
+    }
+    Ok(output)
 }
 
 fn channel(
@@ -812,6 +864,100 @@ mod tests {
                 expert: 0,
             }],
         }
+    }
+
+    #[test]
+    fn frame_reservation_covers_maximal_payload_and_metadata() {
+        let mut placement = placement(vec![0]);
+        let reservation = placement.frame_reservation().unwrap();
+        placement.limits.frame_bytes = reservation;
+        let request = Message {
+            identity: [u8::MAX; 32],
+            forward: u64::MAX,
+            decode: false,
+            rows: vec![
+                RouteRow {
+                    route: usize::MAX,
+                    row: RowId {
+                        session: u64::MAX,
+                        token: u64::MAX
+                    },
+                    expert: usize::MAX,
+                };
+                placement.limits.routes
+            ],
+        };
+        let values = vec![0f32; placement.hidden * placement.limits.routes];
+        let bytes = encode(&request, &values, &placement).unwrap();
+        assert_eq!(bytes.len(), reservation);
+        assert_eq!(decode(&bytes, &placement).unwrap().1, values);
+        placement.limits.frame_bytes -= 1;
+        assert!(encode(&request, &values, &placement).is_err());
+    }
+
+    #[test]
+    fn decode_routes_share_one_input_tensor_and_reject_inconsistent_rows() {
+        use std::sync::Mutex;
+
+        struct ObservedExpert(Arc<Mutex<Vec<Tensor>>>);
+        impl Expert for ObservedExpert {
+            fn forward(&self, input: &Tensor) -> candle_core::Result<Tensor> {
+                self.0.lock().unwrap().push(input.clone());
+                Ok(input.clone())
+            }
+        }
+        let placement = placement(vec![0, 0]);
+        let mut request = message(&placement);
+        request.rows.push(RouteRow {
+            route: 1,
+            ..request.rows[0].clone()
+        });
+        request.rows.push(RouteRow {
+            route: 2,
+            expert: 1,
+            ..request.rows[0].clone()
+        });
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let experts = BTreeMap::from([
+            (0, ObservedExpert(observed.clone())),
+            (1, ObservedExpert(observed.clone())),
+        ]);
+        let values = [1f32, 2., 1., 2., 1., 2.];
+        assert_eq!(
+            execute_rows(&experts, &request, &values, 2).unwrap(),
+            values
+        );
+        let inputs = observed.lock().unwrap();
+        assert_eq!(inputs.len(), 3);
+        assert!(inputs.iter().all(|input| input.id() == inputs[0].id()));
+        drop(inputs);
+        let inconsistent = [1f32, 2., 3., 4., 1., 2.];
+        assert!(execute_rows(&experts, &request, &inconsistent, 2).is_err());
+    }
+
+    #[test]
+    fn partial_frame_still_has_a_receive_deadline() {
+        use std::io::Write;
+
+        let mut placement = placement(vec![0]);
+        placement.limits.timeout_ms = 100;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = ExpertSet {
+            placement,
+            owner: 0,
+            experts: BTreeMap::new(),
+        };
+        let handle =
+            thread::spawn(move || worker.serve(listener.accept().unwrap().0, Uuid::new_v4(), KEY));
+        let mut stream = TcpStream::connect(address).unwrap();
+        stream.write_all(&[0]).unwrap();
+        let error = handle.join().unwrap().unwrap_err();
+        let error = error.downcast_ref::<std::io::Error>().unwrap();
+        assert!(matches!(
+            error.kind(),
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+        ));
     }
 
     #[test]
