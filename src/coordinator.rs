@@ -148,6 +148,9 @@ pub struct WorkerInfo {
 pub struct ModelSlots {
     /// The model's id.
     pub id: String,
+    /// This model's loaded context window; absent on older workers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub n_ctx: Option<u32>,
     /// Admission cap for this model's requests.
     pub max_concurrency: usize,
     /// This model's requests executing now, from every client.
@@ -184,7 +187,15 @@ impl WorkerInfo {
 
     /// `model`'s own admission figures, when the worker reports them.
     fn slots_of(&self, model: Option<&str>) -> Option<&ModelSlots> {
-        model.and_then(|m| self.models.iter().find(|s| s.id == m))
+        let model = model.unwrap_or(&self.model);
+        self.models.iter().find(|s| s.id == model)
+    }
+
+    fn context_of(&self, model: &str) -> Option<u32> {
+        self.slots_of(Some(model))
+            .and_then(|slots| slots.n_ctx)
+            .or_else(|| (model == self.model).then_some(self.n_ctx))
+            .filter(|context| *context > 0)
     }
 }
 
@@ -292,6 +303,7 @@ struct Worker {
     dispatched: AtomicUsize,
     /// The same by requested model.
     dispatched_by_model: Mutex<HashMap<String, usize>>,
+    work_by_model: Mutex<HashMap<String, u64>>,
 }
 
 impl Worker {
@@ -315,6 +327,7 @@ impl Worker {
 /// Why no worker slot could be had.
 #[derive(Debug)]
 enum Reject {
+    ContextTooSmall,
     /// The request names a model no configured worker reports.
     UnknownModel(String, Vec<String>),
     /// Workers serve the model, but none is healthy.
@@ -341,14 +354,27 @@ struct SlotGuard {
     index: usize,
     /// The requested model, counted against its own admission figures.
     model: Option<String>,
+    work: u64,
 }
 
 impl Drop for SlotGuard {
     fn drop(&mut self) {
         let w = &self.coordinator.workers[self.index];
         if let Some(model) = &self.model {
-            if let Some(n) = w.by_model().get_mut(model) {
+            let mut counts = w.by_model();
+            if let Some(n) = counts.get_mut(model) {
                 *n = n.saturating_sub(1);
+                if *n == 0 {
+                    counts.remove(model);
+                }
+            }
+            drop(counts);
+            let mut work = w.work_by_model.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(total) = work.get_mut(model) {
+                *total = total.saturating_sub(self.work);
+                if *total == 0 {
+                    work.remove(model);
+                }
             }
         }
         w.dispatched.fetch_sub(1, Ordering::AcqRel);
@@ -429,13 +455,117 @@ enum FirstOutput {
     },
 }
 
-/// The one field the router reads from a request body.  Every other field
-/// is validated and skipped without being built, so routing a large prompt
-/// or embedding batch does not copy it into a JSON tree.
-#[derive(Deserialize)]
-struct Envelope {
-    #[serde(default)]
+/// Borrow prompt JSON without decoding strings or constructing a JSON tree.
+#[derive(Default)]
+struct Envelope<'a> {
     model: Option<String>,
+    messages: Option<&'a serde_json::value::RawValue>,
+    prompt: Option<&'a serde_json::value::RawValue>,
+    input: Option<&'a serde_json::value::RawValue>,
+    max_tokens: Option<&'a serde_json::value::RawValue>,
+    max_completion_tokens: Option<&'a serde_json::value::RawValue>,
+    context_window: Option<&'a serde_json::value::RawValue>,
+    num_ctx: Option<&'a serde_json::value::RawValue>,
+    n_ctx: Option<&'a serde_json::value::RawValue>,
+}
+
+impl<'de> Deserialize<'de> for Envelope<'de> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(field_identifier, rename_all = "snake_case")]
+        enum Field {
+            Model, Messages, Prompt, Input, MaxTokens, MaxCompletionTokens,
+            ContextWindow, NumCtx, NCtx,
+            #[serde(other)]
+            Ignore,
+        }
+
+        struct EnvelopeVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for EnvelopeVisitor {
+            type Value = Envelope<'de>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a request object")
+            }
+
+            fn visit_map<M: serde::de::MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
+                let mut envelope = Envelope::default();
+                let mut seen_model = false;
+                while let Some(field) = map.next_key::<Field>()? {
+                    let target = match field {
+                        Field::Model => {
+                            if seen_model {
+                                return Err(serde::de::Error::duplicate_field("model"));
+                            }
+                            seen_model = true;
+                            envelope.model = map.next_value()?;
+                            continue;
+                        }
+                        Field::Messages => &mut envelope.messages,
+                        Field::Prompt => &mut envelope.prompt,
+                        Field::Input => &mut envelope.input,
+                        Field::MaxTokens => &mut envelope.max_tokens,
+                        Field::MaxCompletionTokens => &mut envelope.max_completion_tokens,
+                        Field::ContextWindow => &mut envelope.context_window,
+                        Field::NumCtx => &mut envelope.num_ctx,
+                        Field::NCtx => &mut envelope.n_ctx,
+                        Field::Ignore => {
+                            map.next_value::<serde::de::IgnoredAny>()?;
+                            continue;
+                        }
+                    };
+                    *target = map.next_value()?;
+                }
+                Ok(envelope)
+            }
+        }
+
+        deserializer.deserialize_map(EnvelopeVisitor)
+    }
+}
+
+#[derive(Default)]
+struct RequestWork {
+    context: Option<u32>,
+    /// Capped scheduling hints, not a token count or an execution-time bound.
+    units: u64,
+}
+
+impl Envelope<'_> {
+    fn work(&self, path: &str) -> RequestWork {
+        let chat = path == "/v1/chat/completions";
+        let input = match path {
+            "/v1/chat/completions" => self.messages,
+            "/v1/completions" => self.prompt,
+            _ => self.input,
+        };
+        let output = if chat {
+            self.max_completion_tokens.or(self.max_tokens)
+        } else if path == "/v1/completions" {
+            self.max_tokens
+        } else {
+            None
+        };
+        let output = output.and_then(|raw| serde_json::from_str::<u32>(raw.get()).ok());
+        RequestWork {
+            context: if chat {
+                self.context_window
+                    .or(self.num_ctx)
+                    .or(self.n_ctx)
+                    .and_then(|raw| serde_json::from_str::<u32>(raw.get()).ok())
+                    .filter(|context| *context > 0)
+            } else {
+                None
+            },
+            units: (input.map_or(0, |raw| raw.get().len()) as u64)
+                .saturating_add(
+                    u64::from(output.unwrap_or(if path == "/v1/embeddings" { 0 } else { 256 }))
+                        .saturating_mul(4),
+                )
+                .clamp(1, 1 << 24),
+        }
+    }
 }
 
 impl Coordinator {
@@ -459,6 +589,7 @@ impl Coordinator {
                 status: Mutex::new(WorkerStatus::default()),
                 dispatched: AtomicUsize::new(0),
                 dispatched_by_model: Mutex::new(HashMap::new()),
+                work_by_model: Mutex::new(HashMap::new()),
             });
         }
         Ok(Arc::new(Self {
@@ -606,32 +737,58 @@ impl Coordinator {
             .unwrap_or_else(|_| Err("worker info probe timed out".to_string()))
     }
 
-    /// Reserve the least-loaded healthy worker that serves `model` on
-    /// `path`, skipping `exclude`.
-    fn try_pick(self: &Arc<Self>, path: &str, model: Option<&str>, exclude: &[usize]) -> Pick {
+    /// Reserve a context-compatible healthy worker by outstanding work per
+    /// slot, skipping `exclude`.
+    fn try_pick(
+        self: &Arc<Self>,
+        path: &str,
+        model: Option<&str>,
+        work: &RequestWork,
+        exclude: &[usize],
+    ) -> Pick {
         let _lock = self.pick_lock.lock().unwrap_or_else(|p| p.into_inner());
         let n = self.workers.len();
         let start = self.rotation.fetch_add(1, Ordering::Relaxed) % n;
         let mut model_known = false;
         let mut any_eligible = false;
         let mut any_excluded = false;
-        // (index, load ratio, load)
-        let mut best: Option<(usize, f64, usize)> = None;
+        let mut context_mismatch = false;
+        let mut context_possible = false;
+        let mut best: Option<(usize, String, bool, f64, usize)> = None;
         for k in 0..n {
             let i = (start + k) % n;
             let w = &self.workers[i];
             let st = w.status();
             let Some(info) = st.info.as_ref() else {
+                context_possible = true;
                 continue;
             };
-            let own = info.slots_of(model);
-            if model.is_some_and(|m| !info.model_ids().any(|id| id == m))
+            let own = if path == TRANSCRIPTIONS_PATH {
+                None
+            } else {
+                info.slots_of(model)
+            };
+            if (path != TRANSCRIPTIONS_PATH
+                && model.is_none()
+                && info.models.iter().any(|slots| slots.id != info.model))
+                || model.is_some_and(|m| !info.model_ids().any(|id| id == m))
                 || !info.capabilities.serves(path)
                 || (path == "/v1/embeddings" && own.is_some_and(|s| !s.embeddings))
             {
                 continue;
             }
             model_known = true;
+            let selected_model = model.unwrap_or(&info.model);
+            let context = info.context_of(selected_model);
+            if work
+                .context
+                .zip(context)
+                .is_some_and(|(needed, available)| needed > available)
+            {
+                context_mismatch = true;
+                continue;
+            }
+            context_possible = true;
             if !st.healthy {
                 continue;
             }
@@ -664,21 +821,53 @@ impl Coordinator {
             if load >= slots {
                 continue;
             }
-            let ratio = load as f64 / slots as f64;
-            if best.is_none_or(|(_, r, l)| ratio < r || (ratio == r && load < l)) {
-                best = Some((i, ratio, load));
+            let local_work = w
+                .work_by_model
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(selected_model)
+                .copied()
+                .unwrap_or(0);
+            let external = if own.is_some() {
+                st.external_by_model
+                    .get(selected_model)
+                    .copied()
+                    .unwrap_or(0)
+            } else {
+                st.external_in_flight
+            };
+            let ratio = if path == TRANSCRIPTIONS_PATH {
+                load as f64 / slots as f64
+            } else {
+                (local_work
+                    .saturating_add((external as u64).saturating_mul(work.units))
+                    .saturating_add(work.units)) as f64
+                    / slots as f64
+            };
+            let unknown_context = work.context.is_some() && context.is_none();
+            if best.as_ref().is_none_or(|(_, _, unknown, score, count)| {
+                (unknown_context, ratio, load) < (*unknown, *score, *count)
+            }) {
+                best = Some((i, selected_model.to_string(), unknown_context, ratio, load));
             }
         }
-        if let Some((index, _, _)) = best {
+        if let Some((index, selected_model, _, _, _)) = best {
             let w = &self.workers[index];
             w.dispatched.fetch_add(1, Ordering::AcqRel);
-            if let Some(m) = model {
-                *w.by_model().entry(m.to_string()).or_default() += 1;
+            let model = (path != TRANSCRIPTIONS_PATH).then_some(selected_model);
+            if let Some(model) = &model {
+                *w.by_model().entry(model.clone()).or_default() += 1;
+                *w.work_by_model
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .entry(model.clone())
+                    .or_default() += work.units;
             }
             return Pick::Slot(SlotGuard {
                 coordinator: Arc::clone(self),
                 index,
-                model: model.map(str::to_string),
+                model,
+                work: work.units,
             });
         }
         if any_eligible {
@@ -686,6 +875,9 @@ impl Coordinator {
         }
         if any_excluded {
             return Pick::Reject(Reject::Exhausted);
+        }
+        if context_mismatch && !context_possible {
+            return Pick::Reject(Reject::ContextTooSmall);
         }
         if !model_known {
             if let Some(m) = model {
@@ -704,9 +896,10 @@ impl Coordinator {
         self: &Arc<Self>,
         path: &str,
         model: Option<&str>,
+        work: &RequestWork,
         exclude: &[usize],
     ) -> Result<SlotGuard, Reject> {
-        match self.try_pick(path, model, exclude) {
+        match self.try_pick(path, model, work, exclude) {
             Pick::Slot(slot) => return Ok(slot),
             Pick::Reject(r) => return Err(r),
             Pick::Busy => {}
@@ -723,7 +916,7 @@ impl Coordinator {
             let notified = self.released.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            match self.try_pick(path, model, exclude) {
+            match self.try_pick(path, model, work, exclude) {
                 Pick::Slot(slot) => return Ok(slot),
                 Pick::Reject(r) => return Err(r),
                 Pick::Busy => {}
@@ -1031,15 +1224,18 @@ impl Coordinator {
         } else {
             None
         };
-        let model = if path == TRANSCRIPTIONS_PATH {
+        let (model, work) = if path == TRANSCRIPTIONS_PATH {
             // A transcription body is a multipart upload, not JSON, so there
             // is no `model` field to read and no JSON to validate.  The
             // worker's advertised `transcriptions` capability is the only
             // routing constraint (#157).
-            None
+            (None, RequestWork::default())
         } else {
             match serde_json::from_slice::<Envelope>(&body) {
-                Ok(envelope) => envelope.model.filter(|m| !m.is_empty()),
+                Ok(envelope) => {
+                    let work = envelope.work(path);
+                    (envelope.model.filter(|m| !m.is_empty()), work)
+                }
                 Err(e) => {
                     return with_request_id(
                         error_response(
@@ -1058,7 +1254,7 @@ impl Coordinator {
         let mut tried: Vec<usize> = Vec::new();
         let mut last_admission_only = true;
         loop {
-            let slot = match self.acquire(path, model.as_deref(), &tried).await {
+            let slot = match self.acquire(path, model.as_deref(), &work, &tried).await {
                 Ok(slot) => slot,
                 Err(reject) => {
                     // Once attempts were made, "no worker left" is about
@@ -1307,6 +1503,12 @@ fn error_response(status: StatusCode, message: &str, kind: &str, code: Option<&s
 
 fn reject_response(reject: Reject) -> Response {
     match reject {
+        Reject::ContextTooSmall => error_response(
+            StatusCode::BAD_REQUEST,
+            "requested context_window exceeds every matching worker's loaded context",
+            "invalid_request_error",
+            Some("context_window_exceeded"),
+        ),
         Reject::UnknownModel(model, available) => error_response(
             StatusCode::NOT_FOUND,
             &format!(
@@ -1558,15 +1760,63 @@ mod tests {
     }
 
     #[test]
-    fn the_routing_envelope_reads_only_the_model() {
+    fn the_routing_envelope_borrows_prompt_json_and_bounds_work_hints() {
         let body = br#"{"messages":[{"role":"user","content":"x"}],"model":"m","stream":true}"#;
         let e: Envelope = serde_json::from_slice(body).unwrap();
         assert_eq!(e.model.as_deref(), Some("m"));
+        let messages = e.messages.unwrap().get().as_ptr() as usize;
+        assert!((body.as_ptr() as usize..body.as_ptr() as usize + body.len()).contains(&messages));
         let e: Envelope = serde_json::from_slice(br#"{"model":null}"#).unwrap();
         assert!(e.model.is_none());
         let e: Envelope = serde_json::from_slice(br#"{"model":"a\u0062"}"#).unwrap();
         assert_eq!(e.model.as_deref(), Some("ab"));
         assert!(serde_json::from_slice::<Envelope>(b"{nope").is_err());
+        let e: Envelope = serde_json::from_slice(
+            br#"{"max_tokens":4294967295,"max_completion_tokens":1,"n_ctx":512}"#,
+        )
+        .unwrap();
+        let chat = e.work("/v1/chat/completions");
+        assert_eq!(chat.units, 4);
+        assert_eq!(chat.context, Some(512));
+        let completion = e.work("/v1/completions");
+        assert_eq!(completion.units, 1 << 24);
+        assert_eq!(completion.context, None);
+        let e: Envelope =
+            serde_json::from_slice(br#"{"context_window":"invalid","max_tokens":{}}"#).unwrap();
+        assert_eq!(e.work("/v1/chat/completions").context, None);
+    }
+
+    #[test]
+    fn routing_hints_use_last_duplicate_values_without_rewriting_the_body() {
+        let body = br#"{"model":"m","prompt":"old","prompt":"new","input":[],"input":[1,2],"max_tokens":1,"max_tokens":100,"unknown":{},"unknown":[]}"#;
+        let envelope: Envelope = serde_json::from_slice(body).unwrap();
+        assert_eq!(envelope.prompt.unwrap().get(), "\"new\"");
+        assert_eq!(envelope.input.unwrap().get(), "[1,2]");
+        assert_eq!(envelope.work("/v1/completions").units, 405);
+        let escaped: Envelope = serde_json::from_slice(br#"{"pro\u006dpt":"last"}"#).unwrap();
+        assert_eq!(escaped.prompt.unwrap().get(), "\"last\"");
+        assert!(serde_json::from_slice::<Envelope>(br#"{"model":null,"model":"m"}"#).is_err());
+    }
+
+    #[test]
+    fn null_output_budget_uses_the_legacy_fallback() {
+        #[derive(Deserialize)]
+        struct OriginalBudget<'a> {
+            #[serde(borrow)]
+            max_completion_tokens: Option<&'a serde_json::value::RawValue>,
+        }
+        let original: OriginalBudget = serde_json::from_slice(
+            br#"{"max_completion_tokens":null}"#,
+        ).unwrap();
+        assert!(original.max_completion_tokens.is_none());
+        let envelope: Envelope = serde_json::from_slice(
+            br#"{"max_completion_tokens":null,"max_tokens":4096}"#,
+        ).unwrap();
+        assert_eq!(envelope.work("/v1/chat/completions").units, 4096 * 4);
+        let envelope: Envelope = serde_json::from_slice(
+            br#"{"max_completion_tokens":7,"max_tokens":4096}"#,
+        ).unwrap();
+        assert_eq!(envelope.work("/v1/chat/completions").units, 7 * 4);
     }
 
     #[test]

@@ -104,10 +104,16 @@ async fn a_server_without_a_model_loads_and_unloads_through_the_api() {
         &app,
         "POST",
         "/v1/models/load",
-        serde_json::json!({"model": "tiny.gguf", "id": "second"}),
+        serde_json::json!({"model": "tiny.gguf", "id": "second", "n_ctx": 128}),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, info) = call(&app, "GET", "/v1/worker/info", serde_json::Value::Null).await;
+    assert_eq!(status, StatusCode::OK, "{info}");
+    assert_eq!(info["n_ctx"], 64);
+    assert_eq!(info["models"][0]["n_ctx"], 64);
+    assert_eq!(info["models"][1]["n_ctx"], 128);
 
     let (_, body) = call(&app, "GET", "/v1/models", serde_json::Value::Null).await;
     let ids: Vec<_> = body["data"]

@@ -619,8 +619,11 @@ joshua route --worker 10.0.0.2:8081,10.0.0.3:8082 \
 ```
 
 Requests are matched to workers by their `model` field (no `model` = any
-worker; an unknown model is a `404 model_not_found`) and go to the least
-loaded healthy worker with a free slot.  When every slot is busy, requests
+single-model worker; an unknown model is a `404 model_not_found`) and go to a
+healthy worker with a free model slot, ranked by bounded outstanding-work
+hints. Explicit chat context windows must fit the selected model's advertised
+window when known; prompt bytes are not treated as exact tokens. When every
+fitting slot is busy, requests
 wait in a bounded queue (`--queue-depth`, `--queue-timeout-ms`); a full queue
 answers `429` and a timed-out wait `503`, both with `Retry-After`.  Streams
 are forwarded event by event, in order; a request is retried on another
