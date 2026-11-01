@@ -218,10 +218,10 @@ pub fn repeat_kv(x: Tensor, n_rep: usize) -> Result<Tensor> {
 /// of re-copying the whole accumulated context the way a `Tensor::cat`
 /// append did — O(seq_total) per step, O(T²) over a generation.
 ///
-/// The matmuls consume the transposed `narrow` views directly (the gemm
-/// backends accept row-major and transposed operand strides), and the
-/// buffers grow geometrically, so a generation pays the O(T) total of the
-/// doubling copies instead of O(T²).
+/// The matmuls consume the `narrow` views directly (keys transposed; values
+/// as stored on the CPU, transposed on accelerators; the gemm backends
+/// accept either stride order), and the buffers grow geometrically, so a
+/// generation pays the O(T) total of the doubling copies instead of O(T²).
 ///
 /// Clones share the `Arc`-backed buffers: a clone is a read-only snapshot
 /// only while nobody appends to it.  Appending to any clone rewrites rows
@@ -230,8 +230,8 @@ pub fn repeat_kv(x: Tensor, n_rep: usize) -> Result<Tensor> {
 /// fresh caches, never by cloning; the loaders never clone layer state.
 #[derive(Clone)]
 pub struct SeqKvCache {
-    k: Tensor, // [b, n_kv, dk, cap]
-    v: Tensor, // [b, n_kv, dv, cap]
+    k: Tensor, // [b, n_kv, cap, dk]
+    v: Tensor, // [b, n_kv, cap, dv]
     len: usize,
 }
 
@@ -317,17 +317,18 @@ pub fn tensor_bytes(t: &Tensor) -> u64 {
 /// * `q`: `[b, n_head, seq, dk]`
 /// * `k_new`: `[b, n_kv, seq, dk]`, `v_new`: `[b, n_kv, seq, dv]` (head
 ///   layout; the cache stores the same rows and attention reads them
-///   through transposed views)
+///   through views, without copying)
 ///
 /// `n_head` must be a multiple of `n_kv`; query head `h` reads KV head
 /// `h / (n_head / n_kv)`.  Returns the attention context
 /// `[b, seq, n_head * dv]`, ready for the output projection.
 ///
 /// The cache lives head-major so an append is one contiguous run per head;
-/// `q · k_cacheᵀ` and `v_cache · probsᵀ` read the cached rows through their
-/// transposed views, whose strides the gemm backends take directly.  Grouped
-/// query heads are folded into the row dimension of their KV head instead of
-/// repeating K/V per query head.
+/// `q · k_cacheᵀ` reads the cached keys through a transposed view and the
+/// context step reads the cached values in place (`probs · v` on the CPU,
+/// `vᵀ · probsᵀ` on accelerators), strides the gemm backends take
+/// directly.  Grouped query heads are folded into the row dimension of their
+/// KV head instead of repeating K/V per query head.
 pub fn cached_attention(
     kv_cache: &mut KvCache,
     q: &Tensor,
@@ -347,11 +348,11 @@ pub fn cached_attention(
     let cache = kv_cache.as_mut().expect("cache just built");
     cache.append(&k_new, &v_new)?;
     let seq_total = cache.len;
-    // Transposed views over the cached rows: [b, n_kv, dk, seq_total] and
-    // [b, n_kv, dv, seq_total].  The gemm backends take these strides
-    // directly, so no copy of the cached context is made here.
+    // Views over the cached rows: keys transposed to [b, n_kv, dk, seq_total],
+    // values as stored, [b, n_kv, seq_total, dv].  The gemm backends take
+    // these strides directly, so no copy of the cached context is made here.
     let k_cache = cache.k.narrow(2, 0, seq_total)?.transpose(2, 3)?;
-    let v_cache = cache.v.narrow(2, 0, seq_total)?.transpose(2, 3)?;
+    let v_rows = cache.v.narrow(2, 0, seq_total)?;
 
     // Scaled dot-product attention over the whole cached context.
     let q = q.contiguous()?.reshape((b, n_kv, rep * seq_len, dk))?;
@@ -363,6 +364,24 @@ pub fn cached_attention(
     crate::activation_trace::record("attn-scores", &scores)?;
     let probs = softmax_last_dim(&scores)?.reshape((b, n_kv, rep * seq_len, seq_total))?;
     crate::activation_trace::record("attn-probs", &probs)?;
+    if probs.device().is_cpu() {
+        // probs · v straight from the cached rows.  The context comes out
+        // with dv innermost, so there is no transposed copy of probs (a
+        // single-threaded strided gather the size of the scores, every layer
+        // and chunk) and the final permute moves whole dv rows.  gemm runs
+        // this and the vᵀ · probsᵀ form below as the same FMA chain over
+        // seq_total per output, so the context is bit-identical.
+        return probs
+            .matmul(&v_rows)? // [b, n_kv, rep*seq, dv]
+            .reshape((b, n_kv, rep, seq_len, dv))?
+            .permute((0, 3, 1, 2, 4))? // [b, seq, n_kv, rep, dv]
+            .contiguous()?
+            .reshape((b, seq_len, n_head * dv));
+    }
+    // Accelerators keep this form: their transposed copy is a device kernel
+    // rather than the CPU gather above, and other operand layouts could
+    // change their kernels' summation order.
+    let v_cache = v_rows.transpose(2, 3)?; // [b, n_kv, dv, seq_total]
     let ctx = v_cache.matmul(&probs.transpose(2, 3)?.contiguous()?)?; // [b, n_kv, dv, rep*seq]
     ctx.reshape((b, n_kv, dv, rep, seq_len))?
         .permute((0, 4, 1, 3, 2))? // [b, seq, n_kv, rep, dv]
@@ -746,6 +765,99 @@ mod tests {
             "the cache keeps the un-repeated KV heads in preallocated buffers"
         );
         assert_eq!(cache.v.dims(), &[b, n_kv, KV_CACHE_MIN_CAP, dv]);
+        Ok(())
+    }
+
+    /// The CPU context step (`probs · v` from the cached rows) must equal the
+    /// `vᵀ · probsᵀ` form accelerators run bit for bit, over chunked
+    /// prefill and decode through a cache that grows.  The shapes cover each
+    /// way gemm dispatches the product: single-row decode (gemv), contexts
+    /// of one or two positions (k ≤ 2), small and large tiles, contexts long
+    /// enough to split the reduction into k blocks, dk ≠ dv, and a batch of
+    /// two (the batch stride gemm skips between products).
+    ///
+    /// The identity rests on gemm's internals: it runs both forms as one
+    /// column-major problem whose k blocking depends only on k and the
+    /// kernel shape.  If this fails after a gemm or candle upgrade, the CPU
+    /// `probs · v` branch no longer matches the accelerator form: re-justify
+    /// that branch or remove it.  Do not relax this test to a tolerance.
+    #[test]
+    fn cpu_context_is_bit_identical_to_transposed_probs_form() -> Result<()> {
+        let dev = Device::Cpu;
+        let bits = |t: &Tensor| -> Result<Vec<u32>> {
+            Ok(t.flatten_all()?
+                .to_vec1::<f32>()?
+                .iter()
+                .map(|x| x.to_bits())
+                .collect())
+        };
+        // (b, n_head, n_kv, dk, dv, chunk lengths); a chunk of 1 is a decode
+        // step.
+        let cases: [(usize, usize, usize, usize, usize, &[usize]); 7] = [
+            (1, 4, 4, 64, 64, &[3, 1, 2, 1]),
+            (1, 16, 8, 128, 128, &[5, 1, 70, 1]),
+            (1, 32, 2, 64, 96, &[1, 1, 1, 9]),
+            (1, 8, 1, 192, 128, &[7, 1]),
+            (1, 4, 2, 64, 128, &[520, 600, 1]),
+            (1, 4, 2, 64, 64, &[600, 16, 1]),
+            (2, 8, 2, 64, 96, &[1, 40, 1, 600, 1]),
+        ];
+        let scale = 0.125;
+        for (b, n_head, n_kv, dk, dv, chunks) in cases {
+            let rep = n_head / n_kv;
+            let total: usize = chunks.iter().sum();
+            let fill = |shape: (usize, usize, usize, usize), salt: f32| -> Result<Tensor> {
+                let n = shape.0 * shape.1 * shape.2 * shape.3;
+                let data: Vec<f32> = (0..n).map(|i| (i as f32 * 0.7 + salt).sin()).collect();
+                Tensor::from_vec(data, shape, &dev)
+            };
+            let q = fill((b, n_head, total, dk), 0.1)?;
+            let k = fill((b, n_kv, total, dk), 0.2)?;
+            let v = fill((b, n_kv, total, dv), 0.3)?;
+            let mut kv: KvCache = None;
+            let mut offset = 0;
+            for &seq in chunks {
+                let mask = if seq > 1 {
+                    Some(crate::moe::causal_mask(seq, offset, &dev)?)
+                } else {
+                    None
+                };
+                let q = q.narrow(2, offset, seq)?;
+                let got = cached_attention(
+                    &mut kv,
+                    &q,
+                    k.narrow(2, offset, seq)?,
+                    v.narrow(2, offset, seq)?,
+                    mask.as_ref(),
+                    scale,
+                )?;
+                offset += seq;
+
+                // The accelerator form over the same cache views and probs.
+                let cache = kv.as_ref().unwrap();
+                let k_cache = cache.k.narrow(2, 0, offset)?.transpose(2, 3)?;
+                let v_cache = cache.v.narrow(2, 0, offset)?.transpose(2, 3)?;
+                let q = q.contiguous()?.reshape((b, n_kv, rep * seq, dk))?;
+                let scores = (q.matmul(&k_cache)? * scale)?.reshape((b, n_head, seq, offset))?;
+                let scores = match &mask {
+                    Some(m) => scores.broadcast_add(m)?,
+                    None => scores,
+                };
+                let probs = softmax_last_dim(&scores)?.reshape((b, n_kv, rep * seq, offset))?;
+                let want = v_cache
+                    .matmul(&probs.transpose(2, 3)?.contiguous()?)?
+                    .reshape((b, n_kv, dv, rep, seq))?
+                    .permute((0, 4, 1, 3, 2))?
+                    .contiguous()?
+                    .reshape((b, seq, n_head * dv))?;
+                assert_eq!(got.dims(), want.dims());
+                assert!(
+                    bits(&got)? == bits(&want)?,
+                    "context differs: b {b}, n_head {n_head}, n_kv {n_kv}, dk {dk}, \
+                     dv {dv}, seq {seq}, seq_total {offset}"
+                );
+            }
+        }
         Ok(())
     }
 
