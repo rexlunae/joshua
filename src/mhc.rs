@@ -127,12 +127,14 @@ fn split_sinkhorn_with_scale(
 /// the result is bit-identical: rows through the same `vec_reduce_sum`
 /// candle's last-dim sum uses, columns accumulated top to bottom, and both
 /// as a sequential f64 sum under the precise policy (`precise::Rows`).
-/// `sum * 1.0 + eps` is `affine(1.0, eps)` written out.
+/// `sum * 1.0 + eps` is `affine(1.0, eps)` written out.  A matrix that
+/// carries a backward graph keeps the tensor path, which records it.
 fn normalize_comb(comb: &Tensor, hc: usize, iters: usize, eps: f64) -> Result<Tensor> {
     if matches!(hc, 1..=4)
         && comb.dtype() == candle_core::DType::F32
         && comb.device().is_cpu()
         && comb.is_contiguous()
+        && !comb.track_op()
     {
         use candle_core::cpu::kernels::VecOps;
 
@@ -211,6 +213,28 @@ mod sinkhorn_tests {
             comb = comb.broadcast_div(&crate::precise::sum_keepdim(&comb, 1)?.affine(1.0, eps)?)?;
         }
         Ok(comb)
+    }
+
+    #[test]
+    fn tracked_cpu_mixes_keep_their_gradient() -> Result<()> {
+        let dev = candle_core::Device::Cpu;
+        let hc = 2;
+        let mixes = candle_core::Var::from_tensor(&Tensor::new(
+            &[[0.3f32, -0.2, 0.1, 0.4, 0.7, -0.5, 0.2, 0.9]],
+            &dev,
+        )?)?;
+        let scale = Tensor::new(&[1.0f32, 1.0, 1.0], &dev)?;
+        let base = Tensor::zeros((2 + hc) * hc, candle_core::DType::F32, &dev)?;
+        let mix = split_sinkhorn(mixes.as_tensor(), &scale, &base, hc, 20, 1e-6)?;
+        assert!(mix.comb.track_op(), "comb must stay attached to the graph");
+        // A non-uniform weighting, so the loss is not invariant to the
+        // normalization and the gradient cannot vanish by symmetry.
+        let weights = Tensor::new(&[[[1.0f32, 2.0], [3.0, 4.0]]], &dev)?;
+        let grads = (mix.comb * weights)?.sum_all()?.backward()?;
+        let grad = grads.get(mixes.as_tensor()).expect("gradient for mixes");
+        let comb_part = grad.narrow(1, 2 * hc, hc * hc)?.abs()?.sum_all()?;
+        assert!(comb_part.to_scalar::<f32>()? > 0.0);
+        Ok(())
     }
 
     #[test]
