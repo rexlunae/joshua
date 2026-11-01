@@ -6955,11 +6955,21 @@ fn squeeze_batch_logits(logits: &Tensor) -> Result<Vec<f32>> {
         sorted_idx: Vec<usize>,
         /// Sorted copy of the penalty window, for occurrence counts.
         window: Vec<u32>,
+        /// Min-heap of the `top_k + 1` largest (probability, id) pairs.
+        heap: Vec<(f32, u32)>,
+        /// Ids of the top-k survivors after a sparse fill, ascending.
+        support: Vec<u32>,
+        /// Always take the dense path: the reference the sparse one must match.
+        #[cfg(test)]
+        dense_only: bool,
     }
 
     enum SamplingKind {
         Greedy(u32),
+        /// `probs` holds the normalized distribution.
         Probs,
+        /// As `Probs`, and every non-zero entry's id is in `support`.
+        Sparse,
     }
 
     impl SamplingWorkspace {
@@ -6973,8 +6983,14 @@ fn squeeze_batch_logits(logits: &Tensor) -> Result<Vec<f32>> {
             seed: u64,
             pos: u64,
         ) -> Result<u32> {
-            self.distribution(logits, opts, recent_tokens, mask, pos)?
-                .sample_at(seed, pos)
+            check_finite_logits(logits, pos)?;
+            match self.fill(logits, opts, recent_tokens, mask) {
+                SamplingKind::Greedy(token) => Ok(token),
+                SamplingKind::Probs => TokenDistRef::Probs(&self.probs).sample_at(seed, pos),
+                SamplingKind::Sparse => {
+                    crate::speculative::sample_support_at(&self.probs, &self.support, seed, pos)
+                }
+            }
         }
 
         fn distribution(
@@ -6985,14 +7001,10 @@ fn squeeze_batch_logits(logits: &Tensor) -> Result<Vec<f32>> {
             mask: Option<&SimpleVob>,
             pos: u64,
         ) -> Result<TokenDistRef<'_>> {
-            if let Some(id) = logits.iter().position(|logit| !logit.is_finite()) {
-                return Err(JoshuaError::Inference(format!(
-                    "non-finite logits at position {pos}, first at id {id}"
-                )));
-            }
+            check_finite_logits(logits, pos)?;
             Ok(match self.fill(logits, opts, recent_tokens, mask) {
                 SamplingKind::Greedy(token) => TokenDistRef::Greedy(token),
-                SamplingKind::Probs => TokenDistRef::Probs(&self.probs),
+                SamplingKind::Probs | SamplingKind::Sparse => TokenDistRef::Probs(&self.probs),
             })
         }
 
@@ -7080,6 +7092,32 @@ fn squeeze_batch_logits(logits: &Tensor) -> Result<Vec<f32>> {
                     .fold(f32::NEG_INFINITY, f32::max),
                 None => logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max),
             };
+
+            // Unmasked top-k leaves at most k non-zero entries.  Find them in
+            // the exponential pass and filter only them; anything the sparse
+            // path cannot reproduce exactly falls through to the dense one.
+            let k = opts.top_k as usize;
+            let sparse = mask.is_none() && k > 0 && k < logits.len() && k <= SPARSE_TOP_K_MAX;
+            #[cfg(test)]
+            let sparse = sparse && !self.dense_only;
+            if sparse
+                && fill_top_k(
+                    TopKBuffers {
+                        heap: &mut self.heap,
+                        support: &mut self.support,
+                        probs: &mut self.probs,
+                        sorted_idx: &mut self.sorted_idx,
+                    },
+                    logits,
+                    max_logit,
+                    inv_temp,
+                    k,
+                    opts,
+                )
+            {
+                return SamplingKind::Sparse;
+            }
+
             let probs = &mut self.probs;
             probs.clear();
             probs.extend(logits.iter().map(|&l| ((l - max_logit) * inv_temp).exp()));
@@ -7116,29 +7154,11 @@ fn squeeze_batch_logits(logits: &Tensor) -> Result<Vec<f32>> {
                 if sum > 0.0 {
                     // Top-k/min-p already zeroed the tail.  Sort only the
                     // survivors: with the default top-k this is a few dozen
-                    // entries instead of the whole vocabulary.  Token id
-                    // breaks equal-probability ties so the cut is stable.
+                    // entries instead of the whole vocabulary.
                     let sorted_idx = &mut self.sorted_idx;
                     sorted_idx.clear();
                     sorted_idx.extend((0..probs.len()).filter(|&i| probs[i] > 0.0));
-                    sorted_idx.sort_unstable_by(|&a, &b| {
-                        probs[b]
-                            .partial_cmp(&probs[a])
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                            .then_with(|| a.cmp(&b))
-                    });
-                    let mut cumsum = 0.0_f32;
-                    let mut cut_from = sorted_idx.len();
-                    for (rank, &idx) in sorted_idx.iter().enumerate() {
-                        cumsum += probs[idx] / sum;
-                        if cumsum > opts.top_p {
-                            cut_from = rank + 1;
-                            break;
-                        }
-                    }
-                    for &idx in sorted_idx.iter().skip(cut_from) {
-                        probs[idx] = 0.0;
-                    }
+                    cut_nucleus(probs, sorted_idx, sum, opts.top_p);
                 }
             }
 
@@ -7155,6 +7175,181 @@ fn squeeze_batch_logits(logits: &Tensor) -> Result<Vec<f32>> {
             SamplingKind::Probs
         }
     }
+
+/// The largest top-k [`fill_top_k`] handles.  Its heap and sorts grow with k
+/// while the dense selection does not; at a 152k vocabulary the sparse path
+/// is about 3x faster at k = 40, 2x at 1000 and slower past about 3000.
+const SPARSE_TOP_K_MAX: usize = 1024;
+
+/// The [`SamplingWorkspace`] buffers [`fill_top_k`] writes.  They travel
+/// apart from the workspace because the logits may borrow its penalty buffer.
+struct TopKBuffers<'a> {
+    heap: &'a mut Vec<(f32, u32)>,
+    support: &'a mut Vec<u32>,
+    probs: &'a mut Vec<f32>,
+    sorted_idx: &'a mut Vec<usize>,
+}
+
+/// The unmasked top-k path of [`SamplingWorkspace::fill`] without a
+/// vocabulary-wide pass after the exponentials.
+///
+/// The dense path keeps exactly the `k` largest probabilities unless the
+/// k-th and (k+1)-th are equal (it then sorts the whole vocabulary, whose
+/// tie order this must not guess) or a probability is not finite.  The one
+/// pass here computes every probability with the same expression and keeps
+/// the `k + 1` largest, so with no tie at the cut the survivors are the
+/// dense path's.  Min-p, top-p and the normalization then visit only the
+/// survivors, in ascending id order: a zeroed entry adds exactly nothing to
+/// a sequential sum, never passes a `> 0` test and stays zero under the
+/// min-p threshold and the division, so `probs` ends bit-identical to the
+/// dense result.  `support` lists the survivors for the draw.
+///
+/// Returns `false`, leaving `probs` unspecified, when the dense path must
+/// decide instead: a non-finite probability, a tie at the cut, or nothing
+/// left after the filters (the dense path's greedy fallback).
+fn fill_top_k(
+    bufs: TopKBuffers<'_>,
+    logits: &[f32],
+    max_logit: f32,
+    inv_temp: f32,
+    k: usize,
+    opts: &GenerationOptions,
+) -> bool {
+    let TopKBuffers {
+        heap,
+        support,
+        probs,
+        sorted_idx,
+    } = bufs;
+    let mut entries = logits
+        .iter()
+        .enumerate()
+        .map(|(i, &l)| (((l - max_logit) * inv_temp).exp(), i as u32));
+    // `k < logits.len()`, so the heap fills to `k + 1` entries.
+    heap.clear();
+    heap.extend(entries.by_ref().take(k + 1));
+    if heap.iter().any(|(p, _)| !p.is_finite()) {
+        return false;
+    }
+    for root in (0..heap.len() / 2).rev() {
+        sift_down(heap, root);
+    }
+    for (p, i) in entries {
+        if !p.is_finite() {
+            return false;
+        }
+        if p > heap[0].0 {
+            heap[0] = (p, i);
+            sift_down(heap, 0);
+        }
+    }
+    // Largest first; heap[k] is the largest probability the dense path drops.
+    heap.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+    if heap[k - 1].0 == heap[k].0 {
+        return false;
+    }
+    probs.clear();
+    probs.resize(logits.len(), 0.0);
+    support.clear();
+    for &(p, i) in &heap[..k] {
+        probs[i as usize] = p;
+        support.push(i);
+    }
+    support.sort_unstable();
+
+    // ── Min-p ─────────────────────────────────────────────────────────────────
+    if opts.min_p > 0.0 {
+        // The largest survivor is the vocabulary-wide maximum.
+        let threshold = heap[0].0 * opts.min_p;
+        for &i in support.iter() {
+            let p = &mut probs[i as usize];
+            if *p < threshold {
+                *p = 0.0;
+            }
+        }
+    }
+
+    // ── Top-p (nucleus) ───────────────────────────────────────────────────────
+    if opts.top_p < 1.0 && opts.top_p > 0.0 {
+        let sum: f32 = support.iter().map(|&i| probs[i as usize]).sum();
+        if sum > 0.0 {
+            sorted_idx.clear();
+            sorted_idx.extend(
+                support
+                    .iter()
+                    .map(|&i| i as usize)
+                    .filter(|&i| probs[i] > 0.0),
+            );
+            cut_nucleus(probs, sorted_idx, sum, opts.top_p);
+        }
+    }
+
+    // ── Normalise ─────────────────────────────────────────────────────────────
+    let total: f32 = support.iter().map(|&i| probs[i as usize]).sum();
+    if total <= 0.0 {
+        return false;
+    }
+    for &i in support.iter() {
+        probs[i as usize] /= total;
+    }
+    true
+}
+
+/// Restore the min-heap order (by probability) below `root`.
+fn sift_down(heap: &mut [(f32, u32)], mut root: usize) {
+    loop {
+        let left = 2 * root + 1;
+        if left >= heap.len() {
+            return;
+        }
+        let right = left + 1;
+        let child = if right < heap.len() && heap[right].0 < heap[left].0 {
+            right
+        } else {
+            left
+        };
+        if heap[child].0 >= heap[root].0 {
+            return;
+        }
+        heap.swap(child, root);
+        root = child;
+    }
+}
+
+/// Top-p: order the positive entries listed in `sorted_idx` by descending
+/// probability and zero all of them after the shortest prefix whose share
+/// of `sum` exceeds `top_p`.  Token id breaks equal-probability ties so the
+/// cut is stable.
+fn cut_nucleus(probs: &mut [f32], sorted_idx: &mut [usize], sum: f32, top_p: f32) {
+    sorted_idx.sort_unstable_by(|&a, &b| {
+        probs[b]
+            .partial_cmp(&probs[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.cmp(&b))
+    });
+    let mut cumsum = 0.0_f32;
+    let mut cut_from = sorted_idx.len();
+    for (rank, &idx) in sorted_idx.iter().enumerate() {
+        cumsum += probs[idx] / sum;
+        if cumsum > top_p {
+            cut_from = rank + 1;
+            break;
+        }
+    }
+    for &idx in sorted_idx.iter().skip(cut_from) {
+        probs[idx] = 0.0;
+    }
+}
+
+/// Reject non-finite logits before sampling at position `pos`.
+fn check_finite_logits(logits: &[f32], pos: u64) -> Result<()> {
+    match logits.iter().position(|logit| !logit.is_finite()) {
+        Some(id) => Err(JoshuaError::Inference(format!(
+            "non-finite logits at position {pos}, first at id {id}"
+        ))),
+        None => Ok(()),
+    }
+}
 
 /// Keep the top-k probabilities without fully ordering the vocabulary.
 /// A tied cutoff uses the original sort and input order to preserve its
@@ -7341,7 +7536,7 @@ mod tests {
         let mut workspace = SamplingWorkspace::default();
         match workspace.fill(logits, opts, recent, None) {
             SamplingKind::Greedy(t) => TokenDist::Greedy(t),
-            SamplingKind::Probs => TokenDist::Probs(workspace.probs),
+            SamplingKind::Probs | SamplingKind::Sparse => TokenDist::Probs(workspace.probs),
         }
     }
 
@@ -7518,7 +7713,7 @@ mod tests {
             };
             match SamplingWorkspace::default().fill(&logits, &opts, &recent, None) {
                 SamplingKind::Greedy(t) => t,
-                SamplingKind::Probs => panic!("temperature 0 is greedy"),
+                SamplingKind::Probs | SamplingKind::Sparse => panic!("temperature 0 is greedy"),
             }
         };
         assert_eq!(greedy(0.0, 0.0), 0, "no penalty: raw argmax");
@@ -7567,6 +7762,166 @@ mod tests {
         match (a.as_ref(), b.as_ref()) {
             (TokenDistRef::Probs(a), TokenDistRef::Probs(b)) => assert_eq!(a, b),
             _ => panic!("expected sampled distributions"),
+        }
+    }
+
+    /// A distribution's exact bit patterns.
+    fn dist_bits(dist: TokenDistRef<'_>) -> (Option<u32>, Vec<u32>) {
+        match dist {
+            TokenDistRef::Greedy(t) => (Some(t), Vec::new()),
+            TokenDistRef::Probs(p) => (None, p.iter().map(|x| x.to_bits()).collect()),
+        }
+    }
+
+    /// The sparse top-k path must reproduce the dense filters bit for bit:
+    /// the sampled token and every probability a verifier reads.
+    #[test]
+    fn sparse_top_k_matches_dense_sampling_bit_for_bit() {
+        use rand::{rngs::StdRng, Rng, SeedableRng};
+        let mut rng = StdRng::seed_from_u64(0x5eed);
+        // Both reused across sizes and options, as in a session.
+        let mut sparse = SamplingWorkspace::default();
+        let mut dense = SamplingWorkspace {
+            dense_only: true,
+            ..Default::default()
+        };
+        let (mut draws, mut sparse_draws) = (0, 0);
+        for round in 0..600 {
+            let vocab = [151_936, 1_000, 64, 50][round % 4];
+            // Smooth, coarsely quantized (exact ties at the cut), one
+            // dominant token, flat, and nearly flat logits.
+            let shape = round % 5;
+            let logits: Vec<f32> = (0..vocab)
+                .map(|_| match shape {
+                    0 => rng.gen_range(-12.0f32..18.0),
+                    1 => (rng.gen_range(-8.0f32..8.0) * 2.0).round() / 2.0,
+                    2 if rng.gen_bool(0.001) => 30.0,
+                    2 => rng.gen_range(-40.0..0.0),
+                    3 => 1.0,
+                    _ => rng.gen_range(-1e-3f32..1e-3),
+                })
+                .collect();
+            let v = vocab as i32;
+            let top_k = [0, 1, 2, 5, 40, 41, 100, 1024, v - 1, v, -1][rng.gen_range(0..11)];
+            let opts = GenerationOptions {
+                // 1e-40 makes `1 / temperature` infinite: non-finite
+                // probabilities.
+                temperature: [0.05f32, 0.3, 0.7, 1.0, 1.7, 1e-30, 1e-40][rng.gen_range(0..7)],
+                top_k,
+                top_p: [1.0f32, 0.9, 0.5, 0.0, 0.999][rng.gen_range(0..5)],
+                min_p: [0.0f32, 0.05, 0.5, 1.0, 2.0][rng.gen_range(0..5)],
+                repetition_penalty: [1.0f32, 1.1, 1.3][rng.gen_range(0..3)],
+                presence_penalty: [0.0f32, 0.5][rng.gen_range(0..2)],
+                frequency_penalty: [0.0f32, 0.25][rng.gen_range(0..2)],
+                ..Default::default()
+            };
+            let recent: Vec<u32> = (0..rng.gen_range(0..64))
+                .map(|_| rng.gen_range(0..vocab as u32))
+                .collect();
+            for pos in 0..3 {
+                let seed = rng.gen();
+                let what = format!("round {round}, pos {pos}, {opts:?}");
+                draws += 1;
+                if let SamplingKind::Sparse = sparse.fill(&logits, &opts, &recent, None) {
+                    sparse_draws += 1;
+                }
+                let token = |ws: &mut SamplingWorkspace| {
+                    ws.sample_at(&logits, &opts, &recent, None, seed, pos)
+                        .map_err(|e| e.to_string())
+                };
+                assert_eq!(token(&mut sparse), token(&mut dense), "{what}");
+                let bits = |ws: &mut SamplingWorkspace| {
+                    ws.distribution(&logits, &opts, &recent, None, pos)
+                        .map(dist_bits)
+                        .map_err(|e| e.to_string())
+                };
+                assert!(bits(&mut sparse) == bits(&mut dense), "{what}");
+            }
+        }
+        assert!(
+            sparse_draws > draws / 10,
+            "only {sparse_draws} of {draws} draws took the sparse path"
+        );
+    }
+
+    /// The sparse path leaves ties at the cut, non-finite probabilities and a
+    /// distribution its filters empty to the dense one.
+    #[test]
+    fn sparse_top_k_defers_ties_non_finite_and_empty_results() {
+        let opts = GenerationOptions {
+            temperature: 1.0,
+            top_k: 2,
+            top_p: 1.0,
+            min_p: 0.0,
+            repetition_penalty: 1.0,
+            ..Default::default()
+        };
+        let mut ws = SamplingWorkspace::default();
+        assert!(matches!(
+            ws.fill(&[3.0, 1.0, 2.0, 1.5], &opts, &[], None),
+            SamplingKind::Sparse
+        ));
+        assert_eq!(ws.support, [0, 2]);
+        // The second and third largest are equal.
+        assert!(matches!(
+            ws.fill(&[3.0, 1.0, 2.0, 2.0], &opts, &[], None),
+            SamplingKind::Probs
+        ));
+        // A NaN penalty makes one probability NaN after the heap is full.
+        let nan = GenerationOptions {
+            presence_penalty: f32::NAN,
+            ..opts.clone()
+        };
+        let logits = [3.0, 1.0, 2.0, 1.5, 0.5, 0.25];
+        assert!(!matches!(
+            ws.fill(&logits, &nan, &[5], None),
+            SamplingKind::Sparse
+        ));
+        // Min-p above 1 removes every survivor: greedy fallback.
+        let opts = GenerationOptions { min_p: 2.0, ..opts };
+        assert!(matches!(
+            ws.fill(&[3.0, 1.0, 2.0, 1.5], &opts, &[], None),
+            SamplingKind::Greedy(0)
+        ));
+    }
+
+    #[test]
+    #[ignore = "manual sampler benchmark; run release mode with --nocapture"]
+    fn bench_sparse_top_k_sampling() {
+        use rand::{rngs::StdRng, Rng, SeedableRng};
+        use std::{hint::black_box, time::Instant};
+        let mut rng = StdRng::seed_from_u64(9);
+        let logits: Vec<f32> = (0..151_936)
+            .map(|_| rng.gen_range(-12.0f32..18.0))
+            .collect();
+        let recent: Vec<u32> = (0..64).map(|_| rng.gen_range(0..151_936)).collect();
+        for top_k in [40, 1_000, 4_000] {
+            let opts = GenerationOptions {
+                top_k,
+                ..Default::default()
+            };
+            for dense_only in [true, false] {
+                let mut ws = SamplingWorkspace {
+                    dense_only,
+                    ..Default::default()
+                };
+                let mut sample = |pos| {
+                    ws.sample_at(black_box(&logits), &opts, &recent, None, 1, pos)
+                        .unwrap()
+                };
+                for pos in 0..5 {
+                    black_box(sample(pos));
+                }
+                let n = 200;
+                let start = Instant::now();
+                for pos in 0..n {
+                    black_box(sample(pos));
+                }
+                eprintln!(
+                    "top_k={top_k} dense_only={dense_only}: {:.1} us/token",
+                    start.elapsed().as_secs_f64() * 1e6 / n as f64
+                );
+            }
         }
     }
 
