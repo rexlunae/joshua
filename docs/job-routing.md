@@ -68,10 +68,23 @@ retain the merged #240 cooperative cancellation and asynchronous Whisper
 admission; individual Candle calls and whole-audio mel remain non-preemptible.
 No temporary payload files are created. Audio slots account for observed external
 Whisper work and explicit worker-wide caps without changing affinity scoring.
-Refresh subtracts this coordinator's audio reservations from reported audio
-occupancy separately from generation occupancy. Admission uses current local
-audio reservations plus the external audio snapshot, so a completed local job
-does not remain busy until the next probe. Sequential uploads rotate their
+An unsent reservation is not proof that this coordinator owns the worker's
+Whisper permit. Refresh therefore retains the entire observed audio count when
+ownership is ambiguous, separately from generation occupancy; it never subtracts
+local audio reservations from that count. Admission uses current local audio
+reservations plus this conservative observed snapshot. A reservation-completion
+epoch invalidates occupied snapshots taken before local release (including a
+probe still in flight at release). New and queued acquisitions re-probe these
+snapshots on demand before selecting, so completed local jobs do not wait for the
+periodic health interval. A fresh probe that still observes external audio keeps
+admission blocked, including after a local 503 refusal or unsent cancellation.
+On-demand refreshes are coalesced to one per coordinator, with queued waits still
+bounded by the existing deadline; refresher cancellation releases the refresh
+lock and wakes waiters rather than stranding them until a periodic probe.
+Unknown ownership can conservatively double-count local audio against an explicit
+worker-wide cap during execution, sacrificing utilization rather than hiding
+external work. No extra probe is needed when the cached audio count is zero.
+Sequential uploads rotate their
 starting worker under the selection lock; the independent audio permit and
 configured worker-wide cap still apply. External occupancy remains a probe
 snapshot, not a globally synchronized reservation across coordinators.
@@ -134,7 +147,7 @@ cargo test --test route_tests benchmark_embedding_jobs_loopback_acceptance_matri
 
 The six review findings are covered by focused regressions: a probe during a
 locally dispatched audio job followed by completion and immediate readmission
-without another probe, external audio blocking, sequential audio rotation and
+without waiting for a periodic probe, external audio blocking, sequential audio rotation and
 the explicit worker cap, unhealthy/ineligible cached embedding owners with
 one-byte limits, repeated client IDs with independent internal IDs, and stable
 IDs across an admission retry. Transport tests exercise chat, completion,
@@ -142,7 +155,7 @@ embedding and audio sends plus repeated refresh probes with a configured secret
 and sensitive payload; no TCP connection reaches the non-loopback listener.
 Existing loopback auth and real synthetic Llama/Whisper parity tests still pass.
 
-Validation ran on Erskin Linux x86_64 CPU, from the unique source copy
+Initial review validation at `9044cbc` ran on Erskin Linux x86_64 CPU, from the unique source copy
 `/tmp/joshua-246-review-9EDvdW5C`, using the existing
 `/tmp/joshua-prefix-201-NXjVJ2AM/target`, `CARGO_BUILD_JOBS=2`, `nice -n 19`,
 and serial test execution after #247 released the lane. Source hashes for both
@@ -166,6 +179,34 @@ pretrained real-audio, real-model or multi-host acceptance. No accelerator parit
 peak RSS, network crossover, or independently verified remote SSH/tunnel run was
 performed. The gates below remain open, including #157; #247's supported-device
 parity also remains open.
+
+The subsequent ownership-race review adds
+`unsent_audio_reservation_never_erases_external_occupancy`: it reserves locally
+without sending, starts simulated external worker occupancy, probes, then either
+drops the unsent reservation or sends and receives an admission refusal. In both
+cases occupancy remains one, the next acquisition re-probes and stays blocked,
+and no second upload reaches the busy worker. External release plus a probe
+restores admission. `completed_audio_wakes_queued_upload_without_periodic_probe`
+checks that a waiting upload resumes after local completion using on-demand
+revalidation, while the earlier zero-queue-depth completion regression still
+passes. `audio_revalidation_is_coalesced_and_cancellation_wakes_waiters` verifies
+that competing acquisitions do not start duplicate refresh connections and an
+aborted refresher unlocks and notifies queued work.
+
+Final ownership-race validation used the unique source directory
+`/tmp/joshua-246-audio-race-sVbg5CBo`, the same existing target, jobs=2,
+nice=19 and serial tests. Other observed CPU-heavy work was allowed to finish
+before these runs started; no processes or services were stopped. Source hashes
+again matched the local coordinator files and route tests. Results:
+
+- Default-feature library/controller/route/server/Whisper: 496 / 3 / 45 / 9 / 6
+  passed (559 total), zero failures; the same 11 tests remain ignored.
+- Combined `distributed,tls` all-target check and explicit library/binary build:
+  passed, using the exact check/build commands above.
+- Combined-feature route suite: 46 passed, one exploratory benchmark ignored;
+  focused coordinator suite: 13 passed, including both new unit regressions.
+- `git diff --check`: passed. All prior device, throughput/RSS, real-audio and
+  independently verified remote-tunnel acceptance gaps remain unchanged.
 
 The ignored benchmark emits JSONL for 1/2/4 workers, 1/32/128 inputs,
 1/8 words and concurrency 1/4, direct versus routed, with warmup then eight

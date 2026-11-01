@@ -8,6 +8,26 @@ const MAX_INPUTS: usize = 2048;
 const PARALLEL_BATCHES: usize = 4;
 
 impl Coordinator {
+    pub(super) async fn refresh_completed_audio(&self) {
+        let Ok(refresh) = self.audio_refresh.try_lock() else {
+            return;
+        };
+        let stale = self.workers.iter().any(|worker| {
+            let status = worker.status();
+            status.healthy
+                && status.observed_audio_in_flight > 0
+                && status.audio_probe_epoch != status.audio_completion_epoch
+                && worker.audio_dispatched.load(Ordering::Acquire) == 0
+        });
+        if stale {
+            let _refresh = AudioRefreshGuard {
+                lock: Some(refresh),
+                released: &self.released,
+            };
+            self.refresh().await;
+        }
+    }
+
     pub(super) fn try_pick_audio(self: &Arc<Self>, exclude: &[usize]) -> Pick {
         let _lock = self
             .pick_lock
@@ -33,7 +53,7 @@ impl Coordinator {
                 continue;
             }
             let local = worker.audio_dispatched.load(Ordering::Acquire);
-            if local.saturating_add(status.external_audio_in_flight) > 0 {
+            if local.saturating_add(status.observed_audio_in_flight) > 0 {
                 busy = true;
                 continue;
             }

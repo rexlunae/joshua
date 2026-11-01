@@ -53,7 +53,9 @@ On the router:
   buffered otherwise.
 * `GET /v1/models` — union of the healthy workers' models.
 * `GET /v1/workers` — registry: health, last reported info, slots, requests
-  in flight from this router and from other clients, last error.
+  in flight from this router and a conservative other-client snapshot, last
+  error. Worker audio counts have no ownership identity, so the snapshot can
+  include locally reserved audio; completion triggers on-demand revalidation.
 * `GET /health` — `200` while at least one worker is healthy, else `503`.
 
 * `POST /v1/audio/transcriptions` — routed to a worker reporting the

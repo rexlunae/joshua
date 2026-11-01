@@ -1958,7 +1958,7 @@ async fn completed_audio_is_not_retained_as_external_occupancy() {
     eventually("audio active", || worker.audio_active.load(Ordering::SeqCst) == 1).await;
     coordinator.refresh().await;
     assert_eq!(coordinator.status_report()[0].info.as_ref().unwrap().transcription_in_flight, 1);
-    assert_eq!(coordinator.status_report()[0].external_in_flight, 0);
+    assert_eq!(coordinator.status_report()[0].external_in_flight, 1);
     worker.release.notify_one();
     assert_eq!(audio.await.unwrap().status, StatusCode::OK);
     eventually("audio released", || coordinator.status_report()[0].dispatched == 0).await;
@@ -2000,6 +2000,32 @@ async fn sequential_audio_rotates_workers_and_honors_worker_cap() {
     assert_eq!(call(&router, "POST", "/v1/audio/transcriptions", "blocked").await.status, StatusCode::TOO_MANY_REQUESTS);
     generation.abort();
     eventually("worker lease released", || coordinator.status_report()[0].dispatched == 0).await;
+}
+
+#[tokio::test]
+async fn completed_audio_wakes_queued_upload_without_periodic_probe() {
+    let (worker, url) = spawn_fake("worker", "m", 1, Behavior::Gate).await;
+    worker.transcriptions.store(true, Ordering::SeqCst);
+    let (coordinator, router) = spawn_router(config(&[&url])).await;
+    let first = tokio::spawn({
+        let router = router.clone();
+        async move { call(&router, "POST", "/v1/audio/transcriptions", "first").await }
+    });
+    eventually("first audio active", || worker.audio_active.load(Ordering::SeqCst) == 1).await;
+    coordinator.refresh().await;
+    let mut next = tokio::spawn({
+        let router = router.clone();
+        async move { call(&router, "POST", "/v1/audio/transcriptions", "next").await }
+    });
+    assert!(tokio::time::timeout(Duration::from_millis(30), &mut next).await.is_err());
+    assert_eq!(worker.received.load(Ordering::SeqCst), 1);
+    *worker.behavior.lock().unwrap() = Behavior::Echo;
+    worker.release.notify_one();
+    assert_eq!(first.await.unwrap().status, StatusCode::OK);
+    let response = tokio::time::timeout(Duration::from_secs(2), next).await.unwrap().unwrap();
+    assert_eq!(response.status, StatusCode::OK);
+    assert_eq!(worker.received.load(Ordering::SeqCst), 2);
+    assert_eq!(coordinator.status_report()[0].external_in_flight, 0);
 }
 
 #[tokio::test]

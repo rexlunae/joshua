@@ -319,9 +319,11 @@ struct WorkerStatus {
     healthy: bool,
     info: Option<WorkerInfo>,
     /// Requests the worker runs for clients other than this coordinator, as
-    /// of the last probe.
+    /// of the last probe. Unattributed audio is a conservative upper bound.
     external_in_flight: usize,
-    external_audio_in_flight: usize,
+    observed_audio_in_flight: usize,
+    audio_completion_epoch: usize,
+    audio_probe_epoch: usize,
     /// The same per model, for a worker that reports its models' figures.
     external_by_model: HashMap<String, usize>,
     last_error: Option<String>,
@@ -393,9 +395,6 @@ struct SlotGuard {
 impl Drop for SlotGuard {
     fn drop(&mut self) {
         let w = &self.coordinator.workers[self.index];
-        if self.audio {
-            w.audio_dispatched.fetch_sub(1, Ordering::AcqRel);
-        }
         if let Some(model) = &self.model {
             let mut counts = w.by_model();
             if let Some(n) = counts.get_mut(model) {
@@ -414,11 +413,28 @@ impl Drop for SlotGuard {
             }
         }
         w.dispatched.fetch_sub(1, Ordering::AcqRel);
+        if self.audio {
+            let mut status = w.status();
+            w.audio_dispatched.fetch_sub(1, Ordering::AcqRel);
+            status.audio_completion_epoch = status.audio_completion_epoch.wrapping_add(1);
+        }
         self.coordinator.released.notify_waiters();
     }
 }
 
 struct QueueGuard<'a>(&'a AtomicUsize);
+
+struct AudioRefreshGuard<'a> {
+    lock: Option<tokio::sync::MutexGuard<'a, ()>>,
+    released: &'a Notify,
+}
+
+impl Drop for AudioRefreshGuard<'_> {
+    fn drop(&mut self) {
+        drop(self.lock.take());
+        self.released.notify_waiters();
+    }
+}
 
 impl Drop for QueueGuard<'_> {
     fn drop(&mut self) {
@@ -438,6 +454,7 @@ impl Drop for AbortOnDrop {
 
 /// The request router: worker registry, admission and forwarding.
 pub struct Coordinator {
+    audio_refresh: tokio::sync::Mutex<()>,
     config: CoordinatorConfig,
     workers: Vec<Worker>,
     /// Serialises slot selection so check-and-reserve is atomic.
@@ -462,7 +479,8 @@ pub struct WorkerStatusReport {
     pub slots: Option<usize>,
     /// Requests this coordinator has in flight there.
     pub dispatched: usize,
-    /// Requests from other clients, as of the last probe.
+    /// Requests from other clients, as of the last probe, including
+    /// conservatively counted audio whose ownership is unknown.
     pub external_in_flight: usize,
     /// Last probe or transport error.
     pub last_error: Option<String>,
@@ -630,6 +648,7 @@ impl Coordinator {
             });
         }
         Ok(Arc::new(Self {
+            audio_refresh: tokio::sync::Mutex::new(()),
             config,
             workers,
             pick_lock: Mutex::new(()),
@@ -642,6 +661,7 @@ impl Coordinator {
     /// Probe every worker once and update the registry.
     pub async fn refresh(&self) {
         let probes = self.workers.iter().map(|w| async move {
+            let audio_probe_epoch = w.status().audio_completion_epoch;
             let before = w.dispatched.load(Ordering::Acquire);
             let audio_before = w.audio_dispatched.load(Ordering::Acquire);
             let mut ours_by_model = w.by_model().clone();
@@ -653,9 +673,9 @@ impl Coordinator {
                 *ours = (*ours).max(*n);
             }
             let ours = before.saturating_sub(audio_before).max(after.saturating_sub(audio_after));
-            (w, result, ours, audio_before.max(audio_after), ours_by_model)
+            (w, result, ours, audio_probe_epoch, ours_by_model)
         });
-        for (w, result, ours, ours_audio, ours_by_model) in futures_util::future::join_all(probes).await {
+        for (w, result, ours, audio_probe_epoch, ours_by_model) in futures_util::future::join_all(probes).await {
             let mut st = w.status();
             match result {
                 Ok(info) if info.protocol_version != WORKER_PROTOCOL_VERSION => {
@@ -683,9 +703,10 @@ impl Coordinator {
                             "worker healthy"
                         );
                     }
-                    st.external_audio_in_flight = info.transcription_in_flight.saturating_sub(ours_audio);
+                    st.observed_audio_in_flight = info.transcription_in_flight;
+                    st.audio_probe_epoch = audio_probe_epoch;
                     st.external_in_flight = info.in_flight.saturating_sub(ours)
-                        .saturating_add(st.external_audio_in_flight);
+                        .saturating_add(st.observed_audio_in_flight);
                     st.external_by_model = info
                         .models
                         .iter()
@@ -945,6 +966,7 @@ impl Coordinator {
         work: &RequestWork,
         exclude: &[usize],
     ) -> Result<SlotGuard, Reject> {
+        self.refresh_completed_audio().await;
         match self.try_pick(path, model, work, exclude) {
             Pick::Slot(slot) => return Ok(slot),
             Pick::Reject(r) => return Err(r),
@@ -962,6 +984,9 @@ impl Coordinator {
             let notified = self.released.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
+            tokio::time::timeout_at(deadline, self.refresh_completed_audio())
+                .await
+                .map_err(|_| Reject::QueueTimeout)?;
             match self.try_pick(path, model, work, exclude) {
                 Pick::Slot(slot) => return Ok(slot),
                 Pick::Reject(r) => return Err(r),
@@ -1870,6 +1895,105 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
         let dup = vec![addr, addr];
         assert!(Coordinator::new(CoordinatorConfig::new(dup)).is_err());
+    }
+
+    #[tokio::test]
+    async fn unsent_audio_reservation_never_erases_external_occupancy() {
+        for send_refused in [false, true] {
+            let occupied = Arc::new(AtomicUsize::new(0));
+            let received = Arc::new(AtomicUsize::new(0));
+            let probes = Arc::new(AtomicUsize::new(0));
+            let app = Router::new()
+                .route(WORKER_INFO_PATH, get({
+                    let occupied = occupied.clone();
+                    let probes = probes.clone();
+                    move || {
+                        let occupied = occupied.clone();
+                        let probes = probes.clone();
+                        async move {
+                            probes.fetch_add(1, Ordering::SeqCst);
+                            Json(json!({
+                                "protocol_version": WORKER_PROTOCOL_VERSION,
+                                "model": "m", "n_ctx": 4096, "backend": "cpu",
+                                "max_concurrency": 1, "in_flight": 0,
+                                "transcription_in_flight": occupied.load(Ordering::SeqCst),
+                                "capabilities": {"transcriptions": true},
+                            }))
+                        }
+                    }
+                }))
+                .route(TRANSCRIPTIONS_PATH, post({
+                    let received = received.clone();
+                    move |_body: Bytes| {
+                        let received = received.clone();
+                        async move {
+                            received.fetch_add(1, Ordering::SeqCst);
+                            StatusCode::SERVICE_UNAVAILABLE
+                        }
+                    }
+                }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut config = CoordinatorConfig::new(vec![listener.local_addr().unwrap()]);
+            config.queue_depth = 0;
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let coordinator = Coordinator::new(config).unwrap();
+            coordinator.refresh().await;
+            let Pick::Slot(reservation) = coordinator.try_pick_audio(&[]) else {
+                panic!("initial audio reservation");
+            };
+            assert_eq!(received.load(Ordering::SeqCst), 0);
+            occupied.store(1, Ordering::SeqCst);
+            coordinator.refresh().await;
+            assert_eq!(coordinator.status_report()[0].external_in_flight, 1);
+            if send_refused {
+                let log = RequestLog {
+                    response_limit: 1024, owner: None, request_id: "local-audio".to_string(),
+                    worker: coordinator.workers[0].endpoint.base.clone(), path: TRANSCRIPTIONS_PATH,
+                    attempt: 1, queue_ms: 0, started: Instant::now(),
+                };
+                assert!(matches!(coordinator.first_output(&coordinator.workers[0],
+                    TRANSCRIPTIONS_PATH, Bytes::from_static(b"local upload"), None, &log).await,
+                    Err(Failure::Retry { admission: true, .. })));
+            }
+            drop(reservation);
+            assert!(matches!(coordinator.try_pick_audio(&[]), Pick::Busy));
+            let work = RequestWork { context: None, units: 1 };
+            assert!(matches!(coordinator.acquire(TRANSCRIPTIONS_PATH, None, &work, &[]).await,
+                Err(Reject::QueueFull)));
+            assert_eq!(probes.load(Ordering::SeqCst), 3);
+            assert_eq!(received.load(Ordering::SeqCst), usize::from(send_refused));
+            assert_eq!(coordinator.status_report()[0].external_in_flight, 1);
+            occupied.store(0, Ordering::SeqCst);
+            coordinator.refresh().await;
+            assert!(coordinator.acquire(TRANSCRIPTIONS_PATH, None, &work, &[]).await.is_ok());
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn audio_revalidation_is_coalesced_and_cancellation_wakes_waiters() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let coordinator = Coordinator::new(CoordinatorConfig::new(vec![listener.local_addr().unwrap()])).unwrap();
+        {
+            let mut status = coordinator.workers[0].status();
+            status.healthy = true;
+            status.observed_audio_in_flight = 1;
+            status.audio_completion_epoch = 1;
+        }
+        let refresh = tokio::spawn({
+            let coordinator = coordinator.clone();
+            async move { coordinator.refresh_completed_audio().await }
+        });
+        let (_connection, _) = tokio::time::timeout(Duration::from_secs(1), listener.accept()).await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(1), coordinator.refresh_completed_audio()).await.unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(30), listener.accept()).await.is_err());
+        let notified = coordinator.released.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        refresh.abort();
+        assert!(refresh.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(1), notified).await.unwrap();
+        assert!(coordinator.audio_refresh.try_lock().is_ok());
     }
 
     #[test]
