@@ -19,11 +19,11 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use candle_core::quantized::k_quants::BlockQ6K;
+use candle_core::quantized::k_quants::{BlockQ4_0, BlockQ6K, GgmlType};
 use candle_core::quantized::GgmlDType;
 use candle_core::{Device, Tensor};
 use joshua::quant_matmul::matmul_kquant;
-use joshua::simd::{for_each_row, for_each_row_chunks};
+use joshua::simd::{for_each_row, for_each_row_chunks, SimdLevel};
 use rayon::prelude::*;
 
 // ── Counting allocator ────────────────────────────────────────────────────
@@ -327,24 +327,21 @@ fn for_each_row_allocates_nothing() {
     assert!(hi <= lo + 16, "for_each_row alloc total drifts with n: {new_totals:?}");
 }
 
-/// End to end: Q6_K decode allocates no dequant scratch on AVX-512;
-/// fallback kernels allocate exactly one scratch per chunk and nothing
-/// else. The fallback count tracks the chunk split, not `n`.
-#[test]
-fn quantized_matmul_allocates_only_per_chunk_scratch() {
-    let _guard = census_guard();
+/// Allocation census of one decode-shaped (m=1) `[512, 1024]` matmul of
+/// block type `T`, after a warm-up run.
+fn matmul_census<T: GgmlType + Clone>(dtype: GgmlDType) -> Census {
     const K: usize = 1024;
     const M: usize = 1;
-    let blocks: Vec<BlockQ6K> = {
+    let blocks: Vec<T> = {
         let data: Vec<f32> = (0..512 * K)
             .map(|i| ((((i as u64) * 2654435761) % 100000) as f32 / 1000.0) - 50.0)
             .collect();
         let t = Tensor::from_vec(data, (512, K), &Device::Cpu).unwrap();
-        let qt = candle_core::quantized::QTensor::quantize(&t, GgmlDType::Q6K).unwrap();
+        let qt = candle_core::quantized::QTensor::quantize(&t, dtype).unwrap();
         let bytes = qt.data().unwrap();
-        assert!(bytes.len().is_multiple_of(std::mem::size_of::<BlockQ6K>()));
-        let ptr = bytes.as_ptr() as *const BlockQ6K;
-        let len = bytes.len() / std::mem::size_of::<BlockQ6K>();
+        assert!(bytes.len().is_multiple_of(std::mem::size_of::<T>()));
+        let ptr = bytes.as_ptr() as *const T;
+        let len = bytes.len() / std::mem::size_of::<T>();
         // SAFETY: `data()` is candle's own quantized storage, T-aligned, and
         // every byte pattern of a k-quant block is a valid block.
         unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec()
@@ -353,33 +350,53 @@ fn quantized_matmul_allocates_only_per_chunk_scratch() {
 
     // Warm up so the pool's one-time allocations are not counted.
     let mut warm = vec![0f32; M * 512];
-    matmul_kquant::<BlockQ6K>((M, K, 512), &lhs, &blocks, &mut warm).unwrap();
+    matmul_kquant::<T>((M, K, 512), &lhs, &blocks, &mut warm).unwrap();
 
     let mut dst = vec![0f32; M * 512];
-    // Low-water of three runs: the strict equalities below are exactly the
-    // shape rayon's one-time job-stack growth breaks — the stack lands in
-    // the medium band, and this test flaked ~3/10 at the unmodified PR head
-    // on macOS — while a stray scratch buffer per chunk would recur in
-    // every rep.  See `count_allocs_min`.
+    // Low-water of three runs: the strict equalities in the caller are
+    // exactly the shape rayon's one-time job-stack growth breaks — the stack
+    // lands in the medium band, and this test flaked ~3/10 at the unmodified
+    // PR head on macOS — while a stray scratch buffer per chunk would recur
+    // in every rep.  See `count_allocs_min`.
     let census = count_allocs_min(3, || {
-        matmul_kquant::<BlockQ6K>((M, K, 512), &lhs, &blocks, &mut dst).unwrap()
+        matmul_kquant::<T>((M, K, 512), &lhs, &blocks, &mut dst).unwrap()
     });
-    // Q6_K is fused on AVX-512 and needs no dequant scratch. Other SIMD
-    // levels retain one 4 KiB scratch per chunk. Neither path allocates
-    // per-chunk row-index vectors, so the ≤1 KiB bands stay empty.
-    assert_eq!(
-        census.small_alloc(),
-        0,
-        "matmul left {} small allocations: {census:?}",
-        census.small_alloc()
-    );
-    let expected = if joshua::simd::simd_level() == joshua::simd::SimdLevel::Avx512 {
-        0
-    } else {
-        chunk_count(512)
-    };
-    assert_eq!(census.medium, expected, "dequant scratch census {census:?}, expected {expected}");
-    assert!(dst.iter().any(|v| *v != 0.0), "sanity: the matmul did compute");
+    assert!(dst.iter().any(|v| *v != 0.0), "sanity: the {dtype:?} matmul did compute");
+    census
+}
+
+/// End to end: fused kernels (Q6_K on AVX2 and AVX-512) allocate no dequant
+/// scratch; the dequantize-then-dot fallback (Q4_0 everywhere, Q6_K on NEON
+/// and at the scalar level) allocates exactly one scratch per chunk and
+/// nothing else. The fallback count tracks the chunk split, not `n`.  (Q4_0
+/// because its `to_float` allocates nothing; candle's Q3_K and Q5_K decoders
+/// build a small `Vec` per row.)
+#[test]
+fn quantized_matmul_allocates_only_per_chunk_scratch() {
+    let _guard = census_guard();
+    let q6k_fused = matches!(joshua::simd::simd_level(), SimdLevel::Avx2 | SimdLevel::Avx512);
+    for (dtype, census, expected) in [
+        (
+            GgmlDType::Q6K,
+            matmul_census::<BlockQ6K>(GgmlDType::Q6K),
+            if q6k_fused { 0 } else { chunk_count(512) },
+        ),
+        (GgmlDType::Q4_0, matmul_census::<BlockQ4_0>(GgmlDType::Q4_0), chunk_count(512)),
+    ] {
+        // The fallback retains one 4 KiB scratch per chunk. Neither path
+        // allocates per-chunk row-index vectors, so the ≤1 KiB bands stay
+        // empty.
+        assert_eq!(
+            census.small_alloc(),
+            0,
+            "{dtype:?} matmul left {} small allocations: {census:?}",
+            census.small_alloc()
+        );
+        assert_eq!(
+            census.medium, expected,
+            "{dtype:?} dequant scratch census {census:?}, expected {expected}"
+        );
+    }
 }
 
 /// Reported with numbers so a regression shows up in the log, not just as a

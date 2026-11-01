@@ -548,11 +548,12 @@ impl Weight {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         match self {
             Weight::Candle(q) => {
-                // Joshua's SIMD path first: fused dequant+dot kernels
-                // (Q8_0/Q2_K/Q4_K) or dequant-row + NEON/AVX2 dot (other
-                // k-quants), parallelised across rows — instead of candle's
-                // scalar single-threaded kernel.  Anything without a fast
-                // path here falls through to candle unchanged.
+                // Joshua's SIMD path first: fused dequant+dot kernels (the
+                // dtypes listed at `quant_matmul::try_simd_kquant`) or
+                // dequant-row + SIMD dot (other k-quants), parallelised
+                // across rows — instead of candle's scalar single-threaded
+                // kernel.  Anything without a fast path here falls through
+                // to candle unchanged.
                 if let QMatMul::QTensor(qt) = q {
                     if let Some(res) = crate::quant_matmul::try_fast_cpu_qmatmul(qt, xs) {
                         return res;
