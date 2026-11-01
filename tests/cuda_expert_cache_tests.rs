@@ -13,7 +13,7 @@ use std::sync::Arc;
 const SLOT_BYTES: u64 = 2 * 128 * 66 + 1024 * 34;
 
 fn cuda() -> Device {
-    Device::new_cuda(0).expect("CUDA tests require a working CUDA device")
+    Device::new_cuda_with_stream(0).expect("CUDA tests require a working CUDA device")
 }
 
 #[test]

@@ -1,7 +1,7 @@
 <style>
 :root { --viz-series-1: var(--chart-1); --viz-series-2: var(--chart-2); }
 #expert-cache-timing { margin: 0; color: var(--foreground); font-family: var(--font-sans); }
-#expert-cache-timing .plot { height: 270px; }
+#expert-cache-timing .plot { height: 350px; }
 #expert-cache-timing .scale { display: flex; justify-content: space-between; margin-left: 66px; margin-right: 80px; color: var(--muted-foreground); }
 #expert-cache-timing .run { margin-top: 14px; }
 #expert-cache-timing .row { display: grid; grid-template-columns: 66px minmax(0, 1fr); align-items: center; margin-top: 4px; }
@@ -10,7 +10,7 @@
 #expert-cache-timing .cache { background: var(--viz-series-2); }
 #expert-cache-timing .value { position: absolute; right: 4px; top: 0; color: var(--foreground); font-variant-numeric: tabular-nums; }
 </style>
-<figure id="expert-cache-timing" role="img" aria-label="Three noisy paired debug-profile Qwen decode measurements with an owned compute stream on RTX 5060 Ti. Run 1: host experts 374.835, cache 462.578 tokens per second. Run 2: host 378.597, cache 449.810. Run 3: host 375.289, cache 441.142. Historical no-regression acceptance remains open.">
+<figure id="expert-cache-timing" role="img" aria-label="Four noisy paired debug-profile Qwen decode measurements with an owned compute stream on RTX 5060 Ti. Run 1: host experts 374.835, cache 462.578 tokens per second. Run 2: host 378.597, cache 449.810. Run 3: host 375.289, cache 441.142. Scoped constructor: host 374.998, cache 461.598. Historical no-regression acceptance remains open.">
   <h3>Tiny Qwen decode · owned stream</h3>
   <div class="plot">
     <div class="scale"><span>0</span><span>250</span><span>500 tok/s</span></div>
@@ -26,6 +26,10 @@
       <div class="row"><span>Host</span><div class="track"><div class="bar" style="width:75.0578%"></div><span class="value">375.289</span></div></div>
       <div class="row"><span>Cache</span><div class="track"><div class="bar cache" style="width:88.2284%"></div><span class="value">441.142</span></div></div>
     </div>
+    <div class="run">Scoped constructor
+      <div class="row"><span>Host</span><div class="track"><div class="bar" style="width:74.9996%"></div><span class="value">374.998</span></div></div>
+      <div class="row"><span>Cache</span><div class="track"><div class="bar cache" style="width:92.3196%"></div><span class="value">461.598</span></div></div>
+    </div>
   </div>
-  <figcaption>RTX 5060 Ti · debug · 3 slots · live services · 3 × 64 timed tokens per mode</figcaption>
+  <figcaption>RTX 5060 Ti · debug · 3 slots · live services · 3 × 64 timed tokens per mode · no-regression gate still open</figcaption>
 </figure>

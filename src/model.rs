@@ -851,6 +851,11 @@ impl QuantizedModel {
     /// instance as the template and derives every concurrent session from
     /// it, so extra sessions cost their cache rather than a second copy (on
     /// an accelerator, a second upload) of the weights.
+    ///
+    /// For concurrent CUDA sessions, supply `Device::new_cuda_with_stream`
+    /// when loading the template, as `Engine` does. Candle's `new_cuda`
+    /// retains its per-thread default-stream contract; its cloned device's
+    /// shared cuBLAS handle and quantized scratch are not independent queues.
     pub fn new_session(&self) -> Option<Self> {
         native!(self, (m, wrap) => Some(wrap(m.new_session())), _ => None)
     }

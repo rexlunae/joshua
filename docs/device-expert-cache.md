@@ -134,18 +134,54 @@ backend ownership defect explains cache-independent concurrent corruption, but
 fixing it does not clear strict cached/host greedy parity or historical Qwen
 performance acceptance.
 
-`CudaDevice::new` previously selected cudarc's `per_thread_stream()`, whose raw
+`CudaDevice::new` selects cudarc's `per_thread_stream()`, whose raw
 handle is the CUDA per-thread sentinel `0x2`, not one physical queue shared by
 callers. Cloned Candle devices nevertheless share one cuBLAS handle and
 per-DeviceId MMVQ/MMQ scratch. Scratch locks cover submission, not completion;
 different host threads could therefore reuse scratch on different queues.
 `Device::synchronize` also targeted only the calling thread's default queue.
-The constructor now delegates to the existing `new_with_stream`: one owned,
-nonblocking compute stream, shared by device clones, cuBLAS, and scratch.
+The initial fix in `ff746d7` globally delegated that constructor to
+`new_with_stream`. The follow-up for discussion `4434019973` restores the
+vendored public constructor's original per-thread semantics. Only Joshua's
+Engine CUDA selection paths (automatic and explicit) now call the existing
+`Device::new_cuda_with_stream`: one owned, nonblocking compute stream, shared
+by device clones, cuBLAS, and scratch. Library callers supplying their own
+device must also select that explicit constructor before concurrently sharing
+sessions; merely cloning a per-thread default device is not race-safe. This
+is not a universal fix for external Candle applications sharing default-stream
+devices across host threads.
 Submission locks then order scratch users on the same actual queue, and lease
 fences target that queue. **Sessions share serialized compute, not independent
 per-session GPU overlap.** Background uploads retain their separate completed
 transfer stream. No retirement lists or per-session weight copies are added.
+
+The call-site audit found only two production CUDA constructors, both in
+`src/engine.rs`: `default_device` and explicit `ComputeBackend::Cuda`
+resolution. Other constructors under `src` are test-only. Engine template,
+draft, native/stock model, and session loads receive the selected device rather
+than construct another CUDA device. Quantized MMVQ/MMQ and cuBLAS submit on
+the exposed device stream; compact uploads use `cuda_transfer_stream`, complete
+the copy before publication, and keep cudarc event tracking enabled. No Joshua
+production CUDA graph-capture entry point was found. Exposing `cuda_stream`
+does not promise implicit ordering with external default streams: callers
+must use events or explicit synchronization.
+
+New bounded regressions retain the public constructor's raw per-thread sentinel
+`0x2`, exercise Engine automatic and explicit CUDA construction plus repeated
+tiny Llama generation, and test upload on legacy-default, per-thread-default,
+and transfer streams followed by Candle compute, an explicit completion-event
+handoff, and external-stream readback. The separate graph replay regression
+uses one private owned stream, disables event tracking **before allocations**,
+warms its metadata/host-copy cache, captures affine GPU work, and checks three
+replays. Its unsafe precondition is confined to that test: every allocation,
+use, replay and completion stays on that stream, with no external consumers.
+This does not establish general graph capture with normal event tracking:
+the exploratory tracked attempt failed with `CUDA_ERROR_STREAM_CAPTURE_ISOLATION`
+(then capture invalidation), retained in `interop-capture.log` and
+`interop-workspace-clean.log`. That limitation is not silently fixed or hidden.
+`interop-engine-concurrent-final.log` additionally passes two concurrent Engine
+completions against its serial result for both automatic and explicit CUDA
+selection (five tests passed, one diagnostic ignored).
 
 `cuda_shared_workspace_tests` uses fixed weights/inputs, three host workers,
 F32/F16/BF16, and 1/8/32 input rows. Each worker queues 96 quantized and 96 dense
@@ -199,10 +235,30 @@ and 0.030445576. At offset 26 in the interleaved run, cache scores choose token
 3 (1.9886569). This isolates a repeatable expert-backend numerical-path
 disagreement from concurrent shared-stream corruption. Whether activation
 requantization, reduction ordering, or another kernel precision difference
-fully explains it is **not established**. The ignored diagnostic's successful
+fully explains the end-to-end winner flips is **not established**. The ignored diagnostic's successful
 exit checks numerical bounds only, not greedy acceptance. Changing arithmetic
 or tolerances to hide these flips is not part of this fix. They remain a real
 PR blocker even though they also occur without an expert pool.
+
+The bounded ignored `cuda_q4k_expert_arithmetic_probe` now isolates a concrete
+arithmetic difference using four fixed seeds, 256-by-256 compact Q4_K weights,
+and one 256-element input row. The CPU Q4_K dot product quantizes activations
+as Q8_K (256-element blocks, signed-max scale stored as f32); the fast CUDA
+path uses Q8_1 (32-element blocks with half scales/sums). On the same input,
+fast CUDA differs from CPU by up to 0.0009132363. Bypassing that fast path
+with direct-float DMMV still differs by up to 0.00071775913: merely disabling
+MMVQ is not a parity fix. Quantizing/dequantizing the input to CPU Q8_K first
+and then using CUDA DMMV reduces the observed maximum to 0.000000044703484
+across all four seeds (asserted below 0.000001), with bit-exact repeated GPU
+results. `arithmetic-q4k-control.log` records this initial isolation experiment.
+The scoped-constructor rerun `interop-arithmetic.log` repeats every value.
+This demonstrates different activation arithmetic, not just reduction order,
+for the isolated Q4_K operator. It does **not** prove every model-level flip is
+accounted for or implement a safe production fix. The probe's host round trip
+and process-global DMMV switch are diagnostic only, never a production dispatch
+policy. Matching backend arithmetic on device, all involved quantized formats,
+prefill/decode paths and greedy continuation still needs a verified design;
+neither per-expert host transfers nor tolerance changes are accepted shortcuts.
 
 One DeepSeek4 shared-cache run also failed its unchanged numerical bound
 (`0.98116964 != 0.79818434`, `stream-fix-validation.log`); two immediate focused
@@ -210,6 +266,22 @@ reruns and the next combined run passed. Three constructor-reverted controls
 (`stream-before-ds4-{1..3}.log`) passed, so the failure is **not labelled
 pre-existing** or dismissed as baseline. It remains an unresolved parity
 observation.
+
+After restoring the public constructor and opting the Engine/tests into owned
+streams, `interop-engine-capture.log` passes all five nonignored stream/Engine
+tests (one arithmetic diagnostic ignored). `interop-model-validation.log`
+passes the CPU numerical-reference test and six cache tests, but **fails**
+`cuda_older_loaders_interleaved_eviction_numerical_parity`: Qwen has zero greedy
+flips; DeepSeek2 has seven, split five for `[1,4,2]` (maximum absolute error
+0.030209064) and two for `[5,7,1]` (0.026428163). Upload timing changes which
+experts run on CPU versus CUDA, so mixed-path churn need not match the five
+all-CUDA/host flips. Final DeepSeek2 accounting is three slots / 331776 logical
+bytes, 149 hits, 79 uploads, 76 evictions, zero upload failures. The no-pool
+concurrent gate and DeepSeek4 cache test pass in this run, without clearing
+the earlier unexplained DeepSeek4 observation. `interop-serial-precision.log`
+again reproduces the exact same five all-CUDA/host flips on one host thread.
+Diagnostic success means the experiment completed, not that greedy parity
+passed. Both the strict parity thread and no-regression acceptance stay open.
 
 Three owned-stream timing processes repeat three-token prefill, 70 warmup
 tokens, and three trials of 64 timed tokens, with blocking readbacks and a
@@ -223,6 +295,13 @@ tokens, and three trials of 64 timed tokens, with blocking readbacks and a
 | 1 / DeepSeek2 | 709.550 | 1278.448 | 1334.122 |
 | 2 / DeepSeek2 | 684.341 | 1258.509 | 1330.642 |
 | 3 / DeepSeek2 | 747.854 | 1266.408 | 1342.061 |
+| scoped constructor / Qwen | 374.998 | 461.598 | 1304.135 |
+| scoped constructor / DeepSeek2 | 729.936 | 1254.571 | 1304.585 |
+
+The scoped-constructor pair is `interop-timing.log`, with the same bounded
+prefill/warmup and three-by-64-token debug protocol, not a release or controlled
+no-regression measurement. The earlier roughly 25% Qwen regression remains a
+blocker; these samples do not close it.
 
 The constructor-only baseline (`stream-before-timing.log`) gives Qwen
 373.898 / 453.212 / 1280.390 tok/s and DeepSeek2

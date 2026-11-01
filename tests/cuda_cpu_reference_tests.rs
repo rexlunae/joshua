@@ -8,7 +8,7 @@ use std::io::Cursor;
 
 #[test]
 fn cuda_deepseek2_cpu_reference_numerical_parity() {
-    let device = Device::new_cuda(0).unwrap();
+    let device = Device::new_cuda_with_stream(0).unwrap();
     let dir = common::model_dir("cuda-dense-cpu-reference");
     let path = dir.join("model.gguf");
     common::write_tiny_deepseek2_quantized_gguf(&path);

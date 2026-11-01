@@ -2677,7 +2677,7 @@ impl Engine {
     fn default_device() -> Device {
         #[cfg(feature = "cuda")]
         {
-            match Device::new_cuda(0) {
+            match Device::new_cuda_with_stream(0) {
                 Ok(device) => return device,
                 Err(e) => tracing::warn!("CUDA unavailable, falling back to CPU: {e}"),
             }
@@ -2848,7 +2848,7 @@ impl Engine {
             ComputeBackend::Cuda => {
                 #[cfg(feature = "cuda")]
                 {
-                    Device::new_cuda(0).map_err(|e| {
+                    Device::new_cuda_with_stream(0).map_err(|e| {
                         JoshuaError::ModelLoad(format!(
                             "CUDA device requested but unavailable: {e}. \
                              Build with `--features cuda` and a CUDA toolkit, \

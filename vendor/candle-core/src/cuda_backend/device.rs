@@ -431,7 +431,9 @@ impl BackendDevice for CudaDevice {
     type Storage = CudaStorage;
 
     fn new(ordinal: usize) -> Result<Self> {
-        Self::new_with_stream(ordinal)
+        let context = cudarc::driver::CudaContext::new(ordinal).w()?;
+        let stream = context.per_thread_stream();
+        Self::from_context_and_stream(context, stream)
     }
 
     fn set_seed(&self, seed: u64) -> Result<()> {
