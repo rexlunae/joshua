@@ -302,3 +302,38 @@ This is correctness acceptance evidence, not a performance benchmark. The older
 timing JSON/manifests were not rewritten or rerun; realistic quantized-model
 latency, CUDA/NPU hardware parity, peak device memory and universal speedup remain
 unmeasured. Issue closure still requires maintainer acceptance of this evidence.
+
+### Authenticated post-integration measurement (October 31, 2026)
+
+After merging #247 into the #246 job-routing branch, the authenticated tiny-GGUF
+benchmark was rerun on the Apple M5 Pro host above using CPU execution, the debug
+profile, Rust 1.99.0-nightly, jobs=2, incremental=0, debug symbols disabled and
+`RAYON_NUM_THREADS=1`. The 108 cells completed in 5.00s: all 1,512 measured replies
+matched independently computed cold baselines, and request/output hashes matched
+across all four policies. The raw report is
+`measurements/affinity-246-post-integration-macos.json`; every source hash listed
+in it was verified against the tested checkout. This is a new report, not a
+replacement for either historical measurement.
+
+At concurrency one, affinity saved 2,325 prefill tokens versus work-aware routing's
+1,734, with median-cell-p50 TTFT 1.088ms versus 1.302ms. At concurrency two and
+four, affinity's corresponding TTFT was 1.236ms and 2.119ms versus 1.161ms and
+2.079ms for work-aware routing. Thus the authenticated run confirms locality and
+correctness, not a universal latency improvement. Memory remains end-of-cell
+warm/snapshot accounting, not peak RSS or device allocation. Host isolation and
+production quantized-model performance are not established.
+
+The combined branch passed 497 default library tests, 6 affinity, 8 external-draft,
+52 routing and 11 server tests. With `distributed,tls`, 14 focused coordinator,
+6 affinity, 8 external-draft, 53 routing and 12 server tests passed; the all-target
+feature check passed. Manual benchmarks were run separately rather than counted
+as ordinary tests. Both audio-admission regressions remain enabled: competing
+zero-queue uploads coalesce refresh, and a freed generation slot is usable while
+an unrelated audio probe is pending. The merge retains authenticated internal
+cache scopes, stale-residency lease guards and conservative audio occupancy.
+
+The report's source list predates the job-routing module split. Supplemental
+SHA-256 values for this combined validation are:
+
+- `src/coordinator/jobs.rs`: `723d0ba19c94fbe5540cf834a76abf9d9c015c628e805f22d775dcc186d53be7`
+- `src/job_admission.rs`: `7eea0c91ecf33fa6cd2235e6a7e388f17f59e27dc083ad8d4e3d3dda97dc2b25`

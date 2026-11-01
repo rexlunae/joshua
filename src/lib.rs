@@ -79,6 +79,7 @@ pub mod prefix_key;
 pub mod prompt_stability;
 pub mod stream_prefill;
 pub mod server;
+mod job_admission;
 pub mod simd;
 pub mod speculative;
 pub mod template;

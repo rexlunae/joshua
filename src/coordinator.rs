@@ -84,6 +84,22 @@ use uuid::Uuid;
 
 use crate::types::{ErrorResponse, ModelInfo, ModelListResponse};
 
+mod jobs;
+
+pub const JOB_OWNER_HEADER: &str = "x-joshua-job-owner";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobModel {
+    pub model: String,
+    pub backend: String,
+    pub input_format: String,
+    pub owner: String,
+    pub revision: Option<String>,
+    pub max_inputs: usize,
+    pub max_input_bytes: usize,
+    pub max_output_bytes: usize,
+}
+
 /// Version of the worker protocol this build speaks.  Bumped on any
 /// incompatible change to [`WorkerInfo`] or to how requests are forwarded;
 /// a worker reporting another version is never routed to.
@@ -120,6 +136,12 @@ const ROUTED_PATHS: [&str; 4] = [
 /// What a worker reports at [`WORKER_INFO_PATH`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcription_job: Option<JobModel>,
+    #[serde(default)]
+    pub transcription_in_flight: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub embedding_jobs: Vec<JobModel>,
     /// Bounded live cache inventory; absence is unknown on older workers.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub cache_residency: HashMap<String, crate::affinity::CacheResidency>,
@@ -279,6 +301,14 @@ struct Endpoint {
 }
 
 impl Endpoint {
+    fn require_secure_transport(&self) -> Result<(), String> {
+        if self.authority.parse::<SocketAddr>().is_ok_and(|address| address.ip().is_loopback()) {
+            Ok(())
+        } else {
+            Err("worker HTTP requires a loopback endpoint; use an authenticated encrypted tunnel for remote workers; native worker TLS is not implemented".to_string())
+        }
+    }
+
     fn new(addr: SocketAddr) -> Self {
         // `SocketAddr`'s Display brackets IPv6 hosts, as `Host` requires.
         let authority = addr.to_string();
@@ -296,14 +326,18 @@ struct WorkerStatus {
     healthy: bool,
     info: Option<WorkerInfo>,
     /// Requests the worker runs for clients other than this coordinator, as
-    /// of the last probe.
+    /// of the last probe. Unattributed audio is a conservative upper bound.
     external_in_flight: usize,
+    observed_audio_in_flight: usize,
+    audio_completion_epoch: usize,
+    audio_probe_epoch: usize,
     /// The same per model, for a worker that reports its models' figures.
     external_by_model: HashMap<String, usize>,
     last_error: Option<String>,
 }
 
 struct Worker {
+    audio_dispatched: AtomicUsize,
     dispatch_generation: AtomicU64,
     endpoint: Endpoint,
     status: Mutex<WorkerStatus>,
@@ -358,6 +392,7 @@ enum Pick {
 
 /// One reserved worker slot; released (and queued requests woken) on drop.
 struct SlotGuard {
+    audio: bool,
     coordinator: Arc<Coordinator>,
     index: usize,
     /// The requested model, counted against its own admission figures.
@@ -386,11 +421,28 @@ impl Drop for SlotGuard {
             }
         }
         w.dispatched.fetch_sub(1, Ordering::AcqRel);
+        if self.audio {
+            let mut status = w.status();
+            w.audio_dispatched.fetch_sub(1, Ordering::AcqRel);
+            status.audio_completion_epoch = status.audio_completion_epoch.wrapping_add(1);
+        }
         self.coordinator.released.notify_waiters();
     }
 }
 
 struct QueueGuard<'a>(&'a AtomicUsize);
+
+struct AudioRefreshGuard<'a> {
+    lock: Option<tokio::sync::MutexGuard<'a, ()>>,
+    released: &'a Notify,
+}
+
+impl Drop for AudioRefreshGuard<'_> {
+    fn drop(&mut self) {
+        drop(self.lock.take());
+        self.released.notify_waiters();
+    }
+}
 
 impl Drop for QueueGuard<'_> {
     fn drop(&mut self) {
@@ -410,6 +462,7 @@ impl Drop for AbortOnDrop {
 
 /// The request router: worker registry, admission and forwarding.
 pub struct Coordinator {
+    audio_refresh: tokio::sync::Mutex<()>,
     affinity: Mutex<crate::affinity::Directory>,
     config: CoordinatorConfig,
     workers: Vec<Worker>,
@@ -435,7 +488,8 @@ pub struct WorkerStatusReport {
     pub slots: Option<usize>,
     /// Requests this coordinator has in flight there.
     pub dispatched: usize,
-    /// Requests from other clients, as of the last probe.
+    /// Requests from other clients, as of the last probe, including
+    /// conservatively counted audio whose ownership is unknown.
     pub external_in_flight: usize,
     /// Last probe or transport error.
     pub last_error: Option<String>,
@@ -445,7 +499,7 @@ pub struct WorkerStatusReport {
 enum Failure {
     /// Nothing reached the client and the worker did not (or can no longer)
     /// run the request: try another worker.
-    Retry { reason: String, admission: bool },
+    Retry { reason: String, admission: bool, safe: bool },
     /// The answer to send the client as-is.
     Final(Response),
 }
@@ -601,6 +655,7 @@ impl Coordinator {
                 return Err(format!("worker '{}' is listed twice", endpoint.base));
             }
             workers.push(Worker {
+                audio_dispatched: AtomicUsize::new(0),
                 dispatch_generation: AtomicU64::new(0),
                 endpoint,
                 status: Mutex::new(WorkerStatus::default()),
@@ -610,6 +665,7 @@ impl Coordinator {
             });
         }
         Ok(Arc::new(Self {
+            audio_refresh: tokio::sync::Mutex::new(()),
             affinity: Mutex::new(crate::affinity::Directory::default()),
             config,
             workers,
@@ -623,18 +679,22 @@ impl Coordinator {
     /// Probe every worker once and update the registry.
     pub async fn refresh(&self) {
         let probes = self.workers.iter().map(|w| async move {
+            let audio_probe_epoch = w.status().audio_completion_epoch;
             let generation = w.dispatch_generation.load(Ordering::Acquire);
             let before = w.dispatched.load(Ordering::Acquire);
+            let audio_before = w.audio_dispatched.load(Ordering::Acquire);
             let mut ours_by_model = w.by_model().clone();
             let result = self.probe(w).await;
             let after = w.dispatched.load(Ordering::Acquire);
+            let audio_after = w.audio_dispatched.load(Ordering::Acquire);
             for (model, n) in w.by_model().iter() {
                 let ours = ours_by_model.entry(model.clone()).or_default();
                 *ours = (*ours).max(*n);
             }
-            (w, result, before.max(after), ours_by_model, generation)
+            let ours = before.saturating_sub(audio_before).max(after.saturating_sub(audio_after));
+            (w, result, ours, audio_probe_epoch, ours_by_model, generation)
         });
-        for (w, result, ours, ours_by_model, generation) in
+        for (w, result, ours, audio_probe_epoch, ours_by_model, generation) in
             futures_util::future::join_all(probes).await
         {
             let mut st = w.status();
@@ -665,7 +725,10 @@ impl Coordinator {
                             "worker healthy"
                         );
                     }
-                    st.external_in_flight = info.in_flight.saturating_sub(ours);
+                    st.observed_audio_in_flight = info.transcription_in_flight;
+                    st.audio_probe_epoch = audio_probe_epoch;
+                    st.external_in_flight = info.in_flight.saturating_sub(ours)
+                        .saturating_add(st.observed_audio_in_flight);
                     st.external_by_model = info
                         .models
                         .iter()
@@ -769,6 +832,9 @@ impl Coordinator {
         exclude: &[usize],
         affinity: Option<&crate::affinity::Scope>,
     ) -> Pick {
+        if path == TRANSCRIPTIONS_PATH {
+            return self.try_pick_audio(exclude);
+        }
         let _lock = self.pick_lock.lock().unwrap_or_else(|p| p.into_inner());
         let mut directory = self.affinity.lock().unwrap_or_else(|p| p.into_inner());
         let preferred = affinity.and_then(|scope| directory.preferred(scope, Instant::now()));
@@ -960,6 +1026,7 @@ impl Coordinator {
                     .or_default() += work.units;
             }
             return Pick::Slot(SlotGuard {
+                audio: false,
                 coordinator: Arc::clone(self),
                 index,
                 model,
@@ -986,6 +1053,31 @@ impl Coordinator {
         Pick::Reject(Reject::Unavailable)
     }
 
+    async fn pick_after_audio_refresh(
+        self: &Arc<Self>,
+        path: &str,
+        model: Option<&str>,
+        work: &RequestWork,
+        exclude: &[usize],
+        affinity: Option<&crate::affinity::Scope>,
+    ) -> Pick {
+        let refresh = self.refresh_completed_audio();
+        tokio::pin!(refresh);
+        loop {
+            let notified = self.released.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            match self.try_pick(path, model, work, exclude, affinity) {
+                Pick::Busy => {}
+                result => return result,
+            }
+            tokio::select! {
+                _ = &mut refresh => return self.try_pick(path, model, work, exclude, affinity),
+                _ = notified => {}
+            }
+        }
+    }
+
     /// Reserve a slot, waiting in the bounded queue while every eligible
     /// worker is full.
     async fn acquire(
@@ -996,7 +1088,7 @@ impl Coordinator {
         exclude: &[usize],
         affinity: Option<&crate::affinity::Scope>,
     ) -> Result<SlotGuard, Reject> {
-        match self.try_pick(path, model, work, exclude, affinity) {
+        match self.pick_after_audio_refresh(path, model, work, exclude, affinity).await {
             Pick::Slot(slot) => return Ok(slot),
             Pick::Reject(r) => return Err(r),
             Pick::Busy => {}
@@ -1013,7 +1105,13 @@ impl Coordinator {
             let notified = self.released.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            match self.try_pick(path, model, work, exclude, affinity) {
+            let picked = tokio::time::timeout_at(
+                deadline,
+                self.pick_after_audio_refresh(path, model, work, exclude, affinity),
+            )
+                .await
+                .map_err(|_| Reject::QueueTimeout)?;
+            match picked {
                 Pick::Slot(slot) => return Ok(slot),
                 Pick::Reject(r) => return Err(r),
                 Pick::Busy => {}
@@ -1054,6 +1152,7 @@ impl Coordinator {
         extra: &HeaderMap,
         body: Bytes,
     ) -> Result<(hyper::Response<Incoming>, AbortOnDrop), (bool, String)> {
+        w.endpoint.require_secure_transport().map_err(|reason| (false, reason))?;
         let connect = TcpStream::connect(&w.endpoint.authority);
         let tcp = match tokio::time::timeout(self.config.connect_timeout, connect).await {
             Ok(Ok(tcp)) => tcp,
@@ -1097,6 +1196,8 @@ impl Coordinator {
         log: RequestLog,
     ) -> Result<Response, Failure> {
         let w = &self.workers[slot.index];
+        tracing::debug!(request_id = %log.request_id, worker = %w.endpoint.base,
+            upload_bytes = body.len(), attempt = log.attempt, "dispatching request payload");
         // Dropping the attempt on timeout drops its connection, which
         // cancels the work on the worker.
         let attempt = self.first_output(w, path, body, content_type.as_ref(), &log);
@@ -1167,6 +1268,13 @@ impl Coordinator {
         content_type: Option<&HeaderValue>,
         log: &RequestLog,
     ) -> Result<FirstOutput, Failure> {
+        if let Err(reason) = w.endpoint.require_secure_transport() {
+            return Err(Failure::Final(error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &reason,
+                "server_error", Some("secure_transport_required"),
+            )));
+        }
         let mut extra = HeaderMap::new();
         extra.insert(
             header::CONTENT_TYPE,
@@ -1177,16 +1285,22 @@ impl Coordinator {
         if let Ok(id) = HeaderValue::from_str(&log.request_id) {
             extra.insert(REQUEST_ID_HEADER, id);
         }
+        if let Some(owner) = &log.owner {
+            if let Ok(owner) = HeaderValue::from_str(owner) {
+                extra.insert(JOB_OWNER_HEADER, owner);
+            }
+        }
         if let Some(scope) = &log.cache_scope {
             extra.insert(crate::affinity::CACHE_SCOPE_HEADER, scope.parse().unwrap());
         }
         let (response, conn) = match self.send(w, Method::POST, path, &extra, body).await {
             Ok(ok) => ok,
-            Err((_, reason)) => {
+            Err((sent, reason)) => {
                 w.mark_unhealthy(reason.clone());
                 return Err(Failure::Retry {
                     reason,
                     admission: false,
+                    safe: !sent,
                 });
             }
         };
@@ -1203,6 +1317,7 @@ impl Coordinator {
                 return Err(Failure::Retry {
                     reason: "worker at capacity".to_string(),
                     admission: true,
+                    safe: true,
                 });
             }
             if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
@@ -1233,8 +1348,14 @@ impl Coordinator {
                     .to_ascii_lowercase()
                     .starts_with("text/event-stream")
             });
+        if log.owner.is_some() && is_stream {
+            return Err(Failure::Final(error_response(StatusCode::BAD_GATEWAY,
+                "job worker returned an unexpected stream", "server_error", Some("invalid_job_result"))));
+        }
         if !is_stream {
-            let limit = self.config.max_response_bytes;
+            let limit = if log.owner.is_some() {
+                self.config.max_response_bytes.min(log.response_limit)
+            } else { self.config.max_response_bytes };
             let body = match Limited::new(response.into_body(), limit).collect().await {
                 Ok(c) => c.to_bytes(),
                 Err(e) if e.downcast_ref::<LengthLimitError>().is_some() => {
@@ -1254,6 +1375,7 @@ impl Coordinator {
                     return Err(Failure::Retry {
                         reason,
                         admission: false,
+                        safe: false,
                     });
                 }
             };
@@ -1293,6 +1415,7 @@ impl Coordinator {
                     return Err(Failure::Retry {
                         reason,
                         admission: false,
+                        safe: false,
                     });
                 }
                 // Ended before one whole event: nothing reached the client,
@@ -1301,6 +1424,7 @@ impl Coordinator {
                     return Err(Failure::Retry {
                         reason: "worker closed the stream before output".to_string(),
                         admission: false,
+                        safe: false,
                     })
                 }
             }
@@ -1315,6 +1439,11 @@ impl Coordinator {
         body: Bytes,
     ) -> Response {
         let request_id = request_id_from(headers);
+        if path == "/v1/embeddings" {
+            if let Some(response) = self.embedding_jobs(headers, &body).await {
+                return response;
+            }
+        }
         // A transcription upload is multipart, and the boundary lives in the
         // client's `Content-Type`, not in the body.  The worker cannot parse
         // the upload without it, so it is forwarded on that route.  Every
@@ -1415,7 +1544,12 @@ impl Coordinator {
                 }
             };
             let index = slot.index;
+            let owner = if path == TRANSCRIPTIONS_PATH {
+                self.workers[index].status().info.as_ref()
+                    .and_then(|info| info.transcription_job.as_ref().map(|job| job.owner.clone()))
+            } else { None };
             let log = RequestLog {
+                response_limit: 2 << 20,
                 affinity_handle: handle.clone(),
                 cache_scope: Some(cache_scope.clone()),
                 request_id: request_id.clone(),
@@ -1424,13 +1558,17 @@ impl Coordinator {
                 attempt: tried.len() + 1,
                 queue_ms: arrived.elapsed().as_millis() as u64,
                 started: Instant::now(),
+                owner,
             };
             match self
                 .forward(slot, path, body.clone(), content_type.clone(), log)
                 .await
             {
                 Ok(response) | Err(Failure::Final(response)) => return response,
-                Err(Failure::Retry { reason, admission }) => {
+                Err(Failure::Retry { reason, admission, safe }) => {
+                    if matches!(path, TRANSCRIPTIONS_PATH | "/v1/embeddings") && !safe {
+                        return with_request_id(reject_response(Reject::Exhausted), &request_id);
+                    }
                     tracing::warn!(
                         request_id = %request_id,
                         worker = %self.workers[index].endpoint.base,
@@ -1448,6 +1586,8 @@ impl Coordinator {
 
 /// Per-attempt record for logs and response headers (no request content).
 struct RequestLog {
+    response_limit: usize,
+    owner: Option<String>,
     affinity_handle: Option<String>,
     cache_scope: Option<String>,
     request_id: String,
@@ -1729,6 +1869,9 @@ pub fn create_router(coordinator: Arc<Coordinator>) -> Router {
         );
     }
     let api = api.layer(middleware::from_fn_with_state(
+        crate::job_admission::Admission::default(),
+        crate::job_admission::admit,
+    )).layer(middleware::from_fn_with_state(
         Arc::clone(&coordinator),
         require_api_key,
     ));
@@ -1877,11 +2020,224 @@ mod tests {
     }
 
     #[test]
+    fn worker_transport_allows_only_literal_loopback_endpoints() {
+        for address in ["127.0.0.1:8081", "127.0.0.2:8081", "[::1]:8081"] {
+            assert!(Endpoint::new(address.parse().unwrap()).require_secure_transport().is_ok());
+        }
+        for address in ["0.0.0.0:8081", "10.0.0.2:8081", "[::]:8081", "[2001:db8::1]:8081"] {
+            assert!(Endpoint::new(address.parse().unwrap()).require_secure_transport().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_worker_sends_and_probes_never_open_a_plaintext_connection() {
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let mut config = CoordinatorConfig::new(vec![listener.local_addr().unwrap()]);
+        config.worker_api_key = Some("secret-worker-credential".to_string());
+        let coordinator = Coordinator::new(config).unwrap();
+        let worker = &coordinator.workers[0];
+        for path in ["/v1/chat/completions", "/v1/completions", "/v1/embeddings", TRANSCRIPTIONS_PATH] {
+            let log = RequestLog {
+                affinity_handle: None, cache_scope: None,
+                response_limit: 1024, owner: None, request_id: "sensitive-id".to_string(),
+                worker: worker.endpoint.base.clone(), path, attempt: 1, queue_ms: 0,
+                started: Instant::now(),
+            };
+            let payload = Bytes::from_static(b"private prompt or audio");
+            assert!(matches!(coordinator.send(worker, Method::POST, path,
+                &HeaderMap::new(), payload.clone()).await, Err((false, _))));
+            let Err(Failure::Final(response)) = coordinator.first_output(worker, path, payload, None, &log).await else {
+                panic!("remote job must fail closed");
+            };
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+            let body = String::from_utf8(body.to_vec()).unwrap();
+            assert!(body.contains("secure_transport_required"));
+            assert!(!body.contains("secret-worker-credential"));
+            assert!(!body.contains("private prompt"));
+        }
+        for _ in 0..2 {
+            coordinator.refresh().await;
+            let report = coordinator.status_report();
+            assert!(!report[0].healthy);
+            assert!(report[0].last_error.as_ref().unwrap().contains("loopback endpoint"));
+        }
+        assert!(tokio::time::timeout(Duration::from_millis(50), listener.accept()).await.is_err());
+    }
+
+    #[test]
     fn duplicate_or_missing_workers_are_rejected() {
         assert!(Coordinator::new(CoordinatorConfig::new(vec![])).is_err());
         let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
         let dup = vec![addr, addr];
         assert!(Coordinator::new(CoordinatorConfig::new(dup)).is_err());
+    }
+
+    #[tokio::test]
+    async fn unsent_audio_reservation_never_erases_external_occupancy() {
+        for send_refused in [false, true] {
+            let occupied = Arc::new(AtomicUsize::new(0));
+            let received = Arc::new(AtomicUsize::new(0));
+            let probes = Arc::new(AtomicUsize::new(0));
+            let app = Router::new()
+                .route(WORKER_INFO_PATH, get({
+                    let occupied = occupied.clone();
+                    let probes = probes.clone();
+                    move || {
+                        let occupied = occupied.clone();
+                        let probes = probes.clone();
+                        async move {
+                            probes.fetch_add(1, Ordering::SeqCst);
+                            Json(json!({
+                                "protocol_version": WORKER_PROTOCOL_VERSION,
+                                "model": "m", "n_ctx": 4096, "backend": "cpu",
+                                "max_concurrency": 1, "in_flight": 0,
+                                "transcription_in_flight": occupied.load(Ordering::SeqCst),
+                                "capabilities": {"transcriptions": true},
+                            }))
+                        }
+                    }
+                }))
+                .route(TRANSCRIPTIONS_PATH, post({
+                    let received = received.clone();
+                    move |_body: Bytes| {
+                        let received = received.clone();
+                        async move {
+                            received.fetch_add(1, Ordering::SeqCst);
+                            StatusCode::SERVICE_UNAVAILABLE
+                        }
+                    }
+                }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut config = CoordinatorConfig::new(vec![listener.local_addr().unwrap()]);
+            config.queue_depth = 0;
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let coordinator = Coordinator::new(config).unwrap();
+            coordinator.refresh().await;
+            let Pick::Slot(reservation) = coordinator.try_pick_audio(&[]) else {
+                panic!("initial audio reservation");
+            };
+            assert_eq!(received.load(Ordering::SeqCst), 0);
+            occupied.store(1, Ordering::SeqCst);
+            coordinator.refresh().await;
+            assert_eq!(coordinator.status_report()[0].external_in_flight, 1);
+            if send_refused {
+                let log = RequestLog {
+                    affinity_handle: None, cache_scope: None,
+                    response_limit: 1024, owner: None, request_id: "local-audio".to_string(),
+                    worker: coordinator.workers[0].endpoint.base.clone(), path: TRANSCRIPTIONS_PATH,
+                    attempt: 1, queue_ms: 0, started: Instant::now(),
+                };
+                assert!(matches!(coordinator.first_output(&coordinator.workers[0],
+                    TRANSCRIPTIONS_PATH, Bytes::from_static(b"local upload"), None, &log).await,
+                    Err(Failure::Retry { admission: true, .. })));
+            }
+            drop(reservation);
+            assert!(matches!(coordinator.try_pick_audio(&[]), Pick::Busy));
+            let work = RequestWork { context: None, units: 1 };
+            assert!(matches!(coordinator.acquire(TRANSCRIPTIONS_PATH, None, &work, &[], None).await,
+                Err(Reject::QueueFull)));
+            assert_eq!(probes.load(Ordering::SeqCst), 3);
+            assert_eq!(received.load(Ordering::SeqCst), usize::from(send_refused));
+            assert_eq!(coordinator.status_report()[0].external_in_flight, 1);
+            occupied.store(0, Ordering::SeqCst);
+            coordinator.refresh().await;
+            assert!(coordinator.acquire(TRANSCRIPTIONS_PATH, None, &work, &[], None).await.is_ok());
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn audio_revalidation_is_coalesced_and_cancellation_wakes_waiters() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = CoordinatorConfig::new(vec![listener.local_addr().unwrap()]);
+        config.queue_depth = 0;
+        let coordinator = Coordinator::new(config).unwrap();
+        {
+            let mut status = coordinator.workers[0].status();
+            status.healthy = true;
+            status.observed_audio_in_flight = 1;
+            status.audio_completion_epoch = 1;
+            status.info = Some(serde_json::from_value(json!({
+                "protocol_version": WORKER_PROTOCOL_VERSION,
+                "model": "m", "n_ctx": 4096, "backend": "cpu",
+                "max_concurrency": 1, "in_flight": 0,
+                "capabilities": {"transcriptions": true}
+            })).unwrap());
+        }
+        let refresh = tokio::spawn({
+            let coordinator = coordinator.clone();
+            async move { coordinator.refresh_completed_audio().await }
+        });
+        let (_connection, _) = tokio::time::timeout(Duration::from_secs(1), listener.accept()).await.unwrap().unwrap();
+        let mut acquisition = tokio::spawn({
+            let coordinator = coordinator.clone();
+            async move {
+                coordinator.acquire(TRANSCRIPTIONS_PATH, None,
+                    &RequestWork { context: None, units: 1 }, &[], None).await
+            }
+        });
+        assert!(tokio::time::timeout(Duration::from_millis(30), &mut acquisition).await.is_err());
+        assert!(tokio::time::timeout(Duration::from_millis(30), listener.accept()).await.is_err());
+        let notified = coordinator.released.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        refresh.abort();
+        assert!(refresh.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(1), notified).await.unwrap();
+        {
+            let mut status = coordinator.workers[0].status();
+            status.observed_audio_in_flight = 0;
+            status.audio_probe_epoch = status.audio_completion_epoch;
+        }
+        coordinator.released.notify_waiters();
+        let admitted = tokio::time::timeout(Duration::from_secs(1), acquisition).await.unwrap().unwrap();
+        assert!(admitted.is_ok());
+        drop(admitted);
+        assert!(coordinator.audio_refresh.try_lock().is_ok());
+    }
+
+    #[tokio::test]
+    async fn queued_generation_uses_freed_slot_during_unrelated_audio_probe() {
+        let audio = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let generation = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = CoordinatorConfig::new(vec![audio.local_addr().unwrap(), generation.local_addr().unwrap()]);
+        config.queue_depth = 1;
+        config.queue_timeout = Duration::from_secs(1);
+        config.connect_timeout = Duration::from_secs(5);
+        let coordinator = Coordinator::new(config).unwrap();
+        for (index, model) in ["audio", "m"].into_iter().enumerate() {
+            let mut status = coordinator.workers[index].status();
+            status.healthy = true;
+            status.info = Some(serde_json::from_value(json!({
+                "protocol_version": WORKER_PROTOCOL_VERSION,
+                "model": model, "n_ctx": 4096, "backend": "cpu",
+                "max_concurrency": 1, "in_flight": 0,
+                "capabilities": {"chat": true, "transcriptions": index == 0}
+            })).unwrap());
+        }
+        let work = RequestWork { context: None, units: 1 };
+        let Pick::Slot(occupied) = coordinator.try_pick("/v1/chat/completions", Some("m"), &work, &[], None) else {
+            panic!("initial generation slot");
+        };
+        let mut acquisition = tokio::spawn({
+            let coordinator = coordinator.clone();
+            async move { coordinator.acquire("/v1/chat/completions", Some("m"), &work, &[], None).await }
+        });
+        assert!(tokio::time::timeout(Duration::from_millis(30), &mut acquisition).await.is_err());
+        assert_eq!(coordinator.queued.load(Ordering::Acquire), 1);
+        {
+            let mut status = coordinator.workers[0].status();
+            status.observed_audio_in_flight = 1;
+            status.audio_completion_epoch = 1;
+        }
+        coordinator.released.notify_waiters();
+        let (_connection, _) = tokio::time::timeout(Duration::from_secs(1), audio.accept()).await.unwrap().unwrap();
+        drop(occupied);
+        let admitted = tokio::time::timeout(Duration::from_millis(300), acquisition).await.unwrap().unwrap();
+        assert!(admitted.is_ok());
+        assert_eq!(coordinator.queued.load(Ordering::Acquire), 0);
+        assert!(coordinator.audio_refresh.try_lock().is_ok());
     }
 
     #[test]

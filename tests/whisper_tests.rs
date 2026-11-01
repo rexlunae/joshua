@@ -257,6 +257,74 @@ fn whisper_rejects_unknown_language_and_empty_audio() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+#[tokio::test]
+async fn whole_audio_routing_matches_local_execution_with_whisper_only_registry() {
+    use axum::body::{to_bytes, Body};
+    use axum::http::{Request, StatusCode};
+    use joshua::coordinator::{Coordinator, CoordinatorConfig};
+    use joshua::server::{create_router, ModelRegistry, ServerState};
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    let dir = common::model_dir("whisper-route-synth");
+    write_tiny_whisper(&dir);
+    let whisper = Arc::new(WhisperEngine::new(&dir).unwrap());
+    let wav = tone_wav();
+    let expected = whisper.transcribe_wav(&wav, Some("en"), false).unwrap();
+    let llama_dir = common::model_dir("whisper-route-llama");
+    common::write_tiny_llama_gguf(&llama_dir.join("model.gguf"));
+    let engine = Arc::new(joshua::Engine::with_n_ctx(&llama_dir, 64).unwrap());
+    let worker = create_router(Arc::new(ServerState {
+        models: ModelRegistry::default(), whisper: Some(whisper), api_key: Some("secret".to_string()),
+        ..ServerState::new(engine)
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut config = CoordinatorConfig::new(vec![listener.local_addr().unwrap()]);
+    config.worker_api_key = Some("secret".to_string());
+    let server = tokio::spawn({
+        let worker = worker.clone();
+        async move { axum::serve(listener, worker).await.unwrap(); }
+    });
+    let coordinator = Coordinator::new(config).unwrap();
+    coordinator.refresh().await;
+    let report = coordinator.status_report();
+    let info = report[0].info.as_ref().unwrap();
+    assert!(report[0].healthy && info.capabilities.transcriptions);
+    assert!(!info.capabilities.chat && !info.capabilities.embeddings);
+    assert_eq!(info.transcription_job.as_ref().unwrap().input_format, "wav");
+    let router = joshua::coordinator::create_router(coordinator);
+    let request = |audio: &[u8], format: &str| {
+        let mut body = b"--audio\r\nContent-Disposition: form-data; name=\"file\"; filename=\"tone.wav\"\r\nContent-Type: audio/wav\r\n\r\n".to_vec();
+        body.extend_from_slice(audio);
+        body.extend_from_slice(format!("\r\n--audio\r\nContent-Disposition: form-data; name=\"language\"\r\n\r\nen\r\n--audio\r\nContent-Disposition: form-data; name=\"response_format\"\r\n\r\n{format}\r\n--audio--\r\n").as_bytes());
+        Request::post("/v1/audio/transcriptions").header("content-type", "multipart/form-data; boundary=audio")
+            .body(Body::from(body)).unwrap()
+    };
+    for format in ["json", "text"] {
+        let response = router.clone().oneshot(request(&wav, format)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+        if format == "text" {
+            assert_eq!(bytes.as_ref(), expected.text.as_bytes());
+        } else {
+            let result: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(result["text"], expected.text);
+            assert_eq!(result["duration"], expected.duration);
+            assert_eq!(result["language"], serde_json::json!(expected.language));
+        }
+    }
+    let bad = router.clone().oneshot(request(b"not a WAV", "json")).await.unwrap();
+    assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+    drop(bad);
+    let mut oversized = request(&vec![0; (25 << 20) + 1], "json");
+    oversized.headers_mut().insert("authorization", "Bearer secret".parse().unwrap());
+    let response = worker.clone().oneshot(oversized).await.unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    drop(response);
+    assert_eq!(router.oneshot(request(&wav, "text")).await.unwrap().status(), StatusCode::OK);
+    server.abort();
+}
+
 /// Build a WAV with an arbitrary declared sample rate and bit depth without
 /// writing samples — just enough header to reach the validation checks.
 fn wav_header(sample_rate: u32, bits_per_sample: u16) -> Vec<u8> {

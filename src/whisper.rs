@@ -65,6 +65,7 @@ pub struct Transcription {
 /// transcriptions serialise — matching the one-model-instance memory profile
 /// expected of a sidecar STT model.
 pub struct WhisperEngine {
+    pub(crate) job_owner: String,
     model: Mutex<Whisper>,
     pub(crate) admission: Arc<tokio::sync::Semaphore>,
     tokenizer: Tokenizer,
@@ -135,6 +136,7 @@ impl WhisperEngine {
         );
 
         Ok(Self {
+            job_owner: uuid::Uuid::new_v4().to_string(),
             model: Mutex::new(model),
             admission: Arc::new(tokio::sync::Semaphore::new(1)),
             transcribe_token: token(wm::TRANSCRIBE_TOKEN),
@@ -153,6 +155,10 @@ impl WhisperEngine {
     /// The model directory name, used as the API model identifier.
     pub fn model_name(&self) -> &str {
         &self.model_name
+    }
+
+    pub(crate) fn device(&self) -> &Device {
+        &self.device
     }
 
     /// Transcribe a WAV file (any sample rate / channel count).
