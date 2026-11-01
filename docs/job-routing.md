@@ -17,6 +17,8 @@ implementation marker. Hashing happens at registry load, not per job; it touches
 the whole mmap and its large-model startup/RSS cost remains unmeasured.
 Fan-out requires the same model ID, nonmissing matching revision, backend and
 input format. A missing revision pins all subbatches to one resident owner.
+Only healthy, embedding-eligible compatible owners contribute subbatch limits;
+an offline owner's cached limits cannot reduce a healthy owner's batches.
 Owner snapshots and `x-joshua-job-owner` reject unload/reload races. A different
 backend is deliberately not considered interchangeable even with identical weights.
 
@@ -66,11 +68,20 @@ retain the merged #240 cooperative cancellation and asynchronous Whisper
 admission; individual Candle calls and whole-audio mel remain non-preemptible.
 No temporary payload files are created. Audio slots account for observed external
 Whisper work and explicit worker-wide caps without changing affinity scoring.
+Refresh subtracts this coordinator's audio reservations from reported audio
+occupancy separately from generation occupancy. Admission uses current local
+audio reservations plus the external audio snapshot, so a completed local job
+does not remain busy until the next probe. Sequential uploads rotate their
+starting worker under the selection lock; the independent audio permit and
+configured worker-wide cap still apply. External occupancy remains a probe
+snapshot, not a globally synchronized reservation across coordinators.
 
 ## Retry and security contract
 
-Subjob IDs hash the parent request ID plus ordinal. They are stable for internal
-attempts, not a durable deduplication store or a client replay guarantee.
+Subjob IDs hash an independent random per-request identity plus ordinal. They
+are stable for internal attempts within that logical request, but independent
+of the client-visible `x-request-id`, even when a client reuses that header.
+This is not a durable deduplication store or a client replay guarantee.
 Retries use each eligible worker at most once and only after a pre-send failure
 or a worker 503 admission refusal. Transport/result loss after sending is
 ambiguous and is never automatically re-executed for embeddings or audio.
@@ -80,13 +91,18 @@ select a different Whisper model; cross-worker deterministic audio retry
 compatibility is not guaranteed.
 
 Client authentication and configured `worker_api_key` bearer authentication
-remain in place. Text/audio payload dispatch fails closed with 503
-`secure_transport_required` for non-loopback worker addresses: the current
+remain in place. All payload dispatch, including chat/completions, fails closed
+with 503 `secure_transport_required` for non-loopback worker addresses: the current
 coordinator transport is HTTP, even when built with the server `tls` feature.
+The central send path rejects these endpoints before connecting, so refresh
+probes also cannot transmit bearer credentials. Non-loopback workers remain
+unhealthy rather than entering the routing pool. Direct private-network worker
+addresses previously used for chat/completions and probes must be migrated.
 For multiple hosts, expose workers through authenticated encrypted tunnels
 bound on loopback and configure worker bearer keys. This code cannot verify the
-security of a user-managed tunnel. Health/registry probes still use the existing
-HTTP transport; native authenticated encrypted remote transport remains a gate.
+security of a user-managed tunnel; see `request-routing.md` for an SSH forwarding
+example and the tightened compatibility contract. Native authenticated encrypted
+remote transport remains a gate, not something supplied by a flag.
 
 ## Evidence and reproducibility
 
@@ -109,10 +125,47 @@ unchanged-base failure. Earlier macOS focused validation also passed.
 Run with `CARGO_BUILD_JOBS=2` and the environment's shared `CARGO_TARGET_DIR`:
 
 ```sh
-cargo test --lib --test route_tests --test whisper_tests --test server_tests --test controller_tests --no-default-features
+cargo test --lib --test route_tests --test whisper_tests --test server_tests --test controller_tests --no-default-features -- --test-threads=1
 cargo check --lib --no-default-features --features distributed,tls
 cargo test --test route_tests benchmark_embedding_jobs_loopback_acceptance_matrix -- --ignored --nocapture
 ```
+
+### PR #246 review follow-up, October 31, 2026
+
+The six review findings are covered by focused regressions: a probe during a
+locally dispatched audio job followed by completion and immediate readmission
+without another probe, external audio blocking, sequential audio rotation and
+the explicit worker cap, unhealthy/ineligible cached embedding owners with
+one-byte limits, repeated client IDs with independent internal IDs, and stable
+IDs across an admission retry. Transport tests exercise chat, completion,
+embedding and audio sends plus repeated refresh probes with a configured secret
+and sensitive payload; no TCP connection reaches the non-loopback listener.
+Existing loopback auth and real synthetic Llama/Whisper parity tests still pass.
+
+Validation ran on Erskin Linux x86_64 CPU, from the unique source copy
+`/tmp/joshua-246-review-9EDvdW5C`, using the existing
+`/tmp/joshua-prefix-201-NXjVJ2AM/target`, `CARGO_BUILD_JOBS=2`, `nice -n 19`,
+and serial test execution after #247 released the lane. Source hashes for both
+coordinator files and route tests matched this checkout. No local build or new
+target directory was used; existing services and other worktrees were untouched.
+
+- Default-feature library/controller/route/server/Whisper suites: respectively
+  494 / 3 / 44 / 9 / 6 passed, zero failures; 10 library tests and the exploratory
+  route benchmark remain ignored. The mock-NPU library has zero unit tests.
+- `cargo check --all-targets --features distributed,tls`: passed.
+- `cargo build --lib --bin joshua --features distributed,tls`: passed.
+- `cargo test --features distributed,tls --test route_tests -- --test-threads=1`:
+  45 passed, including HTTPS round-trip, one exploratory benchmark ignored.
+- `cargo test --lib --features distributed,tls coordinator:: -- --test-threads=1`:
+  11 passed, including transport rejection and bounded partition tests.
+- `git diff --check`: passed. Existing compiler warnings are not changed here.
+
+This follow-up measures correctness/admission, not throughput or latency; tiny
+synthetic GGUF fixtures and small fake-worker payloads do not substitute for
+pretrained real-audio, real-model or multi-host acceptance. No accelerator parity,
+peak RSS, network crossover, or independently verified remote SSH/tunnel run was
+performed. The gates below remain open, including #157; #247's supported-device
+parity also remains open.
 
 The ignored benchmark emits JSONL for 1/2/4 workers, 1/32/128 inputs,
 1/8 words and concurrency 1/4, direct versus routed, with warmup then eight
@@ -143,6 +196,10 @@ These illustrate dispatch overhead and fan-out, not real-model acceptance.
 - Separate CPU and available accelerator evidence, plus large-model revision
   hashing startup/RSS measurement. No accelerator performance claim is made.
 
-Overlap with #156: `src/coordinator.rs` and `tests/route_tests.rs` are shared
-files. This patch adds audio admission and job dispatch but does not alter the
-affinity scoring algorithm.
+Overlap with #156 / PR #247 (`5ca32afa361ce0b1ea1a35c74fb0155310367975`):
+`src/coordinator.rs`, `src/server.rs`, and `tests/route_tests.rs` are shared files
+across the PRs. This review follow-up changes coordinator probe accounting and
+transport plus route regressions; it does not change `src/server.rs` or affinity
+scoring. Expect coordinator/test merge conflicts; integration follows green
+validation. Neither #247's worktree nor the root checkout is modified. #156's
+supported-device parity gate and #157's acceptance gates remain open.

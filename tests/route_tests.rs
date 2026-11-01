@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use axum::body::{Body, Bytes};
 use axum::extract::State;
-use axum::http::{header, HeaderMap, StatusCode, Uri};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -65,6 +65,8 @@ enum Behavior {
 }
 
 struct Fake {
+    audio_active: AtomicUsize,
+    external_audio: AtomicUsize,
     embedding_jobs: Mutex<Vec<JobModel>>,
     completed: Mutex<Vec<(String, std::time::Instant)>>,
     bad_indexes: AtomicBool,
@@ -91,6 +93,14 @@ struct Fake {
 
 struct ActiveGuard(Arc<Fake>);
 
+struct AudioGuard(Arc<Fake>);
+
+impl Drop for AudioGuard {
+    fn drop(&mut self) {
+        self.0.audio_active.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 impl Drop for ActiveGuard {
     fn drop(&mut self) {
         self.0.active.fetch_sub(1, Ordering::SeqCst);
@@ -105,7 +115,8 @@ fn sse(data: &str) -> Bytes {
 async fn fake_info(State(f): State<Arc<Fake>>) -> Json<WorkerInfo> {
     Json(WorkerInfo {
         transcription_job: None,
-        transcription_in_flight: 0,
+        transcription_in_flight: f.audio_active.load(Ordering::SeqCst)
+            + f.external_audio.load(Ordering::SeqCst),
         embedding_jobs: f.embedding_jobs.lock().unwrap().clone(),
         protocol_version: WORKER_PROTOCOL_VERSION,
         model: f.model.clone(),
@@ -113,7 +124,8 @@ async fn fake_info(State(f): State<Arc<Fake>>) -> Json<WorkerInfo> {
         n_ctx: f.n_ctx.load(Ordering::SeqCst) as u32,
         backend: "cpu".to_string(),
         max_concurrency: f.max_concurrency,
-        in_flight: f.active.load(Ordering::SeqCst),
+        in_flight: f.active.load(Ordering::SeqCst)
+            .saturating_sub(f.audio_active.load(Ordering::SeqCst)),
         capabilities: WorkerCapabilities {
             chat: true,
             completions: true,
@@ -144,6 +156,8 @@ async fn fake_transcribe(
         .map(str::to_string);
     f.active.fetch_add(1, Ordering::SeqCst);
     let _guard = ActiveGuard(f.clone());
+    f.audio_active.fetch_add(1, Ordering::SeqCst);
+    let _audio_guard = AudioGuard(f.clone());
     let behavior = f.behavior.lock().unwrap().clone();
     match behavior {
         Behavior::Hang => std::future::pending::<()>().await,
@@ -346,6 +360,8 @@ async fn spawn_fake_handle(
     behavior: Behavior,
 ) -> (Arc<Fake>, String, tokio::task::JoinHandle<()>) {
     let fake = Arc::new(Fake {
+        audio_active: AtomicUsize::new(0),
+        external_audio: AtomicUsize::new(0),
         embedding_jobs: Mutex::new(Vec::new()),
         completed: Mutex::new(Vec::new()),
         bad_indexes: AtomicBool::new(false),
@@ -1878,6 +1894,7 @@ async fn embedding_jobs_retry_admission_but_never_reexecute_a_lost_result() {
             assert_eq!(response.status, StatusCode::OK, "{}", response.text());
             assert_eq!(response.json()["usage"]["prompt_tokens"], 1);
             assert_eq!(second.received.load(Ordering::SeqCst), 1);
+            assert_eq!(*first.last_request_id.lock().unwrap(), *second.last_request_id.lock().unwrap());
         }
     }
 }
@@ -1924,6 +1941,112 @@ async fn whole_audio_has_its_own_slot_and_does_not_block_embeddings() {
     assert_eq!(coordinator.status_report()[0].dispatched, 1);
     audio.abort();
     eventually("audio lease released", || coordinator.status_report()[0].dispatched == 0).await;
+}
+
+#[tokio::test]
+async fn completed_audio_is_not_retained_as_external_occupancy() {
+    let (worker, url) = spawn_fake("worker", "m", 1, Behavior::Gate).await;
+    worker.transcriptions.store(true, Ordering::SeqCst);
+    let mut settings = config(&[&url]);
+    settings.queue_depth = 0;
+    settings.worker_slots = Some(1);
+    let (coordinator, router) = spawn_router(settings).await;
+    let audio = tokio::spawn({
+        let router = router.clone();
+        async move { call(&router, "POST", "/v1/audio/transcriptions", "audio").await }
+    });
+    eventually("audio active", || worker.audio_active.load(Ordering::SeqCst) == 1).await;
+    coordinator.refresh().await;
+    assert_eq!(coordinator.status_report()[0].info.as_ref().unwrap().transcription_in_flight, 1);
+    assert_eq!(coordinator.status_report()[0].external_in_flight, 0);
+    worker.release.notify_one();
+    assert_eq!(audio.await.unwrap().status, StatusCode::OK);
+    eventually("audio released", || coordinator.status_report()[0].dispatched == 0).await;
+    *worker.behavior.lock().unwrap() = Behavior::Echo;
+    assert_eq!(call(&router, "POST", "/v1/audio/transcriptions", "next").await.status, StatusCode::OK);
+    worker.external_audio.store(1, Ordering::SeqCst);
+    coordinator.refresh().await;
+    assert_eq!(coordinator.status_report()[0].external_in_flight, 1);
+    let received = worker.received.load(Ordering::SeqCst);
+    assert_eq!(call(&router, "POST", "/v1/audio/transcriptions", "blocked").await.status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(worker.received.load(Ordering::SeqCst), received);
+    worker.external_audio.store(0, Ordering::SeqCst);
+    coordinator.refresh().await;
+    assert_eq!(call(&router, "POST", "/v1/audio/transcriptions", "available").await.status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn sequential_audio_rotates_workers_and_honors_worker_cap() {
+    let (first, first_url) = spawn_fake("first", "m", 1, Behavior::Echo).await;
+    let (second, second_url) = spawn_fake("second", "m", 1, Behavior::Echo).await;
+    first.transcriptions.store(true, Ordering::SeqCst);
+    second.transcriptions.store(true, Ordering::SeqCst);
+    let (_, router) = spawn_router(config(&[&first_url, &second_url])).await;
+    for _ in 0..6 {
+        assert_eq!(call(&router, "POST", "/v1/audio/transcriptions", "audio").await.status, StatusCode::OK);
+    }
+    assert_eq!(first.received.load(Ordering::SeqCst), 3);
+    assert_eq!(second.received.load(Ordering::SeqCst), 3);
+    *first.behavior.lock().unwrap() = Behavior::Gate;
+    let mut settings = config(&[&first_url]);
+    settings.worker_slots = Some(1);
+    settings.queue_depth = 0;
+    let (coordinator, router) = spawn_router(settings).await;
+    let generation = tokio::spawn({
+        let router = router.clone();
+        async move { chat(&router, json!({"model":"m","messages":[]})).await }
+    });
+    eventually("generation admitted", || first.active.load(Ordering::SeqCst) == 1).await;
+    assert_eq!(call(&router, "POST", "/v1/audio/transcriptions", "blocked").await.status, StatusCode::TOO_MANY_REQUESTS);
+    generation.abort();
+    eventually("worker lease released", || coordinator.status_report()[0].dispatched == 0).await;
+}
+
+#[tokio::test]
+async fn embedding_limits_ignore_unhealthy_and_ineligible_cached_owners() {
+    for unhealthy in [true, false] {
+        let (healthy, healthy_url) = spawn_fake("healthy", "m", 2, Behavior::Echo).await;
+        let (other, other_url, handle) = spawn_fake_handle("other", "m", 2, Behavior::Echo).await;
+        enable_embedding_jobs(&healthy, Some("same"));
+        enable_embedding_jobs(&other, Some("same"));
+        other.embedding_jobs.lock().unwrap()[0].max_input_bytes = 1;
+        other.embedding_jobs.lock().unwrap()[0].max_inputs = 1;
+        if !unhealthy {
+            *other.models.lock().unwrap() = vec![ModelSlots { id: "m".to_string(), n_ctx: Some(4096),
+                max_concurrency: 2, in_flight: 0, embeddings: false }];
+        }
+        let (coordinator, router) = spawn_router(config(&[&healthy_url, &other_url])).await;
+        if unhealthy {
+            handle.abort();
+            let _ = handle.await;
+            coordinator.refresh().await;
+            assert!(!coordinator.status_report()[1].healthy);
+            assert!(coordinator.status_report()[1].info.is_some());
+        }
+        let response = call(&router, "POST", "/v1/embeddings", r#"{"model":"m","input":["one","two","three","four"]}"#).await;
+        assert_eq!(response.status, StatusCode::OK, "{}", response.text());
+        assert_eq!(healthy.received.load(Ordering::SeqCst), 2);
+        assert_eq!(other.received.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn embedding_job_identity_is_independent_of_reused_client_request_id() {
+    let (worker, url) = spawn_fake("worker", "m", 1, Behavior::Echo).await;
+    enable_embedding_jobs(&worker, Some("same"));
+    let (_, router) = spawn_router(config(&[&url])).await;
+    let mut job_ids = Vec::new();
+    for _ in 0..2 {
+        let mut sender = open(&router).await;
+        let mut req = request("POST", "/v1/embeddings", r#"{"model":"m","input":["same"]}"#);
+        req.headers_mut().insert(REQUEST_ID_HEADER, HeaderValue::from_static("reused-client-id"));
+        let response = sender.send_request(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers().get(REQUEST_ID_HEADER).unwrap(), "reused-client-id");
+        response.into_body().collect().await.unwrap();
+        job_ids.push(worker.last_request_id.lock().unwrap().clone().unwrap());
+    }
+    assert_ne!(job_ids[0], job_ids[1]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

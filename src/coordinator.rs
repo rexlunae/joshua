@@ -295,6 +295,14 @@ struct Endpoint {
 }
 
 impl Endpoint {
+    fn require_secure_transport(&self) -> Result<(), String> {
+        if self.authority.parse::<SocketAddr>().is_ok_and(|address| address.ip().is_loopback()) {
+            Ok(())
+        } else {
+            Err("worker HTTP requires a loopback endpoint; use an authenticated encrypted tunnel for remote workers; native worker TLS is not implemented".to_string())
+        }
+    }
+
     fn new(addr: SocketAddr) -> Self {
         // `SocketAddr`'s Display brackets IPv6 hosts, as `Host` requires.
         let authority = addr.to_string();
@@ -313,6 +321,7 @@ struct WorkerStatus {
     /// Requests the worker runs for clients other than this coordinator, as
     /// of the last probe.
     external_in_flight: usize,
+    external_audio_in_flight: usize,
     /// The same per model, for a worker that reports its models' figures.
     external_by_model: HashMap<String, usize>,
     last_error: Option<String>,
@@ -634,16 +643,19 @@ impl Coordinator {
     pub async fn refresh(&self) {
         let probes = self.workers.iter().map(|w| async move {
             let before = w.dispatched.load(Ordering::Acquire);
+            let audio_before = w.audio_dispatched.load(Ordering::Acquire);
             let mut ours_by_model = w.by_model().clone();
             let result = self.probe(w).await;
             let after = w.dispatched.load(Ordering::Acquire);
+            let audio_after = w.audio_dispatched.load(Ordering::Acquire);
             for (model, n) in w.by_model().iter() {
                 let ours = ours_by_model.entry(model.clone()).or_default();
                 *ours = (*ours).max(*n);
             }
-            (w, result, before.max(after), ours_by_model)
+            let ours = before.saturating_sub(audio_before).max(after.saturating_sub(audio_after));
+            (w, result, ours, audio_before.max(audio_after), ours_by_model)
         });
-        for (w, result, ours, ours_by_model) in futures_util::future::join_all(probes).await {
+        for (w, result, ours, ours_audio, ours_by_model) in futures_util::future::join_all(probes).await {
             let mut st = w.status();
             match result {
                 Ok(info) if info.protocol_version != WORKER_PROTOCOL_VERSION => {
@@ -671,7 +683,9 @@ impl Coordinator {
                             "worker healthy"
                         );
                     }
-                    st.external_in_flight = info.in_flight.saturating_add(info.transcription_in_flight).saturating_sub(ours);
+                    st.external_audio_in_flight = info.transcription_in_flight.saturating_sub(ours_audio);
+                    st.external_in_flight = info.in_flight.saturating_sub(ours)
+                        .saturating_add(st.external_audio_in_flight);
                     st.external_by_model = info
                         .models
                         .iter()
@@ -989,6 +1003,7 @@ impl Coordinator {
         extra: &HeaderMap,
         body: Bytes,
     ) -> Result<(hyper::Response<Incoming>, AbortOnDrop), (bool, String)> {
+        w.endpoint.require_secure_transport().map_err(|reason| (false, reason))?;
         let connect = TcpStream::connect(&w.endpoint.authority);
         let tcp = match tokio::time::timeout(self.config.connect_timeout, connect).await {
             Ok(Ok(tcp)) => tcp,
@@ -1104,11 +1119,10 @@ impl Coordinator {
         content_type: Option<&HeaderValue>,
         log: &RequestLog,
     ) -> Result<FirstOutput, Failure> {
-        if matches!(path, "/v1/embeddings" | TRANSCRIPTIONS_PATH)
-            && !w.endpoint.authority.parse::<SocketAddr>().is_ok_and(|address| address.ip().is_loopback()) {
+        if let Err(reason) = w.endpoint.require_secure_transport() {
             return Err(Failure::Final(error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
-                "text/audio jobs require a loopback worker or an encrypted tunnel; native worker TLS is not implemented",
+                &reason,
                 "server_error", Some("secure_transport_required"),
             )));
         }
@@ -1803,6 +1817,51 @@ mod tests {
         assert_eq!(e.authority, "127.0.0.1:8081");
         let e = Endpoint::new("[::1]:9000".parse().unwrap());
         assert_eq!(e.authority, "[::1]:9000");
+    }
+
+    #[test]
+    fn worker_transport_allows_only_literal_loopback_endpoints() {
+        for address in ["127.0.0.1:8081", "127.0.0.2:8081", "[::1]:8081"] {
+            assert!(Endpoint::new(address.parse().unwrap()).require_secure_transport().is_ok());
+        }
+        for address in ["0.0.0.0:8081", "10.0.0.2:8081", "[::]:8081", "[2001:db8::1]:8081"] {
+            assert!(Endpoint::new(address.parse().unwrap()).require_secure_transport().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_worker_sends_and_probes_never_open_a_plaintext_connection() {
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let mut config = CoordinatorConfig::new(vec![listener.local_addr().unwrap()]);
+        config.worker_api_key = Some("secret-worker-credential".to_string());
+        let coordinator = Coordinator::new(config).unwrap();
+        let worker = &coordinator.workers[0];
+        for path in ["/v1/chat/completions", "/v1/completions", "/v1/embeddings", TRANSCRIPTIONS_PATH] {
+            let log = RequestLog {
+                response_limit: 1024, owner: None, request_id: "sensitive-id".to_string(),
+                worker: worker.endpoint.base.clone(), path, attempt: 1, queue_ms: 0,
+                started: Instant::now(),
+            };
+            let payload = Bytes::from_static(b"private prompt or audio");
+            assert!(matches!(coordinator.send(worker, Method::POST, path,
+                &HeaderMap::new(), payload.clone()).await, Err((false, _))));
+            let Err(Failure::Final(response)) = coordinator.first_output(worker, path, payload, None, &log).await else {
+                panic!("remote job must fail closed");
+            };
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+            let body = String::from_utf8(body.to_vec()).unwrap();
+            assert!(body.contains("secure_transport_required"));
+            assert!(!body.contains("secret-worker-credential"));
+            assert!(!body.contains("private prompt"));
+        }
+        for _ in 0..2 {
+            coordinator.refresh().await;
+            let report = coordinator.status_report();
+            assert!(!report[0].healthy);
+            assert!(report[0].last_error.as_ref().unwrap().contains("loopback endpoint"));
+        }
+        assert!(tokio::time::timeout(Duration::from_millis(50), listener.accept()).await.is_err());
     }
 
     #[test]

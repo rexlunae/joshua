@@ -15,9 +15,13 @@ impl Coordinator {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut busy = false;
         let mut tried = false;
-        for (index, worker) in self.workers.iter().enumerate() {
+        let count = self.workers.len();
+        let start = self.rotation.fetch_add(1, Ordering::Relaxed) % count;
+        for offset in 0..count {
+            let index = (start + offset) % count;
+            let worker = &self.workers[index];
             let status = worker.status();
-            let Some(info) = status
+            let Some(_) = status
                 .info
                 .as_ref()
                 .filter(|info| status.healthy && info.capabilities.transcriptions)
@@ -29,7 +33,7 @@ impl Coordinator {
                 continue;
             }
             let local = worker.audio_dispatched.load(Ordering::Acquire);
-            if local > 0 || info.transcription_in_flight > 0 {
+            if local.saturating_add(status.external_audio_in_flight) > 0 {
                 busy = true;
                 continue;
             }
@@ -75,15 +79,11 @@ impl Coordinator {
             .enumerate()
             .filter_map(|(index, worker)| {
                 let status = worker.status();
-                (!status.info.as_ref().is_some_and(|info| {
-                    info.embedding_jobs.iter().any(|job| {
-                        job.model == model
-                            && job.input_format == "text"
-                            && job.max_inputs > 0
-                            && job.max_input_bytes > 0
-                            && job.max_output_bytes > 0
-                    })
-                }))
+                (!(status.healthy
+                    && status
+                        .info
+                        .as_ref()
+                        .is_some_and(|info| embedding_owner(info, &model).is_some())))
                 .then_some(index)
             })
             .collect();
@@ -131,10 +131,7 @@ impl Coordinator {
             .info
             .clone()
             .ok_or_else(owner_changed)?;
-        let identity = info
-            .embedding_jobs
-            .iter()
-            .find(|job| job.model == model)
+        let identity = embedding_owner(&info, model)
             .cloned()
             .ok_or_else(owner_changed)?;
         let owners: Vec<_> = self
@@ -143,14 +140,11 @@ impl Coordinator {
             .enumerate()
             .map(|(index, worker)| {
                 let status = worker.status();
+                if !status.healthy || excluded.contains(&index) {
+                    return None;
+                }
                 let candidate = status.info.as_ref()?;
-                let job = candidate.embedding_jobs.iter().find(|job| {
-                    job.model == model
-                        && job.input_format == "text"
-                        && job.max_inputs > 0
-                        && job.max_input_bytes > 0
-                        && job.max_output_bytes > 0
-                })?;
+                let job = embedding_owner(candidate, model)?;
                 let compatible = index == anchor
                     || (identity.revision.is_some()
                         && job.revision == identity.revision
@@ -177,6 +171,7 @@ impl Coordinator {
         let batches = partition(&mut envelope, texts, max_inputs, max_bytes)?;
         let count: usize = batches.iter().map(|batch| batch.1).sum();
         let started = Instant::now();
+        let job_request_id = Uuid::new_v4();
         let mut first = Some(first);
         let jobs = batches
             .into_iter()
@@ -193,7 +188,7 @@ impl Coordinator {
                     drop(batch);
                     let job_id = format!(
                         "job-{:x}",
-                        Sha256::digest(format!("{request_id}:embedding:{ordinal}"))
+                        Sha256::digest(format!("{job_request_id}:embedding:{ordinal}"))
                     );
                     let response = self
                         .embedding_batch(model, owners, slot, payload, &job_id)
@@ -347,6 +342,24 @@ impl Coordinator {
             }
         }
     }
+}
+
+fn embedding_owner<'info>(info: &'info WorkerInfo, model: &str) -> Option<&'info JobModel> {
+    if !info.capabilities.embeddings
+        || !info.model_ids().any(|id| id == model)
+        || info
+            .slots_of(Some(model))
+            .is_some_and(|slots| !slots.embeddings)
+    {
+        return None;
+    }
+    info.embedding_jobs.iter().find(|job| {
+        job.model == model
+            && job.input_format == "text"
+            && job.max_inputs > 0
+            && job.max_input_bytes > 0
+            && job.max_output_bytes > 0
+    })
 }
 
 fn partition(

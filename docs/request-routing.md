@@ -17,15 +17,15 @@ HTTP servers that each run whole requests.
 ## Running it
 
 ```bash
-joshua serve --model m.gguf --addr 0.0.0.0:8081 --api-key w-key --max-concurrency 2
-joshua serve --model m.gguf --addr 0.0.0.0:8082 --api-key w-key --max-concurrency 2
-joshua route --worker 10.0.0.2:8081,10.0.0.3:8082 \
+joshua serve --model m.gguf --addr 127.0.0.1:8081 --api-key w-key --max-concurrency 2
+joshua serve --model m.gguf --addr 127.0.0.1:8082 --api-key w-key --max-concurrency 2
+joshua route --worker 127.0.0.1:8081,127.0.0.1:8082 \
   --worker-api-key w-key --api-key client-key --addr 0.0.0.0:8090
 ```
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--worker` (`JOSHUA_ROUTE_WORKERS`) | required | `ip:port` HTTP addresses of `joshua serve` workers, comma-separated or repeated. Plain HTTP. |
+| `--worker` (`JOSHUA_ROUTE_WORKERS`) | required | Loopback `ip:port` HTTP addresses of `joshua serve` workers or local encrypted-tunnel listeners, comma-separated or repeated. Non-loopback sends/probes fail closed. |
 | `--addr` | `127.0.0.1:8090` | Listen address. |
 | `--api-key` (`JOSHUA_API_KEY`) | none | Bearer key clients must send on `/v1` routes. |
 | `--worker-api-key` (`JOSHUA_WORKER_API_KEY`) | none | Bearer key sent to workers (their `--api-key`). |
@@ -206,7 +206,7 @@ The client-facing hop can be encrypted in-process, the same way as
 `joshua serve`:
 
 ```bash
-joshua route --worker 10.0.0.2:8081,10.0.0.3:8082 --api-key client-key \
+joshua route --worker 127.0.0.1:8081,127.0.0.1:8082 --api-key client-key \
   --tls-cert /etc/joshua/fullchain.pem --tls-key /etc/joshua/key.pem
 ```
 
@@ -216,15 +216,28 @@ together, and the binary must be built with `--features tls`, which pulls in
 `rustls` + `axum-server` (ring provider).  Without the feature the router
 refuses to start rather than silently serving plain HTTP.
 
-TLS is terminated at the router, so *worker* connections stay plain HTTP: the
-router authenticates to them with `--worker-api-key`.  That means the
-router–worker network still has to be trusted (or tunnelled); encrypting it
-would need a TLS client in the router and is not implemented.
+TLS is terminated at the router, not on its worker connections. The worker
+client supports HTTP only; `--features tls` and the router's TLS flags do not
+encrypt worker traffic. Every worker send, including registry probes, refuses
+non-loopback endpoints before connecting or attaching credentials. Such workers
+remain unhealthy and receive no payload or bearer key. This intentionally
+tightens compatibility: direct LAN, private-network and tailnet worker addresses
+are no longer accepted for HTTP traffic, even for chat/completions or probes.
+
+For remote workers, retain an actual authenticated encrypted tunnel with a
+loopback listener on the router host and a loopback worker endpoint on the remote
+host. For example, run `joshua serve --addr 127.0.0.1:8081 ...` remotely, then
+`ssh -N -L 127.0.0.1:18081:127.0.0.1:8081 worker-host` on the router host,
+and configure `joshua route --worker 127.0.0.1:18081 ...`. Verify SSH host keys,
+authentication, and tunnel deployment separately. The router permits the local
+HTTP hop; it cannot attest what a local forwarder does beyond that hop. A flag,
+private IP, or local plaintext proxy is not encryption. Native worker TLS is
+not implemented.
 
 ## Limits of this first version
 
-* Plain HTTP to workers (no TLS client); run workers on a trusted network or
-  behind a TLS-terminating tunnel.  The router itself serves plain HTTP
+* Loopback HTTP to workers (no TLS client); remote workers require independently
+  verified authenticated encrypted tunnels. The router itself serves plain HTTP
   unless `--tls-cert`/`--tls-key` are given (see above).
 * Routing uses model id, slots, reported in-flight count and bounded work
   hints from input bytes and output budgets. Explicit chat context windows
