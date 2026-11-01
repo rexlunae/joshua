@@ -193,6 +193,28 @@ passes. `audio_revalidation_is_coalesced_and_cancellation_wakes_waiters` verifie
 that competing acquisitions do not start duplicate refresh connections and an
 aborted refresher unlocks and notifies queued work.
 
+The next admission follow-up makes callers await a shared in-progress audio
+revalidation instead of treating its stale occupancy as a final busy decision.
+Selection checks available eligible slots before awaiting that refresh and on
+every slot-release notification, so a slow unrelated probe cannot hold a newly
+free generation worker behind it. Already queued callers retain their original
+queue deadline; cancelling the selection drops the refresh future and its lock.
+The coalescing regression includes a zero-depth concurrent acquisition, and
+`queued_generation_uses_freed_slot_during_unrelated_audio_probe` holds an audio
+probe open while releasing a different generation worker, requiring immediate
+admission without waiting for that probe's response.
+
+This admission follow-up was validated on macOS arm64 with Rust
+1.99.0-nightly (`d453bdd8f`), the existing shared target, two build jobs,
+incremental compilation disabled and serial tests. With no default features
+(the package default is empty), 488 library, 45 route and 9 server tests passed;
+10 library tests and one exploratory routing benchmark remained ignored.
+With `distributed,tls`, all 13 focused coordinator tests, 46 route tests and
+10 server tests passed, including HTTPS round-trip. The combined-feature
+all-target check and `git diff --check` passed. Logs are retained at
+`/tmp/joshua-246-audio-admission-{default-suites,features,feature-routes,check}.log`.
+These are correctness and admission regressions, not new throughput evidence.
+
 Final ownership-race validation used the unique source directory
 `/tmp/joshua-246-audio-race-sVbg5CBo`, the same existing target, jobs=2,
 nice=19 and serial tests. Other observed CPU-heavy work was allowed to finish

@@ -957,6 +957,30 @@ impl Coordinator {
         Pick::Reject(Reject::Unavailable)
     }
 
+    async fn pick_after_audio_refresh(
+        self: &Arc<Self>,
+        path: &str,
+        model: Option<&str>,
+        work: &RequestWork,
+        exclude: &[usize],
+    ) -> Pick {
+        let refresh = self.refresh_completed_audio();
+        tokio::pin!(refresh);
+        loop {
+            let notified = self.released.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            match self.try_pick(path, model, work, exclude) {
+                Pick::Busy => {}
+                result => return result,
+            }
+            tokio::select! {
+                _ = &mut refresh => return self.try_pick(path, model, work, exclude),
+                _ = notified => {}
+            }
+        }
+    }
+
     /// Reserve a slot, waiting in the bounded queue while every eligible
     /// worker is full.
     async fn acquire(
@@ -966,8 +990,7 @@ impl Coordinator {
         work: &RequestWork,
         exclude: &[usize],
     ) -> Result<SlotGuard, Reject> {
-        self.refresh_completed_audio().await;
-        match self.try_pick(path, model, work, exclude) {
+        match self.pick_after_audio_refresh(path, model, work, exclude).await {
             Pick::Slot(slot) => return Ok(slot),
             Pick::Reject(r) => return Err(r),
             Pick::Busy => {}
@@ -984,10 +1007,13 @@ impl Coordinator {
             let notified = self.released.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            tokio::time::timeout_at(deadline, self.refresh_completed_audio())
+            let picked = tokio::time::timeout_at(
+                deadline,
+                self.pick_after_audio_refresh(path, model, work, exclude),
+            )
                 .await
                 .map_err(|_| Reject::QueueTimeout)?;
-            match self.try_pick(path, model, work, exclude) {
+            match picked {
                 Pick::Slot(slot) => return Ok(slot),
                 Pick::Reject(r) => return Err(r),
                 Pick::Busy => {}
@@ -1973,19 +1999,34 @@ mod tests {
     #[tokio::test]
     async fn audio_revalidation_is_coalesced_and_cancellation_wakes_waiters() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let coordinator = Coordinator::new(CoordinatorConfig::new(vec![listener.local_addr().unwrap()])).unwrap();
+        let mut config = CoordinatorConfig::new(vec![listener.local_addr().unwrap()]);
+        config.queue_depth = 0;
+        let coordinator = Coordinator::new(config).unwrap();
         {
             let mut status = coordinator.workers[0].status();
             status.healthy = true;
             status.observed_audio_in_flight = 1;
             status.audio_completion_epoch = 1;
+            status.info = Some(serde_json::from_value(json!({
+                "protocol_version": WORKER_PROTOCOL_VERSION,
+                "model": "m", "n_ctx": 4096, "backend": "cpu",
+                "max_concurrency": 1, "in_flight": 0,
+                "capabilities": {"transcriptions": true}
+            })).unwrap());
         }
         let refresh = tokio::spawn({
             let coordinator = coordinator.clone();
             async move { coordinator.refresh_completed_audio().await }
         });
         let (_connection, _) = tokio::time::timeout(Duration::from_secs(1), listener.accept()).await.unwrap().unwrap();
-        tokio::time::timeout(Duration::from_secs(1), coordinator.refresh_completed_audio()).await.unwrap();
+        let mut acquisition = tokio::spawn({
+            let coordinator = coordinator.clone();
+            async move {
+                coordinator.acquire(TRANSCRIPTIONS_PATH, None,
+                    &RequestWork { context: None, units: 1 }, &[]).await
+            }
+        });
+        assert!(tokio::time::timeout(Duration::from_millis(30), &mut acquisition).await.is_err());
         assert!(tokio::time::timeout(Duration::from_millis(30), listener.accept()).await.is_err());
         let notified = coordinator.released.notified();
         tokio::pin!(notified);
@@ -1993,6 +2034,58 @@ mod tests {
         refresh.abort();
         assert!(refresh.await.unwrap_err().is_cancelled());
         tokio::time::timeout(Duration::from_secs(1), notified).await.unwrap();
+        {
+            let mut status = coordinator.workers[0].status();
+            status.observed_audio_in_flight = 0;
+            status.audio_probe_epoch = status.audio_completion_epoch;
+        }
+        coordinator.released.notify_waiters();
+        let admitted = tokio::time::timeout(Duration::from_secs(1), acquisition).await.unwrap().unwrap();
+        assert!(admitted.is_ok());
+        drop(admitted);
+        assert!(coordinator.audio_refresh.try_lock().is_ok());
+    }
+
+    #[tokio::test]
+    async fn queued_generation_uses_freed_slot_during_unrelated_audio_probe() {
+        let audio = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let generation = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = CoordinatorConfig::new(vec![audio.local_addr().unwrap(), generation.local_addr().unwrap()]);
+        config.queue_depth = 1;
+        config.queue_timeout = Duration::from_secs(1);
+        config.connect_timeout = Duration::from_secs(5);
+        let coordinator = Coordinator::new(config).unwrap();
+        for (index, model) in ["audio", "m"].into_iter().enumerate() {
+            let mut status = coordinator.workers[index].status();
+            status.healthy = true;
+            status.info = Some(serde_json::from_value(json!({
+                "protocol_version": WORKER_PROTOCOL_VERSION,
+                "model": model, "n_ctx": 4096, "backend": "cpu",
+                "max_concurrency": 1, "in_flight": 0,
+                "capabilities": {"chat": true, "transcriptions": index == 0}
+            })).unwrap());
+        }
+        let work = RequestWork { context: None, units: 1 };
+        let Pick::Slot(occupied) = coordinator.try_pick("/v1/chat/completions", Some("m"), &work, &[]) else {
+            panic!("initial generation slot");
+        };
+        let mut acquisition = tokio::spawn({
+            let coordinator = coordinator.clone();
+            async move { coordinator.acquire("/v1/chat/completions", Some("m"), &work, &[]).await }
+        });
+        assert!(tokio::time::timeout(Duration::from_millis(30), &mut acquisition).await.is_err());
+        assert_eq!(coordinator.queued.load(Ordering::Acquire), 1);
+        {
+            let mut status = coordinator.workers[0].status();
+            status.observed_audio_in_flight = 1;
+            status.audio_completion_epoch = 1;
+        }
+        coordinator.released.notify_waiters();
+        let (_connection, _) = tokio::time::timeout(Duration::from_secs(1), audio.accept()).await.unwrap().unwrap();
+        drop(occupied);
+        let admitted = tokio::time::timeout(Duration::from_millis(300), acquisition).await.unwrap().unwrap();
+        assert!(admitted.is_ok());
+        assert_eq!(coordinator.queued.load(Ordering::Acquire), 0);
         assert!(coordinator.audio_refresh.try_lock().is_ok());
     }
 

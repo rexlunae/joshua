@@ -9,9 +9,7 @@ const PARALLEL_BATCHES: usize = 4;
 
 impl Coordinator {
     pub(super) async fn refresh_completed_audio(&self) {
-        let Ok(refresh) = self.audio_refresh.try_lock() else {
-            return;
-        };
+        let refresh = self.audio_refresh.lock().await;
         let stale = self.workers.iter().any(|worker| {
             let status = worker.status();
             status.healthy
