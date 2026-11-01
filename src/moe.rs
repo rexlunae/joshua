@@ -307,6 +307,60 @@ pub(crate) fn qmatmul_bytes(weight: &candle_core::quantized::QMatMul) -> Option<
     }
 }
 
+pub(crate) fn compact_expert_slot<'a>(
+    tensors: impl Iterator<Item = (&'a str, &'a [usize], u32)>,
+) -> Option<u64> {
+    if ["CANDLE_DEQUANTIZE_ALL", "CANDLE_DEQUANTIZE_ALL_F16"].iter().any(|name| {
+        std::env::var(name).is_ok_and(|value| !value.is_empty() && value != "0")
+    }) {
+        return None;
+    }
+    let mut layers = std::collections::HashMap::<&str, (u64, u8)>::new();
+    for (name, dims, dtype) in tensors {
+        let Some((prefix, projection)) = name.rsplit_once(".ffn_") else { continue };
+        let bit = match projection {
+            "gate_exps.weight" => 1,
+            "up_exps.weight" => 2,
+            "down_exps.weight" => 4,
+            _ => continue,
+        };
+        let [experts, rows, cols] = dims else { return None };
+        if *experts == 0 || *rows == 0 || *cols == 0 || matches!(dtype, 0 | 1 | 30) {
+            return None;
+        }
+        let dtype = crate::gguf_ext::ggml_dtype_from_id(dtype)?;
+        if !cols.is_multiple_of(dtype.block_size()) {
+            return None;
+        }
+        let bytes = rows.checked_mul(*cols)? / dtype.block_size();
+        let bytes = bytes.checked_mul(dtype.type_size())? as u64;
+        let layer = layers.entry(prefix).or_default();
+        layer.0 = layer.0.checked_add(bytes)?;
+        layer.1 |= bit;
+    }
+    if layers.is_empty() || layers.values().any(|(_, mask)| *mask != 7) {
+        return None;
+    }
+    layers.values().map(|(bytes, _)| *bytes).max()
+}
+
+pub(crate) fn usable_expert_cache_budget(
+    content: &candle_core::quantized::gguf_file::Content,
+    raw: Option<&crate::gguf_ext::GgufHeader>,
+    budget: Option<u64>,
+) -> Option<u64> {
+    let budget = budget.filter(|bytes| *bytes > 0)?;
+    let slot = match raw {
+        Some(raw) => compact_expert_slot(raw.tensors.iter().map(|(name, info)| {
+            (name.as_str(), info.dims.as_slice(), info.dtype)
+        })),
+        None => compact_expert_slot(content.tensor_infos.iter().map(|(name, info)| {
+            (name.as_str(), info.shape.dims(), crate::gguf_ext::ggml_id_from_dtype(info.ggml_dtype))
+        })),
+    }?;
+    (slot > 0 && budget >= slot).then_some(budget)
+}
+
 pub(crate) fn device_cache<E, T>(
     experts: Vec<Vec<E>>,
     cpu: crate::residency::CpuResidency,
@@ -912,6 +966,25 @@ mod tests {
     use super::*;
     use candle_core::quantized::QMatMul;
     use candle_core::Module;
+
+    #[test]
+    fn compact_slot_uses_exact_blocks_per_projection() {
+        let tensors = [
+            ("blk.0.ffn_gate_exps.weight", [8, 256, 256], 12),
+            ("blk.0.ffn_up_exps.weight", [8, 256, 256], 14),
+            ("blk.0.ffn_down_exps.weight", [8, 256, 256], 8),
+        ];
+        let slot = compact_expert_slot(tensors.iter().map(|(name, dims, dtype)| {
+            (*name, dims.as_slice(), *dtype)
+        }));
+        assert_eq!(slot, Some(256 * 144 + 256 * 210 + 2048 * 34));
+        assert_eq!(compact_expert_slot(tensors[..2].iter().map(|(name, dims, dtype)| {
+            (*name, dims.as_slice(), *dtype)
+        })), None);
+        assert_eq!(compact_expert_slot(std::iter::once((
+            "blk.0.ffn_gate_exps.weight", [8, 256, 255].as_slice(), 12,
+        ))), None);
+    }
 
     #[test]
     fn topk_never_selects_nan_when_finite_available() -> Result<()> {

@@ -2500,13 +2500,20 @@ impl Engine {
                 let draft_bytes = crate::draft_model::resident_bytes(path).unwrap_or(0);
                 // Native bounded-cache loaders keep their source experts on
                 // the host, with the cache on the expert or dense device.
-                let accel = |d: &Device| d.is_opencl() || d.is_sycl() || d.is_vulkan() || d.is_cuda();
+                let accel = |d: &Device| !d.is_cpu();
                 let ds4 = a.is_deepseek4();
-                let cache = device_expert_cache.filter(|&b| b > 0);
+                let cache = if ds4 {
+                    device_expert_cache.filter(|&b| b > 0)
+                } else {
+                    let slot = crate::moe::compact_expert_slot(raw.tensors.iter().map(|(name, info)| {
+                        (name.as_str(), info.dims.as_slice(), info.dtype)
+                    }));
+                    device_expert_cache.filter(|&bytes| slot.is_some_and(|slot| slot > 0 && bytes >= slot))
+                };
                 let bounded = ds4
                     || (a.is_native()
                         && a != Architecture::NemotronH
-                        && device_expert_cache.is_some());
+                        && cache.is_some());
                 let pool_on_device = !bounded && !expert_device.is_cpu();
                 let cache_on_device = if bounded {
                     cache.filter(|_| accel(&expert_device) || accel(&dense_device))

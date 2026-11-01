@@ -42,8 +42,9 @@ ordinary `from_data`, allocating and copying on the compute stream. It now uses
 one lazily created non-blocking transfer stream per `CudaDevice` (shared by its
 clones). The worker completes that stream before returning the storage; only
 then may `DeviceResidency` publish it. Compact blocks and existing kernel padding
-are preserved. No pinned staging allocation, raw FFI, pending-slot readiness
-state, or change to cache eviction/hot-set policy is introduced.
+are preserved. No pinned staging allocation, raw FFI, or pending-slot readiness
+state is introduced. Completion ownership and the one-slot hot policy were
+subsequently corrected during review, as described below.
 Cudarc can synchronize the context once when the first owned stream is created
 to enter multi-stream mode; the per-upload completion wait is stream-local.
 
@@ -59,28 +60,204 @@ to the pool's existing logical-payload accounting.
 
 This change wires qwen3moe/deepseek2 to one model-wide `CompositeResidency` and
 background uploader rather than unreachable per-layer pools behind a CPU-only
-session residency. With an explicit cache option, compact source experts remain
+session residency. With a usable explicit cache budget, compact source experts remain
 on the host (mmap or streamed loading); the destination is the requested expert
 device, or the dense device when experts are host-placed. Uploads use the shared
 transfer path; dispatch looks up the device payload, moves activations to its
-actual device, and retires the payload after enqueueing its work. Misses retain
+actual device, and holds a launch-owned lease through compute-queue completion. Misses retain
 host execution. No full expert-pool f32 materialization or per-session weight
 copy is introduced.
 
 Slots reserve the largest compact gate/up/down payload, with the total budget
 capped at that reservation times the actual expert count. Auto hot-set sizing
 uses three quarters of resolved slots instead of host RAM (at least one tracked
-expert for a nonempty single-slot pool, so uploads are not disabled); refresh replaces the
+expert for a nonempty single-slot pool, which protects that slot and refuses cold
+uploads until the next hot-set replacement); refresh replaces the
 capped protected set instead of accumulating stale protected members. Sessions
 share the pool and uploader, but their frequency histories remain independent:
 one session can still replace another's protected set. **Disjoint-session
 no-thrash policy is not solved.** Logical payload accounting excludes backend
-padding, transient activations, and retired in-flight payloads; it is not a hard
+padding and transient activations/upload or destruction workspace; it is not a hard
 bound on all CUDA allocations.
+
+### PR #248 review follow-up (2026-10-31)
+
+The model-wide retirement list and its age-based overflow deletion are removed.
+Every successful lookup now returns a launch-owned `DeviceExpertLease`. The
+pool's mutex serializes lookup with victim selection: a payload with another
+strong reference cannot be evicted or explicitly released, and remains charged
+to `resident_bytes`. Before releasing its reference, the lease synchronizes the
+payload's actual compute device/queue. This also runs on dispatch `?`, unwind,
+and session/model teardown; destroying the pool does not destroy a live lease.
+A failed backend completion fence aborts rather than releasing potentially live
+weights or retaining an unbounded error list. A routing readback in a different
+session has no reclamation authority. Qwen, DeepSeek2, and the shared DeepSeek4
+pool use this same contract. **This is bounded synchronous cached dispatch,
+not evidence of asynchronous compute/upload overlap.**
+
+For Metal the lease uses `flush_and_wait_current`, retaining the specific
+committed command buffer while waiting. The general `Device::synchronize`
+drains a shared in-flight list and can return early if another thread already
+took that list; it is not the lease completion primitive. CUDA waits on the
+payload's compute stream; OpenCL/SYCL/Vulkan use their queue completion fences.
+Only CUDA was executed in this follow-up; Metal and other accelerator behavior
+was inspected, not rerun or locally rebuilt.
+
+Before overriding an explicitly requested expert device, Qwen and DeepSeek2
+resolve the largest complete gate/up/down compact payload from the GGUF tensor
+shapes and block types. A zero, sub-slot, incomplete, or noncompact configuration
+does not force CPU sources and builds no cache. The exact Q4_K fixture slot is
+`3 * (256 * 256 / 256 * 144) = 110592` bytes. Draft admission uses the same
+compact-slot feasibility policy and includes Metal alongside the other device
+backends. Both mmap and streamed placement are tested at zero, slot-minus-one,
+and exactly one slot, inspecting the actual loaded expert device.
+
+When that explicit cache is usable, Qwen suppresses `JOSHUA_GPU_WEIGHT_CACHE`.
+Inspection of `WeightCache::new` confirms that it previously only created an
+empty host-side map and retained the mmap/device handles: its numeric capacity
+was **not a VRAM reservation**. Device allocation occurs lazily in `forward`,
+which host source experts did not call. Suppression makes the precedence
+explicit and avoids constructing the unused cache at all.
+
+Physical accounting remains distinct: the logical slot budget includes active
+leases and upload reservations, with no model-wide retired-payload allowance.
+Backend quantized-buffer padding, dense weights, KV, activations, driver/allocator
+retention, and temporary upload/deletion workspace are additional. Payloads
+selected for deletion are dropped outside the pool lock; concurrent acquisition
+may overlap that destructor with the next reservation. Thus logical accounting
+is not a hard bound on process-wide VRAM or transient allocation peaks.
+
+### Review validation and remaining blockers
+
+All follow-up accelerator runs used kleya's RTX 5060 Ti with the existing
+CPU :8080 and CUDA :8081 services intact (PIDs 4061392 and 4063925). Before tiny
+GPU tests, free VRAM was about 12,500 MiB. No large models or local builds were
+started. Sources live in `/tmp/joshua-248-devin-20261031-171830`; commands used
+`CARGO_BUILD_JOBS=2`, `nice -n 19`, and the existing shared target
+`/home/tserica/joshua-cache-62-52-ff7528ad/target`. Changed source files were
+touched after baseline builds before rebuilding the candidate; passing an old
+shared-target binary is not counted as candidate validation.
+
+`final-validation.log` records:
+
+- 497 library tests passed, 10 ignored, including exact block sizing, one-slot
+  protected-hot churn, active leases remaining charged through hundreds of
+  acquisitions, and a blocking completion fence preventing payload destruction.
+- Both CUDA placement tests passed, inspecting actual expert devices for
+  `None`, zero, slot-minus-one, and exact-slot budgets, streamed and mmap loads.
+  `final-overlap-placement.log` repeats these with `JOSHUA_GPU_WEIGHT_CACHE=1`:
+  2 passed. `final-check.log`: `cargo check --features cuda --all-targets` passed.
+- The deterministic actual-GPU lifetime regression passed: A completes a
+  readback, B holds a lease and queues 33 expert matmuls, A attempts 300
+  acquisitions/releases, then B queues another launch and returns an injected
+  error. Sixteen cycles verify the payload stays charged and cannot be freed;
+  pool destruction with a live lease is also covered.
+- The 72-token greedy-continuation test passed for Qwen and DeepSeek2 against
+  CUDA-dense/CPU-expert execution, plus all-CPU numerical reference and three
+  all-row verification logits. Maximum cache-vs-host absolute errors were
+  0.018511906 and 0.03250295, respectively. Dropping a queued session and
+  continuing another session is covered. Existing tolerances are unchanged.
+- The separate all-CPU numerical-reference test passed with disabled and
+  three-slot caches. It does **not** establish CPU/CUDA greedy identity:
+  DeepSeek2's offset-26 winner is 15 on CUDA versus 3 on CPU, with maximum
+  absolute error 0.07400927, in both modes.
+- CUDA integration finished **5 passed, 1 failed, 1 ignored**. The failing new
+  test was `cuda_older_loaders_interleaved_eviction_numerical_parity`, with
+  `0.73215044 != 2.1182497` in concurrent Qwen execution. An earlier run passed
+  the same churn test, but recorded 4 and 1 DeepSeek2 greedy disagreements for
+  its two sessions. The original strict shared-cache test passed in the final
+  run but failed intermittently in repetition (4/5 repeated runs passed;
+  failing example `-0.39236903 != 1.2431526`). These are not green parity gates.
+
+The final churn harness preloads both reference models before starting all
+three workers, so no failure can strand the uploader at its start barrier.
+`final-churn-{1..3}.log` records this version: two failures
+(`1.5724974 != 1.2495484`, `-0.566552 != -0.7212319`) and one numerical pass.
+That pass exercised 401 Qwen and 70 DeepSeek2 evictions, with three resident
+slots and 331776 logical bytes each, but still reported 5 and 2 DeepSeek2
+greedy disagreements. It does not replace the original strict greedy test or
+clear concurrent-output acceptance.
+
+The intermittent concurrent numerical failure is independently reproducible
+with **no expert cache at all** on unchanged pre-review source. The original
+artifact `/tmp/joshua-62-20261031.YI3I9oOi` has Qwen source SHA256
+`fa661ca1a9b4c4fa7e8c26fc1b1e2d2bb6b6f0abb7c6859ae72583851d64bbfb`
+and residency SHA256
+`494406ece0dba15fc1ba85b28bc784e4b881110a69c936b7f94b57d977ad6754`,
+matching `9736eb6`. `baseline-concurrent-repeat-{1..6}.log` in the follow-up
+directory records the unchanged strict test: 2 passed, 4 failed; examples
+`1.2475119 != 0.8166167` and `-0.11178517 != 1.1484298`.
+The standalone diagnostic
+`/tmp/joshua-62-20261031.YI3I9oOi/tests/cuda_dense_concurrency_probe.rs`
+loads all models with `Some(0)` and asserts no pool exists. Running
+`cargo test --release --features cuda --test cuda_dense_concurrency_probe -- --nocapture --test-threads=1`
+on that artifact failed twice in three runs: offset 7
+`1.2651038 != 1.072143` and offset 42 `0.17209363 != 0.16552365`
+(`baseline-no-cache-{1..3}.log`). Its stricter diagnostic threshold is not a
+change to any existing test. The source of this cache-independent CUDA
+concurrency failure is not established or fixed here; it remains an output
+parity acceptance blocker, not evidence that the new lifetime regression passed
+end-to-end model parity.
+
+Other exact baseline reproductions are retained: `baseline-9736-cpu-reference-2.log`
+records the same disabled-cache DeepSeek2 CPU/CUDA winner divergence, and
+`baseline-9736-churn-2.log` records the strict adversarial-churn 3-versus-6
+DeepSeek2 greedy mismatch on the pre-review source. The diagnostic test for the
+latter remains at
+`/tmp/joshua-62-20261031.YI3I9oOi/tests/cuda_churn_baseline_probe.rs`.
+No tolerance was loosened to call these passes.
+
+`integration-review.log` records CUDA-feature builds with CUDA explicitly hidden
+for CPU/fallback validation: DeepSeek2 12 passed, external draft 7 passed,
+memory placement 13 passed, Qwen3MoE 8 passed, speculative 22 passed. These are
+not GPU passes. The original CUDA-visible speculative baseline failure log
+`/tmp/joshua-62-base-SnqkN1/baseline-speculative.log` is preserved: ten foreign
+CUDA expert-device load failures and two `unsupported dtype for quantized matmul
+Iq2Xxs` failures on unchanged `99d2ddb`. Exact failing names:
+
+```text
+deepseek2_speculative_greedy_matches_plain_decoding
+deepseek4_speculative_greedy_matches_plain_decoding
+deepseek4_speculative_speeds_up_repetitive_output
+draft_model_greedy_matches_plain_decoding_deepseek2
+draft_model_greedy_matches_plain_decoding_qwen3moe
+draft_model_sampling_matches_plain_sampling_distribution
+kda_hybrid_speculates_without_changing_output
+qwen3moe_speculative_greedy_matches_plain_decoding
+recurrent_hybrid_speculates_without_changing_output
+sampled_self_draft_matches_plain_token_for_token
+self_draft_is_always_accepted
+speculative_sampling_matches_plain_for_a_fixed_seed
+```
+
+Three independent bounded timing processes used three-token prefill, 70 warmup
+tokens, then three trials of 64 timed decode tokens per mode with blocking
+logit readbacks. The three-slot logical budget was 331776 bytes, with positive
+hits/uploads and zero upload failures. Services remained live, so these tiny
+measurements are noisy, not an idle-device performance acceptance:
+
+| Run / architecture | CPU experts, CUDA dense (tok/s) | 3-slot cache (tok/s) | All CUDA (tok/s) |
+|---|---:|---:|---:|
+| 1 / Qwen | 914.092 | 927.198 | 2082.637 |
+| 2 / Qwen | 342.281 | 356.889 | 1159.392 |
+| 3 / Qwen | 576.655 | 432.335 | 1132.394 |
+| 1 / DeepSeek2 | 1262.852 | 1950.120 | 2023.647 |
+| 2 / DeepSeek2 | 576.690 | 1043.116 | 1054.181 |
+| 3 / DeepSeek2 | 480.406 | 1384.761 | 1489.317 |
+
+Logs are `timing-review.log`, `timing-review-2.log`, and `timing-review-3.log`
+in the follow-up directory. Qwen's third run still regresses by about 25% versus
+host experts. **The known Qwen no-regression blocker remains open.** The first
+two paired runs do not clear it. No real-model, PCIe-traffic, pinned-transfer,
+async-overlap, or new Metal performance acceptance is claimed. Keep #62 and #52
+open; neither the review fixes nor the pre-review green CI establish completion
+of those issues.
+
+### Pre-review validation (`9736eb6`)
 
 On kleya's RTX 5060 Ti (16,311 MiB), existing services were preserved; the initial
 probe showed 3,371 MiB used and 12,477 MiB free. Only tiny fixtures were loaded.
-Release CUDA tests pass twice on the final dispatch-lifetime implementation
+Release CUDA tests passed twice on the pre-review retirement-list implementation
 (3 passed, 1 explicitly ignored timing probe): compact transfers, DeepSeek4,
 and Qwen/DeepSeek2 shared-cache prefill, 70 decode steps per concurrent session,
 all-row continuation, streamed-source fallback, and exact budget-zero host-expert

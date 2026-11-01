@@ -16,6 +16,107 @@ fn cuda() -> Device {
     Device::new_cuda(0).expect("CUDA tests require a working CUDA device")
 }
 
+#[test]
+fn cuda_interleaved_readback_launch_eviction_and_error_drop() {
+    use joshua::residency::{DeviceExpertSlot, DeviceResidency, ExpertResidency};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Barrier;
+
+    struct Slot {
+        weight: QMatMul,
+        device: Device,
+        pending: AtomicBool,
+        drops: Arc<AtomicUsize>,
+    }
+    impl DeviceExpertSlot for Slot {
+        fn device_bytes(&self) -> u64 { 256 * 144 }
+        fn synchronize(&self) -> candle_core::Result<()> {
+            self.device.synchronize()?;
+            self.pending.store(false, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+    impl Drop for Slot {
+        fn drop(&mut self) {
+            assert!(!self.pending.load(Ordering::SeqCst), "freed queued GPU weights");
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let device = cuda();
+    let source = Tensor::from_vec(common::weights(256 * 256, 173), (256, 256), &Device::Cpu).unwrap();
+    let host = QMatMul::QTensor(Arc::new(QTensor::quantize(&source, GgmlDType::Q4K).unwrap()));
+    let expected = host.forward(&Tensor::ones((1, 256), candle_core::DType::F32, &Device::Cpu).unwrap())
+        .unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    let drops = Arc::new(AtomicUsize::new(0));
+    let upload_device = device.clone();
+    let upload_drops = Arc::clone(&drops);
+    let pool = Arc::new(DeviceResidency::new(256 * 144, 256 * 144, Arc::new(move |_, _| {
+        Some(Arc::new(Slot {
+            weight: joshua::moe::upload_qmatmul(&host, &upload_device)?,
+            device: upload_device.clone(),
+            pending: AtomicBool::new(false),
+            drops: Arc::clone(&upload_drops),
+        }))
+    })));
+    for iteration in 0..16 {
+        pool.acquire(0, iteration);
+        let readback = Barrier::new(2);
+        let launched = Barrier::new(2);
+        let evicted = Barrier::new(2);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let input = Tensor::ones((1, 256), candle_core::DType::F32, &device).unwrap();
+                input.to_vec2::<f32>().unwrap();
+                readback.wait();
+                launched.wait();
+                let before = drops.load(Ordering::SeqCst);
+                for expert in 100..400 {
+                    pool.acquire(1, expert);
+                    pool.release(0, iteration);
+                }
+                let after = drops.load(Ordering::SeqCst);
+                let retained = pool.contains(0, iteration);
+                let resident_bytes = pool.resident_bytes();
+                evicted.wait();
+                assert_eq!(after, before);
+                assert!(retained);
+                assert_eq!(resident_bytes, 256 * 144);
+            });
+            scope.spawn(|| {
+                readback.wait();
+                let result = (|| -> candle_core::Result<()> {
+                    let lease = pool.lookup(0, iteration).unwrap();
+                    let input = Tensor::ones((1, 256), candle_core::DType::F32, &device)?;
+                    lease.pending.store(true, Ordering::SeqCst);
+                    let mut output = lease.weight.forward(&input)?;
+                    for _ in 0..32 {
+                        output = lease.weight.forward(&output)?;
+                    }
+                    launched.wait();
+                    evicted.wait();
+                    let output = lease.weight.forward(&input)?.flatten_all()?.to_vec1::<f32>()?;
+                    assert_close(&output, &expected);
+                    let _queued = lease.weight.forward(&input)?;
+                    candle_core::bail!("injected dispatch error after launches")
+                })();
+                assert!(result.unwrap_err().to_string().contains("injected dispatch error"));
+            });
+        });
+        pool.release(0, iteration);
+        assert_eq!(pool.resident_bytes(), 0);
+    }
+    pool.acquire(0, 0);
+    let lease = pool.lookup(0, 0).unwrap();
+    lease.pending.store(true, Ordering::SeqCst);
+    let input = Tensor::ones((1, 256), candle_core::DType::F32, &device).unwrap();
+    let output = lease.weight.forward(&input).unwrap();
+    drop(pool);
+    drop(lease);
+    assert_close(&output.flatten_all().unwrap().to_vec1::<f32>().unwrap(), &expected);
+    assert_eq!(drops.load(Ordering::SeqCst), 17);
+}
+
 fn load(path: &Path, device: &Device, budget: Option<u64>) -> QuantizedModel {
     let bytes = std::fs::read(path).unwrap();
     let mut cursor = Cursor::new(&bytes);
@@ -366,6 +467,128 @@ fn cuda_older_loaders_bounded_shared_cache() {
             "{report:?}"
         );
         assert_eq!(report.stats.upload_failures, 0);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[test]
+fn cuda_older_loaders_interleaved_eviction_numerical_parity() {
+    use joshua::native_session::LayerStack;
+    const SLOT: u64 = 3 * 256 * 144;
+    let device = cuda();
+    for (name, write) in [
+        ("qwen", common::write_tiny_qwen3moe_quantized_gguf as fn(&Path)),
+        ("deepseek2", common::write_tiny_deepseek2_quantized_gguf as fn(&Path)),
+    ] {
+        let dir = common::model_dir(&format!("cuda-interleaved-churn-{name}"));
+        let path = dir.join("model.gguf");
+        write(&path);
+        let template = load_older(&path, &device, Some(3 * SLOT));
+        let residency = match &template {
+            QuantizedModel::Qwen(model) => Arc::clone(model.weights().residency()),
+            QuantizedModel::DeepSeek2(model) => Arc::clone(model.weights().residency()),
+            _ => unreachable!(),
+        };
+        let sessions = [[1, 4, 2], [5, 7, 1]].map(|prompt| {
+            (template.new_session().unwrap(), load_older(&path, &device, Some(0)), prompt)
+        });
+        let start = std::sync::Barrier::new(3);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                start.wait();
+                for _ in 0..70 {
+                    residency.replace_hot_set(&[]);
+                    for layer in if name == "qwen" { 0..2 } else { 1..2 } {
+                        for expert in 0..4 {
+                            residency.acquire(layer, expert);
+                        }
+                    }
+                    residency.wait_for_uploads();
+                }
+            });
+            for (mut cached, mut host, prompt) in sessions {
+                let device = &device;
+                let start = &start;
+                scope.spawn(move || {
+                    start.wait();
+                    let mut mismatches = 0;
+                    let mut max_error = 0f32;
+                    let mut compare = |actual: Vec<f32>, expected: Vec<f32>| {
+                        assert_close(&actual, &expected);
+                        for (actual, expected) in actual.chunks_exact(16).zip(expected.chunks_exact(16)) {
+                            let winner = |row: &[f32]| row.iter().enumerate()
+                                .max_by(|left, right| left.1.total_cmp(right.1)).unwrap().0;
+                            mismatches += usize::from(winner(actual) != winner(expected));
+                            for (actual, expected) in actual.iter().zip(expected) {
+                                max_error = max_error.max((actual - expected).abs());
+                            }
+                        }
+                    };
+                    compare(older_logits(&mut cached, device, &prompt, 0), older_logits(&mut host, device, &prompt, 0));
+                    for offset in 3..73 {
+                        compare(older_logits(&mut cached, device, &[3], offset), older_logits(&mut host, device, &[3], offset));
+                        let report = cached.device_expert_cache().unwrap();
+                        assert!(report.resident <= 3 && report.resident_bytes <= 3 * SLOT, "{report:?}");
+                    }
+                    compare(older_logits(&mut cached, device, &[3, 8, 3], 73), older_logits(&mut host, device, &[3, 8, 3], 73));
+                    eprintln!("CUDA interleaved {name} prompt={prompt:?}: max_abs_error={max_error}, greedy_mismatches={mismatches}");
+                });
+            }
+        });
+        template.wait_for_expert_uploads();
+        let report = template.device_expert_cache().unwrap();
+        assert!(report.stats.evictions > 0 && report.stats.uploads > 0 && report.stats.hits > 0, "{report:?}");
+        assert_eq!(report.stats.upload_failures, 0);
+        eprintln!("CUDA interleaved {name}: {report:?}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[test]
+fn cuda_older_cache_cpu_greedy_continuation_and_all_rows() {
+    const SLOT: u64 = 3 * 256 * 144;
+    let device = cuda();
+    for (name, write) in [
+        ("qwen", common::write_tiny_qwen3moe_quantized_gguf as fn(&Path)),
+        ("deepseek2", common::write_tiny_deepseek2_quantized_gguf as fn(&Path)),
+    ] {
+        let dir = common::model_dir(&format!("cuda-cpu-reference-{name}"));
+        let path = dir.join("model.gguf");
+        write(&path);
+        let mut cached = load_older(&path, &device, Some(3 * SLOT));
+        let mut host = load_older(&path, &device, Some(0));
+        let mut cpu = load_older(&path, &Device::Cpu, None);
+        cached.set_pin_hot_experts(3);
+        let mut actual = older_logits(&mut cached, &device, &[1, 4, 2], 0);
+        let mut expected = older_logits(&mut host, &device, &[1, 4, 2], 0);
+        assert_close(&actual, &older_logits(&mut cpu, &Device::Cpu, &[1, 4, 2], 0));
+        let mut error = older_error(&actual, &expected);
+        for offset in 3..75 {
+            let row = &expected[expected.len() - 16..];
+            let token = row.iter().enumerate().max_by(|left, right| left.1.total_cmp(right.1)).unwrap().0 as u32;
+            actual = older_logits(&mut cached, &device, &[token], offset);
+            expected = older_logits(&mut host, &device, &[token], offset);
+            error = error.max(older_error(&actual, &expected));
+            assert_close(&actual, &older_logits(&mut cpu, &Device::Cpu, &[token], offset));
+            cached.wait_for_expert_uploads();
+        }
+        actual = older_logits(&mut cached, &device, &[3, 8, 3], 75);
+        expected = older_logits(&mut host, &device, &[3, 8, 3], 75);
+        error = error.max(older_error(&actual, &expected));
+        assert_close(&actual, &older_logits(&mut cpu, &Device::Cpu, &[3, 8, 3], 75));
+        let mut abandoned = cached.new_session().unwrap();
+        let input = Tensor::new(&[1u32, 4, 2], &device).unwrap().reshape((1, 3)).unwrap();
+        let _queued = abandoned.forward_all_logits(&input, 0).unwrap();
+        drop(abandoned);
+        assert!(cached.device_expert_cache().unwrap().resident_bytes <= 3 * SLOT);
+        cached.clear_kv_cache();
+        host.clear_kv_cache();
+        cpu.clear_kv_cache();
+        older_error(
+            &older_logits(&mut cached, &device, &[1, 4, 2], 0),
+            &older_logits(&mut host, &device, &[1, 4, 2], 0),
+        );
+        eprintln!("CUDA {name}: all-CPU numerical reference, 72 host-expert greedy continuation tokens + three all-row verification logits, max_abs_cache_error={error}");
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

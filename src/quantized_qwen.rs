@@ -1293,6 +1293,10 @@ impl crate::residency::DeviceExpertSlot for DeviceExpert {
     fn device_bytes(&self) -> u64 {
         self.bytes
     }
+
+    fn synchronize(&self) -> Result<()> {
+        crate::residency::synchronize_expert_device(&self.device)
+    }
 }
 
 /// An always-on shared expert, optionally scaled per token by
@@ -1393,16 +1397,12 @@ impl Moe {
         // device-resident (uploaded) weights, moving the activation to that
         // expert's device; on a miss run the host form. `None` residency keeps
         // today's single-device path byte-for-byte (`dispatch_decode`/`_prefill`).
-        if let Some(pool) = &self.residency {
-            pool.reclaim();
-        }
         let fwd: crate::moe::ResidencyForward<'_> = match &self.residency {
             Some(res) => Some(&(|e: usize, x: &Tensor| {
                 if let Some(dev) = res.lookup(self.layer, e as u32) {
                     let xd = crate::moe::on_device(x, &dev.device)?;
                     let out = dev.mlp.forward(&xd)?;
                     let out = crate::moe::on_device(&out, x.device()).map(|c| c.into_owned());
-                    res.retire(dev);
                     out
                 } else {
                     self.experts[e].forward(x)
@@ -2357,6 +2357,9 @@ fn load_parts<R: Read + Seek>(
             }
         }
         let owned = range.clone().unwrap_or(0..cfg.n_layer);
+        let device_expert_cache_bytes = crate::moe::usable_expert_cache_budget(
+            &ct, raw.as_ref(), device_expert_cache_bytes,
+        );
         // Zero-copy Metal: bind the mapped weights into no-copy GPU buffers
         // so quantized weights are never uploaded.  Best effort — if the
         // mapping is not page-aligned or the device refuses the buffers, fall
@@ -2389,6 +2392,7 @@ fn load_parts<R: Read + Seek>(
         // disables.  Only meaningful with an mmap-backed model on a device that
         // can hold quantized blocks; building it is best-effort.
         let gpu_cache = match std::env::var("JOSHUA_GPU_WEIGHT_CACHE") {
+            _ if device_expert_cache_bytes.is_some() => None,
             Ok(v) if !v.is_empty() && v != "0" => {
                 let mib = v.parse::<usize>().unwrap_or(0);
                 if mib == 0 {
@@ -2617,6 +2621,42 @@ impl CpuPipelineWeights {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn unusable_cache_preserves_cuda_expert_placement() -> Result<()> {
+        let device = Device::new_cuda(0)?;
+        let dir = crate::test_common::model_dir("quantized_qwen-placement");
+        let path = dir.join("model.gguf");
+        crate::test_common::write_tiny_qwen3moe_quantized_gguf(&path);
+        let bytes = std::fs::read(&path)?;
+        let slot = 3 * 256 * 144;
+        for mapped in [false, true] {
+            for budget in [None, Some(0), Some(slot - 1), Some(slot)] {
+                let mut reader = std::io::Cursor::new(&bytes);
+                let header = crate::gguf_ext::read_header(&mut reader).unwrap();
+                let mapping = mapped.then(|| Arc::new(unsafe {
+                    memmap2::Mmap::map(&std::fs::File::open(&path).unwrap()).unwrap()
+                }));
+                let model = ModelWeights::from_gguf_mmap_placed(
+                    header.to_candle_content().unwrap(), None, &mut reader,
+                    &device, &device, mapping, budget,
+                )?;
+                let cached = budget == Some(slot);
+                assert_eq!(model.device_expert_cache().is_some(), cached);
+                for layer in &model.weights().layers {
+                    if let FeedForward::Moe(moe) = &layer.ffn {
+                        assert_eq!(moe.expert_device.is_cpu(), cached);
+                        if !cached {
+                            assert!(moe.expert_device.same_device(&device));
+                        }
+                    }
+                }
+            }
+        }
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
     use candle_core::quantized::{GgmlDType, QStorage};
     use std::borrow::Cow;
 

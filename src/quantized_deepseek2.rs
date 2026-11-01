@@ -693,6 +693,10 @@ impl crate::residency::DeviceExpertSlot for DeviceExpert {
     fn device_bytes(&self) -> u64 {
         self.bytes
     }
+
+    fn synchronize(&self) -> Result<()> {
+        crate::residency::synchronize_expert_device(&self.device)
+    }
 }
 
 impl DeviceExpert {
@@ -830,16 +834,12 @@ impl Moe {
         // Residency-aware per-expert forward: on a `DeviceResidency` hit run the
         // uploaded weights on the expert device; on a miss run the host form.
         // `None` residency keeps today's single-device path byte-for-byte.
-        if let Some(pool) = &self.residency {
-            pool.reclaim();
-        }
         let fwd: crate::moe::ResidencyForward<'_> = match &self.residency {
             Some(res) => Some(&(|e: usize, x: &Tensor| {
                 if let Some(dev) = res.lookup(self.layer, e as u32) {
                     let xd = crate::moe::on_device(x, &dev.device)?;
                     let out = dev.forward(&xd)?;
                     let out = crate::moe::on_device(&out, x.device()).map(|c| c.into_owned());
-                    res.retire(dev);
                     out
                 } else {
                     self.experts[e].forward(x)
@@ -1409,6 +1409,9 @@ impl ModelWeights {
             );
         }
         let cfg = Config::from_metadata(&ct.metadata, arch)?;
+        let device_expert_cache_bytes = crate::moe::usable_expert_cache_budget(
+            &ct, raw.as_ref(), device_expert_cache_bytes,
+        );
         // The Content owns metadata; move it into our reader together with the
         // underlying file handle (borrowed for the lifetime of the load).
         let mut rd = Reader {
@@ -1762,6 +1765,42 @@ fn split_experts<R: Read + Seek>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn unusable_cache_preserves_cuda_expert_placement() -> Result<()> {
+        let device = Device::new_cuda(0)?;
+        let dir = crate::test_common::model_dir("quantized_deepseek2-placement");
+        let path = dir.join("model.gguf");
+        crate::test_common::write_tiny_deepseek2_quantized_gguf(&path);
+        let bytes = std::fs::read(&path)?;
+        let slot = 3 * 256 * 144;
+        for mapped in [false, true] {
+            for budget in [None, Some(0), Some(slot - 1), Some(slot)] {
+                let mut reader = std::io::Cursor::new(&bytes);
+                let header = crate::gguf_ext::read_header(&mut reader).unwrap();
+                let mapping = mapped.then(|| Arc::new(unsafe {
+                    memmap2::Mmap::map(&std::fs::File::open(&path).unwrap()).unwrap()
+                }));
+                let model = ModelWeights::from_gguf_mmap_placed(
+                    header.to_candle_content().unwrap(), None, &mut reader,
+                    &device, &device, mapping, budget,
+                )?;
+                let cached = budget == Some(slot);
+                assert_eq!(model.device_expert_cache().is_some(), cached);
+                for layer in &model.weights().layers {
+                    if let FeedForward::Moe(moe) = &layer.ffn {
+                        assert_eq!(moe.expert_device.is_cpu(), cached);
+                        if !cached {
+                            assert!(moe.expert_device.same_device(&device));
+                        }
+                    }
+                }
+            }
+        }
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
     use candle_core::quantized::GgmlDType;
 
     /// Shared random weights for a tiny `Attention` (`n_head=2`,

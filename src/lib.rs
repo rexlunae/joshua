@@ -22,6 +22,11 @@
 //! alongside the `.gguf` file so the engine can tokenise prompts.
 
 mod activation_trace;
+#[cfg(all(test, feature = "cuda"))]
+extern crate self as joshua;
+#[cfg(all(test, feature = "cuda"))]
+#[path = "../tests/common/mod.rs"]
+mod test_common;
 mod precise;
 pub mod anthropic;
 pub mod attention;

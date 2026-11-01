@@ -513,11 +513,16 @@ pub(crate) struct Ds4DeviceExpert {
     down: QMatMul,
     clamp: f64,
     bytes: u64,
+    device: Device,
 }
 
 impl crate::residency::DeviceExpertSlot for Ds4DeviceExpert {
     fn device_bytes(&self) -> u64 {
         self.bytes
+    }
+
+    fn synchronize(&self) -> Result<()> {
+        crate::residency::synchronize_expert_device(&self.device)
     }
 }
 
@@ -940,6 +945,7 @@ fn build_device_pool(
                 down: QMatMul::from_arc(Arc::clone(&ex.down))?,
                 clamp: ex.clamp,
                 bytes: ex.bytes,
+                device: dev2.clone(),
             }));
         }
         // Advise the three ranges in before the blocking write so it does
@@ -959,6 +965,7 @@ fn build_device_pool(
             down: upload(&ex.down)?,
             clamp: ex.clamp,
             bytes: ex.bytes,
+            device: dev2.clone(),
         }))
     };
     let upload: Arc<dyn Fn(u32, u32) -> Option<Arc<Ds4DeviceExpert>> + Send + Sync> =
@@ -2870,14 +2877,6 @@ impl Moe {
             return distributed.dispatch(x2, &ids, &wts, k);
         }
         let out_device = x2.device().clone();
-        if let Some(pool) = &self.device_pool {
-            // Every launch of the previous MoE layer has completed: with the
-            // dense set on the device the routing read-back above waited for
-            // the in-order queue, and with it on the CPU that layer's pooled
-            // dispatch ended with a blocking read of its device sum (or
-            // launched nothing).  Buffers evicted since can go.
-            pool.pool.reclaim();
-        }
 
         let per_expert = bucket_by_expert(&ids, &wts, k, n_tokens, self.experts.len())?;
 
@@ -3167,7 +3166,7 @@ impl Moe {
         h: usize,
     ) -> Result<Tensor> {
         let dev = &pool.device;
-        let mut hits: Vec<(usize, Arc<Ds4DeviceExpert>)> = Vec::new();
+        let mut hits: Vec<(usize, crate::residency::DeviceExpertLease<Ds4DeviceExpert>)> = Vec::new();
         let mut misses: Vec<usize> = Vec::new();
         for (e, bucket) in per_expert.iter().enumerate() {
             if bucket.is_empty() {
@@ -3254,12 +3253,7 @@ impl Moe {
             Some(self.host_experts(&x_host, per_expert, &misses, n_tokens, h)?)
         };
         let t2 = std::time::Instant::now();
-        // The handles this layer launched on go back to the pool's retire
-        // list: freed at the next `reclaim`, after a read-back proved the
-        // launches complete, even if the uploader evicts them meanwhile.
-        for (_, slot) in hits {
-            pool.pool.retire(slot);
-        }
+        drop(hits);
         let out_device = x2.device();
         let y = match (y_dev, y_host) {
             (Some(d), Some(hst)) => {
@@ -3283,7 +3277,7 @@ impl Moe {
     /// each expert's output is scaled by its routing weight (a host scalar,
     /// no upload) and the outputs are summed.
     fn pooled_decode(
-        hits: &[(usize, Arc<Ds4DeviceExpert>)],
+        hits: &[(usize, crate::residency::DeviceExpertLease<Ds4DeviceExpert>)],
         per_expert: &[Vec<(u32, f32)>],
         x_dev: &Tensor,
     ) -> Result<Tensor> {
@@ -3304,7 +3298,7 @@ impl Moe {
     /// each expert gathers its rows through a narrowed view, and the
     /// weighted outputs are scattered back with one `index_add`.
     fn pooled_prefill(
-        hits: &[(usize, Arc<Ds4DeviceExpert>)],
+        hits: &[(usize, crate::residency::DeviceExpertLease<Ds4DeviceExpert>)],
         per_expert: &[Vec<(u32, f32)>],
         x_dev: &Tensor,
         n_tokens: usize,
