@@ -819,9 +819,10 @@ async fn count_requests(
 
 /// Reject `/v1` requests that lack the configured bearer API key.
 ///
-/// A no-op when no key is configured.  Comparison is constant-time so the
-/// key can't be recovered byte-by-byte through response timing.
-async fn require_api_key(State(state): State<AppState>, req: Request, next: Next) -> Response {
+/// Without a configured key, accept public requests but discard internal cache
+/// scopes. Comparison is constant-time so the key can't be recovered byte-by-byte
+/// through response timing.
+async fn require_api_key(State(state): State<AppState>, mut req: Request, next: Next) -> Response {
     if let Some(expected) = &state.api_key {
         let provided = req
             .headers()
@@ -862,6 +863,8 @@ async fn require_api_key(State(state): State<AppState>, req: Request, next: Next
             );
             return (StatusCode::UNAUTHORIZED, Json(body)).into_response();
         }
+    } else {
+        req.headers_mut().remove(crate::affinity::CACHE_SCOPE_HEADER);
     }
     next.run(req).await
 }

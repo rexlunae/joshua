@@ -27,11 +27,8 @@ pub struct CacheResidency {
 }
 
 pub(crate) fn namespace(scope: Option<Scope>, context: Option<u32>) -> Option<Scope> {
-    context.map_or(scope, |context| {
-        Some(digest(&[
-            scope.as_ref().map_or(&[], |scope| scope.as_slice()),
-            &context.to_le_bytes(),
-        ]))
+    scope.map(|scope| {
+        context.map_or(scope, |context| digest(&[&scope, &context.to_le_bytes()]))
     })
 }
 
@@ -258,6 +255,17 @@ mod tests {
         assert_eq!(directory.preferred(&scope, now), None);
         directory.expire(now + TTL);
         assert!(directory.entries.is_empty());
+    }
+
+    #[test]
+    fn only_explicit_scopes_are_context_isolated() {
+        for context in [None, Some(64), Some(128)] {
+            assert_eq!(namespace(None, context), None);
+        }
+        let scope = Some([1; 32]);
+        assert_ne!(namespace(scope, None), namespace(scope, Some(64)));
+        assert_ne!(namespace(scope, Some(64)), namespace(scope, Some(128)));
+        assert_eq!(namespace(scope, Some(64)), namespace(scope, Some(64)));
     }
 
     #[test]

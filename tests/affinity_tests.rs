@@ -3,6 +3,36 @@ mod common;
 use joshua::{types::GenerationOptions, Engine};
 
 #[test]
+fn unscoped_default_and_explicit_contexts_reuse_compatible_prefixes() {
+    let directory = common::model_dir("affinity-unscoped-context");
+    common::write_tiny_qwen3_layers(&directory.join("model.gguf"), 1);
+    for (initial, continuation) in [(None, Some(64)), (Some(64), None), (Some(64), Some(96))] {
+        let engine = Engine::with_n_ctx(&directory, 128).unwrap();
+        let fresh = Engine::with_n_ctx(&directory, 128).unwrap();
+        let mut options = GenerationOptions {
+            context_window: initial,
+            max_tokens: 0,
+            temperature: 0.0,
+            repetition_penalty: 1.0,
+            ..Default::default()
+        };
+        engine.complete_raw("hello a b c", &options).unwrap();
+        options.context_window = continuation;
+        options.max_tokens = 4;
+        let prompt = "hello a b c world";
+        assert_eq!(
+            engine.complete_raw(prompt, &options).unwrap().0,
+            fresh.complete_raw(prompt, &options).unwrap().0
+        );
+        assert_eq!(
+            engine.kv_reuse_count(),
+            1,
+            "{initial:?} -> {continuation:?}"
+        );
+    }
+}
+
+#[test]
 fn scoped_snapshot_residency_survives_pool_eviction_with_a_bounded_report() {
     let directory = common::model_dir("affinity-snapshot-residency");
     common::write_tiny_qwen3_layers(&directory.join("model.gguf"), 1);
@@ -189,9 +219,7 @@ fn scoped_recurrent_continuation_and_reset_match_fresh() {
 #[cfg(feature = "metal")]
 #[test]
 fn scoped_metal_sessions_preserve_cpu_output_and_owner_isolation() {
-    if candle_core::Device::new_metal(0).is_err() {
-        return;
-    }
+    candle_core::Device::new_metal(0).expect("physical Metal device required");
     let directory = common::model_dir("affinity-metal");
     common::write_tiny_llama_gguf_hd32(&directory.join("model.gguf"));
     let metal = Engine::with_options(
@@ -199,7 +227,13 @@ fn scoped_metal_sessions_preserve_cpu_output_and_owner_isolation() {
         joshua::EngineOptions::with_n_ctx(64).backend(joshua::ComputeBackend::Metal),
     )
     .unwrap();
-    let cpu = Engine::with_n_ctx(&directory, 64).unwrap();
+    assert!(metal.device().is_metal(), "Metal must not fall back to CPU");
+    let cpu = Engine::with_options(
+        &directory,
+        joshua::EngineOptions::with_n_ctx(64).backend(joshua::ComputeBackend::Cpu),
+    )
+    .unwrap();
+    assert!(cpu.device().is_cpu());
     let mut options = GenerationOptions {
         cache_scope: Some([1; 32]),
         max_tokens: 0,
@@ -216,4 +250,17 @@ fn scoped_metal_sessions_preserve_cpu_output_and_owner_isolation() {
     options.cache_scope = Some([2; 32]);
     assert_eq!(metal.complete_raw(prompt, &options).unwrap().0, expected);
     assert_eq!(metal.kv_reuse_count(), 1);
+    for prompt in ["hello a world", "world b c"] {
+        assert_eq!(
+            metal.complete_raw(prompt, &options).unwrap().0,
+            cpu.complete_raw(prompt, &options).unwrap().0
+        );
+    }
+    let before = metal.kv_reuse_count();
+    options.context_window = Some(32);
+    assert_eq!(
+        metal.complete_raw(prompt, &options).unwrap().0,
+        cpu.complete_raw(prompt, &options).unwrap().0
+    );
+    assert_eq!(metal.kv_reuse_count(), before);
 }

@@ -520,10 +520,15 @@ async fn timed_affinity_request(
 async fn real_worker_affinity_reuses_only_its_owned_scope_and_matches_cold_output() {
     let engine = Arc::new(tiny_engine("affinity-http"));
     let worker = serve_app(joshua::server::create_router(Arc::new(
-        joshua::server::ServerState::new(engine.clone()),
+        joshua::server::ServerState {
+            api_key: Some("affinity-worker-test-key".into()),
+            ..joshua::server::ServerState::new(engine.clone())
+        },
     )))
     .await;
-    let (coordinator, router) = spawn_router(config(&[&worker])).await;
+    let mut settings = config(&[&worker]);
+    settings.worker_api_key = Some("affinity-worker-test-key".into());
+    let (coordinator, router) = spawn_router(settings).await;
     let mut body = json!({"model": engine.model_name(), "messages": [{"role": "user", "content": "hello a b c"}], "temperature": 0.0, "max_tokens": 0});
     let first = affinity_request(&router, Some("new"), "alice", &body).await;
     assert_eq!(first.status, StatusCode::OK);
@@ -587,15 +592,19 @@ async fn benchmark_tiny_affinity_policies() {
                                 .with_max_concurrency(1),
                         );
                         let (url, service) = serve_app_handle(joshua::server::create_router(
-                            Arc::new(joshua::server::ServerState::new(engine.clone())),
+                            Arc::new(joshua::server::ServerState {
+                                api_key: Some("affinity-worker-test-key".into()),
+                                ..joshua::server::ServerState::new(engine.clone())
+                            }),
                         ))
                         .await;
                         engines.push(engine);
                         workers.push(url);
                         services.push(service);
                     }
-                    let coordinator =
-                        Coordinator::new(config(&[&workers[0], &workers[1]])).unwrap();
+                    let mut settings = config(&[&workers[0], &workers[1]]);
+                    settings.worker_api_key = Some("affinity-worker-test-key".into());
+                    let coordinator = Coordinator::new(settings).unwrap();
                     let (router, service) =
                         serve_app_handle(joshua::coordinator::create_router(coordinator.clone()))
                             .await;
@@ -665,7 +674,11 @@ async fn benchmark_tiny_affinity_policies() {
                                 let (response, ttft, _) = timed_affinity_request(
                                     &target,
                                     (policy != "load").then_some(handle.as_str()),
-                                    "bench",
+                                    if direct {
+                                        "affinity-worker-test-key"
+                                    } else {
+                                        "bench"
+                                    },
                                     &body,
                                 )
                                 .await;
@@ -939,10 +952,15 @@ async fn real_worker_eviction_feedback_invalidates_affinity_and_recomputes() {
         .unwrap(),
     );
     let worker = serve_app(joshua::server::create_router(Arc::new(
-        joshua::server::ServerState::new(engine.clone()),
+        joshua::server::ServerState {
+            api_key: Some("affinity-worker-test-key".into()),
+            ..joshua::server::ServerState::new(engine.clone())
+        },
     )))
     .await;
-    let (coordinator, router) = spawn_router(config(&[&worker])).await;
+    let mut settings = config(&[&worker]);
+    settings.worker_api_key = Some("affinity-worker-test-key".into());
+    let (coordinator, router) = spawn_router(settings).await;
     let mut body = json!({"model": engine.model_name(), "messages": [{"role": "user", "content": "hello a b c"}], "temperature": 0.0, "max_tokens": 0});
     let initial = affinity_request(&router, Some("new"), "alice", &body).await;
     assert_eq!(initial.status, StatusCode::OK);

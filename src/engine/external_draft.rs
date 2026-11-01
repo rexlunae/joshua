@@ -117,7 +117,7 @@ impl Engine {
             Duration::ZERO,
             None,
         )?;
-        let (mut model, reused) = self.acquire_session(prompt, false)?;
+        let (mut model, reused) = self.acquire_session(prompt, false, options.cache_namespace())?;
         if !model.supports_speculative() {
             return Err(invalid("model lacks all-position logits and safe rollback"));
         }

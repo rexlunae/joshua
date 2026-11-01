@@ -1,0 +1,107 @@
+{
+  "schema": 1,
+  "date": "2026-10-31",
+  "kind": "correctness-validation-not-performance",
+  "source_parent": "44586f509809c0986a852ac842acf029324c3a32",
+  "source_sha256": {
+    "Cargo.toml": "9780ce55aafef12a223e1c4f6e2c51cdb2fd096fb70235f6d24589b492f7352d",
+    "Cargo.lock": "72a18732153c220658662c8e50cd42250dfe7507e9cb91ec9859af2d71bd9156",
+    "src/affinity.rs": "c311510609fd10454d9a14e2605e2889f46e6c41791ba187d7c781799adc841e",
+    "src/coordinator.rs": "fe1693954333baf55e3768ec056a35fb3dce7a463c5813dce7214769e0e36af5",
+    "src/server.rs": "afe236fd2e10a943da7d7e029c59af3c037af1fc0d946e37998f70d921708b5a",
+    "src/types.rs": "5caa78469a57cd344777e2f46ecdf49c54c3c2cd31c7b3296eed5c9ce24f20d8",
+    "src/engine.rs": "11b75c4a5a296eb106a8a686dbe35a870e136cc060c1fe379f435e597817599e",
+    "src/engine/external_draft.rs": "b96fdf15b4100b146d70229afc9c14f721b9bcc3edb660fcff97efdce86f7b23",
+    "tests/common/mod.rs": "95d03cf694f41f236292e9ea6567a40e6f57e9b69cda6d8dfb3cfe2845bb33bb",
+    "tests/affinity_tests.rs": "de2e6d5d01e84b06177fa25779dc2b62ab149bcf82402353a867c7fbb2d2bde3",
+    "tests/server_tests.rs": "be6e1ea65eeb2159578f5c874c04159219a843a8a460df1ed81b57968f1e94c4",
+    "tests/route_tests.rs": "f09f5865745e43e90929a5e3b86f815bd97197e4fe8424d9530b9a84b0600fdb",
+    "tests/external_draft_tests.rs": "567e28937ebc88540ec16ae96c70edcd51adb14b35f22a033284b426854e3e3d"
+  },
+  "remote_source_hashes_match": true,
+  "limits": {
+    "cargo_build_jobs": 2,
+    "cargo_incremental": 0,
+    "rayon_num_threads": 1,
+    "test_threads": 1
+  },
+  "remote": {
+    "host": "erskin",
+    "cpu": "AMD Ryzen 9 5900HX",
+    "platform": "Linux 7.2.9-arch1-1 x86_64",
+    "rust": "1.99.0 (b940084d7 2026-09-28)",
+    "default_target": "/tmp/joshua-prefix-201-NXjVJ2AM/target",
+    "feature_target": "/home/tserica/joshua/target",
+    "new_targets_created": false,
+    "source_checkout_created": false
+  },
+  "runs": [
+    {
+      "command": "cargo test --locked --lib --test affinity_tests --test server_tests --test route_tests --test external_draft_tests -- --test-threads=1",
+      "library": {
+        "passed": 498,
+        "ignored": 10
+      },
+      "note": "Library passed; integration tests subsequently corrected and rerun below. No failing test was skipped or labeled pre-existing."
+    },
+    {
+      "command": "cargo test --locked --test affinity_tests --test server_tests --test route_tests --test external_draft_tests -- --test-threads=1",
+      "passed": {
+        "affinity": 6,
+        "server": 11,
+        "route": 36,
+        "external_draft": 8
+      },
+      "ignored": 1,
+      "result": "passed"
+    },
+    {
+      "command": "cargo check --locked --features distributed,tls --lib --bins --tests",
+      "result": "passed"
+    },
+    {
+      "command": "cargo test --locked --features distributed,tls --test affinity_tests --test server_tests --test route_tests --test external_draft_tests -- --test-threads=1",
+      "passed": {
+        "affinity": 6,
+        "server": 12,
+        "route": 37,
+        "external_draft": 8
+      },
+      "ignored": 1,
+      "result": "passed"
+    },
+    {
+      "command": "cargo test --locked --features metal --test affinity_tests scoped_metal_sessions_preserve_cpu_output_and_owner_isolation -- --exact --nocapture",
+      "platform": "macOS 27.0.1 (26A434)",
+      "device": "Apple M5 Pro, 16 GPU cores, Metal 4",
+      "rust": "1.99.0-nightly (d453bdd8f 2026-08-14)",
+      "fixture": "tiny llama head dimension 32; context 64, then 32; max_tokens 4",
+      "passed": 1,
+      "ignored": 0,
+      "test_seconds": 0.89,
+      "cpu_fallback_allowed": false,
+      "reference_backend": "explicit CPU",
+      "coverage": [
+        "continuation",
+        "owner separation",
+        "edited prompt",
+        "unrelated prompt",
+        "context separation"
+      ],
+      "result": "passed"
+    }
+  ],
+  "historical_timing_files_unchanged": [
+    "affinity-156-erskin-cpu.json",
+    "affinity-156-macos-exploratory.json"
+  ],
+  "benchmark_rerun": false,
+  "unmeasured": [
+    "realistic quantized-model performance",
+    "CUDA hardware parity",
+    "NPU hardware parity",
+    "peak device memory",
+    "universal speedup"
+  ],
+  "acceptance": "Physical scoped Metal correctness gate passed; no automatic issue closure or maintainer acceptance claimed."
+}

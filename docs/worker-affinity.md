@@ -26,12 +26,24 @@ when these must be different tenants. Existing authentication middleware remains
 authoritative, and a UUID never bypasses it.
 
 The coordinator overwrites the internal `x-joshua-cache-scope` on forwarding.
-Workers hash that scope with their authenticated credential and context; raw
+Workers accept this internal scope only after successful configured worker
+authentication. With no worker API key configured, the middleware ignores the
+internal header, even if a client supplies an arbitrary Authorization/x-api-key
+value. Public affinity hints and ordinary requests remain accepted; disabling
+authentication does not create trusted identities or tenant isolation. Configure
+the worker's `--api-key` and the coordinator's `--worker-api-key` consistently to
+enable trusted routed cache ownership/residency. Every accepted worker key is a
+trusted caller for its own credential namespace, including during key rotation;
+do not distribute coordinator worker credentials to untrusted clients.
+Workers hash the accepted scope with their authenticated credential and context; raw
 credentials and prompts are not kept in the directory or inventory. Direct
 worker HTTP calls are owner/context isolated too, but `new` is a coordinator
 protocol operation, not a direct-worker handle-allocation API. Library callers
 may set the trusted, serde-skipped `GenerationOptions.cache_scope`; omitted
-scopes keep the original unscoped library cache behavior.
+scopes keep the original unscoped library cache behavior across compatible
+default/explicit context windows. Explicit trusted scopes remain context-isolated.
+Exact token-prefix checks, cache compatibility, and rollback rules remain the
+authority for every reuse; neither a scope nor a routing hint supplies history.
 
 Each loaded Engine has a fresh incarnation UUID, covering the actual loaded
 model/tokenizer revision, backend and immutable execution configuration. No
@@ -141,7 +153,15 @@ The earlier macOS exploratory report predates final scoring/tests and records
 only its tracked diff hash, omitting then-untracked affinity files; it is retained
 as historical evidence, not final-source provenance or an independent speedup claim.
 
-### Saved CPU results (October 31, 2026)
+### Historical CPU results (October 31, 2026)
+
+The saved JSON files and their source manifests are immutable historical evidence
+for the pre-review implementation at `5ca32af`, not measurements of the current
+revision. Review fixes preserve unscoped library context reuse, ignore internal
+scopes on unauthenticated workers, and authenticate the real-worker/benchmark
+fixtures. Those semantic and fixture source changes invalidate any current-source
+timing attribution to these reports. No updated performance result or universal
+latency improvement is claimed; rerun the authenticated fixture for new timings.
 
 Final report: `measurements/affinity-156-erskin-cpu.json`, Linux x86_64,
 AMD Ryzen 9 5900HX (8 cores/16 threads), Rust 1.99 toolchain, debug profile,
@@ -198,7 +218,7 @@ compare against fresh logits; scoped tests compare fresh greedy outputs across
 7/8/9, 15/16/17 and 23-word compressed-cache boundaries. Routing/server suites
 also retain auth, cancellation and stream/output checks.
 
-Final remote commands used a unique source archive (no checkout), shared
+Historical pre-review commands at `5ca32af` used a unique source archive (no checkout), shared
 `CARGO_TARGET_DIR=/tmp/joshua-prefix-201-NXjVJ2AM/target`, jobs=2 and nice=19.
 Changed source/test files were touched when switching roots. Results:
 
@@ -213,7 +233,7 @@ Changed source/test files were touched when switching roots. Results:
   output parity. This tests the real shim/process path, not accelerator hardware.
 - Final ignored benchmark: passed; all 1,512 measured replies matched cold
   baselines and cross-policy request/output hashes agreed. The subsequent
-  manifest verification matched every recorded source hash to this patch.
+  manifest verification matched every recorded source hash to that pre-review source.
 
 An initial parallel library run on erskin failed only
 `auto_placement::tests::cpu_probe_measures_both_shapes_within_the_deadline`,
@@ -225,13 +245,60 @@ also overlapped #157 validation; the unchanged reproduction did not need that
 additional load. Both serialized implementation runs passed, including the
 deadline test. No deadline/tolerance was relaxed and no failure was skipped.
 
-Hardware/performance limitations are separate from those correctness gates:
-no accelerator run is claimed. A scoped Metal parity/isolation test is included
-but not compiled/run because local disk was unsafe; CUDA and NPU hardware
-services/workloads were preserved. CPU synthetic timings do not establish a
+The pre-review validation did not run accelerator hardware because local disk
+was unsafe. The review validation below supersedes that hardware limitation;
+CUDA and NPU hardware services/workloads were preserved. CPU synthetic timings do not establish a
 production quantized-model speedup, full-device memory bound, or calibrated
 saved-prefill-versus-queue cost model. Before closing #156, review the final
-CPU evidence and run scoped continuation/edit/reset parity on a supported
-accelerator; validate realistic quantized-model multi-turn/load performance
+CPU evidence and the scoped physical-device correctness evidence; validate
+realistic quantized-model multi-turn/load performance
 if claiming a deployment latency improvement. This PR intentionally does not
 auto-close #156 or claim universal latency improvement.
+
+### Review validation (October 31, 2026)
+
+The merged-main review revision preserves the external-draft integration fix:
+draft session acquisition receives `options.cache_namespace()`. A new regression
+compares scoped warm acquisition with cold draft verification and rejects reuse
+across different scopes or from the unscoped pool. The full external-draft suite
+also exercises all-position verification, rejection continuation and replay.
+
+On erskin (Ryzen 9 5900HX, Linux x86_64, Rust 1.99.0), a source-only snapshot
+and the local Cargo.lock were validated with jobs=2, incremental=0, Rayon=1,
+nice=19 and serialized test execution:
+
+- `cargo test --locked --lib --test affinity_tests --test server_tests
+  --test route_tests --test external_draft_tests -- --test-threads=1`:
+  498 library tests passed (10 manual tests ignored). After correcting the
+  remaining unauthenticated eviction fixture and new test assertions to respect
+  bounded pool replacement and exact-prefix rules, the final integration rerun
+  passed all 6 affinity, 11 server, 36 routing and 8 external-draft tests
+  (1 manual routing benchmark ignored).
+- `cargo check --locked --features distributed,tls --lib --bins --tests`:
+  passed. The same four integration suites with `--features distributed,tls`
+  passed 6 affinity, 12 server, 37 routing and 8 external-draft tests, including
+  both worker and coordinator HTTPS round trips (1 manual benchmark ignored).
+- Default tests reused `/tmp/joshua-prefix-201-NXjVJ2AM/target`. Feature checks
+  and tests reused the existing `/home/tserica/joshua/target` to avoid exhausting
+  tmpfs (2.2 GiB remaining). No target directory or remote checkout was created.
+
+Physical device correctness was executed on this Mac: Apple M5 Pro, 16 GPU cores,
+Metal 4, macOS 27.0.1, Rust 1.99.0-nightly. With the existing shared local target,
+jobs=2, incremental=0 and Rayon=1:
+
+`cargo test --locked --features metal --test affinity_tests
+scoped_metal_sessions_preserve_cpu_output_and_owner_isolation -- --exact --nocapture`
+
+passed (1 test, 0 ignored, final test duration 0.89s). The test now fails if no
+physical Metal device initializes, explicitly selects and asserts Metal for the
+tested Engine and CPU for the reference, and checks greedy output parity on the
+tiny llama head-dimension-32 fixture: scoped continuation, owner change, edited
+and unrelated prompts, and context change. Thus CPU fallback cannot satisfy this
+gate. Local free disk remained 7.8 GiB; no other artifacts/services were removed.
+
+`measurements/affinity-247-review-validation.json` records the validated source
+hashes (also matched against the remote snapshot), commands and limitations.
+This is correctness acceptance evidence, not a performance benchmark. The older
+timing JSON/manifests were not rewritten or rerun; realistic quantized-model
+latency, CUDA/NPU hardware parity, peak device memory and universal speedup remain
+unmeasured. Issue closure still requires maintainer acceptance of this evidence.
