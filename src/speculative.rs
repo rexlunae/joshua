@@ -876,6 +876,37 @@ mod tests {
         }
     }
 
+    #[test]
+    fn position_keyed_verification_passes_distribution_goodness_of_fit() {
+        let probabilities = [0.1_f32, 0.6, 0.3, 0.0];
+        let distribution = TokenDistRef::Probs(&probabilities);
+        let trials = 50_000;
+        for draft in 0..4 {
+            let mut counts = [0usize; 4];
+            for seed in 0..trials {
+                let token = match distribution.verify_at(draft, seed, 11).unwrap() {
+                    Verdict::Accept => draft,
+                    Verdict::Reject(token) => token,
+                };
+                assert_eq!(token, distribution.sample_at(seed, 11).unwrap());
+                counts[token as usize] += 1;
+            }
+            assert_eq!(counts[3], 0);
+            let chi_squared: f64 = counts[..3]
+                .iter()
+                .zip(&probabilities[..3])
+                .map(|(&observed, &probability)| {
+                    let expected = trials as f64 * probability as f64;
+                    (observed as f64 - expected).powi(2) / expected
+                })
+                .sum();
+            assert!(
+                chi_squared < 27.631,
+                "draft {draft}: chi-square {chi_squared} (2 df, alpha 1e-6)"
+            );
+        }
+    }
+
     /// The position hash stays in `[0, 1)`, changes with every stream, and
     /// never selects a zero-probability token.
     #[test]

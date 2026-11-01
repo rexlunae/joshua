@@ -125,6 +125,8 @@ use crate::template::ChatTemplate;
 use crate::error::{JoshuaError, Result};
 use crate::types::{ChatMessage, GenerationOptions, Tool, UsageInfo};
 
+pub mod external_draft;
+
 // ─── Mmap configuration ─────────────────────────────────────────────────────
 
 /// Explicit huge-page size for [`HugePages::Explicit`].
