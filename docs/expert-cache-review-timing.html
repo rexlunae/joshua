@@ -10,22 +10,22 @@
 #expert-cache-timing .cache { background: var(--viz-series-2); }
 #expert-cache-timing .value { position: absolute; right: 4px; top: 0; color: var(--foreground); font-variant-numeric: tabular-nums; }
 </style>
-<figure id="expert-cache-timing" role="img" aria-label="Three noisy paired Qwen decode measurements on RTX 5060 Ti. Run 1: host experts 914.092, cache 927.198 tokens per second. Run 2: host 342.281, cache 356.889. Run 3: host 576.655, cache 432.335, about a 25 percent regression.">
-  <h3>Tiny Qwen decode · RTX 5060 Ti</h3>
+<figure id="expert-cache-timing" role="img" aria-label="Three noisy paired debug-profile Qwen decode measurements with an owned compute stream on RTX 5060 Ti. Run 1: host experts 374.835, cache 462.578 tokens per second. Run 2: host 378.597, cache 449.810. Run 3: host 375.289, cache 441.142. Historical no-regression acceptance remains open.">
+  <h3>Tiny Qwen decode · owned stream</h3>
   <div class="plot">
-    <div class="scale"><span>0</span><span>500</span><span>1000 tok/s</span></div>
+    <div class="scale"><span>0</span><span>250</span><span>500 tok/s</span></div>
     <div class="run">Run 1
-      <div class="row"><span>Host</span><div class="track"><div class="bar" style="width:91.4092%"></div><span class="value">914.092</span></div></div>
-      <div class="row"><span>Cache</span><div class="track"><div class="bar cache" style="width:92.7198%"></div><span class="value">927.198</span></div></div>
+      <div class="row"><span>Host</span><div class="track"><div class="bar" style="width:74.967%"></div><span class="value">374.835</span></div></div>
+      <div class="row"><span>Cache</span><div class="track"><div class="bar cache" style="width:92.5156%"></div><span class="value">462.578</span></div></div>
     </div>
     <div class="run">Run 2
-      <div class="row"><span>Host</span><div class="track"><div class="bar" style="width:34.2281%"></div><span class="value">342.281</span></div></div>
-      <div class="row"><span>Cache</span><div class="track"><div class="bar cache" style="width:35.6889%"></div><span class="value">356.889</span></div></div>
+      <div class="row"><span>Host</span><div class="track"><div class="bar" style="width:75.7194%"></div><span class="value">378.597</span></div></div>
+      <div class="row"><span>Cache</span><div class="track"><div class="bar cache" style="width:89.962%"></div><span class="value">449.810</span></div></div>
     </div>
-    <div class="run">Run 3 · cache −25.0%
-      <div class="row"><span>Host</span><div class="track"><div class="bar" style="width:57.6655%"></div><span class="value">576.655</span></div></div>
-      <div class="row"><span>Cache</span><div class="track"><div class="bar cache" style="width:43.2335%"></div><span class="value">432.335</span></div></div>
+    <div class="run">Run 3
+      <div class="row"><span>Host</span><div class="track"><div class="bar" style="width:75.0578%"></div><span class="value">375.289</span></div></div>
+      <div class="row"><span>Cache</span><div class="track"><div class="bar cache" style="width:88.2284%"></div><span class="value">441.142</span></div></div>
     </div>
   </div>
-  <figcaption>3-slot cache · live services · 3 × 64 timed tokens per mode</figcaption>
+  <figcaption>RTX 5060 Ti · debug · 3 slots · live services · 3 × 64 timed tokens per mode</figcaption>
 </figure>

@@ -127,7 +127,120 @@ selected for deletion are dropped outside the pool lock; concurrent acquisition
 may overlap that destructor with the next reservation. Thus logical accounting
 is not a hard bound on process-wide VRAM or transient allocation peaks.
 
-### Review validation and remaining blockers
+### CUDA shared-session ownership investigation (2026-10-31)
+
+**Do not merge.** Devin thread `PRRT_kwDOSigPUM6yWM8u` remains open. A verified
+backend ownership defect explains cache-independent concurrent corruption, but
+fixing it does not clear strict cached/host greedy parity or historical Qwen
+performance acceptance.
+
+`CudaDevice::new` previously selected cudarc's `per_thread_stream()`, whose raw
+handle is the CUDA per-thread sentinel `0x2`, not one physical queue shared by
+callers. Cloned Candle devices nevertheless share one cuBLAS handle and
+per-DeviceId MMVQ/MMQ scratch. Scratch locks cover submission, not completion;
+different host threads could therefore reuse scratch on different queues.
+`Device::synchronize` also targeted only the calling thread's default queue.
+The constructor now delegates to the existing `new_with_stream`: one owned,
+nonblocking compute stream, shared by device clones, cuBLAS, and scratch.
+Submission locks then order scratch users on the same actual queue, and lease
+fences target that queue. **Sessions share serialized compute, not independent
+per-session GPU overlap.** Background uploads retain their separate completed
+transfer stream. No retirement lists or per-session weight copies are added.
+
+`cuda_shared_workspace_tests` uses fixed weights/inputs, three host workers,
+F32/F16/BF16, and 1/8/32 input rows. Each worker queues 96 quantized and 96 dense
+operations, then compares every output bit-for-bit with serial GPU references.
+Pending outputs are bounded; the compact Q4_K matrix is only 512 by 1024.
+This tests scratch and dense-handle sharing without CPU/GPU rounding in its
+reference. Inputs are deterministic, OS/GPU scheduling is not; repeated passes
+do not prove every CUDA kernel race-free.
+
+Sources/logs remain in `/tmp/joshua-248-devin-20261031-171830`. Controls restore
+only `cuda_backend/device.rs` from the exact saved
+`source-e48b61804abd2f53f4453bf7d0d2b983e0fbffee.tar`. Candidate rebuilds touch
+that file afterward; its owned-stream SHA256 is
+`89ee49b61803f6996fb84d5d2d6d36da38325011d419c4a71b5d369a14e4cfee`.
+These focused runs use the **debug** profile, the existing shared target,
+`CARGO_BUILD_JOBS=2`, and `nice -n 19`, not release/real-model acceptance.
+
+- `stream-control-before.log`: the initial F32-only default-stream experiment
+  failed (`-0.09726913` versus `-0.079484716`); the owned-stream control passed.
+  Two further processes happened to pass both.
+- `stream-before-expanded-{1..3}.log`: the expanded default-stream experiment
+  failed twice, including F16/BF16 quantized and dense F32 results; the explicit
+  owned-stream control passed all three processes.
+- `stream-before-no-pool{,-2,-3,-4,-5}.log`: bit-exact concurrent Qwen and
+  DeepSeek2 no-pool model testing failed once in five processes before the fix.
+  `stream-owned-no-pool-{1..5}.log`: five passes after it, covering prefill,
+  70 decode rows, and three all-logit continuation rows.
+- `stream-owned-workspace-{1..5}.log`: both constructors passed every dense and
+  quantized case in all five processes, bit-exact for all three dtypes.
+- `stream-fix-strict.log` and `stream-owned-strict-churn-{2,3}.log`: strict
+  interleaved cache/host greedy parity still fails, with 5, 5, and 7 DeepSeek2
+  disagreements. The test now **asserts** the total disagreement count after
+  both architectures complete instead of merely logging it. Tolerances are
+  unchanged. Qwen had zero greedy disagreements in these three runs.
+
+The final rebuilt candidate (`stream-final-validation.log`, using
+`--no-fail-fast`) reports: CPU numerical reference 1 passed; expert-cache tests
+6 passed, **1 failed**, 2 ignored; shared-workspace tests 2 passed. The failure
+is strict DeepSeek2 churn with five greedy disagreements, not a passing gate.
+The actual interleaved readback/launch/eviction/error-drop lifetime test passes.
+Both actual CUDA zero/sub-slot placement tests also pass with
+`JOSHUA_GPU_WEIGHT_CACHE=1` (`stream-final-placement.log`).
+
+The separate `cuda_serial_expert_precision_probe` loads one all-CUDA-expert
+model and one CUDA-dense/CPU-expert model, **neither with a pool**, and runs them
+sequentially on one host thread. `stream-serial-precision{,-2}.log` repeats the
+same four DeepSeek2 winner flips for prompt `[1,4,2]` at offsets 30, 38, 39, 40,
+and one for `[5,7,1]` at offset 26. Maximum absolute differences are 0.030333817
+and 0.030445576. At offset 26 in the interleaved run, cache scores choose token
+3 (1.9908428) over 6 (1.9860317), but host scores choose 6 (1.9931693) over
+3 (1.9886569). This isolates a repeatable expert-backend numerical-path
+disagreement from concurrent shared-stream corruption. Whether activation
+requantization, reduction ordering, or another kernel precision difference
+fully explains it is **not established**. The ignored diagnostic's successful
+exit checks numerical bounds only, not greedy acceptance. Changing arithmetic
+or tolerances to hide these flips is not part of this fix. They remain a real
+PR blocker even though they also occur without an expert pool.
+
+One DeepSeek4 shared-cache run also failed its unchanged numerical bound
+(`0.98116964 != 0.79818434`, `stream-fix-validation.log`); two immediate focused
+reruns and the next combined run passed. Three constructor-reverted controls
+(`stream-before-ds4-{1..3}.log`) passed, so the failure is **not labelled
+pre-existing** or dismissed as baseline. It remains an unresolved parity
+observation.
+
+Three owned-stream timing processes repeat three-token prefill, 70 warmup
+tokens, and three trials of 64 timed tokens, with blocking readbacks and a
+331776-byte logical cache. `stream-owned-timing-{1..3}.log` records:
+
+| Run / architecture | CPU experts, CUDA dense (tok/s) | 3-slot cache (tok/s) | All CUDA (tok/s) |
+|---|---:|---:|---:|
+| 1 / Qwen | 374.835 | 462.578 | 1288.685 |
+| 2 / Qwen | 378.597 | 449.810 | 1331.570 |
+| 3 / Qwen | 375.289 | 441.142 | 1361.540 |
+| 1 / DeepSeek2 | 709.550 | 1278.448 | 1334.122 |
+| 2 / DeepSeek2 | 684.341 | 1258.509 | 1330.642 |
+| 3 / DeepSeek2 | 747.854 | 1266.408 | 1342.061 |
+
+The constructor-only baseline (`stream-before-timing.log`) gives Qwen
+373.898 / 453.212 / 1280.390 tok/s and DeepSeek2
+712.256 / 1214.650 / 1244.758. These live-service debug samples do not prove a
+controlled throughput improvement or clear the historical Qwen regression
+below. Physical padding, activations, cuBLAS/driver workspace, stream/event
+metadata, allocator retention, and destruction/upload transients remain extra
+to logical payload accounting. No new physical VRAM cap or async overlap is
+claimed. Existing CPU :8080 and CUDA :8081 PIDs remained 4061392 and 4063925,
+with approximately 12517 MiB free before/after focused runs. No local builds
+or new targets were used. #62 and #52 remain open.
+
+Reproduce focused tests with `cargo test --features cuda --test
+cuda_shared_workspace_tests --test cuda_expert_cache_tests --no-fail-fast --
+--test-threads=1 --nocapture`. Run the serial diagnostic or timing explicitly
+with their exact test name and `-- --ignored --exact --nocapture`.
+
+### Historical review validation at `e48b618` and remaining blockers
 
 All follow-up accelerator runs used kleya's RTX 5060 Ti with the existing
 CPU :8080 and CUDA :8081 services intact (PIDs 4061392 and 4063925). Before tiny
@@ -194,10 +307,10 @@ loads all models with `Some(0)` and asserts no pool exists. Running
 on that artifact failed twice in three runs: offset 7
 `1.2651038 != 1.072143` and offset 42 `0.17209363 != 0.16552365`
 (`baseline-no-cache-{1..3}.log`). Its stricter diagnostic threshold is not a
-change to any existing test. The source of this cache-independent CUDA
-concurrency failure is not established or fixed here; it remains an output
-parity acceptance blocker, not evidence that the new lifetime regression passed
-end-to-end model parity.
+change to any existing test. At that point the concurrency failure's source
+was not established or fixed. The later shared-stream investigation above
+identifies a backend ownership defect, but retains separate strict output
+parity blockers; these historical failures are not passing evidence.
 
 Other exact baseline reproductions are retained: `baseline-9736-cpu-reference-2.log`
 records the same disabled-cache DeepSeek2 CPU/CUDA winner divergence, and

@@ -377,6 +377,47 @@ fn older_error(actual: &[f32], expected: &[f32]) -> f32 {
 }
 
 #[test]
+fn cuda_older_loaders_concurrent_no_pool_parity() {
+    let device = cuda();
+    for (name, write) in [
+        ("qwen", common::write_tiny_qwen3moe_quantized_gguf as fn(&Path)),
+        ("deepseek2", common::write_tiny_deepseek2_quantized_gguf as fn(&Path)),
+    ] {
+        let dir = common::model_dir(&format!("cuda-no-pool-{name}"));
+        let path = dir.join("model.gguf");
+        write(&path);
+        let template = load_older(&path, &device, Some(0));
+        assert!(template.device_expert_cache().is_none());
+        let sessions = [[1, 4, 2], [5, 7, 1]].map(|prompt| {
+            let mut reference = template.new_session().unwrap();
+            let mut expected = vec![older_logits(&mut reference, &device, &prompt, 0)];
+            for offset in 3..73 {
+                expected.push(older_logits(&mut reference, &device, &[3], offset));
+            }
+            expected.push(older_logits(&mut reference, &device, &[3, 8, 3], 73));
+            (template.new_session().unwrap(), prompt, expected)
+        });
+        let start = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            for (mut session, prompt, expected) in sessions {
+                let device = &device;
+                let start = &start;
+                scope.spawn(move || {
+                    start.wait();
+                    assert_eq!(older_logits(&mut session, device, &prompt, 0), expected[0]);
+                    for offset in 3..73 {
+                        assert_eq!(older_logits(&mut session, device, &[3], offset), expected[offset - 2]);
+                    }
+                    assert_eq!(older_logits(&mut session, device, &[3, 8, 3], 73), expected[71]);
+                });
+            }
+        });
+        eprintln!("CUDA {name} concurrent no-pool: bit-exact prefill, 70 decode rows, three all-logit rows");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[test]
 fn cuda_older_loaders_bounded_shared_cache() {
     const SLOT: u64 = 3 * 256 * 256 / 256 * 144;
     let device = cuda();
@@ -474,8 +515,10 @@ fn cuda_older_loaders_bounded_shared_cache() {
 #[test]
 fn cuda_older_loaders_interleaved_eviction_numerical_parity() {
     use joshua::native_session::LayerStack;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     const SLOT: u64 = 3 * 256 * 144;
     let device = cuda();
+    let mut greedy_failures = Vec::new();
     for (name, write) in [
         ("qwen", common::write_tiny_qwen3moe_quantized_gguf as fn(&Path)),
         ("deepseek2", common::write_tiny_deepseek2_quantized_gguf as fn(&Path)),
@@ -493,6 +536,7 @@ fn cuda_older_loaders_interleaved_eviction_numerical_parity() {
             (template.new_session().unwrap(), load_older(&path, &device, Some(0)), prompt)
         });
         let start = std::sync::Barrier::new(3);
+        let total_mismatches = AtomicUsize::new(0);
         std::thread::scope(|scope| {
             scope.spawn(|| {
                 start.wait();
@@ -509,28 +553,35 @@ fn cuda_older_loaders_interleaved_eviction_numerical_parity() {
             for (mut cached, mut host, prompt) in sessions {
                 let device = &device;
                 let start = &start;
+                let total_mismatches = &total_mismatches;
                 scope.spawn(move || {
                     start.wait();
                     let mut mismatches = 0;
                     let mut max_error = 0f32;
-                    let mut compare = |actual: Vec<f32>, expected: Vec<f32>| {
+                    let mut compare = |actual: Vec<f32>, expected: Vec<f32>, offset| {
                         assert_close(&actual, &expected);
-                        for (actual, expected) in actual.chunks_exact(16).zip(expected.chunks_exact(16)) {
+                        for (row, (actual, expected)) in actual.chunks_exact(16).zip(expected.chunks_exact(16)).enumerate() {
                             let winner = |row: &[f32]| row.iter().enumerate()
                                 .max_by(|left, right| left.1.total_cmp(right.1)).unwrap().0;
-                            mismatches += usize::from(winner(actual) != winner(expected));
+                            if winner(actual) != winner(expected) {
+                                mismatches += 1;
+                                if mismatches <= 3 {
+                                    eprintln!("CUDA {name} prompt={prompt:?} offset={offset} row={row}: cache winner={} ({} vs {}), host winner={} ({} vs {})", winner(actual), actual[winner(actual)], expected[winner(actual)], winner(expected), actual[winner(expected)], expected[winner(expected)]);
+                                }
+                            }
                             for (actual, expected) in actual.iter().zip(expected) {
                                 max_error = max_error.max((actual - expected).abs());
                             }
                         }
                     };
-                    compare(older_logits(&mut cached, device, &prompt, 0), older_logits(&mut host, device, &prompt, 0));
+                    compare(older_logits(&mut cached, device, &prompt, 0), older_logits(&mut host, device, &prompt, 0), 0);
                     for offset in 3..73 {
-                        compare(older_logits(&mut cached, device, &[3], offset), older_logits(&mut host, device, &[3], offset));
+                        compare(older_logits(&mut cached, device, &[3], offset), older_logits(&mut host, device, &[3], offset), offset);
                         let report = cached.device_expert_cache().unwrap();
                         assert!(report.resident <= 3 && report.resident_bytes <= 3 * SLOT, "{report:?}");
                     }
-                    compare(older_logits(&mut cached, device, &[3, 8, 3], 73), older_logits(&mut host, device, &[3, 8, 3], 73));
+                    compare(older_logits(&mut cached, device, &[3, 8, 3], 73), older_logits(&mut host, device, &[3, 8, 3], 73), 73);
+                    total_mismatches.fetch_add(mismatches, Ordering::Relaxed);
                     eprintln!("CUDA interleaved {name} prompt={prompt:?}: max_abs_error={max_error}, greedy_mismatches={mismatches}");
                 });
             }
@@ -540,8 +591,10 @@ fn cuda_older_loaders_interleaved_eviction_numerical_parity() {
         assert!(report.stats.evictions > 0 && report.stats.uploads > 0 && report.stats.hits > 0, "{report:?}");
         assert_eq!(report.stats.upload_failures, 0);
         eprintln!("CUDA interleaved {name}: {report:?}");
+        greedy_failures.push((name, total_mismatches.load(Ordering::Relaxed)));
         std::fs::remove_dir_all(dir).unwrap();
     }
+    assert!(greedy_failures.iter().all(|(_, count)| *count == 0), "cached/host greedy parity failed: {greedy_failures:?}");
 }
 
 #[test]
@@ -638,4 +691,44 @@ fn cuda_older_loaders_decode_measurement() {
         }
         std::fs::remove_dir_all(dir).unwrap();
     }
+}
+
+#[test]
+#[ignore = "bounded serial precision diagnostic, not an acceptance gate"]
+fn cuda_serial_expert_precision_probe() {
+    let device = cuda();
+    let dir = common::model_dir("cuda-serial-expert-precision");
+    let path = dir.join("model.gguf");
+    common::write_tiny_deepseek2_quantized_gguf(&path);
+    for prompt in [[1, 4, 2], [5, 7, 1]] {
+        let mut accelerator = load_older_placed(&path, &device, &device, None);
+        let mut host = load_older(&path, &device, Some(0));
+        assert!(accelerator.device_expert_cache().is_none());
+        assert!(host.device_expert_cache().is_none());
+        let mut mismatches = 0;
+        let mut maximum = 0f32;
+        for offset in std::iter::once(0).chain(3..73).chain(std::iter::once(73)) {
+            let tokens: &[u32] = match offset {
+                0 => &prompt,
+                73 => &[3, 8, 3],
+                _ => &[3],
+            };
+            let actual = older_logits(&mut accelerator, &device, tokens, offset);
+            let expected = older_logits(&mut host, &device, tokens, offset);
+            assert_close(&actual, &expected);
+            for (row, (actual, expected)) in actual.chunks_exact(16).zip(expected.chunks_exact(16)).enumerate() {
+                let winner = |row: &[f32]| row.iter().enumerate()
+                    .max_by(|left, right| left.1.total_cmp(right.1)).unwrap().0;
+                if winner(actual) != winner(expected) {
+                    mismatches += 1;
+                    eprintln!("serial no-pool DeepSeek2 prompt={prompt:?} offset={offset} row={row}: accelerator winner={}, host winner={}", winner(actual), winner(expected));
+                }
+                for (actual, expected) in actual.iter().zip(expected) {
+                    maximum = maximum.max((actual - expected).abs());
+                }
+            }
+        }
+        eprintln!("serial no-pool DeepSeek2 prompt={prompt:?}: max_abs_error={maximum}, greedy_mismatches={mismatches}");
+    }
+    std::fs::remove_dir_all(dir).unwrap();
 }

@@ -51,7 +51,7 @@ static WORKSPACE: OnceLock<Mutex<HashMap<DeviceId, WorkspaceSlot>>> = OnceLock::
 /// Returns a device pointer to the scratch workspace, growing it if needed.
 /// The returned `MutexGuard` must be held alive until the kernels using
 /// this pointer have been launched (all launches are on the device's
-/// default stream, so they are serialised).
+/// owned compute stream, shared by every host thread, so they are serialised).
 fn workspace_ensure(
     dev: &CudaDevice,
     bytes: usize,
