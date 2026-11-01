@@ -109,18 +109,163 @@ fn split_sinkhorn_with_scale(
         .broadcast_add(&base.narrow(0, 2 * hc, hc * hc)?)?;
     let comb0 = comb0.reshape((n, hc, hc))?;
 
-    let mut comb = softmax_last_dim(&comb0)?.affine(1.0, eps)?;
-    comb = comb.broadcast_div(&crate::precise::sum_keepdim(&comb, 1)?.affine(1.0, eps)?)?;
-    for _ in 0..iters.saturating_sub(1) {
-        comb = comb.broadcast_div(&crate::precise::sum_keepdim(&comb, 2)?.affine(1.0, eps)?)?;
-        comb = comb.broadcast_div(&crate::precise::sum_keepdim(&comb, 1)?.affine(1.0, eps)?)?;
-    }
+    let comb = normalize_comb(&softmax_last_dim(&comb0)?.affine(1.0, eps)?, hc, iters, eps)?;
 
     let lead = &shape[..shape.len() - 1];
     let pre = pre.reshape([lead, &[hc]].concat())?;
     let post = post.reshape([lead, &[hc]].concat())?;
     let comb = comb.reshape([lead, &[hc, hc]].concat())?;
     Ok(HcMix { pre, post, comb })
+}
+
+/// Sinkhorn-normalize `comb` (`[n, hc, hc]`): one column pass, then
+/// `iters - 1` row-then-column rounds.
+///
+/// A small CPU f32 matrix is normalized in one owned buffer instead of
+/// allocating a sum tensor and a quotient tensor per pass (twenty rounds is
+/// the loader default).  Every reduction keeps the tensor path's order, so
+/// the result is bit-identical: rows through the same `vec_reduce_sum`
+/// candle's last-dim sum uses, columns accumulated top to bottom, and both
+/// as a sequential f64 sum under the precise policy (`precise::Rows`).
+/// `sum * 1.0 + eps` is `affine(1.0, eps)` written out.  A matrix that
+/// carries a backward graph keeps the tensor path, which records it.
+fn normalize_comb(comb: &Tensor, hc: usize, iters: usize, eps: f64) -> Result<Tensor> {
+    if matches!(hc, 1..=4)
+        && comb.dtype() == candle_core::DType::F32
+        && comb.device().is_cpu()
+        && comb.is_contiguous()
+        && !comb.track_op()
+    {
+        use candle_core::cpu::kernels::VecOps;
+
+        let (storage, layout) = comb.storage_and_layout();
+        let candle_core::Storage::Cpu(storage) = &*storage else {
+            unreachable!()
+        };
+        let source = storage.as_slice::<f32>()?;
+        let mut output =
+            source[layout.start_offset()..layout.start_offset() + comb.elem_count()].to_vec();
+        let precise = crate::precise::active(comb);
+        let eps = eps as f32;
+        for matrix in output.chunks_exact_mut(hc * hc) {
+            for iteration in 0..iters.max(1) {
+                if iteration != 0 {
+                    for row in matrix.chunks_exact_mut(hc) {
+                        let mut sum = 0f32;
+                        if precise {
+                            let mut wide_sum = 0f64;
+                            for &value in row.iter() {
+                                wide_sum += value as f64;
+                            }
+                            sum = wide_sum as f32;
+                        } else {
+                            // SAFETY: `row` holds exactly `hc` initialized f32s.
+                            unsafe { f32::vec_reduce_sum(row.as_ptr(), &mut sum, hc) };
+                        }
+                        let denominator = sum * 1.0 + eps;
+                        for value in row {
+                            *value /= denominator;
+                        }
+                    }
+                }
+                let mut denominators = [0f32; 4];
+                for column in 0..hc {
+                    let mut sum = 0f32;
+                    if precise {
+                        let mut wide_sum = 0f64;
+                        for row in 0..hc {
+                            wide_sum += matrix[row * hc + column] as f64;
+                        }
+                        sum = wide_sum as f32;
+                    } else {
+                        for row in 0..hc {
+                            sum += matrix[row * hc + column];
+                        }
+                    }
+                    denominators[column] = sum * 1.0 + eps;
+                }
+                for row in matrix.chunks_exact_mut(hc) {
+                    for (value, denominator) in row.iter_mut().zip(denominators) {
+                        *value /= denominator;
+                    }
+                }
+            }
+        }
+        return Tensor::from_vec(output, comb.shape(), comb.device());
+    }
+    let mut comb = comb.broadcast_div(&crate::precise::sum_keepdim(comb, 1)?.affine(1.0, eps)?)?;
+    for _ in 0..iters.saturating_sub(1) {
+        comb = comb.broadcast_div(&crate::precise::sum_keepdim(&comb, 2)?.affine(1.0, eps)?)?;
+        comb = comb.broadcast_div(&crate::precise::sum_keepdim(&comb, 1)?.affine(1.0, eps)?)?;
+    }
+    Ok(comb)
+}
+
+#[cfg(test)]
+mod sinkhorn_tests {
+    use super::*;
+
+    fn reference(comb: &Tensor, iters: usize, eps: f64) -> Result<Tensor> {
+        let mut comb =
+            comb.broadcast_div(&crate::precise::sum_keepdim(comb, 1)?.affine(1.0, eps)?)?;
+        for _ in 0..iters.saturating_sub(1) {
+            comb = comb.broadcast_div(&crate::precise::sum_keepdim(&comb, 2)?.affine(1.0, eps)?)?;
+            comb = comb.broadcast_div(&crate::precise::sum_keepdim(&comb, 1)?.affine(1.0, eps)?)?;
+        }
+        Ok(comb)
+    }
+
+    #[test]
+    fn tracked_cpu_mixes_keep_their_gradient() -> Result<()> {
+        let dev = candle_core::Device::Cpu;
+        let hc = 2;
+        let mixes = candle_core::Var::from_tensor(&Tensor::new(
+            &[[0.3f32, -0.2, 0.1, 0.4, 0.7, -0.5, 0.2, 0.9]],
+            &dev,
+        )?)?;
+        let scale = Tensor::new(&[1.0f32, 1.0, 1.0], &dev)?;
+        let base = Tensor::zeros((2 + hc) * hc, candle_core::DType::F32, &dev)?;
+        let mix = split_sinkhorn(mixes.as_tensor(), &scale, &base, hc, 20, 1e-6)?;
+        assert!(mix.comb.track_op(), "comb must stay attached to the graph");
+        // A non-uniform weighting, so the loss is not invariant to the
+        // normalization and the gradient cannot vanish by symmetry.
+        let weights = Tensor::new(&[[[1.0f32, 2.0], [3.0, 4.0]]], &dev)?;
+        let grads = (mix.comb * weights)?.sum_all()?.backward()?;
+        let grad = grads.get(mixes.as_tensor()).expect("gradient for mixes");
+        let comb_part = grad.narrow(1, 2 * hc, hc * hc)?.abs()?.sum_all()?;
+        assert!(comb_part.to_scalar::<f32>()? > 0.0);
+        Ok(())
+    }
+
+    #[test]
+    fn cpu_normalization_preserves_reduction_bits_and_offsets() -> Result<()> {
+        for hc in 1..=5 {
+            for rows in [0, 1, 7, 129] {
+                let values = (0..(rows + 2) * hc * hc)
+                    .map(|index| ((index * 73 % 101) as f32 + 0.125) / 103.0)
+                    .collect::<Vec<_>>();
+                let input = Tensor::from_vec(values, (rows + 2, hc, hc), &candle_core::Device::Cpu)?;
+                let input = input.narrow(0, 1, rows)?;
+                for input in [&input, &input.transpose(1, 2)?] {
+                    for iters in [0, 1, 2, 20] {
+                        for eps in [0.0, 1e-12, 1e-5] {
+                            let actual = normalize_comb(input, hc, iters, eps)?;
+                            let expected = reference(input, iters, eps)?;
+                            assert_eq!(actual.dims(), expected.dims());
+                            let actual = actual.flatten_all()?.to_vec1::<f32>()?;
+                            let expected = expected.flatten_all()?.to_vec1::<f32>()?;
+                            assert_eq!(
+                                actual.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+                                expected.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+                                "hc={hc} rows={rows} iters={iters} eps={eps}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(feature = "vulkan")]
