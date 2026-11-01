@@ -125,6 +125,8 @@ use crate::template::ChatTemplate;
 use crate::error::{JoshuaError, Result};
 use crate::types::{ChatMessage, GenerationOptions, Tool, UsageInfo};
 
+pub mod external_draft;
+
 // ─── Mmap configuration ─────────────────────────────────────────────────────
 
 /// Explicit huge-page size for [`HugePages::Explicit`].
@@ -815,6 +817,7 @@ fn legacy_reppen() -> bool {
 /// Instances are cheaply clonable (the tokenizer is `Arc`-wrapped) and are
 /// `Send + Sync`, so a single `Arc<Engine>` can be shared across threads.
 pub struct Engine {
+    cache_epoch: String,
     /// Path to the `.gguf` file.
     model_path: PathBuf,
     /// The GGUF file memory-mapped into the process address space.
@@ -864,6 +867,7 @@ pub struct Engine {
     model_cache: Mutex<Vec<CachedModel>>,
     /// Number of requests that continued from a cached KV prefix.
     kv_reuses: AtomicU64,
+    kv_tokens_reused: AtomicU64,
     /// Number of requests that continued from a cached KV prefix recovered
     /// across an *edit* of the conversation — the prompt shares only a
     /// prefix with the cached history (agent harnesses truncate or replace
@@ -1233,6 +1237,8 @@ impl Drop for InFlightGuard<'_> {
 
 /// A parked generation session whose state holds exactly `tokens`.
 struct CachedModel {
+    scope: Option<crate::affinity::Scope>,
+    parked_at: Instant,
     session: GenSession,
     tokens: Vec<u32>,
 }
@@ -2575,7 +2581,9 @@ impl Engine {
             special_tokens,
             embed_model: Mutex::new(None),
             model_cache: Mutex::new(Vec::new()),
+            cache_epoch: uuid::Uuid::new_v4().to_string(),
             kv_reuses: AtomicU64::new(0),
+            kv_tokens_reused: AtomicU64::new(0),
             kv_edit_reuses: AtomicU64::new(0),
             npu: None,
             in_flight: AdmissionGate::new(),
@@ -2928,6 +2936,46 @@ impl Engine {
     /// The stem of the loaded model file name.
     pub fn model_name(&self) -> &str {
         &self.model_name
+    }
+
+    /// Identity of this loaded engine, including its immutable execution configuration.
+    pub fn cache_epoch(&self) -> &str {
+        &self.cache_epoch
+    }
+
+    /// Bounded, point-in-time residency across the warm pool and detached snapshots.
+    pub fn cache_residency(&self, limit: usize) -> crate::affinity::CacheResidency {
+        let mut entries = std::collections::BTreeMap::<crate::affinity::Scope, usize>::new();
+        let mut complete = true;
+        let mut visit = |scope, tokens| {
+            if let Some(length) = entries.get_mut(&scope) {
+                *length = (*length).max(tokens);
+            } else if entries.len() < limit {
+                entries.insert(scope, tokens);
+            } else {
+                complete = false;
+            }
+        };
+        let mut pool = self.model_pool();
+        pool.retain(|entry| {
+            entry.scope.is_none() || entry.parked_at.elapsed() < crate::affinity::TTL
+        });
+        for entry in pool.iter().filter(|entry| !entry.tokens.is_empty()) {
+            if let Some(scope) = entry.scope {
+                visit(scope, entry.tokens.len());
+            }
+        }
+        self.prefix_cache().visit_residency(&mut visit);
+        crate::affinity::CacheResidency {
+            entries: entries
+                .into_iter()
+                .map(|(scope, tokens)| crate::affinity::ResidentScope {
+                    scope: crate::affinity::encode(scope),
+                    tokens,
+                })
+                .collect(),
+            complete,
+        }
     }
 
     /// Absolute path of the loaded `.gguf` file.
@@ -3335,11 +3383,11 @@ impl Engine {
 
         // Acquire an NPU session (never by token prefix — the plugin owns
         // tokenisation here, so no history to match).
-        let (mut session, _) = self.acquire_session(&[], true)?;
+        let (mut session, _) = self.acquire_session(&[], true, options.cache_namespace())?;
         if !session.supports_media() {
             // Repool the (text-capable) session before failing.
             if session.clear_state() {
-                self.release_model(session, Vec::new());
+                self.release_model(session, Vec::new(), options.cache_namespace());
             }
             return Err(JoshuaError::InvalidRequest(
                 "this request contains images, which require a multimodal NPU plugin — \
@@ -3377,7 +3425,7 @@ impl Engine {
                 // The session's token history is plugin-internal; repool only
                 // after a clean reset.
                 if session.clear_state() {
-                    self.release_model(session, Vec::new());
+                    self.release_model(session, Vec::new(), options.cache_namespace());
                 }
                 let prefill_tps = if prefill_ms > 0.0 {
                     n_past as f64 / (prefill_ms / 1000.0)
@@ -3402,7 +3450,7 @@ impl Engine {
                 // A request error, not a backend fault: keep the session and
                 // leave the circuit breaker alone.
                 if session.clear_state() {
-                    self.release_model(session, Vec::new());
+                    self.release_model(session, Vec::new(), options.cache_namespace());
                 }
                 Err(e)
             }
@@ -3536,7 +3584,8 @@ impl Engine {
         // ── Acquire a session, generate, retry on CPU if the NPU fails ──────
         // Prefer a pooled instance whose state already covers a prefix of
         // this prompt; fall back to a reset instance or a fresh load.
-        let (mut session, n_reused) = self.acquire_session(prompt_tokens, true)?;
+        let (mut session, n_reused) =
+            self.acquire_session(prompt_tokens, true, options.cache_namespace())?;
         let was_npu = session.is_npu();
 
         let streaming = on_text.is_some();
@@ -3552,7 +3601,7 @@ impl Engine {
         match result {
             Ok((completion, kv_tokens)) => {
                 // Park the instance for reuse by a follow-up request.
-                self.release_model(session, kv_tokens);
+                self.release_model(session, kv_tokens, options.cache_namespace());
                 Ok(completion)
             }
             // Client errors (`InvalidRequest`) are not backend failures: they
@@ -3573,7 +3622,7 @@ impl Engine {
                     npu.record_failure(&npu.backend.name(), &e.to_string());
                 }
                 if session.clear_state() {
-                    self.release_model(session, Vec::new());
+                    self.release_model(session, Vec::new(), options.cache_namespace());
                 }
                 if self.arch_error.is_some() {
                     // No candle loader exists for this architecture, so the
@@ -3582,7 +3631,8 @@ impl Engine {
                     return Err(e);
                 }
                 tracing::warn!("Retrying request on the candle path after NPU failure: {e}");
-                let (mut session, n_reused) = self.acquire_session(prompt_tokens, false)?;
+                let (mut session, n_reused) =
+                    self.acquire_session(prompt_tokens, false, options.cache_namespace())?;
                 match self.run_generation(
                     &mut session,
                     prompt_tokens,
@@ -3593,12 +3643,12 @@ impl Engine {
                     None,
                 ) {
                     Ok((completion, kv_tokens)) => {
-                        self.release_model(session, kv_tokens);
+                        self.release_model(session, kv_tokens, options.cache_namespace());
                         Ok(completion)
                     }
                     Err(e) => {
                         if session.clear_state() {
-                            self.release_model(session, Vec::new());
+                            self.release_model(session, Vec::new(), options.cache_namespace());
                         }
                         Err(e)
                     }
@@ -3609,7 +3659,7 @@ impl Engine {
                 // a cleared cache is fully consistent, so keep the (expensive
                 // to reload) weights warm where the architecture allows it.
                 if session.clear_state() {
-                    self.release_model(session, Vec::new());
+                    self.release_model(session, Vec::new(), options.cache_namespace());
                 }
                 Err(e)
             }
@@ -3743,23 +3793,33 @@ impl Engine {
         // prompt in two parts; an attention-only model reads it in one and
         // the snapshot is cut back to the head.
         let root = root.filter(|&r| {
-            r > n_reused && r < n_prompt && model.supports_snapshot() && self.root_wanted(&prompt_tokens[..r])
+            r > n_reused
+                && r < n_prompt
+                && model.supports_snapshot()
+                && self.root_wanted(&prompt_tokens[..r], options.cache_namespace())
         });
         let prefill_start = Instant::now();
         let logits_vec = match root {
             Some(r) if !model.supports_truncate() => {
                 self.prefill(model, &prompt_tokens[n_reused..r], n_reused)?;
-                self.store_root(model, &prompt_tokens[..r], r);
+                self.store_root(model, &prompt_tokens[..r], r, options.cache_namespace());
                 self.prefill(model, &prompt_tokens[r..], r)?
             }
             Some(r) => {
                 let logits = self.prefill(model, new_tokens, n_reused)?;
-                self.store_root(model, &prompt_tokens[..r], n_prompt);
+                self.store_root(
+                    model,
+                    &prompt_tokens[..r],
+                    n_prompt,
+                    options.cache_namespace(),
+                );
                 logits
             }
             None => self.prefill(model, new_tokens, n_reused)?,
         };
         let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
+        self.kv_tokens_reused
+            .fetch_add(n_reused as u64, Ordering::Relaxed);
 
         // ── Repetition-penalty history ────────────────────────────────────────
         let outcome = self.decode_loop(
@@ -4446,6 +4506,25 @@ impl Engine {
         self.kv_reuses.load(Ordering::Relaxed)
     }
 
+    /// Prompt tokens skipped by successful cached-state prefills.
+    pub fn kv_tokens_reused(&self) -> u64 {
+        self.kv_tokens_reused.load(Ordering::Relaxed)
+    }
+
+    /// Warm-session count and reported state bytes, excluding shared weights.
+    /// Remote backends do not expose their state allocation and report zero bytes.
+    pub fn warm_cache_stats(&self) -> (usize, u64) {
+        let pool = self.model_pool();
+        (
+            pool.len(),
+            pool.iter().fold(0u64, |bytes, entry| {
+                bytes
+                    .saturating_add(entry.session.state_bytes())
+                    .saturating_add((entry.tokens.capacity() as u64).saturating_mul(4))
+            }),
+        )
+    }
+
     /// Number of requests so far that continued from a cached KV prefix
     /// recovered across an edit of the conversation (the prompt shares only
     /// a prefix with the cached history, so the session state was rewound
@@ -4584,6 +4663,7 @@ impl Engine {
         &self,
         prompt_tokens: &[u32],
         allow_npu: bool,
+        scope: Option<crate::affinity::Scope>,
     ) -> Result<(GenSession, usize)> {
         let want_npu = allow_npu && self.npu.as_ref().is_some_and(|n| n.usable());
 
@@ -4599,6 +4679,9 @@ impl Engine {
 
         {
             let mut pool = self.model_pool();
+            pool.retain(|entry| {
+                entry.scope.is_none() || entry.parked_at.elapsed() < crate::affinity::TTL
+            });
             // Only reuse sessions of the kind this request will run on —
             // mixing kinds mid-conversation would splice numerically
             // different logits into one generation.
@@ -4611,6 +4694,7 @@ impl Engine {
                     // empty (or poisoned, below) reach the clearing path
                     // instead of being served as-is.
                     !c.tokens.is_empty()
+                        && c.scope == scope
                         && c.session.is_npu() == want_npu
                         && c.tokens.len() < prompt_tokens.len()
                         && prompt_tokens.starts_with(&c.tokens)
@@ -4620,7 +4704,11 @@ impl Engine {
             // A longer prefix-cache entry (a parked conversation that went
             // further) beats continuing a shorter pooled one, which then
             // stays pooled.
-            let cached = if want_npu { 0 } else { self.prefix_cache().best_len(prompt_tokens) };
+            let cached = if want_npu {
+                0
+            } else {
+                self.prefix_cache().best_len_scoped(prompt_tokens, scope)
+            };
             from_cache = best.is_some_and(|i| cached > pool[i].tokens.len());
             if let Some(i) = best.filter(|_| !from_cache) {
                 let cached = pool.swap_remove(i);
@@ -4658,7 +4746,7 @@ impl Engine {
                 let best_edit = pool
                     .iter()
                     .enumerate()
-                    .filter(|(_, c)| !c.session.is_npu())
+                    .filter(|(_, c)| c.scope == scope && !c.session.is_npu())
                     .map(|(i, c)| {
                         let lcp = longest_common_prefix(&c.tokens, prompt_tokens);
                         // Rollback case: keep one token behind so the suffix
@@ -4694,7 +4782,7 @@ impl Engine {
         // two alternating conversations would otherwise each re-read the
         // other's history away.
         if let Some(mut cached) = clear_pick {
-            self.park_session(&cached.session, &cached.tokens);
+            self.park_session(&cached.session, &cached.tokens, cached.scope);
             if cached.session.clear_state() {
                 tracing::debug!(npu = want_npu, "Reusing pooled session with cleared state");
                 return Ok((cached.session, 0));
@@ -4703,7 +4791,7 @@ impl Engine {
         }
 
         if from_cache {
-            if let Some(resumed) = self.resume_from_prefix_cache(prompt_tokens)? {
+            if let Some(resumed) = self.resume_from_prefix_cache(prompt_tokens, scope)? {
                 return Ok(resumed);
             }
         }
@@ -4856,27 +4944,44 @@ impl Engine {
 
     /// Whether `head` should become a root entry: the cache is on, keeps none
     /// for it yet, and the box has room.
-    fn root_wanted(&self, head: &[u32]) -> bool {
+    fn root_wanted(&self, head: &[u32], scope: Option<crate::affinity::Scope>) -> bool {
         let cache = self.prefix_cache();
-        cache.enabled() && !cache.has_root(head) && Self::ram_allows_parking()
+        cache.enabled() && !cache.has_root_scoped(head, scope) && Self::ram_allows_parking()
     }
 
     /// Keep the state after `head` (of the `len` tokens the session has been
     /// fed) as a root entry.  Best-effort: a model outside the shared session,
     /// or a snapshot over budget, stores nothing.
-    fn store_root(&self, model: &GenSession, head: &[u32], len: usize) {
+    fn store_root(
+        &self,
+        model: &GenSession,
+        head: &[u32],
+        len: usize,
+        scope: Option<crate::affinity::Scope>,
+    ) {
         if !self.snapshot_fits(model, head.len(), len) {
             return;
         }
         if let Some(snap) = model.snapshot(head.len(), len) {
-            let stored = self.prefix_cache().insert(head.to_vec(), snap, true);
-            tracing::debug!(tokens = head.len(), stored, "prefix cache: system-prompt root");
+            let stored = self
+                .prefix_cache()
+                .insert_scoped(head.to_vec(), snap, true, scope);
+            tracing::debug!(
+                tokens = head.len(),
+                stored,
+                "prefix cache: system-prompt root"
+            );
         }
     }
 
     /// Park a session the warm pool is letting go of, so its conversation can
     /// resume later without re-reading its history.
-    fn park_session(&self, session: &GenSession, tokens: &[u32]) {
+    fn park_session(
+        &self,
+        session: &GenSession,
+        tokens: &[u32],
+        scope: Option<crate::affinity::Scope>,
+    ) {
         let min = PREFIX_CACHE_PARK_MIN.min(self.prefix_cache_root_min);
         if tokens.len() < min || !self.prefix_cache().enabled() {
             return;
@@ -4889,8 +4994,14 @@ impl Engine {
             return;
         }
         if let Some(snap) = session.snapshot(tokens.len(), tokens.len()) {
-            let stored = self.prefix_cache().insert(tokens.to_vec(), snap, false);
-            tracing::debug!(tokens = tokens.len(), stored, "prefix cache: parked a conversation");
+            let stored = self
+                .prefix_cache()
+                .insert_scoped(tokens.to_vec(), snap, false, scope);
+            tracing::debug!(
+                tokens = tokens.len(),
+                stored,
+                "prefix cache: parked a conversation"
+            );
         }
     }
 
@@ -4898,10 +5009,14 @@ impl Engine {
     /// extends: a fresh session over the shared weights takes the entry's
     /// state, so no pooled conversation is disturbed.  `None` when nothing
     /// matches or the state cannot be restored.
-    fn resume_from_prefix_cache(&self, prompt_tokens: &[u32]) -> Result<Option<(GenSession, usize)>> {
+    fn resume_from_prefix_cache(
+        &self,
+        prompt_tokens: &[u32],
+        scope: Option<crate::affinity::Scope>,
+    ) -> Result<Option<(GenSession, usize)>> {
         let hit = {
             let mut cache = self.prefix_cache();
-            match cache.take(prompt_tokens, |s| s.duplicate(&Device::Cpu)) {
+            match cache.take_scoped(prompt_tokens, scope, |s| s.duplicate(&Device::Cpu)) {
                 Ok(hit) => hit,
                 Err(e) => {
                     tracing::debug!(error = %e, "prefix cache: copying a root failed");
@@ -4938,9 +5053,19 @@ impl Engine {
     }
 
     /// Return a finished session (state = `tokens`) to the pool.
-    fn release_model(&self, session: GenSession, tokens: Vec<u32>) {
+    fn release_model(
+        &self,
+        session: GenSession,
+        tokens: Vec<u32>,
+        scope: Option<crate::affinity::Scope>,
+    ) {
         let mut pool = self.model_pool();
-        pool.push(CachedModel { session, tokens });
+        pool.push(CachedModel {
+            session,
+            tokens,
+            scope,
+            parked_at: Instant::now(),
+        });
         // Evict oldest beyond the cap.  Under memory pressure the pool also
         // holds fewer (or no) idle sessions, so a heavy model's working set
         // isn't kept resident twice/three times just to warm a next request
@@ -4978,7 +5103,7 @@ impl Engine {
         // Copy each evicted conversation into the prefix cache outside the
         // pool lock (a large KV copy must not stall other requests).
         for c in evicted {
-            self.park_session(&c.session, &c.tokens);
+            self.park_session(&c.session, &c.tokens, c.scope);
         }
     }
 

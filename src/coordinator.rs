@@ -60,7 +60,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -142,6 +142,12 @@ pub struct WorkerInfo {
     pub transcription_in_flight: usize,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub embedding_jobs: Vec<JobModel>,
+    /// Bounded live cache inventory; absence is unknown on older workers.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub cache_residency: HashMap<String, crate::affinity::CacheResidency>,
+    /// Per-engine incarnation, changed on restart or model reload.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub cache_epochs: HashMap<String, String>,
     /// The worker's [`WORKER_PROTOCOL_VERSION`].
     pub protocol_version: u32,
     /// Model identity (the id the worker reports in `/v1/models`).
@@ -316,6 +322,7 @@ impl Endpoint {
 /// Last known state of one worker.
 #[derive(Debug, Clone, Default)]
 struct WorkerStatus {
+    residency_generation: u64,
     healthy: bool,
     info: Option<WorkerInfo>,
     /// Requests the worker runs for clients other than this coordinator, as
@@ -331,6 +338,7 @@ struct WorkerStatus {
 
 struct Worker {
     audio_dispatched: AtomicUsize,
+    dispatch_generation: AtomicU64,
     endpoint: Endpoint,
     status: Mutex<WorkerStatus>,
     /// Requests this coordinator has in flight on the worker.
@@ -455,6 +463,7 @@ impl Drop for AbortOnDrop {
 /// The request router: worker registry, admission and forwarding.
 pub struct Coordinator {
     audio_refresh: tokio::sync::Mutex<()>,
+    affinity: Mutex<crate::affinity::Directory>,
     config: CoordinatorConfig,
     workers: Vec<Worker>,
     /// Serialises slot selection so check-and-reserve is atomic.
@@ -623,6 +632,13 @@ impl Envelope<'_> {
 }
 
 impl Coordinator {
+    /// Routing preferences, not worker-confirmed KV cache hits.
+    pub fn affinity_stats(&self) -> crate::affinity::AffinityStats {
+        self.affinity
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .stats()
+    }
     /// Build a coordinator over the configured workers.  No worker is
     /// routable until [`Coordinator::refresh`] has probed it.
     pub fn new(config: CoordinatorConfig) -> Result<Arc<Self>, String> {
@@ -640,6 +656,7 @@ impl Coordinator {
             }
             workers.push(Worker {
                 audio_dispatched: AtomicUsize::new(0),
+                dispatch_generation: AtomicU64::new(0),
                 endpoint,
                 status: Mutex::new(WorkerStatus::default()),
                 dispatched: AtomicUsize::new(0),
@@ -649,6 +666,7 @@ impl Coordinator {
         }
         Ok(Arc::new(Self {
             audio_refresh: tokio::sync::Mutex::new(()),
+            affinity: Mutex::new(crate::affinity::Directory::default()),
             config,
             workers,
             pick_lock: Mutex::new(()),
@@ -662,6 +680,7 @@ impl Coordinator {
     pub async fn refresh(&self) {
         let probes = self.workers.iter().map(|w| async move {
             let audio_probe_epoch = w.status().audio_completion_epoch;
+            let generation = w.dispatch_generation.load(Ordering::Acquire);
             let before = w.dispatched.load(Ordering::Acquire);
             let audio_before = w.audio_dispatched.load(Ordering::Acquire);
             let mut ours_by_model = w.by_model().clone();
@@ -673,9 +692,11 @@ impl Coordinator {
                 *ours = (*ours).max(*n);
             }
             let ours = before.saturating_sub(audio_before).max(after.saturating_sub(audio_after));
-            (w, result, ours, audio_probe_epoch, ours_by_model)
+            (w, result, ours, audio_probe_epoch, ours_by_model, generation)
         });
-        for (w, result, ours, audio_probe_epoch, ours_by_model) in futures_util::future::join_all(probes).await {
+        for (w, result, ours, audio_probe_epoch, ours_by_model, generation) in
+            futures_util::future::join_all(probes).await
+        {
             let mut st = w.status();
             match result {
                 Ok(info) if info.protocol_version != WORKER_PROTOCOL_VERSION => {
@@ -694,6 +715,7 @@ impl Coordinator {
                     st.info = Some(info);
                 }
                 Ok(info) => {
+                    st.residency_generation = generation;
                     if !st.healthy {
                         tracing::info!(
                             worker = %w.endpoint.base,
@@ -808,11 +830,59 @@ impl Coordinator {
         model: Option<&str>,
         work: &RequestWork,
         exclude: &[usize],
+        affinity: Option<&crate::affinity::Scope>,
     ) -> Pick {
         if path == TRANSCRIPTIONS_PATH {
             return self.try_pick_audio(exclude);
         }
         let _lock = self.pick_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let mut directory = self.affinity.lock().unwrap_or_else(|p| p.into_inner());
+        let preferred = affinity.and_then(|scope| directory.preferred(scope, Instant::now()));
+        let preferred = preferred.filter(|(index, epoch, lease)| {
+            let status = self.workers[*index].status();
+            let valid = status.healthy
+                && !exclude.contains(index)
+                && status
+                    .info
+                    .as_ref()
+                    .and_then(|info| model.and_then(|model| info.cache_epochs.get(model)))
+                    == Some(epoch);
+            if !valid {
+                if let Some(scope) = affinity {
+                    directory.invalidate(scope);
+                }
+            }
+            if valid
+                && *lease <= status.residency_generation
+                && self.workers[*index].dispatched.load(Ordering::Acquire) == 0
+            {
+                if let Some(info) = &status.info {
+                    if info.in_flight == 0 {
+                        if let Some(residency) =
+                            model.and_then(|model| info.cache_residency.get(model))
+                        {
+                            let scope = affinity.unwrap();
+                            let namespace =
+                                crate::affinity::encode(crate::affinity::worker_namespace(
+                                    *scope,
+                                    work.context,
+                                    self.config.worker_api_key.as_deref(),
+                                ));
+                            return directory.residency(
+                                scope,
+                                residency
+                                    .entries
+                                    .iter()
+                                    .find(|entry| entry.scope == namespace)
+                                    .map(|entry| entry.tokens),
+                                residency.complete,
+                            );
+                        }
+                    }
+                }
+            }
+            valid
+        });
         let n = self.workers.len();
         let start = self.rotation.fetch_add(1, Ordering::Relaxed) % n;
         let mut model_known = false;
@@ -902,7 +972,7 @@ impl Coordinator {
             } else {
                 st.external_in_flight
             };
-            let ratio = if path == TRANSCRIPTIONS_PATH {
+            let mut ratio = if path == TRANSCRIPTIONS_PATH {
                 load as f64 / slots as f64
             } else {
                 (local_work
@@ -910,6 +980,12 @@ impl Coordinator {
                     .saturating_add(work.units)) as f64
                     / slots as f64
             };
+            if preferred
+                .as_ref()
+                .is_some_and(|(worker, _, _)| *worker == i)
+            {
+                ratio -= directory.saved_work(affinity.unwrap(), work.units) as f64 / slots as f64;
+            }
             let unknown_context = work.context.is_some() && context.is_none();
             if best.as_ref().is_none_or(|(_, _, unknown, score, count)| {
                 (unknown_context, ratio, load) < (*unknown, *score, *count)
@@ -919,6 +995,26 @@ impl Coordinator {
         }
         if let Some((index, selected_model, _, _, _)) = best {
             let w = &self.workers[index];
+            let lease = w.dispatch_generation.fetch_add(1, Ordering::AcqRel) + 1;
+            if let Some(scope) = affinity {
+                if let Some(epoch) = w
+                    .status()
+                    .info
+                    .as_ref()
+                    .and_then(|info| info.cache_epochs.get(&selected_model))
+                    .filter(|epoch| epoch.len() == 36 && Uuid::parse_str(epoch).is_ok())
+                {
+                    directory.record(
+                        *scope,
+                        index,
+                        epoch,
+                        preferred.as_ref().map(|(worker, _, _)| *worker),
+                        Instant::now(),
+                        lease,
+                        (work.units / 4) as usize,
+                    );
+                }
+            }
             w.dispatched.fetch_add(1, Ordering::AcqRel);
             let model = (path != TRANSCRIPTIONS_PATH).then_some(selected_model);
             if let Some(model) = &model {
@@ -963,6 +1059,7 @@ impl Coordinator {
         model: Option<&str>,
         work: &RequestWork,
         exclude: &[usize],
+        affinity: Option<&crate::affinity::Scope>,
     ) -> Pick {
         let refresh = self.refresh_completed_audio();
         tokio::pin!(refresh);
@@ -970,12 +1067,12 @@ impl Coordinator {
             let notified = self.released.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            match self.try_pick(path, model, work, exclude) {
+            match self.try_pick(path, model, work, exclude, affinity) {
                 Pick::Busy => {}
                 result => return result,
             }
             tokio::select! {
-                _ = &mut refresh => return self.try_pick(path, model, work, exclude),
+                _ = &mut refresh => return self.try_pick(path, model, work, exclude, affinity),
                 _ = notified => {}
             }
         }
@@ -989,8 +1086,9 @@ impl Coordinator {
         model: Option<&str>,
         work: &RequestWork,
         exclude: &[usize],
+        affinity: Option<&crate::affinity::Scope>,
     ) -> Result<SlotGuard, Reject> {
-        match self.pick_after_audio_refresh(path, model, work, exclude).await {
+        match self.pick_after_audio_refresh(path, model, work, exclude, affinity).await {
             Pick::Slot(slot) => return Ok(slot),
             Pick::Reject(r) => return Err(r),
             Pick::Busy => {}
@@ -1009,7 +1107,7 @@ impl Coordinator {
             notified.as_mut().enable();
             let picked = tokio::time::timeout_at(
                 deadline,
-                self.pick_after_audio_refresh(path, model, work, exclude),
+                self.pick_after_audio_refresh(path, model, work, exclude, affinity),
             )
                 .await
                 .map_err(|_| Reject::QueueTimeout)?;
@@ -1191,6 +1289,9 @@ impl Coordinator {
             if let Ok(owner) = HeaderValue::from_str(owner) {
                 extra.insert(JOB_OWNER_HEADER, owner);
             }
+        }
+        if let Some(scope) = &log.cache_scope {
+            extra.insert(crate::affinity::CACHE_SCOPE_HEADER, scope.parse().unwrap());
         }
         let (response, conn) = match self.send(w, Method::POST, path, &extra, body).await {
             Ok(ok) => ok,
@@ -1379,10 +1480,43 @@ impl Coordinator {
         };
 
         let arrived = Instant::now();
+        let handle =
+            if matches!(path, "/v1/chat/completions" | "/v1/completions") && model.is_some() {
+                match crate::affinity::handle(headers) {
+                    Ok(handle) => handle,
+                    Err(message) => {
+                        return with_request_id(
+                            error_response(
+                                StatusCode::BAD_REQUEST,
+                                message,
+                                "invalid_request_error",
+                                None,
+                            ),
+                            &request_id,
+                        )
+                    }
+                }
+            } else {
+                None
+            };
+        let affinity = handle.as_ref().map(|handle| {
+            crate::affinity::digest(&[
+                crate::affinity::owner(headers),
+                handle.as_bytes(),
+                model.as_deref().unwrap().as_bytes(),
+                &work.context.unwrap_or(0).to_le_bytes(),
+            ])
+        });
+        let cache_scope = crate::affinity::encode(
+            affinity.unwrap_or_else(|| crate::affinity::digest(&[crate::affinity::owner(headers)])),
+        );
         let mut tried: Vec<usize> = Vec::new();
         let mut last_admission_only = true;
         loop {
-            let slot = match self.acquire(path, model.as_deref(), &work, &tried).await {
+            let slot = match self
+                .acquire(path, model.as_deref(), &work, &tried, affinity.as_ref())
+                .await
+            {
                 Ok(slot) => slot,
                 Err(reject) => {
                     // Once attempts were made, "no worker left" is about
@@ -1416,6 +1550,8 @@ impl Coordinator {
             } else { None };
             let log = RequestLog {
                 response_limit: 2 << 20,
+                affinity_handle: handle.clone(),
+                cache_scope: Some(cache_scope.clone()),
                 request_id: request_id.clone(),
                 worker: self.workers[index].endpoint.base.clone(),
                 path,
@@ -1452,6 +1588,8 @@ impl Coordinator {
 struct RequestLog {
     response_limit: usize,
     owner: Option<String>,
+    affinity_handle: Option<String>,
+    cache_scope: Option<String>,
     request_id: String,
     worker: String,
     path: &'static str,
@@ -1477,6 +1615,13 @@ impl RequestLog {
 
     fn headers(&self) -> HeaderMap {
         let mut h = HeaderMap::new();
+        h.insert(
+            "x-joshua-queue-ms",
+            self.queue_ms.to_string().parse().unwrap(),
+        );
+        if let Some(handle) = &self.affinity_handle {
+            h.insert(crate::affinity::AFFINITY_HEADER, handle.parse().unwrap());
+        }
         if let Ok(v) = HeaderValue::from_str(&self.request_id) {
             h.insert(REQUEST_ID_HEADER, v);
         }
@@ -1709,6 +1854,10 @@ pub fn create_router(coordinator: Arc<Coordinator>) -> Router {
     let mut api = Router::new()
         .route("/v1/models", get(list_models))
         .route("/v1/workers", get(list_workers));
+    api = api.route(
+        "/v1/affinity",
+        get(|State(c): State<Arc<Coordinator>>| async move { Json(c.affinity_stats()) }),
+    );
     for path in ROUTED_PATHS {
         api = api.route(
             path,
@@ -1889,6 +2038,7 @@ mod tests {
         let worker = &coordinator.workers[0];
         for path in ["/v1/chat/completions", "/v1/completions", "/v1/embeddings", TRANSCRIPTIONS_PATH] {
             let log = RequestLog {
+                affinity_handle: None, cache_scope: None,
                 response_limit: 1024, owner: None, request_id: "sensitive-id".to_string(),
                 worker: worker.endpoint.base.clone(), path, attempt: 1, queue_ms: 0,
                 started: Instant::now(),
@@ -1973,6 +2123,7 @@ mod tests {
             assert_eq!(coordinator.status_report()[0].external_in_flight, 1);
             if send_refused {
                 let log = RequestLog {
+                    affinity_handle: None, cache_scope: None,
                     response_limit: 1024, owner: None, request_id: "local-audio".to_string(),
                     worker: coordinator.workers[0].endpoint.base.clone(), path: TRANSCRIPTIONS_PATH,
                     attempt: 1, queue_ms: 0, started: Instant::now(),
@@ -1984,14 +2135,14 @@ mod tests {
             drop(reservation);
             assert!(matches!(coordinator.try_pick_audio(&[]), Pick::Busy));
             let work = RequestWork { context: None, units: 1 };
-            assert!(matches!(coordinator.acquire(TRANSCRIPTIONS_PATH, None, &work, &[]).await,
+            assert!(matches!(coordinator.acquire(TRANSCRIPTIONS_PATH, None, &work, &[], None).await,
                 Err(Reject::QueueFull)));
             assert_eq!(probes.load(Ordering::SeqCst), 3);
             assert_eq!(received.load(Ordering::SeqCst), usize::from(send_refused));
             assert_eq!(coordinator.status_report()[0].external_in_flight, 1);
             occupied.store(0, Ordering::SeqCst);
             coordinator.refresh().await;
-            assert!(coordinator.acquire(TRANSCRIPTIONS_PATH, None, &work, &[]).await.is_ok());
+            assert!(coordinator.acquire(TRANSCRIPTIONS_PATH, None, &work, &[], None).await.is_ok());
             server.abort();
         }
     }
@@ -2023,7 +2174,7 @@ mod tests {
             let coordinator = coordinator.clone();
             async move {
                 coordinator.acquire(TRANSCRIPTIONS_PATH, None,
-                    &RequestWork { context: None, units: 1 }, &[]).await
+                    &RequestWork { context: None, units: 1 }, &[], None).await
             }
         });
         assert!(tokio::time::timeout(Duration::from_millis(30), &mut acquisition).await.is_err());
@@ -2066,12 +2217,12 @@ mod tests {
             })).unwrap());
         }
         let work = RequestWork { context: None, units: 1 };
-        let Pick::Slot(occupied) = coordinator.try_pick("/v1/chat/completions", Some("m"), &work, &[]) else {
+        let Pick::Slot(occupied) = coordinator.try_pick("/v1/chat/completions", Some("m"), &work, &[], None) else {
             panic!("initial generation slot");
         };
         let mut acquisition = tokio::spawn({
             let coordinator = coordinator.clone();
-            async move { coordinator.acquire("/v1/chat/completions", Some("m"), &work, &[]).await }
+            async move { coordinator.acquire("/v1/chat/completions", Some("m"), &work, &[], None).await }
         });
         assert!(tokio::time::timeout(Duration::from_millis(30), &mut acquisition).await.is_err());
         assert_eq!(coordinator.queued.load(Ordering::Acquire), 1);

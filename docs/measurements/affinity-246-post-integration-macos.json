@@ -1,0 +1,5321 @@
+{
+  "backend": "cpu",
+  "host_arch": "aarch64",
+  "host_os": "macos",
+  "profile": "debug",
+  "model": "synthetic one-layer Qwen3 F32 GGUF",
+  "context": 256,
+  "max_tokens": 1,
+  "turns": 6,
+  "workers": 2,
+  "slots_per_worker": 1,
+  "prefix_cache_bytes_per_worker": 1048576,
+  "source_files_sha256": {
+    "Cargo.lock": "72a18732153c220658662c8e50cd42250dfe7507e9cb91ec9859af2d71bd9156",
+    "src/affinity.rs": "c311510609fd10454d9a14e2605e2889f46e6c41791ba187d7c781799adc841e",
+    "src/coordinator.rs": "66cfef9fc4cea623a2b676e1a94de35cbace600d193f1d3d047f406156c7c6d3",
+    "src/engine.rs": "686f0e17de085931b59a728fbb4e51b6b27c1b917d205e9d54c4d56ae6b8b0b4",
+    "src/lib.rs": "44dae3dda3cdbf76a5178b7fec85d485ca20f599e7fc5a0c2a2c5933995b315d",
+    "src/prefix_cache.rs": "530c16843e0f84ae9cd38abba8a74db669d7d3dcde52b08a1ad3d96de35cde01",
+    "src/server.rs": "6584ba3232b67deda53b990da1aa7112f8bb5799d1dd4372f04ba6682e9856ba",
+    "src/types.rs": "5caa78469a57cd344777e2f46ecdf49c54c3c2cd31c7b3296eed5c9ce24f20d8",
+    "tests/affinity_tests.rs": "de2e6d5d01e84b06177fa25779dc2b62ab149bcf82402353a867c7fbb2d2bde3",
+    "tests/npu_tests.rs": "3c5424ee9a86ef1a7b486e96e124e63106edba51aa44993b18caf0cec110bb59",
+    "tests/route_tests.rs": "e0a7af2f5353cc0458dfa9860ace2a27695faf28e11b2584c744a0adf59f9040",
+    "tests/common/mod.rs": "95d03cf694f41f236292e9ea6567a40e6f57e9b69cda6d8dfb3cfe2845bb33bb"
+  },
+  "rows": [
+    {
+      "repeat": 0,
+      "prefix_words": 8,
+      "concurrency": 1,
+      "policy": "round_robin",
+      "request_count": 6,
+      "ttft_ms_p50": 0.971625,
+      "ttft_ms_max": 3.7229579999999998,
+      "queue_ms_p50": 0.0005,
+      "queue_ms_max": 0.001166,
+      "completion_latency_ms_p50": 1.08375,
+      "completion_latency_ms_max": 3.8387909999999996,
+      "prompt_tokens": 179,
+      "workers": [
+        {
+          "reuses": 2,
+          "tokens_reused": 37,
+          "snapshot_bytes": 0,
+          "warm_sessions": 1,
+          "warm_state_bytes": 2944
+        },
+        {
+          "reuses": 2,
+          "tokens_reused": 49,
+          "snapshot_bytes": 0,
+          "warm_sessions": 1,
+          "warm_state_bytes": 3592
+        }
+      ],
+      "requests_per_worker": [
+        3,
+        3
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 6,
+      "request_sha256": "ef867a1bb66cc68ebe823361a8aa76b2b4e4a1ab0911b05e484ce9588b3ce17e",
+      "output_sha256": "50ad6720f7265355e3c64a353bafe7cb1c86b4d73fcb9322fcc00f05fd4c5541",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 0,
+      "prefix_words": 8,
+      "concurrency": 1,
+      "policy": "load",
+      "request_count": 6,
+      "ttft_ms_p50": 1.047,
+      "ttft_ms_max": 1.067584,
+      "queue_ms_p50": 0.000042,
+      "queue_ms_max": 0.000042,
+      "completion_latency_ms_p50": 1.131875,
+      "completion_latency_ms_max": 1.173292,
+      "prompt_tokens": 179,
+      "workers": [
+        {
+          "reuses": 2,
+          "tokens_reused": 37,
+          "snapshot_bytes": 0,
+          "warm_sessions": 1,
+          "warm_state_bytes": 2944
+        },
+        {
+          "reuses": 2,
+          "tokens_reused": 49,
+          "snapshot_bytes": 0,
+          "warm_sessions": 1,
+          "warm_state_bytes": 3592
+        }
+      ],
+      "requests_per_worker": [
+        3,
+        3
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 6,
+      "request_sha256": "ef867a1bb66cc68ebe823361a8aa76b2b4e4a1ab0911b05e484ce9588b3ce17e",
+      "output_sha256": "50ad6720f7265355e3c64a353bafe7cb1c86b4d73fcb9322fcc00f05fd4c5541",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 0,
+      "prefix_words": 8,
+      "concurrency": 1,
+      "policy": "session",
+      "request_count": 6,
+      "ttft_ms_p50": 0.7308330000000001,
+      "ttft_ms_max": 0.7537910000000001,
+      "queue_ms_p50": 0.00045900000000000004,
+      "queue_ms_max": 0.000583,
+      "completion_latency_ms_p50": 0.827125,
+      "completion_latency_ms_max": 0.865083,
+      "prompt_tokens": 179,
+      "workers": [
+        {
+          "reuses": 5,
+          "tokens_reused": 125,
+          "snapshot_bytes": 0,
+          "warm_sessions": 1,
+          "warm_state_bytes": 3592
+        },
+        {
+          "reuses": 0,
+          "tokens_reused": 0,
+          "snapshot_bytes": 0,
+          "warm_sessions": 0,
+          "warm_state_bytes": 0
+        }
+      ],
+      "requests_per_worker": [
+        6,
+        0
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 6,
+      "request_sha256": "ef867a1bb66cc68ebe823361a8aa76b2b4e4a1ab0911b05e484ce9588b3ce17e",
+      "output_sha256": "50ad6720f7265355e3c64a353bafe7cb1c86b4d73fcb9322fcc00f05fd4c5541",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 0,
+      "prefix_words": 8,
+      "concurrency": 1,
+      "policy": "affinity",
+      "request_count": 6,
+      "ttft_ms_p50": 0.973416,
+      "ttft_ms_max": 1.1283750000000001,
+      "queue_ms_p50": 0.000042,
+      "queue_ms_max": 0.000042,
+      "completion_latency_ms_p50": 1.062791,
+      "completion_latency_ms_max": 1.208042,
+      "prompt_tokens": 179,
+      "workers": [
+        {
+          "reuses": 5,
+          "tokens_reused": 125,
+          "snapshot_bytes": 0,
+          "warm_sessions": 1,
+          "warm_state_bytes": 3592
+        },
+        {
+          "reuses": 0,
+          "tokens_reused": 0,
+          "snapshot_bytes": 0,
+          "warm_sessions": 0,
+          "warm_state_bytes": 0
+        }
+      ],
+      "requests_per_worker": [
+        6,
+        0
+      ],
+      "directory": {
+        "entries": 1,
+        "preferred": 5,
+        "misses": 1,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 130
+      },
+      "outputs_checked": 6,
+      "request_sha256": "ef867a1bb66cc68ebe823361a8aa76b2b4e4a1ab0911b05e484ce9588b3ce17e",
+      "output_sha256": "50ad6720f7265355e3c64a353bafe7cb1c86b4d73fcb9322fcc00f05fd4c5541",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 0,
+      "prefix_words": 8,
+      "concurrency": 2,
+      "policy": "round_robin",
+      "request_count": 12,
+      "ttft_ms_p50": 0.7507510000000001,
+      "ttft_ms_max": 1.546166,
+      "queue_ms_p50": 0.000417,
+      "queue_ms_max": 0.00125,
+      "completion_latency_ms_p50": 0.85375,
+      "completion_latency_ms_max": 1.647666,
+      "prompt_tokens": 364,
+      "workers": [
+        {
+          "reuses": 5,
+          "tokens_reused": 125,
+          "snapshot_bytes": 0,
+          "warm_sessions": 1,
+          "warm_state_bytes": 3592
+        },
+        {
+          "reuses": 5,
+          "tokens_reused": 130,
+          "snapshot_bytes": 0,
+          "warm_sessions": 1,
+          "warm_state_bytes": 3664
+        }
+      ],
+      "requests_per_worker": [
+        6,
+        6
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 12,
+      "request_sha256": "7657a001daa411832135ada6b5d6c035ed3b241b4a65552e8591da0ac59ce6ce",
+      "output_sha256": "18ea291ff0fd284f1b426c8a95b9de3e791c7b46dd91a46f00943cc2fb15caf1",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 0,
+      "prefix_words": 8,
+      "concurrency": 2,
+      "policy": "load",
+      "request_count": 12,
+      "ttft_ms_p50": 0.975625,
+      "ttft_ms_max": 1.1295000000000002,
+      "queue_ms_p50": 0.000041,
+      "queue_ms_max": 0.000042,
+      "completion_latency_ms_p50": 1.11025,
+      "completion_latency_ms_max": 1.256541,
+      "prompt_tokens": 364,
+      "workers": [
+        {
+          "reuses": 5,
+          "tokens_reused": 125,
+          "snapshot_bytes": 0,
+          "warm_sessions": 1,
+          "warm_state_bytes": 3592
+        },
+        {
+          "reuses": 5,
+          "tokens_reused": 130,
+          "snapshot_bytes": 0,
+          "warm_sessions": 1,
+          "warm_state_bytes": 3664
+        }
+      ],
+      "requests_per_worker": [
+        6,
+        6
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 12,
+      "request_sha256": "7657a001daa411832135ada6b5d6c035ed3b241b4a65552e8591da0ac59ce6ce",
+      "output_sha256": "18ea291ff0fd284f1b426c8a95b9de3e791c7b46dd91a46f00943cc2fb15caf1",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 0,
+      "prefix_words": 8,
+      "concurrency": 2,
+      "policy": "session",
+      "request_count": 12,
+      "ttft_ms_p50": 0.7582499999999999,
+      "ttft_ms_max": 0.869957,
+      "queue_ms_p50": 0.00033299999999999996,
+      "queue_ms_max": 0.0006659999999999999,
+      "completion_latency_ms_p50": 0.8736250000000001,
+      "completion_latency_ms_max": 0.978166,
+      "prompt_tokens": 364,
+      "workers": [
+        {
+          "reuses": 5,
+          "tokens_reused": 125,
+          "snapshot_bytes": 0,
+          "warm_sessions": 1,
+          "warm_state_bytes": 3592
+        },
+        {
+          "reuses": 5,
+          "tokens_reused": 130,
+          "snapshot_bytes": 0,
+          "warm_sessions": 1,
+          "warm_state_bytes": 3664
+        }
+      ],
+      "requests_per_worker": [
+        6,
+        6
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 12,
+      "request_sha256": "7657a001daa411832135ada6b5d6c035ed3b241b4a65552e8591da0ac59ce6ce",
+      "output_sha256": "18ea291ff0fd284f1b426c8a95b9de3e791c7b46dd91a46f00943cc2fb15caf1",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 0,
+      "prefix_words": 8,
+      "concurrency": 2,
+      "policy": "affinity",
+      "request_count": 12,
+      "ttft_ms_p50": 1.011208,
+      "ttft_ms_max": 1.103834,
+      "queue_ms_p50": 0.000042,
+      "queue_ms_max": 0.000042,
+      "completion_latency_ms_p50": 1.1199999999999999,
+      "completion_latency_ms_max": 1.16625,
+      "prompt_tokens": 364,
+      "workers": [
+        {
+          "reuses": 5,
+          "tokens_reused": 125,
+          "snapshot_bytes": 0,
+          "warm_sessions": 1,
+          "warm_state_bytes": 3592
+        },
+        {
+          "reuses": 5,
+          "tokens_reused": 130,
+          "snapshot_bytes": 0,
+          "warm_sessions": 1,
+          "warm_state_bytes": 3664
+        }
+      ],
+      "requests_per_worker": [
+        6,
+        6
+      ],
+      "directory": {
+        "entries": 2,
+        "preferred": 10,
+        "misses": 2,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 261
+      },
+      "outputs_checked": 12,
+      "request_sha256": "7657a001daa411832135ada6b5d6c035ed3b241b4a65552e8591da0ac59ce6ce",
+      "output_sha256": "18ea291ff0fd284f1b426c8a95b9de3e791c7b46dd91a46f00943cc2fb15caf1",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 0,
+      "prefix_words": 8,
+      "concurrency": 4,
+      "policy": "round_robin",
+      "request_count": 24,
+      "ttft_ms_p50": 1.7196669999999998,
+      "ttft_ms_max": 2.994249,
+      "queue_ms_p50": 0.8721249999999999,
+      "queue_ms_max": 1.475958,
+      "completion_latency_ms_p50": 1.825542,
+      "completion_latency_ms_max": 3.11075,
+      "prompt_tokens": 752,
+      "workers": [
+        {
+          "reuses": 0,
+          "tokens_reused": 0,
+          "snapshot_bytes": 20160,
+          "warm_sessions": 1,
+          "warm_state_bytes": 3736
+        },
+        {
+          "reuses": 0,
+          "tokens_reused": 0,
+          "snapshot_bytes": 21824,
+          "warm_sessions": 1,
+          "warm_state_bytes": 3808
+        }
+      ],
+      "requests_per_worker": [
+        12,
+        12
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 24,
+      "request_sha256": "398a2056e936cda68bc5cfa46e414aaf7f617010cdf1d26dbe0043c047c989a9",
+      "output_sha256": "c20e2e405818307db3819747c36f0a2525027463bc0af412ba923c035b820f49",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 0,
+      "prefix_words": 8,
+      "concurrency": 4,
+      "policy": "load",
+      "request_count": 24,
+      "ttft_ms_p50": 1.833833,
+      "ttft_ms_max": 3.1447089999999998,
+      "queue_ms_p50": 0.000041,
+      "queue_ms_max": 1.000042,
+      "completion_latency_ms_p50": 1.920875,
+      "completion_latency_ms_max": 3.245791,
+      "prompt_tokens": 752,
+      "workers": [
+        {
+          "reuses": 11,
+          "tokens_reused": 42,
+          "snapshot_bytes": 0,
+          "warm_sessions": 1,
+          "warm_state_bytes": 3736
+        },
+        {
+          "reuses": 11,
+          "tokens_reused": 98,
+          "snapshot_bytes": 0,
+          "warm_sessions": 1,
+          "warm_state_bytes": 3808
+        }
+      ],
+      "requests_per_worker": [
+        12,
+        12
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 24,
+      "request_sha256": "398a2056e936cda68bc5cfa46e414aaf7f617010cdf1d26dbe0043c047c989a9",
+      "output_sha256": "c20e2e405818307db3819747c36f0a2525027463bc0af412ba923c035b820f49",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 0,
+      "prefix_words": 8,
+      "concurrency": 4,
+      "policy": "session",
+      "request_count": 24,
+      "ttft_ms_p50": 1.691834,
+      "ttft_ms_max": 3.014041,
+      "queue_ms_p50": 0.8455,
+      "queue_ms_max": 1.50025,
+      "completion_latency_ms_p50": 1.805125,
+      "completion_latency_ms_max": 3.120709,
+      "prompt_tokens": 752,
+      "workers": [
+        {
+          "reuses": 0,
+          "tokens_reused": 0,
+          "snapshot_bytes": 20160,
+          "warm_sessions": 1,
+          "warm_state_bytes": 3736
+        },
+        {
+          "reuses": 0,
+          "tokens_reused": 0,
+          "snapshot_bytes": 21824,
+          "warm_sessions": 1,
+          "warm_state_bytes": 3808
+        }
+      ],
+      "requests_per_worker": [
+        12,
+        12
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 24,
+      "request_sha256": "398a2056e936cda68bc5cfa46e414aaf7f617010cdf1d26dbe0043c047c989a9",
+      "output_sha256": "c20e2e405818307db3819747c36f0a2525027463bc0af412ba923c035b820f49",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 0,
+      "prefix_words": 8,
+      "concurrency": 4,
+      "policy": "affinity",
+      "request_count": 24,
+      "ttft_ms_p50": 1.8615420000000003,
+      "ttft_ms_max": 3.3287080000000002,
+      "queue_ms_p50": 0.000042,
+      "queue_ms_max": 1.000042,
+      "completion_latency_ms_p50": 1.9562920000000001,
+      "completion_latency_ms_max": 3.420833,
+      "prompt_tokens": 752,
+      "workers": [
+        {
+          "reuses": 0,
+          "tokens_reused": 0,
+          "snapshot_bytes": 20416,
+          "warm_sessions": 1,
+          "warm_state_bytes": 3736
+        },
+        {
+          "reuses": 1,
+          "tokens_reused": 14,
+          "snapshot_bytes": 20544,
+          "warm_sessions": 1,
+          "warm_state_bytes": 3808
+        }
+      ],
+      "requests_per_worker": [
+        12,
+        12
+      ],
+      "directory": {
+        "entries": 4,
+        "preferred": 15,
+        "misses": 5,
+        "spillovers": 4,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 1,
+        "cached_tokens": 524
+      },
+      "outputs_checked": 24,
+      "request_sha256": "398a2056e936cda68bc5cfa46e414aaf7f617010cdf1d26dbe0043c047c989a9",
+      "output_sha256": "c20e2e405818307db3819747c36f0a2525027463bc0af412ba923c035b820f49",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 0,
+      "prefix_words": 32,
+      "concurrency": 1,
+      "policy": "round_robin",
+      "request_count": 6,
+      "ttft_ms_p50": 1.043625,
+      "ttft_ms_max": 1.3527509999999998,
+      "queue_ms_p50": 0.000417,
+      "queue_ms_max": 0.0005,
+      "completion_latency_ms_p50": 1.149958,
+      "completion_latency_ms_max": 1.4668750000000002,
+      "prompt_tokens": 323,
+      "workers": [
+        {
+          "reuses": 2,
+          "tokens_reused": 85,
+          "snapshot_bytes": 2304,
+          "warm_sessions": 1,
+          "warm_state_bytes": 4672
+        },
+        {
+          "reuses": 2,
+          "tokens_reused": 97,
+          "snapshot_bytes": 2304,
+          "warm_sessions": 1,
+          "warm_state_bytes": 5320
+        }
+      ],
+      "requests_per_worker": [
+        3,
+        3
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 6,
+      "request_sha256": "70c42c5e729b202b6ebe896034221b196139c485387cda6540c76701738ac51e",
+      "output_sha256": "fe144b2e26ce8bf181665f07c65996c8d65f86677ca5ff2eec03979abd593558",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 0,
+      "prefix_words": 32,
+      "concurrency": 1,
+      "policy": "load",
+      "request_count": 6,
+      "ttft_ms_p50": 1.2097090000000001,
+      "ttft_ms_max": 1.5833340000000002,
+      "queue_ms_p50": 0.000042,
+      "queue_ms_max": 0.000042,
+      "completion_latency_ms_p50": 1.3107920000000002,
+      "completion_latency_ms_max": 1.688542,
+      "prompt_tokens": 323,
+      "workers": [
+        {
+          "reuses": 2,
+          "tokens_reused": 85,
+          "snapshot_bytes": 2304,
+          "warm_sessions": 1,
+          "warm_state_bytes": 4672
+        },
+        {
+          "reuses": 2,
+          "tokens_reused": 97,
+          "snapshot_bytes": 2304,
+          "warm_sessions": 1,
+          "warm_state_bytes": 5320
+        }
+      ],
+      "requests_per_worker": [
+        3,
+        3
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 6,
+      "request_sha256": "70c42c5e729b202b6ebe896034221b196139c485387cda6540c76701738ac51e",
+      "output_sha256": "fe144b2e26ce8bf181665f07c65996c8d65f86677ca5ff2eec03979abd593558",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 0,
+      "prefix_words": 32,
+      "concurrency": 1,
+      "policy": "session",
+      "request_count": 6,
+      "ttft_ms_p50": 0.87225,
+      "ttft_ms_max": 1.229167,
+      "queue_ms_p50": 0.000625,
+      "queue_ms_max": 0.000792,
+      "completion_latency_ms_p50": 0.988208,
+      "completion_latency_ms_max": 1.3422919999999998,
+      "prompt_tokens": 323,
+      "workers": [
+        {
+          "reuses": 5,
+          "tokens_reused": 245,
+          "snapshot_bytes": 2304,
+          "warm_sessions": 1,
+          "warm_state_bytes": 5320
+        },
+        {
+          "reuses": 0,
+          "tokens_reused": 0,
+          "snapshot_bytes": 0,
+          "warm_sessions": 0,
+          "warm_state_bytes": 0
+        }
+      ],
+      "requests_per_worker": [
+        6,
+        0
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 6,
+      "request_sha256": "70c42c5e729b202b6ebe896034221b196139c485387cda6540c76701738ac51e",
+      "output_sha256": "fe144b2e26ce8bf181665f07c65996c8d65f86677ca5ff2eec03979abd593558",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 0,
+      "prefix_words": 32,
+      "concurrency": 1,
+      "policy": "affinity",
+      "request_count": 6,
+      "ttft_ms_p50": 1.087584,
+      "ttft_ms_max": 1.500583,
+      "queue_ms_p50": 0.000042,
+      "queue_ms_max": 0.000042,
+      "completion_latency_ms_p50": 1.1761670000000002,
+      "completion_latency_ms_max": 1.589792,
+      "prompt_tokens": 323,
+      "workers": [
+        {
+          "reuses": 5,
+          "tokens_reused": 245,
+          "snapshot_bytes": 2304,
+          "warm_sessions": 1,
+          "warm_state_bytes": 5320
+        },
+        {
+          "reuses": 0,
+          "tokens_reused": 0,
+          "snapshot_bytes": 0,
+          "warm_sessions": 0,
+          "warm_state_bytes": 0
+        }
+      ],
+      "requests_per_worker": [
+        6,
+        0
+      ],
+      "directory": {
+        "entries": 1,
+        "preferred": 5,
+        "misses": 1,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 166
+      },
+      "outputs_checked": 6,
+      "request_sha256": "70c42c5e729b202b6ebe896034221b196139c485387cda6540c76701738ac51e",
+      "output_sha256": "fe144b2e26ce8bf181665f07c65996c8d65f86677ca5ff2eec03979abd593558",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 0,
+      "prefix_words": 32,
+      "concurrency": 2,
+      "policy": "round_robin",
+      "request_count": 12,
+      "ttft_ms_p50": 0.873,
+      "ttft_ms_max": 1.393416,
+      "queue_ms_p50": 0.00045900000000000004,
+      "queue_ms_max": 0.000625,
+      "completion_latency_ms_p50": 0.9885829999999999,
+      "completion_latency_ms_max": 1.496583,
+      "prompt_tokens": 652,
+      "workers": [
+        {
+          "reuses": 5,
+          "tokens_reused": 245,
+          "snapshot_bytes": 2304,
+          "warm_sessions": 1,
+          "warm_state_bytes": 5320
+        },
+        {
+          "reuses": 5,
+          "tokens_reused": 250,
+          "snapshot_bytes": 2368,
+          "warm_sessions": 1,
+          "warm_state_bytes": 5392
+        }
+      ],
+      "requests_per_worker": [
+        6,
+        6
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 12,
+      "request_sha256": "348cbf3afc2fb147aba796facb7ffda836a2790c1e87acb67ccd85abed2477ae",
+      "output_sha256": "9addfe7c5af1498947e4cfc81d795aa8bcc9086fe0ec83d6a4f12d33075530d0",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 0,
+      "prefix_words": 32,
+      "concurrency": 2,
+      "policy": "load",
+      "request_count": 12,
+      "ttft_ms_p50": 1.132874,
+      "ttft_ms_max": 1.678458,
+      "queue_ms_p50": 0.0,
+      "queue_ms_max": 0.000042,
+      "completion_latency_ms_p50": 1.2418749999999998,
+      "completion_latency_ms_max": 1.7809169999999999,
+      "prompt_tokens": 652,
+      "workers": [
+        {
+          "reuses": 5,
+          "tokens_reused": 245,
+          "snapshot_bytes": 2304,
+          "warm_sessions": 1,
+          "warm_state_bytes": 5320
+        },
+        {
+          "reuses": 5,
+          "tokens_reused": 250,
+          "snapshot_bytes": 2368,
+          "warm_sessions": 1,
+          "warm_state_bytes": 5392
+        }
+      ],
+      "requests_per_worker": [
+        6,
+        6
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 12,
+      "request_sha256": "348cbf3afc2fb147aba796facb7ffda836a2790c1e87acb67ccd85abed2477ae",
+      "output_sha256": "9addfe7c5af1498947e4cfc81d795aa8bcc9086fe0ec83d6a4f12d33075530d0",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 0,
+      "prefix_words": 32,
+      "concurrency": 2,
+      "policy": "session",
+      "request_count": 12,
+      "ttft_ms_p50": 0.871333,
+      "ttft_ms_max": 1.4375,
+      "queue_ms_p50": 0.000375,
+      "queue_ms_max": 0.0005,
+      "completion_latency_ms_p50": 0.982166,
+      "completion_latency_ms_max": 1.555209,
+      "prompt_tokens": 652,
+      "workers": [
+        {
+          "reuses": 5,
+          "tokens_reused": 245,
+          "snapshot_bytes": 2304,
+          "warm_sessions": 1,
+          "warm_state_bytes": 5320
+        },
+        {
+          "reuses": 5,
+          "tokens_reused": 250,
+          "snapshot_bytes": 2368,
+          "warm_sessions": 1,
+          "warm_state_bytes": 5392
+        }
+      ],
+      "requests_per_worker": [
+        6,
+        6
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 12,
+      "request_sha256": "348cbf3afc2fb147aba796facb7ffda836a2790c1e87acb67ccd85abed2477ae",
+      "output_sha256": "9addfe7c5af1498947e4cfc81d795aa8bcc9086fe0ec83d6a4f12d33075530d0",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 0,
+      "prefix_words": 32,
+      "concurrency": 2,
+      "policy": "affinity",
+      "request_count": 12,
+      "ttft_ms_p50": 1.131249,
+      "ttft_ms_max": 1.668209,
+      "queue_ms_p50": 0.000041,
+      "queue_ms_max": 0.000042,
+      "completion_latency_ms_p50": 1.225875,
+      "completion_latency_ms_max": 1.7705419999999998,
+      "prompt_tokens": 652,
+      "workers": [
+        {
+          "reuses": 5,
+          "tokens_reused": 245,
+          "snapshot_bytes": 2304,
+          "warm_sessions": 1,
+          "warm_state_bytes": 5320
+        },
+        {
+          "reuses": 5,
+          "tokens_reused": 250,
+          "snapshot_bytes": 2368,
+          "warm_sessions": 1,
+          "warm_state_bytes": 5392
+        }
+      ],
+      "requests_per_worker": [
+        6,
+        6
+      ],
+      "directory": {
+        "entries": 2,
+        "preferred": 10,
+        "misses": 2,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 333
+      },
+      "outputs_checked": 12,
+      "request_sha256": "348cbf3afc2fb147aba796facb7ffda836a2790c1e87acb67ccd85abed2477ae",
+      "output_sha256": "9addfe7c5af1498947e4cfc81d795aa8bcc9086fe0ec83d6a4f12d33075530d0",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 0,
+      "prefix_words": 32,
+      "concurrency": 4,
+      "policy": "round_robin",
+      "request_count": 24,
+      "ttft_ms_p50": 1.633376,
+      "ttft_ms_max": 2.824208,
+      "queue_ms_p50": 0.820167,
+      "queue_ms_max": 1.503083,
+      "completion_latency_ms_p50": 1.7542090000000001,
+      "completion_latency_ms_max": 2.921791,
+      "prompt_tokens": 1328,
+      "workers": [
+        {
+          "reuses": 10,
+          "tokens_reused": 499,
+          "snapshot_bytes": 7232,
+          "warm_sessions": 2,
+          "warm_state_bytes": 10784
+        },
+        {
+          "reuses": 10,
+          "tokens_reused": 509,
+          "snapshot_bytes": 7424,
+          "warm_sessions": 2,
+          "warm_state_bytes": 10928
+        }
+      ],
+      "requests_per_worker": [
+        12,
+        12
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 24,
+      "request_sha256": "8cbbb6153a1f97d9272587ccceda540693427fc2a60df9d0420ce4b0f750dd52",
+      "output_sha256": "2508c20bce7e0881ab63af06deabcd446224a271c929e44028921d715ec5b154",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 0,
+      "prefix_words": 32,
+      "concurrency": 4,
+      "policy": "load",
+      "request_count": 24,
+      "ttft_ms_p50": 2.078625,
+      "ttft_ms_max": 3.1219170000000003,
+      "queue_ms_p50": 0.000042,
+      "queue_ms_max": 1.000042,
+      "completion_latency_ms_p50": 2.1923340000000002,
+      "completion_latency_ms_max": 3.2607920000000004,
+      "prompt_tokens": 1328,
+      "workers": [
+        {
+          "reuses": 11,
+          "tokens_reused": 413,
+          "snapshot_bytes": 15680,
+          "warm_sessions": 2,
+          "warm_state_bytes": 10856
+        },
+        {
+          "reuses": 11,
+          "tokens_reused": 413,
+          "snapshot_bytes": 12800,
+          "warm_sessions": 2,
+          "warm_state_bytes": 10856
+        }
+      ],
+      "requests_per_worker": [
+        12,
+        12
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 24,
+      "request_sha256": "8cbbb6153a1f97d9272587ccceda540693427fc2a60df9d0420ce4b0f750dd52",
+      "output_sha256": "2508c20bce7e0881ab63af06deabcd446224a271c929e44028921d715ec5b154",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 0,
+      "prefix_words": 32,
+      "concurrency": 4,
+      "policy": "session",
+      "request_count": 24,
+      "ttft_ms_p50": 1.575291,
+      "ttft_ms_max": 2.8126670000000003,
+      "queue_ms_p50": 0.821125,
+      "queue_ms_max": 1.4785840000000001,
+      "completion_latency_ms_p50": 1.685167,
+      "completion_latency_ms_max": 2.927834,
+      "prompt_tokens": 1328,
+      "workers": [
+        {
+          "reuses": 10,
+          "tokens_reused": 499,
+          "snapshot_bytes": 7232,
+          "warm_sessions": 2,
+          "warm_state_bytes": 10784
+        },
+        {
+          "reuses": 10,
+          "tokens_reused": 509,
+          "snapshot_bytes": 7424,
+          "warm_sessions": 2,
+          "warm_state_bytes": 10928
+        }
+      ],
+      "requests_per_worker": [
+        12,
+        12
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 24,
+      "request_sha256": "8cbbb6153a1f97d9272587ccceda540693427fc2a60df9d0420ce4b0f750dd52",
+      "output_sha256": "2508c20bce7e0881ab63af06deabcd446224a271c929e44028921d715ec5b154",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 0,
+      "prefix_words": 32,
+      "concurrency": 4,
+      "policy": "affinity",
+      "request_count": 24,
+      "ttft_ms_p50": 2.119292,
+      "ttft_ms_max": 3.301583,
+      "queue_ms_p50": 0.000041,
+      "queue_ms_max": 1.000041,
+      "completion_latency_ms_p50": 2.247875,
+      "completion_latency_ms_max": 3.419208,
+      "prompt_tokens": 1328,
+      "workers": [
+        {
+          "reuses": 8,
+          "tokens_reused": 404,
+          "snapshot_bytes": 20992,
+          "warm_sessions": 2,
+          "warm_state_bytes": 10784
+        },
+        {
+          "reuses": 9,
+          "tokens_reused": 452,
+          "snapshot_bytes": 18944,
+          "warm_sessions": 2,
+          "warm_state_bytes": 10928
+        }
+      ],
+      "requests_per_worker": [
+        12,
+        12
+      ],
+      "directory": {
+        "entries": 4,
+        "preferred": 14,
+        "misses": 4,
+        "spillovers": 6,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 668
+      },
+      "outputs_checked": 24,
+      "request_sha256": "8cbbb6153a1f97d9272587ccceda540693427fc2a60df9d0420ce4b0f750dd52",
+      "output_sha256": "2508c20bce7e0881ab63af06deabcd446224a271c929e44028921d715ec5b154",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 0,
+      "prefix_words": 64,
+      "concurrency": 1,
+      "policy": "round_robin",
+      "request_count": 6,
+      "ttft_ms_p50": 1.2897079999999999,
+      "ttft_ms_max": 2.310833,
+      "queue_ms_p50": 0.000375,
+      "queue_ms_max": 0.000458,
+      "completion_latency_ms_p50": 1.405917,
+      "completion_latency_ms_max": 2.41725,
+      "prompt_tokens": 515,
+      "workers": [
+        {
+          "reuses": 2,
+          "tokens_reused": 149,
+          "snapshot_bytes": 4352,
+          "warm_sessions": 1,
+          "warm_state_bytes": 6976
+        },
+        {
+          "reuses": 2,
+          "tokens_reused": 161,
+          "snapshot_bytes": 4352,
+          "warm_sessions": 1,
+          "warm_state_bytes": 7624
+        }
+      ],
+      "requests_per_worker": [
+        3,
+        3
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 6,
+      "request_sha256": "98b988d147220bf5d92f5c78ce5ed901f90b74d383f18cd1c736aaf4fb99cb57",
+      "output_sha256": "ef3e025de5b66cdac1a26c0c1ff298027fbd339982fcf031a4423424d299dad0",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 0,
+      "prefix_words": 64,
+      "concurrency": 1,
+      "policy": "load",
+      "request_count": 6,
+      "ttft_ms_p50": 1.5138340000000001,
+      "ttft_ms_max": 2.518541,
+      "queue_ms_p50": 0.000042,
+      "queue_ms_max": 0.000042,
+      "completion_latency_ms_p50": 1.608875,
+      "completion_latency_ms_max": 2.624,
+      "prompt_tokens": 515,
+      "workers": [
+        {
+          "reuses": 2,
+          "tokens_reused": 149,
+          "snapshot_bytes": 4352,
+          "warm_sessions": 1,
+          "warm_state_bytes": 6976
+        },
+        {
+          "reuses": 2,
+          "tokens_reused": 161,
+          "snapshot_bytes": 4352,
+          "warm_sessions": 1,
+          "warm_state_bytes": 7624
+        }
+      ],
+      "requests_per_worker": [
+        3,
+        3
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 6,
+      "request_sha256": "98b988d147220bf5d92f5c78ce5ed901f90b74d383f18cd1c736aaf4fb99cb57",
+      "output_sha256": "ef3e025de5b66cdac1a26c0c1ff298027fbd339982fcf031a4423424d299dad0",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 0,
+      "prefix_words": 64,
+      "concurrency": 1,
+      "policy": "session",
+      "request_count": 6,
+      "ttft_ms_p50": 0.9865409999999999,
+      "ttft_ms_max": 2.348292,
+      "queue_ms_p50": 0.000541,
+      "queue_ms_max": 0.000917,
+      "completion_latency_ms_p50": 1.095333,
+      "completion_latency_ms_max": 2.475625,
+      "prompt_tokens": 515,
+      "workers": [
+        {
+          "reuses": 5,
+          "tokens_reused": 405,
+          "snapshot_bytes": 4352,
+          "warm_sessions": 1,
+          "warm_state_bytes": 7624
+        },
+        {
+          "reuses": 0,
+          "tokens_reused": 0,
+          "snapshot_bytes": 0,
+          "warm_sessions": 0,
+          "warm_state_bytes": 0
+        }
+      ],
+      "requests_per_worker": [
+        6,
+        0
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 6,
+      "request_sha256": "98b988d147220bf5d92f5c78ce5ed901f90b74d383f18cd1c736aaf4fb99cb57",
+      "output_sha256": "ef3e025de5b66cdac1a26c0c1ff298027fbd339982fcf031a4423424d299dad0",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 0,
+      "prefix_words": 64,
+      "concurrency": 1,
+      "policy": "affinity",
+      "request_count": 6,
+      "ttft_ms_p50": 1.22125,
+      "ttft_ms_max": 2.3974170000000004,
+      "queue_ms_p50": 0.000041,
+      "queue_ms_max": 0.000042,
+      "completion_latency_ms_p50": 1.3095839999999999,
+      "completion_latency_ms_max": 2.504042,
+      "prompt_tokens": 515,
+      "workers": [
+        {
+          "reuses": 5,
+          "tokens_reused": 405,
+          "snapshot_bytes": 4352,
+          "warm_sessions": 1,
+          "warm_state_bytes": 7624
+        },
+        {
+          "reuses": 0,
+          "tokens_reused": 0,
+          "snapshot_bytes": 0,
+          "warm_sessions": 0,
+          "warm_state_bytes": 0
+        }
+      ],
+      "requests_per_worker": [
+        6,
+        0
+      ],
+      "directory": {
+        "entries": 1,
+        "preferred": 5,
+        "misses": 1,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 214
+      },
+      "outputs_checked": 6,
+      "request_sha256": "98b988d147220bf5d92f5c78ce5ed901f90b74d383f18cd1c736aaf4fb99cb57",
+      "output_sha256": "ef3e025de5b66cdac1a26c0c1ff298027fbd339982fcf031a4423424d299dad0",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 0,
+      "prefix_words": 64,
+      "concurrency": 2,
+      "policy": "round_robin",
+      "request_count": 12,
+      "ttft_ms_p50": 1.022417,
+      "ttft_ms_max": 2.556251,
+      "queue_ms_p50": 0.00045900000000000004,
+      "queue_ms_max": 0.000709,
+      "completion_latency_ms_p50": 1.130833,
+      "completion_latency_ms_max": 2.678709,
+      "prompt_tokens": 1036,
+      "workers": [
+        {
+          "reuses": 5,
+          "tokens_reused": 405,
+          "snapshot_bytes": 4352,
+          "warm_sessions": 1,
+          "warm_state_bytes": 7624
+        },
+        {
+          "reuses": 5,
+          "tokens_reused": 410,
+          "snapshot_bytes": 4416,
+          "warm_sessions": 1,
+          "warm_state_bytes": 7696
+        }
+      ],
+      "requests_per_worker": [
+        6,
+        6
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 12,
+      "request_sha256": "3c3d6a63b17f5ad83df1cb0359295ef03b036346e6e37582db3301f93cb7bb93",
+      "output_sha256": "6f31307f1c6d18cc33689e61d75e43809748db548c009e6dbe31a722912b4db9",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 0,
+      "prefix_words": 64,
+      "concurrency": 2,
+      "policy": "load",
+      "request_count": 12,
+      "ttft_ms_p50": 1.271875,
+      "ttft_ms_max": 2.6991250000000004,
+      "queue_ms_p50": 0.000042,
+      "queue_ms_max": 0.000042,
+      "completion_latency_ms_p50": 1.3706250000000002,
+      "completion_latency_ms_max": 2.806292,
+      "prompt_tokens": 1036,
+      "workers": [
+        {
+          "reuses": 5,
+          "tokens_reused": 405,
+          "snapshot_bytes": 4352,
+          "warm_sessions": 1,
+          "warm_state_bytes": 7624
+        },
+        {
+          "reuses": 5,
+          "tokens_reused": 410,
+          "snapshot_bytes": 4416,
+          "warm_sessions": 1,
+          "warm_state_bytes": 7696
+        }
+      ],
+      "requests_per_worker": [
+        6,
+        6
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 12,
+      "request_sha256": "3c3d6a63b17f5ad83df1cb0359295ef03b036346e6e37582db3301f93cb7bb93",
+      "output_sha256": "6f31307f1c6d18cc33689e61d75e43809748db548c009e6dbe31a722912b4db9",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 0,
+      "prefix_words": 64,
+      "concurrency": 2,
+      "policy": "session",
+      "request_count": 12,
+      "ttft_ms_p50": 0.999917,
+      "ttft_ms_max": 2.5340000000000003,
+      "queue_ms_p50": 0.000375,
+      "queue_ms_max": 0.0005,
+      "completion_latency_ms_p50": 1.113834,
+      "completion_latency_ms_max": 2.6375,
+      "prompt_tokens": 1036,
+      "workers": [
+        {
+          "reuses": 5,
+          "tokens_reused": 405,
+          "snapshot_bytes": 4352,
+          "warm_sessions": 1,
+          "warm_state_bytes": 7624
+        },
+        {
+          "reuses": 5,
+          "tokens_reused": 410,
+          "snapshot_bytes": 4416,
+          "warm_sessions": 1,
+          "warm_state_bytes": 7696
+        }
+      ],
+      "requests_per_worker": [
+        6,
+        6
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 12,
+      "request_sha256": "3c3d6a63b17f5ad83df1cb0359295ef03b036346e6e37582db3301f93cb7bb93",
+      "output_sha256": "6f31307f1c6d18cc33689e61d75e43809748db548c009e6dbe31a722912b4db9",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 0,
+      "prefix_words": 64,
+      "concurrency": 2,
+      "policy": "affinity",
+      "request_count": 12,
+      "ttft_ms_p50": 1.284459,
+      "ttft_ms_max": 2.6905010000000003,
+      "queue_ms_p50": 0.000042,
+      "queue_ms_max": 0.000042,
+      "completion_latency_ms_p50": 1.411042,
+      "completion_latency_ms_max": 2.813959,
+      "prompt_tokens": 1036,
+      "workers": [
+        {
+          "reuses": 5,
+          "tokens_reused": 405,
+          "snapshot_bytes": 4352,
+          "warm_sessions": 1,
+          "warm_state_bytes": 7624
+        },
+        {
+          "reuses": 5,
+          "tokens_reused": 410,
+          "snapshot_bytes": 4416,
+          "warm_sessions": 1,
+          "warm_state_bytes": 7696
+        }
+      ],
+      "requests_per_worker": [
+        6,
+        6
+      ],
+      "directory": {
+        "entries": 2,
+        "preferred": 10,
+        "misses": 2,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 429
+      },
+      "outputs_checked": 12,
+      "request_sha256": "3c3d6a63b17f5ad83df1cb0359295ef03b036346e6e37582db3301f93cb7bb93",
+      "output_sha256": "6f31307f1c6d18cc33689e61d75e43809748db548c009e6dbe31a722912b4db9",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 0,
+      "prefix_words": 64,
+      "concurrency": 4,
+      "policy": "round_robin",
+      "request_count": 24,
+      "ttft_ms_p50": 1.897125,
+      "ttft_ms_max": 4.830167,
+      "queue_ms_p50": 0.895,
+      "queue_ms_max": 2.597125,
+      "completion_latency_ms_p50": 2.00425,
+      "completion_latency_ms_max": 4.9325,
+      "prompt_tokens": 2096,
+      "workers": [
+        {
+          "reuses": 10,
+          "tokens_reused": 819,
+          "snapshot_bytes": 13376,
+          "warm_sessions": 2,
+          "warm_state_bytes": 15392
+        },
+        {
+          "reuses": 10,
+          "tokens_reused": 829,
+          "snapshot_bytes": 13568,
+          "warm_sessions": 2,
+          "warm_state_bytes": 15536
+        }
+      ],
+      "requests_per_worker": [
+        12,
+        12
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 24,
+      "request_sha256": "c0b587dbea8ba9e973cfb08a161e2081c44771dd878a533c62f127e725093d84",
+      "output_sha256": "77834a5720fe52f9c1cafdf1e162908e6fbe644f1c5afc3b70098b694ed51e9b",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 0,
+      "prefix_words": 64,
+      "concurrency": 4,
+      "policy": "load",
+      "request_count": 24,
+      "ttft_ms_p50": 2.728417,
+      "ttft_ms_max": 5.044499,
+      "queue_ms_p50": 1.0,
+      "queue_ms_max": 2.000041,
+      "completion_latency_ms_p50": 2.837292,
+      "completion_latency_ms_max": 5.1305,
+      "prompt_tokens": 2096,
+      "workers": [
+        {
+          "reuses": 11,
+          "tokens_reused": 626,
+          "snapshot_bytes": 35328,
+          "warm_sessions": 2,
+          "warm_state_bytes": 15392
+        },
+        {
+          "reuses": 11,
+          "tokens_reused": 613,
+          "snapshot_bytes": 41152,
+          "warm_sessions": 2,
+          "warm_state_bytes": 15536
+        }
+      ],
+      "requests_per_worker": [
+        12,
+        12
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 24,
+      "request_sha256": "c0b587dbea8ba9e973cfb08a161e2081c44771dd878a533c62f127e725093d84",
+      "output_sha256": "77834a5720fe52f9c1cafdf1e162908e6fbe644f1c5afc3b70098b694ed51e9b",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 0,
+      "prefix_words": 64,
+      "concurrency": 4,
+      "policy": "session",
+      "request_count": 24,
+      "ttft_ms_p50": 1.893876,
+      "ttft_ms_max": 4.776209,
+      "queue_ms_p50": 0.953209,
+      "queue_ms_max": 2.557292,
+      "completion_latency_ms_p50": 2.018292,
+      "completion_latency_ms_max": 4.88,
+      "prompt_tokens": 2096,
+      "workers": [
+        {
+          "reuses": 10,
+          "tokens_reused": 819,
+          "snapshot_bytes": 13376,
+          "warm_sessions": 2,
+          "warm_state_bytes": 15392
+        },
+        {
+          "reuses": 10,
+          "tokens_reused": 829,
+          "snapshot_bytes": 13568,
+          "warm_sessions": 2,
+          "warm_state_bytes": 15536
+        }
+      ],
+      "requests_per_worker": [
+        12,
+        12
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 24,
+      "request_sha256": "c0b587dbea8ba9e973cfb08a161e2081c44771dd878a533c62f127e725093d84",
+      "output_sha256": "77834a5720fe52f9c1cafdf1e162908e6fbe644f1c5afc3b70098b694ed51e9b",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 0,
+      "prefix_words": 64,
+      "concurrency": 4,
+      "policy": "affinity",
+      "request_count": 24,
+      "ttft_ms_p50": 2.5583329999999997,
+      "ttft_ms_max": 5.143625,
+      "queue_ms_p50": 0.000042,
+      "queue_ms_max": 2.000042,
+      "completion_latency_ms_p50": 2.675209,
+      "completion_latency_ms_max": 5.232708,
+      "prompt_tokens": 2096,
+      "workers": [
+        {
+          "reuses": 9,
+          "tokens_reused": 718,
+          "snapshot_bytes": 33920,
+          "warm_sessions": 2,
+          "warm_state_bytes": 15392
+        },
+        {
+          "reuses": 9,
+          "tokens_reused": 725,
+          "snapshot_bytes": 33984,
+          "warm_sessions": 2,
+          "warm_state_bytes": 15536
+        }
+      ],
+      "requests_per_worker": [
+        12,
+        12
+      ],
+      "directory": {
+        "entries": 4,
+        "preferred": 14,
+        "misses": 4,
+        "spillovers": 6,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 860
+      },
+      "outputs_checked": 24,
+      "request_sha256": "c0b587dbea8ba9e973cfb08a161e2081c44771dd878a533c62f127e725093d84",
+      "output_sha256": "77834a5720fe52f9c1cafdf1e162908e6fbe644f1c5afc3b70098b694ed51e9b",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 1,
+      "prefix_words": 8,
+      "concurrency": 1,
+      "policy": "affinity",
+      "request_count": 6,
+      "ttft_ms_p50": 0.9841239999999999,
+      "ttft_ms_max": 1.071334,
+      "queue_ms_p50": 0.000042,
+      "queue_ms_max": 0.000084,
+      "completion_latency_ms_p50": 1.071416,
+      "completion_latency_ms_max": 1.1743750000000002,
+      "prompt_tokens": 179,
+      "workers": [
+        {
+          "reuses": 5,
+          "tokens_reused": 125,
+          "snapshot_bytes": 0,
+          "warm_sessions": 1,
+          "warm_state_bytes": 3592
+        },
+        {
+          "reuses": 0,
+          "tokens_reused": 0,
+          "snapshot_bytes": 0,
+          "warm_sessions": 0,
+          "warm_state_bytes": 0
+        }
+      ],
+      "requests_per_worker": [
+        6,
+        0
+      ],
+      "directory": {
+        "entries": 1,
+        "preferred": 5,
+        "misses": 1,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 130
+      },
+      "outputs_checked": 6,
+      "request_sha256": "ef867a1bb66cc68ebe823361a8aa76b2b4e4a1ab0911b05e484ce9588b3ce17e",
+      "output_sha256": "50ad6720f7265355e3c64a353bafe7cb1c86b4d73fcb9322fcc00f05fd4c5541",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 1,
+      "prefix_words": 8,
+      "concurrency": 1,
+      "policy": "session",
+      "request_count": 6,
+      "ttft_ms_p50": 0.690917,
+      "ttft_ms_max": 0.8174580000000001,
+      "queue_ms_p50": 0.000417,
+      "queue_ms_max": 0.0011250000000000001,
+      "completion_latency_ms_p50": 0.820416,
+      "completion_latency_ms_max": 0.922875,
+      "prompt_tokens": 179,
+      "workers": [
+        {
+          "reuses": 5,
+          "tokens_reused": 125,
+          "snapshot_bytes": 0,
+          "warm_sessions": 1,
+          "warm_state_bytes": 3592
+        },
+        {
+          "reuses": 0,
+          "tokens_reused": 0,
+          "snapshot_bytes": 0,
+          "warm_sessions": 0,
+          "warm_state_bytes": 0
+        }
+      ],
+      "requests_per_worker": [
+        6,
+        0
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 6,
+      "request_sha256": "ef867a1bb66cc68ebe823361a8aa76b2b4e4a1ab0911b05e484ce9588b3ce17e",
+      "output_sha256": "50ad6720f7265355e3c64a353bafe7cb1c86b4d73fcb9322fcc00f05fd4c5541",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 1,
+      "prefix_words": 8,
+      "concurrency": 1,
+      "policy": "load",
+      "request_count": 6,
+      "ttft_ms_p50": 1.021583,
+      "ttft_ms_max": 1.138709,
+      "queue_ms_p50": 0.0,
+      "queue_ms_max": 0.000042,
+      "completion_latency_ms_p50": 1.13,
+      "completion_latency_ms_max": 1.2435,
+      "prompt_tokens": 179,
+      "workers": [
+        {
+          "reuses": 2,
+          "tokens_reused": 37,
+          "snapshot_bytes": 0,
+          "warm_sessions": 1,
+          "warm_state_bytes": 2944
+        },
+        {
+          "reuses": 2,
+          "tokens_reused": 49,
+          "snapshot_bytes": 0,
+          "warm_sessions": 1,
+          "warm_state_bytes": 3592
+        }
+      ],
+      "requests_per_worker": [
+        3,
+        3
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 6,
+      "request_sha256": "ef867a1bb66cc68ebe823361a8aa76b2b4e4a1ab0911b05e484ce9588b3ce17e",
+      "output_sha256": "50ad6720f7265355e3c64a353bafe7cb1c86b4d73fcb9322fcc00f05fd4c5541",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 1,
+      "prefix_words": 8,
+      "concurrency": 1,
+      "policy": "round_robin",
+      "request_count": 6,
+      "ttft_ms_p50": 0.792,
+      "ttft_ms_max": 0.8815839999999999,
+      "queue_ms_p50": 0.000417,
+      "queue_ms_max": 0.00075,
+      "completion_latency_ms_p50": 0.8924160000000001,
+      "completion_latency_ms_max": 0.986208,
+      "prompt_tokens": 179,
+      "workers": [
+        {
+          "reuses": 2,
+          "tokens_reused": 37,
+          "snapshot_bytes": 0,
+          "warm_sessions": 1,
+          "warm_state_bytes": 2944
+        },
+        {
+          "reuses": 2,
+          "tokens_reused": 49,
+          "snapshot_bytes": 0,
+          "warm_sessions": 1,
+          "warm_state_bytes": 3592
+        }
+      ],
+      "requests_per_worker": [
+        3,
+        3
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 6,
+      "request_sha256": "ef867a1bb66cc68ebe823361a8aa76b2b4e4a1ab0911b05e484ce9588b3ce17e",
+      "output_sha256": "50ad6720f7265355e3c64a353bafe7cb1c86b4d73fcb9322fcc00f05fd4c5541",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 1,
+      "prefix_words": 8,
+      "concurrency": 2,
+      "policy": "affinity",
+      "request_count": 12,
+      "ttft_ms_p50": 1.1011250000000001,
+      "ttft_ms_max": 1.2054590000000003,
+      "queue_ms_p50": 0.000041,
+      "queue_ms_max": 0.000125,
+      "completion_latency_ms_p50": 1.222291,
+      "completion_latency_ms_max": 1.356708,
+      "prompt_tokens": 364,
+      "workers": [
+        {
+          "reuses": 5,
+          "tokens_reused": 125,
+          "snapshot_bytes": 0,
+          "warm_sessions": 1,
+          "warm_state_bytes": 3592
+        },
+        {
+          "reuses": 5,
+          "tokens_reused": 130,
+          "snapshot_bytes": 0,
+          "warm_sessions": 1,
+          "warm_state_bytes": 3664
+        }
+      ],
+      "requests_per_worker": [
+        6,
+        6
+      ],
+      "directory": {
+        "entries": 2,
+        "preferred": 10,
+        "misses": 2,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 261
+      },
+      "outputs_checked": 12,
+      "request_sha256": "7657a001daa411832135ada6b5d6c035ed3b241b4a65552e8591da0ac59ce6ce",
+      "output_sha256": "18ea291ff0fd284f1b426c8a95b9de3e791c7b46dd91a46f00943cc2fb15caf1",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 1,
+      "prefix_words": 8,
+      "concurrency": 2,
+      "policy": "session",
+      "request_count": 12,
+      "ttft_ms_p50": 0.7139999999999999,
+      "ttft_ms_max": 0.9000410000000001,
+      "queue_ms_p50": 0.000417,
+      "queue_ms_max": 0.001,
+      "completion_latency_ms_p50": 0.8438329999999999,
+      "completion_latency_ms_max": 1.013833,
+      "prompt_tokens": 364,
+      "workers": [
+        {
+          "reuses": 5,
+          "tokens_reused": 125,
+          "snapshot_bytes": 0,
+          "warm_sessions": 1,
+          "warm_state_bytes": 3592
+        },
+        {
+          "reuses": 5,
+          "tokens_reused": 130,
+          "snapshot_bytes": 0,
+          "warm_sessions": 1,
+          "warm_state_bytes": 3664
+        }
+      ],
+      "requests_per_worker": [
+        6,
+        6
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 12,
+      "request_sha256": "7657a001daa411832135ada6b5d6c035ed3b241b4a65552e8591da0ac59ce6ce",
+      "output_sha256": "18ea291ff0fd284f1b426c8a95b9de3e791c7b46dd91a46f00943cc2fb15caf1",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 1,
+      "prefix_words": 8,
+      "concurrency": 2,
+      "policy": "load",
+      "request_count": 12,
+      "ttft_ms_p50": 1.0075010000000002,
+      "ttft_ms_max": 1.152875,
+      "queue_ms_p50": 0.000042,
+      "queue_ms_max": 0.000042,
+      "completion_latency_ms_p50": 1.1083749999999999,
+      "completion_latency_ms_max": 1.310667,
+      "prompt_tokens": 364,
+      "workers": [
+        {
+          "reuses": 5,
+          "tokens_reused": 114,
+          "snapshot_bytes": 0,
+          "warm_sessions": 1,
+          "warm_state_bytes": 3592
+        },
+        {
+          "reuses": 5,
+          "tokens_reused": 118,
+          "snapshot_bytes": 0,
+          "warm_sessions": 1,
+          "warm_state_bytes": 3664
+        }
+      ],
+      "requests_per_worker": [
+        6,
+        6
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 12,
+      "request_sha256": "7657a001daa411832135ada6b5d6c035ed3b241b4a65552e8591da0ac59ce6ce",
+      "output_sha256": "18ea291ff0fd284f1b426c8a95b9de3e791c7b46dd91a46f00943cc2fb15caf1",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 1,
+      "prefix_words": 8,
+      "concurrency": 2,
+      "policy": "round_robin",
+      "request_count": 12,
+      "ttft_ms_p50": 0.8350420000000001,
+      "ttft_ms_max": 0.889,
+      "queue_ms_p50": 0.00045900000000000004,
+      "queue_ms_max": 0.000833,
+      "completion_latency_ms_p50": 0.9405420000000001,
+      "completion_latency_ms_max": 0.9966669999999999,
+      "prompt_tokens": 364,
+      "workers": [
+        {
+          "reuses": 5,
+          "tokens_reused": 125,
+          "snapshot_bytes": 0,
+          "warm_sessions": 1,
+          "warm_state_bytes": 3592
+        },
+        {
+          "reuses": 5,
+          "tokens_reused": 130,
+          "snapshot_bytes": 0,
+          "warm_sessions": 1,
+          "warm_state_bytes": 3664
+        }
+      ],
+      "requests_per_worker": [
+        6,
+        6
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 12,
+      "request_sha256": "7657a001daa411832135ada6b5d6c035ed3b241b4a65552e8591da0ac59ce6ce",
+      "output_sha256": "18ea291ff0fd284f1b426c8a95b9de3e791c7b46dd91a46f00943cc2fb15caf1",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 1,
+      "prefix_words": 8,
+      "concurrency": 4,
+      "policy": "affinity",
+      "request_count": 24,
+      "ttft_ms_p50": 1.847,
+      "ttft_ms_max": 3.3980829999999997,
+      "queue_ms_p50": 0.000042,
+      "queue_ms_max": 1.000042,
+      "completion_latency_ms_p50": 1.949042,
+      "completion_latency_ms_max": 3.512166,
+      "prompt_tokens": 752,
+      "workers": [
+        {
+          "reuses": 0,
+          "tokens_reused": 0,
+          "snapshot_bytes": 20224,
+          "warm_sessions": 1,
+          "warm_state_bytes": 3736
+        },
+        {
+          "reuses": 1,
+          "tokens_reused": 14,
+          "snapshot_bytes": 20736,
+          "warm_sessions": 1,
+          "warm_state_bytes": 3808
+        }
+      ],
+      "requests_per_worker": [
+        12,
+        12
+      ],
+      "directory": {
+        "entries": 4,
+        "preferred": 15,
+        "misses": 5,
+        "spillovers": 4,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 1,
+        "cached_tokens": 524
+      },
+      "outputs_checked": 24,
+      "request_sha256": "398a2056e936cda68bc5cfa46e414aaf7f617010cdf1d26dbe0043c047c989a9",
+      "output_sha256": "c20e2e405818307db3819747c36f0a2525027463bc0af412ba923c035b820f49",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 1,
+      "prefix_words": 8,
+      "concurrency": 4,
+      "policy": "session",
+      "request_count": 24,
+      "ttft_ms_p50": 1.5887090000000001,
+      "ttft_ms_max": 3.090084,
+      "queue_ms_p50": 0.844375,
+      "queue_ms_max": 1.512709,
+      "completion_latency_ms_p50": 1.6905,
+      "completion_latency_ms_max": 3.187292,
+      "prompt_tokens": 752,
+      "workers": [
+        {
+          "reuses": 0,
+          "tokens_reused": 0,
+          "snapshot_bytes": 20160,
+          "warm_sessions": 1,
+          "warm_state_bytes": 3736
+        },
+        {
+          "reuses": 0,
+          "tokens_reused": 0,
+          "snapshot_bytes": 21824,
+          "warm_sessions": 1,
+          "warm_state_bytes": 3808
+        }
+      ],
+      "requests_per_worker": [
+        12,
+        12
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 24,
+      "request_sha256": "398a2056e936cda68bc5cfa46e414aaf7f617010cdf1d26dbe0043c047c989a9",
+      "output_sha256": "c20e2e405818307db3819747c36f0a2525027463bc0af412ba923c035b820f49",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 1,
+      "prefix_words": 8,
+      "concurrency": 4,
+      "policy": "load",
+      "request_count": 24,
+      "ttft_ms_p50": 1.856874,
+      "ttft_ms_max": 3.680667,
+      "queue_ms_p50": 0.000042,
+      "queue_ms_max": 1.000042,
+      "completion_latency_ms_p50": 1.9600410000000001,
+      "completion_latency_ms_max": 3.726625,
+      "prompt_tokens": 752,
+      "workers": [
+        {
+          "reuses": 11,
+          "tokens_reused": 24,
+          "snapshot_bytes": 0,
+          "warm_sessions": 1,
+          "warm_state_bytes": 3736
+        },
+        {
+          "reuses": 11,
+          "tokens_reused": 31,
+          "snapshot_bytes": 0,
+          "warm_sessions": 1,
+          "warm_state_bytes": 3808
+        }
+      ],
+      "requests_per_worker": [
+        12,
+        12
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 24,
+      "request_sha256": "398a2056e936cda68bc5cfa46e414aaf7f617010cdf1d26dbe0043c047c989a9",
+      "output_sha256": "c20e2e405818307db3819747c36f0a2525027463bc0af412ba923c035b820f49",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 1,
+      "prefix_words": 8,
+      "concurrency": 4,
+      "policy": "round_robin",
+      "request_count": 24,
+      "ttft_ms_p50": 1.732125,
+      "ttft_ms_max": 3.000042,
+      "queue_ms_p50": 0.8890830000000001,
+      "queue_ms_max": 1.4935,
+      "completion_latency_ms_p50": 1.842375,
+      "completion_latency_ms_max": 3.111875,
+      "prompt_tokens": 752,
+      "workers": [
+        {
+          "reuses": 0,
+          "tokens_reused": 0,
+          "snapshot_bytes": 20160,
+          "warm_sessions": 1,
+          "warm_state_bytes": 3736
+        },
+        {
+          "reuses": 0,
+          "tokens_reused": 0,
+          "snapshot_bytes": 21824,
+          "warm_sessions": 1,
+          "warm_state_bytes": 3808
+        }
+      ],
+      "requests_per_worker": [
+        12,
+        12
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 24,
+      "request_sha256": "398a2056e936cda68bc5cfa46e414aaf7f617010cdf1d26dbe0043c047c989a9",
+      "output_sha256": "c20e2e405818307db3819747c36f0a2525027463bc0af412ba923c035b820f49",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 1,
+      "prefix_words": 32,
+      "concurrency": 1,
+      "policy": "affinity",
+      "request_count": 6,
+      "ttft_ms_p50": 1.086375,
+      "ttft_ms_max": 1.501125,
+      "queue_ms_p50": 0.000042,
+      "queue_ms_max": 0.000042,
+      "completion_latency_ms_p50": 1.1895829999999998,
+      "completion_latency_ms_max": 1.6032920000000002,
+      "prompt_tokens": 323,
+      "workers": [
+        {
+          "reuses": 5,
+          "tokens_reused": 245,
+          "snapshot_bytes": 2304,
+          "warm_sessions": 1,
+          "warm_state_bytes": 5320
+        },
+        {
+          "reuses": 0,
+          "tokens_reused": 0,
+          "snapshot_bytes": 0,
+          "warm_sessions": 0,
+          "warm_state_bytes": 0
+        }
+      ],
+      "requests_per_worker": [
+        6,
+        0
+      ],
+      "directory": {
+        "entries": 1,
+        "preferred": 5,
+        "misses": 1,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 166
+      },
+      "outputs_checked": 6,
+      "request_sha256": "70c42c5e729b202b6ebe896034221b196139c485387cda6540c76701738ac51e",
+      "output_sha256": "fe144b2e26ce8bf181665f07c65996c8d65f86677ca5ff2eec03979abd593558",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 1,
+      "prefix_words": 32,
+      "concurrency": 1,
+      "policy": "session",
+      "request_count": 6,
+      "ttft_ms_p50": 0.963959,
+      "ttft_ms_max": 1.4347089999999998,
+      "queue_ms_p50": 0.0006670000000000001,
+      "queue_ms_max": 0.000959,
+      "completion_latency_ms_p50": 1.0764170000000002,
+      "completion_latency_ms_max": 1.535334,
+      "prompt_tokens": 323,
+      "workers": [
+        {
+          "reuses": 5,
+          "tokens_reused": 245,
+          "snapshot_bytes": 2304,
+          "warm_sessions": 1,
+          "warm_state_bytes": 5320
+        },
+        {
+          "reuses": 0,
+          "tokens_reused": 0,
+          "snapshot_bytes": 0,
+          "warm_sessions": 0,
+          "warm_state_bytes": 0
+        }
+      ],
+      "requests_per_worker": [
+        6,
+        0
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 6,
+      "request_sha256": "70c42c5e729b202b6ebe896034221b196139c485387cda6540c76701738ac51e",
+      "output_sha256": "fe144b2e26ce8bf181665f07c65996c8d65f86677ca5ff2eec03979abd593558",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 1,
+      "prefix_words": 32,
+      "concurrency": 1,
+      "policy": "load",
+      "request_count": 6,
+      "ttft_ms_p50": 1.413667,
+      "ttft_ms_max": 1.7961660000000002,
+      "queue_ms_p50": 0.000041,
+      "queue_ms_max": 0.000042,
+      "completion_latency_ms_p50": 1.516917,
+      "completion_latency_ms_max": 1.890583,
+      "prompt_tokens": 323,
+      "workers": [
+        {
+          "reuses": 2,
+          "tokens_reused": 85,
+          "snapshot_bytes": 2304,
+          "warm_sessions": 1,
+          "warm_state_bytes": 4672
+        },
+        {
+          "reuses": 2,
+          "tokens_reused": 97,
+          "snapshot_bytes": 2304,
+          "warm_sessions": 1,
+          "warm_state_bytes": 5320
+        }
+      ],
+      "requests_per_worker": [
+        3,
+        3
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 6,
+      "request_sha256": "70c42c5e729b202b6ebe896034221b196139c485387cda6540c76701738ac51e",
+      "output_sha256": "fe144b2e26ce8bf181665f07c65996c8d65f86677ca5ff2eec03979abd593558",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 1,
+      "prefix_words": 32,
+      "concurrency": 1,
+      "policy": "round_robin",
+      "request_count": 6,
+      "ttft_ms_p50": 1.135124,
+      "ttft_ms_max": 1.579083,
+      "queue_ms_p50": 0.000791,
+      "queue_ms_max": 0.000875,
+      "completion_latency_ms_p50": 1.238875,
+      "completion_latency_ms_max": 1.701208,
+      "prompt_tokens": 323,
+      "workers": [
+        {
+          "reuses": 2,
+          "tokens_reused": 85,
+          "snapshot_bytes": 2304,
+          "warm_sessions": 1,
+          "warm_state_bytes": 4672
+        },
+        {
+          "reuses": 2,
+          "tokens_reused": 97,
+          "snapshot_bytes": 2304,
+          "warm_sessions": 1,
+          "warm_state_bytes": 5320
+        }
+      ],
+      "requests_per_worker": [
+        3,
+        3
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 6,
+      "request_sha256": "70c42c5e729b202b6ebe896034221b196139c485387cda6540c76701738ac51e",
+      "output_sha256": "fe144b2e26ce8bf181665f07c65996c8d65f86677ca5ff2eec03979abd593558",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 1,
+      "prefix_words": 32,
+      "concurrency": 2,
+      "policy": "affinity",
+      "request_count": 12,
+      "ttft_ms_p50": 1.368333,
+      "ttft_ms_max": 2.131249,
+      "queue_ms_p50": 0.000042,
+      "queue_ms_max": 0.000167,
+      "completion_latency_ms_p50": 1.50925,
+      "completion_latency_ms_max": 2.244875,
+      "prompt_tokens": 652,
+      "workers": [
+        {
+          "reuses": 5,
+          "tokens_reused": 245,
+          "snapshot_bytes": 2304,
+          "warm_sessions": 1,
+          "warm_state_bytes": 5320
+        },
+        {
+          "reuses": 5,
+          "tokens_reused": 250,
+          "snapshot_bytes": 2368,
+          "warm_sessions": 1,
+          "warm_state_bytes": 5392
+        }
+      ],
+      "requests_per_worker": [
+        6,
+        6
+      ],
+      "directory": {
+        "entries": 2,
+        "preferred": 10,
+        "misses": 2,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 333
+      },
+      "outputs_checked": 12,
+      "request_sha256": "348cbf3afc2fb147aba796facb7ffda836a2790c1e87acb67ccd85abed2477ae",
+      "output_sha256": "9addfe7c5af1498947e4cfc81d795aa8bcc9086fe0ec83d6a4f12d33075530d0",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 1,
+      "prefix_words": 32,
+      "concurrency": 2,
+      "policy": "session",
+      "request_count": 12,
+      "ttft_ms_p50": 0.9893750000000001,
+      "ttft_ms_max": 1.685084,
+      "queue_ms_p50": 0.000792,
+      "queue_ms_max": 0.0011250000000000001,
+      "completion_latency_ms_p50": 1.091584,
+      "completion_latency_ms_max": 1.842458,
+      "prompt_tokens": 652,
+      "workers": [
+        {
+          "reuses": 5,
+          "tokens_reused": 245,
+          "snapshot_bytes": 2304,
+          "warm_sessions": 1,
+          "warm_state_bytes": 5320
+        },
+        {
+          "reuses": 5,
+          "tokens_reused": 250,
+          "snapshot_bytes": 2368,
+          "warm_sessions": 1,
+          "warm_state_bytes": 5392
+        }
+      ],
+      "requests_per_worker": [
+        6,
+        6
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 12,
+      "request_sha256": "348cbf3afc2fb147aba796facb7ffda836a2790c1e87acb67ccd85abed2477ae",
+      "output_sha256": "9addfe7c5af1498947e4cfc81d795aa8bcc9086fe0ec83d6a4f12d33075530d0",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 1,
+      "prefix_words": 32,
+      "concurrency": 2,
+      "policy": "load",
+      "request_count": 12,
+      "ttft_ms_p50": 1.161,
+      "ttft_ms_max": 2.090709,
+      "queue_ms_p50": 0.0,
+      "queue_ms_max": 0.000042,
+      "completion_latency_ms_p50": 1.279708,
+      "completion_latency_ms_max": 2.1814999999999998,
+      "prompt_tokens": 652,
+      "workers": [
+        {
+          "reuses": 5,
+          "tokens_reused": 245,
+          "snapshot_bytes": 2304,
+          "warm_sessions": 1,
+          "warm_state_bytes": 5320
+        },
+        {
+          "reuses": 5,
+          "tokens_reused": 250,
+          "snapshot_bytes": 2368,
+          "warm_sessions": 1,
+          "warm_state_bytes": 5392
+        }
+      ],
+      "requests_per_worker": [
+        6,
+        6
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 12,
+      "request_sha256": "348cbf3afc2fb147aba796facb7ffda836a2790c1e87acb67ccd85abed2477ae",
+      "output_sha256": "9addfe7c5af1498947e4cfc81d795aa8bcc9086fe0ec83d6a4f12d33075530d0",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 1,
+      "prefix_words": 32,
+      "concurrency": 2,
+      "policy": "round_robin",
+      "request_count": 12,
+      "ttft_ms_p50": 0.8567910000000001,
+      "ttft_ms_max": 1.460459,
+      "queue_ms_p50": 0.000417,
+      "queue_ms_max": 0.000875,
+      "completion_latency_ms_p50": 0.9717079999999999,
+      "completion_latency_ms_max": 1.566292,
+      "prompt_tokens": 652,
+      "workers": [
+        {
+          "reuses": 5,
+          "tokens_reused": 245,
+          "snapshot_bytes": 2304,
+          "warm_sessions": 1,
+          "warm_state_bytes": 5320
+        },
+        {
+          "reuses": 5,
+          "tokens_reused": 250,
+          "snapshot_bytes": 2368,
+          "warm_sessions": 1,
+          "warm_state_bytes": 5392
+        }
+      ],
+      "requests_per_worker": [
+        6,
+        6
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 12,
+      "request_sha256": "348cbf3afc2fb147aba796facb7ffda836a2790c1e87acb67ccd85abed2477ae",
+      "output_sha256": "9addfe7c5af1498947e4cfc81d795aa8bcc9086fe0ec83d6a4f12d33075530d0",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 1,
+      "prefix_words": 32,
+      "concurrency": 4,
+      "policy": "affinity",
+      "request_count": 24,
+      "ttft_ms_p50": 1.9949579999999998,
+      "ttft_ms_max": 3.2095000000000002,
+      "queue_ms_p50": 0.000042,
+      "queue_ms_max": 1.000041,
+      "completion_latency_ms_p50": 2.098042,
+      "completion_latency_ms_max": 3.318375,
+      "prompt_tokens": 1328,
+      "workers": [
+        {
+          "reuses": 10,
+          "tokens_reused": 499,
+          "snapshot_bytes": 7232,
+          "warm_sessions": 2,
+          "warm_state_bytes": 10784
+        },
+        {
+          "reuses": 10,
+          "tokens_reused": 509,
+          "snapshot_bytes": 7552,
+          "warm_sessions": 2,
+          "warm_state_bytes": 10928
+        }
+      ],
+      "requests_per_worker": [
+        12,
+        12
+      ],
+      "directory": {
+        "entries": 4,
+        "preferred": 20,
+        "misses": 4,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 668
+      },
+      "outputs_checked": 24,
+      "request_sha256": "8cbbb6153a1f97d9272587ccceda540693427fc2a60df9d0420ce4b0f750dd52",
+      "output_sha256": "2508c20bce7e0881ab63af06deabcd446224a271c929e44028921d715ec5b154",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 1,
+      "prefix_words": 32,
+      "concurrency": 4,
+      "policy": "session",
+      "request_count": 24,
+      "ttft_ms_p50": 1.5604580000000001,
+      "ttft_ms_max": 2.864166,
+      "queue_ms_p50": 0.789375,
+      "queue_ms_max": 1.5423749999999998,
+      "completion_latency_ms_p50": 1.6755,
+      "completion_latency_ms_max": 2.960041,
+      "prompt_tokens": 1328,
+      "workers": [
+        {
+          "reuses": 10,
+          "tokens_reused": 499,
+          "snapshot_bytes": 7232,
+          "warm_sessions": 2,
+          "warm_state_bytes": 10784
+        },
+        {
+          "reuses": 10,
+          "tokens_reused": 509,
+          "snapshot_bytes": 7424,
+          "warm_sessions": 2,
+          "warm_state_bytes": 10928
+        }
+      ],
+      "requests_per_worker": [
+        12,
+        12
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 24,
+      "request_sha256": "8cbbb6153a1f97d9272587ccceda540693427fc2a60df9d0420ce4b0f750dd52",
+      "output_sha256": "2508c20bce7e0881ab63af06deabcd446224a271c929e44028921d715ec5b154",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 1,
+      "prefix_words": 32,
+      "concurrency": 4,
+      "policy": "load",
+      "request_count": 24,
+      "ttft_ms_p50": 1.887,
+      "ttft_ms_max": 3.3198339999999997,
+      "queue_ms_p50": 0.000041,
+      "queue_ms_max": 1.0,
+      "completion_latency_ms_p50": 2.0167919999999997,
+      "completion_latency_ms_max": 3.412625,
+      "prompt_tokens": 1328,
+      "workers": [
+        {
+          "reuses": 11,
+          "tokens_reused": 455,
+          "snapshot_bytes": 10624,
+          "warm_sessions": 2,
+          "warm_state_bytes": 10784
+        },
+        {
+          "reuses": 11,
+          "tokens_reused": 457,
+          "snapshot_bytes": 10624,
+          "warm_sessions": 2,
+          "warm_state_bytes": 10928
+        }
+      ],
+      "requests_per_worker": [
+        12,
+        12
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 24,
+      "request_sha256": "8cbbb6153a1f97d9272587ccceda540693427fc2a60df9d0420ce4b0f750dd52",
+      "output_sha256": "2508c20bce7e0881ab63af06deabcd446224a271c929e44028921d715ec5b154",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 1,
+      "prefix_words": 32,
+      "concurrency": 4,
+      "policy": "round_robin",
+      "request_count": 24,
+      "ttft_ms_p50": 1.618709,
+      "ttft_ms_max": 2.8775,
+      "queue_ms_p50": 0.8099999999999999,
+      "queue_ms_max": 1.564,
+      "completion_latency_ms_p50": 1.7045409999999999,
+      "completion_latency_ms_max": 2.966542,
+      "prompt_tokens": 1328,
+      "workers": [
+        {
+          "reuses": 10,
+          "tokens_reused": 499,
+          "snapshot_bytes": 7232,
+          "warm_sessions": 2,
+          "warm_state_bytes": 10784
+        },
+        {
+          "reuses": 10,
+          "tokens_reused": 509,
+          "snapshot_bytes": 7424,
+          "warm_sessions": 2,
+          "warm_state_bytes": 10928
+        }
+      ],
+      "requests_per_worker": [
+        12,
+        12
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 24,
+      "request_sha256": "8cbbb6153a1f97d9272587ccceda540693427fc2a60df9d0420ce4b0f750dd52",
+      "output_sha256": "2508c20bce7e0881ab63af06deabcd446224a271c929e44028921d715ec5b154",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 1,
+      "prefix_words": 64,
+      "concurrency": 1,
+      "policy": "affinity",
+      "request_count": 6,
+      "ttft_ms_p50": 1.264334,
+      "ttft_ms_max": 2.433084,
+      "queue_ms_p50": 0.000041,
+      "queue_ms_max": 0.000042,
+      "completion_latency_ms_p50": 1.364167,
+      "completion_latency_ms_max": 2.535333,
+      "prompt_tokens": 515,
+      "workers": [
+        {
+          "reuses": 5,
+          "tokens_reused": 405,
+          "snapshot_bytes": 4352,
+          "warm_sessions": 1,
+          "warm_state_bytes": 7624
+        },
+        {
+          "reuses": 0,
+          "tokens_reused": 0,
+          "snapshot_bytes": 0,
+          "warm_sessions": 0,
+          "warm_state_bytes": 0
+        }
+      ],
+      "requests_per_worker": [
+        6,
+        0
+      ],
+      "directory": {
+        "entries": 1,
+        "preferred": 5,
+        "misses": 1,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 214
+      },
+      "outputs_checked": 6,
+      "request_sha256": "98b988d147220bf5d92f5c78ce5ed901f90b74d383f18cd1c736aaf4fb99cb57",
+      "output_sha256": "ef3e025de5b66cdac1a26c0c1ff298027fbd339982fcf031a4423424d299dad0",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 1,
+      "prefix_words": 64,
+      "concurrency": 1,
+      "policy": "session",
+      "request_count": 6,
+      "ttft_ms_p50": 0.965958,
+      "ttft_ms_max": 2.205708,
+      "queue_ms_p50": 0.0005,
+      "queue_ms_max": 0.000958,
+      "completion_latency_ms_p50": 1.075458,
+      "completion_latency_ms_max": 2.316458,
+      "prompt_tokens": 515,
+      "workers": [
+        {
+          "reuses": 5,
+          "tokens_reused": 405,
+          "snapshot_bytes": 4352,
+          "warm_sessions": 1,
+          "warm_state_bytes": 7624
+        },
+        {
+          "reuses": 0,
+          "tokens_reused": 0,
+          "snapshot_bytes": 0,
+          "warm_sessions": 0,
+          "warm_state_bytes": 0
+        }
+      ],
+      "requests_per_worker": [
+        6,
+        0
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 6,
+      "request_sha256": "98b988d147220bf5d92f5c78ce5ed901f90b74d383f18cd1c736aaf4fb99cb57",
+      "output_sha256": "ef3e025de5b66cdac1a26c0c1ff298027fbd339982fcf031a4423424d299dad0",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 1,
+      "prefix_words": 64,
+      "concurrency": 1,
+      "policy": "load",
+      "request_count": 6,
+      "ttft_ms_p50": 1.474999,
+      "ttft_ms_max": 2.558208,
+      "queue_ms_p50": 0.000041,
+      "queue_ms_max": 0.000041,
+      "completion_latency_ms_p50": 1.559375,
+      "completion_latency_ms_max": 2.664291,
+      "prompt_tokens": 515,
+      "workers": [
+        {
+          "reuses": 2,
+          "tokens_reused": 149,
+          "snapshot_bytes": 4352,
+          "warm_sessions": 1,
+          "warm_state_bytes": 6976
+        },
+        {
+          "reuses": 2,
+          "tokens_reused": 161,
+          "snapshot_bytes": 4352,
+          "warm_sessions": 1,
+          "warm_state_bytes": 7624
+        }
+      ],
+      "requests_per_worker": [
+        3,
+        3
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 6,
+      "request_sha256": "98b988d147220bf5d92f5c78ce5ed901f90b74d383f18cd1c736aaf4fb99cb57",
+      "output_sha256": "ef3e025de5b66cdac1a26c0c1ff298027fbd339982fcf031a4423424d299dad0",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 1,
+      "prefix_words": 64,
+      "concurrency": 1,
+      "policy": "round_robin",
+      "request_count": 6,
+      "ttft_ms_p50": 1.281666,
+      "ttft_ms_max": 2.3364999999999996,
+      "queue_ms_p50": 0.000417,
+      "queue_ms_max": 0.000583,
+      "completion_latency_ms_p50": 1.413541,
+      "completion_latency_ms_max": 2.438542,
+      "prompt_tokens": 515,
+      "workers": [
+        {
+          "reuses": 2,
+          "tokens_reused": 149,
+          "snapshot_bytes": 4352,
+          "warm_sessions": 1,
+          "warm_state_bytes": 6976
+        },
+        {
+          "reuses": 2,
+          "tokens_reused": 161,
+          "snapshot_bytes": 4352,
+          "warm_sessions": 1,
+          "warm_state_bytes": 7624
+        }
+      ],
+      "requests_per_worker": [
+        3,
+        3
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 6,
+      "request_sha256": "98b988d147220bf5d92f5c78ce5ed901f90b74d383f18cd1c736aaf4fb99cb57",
+      "output_sha256": "ef3e025de5b66cdac1a26c0c1ff298027fbd339982fcf031a4423424d299dad0",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 1,
+      "prefix_words": 64,
+      "concurrency": 2,
+      "policy": "affinity",
+      "request_count": 12,
+      "ttft_ms_p50": 1.313917,
+      "ttft_ms_max": 2.826041,
+      "queue_ms_p50": 0.000041,
+      "queue_ms_max": 0.000042,
+      "completion_latency_ms_p50": 1.446083,
+      "completion_latency_ms_max": 2.921625,
+      "prompt_tokens": 1036,
+      "workers": [
+        {
+          "reuses": 5,
+          "tokens_reused": 410,
+          "snapshot_bytes": 4416,
+          "warm_sessions": 1,
+          "warm_state_bytes": 7696
+        },
+        {
+          "reuses": 5,
+          "tokens_reused": 405,
+          "snapshot_bytes": 4352,
+          "warm_sessions": 1,
+          "warm_state_bytes": 7624
+        }
+      ],
+      "requests_per_worker": [
+        6,
+        6
+      ],
+      "directory": {
+        "entries": 2,
+        "preferred": 10,
+        "misses": 2,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 429
+      },
+      "outputs_checked": 12,
+      "request_sha256": "3c3d6a63b17f5ad83df1cb0359295ef03b036346e6e37582db3301f93cb7bb93",
+      "output_sha256": "6f31307f1c6d18cc33689e61d75e43809748db548c009e6dbe31a722912b4db9",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 1,
+      "prefix_words": 64,
+      "concurrency": 2,
+      "policy": "session",
+      "request_count": 12,
+      "ttft_ms_p50": 1.0422500000000001,
+      "ttft_ms_max": 2.5156249999999996,
+      "queue_ms_p50": 0.000375,
+      "queue_ms_max": 0.00075,
+      "completion_latency_ms_p50": 1.163958,
+      "completion_latency_ms_max": 2.6197920000000003,
+      "prompt_tokens": 1036,
+      "workers": [
+        {
+          "reuses": 5,
+          "tokens_reused": 405,
+          "snapshot_bytes": 4352,
+          "warm_sessions": 1,
+          "warm_state_bytes": 7624
+        },
+        {
+          "reuses": 5,
+          "tokens_reused": 410,
+          "snapshot_bytes": 4416,
+          "warm_sessions": 1,
+          "warm_state_bytes": 7696
+        }
+      ],
+      "requests_per_worker": [
+        6,
+        6
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 12,
+      "request_sha256": "3c3d6a63b17f5ad83df1cb0359295ef03b036346e6e37582db3301f93cb7bb93",
+      "output_sha256": "6f31307f1c6d18cc33689e61d75e43809748db548c009e6dbe31a722912b4db9",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 1,
+      "prefix_words": 64,
+      "concurrency": 2,
+      "policy": "load",
+      "request_count": 12,
+      "ttft_ms_p50": 1.393833,
+      "ttft_ms_max": 2.7377920000000002,
+      "queue_ms_p50": 0.000042,
+      "queue_ms_max": 0.000125,
+      "completion_latency_ms_p50": 1.5271670000000002,
+      "completion_latency_ms_max": 2.820542,
+      "prompt_tokens": 1036,
+      "workers": [
+        {
+          "reuses": 5,
+          "tokens_reused": 338,
+          "snapshot_bytes": 8768,
+          "warm_sessions": 1,
+          "warm_state_bytes": 7624
+        },
+        {
+          "reuses": 5,
+          "tokens_reused": 342,
+          "snapshot_bytes": 8768,
+          "warm_sessions": 1,
+          "warm_state_bytes": 7696
+        }
+      ],
+      "requests_per_worker": [
+        6,
+        6
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 12,
+      "request_sha256": "3c3d6a63b17f5ad83df1cb0359295ef03b036346e6e37582db3301f93cb7bb93",
+      "output_sha256": "6f31307f1c6d18cc33689e61d75e43809748db548c009e6dbe31a722912b4db9",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 1,
+      "prefix_words": 64,
+      "concurrency": 2,
+      "policy": "round_robin",
+      "request_count": 12,
+      "ttft_ms_p50": 1.257251,
+      "ttft_ms_max": 2.830208,
+      "queue_ms_p50": 0.000917,
+      "queue_ms_max": 0.0012920000000000002,
+      "completion_latency_ms_p50": 1.381042,
+      "completion_latency_ms_max": 2.92675,
+      "prompt_tokens": 1036,
+      "workers": [
+        {
+          "reuses": 5,
+          "tokens_reused": 405,
+          "snapshot_bytes": 4352,
+          "warm_sessions": 1,
+          "warm_state_bytes": 7624
+        },
+        {
+          "reuses": 5,
+          "tokens_reused": 410,
+          "snapshot_bytes": 4416,
+          "warm_sessions": 1,
+          "warm_state_bytes": 7696
+        }
+      ],
+      "requests_per_worker": [
+        6,
+        6
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 12,
+      "request_sha256": "3c3d6a63b17f5ad83df1cb0359295ef03b036346e6e37582db3301f93cb7bb93",
+      "output_sha256": "6f31307f1c6d18cc33689e61d75e43809748db548c009e6dbe31a722912b4db9",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 1,
+      "prefix_words": 64,
+      "concurrency": 4,
+      "policy": "affinity",
+      "request_count": 24,
+      "ttft_ms_p50": 2.699375,
+      "ttft_ms_max": 6.249375,
+      "queue_ms_p50": 1.0,
+      "queue_ms_max": 3.0,
+      "completion_latency_ms_p50": 2.816416,
+      "completion_latency_ms_max": 6.348166,
+      "prompt_tokens": 2096,
+      "workers": [
+        {
+          "reuses": 9,
+          "tokens_reused": 726,
+          "snapshot_bytes": 33856,
+          "warm_sessions": 2,
+          "warm_state_bytes": 15536
+        },
+        {
+          "reuses": 9,
+          "tokens_reused": 725,
+          "snapshot_bytes": 28800,
+          "warm_sessions": 2,
+          "warm_state_bytes": 15392
+        }
+      ],
+      "requests_per_worker": [
+        12,
+        12
+      ],
+      "directory": {
+        "entries": 4,
+        "preferred": 16,
+        "misses": 4,
+        "spillovers": 4,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 860
+      },
+      "outputs_checked": 24,
+      "request_sha256": "c0b587dbea8ba9e973cfb08a161e2081c44771dd878a533c62f127e725093d84",
+      "output_sha256": "77834a5720fe52f9c1cafdf1e162908e6fbe644f1c5afc3b70098b694ed51e9b",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 1,
+      "prefix_words": 64,
+      "concurrency": 4,
+      "policy": "session",
+      "request_count": 24,
+      "ttft_ms_p50": 2.0534999999999997,
+      "ttft_ms_max": 5.3604590000000005,
+      "queue_ms_p50": 0.988542,
+      "queue_ms_max": 2.9467920000000003,
+      "completion_latency_ms_p50": 2.1803339999999998,
+      "completion_latency_ms_max": 5.464209,
+      "prompt_tokens": 2096,
+      "workers": [
+        {
+          "reuses": 10,
+          "tokens_reused": 819,
+          "snapshot_bytes": 13376,
+          "warm_sessions": 2,
+          "warm_state_bytes": 15392
+        },
+        {
+          "reuses": 10,
+          "tokens_reused": 829,
+          "snapshot_bytes": 13568,
+          "warm_sessions": 2,
+          "warm_state_bytes": 15536
+        }
+      ],
+      "requests_per_worker": [
+        12,
+        12
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 24,
+      "request_sha256": "c0b587dbea8ba9e973cfb08a161e2081c44771dd878a533c62f127e725093d84",
+      "output_sha256": "77834a5720fe52f9c1cafdf1e162908e6fbe644f1c5afc3b70098b694ed51e9b",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 1,
+      "prefix_words": 64,
+      "concurrency": 4,
+      "policy": "load",
+      "request_count": 24,
+      "ttft_ms_p50": 2.5787090000000004,
+      "ttft_ms_max": 5.098707999999999,
+      "queue_ms_p50": 0.000084,
+      "queue_ms_max": 2.000042,
+      "completion_latency_ms_p50": 2.682958,
+      "completion_latency_ms_max": 5.2005,
+      "prompt_tokens": 2096,
+      "workers": [
+        {
+          "reuses": 11,
+          "tokens_reused": 685,
+          "snapshot_bytes": 36032,
+          "warm_sessions": 2,
+          "warm_state_bytes": 15464
+        },
+        {
+          "reuses": 11,
+          "tokens_reused": 698,
+          "snapshot_bytes": 36096,
+          "warm_sessions": 2,
+          "warm_state_bytes": 15464
+        }
+      ],
+      "requests_per_worker": [
+        12,
+        12
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 24,
+      "request_sha256": "c0b587dbea8ba9e973cfb08a161e2081c44771dd878a533c62f127e725093d84",
+      "output_sha256": "77834a5720fe52f9c1cafdf1e162908e6fbe644f1c5afc3b70098b694ed51e9b",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 1,
+      "prefix_words": 64,
+      "concurrency": 4,
+      "policy": "round_robin",
+      "request_count": 24,
+      "ttft_ms_p50": 1.9221249999999999,
+      "ttft_ms_max": 4.791708,
+      "queue_ms_p50": 0.9602499999999999,
+      "queue_ms_max": 2.5907500000000003,
+      "completion_latency_ms_p50": 2.026041,
+      "completion_latency_ms_max": 4.907875,
+      "prompt_tokens": 2096,
+      "workers": [
+        {
+          "reuses": 10,
+          "tokens_reused": 819,
+          "snapshot_bytes": 13376,
+          "warm_sessions": 2,
+          "warm_state_bytes": 15392
+        },
+        {
+          "reuses": 10,
+          "tokens_reused": 829,
+          "snapshot_bytes": 13568,
+          "warm_sessions": 2,
+          "warm_state_bytes": 15536
+        }
+      ],
+      "requests_per_worker": [
+        12,
+        12
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 24,
+      "request_sha256": "c0b587dbea8ba9e973cfb08a161e2081c44771dd878a533c62f127e725093d84",
+      "output_sha256": "77834a5720fe52f9c1cafdf1e162908e6fbe644f1c5afc3b70098b694ed51e9b",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 2,
+      "prefix_words": 8,
+      "concurrency": 1,
+      "policy": "round_robin",
+      "request_count": 6,
+      "ttft_ms_p50": 0.8162510000000001,
+      "ttft_ms_max": 0.872958,
+      "queue_ms_p50": 0.000583,
+      "queue_ms_max": 0.000959,
+      "completion_latency_ms_p50": 0.921625,
+      "completion_latency_ms_max": 0.97375,
+      "prompt_tokens": 179,
+      "workers": [
+        {
+          "reuses": 2,
+          "tokens_reused": 37,
+          "snapshot_bytes": 0,
+          "warm_sessions": 1,
+          "warm_state_bytes": 2944
+        },
+        {
+          "reuses": 2,
+          "tokens_reused": 49,
+          "snapshot_bytes": 0,
+          "warm_sessions": 1,
+          "warm_state_bytes": 3592
+        }
+      ],
+      "requests_per_worker": [
+        3,
+        3
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 6,
+      "request_sha256": "ef867a1bb66cc68ebe823361a8aa76b2b4e4a1ab0911b05e484ce9588b3ce17e",
+      "output_sha256": "50ad6720f7265355e3c64a353bafe7cb1c86b4d73fcb9322fcc00f05fd4c5541",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 2,
+      "prefix_words": 8,
+      "concurrency": 1,
+      "policy": "load",
+      "request_count": 6,
+      "ttft_ms_p50": 1.033875,
+      "ttft_ms_max": 1.14125,
+      "queue_ms_p50": 0.000041,
+      "queue_ms_max": 0.000042,
+      "completion_latency_ms_p50": 1.124333,
+      "completion_latency_ms_max": 1.240375,
+      "prompt_tokens": 179,
+      "workers": [
+        {
+          "reuses": 2,
+          "tokens_reused": 37,
+          "snapshot_bytes": 0,
+          "warm_sessions": 1,
+          "warm_state_bytes": 2944
+        },
+        {
+          "reuses": 2,
+          "tokens_reused": 49,
+          "snapshot_bytes": 0,
+          "warm_sessions": 1,
+          "warm_state_bytes": 3592
+        }
+      ],
+      "requests_per_worker": [
+        3,
+        3
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 6,
+      "request_sha256": "ef867a1bb66cc68ebe823361a8aa76b2b4e4a1ab0911b05e484ce9588b3ce17e",
+      "output_sha256": "50ad6720f7265355e3c64a353bafe7cb1c86b4d73fcb9322fcc00f05fd4c5541",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 2,
+      "prefix_words": 8,
+      "concurrency": 1,
+      "policy": "session",
+      "request_count": 6,
+      "ttft_ms_p50": 0.715292,
+      "ttft_ms_max": 0.743041,
+      "queue_ms_p50": 0.00041600000000000003,
+      "queue_ms_max": 0.0005,
+      "completion_latency_ms_p50": 0.819125,
+      "completion_latency_ms_max": 0.839125,
+      "prompt_tokens": 179,
+      "workers": [
+        {
+          "reuses": 5,
+          "tokens_reused": 125,
+          "snapshot_bytes": 0,
+          "warm_sessions": 1,
+          "warm_state_bytes": 3592
+        },
+        {
+          "reuses": 0,
+          "tokens_reused": 0,
+          "snapshot_bytes": 0,
+          "warm_sessions": 0,
+          "warm_state_bytes": 0
+        }
+      ],
+      "requests_per_worker": [
+        6,
+        0
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 6,
+      "request_sha256": "ef867a1bb66cc68ebe823361a8aa76b2b4e4a1ab0911b05e484ce9588b3ce17e",
+      "output_sha256": "50ad6720f7265355e3c64a353bafe7cb1c86b4d73fcb9322fcc00f05fd4c5541",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 2,
+      "prefix_words": 8,
+      "concurrency": 1,
+      "policy": "affinity",
+      "request_count": 6,
+      "ttft_ms_p50": 0.906083,
+      "ttft_ms_max": 0.9982909999999999,
+      "queue_ms_p50": 0.0,
+      "queue_ms_max": 0.000041,
+      "completion_latency_ms_p50": 1.0033329999999998,
+      "completion_latency_ms_max": 1.0985,
+      "prompt_tokens": 179,
+      "workers": [
+        {
+          "reuses": 5,
+          "tokens_reused": 125,
+          "snapshot_bytes": 0,
+          "warm_sessions": 1,
+          "warm_state_bytes": 3592
+        },
+        {
+          "reuses": 0,
+          "tokens_reused": 0,
+          "snapshot_bytes": 0,
+          "warm_sessions": 0,
+          "warm_state_bytes": 0
+        }
+      ],
+      "requests_per_worker": [
+        6,
+        0
+      ],
+      "directory": {
+        "entries": 1,
+        "preferred": 5,
+        "misses": 1,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 130
+      },
+      "outputs_checked": 6,
+      "request_sha256": "ef867a1bb66cc68ebe823361a8aa76b2b4e4a1ab0911b05e484ce9588b3ce17e",
+      "output_sha256": "50ad6720f7265355e3c64a353bafe7cb1c86b4d73fcb9322fcc00f05fd4c5541",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 2,
+      "prefix_words": 8,
+      "concurrency": 2,
+      "policy": "round_robin",
+      "request_count": 12,
+      "ttft_ms_p50": 0.7264579999999999,
+      "ttft_ms_max": 0.875416,
+      "queue_ms_p50": 0.00041600000000000003,
+      "queue_ms_max": 0.0006670000000000001,
+      "completion_latency_ms_p50": 0.853709,
+      "completion_latency_ms_max": 0.974375,
+      "prompt_tokens": 364,
+      "workers": [
+        {
+          "reuses": 5,
+          "tokens_reused": 125,
+          "snapshot_bytes": 0,
+          "warm_sessions": 1,
+          "warm_state_bytes": 3592
+        },
+        {
+          "reuses": 5,
+          "tokens_reused": 130,
+          "snapshot_bytes": 0,
+          "warm_sessions": 1,
+          "warm_state_bytes": 3664
+        }
+      ],
+      "requests_per_worker": [
+        6,
+        6
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 12,
+      "request_sha256": "7657a001daa411832135ada6b5d6c035ed3b241b4a65552e8591da0ac59ce6ce",
+      "output_sha256": "18ea291ff0fd284f1b426c8a95b9de3e791c7b46dd91a46f00943cc2fb15caf1",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 2,
+      "prefix_words": 8,
+      "concurrency": 2,
+      "policy": "load",
+      "request_count": 12,
+      "ttft_ms_p50": 0.987917,
+      "ttft_ms_max": 1.135416,
+      "queue_ms_p50": 0.000041,
+      "queue_ms_max": 0.000042,
+      "completion_latency_ms_p50": 1.103291,
+      "completion_latency_ms_max": 1.213916,
+      "prompt_tokens": 364,
+      "workers": [
+        {
+          "reuses": 5,
+          "tokens_reused": 125,
+          "snapshot_bytes": 0,
+          "warm_sessions": 1,
+          "warm_state_bytes": 3592
+        },
+        {
+          "reuses": 5,
+          "tokens_reused": 130,
+          "snapshot_bytes": 0,
+          "warm_sessions": 1,
+          "warm_state_bytes": 3664
+        }
+      ],
+      "requests_per_worker": [
+        6,
+        6
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 12,
+      "request_sha256": "7657a001daa411832135ada6b5d6c035ed3b241b4a65552e8591da0ac59ce6ce",
+      "output_sha256": "18ea291ff0fd284f1b426c8a95b9de3e791c7b46dd91a46f00943cc2fb15caf1",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 2,
+      "prefix_words": 8,
+      "concurrency": 2,
+      "policy": "session",
+      "request_count": 12,
+      "ttft_ms_p50": 0.812375,
+      "ttft_ms_max": 1.002917,
+      "queue_ms_p50": 0.000417,
+      "queue_ms_max": 0.00075,
+      "completion_latency_ms_p50": 0.926333,
+      "completion_latency_ms_max": 1.1150000000000002,
+      "prompt_tokens": 364,
+      "workers": [
+        {
+          "reuses": 5,
+          "tokens_reused": 125,
+          "snapshot_bytes": 0,
+          "warm_sessions": 1,
+          "warm_state_bytes": 3592
+        },
+        {
+          "reuses": 5,
+          "tokens_reused": 130,
+          "snapshot_bytes": 0,
+          "warm_sessions": 1,
+          "warm_state_bytes": 3664
+        }
+      ],
+      "requests_per_worker": [
+        6,
+        6
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 12,
+      "request_sha256": "7657a001daa411832135ada6b5d6c035ed3b241b4a65552e8591da0ac59ce6ce",
+      "output_sha256": "18ea291ff0fd284f1b426c8a95b9de3e791c7b46dd91a46f00943cc2fb15caf1",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 2,
+      "prefix_words": 8,
+      "concurrency": 2,
+      "policy": "affinity",
+      "request_count": 12,
+      "ttft_ms_p50": 0.964584,
+      "ttft_ms_max": 1.1524580000000002,
+      "queue_ms_p50": 0.000042,
+      "queue_ms_max": 0.000042,
+      "completion_latency_ms_p50": 1.0735000000000001,
+      "completion_latency_ms_max": 1.252667,
+      "prompt_tokens": 364,
+      "workers": [
+        {
+          "reuses": 5,
+          "tokens_reused": 130,
+          "snapshot_bytes": 0,
+          "warm_sessions": 1,
+          "warm_state_bytes": 3664
+        },
+        {
+          "reuses": 5,
+          "tokens_reused": 125,
+          "snapshot_bytes": 0,
+          "warm_sessions": 1,
+          "warm_state_bytes": 3592
+        }
+      ],
+      "requests_per_worker": [
+        6,
+        6
+      ],
+      "directory": {
+        "entries": 2,
+        "preferred": 10,
+        "misses": 2,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 261
+      },
+      "outputs_checked": 12,
+      "request_sha256": "7657a001daa411832135ada6b5d6c035ed3b241b4a65552e8591da0ac59ce6ce",
+      "output_sha256": "18ea291ff0fd284f1b426c8a95b9de3e791c7b46dd91a46f00943cc2fb15caf1",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 2,
+      "prefix_words": 8,
+      "concurrency": 4,
+      "policy": "round_robin",
+      "request_count": 24,
+      "ttft_ms_p50": 1.7271239999999999,
+      "ttft_ms_max": 3.060292,
+      "queue_ms_p50": 0.8566659999999999,
+      "queue_ms_max": 1.567959,
+      "completion_latency_ms_p50": 1.8333329999999999,
+      "completion_latency_ms_max": 3.1603339999999998,
+      "prompt_tokens": 752,
+      "workers": [
+        {
+          "reuses": 0,
+          "tokens_reused": 0,
+          "snapshot_bytes": 20160,
+          "warm_sessions": 1,
+          "warm_state_bytes": 3736
+        },
+        {
+          "reuses": 0,
+          "tokens_reused": 0,
+          "snapshot_bytes": 21824,
+          "warm_sessions": 1,
+          "warm_state_bytes": 3808
+        }
+      ],
+      "requests_per_worker": [
+        12,
+        12
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 24,
+      "request_sha256": "398a2056e936cda68bc5cfa46e414aaf7f617010cdf1d26dbe0043c047c989a9",
+      "output_sha256": "c20e2e405818307db3819747c36f0a2525027463bc0af412ba923c035b820f49",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 2,
+      "prefix_words": 8,
+      "concurrency": 4,
+      "policy": "load",
+      "request_count": 24,
+      "ttft_ms_p50": 1.7795,
+      "ttft_ms_max": 3.2866250000000004,
+      "queue_ms_p50": 0.000042,
+      "queue_ms_max": 1.000042,
+      "completion_latency_ms_p50": 1.9038329999999999,
+      "completion_latency_ms_max": 3.416459,
+      "prompt_tokens": 752,
+      "workers": [
+        {
+          "reuses": 11,
+          "tokens_reused": 22,
+          "snapshot_bytes": 0,
+          "warm_sessions": 1,
+          "warm_state_bytes": 3736
+        },
+        {
+          "reuses": 11,
+          "tokens_reused": 47,
+          "snapshot_bytes": 0,
+          "warm_sessions": 1,
+          "warm_state_bytes": 3808
+        }
+      ],
+      "requests_per_worker": [
+        12,
+        12
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 24,
+      "request_sha256": "398a2056e936cda68bc5cfa46e414aaf7f617010cdf1d26dbe0043c047c989a9",
+      "output_sha256": "c20e2e405818307db3819747c36f0a2525027463bc0af412ba923c035b820f49",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 2,
+      "prefix_words": 8,
+      "concurrency": 4,
+      "policy": "session",
+      "request_count": 24,
+      "ttft_ms_p50": 1.6687079999999999,
+      "ttft_ms_max": 3.190708,
+      "queue_ms_p50": 0.8340420000000001,
+      "queue_ms_max": 1.667958,
+      "completion_latency_ms_p50": 1.7761669999999998,
+      "completion_latency_ms_max": 3.299458,
+      "prompt_tokens": 752,
+      "workers": [
+        {
+          "reuses": 0,
+          "tokens_reused": 0,
+          "snapshot_bytes": 20160,
+          "warm_sessions": 1,
+          "warm_state_bytes": 3736
+        },
+        {
+          "reuses": 0,
+          "tokens_reused": 0,
+          "snapshot_bytes": 21824,
+          "warm_sessions": 1,
+          "warm_state_bytes": 3808
+        }
+      ],
+      "requests_per_worker": [
+        12,
+        12
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 24,
+      "request_sha256": "398a2056e936cda68bc5cfa46e414aaf7f617010cdf1d26dbe0043c047c989a9",
+      "output_sha256": "c20e2e405818307db3819747c36f0a2525027463bc0af412ba923c035b820f49",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 2,
+      "prefix_words": 8,
+      "concurrency": 4,
+      "policy": "affinity",
+      "request_count": 24,
+      "ttft_ms_p50": 1.9561250000000001,
+      "ttft_ms_max": 3.545083,
+      "queue_ms_p50": 0.000042,
+      "queue_ms_max": 1.000042,
+      "completion_latency_ms_p50": 2.0591670000000004,
+      "completion_latency_ms_max": 3.683958,
+      "prompt_tokens": 752,
+      "workers": [
+        {
+          "reuses": 0,
+          "tokens_reused": 0,
+          "snapshot_bytes": 20352,
+          "warm_sessions": 1,
+          "warm_state_bytes": 3808
+        },
+        {
+          "reuses": 4,
+          "tokens_reused": 112,
+          "snapshot_bytes": 13952,
+          "warm_sessions": 1,
+          "warm_state_bytes": 3736
+        }
+      ],
+      "requests_per_worker": [
+        12,
+        12
+      ],
+      "directory": {
+        "entries": 4,
+        "preferred": 13,
+        "misses": 5,
+        "spillovers": 6,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 1,
+        "cached_tokens": 524
+      },
+      "outputs_checked": 24,
+      "request_sha256": "398a2056e936cda68bc5cfa46e414aaf7f617010cdf1d26dbe0043c047c989a9",
+      "output_sha256": "c20e2e405818307db3819747c36f0a2525027463bc0af412ba923c035b820f49",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 2,
+      "prefix_words": 32,
+      "concurrency": 1,
+      "policy": "round_robin",
+      "request_count": 6,
+      "ttft_ms_p50": 1.0616670000000001,
+      "ttft_ms_max": 1.386293,
+      "queue_ms_p50": 0.000375,
+      "queue_ms_max": 0.0011250000000000001,
+      "completion_latency_ms_p50": 1.168917,
+      "completion_latency_ms_max": 1.4886249999999999,
+      "prompt_tokens": 323,
+      "workers": [
+        {
+          "reuses": 2,
+          "tokens_reused": 85,
+          "snapshot_bytes": 2304,
+          "warm_sessions": 1,
+          "warm_state_bytes": 4672
+        },
+        {
+          "reuses": 2,
+          "tokens_reused": 97,
+          "snapshot_bytes": 2304,
+          "warm_sessions": 1,
+          "warm_state_bytes": 5320
+        }
+      ],
+      "requests_per_worker": [
+        3,
+        3
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 6,
+      "request_sha256": "70c42c5e729b202b6ebe896034221b196139c485387cda6540c76701738ac51e",
+      "output_sha256": "fe144b2e26ce8bf181665f07c65996c8d65f86677ca5ff2eec03979abd593558",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 2,
+      "prefix_words": 32,
+      "concurrency": 1,
+      "policy": "load",
+      "request_count": 6,
+      "ttft_ms_p50": 1.3021260000000001,
+      "ttft_ms_max": 1.5723760000000002,
+      "queue_ms_p50": 0.000042,
+      "queue_ms_max": 0.000042,
+      "completion_latency_ms_p50": 1.4077499999999998,
+      "completion_latency_ms_max": 1.660709,
+      "prompt_tokens": 323,
+      "workers": [
+        {
+          "reuses": 2,
+          "tokens_reused": 85,
+          "snapshot_bytes": 2304,
+          "warm_sessions": 1,
+          "warm_state_bytes": 4672
+        },
+        {
+          "reuses": 2,
+          "tokens_reused": 97,
+          "snapshot_bytes": 2304,
+          "warm_sessions": 1,
+          "warm_state_bytes": 5320
+        }
+      ],
+      "requests_per_worker": [
+        3,
+        3
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 6,
+      "request_sha256": "70c42c5e729b202b6ebe896034221b196139c485387cda6540c76701738ac51e",
+      "output_sha256": "fe144b2e26ce8bf181665f07c65996c8d65f86677ca5ff2eec03979abd593558",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 2,
+      "prefix_words": 32,
+      "concurrency": 1,
+      "policy": "session",
+      "request_count": 6,
+      "ttft_ms_p50": 0.855417,
+      "ttft_ms_max": 1.251333,
+      "queue_ms_p50": 0.000458,
+      "queue_ms_max": 0.000542,
+      "completion_latency_ms_p50": 0.9532079999999999,
+      "completion_latency_ms_max": 1.3573330000000001,
+      "prompt_tokens": 323,
+      "workers": [
+        {
+          "reuses": 5,
+          "tokens_reused": 245,
+          "snapshot_bytes": 2304,
+          "warm_sessions": 1,
+          "warm_state_bytes": 5320
+        },
+        {
+          "reuses": 0,
+          "tokens_reused": 0,
+          "snapshot_bytes": 0,
+          "warm_sessions": 0,
+          "warm_state_bytes": 0
+        }
+      ],
+      "requests_per_worker": [
+        6,
+        0
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 6,
+      "request_sha256": "70c42c5e729b202b6ebe896034221b196139c485387cda6540c76701738ac51e",
+      "output_sha256": "fe144b2e26ce8bf181665f07c65996c8d65f86677ca5ff2eec03979abd593558",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 2,
+      "prefix_words": 32,
+      "concurrency": 1,
+      "policy": "affinity",
+      "request_count": 6,
+      "ttft_ms_p50": 1.101417,
+      "ttft_ms_max": 1.5368330000000001,
+      "queue_ms_p50": 0.000042,
+      "queue_ms_max": 0.000042,
+      "completion_latency_ms_p50": 1.193083,
+      "completion_latency_ms_max": 1.62675,
+      "prompt_tokens": 323,
+      "workers": [
+        {
+          "reuses": 5,
+          "tokens_reused": 245,
+          "snapshot_bytes": 2304,
+          "warm_sessions": 1,
+          "warm_state_bytes": 5320
+        },
+        {
+          "reuses": 0,
+          "tokens_reused": 0,
+          "snapshot_bytes": 0,
+          "warm_sessions": 0,
+          "warm_state_bytes": 0
+        }
+      ],
+      "requests_per_worker": [
+        6,
+        0
+      ],
+      "directory": {
+        "entries": 1,
+        "preferred": 5,
+        "misses": 1,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 166
+      },
+      "outputs_checked": 6,
+      "request_sha256": "70c42c5e729b202b6ebe896034221b196139c485387cda6540c76701738ac51e",
+      "output_sha256": "fe144b2e26ce8bf181665f07c65996c8d65f86677ca5ff2eec03979abd593558",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 2,
+      "prefix_words": 32,
+      "concurrency": 2,
+      "policy": "round_robin",
+      "request_count": 12,
+      "ttft_ms_p50": 0.936833,
+      "ttft_ms_max": 1.44225,
+      "queue_ms_p50": 0.000417,
+      "queue_ms_max": 0.00075,
+      "completion_latency_ms_p50": 1.086042,
+      "completion_latency_ms_max": 1.552333,
+      "prompt_tokens": 652,
+      "workers": [
+        {
+          "reuses": 5,
+          "tokens_reused": 245,
+          "snapshot_bytes": 2304,
+          "warm_sessions": 1,
+          "warm_state_bytes": 5320
+        },
+        {
+          "reuses": 5,
+          "tokens_reused": 250,
+          "snapshot_bytes": 2368,
+          "warm_sessions": 1,
+          "warm_state_bytes": 5392
+        }
+      ],
+      "requests_per_worker": [
+        6,
+        6
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 12,
+      "request_sha256": "348cbf3afc2fb147aba796facb7ffda836a2790c1e87acb67ccd85abed2477ae",
+      "output_sha256": "9addfe7c5af1498947e4cfc81d795aa8bcc9086fe0ec83d6a4f12d33075530d0",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 2,
+      "prefix_words": 32,
+      "concurrency": 2,
+      "policy": "load",
+      "request_count": 12,
+      "ttft_ms_p50": 1.1985,
+      "ttft_ms_max": 1.687875,
+      "queue_ms_p50": 0.000041,
+      "queue_ms_max": 0.000167,
+      "completion_latency_ms_p50": 1.3038329999999998,
+      "completion_latency_ms_max": 1.80075,
+      "prompt_tokens": 652,
+      "workers": [
+        {
+          "reuses": 5,
+          "tokens_reused": 245,
+          "snapshot_bytes": 2304,
+          "warm_sessions": 1,
+          "warm_state_bytes": 5320
+        },
+        {
+          "reuses": 5,
+          "tokens_reused": 250,
+          "snapshot_bytes": 2368,
+          "warm_sessions": 1,
+          "warm_state_bytes": 5392
+        }
+      ],
+      "requests_per_worker": [
+        6,
+        6
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 12,
+      "request_sha256": "348cbf3afc2fb147aba796facb7ffda836a2790c1e87acb67ccd85abed2477ae",
+      "output_sha256": "9addfe7c5af1498947e4cfc81d795aa8bcc9086fe0ec83d6a4f12d33075530d0",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 2,
+      "prefix_words": 32,
+      "concurrency": 2,
+      "policy": "session",
+      "request_count": 12,
+      "ttft_ms_p50": 0.880667,
+      "ttft_ms_max": 1.5908749999999998,
+      "queue_ms_p50": 0.000334,
+      "queue_ms_max": 0.001041,
+      "completion_latency_ms_p50": 1.007833,
+      "completion_latency_ms_max": 1.680167,
+      "prompt_tokens": 652,
+      "workers": [
+        {
+          "reuses": 5,
+          "tokens_reused": 245,
+          "snapshot_bytes": 2304,
+          "warm_sessions": 1,
+          "warm_state_bytes": 5320
+        },
+        {
+          "reuses": 5,
+          "tokens_reused": 250,
+          "snapshot_bytes": 2368,
+          "warm_sessions": 1,
+          "warm_state_bytes": 5392
+        }
+      ],
+      "requests_per_worker": [
+        6,
+        6
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 12,
+      "request_sha256": "348cbf3afc2fb147aba796facb7ffda836a2790c1e87acb67ccd85abed2477ae",
+      "output_sha256": "9addfe7c5af1498947e4cfc81d795aa8bcc9086fe0ec83d6a4f12d33075530d0",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 2,
+      "prefix_words": 32,
+      "concurrency": 2,
+      "policy": "affinity",
+      "request_count": 12,
+      "ttft_ms_p50": 1.235833,
+      "ttft_ms_max": 1.778416,
+      "queue_ms_p50": 0.000042,
+      "queue_ms_max": 0.000083,
+      "completion_latency_ms_p50": 1.333125,
+      "completion_latency_ms_max": 1.880792,
+      "prompt_tokens": 652,
+      "workers": [
+        {
+          "reuses": 5,
+          "tokens_reused": 245,
+          "snapshot_bytes": 2304,
+          "warm_sessions": 1,
+          "warm_state_bytes": 5320
+        },
+        {
+          "reuses": 5,
+          "tokens_reused": 250,
+          "snapshot_bytes": 2368,
+          "warm_sessions": 1,
+          "warm_state_bytes": 5392
+        }
+      ],
+      "requests_per_worker": [
+        6,
+        6
+      ],
+      "directory": {
+        "entries": 2,
+        "preferred": 10,
+        "misses": 2,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 333
+      },
+      "outputs_checked": 12,
+      "request_sha256": "348cbf3afc2fb147aba796facb7ffda836a2790c1e87acb67ccd85abed2477ae",
+      "output_sha256": "9addfe7c5af1498947e4cfc81d795aa8bcc9086fe0ec83d6a4f12d33075530d0",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 2,
+      "prefix_words": 32,
+      "concurrency": 4,
+      "policy": "round_robin",
+      "request_count": 24,
+      "ttft_ms_p50": 1.805167,
+      "ttft_ms_max": 5.560792,
+      "queue_ms_p50": 0.883875,
+      "queue_ms_max": 3.836792,
+      "completion_latency_ms_p50": 1.91975,
+      "completion_latency_ms_max": 5.691542,
+      "prompt_tokens": 1328,
+      "workers": [
+        {
+          "reuses": 10,
+          "tokens_reused": 499,
+          "snapshot_bytes": 7232,
+          "warm_sessions": 2,
+          "warm_state_bytes": 10784
+        },
+        {
+          "reuses": 10,
+          "tokens_reused": 509,
+          "snapshot_bytes": 7424,
+          "warm_sessions": 2,
+          "warm_state_bytes": 10928
+        }
+      ],
+      "requests_per_worker": [
+        12,
+        12
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 24,
+      "request_sha256": "8cbbb6153a1f97d9272587ccceda540693427fc2a60df9d0420ce4b0f750dd52",
+      "output_sha256": "2508c20bce7e0881ab63af06deabcd446224a271c929e44028921d715ec5b154",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 2,
+      "prefix_words": 32,
+      "concurrency": 4,
+      "policy": "load",
+      "request_count": 24,
+      "ttft_ms_p50": 2.163459,
+      "ttft_ms_max": 3.167291,
+      "queue_ms_p50": 0.000042,
+      "queue_ms_max": 1.000042,
+      "completion_latency_ms_p50": 2.2542920000000004,
+      "completion_latency_ms_max": 3.224667,
+      "prompt_tokens": 1328,
+      "workers": [
+        {
+          "reuses": 11,
+          "tokens_reused": 367,
+          "snapshot_bytes": 21120,
+          "warm_sessions": 2,
+          "warm_state_bytes": 10784
+        },
+        {
+          "reuses": 11,
+          "tokens_reused": 405,
+          "snapshot_bytes": 24704,
+          "warm_sessions": 2,
+          "warm_state_bytes": 10928
+        }
+      ],
+      "requests_per_worker": [
+        12,
+        12
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 24,
+      "request_sha256": "8cbbb6153a1f97d9272587ccceda540693427fc2a60df9d0420ce4b0f750dd52",
+      "output_sha256": "2508c20bce7e0881ab63af06deabcd446224a271c929e44028921d715ec5b154",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 2,
+      "prefix_words": 32,
+      "concurrency": 4,
+      "policy": "session",
+      "request_count": 24,
+      "ttft_ms_p50": 1.653416,
+      "ttft_ms_max": 3.172667,
+      "queue_ms_p50": 0.7895000000000001,
+      "queue_ms_max": 1.7524170000000001,
+      "completion_latency_ms_p50": 1.7695,
+      "completion_latency_ms_max": 3.272625,
+      "prompt_tokens": 1328,
+      "workers": [
+        {
+          "reuses": 10,
+          "tokens_reused": 499,
+          "snapshot_bytes": 7232,
+          "warm_sessions": 2,
+          "warm_state_bytes": 10784
+        },
+        {
+          "reuses": 10,
+          "tokens_reused": 509,
+          "snapshot_bytes": 7424,
+          "warm_sessions": 2,
+          "warm_state_bytes": 10928
+        }
+      ],
+      "requests_per_worker": [
+        12,
+        12
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 24,
+      "request_sha256": "8cbbb6153a1f97d9272587ccceda540693427fc2a60df9d0420ce4b0f750dd52",
+      "output_sha256": "2508c20bce7e0881ab63af06deabcd446224a271c929e44028921d715ec5b154",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 2,
+      "prefix_words": 32,
+      "concurrency": 4,
+      "policy": "affinity",
+      "request_count": 24,
+      "ttft_ms_p50": 2.231666,
+      "ttft_ms_max": 3.254416,
+      "queue_ms_p50": 0.000041,
+      "queue_ms_max": 1.000042,
+      "completion_latency_ms_p50": 2.321167,
+      "completion_latency_ms_max": 3.356042,
+      "prompt_tokens": 1328,
+      "workers": [
+        {
+          "reuses": 8,
+          "tokens_reused": 384,
+          "snapshot_bytes": 25600,
+          "warm_sessions": 2,
+          "warm_state_bytes": 10856
+        },
+        {
+          "reuses": 8,
+          "tokens_reused": 388,
+          "snapshot_bytes": 22208,
+          "warm_sessions": 2,
+          "warm_state_bytes": 10856
+        }
+      ],
+      "requests_per_worker": [
+        12,
+        12
+      ],
+      "directory": {
+        "entries": 4,
+        "preferred": 14,
+        "misses": 4,
+        "spillovers": 6,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 668
+      },
+      "outputs_checked": 24,
+      "request_sha256": "8cbbb6153a1f97d9272587ccceda540693427fc2a60df9d0420ce4b0f750dd52",
+      "output_sha256": "2508c20bce7e0881ab63af06deabcd446224a271c929e44028921d715ec5b154",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 2,
+      "prefix_words": 64,
+      "concurrency": 1,
+      "policy": "round_robin",
+      "request_count": 6,
+      "ttft_ms_p50": 1.263833,
+      "ttft_ms_max": 2.330375,
+      "queue_ms_p50": 0.000375,
+      "queue_ms_max": 0.0006659999999999999,
+      "completion_latency_ms_p50": 1.3783750000000001,
+      "completion_latency_ms_max": 2.445542,
+      "prompt_tokens": 515,
+      "workers": [
+        {
+          "reuses": 2,
+          "tokens_reused": 149,
+          "snapshot_bytes": 4352,
+          "warm_sessions": 1,
+          "warm_state_bytes": 6976
+        },
+        {
+          "reuses": 2,
+          "tokens_reused": 161,
+          "snapshot_bytes": 4352,
+          "warm_sessions": 1,
+          "warm_state_bytes": 7624
+        }
+      ],
+      "requests_per_worker": [
+        3,
+        3
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 6,
+      "request_sha256": "98b988d147220bf5d92f5c78ce5ed901f90b74d383f18cd1c736aaf4fb99cb57",
+      "output_sha256": "ef3e025de5b66cdac1a26c0c1ff298027fbd339982fcf031a4423424d299dad0",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 2,
+      "prefix_words": 64,
+      "concurrency": 1,
+      "policy": "load",
+      "request_count": 6,
+      "ttft_ms_p50": 1.5253750000000001,
+      "ttft_ms_max": 2.59625,
+      "queue_ms_p50": 0.000042,
+      "queue_ms_max": 0.000125,
+      "completion_latency_ms_p50": 1.6371669999999998,
+      "completion_latency_ms_max": 2.704708,
+      "prompt_tokens": 515,
+      "workers": [
+        {
+          "reuses": 2,
+          "tokens_reused": 149,
+          "snapshot_bytes": 4352,
+          "warm_sessions": 1,
+          "warm_state_bytes": 6976
+        },
+        {
+          "reuses": 2,
+          "tokens_reused": 161,
+          "snapshot_bytes": 4352,
+          "warm_sessions": 1,
+          "warm_state_bytes": 7624
+        }
+      ],
+      "requests_per_worker": [
+        3,
+        3
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 6,
+      "request_sha256": "98b988d147220bf5d92f5c78ce5ed901f90b74d383f18cd1c736aaf4fb99cb57",
+      "output_sha256": "ef3e025de5b66cdac1a26c0c1ff298027fbd339982fcf031a4423424d299dad0",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 2,
+      "prefix_words": 64,
+      "concurrency": 1,
+      "policy": "session",
+      "request_count": 6,
+      "ttft_ms_p50": 1.057917,
+      "ttft_ms_max": 2.209709,
+      "queue_ms_p50": 0.0007080000000000001,
+      "queue_ms_max": 0.001,
+      "completion_latency_ms_p50": 1.176083,
+      "completion_latency_ms_max": 2.3228329999999997,
+      "prompt_tokens": 515,
+      "workers": [
+        {
+          "reuses": 5,
+          "tokens_reused": 405,
+          "snapshot_bytes": 4352,
+          "warm_sessions": 1,
+          "warm_state_bytes": 7624
+        },
+        {
+          "reuses": 0,
+          "tokens_reused": 0,
+          "snapshot_bytes": 0,
+          "warm_sessions": 0,
+          "warm_state_bytes": 0
+        }
+      ],
+      "requests_per_worker": [
+        6,
+        0
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 6,
+      "request_sha256": "98b988d147220bf5d92f5c78ce5ed901f90b74d383f18cd1c736aaf4fb99cb57",
+      "output_sha256": "ef3e025de5b66cdac1a26c0c1ff298027fbd339982fcf031a4423424d299dad0",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 2,
+      "prefix_words": 64,
+      "concurrency": 1,
+      "policy": "affinity",
+      "request_count": 6,
+      "ttft_ms_p50": 1.220999,
+      "ttft_ms_max": 2.502749,
+      "queue_ms_p50": 0.000042,
+      "queue_ms_max": 0.000042,
+      "completion_latency_ms_p50": 1.324666,
+      "completion_latency_ms_max": 2.604958,
+      "prompt_tokens": 515,
+      "workers": [
+        {
+          "reuses": 5,
+          "tokens_reused": 405,
+          "snapshot_bytes": 4352,
+          "warm_sessions": 1,
+          "warm_state_bytes": 7624
+        },
+        {
+          "reuses": 0,
+          "tokens_reused": 0,
+          "snapshot_bytes": 0,
+          "warm_sessions": 0,
+          "warm_state_bytes": 0
+        }
+      ],
+      "requests_per_worker": [
+        6,
+        0
+      ],
+      "directory": {
+        "entries": 1,
+        "preferred": 5,
+        "misses": 1,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 214
+      },
+      "outputs_checked": 6,
+      "request_sha256": "98b988d147220bf5d92f5c78ce5ed901f90b74d383f18cd1c736aaf4fb99cb57",
+      "output_sha256": "ef3e025de5b66cdac1a26c0c1ff298027fbd339982fcf031a4423424d299dad0",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 2,
+      "prefix_words": 64,
+      "concurrency": 2,
+      "policy": "round_robin",
+      "request_count": 12,
+      "ttft_ms_p50": 1.066792,
+      "ttft_ms_max": 2.5598340000000004,
+      "queue_ms_p50": 0.00045900000000000004,
+      "queue_ms_max": 0.000791,
+      "completion_latency_ms_p50": 1.1905,
+      "completion_latency_ms_max": 2.661209,
+      "prompt_tokens": 1036,
+      "workers": [
+        {
+          "reuses": 5,
+          "tokens_reused": 405,
+          "snapshot_bytes": 4352,
+          "warm_sessions": 1,
+          "warm_state_bytes": 7624
+        },
+        {
+          "reuses": 5,
+          "tokens_reused": 410,
+          "snapshot_bytes": 4416,
+          "warm_sessions": 1,
+          "warm_state_bytes": 7696
+        }
+      ],
+      "requests_per_worker": [
+        6,
+        6
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 12,
+      "request_sha256": "3c3d6a63b17f5ad83df1cb0359295ef03b036346e6e37582db3301f93cb7bb93",
+      "output_sha256": "6f31307f1c6d18cc33689e61d75e43809748db548c009e6dbe31a722912b4db9",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 2,
+      "prefix_words": 64,
+      "concurrency": 2,
+      "policy": "load",
+      "request_count": 12,
+      "ttft_ms_p50": 1.2865420000000003,
+      "ttft_ms_max": 3.018834,
+      "queue_ms_p50": 0.000042,
+      "queue_ms_max": 0.000042,
+      "completion_latency_ms_p50": 1.43475,
+      "completion_latency_ms_max": 3.141375,
+      "prompt_tokens": 1036,
+      "workers": [
+        {
+          "reuses": 5,
+          "tokens_reused": 405,
+          "snapshot_bytes": 4352,
+          "warm_sessions": 1,
+          "warm_state_bytes": 7624
+        },
+        {
+          "reuses": 5,
+          "tokens_reused": 410,
+          "snapshot_bytes": 4416,
+          "warm_sessions": 1,
+          "warm_state_bytes": 7696
+        }
+      ],
+      "requests_per_worker": [
+        6,
+        6
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 12,
+      "request_sha256": "3c3d6a63b17f5ad83df1cb0359295ef03b036346e6e37582db3301f93cb7bb93",
+      "output_sha256": "6f31307f1c6d18cc33689e61d75e43809748db548c009e6dbe31a722912b4db9",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 2,
+      "prefix_words": 64,
+      "concurrency": 2,
+      "policy": "session",
+      "request_count": 12,
+      "ttft_ms_p50": 1.0565419999999999,
+      "ttft_ms_max": 2.596917,
+      "queue_ms_p50": 0.000458,
+      "queue_ms_max": 0.001083,
+      "completion_latency_ms_p50": 1.1724999999999999,
+      "completion_latency_ms_max": 2.707167,
+      "prompt_tokens": 1036,
+      "workers": [
+        {
+          "reuses": 5,
+          "tokens_reused": 405,
+          "snapshot_bytes": 4352,
+          "warm_sessions": 1,
+          "warm_state_bytes": 7624
+        },
+        {
+          "reuses": 5,
+          "tokens_reused": 410,
+          "snapshot_bytes": 4416,
+          "warm_sessions": 1,
+          "warm_state_bytes": 7696
+        }
+      ],
+      "requests_per_worker": [
+        6,
+        6
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 12,
+      "request_sha256": "3c3d6a63b17f5ad83df1cb0359295ef03b036346e6e37582db3301f93cb7bb93",
+      "output_sha256": "6f31307f1c6d18cc33689e61d75e43809748db548c009e6dbe31a722912b4db9",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 2,
+      "prefix_words": 64,
+      "concurrency": 2,
+      "policy": "affinity",
+      "request_count": 12,
+      "ttft_ms_p50": 1.352541,
+      "ttft_ms_max": 2.8197919999999996,
+      "queue_ms_p50": 0.000041,
+      "queue_ms_max": 0.000167,
+      "completion_latency_ms_p50": 1.550792,
+      "completion_latency_ms_max": 2.9395,
+      "prompt_tokens": 1036,
+      "workers": [
+        {
+          "reuses": 5,
+          "tokens_reused": 405,
+          "snapshot_bytes": 4352,
+          "warm_sessions": 1,
+          "warm_state_bytes": 7624
+        },
+        {
+          "reuses": 5,
+          "tokens_reused": 410,
+          "snapshot_bytes": 4416,
+          "warm_sessions": 1,
+          "warm_state_bytes": 7696
+        }
+      ],
+      "requests_per_worker": [
+        6,
+        6
+      ],
+      "directory": {
+        "entries": 2,
+        "preferred": 10,
+        "misses": 2,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 429
+      },
+      "outputs_checked": 12,
+      "request_sha256": "3c3d6a63b17f5ad83df1cb0359295ef03b036346e6e37582db3301f93cb7bb93",
+      "output_sha256": "6f31307f1c6d18cc33689e61d75e43809748db548c009e6dbe31a722912b4db9",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 2,
+      "prefix_words": 64,
+      "concurrency": 4,
+      "policy": "round_robin",
+      "request_count": 24,
+      "ttft_ms_p50": 1.899208,
+      "ttft_ms_max": 4.942792,
+      "queue_ms_p50": 0.938166,
+      "queue_ms_max": 2.671458,
+      "completion_latency_ms_p50": 2.0045,
+      "completion_latency_ms_max": 5.060708,
+      "prompt_tokens": 2096,
+      "workers": [
+        {
+          "reuses": 10,
+          "tokens_reused": 819,
+          "snapshot_bytes": 13376,
+          "warm_sessions": 2,
+          "warm_state_bytes": 15392
+        },
+        {
+          "reuses": 10,
+          "tokens_reused": 829,
+          "snapshot_bytes": 13568,
+          "warm_sessions": 2,
+          "warm_state_bytes": 15536
+        }
+      ],
+      "requests_per_worker": [
+        12,
+        12
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 24,
+      "request_sha256": "c0b587dbea8ba9e973cfb08a161e2081c44771dd878a533c62f127e725093d84",
+      "output_sha256": "77834a5720fe52f9c1cafdf1e162908e6fbe644f1c5afc3b70098b694ed51e9b",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 2,
+      "prefix_words": 64,
+      "concurrency": 4,
+      "policy": "load",
+      "request_count": 24,
+      "ttft_ms_p50": 2.721458,
+      "ttft_ms_max": 5.162291000000001,
+      "queue_ms_p50": 0.000042,
+      "queue_ms_max": 2.000042,
+      "completion_latency_ms_p50": 2.8447080000000002,
+      "completion_latency_ms_max": 5.2416670000000005,
+      "prompt_tokens": 2096,
+      "workers": [
+        {
+          "reuses": 11,
+          "tokens_reused": 636,
+          "snapshot_bytes": 29120,
+          "warm_sessions": 2,
+          "warm_state_bytes": 15464
+        },
+        {
+          "reuses": 11,
+          "tokens_reused": 706,
+          "snapshot_bytes": 30592,
+          "warm_sessions": 2,
+          "warm_state_bytes": 15464
+        }
+      ],
+      "requests_per_worker": [
+        12,
+        12
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 24,
+      "request_sha256": "c0b587dbea8ba9e973cfb08a161e2081c44771dd878a533c62f127e725093d84",
+      "output_sha256": "77834a5720fe52f9c1cafdf1e162908e6fbe644f1c5afc3b70098b694ed51e9b",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 2,
+      "prefix_words": 64,
+      "concurrency": 4,
+      "policy": "session",
+      "request_count": 24,
+      "ttft_ms_p50": 2.02475,
+      "ttft_ms_max": 4.949417,
+      "queue_ms_p50": 0.9953329999999999,
+      "queue_ms_max": 2.713334,
+      "completion_latency_ms_p50": 2.136459,
+      "completion_latency_ms_max": 5.052167,
+      "prompt_tokens": 2096,
+      "workers": [
+        {
+          "reuses": 10,
+          "tokens_reused": 819,
+          "snapshot_bytes": 13376,
+          "warm_sessions": 2,
+          "warm_state_bytes": 15392
+        },
+        {
+          "reuses": 10,
+          "tokens_reused": 829,
+          "snapshot_bytes": 13568,
+          "warm_sessions": 2,
+          "warm_state_bytes": 15536
+        }
+      ],
+      "requests_per_worker": [
+        12,
+        12
+      ],
+      "directory": {
+        "entries": 0,
+        "preferred": 0,
+        "misses": 0,
+        "spillovers": 0,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 0
+      },
+      "outputs_checked": 24,
+      "request_sha256": "c0b587dbea8ba9e973cfb08a161e2081c44771dd878a533c62f127e725093d84",
+      "output_sha256": "77834a5720fe52f9c1cafdf1e162908e6fbe644f1c5afc3b70098b694ed51e9b",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    },
+    {
+      "repeat": 2,
+      "prefix_words": 64,
+      "concurrency": 4,
+      "policy": "affinity",
+      "request_count": 24,
+      "ttft_ms_p50": 2.609875,
+      "ttft_ms_max": 5.364790999999999,
+      "queue_ms_p50": 0.000125,
+      "queue_ms_max": 2.000042,
+      "completion_latency_ms_p50": 2.709542,
+      "completion_latency_ms_max": 5.451917,
+      "prompt_tokens": 2096,
+      "workers": [
+        {
+          "reuses": 8,
+          "tokens_reused": 673,
+          "snapshot_bytes": 32320,
+          "warm_sessions": 2,
+          "warm_state_bytes": 15536
+        },
+        {
+          "reuses": 9,
+          "tokens_reused": 735,
+          "snapshot_bytes": 28544,
+          "warm_sessions": 2,
+          "warm_state_bytes": 15392
+        }
+      ],
+      "requests_per_worker": [
+        12,
+        12
+      ],
+      "directory": {
+        "entries": 4,
+        "preferred": 16,
+        "misses": 4,
+        "spillovers": 4,
+        "evicted": 0,
+        "expired": 0,
+        "stale": 0,
+        "residency_misses": 0,
+        "cached_tokens": 860
+      },
+      "outputs_checked": 24,
+      "request_sha256": "c0b587dbea8ba9e973cfb08a161e2081c44771dd878a533c62f127e725093d84",
+      "output_sha256": "77834a5720fe52f9c1cafdf1e162908e6fbe644f1c5afc3b70098b694ed51e9b",
+      "model_sha256": "73bcb95f56e3b44ae51591c03132668cebc7931033ab0f65420f576e71bc848f"
+    }
+  ]
+}

@@ -39,6 +39,8 @@ impl Snapshot for crate::model::ModelSnapshot {
 pub const MAX_ROOTS: usize = 4;
 
 struct Entry<S> {
+    scope: Option<crate::affinity::Scope>,
+    expires: Option<std::time::Instant>,
     tokens: Vec<u32>,
     snap: S,
     bytes: u64,
@@ -59,6 +61,8 @@ pub struct Hit<S> {
 /// Counters for the operator (see [`PrefixCache::stats`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PrefixCacheStats {
+    /// Scoped snapshots removed after their idle lease expired.
+    pub expired: u64,
     /// Requests that started from a cached entry.
     pub hits: u64,
     /// Prompt tokens those requests did not have to read.
@@ -110,15 +114,29 @@ impl<S: Snapshot> PrefixCache<S> {
     /// strict prefix, so at least one prompt token is left to produce the
     /// next-token logits).  `0` when none matches.
     pub fn best_len(&self, prompt: &[u32]) -> usize {
-        self.best(prompt)
+        self.best_len_scoped(prompt, None)
+    }
+
+    pub(crate) fn best_len_scoped(
+        &self,
+        prompt: &[u32],
+        scope: Option<crate::affinity::Scope>,
+    ) -> usize {
+        self.best(prompt, scope)
             .map_or(0, |i| self.entries[i].tokens.len())
     }
 
-    fn best(&self, prompt: &[u32]) -> Option<usize> {
+    fn best(&self, prompt: &[u32], scope: Option<crate::affinity::Scope>) -> Option<usize> {
         self.entries
             .iter()
             .enumerate()
-            .filter(|(_, e)| e.tokens.len() < prompt.len() && prompt.starts_with(&e.tokens))
+            .filter(|(_, e)| {
+                e.scope == scope
+                    && e.expires
+                        .is_none_or(|expires| expires > std::time::Instant::now())
+                    && e.tokens.len() < prompt.len()
+                    && prompt.starts_with(&e.tokens)
+            })
             .max_by_key(|(_, e)| (e.tokens.len(), e.last_used))
             .map(|(i, _)| i)
     }
@@ -132,13 +150,23 @@ impl<S: Snapshot> PrefixCache<S> {
         prompt: &[u32],
         duplicate: impl FnOnce(&S) -> Result<S, E>,
     ) -> Result<Option<Hit<S>>, E> {
-        let Some(i) = self.best(prompt) else {
+        self.take_scoped(prompt, None, duplicate)
+    }
+
+    pub(crate) fn take_scoped<E>(
+        &mut self,
+        prompt: &[u32],
+        scope: Option<crate::affinity::Scope>,
+        duplicate: impl FnOnce(&S) -> Result<S, E>,
+    ) -> Result<Option<Hit<S>>, E> {
+        let Some(i) = self.best(prompt, scope) else {
             return Ok(None);
         };
         let now = self.tick();
         let hit = if self.entries[i].root {
             let e = &mut self.entries[i];
             e.last_used = now;
+            e.expires = scope.map(|_| std::time::Instant::now() + crate::affinity::TTL);
             Hit {
                 snap: duplicate(&e.snap)?,
                 len: e.tokens.len(),
@@ -160,7 +188,21 @@ impl<S: Snapshot> PrefixCache<S> {
 
     /// Whether a root entry covers exactly `tokens`.
     pub fn has_root(&self, tokens: &[u32]) -> bool {
-        self.entries.iter().any(|e| e.root && e.tokens == tokens)
+        self.has_root_scoped(tokens, None)
+    }
+
+    pub(crate) fn has_root_scoped(
+        &self,
+        tokens: &[u32],
+        scope: Option<crate::affinity::Scope>,
+    ) -> bool {
+        self.entries.iter().any(|e| {
+            e.scope == scope
+                && e.root
+                && e.tokens == tokens
+                && e.expires
+                    .is_none_or(|expires| expires > std::time::Instant::now())
+        })
     }
 
     /// Whether an entry of `bytes` could be stored at all.
@@ -174,15 +216,30 @@ impl<S: Snapshot> PrefixCache<S> {
     /// root also pushes out the oldest root beyond [`MAX_ROOTS`].  Returns
     /// whether it was stored.
     pub fn insert(&mut self, tokens: Vec<u32>, snap: S, root: bool) -> bool {
+        self.insert_scoped(tokens, snap, root, None)
+    }
+
+    pub(crate) fn insert_scoped(
+        &mut self,
+        tokens: Vec<u32>,
+        snap: S,
+        root: bool,
+        scope: Option<crate::affinity::Scope>,
+    ) -> bool {
+        self.expire(std::time::Instant::now());
         let bytes = snap.bytes();
         if tokens.is_empty() || !self.fits(bytes) {
             return false;
         }
-        if let Some(i) = self.entries.iter().position(|e| e.tokens == tokens) {
+        if let Some(i) = self
+            .entries
+            .iter()
+            .position(|e| e.scope == scope && e.tokens == tokens)
+        {
             let old = self.entries.swap_remove(i);
             self.used -= old.bytes;
             // A conversation reaching a root's exact tokens keeps it a root.
-            return self.insert(tokens, snap, root || old.root);
+            return self.insert_scoped(tokens, snap, root || old.root, scope);
         }
         if root {
             while self.entries.iter().filter(|e| e.root).count() >= MAX_ROOTS {
@@ -197,6 +254,8 @@ impl<S: Snapshot> PrefixCache<S> {
         let now = self.tick();
         self.used += bytes;
         self.entries.push(Entry {
+            scope,
+            expires: scope.map(|_| std::time::Instant::now() + crate::affinity::TTL),
             tokens,
             snap,
             bytes,
@@ -234,6 +293,27 @@ impl<S: Snapshot> PrefixCache<S> {
     pub fn clear(&mut self) {
         self.entries.clear();
         self.used = 0;
+    }
+
+    fn expire(&mut self, now: std::time::Instant) {
+        self.entries.retain(|entry| {
+            if entry.expires.is_some_and(|expires| expires <= now) {
+                self.used -= entry.bytes;
+                self.stats.expired += 1;
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    pub(crate) fn visit_residency(&mut self, mut visit: impl FnMut(crate::affinity::Scope, usize)) {
+        self.expire(std::time::Instant::now());
+        for entry in &self.entries {
+            if let Some(scope) = entry.scope {
+                visit(scope, entry.tokens.len());
+            }
+        }
     }
 
     /// Counters and current occupancy.
@@ -275,6 +355,55 @@ mod tests {
 
     fn copy(s: &Fake) -> Result<Fake, ()> {
         Ok(Fake(s.0))
+    }
+
+    #[test]
+    fn expired_scoped_snapshots_are_not_advertised_or_reused() {
+        let mut cache = PrefixCache::new(30);
+        cache.insert_scoped(vec![1, 2], Fake(10), true, Some([1; 32]));
+        cache.insert(vec![1, 2], Fake(10), true);
+        cache.entries[0].expires =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+        assert_eq!(cache.best_len_scoped(&[1, 2, 3], Some([1; 32])), 0);
+        assert!(!cache.has_root_scoped(&[1, 2], Some([1; 32])));
+        cache.visit_residency(|_, _| panic!("expired scoped state must be absent"));
+        assert_eq!(cache.stats().expired, 1);
+        assert_eq!(cache.stats().entries, 1);
+        assert_eq!(cache.stats().bytes, 10);
+        assert_eq!(cache.best_len(&[1, 2, 3]), 2);
+    }
+
+    #[test]
+    fn scopes_isolate_roots_conversations_and_replacement_under_one_budget() {
+        let mut cache = PrefixCache::new(30);
+        let alice = Some([1; 32]);
+        let bob = Some([2; 32]);
+        assert!(cache.insert_scoped(vec![1, 2], Fake(10), true, alice));
+        assert_eq!(cache.best_len_scoped(&[1, 2, 3], bob), 0);
+        assert_eq!(cache.best_len(&[1, 2, 3]), 0);
+        assert!(!cache.has_root_scoped(&[1, 2], bob));
+        assert!(cache.insert_scoped(vec![1, 2], Fake(10), false, bob));
+        assert_eq!(cache.stats().entries, 2);
+        assert!(
+            !cache
+                .take_scoped(&[1, 2, 3], bob, copy)
+                .unwrap()
+                .unwrap()
+                .root
+        );
+        assert_eq!(cache.stats().entries, 1);
+        assert!(
+            cache
+                .take_scoped(&[1, 2, 3], alice, copy)
+                .unwrap()
+                .unwrap()
+                .root
+        );
+        for index in 0..100 {
+            cache.insert_scoped(vec![index], Fake(10), false, Some([index as u8; 32]));
+            assert!(cache.stats().bytes <= 30);
+        }
+        assert_eq!(cache.best_len_scoped(&[1, 2, 3], bob), 0);
     }
 
     #[test]

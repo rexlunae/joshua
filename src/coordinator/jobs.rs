@@ -139,7 +139,7 @@ impl Coordinator {
         };
         let waiting = Instant::now();
         let first = self
-            .acquire("/v1/embeddings", Some(model), &work, excluded)
+            .acquire("/v1/embeddings", Some(model), &work, excluded, None)
             .await
             .map_err(reject_response)?;
         let first_wait = waiting.elapsed();
@@ -323,7 +323,7 @@ impl Coordinator {
                 }
                 None => {
                     let slot = self
-                        .acquire("/v1/embeddings", Some(model), &work, &excluded)
+                        .acquire("/v1/embeddings", Some(model), &work, &excluded, None)
                         .await
                         .map_err(reject_response)?;
                     queue_wait += waiting.elapsed();
@@ -341,6 +341,8 @@ impl Coordinator {
                 return Err(owner_changed());
             }
             let log = RequestLog {
+                affinity_handle: None,
+                cache_scope: None,
                 owner: Some(owner.owner.clone()),
                 response_limit: owner.max_output_bytes.min(2 << 20),
                 request_id: job_id.to_string(),

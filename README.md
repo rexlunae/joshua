@@ -949,11 +949,21 @@ loader's plain-attention models (`qwen`, `qwen2moe`, `qwen2vl`, `qwen3`,
 Kimi-K2, GLM-5), and `deepseek4`/`deepseek41` (whose sliding-window ring and
 streaming compressors are rewound through the verification pass's
 checkpoint; for edited context reuse they keep the same kind of copy at
-prefill and turn boundaries).  On the rest — candle's stock loaders (private KV caches) and
-the recurrent DeltaNet/KDA hybrids (qwen3next, qwen3.5, qwen4exp, glm5next,
-kimi-linear, kimi-k3, whose state only clears) — the flag warns at load,
+prefill and turn boundaries). Native recurrent DeltaNet/KDA and Nemotron-H
+sessions support verification through per-pass checkpoints and replay of the
+accepted prefix. On architectures without all-position logits and safe rollback
+(including candle's stock loaders with private KV caches), the flag warns at load,
 `Engine::speculative_config()` reads back `None`, and decoding stays one
 token per pass.
+
+### Caller-supplied deterministic drafts (local API)
+
+`Engine::begin_draft_session` accepts token-ID proposals through a bounded,
+stateful local verifier with sequence/offset checks and latest-response replay.
+It is **not a remote worker or an HTTP API** and does not complete #160:
+authenticated encrypted transport, artifact identity negotiation, a bounded
+owned-session registry and remote-decode fallback remain unimplemented.
+See [the API contract and remaining remote validation gates](docs/external-draft-verification.md).
 
 ### Draft model
 
