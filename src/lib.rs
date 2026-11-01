@@ -66,6 +66,7 @@ pub mod raw_block;
 pub mod cuda_io;
 pub mod residency;
 pub mod route_trace;
+pub mod affinity;
 pub mod scan;
 pub mod cache_sim;
 pub mod npu;

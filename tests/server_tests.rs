@@ -45,6 +45,117 @@ fn get(uri: &str, bearer: Option<&str>) -> Request<Body> {
 }
 
 #[tokio::test]
+async fn internal_cache_scope_requires_authenticated_worker_access() {
+    for configured in [None, Some("alice, bob")] {
+        let state = tiny_state("server-internal-cache-scope", configured);
+        let engine = state.models.list()[0].engine.clone();
+        let app = create_router(state);
+        let mut observed_scopes = std::collections::HashSet::new();
+        for scope in ["coordinator-one", "coordinator-two"] {
+            for (credential, expected) in [
+                (None, StatusCode::UNAUTHORIZED),
+                (Some("invalid"), StatusCode::UNAUTHORIZED),
+                (Some("alice"), StatusCode::OK),
+                (Some("bob"), StatusCode::OK),
+            ] {
+                for key_header in [header::AUTHORIZATION.as_str(), "x-api-key"] {
+                    let mut request = Request::post("/v1/completions")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header("x-joshua-cache-scope", scope);
+                    if let Some(credential) = credential {
+                        request = request.header(
+                            key_header,
+                            if key_header == "x-api-key" {
+                                credential.to_string()
+                            } else {
+                                format!("Bearer {credential}")
+                            },
+                        );
+                    }
+                    let response = app
+                        .clone()
+                        .oneshot(
+                            request
+                                .body(Body::from(r#"{"prompt":"hello a b c","max_tokens":0}"#))
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        response.status(),
+                        if configured.is_none() {
+                            StatusCode::OK
+                        } else {
+                            expected
+                        }
+                    );
+                    if configured.is_some() && expected == StatusCode::OK {
+                        let report = engine.cache_residency(128);
+                        assert!(report.complete);
+                        observed_scopes.extend(report.entries.into_iter().map(|entry| entry.scope));
+                    }
+                }
+            }
+        }
+        if configured.is_some() {
+            assert_eq!(
+                observed_scopes.len(),
+                4,
+                "keys and internal scopes isolate; auth header forms share"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn unauthenticated_internal_scope_is_ignored_without_breaking_public_hints() {
+    let mut public_scopes = std::collections::HashSet::new();
+    for public_hint in [None, Some("public-conversation")] {
+        let state = tiny_state("server-ignore-internal-cache-scope", None);
+        let engine = state.models.list()[0].engine.clone();
+        let app = create_router(state);
+        let mut observed_scopes = std::collections::HashSet::new();
+        for (internal_scope, prompt) in [
+            (None, "hello a b c"),
+            (Some("spoofed-one"), "hello a b c world"),
+            (Some("spoofed-two"), "hello a b c world d"),
+        ] {
+            let mut request =
+                Request::post("/v1/completions").header(header::CONTENT_TYPE, "application/json");
+            if let Some(hint) = public_hint {
+                request = request.header("x-joshua-affinity", hint);
+            }
+            if let Some(scope) = internal_scope {
+                request = request.header("x-joshua-cache-scope", scope);
+            }
+            let response = app
+                .clone()
+                .oneshot(
+                    request
+                        .body(Body::from(
+                            serde_json::json!({"prompt": prompt, "max_tokens": 0}).to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let report = engine.cache_residency(128);
+            assert!(report.complete);
+            observed_scopes.extend(report.entries.into_iter().map(|entry| entry.scope));
+        }
+        assert_eq!(observed_scopes.len(), 1, "internal hints must be ignored");
+        assert!(engine.kv_reuse_count() > 0);
+        public_scopes.extend(observed_scopes);
+    }
+    assert_eq!(
+        public_scopes.len(),
+        2,
+        "public affinity semantics are preserved"
+    );
+}
+
+#[tokio::test]
 async fn v1_routes_require_the_configured_api_key() {
     let app = create_router(tiny_state("server-auth", Some("sekret")));
 

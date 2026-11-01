@@ -166,6 +166,41 @@ fn check_blocks(engine: &Engine, options: &GenerationOptions) {
 }
 
 #[test]
+fn draft_sessions_only_acquire_their_trusted_cache_namespace() {
+    let directory = common::model_dir("external-cache-namespace");
+    write_model(&directory.join("model.gguf"), "qwen3");
+    for (warm_scope, draft_scope, expected_reuses) in [
+        (Some([1; 32]), Some([1; 32]), 1),
+        (Some([1; 32]), Some([2; 32]), 0),
+        (None, Some([1; 32]), 0),
+    ] {
+        let engine = Engine::with_n_ctx(&directory, 64).unwrap();
+        let mut options = GenerationOptions {
+            cache_scope: warm_scope,
+            max_tokens: 0,
+            ..options()
+        };
+        engine.complete_raw("hello a b c", &options).unwrap();
+        options.cache_scope = draft_scope;
+        options.max_tokens = 4;
+        let prompt = engine.tokenize("hello a b c world", false).unwrap();
+        let mut session = engine
+            .begin_draft_session(&prompt, &options, 4, Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(engine.kv_reuse_count(), expected_reuses);
+        let response = session.verify(&request(&session, 0, &[])).unwrap();
+        let fresh = Engine::with_n_ctx(&directory, 64).unwrap();
+        let mut cold = fresh
+            .begin_draft_session(&prompt, &options, 4, Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(
+            response.tokens,
+            cold.verify(&request(&cold, 0, &[])).unwrap().tokens
+        );
+    }
+}
+
+#[test]
 fn tiny_architecture_blocks_match_plain_and_continue_after_every_rejection() {
     for &arch in ARCHITECTURES {
         let dir = common::model_dir(&format!("external-{arch}"));

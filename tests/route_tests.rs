@@ -64,6 +64,8 @@ enum Behavior {
 }
 
 struct Fake {
+    residency: Mutex<Option<joshua::affinity::CacheResidency>>,
+    epoch: Mutex<String>,
     name: String,
     model: String,
     max_concurrency: usize,
@@ -101,6 +103,14 @@ fn sse(data: &str) -> Bytes {
 async fn fake_info(State(f): State<Arc<Fake>>) -> Json<WorkerInfo> {
     Json(WorkerInfo {
         protocol_version: WORKER_PROTOCOL_VERSION,
+        cache_residency: f
+            .residency
+            .lock()
+            .unwrap()
+            .clone()
+            .map(|residency| [(f.model.clone(), residency)].into())
+            .unwrap_or_default(),
+        cache_epochs: [(f.model.clone(), f.epoch.lock().unwrap().clone())].into(),
         model: f.model.clone(),
         models: f.models.lock().unwrap().clone(),
         n_ctx: f.n_ctx.load(Ordering::SeqCst) as u32,
@@ -300,6 +310,8 @@ async fn spawn_fake_handle(
     behavior: Behavior,
 ) -> (Arc<Fake>, String, tokio::task::JoinHandle<()>) {
     let fake = Arc::new(Fake {
+        residency: Mutex::new(None),
+        epoch: Mutex::new(uuid::Uuid::new_v4().to_string()),
         name: name.to_string(),
         model: model.to_string(),
         max_concurrency,
@@ -429,6 +441,575 @@ async fn call(url: &str, method: &str, path: &str, body: &str) -> Reply {
 
 async fn chat(url: &str, body: Value) -> Reply {
     call(url, "POST", "/v1/chat/completions", &body.to_string()).await
+}
+
+async fn affinity_chat(url: &str, handle: &str, owner: &str) -> Reply {
+    affinity_request(
+        url,
+        Some(handle),
+        owner,
+        &json!({
+            "model": "alpha", "messages": [{"role": "user", "content": "hello"}], "max_tokens": 4
+        }),
+    )
+    .await
+}
+
+async fn affinity_request(url: &str, handle: Option<&str>, owner: &str, body: &Value) -> Reply {
+    timed_affinity_request(url, handle, owner, body).await.0
+}
+
+async fn timed_affinity_request(
+    url: &str,
+    handle: Option<&str>,
+    owner: &str,
+    body: &Value,
+) -> (Reply, f64, f64) {
+    let started = std::time::Instant::now();
+    let mut sender = open(url).await;
+    let mut req = request("POST", "/v1/chat/completions", &body.to_string());
+    if let Some(handle) = handle {
+        req.headers_mut()
+            .insert("x-joshua-affinity", handle.parse().unwrap());
+    }
+    req.headers_mut().insert(
+        header::AUTHORIZATION,
+        format!("Bearer {owner}").parse().unwrap(),
+    );
+    let response = sender.send_request(req).await.unwrap();
+    let status = response.status();
+    let headers = response.headers().clone();
+    let mut incoming = response.into_body();
+    let mut bytes = Vec::new();
+    let mut ttft = None;
+    while let Some(frame) = incoming.frame().await {
+        if let Ok(data) = frame.unwrap().into_data() {
+            bytes.extend_from_slice(&data);
+            if ttft.is_none()
+                && sse_data(&String::from_utf8_lossy(&bytes))
+                    .iter()
+                    .any(|data| {
+                        serde_json::from_str::<Value>(data)
+                            .ok()
+                            .is_some_and(|event| {
+                                ["content", "reasoning_content"].iter().any(|field| {
+                                    event["choices"][0]["delta"][field]
+                                        .as_str()
+                                        .is_some_and(|value| !value.is_empty())
+                                }) || !event["choices"][0]["finish_reason"].is_null()
+                            })
+                    })
+            {
+                ttft = Some(started.elapsed().as_secs_f64() * 1000.0);
+            }
+        }
+    }
+    let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+    (
+        Reply {
+            status,
+            headers,
+            body: Bytes::from(bytes),
+        },
+        ttft.unwrap_or(elapsed),
+        elapsed,
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_worker_affinity_reuses_only_its_owned_scope_and_matches_cold_output() {
+    let engine = Arc::new(tiny_engine("affinity-http"));
+    let worker = serve_app(joshua::server::create_router(Arc::new(
+        joshua::server::ServerState {
+            api_key: Some("affinity-worker-test-key".into()),
+            ..joshua::server::ServerState::new(engine.clone())
+        },
+    )))
+    .await;
+    let mut settings = config(&[&worker]);
+    settings.worker_api_key = Some("affinity-worker-test-key".into());
+    let (coordinator, router) = spawn_router(settings).await;
+    let mut body = json!({"model": engine.model_name(), "messages": [{"role": "user", "content": "hello a b c"}], "temperature": 0.0, "max_tokens": 0});
+    let first = affinity_request(&router, Some("new"), "alice", &body).await;
+    assert_eq!(first.status, StatusCode::OK);
+    let handle = first.header("x-joshua-affinity").unwrap();
+    body["max_tokens"] = json!(4);
+    body["messages"][0]["content"] = json!("hello a b c world");
+    let warm = affinity_request(&router, Some(handle), "alice", &body).await;
+    assert_eq!(warm.status, StatusCode::OK);
+    assert!(engine.kv_reuse_count() > 0);
+    assert!(engine.kv_tokens_reused() > 0);
+    let before = engine.kv_reuse_count();
+    let cold = affinity_request(&router, Some(handle), "bob", &body).await;
+    assert_eq!(cold.status, StatusCode::OK);
+    assert_eq!(comparable(&warm.json()), comparable(&cold.json()));
+    assert_eq!(engine.kv_reuse_count(), before);
+    assert_eq!(coordinator.affinity_stats().entries, 2);
+    body["stream"] = json!(true);
+    let streamed = affinity_request(&router, Some(handle), "alice", &body).await;
+    assert_eq!(streamed.status, StatusCode::OK);
+    assert_eq!(streamed.header("x-joshua-affinity"), Some(handle));
+    let fresh_stream = affinity_request(&router, Some("new"), "alice", &body).await;
+    assert_eq!(
+        stream_text(&streamed.text()),
+        stream_text(&fresh_stream.text())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "manual tiny-model CPU locality measurement"]
+async fn benchmark_tiny_affinity_policies() {
+    use sha2::{Digest, Sha256};
+    let mut rows = Vec::new();
+    for repeat in 0..3 {
+        for prefix_words in [8, 32, 64] {
+            for concurrency in [1, 2, 4] {
+                let mut policies = vec!["round_robin", "load", "session", "affinity"];
+                if repeat % 2 == 1 {
+                    policies.reverse();
+                }
+                for policy in policies {
+                    let mut engines = Vec::new();
+                    let mut workers = Vec::new();
+                    let mut services = Vec::new();
+                    let mut model_sha256 = String::new();
+                    for index in 0..2 {
+                        let directory = common::model_dir(&format!(
+                            "affinity-bench-{repeat}-{prefix_words}-{concurrency}-{policy}-{index}"
+                        ));
+                        common::write_tiny_qwen3_layers(&directory.join("model.gguf"), 1);
+                        model_sha256 = format!(
+                            "{:x}",
+                            Sha256::digest(std::fs::read(directory.join("model.gguf")).unwrap())
+                        );
+                        let options = joshua::EngineOptions::with_n_ctx(256)
+                            .backend(joshua::ComputeBackend::Cpu)
+                            .prefix_cache_bytes(1 << 20)
+                            .prefix_cache_root_min(16);
+                        let engine = Arc::new(
+                            joshua::Engine::with_options(&directory, options)
+                                .unwrap()
+                                .with_max_concurrency(1),
+                        );
+                        let (url, service) = serve_app_handle(joshua::server::create_router(
+                            Arc::new(joshua::server::ServerState {
+                                api_key: Some("affinity-worker-test-key".into()),
+                                ..joshua::server::ServerState::new(engine.clone())
+                            }),
+                        ))
+                        .await;
+                        engines.push(engine);
+                        workers.push(url);
+                        services.push(service);
+                    }
+                    let mut settings = config(&[&workers[0], &workers[1]]);
+                    settings.worker_api_key = Some("affinity-worker-test-key".into());
+                    let coordinator = Coordinator::new(settings).unwrap();
+                    let (router, service) =
+                        serve_app_handle(joshua::coordinator::create_router(coordinator.clone()))
+                            .await;
+                    services.push(service);
+                    let handles: Vec<_> = (0..concurrency)
+                        .map(|_| uuid::Uuid::new_v4().to_string())
+                        .collect();
+                    let baseline_directory = common::model_dir(&format!(
+                        "affinity-bench-baseline-{repeat}-{prefix_words}-{concurrency}-{policy}"
+                    ));
+                    common::write_tiny_qwen3_layers(&baseline_directory.join("model.gguf"), 1);
+                    let baseline_engine = Arc::new(
+                        joshua::Engine::with_options(
+                            &baseline_directory,
+                            joshua::EngineOptions::with_n_ctx(256)
+                                .backend(joshua::ComputeBackend::Cpu)
+                                .prefix_cache_bytes(0),
+                        )
+                        .unwrap(),
+                    );
+                    let (baseline_url, baseline_service) =
+                        serve_app_handle(joshua::server::create_router(Arc::new(
+                            joshua::server::ServerState::new(baseline_engine),
+                        )))
+                        .await;
+                    services.push(baseline_service);
+                    let mut histories: Vec<Vec<Value>> = (0..concurrency).map(|conversation| vec![json!({"role": "system", "content": format!("{} b {}", "a ".repeat(conversation + 1), "hello world ".repeat(prefix_words / 2))}), json!({"role": "user", "content": "hello"})]).collect();
+                    let mut durations = Vec::new();
+                    let mut ttfts = Vec::new();
+                    let queues: Vec<_> = (0..2)
+                        .map(|_| Arc::new(tokio::sync::Semaphore::new(1)))
+                        .collect();
+                    let mut queue_delays = Vec::new();
+                    let mut total_prompt = 0;
+                    let mut requests_per_worker = [0usize; 2];
+                    let mut request_hash = Sha256::new();
+                    let mut output_hash = Sha256::new();
+                    for turn in 0..6 {
+                        coordinator.refresh().await;
+                        let mut pending = Vec::new();
+                        for conversation in 0..concurrency {
+                            let worker = if policy == "round_robin" {
+                                (turn * concurrency + conversation) % 2
+                            } else {
+                                conversation % 2
+                            };
+                            let direct = matches!(policy, "round_robin" | "session");
+                            let target = if direct {
+                                workers[worker].clone()
+                            } else {
+                                router.clone()
+                            };
+                            let handle = handles[conversation].clone();
+                            let body = json!({"model": engines[0].model_name(), "messages": histories[conversation], "temperature": 0.0, "max_tokens": 1, "stream": true, "stream_options": {"include_usage": true}});
+                            let encoded = serde_json::to_vec(&body).unwrap();
+                            request_hash.update((encoded.len() as u64).to_le_bytes());
+                            request_hash.update(encoded);
+                            let queue = queues[worker].clone();
+                            pending.push(tokio::spawn(async move {
+                                let started = std::time::Instant::now();
+                                let permit = if direct {
+                                    Some(queue.acquire_owned().await.unwrap())
+                                } else {
+                                    None
+                                };
+                                let client_queue_ms = started.elapsed().as_secs_f64() * 1000.0;
+                                let (response, ttft, _) = timed_affinity_request(
+                                    &target,
+                                    (policy != "load").then_some(handle.as_str()),
+                                    if direct {
+                                        "affinity-worker-test-key"
+                                    } else {
+                                        "bench"
+                                    },
+                                    &body,
+                                )
+                                .await;
+                                let queue_ms = client_queue_ms
+                                    + response
+                                        .header("x-joshua-queue-ms")
+                                        .and_then(|value| value.parse::<f64>().ok())
+                                        .unwrap_or(0.0);
+                                drop(permit);
+                                assert_eq!(response.status, StatusCode::OK, "{}", response.text());
+                                (
+                                    conversation,
+                                    worker,
+                                    response.header(WORKER_HEADER).map(str::to_owned),
+                                    started.elapsed().as_secs_f64() * 1000.0,
+                                    response.text(),
+                                    body,
+                                    ttft + client_queue_ms,
+                                    queue_ms,
+                                )
+                            }));
+                        }
+                        let mut wave = Vec::new();
+                        for pending in pending {
+                            wave.push(pending.await.unwrap());
+                        }
+                        for (
+                            conversation,
+                            direct_worker,
+                            worker_header,
+                            elapsed,
+                            response,
+                            body,
+                            ttft,
+                            queue_ms,
+                        ) in wave
+                        {
+                            durations.push(elapsed);
+                            ttfts.push(ttft);
+                            queue_delays.push(queue_ms);
+                            let worker = worker_header
+                                .and_then(|worker| workers.iter().position(|url| url == &worker))
+                                .unwrap_or(direct_worker);
+                            requests_per_worker[worker] += 1;
+                            total_prompt += sse_data(&response)
+                                .into_iter()
+                                .filter_map(|event| serde_json::from_str::<Value>(&event).ok())
+                                .find_map(|event| event["usage"]["prompt_tokens"].as_u64())
+                                .unwrap();
+                            let baseline = affinity_request(
+                                &baseline_url,
+                                Some(&uuid::Uuid::new_v4().to_string()),
+                                "cold-baseline",
+                                &body,
+                            )
+                            .await;
+                            assert_eq!(baseline.status, StatusCode::OK);
+                            let output = stream_text(&response);
+                            assert_eq!(output, stream_text(&baseline.text()));
+                            let encoded = serde_json::to_vec(&output).unwrap();
+                            output_hash.update((encoded.len() as u64).to_le_bytes());
+                            output_hash.update(encoded);
+                            histories[conversation]
+                                .push(json!({"role": "assistant", "content": output.0}));
+                            histories[conversation].push(json!({"role": "user", "content": format!("world {}", "c ".repeat(turn + 1))}));
+                        }
+                    }
+                    durations.sort_by(f64::total_cmp);
+                    ttfts.sort_by(f64::total_cmp);
+                    queue_delays.sort_by(f64::total_cmp);
+                    let metrics: Vec<_> = engines.iter().map(|engine| json!({"reuses": engine.kv_reuse_count(), "tokens_reused": engine.kv_tokens_reused(), "snapshot_bytes": engine.prefix_cache_stats().bytes, "warm_sessions": engine.warm_cache_stats().0, "warm_state_bytes": engine.warm_cache_stats().1})).collect();
+                    rows.push(json!({"repeat": repeat, "prefix_words": prefix_words, "concurrency": concurrency, "policy": policy, "request_count": durations.len(), "ttft_ms_p50": ttfts[ttfts.len()/2], "ttft_ms_max": ttfts.last(), "queue_ms_p50": queue_delays[queue_delays.len()/2], "queue_ms_max": queue_delays.last(), "completion_latency_ms_p50": durations[durations.len()/2], "completion_latency_ms_max": durations.last(), "prompt_tokens": total_prompt, "workers": metrics, "requests_per_worker": requests_per_worker, "directory": coordinator.affinity_stats(), "outputs_checked": durations.len(), "request_sha256": format!("{:x}", request_hash.finalize()), "output_sha256": format!("{:x}", output_hash.finalize()), "model_sha256": model_sha256}));
+                    for service in services {
+                        service.abort();
+                        let _ = service.await;
+                    }
+                }
+            }
+        }
+    }
+    for row in &rows {
+        let peers: Vec<_> = rows
+            .iter()
+            .filter(|peer| {
+                peer["repeat"] == row["repeat"]
+                    && peer["prefix_words"] == row["prefix_words"]
+                    && peer["concurrency"] == row["concurrency"]
+            })
+            .collect();
+        for peer in peers {
+            assert_eq!(row["request_sha256"], peer["request_sha256"]);
+            assert_eq!(row["output_sha256"], peer["output_sha256"]);
+        }
+    }
+    let mut source_files = serde_json::Map::new();
+    for path in [
+        "Cargo.lock",
+        "src/affinity.rs",
+        "src/coordinator.rs",
+        "src/engine.rs",
+        "src/lib.rs",
+        "src/prefix_cache.rs",
+        "src/server.rs",
+        "src/types.rs",
+        "tests/affinity_tests.rs",
+        "tests/npu_tests.rs",
+        "tests/route_tests.rs",
+        "tests/common/mod.rs",
+    ] {
+        let bytes =
+            std::fs::read(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(path)).unwrap();
+        source_files.insert(path.into(), json!(format!("{:x}", Sha256::digest(bytes))));
+    }
+    let report = json!({"backend": "cpu", "host_arch": std::env::consts::ARCH, "host_os": std::env::consts::OS, "profile": "debug", "model": "synthetic one-layer Qwen3 F32 GGUF", "context": 256, "max_tokens": 1, "turns": 6, "workers": 2, "slots_per_worker": 1, "prefix_cache_bytes_per_worker": 1 << 20, "source_files_sha256": source_files, "rows": rows});
+    let output = std::env::temp_dir().join("joshua-156-tiny-affinity.json");
+    std::fs::write(&output, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+    eprintln!("affinity measurements: {}", output.display());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn affinity_pins_spills_and_old_completions_cannot_restore_an_old_owner() {
+    let (first, first_url) = spawn_fake("first", "alpha", 1, Behavior::Echo).await;
+    let (second, second_url) = spawn_fake("second", "alpha", 1, Behavior::Echo).await;
+    let (coordinator, router) = spawn_router(config(&[&first_url, &second_url])).await;
+    let initial = affinity_chat(&router, "new", "alice").await;
+    assert_eq!(initial.status, StatusCode::OK);
+    let handle = initial.header("x-joshua-affinity").unwrap().to_string();
+    let owner = initial.header(WORKER_HEADER).unwrap().to_string();
+    for _ in 0..4 {
+        assert_eq!(
+            affinity_chat(&router, &handle, "alice")
+                .await
+                .header(WORKER_HEADER),
+            Some(owner.as_str())
+        );
+    }
+    let busy = if owner == first_url { &first } else { &second };
+    *busy.behavior.lock().unwrap() = Behavior::Gate;
+    let pending = tokio::spawn({
+        let router = router.clone();
+        let handle = handle.clone();
+        async move { affinity_chat(&router, &handle, "alice").await }
+    });
+    eventually("affinity owner busy", || {
+        busy.active.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    let spill = affinity_chat(&router, &handle, "alice").await;
+    let next_owner = spill.header(WORKER_HEADER).unwrap().to_string();
+    assert_ne!(next_owner, owner);
+    busy.release.notify_one();
+    assert_eq!(pending.await.unwrap().status, StatusCode::OK);
+    *busy.behavior.lock().unwrap() = Behavior::Echo;
+    assert_eq!(
+        affinity_chat(&router, &handle, "alice")
+            .await
+            .header(WORKER_HEADER),
+        Some(next_owner.as_str())
+    );
+    assert!(coordinator.affinity_stats().spillovers >= 1);
+    assert_eq!(coordinator.affinity_stats().entries, 1);
+    affinity_chat(&router, &handle, "bob").await;
+    assert_eq!(coordinator.affinity_stats().entries, 2);
+    let restarted = if next_owner == first_url {
+        &first
+    } else {
+        &second
+    };
+    *restarted.epoch.lock().unwrap() = uuid::Uuid::new_v4().to_string();
+    coordinator.refresh().await;
+    assert_eq!(
+        affinity_chat(&router, &handle, "alice").await.status,
+        StatusCode::OK
+    );
+    assert_eq!(coordinator.affinity_stats().stale, 1);
+    assert_eq!(
+        affinity_chat(&router, "not-a-handle", "alice").await.status,
+        StatusCode::BAD_REQUEST
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn affinity_auth_and_admission_failover_preserve_the_handle() {
+    let (first, first_url) = spawn_fake("first", "alpha", 1, Behavior::Echo).await;
+    let (second, second_url) = spawn_fake("second", "alpha", 1, Behavior::Echo).await;
+    let mut cfg = config(&[&first_url, &second_url]);
+    cfg.api_key = Some("alice".into());
+    let (coordinator, router) = spawn_router(cfg).await;
+    assert_eq!(
+        affinity_chat(&router, "new", "bob").await.status,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(coordinator.affinity_stats().entries, 0);
+    let initial = affinity_chat(&router, "new", "alice").await;
+    let handle = initial.header("x-joshua-affinity").unwrap();
+    let previous = initial.header(WORKER_HEADER).unwrap();
+    let rejected = if previous == first_url {
+        &first
+    } else {
+        &second
+    };
+    *rejected.behavior.lock().unwrap() = Behavior::Reject503;
+    let retried = affinity_chat(&router, handle, "alice").await;
+    assert_eq!(retried.status, StatusCode::OK);
+    assert_eq!(retried.header("x-joshua-affinity"), Some(handle));
+    assert_ne!(retried.header(WORKER_HEADER), Some(previous));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn affinity_residency_feedback_is_bounded_and_older_probes_do_not_erase_new_leases() {
+    let (worker, url) = spawn_fake("first", "alpha", 1, Behavior::Echo).await;
+    *worker.residency.lock().unwrap() = Some(joshua::affinity::CacheResidency {
+        entries: Vec::new(),
+        complete: true,
+    });
+    let (coordinator, router) = spawn_router(config(&[&url])).await;
+    let initial = affinity_chat(&router, "new", "alice").await;
+    let handle = initial.header("x-joshua-affinity").unwrap();
+    assert_eq!(
+        affinity_chat(&router, handle, "alice").await.status,
+        StatusCode::OK
+    );
+    assert_eq!(coordinator.affinity_stats().residency_misses, 0);
+    coordinator.refresh().await;
+    assert_eq!(
+        affinity_chat(&router, handle, "alice").await.status,
+        StatusCode::OK
+    );
+    assert_eq!(coordinator.affinity_stats().residency_misses, 1);
+    worker.residency.lock().unwrap().as_mut().unwrap().complete = false;
+    coordinator.refresh().await;
+    assert_eq!(
+        affinity_chat(&router, handle, "alice").await.status,
+        StatusCode::OK
+    );
+    assert_eq!(coordinator.affinity_stats().residency_misses, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn affinity_worker_connection_loss_reconstructs_on_another_worker() {
+    let (_, first_url, first_task) = spawn_fake_handle("first", "alpha", 1, Behavior::Echo).await;
+    let (_, second_url, second_task) =
+        spawn_fake_handle("second", "alpha", 1, Behavior::Echo).await;
+    let (_, router) = spawn_router(config(&[&first_url, &second_url])).await;
+    let initial = affinity_chat(&router, "new", "alice").await;
+    let handle = initial.header("x-joshua-affinity").unwrap();
+    let previous = initial.header(WORKER_HEADER).unwrap();
+    if previous == first_url {
+        first_task.abort();
+    } else {
+        second_task.abort();
+    }
+    tokio::task::yield_now().await;
+    let next = affinity_chat(&router, handle, "alice").await;
+    assert_eq!(next.status, StatusCode::OK);
+    assert_ne!(next.header(WORKER_HEADER), Some(previous));
+    assert_eq!(next.header("x-joshua-affinity"), Some(handle));
+    first_task.abort();
+    second_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_worker_eviction_feedback_invalidates_affinity_and_recomputes() {
+    let directory = common::model_dir("affinity-real-eviction");
+    common::write_tiny_qwen3_layers(&directory.join("model.gguf"), 1);
+    let engine = Arc::new(
+        joshua::Engine::with_options(
+            &directory,
+            joshua::EngineOptions::with_n_ctx(128).prefix_cache_bytes(0),
+        )
+        .unwrap(),
+    );
+    let worker = serve_app(joshua::server::create_router(Arc::new(
+        joshua::server::ServerState {
+            api_key: Some("affinity-worker-test-key".into()),
+            ..joshua::server::ServerState::new(engine.clone())
+        },
+    )))
+    .await;
+    let mut settings = config(&[&worker]);
+    settings.worker_api_key = Some("affinity-worker-test-key".into());
+    let (coordinator, router) = spawn_router(settings).await;
+    let mut body = json!({"model": engine.model_name(), "messages": [{"role": "user", "content": "hello a b c"}], "temperature": 0.0, "max_tokens": 0});
+    let initial = affinity_request(&router, Some("new"), "alice", &body).await;
+    assert_eq!(initial.status, StatusCode::OK);
+    let handle = initial.header("x-joshua-affinity").unwrap();
+    for _ in 0..8 {
+        assert_eq!(
+            affinity_request(&router, Some("new"), "alice", &body)
+                .await
+                .status,
+            StatusCode::OK
+        );
+    }
+    assert!(engine.warm_cache_stats().0 <= 4);
+    assert_eq!(engine.prefix_cache_stats().bytes, 0);
+    coordinator.refresh().await;
+    body["messages"][0]["content"] = json!("hello a b c world");
+    body["max_tokens"] = json!(4);
+    let before = engine.kv_reuse_count();
+    let recomputed = affinity_request(&router, Some(handle), "alice", &body).await;
+    assert_eq!(recomputed.status, StatusCode::OK);
+    assert_eq!(coordinator.affinity_stats().residency_misses, 1);
+    assert_eq!(engine.kv_reuse_count(), before);
+    let cold = affinity_request(&router, Some("new"), "alice", &body).await;
+    assert_eq!(comparable(&recomputed.json()), comparable(&cold.json()));
+}
+
+#[tokio::test]
+async fn affinity_handles_are_scoped_to_explicit_model_and_context() {
+    let (_, alpha) = spawn_fake("alpha", "alpha", 1, Behavior::Echo).await;
+    let (_, beta) = spawn_fake("beta", "beta", 1, Behavior::Echo).await;
+    let (coordinator, router) = spawn_router(config(&[&alpha, &beta])).await;
+    let mut body = json!({"model": "alpha", "messages": [{"role": "user", "content": "hello"}]});
+    let initial = affinity_request(&router, Some("new"), "alice", &body).await;
+    let handle = initial.header("x-joshua-affinity").unwrap();
+    body["model"] = json!("beta");
+    assert_eq!(
+        affinity_request(&router, Some(handle), "alice", &body)
+            .await
+            .header(WORKER_HEADER),
+        Some(beta.as_str())
+    );
+    body["context_window"] = json!(64);
+    assert_eq!(
+        affinity_request(&router, Some(handle), "alice", &body)
+            .await
+            .status,
+        StatusCode::OK
+    );
+    assert_eq!(coordinator.affinity_stats().entries, 3);
 }
 
 /// Poll `cond` for up to five seconds.
@@ -1245,6 +1826,8 @@ async fn spawn_two_model_worker() -> (Arc<(AtomicUsize, Notify)>, String) {
     let info = || async {
         Json(WorkerInfo {
             protocol_version: WORKER_PROTOCOL_VERSION,
+            cache_residency: Default::default(),
+            cache_epochs: Default::default(),
             model: "alpha".to_string(),
             models: vec![
                 ModelSlots {

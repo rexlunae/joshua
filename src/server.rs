@@ -40,7 +40,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use axum::{
     extract::{Request, State},
-    http::{header, HeaderValue, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{
         sse::{Event, Sse},
@@ -819,9 +819,10 @@ async fn count_requests(
 
 /// Reject `/v1` requests that lack the configured bearer API key.
 ///
-/// A no-op when no key is configured.  Comparison is constant-time so the
-/// key can't be recovered byte-by-byte through response timing.
-async fn require_api_key(State(state): State<AppState>, req: Request, next: Next) -> Response {
+/// Without a configured key, accept public requests but discard internal cache
+/// scopes. Comparison is constant-time so the key can't be recovered byte-by-byte
+/// through response timing.
+async fn require_api_key(State(state): State<AppState>, mut req: Request, next: Next) -> Response {
     if let Some(expected) = &state.api_key {
         let provided = req
             .headers()
@@ -862,6 +863,8 @@ async fn require_api_key(State(state): State<AppState>, req: Request, next: Next
             );
             return (StatusCode::UNAUTHORIZED, Json(body)).into_response();
         }
+    } else {
+        req.headers_mut().remove(crate::affinity::CACHE_SCOPE_HEADER);
     }
     next.run(req).await
 }
@@ -980,7 +983,32 @@ async fn server_status(State(state): State<AppState>) -> Json<serde_json::Value>
 
 /// `GET /metrics` — JSON counters.
 async fn metrics_json(State(state): State<AppState>) -> Json<serde_json::Value> {
-    Json(state.metrics.snapshot())
+    let mut metrics = state.metrics.snapshot();
+    metrics["prefix_cache"] = serde_json::Value::Array(
+        state
+            .models
+            .list()
+            .iter()
+            .map(|model| {
+                let cache = model.engine.prefix_cache_stats();
+                let (warm_sessions, warm_state_bytes) = model.engine.warm_cache_stats();
+                json!({
+                    "model": model.id,
+                    "reuses": model.engine.kv_reuse_count(),
+                    "rewinds": model.engine.kv_edit_reuse_count(),
+                    "tokens_reused": model.engine.kv_tokens_reused(),
+                    "snapshot_entries": cache.entries,
+                    "snapshot_bytes": cache.bytes,
+                    "snapshot_budget": cache.budget,
+                    "snapshot_evictions": cache.evicted,
+                    "snapshot_expirations": cache.expired,
+                    "warm_sessions": warm_sessions,
+                    "warm_state_bytes": warm_state_bytes,
+                })
+            })
+            .collect(),
+    );
+    Json(metrics)
 }
 
 /// `GET /metrics/prometheus` — Prometheus text exposition format.
@@ -1159,6 +1187,19 @@ async fn worker_info(State(state): State<AppState>) -> Result<Json<WorkerInfo>, 
     let engines = || models.iter().map(|m| &m.engine);
     Ok(Json(WorkerInfo {
         protocol_version: WORKER_PROTOCOL_VERSION,
+        cache_epochs: models
+            .iter()
+            .map(|model| (model.id.clone(), model.engine.cache_epoch().to_owned()))
+            .collect(),
+        cache_residency: models
+            .iter()
+            .map(|model| {
+                (
+                    model.id.clone(),
+                    model.engine.cache_residency(128 / models.len().max(1)),
+                )
+            })
+            .collect(),
         model: first.id.clone(),
         models: match models.len() {
             1 => Vec::new(),
@@ -1253,11 +1294,16 @@ async fn list_models(State(state): State<AppState>) -> Json<ModelListResponse> {
 /// `POST /v1/chat/completions` — OpenAI chat completions.
 async fn chat_completions(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Result<Response, ApiError> {
     let (model, engine) = state.models.resolve(&req.model)?;
     let stream = req.stream.unwrap_or(false);
-    let options = req.to_generation_options().map_err(ApiError::bad_request)?;
+    let mut options = req.to_generation_options().map_err(ApiError::bad_request)?;
+    options.cache_scope = Some(crate::affinity::cache_scope(
+        &headers,
+        options.context_window,
+    ));
     let messages = req.messages.clone();
     let tools = req.offered_tools();
 
@@ -1773,11 +1819,16 @@ async fn messages_count_tokens(
 
 async fn messages(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<MessagesRequest>,
 ) -> Result<Response, ApiError> {
     let (resolved_model, engine) = state.models.resolve(&req.model)?;
-    let (messages, tools, options) =
+    let (messages, tools, mut options) =
         anthropic::to_chat_request(&req).map_err(ApiError::bad_request)?;
+    options.cache_scope = Some(crate::affinity::cache_scope(
+        &headers,
+        options.context_window,
+    ));
     let tools_disabled = matches!(
         req.tool_choice
             .as_ref()
@@ -2075,6 +2126,7 @@ fn stream_messages(
 /// `POST /v1/completions` — legacy (non-chat) text completion.
 async fn completions(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let (model, engine) = state
@@ -2087,6 +2139,7 @@ async fn completions(
         .to_string();
 
     let options = GenerationOptions {
+        cache_scope: Some(crate::affinity::cache_scope(&headers, None)),
         max_tokens: body
             .get("max_tokens")
             .and_then(|v| v.as_u64())
