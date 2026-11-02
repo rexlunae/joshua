@@ -6961,7 +6961,7 @@ fn squeeze_batch_logits(logits: &Tensor) -> Result<Vec<f32>> {
         support: Vec<u32>,
         /// Always take the dense path: the reference the sparse one must match.
         #[cfg(test)]
-        dense_only: bool,
+        force_dense_sampling: bool,
     }
 
     enum SamplingKind {
@@ -7099,7 +7099,7 @@ fn squeeze_batch_logits(logits: &Tensor) -> Result<Vec<f32>> {
             let k = opts.top_k as usize;
             let sparse = mask.is_none() && k > 0 && k < logits.len() && k <= SPARSE_TOP_K_MAX;
             #[cfg(test)]
-            let sparse = sparse && !self.dense_only;
+            let sparse = sparse && !self.force_dense_sampling;
             if sparse
                 && fill_top_k(
                     TopKBuffers {
@@ -7206,7 +7206,10 @@ struct TopKBuffers<'a> {
 ///
 /// Returns `false`, leaving `probs` unspecified, when the dense path must
 /// decide instead: a non-finite probability, a tie at the cut, or nothing
-/// left after the filters (the dense path's greedy fallback).
+/// left after the filters (the dense path's greedy fallback).  That token
+/// then pays for the exponential pass twice, which is small next to the
+/// full sort the dense path does on a tie.  Real f32 logits rarely tie at
+/// the cut; coarsely quantized ones (f16, bf16) can.
 fn fill_top_k(
     bufs: TopKBuffers<'_>,
     logits: &[f32],
@@ -7782,12 +7785,12 @@ mod tests {
         // Both reused across sizes and options, as in a session.
         let mut sparse = SamplingWorkspace::default();
         let mut dense = SamplingWorkspace {
-            dense_only: true,
+            force_dense_sampling: true,
             ..Default::default()
         };
         let (mut draws, mut sparse_draws) = (0, 0);
         for round in 0..600 {
-            let vocab = [151_936, 1_000, 64, 50][round % 4];
+            let vocab: i32 = [151_936, 1_000, 64, 50][round % 4];
             // Smooth, coarsely quantized (exact ties at the cut), one
             // dominant token, flat, and nearly flat logits.
             let shape = round % 5;
@@ -7801,8 +7804,7 @@ mod tests {
                     _ => rng.gen_range(-1e-3f32..1e-3),
                 })
                 .collect();
-            let v = vocab as i32;
-            let top_k = [0, 1, 2, 5, 40, 41, 100, 1024, v - 1, v, -1][rng.gen_range(0..11)];
+            let top_k = [0, 1, 2, 5, 40, 41, 100, 1024, vocab - 1, vocab, -1][rng.gen_range(0..11)];
             let opts = GenerationOptions {
                 // 1e-40 makes `1 / temperature` infinite: non-finite
                 // probabilities.
@@ -7885,6 +7887,108 @@ mod tests {
         ));
     }
 
+    /// Sampled tokens and survivor counts recorded from the sampler before
+    /// the sparse path (f5309e4), when the top-p cut and the draw were still
+    /// inline.  The parity test above checks the sparse path against the
+    /// dense one, but both now share `cut_nucleus` and `sample_entries`, so a
+    /// change to either would move both sides together; this pins them to
+    /// the old results.  It records tokens and counts rather than
+    /// probability bits, whose last place can differ between platforms'
+    /// `exp`.
+    #[test]
+    fn sampling_matches_tokens_recorded_before_the_sparse_path() {
+        // SplitMix64 rather than `rand`, so the logits cannot change with a
+        // dependency update.  Each value is a 24-bit fraction, exact in f32.
+        let mut state = 0x5eed_u64;
+        let mut unit = || {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            ((z ^ (z >> 31)) >> 40) as f32 / (1u32 << 24) as f32
+        };
+        // About 60 head tokens in [5, 20) above a [-10, 5) tail, so each
+        // filter cuts at a different place.
+        let logits: Vec<f32> = (0..151_936)
+            .map(|_| {
+                let head = unit() < 0.0004;
+                let u = unit();
+                if head {
+                    5.0 + 15.0 * u
+                } else {
+                    -10.0 + 15.0 * u
+                }
+            })
+            .collect();
+        // Every fourth and every sixth head token, so every twelfth twice.
+        let head: Vec<u32> = (0..logits.len() as u32)
+            .filter(|&i| logits[i as usize] >= 5.0)
+            .collect();
+        let recent: Vec<u32> = head
+            .iter()
+            .step_by(4)
+            .chain(head.iter().step_by(6))
+            .copied()
+            .collect();
+        // (temperature, top_k, top_p, min_p, repetition, presence, frequency)
+        let cases = [
+            // Sparse: the defaults, top-k alone, k = 1, k up to the cap, and
+            // the penalties.
+            (0.7, 40, 0.9, 0.05, 1.1, 0.0, 0.0),
+            (1.0, 40, 1.0, 0.0, 1.0, 0.0, 0.0),
+            (1.0, 1, 1.0, 0.0, 1.0, 0.0, 0.0),
+            (1.3, 1000, 0.95, 0.0, 1.0, 0.0, 0.0),
+            (1.3, 1024, 0.999, 0.0, 1.0, 0.0, 0.0),
+            (0.8, 40, 0.9, 0.05, 1.3, 0.5, 0.25),
+            // Dense: no top-k, k past the cap, and k = -1.
+            (1.5, 0, 0.9, 0.0, 1.0, 0.0, 0.0),
+            (1.0, 1025, 0.8, 0.02, 1.1, 0.0, 0.0),
+            (2.0, 4000, 0.5, 0.0, 1.0, 0.0, 0.0),
+            (1.0, -1, 1.0, 0.1, 1.0, 0.0, 0.0),
+        ];
+        // What base f5309e4 produced for each case: the number of non-zero
+        // probabilities, and the tokens at positions 0..8 with the case
+        // index as the seed.
+        let survivors = [6, 40, 1, 19, 389, 7, 33, 6, 8, 9];
+        let tokens: [[u32; 8]; 10] = [
+            [65012, 14945, 151683, 22170, 14945, 14945, 22170, 151683],
+            [22170, 44319, 85442, 138988, 17495, 9865, 151683, 22170],
+            [22170; 8],
+            [132651, 44319, 22170, 17495, 132651, 151683, 124598, 22170],
+            [68374, 22170, 17495, 9865, 44319, 138988, 14945, 65012],
+            [151683, 14945, 22170, 22170, 151683, 22170, 22170, 132651],
+            [124598, 44319, 48606, 22170, 65012, 22170, 22170, 133248],
+            [132651, 65012, 22170, 151683, 14945, 14945, 65012, 151683],
+            [22170, 22170, 65012, 132651, 65012, 22170, 133248, 9865],
+            [151683, 44319, 14945, 132651, 151683, 151683, 14945, 132651],
+        ];
+        // One workspace throughout, as in a session.
+        let mut ws = SamplingWorkspace::default();
+        for (case, &options) in cases.iter().enumerate() {
+            let (temperature, top_k, top_p, min_p, rep, presence, frequency) = options;
+            let opts = GenerationOptions {
+                temperature,
+                top_k,
+                top_p,
+                min_p,
+                repetition_penalty: rep,
+                presence_penalty: presence,
+                frequency_penalty: frequency,
+                ..Default::default()
+            };
+            let kept = match ws.distribution(&logits, &opts, &recent, None, 0).unwrap() {
+                TokenDistRef::Greedy(_) => 0,
+                TokenDistRef::Probs(p) => p.iter().filter(|&&x| x > 0.0).count(),
+            };
+            assert_eq!(kept, survivors[case], "survivors, {options:?}");
+            let drawn: [u32; 8] = std::array::from_fn(|pos| {
+                ws.sample_at(&logits, &opts, &recent, None, case as u64, pos as u64)
+                    .unwrap()
+            });
+            assert_eq!(drawn, tokens[case], "tokens, {options:?}");
+        }
+    }
+
     #[test]
     #[ignore = "manual sampler benchmark; run release mode with --nocapture"]
     fn bench_sparse_top_k_sampling() {
@@ -7900,9 +8004,9 @@ mod tests {
                 top_k,
                 ..Default::default()
             };
-            for dense_only in [true, false] {
+            for force_dense_sampling in [true, false] {
                 let mut ws = SamplingWorkspace {
-                    dense_only,
+                    force_dense_sampling,
                     ..Default::default()
                 };
                 let mut sample = |pos| {
@@ -7918,7 +8022,7 @@ mod tests {
                     black_box(sample(pos));
                 }
                 eprintln!(
-                    "top_k={top_k} dense_only={dense_only}: {:.1} us/token",
+                    "top_k={top_k} dense={force_dense_sampling}: {:.1} us/token",
                     start.elapsed().as_secs_f64() * 1e6 / n as f64
                 );
             }
