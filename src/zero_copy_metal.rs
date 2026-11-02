@@ -370,6 +370,11 @@ impl ZcWeight {
         self.offset
     }
 
+    /// Candle-order dims `[n, k]`.
+    pub fn dims(&self) -> [usize; 2] {
+        self.dims
+    }
+
     /// `xs @ W^T` with `W` the `[n, k]` weight, activations f32 on Metal.
     pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let (storage_guard, layout) = xs.storage_and_layout();
@@ -718,6 +723,11 @@ mod imp {
 
         pub fn forward(&self, _xs: &candle_core::Tensor) -> candle_core::Result<candle_core::Tensor> {
             candle_core::bail!("zero-copy Metal requires the `metal` feature")
+        }
+
+        /// Never called: without the `metal` feature no `ZcWeight` exists.
+        pub fn dims(&self) -> [usize; 2] {
+            [0, 0]
         }
     }
 

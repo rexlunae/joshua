@@ -52,6 +52,11 @@
 //! The math follows llama.cpp's `src/models/qwen*.cpp` graphs on the same
 //! GGUF tensors.  Activations run in f32 for CPU accuracy, mirroring the
 //! other Joshua quantized loaders (`glm4`, `deepseek2`).
+//!
+//! LoRA adapters ([`crate::lora`]) add their deltas to the attention
+//! projections and the dense or shared-expert FFN, after the quantized
+//! matmul and before the bias; without an adapter every op is the base
+//! model's.
 
 use std::io::{Read, Seek};
 use std::sync::Arc;
@@ -63,6 +68,7 @@ use candle_nn::ops::{sigmoid, silu};
 use candle_transformers::quantized_nn::RmsNorm;
 
 use crate::attention::{KvCache, Rope, RopeStyle};
+use crate::lora::{LayerLora, Proj, SlotDelta};
 use crate::moe::Gating;
 
 mod qwen4exp;
@@ -565,6 +571,30 @@ impl Weight {
             Weight::Paged(p) => p.forward(xs),
         }
     }
+
+    /// [`Self::forward`] plus a LoRA delta, added after the quantized matmul
+    /// (llama.cpp's `build_lora_mm`).  Without one, exactly the base ops.
+    fn forward_lora(&self, xs: &Tensor, lora: Option<&SlotDelta>) -> Result<Tensor> {
+        let y = self.forward(xs)?;
+        match lora {
+            Some(d) => d.apply(xs, y),
+            None => Ok(y),
+        }
+    }
+
+    /// `[out, in]` of a dense 2-D weight (a LoRA slot's dims); `None` for a
+    /// paged expert.
+    fn dims(&self) -> Option<(usize, usize)> {
+        match self {
+            Weight::Candle(QMatMul::QTensor(q)) => q.shape().dims2().ok(),
+            Weight::Candle(QMatMul::Tensor(t) | QMatMul::TensorF16(t)) => t.dims2().ok(),
+            Weight::Zc(z) => {
+                let [o, i] = z.dims();
+                Some((o, i))
+            }
+            Weight::Paged(_) => None,
+        }
+    }
 }
 
 // ─── Linear helpers ─────────────────────────────────────────────────────────
@@ -577,7 +607,13 @@ struct Linear {
 
 impl Linear {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let y = self.w.forward(xs)?;
+        self.forward_lora(xs, None)
+    }
+
+    /// `W·x`, then the LoRA delta when there is one, then the bias —
+    /// llama.cpp's order.
+    fn forward_lora(&self, xs: &Tensor, lora: Option<&SlotDelta>) -> Result<Tensor> {
+        let y = self.w.forward_lora(xs, lora)?;
         match &self.b {
             Some(b) => y.broadcast_add(b),
             None => Ok(y),
@@ -630,17 +666,23 @@ impl Qkv {
         Ok(Self::Split { q: lin("attn_q")?, k: lin("attn_k")?, v: lin("attn_v")? })
     }
 
-    fn forward(&self, xs: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
+    fn forward(&self, xs: &Tensor, lora: Option<&LayerLora>) -> Result<(Tensor, Tensor, Tensor)> {
+        let d = |p| crate::lora::slot(lora, p);
         match self {
             Self::Fused { qkv, q_dim, k_dim, v_dim } => {
-                let y = qkv.forward(xs)?;
+                // A fused adapter's B rows are `[q ‖ k ‖ v]` like the weight's.
+                let y = qkv.forward_lora(xs, d(Proj::AttnQkv))?;
                 Ok((
                     y.narrow(D::Minus1, 0, *q_dim)?,
                     y.narrow(D::Minus1, *q_dim, *k_dim)?,
                     y.narrow(D::Minus1, q_dim + k_dim, *v_dim)?,
                 ))
             }
-            Self::Split { q, k, v } => Ok((q.forward(xs)?, k.forward(xs)?, v.forward(xs)?)),
+            Self::Split { q, k, v } => Ok((
+                q.forward_lora(xs, d(Proj::AttnQ))?,
+                k.forward_lora(xs, d(Proj::AttnK))?,
+                v.forward_lora(xs, d(Proj::AttnV))?,
+            )),
         }
     }
 }
@@ -710,6 +752,7 @@ impl Attention {
         xs: &Tensor,
         mask: Option<&Tensor>,
         offset: usize,
+        lora: Option<&LayerLora>,
     ) -> Result<Tensor> {
         let _p = prof::Phase::start(&prof::ATT);
         let (b, seq_len, _) = xs.dims3()?;
@@ -721,7 +764,7 @@ impl Attention {
         };
         let mask = sparse.as_ref().or(mask);
         let kv_cache = &mut state.kv;
-        let (q, k, v) = self.qkv.forward(xs)?;
+        let (q, k, v) = self.qkv.forward(xs, lora)?;
         crate::activation_trace::record("qwen-q-proj", &q)?;
         crate::activation_trace::record("qwen-k-proj", &k)?;
         crate::activation_trace::record("qwen-v-proj", &v)?;
@@ -755,7 +798,8 @@ impl Attention {
         if let Some(gate) = gate {
             ctx = (ctx * sigmoid(&gate)?)?;
         }
-        self.o.forward(&ctx)
+        let d = crate::lora::slot(lora, Proj::AttnOutput);
+        self.o.forward_lora(&ctx, d)
     }
 }
 
@@ -1223,12 +1267,23 @@ impl Mlp {
     }
 
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        self.forward_lora(xs, [None; 3])
+    }
+
+    /// [`Self::forward`] with LoRA deltas on the gate, up and down
+    /// projections.  With the fused `[gate ‖ up]` weight, the `up` delta's B
+    /// rows cover both halves.
+    fn forward_lora(&self, xs: &Tensor, lora: [Option<&SlotDelta>; 3]) -> Result<Tensor> {
+        let [d_gate, d_up, d_down] = lora;
         let (w1, w3) = match &self.gate {
-            Some(gate) => (gate.forward(xs)?, self.up.forward(xs)?),
+            Some(gate) => (
+                gate.forward_lora(xs, d_gate)?,
+                self.up.forward_lora(xs, d_up)?,
+            ),
             // llama.cpp `LLM_FFN_SWIGLU`: silu of the first half times the
             // second.
             None => {
-                let y = self.up.forward(xs)?;
+                let y = self.up.forward_lora(xs, d_up)?;
                 let half = y.dim(D::Minus1)? / 2;
                 (y.narrow(D::Minus1, 0, half)?, y.narrow(D::Minus1, half, half)?)
             }
@@ -1239,7 +1294,12 @@ impl Mlp {
         crate::activation_trace::record("qwen-ffn-silu", &act)?;
         let act = (act * w3)?;
         crate::activation_trace::record("qwen-ffn-product", &act)?;
-        self.down.forward(&act)
+        self.down.forward_lora(&act, d_down)
+    }
+
+    /// `layer`'s deltas for the three projections named `names`.
+    fn lora_deltas(layer: Option<&LayerLora>, names: [Proj; 3]) -> [Option<&SlotDelta>; 3] {
+        names.map(|p| crate::lora::slot(layer, p))
     }
 
     /// This expert with every weight re-uploaded onto `device` (see
@@ -1289,8 +1349,9 @@ struct SharedExpert {
 }
 
 impl SharedExpert {
-    fn forward(&self, x2: &Tensor) -> Result<Tensor> {
-        let out = self.mlp.forward(x2)?;
+    fn forward(&self, x2: &Tensor, lora: Option<&LayerLora>) -> Result<Tensor> {
+        let names = [Proj::FfnGateShexp, Proj::FfnUpShexp, Proj::FfnDownShexp];
+        let out = self.mlp.forward_lora(x2, Mlp::lora_deltas(lora, names))?;
         match &self.gate {
             Some(g) => out.broadcast_mul(&sigmoid(&x2.matmul(g)?)?),
             None => Ok(out),
@@ -1328,7 +1389,9 @@ struct Moe {
 }
 
 impl Moe {
-    fn forward(&self, xs: &Tensor) -> Result<(Tensor, Vec<u32>)> {
+    /// Routed experts plus the shared expert; LoRA deltas reach only the
+    /// shared expert (an adapter on the experts or router fails its load).
+    fn forward(&self, xs: &Tensor, lora: Option<&LayerLora>) -> Result<(Tensor, Vec<u32>)> {
         let _p = prof::Phase::start(&prof::MOE);
         let (b, seq_len, h) = xs.dims3()?;
         let n_tokens = b * seq_len;
@@ -1340,7 +1403,7 @@ impl Moe {
         // even when the cache is disabled).
         let (mut out, ids) = self.dispatch(&x2, &topk_idx, &weights, n_tokens)?;
         if let Some(shared) = &self.shared {
-            out = (out + shared.forward(&x2)?)?;
+            out = (out + shared.forward(&x2, lora)?)?;
         }
         Ok((out.reshape((b, seq_len, h))?, ids))
     }
@@ -1427,10 +1490,16 @@ enum FeedForward {
 impl FeedForward {
     /// The block's output plus the routed-expert ids this input used (empty
     /// for dense blocks) — the routing-frequency cache's input.
-    fn forward(&self, xs: &Tensor) -> Result<(Tensor, Vec<u32>)> {
+    fn forward(&self, xs: &Tensor, lora: Option<&LayerLora>) -> Result<(Tensor, Vec<u32>)> {
         match self {
-            Self::Dense(m) => Ok((m.forward(xs)?, Vec::new())),
-            Self::Moe(m) => m.forward(xs),
+            Self::Dense(m) => {
+                let names = [Proj::FfnGate, Proj::FfnUp, Proj::FfnDown];
+                Ok((
+                    m.forward_lora(xs, Mlp::lora_deltas(lora, names))?,
+                    Vec::new(),
+                ))
+            }
+            Self::Moe(m) => m.forward(xs, lora),
         }
     }
 }
@@ -1469,18 +1538,29 @@ struct Layer {
 }
 
 impl Layer {
-    fn mixer_forward(&self, state: &mut LayerState, h: &Tensor, mask: Option<&Tensor>, offset: usize) -> Result<Tensor> {
+    fn mixer_forward(
+        &self,
+        state: &mut LayerState,
+        h: &Tensor,
+        mask: Option<&Tensor>,
+        offset: usize,
+        lora: Option<&LayerLora>,
+    ) -> Result<Tensor> {
         match &self.mixer {
-            Mixer::Attention(a) => a.forward(state, h, mask, offset),
+            Mixer::Attention(a) => a.forward(state, h, mask, offset, lora),
+            // A DeltaNet-targeting adapter fails its load (see `lora_slots`).
             Mixer::DeltaNet(d) => d.forward(&mut state.delta, &mut state.capture, h),
         }
     }
 
+    /// `lora`: this layer's LoRA deltas (`None` for the base model and for
+    /// the MTP block).
     fn forward(
         &self,
         state: &mut LayerState,
         xs: &Tensor,
         input: &crate::native_session::LayerInput<'_>,
+        lora: Option<&LayerLora>,
     ) -> Result<(Tensor, Vec<u32>)> {
         let (mask, offset) = (input.mask, input.offset);
         crate::activation_trace::position(offset);
@@ -1490,7 +1570,7 @@ impl Layer {
                 let h = {
                     let norm = attn_norm.forward(xs)?;
                     crate::activation_trace::record("qwen-attn-norm", &norm)?;
-                    self.mixer_forward(state, &norm, mask, offset)?
+                    self.mixer_forward(state, &norm, mask, offset, lora)?
                 };
                 crate::activation_trace::record("qwen-attn-out", &h)?;
                 let xs = (xs + h)?;
@@ -1498,7 +1578,7 @@ impl Layer {
                 let (h, routed) = {
                     let norm = ffn_norm.forward(&xs)?;
                     crate::activation_trace::record("qwen-ffn-norm", &norm)?;
-                    self.ffn.forward(&norm)?
+                    self.ffn.forward(&norm, lora)?
                 };
                 crate::activation_trace::record("qwen-ffn-out", &h)?;
                 let out = (xs + h)?;
@@ -1506,9 +1586,9 @@ impl Layer {
                 Ok((out, routed))
             }
             Residual::Sandwich { attn_norm, attn_post_norm, ffn_norm, ffn_post_norm } => {
-                let h = self.mixer_forward(state, &attn_norm.forward(xs)?, mask, offset)?;
+                let h = self.mixer_forward(state, &attn_norm.forward(xs)?, mask, offset, lora)?;
                 let xs = (xs + attn_post_norm.forward(&h)?)?;
-                let (h, routed) = self.ffn.forward(&ffn_norm.forward(&xs)?)?;
+                let (h, routed) = self.ffn.forward(&ffn_norm.forward(&xs)?, lora)?;
                 Ok(((xs + ffn_post_norm.forward(&h)?)?, routed))
             }
             Residual::Hyper { attn, ffn, ple } => {
@@ -1522,10 +1602,10 @@ impl Layer {
                     None => xs.clone(),
                 };
                 let (h, inject) = attn.mix(&res)?;
-                let h = self.mixer_forward(state, &h, mask, offset)?;
+                let h = self.mixer_forward(state, &h, mask, offset, lora)?;
                 let res = attn.combine(&res, &h, &inject.expect("layer mixers inject"))?;
                 let (h, inject) = ffn.mix(&res)?;
-                let (h, routed) = self.ffn.forward(&h)?;
+                let (h, routed) = self.ffn.forward(&h, lora)?;
                 Ok((ffn.combine(&res, &h, &inject.expect("layer mixers inject"))?, routed))
             }
         }
@@ -1564,6 +1644,8 @@ enum HeadNorm {
 /// conversation costs its cache rather than a second copy of the weights —
 /// on an accelerator, a second upload of the whole model.
 pub struct Weights {
+    /// `general.architecture`.
+    arch: &'static str,
     tok_embeddings: TokenEmbedding,
     layers: Vec<Layer>,
     norm: HeadNorm,
@@ -1716,7 +1798,53 @@ impl crate::native_session::LayerStack for Weights {
         xs: &Tensor,
         input: &crate::native_session::LayerInput<'_>,
     ) -> Result<(Tensor, Vec<u32>)> {
-        self.layers[l].forward(&mut states[l], xs, input)
+        let lora = input.lora.and_then(|set| set.layer(l));
+        self.layers[l].forward(&mut states[l], xs, input, lora)
+    }
+
+    fn lora_slots(&self) -> Option<crate::lora::SlotTable> {
+        use crate::lora::SlotKey;
+        let mut t = crate::lora::SlotTable::new(self.arch, self.layers.len(), self.device.clone());
+        let add = |t: &mut crate::lora::SlotTable, l: usize, p: Proj, w: &Weight| {
+            if let Some((o, i)) = w.dims() {
+                t.insert(SlotKey::new(l, p), o, i);
+            }
+        };
+        for (l, layer) in self.layers.iter().enumerate() {
+            match &layer.mixer {
+                Mixer::Attention(a) => {
+                    match &a.qkv {
+                        Qkv::Fused { qkv, .. } => add(&mut t, l, Proj::AttnQkv, &qkv.w),
+                        Qkv::Split { q, k, v } => {
+                            add(&mut t, l, Proj::AttnQ, &q.w);
+                            add(&mut t, l, Proj::AttnK, &k.w);
+                            add(&mut t, l, Proj::AttnV, &v.w);
+                        }
+                    }
+                    add(&mut t, l, Proj::AttnOutput, &a.o.w);
+                }
+                Mixer::DeltaNet(_) => t.mark_recurrent(l),
+            }
+            // Routed experts and routers take no delta; the shared expert
+            // does.
+            let mlp = match &layer.ffn {
+                FeedForward::Dense(m) => Some((m, [Proj::FfnGate, Proj::FfnUp, Proj::FfnDown])),
+                FeedForward::Moe(m) => m.shared.as_ref().map(|s| {
+                    (
+                        &s.mlp,
+                        [Proj::FfnGateShexp, Proj::FfnUpShexp, Proj::FfnDownShexp],
+                    )
+                }),
+            };
+            if let Some((m, [gate, up, down])) = mlp {
+                if let Some(g) = &m.gate {
+                    add(&mut t, l, gate, g);
+                }
+                add(&mut t, l, up, &m.up);
+                add(&mut t, l, down, &m.down);
+            }
+        }
+        Some(t)
     }
 
     fn head(&self, xs: &Tensor) -> Result<Tensor> {
@@ -1766,7 +1894,7 @@ impl crate::native_session::LayerStack for Weights {
         };
         let x = Tensor::cat(&[m.enorm.forward(emb)?, m.hnorm.forward(seeds)?], 2)?;
         let x = m.eh_proj.forward(&x)?;
-        let (x, _routed) = m.layer.forward(state, &x, input)?;
+        let (x, _routed) = m.layer.forward(state, &x, input, None)?;
         match &m.head_norm {
             Some(n) => n.forward(&x),
             None => self.head_norm(&x),
@@ -2322,6 +2450,7 @@ impl ModelWeights {
         let parts = load_parts(ct, raw, reader, device, expert_device, mmap,
             device_expert_cache_bytes, None)?;
         Ok(Self::from_weights(Weights {
+            arch: parts.arch,
             tok_embeddings: parts.tok_embeddings.expect("full-model embedding"),
             layers: parts.layers,
             norm: parts.norm.expect("full-model norm"),
@@ -2338,6 +2467,7 @@ impl ModelWeights {
 
 // A stage loads only its layer range and owns endpoints only at the edges.
 struct LoadedParts {
+    arch: &'static str,
     tok_embeddings: Option<TokenEmbedding>,
     layers: Vec<Layer>,
     norm: Option<HeadNorm>,
@@ -2484,6 +2614,7 @@ fn load_parts<R: Read + Seek>(
                     .collect(),
             ));
         Ok(LoadedParts {
+            arch: cfg.arch,
             tok_embeddings,
             layers,
             norm,
@@ -2585,10 +2716,10 @@ impl CpuPipelineWeights {
             Some(crate::moe::causal_mask(n, offset, &Device::Cpu)?)
         };
         let input = crate::native_session::LayerInput {
-            mask: mask.as_ref(), offset, tokens: &[], verify: false,
+            mask: mask.as_ref(), offset, tokens: &[], verify: false, lora: None,
         };
         for (layer, state) in self.parts.layers.iter().zip(state.iter_mut()) {
-            xs = layer.forward(state, &xs, &input)?.0;
+            xs = layer.forward(state, &xs, &input, None)?.0;
         }
         if let (Some(norm), Some(output)) = (&self.parts.norm, &self.parts.output) {
             xs = xs.narrow(1, n - 1, 1)?;
@@ -2698,8 +2829,8 @@ mod tests {
         let _ = &res;
 
         let xs = Tensor::randn(0f32, 1f32, (1, 4, 8), &dev)?; // [b, seq, h]
-        let (a, _) = moe.forward(&xs)?;
-        let (b, _) = mixed.forward(&xs)?;
+        let (a, _) = moe.forward(&xs, None)?;
+        let (b, _) = mixed.forward(&xs, None)?;
         let av = a.flatten_all()?.to_vec1::<f32>()?;
         let bv = b.flatten_all()?.to_vec1::<f32>()?;
         assert_eq!(av.len(), bv.len());
@@ -2768,8 +2899,8 @@ mod tests {
         let moe = tiny_moe(&dev, true)?;
         let row = Tensor::randn(0f32, 1f32, (1, 1, 8), &dev)?;
         let two = Tensor::cat(&[&row, &row], 1)?; // [1, 2, 8], identical rows
-        let (out2, _) = moe.forward(&two)?; // prefill path (n_tokens = 2)
-        let (out1, _) = moe.forward(&row)?; // decode path (n_tokens = 1)
+        let (out2, _) = moe.forward(&two, None)?; // prefill path (n_tokens = 2)
+        let (out1, _) = moe.forward(&row, None)?; // decode path (n_tokens = 1)
         let a: Vec<f32> = out2.narrow(1, 1, 1)?.flatten_all()?.to_vec1()?;
         let b: Vec<f32> = out1.flatten_all()?.to_vec1()?;
         for (x, y) in a.iter().zip(&b) {
@@ -2829,7 +2960,7 @@ mod tests {
             let mut state = LayerState::default();
 
             let xs = Tensor::randn(0f32, 1f32, (1, 3, h), &dev)?;
-            let out = attn.forward(&mut state, &xs, None, 0)?;
+            let out = attn.forward(&mut state, &xs, None, 0, None)?;
             assert_eq!(out.dims(), &[1, 3, h]);
             let cache = state.kv.as_ref().expect("cache after prefill");
             assert_eq!(cache.len(), 3);
@@ -2842,7 +2973,13 @@ mod tests {
             assert_eq!((cache.v().dim(1)?, cache.v().dim(3)?), (nkv, hd));
 
             // Decode appends one more position.
-            let _ = attn.forward(&mut state, &Tensor::randn(0f32, 1f32, (1, 1, h), &dev)?, None, 3)?;
+            let _ = attn.forward(
+                &mut state,
+                &Tensor::randn(0f32, 1f32, (1, 1, h), &dev)?,
+                None,
+                3,
+                None,
+            )?;
             let cache = state.kv.as_ref().expect("cache after decode");
             assert_eq!(cache.len(), 4);
             assert_eq!((cache.k().dim(1)?, cache.k().dim(3)?), (nkv, hd));
@@ -2873,7 +3010,7 @@ mod tests {
             v_dim: wv.dim(0)?,
         };
         let xs = Tensor::randn(0f32, 1f32, (1, 3, 8), &dev)?;
-        let (a, b) = (split.qkv.forward(&xs)?, fused.forward(&xs)?);
+        let (a, b) = (split.qkv.forward(&xs, None)?, fused.forward(&xs, None)?);
         for (x, y) in [(a.0, b.0), (a.1, b.1), (a.2, b.2)] {
             let d = (x - y)?.abs()?.flatten_all()?.max(0)?.to_scalar::<f32>()?;
             assert!(d < 1e-5, "fused vs split projection diverge: {d}");
@@ -3056,6 +3193,91 @@ mod tests {
         md.insert("qwen3moe.attention.key_length".into(), u(128));
         let cfg = Config::from_metadata(&md, "qwen3moe")?;
         assert_eq!(cfg.head_dim, 128);
+        Ok(())
+    }
+
+    /// A LoRA delta on one biased projection, for F32, Q8_0 and Q4_K weights.
+    /// `forward_lora − forward` is `s·B(A·x)` checked in f64 (the weight's
+    /// quantization cancels); the delta lands before the bias, bit for bit
+    /// `(W·x + Δ) + b`; without a delta `forward_lora` is `forward`; and on
+    /// the fused quantized kernels one row alone gives the bits it gets in a
+    /// batch.
+    #[test]
+    fn linear_lora_delta_matches_reference() -> Result<()> {
+        use crate::lora::{LoraPair, SlotDelta};
+        let dev = Device::Cpu;
+        let (n_in, n_out, m, r, s) = (256usize, 12usize, 3usize, 4usize, 1.75f32);
+        let vals = |n: usize, seed: u32| -> Vec<f32> {
+            let mut state = seed | 1;
+            (0..n)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 17;
+                    state ^= state << 5;
+                    ((state % 2000) as f32 / 1000.0 - 1.0) * 0.25
+                })
+                .collect()
+        };
+        let xv = vals(m * n_in, 1);
+        let x = Tensor::from_vec(xv.clone(), (1, m, n_in), &dev)?;
+        let (a, b) = (vals(r * n_in, 2), vals(n_out * r, 3));
+        let pair = LoraPair::new(a.clone(), b.clone(), r, n_in, n_out, &dev)?;
+        let delta = SlotDelta::from_terms(vec![(Arc::new(pair), s)]);
+        let bias = Tensor::from_vec(vals(n_out, 5), n_out, &dev)?;
+        let flat = |t: Tensor| t.flatten_all()?.to_vec1::<f32>();
+        for dtype in [GgmlDType::F32, GgmlDType::Q8_0, GgmlDType::Q4K] {
+            let w = Tensor::from_vec(vals(n_out * n_in, 4), (n_out, n_in), &dev)?;
+            let lin = Linear {
+                w: Weight::Candle(QMatMul::from_qtensor(QTensor::quantize(&w, dtype)?)?),
+                b: Some(bias.clone()),
+            };
+            assert_eq!(lin.w.dims(), Some((n_out, n_in)));
+            let base = flat(lin.forward(&x)?)?;
+            let with = flat(lin.forward_lora(&x, Some(&delta))?)?;
+            assert_eq!(
+                flat(lin.forward_lora(&x, None)?)?,
+                base,
+                "{dtype:?}: no delta"
+            );
+            let manual = delta.apply(&x, lin.w.forward(&x)?)?.broadcast_add(&bias)?;
+            assert_eq!(flat(manual)?, with, "{dtype:?}: delta before bias");
+            for row in 0..m {
+                let xr = &xv[row * n_in..(row + 1) * n_in];
+                let t: Vec<f64> = (0..r)
+                    .map(|j| {
+                        (0..n_in)
+                            .map(|i| a[j * n_in + i] as f64 * xr[i] as f64)
+                            .sum()
+                    })
+                    .collect();
+                for o in 0..n_out {
+                    let want = s as f64 * (0..r).map(|j| b[o * r + j] as f64 * t[j]).sum::<f64>();
+                    let (y0, y1) = (base[row * n_out + o], with[row * n_out + o]);
+                    let tol = 1e-6 * (1.0 + y0.abs() as f64 + y1.abs() as f64);
+                    let got = y1 as f64 - y0 as f64;
+                    assert!(
+                        (got - want).abs() < tol,
+                        "{dtype:?} [{row}, {o}]: {got} vs {want}"
+                    );
+                }
+            }
+            #[cfg(target_arch = "x86_64")]
+            if dtype != GgmlDType::F32 {
+                for row in 0..m {
+                    let one = Tensor::from_vec(
+                        xv[row * n_in..(row + 1) * n_in].to_vec(),
+                        (1, 1, n_in),
+                        &dev,
+                    )?;
+                    let got = flat(lin.forward_lora(&one, Some(&delta))?)?;
+                    assert_eq!(
+                        got,
+                        with[row * n_out..(row + 1) * n_out],
+                        "{dtype:?} row {row}"
+                    );
+                }
+            }
+        }
         Ok(())
     }
 }

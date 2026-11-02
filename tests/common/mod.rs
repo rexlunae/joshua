@@ -274,6 +274,16 @@ pub fn check_prefix_checkpoint_rewind(model: &joshua::model::QuantizedModel, wha
 /// decoding exactly as if no snapshot had been taken (the copy shares no
 /// buffer either writes to); and a duplicate of the snapshot does the same.
 pub fn check_snapshot_restore(model: &joshua::model::QuantizedModel, what: &str) {
+    check_snapshot_restore_with(model, what, &|_| {});
+}
+
+/// [`check_snapshot_restore`] with every session `prepare`d first (e.g. set
+/// to run a LoRA adapter set).
+pub fn check_snapshot_restore_with(
+    model: &joshua::model::QuantizedModel,
+    what: &str,
+    prepare: &dyn Fn(&mut joshua::model::QuantizedModel),
+) {
     use joshua::stream_prefill::Chunk;
     const TURN1: [u32; 5] = [1, 4, 2, 7, 5];
     const REPLY: [u32; 2] = [9, 3];
@@ -297,8 +307,13 @@ pub fn check_snapshot_restore(model: &joshua::model::QuantizedModel, what: &str)
     let continue_from = |m: &mut joshua::model::QuantizedModel, at: usize| {
         [logits(m, &NEXT, at), logits(m, &[7], at + NEXT.len())]
     };
+    let fresh = || {
+        let mut m = model.new_session().unwrap();
+        prepare(&mut m);
+        m
+    };
 
-    let mut m = model.new_session().unwrap();
+    let mut m = fresh();
     replay(&mut m, n2);
     // TURN1's end is a prompt boundary, so even a recurrent model holds a
     // checkpoint there.
@@ -311,11 +326,11 @@ pub fn check_snapshot_restore(model: &joshua::model::QuantizedModel, what: &str)
         assert!(snap.bytes() > 0, "{what}");
         let copy = snap.duplicate(&Device::Cpu).unwrap();
 
-        let mut reference = model.new_session().unwrap();
+        let mut reference = fresh();
         replay(&mut reference, keep);
         let want = continue_from(&mut reference, keep);
         for (label, snap) in [("restored", snap), ("duplicate", copy)] {
-            let mut r = model.new_session().unwrap();
+            let mut r = fresh();
             assert!(r.restore_snapshot(snap).unwrap(), "{what}: restore at {keep}");
             let got = continue_from(&mut r, keep);
             for (w, g) in want.iter().zip(&got) {
@@ -334,7 +349,7 @@ pub fn check_snapshot_restore(model: &joshua::model::QuantizedModel, what: &str)
     }
     // The source session decodes on as if nothing happened.
     let got = continue_from(&mut m, n2);
-    let mut reference = model.new_session().unwrap();
+    let mut reference = fresh();
     replay(&mut reference, n2);
     let want = continue_from(&mut reference, n2);
     for (w, g) in want.iter().zip(&got) {
@@ -1604,17 +1619,24 @@ pub fn write_tiny_qwen3_q6k_layers(path: &Path, layers: usize) {
 }
 
 fn requantize_aligned(path: &Path, dtype: GgmlDType) {
-    let mut file = File::open(path).unwrap();
+    rewrite_gguf(path, path, |_, qt| {
+        if qt.shape().rank() == 2 && qt.shape().dims()[1] % 256 == 0 {
+            QTensor::quantize(&qt.dequantize(&Device::Cpu).unwrap(), dtype).unwrap()
+        } else {
+            qt
+        }
+    });
+}
+
+/// Rewrite the GGUF at `src` to `dst` (which may be the same file) with every
+/// tensor passed through `map` by name and the metadata unchanged.
+fn rewrite_gguf(src: &Path, dst: &Path, mut map: impl FnMut(&str, QTensor) -> QTensor) {
+    let mut file = File::open(src).unwrap();
     let content = gguf_file::Content::read(&mut file).unwrap();
     let mut tensors = Vec::new();
     for name in content.tensor_infos.keys() {
         let qt = content.tensor(&mut file, name, &Device::Cpu).unwrap();
-        let qt = if qt.shape().rank() == 2 && qt.shape().dims()[1] % 256 == 0 {
-            QTensor::quantize(&qt.dequantize(&Device::Cpu).unwrap(), dtype).unwrap()
-        } else {
-            qt
-        };
-        tensors.push((name.as_str(), qt));
+        tensors.push((name.as_str(), map(name, qt)));
     }
     let refs: Vec<_> = tensors.iter().map(|(name, qt)| (*name, qt)).collect();
     let metadata: Vec<_> = content
@@ -1622,7 +1644,7 @@ fn requantize_aligned(path: &Path, dtype: GgmlDType) {
         .iter()
         .map(|(key, value)| (key.as_str(), value))
         .collect();
-    gguf_file::write(&mut File::create(path).unwrap(), &metadata, &refs).unwrap();
+    gguf_file::write(&mut File::create(dst).unwrap(), &metadata, &refs).unwrap();
 }
 
 fn write_tiny_qwen_layers<const EMB: usize, const NFF: usize>(path: &Path, arch: &str, layers: Option<usize>, quantized: bool, mtp: bool) {
@@ -2113,6 +2135,19 @@ impl RawTensor {
         Self {
             name: name.into(),
             dtype: DTYPE_F16,
+            dims: dims.to_vec(),
+            data,
+        }
+    }
+
+    pub fn bf16(name: &str, data: Vec<f32>, dims: &[usize]) -> Self {
+        let data = data
+            .iter()
+            .flat_map(|v| half::bf16::from_f32(*v).to_le_bytes())
+            .collect();
+        Self {
+            name: name.into(),
+            dtype: DTYPE_BF16,
             dims: dims.to_vec(),
             data,
         }
@@ -3707,4 +3742,142 @@ pub fn load_model_mapped(path: &Path) -> joshua::model::QuantizedModel {
         0,
     )
     .unwrap()
+}
+
+// ─── LoRA adapters ───────────────────────────────────────────────────────────
+
+/// The tensor types `convert_lora_to_gguf.py --outtype` writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoraDtype {
+    F32,
+    F16,
+    Bf16,
+    Q8_0,
+}
+
+/// One tensor pair of a synthetic LoRA adapter: the base weight it targets
+/// and the f32 values it holds, `a` `[r, n_in]` and `b` `[n_out, r]`.
+#[derive(Clone, Debug)]
+pub struct LoraSpec {
+    pub base: String,
+    pub r: usize,
+    pub n_out: usize,
+    pub n_in: usize,
+    pub a: Vec<f32>,
+    pub b: Vec<f32>,
+}
+
+impl LoraSpec {
+    /// Deterministic values from `seed`, the same magnitude as the tiny
+    /// fixtures' weights, so the delta visibly moves their logits.
+    pub fn new(base: &str, r: usize, n_out: usize, n_in: usize, seed: u32) -> Self {
+        Self {
+            base: base.into(),
+            r,
+            n_out,
+            n_in,
+            a: weights(r * n_in, seed),
+            b: weights(n_out * r, seed.wrapping_mul(31).wrapping_add(7)),
+        }
+    }
+
+    /// The values a file of type `dtype` holds for this pair, decoded back
+    /// to f32.
+    pub fn stored(&self, dtype: LoraDtype) -> Self {
+        let round = |v: &[f32], dims: &[usize]| -> Vec<f32> {
+            match dtype {
+                LoraDtype::F32 => v.to_vec(),
+                LoraDtype::F16 => v.iter().map(|&x| half::f16::from_f32(x).to_f32()).collect(),
+                LoraDtype::Bf16 => v
+                    .iter()
+                    .map(|&x| half::bf16::from_f32(x).to_f32())
+                    .collect(),
+                LoraDtype::Q8_0 => {
+                    let t = Tensor::from_vec(v.to_vec(), dims, &Device::Cpu).unwrap();
+                    QTensor::quantize(&t, GgmlDType::Q8_0)
+                        .unwrap()
+                        .dequantize(&Device::Cpu)
+                        .unwrap()
+                        .flatten_all()
+                        .unwrap()
+                        .to_vec1()
+                        .unwrap()
+                }
+            }
+        };
+        Self {
+            a: round(&self.a, &[self.r, self.n_in]),
+            b: round(&self.b, &[self.n_out, self.r]),
+            ..self.clone()
+        }
+    }
+}
+
+/// The metadata `convert_lora_to_gguf.py` writes for an `arch` base.
+pub fn lora_metadata(arch: &str, alpha: f32) -> Vec<(String, gguf_file::Value)> {
+    let s = |v: &str| gguf_file::Value::String(v.into());
+    vec![
+        ("general.type".into(), s("adapter")),
+        ("general.architecture".into(), s(arch)),
+        ("adapter.type".into(), s("lora")),
+        ("adapter.lora.alpha".into(), gguf_file::Value::F32(alpha)),
+    ]
+}
+
+/// The `<base>.lora_a` / `<base>.lora_b` tensors of `specs`.
+pub fn lora_tensors(specs: &[LoraSpec], dtype: LoraDtype) -> Vec<RawTensor> {
+    let tensor = |name: String, v: &[f32], dims: &[usize]| match dtype {
+        LoraDtype::F32 => RawTensor::f32(&name, v.to_vec(), dims),
+        LoraDtype::F16 => RawTensor::f16(&name, v.to_vec(), dims),
+        LoraDtype::Bf16 => RawTensor::bf16(&name, v.to_vec(), dims),
+        LoraDtype::Q8_0 => RawTensor::q8_0(&name, v.to_vec(), dims),
+    };
+    specs
+        .iter()
+        .flat_map(|s| {
+            [
+                tensor(format!("{}.lora_a", s.base), &s.a, &[s.r, s.n_in]),
+                tensor(format!("{}.lora_b", s.base), &s.b, &[s.n_out, s.r]),
+            ]
+        })
+        .collect()
+}
+
+/// Write a LoRA adapter GGUF laid out the way `convert_lora_to_gguf.py`
+/// writes one.
+pub fn write_lora_gguf(path: &Path, arch: &str, alpha: f32, specs: &[LoraSpec], dtype: LoraDtype) {
+    write_raw_gguf(
+        path,
+        &lora_metadata(arch, alpha),
+        &lora_tensors(specs, dtype),
+    );
+}
+
+/// Rewrite the GGUF at `base` to `out` with every weight a spec targets
+/// replaced by f32 `dequant(W) + Σ s·B·A`, accumulated in f64: the merged
+/// model a LoRA run must match.  `deltas` pairs each spec with its effective
+/// scale.
+pub fn write_merged_gguf(base: &Path, out: &Path, deltas: &[(&LoraSpec, f32)]) {
+    rewrite_gguf(base, out, |name, qt| {
+        let mine: Vec<_> = deltas.iter().filter(|(s, _)| s.base == name).collect();
+        if mine.is_empty() {
+            return qt;
+        }
+        let w = qt.dequantize(&Device::Cpu).unwrap();
+        let (n_out, n_in) = w.dims2().unwrap();
+        let w: Vec<f32> = w.flatten_all().unwrap().to_vec1().unwrap();
+        let mut merged: Vec<f64> = w.iter().map(|&v| v as f64).collect();
+        for (s, scale) in mine {
+            assert_eq!((s.n_out, s.n_in), (n_out, n_in), "{name}");
+            for o in 0..n_out {
+                for i in 0..n_in {
+                    let ba: f64 = (0..s.r)
+                        .map(|j| s.b[o * s.r + j] as f64 * s.a[j * n_in + i] as f64)
+                        .sum();
+                    merged[o * n_in + i] += *scale as f64 * ba;
+                }
+            }
+        }
+        qtensor(merged.iter().map(|&v| v as f32).collect(), &[n_out, n_in])
+    });
 }
