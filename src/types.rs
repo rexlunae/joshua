@@ -923,14 +923,23 @@ impl SamplingParams {
     }
 }
 
+/// The largest logit bias a request can set: OpenAI's documented range,
+/// to which vLLM clamps every bias.
+pub const MAX_LOGIT_BIAS: f64 = 100.0;
+
 /// Parse `logit_bias`: OpenAI's object of token id → bias, or llama.cpp's
 /// array of `[token, bias]` pairs, where a token may be text and a bias of
 /// `false` bans it.  Entries llama.cpp would skip (a non-numeric bias, a
-/// malformed pair) are skipped here too.
+/// malformed pair) are skipped here too.  Numeric biases are clamped to
+/// ±[`MAX_LOGIT_BIAS`] as vLLM does: a larger one decides nothing more,
+/// and one past `f32`'s range would turn the sampled distribution into
+/// NaN.
 pub fn parse_logit_bias(value: &serde_json::Value) -> Result<Vec<LogitBias>, String> {
     use serde_json::Value;
     let bias = |v: &Value| match v {
-        Value::Number(n) => n.as_f64().map(|b| b as f32),
+        Value::Number(n) => n
+            .as_f64()
+            .map(|b| b.clamp(-MAX_LOGIT_BIAS, MAX_LOGIT_BIAS) as f32),
         Value::Bool(false) => Some(f32::NEG_INFINITY),
         _ => None,
     };
@@ -1846,6 +1855,12 @@ mod tests {
             ]
         );
         assert!(rejected(json!({"logit_bias": 5})).contains("logit_bias"));
+        // vLLM's clamp: past f32's range a bias would be infinite, and an
+        // infinite one makes the sampled distribution NaN.  `false` is
+        // still the only ban.
+        let o = options(json!({"logit_bias": [[1, 1e39], [2, -1e39], [3, 150], [4, -100.0]]}));
+        let biases: Vec<f32> = o.logit_bias.iter().map(|b| b.bias).collect();
+        assert_eq!(biases, vec![100.0, -100.0, 100.0, -100.0]);
     }
 
     #[test]

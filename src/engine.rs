@@ -1606,6 +1606,16 @@ impl StopType {
         }
     }
 
+    /// [`StopType::finish_reason`] for a chat answer that may have called
+    /// tools (`has_calls`): `tool_calls` when the turn ended on its own,
+    /// while a call cut off by a cap stays `length` (llama-server, vLLM).
+    pub fn chat_finish_reason(self, has_calls: bool) -> &'static str {
+        match self {
+            Self::Eos | Self::Word if has_calls => "tool_calls",
+            _ => self.finish_reason(),
+        }
+    }
+
     /// llama-server's `stop_type` string.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -1778,9 +1788,23 @@ enum PromptSource<'a> {
     Tokens(Vec<u32>),
 }
 
+/// Where a streaming generation's output goes.
+enum TextSink<'a> {
+    /// Decoded text as it comes.
+    Text(&'a mut (dyn FnMut(&str) + 'a)),
+    /// The text split into reasoning and answer as it comes.
+    Split(&'a mut (dyn FnMut(crate::reasoning::Split) + 'a)),
+}
+
 /// Default repetition-penalty window: the last this-many tokens are
 /// penalised (see [`GenerationOptions::repeat_last_n`]).
 const REP_WINDOW: usize = 64;
+
+/// The most token sequences a request's `bad_words` may ban, and the most
+/// tokens across them: vLLM's `VLLM_MAX_NUM_BAD_WORDS` and
+/// `VLLM_MAX_BAD_WORDS_TOTAL_TOKENS` defaults.
+const MAX_BAD_WORDS: usize = 128;
+const MAX_BAD_WORD_TOKENS: usize = 1024;
 
 /// The penalty window for `repeat_last_n` (-1 = the context window).
 fn penalty_window(repeat_last_n: i32, n_ctx: usize) -> usize {
@@ -3448,17 +3472,51 @@ impl Engine {
         tools: Option<&[Tool]>,
         options: &GenerationOptions,
     ) -> Result<u32> {
-        let reordered = tools.and_then(|t| self.tool_orders.stable(t));
-        let tools = reordered.as_deref().or(tools);
+        let (messages, tools) = self.stable_chat(messages, tools, false);
+        let rendered = self.render_chat(&messages, tools.as_deref(), options)?;
+        self.tokenize(&rendered.text, rendered.add_special_tokens)
+            .map(|tokens| tokens.len() as u32)
+    }
+
+    /// The conversation a chat request's prompt is rendered from: its tools
+    /// in the order this set was first seen and, with
+    /// [`EngineOptions::env_to_user`], the system prompt's `<env>` block
+    /// moved to the first user message, so cached prompt state still matches
+    /// where the client varies the prompt's head for no semantic reason (see
+    /// [`crate::prompt_stability`]).  Only a prompt that is generated from
+    /// (`run`) records a new tool order; one that is only rendered or
+    /// counted looks it up.
+    fn stable_chat<'a>(
+        &self,
+        messages: &'a [ChatMessage],
+        tools: Option<&'a [Tool]>,
+        run: bool,
+    ) -> (
+        std::borrow::Cow<'a, [ChatMessage]>,
+        Option<std::borrow::Cow<'a, [Tool]>>,
+    ) {
+        use std::borrow::Cow;
+        let reordered = tools.and_then(|t| {
+            if run {
+                self.tool_orders.stable(t)
+            } else {
+                self.tool_orders.peek(t)
+            }
+        });
+        let tools = match reordered {
+            Some(tools) => Some(Cow::Owned(tools)),
+            None => tools.map(Cow::Borrowed),
+        };
         let moved = if self.env_to_user {
             crate::prompt_stability::env_to_user(messages)
         } else {
             None
         };
-        let messages = moved.as_deref().unwrap_or(messages);
-        let rendered = self.render_chat(messages, tools, options)?;
-        self.tokenize(&rendered.text, rendered.add_special_tokens)
-            .map(|tokens| tokens.len() as u32)
+        let messages = match moved {
+            Some(messages) => Cow::Owned(messages),
+            None => Cow::Borrowed(messages),
+        };
+        (messages, tools)
     }
 
     /// Tokenize a raw prompt: text parts are encoded without a chat
@@ -3546,34 +3604,34 @@ impl Engine {
     /// The prompt a chat request renders to, without running the model
     /// (llama-server's `/apply-template`): the chat template with the
     /// request's template controls — generation prompt, assistant prefill,
-    /// its own template, the `developer` role mapping.
+    /// its own template, the `developer` role mapping — over the same
+    /// tool order and messages generation uses.
     pub fn apply_chat_template(
         &self,
         messages: &[ChatMessage],
         tools: Option<&[Tool]>,
         options: &GenerationOptions,
     ) -> Result<String> {
-        self.render_chat(messages, tools, options).map(|r| r.text)
+        let (messages, tools) = self.stable_chat(messages, tools, false);
+        self.render_chat(&messages, tools.as_deref(), options)
+            .map(|r| r.text)
     }
 
-    /// A [`crate::reasoning::ReasoningSplitter`] for this chat request's
-    /// output: it starts inside the reasoning when the rendered prompt opens
-    /// the block (DeepSeek-R1's `<think>` generation prompt).  Renders the
-    /// prompt only for a model that has a reasoning format.
-    pub fn reasoning_splitter(
-        &self,
-        messages: &[ChatMessage],
-        tools: Option<&[Tool]>,
-        options: &GenerationOptions,
-    ) -> Result<crate::reasoning::ReasoningSplitter> {
+    /// Whether `prompt` leaves the model inside a reasoning block, so its
+    /// output starts there ([`Completion::reasoning_open`]): the one rule
+    /// for every prompt, [`crate::reasoning::ReasoningFormat::prompt_opens_reasoning`]
+    /// on the prompt's text, with token ids decoded first.  The text is the
+    /// whole prompt, so a `truncate_prompt_tokens` cut does not change it.
+    fn prompt_opens_reasoning(&self, prompt: &PromptSource<'_>) -> bool {
         if !self.reasoning_format.is_some() {
-            return Ok(crate::reasoning::ReasoningSplitter::disabled());
+            return false;
         }
-        let rendered = self.render_chat(messages, tools, options)?;
-        Ok(crate::reasoning::ReasoningSplitter::new(
-            self.reasoning_format.clone(),
-            self.reasoning_format.prompt_opens_reasoning(&rendered.text),
-        ))
+        match prompt {
+            PromptSource::Text { text, .. } => self.reasoning_format.prompt_opens_reasoning(text),
+            PromptSource::Tokens(tokens) => self
+                .detokenize(tokens, false)
+                .is_ok_and(|text| self.reasoning_format.prompt_opens_reasoning(&text)),
+        }
     }
 
     /// Device the routed-expert pool of a MoE model lives on: the compute
@@ -3832,7 +3890,32 @@ impl Engine {
             tools,
             options,
             Some(cancel),
-            Some(on_text),
+            Some(TextSink::Text(on_text)),
+        )
+    }
+
+    /// [`Engine::complete_chat_streaming_detailed`] with the text split into
+    /// reasoning and answer as it is decoded (see [`crate::reasoning`]):
+    /// `on_split` gets each step's [`crate::reasoning::Split`], and a last
+    /// one with whatever the splitter held back once decoding ends.  The
+    /// split starts from the prompt state the returned
+    /// [`Completion::reasoning_open`] reports, so it matches
+    /// [`crate::reasoning::split`] of the whole text.  For a model without
+    /// a reasoning format everything is answer.
+    pub fn complete_chat_streaming_split(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        options: &GenerationOptions,
+        cancel: &AtomicBool,
+        on_split: &mut dyn FnMut(crate::reasoning::Split),
+    ) -> Result<Completion> {
+        self.complete_chat_inner(
+            messages,
+            tools,
+            options,
+            Some(cancel),
+            Some(TextSink::Split(on_split)),
         )
     }
 
@@ -3872,19 +3955,10 @@ impl Engine {
         tools: Option<&[Tool]>,
         options: &GenerationOptions,
         cancel: Option<&AtomicBool>,
-        mut on_text: Option<&mut (dyn FnMut(&str) + '_)>,
+        sink: Option<TextSink<'_>>,
     ) -> Result<Completion> {
-        // Keep the prompt's head byte-identical across requests where the
-        // client varies it for no semantic reason, so cached prompt state
-        // still matches (see `crate::prompt_stability`).
-        let reordered = tools.and_then(|t| self.tool_orders.stable(t));
-        let tools = reordered.as_deref().or(tools);
-        let moved = if self.env_to_user {
-            crate::prompt_stability::env_to_user(messages)
-        } else {
-            None
-        };
-        let messages = moved.as_deref().unwrap_or(messages);
+        let (messages, tools) = self.stable_chat(messages, tools, true);
+        let (messages, tools) = (&*messages, tools.as_deref());
         // Multimodal branch: messages carrying images go through a
         // media-capable NPU/llama.cpp plugin session.
         if messages
@@ -3893,19 +3967,22 @@ impl Engine {
         {
             let (marked_messages, images) = resolve_message_media(messages)?;
             let rendered = self.render_chat(&marked_messages, tools, options)?;
+            // The plugin tokenizes this text, so the rule reads it directly.
             let reasoning_open = self.reasoning_format.prompt_opens_reasoning(&rendered.text);
-            return self.complete_media(
-                &rendered.text,
-                &images,
-                reasoning_open,
-                options,
-                cancel,
-                on_text.as_deref_mut(),
-            );
+            return self.stream_to(sink, reasoning_open, |on_text| {
+                self.complete_media(
+                    &rendered.text,
+                    &images,
+                    reasoning_open,
+                    options,
+                    cancel,
+                    on_text,
+                )
+            });
         }
         let rendered = self.render_chat(messages, tools, options)?;
         let root = self.prompt_root_chars(messages, tools, options, &rendered.text);
-        self.complete_with(
+        self.complete_source(
             PromptSource::Text {
                 text: &rendered.text,
                 add_special_tokens: rendered.add_special_tokens,
@@ -3913,8 +3990,53 @@ impl Engine {
             },
             options,
             cancel,
-            on_text.as_deref_mut(),
+            sink,
         )
+    }
+
+    /// [`Engine::complete_with`] for a prompt whose reasoning state is
+    /// worked out here, once, for both the decode loop and a split stream.
+    fn complete_source(
+        &self,
+        prompt: PromptSource<'_>,
+        options: &GenerationOptions,
+        cancel: Option<&AtomicBool>,
+        sink: Option<TextSink<'_>>,
+    ) -> Result<Completion> {
+        let reasoning_open = self.prompt_opens_reasoning(&prompt);
+        self.stream_to(sink, reasoning_open, |on_text| {
+            self.complete_with(prompt, reasoning_open, options, cancel, on_text)
+        })
+    }
+
+    /// Run `generate` with `sink`'s text callback.  A split sink gets the
+    /// text through a [`crate::reasoning::ReasoningSplitter`] that starts
+    /// from `reasoning_open`, flushed once generation succeeds.
+    fn stream_to(
+        &self,
+        sink: Option<TextSink<'_>>,
+        reasoning_open: bool,
+        generate: impl FnOnce(Option<&mut (dyn FnMut(&str) + '_)>) -> Result<Completion>,
+    ) -> Result<Completion> {
+        match sink {
+            None => generate(None),
+            Some(TextSink::Text(on_text)) => generate(Some(on_text)),
+            Some(TextSink::Split(on_split)) => {
+                let mut splitter = crate::reasoning::ReasoningSplitter::new(
+                    self.reasoning_format.clone(),
+                    reasoning_open,
+                );
+                let result = {
+                    let on_text: &mut dyn FnMut(&str) =
+                        &mut |delta: &str| on_split(splitter.push(delta));
+                    generate(Some(on_text))
+                };
+                if result.is_ok() {
+                    on_split(splitter.finish());
+                }
+                result
+            }
+        }
     }
 
     // ─── Raw-prompt completion ────────────────────────────────────────────────
@@ -3954,7 +4076,7 @@ impl Engine {
         cancel: &AtomicBool,
         on_text: &mut dyn FnMut(&str),
     ) -> Result<Completion> {
-        self.complete_prompt_inner(prompt, options, Some(cancel), Some(on_text))
+        self.complete_prompt_inner(prompt, options, Some(cancel), Some(TextSink::Text(on_text)))
     }
 
     fn complete_prompt_inner(
@@ -3962,26 +4084,19 @@ impl Engine {
         prompt: &RawPrompt,
         options: &GenerationOptions,
         cancel: Option<&AtomicBool>,
-        on_text: Option<&mut (dyn FnMut(&str) + '_)>,
+        sink: Option<TextSink<'_>>,
     ) -> Result<Completion> {
         // A single text part keeps the text path (identical to
         // `complete_raw`); anything with token ids is tokenized here.
-        match prompt.parts.as_slice() {
-            [PromptPart::Text(text)] => self.complete_with(
-                PromptSource::Text {
-                    text,
-                    add_special_tokens: prompt.add_special_tokens,
-                    root_chars: None,
-                },
-                options,
-                cancel,
-                on_text,
-            ),
-            _ => {
-                let tokens = self.tokenize_prompt(prompt)?;
-                self.complete_with(PromptSource::Tokens(tokens), options, cancel, on_text)
-            }
-        }
+        let source = match prompt.parts.as_slice() {
+            [PromptPart::Text(text)] => PromptSource::Text {
+                text,
+                add_special_tokens: prompt.add_special_tokens,
+                root_chars: None,
+            },
+            _ => PromptSource::Tokens(self.tokenize_prompt(prompt)?),
+        };
+        self.complete_source(source, options, cancel, sink)
     }
 
     /// Run a multimodal completion: the plugin tokenises and prefills the
@@ -4009,7 +4124,7 @@ impl Engine {
             return Ok(Completion::empty(StopType::Cancelled));
         }
         let n_ctx = self.request_n_ctx(options)?;
-        self.check_token_ids(options)?;
+        self.check_token_controls(options)?;
         // The plugin owns tokenisation, so the prompt length is unknown here;
         // clamp only to the server ceiling. The prompt is checked against the
         // request's window once prefill reports its length, and the decode
@@ -4175,14 +4290,15 @@ impl Engine {
     /// Check a request's options against this model before any work, as
     /// generation does: a per-request chat template needs the server's
     /// trust, the context window and `truncate_prompt_tokens` must fit the
-    /// loaded window, and `allowed_token_ids` must name tokens of the
-    /// vocabulary.  An API layer calls it to answer a bad request with a
-    /// client error before it starts a stream.
+    /// loaded window, `allowed_token_ids` must name tokens of the
+    /// vocabulary, and `bad_words` must stay within vLLM's limits.  An API
+    /// layer calls it to answer a bad request with a client error before it
+    /// starts a stream.
     pub fn validate_options(&self, options: &GenerationOptions) -> Result<()> {
         self.check_request_template(options)?;
         let n_ctx = self.request_n_ctx(options)?;
         self.prompt_keep(options, n_ctx)?;
-        self.check_token_ids(options)
+        self.check_token_controls(options)
     }
 
     /// Refuse a request's own chat template unless the server trusts them
@@ -4218,30 +4334,31 @@ impl Engine {
         }
     }
 
-    /// Reject an `allowed_token_ids` list that is empty or names ids outside
-    /// the vocabulary (vLLM's checks): either would leave nothing to sample.
-    fn check_token_ids(&self, options: &GenerationOptions) -> Result<()> {
-        let Some(allowed) = &options.allowed_token_ids else {
-            return Ok(());
-        };
-        if allowed.is_empty() {
-            return Err(JoshuaError::InvalidRequest(
-                "allowed_token_ids must not be empty".to_string(),
-            ));
+    /// Reject the token controls vLLM rejects before any work: an
+    /// `allowed_token_ids` list that is empty or names ids outside the
+    /// vocabulary (either would leave nothing to sample), and `bad_words`
+    /// past its limits (see [`Self::bad_word_sequences`]).
+    fn check_token_controls(&self, options: &GenerationOptions) -> Result<()> {
+        if let Some(allowed) = &options.allowed_token_ids {
+            if allowed.is_empty() {
+                return Err(JoshuaError::InvalidRequest(
+                    "allowed_token_ids must not be empty".to_string(),
+                ));
+            }
+            let vocab = self.vocab_size();
+            let outside: Vec<u32> = allowed
+                .iter()
+                .copied()
+                .filter(|&id| id as usize >= vocab)
+                .collect();
+            if !outside.is_empty() {
+                return Err(JoshuaError::InvalidRequest(format!(
+                    "allowed_token_ids contains out-of-vocab token ids {outside:?} \
+                     (vocabulary size {vocab})"
+                )));
+            }
         }
-        let vocab = self.vocab_size();
-        let outside: Vec<u32> = allowed
-            .iter()
-            .copied()
-            .filter(|&id| id as usize >= vocab)
-            .collect();
-        if !outside.is_empty() {
-            return Err(JoshuaError::InvalidRequest(format!(
-                "allowed_token_ids contains out-of-vocab token ids {outside:?} \
-                 (vocabulary size {vocab})"
-            )));
-        }
-        Ok(())
+        self.bad_word_sequences(&options.bad_words).map(|_| ())
     }
 
     /// [`Engine::request_n_ctx`] for an already-validated request: clamps
@@ -4278,10 +4395,12 @@ impl Engine {
     ///
     /// A text prompt's `root_chars` is where its shared head (system prompt
     /// and tools) ends, for the prefix cache's root entry; see
-    /// [`Self::prompt_root_chars`].
+    /// [`Self::prompt_root_chars`].  `reasoning_open` is
+    /// [`Self::prompt_opens_reasoning`] of the prompt.
     fn complete_with(
         &self,
         prompt: PromptSource<'_>,
+        reasoning_open: bool,
         options: &GenerationOptions,
         cancel: Option<&AtomicBool>,
         mut on_text: Option<&mut (dyn FnMut(&str) + '_)>,
@@ -4329,6 +4448,13 @@ impl Engine {
         let prompt_tokens = prompt_tokens.as_slice();
         let n_prompt = prompt_tokens.len();
 
+        if n_prompt == 0 {
+            // Nothing to predict from (vLLM's check; a model without BOS
+            // tokenizes empty text to nothing).
+            return Err(JoshuaError::InvalidRequest(
+                "The decoder prompt cannot be empty".to_string(),
+            ));
+        }
         if n_prompt >= n_ctx {
             return Err(JoshuaError::PromptTooLong(n_prompt, n_ctx));
         }
@@ -4336,11 +4462,6 @@ impl Engine {
         // Clamp the client-supplied generation length to the server ceiling
         // and the remaining context window.
         let options = &self.clamp_options(options, Some(n_prompt));
-        // Whether the prompt leaves the model inside a reasoning block: its
-        // last opening tag comes after its last closing one.
-        let reasoning_open = self.reasoning_tags.as_ref().is_some_and(|(start, end)| {
-            rfind_tokens(prompt_tokens, start) > rfind_tokens(prompt_tokens, end)
-        });
 
         // ── Validate the structured-output constraint before any backend work ─
         // A malformed `response_format` (or a tokenizer that cannot support
@@ -4350,8 +4471,9 @@ impl Engine {
         if options.constraint.is_some() {
             self.constraint_matcher(options)?;
         }
-        // Likewise a token restriction that leaves nothing to sample.
-        self.check_token_ids(options)?;
+        // Likewise a token restriction that leaves nothing to sample, or
+        // bad words past their limits.
+        self.check_token_controls(options)?;
 
         // ── Acquire a session, generate, retry on CPU if the NPU fails ──────
         // Prefer a pooled instance whose state already covers a prefix of
@@ -4706,7 +4828,9 @@ impl Engine {
             controls: self.logit_controls(options, seed, penalty_seed, n_ctx),
             ..Default::default()
         };
-        let bad_words = self.bad_word_sequences(&options.bad_words);
+        // Checked before the session was taken; at most `MAX_BAD_WORDS`
+        // short sequences to tokenize again here.
+        let bad_words = self.bad_word_sequences(&options.bad_words)?;
         let mut constraint = self.constraint_matcher(options)?;
         // A user stop string could truncate the document before the grammar
         // completes, producing invalid JSON.  The grammar's own EOS is the
@@ -5186,21 +5310,52 @@ impl Engine {
         controls
     }
 
-    /// Token sequences for vLLM's `bad_words`: each word with and without a
-    /// leading space.
-    fn bad_word_sequences(&self, words: &[String]) -> Vec<Vec<u32>> {
+    /// Token sequences for vLLM's `bad_words`, by its rules
+    /// (`SamplingParams.update_from_tokenizer`): each distinct word without
+    /// its leading whitespace, plus the space-prefixed form when that is
+    /// as long and starts with a different token (a word token of its
+    /// own).  An empty word, one that tokenizes to nothing, more than
+    /// [`MAX_BAD_WORDS`] sequences or more than [`MAX_BAD_WORD_TOKENS`]
+    /// tokens in all is a client error; tokenizing stops at the first
+    /// sequence past the limit, so a long list costs no more than that.
+    fn bad_word_sequences(&self, words: &[String]) -> Result<Vec<Vec<u32>>> {
+        let invalid = |message: String| Err(JoshuaError::InvalidRequest(message));
+        let mut seen = std::collections::HashSet::new();
         let mut out: Vec<Vec<u32>> = Vec::new();
         for word in words {
+            if word.is_empty() {
+                return invalid("bad_words cannot contain an empty string.".to_string());
+            }
+            if !seen.insert(word.as_str()) {
+                continue;
+            }
             let word = word.trim_start();
-            for text in [word.to_string(), format!(" {word}")] {
-                if let Ok(ids) = self.tokenize(&text, false) {
-                    if !ids.is_empty() && !out.contains(&ids) {
-                        out.push(ids);
-                    }
+            let plain = self.tokenize(word, false)?;
+            if plain.is_empty() {
+                return invalid(
+                    "bad_words entries must tokenize to at least one token.".to_string(),
+                );
+            }
+            let spaced = self.tokenize(&format!(" {word}"), false)?;
+            let own_word = spaced.len() == plain.len() && spaced.first() != plain.first();
+            for sequence in std::iter::once(plain).chain(own_word.then_some(spaced)) {
+                out.push(sequence);
+                if out.len() > MAX_BAD_WORDS {
+                    return invalid(format!(
+                        "Too many bad words after tokenization: {}. The max number is \
+                         {MAX_BAD_WORDS}.",
+                        out.len()
+                    ));
                 }
             }
         }
-        out
+        let total: usize = out.iter().map(Vec::len).sum();
+        if total > MAX_BAD_WORD_TOKENS {
+            return invalid(format!(
+                "Too many total bad word tokens: {total}. The max is {MAX_BAD_WORD_TOKENS}."
+            ));
+        }
+        Ok(out)
     }
 
     /// A draft-model session for a request whose context is `prompt`, its
@@ -7866,16 +8021,6 @@ fn detect_reasoning(
         _ => None,
     };
     (format, tags)
-}
-
-/// Where the last occurrence of `needle` in `haystack` starts.
-fn rfind_tokens(haystack: &[u32], needle: &[u32]) -> Option<usize> {
-    if needle.is_empty() || needle.len() > haystack.len() {
-        return None;
-    }
-    (0..=haystack.len() - needle.len())
-        .rev()
-        .find(|&i| haystack[i..i + needle.len()] == *needle)
 }
 
 /// Derive EOS token IDs from GGUF metadata and well-known special token strings.
@@ -10654,10 +10799,7 @@ mod tests {
     }
 
     #[test]
-    fn token_search_and_penalty_windows() {
-        assert_eq!(rfind_tokens(&[1, 2, 1, 2], &[1, 2]), Some(2));
-        assert_eq!(rfind_tokens(&[1, 2], &[3]), None);
-        assert_eq!(rfind_tokens(&[1], &[1, 2]), None);
+    fn penalty_windows() {
         assert_eq!(penalty_window(64, 4096), 64);
         assert_eq!(penalty_window(0, 4096), 0);
         assert_eq!(penalty_window(-1, 4096), 4096);
@@ -10678,6 +10820,21 @@ mod tests {
             ]
             .map(StopType::as_str),
             ["eos", "word", "limit", "none"]
+        );
+        // Tool calls end a turn as `tool_calls` only when nothing cut them.
+        let all = [
+            StopType::Eos,
+            StopType::Word,
+            StopType::Limit,
+            StopType::Cancelled,
+        ];
+        assert_eq!(
+            all.map(|s| s.chat_finish_reason(true)),
+            ["tool_calls", "tool_calls", "length", "length"]
+        );
+        assert_eq!(
+            all.map(|s| s.chat_finish_reason(false)),
+            all.map(StopType::finish_reason)
         );
     }
 

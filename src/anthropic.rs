@@ -531,21 +531,17 @@ pub fn stop_reason(stop_type: StopType, has_calls: bool) -> &'static str {
     }
 }
 
-/// Build a non-streaming response from the model's answer text (`answer`,
-/// the reasoning already split off into `reasoning`) and its completion.
+/// Build a non-streaming response from the model's output after the shared
+/// post-processing: its reasoning, the answer `prose` around its tool
+/// `calls`, and its completion.
 pub fn response(
     id: String,
     model: String,
-    answer: &str,
+    prose: &str,
     reasoning: Option<&str>,
+    calls: &[ParsedToolCall],
     completion: &Completion,
-    tools_offered: bool,
-) -> (MessagesResponse, Vec<ParsedToolCall>) {
-    let (prose, calls) = if tools_offered {
-        crate::tools::parse_tool_calls(answer)
-    } else {
-        (answer.to_string(), Vec::new())
-    };
+) -> MessagesResponse {
     let mut content = Vec::new();
     if let Some(thinking) = reasoning.filter(|r| !r.is_empty()) {
         content.push(ResponseBlock::Thinking {
@@ -554,16 +550,18 @@ pub fn response(
         });
     }
     if !prose.is_empty() {
-        content.push(ResponseBlock::Text { text: prose });
+        content.push(ResponseBlock::Text {
+            text: prose.to_string(),
+        });
     }
-    for call in &calls {
+    for call in calls {
         content.push(ResponseBlock::ToolUse {
             id: format!("toolu_{}", uuid::Uuid::new_v4().simple()),
             name: call.name.clone(),
             input: tool_input(&call.arguments),
         });
     }
-    let response = MessagesResponse {
+    MessagesResponse {
         id,
         message_type: "message".to_string(),
         role: "assistant".to_string(),
@@ -572,8 +570,7 @@ pub fn response(
         stop_reason: stop_reason(completion.stop_type, !calls.is_empty()).to_string(),
         stop_sequence: completion.stop_sequence.clone(),
         usage: MessagesUsage::from_completion(completion),
-    };
-    (response, calls)
+    }
 }
 
 #[cfg(test)]
@@ -702,32 +699,38 @@ mod tests {
     #[test]
     fn response_maps_tool_markup_to_tool_use_blocks() {
         let c = completion("", StopType::Eos, None);
-        let (response, calls) = response(
-            "msg_1".to_string(),
-            "m".to_string(),
+        let (prose, calls) = crate::tools::parse_tool_calls(
             "<tool_call>{\"name\":\"add\",\"arguments\":{\"a\":2,\"b\":2}}</tool_call>",
-            None,
-            &c,
-            true,
         );
         assert_eq!(calls.len(), 1);
+        let response = response(
+            "msg_1".to_string(),
+            "m".to_string(),
+            &prose,
+            None,
+            &calls,
+            &c,
+        );
         assert_eq!(response.stop_reason, "tool_use");
-        assert!(matches!(
-            &response.content[0],
-            ResponseBlock::ToolUse { .. }
-        ));
+        assert_eq!(response.content.len(), 1);
+        match &response.content[0] {
+            ResponseBlock::ToolUse { name, input, .. } => {
+                assert_eq!((name.as_str(), input), ("add", &json!({"a": 2, "b": 2})))
+            }
+            other => panic!("expected a tool_use block, got {other:?}"),
+        }
     }
 
     #[test]
     fn response_puts_thinking_first_and_reports_cached_tokens() {
         let c = completion("", StopType::Limit, None);
-        let (response, _) = response(
+        let response = response(
             "msg_1".to_string(),
             "m".to_string(),
             "Hi.",
             Some("The user greets me."),
+            &[],
             &c,
-            false,
         );
         let value = serde_json::to_value(&response).unwrap();
         assert_eq!(
@@ -794,15 +797,14 @@ mod tests {
     #[test]
     fn response_reports_the_matched_stop_sequence() {
         let c = completion("", StopType::Word, Some("END"));
-        let (response, calls) = response(
+        let response = response(
             "msg_1".to_string(),
             "m".to_string(),
             "hello ",
             None,
+            &[],
             &c,
-            false,
         );
-        assert!(calls.is_empty());
         assert_eq!(response.stop_reason, "stop_sequence");
         assert_eq!(response.stop_sequence.as_deref(), Some("END"));
     }

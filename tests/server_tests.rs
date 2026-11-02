@@ -885,6 +885,74 @@ async fn chat_lengths_follow_llama_cpp_and_vllm_conventions() {
     assert_eq!(status, StatusCode::OK, "{body}");
 }
 
+/// Token controls are held to vLLM's limits: a `bad_words` list past them
+/// is a 400 before any stream starts (it used to cost time quadratic in
+/// its length while holding a session), and a `logit_bias` past `f32`'s
+/// range is clamped to OpenAI's ±100 instead of turning the sampled
+/// distribution into NaN, a 500 that counted against the NPU.
+#[tokio::test]
+async fn token_controls_stay_within_vllm_limits() {
+    let app = create_router(tiny_state("server-token-limits", None));
+    let base = |extra: serde_json::Value| {
+        let mut body = serde_json::json!({
+            "model": "model",
+            "messages": [{"role": "user", "content": "a b"}],
+            "max_tokens": 3,
+            "temperature": 0.7,
+            "seed": 1,
+            "ignore_eos": true,
+        });
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        body
+    };
+    let many: Vec<String> = (0..20_000).map(|i| format!("w{i}")).collect();
+    for stream in [false, true] {
+        for (extra, needle) in [
+            (serde_json::json!({"bad_words": ["b", ""]}), "empty string"),
+            (
+                serde_json::json!({"bad_words": ["  "]}),
+                "at least one token",
+            ),
+            (serde_json::json!({"bad_words": many}), "Too many bad words"),
+            (
+                serde_json::json!({"bad_words": ["a ".repeat(1025)]}),
+                "Too many total bad word tokens",
+            ),
+        ] {
+            let mut body = base(extra.clone());
+            body["stream"] = serde_json::json!(stream);
+            let (status, text) = chat(app.clone(), body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{stream}: {text}");
+            assert!(text.contains(needle), "{needle}: {text}");
+        }
+        // Sampled, with a bias far past f32's range on `b` (id 5).
+        let mut body = base(serde_json::json!({"logit_bias": {"5": 1e39}}));
+        body["stream"] = serde_json::json!(stream);
+        let (status, text) = chat(app.clone(), body).await;
+        assert_eq!(status, StatusCode::OK, "{stream}: {text}");
+        assert!(!text.contains("error"), "{stream}: {text}");
+        let content: String = if stream {
+            sse_chunks(&text)
+                .iter()
+                .filter_map(|c| {
+                    c["choices"][0]["delta"]["content"]
+                        .as_str()
+                        .map(String::from)
+                })
+                .collect()
+        } else {
+            let response: serde_json::Value = serde_json::from_str(&text).unwrap();
+            response["choices"][0]["message"]["content"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(content.replace(' ', ""), "bbb", "{stream}: {text}");
+    }
+}
+
 /// A request's own chat template is code the server would run: refused,
 /// before any stream starts, unless the server trusts them (vLLM's
 /// `--trust-request-chat-template`).

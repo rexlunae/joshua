@@ -57,12 +57,12 @@ use uuid::Uuid;
 
 use crate::anthropic::{self, MessagesRequest};
 use crate::coordinator::{JobModel, ModelSlots, WorkerCapabilities, WorkerInfo, JOB_OWNER_HEADER, WORKER_PROTOCOL_VERSION};
-use crate::engine::{Engine, EngineOptions, StopType};
+use crate::engine::{Completion, Engine, EngineOptions};
 use crate::error::JoshuaError;
-use crate::reasoning::{ReasoningOutput, ReasoningSplitter, Split};
+use crate::reasoning::{ReasoningOutput, Split};
 use crate::sampling::SamplingProfile;
 use crate::whisper::WhisperEngine;
-use crate::tools::parse_tool_calls;
+use crate::tools::{parse_tool_calls, ParsedToolCall};
 use crate::types::{
     AssistantMessage, ChatChoice, ChatCompletionChunk, ChatCompletionRequest,
     ChatCompletionResponse, ChatMessage, DeltaContent, EmbeddingData, EmbeddingRequest,
@@ -1419,53 +1419,41 @@ async fn chat_completions(
     .map_err(ApiError::from)?;
     state.metrics.record_generation(&completion.usage);
 
-    // Reasoning first, then tool calls from the answer alone.
-    let (reasoning, mut text) = if reasoning_output.splits(false) {
-        crate::reasoning::split(
-            engine.reasoning_format(),
-            completion.reasoning_open,
-            &completion.text,
-        )
+    let answer = chat_answer(
+        &engine,
+        &completion,
+        reasoning_output.splits(false),
+        tools.is_some(),
+    );
+    let reasoning = answer
+        .reasoning
+        .filter(|_| reasoning_output != ReasoningOutput::Hidden);
+    let finish_reason = completion
+        .stop_type
+        .chat_finish_reason(!answer.calls.is_empty());
+    let (mut content, tool_calls) = if answer.calls.is_empty() {
+        (Some(answer.text), None)
     } else {
-        (None, completion.text.clone())
-    };
-    let reasoning = reasoning.filter(|_| reasoning_output != ReasoningOutput::Hidden);
-    if let Some(prefix) = &echo {
-        text.insert_str(0, prefix);
-    }
-    let natural_stop = matches!(completion.stop_type, StopType::Eos | StopType::Word);
-
-    // Extract tool calls from the output when the request offered tools.
-    let (content, tool_calls, finish_reason) = if tools.is_some() {
-        let (prose, calls) = parse_tool_calls(&text);
-        if calls.is_empty() {
-            (Some(text), None, completion.finish_reason())
-        } else {
-            let calls: Vec<ToolCall> = calls
-                .into_iter()
-                .map(|c| ToolCall {
-                    id: format!("call_{}", Uuid::new_v4().simple()),
-                    call_type: "function".to_string(),
-                    function: FunctionCallResult {
-                        name: c.name,
-                        arguments: c.arguments,
-                    },
-                })
-                .collect();
-            (
-                if prose.is_empty() { None } else { Some(prose) },
-                Some(calls),
-                // A call cut off by a cap stays `length` (llama-server, vLLM).
-                if natural_stop {
-                    "tool_calls"
-                } else {
-                    completion.finish_reason()
+        let calls: Vec<ToolCall> = answer
+            .calls
+            .into_iter()
+            .map(|c| ToolCall {
+                id: format!("call_{}", Uuid::new_v4().simple()),
+                call_type: "function".to_string(),
+                function: FunctionCallResult {
+                    name: c.name,
+                    arguments: c.arguments,
                 },
-            )
-        }
-    } else {
-        (Some(text), None, completion.finish_reason())
+            })
+            .collect();
+        let prose = Some(answer.prose).filter(|p| !p.is_empty());
+        (prose, Some(calls))
     };
+    // vLLM's `echo` goes in front of the content once the calls are out of
+    // it, as the stream sends it first.
+    if let Some(prefix) = &echo {
+        content = Some(format!("{prefix}{}", content.unwrap_or_default()));
+    }
 
     let id = format!("chatcmpl-{}", Uuid::new_v4().simple());
     let mut response = ChatCompletionResponse::new(
@@ -1689,6 +1677,130 @@ impl ChatStreamFilter {
     }
 }
 
+/// One piece of a chat completion's output, in the order to send it.
+pub(crate) enum ChatPiece<'a> {
+    /// Reasoning text.
+    Reasoning(&'a str),
+    /// Answer prose that is safe to send.
+    Text(&'a str),
+}
+
+/// The output post-processing every chat API shares, streaming or not: the
+/// reasoning is split off first (by the engine, as it decodes), then tool-call
+/// markup is withheld from the answer and the calls are parsed from the
+/// answer alone.  Each API maps the pieces onto its own wire events.
+struct ChatOutput {
+    filter: ChatStreamFilter,
+    /// The answer as the client sees it, for the tool-call parse.
+    answer: String,
+}
+
+impl ChatOutput {
+    fn new(tools: bool) -> Self {
+        Self {
+            filter: ChatStreamFilter::new(tools),
+            answer: String::new(),
+        }
+    }
+
+    /// One step of the split output: its reasoning, then the answer prose
+    /// that is safe to send now.
+    fn push(&mut self, split: &Split, emit: &mut dyn FnMut(ChatPiece<'_>)) {
+        if !split.reasoning.is_empty() {
+            emit(ChatPiece::Reasoning(&split.reasoning));
+        }
+        if !split.content.is_empty() {
+            self.answer.push_str(&split.content);
+            for text in self.filter.push(&split.content) {
+                emit(ChatPiece::Text(&text));
+            }
+        }
+    }
+
+    /// After decoding: the prose still withheld, then the tool calls parsed
+    /// from the answer.
+    fn finish(mut self, emit: &mut dyn FnMut(ChatPiece<'_>)) -> Vec<ParsedToolCall> {
+        for text in self.filter.finish(&self.answer) {
+            emit(ChatPiece::Text(&text));
+        }
+        self.filter.parse(&self.answer).1
+    }
+}
+
+/// Run a streaming chat completion through the shared post-processing:
+/// `emit` gets each piece as it is decoded, with the reasoning split off
+/// when `split` (otherwise all of it is answer).  Returns the completion and
+/// the tool calls parsed from the answer.
+pub(crate) fn stream_chat_output(
+    engine: &Engine,
+    messages: &[ChatMessage],
+    tools: Option<&[Tool]>,
+    options: &GenerationOptions,
+    cancel: &AtomicBool,
+    split: bool,
+    emit: &mut dyn FnMut(ChatPiece<'_>),
+) -> crate::error::Result<(Completion, Vec<ParsedToolCall>)> {
+    let mut output = ChatOutput::new(tools.is_some());
+    let completion = if split {
+        engine.complete_chat_streaming_split(messages, tools, options, cancel, &mut |s| {
+            output.push(&s, emit)
+        })
+    } else {
+        engine.complete_chat_streaming_detailed(messages, tools, options, cancel, &mut |delta| {
+            let s = Split {
+                content: delta.to_string(),
+                ..Default::default()
+            };
+            output.push(&s, emit)
+        })
+    }?;
+    Ok((completion, output.finish(emit)))
+}
+
+/// A finished chat completion after the shared post-processing.
+pub(crate) struct ChatAnswer {
+    /// The reasoning split off the output.
+    pub(crate) reasoning: Option<String>,
+    /// The answer: the output after its reasoning.
+    pub(crate) text: String,
+    /// The answer around its tool calls, as the tool-call parser leaves it
+    /// (the answer itself when no tools were offered).
+    pub(crate) prose: String,
+    /// The tool calls in the answer.
+    pub(crate) calls: Vec<ParsedToolCall>,
+}
+
+/// [`stream_chat_output`] for a finished completion: the reasoning split
+/// off its text when `split`, then the tool calls parsed from the answer
+/// when `tools` were offered.
+pub(crate) fn chat_answer(
+    engine: &Engine,
+    completion: &Completion,
+    split: bool,
+    tools: bool,
+) -> ChatAnswer {
+    let (reasoning, text) = if split {
+        crate::reasoning::split(
+            engine.reasoning_format(),
+            completion.reasoning_open,
+            &completion.text,
+        )
+    } else {
+        (None, completion.text.clone())
+    };
+    let (prose, calls) = if tools {
+        parse_tool_calls(&text)
+    } else {
+        (text.clone(), Vec::new())
+    };
+    ChatAnswer {
+        reasoning,
+        text,
+        prose,
+        calls,
+    }
+}
+
 /// Largest char boundary at or below `index`.
 fn floor_char_boundary(s: &str, mut index: usize) -> usize {
     while index > 0 && !s.is_char_boundary(index) {
@@ -1842,69 +1954,38 @@ fn stream_chat_completion(
     tx: tokio::sync::mpsc::UnboundedSender<String>,
     metrics: &ServerMetrics,
 ) {
-    let mut filter = ChatStreamFilter::new(tools.is_some());
     let mut emitter = ChatStreamEmitter::new(id.to_string(), model.to_string(), tx);
-    let mut splitter = if output.reasoning.splits(true) {
-        engine
-            .reasoning_splitter(messages, tools, options)
-            .unwrap_or_else(|_| ReasoningSplitter::disabled())
-    } else {
-        ReasoningSplitter::disabled()
-    };
     let show_reasoning = output.reasoning != ReasoningOutput::Hidden;
     if let Some(prefix) = &output.echo {
         emitter.text(prefix);
     }
-    // The answer as the client sees it, for the tool-call parse.
-    let mut content = String::new();
-    let mut forward =
-        |split: Split, emitter: &mut ChatStreamEmitter, filter: &mut ChatStreamFilter| {
-            if show_reasoning {
-                emitter.reasoning(&split.reasoning);
-            }
-            if !split.content.is_empty() {
-                content.push_str(&split.content);
-                for text in filter.push(&split.content) {
-                    emitter.text(&text);
-                }
-            }
-        };
-    let result = {
-        let mut on_text = |delta: &str| {
-            let split = splitter.push(delta);
-            forward(split, &mut emitter, &mut filter);
-        };
-        engine.complete_chat_streaming_detailed(messages, tools, options, cancel, &mut on_text)
-    };
+    let result = stream_chat_output(
+        engine,
+        messages,
+        tools,
+        options,
+        cancel,
+        output.reasoning.splits(true),
+        &mut |piece| match piece {
+            ChatPiece::Reasoning(text) if show_reasoning => emitter.reasoning(text),
+            ChatPiece::Reasoning(_) => {}
+            ChatPiece::Text(text) => emitter.text(text),
+        },
+    );
 
     match result {
-        Ok(completion) => {
+        Ok((completion, calls)) => {
             metrics.record_generation(&completion.usage);
-            forward(splitter.finish(), &mut emitter, &mut filter);
-            for withheld in filter.finish(&content) {
-                emitter.text(&withheld);
+            for (index, call) in calls.iter().enumerate() {
+                let call_id = format!("call_{}", Uuid::new_v4().simple());
+                emitter.tool_start(index, &call_id, &call.name);
+                emitter.tool_args(index, &call.arguments);
             }
-            let (_, calls) = filter.parse(&content);
-            let natural_stop = matches!(completion.stop_type, StopType::Eos | StopType::Word);
-            if calls.is_empty() {
-                emitter.finish(
-                    completion.finish_reason(),
-                    &completion.usage,
-                    &completion.timings,
-                );
-            } else {
-                for (index, call) in calls.iter().enumerate() {
-                    let call_id = format!("call_{}", Uuid::new_v4().simple());
-                    emitter.tool_start(index, &call_id, &call.name);
-                    emitter.tool_args(index, &call.arguments);
-                }
-                let reason = if natural_stop {
-                    "tool_calls"
-                } else {
-                    completion.finish_reason()
-                };
-                emitter.finish(reason, &completion.usage, &completion.timings);
-            }
+            emitter.finish(
+                completion.stop_type.chat_finish_reason(!calls.is_empty()),
+                &completion.usage,
+                &completion.timings,
+            );
         }
         Err(error) => {
             tracing::error!("streaming completion failed: {error}");
@@ -2030,19 +2111,15 @@ async fn messages(
     .map_err(ApiError::from)?;
     state.metrics.record_generation(&completion.usage);
 
-    let (reasoning, answer) = crate::reasoning::split(
-        engine.reasoning_format(),
-        completion.reasoning_open,
-        &completion.text,
-    );
+    let answer = chat_answer(&engine, &completion, true, tools_offered);
     let id = format!("msg_{}", Uuid::new_v4().simple());
-    let (response, _) = anthropic::response(
+    let response = anthropic::response(
         id,
         model,
-        &answer,
-        reasoning.as_deref(),
+        &answer.prose,
+        answer.reasoning.as_deref(),
+        &answer.calls,
         &completion,
-        tools_offered,
     );
     Ok(Json(response).into_response())
 }
@@ -2278,38 +2355,23 @@ fn stream_messages(
     metrics: &ServerMetrics,
     input_tokens: u32,
 ) {
-    let mut filter = ChatStreamFilter::new(tools.is_some());
     let mut emitter = AnthropicStreamEmitter::new(id.to_string(), model.to_string(), tx);
-    let mut splitter = engine
-        .reasoning_splitter(messages, tools, options)
-        .unwrap_or_else(|_| ReasoningSplitter::disabled());
     emitter.message_start(input_tokens);
-    let mut content = String::new();
-    let mut forward =
-        |split: Split, emitter: &mut AnthropicStreamEmitter, filter: &mut ChatStreamFilter| {
-            emitter.thinking(&split.reasoning);
-            if !split.content.is_empty() {
-                content.push_str(&split.content);
-                for text in filter.push(&split.content) {
-                    emitter.text(&text);
-                }
-            }
-        };
-    let result = {
-        let mut on_text = |delta: &str| {
-            let split = splitter.push(delta);
-            forward(split, &mut emitter, &mut filter);
-        };
-        engine.complete_chat_streaming_detailed(messages, tools, options, cancel, &mut on_text)
-    };
+    let result = stream_chat_output(
+        engine,
+        messages,
+        tools,
+        options,
+        cancel,
+        true,
+        &mut |piece| match piece {
+            ChatPiece::Reasoning(text) => emitter.thinking(text),
+            ChatPiece::Text(text) => emitter.text(text),
+        },
+    );
     match result {
-        Ok(completion) => {
+        Ok((completion, calls)) => {
             metrics.record_generation(&completion.usage);
-            forward(splitter.finish(), &mut emitter, &mut filter);
-            for withheld in filter.finish(&content) {
-                emitter.text(&withheld);
-            }
-            let (_, calls) = filter.parse(&content);
             emitter.finish(&calls, &completion);
         }
         Err(error) => {

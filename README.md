@@ -398,8 +398,8 @@ Besides `model`, `messages`, `stream` and `tools`:
 | `presence_penalty`, `frequency_penalty` | OpenAI penalties, `-2.0..=2.0` |
 | `repeat_last_n` | Penalty window (default 64; `0` off, `-1` the whole context) |
 | `typical_p`, `top_n_sigma`, `xtc_probability`, `xtc_threshold`, `mirostat`, `mirostat_tau`, `mirostat_eta`, `dry_multiplier`, `dry_base`, `dry_allowed_length`, `dry_penalty_last_n`, `dry_sequence_breakers` | llama.cpp's samplers, same semantics; all off by default (`dynatemp_range` other than 0 is a **400**) |
-| `logit_bias` | OpenAI's `{"<id>": bias}` or llama.cpp's `[[id or text, bias], …]`; `false` bans a token |
-| `ignore_eos`, `min_tokens`, `stop_token_ids`, `include_stop_str_in_output`, `allowed_token_ids`, `bad_words`, `truncate_prompt_tokens` | vLLM's sampling extras; an empty or out-of-vocabulary `allowed_token_ids`, controls that together leave no token to sample, and a `truncate_prompt_tokens` of 0 or larger than the context are a **400** (`-1` keeps as much of the prompt as the context holds) |
+| `logit_bias` | OpenAI's `{"<id>": bias}` or llama.cpp's `[[id or text, bias], …]`; `false` bans a token, and numeric biases are clamped to `-100..=100` as vLLM does |
+| `ignore_eos`, `min_tokens`, `stop_token_ids`, `include_stop_str_in_output`, `allowed_token_ids`, `bad_words`, `truncate_prompt_tokens` | vLLM's sampling extras; an empty or out-of-vocabulary `allowed_token_ids`, `bad_words` past vLLM's limits (an empty entry, one that tokenizes to nothing, more than 128 token sequences or 1024 tokens in all), controls that together leave no token to sample, and a `truncate_prompt_tokens` of 0 or larger than the context are a **400** (`-1` keeps as much of the prompt as the context holds) |
 | `seed` | Reproducible sampling; negative (llama.cpp's `-1`) means random |
 | `reasoning_effort` | `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` — see below |
 | `reasoning` | `{"effort": …, "enabled": bool, "max_tokens": n}` (OpenAI Responses / OpenRouter shape) |

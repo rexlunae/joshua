@@ -14,7 +14,9 @@ use common::{
 };
 use joshua::fim::InfillChunk;
 use joshua::reasoning::{split, ReasoningFormat};
-use joshua::types::{LogitBias, TokenRef, MAX_TOKENS_UNLIMITED, TRUNCATE_TO_CONTEXT};
+use joshua::types::{
+    FunctionDef, LogitBias, TokenRef, Tool, MAX_TOKENS_UNLIMITED, TRUNCATE_TO_CONTEXT,
+};
 use joshua::{
     ChatMessage, Engine, EngineOptions, GenerationOptions, JoshuaError, PromptPart, RawPrompt,
     SamplingOverrides, SamplingProfile, StopType,
@@ -653,11 +655,168 @@ fn reasoning_budget_forces_the_end_tag() {
         .unwrap();
     assert_eq!(&message.token_ids[1..3], &[C, 15]);
 
-    // The streaming splitter starts inside the reasoning for this prompt.
-    let splitter = engine
-        .reasoning_splitter(&messages, None, &think_options(5, None))
+    // A split stream starts from the same prompt state, so it splits the
+    // text as the one-shot split of the completion does.
+    let (mut reasoning, mut content) = (String::new(), String::new());
+    let cancel = AtomicBool::new(false);
+    let streamed = engine
+        .complete_chat_streaming_split(
+            &messages,
+            None,
+            &think_options(5, Some(2)),
+            &cancel,
+            &mut |piece| {
+                reasoning.push_str(&piece.reasoning);
+                content.push_str(&piece.content);
+            },
+        )
         .unwrap();
-    assert!(splitter.in_reasoning());
+    assert!(streamed.reasoning_open);
+    let (whole_reasoning, whole_content) = split(engine.reasoning_format(), true, &streamed.text);
+    assert_eq!(
+        (Some(reasoning.as_str()), content.as_str()),
+        (whole_reasoning.as_deref(), whole_content.as_str())
+    );
+    assert_eq!(reasoning, text_of(&engine, &streamed.token_ids[..2]));
+
+    // The rule reads the prompt's text, whatever form it came in: the
+    // rendered chat's token ids open the block too, and a prompt that
+    // closes it does not.
+    let rendered = engine
+        .apply_chat_template(&messages, None, &think_options(5, None))
+        .unwrap();
+    let ids = engine.tokenize(&rendered, false).unwrap();
+    for prompt in [RawPrompt::text(rendered.clone()), RawPrompt::tokens(ids)] {
+        let c = engine
+            .complete_prompt(&prompt, &think_options(2, None))
+            .unwrap();
+        assert!(c.reasoning_open);
+        assert_eq!(c.reasoning_tokens, Some(2));
+    }
+    let closed = engine
+        .complete_prompt(
+            &RawPrompt::text(format!("{rendered} a </think>")),
+            &think_options(2, None),
+        )
+        .unwrap();
+    assert!(!closed.reasoning_open);
+    assert_eq!(closed.reasoning_tokens, Some(0));
+}
+
+#[test]
+fn empty_prompts_are_client_errors() {
+    let engine = engine("core-empty-prompt");
+    // The tiny tokenizer adds no BOS, so empty text is no tokens either.
+    for prompt in [
+        RawPrompt::tokens(vec![]),
+        RawPrompt::text(""),
+        RawPrompt::text("").with_special_tokens(false),
+        RawPrompt::mixed(vec![]),
+    ] {
+        match engine.complete_prompt(&prompt, &greedy(4)) {
+            Err(JoshuaError::InvalidRequest(message)) => {
+                assert!(message.contains("prompt cannot be empty"), "{message}")
+            }
+            other => panic!("an empty prompt must be refused, got {other:?}"),
+        }
+    }
+    // The next request is served.
+    assert!(engine
+        .complete_prompt(&RawPrompt::text("hello a"), &greedy(2))
+        .is_ok());
+}
+
+#[test]
+fn bad_words_follow_vllm_limits() {
+    let engine = engine("core-bad-words");
+    let prompt = RawPrompt::text("hello a b");
+    let words = |words: Vec<String>| GenerationOptions {
+        bad_words: words,
+        allowed_token_ids: Some(vec![B, C]),
+        ignore_eos: true,
+        ..greedy(4)
+    };
+    let refused = |options: GenerationOptions, needle: &str| {
+        for result in [
+            engine.validate_options(&options),
+            engine.complete_prompt(&prompt, &options).map(|_| ()),
+        ] {
+            match result {
+                Err(JoshuaError::InvalidRequest(message)) => {
+                    assert!(message.contains(needle), "{needle}: {message}")
+                }
+                other => panic!("{needle}: expected a client error, got {other:?}"),
+            }
+        }
+    };
+    refused(words(vec!["b".into(), String::new()]), "empty string");
+    refused(words(vec!["  ".into()]), "at least one token");
+    // More sequences than vLLM's 128, however long the list: tokenizing
+    // stops at the first one past the limit.
+    let many: Vec<String> = (0..200_000).map(|i| format!("w{i}")).collect();
+    refused(words(many), "Too many bad words after tokenization: 129");
+    // More than 1024 tokens across them.
+    refused(
+        words(vec!["a ".repeat(1025)]),
+        "Too many total bad word tokens: 1025",
+    );
+
+    // Repeats count once, so a long list of one word is still one word.
+    let c = engine
+        .complete_prompt(&prompt, &words(vec!["b".into(); 1000]))
+        .unwrap();
+    assert_eq!(c.token_ids, vec![C; 4]);
+    let at_limit: Vec<String> = (0..127)
+        .map(|i| format!("w{i}"))
+        .chain(["b".to_string()])
+        .collect();
+    let c = engine.complete_prompt(&prompt, &words(at_limit)).unwrap();
+    assert_eq!(c.token_ids, vec![C; 4]);
+}
+
+#[test]
+fn apply_chat_template_renders_the_prompt_generation_uses() {
+    let dir = model_dir("core-stable-chat");
+    write_tiny_llama_gguf(&dir.join("model.gguf"));
+    let engine = Engine::with_options(&dir, EngineOptions::with_n_ctx(64).env_to_user(true))
+        .unwrap()
+        .with_chat_template(
+            "{% for t in tools %}{{ t.function.name }} {% endfor %}\
+             {% for m in messages %}{{ m.role }} {{ m.content }} {% endfor %}",
+        );
+    let tool = |name: &str| Tool {
+        tool_type: "function".into(),
+        function: FunctionDef {
+            name: name.into(),
+            description: None,
+            parameters: None,
+        },
+    };
+    let (ab, ba) = ([tool("a"), tool("b")], [tool("b"), tool("a")]);
+    let messages = [
+        ChatMessage::text("system", "c\n<env>\nd\n</env>"),
+        ChatMessage::text("user", "e"),
+    ];
+    let options = GenerationOptions::default();
+    let render = |tools: &[Tool]| {
+        engine
+            .apply_chat_template(&messages, Some(tools), &options)
+            .unwrap()
+    };
+    // Rendering alone does not record a tool order...
+    assert!(render(&ba).starts_with("b a "));
+    // ...nor does counting...
+    engine
+        .count_chat_tokens(&messages, Some(&ba), &options)
+        .unwrap();
+    assert!(render(&ab).starts_with("a b "));
+    // ...generation does, and later renders follow it as later generations
+    // do.  The `<env>` block moves to the user message in both.
+    engine
+        .complete_chat_detailed(&messages, Some(&ab), &greedy(1))
+        .unwrap();
+    assert_eq!(render(&ba), render(&ab));
+    assert_eq!(render(&ba), "a b system c\n user <env>\nd\n</env>\n\ne ");
 }
 
 #[test]
