@@ -147,8 +147,8 @@ of every possible inference failure.
 
 Converter PR `rexlunae/ds4-convert#1` has merged with the FP4 nibble fix.
 At the time of the October 30 sampling, the corrected GGUF was still regenerating at
-`/home/tserica/models/DSV41-REAP272E-balanced-fp4fix.gguf`;
-it was **not** used, interrupted, or replaced. Original `/tank` files were
+`/home/tserica/models/DSV41-REAP272E-balanced-fp4fix.gguf` (since moved to
+`/tank`, see below); it was **not** used, interrupted, or replaced. Original `/tank` files were
 untouched. This historical sample covered only the original artifact, not
 corrected-model parity or generation. The October 31 results below supersede
 that pending status with completed corrected-artifact sampling and CPU raw/chat
@@ -159,6 +159,10 @@ inference path.
 ### October 31: corrected artifact and CPU generation
 
 The separate regeneration completed on kleya with converter exit status 0.
+On November 1 the corrected file moved to kleya's long-term model storage,
+`/tank/share/models/DSV41-REAP272E-balanced-fp4fix.gguf`. rsync verified the
+copy before removing the original. The commands below use that path; the
+October 31 runs read the same bytes from `/home/tserica/models/`.
 `/home/tserica/ds4-fp4fix-run.log` reports all 1,046 tensors written. A read-only
 header/directory audit of the corrected path found 1,046 tensors and checked
 every tensor's encoded extent against the 290,070,476,416-byte file. The final
@@ -198,7 +202,7 @@ The following greedy chat run used the corrected file and its embedded template:
 systemd-run --user --scope --quiet -p MemoryMax=16G -p MemorySwapMax=0 \
   timeout --signal=TERM --kill-after=10s 900s env RUST_LOG=info \
   /usr/bin/time -v nice -n19 ionice -c3 /tmp/joshua-175-main-99d2ddb run \
-  --model /home/tserica/models/DSV41-REAP272E-balanced-fp4fix.gguf \
+  --model /tank/share/models/DSV41-REAP272E-balanced-fp4fix.gguf \
   --device cpu --temperature 0 --max-tokens 80 --n-ctx 128 --lazy-weights \
   --prefetch-model=false --pin-hot-weights=false --expert-cache 0 \
   --ssd-expert-cache 0 --engram-tier disk \
@@ -224,7 +228,7 @@ A CPU raw-prompt check used the existing `debug_dsv4` example, built from the
 same `99d2ddb` source, and the source directory's `tokenizer.json`:
 
 ```sh
-debug_dsv4 /home/tserica/models/DSV41-REAP272E-balanced-fp4fix.gguf \
+debug_dsv4 /tank/share/models/DSV41-REAP272E-balanced-fp4fix.gguf \
   /tank/share/models/DeepSeek-V4.1-Flash-REAP-272E/tokenizer.json \
   'The capital of France is' 8
 ```
