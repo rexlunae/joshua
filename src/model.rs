@@ -529,6 +529,16 @@ impl ModelSnapshot {
         }
     }
 
+    /// The LoRA adapter set the state was computed under (`None`: the base
+    /// model).
+    pub fn adapter_key(&self) -> Option<crate::lora::AdapterKey> {
+        match self {
+            Self::Qwen(s) => s.adapter_key(),
+            Self::DeepSeek2(s) => s.adapter_key(),
+            Self::NemotronH(s) => s.adapter_key(),
+        }
+    }
+
     /// An independent copy on `device`.
     pub fn duplicate(&self, device: &Device) -> Result<Self> {
         Ok(match self {
@@ -1111,6 +1121,42 @@ impl QuantizedModel {
     /// Whether MTP drafting is on.
     pub fn mtp_enabled(&self) -> bool {
         session!(self, m => m.mtp_enabled(), _ => false)
+    }
+
+    /// The projections this model applies LoRA deltas to, to validate
+    /// adapters against (see [`crate::lora::LoraAdapter::load`]); `None` for
+    /// loaders that apply none.
+    pub fn lora_slots(&self) -> Option<crate::lora::SlotTable> {
+        session!(self, m => m.lora_slots(), _ => None)
+    }
+
+    /// Whether this model's loader applies LoRA adapters.
+    pub fn supports_lora(&self) -> bool {
+        self.lora_slots().is_some()
+    }
+
+    /// Run every later forward pass of this session with `set`'s LoRA deltas
+    /// (`None`: the base model); see
+    /// [`crate::native_session::Session::set_adapters`].  `Ok(true)` when the
+    /// adapter set changed and the session's state was cleared.  An error for
+    /// loaders that apply no adapters, so a request for one is refused
+    /// instead of answered by the base model.
+    pub fn set_adapters(
+        &mut self,
+        set: Option<std::sync::Arc<crate::lora::ActiveSet>>,
+    ) -> Result<bool> {
+        session!(self, m => m.set_adapters(set), _ => match set {
+            Some(_) => Err(candle_core::Error::Msg(
+                "LoRA adapters are not supported for this architecture".into(),
+            )),
+            None => Ok(false),
+        })
+    }
+
+    /// The key of the LoRA adapter set this session runs (`None`: the base
+    /// model).
+    pub fn adapter_key(&self) -> Option<crate::lora::AdapterKey> {
+        session!(self, m => m.adapter_key(), _ => None)
     }
 
     /// Up to `n` MTP drafts after `next`, the token about to be fed at `pos`

@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use candle_core::{Device, Result, Tensor};
 
+use crate::lora::{ActiveSet, AdapterKey, SlotTable};
 use crate::residency::ExpertResidency;
 use crate::token_embedding::TokenEmbedding;
 
@@ -34,6 +35,10 @@ pub struct LayerInput<'a> {
     /// is about to overwrite (see [`LayerStack::snapshot_state`]).  Prefill
     /// sets `false`: it is never partially undone.
     pub verify: bool,
+    /// The LoRA deltas this input runs with (see [`crate::lora`]), or `None`
+    /// for the base model.  A loader that applies them reports a
+    /// [`LayerStack::lora_slots`] table; the MTP block always runs without.
+    pub lora: Option<&'a ActiveSet>,
 }
 
 /// A loader's immutable weights, seen as an embedding, a stack of decoder
@@ -63,6 +68,14 @@ pub trait LayerStack: Send + Sync + 'static {
     /// session then keeps it, at the cost of a host copy of each input.
     fn wants_tokens(&self) -> bool {
         false
+    }
+
+    /// The projections that take a LoRA delta from [`LayerInput::lora`], to
+    /// validate adapters against.  `None` (the default) for weights that
+    /// apply none: a session over them refuses adapters instead of silently
+    /// running the base model.
+    fn lora_slots(&self) -> Option<SlotTable> {
+        None
     }
 
     /// Turn the token embedding `[1, seq, n_embd]` into the residual form
@@ -299,7 +312,7 @@ fn mtp_advance<W: LayerStack>(
     } else {
         first
     };
-    let input = LayerInput { mask, offset, tokens: &[], verify: false };
+    let input = LayerInput { mask, offset, tokens: &[], verify: false, lora: None };
     w.mtp_forward(&mut m.state, emb, &seeds, &input)?;
     m.len = offset + n;
     // A copy, so the seed does not hold a whole prefill's rows alive.
@@ -444,6 +457,9 @@ pub struct SessionSnapshot<W: LayerStack> {
     tokens: Vec<u32>,
     /// The MTP block's KV and seed, when the session kept one up to `pos`.
     mtp: Option<(W::State, Option<Tensor>)>,
+    /// The LoRA adapter set the state was computed under; a restore into a
+    /// session running another set (or none) is refused.
+    adapters: Option<AdapterKey>,
     device: Device,
     bytes: u64,
 }
@@ -487,6 +503,12 @@ impl<W: LayerStack> SessionSnapshot<W> {
         self.bytes
     }
 
+    /// The LoRA adapter set the state was computed under (`None`: the base
+    /// model).
+    pub fn adapter_key(&self) -> Option<AdapterKey> {
+        self.adapters
+    }
+
     /// An independent copy on `device`, for a snapshot the cache keeps while
     /// a session continues from it.
     pub fn duplicate(&self, device: &Device) -> Result<Self> {
@@ -506,6 +528,7 @@ impl<W: LayerStack> SessionSnapshot<W> {
             state,
             tokens: self.tokens.clone(),
             mtp,
+            adapters: self.adapters,
             device: device.clone(),
         })
     }
@@ -551,6 +574,9 @@ pub struct Session<W: LayerStack> {
     /// The MTP block's state while MTP drafting is on (see
     /// [`Session::set_mtp`]).
     mtp: Option<MtpState<W::State>>,
+    /// The LoRA adapters every forward pass applies (see
+    /// [`Session::set_adapters`]); `None` runs the base model.
+    lora: Option<Arc<ActiveSet>>,
 }
 
 impl<W: LayerStack> Session<W> {
@@ -569,6 +595,7 @@ impl<W: LayerStack> Session<W> {
             last_routed: vec![Vec::new(); n],
             verify_routed: vec![Vec::new(); n],
             mtp: None,
+            lora: None,
             weights,
         }
     }
@@ -580,7 +607,8 @@ impl<W: LayerStack> Session<W> {
 
     /// A fresh session over the same weights: shares every weight tensor
     /// (one `Arc` clone — no read, no upload) and starts with empty state and
-    /// a fresh routing record under the same hot-expert budget.
+    /// a fresh routing record under the same hot-expert budget, running the
+    /// base model.
     pub fn new_session(&self) -> Self {
         Self {
             weights: Arc::clone(&self.weights),
@@ -598,6 +626,7 @@ impl<W: LayerStack> Session<W> {
             last_routed: vec![Vec::new(); self.state.len()],
             verify_routed: vec![Vec::new(); self.state.len()],
             mtp: self.mtp.as_ref().map(|_| MtpState::new()),
+            lora: None,
         }
     }
 
@@ -706,6 +735,7 @@ impl<W: LayerStack> Session<W> {
             offset,
             tokens: if w.wants_tokens() { &self.tokens[..offset + seq_len] } else { &[] },
             verify: all_logits,
+            lora: self.lora.as_deref(),
         };
         // A verification pass may be rolled back past its rejected tail, so arm
         // every layer to record what it is about to overwrite before the loop
@@ -717,7 +747,9 @@ impl<W: LayerStack> Session<W> {
                 W::begin_verify(s);
             }
         }
-        if seq_len == 1 && !all_logits && self.mtp.is_none() {
+        // The fused kernel knows nothing of LoRA deltas: an adapter set takes
+        // the layer-by-layer path.
+        if seq_len == 1 && !all_logits && self.mtp.is_none() && self.lora.is_none() {
             if let Some(logits) = w.fused_decode(&mut self.state, &xs, offset)? {
                 return Ok(logits);
             }
@@ -789,6 +821,52 @@ impl<W: LayerStack> Session<W> {
         self.mtp.is_some()
     }
 
+    /// The projections these weights apply LoRA deltas to (see
+    /// [`LayerStack::lora_slots`]); `None` when they apply none.
+    pub fn lora_slots(&self) -> Option<SlotTable> {
+        self.weights.lora_slots()
+    }
+
+    /// Run every later forward pass with `set`'s LoRA deltas, or the base
+    /// model for `None`.  State computed under one adapter set is never
+    /// continued under another: when the set's [`AdapterKey`] differs from
+    /// the current one, the whole state (every layer, the MTP block, the
+    /// checkpoints) is cleared, and `Ok(true)` reports that.  Refused, with
+    /// the state untouched, for weights that apply no deltas and for a set
+    /// whose adapters were validated against weights of other shapes or
+    /// placed on another device than these weights'.
+    pub fn set_adapters(&mut self, set: Option<Arc<ActiveSet>>) -> Result<bool> {
+        if let Some(s) = &set {
+            if !self.lora.as_ref().is_some_and(|cur| Arc::ptr_eq(cur, s)) {
+                let Some(table) = self.weights.lora_slots() else {
+                    candle_core::bail!("this model's loader applies no LoRA adapters");
+                };
+                if s.base() != &table.fingerprint() {
+                    candle_core::bail!("the LoRA adapters were loaded for a different base model");
+                }
+                if !s.device().same_device(table.device()) {
+                    candle_core::bail!(
+                        "the LoRA adapters were loaded onto another device ({:?}) than this model's ({:?})",
+                        s.device().location(),
+                        table.device().location()
+                    );
+                }
+            }
+        }
+        let changed = set.as_ref().map(|s| s.key()) != self.adapter_key();
+        if changed {
+            self.clear_kv_cache();
+        }
+        self.lora = set;
+        Ok(changed)
+    }
+
+    /// The key of the LoRA adapter set this session runs (`None`: the base
+    /// model).
+    pub fn adapter_key(&self) -> Option<AdapterKey> {
+        self.lora.as_ref().map(|s| s.key())
+    }
+
     /// Draft up to `n` tokens after `next`, the token about to be fed at
     /// `pos`, with the MTP block: the row `(next, h_{pos-1})` predicts the
     /// first draft, and each further row chains the block's own output as
@@ -816,7 +894,7 @@ impl<W: LayerStack> Session<W> {
                 Some(s) => s,
                 None => emb.zeros_like()?,
             };
-            let input = LayerInput { mask: None, offset: pos + d, tokens: &[], verify: false };
+            let input = LayerInput { mask: None, offset: pos + d, tokens: &[], verify: false, lora: None };
             let out = w.mtp_forward(&mut m.state, &emb, &s, &input)?;
             ids = w.head_logits(&out)?.flatten_all()?.argmax_keepdim(0)?;
             picks.push(ids.clone());
@@ -957,6 +1035,7 @@ impl<W: LayerStack> Session<W> {
             state,
             tokens,
             mtp,
+            adapters: self.adapter_key(),
             device: device.clone(),
         }))
     }
@@ -971,9 +1050,12 @@ impl<W: LayerStack> Session<W> {
     /// Continue from `snap`: this session's state becomes the snapshot's
     /// (moved back onto the weights' device when it was parked elsewhere).
     /// Refused (`Ok(false)`, state untouched) for a snapshot taken over other
-    /// weights.
+    /// weights or under another LoRA adapter set than this session runs.
     pub fn restore(&mut self, snap: SessionSnapshot<W>) -> Result<bool> {
-        if !Arc::ptr_eq(&self.weights, &snap.weights) || snap.state.len() != self.state.len() {
+        if !Arc::ptr_eq(&self.weights, &snap.weights)
+            || snap.state.len() != self.state.len()
+            || snap.adapters != self.adapter_key()
+        {
             return Ok(false);
         }
         let device = self.weights.device().clone();
@@ -1208,6 +1290,7 @@ impl<W: LayerStack> crate::stream_prefill::StreamPrefill for Session<W> {
             offset: pos,
             tokens,
             verify: false,
+            lora: self.lora.as_deref(),
         };
         let (out, routed) = w.layer(l, &mut self.state, xs, &input)?;
         let step = self.hot_experts.begin_step(false);
