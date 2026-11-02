@@ -42,6 +42,18 @@ changes out of the patch.
 
 ## Share code without obscuring behavior
 
+- Remove duplication as you go. Before writing a conversion, mapping,
+  validation, or set of command-line flags, look for an existing one and
+  reuse or generalize it. When the code a change touches repeats logic that
+  lives elsewhere, consolidate it in the same change, keeping outputs
+  identical, rather than adding a second copy to clean up later. A sweeping
+  refactor of code the change does not touch still belongs in its own PR.
+- Build the HTTP API layers (OpenAI, Anthropic, Ollama, llama.cpp-native,
+  Responses) on one request-to-`GenerationOptions` mapping, one model-name
+  resolver, one streaming framer per wire format, and one error-envelope
+  builder per wire format, with each API's differences in a thin adapter.
+  Give binaries and subcommands one shared definition of the model-load
+  flags instead of repeating it per command.
 - Check existing shared modules before adding a loader-specific copy:
   `moe`, `mhc`, `attention`, `token_embedding`, `raw_block`, and
   `stream_prefill`. Put genuinely common behavior there; keep architecture
