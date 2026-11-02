@@ -118,6 +118,19 @@ fn backends() -> Vec<Backend> {
     v
 }
 
+/// [`backends`] plus CUDA when it is compiled in and a device is available,
+/// for the tests that also run there.
+fn backends_and_cuda() -> Vec<Backend> {
+    #[allow(unused_mut)]
+    let mut v = backends();
+    #[cfg(feature = "cuda")]
+    match Device::cuda_if_available(0) {
+        Ok(d) if !d.is_cpu() => v.push(Backend { name: "cuda", device: d }),
+        _ => eprintln!("matrix: cuda unavailable (no device)"),
+    }
+    v
+}
+
 fn fixtures() -> Vec<(&'static str, fn(&Path))> {
     vec![
         ("llama", common::write_tiny_llama_gguf as fn(&Path)),
@@ -266,14 +279,7 @@ fn mtp_draft_runs_on_every_backend() {
     common::write_tiny_qwen_mtp_gguf(&model, "qwen3moe");
     let prompt: Vec<u32> = vec![1, 4, 2, 7, 5, 9, 3, 6];
     let n = prompt.len();
-    #[allow(unused_mut)]
-    let mut backends = backends();
-    #[cfg(feature = "cuda")]
-    match Device::cuda_if_available(0) {
-        Ok(d) if !d.is_cpu() => backends.push(Backend { name: "cuda", device: d }),
-        _ => eprintln!("matrix: cuda unavailable (no device)"),
-    }
-    for backend in backends {
+    for backend in backends_and_cuda() {
         let what = format!("[mtp × {}]", backend.name);
         let mut m = joshua::quantized_qwen::with_mtp_block(|| load_mmap(&model, &backend.device));
         assert!(m.set_mtp(true), "{what}: the NextN block loads");
@@ -293,4 +299,100 @@ fn mtp_draft_runs_on_every_backend() {
             assert!((a - w).abs() <= 1e-5, "{what}: trunk logit {i} after a draft: {a} vs {w}");
         }
     }
+}
+
+/// LoRA adapters on every backend in the matrix, plus CUDA.  An adapter's
+/// weights live on the device of the model it was loaded against: there it
+/// runs and agrees with the CPU's run of the same file, prefill and decode.
+/// A set loaded onto one device is refused by a model on another (and two
+/// such adapters do not combine into one set) before the session's state is
+/// touched, instead of failing in the middle of the next forward pass.  A
+/// CPU-only build checks only the CPU reference.
+#[test]
+fn lora_adapters_run_on_the_device_they_were_loaded_onto() {
+    use joshua::lora::{ActiveSet, LoraAdapter, LoraLimits};
+    use std::sync::Arc;
+    let dir = common::model_dir("matrix-lora-qwen3");
+    let model = dir.join("model.gguf");
+    common::write_tiny_qwen_gguf(&model, "qwen3");
+    let prompt: Vec<u32> = vec![1, 4, 2, 7, 5, 9];
+    let n = prompt.len();
+    let limits = LoraLimits::default();
+    let mut cpu = load_mmap(&model, &Device::Cpu);
+    let table = cpu.lora_slots().expect("the qwen loader applies LoRA");
+    let specs: Vec<_> = table
+        .iter()
+        .enumerate()
+        .map(|(i, (k, n_out, n_in))| {
+            common::LoraSpec::new(&k.tensor_name(), 4, n_out, n_in, 1300 + 13 * i as u32)
+        })
+        .collect();
+    let adapter = dir.join("adapter.gguf");
+    common::write_lora_gguf(&adapter, table.arch(), 8.0, &specs, common::LoraDtype::F32);
+    let load_lora = |m: &QuantizedModel| {
+        let table = m.lora_slots().expect("the qwen loader applies LoRA");
+        Arc::new(LoraAdapter::load(&adapter, &table, &limits).unwrap())
+    };
+    let set = |selection: &[(Arc<LoraAdapter>, f32)]| {
+        ActiveSet::new(selection, &limits).map(|s| s.map(Arc::new))
+    };
+    let alone = |a: &Arc<LoraAdapter>| set(&[(Arc::clone(a), 1.0)]).unwrap();
+    let max_diff = |a: &[f32], b: &[f32]| {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0f32, f32::max)
+    };
+
+    let cpu_lora = load_lora(&cpu);
+    let base = logits(&mut cpu.new_session().unwrap(), &prompt, 0, &Device::Cpu);
+    cpu.set_adapters(alone(&cpu_lora)).unwrap();
+    let want = logits(&mut cpu, &prompt, 0, &Device::Cpu);
+    let want_next = logits(&mut cpu, &[3], n, &Device::Cpu);
+    // A device that dropped the delta must not pass the comparison below.
+    let shift = max_diff(&want, &base);
+    assert!(shift > 1e-3, "the adapter moves the logits by {shift}");
+
+    for backend in backends_and_cuda() {
+        if backend.device.is_cpu() {
+            continue;
+        }
+        let what = format!("[lora × {}]", backend.name);
+        let mut m = load_mmap(&model, &backend.device);
+        let dev_lora = load_lora(&m);
+        assert!(dev_lora.device().same_device(&backend.device), "{what}");
+
+        // The base model's continuation on this device, for the state check.
+        let mut plain = m.new_session().unwrap();
+        logits(&mut plain, &prompt, 0, &backend.device);
+        let base_next = logits(&mut plain, &[3], n, &backend.device);
+
+        // A CPU set is refused here, with the base prefill kept.
+        logits(&mut m, &prompt, 0, &backend.device);
+        let err = m.set_adapters(alone(&cpu_lora)).unwrap_err();
+        assert!(err.to_string().contains("another device"), "{what}: {err}");
+        assert_eq!(m.adapter_key(), None, "{what}");
+        let next = logits(&mut m, &[3], n, &backend.device);
+        let kept = max_diff(&next, &base_next);
+        assert!(kept <= 1e-5, "{what}: decode after a refused set: {kept}");
+        // And this device's set on the CPU, and the two in one set.
+        let mut c = cpu.new_session().unwrap();
+        let err = c.set_adapters(alone(&dev_lora)).unwrap_err();
+        assert!(err.to_string().contains("another device"), "{what}: {err}");
+        let mixed = set(&[(Arc::clone(&cpu_lora), 1.0), (Arc::clone(&dev_lora), 0.5)]);
+        assert!(mixed.is_err(), "{what}: adapters on two devices combined");
+
+        // The device's own set runs there and agrees with the CPU, well
+        // inside the adapter's own effect.
+        assert!(m.set_adapters(alone(&dev_lora)).unwrap(), "{what}");
+        let got = logits(&mut m, &prompt, 0, &backend.device);
+        let got_next = logits(&mut m, &[3], n, &backend.device);
+        for (step, got, want) in [("prefill", got, &want), ("decode", got_next, &want_next)] {
+            assert_spread_close(&format!("{what} {step}"), &got, want);
+            let d = max_diff(&got, want);
+            assert!(d < shift / 20.0, "{what} {step}: {d} off, shift {shift}");
+            println!("{what} {step}: {d:.1e} off the CPU, adapter shift {shift:.3}");
+        }
+    }
+    std::fs::remove_dir_all(dir).ok();
 }

@@ -27,11 +27,12 @@
 //!   that every reuse of computed state (pooled sessions, snapshots) must
 //!   match.
 //! * The delta kernels behind [`SlotDelta::apply`].  On the CPU a fused kernel
-//!   computes each output from its own input row alone, so a one-row decode
-//!   step and a many-row prefill or verification pass add bit-identical
-//!   deltas.  The scale multiplies `A·x` rather than being folded into `B`,
-//!   so a per-request scale costs no copy of `B`.  On an accelerator the
-//!   delta is two f32 matmuls on the weights' device.
+//!   adds into the base output in place and computes each output from its
+//!   own input row alone, so a one-row decode step and a many-row prefill or
+//!   verification pass add bit-identical deltas.  The scale multiplies `A·x`
+//!   rather than being folded into `B`, so a per-request scale costs no copy
+//!   of `B`.  On an accelerator the delta is two f32 matmuls on the weights'
+//!   device.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -41,7 +42,7 @@ use std::sync::Arc;
 
 use candle_core::quantized::gguf_file::Value;
 use candle_core::quantized::QMatMul;
-use candle_core::{CpuStorage, CustomOp2, DType, Device, Layout, Module, Shape, Tensor};
+use candle_core::{CpuStorage, DType, Device, InplaceOp2, Layout, Module, Tensor};
 use sha2::{Digest, Sha256};
 
 use crate::{JoshuaError, Result};
@@ -194,7 +195,10 @@ impl SlotTable {
     }
 
     /// SHA-256 of the architecture, layer count and every slot's dims: two
-    /// loaded models with the same fingerprint accept the same adapters.
+    /// loaded models with the same fingerprint accept adapters of the same
+    /// shapes.  The device is not part of it: an adapter's weights live on
+    /// the device of the table it was loaded against (see
+    /// [`LoraAdapter::device`]), and a session checks that separately.
     pub fn fingerprint(&self) -> [u8; 32] {
         let mut hash = Sha256::new();
         hash.update(b"joshua/lora-slots/v1");
@@ -374,6 +378,7 @@ impl LoraPair {
 pub struct LoraAdapter {
     digest: [u8; 32],
     base: [u8; 32],
+    device: Device,
     alpha: f32,
     task_name: Option<String>,
     prompt_prefix: Option<String>,
@@ -385,6 +390,7 @@ impl fmt::Debug for LoraAdapter {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("LoraAdapter")
             .field("digest", &Hex(&self.digest))
+            .field("device", &self.device.location())
             .field("alpha", &self.alpha)
             .field("pairs", &self.pairs.len())
             .field("bytes", &self.bytes)
@@ -595,6 +601,7 @@ impl LoraAdapter {
         Ok(Self {
             digest,
             base: table.fingerprint(),
+            device: table.device().clone(),
             alpha,
             task_name: string("adapter.lora.task_name"),
             prompt_prefix: string("adapter.lora.prompt_prefix"),
@@ -611,6 +618,11 @@ impl LoraAdapter {
     /// The [`SlotTable::fingerprint`] the adapter was validated against.
     pub fn base(&self) -> &[u8; 32] {
         &self.base
+    }
+
+    /// The device the adapter's weights live on: that table's.
+    pub fn device(&self) -> &Device {
+        &self.device
     }
 
     /// `adapter.lora.alpha` (0 when absent).
@@ -711,6 +723,7 @@ impl AdapterKey {
 pub struct ActiveSet {
     key: AdapterKey,
     base: [u8; 32],
+    device: Device,
     adapters: Vec<(Arc<LoraAdapter>, f32)>,
     layers: Vec<Option<Box<LayerLora>>>,
 }
@@ -728,7 +741,8 @@ impl ActiveSet {
     /// The set for `selection` (`(adapter, user scale)`), or `None` when
     /// every scale is 0.  Entries are applied in canonical order (see
     /// [`AdapterKey`]), so the same selection in any order computes the same
-    /// sums.  Every adapter must have been validated against the same base.
+    /// sums.  Every adapter must have been validated against the same base
+    /// and placed on the same device.
     pub fn new(selection: &[(Arc<LoraAdapter>, f32)], limits: &LoraLimits) -> Result<Option<Self>> {
         if let Some((_, s)) = selection.iter().find(|(_, s)| !s.is_finite()) {
             return Err(JoshuaError::InvalidRequest(format!(
@@ -761,6 +775,15 @@ impl ActiveSet {
                 "the selected LoRA adapters were loaded for different base models".into(),
             ));
         }
+        let device = adapters[0].0.device().clone();
+        if adapters
+            .iter()
+            .any(|(a, _)| !a.device().same_device(&device))
+        {
+            return Err(JoshuaError::InvalidRequest(
+                "the selected LoRA adapters were loaded onto different devices".into(),
+            ));
+        }
         let n_layers = adapters
             .iter()
             .flat_map(|(a, _)| a.targets())
@@ -785,6 +808,7 @@ impl ActiveSet {
         Ok(Some(Self {
             key,
             base,
+            device,
             adapters,
             layers,
         }))
@@ -797,6 +821,11 @@ impl ActiveSet {
     /// The [`SlotTable::fingerprint`] the adapters were validated against.
     pub fn base(&self) -> &[u8; 32] {
         &self.base
+    }
+
+    /// The device the adapters' weights live on.
+    pub fn device(&self) -> &Device {
+        &self.device
     }
 
     /// The adapters and user scales, in the order their deltas are summed.
@@ -841,6 +870,10 @@ impl SlotDelta {
 
     /// `y + Σ s·B(A·x)`, for `y` the base projection of `xs` (bias not yet
     /// added).  `xs` is `[…, in]` and `y` `[…, out]`.
+    ///
+    /// On the CPU the deltas are added into `y`'s own buffer, so `y` must be
+    /// the projection's fresh output: not a tensor, or a clone of one, that
+    /// anything else still reads.
     pub fn apply(&self, xs: &Tensor, y: Tensor) -> candle_core::Result<Tensor> {
         let host = self
             .terms
@@ -848,7 +881,8 @@ impl SlotDelta {
             .all(|(p, _)| matches!(p.data, PairData::Host { .. }));
         if host && xs.device().is_cpu() && y.device().is_cpu() {
             let (xs, y) = (xs.contiguous()?, y.contiguous()?);
-            return y.apply_op2_no_bwd(&xs, &CpuDelta { terms: &self.terms });
+            y.inplace_op2(&xs, &CpuDelta { terms: &self.terms })?;
+            return Ok(y);
         }
         let x = if xs.dtype() == DType::F32 {
             xs.clone()
@@ -893,37 +927,39 @@ fn run_rows(n: usize, work: usize, threads: Option<usize>, f: impl Fn(Range<usiz
     }
 }
 
-/// The CPU delta over borrowed input and base-output rows.
+/// The CPU delta over borrowed input rows, added in place into the base
+/// output rows.
 struct CpuDelta<'a> {
     terms: &'a [(Arc<LoraPair>, f32)],
 }
 
-impl CustomOp2 for CpuDelta<'_> {
+impl InplaceOp2 for CpuDelta<'_> {
     fn name(&self) -> &'static str {
         "lora-delta"
     }
 
     fn cpu_fwd(
         &self,
-        ys: &CpuStorage,
+        ys: &mut CpuStorage,
         yl: &Layout,
         xs: &CpuStorage,
         xl: &Layout,
-    ) -> candle_core::Result<(CpuStorage, Shape)> {
+    ) -> candle_core::Result<()> {
         let (Some((y0, y1)), Some((x0, x1))) = (yl.contiguous_offsets(), xl.contiguous_offsets())
         else {
             candle_core::bail!("LoRA delta: non-contiguous input");
         };
-        let y = &ys.as_slice::<f32>()?[y0..y1];
+        let CpuStorage::F32(ys) = ys else {
+            candle_core::bail!("LoRA delta: the base output is not f32");
+        };
         let x = &xs.as_slice::<f32>()?[x0..x1];
         let n_out = yl.dims().last().copied().unwrap_or(0);
         let n_in = xl.dims().last().copied().unwrap_or(0);
-        let out = delta_rows(self.terms, x, y, n_in, n_out, None)?;
-        Ok((CpuStorage::F32(out), yl.shape().clone()))
+        delta_rows(self.terms, x, &mut ys[y0..y1], n_in, n_out, None)
     }
 }
 
-/// `out[m, o] = y[m, o] + Σₖ Σⱼ (sₖ · tₖ[m, j]) · Bₖ[o, j]` with
+/// `y[m, o] += Σₖ Σⱼ (sₖ · tₖ[m, j]) · Bₖ[o, j]` with
 /// `tₖ[m, j] = Aₖ[j, :] · x[m, :]` (a SIMD dot).
 ///
 /// Every element is one fixed sequence of operations over its own input row
@@ -934,11 +970,11 @@ impl CustomOp2 for CpuDelta<'_> {
 fn delta_rows(
     terms: &[(Arc<LoraPair>, f32)],
     x: &[f32],
-    y: &[f32],
+    y: &mut [f32],
     n_in: usize,
     n_out: usize,
     threads: Option<usize>,
-) -> candle_core::Result<Vec<f32>> {
+) -> candle_core::Result<()> {
     if n_in == 0 || n_out == 0 || x.len() % n_in != 0 || y.len() != x.len() / n_in * n_out {
         candle_core::bail!(
             "LoRA delta: {} inputs of width {n_in} for {} outputs of width {n_out}",
@@ -977,8 +1013,7 @@ fn delta_rows(
         });
         stages.push((bt.as_slice(), r, *scale, t));
     }
-    let mut out = y.to_vec();
-    let dst = crate::simd::DstPtr::new(&mut out);
+    let dst = crate::simd::DstPtr::new(y);
     let rank_sum: usize = stages.iter().map(|s| s.1).sum();
     run_rows(n_out, m * rank_sum, threads, |outs| {
         for row in 0..m {
@@ -996,41 +1031,30 @@ fn delta_rows(
             }
         }
     });
-    Ok(out)
+    Ok(())
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod testing {
+    //! Deterministic values and an f64 reference for the delta, shared by the
+    //! kernel tests here and the loaders' hook tests.
     use super::*;
 
-    fn values(n: usize, seed: u32) -> Vec<f32> {
+    /// `n` deterministic values in `[-amp, amp)` (xorshift32).
+    pub fn values(n: usize, seed: u32, amp: f32) -> Vec<f32> {
         let mut state = seed | 1;
         (0..n)
             .map(|_| {
                 state ^= state << 13;
                 state ^= state >> 17;
                 state ^= state << 5;
-                ((state % 2000) as f32 / 1000.0 - 1.0) * 0.5
+                ((state % 2000) as f32 / 1000.0 - 1.0) * amp
             })
             .collect()
     }
 
-    fn pair(rank: usize, n_in: usize, n_out: usize, seed: u32) -> Arc<LoraPair> {
-        Arc::new(
-            LoraPair::new(
-                values(rank * n_in, seed),
-                values(n_out * rank, seed + 1),
-                rank,
-                n_in,
-                n_out,
-                &Device::Cpu,
-            )
-            .unwrap(),
-        )
-    }
-
-    /// `y + Σ s·B(A·x)` in f64, row by row.
-    fn reference(
+    /// `y + Σ s·B(A·x)` in f64, row by row, for pairs held on the host.
+    pub fn reference(
         terms: &[(Arc<LoraPair>, f32)],
         x: &[f32],
         y: &[f32],
@@ -1060,6 +1084,44 @@ mod tests {
         }
         out
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testing::reference;
+    use super::*;
+
+    fn values(n: usize, seed: u32) -> Vec<f32> {
+        super::testing::values(n, seed, 0.5)
+    }
+
+    fn pair(rank: usize, n_in: usize, n_out: usize, seed: u32) -> Arc<LoraPair> {
+        Arc::new(
+            LoraPair::new(
+                values(rank * n_in, seed),
+                values(n_out * rank, seed + 1),
+                rank,
+                n_in,
+                n_out,
+                &Device::Cpu,
+            )
+            .unwrap(),
+        )
+    }
+
+    /// [`delta_rows`] added into a copy of `y`.
+    fn added(
+        terms: &[(Arc<LoraPair>, f32)],
+        x: &[f32],
+        y: &[f32],
+        n_in: usize,
+        n_out: usize,
+        threads: Option<usize>,
+    ) -> candle_core::Result<Vec<f32>> {
+        let mut out = y.to_vec();
+        delta_rows(terms, x, &mut out, n_in, n_out, threads)?;
+        Ok(out)
+    }
 
     #[test]
     fn delta_matches_f64_reference() {
@@ -1070,7 +1132,7 @@ mod tests {
         ];
         let x = values(m * n_in, 21);
         let y = values(m * n_out, 22);
-        let got = delta_rows(&terms, &x, &y, n_in, n_out, None).unwrap();
+        let got = added(&terms, &x, &y, n_in, n_out, None).unwrap();
         let want = reference(&terms, &x, &y, n_in, n_out);
         for (i, (g, w)) in got.iter().zip(&want).enumerate() {
             assert!((*g as f64 - w).abs() < 1e-5, "element {i}: {g} vs {w}");
@@ -1088,18 +1150,18 @@ mod tests {
         ];
         let x = values(m * n_in, 31);
         let y = values(m * n_out, 32);
-        let all = delta_rows(&terms, &x, &y, n_in, n_out, Some(1)).unwrap();
+        let all = added(&terms, &x, &y, n_in, n_out, Some(1)).unwrap();
         for threads in [2, 3, 8] {
-            let par = delta_rows(&terms, &x, &y, n_in, n_out, Some(threads)).unwrap();
+            let par = added(&terms, &x, &y, n_in, n_out, Some(threads)).unwrap();
             assert_eq!(par, all, "{threads} threads");
         }
         assert_eq!(
-            delta_rows(&terms, &x, &y, n_in, n_out, None).unwrap(),
+            added(&terms, &x, &y, n_in, n_out, None).unwrap(),
             all,
             "global pool"
         );
         for row in 0..m {
-            let one = delta_rows(
+            let one = added(
                 &terms,
                 &x[row * n_in..(row + 1) * n_in],
                 &y[row * n_out..(row + 1) * n_out],
@@ -1113,7 +1175,9 @@ mod tests {
     }
 
     /// The accelerator path (two matmuls, then scale and add) agrees with the
-    /// CPU kernel, for 2-D and 3-D activations.
+    /// CPU kernel, for 2-D and 3-D activations and for rows narrowed out of
+    /// a larger buffer (contiguous at an offset, where the CPU kernel adds
+    /// in place).
     #[test]
     fn tensor_path_matches_cpu_kernel() {
         let (n_in, n_out, m) = (32, 20, 3);
@@ -1127,14 +1191,27 @@ mod tests {
             SlotDelta::from_terms(vec![(Arc::new(p), 1.25)])
         };
         let (cpu, dev) = (mk(false), mk(true));
-        for shape in [vec![m, n_in], vec![1, m, n_in]] {
-            let x = Tensor::from_vec(values(m * n_in, 43), shape.as_slice(), &Device::Cpu).unwrap();
-            let mut out_shape = shape.clone();
-            *out_shape.last_mut().unwrap() = n_out;
-            let y = Tensor::from_vec(values(m * n_out, 44), out_shape.as_slice(), &Device::Cpu)
-                .unwrap();
-            let a = cpu.apply(&x, y.clone()).unwrap();
-            let b = dev.apply(&x, y).unwrap();
+        for (shape, skip) in [
+            (vec![m, n_in], 0),
+            (vec![1, m, n_in], 0),
+            (vec![m, n_in], 2),
+        ] {
+            let d = shape.len() - 2;
+            // `skip` leading rows of a larger buffer, narrowed away.
+            let rows = |width: usize, seed: u32| {
+                let mut full = shape.clone();
+                full[d] += skip;
+                *full.last_mut().unwrap() = width;
+                let n = full.iter().product();
+                Tensor::from_vec(values(n, seed), full.as_slice(), &Device::Cpu)
+                    .unwrap()
+                    .narrow(d, skip, m)
+                    .unwrap()
+            };
+            let x = rows(n_in, 43);
+            // Each path gets its own base output: the CPU kernel adds into it.
+            let a = cpu.apply(&x, rows(n_out, 44)).unwrap();
+            let b = dev.apply(&x, rows(n_out, 44)).unwrap();
             assert_eq!(a.dims(), b.dims());
             let (a, b): (Vec<f32>, Vec<f32>) = (
                 a.flatten_all().unwrap().to_vec1().unwrap(),
@@ -1149,9 +1226,9 @@ mod tests {
     #[test]
     fn delta_rejects_mismatched_dims() {
         let terms = vec![(pair(2, 8, 4, 1), 1.0f32)];
-        assert!(delta_rows(&terms, &values(9, 1), &values(4, 2), 9, 4, None).is_err());
-        assert!(delta_rows(&terms, &values(8, 1), &values(5, 2), 8, 5, None).is_err());
-        assert!(delta_rows(&terms, &values(7, 1), &values(4, 2), 8, 4, None).is_err());
+        assert!(added(&terms, &values(9, 1), &values(4, 2), 9, 4, None).is_err());
+        assert!(added(&terms, &values(8, 1), &values(5, 2), 8, 5, None).is_err());
+        assert!(added(&terms, &values(7, 1), &values(4, 2), 8, 4, None).is_err());
     }
 
     #[test]

@@ -3204,25 +3204,16 @@ mod tests {
     /// batch.
     #[test]
     fn linear_lora_delta_matches_reference() -> Result<()> {
+        use crate::lora::testing::{reference, values};
         use crate::lora::{LoraPair, SlotDelta};
         let dev = Device::Cpu;
         let (n_in, n_out, m, r, s) = (256usize, 12usize, 3usize, 4usize, 1.75f32);
-        let vals = |n: usize, seed: u32| -> Vec<f32> {
-            let mut state = seed | 1;
-            (0..n)
-                .map(|_| {
-                    state ^= state << 13;
-                    state ^= state >> 17;
-                    state ^= state << 5;
-                    ((state % 2000) as f32 / 1000.0 - 1.0) * 0.25
-                })
-                .collect()
-        };
+        let vals = |n: usize, seed: u32| values(n, seed, 0.25);
         let xv = vals(m * n_in, 1);
         let x = Tensor::from_vec(xv.clone(), (1, m, n_in), &dev)?;
-        let (a, b) = (vals(r * n_in, 2), vals(n_out * r, 3));
-        let pair = LoraPair::new(a.clone(), b.clone(), r, n_in, n_out, &dev)?;
-        let delta = SlotDelta::from_terms(vec![(Arc::new(pair), s)]);
+        let pair = LoraPair::new(vals(r * n_in, 2), vals(n_out * r, 3), r, n_in, n_out, &dev)?;
+        let terms = vec![(Arc::new(pair), s)];
+        let delta = SlotDelta::from_terms(terms.clone());
         let bias = Tensor::from_vec(vals(n_out, 5), n_out, &dev)?;
         let flat = |t: Tensor| t.flatten_all()?.to_vec1::<f32>();
         for dtype in [GgmlDType::F32, GgmlDType::Q8_0, GgmlDType::Q4K] {
@@ -3241,25 +3232,16 @@ mod tests {
             );
             let manual = delta.apply(&x, lin.w.forward(&x)?)?.broadcast_add(&bias)?;
             assert_eq!(flat(manual)?, with, "{dtype:?}: delta before bias");
-            for row in 0..m {
-                let xr = &xv[row * n_in..(row + 1) * n_in];
-                let t: Vec<f64> = (0..r)
-                    .map(|j| {
-                        (0..n_in)
-                            .map(|i| a[j * n_in + i] as f64 * xr[i] as f64)
-                            .sum()
-                    })
-                    .collect();
-                for o in 0..n_out {
-                    let want = s as f64 * (0..r).map(|j| b[o * r + j] as f64 * t[j]).sum::<f64>();
-                    let (y0, y1) = (base[row * n_out + o], with[row * n_out + o]);
-                    let tol = 1e-6 * (1.0 + y0.abs() as f64 + y1.abs() as f64);
-                    let got = y1 as f64 - y0 as f64;
-                    assert!(
-                        (got - want).abs() < tol,
-                        "{dtype:?} [{row}, {o}]: {got} vs {want}"
-                    );
-                }
+            // `base + s·B(A·x)` in f64.
+            let want = reference(&terms, &xv, &base, n_in, n_out);
+            for (i, ((&y0, &y1), &w)) in base.iter().zip(&with).zip(&want).enumerate() {
+                let tol = 1e-6 * (1.0 + y0.abs() as f64 + y1.abs() as f64);
+                let (got, want) = (y1 as f64 - y0 as f64, w - y0 as f64);
+                let (row, o) = (i / n_out, i % n_out);
+                assert!(
+                    (got - want).abs() < tol,
+                    "{dtype:?} [{row}, {o}]: {got} vs {want}"
+                );
             }
             #[cfg(target_arch = "x86_64")]
             if dtype != GgmlDType::F32 {

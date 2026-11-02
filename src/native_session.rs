@@ -831,9 +831,10 @@ impl<W: LayerStack> Session<W> {
     /// model for `None`.  State computed under one adapter set is never
     /// continued under another: when the set's [`AdapterKey`] differs from
     /// the current one, the whole state (every layer, the MTP block, the
-    /// checkpoints) is cleared, and `Ok(true)` reports that.  Refused for
-    /// weights that apply no deltas and for a set whose adapters were
-    /// validated against other weights.
+    /// checkpoints) is cleared, and `Ok(true)` reports that.  Refused, with
+    /// the state untouched, for weights that apply no deltas and for a set
+    /// whose adapters were validated against weights of other shapes or
+    /// placed on another device than these weights'.
     pub fn set_adapters(&mut self, set: Option<Arc<ActiveSet>>) -> Result<bool> {
         if let Some(s) = &set {
             if !self.lora.as_ref().is_some_and(|cur| Arc::ptr_eq(cur, s)) {
@@ -842,6 +843,13 @@ impl<W: LayerStack> Session<W> {
                 };
                 if s.base() != &table.fingerprint() {
                     candle_core::bail!("the LoRA adapters were loaded for a different base model");
+                }
+                if !s.device().same_device(table.device()) {
+                    candle_core::bail!(
+                        "the LoRA adapters were loaded onto another device ({:?}) than this model's ({:?})",
+                        s.device().location(),
+                        table.device().location()
+                    );
                 }
             }
         }
