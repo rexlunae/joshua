@@ -649,6 +649,12 @@ fn invalid_adapters_are_refused() {
     assert_eq!(lora.scale(1.0, 4), 2.0);
     assert_eq!(lora.bytes(), 4 * 4 * (16 + 8));
 
+    // The file is mapped rather than read; an empty one is refused, not a
+    // zero-length mapping that panics.
+    let empty = dir.join("empty.gguf");
+    std::fs::write(&empty, b"").unwrap();
+    assert!(LoraAdapter::load(&empty, &table, &limits).is_err());
+
     let bad_shape = LoraSpec::new("blk.0.attn_q.weight", 4, 16, 9, 1);
     let mut untransposed = tensors(&good);
     untransposed[1] = RawTensor::f32("blk.0.attn_q.weight.lora_b", vec![0.01; 16 * 5], &[16, 5]);

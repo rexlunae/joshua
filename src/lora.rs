@@ -437,8 +437,13 @@ fn decode_f32(name: &str, dtype: u32, bytes: &[u8], elems: usize) -> Result<Vec<
 
 impl LoraAdapter {
     /// Read and validate the adapter at `path` against `table`.
+    ///
+    /// The file is mapped, not read: while the pairs are decoded the file's
+    /// bytes stay in reclaimable page cache instead of a heap copy, so peak
+    /// memory is the decoded pairs plus one pair in flight.
     pub fn load(path: &Path, table: &SlotTable, limits: &LoraLimits) -> Result<Self> {
-        let len = std::fs::metadata(path)?.len();
+        let file = std::fs::File::open(path)?;
+        let len = file.metadata()?.len();
         if len > limits.max_bytes {
             return Err(invalid(format!(
                 "{} is {len} bytes, over the {}-byte limit",
@@ -446,7 +451,11 @@ impl LoraAdapter {
                 limits.max_bytes
             )));
         }
-        Self::from_bytes(&std::fs::read(path)?, table, limits)
+        // SAFETY: the mapping is read-only and dropped before returning; as
+        // for the model itself, a file changed underneath the engine is
+        // outside its contract.
+        let mmap = unsafe { memmap2::Mmap::map(&file) }?;
+        Self::from_bytes(&mmap, table, limits)
     }
 
     /// Parse and validate an adapter file's bytes against `table`, mirroring
