@@ -349,6 +349,19 @@ impl<'a> DstPtr<'a> {
         Self { ptr: self.ptr.add(offset), _marker: PhantomData }
     }
 
+    /// The `len` elements from `dst[start]` as a slice, for a worker that
+    /// owns that whole run.
+    ///
+    /// # Safety
+    /// The run must lie within the original destination, and no other
+    /// worker may touch it while the slice lives (the row-splitting
+    /// contract).
+    #[inline(always)]
+    #[allow(clippy::mut_from_ref)]
+    pub(crate) unsafe fn slice_mut(&self, start: usize, len: usize) -> &mut [f32] {
+        std::slice::from_raw_parts_mut(self.ptr.add(start), len)
+    }
+
     /// Accumulate: `dst[idx] += val` (read-modify-write).
     ///
     /// # Safety
