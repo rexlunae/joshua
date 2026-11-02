@@ -1,5 +1,5 @@
 //! Fused SIMD dequant+dot kernels for candle's k-quant block types used by
-//! GGUFs (Q8_0, Q2_K, Q4_K, plus Q6_K on AVX-512).
+//! GGUFs (Q8_0, Q2_K, Q4_K, plus Q6_K on AVX2 and AVX-512 and Q5_K on AVX2).
 //!
 //! The generic fast path in [`crate::quant_matmul`] dequantizes each weight
 //! row into an f32 scratch buffer (via candle's scalar `GgmlType::to_float`)
@@ -18,8 +18,9 @@
 //!   exactly one register, so each group is one dequant + one FMA per
 //!   activation row.
 //! * **x86_64 AVX2** — AVX2/FMA, 8 f32 lanes (`vfmadd231ps`), kernels
-//!   `fused_row_q8_0` / `fused_row_q2k` / `fused_row_q4k`, entered only
-//!   after `avx2_fma_available()`.
+//!   `fused_row_q8_0` / `fused_row_q2k` / `fused_row_q4k` /
+//!   `fused_row_q6k` / `fused_row_q5k`, entered only after
+//!   `avx2_fma_available()`.
 //! * **aarch64** — NEON, 4 f32 lanes (`fmla`), kernels
 //!   `fused_row_q8_0_neon` / `fused_row_q2k_neon` / `fused_row_q4k_neon`.
 //!   NEON is mandatory in AArch64, so these are always eligible.
@@ -39,6 +40,8 @@
 //! * **Q6_K** — 256 signed six-bit values split across low nibbles and
 //!   two-bit high fields; each sixteen-value group has a signed scale.
 //!   Dequantization is `(d·sc)·(q−32)`, exactly as in candle's row decoder.
+//! * **Q5_K** — Q4_K's nibble and scale layout plus a fifth bit per value:
+//!   value `v` takes bit `v/32` of `qh[v mod 32]`; `y = d·sc·q − dmin·m`.
 //!
 //! # Safety model
 //!
@@ -110,17 +113,37 @@ pub struct BlockQ6KRaw {
     pub d: [u8; 2],
 }
 
+/// Raw Q5_K block — byte-identical to candle's `BlockQ5K`
+/// (`d`, `dmin`, `scales[12]`, `qh[32]`, `qs[128]`).  The low four bits and
+/// the scale/min pairs are packed exactly like Q4_K's.
+#[derive(Clone, Copy, Debug)]
+#[repr(C, packed)]
+pub struct BlockQ5KRaw {
+    /// f16 super-block scale.
+    pub d: [u8; 2],
+    /// f16 super-block min.
+    pub dmin: [u8; 2],
+    /// 12 packed scale/min bytes (6 bits each, 8 pairs).
+    pub scales: [u8; 12],
+    /// Fifth bits: bit `j` of byte `l` belongs to value `32·j + l`.
+    pub qh: [u8; 32],
+    /// Low four bits, 2 per byte (Q4_K's nibble layout).
+    pub qs: [u8; 128],
+}
+
 const _: () = {
     assert!(std::mem::size_of::<BlockQ8_0Raw>() == 34);
     assert!(std::mem::size_of::<BlockQ2KRaw>() == 84);
     assert!(std::mem::size_of::<BlockQ4KRaw>() == 144);
     assert!(std::mem::size_of::<BlockQ6KRaw>() == 210);
+    assert!(std::mem::size_of::<BlockQ5KRaw>() == 176);
     // These must stay in lockstep with candle's block structs (the GGUF
     // reader and the streamed loader size reads through these layouts).
     assert!(std::mem::size_of::<BlockQ8_0Raw>() == std::mem::size_of::<candle_core::quantized::k_quants::BlockQ8_0>());
     assert!(std::mem::size_of::<BlockQ2KRaw>() == std::mem::size_of::<candle_core::quantized::k_quants::BlockQ2K>());
     assert!(std::mem::size_of::<BlockQ4KRaw>() == std::mem::size_of::<candle_core::quantized::k_quants::BlockQ4K>());
     assert!(std::mem::size_of::<BlockQ6KRaw>() == std::mem::size_of::<candle_core::quantized::k_quants::BlockQ6K>());
+    assert!(std::mem::size_of::<BlockQ5KRaw>() == std::mem::size_of::<candle_core::quantized::k_quants::BlockQ5K>());
 };
 
 /// Decode scale pair `j` (0..8) of a Q4_K block's 12 packed scale bytes
@@ -447,6 +470,8 @@ pub fn try_matmul_fused_avx2(
         GgmlDType::Q8_0 => try_fused::<BlockQ8_0Raw, QK8_0>(m, k, n, lhs, block_bytes, dst, parallel, fused_row_q8_0),
         GgmlDType::Q2K => try_fused::<BlockQ2KRaw, QK_K>(m, k, n, lhs, block_bytes, dst, parallel, fused_row_q2k),
         GgmlDType::Q4K => try_fused::<BlockQ4KRaw, QK_K>(m, k, n, lhs, block_bytes, dst, parallel, fused_row_q4k),
+        GgmlDType::Q6K => try_fused::<BlockQ6KRaw, QK_K>(m, k, n, lhs, block_bytes, dst, parallel, fused_row_q6k),
+        GgmlDType::Q5K => try_fused::<BlockQ5KRaw, QK_K>(m, k, n, lhs, block_bytes, dst, parallel, fused_row_q5k),
         _ => false,
     }
 }
@@ -558,7 +583,9 @@ fn try_fused<B: Sync, const BLOCK_ELEMS: usize>(
 // each block into 8-lane registers, FMA-accumulate against the m-tile of
 // activation rows.  Results differ from the scalar dequant+dot path by at
 // most FMA rounding (the dequant `d·dl·q − dmin·dh` is a single fmsub
-// instead of two rounded ops), far below the tests' tolerances.
+// instead of two rounded ops), far below the tests' tolerances.  The Q6_K
+// and Q5_K kernels are pinned bit-identical to the dequantize-then-dot path
+// they replaced: their tests compare bits, not tolerances.
 
 /// # Safety
 /// Caller must have verified AVX2+FMA and row-disjointness (see
@@ -764,6 +791,173 @@ unsafe fn fused_row_q4k(
                         d1,
                         m1,
                     );
+                    let a = base + 64 * c + 32 * r;
+                    for i in 0..mcnt {
+                        let p = lhs[(m0 + i) * k + a..].as_ptr();
+                        acc[i] = _mm256_fmadd_ps(_mm256_loadu_ps(p), w0, acc[i]);
+                        acc[i] = _mm256_fmadd_ps(_mm256_loadu_ps(p.add(8)), w1, acc[i]);
+                        acc[i] = _mm256_fmadd_ps(_mm256_loadu_ps(p.add(16)), w2, acc[i]);
+                        acc[i] = _mm256_fmadd_ps(_mm256_loadu_ps(p.add(24)), w3, acc[i]);
+                    }
+                }
+            }
+        }
+        for (i, acc_i) in acc.iter().enumerate().take(mcnt) {
+            // SAFETY: row `row` owns dst[i*n + row] for all i; disjoint per row.
+            dst.write((m0 + i) * n + row, crate::simd::hsum256(*acc_i));
+        }
+        m0 += MTILE;
+    }
+}
+
+/// Q6_K on AVX2, bit-identical to the generic path it replaces (candle's
+/// `to_float` row, then `quant_matmul`'s `dot_row_avx2`).  Each weight is
+/// `(d·sc)·(q−32)` as in candle's decoder, and exact in f32 (an f16 scale,
+/// an i8 scale and a six-bit value need at most 23 significant bits), so
+/// the weights match candle's to the bit.  What fixes the result is the
+/// accumulation: each output keeps one 8-lane FMA accumulator walked in
+/// ascending column order, then `hsum256`, exactly as `dot_row_avx2` does.
+/// Groups are decoded like [`fused_row_q6k_avx512`].
+///
+/// # Safety
+/// See [`fused_row_q8_0`].
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[allow(clippy::too_many_arguments)] // (m, k, n) is the matmul shape; kept flat for the hot loop
+unsafe fn fused_row_q6k(
+    m: usize,
+    k: usize,
+    n: usize,
+    lhs: &[f32],
+    blocks: &[BlockQ6KRaw],
+    blocks_per_row: usize,
+    row: usize,
+    dst: &crate::simd::DstPtr,
+) {
+    use std::arch::x86_64::*;
+
+    const MTILE: usize = 4;
+    let row_blocks = &blocks[row * blocks_per_row..(row + 1) * blocks_per_row];
+    let low_mask = _mm_set1_epi8(15);
+    let high_mask = _mm_set1_epi8(3);
+    let bias = _mm_set1_epi8(32);
+    let mut m0 = 0;
+    while m0 < m {
+        let mcnt = (m - m0).min(MTILE);
+        let mut acc = [_mm256_setzero_ps(); MTILE];
+        for (b, block) in row_blocks.iter().enumerate() {
+            let d = f16::from_le_bytes(block.d).to_f32();
+            for sg in 0..2usize {
+                // Group g covers values [16g, 16g+16) of this 128-value half:
+                // low bits from ql (low nibble for g < 4, high otherwise),
+                // two high bits from qh at shift 2·(g/2), scale sg*8+g.
+                for group in 0..8usize {
+                    let half = group % 2 * 16;
+                    let lo_offset = sg * 64 + (group / 2 % 2) * 32 + half;
+                    let lo = _mm_loadu_si128(block.ql.as_ptr().add(lo_offset) as *const __m128i);
+                    let hi = _mm_loadu_si128(block.qh.as_ptr().add(sg * 32 + half) as *const __m128i);
+                    let lo = if group < 4 { lo } else { _mm_srli_epi16(lo, 4) };
+                    let hi = match group / 2 {
+                        0 => hi,
+                        1 => _mm_srli_epi16(hi, 2),
+                        2 => _mm_srli_epi16(hi, 4),
+                        _ => _mm_srli_epi16(hi, 6),
+                    };
+                    let q = _mm_or_si128(
+                        _mm_and_si128(lo, low_mask),
+                        _mm_slli_epi16(_mm_and_si128(hi, high_mask), 4),
+                    );
+                    // q − 32 fits in i8, as in candle's `as i8 - 32`.
+                    let q = _mm_sub_epi8(q, bias);
+                    let scale = _mm256_set1_ps(d * block.scales[sg * 8 + group] as f32);
+                    let w0 = _mm256_mul_ps(scale, _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(q)));
+                    let w1 = _mm256_mul_ps(
+                        scale,
+                        _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(q, 8))),
+                    );
+                    let a = b * QK_K + sg * 128 + group * 16;
+                    for i in 0..mcnt {
+                        let p = lhs[(m0 + i) * k + a..].as_ptr();
+                        acc[i] = _mm256_fmadd_ps(_mm256_loadu_ps(p), w0, acc[i]);
+                        acc[i] = _mm256_fmadd_ps(_mm256_loadu_ps(p.add(8)), w1, acc[i]);
+                    }
+                }
+            }
+        }
+        for (i, acc_i) in acc.iter().enumerate().take(mcnt) {
+            // SAFETY: row `row` owns dst[i*n + row] for all i; disjoint per row.
+            dst.write((m0 + i) * n + row, crate::simd::hsum256(*acc_i));
+        }
+        m0 += MTILE;
+    }
+}
+
+/// Q5_K on AVX2, bit-identical to the generic path it replaces (candle's
+/// `to_float` row, then `quant_matmul`'s `dot_row_avx2`).  Each weight is
+/// `d1·q − m1`, a multiply then a subtract as in candle's decoder; `d1·q`
+/// is exact in f32 (an f16 scale, a six-bit scale and a five-bit value), so
+/// only the subtract rounds and the weights match candle's to the bit.  Each
+/// output keeps one 8-lane FMA accumulator walked in ascending column
+/// order, then `hsum256`, exactly as `dot_row_avx2` does.
+///
+/// # Safety
+/// See [`fused_row_q8_0`].
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[allow(clippy::too_many_arguments)] // (m, k, n) is the matmul shape; kept flat for the hot loop
+unsafe fn fused_row_q5k(
+    m: usize,
+    k: usize,
+    n: usize,
+    lhs: &[f32],
+    blocks: &[BlockQ5KRaw],
+    blocks_per_row: usize,
+    row: usize,
+    dst: &crate::simd::DstPtr,
+) {
+    use std::arch::x86_64::*;
+
+    const MTILE: usize = 4;
+    let row_blocks = &blocks[row * blocks_per_row..(row + 1) * blocks_per_row];
+    let mf = _mm256_set1_epi8(0x0F);
+    let one = _mm256_set1_epi8(1);
+    let mut m0 = 0;
+    while m0 < m {
+        let mcnt = (m - m0).min(MTILE);
+        let mut acc = [_mm256_setzero_ps(); MTILE];
+        for (b, block) in row_blocks.iter().enumerate() {
+            let d = f16::from_le_bytes(block.d).to_f32();
+            let dmin = f16::from_le_bytes(block.dmin).to_f32();
+            let base = b * QK_K;
+            // Group j = 2c + r takes bit j of every qh byte.  Shifting the
+            // 16-bit lanes right once per group brings that bit to bit 0 of
+            // both bytes; the `& 1` drops what spills in from the high byte.
+            let mut qh = _mm256_loadu_si256(block.qh.as_ptr() as *const __m256i);
+            for c in 0..4usize {
+                // Same nibble layout as Q4_K: low nibbles are values
+                // [64c, 64c+32), high nibbles [64c+32, 64c+64).
+                let x = _mm256_loadu_si256(block.qs[c * 32..c * 32 + 32].as_ptr() as *const __m256i);
+                for r in 0..2usize {
+                    let nib = if r == 0 {
+                        _mm256_and_si256(x, mf)
+                    } else {
+                        _mm256_and_si256(_mm256_srli_epi16(x, 4), mf)
+                    };
+                    let xv = _mm256_or_si256(nib, _mm256_slli_epi16(_mm256_and_si256(qh, one), 4));
+                    qh = _mm256_srli_epi16(qh, 1);
+                    let (sc, mn) = q4k_scale_min(&block.scales, 2 * c + r);
+                    let d1 = _mm256_set1_ps(d * sc as f32);
+                    let m1 = _mm256_set1_ps(dmin * mn as f32);
+                    let low = _mm256_castsi256_si128(xv);
+                    let high = _mm256_extracti128_si256(xv, 1);
+                    let deq = |bytes: __m128i| {
+                        let q = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(bytes));
+                        _mm256_sub_ps(_mm256_mul_ps(d1, q), m1)
+                    };
+                    let w0 = deq(low);
+                    let w1 = deq(_mm_srli_si128(low, 8));
+                    let w2 = deq(high);
+                    let w3 = deq(_mm_srli_si128(high, 8));
                     let a = base + 64 * c + 32 * r;
                     for i in 0..mcnt {
                         let p = lhs[(m0 + i) * k + a..].as_ptr();
@@ -1481,7 +1675,12 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     fn fused_parallel_matches_serial_bit_exact() {
         for (name, fused, _) in families() {
-            for dtype in [GgmlDType::Q8_0, GgmlDType::Q2K, GgmlDType::Q4K] {
+            // Q6_K is fused on both x86_64 families, Q5_K on AVX2 only.
+            let more: &[GgmlDType] = match name {
+                "avx2" => &[GgmlDType::Q6K, GgmlDType::Q5K],
+                _ => &[GgmlDType::Q6K],
+            };
+            for &dtype in [GgmlDType::Q8_0, GgmlDType::Q2K, GgmlDType::Q4K].iter().chain(more) {
                 // m = 11 covers a full and a partial m-tile on every family.
                 let block_bytes = quantized_block_bytes(24, 256, dtype);
                 let lhs: Vec<f32> = (0..11 * 256).map(|i| (i as f32) * 0.01 - 1.0).collect();
@@ -1565,16 +1764,25 @@ mod tests {
     }
 
     /// The unified dispatcher runs a fused kernel at every SIMD level and
-    /// declines at the scalar one.
+    /// declines at the scalar one.  Q6_K is fused on both x86_64 levels and
+    /// Q5_K on AVX2; elsewhere they keep the dequantize-then-dot path.
     #[test]
     fn unified_dispatcher_runs_fused_kernels() {
-        let simd = crate::simd::simd_level() != crate::simd::SimdLevel::Scalar;
-        for dtype in [GgmlDType::Q8_0, GgmlDType::Q2K, GgmlDType::Q4K] {
+        use crate::simd::SimdLevel;
+        let level = crate::simd::simd_level();
+        let simd = level != SimdLevel::Scalar;
+        for (dtype, fused) in [
+            (GgmlDType::Q8_0, simd),
+            (GgmlDType::Q2K, simd),
+            (GgmlDType::Q4K, simd),
+            (GgmlDType::Q6K, matches!(level, SimdLevel::Avx2 | SimdLevel::Avx512)),
+            (GgmlDType::Q5K, level == SimdLevel::Avx2),
+        ] {
             let block_bytes = quantized_block_bytes(8, 256, dtype);
             let lhs: Vec<f32> = (0..2 * 256).map(|i| (i as f32) * 0.01 - 1.0).collect();
             let mut dst = vec![0f32; 2 * 8];
             let ran = try_matmul_fused(dtype, (2, 256, 8), &lhs, &block_bytes, &mut dst, false);
-            assert_eq!(ran, simd, "{dtype:?} at {:?}", crate::simd::simd_level());
+            assert_eq!(ran, fused, "{dtype:?} at {level:?}");
         }
     }
 }
