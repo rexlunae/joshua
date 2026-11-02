@@ -1582,6 +1582,9 @@ fn chat_template_source(
     };
     match std::fs::read_to_string(&value) {
         Ok(source) => Ok(Some(source)),
+        // Something is at the path but cannot be read (a directory, no
+        // permission): report it rather than render the path as a template.
+        Err(e) if Path::new(&value).exists() => anyhow::bail!("--chat-template {value}: {e}"),
         Err(_) if value.contains(['{', '}', '\n']) => Ok(Some(value)),
         Err(e) => anyhow::bail!(
             "--chat-template {value}: not a Jinja template, and not a readable file ({e}); \
@@ -1772,6 +1775,11 @@ mod tests {
             assert!(err.contains("not a Jinja template"), "{value}: {err}");
         }
         assert!(chat_template_source(None, Some(missing)).is_err());
+        // A path that exists but cannot be read is an error, even when its
+        // name has braces that would otherwise make it Jinja text.
+        let unreadable = dir.join("{tpl}");
+        std::fs::create_dir_all(&unreadable).unwrap();
+        assert!(flag(&unreadable.to_string_lossy()).is_err());
         assert_eq!(chat_template_source(None, None).unwrap(), None);
         // The trust switch parses, off by default.
         let serve = ["joshua", "serve", "--model", "m.gguf"];
