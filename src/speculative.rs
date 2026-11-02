@@ -420,12 +420,29 @@ fn residual_total(p: &[f32], skip: u32) -> f64 {
 /// last positive index on rounding overshoot.
 fn sample_slice(p: &[f32], skip: Option<u32>, u: f64) -> Result<u32> {
     let skip = skip.map(|s| s as usize);
-    let total: f64 = p
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| Some(*i) != skip)
-        .map(|(_, &x)| x as f64)
-        .sum();
+    sample_entries(
+        p.iter()
+            .copied()
+            .enumerate()
+            .filter(move |&(i, _)| Some(i) != skip),
+        u,
+    )
+}
+
+/// [`TokenDistRef::sample_at`] over `p` when every non-zero entry's id is
+/// in `support` (ascending).  The zero entries add exactly nothing to the
+/// running sums and are never chosen, so this draws the same token as the
+/// dense scan without visiting the whole vocabulary.
+pub(crate) fn sample_support_at(p: &[f32], support: &[u32], seed: u64, pos: u64) -> Result<u32> {
+    sample_entries(
+        support.iter().map(|&i| (i as usize, p[i as usize])),
+        splitmix_uniform(seed, pos, SAMPLE_STREAM),
+    )
+}
+
+/// Inverse-CDF draw over `(id, probability)` pairs in ascending id order.
+fn sample_entries(entries: impl Iterator<Item = (usize, f32)> + Clone, u: f64) -> Result<u32> {
+    let total: f64 = entries.clone().map(|(_, x)| x as f64).sum();
     if !(total > 0.0) {
         return Err(JoshuaError::Inference(
             "sampling from an empty distribution".to_string(),
@@ -434,8 +451,8 @@ fn sample_slice(p: &[f32], skip: Option<u32>, u: f64) -> Result<u32> {
     let target = u * total;
     let mut acc = 0.0;
     let mut last = None;
-    for (i, &x) in p.iter().enumerate() {
-        if Some(i) == skip || x <= 0.0 {
+    for (i, x) in entries {
+        if x <= 0.0 {
             continue;
         }
         acc += x as f64;
