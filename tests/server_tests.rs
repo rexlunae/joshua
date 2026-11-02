@@ -1064,6 +1064,78 @@ async fn streaming_chat_with_tools_reconstructs_the_non_streaming_text() {
     assert_ne!(finish_reason.as_deref(), Some("tool_calls"));
 }
 
+/// A tiny llama whose chat template iterates an assistant call's arguments
+/// (`arguments|items`, as Qwen3-Coder's and GLM's do), in the fixture's
+/// vocabulary so the prompt token count shows what rendered.
+fn tool_history_state(dir_name: &str) -> Arc<ServerState> {
+    let dir = model_dir(dir_name);
+    let model = dir.join("model.gguf");
+    write_tiny_llama_gguf(&model);
+    common::replace_chat_template(
+        &model,
+        "{% for m in messages %}{% if m.tool_calls %}{% for c in m.tool_calls %}\
+         {% for k, v in c.function.arguments|items %}{{ k }} {% endfor %}{% endfor %}\
+         {% else %}hello {{ m.content }} {% endif %}{% endfor %}\
+         {% if add_generation_prompt %}world{% endif %}",
+    );
+    let engine = Engine::with_n_ctx(&dir, 64).expect("engine should load tiny model");
+    Arc::new(ServerState::new(Arc::new(engine)))
+}
+
+/// Assistant tool calls sent back with OpenAI's JSON-string arguments (and
+/// Anthropic `tool_use` blocks) reach the GGUF template as objects, so it
+/// renders instead of falling back to ChatML: "hello a b c hello d world"
+/// is 7 tokens.
+#[tokio::test]
+async fn tool_call_history_renders_with_the_gguf_template() {
+    let app = create_router(tool_history_state("server-tool-history"));
+    let (status, body) = chat(
+        app.clone(),
+        serde_json::json!({
+            "model": "model",
+            "messages": [
+                {"role": "user", "content": "a"},
+                {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "call_1", "type": "function",
+                    "function": {"name": "f", "arguments": "{\"b\": 1, \"c\": 2}"}
+                }]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "d"}
+            ],
+            "max_tokens": 1,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let response: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(response["usage"]["prompt_tokens"], 7, "{body}");
+
+    let res = app
+        .oneshot(post_json(
+            "/v1/messages/count_tokens",
+            None,
+            serde_json::json!({
+                "model": "model",
+                "max_tokens": 1,
+                "messages": [
+                    {"role": "user", "content": "a"},
+                    {"role": "assistant", "content": [
+                        {"type": "tool_use", "id": "toolu_1", "name": "f", "input": {"b": 1, "c": 2}}
+                    ]},
+                    {"role": "user", "content": [
+                        {"type": "tool_result", "tool_use_id": "toolu_1", "content": "d"}
+                    ]}
+                ]
+            }),
+        ))
+        .await
+        .unwrap();
+    let status = res.status();
+    let body = body_text(res).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let count: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(count["input_tokens"], 7, "{count}");
+}
+
 // ─── TLS (only with `cargo test --features tls`) ─────────────────────────────
 
 #[cfg(feature = "tls")]

@@ -26,6 +26,7 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 
+use minijinja::value::Kwargs;
 use minijinja::{Environment, Error, ErrorKind, Value};
 use serde::Serialize;
 use tokenizers::Tokenizer;
@@ -282,7 +283,7 @@ impl ChatTemplate {
             #[serde(skip_serializing_if = "Option::is_none")]
             name: Option<&'a str>,
             #[serde(skip_serializing_if = "Option::is_none")]
-            tool_calls: Option<&'a serde_json::Value>,
+            tool_calls: Option<Cow<'a, serde_json::Value>>,
             #[serde(skip_serializing_if = "Option::is_none")]
             tool_call_id: Option<&'a str>,
             #[serde(skip_serializing_if = "Option::is_none")]
@@ -295,7 +296,7 @@ impl ChatTemplate {
                 role: &m.role,
                 content: &m.content,
                 name: m.name.as_deref(),
-                tool_calls: m.tool_calls.as_ref(),
+                tool_calls: m.tool_calls.as_ref().and_then(template_tool_calls),
                 tool_call_id: m.tool_call_id.as_deref(),
                 reasoning_content: m.reasoning_content.as_deref(),
             })
@@ -307,6 +308,16 @@ impl ChatTemplate {
         env.add_function("raise_exception", |msg: String| -> Result<(), Error> {
             Err(Error::new(ErrorKind::InvalidOperation, msg))
         });
+        // transformers' `tojson` takes `ensure_ascii`: GLM-4.5+ and Kimi K3
+        // write their tools and call arguments with `ensure_ascii=False`,
+        // which minijinja's filter rejects.  Its output is UTF-8 already.
+        env.add_filter(
+            "tojson",
+            |value: &Value, indent: Option<Value>, kwargs: Kwargs| -> Result<Value, Error> {
+                let _: Option<bool> = kwargs.get("ensure_ascii")?;
+                minijinja::filters::tojson(value, indent, kwargs)
+            },
+        );
         env.add_template("chat", &self.source)
             .map_err(|e| format!("chat template failed to parse: {e}"))?;
 
@@ -387,6 +398,59 @@ pub(crate) fn map_developer_role<'a>(
     out.push(ChatMessage::text("system", system.join("\n\n")));
     out.extend(rest);
     Cow::Owned(out)
+}
+
+// ─── Tool calls in the history ──────────────────────────────────────────────
+
+/// An assistant message's `tool_calls` as chat templates expect them.
+///
+/// OpenAI clients send `function.arguments` as a JSON string, but templates
+/// written for transformers iterate it (`arguments|items`, Qwen3-Coder and
+/// GLM) or `tojson` it (Llama 3.x, DeepSeek, Mistral), which double-encodes
+/// a string.  As vLLM's `_postprocess_messages` and llama.cpp's
+/// `func_args_not_string` do, a string that holds a JSON object becomes that
+/// object, and missing or empty arguments become `{}`; a string that is not
+/// a JSON object is kept as it is.  An empty `tool_calls` list is dropped so
+/// the template takes its plain-assistant path.  The value is copied only
+/// when something changes.
+fn template_tool_calls(calls: &serde_json::Value) -> Option<Cow<'_, serde_json::Value>> {
+    use serde_json::Value;
+
+    /// The object `arguments` should be, when it is not one already.
+    fn arguments_object(arguments: Option<&Value>) -> Option<Value> {
+        match arguments {
+            None | Some(Value::Null) => Some(Value::Object(Default::default())),
+            Some(Value::String(text)) if text.trim().is_empty() => {
+                Some(Value::Object(Default::default()))
+            }
+            Some(Value::String(text)) => serde_json::from_str::<Value>(text)
+                .ok()
+                .filter(Value::is_object),
+            Some(_) => None,
+        }
+    }
+    let Value::Array(items) = calls else {
+        return Some(Cow::Borrowed(calls));
+    };
+    if items.is_empty() {
+        return None;
+    }
+    let changes = items
+        .iter()
+        .filter_map(|call| call.get("function").filter(|f| f.is_object()))
+        .any(|f| arguments_object(f.get("arguments")).is_some());
+    if !changes {
+        return Some(Cow::Borrowed(calls));
+    }
+    let mut calls = calls.clone();
+    for item in calls.as_array_mut().into_iter().flatten() {
+        if let Some(Value::Object(f)) = item.get_mut("function") {
+            if let Some(object) = arguments_object(f.get("arguments")) {
+                f.insert("arguments".to_string(), object);
+            }
+        }
+    }
+    Some(Cow::Owned(calls))
 }
 
 // ─── Control-token hardening ────────────────────────────────────────────────
@@ -849,6 +913,47 @@ mod tests {
             .render(&[msg("user", "go"), assistant, tool_result], None)
             .unwrap();
         assert_eq!(out, "go;calls:1;result[call_1]:42;");
+    }
+
+    /// Qwen3-Coder's history loop: `arguments|items` needs an object, which
+    /// the client's JSON string becomes; without the change the template
+    /// fails and the prompt falls back to ChatML.
+    #[test]
+    fn string_tool_arguments_reach_the_template_as_an_object() {
+        let source = "{% for m in messages %}{% for c in m.tool_calls %}<function={{ c.function.name }}>\
+                      {% for k, v in c.function.arguments|items %}<parameter={{ k }}>{{ v }}</parameter>{% endfor %}\
+                      </function>{% endfor %}{% endfor %}";
+        let t = ChatTemplate::new(source, "", "");
+        let mut assistant = msg("assistant", "");
+        assistant.tool_calls = Some(serde_json::json!([{
+            "id": "call_1", "type": "function",
+            "function": {"name": "f", "arguments": "{\"city\": \"Paris\"}"}
+        }]));
+        assert_eq!(
+            t.render(&[assistant], None).unwrap(),
+            "<function=f><parameter=city>Paris</parameter></function>"
+        );
+        // The caller's messages are untouched.
+        let calls = serde_json::json!([{"function": {"name": "f", "arguments": "{}"}}]);
+        assert!(matches!(template_tool_calls(&calls), Some(Cow::Owned(_))));
+        let objects = serde_json::json!([{"function": {"name": "f", "arguments": {}}}]);
+        assert!(matches!(template_tool_calls(&objects), Some(Cow::Borrowed(_))));
+        assert!(template_tool_calls(&serde_json::json!([])).is_none());
+    }
+
+    /// GLM-4.5+ and Kimi K3 call `tojson(ensure_ascii=False)`; output
+    /// without the keyword is minijinja's, unchanged.
+    #[test]
+    fn tojson_takes_transformers_ensure_ascii() {
+        let t = ChatTemplate::new(
+            "{{ messages[0].content | tojson(ensure_ascii=False) }}|{{ messages[0].content | tojson }}|{{ {'a': 1} | tojson(indent=2) }}",
+            "",
+            "",
+        );
+        assert_eq!(
+            t.render(&[msg("user", "上海 <b>")], None).unwrap(),
+            "\"上海 \\u003cb\\u003e\"|\"上海 \\u003cb\\u003e\"|{\n  \"a\": 1\n}"
+        );
     }
 
     // ── Reasoning switches (#144) ──────────────────────────────────────────

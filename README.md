@@ -21,7 +21,7 @@ framework) and [tokenizers](https://github.com/huggingface/tokenizers).
 | **Quant formats** | Every GGUF weight format llama.cpp writes: F32/F16/BF16, Q4_0…Q8_1 and the k-quants (candle's kernels), plus in-mapping decoders for the i-quants small-model GGUFs use (IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS), BitNet's ternary TQ1_0 / TQ2_0, MXFP4 / NVFP4 and Bonsai's Q1_0 / Q2_0 — each bit-identical to llama.cpp's `dequantize_row_*`, with matmuls that keep the blocks in the mmap instead of materialising f32.  One generic `RawBlock` layer serves every loader, candle's stock ones (Llama, Gemma, Phi, …) included |
 | **Fused SIMD kernels** | AVX-512 and AVX2 (x86-64) and NEON (aarch64) dequant+dot fusion — the weights decode inside the dot in registers — for Q8_0/Q2_K/Q4_K, IQ2_XXS, MXFP4 and Bonsai's Q1_0/Q2_0 (also Q6_K on x86-64 and Q5_K on AVX2; the other i-quants, TQ1_0/TQ2_0 and NVFP4 on AVX-512), plus parallel SIMD matmuls for the other k-quants; the widest ISA the CPU has is picked at startup (`JOSHUA_SIMD` overrides) |
 | **Chat templates** | Renders the model's own `tokenizer.chat_template` from the GGUF (Jinja via pure-Rust minijinja); ChatML fallback |
-| **Tool calling** | OpenAI-compatible `tools` / `tool_calls`, parsing Hermes/Qwen, Mistral, and Llama-3 call formats |
+| **Tool calling** | OpenAI-compatible `tools` / `tool_calls` (streamed as argument deltas) and Anthropic `tool_use`, parsing each family's own call format — Hermes / Qwen / Qwen3-Coder, Mistral, Llama 3.x JSON, pythonic (Llama 3.2 / 4, LFM2), Nemotron, Phi-4-mini, DeepSeek V3 / R1 / V3.1 / V3.2 / V4 / V4.1, Kimi K2 / K3, GLM-4.5+ and gpt-oss harmony — picked from the chat template (see [Tool calling](#tool-calling)) |
 | **Embeddings** | Dense sentence embeddings for llama / qwen2 / qwen3 embedding models, with GGUF pooling metadata |
 | **KV-cache reuse** | Multi-turn requests continue from a warm model pool and prefill only the new suffix — including across *context edits*: when an agent harness truncates or replaces middle blocks, the pooled session's KV state is rewound to the longest common token prefix instead of being cleared (Qwen and DeepSeek-V2/V3/K2 loaders; models with recurrent layers — Qwen3-Next, Qwen3.5, DeepSeek-V4/V4.1 — rewind to a state checkpoint at a prefill or turn boundary and re-prefill only the divergence). DeepSeek MLA caches the compressed latent (`c_kv` + `k_pe`) instead of the reconstructed per-head K/V, cutting KV memory ~70× |
 | **Speculative decoding** | `--speculative N` drafts up to N tokens per step by prompt lookup and verifies them in one forward pass, rolling the KV cache back past the first rejection — output unchanged (token-identical when greedy, same distribution when sampling), fewer weight sweeps on repetitive output; `--draft-model PATH` drafts with a small model sharing the tokenizer instead (qwen-family, `deepseek2`-family and `deepseek4` loaders with a rewound-able KV cache, including the recurrent DeltaNet and KDA hybrids, whose running state is snapshotted before a pass and replayed on rollback; on `qwen4exp`'s PLE convolutions and candle's stock loaders the flag warns and is ignored) |
@@ -447,6 +447,52 @@ U+200B after the first character: the model reads it as ordinary text and it
 is invisible in the conversation. Control tokens inserted by the template
 itself are unaffected. Tool definitions are treated as developer input and
 are not rewritten.
+
+#### Tool calling
+
+With `tools` in the request, the model's output is read in its family's
+own tool-call markup and returned as OpenAI `tool_calls` (finish reason
+`tool_calls`), with any text around the calls as `content`.  The format is
+detected from the GGUF's chat template (the strings only that family's
+template contains, in llama.cpp's order), then from the architecture, and
+defaults to the Hermes / Qwen / Mistral reader.  A model without a template
+that can render a request with tools is prompted with the ChatML fallback,
+which teaches Hermes calls, so its output is read as Hermes (the load log's
+`tool_calls=` names the format in use):
+
+| Family | Markup | `--tool-call-parser` |
+|---|---|---|
+| Hermes, Qwen 2.5 / 3, Qwen3-Coder / 3.5, Granite, Mistral, Functionary | `<tool_call>{…}</tool_call>`, `<function=…><parameter=…>`, `[TOOL_CALLS]…` | `hermes`, `qwen3_coder`, `mistral` |
+| Llama 3.x | `{"name": …, "parameters": …}` (after `<\|python_tag\|>` or alone) | `llama3_json` |
+| Llama 3.2 / 4 pythonic, LFM2 | `[get_weather(city="Paris")]`, `<\|tool_call_start\|>[…]<\|tool_call_end\|>` | `pythonic`, `llama4_pythonic`, `lfm2` |
+| Nemotron Nano v2 | `<TOOLCALL>[…]</TOOLCALL>` | `nemotron_v2` |
+| Phi-4-mini, Firefunction v2 | `functools[…]` | `phi4_mini_json` |
+| DeepSeek V3 / R1 / V3.1 | `<｜tool▁calls▁begin｜>…` | `deepseek_v3`, `deepseek_v31` |
+| DeepSeek V3.2 / V4 / V4.1 | DSML `<｜DSML｜invoke name="…">` | `deepseek_v32`, `deepseek_v4`, `deepseek_v41` |
+| Kimi K2 / Kimi-Linear, Kimi K3 | `<\|tool_calls_section_begin\|>…`, `<\|open\|>tools<\|sep\|>…` | `kimi_k2`, `kimi_k3` |
+| GLM-4.5 / 4.6 / 4.7 / 5 | `<tool_call>name<arg_key>…</arg_key><arg_value>…` | `glm45`, `glm47` |
+| gpt-oss | a harmony message `to=functions.name` | `openai` |
+
+`--tool-call-parser NAME` (or `JOSHUA_TOOL_CALL_PARSER`; vLLM's names)
+overrides the detection, e.g. for a fine-tune whose template does not
+match its training.  Arguments written one tag per parameter are typed by
+the tool's JSON schema: a parameter the schema types as a string keeps its
+text verbatim, any other is read as JSON when it is JSON.  A call id the
+model writes itself (Kimi's `functions.name:0`, Mistral's `[CALL_ID]`) is
+returned as the call's id, since its template expects it back.
+
+Streaming sends a call as soon as its name is known — one chunk with the
+call's `index`, `id`, `type` and `function.name` — then its
+`function.arguments` in pieces as the model writes them; tool-call markup
+never reaches `content`, and text before (or after) a call streams as
+content.  On `/v1/messages` each call is a `tool_use` content block whose
+input arrives as `input_json_delta`s.
+
+Assistant `tool_calls` sent back in the history reach the chat template with
+`function.arguments` as an object, as transformers-style templates expect
+(vLLM and llama.cpp do the same): a JSON-string object is parsed, and empty
+arguments become `{}`; a string that is not a JSON object is passed through
+unchanged.
 
 #### Structured outputs
 
@@ -962,6 +1008,7 @@ prints the dense/expert split of any GGUF to sanity-check a new model.
 | `JOSHUA_TEMP`, `JOSHUA_TOP_K`, `JOSHUA_TOP_P`, `JOSHUA_MIN_P`, `JOSHUA_TYPICAL_P`, `JOSHUA_REPEAT_PENALTY`, `JOSHUA_REPEAT_LAST_N`, `JOSHUA_PRESENCE_PENALTY`, `JOSHUA_FREQUENCY_PENALTY`, `JOSHUA_XTC_PROBABILITY`, `JOSHUA_XTC_THRESHOLD`, `JOSHUA_MIROSTAT`, `JOSHUA_MIROSTAT_LR`, `JOSHUA_MIROSTAT_ENT` | Server sampling defaults (same as `--temp`, `--top-k`, …; see [Sampling defaults](#sampling-defaults)) |
 | `JOSHUA_CHAT_TEMPLATE` / `JOSHUA_CHAT_TEMPLATE_FILE` | A Jinja chat template (or a file holding one) used instead of the GGUF's (same as `--chat-template` / `--chat-template-file`); a `--chat-template` value that is neither an existing file nor Jinja is refused at startup |
 | `JOSHUA_TRUST_REQUEST_CHAT_TEMPLATE` | Accept a request's own `chat_template` (same as `--trust-request-chat-template`; off by default) |
+| `JOSHUA_TOOL_CALL_PARSER` | Tool-call format to parse output with, or `auto` (same as `--tool-call-parser`; see [Tool calling](#tool-calling)) |
 | `JOSHUA_WHISPER_MODEL` | Whisper model directory mounted at `/v1/audio/transcriptions` (same as `--whisper-model`) |
 | `JOSHUA_NPU_PLUGIN` | NPU vendor plugin path (same as `--npu-plugin`) |
 | `JOSHUA_LLAMA_N_GPU_LAYERS` | llama.cpp adapter layer offload count (default: all) |
