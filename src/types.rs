@@ -265,7 +265,8 @@ pub struct GenerationOptions {
     #[serde(default)]
     pub bad_words: Vec<String>,
     /// Keep only the last this-many prompt tokens (vLLM's
-    /// `truncate_prompt_tokens`).
+    /// `truncate_prompt_tokens`): at least 1 and at most the context
+    /// window, or [`TRUNCATE_TO_CONTEXT`].
     #[serde(default)]
     pub truncate_prompt_tokens: Option<u32>,
     /// Top-n-sigma: drop tokens more than this many standard deviations
@@ -312,6 +313,10 @@ pub struct GenerationOptions {
 /// `max_tokens` value that means "until end of sequence or the end of the
 /// context window" (still capped by the server's `--max-output-tokens`).
 pub const MAX_TOKENS_UNLIMITED: u32 = u32::MAX;
+
+/// `truncate_prompt_tokens` value that keeps as much of the prompt as the
+/// context window holds with room for one generated token (vLLM's `-1`).
+pub const TRUNCATE_TO_CONTEXT: u32 = u32::MAX;
 
 /// One logit bias: a token id, or text whose every token gets the bias
 /// (llama.cpp accepts both).
@@ -381,14 +386,14 @@ impl GenerationOptions {
 
     /// Whether a setting depends on the tokens generated so far in a way
     /// speculative verification does not reproduce, so decoding goes one
-    /// token at a time: a minimum length, bad words, DRY, Mirostat's
-    /// running state, or a reasoning budget that forces tokens.
+    /// token at a time: a minimum length, bad words, DRY or Mirostat's
+    /// running state.  A reasoning budget does too, on a model with
+    /// reasoning tags (the engine checks that).
     pub(crate) fn needs_plain_decode(&self) -> bool {
         self.min_tokens > 0
             || !self.bad_words.is_empty()
             || self.dry.enabled()
             || self.mirostat != 0
-            || self.reasoning_budget.is_some()
     }
 
     fn default_max_tokens() -> u32 {
@@ -717,7 +722,8 @@ pub struct SamplingParams {
     /// Words that may not be generated (vLLM).
     #[serde(default)]
     pub bad_words: Option<Vec<String>>,
-    /// Keep only the last N prompt tokens (vLLM; `-1` keeps them all).
+    /// Keep only the last N prompt tokens (vLLM; `-1` keeps as many as the
+    /// context window holds).
     #[serde(default)]
     pub truncate_prompt_tokens: Option<i64>,
     /// Top-n-sigma (≤ 0 = off).
@@ -879,7 +885,12 @@ impl SamplingParams {
             options.bad_words = words.clone();
         }
         if let Some(n) = self.truncate_prompt_tokens {
-            options.truncate_prompt_tokens = u32::try_from(n).ok();
+            // The engine refuses 0 and counts past the context window.
+            let most = TRUNCATE_TO_CONTEXT - 1;
+            options.truncate_prompt_tokens = Some(match n {
+                -1 => TRUNCATE_TO_CONTEXT,
+                n => u32::try_from(n).map_or(most, |n| n.min(most)),
+            });
         }
         if let Some(bias) = &self.logit_bias {
             options.logit_bias = parse_logit_bias(bias)?;
@@ -1780,8 +1791,22 @@ mod tests {
         assert!(rejected(json!({"dry_sequence_breakers": []})).contains("dry_sequence_breakers"));
         assert!(rejected(json!({"min_tokens": 9, "max_tokens": 4})).contains("min_tokens"));
         assert!(rejected(json!({"repeat_last_n": -2})).contains("repeat_last_n"));
+        assert!(rejected(json!({"truncate_prompt_tokens": -2})).contains("truncate"));
         // Zero dynamic-temperature range is accepted (SillyTavern sends it).
         options(json!({"dynatemp_range": 0.0}));
+        // vLLM's `-1` keeps what the context holds; a huge count stays a
+        // count, for the engine to refuse.
+        let truncate =
+            |n: i64| options(json!({ "truncate_prompt_tokens": n })).truncate_prompt_tokens;
+        assert_eq!(truncate(-1), Some(TRUNCATE_TO_CONTEXT));
+        assert_eq!(truncate(1 << 40), Some(TRUNCATE_TO_CONTEXT - 1));
+        assert_eq!(truncate(0), Some(0));
+        // DRY scans llama.cpp's 64 tokens unless the request says otherwise.
+        let dry = options(json!({"dry_multiplier": 0.8})).dry;
+        assert_eq!(
+            (dry.penalty_last_n, dry.allowed_length, dry.base),
+            (64, 2, 1.75)
+        );
     }
 
     #[test]

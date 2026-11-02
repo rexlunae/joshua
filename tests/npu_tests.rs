@@ -365,6 +365,64 @@ fn engine_generates_from_an_image_message() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// Token controls that leave nothing to sample are the client's error, on
+/// the text and the media path alike: they must not count against the NPU,
+/// whose breaker would otherwise switch it off for everyone after three.
+#[test]
+fn requests_with_nothing_to_sample_leave_the_npu_breaker_alone() {
+    let dir = tiny_model_dir("npu-nothing-to-sample");
+    let engine = Engine::with_n_ctx(&dir, 64)
+        .expect("engine should load")
+        .with_npu_backend(Arc::new(shim_backend()));
+    let mut image_message = joshua::ChatMessage::text("user", "look");
+    image_message.images = Some(vec![format!("data:image/png;base64,{}", {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode([1u8, 2, 3, 4])
+    })]);
+    let greedy = GenerationOptions {
+        max_tokens: 3,
+        temperature: 0.0,
+        ..Default::default()
+    };
+    // The only allowed token is EOS, which `min_tokens` holds back; then
+    // an empty list and an out-of-vocabulary id.
+    let refused = [
+        GenerationOptions {
+            allowed_token_ids: Some(vec![3]),
+            min_tokens: 2,
+            ..greedy.clone()
+        },
+        GenerationOptions {
+            allowed_token_ids: Some(vec![]),
+            ..greedy.clone()
+        },
+        GenerationOptions {
+            allowed_token_ids: Some(vec![999_999]),
+            ..greedy.clone()
+        },
+    ];
+    for _ in 0..2 {
+        for options in &refused {
+            let text = engine.complete_raw("hello a", options).map(|_| ());
+            let media = engine
+                .complete(std::slice::from_ref(&image_message), options)
+                .map(|_| ());
+            for result in [text, media] {
+                assert!(
+                    matches!(result, Err(joshua::JoshuaError::InvalidRequest(_))),
+                    "{result:?}"
+                );
+            }
+        }
+    }
+    assert!(engine.npu_active(), "client errors tripped the breaker");
+    engine
+        .complete_raw("hello a", &greedy)
+        .expect("the NPU still serves");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// Regression (Devin review on #172): the media prompt's length is only
 /// known after the plugin prefills it, and a prompt that already fills the
 /// request's `context_window` must be rejected rather than returning an

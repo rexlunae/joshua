@@ -101,7 +101,9 @@ impl Engine {
             ));
         }
         // Settings that need the decode loop's per-token bookkeeping.
-        if options.needs_plain_decode() || options.ignore_eos || !options.stop_token_ids.is_empty()
+        if self.needs_plain_decode(options)
+            || options.ignore_eos
+            || !options.stop_token_ids.is_empty()
         {
             return Err(invalid(
                 "min_tokens, bad_words, DRY, Mirostat, a reasoning budget, ignore_eos and \

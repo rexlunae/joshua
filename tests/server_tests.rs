@@ -840,10 +840,26 @@ async fn chat_lengths_follow_llama_cpp_and_vllm_conventions() {
         serde_json::json!({"continue_final_message": true, "add_generation_prompt": true}),
         serde_json::json!({"reasoning_format": "bogus"}),
         serde_json::json!({"chat_template": "{% for m in messages %}"}),
+        // vLLM's token-id checks, and controls that leave nothing to sample
+        // (the only allowed token is EOS, which `ignore_eos` bans): a 400,
+        // not a backend failure.
+        serde_json::json!({"allowed_token_ids": []}),
+        serde_json::json!({"allowed_token_ids": [999999]}),
+        serde_json::json!({"allowed_token_ids": [3]}),
+        serde_json::json!({"allowed_token_ids": [3], "temperature": 0.8}),
+        serde_json::json!({"truncate_prompt_tokens": 0}),
+        serde_json::json!({"truncate_prompt_tokens": 65}),
     ] {
         let (status, body) = chat(app.clone(), base(extra.clone())).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{extra}: {body}");
     }
+    // vLLM's `-1` keeps what the context holds.
+    let (status, body) = chat(
+        app.clone(),
+        base(serde_json::json!({"truncate_prompt_tokens": -1, "max_tokens": 2})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
     // The developer role and the llama.cpp sampler fields are accepted.
     let (status, body) = chat(
         app,
@@ -867,6 +883,41 @@ async fn chat_lengths_follow_llama_cpp_and_vllm_conventions() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// A request's own chat template is code the server would run: refused,
+/// before any stream starts, unless the server trusts them (vLLM's
+/// `--trust-request-chat-template`).
+#[tokio::test]
+async fn request_chat_templates_need_the_servers_trust() {
+    let body = |stream: bool| {
+        serde_json::json!({
+            "model": "model",
+            "messages": [{"role": "user", "content": "a b"}],
+            "max_tokens": 2,
+            "stream": stream,
+            "chat_template": "{% for m in messages %}{{ m.content }} {% endfor %}",
+        })
+    };
+    let app = create_router(tiny_state("server-template-untrusted", None));
+    for stream in [false, true] {
+        let (status, text) = chat(app.clone(), body(stream)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "stream={stream}: {text}");
+        assert!(text.contains("--trust-request-chat-template"), "{text}");
+    }
+
+    let dir = model_dir("server-template-trusted");
+    write_tiny_llama_gguf(&dir.join("model.gguf"));
+    let engine = Engine::with_options(
+        &dir,
+        joshua::EngineOptions::with_n_ctx(64).trust_request_chat_template(true),
+    )
+    .expect("engine should load tiny model");
+    let app = create_router(Arc::new(ServerState::new(Arc::new(engine))));
+    for stream in [false, true] {
+        let (status, text) = chat(app.clone(), body(stream)).await;
+        assert_eq!(status, StatusCode::OK, "stream={stream}: {text}");
+    }
 }
 
 #[tokio::test]

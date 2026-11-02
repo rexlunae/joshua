@@ -548,19 +548,21 @@ pub struct DryOptions {
     pub base: f32,
     /// Repeats up to this many tokens are free.
     pub allowed_length: u32,
-    /// How many recent tokens to scan (0 = off, -1 = the context window).
+    /// How many recent tokens to scan (default 64; 0 = off, -1 = the
+    /// context window).
     pub penalty_last_n: i32,
     /// Strings that end a repeated sequence.
     pub sequence_breakers: Vec<String>,
 }
 
+/// llama.cpp's DRY defaults (`common/common.h`).
 impl Default for DryOptions {
     fn default() -> Self {
         Self {
             multiplier: 0.0,
             base: 1.75,
             allowed_length: 2,
-            penalty_last_n: -1,
+            penalty_last_n: 64,
             sequence_breakers: default_dry_sequence_breakers(),
         }
     }

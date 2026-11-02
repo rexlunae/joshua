@@ -399,7 +399,7 @@ Besides `model`, `messages`, `stream` and `tools`:
 | `repeat_last_n` | Penalty window (default 64; `0` off, `-1` the whole context) |
 | `typical_p`, `top_n_sigma`, `xtc_probability`, `xtc_threshold`, `mirostat`, `mirostat_tau`, `mirostat_eta`, `dry_multiplier`, `dry_base`, `dry_allowed_length`, `dry_penalty_last_n`, `dry_sequence_breakers` | llama.cpp's samplers, same semantics; all off by default (`dynatemp_range` other than 0 is a **400**) |
 | `logit_bias` | OpenAI's `{"<id>": bias}` or llama.cpp's `[[id or text, bias], …]`; `false` bans a token |
-| `ignore_eos`, `min_tokens`, `stop_token_ids`, `include_stop_str_in_output`, `allowed_token_ids`, `bad_words`, `truncate_prompt_tokens` | vLLM's sampling extras |
+| `ignore_eos`, `min_tokens`, `stop_token_ids`, `include_stop_str_in_output`, `allowed_token_ids`, `bad_words`, `truncate_prompt_tokens` | vLLM's sampling extras; an empty or out-of-vocabulary `allowed_token_ids`, controls that together leave no token to sample, and a `truncate_prompt_tokens` of 0 or larger than the context are a **400** (`-1` keeps as much of the prompt as the context holds) |
 | `seed` | Reproducible sampling; negative (llama.cpp's `-1`) means random |
 | `reasoning_effort` | `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` — see below |
 | `reasoning` | `{"effort": …, "enabled": bool, "max_tokens": n}` (OpenAI Responses / OpenRouter shape) |
@@ -407,7 +407,7 @@ Besides `model`, `messages`, `stream` and `tools`:
 | `thinking_token_budget` (alias `reasoning_budget_tokens`, `thinking_budget_tokens`), `reasoning_budget_message` | Cut the reasoning after N tokens by forcing its end tag (optionally after the message) |
 | `reasoning_format`, `include_reasoning` | How reasoning is returned — see [Reasoning and thinking](#reasoning-and-thinking) |
 | `chat_template_kwargs` | Extra variables for the GGUF chat template (vLLM / llama.cpp convention); override the reasoning-derived ones |
-| `chat_template` | Render this request with this Jinja template instead of the model's |
+| `chat_template` | Render this request with this Jinja template instead of the model's; a **400** unless the server runs with `--trust-request-chat-template` (vLLM's rule) |
 | `add_generation_prompt`, `continue_final_message` | Template controls (vLLM); a conversation ending in an assistant message is continued (prefill) unless `continue_final_message` is `false`; both `true` is a **400** |
 | `documents`, `echo` | Passed to the template as `documents`; `echo` repeats the continued assistant message |
 | `context_window` (alias `num_ctx`, `n_ctx`) | Per-request context window; **400** when larger than the server's `--n-ctx` (the KV cache and RoPE tables are sized at load), and the prompt must fit inside it |
@@ -727,6 +727,10 @@ Two limits bound how much work a single client can demand, both tunable:
 - `--n-ctx` (default: 4096) is the context window — prompt plus generated
   tokens — the model is loaded with.  A request can narrow it with
   `context_window` but never widen it.
+- A request's own `chat_template` is Jinja code the server would run, so it
+  is refused unless the server starts with `--trust-request-chat-template`;
+  even then a render stops after a fixed instruction budget (well under a
+  second) instead of looping.
 
 Uploaded audio is limited to ~30 minutes of 16 kHz-equivalent samples, and
 inline image data must be a base64 `data:` URL (filesystem paths and remote
@@ -956,7 +960,8 @@ prints the dense/expert split of any GGUF to sanity-check a new model.
 | `JOSHUA_MAX_CONCURRENCY` | Cap on simultaneous generations/embeddings (same as `--max-concurrency`) |
 | `JOSHUA_MAX_OUTPUT_TOKENS` | Hard ceiling on generated tokens per request (same as `--max-output-tokens`) |
 | `JOSHUA_TEMP`, `JOSHUA_TOP_K`, `JOSHUA_TOP_P`, `JOSHUA_MIN_P`, `JOSHUA_TYPICAL_P`, `JOSHUA_REPEAT_PENALTY`, `JOSHUA_REPEAT_LAST_N`, `JOSHUA_PRESENCE_PENALTY`, `JOSHUA_FREQUENCY_PENALTY`, `JOSHUA_XTC_PROBABILITY`, `JOSHUA_XTC_THRESHOLD`, `JOSHUA_MIROSTAT`, `JOSHUA_MIROSTAT_LR`, `JOSHUA_MIROSTAT_ENT` | Server sampling defaults (same as `--temp`, `--top-k`, …; see [Sampling defaults](#sampling-defaults)) |
-| `JOSHUA_CHAT_TEMPLATE` / `JOSHUA_CHAT_TEMPLATE_FILE` | A Jinja chat template (or a file holding one) used instead of the GGUF's (same as `--chat-template` / `--chat-template-file`) |
+| `JOSHUA_CHAT_TEMPLATE` / `JOSHUA_CHAT_TEMPLATE_FILE` | A Jinja chat template (or a file holding one) used instead of the GGUF's (same as `--chat-template` / `--chat-template-file`); a `--chat-template` value that is neither an existing file nor Jinja is refused at startup |
+| `JOSHUA_TRUST_REQUEST_CHAT_TEMPLATE` | Accept a request's own `chat_template` (same as `--trust-request-chat-template`; off by default) |
 | `JOSHUA_WHISPER_MODEL` | Whisper model directory mounted at `/v1/audio/transcriptions` (same as `--whisper-model`) |
 | `JOSHUA_NPU_PLUGIN` | NPU vendor plugin path (same as `--npu-plugin`) |
 | `JOSHUA_LLAMA_N_GPU_LAYERS` | llama.cpp adapter layer offload count (default: all) |
@@ -1073,7 +1078,7 @@ joshua run Qwen3-30B-A3B-Q4_K_M.gguf "Explain ..." --draft-model Qwen3-0.6B-Q8_0
 | `typical_p`, `top_n_sigma`, `xtc_*`, `mirostat*`, `dry` | | off | llama.cpp's extra samplers |
 | `logit_bias`, `allowed_token_ids`, `bad_words`, `ignore_eos`, `min_tokens`, `stop_token_ids`, `include_stop_str_in_output`, `truncate_prompt_tokens` | | off | Token controls (see the request table) |
 | `reasoning_budget`, `reasoning_budget_message` | `Option` | `None` | Force the end of a tagged reasoning block after N tokens |
-| `chat_template`, `add_generation_prompt`, `continue_final_message` | | `None`, `true`, `None` | Template controls (`None` continues a final assistant message) |
+| `chat_template`, `add_generation_prompt`, `continue_final_message` | | `None`, `true`, `None` | Template controls (`None` continues a final assistant message); a `chat_template` is refused unless the engine was built with `EngineOptions::trust_request_chat_template` |
 
 `GenerationOptions::default()` keeps the library's historical values above;
 `GenerationOptions::with_defaults(&engine.sampling_defaults(profile))` starts
@@ -1088,7 +1093,11 @@ chat template; every completion method returns a `Completion` with its
 `stop_type` (`eos`, `word`, `limit`), stop string or stop token, cached
 prompt tokens, `timings` and generated token ids.
 `Engine::format_infill` builds a llama-server `/infill` fill-in-the-middle
-prompt from the GGUF's FIM tokens.
+prompt from the GGUF's FIM tokens.  `Engine::validate_options` runs the
+checks generation would run on a request's options (a trusted
+`chat_template`, the context window, `truncate_prompt_tokens`,
+`allowed_token_ids`) so an API layer can answer with a client error before
+it starts a stream.
 
 ---
 

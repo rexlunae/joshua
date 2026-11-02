@@ -193,6 +193,37 @@ fn deepseek2_speculative_greedy_matches_plain_decoding() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// A reasoning budget forces tokens only on a model with reasoning tags;
+/// on one without (the tiny vocabulary has none) it changes nothing, so it
+/// must not switch drafting off.
+#[test]
+fn reasoning_budget_keeps_drafting_on_a_model_without_reasoning_tags() {
+    let dir = common::model_dir("spec-budget-no-tags");
+    common::write_tiny_qwen3moe_gguf(&dir.join("model.gguf"));
+    let config = SpeculativeConfig {
+        max_draft: 4,
+        max_ngram: 3,
+        min_ngram: 1,
+        cost_gate: false,
+    };
+    let plain = engine(&dir, None);
+    let spec = engine(&dir, Some(config));
+    let options = GenerationOptions {
+        reasoning_budget: Some(4),
+        ..greedy(24)
+    };
+    let prompt = "a b c d a b c d a b c d a b c d a b";
+    let (want, _, _, _) = plain.complete_raw(prompt, &options).unwrap();
+    let (got, _, _, _) = spec.complete_raw(prompt, &options).unwrap();
+    assert_eq!(got, want);
+    let stats = spec.speculative_stats();
+    assert!(
+        stats.drafted > 0,
+        "the budget switched drafting off: {stats:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// The deepseek4 loader (window-only layers): the verification pass and the
 /// ring rollback must match incremental decoding.
 #[test]

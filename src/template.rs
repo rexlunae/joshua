@@ -41,7 +41,21 @@ pub struct ChatTemplate {
     /// The tokenizer's control-token strings.  Untrusted message text is
     /// escaped so a literal copy of one cannot become a control token.
     special_tokens: Vec<String>,
+    /// The most template instructions one render may run (`None`: no
+    /// limit); see [`ChatTemplate::with_fuel`].
+    fuel: Option<u64>,
 }
+
+/// The [`ChatTemplate::with_fuel`] limit for a template a request supplies:
+/// far more than any real chat template needs for a long conversation, and
+/// well under a second of rendering, so a looping template fails instead of
+/// holding a thread.
+pub const REQUEST_TEMPLATE_FUEL: u64 = 10_000_000;
+
+/// Appended to the final message to find where the template's copy of it
+/// ends (see [`ChatTemplate::render_continuation`]): private-use characters
+/// no tokenizer control string contains, and none `tojson` escapes.
+const CONTINUATION_MARKER: &str = "\u{f8ff}joshua-continue\u{f8ff}";
 
 impl ChatTemplate {
     /// Wrap raw Jinja source with the model's BOS/EOS token strings.
@@ -58,7 +72,16 @@ impl ChatTemplate {
             bos_token: bos_token.into(),
             eos_token: eos_token.into(),
             special_tokens: Vec::new(),
+            fuel: None,
         }
+    }
+
+    /// Stop a render after `fuel` template instructions with an error — for
+    /// templates from an untrusted source, which could otherwise loop for
+    /// as long as they like.
+    pub fn with_fuel(mut self, fuel: Option<u64>) -> Self {
+        self.fuel = fuel;
+        self
     }
 
     /// Arm the template with the tokenizer's control-token strings.
@@ -152,6 +175,10 @@ impl ChatTemplate {
     /// A template that does not echo the message (one that drops the role,
     /// say) gets the earlier turns plus a generation prompt, then the text,
     /// as llama.cpp builds a continuation.
+    ///
+    /// The cut is found by a marker rendered after the message, not by
+    /// searching for its text, which can also occur in what the template
+    /// writes after it (a prefill of `<` in Qwen's `<|im_end|>`).
     fn render_continuation(
         &self,
         messages: &[ChatMessage],
@@ -166,21 +193,28 @@ impl ChatTemplate {
         if final_text.trim().is_empty() {
             return self.render_inner(earlier, tools, vars, true);
         }
-        let rendered = self.render_inner(messages, tools, vars, false)?;
-        let Some(at) = rendered.rfind(final_text.trim()) else {
+        let mut marked = messages.to_vec();
+        if let Some(last) = marked.last_mut() {
+            last.content.push_str(CONTINUATION_MARKER);
+        }
+        let rendered = self.render_inner(&marked, tools, vars, false)?;
+        let Some(at) = rendered.rfind(CONTINUATION_MARKER) else {
             let mut prompt = self.render_inner(earlier, tools, vars, true)?;
             prompt.push_str(final_text);
             return Ok(prompt);
         };
-        // Keep the message's own trailing whitespace when the template kept
-        // it; otherwise end where the template's copy ends.
-        let kept = final_text.trim_start();
-        let end = if rendered[at..].starts_with(kept) {
-            at + kept.len()
-        } else {
-            at + final_text.trim().len()
-        };
-        Ok(rendered[..end].to_string())
+        let head = &rendered[..at];
+        // The marker keeps the message's trailing whitespace from a
+        // template that trims it (Llama 3's `| trim`); end where that
+        // template's own copy ends, as transformers does.
+        let trailing = &final_text[final_text.trim_end().len()..];
+        if !trailing.is_empty() && head.ends_with(trailing) {
+            let plain = self.render_inner(messages, tools, vars, false)?;
+            if !plain.starts_with(head) {
+                return Ok(head[..head.len() - trailing.len()].to_string());
+            }
+        }
+        Ok(head.to_string())
     }
 
     fn render_inner(
@@ -226,6 +260,7 @@ impl ChatTemplate {
             .collect();
 
         let mut env = Environment::new();
+        env.set_fuel(self.fuel);
         env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
         env.add_function("raise_exception", |msg: String| -> Result<(), Error> {
             Err(Error::new(ErrorKind::InvalidOperation, msg))
@@ -958,6 +993,39 @@ mod tests {
             render(&t, &m, CONTINUE),
             t.render(&[msg("user", "Hi")], None).unwrap()
         );
+    }
+
+    #[test]
+    fn continuation_cut_ignores_copies_of_the_prefill_after_it() {
+        // Each prefill also occurs in the `<|im_end|>` the template writes
+        // after the message; searching for the text would cut there.
+        let t = ChatTemplate::new(QWEN_CHATML, "", "<|im_end|>");
+        for prefill in ["<", "m_end", "|>", "end|>\n"] {
+            let m = [msg("user", "hi"), msg("assistant", prefill)];
+            assert_eq!(
+                render(&t, &m, CONTINUE),
+                format!("<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n{prefill}"),
+                "{prefill:?}"
+            );
+        }
+        // A template that keeps trailing whitespace keeps the prefill's.
+        let m = [msg("user", "hi"), msg("assistant", "Sure, ")];
+        assert!(render(&t, &m, CONTINUE).ends_with("assistant\nSure, "));
+    }
+
+    #[test]
+    fn fuel_stops_a_looping_template() {
+        let looping =
+            "{% for a in range(100000) %}{% for b in range(100000) %}{% endfor %}{% endfor %}";
+        let t = ChatTemplate::new(looping, "", "").with_fuel(Some(REQUEST_TEMPLATE_FUEL));
+        let err = t.render(&[msg("user", "hi")], None).unwrap_err();
+        assert!(err.contains("fuel"), "{err}");
+        // An ordinary long conversation renders well inside the limit.
+        let t = ChatTemplate::new(QWEN_CHATML, "", "").with_fuel(Some(REQUEST_TEMPLATE_FUEL));
+        let long: Vec<ChatMessage> = (0..5000)
+            .map(|i| msg(if i % 2 == 0 { "user" } else { "assistant" }, "some text"))
+            .collect();
+        assert!(t.render(&long, None).is_ok());
     }
 
     #[test]

@@ -590,7 +590,8 @@ impl ModelManager {
             .u32("context_length")
             .map_err(|e| ModelLoad(e.to_string()))? as usize;
         let defaults = Limits::default();
-        let server_ctx = match (self.engine_options)(path).n_ctx {
+        let server = (self.engine_options)(path);
+        let server_ctx = match server.n_ctx {
             0 => defaults.context,
             n => n as usize,
         };
@@ -602,11 +603,15 @@ impl ModelManager {
             ..defaults
         };
         // The controller maps the file only to tokenize and to read slices;
-        // nothing is prefetched or loaded for compute here.
+        // nothing is prefetched or loaded for compute here.  It renders the
+        // chat and samples, so the server's template and sampling flags apply.
         let options = EngineOptions::with_n_ctx(context as u32)
             .backend(crate::engine::ComputeBackend::Cpu)
             .lazy_weights(true)
-            .prefill_chunk(limits.chunk);
+            .prefill_chunk(limits.chunk)
+            .sampling(server.sampling)
+            .chat_template(server.chat_template)
+            .trust_request_chat_template(server.trust_request_chat_template);
         let engine = Engine::with_options(path, options)?;
         let pipeline = Pipeline::deploy(
             path,
@@ -1337,6 +1342,8 @@ async fn chat_completions(
     let mut options = req
         .to_generation_options_with(&defaults)
         .map_err(ApiError::bad_request)?;
+    // Answer a request the model cannot serve before a stream starts.
+    engine.validate_options(&options).map_err(ApiError::from)?;
     let reasoning_output = req.reasoning_output().map_err(ApiError::bad_request)?;
     options.cache_scope = Some(crate::affinity::cache_scope(
         &headers,

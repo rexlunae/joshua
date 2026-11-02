@@ -14,10 +14,10 @@ use common::{
 };
 use joshua::fim::InfillChunk;
 use joshua::reasoning::{split, ReasoningFormat};
-use joshua::types::{LogitBias, TokenRef, MAX_TOKENS_UNLIMITED};
+use joshua::types::{LogitBias, TokenRef, MAX_TOKENS_UNLIMITED, TRUNCATE_TO_CONTEXT};
 use joshua::{
-    ChatMessage, Engine, GenerationOptions, JoshuaError, PromptPart, RawPrompt, SamplingOverrides,
-    SamplingProfile, StopType,
+    ChatMessage, Engine, EngineOptions, GenerationOptions, JoshuaError, PromptPart, RawPrompt,
+    SamplingOverrides, SamplingProfile, StopType,
 };
 
 /// EOS in the tiny vocabulary, and the ordinary words `a`, `b`, `c`.
@@ -411,28 +411,164 @@ fn template_controls_shape_the_prompt() {
     };
     assert_eq!(render(std::slice::from_ref(&user), &bare), "hello a ");
 
-    // A per-request template, which also shows the developer role mapped.
+    // A per-request template is code: refused unless the server trusts it.
     let custom = GenerationOptions {
         chat_template: Some(
             "{% for m in messages %}{{ m.role }}:{{ m.content }};{% endfor %}".into(),
         ),
         ..options.clone()
     };
+    let developer = [ChatMessage::text("developer", "x"), user.clone()];
+    for refused in [
+        engine.apply_chat_template(&developer, None, &custom),
+        engine.validate_options(&custom).map(|_| String::new()),
+        engine
+            .complete_chat_detailed(&developer, None, &custom)
+            .map(|c| c.text),
+    ] {
+        match refused {
+            Err(JoshuaError::InvalidRequest(message)) => {
+                assert!(
+                    message.contains("--trust-request-chat-template"),
+                    "{message}"
+                )
+            }
+            other => panic!("an untrusted template must be refused, got {other:?}"),
+        }
+    }
+
+    // Trusted, it renders, which also shows the developer role mapped.
+    let dir = model_dir("core-template-trusted");
+    write_tiny_llama_gguf(&dir.join("model.gguf"));
+    let trusting = Engine::with_options(
+        &dir,
+        EngineOptions::with_n_ctx(64).trust_request_chat_template(true),
+    )
+    .unwrap();
     assert_eq!(
-        render(
-            &[ChatMessage::text("developer", "x"), user.clone()],
-            &custom
-        ),
+        trusting
+            .apply_chat_template(&developer, None, &custom)
+            .unwrap(),
         "system:x;user:a;"
     );
+    assert!(trusting.validate_options(&custom).is_ok());
     let broken = GenerationOptions {
         chat_template: Some("{% for m in messages %}".into()),
-        ..options
+        ..options.clone()
     };
     assert!(matches!(
-        engine.apply_chat_template(&[user], None, &broken),
+        trusting.apply_chat_template(std::slice::from_ref(&user), None, &broken),
         Err(JoshuaError::InvalidRequest(_))
     ));
+    // Even a trusted template cannot loop for long.
+    let looping = GenerationOptions {
+        chat_template: Some(
+            "{% for a in range(100000) %}{% for b in range(100000) %}{% endfor %}{% endfor %}"
+                .into(),
+        ),
+        ..options
+    };
+    match trusting.apply_chat_template(&[user], None, &looping) {
+        Err(JoshuaError::InvalidRequest(message)) => assert!(message.contains("fuel"), "{message}"),
+        other => panic!("a looping template must stop, got {other:?}"),
+    }
+}
+
+#[test]
+fn requests_that_leave_nothing_to_sample_are_client_errors() {
+    let engine = engine("core-nothing-to-sample");
+    let prompt = RawPrompt::text("hello a b");
+    let refused = |options: GenerationOptions, needle: &str| {
+        for result in [
+            engine.validate_options(&options),
+            engine.complete_prompt(&prompt, &options).map(|_| ()),
+        ] {
+            match result {
+                Err(JoshuaError::InvalidRequest(message)) => {
+                    assert!(message.contains(needle), "{needle}: {message}")
+                }
+                other => panic!("{needle}: expected a client error, got {other:?}"),
+            }
+        }
+    };
+    // vLLM's checks on the list itself, before any work.
+    refused(
+        GenerationOptions {
+            allowed_token_ids: Some(vec![]),
+            ..greedy(4)
+        },
+        "empty",
+    );
+    refused(
+        GenerationOptions {
+            allowed_token_ids: Some(vec![A, 999_999]),
+            ..greedy(4)
+        },
+        "999999",
+    );
+    // Controls that contradict each other, sampled or greedy: the only
+    // allowed token is EOS, which `min_tokens` holds back.
+    for temperature in [0.0, 0.9] {
+        let options = GenerationOptions {
+            allowed_token_ids: Some(vec![EOS]),
+            min_tokens: 2,
+            temperature,
+            seed: Some(1),
+            ..greedy(4)
+        };
+        assert!(engine.validate_options(&options).is_ok());
+        match engine.complete_prompt(&prompt, &options) {
+            Err(JoshuaError::InvalidRequest(message)) => {
+                assert!(message.contains("no token"), "{message}")
+            }
+            other => panic!("expected a client error, got {other:?}"),
+        }
+    }
+    // The engine still serves the next request.
+    let ok = engine
+        .complete_prompt(
+            &prompt,
+            &GenerationOptions {
+                allowed_token_ids: Some(vec![B]),
+                ignore_eos: true,
+                ..greedy(2)
+            },
+        )
+        .unwrap();
+    assert_eq!(ok.token_ids, vec![B, B]);
+}
+
+#[test]
+fn truncate_prompt_tokens_follows_vllm() {
+    let engine = engine("core-truncate");
+    let prompt = RawPrompt::tokens(vec![1; 80]);
+    let truncate = |keep: u32| GenerationOptions {
+        truncate_prompt_tokens: Some(keep),
+        ignore_eos: true,
+        ..greedy(1)
+    };
+    // `-1` keeps all but one token of the 64-token window.
+    let c = engine
+        .complete_prompt(&prompt, &truncate(TRUNCATE_TO_CONTEXT))
+        .unwrap();
+    assert_eq!(c.usage.prompt_tokens, 63);
+    assert_eq!(c.usage.completion_tokens, 1);
+    let c = engine.complete_prompt(&prompt, &truncate(10)).unwrap();
+    assert_eq!(c.usage.prompt_tokens, 10);
+    // Zero would leave no prompt; more than the window cannot fit.
+    for (keep, needle) in [(0, "at least 1"), (65, "context window")] {
+        for result in [
+            engine.validate_options(&truncate(keep)),
+            engine.complete_prompt(&prompt, &truncate(keep)).map(|_| ()),
+        ] {
+            match result {
+                Err(JoshuaError::InvalidRequest(message)) => {
+                    assert!(message.contains(needle), "{keep}: {message}")
+                }
+                other => panic!("{keep}: expected a client error, got {other:?}"),
+            }
+        }
+    }
 }
 
 fn think_engine(name: &str) -> Engine {

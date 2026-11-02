@@ -577,6 +577,9 @@ pub struct EngineOptions {
     /// A chat template replacing the GGUF's (see
     /// [`Engine::with_chat_template`]).
     pub chat_template: Option<String>,
+    /// Render a request's own [`GenerationOptions::chat_template`] (see
+    /// [`Engine::with_trust_request_chat_template`]).
+    pub trust_request_chat_template: bool,
 }
 
 impl EngineOptions {
@@ -591,6 +594,13 @@ impl EngineOptions {
     /// [`Engine::with_chat_template`].
     pub fn chat_template(mut self, source: Option<String>) -> Self {
         self.chat_template = source;
+        self
+    }
+
+    /// Accept per-request chat templates.  See
+    /// [`Engine::with_trust_request_chat_template`].
+    pub fn trust_request_chat_template(mut self, trust: bool) -> Self {
+        self.trust_request_chat_template = trust;
         self
     }
 
@@ -872,6 +882,8 @@ pub struct Engine {
     eos_token_ids: Vec<u32>,
     /// The model's chat template from GGUF metadata, if it ships one.
     chat_template: Option<ChatTemplate>,
+    /// Whether a request may bring its own chat template.
+    trust_request_chat_template: bool,
     /// The tokenizer's control-token strings, longest first.
     ///
     /// Message text is escaped against these before rendering so a user or
@@ -893,6 +905,9 @@ pub struct Engine {
     fim: crate::fim::FimTokens,
     /// Every token's decoded text, built on the first DRY request.
     vocab_pieces: std::sync::OnceLock<Vec<String>>,
+    /// The vocabulary size, counted on first use (see
+    /// [`Engine::vocab_size`]).
+    vocab_len: std::sync::OnceLock<usize>,
     /// The tokenizer with added special tokens treated as plain text, built
     /// on first use (FIM text, which llama-server tokenizes without
     /// special-token parsing).
@@ -2888,6 +2903,7 @@ impl Engine {
             byte_level_decode,
             eos_token_ids,
             chat_template,
+            trust_request_chat_template: options.trust_request_chat_template,
             special_tokens,
             template_tokens,
             reasoning_format,
@@ -2896,6 +2912,7 @@ impl Engine {
             cli_sampling,
             fim,
             vocab_pieces: std::sync::OnceLock::new(),
+            vocab_len: std::sync::OnceLock::new(),
             plain_tokenizer: std::sync::OnceLock::new(),
             embed_model: Mutex::new(None),
             model_cache: Mutex::new(Vec::new()),
@@ -3011,6 +3028,16 @@ impl Engine {
         self.chat_template = Some(template);
         self.reasoning_format = format;
         self.reasoning_tags = tags;
+        self
+    }
+
+    /// Render a request's own [`GenerationOptions::chat_template`] (the
+    /// server's `--trust-request-chat-template`, off by default as in
+    /// vLLM).  A template is code the server runs, so an untrusted one is
+    /// refused; a trusted one still stops after
+    /// [`crate::template::REQUEST_TEMPLATE_FUEL`] instructions.
+    pub fn with_trust_request_chat_template(mut self, trust: bool) -> Self {
+        self.trust_request_chat_template = trust;
         self
     }
 
@@ -3405,9 +3432,11 @@ impl Engine {
             .map_err(|e| JoshuaError::Tokenization(e.to_string()))
     }
 
-    /// The vocabulary size, for the tokenizer endpoints that report it.
+    /// The vocabulary size, for the tokenizer endpoints that report it and
+    /// the checks on requested token ids.  Counted once: the tokenizer
+    /// builds its whole vocabulary map to count it.
     pub fn vocab_size(&self) -> usize {
-        self.tokenizer.get_vocab_size(true)
+        *self.vocab_len.get_or_init(|| self.tokenizer.get_vocab_size(true))
     }
 
     /// Count the prompt tokens a chat request will use, without running the
@@ -3671,16 +3700,18 @@ impl Engine {
     /// Format messages into the prompt the model was trained on.
     ///
     /// Uses the request's own template ([`GenerationOptions::chat_template`],
-    /// whose render errors are the client's), else the GGUF-embedded chat
-    /// template, else (or if that template fails to render) ChatML.
-    /// [`GenerationOptions::chat_template_kwargs`] are extra template
-    /// variables; the ChatML fallback has no switches and ignores them.
+    /// when the server trusts them, with render errors the client's), else
+    /// the GGUF-embedded chat template, else (or if that template fails to
+    /// render) ChatML.  [`GenerationOptions::chat_template_kwargs`] are
+    /// extra template variables; the ChatML fallback has no switches and
+    /// ignores them.
     fn render_chat(
         &self,
         messages: &[ChatMessage],
         tools: Option<&[Tool]>,
         options: &GenerationOptions,
     ) -> Result<RenderedChat> {
+        self.check_request_template(options)?;
         let continues = Self::continues_final_message(messages, options);
         let render = crate::template::RenderOptions {
             add_generation_prompt: options.add_generation_prompt && !continues,
@@ -3692,7 +3723,8 @@ impl Engine {
         if let Some(source) = &options.chat_template {
             let (bos, eos) = self.template_tokens.clone();
             let template = ChatTemplate::new(source.clone(), bos, eos)
-                .with_special_tokens(self.special_tokens.clone());
+                .with_special_tokens(self.special_tokens.clone())
+                .with_fuel(Some(crate::template::REQUEST_TEMPLATE_FUEL));
             return template
                 .render_with_options(messages, tools, vars, render)
                 .map(|text| RenderedChat {
@@ -3977,6 +4009,7 @@ impl Engine {
             return Ok(Completion::empty(StopType::Cancelled));
         }
         let n_ctx = self.request_n_ctx(options)?;
+        self.check_token_ids(options)?;
         // The plugin owns tokenisation, so the prompt length is unknown here;
         // clamp only to the server ceiling. The prompt is checked against the
         // request's window once prefill reports its length, and the decode
@@ -4045,8 +4078,9 @@ impl Engine {
                     reasoning_open,
                 ))
             }
-            Err(e @ JoshuaError::PromptTooLong(..)) => {
-                // A request error, not a backend fault: keep the session and
+            Err(e @ (JoshuaError::PromptTooLong(..) | JoshuaError::InvalidRequest(_))) => {
+                // A request error (such as token controls that leave nothing
+                // to sample), not a backend fault: keep the session and
                 // leave the circuit breaker alone.
                 if session.clear_state() {
                     self.release_model(session, Vec::new(), options.cache_namespace());
@@ -4138,6 +4172,78 @@ impl Engine {
         }
     }
 
+    /// Check a request's options against this model before any work, as
+    /// generation does: a per-request chat template needs the server's
+    /// trust, the context window and `truncate_prompt_tokens` must fit the
+    /// loaded window, and `allowed_token_ids` must name tokens of the
+    /// vocabulary.  An API layer calls it to answer a bad request with a
+    /// client error before it starts a stream.
+    pub fn validate_options(&self, options: &GenerationOptions) -> Result<()> {
+        self.check_request_template(options)?;
+        let n_ctx = self.request_n_ctx(options)?;
+        self.prompt_keep(options, n_ctx)?;
+        self.check_token_ids(options)
+    }
+
+    /// Refuse a request's own chat template unless the server trusts them
+    /// (vLLM's `--trust-request-chat-template` rule).
+    fn check_request_template(&self, options: &GenerationOptions) -> Result<()> {
+        if options.chat_template.is_some() && !self.trust_request_chat_template {
+            return Err(JoshuaError::InvalidRequest(
+                "Chat template is passed with request, but --trust-request-chat-template \
+                 is not set. Refused request with untrusted chat template."
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// How many prompt tokens [`GenerationOptions::truncate_prompt_tokens`]
+    /// keeps in a window of `n_ctx`: vLLM's rules, where
+    /// [`crate::types::TRUNCATE_TO_CONTEXT`] (its `-1`) keeps all but one
+    /// token of the window for output, and zero or more than the window is
+    /// a client error.
+    fn prompt_keep(&self, options: &GenerationOptions, n_ctx: usize) -> Result<Option<usize>> {
+        match options.truncate_prompt_tokens {
+            None => Ok(None),
+            Some(crate::types::TRUNCATE_TO_CONTEXT) => Ok(Some(n_ctx.saturating_sub(1).max(1))),
+            Some(0) => Err(JoshuaError::InvalidRequest(
+                "truncate_prompt_tokens must be -1 or at least 1".to_string(),
+            )),
+            Some(keep) if keep as usize > n_ctx => Err(JoshuaError::InvalidRequest(format!(
+                "truncate_prompt_tokens={keep} cannot be greater than the context window \
+                 of {n_ctx} tokens"
+            ))),
+            Some(keep) => Ok(Some(keep as usize)),
+        }
+    }
+
+    /// Reject an `allowed_token_ids` list that is empty or names ids outside
+    /// the vocabulary (vLLM's checks): either would leave nothing to sample.
+    fn check_token_ids(&self, options: &GenerationOptions) -> Result<()> {
+        let Some(allowed) = &options.allowed_token_ids else {
+            return Ok(());
+        };
+        if allowed.is_empty() {
+            return Err(JoshuaError::InvalidRequest(
+                "allowed_token_ids must not be empty".to_string(),
+            ));
+        }
+        let vocab = self.vocab_size();
+        let outside: Vec<u32> = allowed
+            .iter()
+            .copied()
+            .filter(|&id| id as usize >= vocab)
+            .collect();
+        if !outside.is_empty() {
+            return Err(JoshuaError::InvalidRequest(format!(
+                "allowed_token_ids contains out-of-vocab token ids {outside:?} \
+                 (vocabulary size {vocab})"
+            )));
+        }
+        Ok(())
+    }
+
     /// [`Engine::request_n_ctx`] for an already-validated request: clamps
     /// instead of failing.
     fn effective_n_ctx(&self, options: &GenerationOptions) -> usize {
@@ -4210,11 +4316,12 @@ impl Engine {
             }
             PromptSource::Tokens(tokens) => (tokens, None),
         };
+        let n_ctx = self.request_n_ctx(options)?;
         // vLLM's `truncate_prompt_tokens`: keep the prompt's tail.  The
         // shared head is gone, so is its prefix-cache root.
-        let root = match options.truncate_prompt_tokens {
-            Some(keep) if (keep as usize) < prompt_tokens.len() => {
-                prompt_tokens.drain(..prompt_tokens.len() - keep as usize);
+        let root = match self.prompt_keep(options, n_ctx)? {
+            Some(keep) if keep < prompt_tokens.len() => {
+                prompt_tokens.drain(..prompt_tokens.len() - keep);
                 None
             }
             _ => root,
@@ -4222,7 +4329,6 @@ impl Engine {
         let prompt_tokens = prompt_tokens.as_slice();
         let n_prompt = prompt_tokens.len();
 
-        let n_ctx = self.request_n_ctx(options)?;
         if n_prompt >= n_ctx {
             return Err(JoshuaError::PromptTooLong(n_prompt, n_ctx));
         }
@@ -4244,6 +4350,8 @@ impl Engine {
         if options.constraint.is_some() {
             self.constraint_matcher(options)?;
         }
+        // Likewise a token restriction that leaves nothing to sample.
+        self.check_token_ids(options)?;
 
         // ── Acquire a session, generate, retry on CPU if the NPU fails ──────
         // Prefer a pooled instance whose state already covers a prefix of
@@ -4613,7 +4721,7 @@ impl Engine {
         let options = constrained_options.as_ref().unwrap_or(options);
         // Settings that depend on the tokens decoded so far keep decoding
         // one token at a time, like a grammar does.
-        let plain = constraint.is_some() || options.needs_plain_decode();
+        let plain = constraint.is_some() || self.needs_plain_decode(options);
         // Reasoning tokens are counted for tagged formats; a budget, which
         // forces tokens, would break a grammar and is left out with one.
         let mut reasoning = self.reasoning_tags.as_ref().map(|(start, end)| {
@@ -4995,6 +5103,15 @@ impl Engine {
             token_ids: text.decoded_ids,
             reasoning_tokens: reasoning.map(|r| r.count),
         })
+    }
+
+    /// Whether this request decodes one token at a time, with no drafting:
+    /// [`GenerationOptions::needs_plain_decode`], or a reasoning budget on a
+    /// model whose reasoning tags let the engine force the end tag (without
+    /// tags the budget does nothing, so drafting stays on).
+    fn needs_plain_decode(&self, options: &GenerationOptions) -> bool {
+        options.needs_plain_decode()
+            || (options.reasoning_budget.is_some() && self.reasoning_tags.is_some())
     }
 
     /// The request's static logit controls, resolved against this model's
@@ -7893,6 +8010,20 @@ fn squeeze_batch_logits(logits: &Tensor) -> Result<Vec<f32>> {
         Probs,
         /// As `Probs`, and every non-zero entry's id is in `support`.
         Sparse,
+        /// The request's own token controls masked every token.
+        Exhausted,
+    }
+
+    /// The client error for [`SamplingKind::Exhausted`]: a request whose
+    /// restrictions contradict each other (`allowed_token_ids` only naming
+    /// an end-of-sequence token under `min_tokens`, say), not a backend
+    /// failure.
+    fn exhausted() -> JoshuaError {
+        JoshuaError::InvalidRequest(
+            "the request's token controls (allowed_token_ids, logit_bias, bad_words, \
+             min_tokens, ignore_eos, response_format) leave no token to sample"
+                .to_string(),
+        )
     }
 
     impl SamplingWorkspace {
@@ -7956,6 +8087,7 @@ fn squeeze_batch_logits(logits: &Tensor) -> Result<Vec<f32>> {
                 SamplingKind::Sparse => {
                     crate::speculative::sample_support_at(&self.probs, &self.support, seed, pos)
                 }
+                SamplingKind::Exhausted => Err(exhausted()),
             }
         }
 
@@ -7972,6 +8104,7 @@ fn squeeze_batch_logits(logits: &Tensor) -> Result<Vec<f32>> {
             Ok(match self.fill(logits, opts, recent_tokens, mask) {
                 SamplingKind::Greedy(token) => TokenDistRef::Greedy(token),
                 SamplingKind::Probs | SamplingKind::Sparse => TokenDistRef::Probs(&self.probs),
+                SamplingKind::Exhausted => return Err(exhausted()),
             })
         }
 
@@ -8013,6 +8146,15 @@ fn squeeze_batch_logits(logits: &Tensor) -> Result<Vec<f32>> {
                 self.adjusted.extend_from_slice(logits);
                 let v = &mut self.adjusted;
                 self.controls.apply(v);
+                // Only the controls can mask every token (the model's logits
+                // are finite); sampling nothing is the request's error.
+                if controls
+                    && !v.iter().enumerate().any(|(i, &l)| {
+                        l > f32::NEG_INFINITY && mask.is_none_or(|m| m.is_allowed(i as u32))
+                    })
+                {
+                    return SamplingKind::Exhausted;
+                }
                 if reppen != 1.0 {
                     for &token in recent_tokens {
                         if let Some(l) = v.get_mut(token as usize) {
@@ -8557,6 +8699,7 @@ mod tests {
         match workspace.fill(logits, opts, recent, None) {
             SamplingKind::Greedy(t) => TokenDist::Greedy(t),
             SamplingKind::Probs | SamplingKind::Sparse => TokenDist::Probs(workspace.probs),
+            SamplingKind::Exhausted => unreachable!("no token controls"),
         }
     }
 
@@ -8733,7 +8876,9 @@ mod tests {
             };
             match SamplingWorkspace::default().fill(&logits, &opts, &recent, None) {
                 SamplingKind::Greedy(t) => t,
-                SamplingKind::Probs | SamplingKind::Sparse => panic!("temperature 0 is greedy"),
+                SamplingKind::Probs | SamplingKind::Sparse | SamplingKind::Exhausted => {
+                    panic!("temperature 0 is greedy")
+                }
             }
         };
         assert_eq!(greedy(0.0, 0.0), 0, "no penalty: raw argmax");
@@ -10371,6 +10516,39 @@ mod tests {
         ws.controls.bias.clear();
         ws.controls.allowed = Some(vec![0]);
         assert_eq!(greedy(&mut ws), 0);
+    }
+
+    #[test]
+    fn controls_that_mask_every_token_are_a_client_error() {
+        let logits = [0.5, 2.0, 1.0, -1.0];
+        for temperature in [0.0, 0.8] {
+            let opts = GenerationOptions {
+                temperature,
+                ..Default::default()
+            };
+            let mut ws = SamplingWorkspace::default();
+            // The one allowed token is banned (an EOS under `min_tokens`).
+            ws.controls.allowed = Some(vec![1]);
+            ws.controls.ban = vec![1];
+            assert!(matches!(
+                ws.sample_at(&logits, &opts, &[], None, 7, 0),
+                Err(JoshuaError::InvalidRequest(_))
+            ));
+            assert!(matches!(
+                ws.distribution(&logits, &opts, &[], None, 0),
+                Err(JoshuaError::InvalidRequest(_))
+            ));
+            // Allowed ids past the logits mask everything too.
+            ws.controls.ban.clear();
+            ws.controls.allowed = Some(vec![9]);
+            assert!(matches!(
+                ws.sample_at(&logits, &opts, &[], None, 7, 0),
+                Err(JoshuaError::InvalidRequest(_))
+            ));
+            // One token left is enough.
+            ws.controls.allowed = Some(vec![2, 9]);
+            assert_eq!(ws.sample_at(&logits, &opts, &[], None, 7, 0).unwrap(), 2);
+        }
     }
 
     #[test]

@@ -543,8 +543,9 @@ enum Commands {
         max_output_tokens: Option<u32>,
         #[command(flatten)]
         sampling: SamplingArgs,
-        /// Jinja chat template to render chats with instead of the GGUF's
-        /// own (llama-server / vLLM `--chat-template`).
+        /// Jinja chat template, or a file holding one, to render chats with
+        /// instead of the GGUF's own (vLLM's `--chat-template`; llama-server's
+        /// built-in template names are not supported).
         #[arg(
             long,
             env = "JOSHUA_CHAT_TEMPLATE",
@@ -554,6 +555,15 @@ enum Commands {
         /// Read the --chat-template from this file.
         #[arg(long, env = "JOSHUA_CHAT_TEMPLATE_FILE")]
         chat_template_file: Option<PathBuf>,
+        /// Let requests render with their own `chat_template` (vLLM's
+        /// `--trust-request-chat-template`).  A template is code the server
+        /// runs, so they are refused with a 400 unless this is set.
+        #[arg(
+            long,
+            env = "JOSHUA_TRUST_REQUEST_CHAT_TEMPLATE",
+            default_value_t = false
+        )]
+        trust_request_chat_template: bool,
         /// Require this API key on /v1 routes (Authorization: Bearer <key>
         /// or x-api-key: <key>).  A comma-separated list accepts any key.
         #[arg(long, env = "JOSHUA_API_KEY")]
@@ -1007,6 +1017,7 @@ async fn main() -> anyhow::Result<()> {
             sampling,
             chat_template,
             chat_template_file,
+            trust_request_chat_template,
             api_key,
             cors_origin,
             tls_cert,
@@ -1080,12 +1091,8 @@ async fn main() -> anyhow::Result<()> {
                 .engram_tier(engram_tier)
                 .device_memory_budget(vram_budget.map(|mib| mib.saturating_mul(1024 * 1024)))
                 .sampling(sampling.overrides())
-                .chat_template(match chat_template_file {
-                    Some(path) => Some(std::fs::read_to_string(&path).map_err(|e| {
-                        anyhow::anyhow!("--chat-template-file {}: {e}", path.display())
-                    })?),
-                    None => chat_template,
-                });
+                .chat_template(chat_template_source(chat_template, chat_template_file)?)
+                .trust_request_chat_template(trust_request_chat_template);
             // One backend serves the startup model and any loaded later.
             let npu = npu_plugin
                 .map(|plugin| npu_backend(&plugin, npu_in_process))
@@ -1556,6 +1563,33 @@ fn mmap_mode(explicit: bool) -> MmapMode {
     }
 }
 
+/// The Jinja source `--chat-template` or `--chat-template-file` names.  As
+/// in vLLM, a `--chat-template` value is read as a file when one exists;
+/// otherwise it is the template itself, and a value without Jinja syntax
+/// (`{`, `}` or a newline) is refused rather than rendered as the literal
+/// prompt for every chat.
+fn chat_template_source(
+    template: Option<String>,
+    file: Option<PathBuf>,
+) -> anyhow::Result<Option<String>> {
+    if let Some(path) = file {
+        return std::fs::read_to_string(&path)
+            .map(Some)
+            .map_err(|e| anyhow::anyhow!("--chat-template-file {}: {e}", path.display()));
+    }
+    let Some(value) = template else {
+        return Ok(None);
+    };
+    match std::fs::read_to_string(&value) {
+        Ok(source) => Ok(Some(source)),
+        Err(_) if value.contains(['{', '}', '\n']) => Ok(Some(value)),
+        Err(e) => anyhow::bail!(
+            "--chat-template {value}: not a Jinja template, and not a readable file ({e}); \
+             built-in template names are not supported"
+        ),
+    }
+}
+
 /// Parse a `--reasoning-effort` value with the API's spelling.
 fn parse_reasoning_effort(s: &str) -> Result<ReasoningEffort, String> {
     serde_json::from_value(serde_json::Value::String(s.to_ascii_lowercase())).map_err(|_| {
@@ -1712,6 +1746,47 @@ fn npu_backend(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chat_template_flag_reads_a_file_or_takes_jinja_text() {
+        let dir = std::env::temp_dir().join(format!("joshua-template-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("tpl.jinja");
+        std::fs::write(&file, "{{ messages }}").unwrap();
+        let missing = dir.join("missing.jinja");
+        let flag = |value: &str| chat_template_source(Some(value.to_string()), None);
+
+        // A path is read, through either flag.
+        let read = Some("{{ messages }}".to_string());
+        assert_eq!(flag(&file.to_string_lossy()).unwrap(), read);
+        assert_eq!(
+            chat_template_source(None, Some(file.clone())).unwrap(),
+            read
+        );
+        // Jinja text is the template.
+        let literal = "{% for m in messages %}{{ m.content }}{% endfor %}";
+        assert_eq!(flag(literal).unwrap().as_deref(), Some(literal));
+        // A missing file or a built-in name would render as itself.
+        for value in [missing.to_string_lossy().to_string(), "chatml".into()] {
+            let err = flag(&value).unwrap_err().to_string();
+            assert!(err.contains("not a Jinja template"), "{value}: {err}");
+        }
+        assert!(chat_template_source(None, Some(missing)).is_err());
+        assert_eq!(chat_template_source(None, None).unwrap(), None);
+        // The trust switch parses, off by default.
+        let serve = ["joshua", "serve", "--model", "m.gguf"];
+        let cli = |args: &[&str]| Cli::try_parse_from(serve.iter().chain(args)).unwrap();
+        let trusted = |args: &[&str]| match cli(args).command {
+            Commands::Serve {
+                trust_request_chat_template,
+                ..
+            } => trust_request_chat_template,
+            _ => panic!("expected the serve subcommand"),
+        };
+        assert!(!trusted(&[]));
+        assert!(trusted(&["--trust-request-chat-template"]));
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn bounded_weight_lock_cli_requires_locking_and_rejects_overflow() {
