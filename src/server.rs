@@ -57,8 +57,10 @@ use uuid::Uuid;
 
 use crate::anthropic::{self, MessagesRequest};
 use crate::coordinator::{JobModel, ModelSlots, WorkerCapabilities, WorkerInfo, JOB_OWNER_HEADER, WORKER_PROTOCOL_VERSION};
-use crate::engine::{Engine, EngineOptions};
+use crate::engine::{Engine, EngineOptions, StopType};
 use crate::error::JoshuaError;
+use crate::reasoning::{ReasoningOutput, ReasoningSplitter, Split};
+use crate::sampling::SamplingProfile;
 use crate::whisper::WhisperEngine;
 use crate::tools::parse_tool_calls;
 use crate::types::{
@@ -1056,7 +1058,8 @@ async fn props(State(state): State<AppState>) -> Result<Json<serde_json::Value>,
             "model_not_loaded",
         ));
     };
-    let defaults = GenerationOptions::default();
+    // What a llama.cpp-native request gets when it sets nothing.
+    let defaults = first.engine.sampling_defaults(SamplingProfile::LlamaCpp);
     let total_slots: usize = models.iter().map(|m| m.engine.max_concurrency()).sum();
     Ok(Json(json!({
         "model_path": first.engine.model_path(),
@@ -1065,7 +1068,7 @@ async fn props(State(state): State<AppState>) -> Result<Json<serde_json::Value>,
         "chat_template": first.engine.has_chat_template().then_some("<gguf chat template>"),
         "total_slots": total_slots,
         "default_generation_settings": {
-            "n_predict": defaults.max_tokens,
+            "n_predict": -1,
             "temperature": defaults.temperature,
             "top_p": defaults.top_p,
             "top_k": defaults.top_k,
@@ -1330,13 +1333,22 @@ async fn chat_completions(
 ) -> Result<Response, ApiError> {
     let (model, engine) = state.models.resolve(&req.model)?;
     let stream = req.stream.unwrap_or(false);
-    let mut options = req.to_generation_options().map_err(ApiError::bad_request)?;
+    let defaults = engine.sampling_defaults(SamplingProfile::OpenAi);
+    let mut options = req
+        .to_generation_options_with(&defaults)
+        .map_err(ApiError::bad_request)?;
+    let reasoning_output = req.reasoning_output().map_err(ApiError::bad_request)?;
     options.cache_scope = Some(crate::affinity::cache_scope(
         &headers,
         options.context_window,
     ));
     let messages = req.messages.clone();
     let tools = req.offered_tools();
+    // vLLM's `echo`: repeat the assistant message being continued.
+    let echo = (req.echo == Some(true))
+        .then(|| messages.last().filter(|m| m.role == "assistant"))
+        .flatten()
+        .map(|m| m.content.clone());
 
     if stream {
         // ── Streaming path ────────────────────────────────────────────────────
@@ -1363,6 +1375,10 @@ async fn chat_completions(
                     &messages,
                     tools.as_deref(),
                     &options,
+                    ChatStreamOutput {
+                        reasoning: reasoning_output,
+                        echo,
+                    },
                     &flag,
                     tx,
                     &metrics,
@@ -1383,28 +1399,40 @@ async fn chat_completions(
 
     // ── Non-streaming path ────────────────────────────────────────────────────
     let cancel = CancelOnDrop::new();
-    let max_tokens = options.max_tokens;
-    let (text, usage, _, _) = tokio::task::spawn_blocking({
+    let completion = tokio::task::spawn_blocking({
         let engine = Arc::clone(&engine);
         let tools = tools.clone();
         let flag = cancel.flag();
-        move || engine.complete_chat_cancellable(&messages, tools.as_deref(), &options, &flag)
+        move || {
+            engine.complete_chat_cancellable_detailed(&messages, tools.as_deref(), &options, &flag)
+        }
     })
     .await
     .map_err(|e| ApiError::internal(e.to_string()))?
     .map_err(ApiError::from)?;
-    state.metrics.record_generation(&usage);
+    state.metrics.record_generation(&completion.usage);
+
+    // Reasoning first, then tool calls from the answer alone.
+    let (reasoning, mut text) = if reasoning_output.splits(false) {
+        crate::reasoning::split(
+            engine.reasoning_format(),
+            completion.reasoning_open,
+            &completion.text,
+        )
+    } else {
+        (None, completion.text.clone())
+    };
+    let reasoning = reasoning.filter(|_| reasoning_output != ReasoningOutput::Hidden);
+    if let Some(prefix) = &echo {
+        text.insert_str(0, prefix);
+    }
+    let natural_stop = matches!(completion.stop_type, StopType::Eos | StopType::Word);
 
     // Extract tool calls from the output when the request offered tools.
     let (content, tool_calls, finish_reason) = if tools.is_some() {
         let (prose, calls) = parse_tool_calls(&text);
         if calls.is_empty() {
-            let reason = if usage.completion_tokens >= max_tokens {
-                "length"
-            } else {
-                "stop"
-            };
-            (Some(text), None, reason)
+            (Some(text), None, completion.finish_reason())
         } else {
             let calls: Vec<ToolCall> = calls
                 .into_iter()
@@ -1420,20 +1448,20 @@ async fn chat_completions(
             (
                 if prose.is_empty() { None } else { Some(prose) },
                 Some(calls),
-                "tool_calls",
+                // A call cut off by a cap stays `length` (llama-server, vLLM).
+                if natural_stop {
+                    "tool_calls"
+                } else {
+                    completion.finish_reason()
+                },
             )
         }
     } else {
-        let reason = if usage.completion_tokens >= max_tokens {
-            "length"
-        } else {
-            "stop"
-        };
-        (Some(text), None, reason)
+        (Some(text), None, completion.finish_reason())
     };
 
     let id = format!("chatcmpl-{}", Uuid::new_v4().simple());
-    let response = ChatCompletionResponse::new(
+    let mut response = ChatCompletionResponse::new(
         id,
         model,
         vec![ChatChoice {
@@ -1441,15 +1469,17 @@ async fn chat_completions(
             message: AssistantMessage {
                 role: "assistant".to_string(),
                 content,
+                reasoning_content: reasoning.clone(),
+                reasoning,
                 tool_calls,
             },
             finish_reason: finish_reason.to_string(),
         }],
-        usage,
+        completion.usage.clone(),
     );
+    response.timings = Some(completion.timings);
     Ok(Json(response).into_response())
 }
-
 /// Markers that begin a tool call in the model's textual output.  The
 /// longest marker sets how much trailing text the stream must withhold,
 /// because a marker can be split across two decoded tokens.
@@ -1689,39 +1719,57 @@ impl ChatStreamEmitter {
         let delta = DeltaContent {
             role: self.take_role(),
             content: Some(text.to_string()),
-            tool_calls: None,
+            ..Default::default()
         };
-        self.send(delta, None, None);
+        self.send(delta, None, None, None);
+    }
+
+    /// Reasoning text, under both llama.cpp's and vLLM's field names.
+    fn reasoning(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let delta = DeltaContent {
+            role: self.take_role(),
+            reasoning_content: Some(text.to_string()),
+            reasoning: Some(text.to_string()),
+            ..Default::default()
+        };
+        self.send(delta, None, None, None);
     }
 
     fn tool_start(&mut self, index: usize, id: &str, name: &str) {
         let delta = DeltaContent {
             role: self.take_role(),
-            content: None,
             tool_calls: Some(json!([{
                 "index": index,
                 "id": id,
                 "type": "function",
                 "function": {"name": name, "arguments": ""},
             }])),
+            ..Default::default()
         };
-        self.send(delta, None, None);
+        self.send(delta, None, None, None);
     }
 
     fn tool_args(&mut self, index: usize, arguments: &str) {
         let delta = DeltaContent {
-            role: None,
-            content: None,
             tool_calls: Some(json!([{
                 "index": index,
                 "function": {"arguments": arguments},
             }])),
+            ..Default::default()
         };
-        self.send(delta, None, None);
+        self.send(delta, None, None, None);
     }
 
-    fn finish(&mut self, reason: &str, usage: &UsageInfo) {
-        self.send(DeltaContent::default(), Some(reason.to_string()), Some(usage));
+    fn finish(&mut self, reason: &str, usage: &UsageInfo, timings: &crate::types::Timings) {
+        self.send(
+            DeltaContent::default(),
+            Some(reason.to_string()),
+            Some(usage),
+            Some(timings),
+        );
         let _ = self.tx.send("[DONE]".to_string());
     }
 
@@ -1750,26 +1798,31 @@ impl ChatStreamEmitter {
         delta: DeltaContent,
         finish_reason: Option<String>,
         usage: Option<&UsageInfo>,
+        timings: Option<&crate::types::Timings>,
     ) {
-        let chunk = ChatCompletionChunk::new(
-            self.id.clone(),
-            self.model.clone(),
-            delta,
-            finish_reason,
-        );
+        let chunk =
+            ChatCompletionChunk::new(self.id.clone(), self.model.clone(), delta, finish_reason);
         let mut value = serde_json::to_value(&chunk).unwrap_or_default();
         if let Some(usage) = usage {
-            value["usage"] = json!({
-                "prompt_tokens": usage.prompt_tokens,
-                "completion_tokens": usage.completion_tokens,
-                "total_tokens": usage.total_tokens,
-            });
+            value["usage"] = serde_json::to_value(usage).unwrap_or_default();
+        }
+        if let Some(timings) = timings {
+            // llama-server puts its timings on the final chunk.
+            value["timings"] = serde_json::to_value(timings).unwrap_or_default();
         }
         let _ = self.tx.send(value.to_string());
     }
 }
 
+/// How a streamed chat response reports reasoning and echoes the prefill.
+struct ChatStreamOutput {
+    reasoning: ReasoningOutput,
+    /// The continued assistant message to repeat first (vLLM's `echo`).
+    echo: Option<String>,
+}
+
 /// Run one streaming chat completion on the blocking pool.
+#[allow(clippy::too_many_arguments)]
 fn stream_chat_completion(
     engine: &Engine,
     model: &str,
@@ -1777,42 +1830,73 @@ fn stream_chat_completion(
     messages: &[ChatMessage],
     tools: Option<&[Tool]>,
     options: &GenerationOptions,
+    output: ChatStreamOutput,
     cancel: &AtomicBool,
     tx: tokio::sync::mpsc::UnboundedSender<String>,
     metrics: &ServerMetrics,
 ) {
     let mut filter = ChatStreamFilter::new(tools.is_some());
     let mut emitter = ChatStreamEmitter::new(id.to_string(), model.to_string(), tx);
-    let result = {
-        let mut on_text = |delta: &str| {
-            for text in filter.push(delta) {
-                emitter.text(&text);
+    let mut splitter = if output.reasoning.splits(true) {
+        engine
+            .reasoning_splitter(messages, tools, options)
+            .unwrap_or_else(|_| ReasoningSplitter::disabled())
+    } else {
+        ReasoningSplitter::disabled()
+    };
+    let show_reasoning = output.reasoning != ReasoningOutput::Hidden;
+    if let Some(prefix) = &output.echo {
+        emitter.text(prefix);
+    }
+    // The answer as the client sees it, for the tool-call parse.
+    let mut content = String::new();
+    let mut forward =
+        |split: Split, emitter: &mut ChatStreamEmitter, filter: &mut ChatStreamFilter| {
+            if show_reasoning {
+                emitter.reasoning(&split.reasoning);
+            }
+            if !split.content.is_empty() {
+                content.push_str(&split.content);
+                for text in filter.push(&split.content) {
+                    emitter.text(&text);
+                }
             }
         };
-        engine.complete_chat_streaming(messages, tools, options, cancel, &mut on_text)
+    let result = {
+        let mut on_text = |delta: &str| {
+            let split = splitter.push(delta);
+            forward(split, &mut emitter, &mut filter);
+        };
+        engine.complete_chat_streaming_detailed(messages, tools, options, cancel, &mut on_text)
     };
 
     match result {
-        Ok((text, usage, _, _)) => {
-            metrics.record_generation(&usage);
-            for withheld in filter.finish(&text) {
+        Ok(completion) => {
+            metrics.record_generation(&completion.usage);
+            forward(splitter.finish(), &mut emitter, &mut filter);
+            for withheld in filter.finish(&content) {
                 emitter.text(&withheld);
             }
-            let (_, calls) = filter.parse(&text);
+            let (_, calls) = filter.parse(&content);
+            let natural_stop = matches!(completion.stop_type, StopType::Eos | StopType::Word);
             if calls.is_empty() {
-                let reason = if usage.completion_tokens >= options.max_tokens {
-                    "length"
-                } else {
-                    "stop"
-                };
-                emitter.finish(reason, &usage);
+                emitter.finish(
+                    completion.finish_reason(),
+                    &completion.usage,
+                    &completion.timings,
+                );
             } else {
                 for (index, call) in calls.iter().enumerate() {
                     let call_id = format!("call_{}", Uuid::new_v4().simple());
                     emitter.tool_start(index, &call_id, &call.name);
                     emitter.tool_args(index, &call.arguments);
                 }
-                emitter.finish("tool_calls", &usage);
+                let reason = if natural_stop {
+                    "tool_calls"
+                } else {
+                    completion.finish_reason()
+                };
+                emitter.finish(reason, &completion.usage, &completion.timings);
             }
         }
         Err(error) => {
@@ -1840,8 +1924,9 @@ async fn messages_count_tokens(
     Json(req): Json<MessagesRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let (_, engine) = state.models.resolve(&req.model)?;
+    let defaults = engine.sampling_defaults(SamplingProfile::OpenAi);
     let (messages, tools, options) =
-        anthropic::to_chat_request(&req).map_err(ApiError::bad_request)?;
+        anthropic::to_chat_request(&req, &defaults).map_err(ApiError::bad_request)?;
     let count = engine
         .count_chat_tokens(&messages, tools.as_deref(), &options)
         .map_err(ApiError::from)?;
@@ -1854,8 +1939,10 @@ async fn messages(
     Json(req): Json<MessagesRequest>,
 ) -> Result<Response, ApiError> {
     let (resolved_model, engine) = state.models.resolve(&req.model)?;
+    // Anthropic's defaults are the neutral OpenAI-family ones.
+    let defaults = engine.sampling_defaults(SamplingProfile::OpenAi);
     let (messages, tools, mut options) =
-        anthropic::to_chat_request(&req).map_err(ApiError::bad_request)?;
+        anthropic::to_chat_request(&req, &defaults).map_err(ApiError::bad_request)?;
     options.cache_scope = Some(crate::affinity::cache_scope(
         &headers,
         options.context_window,
@@ -1869,7 +1956,6 @@ async fn messages(
     );
     let tools = if tools_disabled { None } else { tools };
     let tools_offered = tools.is_some();
-    let max_tokens = options.max_tokens;
     let model = if req.model.is_empty() {
         resolved_model
     } else {
@@ -1937,25 +2023,36 @@ async fn messages(
     .map_err(ApiError::from)?;
     state.metrics.record_generation(&completion.usage);
 
+    let (reasoning, answer) = crate::reasoning::split(
+        engine.reasoning_format(),
+        completion.reasoning_open,
+        &completion.text,
+    );
     let id = format!("msg_{}", Uuid::new_v4().simple());
     let (response, _) = anthropic::response(
         id,
         model,
-        &completion.text,
-        &completion.usage,
+        &answer,
+        reasoning.as_deref(),
+        &completion,
         tools_offered,
-        max_tokens,
-        completion.stop_sequence.as_deref(),
     );
     Ok(Json(response).into_response())
 }
 
 /// Writes Anthropic streaming events to the SSE channel.
+///
+/// Content blocks come in llama-server's order: a `thinking` block for the
+/// model's reasoning, then the `text` block, then one `tool_use` block per
+/// call, each with its own index.
 struct AnthropicStreamEmitter {
     id: String,
     model: String,
     tx: tokio::sync::mpsc::UnboundedSender<AnthropicSse>,
-    text_started: bool,
+    /// The open `thinking` block's index.
+    thinking: Option<usize>,
+    /// The open `text` block's index.
+    text: Option<usize>,
     next_index: usize,
 }
 
@@ -1969,7 +2066,8 @@ impl AnthropicStreamEmitter {
             id,
             model,
             tx,
-            text_started: false,
+            thinking: None,
+            text: None,
             next_index: 0,
         }
     }
@@ -2000,26 +2098,84 @@ impl AnthropicStreamEmitter {
         );
     }
 
-    fn text(&mut self, text: &str) {
-        if text.is_empty() {
+    /// Reasoning text as a `thinking` block (llama-server's extended
+    /// thinking stream: `thinking_delta`s, then an empty `signature_delta`
+    /// when the block closes).
+    fn thinking(&mut self, text: &str) {
+        if text.is_empty() || self.text.is_some() {
             return;
         }
-        if !self.text_started {
-            self.text_started = true;
-            self.send(
-                "content_block_start",
-                json!({
-                    "type": "content_block_start",
-                    "index": 0,
-                    "content_block": {"type": "text", "text": ""},
-                }),
-            );
-        }
+        let index = match self.thinking {
+            Some(index) => index,
+            None => {
+                let index = self.next_index;
+                self.next_index += 1;
+                self.thinking = Some(index);
+                self.send(
+                    "content_block_start",
+                    json!({
+                        "type": "content_block_start",
+                        "index": index,
+                        "content_block": {"type": "thinking", "thinking": ""},
+                    }),
+                );
+                index
+            }
+        };
         self.send(
             "content_block_delta",
             json!({
                 "type": "content_block_delta",
-                "index": 0,
+                "index": index,
+                "delta": {"type": "thinking_delta", "thinking": text},
+            }),
+        );
+    }
+
+    fn close_thinking(&mut self) {
+        if let Some(index) = self.thinking.take() {
+            self.send(
+                "content_block_delta",
+                json!({
+                    "type": "content_block_delta",
+                    "index": index,
+                    "delta": {"type": "signature_delta", "signature": ""},
+                }),
+            );
+            self.send(
+                "content_block_stop",
+                json!({"type": "content_block_stop", "index": index}),
+            );
+        }
+    }
+
+    fn text(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        self.close_thinking();
+        let index = match self.text {
+            Some(index) => index,
+            None => {
+                let index = self.next_index;
+                self.next_index += 1;
+                self.text = Some(index);
+                self.send(
+                    "content_block_start",
+                    json!({
+                        "type": "content_block_start",
+                        "index": index,
+                        "content_block": {"type": "text", "text": ""},
+                    }),
+                );
+                index
+            }
+        };
+        self.send(
+            "content_block_delta",
+            json!({
+                "type": "content_block_delta",
+                "index": index,
                 "delta": {"type": "text_delta", "text": text},
             }),
         );
@@ -2028,16 +2184,14 @@ impl AnthropicStreamEmitter {
     fn finish(
         &mut self,
         calls: &[crate::tools::ParsedToolCall],
-        usage: &UsageInfo,
-        max_tokens: u32,
-        stop_sequence: Option<&str>,
+        completion: &crate::engine::Completion,
     ) {
-        if self.text_started {
+        self.close_thinking();
+        if let Some(index) = self.text {
             self.send(
                 "content_block_stop",
-                json!({"type": "content_block_stop", "index": 0}),
+                json!({"type": "content_block_stop", "index": index}),
             );
-            self.next_index = 1;
         }
         for call in calls {
             let index = self.next_index;
@@ -2075,24 +2229,19 @@ impl AnthropicStreamEmitter {
                 json!({"type": "content_block_stop", "index": index}),
             );
         }
-        let stop_reason = if !calls.is_empty() {
-            "tool_use"
-        } else if stop_sequence.is_some() {
-            "stop_sequence"
-        } else if usage.completion_tokens >= max_tokens {
-            "max_tokens"
-        } else {
-            "end_turn"
-        };
+        let stop_reason = anthropic::stop_reason(completion.stop_type, !calls.is_empty());
+        let usage = anthropic::MessagesUsage::from_completion(completion);
         self.send(
             "message_delta",
             json!({
                 "type": "message_delta",
                 "delta": {
                     "stop_reason": stop_reason,
-                    "stop_sequence": stop_sequence,
+                    "stop_sequence": completion.stop_sequence,
                 },
-                "usage": {"output_tokens": usage.completion_tokens},
+                // The final counts, including the prompt tokens read from
+                // cache (Anthropic's SDKs take the latest value of each).
+                "usage": usage,
             }),
         );
         self.send("message_stop", json!({"type": "message_stop"}));
@@ -2124,28 +2273,37 @@ fn stream_messages(
 ) {
     let mut filter = ChatStreamFilter::new(tools.is_some());
     let mut emitter = AnthropicStreamEmitter::new(id.to_string(), model.to_string(), tx);
+    let mut splitter = engine
+        .reasoning_splitter(messages, tools, options)
+        .unwrap_or_else(|_| ReasoningSplitter::disabled());
     emitter.message_start(input_tokens);
+    let mut content = String::new();
+    let mut forward =
+        |split: Split, emitter: &mut AnthropicStreamEmitter, filter: &mut ChatStreamFilter| {
+            emitter.thinking(&split.reasoning);
+            if !split.content.is_empty() {
+                content.push_str(&split.content);
+                for text in filter.push(&split.content) {
+                    emitter.text(&text);
+                }
+            }
+        };
     let result = {
         let mut on_text = |delta: &str| {
-            for text in filter.push(delta) {
-                emitter.text(&text);
-            }
+            let split = splitter.push(delta);
+            forward(split, &mut emitter, &mut filter);
         };
         engine.complete_chat_streaming_detailed(messages, tools, options, cancel, &mut on_text)
     };
     match result {
         Ok(completion) => {
             metrics.record_generation(&completion.usage);
-            for withheld in filter.finish(&completion.text) {
+            forward(splitter.finish(), &mut emitter, &mut filter);
+            for withheld in filter.finish(&content) {
                 emitter.text(&withheld);
             }
-            let (_, calls) = filter.parse(&completion.text);
-            emitter.finish(
-                &calls,
-                &completion.usage,
-                options.max_tokens,
-                completion.stop_sequence.as_deref(),
-            );
+            let (_, calls) = filter.parse(&content);
+            emitter.finish(&calls, &completion);
         }
         Err(error) => {
             tracing::error!("streaming Anthropic message failed: {error}");
@@ -2169,44 +2327,35 @@ async fn completions(
         .ok_or_else(|| ApiError::bad_request("Missing required field 'prompt'"))?
         .to_string();
 
-    let options = GenerationOptions {
-        cache_scope: Some(crate::affinity::cache_scope(&headers, None)),
-        max_tokens: body
-            .get("max_tokens")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as u32)
-            .unwrap_or(256),
-        temperature: body
-            .get("temperature")
-            .and_then(|v| v.as_f64())
-            .map(|v| v as f32)
-            .unwrap_or(0.7),
-        ..GenerationOptions::default()
-    };
+    // The OpenAI route's defaults, then the request's own sampling fields
+    // (`max_tokens` absent or -1 runs to end of sequence).
+    let sampling: crate::types::SamplingParams =
+        serde_json::from_value(body.clone()).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let mut options =
+        GenerationOptions::with_defaults(&engine.sampling_defaults(SamplingProfile::OpenAi));
+    sampling
+        .apply(&mut options)
+        .map_err(ApiError::bad_request)?;
+    options.cache_scope = Some(crate::affinity::cache_scope(&headers, None));
 
     let messages = vec![ChatMessage::text("user".to_string(), prompt)];
 
     let cancel = CancelOnDrop::new();
-    let max_tokens = options.max_tokens;
-    let (text, usage, _, _) = tokio::task::spawn_blocking({
+    let completion = tokio::task::spawn_blocking({
         let engine = Arc::clone(&engine);
         let flag = cancel.flag();
-        move || engine.complete_chat_cancellable(&messages, None, &options, &flag)
+        move || engine.complete_chat_cancellable_detailed(&messages, None, &options, &flag)
     })
     .await
     .map_err(|e| ApiError::internal(e.to_string()))?
     .map_err(ApiError::from)?;
 
-    state.metrics.record_generation(&usage);
+    let usage = &completion.usage;
+    state.metrics.record_generation(usage);
     let created = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let finish_reason = if usage.completion_tokens >= max_tokens {
-        "length"
-    } else {
-        "stop"
-    };
 
     Ok(Json(json!({
         "id": format!("cmpl-{}", Uuid::new_v4().simple()),
@@ -2214,15 +2363,12 @@ async fn completions(
         "created": created,
         "model": model,
         "choices": [{
-            "text": text,
+            "text": completion.text,
             "index": 0,
-            "finish_reason": finish_reason
+            "finish_reason": completion.finish_reason()
         }],
-        "usage": {
-            "prompt_tokens": usage.prompt_tokens,
-            "completion_tokens": usage.completion_tokens,
-            "total_tokens": usage.total_tokens
-        }
+        "usage": usage,
+        "timings": completion.timings,
     })))
 }
 
@@ -2287,6 +2433,7 @@ async fn embeddings(
             prompt_tokens,
             completion_tokens: 0,
             total_tokens: prompt_tokens,
+            ..Default::default()
         },
     };
     let limit = if headers.contains_key(JOB_OWNER_HEADER) { 2 << 20 } else { 8 << 20 };

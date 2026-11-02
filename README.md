@@ -393,21 +393,52 @@ Besides `model`, `messages`, `stream` and `tools`:
 
 | Field | Notes |
 |---|---|
-| `max_tokens` / `max_completion_tokens` | Generation cap (the latter wins); always clamped to `--max-output-tokens` and the remaining context |
-| `temperature`, `top_p`, `top_k`, `min_p`, `repetition_penalty`, `stop` | See [Generation options](#generation-options) |
+| `max_tokens` / `max_completion_tokens` / `n_predict` | Generation cap (`n_predict` wins, then `max_completion_tokens`); absent or `-1` generates until end of sequence or of the context; always clamped to `--max-output-tokens` and the remaining context |
+| `temperature`, `top_p`, `top_k`, `min_p`, `repetition_penalty` (alias `repeat_penalty`), `stop` | Unset values come from [sampling defaults](#sampling-defaults) |
 | `presence_penalty`, `frequency_penalty` | OpenAI penalties, `-2.0..=2.0` |
+| `repeat_last_n` | Penalty window (default 64; `0` off, `-1` the whole context) |
+| `typical_p`, `top_n_sigma`, `xtc_probability`, `xtc_threshold`, `mirostat`, `mirostat_tau`, `mirostat_eta`, `dry_multiplier`, `dry_base`, `dry_allowed_length`, `dry_penalty_last_n`, `dry_sequence_breakers` | llama.cpp's samplers, same semantics; all off by default (`dynatemp_range` other than 0 is a **400**) |
+| `logit_bias` | OpenAI's `{"<id>": bias}` or llama.cpp's `[[id or text, bias], …]`; `false` bans a token |
+| `ignore_eos`, `min_tokens`, `stop_token_ids`, `include_stop_str_in_output`, `allowed_token_ids`, `bad_words`, `truncate_prompt_tokens` | vLLM's sampling extras |
 | `seed` | Reproducible sampling; negative (llama.cpp's `-1`) means random |
-| `reasoning_effort` | `none`, `minimal`, `low`, `medium`, `high`, `xhigh` — see below |
+| `reasoning_effort` | `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` — see below |
 | `reasoning` | `{"effort": …, "enabled": bool, "max_tokens": n}` (OpenAI Responses / OpenRouter shape) |
 | `enable_thinking` | Thinking on/off (Qwen API spelling) |
+| `thinking_token_budget` (alias `reasoning_budget_tokens`, `thinking_budget_tokens`), `reasoning_budget_message` | Cut the reasoning after N tokens by forcing its end tag (optionally after the message) |
+| `reasoning_format`, `include_reasoning` | How reasoning is returned — see [Reasoning and thinking](#reasoning-and-thinking) |
 | `chat_template_kwargs` | Extra variables for the GGUF chat template (vLLM / llama.cpp convention); override the reasoning-derived ones |
+| `chat_template` | Render this request with this Jinja template instead of the model's |
+| `add_generation_prompt`, `continue_final_message` | Template controls (vLLM); a conversation ending in an assistant message is continued (prefill) unless `continue_final_message` is `false`; both `true` is a **400** |
+| `documents`, `echo` | Passed to the template as `documents`; `echo` repeats the continued assistant message |
 | `context_window` (alias `num_ctx`, `n_ctx`) | Per-request context window; **400** when larger than the server's `--n-ctx` (the KV cache and RoPE tables are sized at load), and the prompt must fit inside it |
 | `tool_choice` | `"none"` hides `tools`; `"required"` and named functions cannot be enforced and act like `"auto"` |
 | `stream_options` | Accepted; usage is always sent on the final chunk |
 | `n`, `logprobs`, `top_logprobs` | Only `n: 1`, `logprobs: false` and `top_logprobs: 0` are accepted; anything else is a **400** rather than silently ignored |
 | `response_format` | `{"type": "text"}`, `{"type": "json_object"}`, or `{"type": "json_schema", "json_schema": {"name": …, "schema": {…}}}` — see [Structured outputs](#structured-outputs) |
 
-Other unknown fields are ignored.
+Other unknown fields are ignored.  A `developer` message becomes a `system`
+message (merged into one leading system message) unless the template names
+the role itself, as vLLM does.
+
+Responses carry `usage.prompt_tokens_details.cached_tokens` (prompt tokens
+whose state was reused) and llama-server's `timings` object (`cache_n`,
+`prompt_n`, `prompt_ms`, `predicted_n`, `predicted_ms` and their rates); a
+stream carries both on its final chunk.  `finish_reason` is `length` whenever
+any cap — `max_tokens`, `--max-output-tokens` or the context — ended the
+generation.
+
+#### Sampling defaults
+
+A request falls back, field by field, to the server's sampling flags
+(`--temp`, `--top-k`, `--top-p`, `--min-p`, `--typical`, `--repeat-penalty`,
+`--repeat-last-n`, `--presence-penalty`, `--frequency-penalty`,
+`--xtc-probability`, `--xtc-threshold`, `--mirostat`, `--mirostat-lr`,
+`--mirostat-ent`), then the model's `general.sampling.*` GGUF metadata (the
+publisher's recommended settings, read as llama.cpp reads them), then the
+defaults of the API it came through: temperature 1.0 and no top-p, top-k,
+min-p or repetition penalty on the OpenAI and Anthropic routes (vLLM's
+defaults); Ollama's `DefaultOptions` (temperature 0.8, top-k 40, top-p 0.9)
+on `/api/*`; llama.cpp's (0.8, 40, 0.95, min-p 0.05) on its native routes.
 
 Control-token strings in client-supplied message fields (content, role,
 name, tool-call ids and arguments) are escaped before the template renders,
@@ -473,6 +504,13 @@ Set `"stream": true` for Anthropic SSE events (`message_start`,
 `message_delta`, `message_stop`).  Tool calls are emitted as `tool_use`
 content blocks with parsed JSON input; assistant `tool_use` and user
 `tool_result` blocks are converted back into the model's chat template.
+A reasoning model's thinking comes first as a `thinking` block
+(`thinking_delta`s, then an empty `signature_delta`), and earlier `thinking`
+blocks are passed back to the template.  `thinking: {"type": "enabled",
+"budget_tokens": N}` turns thinking on and enforces the budget; `{"type":
+"disabled"}` turns it off.  A final assistant message is a prefill the model
+continues.  `usage` reports `cache_read_input_tokens` and the uncached
+remainder as `input_tokens`.
 
 #### Reasoning and thinking
 
@@ -483,8 +521,8 @@ work on exactly the models whose template has the switch:
 |---|---|---|
 | `enable_thinking` | `enable_thinking`, `reasoning.enabled`, or `reasoning_effort` (`none` → `false`, others → `true`) | Qwen3 (hybrid), GLM-4.5/4.6, SmolLM3, Hunyuan-A13B |
 | `thinking` | same as `enable_thinking` | DeepSeek-V3.1/V3.2, Granite 3.x |
-| `reasoning_effort` | `reasoning_effort` / `reasoning.effort` as `low`/`medium`/`high` (`none`, `minimal` → `low`; `xhigh` → `high`); thinking off with no effort → `low` | gpt-oss (which cannot turn reasoning off; `low` is the floor) |
-| `thinking_budget` | `reasoning.max_tokens` (advisory, not enforced by the sampler) | Seed-OSS |
+| `reasoning_effort` | `reasoning_effort` / `reasoning.effort` as `low`/`medium`/`high` (`none`, `minimal` → `low`; `xhigh`, `max` → `high`); thinking off with no effort → `low` | gpt-oss (which cannot turn reasoning off; `low` is the floor) |
+| `thinking_budget` | `reasoning.max_tokens` (also enforced, as `thinking_token_budget` is) | Seed-OSS |
 
 Contradictory spellings (e.g. `reasoning_effort: "high"` with
 `enable_thinking: false`) are a 400.  Models without a switch ignore the
@@ -492,9 +530,24 @@ settings and render exactly as before: Llama, Gemma, Mistral, the
 always-thinking DeepSeek-R1 / Kimi-K2-Thinking / Qwen3-*-Thinking-2507, and
 the never-thinking Qwen3-*-Instruct-2507.  So does any GGUF without an
 embedded chat template (the ChatML fallback has no switches); use
-`chat_template_kwargs` for template variables not listed here.  Thinking
-text is returned in `content` as the model writes it (no separate
-`reasoning_content` field yet).
+`chat_template_kwargs` for template variables not listed here.
+
+The model's reasoning is split from its answer and returned as
+`message.reasoning_content` (llama.cpp's and DeepSeek's field) and
+`message.reasoning` (vLLM's), in stream deltas too, with
+`usage.completion_tokens_details.reasoning_tokens`.  The split follows the
+model's markup: `<think>…</think>` (Qwen3, QwQ, DeepSeek-R1/V3.1+, GLM-4.5+,
+Kimi-K2-Thinking), `<seed:think>`, `[THINK]`, `<|START_THINKING|>`, and
+gpt-oss harmony channels; a template that opens the block in its generation
+prompt (DeepSeek-R1) is detected from the rendered prompt.
+`reasoning_format: "none"` leaves the reasoning in `content`,
+`"deepseek-legacy"` splits only non-streamed responses, and
+`include_reasoning: false` drops it.  Earlier turns' `reasoning_content`
+(or `reasoning`, `thinking`) is passed to templates that render it.
+`thinking_token_budget` (vLLM; `reasoning_budget_tokens` in llama.cpp) and
+`reasoning.max_tokens` end the reasoning after that many tokens by forcing
+the end tag, on models whose reasoning is tagged; such requests decode one
+token at a time.
 
 Attention geometry — sliding-window size, RoPE / YaRN scaling, sparse
 attention top-k — is read from the GGUF metadata at load and is not
@@ -669,6 +722,8 @@ Two limits bound how much work a single client can demand, both tunable:
   large models on small boxes.
 - `--max-output-tokens` (default: 4096) caps generated tokens per request
   regardless of the client's `max_tokens`, bounding single-request CPU time.
+  A request that sets no `max_tokens` (or `-1`) runs to end of sequence up
+  to this cap.
 - `--n-ctx` (default: 4096) is the context window — prompt plus generated
   tokens — the model is loaded with.  A request can narrow it with
   `context_window` but never widen it.
@@ -900,6 +955,8 @@ prints the dense/expert split of any GGUF to sanity-check a new model.
 | `JOSHUA_VULKAN_QGEMV` | `mali-int8` / `mali` / `generic` forces the Mali GEMV on int8 dot products (the default on Arm GPUs that have them), the float Mali GEMV or the generic one on any Vulkan device |
 | `JOSHUA_MAX_CONCURRENCY` | Cap on simultaneous generations/embeddings (same as `--max-concurrency`) |
 | `JOSHUA_MAX_OUTPUT_TOKENS` | Hard ceiling on generated tokens per request (same as `--max-output-tokens`) |
+| `JOSHUA_TEMP`, `JOSHUA_TOP_K`, `JOSHUA_TOP_P`, `JOSHUA_MIN_P`, `JOSHUA_TYPICAL_P`, `JOSHUA_REPEAT_PENALTY`, `JOSHUA_REPEAT_LAST_N`, `JOSHUA_PRESENCE_PENALTY`, `JOSHUA_FREQUENCY_PENALTY`, `JOSHUA_XTC_PROBABILITY`, `JOSHUA_XTC_THRESHOLD`, `JOSHUA_MIROSTAT`, `JOSHUA_MIROSTAT_LR`, `JOSHUA_MIROSTAT_ENT` | Server sampling defaults (same as `--temp`, `--top-k`, …; see [Sampling defaults](#sampling-defaults)) |
+| `JOSHUA_CHAT_TEMPLATE` / `JOSHUA_CHAT_TEMPLATE_FILE` | A Jinja chat template (or a file holding one) used instead of the GGUF's (same as `--chat-template` / `--chat-template-file`) |
 | `JOSHUA_WHISPER_MODEL` | Whisper model directory mounted at `/v1/audio/transcriptions` (same as `--whisper-model`) |
 | `JOSHUA_NPU_PLUGIN` | NPU vendor plugin path (same as `--npu-plugin`) |
 | `JOSHUA_LLAMA_N_GPU_LAYERS` | llama.cpp adapter layer offload count (default: all) |
@@ -1012,9 +1069,26 @@ joshua run Qwen3-30B-A3B-Q4_K_M.gguf "Explain ..." --draft-model Qwen3-0.6B-Q8_0
 | `context_window` | `Option<u32>` | `None` | Per-request cap on prompt + generated tokens; must be ≤ the engine's `n_ctx` |
 | `chat_template_kwargs` | `Map<String, Value>` | `{}` | Extra chat-template variables (reasoning switches; see [Reasoning and thinking](#reasoning-and-thinking)) |
 | `stop_sequences` | `Vec<String>` | `[]` | Stop on these strings |
+| `repeat_last_n` | `i32` | `64` | Penalty window (0 = off, -1 = whole context) |
+| `typical_p`, `top_n_sigma`, `xtc_*`, `mirostat*`, `dry` | | off | llama.cpp's extra samplers |
+| `logit_bias`, `allowed_token_ids`, `bad_words`, `ignore_eos`, `min_tokens`, `stop_token_ids`, `include_stop_str_in_output`, `truncate_prompt_tokens` | | off | Token controls (see the request table) |
+| `reasoning_budget`, `reasoning_budget_message` | `Option` | `None` | Force the end of a tagged reasoning block after N tokens |
+| `chat_template`, `add_generation_prompt`, `continue_final_message` | | `None`, `true`, `None` | Template controls (`None` continues a final assistant message) |
 
-`joshua::types::reasoning_template_kwargs(effort, enabled, budget)` builds the
-`chat_template_kwargs` for a reasoning setting the same way the server does.
+`GenerationOptions::default()` keeps the library's historical values above;
+`GenerationOptions::with_defaults(&engine.sampling_defaults(profile))` starts
+from an API's [sampling defaults](#sampling-defaults) with no output cap, as
+the server does.  `joshua::types::reasoning_template_kwargs(effort, enabled,
+budget)` builds the `chat_template_kwargs` for a reasoning setting the same
+way the server does.
+
+`Engine::complete_prompt` (and its `_cancellable` / `_streaming` variants)
+completes a raw prompt — text, token ids or a mix (`RawPrompt`) — without a
+chat template; every completion method returns a `Completion` with its
+`stop_type` (`eos`, `word`, `limit`), stop string or stop token, cached
+prompt tokens, `timings` and generated token ids.
+`Engine::format_infill` builds a llama-server `/infill` fill-in-the-middle
+prompt from the GGUF's FIM tokens.
 
 ---
 

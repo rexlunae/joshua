@@ -205,6 +205,76 @@ impl std::str::FromStr for SsdExpertCacheArg {
     }
 }
 
+/// Server-wide sampling defaults, with llama-server's flag names.  Each one
+/// replaces the model's `general.sampling.*` recommendation and every API's
+/// own default; a request's explicit value still wins.
+#[derive(clap::Args, Debug, Clone, Default)]
+struct SamplingArgs {
+    /// Default temperature for requests that set none.
+    #[arg(long = "temp", env = "JOSHUA_TEMP")]
+    temp: Option<f32>,
+    /// Default top-k (0 = off).
+    #[arg(long, env = "JOSHUA_TOP_K")]
+    top_k: Option<i32>,
+    /// Default top-p (1.0 = off).
+    #[arg(long, env = "JOSHUA_TOP_P")]
+    top_p: Option<f32>,
+    /// Default min-p (0 = off).
+    #[arg(long, env = "JOSHUA_MIN_P")]
+    min_p: Option<f32>,
+    /// Default locally typical sampling p (1.0 = off).
+    #[arg(long = "typical", env = "JOSHUA_TYPICAL_P")]
+    typical: Option<f32>,
+    /// Default repetition penalty (1.0 = off).
+    #[arg(long, env = "JOSHUA_REPEAT_PENALTY")]
+    repeat_penalty: Option<f32>,
+    /// Default penalty window in tokens (0 = off, -1 = the context).
+    #[arg(long, env = "JOSHUA_REPEAT_LAST_N", allow_negative_numbers = true)]
+    repeat_last_n: Option<i32>,
+    /// Default presence penalty.
+    #[arg(long, env = "JOSHUA_PRESENCE_PENALTY", allow_negative_numbers = true)]
+    presence_penalty: Option<f32>,
+    /// Default frequency penalty.
+    #[arg(long, env = "JOSHUA_FREQUENCY_PENALTY", allow_negative_numbers = true)]
+    frequency_penalty: Option<f32>,
+    /// Default XTC probability (0 = off).
+    #[arg(long, env = "JOSHUA_XTC_PROBABILITY")]
+    xtc_probability: Option<f32>,
+    /// Default XTC threshold.
+    #[arg(long, env = "JOSHUA_XTC_THRESHOLD")]
+    xtc_threshold: Option<f32>,
+    /// Default Mirostat version (0 = off, 1, 2).
+    #[arg(long, env = "JOSHUA_MIROSTAT", value_parser = clap::value_parser!(u8).range(0..=2))]
+    mirostat: Option<u8>,
+    /// Default Mirostat learning rate (eta).
+    #[arg(long = "mirostat-lr", env = "JOSHUA_MIROSTAT_LR")]
+    mirostat_lr: Option<f32>,
+    /// Default Mirostat target entropy (tau).
+    #[arg(long = "mirostat-ent", env = "JOSHUA_MIROSTAT_ENT")]
+    mirostat_ent: Option<f32>,
+}
+
+impl SamplingArgs {
+    fn overrides(&self) -> joshua::SamplingOverrides {
+        joshua::SamplingOverrides {
+            temperature: self.temp,
+            top_k: self.top_k,
+            top_p: self.top_p,
+            min_p: self.min_p,
+            typical_p: self.typical,
+            repetition_penalty: self.repeat_penalty,
+            repeat_last_n: self.repeat_last_n,
+            presence_penalty: self.presence_penalty,
+            frequency_penalty: self.frequency_penalty,
+            xtc_probability: self.xtc_probability,
+            xtc_threshold: self.xtc_threshold,
+            mirostat: self.mirostat,
+            mirostat_tau: self.mirostat_ent,
+            mirostat_eta: self.mirostat_lr,
+        }
+    }
+}
+
 /// An mmap-based LLM inference engine — a Rust clone of Cactus.
 #[derive(Parser)]
 #[command(name = "joshua", version, about, long_about = None)]
@@ -466,9 +536,24 @@ enum Commands {
         #[arg(long, env = "JOSHUA_ADMISSION_QUEUE_DEPTH", default_value_t = 0, hide_default_value = true)]
         admission_queue_depth: usize,
         /// Hard ceiling on tokens generated per request, capping the
-        /// client-supplied max_tokens.
+        /// client-supplied max_tokens.  A request without max_tokens (or
+        /// with -1) generates until end of sequence or of the context, up to
+        /// this ceiling (default 4096).
         #[arg(long, env = "JOSHUA_MAX_OUTPUT_TOKENS")]
         max_output_tokens: Option<u32>,
+        #[command(flatten)]
+        sampling: SamplingArgs,
+        /// Jinja chat template to render chats with instead of the GGUF's
+        /// own (llama-server / vLLM `--chat-template`).
+        #[arg(
+            long,
+            env = "JOSHUA_CHAT_TEMPLATE",
+            conflicts_with = "chat_template_file"
+        )]
+        chat_template: Option<String>,
+        /// Read the --chat-template from this file.
+        #[arg(long, env = "JOSHUA_CHAT_TEMPLATE_FILE")]
+        chat_template_file: Option<PathBuf>,
         /// Require this API key on /v1 routes (Authorization: Bearer <key>
         /// or x-api-key: <key>).  A comma-separated list accepts any key.
         #[arg(long, env = "JOSHUA_API_KEY")]
@@ -584,7 +669,7 @@ enum Commands {
         #[arg(long)]
         seed: Option<u64>,
         /// Reasoning effort for models whose chat template takes one or a
-        /// thinking switch: none, minimal, low, medium, high, xhigh.
+        /// thinking switch: none, minimal, low, medium, high, xhigh, max.
         #[arg(long, value_parser = parse_reasoning_effort)]
         reasoning_effort: Option<ReasoningEffort>,
         /// Turn thinking on or off on models with a switch (Qwen3, GLM-4.5,
@@ -919,6 +1004,9 @@ async fn main() -> anyhow::Result<()> {
             queue_timeout_ms,
             admission_queue_depth,
             max_output_tokens,
+            sampling,
+            chat_template,
+            chat_template_file,
             api_key,
             cors_origin,
             tls_cert,
@@ -990,7 +1078,14 @@ async fn main() -> anyhow::Result<()> {
                 .expert_placement(expert_placement)
                 .dense_placement(dense_placement)
                 .engram_tier(engram_tier)
-                .device_memory_budget(vram_budget.map(|mib| mib.saturating_mul(1024 * 1024)));
+                .device_memory_budget(vram_budget.map(|mib| mib.saturating_mul(1024 * 1024)))
+                .sampling(sampling.overrides())
+                .chat_template(match chat_template_file {
+                    Some(path) => Some(std::fs::read_to_string(&path).map_err(|e| {
+                        anyhow::anyhow!("--chat-template-file {}: {e}", path.display())
+                    })?),
+                    None => chat_template,
+                });
             // One backend serves the startup model and any loaded later.
             let npu = npu_plugin
                 .map(|plugin| npu_backend(&plugin, npu_in_process))
@@ -1464,7 +1559,7 @@ fn mmap_mode(explicit: bool) -> MmapMode {
 /// Parse a `--reasoning-effort` value with the API's spelling.
 fn parse_reasoning_effort(s: &str) -> Result<ReasoningEffort, String> {
     serde_json::from_value(serde_json::Value::String(s.to_ascii_lowercase())).map_err(|_| {
-        format!("unknown reasoning effort `{s}` (none, minimal, low, medium, high, xhigh)")
+        format!("unknown reasoning effort `{s}` (none, minimal, low, medium, high, xhigh, max)")
     })
 }
 

@@ -590,6 +590,313 @@ async fn anthropic_messages_supports_text_and_streaming() {
     assert!(body.contains("event: message_stop"), "{body}");
 }
 
+// ─── Engine-core API semantics (#254) ────────────────────────────────────────
+
+/// A reasoning model: the tiny llama with `<think>`/`</think>` tokens and a
+/// template that opens the block in its generation prompt.
+fn think_state(dir_name: &str) -> Arc<ServerState> {
+    let dir = common::think_model_dir(dir_name);
+    let engine = Engine::with_n_ctx(&dir, 64)
+        .expect("engine should load tiny model")
+        .with_chat_template(common::THINK_TEMPLATE);
+    Arc::new(ServerState::new(Arc::new(engine)))
+}
+
+/// Greedy, fixed-length chat in which only the budget can close the
+/// reasoning block (the model may not write the tags itself).
+fn think_body(extra: serde_json::Value) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "model": "model",
+        "messages": [{"role": "user", "content": "a b"}],
+        "max_tokens": 5,
+        "temperature": 0.0,
+        "ignore_eos": true,
+        "logit_bias": {"14": false, "15": false},
+        "thinking_token_budget": 2,
+    });
+    body.as_object_mut()
+        .unwrap()
+        .extend(extra.as_object().unwrap().clone());
+    body
+}
+
+/// The `data:` payloads of an SSE body, without `[DONE]`.
+fn sse_chunks(body: &str) -> Vec<serde_json::Value> {
+    body.lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter(|data| *data != "[DONE]")
+        .map(|data| serde_json::from_str(data).unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn chat_splits_reasoning_and_reports_usage_details() {
+    let app = create_router(think_state("server-think"));
+    let (status, body) = chat(app.clone(), think_body(serde_json::json!({}))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let response: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let message = &response["choices"][0]["message"];
+    let reasoning = message["reasoning_content"].as_str().unwrap().to_string();
+    let content = message["content"].as_str().unwrap().to_string();
+    assert!(!reasoning.is_empty() && !content.is_empty(), "{body}");
+    assert_eq!(message["reasoning"], message["reasoning_content"]);
+    assert!(!content.contains("</think>"));
+    assert_eq!(response["choices"][0]["finish_reason"], "length");
+    let usage = &response["usage"];
+    assert_eq!(usage["completion_tokens"], 5);
+    assert_eq!(usage["completion_tokens_details"]["reasoning_tokens"], 2);
+    assert!(usage["prompt_tokens_details"]["cached_tokens"].is_u64());
+    assert_eq!(response["timings"]["predicted_n"], 5);
+    assert_eq!(
+        response["timings"]["prompt_n"].as_u64().unwrap()
+            + response["timings"]["cache_n"].as_u64().unwrap(),
+        usage["prompt_tokens"].as_u64().unwrap()
+    );
+
+    // Streaming carries the same split in deltas, then usage and timings.
+    let (status, body) = chat(app.clone(), think_body(serde_json::json!({"stream": true}))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let chunks = sse_chunks(&body);
+    let (mut streamed_reasoning, mut streamed_content) = (String::new(), String::new());
+    for chunk in &chunks {
+        let delta = &chunk["choices"][0]["delta"];
+        if let Some(r) = delta["reasoning_content"].as_str() {
+            assert_eq!(delta["reasoning"].as_str(), Some(r));
+            streamed_reasoning.push_str(r);
+        }
+        if let Some(c) = delta["content"].as_str() {
+            streamed_content.push_str(c);
+        }
+    }
+    assert_eq!(streamed_reasoning, reasoning);
+    assert_eq!(streamed_content, content);
+    let last = chunks.last().unwrap();
+    assert_eq!(last["choices"][0]["finish_reason"], "length");
+    assert_eq!(
+        last["usage"]["completion_tokens_details"]["reasoning_tokens"],
+        2
+    );
+    assert_eq!(last["timings"]["predicted_n"], 5);
+
+    // vLLM's include_reasoning=false drops it; llama.cpp's
+    // reasoning_format=none leaves it inline.
+    let (_, body) = chat(
+        app.clone(),
+        think_body(serde_json::json!({"include_reasoning": false})),
+    )
+    .await;
+    let response: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(response["choices"][0]["message"]
+        .get("reasoning_content")
+        .is_none());
+    assert_eq!(
+        response["choices"][0]["message"]["content"],
+        content.as_str()
+    );
+    let (_, body) = chat(
+        app,
+        think_body(serde_json::json!({"reasoning_format": "none"})),
+    )
+    .await;
+    let response: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        response["choices"][0]["message"]["content"],
+        format!("{reasoning}</think>{content}")
+    );
+}
+
+#[tokio::test]
+async fn anthropic_messages_return_thinking_blocks() {
+    let state = think_state("server-think-anthropic");
+    let engine = state.models.list()[0].engine.clone();
+    let app = create_router(state);
+    let request = serde_json::json!({
+        "model": "model",
+        "max_tokens": 5,
+        "temperature": 0.0,
+        "thinking": {"type": "enabled", "budget_tokens": 2},
+        "messages": [{"role": "user", "content": "a b"}],
+    });
+    // What the engine itself produces for this request.
+    let (messages, _, options) = joshua::anthropic::to_chat_request(
+        &serde_json::from_value(request.clone()).unwrap(),
+        &engine.sampling_defaults(joshua::SamplingProfile::OpenAi),
+    )
+    .unwrap();
+    let expected = engine
+        .complete_chat_detailed(&messages, None, &options)
+        .unwrap();
+    let (reasoning, content) = joshua::reasoning::split(
+        engine.reasoning_format(),
+        expected.reasoning_open,
+        &expected.text,
+    );
+    assert!(
+        expected.reasoning_open,
+        "the template opened the reasoning block"
+    );
+
+    let res = app
+        .clone()
+        .oneshot(post_json("/v1/messages", None, request.clone()))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let response: serde_json::Value = serde_json::from_str(&body_text(res).await).unwrap();
+    let mut blocks = response["content"].as_array().unwrap().iter();
+    if let Some(reasoning) = &reasoning {
+        let block = blocks.next().unwrap();
+        assert_eq!(block["type"], "thinking");
+        assert_eq!(block["thinking"], reasoning.as_str());
+        assert_eq!(block["signature"], "");
+    }
+    if !content.is_empty() {
+        let block = blocks.next().unwrap();
+        assert_eq!(block["type"], "text");
+        assert_eq!(block["text"], content.as_str());
+    }
+    assert!(response["usage"]["cache_read_input_tokens"].is_u64());
+    let reasoning = reasoning.unwrap_or_default();
+
+    let mut streaming = request;
+    streaming["stream"] = serde_json::json!(true);
+    let res = app
+        .oneshot(post_json("/v1/messages", None, streaming))
+        .await
+        .unwrap();
+    let body = body_text(res).await;
+    let (mut thinking, mut text, mut signed) = (String::new(), String::new(), false);
+    for event in sse_chunks(&body) {
+        if event["type"] == "content_block_delta" {
+            let delta = &event["delta"];
+            match delta["type"].as_str().unwrap() {
+                "thinking_delta" => thinking.push_str(delta["thinking"].as_str().unwrap()),
+                "text_delta" => text.push_str(delta["text"].as_str().unwrap()),
+                "signature_delta" => signed = true,
+                _ => {}
+            }
+        }
+        if event["type"] == "message_delta" {
+            assert!(
+                event["usage"]["cache_read_input_tokens"].is_u64(),
+                "{event}"
+            );
+        }
+    }
+    assert_eq!(thinking, reasoning);
+    assert_eq!(text, content);
+    assert_eq!(
+        signed,
+        !reasoning.is_empty(),
+        "a thinking block closes with a signature_delta"
+    );
+}
+
+#[tokio::test]
+async fn chat_lengths_follow_llama_cpp_and_vllm_conventions() {
+    let app = create_router(tiny_state("server-lengths", None));
+    let base = |extra: serde_json::Value| {
+        let mut body = serde_json::json!({
+            "model": "model",
+            "messages": [{"role": "user", "content": "a b"}],
+            "temperature": 0.0,
+            "ignore_eos": true,
+        });
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        body
+    };
+    // No cap (or -1): the rest of the 64-token context, reported `length`.
+    for extra in [serde_json::json!({}), serde_json::json!({"max_tokens": -1})] {
+        let (status, body) = chat(app.clone(), base(extra)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let response: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let usage = &response["usage"];
+        assert_eq!(usage["total_tokens"], 64, "{body}");
+        assert_eq!(response["choices"][0]["finish_reason"], "length");
+    }
+    // llama.cpp's n_predict wins over max_tokens.
+    let (_, body) = chat(
+        app.clone(),
+        base(serde_json::json!({"max_tokens": 9, "n_predict": 3})),
+    )
+    .await;
+    let response: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(response["usage"]["completion_tokens"], 3);
+    // A stop token ends generation with `stop`.
+    let (_, body) = chat(
+        app.clone(),
+        base(serde_json::json!({"logit_bias": {"5": 100}, "stop_token_ids": [5]})),
+    )
+    .await;
+    let response: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(response["choices"][0]["finish_reason"], "stop", "{body}");
+    assert_eq!(response["usage"]["completion_tokens"], 0);
+    // Out-of-range values are client errors.
+    for extra in [
+        serde_json::json!({"max_tokens": -2}),
+        serde_json::json!({"mirostat": 5}),
+        serde_json::json!({"continue_final_message": true, "add_generation_prompt": true}),
+        serde_json::json!({"reasoning_format": "bogus"}),
+        serde_json::json!({"chat_template": "{% for m in messages %}"}),
+    ] {
+        let (status, body) = chat(app.clone(), base(extra.clone())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{extra}: {body}");
+    }
+    // The developer role and the llama.cpp sampler fields are accepted.
+    let (status, body) = chat(
+        app,
+        serde_json::json!({
+            "model": "model",
+            "messages": [
+                {"role": "developer", "content": "a"},
+                {"role": "user", "content": "b"},
+                {"role": "assistant", "content": "c"}
+            ],
+            "max_tokens": 2,
+            "repeat_penalty": 1.1,
+            "repeat_last_n": 32,
+            "typical_p": 0.9,
+            "top_n_sigma": 2.0,
+            "xtc_probability": 0.1,
+            "dry_multiplier": 0.5,
+            "mirostat": 2,
+            "seed": 1,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
+async fn chat_reports_cached_prompt_tokens_on_a_follow_up() {
+    let app = create_router(tiny_state("server-cached", None));
+    // Without a generation prompt the second conversation's prompt extends
+    // the first one's, the warm pool's reuse case.
+    let request = |content: &str, max_tokens: u32| {
+        serde_json::json!({
+            "model": "model",
+            "messages": [{"role": "user", "content": content}],
+            "add_generation_prompt": false,
+            "max_tokens": max_tokens,
+        })
+    };
+    let (status, body) = chat(app.clone(), request("a b", 0)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let first: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(first["usage"]["prompt_tokens_details"]["cached_tokens"], 0);
+    let (_, body) = chat(app, request("a b c", 1)).await;
+    let second: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(
+        second["usage"]["prompt_tokens_details"]["cached_tokens"]
+            .as_u64()
+            .unwrap()
+            > 0,
+        "{body}"
+    );
+}
+
 // ─── TLS (only with `cargo test --features tls`) ─────────────────────────────
 
 #[cfg(feature = "tls")]

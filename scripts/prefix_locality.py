@@ -130,7 +130,12 @@ def stream_request(address, body, timeout):
     finally:
         connection.close()
     result["latency_ms"] = (time.perf_counter() - started) * 1000
-    result["output_sha256"] = digest(["".join(text), "".join(reasoning), finish, result["usage"]])
+    # The cached-token count differs between a warm and a cold run by
+    # design; the output is everything else.
+    usage = result["usage"]
+    if isinstance(usage, dict):
+        usage = {k: v for k, v in usage.items() if k != "prompt_tokens_details"}
+    result["output_sha256"] = digest(["".join(text), "".join(reasoning), finish, usage])
     return result
 
 

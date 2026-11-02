@@ -409,6 +409,12 @@ pub const JSON_TOKENIZER_JSON: &str = r#"{
 /// grouped-query attention plus QKV biases, qwen3 uses GQA, a head_dim
 /// decoupled from the embedding width, Q/K norms, and last-token pooling.
 pub fn write_tiny_gguf(path: &Path, arch: &str) {
+    write_tiny_gguf_with(path, arch, &[]);
+}
+
+/// [`write_tiny_gguf`] with extra metadata; an entry replaces a same-named
+/// default (e.g. `tokenizer.chat_template`).
+pub fn write_tiny_gguf_with(path: &Path, arch: &str, extra: &[(String, gguf_file::Value)]) {
     const VOCAB: usize = 16;
     const EMB: usize = 8;
     const FFN: usize = 16;
@@ -595,6 +601,10 @@ pub fn write_tiny_gguf(path: &Path, arch: &str) {
             "blk.0.attn_k_norm.weight".to_string(),
             qtensor(weights(head_dim, 13), &[head_dim]),
         ));
+    }
+    for (key, value) in extra {
+        metadata.retain(|(k, _)| k != key);
+        metadata.push((key.clone(), value.clone()));
     }
 
     let metadata_refs: Vec<(&str, &gguf_file::Value)> =
@@ -3185,6 +3195,48 @@ pub fn write_tiny_bonsai_gguf(path: &Path, weights_as: BonsaiWeights) {
     }
     tensors.push(norm("output_norm.weight".into(), EMB, 501));
     write_raw_gguf(path, &metadata, &tensors);
+}
+
+/// [`TOKENIZER_JSON`] with ids 14 and 15 as Qwen3-style `<think>` /
+/// `</think>` added tokens (not `special`, like Qwen3's).
+pub const THINK_TOKENIZER_JSON: &str = r#"{
+    "version": "1.0",
+    "truncation": null,
+    "padding": null,
+    "added_tokens": [
+        {"id": 3, "content": "</s>", "single_word": false, "lstrip": false,
+         "rstrip": false, "normalized": false, "special": true},
+        {"id": 14, "content": "<think>", "single_word": false, "lstrip": false,
+         "rstrip": false, "normalized": false, "special": false},
+        {"id": 15, "content": "</think>", "single_word": false, "lstrip": false,
+         "rstrip": false, "normalized": false, "special": false}
+    ],
+    "normalizer": null,
+    "pre_tokenizer": {"type": "Whitespace"},
+    "post_processor": null,
+    "decoder": null,
+    "model": {
+        "type": "WordLevel",
+        "vocab": {"<unk>": 0, "hello": 1, "world": 2, "</s>": 3,
+                  "a": 4, "b": 5, "c": 6, "d": 7, "e": 8, "f": 9,
+                  "g": 10, "h": 11, "i": 12, "j": 13, "<think>": 14, "</think>": 15},
+        "unk_token": "<unk>"
+    }
+}"#;
+
+/// A chat template that opens the reasoning block in its generation
+/// prompt, as DeepSeek-R1's does.
+pub const THINK_TEMPLATE: &str = "{% for message in messages %}hello {{ message.content }} \
+     {% endfor %}{% if add_generation_prompt %}world <think>{% endif %}";
+
+/// A model directory holding the tiny llama GGUF with
+/// [`THINK_TOKENIZER_JSON`]; load it with [`THINK_TEMPLATE`] for a
+/// reasoning model.
+pub fn think_model_dir(name: &str) -> PathBuf {
+    let dir = model_dir(name);
+    std::fs::write(dir.join("tokenizer.json"), THINK_TOKENIZER_JSON).unwrap();
+    write_tiny_llama_gguf(&dir.join("model.gguf"));
+    dir
 }
 
 /// Create a fresh model directory under the target tmp area.

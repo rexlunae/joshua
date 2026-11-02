@@ -1171,18 +1171,21 @@ fn test_generation_options_default() {
 
 #[test]
 fn test_chat_completion_request_to_generation_options() {
-    use joshua::types::ChatCompletionRequest;
+    use joshua::types::{ChatCompletionRequest, SamplingParams};
 
     let req = ChatCompletionRequest {
         model: "test".to_string(),
         messages: vec![],
-        max_tokens: Some(512),
-        temperature: Some(0.5),
-        top_p: Some(0.8),
-        top_k: None,
-        min_p: None,
-        repetition_penalty: None,
-        stop: Some(serde_json::json!(["<end>", "<stop>"])),
+        sampling: SamplingParams {
+            max_tokens: Some(512),
+            temperature: Some(0.5),
+            top_p: Some(0.8),
+            top_k: None,
+            min_p: None,
+            repetition_penalty: None,
+            stop: Some(serde_json::json!(["<end>", "<stop>"])),
+            ..Default::default()
+        },
         stream: None,
         tools: None,
         ..Default::default()

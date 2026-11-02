@@ -109,6 +109,7 @@ use llguidance::Matcher;
 use memmap2::Mmap;
 use rand::rngs::StdRng;
 use rand::{thread_rng, Rng, SeedableRng};
+use serde::{Deserialize, Serialize};
 use tokenizers::Tokenizer;
 
 use crate::embedding::EmbeddingModel;
@@ -123,7 +124,9 @@ pub use crate::placement::{DensePlacement, EngramTier, ExpertPlacement, SsdExper
 use crate::template::ChatTemplate;
 
 use crate::error::{JoshuaError, Result};
-use crate::types::{ChatMessage, GenerationOptions, Tool, UsageInfo};
+use crate::types::{
+    ChatMessage, GenerationOptions, PromptTokensDetails, Timings, TokenRef, Tool, UsageInfo,
+};
 
 pub mod external_draft;
 
@@ -569,9 +572,28 @@ pub struct EngineOptions {
     /// [`crate::draft_model::DEFAULT_DRAFT_MODEL_MAX`]).  The live length
     /// adapts between 1 and this bound from the acceptance observed.
     pub draft_max: usize,
+    /// The server's sampling flags (see [`Engine::with_sampling_overrides`]).
+    pub sampling: crate::sampling::SamplingOverrides,
+    /// A chat template replacing the GGUF's (see
+    /// [`Engine::with_chat_template`]).
+    pub chat_template: Option<String>,
 }
 
 impl EngineOptions {
+    /// Set the server's sampling flags.  See
+    /// [`Engine::with_sampling_overrides`].
+    pub fn sampling(mut self, overrides: crate::sampling::SamplingOverrides) -> Self {
+        self.sampling = overrides;
+        self
+    }
+
+    /// Render chats with this Jinja template instead of the GGUF's.  See
+    /// [`Engine::with_chat_template`].
+    pub fn chat_template(mut self, source: Option<String>) -> Self {
+        self.chat_template = source;
+        self
+    }
+
     /// Default options with an explicit context-window size.
     pub fn with_n_ctx(n_ctx: u32) -> Self {
         Self {
@@ -856,6 +878,25 @@ pub struct Engine {
     /// tool message cannot inject a turn boundary (see
     /// [`crate::template::sanitize_messages`]).
     special_tokens: Vec<String>,
+    /// BOS and EOS token strings a chat template interpolates.
+    template_tokens: (String, String),
+    /// How the model marks its reasoning, from its chat template and vocab.
+    reasoning_format: crate::reasoning::ReasoningFormat,
+    /// The reasoning start and end tags as token ids, when
+    /// `reasoning_format` has tags that tokenize cleanly.
+    reasoning_tags: Option<(Vec<u32>, Vec<u32>)>,
+    /// The model's recommended sampling (`general.sampling.*` metadata).
+    gguf_sampling: crate::sampling::SamplingOverrides,
+    /// The server's sampling flags, which win over the GGUF's values.
+    cli_sampling: crate::sampling::SamplingOverrides,
+    /// Fill-in-the-middle token ids.
+    fim: crate::fim::FimTokens,
+    /// Every token's decoded text, built on the first DRY request.
+    vocab_pieces: std::sync::OnceLock<Vec<String>>,
+    /// The tokenizer with added special tokens treated as plain text, built
+    /// on first use (FIM text, which llama-server tokenizes without
+    /// special-token parsing).
+    plain_tokenizer: std::sync::OnceLock<Tokenizer>,
     /// Lazily built embedding model (stateless, shared by all embed calls).
     embed_model: Mutex<Option<Arc<EmbeddingModel>>>,
     /// Pool of loaded model instances with warm KV caches.
@@ -1513,30 +1554,128 @@ struct DecodeOutcome {
     /// Tokens actually fed to the model during decode (KV-state delta).
     fed_tokens: Vec<u32>,
     decode_tps: f64,
+    /// Wall time of the decode loop.
+    decode_ms: f64,
     /// The configured stop sequence that ended generation, if any.
     stop_sequence: Option<String>,
+    stop_type: StopType,
+    stop_token: Option<u32>,
+    /// Every generated token, in order.
+    token_ids: Vec<u32>,
+    reasoning_tokens: Option<u32>,
 }
 
-/// A completed generation, including which stop sequence ended it.
+/// Why a generation ended — llama-server's `stop_type`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StopType {
+    /// An end-of-sequence token, or one of the request's stop token ids.
+    Eos,
+    /// One of the request's stop strings.
+    Word,
+    /// A length cap: the request's `max_tokens`, the server's
+    /// `--max-output-tokens`, or the end of the context window.
+    Limit,
+    /// The caller cancelled the generation.
+    Cancelled,
+}
+
+impl StopType {
+    /// The OpenAI `finish_reason`: `stop` for an end of sequence or a stop
+    /// string, `length` for any cap (llama-server reports a generation that
+    /// ended without either as `length` too).
+    pub fn finish_reason(self) -> &'static str {
+        match self {
+            Self::Eos | Self::Word => "stop",
+            Self::Limit | Self::Cancelled => "length",
+        }
+    }
+
+    /// llama-server's `stop_type` string.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Eos => "eos",
+            Self::Word => "word",
+            Self::Limit => "limit",
+            Self::Cancelled => "none",
+        }
+    }
+}
+
+/// A completed generation, including why and where it stopped.
 ///
 /// The tuple-returning completion helpers on [`Engine`] are thin wrappers
 /// around this type; callers that need to report Anthropic's
-/// `stop_reason`/`stop_sequence` fields use the `*_detailed` methods.
+/// `stop_reason`/`stop_sequence` fields, cached prompt tokens or timings use
+/// the `*_detailed` methods and the raw-prompt API.
 #[derive(Debug, Clone)]
 pub struct Completion {
-    /// Generated text, with any matched stop sequence removed.
+    /// Generated text, with any matched stop sequence removed (unless the
+    /// request kept it, `include_stop_str_in_output`).
     pub text: String,
-    /// Token accounting for the request.
+    /// Token accounting for the request.  `prompt_tokens_details` carries
+    /// the cached prompt tokens.
     pub usage: UsageInfo,
     /// Prefill throughput in tokens per second.
     pub prefill_tps: f64,
     /// Decode throughput in tokens per second.
     pub decode_tps: f64,
-    /// The configured stop sequence that ended generation, if any.
+    /// The configured stop sequence that ended generation, if any
+    /// (llama-server's `stopping_word`).
     pub stop_sequence: Option<String>,
+    /// Why generation ended.
+    pub stop_type: StopType,
+    /// The request stop token id that ended generation (vLLM's
+    /// `stop_reason`), if one did; `None` for the model's own EOS.
+    pub stop_token: Option<u32>,
+    /// Prompt tokens whose state was reused from an earlier request
+    /// (llama-server's `tokens_cached`).
+    pub cached_tokens: u32,
+    /// llama-server-style prompt and generation timings.
+    pub timings: Timings,
+    /// The generated token ids (vLLM's `return_token_ids`).
+    pub token_ids: Vec<u32>,
+    /// Whether the prompt opened a reasoning block, so the output starts
+    /// inside it (see [`crate::reasoning::ReasoningFormat::prompt_opens_reasoning`]).
+    pub reasoning_open: bool,
+    /// Generated tokens inside the model's reasoning, for models whose
+    /// reasoning is tagged.
+    pub reasoning_tokens: Option<u32>,
 }
 
 impl Completion {
+    /// A completion holding `text`, for tests of response formatting.
+    #[cfg(test)]
+    pub(crate) fn for_tests(text: &str, stop_type: StopType) -> Self {
+        Self {
+            text: text.to_string(),
+            ..Self::empty(stop_type)
+        }
+    }
+
+    /// A generation that produced nothing.
+    fn empty(stop_type: StopType) -> Self {
+        Self {
+            text: String::new(),
+            usage: UsageInfo::default(),
+            prefill_tps: 0.0,
+            decode_tps: 0.0,
+            stop_sequence: None,
+            stop_type,
+            stop_token: None,
+            cached_tokens: 0,
+            timings: Timings::default(),
+            token_ids: Vec::new(),
+            reasoning_open: false,
+            reasoning_tokens: None,
+        }
+    }
+
+    /// The OpenAI `finish_reason` (see [`StopType::finish_reason`]).
+    pub fn finish_reason(&self) -> &'static str {
+        self.stop_type.finish_reason()
+    }
+
     /// Split into the historical `(text, usage, prefill_tps, decode_tps)`
     /// tuple shape.
     fn into_tuple(self) -> (String, UsageInfo, f64, f64) {
@@ -1549,8 +1688,92 @@ impl Completion {
     }
 }
 
-/// Repetition-penalty window: the last this-many tokens are penalised.
+/// One piece of a [`RawPrompt`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PromptPart {
+    /// Text, tokenized as it is (no chat template).
+    Text(String),
+    /// Token ids, used verbatim.
+    Tokens(Vec<u32>),
+}
+
+/// A prompt for raw completion — no chat template — as text, token ids or
+/// a mix of both (llama-server's `prompt` forms, vLLM's `prompt` and
+/// `prompt_token_ids`).  See [`Engine::tokenize_prompt`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawPrompt {
+    /// The pieces, in order.
+    pub parts: Vec<PromptPart>,
+    /// Let the tokenizer add its special tokens (BOS) to a leading text
+    /// part, as vLLM's `add_special_tokens` and llama-server do by default.
+    pub add_special_tokens: bool,
+}
+
+impl RawPrompt {
+    /// A text prompt, with the tokenizer's special tokens.
+    pub fn text(text: impl Into<String>) -> Self {
+        Self {
+            parts: vec![PromptPart::Text(text.into())],
+            add_special_tokens: true,
+        }
+    }
+
+    /// A token-id prompt, used exactly as given.
+    pub fn tokens(ids: impl Into<Vec<u32>>) -> Self {
+        Self {
+            parts: vec![PromptPart::Tokens(ids.into())],
+            add_special_tokens: false,
+        }
+    }
+
+    /// Text and token pieces in order; a leading text piece gets the
+    /// tokenizer's special tokens.
+    pub fn mixed(parts: Vec<PromptPart>) -> Self {
+        Self {
+            parts,
+            add_special_tokens: true,
+        }
+    }
+
+    /// Set [`RawPrompt::add_special_tokens`].
+    pub fn with_special_tokens(mut self, add: bool) -> Self {
+        self.add_special_tokens = add;
+        self
+    }
+}
+
+/// A chat rendered to its prompt text.
+struct RenderedChat {
+    text: String,
+    /// Whether the tokenizer should still add special tokens (only the
+    /// ChatML fallback needs them).
+    add_special_tokens: bool,
+}
+
+/// What [`Engine::complete_with`] generates from.
+enum PromptSource<'a> {
+    /// Prompt text to tokenize; `root_chars` marks the end of the shared
+    /// chat head for the prefix cache (see [`Engine::prompt_root_chars`]).
+    Text {
+        text: &'a str,
+        add_special_tokens: bool,
+        root_chars: Option<usize>,
+    },
+    /// An already tokenized prompt.
+    Tokens(Vec<u32>),
+}
+
+/// Default repetition-penalty window: the last this-many tokens are
+/// penalised (see [`GenerationOptions::repeat_last_n`]).
 const REP_WINDOW: usize = 64;
+
+/// The penalty window for `repeat_last_n` (-1 = the context window).
+fn penalty_window(repeat_last_n: i32, n_ctx: usize) -> usize {
+    match repeat_last_n {
+        n if n < 0 => n_ctx,
+        n => n as usize,
+    }
+}
 
 /// A request's use of the separate draft model (see
 /// [`crate::draft_model`]): the session, the decode context it drafts from,
@@ -1562,15 +1785,18 @@ struct DraftModelState {
     sampler: SamplingWorkspace,
     /// The penalty window extended with the tokens drafted so far.
     window: Vec<u32>,
+    /// The penalty window's length.
+    window_len: usize,
 }
 
 impl DraftModelState {
-    fn new(session: crate::draft_model::DraftSession, context: &[u32]) -> Self {
+    fn new(session: crate::draft_model::DraftSession, context: &[u32], window_len: usize) -> Self {
         Self {
             session,
             context: context.to_vec(),
             sampler: SamplingWorkspace::default(),
-            window: Vec::with_capacity(REP_WINDOW),
+            window: Vec::with_capacity(window_len.min(REP_WINDOW)),
+            window_len,
         }
     }
 }
@@ -1588,7 +1814,8 @@ type TextDecodeStream<'a> = tokenizers::tokenizer::DecodeStream<
 /// Output text and repetition history for one decode loop.
 struct DecodeText<'a> {
     response: String,
-    /// Generated ids, for byte-level whole-buffer fallback decoding.
+    /// Generated ids: the completion's token ids, and the whole buffer for
+    /// byte-level fallback decoding.
     decoded_ids: Vec<u32>,
     /// Incremental byte-level decode state (see [`ByteWindowDecoder`]).
     byte_window: ByteWindowDecoder,
@@ -1596,20 +1823,88 @@ struct DecodeText<'a> {
     stream: TextDecodeStream<'a>,
     /// Sliding repetition-penalty window.
     recent_tokens: Vec<u32>,
+    /// The window's length (0 turns the penalties off).
+    window: usize,
     n_decoded: u32,
 }
 
 impl<'a> DecodeText<'a> {
-    /// Fresh state whose penalty window is seeded with the tail of `seed`.
-    fn new(seed: &[u32], tokenizer: &'a tokenizers::Tokenizer) -> Self {
+    /// Fresh state whose penalty window of `window` tokens is seeded with
+    /// the tail of `seed`.
+    fn new(seed: &[u32], tokenizer: &'a tokenizers::Tokenizer, window: usize) -> Self {
         Self {
             response: String::new(),
             decoded_ids: Vec::new(),
             byte_window: ByteWindowDecoder::default(),
             stream: tokenizer.decode_stream(false),
-            recent_tokens: seed[seed.len().saturating_sub(REP_WINDOW)..].to_vec(),
+            recent_tokens: seed[seed.len().saturating_sub(window)..].to_vec(),
+            window,
             n_decoded: 0,
         }
+    }
+}
+
+/// Follows a tagged reasoning block (`<think>…</think>`) through the
+/// generated token ids: counts the tokens inside it and, with a budget,
+/// hands out the end tag to force once the budget is spent (vLLM's
+/// `thinking_token_budget`, llama.cpp's reasoning budget).
+struct ReasoningTracker<'a> {
+    start: &'a [u32],
+    end: &'a [u32],
+    /// Inside the block now.
+    inside: bool,
+    /// The block has closed; nothing more to track.
+    closed: bool,
+    /// Tokens generated inside the block.
+    count: u32,
+    budget: Option<u32>,
+    /// What to force when the budget runs out (an optional message, then
+    /// the end tag); taken once.
+    forced: Option<Vec<u32>>,
+}
+
+impl<'a> ReasoningTracker<'a> {
+    fn new(
+        start: &'a [u32],
+        end: &'a [u32],
+        open: bool,
+        budget: Option<u32>,
+        forced: Option<Vec<u32>>,
+    ) -> Self {
+        Self {
+            start,
+            end,
+            inside: open,
+            closed: false,
+            count: 0,
+            budget,
+            forced,
+        }
+    }
+
+    /// Record the newest token (the last of `generated`).
+    fn observe(&mut self, generated: &[u32]) {
+        if self.closed {
+            return;
+        }
+        if self.inside {
+            if generated.ends_with(self.end) {
+                self.inside = false;
+                self.closed = true;
+            } else {
+                self.count += 1;
+            }
+        } else if generated.ends_with(self.start) {
+            self.inside = true;
+        }
+    }
+
+    /// The tokens to force now, once: the budget is spent inside the block.
+    fn take_forced(&mut self) -> Option<Vec<u32>> {
+        if self.inside && self.budget.is_some_and(|b| self.count >= b) {
+            return self.forced.take();
+        }
+        None
     }
 }
 
@@ -2016,6 +2311,19 @@ impl Engine {
         let eos_token_ids = extract_eos_ids(&gguf, &tokenizer);
         let special_tokens = crate::template::special_token_strings(&tokenizer);
         let chat_template = extract_chat_template(&gguf, &tokenizer);
+        let template_tokens = (
+            token_str_from_metadata(&gguf, "tokenizer.ggml.bos_token_id", &tokenizer)
+                .unwrap_or_default(),
+            token_str_from_metadata(&gguf, "tokenizer.ggml.eos_token_id", &tokenizer)
+                .unwrap_or_default(),
+        );
+        let (reasoning_format, reasoning_tags) =
+            detect_reasoning(chat_template.as_ref().map(ChatTemplate::source), &tokenizer);
+        let gguf_sampling = crate::sampling::SamplingOverrides::from_gguf(&gguf.metadata);
+        if !gguf_sampling.is_empty() {
+            tracing::info!("GGUF recommends sampling settings: {gguf_sampling:?}");
+        }
+        let fim = crate::fim::FimTokens::from_gguf(&gguf.metadata, &|t| tokenizer.token_to_id(t));
         let target_vocab = crate::draft_model::gguf_tokens(&gguf.metadata);
         let device = Self::resolve_device(options.backend)?;
         #[cfg(feature = "sycl")]
@@ -2568,7 +2876,9 @@ impl Engine {
             n => n,
         };
 
-        Ok(Self {
+        let cli_sampling = options.sampling.clone();
+        let template_override = options.chat_template.clone();
+        let engine = Self {
             model_path: gguf_path,
             mmap: Arc::new(mmap),
             model_file,
@@ -2579,6 +2889,14 @@ impl Engine {
             eos_token_ids,
             chat_template,
             special_tokens,
+            template_tokens,
+            reasoning_format,
+            reasoning_tags,
+            gguf_sampling,
+            cli_sampling,
+            fim,
+            vocab_pieces: std::sync::OnceLock::new(),
+            plain_tokenizer: std::sync::OnceLock::new(),
             embed_model: Mutex::new(None),
             model_cache: Mutex::new(Vec::new()),
             cache_epoch: uuid::Uuid::new_v4().to_string(),
@@ -2627,6 +2945,10 @@ impl Engine {
             spec_verify_steps: AtomicU64::new(0),
             arch,
             arch_error,
+        };
+        Ok(match template_override {
+            Some(source) => engine.with_chat_template(source),
+            None => engine,
         })
     }
 
@@ -2665,6 +2987,59 @@ impl Engine {
     pub fn with_max_output_tokens(mut self, max: u32) -> Self {
         self.max_output_tokens = max.max(1);
         self
+    }
+
+    /// Set the server's sampling flags (`--temp`, `--top-k`, …): they win
+    /// over the GGUF's `general.sampling.*` values and every API's own
+    /// defaults (see [`Engine::sampling_defaults`]); a request's explicit
+    /// values still win over them.
+    pub fn with_sampling_overrides(
+        mut self,
+        overrides: crate::sampling::SamplingOverrides,
+    ) -> Self {
+        self.cli_sampling = overrides;
+        self
+    }
+
+    /// Render chats with this Jinja template instead of the GGUF's own (the
+    /// server's `--chat-template`).
+    pub fn with_chat_template(mut self, source: impl Into<String>) -> Self {
+        let (bos, eos) = self.template_tokens.clone();
+        let template =
+            ChatTemplate::new(source, bos, eos).with_special_tokens(self.special_tokens.clone());
+        let (format, tags) = detect_reasoning(Some(template.source()), &self.tokenizer);
+        self.chat_template = Some(template);
+        self.reasoning_format = format;
+        self.reasoning_tags = tags;
+        self
+    }
+
+    /// The sampler settings a request through `profile`'s API falls back
+    /// to: the server's flags, then the GGUF's `general.sampling.*` values,
+    /// then the API's upstream defaults.
+    pub fn sampling_defaults(
+        &self,
+        profile: crate::sampling::SamplingProfile,
+    ) -> crate::sampling::SamplingDefaults {
+        let mut defaults = profile.defaults();
+        self.gguf_sampling.apply(&mut defaults);
+        self.cli_sampling.apply(&mut defaults);
+        defaults
+    }
+
+    /// The model's `general.sampling.*` recommendations.
+    pub fn gguf_sampling(&self) -> &crate::sampling::SamplingOverrides {
+        &self.gguf_sampling
+    }
+
+    /// How the model marks its reasoning (see [`crate::reasoning`]).
+    pub fn reasoning_format(&self) -> &crate::reasoning::ReasoningFormat {
+        &self.reasoning_format
+    }
+
+    /// The model's fill-in-the-middle token ids.
+    pub fn fim_tokens(&self) -> &crate::fim::FimTokens {
+        &self.fim
     }
 
     /// Baseline availability order for [`ComputeBackend::Auto`].
@@ -3052,10 +3427,124 @@ impl Engine {
             None
         };
         let messages = moved.as_deref().unwrap_or(messages);
-        let (prompt, add_special_tokens) =
-            self.format_prompt(messages, tools, &options.chat_template_kwargs);
-        self.tokenize(&prompt, add_special_tokens)
+        let rendered = self.render_chat(messages, tools, options)?;
+        self.tokenize(&rendered.text, rendered.add_special_tokens)
             .map(|tokens| tokens.len() as u32)
+    }
+
+    /// Tokenize a raw prompt: text parts are encoded without a chat
+    /// template, token parts are taken as they are (llama-server's
+    /// `tokenize_mixed`).  Only the first part, when it is text, gets the
+    /// tokenizer's special tokens, and only if
+    /// [`RawPrompt::add_special_tokens`] is set.  Token ids outside the
+    /// vocabulary are rejected.
+    pub fn tokenize_prompt(&self, prompt: &RawPrompt) -> Result<Vec<u32>> {
+        let has_ids = prompt
+            .parts
+            .iter()
+            .any(|p| matches!(p, PromptPart::Tokens(_)));
+        let vocab = if has_ids { self.vocab_size() } else { 0 };
+        let mut tokens = Vec::new();
+        for (i, part) in prompt.parts.iter().enumerate() {
+            match part {
+                PromptPart::Text(text) => {
+                    let special = i == 0 && prompt.add_special_tokens;
+                    tokens.extend(self.tokenize(text, special)?);
+                }
+                PromptPart::Tokens(ids) => {
+                    if let Some(bad) = ids.iter().find(|&&id| id as usize >= vocab) {
+                        return Err(JoshuaError::InvalidRequest(format!(
+                            "prompt token {bad} is outside the vocabulary of {vocab} tokens"
+                        )));
+                    }
+                    tokens.extend_from_slice(ids);
+                }
+            }
+        }
+        Ok(tokens)
+    }
+
+    /// Build a fill-in-the-middle prompt the way llama-server's `/infill`
+    /// does (see [`crate::fim::format_infill`]), for this model's FIM
+    /// tokens and context window.  The prefix, suffix, extra files and
+    /// prompt are tokenized as plain text (special-token strings in them
+    /// stay text).  `n_predict` of -1 means no output limit.
+    pub fn format_infill(
+        &self,
+        input_prefix: &str,
+        input_suffix: &str,
+        input_extra: &[crate::fim::InfillChunk],
+        prompt: &str,
+        n_predict: i64,
+        spm: bool,
+    ) -> Result<Vec<u32>> {
+        let plain = self.plain_tokenizer.get_or_init(|| {
+            let mut t = (*self.tokenizer).clone();
+            t.set_encode_special_tokens(true);
+            t
+        });
+        let tokenize = |s: &str| -> Vec<u32> {
+            plain
+                .encode(s, false)
+                .map(|e| e.get_ids().to_vec())
+                .unwrap_or_default()
+        };
+        // The tokenizer adds a BOS when its special-token wrapper puts one
+        // in front of ordinary text.
+        let bos = {
+            let with = self.tokenize("a", true)?;
+            let without = self.tokenize("a", false)?;
+            (with.len() > without.len() && with.first() != without.first()).then(|| with[0])
+        };
+        crate::fim::format_infill(
+            &self.fim,
+            &tokenize,
+            tokenize(input_prefix),
+            tokenize(input_suffix),
+            input_extra,
+            &tokenize(prompt),
+            crate::fim::InfillLimits {
+                n_batch: crate::fim::DEFAULT_INFILL_BATCH,
+                n_predict,
+                n_ctx: self.n_ctx as usize,
+            },
+            spm,
+            bos,
+        )
+        .map_err(JoshuaError::InvalidRequest)
+    }
+
+    /// The prompt a chat request renders to, without running the model
+    /// (llama-server's `/apply-template`): the chat template with the
+    /// request's template controls — generation prompt, assistant prefill,
+    /// its own template, the `developer` role mapping.
+    pub fn apply_chat_template(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        options: &GenerationOptions,
+    ) -> Result<String> {
+        self.render_chat(messages, tools, options).map(|r| r.text)
+    }
+
+    /// A [`crate::reasoning::ReasoningSplitter`] for this chat request's
+    /// output: it starts inside the reasoning when the rendered prompt opens
+    /// the block (DeepSeek-R1's `<think>` generation prompt).  Renders the
+    /// prompt only for a model that has a reasoning format.
+    pub fn reasoning_splitter(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        options: &GenerationOptions,
+    ) -> Result<crate::reasoning::ReasoningSplitter> {
+        if !self.reasoning_format.is_some() {
+            return Ok(crate::reasoning::ReasoningSplitter::disabled());
+        }
+        let rendered = self.render_chat(messages, tools, options)?;
+        Ok(crate::reasoning::ReasoningSplitter::new(
+            self.reasoning_format.clone(),
+            self.reasoning_format.prompt_opens_reasoning(&rendered.text),
+        ))
     }
 
     /// Device the routed-expert pool of a MoE model lives on: the compute
@@ -3114,11 +3603,17 @@ impl Engine {
         self.chat_template.is_some()
     }
 
-    /// Format messages as a ChatML prompt and append the assistant turn header.
+    /// Format messages as a ChatML prompt and end it as `render` asks: with
+    /// the assistant turn header (the default), with nothing, or with the
+    /// final message left open for the model to continue.
     ///
     /// When tools are supplied, a Hermes-style system block advertising them
     /// is prepended — the same convention our tool-call parser understands.
-    fn format_chatml_prompt(messages: &[ChatMessage], tools: Option<&[Tool]>) -> String {
+    fn format_chatml_prompt(
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        render: crate::template::RenderOptions,
+    ) -> String {
         let mut prompt = String::new();
         if let Some(tools) = tools.filter(|t| !t.is_empty()) {
             prompt.push_str(
@@ -3143,46 +3638,89 @@ impl Engine {
                  </tool_call><|im_end|>\n",
             );
         }
-        for msg in messages {
+        let open = render.continue_final_message && !messages.is_empty();
+        for (i, msg) in messages.iter().enumerate() {
             prompt.push_str("<|im_start|>");
             prompt.push_str(&msg.role);
             prompt.push('\n');
             prompt.push_str(&msg.content);
+            if open && i + 1 == messages.len() {
+                return prompt;
+            }
             prompt.push_str("<|im_end|>\n");
         }
-        prompt.push_str("<|im_start|>assistant\n");
+        if render.add_generation_prompt || render.continue_final_message {
+            prompt.push_str("<|im_start|>assistant\n");
+        }
         prompt
+    }
+
+    /// Whether a chat request continues its final message: what
+    /// [`GenerationOptions::continue_final_message`] says, or — left unset —
+    /// whether the conversation ends with an assistant message that has no
+    /// tool calls (llama-server's and Anthropic's assistant prefill).
+    fn continues_final_message(messages: &[ChatMessage], options: &GenerationOptions) -> bool {
+        match options.continue_final_message {
+            Some(continues) => continues,
+            None => messages
+                .last()
+                .is_some_and(|m| m.role == "assistant" && m.tool_calls.is_none()),
+        }
     }
 
     /// Format messages into the prompt the model was trained on.
     ///
-    /// Uses the GGUF-embedded chat template when present; otherwise (or if the
-    /// template fails to render) falls back to ChatML.  Returns the prompt and
-    /// whether the tokenizer should still add special tokens: a rendered chat
-    /// template already contains every special token (including BOS), so
-    /// adding them again would duplicate BOS.
-    ///
-    /// `vars` are extra template variables
-    /// ([`GenerationOptions::chat_template_kwargs`]); the ChatML fallback has
-    /// no switches and ignores them.
-    fn format_prompt(
+    /// Uses the request's own template ([`GenerationOptions::chat_template`],
+    /// whose render errors are the client's), else the GGUF-embedded chat
+    /// template, else (or if that template fails to render) ChatML.
+    /// [`GenerationOptions::chat_template_kwargs`] are extra template
+    /// variables; the ChatML fallback has no switches and ignores them.
+    fn render_chat(
         &self,
         messages: &[ChatMessage],
         tools: Option<&[Tool]>,
-        vars: &serde_json::Map<String, serde_json::Value>,
-    ) -> (String, bool) {
+        options: &GenerationOptions,
+    ) -> Result<RenderedChat> {
+        let continues = Self::continues_final_message(messages, options);
+        let render = crate::template::RenderOptions {
+            add_generation_prompt: options.add_generation_prompt && !continues,
+            continue_final_message: continues,
+        };
+        let vars = &options.chat_template_kwargs;
+        // A rendered chat template already contains every special token
+        // (including BOS), so the tokenizer must not add them again.
+        if let Some(source) = &options.chat_template {
+            let (bos, eos) = self.template_tokens.clone();
+            let template = ChatTemplate::new(source.clone(), bos, eos)
+                .with_special_tokens(self.special_tokens.clone());
+            return template
+                .render_with_options(messages, tools, vars, render)
+                .map(|text| RenderedChat {
+                    text,
+                    add_special_tokens: false,
+                })
+                .map_err(JoshuaError::InvalidRequest);
+        }
         if let Some(template) = &self.chat_template {
-            match template.render_with_vars(messages, tools, vars) {
-                Ok(prompt) => return (prompt, false),
+            match template.render_with_options(messages, tools, vars, render) {
+                Ok(text) => {
+                    return Ok(RenderedChat {
+                        text,
+                        add_special_tokens: false,
+                    })
+                }
                 Err(e) => {
                     tracing::warn!("GGUF chat template unusable, falling back to ChatML: {e}");
                 }
             }
         }
-        let sanitized = crate::template::sanitize_messages(messages, &self.special_tokens);
-        (Self::format_chatml_prompt(&sanitized, tools), true)
+        let mapped = crate::template::map_developer_role(messages, None);
+        let sanitized = crate::template::sanitize_messages(&mapped, &self.special_tokens);
+        Ok(RenderedChat {
+            text: Self::format_chatml_prompt(&sanitized, tools, render),
+            add_special_tokens: true,
+        })
     }
-
     // ─── Completion ───────────────────────────────────────────────────────────
 
     /// Run a chat completion.
@@ -3322,27 +3860,96 @@ impl Engine {
             .any(|m| m.images.as_ref().is_some_and(|i| !i.is_empty()))
         {
             let (marked_messages, images) = resolve_message_media(messages)?;
-            let (prompt, _) =
-                self.format_prompt(&marked_messages, tools, &options.chat_template_kwargs);
+            let rendered = self.render_chat(&marked_messages, tools, options)?;
+            let reasoning_open = self.reasoning_format.prompt_opens_reasoning(&rendered.text);
             return self.complete_media(
-                &prompt,
+                &rendered.text,
                 &images,
+                reasoning_open,
                 options,
                 cancel,
                 on_text.as_deref_mut(),
             );
         }
-        let (prompt, add_special_tokens) =
-            self.format_prompt(messages, tools, &options.chat_template_kwargs);
-        let root = self.prompt_root_chars(messages, tools, options, &prompt);
+        let rendered = self.render_chat(messages, tools, options)?;
+        let root = self.prompt_root_chars(messages, tools, options, &rendered.text);
         self.complete_with(
-            &prompt,
-            add_special_tokens,
+            PromptSource::Text {
+                text: &rendered.text,
+                add_special_tokens: rendered.add_special_tokens,
+                root_chars: root,
+            },
             options,
             cancel,
-            root,
             on_text.as_deref_mut(),
         )
+    }
+
+    // ─── Raw-prompt completion ────────────────────────────────────────────────
+
+    /// Complete a raw prompt — text, token ids or both, with no chat
+    /// template (see [`RawPrompt`]).  This is the generation behind
+    /// `/v1/completions`, llama-server's `/completion` and `/infill`, and
+    /// Ollama's `raw` generate.  The result carries the same metadata as a
+    /// chat completion: stop type, cached tokens, timings, token ids.
+    pub fn complete_prompt(
+        &self,
+        prompt: &RawPrompt,
+        options: &GenerationOptions,
+    ) -> Result<Completion> {
+        self.complete_prompt_inner(prompt, options, None, None)
+    }
+
+    /// [`Engine::complete_prompt`] that stops decoding once `cancel` is set
+    /// (see [`Engine::complete_chat_cancellable`]).
+    pub fn complete_prompt_cancellable(
+        &self,
+        prompt: &RawPrompt,
+        options: &GenerationOptions,
+        cancel: &AtomicBool,
+    ) -> Result<Completion> {
+        self.complete_prompt_inner(prompt, options, Some(cancel), None)
+    }
+
+    /// [`Engine::complete_prompt`] that reports text as it is decoded, with
+    /// the same contract as [`Engine::complete_chat_streaming`]: `on_text`
+    /// gets decoded text on the decoding thread, a stop sequence is never
+    /// sent, and decoding stops once `cancel` is set.
+    pub fn complete_prompt_streaming(
+        &self,
+        prompt: &RawPrompt,
+        options: &GenerationOptions,
+        cancel: &AtomicBool,
+        on_text: &mut dyn FnMut(&str),
+    ) -> Result<Completion> {
+        self.complete_prompt_inner(prompt, options, Some(cancel), Some(on_text))
+    }
+
+    fn complete_prompt_inner(
+        &self,
+        prompt: &RawPrompt,
+        options: &GenerationOptions,
+        cancel: Option<&AtomicBool>,
+        on_text: Option<&mut (dyn FnMut(&str) + '_)>,
+    ) -> Result<Completion> {
+        // A single text part keeps the text path (identical to
+        // `complete_raw`); anything with token ids is tokenized here.
+        match prompt.parts.as_slice() {
+            [PromptPart::Text(text)] => self.complete_with(
+                PromptSource::Text {
+                    text,
+                    add_special_tokens: prompt.add_special_tokens,
+                    root_chars: None,
+                },
+                options,
+                cancel,
+                on_text,
+            ),
+            _ => {
+                let tokens = self.tokenize_prompt(prompt)?;
+                self.complete_with(PromptSource::Tokens(tokens), options, cancel, on_text)
+            }
+        }
     }
 
     /// Run a multimodal completion: the plugin tokenises and prefills the
@@ -3351,6 +3958,7 @@ impl Engine {
         &self,
         prompt: &str,
         images: &[Vec<u8>],
+        reasoning_open: bool,
         options: &GenerationOptions,
         cancel: Option<&AtomicBool>,
         on_text: Option<&mut (dyn FnMut(&str) + '_)>,
@@ -3366,13 +3974,7 @@ impl Engine {
         if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
             // A generation cancelled before any work is an empty completion,
             // matching the decode loop's stop path (and the test contract).
-            return Ok(Completion {
-                text: String::new(),
-                usage: UsageInfo::default(),
-                prefill_tps: 0.0,
-                decode_tps: 0.0,
-                stop_sequence: None,
-            });
+            return Ok(Completion::empty(StopType::Cancelled));
         }
         let n_ctx = self.request_n_ctx(options)?;
         // The plugin owns tokenisation, so the prompt length is unknown here;
@@ -3413,6 +4015,7 @@ impl Engine {
                     logits,
                     n_past,
                     &[],
+                    reasoning_open,
                     options,
                     cancel,
                     on_text,
@@ -3432,19 +4035,15 @@ impl Engine {
                 } else {
                     0.0
                 };
-                let usage = UsageInfo {
-                    // Positions consumed by text tokens + media embeddings.
-                    prompt_tokens: n_past as u32,
-                    completion_tokens: outcome.n_decoded,
-                    total_tokens: n_past as u32 + outcome.n_decoded,
-                };
-                Ok(Completion {
-                    text: outcome.response,
-                    usage,
+                // Positions consumed by text tokens + media embeddings.
+                Ok(Self::finished(
+                    outcome,
+                    n_past,
+                    0,
+                    prefill_ms,
                     prefill_tps,
-                    decode_tps: outcome.decode_tps,
-                    stop_sequence: outcome.stop_sequence,
-                })
+                    reasoning_open,
+                ))
             }
             Err(e @ JoshuaError::PromptTooLong(..)) => {
                 // A request error, not a backend fault: keep the session and
@@ -3464,14 +4063,60 @@ impl Engine {
         }
     }
 
-    /// Run completion from an arbitrary raw prompt string.
+    /// Run completion from an arbitrary raw prompt string.  See
+    /// [`Engine::complete_prompt`] for token-id prompts, cancellation,
+    /// streaming and the full [`Completion`].
     pub fn complete_raw(
         &self,
         prompt: &str,
         options: &GenerationOptions,
     ) -> Result<(String, UsageInfo, f64, f64)> {
-        self.complete_with(prompt, true, options, None, None, None)
+        self.complete_prompt(&RawPrompt::text(prompt), options)
             .map(Completion::into_tuple)
+    }
+
+    /// Assemble a [`Completion`] from a finished decode loop over a prompt of
+    /// `n_prompt` tokens, `n_cached` of them reused.
+    fn finished(
+        outcome: DecodeOutcome,
+        n_prompt: usize,
+        n_cached: usize,
+        prefill_ms: f64,
+        prefill_tps: f64,
+        reasoning_open: bool,
+    ) -> Completion {
+        let (n_prompt, n_cached) = (n_prompt as u32, n_cached as u32);
+        let n_decoded = outcome.n_decoded;
+        Completion {
+            usage: UsageInfo {
+                prompt_tokens: n_prompt,
+                completion_tokens: n_decoded,
+                total_tokens: n_prompt + n_decoded,
+                prompt_tokens_details: Some(PromptTokensDetails {
+                    cached_tokens: n_cached,
+                }),
+                completion_tokens_details: outcome.reasoning_tokens.map(|reasoning_tokens| {
+                    crate::types::CompletionTokensDetails { reasoning_tokens }
+                }),
+            },
+            text: outcome.response,
+            prefill_tps,
+            decode_tps: outcome.decode_tps,
+            stop_sequence: outcome.stop_sequence,
+            stop_type: outcome.stop_type,
+            stop_token: outcome.stop_token,
+            cached_tokens: n_cached,
+            timings: Timings::new(
+                n_cached,
+                n_prompt - n_cached,
+                prefill_ms,
+                n_decoded,
+                outcome.decode_ms,
+            ),
+            token_ids: outcome.token_ids,
+            reasoning_open,
+            reasoning_tokens: outcome.reasoning_tokens,
+        }
     }
 
     /// The context window a request may use: its
@@ -3520,20 +4165,19 @@ impl Engine {
         clamped
     }
 
-    /// Shared completion path.  `add_special_tokens` controls whether the
-    /// tokenizer wraps the prompt with its special tokens (disabled for
-    /// template-rendered prompts, which already include them).
+    /// Shared completion path, from prompt text (tokenized here, with the
+    /// tokenizer's special tokens when `add_special_tokens` — disabled for
+    /// template-rendered prompts, which already include them) or from token
+    /// ids.
     ///
-    /// `root_chars` is where the prompt's shared head (system prompt and
-    /// tools) ends in `prompt`, for the prefix cache's root entry; see
+    /// A text prompt's `root_chars` is where its shared head (system prompt
+    /// and tools) ends, for the prefix cache's root entry; see
     /// [`Self::prompt_root_chars`].
     fn complete_with(
         &self,
-        prompt: &str,
-        add_special_tokens: bool,
+        prompt: PromptSource<'_>,
         options: &GenerationOptions,
         cancel: Option<&AtomicBool>,
-        root_chars: Option<usize>,
         mut on_text: Option<&mut (dyn FnMut(&str) + '_)>,
     ) -> Result<Completion> {
         // Bound concurrent heavyweight generations before doing any work.
@@ -3545,21 +4189,37 @@ impl Engine {
             cancel,
         )?;
         if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
-            return Ok(Completion {
-                text: String::new(),
-                usage: UsageInfo::default(),
-                prefill_tps: 0.0,
-                decode_tps: 0.0,
-                stop_sequence: None,
-            });
+            return Ok(Completion::empty(StopType::Cancelled));
         }
 
         // ── Tokenise ─────────────────────────────────────────────────────────
-        let encoding = self
-            .tokenizer
-            .encode(prompt, add_special_tokens)
-            .map_err(|e| JoshuaError::Tokenization(e.to_string()))?;
-        let prompt_tokens = encoding.get_ids();
+        let (mut prompt_tokens, root) = match prompt {
+            PromptSource::Text {
+                text,
+                add_special_tokens,
+                root_chars,
+            } => {
+                let encoding = self
+                    .tokenizer
+                    .encode(text, add_special_tokens)
+                    .map_err(|e| JoshuaError::Tokenization(e.to_string()))?;
+                let tokens = encoding.get_ids().to_vec();
+                let root =
+                    root_chars.and_then(|c| self.root_tokens(text, c, add_special_tokens, &tokens));
+                (tokens, root)
+            }
+            PromptSource::Tokens(tokens) => (tokens, None),
+        };
+        // vLLM's `truncate_prompt_tokens`: keep the prompt's tail.  The
+        // shared head is gone, so is its prefix-cache root.
+        let root = match options.truncate_prompt_tokens {
+            Some(keep) if (keep as usize) < prompt_tokens.len() => {
+                prompt_tokens.drain(..prompt_tokens.len() - keep as usize);
+                None
+            }
+            _ => root,
+        };
+        let prompt_tokens = prompt_tokens.as_slice();
         let n_prompt = prompt_tokens.len();
 
         let n_ctx = self.request_n_ctx(options)?;
@@ -3570,7 +4230,11 @@ impl Engine {
         // Clamp the client-supplied generation length to the server ceiling
         // and the remaining context window.
         let options = &self.clamp_options(options, Some(n_prompt));
-        let root = root_chars.and_then(|c| self.root_tokens(prompt, c, add_special_tokens, prompt_tokens));
+        // Whether the prompt leaves the model inside a reasoning block: its
+        // last opening tag comes after its last closing one.
+        let reasoning_open = self.reasoning_tags.as_ref().is_some_and(|(start, end)| {
+            rfind_tokens(prompt_tokens, start) > rfind_tokens(prompt_tokens, end)
+        });
 
         // ── Validate the structured-output constraint before any backend work ─
         // A malformed `response_format` (or a tokenizer that cannot support
@@ -3596,6 +4260,7 @@ impl Engine {
             options,
             cancel,
             root,
+            reasoning_open,
             on_text.as_deref_mut(),
         );
         match result {
@@ -3640,6 +4305,7 @@ impl Engine {
                     options,
                     cancel,
                     root,
+                    reasoning_open,
                     None,
                 ) {
                     Ok((completion, kv_tokens)) => {
@@ -3771,6 +4437,7 @@ impl Engine {
         options: &GenerationOptions,
         cancel: Option<&AtomicBool>,
         root: Option<usize>,
+        reasoning_open: bool,
         on_text: Option<&mut (dyn FnMut(&str) + '_)>,
     ) -> Result<(Completion, Vec<u32>)> {
         let n_prompt = prompt_tokens.len();
@@ -3827,6 +4494,7 @@ impl Engine {
             logits_vec,
             n_prompt,
             prompt_tokens,
+            reasoning_open,
             options,
             cancel,
             on_text,
@@ -3852,20 +4520,15 @@ impl Engine {
             "Completion finished"
         );
 
-        let usage = UsageInfo {
-            prompt_tokens: n_prompt as u32,
-            completion_tokens: outcome.n_decoded,
-            total_tokens: n_prompt as u32 + outcome.n_decoded,
-        };
-
         Ok((
-            Completion {
-                text: outcome.response,
-                usage,
+            Self::finished(
+                outcome,
+                n_prompt,
+                n_reused,
+                prefill_ms,
                 prefill_tps,
-                decode_tps: outcome.decode_tps,
-                stop_sequence: outcome.stop_sequence,
-            },
+                reasoning_open,
+            ),
             kv_tokens,
         ))
     }
@@ -3914,11 +4577,14 @@ impl Engine {
         mut logits_vec: Vec<f32>,
         start_pos: usize,
         penalty_seed: &[u32],
+        reasoning_open: bool,
         options: &GenerationOptions,
         cancel: Option<&AtomicBool>,
         mut on_text: Option<&mut (dyn FnMut(&str) + '_)>,
     ) -> Result<DecodeOutcome> {
-        let mut text = DecodeText::new(penalty_seed, &self.tokenizer);
+        let n_ctx = self.effective_n_ctx(options);
+        let window = penalty_window(options.repeat_last_n, n_ctx);
+        let mut text = DecodeText::new(penalty_seed, &self.tokenizer, window);
         let mut stream = StreamGate::new(&options.stop_sequences);
         // A fixed seed makes every draw a pure function of (seed, position,
         // stream); without one, pick a request seed once and keep the stream
@@ -3928,23 +4594,50 @@ impl Engine {
         // that match the target's own draw at that position, so this stream
         // affects how many drafts are accepted, never which tokens are emitted.
         let mut draft_rng = StdRng::seed_from_u64(seed);
-        let n_ctx = self.effective_n_ctx(options);
-        let mut sampler = SamplingWorkspace::default();
+        let mut sampler = SamplingWorkspace {
+            controls: self.logit_controls(options, seed, penalty_seed, n_ctx),
+            ..Default::default()
+        };
+        let bad_words = self.bad_word_sequences(&options.bad_words);
         let mut constraint = self.constraint_matcher(options)?;
         // A user stop string could truncate the document before the grammar
         // completes, producing invalid JSON.  The grammar's own EOS is the
-        // only legal stop in constrained mode.
+        // only legal stop in constrained mode, so it is never masked either.
         let constrained_options = constraint.as_ref().map(|_| {
             let mut options = options.clone();
             options.stop_sequences.clear();
+            options.ignore_eos = false;
+            options.min_tokens = 0;
             options
         });
         let options = constrained_options.as_ref().unwrap_or(options);
+        // Settings that depend on the tokens decoded so far keep decoding
+        // one token at a time, like a grammar does.
+        let plain = constraint.is_some() || options.needs_plain_decode();
+        // Reasoning tokens are counted for tagged formats; a budget, which
+        // forces tokens, would break a grammar and is left out with one.
+        let mut reasoning = self.reasoning_tags.as_ref().map(|(start, end)| {
+            let budget = options.reasoning_budget.filter(|_| constraint.is_none());
+            let forced = budget.map(|_| {
+                let mut forced = options
+                    .reasoning_budget_message
+                    .as_deref()
+                    .and_then(|m| self.tokenize(m, false).ok())
+                    .unwrap_or_default();
+                forced.extend_from_slice(end);
+                forced
+            });
+            ReasoningTracker::new(start, end, reasoning_open, budget, forced)
+        });
+        let mut forced: std::collections::VecDeque<u32> = std::collections::VecDeque::new();
         let mut fed_tokens: Vec<u32> = Vec::new();
         let mut n_cur = start_pos;
         let decode_start = Instant::now();
         // Which configured stop sequence ended generation, if any.
         let mut stop_sequence: Option<String> = None;
+        // Why generation ended; a cap unless something else is recorded.
+        let mut stop_type = StopType::Limit;
+        let mut stop_token: Option<u32> = None;
 
         // Speculative decoding needs a text context to draft from and a
         // session that can verify and roll back.
@@ -3952,11 +4645,9 @@ impl Engine {
         // NextN block) takes the place of prompt lookup where the session
         // has it.
         let mut draft_model = match &self.draft {
-            Some(d)
-                if constraint.is_none() && !penalty_seed.is_empty() && model.supports_speculative() =>
-            {
+            Some(d) if !plain && !penalty_seed.is_empty() && model.supports_speculative() => {
                 match self.start_draft(d, penalty_seed) {
-                    Ok(s) => Some(DraftModelState::new(s, penalty_seed)),
+                    Ok(s) => Some(DraftModelState::new(s, penalty_seed, window)),
                     Err(e) => {
                         tracing::warn!(error = %e, "draft model failed; decoding plainly");
                         None
@@ -3965,7 +4656,7 @@ impl Engine {
             }
             _ => None,
         };
-        let mtp = if constraint.is_none()
+        let mtp = if !plain
             && draft_model.is_none()
             && self.mtp > 0
             && model.mtp_enabled()
@@ -3976,7 +4667,7 @@ impl Engine {
             0
         };
         let spec = self.speculative.filter(|_| {
-            constraint.is_none()
+            !plain
                 && draft_model.is_none()
                 && mtp == 0
                 && !penalty_seed.is_empty()
@@ -4016,12 +4707,17 @@ impl Engine {
             // The requester went away: stop as a `max_tokens` stop would, so
             // the session's state stays consistent and reusable.
             if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                stop_type = StopType::Cancelled;
                 break;
             }
             // Never generate past the context window, regardless of
             // max_tokens — bounds KV-cache growth and matches the RoPE tables.
             if n_cur >= n_ctx {
                 break;
+            }
+            // The reasoning budget is spent: write the end tag next.
+            if let Some(tokens) = reasoning.as_mut().and_then(ReasoningTracker::take_forced) {
+                forced.extend(tokens);
             }
 
             let mask = match constraint.as_mut() {
@@ -4038,9 +4734,10 @@ impl Engine {
                 }
                 None => None,
             };
-            let next_token = match pending.take() {
+            let next_token = match pending.take().or_else(|| forced.pop_front()) {
                 Some(t) => t,
                 None => {
+                    sampler.set_bans(options, &self.eos_token_ids, &text.decoded_ids, &bad_words);
                     let t = sampler.sample_at(
                         &logits_vec,
                         options,
@@ -4065,7 +4762,13 @@ impl Engine {
                 }
             };
 
-            if self.eos_token_ids.contains(&next_token) {
+            if !options.ignore_eos && self.eos_token_ids.contains(&next_token) {
+                stop_type = StopType::Eos;
+                break;
+            }
+            if options.stop_token_ids.contains(&next_token) {
+                stop_type = StopType::Eos;
+                stop_token = Some(next_token);
                 break;
             }
             if let Some(matcher) = constraint.as_mut() {
@@ -4076,9 +4779,14 @@ impl Engine {
                 })?;
             }
             let stopped = self.emit_token(&mut text, next_token, options)?;
+            sampler.accept(next_token);
+            if let Some(r) = reasoning.as_mut() {
+                r.observe(&text.decoded_ids);
+            }
             stream.push(&text.response, stopped.is_some(), on_text.as_deref_mut());
             if let Some(stop) = stopped {
                 stop_sequence = Some(stop);
+                stop_type = StopType::Word;
                 break;
             }
             if let Some(d) = drafter.as_mut() {
@@ -4160,6 +4868,9 @@ impl Engine {
             // accepted draft advances `n_cur`, so derive every verification
             // position from here rather than from the moving `n_cur`.
             let draft_pos = n_cur;
+            // Speculation runs only without history-dependent settings, so
+            // the step's bans (EOS under `ignore_eos`) hold for every draft.
+            sampler.set_bans(options, &self.eos_token_ids, &text.decoded_ids, &bad_words);
 
             let mut accepted = 0usize;
             let mut kept = 0usize;
@@ -4177,7 +4888,14 @@ impl Engine {
                 match dist.verify_at(draft, seed, (draft_pos + i) as u64)? {
                     Verdict::Accept => {
                         accepted += 1;
-                        if self.eos_token_ids.contains(&draft) {
+                        if !options.ignore_eos && self.eos_token_ids.contains(&draft) {
+                            stop_type = StopType::Eos;
+                            stop = true;
+                            break;
+                        }
+                        if options.stop_token_ids.contains(&draft) {
+                            stop_type = StopType::Eos;
+                            stop_token = Some(draft);
                             stop = true;
                             break;
                         }
@@ -4194,9 +4912,13 @@ impl Engine {
                             d.context.push(draft);
                         }
                         let stopped = self.emit_token(&mut text, draft, options)?;
+                        if let Some(r) = reasoning.as_mut() {
+                            r.observe(&text.decoded_ids);
+                        }
                         stream.push(&text.response, stopped.is_some(), on_text.as_deref_mut());
                         if let Some(matched) = stopped {
                             stop_sequence = Some(matched);
+                            stop_type = StopType::Word;
                             stop = true;
                             break;
                         }
@@ -4266,8 +4988,102 @@ impl Engine {
             n_decoded,
             fed_tokens,
             decode_tps,
+            decode_ms,
             stop_sequence,
+            stop_type,
+            stop_token,
+            token_ids: text.decoded_ids,
+            reasoning_tokens: reasoning.map(|r| r.count),
         })
+    }
+
+    /// The request's static logit controls, resolved against this model's
+    /// vocabulary: logit biases (text keys tokenized), the allowed-token
+    /// list, and the stateful Mirostat and DRY samplers, seeded with the
+    /// prompt's tail.
+    fn logit_controls(
+        &self,
+        options: &GenerationOptions,
+        seed: u64,
+        prompt: &[u32],
+        n_ctx: usize,
+    ) -> LogitControls {
+        let mut controls = LogitControls {
+            seed,
+            ..LogitControls::default()
+        };
+        // Only a request that names tokens pays for the vocabulary size (the
+        // tokenizer builds its whole vocabulary map to count it).
+        let vocab = if options.logit_bias.is_empty()
+            && options.allowed_token_ids.is_none()
+            && !options.dry.enabled()
+        {
+            0
+        } else {
+            self.vocab_size()
+        };
+        for bias in &options.logit_bias {
+            match &bias.token {
+                TokenRef::Id(id) => {
+                    if (*id as usize) < vocab {
+                        controls.bias.push((*id, bias.bias));
+                    }
+                }
+                TokenRef::Text(text) => {
+                    for id in self.tokenize(text, false).unwrap_or_default() {
+                        controls.bias.push((id, bias.bias));
+                    }
+                }
+            }
+        }
+        if let Some(allowed) = &options.allowed_token_ids {
+            let mut allowed: Vec<u32> = allowed
+                .iter()
+                .copied()
+                .filter(|&id| (id as usize) < vocab)
+                .collect();
+            allowed.sort_unstable();
+            allowed.dedup();
+            controls.allowed = Some(allowed);
+        }
+        if options.mirostat != 0 {
+            controls.mirostat = Some(crate::sampling::Mirostat::new(
+                options.mirostat,
+                options.mirostat_tau,
+                options.mirostat_eta,
+            ));
+        }
+        if options.dry.enabled() {
+            let pieces = self.vocab_pieces.get_or_init(|| {
+                (0..vocab as u32)
+                    .map(|id| self.tokenizer.decode(&[id], false).unwrap_or_default())
+                    .collect()
+            });
+            let tokenize = |s: &str| self.tokenize(s, false).unwrap_or_default();
+            let mut dry = crate::sampling::Dry::new(&options.dry, n_ctx, pieces, &tokenize);
+            for &token in prompt {
+                dry.accept(token);
+            }
+            controls.dry = Some(dry);
+        }
+        controls
+    }
+
+    /// Token sequences for vLLM's `bad_words`: each word with and without a
+    /// leading space.
+    fn bad_word_sequences(&self, words: &[String]) -> Vec<Vec<u32>> {
+        let mut out: Vec<Vec<u32>> = Vec::new();
+        for word in words {
+            let word = word.trim_start();
+            for text in [word.to_string(), format!(" {word}")] {
+                if let Ok(ids) = self.tokenize(&text, false) {
+                    if !ids.is_empty() && !out.contains(&ids) {
+                        out.push(ids);
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// A draft-model session for a request whose context is `prompt`, its
@@ -4308,6 +5124,7 @@ impl Engine {
             context,
             sampler,
             window,
+            window_len,
         } = state;
         drafts.clear();
         let mut logits = session.sync(context, device)?;
@@ -4328,10 +5145,12 @@ impl Engine {
             if j + 1 == n || self.eos_token_ids.contains(&token) {
                 break;
             }
-            if window.len() >= REP_WINDOW {
-                window.remove(0);
+            if *window_len > 0 {
+                if window.len() >= *window_len {
+                    window.remove(0);
+                }
+                window.push(token);
             }
-            window.push(token);
             logits = session.push(token, device)?;
         }
         Ok(())
@@ -4339,13 +5158,15 @@ impl Engine {
 
     /// Append one generated token to the response text and the
     /// repetition-penalty window.  Returns the matched stop sequence, if any
-    /// (the response is trimmed to before it).
+    /// (the response is trimmed to before it unless the request keeps it).
+    /// Stop sequences are not checked until `min_tokens` tokens exist.
     fn emit_token(
         &self,
         text: &mut DecodeText<'_>,
         token: u32,
         options: &GenerationOptions,
     ) -> Result<Option<String>> {
+        text.decoded_ids.push(token);
         if self.byte_level_decode {
             // Byte-level BPE splits multi-byte UTF-8 across token
             // boundaries — a single token can be a lone byte (e.g.
@@ -4354,7 +5175,6 @@ impl Engine {
             // [`ByteWindowDecoder`] keeps that byte state across tokens
             // without re-decoding the whole output every step (the old
             // whole-buffer decode made generation O(n²) in length).
-            text.decoded_ids.push(token);
             let response = std::mem::take(&mut text.response);
             text.response =
                 text.byte_window
@@ -4382,14 +5202,20 @@ impl Engine {
         text.n_decoded += 1;
 
         // Maintain sliding-window token history for repetition penalty.
-        if text.recent_tokens.len() >= REP_WINDOW {
-            text.recent_tokens.remove(0);
+        if text.window > 0 {
+            if text.recent_tokens.len() >= text.window {
+                text.recent_tokens.remove(0);
+            }
+            text.recent_tokens.push(token);
         }
-        text.recent_tokens.push(token);
 
+        if text.n_decoded <= options.min_tokens {
+            return Ok(None);
+        }
         Ok(Self::check_stop_sequences(
             &mut text.response,
             &options.stop_sequences,
+            options.include_stop_str_in_output,
         ))
     }
 
@@ -4918,7 +5744,7 @@ impl Engine {
         let i = messages.iter().position(|m| m.role != "system")?;
         let mut variant = messages.to_vec();
         variant[i].content = if messages[i].content.starts_with('\u{1}') { "\u{2}" } else { "\u{1}" }.into();
-        let (other, _) = self.format_prompt(&variant, tools, &options.chat_template_kwargs);
+        let other = self.render_chat(&variant, tools, options).ok()?.text;
         let n = crate::prefix_cache::common_text_prefix(prompt, &other);
         (n > 0).then_some(n)
     }
@@ -5274,16 +6100,18 @@ impl Engine {
         budget
     }
 
-    /// Scan `response` for any configured stop sequence and truncate it.
-    /// Returns the matched sequence so the caller can report why decoding
-    /// stopped.
-    fn check_stop_sequences(response: &mut String, stops: &[String]) -> Option<String> {
+    /// Scan `response` for any configured stop sequence and truncate it
+    /// (unless `keep`, vLLM's `include_stop_str_in_output`).  Returns the
+    /// matched sequence so the caller can report why decoding stopped.
+    fn check_stop_sequences(response: &mut String, stops: &[String], keep: bool) -> Option<String> {
         for stop in stops {
             if stop.is_empty() {
                 continue;
             }
             if response.ends_with(stop.as_str()) {
-                response.truncate(response.len() - stop.len());
+                if !keep {
+                    response.truncate(response.len() - stop.len());
+                }
                 return Some(stop.clone());
             }
         }
@@ -6896,6 +7724,43 @@ fn extract_chat_template(gguf: &gguf_file::Content, tokenizer: &Tokenizer) -> Op
     )
 }
 
+/// The model's reasoning markup (see [`crate::reasoning::ReasoningFormat`])
+/// and, for a tag pair, the tags' token ids.
+fn detect_reasoning(
+    template: Option<&str>,
+    tokenizer: &Tokenizer,
+) -> (
+    crate::reasoning::ReasoningFormat,
+    Option<(Vec<u32>, Vec<u32>)>,
+) {
+    use crate::reasoning::ReasoningFormat;
+    let format = ReasoningFormat::detect(template, &|t| tokenizer.token_to_id(t).is_some());
+    let tags = match &format {
+        ReasoningFormat::Tags { start, end } => {
+            let encode = |s: &str| {
+                tokenizer
+                    .encode(s, false)
+                    .ok()
+                    .map(|e| e.get_ids().to_vec())
+                    .filter(|ids| !ids.is_empty())
+            };
+            encode(start).zip(encode(end))
+        }
+        _ => None,
+    };
+    (format, tags)
+}
+
+/// Where the last occurrence of `needle` in `haystack` starts.
+fn rfind_tokens(haystack: &[u32], needle: &[u32]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return None;
+    }
+    (0..=haystack.len() - needle.len())
+        .rev()
+        .find(|&i| haystack[i..i + needle.len()] == *needle)
+}
+
 /// Derive EOS token IDs from GGUF metadata and well-known special token strings.
 fn extract_eos_ids(gguf: &gguf_file::Content, tokenizer: &Tokenizer) -> Vec<u32> {
     let mut ids: Vec<u32> = Vec::new();
@@ -6959,10 +7824,68 @@ fn squeeze_batch_logits(logits: &Tensor) -> Result<Vec<f32>> {
         heap: Vec<(f32, u32)>,
         /// Ids of the top-k survivors after a sparse fill, ascending.
         support: Vec<u32>,
+        /// Scratch order for typical-p, XTC and Mirostat.
+        order: Vec<usize>,
+        /// The request's logit controls and stateful samplers (empty — and
+        /// skipped — unless the request sets them).
+        controls: LogitControls,
         /// Always take the dense path: the reference the sparse one must match.
         #[cfg(test)]
         force_dense_sampling: bool,
     }
+
+    /// Logit adjustments and sampler state beyond the per-call options:
+    /// biases and token restrictions resolved against the vocabulary, the
+    /// step's banned tokens, and Mirostat's and DRY's running state.
+    #[derive(Default)]
+    struct LogitControls {
+        /// `(token, bias)` added to the logits.
+        bias: Vec<(u32, f32)>,
+        /// Sorted ids that alone may be sampled.
+        allowed: Option<Vec<u32>>,
+        /// Ids masked for this step (EOS before `min_tokens`, bad words).
+        ban: Vec<u32>,
+        /// The request seed and the step's position, for XTC's draw.
+        seed: u64,
+        pos: u64,
+        mirostat: Option<crate::sampling::Mirostat>,
+        dry: Option<crate::sampling::Dry>,
+    }
+
+    impl LogitControls {
+        /// Whether the logits are changed before the penalties.
+        fn adjusts_logits(&self) -> bool {
+            !self.bias.is_empty()
+                || self.allowed.is_some()
+                || !self.ban.is_empty()
+                || self.dry.is_some()
+        }
+
+        /// Apply the allowed list, biases and bans (before any penalty, as
+        /// llama.cpp's logit-bias sampler comes first).
+        fn apply(&self, logits: &mut [f32]) {
+            if let Some(allowed) = &self.allowed {
+                for (id, l) in logits.iter_mut().enumerate() {
+                    if allowed.binary_search(&(id as u32)).is_err() {
+                        *l = f32::NEG_INFINITY;
+                    }
+                }
+            }
+            for &(id, bias) in &self.bias {
+                if let Some(l) = logits.get_mut(id as usize) {
+                    *l += bias;
+                }
+            }
+            for &id in &self.ban {
+                if let Some(l) = logits.get_mut(id as usize) {
+                    *l = f32::NEG_INFINITY;
+                }
+            }
+        }
+    }
+
+    /// The XTC draw's random stream (distinct from the sample's, stream 0).
+    const XTC_STREAM: u64 = 0x58_54_43;
 
     enum SamplingKind {
         Greedy(u32),
@@ -6973,6 +7896,41 @@ fn squeeze_batch_logits(logits: &Tensor) -> Result<Vec<f32>> {
     }
 
     impl SamplingWorkspace {
+        /// Set the tokens banned for the next step: end-of-sequence tokens
+        /// under `ignore_eos` or before `min_tokens`, stop tokens before
+        /// `min_tokens`, and the last token of every bad word whose other
+        /// tokens were just generated.
+        fn set_bans(
+            &mut self,
+            opts: &GenerationOptions,
+            eos: &[u32],
+            generated: &[u32],
+            bad_words: &[Vec<u32>],
+        ) {
+            let ban = &mut self.controls.ban;
+            ban.clear();
+            let short = (generated.len() as u32) < opts.min_tokens;
+            if opts.ignore_eos || short {
+                ban.extend_from_slice(eos);
+            }
+            if short {
+                ban.extend_from_slice(&opts.stop_token_ids);
+            }
+            for word in bad_words {
+                let (last, head) = word.split_last().expect("bad words are non-empty");
+                if generated.ends_with(head) {
+                    ban.push(*last);
+                }
+            }
+        }
+
+        /// Record an emitted token in the stateful samplers' history.
+        fn accept(&mut self, token: u32) {
+            if let Some(dry) = &mut self.controls.dry {
+                dry.accept(token);
+            }
+        }
+
         /// Draw the token at absolute position `pos` from `seed`.
         fn sample_at(
             &mut self,
@@ -6984,9 +7942,17 @@ fn squeeze_batch_logits(logits: &Tensor) -> Result<Vec<f32>> {
             pos: u64,
         ) -> Result<u32> {
             check_finite_logits(logits, pos)?;
+            self.controls.seed = seed;
+            self.controls.pos = pos;
             match self.fill(logits, opts, recent_tokens, mask) {
                 SamplingKind::Greedy(token) => Ok(token),
-                SamplingKind::Probs => TokenDistRef::Probs(&self.probs).sample_at(seed, pos),
+                SamplingKind::Probs => {
+                    let token = TokenDistRef::Probs(&self.probs).sample_at(seed, pos)?;
+                    if let Some(m) = &mut self.controls.mirostat {
+                        m.update(self.probs[token as usize]);
+                    }
+                    Ok(token)
+                }
                 SamplingKind::Sparse => {
                     crate::speculative::sample_support_at(&self.probs, &self.support, seed, pos)
                 }
@@ -7002,6 +7968,7 @@ fn squeeze_batch_logits(logits: &Tensor) -> Result<Vec<f32>> {
             pos: u64,
         ) -> Result<TokenDistRef<'_>> {
             check_finite_logits(logits, pos)?;
+            self.controls.pos = pos;
             Ok(match self.fill(logits, opts, recent_tokens, mask) {
                 SamplingKind::Greedy(token) => TokenDistRef::Greedy(token),
                 SamplingKind::Probs | SamplingKind::Sparse => TokenDistRef::Probs(&self.probs),
@@ -7038,10 +8005,14 @@ fn squeeze_batch_logits(logits: &Tensor) -> Result<Vec<f32>> {
             // They default to 0 and are honoured at every temperature.
             let (presence, frequency) = (opts.presence_penalty, opts.frequency_penalty);
             let additive = presence != 0.0 || frequency != 0.0;
-            let logits = if (reppen != 1.0 || additive) && !recent_tokens.is_empty() {
+            // Logit biases, token restrictions, bans and DRY (all off by
+            // default) adjust the logits too.
+            let controls = self.controls.adjusts_logits();
+            let logits = if controls || ((reppen != 1.0 || additive) && !recent_tokens.is_empty()) {
                 self.adjusted.clear();
                 self.adjusted.extend_from_slice(logits);
                 let v = &mut self.adjusted;
+                self.controls.apply(v);
                 if reppen != 1.0 {
                     for &token in recent_tokens {
                         if let Some(l) = v.get_mut(token as usize) {
@@ -7065,6 +8036,9 @@ fn squeeze_batch_logits(logits: &Tensor) -> Result<Vec<f32>> {
                             *l -= presence + frequency * run.len() as f32;
                         }
                     }
+                }
+                if let Some(dry) = &mut self.controls.dry {
+                    dry.apply(v);
                 }
                 v.as_slice()
             } else {
@@ -7093,11 +8067,16 @@ fn squeeze_batch_logits(logits: &Tensor) -> Result<Vec<f32>> {
                 None => logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max),
             };
 
+            // The llama.cpp samplers beyond top-k/min-p/top-p work on the
+            // dense vector.
+            let xtc = opts.xtc_probability > 0.0 && opts.xtc_threshold <= 0.5;
+            let extra = opts.typical_p < 1.0 || opts.top_n_sigma > 0.0 || xtc || opts.mirostat != 0;
+
             // Unmasked top-k leaves at most k non-zero entries.  Find them in
             // the exponential pass and filter only them; anything the sparse
             // path cannot reproduce exactly falls through to the dense one.
             let k = opts.top_k as usize;
-            let sparse = mask.is_none() && k > 0 && k < logits.len() && k <= SPARSE_TOP_K_MAX;
+            let sparse = mask.is_none() && !extra && k > 0 && k < logits.len() && k <= SPARSE_TOP_K_MAX;
             #[cfg(test)]
             let sparse = sparse && !self.force_dense_sampling;
             if sparse
@@ -7134,31 +8113,69 @@ fn squeeze_batch_logits(logits: &Tensor) -> Result<Vec<f32>> {
                 }
             }
 
-            // ── Top-k ─────────────────────────────────────────────────────────────────
-            retain_top_k(probs, opts.top_k as usize, &mut self.indexed);
+            if let Some(mirostat) = self.controls.mirostat.as_ref().filter(|_| opts.mirostat != 0) {
+                // ── Mirostat ──────────────────────────────────────────────────────────
+                // Replaces the truncation samplers (llama.cpp's chain is just
+                // temperature then Mirostat).
+                mirostat.truncate(probs, &mut self.order);
+            } else {
+                // ── Top-n-sigma ───────────────────────────────────────────────────────
+                if opts.top_n_sigma > 0.0 {
+                    crate::sampling::top_n_sigma(
+                        logits,
+                        |i| mask.is_none_or(|m| m.is_allowed(i as u32)),
+                        probs,
+                        opts.top_n_sigma,
+                    );
+                }
 
-            // ── Min-p ─────────────────────────────────────────────────────────────────
-            if opts.min_p > 0.0 {
-                let max_p = probs.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let threshold = max_p * opts.min_p;
-                for p in probs.iter_mut() {
-                    if *p < threshold {
-                        *p = 0.0;
+                // ── Top-k ─────────────────────────────────────────────────────────────
+                retain_top_k(probs, opts.top_k as usize, &mut self.indexed);
+
+                // ── Typical-p ─────────────────────────────────────────────────────────
+                if opts.typical_p < 1.0 {
+                    crate::sampling::typical(probs, opts.typical_p, &mut self.order);
+                }
+
+                // ── Min-p ─────────────────────────────────────────────────────────────
+                if opts.min_p > 0.0 {
+                    let max_p = probs.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    let threshold = max_p * opts.min_p;
+                    for p in probs.iter_mut() {
+                        if *p < threshold {
+                            *p = 0.0;
+                        }
                     }
                 }
-            }
 
-            // ── Top-p (nucleus) ───────────────────────────────────────────────────────
-            if opts.top_p < 1.0 && opts.top_p > 0.0 {
-                let sum: f32 = probs.iter().sum();
-                if sum > 0.0 {
-                    // Top-k/min-p already zeroed the tail.  Sort only the
-                    // survivors: with the default top-k this is a few dozen
-                    // entries instead of the whole vocabulary.
-                    let sorted_idx = &mut self.sorted_idx;
-                    sorted_idx.clear();
-                    sorted_idx.extend((0..probs.len()).filter(|&i| probs[i] > 0.0));
-                    cut_nucleus(probs, sorted_idx, sum, opts.top_p);
+                // ── Top-p (nucleus) ───────────────────────────────────────────────────
+                if opts.top_p < 1.0 && opts.top_p > 0.0 {
+                    let sum: f32 = probs.iter().sum();
+                    if sum > 0.0 {
+                        // Top-k/min-p already zeroed the tail.  Sort only the
+                        // survivors: with the default top-k this is a few dozen
+                        // entries instead of the whole vocabulary.
+                        let sorted_idx = &mut self.sorted_idx;
+                        sorted_idx.clear();
+                        sorted_idx.extend((0..probs.len()).filter(|&i| probs[i] > 0.0));
+                        cut_nucleus(probs, sorted_idx, sum, opts.top_p);
+                    }
+                }
+
+                // ── XTC ───────────────────────────────────────────────────────────────
+                if xtc {
+                    let u = crate::speculative::splitmix_uniform(
+                        self.controls.seed,
+                        self.controls.pos,
+                        XTC_STREAM,
+                    );
+                    crate::sampling::xtc(
+                        probs,
+                        opts.xtc_probability,
+                        opts.xtc_threshold,
+                        u,
+                        &mut self.order,
+                    );
                 }
             }
 
@@ -9333,18 +10350,180 @@ mod tests {
     }
 
     #[test]
+    fn logit_controls_steer_greedy_choice_and_are_off_by_default() {
+        let logits = [0.5, 2.0, 1.0, -1.0];
+        let opts = GenerationOptions {
+            temperature: 0.0,
+            ..Default::default()
+        };
+        let mut ws = SamplingWorkspace::default();
+        assert!(!ws.controls.adjusts_logits());
+        let greedy = |ws: &mut SamplingWorkspace| match ws.fill(&logits, &opts, &[], None) {
+            SamplingKind::Greedy(t) => t,
+            _ => panic!("temperature 0 is greedy"),
+        };
+        assert_eq!(greedy(&mut ws), 1);
+        ws.controls.ban = vec![1];
+        assert_eq!(greedy(&mut ws), 2);
+        ws.controls.ban.clear();
+        ws.controls.bias = vec![(3, 10.0)];
+        assert_eq!(greedy(&mut ws), 3);
+        ws.controls.bias.clear();
+        ws.controls.allowed = Some(vec![0]);
+        assert_eq!(greedy(&mut ws), 0);
+    }
+
+    #[test]
+    fn bans_follow_min_tokens_ignore_eos_and_bad_words() {
+        let mut ws = SamplingWorkspace::default();
+        let opts = GenerationOptions {
+            min_tokens: 2,
+            stop_token_ids: vec![9],
+            ..Default::default()
+        };
+        let bad = [vec![5, 6], vec![7]];
+        ws.set_bans(&opts, &[3], &[1], &bad);
+        assert_eq!(
+            ws.controls.ban,
+            vec![3, 9, 7],
+            "short: EOS and stop tokens; single-token bad word"
+        );
+        ws.set_bans(&opts, &[3], &[1, 5], &bad);
+        assert_eq!(
+            ws.controls.ban,
+            vec![6, 7],
+            "long enough; `5` then `6` would spell a bad word"
+        );
+        let ignore = GenerationOptions {
+            ignore_eos: true,
+            ..Default::default()
+        };
+        ws.set_bans(&ignore, &[3], &[1, 2, 4], &[]);
+        assert_eq!(ws.controls.ban, vec![3]);
+        ws.set_bans(&GenerationOptions::default(), &[3], &[], &[]);
+        assert!(ws.controls.ban.is_empty());
+    }
+
+    #[test]
+    fn xtc_is_position_keyed_so_verification_reproduces_the_sample() {
+        let logits: Vec<f32> = (0..32).map(|i| (i as f32 * 0.37).sin() * 3.0).collect();
+        let opts = GenerationOptions {
+            temperature: 1.0,
+            top_k: 0,
+            top_p: 1.0,
+            min_p: 0.0,
+            xtc_probability: 0.5,
+            xtc_threshold: 0.03,
+            ..Default::default()
+        };
+        let mut excluded_any = false;
+        for pos in 0..32 {
+            let mut sampler = SamplingWorkspace::default();
+            let token = sampler
+                .sample_at(&logits, &opts, &[], None, 11, pos)
+                .unwrap();
+            let mut verifier = SamplingWorkspace::default();
+            verifier.controls.seed = 11;
+            let dist = verifier
+                .distribution(&logits, &opts, &[], None, pos)
+                .unwrap();
+            if let TokenDistRef::Probs(p) = dist {
+                excluded_any |= p.iter().filter(|&&q| q == 0.0).count() > 0;
+            }
+            assert!(matches!(
+                dist.verify_at(token, 11, pos).unwrap(),
+                Verdict::Accept
+            ));
+        }
+        assert!(excluded_any, "XTC fired at some position");
+    }
+
+    #[test]
+    fn mirostat_moves_its_budget_after_each_draw() {
+        let logits: Vec<f32> = (0..16).map(|i| -(i as f32) * 0.3).collect();
+        let opts = GenerationOptions {
+            temperature: 1.0,
+            mirostat: 2,
+            ..Default::default()
+        };
+        let mut ws = SamplingWorkspace::default();
+        ws.controls.mirostat = Some(crate::sampling::Mirostat::new(2, 3.0, 0.1));
+        let before = ws.controls.mirostat.unwrap().mu;
+        ws.sample_at(&logits, &opts, &[], None, 1, 0).unwrap();
+        assert_ne!(ws.controls.mirostat.unwrap().mu, before);
+    }
+
+    #[test]
+    fn reasoning_tracker_counts_and_forces_the_end_tag_once() {
+        let (start, end) = ([14u32], [15u32]);
+        let mut t = ReasoningTracker::new(&start, &end, false, Some(2), Some(vec![9, 15]));
+        t.observe(&[4]);
+        assert_eq!(t.count, 0, "not inside yet");
+        t.observe(&[4, 14]);
+        t.observe(&[4, 14, 5]);
+        assert!(t.take_forced().is_none());
+        t.observe(&[4, 14, 5, 6]);
+        assert_eq!(t.take_forced(), Some(vec![9, 15]));
+        assert_eq!(t.take_forced(), None, "forced once");
+        t.observe(&[4, 14, 5, 6, 9]);
+        t.observe(&[4, 14, 5, 6, 9, 15]);
+        assert!(!t.inside && t.closed);
+        assert_eq!(t.count, 3, "the forced message counts as reasoning");
+        // Without a budget it only counts.
+        let mut open = ReasoningTracker::new(&start, &end, true, None, None);
+        open.observe(&[7]);
+        assert_eq!((open.count, open.take_forced()), (1, None));
+    }
+
+    #[test]
+    fn token_search_and_penalty_windows() {
+        assert_eq!(rfind_tokens(&[1, 2, 1, 2], &[1, 2]), Some(2));
+        assert_eq!(rfind_tokens(&[1, 2], &[3]), None);
+        assert_eq!(rfind_tokens(&[1], &[1, 2]), None);
+        assert_eq!(penalty_window(64, 4096), 64);
+        assert_eq!(penalty_window(0, 4096), 0);
+        assert_eq!(penalty_window(-1, 4096), 4096);
+    }
+
+    #[test]
+    fn stop_types_map_to_finish_reasons() {
+        assert_eq!(StopType::Eos.finish_reason(), "stop");
+        assert_eq!(StopType::Word.finish_reason(), "stop");
+        assert_eq!(StopType::Limit.finish_reason(), "length");
+        assert_eq!(StopType::Cancelled.finish_reason(), "length");
+        assert_eq!(
+            [
+                StopType::Eos,
+                StopType::Word,
+                StopType::Limit,
+                StopType::Cancelled
+            ]
+            .map(StopType::as_str),
+            ["eos", "word", "limit", "none"]
+        );
+    }
+
+    #[test]
     fn check_stop_sequences_reports_the_matched_sequence() {
         let mut response = "hello END".to_string();
         let stops = vec!["STOP".to_string(), "END".to_string()];
         assert_eq!(
-            Engine::check_stop_sequences(&mut response, &stops).as_deref(),
+            Engine::check_stop_sequences(&mut response, &stops, false).as_deref(),
             Some("END")
         );
         assert_eq!(response, "hello ");
 
         let mut response = "nothing here".to_string();
-        assert!(Engine::check_stop_sequences(&mut response, &stops).is_none());
+        assert!(Engine::check_stop_sequences(&mut response, &stops, false).is_none());
         assert_eq!(response, "nothing here");
+
+        // vLLM's include_stop_str_in_output keeps the matched string.
+        let mut response = "hello END".to_string();
+        assert_eq!(
+            Engine::check_stop_sequences(&mut response, &stops, true).as_deref(),
+            Some("END")
+        );
+        assert_eq!(response, "hello END");
     }
 
     #[test]

@@ -8,8 +8,12 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::engine::{Completion, StopType};
+use crate::sampling::SamplingDefaults;
 use crate::tools::ParsedToolCall;
-use crate::types::{ChatMessage, FunctionDef, GenerationOptions, Tool, UsageInfo};
+use crate::types::{
+    reasoning_template_kwargs, ChatMessage, FunctionDef, GenerationOptions, SamplingParams, Tool,
+};
 
 /// `POST /v1/messages` request body.
 #[derive(Debug, Deserialize)]
@@ -45,6 +49,26 @@ pub struct MessagesRequest {
     /// `auto`, `any`, `tool`, or `none`.
     #[serde(default)]
     pub tool_choice: Option<Value>,
+    /// Extended thinking: `{"type": "enabled", "budget_tokens": N}`,
+    /// `{"type": "disabled"}` or `{"type": "adaptive"}`.
+    #[serde(default)]
+    pub thinking: Option<ThinkingConfig>,
+}
+
+/// Anthropic's `thinking` request parameter.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ThinkingConfig {
+    /// Think, within a token budget.
+    Enabled {
+        /// Most reasoning tokens before the answer.
+        #[serde(default)]
+        budget_tokens: Option<u32>,
+    },
+    /// Do not think (where the model can switch thinking off).
+    Disabled {},
+    /// Let the model decide how much to think.
+    Adaptive {},
 }
 
 /// Anthropic message.
@@ -109,6 +133,20 @@ pub enum Block {
         #[serde(default)]
         is_error: Option<bool>,
     },
+    /// An earlier turn's reasoning, passed back to the template.
+    Thinking {
+        /// The reasoning text.
+        thinking: String,
+        /// Opaque signature (empty from local models); ignored.
+        #[serde(default)]
+        signature: Option<String>,
+    },
+    /// Reasoning the API withheld; nothing to pass on.
+    RedactedThinking {
+        /// Opaque payload; ignored.
+        #[serde(default)]
+        data: Option<String>,
+    },
 }
 
 /// Anthropic image source.
@@ -137,9 +175,13 @@ pub struct AnthropicTool {
 }
 
 /// Convert an Anthropic request into the engine's chat messages, tools, and
-/// sampling options.
+/// sampling options.  Sampler settings the request leaves unset come from
+/// `defaults` (see [`crate::Engine::sampling_defaults`]; Anthropic's own
+/// are the neutral OpenAI-family ones: temperature 1.0, no top-p, top-k or
+/// repetition penalty).  A final assistant message is continued (prefill).
 pub fn to_chat_request(
     req: &MessagesRequest,
+    defaults: &SamplingDefaults,
 ) -> Result<(Vec<ChatMessage>, Option<Vec<Tool>>, GenerationOptions), String> {
     if req.max_tokens == 0 {
         return Err("max_tokens must be at least 1".to_string());
@@ -181,17 +223,33 @@ pub fn to_chat_request(
                 .collect::<Vec<_>>()
         });
 
-    let mut options = GenerationOptions::default();
-    options.max_tokens = req.max_tokens;
-    // Anthropic's defaults are deliberately different from Joshua's
-    // OpenAI-oriented defaults: temperature 1.0, no nucleus/top-k truncation,
-    // and no repetition penalty unless the caller asks for one.
-    options.temperature = req.temperature.unwrap_or(1.0);
-    options.top_p = req.top_p.unwrap_or(1.0);
-    options.top_k = req.top_k.unwrap_or(0);
-    options.min_p = 0.0;
-    options.repetition_penalty = 1.0;
-    options.stop_sequences = req.stop_sequences.clone().unwrap_or_default();
+    // The same request-to-options mapping as the OpenAI routes.
+    let mut options = GenerationOptions::with_defaults(defaults);
+    SamplingParams {
+        max_tokens: Some(req.max_tokens.into()),
+        temperature: req.temperature,
+        top_p: req.top_p,
+        top_k: req.top_k,
+        stop: req
+            .stop_sequences
+            .as_ref()
+            .map(|stops| Value::from(stops.clone())),
+        ..Default::default()
+    }
+    .apply(&mut options)?;
+    // `thinking` (vLLM's and llama.cpp's mapping): `disabled` turns the
+    // template's thinking switch off; `enabled` turns it on and enforces
+    // `budget_tokens`; `adaptive` leaves the model to decide.
+    match &req.thinking {
+        Some(ThinkingConfig::Enabled { budget_tokens }) => {
+            options.chat_template_kwargs = reasoning_template_kwargs(None, Some(true), None);
+            options.reasoning_budget = *budget_tokens;
+        }
+        Some(ThinkingConfig::Disabled {}) => {
+            options.chat_template_kwargs = reasoning_template_kwargs(None, Some(false), None);
+        }
+        Some(ThinkingConfig::Adaptive {}) | None => {}
+    }
 
     Ok((messages, tools, options))
 }
@@ -240,6 +298,7 @@ fn user_messages(message: &Message, out: &mut Vec<ChatMessage>) -> Result<(), St
                                 name: None,
                                 tool_calls: None,
                                 tool_call_id: None,
+                                reasoning_content: None,
                             });
                         }
                         let (mut result, images) = content_to_message(content);
@@ -253,6 +312,7 @@ fn user_messages(message: &Message, out: &mut Vec<ChatMessage>) -> Result<(), St
                             name: None,
                             tool_calls: None,
                             tool_call_id: Some(tool_use_id.clone()),
+                            reasoning_content: None,
                         });
                     }
                     Block::ToolUse { .. } => {
@@ -260,6 +320,8 @@ fn user_messages(message: &Message, out: &mut Vec<ChatMessage>) -> Result<(), St
                             "tool_use blocks are only valid in assistant messages".to_string()
                         )
                     }
+                    // Reasoning belongs to assistant turns.
+                    Block::Thinking { .. } | Block::RedactedThinking { .. } => {}
                 }
             }
             if !text.is_empty() || !images.is_empty() {
@@ -270,6 +332,7 @@ fn user_messages(message: &Message, out: &mut Vec<ChatMessage>) -> Result<(), St
                     name: None,
                     tool_calls: None,
                     tool_call_id: None,
+                    reasoning_content: None,
                 });
             }
         }
@@ -282,6 +345,7 @@ fn assistant_message(message: &Message) -> Result<ChatMessage, String> {
         Content::Text(text) => Ok(ChatMessage::text("assistant", text.clone())),
         Content::Blocks(blocks) => {
             let mut text = String::new();
+            let mut reasoning = String::new();
             let mut calls = Vec::new();
             for block in blocks {
                 match block {
@@ -291,6 +355,8 @@ fn assistant_message(message: &Message) -> Result<ChatMessage, String> {
                         }
                         text.push_str(part);
                     }
+                    Block::Thinking { thinking, .. } => reasoning.push_str(thinking),
+                    Block::RedactedThinking { .. } => {}
                     Block::ToolUse { id, name, input } => calls.push(json!({
                         "id": id,
                         "type": "function",
@@ -315,6 +381,7 @@ fn assistant_message(message: &Message) -> Result<ChatMessage, String> {
                 name: None,
                 tool_calls: (!calls.is_empty()).then_some(Value::Array(calls)),
                 tool_call_id: None,
+                reasoning_content: (!reasoning.is_empty()).then_some(reasoning),
             })
         }
     }
@@ -380,6 +447,14 @@ fn content_to_message(content: &Value) -> (String, Vec<String>) {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponseBlock {
+    /// The model's reasoning (extended thinking).  Local models have no
+    /// signature to give, so it is empty, as llama-server sends it.
+    Thinking {
+        /// The reasoning text.
+        thinking: String,
+        /// Always empty.
+        signature: String,
+    },
     /// Assistant text.
     Text {
         /// The text.
@@ -396,13 +471,29 @@ pub enum ResponseBlock {
     },
 }
 
-/// Anthropic usage envelope.
+/// Anthropic usage envelope.  As in Anthropic's API and llama-server,
+/// `input_tokens` counts only the prompt tokens processed afresh; the ones
+/// reused from cached state are `cache_read_input_tokens`.
 #[derive(Debug, Serialize)]
 pub struct MessagesUsage {
-    /// Prompt tokens.
+    /// Prompt tokens read from cache.
+    pub cache_read_input_tokens: u32,
+    /// Prompt tokens processed.
     pub input_tokens: u32,
     /// Generated tokens.
     pub output_tokens: u32,
+}
+
+impl MessagesUsage {
+    /// The usage of a finished generation.
+    pub fn from_completion(completion: &Completion) -> Self {
+        let cached = completion.cached_tokens.min(completion.usage.prompt_tokens);
+        Self {
+            cache_read_input_tokens: cached,
+            input_tokens: completion.usage.prompt_tokens - cached,
+            output_tokens: completion.usage.completion_tokens,
+        }
+    }
 }
 
 /// `POST /v1/messages` response.
@@ -417,9 +508,9 @@ pub struct MessagesResponse {
     pub role: String,
     /// Model id.
     pub model: String,
-    /// Text and tool-use blocks.
+    /// Thinking, text and tool-use blocks.
     pub content: Vec<ResponseBlock>,
-    /// `end_turn`, `max_tokens`, or `tool_use`.
+    /// `end_turn`, `max_tokens`, `stop_sequence` or `tool_use`.
     pub stop_reason: String,
     /// Matched stop sequence, if any.
     pub stop_sequence: Option<String>,
@@ -427,22 +518,41 @@ pub struct MessagesResponse {
     pub usage: MessagesUsage,
 }
 
-/// Build a non-streaming response from the model's text.
+/// Anthropic's `stop_reason` for how generation ended: any cap is
+/// `max_tokens` (even mid tool call, as llama-server reports it), a stop
+/// string `stop_sequence`, and an end of turn `tool_use` when the answer
+/// called tools.
+pub fn stop_reason(stop_type: StopType, has_calls: bool) -> &'static str {
+    match stop_type {
+        StopType::Limit | StopType::Cancelled => "max_tokens",
+        StopType::Word => "stop_sequence",
+        StopType::Eos if has_calls => "tool_use",
+        StopType::Eos => "end_turn",
+    }
+}
+
+/// Build a non-streaming response from the model's answer text (`answer`,
+/// the reasoning already split off into `reasoning`) and its completion.
 pub fn response(
     id: String,
     model: String,
-    text: &str,
-    usage: &UsageInfo,
+    answer: &str,
+    reasoning: Option<&str>,
+    completion: &Completion,
     tools_offered: bool,
-    max_tokens: u32,
-    stop_sequence: Option<&str>,
 ) -> (MessagesResponse, Vec<ParsedToolCall>) {
     let (prose, calls) = if tools_offered {
-        crate::tools::parse_tool_calls(text)
+        crate::tools::parse_tool_calls(answer)
     } else {
-        (text.to_string(), Vec::new())
+        (answer.to_string(), Vec::new())
     };
     let mut content = Vec::new();
+    if let Some(thinking) = reasoning.filter(|r| !r.is_empty()) {
+        content.push(ResponseBlock::Thinking {
+            thinking: thinking.to_string(),
+            signature: String::new(),
+        });
+    }
     if !prose.is_empty() {
         content.push(ResponseBlock::Text { text: prose });
     }
@@ -453,27 +563,15 @@ pub fn response(
             input: tool_input(&call.arguments),
         });
     }
-    let stop_reason = if !calls.is_empty() {
-        "tool_use"
-    } else if stop_sequence.is_some() {
-        "stop_sequence"
-    } else if usage.completion_tokens >= max_tokens {
-        "max_tokens"
-    } else {
-        "end_turn"
-    };
     let response = MessagesResponse {
         id,
         message_type: "message".to_string(),
         role: "assistant".to_string(),
         model,
         content,
-        stop_reason: stop_reason.to_string(),
-        stop_sequence: stop_sequence.map(str::to_string),
-        usage: MessagesUsage {
-            input_tokens: usage.prompt_tokens,
-            output_tokens: usage.completion_tokens,
-        },
+        stop_reason: stop_reason(completion.stop_type, !calls.is_empty()).to_string(),
+        stop_sequence: completion.stop_sequence.clone(),
+        usage: MessagesUsage::from_completion(completion),
     };
     (response, calls)
 }
@@ -481,6 +579,32 @@ pub fn response(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::UsageInfo;
+
+    fn completion(text: &str, stop_type: StopType, stop_sequence: Option<&str>) -> Completion {
+        let mut c = Completion::for_tests(text, stop_type);
+        c.usage = UsageInfo {
+            prompt_tokens: 5,
+            completion_tokens: 3,
+            total_tokens: 8,
+            ..Default::default()
+        };
+        c.cached_tokens = 2;
+        c.stop_sequence = stop_sequence.map(str::to_string);
+        c
+    }
+
+    fn request(value: Value) -> MessagesRequest {
+        serde_json::from_value(value).unwrap()
+    }
+
+    fn convert(value: Value) -> (Vec<ChatMessage>, Option<Vec<Tool>>, GenerationOptions) {
+        to_chat_request(
+            &request(value),
+            &crate::sampling::SamplingProfile::OpenAi.defaults(),
+        )
+        .unwrap()
+    }
 
     #[test]
     fn tool_use_and_tool_result_round_trip_through_chat_messages() {
@@ -504,8 +628,7 @@ mod tests {
                 ]}
             ]
         });
-        let request: MessagesRequest = serde_json::from_value(value).unwrap();
-        let (messages, tools, options) = to_chat_request(&request).unwrap();
+        let (messages, tools, options) = convert(value);
         assert_eq!(options.max_tokens, 8);
         assert_eq!(tools.unwrap()[0].function.name, "add");
         assert_eq!(messages[0].role, "system");
@@ -518,20 +641,74 @@ mod tests {
     }
 
     #[test]
+    fn neutral_defaults_and_thinking_settings() {
+        let (_, _, o) = convert(json!({
+            "model": "m", "max_tokens": 8,
+            "messages": [{"role": "user", "content": "hi"}],
+        }));
+        assert_eq!(
+            (o.temperature, o.top_p, o.top_k, o.min_p),
+            (1.0, 1.0, 0, 0.0)
+        );
+        assert_eq!(o.repetition_penalty, 1.0);
+        assert!(o.chat_template_kwargs.is_empty());
+        assert_eq!(o.reasoning_budget, None);
+
+        let (_, _, o) = convert(json!({
+            "model": "m", "max_tokens": 64,
+            "thinking": {"type": "enabled", "budget_tokens": 32},
+            "messages": [{"role": "user", "content": "hi"}],
+        }));
+        assert_eq!(o.reasoning_budget, Some(32));
+        assert_eq!(o.chat_template_kwargs["enable_thinking"], json!(true));
+
+        let (_, _, o) = convert(json!({
+            "model": "m", "max_tokens": 64,
+            "thinking": {"type": "disabled"},
+            "messages": [{"role": "user", "content": "hi"}],
+        }));
+        assert_eq!(o.chat_template_kwargs["enable_thinking"], json!(false));
+        assert_eq!(o.reasoning_budget, None);
+
+        let (_, _, o) = convert(json!({
+            "model": "m", "max_tokens": 64,
+            "thinking": {"type": "adaptive", "display": "summarized"},
+            "messages": [{"role": "user", "content": "hi"}],
+        }));
+        assert!(o.chat_template_kwargs.is_empty());
+    }
+
+    #[test]
+    fn earlier_thinking_blocks_become_reasoning_content() {
+        let (messages, _, _) = convert(json!({
+            "model": "m", "max_tokens": 8,
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "Greet back.", "signature": ""},
+                    {"type": "redacted_thinking", "data": "xyz"},
+                    {"type": "text", "text": "Hello!"}
+                ]},
+                {"role": "user", "content": "again"}
+            ]
+        }));
+        assert_eq!(messages[1].content, "Hello!");
+        assert_eq!(
+            messages[1].reasoning_content.as_deref(),
+            Some("Greet back.")
+        );
+    }
+
+    #[test]
     fn response_maps_tool_markup_to_tool_use_blocks() {
-        let usage = UsageInfo {
-            prompt_tokens: 5,
-            completion_tokens: 3,
-            total_tokens: 8,
-        };
+        let c = completion("", StopType::Eos, None);
         let (response, calls) = response(
             "msg_1".to_string(),
             "m".to_string(),
             "<tool_call>{\"name\":\"add\",\"arguments\":{\"a\":2,\"b\":2}}</tool_call>",
-            &usage,
-            true,
-            16,
             None,
+            &c,
+            true,
         );
         assert_eq!(calls.len(), 1);
         assert_eq!(response.stop_reason, "tool_use");
@@ -539,6 +716,32 @@ mod tests {
             &response.content[0],
             ResponseBlock::ToolUse { .. }
         ));
+    }
+
+    #[test]
+    fn response_puts_thinking_first_and_reports_cached_tokens() {
+        let c = completion("", StopType::Limit, None);
+        let (response, _) = response(
+            "msg_1".to_string(),
+            "m".to_string(),
+            "Hi.",
+            Some("The user greets me."),
+            &c,
+            false,
+        );
+        let value = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            value["content"],
+            json!([
+                {"type": "thinking", "thinking": "The user greets me.", "signature": ""},
+                {"type": "text", "text": "Hi."}
+            ])
+        );
+        assert_eq!(value["stop_reason"], "max_tokens");
+        assert_eq!(
+            value["usage"],
+            json!({"cache_read_input_tokens": 2, "input_tokens": 3, "output_tokens": 3})
+        );
     }
 
     #[test]
@@ -563,8 +766,7 @@ mod tests {
                 ]}
             ]
         });
-        let request: MessagesRequest = serde_json::from_value(value).unwrap();
-        let (messages, _, _) = to_chat_request(&request).unwrap();
+        let (messages, _, _) = convert(value);
         assert_eq!(messages[2].role, "tool");
         assert_eq!(messages[2].content, "captured");
         assert_eq!(
@@ -591,22 +793,26 @@ mod tests {
 
     #[test]
     fn response_reports_the_matched_stop_sequence() {
-        let usage = UsageInfo {
-            prompt_tokens: 5,
-            completion_tokens: 3,
-            total_tokens: 8,
-        };
+        let c = completion("", StopType::Word, Some("END"));
         let (response, calls) = response(
             "msg_1".to_string(),
             "m".to_string(),
             "hello ",
-            &usage,
+            None,
+            &c,
             false,
-            16,
-            Some("END"),
         );
         assert!(calls.is_empty());
         assert_eq!(response.stop_reason, "stop_sequence");
         assert_eq!(response.stop_sequence.as_deref(), Some("END"));
+    }
+
+    #[test]
+    fn stop_reasons_follow_the_stop_type() {
+        assert_eq!(stop_reason(StopType::Eos, false), "end_turn");
+        assert_eq!(stop_reason(StopType::Eos, true), "tool_use");
+        assert_eq!(stop_reason(StopType::Word, false), "stop_sequence");
+        assert_eq!(stop_reason(StopType::Limit, true), "max_tokens");
+        assert_eq!(stop_reason(StopType::Cancelled, false), "max_tokens");
     }
 }
