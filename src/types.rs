@@ -3,6 +3,14 @@
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// The current Unix time in seconds, as the `created` fields carry it.
+pub fn unix_time() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 // ─── Chat messages ───────────────────────────────────────────────────────────
 
 /// A single message in a chat conversation.
@@ -1371,10 +1379,7 @@ impl Timings {
 impl ChatCompletionResponse {
     /// Construct a new response with the current timestamp.
     pub fn new(id: String, model: String, choices: Vec<ChatChoice>, usage: UsageInfo) -> Self {
-        let created = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let created = unix_time();
         Self {
             id,
             object: "chat.completion".to_string(),
@@ -1463,10 +1468,7 @@ impl ChatCompletionChunk {
         delta: DeltaContent,
         finish_reason: Option<String>,
     ) -> Self {
-        let created = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let created = unix_time();
         Self {
             id,
             object: "chat.completion.chunk".to_string(),
@@ -1572,33 +1574,173 @@ pub struct EmbeddingData {
 
 // ─── Models list ─────────────────────────────────────────────────────────────
 
-/// OpenAI-compatible `GET /v1/models` response body.
-#[derive(Debug, Serialize)]
-pub struct ModelListResponse {
+/// OpenAI-compatible `GET /v1/models` response body.  A `joshua route`
+/// coordinator lists its workers' entries as they sent them
+/// (`serde_json::Value`), so fields it does not know pass through.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelListResponse<T = ModelCard> {
     /// Always `"list"`.
     pub object: String,
     /// Available models.
-    pub data: Vec<ModelInfo>,
+    pub data: Vec<T>,
 }
 
-/// Metadata for a single model.
-#[derive(Debug, Serialize)]
-pub struct ModelInfo {
+impl<T> ModelListResponse<T> {
+    /// The list holding `data`.
+    pub fn new(data: Vec<T>) -> Self {
+        Self {
+            object: "list".to_string(),
+            data,
+        }
+    }
+}
+
+/// One `/v1/models` entry, also returned by `GET /v1/models/{id}`:
+/// OpenAI's four fields, the limits a client needs to size a request
+/// (#260), vLLM's `ModelCard` fields, llama-server's `aliases`, `tags` and
+/// `meta`, and joshua's own facts under `joshua`.  Everything past OpenAI's
+/// fields is additive.  Built by [`crate::model_info::ModelInfo::card`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelCard {
     /// Model identifier.
     pub id: String,
     /// Always `"model"`.
+    #[serde(default)]
     pub object: String,
-    /// Unix timestamp of when the model was registered.
+    /// Unix timestamp of when the model was loaded (for a file that is not
+    /// loaded, when it was last modified).
+    #[serde(default)]
     pub created: u64,
     /// Always `"joshua"`.
+    #[serde(default)]
     pub owned_by: String,
-    /// Context window the server serves this model with, in tokens.
-    /// Omitted for entries that cannot report it (e.g. the Whisper model).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Most tokens, prompt and output together, one request may use: the
+    /// context window the model is loaded with (`--n-ctx`), which also caps
+    /// a request's `context_window` (`n_ctx`, `num_ctx`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_length: Option<u32>,
-    /// Largest value `max_tokens` may take for this model.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// The context the model was trained with (`<arch>.context_length`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_context_length: Option<u32>,
+    /// Largest value `max_tokens` may take for this model: the server's
+    /// `--max-output-tokens` ceiling.  Omitted for entries that cannot
+    /// report it (e.g. the Whisper model).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u32>,
+    /// vLLM: the model's file, or its id when it has none.
+    #[serde(default)]
+    pub root: Option<String>,
+    /// vLLM: the base model of an adapter; `null` for a base model.
+    #[serde(default)]
+    pub parent: Option<String>,
+    /// vLLM: the same as `context_length`.
+    #[serde(default)]
+    pub max_model_len: Option<u32>,
+    /// vLLM: one permissive permission record.
+    #[serde(default)]
+    pub permission: Vec<ModelPermission>,
+    /// llama-server: other names the model answers to.
+    #[serde(default)]
+    pub aliases: Vec<String>,
+    /// llama-server: informational tags.
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// llama-server: what the GGUF says about the model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<LlamaCppModelMeta>,
+    /// joshua's own facts: whether the model is loaded, and where it runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub joshua: Option<JoshuaModelExtras>,
+}
+
+/// vLLM's `ModelPermission`, with its defaults.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelPermission {
+    /// `modelperm-` and a random hex id.
+    pub id: String,
+    /// Always `"model_permission"`.
+    pub object: String,
+    pub created: u64,
+    pub allow_create_engine: bool,
+    pub allow_sampling: bool,
+    pub allow_logprobs: bool,
+    pub allow_search_indices: bool,
+    pub allow_view: bool,
+    pub allow_fine_tuning: bool,
+    pub organization: String,
+    pub group: Option<String>,
+    pub is_blocking: bool,
+}
+
+impl ModelPermission {
+    /// vLLM's default permission record, created at `created`.
+    pub fn new(created: u64) -> Self {
+        Self {
+            id: format!("modelperm-{}", uuid::Uuid::new_v4().simple()),
+            object: "model_permission".to_string(),
+            created,
+            allow_create_engine: false,
+            allow_sampling: true,
+            allow_logprobs: true,
+            allow_search_indices: false,
+            allow_view: true,
+            allow_fine_tuning: false,
+            organization: "*".to_string(),
+            group: None,
+            is_blocking: false,
+        }
+    }
+}
+
+/// llama-server's `meta` object.  Values the GGUF does not give are left
+/// out.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LlamaCppModelMeta {
+    /// llama.cpp's `llama_vocab_type` (1 SPM, 2 BPE, 3 WPM, 4 UGM, ...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vocab_type: Option<u32>,
+    /// Tokens in the vocabulary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub n_vocab: Option<u32>,
+    /// The context one request may use (`context_length`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub n_ctx: Option<u32>,
+    /// The context the model was trained with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub n_ctx_train: Option<u32>,
+    /// Embedding width.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub n_embd: Option<u32>,
+    /// Parameters across every tensor.
+    #[serde(default)]
+    pub n_params: u64,
+    /// Bytes of tensor data.
+    #[serde(default)]
+    pub size: u64,
+    /// llama.cpp's name for the file type (`"Q4_K - Medium"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ftype: Option<String>,
+}
+
+/// joshua's own facts about a `/v1/models` entry, under a key of their own
+/// so no upstream field is shadowed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JoshuaModelExtras {
+    /// Whether the model is loaded.  With `--model-dir`, the directory's
+    /// files are listed too; `POST /v1/models/load` loads one.
+    pub loaded: bool,
+    /// `general.architecture` (`"qwen3"`, `"deepseek2"`, ...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub architecture: Option<String>,
+    /// The quantization, as Ollama names it (`"Q4_K_M"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quantization: Option<String>,
+    /// The model file's size in bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_size: Option<u64>,
+    /// Where a loaded model runs.
+    #[serde(default, flatten, skip_serializing_if = "Option::is_none")]
+    pub placement: Option<crate::model_info::Placement>,
 }
 
 // ─── Error response ───────────────────────────────────────────────────────────
@@ -1645,6 +1787,22 @@ impl ErrorResponse {
     /// Create a `server_error` response.
     pub fn server_error(message: impl Into<String>) -> Self {
         Self::new(message, "server_error")
+    }
+
+    /// OpenAI's answer for a model it cannot serve, saying why in
+    /// `message`: `invalid_request_error`, `param: "model"`,
+    /// `code: "model_not_found"`.
+    pub fn model_not_found(message: impl Into<String>) -> Self {
+        let mut body = Self::invalid_request(message);
+        body.error.param = Some("model".to_string());
+        body.error.code = Some("model_not_found".to_string());
+        body
+    }
+
+    /// [`Self::model_not_found`] for an id that names no model, in OpenAI's
+    /// words.
+    pub fn unknown_model(id: &str) -> Self {
+        Self::model_not_found(format!("The model `{id}` does not exist."))
     }
 }
 
@@ -2211,20 +2369,18 @@ mod tests {
 mod model_info_tests {
     use super::*;
 
-    fn info(context: Option<u32>, output: Option<u32>) -> ModelInfo {
-        ModelInfo {
-            id: "Qwen3-14B-Q4_K_M".to_string(),
-            object: "model".to_string(),
-            created: 0,
-            owned_by: "joshua".to_string(),
-            context_length: context,
-            max_output_tokens: output,
-        }
+    use crate::model_info::{ModelInfo, ModelLimits};
+
+    fn info(limits: Option<ModelLimits>) -> ModelCard {
+        let mut info = ModelInfo::new("Qwen3-14B-Q4_K_M", 0);
+        info.limits = limits;
+        info.card()
     }
 
     #[test]
     fn model_entry_reports_context_and_output_limits() {
-        let value = serde_json::to_value(info(Some(16384), Some(4096))).unwrap();
+        let limits = ModelLimits::new(16384, None, 4096);
+        let value = serde_json::to_value(info(Some(limits))).unwrap();
         assert_eq!(value["context_length"], 16384);
         assert_eq!(value["max_output_tokens"], 4096);
         // Existing OpenAI fields must not move or disappear.
@@ -2234,7 +2390,7 @@ mod model_info_tests {
 
     #[test]
     fn model_entry_omits_limits_it_cannot_report() {
-        let value = serde_json::to_value(info(None, None)).unwrap();
+        let value = serde_json::to_value(info(None)).unwrap();
         assert!(value.get("context_length").is_none());
         assert!(value.get("max_output_tokens").is_none());
     }

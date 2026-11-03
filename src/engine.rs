@@ -260,7 +260,7 @@ pub enum ComputeBackend {
 /// [`Engine::with_n_ctx`] are convenience wrappers over the defaults.
 #[derive(Debug, Clone, Default)]
 pub struct EngineOptions {
-    /// Context-window size in tokens (0 selects the 4096 default).
+    /// Context-window size in tokens (0 selects [`DEFAULT_N_CTX`]).
     pub n_ctx: u32,
     /// Compute backend to run inference on.  See [`ComputeBackend`].
     pub backend: ComputeBackend,
@@ -612,6 +612,12 @@ impl EngineOptions {
         }
     }
 
+    /// The context window an engine built from these options gets (see
+    /// [`resolve_n_ctx`]).
+    pub fn resolved_n_ctx(&self) -> u32 {
+        resolve_n_ctx(self.n_ctx)
+    }
+
     /// Select the compute backend.  See [`ComputeBackend`].
     pub fn backend(mut self, backend: ComputeBackend) -> Self {
         self.backend = backend;
@@ -950,6 +956,9 @@ pub struct Engine {
     max_output_tokens: u32,
     /// Stem of the model file (used as the model identifier in API responses).
     model_name: String,
+    /// What the GGUF header says about the model (see
+    /// [`Engine::gguf_facts`]).
+    gguf_facts: crate::model_info::GgufFacts,
     /// Context-window size in tokens.
     n_ctx: u32,
     /// Routing-frequency hot-expert cache budget (see
@@ -1077,6 +1086,18 @@ const LOW_MEM_FLOOR: u64 = 1536 * 1024 * 1024; // 1.5 GiB
 /// prefill.
 pub const DEFAULT_PREFILL_CHUNK: usize = 512;
 
+/// Context window ([`EngineOptions::n_ctx`]) when none is given.
+pub const DEFAULT_N_CTX: u32 = 4096;
+
+/// The context window an `n_ctx` setting gives: `n_ctx`, or
+/// [`DEFAULT_N_CTX`] when it is 0.
+pub fn resolve_n_ctx(n_ctx: u32) -> u32 {
+    match n_ctx {
+        0 => DEFAULT_N_CTX,
+        n => n,
+    }
+}
+
 /// Default [`EngineOptions::prefix_cache_root_min`]: a shared prompt head of
 /// fewer tokens is not kept as a prefix-cache root.  Strata uses 2,048 on a
 /// GPU; a weak CPU box reads a prompt an order of magnitude slower, so a
@@ -1125,7 +1146,14 @@ const NPU_MAX_FAILURES: u32 = 3;
 
 /// Default ceiling on tokens generated per request (independent of the
 /// client-supplied `max_tokens`), bounding single-request CPU/time cost.
-const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 4096;
+pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 4096;
+
+/// The ceiling on tokens per request an engine gets from
+/// `--max-output-tokens`: the value (at least 1), or
+/// [`DEFAULT_MAX_OUTPUT_TOKENS`] without one.
+pub fn output_cap(max_output_tokens: Option<u32>) -> u32 {
+    max_output_tokens.map_or(DEFAULT_MAX_OUTPUT_TOKENS, |max| max.max(1))
+}
 
 /// Admission state for in-flight generations/embeddings.
 ///
@@ -2156,11 +2184,7 @@ impl Engine {
     /// Load a GGUF model with full [`EngineOptions`] (context size and the
     /// huge-page backing strategy).
     pub fn with_options(model_path: impl AsRef<Path>, options: EngineOptions) -> Result<Self> {
-        let n_ctx = if options.n_ctx == 0 {
-            4096
-        } else {
-            options.n_ctx
-        };
+        let n_ctx = options.resolved_n_ctx();
         let pin_hot_experts = options.pin_hot_experts;
         let expert_cache_auto = options.expert_cache_auto;
         let prefill_chunk = match options.prefill_chunk {
@@ -2265,6 +2289,7 @@ impl Engine {
             .len();
         raw.validate_layout(file_len)
             .map_err(|e| JoshuaError::ModelLoad(format!("GGUF layout check failed: {e}")))?;
+        let gguf_facts = crate::model_info::GgufFacts::from_header(&raw, file_len);
 
         // Prefetch and/or lock the always-touched weights, and advise random
         // access on routed experts, when requested.
@@ -2953,8 +2978,9 @@ impl Engine {
             } else {
                 options.admission_queue_depth
             },
-            max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
+            max_output_tokens: output_cap(None),
             model_name,
+            gguf_facts,
             n_ctx,
             pin_hot_experts,
             expert_cache_auto,
@@ -3024,9 +3050,10 @@ impl Engine {
     }
 
     /// Set the hard ceiling on tokens generated per request, applied on top
-    /// of the client-supplied `max_tokens`.  Values below 1 are treated as 1.
+    /// of the client-supplied `max_tokens`.  Values below 1 are treated as 1
+    /// (see [`output_cap`]).
     pub fn with_max_output_tokens(mut self, max: u32) -> Self {
-        self.max_output_tokens = max.max(1);
+        self.max_output_tokens = output_cap(Some(max));
         self
     }
 
@@ -3431,9 +3458,25 @@ impl Engine {
         self.n_ctx
     }
 
-    /// Upper bound on generated tokens per request (`--max-output-tokens`).
+    /// The ceiling on tokens one request generates (see
+    /// [`Engine::with_max_output_tokens`]).
     pub fn max_output_tokens(&self) -> u32 {
         self.max_output_tokens
+    }
+
+    /// What the model's GGUF header says about it, read once at load.
+    pub fn gguf_facts(&self) -> &crate::model_info::GgufFacts {
+        &self.gguf_facts
+    }
+
+    /// The context a request may use, the context the model was trained
+    /// with and the output cap, as `/v1/models` reports them.
+    pub fn limits(&self) -> crate::model_info::ModelLimits {
+        crate::model_info::ModelLimits::new(
+            self.n_ctx,
+            self.gguf_facts.n_ctx_train,
+            self.max_output_tokens,
+        )
     }
 
     /// Tokenize `text` with the model's tokenizer.  `add_special_tokens`

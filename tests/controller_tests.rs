@@ -128,8 +128,11 @@ async fn a_server_without_a_model_loads_and_unloads_through_the_api() {
     // Responses name the model by the id it was loaded under.
     assert_eq!(body["model"], "second");
     // With two models loaded, a request must name one of them.
-    let (status, _) = call(&app, "POST", "/v1/completions", completion("other")).await;
+    let (status, body) = call(&app, "POST", "/v1/completions", completion("other")).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"]["type"], "invalid_request_error", "{body}");
+    assert_eq!(body["error"]["param"], "model", "{body}");
+    assert_eq!(body["error"]["code"], "model_not_found", "{body}");
 
     let (status, _) = call(
         &app,
@@ -139,7 +142,7 @@ async fn a_server_without_a_model_loads_and_unloads_through_the_api() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    let (status, _) = call(
+    let (status, body) = call(
         &app,
         "POST",
         "/v1/models/unload",
@@ -147,8 +150,469 @@ async fn a_server_without_a_model_loads_and_unloads_through_the_api() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"]["code"], "model_not_found", "{body}");
+    let listed = |body: serde_json::Value| -> Vec<serde_json::Value> {
+        body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| serde_json::json!([m["id"], m["joshua"]["loaded"]]))
+            .collect()
+    };
+    // `second` stays loaded from `tiny.gguf`, so the file is not listed
+    // again; once nothing serves it, it is, as a file to load.
     let (_, body) = call(&app, "GET", "/v1/models", serde_json::Value::Null).await;
-    assert_eq!(body["data"].as_array().unwrap().len(), 1);
+    assert_eq!(listed(body), [serde_json::json!(["second", true])]);
+    let (status, _) = call(
+        &app,
+        "POST",
+        "/v1/models/unload",
+        serde_json::json!({"id": "second"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, body) = call(&app, "GET", "/v1/models", serde_json::Value::Null).await;
+    assert_eq!(listed(body), [serde_json::json!(["tiny", false])]);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn the_model_directory_lists_unloaded_files_from_their_headers() {
+    let dir = common::model_dir("controller-cards");
+    common::write_tiny_llama_gguf(&dir.join("tiny.gguf"));
+    std::fs::create_dir_all(dir.join("sub")).unwrap();
+    common::write_tiny_gguf(&dir.join("sub").join("other.gguf"), "qwen3");
+    let mut manager = manager(&dir);
+    manager.max_output_tokens = Some(16);
+    let app = create_router(state(ModelRegistry::default(), Some(manager)));
+
+    // Nothing is loaded: both files are listed from their headers, with the
+    // limits a load with the server's flags (n_ctx 64, max output 16) gives.
+    let (status, body) = call(&app, "GET", "/v1/models", serde_json::Value::Null).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let cards = body["data"].as_array().unwrap();
+    let ids: Vec<_> = cards.iter().map(|m| m["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, ["other", "tiny"]);
+    for card in cards {
+        assert_eq!(card["joshua"]["loaded"], false, "{card}");
+        assert_eq!(card["context_length"], 64, "{card}");
+        assert_eq!(card["max_model_len"], 64, "{card}");
+        assert_eq!(card["max_context_length"], 512, "{card}");
+        assert_eq!(card["max_output_tokens"], 16, "{card}");
+        assert_eq!(card["meta"]["n_ctx_train"], 512, "{card}");
+        assert_eq!(card["meta"]["n_vocab"], 16, "{card}");
+        assert!(
+            card["joshua"].get("backend").is_none(),
+            "not placed yet: {card}"
+        );
+        assert!(card["joshua"]["file_size"].as_u64().unwrap() > 0);
+    }
+    assert_eq!(cards[0]["joshua"]["architecture"], "qwen3");
+    assert!(cards[0]["root"].as_str().unwrap().ends_with("other.gguf"));
+    let (status, other) = call(&app, "GET", "/v1/models/other", serde_json::Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(other["joshua"]["loaded"], false);
+
+    // Loading one turns its entry into the loaded model's; the other file
+    // stays listed.  The load's answer is the same card.
+    let (status, loaded) = call(
+        &app,
+        "POST",
+        "/v1/models/load",
+        serde_json::json!({"model": "tiny.gguf"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{loaded}");
+    assert_eq!(loaded["context_length"], 64);
+    assert_eq!(loaded["joshua"]["loaded"], true);
+    assert_eq!(loaded["workers"], serde_json::json!([]));
+    let (_, body) = call(&app, "GET", "/v1/models", serde_json::Value::Null).await;
+    let cards = body["data"].as_array().unwrap();
+    assert_eq!(cards[0]["id"], "tiny");
+    assert_eq!(cards[0]["joshua"]["loaded"], true);
+    assert_eq!(cards[0]["joshua"]["backend"], "cpu");
+    assert_eq!(cards[0]["max_output_tokens"], 16);
+    assert_eq!(cards[1]["id"], "other");
+    assert_eq!(cards[1]["joshua"]["loaded"], false);
+
+    // The one model loaded still answers a name the list does not have,
+    // but not one it gives a file that is not loaded: that is a 404, on
+    // every API, rather than an answer from another model.
+    let (status, body) = call(&app, "POST", "/v1/completions", completion("gpt-4o")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["model"], "tiny");
+    let messages = serde_json::json!([{"role": "user", "content": "hi"}]);
+    for (uri, request) in [
+        ("/v1/completions", completion("other")),
+        (
+            "/v1/chat/completions",
+            serde_json::json!({"model": "other", "messages": messages, "max_tokens": 2}),
+        ),
+        (
+            "/v1/messages",
+            serde_json::json!({"model": "other", "messages": messages, "max_tokens": 2}),
+        ),
+        (
+            "/api/chat",
+            serde_json::json!({"model": "other", "messages": messages, "stream": false}),
+        ),
+    ] {
+        let (status, body) = call(&app, "POST", uri, request).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}: {body}");
+        assert_eq!(body["error"]["code"], "model_not_found", "{uri}: {body}");
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(message.contains("POST /v1/models/load"), "{uri}: {message}");
+    }
+
+    // Ollama's /api/tags lists the same inventory, now with each file's size
+    // and family; /api/ps only what is loaded.
+    let (_, tags) = call(&app, "GET", "/api/tags", serde_json::Value::Null).await;
+    let names: Vec<_> = tags["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["name"].clone())
+        .collect();
+    assert_eq!(names, ["tiny:latest", "other:latest"]);
+    assert_eq!(tags["models"][0]["details"]["family"], "llama");
+    assert_eq!(tags["models"][0]["size"], cards[0]["joshua"]["file_size"]);
+    assert_eq!(tags["models"][1]["details"]["family"], "qwen3");
+    let (_, ps) = call(&app, "GET", "/api/ps", serde_json::Value::Null).await;
+    assert_eq!(ps["models"].as_array().unwrap().len(), 1);
+    assert_eq!(ps["models"][0]["name"], "tiny:latest");
+
+    // The id the list gives the file in the subdirectory loads it.
+    std::fs::copy(dir.join("tokenizer.json"), dir.join("sub/tokenizer.json")).unwrap();
+    let (status, loaded) = call(
+        &app,
+        "POST",
+        "/v1/models/load",
+        serde_json::json!({"model": "other"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{loaded}");
+    assert_eq!(loaded["id"], "other");
+    assert!(loaded["root"].as_str().unwrap().ends_with("other.gguf"));
+    let (_, body) = call(&app, "GET", "/v1/models", serde_json::Value::Null).await;
+    let loaded: Vec<_> = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| serde_json::json!([m["id"], m["joshua"]["loaded"]]))
+        .collect();
+    assert_eq!(
+        loaded,
+        [
+            serde_json::json!(["tiny", true]),
+            serde_json::json!(["other", true])
+        ]
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn each_model_file_is_listed_once_under_an_id_a_load_takes() {
+    use candle_core::quantized::gguf_file::Value;
+
+    let dir = common::model_dir("controller-inventory");
+    for sub in ["a", "b"] {
+        std::fs::create_dir_all(dir.join(sub)).unwrap();
+        common::write_tiny_llama_gguf(&dir.join(sub).join("model.gguf"));
+        std::fs::copy(
+            dir.join("tokenizer.json"),
+            dir.join(sub).join("tokenizer.json"),
+        )
+        .unwrap();
+    }
+    common::write_tiny_llama_gguf(&dir.join("solo.gguf"));
+    // Files that are not models on their own.
+    for (name, kind) in [("lora.gguf", "adapter"), ("mmproj.gguf", "mmproj")] {
+        let kind = [("general.type".to_string(), Value::String(kind.to_string()))];
+        common::write_tiny_gguf_with(&dir.join(name), "llama", &kind);
+    }
+    // A link leading out of the directory, which a load refuses, and a
+    // second link to a file in it.
+    #[cfg(unix)]
+    let outside = {
+        let outside = common::model_dir("controller-inventory-outside");
+        common::write_tiny_llama_gguf(&outside.join("far.gguf"));
+        std::os::unix::fs::symlink(outside.join("far.gguf"), dir.join("far.gguf")).unwrap();
+        std::os::unix::fs::symlink(dir.join("a/model.gguf"), dir.join("same.gguf")).unwrap();
+        outside
+    };
+    let app = create_router(state(ModelRegistry::default(), Some(manager(&dir))));
+    let ids = |body: &serde_json::Value| -> Vec<serde_json::Value> {
+        body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| serde_json::json!([m["id"], m["joshua"]["loaded"]]))
+            .collect()
+    };
+
+    // Both `model.gguf`s are listed, each under its path since they share
+    // a stem; a file with a stem of its own goes by the stem.
+    let (_, body) = call(&app, "GET", "/v1/models", serde_json::Value::Null).await;
+    assert_eq!(
+        ids(&body),
+        [
+            serde_json::json!(["a/model.gguf", false]),
+            serde_json::json!(["b/model.gguf", false]),
+            serde_json::json!(["solo", false]),
+        ]
+    );
+    assert!(body["data"][0]["root"]
+        .as_str()
+        .unwrap()
+        .ends_with("a/model.gguf"));
+    let (status, card) = call(
+        &app,
+        "GET",
+        "/v1/models/b/model.gguf",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{card}");
+    assert!(card["root"].as_str().unwrap().ends_with("b/model.gguf"));
+
+    // A load without an `id` serves the model under the id it was listed
+    // by, and the other file keeps its own.
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/v1/models/load",
+        serde_json::json!({"model": "b/model.gguf"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["id"], "b/model.gguf");
+    assert!(body["root"].as_str().unwrap().ends_with("b/model.gguf"));
+    let (_, body) = call(&app, "GET", "/v1/models", serde_json::Value::Null).await;
+    assert_eq!(
+        ids(&body),
+        [
+            serde_json::json!(["b/model.gguf", true]),
+            serde_json::json!(["a/model.gguf", false]),
+            serde_json::json!(["solo", false]),
+        ]
+    );
+    let (status, body) = call(&app, "POST", "/v1/completions", completion("a/model.gguf")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    let (status, body) = call(&app, "POST", "/v1/completions", completion("b/model.gguf")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["model"], "b/model.gguf");
+
+    // A model loaded under a file's stem as its id: that file is listed by
+    // its path, so no two entries share an id.
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/v1/models/load",
+        serde_json::json!({"model": "a/model.gguf", "id": "solo"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, body) = call(&app, "GET", "/v1/models", serde_json::Value::Null).await;
+    assert_eq!(
+        ids(&body),
+        [
+            serde_json::json!(["b/model.gguf", true]),
+            serde_json::json!(["solo", true]),
+            serde_json::json!(["solo.gguf", false]),
+        ]
+    );
+    assert!(body["data"][1]["root"]
+        .as_str()
+        .unwrap()
+        .ends_with("a/model.gguf"));
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/v1/models/unload",
+        serde_json::json!({"id": "solo"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, body) = call(&app, "GET", "/v1/models", serde_json::Value::Null).await;
+    assert_eq!(
+        ids(&body),
+        [
+            serde_json::json!(["b/model.gguf", true]),
+            serde_json::json!(["a/model.gguf", false]),
+            serde_json::json!(["solo", false]),
+        ]
+    );
+
+    // Paths the list leaves out (an adapter, a link leading out of the
+    // directory) are free to take as ids.
+    let mut unlisted = vec!["lora.gguf"];
+    if cfg!(unix) {
+        unlisted.push("far.gguf");
+    }
+    for id in unlisted {
+        let load = serde_json::json!({"model": "solo.gguf", "id": id});
+        let (status, body) = call(&app, "POST", "/v1/models/load", load).await;
+        assert_eq!(status, StatusCode::OK, "{id}: {body}");
+        let unload = serde_json::json!({"id": id});
+        let (status, body) = call(&app, "POST", "/v1/models/unload", unload).await;
+        assert_eq!(status, StatusCode::OK, "{id}: {body}");
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+    #[cfg(unix)]
+    std::fs::remove_dir_all(outside).unwrap();
+}
+
+/// A file's path is its id once its stem is shared, so a load cannot take
+/// another file's path as its id, and a file whose path a loaded model
+/// already has (it appeared after the load) is not listed beside it: every
+/// listed id answers for its own entry.
+#[tokio::test]
+async fn no_two_listed_models_share_an_id() {
+    let dir = common::model_dir("controller-path-ids");
+    for sub in ["a", "b"] {
+        std::fs::create_dir_all(dir.join(sub)).unwrap();
+        common::write_tiny_llama_gguf(&dir.join(sub).join("model.gguf"));
+        std::fs::copy(
+            dir.join("tokenizer.json"),
+            dir.join(sub).join("tokenizer.json"),
+        )
+        .unwrap();
+    }
+    let app = create_router(state(ModelRegistry::default(), Some(manager(&dir))));
+    let ids = |body: &serde_json::Value| -> Vec<serde_json::Value> {
+        body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| serde_json::json!([m["id"], m["joshua"]["loaded"]]))
+            .collect()
+    };
+    let load = |model: &str, id: &str| serde_json::json!({"model": model, "id": id});
+
+    // `a/model.gguf` is the other file's id: refused, nothing loaded.
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/v1/models/load",
+        load("b/model.gguf", "a/model.gguf"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["type"], "model_exists");
+    let (_, body) = call(&app, "GET", "/v1/models", serde_json::Value::Null).await;
+    assert_eq!(
+        ids(&body),
+        [
+            serde_json::json!(["a/model.gguf", false]),
+            serde_json::json!(["b/model.gguf", false]),
+        ]
+    );
+
+    // A path no file has yet is free; a file copied there afterwards is not
+    // listed under the loaded model's id until that model is unloaded.
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/v1/models/load",
+        load("b/model.gguf", "c/model.gguf"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    std::fs::create_dir_all(dir.join("c")).unwrap();
+    common::write_tiny_llama_gguf(&dir.join("c").join("model.gguf"));
+    let (_, body) = call(&app, "GET", "/v1/models", serde_json::Value::Null).await;
+    assert_eq!(
+        ids(&body),
+        [
+            serde_json::json!(["c/model.gguf", true]),
+            serde_json::json!(["a/model.gguf", false]),
+        ]
+    );
+    assert!(body["data"][0]["root"]
+        .as_str()
+        .unwrap()
+        .ends_with("b/model.gguf"));
+    let (status, body) = call(&app, "POST", "/v1/completions", completion("c/model.gguf")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["model"], "c/model.gguf");
+    let (status, body) = call(&app, "POST", "/v1/completions", completion("a/model.gguf")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/v1/models/unload",
+        serde_json::json!({"id": "c/model.gguf"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, body) = call(&app, "GET", "/v1/models", serde_json::Value::Null).await;
+    assert_eq!(
+        ids(&body),
+        [
+            serde_json::json!(["a/model.gguf", false]),
+            serde_json::json!(["b/model.gguf", false]),
+            serde_json::json!(["c/model.gguf", false]),
+        ]
+    );
+
+    // A loaded file's path is refused as another load's id too, so the
+    // file is listed under it again once it is unloaded.
+    let (status, body) = call(&app, "POST", "/v1/models/load", load("b/model.gguf", "bee")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/v1/models/load",
+        load("a/model.gguf", "b/model.gguf"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A request's model name is checked against the model directory's ids
+/// without reading a file there: a FIFO named like a GGUF, whose header
+/// read would block until someone writes to it, holds nothing up.
+#[cfg(unix)]
+#[test]
+fn a_model_name_is_checked_without_reading_a_header() {
+    use axum::response::IntoResponse;
+
+    let dir = common::model_dir("controller-resolve");
+    let path = dir.join("tiny.gguf");
+    common::write_tiny_llama_gguf(&path);
+    let fifo = std::process::Command::new("mkfifo")
+        .arg(dir.join("pending.gguf"))
+        .status()
+        .unwrap();
+    assert!(fifo.success());
+    let engine = joshua::Engine::with_options(&path, EngineOptions::with_n_ctx(64)).unwrap();
+    let state = state(
+        ModelRegistry::with_model(Arc::new(engine)),
+        Some(manager(&dir)),
+    );
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn({
+        let state = Arc::clone(&state);
+        move || {
+            let resolve = |name: &str| {
+                state
+                    .resolve(name)
+                    .map(|(id, _)| id)
+                    .map_err(|e| e.into_response().status())
+            };
+            let _ = tx.send((resolve("gpt-4o"), resolve("pending"), resolve("tiny")));
+        }
+    });
+    let (other, pending, tiny) = rx
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("resolving a model name opened a file in the model directory");
+    // The one model loaded answers a name no file has; a file's id is a
+    // 404 even though its header was never read.
+    assert_eq!(other, Ok("tiny".to_string()));
+    assert_eq!(pending, Err(StatusCode::NOT_FOUND));
+    assert_eq!(tiny, Ok("tiny".to_string()));
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -277,20 +741,36 @@ async fn controller_places_a_model_on_model_less_workers_and_unloads_it() {
     let mut manager = manager(&dir);
     manager.workers = workers.clone();
     manager.cluster_key = Some(KEY.to_vec());
-    // The controller samples, so the server's sampling flags reach it.
+    // The controller samples, so the server's sampling flags reach it.  Its
+    // --n-ctx is past the context the model was trained with (512).
     manager.engine_options = Arc::new(|_: &std::path::Path| {
-        EngineOptions::with_n_ctx(64).sampling(joshua::SamplingOverrides {
+        EngineOptions::with_n_ctx(1024).sampling(joshua::SamplingOverrides {
             temperature: Some(0.25),
             ..Default::default()
         })
     });
     let app = create_router(state(ModelRegistry::default(), Some(manager)));
 
+    // Not loaded yet, the file is listed with the context a load onto the
+    // workers gives it: the trained context, not the larger --n-ctx.
+    let (status, body) = call(&app, "GET", "/v1/models", serde_json::Value::Null).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let listed = &body["data"][0];
+    assert_eq!(listed["id"], "qwen", "{body}");
+    assert_eq!(listed["joshua"]["loaded"], false, "{body}");
+    assert_eq!(listed["context_length"], 512, "{body}");
+    assert_eq!(listed["max_model_len"], 512, "{body}");
+
     for round in 0..2 {
-        let request = if round == 0 {
-            serde_json::json!({"model": "qwen.gguf", "n_ctx": 64, "chunk": 16, "sessions": 4})
+        // The second round names no context and gets the one listed.
+        let (request, context) = if round == 0 {
+            let request = serde_json::json!({
+                "model": "qwen.gguf", "n_ctx": 64, "chunk": 16, "sessions": 4,
+            });
+            (request, serde_json::json!(64))
         } else {
-            serde_json::json!({"model": "qwen.gguf", "n_ctx": 64, "ends": [2, 3]})
+            let request = serde_json::json!({"model": "qwen.gguf", "ends": [2, 3]});
+            (request, listed["context_length"].clone())
         };
         let (status, body) = call(&app, "POST", "/v1/models/load", request).await;
         assert_eq!(status, StatusCode::OK, "{body}");
@@ -298,6 +778,12 @@ async fn controller_places_a_model_on_model_less_workers_and_unloads_it() {
         if round == 1 {
             assert_eq!(body["stages"], serde_json::json!([[0, 2], [2, 3]]));
         }
+        // The answer is the model's /v1/models entry, which says it runs on
+        // the workers.
+        assert_eq!(body["context_length"], context);
+        assert_eq!(body["joshua"]["remote"], true);
+        assert_eq!(body["joshua"]["workers"], body["workers"]);
+        assert_eq!(body["joshua"]["stages"], body["stages"]);
         let (status, props) = call(&app, "GET", "/props", serde_json::Value::Null).await;
         assert_eq!(status, StatusCode::OK, "{props}");
         assert_eq!(props["default_generation_settings"]["temperature"], 0.25);

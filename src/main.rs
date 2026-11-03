@@ -311,8 +311,8 @@ enum Commands {
         #[arg(short, long, env = "JOSHUA_MODEL_PATH", required_unless_present = "model_dir")]
         model: Option<PathBuf>,
         /// Enable POST /v1/models/load and /v1/models/unload for models in
-        /// this directory.  Protect the API with --api-key when it is not
-        /// bound to localhost.
+        /// this directory, which GET /v1/models also lists.  Protect the API
+        /// with --api-key when it is not bound to localhost.
         #[arg(long, env = "JOSHUA_MODEL_DIR")]
         model_dir: Option<PathBuf>,
         /// Model-less workers (`joshua worker`) this controller may place

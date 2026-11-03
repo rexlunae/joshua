@@ -77,6 +77,8 @@ struct Fake {
     max_concurrency: usize,
     n_ctx: AtomicUsize,
     models: Mutex<Vec<ModelSlots>>,
+    /// The `/v1/models` entries `/v1/worker/info` reports.
+    cards: Mutex<Vec<Value>>,
     behavior: Mutex<Behavior>,
     /// Requests received on the routed endpoints.
     received: AtomicUsize,
@@ -120,6 +122,7 @@ async fn fake_info(State(f): State<Arc<Fake>>) -> Json<WorkerInfo> {
         transcription_in_flight: f.audio_active.load(Ordering::SeqCst)
             + f.external_audio.load(Ordering::SeqCst),
         embedding_jobs: f.embedding_jobs.lock().unwrap().clone(),
+        cards: f.cards.lock().unwrap().clone(),
         protocol_version: WORKER_PROTOCOL_VERSION,
         cache_residency: f
             .residency
@@ -382,6 +385,7 @@ async fn spawn_fake_handle(
         max_concurrency,
         n_ctx: AtomicUsize::new(4096),
         models: Mutex::new(Vec::new()),
+        cards: Mutex::new(Vec::new()),
         behavior: Mutex::new(behavior),
         received: AtomicUsize::new(0),
         active: AtomicUsize::new(0),
@@ -1162,6 +1166,8 @@ async fn routes_by_model_and_forwards_the_request_unchanged() {
     assert_eq!(res.status, StatusCode::NOT_FOUND);
     let err = res.json();
     assert_eq!(err["error"]["code"], "model_not_found");
+    assert_eq!(err["error"]["param"], "model");
+    assert_eq!(err["error"]["type"], "invalid_request_error");
     let msg = err["error"]["message"].as_str().unwrap();
     assert!(msg.contains("alpha") && msg.contains("beta"), "{msg}");
 
@@ -1174,6 +1180,10 @@ async fn routes_by_model_and_forwards_the_request_unchanged() {
         .map(|m| m["id"].as_str().unwrap())
         .collect();
     assert_eq!(ids, ["alpha", "beta"]);
+    // These workers send no cards: each entry names just the model.
+    assert_eq!(models["data"][0]["object"], "model");
+    assert_eq!(models["data"][0]["owned_by"], "joshua");
+    assert!(models["data"][0].get("context_length").is_none());
 
     // Malformed JSON is rejected at the router.
     let res = call(&router, "POST", "/v1/chat/completions", "{nope").await;
@@ -1862,6 +1872,104 @@ async fn routed_greedy_output_matches_the_worker_directly() {
     assert_eq!(direct.1.last(), Some(&json!("[DONE]")));
 }
 
+/// The router's model list is its workers' own `/v1/models` entries: the
+/// limits, vLLM and llama.cpp fields and placement pass through unchanged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn routed_model_list_passes_the_workers_cards_through() {
+    let worker = spawn_real_worker("route-model-cards", None).await;
+    let (_, router) = spawn_router(config(&[&worker])).await;
+    // vLLM's permission record is minted per response.
+    let comparable_card = |mut card: Value| {
+        card.as_object_mut().unwrap().remove("permission");
+        card
+    };
+
+    let direct = call(&worker, "GET", "/v1/models", "").await.json();
+    let routed = call(&router, "GET", "/v1/models", "").await;
+    assert_eq!(routed.status, StatusCode::OK);
+    let routed = routed.json();
+    assert_eq!(routed["object"], "list");
+    let card = routed["data"][0].clone();
+    assert_eq!(
+        comparable_card(card.clone()),
+        comparable_card(direct["data"][0].clone())
+    );
+    assert_eq!(card["context_length"], 64);
+    assert_eq!(card["max_context_length"], 512);
+    assert_eq!(card["meta"]["n_ctx_train"], 512);
+    assert_eq!(card["joshua"]["backend"], "cpu");
+    assert_eq!(card["permission"][0]["object"], "model_permission");
+
+    // `/models` and `/v1/models/{id}` answer from the same cards.
+    let id = card["id"].as_str().unwrap();
+    let models = call(&router, "GET", "/models", "").await.json();
+    assert_eq!(
+        comparable_card(models["data"][0].clone()),
+        comparable_card(card.clone())
+    );
+    let one = call(&router, "GET", &format!("/v1/models/{id}"), "").await;
+    assert_eq!(one.status, StatusCode::OK);
+    assert_eq!(comparable_card(one.json()), comparable_card(card.clone()));
+    let missing = call(&router, "GET", "/v1/models/nope", "").await;
+    assert_eq!(missing.status, StatusCode::NOT_FOUND);
+    let err = missing.json();
+    assert_eq!(err["error"]["code"], "model_not_found");
+    assert_eq!(err["error"]["param"], "model");
+    assert_eq!(err["error"]["type"], "invalid_request_error");
+}
+
+/// The router lists a worker's entries as the worker sent them: fields it
+/// does not know (a newer worker's) pass through, and an entry it could not
+/// read as its own card does not take the worker out of routing.
+#[tokio::test]
+async fn routed_model_entries_pass_through_as_the_worker_sent_them() {
+    let (worker, url) = spawn_fake("a", "alpha", 4, Behavior::Echo).await;
+    let card = json!({
+        "id": "alpha", "object": "model", "created": 1, "owned_by": "joshua",
+        "status": {"value": "loaded"},
+        "permission": "not a list",
+        "joshua": {"loaded": "yes", "future": [1, 2]},
+    });
+    *worker.cards.lock().unwrap() = vec![card.clone()];
+    let (_, router) = spawn_router(config(&[&url])).await;
+
+    let models = call(&router, "GET", "/v1/models", "").await.json();
+    assert_eq!(models["data"], json!([card]));
+    let one = call(&router, "GET", "/v1/models/alpha", "").await;
+    assert_eq!(one.status, StatusCode::OK);
+    assert_eq!(one.json(), card);
+    let res = chat(&router, json!({"model": "alpha", "messages": []})).await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.json()["worker"], "a");
+}
+
+/// The router lists every entry its workers send, by id: a worker serving
+/// a chat model and Whisper has both listed, as its own `/v1/models` does,
+/// and a worker that predates entries has its model listed by id.
+#[tokio::test]
+async fn routed_model_list_is_the_union_of_the_workers_entries() {
+    let (mixed, mixed_url) = spawn_fake("a", "alpha", 4, Behavior::Echo).await;
+    mixed.transcriptions.store(true, Ordering::SeqCst);
+    let card = |id: &str| {
+        json!({"id": id, "object": "model", "created": 1, "owned_by": "joshua",
+               "joshua": {"loaded": true, "backend": "cpu"}})
+    };
+    *mixed.cards.lock().unwrap() = vec![card("whisper-base"), card("alpha")];
+    let (_older, older_url) = spawn_fake("b", "beta", 4, Behavior::Echo).await;
+    let (_, router) = spawn_router(config(&[&mixed_url, &older_url])).await;
+
+    let models = call(&router, "GET", "/v1/models", "").await.json();
+    let data = models["data"].as_array().unwrap();
+    let ids: Vec<_> = data.iter().map(|m| m["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, ["alpha", "beta", "whisper-base"]);
+    assert_eq!(data[0], card("alpha"));
+    assert_eq!(data[2], card("whisper-base"));
+    assert_eq!(data[1]["joshua"], json!({"loaded": true}));
+    let one = call(&router, "GET", "/v1/models/whisper-base", "").await;
+    assert_eq!(one.status, StatusCode::OK);
+    assert_eq!(one.json(), card("whisper-base"));
+}
+
 /// A generation whose cancel flag is already set stops before decoding and
 /// leaves the engine fully usable: the next request matches a fresh engine.
 #[test]
@@ -1903,6 +2011,7 @@ async fn spawn_two_model_worker() -> (Arc<(AtomicUsize, Notify)>, String) {
             transcription_job: None,
             transcription_in_flight: 0,
             embedding_jobs: Vec::new(),
+            cards: Vec::new(),
             protocol_version: WORKER_PROTOCOL_VERSION,
             cache_residency: Default::default(),
             cache_epochs: Default::default(),
