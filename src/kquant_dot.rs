@@ -1776,7 +1776,8 @@ mod tests {
             (GgmlDType::Q2K, simd),
             (GgmlDType::Q4K, simd),
             (GgmlDType::Q6K, matches!(level, SimdLevel::Avx2 | SimdLevel::Avx512)),
-            (GgmlDType::Q5K, level == SimdLevel::Avx2),
+            // Q5_K has fused kernels on AVX2 and NEON, not AVX-512.
+            (GgmlDType::Q5K, matches!(level, SimdLevel::Avx2 | SimdLevel::Neon)),
         ] {
             let block_bytes = quantized_block_bytes(8, 256, dtype);
             let lhs: Vec<f32> = (0..2 * 256).map(|i| (i as f32) * 0.01 - 1.0).collect();
