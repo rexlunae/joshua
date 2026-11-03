@@ -327,6 +327,36 @@ pub fn tensor_bytes(t: &Tensor) -> u64 {
 /// `q · k_cacheᵀ` reads the cached keys through a transposed view and the
 /// context step reads the cached values in place (`probs · v` on the CPU,
 /// `vᵀ · probsᵀ` on accelerators), strides the gemm backends take
+/// A causal mask sized for the attention actually being computed.
+///
+/// Callers build the mask from their own notion of position, which can disagree with the KV cache
+/// the layer holds: a pooled or rewound session keeps more context than the caller is prefilling.
+/// A mask of the wrong width cannot be broadcast onto the scores, so rebuild it from the real
+/// cache length instead of failing the whole turn (issue #264).
+fn mask_for(
+    mask: Option<&Tensor>,
+    seq_len: usize,
+    seq_total: usize,
+    device: &Device,
+) -> Result<Option<Tensor>> {
+    let Some(m) = mask else { return Ok(None) };
+    let matches = m
+        .dims4()
+        .map(|(_, _, s, w)| s == seq_len && w == seq_total)
+        .unwrap_or(false);
+    if matches {
+        return Ok(Some(m.clone()));
+    }
+    let past = seq_total.saturating_sub(seq_len);
+    tracing::warn!(
+        mask_width = m.dim(3).unwrap_or(0),
+        seq_len,
+        seq_total,
+        "attention mask does not match the KV cache; rebuilding the causal mask"
+    );
+    Ok(Some(crate::moe::causal_mask(seq_len, past, device)?))
+}
+
 /// directly.  Grouped query heads are folded into the row dimension of their
 /// KV head instead of repeating K/V per query head.
 pub fn cached_attention(
@@ -357,8 +387,9 @@ pub fn cached_attention(
     // Scaled dot-product attention over the whole cached context.
     let q = q.contiguous()?.reshape((b, n_kv, rep * seq_len, dk))?;
     let scores = (q.matmul(&k_cache)? * softmax_scale)?.reshape((b, n_head, seq_len, seq_total))?;
-    let scores = match mask {
-        Some(m) => scores.broadcast_add(m)?,
+    let device = scores.device().clone();
+    let scores = match mask_for(mask, seq_len, seq_total, &device)? {
+        Some(m) => scores.broadcast_add(&m)?,
         None => scores,
     };
     crate::activation_trace::record("attn-scores", &scores)?;
@@ -590,6 +621,38 @@ fn copy_rows_runs<S: BackendStorage>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_mask_that_does_not_match_the_cache_is_rebuilt() -> Result<()> {
+        let dev = Device::Cpu;
+        let (seq_len, seq_total) = (4usize, 10usize);
+
+        // What a rewound/pooled session hands over: a mask for 6 positions while the cache
+        // holds 10.  Adding it to the scores used to fail the whole turn (issue #264).
+        let stale = crate::moe::causal_mask(seq_len, 2, &dev)?;
+        let fixed = mask_for(Some(&stale), seq_len, seq_total, &dev)?.expect("rebuilt mask");
+        assert_eq!(fixed.dims4()?, (1, 1, seq_len, seq_total));
+
+        // Causal, so row i sees 0..=i+past and nothing after it.
+        let values = fixed.flatten_all()?.to_vec1::<f32>()?;
+        let past = seq_total - seq_len;
+        for row in 0..seq_len {
+            for col in 0..seq_total {
+                let allowed = col <= row + past;
+                let value = values[row * seq_total + col];
+                assert_eq!(value.is_finite(), allowed, "row {row} col {col}: {value}");
+            }
+        }
+
+        // A mask that already matches is passed through untouched.
+        let matching = crate::moe::causal_mask(seq_len, past, &dev)?;
+        let kept = mask_for(Some(&matching), seq_len, seq_total, &dev)?.expect("kept mask");
+        assert_eq!(kept.dims4()?, matching.dims4()?);
+
+        // No mask stays no mask.
+        assert!(mask_for(None, seq_len, seq_total, &dev)?.is_none());
+        Ok(())
+    }
 
     #[test]
     fn interleaved_rope_rotation_matches_f64_and_cache_chunks() -> Result<()> {
