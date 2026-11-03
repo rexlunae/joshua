@@ -517,7 +517,8 @@ pub struct LoadModelRequest {
     /// or the id `/v1/models` lists a file there by.
     pub model: String,
     /// Name to serve it under; defaults to the id `/v1/models` lists the
-    /// file by (its file stem unless that is ambiguous).
+    /// file by (its file stem unless that is ambiguous).  Another model
+    /// file's path in the directory (`a/model.gguf`) is refused.
     #[serde(default)]
     pub id: Option<String>,
     /// Run the model on this host even when workers are configured.
@@ -551,12 +552,15 @@ impl ModelManager {
     /// was loaded from, each under the id the inventory lists it by: its
     /// file stem or, when another file in the directory has the same stem
     /// (or a loaded model has it as its id), its path in the directory
-    /// (`b/model.gguf`).  So an id depends on the directory alone, not on
-    /// what is loaded or in which order.  `POST /v1/models/load` takes
-    /// either as `model`.  Left out: files a load would refuse (a symlink
-    /// leading out of the directory) and a second link to one file.  Only
-    /// the directory is read, never a header: a request's model name is
-    /// checked against these ids, and the inventory, off the async
+    /// ([`Self::path_id`], `b/model.gguf`).  So loading one file does not
+    /// change another's id, unless the load takes that file's stem as its
+    /// id.  `POST /v1/models/load` takes either as `model`, and refuses
+    /// another file's path as an `id`.  Left out: files a load would refuse (a symlink leading out of the
+    /// directory), a second link to one file, and a file whose path a
+    /// loaded model has as its id (it was loaded before the file appeared):
+    /// no two entries share an id, so each id answers for its own entry.
+    /// Only the directory is read, never a header: a request's model name
+    /// is checked against these ids, and the inventory, off the async
     /// runtime, leaves out the GGUFs that are not models on their own.
     pub fn unloaded(&self, loaded: &[LoadedModel]) -> Vec<(String, PathBuf)> {
         let Ok(root) = self.model_dir.canonicalize() else {
@@ -585,22 +589,37 @@ impl ModelManager {
             .iter()
             .filter_map(|m| m.engine.model_path().canonicalize().ok())
             .collect();
+        let taken = |id: &str| loaded.iter().any(|m| m.id == id);
         files
             .into_iter()
             .filter(|(_, target)| !loaded_from.contains(target))
-            .map(|(file, _)| {
+            .filter_map(|(file, _)| {
                 let stem = stem(&file);
-                let id = if stems[&stem] > 1 || loaded.iter().any(|m| m.id == stem) {
-                    let relative = file.strip_prefix(&self.model_dir).unwrap_or(&file);
-                    let parts: Vec<_> =
-                        relative.iter().map(|part| part.to_string_lossy()).collect();
-                    parts.join("/")
+                let id = if stems[&stem] > 1 || taken(&stem) {
+                    self.path_id(&file)
                 } else {
                     stem
                 };
-                (id, file)
+                (!taken(&id)).then_some((id, file))
             })
             .collect()
+    }
+
+    /// `file`'s path in the model directory, as an id: `b/model.gguf`.
+    fn path_id(&self, file: &Path) -> String {
+        let relative = file.strip_prefix(&self.model_dir).unwrap_or(file);
+        let parts: Vec<_> = relative.iter().map(|part| part.to_string_lossy()).collect();
+        parts.join("/")
+    }
+
+    /// Whether `id` is the path ([`Self::path_id`]) of a GGUF in the model
+    /// directory other than `target` (a canonical path).  A file is listed
+    /// by its path once its stem is taken, so a load cannot take another
+    /// file's path as its id: that file's id would answer with this model.
+    fn names_another_file(&self, id: &str, target: Option<&Path>) -> bool {
+        crate::model_info::discover_gguf(&self.model_dir)
+            .iter()
+            .any(|file| self.path_id(file) == id && file.canonicalize().ok().as_deref() != target)
     }
 
     /// Resolve a requested model inside `model_dir`.
@@ -882,8 +901,8 @@ async fn load_model(
     // By default the model is served under the id the inventory lists its
     // file by, so the list and the served id agree; a file the inventory
     // does not list goes by its stem.
+    let target = path.canonicalize().ok();
     let id = req.id.clone().unwrap_or_else(|| {
-        let target = path.canonicalize().ok();
         unloaded
             .into_iter()
             .find(|(_, file)| target.is_some() && file.canonicalize().ok() == target)
@@ -896,6 +915,13 @@ async fn load_model(
     });
     if id.is_empty() {
         return Err(ApiError::bad_request("empty model id"));
+    }
+    if manager(&state)?.names_another_file(&id, target.as_deref()) {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            format!("id '{id}' is the path of another model file in the model directory"),
+            "model_exists",
+        ));
     }
     let loaded = tokio::task::spawn_blocking(move || {
         let manager = manager(&state)?;

@@ -447,6 +447,114 @@ async fn each_model_file_is_listed_once_under_an_id_a_load_takes() {
     std::fs::remove_dir_all(outside).unwrap();
 }
 
+/// A file's path is its id once its stem is shared, so a load cannot take
+/// another file's path as its id, and a file whose path a loaded model
+/// already has (it appeared after the load) is not listed beside it: every
+/// listed id answers for its own entry.
+#[tokio::test]
+async fn no_two_listed_models_share_an_id() {
+    let dir = common::model_dir("controller-path-ids");
+    for sub in ["a", "b"] {
+        std::fs::create_dir_all(dir.join(sub)).unwrap();
+        common::write_tiny_llama_gguf(&dir.join(sub).join("model.gguf"));
+        std::fs::copy(
+            dir.join("tokenizer.json"),
+            dir.join(sub).join("tokenizer.json"),
+        )
+        .unwrap();
+    }
+    let app = create_router(state(ModelRegistry::default(), Some(manager(&dir))));
+    let ids = |body: &serde_json::Value| -> Vec<serde_json::Value> {
+        body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| serde_json::json!([m["id"], m["joshua"]["loaded"]]))
+            .collect()
+    };
+    let load = |model: &str, id: &str| serde_json::json!({"model": model, "id": id});
+
+    // `a/model.gguf` is the other file's id: refused, nothing loaded.
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/v1/models/load",
+        load("b/model.gguf", "a/model.gguf"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["type"], "model_exists");
+    let (_, body) = call(&app, "GET", "/v1/models", serde_json::Value::Null).await;
+    assert_eq!(
+        ids(&body),
+        [
+            serde_json::json!(["a/model.gguf", false]),
+            serde_json::json!(["b/model.gguf", false]),
+        ]
+    );
+
+    // A path no file has yet is free; a file copied there afterwards is not
+    // listed under the loaded model's id until that model is unloaded.
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/v1/models/load",
+        load("b/model.gguf", "c/model.gguf"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    std::fs::create_dir_all(dir.join("c")).unwrap();
+    common::write_tiny_llama_gguf(&dir.join("c").join("model.gguf"));
+    let (_, body) = call(&app, "GET", "/v1/models", serde_json::Value::Null).await;
+    assert_eq!(
+        ids(&body),
+        [
+            serde_json::json!(["c/model.gguf", true]),
+            serde_json::json!(["a/model.gguf", false]),
+        ]
+    );
+    assert!(body["data"][0]["root"]
+        .as_str()
+        .unwrap()
+        .ends_with("b/model.gguf"));
+    let (status, body) = call(&app, "POST", "/v1/completions", completion("c/model.gguf")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["model"], "c/model.gguf");
+    let (status, body) = call(&app, "POST", "/v1/completions", completion("a/model.gguf")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/v1/models/unload",
+        serde_json::json!({"id": "c/model.gguf"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, body) = call(&app, "GET", "/v1/models", serde_json::Value::Null).await;
+    assert_eq!(
+        ids(&body),
+        [
+            serde_json::json!(["a/model.gguf", false]),
+            serde_json::json!(["b/model.gguf", false]),
+            serde_json::json!(["c/model.gguf", false]),
+        ]
+    );
+
+    // A loaded file's path is refused as another load's id too, so the
+    // file is listed under it again once it is unloaded.
+    let (status, body) = call(&app, "POST", "/v1/models/load", load("b/model.gguf", "bee")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/v1/models/load",
+        load("a/model.gguf", "b/model.gguf"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// A request's model name is checked against the model directory's ids
 /// without reading a file there: a FIFO named like a GGUF, whose header
 /// read would block until someone writes to it, holds nothing up.

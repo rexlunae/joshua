@@ -639,7 +639,10 @@ another file in the directory has the same stem (or a loaded model has it
 as its id), its path in the directory (`a/model.gguf`, `b/model.gguf`), so
 loading one file does not change another's id.  `POST /v1/models/load`
 takes either as `model` and, without an `id`, serves the model under the
-id it was listed by.  A file a loaded model was loaded from is not listed
+id it was listed by; it refuses another file's path as an `id` (`409`).
+No two entries share an id: a file whose path a loaded model already has
+as its id (the file appeared after that load) is left out until the model
+is unloaded.  A file a loaded model was loaded from is not listed
 again, and neither are GGUFs that are not models on their own
 (`general.type` `adapter`, `mmproj` or `imatrix`, or a `clip` projector)
 or links leading out of the directory, which a load refuses.  A listed
