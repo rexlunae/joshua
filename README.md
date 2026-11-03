@@ -635,18 +635,22 @@ under `joshua`.  For `joshua serve --model Qwen3-0.6B-Q4_K_M.gguf --n-ctx 8192`:
 With `--model-dir`, each model file in the directory (two levels deep)
 that is not loaded is listed after the loaded models, with
 `joshua.loaded: false` and no placement.  Its id is its file stem or, when
-an entry before it already has that id, its path in the directory
-(`b/model.gguf`); `POST /v1/models/load` takes either as `model`.  A file a
-loaded model was loaded from is not listed again, and neither are GGUFs
-that are not models on their own (`general.type` `adapter`, `mmproj` or
-`imatrix`, or a `clip` projector) or links leading out of the directory,
-which a load refuses.  A listed file is described from its GGUF header
-without loading any weight; its `context_length`, `max_model_len`,
-`meta.n_ctx` and `max_output_tokens` are the ones `POST /v1/models/load`
-with the server's flags gives it (a load's own `n_ctx` changes them).  A
-Whisper model has an entry with its id and placement.  A `joshua route`
-coordinator lists its workers' entries unchanged, fields it does not know
-included (see [docs/request-routing.md](docs/request-routing.md)).
+another file in the directory has the same stem (or a loaded model has it
+as its id), its path in the directory (`a/model.gguf`, `b/model.gguf`), so
+loading one file does not change another's id.  `POST /v1/models/load`
+takes either as `model` and, without an `id`, serves the model under the
+id it was listed by.  A file a loaded model was loaded from is not listed
+again, and neither are GGUFs that are not models on their own
+(`general.type` `adapter`, `mmproj` or `imatrix`, or a `clip` projector)
+or links leading out of the directory, which a load refuses.  A listed
+file is described from its GGUF header without loading any weight; its
+`context_length`, `max_model_len`, `meta.n_ctx` and `max_output_tokens`
+are the ones `POST /v1/models/load` with the server's flags gives it (a
+load's own `n_ctx` changes them).  A Whisper model has an entry with its
+id and placement.  A `joshua route` coordinator lists the union of its
+workers' entries (a worker's Whisper model included) unchanged, fields it
+does not know included (see
+[docs/request-routing.md](docs/request-routing.md)).
 
 ### `POST /v1/models/load` and `POST /v1/models/unload`
 
@@ -667,10 +671,11 @@ curl -X POST localhost:8080/v1/models/unload -H 'content-type: application/json'
 A load answers with the model's [`/v1/models`](#get-v1models) entry (with
 `workers` and `stages` also at the top level).  Several models can be loaded
 at once; requests pick one with `model`.  A server holding a single model
-answers any name, as before, except an id `/v1/models` lists for a file that
-is not loaded: that is a `404` (`code: "model_not_found"`) saying to load it,
-not an answer from the loaded model.  Unloading waits for requests already
-running on the model.
+answers any name, as before, except the id of a file in the model directory
+that is not loaded (as `/v1/models` would list it): that is a `404`
+(`code: "model_not_found"`) saying to load it, not an answer from the
+loaded model.  Checking a name reads the directory, not the files.
+Unloading waits for requests already running on the model.
 
 #### Model-less workers (experimental, `--features distributed`)
 

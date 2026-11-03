@@ -126,9 +126,9 @@ pub struct TagsResponse {
     models: Vec<TagModel>,
 }
 
-pub async fn tags(State(state): State<AppState>) -> Json<TagsResponse> {
-    let models = state
-        .inventory()
+pub async fn tags(State(state): State<AppState>) -> Result<Json<TagsResponse>, ApiError> {
+    let models = crate::server::inventory(&state)
+        .await?
         .into_iter()
         .map(|m| TagModel {
             name: normalise_name(&m.id),
@@ -139,7 +139,7 @@ pub async fn tags(State(state): State<AppState>) -> Json<TagsResponse> {
             details: details_for(m.facts.as_ref()),
         })
         .collect();
-    Json(TagsResponse { models })
+    Ok(Json(TagsResponse { models }))
 }
 
 // ─── /api/ps ────────────────────────────────────────────────────────────────

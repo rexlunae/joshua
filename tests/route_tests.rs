@@ -1943,6 +1943,33 @@ async fn routed_model_entries_pass_through_as_the_worker_sent_them() {
     assert_eq!(res.json()["worker"], "a");
 }
 
+/// The router lists every entry its workers send, by id: a worker serving
+/// a chat model and Whisper has both listed, as its own `/v1/models` does,
+/// and a worker that predates entries has its model listed by id.
+#[tokio::test]
+async fn routed_model_list_is_the_union_of_the_workers_entries() {
+    let (mixed, mixed_url) = spawn_fake("a", "alpha", 4, Behavior::Echo).await;
+    mixed.transcriptions.store(true, Ordering::SeqCst);
+    let card = |id: &str| {
+        json!({"id": id, "object": "model", "created": 1, "owned_by": "joshua",
+               "joshua": {"loaded": true, "backend": "cpu"}})
+    };
+    *mixed.cards.lock().unwrap() = vec![card("whisper-base"), card("alpha")];
+    let (_older, older_url) = spawn_fake("b", "beta", 4, Behavior::Echo).await;
+    let (_, router) = spawn_router(config(&[&mixed_url, &older_url])).await;
+
+    let models = call(&router, "GET", "/v1/models", "").await.json();
+    let data = models["data"].as_array().unwrap();
+    let ids: Vec<_> = data.iter().map(|m| m["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, ["alpha", "beta", "whisper-base"]);
+    assert_eq!(data[0], card("alpha"));
+    assert_eq!(data[2], card("whisper-base"));
+    assert_eq!(data[1]["joshua"], json!({"loaded": true}));
+    let one = call(&router, "GET", "/v1/models/whisper-base", "").await;
+    assert_eq!(one.status, StatusCode::OK);
+    assert_eq!(one.json(), card("whisper-base"));
+}
+
 /// A generation whose cancel flag is already set stops before decoding and
 /// leaves the engine fully usable: the next request matches a fresh engine.
 #[test]

@@ -1148,31 +1148,31 @@ impl Coordinator {
         models
     }
 
-    /// The `/v1/models` entries for [`Self::models`]: each model's card, as
-    /// the first healthy worker (in configured order) that reports one sent
-    /// it, or an entry naming just the model for workers that predate
-    /// cards.
+    /// The `/v1/models` entries: the union of the healthy workers' own
+    /// entries (a Whisper model's included), sorted by id, each as the
+    /// first healthy worker (in configured order) that reports one sent
+    /// it.  A model in [`Self::models`] that no worker sends an entry for
+    /// (its workers predate cards) gets one naming just the model.
     fn model_cards(&self) -> Vec<serde_json::Value> {
-        let cards: Vec<serde_json::Value> = self
-            .workers
-            .iter()
-            .flat_map(|w| {
-                let st = w.status();
-                st.info
-                    .as_ref()
-                    .filter(|_| st.healthy)
-                    .map(|i| i.cards.clone())
-                    .unwrap_or_default()
-            })
-            .collect();
+        let mut cards = std::collections::BTreeMap::new();
+        for w in &self.workers {
+            let st = w.status();
+            let Some(info) = st.info.as_ref().filter(|_| st.healthy) else {
+                continue;
+            };
+            for card in &info.cards {
+                if let Some(id) = card["id"].as_str() {
+                    cards.entry(id.to_string()).or_insert_with(|| card.clone());
+                }
+            }
+        }
         let created = unix_time();
-        self.models()
-            .into_iter()
-            .map(|id| match cards.iter().find(|card| card["id"] == id) {
-                Some(card) => card.clone(),
-                None => json!(ModelInfo::new(id, created).card()),
-            })
-            .collect()
+        for id in self.models() {
+            cards
+                .entry(id)
+                .or_insert_with_key(|id| json!(ModelInfo::new(id.as_str(), created).card()));
+        }
+        cards.into_values().collect()
     }
 
     /// Open a connection to `w` and send one request.  The returned guard

@@ -229,9 +229,12 @@ impl ServerState {
     }
 
     /// Every model this server can serve: the loaded ones, then (with
-    /// `--model-dir`) the directory's models that are not loaded
-    /// ([`ModelManager::unloaded`]), described from their headers alone.
-    /// This is the inventory `/v1/models` and Ollama's `/api/tags` list.
+    /// `--model-dir`) the directory's files that are not loaded
+    /// ([`ModelManager::unloaded`]), described from their headers alone,
+    /// less the GGUFs that are not models on their own (adapters,
+    /// projectors).  This is the inventory `/v1/models` and Ollama's
+    /// `/api/tags` list.  It reads every such file's header, so handlers
+    /// build it off the async runtime ([`inventory`]).
     pub fn inventory(&self) -> Vec<ModelInfo> {
         let loaded = self.models.list();
         let mut out: Vec<ModelInfo> = loaded.iter().map(LoadedModel::info).collect();
@@ -240,28 +243,32 @@ impl ServerState {
                 manager
                     .unloaded(&loaded)
                     .iter()
-                    .map(|(id, file)| ModelInfo::of_file(id, file, manager)),
+                    .map(|(id, file)| ModelInfo::of_file(id, file, manager))
+                    .filter(|model| model.facts.as_ref().is_none_or(GgufFacts::is_model)),
             );
         }
         out
     }
 
-    /// The model-directory file the inventory lists as `id`, not loaded.
-    fn unloaded_file(&self, id: &str) -> Option<PathBuf> {
-        let manager = self.manager.as_ref()?;
-        manager
-            .unloaded(&self.models.list())
-            .into_iter()
-            .find(|(listed, _)| listed == id)
-            .map(|(_, file)| file)
+    /// The model directory's files that are not loaded, under the ids the
+    /// inventory lists them by ([`ModelManager::unloaded`]).  Reads the
+    /// directory only, never a header.
+    fn unloaded(&self) -> Vec<(String, PathBuf)> {
+        self.manager
+            .as_ref()
+            .map(|manager| manager.unloaded(&self.models.list()))
+            .unwrap_or_default()
     }
 
     /// The model a request names, by id (see [`ModelRegistry::resolve`]).
-    /// A name the inventory gives a model-directory file that is not
-    /// loaded is a `404`, never answered by the one model that is.
+    /// The id of a model-directory file that is not loaded is a `404`,
+    /// never answered by the one model that is.  That is checked against
+    /// the directory alone ([`Self::unloaded`]), so a request never waits
+    /// on a header read.
     pub fn resolve(&self, requested: &str) -> Result<(String, Arc<Engine>), ApiError> {
-        self.models
-            .resolve(requested, |name| self.unloaded_file(name).is_some())
+        self.models.resolve(requested, |name| {
+            self.unloaded().iter().any(|(id, _)| id == name)
+        })
     }
 
     /// The Whisper model's entry, when one is configured.
@@ -271,16 +278,15 @@ impl ServerState {
             ..ModelInfo::new(whisper.model_name(), unix_time())
         })
     }
+}
 
-    /// The `/v1/models` entries: [`Self::inventory`], then the Whisper
-    /// model.
-    fn model_cards(&self) -> Vec<ModelCard> {
-        self.inventory()
-            .into_iter()
-            .chain(self.whisper_info())
-            .map(|model| model.card())
-            .collect()
-    }
+/// [`ServerState::inventory`], built off the async runtime: a file in the
+/// model directory is described by reading its header.
+pub(crate) async fn inventory(state: &AppState) -> Result<Vec<ModelInfo>, ApiError> {
+    let state = Arc::clone(state);
+    tokio::task::spawn_blocking(move || state.inventory())
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))
 }
 
 // ─── Model registry ─────────────────────────────────────────────────────────
@@ -510,7 +516,8 @@ pub struct LoadModelRequest {
     /// GGUF file (or a directory holding one) under the model directory,
     /// or the id `/v1/models` lists a file there by.
     pub model: String,
-    /// Name to serve it under; defaults to the file stem.
+    /// Name to serve it under; defaults to the id `/v1/models` lists the
+    /// file by (its file stem unless that is ambiguous).
     #[serde(default)]
     pub id: Option<String>,
     /// Run the model on this host even when workers are configured.
@@ -540,51 +547,60 @@ pub struct UnloadModelRequest {
 }
 
 impl ModelManager {
-    /// The directory's models that are not loaded, each under the id the
-    /// inventory lists it by: its file stem or, when an entry before it (a
-    /// loaded model or another file) has that id, its path in the
-    /// directory.  `POST /v1/models/load` takes either as `model`.  Left
-    /// out: files a load would refuse (a symlink leading out of the
-    /// directory), files a model in `loaded` was loaded from, a second
-    /// link to one file, and GGUFs that are not models on their own
-    /// (adapters, projectors).
+    /// The directory's GGUFs (two levels deep) that no model in `loaded`
+    /// was loaded from, each under the id the inventory lists it by: its
+    /// file stem or, when another file in the directory has the same stem
+    /// (or a loaded model has it as its id), its path in the directory
+    /// (`b/model.gguf`).  So an id depends on the directory alone, not on
+    /// what is loaded or in which order.  `POST /v1/models/load` takes
+    /// either as `model`.  Left out: files a load would refuse (a symlink
+    /// leading out of the directory) and a second link to one file.  Only
+    /// the directory is read, never a header: a request's model name is
+    /// checked against these ids, and the inventory, off the async
+    /// runtime, leaves out the GGUFs that are not models on their own.
     pub fn unloaded(&self, loaded: &[LoadedModel]) -> Vec<(String, PathBuf)> {
         let Ok(root) = self.model_dir.canonicalize() else {
             return Vec::new();
         };
-        let mut seen: Vec<PathBuf> = loaded
+        let mut targets = std::collections::HashSet::new();
+        let files: Vec<(PathBuf, PathBuf)> = crate::model_info::discover_gguf(&self.model_dir)
+            .into_iter()
+            .filter_map(|file| {
+                let target = file.canonicalize().ok()?;
+                (target.starts_with(&root) && targets.insert(target.clone()))
+                    .then_some((file, target))
+            })
+            .collect();
+        let stem = |file: &Path| -> String {
+            file.file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("model")
+                .to_string()
+        };
+        let mut stems = std::collections::HashMap::<String, usize>::new();
+        for (file, _) in &files {
+            *stems.entry(stem(file)).or_default() += 1;
+        }
+        let loaded_from: Vec<PathBuf> = loaded
             .iter()
             .filter_map(|m| m.engine.model_path().canonicalize().ok())
             .collect();
-        let mut ids: Vec<String> = loaded.iter().map(|m| m.id.clone()).collect();
-        let mut out = Vec::new();
-        for file in crate::model_info::discover_gguf(&self.model_dir) {
-            let Ok(target) = file.canonicalize() else {
-                continue;
-            };
-            if !target.starts_with(&root)
-                || seen.contains(&target)
-                || GgufFacts::read(&file).is_ok_and(|facts| !facts.is_model())
-            {
-                continue;
-            }
-            seen.push(target);
-            let stem = file
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("model")
-                .to_string();
-            let id = if ids.contains(&stem) {
-                let relative = file.strip_prefix(&self.model_dir).unwrap_or(file.as_path());
-                let parts: Vec<_> = relative.iter().map(|part| part.to_string_lossy()).collect();
-                parts.join("/")
-            } else {
-                stem
-            };
-            ids.push(id.clone());
-            out.push((id, file));
-        }
-        out
+        files
+            .into_iter()
+            .filter(|(_, target)| !loaded_from.contains(target))
+            .map(|(file, _)| {
+                let stem = stem(&file);
+                let id = if stems[&stem] > 1 || loaded.iter().any(|m| m.id == stem) {
+                    let relative = file.strip_prefix(&self.model_dir).unwrap_or(&file);
+                    let parts: Vec<_> =
+                        relative.iter().map(|part| part.to_string_lossy()).collect();
+                    parts.join("/")
+                } else {
+                    stem
+                };
+                (id, file)
+            })
+            .collect()
     }
 
     /// Resolve a requested model inside `model_dir`.
@@ -853,15 +869,30 @@ async fn load_model(
     State(state): State<AppState>,
     Json(req): Json<LoadModelRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let unloaded = state.unloaded();
     let path = match manager(&state)?.resolve_path(&req.model) {
         Ok(path) => path,
         // A file the inventory lists by its stem, e.g. in a subdirectory.
-        Err(e) => state.unloaded_file(&req.model).ok_or(e)?,
+        Err(e) => unloaded
+            .iter()
+            .find(|(id, _)| *id == req.model)
+            .map(|(_, file)| file.clone())
+            .ok_or(e)?,
     };
+    // By default the model is served under the id the inventory lists its
+    // file by, so the list and the served id agree; a file the inventory
+    // does not list goes by its stem.
     let id = req.id.clone().unwrap_or_else(|| {
-        path.file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_default()
+        let target = path.canonicalize().ok();
+        unloaded
+            .into_iter()
+            .find(|(_, file)| target.is_some() && file.canonicalize().ok() == target)
+            .map(|(id, _)| id)
+            .unwrap_or_else(|| {
+                path.file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            })
     });
     if id.is_empty() {
         return Err(ApiError::bad_request("empty model id"));
@@ -1470,12 +1501,15 @@ impl Drop for CancelOnDrop {
     }
 }
 
-/// The `/v1/models` entries, built off the async runtime: a file in the
-/// model directory is described by reading its header.
+/// The `/v1/models` entries: [`ServerState::inventory`], then the Whisper
+/// model.
 async fn model_cards(state: AppState) -> Result<Vec<ModelCard>, ApiError> {
-    tokio::task::spawn_blocking(move || state.model_cards())
-        .await
-        .map_err(|e| ApiError::internal(e.to_string()))
+    Ok(inventory(&state)
+        .await?
+        .into_iter()
+        .chain(state.whisper_info())
+        .map(|model| model.card())
+        .collect())
 }
 
 /// `GET /v1/models` (also `GET /models`, as llama-server serves it) — the

@@ -52,14 +52,15 @@ On the router:
   completions; `stream: true` on the other routes still gets JSON), and
   buffered otherwise.
 * `GET /v1/models` (also `GET /models`) — union of the healthy workers'
-  models.  Each entry is the worker's own `/v1/models` entry, limits
-  (`context_length`, `max_output_tokens`), vLLM and llama-server fields and
-  placement included, taken from the first healthy worker (in configured
-  order) that serves the model.  It is passed on as the worker sent it, so
-  fields a newer worker adds reach clients, and an entry the router cannot
-  read does not mark the worker unhealthy.  A worker that predates these
-  entries gets one with just the id.  `GET /v1/models/{id}` returns one entry, or a `404`
-  (`code: "model_not_found"`).
+  models, a worker's Whisper model included, sorted by id.  Each entry is
+  the worker's own `/v1/models` entry, limits (`context_length`,
+  `max_output_tokens`), vLLM and llama-server fields and placement
+  included, taken from the first healthy worker (in configured order) that
+  serves the model.  It is passed on as the worker sent it, so fields a
+  newer worker adds reach clients, and an entry the router cannot read does
+  not mark the worker unhealthy.  A worker that predates these entries gets
+  one with just the id.  `GET /v1/models/{id}` returns one entry, or a
+  `404` (`code: "model_not_found"`).
 * `GET /v1/workers` — registry: health, last reported info, slots, requests
   in flight from this router and a conservative other-client snapshot, last
   error. Worker audio counts have no ownership identity, so the snapshot can

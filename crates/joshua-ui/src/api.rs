@@ -231,8 +231,9 @@ pub struct Model {
     /// The context the model was trained with.
     #[serde(default)]
     pub max_context_length: Option<u32>,
-    /// Ceiling on one request's output; absent when only the context
-    /// limits it.
+    /// Ceiling on one request's output: the server's `--max-output-tokens`.
+    /// Absent only for an entry without limits (the Whisper model, a
+    /// coordinator's entry for an older worker, an older server).
     #[serde(default)]
     pub max_output_tokens: Option<u32>,
     /// Whether the model is loaded, and where it runs.
@@ -274,14 +275,11 @@ impl Model {
         }
     }
 
-    /// The output ceiling: the server's cap, or `"context"` when only the
-    /// context limits output.
+    /// The server's cap on one request's output.  `"–"` when the server
+    /// does not say.
     pub fn output_label(&self) -> String {
-        match (self.max_output_tokens, self.context_length) {
-            (Some(n), _) => n.to_string(),
-            (None, Some(_)) => "context".to_string(),
-            (None, None) => "–".to_string(),
-        }
+        self.max_output_tokens
+            .map_or_else(|| "–".to_string(), |n| n.to_string())
     }
 
     /// Where the model runs: `"cuda"`, `"cuda, experts on cpu"`,
@@ -848,23 +846,29 @@ mod tests {
              "context_length":8192,"max_context_length":40960,"max_output_tokens":4096,
              "max_model_len":8192,"meta":{"n_ctx":8192},
              "joshua":{"loaded":true,"backend":"cuda","dense":"cuda","experts":"cpu"}},
-            {"id":"dense","context_length":4096,"max_context_length":4096,
+            {"id":"dense","context_length":4096,"max_context_length":4096,"max_output_tokens":1024,
              "joshua":{"loaded":true,"backend":"cpu","dense":"cpu"}},
-            {"id":"file","context_length":4096,"joshua":{"loaded":false}},
-            {"id":"split","joshua":{"loaded":true,"backend":"cpu","dense":"cpu","remote":true,
-             "workers":["10.0.0.2:7070","10.0.0.3:7070"],"stages":[[0,14],[14,28]]}}]}"#;
+            {"id":"file","context_length":4096,"max_output_tokens":4096,"joshua":{"loaded":false}},
+            {"id":"split","context_length":512,"max_context_length":512,"max_output_tokens":4096,
+             "joshua":{"loaded":true,"backend":"cpu","dense":"cpu","remote":true,
+             "workers":["10.0.0.2:7070","10.0.0.3:7070"],"stages":[[0,14],[14,28]]}},
+            {"id":"whisper-base","joshua":{"loaded":true,"backend":"cpu","dense":"cpu"}}]}"#;
         let models = parse_models(body).unwrap();
-        let [moe, dense, file, split] = &models.data[..] else {
-            panic!("four models")
+        let [moe, dense, file, split, whisper] = &models.data[..] else {
+            panic!("five models")
         };
         assert_eq!(split.placement_label(), "2 pipeline workers");
         assert_eq!(moe.context_label(), "8192 of 40960");
         assert_eq!(moe.output_label(), "4096");
         assert_eq!(moe.placement_label(), "cuda, experts on cpu");
         assert_eq!(dense.context_label(), "4096");
-        assert_eq!(dense.output_label(), "context");
+        assert_eq!(dense.output_label(), "1024");
         assert_eq!(dense.placement_label(), "cpu");
         assert_eq!(file.placement_label(), "not loaded");
+        // The Whisper model's entry has no limits.
+        assert_eq!(whisper.context_label(), "–");
+        assert_eq!(whisper.output_label(), "–");
+        assert_eq!(whisper.placement_label(), "cpu");
         // Only loaded models are offered for chat; an older server's
         // entries carry no `joshua` object and count as loaded.
         assert!(moe.is_loaded() && split.is_loaded() && !file.is_loaded());

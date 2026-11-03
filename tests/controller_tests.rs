@@ -324,6 +324,7 @@ async fn each_model_file_is_listed_once_under_an_id_a_load_takes() {
         )
         .unwrap();
     }
+    common::write_tiny_llama_gguf(&dir.join("solo.gguf"));
     // Files that are not models on their own.
     for (name, kind) in [("lora.gguf", "adapter"), ("mmproj.gguf", "mmproj")] {
         let kind = [("general.type".to_string(), Value::String(kind.to_string()))];
@@ -349,14 +350,15 @@ async fn each_model_file_is_listed_once_under_an_id_a_load_takes() {
             .collect()
     };
 
-    // Both `model.gguf`s are listed: the second under its path, since its
-    // stem is taken.
+    // Both `model.gguf`s are listed, each under its path since they share
+    // a stem; a file with a stem of its own goes by the stem.
     let (_, body) = call(&app, "GET", "/v1/models", serde_json::Value::Null).await;
     assert_eq!(
         ids(&body),
         [
-            serde_json::json!(["model", false]),
+            serde_json::json!(["a/model.gguf", false]),
             serde_json::json!(["b/model.gguf", false]),
+            serde_json::json!(["solo", false]),
         ]
     );
     assert!(body["data"][0]["root"]
@@ -373,46 +375,122 @@ async fn each_model_file_is_listed_once_under_an_id_a_load_takes() {
     assert_eq!(status, StatusCode::OK, "{card}");
     assert!(card["root"].as_str().unwrap().ends_with("b/model.gguf"));
 
-    // Each listed id loads its file.
+    // A load without an `id` serves the model under the id it was listed
+    // by, and the other file keeps its own.
     let (status, body) = call(
         &app,
         "POST",
         "/v1/models/load",
-        serde_json::json!({"model": "model"}),
+        serde_json::json!({"model": "b/model.gguf"}),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert!(body["root"].as_str().unwrap().ends_with("a/model.gguf"));
-    let (_, body) = call(&app, "GET", "/v1/models", serde_json::Value::Null).await;
-    assert_eq!(
-        ids(&body),
-        [
-            serde_json::json!(["model", true]),
-            serde_json::json!(["b/model.gguf", false]),
-        ]
-    );
-    let (status, body) = call(&app, "POST", "/v1/completions", completion("b/model.gguf")).await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
-    let (status, body) = call(
-        &app,
-        "POST",
-        "/v1/models/load",
-        serde_json::json!({"model": "b/model.gguf", "id": "b"}),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["id"], "b/model.gguf");
     assert!(body["root"].as_str().unwrap().ends_with("b/model.gguf"));
     let (_, body) = call(&app, "GET", "/v1/models", serde_json::Value::Null).await;
     assert_eq!(
         ids(&body),
         [
-            serde_json::json!(["model", true]),
-            serde_json::json!(["b", true])
+            serde_json::json!(["b/model.gguf", true]),
+            serde_json::json!(["a/model.gguf", false]),
+            serde_json::json!(["solo", false]),
+        ]
+    );
+    let (status, body) = call(&app, "POST", "/v1/completions", completion("a/model.gguf")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    let (status, body) = call(&app, "POST", "/v1/completions", completion("b/model.gguf")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["model"], "b/model.gguf");
+
+    // A model loaded under a file's stem as its id: that file is listed by
+    // its path, so no two entries share an id.
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/v1/models/load",
+        serde_json::json!({"model": "a/model.gguf", "id": "solo"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, body) = call(&app, "GET", "/v1/models", serde_json::Value::Null).await;
+    assert_eq!(
+        ids(&body),
+        [
+            serde_json::json!(["b/model.gguf", true]),
+            serde_json::json!(["solo", true]),
+            serde_json::json!(["solo.gguf", false]),
+        ]
+    );
+    assert!(body["data"][1]["root"]
+        .as_str()
+        .unwrap()
+        .ends_with("a/model.gguf"));
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/v1/models/unload",
+        serde_json::json!({"id": "solo"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, body) = call(&app, "GET", "/v1/models", serde_json::Value::Null).await;
+    assert_eq!(
+        ids(&body),
+        [
+            serde_json::json!(["b/model.gguf", true]),
+            serde_json::json!(["a/model.gguf", false]),
+            serde_json::json!(["solo", false]),
         ]
     );
     std::fs::remove_dir_all(dir).unwrap();
     #[cfg(unix)]
     std::fs::remove_dir_all(outside).unwrap();
+}
+
+/// A request's model name is checked against the model directory's ids
+/// without reading a file there: a FIFO named like a GGUF, whose header
+/// read would block until someone writes to it, holds nothing up.
+#[cfg(unix)]
+#[test]
+fn a_model_name_is_checked_without_reading_a_header() {
+    use axum::response::IntoResponse;
+
+    let dir = common::model_dir("controller-resolve");
+    let path = dir.join("tiny.gguf");
+    common::write_tiny_llama_gguf(&path);
+    let fifo = std::process::Command::new("mkfifo")
+        .arg(dir.join("pending.gguf"))
+        .status()
+        .unwrap();
+    assert!(fifo.success());
+    let engine = joshua::Engine::with_options(&path, EngineOptions::with_n_ctx(64)).unwrap();
+    let state = state(
+        ModelRegistry::with_model(Arc::new(engine)),
+        Some(manager(&dir)),
+    );
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn({
+        let state = Arc::clone(&state);
+        move || {
+            let resolve = |name: &str| {
+                state
+                    .resolve(name)
+                    .map(|(id, _)| id)
+                    .map_err(|e| e.into_response().status())
+            };
+            let _ = tx.send((resolve("gpt-4o"), resolve("pending"), resolve("tiny")));
+        }
+    });
+    let (other, pending, tiny) = rx
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("resolving a model name opened a file in the model directory");
+    // The one model loaded answers a name no file has; a file's id is a
+    // 404 even though its header was never read.
+    assert_eq!(other, Ok("tiny".to_string()));
+    assert_eq!(pending, Err(StatusCode::NOT_FOUND));
+    assert_eq!(tiny, Ok("tiny".to_string()));
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[tokio::test]
