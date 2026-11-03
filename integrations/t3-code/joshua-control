@@ -1,0 +1,315 @@
+#!/usr/bin/env python3
+"""joshua-control - run and control Joshua inference servers on this machine or any ssh host.
+
+Joshua is OpenAI-compatible (`/v1/chat/completions`, `/v1/models`, `/v1/models/load`), so one
+control plane can start it anywhere, switch models at runtime, and front several machines with
+Joshua's router (`serve --worker ...`). T3 Code then reaches each host's Joshua through the
+`joshua_acp.py` ACP agent, which this tool also installs.
+
+    joshua-control hosts
+    joshua-control start --host kleya --model ~/llama.cpp/models/qwen/Qwen3-14B-Q4_K_M.gguf
+    joshua-control status --host all
+    joshua-control models --host kleya
+    joshua-control load --host kleya --model ~/models/other.gguf
+    joshua-control cluster up --router kleya --workers kleya,erskin \\
+        --model /home/tserica/llama.cpp/models/qwen/Qwen3-14B-Q4_K_M.gguf
+    joshua-control install --host kleya      # ACP agent + T3 provider instance
+"""
+import argparse, json, os, shlex, socket, subprocess, sys, time
+from pathlib import Path
+
+HOME = Path.home()
+DEFAULT_PORT = 8080
+AGENT_NAME = "joshua_acp.py"
+
+
+def t3_hosts():
+    """Local plus the ssh device hosts configured in T3 Code."""
+    hosts = ["local"]
+    settings = HOME / ".t3/userdata/settings.json"
+    if settings.exists():
+        try:
+            data = json.loads(settings.read_text())
+            for host in data.get("deviceHosts", []):
+                target = host.get("target") or host.get("label")
+                if host.get("kind") == "ssh" and target and target not in hosts:
+                    hosts.append(target)
+        except Exception:
+            pass
+    return hosts
+
+
+def resolve(host):
+    return "local" if host in ("local", "this", "localhost", socket.gethostname()) else host
+
+
+def run(host, command, timeout=60, check=False):
+    if resolve(host) == "local":
+        proc = subprocess.run(["/bin/bash", "-lc", command], capture_output=True, text=True, timeout=timeout)
+    else:
+        proc = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host,
+                               f"bash -lc {shlex.quote(command)}"],
+                              capture_output=True, text=True, timeout=timeout)
+    if check and proc.returncode != 0:
+        raise SystemExit(f"[{host}] command failed ({proc.returncode}): {proc.stderr.strip()[:400]}")
+    return proc
+
+
+def api(host, port, path, method="GET", body=None, timeout=30):
+    payload = f" -H 'Content-Type: application/json' -d {shlex.quote(json.dumps(body))}" if body else ""
+    cmd = f"curl -sS -m {timeout} -X {method}{payload} http://127.0.0.1:{port}{path}"
+    out = run(host, cmd, timeout=timeout + 10)
+    if out.returncode != 0:
+        return None
+    try:
+        return json.loads(out.stdout or "null")
+    except json.JSONDecodeError:
+        return None
+
+
+def joshua_bin(host):
+    out = run(host, "command -v joshua || echo $HOME/.cargo/bin/joshua")
+    return out.stdout.strip().splitlines()[-1] if out.stdout.strip() else "joshua"
+
+
+def provider_port(host, default=DEFAULT_PORT):
+    """The port this host's T3 joshua_local provider points at, so status needs no flags."""
+    out = run(host, "cat $HOME/.t3/userdata/settings.json 2>/dev/null")
+    try:
+        cfg = json.loads(out.stdout)["providerInstances"]["joshua_local"]["config"]
+        args = cfg.get("commandArgs") or []
+        for i, arg in enumerate(args):
+            if arg == "--base-url" and i + 1 < len(args):
+                return int(args[i + 1].rstrip("/").rsplit(":", 1)[-1])
+    except Exception:
+        pass
+    return default
+
+
+def cmd_hosts(args):
+    for host in t3_hosts():
+        version = run(host, "joshua --version 2>/dev/null || echo '(joshua not installed)'").stdout.strip()
+        has_flags = run(host, "joshua serve --help 2>/dev/null | grep -c -- --model-dir").stdout.strip() or "0"
+        print(f"{host:12} {version:28} model-dir={'yes' if has_flags not in ('0', '') else 'no'}")
+
+
+def cmd_status(args):
+    hosts = t3_hosts() if args.host in ("all", None) else [args.host]
+    for host in hosts:
+        port = args.port or provider_port(host)
+        models = api(host, port, "/v1/models")
+        if not models:
+            print(f"{host:12} down (port {port})")
+            continue
+        ids = [m.get("id") for m in models.get("data", [])]
+        workers = api(host, port, "/v1/workers")
+        extra = ""
+        if workers and isinstance(workers, dict):
+            nodes = workers.get("workers") or workers.get("data") or []
+            extra = f" workers={len(nodes)}"
+        print(f"{host:12} up   port={port} models={ids}{extra}")
+
+
+def cmd_models(args):
+    port = args.port or provider_port(args.host)
+    models = api(args.host, port, "/v1/models") or {"data": []}
+    for m in models.get("data", []):
+        print(m.get("id"))
+
+
+def shell_path(host, value):
+    """A shell-ready path: expanded locally for this machine, $HOME-relative for a remote host."""
+    if not value:
+        return value
+    expanded = os.path.expanduser(value)
+    if resolve(host) == "local":
+        return shlex.quote(expanded)
+    home = str(Path.home())
+    if expanded == home:
+        return '"$HOME"'
+    if expanded.startswith(home + os.sep):
+        return '"$HOME/%s"' % expanded[len(home) + 1:]
+    return shlex.quote(expanded)
+
+
+def cmd_start(args):
+    port, host = args.port, args.host
+    log = f"$HOME/.joshua/logs/joshua-{port}.log"
+    run_dir = "$HOME/.joshua/run"
+    launcher = "env -u JOSHUA_API_KEY -u JOSHUA_MODEL_PATH -u JOSHUA_DEVICE" if not args.api_key else "env"
+    parts = [launcher, joshua_bin(host), "serve", "--model", shell_path(host, args.model),
+             "--addr", shlex.quote(args.addr or f"127.0.0.1:{port}"),
+             "--n-ctx", str(args.ctx), "--device", args.device]
+    if args.model_dir:
+        parts += ["--model-dir", shell_path(host, args.model_dir)]
+    if args.api_key:
+        parts += ["--api-key", shlex.quote(args.api_key)]
+    if getattr(args, "dense_placement", None):
+        parts += ["--dense-placement", args.dense_placement]
+    if getattr(args, "expert_placement", None):
+        parts += ["--expert-placement", args.expert_placement]
+    if args.extra:
+        parts += shlex.split(args.extra)
+    cmd = (f"mkdir -p {run_dir} $HOME/.joshua/logs; "
+           f"{' '.join(parts)} > {log} 2>&1 < /dev/null & echo $! > {run_dir}/joshua-{port}.pid")
+    if os.environ.get("JOSHUA_CONTROL_DEBUG"):
+        print("[debug]", cmd)
+    out = run(host, f"nohup bash -lc {shlex.quote(cmd)}", timeout=30)
+    if out.returncode != 0:
+        raise SystemExit(out.stderr.strip()[:400])
+    expected = os.path.basename(args.model).rsplit(".gguf", 1)[0]
+    for _ in range(90):
+        payload = api(host, port, "/v1/models", timeout=5)
+        if isinstance(payload, dict):
+            if "error" in payload:
+                raise SystemExit(f"{host}: port {port} answered with an error (taken by another server?): "
+                                 f"{payload['error'].get('message', payload['error'])}")
+            ids = [m.get("id") for m in payload.get("data", [])]
+            if any(expected in (mid or "") for mid in ids):
+                print(f"{host}: joshua up on port {port} with {ids}")
+                return
+        time.sleep(2)
+    raise SystemExit(f"{host}: joshua did not serve {expected} on port {port}; "
+                     f"see ~/.joshua/logs/joshua-{port}.log")
+
+
+def cmd_stop(args):
+    run(args.host, f"pkill -f 'joshua serve .*--addr [^ ]*:{args.port}' || true")
+    run(args.host, f"rm -f $HOME/.joshua/run/joshua-{args.port}.pid")
+    print(f"{args.host}: stopped (port {args.port})")
+
+
+def cmd_load(args):
+    res = api(args.host, args.port, "/v1/models/load", "POST", {"model": args.model}, timeout=900)
+    print(json.dumps(res)[:400] if res is not None else "no response (is --model-dir set?)")
+
+
+def cmd_unload(args):
+    res = api(args.host, args.port, "/v1/models/unload", "POST", {"model": args.model})
+    print(json.dumps(res)[:400] if res is not None else "no response")
+
+
+def cmd_logs(args):
+    out = run(args.host, f"tail -n {args.lines} $HOME/.joshua/logs/joshua-{args.port}.log 2>/dev/null")
+    print(out.stdout or out.stderr)
+
+
+def cmd_cluster(args):
+    if args.action == "status":
+        for host in args.workers.split(","):
+            host = host.split(":")[0]
+            workers = api(host, port, "/v1/workers")
+            print(f"{host:12} {'router: ' + json.dumps(workers)[:200] if workers else 'no /v1/workers'}")
+        return
+    key = args.key or os.urandom(32).hex()
+    worker_urls = []
+    for item in args.workers.split(","):
+        host, _, port = item.partition(":")
+        port = port or str(args.port)
+        print(f"starting worker {host}:{port} ...")
+        ns = argparse.Namespace(host=host, port=int(port), model=args.model, ctx=args.ctx,
+                                device=args.device, model_dir=args.model_dir, api_key=args.api_key,
+                                addr=f"0.0.0.0:{port}", extra="")
+        cmd_start(ns)
+        ip = run(host, "hostname -I 2>/dev/null | awk '{print $1}' || ipconfig getifaddr en0").stdout.strip()
+        worker_urls.append(f"http://{ip}:{port}")
+    worker_flag = " ".join(f"--worker {u}" for u in worker_urls)
+    print(f"starting router on {args.router} -> {worker_urls}")
+    cmd = (f"mkdir -p $HOME/.joshua/run $HOME/.joshua/logs; JOSHUA_CLUSTER_KEY={key} "
+           f"nohup bash -lc {shlex.quote('JOSHUA_CLUSTER_KEY=%s %s serve --model %s --addr 0.0.0.0:%d --n-ctx %d --device %s %s > $HOME/.joshua/logs/joshua-%d.log 2>&1' % (key, joshua_bin(args.router), shell_path(args.router, args.model), args.port, args.ctx, args.device, worker_flag, args.port))} "
+           f"< /dev/null & echo $! > $HOME/.joshua/run/joshua-{args.port}.pid")
+    run(args.router, cmd, timeout=30)
+    print(f"cluster key: {key}")
+    print(f"router: http://{args.router}:{args.port}")
+
+
+def cmd_install(args):
+    host, port, cpu_port = args.host, args.port, args.cpu_port
+    agent = HOME / ".t3/joshua" / AGENT_NAME
+    if not agent.exists():
+        raise SystemExit(f"missing {agent}")
+    target_dir = f"$HOME/.t3/joshua"
+    run(host, f"mkdir -p {target_dir}", check=True)
+    if resolve(host) != "local":
+        subprocess.run(["rsync", "-a", str(agent), f"{host}:.t3/joshua/{AGENT_NAME}"], check=True)
+    elif Path(agent).resolve() != (Path.home()/".t3/joshua"/AGENT_NAME).resolve():
+        subprocess.run(["cp", str(agent), str(Path.home()/".t3/joshua"/AGENT_NAME)], check=True)
+    run(host, f"chmod +x {target_dir}/{AGENT_NAME}", check=True)
+    script = f'''
+import json, pathlib
+p = pathlib.Path.home()/".t3/userdata/settings.json"
+p.parent.mkdir(parents=True, exist_ok=True)
+d = json.loads(p.read_text()) if p.exists() else {{}}
+inst = d.setdefault("providerInstances", {{}})
+inst["joshua_local"] = {{
+  "driver": "acpRegistry",
+  "displayName": "Joshua (local)",
+  "enabled": True,
+  "config": {{"source": "local", "commandPath": str(pathlib.Path.home()/".t3/joshua/{AGENT_NAME}"),
+              "commandArgs": ["--base-url", "http://127.0.0.1:{port}"]
+                             + (["--cpu-url", "http://127.0.0.1:{cpu_port}"] if {cpu_port} else [])}},
+}}
+p.write_text(json.dumps(d, indent=2) + "\\n")
+print("registered provider instance joshua_local")
+'''
+    out = run(host, f"python3 - <<'PY'\n{script}\nPY", check=True)
+    print(f"[{host}] {out.stdout.strip()}")
+    print(f"[{host}] restart that host's T3 server (or reconnect the device) so it re-reads providers")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("hosts"); p.set_defaults(func=cmd_hosts)
+
+    for name, func in (("status", cmd_status), ("models", cmd_models)):
+        p = sub.add_parser(name)
+        p.add_argument("--host", default="all" if name == "status" else "local")
+        p.add_argument("--port", type=int, default=None)
+        p.set_defaults(func=func)
+
+    p = sub.add_parser("start")
+    p.add_argument("--host", default="local"); p.add_argument("--model", required=True)
+    p.add_argument("--port", type=int, default=DEFAULT_PORT); p.add_argument("--ctx", type=int, default=8192)
+    p.add_argument("--device", default="auto"); p.add_argument("--model-dir")
+    p.add_argument("--api-key"); p.add_argument("--addr"); p.add_argument("--extra", default="")
+    p.add_argument("--dense-placement", help="device | cpu | auto (GPU: force the dense set onto the card)")
+    p.add_argument("--expert-placement", help="device | host | auto (MoE experts)")
+    p.set_defaults(func=cmd_start)
+
+    p = sub.add_parser("stop"); p.add_argument("--host", default="local")
+    p.add_argument("--port", type=int, default=DEFAULT_PORT); p.set_defaults(func=cmd_stop)
+
+    p = sub.add_parser("load"); p.add_argument("--host", default="local")
+    p.add_argument("--model", required=True); p.add_argument("--port", type=int, default=DEFAULT_PORT)
+    p.set_defaults(func=cmd_load)
+
+    p = sub.add_parser("unload"); p.add_argument("--host", default="local")
+    p.add_argument("--model", required=True); p.add_argument("--port", type=int, default=DEFAULT_PORT)
+    p.set_defaults(func=cmd_unload)
+
+    p = sub.add_parser("logs"); p.add_argument("--host", default="local")
+    p.add_argument("--port", type=int, default=DEFAULT_PORT); p.add_argument("-n", "--lines", type=int, default=40)
+    p.set_defaults(func=cmd_logs)
+
+    p = sub.add_parser("cluster")
+    p.add_argument("action", choices=["up", "status"])
+    p.add_argument("--router", default="local"); p.add_argument("--workers", default="")
+    p.add_argument("--model", default=""); p.add_argument("--port", type=int, default=DEFAULT_PORT)
+    p.add_argument("--ctx", type=int, default=8192); p.add_argument("--device", default="auto")
+    p.add_argument("--model-dir"); p.add_argument("--api-key"); p.add_argument("--key")
+    p.set_defaults(func=cmd_cluster)
+
+    p = sub.add_parser("install"); p.add_argument("--host", default="local")
+    p.add_argument("--port", type=int, default=DEFAULT_PORT)
+    p.add_argument("--cpu-port", type=int, default=None,
+                   help="second (CPU) Joshua server that holds models too large for the GPU")
+    p.set_defaults(func=cmd_install)
+
+    args = ap.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
