@@ -54,6 +54,10 @@ use crate::types::Tool;
 
 pub use stream::{ToolCallStream, ToolEvent};
 
+/// The `to=` recipient of a gpt-oss harmony message header, which makes the
+/// message a tool call (see [`crate::reasoning`]).
+pub(crate) use harmony::recipient as harmony_recipient;
+
 /// A tool call extracted from raw model output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedToolCall {

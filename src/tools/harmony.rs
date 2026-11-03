@@ -122,7 +122,7 @@ fn message_end(body: &str, cx: &Cx<'_>) -> Option<usize> {
 }
 
 /// The header's `to=` recipient.
-fn recipient(header: &str) -> Option<&str> {
+pub(crate) fn recipient(header: &str) -> Option<&str> {
     let mut rest = header;
     while let Some(at) = rest.find("to=") {
         let before = &rest[..at];

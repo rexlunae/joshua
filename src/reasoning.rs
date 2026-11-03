@@ -12,8 +12,9 @@
 //!   [`ReasoningFormat::prompt_opens_reasoning`].
 //! * **Harmony** — gpt-oss channels: `<|channel|>analysis<|message|>…<|end|>`
 //!   is reasoning and `<|channel|>final<|message|>…` the answer.  Other
-//!   channels (`commentary`, which carries tool calls) are passed through
-//!   verbatim as answer text for the tool-call parser.
+//!   channels (`commentary`, which carries tool calls), and any message
+//!   addressed to a tool (`to=functions.f`, even on `analysis`), are passed
+//!   through verbatim as answer text for the tool-call parser.
 //!
 //! [`ReasoningSplitter`] works on text as it is decoded: it holds back only
 //! a possible partial marker, so each piece of reasoning or answer is
@@ -24,6 +25,8 @@
 //! tags; the answer after a reasoning block starts at its first
 //! non-whitespace character, as llama-server and Qwen's own parser report
 //! it.
+
+use crate::tools::partial_suffix;
 
 /// How a model marks its reasoning in generated text.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -347,7 +350,7 @@ impl ReasoningSplitter {
                     if flushing {
                         return;
                     }
-                    let keep = partial_suffix(&self.buf, &[end.as_str()]);
+                    let keep = partial_suffix(&self.buf, [end.as_str()]);
                     let ready = self.buf[..self.buf.len() - keep].to_string();
                     self.buf.drain(..self.buf.len() - keep);
                     self.emit_reasoning(out, &ready, false);
@@ -365,7 +368,11 @@ impl ReasoningSplitter {
                                     .next()
                             })
                             .unwrap_or("");
+                        // A message addressed to a tool (`to=functions.f`,
+                        // in either header) is a call on whatever channel:
+                        // it goes to the tool-call parser as written.
                         let channel = match channel {
+                            _ if crate::tools::harmony_recipient(&header).is_some() => Channel::Raw,
                             "analysis" => Channel::Analysis,
                             "final" => Channel::Final,
                             _ => Channel::Raw,
@@ -408,7 +415,7 @@ impl ReasoningSplitter {
                     if flushing {
                         return;
                     }
-                    let keep = partial_suffix(&self.buf, &H_ENDS);
+                    let keep = partial_suffix(&self.buf, H_ENDS);
                     let ready = self.buf[..self.buf.len() - keep].to_string();
                     self.buf.drain(..self.buf.len() - keep);
                     match channel {
@@ -437,25 +444,6 @@ fn looks_like_header(text: &str) -> bool {
         || t.starts_with(H_CHANNEL)
         || H_START.starts_with(t)
         || H_CHANNEL.starts_with(t)
-}
-
-/// Length of the longest suffix of `text` that is a proper prefix of one of
-/// `markers` (and so may still grow into it).  Always a char boundary.
-fn partial_suffix(text: &str, markers: &[&str]) -> usize {
-    let mut best = 0;
-    for marker in markers {
-        for len in (1..marker.len()).rev() {
-            if len <= best || len > text.len() {
-                continue;
-            }
-            let start = text.len() - len;
-            if text.is_char_boundary(start) && marker.starts_with(&text[start..]) {
-                best = len;
-                break;
-            }
-        }
-    }
-    best
 }
 
 /// Split a complete output (see [`ReasoningSplitter`]).  Returns the
@@ -605,6 +593,17 @@ mod tests {
             c,
             "<|start|>assistant<|channel|>commentary to=functions.get_weather <|constrain|>json<|message|>{\"city\":\"Paris\"}<|call|>"
         );
+        // So does a call addressed on the analysis channel (llama.cpp's
+        // gpt-oss cases), which is not reasoning.
+        let text = "<|channel|>analysis<|message|>Need weather.<|end|>\
+                    <|start|>assistant<|channel|>analysis to=functions.get_weather<|message|>{\"city\":\"Paris\"}<|call|>";
+        let (r, c) = assert_streaming_matches(&ReasoningFormat::Harmony, false, text);
+        assert_eq!(r.as_deref(), Some("Need weather."));
+        let (prose, calls) =
+            crate::tools::parse_tool_calls(crate::tools::ToolCallFormat::Harmony, &[], &c);
+        assert_eq!(prose, "");
+        assert_eq!(calls.len(), 1, "{c}");
+        assert_eq!(calls[0].name, "get_weather");
         // Unframed text is an answer.
         let (r, c) = assert_streaming_matches(&ReasoningFormat::Harmony, false, "just text");
         assert_eq!((r, c.as_str()), (None, "just text"));
