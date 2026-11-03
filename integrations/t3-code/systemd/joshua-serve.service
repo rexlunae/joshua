@@ -1,0 +1,15 @@
+[Unit]
+Description=Joshua server (one model per host; edit the model path and device)
+After=network-online.target
+
+[Service]
+Type=simple
+Environment=JOSHUA_API_KEY=
+ExecStart=%h/.cargo/bin/joshua serve --model %h/llama.cpp/models/qwen/Qwen3-14B-Q4_K_M.gguf --model-dir %h --addr 127.0.0.1:18080 --n-ctx 16384 --device cuda --dense-placement device
+Restart=always
+RestartSec=5
+StandardOutput=append:%h/.joshua/logs/joshua-18080.log
+StandardError=append:%h/.joshua/logs/joshua-18080.log
+
+[Install]
+WantedBy=default.target

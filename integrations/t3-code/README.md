@@ -57,23 +57,56 @@ memory, so the picker can offer everything on the host.
 
 ## Clustering
 
-Joshua's router is `serve --worker URL …` with a shared `JOSHUA_CLUSTER_KEY`; every worker is a
-normal `serve` that also answers `/v1/worker/info`. It needs a build with the `distributed` feature and
-the **same model file** on every worker.
+Joshua's distributed build splits a model into stages: **workers are model-less** and a controller
+streams each stage's weights to them.
 
 ```bash
-joshua-control cluster up --router kleya --workers kleya,erskin \
-  --model /home/tserica/models/Qwen3-8B-Q4_K_M.gguf --port 18080 --ctx 8192
-joshua-control cluster status --workers kleya,erskin --port 18092
+# one worker node per host (raw stage protocol on 7070, no HTTP, no model)
+env JOSHUA_CLUSTER_KEY=<64 hex> joshua worker --listen 0.0.0.0:7070
+
+# controller: an ordinary serve that places the model on those nodes
+env JOSHUA_CLUSTER_KEY=<64 hex> joshua serve --model ~/models/Qwen3-8B-Q4_K_M.gguf   --model-dir ~/models --worker 100.97.218.93:7070,100.75.187.112:7070   --addr 127.0.0.1:18085 --n-ctx 8192
 ```
 
-Workers must bind an address the router can reach (`--addr 0.0.0.0:PORT`, tailnet IPs across
-machines) and share the key the command prints; `--worker` takes `host:port`, not a URL. Point a
-provider at the router's port with `joshua-control install --host <router-host> --port <router-port>`.
+Both sides need the same `JOSHUA_CLUSTER_KEY`, the build must include `distributed`, and `--worker`
+takes `host:port` (not a URL).
 
-Membership is only visible on a coordinator (`GET /v1/workers`); `serve --worker` does not mount that
-route, so `cluster status` reports each worker's own `/v1/worker/info` (model, backend, in-flight)
-instead.
+`joshua-control` wraps the same thing:
+
+```bash
+joshua-control cluster up --router kleya --workers kleya,erskin   --model /home/tserica/models/Qwen3-8B-Q4_K_M.gguf --port 18085 --ctx 8192
+joshua-control cluster status --workers kleya,erskin --router kleya --port 18085
+```
+
+`cluster status` probes the worker sockets (a `joshua worker` node does not answer HTTP) and asks the
+controller for its models.
+
+**Known limitation:** the stage planner currently over-reserves and refuses to place even a small
+model — a 5 GB Qwen3-8B across two idle workers reports
+`stage 0 planning reservation 40910570496 exceeds budget 34992283648` — tracked in
+[rexlunae/joshua#267](https://github.com/rexlunae/joshua/issues/267). Until that lands, point one
+provider at each host's own server (below) rather than at a controller.
+
+## Running under systemd
+
+`systemd/` holds two user units that survived a reboot test here:
+
+| Unit | Runs |
+| - | - |
+| `joshua-worker.service` | `joshua worker --listen 0.0.0.0:7070`, model-less |
+| `joshua-serve.service` | one `joshua serve` for this host (edit model path, port, `--device`) |
+
+```bash
+mkdir -p ~/.config/systemd/user ~/.config/joshua
+printf 'JOSHUA_CLUSTER_KEY=%s\n' "$(openssl rand -hex 32)" > ~/.config/joshua/cluster.env   # chmod 600
+cp systemd/*.service ~/.config/systemd/user/
+systemctl --user daemon-reload && systemctl --user enable --now joshua-worker joshua-serve
+loginctl enable-linger "$USER"      # keep them up without a login session
+```
+
+The cluster key goes in `~/.config/joshua/cluster.env` (mode 600), never in the unit file. The units
+use `UnsetEnvironment=JOSHUA_API_KEY`: an **empty** `JOSHUA_API_KEY` is itself a misconfiguration
+(`--api-key contains no non-empty keys`), so the variable has to be removed rather than set blank.
 
 ## Controls
 
