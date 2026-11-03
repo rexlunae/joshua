@@ -442,6 +442,21 @@ async fn each_model_file_is_listed_once_under_an_id_a_load_takes() {
             serde_json::json!(["solo", false]),
         ]
     );
+
+    // Paths the list leaves out (an adapter, a link leading out of the
+    // directory) are free to take as ids.
+    let mut unlisted = vec!["lora.gguf"];
+    if cfg!(unix) {
+        unlisted.push("far.gguf");
+    }
+    for id in unlisted {
+        let load = serde_json::json!({"model": "solo.gguf", "id": id});
+        let (status, body) = call(&app, "POST", "/v1/models/load", load).await;
+        assert_eq!(status, StatusCode::OK, "{id}: {body}");
+        let unload = serde_json::json!({"id": id});
+        let (status, body) = call(&app, "POST", "/v1/models/unload", unload).await;
+        assert_eq!(status, StatusCode::OK, "{id}: {body}");
+    }
     std::fs::remove_dir_all(dir).unwrap();
     #[cfg(unix)]
     std::fs::remove_dir_all(outside).unwrap();

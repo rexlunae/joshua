@@ -612,14 +612,27 @@ impl ModelManager {
         parts.join("/")
     }
 
-    /// Whether `id` is the path ([`Self::path_id`]) of a GGUF in the model
-    /// directory other than `target` (a canonical path).  A file is listed
-    /// by its path once its stem is taken, so a load cannot take another
+    /// Whether `id` is the path ([`Self::path_id`]) of a model the directory
+    /// lists other than `target` (a canonical path).  A file is listed by its
+    /// path once its stem is taken, so a load cannot take another listed
     /// file's path as its id: that file's id would answer with this model.
+    /// Files the inventory leaves out (a link leading out of the directory,
+    /// a GGUF that is not a model on its own) reserve nothing.  Reads the
+    /// header of a file whose path is `id`, so call it off the async runtime.
     fn names_another_file(&self, id: &str, target: Option<&Path>) -> bool {
+        let Ok(root) = self.model_dir.canonicalize() else {
+            return false;
+        };
         crate::model_info::discover_gguf(&self.model_dir)
             .iter()
-            .any(|file| self.path_id(file) == id && file.canonicalize().ok().as_deref() != target)
+            .filter(|file| self.path_id(file) == id)
+            .any(|file| {
+                file.canonicalize()
+                    .is_ok_and(|real| real.starts_with(&root) && Some(real.as_path()) != target)
+                    && GgufFacts::read(file)
+                        .ok()
+                        .is_none_or(|facts| facts.is_model())
+            })
     }
 
     /// Resolve a requested model inside `model_dir`.
@@ -916,15 +929,15 @@ async fn load_model(
     if id.is_empty() {
         return Err(ApiError::bad_request("empty model id"));
     }
-    if manager(&state)?.names_another_file(&id, target.as_deref()) {
-        return Err(ApiError::new(
-            StatusCode::CONFLICT,
-            format!("id '{id}' is the path of another model file in the model directory"),
-            "model_exists",
-        ));
-    }
     let loaded = tokio::task::spawn_blocking(move || {
         let manager = manager(&state)?;
+        if manager.names_another_file(&id, target.as_deref()) {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                format!("id '{id}' is the path of another model file in the model directory"),
+                "model_exists",
+            ));
+        }
         let guard = state.models.reserve(&id)?;
         tracing::info!(model = %id, path = %path.display(), "loading model");
         let model = manager
