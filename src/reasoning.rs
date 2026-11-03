@@ -26,7 +26,10 @@
 //! non-whitespace character, as llama-server and Qwen's own parser report
 //! it.
 
-use crate::tools::partial_suffix;
+use crate::tools::harmony::{
+    self, CHANNEL as H_CHANNEL, ENDS as H_ENDS, MESSAGE as H_MESSAGE, START as H_START,
+};
+use crate::tools::{find_first, partial_suffix};
 
 /// How a model marks its reasoning in generated text.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,12 +54,6 @@ const TAG_PAIRS: [(&str, &str); 4] = [
     ("[THINK]", "[/THINK]"),
     ("<think>", "</think>"),
 ];
-
-/// Harmony markers.
-const H_CHANNEL: &str = "<|channel|>";
-const H_MESSAGE: &str = "<|message|>";
-const H_START: &str = "<|start|>";
-const H_ENDS: [&str; 3] = ["<|end|>", "<|return|>", "<|call|>"];
 
 impl ReasoningFormat {
     /// Work out a model's format from its chat template source and its
@@ -360,21 +357,13 @@ impl ReasoningSplitter {
                     if let Some(at) = self.buf.find(H_MESSAGE) {
                         let header = self.buf[..at].to_string();
                         self.buf.drain(..at + H_MESSAGE.len());
-                        let channel = header
-                            .rfind(H_CHANNEL)
-                            .map(|c| &header[c + H_CHANNEL.len()..])
-                            .and_then(|rest| {
-                                rest.split(|ch: char| ch.is_whitespace() || ch == '<')
-                                    .next()
-                            })
-                            .unwrap_or("");
                         // A message addressed to a tool (`to=functions.f`,
                         // in either header) is a call on whatever channel:
                         // it goes to the tool-call parser as written.
-                        let channel = match channel {
-                            _ if crate::tools::harmony_recipient(&header).is_some() => Channel::Raw,
-                            "analysis" => Channel::Analysis,
-                            "final" => Channel::Final,
+                        let channel = match harmony::channel(&header) {
+                            _ if harmony::recipient(&header).is_some() => Channel::Raw,
+                            Some("analysis") => Channel::Analysis,
+                            Some("final") => Channel::Final,
                             _ => Channel::Raw,
                         };
                         if channel == Channel::Raw {
@@ -394,11 +383,7 @@ impl ReasoningSplitter {
                     return;
                 }
                 (ReasoningFormat::Harmony, State::Body(channel)) => {
-                    let found = H_ENDS
-                        .iter()
-                        .filter_map(|m| self.buf.find(m).map(|at| (at, *m)))
-                        .min_by_key(|(at, _)| *at);
-                    if let Some((at, marker)) = found {
+                    if let Some((at, marker)) = find_first(&self.buf, H_ENDS) {
                         let body = self.buf[..at].to_string();
                         self.buf.drain(..at + marker.len());
                         match channel {
@@ -415,7 +400,7 @@ impl ReasoningSplitter {
                     if flushing {
                         return;
                     }
-                    let keep = partial_suffix(&self.buf, H_ENDS);
+                    let keep = partial_suffix(&self.buf, H_ENDS.iter().copied());
                     let ready = self.buf[..self.buf.len() - keep].to_string();
                     self.buf.drain(..self.buf.len() - keep);
                     match channel {

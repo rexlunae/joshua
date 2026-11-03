@@ -13,14 +13,18 @@
 //! dropped as llama.cpp drops it, and the `final` and `commentary` headers
 //! around plain text are removed so only the text remains.  An `analysis`
 //! message left in the answer (reasoning shown inline) stays as written.
+//!
+//! The harmony vocabulary and header readers here are also the reasoning
+//! splitter's.
 
 use super::json;
 use super::{Cx, Grammar, Marker, PartialCall, Scan};
 
-const START: &str = "<|start|>";
-const CHANNEL: &str = "<|channel|>";
-const MESSAGE: &str = "<|message|>";
-const ENDS: &[&str] = &["<|call|>", "<|end|>", "<|return|>"];
+pub(crate) const START: &str = "<|start|>";
+pub(crate) const CHANNEL: &str = "<|channel|>";
+pub(crate) const MESSAGE: &str = "<|message|>";
+/// The strings that end a message.
+pub(crate) const ENDS: &[&str] = &["<|call|>", "<|end|>", "<|return|>"];
 const FUNCTIONS: &str = "functions.";
 /// Longer than any message header: text this long without `<|message|>`
 /// is not one.
@@ -121,7 +125,7 @@ fn message_end(body: &str, cx: &Cx<'_>) -> Option<usize> {
     }
 }
 
-/// The header's `to=` recipient.
+/// The header's `to=` recipient, which makes the message a tool call.
 pub(crate) fn recipient(header: &str) -> Option<&str> {
     let mut rest = header;
     while let Some(at) = rest.find("to=") {
@@ -139,7 +143,7 @@ pub(crate) fn recipient(header: &str) -> Option<&str> {
 }
 
 /// The header's channel name.
-fn channel(header: &str) -> Option<&str> {
+pub(crate) fn channel(header: &str) -> Option<&str> {
     let at = header.rfind(CHANNEL)?;
     let rest = &header[at + CHANNEL.len()..];
     rest.split(|c: char| c.is_whitespace() || c == '<').next()
