@@ -1,5 +1,5 @@
 //! Fused SIMD dequant+dot kernels for candle's k-quant block types used by
-//! GGUFs (Q8_0, Q2_K, Q4_K, plus Q6_K on AVX2 and AVX-512 and Q5_K on AVX2).
+//! GGUFs (Q8_0, Q2_K, Q4_K, plus Q6_K on AVX2 and AVX-512 and Q5_K on AVX2 and NEON).
 //!
 //! The generic fast path in [`crate::quant_matmul`] dequantizes each weight
 //! row into an f32 scratch buffer (via candle's scalar `GgmlType::to_float`)
@@ -22,7 +22,8 @@
 //!   `fused_row_q6k` / `fused_row_q5k`, entered only after
 //!   `avx2_fma_available()`.
 //! * **aarch64** — NEON, 4 f32 lanes (`fmla`), kernels
-//!   `fused_row_q8_0_neon` / `fused_row_q2k_neon` / `fused_row_q4k_neon`.
+//!   `fused_row_q8_0_neon` / `fused_row_q2k_neon` / `fused_row_q4k_neon` /
+//!   `fused_row_q5k_neon`.
 //!   NEON is mandatory in AArch64, so these are always eligible.
 //!
 //! Block layouts mirror candle's `k_quants` types exactly (the GGUF format
@@ -493,6 +494,7 @@ pub fn try_matmul_fused_neon(
         GgmlDType::Q8_0 => try_fused::<BlockQ8_0Raw, QK8_0>(m, k, n, lhs, block_bytes, dst, parallel, fused_row_q8_0_neon),
         GgmlDType::Q2K => try_fused::<BlockQ2KRaw, QK_K>(m, k, n, lhs, block_bytes, dst, parallel, fused_row_q2k_neon),
         GgmlDType::Q4K => try_fused::<BlockQ4KRaw, QK_K>(m, k, n, lhs, block_bytes, dst, parallel, fused_row_q4k_neon),
+        GgmlDType::Q5K => try_fused::<BlockQ5KRaw, QK_K>(m, k, n, lhs, block_bytes, dst, parallel, fused_row_q5k_neon),
         _ => false,
     }
 }
@@ -1675,7 +1677,7 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     fn fused_parallel_matches_serial_bit_exact() {
         for (name, fused, _) in families() {
-            // Q6_K is fused on both x86_64 families, Q5_K on AVX2 only.
+            // Q6_K is fused on both x86_64 families, Q5_K on AVX2 and NEON.
             let more: &[GgmlDType] = match name {
                 "avx2" => &[GgmlDType::Q6K, GgmlDType::Q5K],
                 _ => &[GgmlDType::Q6K],
@@ -1752,7 +1754,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "aarch64")]
     fn neon_fused_parallel_matches_serial_bit_exact() {
-        for dtype in [GgmlDType::Q8_0, GgmlDType::Q2K, GgmlDType::Q4K] {
+        for dtype in [GgmlDType::Q8_0, GgmlDType::Q2K, GgmlDType::Q4K, GgmlDType::Q5K] {
             let block_bytes = quantized_block_bytes(24, 256, dtype);
             let lhs: Vec<f32> = (0..3 * 256).map(|i| (i as f32) * 0.01 - 1.0).collect();
             let mut par = vec![0f32; 3 * 24];
@@ -1765,7 +1767,7 @@ mod tests {
 
     /// The unified dispatcher runs a fused kernel at every SIMD level and
     /// declines at the scalar one.  Q6_K is fused on both x86_64 levels and
-    /// Q5_K on AVX2; elsewhere they keep the dequantize-then-dot path.
+    /// Q5_K on AVX2 and NEON; elsewhere they keep the generic path.
     #[test]
     fn unified_dispatcher_runs_fused_kernels() {
         use crate::simd::SimdLevel;
