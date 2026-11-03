@@ -3431,6 +3431,11 @@ impl Engine {
         self.n_ctx
     }
 
+    /// Upper bound on generated tokens per request (`--max-output-tokens`).
+    pub fn max_output_tokens(&self) -> u32 {
+        self.max_output_tokens
+    }
+
     /// Tokenize `text` with the model's tokenizer.  `add_special_tokens`
     /// controls the tokenizer's BOS/EOS wrapper; chat prompts formatted by
     /// the engine already contain their special tokens.

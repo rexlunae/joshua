@@ -654,6 +654,8 @@ fn model_json(model: &LoadedModel) -> serde_json::Value {
         "owned_by": "joshua",
         "workers": model.workers.iter().map(|w| w.to_string()).collect::<Vec<_>>(),
         "stages": model.stages,
+        "context_length": model.engine.n_ctx(),
+        "max_output_tokens": model.engine.max_output_tokens(),
     })
 }
 
@@ -1314,6 +1316,8 @@ async fn list_models(State(state): State<AppState>) -> Json<ModelListResponse> {
             object: "model".to_string(),
             created: m.created,
             owned_by: "joshua".to_string(),
+            context_length: Some(m.engine.n_ctx()),
+            max_output_tokens: Some(m.engine.max_output_tokens()),
         })
         .collect();
     if let Some(whisper) = &state.whisper {
@@ -1322,6 +1326,8 @@ async fn list_models(State(state): State<AppState>) -> Json<ModelListResponse> {
             object: "model".to_string(),
             created,
             owned_by: "joshua".to_string(),
+            context_length: None,
+            max_output_tokens: None,
         });
     }
     Json(ModelListResponse {

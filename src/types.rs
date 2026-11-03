@@ -1592,6 +1592,13 @@ pub struct ModelInfo {
     pub created: u64,
     /// Always `"joshua"`.
     pub owned_by: String,
+    /// Context window the server serves this model with, in tokens.
+    /// Omitted for entries that cannot report it (e.g. the Whisper model).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_length: Option<u32>,
+    /// Largest value `max_tokens` may take for this model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
 }
 
 // ─── Error response ───────────────────────────────────────────────────────────
@@ -2197,5 +2204,38 @@ mod tests {
         assert_eq!(o.max_tokens, 5);
         assert_eq!(o.seed, None);
         assert!(o.chat_template_kwargs.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod model_info_tests {
+    use super::*;
+
+    fn info(context: Option<u32>, output: Option<u32>) -> ModelInfo {
+        ModelInfo {
+            id: "Qwen3-14B-Q4_K_M".to_string(),
+            object: "model".to_string(),
+            created: 0,
+            owned_by: "joshua".to_string(),
+            context_length: context,
+            max_output_tokens: output,
+        }
+    }
+
+    #[test]
+    fn model_entry_reports_context_and_output_limits() {
+        let value = serde_json::to_value(info(Some(16384), Some(4096))).unwrap();
+        assert_eq!(value["context_length"], 16384);
+        assert_eq!(value["max_output_tokens"], 4096);
+        // Existing OpenAI fields must not move or disappear.
+        assert_eq!(value["id"], "Qwen3-14B-Q4_K_M");
+        assert_eq!(value["owned_by"], "joshua");
+    }
+
+    #[test]
+    fn model_entry_omits_limits_it_cannot_report() {
+        let value = serde_json::to_value(info(None, None)).unwrap();
+        assert!(value.get("context_length").is_none());
+        assert!(value.get("max_output_tokens").is_none());
     }
 }
