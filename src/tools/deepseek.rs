@@ -27,7 +27,9 @@
 use super::args::{self, Header, TaggedParams};
 use super::generic::close_after;
 use super::json;
-use super::{header_pending, section, CallRead, Cx, Grammar, Marker, PartialCall, Scan};
+use super::{
+    header_broken, header_pending, section, CallRead, Cx, Grammar, Marker, PartialCall, Scan,
+};
 
 // ─── V3 / R1 / V3.1 ─────────────────────────────────────────────────────────
 
@@ -75,6 +77,9 @@ fn v3_call(s: &str, cx: &Cx<'_>) -> CallRead {
     let Some(sep) = s.find(SEP) else {
         return header_pending(s, SEP, cx);
     };
+    if header_broken(&s[..sep]) {
+        return Err(());
+    }
     let head = s[..sep].trim();
     let after_sep = sep + SEP.len();
     let after = &s[after_sep..];
@@ -228,13 +233,16 @@ fn invoke(s: &str, cx: &Cx<'_>) -> CallRead {
         };
     };
     let Some(name_len) = rest.find('"') else {
-        return if cx.finished || rest.contains(['\n', '<']) {
+        return if cx.finished || header_broken(rest) {
             Err(())
         } else {
             Ok(None)
         };
     };
     let name = &rest[..name_len];
+    if header_broken(name) {
+        return Err(());
+    }
     let after_name = NAME.len() + name_len + 1;
     let header_end = match s[after_name..].find('>') {
         Some(at) if s[after_name..after_name + at].trim().is_empty() => after_name + at + 1,

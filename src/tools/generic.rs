@@ -148,22 +148,26 @@ pub(super) type Calls = (Vec<PartialCall>, Option<usize>);
 
 /// Consecutive Qwen3-Coder `<function=name>` blocks starting at `start`.
 /// `Ok(None)` while the first name is still arriving; `Err` when the first
-/// block is not a call.
+/// block is not a call.  A later `<function=` that is not a call ends the
+/// run before it, as it does when it arrives after the run has ended.
 fn xml_functions(region: &str, start: usize, cx: &Cx<'_>) -> Result<Option<Calls>, ()> {
     let mut calls = Vec::new();
     let mut at = start;
+    let mut last_end = start;
     loop {
         let (call, end) = match xml_function(&region[at..], cx) {
             Ok(Some(call)) => call,
             Err(()) if calls.is_empty() => return Err(()),
             Ok(None) if calls.is_empty() => return Ok(None),
-            _ => return Ok(Some((calls, None))),
+            Err(()) => return Ok(Some((calls, Some(last_end)))),
+            Ok(None) => return Ok(Some((calls, None))),
         };
         calls.push(call);
         let Some(end) = end else {
             return Ok(Some((calls, None)));
         };
         at += end;
+        last_end = at;
         let next = skip_ws(region, at);
         let rest = &region[next..];
         if rest.starts_with(FUNCTION) {
@@ -203,7 +207,8 @@ const QWEN3_PARAMS: TaggedParams = TaggedParams {
 fn xml_function(s: &str, cx: &Cx<'_>) -> Result<Option<(PartialCall, Option<usize>)>, ()> {
     let name_start = FUNCTION.len();
     let Some(name_len) = s[name_start..].find('>') else {
-        let partial = s[name_start..].trim_start();
+        // Whitespace around the name is allowed, as it is once `>` comes.
+        let partial = s[name_start..].trim();
         return if cx.finished || partial.contains(char::is_whitespace) {
             Err(())
         } else {
@@ -278,7 +283,7 @@ fn mistral(region: &str, cx: &Cx<'_>) -> Scan {
     let (args, end) = match json::scan_value(raw) {
         Json::Done(len) => (&raw[..len], Some(start + args_at + len)),
         _ if cx.finished => (raw.trim_end(), Some(region.len())),
-        _ => (raw, None),
+        _ => (raw.trim_end(), None),
     };
     let done = end.map(|_| json::canonical(args));
     let streamable = args.starts_with(['{', '[']) || done.is_some();
@@ -336,18 +341,23 @@ impl Grammar for LlamaJson {
     }
 
     fn scan(&self, region: &str, cx: &Cx<'_>) -> Scan {
-        let tagged = region.starts_with(PYTHON_TAG);
-        let first = if tagged { PYTHON_TAG.len() } else { 0 };
-        match llama_json_calls(region, first, cx) {
-            Scan::Text(_) if tagged => Scan::Text(PYTHON_TAG.len()),
-            scan => scan,
-        }
+        let first = if region.starts_with(PYTHON_TAG) {
+            PYTHON_TAG.len()
+        } else {
+            0
+        };
+        llama_json_calls(region, first, cx)
     }
 }
 
-/// `;`-separated JSON calls from `at`, and the end-of-message token Llama
-/// writes after a tagged call.
-fn llama_json_calls(region: &str, mut at: usize, cx: &Cx<'_>) -> Scan {
+/// `;`-separated JSON calls from `first`, and the end-of-message token
+/// Llama writes after a tagged call.  What follows a `;` is another call:
+/// when it is not one, the region is broken markup like a call that breaks
+/// off, so the stream keeps the calls read before it and drops the rest.
+/// A region that is no call gives back only its opening as text, so a
+/// marker later in it is still found.
+fn llama_json_calls(region: &str, first: usize, cx: &Cx<'_>) -> Scan {
+    let mut at = first;
     let mut calls = Vec::new();
     loop {
         let start = skip_ws(region, at);
@@ -363,13 +373,7 @@ fn llama_json_calls(region: &str, mut at: usize, cx: &Cx<'_>) -> Scan {
                     Scan::Calls { calls, end: None }
                 };
             }
-            _ if calls.is_empty() => return Scan::Text(region.len()),
-            _ => {
-                return Scan::Calls {
-                    calls,
-                    end: Some(at),
-                }
-            }
+            _ => return Scan::Text(first),
         };
         calls.push(call.partial(cx.finished));
         let Some(end) = call.end else {
@@ -756,6 +760,72 @@ mod tests {
         let (content, calls) = parse(f, "{\"answer\": 42}");
         assert_eq!(content, "{\"answer\": 42}");
         assert!(calls.is_empty());
+    }
+
+    /// After a `;` comes another call.  One that breaks off after its name
+    /// stands as far as it was read, like any call whose markup breaks
+    /// off, and the rest of the region (through `<|eom_id|>` after
+    /// `<|python_tag|>`, else the rest of the output) never reaches the
+    /// content, however the text is split.
+    #[test]
+    fn llama_json_call_broken_after_a_semicolon_stays_a_call() {
+        let f = ToolCallFormat::LlamaJson;
+        let paris = "{\"name\": \"get_weather\", \"parameters\": {\"city\": \"Paris\"}}";
+        for (text, prose, broken) in [
+            (
+                format!("{paris}; {{\"name\": \"get_weather\", \"parameters\": {{\"city\": x}}}}"),
+                "",
+                "{\"city\": ",
+            ),
+            (
+                format!(
+                    "Let me look.<|python_tag|>{paris}; {{\"name\": \"get_weather\", \
+                     \"parameters\": {{'city': 'Rome'}}}}<|eom_id|> Done."
+                ),
+                "Let me look. Done.",
+                "{",
+            ),
+        ] {
+            let (content, calls) = parse(f, &text);
+            assert_eq!(content, prose, "{text}");
+            assert_eq!(calls.len(), 2, "{text}");
+            assert_eq!(calls[0].arguments, r#"{"city":"Paris"}"#);
+            assert_eq!(calls[1].arguments, broken, "{text}");
+            assert_streams_like_parse(f, &[], &text);
+        }
+        // Text after a `;` that never starts a call is dropped too.
+        let text = format!("{paris}; and that is all.");
+        assert_eq!(parse(f, &text).0, "");
+        assert_eq!(parse(f, &text).1.len(), 1);
+        assert_streams_like_parse(f, &[], &text);
+        // Without a `;`, what follows the call is prose.
+        let text = format!("{paris} and that is all.");
+        assert_eq!(parse(f, &text).0, "and that is all.");
+        assert_streams_like_parse(f, &[], &text);
+    }
+
+    /// A `<function=` after Qwen3-Coder / Functionary calls that is not a
+    /// call ends their run: bare, what follows is prose; inside
+    /// `<tool_call>`, it is dropped through the closing tag.
+    #[test]
+    fn xml_function_that_is_not_a_call_ends_the_run() {
+        let call = "<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>";
+        for (text, prose) in [
+            (
+                format!("{call}\n<function=get weather> and the rest of my answer is here."),
+                "<function=get weather> and the rest of my answer is here.",
+            ),
+            (
+                format!("<tool_call>\n{call}\n<function=get weather> oops\n</tool_call> Done."),
+                "Done.",
+            ),
+        ] {
+            let (content, calls) = parse(G, &text);
+            assert_eq!(content, prose, "{text}");
+            assert_eq!(calls.len(), 1, "{text}");
+            assert_eq!(calls[0].arguments, r#"{"city":"Paris"}"#);
+            assert_streams_like_parse(G, &[], &text);
+        }
     }
 
     /// llama.cpp's NVIDIA-Nemotron-Nano-v2 cases (after the reasoning).

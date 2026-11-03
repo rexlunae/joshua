@@ -466,7 +466,7 @@ pub(crate) struct RawArgs {
 /// a marker spelled inside a string value does not cut it short.  Text that
 /// is not JSON is passed through verbatim once its end marker arrives, and
 /// empty arguments are `{}`.  At the end of decoding an unclosed value is
-/// final as it stands.
+/// final as it stands, up to an end marker if one follows.
 pub(crate) fn raw_args(s: &str, ends: &[&str], finished: bool) -> RawArgs {
     let start = skip_ws(s, 0);
     let body = &s[start..];
@@ -508,15 +508,24 @@ pub(crate) fn raw_args(s: &str, ends: &[&str], finished: bool) -> RawArgs {
                 },
             }
         }
-        Json::Partial => RawArgs {
-            stream: body.to_string(),
-            done: finished.then(|| body.trim_end().to_string()),
-            end: None,
-        },
-        Json::Bad => match super::find_first(s, ends) {
-            Some((at, end)) => closed(s[..at].trim(), at + end.len()),
+        scan => match super::find_first(s, ends) {
+            // Not JSON, or never finished: the first end marker closes it.
+            Some((at, end)) if scan == Json::Bad || finished => {
+                closed(s[..at].trim(), at + end.len())
+            }
+            // An unfinished value streams up to an end marker (one inside
+            // a string that never closes ends it after all) and its
+            // trailing whitespace (a value cut off there ends without it).
+            Some((at, _)) => RawArgs {
+                stream: s[..at].trim().to_string(),
+                done: None,
+                end: None,
+            },
             None => RawArgs {
-                stream: String::new(),
+                stream: match scan {
+                    Json::Bad => String::new(),
+                    _ => super::before_partial(body, ends).trim_end().to_string(),
+                },
                 done: finished.then(|| body.trim_end().to_string()),
                 end: None,
             },

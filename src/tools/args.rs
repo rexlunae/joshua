@@ -228,6 +228,9 @@ impl Params<'_> {
 }
 
 /// A call whose arguments were written one tagged parameter at a time.
+/// `open` is a string parameter still being written; a call `done` while
+/// one is open (decoding ended inside it) keeps it as written so far, as it
+/// streamed.
 pub(crate) fn tagged_call(
     name: &str,
     args: &ArgsJson,
@@ -235,7 +238,14 @@ pub(crate) fn tagged_call(
     done: bool,
 ) -> PartialCall {
     if done {
-        let text = args.finish();
+        let text = match open {
+            Some((key, text)) => {
+                let mut args = args.clone();
+                args.push(key, &Value::from(text));
+                args.finish()
+            }
+            None => args.finish(),
+        };
         PartialCall {
             id: None,
             name: name.to_string(),

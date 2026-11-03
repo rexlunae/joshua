@@ -66,9 +66,13 @@ impl<'a> ToolCallStream<'a> {
     /// A stream for a model emitting `format`.  Without `tools`, markup is
     /// ordinary text and everything passes straight through.
     pub fn new(format: ToolCallFormat, tools: Option<&'a [Tool]>) -> Self {
+        Self::with_grammar(tools.map(|_| format.grammar()), tools.unwrap_or_default())
+    }
+
+    fn with_grammar(grammar: Option<&'static dyn Grammar>, tools: &'a [Tool]) -> Self {
         Self {
-            grammar: tools.map(|_| format.grammar()),
-            tools: tools.unwrap_or_default(),
+            grammar,
+            tools,
             text: String::new(),
             pos: 0,
             region: None,
@@ -180,10 +184,7 @@ impl<'a> ToolCallStream<'a> {
                         calls_before_break(grammar, &self.text[start..], self.tools);
                     self.sync(calls, out);
                     if self.calls.len() > self.region_first {
-                        tracing::debug!(
-                            "tool-call markup broke off after a call began; dropping the rest"
-                        );
-                        self.broken = Some(good);
+                        self.break_off(good);
                         continue;
                     }
                     let n = match scan {
@@ -193,7 +194,15 @@ impl<'a> ToolCallStream<'a> {
                     self.release(start, n, out);
                 }
                 Scan::Calls { calls, end } => {
+                    // A call that began in the region and that the scan no
+                    // longer returns broke off too.
+                    let lost = calls.len() < self.calls.len() - self.region_first;
                     self.sync(calls, out);
+                    if lost {
+                        let read = end.filter(|&n| n > 0);
+                        self.break_off(read.unwrap_or(self.text.len() - start));
+                        continue;
+                    }
                     match end {
                         Some(n) if n > 0 => {
                             self.pos = start + n;
@@ -210,6 +219,14 @@ impl<'a> ToolCallStream<'a> {
                 }
             }
         }
+    }
+
+    /// The open region's markup broke off `from` bytes in, after a call in
+    /// it had begun: the calls sent stand, and the rest of the region is
+    /// dropped.
+    fn break_off(&mut self, from: usize) {
+        tracing::debug!("tool-call markup broke off after a call began; dropping the rest");
+        self.broken = Some(from);
     }
 
     /// Release the first `n` bytes of the region at `start` as prose.
@@ -583,6 +600,44 @@ mod tests {
         let mut stream = ToolCallStream::new(ToolCallFormat::Generic, Some(&[]));
         let events = collect(&mut stream, &[" \n"]);
         assert_eq!(prose(&events), " \n");
+    }
+
+    /// A grammar whose `<x>` region reads a call `f` while it is `<x>f`
+    /// and no call once more follows: a call the scan stops returning
+    /// after the stream has sent it.
+    struct Forgetful;
+
+    impl Grammar for Forgetful {
+        fn markers(&self) -> &'static [Marker] {
+            const MARKERS: &[Marker] = &[Marker::anywhere("<x>").closed_by(&["</x>"])];
+            MARKERS
+        }
+
+        fn scan(&self, region: &str, _: &Cx<'_>) -> Scan {
+            let calls = match region {
+                "<x>f" => vec![PartialCall {
+                    name: "f".into(),
+                    ..PartialCall::default()
+                }],
+                _ => Vec::new(),
+            };
+            Scan::Calls {
+                calls,
+                end: (region.len() > "<x>f".len()).then_some("<x>".len()),
+            }
+        }
+    }
+
+    /// The call sent stands and the rest of its region is dropped, as
+    /// when a region stops scanning as calls.
+    #[test]
+    fn a_call_the_scan_loses_stands_and_its_region_is_dropped() {
+        static FORGETFUL: Forgetful = Forgetful;
+        let mut stream = ToolCallStream::with_grammar(Some(&FORGETFUL), &[]);
+        let events = collect(&mut stream, &["<x>f", "(broken</x> after"]);
+        assert_eq!(prose(&events), " after");
+        assert_eq!(stream.calls().len(), 1);
+        assert_eq!(stream.calls()[0].name, "f");
     }
 
     /// No whitespace-only prose is sent between or after calls; prose

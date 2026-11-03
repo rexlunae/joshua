@@ -21,7 +21,9 @@
 use super::args::{self, Header, TaggedParams};
 use super::generic::close_after;
 use super::json;
-use super::{header_pending, section, CallRead, Cx, Grammar, Marker, PartialCall, Scan};
+use super::{
+    header_broken, header_pending, section, CallRead, Cx, Grammar, Marker, PartialCall, Scan,
+};
 
 // ─── Kimi K2 ────────────────────────────────────────────────────────────────
 
@@ -65,8 +67,7 @@ fn k2_call(s: &str, cx: &Cx<'_>) -> CallRead {
     let Some(header_len) = s.find(K2_ARGS) else {
         return header_pending(s, K2_ARGS, cx);
     };
-    // As for a header still arriving, one with other markup is not one.
-    if s[..header_len].contains(['\n', '<']) {
+    if header_broken(&s[..header_len]) {
         return Err(());
     }
     let header = s[..header_len].trim();
@@ -185,6 +186,9 @@ fn k3_call(s: &str, cx: &Cx<'_>) -> CallRead {
     let Some(attrs_len) = s.find(SEP) else {
         return header_pending(s, SEP, cx);
     };
+    if header_broken(&s[..attrs_len]) {
+        return Err(());
+    }
     let Some(name) = args::attribute(&s[..attrs_len], "tool") else {
         return Err(());
     };

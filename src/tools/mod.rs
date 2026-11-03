@@ -474,11 +474,17 @@ pub(crate) type CallRead = Result<Option<(PartialCall, Option<usize>)>, ()>;
 /// arriving while it stays on one line without other markup (a partial
 /// `end` at its tail aside), not a call otherwise or once decoding ends.
 pub(crate) fn header_pending(s: &str, end: &str, cx: &Cx<'_>) -> CallRead {
-    if cx.finished || before_partial(s, &[end]).contains(['\n', '<']) {
+    if cx.finished || header_broken(before_partial(s, &[end])) {
         Err(())
     } else {
         Ok(None)
     }
+}
+
+/// Whether a call header (or the name in it) runs over a line or into other
+/// markup: then it is not one, whether it is read whole or as it arrives.
+pub(crate) fn header_broken(header: &str) -> bool {
+    header.contains(['\n', '<'])
 }
 
 /// A run of calls each opened by one of `call`, optionally wrapped in a
@@ -587,6 +593,9 @@ pub(crate) fn section(
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod corruption_tests;
 
 #[cfg(test)]
 pub(crate) mod tests {
