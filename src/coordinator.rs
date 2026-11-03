@@ -62,7 +62,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use axum::body::{Body, Bytes};
 use axum::extract::{Request, State};
@@ -82,7 +82,8 @@ use tokio::task::JoinHandle;
 use tower_http::cors::CorsLayer;
 use uuid::Uuid;
 
-use crate::types::{ErrorResponse, ModelInfo, ModelListResponse};
+use crate::model_info::ModelInfo;
+use crate::types::{ErrorResponse, ModelCard, ModelListResponse};
 
 mod jobs;
 
@@ -142,6 +143,10 @@ pub struct WorkerInfo {
     pub transcription_in_flight: usize,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub embedding_jobs: Vec<JobModel>,
+    /// The worker's own `/v1/models` entries for the models it serves, which
+    /// the router's model list passes through; older workers leave it out.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cards: Vec<ModelCard>,
     /// Bounded live cache inventory; absence is unknown on older workers.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub cache_residency: HashMap<String, crate::affinity::CacheResidency>,
@@ -1141,6 +1146,33 @@ impl Coordinator {
         models
     }
 
+    /// The `/v1/models` entries for [`Self::models`]: each model's card
+    /// from the first healthy worker (in configured order) that reports
+    /// one, or an entry naming just the model for workers that predate
+    /// cards.
+    fn model_cards(&self) -> Vec<ModelCard> {
+        let cards: Vec<ModelCard> = self
+            .workers
+            .iter()
+            .flat_map(|w| {
+                let st = w.status();
+                st.info
+                    .as_ref()
+                    .filter(|_| st.healthy)
+                    .map(|i| i.cards.clone())
+                    .unwrap_or_default()
+            })
+            .collect();
+        let created = crate::model_info::now();
+        self.models()
+            .into_iter()
+            .map(|id| match cards.iter().find(|card| card.id == id) {
+                Some(card) => card.clone(),
+                None => ModelInfo::new(id, created).card(),
+            })
+            .collect()
+    }
+
     /// Open a connection to `w` and send one request.  The returned guard
     /// owns the connection; dropping it closes the socket.  The error's flag
     /// says whether the request may have reached the worker.
@@ -1842,8 +1874,8 @@ fn reject_response(reject: Reject) -> Response {
 // ─── HTTP front end ──────────────────────────────────────────────────────────
 
 /// The coordinator's router: the routed `/v1` endpoints plus `GET /health`,
-/// `GET /v1/models` (union of healthy workers' models) and `GET /v1/workers`
-/// (registry status).
+/// `GET /v1/models` (union of healthy workers' models; also `GET /models`
+/// and `GET /v1/models/{id}`) and `GET /v1/workers` (registry status).
 ///
 /// Cross-origin (CORS) access is allowed only when a client API key is
 /// configured: browser pages from other origins can then call the router but
@@ -1853,6 +1885,8 @@ fn reject_response(reject: Reject) -> Response {
 pub fn create_router(coordinator: Arc<Coordinator>) -> Router {
     let mut api = Router::new()
         .route("/v1/models", get(list_models))
+        .route("/models", get(list_models))
+        .route("/v1/models/{*id}", get(retrieve_model))
         .route("/v1/workers", get(list_workers));
     api = api.route(
         "/v1/affinity",
@@ -1922,25 +1956,21 @@ async fn health(State(c): State<Arc<Coordinator>>) -> Response {
 }
 
 async fn list_models(State(c): State<Arc<Coordinator>>) -> Json<ModelListResponse> {
-    let created = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    Json(ModelListResponse {
-        object: "list".to_string(),
-        data: c
-            .models()
-            .into_iter()
-            .map(|id| ModelInfo {
-                id,
-                object: "model".to_string(),
-                created,
-                owned_by: "joshua".to_string(),
-                context_length: None,
-                max_output_tokens: None,
-            })
-            .collect(),
-    })
+    Json(ModelListResponse::new(c.model_cards()))
+}
+
+/// `GET /v1/models/{id}` — one model's entry, as the list has it.
+async fn retrieve_model(
+    State(c): State<Arc<Coordinator>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    match c.model_cards().into_iter().find(|card| card.id == id) {
+        Some(card) => Json(card).into_response(),
+        None => {
+            let body = ErrorResponse::unknown_model(&id);
+            (StatusCode::NOT_FOUND, Json(body)).into_response()
+        }
+    }
 }
 
 async fn list_workers(State(c): State<Arc<Coordinator>>) -> Json<serde_json::Value> {

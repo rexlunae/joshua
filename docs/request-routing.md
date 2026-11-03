@@ -51,7 +51,13 @@ On the router:
   the worker answers `text/event-stream` (a joshua worker streams only chat
   completions; `stream: true` on the other routes still gets JSON), and
   buffered otherwise.
-* `GET /v1/models` — union of the healthy workers' models.
+* `GET /v1/models` (also `GET /models`) — union of the healthy workers'
+  models.  Each entry is the worker's own `/v1/models` entry, limits
+  (`context_length`, `max_output_tokens`), vLLM and llama-server fields and
+  placement included, taken from the first healthy worker (in configured
+  order) that serves the model; a worker that predates these entries gets
+  one with just the id.  `GET /v1/models/{id}` returns one entry, or a `404`
+  (`code: "model_not_found"`).
 * `GET /v1/workers` — registry: health, last reported info, slots, requests
   in flight from this router and a conservative other-client snapshot, last
   error. Worker audio counts have no ownership identity, so the snapshot can
@@ -75,6 +81,9 @@ On each worker, `GET /v1/worker/info` (protocol version 1):
  "capabilities":{"chat":true,"completions":true,"embeddings":true,
                  "transcriptions":false,"streaming":true,"tools":true}}
 ```
+
+A worker also reports `cards`: its `/v1/models` entries for the models it
+serves, which the router's `GET /v1/models` passes through.
 
 ## Registry and admission
 

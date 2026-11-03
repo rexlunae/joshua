@@ -147,8 +147,94 @@ async fn a_server_without_a_model_loads_and_unloads_through_the_api() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+    // `second` stays loaded; `tiny.gguf` is listed again as a file to load.
     let (_, body) = call(&app, "GET", "/v1/models", serde_json::Value::Null).await;
-    assert_eq!(body["data"].as_array().unwrap().len(), 1);
+    let listed: Vec<_> = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| serde_json::json!([m["id"], m["joshua"]["loaded"]]))
+        .collect();
+    let expected = [serde_json::json!(["second", true]), serde_json::json!(["tiny", false])];
+    assert_eq!(listed, expected);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn the_model_directory_lists_unloaded_files_from_their_headers() {
+    let dir = common::model_dir("controller-cards");
+    common::write_tiny_llama_gguf(&dir.join("tiny.gguf"));
+    std::fs::create_dir_all(dir.join("sub")).unwrap();
+    common::write_tiny_gguf(&dir.join("sub").join("other.gguf"), "qwen3");
+    let mut manager = manager(&dir);
+    manager.max_output_tokens = Some(16);
+    let app = create_router(state(ModelRegistry::default(), Some(manager)));
+
+    // Nothing is loaded: both files are listed from their headers, with the
+    // limits a load with the server's flags (n_ctx 64, max output 16) gives.
+    let (status, body) = call(&app, "GET", "/v1/models", serde_json::Value::Null).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let cards = body["data"].as_array().unwrap();
+    let ids: Vec<_> = cards.iter().map(|m| m["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, ["other", "tiny"]);
+    for card in cards {
+        assert_eq!(card["joshua"]["loaded"], false, "{card}");
+        assert_eq!(card["context_length"], 64, "{card}");
+        assert_eq!(card["max_model_len"], 64, "{card}");
+        assert_eq!(card["max_context_length"], 512, "{card}");
+        assert_eq!(card["max_output_tokens"], 16, "{card}");
+        assert_eq!(card["meta"]["n_ctx_train"], 512, "{card}");
+        assert_eq!(card["meta"]["n_vocab"], 16, "{card}");
+        assert!(
+            card["joshua"].get("backend").is_none(),
+            "not placed yet: {card}"
+        );
+        assert!(card["joshua"]["file_size"].as_u64().unwrap() > 0);
+    }
+    assert_eq!(cards[0]["joshua"]["architecture"], "qwen3");
+    assert!(cards[0]["root"].as_str().unwrap().ends_with("other.gguf"));
+    let (status, other) = call(&app, "GET", "/v1/models/other", serde_json::Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(other["joshua"]["loaded"], false);
+
+    // Loading one turns its entry into the loaded model's; the other file
+    // stays listed.  The load's answer is the same card.
+    let (status, loaded) = call(
+        &app,
+        "POST",
+        "/v1/models/load",
+        serde_json::json!({"model": "tiny.gguf"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{loaded}");
+    assert_eq!(loaded["context_length"], 64);
+    assert_eq!(loaded["joshua"]["loaded"], true);
+    assert_eq!(loaded["workers"], serde_json::json!([]));
+    let (_, body) = call(&app, "GET", "/v1/models", serde_json::Value::Null).await;
+    let cards = body["data"].as_array().unwrap();
+    assert_eq!(cards[0]["id"], "tiny");
+    assert_eq!(cards[0]["joshua"]["loaded"], true);
+    assert_eq!(cards[0]["joshua"]["backend"], "cpu");
+    assert_eq!(cards[0]["max_output_tokens"], 16);
+    assert_eq!(cards[1]["id"], "other");
+    assert_eq!(cards[1]["joshua"]["loaded"], false);
+
+    // Ollama's /api/tags lists the same inventory, now with each file's size
+    // and family; /api/ps only what is loaded.
+    let (_, tags) = call(&app, "GET", "/api/tags", serde_json::Value::Null).await;
+    let names: Vec<_> = tags["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["name"].clone())
+        .collect();
+    assert_eq!(names, ["tiny:latest", "other:latest"]);
+    assert_eq!(tags["models"][0]["details"]["family"], "llama");
+    assert_eq!(tags["models"][0]["size"], cards[0]["joshua"]["file_size"]);
+    assert_eq!(tags["models"][1]["details"]["family"], "qwen3");
+    let (_, ps) = call(&app, "GET", "/api/ps", serde_json::Value::Null).await;
+    assert_eq!(ps["models"].as_array().unwrap().len(), 1);
+    assert_eq!(ps["models"][0]["name"], "tiny:latest");
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -298,6 +384,12 @@ async fn controller_places_a_model_on_model_less_workers_and_unloads_it() {
         if round == 1 {
             assert_eq!(body["stages"], serde_json::json!([[0, 2], [2, 3]]));
         }
+        // The answer is the model's /v1/models entry, which says it runs on
+        // the workers.
+        assert_eq!(body["context_length"], 64);
+        assert_eq!(body["joshua"]["remote"], true);
+        assert_eq!(body["joshua"]["workers"], body["workers"]);
+        assert_eq!(body["joshua"]["stages"], body["stages"]);
         let (status, props) = call(&app, "GET", "/props", serde_json::Value::Null).await;
         assert_eq!(status, StatusCode::OK, "{props}");
         assert_eq!(props["default_generation_settings"]["temperature"], 0.25);

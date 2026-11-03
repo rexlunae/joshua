@@ -11,7 +11,9 @@
 //! - `POST /tokenize`                 — tokenize with the loaded model
 //!   (also `/v1/tokenize`, and `/api/tokens` for Ollama clients)
 //! - `POST /v1/detokenize`            — ids back to text (vLLM / llama.cpp)
-//! - `GET  /v1/models`                — list loaded model
+//! - `GET  /v1/models`                — list the models, with their limits
+//!   (also `/models`; `GET /v1/models/{id}` for one, see
+//!   [`crate::model_info`])
 //! - `POST /v1/chat/completions`      — chat completion (stream or non-stream)
 //! - `POST /v1/messages`              — Anthropic Messages API
 //! - `POST /v1/completions`           — legacy text completion
@@ -59,6 +61,7 @@ use crate::anthropic::{self, MessagesRequest};
 use crate::coordinator::{JobModel, ModelSlots, WorkerCapabilities, WorkerInfo, JOB_OWNER_HEADER, WORKER_PROTOCOL_VERSION};
 use crate::engine::{Completion, Engine, EngineOptions};
 use crate::error::JoshuaError;
+use crate::model_info::{device_label, now, GgufFacts, ModelInfo, ModelLimits, Placement};
 use crate::reasoning::{ReasoningOutput, Split};
 use crate::sampling::SamplingProfile;
 use crate::whisper::WhisperEngine;
@@ -66,7 +69,7 @@ use crate::tools::{parse_tool_calls, ParsedToolCall};
 use crate::types::{
     AssistantMessage, ChatChoice, ChatCompletionChunk, ChatCompletionRequest,
     ChatCompletionResponse, ChatMessage, DeltaContent, EmbeddingData, EmbeddingRequest,
-    EmbeddingResponse, ErrorResponse, FunctionCallResult, GenerationOptions, ModelInfo,
+    EmbeddingResponse, ErrorResponse, FunctionCallResult, GenerationOptions, ModelCard,
     ModelListResponse, Tool, ToolCall, UsageInfo,
 };
 
@@ -224,6 +227,46 @@ impl ServerState {
             metrics: Arc::new(ServerMetrics::default()),
         }
     }
+
+    /// Every model this server can serve: the loaded ones, then (with
+    /// `--model-dir`) each `.gguf` in the directory that is not loaded under
+    /// its file stem, described from its header alone.  This is the
+    /// inventory `/v1/models` and Ollama's `/api/tags` list.
+    pub fn inventory(&self) -> Vec<ModelInfo> {
+        let mut out: Vec<ModelInfo> = self.models.list().iter().map(LoadedModel::info).collect();
+        if let Some(manager) = &self.manager {
+            for file in crate::model_info::discover_gguf(&manager.model_dir) {
+                let id = file
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("model")
+                    .to_string();
+                if out.iter().any(|m| m.id == id) {
+                    continue;
+                }
+                out.push(ModelInfo::of_file(&id, &file, manager));
+            }
+        }
+        out
+    }
+
+    /// The Whisper model's entry, when one is configured.
+    fn whisper_info(&self) -> Option<ModelInfo> {
+        self.whisper.as_ref().map(|whisper| ModelInfo {
+            placement: Some(Placement::on(whisper.device())),
+            ..ModelInfo::new(whisper.model_name(), now())
+        })
+    }
+
+    /// The `/v1/models` entries: [`Self::inventory`], then the Whisper
+    /// model.
+    fn model_cards(&self) -> Vec<ModelCard> {
+        self.inventory()
+            .into_iter()
+            .chain(self.whisper_info())
+            .map(|model| model.card())
+            .collect()
+    }
 }
 
 // ─── Model registry ─────────────────────────────────────────────────────────
@@ -241,6 +284,18 @@ pub struct LoadedModel {
     pub created: u64,
 }
 
+impl LoadedModel {
+    /// What `/v1/models` reports about this model.
+    pub fn info(&self) -> ModelInfo {
+        let mut info = ModelInfo::of_engine(&self.id, self.created, &self.engine);
+        if let Some(placement) = &mut info.placement {
+            placement.workers = self.workers.iter().map(|w| w.to_string()).collect();
+            placement.stages = self.stages.clone();
+        }
+        info
+    }
+}
+
 /// The models a server answers for, by id.
 #[derive(Default)]
 pub struct ModelRegistry {
@@ -251,13 +306,6 @@ pub struct ModelRegistry {
     /// A worker serves one controller connection at a time, so a claim
     /// lasts until the model's pipeline has released it.
     workers: Mutex<Vec<std::net::SocketAddr>>,
-}
-
-fn now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
 }
 
 impl ModelRegistry {
@@ -550,6 +598,32 @@ impl ModelManager {
         engine
     }
 
+    /// The limits a load of `path` that names no `n_ctx` gives the model:
+    /// the server's `--n-ctx` (on workers, no more than the context the
+    /// model was trained with) and `--max-output-tokens`, as
+    /// [`Self::load`] applies them.
+    pub fn default_limits(&self, path: &Path, facts: Option<&GgufFacts>) -> ModelLimits {
+        let n_ctx_train = facts.and_then(|f| f.n_ctx_train);
+        // Only the context is read here.  The options also settle (and log)
+        // the file's page-cache plan, which is a load's business, not a
+        // listing's: keep that out of the log on every `/v1/models`.
+        let options = tracing::subscriber::with_default(
+            tracing::subscriber::NoSubscriber::default(),
+            || (self.engine_options)(path),
+        );
+        let context = options.resolved_n_ctx();
+        #[cfg(feature = "distributed")]
+        let context = match n_ctx_train {
+            Some(trained) if !self.workers.is_empty() => context.min(trained),
+            _ => context,
+        };
+        let output_cap = self
+            .max_output_tokens
+            .unwrap_or(crate::engine::DEFAULT_MAX_OUTPUT_TOKENS)
+            .max(1);
+        ModelLimits::new(context, n_ctx_train, output_cap)
+    }
+
     /// Place the model on workers: they receive only their stages, from this
     /// controller, and this host keeps just the tokenizer and sampling.
     #[cfg(feature = "distributed")]
@@ -591,10 +665,8 @@ impl ModelManager {
             .map_err(|e| ModelLoad(e.to_string()))? as usize;
         let defaults = Limits::default();
         let server = (self.engine_options)(path);
-        let server_ctx = match server.n_ctx {
-            0 => defaults.context,
-            n => n as usize,
-        };
+        // See `default_limits`, which reports the context this picks.
+        let server_ctx = server.resolved_n_ctx() as usize;
         let context = req.n_ctx.unwrap_or(server_ctx).min(model_ctx);
         let limits = Limits {
             context,
@@ -646,17 +718,15 @@ impl ModelManager {
     }
 }
 
+/// `POST /v1/models/load`'s answer: the model's `/v1/models` entry, with
+/// its workers and stages also at the top level, where they have always
+/// been.
 fn model_json(model: &LoadedModel) -> serde_json::Value {
-    json!({
-        "id": model.id,
-        "object": "model",
-        "created": model.created,
-        "owned_by": "joshua",
-        "workers": model.workers.iter().map(|w| w.to_string()).collect::<Vec<_>>(),
-        "stages": model.stages,
-        "context_length": model.engine.n_ctx(),
-        "max_output_tokens": model.engine.max_output_tokens(),
-    })
+    let mut body = json!(model.info().card());
+    let workers: Vec<String> = model.workers.iter().map(|w| w.to_string()).collect();
+    body["workers"] = json!(workers);
+    body["stages"] = json!(model.stages);
+    body
 }
 
 fn embedding_job(engine: &Engine, model: &str) -> JobModel {
@@ -757,6 +827,8 @@ async fn unload_model(
 pub fn create_router(state: AppState) -> Router {
     let api = Router::new()
         .route("/v1/models", get(list_models))
+        .route("/models", get(list_models))
+        .route("/v1/models/{*id}", get(retrieve_model))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/messages", post(messages))
         .route("/v1/messages/count_tokens", post(messages_count_tokens))
@@ -1229,6 +1301,12 @@ async fn worker_info(State(state): State<AppState>) -> Result<Json<WorkerInfo>, 
         }),
         embedding_jobs: models.iter().filter(|model| model.engine.supports_embeddings())
             .map(|model| model.embedding_job.clone()).collect(),
+        cards: models
+            .iter()
+            .map(LoadedModel::info)
+            .chain(state.whisper_info())
+            .map(|model| model.card())
+            .collect(),
         protocol_version: WORKER_PROTOCOL_VERSION,
         cache_epochs: models
             .iter()
@@ -1270,19 +1348,6 @@ async fn worker_info(State(state): State<AppState>) -> Result<Json<WorkerInfo>, 
     }))
 }
 
-/// Short backend name for a candle device.
-fn device_label(device: &candle_core::Device) -> &'static str {
-    use candle_core::DeviceLocation as L;
-    match device.location() {
-        L::Cpu => "cpu",
-        L::Cuda { .. } => "cuda",
-        L::Metal { .. } => "metal",
-        L::OpenCl { .. } => "opencl",
-        L::Sycl { .. } => "sycl",
-        L::Vulkan { .. } => "vulkan",
-    }
-}
-
 /// Sets its flag when dropped.  Held by a handler across the blocking
 /// generation, so when hyper drops the handler future (the client hung up)
 /// the engine sees the flag and stops decoding.
@@ -1304,36 +1369,32 @@ impl Drop for CancelOnDrop {
     }
 }
 
-/// `GET /v1/models` — returns the loaded models.
-async fn list_models(State(state): State<AppState>) -> Json<ModelListResponse> {
-    let created = now();
-    let mut data: Vec<ModelInfo> = state
-        .models
-        .list()
+/// The `/v1/models` entries, built off the async runtime: a file in the
+/// model directory is described by reading its header.
+async fn model_cards(state: AppState) -> Result<Vec<ModelCard>, ApiError> {
+    tokio::task::spawn_blocking(move || state.model_cards())
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))
+}
+
+/// `GET /v1/models` (also `GET /models`, as llama-server serves it) — the
+/// loaded models, the model directory's other files, and the Whisper model.
+async fn list_models(State(state): State<AppState>) -> Result<Json<ModelListResponse>, ApiError> {
+    Ok(Json(ModelListResponse::new(model_cards(state).await?)))
+}
+
+/// `GET /v1/models/{id}` — one model's `/v1/models` entry; an id no entry
+/// has is OpenAI's `404`.
+async fn retrieve_model(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<ModelCard>, ApiError> {
+    model_cards(state)
+        .await?
         .into_iter()
-        .map(|m| ModelInfo {
-            id: m.id,
-            object: "model".to_string(),
-            created: m.created,
-            owned_by: "joshua".to_string(),
-            context_length: Some(m.engine.n_ctx()),
-            max_output_tokens: Some(m.engine.max_output_tokens()),
-        })
-        .collect();
-    if let Some(whisper) = &state.whisper {
-        data.push(ModelInfo {
-            id: whisper.model_name().to_string(),
-            object: "model".to_string(),
-            created,
-            owned_by: "joshua".to_string(),
-            context_length: None,
-            max_output_tokens: None,
-        });
-    }
-    Json(ModelListResponse {
-        object: "list".to_string(),
-        data,
-    })
+        .find(|card| card.id == id)
+        .map(Json)
+        .ok_or_else(|| ApiError::unknown_model(&id))
 }
 
 /// `POST /v1/chat/completions` — OpenAI chat completions.
@@ -2853,6 +2914,15 @@ impl ApiError {
         Self {
             status: StatusCode::BAD_REQUEST,
             body: ErrorResponse::invalid_request(msg),
+        }
+    }
+
+    /// `404` for an id that names no model (see
+    /// [`ErrorResponse::unknown_model`]).
+    pub(crate) fn unknown_model(id: &str) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            body: ErrorResponse::unknown_model(id),
         }
     }
 

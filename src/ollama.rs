@@ -33,7 +33,7 @@
 //! Ollama's `:tag` suffix names a manifest, which has no joshua equivalent:
 //! every tag of a name resolves to the same `<name>.gguf`.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -46,6 +46,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use crate::engine::Engine;
+use crate::model_info::GgufFacts;
 use crate::sampling::{SamplingDefaults, SamplingProfile};
 use crate::server::{ApiError, AppState, CancelOnDrop};
 use crate::types::{ChatMessage, GenerationOptions, SamplingParams, Tool};
@@ -71,120 +72,7 @@ pub async fn version() -> Json<VersionResponse> {
     })
 }
 
-// ─── shared model listing (also used by /v1/models) ─────────────────────────
-
-/// One model joshua can serve, whether or not it is currently loaded.
-pub struct AvailableModel {
-    pub id: String,
-    pub path: Option<PathBuf>,
-    pub size: u64,
-    pub loaded: bool,
-}
-
-impl AvailableModel {
-    /// Everything the server can serve: loaded models first, then any `.gguf`
-    /// under `model_dir` not already loaded.  Ids are the GGUF stem.
-    pub fn discover(state: &AppState) -> Vec<AvailableModel> {
-        let mut out: Vec<AvailableModel> = Vec::new();
-        for loaded in state.models.list() {
-            out.push(AvailableModel {
-                id: loaded.id.clone(),
-                path: None,
-                size: 0,
-                loaded: true,
-            });
-        }
-        if let Some(manager) = &state.manager {
-            for file in discover_gguf(&manager.model_dir) {
-                let id = file
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("model")
-                    .to_string();
-                if out.iter().any(|m| m.id == id) {
-                    continue;
-                }
-                let size = std::fs::metadata(&file).map(|m| m.len()).unwrap_or(0);
-                out.push(AvailableModel {
-                    id,
-                    path: Some(file),
-                    size,
-                    loaded: false,
-                });
-            }
-        }
-        out
-    }
-}
-
-fn discover_gguf(dir: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    collect_gguf(dir, 0, &mut out);
-    out.sort();
-    out
-}
-
-fn collect_gguf(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
-    if depth > 2 {
-        return;
-    }
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
-    for entry in rd.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_gguf(&path, depth + 1, out);
-        } else if path
-            .extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|e| e.eq_ignore_ascii_case("gguf"))
-        {
-            out.push(path);
-        }
-    }
-}
-
-/// llama.cpp's `general.file_type` enum → quantisation label.
-fn quant_label(ft: u32) -> Option<String> {
-    let s = match ft {
-        0 => "F32",
-        1 => "F16",
-        2 => "Q4_0",
-        3 => "Q4_1",
-        7 => "Q8_0",
-        8 => "Q5_0",
-        9 => "Q5_1",
-        10 => "Q2_K",
-        11 => "Q3_K_S",
-        12 => "Q3_K_M",
-        13 => "Q3_K_L",
-        14 => "Q4_K_S",
-        15 => "Q4_K_M",
-        16 => "Q5_K_S",
-        17 => "Q5_K_M",
-        18 => "Q6_K",
-        19 => "IQ2_XXS",
-        20 => "IQ2_XS",
-        21 => "Q2_K_S",
-        22 => "IQ3_XS",
-        23 => "IQ3_XXS",
-        24 => "IQ1_S",
-        25 => "IQ4_NL",
-        26 => "IQ3_S",
-        27 => "IQ2_S",
-        28 => "IQ4_XS",
-        29 => "I8",
-        30 => "I16",
-        31 => "I32",
-        32 => "I64",
-        33 => "F64",
-        34 => "IQ1_M",
-        35 => "BF16",
-        39 => "TQ1_0",
-        40 => "TQ2_0",
-        _ => return None,
-    };
-    Some(s.to_string())
-}
+// ─── model details (listing: `ServerState::inventory`) ──────────────────────
 
 #[derive(Serialize, Clone, Default)]
 pub struct TagDetails {
@@ -196,24 +84,17 @@ pub struct TagDetails {
     quantization_level: String,
 }
 
-fn details_for(path: Option<&Path>) -> TagDetails {
+fn details_for(facts: Option<&GgufFacts>) -> TagDetails {
     let mut d = TagDetails {
         format: "gguf".to_string(),
         ..Default::default()
     };
-    let Some(path) = path else { return d };
-    let Ok(file) = std::fs::File::open(path) else { return d };
-    let Ok(content) = crate::gguf_ext::read_header(&mut std::io::BufReader::new(file)) else {
-        return d;
-    };
-    let md = &content.metadata;
-    if let Some(family) = md.get("general.architecture").and_then(|v| v.to_string().ok()) {
+    let Some(facts) = facts else { return d };
+    if let Some(family) = &facts.architecture {
         d.families = vec![family.clone()];
         d.family = family.clone();
     }
-    if let Some(ft) = md.get("general.file_type").and_then(|v| v.to_u32().ok()) {
-        d.quantization_level = quant_label(ft).unwrap_or_default();
-    }
+    d.quantization_level = facts.quantization().unwrap_or_default().to_string();
     d
 }
 
@@ -251,15 +132,16 @@ pub struct TagsResponse {
 }
 
 pub async fn tags(State(state): State<AppState>) -> Json<TagsResponse> {
-    let models = AvailableModel::discover(&state)
+    let models = state
+        .inventory()
         .into_iter()
         .map(|m| TagModel {
             name: normalise_name(&m.id),
             model: normalise_name(&m.id),
             modified_at: now_rfc3339(),
-            size: m.size,
+            size: m.facts.as_ref().map_or(0, |f| f.file_size),
             digest: String::new(),
-            details: details_for(m.path.as_deref()),
+            details: details_for(m.facts.as_ref()),
         })
         .collect();
     Json(TagsResponse { models })
@@ -284,15 +166,17 @@ pub struct PsResponse {
 }
 
 pub async fn ps(State(state): State<AppState>) -> Json<PsResponse> {
-    let models = AvailableModel::discover(&state)
-        .into_iter()
-        .filter(|m| m.loaded)
+    let models = state
+        .models
+        .list()
+        .iter()
+        .map(crate::server::LoadedModel::info)
         .map(|m| PsModel {
             name: normalise_name(&m.id),
             model: normalise_name(&m.id),
-            size: m.size,
+            size: m.facts.as_ref().map_or(0, |f| f.file_size),
             digest: String::new(),
-            details: details_for(m.path.as_deref()),
+            details: details_for(m.facts.as_ref()),
             // No idle eviction yet: a loaded model stays resident.
             expires_at: "2318-01-01T00:00:00Z".to_string(),
             size_vram: 0,
@@ -891,10 +775,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn quant_label_matches_llamacpp_enum() {
-        assert_eq!(quant_label(15).as_deref(), Some("Q4_K_M"));
-        assert_eq!(quant_label(35).as_deref(), Some("BF16"));
-        assert_eq!(quant_label(9999), None);
+    fn details_name_the_family_and_ollama_quantization() {
+        let facts = GgufFacts {
+            architecture: Some("qwen3".to_string()),
+            file_type: Some(15),
+            ..GgufFacts::default()
+        };
+        let d = details_for(Some(&facts));
+        assert_eq!(d.family, "qwen3");
+        assert_eq!(d.families, ["qwen3"]);
+        assert_eq!(d.quantization_level, "Q4_K_M");
+        assert_eq!(details_for(None).format, "gguf");
     }
 
     #[test]

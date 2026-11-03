@@ -285,15 +285,20 @@ fn MonitorView() -> Element {
         Some(Ok(list)) if list.data.is_empty() => rsx! { p { "The server reports no models." } },
         Some(Ok(list)) => rsx! {
             Table { fullwidth: true, striped: true, narrow: true,
-                thead { tr { th { "Model id" } th { "Owner" } } }
+                thead { tr { th { "Model id" } th { "Context" } th { "Max output" } th { "Runs on" } } }
                 tbody {
                     for m in list.data.iter() {
-                        tr { key: "{m.id}", td { code { "{m.id}" } } td { "{m.owned_by}" } }
+                        tr { key: "{m.id}",
+                            td { code { "{m.id}" } }
+                            td { "{m.context_label()}" }
+                            td { "{m.output_label()}" }
+                            td { "{m.placement_label()}" }
+                        }
                     }
                 }
             }
             p { class: "help",
-                "joshua serves one chat model per process; a second entry is the Whisper model when one is loaded."
+                "Context is the most tokens one request may use (of the model's trained context); a request's max_tokens is capped at Max output. With --model-dir, files not loaded yet are listed too; the Whisper model, when loaded, has an entry of its own."
             }
         },
     };
