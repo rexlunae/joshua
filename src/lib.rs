@@ -33,6 +33,7 @@ pub mod profile;
 pub mod draft_model;
 pub mod distributed;
 pub mod embedding;
+pub mod fim;
 pub mod constraints;
 pub mod conv1d;
 pub mod engine;
@@ -64,10 +65,12 @@ pub mod quantized_nemotron;
 pub mod quantized_qwen;
 pub mod quant_matmul;
 pub mod raw_block;
+pub mod reasoning;
 pub mod cuda_io;
 pub mod residency;
 pub mod route_trace;
 pub mod affinity;
+pub mod sampling;
 pub mod scan;
 pub mod cache_sim;
 pub mod npu;
@@ -99,10 +102,12 @@ pub mod types;
 pub use rustls;
 
 pub use engine::{
-    find_gguf_in_dir, ComputeBackend, Engine, EngineOptions, DensePlacement, EngramTier,
-    ExpertPlacement, HugePages, MlockMode, MmapMode, PageSize, SsdExpertCache, VramExpertCache,
+    find_gguf_in_dir, Completion, ComputeBackend, Engine, EngineOptions, DensePlacement,
+    EngramTier, ExpertPlacement, HugePages, MlockMode, MmapMode, PageSize, PromptPart, RawPrompt,
+    SsdExpertCache, StopType, VramExpertCache,
 };
 pub use error::{JoshuaError, Result};
+pub use sampling::{SamplingDefaults, SamplingOverrides, SamplingProfile};
 pub use speculative::{SpeculativeConfig, SpeculativeStats};
 pub use types::{
     ChatMessage, EmbeddingRequest, EmbeddingResponse, GenerationOptions, ReasoningConfig,

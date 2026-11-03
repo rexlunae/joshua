@@ -100,6 +100,16 @@ impl Engine {
                 "invalid draft limits, constraint, or non-local backend",
             ));
         }
+        // Settings that need the decode loop's per-token bookkeeping.
+        if self.needs_plain_decode(options)
+            || options.ignore_eos
+            || !options.stop_token_ids.is_empty()
+        {
+            return Err(invalid(
+                "min_tokens, bad_words, DRY, Mirostat, a reasoning budget, ignore_eos and \
+                 stop_token_ids need ordinary completion",
+            ));
+        }
         let context = self.request_n_ctx(options)?;
         if prompt.is_empty() || prompt.len() >= context {
             return Err(invalid("prompt must be nonempty and shorter than context"));
@@ -124,6 +134,11 @@ impl Engine {
         let logits = self.prefill(&mut model, &prompt[reused..], reused)?;
         let options = self.clamp_options(options, Some(prompt.len()));
         let seed = options.seed.unwrap_or_else(rand::random);
+        let sampler = SamplingWorkspace {
+            controls: self.logit_controls(&options, seed, prompt, context),
+            ..Default::default()
+        };
+        let window = super::penalty_window(options.repeat_last_n, context);
         Ok(DraftSession {
             engine: self,
             model: Some(model),
@@ -137,8 +152,8 @@ impl Engine {
             options,
             seed,
             logits,
-            sampler: SamplingWorkspace::default(),
-            text: DecodeText::new(prompt, &self.tokenizer),
+            sampler,
+            text: DecodeText::new(prompt, &self.tokenizer, window),
             replay: None,
         })
     }

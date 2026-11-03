@@ -277,6 +277,13 @@ async fn controller_places_a_model_on_model_less_workers_and_unloads_it() {
     let mut manager = manager(&dir);
     manager.workers = workers.clone();
     manager.cluster_key = Some(KEY.to_vec());
+    // The controller samples, so the server's sampling flags reach it.
+    manager.engine_options = Arc::new(|_: &std::path::Path| {
+        EngineOptions::with_n_ctx(64).sampling(joshua::SamplingOverrides {
+            temperature: Some(0.25),
+            ..Default::default()
+        })
+    });
     let app = create_router(state(ModelRegistry::default(), Some(manager)));
 
     for round in 0..2 {
@@ -291,6 +298,9 @@ async fn controller_places_a_model_on_model_less_workers_and_unloads_it() {
         if round == 1 {
             assert_eq!(body["stages"], serde_json::json!([[0, 2], [2, 3]]));
         }
+        let (status, props) = call(&app, "GET", "/props", serde_json::Value::Null).await;
+        assert_eq!(status, StatusCode::OK, "{props}");
+        assert_eq!(props["default_generation_settings"]["temperature"], 0.25);
         let (status, got) = call(&app, "POST", "/v1/completions", completion("qwen")).await;
         assert_eq!(status, StatusCode::OK, "{got}");
         assert_eq!(got["choices"][0]["text"], expected["choices"][0]["text"]);

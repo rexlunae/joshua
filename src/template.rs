@@ -41,7 +41,21 @@ pub struct ChatTemplate {
     /// The tokenizer's control-token strings.  Untrusted message text is
     /// escaped so a literal copy of one cannot become a control token.
     special_tokens: Vec<String>,
+    /// The most template instructions one render may run (`None`: no
+    /// limit); see [`ChatTemplate::with_fuel`].
+    fuel: Option<u64>,
 }
+
+/// The [`ChatTemplate::with_fuel`] limit for a template a request supplies:
+/// far more than any real chat template needs for a long conversation, and
+/// well under a second of rendering, so a looping template fails instead of
+/// holding a thread.
+pub const REQUEST_TEMPLATE_FUEL: u64 = 10_000_000;
+
+/// Appended to the final message to find where the template's copy of it
+/// ends (see [`ChatTemplate::render_continuation`]): private-use characters
+/// no tokenizer control string contains, and none `tojson` escapes.
+const CONTINUATION_MARKER: &str = "\u{f8ff}joshua-continue\u{f8ff}";
 
 impl ChatTemplate {
     /// Wrap raw Jinja source with the model's BOS/EOS token strings.
@@ -58,7 +72,16 @@ impl ChatTemplate {
             bos_token: bos_token.into(),
             eos_token: eos_token.into(),
             special_tokens: Vec::new(),
+            fuel: None,
         }
+    }
+
+    /// Stop a render after `fuel` template instructions with an error — for
+    /// templates from an untrusted source, which could otherwise loop for
+    /// as long as they like.
+    pub fn with_fuel(mut self, fuel: Option<u64>) -> Self {
+        self.fuel = fuel;
+        self
     }
 
     /// Arm the template with the tokenizer's control-token strings.
@@ -121,6 +144,86 @@ impl ChatTemplate {
         tools: Option<&[Tool]>,
         vars: &serde_json::Map<String, serde_json::Value>,
     ) -> Result<String, String> {
+        self.render_with_options(messages, tools, vars, RenderOptions::default())
+    }
+
+    /// [`ChatTemplate::render_with_vars`] with the generation-prompt and
+    /// assistant-prefill controls of [`RenderOptions`].
+    ///
+    /// A `developer` message becomes a `system` one (merged into a single
+    /// leading system message) unless the template handles the role itself,
+    /// as vLLM does.
+    pub fn render_with_options(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        vars: &serde_json::Map<String, serde_json::Value>,
+        options: RenderOptions,
+    ) -> Result<String, String> {
+        let mapped = map_developer_role(messages, Some(&self.source));
+        let messages = mapped.as_ref();
+        if options.continue_final_message {
+            return self.render_continuation(messages, tools, vars);
+        }
+        self.render_inner(messages, tools, vars, options.add_generation_prompt)
+    }
+
+    /// Render the conversation so the model continues its final message
+    /// (transformers' `continue_final_message`): render without a generation
+    /// prompt and cut everything the template wrote after that message's
+    /// text.  An empty final message is the same as a fresh assistant turn.
+    /// A template that does not echo the message (one that drops the role,
+    /// say) gets the earlier turns plus a generation prompt, then the text,
+    /// as llama.cpp builds a continuation.
+    ///
+    /// The cut is found by a marker rendered after the message, not by
+    /// searching for its text, which can also occur in what the template
+    /// writes after it (a prefill of `<` in Qwen's `<|im_end|>`).
+    fn render_continuation(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        vars: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<String, String> {
+        let Some((last, earlier)) = messages.split_last() else {
+            return self.render_inner(messages, tools, vars, true);
+        };
+        let sanitized = sanitize_messages(std::slice::from_ref(last), &self.special_tokens);
+        let final_text = sanitized[0].content.as_str();
+        if final_text.trim().is_empty() {
+            return self.render_inner(earlier, tools, vars, true);
+        }
+        let mut marked = messages.to_vec();
+        if let Some(last) = marked.last_mut() {
+            last.content.push_str(CONTINUATION_MARKER);
+        }
+        let rendered = self.render_inner(&marked, tools, vars, false)?;
+        let Some(at) = rendered.rfind(CONTINUATION_MARKER) else {
+            let mut prompt = self.render_inner(earlier, tools, vars, true)?;
+            prompt.push_str(final_text);
+            return Ok(prompt);
+        };
+        let head = &rendered[..at];
+        // The marker keeps the message's trailing whitespace from a
+        // template that trims it (Llama 3's `| trim`); end where that
+        // template's own copy ends, as transformers does.
+        let trailing = &final_text[final_text.trim_end().len()..];
+        if !trailing.is_empty() && head.ends_with(trailing) {
+            let plain = self.render_inner(messages, tools, vars, false)?;
+            if !plain.starts_with(head) {
+                return Ok(head[..head.len() - trailing.len()].to_string());
+            }
+        }
+        Ok(head.to_string())
+    }
+
+    fn render_inner(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        vars: &serde_json::Map<String, serde_json::Value>,
+        add_generation_prompt: bool,
+    ) -> Result<String, String> {
         // A user or tool message may contain the bytes of a control token
         // (e.g. `<|im_start|>`).  The tokenizer splits added special tokens
         // out of ordinary text by default, so without this the message would
@@ -140,6 +243,8 @@ impl ChatTemplate {
             tool_calls: Option<&'a serde_json::Value>,
             #[serde(skip_serializing_if = "Option::is_none")]
             tool_call_id: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            reasoning_content: Option<&'a str>,
         }
 
         let msgs: Vec<Msg> = messages
@@ -150,10 +255,12 @@ impl ChatTemplate {
                 name: m.name.as_deref(),
                 tool_calls: m.tool_calls.as_ref(),
                 tool_call_id: m.tool_call_id.as_deref(),
+                reasoning_content: m.reasoning_content.as_deref(),
             })
             .collect();
 
         let mut env = Environment::new();
+        env.set_fuel(self.fuel);
         env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
         env.add_function("raise_exception", |msg: String| -> Result<(), Error> {
             Err(Error::new(ErrorKind::InvalidOperation, msg))
@@ -166,7 +273,10 @@ impl ChatTemplate {
             .map(|(k, v)| (k.clone(), Value::from_serialize(v)))
             .collect();
         ctx.insert("messages".into(), Value::from_serialize(&msgs));
-        ctx.insert("add_generation_prompt".into(), Value::from(true));
+        ctx.insert(
+            "add_generation_prompt".into(),
+            Value::from(add_generation_prompt),
+        );
         ctx.insert("bos_token".into(), Value::from(self.bos_token.as_str()));
         ctx.insert("eos_token".into(), Value::from(self.eos_token.as_str()));
         // Only define `tools` when the request supplied some: templates
@@ -185,6 +295,56 @@ impl ChatTemplate {
             .render(Value::from(ctx))
             .map_err(|e| format!("chat template failed to render: {e}"))
     }
+}
+
+/// How a conversation ends in the rendered prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RenderOptions {
+    /// Append the assistant header (`add_generation_prompt`).
+    pub add_generation_prompt: bool,
+    /// Leave the final (assistant) message open for the model to continue.
+    pub continue_final_message: bool,
+}
+
+impl Default for RenderOptions {
+    fn default() -> Self {
+        Self {
+            add_generation_prompt: true,
+            continue_final_message: false,
+        }
+    }
+}
+
+/// Map OpenAI's `developer` role to `system` when the template does not
+/// handle it (vLLM's `_detect_developer_role_support`: the template names
+/// the role in quotes), and merge the system messages into one leading
+/// message, since templates such as Qwen's require the system message
+/// first.  `None` (no template: the ChatML fallback) always maps.  The
+/// conversation is copied only when it has a `developer` message.
+pub(crate) fn map_developer_role<'a>(
+    messages: &'a [ChatMessage],
+    template: Option<&str>,
+) -> Cow<'a, [ChatMessage]> {
+    let supported =
+        template.is_some_and(|t| t.contains("\"developer\"") || t.contains("'developer'"));
+    if supported || !messages.iter().any(|m| m.role == "developer") {
+        return Cow::Borrowed(messages);
+    }
+    let mut system: Vec<&str> = Vec::new();
+    let mut rest: Vec<ChatMessage> = Vec::with_capacity(messages.len());
+    for message in messages {
+        if message.role == "system" || message.role == "developer" {
+            if !message.content.is_empty() {
+                system.push(&message.content);
+            }
+        } else {
+            rest.push(message.clone());
+        }
+    }
+    let mut out = Vec::with_capacity(rest.len() + 1);
+    out.push(ChatMessage::text("system", system.join("\n\n")));
+    out.extend(rest);
+    Cow::Owned(out)
 }
 
 // ─── Control-token hardening ────────────────────────────────────────────────
@@ -250,24 +410,26 @@ fn escape_specials<'a>(text: &'a str, specials: &[String]) -> Cow<'a, str> {
 /// paths/data URLs handled by the media path, not free-form prompt text.
 fn messages_need_escaping(messages: &[ChatMessage], specials: &[String]) -> bool {
     messages.iter().any(|message| {
-        specials
-            .iter()
-            .any(|special| {
-                message.role.contains(special.as_str())
-                    || message.content.contains(special.as_str())
-                    || message
-                        .name
-                        .as_deref()
-                        .is_some_and(|name| name.contains(special.as_str()))
-                    || message
-                        .tool_call_id
-                        .as_deref()
-                        .is_some_and(|id| id.contains(special.as_str()))
-                    || message
-                        .tool_calls
-                        .as_ref()
-                        .is_some_and(|calls| json_contains(calls, special.as_str()))
-            })
+        specials.iter().any(|special| {
+            message.role.contains(special.as_str())
+                || message.content.contains(special.as_str())
+                || message
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| name.contains(special.as_str()))
+                || message
+                    .tool_call_id
+                    .as_deref()
+                    .is_some_and(|id| id.contains(special.as_str()))
+                || message
+                    .reasoning_content
+                    .as_deref()
+                    .is_some_and(|r| r.contains(special.as_str()))
+                || message
+                    .tool_calls
+                    .as_ref()
+                    .is_some_and(|calls| json_contains(calls, special.as_str()))
+        })
     })
 }
 
@@ -352,6 +514,11 @@ pub(crate) fn sanitize_messages<'a>(
         if let Some(id) = &mut message.tool_call_id {
             if let Cow::Owned(escaped) = escape_specials(id, specials) {
                 *id = escaped;
+            }
+        }
+        if let Some(reasoning) = &mut message.reasoning_content {
+            if let Cow::Owned(escaped) = escape_specials(reasoning, specials) {
+                *reasoning = escaped;
             }
         }
         if let Some(calls) = &mut message.tool_calls {
@@ -466,6 +633,7 @@ mod tests {
                 }
             }])),
             tool_call_id: Some("id<|im_start|>".into()),
+            reasoning_content: Some("r<|im_end|>".into()),
         };
         let messages = [message];
         let specials = qwen_specials();
@@ -475,6 +643,10 @@ mod tests {
         };
         assert_eq!(out[0].content, "a<\u{200b}|im_start|>");
         assert_eq!(out[0].name.as_deref(), Some("n<\u{200b}|im_end|>"));
+        assert_eq!(
+            out[0].reasoning_content.as_deref(),
+            Some("r<\u{200b}|im_end|>")
+        );
         assert_eq!(
             out[0].tool_call_id.as_deref(),
             Some("id<\u{200b}|im_start|>")
@@ -773,5 +945,143 @@ mod tests {
         // Assert context precedence without depending on the renderer's
         // feature-dependent spelling of boolean values.
         assert_eq!(out, "<s>|generation|1|no_tools|ok");
+    }
+
+    // ── Template controls ──────────────────────────────────────────────────
+
+    fn render(t: &ChatTemplate, m: &[ChatMessage], options: RenderOptions) -> String {
+        t.render_with_options(m, None, &serde_json::Map::new(), options)
+            .unwrap()
+    }
+
+    const CONTINUE: RenderOptions = RenderOptions {
+        add_generation_prompt: false,
+        continue_final_message: true,
+    };
+
+    #[test]
+    fn add_generation_prompt_false_leaves_the_header_off() {
+        let t = ChatTemplate::new(QWEN_CHATML, "", "<|im_end|>");
+        let out = render(
+            &t,
+            &[msg("user", "Hi!")],
+            RenderOptions {
+                add_generation_prompt: false,
+                continue_final_message: false,
+            },
+        );
+        assert_eq!(out, "<|im_start|>user\nHi!<|im_end|>\n");
+    }
+
+    #[test]
+    fn continue_final_message_cuts_after_the_prefill() {
+        let t = ChatTemplate::new(QWEN_CHATML, "", "<|im_end|>");
+        let m = [msg("user", "JSON please"), msg("assistant", "{\"a\":")];
+        assert_eq!(
+            render(&t, &m, CONTINUE),
+            "<|im_start|>user\nJSON please<|im_end|>\n<|im_start|>assistant\n{\"a\":"
+        );
+        // A template that trims the content: the prefill's trailing space
+        // is gone, the cut follows the template.
+        let t = ChatTemplate::new(LLAMA3, "<|begin_of_text|>", "<|eot_id|>");
+        let m = [msg("user", "Hi"), msg("assistant", "Sure, ")];
+        assert!(render(&t, &m, CONTINUE)
+            .ends_with("<|start_header_id|>assistant<|end_header_id|>\n\nSure,"));
+        // An empty prefill is a plain new assistant turn.
+        let m = [msg("user", "Hi"), msg("assistant", "")];
+        assert_eq!(
+            render(&t, &m, CONTINUE),
+            t.render(&[msg("user", "Hi")], None).unwrap()
+        );
+    }
+
+    #[test]
+    fn continuation_cut_ignores_copies_of_the_prefill_after_it() {
+        // Each prefill also occurs in the `<|im_end|>` the template writes
+        // after the message; searching for the text would cut there.
+        let t = ChatTemplate::new(QWEN_CHATML, "", "<|im_end|>");
+        for prefill in ["<", "m_end", "|>", "end|>\n"] {
+            let m = [msg("user", "hi"), msg("assistant", prefill)];
+            assert_eq!(
+                render(&t, &m, CONTINUE),
+                format!("<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n{prefill}"),
+                "{prefill:?}"
+            );
+        }
+        // A template that keeps trailing whitespace keeps the prefill's.
+        let m = [msg("user", "hi"), msg("assistant", "Sure, ")];
+        assert!(render(&t, &m, CONTINUE).ends_with("assistant\nSure, "));
+    }
+
+    #[test]
+    fn fuel_stops_a_looping_template() {
+        let looping =
+            "{% for a in range(100000) %}{% for b in range(100000) %}{% endfor %}{% endfor %}";
+        let t = ChatTemplate::new(looping, "", "").with_fuel(Some(REQUEST_TEMPLATE_FUEL));
+        let err = t.render(&[msg("user", "hi")], None).unwrap_err();
+        assert!(err.contains("fuel"), "{err}");
+        // An ordinary long conversation renders well inside the limit.
+        let t = ChatTemplate::new(QWEN_CHATML, "", "").with_fuel(Some(REQUEST_TEMPLATE_FUEL));
+        let long: Vec<ChatMessage> = (0..5000)
+            .map(|i| msg(if i % 2 == 0 { "user" } else { "assistant" }, "some text"))
+            .collect();
+        assert!(t.render(&long, None).is_ok());
+    }
+
+    #[test]
+    fn continuation_falls_back_when_the_template_drops_the_message() {
+        // A template that never echoes assistant text.
+        let t = ChatTemplate::new(
+            "{% for m in messages %}{% if m.role == 'user' %}U:{{ m.content }};{% endif %}{% endfor %}{% if add_generation_prompt %}A:{% endif %}",
+            "",
+            "",
+        );
+        let m = [msg("user", "hi"), msg("assistant", "Hel")];
+        assert_eq!(render(&t, &m, CONTINUE), "U:hi;A:Hel");
+    }
+
+    #[test]
+    fn developer_role_maps_to_a_leading_system_message() {
+        let t = ChatTemplate::new(QWEN_CHATML, "", "<|im_end|>");
+        let m = [
+            msg("system", "Be brief."),
+            msg("user", "Hi"),
+            msg("developer", "Answer in French."),
+        ];
+        assert_eq!(
+            t.render(&m, None).unwrap(),
+            "<|im_start|>system\nBe brief.\n\nAnswer in French.<|im_end|>\n\
+             <|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
+        );
+        // A template that knows the role keeps it.
+        let aware = ChatTemplate::new(
+            "{% for m in messages %}{% if m.role == 'developer' %}D:{% endif %}{{ m.content }};{% endfor %}",
+            "",
+            "",
+        );
+        assert_eq!(
+            aware
+                .render(&[msg("developer", "x"), msg("user", "y")], None)
+                .unwrap(),
+            "D:x;y;"
+        );
+        // Without a developer message nothing is copied.
+        let plain = [msg("system", "a"), msg("user", "b")];
+        assert!(matches!(map_developer_role(&plain, None), Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn reasoning_content_reaches_the_template() {
+        let t = ChatTemplate::new(
+            "{% for m in messages %}{% if m.reasoning_content %}<think>{{ m.reasoning_content }}</think>{% endif %}{{ m.content }}|{% endfor %}",
+            "",
+            "",
+        );
+        let mut assistant = msg("assistant", "Hello");
+        assistant.reasoning_content = Some("greet".into());
+        assert_eq!(
+            t.render(&[msg("user", "hi"), assistant], None).unwrap(),
+            "hi|<think>greet</think>Hello|"
+        );
     }
 }

@@ -608,6 +608,10 @@ async fn real_worker_affinity_reuses_only_its_owned_scope_and_matches_cold_outpu
     let cold = affinity_request(&router, Some(handle), "bob", &body).await;
     assert_eq!(cold.status, StatusCode::OK);
     assert_eq!(comparable(&warm.json()), comparable(&cold.json()));
+    // The reuse shows in the responses' usage too.
+    let cached = |reply: &Value| reply["usage"]["prompt_tokens_details"]["cached_tokens"].as_u64();
+    assert!(cached(&warm.json()).unwrap() > 0);
+    assert_eq!(cached(&cold.json()), Some(0));
     assert_eq!(engine.kv_reuse_count(), before);
     assert_eq!(coordinator.affinity_stats().entries, 2);
     body["stream"] = json!(true);
@@ -1776,8 +1780,14 @@ async fn spawn_real_worker(dir_name: &str, api_key: Option<&str>) -> String {
 
 /// The parts of a chat response that must match direct vs routed (ids and
 /// timestamps differ per request).
+/// The output of a response: everything but how much of the prompt came
+/// from cache, which differs between a warm and a cold run by design.
 fn comparable(v: &Value) -> Value {
-    json!({"choices": v["choices"], "usage": v["usage"], "model": v["model"]})
+    let mut usage = v["usage"].clone();
+    if let Some(usage) = usage.as_object_mut() {
+        usage.remove("prompt_tokens_details");
+    }
+    json!({"choices": v["choices"], "usage": usage, "model": v["model"]})
 }
 
 fn stream_text(body: &str) -> (String, Vec<Value>) {

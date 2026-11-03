@@ -46,8 +46,9 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use crate::engine::Engine;
+use crate::sampling::{SamplingDefaults, SamplingProfile};
 use crate::server::{ApiError, AppState, CancelOnDrop};
-use crate::types::{ChatMessage, GenerationOptions, Tool};
+use crate::types::{ChatMessage, GenerationOptions, SamplingParams, Tool};
 
 fn now_rfc3339() -> String {
     let secs = SystemTime::now()
@@ -360,36 +361,25 @@ pub struct OllamaOptions {
 }
 
 impl OllamaOptions {
-    fn to_generation_options(&self) -> GenerationOptions {
-        let mut o = GenerationOptions::default();
-        if let Some(t) = self.temperature {
-            o.temperature = t;
+    /// Generation options over `defaults` (the Ollama profile: see
+    /// [`crate::Engine::sampling_defaults`]), through the OpenAI routes'
+    /// request mapping.
+    fn to_generation_options(&self, defaults: &SamplingDefaults) -> Result<GenerationOptions, String> {
+        let mut o = GenerationOptions::with_defaults(defaults);
+        SamplingParams {
+            // Ollama: -1 = until stop, -2 = fill context; both are the
+            // unlimited default (still capped by --max-output-tokens).
+            n_predict: self.num_predict.filter(|&n| n > 0).map(i64::from),
+            temperature: self.temperature,
+            top_k: self.top_k,
+            top_p: self.top_p,
+            min_p: self.min_p,
+            repetition_penalty: self.repeat_penalty,
+            stop: self.stop.as_ref().map(|stop| serde_json::Value::from(stop.clone())),
+            ..Default::default()
         }
-        if let Some(k) = self.top_k {
-            o.top_k = k;
-        }
-        if let Some(p) = self.top_p {
-            o.top_p = p;
-        }
-        if let Some(m) = self.min_p {
-            o.min_p = m;
-        }
-        if let Some(r) = self.repeat_penalty {
-            o.repetition_penalty = r;
-        }
-        if let Some(n) = self.num_predict {
-            // Ollama: -1 = until stop, -2 = fill context.  Only a positive
-            // value maps cleanly onto joshua's max_tokens.
-            if n > 0 {
-                o.max_tokens = n as u32;
-            }
-        }
-        if let Some(stop) = &self.stop {
-            if !stop.is_empty() {
-                o.stop_sequences = stop.clone();
-            }
-        }
-        o
+        .apply(&mut o)?;
+        Ok(o)
     }
 }
 
@@ -440,7 +430,10 @@ pub async fn chat(
     Json(req): Json<ChatRequest>,
 ) -> Result<axum::response::Response, ApiError> {
     let (id, engine) = state.models.resolve(&req.model)?;
-    let options = req.options.to_generation_options();
+    let options = req
+        .options
+        .to_generation_options(&engine.sampling_defaults(SamplingProfile::Ollama))
+        .map_err(ApiError::bad_request)?;
     let messages: Vec<ChatMessage> = req
         .messages
         .iter()
@@ -578,7 +571,10 @@ pub async fn generate(
     Json(req): Json<GenerateRequest>,
 ) -> Result<axum::response::Response, ApiError> {
     let (id, engine) = state.models.resolve(&req.model)?;
-    let options = req.options.to_generation_options();
+    let options = req
+        .options
+        .to_generation_options(&engine.sampling_defaults(SamplingProfile::Ollama))
+        .map_err(ApiError::bad_request)?;
     let prompt = match &req.suffix {
         Some(suffix) => format!("{}{suffix}", req.prompt),
         None => req.prompt.clone(),
@@ -917,12 +913,17 @@ mod tests {
             stop: Some(vec!["</s>".into()]),
             ..Default::default()
         };
-        let g = o.to_generation_options();
+        let g = o
+            .to_generation_options(&SamplingProfile::Ollama.defaults())
+            .unwrap();
         assert_eq!(g.max_tokens, 64);
         assert_eq!(g.temperature, 0.0);
         assert_eq!(g.top_k, 20);
         assert_eq!(g.repetition_penalty, 1.1);
         assert_eq!(g.stop_sequences, vec!["</s>".to_string()]);
+        // Unset values come from Ollama's DefaultOptions.
+        assert_eq!(g.top_p, 0.9);
+        assert_eq!(g.min_p, 0.0);
     }
 
     #[test]
@@ -957,12 +958,20 @@ mod tests {
     }
 
     #[test]
-    fn unlimited_predict_does_not_clobber_default() {
-        // -1 / -2 mean "unbounded" / "fill context" in Ollama; neither maps to
-        // a positive max_tokens, so joshua's default must survive.
-        let o = OllamaOptions { num_predict: Some(-1), ..Default::default() };
-        assert_eq!(o.to_generation_options().max_tokens, GenerationOptions::default().max_tokens);
-        let o = OllamaOptions { num_predict: Some(-2), ..Default::default() };
-        assert_eq!(o.to_generation_options().max_tokens, GenerationOptions::default().max_tokens);
+    fn unlimited_predict_runs_to_the_end_of_sequence() {
+        // -1 / -2 mean "unbounded" / "fill context" in Ollama, as does an
+        // unset num_predict (DefaultOptions' -1); all leave the output to
+        // the server's --max-output-tokens.
+        let defaults = SamplingProfile::Ollama.defaults();
+        for num_predict in [None, Some(-1), Some(-2)] {
+            let o = OllamaOptions {
+                num_predict,
+                ..Default::default()
+            };
+            assert_eq!(
+                o.to_generation_options(&defaults).unwrap().max_tokens,
+                crate::types::MAX_TOKENS_UNLIMITED
+            );
+        }
     }
 }

@@ -151,8 +151,9 @@ base64 = "0.22"
 
 # Chat-template rendering (pure Rust Jinja2 engine).
 # pycompat adds Python string/dict methods (.strip(), .title(), …) that
-# HuggingFace chat templates rely on.
-minijinja = { version = "2", features = ["json"] }
+# HuggingFace chat templates rely on.  fuel bounds the work a per-request
+# template may do.
+minijinja = { version = "2", features = ["json", "fuel"] }
 minijinja-contrib = { version = "2", features = ["pycompat"] }
 
 # Sampling

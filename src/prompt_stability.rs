@@ -32,6 +32,16 @@ impl ToolOrders {
     /// `tools` in the order this set of names was first seen, or `None` when
     /// they already are in that order (or the set is new, or names repeat).
     pub fn stable(&self, tools: &[Tool]) -> Option<Vec<Tool>> {
+        self.order(tools, true)
+    }
+
+    /// [`ToolOrders::stable`] for a prompt that is only rendered or counted,
+    /// not run: a new set is not remembered and no set's recency changes.
+    pub fn peek(&self, tools: &[Tool]) -> Option<Vec<Tool>> {
+        self.order(tools, false)
+    }
+
+    fn order(&self, tools: &[Tool], record: bool) -> Option<Vec<Tool>> {
         let names: Vec<String> = tools.iter().map(|t| t.function.name.clone()).collect();
         let set: BTreeSet<String> = names.iter().cloned().collect();
         if set.len() != names.len() || names.len() < 2 {
@@ -39,17 +49,17 @@ impl ToolOrders {
         }
         let mut seen = self.seen.lock().unwrap_or_else(|p| p.into_inner());
         let Some(i) = seen.iter().position(|(s, _)| *s == set) else {
-            seen.push_back((set, names));
-            if seen.len() > MAX_TOOL_SETS {
-                seen.pop_front();
+            if record {
+                seen.push_back((set, names));
+                if seen.len() > MAX_TOOL_SETS {
+                    seen.pop_front();
+                }
             }
             return None;
         };
-        // Most recently used last, so the oldest set is the one forgotten.
-        let entry = seen.remove(i).expect("position is in range");
-        let reordered = (entry.1 != names).then(|| {
-            entry
-                .1
+        let first = &seen[i].1;
+        let reordered = (*first != names).then(|| {
+            first
                 .iter()
                 .map(|n| {
                     tools
@@ -60,7 +70,11 @@ impl ToolOrders {
                 })
                 .collect()
         });
-        seen.push_back(entry);
+        if record {
+            // Most recently used last, so the oldest set is the one forgotten.
+            let entry = seen.remove(i).expect("position is in range");
+            seen.push_back(entry);
+        }
         reordered
     }
 }
@@ -144,6 +158,31 @@ mod tests {
         );
         // Repeated names are left alone.
         assert!(orders.stable(&[tool("x"), tool("x")]).is_none());
+    }
+
+    #[test]
+    fn a_peek_reorders_without_remembering() {
+        let orders = ToolOrders::default();
+        // A set first seen through a peek is not remembered...
+        assert!(orders.peek(&[tool("b"), tool("a")]).is_none());
+        assert!(orders.stable(&[tool("a"), tool("b")]).is_none());
+        // ...and a remembered set comes back in its first order.
+        assert_eq!(
+            names(&orders.peek(&[tool("b"), tool("a")]).unwrap()),
+            ["a", "b"]
+        );
+        // A peek leaves the recency order alone: the set it looked up is
+        // still the oldest, so it is the one forgotten next.
+        for i in 0..MAX_TOOL_SETS - 1 {
+            orders.stable(&[tool(&format!("x{i}")), tool(&format!("y{i}"))]);
+        }
+        orders.peek(&[tool("b"), tool("a")]);
+        orders.stable(&[tool("p"), tool("q")]);
+        assert!(orders.peek(&[tool("b"), tool("a")]).is_none());
+        assert_eq!(
+            names(&orders.peek(&[tool("y0"), tool("x0")]).unwrap()),
+            ["x0", "y0"]
+        );
     }
 
     fn msg(role: &str, content: &str) -> ChatMessage {
