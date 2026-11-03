@@ -17,7 +17,7 @@ use serde_json::{Map, Number, Value};
 use super::args::{tagged_call, ArgsJson};
 use super::generic::marked_list;
 use super::json::skip_ws;
-use super::{Cx, Grammar, Marker, PartialCall, Scan};
+use super::{Cx, Grammar, Marker, PartialCall, Scan, Stop, MAX_NESTING};
 
 const PYTHON_START: &str = "<|python_start|>";
 const PYTHON_END: &str = "<|python_end|>";
@@ -73,21 +73,13 @@ impl Grammar for Lfm2 {
     }
 }
 
-/// Why a value could not be read.
-enum Stop {
-    /// The text ends inside it.
-    Partial,
-    /// It is not a literal.
-    Bad,
-}
-
 type Read<T> = Result<T, Stop>;
 
 /// A call list at the start of `s`, as far as it has been generated: the
 /// calls with a complete name, and the list's length once it has closed.
 /// `Err` when the text is not a call list.
 fn call_list(s: &str, cx: &Cx<'_>) -> Result<(Vec<PartialCall>, Option<usize>), ()> {
-    let mut r = Reader { s, i: 0 };
+    let mut r = Reader::new(s);
     match r.peek() {
         None => return Ok((Vec::new(), None)),
         Some(b'[') => r.i += 1,
@@ -206,7 +198,7 @@ fn is_dotted_name(name: &str) -> bool {
 
 /// The decoded text so far of a string literal that has not closed.
 fn string_prefix(s: &str) -> Option<String> {
-    let mut r = Reader { s, i: 0 };
+    let mut r = Reader::new(s);
     let quote = r.peek().filter(|b| matches!(b, b'"' | b'\''))?;
     r.i += 1;
     let mut out = String::new();
@@ -225,9 +217,15 @@ fn string_prefix(s: &str) -> Option<String> {
 struct Reader<'a> {
     s: &'a str,
     i: usize,
+    /// The lists, tuples and dicts the cursor is inside.
+    depth: usize,
 }
 
-impl Reader<'_> {
+impl<'a> Reader<'a> {
+    fn new(s: &'a str) -> Self {
+        Self { s, i: 0, depth: 0 }
+    }
+
     fn peek(&self) -> Option<u8> {
         self.s.as_bytes().get(self.i).copied()
     }
@@ -240,12 +238,24 @@ impl Reader<'_> {
     fn value(&mut self) -> Read<Value> {
         match self.peek().ok_or(Stop::Partial)? {
             b'"' | b'\'' => self.string().map(Value::String),
-            b'[' => self.sequence(b']').map(Value::Array),
-            b'(' => self.sequence(b')').map(Value::Array),
-            b'{' => self.dict(),
+            b'[' => self.deeper(|r| r.sequence(b']')).map(Value::Array),
+            b'(' => self.deeper(|r| r.sequence(b')')).map(Value::Array),
+            b'{' => self.deeper(Self::dict),
             b'-' | b'+' | b'0'..=b'9' | b'.' => self.number(),
             _ => self.word(),
         }
+    }
+
+    /// `read` a container one level deeper: not a literal past
+    /// [`MAX_NESTING`].
+    fn deeper<T>(&mut self, read: impl FnOnce(&mut Self) -> Read<T>) -> Read<T> {
+        if self.depth == MAX_NESTING {
+            return Err(Stop::Bad);
+        }
+        self.depth += 1;
+        let value = read(self);
+        self.depth -= 1;
+        value
     }
 
     fn string(&mut self) -> Read<String> {

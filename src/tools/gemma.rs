@@ -17,7 +17,7 @@ use serde_json::{Map, Value};
 
 use super::args::{self, tagged_call, ArgsJson};
 use super::generic::{close_after, undecided};
-use super::{Cx, Grammar, Marker, Scan};
+use super::{Cx, Grammar, Marker, Scan, Stop, MAX_NESTING};
 
 const START: &str = "<start_function_call>";
 const END: &str = "<end_function_call>";
@@ -59,6 +59,7 @@ impl Grammar for FunctionGemma {
             s: &region[body_at..],
             i: 0,
             finished: cx.finished,
+            depth: 0,
         };
         let Ok((params, open, end)) = arguments(&mut r, name, cx) else {
             return Scan::Text(START.len());
@@ -76,14 +77,6 @@ impl Grammar for FunctionGemma {
             end: end.and_then(|end| close_after(region, body_at + end, END, &[START], cx.finished)),
         }
     }
-}
-
-/// Why a value could not be read.
-enum Stop {
-    /// The text ends inside it.
-    Partial,
-    /// It is not a value.
-    Bad,
 }
 
 /// A value as written: an escaped string, whose reading depends on the
@@ -138,6 +131,8 @@ struct Reader<'a> {
     i: usize,
     /// Decoding has ended: a bare value at the end of the text is complete.
     finished: bool,
+    /// The objects and arrays the cursor is inside.
+    depth: usize,
 }
 
 impl<'a> Reader<'a> {
@@ -180,11 +175,11 @@ impl<'a> Reader<'a> {
             None => Err(Stop::Partial),
             Some(b'{') => {
                 self.i += 1;
-                self.object().map(Read::Value)
+                self.deeper(Self::object).map(Read::Value)
             }
             Some(b'[') => {
                 self.i += 1;
-                self.array().map(Read::Value)
+                self.deeper(Self::array).map(Read::Value)
             }
             Some(b'<') => Err(Stop::Bad),
             Some(_) => {
@@ -205,6 +200,21 @@ impl<'a> Reader<'a> {
                 }))
             }
         }
+    }
+
+    /// `read` an object or array one level deeper: not a value past
+    /// [`MAX_NESTING`].
+    fn deeper(
+        &mut self,
+        read: impl FnOnce(&mut Self) -> Result<Value, Stop>,
+    ) -> Result<Value, Stop> {
+        if self.depth == MAX_NESTING {
+            return Err(Stop::Bad);
+        }
+        self.depth += 1;
+        let value = read(self);
+        self.depth -= 1;
+        value
     }
 
     /// A nested value: an escaped string is the JSON it spells, or text.

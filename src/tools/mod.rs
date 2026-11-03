@@ -420,6 +420,20 @@ pub(crate) struct PartialCall {
     pub done: Option<String>,
 }
 
+/// Why a value the pythonic or FunctionGemma reader reads by hand could not
+/// be read.
+pub(crate) enum Stop {
+    /// The text ends inside it.
+    Partial,
+    /// It is not a value.
+    Bad,
+}
+
+/// How deep those readers let a value nest (`serde_json`'s limit).  They
+/// recurse once per level, so deeper text is not a value: a model stuck
+/// writing `[[[[…` cannot overflow the decoding thread's stack.
+pub(crate) const MAX_NESTING: usize = 128;
+
 /// Length of the longest suffix of `text` that is a proper prefix of one of
 /// `patterns`: text that may still turn into one of them.
 pub(crate) fn partial_suffix<'p>(text: &str, patterns: impl IntoIterator<Item = &'p str>) -> usize {
@@ -652,6 +666,41 @@ pub(crate) mod tests {
                 assert_eq!(joined, args(call), "chunk {chunk}: streamed arguments");
             }
         }
+    }
+
+    /// A model stuck nesting brackets inside a call: the readers that
+    /// recurse per level stop at [`MAX_NESTING`] instead of overflowing the
+    /// stack of the thread decoding runs on (tokio's 2 MiB), and the call
+    /// stands as far as it was read, as for any markup that breaks off.
+    #[test]
+    fn deep_nesting_does_not_overflow_the_stack() {
+        for (format, open, level) in [
+            (ToolCallFormat::Pythonic, "[f(a=", "["),
+            (ToolCallFormat::Lfm2, "<|tool_call_start|>[f(a=", "["),
+            (
+                ToolCallFormat::FunctionGemma,
+                "<start_function_call>call:f{a:",
+                "{b:",
+            ),
+        ] {
+            let text = format!("{open}{}", level.repeat(100_000));
+            let (prose, calls) = std::thread::Builder::new()
+                .stack_size(2 << 20)
+                .spawn(move || parse(format, &text))
+                .unwrap()
+                .join()
+                .unwrap();
+            assert_eq!(prose, "", "{format}");
+            assert_eq!(calls.len(), 1, "{format}");
+            assert_eq!(calls[0].name, "f");
+            assert_eq!(calls[0].arguments, "{", "{format}");
+            let text = format!("{open}{}", level.repeat(MAX_NESTING + 2));
+            assert_streams_like_parse(format, &[], &text);
+        }
+        // Up to the limit, a value nests as deep as it is written.
+        let (open, close) = ("[".repeat(MAX_NESTING), "]".repeat(MAX_NESTING));
+        let (_, calls) = parse(ToolCallFormat::Pythonic, &format!("[f(a={open}1{close})]"));
+        assert_eq!(calls[0].arguments, format!("{{\"a\":{open}1{close}}}"));
     }
 
     #[test]
