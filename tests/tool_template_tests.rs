@@ -300,6 +300,103 @@ fn string_arguments_reach_templates_as_objects() {
     );
 }
 
+/// Qwen 2.5 / 3 write tools and call arguments with `tojson`, which writes
+/// what transformers' does (as vLLM and llama.cpp render them): the
+/// client's own `json.dumps` text comes back as it was sent, keys in their
+/// order and nothing HTML-escaped.
+#[test]
+fn qwen3_renders_tools_and_arguments_as_python_json() {
+    let tools = [weather_tool()];
+    let sent = r#"{"path": "a.rs", "code": "if a < b && c > 0 { println!(\"don't\") }"}"#;
+    let mut messages = conversation("call_1");
+    messages[1].tool_calls = Some(json!([{
+        "id": "call_1",
+        "type": "function",
+        "function": {"name": "edit", "arguments": sent}
+    }]));
+    let qwen3 = template("Qwen-Qwen3-0.6B.jinja")
+        .render(&messages, Some(&tools))
+        .unwrap();
+    assert!(
+        qwen3.contains(&format!(
+            "<tool_call>\n{{\"name\": \"edit\", \"arguments\": {sent}}}\n</tool_call>"
+        )),
+        "{qwen3}"
+    );
+    assert!(
+        qwen3.contains(
+            r#"{"type": "function", "function": {"name": "get_weather", "description": "Look up the weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}, "days": {"type": "integer"}}, "required": ["city"]}}}"#
+        ),
+        "{qwen3}"
+    );
+}
+
+/// A tool-call history and its tools render to exactly the prompt
+/// transformers' `apply_chat_template` gives (what vLLM sends the model),
+/// for templates that write tools and calls with `tojson`.  The expected
+/// prompts were rendered with transformers 5.22.1 from the same templates,
+/// with the arguments as a dict (vLLM's `_postprocess_messages`); joshua
+/// gets them as the JSON string an OpenAI client sends.  (Qwen3-Coder's and
+/// GLM's also match, but only once transformers' `trim_blocks` /
+/// `lstrip_blocks` whitespace control, which this renderer does not apply,
+/// is set aside.)
+#[test]
+fn tool_histories_render_as_transformers_renders_them() {
+    let path = format!(
+        "{}/tests/fixtures/chat_templates/transformers-tool-renders.json",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let expected: serde_json::Map<String, Value> =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let tools: Vec<Tool> = serde_json::from_value(json!([{
+        "type": "function",
+        "function": {
+            "name": "edit",
+            "description": "Edit a file",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "code": {"type": "string"},
+                    "n": {"type": "integer"},
+                    "ok": {"type": "boolean"}
+                },
+                "required": ["path", "code"]
+            }
+        }
+    }]))
+    .unwrap();
+    let mut differ = Vec::new();
+    for (file, prompt) in &expected {
+        let call_id = if file.contains("istral") {
+            "a1b2c3d4e"
+        } else {
+            "call_1"
+        };
+        let mut call = ChatMessage::text("assistant", "");
+        call.tool_calls = Some(json!([{
+            "id": call_id,
+            "type": "function",
+            "function": {
+                "name": "edit",
+                "arguments": r#"{"path": "a.rs", "code": "if a < b && c > 0 { println!(\"don't\") }", "n": 3, "ok": true}"#
+            }
+        }]));
+        let mut result = ChatMessage::text("tool", "done");
+        result.tool_call_id = Some(call_id.into());
+        result.name = Some("edit".into());
+        let messages = [ChatMessage::text("user", "Fix a.rs"), call, result];
+        let rendered = template(file)
+            .render(&messages, Some(&tools))
+            .unwrap_or_else(|e| panic!("{file}: {e}"));
+        if rendered != prompt.as_str().unwrap() {
+            eprintln!("{file}:\n{rendered:?}\n{prompt}");
+            differ.push(file.as_str());
+        }
+    }
+    assert!(differ.is_empty(), "{differ:?}");
+}
+
 /// The engine parses in the format its GGUF's template teaches, the
 /// architecture's when the template tells nothing (the tiny llama: the
 /// generic reader), and the operator's `--tool-call-parser` over both.
@@ -359,6 +456,6 @@ fn unusual_tool_call_histories_still_render() {
     let out = t.render(&[call, empty], None).unwrap();
     assert_eq!(
         out,
-        r#"assistant:a(str:not json)b({})c(str:[1, 2])d({"x":1})e({});assistant:plain;"#
+        r#"assistant:a(str:not json)b({})c(str:[1, 2])d({"x": 1})e({});assistant:plain;"#
     );
 }

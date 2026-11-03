@@ -26,7 +26,7 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 
-use minijinja::value::Kwargs;
+use minijinja::value::{Kwargs, ValueKind};
 use minijinja::{Environment, Error, ErrorKind, Value};
 use serde::Serialize;
 use tokenizers::Tokenizer;
@@ -60,7 +60,8 @@ pub const REQUEST_TEMPLATE_FUEL: u64 = 10_000_000;
 
 /// Appended to the final message to find where the template's copy of it
 /// ends (see [`ChatTemplate::render_continuation`]): private-use characters
-/// no tokenizer control string contains, and none `tojson` escapes.
+/// no tokenizer control string contains, and none `tojson` escapes (short
+/// of `ensure_ascii=True`).
 const CONTINUATION_MARKER: &str = "\u{f8ff}joshua-continue\u{f8ff}";
 
 impl ChatTemplate {
@@ -308,16 +309,7 @@ impl ChatTemplate {
         env.add_function("raise_exception", |msg: String| -> Result<(), Error> {
             Err(Error::new(ErrorKind::InvalidOperation, msg))
         });
-        // transformers' `tojson` takes `ensure_ascii`: GLM-4.5+ and Kimi K3
-        // write their tools and call arguments with `ensure_ascii=False`,
-        // which minijinja's filter rejects.  Its output is UTF-8 already.
-        env.add_filter(
-            "tojson",
-            |value: &Value, indent: Option<Value>, kwargs: Kwargs| -> Result<Value, Error> {
-                let _: Option<bool> = kwargs.get("ensure_ascii")?;
-                minijinja::filters::tojson(value, indent, kwargs)
-            },
-        );
+        env.add_filter("tojson", tojson);
         env.add_template("chat", &self.source)
             .map_err(|e| format!("chat template failed to parse: {e}"))?;
 
@@ -398,6 +390,220 @@ pub(crate) fn map_developer_role<'a>(
     out.push(ChatMessage::text("system", system.join("\n\n")));
     out.extend(rest);
     Cow::Owned(out)
+}
+
+// ─── tojson ─────────────────────────────────────────────────────────────────
+
+/// transformers' `tojson`, which its chat-template renderer puts in place of
+/// Jinja's and llama.cpp's renderer copies: Python's
+/// `json.dumps(value, ensure_ascii=False, indent=None, separators=None,
+/// sort_keys=False)`, taking those four as arguments or keywords.  Unlike
+/// minijinja's filter it writes `, ` and `: ` between items, keeps keys in
+/// their order and escapes no HTML characters, so the tools and tool calls
+/// a template writes into the prompt are the text the model was trained
+/// on (and the text a client's own `json.dumps` sent).
+fn tojson(value: &Value, args: &[Value], kwargs: Kwargs) -> Result<Value, Error> {
+    let arg = |index: usize, name: &str| -> Result<Option<Value>, Error> {
+        let value = match kwargs.get::<Option<Value>>(name)? {
+            Some(value) => Some(value),
+            None => args.get(index).cloned(),
+        };
+        Ok(value.filter(|v| !v.is_none() && !v.is_undefined()))
+    };
+    if args.len() > 4 {
+        return Err(Error::from(ErrorKind::TooManyArguments));
+    }
+    let ensure_ascii = arg(0, "ensure_ascii")?.is_some_and(|v| v.is_true());
+    // An integer indents by that many spaces and a string by itself; zero
+    // or a negative number only breaks the lines.
+    let indent = arg(1, "indent")?.map(|v| match v.as_str() {
+        Some(text) => text.to_string(),
+        None => {
+            let spaces = v.as_i64().unwrap_or(i64::from(v.is_true())).max(0);
+            " ".repeat(spaces as usize)
+        }
+    });
+    let (item_sep, key_sep) = match arg(2, "separators")? {
+        Some(separators) => {
+            let pair: Vec<Value> = separators.try_iter()?.collect();
+            match pair.as_slice() {
+                [item, key] => (item.to_string(), key.to_string()),
+                _ => {
+                    return Err(Error::new(
+                        ErrorKind::InvalidOperation,
+                        "tojson separators must be an (item, key) pair",
+                    ))
+                }
+            }
+        }
+        None if indent.is_some() => (",".to_string(), ": ".to_string()),
+        None => (", ".to_string(), ": ".to_string()),
+    };
+    let sort_keys = arg(3, "sort_keys")?.is_some_and(|v| v.is_true());
+    kwargs.assert_all_used()?;
+    let json = PyJson {
+        ensure_ascii,
+        indent,
+        item_sep,
+        key_sep,
+        sort_keys,
+    };
+    let mut out = String::new();
+    json.value(&mut out, value, 0)?;
+    Ok(Value::from_safe_string(out))
+}
+
+/// The settings of one [`tojson`] call.
+struct PyJson {
+    ensure_ascii: bool,
+    indent: Option<String>,
+    item_sep: String,
+    key_sep: String,
+    sort_keys: bool,
+}
+
+impl PyJson {
+    fn value(&self, out: &mut String, value: &Value, depth: usize) -> Result<(), Error> {
+        match value.kind() {
+            ValueKind::Undefined | ValueKind::None => out.push_str("null"),
+            ValueKind::Bool => out.push_str(if value.is_true() { "true" } else { "false" }),
+            ValueKind::Number if value.is_integer() => out.push_str(&value.to_string()),
+            ValueKind::Number => py_float(out, f64::try_from(value.clone())?),
+            ValueKind::String => self.string(out, value.as_str().unwrap_or_default()),
+            ValueKind::Seq | ValueKind::Iterable => {
+                let items: Vec<Value> = value.try_iter()?.collect();
+                self.container(out, ('[', ']'), items.len(), depth, |out, i| {
+                    self.value(out, &items[i], depth + 1)
+                })?;
+            }
+            ValueKind::Map => {
+                let mut keys: Vec<Value> = value.try_iter()?.collect();
+                if self.sort_keys {
+                    keys.sort_by_key(|key| key.to_string());
+                }
+                self.container(out, ('{', '}'), keys.len(), depth, |out, i| {
+                    self.string(out, &keys[i].to_string());
+                    out.push_str(&self.key_sep);
+                    self.value(out, &value.get_item(&keys[i])?, depth + 1)
+                })?;
+            }
+            _ => {
+                return Err(Error::new(
+                    ErrorKind::InvalidOperation,
+                    format!("cannot serialize {} to JSON", value.kind()),
+                ))
+            }
+        }
+        Ok(())
+    }
+
+    /// `len` items between `open` and `close`, each on its own line when
+    /// indenting.
+    fn container(
+        &self,
+        out: &mut String,
+        (open, close): (char, char),
+        len: usize,
+        depth: usize,
+        mut item: impl FnMut(&mut String, usize) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        out.push(open);
+        if len == 0 {
+            out.push(close);
+            return Ok(());
+        }
+        let newline = |out: &mut String, depth: usize| {
+            if let Some(indent) = &self.indent {
+                out.push('\n');
+                out.push_str(&indent.repeat(depth));
+            }
+        };
+        for i in 0..len {
+            if i > 0 {
+                out.push_str(&self.item_sep);
+            }
+            newline(out, depth + 1);
+            item(out, i)?;
+        }
+        newline(out, depth);
+        out.push(close);
+        Ok(())
+    }
+
+    /// A JSON string as Python writes it: control characters escaped
+    /// (`\n`, `\u001b`, lowercase hex), and with `ensure_ascii` everything
+    /// outside printable ASCII too, as UTF-16 code units.
+    fn string(&self, out: &mut String, text: &str) {
+        out.push('"');
+        for c in text.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                '\u{8}' => out.push_str("\\b"),
+                '\u{c}' => out.push_str("\\f"),
+                c if (c as u32) < 0x20 || (self.ensure_ascii && !(' '..='~').contains(&c)) => {
+                    let mut units = [0u16; 2];
+                    for unit in c.encode_utf16(&mut units) {
+                        out.push_str(&format!("\\u{unit:04x}"));
+                    }
+                }
+                c => out.push(c),
+            }
+        }
+        out.push('"');
+    }
+}
+
+/// A float as Python's `repr` writes it (and so `json.dumps`): the shortest
+/// digits that read back the same, in positional notation with at least
+/// one decimal (`1.0`) unless the exponent is below -4 or above 15
+/// (`1e-05`, `1e+16`); non-finite values as `NaN` / `Infinity`.
+fn py_float(out: &mut String, x: f64) {
+    if x.is_nan() {
+        out.push_str("NaN");
+        return;
+    }
+    if x.is_infinite() {
+        out.push_str(if x > 0.0 { "Infinity" } else { "-Infinity" });
+        return;
+    }
+    let shortest = format!("{:e}", x.abs());
+    let (mantissa, exponent) = shortest.split_once('e').unwrap_or((&shortest, "0"));
+    let digits: String = mantissa.chars().filter(char::is_ascii_digit).collect();
+    let exponent: i32 = exponent.parse().unwrap_or(0);
+    if x.is_sign_negative() {
+        out.push('-');
+    }
+    if !(-4..16).contains(&exponent) {
+        out.push_str(&digits[..1]);
+        if digits.len() > 1 {
+            out.push('.');
+            out.push_str(&digits[1..]);
+        }
+        out.push_str(&format!(
+            "e{}{:02}",
+            if exponent < 0 { '-' } else { '+' },
+            exponent.abs()
+        ));
+    } else if exponent < 0 {
+        out.push_str("0.");
+        out.push_str(&"0".repeat((-exponent - 1) as usize));
+        out.push_str(&digits);
+    } else {
+        let point = exponent as usize + 1;
+        if digits.len() > point {
+            out.push_str(&digits[..point]);
+            out.push('.');
+            out.push_str(&digits[point..]);
+        } else {
+            out.push_str(&digits);
+            out.push_str(&"0".repeat(point - digits.len()));
+            out.push_str(".0");
+        }
+    }
 }
 
 // ─── Tool calls in the history ──────────────────────────────────────────────
@@ -937,22 +1143,86 @@ mod tests {
         let calls = serde_json::json!([{"function": {"name": "f", "arguments": "{}"}}]);
         assert!(matches!(template_tool_calls(&calls), Some(Cow::Owned(_))));
         let objects = serde_json::json!([{"function": {"name": "f", "arguments": {}}}]);
-        assert!(matches!(template_tool_calls(&objects), Some(Cow::Borrowed(_))));
+        assert!(matches!(
+            template_tool_calls(&objects),
+            Some(Cow::Borrowed(_))
+        ));
         assert!(template_tool_calls(&serde_json::json!([])).is_none());
     }
 
-    /// GLM-4.5+ and Kimi K3 call `tojson(ensure_ascii=False)`; output
-    /// without the keyword is minijinja's, unchanged.
+    /// `tojson` writes what transformers' (Python's `json.dumps`) does:
+    /// `, ` / `: ` separators, keys in their order, no HTML escaping, and
+    /// its `ensure_ascii`, `indent`, `separators` and `sort_keys` (GLM-4.5+
+    /// and Kimi K3 pass `ensure_ascii=False`).
     #[test]
-    fn tojson_takes_transformers_ensure_ascii() {
-        let t = ChatTemplate::new(
-            "{{ messages[0].content | tojson(ensure_ascii=False) }}|{{ messages[0].content | tojson }}|{{ {'a': 1} | tojson(indent=2) }}",
-            "",
-            "",
+    fn tojson_writes_what_transformers_does() {
+        let render = |source: &str, content: &str| {
+            ChatTemplate::new(source, "", "")
+                .render(&[msg("user", content)], None)
+                .unwrap()
+        };
+        let text = "上海 <b>&'\"\\\n\u{1}\u{1F600}";
+        assert_eq!(
+            render("{{ messages[0].content | tojson }}", text),
+            "\"上海 <b>&'\\\"\\\\\\n\\u0001\u{1F600}\""
         );
         assert_eq!(
-            t.render(&[msg("user", "上海 <b>")], None).unwrap(),
-            "\"上海 \\u003cb\\u003e\"|\"上海 \\u003cb\\u003e\"|{\n  \"a\": 1\n}"
+            render(
+                "{{ messages[0].content | tojson(ensure_ascii=False) }}",
+                text
+            ),
+            render("{{ messages[0].content | tojson }}", text)
+        );
+        assert_eq!(
+            render(
+                "{{ messages[0].content | tojson(ensure_ascii=true) }}",
+                text
+            ),
+            "\"\\u4e0a\\u6d77 <b>&'\\\"\\\\\\n\\u0001\\ud83d\\ude00\""
+        );
+        let map = "{{ {'b': [1, 2.5, none, true], 'a': {}} | tojson";
+        assert_eq!(
+            render(&format!("{map} }}}}"), ""),
+            r#"{"b": [1, 2.5, null, true], "a": {}}"#
+        );
+        assert_eq!(
+            render(&format!("{map}(indent=2) }}}}"), ""),
+            "{\n  \"b\": [\n    1,\n    2.5,\n    null,\n    true\n  ],\n  \"a\": {}\n}"
+        );
+        assert_eq!(
+            render(
+                &format!("{map}(separators=(',', ':'), sort_keys=true) }}}}"),
+                ""
+            ),
+            r#"{"a":{},"b":[1,2.5,null,true]}"#
+        );
+        // Python's float `repr`.
+        let repr = |x: f64| {
+            let mut out = String::new();
+            py_float(&mut out, x);
+            out
+        };
+        let floats = [
+            1.0, 0.1, 100.0, 1e16, 1e15, 1e-4, 1e-5, -0.0, -1.5e-7, 123.456,
+        ];
+        assert_eq!(
+            floats.map(repr),
+            [
+                "1.0",
+                "0.1",
+                "100.0",
+                "1e+16",
+                "1000000000000000.0",
+                "0.0001",
+                "1e-05",
+                "-0.0",
+                "-1.5e-07",
+                "123.456"
+            ]
+        );
+        assert_eq!(
+            [f64::NAN, f64::INFINITY, f64::NEG_INFINITY].map(repr),
+            ["NaN", "Infinity", "-Infinity"]
         );
     }
 
