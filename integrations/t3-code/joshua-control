@@ -196,10 +196,17 @@ def cmd_logs(args):
 
 def cmd_cluster(args):
     if args.action == "status":
-        for host in args.workers.split(","):
-            host = host.split(":")[0]
-            workers = api(host, port, "/v1/workers")
-            print(f"{host:12} {'router: ' + json.dumps(workers)[:200] if workers else 'no /v1/workers'}")
+        for item in args.workers.split(","):
+            host, _, port = item.partition(":")
+            port = int(port or args.port)
+            # Membership lives on a coordinator (`/v1/workers`); `serve --worker` does not mount it,
+            # so report each worker's own /v1/worker/info instead of a 404.
+            info = api(host, port, "/v1/worker/info")
+            if info:
+                print(f"{host:12} worker up  model={info.get('model')} backend={info.get('backend')} "
+                      f"ctx={info.get('n_ctx')} in_flight={info.get('in_flight')}")
+            else:
+                print(f"{host:12} worker not answering on port {port}")
         return
     key = args.key or os.urandom(32).hex()
     worker_urls = []
