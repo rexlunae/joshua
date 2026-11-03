@@ -493,6 +493,7 @@ pub fn try_matmul_fused_neon(
         GgmlDType::Q8_0 => try_fused::<BlockQ8_0Raw, QK8_0>(m, k, n, lhs, block_bytes, dst, parallel, fused_row_q8_0_neon),
         GgmlDType::Q2K => try_fused::<BlockQ2KRaw, QK_K>(m, k, n, lhs, block_bytes, dst, parallel, fused_row_q2k_neon),
         GgmlDType::Q4K => try_fused::<BlockQ4KRaw, QK_K>(m, k, n, lhs, block_bytes, dst, parallel, fused_row_q4k_neon),
+        GgmlDType::Q5K => try_fused::<BlockQ5KRaw, QK_K>(m, k, n, lhs, block_bytes, dst, parallel, fused_row_q5k_neon),
         _ => false,
     }
 }
@@ -1450,10 +1451,91 @@ unsafe fn fused_row_q4k_neon(
     }
 }
 
+/// Q5_K on NEON, bit-identical to candle's dequantized row followed by
+/// `dot_row_neon`. The separate multiply and subtraction are intentional:
+/// fusing them into `vmlaq_n_f32` would change the dequantization rounding.
+/// Each output keeps one four-lane FMA accumulator in ascending column order.
+///
+/// # Safety
+/// See [`fused_row_q8_0_neon`].
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn fused_row_q5k_neon(
+    m: usize,
+    k: usize,
+    n: usize,
+    lhs: &[f32],
+    blocks: &[BlockQ5KRaw],
+    blocks_per_row: usize,
+    row: usize,
+    dst: &crate::simd::DstPtr,
+) {
+    use std::arch::aarch64::*;
+    const MTILE: usize = 4;
+    let row_blocks = &blocks[row * blocks_per_row..(row + 1) * blocks_per_row];
+    let mf = vdupq_n_u8(0x0f);
+    let one = vdupq_n_u8(1);
+    let mut m0 = 0;
+    while m0 < m {
+        let mcnt = (m - m0).min(MTILE);
+        let mut acc = [vdupq_n_f32(0.0); MTILE];
+        for (b, block) in row_blocks.iter().enumerate() {
+            let d = f16::from_le_bytes(block.d).to_f32();
+            let dmin = f16::from_le_bytes(block.dmin).to_f32();
+            let mut qh0 = vld1q_u8(block.qh.as_ptr());
+            let mut qh1 = vld1q_u8(block.qh.as_ptr().add(16));
+            for c in 0..4usize {
+                let x0 = vld1q_u8(block.qs[c * 32..c * 32 + 16].as_ptr());
+                let x1 = vld1q_u8(block.qs[c * 32 + 16..c * 32 + 32].as_ptr());
+                for r in 0..2usize {
+                    let (e0, e1) = if r == 0 {
+                        (vandq_u8(x0, mf), vandq_u8(x1, mf))
+                    } else {
+                        (vandq_u8(vshrq_n_u8(x0, 4), mf), vandq_u8(vshrq_n_u8(x1, 4), mf))
+                    };
+                    let e0 = vorrq_u8(e0, vshlq_n_u8(vandq_u8(qh0, one), 4));
+                    let e1 = vorrq_u8(e1, vshlq_n_u8(vandq_u8(qh1, one), 4));
+                    qh0 = vshrq_n_u8(qh0, 1);
+                    qh1 = vshrq_n_u8(qh1, 1);
+                    let (sc, mn) = q4k_scale_min(&block.scales, 2 * c + r);
+                    let d1 = d * sc as f32;
+                    let m1 = vdupq_n_f32(dmin * mn as f32);
+                    let deq = |q: uint32x4_t| vsubq_f32(vmulq_n_f32(vcvtq_f32_u32(q), d1), m1);
+                    let q00 = vmovl_u8(vget_low_u8(e0));
+                    let q01 = vmovl_u8(vget_high_u8(e0));
+                    let q10 = vmovl_u8(vget_low_u8(e1));
+                    let q11 = vmovl_u8(vget_high_u8(e1));
+                    let w = [
+                        deq(vmovl_u16(vget_low_u16(q00))),
+                        deq(vmovl_u16(vget_high_u16(q00))),
+                        deq(vmovl_u16(vget_low_u16(q01))),
+                        deq(vmovl_u16(vget_high_u16(q01))),
+                        deq(vmovl_u16(vget_low_u16(q10))),
+                        deq(vmovl_u16(vget_high_u16(q10))),
+                        deq(vmovl_u16(vget_low_u16(q11))),
+                        deq(vmovl_u16(vget_high_u16(q11))),
+                    ];
+                    let a = b * QK_K + 64 * c + 32 * r;
+                    for i in 0..mcnt {
+                        let p = lhs[(m0 + i) * k + a..].as_ptr();
+                        for (j, w) in w.iter().enumerate() {
+                            acc[i] = vfmaq_f32(acc[i], vld1q_f32(p.add(4 * j)), *w);
+                        }
+                    }
+                }
+            }
+        }
+        for (i, acc_i) in acc.iter().enumerate().take(mcnt) {
+            dst.write((m0 + i) * n + row, crate::simd::hsum128(*acc_i));
+        }
+        m0 += MTILE;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::quantized::k_quants::{BlockQ2K, BlockQ4K, BlockQ8_0, GgmlType};
+    use candle_core::quantized::k_quants::{BlockQ2K, BlockQ4K, BlockQ5K, BlockQ8_0, GgmlType};
     use candle_core::quantized::{GgmlDType, QTensor};
     use candle_core::{Device, Tensor};
 
@@ -1535,6 +1617,12 @@ mod tests {
                 BlockQ4K::to_float(&blocks, &mut w);
                 w
             }
+            GgmlDType::Q5K => {
+                let blocks = blocks_of::<BlockQ5K>(&block_bytes);
+                let mut w = vec![0f32; n * k];
+                BlockQ5K::to_float(&blocks, &mut w);
+                w
+            }
             _ => unreachable!(),
         };
 
@@ -1584,6 +1672,50 @@ mod tests {
                 fast[i],
                 acc
             );
+        }
+    }
+
+    /// Q5_K must reproduce the old dequantize-then-dot path bit for bit.
+    /// Arbitrary block bytes cover scale/min and high-bit combinations that
+    /// quantizing an ordinary tensor may never produce.
+    #[test]
+    fn fused_q5k_matches_dequantized_row_dot_bit_exact() {
+        let (m, k, n) = (11, 512, 7);
+        let mut bytes = vec![0u8; n * k / QK_K * std::mem::size_of::<BlockQ5KRaw>()];
+        let mut state = 0x9e3779b97f4a7c15u64;
+        for byte in &mut bytes {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            *byte = state as u8;
+        }
+        let lhs: Vec<f32> = (0..m * k)
+            .map(|i| (((i * 40503) % 1000) as f32 / 100.0) - 5.0)
+            .collect();
+        let mut weights = vec![0f32; n * k];
+        BlockQ5K::to_float(&blocks_of::<BlockQ5K>(&bytes), &mut weights);
+        for (name, fused, lanes) in families() {
+            let mut got = vec![0f32; m * n];
+            assert!(fused(GgmlDType::Q5K, (m, k, n), &lhs, &bytes, &mut got, true));
+            for (index, &actual) in got.iter().enumerate() {
+                let (input, output) = (index / n, index % n);
+                let mut acc = [0f32; 16];
+                for c in (0..k).step_by(lanes) {
+                    for lane in 0..lanes {
+                        acc[lane] = lhs[input * k + c + lane]
+                            .mul_add(weights[output * k + c + lane], acc[lane]);
+                    }
+                }
+                let expected = match name {
+                    "avx2" => {
+                        let paired: Vec<f32> = (0..4).map(|i| acc[i] + acc[i + 4]).collect();
+                        (paired[0] + paired[2]) + (paired[1] + paired[3])
+                    }
+                    "neon" => (acc[0] + acc[1]) + (acc[2] + acc[3]),
+                    _ => acc[..lanes].iter().sum::<f32>(),
+                };
+                assert_eq!(actual.to_bits(), expected.to_bits(), "{name} output {index}: {actual} != {expected}");
+            }
         }
     }
 
@@ -1675,7 +1807,7 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     fn fused_parallel_matches_serial_bit_exact() {
         for (name, fused, _) in families() {
-            // Q6_K is fused on both x86_64 families, Q5_K on AVX2 only.
+            // Q6_K is fused on both x86_64 families, Q5_K on AVX2 and NEON.
             let more: &[GgmlDType] = match name {
                 "avx2" => &[GgmlDType::Q6K, GgmlDType::Q5K],
                 _ => &[GgmlDType::Q6K],
@@ -1736,6 +1868,9 @@ mod tests {
         run_case(GgmlDType::Q4K, 1, 256, 40);
         run_case(GgmlDType::Q4K, 3, 512, 13);
         run_case(GgmlDType::Q4K, 4, 768, 25);
+        run_case(GgmlDType::Q5K, 1, 256, 40);
+        run_case(GgmlDType::Q5K, 3, 512, 13);
+        run_case(GgmlDType::Q5K, 11, 768, 7);
     }
 
     /// The real model's shapes against f32 GEMM (aarch64).
@@ -1752,7 +1887,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "aarch64")]
     fn neon_fused_parallel_matches_serial_bit_exact() {
-        for dtype in [GgmlDType::Q8_0, GgmlDType::Q2K, GgmlDType::Q4K] {
+        for dtype in [GgmlDType::Q8_0, GgmlDType::Q2K, GgmlDType::Q4K, GgmlDType::Q5K] {
             let block_bytes = quantized_block_bytes(24, 256, dtype);
             let lhs: Vec<f32> = (0..3 * 256).map(|i| (i as f32) * 0.01 - 1.0).collect();
             let mut par = vec![0f32; 3 * 24];
@@ -1764,8 +1899,8 @@ mod tests {
     }
 
     /// The unified dispatcher runs a fused kernel at every SIMD level and
-    /// declines at the scalar one.  Q6_K is fused on both x86_64 levels and
-    /// Q5_K on AVX2; elsewhere they keep the dequantize-then-dot path.
+    /// declines at the scalar one. Q6_K is fused on both x86_64 levels and
+    /// Q5_K on AVX2 and NEON; elsewhere they keep the generic path.
     #[test]
     fn unified_dispatcher_runs_fused_kernels() {
         use crate::simd::SimdLevel;
@@ -1776,7 +1911,7 @@ mod tests {
             (GgmlDType::Q2K, simd),
             (GgmlDType::Q4K, simd),
             (GgmlDType::Q6K, matches!(level, SimdLevel::Avx2 | SimdLevel::Avx512)),
-            (GgmlDType::Q5K, level == SimdLevel::Avx2),
+            (GgmlDType::Q5K, matches!(level, SimdLevel::Avx2 | SimdLevel::Neon)),
         ] {
             let block_bytes = quantized_block_bytes(8, 256, dtype);
             let lhs: Vec<f32> = (0..2 * 256).map(|i| (i as f32) * 0.01 - 1.0).collect();
