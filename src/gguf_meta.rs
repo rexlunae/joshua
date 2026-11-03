@@ -141,7 +141,7 @@ impl<'a> Meta<'a> {
 
 /// Any GGUF integer (or bool) value as a `u64`; `None` for negatives and
 /// non-integers.
-fn as_u64(v: &gguf_file::Value) -> Option<u64> {
+pub(crate) fn as_u64(v: &gguf_file::Value) -> Option<u64> {
     use gguf_file::Value as V;
     match *v {
         V::U8(x) => Some(x as u64),

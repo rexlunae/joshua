@@ -654,14 +654,71 @@ budgets or change coordinator admission/routing limits.
 
 ```bash
 curl http://localhost:8080/v1/models
+curl http://localhost:8080/v1/models/Qwen3-0.6B-Q4_K_M
 ```
+
+`GET /models` returns the same list (llama-server serves both), and
+`GET /v1/models/{id}` returns one entry, or OpenAI's `404` with
+`code: "model_not_found"` for an id the list does not have.  Each entry has
+OpenAI's four fields, the limits a client needs to size a request, the
+fields vLLM's and llama-server's model lists carry, and joshua's own facts
+under `joshua`.  For `joshua serve --model Qwen3-0.6B-Q4_K_M.gguf --n-ctx 8192`:
+
+```json
+{
+  "id": "Qwen3-0.6B-Q4_K_M", "object": "model", "created": 1793677688, "owned_by": "joshua",
+  "context_length": 8192, "max_context_length": 40960, "max_output_tokens": 4096,
+  "root": "/models/Qwen3-0.6B-Q4_K_M.gguf", "parent": null, "max_model_len": 8192,
+  "permission": [{"id": "modelperm-…", "object": "model_permission", "…": "…"}],
+  "aliases": [], "tags": [],
+  "meta": {"vocab_type": 2, "n_vocab": 151936, "n_ctx": 8192, "n_ctx_train": 40960,
+           "n_embd": 1024, "n_params": 596049920, "size": 390753280, "ftype": "Q4_K - Medium"},
+  "joshua": {"loaded": true, "architecture": "qwen3", "quantization": "Q4_K_M",
+             "file_size": 396705472, "backend": "cpu", "dense": "cpu"}
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `context_length` | The most tokens, prompt and output together, one request may use: the `--n-ctx` the model is loaded with.  A request's `context_window` (`n_ctx`, `num_ctx`) may not exceed it. |
+| `max_context_length` | The context the model was trained with (the GGUF's `<arch>.context_length`). |
+| `max_output_tokens` | The `--max-output-tokens` ceiling on one request's output (default 4096).  A request is also bounded by `context_length`, whichever runs out first. |
+| `max_model_len`, `root`, `parent`, `permission` | vLLM's: `max_model_len` is `context_length`, `root` the GGUF's path, `parent` `null` for a base model. |
+| `aliases`, `tags`, `meta` | llama-server's.  `meta` comes from the GGUF header: `n_ctx` is `context_length`, `size` the bytes of tensor data, `ftype` llama.cpp's name for `general.file_type`.  joshua has no aliases or tags, so both lists are empty. |
+| `joshua.loaded` | Whether the model is loaded. |
+| `joshua.architecture`, `quantization`, `file_size` | From the GGUF header (`quantization` as Ollama names it). |
+| `joshua.backend`, `dense`, `experts` | Where a loaded model runs: its compute backend, the device holding the dense weights and, for a mixture-of-experts model, the routed experts' (`expert_cache_bytes` when a VRAM cache holds a hot subset of host experts).  `npu: true` with an NPU plugin; `remote: true`, `workers` and `stages` for a model placed on pipeline workers (`backend` is then where this host tokenizes and samples). |
+
+With `--model-dir`, each model file in the directory (two levels deep)
+that is not loaded is listed after the loaded models, with
+`joshua.loaded: false` and no placement.  Its id is its file stem or, when
+another file in the directory has the same stem (or a loaded model has it
+as its id), its path in the directory (`a/model.gguf`, `b/model.gguf`), so
+loading one file does not change another's id.  `POST /v1/models/load`
+takes either as `model` and, without an `id`, serves the model under the
+id it was listed by; it refuses another file's path as an `id` (`409`).
+No two entries share an id: a file whose path a loaded model already has
+as its id (the file appeared after that load) is left out until the model
+is unloaded.  A file a loaded model was loaded from is not listed
+again, and neither are GGUFs that are not models on their own
+(`general.type` `adapter`, `mmproj` or `imatrix`, or a `clip` projector)
+or links leading out of the directory, which a load refuses.  A listed
+file is described from its GGUF header without loading any weight; its
+`context_length`, `max_model_len`, `meta.n_ctx` and `max_output_tokens`
+are the ones `POST /v1/models/load` with the server's flags gives it (a
+load's own `n_ctx` changes them).  A Whisper model has an entry with its
+id and placement.  A `joshua route` coordinator lists the union of its
+workers' entries (a worker's Whisper model included) unchanged, fields it
+does not know included (see
+[docs/request-routing.md](docs/request-routing.md)).
 
 ### `POST /v1/models/load` and `POST /v1/models/unload`
 
 Start the server with `--model-dir DIR` (and `--model` becomes optional) to
 load and unload models at runtime.  Requests name a GGUF file, or a directory
-holding one, relative to `DIR`; paths outside it are refused.  Protect these
-routes with `--api-key` when the server is reachable from other hosts.
+holding one, relative to `DIR`, or the id [`/v1/models`](#get-v1models) lists
+a file there by; paths outside it are refused.  Protect these routes with
+`--api-key` when the server is reachable from other hosts.
 
 ```bash
 joshua serve --model-dir ./weights
@@ -671,9 +728,14 @@ curl -X POST localhost:8080/v1/models/unload -H 'content-type: application/json'
   -d '{"id": "qwen3"}'
 ```
 
-Several models can be loaded at once; requests pick one with `model` (a
-server holding a single model answers any name, as before).  Unloading waits
-for requests already running on the model.
+A load answers with the model's [`/v1/models`](#get-v1models) entry (with
+`workers` and `stages` also at the top level).  Several models can be loaded
+at once; requests pick one with `model`.  A server holding a single model
+answers any name, as before, except the id of a file in the model directory
+that is not loaded (as `/v1/models` would list it): that is a `404`
+(`code: "model_not_found"`) saying to load it, not an answer from the
+loaded model.  Checking a name reads the directory, not the files.
+Unloading waits for requests already running on the model.
 
 #### Model-less workers (experimental, `--features distributed`)
 
@@ -784,6 +846,8 @@ Two limits bound how much work a single client can demand, both tunable:
 - `--n-ctx` (default: 4096) is the context window — prompt plus generated
   tokens — the model is loaded with.  A request can narrow it with
   `context_window` but never widen it.
+- `GET /v1/models` reports both per model, as `context_length` and
+  `max_output_tokens`, so a client can offer a context control.
 - A request's own `chat_template` is Jinja code the server would run, so it
   is refused unless the server starts with `--trust-request-chat-template`;
   even then a render stops after a fixed instruction budget (well under a

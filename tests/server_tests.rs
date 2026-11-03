@@ -1016,6 +1016,7 @@ async fn chat_reports_cached_prompt_tokens_on_a_follow_up() {
     );
 }
 
+
 /// With tools offered, the streamed text goes through the tool-call parser:
 /// output without call markup streams as the same content the non-streaming
 /// response returns.
@@ -1134,6 +1135,225 @@ async fn tool_call_history_renders_with_the_gguf_template() {
     assert_eq!(status, StatusCode::OK, "{body}");
     let count: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(count["input_tokens"], 7, "{count}");
+}
+
+// ─── Model cards (/v1/models, /models, /v1/models/{id}) ─────────────────────
+
+async fn get_json(
+    app: &axum::Router,
+    uri: &str,
+    key: Option<&str>,
+) -> (StatusCode, serde_json::Value) {
+    let res = app.clone().oneshot(get(uri, key)).await.unwrap();
+    let status = res.status();
+    (status, serde_json::from_str(&body_text(res).await).unwrap())
+}
+
+/// The fields that differ between two builds of the same card: vLLM's
+/// permission record is minted per response.
+fn without_permission(mut card: serde_json::Value) -> serde_json::Value {
+    card.as_object_mut().unwrap().remove("permission");
+    card
+}
+
+#[tokio::test]
+async fn models_list_carries_limits_and_upstream_card_fields() {
+    let app = create_router(tiny_state("server-model-card", Some("sekret")));
+    let (status, list) = get_json(&app, "/v1/models", Some("sekret")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(list["object"], "list");
+    let card = &list["data"][0];
+
+    // OpenAI's fields, unchanged.
+    assert_eq!(card["id"], "model");
+    assert_eq!(card["object"], "model");
+    assert_eq!(card["owned_by"], "joshua");
+    assert!(card["created"].as_u64().unwrap() > 0);
+    // #260: the per-request ceiling (--n-ctx), the trained context, and the
+    // output cap, reported as configured (the default 4096) even though a
+    // 64-token context runs out first, as #261 reports it.
+    assert_eq!(card["context_length"], 64);
+    assert_eq!(card["max_context_length"], 512);
+    assert_eq!(card["max_output_tokens"], 4096, "{card}");
+    // vLLM's ModelCard.
+    assert!(
+        card["root"].as_str().unwrap().ends_with("model.gguf"),
+        "{card}"
+    );
+    assert!(card.get("parent").is_some_and(|p| p.is_null()));
+    assert_eq!(card["max_model_len"], 64);
+    // llama-server's entry; the tiny GGUF is all F32 with no file type.
+    assert_eq!(card["aliases"], serde_json::json!([]));
+    assert_eq!(card["tags"], serde_json::json!([]));
+    assert_eq!(
+        card["meta"],
+        serde_json::json!({
+            "vocab_type": 1, "n_vocab": 16, "n_ctx": 64, "n_ctx_train": 512,
+            "n_embd": 8, "n_params": 792, "size": 792 * 4,
+        })
+    );
+    // joshua's own facts: where the model runs.
+    let joshua = &card["joshua"];
+    assert_eq!(joshua["loaded"], true);
+    assert_eq!(joshua["architecture"], "llama");
+    assert!(joshua["file_size"].as_u64().unwrap() > 792 * 4);
+    assert_eq!(joshua["backend"], "cpu");
+    assert_eq!(joshua["dense"], "cpu");
+    assert!(joshua.get("experts").is_none(), "a dense model: {joshua}");
+
+    // llama-server also serves the list at /models; GET /v1/models/{id}
+    // returns the same card.  All of them sit behind the key.
+    let (status, models) = get_json(&app, "/models", Some("sekret")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        without_permission(models["data"][0].clone()),
+        without_permission(card.clone())
+    );
+    let (status, one) = get_json(&app, "/v1/models/model", Some("sekret")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(without_permission(one), without_permission(card.clone()));
+    for uri in ["/models", "/v1/models/model"] {
+        let res = app.clone().oneshot(get(uri, None)).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "{uri}");
+    }
+
+    // An id no entry has is OpenAI's 404, even though a single loaded model
+    // answers any name on the inference routes.
+    let (status, err) = get_json(&app, "/v1/models/gpt-4o", Some("sekret")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        err,
+        serde_json::json!({"error": {
+            "message": "The model `gpt-4o` does not exist.",
+            "type": "invalid_request_error",
+            "param": "model",
+            "code": "model_not_found",
+        }})
+    );
+}
+
+#[tokio::test]
+async fn model_cards_use_vllm_and_llama_cpp_field_names() {
+    let app = create_router(tiny_state("server-model-card-names", None));
+    let (_, list) = get_json(&app, "/v1/models", None).await;
+    let card = list["data"][0].as_object().unwrap();
+    fn keys(v: &serde_json::Map<String, serde_json::Value>) -> std::collections::BTreeSet<&str> {
+        v.keys().map(String::as_str).collect()
+    }
+    // vLLM `ModelCard` (vllm/entrypoints/serve/engine/protocol.py).
+    for field in [
+        "id",
+        "object",
+        "created",
+        "owned_by",
+        "root",
+        "parent",
+        "max_model_len",
+        "permission",
+    ] {
+        assert!(
+            card.contains_key(field),
+            "vLLM field {field} missing: {card:?}"
+        );
+    }
+    // vLLM `ModelPermission`, every field and nothing else.
+    let permission = card["permission"][0].as_object().unwrap();
+    assert_eq!(
+        keys(permission),
+        [
+            "allow_create_engine",
+            "allow_fine_tuning",
+            "allow_logprobs",
+            "allow_sampling",
+            "allow_search_indices",
+            "allow_view",
+            "created",
+            "group",
+            "id",
+            "is_blocking",
+            "object",
+            "organization",
+        ]
+        .into()
+    );
+    assert_eq!(permission["object"], "model_permission");
+    assert!(permission["id"].as_str().unwrap().starts_with("modelperm-"));
+    assert_eq!(permission["organization"], "*");
+    assert_eq!(permission["allow_sampling"], true);
+    assert_eq!(permission["allow_view"], true);
+    assert_eq!(permission["allow_create_engine"], false);
+    // llama-server's `get_res_model_info` (tools/server/server-context.cpp).
+    for field in [
+        "id", "aliases", "tags", "object", "created", "owned_by", "meta",
+    ] {
+        assert!(
+            card.contains_key(field),
+            "llama.cpp field {field} missing: {card:?}"
+        );
+    }
+    let meta = card["meta"].as_object().unwrap();
+    let llama_cpp_meta: std::collections::BTreeSet<_> = [
+        "vocab_type",
+        "n_vocab",
+        "n_ctx",
+        "n_ctx_train",
+        "n_embd",
+        "n_params",
+        "size",
+        "ftype",
+    ]
+    .into();
+    assert!(keys(meta).is_subset(&llama_cpp_meta), "{meta:?}");
+    // Nothing joshua adds shadows an upstream name: its own facts sit under
+    // `joshua`, and the rest is #260's three limits.
+    let upstream: std::collections::BTreeSet<_> = [
+        "id",
+        "object",
+        "created",
+        "owned_by",
+        "root",
+        "parent",
+        "max_model_len",
+        "permission",
+        "aliases",
+        "tags",
+        "meta",
+    ]
+    .into();
+    let added: Vec<_> = keys(card).difference(&upstream).copied().collect();
+    assert_eq!(
+        added,
+        [
+            "context_length",
+            "joshua",
+            "max_context_length",
+            "max_output_tokens"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn model_cards_report_the_output_cap_and_expert_placement() {
+    // An output cap below the context is reported.
+    let dir = model_dir("server-model-card-cap");
+    write_tiny_llama_gguf(&dir.join("model.gguf"));
+    let engine = Engine::with_n_ctx(&dir, 64)
+        .unwrap()
+        .with_max_output_tokens(16);
+    let app = create_router(Arc::new(ServerState::new(Arc::new(engine))));
+    let (_, list) = get_json(&app, "/v1/models", None).await;
+    assert_eq!(list["data"][0]["max_output_tokens"], 16);
+    assert_eq!(list["data"][0]["context_length"], 64);
+
+    // A mixture-of-experts model says where its routed experts live.
+    let dir = model_dir("server-model-card-moe");
+    common::write_tiny_qwen3moe_gguf(&dir.join("moe.gguf"));
+    let engine = Engine::with_n_ctx(&dir, 32).unwrap();
+    let app = create_router(Arc::new(ServerState::new(Arc::new(engine))));
+    let (_, card) = get_json(&app, "/v1/models/moe", None).await;
+    assert_eq!(card["joshua"]["architecture"], "qwen3moe");
+    assert_eq!(card["joshua"]["experts"], "cpu");
+    assert_eq!(card["context_length"], 32);
 }
 
 // ─── TLS (only with `cargo test --features tls`) ─────────────────────────────

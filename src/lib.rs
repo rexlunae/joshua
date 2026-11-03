@@ -59,6 +59,7 @@ pub mod iq_grids;
 pub mod native_session;
 pub mod ngram;
 pub mod model;
+pub mod model_info;
 pub mod quantized_deepseek2;
 pub mod quantized_deepseek4;
 pub mod quantized_nemotron;
