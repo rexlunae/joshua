@@ -196,6 +196,13 @@ const CASES: &[Case] = &[
         start: "<|start|>assistant to=",
         end: "<|call|>",
     },
+    Case {
+        file: "vllm-functiongemma.jinja",
+        format: ToolCallFormat::FunctionGemma,
+        call_id: "call_1",
+        start: "<start_function_call>",
+        end: "<end_function_call>",
+    },
 ];
 
 #[test]

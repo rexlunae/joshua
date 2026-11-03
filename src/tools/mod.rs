@@ -27,6 +27,7 @@
 //!   (`<|open|>tools<|sep|>`).
 //! - **GLM-4.5 and later**: `<tool_call>name<arg_key>…</arg_key><arg_value>…`.
 //! - **gpt-oss harmony**: a message addressed `to=functions.name`.
+//! - **FunctionGemma**: `<start_function_call>call:name{key:<escape>…<escape>}`.
 //!
 //! Every format is a [`Grammar`]: the strings that open a tool-call region
 //! and a scan of that region.  [`ToolCallStream`] drives a grammar over text
@@ -36,6 +37,7 @@
 
 mod args;
 mod deepseek;
+mod gemma;
 mod generic;
 mod glm;
 mod harmony;
@@ -135,6 +137,8 @@ pub enum ToolCallFormat {
     Glm45,
     /// gpt-oss harmony messages addressed `to=functions.name`.
     Harmony,
+    /// FunctionGemma's `<start_function_call>call:name{…}`.
+    FunctionGemma,
 }
 
 /// `--tool-call-parser` names (vLLM's spelling where vLLM has the parser)
@@ -162,6 +166,7 @@ const NAMES: &[(&str, ToolCallFormat)] = &[
     ("glm45", ToolCallFormat::Glm45),
     ("glm47", ToolCallFormat::Glm45),
     ("openai", ToolCallFormat::Harmony),
+    ("functiongemma", ToolCallFormat::FunctionGemma),
 ];
 
 /// Whether a chat template's source belongs to a family.
@@ -187,6 +192,9 @@ const TEMPLATE_FINGERPRINTS: &[(ToolCallFormat, Fingerprint)] = &[
         t.contains("<｜tool▁calls▁begin｜>")
     }),
     (ToolCallFormat::Glm45, |t| t.contains("<arg_key>")),
+    (ToolCallFormat::FunctionGemma, |t| {
+        t.contains("<start_function_call>")
+    }),
     (ToolCallFormat::Lfm2, |t| {
         t.contains("<|tool_list_start|>")
             || t.contains("<|tool_call_start|>")
@@ -291,6 +299,7 @@ impl ToolCallFormat {
             Self::KimiK3 => &kimi::KIMI_K3,
             Self::Glm45 => &glm::GLM45,
             Self::Harmony => &harmony::HARMONY,
+            Self::FunctionGemma => &gemma::FUNCTION_GEMMA,
         }
     }
 }
