@@ -54,11 +54,11 @@ pub(super) static DEEPSEEK_V3: DeepSeekV3 = DeepSeekV3;
 impl Grammar for DeepSeekV3 {
     fn markers(&self) -> &'static [Marker] {
         const MARKERS: &[Marker] = &[
-            Marker::anywhere(SECTION[0]),
-            Marker::anywhere(SECTION[1]),
-            Marker::anywhere(SECTION[2]),
-            Marker::anywhere(SECTION[3]),
-            Marker::anywhere(CALL),
+            Marker::anywhere(SECTION[0]).closed_by(&[SECTION_END]),
+            Marker::anywhere(SECTION[1]).closed_by(&[SECTION_END]),
+            Marker::anywhere(SECTION[2]).closed_by(&[SECTION_END]),
+            Marker::anywhere(SECTION[3]).closed_by(&[SECTION_END]),
+            Marker::anywhere(CALL).closed_by(&[CALL_END]),
         ];
         MARKERS
     }
@@ -109,7 +109,13 @@ fn v3_call(s: &str, cx: &Cx<'_>) -> CallRead {
         (_, None) => None,
         (None, Some(end)) => Some(args_at + end),
         // The fence closes the arguments; the call's own end follows.
-        (Some(_), Some(end)) => close_after(s, args_at + end, CALL_END, cx.finished),
+        (Some(_), Some(end)) => close_after(
+            s,
+            args_at + end,
+            CALL_END,
+            &[CALL, SECTION_END],
+            cx.finished,
+        ),
     };
     let call = PartialCall {
         id: None,
@@ -137,6 +143,7 @@ const BLOCK_ENDS: &[&str] = &[
     "</｜DSML｜ calls>",
 ];
 const INVOKE: &[&str] = &["<｜DSML｜invoke", "<｜DSML｜ invoke"];
+const INVOKE_ENDS: &[&str] = &["</｜DSML｜invoke>", "</｜DSML｜ invoke>"];
 
 /// `<｜DSML｜parameter name="key" string="true">value</｜DSML｜parameter>`.
 /// `string="true"` keeps the value as text and `string="false"` reads it as
@@ -194,13 +201,13 @@ pub(super) static DSML: Dsml = Dsml;
 impl Grammar for Dsml {
     fn markers(&self) -> &'static [Marker] {
         const MARKERS: &[Marker] = &[
-            Marker::anywhere(BLOCKS[0]),
-            Marker::anywhere(BLOCKS[1]),
-            Marker::anywhere(BLOCKS[2]),
-            Marker::anywhere(BLOCKS[3]),
-            Marker::anywhere(BLOCKS[4]),
-            Marker::anywhere(INVOKE[0]),
-            Marker::anywhere(INVOKE[1]),
+            Marker::anywhere(BLOCKS[0]).closed_by(BLOCK_ENDS),
+            Marker::anywhere(BLOCKS[1]).closed_by(BLOCK_ENDS),
+            Marker::anywhere(BLOCKS[2]).closed_by(BLOCK_ENDS),
+            Marker::anywhere(BLOCKS[3]).closed_by(BLOCK_ENDS),
+            Marker::anywhere(BLOCKS[4]).closed_by(BLOCK_ENDS),
+            Marker::anywhere(INVOKE[0]).closed_by(INVOKE_ENDS),
+            Marker::anywhere(INVOKE[1]).closed_by(INVOKE_ENDS),
         ];
         MARKERS
     }

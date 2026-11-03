@@ -5,9 +5,12 @@
 //! call's start once its name is known, then its arguments as they grow.
 //! Partial markup never reaches the prose: a possible marker prefix at the
 //! end of the text is held back, and a region that turns out not to be a
-//! call is released as text.
+//! call is released as text.  A call counts from the moment its name is
+//! read, however the text is split into pieces: if its markup then breaks
+//! off, the call stands as far as it was read and the rest of its region is
+//! dropped, so a complete output parses to what its stream sent.
 
-use super::{Cx, Grammar, ParsedToolCall, PartialCall, Scan, ToolCallFormat};
+use super::{Cx, Grammar, Marker, ParsedToolCall, PartialCall, Scan, ToolCallFormat};
 use crate::types::Tool;
 
 /// One step of a streamed response.
@@ -47,6 +50,9 @@ pub struct ToolCallStream<'a> {
     region: Option<usize>,
     /// Index in `calls` of the open region's first call.
     region_first: usize,
+    /// Where the open region's markup broke off after a call in it had
+    /// begun: the region is skipped from there through its closing string.
+    broken: Option<usize>,
     calls: Vec<Sent>,
     /// Whether any prose has been sent.  Whitespace before the first prose
     /// is held: it is dropped if a tool call comes first.
@@ -65,6 +71,7 @@ impl<'a> ToolCallStream<'a> {
             pos: 0,
             region: None,
             region_first: 0,
+            broken: None,
             calls: Vec::new(),
             prose_started: false,
             held_whitespace: String::new(),
@@ -142,27 +149,46 @@ impl<'a> ToolCallStream<'a> {
                     }
                 }
             };
+            if let Some(from) = self.broken {
+                match broken_end(grammar, &self.text[start..], from, finished) {
+                    Some(end) => {
+                        self.pos = start + end;
+                        self.region = None;
+                        self.broken = None;
+                        continue;
+                    }
+                    None => return,
+                }
+            }
             let cx = Cx {
                 tools: self.tools,
                 finished,
             };
             let scan = grammar.scan(&self.text[start..], &cx);
             match scan {
-                // The markup broke off after a call from it had started:
-                // keep the call as streamed and drop the rest of the markup
-                // read so far rather than repeat it as prose.
-                Scan::Pending | Scan::Text(_) if self.calls.len() > self.region_first => {
-                    tracing::debug!("malformed tool-call markup after a call started; dropping it");
-                    self.pos = self.text.len();
-                    self.region = None;
-                    if !finished {
-                        return;
-                    }
-                }
                 Scan::Pending if !finished => return,
-                // A grammar that cannot decide at the end has no call.
-                Scan::Pending => self.release(start, self.text.len() - start, out),
-                Scan::Text(n) => self.release(start, n, out),
+                // Not a call, or no longer one.  A call that had begun in the
+                // region stands as far as it was read, as a stream fed in
+                // smaller pieces would have sent it, and the rest of the
+                // region is broken markup, kept out of the prose.  A grammar
+                // that cannot decide at the end has no call.
+                Scan::Pending | Scan::Text(_) => {
+                    let (calls, good) =
+                        calls_before_break(grammar, &self.text[start..], self.tools);
+                    self.sync(calls, out);
+                    if self.calls.len() > self.region_first {
+                        tracing::debug!(
+                            "tool-call markup broke off after a call began; dropping the rest"
+                        );
+                        self.broken = Some(good);
+                        continue;
+                    }
+                    let n = match scan {
+                        Scan::Text(n) => n,
+                        _ => self.text.len() - start,
+                    };
+                    self.release(start, n, out);
+                }
                 Scan::Calls { calls, end } => {
                     self.sync(calls, out);
                     match end {
@@ -297,6 +323,84 @@ enum Found {
     At(usize),
     /// No marker; the last this many bytes may begin one.
     Hold(usize),
+}
+
+/// The marker a region starts with, and the bytes up to its end (a leading
+/// marker may follow whitespace).
+fn opening(grammar: &dyn Grammar, region: &str) -> Option<(Marker, usize)> {
+    let indent = region.len() - region.trim_start().len();
+    grammar
+        .markers()
+        .iter()
+        .filter_map(|marker| {
+            let at = if marker.leading { indent } else { 0 };
+            region[at..]
+                .starts_with(marker.text)
+                .then_some((*marker, at + marker.text.len()))
+        })
+        .max_by_key(|&(_, end)| end)
+}
+
+/// The calls in the longest prefix of `region` that, read while decoding is
+/// still going, scans as calls, and that prefix's length: what a stream fed
+/// one character at a time would have sent before the markup broke off.
+/// `region` itself no longer scans as calls.  Prefixes scan as pending, then
+/// as calls, then as text, so the break is found by bisection.
+fn calls_before_break(
+    grammar: &dyn Grammar,
+    region: &str,
+    tools: &[Tool],
+) -> (Vec<PartialCall>, usize) {
+    let cx = Cx {
+        tools,
+        finished: false,
+    };
+    let scan = |len: usize| grammar.scan(&region[..len], &cx);
+    match scan(region.len()) {
+        // Broken only because decoding ended.
+        Scan::Calls { calls, .. } => return (calls, region.len()),
+        Scan::Pending => return (Vec::new(), region.len()),
+        Scan::Text(_) => {}
+    }
+    // `good` scans as something other than text, `bad` as text.
+    let Some((_, mut good)) = opening(grammar, region) else {
+        return (Vec::new(), region.len());
+    };
+    let mut bad = region.len();
+    loop {
+        let mut mid = good + (bad - good) / 2;
+        while mid > good && !region.is_char_boundary(mid) {
+            mid -= 1;
+        }
+        if mid == good {
+            mid = (good + 1..bad)
+                .find(|&at| region.is_char_boundary(at))
+                .unwrap_or(bad);
+        }
+        if mid >= bad {
+            break;
+        }
+        match scan(mid) {
+            Scan::Text(_) => bad = mid,
+            _ => good = mid,
+        }
+    }
+    match scan(good) {
+        Scan::Calls { calls, .. } => (calls, good),
+        _ => (Vec::new(), good),
+    }
+}
+
+/// Where a region whose markup broke off at `from` ends: after the first
+/// closing string of the marker that opened it, or at the end of the output
+/// once decoding has ended without one.  `None` while it may still arrive.
+fn broken_end(grammar: &dyn Grammar, region: &str, from: usize, finished: bool) -> Option<usize> {
+    let close = opening(grammar, region).map_or(&[][..], |(marker, _)| marker.close);
+    match super::find_first(&region[from..], close) {
+        Some((at, close)) => Some(from + at + close.len()),
+        None if finished => Some(region.len()),
+        None => None,
+    }
 }
 
 /// Append prose, merging with a preceding text event.

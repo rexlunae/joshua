@@ -328,6 +328,10 @@ pub(crate) struct Marker {
     /// Only at the very start of the output (after whitespace), as for a
     /// response that is nothing but a JSON object or a call list.
     pub leading: bool,
+    /// The strings that close a region this marker opens, when the family
+    /// writes one; otherwise the region may run to the end of the output.
+    /// A call whose markup breaks off is dropped through the first of them.
+    pub close: &'static [&'static str],
 }
 
 impl Marker {
@@ -335,6 +339,7 @@ impl Marker {
         Self {
             text,
             leading: false,
+            close: &[],
         }
     }
 
@@ -342,7 +347,13 @@ impl Marker {
         Self {
             text,
             leading: true,
+            close: &[],
         }
+    }
+
+    /// The marker, with the strings that close its region.
+    pub const fn closed_by(self, close: &'static [&'static str]) -> Self {
+        Self { close, ..self }
     }
 }
 
@@ -436,7 +447,8 @@ pub(crate) fn header_pending(s: &str, end: &str, cx: &Cx<'_>) -> CallRead {
 /// `<｜tool▁calls▁begin｜>`, Kimi's `<|tool_calls_section_begin|>`, DSML's
 /// `<｜DSML｜tool_calls>`).  The region starts with an `opens` or a `call`
 /// string; `read` reads one call.  Calls stop at anything else, which is
-/// prose again.
+/// prose again, except inside a section that has calls: there it is broken
+/// markup, dropped up to the next call or the section's end.
 pub(crate) fn section(
     region: &str,
     opens: &[&str],
@@ -475,6 +487,11 @@ pub(crate) fn section(
                     };
                 }
                 _ if calls.is_empty() => return Scan::Text(marker),
+                // A broken call in a section: skip it below.
+                _ if open.is_some() => {
+                    at = body;
+                    continue;
+                }
                 _ => {
                     return Scan::Calls {
                         calls,
@@ -496,6 +513,28 @@ pub(crate) fn section(
                 calls,
                 end: cx.finished.then_some(region.len()),
             };
+        }
+        if open.is_some() && !calls.is_empty() {
+            // Inside a section that has calls, anything else is broken
+            // markup: drop it up to the next call or the section's end.
+            let skip = [call, closes]
+                .into_iter()
+                .filter_map(|tags| find_first(rest, tags))
+                .map(|(skip, _)| skip)
+                .min();
+            match skip {
+                Some(skip) => {
+                    tracing::debug!("dropping text inside a tool-call section");
+                    at = next + skip;
+                    continue;
+                }
+                None => {
+                    return Scan::Calls {
+                        calls,
+                        end: cx.finished.then_some(region.len()),
+                    }
+                }
+            }
         }
         return if calls.is_empty() {
             Scan::Text(marker)
@@ -563,7 +602,8 @@ pub(crate) mod tests {
     }
 
     /// Every chunking of `text` streams the same calls the one-shot parse
-    /// returns, and the argument deltas join up to the same JSON value.
+    /// returns, and the argument deltas join up to the same JSON value (or,
+    /// for a call whose markup broke off, to the same text).
     pub(crate) fn assert_streams_like_parse(format: ToolCallFormat, tools: &[Tool], text: &str) {
         let (prose, calls) = parse_tool_calls(format, tools, text);
         for chunk in [1, 2, 3, 5, 8, 13, text.len().max(1)] {
@@ -574,6 +614,13 @@ pub(crate) mod tests {
             assert_eq!(streamed.len(), calls.len(), "chunk {chunk}: call count");
             for ((name, arguments), call) in streamed.iter().zip(&calls) {
                 assert_eq!(name, &call.name, "chunk {chunk}");
+                if serde_json::from_str::<Value>(&call.arguments).is_err() {
+                    assert_eq!(
+                        arguments, &call.arguments,
+                        "chunk {chunk}: broken arguments"
+                    );
+                    continue;
+                }
                 let joined: Value = serde_json::from_str(arguments).unwrap_or_else(|e| {
                     panic!("chunk {chunk}: streamed arguments are not JSON ({e}): {arguments}")
                 });

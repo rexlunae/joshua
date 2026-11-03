@@ -15,7 +15,7 @@
 use serde_json::{Map, Number, Value};
 
 use super::args::{tagged_call, ArgsJson};
-use super::generic::{close_after, undecided};
+use super::generic::marked_list;
 use super::json::skip_ws;
 use super::{Cx, Grammar, Marker, PartialCall, Scan};
 
@@ -31,13 +31,18 @@ pub(super) static PYTHONIC: Pythonic = Pythonic;
 
 impl Grammar for Pythonic {
     fn markers(&self) -> &'static [Marker] {
-        const MARKERS: &[Marker] = &[Marker::anywhere(PYTHON_START), Marker::leading("[")];
+        const MARKERS: &[Marker] = &[
+            Marker::anywhere(PYTHON_START).closed_by(&[PYTHON_END]),
+            Marker::leading("["),
+        ];
         MARKERS
     }
 
     fn scan(&self, region: &str, cx: &Cx<'_>) -> Scan {
         if region.starts_with(PYTHON_START) {
-            return marked_list(region, PYTHON_START, PYTHON_END, cx);
+            return marked_list(region, PYTHON_START, Some(PYTHON_END), cx, |s| {
+                call_list(s, cx)
+            });
         }
         // A response that opens with `[`: a call list or ordinary text.
         let start = skip_ws(region, 0);
@@ -59,27 +64,12 @@ pub(super) static LFM2: Lfm2 = Lfm2;
 
 impl Grammar for Lfm2 {
     fn markers(&self) -> &'static [Marker] {
-        const MARKERS: &[Marker] = &[Marker::anywhere(LFM2_START)];
+        const MARKERS: &[Marker] = &[Marker::anywhere(LFM2_START).closed_by(&[LFM2_END])];
         MARKERS
     }
 
     fn scan(&self, region: &str, cx: &Cx<'_>) -> Scan {
-        marked_list(region, LFM2_START, LFM2_END, cx)
-    }
-}
-
-/// A call list between `open` and `close`.
-fn marked_list(region: &str, open: &str, close: &str, cx: &Cx<'_>) -> Scan {
-    let start = skip_ws(region, open.len());
-    if start >= region.len() {
-        return undecided(cx, open);
-    }
-    match call_list(&region[start..], cx) {
-        Err(()) => Scan::Text(open.len()),
-        Ok((calls, end)) => Scan::Calls {
-            calls,
-            end: end.and_then(|end| close_after(region, start + end, close, cx.finished)),
-        },
+        marked_list(region, LFM2_START, Some(LFM2_END), cx, |s| call_list(s, cx))
     }
 }
 
@@ -144,15 +134,19 @@ fn call_list(s: &str, cx: &Cx<'_>) -> Result<(Vec<PartialCall>, Option<usize>), 
 }
 
 /// `a=1, b="x")` after a call's `(`.  A call cut off by the end of the text
-/// is returned unfinished, with a string argument still being written.
+/// is returned unfinished, with a string argument still being written, once
+/// it is plainly a call: after its first `=` (or its `)`), so that prose
+/// opening with `[Note(` never starts one.
 fn read_arguments(r: &mut Reader<'_>, name: &str, cx: &Cx<'_>) -> Read<PartialCall> {
     let mut args = ArgsJson::new();
     let mut first = true;
+    let mut named = false;
     let partial =
         |args: &ArgsJson, open: Option<(&str, &str)>| tagged_call(name, args, open, cx.finished);
     loop {
         r.ws();
         match r.peek() {
+            None if !named => return Err(Stop::Partial),
             None => return Ok(partial(&args, None)),
             Some(b')') => {
                 r.i += 1;
@@ -179,8 +173,12 @@ fn read_arguments(r: &mut Reader<'_>, name: &str, cx: &Cx<'_>) -> Read<PartialCa
         let key = &r.s[key_start..r.i];
         r.ws();
         match r.peek() {
+            None if !named => return Err(Stop::Partial),
             None => return Ok(partial(&args, None)),
-            Some(b'=') if is_dotted_name(key) && !key.contains('.') => r.i += 1,
+            Some(b'=') if is_dotted_name(key) && !key.contains('.') => {
+                r.i += 1;
+                named = true;
+            }
             _ => return Err(Stop::Bad),
         }
         r.ws();
@@ -484,6 +482,7 @@ mod tests {
             "Use this format: [link text](url).",
             "[1] First point.",
             "[Wikipedia](https://www.wikipedia.org) says so.",
+            "[Note(see below)] for the details.",
             "No calls here.",
         ] {
             let (content, calls) = parse(PY, text);

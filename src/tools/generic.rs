@@ -19,19 +19,36 @@ const NAME_KEYS: &[&str] = &["name"];
 const ARG_KEYS: &[&str] = &["arguments", "parameters"];
 
 /// Where a region closed by `close` ends, given that its content ends at
-/// `at`: after the closing tag (whitespace before it allowed), still open
-/// while the tag may be arriving, or at `at` when something else follows.
-pub(super) fn close_after(region: &str, at: usize, close: &str, finished: bool) -> Option<usize> {
+/// `at`: after the closing tag (whitespace before it allowed); after a
+/// closing tag further on, dropping what comes between as broken markup
+/// (a stray brace, a second object), unless one of `stops` (a new region
+/// or call) comes first; still open while the tag may yet arrive; or at
+/// `at` when none does, what follows being prose.
+pub(super) fn close_after(
+    region: &str,
+    at: usize,
+    close: &str,
+    stops: &[&str],
+    finished: bool,
+) -> Option<usize> {
     let tag = skip_ws(region, at);
     let rest = &region[tag..];
     if rest.is_empty() {
-        None
-    } else if rest.starts_with(close) {
-        Some(tag + close.len())
-    } else if close.starts_with(rest) {
-        finished.then_some(region.len())
-    } else {
-        Some(at)
+        return None;
+    }
+    if rest.starts_with(close) {
+        return Some(tag + close.len());
+    }
+    if close.starts_with(rest) {
+        return finished.then_some(region.len());
+    }
+    match (rest.find(close), find_first(rest, stops)) {
+        (Some(end), stop) if stop.is_none_or(|(stop, _)| end < stop) => {
+            tracing::debug!("dropping text after a tool call, before its closing tag");
+            Some(tag + end + close.len())
+        }
+        (None, None) if !finished => None,
+        _ => Some(at),
     }
 }
 
@@ -55,8 +72,8 @@ pub(super) static GENERIC: Generic = Generic;
 impl Grammar for Generic {
     fn markers(&self) -> &'static [Marker] {
         const MARKERS: &[Marker] = &[
-            Marker::anywhere(TOOL_CALL),
-            Marker::anywhere(FUNCTION),
+            Marker::anywhere(TOOL_CALL).closed_by(&[TOOL_CALL_END]),
+            Marker::anywhere(FUNCTION).closed_by(&[FUNCTION_END]),
             Marker::anywhere(MISTRAL),
             Marker::leading("{"),
         ];
@@ -94,9 +111,15 @@ pub(super) fn hermes(region: &str, cx: &Cx<'_>) -> Scan {
         if call.name.is_none() {
             return undecided(cx, TOOL_CALL);
         }
-        let end = call
-            .end
-            .and_then(|end| close_after(region, start + end, TOOL_CALL_END, cx.finished));
+        let end = call.end.and_then(|end| {
+            close_after(
+                region,
+                start + end,
+                TOOL_CALL_END,
+                &[TOOL_CALL],
+                cx.finished,
+            )
+        });
         return Scan::Calls {
             calls: vec![call.partial(cx.finished)],
             end,
@@ -114,14 +137,14 @@ pub(super) fn hermes(region: &str, cx: &Cx<'_>) -> Scan {
         Ok(None) => undecided(cx, TOOL_CALL),
         Ok(Some((calls, Some(end)))) => Scan::Calls {
             calls,
-            end: close_after(region, end, TOOL_CALL_END, cx.finished),
+            end: close_after(region, end, TOOL_CALL_END, &[TOOL_CALL], cx.finished),
         },
         Ok(Some((calls, None))) => Scan::Calls { calls, end: None },
     }
 }
 
 /// Calls read so far and, once the last has closed, where the region ends.
-type Calls = (Vec<PartialCall>, Option<usize>);
+pub(super) type Calls = (Vec<PartialCall>, Option<usize>);
 
 /// Consecutive Qwen3-Coder `<function=name>` blocks starting at `start`.
 /// `Ok(None)` while the first name is still arriving; `Err` when the first
@@ -227,7 +250,7 @@ fn mistral(region: &str, cx: &Cx<'_>) -> Scan {
         return undecided(cx, MISTRAL);
     }
     if payload.starts_with('[') {
-        return marked_list(region, MISTRAL, None, cx);
+        return marked_list(region, MISTRAL, None, cx, |s| json_list(s, cx));
     }
     let Some((name_len, tag)) = find_first(payload, &[MISTRAL_ARGS, MISTRAL_CALL_ID]) else {
         // Still reading the name, unless it has stopped looking like one.
@@ -305,7 +328,10 @@ pub(super) static LLAMA_JSON: LlamaJson = LlamaJson;
 
 impl Grammar for LlamaJson {
     fn markers(&self) -> &'static [Marker] {
-        const MARKERS: &[Marker] = &[Marker::anywhere(PYTHON_TAG), Marker::leading("{")];
+        const MARKERS: &[Marker] = &[
+            Marker::anywhere(PYTHON_TAG).closed_by(&[EOM]),
+            Marker::leading("{"),
+        ];
         MARKERS
     }
 
@@ -383,12 +409,14 @@ pub(super) static NEMOTRON_V2: NemotronV2 = NemotronV2;
 
 impl Grammar for NemotronV2 {
     fn markers(&self) -> &'static [Marker] {
-        const MARKERS: &[Marker] = &[Marker::anywhere(NEMOTRON)];
+        const MARKERS: &[Marker] = &[Marker::anywhere(NEMOTRON).closed_by(&[NEMOTRON_END])];
         MARKERS
     }
 
     fn scan(&self, region: &str, cx: &Cx<'_>) -> Scan {
-        marked_list(region, NEMOTRON, Some(NEMOTRON_END), cx)
+        marked_list(region, NEMOTRON, Some(NEMOTRON_END), cx, |s| {
+            json_list(s, cx)
+        })
     }
 }
 
@@ -409,31 +437,46 @@ impl Grammar for Functools {
     }
 
     fn scan(&self, region: &str, cx: &Cx<'_>) -> Scan {
-        marked_list(region, FUNCTOOLS, None, cx)
+        marked_list(region, FUNCTOOLS, None, cx, |s| json_list(s, cx))
     }
 }
 
-/// A JSON list of calls after `marker`, closed by `close` when the family
-/// writes one: Mistral's `[TOOL_CALLS][…]`, Nemotron's
-/// `<TOOLCALL>[…]</TOOLCALL>` and `functools[…]`.
-fn marked_list(region: &str, marker: &str, close: Option<&str>, cx: &Cx<'_>) -> Scan {
+/// A list of calls after `marker`, closed by `close` when the family writes
+/// one: Mistral's `[TOOL_CALLS][…]`, Nemotron's `<TOOLCALL>[…]</TOOLCALL>`,
+/// `functools[…]`, and the pythonic lists of Llama 4 and LFM2.  `list`
+/// reads the calls from the text after the marker, with the list's length
+/// once it has closed; `Err` when it is not a list.
+pub(super) fn marked_list(
+    region: &str,
+    marker: &str,
+    close: Option<&str>,
+    cx: &Cx<'_>,
+    list: impl FnOnce(&str) -> Result<Calls, ()>,
+) -> Scan {
     let start = skip_ws(region, marker.len());
     if start >= region.len() {
         return undecided(cx, marker);
     }
-    match json::call_list(&region[start..], NAME_KEYS, ARG_KEYS) {
+    match list(&region[start..]) {
         Err(()) => Scan::Text(marker.len()),
         Ok((calls, end)) => Scan::Calls {
-            calls: calls
-                .iter()
-                .map(|call| call.partial(cx.finished || end.is_some()))
-                .collect(),
+            calls,
             end: end.and_then(|end| match close {
-                Some(close) => close_after(region, start + end, close, cx.finished),
+                Some(close) => close_after(region, start + end, close, &[marker], cx.finished),
                 None => Some(start + end),
             }),
         },
     }
+}
+
+/// A JSON list of `{"name": …, "arguments": …}` calls, for [`marked_list`].
+fn json_list(s: &str, cx: &Cx<'_>) -> Result<Calls, ()> {
+    let (calls, end) = json::call_list(s, NAME_KEYS, ARG_KEYS)?;
+    let calls = calls
+        .iter()
+        .map(|call| call.partial(cx.finished || end.is_some()))
+        .collect();
+    Ok((calls, end))
 }
 
 #[cfg(test)]
@@ -466,6 +509,76 @@ mod tests {
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].name, "a");
         assert_eq!(calls[1].name, "b");
+        assert_streams_like_parse(G, &[], text);
+    }
+
+    /// Markup that breaks off after the call's name was read (Python
+    /// literals, a trailing comma): a stream has sent the call by then, so
+    /// it stands as far as it was read, streamed or not, and the rest of
+    /// its tag never reaches the content.
+    #[test]
+    fn hermes_call_broken_after_its_name_stays_a_call() {
+        for (call, name, arguments) in [
+            (
+                "{\"name\": \"get_weather\", \"arguments\": {'city': 'Paris'}}",
+                "get_weather",
+                "{",
+            ),
+            (
+                "{\"name\": \"set\", \"arguments\": {\"on\": True}}",
+                "set",
+                "{\"on\": ",
+            ),
+            (
+                "{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\",}}",
+                "get_weather",
+                "{\"city\": \"Paris\",",
+            ),
+        ] {
+            let text = format!("Checking.<tool_call>\n{call}\n</tool_call> Done.");
+            let (content, calls) = parse(G, &text);
+            assert_eq!(content, "Checking. Done.", "{text}");
+            assert_eq!(calls.len(), 1, "{text}");
+            assert_eq!(calls[0].name, name);
+            assert_eq!(calls[0].arguments, arguments);
+            assert_streams_like_parse(G, &[], &text);
+            // Cut off before its closing tag, the rest of the output is
+            // the broken call's.
+            let text = format!("<tool_call>\n{call} Done.");
+            let (content, calls) = parse(G, &text);
+            assert_eq!((content.as_str(), calls.len()), ("", 1), "{text}");
+            assert_streams_like_parse(G, &[], &text);
+        }
+        // A name that never completes is no call.
+        let text = "<tool_call>{\"name\": 'f'}</tool_call>";
+        assert_eq!(parse(G, text), (text.to_string(), Vec::new()));
+        assert_streams_like_parse(G, &[], text);
+    }
+
+    /// Text after a complete call but inside its tag (a stray brace, a
+    /// second object, which vLLM's reader returns as content) is dropped
+    /// with the tag; without a closing tag, what follows is prose.
+    #[test]
+    fn hermes_text_after_the_call_inside_its_tag_is_dropped() {
+        for text in [
+            "<tool_call>{\"name\": \"f\", \"arguments\": {\"a\": 1}}}}</tool_call> Done.",
+            "<tool_call>\n{\"name\": \"f\", \"arguments\": {\"a\": 1}}\n\
+             {\"name\": \"g\", \"arguments\": {}}\n</tool_call> Done.",
+        ] {
+            let (content, calls) = parse(G, text);
+            assert_eq!(content, "Done.", "{text}");
+            assert_eq!(calls.len(), 1, "{text}");
+            assert_eq!(calls[0].arguments, r#"{"a":1}"#);
+            assert_streams_like_parse(G, &[], text);
+        }
+        let text = "<tool_call>{\"name\": \"f\", \"arguments\": {}} Done.";
+        let (content, calls) = parse(G, text);
+        assert_eq!((content.as_str(), calls.len()), ("Done.", 1));
+        assert_streams_like_parse(G, &[], text);
+        // A second call's tag ends the first, unclosed one.
+        let text = "<tool_call>{\"name\": \"f\", \"arguments\": {}}\n\
+                    <tool_call>{\"name\": \"g\", \"arguments\": {}}</tool_call>";
+        assert_eq!(parse(G, text).1.len(), 2);
         assert_streams_like_parse(G, &[], text);
     }
 

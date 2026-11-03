@@ -59,7 +59,7 @@ pub(super) static GLM45: Glm45 = Glm45;
 
 impl Grammar for Glm45 {
     fn markers(&self) -> &'static [Marker] {
-        const MARKERS: &[Marker] = &[Marker::anywhere(TOOL_CALL)];
+        const MARKERS: &[Marker] = &[Marker::anywhere(TOOL_CALL).closed_by(&[TOOL_CALL_END])];
         MARKERS
     }
 

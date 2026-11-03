@@ -38,7 +38,10 @@ pub(super) static KIMI_K2: KimiK2 = KimiK2;
 
 impl Grammar for KimiK2 {
     fn markers(&self) -> &'static [Marker] {
-        const MARKERS: &[Marker] = &[Marker::anywhere(K2_SECTION), Marker::anywhere(K2_CALL)];
+        const MARKERS: &[Marker] = &[
+            Marker::anywhere(K2_SECTION).closed_by(&[K2_SECTION_END]),
+            Marker::anywhere(K2_CALL).closed_by(&[K2_CALL_END]),
+        ];
         MARKERS
     }
 
@@ -62,6 +65,10 @@ fn k2_call(s: &str, cx: &Cx<'_>) -> CallRead {
     let Some(header_len) = s.find(K2_ARGS) else {
         return header_pending(s, K2_ARGS, cx);
     };
+    // As for a header still arriving, one with other markup is not one.
+    if s[..header_len].contains(['\n', '<']) {
+        return Err(());
+    }
     let header = s[..header_len].trim();
     let (id, name) = match header.rsplit_once(':') {
         Some((head, index)) if !index.is_empty() && index.bytes().all(|b| b.is_ascii_digit()) => {
@@ -144,7 +151,7 @@ pub(super) static KIMI_K3: KimiK3 = KimiK3;
 impl Grammar for KimiK3 {
     fn markers(&self) -> &'static [Marker] {
         const MARKERS: &[Marker] = &[
-            Marker::anywhere(K3_TOOLS),
+            Marker::anywhere(K3_TOOLS).closed_by(&[K3_TOOLS_END]),
             Marker::anywhere(K3_FRAMING[0]),
             Marker::anywhere(K3_FRAMING[1]),
             Marker::anywhere(K3_FRAMING[2]),
@@ -198,9 +205,15 @@ fn k3_call(s: &str, cx: &Cx<'_>) -> CallRead {
         };
         let json_at = body_at + json_attrs + SEP.len();
         let raw = json::raw_args(&s[json_at..], &[K3_JSON_END], cx.finished);
-        let end = raw
-            .end
-            .and_then(|end| close_after(s, json_at + end, K3_CALL_END, cx.finished));
+        let end = raw.end.and_then(|end| {
+            close_after(
+                s,
+                json_at + end,
+                K3_CALL_END,
+                &[K3_CALL, K3_TOOLS_END],
+                cx.finished,
+            )
+        });
         let call = PartialCall {
             id: None,
             name: name.into_owned(),
@@ -272,6 +285,21 @@ mod tests {
         let text = "<|tool_calls_section_begin|><|tool_call_begin|>functions.f:0<|tool_call_argument_begin|>{\"a\": 1}<|tool_calls_section_end|>";
         let (content, calls) = parse(K2, text);
         assert_eq!((content.as_str(), calls.len()), ("", 1));
+        assert_streams_like_parse(K2, &[], text);
+    }
+
+    /// Text inside a section, between its calls, and a call whose header is
+    /// broken, are dropped with the section instead of reaching the content.
+    #[test]
+    fn k2_text_inside_a_section_is_dropped() {
+        let text = "<|tool_calls_section_begin|><|tool_call_begin|>functions.f:0\
+                    <|tool_call_argument_begin|>{}<|tool_call_end|> stray \
+                    <|tool_call_begin|>broken header\n<|tool_call_begin|>functions.g:1\
+                    <|tool_call_argument_begin|>{}<|tool_call_end|><|tool_calls_section_end|> Done.";
+        let (content, calls) = parse(K2, text);
+        assert_eq!(content, "Done.");
+        let names: Vec<&str> = calls.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["f", "g"]);
         assert_streams_like_parse(K2, &[], text);
     }
 

@@ -34,14 +34,14 @@ pub(super) static HARMONY: Harmony = Harmony;
 impl Grammar for Harmony {
     fn markers(&self) -> &'static [Marker] {
         const MARKERS: &[Marker] = &[
-            Marker::anywhere(START),
-            Marker::anywhere(CHANNEL),
+            Marker::anywhere(START).closed_by(ENDS),
+            Marker::anywhere(CHANNEL).closed_by(ENDS),
             Marker::anywhere(ENDS[0]),
             Marker::anywhere(ENDS[1]),
             Marker::anywhere(ENDS[2]),
             // The prompt ends with `<|start|>assistant`, so a call addressed
             // in the role header starts the output with ` to=functions.…`.
-            Marker::leading("to="),
+            Marker::leading("to=").closed_by(ENDS),
         ];
         MARKERS
     }
