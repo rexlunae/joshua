@@ -61,6 +61,7 @@ use crate::engine::{Engine, EngineOptions};
 use crate::error::JoshuaError;
 use crate::whisper::WhisperEngine;
 use crate::tools::parse_tool_calls;
+use crate::reasoning::ReasoningSplitter;
 use crate::types::{
     AssistantMessage, ChatChoice, ChatCompletionChunk, ChatCompletionRequest,
     ChatCompletionResponse, ChatMessage, DeltaContent, EmbeddingData, EmbeddingRequest,
@@ -1433,6 +1434,23 @@ async fn chat_completions(
     };
 
     let id = format!("chatcmpl-{}", Uuid::new_v4().simple());
+    // Split the thinking trace out of the visible answer, so a client can collapse it.
+    let (content, reasoning_content) = match content {
+        Some(text) => {
+            let mut splitter = ReasoningSplitter::new();
+            let mut visible = String::new();
+            let mut trace = String::new();
+            for (c, r) in [splitter.feed(&text), splitter.finish()] {
+                visible.push_str(&c);
+                trace.push_str(&r);
+            }
+            (
+                if visible.trim().is_empty() { None } else { Some(visible) },
+                if trace.trim().is_empty() { None } else { Some(trace) },
+            )
+        }
+        None => (None, None),
+    };
     let response = ChatCompletionResponse::new(
         id,
         model,
@@ -1442,6 +1460,7 @@ async fn chat_completions(
                 role: "assistant".to_string(),
                 content,
                 tool_calls,
+                reasoning_content,
             },
             finish_reason: finish_reason.to_string(),
         }],
@@ -1690,6 +1709,20 @@ impl ChatStreamEmitter {
             role: self.take_role(),
             content: Some(text.to_string()),
             tool_calls: None,
+            reasoning_content: None,
+        };
+        self.send(delta, None, None);
+    }
+
+    fn reasoning(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let delta = DeltaContent {
+            role: self.take_role(),
+            content: None,
+            tool_calls: None,
+            reasoning_content: Some(text.to_string()),
         };
         self.send(delta, None, None);
     }
@@ -1704,6 +1737,7 @@ impl ChatStreamEmitter {
                 "type": "function",
                 "function": {"name": name, "arguments": ""},
             }])),
+            reasoning_content: None,
         };
         self.send(delta, None, None);
     }
@@ -1716,6 +1750,7 @@ impl ChatStreamEmitter {
                 "index": index,
                 "function": {"arguments": arguments},
             }])),
+            reasoning_content: None,
         };
         self.send(delta, None, None);
     }
@@ -1782,11 +1817,14 @@ fn stream_chat_completion(
     metrics: &ServerMetrics,
 ) {
     let mut filter = ChatStreamFilter::new(tools.is_some());
+    let mut splitter = ReasoningSplitter::new();
     let mut emitter = ChatStreamEmitter::new(id.to_string(), model.to_string(), tx);
     let result = {
         let mut on_text = |delta: &str| {
             for text in filter.push(delta) {
-                emitter.text(&text);
+                let (content, reasoning) = splitter.feed(&text);
+                emitter.reasoning(&reasoning);
+                emitter.text(&content);
             }
         };
         engine.complete_chat_streaming(messages, tools, options, cancel, &mut on_text)
@@ -1796,8 +1834,13 @@ fn stream_chat_completion(
         Ok((text, usage, _, _)) => {
             metrics.record_generation(&usage);
             for withheld in filter.finish(&text) {
-                emitter.text(&withheld);
+                let (content, reasoning) = splitter.feed(&withheld);
+                emitter.reasoning(&reasoning);
+                emitter.text(&content);
             }
+            let (content, reasoning) = splitter.finish();
+            emitter.reasoning(&reasoning);
+            emitter.text(&content);
             let (_, calls) = filter.parse(&text);
             if calls.is_empty() {
                 let reason = if usage.completion_tokens >= options.max_tokens {

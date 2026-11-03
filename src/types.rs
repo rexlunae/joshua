@@ -722,6 +722,10 @@ pub struct AssistantMessage {
     /// Parsed tool calls from the model output, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
+    /// The model's thinking trace, split out of `content` (Qwen/GLM/DeepSeek-style
+    /// `thinking` spans).  Absent when the model did not think.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 /// A single tool call emitted by the assistant.
@@ -811,6 +815,9 @@ pub struct DeltaContent {
     /// Tool-call deltas (OpenAI wire format, including `index` per entry).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<serde_json::Value>,
+    /// Thinking-trace delta, streamed separately from `content`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 // ─── Embeddings ───────────────────────────────────────────────────────────────
