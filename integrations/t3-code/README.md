@@ -64,12 +64,16 @@ the **same model file** on every worker.
 ```bash
 joshua-control cluster up --router kleya --workers kleya,erskin \
   --model /home/tserica/models/Qwen3-8B-Q4_K_M.gguf --port 18080 --ctx 8192
-joshua-control cluster status --workers kleya,erskin --port 18080
+joshua-control cluster status --workers kleya,erskin --port 18092
 ```
 
 Workers must bind an address the router can reach (`--addr 0.0.0.0:PORT`, tailnet IPs across
-machines) and share the key the command prints. Point a provider at the router's port with
-`joshua-control install --host <router-host> --port <router-port>`.
+machines) and share the key the command prints; `--worker` takes `host:port`, not a URL. Point a
+provider at the router's port with `joshua-control install --host <router-host> --port <router-port>`.
+
+Membership is only visible on a coordinator (`GET /v1/workers`); `serve --worker` does not mount that
+route, so `cluster status` reports each worker's own `/v1/worker/info` (model, backend, in-flight)
+instead.
 
 ## Controls
 

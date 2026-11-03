@@ -211,8 +211,9 @@ def cmd_cluster(args):
                                 device=args.device, model_dir=args.model_dir, api_key=args.api_key,
                                 addr=f"0.0.0.0:{port}", extra="")
         cmd_start(ns)
-        ip = run(host, "hostname -I 2>/dev/null | awk '{print $1}' || ipconfig getifaddr en0").stdout.strip()
-        worker_urls.append(f"http://{ip}:{port}")
+        ip = run(host, "hostname -I 2>/dev/null | awk '{print $1}' || ipconfig getifaddr en0").stdout.strip().split()[0]
+        # `--worker` takes a socket address, not a URL
+        worker_urls.append(f"{ip}:{port}")
     worker_flag = " ".join(f"--worker {u}" for u in worker_urls)
     print(f"starting router on {args.router} -> {worker_urls}")
     cmd = (f"mkdir -p $HOME/.joshua/run $HOME/.joshua/logs; JOSHUA_CLUSTER_KEY={key} "
