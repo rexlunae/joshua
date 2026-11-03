@@ -1016,6 +1016,54 @@ async fn chat_reports_cached_prompt_tokens_on_a_follow_up() {
     );
 }
 
+/// With tools offered, the streamed text goes through the tool-call parser:
+/// output without call markup streams as the same content the non-streaming
+/// response returns.
+#[tokio::test]
+async fn streaming_chat_with_tools_reconstructs_the_non_streaming_text() {
+    let app = create_router(tiny_state("server-stream-tools", None));
+    let request = serde_json::json!({
+        "model": "model",
+        "messages": [{"role": "user", "content": "a b"}],
+        "tools": [{"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}],
+        "max_tokens": 6,
+        "temperature": 0.0,
+    });
+    let (status, body) = chat(app.clone(), request.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let response: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let expected = response["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(response["choices"][0]["message"]["tool_calls"].is_null());
+
+    let mut streaming = request;
+    streaming["stream"] = serde_json::json!(true);
+    let (status, body) = chat(app, streaming).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mut text = String::new();
+    let mut finish_reason = None;
+    for data in body.lines().filter_map(|line| line.strip_prefix("data: ")) {
+        if data == "[DONE]" {
+            continue;
+        }
+        let value: serde_json::Value = serde_json::from_str(data).unwrap();
+        assert!(
+            value["choices"][0]["delta"]["tool_calls"].is_null(),
+            "{data}"
+        );
+        if let Some(content) = value["choices"][0]["delta"]["content"].as_str() {
+            text.push_str(content);
+        }
+        if let Some(reason) = value["choices"][0]["finish_reason"].as_str() {
+            finish_reason = Some(reason.to_string());
+        }
+    }
+    assert_eq!(text, expected);
+    assert_ne!(finish_reason.as_deref(), Some("tool_calls"));
+}
+
 // ─── TLS (only with `cargo test --features tls`) ─────────────────────────────
 
 #[cfg(feature = "tls")]

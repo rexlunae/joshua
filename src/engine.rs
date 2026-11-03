@@ -580,6 +580,10 @@ pub struct EngineOptions {
     /// Render a request's own [`GenerationOptions::chat_template`] (see
     /// [`Engine::with_trust_request_chat_template`]).
     pub trust_request_chat_template: bool,
+    /// The tool-call format to parse model output with (the server's
+    /// `--tool-call-parser`).  `None` detects it from the chat template and
+    /// the architecture (see [`Engine::tool_call_format`]).
+    pub tool_call_parser: Option<crate::tools::ToolCallFormat>,
 }
 
 impl EngineOptions {
@@ -823,6 +827,13 @@ impl EngineOptions {
         self.draft_max = n;
         self
     }
+
+    /// Parse tool calls in `format` instead of detecting it.  See
+    /// [`EngineOptions::tool_call_parser`].
+    pub fn tool_call_parser(mut self, format: Option<crate::tools::ToolCallFormat>) -> Self {
+        self.tool_call_parser = format;
+        self
+    }
 }
 
 // ─── Env flags ───────────────────────────────────────────────────────────────
@@ -1037,6 +1048,9 @@ pub struct Engine {
     draft: Option<crate::draft_model::DraftModel>,
     /// Most draft-model tokens per step.
     draft_max: usize,
+    /// The operator's tool-call format, over the detected one (see
+    /// [`EngineOptions::tool_call_parser`]).
+    tool_call_parser: Option<crate::tools::ToolCallFormat>,
     /// Draft tokens verified by speculative decoding.
     spec_drafted: AtomicU64,
     /// Draft tokens the model accepted.
@@ -2792,7 +2806,7 @@ impl Engine {
         }
 
         tracing::info!(
-            "Model '{}' ready (arch={}, ctx={}, eos_ids={:?}, chat_template={}, device={:?})",
+            "Model '{}' ready (arch={}, ctx={}, eos_ids={:?}, chat_template={}, tool_calls={}, device={:?})",
             display_name,
             arch.as_ref()
                 .map(|a| a.display_name())
@@ -2804,6 +2818,7 @@ impl Engine {
             } else {
                 "ChatML fallback"
             },
+            tool_call_format(options.tool_call_parser, chat_template.as_ref(), arch),
             device
         );
 
@@ -2981,6 +2996,7 @@ impl Engine {
             mtp,
             draft,
             draft_max,
+            tool_call_parser: options.tool_call_parser,
             spec_drafted: AtomicU64::new(0),
             spec_accepted: AtomicU64::new(0),
             spec_verify_steps: AtomicU64::new(0),
@@ -3695,6 +3711,20 @@ impl Engine {
         self.chat_template.is_some()
     }
 
+    /// The tool-call markup the model writes: the operator's
+    /// `--tool-call-parser`, else the family its chat template teaches, else
+    /// its architecture's, else the generic Hermes / Qwen / Mistral reader
+    /// (see [`crate::tools::ToolCallFormat::select`]).  Parse output with
+    /// [`crate::tools::parse_tool_calls`] or stream it through a
+    /// [`crate::tools::ToolCallStream`] in this format.
+    pub fn tool_call_format(&self) -> crate::tools::ToolCallFormat {
+        tool_call_format(
+            self.tool_call_parser,
+            self.chat_template.as_ref(),
+            self.arch,
+        )
+    }
+
     /// Format messages as a ChatML prompt and end it as `render` asks: with
     /// the assistant turn header (the default), with nothing, or with the
     /// final message left open for the model to continue.
@@ -3835,8 +3865,8 @@ impl Engine {
     ///
     /// Tools are exposed to the chat template as the standard `tools`
     /// variable so the model is instructed how to emit calls; parse the
-    /// generated text with [`crate::tools::parse_tool_calls`] to extract
-    /// them.
+    /// generated text with [`crate::tools::parse_tool_calls`] in
+    /// [`Engine::tool_call_format`] to extract them.
     pub fn complete_chat(
         &self,
         messages: &[ChatMessage],
@@ -7976,6 +8006,25 @@ fn sanitize_model_name(raw: &str) -> Option<String> {
     } else {
         Some(out)
     }
+}
+
+/// The tool-call format to parse a model's output in (see
+/// [`Engine::tool_call_format`]).  Without a template that renders tools the
+/// prompt is the ChatML fallback, which teaches Hermes calls, so the
+/// architecture's own format does not apply.
+fn tool_call_format(
+    parser: Option<crate::tools::ToolCallFormat>,
+    template: Option<&ChatTemplate>,
+    arch: Option<crate::model::Architecture>,
+) -> crate::tools::ToolCallFormat {
+    use crate::tools::ToolCallFormat;
+    let taught = match template {
+        // The operator's choice needs no look at the template.
+        _ if parser.is_some() => None,
+        Some(template) if template.renders_tools() => template.tool_call_format(),
+        _ => Some(ToolCallFormat::Generic),
+    };
+    ToolCallFormat::select(parser, taught, arch)
 }
 
 /// Extract the model's chat template from GGUF metadata, if present.

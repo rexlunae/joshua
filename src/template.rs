@@ -30,6 +30,7 @@ use minijinja::{Environment, Error, ErrorKind, Value};
 use serde::Serialize;
 use tokenizers::Tokenizer;
 
+use crate::tools::ToolCallFormat;
 use crate::types::{ChatMessage, Tool};
 
 /// A chat template extracted from GGUF metadata, plus the special-token
@@ -44,6 +45,10 @@ pub struct ChatTemplate {
     /// The most template instructions one render may run (`None`: no
     /// limit); see [`ChatTemplate::with_fuel`].
     fuel: Option<u64>,
+    /// The tool-call format the template teaches, if it is a known one.
+    tool_call_format: Option<ToolCallFormat>,
+    /// Whether a request with tools renders (see [`Self::renders_tools`]).
+    renders_tools: std::sync::OnceLock<bool>,
 }
 
 /// The [`ChatTemplate::with_fuel`] limit for a template a request supplies:
@@ -67,12 +72,15 @@ impl ChatTemplate {
         bos_token: impl Into<String>,
         eos_token: impl Into<String>,
     ) -> Self {
+        let source = source.into();
         Self {
-            source: source.into(),
+            tool_call_format: ToolCallFormat::from_template(&source),
+            source,
             bos_token: bos_token.into(),
             eos_token: eos_token.into(),
             special_tokens: Vec::new(),
             fuel: None,
+            renders_tools: std::sync::OnceLock::new(),
         }
     }
 
@@ -111,6 +119,40 @@ impl ChatTemplate {
     /// The raw Jinja source of the template.
     pub fn source(&self) -> &str {
         &self.source
+    }
+
+    /// The tool-call markup the template tells the model to write, when it
+    /// is a family [`ToolCallFormat::from_template`] knows.
+    pub fn tool_call_format(&self) -> Option<ToolCallFormat> {
+        self.tool_call_format
+    }
+
+    /// Whether a request with tools renders: a template that cannot (one
+    /// calling a function the renderer lacks, say) leaves such requests to
+    /// the ChatML fallback, whose prompt teaches Hermes calls instead of the
+    /// template's own.  Checked once, on a one-message conversation.
+    pub fn renders_tools(&self) -> bool {
+        *self.renders_tools.get_or_init(|| {
+            let tool = Tool {
+                tool_type: "function".to_string(),
+                function: crate::types::FunctionDef {
+                    name: "probe".to_string(),
+                    description: Some("A probe".to_string()),
+                    parameters: Some(serde_json::json!({
+                        "type": "object",
+                        "properties": {"a": {"type": "string"}},
+                    })),
+                },
+            };
+            let rendered = self.render(&[ChatMessage::text("user", "hi")], Some(&[tool]));
+            if let Err(e) = &rendered {
+                tracing::warn!(
+                    "the GGUF chat template cannot render tools ({e}); \
+                     requests with tools use the ChatML prompt and Hermes tool calls"
+                );
+            }
+            rendered.is_ok()
+        })
     }
 
     /// Render the conversation to a prompt string, appending the generation

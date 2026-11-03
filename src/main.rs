@@ -564,6 +564,17 @@ enum Commands {
             default_value_t = false
         )]
         trust_request_chat_template: bool,
+        /// Tool-call format to parse model output with, by vLLM's parser
+        /// name (hermes, qwen3_coder, llama3_json, pythonic, deepseek_v4,
+        /// kimi_k2, glm45, openai, …; an unknown name lists them all).
+        /// `auto` detects it from the chat template and the architecture.
+        #[arg(
+            long,
+            env = "JOSHUA_TOOL_CALL_PARSER",
+            default_value = "auto",
+            value_parser = joshua::tools::ToolCallFormat::parse_override
+        )]
+        tool_call_parser: ::std::option::Option<joshua::tools::ToolCallFormat>,
         /// Require this API key on /v1 routes (Authorization: Bearer <key>
         /// or x-api-key: <key>).  A comma-separated list accepts any key.
         #[arg(long, env = "JOSHUA_API_KEY")]
@@ -1018,6 +1029,7 @@ async fn main() -> anyhow::Result<()> {
             chat_template,
             chat_template_file,
             trust_request_chat_template,
+            tool_call_parser,
             api_key,
             cors_origin,
             tls_cert,
@@ -1092,7 +1104,8 @@ async fn main() -> anyhow::Result<()> {
                 .device_memory_budget(vram_budget.map(|mib| mib.saturating_mul(1024 * 1024)))
                 .sampling(sampling.overrides())
                 .chat_template(chat_template_source(chat_template, chat_template_file)?)
-                .trust_request_chat_template(trust_request_chat_template);
+                .trust_request_chat_template(trust_request_chat_template)
+                .tool_call_parser(tool_call_parser);
             // One backend serves the startup model and any loaded later.
             let npu = npu_plugin
                 .map(|plugin| npu_backend(&plugin, npu_in_process))
