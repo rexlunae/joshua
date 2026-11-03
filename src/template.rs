@@ -291,17 +291,26 @@ impl ChatTemplate {
             reasoning_content: Option<&'a str>,
         }
 
-        let msgs: Vec<Msg> = messages
+        let msgs = |objects: bool| -> Vec<Msg> {
+            messages
+                .iter()
+                .map(|m| Msg {
+                    role: &m.role,
+                    content: &m.content,
+                    name: m.name.as_deref(),
+                    tool_calls: m
+                        .tool_calls
+                        .as_ref()
+                        .and_then(|calls| template_tool_calls(calls, objects)),
+                    tool_call_id: m.tool_call_id.as_deref(),
+                    reasoning_content: m.reasoning_content.as_deref(),
+                })
+                .collect()
+        };
+        let with_objects = msgs(true);
+        let converted = with_objects
             .iter()
-            .map(|m| Msg {
-                role: &m.role,
-                content: &m.content,
-                name: m.name.as_deref(),
-                tool_calls: m.tool_calls.as_ref().and_then(template_tool_calls),
-                tool_call_id: m.tool_call_id.as_deref(),
-                reasoning_content: m.reasoning_content.as_deref(),
-            })
-            .collect();
+            .any(|m| matches!(m.tool_calls, Some(Cow::Owned(_))));
 
         let mut env = Environment::new();
         env.set_fuel(self.fuel);
@@ -317,7 +326,6 @@ impl ChatTemplate {
             .iter()
             .map(|(k, v)| (k.clone(), Value::from_serialize(v)))
             .collect();
-        ctx.insert("messages".into(), Value::from_serialize(&msgs));
         ctx.insert(
             "add_generation_prompt".into(),
             Value::from(add_generation_prompt),
@@ -335,10 +343,27 @@ impl ChatTemplate {
             }
         }
 
-        env.get_template("chat")
-            .expect("template was just added")
-            .render(Value::from(ctx))
-            .map_err(|e| format!("chat template failed to render: {e}"))
+        let template = env.get_template("chat").expect("template was just added");
+        let render = |msgs: &[Msg]| {
+            let mut ctx = ctx.clone();
+            ctx.insert("messages".into(), Value::from_serialize(msgs));
+            template.render(Value::from(ctx))
+        };
+        match render(&with_objects) {
+            // A template that cannot take the arguments as objects (one
+            // joining them to text with `+`, as functionary v3.2's does)
+            // gets the client's strings, as llama.cpp's capability probe
+            // leaves them for such a template.
+            Err(e) if converted && e.kind() != ErrorKind::OutOfFuel => {
+                tracing::debug!(
+                    "chat template cannot render tool-call arguments as objects ({e}); \
+                     passing the client's strings"
+                );
+                render(&msgs(false)).map_err(|_| e)
+            }
+            rendered => rendered,
+        }
+        .map_err(|e| format!("chat template failed to render: {e}"))
     }
 }
 
@@ -613,13 +638,17 @@ fn py_float(out: &mut String, x: f64) {
 /// OpenAI clients send `function.arguments` as a JSON string, but templates
 /// written for transformers iterate it (`arguments|items`, Qwen3-Coder and
 /// GLM) or `tojson` it (Llama 3.x, DeepSeek, Mistral), which double-encodes
-/// a string.  As vLLM's `_postprocess_messages` and llama.cpp's
-/// `func_args_not_string` do, a string that holds a JSON object becomes that
-/// object, and missing or empty arguments become `{}`; a string that is not
-/// a JSON object is kept as it is.  An empty `tool_calls` list is dropped so
-/// the template takes its plain-assistant path.  The value is copied only
-/// when something changes.
-fn template_tool_calls(calls: &serde_json::Value) -> Option<Cow<'_, serde_json::Value>> {
+/// a string.  With `objects`, as vLLM's `_postprocess_messages` and
+/// llama.cpp's `func_args_not_string` do, a string that holds a JSON object
+/// becomes that object, and missing or empty arguments become `{}`; a
+/// string that is not a JSON object is kept as it is.  Without, the calls
+/// are the client's, for a template that cannot take objects.  An empty
+/// `tool_calls` list is dropped so the template takes its plain-assistant
+/// path.  The value is copied only when something changes.
+fn template_tool_calls(
+    calls: &serde_json::Value,
+    objects: bool,
+) -> Option<Cow<'_, serde_json::Value>> {
     use serde_json::Value;
 
     /// The object `arguments` should be, when it is not one already.
@@ -641,10 +670,11 @@ fn template_tool_calls(calls: &serde_json::Value) -> Option<Cow<'_, serde_json::
     if items.is_empty() {
         return None;
     }
-    let changes = items
-        .iter()
-        .filter_map(|call| call.get("function").filter(|f| f.is_object()))
-        .any(|f| arguments_object(f.get("arguments")).is_some());
+    let changes = objects
+        && items
+            .iter()
+            .filter_map(|call| call.get("function").filter(|f| f.is_object()))
+            .any(|f| arguments_object(f.get("arguments")).is_some());
     if !changes {
         return Some(Cow::Borrowed(calls));
     }
@@ -1141,13 +1171,48 @@ mod tests {
         );
         // The caller's messages are untouched.
         let calls = serde_json::json!([{"function": {"name": "f", "arguments": "{}"}}]);
-        assert!(matches!(template_tool_calls(&calls), Some(Cow::Owned(_))));
-        let objects = serde_json::json!([{"function": {"name": "f", "arguments": {}}}]);
         assert!(matches!(
-            template_tool_calls(&objects),
+            template_tool_calls(&calls, true),
+            Some(Cow::Owned(_))
+        ));
+        assert!(matches!(
+            template_tool_calls(&calls, false),
             Some(Cow::Borrowed(_))
         ));
-        assert!(template_tool_calls(&serde_json::json!([])).is_none());
+        let objects = serde_json::json!([{"function": {"name": "f", "arguments": {}}}]);
+        assert!(matches!(
+            template_tool_calls(&objects, true),
+            Some(Cow::Borrowed(_))
+        ));
+        assert!(template_tool_calls(&serde_json::json!([]), true).is_none());
+        assert!(template_tool_calls(&serde_json::json!([]), false).is_none());
+    }
+
+    /// A template that joins the arguments to text (functionary v3.2's
+    /// `'>>>' + name + '\n' + arguments`) cannot take an object; it gets
+    /// the client's string instead of failing over to ChatML.
+    #[test]
+    fn a_template_that_concatenates_arguments_gets_the_string() {
+        let source = "{% for m in messages %}{% for c in m.tool_calls %}\
+                      {{ '>>>' + c.function.name + '\\n' + c.function.arguments }}\
+                      {% endfor %}{% endfor %}";
+        let t = ChatTemplate::new(source, "", "");
+        let mut assistant = msg("assistant", "");
+        assistant.tool_calls = Some(serde_json::json!([{
+            "id": "call_1", "type": "function",
+            "function": {"name": "f", "arguments": "{\"city\": \"Paris\"}"}
+        }]));
+        assert_eq!(
+            t.render(&[assistant], None).unwrap(),
+            ">>>f\n{\"city\": \"Paris\"}"
+        );
+        // A template that fails for another reason still fails.
+        let t = ChatTemplate::new("{{ raise_exception('no') }}", "", "");
+        let mut assistant = msg("assistant", "");
+        assistant.tool_calls = Some(serde_json::json!([{
+            "function": {"name": "f", "arguments": "{}"}
+        }]));
+        assert!(t.render(&[assistant], None).unwrap_err().contains("no"));
     }
 
     /// `tojson` writes what transformers' (Python's `json.dumps`) does:

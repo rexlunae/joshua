@@ -307,6 +307,21 @@ fn string_arguments_reach_templates_as_objects() {
     );
 }
 
+/// Functionary v3.2 joins the arguments to text with `+`, which an object
+/// cannot take: its history gets the client's string, as llama.cpp's
+/// capability probe leaves it for this template, instead of the request
+/// falling back to ChatML.
+#[test]
+fn templates_that_concatenate_arguments_take_the_string() {
+    let rendered = template("meetkai-functionary-medium-v3.2.jinja")
+        .render(&conversation("call_1"), Some(&[weather_tool()]))
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert!(
+        rendered.contains(">>>get_weather\n{\"city\": \"Paris\", \"days\": 3}<|eot_id|>"),
+        "{rendered}"
+    );
+}
+
 /// Qwen 2.5 / 3 write tools and call arguments with `tojson`, which writes
 /// what transformers' does (as vLLM and llama.cpp render them): the
 /// client's own `json.dumps` text comes back as it was sent, keys in their

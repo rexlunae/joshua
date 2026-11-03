@@ -494,9 +494,12 @@ input arrives as `input_json_delta`s.
 
 Assistant `tool_calls` sent back in the history reach the chat template with
 `function.arguments` as an object, as transformers-style templates expect
-(vLLM and llama.cpp do the same): a JSON-string object is parsed, and empty
-arguments become `{}`; a string that is not a JSON object is passed through
-unchanged.  The templates' `tojson` writes what transformers' does (Python's
+(vLLM passes them so; llama.cpp does for templates that read them as
+objects): a JSON-string object is parsed, and empty arguments become `{}`;
+a string that is not a JSON object is passed through unchanged.  A template
+that cannot render them as objects (functionary v3.2 joins them to text
+with `+`) gets the client's strings instead, as llama.cpp gives it.  The
+templates' `tojson` writes what transformers' does (Python's
 `json.dumps`: `, ` and `: ` separators, keys in the order the client sent
 them, no HTML escaping, with its `ensure_ascii`, `indent`, `separators` and
 `sort_keys`), so the tools and calls in the prompt are the text vLLM and
