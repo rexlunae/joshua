@@ -54,9 +54,11 @@ pub struct ToolCallStream<'a> {
     /// begun: the region is skipped from there through its closing string.
     broken: Option<usize>,
     calls: Vec<Sent>,
-    /// Whether any prose has been sent.  Whitespace before the first prose
-    /// is held: it is dropped if a tool call comes first.
-    prose_started: bool,
+    /// Whether whitespace-only prose is held back: at the start of the
+    /// output and after a call, until other prose follows.  Held
+    /// whitespace is dropped if a call (or, after a call, the end) comes
+    /// first, so none is sent around or between calls.
+    hold_whitespace: bool,
     held_whitespace: String,
 }
 
@@ -73,7 +75,7 @@ impl<'a> ToolCallStream<'a> {
             region_first: 0,
             broken: None,
             calls: Vec::new(),
-            prose_started: false,
+            hold_whitespace: true,
             held_whitespace: String::new(),
         }
     }
@@ -100,8 +102,9 @@ impl<'a> ToolCallStream<'a> {
             return out;
         }
         self.drain(true, &mut out);
-        if self.calls.is_empty() && !self.prose_started {
-            let held = std::mem::take(&mut self.held_whitespace);
+        // An output of nothing but whitespace is still the answer.
+        let held = std::mem::take(&mut self.held_whitespace);
+        if self.calls.is_empty() {
             push_text(&mut out, &held);
         }
         out
@@ -228,12 +231,12 @@ impl<'a> ToolCallStream<'a> {
         if text.is_empty() {
             return;
         }
-        if !self.prose_started {
+        if self.hold_whitespace {
             if text.trim().is_empty() {
                 self.held_whitespace.push_str(text);
                 return;
             }
-            self.prose_started = true;
+            self.hold_whitespace = false;
             let held = std::mem::take(&mut self.held_whitespace);
             push_text(out, &held);
         }
@@ -250,6 +253,7 @@ impl<'a> ToolCallStream<'a> {
                     return;
                 }
                 self.held_whitespace.clear();
+                self.hold_whitespace = true;
                 out.push(ToolEvent::CallStart {
                     index,
                     id: call.id.clone(),
@@ -579,5 +583,22 @@ mod tests {
         let mut stream = ToolCallStream::new(ToolCallFormat::Generic, Some(&[]));
         let events = collect(&mut stream, &[" \n"]);
         assert_eq!(prose(&events), " \n");
+    }
+
+    /// No whitespace-only prose is sent between or after calls; prose
+    /// after a call keeps the whitespace before it.
+    #[test]
+    fn drops_whitespace_between_and_after_calls() {
+        let call = |name: &str| format!("<tool_call>{{\"name\":\"{name}\"}}</tool_call>");
+        let mut stream = ToolCallStream::new(ToolCallFormat::Generic, Some(&[]));
+        let events = collect(
+            &mut stream,
+            &["Both.\n", &call("a"), "\n", &call("b"), "\n"],
+        );
+        assert_eq!(prose(&events), "Both.\n");
+        assert_eq!(stream.calls().len(), 2);
+        let mut stream = ToolCallStream::new(ToolCallFormat::Generic, Some(&[]));
+        let events = collect(&mut stream, &[&call("a"), "\n\n", "Done."]);
+        assert_eq!(prose(&events), "\n\nDone.");
     }
 }

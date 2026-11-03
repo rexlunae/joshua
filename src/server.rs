@@ -2982,6 +2982,25 @@ mod tests {
         assert_eq!(finish_reason(&chunks), "stop");
     }
 
+    /// No whitespace-only content arrives between two calls.
+    #[test]
+    fn openai_stream_sends_no_whitespace_between_calls() {
+        let pieces = [
+            "Let me check both.\n",
+            "<tool_call>\n{\"name\": \"a\", \"arguments\": {}}\n</tool_call>",
+            "\n",
+            "<tool_call>\n{\"name\": \"b\", \"arguments\": {}}\n</tool_call>",
+            "\n",
+        ];
+        let chunks = openai_chunks(ToolCallFormat::Generic, &pieces, StopType::Eos);
+        let contents: Vec<&str> = chunks
+            .iter()
+            .filter_map(|c| c["choices"][0]["delta"]["content"].as_str())
+            .collect();
+        assert_eq!(contents, ["Let me check both.\n"]);
+        assert_eq!(openai_rebuild(&chunks).1.len(), 2);
+    }
+
     fn anthropic_events(format: ToolCallFormat, pieces: &[&str]) -> Vec<(String, Value)> {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AnthropicSse>();
         let mut emitter = AnthropicStreamEmitter::new("msg_1".into(), "m".into(), tx);
@@ -3116,6 +3135,18 @@ mod tests {
             (blocks[1].0.as_str(), blocks[1].1.as_str()),
             ("text", " Done.")
         );
+    }
+
+    /// Two calls in a row open no text block between them.
+    #[test]
+    fn anthropic_stream_opens_no_whitespace_block_between_calls() {
+        let pieces = [
+            "Let me check both.\n<tool_call>\n{\"name\": \"a\", \"arguments\": {}}\n</tool_call>\n",
+            "<tool_call>\n{\"name\": \"b\", \"arguments\": {}}\n</tool_call>",
+        ];
+        let blocks = anthropic_rebuild(&anthropic_events(ToolCallFormat::Generic, &pieces));
+        let kinds: Vec<&str> = blocks.iter().map(|b| b.0.as_str()).collect();
+        assert_eq!(kinds, ["text", "tool_use", "tool_use"]);
     }
 
     #[test]
