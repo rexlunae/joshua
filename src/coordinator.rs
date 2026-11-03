@@ -83,7 +83,7 @@ use tower_http::cors::CorsLayer;
 use uuid::Uuid;
 
 use crate::model_info::ModelInfo;
-use crate::types::{ErrorResponse, ModelCard, ModelListResponse};
+use crate::types::{unix_time, ErrorResponse, ModelListResponse};
 
 mod jobs;
 
@@ -145,8 +145,10 @@ pub struct WorkerInfo {
     pub embedding_jobs: Vec<JobModel>,
     /// The worker's own `/v1/models` entries for the models it serves, which
     /// the router's model list passes through; older workers leave it out.
+    /// Kept as sent, so fields this router does not know (a newer worker's)
+    /// pass through too, and no entry can fail the report as a whole.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub cards: Vec<ModelCard>,
+    pub cards: Vec<serde_json::Value>,
     /// Bounded live cache inventory; absence is unknown on older workers.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub cache_residency: HashMap<String, crate::affinity::CacheResidency>,
@@ -1146,12 +1148,12 @@ impl Coordinator {
         models
     }
 
-    /// The `/v1/models` entries for [`Self::models`]: each model's card
-    /// from the first healthy worker (in configured order) that reports
-    /// one, or an entry naming just the model for workers that predate
+    /// The `/v1/models` entries for [`Self::models`]: each model's card, as
+    /// the first healthy worker (in configured order) that reports one sent
+    /// it, or an entry naming just the model for workers that predate
     /// cards.
-    fn model_cards(&self) -> Vec<ModelCard> {
-        let cards: Vec<ModelCard> = self
+    fn model_cards(&self) -> Vec<serde_json::Value> {
+        let cards: Vec<serde_json::Value> = self
             .workers
             .iter()
             .flat_map(|w| {
@@ -1163,12 +1165,12 @@ impl Coordinator {
                     .unwrap_or_default()
             })
             .collect();
-        let created = crate::model_info::now();
+        let created = unix_time();
         self.models()
             .into_iter()
-            .map(|id| match cards.iter().find(|card| card.id == id) {
+            .map(|id| match cards.iter().find(|card| card["id"] == id) {
                 Some(card) => card.clone(),
-                None => ModelInfo::new(id, created).card(),
+                None => json!(ModelInfo::new(id, created).card()),
             })
             .collect()
     }
@@ -1825,19 +1827,17 @@ fn reject_response(reject: Reject) -> Response {
             "invalid_request_error",
             Some("context_window_exceeded"),
         ),
-        Reject::UnknownModel(model, available) => error_response(
-            StatusCode::NOT_FOUND,
-            &format!(
+        Reject::UnknownModel(model, available) => {
+            let body = ErrorResponse::model_not_found(format!(
                 "model '{model}' is not served by any worker (available: {})",
                 if available.is_empty() {
                     "none".to_string()
                 } else {
                     available.join(", ")
                 }
-            ),
-            "invalid_request_error",
-            Some("model_not_found"),
-        ),
+            ));
+            (StatusCode::NOT_FOUND, Json(body)).into_response()
+        }
         Reject::Unavailable => error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "no healthy worker serves this request",
@@ -1955,7 +1955,9 @@ async fn health(State(c): State<Arc<Coordinator>>) -> Response {
     (status, Json(body)).into_response()
 }
 
-async fn list_models(State(c): State<Arc<Coordinator>>) -> Json<ModelListResponse> {
+async fn list_models(
+    State(c): State<Arc<Coordinator>>,
+) -> Json<ModelListResponse<serde_json::Value>> {
     Json(ModelListResponse::new(c.model_cards()))
 }
 
@@ -1964,7 +1966,7 @@ async fn retrieve_model(
     State(c): State<Arc<Coordinator>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
-    match c.model_cards().into_iter().find(|card| card.id == id) {
+    match c.model_cards().into_iter().find(|card| card["id"] == id) {
         Some(card) => Json(card).into_response(),
         None => {
             let body = ErrorResponse::unknown_model(&id);

@@ -3,6 +3,14 @@
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// The current Unix time in seconds, as the `created` fields carry it.
+pub fn unix_time() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 // ─── Chat messages ───────────────────────────────────────────────────────────
 
 /// A single message in a chat conversation.
@@ -1371,10 +1379,7 @@ impl Timings {
 impl ChatCompletionResponse {
     /// Construct a new response with the current timestamp.
     pub fn new(id: String, model: String, choices: Vec<ChatChoice>, usage: UsageInfo) -> Self {
-        let created = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let created = unix_time();
         Self {
             id,
             object: "chat.completion".to_string(),
@@ -1463,10 +1468,7 @@ impl ChatCompletionChunk {
         delta: DeltaContent,
         finish_reason: Option<String>,
     ) -> Self {
-        let created = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let created = unix_time();
         Self {
             id,
             object: "chat.completion.chunk".to_string(),
@@ -1572,18 +1574,20 @@ pub struct EmbeddingData {
 
 // ─── Models list ─────────────────────────────────────────────────────────────
 
-/// OpenAI-compatible `GET /v1/models` response body.
+/// OpenAI-compatible `GET /v1/models` response body.  A `joshua route`
+/// coordinator lists its workers' entries as they sent them
+/// (`serde_json::Value`), so fields it does not know pass through.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ModelListResponse {
+pub struct ModelListResponse<T = ModelCard> {
     /// Always `"list"`.
     pub object: String,
     /// Available models.
-    pub data: Vec<ModelCard>,
+    pub data: Vec<T>,
 }
 
-impl ModelListResponse {
+impl<T> ModelListResponse<T> {
     /// The list holding `data`.
-    pub fn new(data: Vec<ModelCard>) -> Self {
+    pub fn new(data: Vec<T>) -> Self {
         Self {
             object: "list".to_string(),
             data,
@@ -1785,13 +1789,20 @@ impl ErrorResponse {
         Self::new(message, "server_error")
     }
 
-    /// OpenAI's answer for an id that names no model:
-    /// `invalid_request_error`, `param: "model"`, `code: "model_not_found"`.
-    pub fn unknown_model(id: &str) -> Self {
-        let mut body = Self::invalid_request(format!("The model `{id}` does not exist."));
+    /// OpenAI's answer for a model it cannot serve, saying why in
+    /// `message`: `invalid_request_error`, `param: "model"`,
+    /// `code: "model_not_found"`.
+    pub fn model_not_found(message: impl Into<String>) -> Self {
+        let mut body = Self::invalid_request(message);
         body.error.param = Some("model".to_string());
         body.error.code = Some("model_not_found".to_string());
         body
+    }
+
+    /// [`Self::model_not_found`] for an id that names no model, in OpenAI's
+    /// words.
+    pub fn unknown_model(id: &str) -> Self {
+        Self::model_not_found(format!("The model `{id}` does not exist."))
     }
 }
 

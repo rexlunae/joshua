@@ -397,8 +397,15 @@ fn PlaygroundView() -> Element {
     let mut error = use_signal(|| None::<String>);
     let mut running = use_signal(|| None::<Task>);
 
+    // Only loaded models: the server refuses a file it lists but has not
+    // loaded.
     let models: Vec<String> = match &ctx.status.read().models {
-        Some(Ok(list)) => list.data.iter().map(|m| m.id.clone()).collect(),
+        Some(Ok(list)) => list
+            .data
+            .iter()
+            .filter(|m| m.is_loaded())
+            .map(|m| m.id.clone())
+            .collect(),
         _ => Vec::new(),
     };
     let first_model = models.first().cloned();

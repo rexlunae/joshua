@@ -35,7 +35,6 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
     extract::State,
@@ -49,14 +48,10 @@ use crate::engine::Engine;
 use crate::model_info::GgufFacts;
 use crate::sampling::{SamplingDefaults, SamplingProfile};
 use crate::server::{ApiError, AppState, CancelOnDrop};
-use crate::types::{ChatMessage, GenerationOptions, SamplingParams, Tool};
+use crate::types::{unix_time, ChatMessage, GenerationOptions, SamplingParams, Tool};
 
 fn now_rfc3339() -> String {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    format!("{secs}.000000000Z")
+    format!("{}.000000000Z", unix_time())
 }
 
 // ─── /api/version ───────────────────────────────────────────────────────────
@@ -212,7 +207,7 @@ pub async fn show(
     Json(req): Json<ShowRequest>,
 ) -> Result<Json<ShowResponse>, ApiError> {
     let requested = req.model.unwrap_or(req.name);
-    let (id, _engine) = state.models.resolve(&requested)?;
+    let (id, _engine) = state.resolve(&requested)?;
     Ok(Json(ShowResponse {
         details: details_for(None),
         modelfile: Some(format!("# joshua model: {id}")),
@@ -313,7 +308,7 @@ pub async fn chat(
     State(state): State<AppState>,
     Json(req): Json<ChatRequest>,
 ) -> Result<axum::response::Response, ApiError> {
-    let (id, engine) = state.models.resolve(&req.model)?;
+    let (id, engine) = state.resolve(&req.model)?;
     let options = req
         .options
         .to_generation_options(&engine.sampling_defaults(SamplingProfile::Ollama))
@@ -454,7 +449,7 @@ pub async fn generate(
     State(state): State<AppState>,
     Json(req): Json<GenerateRequest>,
 ) -> Result<axum::response::Response, ApiError> {
-    let (id, engine) = state.models.resolve(&req.model)?;
+    let (id, engine) = state.resolve(&req.model)?;
     let options = req
         .options
         .to_generation_options(&engine.sampling_defaults(SamplingProfile::Ollama))
@@ -569,7 +564,7 @@ pub async fn embed(
     State(state): State<AppState>,
     Json(req): Json<EmbedRequest>,
 ) -> Result<Json<EmbedResponse>, ApiError> {
-    let (_id, engine) = state.models.resolve(&req.model)?;
+    let (_id, engine) = state.resolve(&req.model)?;
 
     let inputs: Vec<String> = match (&req.input, &req.prompt) {
         (Some(serde_json::Value::String(s)), _) => vec![s.clone()],

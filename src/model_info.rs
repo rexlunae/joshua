@@ -22,13 +22,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::engine::Engine;
 use crate::gguf_ext::GgufHeader;
-use crate::types::{JoshuaModelExtras, LlamaCppModelMeta, ModelCard, ModelPermission};
+use crate::types::{unix_time, JoshuaModelExtras, LlamaCppModelMeta, ModelCard, ModelPermission};
 
 /// What a GGUF header says about a model, read without touching a weight.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GgufFacts {
     /// `general.architecture`.
     pub architecture: Option<String>,
+    /// `general.type`: `model`, or what a file that is not a model on its
+    /// own holds (`adapter`, `mmproj`, `imatrix`).
+    pub kind: Option<String>,
     /// The context the model was trained with (`<arch>.context_length`).
     pub n_ctx_train: Option<u32>,
     /// Embedding width (`<arch>.embedding_length`).
@@ -72,6 +75,10 @@ impl GgufFacts {
             .get("general.file_type")
             .and_then(crate::gguf_meta::as_u64)
             .and_then(|ft| u32::try_from(ft).ok());
+        let kind = md
+            .get("general.type")
+            .and_then(|v| v.to_string().ok())
+            .cloned();
         let (n_params, tensor_bytes) =
             header
                 .tensors
@@ -92,19 +99,20 @@ impl GgufFacts {
             tensor_bytes,
             file_size,
             architecture,
+            kind,
         }
     }
 
-    /// The facts of the GGUF at `path`, or `None` when it cannot be read.
-    /// Only the header is read, once per version of the file: the result is
-    /// kept until the file's size or modification time changes.
-    pub fn read(path: &Path) -> Option<Self> {
+    /// The facts of the GGUF at `path`.  Only the header is read, once per
+    /// version of the file: the result is kept until the file's size or
+    /// modification time changes.
+    pub fn read(path: &Path) -> crate::Result<Self> {
         type Cache = HashMap<PathBuf, ((u64, Option<SystemTime>), GgufFacts)>;
         static CACHE: Mutex<Option<Cache>> = Mutex::new(None);
         /// Files remembered at once; a larger directory starts over.
         const CACHE_FILES: usize = 1024;
 
-        let stat = std::fs::metadata(path).ok()?;
+        let stat = std::fs::metadata(path)?;
         let version = (stat.len(), stat.modified().ok());
         let cached = CACHE
             .lock()
@@ -113,11 +121,11 @@ impl GgufFacts {
             .and_then(|cache| cache.get(path))
             .filter(|(seen, _)| *seen == version)
             .map(|(_, facts)| facts.clone());
-        if cached.is_some() {
-            return cached;
+        if let Some(facts) = cached {
+            return Ok(facts);
         }
-        let file = std::fs::File::open(path).ok()?;
-        let header = crate::gguf_ext::read_header(&mut std::io::BufReader::new(file)).ok()?;
+        let file = std::fs::File::open(path)?;
+        let header = crate::gguf_ext::read_header(&mut std::io::BufReader::new(file))?;
         let facts = Self::from_header(&header, stat.len());
         let mut cache = CACHE.lock().unwrap_or_else(|p| p.into_inner());
         let cache = cache.get_or_insert_with(HashMap::new);
@@ -125,7 +133,16 @@ impl GgufFacts {
             cache.clear();
         }
         cache.insert(path.to_path_buf(), (version, facts.clone()));
-        Some(facts)
+        Ok(facts)
+    }
+
+    /// Whether the file is a model on its own, rather than one a model
+    /// uses (a LoRA adapter, a multimodal projector, an importance matrix):
+    /// its `general.type` is `model` or absent, and its architecture is not
+    /// `clip` (projectors written before `general.type`).
+    pub fn is_model(&self) -> bool {
+        self.kind.as_deref().is_none_or(|kind| kind == "model")
+            && self.architecture.as_deref() != Some("clip")
     }
 
     /// The quantization as Ollama names it (`"Q4_K_M"`).
@@ -354,16 +371,17 @@ impl ModelInfo {
         }
     }
 
-    /// The GGUF at `path` in `manager`'s directory, not loaded, which a
-    /// load serves as `id`.  Its limits are the ones a load with the
-    /// server's flags gives it.  Reads only the file's header.
+    /// The GGUF at `path` in `manager`'s directory, not loaded, listed as
+    /// `id` (see [`crate::server::ModelManager::unloaded`]).  Its limits are
+    /// the ones a load with the server's flags gives it.  Reads only the
+    /// file's header.
     pub fn of_file(id: &str, path: &Path, manager: &crate::server::ModelManager) -> Self {
-        let facts = GgufFacts::read(path);
+        let facts = GgufFacts::read(path).ok();
         let created = std::fs::metadata(path)
             .and_then(|m| m.modified())
             .ok()
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .map_or_else(now, |d| d.as_secs());
+            .map_or_else(unix_time, |d| d.as_secs());
         Self {
             loaded: false,
             path: Some(path.to_path_buf()),
@@ -396,7 +414,7 @@ impl ModelInfo {
             ),
             parent: self.parent.clone(),
             max_model_len: context,
-            permission: vec![ModelPermission::new(now())],
+            permission: vec![ModelPermission::new(unix_time())],
             aliases: Vec::new(),
             tags: Vec::new(),
             meta: facts.map(|f| LlamaCppModelMeta {
@@ -418,14 +436,6 @@ impl ModelInfo {
             }),
         }
     }
-}
-
-/// The current Unix time in seconds.
-pub(crate) fn now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
 }
 
 /// Every `.gguf` under `dir` (two directory levels deep), sorted.
@@ -490,6 +500,7 @@ mod tests {
             version: 3,
             metadata: [
                 ("general.architecture", string("qwen3moe")),
+                ("general.type", string("model")),
                 ("general.file_type", Value::U32(15)),
                 ("qwen3moe.context_length", Value::U32(40960)),
                 ("qwen3moe.embedding_length", Value::U32(1024)),
@@ -532,6 +543,7 @@ mod tests {
             facts,
             GgufFacts {
                 architecture: Some("qwen3moe".to_string()),
+                kind: Some("model".to_string()),
                 n_ctx_train: Some(40960),
                 n_embd: Some(1024),
                 n_vocab: Some(3),
@@ -545,6 +557,25 @@ mod tests {
         );
         assert_eq!(facts.quantization(), Some("Q4_K_M"));
         assert_eq!(facts.ftype_name(), Some("Q4_K - Medium"));
+        assert!(facts.is_model());
+    }
+
+    #[test]
+    fn companion_files_are_not_models() {
+        let facts = |architecture: &str, kind: Option<&str>| GgufFacts {
+            architecture: Some(architecture.to_string()),
+            kind: kind.map(str::to_string),
+            ..GgufFacts::default()
+        };
+        // Older converters write no `general.type`.
+        assert!(facts("qwen3", None).is_model());
+        assert!(facts("qwen3", Some("model")).is_model());
+        // llama.cpp's LoRA, projector and imatrix files.
+        assert!(!facts("qwen3", Some("adapter")).is_model());
+        assert!(!facts("clip", Some("mmproj")).is_model());
+        assert!(!facts("qwen3", Some("imatrix")).is_model());
+        // A projector written before `general.type`.
+        assert!(!facts("clip", None).is_model());
     }
 
     #[test]

@@ -77,6 +77,8 @@ struct Fake {
     max_concurrency: usize,
     n_ctx: AtomicUsize,
     models: Mutex<Vec<ModelSlots>>,
+    /// The `/v1/models` entries `/v1/worker/info` reports.
+    cards: Mutex<Vec<Value>>,
     behavior: Mutex<Behavior>,
     /// Requests received on the routed endpoints.
     received: AtomicUsize,
@@ -120,7 +122,7 @@ async fn fake_info(State(f): State<Arc<Fake>>) -> Json<WorkerInfo> {
         transcription_in_flight: f.audio_active.load(Ordering::SeqCst)
             + f.external_audio.load(Ordering::SeqCst),
         embedding_jobs: f.embedding_jobs.lock().unwrap().clone(),
-        cards: Vec::new(),
+        cards: f.cards.lock().unwrap().clone(),
         protocol_version: WORKER_PROTOCOL_VERSION,
         cache_residency: f
             .residency
@@ -383,6 +385,7 @@ async fn spawn_fake_handle(
         max_concurrency,
         n_ctx: AtomicUsize::new(4096),
         models: Mutex::new(Vec::new()),
+        cards: Mutex::new(Vec::new()),
         behavior: Mutex::new(behavior),
         received: AtomicUsize::new(0),
         active: AtomicUsize::new(0),
@@ -1163,6 +1166,8 @@ async fn routes_by_model_and_forwards_the_request_unchanged() {
     assert_eq!(res.status, StatusCode::NOT_FOUND);
     let err = res.json();
     assert_eq!(err["error"]["code"], "model_not_found");
+    assert_eq!(err["error"]["param"], "model");
+    assert_eq!(err["error"]["type"], "invalid_request_error");
     let msg = err["error"]["message"].as_str().unwrap();
     assert!(msg.contains("alpha") && msg.contains("beta"), "{msg}");
 
@@ -1911,6 +1916,31 @@ async fn routed_model_list_passes_the_workers_cards_through() {
     assert_eq!(err["error"]["code"], "model_not_found");
     assert_eq!(err["error"]["param"], "model");
     assert_eq!(err["error"]["type"], "invalid_request_error");
+}
+
+/// The router lists a worker's entries as the worker sent them: fields it
+/// does not know (a newer worker's) pass through, and an entry it could not
+/// read as its own card does not take the worker out of routing.
+#[tokio::test]
+async fn routed_model_entries_pass_through_as_the_worker_sent_them() {
+    let (worker, url) = spawn_fake("a", "alpha", 4, Behavior::Echo).await;
+    let card = json!({
+        "id": "alpha", "object": "model", "created": 1, "owned_by": "joshua",
+        "status": {"value": "loaded"},
+        "permission": "not a list",
+        "joshua": {"loaded": "yes", "future": [1, 2]},
+    });
+    *worker.cards.lock().unwrap() = vec![card.clone()];
+    let (_, router) = spawn_router(config(&[&url])).await;
+
+    let models = call(&router, "GET", "/v1/models", "").await.json();
+    assert_eq!(models["data"], json!([card]));
+    let one = call(&router, "GET", "/v1/models/alpha", "").await;
+    assert_eq!(one.status, StatusCode::OK);
+    assert_eq!(one.json(), card);
+    let res = chat(&router, json!({"model": "alpha", "messages": []})).await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.json()["worker"], "a");
 }
 
 /// A generation whose cancel flag is already set stops before decoding and

@@ -257,6 +257,13 @@ pub struct ModelPlacement {
 }
 
 impl Model {
+    /// Whether requests can use the model now: a `--model-dir` file not
+    /// loaded yet is listed too, and is not.  Servers that do not say are
+    /// taken to list only loaded models.
+    pub fn is_loaded(&self) -> bool {
+        self.joshua.as_ref().is_none_or(|p| p.loaded)
+    }
+
     /// The context a request may use, with the trained context when that
     /// is larger: `"8192 of 40960"`.  `"–"` when the server does not say.
     pub fn context_label(&self) -> String {
@@ -858,6 +865,11 @@ mod tests {
         assert_eq!(dense.output_label(), "context");
         assert_eq!(dense.placement_label(), "cpu");
         assert_eq!(file.placement_label(), "not loaded");
+        // Only loaded models are offered for chat; an older server's
+        // entries carry no `joshua` object and count as loaded.
+        assert!(moe.is_loaded() && split.is_loaded() && !file.is_loaded());
+        let old = parse_models(r#"{"data":[{"id":"m"}]}"#).unwrap();
+        assert!(old.data[0].is_loaded());
     }
 
     #[test]

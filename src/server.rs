@@ -38,7 +38,7 @@ use std::convert::Infallible;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 use axum::{
     extract::{Extension, Request, State},
@@ -61,13 +61,13 @@ use crate::anthropic::{self, MessagesRequest};
 use crate::coordinator::{JobModel, ModelSlots, WorkerCapabilities, WorkerInfo, JOB_OWNER_HEADER, WORKER_PROTOCOL_VERSION};
 use crate::engine::{Completion, Engine, EngineOptions};
 use crate::error::JoshuaError;
-use crate::model_info::{device_label, now, GgufFacts, ModelInfo, ModelLimits, Placement};
+use crate::model_info::{device_label, GgufFacts, ModelInfo, ModelLimits, Placement};
 use crate::reasoning::{ReasoningOutput, Split};
 use crate::sampling::SamplingProfile;
 use crate::whisper::WhisperEngine;
 use crate::tools::{parse_tool_calls, ParsedToolCall};
 use crate::types::{
-    AssistantMessage, ChatChoice, ChatCompletionChunk, ChatCompletionRequest,
+    unix_time, AssistantMessage, ChatChoice, ChatCompletionChunk, ChatCompletionRequest,
     ChatCompletionResponse, ChatMessage, DeltaContent, EmbeddingData, EmbeddingRequest,
     EmbeddingResponse, ErrorResponse, FunctionCallResult, GenerationOptions, ModelCard,
     ModelListResponse, Tool, ToolCall, UsageInfo,
@@ -229,32 +229,46 @@ impl ServerState {
     }
 
     /// Every model this server can serve: the loaded ones, then (with
-    /// `--model-dir`) each `.gguf` in the directory that is not loaded under
-    /// its file stem, described from its header alone.  This is the
-    /// inventory `/v1/models` and Ollama's `/api/tags` list.
+    /// `--model-dir`) the directory's models that are not loaded
+    /// ([`ModelManager::unloaded`]), described from their headers alone.
+    /// This is the inventory `/v1/models` and Ollama's `/api/tags` list.
     pub fn inventory(&self) -> Vec<ModelInfo> {
-        let mut out: Vec<ModelInfo> = self.models.list().iter().map(LoadedModel::info).collect();
+        let loaded = self.models.list();
+        let mut out: Vec<ModelInfo> = loaded.iter().map(LoadedModel::info).collect();
         if let Some(manager) = &self.manager {
-            for file in crate::model_info::discover_gguf(&manager.model_dir) {
-                let id = file
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("model")
-                    .to_string();
-                if out.iter().any(|m| m.id == id) {
-                    continue;
-                }
-                out.push(ModelInfo::of_file(&id, &file, manager));
-            }
+            out.extend(
+                manager
+                    .unloaded(&loaded)
+                    .iter()
+                    .map(|(id, file)| ModelInfo::of_file(id, file, manager)),
+            );
         }
         out
+    }
+
+    /// The model-directory file the inventory lists as `id`, not loaded.
+    fn unloaded_file(&self, id: &str) -> Option<PathBuf> {
+        let manager = self.manager.as_ref()?;
+        manager
+            .unloaded(&self.models.list())
+            .into_iter()
+            .find(|(listed, _)| listed == id)
+            .map(|(_, file)| file)
+    }
+
+    /// The model a request names, by id (see [`ModelRegistry::resolve`]).
+    /// A name the inventory gives a model-directory file that is not
+    /// loaded is a `404`, never answered by the one model that is.
+    pub fn resolve(&self, requested: &str) -> Result<(String, Arc<Engine>), ApiError> {
+        self.models
+            .resolve(requested, |name| self.unloaded_file(name).is_some())
     }
 
     /// The Whisper model's entry, when one is configured.
     fn whisper_info(&self) -> Option<ModelInfo> {
         self.whisper.as_ref().map(|whisper| ModelInfo {
             placement: Some(Placement::on(whisper.device())),
-            ..ModelInfo::new(whisper.model_name(), now())
+            ..ModelInfo::new(whisper.model_name(), unix_time())
         })
     }
 
@@ -318,7 +332,7 @@ impl ModelRegistry {
             engine,
             workers: Vec::new(),
             stages: Vec::new(),
-            created: now(),
+            created: unix_time(),
         });
         registry
     }
@@ -328,32 +342,42 @@ impl ModelRegistry {
     }
 
     /// The model a request names. With a single model loaded, any name
-    /// selects it, as when a server only ever held one model.
+    /// selects it, as when a server only ever held one model, unless
+    /// `names_another` says the name belongs to a model that is not loaded.
     /// Returns the model's id and engine.
-    pub fn resolve(&self, requested: &str) -> Result<(String, Arc<Engine>), ApiError> {
-        let models = self.models.read().unwrap_or_else(|p| p.into_inner());
-        let found = models
-            .iter()
-            .find(|m| m.id == requested)
-            .or(match models.as_slice() {
-                [only] => Some(only),
-                _ => None,
-            });
-        if let Some(model) = found {
-            return Ok((model.id.clone(), Arc::clone(&model.engine)));
+    pub fn resolve(
+        &self,
+        requested: &str,
+        names_another: impl FnOnce(&str) -> bool,
+    ) -> Result<(String, Arc<Engine>), ApiError> {
+        let only = {
+            let models = self.models.read().unwrap_or_else(|p| p.into_inner());
+            if let Some(model) = models.iter().find(|m| m.id == requested) {
+                return Ok((model.id.clone(), Arc::clone(&model.engine)));
+            }
+            match models.as_slice() {
+                [only] => (only.id.clone(), Arc::clone(&only.engine)),
+                [] => {
+                    return Err(ApiError::new(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "no model is loaded; load one with POST /v1/models/load",
+                        "model_not_loaded",
+                    ))
+                }
+                _ => {
+                    return Err(ApiError::model_not_found(format!(
+                        "model '{requested}' is not loaded"
+                    )))
+                }
+            }
+        };
+        // Asked after the lock is released: the answer may list the models.
+        if names_another(requested) {
+            return Err(ApiError::model_not_found(format!(
+                "model '{requested}' is not loaded; load it with POST /v1/models/load"
+            )));
         }
-        match models.as_slice() {
-            [] => Err(ApiError::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "no model is loaded; load one with POST /v1/models/load",
-                "model_not_loaded",
-            )),
-            _ => Err(ApiError::new(
-                StatusCode::NOT_FOUND,
-                format!("model '{requested}' is not loaded"),
-                "model_not_found",
-            )),
-        }
+        Ok(only)
     }
 
     /// Reserve `id` for a load; dropping the guard releases it.
@@ -481,9 +505,10 @@ pub struct ModelManager {
 }
 
 /// `POST /v1/models/load` request body.
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Default, serde::Deserialize)]
 pub struct LoadModelRequest {
-    /// GGUF file (or a directory holding one) under the model directory.
+    /// GGUF file (or a directory holding one) under the model directory,
+    /// or the id `/v1/models` lists a file there by.
     pub model: String,
     /// Name to serve it under; defaults to the file stem.
     #[serde(default)]
@@ -515,14 +540,59 @@ pub struct UnloadModelRequest {
 }
 
 impl ModelManager {
+    /// The directory's models that are not loaded, each under the id the
+    /// inventory lists it by: its file stem or, when an entry before it (a
+    /// loaded model or another file) has that id, its path in the
+    /// directory.  `POST /v1/models/load` takes either as `model`.  Left
+    /// out: files a load would refuse (a symlink leading out of the
+    /// directory), files a model in `loaded` was loaded from, a second
+    /// link to one file, and GGUFs that are not models on their own
+    /// (adapters, projectors).
+    pub fn unloaded(&self, loaded: &[LoadedModel]) -> Vec<(String, PathBuf)> {
+        let Ok(root) = self.model_dir.canonicalize() else {
+            return Vec::new();
+        };
+        let mut seen: Vec<PathBuf> = loaded
+            .iter()
+            .filter_map(|m| m.engine.model_path().canonicalize().ok())
+            .collect();
+        let mut ids: Vec<String> = loaded.iter().map(|m| m.id.clone()).collect();
+        let mut out = Vec::new();
+        for file in crate::model_info::discover_gguf(&self.model_dir) {
+            let Ok(target) = file.canonicalize() else {
+                continue;
+            };
+            if !target.starts_with(&root)
+                || seen.contains(&target)
+                || GgufFacts::read(&file).is_ok_and(|facts| !facts.is_model())
+            {
+                continue;
+            }
+            seen.push(target);
+            let stem = file
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("model")
+                .to_string();
+            let id = if ids.contains(&stem) {
+                let relative = file.strip_prefix(&self.model_dir).unwrap_or(file.as_path());
+                let parts: Vec<_> = relative.iter().map(|part| part.to_string_lossy()).collect();
+                parts.join("/")
+            } else {
+                stem
+            };
+            ids.push(id.clone());
+            out.push((id, file));
+        }
+        out
+    }
+
     /// Resolve a requested model inside `model_dir`.
     fn resolve_path(&self, requested: &str) -> Result<PathBuf, ApiError> {
         let not_found = || {
-            ApiError::new(
-                StatusCode::NOT_FOUND,
-                format!("model '{requested}' was not found in the model directory"),
-                "model_not_found",
-            )
+            ApiError::model_not_found(format!(
+                "model '{requested}' was not found in the model directory"
+            ))
         };
         let root = self
             .model_dir
@@ -559,9 +629,16 @@ impl ModelManager {
         id: String,
         #[cfg_attr(not(feature = "distributed"), allow(unused_variables))] registry: &ModelRegistry,
     ) -> crate::Result<LoadedModel> {
+        let n_ctx = req
+            .n_ctx
+            .map(|n_ctx| {
+                u32::try_from(n_ctx)
+                    .map_err(|_| crate::JoshuaError::InvalidRequest("n_ctx too large".into()))
+            })
+            .transpose()?;
         #[cfg(feature = "distributed")]
-        if !req.local && (req.workers.is_some() || !self.workers.is_empty()) {
-            return self.load_distributed(req, path, id, registry);
+        if self.on_workers(req) {
+            return self.load_distributed(req, n_ctx, path, id, registry);
         }
         if req.workers.is_some() || req.ends.is_some() {
             return Err(crate::JoshuaError::InvalidRequest(
@@ -569,10 +646,7 @@ impl ModelManager {
             ));
         }
         let mut options = (self.engine_options)(path);
-        if let Some(n_ctx) = req.n_ctx {
-            options.n_ctx = u32::try_from(n_ctx)
-                .map_err(|_| crate::JoshuaError::InvalidRequest("n_ctx too large".into()))?;
-        }
+        options.n_ctx = Self::load_context(&options, n_ctx, None, false);
         let mut engine = Engine::with_options(path, options)?;
         if let Some(backend) = &self.npu_backend {
             engine = engine.with_npu_backend(Arc::clone(backend));
@@ -584,8 +658,37 @@ impl ModelManager {
             engine: Arc::new(engine),
             workers: Vec::new(),
             stages: Vec::new(),
-            created: now(),
+            created: unix_time(),
         })
+    }
+
+    /// Whether `req` places the model on workers rather than on this host.
+    #[cfg(feature = "distributed")]
+    fn on_workers(&self, req: &LoadModelRequest) -> bool {
+        !req.local && (req.workers.is_some() || !self.workers.is_empty())
+    }
+
+    /// Whether `req` places the model on workers rather than on this host.
+    #[cfg(not(feature = "distributed"))]
+    fn on_workers(&self, _req: &LoadModelRequest) -> bool {
+        false
+    }
+
+    /// The context window a load gives a model trained with `n_ctx_train`:
+    /// the load's own `n_ctx`, else the server's `--n-ctx` in `options`;
+    /// placed on workers, no more than `n_ctx_train`.  Every load, and
+    /// [`Self::default_limits`], sizes the context here.
+    fn load_context(
+        options: &EngineOptions,
+        n_ctx: Option<u32>,
+        n_ctx_train: Option<u32>,
+        on_workers: bool,
+    ) -> u32 {
+        let context = crate::engine::resolve_n_ctx(n_ctx.unwrap_or(options.n_ctx));
+        match n_ctx_train {
+            Some(trained) if on_workers => context.min(trained),
+            _ => context,
+        }
     }
 
     fn finish_engine(&self, mut engine: Engine) -> Engine {
@@ -598,38 +701,33 @@ impl ModelManager {
         engine
     }
 
-    /// The limits a load of `path` that names no `n_ctx` gives the model:
-    /// the server's `--n-ctx` (on workers, no more than the context the
-    /// model was trained with) and `--max-output-tokens`, as
-    /// [`Self::load`] applies them.
+    /// The limits a load of `path` that names nothing else gives the
+    /// model, as [`Self::load`] sets them: the context from
+    /// [`Self::load_context`] and the output cap from
+    /// `--max-output-tokens` ([`crate::engine::output_cap`]).
     pub fn default_limits(&self, path: &Path, facts: Option<&GgufFacts>) -> ModelLimits {
         let n_ctx_train = facts.and_then(|f| f.n_ctx_train);
         // Only the context is read here.  The options also settle (and log)
         // the file's page-cache plan, which is a load's business, not a
         // listing's: keep that out of the log on every `/v1/models`.
-        let options = tracing::subscriber::with_default(
-            tracing::subscriber::NoSubscriber::default(),
-            || (self.engine_options)(path),
-        );
-        let context = options.resolved_n_ctx();
-        #[cfg(feature = "distributed")]
-        let context = match n_ctx_train {
-            Some(trained) if !self.workers.is_empty() => context.min(trained),
-            _ => context,
-        };
-        let output_cap = self
-            .max_output_tokens
-            .unwrap_or(crate::engine::DEFAULT_MAX_OUTPUT_TOKENS)
-            .max(1);
+        let options =
+            tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
+                (self.engine_options)(path)
+            });
+        let on_workers = self.on_workers(&LoadModelRequest::default());
+        let context = Self::load_context(&options, None, n_ctx_train, on_workers);
+        let output_cap = crate::engine::output_cap(self.max_output_tokens);
         ModelLimits::new(context, n_ctx_train, output_cap)
     }
 
     /// Place the model on workers: they receive only their stages, from this
     /// controller, and this host keeps just the tokenizer and sampling.
+    /// `n_ctx` is the load's own context window, if it names one.
     #[cfg(feature = "distributed")]
     fn load_distributed(
         &self,
         req: &LoadModelRequest,
+        n_ctx: Option<u32>,
         path: &Path,
         id: String,
         registry: &ModelRegistry,
@@ -656,18 +754,16 @@ impl ModelManager {
         }
         // A worker holds one model at a time and serves one controller.
         let claim = registry.claim_workers(&workers)?;
-        let header = crate::gguf_ext::read_header(&mut std::io::BufReader::new(
-            std::fs::File::open(path)?,
-        ))?;
-        let arch = header.architecture().unwrap_or_default();
-        let model_ctx = crate::gguf_meta::Meta::new(&header.metadata, &arch)
-            .u32("context_length")
-            .map_err(|e| ModelLoad(e.to_string()))? as usize;
+        let facts = GgufFacts::read(path)?;
+        let model_ctx = facts.n_ctx_train.ok_or_else(|| {
+            let arch = facts.architecture.as_deref().unwrap_or_default();
+            ModelLoad(format!(
+                "{arch}: missing GGUF metadata key `{arch}.context_length`"
+            ))
+        })?;
         let defaults = Limits::default();
         let server = (self.engine_options)(path);
-        // See `default_limits`, which reports the context this picks.
-        let server_ctx = server.resolved_n_ctx() as usize;
-        let context = req.n_ctx.unwrap_or(server_ctx).min(model_ctx);
+        let context = Self::load_context(&server, n_ctx, Some(model_ctx), true) as usize;
         let limits = Limits {
             context,
             chunk: req.chunk.unwrap_or(defaults.chunk).min(context),
@@ -713,7 +809,7 @@ impl ModelManager {
             engine: Arc::new(engine),
             workers,
             stages,
-            created: now(),
+            created: unix_time(),
         })
     }
 }
@@ -757,7 +853,11 @@ async fn load_model(
     State(state): State<AppState>,
     Json(req): Json<LoadModelRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let path = manager(&state)?.resolve_path(&req.model)?;
+    let path = match manager(&state)?.resolve_path(&req.model) {
+        Ok(path) => path,
+        // A file the inventory lists by its stem, e.g. in a subdirectory.
+        Err(e) => state.unloaded_file(&req.model).ok_or(e)?,
+    };
     let id = req.id.clone().unwrap_or_else(|| {
         path.file_stem()
             .map(|s| s.to_string_lossy().into_owned())
@@ -794,13 +894,10 @@ async fn unload_model(
     Json(req): Json<UnloadModelRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     manager(&state)?;
-    let model = state.models.remove(&req.id).ok_or_else(|| {
-        ApiError::new(
-            StatusCode::NOT_FOUND,
-            format!("model '{}' is not loaded", req.id),
-            "model_not_found",
-        )
-    })?;
+    let model = state
+        .models
+        .remove(&req.id)
+        .ok_or_else(|| ApiError::model_not_found(format!("model '{}' is not loaded", req.id)))?;
     tracing::info!(model = %model.id, "unloading model");
     // New requests no longer find it. Wait for the ones already running,
     // then drop the engine here: that frees its weights or releases its
@@ -1185,9 +1282,11 @@ async fn tokenize(
     State(state): State<AppState>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let (_, engine) = state
-        .models
-        .resolve(body.get("model").and_then(|v| v.as_str()).unwrap_or_default())?;
+    let (_, engine) = state.resolve(
+        body.get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default(),
+    )?;
     let prompt = body
         .get("prompt")
         .or_else(|| body.get("content"))
@@ -1218,9 +1317,11 @@ async fn detokenize(
     State(state): State<AppState>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let (_, engine) = state
-        .models
-        .resolve(body.get("model").and_then(|v| v.as_str()).unwrap_or_default())?;
+    let (_, engine) = state.resolve(
+        body.get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default(),
+    )?;
     let tokens = body
         .get("tokens")
         .and_then(|v| v.as_array())
@@ -1305,7 +1406,7 @@ async fn worker_info(State(state): State<AppState>) -> Result<Json<WorkerInfo>, 
             .iter()
             .map(LoadedModel::info)
             .chain(state.whisper_info())
-            .map(|model| model.card())
+            .map(|model| json!(model.card()))
             .collect(),
         protocol_version: WORKER_PROTOCOL_VERSION,
         cache_epochs: models
@@ -1403,7 +1504,7 @@ async fn chat_completions(
     headers: HeaderMap,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Result<Response, ApiError> {
-    let (model, engine) = state.models.resolve(&req.model)?;
+    let (model, engine) = state.resolve(&req.model)?;
     let stream = req.stream.unwrap_or(false);
     let defaults = engine.sampling_defaults(SamplingProfile::OpenAi);
     let mut options = req
@@ -2078,7 +2179,7 @@ async fn messages_count_tokens(
     State(state): State<AppState>,
     Json(req): Json<MessagesRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let (_, engine) = state.models.resolve(&req.model)?;
+    let (_, engine) = state.resolve(&req.model)?;
     let defaults = engine.sampling_defaults(SamplingProfile::OpenAi);
     let (messages, tools, options) =
         anthropic::to_chat_request(&req, &defaults).map_err(ApiError::bad_request)?;
@@ -2093,7 +2194,7 @@ async fn messages(
     headers: HeaderMap,
     Json(req): Json<MessagesRequest>,
 ) -> Result<Response, ApiError> {
-    let (resolved_model, engine) = state.models.resolve(&req.model)?;
+    let (resolved_model, engine) = state.resolve(&req.model)?;
     // Anthropic's defaults are the neutral OpenAI-family ones.
     let defaults = engine.sampling_defaults(SamplingProfile::OpenAi);
     let (messages, tools, mut options) =
@@ -2454,9 +2555,11 @@ async fn completions(
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let (model, engine) = state
-        .models
-        .resolve(body.get("model").and_then(|v| v.as_str()).unwrap_or_default())?;
+    let (model, engine) = state.resolve(
+        body.get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default(),
+    )?;
     let prompt = body
         .get("prompt")
         .and_then(|v| v.as_str())
@@ -2488,10 +2591,7 @@ async fn completions(
 
     let usage = &completion.usage;
     state.metrics.record_generation(usage);
-    let created = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let created = unix_time();
 
     Ok(Json(json!({
         "id": format!("cmpl-{}", Uuid::new_v4().simple()),
@@ -2515,7 +2615,7 @@ async fn embeddings(
     headers: HeaderMap,
     Json(req): Json<EmbeddingRequest>,
 ) -> Result<Response, ApiError> {
-    let (model, engine) = state.models.resolve(&req.model)?;
+    let (model, engine) = state.resolve(&req.model)?;
     if let Some(owner) = headers.get(JOB_OWNER_HEADER) {
         let matches = state.models.list().iter().any(|loaded| {
             Arc::ptr_eq(&loaded.engine, &engine)
@@ -2914,6 +3014,15 @@ impl ApiError {
         Self {
             status: StatusCode::BAD_REQUEST,
             body: ErrorResponse::invalid_request(msg),
+        }
+    }
+
+    /// `404` for a model this server cannot serve, saying why (see
+    /// [`ErrorResponse::model_not_found`]).
+    pub(crate) fn model_not_found(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            body: ErrorResponse::model_not_found(msg),
         }
     }
 

@@ -612,13 +612,10 @@ impl EngineOptions {
         }
     }
 
-    /// The context window an engine built from these options gets:
-    /// [`Self::n_ctx`], or [`DEFAULT_N_CTX`] when it is 0.
+    /// The context window an engine built from these options gets (see
+    /// [`resolve_n_ctx`]).
     pub fn resolved_n_ctx(&self) -> u32 {
-        match self.n_ctx {
-            0 => DEFAULT_N_CTX,
-            n => n,
-        }
+        resolve_n_ctx(self.n_ctx)
     }
 
     /// Select the compute backend.  See [`ComputeBackend`].
@@ -1092,6 +1089,15 @@ pub const DEFAULT_PREFILL_CHUNK: usize = 512;
 /// Context window ([`EngineOptions::n_ctx`]) when none is given.
 pub const DEFAULT_N_CTX: u32 = 4096;
 
+/// The context window an `n_ctx` setting gives: `n_ctx`, or
+/// [`DEFAULT_N_CTX`] when it is 0.
+pub fn resolve_n_ctx(n_ctx: u32) -> u32 {
+    match n_ctx {
+        0 => DEFAULT_N_CTX,
+        n => n,
+    }
+}
+
 /// Default [`EngineOptions::prefix_cache_root_min`]: a shared prompt head of
 /// fewer tokens is not kept as a prefix-cache root.  Strata uses 2,048 on a
 /// GPU; a weak CPU box reads a prompt an order of magnitude slower, so a
@@ -1141,6 +1147,13 @@ const NPU_MAX_FAILURES: u32 = 3;
 /// Default ceiling on tokens generated per request (independent of the
 /// client-supplied `max_tokens`), bounding single-request CPU/time cost.
 pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 4096;
+
+/// The ceiling on tokens per request an engine gets from
+/// `--max-output-tokens`: the value (at least 1), or
+/// [`DEFAULT_MAX_OUTPUT_TOKENS`] without one.
+pub fn output_cap(max_output_tokens: Option<u32>) -> u32 {
+    max_output_tokens.map_or(DEFAULT_MAX_OUTPUT_TOKENS, |max| max.max(1))
+}
 
 /// Admission state for in-flight generations/embeddings.
 ///
@@ -2965,7 +2978,7 @@ impl Engine {
             } else {
                 options.admission_queue_depth
             },
-            max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
+            max_output_tokens: output_cap(None),
             model_name,
             gguf_facts,
             n_ctx,
@@ -3037,9 +3050,10 @@ impl Engine {
     }
 
     /// Set the hard ceiling on tokens generated per request, applied on top
-    /// of the client-supplied `max_tokens`.  Values below 1 are treated as 1.
+    /// of the client-supplied `max_tokens`.  Values below 1 are treated as 1
+    /// (see [`output_cap`]).
     pub fn with_max_output_tokens(mut self, max: u32) -> Self {
-        self.max_output_tokens = max.max(1);
+        self.max_output_tokens = output_cap(Some(max));
         self
     }
 
