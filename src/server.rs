@@ -2969,6 +2969,31 @@ mod tests {
         );
     }
 
+    /// Mistral's templates take back only 9-alphanumeric call ids, so those
+    /// are the ids minted for a Mistral model's calls, streamed or not.
+    #[test]
+    fn mistral_calls_get_ids_their_template_accepts() {
+        let text = "[TOOL_CALLS][{\"name\": \"f\", \"arguments\": {}}, {\"name\": \"g\", \"arguments\": {}}]";
+        let chunks = openai_chunks(ToolCallFormat::Mistral, &[text], StopType::Eos);
+        let (_, calls) = openai_rebuild(&chunks);
+        assert_eq!(calls.len(), 2);
+        for (id, _, _) in &calls {
+            assert_eq!(id.len(), 9, "{id}");
+            assert!(id.chars().all(|c| c.is_ascii_alphanumeric()), "{id}");
+        }
+        assert_ne!(calls[0].0, calls[1].0);
+        // The calls the stream returns carry the ids it sent.
+        let mut sent = Vec::new();
+        let returned = feed(ToolCallFormat::Mistral, ANTHROPIC_CALL_IDS, &[text], &mut |piece| {
+            if let ChatPiece::CallStart { id, .. } = piece {
+                sent.push(id.to_string());
+            }
+        });
+        let returned: Vec<String> = returned.into_iter().map(|c| c.id.unwrap()).collect();
+        assert_eq!(returned, sent);
+        assert!(sent.iter().all(|id| id.len() == 9));
+    }
+
     #[test]
     fn openai_stream_without_tool_markup_is_plain_content() {
         let chunks = openai_chunks(

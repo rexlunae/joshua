@@ -462,7 +462,8 @@ which teaches Hermes calls, so its output is read as Hermes (the load log's
 
 | Family | Markup | `--tool-call-parser` |
 |---|---|---|
-| Hermes, Qwen 2.5 / 3, Qwen3-Coder / 3.5, Granite, Mistral, Functionary | `<tool_call>{…}</tool_call>`, `<function=…><parameter=…>`, `[TOOL_CALLS]…` | `hermes`, `qwen3_coder`, `mistral` |
+| Hermes, Qwen 2.5 / 3, Qwen3-Coder / 3.5, Granite, Functionary | `<tool_call>{…}</tool_call>`, `<function=…><parameter=…>` | `hermes`, `qwen3_coder` |
+| Mistral, Devstral, Magistral | `[TOOL_CALLS][…]`, `[TOOL_CALLS]name[ARGS]{…}` | `mistral` |
 | Llama 3.x | `{"name": …, "parameters": …}` (after `<\|python_tag\|>` or alone) | `llama3_json` |
 | Llama 3.2 / 4 pythonic, LFM2 | `[get_weather(city="Paris")]`, `<\|tool_call_start\|>[…]<\|tool_call_end\|>` | `pythonic`, `llama4_pythonic`, `lfm2` |
 | Nemotron Nano v2 | `<TOOLCALL>[…]</TOOLCALL>` | `nemotron_v2` |
@@ -479,7 +480,9 @@ match its training.  Arguments written one tag per parameter are typed by
 the tool's JSON schema: a parameter the schema types as a string keeps its
 text verbatim, any other is read as JSON when it is JSON.  A call id the
 model writes itself (Kimi's `functions.name:0`, Mistral's `[CALL_ID]`) is
-returned as the call's id, since its template expects it back.
+returned as the call's id, since its template expects it back; the ids
+minted for a Mistral model's other calls are 9 alphanumerics, the only ids
+its templates accept back.
 
 Streaming sends a call as soon as its name is known — one chunk with the
 call's `index`, `id`, `type` and `function.name` — then its

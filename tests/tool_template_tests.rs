@@ -100,14 +100,14 @@ const CASES: &[Case] = &[
     },
     Case {
         file: "mistralai-Mistral-Nemo-Instruct-2407.jinja",
-        format: ToolCallFormat::Generic,
+        format: ToolCallFormat::Mistral,
         call_id: "a1b2c3d4e",
         start: "[TOOL_CALLS]",
         end: "</s>",
     },
     Case {
         file: "unsloth-mistral-Devstral-Small-2507.jinja",
-        format: ToolCallFormat::Generic,
+        format: ToolCallFormat::Mistral,
         call_id: "a1b2c3d4e",
         start: "[TOOL_CALLS]",
         end: "</s>",
@@ -247,6 +247,31 @@ fn tool_call_history_renders_and_parses_back() {
             case.file
         );
     }
+}
+
+/// Mistral's templates raise on a call id that is not 9 alphanumerics, so
+/// the ids minted for a Mistral model's calls are such ids, and a history
+/// holding one renders (a `call_…` id would fall back to the ChatML prompt).
+#[test]
+fn mistral_templates_take_back_the_ids_minted_for_them() {
+    let tools = [weather_tool()];
+    let nemo = template("mistralai-Mistral-Nemo-Instruct-2407.jinja");
+    let format = nemo.tool_call_format().unwrap();
+    let id = format.call_id("call_");
+    assert!(id.len() == 9 && id.chars().all(|c| c.is_ascii_alphanumeric()));
+    let rendered = nemo
+        .render(&conversation(&id), Some(&tools))
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert!(
+        rendered.contains(&format!("\"id\": \"{id}\"")),
+        "{rendered}"
+    );
+    let other = ToolCallFormat::Generic.call_id("call_");
+    assert!(nemo.render(&conversation(&other), Some(&tools)).is_err());
+    // Devstral's template does not check them, and renders either.
+    let devstral = template("unsloth-mistral-Devstral-Small-2507.jinja");
+    assert_eq!(devstral.tool_call_format(), Some(ToolCallFormat::Mistral));
+    devstral.render(&conversation(&id), Some(&tools)).unwrap();
 }
 
 /// JSON-string arguments reach the template as an object, not a string it

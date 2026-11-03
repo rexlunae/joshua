@@ -13,6 +13,8 @@
 //!   in `<tool_call>` or bare; Functionary v3.1 puts a JSON object in it),
 //!   Mistral's `[TOOL_CALLS][{…}]` and `[TOOL_CALLS]name[ARGS]{…}`, or a
 //!   response that is one JSON object.
+//! - **Mistral**: the generic reader, for models whose templates take back
+//!   only 9-character call ids, so the ids minted for their calls are those.
 //! - **Llama 3.x JSON**: `{"name": …, "parameters": …}`, `;`-separated,
 //!   optionally after `<|python_tag|>`.
 //! - **Pythonic** (Llama 3.2 / 4): `[get_weather(city="Paris")]`, and
@@ -107,6 +109,9 @@ pub enum ToolCallFormat {
     /// `[TOOL_CALLS]` and a bare JSON object, all recognised.
     #[default]
     Generic,
+    /// Mistral's `[TOOL_CALLS]`, read as [`ToolCallFormat::Generic`] is;
+    /// its templates take back only 9-alphanumeric call ids.
+    Mistral,
     /// Llama 3.x JSON calls (`{"name": …, "parameters": …}`).
     LlamaJson,
     /// Python-call lists (`[f(a=1)]`): Llama 3.2 / Llama 4 pythonic.
@@ -139,7 +144,7 @@ const NAMES: &[(&str, ToolCallFormat)] = &[
     ("qwen3_json", ToolCallFormat::Generic),
     ("qwen3_coder", ToolCallFormat::Generic),
     ("qwen3_xml", ToolCallFormat::Generic),
-    ("mistral", ToolCallFormat::Generic),
+    ("mistral", ToolCallFormat::Mistral),
     ("llama3_json", ToolCallFormat::LlamaJson),
     ("llama4_json", ToolCallFormat::LlamaJson),
     ("pythonic", ToolCallFormat::Pythonic),
@@ -189,8 +194,9 @@ const TEMPLATE_FINGERPRINTS: &[(ToolCallFormat, Fingerprint)] = &[
     }),
     (ToolCallFormat::NemotronV2, |t| t.contains("<TOOLCALL>")),
     (ToolCallFormat::Functools, |t| t.contains("functools[")),
+    (ToolCallFormat::Mistral, |t| t.contains("[TOOL_CALLS]")),
     (ToolCallFormat::Generic, |t| {
-        t.contains("<tool_call>") || t.contains("<function=") || t.contains("[TOOL_CALLS]")
+        t.contains("<tool_call>") || t.contains("<function=")
     }),
     (ToolCallFormat::Pythonic, |t| t.contains("[func_name1(")),
     (ToolCallFormat::LlamaJson, |t| {
@@ -260,14 +266,20 @@ impl ToolCallFormat {
     }
 
     /// A fresh id for a call the model wrote none for: `prefix` (`call_`
-    /// for OpenAI, `toolu_` for Anthropic) and a UUID.
+    /// for OpenAI, `toolu_` for Anthropic) and a UUID, or for Mistral the 9
+    /// alphanumerics its templates require of the ids sent back to them
+    /// (vLLM's Mistral parser mints the same).
     pub fn call_id(self, prefix: &str) -> String {
-        format!("{prefix}{}", uuid::Uuid::new_v4().simple())
+        let uuid = uuid::Uuid::new_v4().simple().to_string();
+        match self {
+            Self::Mistral => uuid[..9].to_string(),
+            _ => format!("{prefix}{uuid}"),
+        }
     }
 
     fn grammar(self) -> &'static dyn Grammar {
         match self {
-            Self::Generic => &generic::GENERIC,
+            Self::Generic | Self::Mistral => &generic::GENERIC,
             Self::LlamaJson => &generic::LLAMA_JSON,
             Self::NemotronV2 => &generic::NEMOTRON_V2,
             Self::Functools => &generic::FUNCTOOLS_LIST,
