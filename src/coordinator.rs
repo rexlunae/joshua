@@ -1936,6 +1936,8 @@ async fn list_models(State(c): State<Arc<Coordinator>>) -> Json<ModelListRespons
                 object: "model".to_string(),
                 created,
                 owned_by: "joshua".to_string(),
+                context_length: None,
+                max_output_tokens: None,
             })
             .collect(),
     })
