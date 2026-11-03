@@ -5326,10 +5326,12 @@ impl Engine {
             if word.is_empty() {
                 return invalid("bad_words cannot contain an empty string.".to_string());
             }
-            if !seen.insert(word.as_str()) {
+            // Leading spaces are dropped before tokenizing, so "word" and
+            // " word" are the same entry.
+            let word = word.trim_start();
+            if !seen.insert(word) {
                 continue;
             }
-            let word = word.trim_start();
             let plain = self.tokenize(word, false)?;
             if plain.is_empty() {
                 return invalid(

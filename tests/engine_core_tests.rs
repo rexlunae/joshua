@@ -761,14 +761,19 @@ fn bad_words_follow_vllm_limits() {
         "Too many total bad word tokens: 1025",
     );
 
-    // Repeats count once, so a long list of one word is still one word.
-    let c = engine
-        .complete_prompt(&prompt, &words(vec!["b".into(); 1000]))
-        .unwrap();
+    // Repeats count once, with or without leading spaces, so a long list
+    // of one word is still one word.
+    let repeats: Vec<String> = ["b", " b", "  b"]
+        .iter()
+        .cycle()
+        .take(1000)
+        .map(|w| w.to_string())
+        .collect();
+    let c = engine.complete_prompt(&prompt, &words(repeats)).unwrap();
     assert_eq!(c.token_ids, vec![C; 4]);
     let at_limit: Vec<String> = (0..127)
         .map(|i| format!("w{i}"))
-        .chain(["b".to_string()])
+        .chain(["b".to_string(), " b".to_string()])
         .collect();
     let c = engine.complete_prompt(&prompt, &words(at_limit)).unwrap();
     assert_eq!(c.token_ids, vec![C; 4]);
