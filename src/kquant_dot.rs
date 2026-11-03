@@ -1787,5 +1787,19 @@ mod tests {
             let ran = try_matmul_fused(dtype, (2, 256, 8), &lhs, &block_bytes, &mut dst, false);
             assert_eq!(ran, fused, "{dtype:?} at {level:?}");
         }
+        #[cfg(target_arch = "x86_64")]
+        if level == SimdLevel::Avx512 {
+            let block_bytes = quantized_block_bytes(8, 256, GgmlDType::Q5K);
+            let lhs = vec![0.0f32; 2 * 256];
+            let mut dst = vec![0.0f32; 2 * 8];
+            assert!(!try_matmul_fused_avx512(
+                GgmlDType::Q5K,
+                (2, 256, 8),
+                &lhs,
+                &block_bytes,
+                &mut dst,
+                false,
+            ));
+        }
     }
 }
