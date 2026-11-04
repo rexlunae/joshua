@@ -269,6 +269,13 @@ impl<'a> ToolCallStream<'a> {
                     // Later calls cannot start before this one.
                     return;
                 }
+                // JSON call objects can place their model-supplied id after
+                // the name. Do not emit CallStart with a placeholder id: once
+                // sent, the API cannot replace it with the model's id. Wait
+                // until the ID is complete or the call itself is complete.
+                if call.id.is_none() && call.done.is_none() {
+                    return;
+                }
                 self.held_whitespace.clear();
                 self.hold_whitespace = true;
                 out.push(ToolEvent::CallStart {

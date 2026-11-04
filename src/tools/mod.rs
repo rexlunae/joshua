@@ -812,4 +812,33 @@ pub(crate) mod tests {
             assert_streams_like_parse(format, &[], text);
         }
     }
+
+    #[test]
+    fn streamed_json_call_preserves_id_before_or_after_name() {
+        for text in [
+            "[TOOL_CALLS][{\"id\":\"a1b2c3d4e\",\"name\":\"weather\",\"arguments\":{}}]",
+            "[TOOL_CALLS][{\"name\":\"weather\",\"arguments\":{},\"id\":\"a1b2c3d4e\"}]",
+        ] {
+            let format = ToolCallFormat::Mistral;
+            let (_, expected) = parse_tool_calls(format, &[], text);
+            assert_eq!(expected.len(), 1);
+            assert_eq!(expected[0].id.as_deref(), Some("a1b2c3d4e"));
+            for chunk in [1, 2, 3, 5, text.len()] {
+                let mut stream = ToolCallStream::new(format, Some(&[]));
+                let mut start_id = None;
+                for piece in text.as_bytes().chunks(chunk) {
+                    let piece = std::str::from_utf8(piece).unwrap();
+                    for event in stream.push(piece) {
+                        if let ToolEvent::CallStart { id, .. } = event {
+                            start_id = id;
+                        }
+                    }
+                }
+                let _ = stream.finish();
+                let (_, calls) = parse_tool_calls(format, &[], text);
+                assert_eq!(calls, expected, "chunk {chunk}, text {text}");
+                assert_eq!(start_id.as_deref(), Some("a1b2c3d4e"), "chunk {chunk}");
+            }
+        }
+    }
 }
