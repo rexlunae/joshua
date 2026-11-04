@@ -917,8 +917,7 @@ enum Commands {
         /// Context window in tokens.
         #[arg(long, env = "JOSHUA_N_CTX", default_value_t = 4096)]
         n_ctx: u32,
-        /// Tokens per scored window (defaults to the context window, and is
-        /// clamped to it: a window cannot exceed the model's context).
+        /// Tokens per scored window (defaults to the context window).
         #[arg(long)]
         window: Option<usize>,
         /// Score at most this many tokens (0 = the whole file).
@@ -1413,10 +1412,9 @@ async fn main() -> anyhow::Result<()> {
             if limit > 0 && tokens.len() > limit {
                 tokens.truncate(limit);
             }
-            let window = window.unwrap_or(n_ctx).clamp(2, n_ctx);
+            let window = ppl_window(window, n_ctx);
+
             if tokens.len() < 2 {
-                // One pair is the smallest scoreable corpus; fewer almost always
-                // means the wrong tokenizer produced nothing usable.
                 anyhow::bail!(
                     "need at least 2 tokens to score (got {}); is the tokenizer the model's own?",
                     tokens.len()
@@ -1823,6 +1821,10 @@ fn cache_plan_for(file: Option<u64>, ram: Option<u64>) -> (bool, bool) {
     }
 }
 
+fn ppl_window(window: Option<usize>, n_ctx: usize) -> usize {
+    window.unwrap_or(n_ctx).clamp(2, n_ctx.max(2))
+}
+
 /// Auto decisions for the page-cache options, from the model size vs RAM:
 /// `(pin_hot_weights, prefetch_whole_model)`.  Logged so operators see which
 /// way the auto-resolution went and why.
@@ -1877,6 +1879,14 @@ fn npu_backend(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ppl_window_is_clamped_to_context() {
+        assert_eq!(ppl_window(Some(512), 512), 512);
+        assert_eq!(ppl_window(Some(128), 512), 128);
+        assert_eq!(ppl_window(Some(1024), 512), 512);
+        assert_eq!(ppl_window(None, 512), 512);
+    }
 
     #[test]
     fn chat_template_flag_reads_a_file_or_takes_jinja_text() {
