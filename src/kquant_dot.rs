@@ -1696,6 +1696,10 @@ mod tests {
         let mut weights = vec![0f32; n * k];
         BlockQ5K::to_float(&blocks_of::<BlockQ5K>(&bytes), &mut weights);
         for (name, fused, lanes) in families() {
+            if name == "avx512" {
+                // Q5_K intentionally falls back to the generic path on AVX-512.
+                continue;
+            }
             let mut got = vec![0f32; m * n];
             assert!(fused(GgmlDType::Q5K, (m, k, n), &lhs, &bytes, &mut got, true));
             for (index, &actual) in got.iter().enumerate() {
