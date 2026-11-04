@@ -87,8 +87,9 @@ takes `host:port` (not a URL).
 `joshua-control` wraps the same thing:
 
 ```bash
-joshua-control cluster up --router kleya --workers kleya,erskin   --model /home/tserica/models/Qwen3-8B-Q4_K_M.gguf --port 18085 --ctx 8192
-joshua-control cluster status --workers kleya,erskin --router kleya --port 18085
+joshua-control cluster up --router kleya --workers kleya,erskin \
+  --model /home/tserica/models/Qwen3-8B-Q4_K_M.gguf --port 18085 --ctx 8192 --api-key "$JOSHUA_API_KEY"
+joshua-control cluster status --workers kleya,erskin --router kleya --port 18085 --api-key "$JOSHUA_API_KEY"
 ```
 
 `cluster status` probes the worker sockets (a `joshua worker` node does not answer HTTP) and asks the

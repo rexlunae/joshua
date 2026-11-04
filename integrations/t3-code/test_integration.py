@@ -286,13 +286,22 @@ class ControlTests(unittest.TestCase):
 
     def test_status_does_not_treat_error_envelope_as_healthy(self):
         args = SimpleNamespace(action="status", workers="", worker_port=7070,
-                               port=8080, router="router", api_key=None)
+                               port=8080, router="router", api_key="key")
         with patch.object(control, "api", return_value={"error": "worker unavailable"}):
             with patch.object(control, "tcp_open", return_value=False):
                 with patch.object(control, "print") as output:
                     control.cmd_cluster(args)
 
         self.assertIn("controller not answering", output.call_args.args[0])
+
+    def test_cluster_cli_accepts_api_key_for_status(self):
+        result = subprocess.run(
+            ["python3", str(ROOT / "joshua-control"), "cluster", "status",
+             "--workers", "", "--api-key", "key", "--help"],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--api-key", result.stdout)
 
 
 if __name__ == "__main__":
