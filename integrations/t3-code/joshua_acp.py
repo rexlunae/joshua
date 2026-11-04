@@ -347,6 +347,8 @@ class Agent:
                 resolved = Path(os.path.expanduser(root)).resolve()
                 if resolved.is_relative_to(self.model_dir):
                     self.roots.append(resolved)
+            if not self.roots:
+                self.roots.append(self.model_dir)
 
     @staticmethod
     def _active_response(session, response):

@@ -63,6 +63,21 @@ class CatalogTests(unittest.TestCase):
             self.assertEqual(set(agent.catalog()), {"inside"})
             self.assertEqual(acp.Agent("http://127.0.0.1:8080", None, None).catalog(), {})
 
+    def test_nested_server_model_directory_is_scanned(self):
+        with tempfile.TemporaryDirectory() as temp:
+            parent = Path(temp) / "models"
+            root = parent / "project"
+            root.mkdir(parents=True)
+            (root / "inside.gguf").write_bytes(b"GGUF" + b"\0" * 24)
+            (root / "tokenizer.json").write_text("{}")
+
+            agent = acp.Agent(
+                "http://127.0.0.1:8080", None, None,
+                catalog_roots=[str(parent)], model_dir=str(root),
+            )
+
+            self.assertEqual(set(agent.catalog()), {"inside"})
+
 
 class CancellationTests(unittest.TestCase):
     def test_cancel_closes_active_response(self):
@@ -235,6 +250,15 @@ class ControlTests(unittest.TestCase):
 
         self.assertEqual(result, '"$HOME"/' + shlex.quote("models/$(touch should-not-run)"))
 
+    def test_cluster_worker_probe_runs_from_router_host(self):
+        with patch.object(control, "run", return_value=SimpleNamespace(returncode=0)) as run:
+            self.assertTrue(control.tcp_open_from("router", "192.0.2.1", 7070))
+
+        self.assertEqual(run.call_args.args[0], "router")
+        command = run.call_args.args[1]
+        self.assertIn("192.0.2.1", command)
+        self.assertIn("7070", command)
+
     def test_secret_is_written_to_stdin_not_command_arguments(self):
         secret = "sensitive value; $(not-a-command)"
         with patch.object(control, "run") as run:
@@ -260,7 +284,8 @@ class ControlTests(unittest.TestCase):
             home = Path(temp)
             agent = home / ".t3/joshua/joshua_acp.py"
             agent.parent.mkdir(parents=True)
-            agent.write_text("# test agent\n")
+            agent.write_text("#!/bin/sh\nprintf '%s\\n' \"$JOSHUA_API_KEY\" \"$@\"\n")
+            agent.chmod(0o700)
             commands = []
 
             def fake_run(host, command, **kwargs):
@@ -280,9 +305,27 @@ class ControlTests(unittest.TestCase):
                            capture_output=True, check=True,
                            env={**os.environ, "HOME": temp})
             settings = json.loads((home / ".t3/userdata/settings.json").read_text())
-            config_args = settings["providerInstances"]["joshua_local"]["config"]["commandArgs"]
+            provider_config = settings["providerInstances"]["joshua_local"]["config"]
+            config_args = provider_config["commandArgs"]
             self.assertEqual(config_args[-2:], ["--model-dir", "/models"])
             self.assertEqual((home / ".t3/userdata/settings.json").stat().st_mode & 0o777, 0o600)
+            launcher = Path(provider_config["commandPath"])
+            self.assertEqual(launcher.stat().st_mode & 0o777, 0o700)
+            self.assertIn("api-8080.env", launcher.read_text())
+            self.assertNotIn("--api-key", launcher.read_text())
+            api_env = home / ".config/joshua/api-8080.env"
+            api_env.parent.mkdir(parents=True, exist_ok=True)
+            api_env.write_text("export JOSHUA_API_KEY='integration-test-secret'\n")
+            api_env.chmod(0o600)
+            launched = subprocess.run(
+                [str(launcher), "--base-url", "http://127.0.0.1:8080"],
+                capture_output=True, text=True, check=True,
+                env={**os.environ, "HOME": temp},
+            )
+            self.assertEqual(
+                launched.stdout.splitlines(),
+                ["integration-test-secret", "--base-url", "http://127.0.0.1:8080"],
+            )
 
     def test_status_does_not_treat_error_envelope_as_healthy(self):
         args = SimpleNamespace(action="status", workers="", worker_port=7070,

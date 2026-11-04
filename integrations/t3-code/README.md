@@ -29,7 +29,9 @@ after `install`.
 
 Use `--api-key` with `start` or `cluster up` to protect the controller API. The key is stored in a
 mode-600 environment file rather than the server's process arguments; pass it to `status`, `models`,
-`load`, `unload`, or `cluster status` when querying that server.
+`load`, `unload`, or `cluster status` when querying that server. `install` registers a launcher
+that reads the matching environment file, so the T3 provider can authenticate without putting the
+key in provider arguments or the process command line.
 
 ## Model picker
 

@@ -88,6 +88,19 @@ def tcp_open(host, port, timeout=3.0):
         return False
 
 
+def tcp_open_from(host, target, port, timeout=3.0):
+    """Probe a worker from the router host, which is the process that must reach it."""
+    address = ipaddress.ip_address(target)
+    if address.version != 4 or not 1 <= int(port) <= 65535:
+        return False
+    script = (
+        "import socket; "
+        f"socket.create_connection(({str(address)!r}, {int(port)}), timeout={float(timeout)!r}).close()"
+    )
+    out = run(host, f"python3 -c {shlex.quote(script)}", timeout=timeout + 5)
+    return out.returncode == 0
+
+
 def worker_ipv4(host):
     out = run(host, "hostname -I 2>/dev/null || ipconfig getifaddr en0")
     for candidate in out.stdout.split():
@@ -310,7 +323,7 @@ def cmd_cluster(args):
     for address in addresses:
         ip, port = address.rsplit(":", 1)
         for _ in range(15):
-            if tcp_open(ip, int(port), timeout=1):
+            if tcp_open_from(args.router, ip, int(port), timeout=1):
                 break
             time.sleep(1)
         else:
@@ -365,6 +378,14 @@ config = json.loads(sys.stdin.readline())
 p = pathlib.Path.home()/".t3/userdata/settings.json"
 p.parent.mkdir(parents=True, exist_ok=True)
 d = json.loads(p.read_text()) if p.exists() else {}
+agent = "$HOME/.t3/joshua/joshua_acp.py"
+launcher = pathlib.Path.home()/".t3/joshua/joshua-acp"
+api_env = f"$HOME/.config/joshua/api-{config['port']}.env"
+launcher.write_text(
+  "#!/bin/sh\\n"
+  f'if [ -r "{api_env}" ]; then . "{api_env}"; fi\\n'
+  f'exec "{agent}" "$@"\\n')
+launcher.chmod(0o700)
 args = ["--base-url", config["base_url"]]
 if config["cpu_url"]:
     args += ["--cpu-url", config["cpu_url"]]
@@ -375,7 +396,7 @@ d.setdefault("providerInstances", {})["joshua_local"] = {
   "displayName": "Joshua (local)",
   "enabled": True,
   "config": {"source": "local",
-             "commandPath": str(pathlib.Path.home()/".t3/joshua/joshua_acp.py"),
+             "commandPath": str(launcher),
              "commandArgs": args},
 }
 p.write_text(json.dumps(d, indent=2) + "\\n")
@@ -386,6 +407,7 @@ print("registered provider instance joshua_local")
         "base_url": f"http://127.0.0.1:{port}",
         "cpu_url": f"http://127.0.0.1:{cpu_port}" if cpu_port else None,
         "model_dir": args.model_dir,
+        "port": port,
     }) + "\n"
     out = run(host, f"python3 -c {shlex.quote(script)}", check=True, input=payload)
     print(f"[{host}] {out.stdout.strip()}")
