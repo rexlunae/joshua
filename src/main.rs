@@ -1397,11 +1397,22 @@ async fn main() -> anyhow::Result<()> {
             };
             let opts = EngineOptions::with_n_ctx(n_ctx).backend(device.into());
             let engine = Engine::with_options(&model, opts)?;
+            // The engine resolves 0 to its default context, so bound and default
+            // the window from what it actually loaded — not from the raw flag,
+            // where `--n-ctx 0` would invert `clamp`'s bounds and panic.
+            let n_ctx = engine.n_ctx();
+            if n_ctx < 3 {
+                anyhow::bail!(
+                    "context window of {n_ctx} token(s) is too small to score: a window needs \
+                     at least 2 tokens and one scored pair needs 3"
+                );
+            }
+            let n_ctx = n_ctx as usize;
             let mut tokens = engine.tokenize(&text, bos)?;
             if limit > 0 && tokens.len() > limit {
                 tokens.truncate(limit);
             }
-            let window = window.unwrap_or(n_ctx as usize).clamp(2, n_ctx as usize);
+            let window = window.unwrap_or(n_ctx).clamp(2, n_ctx);
             if tokens.len() < 3 {
                 anyhow::bail!(
                     "need at least 3 tokens to score (got {}); is the tokenizer the model's own?",
