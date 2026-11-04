@@ -917,7 +917,8 @@ enum Commands {
         /// Context window in tokens.
         #[arg(long, env = "JOSHUA_N_CTX", default_value_t = 4096)]
         n_ctx: u32,
-        /// Tokens per scored window (defaults to the context window).
+        /// Tokens per scored window (defaults to the context window, and is
+        /// clamped to it: a window cannot exceed the model's context).
         #[arg(long)]
         window: Option<usize>,
         /// Score at most this many tokens (0 = the whole file).
@@ -1400,7 +1401,7 @@ async fn main() -> anyhow::Result<()> {
             if limit > 0 && tokens.len() > limit {
                 tokens.truncate(limit);
             }
-            let window = window.unwrap_or(n_ctx as usize);
+            let window = window.unwrap_or(n_ctx as usize).clamp(2, n_ctx as usize);
             if tokens.len() < 3 {
                 anyhow::bail!(
                     "need at least 3 tokens to score (got {}); is the tokenizer the model's own?",

@@ -36,6 +36,58 @@ pub fn windows(n: usize, window: usize) -> Vec<(usize, usize)> {
     out
 }
 
+/// How many logit rows one forward pass may materialise while scoring.
+///
+/// 256 rows of a 129k-token vocabulary is ~132 MB of `f32`: enough to amortise
+/// each pass over the weights, while keeping the logits buffer bounded no matter
+/// how wide the scored window is.
+pub const SCORE_ROWS_PER_PASS: usize = 256;
+
+/// One forward pass inside a scored window.
+///
+/// A window is fed in slices so the logits of a whole window never have to be
+/// materialised at once: a 4096-token window over a 129k vocabulary is 2.1 GB
+/// of `f32` rows. Slices are contiguous — the KV cache carries across them, so
+/// the model still sees the full window context — and only the *materialised
+/// rows* are bounded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Slice {
+    /// First token of this slice (absolute, in the scored token stream).
+    pub from: usize,
+    /// One past the last token fed in this slice.
+    pub to: usize,
+    /// Position to feed `from` at, relative to the start of the window.
+    pub pos: usize,
+    /// One past the last token that can be scored from this slice's rows.
+    ///
+    /// Usually `to + 1`, because the last row predicts the first token of the
+    /// next slice — that token is known, so the row is scoreable. At the end of
+    /// a window it is `to`: the final row has no successor inside the window.
+    pub target_end: usize,
+}
+
+/// Split the window `[start, end)` into forward passes of at most `max_rows`
+/// tokens each.
+pub fn slices(start: usize, end: usize, max_rows: usize) -> Vec<Slice> {
+    let max_rows = max_rows.max(1);
+    let mut out = Vec::new();
+    let mut from = start;
+    while from < end {
+        let to = (from + max_rows).min(end);
+        // A slice that does not reach the window end can still score its last
+        // row, because the next slice's first token is its target.
+        let target_end = if to < end { to + 1 } else { to };
+        out.push(Slice {
+            from,
+            to,
+            pos: from - start,
+            target_end,
+        });
+        from = to;
+    }
+    out
+}
+
 /// Negative log-likelihood of `target` under `logits`, in nats.
 ///
 /// `None` when the row cannot produce a finite value: an empty/one-class
@@ -172,6 +224,69 @@ mod tests {
         assert_eq!(windows(5, 0), vec![(0, 2), (2, 4)]);
         assert_eq!(windows(5, 1), vec![(0, 2), (2, 4)]);
         assert_eq!(windows(6, 0), vec![(0, 2), (2, 4), (4, 6)]);
+    }
+
+    #[test]
+    fn slices_cover_the_window_contiguously_with_growing_positions() {
+        let s = slices(100, 350, 100);
+        assert_eq!(s.len(), 3);
+        assert_eq!(s[0], Slice { from: 100, to: 200, pos: 0, target_end: 201 });
+        assert_eq!(s[1], Slice { from: 200, to: 300, pos: 100, target_end: 301 });
+        // Last slice: no successor inside the window, so nothing extra to score.
+        assert_eq!(s[2], Slice { from: 300, to: 350, pos: 200, target_end: 350 });
+        // Contiguous, and every slice except the last hands its last row a target.
+        for pair in s.windows(2) {
+            assert_eq!(pair[0].to, pair[1].from);
+            assert_eq!(pair[0].target_end, pair[1].from + 1);
+        }
+    }
+
+    #[test]
+    fn slices_bound_the_rows_materialised_per_pass() {
+        // A 4096-token window at 256 rows/pass is 16 passes, never one 2 GiB
+        // logits buffer.
+        let s = slices(0, 4096, 256);
+        assert_eq!(s.len(), 16);
+        assert!(s.iter().all(|x| x.to - x.from == 256));
+        // A window smaller than the budget stays a single pass.
+        assert_eq!(slices(0, 10, 256), vec![Slice { from: 0, to: 10, pos: 0, target_end: 10 }]);
+    }
+
+    #[test]
+    fn slices_degenerate_budget_still_makes_progress() {
+        // A zero budget is clamped to one row per pass; a non-final slice still
+        // hands its last row a target (the next slice's first token).
+        assert_eq!(slices(0, 3, 0).len(), 3);
+        assert_eq!(slices(0, 3, 0)[0], Slice { from: 0, to: 1, pos: 0, target_end: 2 });
+        assert_eq!(slices(0, 3, 0)[2], Slice { from: 2, to: 3, pos: 2, target_end: 3 });
+        assert!(slices(5, 5, 8).is_empty());
+    }
+
+    #[test]
+    fn sliced_scoring_matches_one_shot_scoring() {
+        // The point of slicing is that it must not change the score: score the
+        // same 4-token window as one pass and as 2-row slices, feeding the
+        // concatenation of rows to the accumulator either way.
+        let tokens = [1u32, 2, 3, 4];
+        let vocab = 5;
+        let rows: Vec<Vec<f32>> = (0..4)
+            .map(|i| {
+                let mut r = vec![0.0f32; vocab];
+                r[(i + 1) % vocab] = 5.0;      // strongly predict token i+1
+                r
+            })
+            .collect();
+
+        let mut one = Accumulator::new();
+        one.push_window(&tokens, &rows);
+
+        let mut sliced = Accumulator::new();
+        for s in slices(0, tokens.len(), 2) {
+            sliced.push_window(&tokens[s.from..s.target_end], &rows[s.from..s.to]);
+        }
+        assert_eq!(one.scored(), sliced.scored());
+        assert_eq!(one.skipped(), sliced.skipped());
+        assert!(close(one.mean_nll().unwrap(), sliced.mean_nll().unwrap()));
     }
 
     #[test]
