@@ -4,11 +4,8 @@
 
 mod common;
 
-use candle_core::quantized::gguf_file;
-use candle_core::Device;
 use joshua::types::reasoning_template_kwargs;
 use joshua::{ChatMessage, Engine, GenerationOptions, JoshuaError, ReasoningEffort};
-use std::path::Path;
 
 fn greedy(max_tokens: u32) -> GenerationOptions {
     GenerationOptions {
@@ -90,32 +87,6 @@ fn seed_reproduces_sampled_output() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// Rewrite `path` with a different `tokenizer.chat_template`, keeping every
-/// other metadata entry and tensor.
-fn replace_chat_template(path: &Path, template: &str) {
-    let mut file = std::fs::File::open(path).unwrap();
-    let content = gguf_file::Content::read(&mut file).unwrap();
-    let mut metadata = content.metadata.clone();
-    metadata.insert(
-        "tokenizer.chat_template".to_string(),
-        gguf_file::Value::String(template.to_string()),
-    );
-    let tensors: Vec<(String, _)> = content
-        .tensor_infos
-        .keys()
-        .map(|name| {
-            let t = content.tensor(&mut file, name, &Device::Cpu).unwrap();
-            (name.clone(), t)
-        })
-        .collect();
-    drop(file);
-    let metadata_refs: Vec<(&str, &gguf_file::Value)> =
-        metadata.iter().map(|(k, v)| (k.as_str(), v)).collect();
-    let tensor_refs: Vec<(&str, &_)> = tensors.iter().map(|(k, t)| (k.as_str(), t)).collect();
-    let mut out = std::fs::File::create(path).unwrap();
-    gguf_file::write(&mut out, &metadata_refs, &tensor_refs).unwrap();
-}
-
 #[test]
 fn reasoning_settings_reach_the_gguf_chat_template() {
     let dir = common::model_dir("req-reasoning");
@@ -124,7 +95,7 @@ fn reasoning_settings_reach_the_gguf_chat_template() {
     // Qwen3-style switch (thinking off adds "a b") plus a gpt-oss-style
     // effort marker ("c" for high, "d" otherwise), in the fixture's tiny
     // vocabulary so the prompt token count shows what was rendered.
-    replace_chat_template(
+    common::replace_chat_template(
         &model,
         "{% for message in messages %}hello {{ message.content }} {% endfor %}\
          {% if add_generation_prompt %}\

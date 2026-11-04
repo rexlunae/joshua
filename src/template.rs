@@ -26,10 +26,12 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 
+use minijinja::value::{Kwargs, ValueKind};
 use minijinja::{Environment, Error, ErrorKind, Value};
 use serde::Serialize;
 use tokenizers::Tokenizer;
 
+use crate::tools::ToolCallFormat;
 use crate::types::{ChatMessage, Tool};
 
 /// A chat template extracted from GGUF metadata, plus the special-token
@@ -44,6 +46,8 @@ pub struct ChatTemplate {
     /// The most template instructions one render may run (`None`: no
     /// limit); see [`ChatTemplate::with_fuel`].
     fuel: Option<u64>,
+    /// The tool-call format the template teaches, if it is a known one.
+    tool_call_format: Option<ToolCallFormat>,
 }
 
 /// The [`ChatTemplate::with_fuel`] limit for a template a request supplies:
@@ -54,7 +58,8 @@ pub const REQUEST_TEMPLATE_FUEL: u64 = 10_000_000;
 
 /// Appended to the final message to find where the template's copy of it
 /// ends (see [`ChatTemplate::render_continuation`]): private-use characters
-/// no tokenizer control string contains, and none `tojson` escapes.
+/// no tokenizer control string contains, and none `tojson` escapes (short
+/// of `ensure_ascii=True`).
 const CONTINUATION_MARKER: &str = "\u{f8ff}joshua-continue\u{f8ff}";
 
 impl ChatTemplate {
@@ -67,8 +72,10 @@ impl ChatTemplate {
         bos_token: impl Into<String>,
         eos_token: impl Into<String>,
     ) -> Self {
+        let source = source.into();
         Self {
-            source: source.into(),
+            tool_call_format: ToolCallFormat::from_template(&source),
+            source,
             bos_token: bos_token.into(),
             eos_token: eos_token.into(),
             special_tokens: Vec::new(),
@@ -111,6 +118,12 @@ impl ChatTemplate {
     /// The raw Jinja source of the template.
     pub fn source(&self) -> &str {
         &self.source
+    }
+
+    /// The tool-call markup the template tells the model to write, when it
+    /// is a family [`ToolCallFormat::from_template`] knows.
+    pub fn tool_call_format(&self) -> Option<ToolCallFormat> {
+        self.tool_call_format
     }
 
     /// Render the conversation to a prompt string, appending the generation
@@ -240,24 +253,33 @@ impl ChatTemplate {
             #[serde(skip_serializing_if = "Option::is_none")]
             name: Option<&'a str>,
             #[serde(skip_serializing_if = "Option::is_none")]
-            tool_calls: Option<&'a serde_json::Value>,
+            tool_calls: Option<Cow<'a, serde_json::Value>>,
             #[serde(skip_serializing_if = "Option::is_none")]
             tool_call_id: Option<&'a str>,
             #[serde(skip_serializing_if = "Option::is_none")]
             reasoning_content: Option<&'a str>,
         }
 
-        let msgs: Vec<Msg> = messages
+        let msgs = |objects: bool| -> Vec<Msg> {
+            messages
+                .iter()
+                .map(|m| Msg {
+                    role: &m.role,
+                    content: &m.content,
+                    name: m.name.as_deref(),
+                    tool_calls: m
+                        .tool_calls
+                        .as_ref()
+                        .and_then(|calls| template_tool_calls(calls, objects)),
+                    tool_call_id: m.tool_call_id.as_deref(),
+                    reasoning_content: m.reasoning_content.as_deref(),
+                })
+                .collect()
+        };
+        let with_objects = msgs(true);
+        let converted = with_objects
             .iter()
-            .map(|m| Msg {
-                role: &m.role,
-                content: &m.content,
-                name: m.name.as_deref(),
-                tool_calls: m.tool_calls.as_ref(),
-                tool_call_id: m.tool_call_id.as_deref(),
-                reasoning_content: m.reasoning_content.as_deref(),
-            })
-            .collect();
+            .any(|m| matches!(m.tool_calls, Some(Cow::Owned(_))));
 
         let mut env = Environment::new();
         env.set_fuel(self.fuel);
@@ -265,6 +287,7 @@ impl ChatTemplate {
         env.add_function("raise_exception", |msg: String| -> Result<(), Error> {
             Err(Error::new(ErrorKind::InvalidOperation, msg))
         });
+        env.add_filter("tojson", tojson);
         env.add_template("chat", &self.source)
             .map_err(|e| format!("chat template failed to parse: {e}"))?;
 
@@ -272,7 +295,6 @@ impl ChatTemplate {
             .iter()
             .map(|(k, v)| (k.clone(), Value::from_serialize(v)))
             .collect();
-        ctx.insert("messages".into(), Value::from_serialize(&msgs));
         ctx.insert(
             "add_generation_prompt".into(),
             Value::from(add_generation_prompt),
@@ -290,10 +312,27 @@ impl ChatTemplate {
             }
         }
 
-        env.get_template("chat")
-            .expect("template was just added")
-            .render(Value::from(ctx))
-            .map_err(|e| format!("chat template failed to render: {e}"))
+        let template = env.get_template("chat").expect("template was just added");
+        let render = |msgs: &[Msg]| {
+            let mut ctx = ctx.clone();
+            ctx.insert("messages".into(), Value::from_serialize(msgs));
+            template.render(Value::from(ctx))
+        };
+        match render(&with_objects) {
+            // A template that cannot take the arguments as objects (one
+            // joining them to text with `+`, as functionary v3.2's does)
+            // gets the client's strings, as llama.cpp's capability probe
+            // leaves them for such a template.
+            Err(e) if converted && e.kind() != ErrorKind::OutOfFuel => {
+                tracing::debug!(
+                    "chat template cannot render tool-call arguments as objects ({e}); \
+                     passing the client's strings"
+                );
+                render(&msgs(false)).map_err(|_| e)
+            }
+            rendered => rendered,
+        }
+        .map_err(|e| format!("chat template failed to render: {e}"))
     }
 }
 
@@ -345,6 +384,278 @@ pub(crate) fn map_developer_role<'a>(
     out.push(ChatMessage::text("system", system.join("\n\n")));
     out.extend(rest);
     Cow::Owned(out)
+}
+
+// ─── tojson ─────────────────────────────────────────────────────────────────
+
+/// transformers' `tojson`, which its chat-template renderer puts in place of
+/// Jinja's and llama.cpp's renderer copies: Python's
+/// `json.dumps(value, ensure_ascii=False, indent=None, separators=None,
+/// sort_keys=False)`, taking those four as arguments or keywords.  Unlike
+/// minijinja's filter it writes `, ` and `: ` between items, keeps keys in
+/// their order and escapes no HTML characters, so the tools and tool calls
+/// a template writes into the prompt are the text the model was trained
+/// on (and the text a client's own `json.dumps` sent).
+fn tojson(value: &Value, args: &[Value], kwargs: Kwargs) -> Result<Value, Error> {
+    let arg = |index: usize, name: &str| -> Result<Option<Value>, Error> {
+        let value = match kwargs.get::<Option<Value>>(name)? {
+            Some(value) => Some(value),
+            None => args.get(index).cloned(),
+        };
+        Ok(value.filter(|v| !v.is_none() && !v.is_undefined()))
+    };
+    if args.len() > 4 {
+        return Err(Error::from(ErrorKind::TooManyArguments));
+    }
+    let ensure_ascii = arg(0, "ensure_ascii")?.is_some_and(|v| v.is_true());
+    // An integer indents by that many spaces and a string by itself; zero
+    // or a negative number only breaks the lines.
+    let indent = arg(1, "indent")?.map(|v| match v.as_str() {
+        Some(text) => text.to_string(),
+        None => {
+            let spaces = v.as_i64().unwrap_or(i64::from(v.is_true())).max(0);
+            " ".repeat(spaces as usize)
+        }
+    });
+    let (item_sep, key_sep) = match arg(2, "separators")? {
+        Some(separators) => {
+            let pair: Vec<Value> = separators.try_iter()?.collect();
+            match pair.as_slice() {
+                [item, key] => (item.to_string(), key.to_string()),
+                _ => {
+                    return Err(Error::new(
+                        ErrorKind::InvalidOperation,
+                        "tojson separators must be an (item, key) pair",
+                    ))
+                }
+            }
+        }
+        None if indent.is_some() => (",".to_string(), ": ".to_string()),
+        None => (", ".to_string(), ": ".to_string()),
+    };
+    let sort_keys = arg(3, "sort_keys")?.is_some_and(|v| v.is_true());
+    kwargs.assert_all_used()?;
+    let json = PyJson {
+        ensure_ascii,
+        indent,
+        item_sep,
+        key_sep,
+        sort_keys,
+    };
+    let mut out = String::new();
+    json.value(&mut out, value, 0)?;
+    Ok(Value::from_safe_string(out))
+}
+
+/// The settings of one [`tojson`] call.
+struct PyJson {
+    ensure_ascii: bool,
+    indent: Option<String>,
+    item_sep: String,
+    key_sep: String,
+    sort_keys: bool,
+}
+
+impl PyJson {
+    fn value(&self, out: &mut String, value: &Value, depth: usize) -> Result<(), Error> {
+        match value.kind() {
+            ValueKind::Undefined | ValueKind::None => out.push_str("null"),
+            ValueKind::Bool => out.push_str(if value.is_true() { "true" } else { "false" }),
+            ValueKind::Number if value.is_integer() => out.push_str(&value.to_string()),
+            ValueKind::Number => py_float(out, f64::try_from(value.clone())?),
+            ValueKind::String => self.string(out, value.as_str().unwrap_or_default()),
+            ValueKind::Seq | ValueKind::Iterable => {
+                let items: Vec<Value> = value.try_iter()?.collect();
+                self.container(out, ('[', ']'), items.len(), depth, |out, i| {
+                    self.value(out, &items[i], depth + 1)
+                })?;
+            }
+            ValueKind::Map => {
+                let mut keys: Vec<Value> = value.try_iter()?.collect();
+                if self.sort_keys {
+                    keys.sort_by_key(|key| key.to_string());
+                }
+                self.container(out, ('{', '}'), keys.len(), depth, |out, i| {
+                    self.string(out, &keys[i].to_string());
+                    out.push_str(&self.key_sep);
+                    self.value(out, &value.get_item(&keys[i])?, depth + 1)
+                })?;
+            }
+            _ => {
+                return Err(Error::new(
+                    ErrorKind::InvalidOperation,
+                    format!("cannot serialize {} to JSON", value.kind()),
+                ))
+            }
+        }
+        Ok(())
+    }
+
+    /// `len` items between `open` and `close`, each on its own line when
+    /// indenting.
+    fn container(
+        &self,
+        out: &mut String,
+        (open, close): (char, char),
+        len: usize,
+        depth: usize,
+        mut item: impl FnMut(&mut String, usize) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        out.push(open);
+        if len == 0 {
+            out.push(close);
+            return Ok(());
+        }
+        let newline = |out: &mut String, depth: usize| {
+            if let Some(indent) = &self.indent {
+                out.push('\n');
+                out.push_str(&indent.repeat(depth));
+            }
+        };
+        for i in 0..len {
+            if i > 0 {
+                out.push_str(&self.item_sep);
+            }
+            newline(out, depth + 1);
+            item(out, i)?;
+        }
+        newline(out, depth);
+        out.push(close);
+        Ok(())
+    }
+
+    /// A JSON string as Python writes it: control characters escaped
+    /// (`\n`, `\u001b`, lowercase hex), and with `ensure_ascii` everything
+    /// outside printable ASCII too, as UTF-16 code units.
+    fn string(&self, out: &mut String, text: &str) {
+        out.push('"');
+        for c in text.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                '\u{8}' => out.push_str("\\b"),
+                '\u{c}' => out.push_str("\\f"),
+                c if (c as u32) < 0x20 || (self.ensure_ascii && !(' '..='~').contains(&c)) => {
+                    let mut units = [0u16; 2];
+                    for unit in c.encode_utf16(&mut units) {
+                        out.push_str(&format!("\\u{unit:04x}"));
+                    }
+                }
+                c => out.push(c),
+            }
+        }
+        out.push('"');
+    }
+}
+
+/// A float as Python's `repr` writes it (and so `json.dumps`): the shortest
+/// digits that read back the same, in positional notation with at least
+/// one decimal (`1.0`) unless the exponent is below -4 or above 15
+/// (`1e-05`, `1e+16`); non-finite values as `NaN` / `Infinity`.
+fn py_float(out: &mut String, x: f64) {
+    if x.is_nan() {
+        out.push_str("NaN");
+        return;
+    }
+    if x.is_infinite() {
+        out.push_str(if x > 0.0 { "Infinity" } else { "-Infinity" });
+        return;
+    }
+    let shortest = format!("{:e}", x.abs());
+    let (mantissa, exponent) = shortest.split_once('e').unwrap_or((&shortest, "0"));
+    let digits: String = mantissa.chars().filter(char::is_ascii_digit).collect();
+    let exponent: i32 = exponent.parse().unwrap_or(0);
+    if x.is_sign_negative() {
+        out.push('-');
+    }
+    if !(-4..16).contains(&exponent) {
+        out.push_str(&digits[..1]);
+        if digits.len() > 1 {
+            out.push('.');
+            out.push_str(&digits[1..]);
+        }
+        out.push_str(&format!(
+            "e{}{:02}",
+            if exponent < 0 { '-' } else { '+' },
+            exponent.abs()
+        ));
+    } else if exponent < 0 {
+        out.push_str("0.");
+        out.push_str(&"0".repeat((-exponent - 1) as usize));
+        out.push_str(&digits);
+    } else {
+        let point = exponent as usize + 1;
+        if digits.len() > point {
+            out.push_str(&digits[..point]);
+            out.push('.');
+            out.push_str(&digits[point..]);
+        } else {
+            out.push_str(&digits);
+            out.push_str(&"0".repeat(point - digits.len()));
+            out.push_str(".0");
+        }
+    }
+}
+
+// ─── Tool calls in the history ──────────────────────────────────────────────
+
+/// An assistant message's `tool_calls` as chat templates expect them.
+///
+/// OpenAI clients send `function.arguments` as a JSON string, but templates
+/// written for transformers iterate it (`arguments|items`, Qwen3-Coder and
+/// GLM) or `tojson` it (Llama 3.x, DeepSeek, Mistral), which double-encodes
+/// a string.  With `objects`, as vLLM's `_postprocess_messages` and
+/// llama.cpp's `func_args_not_string` do, a string that holds a JSON object
+/// becomes that object, and missing or empty arguments become `{}`; a
+/// string that is not a JSON object is kept as it is.  Without, the calls
+/// are the client's, for a template that cannot take objects.  An empty
+/// `tool_calls` list is dropped so the template takes its plain-assistant
+/// path.  The value is copied only when something changes.
+fn template_tool_calls(
+    calls: &serde_json::Value,
+    objects: bool,
+) -> Option<Cow<'_, serde_json::Value>> {
+    use serde_json::Value;
+
+    /// The object `arguments` should be, when it is not one already.
+    fn arguments_object(arguments: Option<&Value>) -> Option<Value> {
+        match arguments {
+            None | Some(Value::Null) => Some(Value::Object(Default::default())),
+            Some(Value::String(text)) if text.trim().is_empty() => {
+                Some(Value::Object(Default::default()))
+            }
+            Some(Value::String(text)) => serde_json::from_str::<Value>(text)
+                .ok()
+                .filter(Value::is_object),
+            Some(_) => None,
+        }
+    }
+    let Value::Array(items) = calls else {
+        return Some(Cow::Borrowed(calls));
+    };
+    if items.is_empty() {
+        return None;
+    }
+    let changes = objects
+        && items
+            .iter()
+            .filter_map(|call| call.get("function").filter(|f| f.is_object()))
+            .any(|f| arguments_object(f.get("arguments")).is_some());
+    if !changes {
+        return Some(Cow::Borrowed(calls));
+    }
+    let mut calls = calls.clone();
+    for item in calls.as_array_mut().into_iter().flatten() {
+        if let Some(Value::Object(f)) = item.get_mut("function") {
+            if let Some(object) = arguments_object(f.get("arguments")) {
+                f.insert("arguments".to_string(), object);
+            }
+        }
+    }
+    Some(Cow::Owned(calls))
 }
 
 // ─── Control-token hardening ────────────────────────────────────────────────
@@ -807,6 +1118,146 @@ mod tests {
             .render(&[msg("user", "go"), assistant, tool_result], None)
             .unwrap();
         assert_eq!(out, "go;calls:1;result[call_1]:42;");
+    }
+
+    /// Qwen3-Coder's history loop: `arguments|items` needs an object, which
+    /// the client's JSON string becomes; without the change the template
+    /// fails and the prompt falls back to ChatML.
+    #[test]
+    fn string_tool_arguments_reach_the_template_as_an_object() {
+        let source = "{% for m in messages %}{% for c in m.tool_calls %}<function={{ c.function.name }}>\
+                      {% for k, v in c.function.arguments|items %}<parameter={{ k }}>{{ v }}</parameter>{% endfor %}\
+                      </function>{% endfor %}{% endfor %}";
+        let t = ChatTemplate::new(source, "", "");
+        let mut assistant = msg("assistant", "");
+        assistant.tool_calls = Some(serde_json::json!([{
+            "id": "call_1", "type": "function",
+            "function": {"name": "f", "arguments": "{\"city\": \"Paris\"}"}
+        }]));
+        assert_eq!(
+            t.render(&[assistant], None).unwrap(),
+            "<function=f><parameter=city>Paris</parameter></function>"
+        );
+        // The caller's messages are untouched.
+        let calls = serde_json::json!([{"function": {"name": "f", "arguments": "{}"}}]);
+        assert!(matches!(
+            template_tool_calls(&calls, true),
+            Some(Cow::Owned(_))
+        ));
+        assert!(matches!(
+            template_tool_calls(&calls, false),
+            Some(Cow::Borrowed(_))
+        ));
+        let objects = serde_json::json!([{"function": {"name": "f", "arguments": {}}}]);
+        assert!(matches!(
+            template_tool_calls(&objects, true),
+            Some(Cow::Borrowed(_))
+        ));
+        assert!(template_tool_calls(&serde_json::json!([]), true).is_none());
+        assert!(template_tool_calls(&serde_json::json!([]), false).is_none());
+    }
+
+    /// A template that joins the arguments to text (functionary v3.2's
+    /// `'>>>' + name + '\n' + arguments`) cannot take an object; it gets
+    /// the client's string instead of failing over to ChatML.
+    #[test]
+    fn a_template_that_concatenates_arguments_gets_the_string() {
+        let source = "{% for m in messages %}{% for c in m.tool_calls %}\
+                      {{ '>>>' + c.function.name + '\\n' + c.function.arguments }}\
+                      {% endfor %}{% endfor %}";
+        let t = ChatTemplate::new(source, "", "");
+        let mut assistant = msg("assistant", "");
+        assistant.tool_calls = Some(serde_json::json!([{
+            "id": "call_1", "type": "function",
+            "function": {"name": "f", "arguments": "{\"city\": \"Paris\"}"}
+        }]));
+        assert_eq!(
+            t.render(&[assistant], None).unwrap(),
+            ">>>f\n{\"city\": \"Paris\"}"
+        );
+        // A template that fails for another reason still fails.
+        let t = ChatTemplate::new("{{ raise_exception('no') }}", "", "");
+        let mut assistant = msg("assistant", "");
+        assistant.tool_calls = Some(serde_json::json!([{
+            "function": {"name": "f", "arguments": "{}"}
+        }]));
+        assert!(t.render(&[assistant], None).unwrap_err().contains("no"));
+    }
+
+    /// `tojson` writes what transformers' (Python's `json.dumps`) does:
+    /// `, ` / `: ` separators, keys in their order, no HTML escaping, and
+    /// its `ensure_ascii`, `indent`, `separators` and `sort_keys` (GLM-4.5+
+    /// and Kimi K3 pass `ensure_ascii=False`).
+    #[test]
+    fn tojson_writes_what_transformers_does() {
+        let render = |source: &str, content: &str| {
+            ChatTemplate::new(source, "", "")
+                .render(&[msg("user", content)], None)
+                .unwrap()
+        };
+        let text = "上海 <b>&'\"\\\n\u{1}\u{1F600}";
+        assert_eq!(
+            render("{{ messages[0].content | tojson }}", text),
+            "\"上海 <b>&'\\\"\\\\\\n\\u0001\u{1F600}\""
+        );
+        assert_eq!(
+            render(
+                "{{ messages[0].content | tojson(ensure_ascii=False) }}",
+                text
+            ),
+            render("{{ messages[0].content | tojson }}", text)
+        );
+        assert_eq!(
+            render(
+                "{{ messages[0].content | tojson(ensure_ascii=true) }}",
+                text
+            ),
+            "\"\\u4e0a\\u6d77 <b>&'\\\"\\\\\\n\\u0001\\ud83d\\ude00\""
+        );
+        let map = "{{ {'b': [1, 2.5, none, true], 'a': {}} | tojson";
+        assert_eq!(
+            render(&format!("{map} }}}}"), ""),
+            r#"{"b": [1, 2.5, null, true], "a": {}}"#
+        );
+        assert_eq!(
+            render(&format!("{map}(indent=2) }}}}"), ""),
+            "{\n  \"b\": [\n    1,\n    2.5,\n    null,\n    true\n  ],\n  \"a\": {}\n}"
+        );
+        assert_eq!(
+            render(
+                &format!("{map}(separators=(',', ':'), sort_keys=true) }}}}"),
+                ""
+            ),
+            r#"{"a":{},"b":[1,2.5,null,true]}"#
+        );
+        // Python's float `repr`.
+        let repr = |x: f64| {
+            let mut out = String::new();
+            py_float(&mut out, x);
+            out
+        };
+        let floats = [
+            1.0, 0.1, 100.0, 1e16, 1e15, 1e-4, 1e-5, -0.0, -1.5e-7, 123.456,
+        ];
+        assert_eq!(
+            floats.map(repr),
+            [
+                "1.0",
+                "0.1",
+                "100.0",
+                "1e+16",
+                "1000000000000000.0",
+                "0.0001",
+                "1e-05",
+                "-0.0",
+                "-1.5e-07",
+                "123.456"
+            ]
+        );
+        assert_eq!(
+            [f64::NAN, f64::INFINITY, f64::NEG_INFINITY].map(repr),
+            ["NaN", "Infinity", "-Infinity"]
+        );
     }
 
     // ── Reasoning switches (#144) ──────────────────────────────────────────

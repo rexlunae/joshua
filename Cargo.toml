@@ -152,8 +152,10 @@ base64 = "0.22"
 # Chat-template rendering (pure Rust Jinja2 engine).
 # pycompat adds Python string/dict methods (.strip(), .title(), …) that
 # HuggingFace chat templates rely on.  fuel bounds the work a per-request
-# template may do.
-minijinja = { version = "2", features = ["json", "fuel"] }
+# template may do.  preserve_order keeps a map's keys in their order, as
+# Python's dicts do, so `items` and `tojson` write a tool's schema and a
+# call's arguments in the order the client sent them.
+minijinja = { version = "2", features = ["json", "fuel", "preserve_order"] }
 minijinja-contrib = { version = "2", features = ["pycompat"] }
 
 # Sampling
@@ -167,7 +169,9 @@ sha2 = "0.10"
 axum = { version = "0.8", features = ["json", "macros", "multipart"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["raw_value"] }
+# preserve_order (which llguidance also turns on): a request's JSON objects
+# keep their key order on their way into chat templates.
+serde_json = { version = "1", features = ["raw_value", "preserve_order"] }
 thiserror = "1"
 anyhow = "1"
 tracing = "0.1"

@@ -533,7 +533,7 @@ pub fn stop_reason(stop_type: StopType, has_calls: bool) -> &'static str {
 
 /// Build a non-streaming response from the model's output after the shared
 /// post-processing: its reasoning, the answer `prose` around its tool
-/// `calls`, and its completion.
+/// `calls` (each with its id), and its completion.
 pub fn response(
     id: String,
     model: String,
@@ -556,7 +556,7 @@ pub fn response(
     }
     for call in calls {
         content.push(ResponseBlock::ToolUse {
-            id: format!("toolu_{}", uuid::Uuid::new_v4().simple()),
+            id: call.id.clone().unwrap_or_default(),
             name: call.name.clone(),
             input: tool_input(&call.arguments),
         });
@@ -700,6 +700,8 @@ mod tests {
     fn response_maps_tool_markup_to_tool_use_blocks() {
         let c = completion("", StopType::Eos, None);
         let (prose, calls) = crate::tools::parse_tool_calls(
+            crate::tools::ToolCallFormat::Generic,
+            &[],
             "<tool_call>{\"name\":\"add\",\"arguments\":{\"a\":2,\"b\":2}}</tool_call>",
         );
         assert_eq!(calls.len(), 1);
