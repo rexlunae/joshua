@@ -3528,13 +3528,22 @@ impl Engine {
     /// Score in bounded slices with context continuity inside each window.
     pub fn perplexity(&self, tokens: &[u32], window: usize) -> Result<crate::ppl::Accumulator> {
         if window == 0 || window > self.n_ctx as usize {
-            return Err(JoshuaError::InvalidRequest(format!("perplexity window {window} must be in 1..={} (configured context)", self.n_ctx)));
+            return Err(JoshuaError::InvalidRequest(format!(
+                "perplexity window {window} must be in 1..={} (configured context)",
+                self.n_ctx
+            )));
         }
         let device = &self.dense_device;
         let (session, _) = self.acquire_session(&[], false, None)?;
         let mut session = Some(session);
-        let all_positions = session.as_ref().expect("initial session").supports_speculative();
-        let supports_reset = session.as_ref().expect("initial session").supports_cache_clear();
+        let all_positions = session
+            .as_ref()
+            .expect("initial session")
+            .supports_speculative();
+        let supports_reset = session
+            .as_ref()
+            .expect("initial session")
+            .supports_cache_clear();
         let mut acc = crate::ppl::Accumulator::new();
         let mut outcome: Result<()> = Ok(());
         let mut first_window = true;
@@ -3545,8 +3554,19 @@ impl Engine {
                 PplWindowAction::UseFresh => {}
                 PplWindowAction::Reset => {
                     if !session.as_mut().expect("active session").clear_state() {
-                        outcome = Err(JoshuaError::InvalidRequest("model KV reset failed between perplexity windows".into()));
-                        break;
+                        // A failed reset cannot safely reuse the cache. Drop
+                        // the session first so non-sharing models never need
+                        // two full device copies to start the next window.
+                        drop(session.take());
+                        session_available = false;
+                        session = match self.load_model() {
+                            Ok(model) => Some(GenSession::Candle(Box::new(model))),
+                            Err(error) => {
+                                outcome = Err(error);
+                                break;
+                            }
+                        };
+                        session_available = true;
                     }
                 }
                 PplWindowAction::Reload => {
@@ -3555,9 +3575,12 @@ impl Engine {
                     // do not temporarily need room for two copies.
                     drop(session.take());
                     session_available = false;
-                    session = match self.load_fresh_model() {
+                    session = match self.load_model() {
                         Ok(model) => Some(GenSession::Candle(Box::new(model))),
-                        Err(error) => { outcome = Err(error); break; }
+                        Err(error) => {
+                            outcome = Err(error);
+                            break;
+                        }
                     };
                     session_available = true;
                 }
@@ -3567,24 +3590,43 @@ impl Engine {
                 let fed = &tokens[slice.from..slice.to];
                 let targets = &tokens[slice.from..slice.target_end];
                 if all_positions {
-                    match session.as_mut().expect("active session").forward_tokens_all(fed, slice.pos, device) {
+                    match session
+                        .as_mut()
+                        .expect("active session")
+                        .forward_tokens_all(fed, slice.pos, device)
+                    {
                         Ok(rows) => { acc.push_window(targets, &rows); }
                         Err(error) => { outcome = Err(error); break; }
                     }
                 } else {
                     let mut rows = Vec::with_capacity(fed.len());
                     for (i, tok) in fed.iter().enumerate() {
-                        if slice.from + i + 1 >= slice.target_end { break; }
-                        match session.as_mut().expect("active session").forward_tokens(std::slice::from_ref(tok), slice.pos + i, device) {
+                        if slice.from + i + 1 >= slice.target_end {
+                            break;
+                        }
+                        match session
+                            .as_mut()
+                            .expect("active session")
+                            .forward_tokens(std::slice::from_ref(tok), slice.pos + i, device)
+                        {
                             Ok(logits) => rows.push(logits),
-                            Err(error) => { outcome = Err(error); break; }
+                            Err(error) => {
+                                outcome = Err(error);
+                                break;
+                            }
                         }
                     }
-                    if outcome.is_ok() { acc.push_window(targets, &rows); }
+                    if outcome.is_ok() {
+                        acc.push_window(targets, &rows);
+                    }
                 }
-                if outcome.is_err() { break; }
+                if outcome.is_err() {
+                    break;
+                }
             }
-            if outcome.is_err() { break; }
+            if outcome.is_err() {
+                break;
+            }
         }
         if session_available {
             self.release_model(session.expect("available session"), Vec::new(), None);
@@ -6495,34 +6537,6 @@ impl Engine {
             }
             None => Ok(model),
         }
-    }
-
-    /// Load an independent instance from the mmap, honoring the engine's
-    /// resolved backend and dense/expert placement. Used for operations that
-    /// need a fresh KV cache on architectures without a reset hook.
-    fn load_fresh_model(&self) -> Result<QuantizedModel> {
-        let mut cursor = Cursor::new(&self.mmap[..]);
-        let gguf = read_gguf_header(&self.mmap)
-            .map_err(|e| JoshuaError::ModelLoad(format!("GGUF read failed: {e}")))?;
-        let load = || QuantizedModel::from_gguf_mmap_placed_with_ssd(
-            gguf,
-            &mut cursor,
-            &self.dense_device,
-            &self.expert_device,
-            Some(Arc::clone(&self.mmap)),
-            self.model_file.clone(),
-            self.n_ctx as usize,
-            self.device_expert_cache,
-            self.engram_tier,
-            self.ssd_expert_cache,
-        );
-        let mut model = if self.mtp > 0 { crate::quantized_qwen::with_mtp_block(load) } else { load() }
-            .map_err(|e| JoshuaError::ModelLoad(format!("model init failed: {e}")))?;
-        model.set_pin_hot_experts(if self.expert_cache_auto { self.auto_expert_budget(&model) } else { self.pin_hot_experts });
-        model.set_prefix_checkpoints(self.prefix_checkpoints);
-        model.set_speculative_expert_prefetch(self.predict_experts);
-        if self.mtp > 0 { let _ = model.set_mtp(true); }
-        Ok(model)
     }
 
     /// Phase-5 automatic sizing: pick the hot-expert budget from available
