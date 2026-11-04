@@ -2,8 +2,8 @@
 //! JSON grammar, Llama 3.x JSON, and Nemotron Nano v2's `<TOOLCALL>` list.
 
 use super::args::{Header, TaggedParams};
-use super::json::{self, skip_ws, Json};
-use super::{find_first, Cx, Grammar, Marker, PartialCall, Scan};
+use super::json::{self, Json, skip_ws};
+use super::{Cx, Grammar, Marker, PartialCall, Scan, find_first};
 
 const TOOL_CALL: &str = "<tool_call>";
 const TOOL_CALL_END: &str = "</tool_call>";
@@ -17,6 +17,58 @@ const MISTRAL_CALL_ID: &str = "[CALL_ID]";
 
 const NAME_KEYS: &[&str] = &["name"];
 const ARG_KEYS: &[&str] = &["arguments", "parameters"];
+
+fn broken_call_end(
+    region: &str,
+    after: usize,
+    open: &str,
+    close: &str,
+    finished: bool,
+) -> Option<usize> {
+    let close_at = region[after..].find(close).map(|offset| after + offset);
+    let next_at = region[after..].find(open).map(|offset| after + offset);
+    match (next_at, close_at) {
+        (Some(next), Some(close)) if next < close => Some(next),
+        (Some(next), None) => Some(next),
+        (_, Some(at)) => Some(at + close.len()),
+        (None, None) if finished => Some(region.len()),
+        (None, None) => None,
+    }
+}
+
+fn next_json_call(s: &str, after: usize) -> Option<usize> {
+    s[after..]
+        .match_indices('{')
+        .filter_map(|(offset, _)| {
+            let at = after + offset;
+            let previous = s[..at].chars().next_back()?;
+            if !previous.is_whitespace() && !matches!(previous, '}' | ';') {
+                return None;
+            }
+            let call = json::call_object(&s[at..], NAME_KEYS, ARG_KEYS).ok()?;
+            call.name.map(|_| at)
+        })
+        .next()
+}
+
+fn json_calls_after(s: &str, mut at: usize) -> (Vec<PartialCall>, usize) {
+    let mut calls = Vec::new();
+    loop {
+        let start = skip_ws(s, at);
+        let Ok(call) = json::call_object(&s[start..], NAME_KEYS, ARG_KEYS) else {
+            return (calls, at);
+        };
+        if call.name.is_none() {
+            return (calls, at);
+        }
+        let end = call.end.map_or(s.len() - start, |end| end);
+        calls.push(call.partial(true));
+        at = start + end;
+        if at == s.len() {
+            return (calls, at);
+        }
+    }
+}
 
 /// Where a region closed by `close` ends, given that its content ends at
 /// `at`: after the closing tag (whitespace before it allowed); after a
@@ -105,8 +157,26 @@ pub(super) fn hermes(region: &str, cx: &Cx<'_>) -> Scan {
         return undecided(cx, TOOL_CALL);
     }
     if payload.starts_with('{') {
-        let Ok(call) = json::call_object(payload, NAME_KEYS, ARG_KEYS) else {
-            return Scan::Text(TOOL_CALL.len());
+        let call = match json::call_object(payload, NAME_KEYS, ARG_KEYS) {
+            Ok(call) => call,
+            Err(()) => {
+                let Some((call, prefix_len)) =
+                    json::call_object_name_prefix(payload, NAME_KEYS, ARG_KEYS)
+                else {
+                    return Scan::Text(TOOL_CALL.len());
+                };
+                let end = broken_call_end(
+                    region,
+                    start + prefix_len,
+                    TOOL_CALL,
+                    TOOL_CALL_END,
+                    cx.finished,
+                );
+                return Scan::Calls {
+                    calls: vec![call],
+                    end,
+                };
+            }
         };
         if call.name.is_none() {
             return undecided(cx, TOOL_CALL);
@@ -281,21 +351,17 @@ fn mistral(region: &str, cx: &Cx<'_>) -> Scan {
     let args_at = skip_ws(payload, at);
     let raw = &payload[args_at..];
     let (args, end) = match json::scan_value(raw) {
-        Json::Done(len) => (&raw[..len], Some(start + args_at + len)),
-        _ if cx.finished => (raw.trim_end(), Some(region.len())),
-        _ => (raw.trim_end(), None),
+        Json::Done(len) => (raw[..len].to_string(), Some(start + args_at + len)),
+        _ if cx.finished => (json::partial_json(raw), Some(region.len())),
+        _ => (json::partial_json(raw), None),
     };
-    let done = end.map(|_| json::canonical(args));
+    let done = end.map(|_| json::canonical(&args));
     let streamable = args.starts_with(['{', '[']) || done.is_some();
     Scan::Calls {
         calls: vec![PartialCall {
             id,
             name: name.to_string(),
-            args: if streamable {
-                args.to_string()
-            } else {
-                String::new()
-            },
+            args: if streamable { args } else { String::new() },
             done,
         }],
         end,
@@ -313,6 +379,26 @@ fn bare_json(region: &str, cx: &Cx<'_>) -> Scan {
         Ok(call) if call.name.is_some() && call.end == Some(body.len()) => Scan::Calls {
             calls: vec![call.partial(true)],
             end: Some(region.len()),
+        },
+        Err(()) => match json::call_object_name_prefix(body, NAME_KEYS, ARG_KEYS) {
+            Some((call, prefix_len)) => {
+                let leading = region.len() - region.trim_start().len();
+                if let Some(next) = next_json_call(body, prefix_len) {
+                    let (following, end) = json_calls_after(body, next);
+                    let mut calls = vec![call];
+                    calls.extend(following);
+                    Scan::Calls {
+                        calls,
+                        end: Some(leading + end),
+                    }
+                } else {
+                    Scan::Calls {
+                        calls: vec![call],
+                        end: Some(region.len()),
+                    }
+                }
+            }
+            None => Scan::Text(region.len()),
         },
         _ => Scan::Text(region.len()),
     }
@@ -372,6 +458,19 @@ fn llama_json_calls(region: &str, first: usize, cx: &Cx<'_>) -> Scan {
                 } else {
                     Scan::Calls { calls, end: None }
                 };
+            }
+            Err(()) => {
+                if let Some((call, _)) =
+                    json::call_object_name_prefix(&region[start..], NAME_KEYS, ARG_KEYS)
+                {
+                    calls.push(call);
+                    let end = region[start..]
+                        .find(EOM)
+                        .map(|offset| start + offset + EOM.len())
+                        .or_else(|| cx.finished.then_some(region.len()));
+                    return Scan::Calls { calls, end };
+                }
+                return Scan::Text(first);
             }
             _ => return Scan::Text(first),
         };
@@ -486,7 +585,7 @@ fn json_list(s: &str, cx: &Cx<'_>) -> Result<Calls, ()> {
 #[cfg(test)]
 mod tests {
     use super::super::tests::{args, assert_streams_like_parse, parse};
-    use super::super::{parse_tool_calls, ToolCallFormat};
+    use super::super::{ToolCallFormat, parse_tool_calls};
     use crate::types::{FunctionDef, Tool};
 
     const G: ToolCallFormat = ToolCallFormat::Generic;

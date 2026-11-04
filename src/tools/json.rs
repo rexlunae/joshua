@@ -384,8 +384,6 @@ pub(crate) fn call_object<'a>(
                     Ok(_) => out.id = None,
                     Err(_) => return Err(()),
                 }
-            } else if !value.starts_with('"') {
-                return Err(());
             }
         } else if let Some(rank) = arg_keys.iter().position(|k| *k == key) {
             if rank <= args_rank {
@@ -398,6 +396,66 @@ pub(crate) fn call_object<'a>(
         }
         i += len;
     }
+}
+
+/// Recover a call's valid name from an object whose later fields are broken.
+/// Returns the parsed prefix length so callers can distinguish the call from
+/// malformed trailing text.
+pub(crate) fn call_object_name_prefix(
+    s: &str,
+    name_keys: &[&str],
+    arg_keys: &[&str],
+) -> Option<(PartialCall, usize)> {
+    // Prefixes before a complete name are parseable but have no name; after
+    // malformed data they are errors. Searching these three states avoids
+    // re-parsing every byte prefix of a long argument.
+    let mut low = 0;
+    let mut high = s.len();
+    let mut best = None;
+    while low <= high {
+        let mut mid = low + (high - low) / 2;
+        while mid > low && !s.is_char_boundary(mid) {
+            mid -= 1;
+        }
+        match call_object(&s[..mid], name_keys, arg_keys) {
+            Ok(call) if call.name.is_some() => {
+                best = Some((mid, call));
+                low = mid.saturating_add(1);
+                while low <= s.len() && !s.is_char_boundary(low) {
+                    low += 1;
+                }
+            }
+            Ok(_) => {
+                low = mid.saturating_add(1);
+                while low <= s.len() && !s.is_char_boundary(low) {
+                    low += 1;
+                }
+            }
+            Err(()) => {
+                if mid == 0 {
+                    break;
+                }
+                high = mid - 1;
+                while high > 0 && !s.is_char_boundary(high) {
+                    high -= 1;
+                }
+            }
+        }
+    }
+
+    let (candidate_end, call) = best?;
+    let end = call.end.unwrap_or(candidate_end);
+    let name = call.name.clone()?;
+    let args = call.stream_args();
+    Some((
+        PartialCall {
+            id: call.id.clone(),
+            name,
+            args,
+            done: Some(call.final_args()),
+        },
+        end,
+    ))
 }
 
 /// A JSON array of call objects (`[TOOL_CALLS][…]`, `<TOOLCALL>[…]`) as far
@@ -524,25 +582,59 @@ pub(crate) fn raw_args(s: &str, ends: &[&str], finished: bool) -> RawArgs {
         scan => match super::find_first(s, ends) {
             // Not JSON, or never finished: the first end marker closes it.
             Some((at, end)) if scan == Json::Bad || finished => {
-                closed(s[..at].trim(), at + end.len())
+                let raw = if scan == Json::Partial {
+                    partial_json(&s[..at])
+                } else {
+                    s[..at].trim().to_string()
+                };
+                closed(&raw, at + end.len())
             }
             // An unfinished value streams up to an end marker (one inside
             // a string that never closes ends it after all) and its
             // trailing whitespace (a value cut off there ends without it).
             Some((at, _)) => RawArgs {
-                stream: s[..at].trim().to_string(),
+                stream: partial_json(&s[..at]),
                 done: None,
                 end: None,
             },
             None => RawArgs {
                 stream: match scan {
                     Json::Bad => String::new(),
-                    _ => super::before_partial(body, ends).trim_end().to_string(),
+                    Json::Partial => partial_json(super::before_partial(body, ends)),
+                    Json::Done(_) => unreachable!("complete values are handled above"),
                 },
-                done: finished.then(|| body.trim_end().to_string()),
+                done: finished.then(|| match scan {
+                    Json::Partial => partial_json(body),
+                    _ => body.trim_end().to_string(),
+                }),
                 end: None,
             },
         },
+    }
+}
+
+/// Keep spaces that are still inside an unfinished JSON string, but discard
+/// whitespace outside the value so streamed text remains a prefix of JSON.
+pub(crate) fn partial_json(raw: &str) -> String {
+    let mut in_string = false;
+    let mut escaped = false;
+    for byte in raw.bytes() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+        } else if byte == b'"' {
+            in_string = true;
+        }
+    }
+    if in_string {
+        raw.trim_start().to_string()
+    } else {
+        raw.trim().to_string()
     }
 }
 
@@ -598,6 +690,15 @@ mod tests {
     }
 
     #[test]
+    fn raw_args_keeps_spaces_inside_an_unfinished_json_string() {
+        let partial = raw_args(r#"{"text":"hello "#, &["</tool_call>"], false);
+        assert_eq!(partial.stream, r#"{"text":"hello "#);
+
+        let complete = raw_args(r#"{"text":"hello world"}"#, &["</tool_call>"], true);
+        assert!(complete.done.unwrap().starts_with(&partial.stream));
+    }
+
+    #[test]
     fn call_object_rejects_objects_without_a_name() {
         assert!(call_object(r#"{"answer": 42}"#, &["name"], &["arguments"]).is_err());
         assert!(call_object(r#"{"name": 3}"#, &["name"], &["arguments"]).is_err());
@@ -605,6 +706,43 @@ mod tests {
         // Undecided while the name is still arriving.
         let call = call_object(r#"{"name": "lo"#, &["name"], &["arguments"]).unwrap();
         assert!(call.name.is_none());
+    }
+
+    #[test]
+    fn malformed_suffix_recovers_long_argument_without_quadratic_prefix_scans() {
+        let payload = "x".repeat(64 * 1024);
+        let text = format!(r#"{{"name":"f","arguments":{{"payload":"{payload}"}},"broken": x}}"#);
+        let (call, end) = call_object_name_prefix(&text, &["name"], &["arguments"]).unwrap();
+        assert_eq!(call.name, "f");
+        assert!(end < text.len());
+        assert!(call.args.contains(&payload));
+    }
+
+    #[test]
+    fn malformed_argument_prefix_keeps_its_valid_json_prefix() {
+        let (call, _) = call_object_name_prefix(
+            r#"{"name":"f","arguments":{'city': 'Paris'}}"#,
+            &["name"],
+            &["arguments"],
+        )
+        .unwrap();
+        assert_eq!(call.args, "{");
+
+        let (call, _) = call_object_name_prefix(
+            r#"{"name":"f","arguments":{"on": True}}"#,
+            &["name"],
+            &["arguments"],
+        )
+        .unwrap();
+        assert_eq!(call.args, r#"{"on": "#);
+    }
+
+    #[test]
+    fn recovered_call_end_does_not_consume_following_text() {
+        let text = r#"{"name":"f","arguments":{}} trailing"#;
+        let (call, end) = call_object_name_prefix(text, &["name"], &["arguments"]).unwrap();
+        assert_eq!(call.name, "f");
+        assert_eq!(&text[end..], " trailing");
     }
 
     #[test]

@@ -268,6 +268,12 @@ impl ToolCallFormat {
             .map_or("hermes", |&(name, _)| name)
     }
 
+    /// Whether the format's grammar can add a model-supplied id after a
+    /// completed function name, so a streamed `CallStart` must wait.
+    pub(crate) fn may_supply_late_id(self) -> bool {
+        matches!(self, Self::NemotronV2)
+    }
+
     /// Every accepted `--tool-call-parser` name besides `auto`.
     pub fn names() -> impl Iterator<Item = &'static str> {
         NAMES.iter().map(|&(name, _)| name)
@@ -537,7 +543,7 @@ pub(crate) fn section(
                     return Scan::Calls {
                         calls,
                         end: Some(at),
-                    }
+                    };
                 }
             }
         }
@@ -573,7 +579,7 @@ pub(crate) fn section(
                     return Scan::Calls {
                         calls,
                         end: cx.finished.then_some(region.len()),
-                    }
+                    };
                 }
             }
         }

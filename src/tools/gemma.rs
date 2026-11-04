@@ -15,9 +15,9 @@
 
 use serde_json::{Map, Value};
 
-use super::args::{self, tagged_call, ArgsJson};
+use super::args::{self, ArgsJson, tagged_call};
 use super::generic::{close_after, undecided};
-use super::{Cx, Grammar, Marker, Scan, Stop, MAX_NESTING};
+use super::{Cx, Grammar, MAX_NESTING, Marker, Scan, Stop};
 
 const START: &str = "<start_function_call>";
 const END: &str = "<end_function_call>";
@@ -273,7 +273,7 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::super::tests::{args, assert_streams_like_parse, parse};
-    use super::super::{parse_tool_calls, ToolCallFormat};
+    use super::super::{ToolCallFormat, parse_tool_calls};
     use crate::types::{FunctionDef, Tool};
     use serde_json::json;
 
@@ -375,6 +375,15 @@ mod tests {
             streamed.ends_with(r#""text":"Buy milk, then "#),
             "{streamed}"
         );
+
+        let truncated = "<start_function_call>call:note{text:<escape>Buy milk";
+        let (_, parsed) = parse_tool_calls(FG, &tools, truncated);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].arguments, r#"{"text":"Buy milk"}"#);
+        let mut stream = super::super::ToolCallStream::new(FG, Some(&tools));
+        stream.push(truncated);
+        stream.finish();
+        assert_eq!(stream.calls()[0].arguments, parsed[0].arguments);
     }
 
     #[test]

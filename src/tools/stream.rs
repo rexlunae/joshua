@@ -42,10 +42,14 @@ struct Sent {
 pub struct ToolCallStream<'a> {
     /// `None`: the request offered no tools, so all text is prose.
     grammar: Option<&'static dyn Grammar>,
+    format: Option<ToolCallFormat>,
     tools: &'a [Tool],
     text: String,
     /// Bytes of `text` already emitted or consumed.
     pos: usize,
+    /// Whether this is still the beginning of the response, independent of
+    /// buffer compaction.
+    at_start: bool,
     /// Start of the tool-call region being read.
     region: Option<usize>,
     /// Index in `calls` of the open region's first call.
@@ -66,15 +70,20 @@ impl<'a> ToolCallStream<'a> {
     /// A stream for a model emitting `format`.  Without `tools`, markup is
     /// ordinary text and everything passes straight through.
     pub fn new(format: ToolCallFormat, tools: Option<&'a [Tool]>) -> Self {
-        Self::with_grammar(tools.map(|_| format.grammar()), tools.unwrap_or_default())
+        let mut stream =
+            Self::with_grammar(tools.map(|_| format.grammar()), tools.unwrap_or_default());
+        stream.format = tools.map(|_| format);
+        stream
     }
 
     fn with_grammar(grammar: Option<&'static dyn Grammar>, tools: &'a [Tool]) -> Self {
         Self {
             grammar,
+            format: None,
             tools,
             text: String::new(),
             pos: 0,
+            at_start: true,
             region: None,
             region_first: 0,
             broken: None,
@@ -96,6 +105,7 @@ impl<'a> ToolCallStream<'a> {
         self.text.push_str(delta);
         let mut out = Vec::new();
         self.drain(false, &mut out);
+        self.compact();
         out
     }
 
@@ -106,6 +116,7 @@ impl<'a> ToolCallStream<'a> {
             return out;
         }
         self.drain(true, &mut out);
+        self.compact();
         // An output of nothing but whitespace is still the answer.
         let held = std::mem::take(&mut self.held_whitespace);
         if self.calls.is_empty() {
@@ -142,6 +153,7 @@ impl<'a> ToolCallStream<'a> {
                     Found::At(at) => {
                         let text = rest[..at].to_string();
                         self.prose(&text, out);
+                        self.at_start = false;
                         self.pos += at;
                         self.region = Some(self.pos);
                         self.region_first = self.calls.len();
@@ -157,7 +169,7 @@ impl<'a> ToolCallStream<'a> {
                 }
             };
             if let Some(from) = self.broken {
-                match broken_end(grammar, &self.text[start..], from, finished) {
+                match broken_end(grammar, &self.text[start..], from, self.tools, finished) {
                     Some(end) => {
                         self.pos = start + end;
                         self.region = None;
@@ -221,6 +233,24 @@ impl<'a> ToolCallStream<'a> {
         }
     }
 
+    fn compact(&mut self) {
+        let consumed = self.region.unwrap_or(self.pos);
+        if consumed == 0 {
+            return;
+        }
+        if consumed == self.text.len() {
+            self.text = String::new();
+        } else if consumed >= 4096 && consumed >= self.text.len() / 2 {
+            self.text = self.text[consumed..].to_string();
+        } else {
+            self.text.drain(..consumed);
+        }
+        self.pos -= consumed;
+        if let Some(start) = &mut self.region {
+            *start -= consumed;
+        }
+    }
+
     /// The open region's markup broke off `from` bytes in, after a call in
     /// it had begun: the calls sent stand, and the rest of the region is
     /// dropped.
@@ -257,6 +287,7 @@ impl<'a> ToolCallStream<'a> {
             let held = std::mem::take(&mut self.held_whitespace);
             push_text(out, &held);
         }
+        self.at_start = false;
         push_text(out, text);
     }
 
@@ -273,7 +304,18 @@ impl<'a> ToolCallStream<'a> {
                 // the name. Do not emit CallStart with a placeholder id: once
                 // sent, the API cannot replace it with the model's id. Wait
                 // until the ID is complete or the call itself is complete.
-                if call.id.is_none() && call.done.is_none() {
+                let region_has_mistral_ids = self.region.is_some_and(|start| {
+                    self.text[start..]
+                        .trim_start()
+                        .strip_prefix("[TOOL_CALLS]")
+                        .is_some_and(|rest| rest.trim_start().starts_with('['))
+                });
+                let format_can_supply_ids =
+                    self.format.is_some_and(ToolCallFormat::may_supply_late_id);
+                if call.id.is_none()
+                    && call.done.is_none()
+                    && (region_has_mistral_ids || format_can_supply_ids)
+                {
                     return;
                 }
                 self.held_whitespace.clear();
@@ -321,7 +363,7 @@ impl<'a> ToolCallStream<'a> {
     fn find_marker(&self, grammar: &dyn Grammar, rest: &str, finished: bool) -> Found {
         let markers = grammar.markers();
         // A leading marker can only open the output itself.
-        if self.pos == 0 {
+        if self.at_start {
             let body = rest.trim_start();
             let leading = || markers.iter().filter(|m| m.leading);
             if leading().any(|marker| body.starts_with(marker.text)) {
@@ -422,12 +464,48 @@ fn calls_before_break(
 /// Where a region whose markup broke off at `from` ends: after the first
 /// closing string of the marker that opened it, or at the end of the output
 /// once decoding has ended without one.  `None` while it may still arrive.
-fn broken_end(grammar: &dyn Grammar, region: &str, from: usize, finished: bool) -> Option<usize> {
+fn broken_end(
+    grammar: &dyn Grammar,
+    region: &str,
+    from: usize,
+    tools: &[Tool],
+    finished: bool,
+) -> Option<usize> {
     let close = opening(grammar, region).map_or(&[][..], |(marker, _)| marker.close);
-    match super::find_first(&region[from..], close) {
-        Some((at, close)) => Some(from + at + close.len()),
-        None if finished => Some(region.len()),
-        None => None,
+    let close_at =
+        super::find_first(&region[from..], close).map(|(at, marker)| (from + at, marker.len()));
+    let cx = Cx {
+        tools,
+        finished: true,
+    };
+    let next_at = grammar
+        .markers()
+        .iter()
+        .filter(|marker| !marker.close.is_empty())
+        .flat_map(|marker| {
+            region[from..]
+                .match_indices(marker.text)
+                .map(move |(offset, _)| (marker, from + offset))
+        })
+        .filter_map(|(marker, at)| {
+            let previous = region[..at].chars().next_back();
+            if marker.leading
+                && previous.is_some_and(|c| !c.is_whitespace() && !matches!(c, '}' | ';'))
+            {
+                return None;
+            }
+            match grammar.scan(&region[at..], &cx) {
+                Scan::Calls { calls, .. } if !calls.is_empty() => Some(at),
+                _ => None,
+            }
+        })
+        .min();
+    match (next_at, close_at) {
+        (Some(next), Some((close, _))) if next < close => Some(next),
+        (Some(next), None) => Some(next),
+        (_, Some((close, len))) => Some(close + len),
+        (None, None) if finished => Some(region.len()),
+        (None, None) => None,
     }
 }
 
@@ -491,6 +569,22 @@ mod tests {
         let events = collect(&mut stream, &["a ", "<tool_call>", "c"]);
         assert_eq!(prose(&events), "a <tool_call>c");
         assert!(!stream.has_calls());
+    }
+
+    #[test]
+    fn discards_consumed_prose_before_the_next_stream_chunk() {
+        let mut stream = ToolCallStream::new(ToolCallFormat::Generic, Some(&[]));
+        let text = "a".repeat(8192);
+        assert_eq!(stream.push(&text), vec![ToolEvent::Text(text)]);
+        assert!(stream.text.is_empty());
+        assert!(stream.text.capacity() < 8192);
+
+        let events = collect(
+            &mut stream,
+            &[r#"<tool_call>{"name":"f","arguments":{}}</tool_call>"#],
+        );
+        assert_eq!(stream.calls().len(), 1);
+        assert_eq!(prose(&events), "");
     }
 
     #[test]
@@ -594,6 +688,87 @@ mod tests {
     }
 
     #[test]
+    fn mistral_stream_waits_for_a_late_id_but_ignores_split_non_string_ids() {
+        let mut stream = ToolCallStream::new(ToolCallFormat::Generic, Some(&[]));
+        let first = stream.push(r#"[TOOL_CALLS][{"name":"weather","arguments":{"city":"Paris"},"#);
+        assert!(first.is_empty());
+        let last = stream.push(r#""id":"a1b2c3d4e"}]"#);
+        assert_eq!(
+            last,
+            vec![
+                ToolEvent::CallStart {
+                    index: 0,
+                    id: Some("a1b2c3d4e".into()),
+                    name: "weather".into(),
+                },
+                ToolEvent::CallArgs {
+                    index: 0,
+                    delta: r#"{"city":"Paris"}"#.into(),
+                },
+            ]
+        );
+
+        let mut stream = ToolCallStream::new(ToolCallFormat::Generic, Some(&[]));
+        assert!(
+            stream
+                .push(r#"[TOOL_CALLS][{"name":"weather","arguments":{"city":"Paris"},"id":1"#)
+                .is_empty()
+        );
+        let events = stream.push("2}]");
+        assert!(matches!(
+            events.first(),
+            Some(ToolEvent::CallStart { id: None, name, .. }) if name == "weather"
+        ));
+        assert_eq!(stream.calls().len(), 1);
+        assert_eq!(stream.calls()[0].arguments, r#"{"city":"Paris"}"#);
+    }
+
+    #[test]
+    fn mistral_inline_arguments_preserve_spaces_across_chunks() {
+        let mut stream = ToolCallStream::new(ToolCallFormat::Mistral, Some(&[]));
+        let mut streamed = String::new();
+        for piece in [r#"[TOOL_CALLS]write_file[ARGS]{"text":"hello "#, "world\"}"] {
+            for event in stream.push(piece) {
+                if let ToolEvent::CallArgs { delta, .. } = event {
+                    streamed.push_str(&delta);
+                }
+            }
+        }
+        stream.finish();
+        assert_eq!(streamed, stream.calls()[0].arguments);
+        assert_eq!(streamed, r#"{"text":"hello world"}"#);
+    }
+
+    #[test]
+    fn malformed_call_does_not_consume_the_next_call() {
+        for text in [
+            r#"{"name":"f","arguments":{'x':1}}{"name":"g","arguments":{}}"#,
+            r#"<tool_call>{"name":"f","arguments":{'x':1}<tool_call>{"name":"g","arguments":{}}</tool_call>"#,
+        ] {
+            let (_, parsed) = super::super::parse_tool_calls(ToolCallFormat::Generic, &[], text);
+            assert_eq!(parsed.len(), 2, "{text}: {parsed:?}");
+            assert_eq!(parsed[0].name, "f");
+            assert_eq!(parsed[1].name, "g");
+
+            for one_byte_at_a_time in [false, true] {
+                let mut stream = ToolCallStream::new(ToolCallFormat::Generic, Some(&[]));
+                if one_byte_at_a_time {
+                    for ch in text.chars() {
+                        stream.push(&ch.to_string());
+                    }
+                } else {
+                    stream.push(text);
+                }
+                stream.finish();
+                let calls = stream.calls();
+                assert_eq!(calls.len(), 2, "{text}");
+                assert_eq!(calls[0].name, "f");
+                assert_eq!(calls[1].name, "g");
+            }
+        }
+    }
+
+    #[test]
     fn drops_whitespace_before_a_call_but_keeps_it_in_plain_text() {
         let mut stream = ToolCallStream::new(ToolCallFormat::Generic, Some(&[]));
         let events = collect(
@@ -621,16 +796,21 @@ mod tests {
         }
 
         fn scan(&self, region: &str, _: &Cx<'_>) -> Scan {
-            let calls = match region {
-                "<x>f" => vec![PartialCall {
+            let calls = if region == "<x>f" || region.starts_with("<x>f</x>") {
+                vec![PartialCall {
                     name: "f".into(),
                     ..PartialCall::default()
-                }],
-                _ => Vec::new(),
+                }]
+            } else {
+                Vec::new()
             };
             Scan::Calls {
                 calls,
-                end: (region.len() > "<x>f".len()).then_some("<x>".len()),
+                end: if region.starts_with("<x>f</x>") {
+                    Some("<x>f</x>".len())
+                } else {
+                    (region.len() > "<x>f".len()).then_some("<x>".len())
+                },
             }
         }
     }
@@ -645,6 +825,11 @@ mod tests {
         assert_eq!(prose(&events), " after");
         assert_eq!(stream.calls().len(), 1);
         assert_eq!(stream.calls()[0].name, "f");
+
+        let mut stream = ToolCallStream::with_grammar(Some(&FORGETFUL), &[]);
+        let events = collect(&mut stream, &["<x>f", "(broken<x>f</x>"]);
+        assert_eq!(prose(&events), "");
+        assert_eq!(stream.calls().len(), 2);
     }
 
     /// No whitespace-only prose is sent between or after calls; prose
