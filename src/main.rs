@@ -1401,10 +1401,11 @@ async fn main() -> anyhow::Result<()> {
             // the window from what it actually loaded — not from the raw flag,
             // where `--n-ctx 0` would invert `clamp`'s bounds and panic.
             let n_ctx = engine.n_ctx();
-            if n_ctx < 3 {
+            if n_ctx < 2 {
+                // A window needs two tokens: position 0 predicts token 1.
                 anyhow::bail!(
                     "context window of {n_ctx} token(s) is too small to score: a window needs \
-                     at least 2 tokens and one scored pair needs 3"
+                     at least 2 tokens"
                 );
             }
             let n_ctx = n_ctx as usize;
@@ -1413,9 +1414,11 @@ async fn main() -> anyhow::Result<()> {
                 tokens.truncate(limit);
             }
             let window = window.unwrap_or(n_ctx).clamp(2, n_ctx);
-            if tokens.len() < 3 {
+            if tokens.len() < 2 {
+                // One pair is the smallest scoreable corpus; fewer almost always
+                // means the wrong tokenizer produced nothing usable.
                 anyhow::bail!(
-                    "need at least 3 tokens to score (got {}); is the tokenizer the model's own?",
+                    "need at least 2 tokens to score (got {}); is the tokenizer the model's own?",
                     tokens.len()
                 );
             }
