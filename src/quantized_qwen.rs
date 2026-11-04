@@ -756,6 +756,25 @@ impl Attention {
     ) -> Result<Tensor> {
         let _p = prof::Phase::start(&prof::ATT);
         let (b, seq_len, _) = xs.dims3()?;
+        let cached = state.kv.as_ref().map_or(0, |cache| cache.len());
+        if cached < offset {
+            candle_core::bail!(
+                "Qwen attention cache has {cached} positions, before input offset {offset}"
+            );
+        }
+        if cached > offset {
+            if self.qsa.is_some() {
+                candle_core::bail!(
+                    "cannot rewind QSA attention cache from {cached} to {offset} positions"
+                );
+            }
+            tracing::warn!(
+                cached_positions = cached,
+                input_offset = offset,
+                "truncating stale Qwen attention cache before prefill"
+            );
+            crate::attention::truncate_kv(&mut state.kv, offset);
+        }
         let hd = self.head_dim;
         // QSA narrows each query to its selected cells (None: dense).
         let sparse = match &self.qsa {
@@ -2985,6 +3004,29 @@ mod tests {
             assert_eq!((cache.k().dim(1)?, cache.k().dim(3)?), (nkv, hd));
             assert_eq!((cache.v().dim(1)?, cache.v().dim(3)?), (nkv, hd));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn attention_rewind_truncates_stale_cache_before_prefill() -> Result<()> {
+        let dev = Device::Cpu;
+        let h = 8usize;
+        let attn = tiny_attention(&dev, false, false)?;
+        let xs = Tensor::randn(0f32, 1f32, (1, 5, h), &dev)?;
+
+        let mut stale = LayerState::default();
+        let _ = attn.forward(&mut stale, &xs, None, 0, None)?;
+        let mask = crate::moe::causal_mask(2, 3, &dev)?;
+        let got = attn.forward(&mut stale, &xs.narrow(1, 3, 2)?, Some(&mask), 3, None)?;
+
+        let mut rewound = LayerState::default();
+        let _ = attn.forward(&mut rewound, &xs.narrow(1, 0, 3)?, None, 0, None)?;
+        let want = attn.forward(&mut rewound, &xs.narrow(1, 3, 2)?, Some(&mask), 3, None)?;
+
+        assert_eq!(got.dims(), want.dims());
+        let max_delta = (&got - &want)?.abs()?.max_all()?.to_scalar::<f32>()?;
+        assert!(max_delta < 1e-6, "max delta {max_delta}");
+        assert_eq!(stale.kv.as_ref().unwrap().len(), 5);
         Ok(())
     }
 
