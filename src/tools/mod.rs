@@ -796,4 +796,20 @@ pub(crate) mod tests {
         );
         assert_eq!(partial_suffix("x<｜", ["<｜DSML｜invoke"]), "<｜".len());
     }
+
+    #[test]
+    fn json_argument_trailing_spaces_survive_split_string_closers() {
+        for (format, text) in [
+            (
+                ToolCallFormat::Generic,
+                "<tool_call>{\"name\":\"note\",\"arguments\":{\"text\":\"hello   \",\"b\":\" x \"}}</tool_call>",
+            ),
+            (
+                ToolCallFormat::Mistral,
+                "[TOOL_CALLS]note[ARGS]{\"text\":\"hello   \",\"b\":\" x \"}",
+            ),
+        ] {
+            assert_streams_like_parse(format, &[], text);
+        }
+    }
 }

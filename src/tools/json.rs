@@ -242,6 +242,8 @@ fn scan_number(b: &[u8], start: usize) -> Json {
 /// A `{"name": …, "arguments": …}` object as far as it has been generated.
 #[derive(Debug, Default)]
 pub(crate) struct CallObject<'a> {
+    /// An id the model supplied on a JSON-list call, once its string is complete.
+    pub id: Option<String>,
     /// The function name, once its string is complete.
     pub name: Option<String>,
     /// The raw arguments value and whether it is complete.
@@ -282,7 +284,7 @@ impl CallObject<'_> {
     /// decoding has `finished`.
     pub fn partial(&self, finished: bool) -> PartialCall {
         PartialCall {
-            id: None,
+            id: self.id.clone(),
             name: self.name.clone().unwrap_or_default(),
             args: self.stream_args(),
             done: (self.end.is_some() || finished).then(|| self.final_args()),
@@ -370,6 +372,17 @@ pub(crate) fn call_object<'a>(
                 match serde_json::from_str::<Value>(&value[..len]) {
                     Ok(Value::String(name)) => out.name = Some(name),
                     _ => return Err(()),
+                }
+            } else if !value.starts_with('"') {
+                return Err(());
+            }
+        } else if key == "id" {
+            if done {
+                match serde_json::from_str::<Value>(&value[..len]) {
+                    Ok(Value::String(id)) => out.id = Some(id),
+                    // Non-string and null ids are not protocol call IDs.
+                    Ok(_) => out.id = None,
+                    Err(_) => return Err(()),
                 }
             } else if !value.starts_with('"') {
                 return Err(());
@@ -612,5 +625,29 @@ mod tests {
         )
         .unwrap();
         assert_eq!((calls.len(), end), (1, None));
+    }
+
+    #[test]
+    fn call_list_preserves_model_supplied_mistral_ids() {
+        let (calls, end) = call_list(
+            r#"[{"name":"weather","arguments":{"city":"Paris"},"id":"a1b2c3d4e"}]"#,
+            &["name"],
+            &["arguments"],
+        )
+        .unwrap();
+        assert!(end.is_some());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id.as_deref(), Some("a1b2c3d4e"));
+        assert_eq!(calls[0].partial(true).id.as_deref(), Some("a1b2c3d4e"));
+
+        let (calls, end) = call_list(
+            r#"[{"name":"weather","arguments":{},"id":"a1b2c3d4e"}"#,
+            &["name"],
+            &["arguments"],
+        )
+        .unwrap();
+        assert!(end.is_none());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].partial(false).id.as_deref(), Some("a1b2c3d4e"));
     }
 }
