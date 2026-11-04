@@ -1461,6 +1461,17 @@ impl GenSession {
         }
     }
 
+    fn supports_cache_clear(&self) -> bool {
+        match self {
+            Self::Candle(model) => model.supports_kv_clear(),
+            Self::Npu(_) => true,
+        }
+    }
+
+    fn prepare_ppl_window(&mut self, first_window: bool) -> bool {
+        first_window || self.clear_state()
+    }
+
     /// The longest prefix of at most `keep` tokens [`Self::truncate_to`] can
     /// rewind this session to (`0`: none).  `keep` itself for an
     /// attention-only model; the latest prefix checkpoint at or before it
@@ -1592,11 +1603,23 @@ impl GenSession {
     }
 }
 
-/// Select a fresh session rather than requiring a reset hook before a
-/// perplexity window. A fresh model instance is already at an empty context.
-fn needs_fresh_ppl_session(first_window: bool, can_reset: bool) -> bool {
-    !first_window && !can_reset
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PplWindowAction {
+    UseFresh,
+    Reset,
+    Reload,
 }
+
+fn ppl_window_action(first_window: bool, supports_reset: bool) -> PplWindowAction {
+    if first_window {
+        PplWindowAction::UseFresh
+    } else if supports_reset {
+        PplWindowAction::Reset
+    } else {
+        PplWindowAction::Reload
+    }
+}
+
 
 /// Result of a decode loop.
 struct DecodeOutcome {
@@ -3513,29 +3536,43 @@ impl Engine {
             return Err(JoshuaError::InvalidRequest(format!("perplexity window {window} must be in 1..={} (configured context)", self.n_ctx)));
         }
         let device = &self.dense_device;
-        let (mut session, _) = self.acquire_session(&[], false, None)?;
-        let all_positions = session.supports_speculative();
-        let supports_reset = match &session { GenSession::Candle(model) => model.supports_kv_clear(), GenSession::Npu(_) => true };
+        let (session, _) = self.acquire_session(&[], false, None)?;
+        let mut session = Some(session);
+        let all_positions = session.as_ref().expect("initial session").supports_speculative();
+        let supports_reset = session.as_ref().expect("initial session").supports_cache_clear();
         let mut acc = crate::ppl::Accumulator::new();
         let mut outcome: Result<()> = Ok(());
         let mut first_window = true;
+        let mut session_available = true;
         for (start, end) in crate::ppl::windows(tokens.len(), window) {
-            if !first_window && !session.clear_state() {
-                if supports_reset {
-                    outcome = Err(JoshuaError::InvalidRequest("model KV reset failed between perplexity windows".into()));
+            match ppl_window_action(first_window, supports_reset) {
+                PplWindowAction::UseFresh => {}
+                PplWindowAction::Reset if session.as_mut().expect("active session").prepare_ppl_window(false) => {}
+                PplWindowAction::Reset => {
+                    outcome = Err(JoshuaError::InvalidRequest(
+                        "model KV reset failed between perplexity windows".into(),
+                    ));
                     break;
                 }
-                session = match self.load_fresh_model() {
-                    Ok(model) => GenSession::Candle(Box::new(model)),
-                    Err(error) => { outcome = Err(error); break; }
-                };
+                PplWindowAction::Reload => {
+                    // Stock Candle sessions own their full weights. Drop the
+                    // prior instance before loading the next so one-model GPUs
+                    // do not temporarily need room for two copies.
+                    drop(session.take());
+                    session_available = false;
+                    session = match self.load_fresh_model() {
+                        Ok(model) => Some(GenSession::Candle(Box::new(model))),
+                        Err(error) => { outcome = Err(error); break; }
+                    };
+                    session_available = true;
+                }
             }
             first_window = false;
             for slice in crate::ppl::slices(start, end, crate::ppl::SCORE_ROWS_PER_PASS) {
                 let fed = &tokens[slice.from..slice.to];
                 let targets = &tokens[slice.from..slice.target_end];
                 if all_positions {
-                    match session.forward_tokens_all(fed, slice.pos, device) {
+                    match session.as_mut().expect("active session").forward_tokens_all(fed, slice.pos, device) {
                         Ok(rows) => { acc.push_window(targets, &rows); }
                         Err(error) => { outcome = Err(error); break; }
                     }
@@ -3543,7 +3580,7 @@ impl Engine {
                     let mut rows = Vec::with_capacity(fed.len());
                     for (i, tok) in fed.iter().enumerate() {
                         if slice.from + i + 1 >= slice.target_end { break; }
-                        match session.forward_tokens(std::slice::from_ref(tok), slice.pos + i, device) {
+                        match session.as_mut().expect("active session").forward_tokens(std::slice::from_ref(tok), slice.pos + i, device) {
                             Ok(logits) => rows.push(logits),
                             Err(error) => { outcome = Err(error); break; }
                         }
@@ -3554,7 +3591,9 @@ impl Engine {
             }
             if outcome.is_err() { break; }
         }
-        self.release_model(session, Vec::new(), None);
+        if session_available {
+            self.release_model(session.expect("available session"), Vec::new(), None);
+        }
         outcome.map(|_| acc)
     }
 
@@ -8870,11 +8909,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fresh_perplexity_window_never_needs_a_cache_reset() {
-        assert!(!needs_fresh_ppl_session(true, false));
-        assert!(!needs_fresh_ppl_session(true, true));
-        assert!(!needs_fresh_ppl_session(false, true));
-        assert!(needs_fresh_ppl_session(false, false));
+    fn perplexity_window_transition_uses_fresh_first_window_and_reload_when_needed() {
+        assert_eq!(ppl_window_action(true, false), PplWindowAction::UseFresh);
+        assert_eq!(ppl_window_action(true, true), PplWindowAction::UseFresh);
+        assert_eq!(ppl_window_action(false, true), PplWindowAction::Reset);
+        assert_eq!(ppl_window_action(false, false), PplWindowAction::Reload);
     }
 
     #[test]

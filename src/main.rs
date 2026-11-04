@@ -1414,9 +1414,9 @@ async fn main() -> anyhow::Result<()> {
             }
             let window = ppl_window(window, n_ctx);
 
-            if tokens.len() < 3 {
+            if tokens.len() < 2 {
                 anyhow::bail!(
-                    "need at least 3 tokens to score (got {}); is the tokenizer the model's own?",
+                    "need at least 2 tokens to score (got {}); is the tokenizer the model's own?",
                     tokens.len()
                 );
             }
