@@ -1011,6 +1011,8 @@ pub struct Engine {
     /// whose accelerator GEMM is slower than CPU-BLAS).  The dense weights are
     /// laid out on this device and the accelerator is unused for them.
     dense_device: Device,
+    /// Backend used to reconstruct non-resettable model instances for
+    /// independent perplexity windows.
     /// Device the routed-expert pool of a MoE model is built on: `device`,
     /// or the CPU when the experts stay in host RAM (see
     /// [`EngineOptions::expert_placement`]).
@@ -1588,6 +1590,12 @@ impl GenSession {
                 .map_err(JoshuaError::Inference),
         }
     }
+}
+
+/// Select a fresh session rather than requiring a reset hook before a
+/// perplexity window. A fresh model instance is already at an empty context.
+fn needs_fresh_ppl_session(first_window: bool, can_reset: bool) -> bool {
+    !first_window && !can_reset
 }
 
 /// Result of a decode loop.
@@ -3504,24 +3512,48 @@ impl Engine {
     /// that can emit every position's logits in one pass do so; the rest fall
     /// back to one forward per token, which is correct but far slower.
     pub fn perplexity(&self, tokens: &[u32], window: usize) -> Result<crate::ppl::Accumulator> {
-        let device = self.device();
+        if window == 0 || window > self.n_ctx as usize {
+            return Err(JoshuaError::InvalidRequest(format!(
+                "perplexity window {window} must be in 1..={} (configured context)", self.n_ctx
+            )));
+        }
+        let device = self.dense_device();
         // A scoring run has no request, so it belongs to no affinity scope:
         // take/return the session in the unscoped pool namespace.
         let (mut session, _reused) = self.acquire_session(&[], false, None)?;
         let all_positions = session.supports_speculative();
+        let supports_reset = match &session {
+            GenSession::Candle(model) => model.supports_kv_clear(),
+            GenSession::Npu(_) => true,
+        };
         let mut acc = crate::ppl::Accumulator::new();
         let mut outcome: Result<()> = Ok(());
+        let mut first_window = true;
         for (start, end) in crate::ppl::windows(tokens.len(), window) {
             // `clear_state` is the documented reset hook; a session that cannot
             // reset would carry one window's context into the next and quietly
             // flatter the score, so refuse rather than measure the wrong thing.
-            if !session.clear_state() {
-                outcome = Err(JoshuaError::InvalidRequest(
-                    "this model has no KV-cache reset, so windows cannot be scored independently"
-                        .to_string(),
-                ));
-                break;
+            if !first_window && supports_reset && !session.clear_state() {
+                // Stock Candle loaders without a reset hook start with an
+                // empty cache. Recreate those sessions between windows; do
+                // not reject a scoring run before its first fresh window.
+                session = match self.load_fresh_model() {
+                    Ok(model) => GenSession::Candle(Box::new(model)),
+                    Err(error) => {
+                        outcome = Err(error);
+                        break;
+                    }
+                };
+            } else if needs_fresh_ppl_session(first_window, supports_reset) {
+                session = match self.load_fresh_model() {
+                    Ok(model) => GenSession::Candle(Box::new(model)),
+                    Err(error) => {
+                        outcome = Err(error);
+                        break;
+                    }
+                };
             }
+            first_window = false;
             let chunk = &tokens[start..end];
             if all_positions {
                 match session.forward_tokens_all(chunk, 0, device) {
@@ -6466,6 +6498,34 @@ impl Engine {
         }
     }
 
+    /// Load an independent instance from the mmap, honoring the engine's
+    /// resolved backend and dense/expert placement. Used for operations that
+    /// need a fresh KV cache on architectures without a reset hook.
+    fn load_fresh_model(&self) -> Result<QuantizedModel> {
+        let mut cursor = Cursor::new(&self.mmap[..]);
+        let gguf = read_gguf_header(&self.mmap)
+            .map_err(|e| JoshuaError::ModelLoad(format!("GGUF read failed: {e}")))?;
+        let load = || QuantizedModel::from_gguf_mmap_placed_with_ssd(
+            gguf,
+            &mut cursor,
+            &self.dense_device,
+            &self.expert_device,
+            Some(Arc::clone(&self.mmap)),
+            self.model_file.clone(),
+            self.n_ctx as usize,
+            self.device_expert_cache,
+            self.engram_tier,
+            self.ssd_expert_cache,
+        );
+        let mut model = if self.mtp > 0 { crate::quantized_qwen::with_mtp_block(load) } else { load() }
+            .map_err(|e| JoshuaError::ModelLoad(format!("model init failed: {e}")))?;
+        model.set_pin_hot_experts(if self.expert_cache_auto { self.auto_expert_budget(&model) } else { self.pin_hot_experts });
+        model.set_prefix_checkpoints(self.prefix_checkpoints);
+        model.set_speculative_expert_prefetch(self.predict_experts);
+        if self.mtp > 0 { let _ = model.set_mtp(true); }
+        Ok(model)
+    }
+
     /// Phase-5 automatic sizing: pick the hot-expert budget from available
     /// memory, the per-expert byte size (model file / residency capacity) and
     /// a fixed headroom for the KV cache and the OS.
@@ -8843,6 +8903,14 @@ fn argmax(logits: &[f32]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fresh_perplexity_window_never_needs_a_cache_reset() {
+        assert!(!needs_fresh_ppl_session(true, false));
+        assert!(!needs_fresh_ppl_session(true, true));
+        assert!(!needs_fresh_ppl_session(false, true));
+        assert!(needs_fresh_ppl_session(false, false));
+    }
 
     #[test]
     fn non_finite_logits_are_an_error_not_last_token() {

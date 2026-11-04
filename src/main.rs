@@ -1401,6 +1401,7 @@ async fn main() -> anyhow::Result<()> {
                 tokens.truncate(limit);
             }
             let window = window.unwrap_or(n_ctx as usize);
+            validate_ppl_window(window, n_ctx)?;
             if tokens.len() < 3 {
                 anyhow::bail!(
                     "need at least 3 tokens to score (got {}); is the tokenizer the model's own?",
@@ -1808,6 +1809,14 @@ fn cache_plan_for(file: Option<u64>, ram: Option<u64>) -> (bool, bool) {
     }
 }
 
+fn validate_ppl_window(window: usize, n_ctx: u32) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        window <= n_ctx as usize,
+        "--window ({window}) exceeds configured context (--n-ctx {n_ctx})"
+    );
+    Ok(())
+}
+
 /// Auto decisions for the page-cache options, from the model size vs RAM:
 /// `(pin_hot_weights, prefetch_whole_model)`.  Logged so operators see which
 /// way the auto-resolution went and why.
@@ -1862,6 +1871,15 @@ fn npu_backend(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ppl_window_cannot_exceed_context() {
+        assert!(validate_ppl_window(512, 512).is_ok());
+        assert!(validate_ppl_window(128, 512).is_ok());
+        let error = validate_ppl_window(1024, 512).unwrap_err().to_string();
+        assert!(error.contains("window"));
+        assert!(error.contains("context"));
+    }
 
     #[test]
     fn chat_template_flag_reads_a_file_or_takes_jinja_text() {
