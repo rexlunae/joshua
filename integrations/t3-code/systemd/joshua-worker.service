@@ -1,0 +1,16 @@
+[Unit]
+Description=Joshua distributed worker node (model-less, stage-fed by a controller)
+After=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/joshua/cluster.env
+Environment=JOSHUA_API_KEY=
+ExecStart=%h/.cargo/bin/joshua worker --listen 0.0.0.0:7070
+Restart=always
+RestartSec=3
+StandardOutput=append:%h/.joshua/logs/worker-7070.log
+StandardError=append:%h/.joshua/logs/worker-7070.log
+
+[Install]
+WantedBy=default.target
