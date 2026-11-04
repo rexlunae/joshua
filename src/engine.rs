@@ -3757,11 +3757,12 @@ impl Engine {
         self.chat_template.is_some()
     }
 
-    /// The model-level tool-call format: the operator's `--tool-call-parser`,
-    /// else the family its embedded chat template teaches, else its
-    /// architecture's, else the generic Hermes / Qwen / Mistral reader (see
-    /// [`crate::tools::ToolCallFormat::select`]). Request handling selects
-    /// again from the template that renders the actual request.
+    /// The default model-level tool-call format: the operator's
+    /// `--tool-call-parser`, else the family its embedded chat template
+    /// teaches, else its architecture's, else the generic Hermes / Qwen /
+    /// Mistral reader (see [`crate::tools::ToolCallFormat::select`]).
+    /// For a particular request, use [`Engine::tool_call_format_for_request`]
+    /// because an unusable template falls back to ChatML.
     pub fn tool_call_format(&self) -> crate::tools::ToolCallFormat {
         tool_call_format(
             self.tool_call_parser,
@@ -3771,9 +3772,10 @@ impl Engine {
     }
 
     /// Select the parser from the template that renders these exact messages
-    /// and request variables. The render is repeated when generation starts;
-    /// this preflight keeps streamed call IDs stable from the first chunk.
-    pub(crate) fn tool_call_format_for_request(
+    /// and request variables. Use this with [`Engine::complete_chat`] when
+    /// parsing its result; an unusable template falls back to the generic
+    /// Hermes format. The render is repeated when generation starts.
+    pub fn tool_call_format_for_request(
         &self,
         messages: &[ChatMessage],
         tools: Option<&[Tool]>,
@@ -3782,7 +3784,8 @@ impl Engine {
         if self.tool_call_parser.is_some() {
             return Ok(self.tool_call_format());
         }
-        let rendered = self.render_chat(messages, tools, options)?;
+        let (messages, tools) = self.stable_chat(messages, tools, false);
+        let rendered = self.render_chat(&messages, tools.as_deref(), options)?;
         Ok(crate::tools::ToolCallFormat::select(
             self.tool_call_parser,
             rendered.tool_call_format,
@@ -3933,8 +3936,8 @@ impl Engine {
     ///
     /// Tools are exposed to the chat template as the standard `tools`
     /// variable so the model is instructed how to emit calls; parse the
-    /// generated text with [`crate::tools::parse_tool_calls`] in
-    /// [`Engine::tool_call_format`] to extract them.
+    /// generated text with [`crate::tools::parse_tool_calls`] using
+    /// [`Engine::tool_call_format_for_request`] to extract them.
     pub fn complete_chat(
         &self,
         messages: &[ChatMessage],

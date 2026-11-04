@@ -300,10 +300,8 @@ impl<'a> ToolCallStream<'a> {
                     // Later calls cannot start before this one.
                     return;
                 }
-                // JSON call objects can place their model-supplied id after
-                // the name. Do not emit CallStart with a placeholder id: once
-                // sent, the API cannot replace it with the model's id. Wait
-                // until the ID is complete or the call itself is complete.
+                // Formats that may add a late model id and Mistral's JSON
+                // list cannot start until that id is known.
                 let region_has_mistral_ids = self.region.is_some_and(|start| {
                     self.text[start..]
                         .trim_start()
@@ -311,8 +309,7 @@ impl<'a> ToolCallStream<'a> {
                         .is_some_and(|rest| rest.trim_start().starts_with('['))
                 });
                 let format_can_supply_ids = self.format.is_some_and(|format| {
-                    self.region
-                        .is_some_and(|start| format.may_supply_late_id(&self.text[start..]))
+                    format.may_supply_late_id()
                 });
                 if call.id.is_none()
                     && call.done.is_none()
@@ -335,6 +332,11 @@ impl<'a> ToolCallStream<'a> {
                 });
             }
             let sent = &mut self.calls[index];
+            // Generic JSON can put an optional id after arguments have
+            // started streaming; retain it in the final parsed call.
+            if sent.id.is_none() && call.id.is_some() {
+                sent.id = call.id.clone();
+            }
             // Once the call is complete, final arguments that extend what
             // was streamed (arguments only readable whole: a string-encoded
             // object, text that is not JSON) are streamed too.
@@ -726,29 +728,45 @@ mod tests {
     }
 
     #[test]
-    fn json_call_stream_waits_for_a_late_model_id() {
-        for (format, first, last, expected) in [
-            (
-                ToolCallFormat::Generic,
-                r#"<tool_call>{"name":"weather","arguments":{"city":"Paris"},"#,
-                r#""id":"model-123"}</tool_call>"#,
-                "model-123",
-            ),
-            (
-                ToolCallFormat::LlamaJson,
-                r#"{"name":"weather","parameters":{"city":"Paris"},"#,
-                r#""id":"model-456"}"#,
-                "model-456",
-            ),
-        ] {
-            let mut stream = ToolCallStream::new(format, Some(&[]));
-            assert!(stream.push(first).is_empty());
-            assert!(stream.push(last).iter().any(|event| matches!(
+    fn generic_json_streams_arguments_before_a_late_optional_id() {
+        let mut stream = ToolCallStream::new(ToolCallFormat::Generic, Some(&[]));
+        let first = stream.push(
+            r#"<tool_call>{"name":"weather","arguments":{"city":"Pa"#,
+        );
+        assert!(first.iter().any(|event| matches!(
+            event,
+            ToolEvent::CallStart {
+                id: None,
+                name,
+                ..
+            } if name == "weather"
+        )));
+        assert!(first.iter().any(|event| matches!(
+            event,
+            ToolEvent::CallArgs { delta, .. } if delta == r#"{"city":"Pa"#
+        )));
+
+        stream.push(r#"ris"},"id":"model-123"}</tool_call>"#);
+        assert_eq!(stream.calls()[0].id.as_deref(), Some("model-123"));
+        assert_eq!(stream.calls()[0].arguments, r#"{"city":"Paris"}"#);
+    }
+
+    #[test]
+    fn llama_json_waits_for_a_late_model_id() {
+        let mut stream = ToolCallStream::new(ToolCallFormat::LlamaJson, Some(&[]));
+        assert!(
+            stream
+                .push(r#"{"name":"weather","parameters":{"city":"Paris"},"#)
+                .is_empty()
+        );
+        assert!(stream
+            .push(r#""id":"model-456"}"#)
+            .iter()
+            .any(|event| matches!(
                 event,
-                ToolEvent::CallStart { id: Some(id), .. } if id == expected
+                ToolEvent::CallStart { id: Some(id), .. } if id == "model-456"
             )));
-            assert_eq!(stream.calls()[0].id.as_deref(), Some(expected));
-        }
+        assert_eq!(stream.calls()[0].id.as_deref(), Some("model-456"));
     }
 
     #[test]

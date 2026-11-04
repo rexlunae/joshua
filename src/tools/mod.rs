@@ -268,19 +268,11 @@ impl ToolCallFormat {
             .map_or("hermes", |&(name, _)| name)
     }
 
-    /// Whether the format's grammar can add a model-supplied id after a
-    /// completed function name, so a streamed `CallStart` must wait.
-    pub(crate) fn may_supply_late_id(self, region: &str) -> bool {
+    /// Whether this format requires resolving a model ID before streaming
+    /// arguments.
+    pub(crate) fn may_supply_late_id(self) -> bool {
         match self {
-            Self::Generic => {
-                let region = region.trim_start();
-                let body = region
-                    .strip_prefix("<tool_call>")
-                    .unwrap_or(region)
-                    .trim_start();
-                body.starts_with('{')
-            }
-            Self::LlamaJson | Self::NemotronV2 | Self::Functools | Self::DeepSeekV3 => true,
+            Self::LlamaJson | Self::NemotronV2 | Self::Functools => true,
             _ => false,
         }
     }
@@ -614,6 +606,15 @@ mod corruption_tests;
 pub(crate) mod tests {
     use super::*;
     use serde_json::Value;
+
+    #[test]
+    fn late_id_waiting_excludes_generic_and_deepseek_v3() {
+        assert!(ToolCallFormat::LlamaJson.may_supply_late_id());
+        assert!(ToolCallFormat::NemotronV2.may_supply_late_id());
+        assert!(ToolCallFormat::Functools.may_supply_late_id());
+        assert!(!ToolCallFormat::Generic.may_supply_late_id());
+        assert!(!ToolCallFormat::DeepSeekV3.may_supply_late_id());
+    }
 
     /// Parse `text` in `format` with no tool schemas.
     pub(crate) fn parse(format: ToolCallFormat, text: &str) -> (String, Vec<ParsedToolCall>) {
