@@ -1396,12 +1396,24 @@ async fn main() -> anyhow::Result<()> {
             };
             let opts = EngineOptions::with_n_ctx(n_ctx).backend(device.into());
             let engine = Engine::with_options(&model, opts)?;
+            // The engine resolves 0 to its default context, so bound and default
+            // the window from what it actually loaded — not from the raw flag,
+            // where `--n-ctx 0` would invert `clamp`'s bounds and panic.
+            let n_ctx = engine.n_ctx();
+            if n_ctx < 2 {
+                // A window needs two tokens: position 0 predicts token 1.
+                anyhow::bail!(
+                    "context window of {n_ctx} token(s) is too small to score: a window needs \
+                     at least 2 tokens"
+                );
+            }
+            let n_ctx = n_ctx as usize;
             let mut tokens = engine.tokenize(&text, bos)?;
             if limit > 0 && tokens.len() > limit {
                 tokens.truncate(limit);
             }
-            let window = window.unwrap_or(n_ctx as usize);
-            validate_ppl_window(window, n_ctx)?;
+            let window = ppl_window(window, n_ctx);
+
             if tokens.len() < 3 {
                 anyhow::bail!(
                     "need at least 3 tokens to score (got {}); is the tokenizer the model's own?",
@@ -1809,12 +1821,8 @@ fn cache_plan_for(file: Option<u64>, ram: Option<u64>) -> (bool, bool) {
     }
 }
 
-fn validate_ppl_window(window: usize, n_ctx: u32) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        window <= n_ctx as usize,
-        "--window ({window}) exceeds configured context (--n-ctx {n_ctx})"
-    );
-    Ok(())
+fn ppl_window(window: Option<usize>, n_ctx: usize) -> usize {
+    window.unwrap_or(n_ctx).clamp(2, n_ctx.max(2))
 }
 
 /// Auto decisions for the page-cache options, from the model size vs RAM:
@@ -1873,12 +1881,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ppl_window_cannot_exceed_context() {
-        assert!(validate_ppl_window(512, 512).is_ok());
-        assert!(validate_ppl_window(128, 512).is_ok());
-        let error = validate_ppl_window(1024, 512).unwrap_err().to_string();
-        assert!(error.contains("window"));
-        assert!(error.contains("context"));
+    fn ppl_window_is_clamped_to_context() {
+        assert_eq!(ppl_window(Some(512), 512), 512);
+        assert_eq!(ppl_window(Some(128), 512), 128);
+        assert_eq!(ppl_window(Some(1024), 512), 512);
+        assert_eq!(ppl_window(None, 512), 512);
     }
 
     #[test]

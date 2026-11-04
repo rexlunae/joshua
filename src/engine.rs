@@ -3507,87 +3507,52 @@ impl Engine {
     /// cache, so it is scored with exactly the context it declares — that is
     /// what makes the number comparable across checkpoints, and to llama.cpp.
     ///
-    /// The session comes from the warm-model pool and is returned to it, so
-    /// scoring a corpus does not reload the model per window. Architectures
-    /// that can emit every position's logits in one pass do so; the rest fall
-    /// back to one forward per token, which is correct but far slower.
+    /// Score in bounded slices with context continuity inside each window.
     pub fn perplexity(&self, tokens: &[u32], window: usize) -> Result<crate::ppl::Accumulator> {
         if window == 0 || window > self.n_ctx as usize {
-            return Err(JoshuaError::InvalidRequest(format!(
-                "perplexity window {window} must be in 1..={} (configured context)", self.n_ctx
-            )));
+            return Err(JoshuaError::InvalidRequest(format!("perplexity window {window} must be in 1..={} (configured context)", self.n_ctx)));
         }
-        let device = self.dense_device();
-        // A scoring run has no request, so it belongs to no affinity scope:
-        // take/return the session in the unscoped pool namespace.
-        let (mut session, _reused) = self.acquire_session(&[], false, None)?;
+        let device = &self.dense_device;
+        let (mut session, _) = self.acquire_session(&[], false, None)?;
         let all_positions = session.supports_speculative();
-        let supports_reset = match &session {
-            GenSession::Candle(model) => model.supports_kv_clear(),
-            GenSession::Npu(_) => true,
-        };
+        let supports_reset = match &session { GenSession::Candle(model) => model.supports_kv_clear(), GenSession::Npu(_) => true };
         let mut acc = crate::ppl::Accumulator::new();
         let mut outcome: Result<()> = Ok(());
         let mut first_window = true;
         for (start, end) in crate::ppl::windows(tokens.len(), window) {
-            // `clear_state` is the documented reset hook; a session that cannot
-            // reset would carry one window's context into the next and quietly
-            // flatter the score, so refuse rather than measure the wrong thing.
-            if !first_window && supports_reset && !session.clear_state() {
-                // Stock Candle loaders without a reset hook start with an
-                // empty cache. Recreate those sessions between windows; do
-                // not reject a scoring run before its first fresh window.
+            if !first_window && !session.clear_state() {
+                if supports_reset {
+                    outcome = Err(JoshuaError::InvalidRequest("model KV reset failed between perplexity windows".into()));
+                    break;
+                }
                 session = match self.load_fresh_model() {
                     Ok(model) => GenSession::Candle(Box::new(model)),
-                    Err(error) => {
-                        outcome = Err(error);
-                        break;
-                    }
-                };
-            } else if needs_fresh_ppl_session(first_window, supports_reset) {
-                session = match self.load_fresh_model() {
-                    Ok(model) => GenSession::Candle(Box::new(model)),
-                    Err(error) => {
-                        outcome = Err(error);
-                        break;
-                    }
+                    Err(error) => { outcome = Err(error); break; }
                 };
             }
             first_window = false;
-            let chunk = &tokens[start..end];
-            if all_positions {
-                match session.forward_tokens_all(chunk, 0, device) {
-                    Ok(logits) => {
-                        acc.push_window(chunk, &logits);
+            for slice in crate::ppl::slices(start, end, crate::ppl::SCORE_ROWS_PER_PASS) {
+                let fed = &tokens[slice.from..slice.to];
+                let targets = &tokens[slice.from..slice.target_end];
+                if all_positions {
+                    match session.forward_tokens_all(fed, slice.pos, device) {
+                        Ok(rows) => { acc.push_window(targets, &rows); }
+                        Err(error) => { outcome = Err(error); break; }
                     }
-                    Err(e) => {
-                        outcome = Err(e);
-                        break;
-                    }
-                }
-            } else {
-                // One forward per token: feed token `i`, score token `i + 1`.
-                let mut rows: Vec<Vec<f32>> = Vec::with_capacity(chunk.len());
-                let mut failed = None;
-                for (i, tok) in chunk.iter().enumerate().take(chunk.len().saturating_sub(1)) {
-                    match session.forward_tokens(std::slice::from_ref(tok), i, device) {
-                        Ok(logits) => rows.push(logits),
-                        Err(e) => {
-                            failed = Some(e);
-                            break;
+                } else {
+                    let mut rows = Vec::with_capacity(fed.len());
+                    for (i, tok) in fed.iter().enumerate() {
+                        if slice.from + i + 1 >= slice.target_end { break; }
+                        match session.forward_tokens(std::slice::from_ref(tok), slice.pos + i, device) {
+                            Ok(logits) => rows.push(logits),
+                            Err(error) => { outcome = Err(error); break; }
                         }
                     }
+                    if outcome.is_ok() { acc.push_window(targets, &rows); }
                 }
-                match failed {
-                    Some(e) => {
-                        outcome = Err(e);
-                        break;
-                    }
-                    None => {
-                        acc.push_window(chunk, &rows);
-                    }
-                }
+                if outcome.is_err() { break; }
             }
+            if outcome.is_err() { break; }
         }
         self.release_model(session, Vec::new(), None);
         outcome.map(|_| acc)
