@@ -1620,6 +1620,16 @@ fn ppl_window_action(first_window: bool, supports_reset: bool) -> PplWindowActio
     }
 }
 
+fn prepare_ppl_window(session: &mut GenSession, first_window: bool) -> PplWindowAction {
+    let action = ppl_window_action(first_window, session.supports_cache_clear());
+    match action {
+        PplWindowAction::UseFresh => PplWindowAction::UseFresh,
+        PplWindowAction::Reset if session.prepare_ppl_window(false) => PplWindowAction::Reset,
+        PplWindowAction::Reset => PplWindowAction::Reload,
+        PplWindowAction::Reload => PplWindowAction::Reload,
+    }
+}
+
 
 /// Result of a decode loop.
 struct DecodeOutcome {
@@ -3539,21 +3549,14 @@ impl Engine {
         let (session, _) = self.acquire_session(&[], false, None)?;
         let mut session = Some(session);
         let all_positions = session.as_ref().expect("initial session").supports_speculative();
-        let supports_reset = session.as_ref().expect("initial session").supports_cache_clear();
         let mut acc = crate::ppl::Accumulator::new();
         let mut outcome: Result<()> = Ok(());
         let mut first_window = true;
         let mut session_available = true;
         for (start, end) in crate::ppl::windows(tokens.len(), window) {
-            match ppl_window_action(first_window, supports_reset) {
+            match prepare_ppl_window(session.as_mut().expect("active session"), first_window) {
                 PplWindowAction::UseFresh => {}
-                PplWindowAction::Reset if session.as_mut().expect("active session").prepare_ppl_window(false) => {}
-                PplWindowAction::Reset => {
-                    outcome = Err(JoshuaError::InvalidRequest(
-                        "model KV reset failed between perplexity windows".into(),
-                    ));
-                    break;
-                }
+                PplWindowAction::Reset => {}
                 PplWindowAction::Reload => {
                     // Stock Candle sessions own their full weights. Drop the
                     // prior instance before loading the next so one-model GPUs
