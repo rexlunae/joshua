@@ -20,17 +20,23 @@ cp joshua_acp.py joshua-control ~/.t3/joshua/
 chmod +x ~/.t3/joshua/joshua_acp.py ~/.t3/joshua/joshua-control
 joshua-control hosts                 # this machine + the ssh device hosts in T3's settings
 joshua-control start --host <host> --model <path.gguf> --model-dir ~/models --port 18080
-joshua-control install --host <host> --port 18080     # agent + provider instance in T3's settings
+joshua-control install --host <host> --port 18080 --model-dir ~/models
 ```
 
-Reconnect the device in T3 (or restart its server) after `install`.
+Pass the same `--model-dir` used by `joshua-control start`; catalog discovery is restricted to that
+directory, matching the server's loadable paths. Reconnect the device in T3 (or restart its server)
+after `install`.
+
+Use `--api-key` with `start` or `cluster up` to protect the controller API. The key is stored in a
+mode-600 environment file rather than the server's process arguments; pass it to `status`, `models`,
+`load`, `unload`, or `cluster status` when querying that server.
 
 ## Model picker
 
 The agent advertises every loadable GGUF on the host, not only what is loaded:
 
-- scans `~/models`, `~/llama.cpp/models`, `~/.lmstudio/models`, `~/nemo` and `~/joshua-decode-*`
-  (override with `--catalog DIR`, repeatable)
+- scans the default model directories (including current `~/joshua-decode-*` directories), but only
+  paths inside the configured server `--model-dir`; `--catalog DIR` can add a narrower root inside it
 - offers a file when it has a sibling `tokenizer.json` and a real `GGUF` magic (truncated downloads
   and HTML error pages are skipped)
 - sharded models (`…-00001-of-00003.gguf`) appear once, pointing at the first shard
@@ -61,11 +67,18 @@ Joshua's distributed build splits a model into stages: **workers are model-less*
 streams each stage's weights to them.
 
 ```bash
+# Copy this mode-600 file to each worker and controller; do not put the key in command arguments.
+mkdir -p ~/.config/joshua
+(umask 077; openssl rand -hex 32 | sed 's/^/export JOSHUA_CLUSTER_KEY=/' > ~/.config/joshua/cluster.env)
+chmod 600 ~/.config/joshua/cluster.env
+
 # one worker node per host (raw stage protocol on 7070, no HTTP, no model)
-env JOSHUA_CLUSTER_KEY=<64 hex> joshua worker --listen 0.0.0.0:7070
+. ~/.config/joshua/cluster.env && joshua worker --listen 0.0.0.0:7070
 
 # controller: an ordinary serve that places the model on those nodes
-env JOSHUA_CLUSTER_KEY=<64 hex> joshua serve --model ~/models/Qwen3-8B-Q4_K_M.gguf   --model-dir ~/models --worker 100.97.218.93:7070,100.75.187.112:7070   --addr 127.0.0.1:18085 --n-ctx 8192
+. ~/.config/joshua/cluster.env && joshua serve --model ~/models/Qwen3-8B-Q4_K_M.gguf \
+  --model-dir ~/models --worker 100.97.218.93:7070,100.75.187.112:7070 \
+  --addr 127.0.0.1:18085 --n-ctx 8192
 ```
 
 Both sides need the same `JOSHUA_CLUSTER_KEY`, the build must include `distributed`, and `--worker`
@@ -124,6 +137,8 @@ max output tokens, temperature, top-p, top-k, min-p. `default` omits the field. 
   (`<tool_call>{"name": …}}}</tool_call>`). The agent parses `<tool_call>`, `<tool_code>` and
   `<|call|>` blocks tolerantly, repairs runaway braces and code fences, executes the call and keeps
   the marker out of the transcript.
-- Thinking spans (` thinking…</think>`) are stripped from the answer; upstream sends them as
-  `reasoning_content` instead.
+- Explicit `<think>…</think>` spans are stripped; separate upstream `reasoning_content` is ignored.
+  Ordinary prose containing words such as “thinking” is preserved.
+- `session/cancel` is handled while a completion or command is running; it closes the active request
+  and terminates the command process group.
 - The agent auto-approves its tools, matching a T3 "Full access" thread.
