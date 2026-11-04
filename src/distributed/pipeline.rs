@@ -42,6 +42,7 @@ const SLICE_CHUNK: usize = 1024 * 1024;
 pub struct Limits {
     pub context: usize,
     pub chunk: usize,
+    /// Maximum concurrent sessions. Each reserves KV for the full context.
     pub sessions: usize,
     pub queue_depth: usize,
     pub batch: usize,
@@ -54,7 +55,7 @@ impl Default for Limits {
         Self {
             context: 4096,
             chunk: 128,
-            sessions: 8,
+            sessions: 1,
             queue_depth: 2,
             batch: 8,
             timeout_ms: 30_000,
@@ -1839,6 +1840,11 @@ impl AbortHandle {
 #[cfg(test)]
 mod tests {
     use super::{matrix_bytes, model_header};
+
+    #[test]
+    fn default_session_limit_bounds_full_context_kv_reservation() {
+        assert_eq!(super::Limits::default().sessions, 1);
+    }
 
     /// A qwen3 GGUF holding one 8-float F32 tensor, its data cut to `data` bytes.
     fn qwen3_gguf(data: usize) -> Vec<u8> {
