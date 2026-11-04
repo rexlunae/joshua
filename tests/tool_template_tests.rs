@@ -11,7 +11,7 @@ mod common;
 
 use joshua::template::ChatTemplate;
 use joshua::tools::{parse_tool_calls, ToolCallFormat};
-use joshua::types::{FunctionDef, Tool};
+use joshua::types::{FunctionDef, GenerationOptions, Tool};
 use joshua::{ChatMessage, Engine, EngineOptions};
 use serde_json::{json, Value};
 
@@ -452,7 +452,17 @@ fn engine_tool_call_format_follows_template_and_override() {
         "{{ undefined_function() }}{# <arg_key>key</arg_key> #}",
     );
     let engine = Engine::with_n_ctx(&dir, 64).unwrap();
-    assert_eq!(engine.tool_call_format(), ToolCallFormat::Generic);
+    assert_eq!(engine.tool_call_format(), ToolCallFormat::Glm45);
+    assert_eq!(
+        engine
+            .tool_call_format_for_request(
+                &[ChatMessage::text("user", "weather?")],
+                Some(&[weather_tool()]),
+                &GenerationOptions::default(),
+            )
+            .unwrap(),
+        ToolCallFormat::Generic
+    );
     drop(engine);
     std::fs::remove_dir_all(&dir).ok();
 }
