@@ -68,6 +68,8 @@ class CatalogTests(unittest.TestCase):
             parent = Path(temp) / "models"
             root = parent / "project"
             root.mkdir(parents=True)
+            (parent / "sibling.gguf").write_bytes(b"GGUF" + b"\0" * 24)
+            (parent / "tokenizer.json").write_text("{}")
             (root / "inside.gguf").write_bytes(b"GGUF" + b"\0" * 24)
             (root / "tokenizer.json").write_text("{}")
 
@@ -77,6 +79,22 @@ class CatalogTests(unittest.TestCase):
             )
 
             self.assertEqual(set(agent.catalog()), {"inside"})
+
+    def test_unrelated_explicit_catalog_does_not_widen_to_model_dir(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "models"
+            unrelated = Path(temp) / "other"
+            root.mkdir()
+            unrelated.mkdir()
+            (root / "private.gguf").write_bytes(b"GGUF" + b"\0" * 24)
+            (root / "tokenizer.json").write_text("{}")
+
+            agent = acp.Agent(
+                "http://127.0.0.1:8080", None, None,
+                catalog_roots=[str(unrelated)], model_dir=str(root),
+            )
+
+            self.assertEqual(agent.catalog(), {})
 
 
 class CancellationTests(unittest.TestCase):

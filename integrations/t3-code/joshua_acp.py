@@ -343,11 +343,14 @@ class Agent:
         self.model_dir = Path(os.path.expanduser(model_dir)).resolve() if model_dir else None
         self.roots = []
         if self.model_dir:
-            for root in (catalog_roots or default_roots()):
+            roots = catalog_roots if catalog_roots is not None else default_roots()
+            for root in roots:
                 resolved = Path(os.path.expanduser(root)).resolve()
                 if resolved.is_relative_to(self.model_dir):
                     self.roots.append(resolved)
-            if not self.roots:
+                elif self.model_dir.is_relative_to(resolved):
+                    self.roots.append(self.model_dir)
+            if not self.roots and catalog_roots is None:
                 self.roots.append(self.model_dir)
 
     @staticmethod
