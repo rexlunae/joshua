@@ -310,8 +310,10 @@ impl<'a> ToolCallStream<'a> {
                         .strip_prefix("[TOOL_CALLS]")
                         .is_some_and(|rest| rest.trim_start().starts_with('['))
                 });
-                let format_can_supply_ids =
-                    self.format.is_some_and(ToolCallFormat::may_supply_late_id);
+                let format_can_supply_ids = self.format.is_some_and(|format| {
+                    self.region
+                        .is_some_and(|start| format.may_supply_late_id(&self.text[start..]))
+                });
                 if call.id.is_none()
                     && call.done.is_none()
                     && (region_has_mistral_ids || format_can_supply_ids)
@@ -642,14 +644,14 @@ mod tests {
     /// closed.
     #[test]
     fn streams_arguments_as_they_are_generated() {
-        let mut stream = ToolCallStream::new(ToolCallFormat::Generic, Some(&[]));
+        let mut stream = ToolCallStream::new(ToolCallFormat::Mistral, Some(&[]));
         let mut events = Vec::new();
         for piece in [
             "Let me look.",
-            "<tool_call>\n{\"name\": \"get_",
-            "weather\", \"arguments\": {\"ci",
+            "[TOOL_CALLS]get_",
+            "weather[ARGS]{\"ci",
             "ty\": \"Par",
-            "is\"}}\n</tool_call>",
+            "is\"}",
         ] {
             events.push(stream.push(piece));
         }
@@ -724,6 +726,32 @@ mod tests {
     }
 
     #[test]
+    fn json_call_stream_waits_for_a_late_model_id() {
+        for (format, first, last, expected) in [
+            (
+                ToolCallFormat::Generic,
+                r#"<tool_call>{"name":"weather","arguments":{"city":"Paris"},"#,
+                r#""id":"model-123"}</tool_call>"#,
+                "model-123",
+            ),
+            (
+                ToolCallFormat::LlamaJson,
+                r#"{"name":"weather","parameters":{"city":"Paris"},"#,
+                r#""id":"model-456"}"#,
+                "model-456",
+            ),
+        ] {
+            let mut stream = ToolCallStream::new(format, Some(&[]));
+            assert!(stream.push(first).is_empty());
+            assert!(stream.push(last).iter().any(|event| matches!(
+                event,
+                ToolEvent::CallStart { id: Some(id), .. } if id == expected
+            )));
+            assert_eq!(stream.calls()[0].id.as_deref(), Some(expected));
+        }
+    }
+
+    #[test]
     fn mistral_inline_arguments_preserve_spaces_across_chunks() {
         let mut stream = ToolCallStream::new(ToolCallFormat::Mistral, Some(&[]));
         let mut streamed = String::new();
@@ -742,7 +770,7 @@ mod tests {
     #[test]
     fn malformed_call_does_not_consume_the_next_call() {
         for text in [
-            r#"{"name":"f","arguments":{'x':1}}{"name":"g","arguments":{}}"#,
+            r#"<tool_call>{"name":"f","arguments":{'x':1}}<tool_call>{"name":"g","arguments":{}}</tool_call>"#,
             r#"<tool_call>{"name":"f","arguments":{'x':1}<tool_call>{"name":"g","arguments":{}}</tool_call>"#,
         ] {
             let (_, parsed) = super::super::parse_tool_calls(ToolCallFormat::Generic, &[], text);

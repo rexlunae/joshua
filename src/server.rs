@@ -1648,6 +1648,13 @@ async fn chat_completions(
     }
 
     // ── Non-streaming path ────────────────────────────────────────────────────
+    let tool_call_format = if tools.is_some() {
+        engine
+            .tool_call_format_for_request(&messages, tools.as_deref(), &options)
+            .map_err(ApiError::from)?
+    } else {
+        engine.tool_call_format()
+    };
     let cancel = CancelOnDrop::new();
     let completion = tokio::task::spawn_blocking({
         let engine = Arc::clone(&engine);
@@ -1667,6 +1674,7 @@ async fn chat_completions(
         &completion,
         reasoning_output.splits(false),
         tools.as_deref(),
+        tool_call_format,
         OPENAI_CALL_IDS,
     );
     let reasoning = answer
@@ -1828,7 +1836,12 @@ pub(crate) fn stream_chat_output(
     id_prefix: &'static str,
     emit: &mut dyn FnMut(ChatPiece<'_>),
 ) -> crate::error::Result<(Completion, Vec<ParsedToolCall>)> {
-    let mut output = ChatOutput::new(engine.tool_call_format(), tools, id_prefix);
+    let format = if tools.is_some() {
+        engine.tool_call_format_for_request(messages, tools, options)?
+    } else {
+        engine.tool_call_format()
+    };
+    let mut output = ChatOutput::new(format, tools, id_prefix);
     let completion = if split {
         engine.complete_chat_streaming_split(messages, tools, options, cancel, &mut |s| {
             output.push(&s, emit)
@@ -1868,6 +1881,7 @@ pub(crate) fn chat_answer(
     completion: &Completion,
     split: bool,
     tools: Option<&[Tool]>,
+    format: crate::tools::ToolCallFormat,
     id_prefix: &str,
 ) -> ChatAnswer {
     let (reasoning, text) = if split {
@@ -1887,7 +1901,6 @@ pub(crate) fn chat_answer(
             calls: Vec::new(),
         };
     };
-    let format = engine.tool_call_format();
     let (content, mut calls) = crate::tools::read_tool_calls(format, tools, &text);
     for call in &mut calls {
         call.id.get_or_insert_with(|| format.call_id(id_prefix));
@@ -2196,6 +2209,13 @@ async fn messages(
         return Ok(Sse::new(events).into_response());
     }
 
+    let tool_call_format = if tools.is_some() {
+        engine
+            .tool_call_format_for_request(&messages, tools.as_deref(), &options)
+            .map_err(ApiError::from)?
+    } else {
+        engine.tool_call_format()
+    };
     let cancel = CancelOnDrop::new();
     let completion = tokio::task::spawn_blocking({
         let engine = Arc::clone(&engine);
@@ -2213,6 +2233,7 @@ async fn messages(
         &completion,
         true,
         tools.as_deref(),
+        tool_call_format,
         ANTHROPIC_CALL_IDS,
     );
     let id = format!("msg_{}", Uuid::new_v4().simple());

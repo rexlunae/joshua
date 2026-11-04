@@ -1815,6 +1815,9 @@ struct RenderedChat {
     /// Whether the tokenizer should still add special tokens (only the
     /// ChatML fallback needs them).
     add_special_tokens: bool,
+    /// The format taught by the template that actually rendered this request.
+    /// ChatML fallback explicitly teaches the generic Hermes format.
+    tool_call_format: Option<crate::tools::ToolCallFormat>,
 }
 
 /// What [`Engine::complete_with`] generates from.
@@ -3754,18 +3757,37 @@ impl Engine {
         self.chat_template.is_some()
     }
 
-    /// The tool-call markup the model writes: the operator's
-    /// `--tool-call-parser`, else the family its chat template teaches, else
-    /// its architecture's, else the generic Hermes / Qwen / Mistral reader
-    /// (see [`crate::tools::ToolCallFormat::select`]).  Parse output with
-    /// [`crate::tools::parse_tool_calls`] or stream it through a
-    /// [`crate::tools::ToolCallStream`] in this format.
+    /// The model-level tool-call format: the operator's `--tool-call-parser`,
+    /// else the family its embedded chat template teaches, else its
+    /// architecture's, else the generic Hermes / Qwen / Mistral reader (see
+    /// [`crate::tools::ToolCallFormat::select`]). Request handling selects
+    /// again from the template that renders the actual request.
     pub fn tool_call_format(&self) -> crate::tools::ToolCallFormat {
         tool_call_format(
             self.tool_call_parser,
             self.chat_template.as_ref(),
             self.arch,
         )
+    }
+
+    /// Select the parser from the template that renders these exact messages
+    /// and request variables. The render is repeated when generation starts;
+    /// this preflight keeps streamed call IDs stable from the first chunk.
+    pub(crate) fn tool_call_format_for_request(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        options: &GenerationOptions,
+    ) -> Result<crate::tools::ToolCallFormat> {
+        if self.tool_call_parser.is_some() {
+            return Ok(self.tool_call_format());
+        }
+        let rendered = self.render_chat(messages, tools, options)?;
+        Ok(crate::tools::ToolCallFormat::select(
+            self.tool_call_parser,
+            rendered.tool_call_format,
+            self.arch,
+        ))
     }
 
     /// Format messages as a ChatML prompt and end it as `render` asks: with
@@ -3866,6 +3888,7 @@ impl Engine {
                 .map(|text| RenderedChat {
                     text,
                     add_special_tokens: false,
+                    tool_call_format: template.tool_call_format(),
                 })
                 .map_err(JoshuaError::InvalidRequest);
         }
@@ -3875,6 +3898,7 @@ impl Engine {
                     return Ok(RenderedChat {
                         text,
                         add_special_tokens: false,
+                        tool_call_format: template.tool_call_format(),
                     })
                 }
                 Err(e) => {
@@ -3887,6 +3911,7 @@ impl Engine {
         Ok(RenderedChat {
             text: Self::format_chatml_prompt(&sanitized, tools, render),
             add_special_tokens: true,
+            tool_call_format: Some(crate::tools::ToolCallFormat::Generic),
         })
     }
     // ─── Completion ───────────────────────────────────────────────────────────
@@ -8051,10 +8076,9 @@ fn sanitize_model_name(raw: &str) -> Option<String> {
     }
 }
 
-/// The tool-call format to parse a model's output in (see
-/// [`Engine::tool_call_format`]).  Without a template that renders tools the
-/// prompt is the ChatML fallback, which teaches Hermes calls, so the
-/// architecture's own format does not apply.
+/// The model-level tool-call format (see [`Engine::tool_call_format`]).
+/// Request handling refines it against the template that rendered the actual
+/// messages and request variables.
 fn tool_call_format(
     parser: Option<crate::tools::ToolCallFormat>,
     template: Option<&ChatTemplate>,
@@ -8064,8 +8088,8 @@ fn tool_call_format(
     let taught = match template {
         // The operator's choice needs no look at the template.
         _ if parser.is_some() => None,
-        Some(template) if template.renders_tools() => template.tool_call_format(),
-        _ => Some(ToolCallFormat::Generic),
+        Some(template) => template.tool_call_format(),
+        None => Some(ToolCallFormat::Generic),
     };
     ToolCallFormat::select(parser, taught, arch)
 }

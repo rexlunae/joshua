@@ -270,8 +270,19 @@ impl ToolCallFormat {
 
     /// Whether the format's grammar can add a model-supplied id after a
     /// completed function name, so a streamed `CallStart` must wait.
-    pub(crate) fn may_supply_late_id(self) -> bool {
-        matches!(self, Self::NemotronV2)
+    pub(crate) fn may_supply_late_id(self, region: &str) -> bool {
+        match self {
+            Self::Generic => {
+                let region = region.trim_start();
+                let body = region
+                    .strip_prefix("<tool_call>")
+                    .unwrap_or(region)
+                    .trim_start();
+                body.starts_with('{')
+            }
+            Self::LlamaJson | Self::NemotronV2 | Self::Functools | Self::DeepSeekV3 => true,
+            _ => false,
+        }
     }
 
     /// Every accepted `--tool-call-parser` name besides `auto`.

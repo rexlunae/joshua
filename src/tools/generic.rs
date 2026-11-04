@@ -36,40 +36,6 @@ fn broken_call_end(
     }
 }
 
-fn next_json_call(s: &str, after: usize) -> Option<usize> {
-    s[after..]
-        .match_indices('{')
-        .filter_map(|(offset, _)| {
-            let at = after + offset;
-            let previous = s[..at].chars().next_back()?;
-            if !previous.is_whitespace() && !matches!(previous, '}' | ';') {
-                return None;
-            }
-            let call = json::call_object(&s[at..], NAME_KEYS, ARG_KEYS).ok()?;
-            call.name.map(|_| at)
-        })
-        .next()
-}
-
-fn json_calls_after(s: &str, mut at: usize) -> (Vec<PartialCall>, usize) {
-    let mut calls = Vec::new();
-    loop {
-        let start = skip_ws(s, at);
-        let Ok(call) = json::call_object(&s[start..], NAME_KEYS, ARG_KEYS) else {
-            return (calls, at);
-        };
-        if call.name.is_none() {
-            return (calls, at);
-        }
-        let end = call.end.map_or(s.len() - start, |end| end);
-        calls.push(call.partial(true));
-        at = start + end;
-        if at == s.len() {
-            return (calls, at);
-        }
-    }
-}
-
 /// Where a region closed by `close` ends, given that its content ends at
 /// `at`: after the closing tag (whitespace before it allowed); after a
 /// closing tag further on, dropping what comes between as broken markup
@@ -379,26 +345,6 @@ fn bare_json(region: &str, cx: &Cx<'_>) -> Scan {
         Ok(call) if call.name.is_some() && call.end == Some(body.len()) => Scan::Calls {
             calls: vec![call.partial(true)],
             end: Some(region.len()),
-        },
-        Err(()) => match json::call_object_name_prefix(body, NAME_KEYS, ARG_KEYS) {
-            Some((call, prefix_len)) => {
-                let leading = region.len() - region.trim_start().len();
-                if let Some(next) = next_json_call(body, prefix_len) {
-                    let (following, end) = json_calls_after(body, next);
-                    let mut calls = vec![call];
-                    calls.extend(following);
-                    Scan::Calls {
-                        calls,
-                        end: Some(leading + end),
-                    }
-                } else {
-                    Scan::Calls {
-                        calls: vec![call],
-                        end: Some(region.len()),
-                    }
-                }
-            }
-            None => Scan::Text(region.len()),
         },
         _ => Scan::Text(region.len()),
     }
@@ -746,6 +692,15 @@ mod tests {
         let (content, calls) = parse(G, input);
         assert_eq!(content, input);
         assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn malformed_bare_json_is_not_reclassified_as_a_tool_call() {
+        let input = r#"{"name":"explanation","arguments":{"value":}}"#;
+        let (content, calls) = parse(G, input);
+        assert_eq!(content, input);
+        assert!(calls.is_empty());
+        assert_streams_like_parse(G, &[], input);
     }
 
     #[test]
