@@ -1,5 +1,5 @@
 //! Fused SIMD dequant+dot kernels for candle's k-quant block types used by
-//! GGUFs (Q8_0, Q2_K, Q4_K, plus Q6_K on AVX2 and AVX-512 and Q5_K on AVX2).
+//! GGUFs (Q8_0, Q2_K, Q4_K, plus Q6_K on AVX2 and AVX-512 and Q5_K on AVX2 and NEON).
 //!
 //! The generic fast path in [`crate::quant_matmul`] dequantizes each weight
 //! row into an f32 scratch buffer (via candle's scalar `GgmlType::to_float`)
@@ -22,7 +22,8 @@
 //!   `fused_row_q6k` / `fused_row_q5k`, entered only after
 //!   `avx2_fma_available()`.
 //! * **aarch64** — NEON, 4 f32 lanes (`fmla`), kernels
-//!   `fused_row_q8_0_neon` / `fused_row_q2k_neon` / `fused_row_q4k_neon`.
+//!   `fused_row_q8_0_neon` / `fused_row_q2k_neon` / `fused_row_q4k_neon` /
+//!   `fused_row_q5k_neon`.
 //!   NEON is mandatory in AArch64, so these are always eligible.
 //!
 //! Block layouts mirror candle's `k_quants` types exactly (the GGUF format
@@ -1911,6 +1912,7 @@ mod tests {
             (GgmlDType::Q2K, simd),
             (GgmlDType::Q4K, simd),
             (GgmlDType::Q6K, matches!(level, SimdLevel::Avx2 | SimdLevel::Avx512)),
+            // Q5_K has fused kernels on AVX2 and NEON, not AVX-512.
             (GgmlDType::Q5K, matches!(level, SimdLevel::Avx2 | SimdLevel::Neon)),
         ] {
             let block_bytes = quantized_block_bytes(8, 256, dtype);
@@ -1918,6 +1920,20 @@ mod tests {
             let mut dst = vec![0f32; 2 * 8];
             let ran = try_matmul_fused(dtype, (2, 256, 8), &lhs, &block_bytes, &mut dst, false);
             assert_eq!(ran, fused, "{dtype:?} at {level:?}");
+        }
+        #[cfg(target_arch = "x86_64")]
+        if level == SimdLevel::Avx512 {
+            let block_bytes = quantized_block_bytes(8, 256, GgmlDType::Q5K);
+            let lhs = vec![0.0f32; 2 * 256];
+            let mut dst = vec![0.0f32; 2 * 8];
+            assert!(!try_matmul_fused_avx512(
+                GgmlDType::Q5K,
+                (2, 256, 8),
+                &lhs,
+                &block_bytes,
+                &mut dst,
+                false,
+            ));
         }
     }
 }
