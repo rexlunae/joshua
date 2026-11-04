@@ -78,6 +78,7 @@ pub mod npu;
 pub mod ollama;
 pub mod paged_weights;
 pub mod placement;
+pub mod ppl;
 pub mod prefill_cost;
 pub mod prefix_cache;
 pub mod prefix_key;

@@ -11,6 +11,9 @@
 //!
 //! # Embed text
 //! joshua embed --model ./weights/nomic-embed.gguf "Hello world"
+//!
+//! # Score a corpus (perplexity — the quality measurement)
+//! joshua ppl --model ./weights/model.gguf --file held-out.txt --json
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -901,6 +904,36 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Score text and report perplexity — a data-driven quality measurement
+    /// for a checkpoint (compare a compressed model against its source on the
+    /// same corpus).
+    Ppl {
+        /// Path to the GGUF model file.
+        #[arg(short, long, env = "JOSHUA_MODEL_PATH")]
+        model: PathBuf,
+        /// UTF-8 text file to score.  `-` reads standard input.
+        #[arg(short, long)]
+        file: PathBuf,
+        /// Context window in tokens.
+        #[arg(long, env = "JOSHUA_N_CTX", default_value_t = 4096)]
+        n_ctx: u32,
+        /// Tokens per scored window (defaults to the context window, and is
+        /// clamped to it: a window cannot exceed the model's context).
+        #[arg(long)]
+        window: Option<usize>,
+        /// Score at most this many tokens (0 = the whole file).
+        #[arg(long, default_value_t = 0)]
+        limit: usize,
+        /// Wrap the text with the tokenizer's BOS/EOS special tokens.
+        #[arg(long)]
+        bos: bool,
+        /// Compute backend: auto, cpu, metal, or cuda.
+        #[arg(long, env = "JOSHUA_DEVICE", value_enum, default_value_t = DeviceArg::Auto)]
+        device: DeviceArg,
+        /// Emit one JSON object instead of text.
+        #[arg(long)]
+        json: bool,
+    },
     /// Print host, model, and build information for a benchmark report.
     Report {
         /// Optional GGUF model whose size and header describe the run.
@@ -1338,6 +1371,101 @@ async fn main() -> anyhow::Result<()> {
                         row["decode_tps"].as_f64().unwrap_or(0.0),
                     );
                 }
+            }
+        }
+
+        Commands::Ppl {
+            model,
+            file,
+            n_ctx,
+            window,
+            limit,
+            bos,
+            device,
+            json,
+        } => {
+            let text = if file.as_os_str() == "-" {
+                let mut buf = String::new();
+                use std::io::Read;
+                std::io::stdin()
+                    .read_to_string(&mut buf)
+                    .map_err(|e| anyhow::anyhow!("reading stdin: {e}"))?;
+                buf
+            } else {
+                std::fs::read_to_string(&file)
+                    .map_err(|e| anyhow::anyhow!("reading {}: {e}", file.display()))?
+            };
+            let opts = EngineOptions::with_n_ctx(n_ctx).backend(device.into());
+            let engine = Engine::with_options(&model, opts)?;
+            // The engine resolves 0 to its default context, so bound and default
+            // the window from what it actually loaded — not from the raw flag,
+            // where `--n-ctx 0` would invert `clamp`'s bounds and panic.
+            let n_ctx = engine.n_ctx();
+            if n_ctx < 2 {
+                // A window needs two tokens: position 0 predicts token 1.
+                anyhow::bail!(
+                    "context window of {n_ctx} token(s) is too small to score: a window needs \
+                     at least 2 tokens"
+                );
+            }
+            let n_ctx = n_ctx as usize;
+            let mut tokens = engine.tokenize(&text, bos)?;
+            if limit > 0 && tokens.len() > limit {
+                tokens.truncate(limit);
+            }
+            let window = window.unwrap_or(n_ctx).clamp(2, n_ctx);
+            if tokens.len() < 2 {
+                // One pair is the smallest scoreable corpus; fewer almost always
+                // means the wrong tokenizer produced nothing usable.
+                anyhow::bail!(
+                    "need at least 2 tokens to score (got {}); is the tokenizer the model's own?",
+                    tokens.len()
+                );
+            }
+            let started = std::time::Instant::now();
+            let acc = engine.perplexity(&tokens, window)?;
+            let elapsed_s = started.elapsed().as_secs_f64();
+            let Some(ppl) = acc.perplexity() else {
+                anyhow::bail!("no token could be scored ({} skipped)", acc.skipped());
+            };
+            let mean_nll = acc.mean_nll().unwrap_or(f64::NAN);
+            let bpt = acc.bits_per_token().unwrap_or(f64::NAN);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "object": "joshua.ppl",
+                        "model": model,
+                        "file": file,
+                        "window": window,
+                        "bos": bos,
+                        "tokens": tokens.len(),
+                        "scored_tokens": acc.scored(),
+                        "skipped_tokens": acc.skipped(),
+                        "mean_nll": mean_nll,
+                        "bits_per_token": bpt,
+                        "perplexity": ppl,
+                        "elapsed_s": elapsed_s,
+                        "tokens_per_s": acc.scored() as f64 / elapsed_s.max(1e-9),
+                    })
+                );
+            } else {
+                println!("model      {}", model.display());
+                println!("file       {}", file.display());
+                println!(
+                    "tokens     {} ({} scored, {} skipped, window {})",
+                    tokens.len(),
+                    acc.scored(),
+                    acc.skipped(),
+                    window
+                );
+                println!("mean nll   {mean_nll:.6} nats/token");
+                println!("bits/token {bpt:.6}");
+                println!("perplexity {ppl:.6}");
+                println!(
+                    "speed      {:.2} scored tokens/s ({elapsed_s:.1}s)",
+                    acc.scored() as f64 / elapsed_s.max(1e-9)
+                );
             }
         }
 

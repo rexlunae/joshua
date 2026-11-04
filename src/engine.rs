@@ -3489,6 +3489,106 @@ impl Engine {
             .map_err(|e| JoshuaError::Tokenization(e.to_string()))
     }
 
+    /// Score `tokens` and return the running cross-entropy
+    /// ([`crate::ppl::Accumulator`]): perplexity, mean NLL in nats, bits per
+    /// token.
+    ///
+    /// Windows are non-overlapping and `window` tokens wide (a shorter tail is
+    /// kept), and inside a window every token but the first is scored, because
+    /// position `i` predicts token `i + 1`. Each window runs on a **cleared** KV
+    /// cache, so it is scored with exactly the context it declares — that is
+    /// what makes the number comparable across checkpoints, and to llama.cpp.
+    ///
+    /// A window is fed in slices of at most [`crate::ppl::SCORE_ROWS_PER_PASS`]
+    /// rows with the KV cache carrying across them, so the model sees the whole
+    /// window while only a bounded number of logit rows is ever materialised
+    /// (a whole 4096-token window over a 129k vocabulary would otherwise be
+    /// 2.1 GB of `f32`).
+    ///
+    /// The session comes from the warm-model pool and is returned to it, so
+    /// scoring a corpus does not reload the model per window. Architectures
+    /// that can emit every position's logits in one pass do so; the rest fall
+    /// back to one forward per token.
+    ///
+    /// A model whose session cannot be reset is still scoreable as long as the
+    /// corpus fits a single window: the first window starts on a fresh session
+    /// and needs no reset.
+    pub fn perplexity(&self, tokens: &[u32], window: usize) -> Result<crate::ppl::Accumulator> {
+        // Dense weights may be placed on the CPU while the expert pool lives on
+        // an accelerator (or the reverse), so inputs are built where the dense
+        // path runs — the same device the generation loop feeds.
+        let device = &self.dense_device;
+        // A scoring run has no request, so it belongs to no affinity scope:
+        // take/return the session in the unscoped pool namespace.
+        let (mut session, _reused) = self.acquire_session(&[], false, None)?;
+        let all_positions = session.supports_speculative();
+        let mut acc = crate::ppl::Accumulator::new();
+        let mut outcome: Result<()> = Ok(());
+        let mut first_window = true;
+        for (start, end) in crate::ppl::windows(tokens.len(), window) {
+            if !first_window && !session.clear_state() {
+                // Carrying one window's context into the next would quietly
+                // flatter the score, so refuse rather than measure almost the
+                // right thing.
+                outcome = Err(JoshuaError::InvalidRequest(format!(
+                    "this architecture cannot reset its KV cache, so only one window can be \
+                     scored; re-run with --window {end} or more"
+                )));
+                break;
+            }
+            first_window = false;
+            for slice in crate::ppl::slices(start, end, crate::ppl::SCORE_ROWS_PER_PASS) {
+                let fed = &tokens[slice.from..slice.to];
+                let targets = &tokens[slice.from..slice.target_end];
+                if all_positions {
+                    match session.forward_tokens_all(fed, slice.pos, device) {
+                        Ok(rows) => {
+                            acc.push_window(targets, &rows);
+                        }
+                        Err(e) => {
+                            outcome = Err(e);
+                            break;
+                        }
+                    }
+                } else {
+                    // One forward per token: feed row `i`, score the next one.
+                    let mut rows: Vec<Vec<f32>> = Vec::with_capacity(fed.len());
+                    let mut failed = None;
+                    for (i, tok) in fed.iter().enumerate() {
+                        if slice.from + i + 1 >= slice.target_end {
+                            break; // the window's last row has no successor
+                        }
+                        match session.forward_tokens(
+                            std::slice::from_ref(tok),
+                            slice.pos + i,
+                            device,
+                        ) {
+                            Ok(logits) => rows.push(logits),
+                            Err(e) => {
+                                failed = Some(e);
+                                break;
+                            }
+                        }
+                    }
+                    match failed {
+                        Some(e) => {
+                            outcome = Err(e);
+                            break;
+                        }
+                        None => {
+                            acc.push_window(targets, &rows);
+                        }
+                    }
+                }
+            }
+            if outcome.is_err() {
+                break;
+            }
+        }
+        self.release_model(session, Vec::new(), None);
+        outcome.map(|_| acc)
+    }
+
     /// Detokenize `tokens` back to text — the inverse of
     /// [`Engine::tokenize`], and what a vLLM / llama.cpp client expects from
     /// `POST /v1/detokenize`.

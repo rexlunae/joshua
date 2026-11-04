@@ -164,6 +164,13 @@ cargo build --release
 # Host/build/model report to attach to a benchmark result
 ./target/release/joshua report --model ./weights/gemma-3-1b-it-Q4_K_M.gguf --json
 
+# Score a corpus: perplexity / bits-per-token (the quality measurement)
+# Compare a compressed checkpoint against its source on the SAME file, window
+# and --bos setting — shorter windows score strictly worse, so hold them fixed.
+./target/release/joshua ppl \
+    --model ./weights/gemma-3-1b-it-Q4_K_M.gguf \
+    --file held-out.txt --n-ctx 512 --json
+
 # Reasoning models: switch thinking off / pick an effort, reproducible sampling
 ./target/release/joshua run --model ./weights/Qwen3-8B-Q4_K_M.gguf \
     --enable-thinking false --seed 7 "What is 17 * 23?"
