@@ -533,7 +533,7 @@ pub struct LoadModelRequest {
     /// Context window; defaults to the server's, capped by the model.
     #[serde(default)]
     pub n_ctx: Option<usize>,
-    /// Concurrent remote sessions the workers reserve KV for.
+    /// Concurrent remote sessions the workers reserve KV for; defaults to one.
     #[serde(default)]
     pub sessions: Option<usize>,
     /// Prompt tokens per pipeline step.

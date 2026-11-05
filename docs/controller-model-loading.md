@@ -50,7 +50,9 @@ deleted on unload.
 
 - CPU Qwen3 dense models only (the pipeline's current scope).
 - Concurrent sessions share one pipeline and run one batch at a time;
-  requests are not yet batched across sessions.
+  requests are not yet batched across sessions. The default session limit is
+  one because each session reserves KV capacity for the full context; raise it
+  only when the workers have memory for the additional reservations.
 - A lost worker fails the model; unload and load it again.
 - Validated with in-process and separate-process loopback workers only; no
   multi-host or bandwidth measurements yet.
