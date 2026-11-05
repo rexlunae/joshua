@@ -29,10 +29,13 @@ Reconnect the device in T3 (or restart its server) after `install`.
 
 The agent advertises every loadable GGUF on the host, not only what is loaded:
 
-- scans `~/models`, `~/llama.cpp/models`, `~/.lmstudio/models`, `~/nemo` and `~/joshua-decode-*`
-  (override with `--catalog DIR`, repeatable)
-- offers a file when it has a sibling `tokenizer.json` and a real `GGUF` magic (truncated downloads
-  and HTML error pages are skipped)
+- takes Joshua's own `GET /v1/models` as the authority — it lists every GGUF under `--model-dir`
+  with `root`, `joshua.loaded`, architecture, quantization and size — and drops what is not a model
+  (`ggml-vocab-*.gguf` tokenizer vocabularies) while collapsing shards to `…-00001-of-0000N`
+- unions that with a disk scan of `~/models`, `~/llama.cpp/models`, `~/.lmstudio/models`, `~/nemo`
+  and `~/joshua-decode-*` (override with `--catalog DIR`), because Joshua's scan does not recurse
+  into deeper model directories; a scanned file needs a sibling `tokenizer.json` and a real `GGUF`
+  magic (truncated downloads and HTML error pages are skipped)
 - sharded models (`…-00001-of-00003.gguf`) appear once, pointing at the first shard
 - labels lead with the distinguishing part (`UD-IQ1_S Qwen3.8 Flash Next`, `[qwen3] Q4_K_M Qwen3 14B`),
   because the client elides the tail of a long name; `modelId` is unchanged

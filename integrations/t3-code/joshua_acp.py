@@ -191,7 +191,7 @@ class StreamSplitter:
         return rest + leftover
 
 
-QUANT_RE = re.compile(r"(?:^|[-_\s])(UD-)?(IQ\d[_A-Z0-9]*|Q\d_K(?:_[A-Z0-9]+)?|Q\d_\d|Q8_0|Q6_K|Q5_K|Q4_0|MXFP4|TQ1_0|TQ2_0|BF16|F16)"
+QUANT_RE = re.compile(r"(?:^|[-_.\s])(UD-)?(IQ\d[_A-Z0-9]*|Q\d_K(?:_[A-Z0-9]+)?|Q\d_\d|Q8_0|Q6_K|Q5_K|Q4_0|MXFP4|TQ1_0|TQ2_0|BF16|F16)"
                       r"(?:$|[-_\s])")
 
 
@@ -313,70 +313,104 @@ class Agent:
     def servers(self):
         return [u for u in (self.base, self.cpu_base) if u]
 
-    def loaded(self, base=None):
-        """Model ids a Joshua server already has in memory (all of them by default)."""
+    def server_models(self, base=None):
+        """Joshua's own model list: every GGUF it can load, with metadata (newer builds)."""
         bases = [base] if base else self.servers()
-        ids = []
+        out = []
         for url in bases:
             try:
                 data = http_json(f"{url}/v1/models", api_key=self.key, timeout=30)
             except Exception:
                 continue
-            for m in (data.get("data", []) if isinstance(data, dict) else []):
-                if m.get("id") and m["id"] not in ids:
-                    ids.append(m["id"])
-        return ids
+            for model in (data.get("data", []) if isinstance(data, dict) else []):
+                if isinstance(model, dict) and model.get("id"):
+                    model = dict(model)
+                    model["_server"] = url
+                    out.append(model)
+        return out
+
+    def loaded(self, base=None):
+        """Model ids a Joshua server already has in memory."""
+        return [m["id"] for m in self.server_models(base) if (m.get("joshua") or {}).get("loaded")]
 
     def catalog(self):
-        """Loadable GGUFs on this host: id -> {path, name}. Needs a sibling tokenizer.json.
+        """The models Joshua reports, filtered to things a user should actually pick.
 
-        The id is the file stem (what Joshua reports for most models); the display name comes from
-        the GGUF metadata, so `moe.gguf` still reads as "DeepSeek V4 Flash 0731 Reap 150b". When a
-        catalog id has already been loaded, the alias map hides it in favour of the server's own id.
+        Joshua's `/v1/models` is the authority: it lists every GGUF under `--model-dir` with its
+        root path, architecture, quantization and `joshua.loaded` flag.  The list needs filtering
+        before it reaches a picker:
+
+        - `ggml-vocab-*.gguf` are tokenizer vocabularies, not models (`n_params == 0`)
+        - sharded models report one entry per shard; only `…-00001-of-0000N` is a model
         """
+        found = {}
+        for model in self.server_models():
+            model_id = model.get("id", "")
+            meta = model.get("meta") or {}
+            served = model.get("joshua") or {}
+            if model_id.startswith(("llama-fork/", "llama.cpp/")) or "ggml-vocab" in model_id:
+                continue
+            if not served.get("architecture") and int(meta.get("n_params") or 0) == 0:
+                continue
+            shard = re.match(r"^(.*)-(\d{5})-of-(\d{5})$", model_id)
+            if shard:
+                if shard.group(2) != "00001":
+                    continue
+                model_id = shard.group(1)
+            if model_id in found:
+                continue
+            found[model_id] = {
+                "path": model.get("root") or model_id,
+                "name": short_name(model_id),
+                "loaded": bool(served.get("loaded")),
+                "quant": served.get("quantization"),
+                "arch": served.get("architecture"),
+            }
+
+        # Joshua's scan stops at a shallow depth, so pick up deeper model directories too.
+        known = {info["path"] for info in found.values()}
+        for path, model_id in self.scan_paths().items():
+            if path in known or model_id in found:
+                continue
+            found[model_id] = {"path": path, "name": short_name(model_id), "loaded": False,
+                               "quant": None, "arch": None}
+        return found
+
+    def scan_paths(self):
+        """GGUFs on disk that Joshua's own scan misses (it does not recurse deeply)."""
         found = {}
         for root in self.roots:
             if not os.path.isdir(root):
                 continue
             for path in sorted(Path(root).rglob("*.gguf")):
-                if path.name.startswith(("mmproj-", "ggml-vocab")):
+                if "ggml-vocab" in path.name or path.name.startswith("mmproj-"):
+                    continue
+                shard = re.match(r"^(.*)-(\d{5})-of-(\d{5})$", path.stem)
+                if shard and shard.group(2) != "00001":
                     continue
                 if not (path.parent / "tokenizer.json").is_file():
                     continue
                 try:
                     with open(path, "rb") as fh:
-                        if fh.read(4) != b"GGUF":     # truncated download / HTML error page
+                        if fh.read(4) != b"GGUF":
                             continue
                 except OSError:
                     continue
-                stem = path.stem
-                shard = re.match(r"^(.*)-(\d{5})-of-(\d{5})$", stem)
-                if shard:
-                    if shard.group(2) != "00001":      # only the first part is a model entry
-                        continue
-                    stem = shard.group(1)
-                model_id = stem
-                if model_id in found:
-                    model_id = f"{stem} [{path.parent.name}]"
-                meta = gguf_names(path)
-                label = meta.get("general.name") or meta.get("general.basename") or path.stem
-                found[model_id] = {"path": str(path), "name": label}
+                model_id = shard.group(1) if shard else path.stem
+                found[str(path)] = model_id
         return found
 
     def models(self):
-        """Everything the user may pick: what Joshua has loaded, plus the rest of the catalog.
-
-        Each entry's `name` is a short label with the distinguishing part first, because the
-        client elides the tail of a long one (`…-UD-IQ1_S` hid which quant it was).
-        """
-        catalog = self.catalog()
-        loaded = self.loaded()
-        out = [{"modelId": mid,
-                "name": short_name(mid, catalog.get(mid, {}).get("name", ""))} for mid in loaded]
-        for model_id, info in catalog.items():
-            if model_id in loaded or self.aliases.get(model_id) in loaded:
+        """Everything the user may pick, from Joshua's own list."""
+        out, seen = [], set()
+        for model_id, info in self.catalog().items():
+            if model_id in seen:
                 continue
-            out.append({"modelId": model_id, "name": short_name(model_id, info["name"])})
+            seen.add(model_id)
+            label = info["name"]
+            if info.get("loaded"):
+                label = f"{label} *"
+            out.append({"modelId": model_id, "name": label})
         return out
 
     def ensure_loaded(self, model_id):
