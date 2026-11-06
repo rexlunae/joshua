@@ -701,8 +701,13 @@ that is not loaded is listed after the loaded models, with
 `joshua.loaded: false` and no placement.  Its id is its file stem or, when
 another file in the directory has the same stem (or a loaded model has it
 as its id), its path in the directory (`a/model.gguf`, `b/model.gguf`), so
-loading one file does not change another's id.  `POST /v1/models/load`
-takes either as `model` and, without an `id`, serves the model under the
+loading one file does not change another's id.  A request selects a listed
+file by that id and it is **loaded on first use** — the first request that
+names it maps it in and answers, so a client needs no `POST /v1/models/load`
+first; concurrent requests for the same cold model share that one load.
+`POST /v1/models/load`
+takes the id or a file's path as `model` and, without an `id`, serves the
+model under the
 id it was listed by; it refuses another file's path as an `id` (`409`).
 No two entries share an id: a file whose path a loaded model already has
 as its id (the file appeared after that load) is left out until the model
@@ -721,8 +726,10 @@ does not know included (see
 
 ### `POST /v1/models/load` and `POST /v1/models/unload`
 
-Start the server with `--model-dir DIR` (and `--model` becomes optional) to
-load and unload models at runtime.  Requests name a GGUF file, or a directory
+`--model-dir DIR` (and `--model DIR` for a directory: any path that is a
+directory is served as the model directory, and the server starts on the model
+it finds there) lists and loads models at runtime.  Requests name a GGUF file,
+or a directory
 holding one, relative to `DIR`, or the id [`/v1/models`](#get-v1models) lists
 a file there by; paths outside it are refused.  Protect these routes with
 `--api-key` when the server is reachable from other hosts.
@@ -735,14 +742,19 @@ curl -X POST localhost:8080/v1/models/unload -H 'content-type: application/json'
   -d '{"id": "qwen3"}'
 ```
 
-A load answers with the model's [`/v1/models`](#get-v1models) entry (with
+An explicit load is only needed for a file the directory does not list (added
+after startup) or to pin a different `id`.  A load answers with the model's
+[`/v1/models`](#get-v1models) entry (with
 `workers` and `stages` also at the top level).  Several models can be loaded
-at once; requests pick one with `model`.  A server holding a single model
+at once; requests pick one with `model`, and naming a listed model that is not
+loaded loads it (see [`GET /v1/models`](#get-v1models)).  A server holding a
+single model
 answers any name, as before, except the id of a file in the model directory
-that is not loaded (as `/v1/models` would list it): that is a `404`
-(`code: "model_not_found"`) saying to load it, not an answer from the
+that is not loaded (as `/v1/models` would list it): that load is attempted,
+never answered by the
 loaded model.  Checking a name reads the directory, not the files.
-Unloading waits for requests already running on the model.
+Unloading waits for requests already running on the model, after which the
+file is listed (unloaded) again and the next request that names it reloads it.
 
 #### Model-less workers (experimental, `--features distributed`)
 

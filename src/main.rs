@@ -309,13 +309,17 @@ enum Commands {
     },
     /// Start the OpenAI-compatible HTTP API server.
     Serve {
-        /// Path to the GGUF model file.  Optional with --model-dir, where
-        /// models are loaded later through POST /v1/models/load.
+        /// Path to the GGUF model file, or to a directory of models.  A
+        /// directory is served as --model-dir serves it — every model in it is
+        /// listed and selectable by name — and the server starts on the model
+        /// it finds there.  Optional with --model-dir, where every model is
+        /// loaded by the first request that names it.
         #[arg(short, long, env = "JOSHUA_MODEL_PATH", required_unless_present = "model_dir")]
         model: Option<PathBuf>,
         /// Enable POST /v1/models/load and /v1/models/unload for models in
-        /// this directory, which GET /v1/models also lists.  Protect the API
-        /// with --api-key when it is not bound to localhost.
+        /// this directory, which GET /v1/models also lists.  A request selects
+        /// one by its listed id, and the first request that names it loads it.
+        /// Protect the API with --api-key when it is not bound to localhost.
         #[arg(long, env = "JOSHUA_MODEL_DIR")]
         model_dir: Option<PathBuf>,
         /// Model-less workers (`joshua worker`) this controller may place
@@ -1142,6 +1146,14 @@ async fn main() -> anyhow::Result<()> {
             let npu = npu_plugin
                 .map(|plugin| npu_backend(&plugin, npu_in_process))
                 .transpose()?;
+            let model_dir = serve_model_dir(model.as_deref(), model_dir)?;
+            if let Some(dir) = &model_dir {
+                tracing::info!(
+                    dir = %dir.display(),
+                    "model directory: every model in it is listed by GET /v1/models and loaded \
+                     by the first request that names it"
+                );
+            }
             let models = match &model {
                 Some(model) => {
                     let mut engine = Engine::with_options(model, opts.clone())?;
@@ -1838,6 +1850,34 @@ fn ppl_window(window: Option<usize>, n_ctx: usize) -> usize {
     window.unwrap_or(n_ctx).clamp(2, n_ctx.max(2))
 }
 
+/// The model directory a server serves, from `--model` and `--model-dir`.
+///
+/// A `--model` that is a directory names a directory *of* models: it is the
+/// model directory, so every model in it is listed and can be selected by name,
+/// and the engine starts on the model it finds there.  Naming it twice
+/// (`--model DIR --model-dir DIR`) is the same request; two different
+/// directories are ambiguous, so that is an error rather than a silent choice.
+fn serve_model_dir(
+    model: Option<&Path>,
+    model_dir: Option<PathBuf>,
+) -> anyhow::Result<Option<PathBuf>> {
+    match (model, model_dir) {
+        (Some(path), given) if path.is_dir() => {
+            if let Some(dir) = &given {
+                anyhow::ensure!(
+                    dir.canonicalize().ok() == path.canonicalize().ok(),
+                    "--model {} is a directory of models, which is what --model-dir {} names; \
+                     give it once",
+                    path.display(),
+                    dir.display()
+                );
+            }
+            Ok(Some(path.to_path_buf()))
+        }
+        (_, dir) => Ok(dir),
+    }
+}
+
 /// Auto decisions for the page-cache options, from the model size vs RAM:
 /// `(pin_hot_weights, prefetch_whole_model)`.  Logged so operators see which
 /// way the auto-resolution went and why.
@@ -1892,6 +1932,37 @@ fn npu_backend(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_model_directory_is_the_model_directory() {
+        let dir = std::env::temp_dir().join(format!("joshua-serve-dir-{}", std::process::id()));
+        let other = dir.join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        let file = dir.join("model.gguf");
+        std::fs::write(&file, b"never read here").unwrap();
+
+        // A file stays a file: no model directory is implied.
+        assert_eq!(serve_model_dir(Some(&file), None).unwrap(), None);
+        // A directory is the model directory, named once or twice.
+        assert_eq!(
+            serve_model_dir(Some(&dir), None).unwrap(),
+            Some(dir.clone())
+        );
+        assert_eq!(
+            serve_model_dir(Some(&dir), Some(dir.clone())).unwrap(),
+            Some(dir.clone())
+        );
+        // Without --model the flag is taken as given.
+        assert_eq!(
+            serve_model_dir(None, Some(other.clone())).unwrap(),
+            Some(other.clone())
+        );
+        // Two different directories are two different stores: say so rather
+        // than silently serve one.
+        let err = serve_model_dir(Some(&dir), Some(other.clone())).unwrap_err();
+        assert!(err.to_string().contains("give it once"), "{err}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn ppl_window_is_clamped_to_context() {

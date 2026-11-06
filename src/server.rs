@@ -26,6 +26,12 @@
 //!   model directory, locally or onto its workers (when enabled)
 //! - `POST /v1/models/unload`         — unload a model (when enabled)
 //!
+//! With `--model-dir` the directory is the model store: every model in it is
+//! listed, and a request selects one by naming its id — [`select_model`] loads
+//! it on first use, so a client need not call `POST /v1/models/load`.  An
+//! explicit load is still how a file the directory does not list (added after
+//! startup) is served, and how a model is pinned to a chosen id.
+//!
 //! Chat and text completions stop decoding, and embeddings stop between
 //! input texts, when the HTTP request is dropped (the client, or a
 //! coordinator proxying for it, disconnected), so a cancelled request
@@ -322,6 +328,10 @@ pub struct ModelRegistry {
     models: RwLock<Vec<LoadedModel>>,
     /// Ids being loaded, so concurrent loads of one id cannot both run.
     loading: Mutex<Vec<String>>,
+    /// Gates serialising request-initiated loads of one id: requests that name
+    /// a model the directory lists wait for its one load instead of failing.
+    /// An entry is created the first time a request names that id.
+    load_gates: Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Workers claimed by a model being loaded, loaded, or being unloaded.
     /// A worker serves one controller connection at a time, so a claim
     /// lasts until the model's pipeline has released it.
@@ -384,6 +394,21 @@ impl ModelRegistry {
             )));
         }
         Ok(only)
+    }
+
+    /// The loaded model with exactly this id, if it is loaded.
+    fn loaded(&self, id: &str) -> Option<(String, Arc<Engine>)> {
+        let models = self.models.read().unwrap_or_else(|p| p.into_inner());
+        models
+            .iter()
+            .find(|m| m.id == id)
+            .map(|m| (m.id.clone(), Arc::clone(&m.engine)))
+    }
+
+    /// The gate serialising request-initiated loads of `id`.
+    fn load_gate(&self, id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut gates = self.load_gates.lock().unwrap_or_else(|p| p.into_inner());
+        Arc::clone(gates.entry(id.to_string()).or_default())
     }
 
     /// Reserve `id` for a load; dropping the guard releases it.
@@ -864,6 +889,57 @@ impl ModelManager {
     }
 }
 
+/// Map a model-load failure to the error a caller sees.
+///
+/// A load the caller asked for reports its cause (`UNPROCESSABLE_ENTITY` with
+/// the engine's own message); anything else is an internal failure.
+fn load_failure(err: crate::JoshuaError) -> ApiError {
+    match err {
+        crate::JoshuaError::ModelLoad(msg) => {
+            ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, msg, "model_load_failed")
+        }
+        e => ApiError::from(e),
+    }
+}
+
+/// Load `req`'s model file, already resolved to `path`, as `id`.
+///
+/// `target` is `path` canonicalised when the caller has it: the id may not be
+/// another listed file's path (see [`ModelManager::names_another_file`]), which
+/// needs a header read and so stays inside the blocking load.
+///
+/// The reservation in `state.models` keeps any other load of the same id out
+/// while this one runs, and the caller gets the loaded model back to answer
+/// with (dropping its engine releases the weights).
+async fn load_model_file(
+    state: &AppState,
+    req: LoadModelRequest,
+    path: PathBuf,
+    id: String,
+    target: Option<PathBuf>,
+) -> Result<LoadedModel, ApiError> {
+    let state = Arc::clone(state);
+    tokio::task::spawn_blocking(move || {
+        let manager = manager(&state)?;
+        if manager.names_another_file(&id, target.as_deref()) {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                format!("id '{id}' is the path of another model file in the model directory"),
+                "model_exists",
+            ));
+        }
+        let guard = state.models.reserve(&id)?;
+        tracing::info!(model = %id, path = %path.display(), "loading model");
+        let model = manager
+            .load(&req, &path, id, &state.models)
+            .map_err(load_failure)?;
+        guard.finish(model.clone());
+        Ok::<_, ApiError>(model)
+    })
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?
+}
+
 /// `POST /v1/models/load`'s answer: the model's `/v1/models` entry, with
 /// its workers and stages also at the top level, where they have always
 /// been.
@@ -873,6 +949,58 @@ fn model_json(model: &LoadedModel) -> serde_json::Value {
     body["workers"] = json!(workers);
     body["stages"] = json!(model.stages);
     body
+}
+
+/// The engine for the model `requested` names, loading it on first use.
+///
+/// A `--model-dir` server lists every valid model in its directory, so the
+/// directory is the model store: a request selects a model by naming it, and
+/// the first request for one that is not loaded maps it in — no
+/// `POST /v1/models/load` needed first.  Loads of one id are serialised by
+/// [`ModelRegistry::load_gate`], so a burst of requests for a cold model shares
+/// its single load instead of colliding in [`ModelRegistry::reserve`].
+///
+/// A name the directory does not list keeps the registry's own diagnosis,
+/// which reports what *is* loaded ([`ModelRegistry::resolve`]).
+pub(crate) async fn select_model(
+    state: &AppState,
+    requested: &str,
+) -> Result<(String, Arc<Engine>), ApiError> {
+    let unselected = match state.resolve(requested) {
+        Ok(found) => return Ok(found),
+        Err(e) => e,
+    };
+    // Only a file the inventory lists is loadable here.
+    let requested = requested.trim();
+    let Some((id, path)) = state
+        .unloaded()
+        .into_iter()
+        .find(|(id, _)| id == requested)
+    else {
+        return Err(unselected);
+    };
+    let gate = state.models.load_gate(&id);
+    let _held = gate.lock().await;
+    // Another request may have finished loading it while this one waited.
+    if let Some(found) = state.models.loaded(&id) {
+        return Ok(found);
+    }
+    // Loading is logged by `load_model_file` with the file it maps; this says
+    // why the load happened.
+    tracing::info!(model = %id, "loading the model a request named");
+    let target = path.canonicalize().ok();
+    let model = load_model_file(
+        state,
+        LoadModelRequest {
+            model: id.clone(),
+            ..Default::default()
+        },
+        path,
+        id.clone(),
+        target,
+    )
+    .await?;
+    Ok((model.id, Arc::clone(&model.engine)))
 }
 
 fn embedding_job(engine: &Engine, model: &str) -> JobModel {
@@ -931,33 +1059,8 @@ async fn load_model(
     if id.is_empty() {
         return Err(ApiError::bad_request("empty model id"));
     }
-    let loaded = tokio::task::spawn_blocking(move || {
-        let manager = manager(&state)?;
-        if manager.names_another_file(&id, target.as_deref()) {
-            return Err(ApiError::new(
-                StatusCode::CONFLICT,
-                format!("id '{id}' is the path of another model file in the model directory"),
-                "model_exists",
-            ));
-        }
-        let guard = state.models.reserve(&id)?;
-        tracing::info!(model = %id, path = %path.display(), "loading model");
-        let model = manager
-            .load(&req, &path, id, &state.models)
-            .map_err(|e| match e {
-                // The caller asked for this load; tell them why it failed.
-                crate::JoshuaError::ModelLoad(msg) => {
-                    ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, msg, "model_load_failed")
-                }
-                e => ApiError::from(e),
-            })?;
-        let body = model_json(&model);
-        guard.finish(model);
-        Ok::<_, ApiError>(body)
-    })
-    .await
-    .map_err(|e| ApiError::internal(e.to_string()))??;
-    Ok(Json(loaded))
+    let model = load_model_file(&state, req, path, id, target).await?;
+    Ok(Json(model_json(&model)))
 }
 
 /// `POST /v1/models/unload` — stop serving a model and release it.
@@ -1354,11 +1457,13 @@ async fn tokenize(
     State(state): State<AppState>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let (_, engine) = state.resolve(
+    let (_, engine) = select_model(
+        &state,
         body.get("model")
             .and_then(|v| v.as_str())
             .unwrap_or_default(),
-    )?;
+    )
+    .await?;
     let prompt = body
         .get("prompt")
         .or_else(|| body.get("content"))
@@ -1389,11 +1494,13 @@ async fn detokenize(
     State(state): State<AppState>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let (_, engine) = state.resolve(
+    let (_, engine) = select_model(
+        &state,
         body.get("model")
             .and_then(|v| v.as_str())
             .unwrap_or_default(),
-    )?;
+    )
+    .await?;
     let tokens = body
         .get("tokens")
         .and_then(|v| v.as_array())
@@ -1579,7 +1686,7 @@ async fn chat_completions(
     headers: HeaderMap,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Result<Response, ApiError> {
-    let (model, engine) = state.resolve(&req.model)?;
+    let (model, engine) = select_model(&state, &req.model).await?;
     let stream = req.stream.unwrap_or(false);
     let defaults = engine.sampling_defaults(SamplingProfile::OpenAi);
     let mut options = req
@@ -2122,7 +2229,7 @@ async fn messages_count_tokens(
     State(state): State<AppState>,
     Json(req): Json<MessagesRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let (_, engine) = state.resolve(&req.model)?;
+    let (_, engine) = select_model(&state, &req.model).await?;
     let defaults = engine.sampling_defaults(SamplingProfile::OpenAi);
     let (messages, tools, options) =
         anthropic::to_chat_request(&req, &defaults).map_err(ApiError::bad_request)?;
@@ -2137,7 +2244,7 @@ async fn messages(
     headers: HeaderMap,
     Json(req): Json<MessagesRequest>,
 ) -> Result<Response, ApiError> {
-    let (resolved_model, engine) = state.resolve(&req.model)?;
+    let (resolved_model, engine) = select_model(&state, &req.model).await?;
     // Anthropic's defaults are the neutral OpenAI-family ones.
     let defaults = engine.sampling_defaults(SamplingProfile::OpenAi);
     let (messages, tools, mut options) =
@@ -2539,11 +2646,13 @@ async fn completions(
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let (model, engine) = state.resolve(
+    let (model, engine) = select_model(
+        &state,
         body.get("model")
             .and_then(|v| v.as_str())
             .unwrap_or_default(),
-    )?;
+    )
+    .await?;
     let prompt = body
         .get("prompt")
         .and_then(|v| v.as_str())
@@ -2599,7 +2708,7 @@ async fn embeddings(
     headers: HeaderMap,
     Json(req): Json<EmbeddingRequest>,
 ) -> Result<Response, ApiError> {
-    let (model, engine) = state.resolve(&req.model)?;
+    let (model, engine) = select_model(&state, &req.model).await?;
     if let Some(owner) = headers.get(JOB_OWNER_HEADER) {
         let matches = state.models.list().iter().any(|loaded| {
             Arc::ptr_eq(&loaded.engine, &engine)

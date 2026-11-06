@@ -17,7 +17,7 @@ real client binary is *not* covered by the test suite today — see
 | `POST /v1/chat/completions` | ✅ streaming (SSE) + non-stream, tools, `response_format` |
 | `POST /v1/completions` | ✅ legacy text completion |
 | `POST /v1/embeddings` | ✅ |
-| `GET /v1/models` | ✅ |
+| `GET /v1/models` | ✅ loaded models, plus the files the model directory holds (each with its limits; a request naming one loads it on first use) |
 | `POST /v1/models/load` / `unload` | ✅ joshua extension (when a model manager is configured) |
 
 This is the primary target and the README's "drop-in replacement" claim is
