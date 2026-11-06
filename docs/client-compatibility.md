@@ -73,13 +73,15 @@ of model, not adding a route.
 
 | Endpoint | Status |
 |---|---|
+| `HEAD /`, `GET /` | ✅ the heartbeat the `ollama` CLI sends before every command |
 | `GET /api/version` | ✅ |
 | `GET /api/tags` | ✅ |
 | `GET /api/ps` | ✅ |
 | `POST /api/show` | ✅ |
-| `POST /api/chat` | ✅ newline-delimited JSON streaming |
-| `POST /api/generate` | ✅ |
-| `POST /api/embed`, `/api/embeddings` | ✅ |
+| `POST /api/chat` | ✅ newline-delimited JSON streaming, tool calls, `format`, images, `keep_alive` |
+| `POST /api/generate` | ✅ `format`, images, `keep_alive`; `system`, `raw`, `context` are not yet honoured |
+| `POST /api/embed` | ✅ |
+| `POST /api/embeddings` | ✅ legacy shape: one `prompt` in, one `embedding` out |
 | `POST /api/tokens` | ✅ (joshua extension, mirrors `/tokenize`) |
 | `DELETE /api/delete` | ✅ removes `<name>.gguf` from the model directory |
 | `POST /api/copy` | ✅ |
@@ -95,6 +97,42 @@ Generation `options` honoured on `/api/chat` and `/api/generate`:
 narrows the context window, clamped to the server's `--n-ctx` (Ollama treats
 it as a load setting and clients send their own default, so a larger value is
 not an error); other options are ignored.
+
+What the rest of a request and its answer carry:
+
+* **Names**: `name:tag` resolves to the model whose id is the name, else to
+  the one whose id is the name without its tag, so the `tiny:latest` that
+  `/api/tags` lists addresses `tiny.gguf`.  A model in the model directory is
+  loaded by the first request that names it.
+* **Listings**: `modified_at` and `created_at` are RFC 3339 times; `digest` is
+  a 64-hex-digit SHA-256 of the model's id, path, size and modification time
+  (not of its contents, so listing a directory reads no weights); `details`
+  include `parameter_size`.  `/api/ps` adds `context_length` and `size_vram`
+  (the whole file when the model runs on an accelerator, the expert cache when
+  only its dense weights do, 0 on the CPU), and reports no expiry.
+* **`/api/show`** returns the GGUF header facts under their metadata keys
+  (`model_info`), and for a loaded model its chat template, its default
+  sampling parameters and its `capabilities` (`completion`, plus `tools`,
+  `insert`, `thinking` and `embedding` where they apply).
+* **Done object**: `done_reason` (`stop` or `length`), `prompt_eval_count`,
+  `eval_count`, and `total_duration`, `load_duration`, `prompt_eval_duration`
+  and `eval_duration` in nanoseconds.
+* **Tool calls** are read by the same parsers as the OpenAI routes and sent as
+  `message.tool_calls`, each with its arguments as an object, in one chunk
+  before the done object.  Earlier calls and `tool` results (`tool_name`) are
+  accepted in the history.
+* **`format`**: `"json"` constrains the output to a JSON object, a schema to
+  documents valid under it.
+* **`images`**: base64 strings, passed to a media-capable backend as the
+  OpenAI routes' `data:` URLs are.
+* **`keep_alive`**: `0` (or `"0s"`, `"0m"`) unloads the model once the answer
+  is sent, when the server manages a model directory.  A request with no
+  messages or prompt only loads the model (`done_reason: "load"`), or with
+  `keep_alive: 0` unloads it (`"unload"`).  Other values are accepted and
+  change nothing: a model stays loaded until it is unloaded.
+* **Errors** are `{"error": "<message>"}`, before a stream starts where the
+  request can be checked up front, and as a final `{"error": ...}` line when
+  generation fails mid-stream.
 
 ### Why `pull` is not simply "missing"
 

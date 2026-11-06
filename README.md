@@ -392,7 +392,7 @@ registry:
 | Anthropic | `POST /v1/messages`, `POST /v1/messages/count_tokens` |
 | llama.cpp (`llama-server`) | `GET /health`, `GET /props`, `GET /slots`, `POST /tokenize`, `POST /detokenize` |
 | vLLM | `GET /load`, `POST /v1/tokenize`, `POST /v1/detokenize` |
-| Ollama | `/api/chat`, `/api/generate`, `/api/embed` (and `/api/embeddings`), `/api/tags`, `/api/ps`, `/api/show`, `/api/version`, `/api/tokens`, and model management (`/api/delete`, `/api/copy`, `/api/create`) against the model directory |
+| Ollama | `HEAD /` heartbeat, `/api/chat`, `/api/generate`, `/api/embed` (and `/api/embeddings`), `/api/tags`, `/api/ps`, `/api/show`, `/api/version`, `/api/tokens`, and model management (`/api/delete`, `/api/copy`, `/api/create`) against the model directory |
 | joshua | `POST /v1/models/load`, `POST /v1/models/unload`, `GET /v1/worker/info`, `GET /status`, `GET /metrics`, `GET /metrics/prometheus` |
 
 [docs/client-compatibility.md](docs/client-compatibility.md) records what

@@ -3893,6 +3893,12 @@ impl Engine {
         self.chat_template.is_some()
     }
 
+    /// The source of the chat template the model renders prompts with,
+    /// when it has one (the GGUF's own or `--chat-template`).
+    pub fn chat_template_source(&self) -> Option<&str> {
+        self.chat_template.as_ref().map(ChatTemplate::source)
+    }
+
     /// The default model-level tool-call format: the operator's
     /// `--tool-call-parser`, else the family its embedded chat template
     /// teaches, else its architecture's, else the generic Hermes / Qwen /
