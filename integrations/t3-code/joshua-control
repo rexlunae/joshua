@@ -15,7 +15,7 @@ Joshua's router (`serve --worker ...`). T3 Code then reaches each host's Joshua 
         --model /home/tserica/llama.cpp/models/qwen/Qwen3-14B-Q4_K_M.gguf
     joshua-control install --host kleya      # ACP agent + T3 provider instance
 """
-import argparse, json, os, shlex, socket, subprocess, sys, time
+import argparse, ipaddress, json, os, shlex, socket, subprocess, sys, time
 from pathlib import Path
 
 HOME = Path.home()
@@ -43,22 +43,32 @@ def resolve(host):
     return "local" if host in ("local", "this", "localhost", socket.gethostname()) else host
 
 
-def run(host, command, timeout=60, check=False):
+def run(host, command, timeout=60, check=False, input=None):
     if resolve(host) == "local":
-        proc = subprocess.run(["/bin/bash", "-lc", command], capture_output=True, text=True, timeout=timeout)
+        proc = subprocess.run(["/bin/bash", "-lc", command], capture_output=True, text=True,
+                              timeout=timeout, input=input)
     else:
-        proc = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host,
+        proc = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "--", host,
                                f"bash -lc {shlex.quote(command)}"],
-                              capture_output=True, text=True, timeout=timeout)
+                              capture_output=True, text=True, timeout=timeout, input=input)
     if check and proc.returncode != 0:
         raise SystemExit(f"[{host}] command failed ({proc.returncode}): {proc.stderr.strip()[:400]}")
     return proc
 
 
-def api(host, port, path, method="GET", body=None, timeout=30):
+def api(host, port, path, method="GET", body=None, timeout=30, api_key=None):
     payload = f" -H 'Content-Type: application/json' -d {shlex.quote(json.dumps(body))}" if body else ""
-    cmd = f"curl -sS -m {timeout} -X {method}{payload} http://127.0.0.1:{port}{path}"
-    out = run(host, cmd, timeout=timeout + 10)
+    auth_config = None
+    auth_option = ""
+    if api_key:
+        if "\n" in api_key or "\r" in api_key:
+            raise ValueError("API keys cannot contain newlines")
+        escaped_key = api_key.replace("\\", "\\\\").replace('"', '\\"')
+        auth_config = f'header = "Authorization: Bearer {escaped_key}"\n'
+        auth_option = " --config -"
+    cmd = (f"curl -sS -m {timeout} -X {method}{payload}{auth_option} "
+           f"http://127.0.0.1:{port}{path}")
+    out = run(host, cmd, timeout=timeout + 10, input=auth_config)
     if out.returncode != 0:
         return None
     try:
@@ -76,6 +86,32 @@ def tcp_open(host, port, timeout=3.0):
             return True
     except OSError:
         return False
+
+
+def tcp_open_from(host, target, port, timeout=3.0):
+    """Probe a worker from the router host, which is the process that must reach it."""
+    address = ipaddress.ip_address(target)
+    if address.version != 4 or not 1 <= int(port) <= 65535:
+        return False
+    script = (
+        "import socket; "
+        f"socket.create_connection(({str(address)!r}, {int(port)}), timeout={float(timeout)!r}).close()"
+    )
+    out = run(host, f"python3 -c {shlex.quote(script)}", timeout=timeout + 5)
+    return out.returncode == 0
+
+
+def worker_ipv4(host):
+    out = run(host, "hostname -I 2>/dev/null || ipconfig getifaddr en0")
+    for candidate in out.stdout.split():
+        try:
+            address = ipaddress.ip_address(candidate)
+        except ValueError:
+            continue
+        if address.version == 4 and not address.is_loopback and not address.is_unspecified:
+            return str(address)
+    return None
+
 
 def joshua_bin(host):
     out = run(host, "command -v joshua || echo $HOME/.cargo/bin/joshua")
@@ -107,12 +143,13 @@ def cmd_status(args):
     hosts = t3_hosts() if args.host in ("all", None) else [args.host]
     for host in hosts:
         port = args.port or provider_port(host)
-        models = api(host, port, "/v1/models")
-        if not models:
+        models = api(host, port, "/v1/models", api_key=getattr(args, "api_key", None))
+        if (not isinstance(models, dict) or models.get("error")
+                or not isinstance(models.get("data"), list)):
             print(f"{host:12} down (port {port})")
             continue
         ids = [m.get("id") for m in models.get("data", [])]
-        workers = api(host, port, "/v1/workers")
+        workers = api(host, port, "/v1/workers", api_key=getattr(args, "api_key", None))
         extra = ""
         if workers and isinstance(workers, dict):
             nodes = workers.get("workers") or workers.get("data") or []
@@ -122,9 +159,13 @@ def cmd_status(args):
 
 def cmd_models(args):
     port = args.port or provider_port(args.host)
-    models = api(args.host, port, "/v1/models") or {"data": []}
-    for m in models.get("data", []):
-        print(m.get("id"))
+    models = api(args.host, port, "/v1/models", api_key=getattr(args, "api_key", None))
+    if not isinstance(models, dict) or models.get("error"):
+        error = models.get("error") if isinstance(models, dict) else "no response"
+        print(f"{args.host}: model query failed: {error}")
+        return
+    for model in models.get("data", []):
+        print(model.get("id"))
 
 
 def shell_path(host, value):
@@ -138,48 +179,65 @@ def shell_path(host, value):
     if expanded == home:
         return '"$HOME"'
     if expanded.startswith(home + os.sep):
-        return '"$HOME/%s"' % expanded[len(home) + 1:]
+        return '"$HOME"/' + shlex.quote(expanded[len(home) + 1:])
     return shlex.quote(expanded)
+
+
+def store_secret(host, path, variable, value):
+    command = f'umask 077; mkdir -p "$HOME/.config/joshua"; cat > {path}; chmod 600 {path}'
+    contents = f"export {variable}={shlex.quote(value)}\n"
+    run(host, command, timeout=30, check=True, input=contents)
 
 
 def cmd_start(args):
     port, host = args.port, args.host
     log = f"$HOME/.joshua/logs/joshua-{port}.log"
     run_dir = "$HOME/.joshua/run"
-    launcher = "env -u JOSHUA_API_KEY -u JOSHUA_MODEL_PATH -u JOSHUA_DEVICE" if not args.api_key else "env"
-    parts = [launcher, joshua_bin(host), "serve", "--model", shell_path(host, args.model),
+    env_file = f'"$HOME/.config/joshua/api-{port}.env"'
+    if args.api_key:
+        store_secret(host, env_file, "JOSHUA_API_KEY", args.api_key)
+        env_setup = f". {env_file}; "
+        launcher = "env -u JOSHUA_MODEL_PATH -u JOSHUA_DEVICE"
+    else:
+        env_setup = ""
+        launcher = "env -u JOSHUA_API_KEY -u JOSHUA_MODEL_PATH -u JOSHUA_DEVICE"
+    parts = [launcher, shlex.quote(joshua_bin(host)), "serve", "--model", shell_path(host, args.model),
              "--addr", shlex.quote(args.addr or f"127.0.0.1:{port}"),
-             "--n-ctx", str(args.ctx), "--device", args.device]
+             "--n-ctx", str(args.ctx), "--device", shlex.quote(args.device)]
     if args.model_dir:
         parts += ["--model-dir", shell_path(host, args.model_dir)]
-    if args.api_key:
-        parts += ["--api-key", shlex.quote(args.api_key)]
     if getattr(args, "dense_placement", None):
-        parts += ["--dense-placement", args.dense_placement]
+        parts += ["--dense-placement", shlex.quote(args.dense_placement)]
     if getattr(args, "expert_placement", None):
-        parts += ["--expert-placement", args.expert_placement]
+        parts += ["--expert-placement", shlex.quote(args.expert_placement)]
     if args.extra:
-        parts += shlex.split(args.extra)
+        parts += [shlex.quote(part) for part in shlex.split(args.extra)]
+    run(host, f"mkdir -p {run_dir}; rm -f {run_dir}/joshua-{port}.pid")
     cmd = (f"mkdir -p {run_dir} $HOME/.joshua/logs; "
-           f"{' '.join(parts)} > {log} 2>&1 < /dev/null & echo $! > {run_dir}/joshua-{port}.pid")
+           f"{env_setup}{' '.join(parts)} > {log} 2>&1 < /dev/null & "
+           f"echo $! > {run_dir}/joshua-{port}.pid")
     if os.environ.get("JOSHUA_CONTROL_DEBUG"):
         print("[debug]", cmd)
     out = run(host, f"nohup bash -lc {shlex.quote(cmd)}", timeout=30)
     if out.returncode != 0:
         raise SystemExit(out.stderr.strip()[:400])
-    expected = os.path.basename(args.model).rsplit(".gguf", 1)[0]
     for _ in range(90):
-        payload = api(host, port, "/v1/models", timeout=5)
+        payload = api(host, port, "/v1/models", timeout=5, api_key=args.api_key)
         if isinstance(payload, dict):
             if "error" in payload:
+                error = payload["error"]
+                message = error.get("message", error) if isinstance(error, dict) else error
                 raise SystemExit(f"{host}: port {port} answered with an error (taken by another server?): "
-                                 f"{payload['error'].get('message', payload['error'])}")
-            ids = [m.get("id") for m in payload.get("data", [])]
-            if any(expected in (mid or "") for mid in ids):
+                                 f"{message}")
+            models = payload.get("data")
+            ids = [m.get("id") for m in models if isinstance(m, dict) and isinstance(m.get("id"), str)] \
+                if isinstance(models, list) else []
+            pid = run(host, f'kill -0 "$(cat {run_dir}/joshua-{port}.pid)"')
+            if ids and pid.returncode == 0:
                 print(f"{host}: joshua up on port {port} with {ids}")
                 return
         time.sleep(2)
-    raise SystemExit(f"{host}: joshua did not serve {expected} on port {port}; "
+    raise SystemExit(f"{host}: joshua did not serve a model on port {port}; "
                      f"see ~/.joshua/logs/joshua-{port}.log")
 
 
@@ -190,12 +248,14 @@ def cmd_stop(args):
 
 
 def cmd_load(args):
-    res = api(args.host, args.port, "/v1/models/load", "POST", {"model": args.model}, timeout=900)
+    res = api(args.host, args.port, "/v1/models/load", "POST", {"model": args.model}, timeout=900,
+              api_key=getattr(args, "api_key", None))
     print(json.dumps(res)[:400] if res is not None else "no response (is --model-dir set?)")
 
 
 def cmd_unload(args):
-    res = api(args.host, args.port, "/v1/models/unload", "POST", {"model": args.model})
+    res = api(args.host, args.port, "/v1/models/unload", "POST", {"id": args.model},
+              api_key=getattr(args, "api_key", None))
     print(json.dumps(res)[:400] if res is not None else "no response")
 
 
@@ -214,45 +274,91 @@ def cmd_cluster(args):
     if args.action == "status":
         for item in args.workers.split(","):
             host, _, port = item.partition(":")
-            port = int(port or worker_port)
+            try:
+                port = int(port or worker_port)
+            except ValueError as exc:
+                raise SystemExit(f"invalid worker port in {item!r}") from exc
+            if not 1 <= port <= 65535:
+                raise SystemExit(f"worker port out of range in {item!r}")
             target = "127.0.0.1" if resolve(host) == "local" else host
             if tcp_open(target, port):
                 print(f"{host:12} worker node listening on {port}")
             else:
                 print(f"{host:12} worker node not listening on {port}")
-        models = api(args.router, args.port, "/v1/models")
-        if models:
+        port = args.port
+        models = api(args.router, port, "/v1/models", api_key=args.api_key)
+        if (isinstance(models, dict) and not models.get("error")
+                and isinstance(models.get("data"), list)):
             print(f"{args.router:12} controller up  models="
                   f"{[m.get('id') for m in models.get('data', [])]}")
         else:
-            print(f"{args.router:12} controller not answering on port {args.port}")
+            print(f"{args.router:12} controller not answering on port {port}")
         return
 
+    if not args.workers.strip():
+        raise SystemExit("cluster up requires at least one --workers host")
     key = args.key or os.urandom(32).hex()
     addresses = []
     for item in args.workers.split(","):
         host, _, port = item.partition(":")
-        port = port or str(worker_port)
+        try:
+            port = int(port or worker_port)
+        except ValueError as exc:
+            raise SystemExit(f"invalid worker port in {item!r}") from exc
+        if not 1 <= port <= 65535:
+            raise SystemExit(f"worker port out of range in {item!r}")
         log = f"$HOME/.joshua/logs/worker-{port}.log"
-        cmd = (f"mkdir -p $HOME/.joshua/logs; env -u JOSHUA_API_KEY JOSHUA_CLUSTER_KEY={key} "
-               f"setsid nohup {joshua_bin(host)} worker --listen 0.0.0.0:{port} > {log} 2>&1 < /dev/null &")
+        ip = worker_ipv4(host)
+        if not ip:
+            raise SystemExit(f"[{host}] could not determine a worker address")
+        store_secret(host, '"$HOME/.config/joshua/cluster.env"', "JOSHUA_CLUSTER_KEY", key)
+        cmd = (f'mkdir -p "$HOME/.joshua/logs"; '
+               f'. "$HOME/.config/joshua/cluster.env"; '
+               f'env -u JOSHUA_API_KEY setsid nohup {shlex.quote(joshua_bin(host))} '
+               f'worker --listen {ip}:{port} > {log} 2>&1 < /dev/null &')
         run(host, f"bash -lc {shlex.quote(cmd)}", timeout=30)
-        ip = run(host, "hostname -I 2>/dev/null | awk '{print $1}' || ipconfig getifaddr en0").stdout.split()[0]
         addresses.append(f"{ip}:{port}")
         print(f"worker node {host}:{port} ({ip})")
 
+    for address in addresses:
+        ip, port = address.rsplit(":", 1)
+        for _ in range(15):
+            if tcp_open_from(args.router, ip, int(port), timeout=1):
+                break
+            time.sleep(1)
+        else:
+            raise SystemExit(f"worker {address} did not start listening; see worker-{port}.log")
+
     workers = ",".join(addresses)
     log = f"$HOME/.joshua/logs/controller-{args.port}.log"
-    cmd = (f"mkdir -p $HOME/.joshua/logs; env -u JOSHUA_API_KEY JOSHUA_CLUSTER_KEY={key} "
-           f"setsid nohup {joshua_bin(args.router)} serve --model {shell_path(args.router, args.model)} "
-           f"--model-dir {shell_path(args.router, args.model_dir or '~')} --worker {workers} "
-           f"--addr 127.0.0.1:{args.port} --n-ctx {args.ctx} --device {args.device} "
+    store_secret(args.router, '"$HOME/.config/joshua/cluster.env"', "JOSHUA_CLUSTER_KEY", key)
+    if args.api_key:
+        store_secret(args.router, f'"$HOME/.config/joshua/api-{args.port}.env"',
+                     "JOSHUA_API_KEY", args.api_key)
+        api_env = f'. "$HOME/.config/joshua/api-{args.port}.env"; '
+        launcher = "env"
+    else:
+        api_env = ""
+        launcher = "env -u JOSHUA_API_KEY"
+    cmd = (f'mkdir -p "$HOME/.joshua/logs"; '
+           f'. "$HOME/.config/joshua/cluster.env"; '
+           f'{api_env}'
+           f'{launcher} setsid nohup {shlex.quote(joshua_bin(args.router))} '
+           f'serve --model {shell_path(args.router, args.model)} '
+           f'--model-dir {shell_path(args.router, args.model_dir or "~")} --worker {shlex.quote(workers)} '
+           f"--addr 127.0.0.1:{args.port} --n-ctx {args.ctx} --device {shlex.quote(args.device)} "
            f"> {log} 2>&1 < /dev/null &")
     run(args.router, f"bash -lc {shlex.quote(cmd)}", timeout=30)
     print(f"controller {args.router}:{args.port} -> workers {workers}")
-    print(f"cluster key: {key}")
-    print("note: staging a model across workers is still refused by the planner on some models "
-          "(see rexlunae/joshua#267); `cluster status` shows which workers are up.")
+    for _ in range(90):
+        models = api(args.router, args.port, "/v1/models", timeout=5, api_key=args.api_key)
+        if (isinstance(models, dict) and not models.get("error")
+                and isinstance(models.get("data"), list) and models["data"]):
+            print(f"controller ready with {[model.get('id') for model in models['data']]}")
+            print("note: the stage planner still has placement limits; see rexlunae/joshua#267")
+            return
+        time.sleep(2)
+    raise SystemExit(f"[{args.router}] controller did not become ready; see {log}")
 
 
 def cmd_install(args):
@@ -267,24 +373,43 @@ def cmd_install(args):
     elif Path(agent).resolve() != (Path.home()/".t3/joshua"/AGENT_NAME).resolve():
         subprocess.run(["cp", str(agent), str(Path.home()/".t3/joshua"/AGENT_NAME)], check=True)
     run(host, f"chmod +x {target_dir}/{AGENT_NAME}", check=True)
-    script = f'''
-import json, pathlib
+    script = '''import json, pathlib, sys
+config = json.loads(sys.stdin.readline())
 p = pathlib.Path.home()/".t3/userdata/settings.json"
 p.parent.mkdir(parents=True, exist_ok=True)
-d = json.loads(p.read_text()) if p.exists() else {{}}
-inst = d.setdefault("providerInstances", {{}})
-inst["joshua_local"] = {{
+d = json.loads(p.read_text()) if p.exists() else {}
+agent = "$HOME/.t3/joshua/joshua_acp.py"
+launcher = pathlib.Path.home()/".t3/joshua/joshua-acp"
+api_env = f"$HOME/.config/joshua/api-{config['port']}.env"
+launcher.write_text(
+  "#!/bin/sh\\n"
+  f'if [ -r "{api_env}" ]; then . "{api_env}"; fi\\n'
+  f'exec "{agent}" "$@"\\n')
+launcher.chmod(0o700)
+args = ["--base-url", config["base_url"]]
+if config["cpu_url"]:
+    args += ["--cpu-url", config["cpu_url"]]
+if config["model_dir"]:
+    args += ["--model-dir", config["model_dir"]]
+d.setdefault("providerInstances", {})["joshua_local"] = {
   "driver": "acpRegistry",
   "displayName": "Joshua (local)",
   "enabled": True,
-  "config": {{"source": "local", "commandPath": str(pathlib.Path.home()/".t3/joshua/{AGENT_NAME}"),
-              "commandArgs": ["--base-url", "http://127.0.0.1:{port}"]
-                             + (["--cpu-url", "http://127.0.0.1:{cpu_port}"] if {cpu_port} else [])}},
-}}
+  "config": {"source": "local",
+             "commandPath": str(launcher),
+             "commandArgs": args},
+}
 p.write_text(json.dumps(d, indent=2) + "\\n")
+p.chmod(0o600)
 print("registered provider instance joshua_local")
 '''
-    out = run(host, f"python3 - <<'PY'\n{script}\nPY", check=True)
+    payload = json.dumps({
+        "base_url": f"http://127.0.0.1:{port}",
+        "cpu_url": f"http://127.0.0.1:{cpu_port}" if cpu_port else None,
+        "model_dir": args.model_dir,
+        "port": port,
+    }) + "\n"
+    out = run(host, f"python3 -c {shlex.quote(script)}", check=True, input=payload)
     print(f"[{host}] {out.stdout.strip()}")
     print(f"[{host}] restart that host's T3 server (or reconnect the device) so it re-reads providers")
 
@@ -299,6 +424,7 @@ def main():
         p = sub.add_parser(name)
         p.add_argument("--host", default="all" if name == "status" else "local")
         p.add_argument("--port", type=int, default=None)
+        p.add_argument("--api-key")
         p.set_defaults(func=func)
 
     p = sub.add_parser("start")
@@ -315,10 +441,12 @@ def main():
 
     p = sub.add_parser("load"); p.add_argument("--host", default="local")
     p.add_argument("--model", required=True); p.add_argument("--port", type=int, default=DEFAULT_PORT)
+    p.add_argument("--api-key")
     p.set_defaults(func=cmd_load)
 
     p = sub.add_parser("unload"); p.add_argument("--host", default="local")
     p.add_argument("--model", required=True); p.add_argument("--port", type=int, default=DEFAULT_PORT)
+    p.add_argument("--api-key")
     p.set_defaults(func=cmd_unload)
 
     p = sub.add_parser("logs"); p.add_argument("--host", default="local")
@@ -337,6 +465,8 @@ def main():
 
     p = sub.add_parser("install"); p.add_argument("--host", default="local")
     p.add_argument("--port", type=int, default=DEFAULT_PORT)
+    p.add_argument("--model-dir",
+                   help="the same --model-dir used by the Joshua server, for safe model discovery")
     p.add_argument("--cpu-port", type=int, default=None,
                    help="second (CPU) Joshua server that holds models too large for the GPU")
     p.set_defaults(func=cmd_install)

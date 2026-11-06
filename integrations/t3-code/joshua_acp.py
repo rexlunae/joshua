@@ -10,7 +10,7 @@ Models come from Joshua's /v1/models; the model is switchable per session throug
 `model` config option, so no restart is needed when Joshua serves several models
 (`joshua serve --model-dir DIR`).
 """
-import argparse, json, os, re, subprocess, sys, time, uuid
+import argparse, glob, json, os, re, signal, socket, subprocess, sys, threading, time, uuid
 from pathlib import Path
 
 MAX_TURNS = 24
@@ -123,7 +123,7 @@ class StreamSplitter:
 
     def _emit_safe(self, text):
         keep = 0
-        for marker in list(TOOL_BLOCKS) + [" thinking", "</think>"]:
+        for marker in list(TOOL_BLOCKS) + ["<think>", "</think>"]:
             for size in range(min(len(marker) - 1, len(text)), 0, -1):
                 if text.endswith(marker[:size]):
                     keep = max(keep, size)
@@ -144,7 +144,7 @@ class StreamSplitter:
                 self.in_think = False
                 continue
 
-            think = self.pending.find(" thinking")
+            think = self.pending.find("<think>")
             tool_at, tool_marker = None, None
             for marker in TOOL_BLOCKS:
                 at = self.pending.find(marker)
@@ -166,7 +166,7 @@ class StreamSplitter:
 
             if think >= 0 and (tool_at is None or think < tool_at):
                 out.append(self.pending[:think])
-                self.pending = self.pending[think + len(" thinking"):]
+                self.pending = self.pending[think + len("<think>"):]
                 self.in_think = True
                 continue
 
@@ -272,15 +272,36 @@ def gguf_names(path):
     return names
 
 
-def http_json(url, payload=None, api_key=None, timeout=300):
+class PromptCancelled(Exception):
+    pass
+
+
+def http_json(url, payload=None, api_key=None, timeout=300, cancel_event=None,
+              response_callback=None):
     import urllib.request
     data = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(url, data=data, method="POST" if data else "GET")
     req.add_header("Content-Type", "application/json")
     if api_key:
         req.add_header("Authorization", f"Bearer {api_key}")
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read().decode())
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            if response_callback:
+                response_callback(r)
+            if cancel_event and cancel_event.is_set():
+                r.close()
+                raise PromptCancelled()
+            try:
+                return json.loads(r.read().decode())
+            finally:
+                if response_callback:
+                    response_callback(None)
+    except Exception:
+        if response_callback:
+            response_callback(None)
+        if cancel_event and cancel_event.is_set():
+            raise PromptCancelled() from None
+        raise
 
 
 class Session:
@@ -290,37 +311,125 @@ class Session:
         self.cwd = Path(cwd or os.getcwd()).expanduser().resolve()
         self.messages = []
         self.model = None
+        self.cancel_event = threading.Event()
+        self.prompt_lock = threading.Lock()
+        self.response_lock = threading.Lock()
+        self.active_response = None
+        self.active_process = None
         self.opts = {"context_window": None, "reasoning_effort": None, "max_tokens": None,
                      "temperature": None, "top_p": None, "top_k": None, "min_p": None}
 
 
-DEFAULT_ROOTS = ["~/models", "~/llama.cpp/models", "~/.lmstudio/models", "~/nemo",
-                 "~/joshua-decode-20261006"]
+DEFAULT_ROOTS = ["~/models", "~/llama.cpp/models", "~/.lmstudio/models", "~/nemo"]
+
+
+def default_roots():
+    roots = [os.path.expanduser(root) for root in DEFAULT_ROOTS]
+    roots.extend(glob.glob(os.path.expanduser("~/joshua-decode-*")))
+    return roots
 
 
 class Agent:
-    def __init__(self, base_url, api_key, default_model, catalog_roots=None, cpu_url=None):
+    def __init__(self, base_url, api_key, default_model, catalog_roots=None, cpu_url=None,
+                 model_dir=None):
         self.base = base_url.rstrip("/")
         self.cpu_base = cpu_url.rstrip("/") if cpu_url else None
         self.key = api_key
         self.default_model = default_model
         self.sessions = {}
         self.aliases = {}
+        self._send_lock = threading.Lock()
         self.read_timeout = float(os.environ.get("JOSHUA_READ_TIMEOUT", 3600))
-        self.roots = [os.path.expanduser(r) for r in (catalog_roots or DEFAULT_ROOTS)]
+        self.model_dir = Path(os.path.expanduser(model_dir)).resolve() if model_dir else None
+        self.roots = []
+        if self.model_dir:
+            roots = catalog_roots if catalog_roots is not None else default_roots()
+            for root in roots:
+                resolved = Path(os.path.expanduser(root)).resolve()
+                if resolved.is_relative_to(self.model_dir):
+                    self.roots.append(resolved)
+                elif self.model_dir.is_relative_to(resolved):
+                    self.roots.append(self.model_dir)
+            if not self.roots and catalog_roots is None:
+                self.roots.append(self.model_dir)
+
+    @staticmethod
+    def _active_response(session, response):
+        with session.response_lock:
+            session.active_response = response
+            if response is not None and session.cancel_event.is_set():
+                Agent._close_response(response)
+
+    @staticmethod
+    def _close_response(response):
+        try:
+            sock = response.fp.raw._sock
+        except AttributeError:
+            response.close()
+            return
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        response.close()
+
+    @classmethod
+    def _cancel_session(cls, session):
+        session.cancel_event.set()
+        with session.response_lock:
+            response = session.active_response
+            if response is not None:
+                cls._close_response(response)
+            process = session.active_process
+            if process is not None and process.poll() is None:
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                except OSError:
+                    process.terminate()
+
+    @staticmethod
+    def _stop_process(process):
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            process.terminate()
+        try:
+            process.communicate(timeout=2)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except OSError:
+                process.kill()
+            process.communicate()
 
     # ---- Joshua ----
     def servers(self):
         return [u for u in (self.base, self.cpu_base) if u]
 
-    def server_models(self, base=None):
-        """Joshua's own model list: every GGUF it can load, with metadata (newer builds)."""
+    def server_models(self, base=None, session=None):
+        """Joshua's own `/v1/models` entries (all servers by default), tagged with `_server`.
+
+        Newer builds list every GGUF under `--model-dir` with `root`, architecture, quantization
+        and a `joshua.loaded` flag; older builds list only what is loaded.
+        """
         bases = [base] if base else self.servers()
         out = []
         for url in bases:
             try:
-                data = http_json(f"{url}/v1/models", api_key=self.key, timeout=30)
+                data = http_json(
+                    f"{url}/v1/models", api_key=self.key, timeout=30,
+                    cancel_event=session.cancel_event if session else None,
+                    response_callback=(lambda response: self._active_response(session, response))
+                    if session else None)
             except Exception:
+                if session and session.cancel_event.is_set():
+                    raise PromptCancelled()
                 continue
             for model in (data.get("data", []) if isinstance(data, dict) else []):
                 if isinstance(model, dict) and model.get("id"):
@@ -329,118 +438,187 @@ class Agent:
                     out.append(model)
         return out
 
-    def loaded(self, base=None):
-        """Model ids a Joshua server already has in memory."""
-        return [m["id"] for m in self.server_models(base) if (m.get("joshua") or {}).get("loaded")]
+    @staticmethod
+    def _is_loaded(model):
+        served = model.get("joshua")
+        if not isinstance(served, dict) or "loaded" not in served:
+            return True            # older builds only list loaded models
+        return bool(served.get("loaded"))
 
-    def catalog(self):
-        """The models Joshua reports, filtered to things a user should actually pick.
+    def loaded(self, base=None, session=None):
+        """Model ids a Joshua server already has in memory (all of them by default)."""
+        ids = []
+        for model in self.server_models(base, session=session):
+            if self._is_loaded(model) and model["id"] not in ids:
+                ids.append(model["id"])
+        return ids
 
-        Joshua's `/v1/models` is the authority: it lists every GGUF under `--model-dir` with its
-        root path, architecture, quantization and `joshua.loaded` flag.  The list needs filtering
-        before it reaches a picker:
+    def _inside_model_dir(self, root):
+        try:
+            path = Path(os.path.expanduser(root))
+            if not path.is_absolute():
+                return True        # a server-relative id; the server resolves it under its own dir
+            return path.resolve().is_relative_to(self.model_dir)
+        except (OSError, ValueError):
+            return False
+
+    def server_catalog(self):
+        """Joshua's own model list, filtered to things a user should actually pick.
 
         - `ggml-vocab-*.gguf` are tokenizer vocabularies, not models (`n_params == 0`)
-        - sharded models report one entry per shard; only `…-00001-of-0000N` is a model
+        - sharded models report one entry per shard; only `…-00001-of-0000N` is offered
+        - loaded models are left to `loaded()`, and roots outside `--model-dir` are dropped
         """
         found = {}
         for model in self.server_models():
-            model_id = model.get("id", "")
+            model_id = model["id"]
             meta = model.get("meta") or {}
             served = model.get("joshua") or {}
+            if not isinstance(served, dict) or "loaded" not in served or served.get("loaded"):
+                continue
             if model_id.startswith(("llama-fork/", "llama.cpp/")) or "ggml-vocab" in model_id:
                 continue
-            if not served.get("architecture") and int(meta.get("n_params") or 0) == 0:
+            try:
+                n_params = int(meta.get("n_params") or 0) if isinstance(meta, dict) else 0
+            except (TypeError, ValueError):
+                n_params = 0
+            if not served.get("architecture") and n_params == 0:
                 continue
             shard = re.match(r"^(.*)-(\d{5})-of-(\d{5})$", model_id)
             if shard:
                 if shard.group(2) != "00001":
                     continue
                 model_id = shard.group(1)
-            if model_id in found:
+            root = model.get("root") or model["id"]
+            if model_id in found or not self._inside_model_dir(root):
                 continue
-            found[model_id] = {
-                "path": model.get("root") or model_id,
-                "name": short_name(model_id),
-                "loaded": bool(served.get("loaded")),
-                "quant": served.get("quantization"),
-                "arch": served.get("architecture"),
-            }
-
-        # Joshua's scan stops at a shallow depth, so pick up deeper model directories too.
-        known = {info["path"] for info in found.values()}
-        for path, model_id in self.scan_paths().items():
-            if path in known or model_id in found:
-                continue
-            found[model_id] = {"path": path, "name": short_name(model_id), "loaded": False,
-                               "quant": None, "arch": None}
+            found[model_id] = {"path": root, "name": ""}
         return found
 
-    def scan_paths(self):
-        """GGUFs on disk that Joshua's own scan misses (it does not recurse deeply)."""
+    def catalog(self):
+        """Loadable models: Joshua's `/v1/models` list, plus disk-scan entries it misses.
+
+        Joshua's own scan does not recurse into deeper model directories, so the disk scan fills
+        the gap. Both are confined to the configured `--model-dir`.
+        """
+        if not self.model_dir:
+            return {}
+        found = self.server_catalog()
+        known = {str(info["path"]) for info in found.values()}
+        for model_id, info in self.scan_catalog().items():
+            if info["path"] in known or model_id in found:
+                continue
+            found[model_id] = info
+        return found
+
+    def scan_catalog(self):
+        """Loadable GGUFs on this host: id -> {path, name}. Needs a sibling tokenizer.json.
+
+        The id is the file stem (what Joshua reports for most models); the display name comes from
+        the GGUF metadata, so `moe.gguf` still reads as "DeepSeek V4 Flash 0731 Reap 150b". When a
+        catalog id has already been loaded, the alias map hides it in favour of the server's own id.
+        """
         found = {}
+        if not self.model_dir:
+            return found
         for root in self.roots:
             if not os.path.isdir(root):
                 continue
             for path in sorted(Path(root).rglob("*.gguf")):
                 if "ggml-vocab" in path.name or path.name.startswith("mmproj-"):
                     continue
-                shard = re.match(r"^(.*)-(\d{5})-of-(\d{5})$", path.stem)
-                if shard and shard.group(2) != "00001":
+                try:
+                    path = path.resolve(strict=True)
+                    if not path.is_relative_to(self.model_dir):
+                        continue
+                except OSError:
                     continue
                 if not (path.parent / "tokenizer.json").is_file():
                     continue
                 try:
                     with open(path, "rb") as fh:
-                        if fh.read(4) != b"GGUF":
+                        if fh.read(4) != b"GGUF":     # truncated download / HTML error page
                             continue
                 except OSError:
                     continue
-                model_id = shard.group(1) if shard else path.stem
-                found[str(path)] = model_id
+                stem = path.stem
+                shard = re.match(r"^(.*)-(\d{5})-of-(\d{5})$", stem)
+                if shard:
+                    if shard.group(2) != "00001":      # only the first part is a model entry
+                        continue
+                    stem = shard.group(1)
+                model_id = stem
+                if model_id in found:
+                    model_id = f"{stem} [{path.parent.name}]"
+                meta = gguf_names(path)
+                label = meta.get("general.name") or meta.get("general.basename") or path.stem
+                found[model_id] = {"path": str(path), "name": label}
         return found
 
     def models(self):
-        """Everything the user may pick, from Joshua's own list."""
-        out, seen = [], set()
-        for model_id, info in self.catalog().items():
-            if model_id in seen:
+        """Everything the user may pick: what Joshua has loaded, plus the rest of the catalog.
+
+        Each entry's `name` is a short label with the distinguishing part first, because the
+        client elides the tail of a long one (`…-UD-IQ1_S` hid which quant it was).
+        """
+        catalog = self.catalog()
+        loaded = self.loaded()
+        out = [{"modelId": mid,
+                "name": short_name(mid, catalog.get(mid, {}).get("name", "")) + " *"}
+               for mid in loaded]
+        for model_id, info in catalog.items():
+            if model_id in loaded or self.aliases.get(model_id) in loaded:
                 continue
-            seen.add(model_id)
-            label = info["name"]
-            if info.get("loaded"):
-                label = f"{label} *"
-            out.append({"modelId": model_id, "name": label})
+            out.append({"modelId": model_id, "name": short_name(model_id, info["name"])})
         return out
 
-    def ensure_loaded(self, model_id):
+    def ensure_loaded(self, model_id, session=None):
         """Resolve a picker id to a model the server has actually loaded.
 
         A loaded id is returned as-is; a catalog id is loaded through POST /v1/models/load and the
         server's own id for it is remembered, so later turns and the picker agree.
         """
         for candidate in self.servers():
-            in_this = self.loaded(candidate)
+            in_this = self.loaded(candidate, session=session)
             if model_id in in_this:
                 return model_id, candidate
             if self.aliases.get(model_id) in in_this:
                 return self.aliases[model_id], candidate
+        # A catalog id may have been renamed after the server loaded it. The
+        # persistent alias is a hint, not an identity guarantee: discard a
+        # stale alias and continue with the catalog path instead of returning
+        # a model that no longer exists.
+        stale_alias = self.aliases.pop(model_id, None)
+        if stale_alias:
+            for candidate in self.servers():
+                loaded = self.loaded(candidate, session=session)
+                if model_id in loaded:
+                    return model_id, candidate
+                if stale_alias in loaded:
+                    return stale_alias, candidate
         info = self.catalog().get(model_id)
         if info is None:
             raise ValueError(f"model {model_id!r} is not loaded and not in the catalog on this host")
         res, base = None, self.base
         errors = []
         for candidate in self.servers():
-            if model_id in self.loaded(candidate):
+            if model_id in self.loaded(candidate, session=session):
                 return model_id, candidate
             try:
                 attempt = http_json(f"{candidate}/v1/models/load", {"model": info["path"]},
-                                    self.key, timeout=3600)
+                                    self.key, timeout=3600,
+                                    cancel_event=session.cancel_event if session else None,
+                                    response_callback=(lambda response: self._active_response(session, response))
+                                    if session else None)
+            except PromptCancelled:
+                raise
             except Exception as exc:
                 errors.append(f"{candidate}: {exc}")
                 continue
             if isinstance(attempt, dict) and attempt.get("error"):
-                errors.append(f"{candidate}: {attempt['error'].get('message', attempt['error'])}")
+                error = attempt["error"]
+                message = error.get("message", error) if isinstance(error, dict) else error
+                errors.append(f"{candidate}: {message}")
                 continue
             res, base = attempt, candidate
             break
@@ -448,14 +626,19 @@ class Agent:
             raise ValueError("; ".join(errors) or f"could not load {model_id!r}")
         server_id = res.get("id") if isinstance(res, dict) else None
         for _ in range(900):
-            loaded = self.loaded(base)
+            if session and session.cancel_event.is_set():
+                raise PromptCancelled()
+            loaded = self.loaded(base, session=session)
             if server_id and server_id in loaded:
                 self.aliases[model_id] = server_id
                 return server_id, base
             if model_id in loaded:
                 self.aliases[model_id] = model_id
                 return model_id, base
-            time.sleep(1)
+            if session:
+                session.cancel_event.wait(1)
+            else:
+                time.sleep(1)
         raise ValueError(f"Joshua accepted {model_id!r} but never reported it as loaded")
 
     def chat(self, session, tools=None, emit=None):
@@ -483,46 +666,59 @@ class Agent:
 
         content, calls, usage, saw_sse, raw_body = [], {}, None, False, []
         splitter = StreamSplitter()
-        with urllib.request.urlopen(req, timeout=self.read_timeout) as resp:
-            for raw in resp:
-                line = raw.decode("utf-8", "replace").strip()
-                if not line:
-                    continue
-                if not line.startswith("data:"):
-                    raw_body.append(line)
-                    continue
-                saw_sse = True
-                data = line[5:].strip()
-                if data == "[DONE]":
-                    break
+        try:
+            with urllib.request.urlopen(req, timeout=self.read_timeout) as resp:
+                self._active_response(session, resp)
                 try:
-                    chunk = json.loads(data)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(chunk, dict) and chunk.get("error"):
-                    raise ValueError(str(chunk["error"].get("message") or chunk["error"]))
-                if chunk.get("usage"):
-                    usage = chunk["usage"]
-                for choice in chunk.get("choices") or []:
-                    delta = choice.get("delta") or {}
-                    text = delta.get("content")
-                    if text:
-                        visible = splitter.feed(text)
-                        if visible:
-                            content.append(visible)
-                            if emit:
-                                emit(visible)
-                    for piece in delta.get("tool_calls") or []:
-                        slot = calls.setdefault(piece.get("index", 0),
-                                                {"id": None, "type": "function",
-                                                 "function": {"name": "", "arguments": ""}})
-                        if piece.get("id"):
-                            slot["id"] = piece["id"]
-                        fn = piece.get("function") or {}
-                        if fn.get("name"):
-                            slot["function"]["name"] = fn["name"]
-                        if fn.get("arguments"):
-                            slot["function"]["arguments"] += fn["arguments"]
+                    for raw in resp:
+                        if session.cancel_event.is_set():
+                            break
+                        line = raw.decode("utf-8", "replace").strip()
+                        if not line:
+                            continue
+                        if not line.startswith("data:"):
+                            raw_body.append(line)
+                            continue
+                        saw_sse = True
+                        data = line[5:].strip()
+                        if data == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(data)
+                        except json.JSONDecodeError:
+                            continue
+                        if isinstance(chunk, dict) and chunk.get("error"):
+                            raise ValueError(str(chunk["error"].get("message") or chunk["error"]))
+                        if chunk.get("usage"):
+                            usage = chunk["usage"]
+                        for choice in chunk.get("choices") or []:
+                            delta = choice.get("delta") or {}
+                            text = delta.get("content")
+                            if text:
+                                visible = splitter.feed(text)
+                                if visible:
+                                    content.append(visible)
+                                    if emit:
+                                        emit(visible)
+                            for piece in delta.get("tool_calls") or []:
+                                slot = calls.setdefault(piece.get("index", 0),
+                                                        {"id": None, "type": "function",
+                                                         "function": {"name": "", "arguments": ""}})
+                                if piece.get("id"):
+                                    slot["id"] = piece["id"]
+                                fn = piece.get("function") or {}
+                                if fn.get("name"):
+                                    slot["function"]["name"] = fn["name"]
+                                if fn.get("arguments"):
+                                    slot["function"]["arguments"] += fn["arguments"]
+                finally:
+                    self._active_response(session, None)
+        except Exception:
+            if session.cancel_event.is_set():
+                return {"role": "assistant", "content": "".join(content)}
+            raise
+        if session.cancel_event.is_set():
+            return {"role": "assistant", "content": "".join(content)}
 
         if not saw_sse and raw_body:
             try:
@@ -594,11 +790,39 @@ class Agent:
                 p.write_text(text.replace(old, new, 1))
                 return f"edited {p}"
             if name == "run_command":
-                out = subprocess.run(["/bin/bash", "-lc", args["command"]], cwd=session.cwd,
-                                     capture_output=True, text=True,
-                                     timeout=float(args.get("timeout_s") or 120))
-                body = f"exit {out.returncode}\nstdout:\n{out.stdout}\nstderr:\n{out.stderr}"
-                return body[:TOOL_OUTPUT_LIMIT]
+                process = subprocess.Popen(
+                    ["/bin/bash", "-lc", args["command"]], cwd=session.cwd,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                    start_new_session=True)
+                with session.response_lock:
+                    session.active_process = process
+                    cancelled = session.cancel_event.is_set()
+                try:
+                    if cancelled:
+                        self._stop_process(process)
+                        return "ERROR: command cancelled"
+                    deadline = time.monotonic() + float(args.get("timeout_s") or 120)
+                    while True:
+                        if session.cancel_event.is_set():
+                            self._stop_process(process)
+                            return "ERROR: command cancelled"
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            self._stop_process(process)
+                            return "ERROR: command timed out"
+                        try:
+                            stdout, stderr = process.communicate(timeout=min(0.25, remaining))
+                            if session.cancel_event.is_set():
+                                return "ERROR: command cancelled"
+                            break
+                        except subprocess.TimeoutExpired:
+                            continue
+                    body = f"exit {process.returncode}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+                    return body[:TOOL_OUTPUT_LIMIT]
+                finally:
+                    with session.response_lock:
+                        if session.active_process is process:
+                            session.active_process = None
             return f"ERROR: unknown tool {name}"
         except subprocess.TimeoutExpired:
             return "ERROR: command timed out"
@@ -607,8 +831,9 @@ class Agent:
 
     # ---- ACP ----
     def send(self, msg):
-        sys.stdout.write(json.dumps(msg) + "\n")
-        sys.stdout.flush()
+        with self._send_lock:
+            sys.stdout.write(json.dumps(msg) + "\n")
+            sys.stdout.flush()
 
     def note(self, session, text):
         self.send({"jsonrpc": "2.0", "method": "session/update", "params": {
@@ -657,7 +882,7 @@ class Agent:
         else:
             session.opts[key] = value
 
-    def handle(self, req):
+    def handle(self, req, prompt_reserved=False):
         method = req.get("method")
         params = req.get("params") or {}
         rid = req.get("id")
@@ -684,41 +909,75 @@ class Agent:
             s = self.sessions.get(params.get("sessionId"))
             if not s:
                 raise ValueError("unknown session")
-            self.apply_option(s, params.get("configId"), params.get("value"))
+            if not s.prompt_lock.acquire(blocking=False):
+                raise ValueError("cannot change configuration during an active prompt")
+            try:
+                self.apply_option(s, params.get("configId"), params.get("value"))
+            finally:
+                s.prompt_lock.release()
             return {"configOptions": self.config_options(s)}
 
         if method == "session/cancel":
+            s = self.sessions.get(params.get("sessionId"))
+            if s:
+                self._cancel_session(s)
             return {}
 
         if method == "session/prompt":
             s = self.sessions.get(params.get("sessionId"))
             if not s:
                 raise ValueError("unknown session")
-            text = "\n".join(p.get("text", "") for p in params.get("prompt", []) if p.get("type") == "text")
-            if not s.messages:
-                s.messages.append({"role": "system", "content": SYSTEM.format(cwd=s.cwd)})
-            s.model, s.base = self.ensure_loaded(s.model)
-            s.messages.append({"role": "user", "content": text})
-            for _ in range(MAX_TURNS):
-                msg = self.chat(s, TOOLS, emit=lambda t: self.note(s, t))
-                s.messages.append({"role": "assistant", **{k: msg[k] for k in ("content", "tool_calls") if msg.get(k) is not None}})
-                calls = msg.get("tool_calls") or []
-                if not calls:
-                    break
-                for call in calls:
-                    fn = call.get("function") or {}
-                    try:
-                        args = json.loads(fn.get("arguments") or "{}")
-                    except json.JSONDecodeError:
-                        args = {}
-                    result = self.run_tool(s, fn.get("name", ""), args)
-                    s.messages.append({"role": "tool", "tool_call_id": call.get("id"),
-                                       "content": result})
-            return {"stopReason": "end_turn"}
+            if not prompt_reserved:
+                if not s.prompt_lock.acquire(blocking=False):
+                    raise ValueError("a prompt is already active for this session")
+                s.cancel_event.clear()
+            try:
+                text = "\n".join(p.get("text", "") for p in params.get("prompt", []) if p.get("type") == "text")
+                if not s.messages:
+                    s.messages.append({"role": "system", "content": SYSTEM.format(cwd=s.cwd)})
+                s.messages.append({"role": "user", "content": text})
+                try:
+                    s.model, s.base = self.ensure_loaded(s.model, session=s)
+                except PromptCancelled:
+                    return {"stopReason": "cancelled"}
+                for _ in range(MAX_TURNS):
+                    if s.cancel_event.is_set():
+                        return {"stopReason": "cancelled"}
+                    msg = self.chat(s, TOOLS, emit=lambda t: self.note(s, t))
+                    if s.cancel_event.is_set():
+                        if msg.get("content"):
+                            s.messages.append({"role": "assistant", "content": msg["content"]})
+                        return {"stopReason": "cancelled"}
+                    s.messages.append({"role": "assistant", **{k: msg[k] for k in ("content", "tool_calls") if msg.get(k) is not None}})
+                    calls = msg.get("tool_calls") or []
+                    if not calls:
+                        break
+                    for call in calls:
+                        if s.cancel_event.is_set():
+                            return {"stopReason": "cancelled"}
+                        fn = call.get("function") or {}
+                        try:
+                            args = json.loads(fn.get("arguments") or "{}")
+                        except json.JSONDecodeError:
+                            args = {}
+                        result = self.run_tool(s, fn.get("name", ""), args)
+                        s.messages.append({"role": "tool", "tool_call_id": call.get("id"),
+                                           "content": result})
+                return {"stopReason": "end_turn"}
+            finally:
+                s.prompt_lock.release()
 
         raise ValueError(f"unsupported method {method}")
 
     def run(self):
+        def respond(req, prompt_reserved=False):
+            try:
+                result = self.handle(req, prompt_reserved=prompt_reserved)
+                self.send({"jsonrpc": "2.0", "id": req["id"], "result": result})
+            except Exception as exc:
+                self.send({"jsonrpc": "2.0", "id": req["id"],
+                           "error": {"code": -32603, "message": f"{type(exc).__name__}: {exc}"}})
+
         for line in sys.stdin:
             line = line.strip()
             if not line:
@@ -727,14 +986,20 @@ class Agent:
                 req = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            if req.get("method") == "session/cancel" and "id" not in req:
+                self.handle(req)
+                continue
             if "id" not in req:
                 continue
-            try:
-                result = self.handle(req)
-                self.send({"jsonrpc": "2.0", "id": req["id"], "result": result})
-            except Exception as exc:
-                self.send({"jsonrpc": "2.0", "id": req["id"],
-                           "error": {"code": -32603, "message": f"{type(exc).__name__}: {exc}"}})
+            if req.get("method") == "session/prompt":
+                session = self.sessions.get((req.get("params") or {}).get("sessionId"))
+                if session and session.prompt_lock.acquire(blocking=False):
+                    session.cancel_event.clear()
+                    threading.Thread(target=respond, args=(req, True), daemon=True).start()
+                else:
+                    threading.Thread(target=respond, args=(req,), daemon=True).start()
+            else:
+                respond(req)
 
 
 def main():
@@ -745,9 +1010,11 @@ def main():
     ap.add_argument("--cpu-url", default=os.environ.get("JOSHUA_CPU_URL"),
                     help="second Joshua server for models that cannot fit the GPU")
     ap.add_argument("--catalog", action="append", default=None,
-                    help="directory to scan for loadable GGUF models (repeatable)")
+                    help="additional directory inside --model-dir to scan (repeatable)")
+    ap.add_argument("--model-dir", default=os.environ.get("JOSHUA_MODEL_DIR"),
+                    help="Joshua server's --model-dir; catalog results are restricted to this directory")
     args = ap.parse_args()
-    Agent(args.base_url, args.api_key, args.model, args.catalog, args.cpu_url).run()
+    Agent(args.base_url, args.api_key, args.model, args.catalog, args.cpu_url, args.model_dir).run()
 
 
 if __name__ == "__main__":

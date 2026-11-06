@@ -225,6 +225,81 @@ pub struct Model {
     pub created: u64,
     #[serde(default)]
     pub owned_by: String,
+    /// Most tokens, prompt and output together, one request may use.
+    #[serde(default)]
+    pub context_length: Option<u32>,
+    /// The context the model was trained with.
+    #[serde(default)]
+    pub max_context_length: Option<u32>,
+    /// Ceiling on one request's output: the server's `--max-output-tokens`.
+    /// Absent only for an entry without limits (the Whisper model, a
+    /// coordinator's entry for an older worker, an older server).
+    #[serde(default)]
+    pub max_output_tokens: Option<u32>,
+    /// Whether the model is loaded, and where it runs.
+    #[serde(default)]
+    pub joshua: Option<ModelPlacement>,
+}
+
+/// The `joshua` object of a `/v1/models` entry (the fields the UI shows).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+pub struct ModelPlacement {
+    #[serde(default)]
+    pub loaded: bool,
+    #[serde(default)]
+    pub backend: Option<String>,
+    #[serde(default)]
+    pub dense: Option<String>,
+    #[serde(default)]
+    pub experts: Option<String>,
+    /// The layers run on pipeline workers.
+    #[serde(default)]
+    pub workers: Vec<String>,
+}
+
+impl Model {
+    /// Whether requests can use the model now: a `--model-dir` file not
+    /// loaded yet is listed too, and is not.  Servers that do not say are
+    /// taken to list only loaded models.
+    pub fn is_loaded(&self) -> bool {
+        self.joshua.as_ref().is_none_or(|p| p.loaded)
+    }
+
+    /// The context a request may use, with the trained context when that
+    /// is larger: `"8192 of 40960"`.  `"–"` when the server does not say.
+    pub fn context_label(&self) -> String {
+        match (self.context_length, self.max_context_length) {
+            (Some(n), Some(trained)) if trained > n => format!("{n} of {trained}"),
+            (Some(n), _) => n.to_string(),
+            (None, _) => "–".to_string(),
+        }
+    }
+
+    /// The server's cap on one request's output.  `"–"` when the server
+    /// does not say.
+    pub fn output_label(&self) -> String {
+        self.max_output_tokens
+            .map_or_else(|| "–".to_string(), |n| n.to_string())
+    }
+
+    /// Where the model runs: `"cuda"`, `"cuda, experts on cpu"`,
+    /// `"2 pipeline workers"`, or `"not loaded"`.
+    pub fn placement_label(&self) -> String {
+        let Some(p) = &self.joshua else {
+            return "–".to_string();
+        };
+        if !p.loaded {
+            return "not loaded".to_string();
+        }
+        if !p.workers.is_empty() {
+            return format!("{} pipeline workers", p.workers.len());
+        }
+        let dense = p.dense.as_deref().or(p.backend.as_deref()).unwrap_or("–");
+        match p.experts.as_deref() {
+            Some(experts) if experts != dense => format!("{dense}, experts on {experts}"),
+            _ => dense.to_string(),
+        }
+    }
 }
 
 /// `GET /v1/models` body.
@@ -758,6 +833,47 @@ mod tests {
         assert_eq!(models.data[0].id, "qwen3-0.6b");
         assert_eq!(models.data[1].owned_by, "joshua");
         assert_eq!(models.data[0].created, 1_700_000_000);
+        // An older server sends no limits or placement.
+        assert_eq!(models.data[0].context_label(), "–");
+        assert_eq!(models.data[0].output_label(), "–");
+        assert_eq!(models.data[0].placement_label(), "–");
+    }
+
+    #[test]
+    fn parses_model_limits_and_placement() {
+        let body = r#"{"object":"list","data":[
+            {"id":"moe","object":"model","created":1,"owned_by":"joshua",
+             "context_length":8192,"max_context_length":40960,"max_output_tokens":4096,
+             "max_model_len":8192,"meta":{"n_ctx":8192},
+             "joshua":{"loaded":true,"backend":"cuda","dense":"cuda","experts":"cpu"}},
+            {"id":"dense","context_length":4096,"max_context_length":4096,"max_output_tokens":1024,
+             "joshua":{"loaded":true,"backend":"cpu","dense":"cpu"}},
+            {"id":"file","context_length":4096,"max_output_tokens":4096,"joshua":{"loaded":false}},
+            {"id":"split","context_length":512,"max_context_length":512,"max_output_tokens":4096,
+             "joshua":{"loaded":true,"backend":"cpu","dense":"cpu","remote":true,
+             "workers":["10.0.0.2:7070","10.0.0.3:7070"],"stages":[[0,14],[14,28]]}},
+            {"id":"whisper-base","joshua":{"loaded":true,"backend":"cpu","dense":"cpu"}}]}"#;
+        let models = parse_models(body).unwrap();
+        let [moe, dense, file, split, whisper] = &models.data[..] else {
+            panic!("five models")
+        };
+        assert_eq!(split.placement_label(), "2 pipeline workers");
+        assert_eq!(moe.context_label(), "8192 of 40960");
+        assert_eq!(moe.output_label(), "4096");
+        assert_eq!(moe.placement_label(), "cuda, experts on cpu");
+        assert_eq!(dense.context_label(), "4096");
+        assert_eq!(dense.output_label(), "1024");
+        assert_eq!(dense.placement_label(), "cpu");
+        assert_eq!(file.placement_label(), "not loaded");
+        // The Whisper model's entry has no limits.
+        assert_eq!(whisper.context_label(), "–");
+        assert_eq!(whisper.output_label(), "–");
+        assert_eq!(whisper.placement_label(), "cpu");
+        // Only loaded models are offered for chat; an older server's
+        // entries carry no `joshua` object and count as loaded.
+        assert!(moe.is_loaded() && split.is_loaded() && !file.is_loaded());
+        let old = parse_models(r#"{"data":[{"id":"m"}]}"#).unwrap();
+        assert!(old.data[0].is_loaded());
     }
 
     #[test]

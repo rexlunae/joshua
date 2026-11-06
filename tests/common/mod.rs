@@ -3239,6 +3239,32 @@ pub fn think_model_dir(name: &str) -> PathBuf {
     dir
 }
 
+/// Rewrite `path` with a different `tokenizer.chat_template`, keeping every
+/// other metadata entry and tensor.
+pub fn replace_chat_template(path: &Path, template: &str) {
+    let mut file = std::fs::File::open(path).unwrap();
+    let content = gguf_file::Content::read(&mut file).unwrap();
+    let mut metadata = content.metadata.clone();
+    metadata.insert(
+        "tokenizer.chat_template".to_string(),
+        gguf_file::Value::String(template.to_string()),
+    );
+    let tensors: Vec<(String, _)> = content
+        .tensor_infos
+        .keys()
+        .map(|name| {
+            let t = content.tensor(&mut file, name, &Device::Cpu).unwrap();
+            (name.clone(), t)
+        })
+        .collect();
+    drop(file);
+    let metadata_refs: Vec<(&str, &gguf_file::Value)> =
+        metadata.iter().map(|(k, v)| (k.as_str(), v)).collect();
+    let tensor_refs: Vec<(&str, &_)> = tensors.iter().map(|(k, t)| (k.as_str(), t)).collect();
+    let mut out = std::fs::File::create(path).unwrap();
+    gguf_file::write(&mut out, &metadata_refs, &tensor_refs).unwrap();
+}
+
 /// Create a fresh model directory under the target tmp area.
 pub fn model_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir()

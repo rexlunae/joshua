@@ -11,6 +11,9 @@
 //!
 //! # Embed text
 //! joshua embed --model ./weights/nomic-embed.gguf "Hello world"
+//!
+//! # Score a corpus (perplexity — the quality measurement)
+//! joshua ppl --model ./weights/model.gguf --file held-out.txt --json
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -306,13 +309,17 @@ enum Commands {
     },
     /// Start the OpenAI-compatible HTTP API server.
     Serve {
-        /// Path to the GGUF model file.  Optional with --model-dir, where
-        /// models are loaded later through POST /v1/models/load.
+        /// Path to the GGUF model file, or to a directory of models.  A
+        /// directory is served as --model-dir serves it — every model in it is
+        /// listed and selectable by name — and the server starts on the model
+        /// it finds there.  Optional with --model-dir, where every model is
+        /// loaded by the first request that names it.
         #[arg(short, long, env = "JOSHUA_MODEL_PATH", required_unless_present = "model_dir")]
         model: Option<PathBuf>,
         /// Enable POST /v1/models/load and /v1/models/unload for models in
-        /// this directory.  Protect the API with --api-key when it is not
-        /// bound to localhost.
+        /// this directory, which GET /v1/models also lists.  A request selects
+        /// one by its listed id, and the first request that names it loads it.
+        /// Protect the API with --api-key when it is not bound to localhost.
         #[arg(long, env = "JOSHUA_MODEL_DIR")]
         model_dir: Option<PathBuf>,
         /// Model-less workers (`joshua worker`) this controller may place
@@ -564,6 +571,17 @@ enum Commands {
             default_value_t = false
         )]
         trust_request_chat_template: bool,
+        /// Tool-call format to parse model output with, by vLLM's parser
+        /// name (hermes, qwen3_coder, llama3_json, pythonic, deepseek_v4,
+        /// kimi_k2, glm45, openai, …; an unknown name lists them all).
+        /// `auto` detects it from the chat template and the architecture.
+        #[arg(
+            long,
+            env = "JOSHUA_TOOL_CALL_PARSER",
+            default_value = "auto",
+            value_parser = joshua::tools::ToolCallFormat::parse_override
+        )]
+        tool_call_parser: ::std::option::Option<joshua::tools::ToolCallFormat>,
         /// Require this API key on /v1 routes (Authorization: Bearer <key>
         /// or x-api-key: <key>).  A comma-separated list accepts any key.
         #[arg(long, env = "JOSHUA_API_KEY")]
@@ -901,6 +919,35 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Score text and report perplexity — a data-driven quality measurement
+    /// for a checkpoint (compare a compressed model against its source on the
+    /// same corpus).
+    Ppl {
+        /// Path to the GGUF model file.
+        #[arg(short, long, env = "JOSHUA_MODEL_PATH")]
+        model: PathBuf,
+        /// UTF-8 text file to score.  `-` reads standard input.
+        #[arg(short, long)]
+        file: PathBuf,
+        /// Context window in tokens.
+        #[arg(long, env = "JOSHUA_N_CTX", default_value_t = 4096)]
+        n_ctx: u32,
+        /// Tokens per scored window (defaults to the context window).
+        #[arg(long)]
+        window: Option<usize>,
+        /// Score at most this many tokens (0 = the whole file).
+        #[arg(long, default_value_t = 0)]
+        limit: usize,
+        /// Wrap the text with the tokenizer's BOS/EOS special tokens.
+        #[arg(long)]
+        bos: bool,
+        /// Compute backend: auto, cpu, metal, or cuda.
+        #[arg(long, env = "JOSHUA_DEVICE", value_enum, default_value_t = DeviceArg::Auto)]
+        device: DeviceArg,
+        /// Emit one JSON object instead of text.
+        #[arg(long)]
+        json: bool,
+    },
     /// Print host, model, and build information for a benchmark report.
     Report {
         /// Optional GGUF model whose size and header describe the run.
@@ -1018,6 +1065,7 @@ async fn main() -> anyhow::Result<()> {
             chat_template,
             chat_template_file,
             trust_request_chat_template,
+            tool_call_parser,
             api_key,
             cors_origin,
             tls_cert,
@@ -1092,12 +1140,24 @@ async fn main() -> anyhow::Result<()> {
                 .device_memory_budget(vram_budget.map(|mib| mib.saturating_mul(1024 * 1024)))
                 .sampling(sampling.overrides())
                 .chat_template(chat_template_source(chat_template, chat_template_file)?)
-                .trust_request_chat_template(trust_request_chat_template);
+                .trust_request_chat_template(trust_request_chat_template)
+                .tool_call_parser(tool_call_parser);
             // One backend serves the startup model and any loaded later.
             let npu = npu_plugin
                 .map(|plugin| npu_backend(&plugin, npu_in_process))
                 .transpose()?;
-            let models = match &model {
+            let (model, model_dir) = serve_targets(model, model_dir)?;
+            if let Some(dir) = &model_dir {
+                tracing::info!(
+                    dir = %dir.display(),
+                    "model directory: every model in it is listed by GET /v1/models and loaded \
+                     by the first request that names it"
+                );
+            }
+            // Startup model first, so `opts`/`npu` are still available to it;
+            // the registry then names it by the id the inventory lists its file
+            // by, which needs the manager.
+            let engine = match &model {
                 Some(model) => {
                     let mut engine = Engine::with_options(model, opts.clone())?;
                     if let Some(backend) = &npu {
@@ -1109,9 +1169,9 @@ async fn main() -> anyhow::Result<()> {
                     if let Some(max) = max_output_tokens {
                         engine = engine.with_max_output_tokens(max);
                     }
-                    server::ModelRegistry::with_model(Arc::new(engine))
+                    Some(Arc::new(engine))
                 }
-                None => server::ModelRegistry::default(),
+                None => None,
             };
             let manager = model_dir.map(|model_dir| -> anyhow::Result<_> {
                 Ok(server::ModelManager {
@@ -1139,6 +1199,24 @@ async fn main() -> anyhow::Result<()> {
                     workers,
                 })
             });
+            let models = match engine {
+                Some(engine) => {
+                    // The id `/v1/models` lists the startup model's file by, so
+                    // the list and the served id agree (`a/model.gguf` for a
+                    // nested file whose stem is shared).
+                    let id = match (model.as_deref(), manager.as_ref()) {
+                        (Some(model), Some(manager)) => {
+                            manager.as_ref().ok().and_then(|m| m.inventory_id(model))
+                        }
+                        _ => None,
+                    };
+                    match id {
+                        Some(id) => server::ModelRegistry::with_model_named(engine, id),
+                        None => server::ModelRegistry::with_model(engine),
+                    }
+                }
+                None => server::ModelRegistry::default(),
+            };
             let whisper = whisper_model
                 .map(joshua::whisper::WhisperEngine::new)
                 .transpose()?
@@ -1338,6 +1416,100 @@ async fn main() -> anyhow::Result<()> {
                         row["decode_tps"].as_f64().unwrap_or(0.0),
                     );
                 }
+            }
+        }
+
+        Commands::Ppl {
+            model,
+            file,
+            n_ctx,
+            window,
+            limit,
+            bos,
+            device,
+            json,
+        } => {
+            let text = if file.as_os_str() == "-" {
+                let mut buf = String::new();
+                use std::io::Read;
+                std::io::stdin()
+                    .read_to_string(&mut buf)
+                    .map_err(|e| anyhow::anyhow!("reading stdin: {e}"))?;
+                buf
+            } else {
+                std::fs::read_to_string(&file)
+                    .map_err(|e| anyhow::anyhow!("reading {}: {e}", file.display()))?
+            };
+            let opts = EngineOptions::with_n_ctx(n_ctx).backend(device.into());
+            let engine = Engine::with_options(&model, opts)?;
+            // The engine resolves 0 to its default context, so bound and default
+            // the window from what it actually loaded — not from the raw flag,
+            // where `--n-ctx 0` would invert `clamp`'s bounds and panic.
+            let n_ctx = engine.n_ctx();
+            if n_ctx < 2 {
+                // A window needs two tokens: position 0 predicts token 1.
+                anyhow::bail!(
+                    "context window of {n_ctx} token(s) is too small to score: a window needs \
+                     at least 2 tokens"
+                );
+            }
+            let n_ctx = n_ctx as usize;
+            let mut tokens = engine.tokenize(&text, bos)?;
+            if limit > 0 && tokens.len() > limit {
+                tokens.truncate(limit);
+            }
+            let window = ppl_window(window, n_ctx);
+
+            if tokens.len() < 2 {
+                anyhow::bail!(
+                    "need at least 2 tokens to score (got {}); is the tokenizer the model's own?",
+                    tokens.len()
+                );
+            }
+            let started = std::time::Instant::now();
+            let acc = engine.perplexity(&tokens, window)?;
+            let elapsed_s = started.elapsed().as_secs_f64();
+            let Some(ppl) = acc.perplexity() else {
+                anyhow::bail!("no token could be scored ({} skipped)", acc.skipped());
+            };
+            let mean_nll = acc.mean_nll().unwrap_or(f64::NAN);
+            let bpt = acc.bits_per_token().unwrap_or(f64::NAN);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "object": "joshua.ppl",
+                        "model": model,
+                        "file": file,
+                        "window": window,
+                        "bos": bos,
+                        "tokens": tokens.len(),
+                        "scored_tokens": acc.scored(),
+                        "skipped_tokens": acc.skipped(),
+                        "mean_nll": mean_nll,
+                        "bits_per_token": bpt,
+                        "perplexity": ppl,
+                        "elapsed_s": elapsed_s,
+                        "tokens_per_s": acc.scored() as f64 / elapsed_s.max(1e-9),
+                    })
+                );
+            } else {
+                println!("model      {}", model.display());
+                println!("file       {}", file.display());
+                println!(
+                    "tokens     {} ({} scored, {} skipped, window {})",
+                    tokens.len(),
+                    acc.scored(),
+                    acc.skipped(),
+                    window
+                );
+                println!("mean nll   {mean_nll:.6} nats/token");
+                println!("bits/token {bpt:.6}");
+                println!("perplexity {ppl:.6}");
+                println!(
+                    "speed      {:.2} scored tokens/s ({elapsed_s:.1}s)",
+                    acc.scored() as f64 / elapsed_s.max(1e-9)
+                );
             }
         }
 
@@ -1695,6 +1867,47 @@ fn cache_plan_for(file: Option<u64>, ram: Option<u64>) -> (bool, bool) {
     }
 }
 
+fn ppl_window(window: Option<usize>, n_ctx: usize) -> usize {
+    window.unwrap_or(n_ctx).clamp(2, n_ctx.max(2))
+}
+
+/// What a server starts on and serves, from `--model` and `--model-dir`.
+///
+/// A `--model` that is a directory names a directory *of* models: the server
+/// serves the whole directory, so every model in it is listed and can be
+/// selected by name, and starts on the first model the inventory would list.
+/// `joshua::model_info::first_model` discovers it the way the inventory does
+/// (two levels deep, model-on-its-own only), so a directory whose models sit in
+/// subdirectories — or beside an adapter — starts too.  Naming it twice
+/// (`--model DIR --model-dir DIR`) is the same request; two different
+/// directories are ambiguous, so that is an error rather than a silent choice.
+fn serve_targets(
+    model: Option<PathBuf>,
+    model_dir: Option<PathBuf>,
+) -> anyhow::Result<(Option<PathBuf>, Option<PathBuf>)> {
+    match (model, model_dir) {
+        (Some(path), given) if path.is_dir() => {
+            if let Some(dir) = &given {
+                anyhow::ensure!(
+                    dir.canonicalize().ok() == path.canonicalize().ok(),
+                    "--model {} is a directory of models, which is what --model-dir {} names; \
+                     give it once",
+                    path.display(),
+                    dir.display()
+                );
+            }
+            let startup = joshua::model_info::first_model(&path).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--model {} is a directory with no GGUF model in it",
+                    path.display()
+                )
+            })?;
+            Ok((Some(startup), Some(path)))
+        }
+        (model, dir) => Ok((model, dir)),
+    }
+}
+
 /// Auto decisions for the page-cache options, from the model size vs RAM:
 /// `(pin_hot_weights, prefetch_whole_model)`.  Logged so operators see which
 /// way the auto-resolution went and why.
@@ -1749,6 +1962,48 @@ fn npu_backend(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_model_directory_is_the_model_directory() {
+        let dir = std::env::temp_dir().join(format!("joshua-serve-dir-{}", std::process::id()));
+        let other = dir.join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        let file = dir.join("model.gguf");
+        std::fs::write(&file, b"never read here").unwrap();
+
+        // A file stays a file: no model directory is implied.
+        assert_eq!(
+            serve_targets(Some(file.clone()), None).unwrap(),
+            (Some(file.clone()), None)
+        );
+        // Without --model, --model-dir is taken as given.
+        assert_eq!(
+            serve_targets(None, Some(other.clone())).unwrap(),
+            (None, Some(other.clone()))
+        );
+        // A directory is the model directory; starting on one needs a model
+        // this fixture cannot write, so it says so rather than booting empty.
+        let err = serve_targets(Some(dir.clone()), None).unwrap_err();
+        assert!(
+            err.to_string().contains("no GGUF model"),
+            "{err}"
+        );
+        // Naming the same directory twice is unambiguous, and still needs a
+        // model to start on; two different directories are refused outright.
+        let err = serve_targets(Some(dir.clone()), Some(dir.clone())).unwrap_err();
+        assert!(err.to_string().contains("no GGUF model"), "{err}");
+        let err = serve_targets(Some(dir.clone()), Some(other.clone())).unwrap_err();
+        assert!(err.to_string().contains("give it once"), "{err}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn ppl_window_is_clamped_to_context() {
+        assert_eq!(ppl_window(Some(512), 512), 512);
+        assert_eq!(ppl_window(Some(128), 512), 128);
+        assert_eq!(ppl_window(Some(1024), 512), 512);
+        assert_eq!(ppl_window(None, 512), 512);
+    }
 
     #[test]
     fn chat_template_flag_reads_a_file_or_takes_jinja_text() {

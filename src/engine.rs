@@ -260,7 +260,7 @@ pub enum ComputeBackend {
 /// [`Engine::with_n_ctx`] are convenience wrappers over the defaults.
 #[derive(Debug, Clone, Default)]
 pub struct EngineOptions {
-    /// Context-window size in tokens (0 selects the 4096 default).
+    /// Context-window size in tokens (0 selects [`DEFAULT_N_CTX`]).
     pub n_ctx: u32,
     /// Compute backend to run inference on.  See [`ComputeBackend`].
     pub backend: ComputeBackend,
@@ -580,6 +580,10 @@ pub struct EngineOptions {
     /// Render a request's own [`GenerationOptions::chat_template`] (see
     /// [`Engine::with_trust_request_chat_template`]).
     pub trust_request_chat_template: bool,
+    /// The tool-call format to parse model output with (the server's
+    /// `--tool-call-parser`).  `None` detects it from the chat template and
+    /// the architecture (see [`Engine::tool_call_format`]).
+    pub tool_call_parser: Option<crate::tools::ToolCallFormat>,
 }
 
 impl EngineOptions {
@@ -610,6 +614,12 @@ impl EngineOptions {
             n_ctx,
             ..Self::default()
         }
+    }
+
+    /// The context window an engine built from these options gets (see
+    /// [`resolve_n_ctx`]).
+    pub fn resolved_n_ctx(&self) -> u32 {
+        resolve_n_ctx(self.n_ctx)
     }
 
     /// Select the compute backend.  See [`ComputeBackend`].
@@ -823,6 +833,13 @@ impl EngineOptions {
         self.draft_max = n;
         self
     }
+
+    /// Parse tool calls in `format` instead of detecting it.  See
+    /// [`EngineOptions::tool_call_parser`].
+    pub fn tool_call_parser(mut self, format: Option<crate::tools::ToolCallFormat>) -> Self {
+        self.tool_call_parser = format;
+        self
+    }
 }
 
 // ─── Env flags ───────────────────────────────────────────────────────────────
@@ -950,6 +967,9 @@ pub struct Engine {
     max_output_tokens: u32,
     /// Stem of the model file (used as the model identifier in API responses).
     model_name: String,
+    /// What the GGUF header says about the model (see
+    /// [`Engine::gguf_facts`]).
+    gguf_facts: crate::model_info::GgufFacts,
     /// Context-window size in tokens.
     n_ctx: u32,
     /// Routing-frequency hot-expert cache budget (see
@@ -1002,6 +1022,8 @@ pub struct Engine {
     /// whose accelerator GEMM is slower than CPU-BLAS).  The dense weights are
     /// laid out on this device and the accelerator is unused for them.
     dense_device: Device,
+    /// Backend used to reconstruct non-resettable model instances for
+    /// independent perplexity windows.
     /// Device the routed-expert pool of a MoE model is built on: `device`,
     /// or the CPU when the experts stay in host RAM (see
     /// [`EngineOptions::expert_placement`]).
@@ -1037,6 +1059,9 @@ pub struct Engine {
     draft: Option<crate::draft_model::DraftModel>,
     /// Most draft-model tokens per step.
     draft_max: usize,
+    /// The operator's tool-call format, over the detected one (see
+    /// [`EngineOptions::tool_call_parser`]).
+    tool_call_parser: Option<crate::tools::ToolCallFormat>,
     /// Draft tokens verified by speculative decoding.
     spec_drafted: AtomicU64,
     /// Draft tokens the model accepted.
@@ -1076,6 +1101,18 @@ const LOW_MEM_FLOOR: u64 = 1536 * 1024 * 1024; // 1.5 GiB
 /// so often that it dominates on the architectures without a layer-streaming
 /// prefill.
 pub const DEFAULT_PREFILL_CHUNK: usize = 512;
+
+/// Context window ([`EngineOptions::n_ctx`]) when none is given.
+pub const DEFAULT_N_CTX: u32 = 4096;
+
+/// The context window an `n_ctx` setting gives: `n_ctx`, or
+/// [`DEFAULT_N_CTX`] when it is 0.
+pub fn resolve_n_ctx(n_ctx: u32) -> u32 {
+    match n_ctx {
+        0 => DEFAULT_N_CTX,
+        n => n,
+    }
+}
 
 /// Default [`EngineOptions::prefix_cache_root_min`]: a shared prompt head of
 /// fewer tokens is not kept as a prefix-cache root.  Strata uses 2,048 on a
@@ -1125,7 +1162,14 @@ const NPU_MAX_FAILURES: u32 = 3;
 
 /// Default ceiling on tokens generated per request (independent of the
 /// client-supplied `max_tokens`), bounding single-request CPU/time cost.
-const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 4096;
+pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 4096;
+
+/// The ceiling on tokens per request an engine gets from
+/// `--max-output-tokens`: the value (at least 1), or
+/// [`DEFAULT_MAX_OUTPUT_TOKENS`] without one.
+pub fn output_cap(max_output_tokens: Option<u32>) -> u32 {
+    max_output_tokens.map_or(DEFAULT_MAX_OUTPUT_TOKENS, |max| max.max(1))
+}
 
 /// Admission state for in-flight generations/embeddings.
 ///
@@ -1431,6 +1475,13 @@ impl GenSession {
         }
     }
 
+    fn supports_cache_clear(&self) -> bool {
+        match self {
+            Self::Candle(model) => model.supports_kv_clear(),
+            Self::Npu(_) => true,
+        }
+    }
+
     /// The longest prefix of at most `keep` tokens [`Self::truncate_to`] can
     /// rewind this session to (`0`: none).  `keep` itself for an
     /// attention-only model; the latest prefix checkpoint at or before it
@@ -1559,6 +1610,23 @@ impl GenSession {
                 .media_prefill(prompt, images)
                 .map_err(JoshuaError::Inference),
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PplWindowAction {
+    UseFresh,
+    Reset,
+    Reload,
+}
+
+fn ppl_window_action(first_window: bool, supports_reset: bool) -> PplWindowAction {
+    if first_window {
+        PplWindowAction::UseFresh
+    } else if supports_reset {
+        PplWindowAction::Reset
+    } else {
+        PplWindowAction::Reload
     }
 }
 
@@ -1773,6 +1841,9 @@ struct RenderedChat {
     /// Whether the tokenizer should still add special tokens (only the
     /// ChatML fallback needs them).
     add_special_tokens: bool,
+    /// The format taught by the template that actually rendered this request.
+    /// ChatML fallback explicitly teaches the generic Hermes format.
+    tool_call_format: Option<crate::tools::ToolCallFormat>,
 }
 
 /// What [`Engine::complete_with`] generates from.
@@ -2156,11 +2227,7 @@ impl Engine {
     /// Load a GGUF model with full [`EngineOptions`] (context size and the
     /// huge-page backing strategy).
     pub fn with_options(model_path: impl AsRef<Path>, options: EngineOptions) -> Result<Self> {
-        let n_ctx = if options.n_ctx == 0 {
-            4096
-        } else {
-            options.n_ctx
-        };
+        let n_ctx = options.resolved_n_ctx();
         let pin_hot_experts = options.pin_hot_experts;
         let expert_cache_auto = options.expert_cache_auto;
         let prefill_chunk = match options.prefill_chunk {
@@ -2265,6 +2332,7 @@ impl Engine {
             .len();
         raw.validate_layout(file_len)
             .map_err(|e| JoshuaError::ModelLoad(format!("GGUF layout check failed: {e}")))?;
+        let gguf_facts = crate::model_info::GgufFacts::from_header(&raw, file_len);
 
         // Prefetch and/or lock the always-touched weights, and advise random
         // access on routed experts, when requested.
@@ -2792,7 +2860,7 @@ impl Engine {
         }
 
         tracing::info!(
-            "Model '{}' ready (arch={}, ctx={}, eos_ids={:?}, chat_template={}, device={:?})",
+            "Model '{}' ready (arch={}, ctx={}, eos_ids={:?}, chat_template={}, tool_calls={}, device={:?})",
             display_name,
             arch.as_ref()
                 .map(|a| a.display_name())
@@ -2804,6 +2872,7 @@ impl Engine {
             } else {
                 "ChatML fallback"
             },
+            tool_call_format(options.tool_call_parser, chat_template.as_ref(), arch),
             device
         );
 
@@ -2953,8 +3022,9 @@ impl Engine {
             } else {
                 options.admission_queue_depth
             },
-            max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
+            max_output_tokens: output_cap(None),
             model_name,
+            gguf_facts,
             n_ctx,
             pin_hot_experts,
             expert_cache_auto,
@@ -2981,6 +3051,7 @@ impl Engine {
             mtp,
             draft,
             draft_max,
+            tool_call_parser: options.tool_call_parser,
             spec_drafted: AtomicU64::new(0),
             spec_accepted: AtomicU64::new(0),
             spec_verify_steps: AtomicU64::new(0),
@@ -3024,9 +3095,10 @@ impl Engine {
     }
 
     /// Set the hard ceiling on tokens generated per request, applied on top
-    /// of the client-supplied `max_tokens`.  Values below 1 are treated as 1.
+    /// of the client-supplied `max_tokens`.  Values below 1 are treated as 1
+    /// (see [`output_cap`]).
     pub fn with_max_output_tokens(mut self, max: u32) -> Self {
-        self.max_output_tokens = max.max(1);
+        self.max_output_tokens = output_cap(Some(max));
         self
     }
 
@@ -3431,9 +3503,25 @@ impl Engine {
         self.n_ctx
     }
 
-    /// Upper bound on generated tokens per request (`--max-output-tokens`).
+    /// The ceiling on tokens one request generates (see
+    /// [`Engine::with_max_output_tokens`]).
     pub fn max_output_tokens(&self) -> u32 {
         self.max_output_tokens
+    }
+
+    /// What the model's GGUF header says about it, read once at load.
+    pub fn gguf_facts(&self) -> &crate::model_info::GgufFacts {
+        &self.gguf_facts
+    }
+
+    /// The context a request may use, the context the model was trained
+    /// with and the output cap, as `/v1/models` reports them.
+    pub fn limits(&self) -> crate::model_info::ModelLimits {
+        crate::model_info::ModelLimits::new(
+            self.n_ctx,
+            self.gguf_facts.n_ctx_train,
+            self.max_output_tokens,
+        )
     }
 
     /// Tokenize `text` with the model's tokenizer.  `add_special_tokens`
@@ -3444,6 +3532,125 @@ impl Engine {
             .encode(text, add_special_tokens)
             .map(|encoding| encoding.get_ids().to_vec())
             .map_err(|e| JoshuaError::Tokenization(e.to_string()))
+    }
+
+    /// Score `tokens` and return the running cross-entropy
+    /// ([`crate::ppl::Accumulator`]): perplexity, mean NLL in nats, bits per
+    /// token.
+    ///
+    /// Windows are non-overlapping and `window` tokens wide (a shorter tail is
+    /// kept), and inside a window every token but the first is scored, because
+    /// position `i` predicts token `i + 1`. Each window runs on a **cleared** KV
+    /// cache, so it is scored with exactly the context it declares — that is
+    /// what makes the number comparable across checkpoints, and to llama.cpp.
+    ///
+    /// Score in bounded slices with context continuity inside each window.
+    pub fn perplexity(&self, tokens: &[u32], window: usize) -> Result<crate::ppl::Accumulator> {
+        if window == 0 || window > self.n_ctx as usize {
+            return Err(JoshuaError::InvalidRequest(format!(
+                "perplexity window {window} must be in 1..={} (configured context)",
+                self.n_ctx
+            )));
+        }
+        let device = &self.dense_device;
+        let (session, _) = self.acquire_session(&[], false, None)?;
+        let mut session = Some(session);
+        let all_positions = session
+            .as_ref()
+            .expect("initial session")
+            .supports_speculative();
+        let supports_reset = session
+            .as_ref()
+            .expect("initial session")
+            .supports_cache_clear();
+        let mut acc = crate::ppl::Accumulator::new();
+        let mut outcome: Result<()> = Ok(());
+        let mut first_window = true;
+        let mut session_available = true;
+        for (start, end) in crate::ppl::windows(tokens.len(), window) {
+            let action = ppl_window_action(first_window, supports_reset);
+            match action {
+                PplWindowAction::UseFresh => {}
+                PplWindowAction::Reset => {
+                    if !session.as_mut().expect("active session").clear_state() {
+                        // A failed reset cannot safely reuse the cache. Drop
+                        // the session first so non-sharing models never need
+                        // two full device copies to start the next window.
+                        drop(session.take());
+                        session_available = false;
+                        session = match self.load_model() {
+                            Ok(model) => Some(GenSession::Candle(Box::new(model))),
+                            Err(error) => {
+                                outcome = Err(error);
+                                break;
+                            }
+                        };
+                        session_available = true;
+                    }
+                }
+                PplWindowAction::Reload => {
+                    // Stock Candle sessions own their full weights. Drop the
+                    // prior instance before loading the next so one-model GPUs
+                    // do not temporarily need room for two copies.
+                    drop(session.take());
+                    session_available = false;
+                    session = match self.load_model() {
+                        Ok(model) => Some(GenSession::Candle(Box::new(model))),
+                        Err(error) => {
+                            outcome = Err(error);
+                            break;
+                        }
+                    };
+                    session_available = true;
+                }
+            }
+            first_window = false;
+            for slice in crate::ppl::slices(start, end, crate::ppl::SCORE_ROWS_PER_PASS) {
+                let fed = &tokens[slice.from..slice.to];
+                let targets = &tokens[slice.from..slice.target_end];
+                if all_positions {
+                    match session
+                        .as_mut()
+                        .expect("active session")
+                        .forward_tokens_all(fed, slice.pos, device)
+                    {
+                        Ok(rows) => { acc.push_window(targets, &rows); }
+                        Err(error) => { outcome = Err(error); break; }
+                    }
+                } else {
+                    let mut rows = Vec::with_capacity(fed.len());
+                    for (i, tok) in fed.iter().enumerate() {
+                        if slice.from + i + 1 >= slice.target_end {
+                            break;
+                        }
+                        match session
+                            .as_mut()
+                            .expect("active session")
+                            .forward_tokens(std::slice::from_ref(tok), slice.pos + i, device)
+                        {
+                            Ok(logits) => rows.push(logits),
+                            Err(error) => {
+                                outcome = Err(error);
+                                break;
+                            }
+                        }
+                    }
+                    if outcome.is_ok() {
+                        acc.push_window(targets, &rows);
+                    }
+                }
+                if outcome.is_err() {
+                    break;
+                }
+            }
+            if outcome.is_err() {
+                break;
+            }
+        }
+        if session_available {
+            self.release_model(session.expect("available session"), Vec::new(), None);
+        }
+        outcome.map(|_| acc)
     }
 
     /// Detokenize `tokens` back to text — the inverse of
@@ -3695,6 +3902,42 @@ impl Engine {
         self.chat_template.is_some()
     }
 
+    /// The default model-level tool-call format: the operator's
+    /// `--tool-call-parser`, else the family its embedded chat template
+    /// teaches, else its architecture's, else the generic Hermes / Qwen /
+    /// Mistral reader (see [`crate::tools::ToolCallFormat::select`]).
+    /// For a particular request, use [`Engine::tool_call_format_for_request`]
+    /// because an unusable template falls back to ChatML.
+    pub fn tool_call_format(&self) -> crate::tools::ToolCallFormat {
+        tool_call_format(
+            self.tool_call_parser,
+            self.chat_template.as_ref(),
+            self.arch,
+        )
+    }
+
+    /// Select the parser from the template that renders these exact messages
+    /// and request variables. Use this with [`Engine::complete_chat`] when
+    /// parsing its result; an unusable template falls back to the generic
+    /// Hermes format. The render is repeated when generation starts.
+    pub fn tool_call_format_for_request(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        options: &GenerationOptions,
+    ) -> Result<crate::tools::ToolCallFormat> {
+        if self.tool_call_parser.is_some() {
+            return Ok(self.tool_call_format());
+        }
+        let (messages, tools) = self.stable_chat(messages, tools, false);
+        let rendered = self.render_chat(&messages, tools.as_deref(), options)?;
+        Ok(crate::tools::ToolCallFormat::select(
+            self.tool_call_parser,
+            rendered.tool_call_format,
+            self.arch,
+        ))
+    }
+
     /// Format messages as a ChatML prompt and end it as `render` asks: with
     /// the assistant turn header (the default), with nothing, or with the
     /// final message left open for the model to continue.
@@ -3793,6 +4036,7 @@ impl Engine {
                 .map(|text| RenderedChat {
                     text,
                     add_special_tokens: false,
+                    tool_call_format: template.tool_call_format(),
                 })
                 .map_err(JoshuaError::InvalidRequest);
         }
@@ -3802,6 +4046,7 @@ impl Engine {
                     return Ok(RenderedChat {
                         text,
                         add_special_tokens: false,
+                        tool_call_format: template.tool_call_format(),
                     })
                 }
                 Err(e) => {
@@ -3814,6 +4059,7 @@ impl Engine {
         Ok(RenderedChat {
             text: Self::format_chatml_prompt(&sanitized, tools, render),
             add_special_tokens: true,
+            tool_call_format: Some(crate::tools::ToolCallFormat::Generic),
         })
     }
     // ─── Completion ───────────────────────────────────────────────────────────
@@ -3835,8 +4081,8 @@ impl Engine {
     ///
     /// Tools are exposed to the chat template as the standard `tools`
     /// variable so the model is instructed how to emit calls; parse the
-    /// generated text with [`crate::tools::parse_tool_calls`] to extract
-    /// them.
+    /// generated text with [`crate::tools::parse_tool_calls`] using
+    /// [`Engine::tool_call_format_for_request`] to extract them.
     pub fn complete_chat(
         &self,
         messages: &[ChatMessage],
@@ -7978,6 +8224,24 @@ fn sanitize_model_name(raw: &str) -> Option<String> {
     }
 }
 
+/// The model-level tool-call format (see [`Engine::tool_call_format`]).
+/// Request handling refines it against the template that rendered the actual
+/// messages and request variables.
+fn tool_call_format(
+    parser: Option<crate::tools::ToolCallFormat>,
+    template: Option<&ChatTemplate>,
+    arch: Option<crate::model::Architecture>,
+) -> crate::tools::ToolCallFormat {
+    use crate::tools::ToolCallFormat;
+    let taught = match template {
+        // The operator's choice needs no look at the template.
+        _ if parser.is_some() => None,
+        Some(template) => template.tool_call_format(),
+        None => Some(ToolCallFormat::Generic),
+    };
+    ToolCallFormat::select(parser, taught, arch)
+}
+
 /// Extract the model's chat template from GGUF metadata, if present.
 ///
 /// llama.cpp's converters store the HuggingFace chat template verbatim under
@@ -8728,6 +8992,14 @@ fn argmax(logits: &[f32]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn perplexity_window_transition_uses_fresh_first_window_and_reload_when_needed() {
+        assert_eq!(ppl_window_action(true, false), PplWindowAction::UseFresh);
+        assert_eq!(ppl_window_action(true, true), PplWindowAction::UseFresh);
+        assert_eq!(ppl_window_action(false, true), PplWindowAction::Reset);
+        assert_eq!(ppl_window_action(false, false), PplWindowAction::Reload);
+    }
 
     #[test]
     fn non_finite_logits_are_an_error_not_last_token() {

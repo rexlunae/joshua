@@ -21,7 +21,7 @@ framework) and [tokenizers](https://github.com/huggingface/tokenizers).
 | **Quant formats** | Every GGUF weight format llama.cpp writes: F32/F16/BF16, Q4_0…Q8_1 and the k-quants (candle's kernels), plus in-mapping decoders for the i-quants small-model GGUFs use (IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS), BitNet's ternary TQ1_0 / TQ2_0, MXFP4 / NVFP4 and Bonsai's Q1_0 / Q2_0 — each bit-identical to llama.cpp's `dequantize_row_*`, with matmuls that keep the blocks in the mmap instead of materialising f32.  One generic `RawBlock` layer serves every loader, candle's stock ones (Llama, Gemma, Phi, …) included |
 | **Fused SIMD kernels** | AVX-512 and AVX2 (x86-64) and NEON (aarch64) dequant+dot fusion — the weights decode inside the dot in registers — for Q8_0/Q2_K/Q4_K, IQ2_XXS, MXFP4 and Bonsai's Q1_0/Q2_0 (also Q6_K on x86-64 and Q5_K on AVX2; the other i-quants, TQ1_0/TQ2_0 and NVFP4 on AVX-512), plus parallel SIMD matmuls for the other k-quants; the widest ISA the CPU has is picked at startup (`JOSHUA_SIMD` overrides) |
 | **Chat templates** | Renders the model's own `tokenizer.chat_template` from the GGUF (Jinja via pure-Rust minijinja); ChatML fallback |
-| **Tool calling** | OpenAI-compatible `tools` / `tool_calls`, parsing Hermes/Qwen, Mistral, and Llama-3 call formats |
+| **Tool calling** | OpenAI-compatible `tools` / `tool_calls` (streamed as argument deltas) and Anthropic `tool_use`, parsing each family's own call format — Hermes / Qwen / Qwen3-Coder, Mistral, Llama 3.x JSON, pythonic (Llama 3.2 / 4, LFM2), Nemotron, Phi-4-mini, DeepSeek V3 / R1 / V3.1 / V3.2 / V4 / V4.1, Kimi K2 / K3, GLM-4.5+, gpt-oss harmony and FunctionGemma — picked from the chat template (see [Tool calling](#tool-calling)) |
 | **Embeddings** | Dense sentence embeddings for llama / qwen2 / qwen3 embedding models, with GGUF pooling metadata |
 | **KV-cache reuse** | Multi-turn requests continue from a warm model pool and prefill only the new suffix — including across *context edits*: when an agent harness truncates or replaces middle blocks, the pooled session's KV state is rewound to the longest common token prefix instead of being cleared (Qwen and DeepSeek-V2/V3/K2 loaders; models with recurrent layers — Qwen3-Next, Qwen3.5, DeepSeek-V4/V4.1 — rewind to a state checkpoint at a prefill or turn boundary and re-prefill only the divergence). DeepSeek MLA caches the compressed latent (`c_kv` + `k_pe`) instead of the reconstructed per-head K/V, cutting KV memory ~70× |
 | **Speculative decoding** | `--speculative N` drafts up to N tokens per step by prompt lookup and verifies them in one forward pass, rolling the KV cache back past the first rejection — output unchanged (token-identical when greedy, same distribution when sampling), fewer weight sweeps on repetitive output; `--draft-model PATH` drafts with a small model sharing the tokenizer instead (qwen-family, `deepseek2`-family and `deepseek4` loaders with a rewound-able KV cache, including the recurrent DeltaNet and KDA hybrids, whose running state is snapshotted before a pass and replayed on rollback; on `qwen4exp`'s PLE convolutions and candle's stock loaders the flag warns and is ignored) |
@@ -163,6 +163,13 @@ cargo build --release
 
 # Host/build/model report to attach to a benchmark result
 ./target/release/joshua report --model ./weights/gemma-3-1b-it-Q4_K_M.gguf --json
+
+# Score a corpus: perplexity / bits-per-token (the quality measurement)
+# Compare a compressed checkpoint against its source on the SAME file, window
+# and --bos setting — shorter windows score strictly worse, so hold them fixed.
+./target/release/joshua ppl \
+    --model ./weights/gemma-3-1b-it-Q4_K_M.gguf \
+    --file held-out.txt --n-ctx 512 --json
 
 # Reasoning models: switch thinking off / pick an effort, reproducible sampling
 ./target/release/joshua run --model ./weights/Qwen3-8B-Q4_K_M.gguf \
@@ -448,6 +455,63 @@ is invisible in the conversation. Control tokens inserted by the template
 itself are unaffected. Tool definitions are treated as developer input and
 are not rewritten.
 
+#### Tool calling
+
+With `tools` in the request, the model's output is read in its family's
+own tool-call markup and returned as OpenAI `tool_calls` (finish reason
+`tool_calls`), with any text around the calls as `content`.  The format is
+detected from the GGUF's chat template (the strings only that family's
+template contains, in llama.cpp's order), then from the architecture, and
+defaults to the Hermes / Qwen / Mistral reader.  A model without a template
+that can render a request with tools is prompted with the ChatML fallback,
+which teaches Hermes calls, so its output is read as Hermes (the load log's
+`tool_calls=` names the format in use):
+
+| Family | Markup | `--tool-call-parser` |
+|---|---|---|
+| Hermes, Qwen 2.5 / 3, Qwen3-Coder / 3.5, Granite, Functionary | `<tool_call>{…}</tool_call>`, `<function=…><parameter=…>` | `hermes`, `qwen3_coder` |
+| Mistral, Devstral, Magistral | `[TOOL_CALLS][…]`, `[TOOL_CALLS]name[ARGS]{…}` | `mistral` |
+| Llama 3.x | `{"name": …, "parameters": …}` (after `<\|python_tag\|>` or alone) | `llama3_json` |
+| Llama 3.2 / 4 pythonic, LFM2 | `[get_weather(city="Paris")]`, `<\|tool_call_start\|>[…]<\|tool_call_end\|>` | `pythonic`, `llama4_pythonic`, `lfm2` |
+| Nemotron Nano v2 | `<TOOLCALL>[…]</TOOLCALL>` | `nemotron_v2` |
+| Phi-4-mini, Firefunction v2 | `functools[…]` | `phi4_mini_json` |
+| DeepSeek V3 / R1 / V3.1 | `<｜tool▁calls▁begin｜>…` | `deepseek_v3`, `deepseek_v31` |
+| DeepSeek V3.2 / V4 / V4.1 | DSML `<｜DSML｜invoke name="…">` | `deepseek_v32`, `deepseek_v4`, `deepseek_v41` |
+| Kimi K2 / Kimi-Linear, Kimi K3 | `<\|tool_calls_section_begin\|>…`, `<\|open\|>tools<\|sep\|>…` | `kimi_k2`, `kimi_k3` |
+| GLM-4.5 / 4.6 / 4.7 / 5 | `<tool_call>name<arg_key>…</arg_key><arg_value>…` | `glm45`, `glm47` |
+| gpt-oss | a harmony message `to=functions.name` | `openai` |
+| FunctionGemma | `<start_function_call>call:name{key:<escape>…<escape>}<end_function_call>` | `functiongemma` |
+
+`--tool-call-parser NAME` (or `JOSHUA_TOOL_CALL_PARSER`; vLLM's names)
+overrides the detection, e.g. for a fine-tune whose template does not
+match its training.  Arguments written one tag per parameter are typed by
+the tool's JSON schema: a parameter the schema types as a string keeps its
+text verbatim, any other is read as JSON when it is JSON.  A call id the
+model writes itself (Kimi's `functions.name:0`, Mistral's `[CALL_ID]`) is
+returned as the call's id, since its template expects it back; the ids
+minted for a Mistral model's other calls are 9 alphanumerics, the only ids
+its templates accept back.
+
+Streaming sends a call as soon as its name is known — one chunk with the
+call's `index`, `id`, `type` and `function.name` — then its
+`function.arguments` in pieces as the model writes them; tool-call markup
+never reaches `content`, and text before (or after) a call streams as
+content.  On `/v1/messages` each call is a `tool_use` content block whose
+input arrives as `input_json_delta`s.
+
+Assistant `tool_calls` sent back in the history reach the chat template with
+`function.arguments` as an object, as transformers-style templates expect
+(vLLM passes them so; llama.cpp does for templates that read them as
+objects): a JSON-string object is parsed, and empty arguments become `{}`;
+a string that is not a JSON object is passed through unchanged.  A template
+that cannot render them as objects (functionary v3.2 joins them to text
+with `+`) gets the client's strings instead, as llama.cpp gives it.  The
+templates' `tojson` writes what transformers' does (Python's
+`json.dumps`: `, ` and `: ` separators, keys in the order the client sent
+them, no HTML escaping, with its `ensure_ascii`, `indent`, `separators` and
+`sort_keys`), so the tools and calls in the prompt are the text vLLM and
+llama.cpp render.
+
 #### Structured outputs
 
 `response_format` with `json_object` or `json_schema` constrains decoding to
@@ -597,14 +661,78 @@ budgets or change coordinator admission/routing limits.
 
 ```bash
 curl http://localhost:8080/v1/models
+curl http://localhost:8080/v1/models/Qwen3-0.6B-Q4_K_M
 ```
+
+`GET /models` returns the same list (llama-server serves both), and
+`GET /v1/models/{id}` returns one entry, or OpenAI's `404` with
+`code: "model_not_found"` for an id the list does not have.  Each entry has
+OpenAI's four fields, the limits a client needs to size a request, the
+fields vLLM's and llama-server's model lists carry, and joshua's own facts
+under `joshua`.  For `joshua serve --model Qwen3-0.6B-Q4_K_M.gguf --n-ctx 8192`:
+
+```json
+{
+  "id": "Qwen3-0.6B-Q4_K_M", "object": "model", "created": 1793677688, "owned_by": "joshua",
+  "context_length": 8192, "max_context_length": 40960, "max_output_tokens": 4096,
+  "root": "/models/Qwen3-0.6B-Q4_K_M.gguf", "parent": null, "max_model_len": 8192,
+  "permission": [{"id": "modelperm-…", "object": "model_permission", "…": "…"}],
+  "aliases": [], "tags": [],
+  "meta": {"vocab_type": 2, "n_vocab": 151936, "n_ctx": 8192, "n_ctx_train": 40960,
+           "n_embd": 1024, "n_params": 596049920, "size": 390753280, "ftype": "Q4_K - Medium"},
+  "joshua": {"loaded": true, "architecture": "qwen3", "quantization": "Q4_K_M",
+             "file_size": 396705472, "backend": "cpu", "dense": "cpu"}
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `context_length` | The most tokens, prompt and output together, one request may use: the `--n-ctx` the model is loaded with.  A request's `context_window` (`n_ctx`, `num_ctx`) may not exceed it. |
+| `max_context_length` | The context the model was trained with (the GGUF's `<arch>.context_length`). |
+| `max_output_tokens` | The `--max-output-tokens` ceiling on one request's output (default 4096).  A request is also bounded by `context_length`, whichever runs out first. |
+| `max_model_len`, `root`, `parent`, `permission` | vLLM's: `max_model_len` is `context_length`, `root` the GGUF's path, `parent` `null` for a base model. |
+| `aliases`, `tags`, `meta` | llama-server's.  `meta` comes from the GGUF header: `n_ctx` is `context_length`, `size` the bytes of tensor data, `ftype` llama.cpp's name for `general.file_type`.  joshua has no aliases or tags, so both lists are empty. |
+| `joshua.loaded` | Whether the model is loaded. |
+| `joshua.architecture`, `quantization`, `file_size` | From the GGUF header (`quantization` as Ollama names it). |
+| `joshua.backend`, `dense`, `experts` | Where a loaded model runs: its compute backend, the device holding the dense weights and, for a mixture-of-experts model, the routed experts' (`expert_cache_bytes` when a VRAM cache holds a hot subset of host experts).  `npu: true` with an NPU plugin; `remote: true`, `workers` and `stages` for a model placed on pipeline workers (`backend` is then where this host tokenizes and samples). |
+
+With `--model-dir`, each model file in the directory (two levels deep)
+that is not loaded is listed after the loaded models, with
+`joshua.loaded: false` and no placement.  Its id is its file stem or, when
+another file in the directory has the same stem (or a loaded model has it
+as its id), its path in the directory (`a/model.gguf`, `b/model.gguf`), so
+loading one file does not change another's id.  A request selects a listed
+file by that id and it is **loaded on first use** — the first request that
+names it maps it in and answers, so a client needs no `POST /v1/models/load`
+first; concurrent requests for the same cold model share that one load.
+`POST /v1/models/load`
+takes the id or a file's path as `model` and, without an `id`, serves the
+model under the
+id it was listed by; it refuses another file's path as an `id` (`409`).
+No two entries share an id: a file whose path a loaded model already has
+as its id (the file appeared after that load) is left out until the model
+is unloaded.  A file a loaded model was loaded from is not listed
+again, and neither are GGUFs that are not models on their own
+(`general.type` `adapter`, `mmproj` or `imatrix`, or a `clip` projector)
+or links leading out of the directory, which a load refuses.  A listed
+file is described from its GGUF header without loading any weight; its
+`context_length`, `max_model_len`, `meta.n_ctx` and `max_output_tokens`
+are the ones `POST /v1/models/load` with the server's flags gives it (a
+load's own `n_ctx` changes them).  A Whisper model has an entry with its
+id and placement.  A `joshua route` coordinator lists the union of its
+workers' entries (a worker's Whisper model included) unchanged, fields it
+does not know included (see
+[docs/request-routing.md](docs/request-routing.md)).
 
 ### `POST /v1/models/load` and `POST /v1/models/unload`
 
-Start the server with `--model-dir DIR` (and `--model` becomes optional) to
-load and unload models at runtime.  Requests name a GGUF file, or a directory
-holding one, relative to `DIR`; paths outside it are refused.  Protect these
-routes with `--api-key` when the server is reachable from other hosts.
+`--model-dir DIR` (and `--model DIR` for a directory: any path that is a
+directory is served as the model directory, and the server starts on the model
+it finds there) lists and loads models at runtime.  Requests name a GGUF file,
+or a directory
+holding one, relative to `DIR`, or the id [`/v1/models`](#get-v1models) lists
+a file there by; paths outside it are refused.  Protect these routes with
+`--api-key` when the server is reachable from other hosts.
 
 ```bash
 joshua serve --model-dir ./weights
@@ -614,9 +742,19 @@ curl -X POST localhost:8080/v1/models/unload -H 'content-type: application/json'
   -d '{"id": "qwen3"}'
 ```
 
-Several models can be loaded at once; requests pick one with `model` (a
-server holding a single model answers any name, as before).  Unloading waits
-for requests already running on the model.
+An explicit load is only needed for a file the directory does not list (added
+after startup) or to pin a different `id`.  A load answers with the model's
+[`/v1/models`](#get-v1models) entry (with
+`workers` and `stages` also at the top level).  Several models can be loaded
+at once; requests pick one with `model`, and naming a listed model that is not
+loaded loads it (see [`GET /v1/models`](#get-v1models)).  A server holding a
+single model
+answers any name, as before, except the id of a file in the model directory
+that is not loaded (as `/v1/models` would list it): that load is attempted,
+never answered by the
+loaded model.  Checking a name reads the directory, not the files.
+Unloading waits for requests already running on the model, after which the
+file is listed (unloaded) again and the next request that names it reloads it.
 
 #### Model-less workers (experimental, `--features distributed`)
 
@@ -727,6 +865,8 @@ Two limits bound how much work a single client can demand, both tunable:
 - `--n-ctx` (default: 4096) is the context window — prompt plus generated
   tokens — the model is loaded with.  A request can narrow it with
   `context_window` but never widen it.
+- `GET /v1/models` reports both per model, as `context_length` and
+  `max_output_tokens`, so a client can offer a context control.
 - A request's own `chat_template` is Jinja code the server would run, so it
   is refused unless the server starts with `--trust-request-chat-template`;
   even then a render stops after a fixed instruction budget (well under a
@@ -962,6 +1102,7 @@ prints the dense/expert split of any GGUF to sanity-check a new model.
 | `JOSHUA_TEMP`, `JOSHUA_TOP_K`, `JOSHUA_TOP_P`, `JOSHUA_MIN_P`, `JOSHUA_TYPICAL_P`, `JOSHUA_REPEAT_PENALTY`, `JOSHUA_REPEAT_LAST_N`, `JOSHUA_PRESENCE_PENALTY`, `JOSHUA_FREQUENCY_PENALTY`, `JOSHUA_XTC_PROBABILITY`, `JOSHUA_XTC_THRESHOLD`, `JOSHUA_MIROSTAT`, `JOSHUA_MIROSTAT_LR`, `JOSHUA_MIROSTAT_ENT` | Server sampling defaults (same as `--temp`, `--top-k`, …; see [Sampling defaults](#sampling-defaults)) |
 | `JOSHUA_CHAT_TEMPLATE` / `JOSHUA_CHAT_TEMPLATE_FILE` | A Jinja chat template (or a file holding one) used instead of the GGUF's (same as `--chat-template` / `--chat-template-file`); a `--chat-template` value that is neither an existing file nor Jinja is refused at startup |
 | `JOSHUA_TRUST_REQUEST_CHAT_TEMPLATE` | Accept a request's own `chat_template` (same as `--trust-request-chat-template`; off by default) |
+| `JOSHUA_TOOL_CALL_PARSER` | Tool-call format to parse output with, or `auto` (same as `--tool-call-parser`; see [Tool calling](#tool-calling)) |
 | `JOSHUA_WHISPER_MODEL` | Whisper model directory mounted at `/v1/audio/transcriptions` (same as `--whisper-model`) |
 | `JOSHUA_NPU_PLUGIN` | NPU vendor plugin path (same as `--npu-plugin`) |
 | `JOSHUA_LLAMA_N_GPU_LAYERS` | llama.cpp adapter layer offload count (default: all) |

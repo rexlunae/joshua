@@ -11,7 +11,9 @@
 //! - `POST /tokenize`                 — tokenize with the loaded model
 //!   (also `/v1/tokenize`, and `/api/tokens` for Ollama clients)
 //! - `POST /v1/detokenize`            — ids back to text (vLLM / llama.cpp)
-//! - `GET  /v1/models`                — list loaded model
+//! - `GET  /v1/models`                — list the models, with their limits
+//!   (also `/models`; `GET /v1/models/{id}` for one, see
+//!   [`crate::model_info`])
 //! - `POST /v1/chat/completions`      — chat completion (stream or non-stream)
 //! - `POST /v1/messages`              — Anthropic Messages API
 //! - `POST /v1/completions`           — legacy text completion
@@ -23,6 +25,12 @@
 //! - `POST /v1/models/load`           — load a model from the controller's
 //!   model directory, locally or onto its workers (when enabled)
 //! - `POST /v1/models/unload`         — unload a model (when enabled)
+//!
+//! With `--model-dir` the directory is the model store: every model in it is
+//! listed, and a request selects one by naming its id — [`select_model`] loads
+//! it on first use, so a client need not call `POST /v1/models/load`.  An
+//! explicit load is still how a file the directory does not list (added after
+//! startup) is served, and how a model is pinned to a chosen id.
 //!
 //! Chat and text completions stop decoding, and embeddings stop between
 //! input texts, when the HTTP request is dropped (the client, or a
@@ -36,7 +44,7 @@ use std::convert::Infallible;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 use axum::{
     extract::{Extension, Request, State},
@@ -59,14 +67,15 @@ use crate::anthropic::{self, MessagesRequest};
 use crate::coordinator::{JobModel, ModelSlots, WorkerCapabilities, WorkerInfo, JOB_OWNER_HEADER, WORKER_PROTOCOL_VERSION};
 use crate::engine::{Completion, Engine, EngineOptions};
 use crate::error::JoshuaError;
+use crate::model_info::{device_label, GgufFacts, ModelInfo, ModelLimits, Placement};
 use crate::reasoning::{ReasoningOutput, Split};
 use crate::sampling::SamplingProfile;
 use crate::whisper::WhisperEngine;
-use crate::tools::{parse_tool_calls, ParsedToolCall};
+use crate::tools::{ParsedToolCall, ToolCallFormat, ToolCallStream, ToolEvent};
 use crate::types::{
-    AssistantMessage, ChatChoice, ChatCompletionChunk, ChatCompletionRequest,
+    unix_time, AssistantMessage, ChatChoice, ChatCompletionChunk, ChatCompletionRequest,
     ChatCompletionResponse, ChatMessage, DeltaContent, EmbeddingData, EmbeddingRequest,
-    EmbeddingResponse, ErrorResponse, FunctionCallResult, GenerationOptions, ModelInfo,
+    EmbeddingResponse, ErrorResponse, FunctionCallResult, GenerationOptions, ModelCard,
     ModelListResponse, Tool, ToolCall, UsageInfo,
 };
 
@@ -224,6 +233,66 @@ impl ServerState {
             metrics: Arc::new(ServerMetrics::default()),
         }
     }
+
+    /// Every model this server can serve: the loaded ones, then (with
+    /// `--model-dir`) the directory's files that are not loaded
+    /// ([`ModelManager::unloaded`]), described from their headers alone,
+    /// less the GGUFs that are not models on their own (adapters,
+    /// projectors).  This is the inventory `/v1/models` and Ollama's
+    /// `/api/tags` list.  It reads every such file's header, so handlers
+    /// build it off the async runtime ([`inventory`]).
+    pub fn inventory(&self) -> Vec<ModelInfo> {
+        let loaded = self.models.list();
+        let mut out: Vec<ModelInfo> = loaded.iter().map(LoadedModel::info).collect();
+        if let Some(manager) = &self.manager {
+            out.extend(
+                manager
+                    .unloaded(&loaded)
+                    .iter()
+                    .map(|(id, file)| ModelInfo::of_file(id, file, manager))
+                    .filter(|model| model.facts.as_ref().is_none_or(GgufFacts::is_model)),
+            );
+        }
+        out
+    }
+
+    /// The model directory's files that are not loaded, under the ids the
+    /// inventory lists them by ([`ModelManager::unloaded`]).  Reads the
+    /// directory only, never a header.
+    fn unloaded(&self) -> Vec<(String, PathBuf)> {
+        self.manager
+            .as_ref()
+            .map(|manager| manager.unloaded(&self.models.list()))
+            .unwrap_or_default()
+    }
+
+    /// The model a request names, by id (see [`ModelRegistry::resolve`]).
+    /// The id of a model-directory file that is not loaded is a `404`,
+    /// never answered by the one model that is.  That is checked against
+    /// the directory alone ([`Self::unloaded`]), so a request never waits
+    /// on a header read.
+    pub fn resolve(&self, requested: &str) -> Result<(String, Arc<Engine>), ApiError> {
+        self.models.resolve(requested, |name| {
+            self.unloaded().iter().any(|(id, _)| id == name)
+        })
+    }
+
+    /// The Whisper model's entry, when one is configured.
+    fn whisper_info(&self) -> Option<ModelInfo> {
+        self.whisper.as_ref().map(|whisper| ModelInfo {
+            placement: Some(Placement::on(whisper.device())),
+            ..ModelInfo::new(whisper.model_name(), unix_time())
+        })
+    }
+}
+
+/// [`ServerState::inventory`], built off the async runtime: a file in the
+/// model directory is described by reading its header.
+pub(crate) async fn inventory(state: &AppState) -> Result<Vec<ModelInfo>, ApiError> {
+    let state = Arc::clone(state);
+    tokio::task::spawn_blocking(move || state.inventory())
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))
 }
 
 // ─── Model registry ─────────────────────────────────────────────────────────
@@ -241,36 +310,56 @@ pub struct LoadedModel {
     pub created: u64,
 }
 
+impl LoadedModel {
+    /// What `/v1/models` reports about this model.
+    pub fn info(&self) -> ModelInfo {
+        let mut info = ModelInfo::of_engine(&self.id, self.created, &self.engine);
+        if let Some(placement) = &mut info.placement {
+            placement.workers = self.workers.iter().map(|w| w.to_string()).collect();
+            placement.stages = self.stages.clone();
+        }
+        info
+    }
+}
+
 /// The models a server answers for, by id.
 #[derive(Default)]
 pub struct ModelRegistry {
     models: RwLock<Vec<LoadedModel>>,
     /// Ids being loaded, so concurrent loads of one id cannot both run.
     loading: Mutex<Vec<String>>,
+    /// Gates serialising request-initiated loads of one id: requests that name
+    /// a model the directory lists wait for its one load instead of failing.
+    /// An entry is created the first time a request names that id.
+    load_gates: Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Workers claimed by a model being loaded, loaded, or being unloaded.
     /// A worker serves one controller connection at a time, so a claim
     /// lasts until the model's pipeline has released it.
     workers: Mutex<Vec<std::net::SocketAddr>>,
 }
 
-fn now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
 impl ModelRegistry {
     /// A registry holding `engine` under its model name.
     pub fn with_model(engine: Arc<Engine>) -> Self {
+        let id = engine.model_name().to_string();
+        Self::with_model_named(engine, id)
+    }
+
+    /// A registry holding `engine` under `id`, which may differ from the
+    /// engine's model name (its file stem): a directory server starts on a
+    /// model under the id `/v1/models` lists its file by (`qwen3-8b`, or
+    /// `a/model.gguf` when another file shares its stem), so the list and the
+    /// served id agree.
+    pub fn with_model_named(engine: Arc<Engine>, id: impl Into<String>) -> Self {
         let registry = Self::default();
+        let id = id.into();
         registry.models.write().expect("fresh lock").push(LoadedModel {
-            embedding_job: embedding_job(&engine, engine.model_name()),
-            id: engine.model_name().to_string(),
+            embedding_job: embedding_job(&engine, &id),
+            id,
             engine,
             workers: Vec::new(),
             stages: Vec::new(),
-            created: now(),
+            created: unix_time(),
         });
         registry
     }
@@ -280,32 +369,57 @@ impl ModelRegistry {
     }
 
     /// The model a request names. With a single model loaded, any name
-    /// selects it, as when a server only ever held one model.
+    /// selects it, as when a server only ever held one model, unless
+    /// `names_another` says the name belongs to a model that is not loaded.
     /// Returns the model's id and engine.
-    pub fn resolve(&self, requested: &str) -> Result<(String, Arc<Engine>), ApiError> {
+    pub fn resolve(
+        &self,
+        requested: &str,
+        names_another: impl FnOnce(&str) -> bool,
+    ) -> Result<(String, Arc<Engine>), ApiError> {
+        let only = {
+            let models = self.models.read().unwrap_or_else(|p| p.into_inner());
+            if let Some(model) = models.iter().find(|m| m.id == requested) {
+                return Ok((model.id.clone(), Arc::clone(&model.engine)));
+            }
+            match models.as_slice() {
+                [only] => (only.id.clone(), Arc::clone(&only.engine)),
+                [] => {
+                    return Err(ApiError::new(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "no model is loaded; load one with POST /v1/models/load",
+                        "model_not_loaded",
+                    ))
+                }
+                _ => {
+                    return Err(ApiError::model_not_found(format!(
+                        "model '{requested}' is not loaded"
+                    )))
+                }
+            }
+        };
+        // Asked after the lock is released: the answer may list the models.
+        if names_another(requested) {
+            return Err(ApiError::model_not_found(format!(
+                "model '{requested}' is not loaded; load it with POST /v1/models/load"
+            )));
+        }
+        Ok(only)
+    }
+
+    /// The loaded model with exactly this id, if it is loaded.
+    fn loaded(&self, id: &str) -> Option<(String, Arc<Engine>)> {
         let models = self.models.read().unwrap_or_else(|p| p.into_inner());
-        let found = models
+        models
             .iter()
-            .find(|m| m.id == requested)
-            .or(match models.as_slice() {
-                [only] => Some(only),
-                _ => None,
-            });
-        if let Some(model) = found {
-            return Ok((model.id.clone(), Arc::clone(&model.engine)));
-        }
-        match models.as_slice() {
-            [] => Err(ApiError::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "no model is loaded; load one with POST /v1/models/load",
-                "model_not_loaded",
-            )),
-            _ => Err(ApiError::new(
-                StatusCode::NOT_FOUND,
-                format!("model '{requested}' is not loaded"),
-                "model_not_found",
-            )),
-        }
+            .find(|m| m.id == id)
+            .map(|m| (m.id.clone(), Arc::clone(&m.engine)))
+    }
+
+    /// The gate serialising request-initiated loads of `id`.
+    fn load_gate(&self, id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut gates = self.load_gates.lock().unwrap_or_else(|p| p.into_inner());
+        Arc::clone(gates.entry(id.to_string()).or_default())
     }
 
     /// Reserve `id` for a load; dropping the guard releases it.
@@ -433,11 +547,14 @@ pub struct ModelManager {
 }
 
 /// `POST /v1/models/load` request body.
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Default, serde::Deserialize)]
 pub struct LoadModelRequest {
-    /// GGUF file (or a directory holding one) under the model directory.
+    /// GGUF file (or a directory holding one) under the model directory,
+    /// or the id `/v1/models` lists a file there by.
     pub model: String,
-    /// Name to serve it under; defaults to the file stem.
+    /// Name to serve it under; defaults to the id `/v1/models` lists the
+    /// file by (its file stem unless that is ambiguous).  Another model
+    /// file's path in the directory (`a/model.gguf`) is refused.
     #[serde(default)]
     pub id: Option<String>,
     /// Run the model on this host even when workers are configured.
@@ -452,7 +569,7 @@ pub struct LoadModelRequest {
     /// Context window; defaults to the server's, capped by the model.
     #[serde(default)]
     pub n_ctx: Option<usize>,
-    /// Concurrent remote sessions the workers reserve KV for.
+    /// Concurrent remote sessions the workers reserve KV for; defaults to one.
     #[serde(default)]
     pub sessions: Option<usize>,
     /// Prompt tokens per pipeline step.
@@ -467,14 +584,110 @@ pub struct UnloadModelRequest {
 }
 
 impl ModelManager {
+    /// The directory's GGUFs (two levels deep) that no model in `loaded`
+    /// was loaded from, each under the id the inventory lists it by: its
+    /// file stem or, when another file in the directory has the same stem
+    /// (or a loaded model has it as its id), its path in the directory
+    /// ([`Self::path_id`], `b/model.gguf`).  So loading one file does not
+    /// change another's id, unless the load takes that file's stem as its
+    /// id.  `POST /v1/models/load` takes either as `model`, and refuses
+    /// another file's path as an `id`.  Left out: files a load would refuse (a symlink leading out of the
+    /// directory), a second link to one file, and a file whose path a
+    /// loaded model has as its id (it was loaded before the file appeared):
+    /// no two entries share an id, so each id answers for its own entry.
+    /// Only the directory is read, never a header: a request's model name
+    /// is checked against these ids, and the inventory, off the async
+    /// runtime, leaves out the GGUFs that are not models on their own.
+    pub fn unloaded(&self, loaded: &[LoadedModel]) -> Vec<(String, PathBuf)> {
+        let Ok(root) = self.model_dir.canonicalize() else {
+            return Vec::new();
+        };
+        let mut targets = std::collections::HashSet::new();
+        let files: Vec<(PathBuf, PathBuf)> = crate::model_info::discover_gguf(&self.model_dir)
+            .into_iter()
+            .filter_map(|file| {
+                let target = file.canonicalize().ok()?;
+                (target.starts_with(&root) && targets.insert(target.clone()))
+                    .then_some((file, target))
+            })
+            .collect();
+        let stem = |file: &Path| -> String {
+            file.file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("model")
+                .to_string()
+        };
+        let mut stems = std::collections::HashMap::<String, usize>::new();
+        for (file, _) in &files {
+            *stems.entry(stem(file)).or_default() += 1;
+        }
+        let loaded_from: Vec<PathBuf> = loaded
+            .iter()
+            .filter_map(|m| m.engine.model_path().canonicalize().ok())
+            .collect();
+        let taken = |id: &str| loaded.iter().any(|m| m.id == id);
+        files
+            .into_iter()
+            .filter(|(_, target)| !loaded_from.contains(target))
+            .filter_map(|(file, _)| {
+                let stem = stem(&file);
+                let id = if stems[&stem] > 1 || taken(&stem) {
+                    self.path_id(&file)
+                } else {
+                    stem
+                };
+                (!taken(&id)).then_some((id, file))
+            })
+            .collect()
+    }
+
+    /// `file`'s path in the model directory, as an id: `b/model.gguf`.
+    fn path_id(&self, file: &Path) -> String {
+        let relative = file.strip_prefix(&self.model_dir).unwrap_or(file);
+        let parts: Vec<_> = relative.iter().map(|part| part.to_string_lossy()).collect();
+        parts.join("/")
+    }
+
+    /// The id the inventory lists `file` by, if it is a file of this model
+    /// directory: the same choice [`Self::unloaded`] makes — its stem, or its
+    /// path in the directory when another file shares that stem.
+    pub fn inventory_id(&self, file: &Path) -> Option<String> {
+        let target = file.canonicalize().ok()?;
+        self.unloaded(&[])
+            .into_iter()
+            .find(|(_, path)| path.canonicalize().is_ok_and(|path| path == target))
+            .map(|(id, _)| id)
+    }
+
+    /// Whether `id` is the path ([`Self::path_id`]) of a model the directory
+    /// lists other than `target` (a canonical path).  A file is listed by its
+    /// path once its stem is taken, so a load cannot take another listed
+    /// file's path as its id: that file's id would answer with this model.
+    /// Files the inventory leaves out (a link leading out of the directory,
+    /// a GGUF that is not a model on its own) reserve nothing.  Reads the
+    /// header of a file whose path is `id`, so call it off the async runtime.
+    fn names_another_file(&self, id: &str, target: Option<&Path>) -> bool {
+        let Ok(root) = self.model_dir.canonicalize() else {
+            return false;
+        };
+        crate::model_info::discover_gguf(&self.model_dir)
+            .iter()
+            .filter(|file| self.path_id(file) == id)
+            .any(|file| {
+                file.canonicalize()
+                    .is_ok_and(|real| real.starts_with(&root) && Some(real.as_path()) != target)
+                    && GgufFacts::read(file)
+                        .ok()
+                        .is_none_or(|facts| facts.is_model())
+            })
+    }
+
     /// Resolve a requested model inside `model_dir`.
     fn resolve_path(&self, requested: &str) -> Result<PathBuf, ApiError> {
         let not_found = || {
-            ApiError::new(
-                StatusCode::NOT_FOUND,
-                format!("model '{requested}' was not found in the model directory"),
-                "model_not_found",
-            )
+            ApiError::model_not_found(format!(
+                "model '{requested}' was not found in the model directory"
+            ))
         };
         let root = self
             .model_dir
@@ -511,9 +724,16 @@ impl ModelManager {
         id: String,
         #[cfg_attr(not(feature = "distributed"), allow(unused_variables))] registry: &ModelRegistry,
     ) -> crate::Result<LoadedModel> {
+        let n_ctx = req
+            .n_ctx
+            .map(|n_ctx| {
+                u32::try_from(n_ctx)
+                    .map_err(|_| crate::JoshuaError::InvalidRequest("n_ctx too large".into()))
+            })
+            .transpose()?;
         #[cfg(feature = "distributed")]
-        if !req.local && (req.workers.is_some() || !self.workers.is_empty()) {
-            return self.load_distributed(req, path, id, registry);
+        if self.on_workers(req) {
+            return self.load_distributed(req, n_ctx, path, id, registry);
         }
         if req.workers.is_some() || req.ends.is_some() {
             return Err(crate::JoshuaError::InvalidRequest(
@@ -521,10 +741,7 @@ impl ModelManager {
             ));
         }
         let mut options = (self.engine_options)(path);
-        if let Some(n_ctx) = req.n_ctx {
-            options.n_ctx = u32::try_from(n_ctx)
-                .map_err(|_| crate::JoshuaError::InvalidRequest("n_ctx too large".into()))?;
-        }
+        options.n_ctx = Self::load_context(&options, n_ctx, None, false);
         let mut engine = Engine::with_options(path, options)?;
         if let Some(backend) = &self.npu_backend {
             engine = engine.with_npu_backend(Arc::clone(backend));
@@ -536,8 +753,37 @@ impl ModelManager {
             engine: Arc::new(engine),
             workers: Vec::new(),
             stages: Vec::new(),
-            created: now(),
+            created: unix_time(),
         })
+    }
+
+    /// Whether `req` places the model on workers rather than on this host.
+    #[cfg(feature = "distributed")]
+    fn on_workers(&self, req: &LoadModelRequest) -> bool {
+        !req.local && (req.workers.is_some() || !self.workers.is_empty())
+    }
+
+    /// Whether `req` places the model on workers rather than on this host.
+    #[cfg(not(feature = "distributed"))]
+    fn on_workers(&self, _req: &LoadModelRequest) -> bool {
+        false
+    }
+
+    /// The context window a load gives a model trained with `n_ctx_train`:
+    /// the load's own `n_ctx`, else the server's `--n-ctx` in `options`;
+    /// placed on workers, no more than `n_ctx_train`.  Every load, and
+    /// [`Self::default_limits`], sizes the context here.
+    fn load_context(
+        options: &EngineOptions,
+        n_ctx: Option<u32>,
+        n_ctx_train: Option<u32>,
+        on_workers: bool,
+    ) -> u32 {
+        let context = crate::engine::resolve_n_ctx(n_ctx.unwrap_or(options.n_ctx));
+        match n_ctx_train {
+            Some(trained) if on_workers => context.min(trained),
+            _ => context,
+        }
     }
 
     fn finish_engine(&self, mut engine: Engine) -> Engine {
@@ -550,12 +796,33 @@ impl ModelManager {
         engine
     }
 
+    /// The limits a load of `path` that names nothing else gives the
+    /// model, as [`Self::load`] sets them: the context from
+    /// [`Self::load_context`] and the output cap from
+    /// `--max-output-tokens` ([`crate::engine::output_cap`]).
+    pub fn default_limits(&self, path: &Path, facts: Option<&GgufFacts>) -> ModelLimits {
+        let n_ctx_train = facts.and_then(|f| f.n_ctx_train);
+        // Only the context is read here.  The options also settle (and log)
+        // the file's page-cache plan, which is a load's business, not a
+        // listing's: keep that out of the log on every `/v1/models`.
+        let options =
+            tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
+                (self.engine_options)(path)
+            });
+        let on_workers = self.on_workers(&LoadModelRequest::default());
+        let context = Self::load_context(&options, None, n_ctx_train, on_workers);
+        let output_cap = crate::engine::output_cap(self.max_output_tokens);
+        ModelLimits::new(context, n_ctx_train, output_cap)
+    }
+
     /// Place the model on workers: they receive only their stages, from this
     /// controller, and this host keeps just the tokenizer and sampling.
+    /// `n_ctx` is the load's own context window, if it names one.
     #[cfg(feature = "distributed")]
     fn load_distributed(
         &self,
         req: &LoadModelRequest,
+        n_ctx: Option<u32>,
         path: &Path,
         id: String,
         registry: &ModelRegistry,
@@ -582,20 +849,16 @@ impl ModelManager {
         }
         // A worker holds one model at a time and serves one controller.
         let claim = registry.claim_workers(&workers)?;
-        let header = crate::gguf_ext::read_header(&mut std::io::BufReader::new(
-            std::fs::File::open(path)?,
-        ))?;
-        let arch = header.architecture().unwrap_or_default();
-        let model_ctx = crate::gguf_meta::Meta::new(&header.metadata, &arch)
-            .u32("context_length")
-            .map_err(|e| ModelLoad(e.to_string()))? as usize;
+        let facts = GgufFacts::read(path)?;
+        let model_ctx = facts.n_ctx_train.ok_or_else(|| {
+            let arch = facts.architecture.as_deref().unwrap_or_default();
+            ModelLoad(format!(
+                "{arch}: missing GGUF metadata key `{arch}.context_length`"
+            ))
+        })?;
         let defaults = Limits::default();
         let server = (self.engine_options)(path);
-        let server_ctx = match server.n_ctx {
-            0 => defaults.context,
-            n => n as usize,
-        };
-        let context = req.n_ctx.unwrap_or(server_ctx).min(model_ctx);
+        let context = Self::load_context(&server, n_ctx, Some(model_ctx), true) as usize;
         let limits = Limits {
             context,
             chunk: req.chunk.unwrap_or(defaults.chunk).min(context),
@@ -604,14 +867,16 @@ impl ModelManager {
         };
         // The controller maps the file only to tokenize and to read slices;
         // nothing is prefetched or loaded for compute here.  It renders the
-        // chat and samples, so the server's template and sampling flags apply.
+        // chat, samples and reads tool calls, so the server's template,
+        // sampling and tool-call parser flags apply.
         let options = EngineOptions::with_n_ctx(context as u32)
             .backend(crate::engine::ComputeBackend::Cpu)
             .lazy_weights(true)
             .prefill_chunk(limits.chunk)
             .sampling(server.sampling)
             .chat_template(server.chat_template)
-            .trust_request_chat_template(server.trust_request_chat_template);
+            .trust_request_chat_template(server.trust_request_chat_template)
+            .tool_call_parser(server.tool_call_parser);
         let engine = Engine::with_options(path, options)?;
         let pipeline = Pipeline::deploy(
             path,
@@ -641,22 +906,144 @@ impl ModelManager {
             engine: Arc::new(engine),
             workers,
             stages,
-            created: now(),
+            created: unix_time(),
         })
     }
 }
 
-fn model_json(model: &LoadedModel) -> serde_json::Value {
-    json!({
-        "id": model.id,
-        "object": "model",
-        "created": model.created,
-        "owned_by": "joshua",
-        "workers": model.workers.iter().map(|w| w.to_string()).collect::<Vec<_>>(),
-        "stages": model.stages,
-        "context_length": model.engine.n_ctx(),
-        "max_output_tokens": model.engine.max_output_tokens(),
+/// Map a model-load failure to the error a caller sees.
+///
+/// A load the caller asked for reports its cause (`UNPROCESSABLE_ENTITY` with
+/// the engine's own message); anything else is an internal failure.
+fn load_failure(err: crate::JoshuaError) -> ApiError {
+    match err {
+        crate::JoshuaError::ModelLoad(msg) => {
+            ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, msg, "model_load_failed")
+        }
+        e => ApiError::from(e),
+    }
+}
+
+/// Load `req`'s model file, already resolved to `path`, as `id`.
+///
+/// `target` is `path` canonicalised when the caller has it: the id may not be
+/// another listed file's path (see [`ModelManager::names_another_file`]), which
+/// needs a header read and so stays inside the blocking load.
+///
+/// The reservation in `state.models` keeps any other load of the same id out
+/// while this one runs, and the caller gets the loaded model back to answer
+/// with (dropping its engine releases the weights).
+async fn load_model_file(
+    state: &AppState,
+    req: LoadModelRequest,
+    path: PathBuf,
+    id: String,
+    target: Option<PathBuf>,
+) -> Result<LoadedModel, ApiError> {
+    let state = Arc::clone(state);
+    tokio::task::spawn_blocking(move || {
+        let manager = manager(&state)?;
+        if manager.names_another_file(&id, target.as_deref()) {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                format!("id '{id}' is the path of another model file in the model directory"),
+                "model_exists",
+            ));
+        }
+        let guard = state.models.reserve(&id)?;
+        tracing::info!(model = %id, path = %path.display(), "loading model");
+        let model = manager
+            .load(&req, &path, id, &state.models)
+            .map_err(load_failure)?;
+        guard.finish(model.clone());
+        Ok::<_, ApiError>(model)
     })
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?
+}
+
+/// `POST /v1/models/load`'s answer: the model's `/v1/models` entry, with
+/// its workers and stages also at the top level, where they have always
+/// been.
+fn model_json(model: &LoadedModel) -> serde_json::Value {
+    let mut body = json!(model.info().card());
+    let workers: Vec<String> = model.workers.iter().map(|w| w.to_string()).collect();
+    body["workers"] = json!(workers);
+    body["stages"] = json!(model.stages);
+    body
+}
+
+/// The engine for the model `requested` names, loading it on first use.
+///
+/// A `--model-dir` server lists every valid model in its directory, so the
+/// directory is the model store: a request selects a model by naming it, and
+/// the first request for one that is not loaded maps it in — no
+/// `POST /v1/models/load` needed first.  Loads of one id are serialised by
+/// [`ModelRegistry::load_gate`], which `POST /v1/models/unload` holds across its
+/// whole wait: a burst of requests for a cold model shares its single load and
+/// a reload cannot overlap the model it replaces.
+///
+/// A name the directory does not list keeps the registry's own diagnosis,
+/// which reports what *is* loaded ([`ModelRegistry::resolve`]).
+pub(crate) async fn select_model(
+    state: &AppState,
+    requested: &str,
+) -> Result<(String, Arc<Engine>), ApiError> {
+    let unselected = match state.resolve(requested) {
+        Ok(found) => return Ok(found),
+        Err(e) => e,
+    };
+    // Only a file the inventory lists is loadable here.
+    let requested = requested.trim();
+    let Some((id, path)) = state
+        .unloaded()
+        .into_iter()
+        .find(|(id, _)| id == requested)
+    else {
+        return Err(unselected);
+    };
+    // Every GGUF in the directory is listed by `unloaded`, but `/v1/models`
+    // leaves out the ones that are not models on their own (an adapter, a
+    // projector, an importance matrix).  Loading one would answer a bad name
+    // with an engine error, so those stay on the unknown-model path.
+    if !is_model_file(&path).await? {
+        return Err(unselected);
+    }
+    let gate = state.models.load_gate(&id);
+    let _held = gate.lock().await;
+    // An unload of this id holds the same gate until the old engine is gone, so
+    // by now the id is free; and a load that finished while this one waited is
+    // reused rather than repeated.
+    if let Some(found) = state.models.loaded(&id) {
+        return Ok(found);
+    }
+    // Loading is logged by `load_model_file` with the file it maps; this says
+    // why the load happened.
+    tracing::info!(model = %id, "loading the model a request named");
+    let target = path.canonicalize().ok();
+    let model = load_model_file(
+        state,
+        LoadModelRequest {
+            model: id.clone(),
+            ..Default::default()
+        },
+        path,
+        id.clone(),
+        target,
+    )
+    .await?;
+    Ok((model.id, Arc::clone(&model.engine)))
+}
+
+/// Whether `path` is a GGUF model on its own (not an adapter, projector or
+/// importance matrix), read from its header — I/O, so off the async runtime.
+async fn is_model_file(path: &Path) -> Result<bool, ApiError> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        crate::model_info::GgufFacts::read(&path).is_ok_and(|facts| facts.is_model())
+    })
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))
 }
 
 fn embedding_job(engine: &Engine, model: &str) -> JobModel {
@@ -687,35 +1074,41 @@ async fn load_model(
     State(state): State<AppState>,
     Json(req): Json<LoadModelRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let path = manager(&state)?.resolve_path(&req.model)?;
+    let unloaded = state.unloaded();
+    let path = match manager(&state)?.resolve_path(&req.model) {
+        Ok(path) => path,
+        // A file the inventory lists by its stem, e.g. in a subdirectory.
+        Err(e) => unloaded
+            .iter()
+            .find(|(id, _)| *id == req.model)
+            .map(|(_, file)| file.clone())
+            .ok_or(e)?,
+    };
+    // By default the model is served under the id the inventory lists its
+    // file by, so the list and the served id agree; a file the inventory
+    // does not list goes by its stem.
+    let target = path.canonicalize().ok();
     let id = req.id.clone().unwrap_or_else(|| {
-        path.file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_default()
+        unloaded
+            .into_iter()
+            .find(|(_, file)| target.is_some() && file.canonicalize().ok() == target)
+            .map(|(id, _)| id)
+            .unwrap_or_else(|| {
+                path.file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            })
     });
     if id.is_empty() {
         return Err(ApiError::bad_request("empty model id"));
     }
-    let loaded = tokio::task::spawn_blocking(move || {
-        let manager = manager(&state)?;
-        let guard = state.models.reserve(&id)?;
-        tracing::info!(model = %id, path = %path.display(), "loading model");
-        let model = manager
-            .load(&req, &path, id, &state.models)
-            .map_err(|e| match e {
-                // The caller asked for this load; tell them why it failed.
-                crate::JoshuaError::ModelLoad(msg) => {
-                    ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, msg, "model_load_failed")
-                }
-                e => ApiError::from(e),
-            })?;
-        let body = model_json(&model);
-        guard.finish(model);
-        Ok::<_, ApiError>(body)
-    })
-    .await
-    .map_err(|e| ApiError::internal(e.to_string()))??;
-    Ok(Json(loaded))
+    // The id's gate serialises this load with a request-initiated load and with
+    // an unload of the same id, so a load can never overlap the engine it
+    // replaces.
+    let gate = state.models.load_gate(&id);
+    let _held = gate.lock().await;
+    let model = load_model_file(&state, req, path, id, target).await?;
+    Ok(Json(model_json(&model)))
 }
 
 /// `POST /v1/models/unload` — stop serving a model and release it.
@@ -724,13 +1117,15 @@ async fn unload_model(
     Json(req): Json<UnloadModelRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     manager(&state)?;
-    let model = state.models.remove(&req.id).ok_or_else(|| {
-        ApiError::new(
-            StatusCode::NOT_FOUND,
-            format!("model '{}' is not loaded", req.id),
-            "model_not_found",
-        )
-    })?;
+    // Hold the id's gate from the removal until the old engine (and, on a
+    // controller, its workers) is gone: a request that names the model waits
+    // instead of mapping a second copy while the first still serves one.
+    let gate = state.models.load_gate(&req.id);
+    let _held = gate.lock().await;
+    let model = state
+        .models
+        .remove(&req.id)
+        .ok_or_else(|| ApiError::model_not_found(format!("model '{}' is not loaded", req.id)))?;
     tracing::info!(model = %model.id, "unloading model");
     // New requests no longer find it. Wait for the ones already running,
     // then drop the engine here: that frees its weights or releases its
@@ -757,6 +1152,8 @@ async fn unload_model(
 pub fn create_router(state: AppState) -> Router {
     let api = Router::new()
         .route("/v1/models", get(list_models))
+        .route("/models", get(list_models))
+        .route("/v1/models/{*id}", get(retrieve_model))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/messages", post(messages))
         .route("/v1/messages/count_tokens", post(messages_count_tokens))
@@ -1113,9 +1510,13 @@ async fn tokenize(
     State(state): State<AppState>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let (_, engine) = state
-        .models
-        .resolve(body.get("model").and_then(|v| v.as_str()).unwrap_or_default())?;
+    let (_, engine) = select_model(
+        &state,
+        body.get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default(),
+    )
+    .await?;
     let prompt = body
         .get("prompt")
         .or_else(|| body.get("content"))
@@ -1146,9 +1547,13 @@ async fn detokenize(
     State(state): State<AppState>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let (_, engine) = state
-        .models
-        .resolve(body.get("model").and_then(|v| v.as_str()).unwrap_or_default())?;
+    let (_, engine) = select_model(
+        &state,
+        body.get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default(),
+    )
+    .await?;
     let tokens = body
         .get("tokens")
         .and_then(|v| v.as_array())
@@ -1229,6 +1634,12 @@ async fn worker_info(State(state): State<AppState>) -> Result<Json<WorkerInfo>, 
         }),
         embedding_jobs: models.iter().filter(|model| model.engine.supports_embeddings())
             .map(|model| model.embedding_job.clone()).collect(),
+        cards: models
+            .iter()
+            .map(LoadedModel::info)
+            .chain(state.whisper_info())
+            .map(|model| json!(model.card()))
+            .collect(),
         protocol_version: WORKER_PROTOCOL_VERSION,
         cache_epochs: models
             .iter()
@@ -1270,19 +1681,6 @@ async fn worker_info(State(state): State<AppState>) -> Result<Json<WorkerInfo>, 
     }))
 }
 
-/// Short backend name for a candle device.
-fn device_label(device: &candle_core::Device) -> &'static str {
-    use candle_core::DeviceLocation as L;
-    match device.location() {
-        L::Cpu => "cpu",
-        L::Cuda { .. } => "cuda",
-        L::Metal { .. } => "metal",
-        L::OpenCl { .. } => "opencl",
-        L::Sycl { .. } => "sycl",
-        L::Vulkan { .. } => "vulkan",
-    }
-}
-
 /// Sets its flag when dropped.  Held by a handler across the blocking
 /// generation, so when hyper drops the handler future (the client hung up)
 /// the engine sees the flag and stops decoding.
@@ -1304,36 +1702,35 @@ impl Drop for CancelOnDrop {
     }
 }
 
-/// `GET /v1/models` — returns the loaded models.
-async fn list_models(State(state): State<AppState>) -> Json<ModelListResponse> {
-    let created = now();
-    let mut data: Vec<ModelInfo> = state
-        .models
-        .list()
+/// The `/v1/models` entries: [`ServerState::inventory`], then the Whisper
+/// model.
+async fn model_cards(state: AppState) -> Result<Vec<ModelCard>, ApiError> {
+    Ok(inventory(&state)
+        .await?
         .into_iter()
-        .map(|m| ModelInfo {
-            id: m.id,
-            object: "model".to_string(),
-            created: m.created,
-            owned_by: "joshua".to_string(),
-            context_length: Some(m.engine.n_ctx()),
-            max_output_tokens: Some(m.engine.max_output_tokens()),
-        })
-        .collect();
-    if let Some(whisper) = &state.whisper {
-        data.push(ModelInfo {
-            id: whisper.model_name().to_string(),
-            object: "model".to_string(),
-            created,
-            owned_by: "joshua".to_string(),
-            context_length: None,
-            max_output_tokens: None,
-        });
-    }
-    Json(ModelListResponse {
-        object: "list".to_string(),
-        data,
-    })
+        .chain(state.whisper_info())
+        .map(|model| model.card())
+        .collect())
+}
+
+/// `GET /v1/models` (also `GET /models`, as llama-server serves it) — the
+/// loaded models, the model directory's other files, and the Whisper model.
+async fn list_models(State(state): State<AppState>) -> Result<Json<ModelListResponse>, ApiError> {
+    Ok(Json(ModelListResponse::new(model_cards(state).await?)))
+}
+
+/// `GET /v1/models/{id}` — one model's `/v1/models` entry; an id no entry
+/// has is OpenAI's `404`.
+async fn retrieve_model(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<ModelCard>, ApiError> {
+    model_cards(state)
+        .await?
+        .into_iter()
+        .find(|card| card.id == id)
+        .map(Json)
+        .ok_or_else(|| ApiError::unknown_model(&id))
 }
 
 /// `POST /v1/chat/completions` — OpenAI chat completions.
@@ -1342,7 +1739,7 @@ async fn chat_completions(
     headers: HeaderMap,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Result<Response, ApiError> {
-    let (model, engine) = state.models.resolve(&req.model)?;
+    let (model, engine) = select_model(&state, &req.model).await?;
     let stream = req.stream.unwrap_or(false);
     let defaults = engine.sampling_defaults(SamplingProfile::OpenAi);
     let mut options = req
@@ -1411,6 +1808,13 @@ async fn chat_completions(
     }
 
     // ── Non-streaming path ────────────────────────────────────────────────────
+    let tool_call_format = if tools.is_some() {
+        engine
+            .tool_call_format_for_request(&messages, tools.as_deref(), &options)
+            .map_err(ApiError::from)?
+    } else {
+        engine.tool_call_format()
+    };
     let cancel = CancelOnDrop::new();
     let completion = tokio::task::spawn_blocking({
         let engine = Arc::clone(&engine);
@@ -1429,7 +1833,9 @@ async fn chat_completions(
         &engine,
         &completion,
         reasoning_output.splits(false),
-        tools.is_some(),
+        tools.as_deref(),
+        tool_call_format,
+        OPENAI_CALL_IDS,
     );
     let reasoning = answer
         .reasoning
@@ -1438,13 +1844,13 @@ async fn chat_completions(
         .stop_type
         .chat_finish_reason(!answer.calls.is_empty());
     let (mut content, tool_calls) = if answer.calls.is_empty() {
-        (Some(answer.text), None)
+        (Some(answer.content), None)
     } else {
         let calls: Vec<ToolCall> = answer
             .calls
             .into_iter()
             .map(|c| ToolCall {
-                id: format!("call_{}", Uuid::new_v4().simple()),
+                id: c.id.unwrap_or_default(),
                 call_type: "function".to_string(),
                 function: FunctionCallResult {
                     name: c.name,
@@ -1481,262 +1887,105 @@ async fn chat_completions(
     response.timings = Some(completion.timings);
     Ok(Json(response).into_response())
 }
-/// Markers that begin a tool call in the model's textual output.  The
-/// longest marker sets how much trailing text the stream must withhold,
-/// because a marker can be split across two decoded tokens.
-const TOOL_MARKERS: [&str; 3] = ["<tool_call>", "[TOOL_CALLS]", "<function="];
-
-/// Filters decoded text for the chat SSE stream.
-///
-/// Prose is forwarded as soon as it is safe.  A marker that may begin a tool
-/// call (or a prefix of one split across decoded tokens) is held back, and
-/// the text between a call's opening and closing marker is never emitted as
-/// prose.  Once the closing marker arrives the filter resumes streaming the
-/// prose that follows it.  Malformed markers are forwarded as ordinary text
-/// instead of swallowing the rest of the response, and a bare JSON tool call
-/// (which has no marker) is buffered until the parser can tell it apart from
-/// ordinary JSON prose.
-struct ChatStreamFilter {
-    tools: bool,
-    all: String,
-    /// Next byte of `all` that has not been scanned/emitted.
-    pos: usize,
-    holdback: usize,
-    /// A leading `{` may be a bare JSON tool call; hold the whole response
-    /// until the final parse decides.
-    bare_json: bool,
-}
-
-/// How a tool-call marker is terminated.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ToolMarkerKind {
-    /// `<tool_call> … </tool_call>`
-    Tagged,
-    /// `[TOOL_CALLS][…]` — consumes the rest of the output.
-    Mistral,
-    /// `<function=…> … </function>` without a wrapper.
-    Function,
-}
-
-fn tool_marker_kind(marker: &str) -> ToolMarkerKind {
-    match marker {
-        "<tool_call>" => ToolMarkerKind::Tagged,
-        "[TOOL_CALLS]" => ToolMarkerKind::Mistral,
-        _ => ToolMarkerKind::Function,
-    }
-}
-
-impl ChatStreamFilter {
-    fn new(tools: bool) -> Self {
-        let holdback = if tools {
-            TOOL_MARKERS
-                .iter()
-                .map(|m| m.len())
-                .max()
-                .unwrap_or(0)
-                .saturating_sub(1)
-        } else {
-            0
-        };
-        Self {
-            tools,
-            all: String::new(),
-            pos: 0,
-            holdback,
-            bare_json: false,
-        }
-    }
-
-    /// Returns the prose that is safe to send now.
-    fn push(&mut self, delta: &str) -> Vec<String> {
-        if !self.tools {
-            return vec![delta.to_string()];
-        }
-        self.all.push_str(delta);
-        if self.pos == 0 && self.all.trim_start().starts_with('{') {
-            self.bare_json = true;
-        }
-        self.drain(false)
-    }
-
-    /// Flush any withheld prose after decoding ends.
-    fn finish(&mut self, final_text: &str) -> Vec<String> {
-        if !self.tools {
-            return Vec::new();
-        }
-        if self.all.is_empty() {
-            self.all.push_str(final_text);
-        }
-        if self.pos == 0 && self.all.trim_start().starts_with('{') {
-            self.bare_json = true;
-        }
-        let calls = parse_tool_calls(&self.all).1;
-        if !calls.is_empty() {
-            // A bare JSON call consumes the whole response; there is no prose
-            // to flush.  Marked calls were already skipped while streaming.
-            if self.bare_json {
-                return Vec::new();
-            }
-            return self.drain(true);
-        }
-        // No call was recognised, so any marker-like text is ordinary prose:
-        // release everything that is still buffered.
-        self.bare_json = false;
-        self.drain(true)
-    }
-
-    /// Parse the complete output.  With tools, `all` is the exact stream the
-    /// engine reported; the return value from the engine is the fallback for
-    /// an empty stream.
-    fn parse(&self, final_text: &str) -> (String, Vec<crate::tools::ParsedToolCall>) {
-        if !self.tools {
-            // Without offered tools the model's markup is ordinary text.
-            return (final_text.to_string(), Vec::new());
-        }
-        if !self.all.is_empty() {
-            parse_tool_calls(&self.all)
-        } else {
-            parse_tool_calls(final_text)
-        }
-    }
-
-    fn drain(&mut self, flushing: bool) -> Vec<String> {
-        if self.bare_json {
-            return Vec::new();
-        }
-        let mut out = String::new();
-        loop {
-            let rest = &self.all[self.pos..];
-            let next = TOOL_MARKERS
-                .iter()
-                .filter_map(|marker| rest.find(marker).map(|at| (at, *marker)))
-                .min_by_key(|(at, _)| *at);
-            let Some((at, marker)) = next else {
-                let end = if flushing {
-                    self.all.len()
-                } else {
-                    floor_char_boundary(
-                        &self.all,
-                        self.all.len().saturating_sub(self.holdback),
-                    )
-                };
-                if end > self.pos {
-                    out.push_str(&self.all[self.pos..end]);
-                    self.pos = end;
-                }
-                break;
-            };
-
-            let marker_start = self.pos + at;
-            if marker_start > self.pos {
-                out.push_str(&self.all[self.pos..marker_start]);
-                self.pos = marker_start;
-            }
-
-            match tool_marker_kind(marker) {
-                ToolMarkerKind::Mistral => {
-                    // The payload runs to the end of the response, so there
-                    // is no prose after it to stream.
-                    if flushing {
-                        let region = &self.all[marker_start..];
-                        if parse_tool_calls(region).1.is_empty() {
-                            out.push_str(region);
-                        }
-                        self.pos = self.all.len();
-                    }
-                    break;
-                }
-                kind => {
-                    let terminator = if kind == ToolMarkerKind::Tagged {
-                        "</tool_call>"
-                    } else {
-                        "</function>"
-                    };
-                    let body_start = marker_start + marker.len();
-                    if let Some(found) = self.all[body_start..].find(terminator) {
-                        let end = body_start + found + terminator.len();
-                        let region = &self.all[marker_start..end];
-                        if parse_tool_calls(region).1.is_empty() {
-                            // Not a call: forward the marker text as prose.
-                            out.push_str(region);
-                        }
-                        self.pos = end;
-                        continue;
-                    }
-                    if flushing {
-                        let region = &self.all[marker_start..];
-                        if parse_tool_calls(region).1.is_empty() {
-                            out.push_str(region);
-                        }
-                        self.pos = self.all.len();
-                    }
-                    // Otherwise wait for the closing marker to arrive.
-                    break;
-                }
-            }
-        }
-        if out.is_empty() {
-            Vec::new()
-        } else {
-            vec![out]
-        }
-    }
-}
-
 /// One piece of a chat completion's output, in the order to send it.
 pub(crate) enum ChatPiece<'a> {
     /// Reasoning text.
     Reasoning(&'a str),
     /// Answer prose that is safe to send.
     Text(&'a str),
+    /// Tool call `index` begins, with its id (the model's own, or one
+    /// minted for it) and its function name.
+    CallStart {
+        index: usize,
+        id: &'a str,
+        name: &'a str,
+    },
+    /// More of call `index`'s JSON arguments.
+    CallArgs { index: usize, delta: &'a str },
 }
+
+/// The prefix of the ids minted for an OpenAI response's tool calls.
+const OPENAI_CALL_IDS: &str = "call_";
+/// The prefix of the ids minted for an Anthropic response's `tool_use`
+/// blocks.
+const ANTHROPIC_CALL_IDS: &str = "toolu_";
 
 /// The output post-processing every chat API shares, streaming or not: the
-/// reasoning is split off first (by the engine, as it decodes), then tool-call
-/// markup is withheld from the answer and the calls are parsed from the
-/// answer alone.  Each API maps the pieces onto its own wire events.
-struct ChatOutput {
-    filter: ChatStreamFilter,
-    /// The answer as the client sees it, for the tool-call parse.
-    answer: String,
+/// reasoning is split off first (by the engine, as it decodes), then the
+/// answer goes through the model's tool-call reader, which passes prose on
+/// at once and each call as it is written, without its markup.  Each API
+/// maps the pieces onto its own wire events.
+struct ChatOutput<'a> {
+    calls: ToolCallStream<'a>,
+    format: ToolCallFormat,
+    /// The prefix of the ids minted for calls the model gives none.
+    id_prefix: &'static str,
+    /// Each call's id, as sent.
+    ids: Vec<String>,
 }
 
-impl ChatOutput {
-    fn new(tools: bool) -> Self {
+impl<'a> ChatOutput<'a> {
+    fn new(format: ToolCallFormat, tools: Option<&'a [Tool]>, id_prefix: &'static str) -> Self {
         Self {
-            filter: ChatStreamFilter::new(tools),
-            answer: String::new(),
+            calls: ToolCallStream::new(format, tools),
+            format,
+            id_prefix,
+            ids: Vec::new(),
         }
     }
 
-    /// One step of the split output: its reasoning, then the answer prose
-    /// that is safe to send now.
+    /// One step of the split output: its reasoning, then what of the answer
+    /// is safe to send now.
     fn push(&mut self, split: &Split, emit: &mut dyn FnMut(ChatPiece<'_>)) {
         if !split.reasoning.is_empty() {
             emit(ChatPiece::Reasoning(&split.reasoning));
         }
         if !split.content.is_empty() {
-            self.answer.push_str(&split.content);
-            for text in self.filter.push(&split.content) {
-                emit(ChatPiece::Text(&text));
-            }
+            let events = self.calls.push(&split.content);
+            self.send(events, emit);
         }
     }
 
-    /// After decoding: the prose still withheld, then the tool calls parsed
-    /// from the answer.
+    /// After decoding: the rest of the answer, then the tool calls read
+    /// from it, under the ids they were sent with.
     fn finish(mut self, emit: &mut dyn FnMut(ChatPiece<'_>)) -> Vec<ParsedToolCall> {
-        for text in self.filter.finish(&self.answer) {
-            emit(ChatPiece::Text(&text));
+        let events = self.calls.finish();
+        self.send(events, emit);
+        let mut calls = self.calls.calls();
+        for (call, id) in calls.iter_mut().zip(self.ids) {
+            call.id = Some(id);
         }
-        self.filter.parse(&self.answer).1
+        calls
+    }
+
+    fn send(&mut self, events: Vec<ToolEvent>, emit: &mut dyn FnMut(ChatPiece<'_>)) {
+        for event in events {
+            match event {
+                ToolEvent::Text(text) => emit(ChatPiece::Text(&text)),
+                ToolEvent::CallStart { index, id, name } => {
+                    let id = id.unwrap_or_else(|| self.format.call_id(self.id_prefix));
+                    emit(ChatPiece::CallStart {
+                        index,
+                        id: &id,
+                        name: &name,
+                    });
+                    self.ids.push(id);
+                }
+                ToolEvent::CallArgs { index, delta } => emit(ChatPiece::CallArgs {
+                    index,
+                    delta: &delta,
+                }),
+            }
+        }
     }
 }
 
 /// Run a streaming chat completion through the shared post-processing:
 /// `emit` gets each piece as it is decoded, with the reasoning split off
-/// when `split` (otherwise all of it is answer).  Returns the completion and
-/// the tool calls parsed from the answer.
+/// when `split` (otherwise all of it is answer).  Calls the model gives no
+/// id get one starting `id_prefix`.  Returns the completion and the tool
+/// calls read from the answer.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn stream_chat_output(
     engine: &Engine,
     messages: &[ChatMessage],
@@ -1744,9 +1993,15 @@ pub(crate) fn stream_chat_output(
     options: &GenerationOptions,
     cancel: &AtomicBool,
     split: bool,
+    id_prefix: &'static str,
     emit: &mut dyn FnMut(ChatPiece<'_>),
 ) -> crate::error::Result<(Completion, Vec<ParsedToolCall>)> {
-    let mut output = ChatOutput::new(tools.is_some());
+    let format = if tools.is_some() {
+        engine.tool_call_format_for_request(messages, tools, options)?
+    } else {
+        engine.tool_call_format()
+    };
+    let mut output = ChatOutput::new(format, tools, id_prefix);
     let completion = if split {
         engine.complete_chat_streaming_split(messages, tools, options, cancel, &mut |s| {
             output.push(&s, emit)
@@ -1767,23 +2022,27 @@ pub(crate) fn stream_chat_output(
 pub(crate) struct ChatAnswer {
     /// The reasoning split off the output.
     pub(crate) reasoning: Option<String>,
-    /// The answer: the output after its reasoning.
-    pub(crate) text: String,
-    /// The answer around its tool calls, as the tool-call parser leaves it
-    /// (the answer itself when no tools were offered).
+    /// The answer as a stream sends it: the output after its reasoning,
+    /// without its tool-call markup.
+    pub(crate) content: String,
+    /// The answer around its tool calls, trimmed as the tool-call parser
+    /// leaves it (the answer itself when no tools were offered).
     pub(crate) prose: String,
-    /// The tool calls in the answer.
+    /// The tool calls in the answer, each with its id.
     pub(crate) calls: Vec<ParsedToolCall>,
 }
 
 /// [`stream_chat_output`] for a finished completion: the reasoning split
-/// off its text when `split`, then the tool calls parsed from the answer
-/// when `tools` were offered.
+/// off its text when `split`, then the tool calls read from the answer when
+/// `tools` were offered, with ids starting `id_prefix` for those the model
+/// gives none.
 pub(crate) fn chat_answer(
     engine: &Engine,
     completion: &Completion,
     split: bool,
-    tools: bool,
+    tools: Option<&[Tool]>,
+    format: crate::tools::ToolCallFormat,
+    id_prefix: &str,
 ) -> ChatAnswer {
     let (reasoning, text) = if split {
         crate::reasoning::split(
@@ -1794,25 +2053,24 @@ pub(crate) fn chat_answer(
     } else {
         (None, completion.text.clone())
     };
-    let (prose, calls) = if tools {
-        parse_tool_calls(&text)
-    } else {
-        (text.clone(), Vec::new())
+    let Some(tools) = tools else {
+        return ChatAnswer {
+            reasoning,
+            prose: text.clone(),
+            content: text,
+            calls: Vec::new(),
+        };
     };
+    let (content, mut calls) = crate::tools::read_tool_calls(format, tools, &text);
+    for call in &mut calls {
+        call.id.get_or_insert_with(|| format.call_id(id_prefix));
+    }
     ChatAnswer {
         reasoning,
-        text,
-        prose,
+        prose: content.trim().to_string(),
+        content,
         calls,
     }
-}
-
-/// Largest char boundary at or below `index`.
-fn floor_char_boundary(s: &str, mut index: usize) -> usize {
-    while index > 0 && !s.is_char_boundary(index) {
-        index -= 1;
-    }
-    index
 }
 
 /// Writes OpenAI streaming chunks to the SSE channel.
@@ -1863,6 +2121,8 @@ impl ChatStreamEmitter {
         self.send(delta, None, None, None);
     }
 
+    /// A call's first chunk carries its id, type and name (OpenAI's and
+    /// vLLM's shape); its arguments follow in [`Self::tool_args`] chunks.
     fn tool_start(&mut self, index: usize, id: &str, name: &str) {
         let delta = DeltaContent {
             role: self.take_role(),
@@ -1877,15 +2137,28 @@ impl ChatStreamEmitter {
         self.send(delta, None, None, None);
     }
 
-    fn tool_args(&mut self, index: usize, arguments: &str) {
+    /// More of call `index`'s arguments.
+    fn tool_args(&mut self, index: usize, delta: &str) {
         let delta = DeltaContent {
             tool_calls: Some(json!([{
                 "index": index,
-                "function": {"arguments": arguments},
+                "function": {"arguments": delta},
             }])),
             ..Default::default()
         };
         self.send(delta, None, None, None);
+    }
+
+    /// Send one piece of the shared post-processing's output; reasoning
+    /// only when `show_reasoning`.
+    fn piece(&mut self, piece: ChatPiece<'_>, show_reasoning: bool) {
+        match piece {
+            ChatPiece::Reasoning(text) if show_reasoning => self.reasoning(text),
+            ChatPiece::Reasoning(_) => {}
+            ChatPiece::Text(text) => self.text(text),
+            ChatPiece::CallStart { index, id, name } => self.tool_start(index, id, name),
+            ChatPiece::CallArgs { index, delta } => self.tool_args(index, delta),
+        }
     }
 
     fn finish(&mut self, reason: &str, usage: &UsageInfo, timings: &crate::types::Timings) {
@@ -1972,21 +2245,13 @@ fn stream_chat_completion(
         options,
         cancel,
         output.reasoning.splits(true),
-        &mut |piece| match piece {
-            ChatPiece::Reasoning(text) if show_reasoning => emitter.reasoning(text),
-            ChatPiece::Reasoning(_) => {}
-            ChatPiece::Text(text) => emitter.text(text),
-        },
+        OPENAI_CALL_IDS,
+        &mut |piece| emitter.piece(piece, show_reasoning),
     );
 
     match result {
         Ok((completion, calls)) => {
             metrics.record_generation(&completion.usage);
-            for (index, call) in calls.iter().enumerate() {
-                let call_id = format!("call_{}", Uuid::new_v4().simple());
-                emitter.tool_start(index, &call_id, &call.name);
-                emitter.tool_args(index, &call.arguments);
-            }
             emitter.finish(
                 completion.stop_type.chat_finish_reason(!calls.is_empty()),
                 &completion.usage,
@@ -2017,7 +2282,7 @@ async fn messages_count_tokens(
     State(state): State<AppState>,
     Json(req): Json<MessagesRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let (_, engine) = state.models.resolve(&req.model)?;
+    let (_, engine) = select_model(&state, &req.model).await?;
     let defaults = engine.sampling_defaults(SamplingProfile::OpenAi);
     let (messages, tools, options) =
         anthropic::to_chat_request(&req, &defaults).map_err(ApiError::bad_request)?;
@@ -2032,7 +2297,7 @@ async fn messages(
     headers: HeaderMap,
     Json(req): Json<MessagesRequest>,
 ) -> Result<Response, ApiError> {
-    let (resolved_model, engine) = state.models.resolve(&req.model)?;
+    let (resolved_model, engine) = select_model(&state, &req.model).await?;
     // Anthropic's defaults are the neutral OpenAI-family ones.
     let defaults = engine.sampling_defaults(SamplingProfile::OpenAi);
     let (messages, tools, mut options) =
@@ -2049,7 +2314,6 @@ async fn messages(
         Some("none")
     );
     let tools = if tools_disabled { None } else { tools };
-    let tools_offered = tools.is_some();
     let model = if req.model.is_empty() {
         resolved_model
     } else {
@@ -2105,6 +2369,13 @@ async fn messages(
         return Ok(Sse::new(events).into_response());
     }
 
+    let tool_call_format = if tools.is_some() {
+        engine
+            .tool_call_format_for_request(&messages, tools.as_deref(), &options)
+            .map_err(ApiError::from)?
+    } else {
+        engine.tool_call_format()
+    };
     let cancel = CancelOnDrop::new();
     let completion = tokio::task::spawn_blocking({
         let engine = Arc::clone(&engine);
@@ -2117,7 +2388,14 @@ async fn messages(
     .map_err(ApiError::from)?;
     state.metrics.record_generation(&completion.usage);
 
-    let answer = chat_answer(&engine, &completion, true, tools_offered);
+    let answer = chat_answer(
+        &engine,
+        &completion,
+        true,
+        tools.as_deref(),
+        tool_call_format,
+        ANTHROPIC_CALL_IDS,
+    );
     let id = format!("msg_{}", Uuid::new_v4().simple());
     let response = anthropic::response(
         id,
@@ -2132,18 +2410,36 @@ async fn messages(
 
 /// Writes Anthropic streaming events to the SSE channel.
 ///
-/// Content blocks come in llama-server's order: a `thinking` block for the
-/// model's reasoning, then the `text` block, then one `tool_use` block per
-/// call, each with its own index.
+/// Content blocks open and close as the output streams, in llama-server's
+/// order: a `thinking` block for the model's reasoning, then a `text` block
+/// for prose and one `tool_use` block per call, whose input arrives as
+/// `input_json_delta`s while the model writes it.  Prose after a call opens
+/// a new `text` block.
 struct AnthropicStreamEmitter {
     id: String,
     model: String,
     tx: tokio::sync::mpsc::UnboundedSender<AnthropicSse>,
-    /// The open `thinking` block's index.
-    thinking: Option<usize>,
-    /// The open `text` block's index.
-    text: Option<usize>,
+    /// The open content block's index and kind.
+    open: Option<(usize, AnthropicBlock)>,
+    /// Whether a `text` or `tool_use` block has opened: reasoning after the
+    /// answer has begun is not sent.
+    answered: bool,
     next_index: usize,
+}
+
+/// The kind of an open Anthropic content block.
+enum AnthropicBlock {
+    Thinking,
+    Text,
+    /// Tool call `call`'s `tool_use` block.  Its arguments stream as they
+    /// arrive once they start a JSON value (`streaming`); arguments the
+    /// model wrote as plain text are `held` and sent as one JSON string when
+    /// the block closes, like the non-streaming `tool_use.input`.
+    Tool {
+        call: usize,
+        streaming: bool,
+        held: Option<String>,
+    },
 }
 
 impl AnthropicStreamEmitter {
@@ -2156,8 +2452,8 @@ impl AnthropicStreamEmitter {
             id,
             model,
             tx,
-            thinking: None,
-            text: None,
+            open: None,
+            answered: false,
             next_index: 0,
         }
     }
@@ -2188,138 +2484,150 @@ impl AnthropicStreamEmitter {
         );
     }
 
-    /// Reasoning text as a `thinking` block (llama-server's extended
-    /// thinking stream: `thinking_delta`s, then an empty `signature_delta`
-    /// when the block closes).
-    fn thinking(&mut self, text: &str) {
-        if text.is_empty() || self.text.is_some() {
+    /// Open a content block, closing the one before it.
+    fn open_block(&mut self, kind: AnthropicBlock, content_block: serde_json::Value) -> usize {
+        self.close_block();
+        let index = self.next_index;
+        self.next_index += 1;
+        self.send(
+            "content_block_start",
+            json!({
+                "type": "content_block_start",
+                "index": index,
+                "content_block": content_block,
+            }),
+        );
+        self.open = Some((index, kind));
+        index
+    }
+
+    /// Close the open content block: a `thinking` block ends with an empty
+    /// `signature_delta` (llama-server's extended thinking stream), and a
+    /// `tool_use` block with arguments held as text sends them now.
+    fn close_block(&mut self) {
+        let Some((index, kind)) = self.open.take() else {
             return;
-        }
-        let index = match self.thinking {
-            Some(index) => index,
-            None => {
-                let index = self.next_index;
-                self.next_index += 1;
-                self.thinking = Some(index);
-                self.send(
-                    "content_block_start",
-                    json!({
-                        "type": "content_block_start",
-                        "index": index,
-                        "content_block": {"type": "thinking", "thinking": ""},
-                    }),
-                );
-                index
-            }
         };
+        match kind {
+            AnthropicBlock::Thinking => {
+                self.delta(index, json!({"type": "signature_delta", "signature": ""}))
+            }
+            AnthropicBlock::Tool {
+                held: Some(held), ..
+            } => self.delta(
+                index,
+                json!({
+                    "type": "input_json_delta",
+                    "partial_json": anthropic::tool_arguments_json(&held),
+                }),
+            ),
+            _ => {}
+        }
+        self.send(
+            "content_block_stop",
+            json!({"type": "content_block_stop", "index": index}),
+        );
+    }
+
+    fn delta(&self, index: usize, delta: serde_json::Value) {
         self.send(
             "content_block_delta",
             json!({
                 "type": "content_block_delta",
                 "index": index,
-                "delta": {"type": "thinking_delta", "thinking": text},
+                "delta": delta,
             }),
         );
     }
 
-    fn close_thinking(&mut self) {
-        if let Some(index) = self.thinking.take() {
-            self.send(
-                "content_block_delta",
-                json!({
-                    "type": "content_block_delta",
-                    "index": index,
-                    "delta": {"type": "signature_delta", "signature": ""},
-                }),
-            );
-            self.send(
-                "content_block_stop",
-                json!({"type": "content_block_stop", "index": index}),
-            );
+    /// Reasoning text, in a `thinking` block.
+    fn thinking(&mut self, text: &str) {
+        if text.is_empty() || self.answered {
+            return;
         }
+        let index = match self.open {
+            Some((index, AnthropicBlock::Thinking)) => index,
+            _ => self.open_block(
+                AnthropicBlock::Thinking,
+                json!({"type": "thinking", "thinking": ""}),
+            ),
+        };
+        self.delta(index, json!({"type": "thinking_delta", "thinking": text}));
     }
 
     fn text(&mut self, text: &str) {
         if text.is_empty() {
             return;
         }
-        self.close_thinking();
-        let index = match self.text {
-            Some(index) => index,
-            None => {
-                let index = self.next_index;
-                self.next_index += 1;
-                self.text = Some(index);
-                self.send(
-                    "content_block_start",
-                    json!({
-                        "type": "content_block_start",
-                        "index": index,
-                        "content_block": {"type": "text", "text": ""},
-                    }),
-                );
-                index
+        let index = match self.open {
+            Some((index, AnthropicBlock::Text)) => index,
+            _ => {
+                self.answered = true;
+                self.open_block(AnthropicBlock::Text, json!({"type": "text", "text": ""}))
             }
         };
-        self.send(
-            "content_block_delta",
-            json!({
-                "type": "content_block_delta",
-                "index": index,
-                "delta": {"type": "text_delta", "text": text},
-            }),
+        self.delta(index, json!({"type": "text_delta", "text": text}));
+    }
+
+    fn tool_start(&mut self, index: usize, id: &str, name: &str) {
+        self.answered = true;
+        self.open_block(
+            AnthropicBlock::Tool {
+                call: index,
+                streaming: false,
+                held: None,
+            },
+            json!({"type": "tool_use", "id": id, "name": name, "input": {}}),
         );
     }
 
-    fn finish(
-        &mut self,
-        calls: &[crate::tools::ParsedToolCall],
-        completion: &crate::engine::Completion,
-    ) {
-        self.close_thinking();
-        if let Some(index) = self.text {
-            self.send(
-                "content_block_stop",
-                json!({"type": "content_block_stop", "index": index}),
-            );
+    fn tool_args(&mut self, index: usize, delta: &str) {
+        let block = match &mut self.open {
+            Some((
+                block,
+                AnthropicBlock::Tool {
+                    call,
+                    streaming,
+                    held,
+                },
+            )) if *call == index => {
+                if !*streaming && held.is_none() {
+                    if delta.trim_start().starts_with(['{', '[']) {
+                        *streaming = true;
+                    } else {
+                        *held = Some(String::new());
+                    }
+                }
+                if let Some(held) = held {
+                    held.push_str(delta);
+                    return;
+                }
+                *block
+            }
+            _ => {
+                tracing::debug!("arguments for tool call {index} after its block closed");
+                return;
+            }
+        };
+        self.delta(
+            block,
+            json!({"type": "input_json_delta", "partial_json": delta}),
+        );
+    }
+
+    /// Send one piece of the shared post-processing's output.
+    fn piece(&mut self, piece: ChatPiece<'_>) {
+        match piece {
+            ChatPiece::Reasoning(text) => self.thinking(text),
+            ChatPiece::Text(text) => self.text(text),
+            ChatPiece::CallStart { index, id, name } => self.tool_start(index, id, name),
+            ChatPiece::CallArgs { index, delta } => self.tool_args(index, delta),
         }
-        for call in calls {
-            let index = self.next_index;
-            self.next_index += 1;
-            let id = format!("toolu_{}", Uuid::new_v4().simple());
-            self.send(
-                "content_block_start",
-                json!({
-                    "type": "content_block_start",
-                    "index": index,
-                    "content_block": {
-                        "type": "tool_use",
-                        "id": id,
-                        "name": call.name,
-                        "input": {},
-                    },
-                }),
-            );
-            self.send(
-                "content_block_delta",
-                json!({
-                    "type": "content_block_delta",
-                    "index": index,
-                    "delta": {
-                        "type": "input_json_delta",
-                        // Must be valid JSON text even when the model emitted
-                        // malformed arguments; the non-streaming response
-                        // normalises the same value to a JSON string.
-                        "partial_json": anthropic::tool_arguments_json(&call.arguments),
-                    },
-                }),
-            );
-            self.send(
-                "content_block_stop",
-                json!({"type": "content_block_stop", "index": index}),
-            );
-        }
-        let stop_reason = anthropic::stop_reason(completion.stop_type, !calls.is_empty());
+    }
+
+    fn finish(&mut self, has_calls: bool, completion: &crate::engine::Completion) {
+        self.close_block();
+        let stop_reason = anthropic::stop_reason(completion.stop_type, has_calls);
         let usage = anthropic::MessagesUsage::from_completion(completion);
         self.send(
             "message_delta",
@@ -2370,15 +2678,13 @@ fn stream_messages(
         options,
         cancel,
         true,
-        &mut |piece| match piece {
-            ChatPiece::Reasoning(text) => emitter.thinking(text),
-            ChatPiece::Text(text) => emitter.text(text),
-        },
+        ANTHROPIC_CALL_IDS,
+        &mut |piece| emitter.piece(piece),
     );
     match result {
         Ok((completion, calls)) => {
             metrics.record_generation(&completion.usage);
-            emitter.finish(&calls, &completion);
+            emitter.finish(!calls.is_empty(), &completion);
         }
         Err(error) => {
             tracing::error!("streaming Anthropic message failed: {error}");
@@ -2393,9 +2699,13 @@ async fn completions(
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let (model, engine) = state
-        .models
-        .resolve(body.get("model").and_then(|v| v.as_str()).unwrap_or_default())?;
+    let (model, engine) = select_model(
+        &state,
+        body.get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default(),
+    )
+    .await?;
     let prompt = body
         .get("prompt")
         .and_then(|v| v.as_str())
@@ -2427,10 +2737,7 @@ async fn completions(
 
     let usage = &completion.usage;
     state.metrics.record_generation(usage);
-    let created = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let created = unix_time();
 
     Ok(Json(json!({
         "id": format!("cmpl-{}", Uuid::new_v4().simple()),
@@ -2454,7 +2761,7 @@ async fn embeddings(
     headers: HeaderMap,
     Json(req): Json<EmbeddingRequest>,
 ) -> Result<Response, ApiError> {
-    let (model, engine) = state.models.resolve(&req.model)?;
+    let (model, engine) = select_model(&state, &req.model).await?;
     if let Some(owner) = headers.get(JOB_OWNER_HEADER) {
         let matches = state.models.list().iter().any(|loaded| {
             Arc::ptr_eq(&loaded.engine, &engine)
@@ -2856,6 +3163,24 @@ impl ApiError {
         }
     }
 
+    /// `404` for a model this server cannot serve, saying why (see
+    /// [`ErrorResponse::model_not_found`]).
+    pub(crate) fn model_not_found(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            body: ErrorResponse::model_not_found(msg),
+        }
+    }
+
+    /// `404` for an id that names no model (see
+    /// [`ErrorResponse::unknown_model`]).
+    pub(crate) fn unknown_model(id: &str) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            body: ErrorResponse::unknown_model(id),
+        }
+    }
+
     /// Internal failure: the detail is logged server-side, and the client
     /// receives only a generic message (no internal strings / panic text).
     pub(crate) fn internal(msg: impl Into<String>) -> Self {
@@ -2918,115 +3243,370 @@ mod tests {
         assert!(!api_keys_match(b"a", b""));
     }
 
-    #[test]
-    fn stream_filter_hides_a_tool_marker_split_across_chunks() {
-        let mut filter = super::ChatStreamFilter::new(true);
-        let mut prose = String::new();
-        for piece in [
-            "I will call ",
-            "<tool",
-            "_call>{\"name\":",
-            "\"f\",\"arguments\":{}}</tool_call>",
-        ] {
-            for text in filter.push(piece) {
-                prose.push_str(&text);
+    use super::{
+        AnthropicSse, AnthropicStreamEmitter, ChatOutput, ChatPiece, ChatStreamEmitter, UsageInfo,
+        ANTHROPIC_CALL_IDS, OPENAI_CALL_IDS,
+    };
+    use crate::engine::{Completion, StopType};
+    use crate::reasoning::Split;
+    use crate::tools::{ParsedToolCall, ToolCallFormat};
+    use serde_json::Value;
+
+    /// Feed `pieces` of answer text (or of reasoning, for pieces starting
+    /// `reasoning:`) through the shared chat post-processing in `format`
+    /// with tools offered, into `emit`.  Returns the calls it read.
+    fn feed(
+        format: ToolCallFormat,
+        id_prefix: &'static str,
+        pieces: &[&str],
+        emit: &mut dyn FnMut(ChatPiece<'_>),
+    ) -> Vec<ParsedToolCall> {
+        let mut output = ChatOutput::new(format, Some(&[]), id_prefix);
+        for piece in pieces {
+            let split = match piece.strip_prefix("reasoning:") {
+                Some(reasoning) => Split {
+                    reasoning: reasoning.to_string(),
+                    ..Default::default()
+                },
+                None => Split {
+                    content: piece.to_string(),
+                    ..Default::default()
+                },
+            };
+            output.push(&split, emit);
+        }
+        output.finish(emit)
+    }
+
+    fn openai_chunks(format: ToolCallFormat, pieces: &[&str], stop_type: StopType) -> Vec<Value> {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut emitter = ChatStreamEmitter::new("chatcmpl-1".into(), "m".into(), tx);
+        let calls = feed(format, OPENAI_CALL_IDS, pieces, &mut |piece| {
+            emitter.piece(piece, true)
+        });
+        emitter.finish(
+            stop_type.chat_finish_reason(!calls.is_empty()),
+            &UsageInfo::default(),
+            &Default::default(),
+        );
+        drop(emitter);
+        let mut chunks = Vec::new();
+        while let Ok(data) = rx.try_recv() {
+            if data != "[DONE]" {
+                chunks.push(serde_json::from_str(&data).unwrap());
             }
         }
-        assert_eq!(prose, "I will call ");
-        let (_, calls) = filter.parse("");
+        chunks
+    }
+
+    /// The content and per-call `(id, name, arguments)` a client rebuilds
+    /// from OpenAI stream chunks.
+    fn openai_rebuild(chunks: &[Value]) -> (String, Vec<(String, String, String)>) {
+        let mut content = String::new();
+        let mut calls: Vec<(String, String, String)> = Vec::new();
+        for chunk in chunks {
+            let delta = &chunk["choices"][0]["delta"];
+            if let Some(text) = delta["content"].as_str() {
+                content.push_str(text);
+            }
+            for call in delta["tool_calls"].as_array().into_iter().flatten() {
+                let index = call["index"].as_u64().unwrap() as usize;
+                if index == calls.len() {
+                    assert_eq!(call["type"], "function");
+                    calls.push((
+                        call["id"].as_str().unwrap().to_string(),
+                        call["function"]["name"].as_str().unwrap().to_string(),
+                        String::new(),
+                    ));
+                } else {
+                    assert!(call.get("id").is_none(), "only the first chunk has the id");
+                }
+                calls[index]
+                    .2
+                    .push_str(call["function"]["arguments"].as_str().unwrap());
+            }
+        }
+        (content, calls)
+    }
+
+    fn finish_reason(chunks: &[Value]) -> &str {
+        chunks.last().unwrap()["choices"][0]["finish_reason"]
+            .as_str()
+            .unwrap()
+    }
+
+    /// Tool calls stream as OpenAI deltas while the model writes them: the
+    /// call's id, type and name once, then its arguments in pieces, with no
+    /// markup in the content.
+    #[test]
+    fn openai_stream_sends_tool_call_deltas_as_they_are_generated() {
+        let pieces = [
+            "Let me look.",
+            "<tool_call>\n{\"name\": \"get_",
+            "weather\", \"arguments\": {\"ci",
+            "ty\": \"Par",
+            "is\"}}\n</tool_call>",
+        ];
+        let chunks = openai_chunks(ToolCallFormat::Generic, &pieces, StopType::Eos);
+        let (content, calls) = openai_rebuild(&chunks);
+        assert_eq!(content, "Let me look.");
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "f");
-        assert_eq!(calls[0].arguments, "{}");
+        assert!(calls[0].0.starts_with("call_"));
+        assert_eq!(calls[0].1, "get_weather");
+        let args: Value = serde_json::from_str(&calls[0].2).unwrap();
+        assert_eq!(args, serde_json::json!({"city": "Paris"}));
+        // The arguments arrive over several chunks, before the call closes.
+        let arg_chunks = chunks
+            .iter()
+            .filter(|c| c["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"] != "")
+            .count();
+        assert!(arg_chunks >= 3, "{chunks:?}");
+        assert_eq!(chunks[0]["choices"][0]["delta"]["role"], "assistant");
+        assert_eq!(finish_reason(&chunks), "tool_calls");
+        for chunk in &chunks {
+            let text = chunk["choices"][0]["delta"]["content"]
+                .as_str()
+                .unwrap_or("");
+            assert!(!text.contains('<'), "markup leaked: {text}");
+        }
     }
 
+    /// A call cut off by the token cap is still streamed as far as it got,
+    /// but the response ends with `length`, not `tool_calls`.
     #[test]
-    fn stream_filter_forwards_everything_without_tools() {
-        let mut filter = super::ChatStreamFilter::new(false);
-        let mut prose = String::new();
-        for piece in ["a ", "b ", "c"] {
-            for text in filter.push(piece) {
-                prose.push_str(&text);
-            }
-        }
-        assert_eq!(prose, "a b c");
-        assert!(filter.parse("a b c").1.is_empty());
-    }
-
-    #[test]
-    fn stream_filter_resumes_prose_after_a_tool_call() {
-        let mut filter = super::ChatStreamFilter::new(true);
-        let mut prose = String::new();
-        for piece in [
-            "Checking ",
-            "<tool_call>{\"name\":\"f\",\"arguments\":{}}</tool_call>",
-            " Done",
-        ] {
-            for text in filter.push(piece) {
-                prose.push_str(&text);
-            }
-        }
-        for text in filter.finish("") {
-            prose.push_str(&text);
-        }
-        assert_eq!(prose, "Checking  Done");
-        let (parsed_prose, calls) = filter.parse("");
+    fn openai_stream_reports_length_for_a_cut_off_call() {
+        let pieces = ["<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Pa"];
+        let chunks = openai_chunks(ToolCallFormat::Generic, &pieces, StopType::Limit);
+        let (_, calls) = openai_rebuild(&chunks);
         assert_eq!(calls.len(), 1);
-        assert_eq!(parsed_prose, "Checking  Done");
+        assert_eq!(finish_reason(&chunks), "length");
+    }
+
+    /// A model's own call ids (Kimi's `functions.name:index`) are reported
+    /// as the call ids, since its template expects them back.
+    #[test]
+    fn openai_stream_keeps_the_model_call_ids() {
+        let text = "<|tool_calls_section_begin|><|tool_call_begin|>functions.f:0\
+                    <|tool_call_argument_begin|>{\"a\": 1}<|tool_call_end|>\
+                    <|tool_call_begin|>functions.g:1<|tool_call_argument_begin|>{}<|tool_call_end|>\
+                    <|tool_calls_section_end|>";
+        let chunks = openai_chunks(ToolCallFormat::KimiK2, &[text], StopType::Eos);
+        let (content, calls) = openai_rebuild(&chunks);
+        assert_eq!(content, "");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            (calls[0].0.as_str(), calls[0].1.as_str()),
+            ("functions.f:0", "f")
+        );
+        assert_eq!(
+            (calls[1].0.as_str(), calls[1].1.as_str()),
+            ("functions.g:1", "g")
+        );
+    }
+
+    /// Mistral's templates take back only 9-alphanumeric call ids, so those
+    /// are the ids minted for a Mistral model's calls, streamed or not.
+    #[test]
+    fn mistral_calls_get_ids_their_template_accepts() {
+        let text = "[TOOL_CALLS][{\"name\": \"f\", \"arguments\": {}}, {\"name\": \"g\", \"arguments\": {}}]";
+        let chunks = openai_chunks(ToolCallFormat::Mistral, &[text], StopType::Eos);
+        let (_, calls) = openai_rebuild(&chunks);
+        assert_eq!(calls.len(), 2);
+        for (id, _, _) in &calls {
+            assert_eq!(id.len(), 9, "{id}");
+            assert!(id.chars().all(|c| c.is_ascii_alphanumeric()), "{id}");
+        }
+        assert_ne!(calls[0].0, calls[1].0);
+        // The calls the stream returns carry the ids it sent.
+        let mut sent = Vec::new();
+        let returned = feed(ToolCallFormat::Mistral, ANTHROPIC_CALL_IDS, &[text], &mut |piece| {
+            if let ChatPiece::CallStart { id, .. } = piece {
+                sent.push(id.to_string());
+            }
+        });
+        let returned: Vec<String> = returned.into_iter().map(|c| c.id.unwrap()).collect();
+        assert_eq!(returned, sent);
+        assert!(sent.iter().all(|id| id.len() == 9));
     }
 
     #[test]
-    fn stream_filter_does_not_duplicate_a_bare_json_tool_call() {
-        let mut filter = super::ChatStreamFilter::new(true);
-        let mut prose = String::new();
-        for piece in ["{\"name\":\"lookup\",", "\"arguments\":{\"q\":\"rust\"}}"] {
-            for text in filter.push(piece) {
-                prose.push_str(&text);
-            }
-        }
-        for text in filter.finish("") {
-            prose.push_str(&text);
-        }
-        assert_eq!(prose, "");
-        let (parsed_prose, calls) = filter.parse("");
-        assert_eq!(parsed_prose, "");
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "lookup");
+    fn openai_stream_without_tool_markup_is_plain_content() {
+        let chunks = openai_chunks(
+            ToolCallFormat::Generic,
+            &["Hello", ", world"],
+            StopType::Eos,
+        );
+        let (content, calls) = openai_rebuild(&chunks);
+        assert_eq!(content, "Hello, world");
+        assert!(calls.is_empty());
+        assert_eq!(finish_reason(&chunks), "stop");
     }
 
+    /// No whitespace-only content arrives between two calls.
     #[test]
-    fn stream_filter_releases_plain_json_instead_of_dropping_it() {
-        let mut filter = super::ChatStreamFilter::new(true);
-        let mut prose = String::new();
-        for piece in ["{\"answer\":", "42}"] {
-            for text in filter.push(piece) {
-                prose.push_str(&text);
-            }
-        }
-        for text in filter.finish("") {
-            prose.push_str(&text);
-        }
-        assert_eq!(prose, "{\"answer\":42}");
-        assert!(filter.parse("").1.is_empty());
+    fn openai_stream_sends_no_whitespace_between_calls() {
+        let pieces = [
+            "Let me check both.\n",
+            "<tool_call>\n{\"name\": \"a\", \"arguments\": {}}\n</tool_call>",
+            "\n",
+            "<tool_call>\n{\"name\": \"b\", \"arguments\": {}}\n</tool_call>",
+            "\n",
+        ];
+        let chunks = openai_chunks(ToolCallFormat::Generic, &pieces, StopType::Eos);
+        let contents: Vec<&str> = chunks
+            .iter()
+            .filter_map(|c| c["choices"][0]["delta"]["content"].as_str())
+            .collect();
+        assert_eq!(contents, ["Let me check both.\n"]);
+        assert_eq!(openai_rebuild(&chunks).1.len(), 2);
     }
 
-    #[test]
-    fn stream_filter_does_not_swallow_prose_after_an_invalid_marker() {
-        let mut filter = super::ChatStreamFilter::new(true);
-        let mut prose = String::new();
-        for piece in [
-            "before ",
-            "<tool_call>not a call</tool_call>",
-            " after",
-        ] {
-            for text in filter.push(piece) {
-                prose.push_str(&text);
+    fn anthropic_events(format: ToolCallFormat, pieces: &[&str]) -> Vec<(String, Value)> {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AnthropicSse>();
+        let mut emitter = AnthropicStreamEmitter::new("msg_1".into(), "m".into(), tx);
+        emitter.message_start(3);
+        let calls = feed(format, ANTHROPIC_CALL_IDS, pieces, &mut |piece| {
+            emitter.piece(piece)
+        });
+        emitter.finish(!calls.is_empty(), &Completion::for_tests("", StopType::Eos));
+        drop(emitter);
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push((
+                event.event.to_string(),
+                serde_json::from_str(&event.data).unwrap(),
+            ));
+        }
+        events
+    }
+
+    /// The content blocks a client rebuilds from Anthropic stream events:
+    /// `(type, text or name, input JSON text)`.  Checks that every block
+    /// starts, takes deltas and stops in order.
+    fn anthropic_rebuild(events: &[(String, Value)]) -> Vec<(String, String, String)> {
+        let mut blocks: Vec<(String, String, String)> = Vec::new();
+        let mut open = None;
+        for (event, data) in events {
+            assert_eq!(event.as_str(), data["type"].as_str().unwrap());
+            match event.as_str() {
+                "content_block_start" => {
+                    assert_eq!(open, None, "a block opened inside another");
+                    let index = data["index"].as_u64().unwrap() as usize;
+                    assert_eq!(index, blocks.len());
+                    let block = &data["content_block"];
+                    let kind = block["type"].as_str().unwrap().to_string();
+                    let name = block["name"].as_str().unwrap_or("").to_string();
+                    if kind == "tool_use" {
+                        assert!(block["id"].as_str().is_some_and(|id| !id.is_empty()));
+                        assert_eq!(block["input"], serde_json::json!({}));
+                    }
+                    blocks.push((kind, name, String::new()));
+                    open = Some(index);
+                }
+                "content_block_delta" => {
+                    let index = data["index"].as_u64().unwrap() as usize;
+                    assert_eq!(open, Some(index));
+                    let delta = &data["delta"];
+                    match delta["type"].as_str().unwrap() {
+                        "text_delta" => blocks[index].1.push_str(delta["text"].as_str().unwrap()),
+                        "thinking_delta" => blocks[index]
+                            .1
+                            .push_str(delta["thinking"].as_str().unwrap()),
+                        "signature_delta" => assert_eq!(blocks[index].0, "thinking"),
+                        "input_json_delta" => blocks[index]
+                            .2
+                            .push_str(delta["partial_json"].as_str().unwrap()),
+                        other => panic!("unexpected delta {other}"),
+                    }
+                }
+                "content_block_stop" => {
+                    assert_eq!(open, data["index"].as_u64().map(|i| i as usize));
+                    open = None;
+                }
+                _ => {}
             }
         }
-        for text in filter.finish("") {
-            prose.push_str(&text);
-        }
-        assert_eq!(prose, "before <tool_call>not a call</tool_call> after");
-        assert!(filter.parse("").1.is_empty());
+        assert_eq!(open, None, "a block was left open");
+        blocks
+    }
+
+    /// Anthropic streaming: a thinking block, a text block, then a
+    /// `tool_use` block whose input arrives as `input_json_delta`s, then
+    /// `stop_reason: tool_use`.
+    #[test]
+    fn anthropic_stream_sends_tool_use_blocks_as_they_are_generated() {
+        let pieces = [
+            "reasoning:Add them.",
+            "Checking.",
+            "<tool_call>\n<function=add>\n<parameter=a>\n2\n</parameter>\n",
+            "<parameter=b>\n3\n</parameter>\n</function>\n</tool_call>",
+        ];
+        let events = anthropic_events(ToolCallFormat::Generic, &pieces);
+        let blocks = anthropic_rebuild(&events);
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(
+            (blocks[0].0.as_str(), blocks[0].1.as_str()),
+            ("thinking", "Add them.")
+        );
+        assert_eq!(
+            (blocks[1].0.as_str(), blocks[1].1.as_str()),
+            ("text", "Checking.")
+        );
+        assert_eq!(
+            (blocks[2].0.as_str(), blocks[2].1.as_str()),
+            ("tool_use", "add")
+        );
+        let (_, start) = events
+            .iter()
+            .find(|(_, data)| data["content_block"]["type"] == "tool_use")
+            .unwrap();
+        assert!(start["content_block"]["id"]
+            .as_str()
+            .unwrap()
+            .starts_with("toolu_"));
+        let input: Value = serde_json::from_str(&blocks[2].2)
+            .unwrap_or_else(|e| panic!("{e}: {} in {events:?}", blocks[2].2));
+        assert_eq!(input, serde_json::json!({"a": 2, "b": 3}));
+        let input_deltas = events
+            .iter()
+            .filter(|(_, data)| data["delta"]["type"] == "input_json_delta")
+            .count();
+        assert!(input_deltas >= 2, "{events:?}");
+        let (_, message_delta) = events.iter().find(|(e, _)| e == "message_delta").unwrap();
+        assert_eq!(message_delta["delta"]["stop_reason"], "tool_use");
+        assert_eq!(events.last().unwrap().0, "message_stop");
+    }
+
+    /// Prose after a call opens a new text block; arguments the model
+    /// wrote as plain text arrive as one JSON string, as the non-streaming
+    /// `tool_use.input` reports them.
+    #[test]
+    fn anthropic_stream_text_after_a_call_and_plain_text_arguments() {
+        let text = "<|tool_calls_section_begin|><|tool_call_begin|>functions.f:0\
+                    <|tool_call_argument_begin|>not json<|tool_call_end|><|tool_calls_section_end|> Done.";
+        let blocks = anthropic_rebuild(&anthropic_events(ToolCallFormat::KimiK2, &[text]));
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].0, "tool_use");
+        assert_eq!(
+            serde_json::from_str::<Value>(&blocks[0].2).unwrap(),
+            "not json"
+        );
+        assert_eq!(
+            (blocks[1].0.as_str(), blocks[1].1.as_str()),
+            ("text", " Done.")
+        );
+    }
+
+    /// Two calls in a row open no text block between them.
+    #[test]
+    fn anthropic_stream_opens_no_whitespace_block_between_calls() {
+        let pieces = [
+            "Let me check both.\n<tool_call>\n{\"name\": \"a\", \"arguments\": {}}\n</tool_call>\n",
+            "<tool_call>\n{\"name\": \"b\", \"arguments\": {}}\n</tool_call>",
+        ];
+        let blocks = anthropic_rebuild(&anthropic_events(ToolCallFormat::Generic, &pieces));
+        let kinds: Vec<&str> = blocks.iter().map(|b| b.0.as_str()).collect();
+        assert_eq!(kinds, ["text", "tool_use", "tool_use"]);
     }
 
     #[test]
