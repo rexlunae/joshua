@@ -1920,21 +1920,11 @@ pub fn create_router(coordinator: Arc<Coordinator>) -> Router {
 }
 
 async fn require_api_key(State(c): State<Arc<Coordinator>>, req: Request, next: Next) -> Response {
-    if let Some(expected) = &c.config.api_key {
-        let provided = req
-            .headers()
-            .get(header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "));
-        if !provided
-            .is_some_and(|k| crate::server::api_keys_match(k.as_bytes(), expected.as_bytes()))
-        {
-            return error_response(
-                StatusCode::UNAUTHORIZED,
-                "invalid or missing API key — pass the key as 'Authorization: Bearer <key>'",
-                "invalid_request_error",
-                None,
-            );
+    if let Some(configured) = &c.config.api_key {
+        // The same check `joshua serve` runs: either header, any key of a
+        // comma-separated rotation list.
+        if let Err(rejection) = crate::server::check_api_key(configured, req.headers()) {
+            return error_response(rejection.status(), rejection.message(), rejection.kind(), None);
         }
     }
     next.run(req).await
