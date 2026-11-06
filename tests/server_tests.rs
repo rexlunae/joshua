@@ -1582,6 +1582,15 @@ async fn raw_completions_take_every_prompt_form_and_stream() {
     assert!(finish.is_some(), "{body}");
     assert_eq!(usage.unwrap()["prompt_tokens"], raw_tokens);
 
+    // A prompt generation would refuse is a 400 before a stream starts.
+    for prompt in [serde_json::json!([99_999_999]), serde_json::json!("a ".repeat(100))] {
+        let mut bad = base.clone();
+        bad["prompt"] = prompt.clone();
+        bad["stream"] = serde_json::json!(true);
+        let (status, text) = complete(bad).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{prompt}: {text}");
+    }
+
     // Refused rather than ignored.
     for (extra, needle) in [
         (serde_json::json!({"logprobs": 2}), "logprobs"),

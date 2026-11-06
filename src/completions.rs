@@ -118,20 +118,33 @@ struct Job {
     echo: String,
 }
 
+/// How a request's prompts are built.
+struct Build {
+    suffix: Option<String>,
+    /// The tokenizer's special tokens (BOS) on a text or infill prompt.
+    special: bool,
+    /// Keep the prompt's text for `echo`.
+    echo: bool,
+}
+
 /// Build each prompt's [`Job`]: a text prompt with the tokenizer's special
 /// tokens unless `add_special_tokens` is false, token ids verbatim, and with
-/// `suffix` an infill prompt in the model's FIM format.
+/// `suffix` an infill prompt in the model's FIM format.  Each is checked as
+/// generation will check it (token ids, empty or too long for the window),
+/// so a bad prompt is a client error before a stream starts.
 fn jobs(
     engine: &Engine,
-    suffix: Option<&str>,
-    special: bool,
+    build: &Build,
+    options: &GenerationOptions,
     prompts: Vec<Prompt>,
 ) -> Result<Vec<Job>, ApiError> {
-    let suffix = suffix.filter(|s| !s.is_empty());
+    let suffix = build.suffix.as_deref().filter(|s| !s.is_empty());
+    let special = build.special;
     prompts
         .into_iter()
         .map(|prompt| {
             let echo = match &prompt {
+                _ if !build.echo => String::new(),
                 Prompt::Text(text) => text.clone(),
                 Prompt::Tokens(ids) => engine.detokenize(ids, false).map_err(ApiError::from)?,
             };
@@ -143,7 +156,7 @@ fn jobs(
                         )));
                     }
                     let ids = engine
-                        .format_infill(&text, suffix, &[], "", -1, false)
+                        .format_infill(&text, suffix, &[], "", -1, false, special)
                         .map_err(ApiError::from)?;
                     RawPrompt::tokens(ids)
                 }
@@ -153,6 +166,7 @@ fn jobs(
                 (Prompt::Text(text), None) => RawPrompt::text(text).with_special_tokens(special),
                 (Prompt::Tokens(ids), None) => RawPrompt::tokens(ids),
             };
+            engine.check_prompt(&prompt, options).map_err(ApiError::from)?;
             Ok(Job { prompt, echo })
         })
         .collect()
@@ -182,10 +196,32 @@ fn options(
     Ok(options)
 }
 
-fn add_usage(total: &mut UsageInfo, usage: &UsageInfo) {
-    total.prompt_tokens += usage.prompt_tokens;
-    total.completion_tokens += usage.completion_tokens;
-    total.total_tokens += usage.total_tokens;
+/// The usage of a request's completions: one completion's as the engine
+/// reports it, or every count summed, the token details included (each
+/// kept when any completion reports it).
+fn total_usage<'a>(usages: impl IntoIterator<Item = &'a UsageInfo>) -> UsageInfo {
+    let mut usages = usages.into_iter();
+    let Some(first) = usages.next() else {
+        return UsageInfo::default();
+    };
+    usages.fold(first.clone(), |mut total, usage| {
+        total.prompt_tokens += usage.prompt_tokens;
+        total.completion_tokens += usage.completion_tokens;
+        total.total_tokens += usage.total_tokens;
+        if let Some(d) = &usage.prompt_tokens_details {
+            total
+                .prompt_tokens_details
+                .get_or_insert_with(Default::default)
+                .cached_tokens += d.cached_tokens;
+        }
+        if let Some(d) = &usage.completion_tokens_details {
+            total
+                .completion_tokens_details
+                .get_or_insert_with(Default::default)
+                .reasoning_tokens += d.reasoning_tokens;
+        }
+        total
+    })
 }
 
 /// `POST /v1/completions`.
@@ -200,15 +236,20 @@ pub(crate) async fn completions(
     let prompts = prompts(req.prompt.as_ref()).map_err(ApiError::bad_request)?;
     let (model, engine) = select_model(&state, &req.model).await?;
     let options = options(&engine, &body, &req, &headers)?;
-    let jobs = {
-        let engine = Arc::clone(&engine);
-        let suffix = req.suffix.clone();
-        let special = req.add_special_tokens.unwrap_or(true);
-        tokio::task::spawn_blocking(move || jobs(&engine, suffix.as_deref(), special, prompts))
-            .await
-            .map_err(|e| ApiError::internal(e.to_string()))??
-    };
     let echo = req.echo == Some(true);
+    let (jobs, options) = {
+        let engine = Arc::clone(&engine);
+        let build = Build {
+            suffix: req.suffix.clone(),
+            special: req.add_special_tokens.unwrap_or(true),
+            echo,
+        };
+        tokio::task::spawn_blocking(move || {
+            jobs(&engine, &build, &options, prompts).map(|jobs| (jobs, options))
+        })
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))??
+    };
     let id = format!("cmpl-{}", Uuid::new_v4().simple());
     let created = unix_time();
     let cancel = CancelOnDrop::new();
@@ -230,7 +271,7 @@ pub(crate) async fn completions(
             let send = |value: Value| {
                 let _ = tx.send(value.to_string());
             };
-            let mut usage = UsageInfo::default();
+            let mut usages = Vec::with_capacity(jobs.len());
             let count = jobs.len();
             for (index, job) in jobs.into_iter().enumerate() {
                 if echo && !job.echo.is_empty() {
@@ -242,10 +283,11 @@ pub(crate) async fn completions(
                 match result {
                     Ok(completion) => {
                         metrics.record_generation(&completion.usage);
-                        add_usage(&mut usage, &completion.usage);
+                        usages.push(completion.usage.clone());
                         let mut last = chunk(index, "", Some(completion.finish_reason()));
                         if index + 1 == count {
-                            last["usage"] = serde_json::to_value(&usage).unwrap_or_default();
+                            last["usage"] =
+                                serde_json::to_value(total_usage(&usages)).unwrap_or_default();
                             last["timings"] =
                                 serde_json::to_value(&completion.timings).unwrap_or_default();
                         }
@@ -285,14 +327,13 @@ pub(crate) async fn completions(
     .map_err(|e| ApiError::internal(e.to_string()))?
     .map_err(ApiError::from)?;
 
-    let mut usage = UsageInfo::default();
+    let usage = total_usage(completions.iter().map(|c| &c.usage));
     let choices: Vec<Value> = completions
         .iter()
         .zip(&jobs)
         .enumerate()
         .map(|(index, (completion, job))| {
             state.metrics.record_generation(&completion.usage);
-            add_usage(&mut usage, &completion.usage);
             let text = if echo {
                 format!("{}{}", job.echo, completion.text)
             } else {
@@ -314,4 +355,49 @@ pub(crate) async fn completions(
         "timings": completions.last().map(|c| &c.timings),
     }))
     .into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{CompletionTokensDetails, PromptTokensDetails};
+
+    fn usage(prompt: u32, completion: u32, cached: Option<u32>) -> UsageInfo {
+        UsageInfo {
+            prompt_tokens: prompt,
+            completion_tokens: completion,
+            total_tokens: prompt + completion,
+            prompt_tokens_details: cached.map(|cached_tokens| PromptTokensDetails { cached_tokens }),
+            completion_tokens_details: None,
+        }
+    }
+
+    #[test]
+    fn usage_keeps_and_sums_the_token_details() {
+        let one = usage(100, 5, Some(80));
+        assert_eq!(
+            serde_json::to_value(total_usage([&one])).unwrap(),
+            serde_json::to_value(&one).unwrap()
+        );
+        let mut reasoning = usage(10, 4, None);
+        reasoning.completion_tokens_details = Some(CompletionTokensDetails { reasoning_tokens: 3 });
+        let total = total_usage([&one, &reasoning, &usage(7, 1, Some(2))]);
+        assert_eq!((total.prompt_tokens, total.completion_tokens, total.total_tokens), (117, 10, 127));
+        assert_eq!(total.prompt_tokens_details.unwrap().cached_tokens, 82);
+        assert_eq!(total.completion_tokens_details.unwrap().reasoning_tokens, 3);
+    }
+
+    #[test]
+    fn prompts_take_every_openai_form() {
+        assert_eq!(prompts(Some(&json!("a"))).unwrap(), [Prompt::Text("a".into())]);
+        assert_eq!(prompts(Some(&json!([1, 2]))).unwrap(), [Prompt::Tokens(vec![1, 2])]);
+        assert_eq!(
+            prompts(Some(&json!(["a", [3]]))).unwrap(),
+            [Prompt::Text("a".into()), Prompt::Tokens(vec![3])]
+        );
+        for bad in [json!([]), json!([[]]), json!([-1]), json!({}), json!([1, "a"])] {
+            assert!(prompts(Some(&bad)).is_err(), "{bad}");
+        }
+        assert!(prompts(None).is_err());
+    }
 }
