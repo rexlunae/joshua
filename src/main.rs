@@ -1146,7 +1146,7 @@ async fn main() -> anyhow::Result<()> {
             let npu = npu_plugin
                 .map(|plugin| npu_backend(&plugin, npu_in_process))
                 .transpose()?;
-            let model_dir = serve_model_dir(model.as_deref(), model_dir)?;
+            let (model, model_dir) = serve_targets(model, model_dir)?;
             if let Some(dir) = &model_dir {
                 tracing::info!(
                     dir = %dir.display(),
@@ -1154,7 +1154,10 @@ async fn main() -> anyhow::Result<()> {
                      by the first request that names it"
                 );
             }
-            let models = match &model {
+            // Startup model first, so `opts`/`npu` are still available to it;
+            // the registry then names it by the id the inventory lists its file
+            // by, which needs the manager.
+            let engine = match &model {
                 Some(model) => {
                     let mut engine = Engine::with_options(model, opts.clone())?;
                     if let Some(backend) = &npu {
@@ -1166,9 +1169,9 @@ async fn main() -> anyhow::Result<()> {
                     if let Some(max) = max_output_tokens {
                         engine = engine.with_max_output_tokens(max);
                     }
-                    server::ModelRegistry::with_model(Arc::new(engine))
+                    Some(Arc::new(engine))
                 }
-                None => server::ModelRegistry::default(),
+                None => None,
             };
             let manager = model_dir.map(|model_dir| -> anyhow::Result<_> {
                 Ok(server::ModelManager {
@@ -1196,6 +1199,24 @@ async fn main() -> anyhow::Result<()> {
                     workers,
                 })
             });
+            let models = match engine {
+                Some(engine) => {
+                    // The id `/v1/models` lists the startup model's file by, so
+                    // the list and the served id agree (`a/model.gguf` for a
+                    // nested file whose stem is shared).
+                    let id = match (model.as_deref(), manager.as_ref()) {
+                        (Some(model), Some(manager)) => {
+                            manager.as_ref().ok().and_then(|m| m.inventory_id(model))
+                        }
+                        _ => None,
+                    };
+                    match id {
+                        Some(id) => server::ModelRegistry::with_model_named(engine, id),
+                        None => server::ModelRegistry::with_model(engine),
+                    }
+                }
+                None => server::ModelRegistry::default(),
+            };
             let whisper = whisper_model
                 .map(joshua::whisper::WhisperEngine::new)
                 .transpose()?
@@ -1850,17 +1871,20 @@ fn ppl_window(window: Option<usize>, n_ctx: usize) -> usize {
     window.unwrap_or(n_ctx).clamp(2, n_ctx.max(2))
 }
 
-/// The model directory a server serves, from `--model` and `--model-dir`.
+/// What a server starts on and serves, from `--model` and `--model-dir`.
 ///
-/// A `--model` that is a directory names a directory *of* models: it is the
-/// model directory, so every model in it is listed and can be selected by name,
-/// and the engine starts on the model it finds there.  Naming it twice
+/// A `--model` that is a directory names a directory *of* models: the server
+/// serves the whole directory, so every model in it is listed and can be
+/// selected by name, and starts on the first model the inventory would list.
+/// `joshua::model_info::first_model` discovers it the way the inventory does
+/// (two levels deep, model-on-its-own only), so a directory whose models sit in
+/// subdirectories — or beside an adapter — starts too.  Naming it twice
 /// (`--model DIR --model-dir DIR`) is the same request; two different
 /// directories are ambiguous, so that is an error rather than a silent choice.
-fn serve_model_dir(
-    model: Option<&Path>,
+fn serve_targets(
+    model: Option<PathBuf>,
     model_dir: Option<PathBuf>,
-) -> anyhow::Result<Option<PathBuf>> {
+) -> anyhow::Result<(Option<PathBuf>, Option<PathBuf>)> {
     match (model, model_dir) {
         (Some(path), given) if path.is_dir() => {
             if let Some(dir) = &given {
@@ -1872,9 +1896,15 @@ fn serve_model_dir(
                     dir.display()
                 );
             }
-            Ok(Some(path.to_path_buf()))
+            let startup = joshua::model_info::first_model(&path).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--model {} is a directory with no GGUF model in it",
+                    path.display()
+                )
+            })?;
+            Ok((Some(startup), Some(path)))
         }
-        (_, dir) => Ok(dir),
+        (model, dir) => Ok((model, dir)),
     }
 }
 
@@ -1942,24 +1972,27 @@ mod tests {
         std::fs::write(&file, b"never read here").unwrap();
 
         // A file stays a file: no model directory is implied.
-        assert_eq!(serve_model_dir(Some(&file), None).unwrap(), None);
-        // A directory is the model directory, named once or twice.
         assert_eq!(
-            serve_model_dir(Some(&dir), None).unwrap(),
-            Some(dir.clone())
+            serve_targets(Some(file.clone()), None).unwrap(),
+            (Some(file.clone()), None)
         );
+        // Without --model, --model-dir is taken as given.
         assert_eq!(
-            serve_model_dir(Some(&dir), Some(dir.clone())).unwrap(),
-            Some(dir.clone())
+            serve_targets(None, Some(other.clone())).unwrap(),
+            (None, Some(other.clone()))
         );
-        // Without --model the flag is taken as given.
-        assert_eq!(
-            serve_model_dir(None, Some(other.clone())).unwrap(),
-            Some(other.clone())
+        // A directory is the model directory; starting on one needs a model
+        // this fixture cannot write, so it says so rather than booting empty.
+        let err = serve_targets(Some(dir.clone()), None).unwrap_err();
+        assert!(
+            err.to_string().contains("no GGUF model"),
+            "{err}"
         );
-        // Two different directories are two different stores: say so rather
-        // than silently serve one.
-        let err = serve_model_dir(Some(&dir), Some(other.clone())).unwrap_err();
+        // Naming the same directory twice is unambiguous, and still needs a
+        // model to start on; two different directories are refused outright.
+        let err = serve_targets(Some(dir.clone()), Some(dir.clone())).unwrap_err();
+        assert!(err.to_string().contains("no GGUF model"), "{err}");
+        let err = serve_targets(Some(dir.clone()), Some(other.clone())).unwrap_err();
         assert!(err.to_string().contains("give it once"), "{err}");
         std::fs::remove_dir_all(dir).unwrap();
     }

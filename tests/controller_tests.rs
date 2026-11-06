@@ -1005,3 +1005,80 @@ async fn concurrent_requests_share_one_load_of_a_cold_model() {
     assert_eq!(body["data"][0]["joshua"]["loaded"], true, "{body}");
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+/// A GGUF that is not a model on its own is not loaded by naming it: the
+/// request keeps the answer `/v1/models` implies (that id is no model there),
+/// rather than starting an engine on an adapter.
+#[tokio::test]
+async fn a_gguf_that_is_not_a_model_is_not_loaded_by_naming_it() {
+    use candle_core::quantized::gguf_file::Value;
+    let dir = common::model_dir("controller-select-adapter");
+    common::write_tiny_llama_gguf(&dir.join("base.gguf"));
+    let adapter = [(
+        "general.type".to_string(),
+        Value::String("adapter".to_string()),
+    )];
+    common::write_tiny_gguf_with(&dir.join("lora.gguf"), "llama", &adapter);
+    let app = create_router(state(ModelRegistry::default(), Some(manager(&dir))));
+
+    // The adapter is not listed as a model, so it is not a name to select.
+    let (_, body) = call(&app, "GET", "/v1/models", serde_json::Value::Null).await;
+    let ids: Vec<_> = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].clone())
+        .collect();
+    assert_eq!(ids, ["base"], "{body}");
+
+    // Load the model the directory does list, then name the adapter: the
+    // answer stays the unknown-model one and no second engine starts.
+    let (status, body) = call(&app, "POST", "/v1/completions", completion("base")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = call(&app, "POST", "/v1/completions", completion("lora")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"]["code"], "model_not_found", "{body}");
+    let (_, body) = call(&app, "GET", "/v1/models", serde_json::Value::Null).await;
+    let loaded: Vec<_> = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["joshua"]["loaded"] == true)
+        .map(|m| m["id"].clone())
+        .collect();
+    assert_eq!(loaded, ["base"], "{body}");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// The model `--model DIR` starts on comes from the inventory's own discovery:
+/// a directory whose models are all in subdirectories starts, and one with no
+/// model at all is reported.
+#[test]
+fn the_first_model_in_a_directory_is_a_loadable_one() {
+    use candle_core::quantized::gguf_file::Value;
+    let dir = common::model_dir("controller-first-model");
+    let kind = |k: &str| {
+        [(
+            "general.type".to_string(),
+            Value::String(k.to_string()),
+        )]
+    };
+    // Neither a model on its own, both before the model in path order.
+    common::write_tiny_gguf_with(&dir.join("a-adapter.gguf"), "llama", &kind("adapter"));
+    std::fs::write(dir.join("b-broken.gguf"), b"not a gguf").unwrap();
+    std::fs::create_dir_all(dir.join("nested")).unwrap();
+    common::write_tiny_llama_gguf(&dir.join("nested").join("model.gguf"));
+
+    assert_eq!(
+        joshua::model_info::first_model(&dir),
+        Some(dir.join("nested").join("model.gguf"))
+    );
+
+    // A directory of anything-but-models has nothing to start on.
+    let none = common::model_dir("controller-first-model-none");
+    common::write_tiny_gguf_with(&none.join("a.gguf"), "llama", &kind("adapter"));
+    common::write_tiny_gguf_with(&none.join("b.gguf"), "llama", &kind("imatrix"));
+    assert_eq!(joshua::model_info::first_model(&none), None);
+    std::fs::remove_dir_all(dir).unwrap();
+    std::fs::remove_dir_all(none).unwrap();
+}

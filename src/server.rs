@@ -341,10 +341,21 @@ pub struct ModelRegistry {
 impl ModelRegistry {
     /// A registry holding `engine` under its model name.
     pub fn with_model(engine: Arc<Engine>) -> Self {
+        let id = engine.model_name().to_string();
+        Self::with_model_named(engine, id)
+    }
+
+    /// A registry holding `engine` under `id`, which may differ from the
+    /// engine's model name (its file stem): a directory server starts on a
+    /// model under the id `/v1/models` lists its file by (`qwen3-8b`, or
+    /// `a/model.gguf` when another file shares its stem), so the list and the
+    /// served id agree.
+    pub fn with_model_named(engine: Arc<Engine>, id: impl Into<String>) -> Self {
         let registry = Self::default();
+        let id = id.into();
         registry.models.write().expect("fresh lock").push(LoadedModel {
-            embedding_job: embedding_job(&engine, engine.model_name()),
-            id: engine.model_name().to_string(),
+            embedding_job: embedding_job(&engine, &id),
+            id,
             engine,
             workers: Vec::new(),
             stages: Vec::new(),
@@ -635,6 +646,17 @@ impl ModelManager {
         let relative = file.strip_prefix(&self.model_dir).unwrap_or(file);
         let parts: Vec<_> = relative.iter().map(|part| part.to_string_lossy()).collect();
         parts.join("/")
+    }
+
+    /// The id the inventory lists `file` by, if it is a file of this model
+    /// directory: the same choice [`Self::unloaded`] makes — its stem, or its
+    /// path in the directory when another file shares that stem.
+    pub fn inventory_id(&self, file: &Path) -> Option<String> {
+        let target = file.canonicalize().ok()?;
+        self.unloaded(&[])
+            .into_iter()
+            .find(|(_, path)| path.canonicalize().is_ok_and(|path| path == target))
+            .map(|(id, _)| id)
     }
 
     /// Whether `id` is the path ([`Self::path_id`]) of a model the directory
@@ -957,8 +979,9 @@ fn model_json(model: &LoadedModel) -> serde_json::Value {
 /// directory is the model store: a request selects a model by naming it, and
 /// the first request for one that is not loaded maps it in — no
 /// `POST /v1/models/load` needed first.  Loads of one id are serialised by
-/// [`ModelRegistry::load_gate`], so a burst of requests for a cold model shares
-/// its single load instead of colliding in [`ModelRegistry::reserve`].
+/// [`ModelRegistry::load_gate`], which `POST /v1/models/unload` holds across its
+/// whole wait: a burst of requests for a cold model shares its single load and
+/// a reload cannot overlap the model it replaces.
 ///
 /// A name the directory does not list keeps the registry's own diagnosis,
 /// which reports what *is* loaded ([`ModelRegistry::resolve`]).
@@ -979,9 +1002,18 @@ pub(crate) async fn select_model(
     else {
         return Err(unselected);
     };
+    // Every GGUF in the directory is listed by `unloaded`, but `/v1/models`
+    // leaves out the ones that are not models on their own (an adapter, a
+    // projector, an importance matrix).  Loading one would answer a bad name
+    // with an engine error, so those stay on the unknown-model path.
+    if !is_model_file(&path).await? {
+        return Err(unselected);
+    }
     let gate = state.models.load_gate(&id);
     let _held = gate.lock().await;
-    // Another request may have finished loading it while this one waited.
+    // An unload of this id holds the same gate until the old engine is gone, so
+    // by now the id is free; and a load that finished while this one waited is
+    // reused rather than repeated.
     if let Some(found) = state.models.loaded(&id) {
         return Ok(found);
     }
@@ -1001,6 +1033,17 @@ pub(crate) async fn select_model(
     )
     .await?;
     Ok((model.id, Arc::clone(&model.engine)))
+}
+
+/// Whether `path` is a GGUF model on its own (not an adapter, projector or
+/// importance matrix), read from its header — I/O, so off the async runtime.
+async fn is_model_file(path: &Path) -> Result<bool, ApiError> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        crate::model_info::GgufFacts::read(&path).is_ok_and(|facts| facts.is_model())
+    })
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))
 }
 
 fn embedding_job(engine: &Engine, model: &str) -> JobModel {
@@ -1059,6 +1102,11 @@ async fn load_model(
     if id.is_empty() {
         return Err(ApiError::bad_request("empty model id"));
     }
+    // The id's gate serialises this load with a request-initiated load and with
+    // an unload of the same id, so a load can never overlap the engine it
+    // replaces.
+    let gate = state.models.load_gate(&id);
+    let _held = gate.lock().await;
     let model = load_model_file(&state, req, path, id, target).await?;
     Ok(Json(model_json(&model)))
 }
@@ -1069,6 +1117,11 @@ async fn unload_model(
     Json(req): Json<UnloadModelRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     manager(&state)?;
+    // Hold the id's gate from the removal until the old engine (and, on a
+    // controller, its workers) is gone: a request that names the model waits
+    // instead of mapping a second copy while the first still serves one.
+    let gate = state.models.load_gate(&req.id);
+    let _held = gate.lock().await;
     let model = state
         .models
         .remove(&req.id)
