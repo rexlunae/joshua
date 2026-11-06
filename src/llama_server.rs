@@ -245,6 +245,19 @@ async fn answer(
     })
 }
 
+/// llama.cpp's default seed, `4294967295` (`LLAMA_DEFAULT_SEED`, which
+/// `generation_settings` report for a random one), means a random seed in
+/// llama-server; the shared mapping reads only a negative seed as random
+/// (an OpenAI request's `4294967295` stays fixed), so it becomes `-1`.
+fn random_seed_spelled_out(body: &Value) -> std::borrow::Cow<'_, Value> {
+    if body.get("seed").and_then(Value::as_u64) != Some(u64::from(u32::MAX)) {
+        return std::borrow::Cow::Borrowed(body);
+    }
+    let mut body = body.clone();
+    body["seed"] = json!(-1);
+    std::borrow::Cow::Owned(body)
+}
+
 /// The pieces every generating route shares: the request, its model, its
 /// options and how its results are framed.
 async fn prepare(
@@ -257,7 +270,7 @@ async fn prepare(
     let (model, engine) = select_model(state, &req.model).await?;
     let options = options(
         &engine,
-        body,
+        &random_seed_spelled_out(body),
         SamplingProfile::LlamaCpp,
         constraint,
         headers,
@@ -484,6 +497,14 @@ mod tests {
             constraint(json!({"json_schema": {}, "response_format": {"type": "json_object"}}))
                 .is_none()
         );
+    }
+
+    #[test]
+    fn llama_cpp_default_seed_is_random() {
+        let seed = |body: Value| random_seed_spelled_out(&body)["seed"].clone();
+        assert_eq!(seed(json!({"seed": 4294967295u64})), -1);
+        assert_eq!(seed(json!({"seed": 42})), 42);
+        assert_eq!(seed(json!({})), Value::Null);
     }
 
     #[test]

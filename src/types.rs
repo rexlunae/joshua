@@ -726,8 +726,7 @@ pub struct SamplingParams {
     /// OpenAI frequency penalty, `-2.0..=2.0`.
     #[serde(default)]
     pub frequency_penalty: Option<f32>,
-    /// Sampler seed; a negative value (llama.cpp's `-1`) or llama.cpp's
-    /// default seed `4294967295` means random.
+    /// Sampler seed; a negative value (llama.cpp's `-1`) means random.
     #[serde(default)]
     pub seed: Option<i64>,
     /// Stop sequences — either a single string or an array.
@@ -901,9 +900,7 @@ impl SamplingParams {
             mirostat_eta
         );
         if let Some(seed) = self.seed {
-            // llama.cpp's LLAMA_DEFAULT_SEED (u32::MAX), which its
-            // `generation_settings` report for a random seed, is random too.
-            options.seed = u64::try_from(seed).ok().filter(|&s| s != u64::from(u32::MAX));
+            options.seed = u64::try_from(seed).ok();
         }
         if let Some(m) = self.mirostat {
             options.mirostat = m as u8;
@@ -1906,13 +1903,6 @@ mod tests {
         assert!(o.add_generation_prompt);
         assert_eq!(o.continue_final_message, None);
         assert!(!o.needs_plain_decode());
-    }
-
-    #[test]
-    fn llama_cpp_random_seed_sentinels_stay_random() {
-        assert_eq!(options(json!({"seed": -1})).seed, None);
-        assert_eq!(options(json!({"seed": 4294967295u64})).seed, None);
-        assert_eq!(options(json!({"seed": 42})).seed, Some(42));
     }
 
     #[test]
