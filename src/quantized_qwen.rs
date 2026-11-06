@@ -756,6 +756,20 @@ impl Attention {
     ) -> Result<Tensor> {
         let _p = prof::Phase::start(&prof::ATT);
         let (b, seq_len, _) = xs.dims3()?;
+        let cached = state.kv.as_ref().map_or(0, |cache| cache.len());
+        if cached < offset {
+            candle_core::bail!(
+                "Qwen attention cache has {cached} positions, before input offset {offset}"
+            );
+        }
+        if cached > offset {
+            tracing::warn!(
+                cached_positions = cached,
+                input_offset = offset,
+                "truncating stale Qwen attention cache before prefill"
+            );
+            crate::attention::truncate_kv(&mut state.kv, offset);
+        }
         let hd = self.head_dim;
         // QSA narrows each query to its selected cells (None: dense).
         let sparse = match &self.qsa {
@@ -2910,6 +2924,15 @@ mod tests {
     }
 
     fn tiny_attention(dev: &Device, fused: bool, gated: bool) -> Result<Attention> {
+        tiny_attention_with_qsa(dev, fused, gated, None)
+    }
+
+    fn tiny_attention_with_qsa(
+        dev: &Device,
+        fused: bool,
+        gated: bool,
+        qsa: Option<qwen4exp::Qsa>,
+    ) -> Result<Attention> {
         let (h, nh, nkv, hd) = (8usize, 2usize, 1usize, 4usize);
         let qd = nh * hd * if gated { 2 } else { 1 };
         let mk = |r: usize, c: usize| Tensor::randn(0f32, 1f32, (r, c), dev).unwrap();
@@ -2940,7 +2963,7 @@ mod tests {
             k_norm: Some(rms_from_f32(&vec![1.0; hd], hd, dev)?),
             gated,
             rope: Arc::new(Rope::new(hd, 10_000.0, 64, RopeStyle::Neox, dev)?),
-            qsa: None,
+            qsa,
             n_head: nh,
             n_kv_head: nkv,
             head_dim: hd,
@@ -2985,6 +3008,51 @@ mod tests {
             assert_eq!((cache.k().dim(1)?, cache.k().dim(3)?), (nkv, hd));
             assert_eq!((cache.v().dim(1)?, cache.v().dim(3)?), (nkv, hd));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn attention_rewind_truncates_stale_cache_before_prefill() -> Result<()> {
+        let dev = Device::Cpu;
+        let h = 8usize;
+        let attn = tiny_attention(&dev, false, false)?;
+        let xs = Tensor::randn(0f32, 1f32, (1, 5, h), &dev)?;
+
+        let mut stale = LayerState::default();
+        let _ = attn.forward(&mut stale, &xs, None, 0, None)?;
+        let mask = crate::moe::causal_mask(2, 3, &dev)?;
+        let got = attn.forward(&mut stale, &xs.narrow(1, 3, 2)?, Some(&mask), 3, None)?;
+
+        let mut rewound = LayerState::default();
+        let _ = attn.forward(&mut rewound, &xs.narrow(1, 0, 3)?, None, 0, None)?;
+        let want = attn.forward(&mut rewound, &xs.narrow(1, 3, 2)?, Some(&mask), 3, None)?;
+
+        assert_eq!(got.dims(), want.dims());
+        let max_delta = (&got - &want)?.abs()?.max_all()?.to_scalar::<f32>()?;
+        assert!(max_delta < 1e-6, "max delta {max_delta}");
+        assert_eq!(stale.kv.as_ref().unwrap().len(), 5);
+        Ok(())
+    }
+
+    #[test]
+    fn qsa_attention_rewind_matches_clean_prefix() -> Result<()> {
+        let dev = Device::Cpu;
+        let qsa = qwen4exp::tiny_qsa_for_test(&dev)?;
+        let attn = tiny_attention_with_qsa(&dev, false, false, Some(qsa))?;
+        let xs = Tensor::randn(0f32, 1f32, (1, 9, 8), &dev)?;
+        let replacement = Tensor::randn(0f32, 1f32, (1, 3, 8), &dev)?;
+
+        let mut stale = LayerState::default();
+        let _ = attn.forward(&mut stale, &xs, None, 0, None)?;
+        let got = attn.forward(&mut stale, &replacement, None, 5, None)?;
+
+        let mut clean = LayerState::default();
+        let _ = attn.forward(&mut clean, &xs.narrow(1, 0, 5)?, None, 0, None)?;
+        let want = attn.forward(&mut clean, &replacement, None, 5, None)?;
+
+        let max_delta = (&got - &want)?.abs()?.max_all()?.to_scalar::<f32>()?;
+        assert!(max_delta < 1e-6, "max delta {max_delta}");
+        assert_eq!(stale.kv.as_ref().unwrap().len(), 8);
         Ok(())
     }
 

@@ -608,6 +608,49 @@ impl Qsa {
 }
 
 #[cfg(test)]
+pub(super) fn tiny_qsa_for_test(dev: &Device) -> Result<Qsa> {
+    use candle_core::quantized::QMatMul;
+    let lcg = |seed: &mut u64| {
+        *seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((*seed >> 33) as f32 - 8_388_608.0) / 8_388_608.0
+    };
+    let mut seed = 0xdead_beef;
+    let mat = |rows: usize, seed: &mut u64| -> Result<Tensor> {
+        let v: Vec<f32> = (0..rows * 8).map(|_| lcg(seed)).collect();
+        Tensor::from_vec(v, (rows, 8), dev)
+    };
+    let norm = || -> Result<RmsNorm> {
+        let w = Tensor::ones(8, DType::F32, dev)?;
+        RmsNorm::from_qtensor(
+            candle_core::quantized::QTensor::quantize(
+                &w,
+                candle_core::quantized::GgmlDType::F32,
+            )?,
+            1e-5,
+        )
+    };
+    Ok(Qsa {
+        q_proj: Weight::Candle(QMatMul::Tensor(mat(16, &mut seed)?)),
+        k_proj: Weight::Candle(QMatMul::Tensor(mat(8, &mut seed)?)),
+        q_norm: norm()?,
+        k_norm: norm()?,
+        rope: Arc::new(Rope::new(
+            4,
+            10000.0,
+            64,
+            crate::attention::RopeStyle::Neox,
+            dev,
+        )?),
+        n_heads: 2,
+        dim: 8,
+        ratio: 4,
+        top_k: 2,
+    })
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use candle_core::Device;
@@ -644,39 +687,7 @@ mod tests {
     /// A tiny QSA: 8-dim keys, 2 heads, ratio 4, top_k 2 (width 5). f32
     /// weights, unit RMS norms, plain RoPE over half the key width.
     fn tiny_qsa(dev: &Device) -> Result<Qsa> {
-        use candle_core::quantized::QMatMul;
-        let lcg = |seed: &mut u64| {
-            *seed = seed
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            ((*seed >> 33) as f32 - 8_388_608.0) / 8_388_608.0
-        };
-        let mut seed = 0xdead_beef;
-        let mat = |rows: usize, seed: &mut u64| -> Result<Tensor> {
-            let v: Vec<f32> = (0..rows * 8).map(|_| lcg(seed)).collect();
-            Tensor::from_vec(v, (rows, 8), dev)
-        };
-        let norm = || -> Result<RmsNorm> {
-            let w = Tensor::ones(8, DType::F32, dev)?;
-            RmsNorm::from_qtensor(
-                candle_core::quantized::QTensor::quantize(
-                    &w,
-                    candle_core::quantized::GgmlDType::F32,
-                )?,
-                1e-5,
-            )
-        };
-        Ok(Qsa {
-            q_proj: Weight::Candle(QMatMul::Tensor(mat(16, &mut seed)?)),
-            k_proj: Weight::Candle(QMatMul::Tensor(mat(8, &mut seed)?)),
-            q_norm: norm()?,
-            k_norm: norm()?,
-            rope: Arc::new(Rope::new(4, 10000.0, 64, RopeStyle::Neox, dev)?),
-            n_heads: 2,
-            dim: 8,
-            ratio: 4,
-            top_k: 2,
-        })
+        super::tiny_qsa_for_test(dev)
     }
 
     /// One-shot (a single forward over 9 positions) and token-by-token
