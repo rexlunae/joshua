@@ -38,6 +38,18 @@ fn runtime_candidates() -> Vec<PathBuf> {
     candidates
 }
 
+/// The bridge file [`api`] loaded, once it has.
+static LOADED_FROM: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Which `libjoshua_sycl` file was loaded, once a SYCL device has been opened.
+///
+/// Without `JOSHUA_SYCL_LIBRARY` the bridge is searched for on the library
+/// path and then under `~/joshua-sycl/`, so a stale bridge from another tree
+/// can be picked up silently; callers log this so a run says which it used.
+pub fn library_path() -> Option<&'static std::path::Path> {
+    LOADED_FROM.get().map(PathBuf::as_path)
+}
+
 fn bridge_candidates() -> Vec<PathBuf> {
     if let Some(path) = std::env::var_os("JOSHUA_SYCL_LIBRARY") {
         return vec![path.into()];
@@ -72,7 +84,11 @@ macro_rules! api {
                 let mut errors = Vec::new();
                 for path in bridge_candidates() {
                     match load_library(&path) {
-                        Ok(library) => { loaded = Some(library); break; }
+                        Ok(library) => {
+                            let _ = LOADED_FROM.set(path.clone());
+                            loaded = Some(library);
+                            break;
+                        }
                         Err(e) => errors.push(format!("{path:?}: {e}")),
                     }
                 }

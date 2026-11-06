@@ -426,6 +426,31 @@ async fn ops_endpoints_report_models_load_and_metrics() {
     assert_eq!(res.status(), StatusCode::OK);
 }
 
+/// `/detokenize` is llama-server's path (`/v1/detokenize` is vLLM's), and
+/// the two read the text from different keys.
+#[tokio::test]
+async fn detokenize_answers_on_both_paths_with_both_keys() {
+    let app = create_router(tiny_state("server-detokenize", None));
+    let res = app
+        .clone()
+        .oneshot(post_json("/tokenize", None, serde_json::json!({"prompt": "hello world"})))
+        .await
+        .unwrap();
+    let tokens: serde_json::Value = serde_json::from_str(&body_text(res).await).unwrap();
+    let ids = tokens["tokens"].clone();
+    for path in ["/detokenize", "/v1/detokenize"] {
+        let res = app
+            .clone()
+            .oneshot(post_json(path, None, serde_json::json!({"tokens": ids})))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "{path}");
+        let body: serde_json::Value = serde_json::from_str(&body_text(res).await).unwrap();
+        assert!(body["prompt"].is_string(), "{path}: {body}");
+        assert_eq!(body["prompt"], body["content"], "{path}");
+    }
+}
+
 #[tokio::test]
 async fn x_api_key_and_rotation_keys_are_accepted() {
     let app = create_router(tiny_state("server-key-rotation", Some("one, two")));

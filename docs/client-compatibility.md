@@ -17,7 +17,8 @@ real client binary is *not* covered by the test suite today — see
 | `POST /v1/chat/completions` | ✅ streaming (SSE) + non-stream, tools, `response_format` |
 | `POST /v1/completions` | ✅ legacy text completion |
 | `POST /v1/embeddings` | ✅ |
-| `GET /v1/models` | ✅ loaded models, plus the files the model directory holds (each with its limits; a request naming one loads it on first use) |
+| `GET /v1/models` (also `/models`), `GET /v1/models/{id}` | ✅ loaded models, plus the files the model directory holds (each with its limits; a request naming one loads it on first use) |
+| `POST /v1/audio/transcriptions` | ✅ when the server has a `--whisper-model` |
 | `POST /v1/models/load` / `unload` | ✅ joshua extension (when a model manager is configured) |
 
 This is the primary target and the README's "drop-in replacement" claim is
@@ -28,6 +29,7 @@ about these routes.
 | Endpoint | Status |
 |---|---|
 | `POST /v1/messages` | ✅ text, streaming, tool use |
+| `x-api-key` authentication | ✅ on the server and on `joshua route` |
 | `POST /v1/messages/count_tokens` | ✅ engine's own chat-token count, no model run |
 
 ## llama.cpp (`llama-server`)
@@ -38,7 +40,7 @@ about these routes.
 | `GET /props` | ✅ properties + `default_generation_settings` |
 | `GET /slots` | ✅ one record per loaded model |
 | `POST /tokenize` | ✅ (`/api/tokens` too) |
-| `POST /detokenize` | ✅ via `POST /v1/detokenize` |
+| `POST /detokenize` | ✅ answers with `content` (llama.cpp's key) and `prompt` (vLLM's) |
 
 `/props` returns the fields clients read for defaults (`n_ctx`,
 `default_generation_settings`, `total_slots`).  Field-for-field parity with a
@@ -86,6 +88,14 @@ of model, not adding a route.
 | `POST /api/pull` | ❌ not implemented — see below |
 | `POST /api/push` | ❌ no registry |
 
+Generation `options` honoured on `/api/chat` and `/api/generate`:
+`num_predict`, `temperature`, `top_k`, `top_p`, `min_p`, `typical_p`,
+`repeat_penalty`, `repeat_last_n`, `presence_penalty`, `frequency_penalty`,
+`mirostat`, `mirostat_tau`, `mirostat_eta`, `seed` and `stop`.  `num_ctx`
+narrows the context window, clamped to the server's `--n-ctx` (Ollama treats
+it as a load setting and clients send their own default, so a larger value is
+not an error); other options are ignored.
+
 ### Why `pull` is not simply "missing"
 
 Ollama's `pull` is not a file download: it fetches a **manifest** from
@@ -95,8 +105,8 @@ implementing that registry protocol, not adding a route. The endpoint returns
 guidance rather than hanging:
 
 > cannot pull `llama3`: joshua does not implement the Ollama registry protocol.
-> Pass an explicit https:// URL to a .gguf file, or place the file in the model
-> directory and load it with POST /v1/models/load.
+> Place the .gguf file in the model directory and load it with
+> POST /v1/models/load.
 
 Explicit-URL downloading is itself still unimplemented (returns 501); adding an
 HTTP client is a separate decision because it introduces outbound network
@@ -115,7 +125,7 @@ Ollama's `:tag` names a manifest, which has no joshua equivalent.
 | What | Covered? |
 |---|---|
 | Route exists and is wired | ✅ by inspection + the inline unit tests |
-| Translation layer (Ollama option mapping, name tagging, path confinement) | ✅ 7 unit tests in `src/ollama.rs` |
+| Translation layer (Ollama option mapping, name tagging, path confinement) | ✅ unit tests in `src/ollama.rs` |
 | **A real `ollama` / `llama-server` / vLLM client against the server** | ❌ **not tested** |
 
 The last row is the real gap. The endpoints look right, but no test drives them

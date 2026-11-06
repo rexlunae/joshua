@@ -7,6 +7,7 @@
 mod bridge;
 pub mod kernels;
 pub mod mega;
+pub use bridge::library_path as bridge_library_path;
 pub use kernels::{fallback_count, native_enabled, native_exec_count};
 use crate::backend::{BackendDevice, BackendStorage};
 use crate::op::{BinaryOpT, CmpOp, ReduceOp, UnaryOpT};

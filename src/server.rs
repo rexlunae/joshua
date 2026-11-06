@@ -10,7 +10,8 @@
 //! - `POST /v1/messages/count_tokens`  — Anthropic token count without running the model
 //! - `POST /tokenize`                 — tokenize with the loaded model
 //!   (also `/v1/tokenize`, and `/api/tokens` for Ollama clients)
-//! - `POST /v1/detokenize`            — ids back to text (vLLM / llama.cpp)
+//! - `POST /detokenize`               — ids back to text (llama.cpp; also
+//!   `/v1/detokenize` for vLLM)
 //! - `GET  /v1/models`                — list the models, with their limits
 //!   (also `/models`; `GET /v1/models/{id}` for one, see
 //!   [`crate::model_info`])
@@ -25,6 +26,7 @@
 //! - `POST /v1/models/load`           — load a model from the controller's
 //!   model directory, locally or onto its workers (when enabled)
 //! - `POST /v1/models/unload`         — unload a model (when enabled)
+//! - `/api/*`                         — the Ollama API (see [`crate::ollama`])
 //!
 //! With `--model-dir` the directory is the model store: every model in it is
 //! listed, and a request selects one by naming its id — [`select_model`] loads
@@ -1175,6 +1177,7 @@ pub fn create_router(state: AppState) -> Router {
         ))
         .route("/tokenize", post(tokenize))
         .route("/v1/tokenize", post(tokenize))
+        .route("/detokenize", post(detokenize))
         .route("/v1/detokenize", post(detokenize))
         .route("/api/tokens", post(tokenize))
         .route("/load", get(server_load))
@@ -1579,14 +1582,15 @@ async fn tokenize(
     })))
 }
 
-/// `POST /v1/detokenize` — turn token ids back into text.
+/// `POST /detokenize` (and `/v1/detokenize`) — turn token ids back into text.
 ///
 /// vLLM and llama.cpp both expose this next to tokenize, and OpenAI-compatible
 /// tooling uses it to reconstruct a prompt from ids.  Body:
 /// `{"model": "...", "tokens": [1, 2, 3], "skip_special_tokens": true}`.
 /// `skip_special_tokens` defaults to **true**, matching vLLM (which drops
 /// BOS/EOS unless asked otherwise); llama.cpp's `/detokenize` only takes
-/// `tokens`, and this body is a superset of that.
+/// `tokens`, and this body is a superset of that.  The text is returned as
+/// both `prompt` (vLLM) and `content` (llama.cpp), so either client finds it.
 async fn detokenize(
     State(state): State<AppState>,
     Json(body): Json<serde_json::Value>,
@@ -1619,7 +1623,7 @@ async fn detokenize(
     let text = engine
         .detokenize(&ids, skip_special)
         .map_err(ApiError::from)?;
-    Ok(Json(json!({ "prompt": text })))
+    Ok(Json(json!({ "prompt": text, "content": text })))
 }
 
 /// `GET /load` — vLLM's server-load metrics.

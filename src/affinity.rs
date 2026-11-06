@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use axum::http::{header, HeaderMap};
+use axum::http::HeaderMap;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -227,6 +227,7 @@ impl Directory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::header;
 
     #[test]
     fn directory_is_bounded_expires_and_invalidates_incarnations() {

@@ -3276,7 +3276,7 @@ impl Engine {
     fn log_sycl_device(device: &Device) {
         if let Ok(sycl) = device.as_sycl_device() {
             tracing::info!(
-                "SYCL device: {} ({}; native kernels {})",
+                "SYCL device: {} ({}; native kernels {}; bridge {})",
                 sycl.name(),
                 if sycl.host_unified_memory() {
                     "host-unified memory"
@@ -3288,6 +3288,8 @@ impl Engine {
                 } else {
                     "off"
                 },
+                candle_core::sycl_backend::bridge_library_path()
+                    .map_or_else(|| "?".to_string(), |p| p.display().to_string()),
             );
         }
     }
