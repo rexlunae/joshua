@@ -8,24 +8,32 @@
 //! `response_format` constrains the output as on the chat route.  Sampling
 //! fields are the shared [`SamplingParams`].  `logprobs`, `n > 1` and
 //! `best_of > 1` are refused rather than ignored.
+//!
+//! The prompt forms, the infill prompt, the request's options and the
+//! runners that complete a request's prompts are shared with llama-server's
+//! native `/completion` and `/infill` ([`crate::llama_server`]); each route
+//! only frames the results for its clients.
 
-use std::convert::Infallible;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use axum::{
     extract::State,
     http::HeaderMap,
-    response::{sse::Event, IntoResponse, Response, Sse},
+    response::{IntoResponse, Response},
     Json,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use crate::engine::{Completion, Engine, RawPrompt};
+use crate::engine::{Completion, Engine, PromptPart, RawPrompt};
+use crate::fim::InfillChunk;
 use crate::sampling::SamplingProfile;
-use crate::server::{select_model, ApiError, AppState, CancelOnDrop};
-use crate::types::{unix_time, GenerationOptions, SamplingParams, UsageInfo};
+use crate::server::{select_model, sse_response, ApiError, AppState, CancelOnDrop, ServerMetrics};
+use crate::types::{
+    unix_time, ConstraintSpec, GenerationOptions, SamplingParams, UsageInfo, MAX_TOKENS_UNLIMITED,
+};
 
 /// The fields of a completion request that are not sampling settings.
 #[derive(Debug, Deserialize)]
@@ -53,23 +61,55 @@ struct CompletionRequest {
     response_format: Option<Value>,
 }
 
-/// One prompt of a request: what is completed, and the text `echo` repeats.
+/// One prompt of a request, as the client gave it.
 #[derive(Debug, Clone, PartialEq)]
-enum Prompt {
+pub(crate) enum Prompt {
     Text(String),
     Tokens(Vec<u32>),
+    /// Text and token ids in one prompt (llama-server only).
+    Mixed(Vec<PromptPart>),
+}
+
+/// How a request's `prompt` array is read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PromptForms {
+    /// OpenAI's and vLLM's: a string, token ids, or an array of either.
+    OpenAi,
+    /// llama-server's: those, plus an array mixing strings and token ids,
+    /// which is one prompt, at the top level or as an element.
+    LlamaCpp,
 }
 
 /// The request's `prompt` as one or more prompts.
-fn prompts(prompt: Option<&Value>) -> Result<Vec<Prompt>, String> {
-    let ids = |items: &[Value]| -> Option<Vec<u32>> {
-        items
-            .iter()
-            .map(|v| v.as_u64().and_then(|id| u32::try_from(id).ok()))
-            .collect()
+pub(crate) fn prompts(prompt: Option<&Value>, forms: PromptForms) -> Result<Vec<Prompt>, String> {
+    let id = |v: &Value| v.as_u64().and_then(|id| u32::try_from(id).ok());
+    let ids = |items: &[Value]| -> Option<Vec<u32>> { items.iter().map(id).collect() };
+    // llama-server's mixed prompt: any array holding both a string and an
+    // integer, every item one or the other.
+    let mixed = |items: &[Value]| -> Option<Vec<PromptPart>> {
+        if forms != PromptForms::LlamaCpp
+            || !items.iter().any(Value::is_string)
+            || !items.iter().any(Value::is_number)
+        {
+            return None;
+        }
+        let mut parts: Vec<PromptPart> = Vec::new();
+        for item in items {
+            match (item, parts.last_mut()) {
+                (Value::String(s), _) => parts.push(PromptPart::Text(s.clone())),
+                (n, Some(PromptPart::Tokens(run))) => run.push(id(n)?),
+                (n, _) => parts.push(PromptPart::Tokens(vec![id(n)?])),
+            }
+        }
+        Some(parts)
     };
-    let invalid = || {
-        "`prompt` must be a string, an array of token ids, or an array of either".to_string()
+    let invalid = || match forms {
+        PromptForms::OpenAi => {
+            "`prompt` must be a string, an array of token ids, or an array of either".to_string()
+        }
+        PromptForms::LlamaCpp => "`prompt` must be a string, an array of token ids or strings \
+             and token ids, or an array of those"
+            .to_string(),
     };
     let out = match prompt {
         None | Some(Value::Null) => return Err("Missing required field 'prompt'".to_string()),
@@ -78,11 +118,20 @@ fn prompts(prompt: Option<&Value>) -> Result<Vec<Prompt>, String> {
         Some(Value::Array(items)) if items.iter().all(Value::is_number) => {
             vec![Prompt::Tokens(ids(items).ok_or_else(invalid)?)]
         }
+        Some(Value::Array(items))
+            if items.iter().all(|v| v.is_string() || v.is_number())
+                && items.iter().any(Value::is_number) =>
+        {
+            vec![Prompt::Mixed(mixed(items).ok_or_else(invalid)?)]
+        }
         Some(Value::Array(items)) => items
             .iter()
             .map(|item| match item {
                 Value::String(s) => Ok(Prompt::Text(s.clone())),
-                Value::Array(t) if !t.is_empty() => ids(t).map(Prompt::Tokens).ok_or_else(invalid),
+                Value::Array(t) if !t.is_empty() && t.iter().all(Value::is_number) => {
+                    ids(t).map(Prompt::Tokens).ok_or_else(invalid)
+                }
+                Value::Array(t) => mixed(t).map(Prompt::Mixed).ok_or_else(invalid),
                 _ => Err(invalid()),
             })
             .collect::<Result<_, _>>()?,
@@ -113,18 +162,47 @@ impl CompletionRequest {
 }
 
 /// A prompt as the engine completes it, plus the text `echo` repeats.
-struct Job {
-    prompt: RawPrompt,
-    echo: String,
+pub(crate) struct Job {
+    pub(crate) prompt: RawPrompt,
+    pub(crate) echo: String,
+    /// `truncate_prompt_tokens` cuts the prompt.
+    pub(crate) truncated: bool,
 }
 
 /// How a request's prompts are built.
-struct Build {
-    suffix: Option<String>,
+pub(crate) struct Build {
+    pub(crate) suffix: Option<String>,
     /// The tokenizer's special tokens (BOS) on a text or infill prompt.
-    special: bool,
+    pub(crate) special: bool,
     /// Keep the prompt's text for `echo`.
-    echo: bool,
+    pub(crate) echo: bool,
+}
+
+/// A fill-in-the-middle prompt in the model's FIM format (see
+/// [`Engine::format_infill`]), or a client error for a model without FIM
+/// tokens.
+pub(crate) fn infill_prompt(
+    engine: &Engine,
+    prefix: &str,
+    suffix: &str,
+    extra: &[InfillChunk],
+    prompt: &str,
+    options: &GenerationOptions,
+    special: bool,
+) -> Result<RawPrompt, ApiError> {
+    if let Some(missing) = engine.fim_tokens().missing() {
+        return Err(ApiError::bad_request(format!(
+            "fill-in-the-middle needs a model with FIM tokens: {missing}"
+        )));
+    }
+    let n_predict = match options.max_tokens {
+        MAX_TOKENS_UNLIMITED => -1,
+        n => i64::from(n),
+    };
+    engine
+        .format_infill(prefix, suffix, extra, prompt, n_predict, false, special)
+        .map(RawPrompt::tokens)
+        .map_err(ApiError::from)
 }
 
 /// Build each prompt's [`Job`]: a text prompt with the tokenizer's special
@@ -132,7 +210,7 @@ struct Build {
 /// `suffix` an infill prompt in the model's FIM format.  Each is checked as
 /// generation will check it (token ids, empty or too long for the window),
 /// so a bad prompt is a client error before a stream starts.
-fn jobs(
+pub(crate) fn jobs(
     engine: &Engine,
     build: &Build,
     options: &GenerationOptions,
@@ -140,60 +218,167 @@ fn jobs(
 ) -> Result<Vec<Job>, ApiError> {
     let suffix = build.suffix.as_deref().filter(|s| !s.is_empty());
     let special = build.special;
+    let text_of = |ids: &[u32]| engine.detokenize(ids, false).map_err(ApiError::from);
     prompts
         .into_iter()
         .map(|prompt| {
             let echo = match &prompt {
                 _ if !build.echo => String::new(),
                 Prompt::Text(text) => text.clone(),
-                Prompt::Tokens(ids) => engine.detokenize(ids, false).map_err(ApiError::from)?,
+                Prompt::Tokens(ids) => text_of(ids)?,
+                Prompt::Mixed(parts) => parts
+                    .iter()
+                    .map(|part| match part {
+                        PromptPart::Text(text) => Ok(text.clone()),
+                        PromptPart::Tokens(ids) => text_of(ids),
+                    })
+                    .collect::<Result<String, _>>()?,
             };
             let prompt = match (prompt, suffix) {
                 (Prompt::Text(text), Some(suffix)) => {
-                    if let Some(missing) = engine.fim_tokens().missing() {
-                        return Err(ApiError::bad_request(format!(
-                            "`suffix` needs a fill-in-the-middle model: {missing}"
-                        )));
-                    }
-                    let ids = engine
-                        .format_infill(&text, suffix, &[], "", -1, false, special)
-                        .map_err(ApiError::from)?;
-                    RawPrompt::tokens(ids)
+                    infill_prompt(engine, &text, suffix, &[], "", options, special)?
                 }
-                (Prompt::Tokens(_), Some(_)) => {
-                    return Err(ApiError::bad_request("`suffix` needs a text prompt"))
-                }
+                (_, Some(_)) => return Err(ApiError::bad_request("`suffix` needs a text prompt")),
                 (Prompt::Text(text), None) => RawPrompt::text(text).with_special_tokens(special),
                 (Prompt::Tokens(ids), None) => RawPrompt::tokens(ids),
+                (Prompt::Mixed(parts), None) => {
+                    RawPrompt::mixed(parts).with_special_tokens(special)
+                }
             };
-            engine.check_prompt(&prompt, options).map_err(ApiError::from)?;
-            Ok(Job { prompt, echo })
+            let truncated = engine
+                .check_prompt(&prompt, options)
+                .map_err(ApiError::from)?;
+            Ok(Job {
+                prompt,
+                echo,
+                truncated,
+            })
         })
         .collect()
 }
 
-/// The request's generation options: the OpenAI profile's defaults, then
-/// its sampling fields (`max_tokens` absent or -1 runs to the end of the
-/// sequence) and `response_format`.
-fn options(
+/// A request's generation options: `profile`'s defaults, then its
+/// sampling fields (`max_tokens` absent or -1 runs to the end of the
+/// sequence) and `constraint`.  A request the model cannot serve is a
+/// client error before a stream starts.
+pub(crate) fn options(
     engine: &Engine,
     body: &Value,
-    req: &CompletionRequest,
+    profile: SamplingProfile,
+    constraint: Option<ConstraintSpec>,
     headers: &HeaderMap,
 ) -> Result<GenerationOptions, ApiError> {
     let sampling: SamplingParams =
         serde_json::from_value(body.clone()).map_err(|e| ApiError::bad_request(e.to_string()))?;
-    let mut options =
-        GenerationOptions::with_defaults(&engine.sampling_defaults(SamplingProfile::OpenAi));
-    sampling.apply(&mut options).map_err(ApiError::bad_request)?;
-    if let Some(format) = &req.response_format {
-        options.constraint =
-            crate::types::parse_response_format(format).map_err(ApiError::bad_request)?;
-    }
+    let mut options = GenerationOptions::with_defaults(&engine.sampling_defaults(profile));
+    sampling
+        .apply(&mut options)
+        .map_err(ApiError::bad_request)?;
+    options.constraint = constraint;
     options.cache_scope = Some(crate::affinity::cache_scope(headers, None));
-    // Answer a request the model cannot serve before a stream starts.
     engine.validate_options(&options).map_err(ApiError::from)?;
     Ok(options)
+}
+
+/// Build a request's jobs off the async runtime (tokenizing a long prompt
+/// is real work).
+pub(crate) async fn build_jobs(
+    engine: &Arc<Engine>,
+    build: Build,
+    options: &GenerationOptions,
+    prompts: Vec<Prompt>,
+) -> Result<Vec<Job>, ApiError> {
+    let engine = Arc::clone(engine);
+    let options = options.clone();
+    tokio::task::spawn_blocking(move || jobs(&engine, &build, &options, prompts))
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?
+}
+
+/// Complete each job's prompt in turn, until the client goes away.
+pub(crate) async fn complete_all(
+    engine: &Arc<Engine>,
+    jobs: &[Job],
+    options: GenerationOptions,
+    metrics: &ServerMetrics,
+) -> Result<Vec<Completion>, ApiError> {
+    let cancel = CancelOnDrop::new();
+    let flag = cancel.flag();
+    let engine = Arc::clone(engine);
+    let prompts: Vec<RawPrompt> = jobs.iter().map(|j| j.prompt.clone()).collect();
+    let completions = tokio::task::spawn_blocking(move || {
+        prompts
+            .iter()
+            .map(|p| engine.complete_prompt_cancellable(p, &options, &flag))
+            .collect::<crate::Result<Vec<_>>>()
+    })
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?
+    .map_err(ApiError::from)?;
+    for completion in &completions {
+        metrics.record_generation(&completion.usage);
+    }
+    Ok(completions)
+}
+
+/// What a streamed request reports, prompt by prompt.
+pub(crate) enum Progress<'a> {
+    /// New text for the prompt at this index.
+    Text(usize, &'a str),
+    /// The prompt at this index is done.
+    Done(usize, &'a Completion),
+}
+
+/// Stream each job's completion in turn as server-sent events, each
+/// [`Progress`] framed by `frame` (`None` sends nothing).  A failed
+/// generation ends the stream with `error`; `last`, when set, ends every
+/// stream, a failed one included.  The engine stops when the client goes away.
+pub(crate) fn stream_all(
+    engine: Arc<Engine>,
+    jobs: Vec<Job>,
+    options: GenerationOptions,
+    metrics: Arc<ServerMetrics>,
+    mut frame: impl FnMut(Progress<'_>) -> Option<Value> + Send + 'static,
+    error: Value,
+    last: Option<&'static str>,
+) -> Response {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let cancel = CancelOnDrop::new();
+    let flag = cancel.flag();
+    metrics.record_stream();
+    tokio::task::spawn_blocking(move || {
+        let flag: &AtomicBool = &flag;
+        let send = |value: Option<Value>| {
+            if let Some(value) = value {
+                let _ = tx.send(value.to_string());
+            }
+        };
+        let finish = || {
+            if let Some(last) = last {
+                let _ = tx.send(last.to_string());
+            }
+        };
+        for (index, job) in jobs.iter().enumerate() {
+            let result =
+                engine.complete_prompt_streaming(&job.prompt, &options, flag, &mut |text| {
+                    send(frame(Progress::Text(index, text)))
+                });
+            match result {
+                Ok(completion) => {
+                    metrics.record_generation(&completion.usage);
+                    send(frame(Progress::Done(index, &completion)));
+                }
+                Err(e) => {
+                    tracing::error!("streaming completion failed: {e}");
+                    send(Some(error));
+                    finish();
+                    return;
+                }
+            }
+        }
+        finish();
+    });
+    sse_response(rx, cancel)
 }
 
 /// The usage of a request's completions: one completion's as the engine
@@ -233,107 +418,94 @@ pub(crate) async fn completions(
     let req: CompletionRequest =
         serde_json::from_value(body.clone()).map_err(|e| ApiError::bad_request(e.to_string()))?;
     req.check().map_err(ApiError::bad_request)?;
-    let prompts = prompts(req.prompt.as_ref()).map_err(ApiError::bad_request)?;
-    let (model, engine) = select_model(&state, &req.model).await?;
-    let options = options(&engine, &body, &req, &headers)?;
-    let echo = req.echo == Some(true);
-    let (jobs, options) = {
-        let engine = Arc::clone(&engine);
-        let build = Build {
-            suffix: req.suffix.clone(),
-            special: req.add_special_tokens.unwrap_or(true),
-            echo,
-        };
-        tokio::task::spawn_blocking(move || {
-            jobs(&engine, &build, &options, prompts).map(|jobs| (jobs, options))
-        })
-        .await
-        .map_err(|e| ApiError::internal(e.to_string()))??
+    let prompts =
+        prompts(req.prompt.as_ref(), PromptForms::OpenAi).map_err(ApiError::bad_request)?;
+    let constraint = match &req.response_format {
+        Some(format) => {
+            crate::types::parse_response_format(format).map_err(ApiError::bad_request)?
+        }
+        None => None,
     };
+    let (model, engine) = select_model(&state, &req.model).await?;
+    let options = options(
+        &engine,
+        &body,
+        SamplingProfile::OpenAi,
+        constraint,
+        &headers,
+    )?;
+    let echo = req.echo == Some(true);
+    let build = Build {
+        suffix: req.suffix.clone(),
+        special: req.add_special_tokens.unwrap_or(true),
+        echo,
+    };
+    let jobs = build_jobs(&engine, build, &options, prompts).await?;
     let id = format!("cmpl-{}", Uuid::new_v4().simple());
     let created = unix_time();
-    let cancel = CancelOnDrop::new();
 
     if req.stream == Some(true) {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-        let flag = cancel.flag();
-        state.metrics.record_stream();
-        let metrics = Arc::clone(&state.metrics);
-        tokio::task::spawn_blocking(move || {
-            let chunk = |index: usize, text: &str, finish: Option<&str>| {
-                json!({
-                    "id": id, "object": "text_completion", "created": created, "model": model,
-                    "choices": [{
-                        "index": index, "text": text, "logprobs": null, "finish_reason": finish,
-                    }],
-                })
-            };
-            let send = |value: Value| {
-                let _ = tx.send(value.to_string());
-            };
-            let mut usages = Vec::with_capacity(jobs.len());
-            let count = jobs.len();
-            for (index, job) in jobs.into_iter().enumerate() {
-                if echo && !job.echo.is_empty() {
-                    send(chunk(index, &job.echo, None));
+        let chunk = move |index: usize, text: &str, finish: Option<&str>| {
+            json!({
+                "id": id, "object": "text_completion", "created": created, "model": model,
+                "choices": [{
+                    "index": index, "text": text, "logprobs": null, "finish_reason": finish,
+                }],
+            })
+        };
+        let echoes: Vec<String> = jobs.iter().map(|j| j.echo.clone()).collect();
+        let count = jobs.len();
+        let mut usages = Vec::with_capacity(count);
+        let mut started = vec![false; count];
+        // The echoed prompt goes ahead of a prompt's first text (or its
+        // end, when it generated none).
+        let mut echo_once = move |index: usize| -> Option<String> {
+            (echo && !std::mem::replace(&mut started[index], true))
+                .then(|| echoes[index].clone())
+                .filter(|e| !e.is_empty())
+        };
+        let frame = move |progress: Progress<'_>| -> Option<Value> {
+            match progress {
+                Progress::Text(index, text) => {
+                    let text = match echo_once(index) {
+                        Some(prompt) => prompt + text,
+                        None => text.to_string(),
+                    };
+                    Some(chunk(index, &text, None))
                 }
-                let result = engine.complete_prompt_streaming(&job.prompt, &options, &flag, &mut |text| {
-                    send(chunk(index, text, None))
-                });
-                match result {
-                    Ok(completion) => {
-                        metrics.record_generation(&completion.usage);
-                        usages.push(completion.usage.clone());
-                        let mut last = chunk(index, "", Some(completion.finish_reason()));
-                        if index + 1 == count {
-                            last["usage"] =
-                                serde_json::to_value(total_usage(&usages)).unwrap_or_default();
-                            last["timings"] =
-                                serde_json::to_value(&completion.timings).unwrap_or_default();
-                        }
-                        send(last);
+                Progress::Done(index, completion) => {
+                    usages.push(completion.usage.clone());
+                    let text = echo_once(index).unwrap_or_default();
+                    let mut last = chunk(index, &text, Some(completion.finish_reason()));
+                    if index + 1 == count {
+                        last["usage"] =
+                            serde_json::to_value(total_usage(&usages)).unwrap_or_default();
+                        last["timings"] =
+                            serde_json::to_value(completion.timings).unwrap_or_default();
                     }
-                    Err(error) => {
-                        tracing::error!("streaming completion failed: {error}");
-                        send(json!({
-                            "error": {"message": "generation failed", "type": "server_error"},
-                        }));
-                        break;
-                    }
+                    Some(last)
                 }
             }
-            let _ = tx.send("[DONE]".to_string());
-        });
-        let events = futures_util::stream::unfold((rx, cancel), |(mut rx, cancel)| async move {
-            rx.recv()
-                .await
-                .map(|data| (Ok::<Event, Infallible>(Event::default().data(data)), (rx, cancel)))
-        });
-        return Ok(Sse::new(events).into_response());
+        };
+        let error = json!({"error": {"message": "generation failed", "type": "server_error"}});
+        return Ok(stream_all(
+            engine,
+            jobs,
+            options,
+            Arc::clone(&state.metrics),
+            frame,
+            error,
+            Some("[DONE]"),
+        ));
     }
 
-    let flag = cancel.flag();
-    let completions: Vec<Completion> = tokio::task::spawn_blocking({
-        let engine = Arc::clone(&engine);
-        let prompts: Vec<RawPrompt> = jobs.iter().map(|j| j.prompt.clone()).collect();
-        move || {
-            prompts
-                .iter()
-                .map(|p| engine.complete_prompt_cancellable(p, &options, &flag))
-                .collect::<crate::Result<Vec<_>>>()
-        }
-    })
-    .await
-    .map_err(|e| ApiError::internal(e.to_string()))?
-    .map_err(ApiError::from)?;
-
+    let completions = complete_all(&engine, &jobs, options, &state.metrics).await?;
     let usage = total_usage(completions.iter().map(|c| &c.usage));
     let choices: Vec<Value> = completions
         .iter()
         .zip(&jobs)
         .enumerate()
         .map(|(index, (completion, job))| {
-            state.metrics.record_generation(&completion.usage);
             let text = if echo {
                 format!("{}{}", job.echo, completion.text)
             } else {
@@ -367,7 +539,8 @@ mod tests {
             prompt_tokens: prompt,
             completion_tokens: completion,
             total_tokens: prompt + completion,
-            prompt_tokens_details: cached.map(|cached_tokens| PromptTokensDetails { cached_tokens }),
+            prompt_tokens_details: cached
+                .map(|cached_tokens| PromptTokensDetails { cached_tokens }),
             completion_tokens_details: None,
         }
     }
@@ -380,24 +553,63 @@ mod tests {
             serde_json::to_value(&one).unwrap()
         );
         let mut reasoning = usage(10, 4, None);
-        reasoning.completion_tokens_details = Some(CompletionTokensDetails { reasoning_tokens: 3 });
+        reasoning.completion_tokens_details = Some(CompletionTokensDetails {
+            reasoning_tokens: 3,
+        });
         let total = total_usage([&one, &reasoning, &usage(7, 1, Some(2))]);
-        assert_eq!((total.prompt_tokens, total.completion_tokens, total.total_tokens), (117, 10, 127));
+        assert_eq!(
+            (
+                total.prompt_tokens,
+                total.completion_tokens,
+                total.total_tokens
+            ),
+            (117, 10, 127)
+        );
         assert_eq!(total.prompt_tokens_details.unwrap().cached_tokens, 82);
         assert_eq!(total.completion_tokens_details.unwrap().reasoning_tokens, 3);
     }
 
     #[test]
     fn prompts_take_every_openai_form() {
-        assert_eq!(prompts(Some(&json!("a"))).unwrap(), [Prompt::Text("a".into())]);
-        assert_eq!(prompts(Some(&json!([1, 2]))).unwrap(), [Prompt::Tokens(vec![1, 2])]);
+        let openai = |v: Value| prompts(Some(&v), PromptForms::OpenAi);
+        assert_eq!(openai(json!("a")).unwrap(), [Prompt::Text("a".into())]);
+        assert_eq!(openai(json!([1, 2])).unwrap(), [Prompt::Tokens(vec![1, 2])]);
         assert_eq!(
-            prompts(Some(&json!(["a", [3]]))).unwrap(),
+            openai(json!(["a", [3]])).unwrap(),
             [Prompt::Text("a".into()), Prompt::Tokens(vec![3])]
         );
-        for bad in [json!([]), json!([[]]), json!([-1]), json!({}), json!([1, "a"])] {
-            assert!(prompts(Some(&bad)).is_err(), "{bad}");
+        for bad in [
+            json!([]),
+            json!([[]]),
+            json!([-1]),
+            json!({}),
+            json!([1, "a"]),
+            json!([["a", 1]]),
+        ] {
+            assert!(openai(bad.clone()).is_err(), "{bad}");
         }
-        assert!(prompts(None).is_err());
+        assert!(prompts(None, PromptForms::OpenAi).is_err());
+    }
+
+    #[test]
+    fn llama_prompts_also_mix_text_and_token_ids() {
+        let llama = |v: Value| prompts(Some(&v), PromptForms::LlamaCpp);
+        let mixed = Prompt::Mixed(vec![
+            PromptPart::Tokens(vec![1, 2]),
+            PromptPart::Text("a".into()),
+            PromptPart::Tokens(vec![3]),
+        ]);
+        assert_eq!(llama(json!([1, 2, "a", 3])).unwrap(), std::slice::from_ref(&mixed));
+        assert_eq!(
+            llama(json!(["b", [1, 2, "a", 3], [4]])).unwrap(),
+            [Prompt::Text("b".into()), mixed, Prompt::Tokens(vec![4])]
+        );
+        assert_eq!(
+            llama(json!(["a", "b"])).unwrap(),
+            [Prompt::Text("a".into()), Prompt::Text("b".into())]
+        );
+        for bad in [json!([1, "a", -1]), json!([["a", {}]]), json!([[]])] {
+            assert!(llama(bad.clone()).is_err(), "{bad}");
+        }
     }
 }
