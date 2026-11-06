@@ -221,15 +221,15 @@ pub enum MlockMode {
 /// Compute backend for the engine.
 ///
 /// [`ComputeBackend::Auto`] (the default) picks the best backend this build
-/// was compiled with — CUDA first when the `cuda` feature is on, then Metal
-/// when the `metal` feature is on, else CPU — and falls back to CPU with a
-/// warning when the compiled-in backend is unavailable at runtime.  An
-/// explicit [`ComputeBackend::Metal`] or [`ComputeBackend::Cuda`] request
-/// instead fails the load when the backend is not compiled in or cannot be
-/// initialised, so a wrong `--device` flag is never silently ignored.
+/// was compiled with, trying each compiled-in one in the order CUDA, Metal,
+/// OpenCL, Vulkan, SYCL and falling back to CPU with a warning when none is
+/// available at runtime.  An explicit GPU request instead fails the load
+/// when that backend is not compiled in or cannot be initialised, so a wrong
+/// `--device` flag is never silently ignored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ComputeBackend {
-    /// Best backend compiled in (CUDA > Metal > CPU), falling back to CPU.
+    /// Best backend compiled in (CUDA > Metal > OpenCL > Vulkan > SYCL),
+    /// falling back to CPU.
     #[default]
     Auto,
     /// CPU inference (always available).
