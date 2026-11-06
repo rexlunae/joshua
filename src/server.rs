@@ -1166,7 +1166,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/messages", post(messages))
         .route("/v1/messages/count_tokens", post(messages_count_tokens))
-        .route("/v1/completions", post(completions))
+        .route("/v1/completions", post(crate::completions::completions))
         .route("/v1/embeddings", post(embeddings))
         .route("/v1/audio/transcriptions", post(transcriptions))
         .route(crate::coordinator::WORKER_INFO_PATH, get(worker_info))
@@ -2751,67 +2751,6 @@ fn stream_messages(
             emitter.error("generation failed");
         }
     }
-}
-
-/// `POST /v1/completions` — legacy (non-chat) text completion.
-async fn completions(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(body): Json<serde_json::Value>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let (model, engine) = select_model(
-        &state,
-        body.get("model")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default(),
-    )
-    .await?;
-    let prompt = body
-        .get("prompt")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| ApiError::bad_request("Missing required field 'prompt'"))?
-        .to_string();
-
-    // The OpenAI route's defaults, then the request's own sampling fields
-    // (`max_tokens` absent or -1 runs to end of sequence).
-    let sampling: crate::types::SamplingParams =
-        serde_json::from_value(body.clone()).map_err(|e| ApiError::bad_request(e.to_string()))?;
-    let mut options =
-        GenerationOptions::with_defaults(&engine.sampling_defaults(SamplingProfile::OpenAi));
-    sampling
-        .apply(&mut options)
-        .map_err(ApiError::bad_request)?;
-    options.cache_scope = Some(crate::affinity::cache_scope(&headers, None));
-
-    let messages = vec![ChatMessage::text("user".to_string(), prompt)];
-
-    let cancel = CancelOnDrop::new();
-    let completion = tokio::task::spawn_blocking({
-        let engine = Arc::clone(&engine);
-        let flag = cancel.flag();
-        move || engine.complete_chat_cancellable_detailed(&messages, None, &options, &flag)
-    })
-    .await
-    .map_err(|e| ApiError::internal(e.to_string()))?
-    .map_err(ApiError::from)?;
-
-    let usage = &completion.usage;
-    state.metrics.record_generation(usage);
-    let created = unix_time();
-
-    Ok(Json(json!({
-        "id": format!("cmpl-{}", Uuid::new_v4().simple()),
-        "object": "text_completion",
-        "created": created,
-        "model": model,
-        "choices": [{
-            "text": completion.text,
-            "index": 0,
-            "finish_reason": completion.finish_reason()
-        }],
-        "usage": usage,
-        "timings": completion.timings,
-    })))
 }
 
 /// `POST /v1/embeddings` — dense text embeddings.

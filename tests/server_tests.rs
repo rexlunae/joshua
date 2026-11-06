@@ -1500,3 +1500,103 @@ vAAgG105dwYP0yuZkqDAzaPJA2jHb6cV4BcMkMIMtyb4dWcn+I8bcnwI
         server.abort();
     }
 }
+
+/// `/v1/completions` completes the prompt as given (no chat template), as
+/// text, token ids or a batch of either; streams `text_completion` chunks
+/// that add up to the whole answer; echoes the prompt; and refuses what it
+/// does not do instead of ignoring it.
+#[tokio::test]
+async fn raw_completions_take_every_prompt_form_and_stream() {
+    let state = tiny_state("server-raw-completions", None);
+    let engine = state.models.list()[0].engine.clone();
+    let app = create_router(state);
+    let complete = |body: serde_json::Value| {
+        let app = app.clone();
+        async move {
+            let res = app.oneshot(post_json("/v1/completions", None, body)).await.unwrap();
+            let status = res.status();
+            (status, body_text(res).await)
+        }
+    };
+    let base = serde_json::json!({"prompt": "a b c", "max_tokens": 4, "temperature": 0.0});
+
+    // No chat template: the prompt is the tokenizer's encoding of the text.
+    let (status, body) = complete(base.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let whole: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let raw_tokens = engine.tokenize("a b c", true).unwrap().len() as u64;
+    assert_eq!(whole["usage"]["prompt_tokens"], raw_tokens, "{body}");
+    let text = whole["choices"][0]["text"].as_str().unwrap().to_string();
+
+    // The same prompt as token ids gives the same answer.
+    let ids = engine.tokenize("a b c", true).unwrap();
+    let mut by_ids = base.clone();
+    by_ids["prompt"] = serde_json::json!(ids);
+    let (status, body) = complete(by_ids).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["choices"][0]["text"], text, "{body}");
+
+    // A batch: one choice per prompt, usage summed.
+    let mut batch = base.clone();
+    batch["prompt"] = serde_json::json!(["a b c", ids]);
+    let (status, body) = complete(batch).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let choices = v["choices"].as_array().unwrap();
+    assert_eq!(choices.len(), 2, "{body}");
+    assert_eq!((choices[0]["index"].clone(), choices[1]["index"].clone()), (0.into(), 1.into()));
+    assert_eq!(v["usage"]["prompt_tokens"], 2 * raw_tokens, "{body}");
+
+    // echo repeats the prompt in front.
+    let mut echo = base.clone();
+    echo["echo"] = serde_json::json!(true);
+    let (_, body) = complete(echo).await;
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["choices"][0]["text"], format!("a b c{text}"), "{body}");
+
+    // Streaming adds up to the same text and ends in [DONE].
+    let mut stream = base.clone();
+    stream["stream"] = serde_json::json!(true);
+    let (status, body) = complete(stream).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mut streamed = String::new();
+    let mut finish = None;
+    let mut usage = None;
+    let mut done = false;
+    for data in body.lines().filter_map(|l| l.strip_prefix("data: ")) {
+        if data == "[DONE]" {
+            done = true;
+            continue;
+        }
+        let v: serde_json::Value = serde_json::from_str(data).unwrap();
+        assert_eq!(v["object"], "text_completion", "{data}");
+        streamed.push_str(v["choices"][0]["text"].as_str().unwrap());
+        if let Some(reason) = v["choices"][0]["finish_reason"].as_str() {
+            finish = Some(reason.to_string());
+            usage = Some(v["usage"].clone());
+        }
+    }
+    assert!(done, "{body}");
+    assert_eq!(streamed, text);
+    assert!(finish.is_some(), "{body}");
+    assert_eq!(usage.unwrap()["prompt_tokens"], raw_tokens);
+
+    // Refused rather than ignored.
+    for (extra, needle) in [
+        (serde_json::json!({"logprobs": 2}), "logprobs"),
+        (serde_json::json!({"n": 2}), "n = 1"),
+        (serde_json::json!({"best_of": 3}), "best_of"),
+        (serde_json::json!({"prompt": []}), "prompt"),
+        (serde_json::json!({"prompt": [1, "x"]}), "prompt"),
+        (serde_json::json!({"suffix": "end"}), "fill-in-the-middle"),
+    ] {
+        let mut body = base.clone();
+        for (k, v) in extra.as_object().unwrap() {
+            body[k] = v.clone();
+        }
+        let (status, text) = complete(body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{extra}: {text}");
+        assert!(text.contains(needle), "{extra}: {text}");
+    }
+}

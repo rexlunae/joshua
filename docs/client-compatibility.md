@@ -15,7 +15,7 @@ real client binary is *not* covered by the test suite today — see
 | Endpoint | Status |
 |---|---|
 | `POST /v1/chat/completions` | ✅ streaming (SSE) + non-stream, tools, `response_format` |
-| `POST /v1/completions` | ✅ legacy text completion |
+| `POST /v1/completions` | ✅ raw prompt (no chat template): a string, token ids, or a batch of either (one choice each); SSE streaming, `echo`, `suffix` (fill-in-the-middle models), `response_format`, `add_special_tokens`. `logprobs`, `n > 1` and `best_of > 1` are refused |
 | `POST /v1/embeddings` | ✅ |
 | `GET /v1/models` (also `/models`), `GET /v1/models/{id}` | ✅ loaded models, plus the files the model directory holds (each with its limits; a request naming one loads it on first use) |
 | `POST /v1/audio/transcriptions` | ✅ when the server has a `--whisper-model` |
