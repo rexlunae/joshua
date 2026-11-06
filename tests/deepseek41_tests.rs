@@ -8,7 +8,7 @@ mod common;
 use candle_core::{Device, Tensor};
 use common::{assert_close, load_model, logits};
 use joshua::model::{Architecture, QuantizedModel};
-use joshua::placement::{EngramResidency, EngramTier};
+use joshua::placement::EngramResidency;
 
 const TOKENS: [u32; 14] = [1, 4, 2, 7, 5, 9, 3, 6, 8, 4, 1, 12, 13, 5];
 

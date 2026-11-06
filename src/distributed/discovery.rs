@@ -983,7 +983,7 @@ mod tests {
         // goodbye lands in well under a second, whereas expiry alone would take
         // the full 15 s. Without this, a missing goodbye or a dropped removal
         // event would go unnoticed.
-        b.shutdown();
+        b.shutdown().expect("B shuts down");
         let sees_b = |a: &Discovery| a.peers().iter().any(|p| p.node.uuid == b_uuid);
         let gone_by = Instant::now() + PEER_TTL / 2;
         while Instant::now() < gone_by && sees_b(&a) {

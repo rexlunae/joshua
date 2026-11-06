@@ -99,7 +99,7 @@
 use std::fs::File;
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -1249,6 +1249,8 @@ struct InFlightGuard<'a> {
 }
 
 impl<'a> InFlightGuard<'a> {
+    /// [`Self::acquire_with`] at the default queue depth, uncancellable.
+    #[cfg(test)]
     fn acquire(gate: &'a AdmissionGate, max: usize, wait: Duration) -> Result<Self> {
         Self::acquire_with(gate, max, DEFAULT_ADMISSION_QUEUE_DEPTH, wait, None)
     }
@@ -1442,27 +1444,6 @@ impl GenSession {
         Ok(Some(
             squeeze_batch_logits(&logits).map_err(|e| JoshuaError::Inference(e.to_string()))?,
         ))
-    }
-
-    /// Feed one decode step across `seqs` **independent** sequences at their
-    /// own positions, returning one logits vector per sequence.  The MoE
-    /// dispatch for the batch is shared, so the routed-expert fetch is
-    /// amortized across the sequences (see
-    /// `quantized_deepseek4::ModelWeights::forward_sequences`).  Only the
-    /// candle deepseek4 model implements this; anything else reports an
-    /// unsupported error so callers can fall back to per-sequence steps.
-    fn forward_tokens_batched(
-        &mut self,
-        seqs: &[(&Tensor, usize)],
-    ) -> Result<Vec<Vec<f32>>, JoshuaError> {
-        match self {
-            Self::Candle(model) => model
-                .forward_sequences(seqs)
-                .map_err(|e| JoshuaError::Inference(e.to_string())),
-            Self::Npu(_) => Err(JoshuaError::Inference(
-                "batched forward is not supported on the NPU session".into(),
-            )),
-        }
     }
 
     /// Clear internal state for reuse with an unrelated prompt.
@@ -6023,8 +6004,8 @@ impl Engine {
         // below so concurrent acquire/release is never stalled by it.
         let mut edit_pick: Option<(CachedModel, usize)> = None;
         // Whether the prefix cache holds a longer reusable state than any
-        // pooled session can be rewound to.
-        let mut from_cache = false;
+        // pooled session can be rewound to (decided under the pool lock).
+        let mut from_cache;
         // A pooled session to clear for this unrelated prompt.
         let mut clear_pick: Option<CachedModel> = None;
 

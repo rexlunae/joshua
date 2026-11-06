@@ -195,7 +195,7 @@ fn verification_rollback_matches_plain_decode() {
     let mut plain = nemotron("rollback_plain");
     common::logits(&mut plain, &prompt, 0);
     let keep = 2usize;
-    let accepted = common::logits(&mut plain, &drafted[..keep], prompt.len());
+    common::logits(&mut plain, &drafted[..keep], prompt.len());
 
     // A verification pass over the drafts *at the current position*, then a
     // rollback to the first `keep` of them.

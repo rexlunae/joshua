@@ -437,7 +437,6 @@ impl CustomOp2 for Nvfp4Matmul {
         s2: &candle_core::VulkanStorage,
         l2: &Layout,
     ) -> Result<(candle_core::VulkanStorage, Shape)> {
-        use candle_core::backend::{BackendDevice as _, BackendStorage as _};
         use candle_core::vulkan_backend::kernels::{self, Buf, Idx, Push};
         let g = geometry_t(l1, l2)?;
         let native = vulkan_native_enabled()

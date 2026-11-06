@@ -2228,6 +2228,7 @@ fn load_moe<R: Read + Seek>(rd: &mut Reader<R>, p: &str, cfg: &Config) -> Result
 impl Weights {
     /// Attach the decode megakernel when `JOSHUA_MEGAKERNEL` asks for it and
     /// the model fits it; otherwise say why and keep the layer-by-layer path.
+    #[cfg_attr(not(feature = "sycl"), allow(unused_mut))]
     fn with_megakernel(mut self) -> Self {
         if !crate::megakernel::requested() {
             return self;

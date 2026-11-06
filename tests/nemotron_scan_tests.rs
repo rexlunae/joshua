@@ -179,6 +179,7 @@ fn run_both(c: &ScanConfig, f: &Fixture) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f
 /// an absurdly loose tolerance or produces false alarms. Compare the max
 /// absolute deviation against the largest magnitude in the reference instead,
 /// which is what "same answer to f32 precision" means for a dense buffer.
+#[cfg(feature = "opencl")]
 fn assert_close_scaled(name: &str, got: &[f32], want: &[f32], rel_of_scale: f32) {
     assert_eq!(got.len(), want.len(), "{name}: length");
     let scale = want.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-30);

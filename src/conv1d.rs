@@ -47,7 +47,9 @@
 //! `fallback_counts_by_op()`), so a test can assert the native path ran by
 //! watching `native_exec_count()` move with no fallback named [`OP_NAME`].
 
-use candle_core::{CpuStorage, CustomOp1, DType, Layout, Result, Shape, Storage, Tensor};
+#[cfg(feature = "opencl")]
+use candle_core::Storage;
+use candle_core::{CpuStorage, CustomOp1, DType, Layout, Result, Shape, Tensor};
 
 /// Op name used in fallback accounting (`fallback_counts_by_op`).
 pub const OP_NAME: &str = "conv1d";
@@ -213,6 +215,7 @@ struct Conv1dOp {
 }
 
 /// The device-independent part of one call.
+#[cfg_attr(not(any(feature = "opencl", feature = "vulkan")), allow(dead_code))]
 struct Args {
     t: usize,
     c: usize,
@@ -222,6 +225,7 @@ struct Args {
 }
 
 /// `offset` of a layout that is contiguous and holds exactly `want` elements.
+#[cfg_attr(not(any(feature = "opencl", feature = "vulkan")), allow(dead_code))]
 fn contiguous(layout: &Layout, want: usize) -> Option<usize> {
     let (o, e) = layout.contiguous_offsets()?;
     (e == o + want).then_some(o)
@@ -253,6 +257,7 @@ impl Conv1dOp {
     /// `Some(..)` when the layouts let the kernels index the buffers
     /// directly; `None` for a view the native path does not handle (the
     /// caller then falls back for a correct result).
+    #[cfg_attr(not(any(feature = "opencl", feature = "vulkan")), allow(dead_code))]
     fn native_args(&self, layout: &Layout) -> Result<Option<Args>> {
         let (t, c) = self.out_dims(layout)?;
         let rows = layout.dims()[0];
@@ -400,7 +405,6 @@ impl CustomOp1 for Conv1dOp {
         storage: &candle_core::VulkanStorage,
         layout: &Layout,
     ) -> Result<(candle_core::VulkanStorage, Shape)> {
-        use candle_core::backend::{BackendDevice as _, BackendStorage as _};
         use candle_core::vulkan_backend::kernels::{self, Buf, Idx, Push};
         let shape = Shape::from(self.out_dims(layout)?);
         // Every buffer the shader reads is declared `float`, so *all* of the

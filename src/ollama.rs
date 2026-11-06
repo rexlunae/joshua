@@ -738,14 +738,13 @@ pub async fn create(
 
 /// `POST /api/pull` — fetch a model file from an explicit https URL.
 ///
-/// Ollama's registry protocol (`model:tag` resolved against its library) is not
-/// implemented: it needs the registry manifest/blob API, which joshua does not
-/// speak.  A bare library name therefore fails with guidance rather than
-/// hanging, while an explicit https URL downloads into the model directory.
-/// The response is a single object (`stream: false` shape), which every client
-/// accepts, and the final `status` is `success` on completion.
+/// Neither source is implemented yet.  Ollama's registry protocol
+/// (`model:tag` resolved against its library) needs the registry
+/// manifest/blob API, which joshua does not speak, so a bare library name
+/// fails with a 400 and guidance rather than hanging; an explicit https URL
+/// is answered with a 501 until URL downloads land.  Either way the client
+/// is told to place the file in the model directory and load it.
 pub async fn pull(
-    State(state): State<AppState>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let name = body
@@ -754,7 +753,9 @@ pub async fn pull(
         .ok_or_else(|| ApiError::bad_request("missing 'model'"))?;
     if !name.starts_with("https://") {
         return Err(ApiError::bad_request(&format!(
-            "cannot pull `{name}`: joshua does not implement the Ollama registry protocol.              Pass an explicit https:// URL to a .gguf file, or place the file in the              model directory and load it with POST /v1/models/load."
+            "cannot pull `{name}`: joshua does not implement the Ollama registry protocol. \
+             Place the .gguf file in the model directory and load it with \
+             POST /v1/models/load."
         )));
     }
     Err(ApiError::new(

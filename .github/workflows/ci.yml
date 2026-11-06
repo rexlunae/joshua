@@ -97,6 +97,24 @@ jobs:
           cargo clippy -p joshua-ui --all-targets -- -D warnings
           cargo clippy -p joshua-ui --target wasm32-unknown-unknown -- -D warnings
 
+  # The accelerator backends (OpenCL, Vulkan, SYCL) are cargo features the
+  # jobs above never enable, so their cfg-gated code, tests and examples
+  # could stop compiling unnoticed (two of them had). `cargo check` needs
+  # no GPU, driver, OpenCL ICD or SYCL compiler: nothing is linked, and the
+  # SYCL kernels are a separate CMake/icpx library loaded at runtime.
+  check-accelerators:
+    name: check (--features opencl,vulkan,sycl)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the pinned toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.89.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Check every target with the accelerator features
+        run: cargo check --release --all-targets --features opencl,vulkan,sycl,distributed
+
   # RFC #86's networking and sharding code — discovery, multicast, the
   # partitioner, the shard map and the deepseek4 cluster integration tests —
   # is all behind `--features distributed`. A plain `cargo test --tests` runs

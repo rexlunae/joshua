@@ -694,6 +694,7 @@ fn main() -> Result<()> {
         Some(file.clone()),
         context,
         cache_bytes,
+        joshua::placement::EngramTier::default(),
     )?;
     dev.synchronize()?;
     let load_seconds = load_start.elapsed().as_secs_f64();

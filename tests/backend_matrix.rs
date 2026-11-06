@@ -17,7 +17,7 @@
 mod common;
 use candle_core::{Device, Tensor};
 use joshua::model::QuantizedModel;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 fn load_mmap(model: &Path, device: &Device) -> QuantizedModel {
     let bytes = std::fs::read(model).unwrap();
@@ -170,7 +170,7 @@ fn backend_matrix_parity() {
         let mut ref_last = ref_long.clone();
         let mut ref_step_logits: Vec<Vec<f32>> = Vec::new();
         let ref_greedy = (0..6)
-            .map(|step| {
+            .map(|_| {
                 let next = argmax(&ref_last);
                 ref_ids.push(next);
                 ref_last = logits(&mut cpu_long_model, &[next], ref_ids.len() - 1, &Device::Cpu);

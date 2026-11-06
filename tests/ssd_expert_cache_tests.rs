@@ -105,7 +105,7 @@ fn ssd_cache_is_gated_off_and_outputs_are_unchanged() {
         SsdExpertCache::Unset,
         SsdExpertCache::Disabled,
         SsdExpertCache::Bytes(0),
-        SsdExpertCache::Bytes(64 << 20),
+        SsdExpertCache::Bytes(SLAB_BUDGET),
         SsdExpertCache::Auto,
     ] {
         let mut model = load(&path, setting);
@@ -138,7 +138,7 @@ fn gated_loads_are_deterministic_across_repeats() {
 
     let mut first: Option<(Vec<f32>, Vec<f32>)> = None;
     for attempt in 0..4 {
-        let mut model = load(&path, SsdExpertCache::Bytes(64 << 20));
+        let mut model = load(&path, SsdExpertCache::Bytes(SLAB_BUDGET));
         let got = (
             logits(&mut model, &prompt, 0),
             logits(&mut model, &[9], prompt.len()),

@@ -1254,7 +1254,7 @@ mod tests {
         // (e.g. 0.5% of the pool) declines; a device slower than CPU-BLAS on
         // decode never engages, however large the leftover (0.39x below).
         auto_request(Some(2_300 << 20), 72_000 << 20, Some(2.0)).expect("3% of the pool now engages");
-        let err = auto_request(Some((360 << 20)), 72_000 << 20, Some(2.0)).unwrap_err();
+        let err = auto_request(Some(360 << 20), 72_000 << 20, Some(2.0)).unwrap_err();
         assert!(
             matches!(err, AutoVramCacheDecline::TooSmallResidency(0)),
             "0.5% residency is below the 1/64 floor: {err:?}"
@@ -1356,8 +1356,7 @@ mod tests {
     fn dense_moves_to_cpu_to_grow_the_cache_over_the_floor() {
         // A 0.8 GiB leftover on a 72 GiB pool is ~1.1% — under the 1/64 floor
         // (1.125 GiB), so it declines on residency.
-        let leftover = 0x8000_0000usize << 10; // 0.8 GiB
-        let leftover = (800 << 20) as u64;
+        let leftover = (800 << 20) as u64; // 0.8 GiB
         let decline = auto_request(Some(leftover), 72 * GIB, Some(1.8)).unwrap_err();
         assert!(matches!(
             decline,
@@ -1366,20 +1365,20 @@ mod tests {
         // Freeing a dense set that clears the floor (~2.5% collectively)
         // engages.  floor = 72 GiB/64 = 1.125 GiB; 0.8 + 0.5 = 1.3 GiB.
         let freed =
-            dense_to_cpu_for_cache(&decline, true, (500 << 20), leftover, 72 * GIB, Some(1.8))
+            dense_to_cpu_for_cache(&decline, true, 500 << 20, leftover, 72 * GIB, Some(1.8))
                 .expect("freed dense clears the floor");
         assert_eq!(freed, leftover + (500 << 20));
         // The dense recommendation itself would have picked CPU (<1.5x),
         // so this helper is only reached at >= 1x; below 1x it stays out.
         assert_eq!(
-            dense_to_cpu_for_cache(&decline, true, (500 << 20), leftover, 72 * GIB, Some(0.9)),
+            dense_to_cpu_for_cache(&decline, true, 500 << 20, leftover, 72 * GIB, Some(0.9)),
             None,
             "a device slower than CPU-BLAS must not buy the dense move"
         );
         // Freed memory that still misses the floor keeps the decline: freeing
         // only 0.2 GiB leaves 1.0 GiB < the 1.125 GiB floor.
         assert_eq!(
-            dense_to_cpu_for_cache(&decline, true, (200 << 20), leftover, 72 * GIB, Some(1.8)),
+            dense_to_cpu_for_cache(&decline, true, 200 << 20, leftover, 72 * GIB, Some(1.8)),
             None,
             "a sub-GiB dense set does not clear the floor even freed"
         );

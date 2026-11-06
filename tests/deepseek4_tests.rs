@@ -1108,7 +1108,7 @@ fn deepseek4_long_prefill_consistency() {
     let mut ref_ids = prompt.clone();
     let mut ref_last = reference.clone();
     let mut ref_decoded: Vec<u32> = Vec::new();
-    for step in 0..8 {
+    for _ in 0..8 {
         let next = ref_last
             .iter()
             .enumerate()

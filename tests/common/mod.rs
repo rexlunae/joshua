@@ -3577,7 +3577,6 @@ pub fn write_nemotron_h_gguf(path: &Path, opts: NemotronTiny) {
 
     let conv_dim = D_INNER + 2 * N_GROUP * D_STATE;
     let d_in_proj = 2 * D_INNER + conv_dim + SSM_HEAD;
-    let head_dim = D_INNER / SSM_HEAD;
 
     let mut tensors: Vec<(String, QTensor)> = vec![
         (

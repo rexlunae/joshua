@@ -52,9 +52,6 @@ fn main() -> candle_core::Result<()> {
         println!("SKIP: no vulkan device");
         return Ok(());
     }
-    if let Device::Vulkan(vk) = &dev {
-        println!("limits: {:?}", "vulkan device");
-    }
     let mut all_ok = true;
     for seq in [8usize, 32, 48, 64, 72, 80, 88, 96, 104, 128, 160, 200] {
         let (b, h, d) = (1usize, 8usize, 64usize);

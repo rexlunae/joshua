@@ -654,7 +654,6 @@ pub(super) fn tiny_qsa_for_test(dev: &Device) -> Result<Qsa> {
 mod tests {
     use super::*;
     use candle_core::Device;
-    use crate::attention::RopeStyle;
 
     /// The hash reads EOS before the sequence start and at/before an EOS in
     /// the window, never at the token itself, and wraps in u64.

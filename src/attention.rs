@@ -8,7 +8,7 @@
 //! of [`Rope`].
 
 use candle_core::backend::BackendStorage;
-use candle_core::{bail, DType, Device, Layout, Result, Storage, Tensor, D};
+use candle_core::{bail, Device, Layout, Result, Storage, Tensor, D};
 use candle_nn::ops::softmax_last_dim;
 
 /// How rotated dimensions are paired.
@@ -444,11 +444,13 @@ impl SeqKvCache {
     /// [`Self::len`] holding the cached positions.  Crate-visible for the
     /// loader tests and diagnostics; clones share storage (see the type
     /// docs).
+    #[cfg_attr(not(feature = "sycl"), allow(dead_code))] // the SYCL decode megakernel
     pub(crate) fn k(&self) -> &Tensor {
         &self.k
     }
 
     /// The value buffer `[b, n_kv, cap, dv]`.
+    #[cfg_attr(not(feature = "sycl"), allow(dead_code))] // the SYCL decode megakernel
     pub(crate) fn v(&self) -> &Tensor {
         &self.v
     }
@@ -493,6 +495,7 @@ impl SeqKvCache {
     /// Make room for `n` more rows past [`Self::len`] without writing them,
     /// for a kernel that writes the rows itself (the decode megakernel);
     /// [`Self::advance`] then counts them.
+    #[cfg_attr(not(feature = "sycl"), allow(dead_code))] // the SYCL decode megakernel
     pub(crate) fn reserve(&mut self, n: usize) -> Result<()> {
         let cap = self.k.dim(2)?;
         if self.len + n > cap {
@@ -502,6 +505,7 @@ impl SeqKvCache {
     }
 
     /// Count `n` rows past [`Self::len`] that were written in place.
+    #[cfg_attr(not(feature = "sycl"), allow(dead_code))] // the SYCL decode megakernel
     pub(crate) fn advance(&mut self, n: usize) {
         self.len += n;
     }
@@ -621,6 +625,7 @@ fn copy_rows_runs<S: BackendStorage>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle_core::DType;
 
     #[test]
     fn a_mask_that_does_not_match_the_cache_is_rebuilt() -> Result<()> {
@@ -659,6 +664,7 @@ mod tests {
         let (batch, heads, seq, dim, offset) = (2, 4, 33, 64, 17);
         let data: Vec<f32> = (0..batch*heads*seq*dim)
             .map(|i| ((i%251) as f32-125.)*0.25).collect();
+        #[allow(unused_mut)] // accelerator builds push their devices
         let mut devices = vec![Device::Cpu];
         #[cfg(feature = "vulkan")]
         if let Ok(dev) = Device::new_vulkan(0) { devices.push(dev); }
@@ -705,6 +711,7 @@ mod tests {
             (65535, 1, 0.9813275592311402, 0.19234401860586398),
             (65535, 2, 0.06548809955881085, 0.9978533503557401),
         ];
+        #[allow(unused_mut)] // accelerator builds push their devices
         let mut devices = vec![Device::Cpu];
         #[cfg(feature = "vulkan")]
         if let Ok(dev) = Device::new_vulkan(0) {
