@@ -36,7 +36,8 @@ use joshua::{
 /// Values for `--device` (CLI form of [`ComputeBackend`]).
 #[derive(Debug, Clone, Copy, ValueEnum, Default)]
 enum DeviceArg {
-    /// Best backend this build supports: CUDA, then Metal, then CPU.
+    /// Best backend this build supports, tried in order: CUDA, Metal,
+    /// OpenCL, Vulkan, SYCL, then CPU.
     #[default]
     Auto,
     /// CPU inference.
@@ -278,6 +279,277 @@ impl SamplingArgs {
     }
 }
 
+/// Model-load flags shared by every subcommand that loads a GGUF model
+/// (`serve`, `run`, `bench`, `ppl`): one definition, so a flag and its
+/// help text cannot drift between commands, and one translation into
+/// [`EngineOptions`].
+#[derive(clap::Args, Debug, Clone)]
+struct ModelLoadArgs {
+    /// Context window size in tokens (prompt + generated), fixed at load:
+    /// it sizes the KV cache and RoPE tables.  On `serve`, a request may ask
+    /// for a smaller window with `context_window` (or `num_ctx`), never a
+    /// larger one.
+    #[arg(long, env = "JOSHUA_N_CTX", default_value_t = 4096)]
+    n_ctx: u32,
+    /// Compute backend: auto, cpu, metal, cuda, opencl, vulkan, or sycl.
+    /// An explicit GPU request fails the load when the backend is not built
+    /// in or is unavailable at runtime.
+    #[arg(long, env = "JOSHUA_DEVICE", value_enum, default_value_t = DeviceArg::Auto)]
+    device: DeviceArg,
+    /// Physical-memory backing for the model: off, transparent, huge,
+    /// 2mb, or 1gb (Linux only for the huge-page modes).  Defaults to
+    /// transparent on Linux (best-effort 2 MiB pages), off elsewhere.
+    #[arg(long, value_enum, default_value_t = default_huge_pages())]
+    huge_pages: HugePagesArg,
+    /// Require the model to be memory-mappable: a compressed model file
+    /// (a gzip/zstd/... stream, or one the filesystem stores compressed)
+    /// becomes a load error instead of a warning.
+    #[arg(long, default_value_t = false)]
+    mmap: bool,
+    /// Optimise the mapping for a model far larger than RAM: no readahead,
+    /// so pages fault in only as weights are genuinely touched.
+    #[arg(long, env = "JOSHUA_LAZY_WEIGHTS", default_value_t = false)]
+    lazy_weights: bool,
+    /// Prefetch the whole model file into the OS page cache at load
+    /// (MADV_WILLNEED), so a model that fits in RAM is fully resident
+    /// before the first request and inference never re-reads weights from
+    /// disk.  Defaults to on when the model file fits in RAM; pass
+    /// `--prefetch-model=false` to force it off.
+    #[arg(long, env = "JOSHUA_PREFETCH_MODEL", num_args = 0..=1, default_missing_value = "true")]
+    prefetch_model: Option<bool>,
+    /// Prefetch the always-touched weights (embeddings, norms, attention,
+    /// routers, shared experts, output) at load and advise random access
+    /// on routed experts, so the per-token working set stays resident.
+    /// Defaults to on when the model file is larger than RAM; pass
+    /// `--pin-hot-weights=false` to force it off.
+    #[arg(long, env = "JOSHUA_PIN_HOT_WEIGHTS", num_args = 0..=1, default_missing_value = "true")]
+    pin_hot_weights: Option<bool>,
+    /// Keep the N most frequently routed experts resident (routing-
+    /// frequency LRU; recency as the tie-break).  0 disables.  Wired for
+    /// the joshua-native MoE loaders (deepseek2, deepseek4, qwen3moe).
+    #[arg(long, env = "JOSHUA_PIN_HOT_EXPERTS", default_value_t = 0)]
+    pin_hot_experts: usize,
+    /// Size the hot-expert cache automatically at load (`auto`), or set a
+    /// fixed expert count.  Overrides --pin-hot-experts when given a count.
+    #[arg(long, env = "JOSHUA_EXPERT_CACHE", value_parser = clap::value_parser!(ExpertCacheArg))]
+    expert_cache: Option<ExpertCacheArg>,
+    /// Size the bounded VRAM expert cache (#62): upload a hot subset of the
+    /// routed experts to the accelerator.  `auto` derives the device byte
+    /// budget at load (device free − dense − headroom − KV); a number is a
+    /// fixed MiB budget; `0` disables (all experts stay on the host).
+    /// Unset (the default), `--expert-placement auto` engages the cache
+    /// itself where the leftover device memory is worth it (#110).
+    #[arg(long, env = "JOSHUA_VRAM_EXPERT_CACHE", value_parser = clap::value_parser!(VramExpertCacheArg))]
+    vram_expert_cache: Option<VramExpertCacheArg>,
+    /// Size the Tier-3 NVMe/SSD expert staging slab (`--ssd-expert-cache`):
+    /// a bounded host-RAM slab that `pread(2)`-streams a hot subset of the
+    /// routed experts off the SSD (see `NvmeResidency`).  `auto` derives the
+    /// host-RAM byte budget from the machine's available RAM at load; a
+    /// number is a fixed MiB budget; `0` disables (experts keep their
+    /// ordinary host page-cache residency).
+    #[arg(long, env = "JOSHUA_SSD_EXPERT_CACHE", value_parser = clap::value_parser!(SsdExpertCacheArg))]
+    ssd_expert_cache: Option<SsdExpertCacheArg>,
+    /// Tokens per prefill chunk (default 512).  Bounds the per-layer
+    /// prefill workspace and sets how many prompt rows each routed expert
+    /// sees per matmul; the joshua-native MoE loaders read each layer's
+    /// weights once per prefill whatever the chunk.
+    #[arg(
+        long,
+        env = "JOSHUA_PREFILL_CHUNK",
+        default_value_t = 0,
+        hide_default_value = true
+    )]
+    prefill_chunk: usize,
+    /// Target wall time for one prefill chunk, in milliseconds.  When
+    /// non-zero, architectures that prefill chunk by chunk choose each
+    /// chunk from an online cost model; `--prefill-chunk` is the ceiling.
+    /// 0 (the default) keeps the fixed chunk size.
+    #[arg(long, env = "JOSHUA_PREFILL_BUDGET_MS", default_value_t = 0, hide_default_value = true)]
+    prefill_budget_ms: u64,
+    /// Speculative token generation: draft up to N tokens per step by
+    /// prompt lookup (the continuation of the latest earlier occurrence
+    /// of the output's trailing n-gram) and verify them in one forward
+    /// pass.  Output is unchanged; repetitive output (code edits, quoted
+    /// context, tool-call arguments) decodes in fewer weight sweeps.
+    /// `0` (the default) disables it.  Applies to the loaders that can
+    /// score every position and roll their KV cache back: the plain-
+    /// attention qwen family (qwen, qwen2moe, qwen2vl, qwen3, qwen3moe,
+    /// qwen3vl, qwen3vlmoe, chatglm, glm4, glm4moe), the deepseek2 family
+    /// (deepseek, deepseek2, glm-dsa — incl. V3 / Kimi-K2 / GLM-5), and
+    /// deepseek4 / deepseek41.  Models with recurrent DeltaNet or KDA
+    /// layers (qwen3next, qwen3.5, qwen4exp, glm5next, kimi-linear,
+    /// kimi-k3) and candle's stock loaders cannot roll their KV cache
+    /// back; there the flag is ignored with a warning.
+    #[arg(
+        long,
+        env = "JOSHUA_SPECULATIVE",
+        default_value_t = 0,
+        hide_default_value = true
+    )]
+    speculative: usize,
+    /// MTP drafting: draft up to N tokens per step (at most 7) with the
+    /// model's own NextN / MTP block, which GLM-4.5+ and Qwen3.5/3.6
+    /// GGUFs carry, and verify them in one forward pass.  Output is
+    /// unchanged.  Replaces --speculative's prompt lookup on a model with
+    /// the block and is ignored with a warning on one without.  Every
+    /// forward pass also runs through the block (one more layer).  `0`
+    /// (the default) disables it and skips loading the block.
+    #[arg(long, env = "JOSHUA_MTP", default_value_t = 0, hide_default_value = true)]
+    mtp: usize,
+    /// Draft-model speculative decoding: a small GGUF that shares this
+    /// model's tokenizer (e.g. Qwen3-0.6B for a Qwen3 MoE) drafts up to
+    /// --draft-max tokens per step, verified in one forward pass of this
+    /// model.  Greedy output is unchanged; sampled output is verified
+    /// against the draft's own distribution, so it is distributed as
+    /// plain sampling.  The draft must be an attention-only model of a
+    /// joshua-native loader (qwen3, qwen3moe, glm4, deepseek2, …) and
+    /// runs on the dense device.  Takes the place of --speculative's
+    /// prompt lookup and of --mtp.
+    #[arg(long, env = "JOSHUA_DRAFT_MODEL")]
+    draft_model: Option<PathBuf>,
+    /// Most draft-model tokens per step (default 4).
+    #[arg(long, env = "JOSHUA_DRAFT_MAX", default_value_t = 0, hide_default_value = true)]
+    draft_max: usize,
+    /// Lock the always-touched weights into RAM (mlock).  Needs the
+    /// process memlock limit to cover the hot set: `LimitMEMLOCK=infinity`
+    /// (systemd), `ulimit -l unlimited`, or /etc/security/limits.conf.
+    /// On a systemd *user* session the hard limit is inherited from the
+    /// login session, so a unit's LimitMEMLOCK alone is silently capped —
+    /// apply `sudo prlimit --pid <user manager pid> --memlock=-1:-1` for a
+    /// live fix, or re-login.  `=required` fails the load instead of
+    /// degrading when the limit is too low; the limit is checked before
+    /// any mlock attempt, with one warning naming limit vs required size.
+    #[arg(long, env = "JOSHUA_MLOCK_HOT_WEIGHTS", num_args = 0..=1, default_missing_value = "on", value_enum)]
+    mlock_hot_weights: Option<MlockArg>,
+    /// Cap locked weight pages in MiB when the full dense set exceeds
+    /// RAM. Requires --mlock-hot-weights; skips untied input embeddings
+    /// and routed experts. Leave RAM for KV state and disk staging.
+    #[arg(long, value_name = "MiB", requires = "mlock_hot_weights",
+        value_parser = clap::value_parser!(u64).range(1..=u64::MAX / (1024 * 1024)))]
+    mlock_weight_budget: Option<u64>,
+    /// Where a MoE model's routed experts live on a GPU: `device` uploads
+    /// them (the whole model must fit), `host` keeps them in RAM borrowed
+    /// from the mapping with only the dense set on the GPU (runs models
+    /// larger than VRAM), `auto` picks `device` only when the model fits
+    /// the GPU's free memory with headroom.  Ignored on the CPU.  When
+    /// `auto` falls back to `host` on an architecture that can run routed
+    /// experts from a bounded VRAM cache (deepseek4 on OpenCL/SYCL), that
+    /// cache is engaged by default where the leftover device memory is
+    /// worth it (#110); `--vram-expert-cache 0` opts out.
+    #[arg(long, env = "JOSHUA_EXPERT_PLACEMENT", default_value = "auto", value_parser = clap::value_parser!(ExpertPlacement))]
+    expert_placement: ExpertPlacement,
+    /// GPU memory the model may use, in MiB.  Overrides the probe for the
+    /// `--expert-placement auto` decision and the per-GPU session cap;
+    /// the way to state the budget on backends without a probe (Metal,
+    /// OpenCL) or when sharing the card.
+    #[arg(long, env = "JOSHUA_VRAM_BUDGET")]
+    vram_budget: Option<u64>,
+    /// NPU vendor plugin (a cdylib exporting the joshua_npu_* ABI).
+    #[arg(long, env = "JOSHUA_NPU_PLUGIN")]
+    npu_plugin: Option<PathBuf>,
+    /// Load the NPU plugin in-process instead of the isolated shim
+    /// (lower overhead; a plugin crash takes the server down).
+    #[arg(long, default_value_t = false)]
+    npu_in_process: bool,
+    /// Where a DeepSeek-V4.1 model's Engram n-gram tables are resident
+    /// (a separate policy from the routed experts): `auto` resolves them
+    /// straight from the mmap mapping (disk-pinned) and promotes a working
+    /// subset into RAM only when free RAM is ample (>~192 GiB), `ram`
+    /// always promotes the working subset into RAM, `disk` always pins
+    /// them to storage.  The tables never consume a Tier-1 VRAM or Tier-2
+    /// host-slot budget under any tier.
+    #[arg(long, env = "JOSHUA_ENGRAM_TIER", default_value = "auto", value_parser = clap::value_parser!(EngramTier))]
+    engram_tier: EngramTier,
+    /// Where the dense set (embeddings, norms, attention, routers, shared
+    /// experts, output) runs on a GPU: `device` offloads it (right for a
+    /// real GPU whose GEMM beats CPU-BLAS), `cpu` keeps it on CPU-BLAS
+    /// (right when the accelerator is a weak iGPU / software OpenCL-Vulkan
+    /// path that is slower than the CPU), `auto` runs a quick startup probe
+    /// and picks by measured throughput.  Ignored on the CPU.
+    #[arg(long, env = "JOSHUA_DENSE_PLACEMENT", default_value = "auto", value_parser = clap::value_parser!(DensePlacement))]
+    dense_placement: DensePlacement,
+    /// Skip the `--dense auto` startup probe (fast launch).  `auto` then keeps
+    /// its historical on-device default, still gated on the dense set fitting
+    /// the device memory budget (#176).
+    #[arg(long, env = "JOSHUA_SKIP_PLACEMENT_BENCH", num_args = 0..=1, default_missing_value = "true")]
+    skip_placement_bench: bool,
+}
+
+impl ModelLoadArgs {
+    /// The [`EngineOptions`] these flags describe for `model`.  The page-cache
+    /// defaults (`--pin-hot-weights`, `--prefetch-model`) depend on the model
+    /// file's size, so a server that loads several models calls
+    /// [`Self::with_cache_plan`] again per model.
+    fn engine_options(&self, model: Option<&Path>) -> EngineOptions {
+        // `--skip-placement-bench` is read by the engine from the
+        // environment, so the flag is applied there.
+        if self.skip_placement_bench {
+            std::env::set_var("JOSHUA_SKIP_PLACEMENT_BENCH", "1");
+        }
+        let (pin_hot_experts, expert_cache_auto) = match self.expert_cache {
+            Some(ExpertCacheArg::Auto) => (self.pin_hot_experts, true),
+            Some(ExpertCacheArg::Count(n)) => (n, false),
+            None => (self.pin_hot_experts, false),
+        };
+        let vram_cache = match self.vram_expert_cache {
+            Some(VramExpertCacheArg::Auto) => VramExpertCache::Auto, // engine sizes at load
+            Some(VramExpertCacheArg::MiB(n)) => VramExpertCache::Bytes(mib_to_bytes(n as u64)),
+            None => VramExpertCache::Unset, // the engine may engage a partial cache (#110)
+        };
+        let ssd_cache = match self.ssd_expert_cache {
+            Some(SsdExpertCacheArg::Auto) => SsdExpertCache::Auto, // engine sizes at load
+            Some(SsdExpertCacheArg::MiB(n)) => SsdExpertCache::Bytes(mib_to_bytes(n as u64)),
+            None => SsdExpertCache::Unset, // the engine decides
+        };
+        let opts = EngineOptions::with_n_ctx(self.n_ctx)
+            .backend(self.device.into())
+            .huge_pages(self.huge_pages.into())
+            .mmap(mmap_mode(self.mmap))
+            .lazy_weights(self.lazy_weights)
+            .pin_hot_experts(pin_hot_experts)
+            .expert_cache_auto(expert_cache_auto)
+            .vram_expert_cache(vram_cache)
+            .ssd_expert_cache(ssd_cache)
+            .prefill_chunk(self.prefill_chunk)
+            .prefill_budget_ms(self.prefill_budget_ms)
+            .speculative(speculative_config(self.speculative))
+            .mtp(self.mtp)
+            .draft_model(self.draft_model.clone())
+            .draft_max(self.draft_max)
+            .mlock_hot_weights(self.mlock_hot_weights.map_or(MlockMode::Off, MlockMode::from))
+            .mlock_weight_budget(self.mlock_weight_budget.map(mib_to_bytes))
+            .expert_placement(self.expert_placement)
+            .dense_placement(self.dense_placement)
+            .engram_tier(self.engram_tier)
+            .device_memory_budget(self.vram_budget.map(mib_to_bytes));
+        self.with_cache_plan(opts, model)
+    }
+
+    /// Apply the page-cache options for `model`: an explicit
+    /// `--pin-hot-weights` / `--prefetch-model` wins, otherwise the choice
+    /// follows the model's size against RAM ([`cache_plan`]).  Without a
+    /// model both stay off.
+    fn with_cache_plan(&self, opts: EngineOptions, model: Option<&Path>) -> EngineOptions {
+        let (auto_pin, auto_prefetch) = model.map_or((false, false), cache_plan);
+        opts.pin_hot_weights(self.pin_hot_weights.unwrap_or(auto_pin))
+            .prefetch_whole_model(self.prefetch_model.unwrap_or(auto_prefetch))
+    }
+
+    /// The NPU backend `--npu-plugin` names, if any.
+    fn npu_backend(&self) -> anyhow::Result<Option<Arc<dyn joshua::npu::NpuBackend>>> {
+        self.npu_plugin
+            .as_deref()
+            .map(|plugin| npu_backend(plugin, self.npu_in_process))
+            .transpose()
+    }
+}
+
+/// A MiB count from the command line in bytes, saturating rather than
+/// wrapping on an absurd value.
+fn mib_to_bytes(mib: u64) -> u64 {
+    mib.saturating_mul(1024 * 1024)
+}
+
 /// An mmap-based LLM inference engine — a Rust clone of Cactus.
 #[derive(Parser)]
 #[command(name = "joshua", version, about, long_about = None)]
@@ -333,87 +605,8 @@ enum Commands {
         /// unauthenticated.
         #[arg(short, long, default_value = "127.0.0.1:8080")]
         addr: String,
-        /// Context window size in tokens (prompt + generated), fixed at load:
-        /// it sizes the KV cache and RoPE tables.  A request may ask for a
-        /// smaller window with `context_window` (or `num_ctx`), never a
-        /// larger one.
-        #[arg(long, env = "JOSHUA_N_CTX", default_value_t = 4096)]
-        n_ctx: u32,
-        /// Compute backend: auto, cpu, metal, or cuda.  An explicit GPU
-        /// request fails the load when the backend is not built in or is
-        /// unavailable at runtime.
-        #[arg(long, env = "JOSHUA_DEVICE", value_enum, default_value_t = DeviceArg::Auto)]
-        device: DeviceArg,
-        /// Physical-memory backing for the model: off, transparent, huge,
-        /// 2mb, or 1gb (Linux only for the huge-page modes).  Defaults to
-        /// transparent on Linux (best-effort 2 MiB pages), off elsewhere.
-        #[arg(long, value_enum, default_value_t = default_huge_pages())]
-        huge_pages: HugePagesArg,
-        /// Require the model to be memory-mappable: a compressed model file
-        /// (a gzip/zstd/... stream, or one the filesystem stores compressed)
-        /// becomes a load error instead of a warning.
-        #[arg(long, default_value_t = false)]
-        mmap: bool,
-        /// Optimise the mapping for a model far larger than RAM: no readahead,
-        /// so pages fault in only as weights are genuinely touched.
-        #[arg(long, env = "JOSHUA_LAZY_WEIGHTS", default_value_t = false)]
-        lazy_weights: bool,
-        /// Prefetch the whole model file into the OS page cache at load
-        /// (MADV_WILLNEED), so a model that fits in RAM is fully resident
-        /// before the first request and inference never re-reads weights from
-        /// disk.  Defaults to on when the model file fits in RAM; pass
-        /// `--prefetch-model=false` to force it off.
-        #[arg(long, env = "JOSHUA_PREFETCH_MODEL", num_args = 0..=1, default_missing_value = "true")]
-        prefetch_model: Option<bool>,
-        /// Prefetch the always-touched weights (embeddings, norms, attention,
-        /// routers, shared experts, output) at load and advise random access
-        /// on routed experts, so the per-token working set stays resident.
-        /// Defaults to on when the model file is larger than RAM; pass
-        /// `--pin-hot-weights=false` to force it off.
-        #[arg(long, env = "JOSHUA_PIN_HOT_WEIGHTS", num_args = 0..=1, default_missing_value = "true")]
-        pin_hot_weights: Option<bool>,
-        /// Keep the N most frequently routed experts resident (routing-
-        /// frequency LRU; recency as the tie-break).  0 disables.  Wired for
-        /// the joshua-native MoE loaders (deepseek2, deepseek4, qwen3moe).
-        #[arg(long, env = "JOSHUA_PIN_HOT_EXPERTS", default_value_t = 0)]
-        pin_hot_experts: usize,
-        /// Size the hot-expert cache automatically at load (`auto`), or set a
-        /// fixed expert count.  Overrides --pin-hot-experts when given a count.
-        #[arg(long, env = "JOSHUA_EXPERT_CACHE", value_parser = clap::value_parser!(ExpertCacheArg))]
-        expert_cache: Option<ExpertCacheArg>,
-        /// Size the bounded VRAM expert cache (#62): upload a hot subset of the
-        /// routed experts to the accelerator.  `auto` derives the device byte
-        /// budget at load (device free − dense − headroom − KV); a number is a
-        /// fixed MiB budget; `0` disables (all experts stay on the host).
-        /// Unset (the default), `--expert-placement auto` engages the cache
-        /// itself where the leftover device memory is worth it (#110).
-        #[arg(long, env = "JOSHUA_VRAM_EXPERT_CACHE", value_parser = clap::value_parser!(VramExpertCacheArg))]
-        vram_expert_cache: Option<VramExpertCacheArg>,
-        /// Size the Tier-3 NVMe/SSD expert staging slab (`--ssd-expert-cache`):
-        /// a bounded host-RAM slab that `pread(2)`-streams a hot subset of the
-        /// routed experts off the SSD (see `NvmeResidency`).  `auto` derives the
-        /// host-RAM byte budget from the machine's available RAM at load; a
-        /// number is a fixed MiB budget; `0` disables (experts keep their
-        /// ordinary host page-cache residency).
-        #[arg(long, env = "JOSHUA_SSD_EXPERT_CACHE", value_parser = clap::value_parser!(SsdExpertCacheArg))]
-        ssd_expert_cache: Option<SsdExpertCacheArg>,
-        /// Tokens per prefill chunk (default 512).  Bounds the per-layer
-        /// prefill workspace and sets how many prompt rows each routed expert
-        /// sees per matmul; the joshua-native MoE loaders read each layer's
-        /// weights once per prefill whatever the chunk.
-        #[arg(
-            long,
-            env = "JOSHUA_PREFILL_CHUNK",
-            default_value_t = 0,
-            hide_default_value = true
-        )]
-        prefill_chunk: usize,
-        /// Target wall time for one prefill chunk, in milliseconds.  When
-        /// non-zero, architectures that prefill chunk by chunk choose each
-        /// chunk from an online cost model; `--prefill-chunk` is the ceiling.
-        /// 0 (the default) keeps the fixed chunk size.
-        #[arg(long, env = "JOSHUA_PREFILL_BUDGET_MS", default_value_t = 0, hide_default_value = true)]
-        prefill_budget_ms: u64,
+        #[command(flatten)]
+        load: ModelLoadArgs,
         /// Prefix checkpoints kept per session of a model with recurrent
         /// layers (Qwen3-Next, Qwen3.5, Qwen3.8-Flash-Next, Kimi-Linear):
         /// copies of the running state at each prompt boundary, so an edited
@@ -441,91 +634,6 @@ enum Commands {
         /// one message later.
         #[arg(long, env = "JOSHUA_ENV_TO_USER")]
         env_to_user: bool,
-        /// Speculative token generation: draft up to N tokens per step by
-        /// prompt lookup (the continuation of the latest earlier occurrence
-        /// of the output's trailing n-gram) and verify them in one forward
-        /// pass.  Output is unchanged; repetitive output (code edits, quoted
-        /// context, tool-call arguments) decodes in fewer weight sweeps.
-        /// `0` (the default) disables it.  Applies to the loaders that can
-        /// score every position and roll their KV cache back: the plain-
-        /// attention qwen family (qwen, qwen2moe, qwen2vl, qwen3, qwen3moe,
-        /// qwen3vl, qwen3vlmoe, chatglm, glm4, glm4moe), the deepseek2 family
-        /// (deepseek, deepseek2, glm-dsa — incl. V3 / Kimi-K2 / GLM-5), and
-        /// deepseek4 / deepseek41.  Models with recurrent DeltaNet or KDA
-        /// layers (qwen3next, qwen3.5, qwen4exp, glm5next, kimi-linear,
-        /// kimi-k3) and candle's stock loaders cannot roll their KV cache
-        /// back; there the flag is ignored with a warning.
-        #[arg(
-            long,
-            env = "JOSHUA_SPECULATIVE",
-            default_value_t = 0,
-            hide_default_value = true
-        )]
-        speculative: usize,
-        /// MTP drafting: draft up to N tokens per step (at most 7) with the
-        /// model's own NextN / MTP block, which GLM-4.5+ and Qwen3.5/3.6
-        /// GGUFs carry, and verify them in one forward pass.  Output is
-        /// unchanged.  Replaces --speculative's prompt lookup on a model with
-        /// the block and is ignored with a warning on one without.  Every
-        /// forward pass also runs through the block (one more layer).  `0`
-        /// (the default) disables it and skips loading the block.
-        #[arg(long, env = "JOSHUA_MTP", default_value_t = 0, hide_default_value = true)]
-        mtp: usize,
-        /// Draft-model speculative decoding: a small GGUF that shares this
-        /// model's tokenizer (e.g. Qwen3-0.6B for a Qwen3 MoE) drafts up to
-        /// --draft-max tokens per step, verified in one forward pass of this
-        /// model.  Greedy output is unchanged; sampled output is verified
-        /// against the draft's own distribution, so it is distributed as
-        /// plain sampling.  The draft must be an attention-only model of a
-        /// joshua-native loader (qwen3, qwen3moe, glm4, deepseek2, …) and
-        /// runs on the dense device.  Takes the place of --speculative's
-        /// prompt lookup and of --mtp.
-        #[arg(long, env = "JOSHUA_DRAFT_MODEL")]
-        draft_model: Option<PathBuf>,
-        /// Most draft-model tokens per step (default 4).
-        #[arg(long, env = "JOSHUA_DRAFT_MAX", default_value_t = 0, hide_default_value = true)]
-        draft_max: usize,
-        /// Lock the always-touched weights into RAM (mlock).  Needs the
-        /// process memlock limit to cover the hot set: `LimitMEMLOCK=infinity`
-        /// (systemd), `ulimit -l unlimited`, or /etc/security/limits.conf.
-        /// On a systemd *user* session the hard limit is inherited from the
-        /// login session, so a unit's LimitMEMLOCK alone is silently capped —
-        /// apply `sudo prlimit --pid <user manager pid> --memlock=-1:-1` for a
-        /// live fix, or re-login.  `=required` fails the load instead of
-        /// degrading when the limit is too low; the limit is checked before
-        /// any mlock attempt, with one warning naming limit vs required size.
-        #[arg(long, env = "JOSHUA_MLOCK_HOT_WEIGHTS", num_args = 0..=1, default_missing_value = "on", value_enum)]
-        mlock_hot_weights: Option<MlockArg>,
-        /// Cap locked weight pages in MiB when the full dense set exceeds
-        /// RAM. Requires --mlock-hot-weights; skips untied input embeddings
-        /// and routed experts. Leave RAM for KV state and disk staging.
-        #[arg(long, value_name = "MiB", requires = "mlock_hot_weights",
-            value_parser = clap::value_parser!(u64).range(1..=u64::MAX / (1024 * 1024)))]
-        mlock_weight_budget: Option<u64>,
-        /// Where a MoE model's routed experts live on a GPU: `device` uploads
-        /// them (the whole model must fit), `host` keeps them in RAM borrowed
-        /// from the mapping with only the dense set on the GPU (runs models
-        /// larger than VRAM), `auto` picks `device` only when the model fits
-        /// the GPU's free memory with headroom.  Ignored on the CPU.  When
-        /// `auto` falls back to `host` on an architecture that can run routed
-        /// experts from a bounded VRAM cache (deepseek4 on OpenCL/SYCL), that
-        /// cache is engaged by default where the leftover device memory is
-        /// worth it (#110); `--vram-expert-cache 0` opts out.
-        #[arg(long, env = "JOSHUA_EXPERT_PLACEMENT", default_value = "auto", value_parser = clap::value_parser!(ExpertPlacement))]
-        expert_placement: ExpertPlacement,
-        /// GPU memory the model may use, in MiB.  Overrides the probe for the
-        /// `--expert-placement auto` decision and the per-GPU session cap;
-        /// the way to state the budget on backends without a probe (Metal,
-        /// OpenCL) or when sharing the card.
-        #[arg(long, env = "JOSHUA_VRAM_BUDGET")]
-        vram_budget: Option<u64>,
-        /// NPU vendor plugin (a cdylib exporting the joshua_npu_* ABI).
-        #[arg(long, env = "JOSHUA_NPU_PLUGIN")]
-        npu_plugin: Option<PathBuf>,
-        /// Load the NPU plugin in-process instead of the isolated shim
-        /// (lower overhead; a plugin crash takes the server down).
-        #[arg(long, default_value_t = false)]
-        npu_in_process: bool,
         /// Whisper model directory to mount at /v1/audio/transcriptions.
         #[arg(long, env = "JOSHUA_WHISPER_MODEL")]
         whisper_model: Option<PathBuf>,
@@ -598,28 +706,6 @@ enum Commands {
         /// PEM private key for --tls-cert.
         #[arg(long, env = "JOSHUA_TLS_KEY", requires = "tls_cert")]
         tls_key: Option<PathBuf>,
-        /// Where a DeepSeek-V4.1 model's Engram n-gram tables are resident
-        /// (a separate policy from the routed experts): `auto` resolves them
-        /// straight from the mmap mapping (disk-pinned) and promotes a working
-        /// subset into RAM only when free RAM is ample (>~192 GiB), `ram`
-        /// always promotes the working subset into RAM, `disk` always pins
-        /// them to storage.  The tables never consume a Tier-1 VRAM or Tier-2
-        /// host-slot budget under any tier.
-        #[arg(long, env = "JOSHUA_ENGRAM_TIER", default_value = "auto", value_parser = clap::value_parser!(EngramTier))]
-        engram_tier: EngramTier,
-        /// Where the dense set (embeddings, norms, attention, routers, shared
-        /// experts, output) runs on a GPU: `device` offloads it (right for a
-        /// real GPU whose GEMM beats CPU-BLAS), `cpu` keeps it on CPU-BLAS
-        /// (right when the accelerator is a weak iGPU / software OpenCL-Vulkan
-        /// path that is slower than the CPU), `auto` runs a quick startup probe
-        /// and picks by measured throughput.  Ignored on the CPU.
-        #[arg(long, env = "JOSHUA_DENSE_PLACEMENT", default_value = "auto", value_parser = clap::value_parser!(DensePlacement))]
-        dense_placement: DensePlacement,
-        /// Skip the `--dense auto` startup probe (fast launch).  `auto` then keeps
-        /// its historical on-device default, still gated on the dense set fitting
-        /// the device memory budget (#176).
-        #[arg(long, env = "JOSHUA_SKIP_PLACEMENT_BENCH", num_args = 0..=1, default_missing_value = "true")]
-        skip_placement_bench: bool,
     },
     /// Route whole requests across independent `joshua serve` workers.
     ///
@@ -704,188 +790,8 @@ enum Commands {
         /// DeepSeek-V3.1, …).
         #[arg(long)]
         enable_thinking: Option<bool>,
-        /// Context window size in tokens (prompt + generated).
-        #[arg(long, env = "JOSHUA_N_CTX", default_value_t = 4096)]
-        n_ctx: u32,
-        /// Compute backend: auto, cpu, metal, or cuda.  An explicit GPU
-        /// request fails the load when the backend is not built in or is
-        /// unavailable at runtime.
-        #[arg(long, env = "JOSHUA_DEVICE", value_enum, default_value_t = DeviceArg::Auto)]
-        device: DeviceArg,
-        /// Physical-memory backing for the model: off, transparent, huge,
-        /// 2mb, or 1gb (Linux only for the huge-page modes).  Defaults to
-        /// transparent on Linux (best-effort 2 MiB pages), off elsewhere.
-        #[arg(long, value_enum, default_value_t = default_huge_pages())]
-        huge_pages: HugePagesArg,
-        /// Require the model to be memory-mappable: a compressed model file
-        /// (a gzip/zstd/... stream, or one the filesystem stores compressed)
-        /// becomes a load error instead of a warning.
-        #[arg(long, default_value_t = false)]
-        mmap: bool,
-        /// Optimise the mapping for a model far larger than RAM: no readahead,
-        /// so pages fault in only as weights are genuinely touched.
-        #[arg(long, env = "JOSHUA_LAZY_WEIGHTS", default_value_t = false)]
-        lazy_weights: bool,
-        /// Prefetch the whole model file into the OS page cache at load
-        /// (MADV_WILLNEED), so a model that fits in RAM is fully resident
-        /// before the first request.  Defaults to on when the model file fits
-        /// in RAM; pass `--prefetch-model=false` to force it off.
-        #[arg(long, env = "JOSHUA_PREFETCH_MODEL", num_args = 0..=1, default_missing_value = "true")]
-        prefetch_model: Option<bool>,
-        /// Prefetch the always-touched weights at load and advise random
-        /// access on routed experts.  Defaults to on when the model file is
-        /// larger than RAM; pass `--pin-hot-weights=false` to force it off.
-        #[arg(long, env = "JOSHUA_PIN_HOT_WEIGHTS", num_args = 0..=1, default_missing_value = "true")]
-        pin_hot_weights: Option<bool>,
-        /// Keep the N most frequently routed experts resident (routing-
-        /// frequency LRU; recency as the tie-break).  0 disables.  Wired for
-        /// the joshua-native MoE loaders (deepseek2, deepseek4, qwen3moe).
-        #[arg(long, env = "JOSHUA_PIN_HOT_EXPERTS", default_value_t = 0)]
-        pin_hot_experts: usize,
-        /// Size the hot-expert cache automatically at load (`auto`), or set a
-        /// fixed expert count.  Overrides --pin-hot-experts when given a count.
-        #[arg(long, env = "JOSHUA_EXPERT_CACHE", value_parser = clap::value_parser!(ExpertCacheArg))]
-        expert_cache: Option<ExpertCacheArg>,
-        /// Size the bounded VRAM expert cache (#62): upload a hot subset of the
-        /// routed experts to the accelerator.  `auto` derives the device byte
-        /// budget at load (device free − dense − headroom − KV); a number is a
-        /// fixed MiB budget; `0` disables (all experts stay on the host).
-        /// Unset (the default), `--expert-placement auto` engages the cache
-        /// itself where the leftover device memory is worth it (#110).
-        #[arg(long, env = "JOSHUA_VRAM_EXPERT_CACHE", value_parser = clap::value_parser!(VramExpertCacheArg))]
-        vram_expert_cache: Option<VramExpertCacheArg>,
-        /// Size the Tier-3 NVMe/SSD expert staging slab (`--ssd-expert-cache`):
-        /// a bounded host-RAM slab that `pread(2)`-streams a hot subset of the
-        /// routed experts off the SSD (see `NvmeResidency`).  `auto` derives the
-        /// host-RAM byte budget from the machine's available RAM at load; a
-        /// number is a fixed MiB budget; `0` disables (experts keep their
-        /// ordinary host page-cache residency).
-        #[arg(long, env = "JOSHUA_SSD_EXPERT_CACHE", value_parser = clap::value_parser!(SsdExpertCacheArg))]
-        ssd_expert_cache: Option<SsdExpertCacheArg>,
-        /// Tokens per prefill chunk (default 512).  Bounds the per-layer
-        /// prefill workspace and sets how many prompt rows each routed expert
-        /// sees per matmul; the joshua-native MoE loaders read each layer's
-        /// weights once per prefill whatever the chunk.
-        #[arg(
-            long,
-            env = "JOSHUA_PREFILL_CHUNK",
-            default_value_t = 0,
-            hide_default_value = true
-        )]
-        prefill_chunk: usize,
-        /// Target wall time for one prefill chunk, in milliseconds.  When
-        /// non-zero, architectures that prefill chunk by chunk choose each
-        /// chunk from an online cost model; `--prefill-chunk` is the ceiling.
-        /// 0 (the default) keeps the fixed chunk size.
-        #[arg(long, env = "JOSHUA_PREFILL_BUDGET_MS", default_value_t = 0, hide_default_value = true)]
-        prefill_budget_ms: u64,
-        /// Speculative token generation: draft up to N tokens per step by
-        /// prompt lookup (the continuation of the latest earlier occurrence
-        /// of the output's trailing n-gram) and verify them in one forward
-        /// pass.  Output is unchanged; repetitive output (code edits, quoted
-        /// context, tool-call arguments) decodes in fewer weight sweeps.
-        /// `0` (the default) disables it.  Applies to the loaders that can
-        /// score every position and roll their KV cache back: the plain-
-        /// attention qwen family (qwen, qwen2moe, qwen2vl, qwen3, qwen3moe,
-        /// qwen3vl, qwen3vlmoe, chatglm, glm4, glm4moe), the deepseek2 family
-        /// (deepseek, deepseek2, glm-dsa — incl. V3 / Kimi-K2 / GLM-5), and
-        /// deepseek4 / deepseek41.  Models with recurrent DeltaNet or KDA
-        /// layers (qwen3next, qwen3.5, qwen4exp, glm5next, kimi-linear,
-        /// kimi-k3) and candle's stock loaders cannot roll their KV cache
-        /// back; there the flag is ignored with a warning.
-        #[arg(
-            long,
-            env = "JOSHUA_SPECULATIVE",
-            default_value_t = 0,
-            hide_default_value = true
-        )]
-        speculative: usize,
-        /// MTP drafting: draft up to N tokens per step (at most 7) with the
-        /// model's own NextN / MTP block, which GLM-4.5+ and Qwen3.5/3.6
-        /// GGUFs carry, and verify them in one forward pass.  Output is
-        /// unchanged.  Replaces --speculative's prompt lookup on a model with
-        /// the block and is ignored with a warning on one without.  Every
-        /// forward pass also runs through the block (one more layer).  `0`
-        /// (the default) disables it and skips loading the block.
-        #[arg(long, env = "JOSHUA_MTP", default_value_t = 0, hide_default_value = true)]
-        mtp: usize,
-        /// Draft-model speculative decoding: a small GGUF that shares this
-        /// model's tokenizer (e.g. Qwen3-0.6B for a Qwen3 MoE) drafts up to
-        /// --draft-max tokens per step, verified in one forward pass of this
-        /// model.  Greedy output is unchanged; sampled output is verified
-        /// against the draft's own distribution, so it is distributed as
-        /// plain sampling.  The draft must be an attention-only model of a
-        /// joshua-native loader (qwen3, qwen3moe, glm4, deepseek2, …) and
-        /// runs on the dense device.  Takes the place of --speculative's
-        /// prompt lookup and of --mtp.
-        #[arg(long, env = "JOSHUA_DRAFT_MODEL")]
-        draft_model: Option<PathBuf>,
-        /// Most draft-model tokens per step (default 4).
-        #[arg(long, env = "JOSHUA_DRAFT_MAX", default_value_t = 0, hide_default_value = true)]
-        draft_max: usize,
-        /// Lock the always-touched weights into RAM (mlock).  Needs the
-        /// process memlock limit to cover the hot set: `LimitMEMLOCK=infinity`
-        /// (systemd), `ulimit -l unlimited`, or /etc/security/limits.conf.
-        /// On a systemd *user* session the hard limit is inherited from the
-        /// login session, so a unit's LimitMEMLOCK alone is silently capped —
-        /// apply `sudo prlimit --pid <user manager pid> --memlock=-1:-1` for a
-        /// live fix, or re-login.  `=required` fails the load instead of
-        /// degrading when the limit is too low; the limit is checked before
-        /// any mlock attempt, with one warning naming limit vs required size.
-        #[arg(long, env = "JOSHUA_MLOCK_HOT_WEIGHTS", num_args = 0..=1, default_missing_value = "on", value_enum)]
-        mlock_hot_weights: Option<MlockArg>,
-        /// Cap locked weight pages in MiB when the full dense set exceeds
-        /// RAM. Requires --mlock-hot-weights; skips untied input embeddings
-        /// and routed experts. Leave RAM for KV state and disk staging.
-        #[arg(long, value_name = "MiB", requires = "mlock_hot_weights",
-            value_parser = clap::value_parser!(u64).range(1..=u64::MAX / (1024 * 1024)))]
-        mlock_weight_budget: Option<u64>,
-        /// Where a MoE model's routed experts live on a GPU: `device` uploads
-        /// them (the whole model must fit), `host` keeps them in RAM borrowed
-        /// from the mapping with only the dense set on the GPU (runs models
-        /// larger than VRAM), `auto` picks `device` only when the model fits
-        /// the GPU's free memory with headroom.  Ignored on the CPU.  When
-        /// `auto` falls back to `host` on an architecture that can run routed
-        /// experts from a bounded VRAM cache (deepseek4 on OpenCL/SYCL), that
-        /// cache is engaged by default where the leftover device memory is
-        /// worth it (#110); `--vram-expert-cache 0` opts out.
-        #[arg(long, env = "JOSHUA_EXPERT_PLACEMENT", default_value = "auto", value_parser = clap::value_parser!(ExpertPlacement))]
-        expert_placement: ExpertPlacement,
-        /// GPU memory the model may use, in MiB.  Overrides the probe for the
-        /// `--expert-placement auto` decision and the per-GPU session cap;
-        /// the way to state the budget on backends without a probe (Metal,
-        /// OpenCL) or when sharing the card.
-        #[arg(long, env = "JOSHUA_VRAM_BUDGET")]
-        vram_budget: Option<u64>,
-        /// NPU vendor plugin (a cdylib exporting the joshua_npu_* ABI).
-        #[arg(long, env = "JOSHUA_NPU_PLUGIN")]
-        npu_plugin: Option<PathBuf>,
-        /// Load the NPU plugin in-process instead of the isolated shim
-        /// (lower overhead; a plugin crash takes the server down).
-        #[arg(long, default_value_t = false)]
-        npu_in_process: bool,
-        /// Where a DeepSeek-V4.1 model's Engram n-gram tables are resident
-        /// (a separate policy from the routed experts): `auto` resolves them
-        /// straight from the mmap mapping (disk-pinned) and promotes a working
-        /// subset into RAM only when free RAM is ample (>~192 GiB), `ram`
-        /// always promotes the working subset into RAM, `disk` always pins
-        /// them to storage.  The tables never consume a Tier-1 VRAM or Tier-2
-        /// host-slot budget under any tier.
-        #[arg(long, env = "JOSHUA_ENGRAM_TIER", default_value = "auto", value_parser = clap::value_parser!(EngramTier))]
-        engram_tier: EngramTier,
-        /// Where the dense set (embeddings, norms, attention, routers, shared
-        /// experts, output) runs on a GPU: `device` offloads it (right for a
-        /// real GPU whose GEMM beats CPU-BLAS), `cpu` keeps it on CPU-BLAS
-        /// (right when the accelerator is a weak iGPU / software OpenCL-Vulkan
-        /// path that is slower than the CPU), `auto` runs a quick startup probe
-        /// and picks by measured throughput.  Ignored on the CPU.
-        #[arg(long, env = "JOSHUA_DENSE_PLACEMENT", default_value = "auto", value_parser = clap::value_parser!(DensePlacement))]
-        dense_placement: DensePlacement,
-        /// Skip the `--dense auto` startup probe (fast launch).  `auto` then keeps
-        /// its historical on-device default, still gated on the dense set fitting
-        /// the device memory budget (#176).
-        #[arg(long, env = "JOSHUA_SKIP_PLACEMENT_BENCH", num_args = 0..=1, default_missing_value = "true")]
-        skip_placement_bench: bool,
+        #[command(flatten)]
+        load: ModelLoadArgs,
     },
     /// Run a repeatable generation benchmark and print throughput.
     Bench {
@@ -905,12 +811,8 @@ enum Commands {
         /// Sampler seed.
         #[arg(long)]
         seed: Option<u64>,
-        /// Context window in tokens.
-        #[arg(long, env = "JOSHUA_N_CTX", default_value_t = 4096)]
-        n_ctx: u32,
-        /// Compute backend: auto, cpu, metal, or cuda.
-        #[arg(long, env = "JOSHUA_DEVICE", value_enum, default_value_t = DeviceArg::Auto)]
-        device: DeviceArg,
+        #[command(flatten)]
+        load: ModelLoadArgs,
         /// Prompt to run; repeat for several.  Defaults to a small built-in
         /// mix of prose and code.
         #[arg(long = "prompt")]
@@ -929,9 +831,8 @@ enum Commands {
         /// UTF-8 text file to score.  `-` reads standard input.
         #[arg(short, long)]
         file: PathBuf,
-        /// Context window in tokens.
-        #[arg(long, env = "JOSHUA_N_CTX", default_value_t = 4096)]
-        n_ctx: u32,
+        #[command(flatten)]
+        load: ModelLoadArgs,
         /// Tokens per scored window (defaults to the context window).
         #[arg(long)]
         window: Option<usize>,
@@ -941,9 +842,6 @@ enum Commands {
         /// Wrap the text with the tokenizer's BOS/EOS special tokens.
         #[arg(long)]
         bos: bool,
-        /// Compute backend: auto, cpu, metal, or cuda.
-        #[arg(long, env = "JOSHUA_DEVICE", value_enum, default_value_t = DeviceArg::Auto)]
-        device: DeviceArg,
         /// Emit one JSON object instead of text.
         #[arg(long)]
         json: bool,
@@ -1026,36 +924,11 @@ async fn main() -> anyhow::Result<()> {
             #[cfg(feature = "distributed")]
             workers,
             addr,
-            n_ctx,
-            device,
-            huge_pages,
-            mmap,
-            lazy_weights,
-            prefetch_model,
-            pin_hot_weights,
-            pin_hot_experts,
-            expert_cache,
-            vram_expert_cache,
-            ssd_expert_cache,
-            prefill_chunk,
-            prefill_budget_ms,
+            load,
             prefix_checkpoints,
             prefix_cache_mib,
             prefix_cache_root_min,
             env_to_user,
-            speculative,
-            mtp,
-            draft_model,
-            draft_max,
-            mlock_hot_weights,
-            mlock_weight_budget,
-            expert_placement,
-            dense_placement,
-            engram_tier,
-            skip_placement_bench,
-            vram_budget,
-            npu_plugin,
-            npu_in_process,
             whisper_model,
             max_concurrency,
             queue_timeout_ms,
@@ -1071,9 +944,6 @@ async fn main() -> anyhow::Result<()> {
             tls_cert,
             tls_key,
         } => {
-            if skip_placement_bench {
-                std::env::set_var("JOSHUA_SKIP_PLACEMENT_BENCH", "1");
-            }
             // Fail fast, before the (potentially slow) model load, when TLS
             // flags are passed to a build compiled without TLS support.
             #[cfg(not(feature = "tls"))]
@@ -1083,70 +953,23 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
 
-            let (auto_pin, auto_prefetch) = model.as_deref().map_or((false, false), cache_plan);
-            let pin_hot = pin_hot_weights.unwrap_or(auto_pin);
-            let prefetch = prefetch_model.unwrap_or(auto_prefetch);
-            let (pin_hot_experts, expert_cache_auto) = match expert_cache {
-                Some(ExpertCacheArg::Auto) => (pin_hot_experts, true),
-                Some(ExpertCacheArg::Count(n)) => (n, false),
-                None => (pin_hot_experts, false),
-            };
-            let vram_cache: VramExpertCache = match vram_expert_cache {
-                Some(VramExpertCacheArg::Auto) => VramExpertCache::Auto, // engine sizes at load
-                Some(VramExpertCacheArg::MiB(n)) => {
-                    VramExpertCache::Bytes((n as u64).saturating_mul(1024 * 1024))
-                }
-                None => VramExpertCache::Unset, // the engine may engage a partial cache (#110)
-            };
-            let ssd_cache: SsdExpertCache = match ssd_expert_cache {
-                Some(SsdExpertCacheArg::Auto) => SsdExpertCache::Auto, // engine sizes at load
-                Some(SsdExpertCacheArg::MiB(n)) => {
-                    SsdExpertCache::Bytes((n as u64).saturating_mul(1024 * 1024))
-                }
-                None => SsdExpertCache::Unset, // the engine decides
-            };
-            let opts = EngineOptions::with_n_ctx(n_ctx)
-                .backend(device.into())
-                .huge_pages(huge_pages.into())
-                .mmap(mmap_mode(mmap))
-                .lazy_weights(lazy_weights)
-                .prefetch_whole_model(prefetch)
-                .pin_hot_weights(pin_hot)
-                .pin_hot_experts(pin_hot_experts)
-                .expert_cache_auto(expert_cache_auto)
-                .vram_expert_cache(vram_cache)
-                .ssd_expert_cache(ssd_cache)
-                .prefill_chunk(prefill_chunk)
-                .prefill_budget_ms(prefill_budget_ms)
+            // One backend serves the startup model and any loaded later.
+            let npu = load.npu_backend()?;
+            let (model, model_dir) = serve_targets(model, model_dir)?;
+            // Sized from the startup *file*, which `serve_targets` resolves
+            // from a directory `--model`; later loads re-plan per model.
+            let opts = load
+                .engine_options(model.as_deref())
                 .queue_timeout_ms(queue_timeout_ms)
                 .admission_queue_depth(admission_queue_depth)
                 .prefix_checkpoints_opt(prefix_checkpoints)
                 .prefix_cache_mib_opt(prefix_cache_mib)
                 .prefix_cache_root_min_opt(prefix_cache_root_min)
                 .env_to_user(env_to_user)
-                .speculative(speculative_config(speculative))
-                .mtp(mtp)
-                .draft_model(draft_model)
-                .draft_max(draft_max)
-                .mlock_hot_weights(
-                    mlock_hot_weights
-                        .map(MlockMode::from)
-                        .unwrap_or(MlockMode::Off),
-                )
-                .mlock_weight_budget(mlock_weight_budget.map(|mib| mib * 1024 * 1024))
-                .expert_placement(expert_placement)
-                .dense_placement(dense_placement)
-                .engram_tier(engram_tier)
-                .device_memory_budget(vram_budget.map(|mib| mib.saturating_mul(1024 * 1024)))
                 .sampling(sampling.overrides())
                 .chat_template(chat_template_source(chat_template, chat_template_file)?)
                 .trust_request_chat_template(trust_request_chat_template)
                 .tool_call_parser(tool_call_parser);
-            // One backend serves the startup model and any loaded later.
-            let npu = npu_plugin
-                .map(|plugin| npu_backend(&plugin, npu_in_process))
-                .transpose()?;
-            let (model, model_dir) = serve_targets(model, model_dir)?;
             if let Some(dir) = &model_dir {
                 tracing::info!(
                     dir = %dir.display(),
@@ -1179,10 +1002,7 @@ async fn main() -> anyhow::Result<()> {
                     // Size-based cache defaults are per model; explicit
                     // flags still win.
                     engine_options: Arc::new(move |path: &Path| {
-                        let (auto_pin, auto_prefetch) = cache_plan(path);
-                        opts.clone()
-                            .pin_hot_weights(pin_hot_weights.unwrap_or(auto_pin))
-                            .prefetch_whole_model(prefetch_model.unwrap_or(auto_prefetch))
+                        load.with_cache_plan(opts.clone(), Some(path))
                     }),
                     npu_backend: npu,
                     max_concurrency,
@@ -1300,8 +1120,7 @@ async fn main() -> anyhow::Result<()> {
             runs,
             temperature,
             seed,
-            n_ctx,
-            device,
+            load,
             prompts,
             json,
         } => {
@@ -1310,8 +1129,7 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 prompts
             };
-            let opts = EngineOptions::with_n_ctx(n_ctx).backend(device.into());
-            let engine = Engine::with_options(&model, opts)?;
+            let engine = load_engine(&model, &load)?;
             let runs = runs.max(1);
             let started = std::time::Instant::now();
             let mut rows = Vec::new();
@@ -1422,11 +1240,10 @@ async fn main() -> anyhow::Result<()> {
         Commands::Ppl {
             model,
             file,
-            n_ctx,
+            load,
             window,
             limit,
             bos,
-            device,
             json,
         } => {
             let text = if file.as_os_str() == "-" {
@@ -1440,8 +1257,7 @@ async fn main() -> anyhow::Result<()> {
                 std::fs::read_to_string(&file)
                     .map_err(|e| anyhow::anyhow!("reading {}: {e}", file.display()))?
             };
-            let opts = EngineOptions::with_n_ctx(n_ctx).backend(device.into());
-            let engine = Engine::with_options(&model, opts)?;
+            let engine = load_engine(&model, &load)?;
             // The engine resolves 0 to its default context, so bound and default
             // the window from what it actually loaded — not from the raw flag,
             // where `--n-ctx 0` would invert `clamp`'s bounds and panic.
@@ -1583,93 +1399,13 @@ async fn main() -> anyhow::Result<()> {
             seed,
             reasoning_effort,
             enable_thinking,
-            n_ctx,
-            device,
-            huge_pages,
-            mmap,
-            lazy_weights,
-            prefetch_model,
-            pin_hot_weights,
-            pin_hot_experts,
-            expert_cache,
-            vram_expert_cache,
-            ssd_expert_cache,
-            prefill_chunk,
-            prefill_budget_ms,
-            speculative,
-            mtp,
-            draft_model,
-            draft_max,
-            mlock_hot_weights,
-            mlock_weight_budget,
-            expert_placement,
-            dense_placement,
-            engram_tier,
-            skip_placement_bench,
-            vram_budget,
-            npu_plugin,
-            npu_in_process,
+            load,
         } => {
             // Reject contradictory reasoning flags before loading the model.
             let chat_template_kwargs =
                 checked_reasoning_template_kwargs(reasoning_effort, enable_thinking, None)
                     .map_err(anyhow::Error::msg)?;
-            if skip_placement_bench {
-                std::env::set_var("JOSHUA_SKIP_PLACEMENT_BENCH", "1");
-            }
-            let (auto_pin, auto_prefetch) = cache_plan(&model);
-            let pin_hot = pin_hot_weights.unwrap_or(auto_pin);
-            let prefetch = prefetch_model.unwrap_or(auto_prefetch);
-            let (pin_hot_experts, expert_cache_auto) = match expert_cache {
-                Some(ExpertCacheArg::Auto) => (pin_hot_experts, true),
-                Some(ExpertCacheArg::Count(n)) => (n, false),
-                None => (pin_hot_experts, false),
-            };
-            let vram_cache: VramExpertCache = match vram_expert_cache {
-                Some(VramExpertCacheArg::Auto) => VramExpertCache::Auto, // engine sizes at load
-                Some(VramExpertCacheArg::MiB(n)) => {
-                    VramExpertCache::Bytes((n as u64).saturating_mul(1024 * 1024))
-                }
-                None => VramExpertCache::Unset, // the engine may engage a partial cache (#110)
-            };
-            let ssd_cache: SsdExpertCache = match ssd_expert_cache {
-                Some(SsdExpertCacheArg::Auto) => SsdExpertCache::Auto, // engine sizes at load
-                Some(SsdExpertCacheArg::MiB(n)) => {
-                    SsdExpertCache::Bytes((n as u64).saturating_mul(1024 * 1024))
-                }
-                None => SsdExpertCache::Unset, // the engine decides
-            };
-            let opts = EngineOptions::with_n_ctx(n_ctx)
-                .backend(device.into())
-                .huge_pages(huge_pages.into())
-                .mmap(mmap_mode(mmap))
-                .lazy_weights(lazy_weights)
-                .prefetch_whole_model(prefetch)
-                .pin_hot_weights(pin_hot)
-                .pin_hot_experts(pin_hot_experts)
-                .expert_cache_auto(expert_cache_auto)
-                .vram_expert_cache(vram_cache)
-                .ssd_expert_cache(ssd_cache)
-                .prefill_chunk(prefill_chunk)
-                .prefill_budget_ms(prefill_budget_ms)
-                .speculative(speculative_config(speculative))
-                .mtp(mtp)
-                .draft_model(draft_model)
-                .draft_max(draft_max)
-                .mlock_hot_weights(
-                    mlock_hot_weights
-                        .map(MlockMode::from)
-                        .unwrap_or(MlockMode::Off),
-                )
-                .mlock_weight_budget(mlock_weight_budget.map(|mib| mib * 1024 * 1024))
-                .expert_placement(expert_placement)
-                .dense_placement(dense_placement)
-                .engram_tier(engram_tier)
-                .device_memory_budget(vram_budget.map(|mib| mib.saturating_mul(1024 * 1024)));
-            let mut engine = Engine::with_options(&model, opts)?;
-            if let Some(plugin) = npu_plugin {
-                engine = engine.with_npu_backend(npu_backend(&plugin, npu_in_process)?);
-            }
+            let engine = load_engine(&model, &load)?;
             let messages = vec![ChatMessage::text("user".to_string(), prompt)];
             let options = GenerationOptions {
                 max_tokens,
@@ -1722,6 +1458,15 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Load `model` with the shared model-load flags, NPU plugin included.
+fn load_engine(model: &Path, load: &ModelLoadArgs) -> anyhow::Result<Engine> {
+    let mut engine = Engine::with_options(model, load.engine_options(Some(model)))?;
+    if let Some(backend) = load.npu_backend()? {
+        engine = engine.with_npu_backend(backend);
+    }
+    Ok(engine)
 }
 
 /// Translate the `--mmap` flag: passing it makes memory mapping an explicit
@@ -2107,6 +1852,36 @@ mod tests {
         }
 
         assert!(Cli::try_parse_from(["joshua", "report", "--json"]).is_ok());
+    }
+
+    #[test]
+    fn every_model_loading_command_takes_the_same_load_flags() {
+        let flags = [
+            "--n-ctx", "512", "--device", "cpu", "--expert-placement", "host",
+            "--dense-placement", "cpu", "--pin-hot-experts", "3", "--prefill-chunk", "64",
+        ];
+        let commands: [&[&str]; 4] = [
+            &["joshua", "serve", "--model", "m.gguf"],
+            &["joshua", "run", "--model", "m.gguf", "hi"],
+            &["joshua", "bench", "--model", "m.gguf"],
+            &["joshua", "ppl", "--model", "m.gguf", "--file", "t.txt"],
+        ];
+        for command in commands {
+            let cli = Cli::try_parse_from(command.iter().chain(&flags))
+                .unwrap_or_else(|e| panic!("{command:?}: {e}"));
+            let load = match cli.command {
+                Commands::Serve { load, .. }
+                | Commands::Run { load, .. }
+                | Commands::Bench { load, .. }
+                | Commands::Ppl { load, .. } => load,
+                _ => unreachable!(),
+            };
+            assert_eq!(load.n_ctx, 512, "{command:?}");
+            assert_eq!(load.pin_hot_experts, 3, "{command:?}");
+            assert_eq!(load.prefill_chunk, 64, "{command:?}");
+            let opts = load.engine_options(None);
+            assert_eq!(opts.n_ctx, 512, "{command:?}");
+        }
     }
 
     #[test]

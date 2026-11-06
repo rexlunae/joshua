@@ -3576,8 +3576,8 @@ pub fn write_nemotron_h_gguf(path: &Path, opts: NemotronTiny) {
     let ones = |n: usize| vec![1.0f32; n];
 
     let conv_dim = D_INNER + 2 * N_GROUP * D_STATE;
-    let d_in_proj = 2 * D_INNER + conv_dim + SSM_HEAD;
-    let head_dim = D_INNER / SSM_HEAD;
+    // `[z | xBC | dt]`: d_inner + conv_dim + n_head rows, as llama.cpp sizes it.
+    let d_in_proj = D_INNER + conv_dim + SSM_HEAD;
 
     let mut tensors: Vec<(String, QTensor)> = vec![
         (

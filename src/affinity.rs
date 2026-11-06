@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use axum::http::{header, HeaderMap};
+use axum::http::HeaderMap;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -55,16 +55,7 @@ pub(crate) fn digest(parts: &[&[u8]]) -> Scope {
 }
 
 pub(crate) fn owner(headers: &HeaderMap) -> &[u8] {
-    headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .or_else(|| {
-            headers
-                .get("x-api-key")
-                .and_then(|value| value.to_str().ok())
-        })
-        .map_or(&[], str::as_bytes)
+    crate::server::presented_api_key(headers).map_or(&[], str::as_bytes)
 }
 
 pub(crate) fn handle(headers: &HeaderMap) -> Result<Option<String>, &'static str> {
@@ -236,6 +227,7 @@ impl Directory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::header;
 
     #[test]
     fn directory_is_bounded_expires_and_invalidates_incarnations() {

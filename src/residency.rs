@@ -2259,8 +2259,6 @@ mod device_pool_tests {
 #[cfg(all(test, unix))]
 mod nvme_residency_tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Duration;
 
     /// A fake staged payload — the loader's `pread(2)`-streamed host-RAM form,
     /// `CountingPrefetch`-style so a stage is observable without real I/O.

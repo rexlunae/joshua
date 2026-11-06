@@ -99,7 +99,7 @@
 use std::fs::File;
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -221,15 +221,15 @@ pub enum MlockMode {
 /// Compute backend for the engine.
 ///
 /// [`ComputeBackend::Auto`] (the default) picks the best backend this build
-/// was compiled with — CUDA first when the `cuda` feature is on, then Metal
-/// when the `metal` feature is on, else CPU — and falls back to CPU with a
-/// warning when the compiled-in backend is unavailable at runtime.  An
-/// explicit [`ComputeBackend::Metal`] or [`ComputeBackend::Cuda`] request
-/// instead fails the load when the backend is not compiled in or cannot be
-/// initialised, so a wrong `--device` flag is never silently ignored.
+/// was compiled with, trying each compiled-in one in the order CUDA, Metal,
+/// OpenCL, Vulkan, SYCL and falling back to CPU with a warning when none is
+/// available at runtime.  An explicit GPU request instead fails the load
+/// when that backend is not compiled in or cannot be initialised, so a wrong
+/// `--device` flag is never silently ignored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ComputeBackend {
-    /// Best backend compiled in (CUDA > Metal > CPU), falling back to CPU.
+    /// Best backend compiled in (CUDA > Metal > OpenCL > Vulkan > SYCL),
+    /// falling back to CPU.
     #[default]
     Auto,
     /// CPU inference (always available).
@@ -1249,6 +1249,8 @@ struct InFlightGuard<'a> {
 }
 
 impl<'a> InFlightGuard<'a> {
+    /// [`Self::acquire_with`] at the default queue depth, uncancellable.
+    #[cfg(test)]
     fn acquire(gate: &'a AdmissionGate, max: usize, wait: Duration) -> Result<Self> {
         Self::acquire_with(gate, max, DEFAULT_ADMISSION_QUEUE_DEPTH, wait, None)
     }
@@ -1442,27 +1444,6 @@ impl GenSession {
         Ok(Some(
             squeeze_batch_logits(&logits).map_err(|e| JoshuaError::Inference(e.to_string()))?,
         ))
-    }
-
-    /// Feed one decode step across `seqs` **independent** sequences at their
-    /// own positions, returning one logits vector per sequence.  The MoE
-    /// dispatch for the batch is shared, so the routed-expert fetch is
-    /// amortized across the sequences (see
-    /// `quantized_deepseek4::ModelWeights::forward_sequences`).  Only the
-    /// candle deepseek4 model implements this; anything else reports an
-    /// unsupported error so callers can fall back to per-sequence steps.
-    fn forward_tokens_batched(
-        &mut self,
-        seqs: &[(&Tensor, usize)],
-    ) -> Result<Vec<Vec<f32>>, JoshuaError> {
-        match self {
-            Self::Candle(model) => model
-                .forward_sequences(seqs)
-                .map_err(|e| JoshuaError::Inference(e.to_string())),
-            Self::Npu(_) => Err(JoshuaError::Inference(
-                "batched forward is not supported on the NPU session".into(),
-            )),
-        }
     }
 
     /// Clear internal state for reuse with an unrelated prompt.
@@ -3295,7 +3276,7 @@ impl Engine {
     fn log_sycl_device(device: &Device) {
         if let Ok(sycl) = device.as_sycl_device() {
             tracing::info!(
-                "SYCL device: {} ({}; native kernels {})",
+                "SYCL device: {} ({}; native kernels {}; bridge {})",
                 sycl.name(),
                 if sycl.host_unified_memory() {
                     "host-unified memory"
@@ -3307,6 +3288,16 @@ impl Engine {
                 } else {
                     "off"
                 },
+                candle_core::sycl_backend::bridge_library_path().map_or_else(
+                    || "?".to_string(),
+                    // A bare file name was found by the dynamic loader's own
+                    // search, which does not report the directory it used.
+                    |p| if p.parent().is_some_and(|d| !d.as_os_str().is_empty()) {
+                        p.display().to_string()
+                    } else {
+                        format!("{} from the system library search path", p.display())
+                    },
+                ),
             );
         }
     }
@@ -6023,8 +6014,8 @@ impl Engine {
         // below so concurrent acquire/release is never stalled by it.
         let mut edit_pick: Option<(CachedModel, usize)> = None;
         // Whether the prefix cache holds a longer reusable state than any
-        // pooled session can be rewound to.
-        let mut from_cache = false;
+        // pooled session can be rewound to (decided under the pool lock).
+        let mut from_cache;
         // A pooled session to clear for this unrelated prompt.
         let mut clear_pick: Option<CachedModel> = None;
 

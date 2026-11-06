@@ -86,9 +86,6 @@ struct SsmConfig {
     /// B/C groups (`ssm.group_count`); each B/C row is shared by
     /// `n_head / n_group` heads.
     n_group: usize,
-    /// Precomputed `-(ssm_a)` per head, i.e. the negative decay rate.
-    /// `None` until [`Self::with_a`]; the loaded value lives on the layer.
-    time_step_min: f32,
 }
 
 impl SsmConfig {
@@ -102,12 +99,7 @@ impl SsmConfig {
     /// The fused projection's output width: `[z ‖ xBC ‖ dt]`.
     fn d_in_proj(&self) -> usize {
         2 * self.d_inner + 2 * self.n_group * self.d_state + self.n_head
-    }
-    /// The group `head h` reads its `B`/`C` from.
-    fn group(&self, h: usize) -> usize {
-        h / (self.n_head / self.n_group)
-    }
-}
+    }}
 
 /// A per-layer key that may also be a single scalar applying to every layer.
 ///
@@ -143,10 +135,9 @@ enum LayerKind {
 /// One layer's declared shape, in the order the GGUF declares them.
 #[derive(Debug, Clone)]
 struct LayerSpec {
+    /// Derived from the layer's `head_count_kv` and `feed_forward_length`
+    /// (recurrent when both are zero).
     kind: LayerKind,
-    /// `n_head_kv == 0` when the layer is recurrent (used to *derive* `kind`).
-    n_head_kv: usize,
-    n_ff: usize,
 }
 
 /// The model geometry.
@@ -164,14 +155,11 @@ struct Config {
     /// `context_length` pass never runs off the end of it.
     context_length: usize,
     rms_eps: f64,
-    n_vocab: usize,
     n_expert: usize,
     n_expert_used: usize,
     /// `routed_scaling_factor` (2.5 on Nemotron 3.5).
     expert_weights_scale: f64,
     expert_weights_norm: bool,
-    /// Latent MoE width (`moe_latent_size`); `None` = no latent projection.
-    moe_latent: Option<usize>,
     ssm: SsmConfig,
     layers: Vec<LayerSpec>,
 }
@@ -212,7 +200,6 @@ impl Config {
             d_inner,
             n_head: m.u32("ssm.time_step_rank")? as usize,
             n_group: m.u32("ssm.group_count")? as usize,
-            time_step_min: 0.0,
         };
         if ssm.d_conv == 0 {
             candle_core::bail!("{}: ssm.conv_kernel must be positive", m.arch());
@@ -255,11 +242,7 @@ impl Config {
             } else {
                 LayerKind::Moe
             };
-            layers.push(LayerSpec {
-                kind,
-                n_head_kv: n_head_kv_i,
-                n_ff: n_ff_i,
-            });
+            layers.push(LayerSpec { kind });
         }
         let n_attn = layers
             .iter()
@@ -295,12 +278,10 @@ impl Config {
             rope_theta: m.f32_or("rope.freq_base", 10_000.0),
             context_length: m.u32_or("context_length", 4096) as usize,
             rms_eps: m.f32_or("attention.layer_norm_rms_epsilon", 1e-5) as f64,
-            n_vocab: m.u32_or("vocab_size", 0) as usize,
             n_expert: m.u32_or("expert_count", 0) as usize,
             n_expert_used: m.u32_or("expert_used_count", 0) as usize,
             expert_weights_scale: m.f32_or("expert_weights_scale", 0.0) as f64,
             expert_weights_norm: m.bool_or("expert_weights_norm", false),
-            moe_latent: m.u32_opt("moe_latent_size").map(|v| v as usize),
             ssm,
             layers,
         }))
@@ -427,13 +408,16 @@ impl Weight {
     /// The logical weight shape, for load-time validation.
     fn shape(&self) -> Option<(usize, usize)> {
         match self {
-            Self::Quant(q) => match q {
-                QMatMul::QTensor(t) => t.shape().dims().first().map(|_| ()).and_then(|_| {
-                    let d = t.shape().dims();
-                    (d.len() == 2).then(|| (d[0], d[1]))
-                }),
-                _ => None,
-            },
+            Self::Quant(q) => {
+                let dims = match q {
+                    QMatMul::QTensor(t) => t.shape().dims(),
+                    QMatMul::Tensor(t) | QMatMul::TensorF16(t) => t.dims(),
+                };
+                match *dims {
+                    [out_dim, in_dim] => Some((out_dim, in_dim)),
+                    _ => None,
+                }
+            }
             Self::Nvfp4 { out_dim, in_dim, .. } => Some((*out_dim, *in_dim)),
         }
     }
@@ -530,8 +514,21 @@ impl Mamba2 {
             .t()?
             .contiguous()?
             .reshape((1, cfg.n_group, cfg.d_inner / cfg.n_group))?;
+        // The forward pass slices `[z | xBC | dt]` out of the fused
+        // projection by the config's widths, so a projection of another
+        // width would be read at the wrong offsets; refuse it at load.
+        let in_proj = load_weight(src, &format!("{p}.ssm_in.weight"))?;
+        if let Some((rows, _)) = in_proj.shape() {
+            if rows != cfg.d_in_proj() {
+                candle_core::bail!(
+                    "{p}.ssm_in.weight has {rows} output rows, but the SSM config \
+                     (inner_size, group_count, state_size, time_step_rank) implies {}",
+                    cfg.d_in_proj()
+                );
+            }
+        }
         Ok(Self {
-            in_proj: load_weight(src, &format!("{p}.ssm_in.weight"))?,
+            in_proj,
             conv_w,
             conv_b,
             dt_b,
@@ -890,7 +887,6 @@ struct MoeBlock {
     shared_down: Weight,
     latent_down: Option<Weight>,
     latent_up: Option<Weight>,
-    n_expert: usize,
     k: usize,
     scale: f64,
     norm_weights: bool,
@@ -987,7 +983,6 @@ impl MoeBlock {
             } else {
                 None
             },
-            n_expert: cfg.n_expert,
             k: cfg.n_expert_used,
             scale: cfg.expert_weights_scale,
             norm_weights: cfg.expert_weights_norm,
@@ -1104,7 +1099,6 @@ impl MtpBlock {
         if !src.has(&format!("{p}.nextn.eh_proj.weight")) {
             return Ok(None);
         }
-        let device = src.device.clone();
         Ok(Some(Self {
             enorm: src.rms_norm(&format!("{p}.nextn.enorm.weight"), cfg.rms_eps)?,
             hnorm: src.rms_norm(&format!("{p}.nextn.hnorm.weight"), cfg.rms_eps)?,
@@ -1246,7 +1240,6 @@ pub struct Weights {
     device: Device,
     residency: Arc<dyn crate::residency::ExpertResidency>,
     n_expert: usize,
-    cfg: Config,
     /// The NextN / MTP draft block, when the file has one and the caller
     /// asked for it (see [`crate::quantized_qwen::with_mtp_block`]).
     mtp: Option<MtpBlock>,
@@ -1331,7 +1324,6 @@ impl Weights {
             device: device.clone(),
             residency: Arc::new(crate::residency::NoopResidency),
             n_expert: cfg.n_expert,
-            cfg,
             mtp,
         })
     }
@@ -1821,7 +1813,6 @@ mod tests {
             d_inner: 32,
             n_head: 4,
             n_group: 2,
-            time_step_min: 0.0,
         };
         let channels = cfg.conv_dim();
         let unused = || {

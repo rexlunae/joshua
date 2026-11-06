@@ -10,9 +10,12 @@
 //!   cargo run --release --features opencl --example quant_bench
 
 
+#[cfg(any(feature = "opencl", feature = "sycl"))]
 use candle_core::quantized::GgmlDType;
 
+#[cfg(any(feature = "opencl", feature = "sycl"))]
 const IQ2_XXS_TSIZE: i32 = 66;
+#[cfg(any(feature = "opencl", feature = "sycl"))]
 const IQ2_XXS_QK: usize = 256;
 
 #[cfg(all(feature = "sycl", target_os = "linux"))]

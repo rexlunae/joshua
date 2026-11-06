@@ -1557,16 +1557,25 @@ async fn the_router_api_key_is_enforced() {
     // (The worker-side key is covered by the real-worker parity test.)
     let (_, url) = spawn_fake("a", "m", 1, Behavior::Echo).await;
     let mut cfg = config(&[&url]);
-    cfg.api_key = Some("client-key".to_string());
+    // A rotation list, as `joshua serve --api-key` takes it.
+    cfg.api_key = Some("old-key,client-key".to_string());
     let (_, router) = spawn_router(cfg).await;
     let res = chat(&router, json!({"messages": []})).await;
     assert_eq!(res.status, StatusCode::UNAUTHORIZED);
-    let mut sender = open(&router).await;
-    let mut req = request("POST", "/v1/chat/completions", "{\"messages\":[]}");
-    req.headers_mut()
-        .insert(header::AUTHORIZATION, "Bearer client-key".parse().unwrap());
-    let res = sender.send_request(req).await.unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
+    // Either listed key, in either header the workers accept (Anthropic
+    // SDKs send `x-api-key`).
+    for (name, value, want) in [
+        (header::AUTHORIZATION, "Bearer client-key", StatusCode::OK),
+        (header::AUTHORIZATION, "Bearer old-key", StatusCode::OK),
+        (header::HeaderName::from_static("x-api-key"), "client-key", StatusCode::OK),
+        (header::AUTHORIZATION, "Bearer old-key,client-key", StatusCode::UNAUTHORIZED),
+    ] {
+        let mut sender = open(&router).await;
+        let mut req = request("POST", "/v1/chat/completions", "{\"messages\":[]}");
+        req.headers_mut().insert(name, value.parse().unwrap());
+        let res = sender.send_request(req).await.unwrap();
+        assert_eq!(res.status(), want, "{value}");
+    }
     // /health stays open.
     assert_eq!(
         call(&router, "GET", "/health", "").await.status,

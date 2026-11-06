@@ -896,6 +896,7 @@ mod tests {
             (x.max(0.) + (-x.abs()).exp().ln_1p()).sqrt() + b as f64
         }).collect();
         assert!(exact[0] > exact[1]);
+        #[allow(unused_mut)] // accelerator builds push their devices
         let mut devices = vec![Device::Cpu];
         #[cfg(feature = "vulkan")]
         if let Ok(d) = Device::new_vulkan(0) { devices.push(d); }

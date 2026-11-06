@@ -175,12 +175,20 @@ cargo build --release
 ./target/release/joshua run --model ./weights/Qwen3-8B-Q4_K_M.gguf \
     --enable-thinking false --seed 7 "What is 17 * 23?"
 
-# Start the API server (--n-ctx sets the context window; requests may narrow it)
+# Start the API server (--n-ctx sets the context window; requests may narrow it).
+# It binds localhost; set --api-key (and ideally TLS) before binding 0.0.0.0.
 ./target/release/joshua serve \
     --model ./weights/gemma-3-1b-it-Q4_K_M.gguf \
     --n-ctx 8192 \
-    --addr 0.0.0.0:8080
+    --addr 127.0.0.1:8080
 ```
+
+`serve`, `run`, `bench` and `ppl` take the same model-load flags (`--n-ctx`,
+`--device`, `--huge-pages`, the page-cache, expert-cache and placement flags,
+`--speculative` / `--mtp` / `--draft-model`, `--npu-plugin`, …), so a
+benchmark or perplexity run loads the model exactly as the server would.
+Every subcommand and flag, with its environment variable, is listed in the
+[CLI reference](docs/cli-reference.md) (generated from `--help`).
 
 ### 5 — GPU acceleration (Metal / CUDA / OpenCL / Vulkan / SYCL)
 
@@ -266,8 +274,12 @@ design, the environment variables and the limits.
 **SYCL (Intel oneAPI / LLVM).** The Rust crate always compiles without a
 SYCL toolchain; the kernels live in a separate `libjoshua_sycl` shared
 library (built from `vendor/candle-core/src/sycl_backend/bridge.cpp` with
-a SYCL compiler via `cmake`), which joshua `dlopen`s at first use.  Point
-`JOSHUA_SYCL_LIBRARY` at a non-standard path, `JOSHUA_SYCL_NATIVE=0` to
+a SYCL compiler via `cmake`), which joshua `dlopen`s at first use.  Without
+`JOSHUA_SYCL_LIBRARY` it is searched for on the system library path, then as
+`~/joshua-sycl/build/libjoshua_sycl.so` and `~/joshua-sycl/libjoshua_sycl.so`;
+the bridge must come from the same tree as the binary, so point
+`JOSHUA_SYCL_LIBRARY` at the one you built (the startup log names the file it
+loaded).  Use `JOSHUA_SYCL_NATIVE=0` to
 force the CPU round-trip, and `JOSHUA_SYCL_TRACE=1` to log every native
 kernel and fallback.  Supported operations run as native SYCL kernels
 (f32 GEMM, RMSNorm, RoPE, softmax, reductions, index/gather/scatter), and
@@ -371,7 +383,21 @@ memory.  See `docs/memory-analysis.md` for the full accounting.
 
 ## HTTP API
 
-All endpoints are OpenAI-compatible.
+One server speaks several client protocols over the same engine and model
+registry:
+
+| Protocol | Endpoints |
+|---|---|
+| OpenAI | `POST /v1/chat/completions`, `POST /v1/completions`, `POST /v1/embeddings`, `POST /v1/audio/transcriptions`, `GET /v1/models` (also `/models`), `GET /v1/models/{id}` |
+| Anthropic | `POST /v1/messages`, `POST /v1/messages/count_tokens` |
+| llama.cpp (`llama-server`) | `GET /health`, `GET /props`, `GET /slots`, `POST /tokenize`, `POST /detokenize` |
+| vLLM | `GET /load`, `POST /v1/tokenize`, `POST /v1/detokenize` |
+| Ollama | `/api/chat`, `/api/generate`, `/api/embed` (and `/api/embeddings`), `/api/tags`, `/api/ps`, `/api/show`, `/api/version`, `/api/tokens`, and model management (`/api/delete`, `/api/copy`, `/api/create`) against the model directory |
+| joshua | `POST /v1/models/load`, `POST /v1/models/unload`, `GET /v1/worker/info`, `GET /status`, `GET /metrics`, `GET /metrics/prometheus` |
+
+[docs/client-compatibility.md](docs/client-compatibility.md) records what
+each route supports and what it does not (for example Ollama's registry
+`pull`).  The sections below cover the OpenAI and Anthropic routes in detail.
 
 ### `POST /v1/chat/completions`
 
@@ -878,12 +904,15 @@ URLs in image fields are rejected).
 
 ### API-key authentication
 
-Pass `--api-key` (or set `JOSHUA_API_KEY`) and every `/v1` route, plus the
-operational endpoints above, requires the key.  Send it either as an
-OpenAI-style bearer token or as `x-api-key`; `GET /health` stays open for
-liveness probes.  A comma-separated key list accepts any listed key, so keys
-can be rotated without a restart.  Requests without a valid key get a `401`
-with an OpenAI-format error body, so standard clients report it cleanly.
+Pass `--api-key` (or set `JOSHUA_API_KEY`) and every `/v1` route, the
+operational endpoints above, the Ollama `/api/*` routes and model
+management require the key.  Send it either as an OpenAI-style bearer token
+or as `x-api-key` (what Anthropic SDKs send); `GET /health` stays open for
+liveness probes.  A comma-separated key list accepts any listed key, so a key
+can be rotated by listing the old and the new one until every client has
+switched (the list is read at startup).  `joshua route --api-key` runs the
+same check.  Requests without a valid key get a `401` with an OpenAI-format
+error body, so standard clients report it cleanly.
 
 ```bash
 joshua serve --model m.gguf --api-key sk-my-secret
@@ -1065,13 +1094,18 @@ prints the dense/expert split of any GGUF to sanity-check a new model.
 
 | Variable | Description |
 |---|---|
-| `JOSHUA_MODEL_PATH` | Default model path (overrides `--model` flag) |
+| `JOSHUA_MODEL_PATH` | Model path when `--model` is not given (an explicit flag wins over every variable in this table) |
+| `JOSHUA_MODEL_DIR` | Directory of models to list and load on demand (same as `--model-dir`) |
+| `JOSHUA_DEVICE` | Compute backend (same as `--device`: `auto`, `cpu`, `metal`, `cuda`, `opencl`, `vulkan`, `sycl`) |
 | `JOSHUA_N_CTX` | Context window in tokens (same as `--n-ctx`, default 4096); requests may only narrow it |
 | `JOSHUA_API_KEY` | API key required on `/v1` routes (same as `--api-key`; comma-separated keys are all accepted) |
 | `JOSHUA_CORS_ORIGINS` | Comma-separated exact CORS origins (same as repeating `--cors-origin`; unset keeps permissive localhost development policy) |
 | `JOSHUA_TLS_CERT` | PEM certificate chain for HTTPS (same as `--tls-cert` on `serve` and `route`; needs `--features tls`) |
 | `JOSHUA_TLS_KEY` | PEM private key for HTTPS (same as `--tls-key` on `serve` and `route`) |
 | `JOSHUA_LAZY_WEIGHTS` | Same as `--lazy-weights` |
+| `JOSHUA_PIN_HOT_EXPERTS` / `JOSHUA_EXPERT_CACHE` | Same as `--pin-hot-experts` (a count) / `--expert-cache` (`auto` or a count) |
+| `JOSHUA_SSD_EXPERT_CACHE` | Same as `--ssd-expert-cache` (`auto` or MiB of host RAM for the NVMe expert staging slab) |
+| `JOSHUA_ENGRAM_TIER` | Same as `--engram-tier` (`auto`, `ram`, or `disk`; DeepSeek-V4.1 Engram tables) |
 | `JOSHUA_PREFETCH_MODEL` | Same as `--prefetch-model` (`true`/`false`, or the flag with no value) |
 | `JOSHUA_PIN_HOT_WEIGHTS` | Same as `--pin-hot-weights` (`true`/`false`, or the flag with no value) |
 | `JOSHUA_MLOCK_HOT_WEIGHTS` | Same as `--mlock-hot-weights` (`on`, `required`, or `off`) |
@@ -1084,6 +1118,10 @@ prints the dense/expert split of any GGUF to sanity-check a new model.
 | `JOSHUA_EXPERT_STATS` | `1` probes host-miss page residency for the decode time split logged with the VRAM expert cache |
 | `JOSHUA_ROUTE_TRACE` | Path of a routing-trace CSV to write, for `cargo run --example cache_sim` |
 | `JOSHUA_PREFILL_CHUNK` | Tokens per prefill chunk (default 512; also `--prefill-chunk`) |
+| `JOSHUA_PREFILL_BUDGET_MS` | Target wall time per prefill chunk (same as `--prefill-budget-ms`; 0 = fixed chunks) |
+| `JOSHUA_PREFIX_CHECKPOINTS` / `JOSHUA_PREFIX_CACHE_MIB` / `JOSHUA_PREFIX_CACHE_ROOT_MIN` | Same as `--prefix-checkpoints`, `--prefix-cache-mib`, `--prefix-cache-root-min` (server prefix reuse) |
+| `JOSHUA_ENV_TO_USER` | Same as `--env-to-user` (move an `<env>` block out of the system prompt so the prefix cache keeps covering it) |
+| `JOSHUA_MTP` | Max MTP draft tokens per step (same as `--mtp`; 0 = off) |
 | `JOSHUA_SPECULATIVE` | Max draft tokens per speculative decode step (default 0 = off; also `--speculative`) |
 | `JOSHUA_DRAFT_MODEL` | Draft GGUF for draft-model speculative decoding (also `--draft-model`) |
 | `JOSHUA_DRAFT_MAX` | Most draft-model tokens per step (default 4; also `--draft-max`) |
@@ -1098,6 +1136,7 @@ prints the dense/expert split of any GGUF to sanity-check a new model.
 | `JOSHUA_OPENCL_QGEMV` | `v1` runs the IQ2_XXS / Q2_K / Q4_K..Q6_K matmuls through the one-row quantized GEMV instead of the multi-row kernel (bisecting) |
 | `JOSHUA_VULKAN_QGEMV` | `mali-int8` / `mali` / `generic` forces the Mali GEMV on int8 dot products (the default on Arm GPUs that have them), the float Mali GEMV or the generic one on any Vulkan device |
 | `JOSHUA_MAX_CONCURRENCY` | Cap on simultaneous generations/embeddings (same as `--max-concurrency`) |
+| `JOSHUA_QUEUE_TIMEOUT_MS` / `JOSHUA_ADMISSION_QUEUE_DEPTH` | How long and how many requests may wait for a concurrency slot (same as `--queue-timeout-ms` / `--admission-queue-depth`) |
 | `JOSHUA_MAX_OUTPUT_TOKENS` | Hard ceiling on generated tokens per request (same as `--max-output-tokens`) |
 | `JOSHUA_TEMP`, `JOSHUA_TOP_K`, `JOSHUA_TOP_P`, `JOSHUA_MIN_P`, `JOSHUA_TYPICAL_P`, `JOSHUA_REPEAT_PENALTY`, `JOSHUA_REPEAT_LAST_N`, `JOSHUA_PRESENCE_PENALTY`, `JOSHUA_FREQUENCY_PENALTY`, `JOSHUA_XTC_PROBABILITY`, `JOSHUA_XTC_THRESHOLD`, `JOSHUA_MIROSTAT`, `JOSHUA_MIROSTAT_LR`, `JOSHUA_MIROSTAT_ENT` | Server sampling defaults (same as `--temp`, `--top-k`, …; see [Sampling defaults](#sampling-defaults)) |
 | `JOSHUA_CHAT_TEMPLATE` / `JOSHUA_CHAT_TEMPLATE_FILE` | A Jinja chat template (or a file holding one) used instead of the GGUF's (same as `--chat-template` / `--chat-template-file`); a `--chat-template` value that is neither an existing file nor Jinja is refused at startup |
@@ -1105,6 +1144,16 @@ prints the dense/expert split of any GGUF to sanity-check a new model.
 | `JOSHUA_TOOL_CALL_PARSER` | Tool-call format to parse output with, or `auto` (same as `--tool-call-parser`; see [Tool calling](#tool-calling)) |
 | `JOSHUA_WHISPER_MODEL` | Whisper model directory mounted at `/v1/audio/transcriptions` (same as `--whisper-model`) |
 | `JOSHUA_NPU_PLUGIN` | NPU vendor plugin path (same as `--npu-plugin`) |
+| `JOSHUA_NPU_SHIM` | Path of the `joshua-npu-shim` executable that isolates the plugin (default: next to `joshua`) |
+| `JOSHUA_ROUTE_WORKERS` / `JOSHUA_WORKER_API_KEY` | `joshua route`: worker addresses (same as `--worker`) and the key presented to them (same as `--worker-api-key`) |
+| `JOSHUA_CLUSTER_KEY` | 64 hex characters shared by a controller and its `joshua worker`s (`--features distributed`) |
+| `JOSHUA_WORKER_CACHE` | `joshua worker`: keep received stages here for reuse (same as `--cache-dir`) |
+| `JOSHUA_SYCL_LIBRARY` | Path of the `libjoshua_sycl` bridge to load (see [SYCL](#5--gpu-acceleration-metal--cuda--opencl--vulkan--sycl)) |
+| `JOSHUA_MEGAKERNEL` | `1` runs single-token decode of qualifying dense models as one persistent SYCL kernel |
+| `JOSHUA_CPU_AFFINITY` | Pin the process to performance cores on hybrid CPUs: `auto` detects them, or give a CPU list; unset/`off` leaves affinity alone (Linux) |
+| `JOSHUA_GPU_WEIGHT_CACHE` | MiB budget for the opt-in bounded GPU weight cache of the `qwen3moe` loader (0/unset = off) |
+| `JOSHUA_PROFILE` | `1` prints a per-phase decode profile from the Qwen-family loaders |
+| `JOSHUA_DEBUG_TOKENS` | Print each decode step's top-5 logits to stderr (debugging) |
 | `JOSHUA_LLAMA_N_GPU_LAYERS` | llama.cpp adapter layer offload count (default: all) |
 | `JOSHUA_LLAMA_MMPROJ` | Multimodal projector GGUF for vision via llama.cpp's `mtmd` |
 | `JOSHUA_LLAMA_BACKENDS_DIR` | Directory of `libggml-<name>` modules to register at adapter startup (llama.cpp `dynamic-backends` builds) |

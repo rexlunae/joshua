@@ -10,7 +10,8 @@
 //! - `POST /v1/messages/count_tokens`  — Anthropic token count without running the model
 //! - `POST /tokenize`                 — tokenize with the loaded model
 //!   (also `/v1/tokenize`, and `/api/tokens` for Ollama clients)
-//! - `POST /v1/detokenize`            — ids back to text (vLLM / llama.cpp)
+//! - `POST /detokenize`               — ids back to text (llama.cpp; also
+//!   `/v1/detokenize` for vLLM)
 //! - `GET  /v1/models`                — list the models, with their limits
 //!   (also `/models`; `GET /v1/models/{id}` for one, see
 //!   [`crate::model_info`])
@@ -25,6 +26,7 @@
 //! - `POST /v1/models/load`           — load a model from the controller's
 //!   model directory, locally or onto its workers (when enabled)
 //! - `POST /v1/models/unload`         — unload a model (when enabled)
+//! - `/api/*`                         — the Ollama API (see [`crate::ollama`])
 //!
 //! With `--model-dir` the directory is the model store: every model in it is
 //! listed, and a request selects one by naming its id — [`select_model`] loads
@@ -1175,6 +1177,7 @@ pub fn create_router(state: AppState) -> Router {
         ))
         .route("/tokenize", post(tokenize))
         .route("/v1/tokenize", post(tokenize))
+        .route("/detokenize", post(detokenize))
         .route("/v1/detokenize", post(detokenize))
         .route("/api/tokens", post(tokenize))
         .route("/load", get(server_load))
@@ -1250,50 +1253,94 @@ async fn count_requests(
 /// scopes. Comparison is constant-time so the key can't be recovered byte-by-byte
 /// through response timing.
 async fn require_api_key(State(state): State<AppState>, mut req: Request, next: Next) -> Response {
-    if let Some(expected) = &state.api_key {
-        let provided = req
-            .headers()
-            .get(header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-            .or_else(|| {
-                req.headers()
-                    .get("x-api-key")
-                    .and_then(|v| v.to_str().ok())
-            });
-        // A comma-separated configuration supports key rotation: any listed
-        // key is accepted.  Empty entries are ignored so a trailing comma or
-        // a stray space does not accidentally accept an empty key.  A value
-        // that contains no non-empty key is a configuration error: refuse
-        // every request rather than silently disabling authentication.
-        let expected_keys: Vec<&str> = expected
-            .split(',')
-            .map(str::trim)
-            .filter(|candidate| !candidate.is_empty())
-            .collect();
-        if expected_keys.is_empty() {
-            let body = ErrorResponse::new(
-                "server misconfigured: --api-key contains no non-empty keys",
-                "server_error",
-            );
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response();
-        }
-        if !provided.is_some_and(|key| {
-            expected_keys
-                .iter()
-                .any(|candidate| api_keys_match(key.as_bytes(), candidate.as_bytes()))
-        }) {
-            let body = ErrorResponse::new(
-                "invalid or missing API key — pass the key as \
-                 'Authorization: Bearer <key>' or 'x-api-key: <key>'",
-                "invalid_request_error",
-            );
-            return (StatusCode::UNAUTHORIZED, Json(body)).into_response();
+    if let Some(configured) = &state.api_key {
+        if let Err(rejection) = check_api_key(configured, req.headers()) {
+            let body = ErrorResponse::new(rejection.message(), rejection.kind());
+            return (rejection.status(), Json(body)).into_response();
         }
     } else {
         req.headers_mut().remove(crate::affinity::CACHE_SCOPE_HEADER);
     }
     next.run(req).await
+}
+
+/// The API key a request presents: `Authorization: Bearer <key>` (the
+/// scheme matched case-insensitively, as HTTP auth schemes are) or
+/// Anthropic's `x-api-key: <key>`.
+pub(crate) fn presented_api_key(headers: &axum::http::HeaderMap) -> Option<&str> {
+    let bearer = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| {
+            let (scheme, key) = v.split_once(' ')?;
+            scheme.eq_ignore_ascii_case("bearer").then_some(key.trim_start())
+        });
+    bearer.or_else(|| headers.get("x-api-key").and_then(|v| v.to_str().ok()))
+}
+
+/// Why [`check_api_key`] refused a request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ApiKeyRejection {
+    /// The key is missing or matches none of the configured keys.
+    Invalid,
+    /// The configured value holds no non-empty key.
+    Misconfigured,
+}
+
+impl ApiKeyRejection {
+    pub(crate) fn status(self) -> StatusCode {
+        match self {
+            Self::Invalid => StatusCode::UNAUTHORIZED,
+            Self::Misconfigured => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+
+    pub(crate) fn kind(self) -> &'static str {
+        match self {
+            Self::Invalid => "invalid_request_error",
+            Self::Misconfigured => "server_error",
+        }
+    }
+
+    pub(crate) fn message(self) -> &'static str {
+        match self {
+            Self::Invalid => {
+                "invalid or missing API key — pass the key as \
+                 'Authorization: Bearer <key>' or 'x-api-key: <key>'"
+            }
+            Self::Misconfigured => "server misconfigured: --api-key contains no non-empty keys",
+        }
+    }
+}
+
+/// Check a request's key against a configured `--api-key` value, shared by
+/// `joshua serve` and `joshua route` so both accept the same headers and
+/// the same configuration.
+///
+/// A comma-separated configuration supports key rotation: any listed key is
+/// accepted.  Empty entries are ignored so a trailing comma or a stray space
+/// does not accidentally accept an empty key.  A value that contains no
+/// non-empty key is a configuration error: every request is refused rather
+/// than authentication silently disabled.
+pub(crate) fn check_api_key(
+    configured: &str,
+    headers: &axum::http::HeaderMap,
+) -> Result<(), ApiKeyRejection> {
+    let mut keys = configured
+        .split(',')
+        .map(str::trim)
+        .filter(|candidate| !candidate.is_empty())
+        .peekable();
+    if keys.peek().is_none() {
+        return Err(ApiKeyRejection::Misconfigured);
+    }
+    let presented = presented_api_key(headers).ok_or(ApiKeyRejection::Invalid)?;
+    // Compare against every key (no short-circuit), so timing does not
+    // reveal which configured key, if any, matched.
+    let matched = keys.fold(false, |hit, candidate| {
+        api_keys_match(presented.as_bytes(), candidate.as_bytes()) | hit
+    });
+    matched.then_some(()).ok_or(ApiKeyRejection::Invalid)
 }
 
 /// Key equality that leaks nothing about the configured key through timing.
@@ -1535,14 +1582,15 @@ async fn tokenize(
     })))
 }
 
-/// `POST /v1/detokenize` — turn token ids back into text.
+/// `POST /detokenize` (and `/v1/detokenize`) — turn token ids back into text.
 ///
 /// vLLM and llama.cpp both expose this next to tokenize, and OpenAI-compatible
 /// tooling uses it to reconstruct a prompt from ids.  Body:
 /// `{"model": "...", "tokens": [1, 2, 3], "skip_special_tokens": true}`.
 /// `skip_special_tokens` defaults to **true**, matching vLLM (which drops
 /// BOS/EOS unless asked otherwise); llama.cpp's `/detokenize` only takes
-/// `tokens`, and this body is a superset of that.
+/// `tokens`, and this body is a superset of that.  The text is returned as
+/// both `prompt` (vLLM) and `content` (llama.cpp), so either client finds it.
 async fn detokenize(
     State(state): State<AppState>,
     Json(body): Json<serde_json::Value>,
@@ -1575,7 +1623,7 @@ async fn detokenize(
     let text = engine
         .detokenize(&ids, skip_special)
         .map_err(ApiError::from)?;
-    Ok(Json(json!({ "prompt": text })))
+    Ok(Json(json!({ "prompt": text, "content": text })))
 }
 
 /// `GET /load` — vLLM's server-load metrics.
@@ -3241,6 +3289,37 @@ mod tests {
     fn api_keys_match_handles_an_empty_expected_key() {
         assert!(api_keys_match(b"", b""));
         assert!(!api_keys_match(b"a", b""));
+    }
+
+    #[test]
+    fn check_api_key_takes_either_header_and_any_rotated_key() {
+        use super::{check_api_key, ApiKeyRejection};
+        use axum::http::{header, HeaderMap};
+        let with = |name: header::HeaderName, value: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(name, value.parse().unwrap());
+            headers
+        };
+        let x_api_key = header::HeaderName::from_static("x-api-key");
+        for configured in ["old,new", " new ,", "new"] {
+            assert_eq!(check_api_key(configured, &with(header::AUTHORIZATION, "Bearer new")), Ok(()));
+            assert_eq!(check_api_key(configured, &with(header::AUTHORIZATION, "bearer new")), Ok(()));
+            assert_eq!(check_api_key(configured, &with(x_api_key.clone(), "new")), Ok(()));
+            assert_eq!(
+                check_api_key(configured, &with(header::AUTHORIZATION, "Bearer wrong")),
+                Err(ApiKeyRejection::Invalid)
+            );
+            assert_eq!(
+                check_api_key(configured, &with(header::AUTHORIZATION, "Basic new")),
+                Err(ApiKeyRejection::Invalid)
+            );
+            assert_eq!(check_api_key(configured, &HeaderMap::new()), Err(ApiKeyRejection::Invalid));
+        }
+        assert_eq!(check_api_key("old,new", &with(x_api_key, "old")), Ok(()));
+        assert_eq!(
+            check_api_key(" , ", &with(header::AUTHORIZATION, "Bearer ")),
+            Err(ApiKeyRejection::Misconfigured)
+        );
     }
 
     use super::{

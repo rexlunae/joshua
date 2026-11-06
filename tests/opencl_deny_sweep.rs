@@ -98,8 +98,8 @@ fn parity(device: &Device, model: &Path, what: &str) {
 fn parity_with(dev_model: &mut QuantizedModel, model: &Path, device: &Device, what: &str) {
     let tokens: Vec<u32> = (0..160).map(|i| 1 + (i % 15) as u32).collect();
     let mut cpu = load_mmap(model, &Device::Cpu);
-    let ref_prefill = logits(&mut cpu, &tokens, 0);
-    let ref_decode = logits(&mut cpu, &tokens[tokens.len() - 1..], tokens.len(), );
+    let ref_prefill = logits(&mut cpu, &tokens, 0, &Device::Cpu);
+    let ref_decode = logits(&mut cpu, &tokens[tokens.len() - 1..], tokens.len(), &Device::Cpu);
 
     let got_prefill = logits(dev_model, &tokens, 0, device);
     let got_decode = logits(dev_model, &tokens[tokens.len() - 1..], tokens.len(), device);
@@ -143,7 +143,8 @@ fn deny_each_kernel_falls_back_to_matching_results() {
         // A denied kernel can break the LOAD itself (e.g. the eager F16
         // dequantize of output.weight has no CPU fallback): that is a
         // distinct finding — the op is load-critical, not just parity — so
-        // report it and move on rather than failing the sweep.
+        // report it and move on rather than failing the sweep.  `load_mmap`
+        // panics on a load error, so both shapes surface as a panic here.
         let loaded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             load_mmap(&model, &dev)
         }));
@@ -153,12 +154,7 @@ fn deny_each_kernel_falls_back_to_matching_results() {
                 std::env::remove_var("JOSHUA_OPENCL_NATIVE_DENY");
                 continue;
             }
-            Ok(Err(_)) => {
-                println!("deny {kernel}: load-critical (load returned an error)");
-                std::env::remove_var("JOSHUA_OPENCL_NATIVE_DENY");
-                continue;
-            }
-            Ok(Ok(mut dev_model)) => {
+            Ok(mut dev_model) => {
                 parity_with(&mut dev_model, &model, &dev, &format!("deny {kernel}"));
                 println!("deny {kernel}: fallback parity OK");
             }

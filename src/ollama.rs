@@ -5,7 +5,9 @@
 //! 1. **Streaming is newline-delimited JSON**, not SSE.  Each line is a whole
 //!    object; the last carries `"done": true`.
 //! 2. **Generation parameters live under `options`** (`num_ctx`, `num_predict`,
-//!    `temperature`, `top_k`, `top_p`, `repeat_penalty`, `stop`).
+//!    `temperature`, `top_k`, `top_p`, `min_p`, `typical_p`, `repeat_penalty`,
+//!    `repeat_last_n`, `presence_penalty`, `frequency_penalty`, `mirostat*`,
+//!    `seed`, `stop`).
 //! 3. **Models are addressed by bare name** from a listing endpoint
 //!    (`/api/tags`) that must work before anything is loaded.
 //!
@@ -28,7 +30,8 @@
 //! * `pull` does not speak the Ollama registry protocol, so a bare library name
 //!   such as `llama3` fails with guidance instead of hanging.  Place the
 //!   `.gguf` in the model directory and use `POST /v1/models/load`, or move the
-//!   file in by hand.
+//!   file in by hand.  An explicit `https://` URL is answered with a 501:
+//!   URL downloads are not implemented.
 //!
 //! Ollama's `:tag` suffix names a manifest, which has no joshua equivalent:
 //! every tag of a name resolves to the same `<name>.gguf`.
@@ -237,14 +240,44 @@ pub struct OllamaOptions {
     pub repeat_penalty: Option<f32>,
     #[serde(default)]
     pub stop: Option<Vec<String>>,
+    #[serde(default)]
+    pub seed: Option<i64>,
+    #[serde(default)]
+    pub typical_p: Option<f32>,
+    #[serde(default)]
+    pub repeat_last_n: Option<i32>,
+    #[serde(default)]
+    pub presence_penalty: Option<f32>,
+    #[serde(default)]
+    pub frequency_penalty: Option<f32>,
+    #[serde(default)]
+    pub mirostat: Option<i32>,
+    #[serde(default)]
+    pub mirostat_tau: Option<f32>,
+    #[serde(default)]
+    pub mirostat_eta: Option<f32>,
 }
 
 impl OllamaOptions {
     /// Generation options over `defaults` (the Ollama profile: see
     /// [`crate::Engine::sampling_defaults`]), through the OpenAI routes'
     /// request mapping.
-    fn to_generation_options(&self, defaults: &SamplingDefaults) -> Result<GenerationOptions, String> {
+    ///
+    /// `num_ctx` narrows the context window to at most `loaded_ctx`, the
+    /// server's `--n-ctx`.  Ollama treats it as a load parameter and clients
+    /// send their own default (often larger than the server's window), so a
+    /// larger value is clamped rather than refused as the OpenAI routes'
+    /// `context_window` is; 0 leaves the window alone.
+    fn to_generation_options(
+        &self,
+        defaults: &SamplingDefaults,
+        loaded_ctx: u32,
+    ) -> Result<GenerationOptions, String> {
         let mut o = GenerationOptions::with_defaults(defaults);
+        o.context_window = self
+            .num_ctx
+            .filter(|&n| n > 0)
+            .map(|n| n.min(loaded_ctx.max(1)));
         SamplingParams {
             // Ollama: -1 = until stop, -2 = fill context; both are the
             // unlimited default (still capped by --max-output-tokens).
@@ -255,6 +288,14 @@ impl OllamaOptions {
             min_p: self.min_p,
             repetition_penalty: self.repeat_penalty,
             stop: self.stop.as_ref().map(|stop| serde_json::Value::from(stop.clone())),
+            seed: self.seed,
+            typical_p: self.typical_p,
+            repeat_last_n: self.repeat_last_n,
+            presence_penalty: self.presence_penalty,
+            frequency_penalty: self.frequency_penalty,
+            mirostat: self.mirostat,
+            mirostat_tau: self.mirostat_tau,
+            mirostat_eta: self.mirostat_eta,
             ..Default::default()
         }
         .apply(&mut o)?;
@@ -311,7 +352,7 @@ pub async fn chat(
     let (id, engine) = select_model(&state, &req.model).await?;
     let options = req
         .options
-        .to_generation_options(&engine.sampling_defaults(SamplingProfile::Ollama))
+        .to_generation_options(&engine.sampling_defaults(SamplingProfile::Ollama), engine.n_ctx())
         .map_err(ApiError::bad_request)?;
     let messages: Vec<ChatMessage> = req
         .messages
@@ -452,7 +493,7 @@ pub async fn generate(
     let (id, engine) = select_model(&state, &req.model).await?;
     let options = req
         .options
-        .to_generation_options(&engine.sampling_defaults(SamplingProfile::Ollama))
+        .to_generation_options(&engine.sampling_defaults(SamplingProfile::Ollama), engine.n_ctx())
         .map_err(ApiError::bad_request)?;
     let prompt = match &req.suffix {
         Some(suffix) => format!("{}{suffix}", req.prompt),
@@ -614,6 +655,16 @@ pub async fn embed(
 //   is rejected with guidance); it does not speak the Ollama registry
 //   protocol, so `ollama pull llama3` cannot resolve.
 
+/// The file stem a management request's model name stands for, or `None`
+/// for a name that could reach outside the model directory (empty, a path,
+/// or containing `..`).
+fn bare_model_stem(name: &str) -> Option<&str> {
+    let stem = strip_tag(name);
+    let unsafe_name =
+        stem.is_empty() || stem.contains('/') || stem.contains('\\') || stem.contains("..");
+    (!unsafe_name).then_some(stem)
+}
+
 /// Resolve a requested model name to a `.gguf` inside the model directory.
 ///
 /// Confinement matters here: these endpoints delete and overwrite files, so a
@@ -626,12 +677,11 @@ fn model_file(state: &AppState, name: &str) -> Result<PathBuf, ApiError> {
             "management_disabled",
         )
     })?;
-    let stem = strip_tag(name);
-    if stem.is_empty() || stem.contains('/') || stem.contains('\\') || stem.contains("..") {
+    let Some(stem) = bare_model_stem(name) else {
         return Err(ApiError::bad_request(&format!(
             "invalid model name `{name}`: expected a bare name inside the model directory"
         )));
-    }
+    };
     let path = manager.model_dir.join(format!("{stem}.gguf"));
     // A name that canonicalises outside the directory (a symlink pointing out,
     // for instance) is refused even when the joined path looks contained.
@@ -738,14 +788,13 @@ pub async fn create(
 
 /// `POST /api/pull` — fetch a model file from an explicit https URL.
 ///
-/// Ollama's registry protocol (`model:tag` resolved against its library) is not
-/// implemented: it needs the registry manifest/blob API, which joshua does not
-/// speak.  A bare library name therefore fails with guidance rather than
-/// hanging, while an explicit https URL downloads into the model directory.
-/// The response is a single object (`stream: false` shape), which every client
-/// accepts, and the final `status` is `success` on completion.
+/// Neither source is implemented yet.  Ollama's registry protocol
+/// (`model:tag` resolved against its library) needs the registry
+/// manifest/blob API, which joshua does not speak, so a bare library name
+/// fails with a 400 and guidance rather than hanging; an explicit https URL
+/// is answered with a 501 until URL downloads land.  Either way the client
+/// is told to place the file in the model directory and load it.
 pub async fn pull(
-    State(state): State<AppState>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let name = body
@@ -754,7 +803,9 @@ pub async fn pull(
         .ok_or_else(|| ApiError::bad_request("missing 'model'"))?;
     if !name.starts_with("https://") {
         return Err(ApiError::bad_request(&format!(
-            "cannot pull `{name}`: joshua does not implement the Ollama registry protocol.              Pass an explicit https:// URL to a .gguf file, or place the file in the              model directory and load it with POST /v1/models/load."
+            "cannot pull `{name}`: joshua does not implement the Ollama registry protocol. \
+             Place the .gguf file in the model directory and load it with \
+             POST /v1/models/load."
         )));
     }
     Err(ApiError::new(
@@ -800,7 +851,7 @@ mod tests {
             ..Default::default()
         };
         let g = o
-            .to_generation_options(&SamplingProfile::Ollama.defaults())
+            .to_generation_options(&SamplingProfile::Ollama.defaults(), 4096)
             .unwrap();
         assert_eq!(g.max_tokens, 64);
         assert_eq!(g.temperature, 0.0);
@@ -810,6 +861,38 @@ mod tests {
         // Unset values come from Ollama's DefaultOptions.
         assert_eq!(g.top_p, 0.9);
         assert_eq!(g.min_p, 0.0);
+        assert_eq!(g.context_window, None);
+    }
+
+    #[test]
+    fn num_ctx_and_the_other_sampler_options_are_honoured() {
+        let o = OllamaOptions {
+            num_ctx: Some(1024),
+            seed: Some(7),
+            typical_p: Some(0.5),
+            repeat_last_n: Some(32),
+            presence_penalty: Some(0.25),
+            frequency_penalty: Some(0.5),
+            mirostat: Some(2),
+            mirostat_tau: Some(4.0),
+            mirostat_eta: Some(0.2),
+            ..Default::default()
+        };
+        let defaults = SamplingProfile::Ollama.defaults();
+        let g = o.to_generation_options(&defaults, 4096).unwrap();
+        assert_eq!(g.context_window, Some(1024));
+        assert_eq!(g.seed, Some(7));
+        assert_eq!(g.typical_p, 0.5);
+        assert_eq!(g.repeat_last_n, 32);
+        assert_eq!(g.presence_penalty, 0.25);
+        assert_eq!(g.frequency_penalty, 0.5);
+        assert_eq!((g.mirostat, g.mirostat_tau, g.mirostat_eta), (2, 4.0, 0.2));
+        // A client default larger than the loaded window is clamped to it,
+        // and 0 leaves the window alone.
+        let wide = OllamaOptions { num_ctx: Some(32_768), ..Default::default() };
+        assert_eq!(wide.to_generation_options(&defaults, 4096).unwrap().context_window, Some(4096));
+        let zero = OllamaOptions { num_ctx: Some(0), ..Default::default() };
+        assert_eq!(zero.to_generation_options(&defaults, 4096).unwrap().context_window, None);
     }
 
     #[test]
@@ -825,21 +908,17 @@ mod tests {
     /// reach outside it.
     #[test]
     fn unsafe_model_names_are_rejected() {
-        for bad in ["", "../etc/passwd", "a/b", "..", "dir/../x", "/abs/path"] {
-            let stem = strip_tag(bad);
-            let rejected = stem.is_empty()
-                || stem.contains('/')
-                || stem.contains('\\')
-                || stem.contains("..");
-            assert!(rejected, "`{bad}` must be rejected as a model name");
+        for bad in ["", "../etc/passwd", "a/b", "..", "dir/../x", "/abs/path", "a\\b", ":tag"] {
+            assert_eq!(bare_model_stem(bad), None, "`{bad}` must be rejected as a model name");
         }
         // The bare names clients actually send must pass.
-        for good in ["llama3", "llama3:13b", "my-model_1", "Qwen3-30B-A3B"] {
-            let stem = strip_tag(good);
-            assert!(
-                !stem.is_empty() && !stem.contains('/') && !stem.contains(".."),
-                "`{good}` must be accepted"
-            );
+        for (good, stem) in [
+            ("llama3", "llama3"),
+            ("llama3:13b", "llama3"),
+            ("my-model_1", "my-model_1"),
+            ("Qwen3-30B-A3B", "Qwen3-30B-A3B"),
+        ] {
+            assert_eq!(bare_model_stem(good), Some(stem), "`{good}` must be accepted");
         }
     }
 
@@ -855,7 +934,7 @@ mod tests {
                 ..Default::default()
             };
             assert_eq!(
-                o.to_generation_options(&defaults).unwrap().max_tokens,
+                o.to_generation_options(&defaults, 4096).unwrap().max_tokens,
                 crate::types::MAX_TOKENS_UNLIMITED
             );
         }

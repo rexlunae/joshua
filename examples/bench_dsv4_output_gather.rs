@@ -40,7 +40,7 @@ fn call_old(oa: &Tensor, seq: usize, dev: &Device) -> Result<Tensor> {
 }
 
 /// The new per-call sequence: zero-copy narrows + one concatenate.
-fn call_new(oa: &Tensor, seq: usize) -> Result<Tensor> {
+fn call_new(oa: &Tensor, _seq: usize) -> Result<Tensor> {
     let blocks: Vec<Tensor> = (0..GROUPS)
         .map(|g| {
             oa.narrow(1, g, 1)?
