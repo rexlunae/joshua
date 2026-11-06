@@ -1285,6 +1285,43 @@ async fn ollama_clients_get_ollama_shaped_answers() {
     let (_, ps) = call(&app, "GET", "/api/ps", serde_json::Value::Null).await;
     assert!(ps["models"].as_array().unwrap().is_empty(), "{ps}");
 
+    // ... and when the request fails after loading it.
+    let (status, _) = call(
+        &app,
+        "POST",
+        "/api/chat",
+        serde_json::json!({
+            "model": "tiny", "messages": messages, "stream": false, "keep_alive": 0,
+            "format": "xml",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (_, ps) = call(&app, "GET", "/api/ps", serde_json::Value::Null).await;
+    assert!(ps["models"].as_array().unwrap().is_empty(), "{ps}");
+
+    // A name generation would resolve to the one loaded model unloads that
+    // model, not nothing.
+    let (status, _) = call(
+        &app,
+        "POST",
+        "/api/generate",
+        serde_json::json!({"model": "tiny"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/api/generate",
+        serde_json::json!({"model": "an-alias", "keep_alive": 0}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["model"], "tiny", "{body}");
+    let (_, ps) = call(&app, "GET", "/api/ps", serde_json::Value::Null).await;
+    assert!(ps["models"].as_array().unwrap().is_empty(), "{ps}");
+
     // Errors are `{"error": "<message>"}`: an unknown model, and a body that
     // does not parse.
     let (status, body) = call(

@@ -287,13 +287,18 @@ pub struct PsModel {
 }
 
 /// Bytes of the model on an accelerator: all of it when its dense weights
-/// and experts run there, its expert cache when only the dense weights do
-/// (the experts stay in host memory), none on the CPU.
+/// and experts run there; its dense weights plus its expert cache when the
+/// routed experts stay in host memory; none on the CPU.
 fn size_vram(info: &ModelInfo) -> u64 {
-    let size = info.facts.as_ref().map_or(0, |f| f.file_size);
+    let Some(facts) = &info.facts else { return 0 };
     match &info.placement {
-        Some(p) if p.dense != "cpu" && p.experts.as_deref().is_none_or(|e| e != "cpu") => size,
-        Some(p) if p.dense != "cpu" => p.expert_cache_bytes.unwrap_or(0),
+        Some(p) if p.dense != "cpu" && p.experts.as_deref().is_none_or(|e| e != "cpu") => {
+            facts.file_size
+        }
+        Some(p) if p.dense != "cpu" => {
+            facts.tensor_bytes.saturating_sub(facts.expert_bytes)
+                + p.expert_cache_bytes.unwrap_or(0)
+        }
         _ => 0,
     }
 }
@@ -454,9 +459,11 @@ fn parameters(d: &SamplingDefaults) -> String {
 /// What a loaded model can do, in Ollama's capability names.
 fn capabilities(engine: &Engine) -> Vec<String> {
     let mut caps = vec!["completion"];
+    // A template that renders tools reads its `tools` variable (Ollama's
+    // own test); without a template, the ChatML fallback teaches them.
     if engine
         .chat_template_source()
-        .is_some_and(|t| t.contains("tools"))
+        .is_none_or(|t| t.contains("tools"))
     {
         caps.push("tools");
     }
@@ -705,17 +712,15 @@ struct Turn {
 }
 
 /// Answer a [`Turn`]: load or unload only, when it has nothing to say, else
-/// generate, streaming newline-delimited JSON or in one object.
+/// generate, streaming newline-delimited JSON or in one object.  With
+/// `keep_alive: 0` the model is unloaded once the request is done with it,
+/// however the request ends.
 async fn answer(state: AppState, turn: Turn) -> Result<Response, ApiError> {
     let started = Instant::now();
     let unload = unload_after(turn.keep_alive.as_ref()) && state.manager.is_some();
     if turn.messages.is_empty() {
         let (id, reason, load) = if unload {
-            let id = model_id(&state, &turn.model);
-            if state.models.list().iter().any(|m| m.id == id) {
-                crate::server::unload(&state, &id).await?;
-            }
-            (id, "unload", Duration::ZERO)
+            (unload_named(&state, &turn.model).await?, "unload", Duration::ZERO)
         } else {
             let (id, _engine, load) = select(&state, &turn.model).await?;
             (id, "load", load)
@@ -725,115 +730,180 @@ async fn answer(state: AppState, turn: Turn) -> Result<Response, ApiError> {
     }
 
     let (id, engine, load) = select(&state, &turn.model).await?;
-    let mut options = turn
-        .options
-        .to_generation_options(&engine.sampling_defaults(SamplingProfile::Ollama), engine.n_ctx())
-        .map_err(ApiError::bad_request)?;
-    options.constraint = constraint(turn.format.as_ref()).map_err(ApiError::bad_request)?;
-    // Answer a request the model cannot serve before a stream starts.
-    engine.validate_options(&options).map_err(ApiError::from)?;
-    let Turn { wire, messages, tools, stream, .. } = turn;
-    // `keep_alive: 0`: unload once the engine is no longer in use.
-    let release = move |state: AppState, id: String| async move {
-        if unload {
-            if let Err(e) = crate::server::unload(&state, &id).await {
-                tracing::debug!(model = %id, "keep_alive unload: {}", e.into_response().status());
-            }
+    let release = unload.then(|| (Arc::clone(&state), id.clone()));
+    let (result, streaming) =
+        generate_turn(&state, turn, id, engine, started, load, release.clone()).await;
+    // A stream unloads once its generation ends; every other exit here.
+    if !streaming {
+        if let Some((state, id)) = release {
+            unload_quietly(state, id).await;
         }
-    };
-
-    let cancel = CancelOnDrop::new();
-    if !stream {
-        let completion = tokio::task::spawn_blocking({
-            let engine = Arc::clone(&engine);
-            let messages = messages.clone();
-            let tools = tools.clone();
-            let flag = cancel.flag();
-            move || {
-                let format = match &tools {
-                    Some(tools) => engine.tool_call_format_for_request(&messages, Some(tools), &options)?,
-                    None => engine.tool_call_format(),
-                };
-                let completion = engine.complete_chat_cancellable_detailed(
-                    &messages,
-                    tools.as_deref(),
-                    &options,
-                    &flag,
-                )?;
-                Ok::<_, crate::JoshuaError>((completion, format))
-            }
-        })
-        .await
-        .map_err(|e| ApiError::internal(e.to_string()))?
-        .map_err(ApiError::from)?;
-        let (completion, format) = completion;
-        state.metrics.record_generation(&completion.usage);
-        let answer = crate::server::chat_answer(
-            &engine,
-            &completion,
-            false,
-            tools.as_deref(),
-            format,
-            "call_",
-        );
-        let end = End {
-            reason: completion.stop_type.finish_reason(),
-            completion: Some(&completion),
-            tool_calls: ollama_calls(&answer.calls),
-            started,
-            load,
-        };
-        let body = wire.done(&id, &answer.prose, &end);
-        drop(engine);
-        release(Arc::clone(&state), id).await;
-        return Ok(Json(body).into_response());
     }
+    result
+}
 
+/// Unload the model a request names with `keep_alive: 0` and nothing to
+/// say: the loaded model the name resolves to, as generation would pick it.
+/// A name for a directory model that is not loaded has nothing to unload.
+async fn unload_named(state: &AppState, name: &str) -> Result<String, ApiError> {
+    let id = model_id(state, name);
+    match state.resolve(&id) {
+        Ok((loaded, engine)) => {
+            drop(engine);
+            crate::server::unload(state, &loaded).await?;
+            Ok(loaded)
+        }
+        Err(_) if state.unloaded().iter().any(|(listed, _)| *listed == id) => Ok(id),
+        Err(e) => Err(e),
+    }
+}
+
+/// `keep_alive: 0`'s unload, once nothing holds the engine; a model that
+/// another request already unloaded is not an error.
+async fn unload_quietly(state: AppState, id: String) {
+    if let Err(e) = crate::server::unload(&state, &id).await {
+        tracing::debug!(model = %id, "keep_alive unload: {}", e.into_response().status());
+    }
+}
+
+/// Generate a [`Turn`] on `engine`.  Returns the response and whether it
+/// streams; a stream unloads the model itself (`release`) once its
+/// generation ends.  Every engine reference this holds is dropped by the
+/// time a non-streaming response returns.
+#[allow(clippy::too_many_arguments)]
+async fn generate_turn(
+    state: &AppState,
+    turn: Turn,
+    id: String,
+    engine: Arc<Engine>,
+    started: Instant,
+    load: Duration,
+    release: Option<(AppState, String)>,
+) -> (Result<Response, ApiError>, bool) {
+    let prepared = (|| {
+        let mut options = turn
+            .options
+            .to_generation_options(&engine.sampling_defaults(SamplingProfile::Ollama), engine.n_ctx())
+            .map_err(ApiError::bad_request)?;
+        options.constraint = constraint(turn.format.as_ref()).map_err(ApiError::bad_request)?;
+        // Answer a request the model cannot serve before a stream starts.
+        engine.validate_options(&options).map_err(ApiError::from)?;
+        Ok::<_, ApiError>(options)
+    })();
+    let options = match prepared {
+        Ok(options) => options,
+        Err(e) => return (Err(e), false),
+    };
+    let Turn { wire, messages, tools, stream, .. } = turn;
+    if stream {
+        (Ok(stream_turn(state, wire, id, engine, messages, tools, options, started, load, release)), true)
+    } else {
+        (whole_turn(state, wire, &id, engine, messages, tools, options, started, load).await, false)
+    }
+}
+
+/// One whole answer, generated on the blocking pool, which holds the
+/// engine until it is read.
+#[allow(clippy::too_many_arguments)]
+async fn whole_turn(
+    state: &AppState,
+    wire: Wire,
+    id: &str,
+    engine: Arc<Engine>,
+    messages: Vec<ChatMessage>,
+    tools: Option<Vec<Tool>>,
+    options: GenerationOptions,
+    started: Instant,
+    load: Duration,
+) -> Result<Response, ApiError> {
+    let cancel = CancelOnDrop::new();
+    let flag = cancel.flag();
+    let generated = tokio::task::spawn_blocking(move || {
+        let tools = tools.as_deref();
+        let format = match tools {
+            Some(tools) => engine.tool_call_format_for_request(&messages, Some(tools), &options)?,
+            None => engine.tool_call_format(),
+        };
+        let completion =
+            engine.complete_chat_cancellable_detailed(&messages, tools, &options, &flag)?;
+        let answer = crate::server::chat_answer(&engine, &completion, false, tools, format, "call_");
+        Ok::<_, crate::JoshuaError>((completion, answer))
+    })
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?;
+    let (completion, answer) = generated.map_err(ApiError::from)?;
+    state.metrics.record_generation(&completion.usage);
+    let end = End {
+        reason: completion.stop_type.finish_reason(),
+        completion: Some(&completion),
+        tool_calls: ollama_calls(&answer.calls),
+        started,
+        load,
+    };
+    Ok(Json(wire.done(id, &answer.prose, &end)).into_response())
+}
+
+/// A streamed answer: newline-delimited JSON from a blocking thread, which
+/// unloads the model (`release`) once generation ends.
+#[allow(clippy::too_many_arguments)]
+fn stream_turn(
+    state: &AppState,
+    wire: Wire,
+    id: String,
+    engine: Arc<Engine>,
+    messages: Vec<ChatMessage>,
+    tools: Option<Vec<Tool>>,
+    options: GenerationOptions,
+    started: Instant,
+    load: Duration,
+    release: Option<(AppState, String)>,
+) -> Response {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let cancel = CancelOnDrop::new();
     let flag = cancel.flag();
     state.metrics.record_stream();
     let runtime = tokio::runtime::Handle::current();
-    tokio::task::spawn_blocking({
-        let state = Arc::clone(&state);
-        move || {
-            let send = |value: Value| {
-                let _ = tx.send(format!("{value}\n"));
-            };
-            let result = crate::server::stream_chat_output(
-                &engine,
-                &messages,
-                tools.as_deref(),
-                &options,
-                &flag,
-                false,
-                "call_",
-                &mut |piece| {
-                    // Calls go out whole, once the answer is read (below).
-                    if let ChatPiece::Text(text) = piece {
-                        send(wire.chunk(&id, text, None));
-                    }
-                },
-            );
-            match result {
-                Ok((completion, calls)) => {
-                    state.metrics.record_generation(&completion.usage);
-                    let tool_calls = ollama_calls(&calls);
-                    if tool_calls.is_some() {
-                        send(wire.chunk(&id, "", tool_calls.clone()));
-                    }
-                    let end = End {
-                        reason: completion.stop_type.finish_reason(),
-                        completion: Some(&completion),
-                        tool_calls: None,
-                        started,
-                        load,
-                    };
-                    send(wire.done(&id, "", &end));
+    let metrics = Arc::clone(&state.metrics);
+    tokio::task::spawn_blocking(move || {
+        let send = |value: Value| {
+            let _ = tx.send(format!("{value}\n"));
+        };
+        let result = crate::server::stream_chat_output(
+            &engine,
+            &messages,
+            tools.as_deref(),
+            &options,
+            &flag,
+            false,
+            "call_",
+            &mut |piece| {
+                // Calls go out whole, once the answer is read (below).
+                if let ChatPiece::Text(text) = piece {
+                    send(wire.chunk(&id, text, None));
                 }
-                Err(e) => send(json!({ "error": e.to_string() })),
+            },
+        );
+        drop(engine);
+        match result {
+            Ok((completion, calls)) => {
+                metrics.record_generation(&completion.usage);
+                let tool_calls = ollama_calls(&calls);
+                if tool_calls.is_some() {
+                    send(wire.chunk(&id, "", tool_calls));
+                }
+                let end = End {
+                    reason: completion.stop_type.finish_reason(),
+                    completion: Some(&completion),
+                    tool_calls: None,
+                    started,
+                    load,
+                };
+                send(wire.done(&id, "", &end));
             }
-            drop(engine);
-            runtime.spawn(release(state, id));
+            Err(e) => send(json!({ "error": e.to_string() })),
+        }
+        if let Some((state, id)) = release {
+            runtime.spawn(unload_quietly(state, id));
         }
     });
 
@@ -850,7 +920,7 @@ async fn answer(state: AppState, turn: Turn) -> Result<Response, ApiError> {
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/x-ndjson"),
     );
-    Ok(response)
+    response
 }
 
 // ─── /api/chat ──────────────────────────────────────────────────────────────
@@ -1283,6 +1353,36 @@ mod tests {
         assert_eq!(parameter_size(596_049_920), "596.05M");
         assert_eq!(parameter_size(12_345), "12.35K");
         assert_eq!(parameter_size(0), "");
+    }
+
+    #[test]
+    fn vram_counts_what_runs_on_the_accelerator() {
+        let facts = GgufFacts {
+            tensor_bytes: 1_000,
+            expert_bytes: 800,
+            file_size: 1_100,
+            ..GgufFacts::default()
+        };
+        let info = |dense: &str, experts: Option<&str>, cache: Option<u64>| ModelInfo {
+            facts: Some(facts.clone()),
+            placement: Some(crate::model_info::Placement {
+                backend: dense.to_string(),
+                dense: dense.to_string(),
+                experts: experts.map(str::to_string),
+                expert_cache_bytes: cache,
+                npu: false,
+                remote: false,
+                workers: Vec::new(),
+                stages: Vec::new(),
+            }),
+            ..ModelInfo::new("m", 0)
+        };
+        assert_eq!(size_vram(&info("cuda", None, None)), 1_100);
+        assert_eq!(size_vram(&info("cuda", Some("cuda"), None)), 1_100);
+        // Dense weights on the device, routed experts in host memory.
+        assert_eq!(size_vram(&info("cuda", Some("cpu"), None)), 200);
+        assert_eq!(size_vram(&info("cuda", Some("cpu"), Some(50))), 250);
+        assert_eq!(size_vram(&info("cpu", Some("cpu"), None)), 0);
     }
 
     #[test]

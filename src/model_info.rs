@@ -50,6 +50,9 @@ pub struct GgufFacts {
     pub n_params: u64,
     /// Bytes of tensor data across every tensor.
     pub tensor_bytes: u64,
+    /// Bytes of tensor data in the routed experts (`*_exps` tensors); 0 for
+    /// a dense model.
+    pub expert_bytes: u64,
     /// The file's size in bytes.
     pub file_size: u64,
 }
@@ -79,15 +82,17 @@ impl GgufFacts {
             .get("general.type")
             .and_then(|v| v.to_string().ok())
             .cloned();
-        let (n_params, tensor_bytes) =
-            header
-                .tensors
-                .values()
-                .fold((0u64, 0u64), |(params, bytes), tensor| {
-                    let elems = tensor.elem_count();
-                    let size = crate::gguf_ext::type_size_bytes(tensor.dtype, elems).unwrap_or(0);
-                    (params + elems as u64, bytes + size as u64)
-                });
+        let (mut n_params, mut tensor_bytes, mut expert_bytes) = (0u64, 0u64, 0u64);
+        for (name, tensor) in &header.tensors {
+            let elems = tensor.elem_count();
+            let size = crate::gguf_ext::type_size_bytes(tensor.dtype, elems).unwrap_or(0) as u64;
+            n_params += elems as u64;
+            tensor_bytes += size;
+            // Routed experts: `blk.N.ffn_{gate,up,down}_exps.weight`.
+            if name.contains("_exps") {
+                expert_bytes += size;
+            }
+        }
         Self {
             n_ctx_train: arch_u32("context_length"),
             n_embd: arch_u32("embedding_length"),
@@ -97,6 +102,7 @@ impl GgufFacts {
             file_type,
             n_params,
             tensor_bytes,
+            expert_bytes,
             file_size,
             architecture,
             kind,
@@ -539,7 +545,7 @@ mod tests {
                     },
                 ),
                 (
-                    "proj",
+                    "blk.0.ffn_up_exps.weight",
                     RawTensorInfo {
                         dtype: 12,
                         dims: vec![2, 256],
@@ -566,6 +572,7 @@ mod tests {
                 file_type: Some(15),
                 n_params: 32 + 512,
                 tensor_bytes: 32 * 4 + 2 * 144,
+                expert_bytes: 2 * 144,
                 file_size: 5000,
             }
         );

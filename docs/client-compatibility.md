@@ -108,11 +108,12 @@ What the rest of a request and its answer carry:
   a 64-hex-digit SHA-256 of the model's id, path, size and modification time
   (not of its contents, so listing a directory reads no weights); `details`
   include `parameter_size`.  `/api/ps` adds `context_length` and `size_vram`
-  (the whole file when the model runs on an accelerator, the expert cache when
-  only its dense weights do, 0 on the CPU), and reports no expiry.
+  (the whole file when the model runs on an accelerator; its dense weights plus
+  its expert cache when the routed experts stay in host memory; 0 on the CPU), and reports no expiry.
 * **`/api/show`** returns the GGUF header facts under their metadata keys
   (`model_info`), and for a loaded model its chat template, its default
-  sampling parameters and its `capabilities` (`completion`, plus `tools`,
+  sampling parameters and its `capabilities` (`completion`, plus `tools` when
+  its template reads `tools` or it has none and uses the ChatML fallback,
   `insert`, `thinking` and `embedding` where they apply).
 * **Done object**: `done_reason` (`stop` or `length`), `prompt_eval_count`,
   `eval_count`, and `total_duration`, `load_duration`, `prompt_eval_duration`
@@ -126,7 +127,7 @@ What the rest of a request and its answer carry:
 * **`images`**: base64 strings, passed to a media-capable backend as the
   OpenAI routes' `data:` URLs are.
 * **`keep_alive`**: `0` (or `"0s"`, `"0m"`) unloads the model once the answer
-  is sent, when the server manages a model directory.  A request with no
+  is sent (or the request fails), when the server manages a model directory.  A request with no
   messages or prompt only loads the model (`done_reason: "load"`), or with
   `keep_alive: 0` unloads it (`"unload"`).  Other values are accepted and
   change nothing: a model stays loaded until it is unloaded.
