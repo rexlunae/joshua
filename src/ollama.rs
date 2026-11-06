@@ -47,7 +47,7 @@ use serde::{Deserialize, Serialize};
 use crate::engine::Engine;
 use crate::model_info::GgufFacts;
 use crate::sampling::{SamplingDefaults, SamplingProfile};
-use crate::server::{ApiError, AppState, CancelOnDrop};
+use crate::server::{select_model, ApiError, AppState, CancelOnDrop};
 use crate::types::{unix_time, ChatMessage, GenerationOptions, SamplingParams, Tool};
 
 fn now_rfc3339() -> String {
@@ -308,7 +308,7 @@ pub async fn chat(
     State(state): State<AppState>,
     Json(req): Json<ChatRequest>,
 ) -> Result<axum::response::Response, ApiError> {
-    let (id, engine) = state.resolve(&req.model)?;
+    let (id, engine) = select_model(&state, &req.model).await?;
     let options = req
         .options
         .to_generation_options(&engine.sampling_defaults(SamplingProfile::Ollama))
@@ -449,7 +449,7 @@ pub async fn generate(
     State(state): State<AppState>,
     Json(req): Json<GenerateRequest>,
 ) -> Result<axum::response::Response, ApiError> {
-    let (id, engine) = state.resolve(&req.model)?;
+    let (id, engine) = select_model(&state, &req.model).await?;
     let options = req
         .options
         .to_generation_options(&engine.sampling_defaults(SamplingProfile::Ollama))
@@ -564,7 +564,7 @@ pub async fn embed(
     State(state): State<AppState>,
     Json(req): Json<EmbedRequest>,
 ) -> Result<Json<EmbedResponse>, ApiError> {
-    let (_id, engine) = state.resolve(&req.model)?;
+    let (_id, engine) = select_model(&state, &req.model).await?;
 
     let inputs: Vec<String> = match (&req.input, &req.prompt) {
         (Some(serde_json::Value::String(s)), _) => vec![s.clone()],

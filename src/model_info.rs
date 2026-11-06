@@ -446,6 +446,20 @@ pub fn discover_gguf(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// The first file under `dir` that the inventory lists as a model: a GGUF that
+/// is a model on its own, in [`discover_gguf`] order (two levels deep, by
+/// path).
+///
+/// A model directory can hold more than models — adapters, projectors,
+/// importance matrices — and only [`GgufFacts::is_model`] tells them apart, so
+/// picking a model to start on reads the candidate headers instead of trusting
+/// the extension.  `None` means the directory holds no loadable model.
+pub fn first_model(dir: &Path) -> Option<PathBuf> {
+    discover_gguf(dir)
+        .into_iter()
+        .find(|file| GgufFacts::read(file).is_ok_and(|facts| facts.is_model()))
+}
+
 fn collect_gguf(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
     if depth > 2 {
         return;

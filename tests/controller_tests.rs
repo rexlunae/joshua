@@ -74,20 +74,16 @@ async fn a_server_without_a_model_loads_and_unloads_through_the_api() {
     common::write_tiny_llama_gguf(&dir.join("tiny.gguf"));
     let app = create_router(state(ModelRegistry::default(), Some(manager(&dir))));
 
-    let (status, body) = call(&app, "POST", "/v1/completions", completion("tiny")).await;
+    // Nothing is loaded, and `missing` is no model the directory lists.
+    let (status, body) = call(&app, "POST", "/v1/completions", completion("missing")).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     let (status, _) = call(&app, "GET", "/v1/worker/info", serde_json::Value::Null).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
 
-    let (status, body) = call(
-        &app,
-        "POST",
-        "/v1/models/load",
-        serde_json::json!({"model": "tiny.gguf"}),
-    )
-    .await;
+    // A request that names a listed model loads it: no explicit load first.
+    let (status, body) = call(&app, "POST", "/v1/completions", completion("tiny")).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["id"], "tiny");
+    assert_eq!(body["model"], "tiny");
     // A `joshua route` coordinator sees the loaded model.
     let (status, body) = call(&app, "GET", "/v1/worker/info", serde_json::Value::Null).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -235,12 +231,9 @@ async fn the_model_directory_lists_unloaded_files_from_their_headers() {
     assert_eq!(cards[1]["id"], "other");
     assert_eq!(cards[1]["joshua"]["loaded"], false);
 
-    // The one model loaded still answers a name the list does not have,
-    // but not one it gives a file that is not loaded: that is a 404, on
-    // every API, rather than an answer from another model.
-    let (status, body) = call(&app, "POST", "/v1/completions", completion("gpt-4o")).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["model"], "tiny");
+    // A listed file's id belongs to that file: a request that names it loads
+    // that file — which cannot load yet, its tokenizer is missing — rather than
+    // being answered by the model that is loaded.
     let messages = serde_json::json!([{"role": "user", "content": "hi"}]);
     for (uri, request) in [
         ("/v1/completions", completion("other")),
@@ -258,10 +251,8 @@ async fn the_model_directory_lists_unloaded_files_from_their_headers() {
         ),
     ] {
         let (status, body) = call(&app, "POST", uri, request).await;
-        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}: {body}");
-        assert_eq!(body["error"]["code"], "model_not_found", "{uri}: {body}");
-        let message = body["error"]["message"].as_str().unwrap();
-        assert!(message.contains("POST /v1/models/load"), "{uri}: {message}");
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{uri}: {body}");
+        assert_eq!(body["error"]["type"], "model_load_failed", "{uri}: {body}");
     }
 
     // Ollama's /api/tags lists the same inventory, now with each file's size
@@ -396,8 +387,6 @@ async fn each_model_file_is_listed_once_under_an_id_a_load_takes() {
             serde_json::json!(["solo", false]),
         ]
     );
-    let (status, body) = call(&app, "POST", "/v1/completions", completion("a/model.gguf")).await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
     let (status, body) = call(&app, "POST", "/v1/completions", completion("b/model.gguf")).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["model"], "b/model.gguf");
@@ -535,8 +524,6 @@ async fn no_two_listed_models_share_an_id() {
     let (status, body) = call(&app, "POST", "/v1/completions", completion("c/model.gguf")).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["model"], "c/model.gguf");
-    let (status, body) = call(&app, "POST", "/v1/completions", completion("a/model.gguf")).await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
     let (status, body) = call(
         &app,
         "POST",
@@ -884,4 +871,214 @@ async fn a_request_router_reaches_every_loaded_model() {
         assert_eq!(body["model"], model);
     }
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A `--model-dir` server serves its directory: a request that names a listed
+/// model loads it, so nothing has to be loaded through `POST /v1/models/load`
+/// before it is used.
+#[tokio::test]
+async fn a_request_loads_the_model_it_names() {
+    let dir = common::model_dir("controller-select");
+    for sub in ["alpha", "beta"] {
+        std::fs::create_dir_all(dir.join(sub)).unwrap();
+        common::write_tiny_llama_gguf(&dir.join(sub).join("model.gguf"));
+        std::fs::copy(
+            dir.join("tokenizer.json"),
+            dir.join(sub).join("tokenizer.json"),
+        )
+        .unwrap();
+    }
+    let app = create_router(state(ModelRegistry::default(), Some(manager(&dir))));
+    let listed = |body: &serde_json::Value| -> Vec<serde_json::Value> {
+        body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| serde_json::json!([m["id"], m["joshua"]["loaded"]]))
+            .collect()
+    };
+
+    // Both files share a stem, so each is listed by its path, unloaded.
+    let (_, body) = call(&app, "GET", "/v1/models", serde_json::Value::Null).await;
+    assert_eq!(
+        listed(&body),
+        [
+            serde_json::json!(["alpha/model.gguf", false]),
+            serde_json::json!(["beta/model.gguf", false]),
+        ]
+    );
+
+    // The request names one by its listed id: it loads and answers.
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/v1/completions",
+        completion("beta/model.gguf"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["model"], "beta/model.gguf");
+    let (_, body) = call(&app, "GET", "/v1/models", serde_json::Value::Null).await;
+    assert_eq!(
+        listed(&body),
+        [
+            serde_json::json!(["beta/model.gguf", true]),
+            serde_json::json!(["alpha/model.gguf", false]),
+        ]
+    );
+
+    // The next request reuses the loaded model, and the other file is still
+    // available (and untouched) under its own id.
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/v1/completions",
+        completion("beta/model.gguf"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, card) = call(
+        &app,
+        "GET",
+        "/v1/models/alpha/model.gguf",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{card}");
+    assert_eq!(card["joshua"]["loaded"], false, "{card}");
+
+    // Unloading hands the file back to the inventory; naming it loads it again.
+    let (status, _) = call(
+        &app,
+        "POST",
+        "/v1/models/unload",
+        serde_json::json!({"id": "beta/model.gguf"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, body) = call(&app, "GET", "/v1/models", serde_json::Value::Null).await;
+    assert!(
+        listed(&body).iter().all(|entry| entry[1] == false),
+        "{body}"
+    );
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/v1/completions",
+        completion("beta/model.gguf"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["model"], "beta/model.gguf");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A burst of requests for one cold model loads it once: they share the load
+/// rather than one of them failing as a duplicate.
+#[tokio::test]
+async fn concurrent_requests_share_one_load_of_a_cold_model() {
+    let dir = common::model_dir("controller-select-race");
+    common::write_tiny_llama_gguf(&dir.join("tiny.gguf"));
+    let app = create_router(state(ModelRegistry::default(), Some(manager(&dir))));
+
+    // Two different routes name the same unloaded model at once.
+    let (completion_res, chat_res) = tokio::join!(
+        call(&app, "POST", "/v1/completions", completion("tiny")),
+        call(
+            &app,
+            "POST",
+            "/api/chat",
+            serde_json::json!({
+                "model": "tiny",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": false,
+            }),
+        ),
+    );
+    assert_eq!(completion_res.0, StatusCode::OK, "{}", completion_res.1);
+    assert_eq!(chat_res.0, StatusCode::OK, "{}", chat_res.1);
+
+    // One entry, loaded once.
+    let (_, body) = call(&app, "GET", "/v1/models", serde_json::Value::Null).await;
+    assert_eq!(body["data"].as_array().unwrap().len(), 1, "{body}");
+    assert_eq!(body["data"][0]["id"], "tiny", "{body}");
+    assert_eq!(body["data"][0]["joshua"]["loaded"], true, "{body}");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A GGUF that is not a model on its own is not loaded by naming it: the
+/// request keeps the answer `/v1/models` implies (that id is no model there),
+/// rather than starting an engine on an adapter.
+#[tokio::test]
+async fn a_gguf_that_is_not_a_model_is_not_loaded_by_naming_it() {
+    use candle_core::quantized::gguf_file::Value;
+    let dir = common::model_dir("controller-select-adapter");
+    common::write_tiny_llama_gguf(&dir.join("base.gguf"));
+    let adapter = [(
+        "general.type".to_string(),
+        Value::String("adapter".to_string()),
+    )];
+    common::write_tiny_gguf_with(&dir.join("lora.gguf"), "llama", &adapter);
+    let app = create_router(state(ModelRegistry::default(), Some(manager(&dir))));
+
+    // The adapter is not listed as a model, so it is not a name to select.
+    let (_, body) = call(&app, "GET", "/v1/models", serde_json::Value::Null).await;
+    let ids: Vec<_> = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].clone())
+        .collect();
+    assert_eq!(ids, ["base"], "{body}");
+
+    // Load the model the directory does list, then name the adapter: the
+    // answer stays the unknown-model one and no second engine starts.
+    let (status, body) = call(&app, "POST", "/v1/completions", completion("base")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = call(&app, "POST", "/v1/completions", completion("lora")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"]["code"], "model_not_found", "{body}");
+    let (_, body) = call(&app, "GET", "/v1/models", serde_json::Value::Null).await;
+    let loaded: Vec<_> = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["joshua"]["loaded"] == true)
+        .map(|m| m["id"].clone())
+        .collect();
+    assert_eq!(loaded, ["base"], "{body}");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// The model `--model DIR` starts on comes from the inventory's own discovery:
+/// a directory whose models are all in subdirectories starts, and one with no
+/// model at all is reported.
+#[test]
+fn the_first_model_in_a_directory_is_a_loadable_one() {
+    use candle_core::quantized::gguf_file::Value;
+    let dir = common::model_dir("controller-first-model");
+    let kind = |k: &str| {
+        [(
+            "general.type".to_string(),
+            Value::String(k.to_string()),
+        )]
+    };
+    // Neither a model on its own, both before the model in path order.
+    common::write_tiny_gguf_with(&dir.join("a-adapter.gguf"), "llama", &kind("adapter"));
+    std::fs::write(dir.join("b-broken.gguf"), b"not a gguf").unwrap();
+    std::fs::create_dir_all(dir.join("nested")).unwrap();
+    common::write_tiny_llama_gguf(&dir.join("nested").join("model.gguf"));
+
+    assert_eq!(
+        joshua::model_info::first_model(&dir),
+        Some(dir.join("nested").join("model.gguf"))
+    );
+
+    // A directory of anything-but-models has nothing to start on.
+    let none = common::model_dir("controller-first-model-none");
+    common::write_tiny_gguf_with(&none.join("a.gguf"), "llama", &kind("adapter"));
+    common::write_tiny_gguf_with(&none.join("b.gguf"), "llama", &kind("imatrix"));
+    assert_eq!(joshua::model_info::first_model(&none), None);
+    std::fs::remove_dir_all(dir).unwrap();
+    std::fs::remove_dir_all(none).unwrap();
 }
