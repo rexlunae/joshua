@@ -983,7 +983,11 @@ mod tests {
         // goodbye lands in well under a second, whereas expiry alone would take
         // the full 15 s. Without this, a missing goodbye or a dropped removal
         // event would go unnoticed.
-        b.shutdown().expect("B shuts down");
+        // `shutdown` first unregisters B's service (the mDNS goodbye the
+        // removal check below relies on), then stops B's daemon. Its error
+        // context says which of the two failed ("wait for mDNS goodbye" or
+        // "wait for mDNS shutdown"), so the message here names neither.
+        b.shutdown().expect("second node (B) did not shut down cleanly");
         let sees_b = |a: &Discovery| a.peers().iter().any(|p| p.node.uuid == b_uuid);
         let gone_by = Instant::now() + PEER_TTL / 2;
         while Instant::now() < gone_by && sees_b(&a) {
