@@ -1120,7 +1120,7 @@ pub struct ChatCompletionRequest {
 }
 
 /// Parse the OpenAI `response_format` value into a decoding constraint.
-fn parse_response_format(format: &serde_json::Value) -> Result<Option<ConstraintSpec>, String> {
+pub(crate) fn parse_response_format(format: &serde_json::Value) -> Result<Option<ConstraintSpec>, String> {
     let kind = format
         .get("type")
         .and_then(|v| v.as_str())

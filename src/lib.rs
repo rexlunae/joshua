@@ -27,6 +27,7 @@ pub mod anthropic;
 pub mod attention;
 pub mod auto_placement;
 pub mod compression;
+pub mod completions;
 pub mod coordinator;
 pub mod cpu_pinning;
 pub mod profile;

@@ -3758,7 +3758,11 @@ impl Engine {
     /// does (see [`crate::fim::format_infill`]), for this model's FIM
     /// tokens and context window.  The prefix, suffix, extra files and
     /// prompt are tokenized as plain text (special-token strings in them
-    /// stay text).  `n_predict` of -1 means no output limit.
+    /// stay text).  `n_predict` of -1 means no output limit.  `add_bos`
+    /// puts the tokenizer's BOS (when it has one) in front of the prefix,
+    /// as llama-server does; vLLM's `add_special_tokens: false` turns it
+    /// off.
+    #[allow(clippy::too_many_arguments)]
     pub fn format_infill(
         &self,
         input_prefix: &str,
@@ -3767,6 +3771,7 @@ impl Engine {
         prompt: &str,
         n_predict: i64,
         spm: bool,
+        add_bos: bool,
     ) -> Result<Vec<u32>> {
         let plain = self.plain_tokenizer.get_or_init(|| {
             let mut t = (*self.tokenizer).clone();
@@ -3781,7 +3786,9 @@ impl Engine {
         };
         // The tokenizer adds a BOS when its special-token wrapper puts one
         // in front of ordinary text.
-        let bos = {
+        let bos = if !add_bos {
+            None
+        } else {
             let with = self.tokenize("a", true)?;
             let without = self.tokenize("a", false)?;
             (with.len() > without.len() && with.first() != without.first()).then(|| with[0])
@@ -4533,6 +4540,28 @@ impl Engine {
             ))),
             Some(w) => Ok(w as usize),
         }
+    }
+
+    /// Tokenize `prompt` and check it as generation will, so an API layer
+    /// can refuse it before a stream starts: token ids within the
+    /// vocabulary, and, after any `truncate_prompt_tokens`, a prompt that is
+    /// not empty and leaves room in the request's context window.
+    pub fn check_prompt(&self, prompt: &RawPrompt, options: &GenerationOptions) -> Result<()> {
+        let n_prompt = self.tokenize_prompt(prompt)?.len();
+        let n_ctx = self.request_n_ctx(options)?;
+        let n_prompt = match self.prompt_keep(options, n_ctx)? {
+            Some(keep) => n_prompt.min(keep),
+            None => n_prompt,
+        };
+        if n_prompt == 0 {
+            return Err(JoshuaError::InvalidRequest(
+                "The decoder prompt cannot be empty".to_string(),
+            ));
+        }
+        if n_prompt >= n_ctx {
+            return Err(JoshuaError::PromptTooLong(n_prompt, n_ctx));
+        }
+        Ok(())
     }
 
     /// Check a request's options against this model before any work, as

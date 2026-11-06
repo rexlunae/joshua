@@ -862,8 +862,14 @@ fn fim_tokens_and_infill_prompt() {
         text: "d".into(),
     }];
     let prompt = engine
-        .format_infill("hello", "world", &extra, "a", -1, false)
+        .format_infill("hello", "world", &extra, "a", -1, false, true)
         .unwrap();
+    // Without the BOS the prompt is the same less any BOS the tokenizer adds.
+    let bos = engine.tokenize("a", true).unwrap().len() > engine.tokenize("a", false).unwrap().len();
+    let without = engine
+        .format_infill("hello", "world", &extra, "a", -1, false, false)
+        .unwrap();
+    assert_eq!(without.len() + usize::from(bos), prompt.len());
     // [SEP] c \n d [SEP] filename \n [PRE] hello a [SUF] world [MID]; the
     // word-level test vocabulary maps `filename` to <unk>.
     let pre = prompt.iter().position(|&t| t == 10).unwrap();
@@ -877,7 +883,7 @@ fn fim_tokens_and_infill_prompt() {
     // A model without FIM tokens cannot infill.
     let plain = self::engine("core-no-fim");
     assert!(matches!(
-        plain.format_infill("a", "b", &[], "", -1, false),
+        plain.format_infill("a", "b", &[], "", -1, false, true),
         Err(JoshuaError::InvalidRequest(_))
     ));
 }
