@@ -453,21 +453,27 @@ class Agent:
                 ids.append(model["id"])
         return ids
 
-    def _inside_model_dir(self, root):
+    def _inside_catalog(self, root):
+        """Whether a server-reported root lies inside the catalog roots (`--catalog`/`--model-dir`)."""
         try:
             path = Path(os.path.expanduser(root))
             if not path.is_absolute():
-                return True        # a server-relative id; the server resolves it under its own dir
-            return path.resolve().is_relative_to(self.model_dir)
+                path = self.model_dir / path   # server-relative id, resolved under its own dir
+            path = path.resolve()
         except (OSError, ValueError):
             return False
+        return any(path.is_relative_to(r) for r in self.roots)
+
+    @staticmethod
+    def _is_vocab(name):
+        return Path(name).name.startswith("ggml-vocab")
 
     def server_catalog(self):
         """Joshua's own model list, filtered to things a user should actually pick.
 
         - `ggml-vocab-*.gguf` are tokenizer vocabularies, not models (`n_params == 0`)
         - sharded models report one entry per shard; only `…-00001-of-0000N` is offered
-        - loaded models are left to `loaded()`, and roots outside `--model-dir` are dropped
+        - loaded models are left to `loaded()`, and roots outside the catalog roots are dropped
         """
         found = {}
         for model in self.server_models():
@@ -476,7 +482,7 @@ class Agent:
             served = model.get("joshua") or {}
             if not isinstance(served, dict) or "loaded" not in served or served.get("loaded"):
                 continue
-            if model_id.startswith(("llama-fork/", "llama.cpp/")) or "ggml-vocab" in model_id:
+            if model_id.startswith(("llama-fork/", "llama.cpp/")) or self._is_vocab(model_id):
                 continue
             try:
                 n_params = int(meta.get("n_params") or 0) if isinstance(meta, dict) else 0
@@ -490,7 +496,7 @@ class Agent:
                     continue
                 model_id = shard.group(1)
             root = model.get("root") or model["id"]
-            if model_id in found or not self._inside_model_dir(root):
+            if model_id in found or not self._inside_catalog(root):
                 continue
             found[model_id] = {"path": root, "name": ""}
         return found
@@ -525,7 +531,7 @@ class Agent:
             if not os.path.isdir(root):
                 continue
             for path in sorted(Path(root).rglob("*.gguf")):
-                if "ggml-vocab" in path.name or path.name.startswith("mmproj-"):
+                if self._is_vocab(path.name) or path.name.startswith("mmproj-"):
                     continue
                 try:
                     path = path.resolve(strict=True)

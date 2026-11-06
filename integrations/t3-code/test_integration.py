@@ -91,6 +91,29 @@ class CatalogTests(unittest.TestCase):
             self.assertTrue(names["Running"].endswith(" *"))
             self.assertNotIn("ggml-vocab-llama", names)
 
+    def test_server_models_respect_explicit_catalog_roots(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "models"
+            public = root / "public"
+            public.mkdir(parents=True)
+            (root / "private").mkdir()
+            served = [
+                {"id": "pub", "root": str(public / "pub.gguf"),
+                 "joshua": {"loaded": False, "architecture": "llama"}},
+                {"id": "priv", "root": str(root / "private" / "priv.gguf"),
+                 "joshua": {"loaded": False, "architecture": "llama"}},
+                {"id": "public/rel", "root": "public/rel.gguf",
+                 "joshua": {"loaded": False, "architecture": "llama"}},
+                {"id": "qwen-ggml-vocab-finetune", "root": str(public / "qwen-ggml-vocab-finetune.gguf"),
+                 "joshua": {"loaded": False, "architecture": "qwen3"}},
+                {"id": "public/ggml-vocab-llama", "root": str(public / "ggml-vocab-llama.gguf"),
+                 "joshua": {"loaded": False, "architecture": "llama"}},
+            ]
+            agent = acp.Agent("http://127.0.0.1:8080", None, None,
+                              catalog_roots=[str(public)], model_dir=str(root))
+            agent.server_models = lambda base=None, session=None: [dict(m) for m in served]
+            self.assertEqual(set(agent.catalog()), {"pub", "public/rel", "qwen-ggml-vocab-finetune"})
+
     def test_legacy_model_list_counts_as_loaded(self):
         agent = acp.Agent("http://127.0.0.1:8080", None, None)
         agent.server_models = lambda base=None, session=None: [{"id": "legacy"}]
