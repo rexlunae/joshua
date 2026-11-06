@@ -2842,9 +2842,7 @@ async fn embeddings(
         }
     }
     let texts: Vec<String> = req.input.into_vec();
-    if texts.len() > 2048 {
-        return Err(ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "too many embedding inputs", "job_input_limit"));
-    }
+    check_embedding_inputs(texts.len())?;
     if headers.contains_key(JOB_OWNER_HEADER) && texts.len() > 32 {
         return Err(ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "too many inputs in embedding subbatch", "job_input_limit"));
     }
@@ -2872,8 +2870,30 @@ async fn embeddings(
             ..Default::default()
         },
     };
-    let limit = if headers.contains_key(JOB_OWNER_HEADER) { 2 << 20 } else { 8 << 20 };
-    crate::job_admission::json_response(&response, limit).map_err(|_| {
+    let limit = if headers.contains_key(JOB_OWNER_HEADER) { 2 << 20 } else { EMBEDDING_RESPONSE_LIMIT };
+    embedding_response(&response, limit)
+}
+
+/// Most inputs one embedding request may carry.
+const EMBEDDING_INPUT_LIMIT: usize = 2048;
+/// Largest embedding response, in bytes.
+pub(crate) const EMBEDDING_RESPONSE_LIMIT: usize = 8 << 20;
+
+/// Refuse an embedding request with more than [`EMBEDDING_INPUT_LIMIT`]
+/// inputs.
+pub(crate) fn check_embedding_inputs(count: usize) -> Result<(), ApiError> {
+    if count > EMBEDDING_INPUT_LIMIT {
+        return Err(ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "too many embedding inputs", "job_input_limit"));
+    }
+    Ok(())
+}
+
+/// An embedding response serialized within `limit` bytes, or refused.
+pub(crate) fn embedding_response(
+    value: &impl serde::Serialize,
+    limit: usize,
+) -> Result<Response, ApiError> {
+    crate::job_admission::json_response(value, limit).map_err(|_| {
         ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "embedding response exceeds job buffer limit", "job_response_limit")
     })
 }

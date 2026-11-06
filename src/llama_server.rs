@@ -14,7 +14,7 @@ use axum::{
     extract::State,
     http::HeaderMap,
     response::{IntoResponse, Response},
-    Json,
+    Extension, Json,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -26,7 +26,11 @@ use crate::completions::{
 use crate::engine::{Completion, Engine, PromptPart};
 use crate::fim::InfillChunk;
 use crate::sampling::SamplingProfile;
-use crate::server::{embed_texts, select_model, ApiError, AppState};
+use crate::job_admission::JobLease;
+use crate::server::{
+    check_embedding_inputs, embed_texts, embedding_response, select_model, ApiError, AppState,
+    EMBEDDING_RESPONSE_LIMIT,
+};
 use crate::types::{
     ChatCompletionRequest, ConstraintSpec, GenerationOptions, MAX_TOKENS_UNLIMITED,
 };
@@ -150,9 +154,25 @@ struct Frame {
     return_tokens: bool,
 }
 
+/// What a result reports about its prompt: the prompt's text and whether
+/// `truncate_prompt_tokens` cut it.
+struct JobFacts {
+    prompt: String,
+    truncated: bool,
+}
+
+impl JobFacts {
+    fn of(job: &Job) -> Self {
+        Self {
+            prompt: job.echo.clone(),
+            truncated: job.truncated,
+        }
+    }
+}
+
 impl Frame {
     /// A finished prompt's result (llama-server's final response).
-    fn result(&self, index: usize, content: &str, prompt: &str, completion: &Completion) -> Value {
+    fn result(&self, index: usize, content: &str, job: &JobFacts, completion: &Completion) -> Value {
         json!({
             "index": index,
             "content": content,
@@ -163,9 +183,9 @@ impl Frame {
             "tokens_predicted": completion.usage.completion_tokens,
             "tokens_evaluated": completion.usage.prompt_tokens,
             "generation_settings": self.settings,
-            "prompt": prompt,
+            "prompt": job.prompt,
             "has_new_line": completion.text.contains('\n'),
-            "truncated": false,
+            "truncated": job.truncated,
             "stop_type": completion.stop_type.as_str(),
             "stopping_word": completion.stop_sequence.as_deref().unwrap_or(""),
             "tokens_cached": completion.cached_tokens,
@@ -187,14 +207,14 @@ async fn answer(
     stream: bool,
 ) -> Result<Response, ApiError> {
     if stream {
-        let echoes: Vec<String> = jobs.iter().map(|j| j.echo.clone()).collect();
+        let facts: Vec<JobFacts> = jobs.iter().map(JobFacts::of).collect();
         let framer = move |progress: Progress<'_>| -> Option<Value> {
             Some(match progress {
                 Progress::Text(index, text) => json!({
                     "index": index, "content": text, "tokens": [], "stop": false, "id_slot": -1,
                 }),
                 Progress::Done(index, completion) => {
-                    frame.result(index, "", &echoes[index], completion)
+                    frame.result(index, "", &facts[index], completion)
                 }
             })
         };
@@ -216,7 +236,7 @@ async fn answer(
         .zip(&jobs)
         .enumerate()
         .map(|(index, (completion, job))| {
-            frame.result(index, &completion.text, &job.echo, completion)
+            frame.result(index, &completion.text, &JobFacts::of(job), completion)
         })
         .collect();
     Ok(match results.len() {
@@ -312,7 +332,7 @@ pub(crate) async fn infill(
         let options = options.clone();
         tokio::task::spawn_blocking(move || -> Result<Vec<Job>, ApiError> {
             let prompt = infill_prompt(&engine, &prefix, &suffix, &extra, &prompt, &options, true)?;
-            engine
+            let truncated = engine
                 .check_prompt(&prompt, &options)
                 .map_err(ApiError::from)?;
             let ids: Vec<u32> = prompt
@@ -325,7 +345,11 @@ pub(crate) async fn infill(
                 .copied()
                 .collect();
             let echo = engine.detokenize(&ids, false).map_err(ApiError::from)?;
-            Ok(vec![Job { prompt, echo }])
+            Ok(vec![Job {
+                prompt,
+                echo,
+                truncated,
+            }])
         })
         .await
         .map_err(|e| ApiError::internal(e.to_string()))??
@@ -346,8 +370,9 @@ pub(crate) async fn infill(
 /// vector per input.
 pub(crate) async fn embedding(
     State(state): State<AppState>,
+    Extension(lease): Extension<Arc<JobLease>>,
     Json(body): Json<Value>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Response, ApiError> {
     let input = body.get("content").or_else(|| body.get("input"));
     let texts: Vec<String> = match input {
         Some(Value::String(s)) => vec![s.clone()],
@@ -360,6 +385,7 @@ pub(crate) async fn embedding(
             })?,
         _ => return Err(ApiError::bad_request("`content` is required")),
     };
+    check_embedding_inputs(texts.len())?;
     match body.get("embd_normalize") {
         None | Some(Value::Null) => {}
         Some(n) if n.as_i64() == Some(2) => {}
@@ -374,14 +400,13 @@ pub(crate) async fn embedding(
         .and_then(Value::as_str)
         .unwrap_or_default();
     let (_, engine) = select_model(&state, model).await?;
-    let (vectors, _) = embed_texts(&state, &engine, texts, None).await?;
-    Ok(Json(Value::Array(
-        vectors
-            .into_iter()
-            .enumerate()
-            .map(|(index, vector)| json!({"index": index, "embedding": [vector]}))
-            .collect(),
-    )))
+    let (vectors, _) = embed_texts(&state, &engine, texts, Some(lease)).await?;
+    let results: Vec<Value> = vectors
+        .into_iter()
+        .enumerate()
+        .map(|(index, vector)| json!({"index": index, "embedding": [vector]}))
+        .collect();
+    embedding_response(&results, EMBEDDING_RESPONSE_LIMIT)
 }
 
 /// `POST /apply-template`: the prompt a chat request renders to, without

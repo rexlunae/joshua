@@ -165,6 +165,8 @@ impl CompletionRequest {
 pub(crate) struct Job {
     pub(crate) prompt: RawPrompt,
     pub(crate) echo: String,
+    /// `truncate_prompt_tokens` cuts the prompt.
+    pub(crate) truncated: bool,
 }
 
 /// How a request's prompts are built.
@@ -243,10 +245,14 @@ pub(crate) fn jobs(
                     RawPrompt::mixed(parts).with_special_tokens(special)
                 }
             };
-            engine
+            let truncated = engine
                 .check_prompt(&prompt, options)
                 .map_err(ApiError::from)?;
-            Ok(Job { prompt, echo })
+            Ok(Job {
+                prompt,
+                echo,
+                truncated,
+            })
         })
         .collect()
 }
@@ -325,8 +331,8 @@ pub(crate) enum Progress<'a> {
 
 /// Stream each job's completion in turn as server-sent events, each
 /// [`Progress`] framed by `frame` (`None` sends nothing).  A failed
-/// generation ends the stream with `error`; `last`, when set, is sent after
-/// every prompt is done.  The engine stops when the client goes away.
+/// generation ends the stream with `error`; `last`, when set, ends every
+/// stream, a failed one included.  The engine stops when the client goes away.
 pub(crate) fn stream_all(
     engine: Arc<Engine>,
     jobs: Vec<Job>,
@@ -347,6 +353,11 @@ pub(crate) fn stream_all(
                 let _ = tx.send(value.to_string());
             }
         };
+        let finish = || {
+            if let Some(last) = last {
+                let _ = tx.send(last.to_string());
+            }
+        };
         for (index, job) in jobs.iter().enumerate() {
             let result =
                 engine.complete_prompt_streaming(&job.prompt, &options, flag, &mut |text| {
@@ -360,13 +371,12 @@ pub(crate) fn stream_all(
                 Err(e) => {
                     tracing::error!("streaming completion failed: {e}");
                     send(Some(error));
+                    finish();
                     return;
                 }
             }
         }
-        if let Some(last) = last {
-            let _ = tx.send(last.to_string());
-        }
+        finish();
     });
     sse_response(rx, cancel)
 }

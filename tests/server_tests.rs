@@ -1640,6 +1640,16 @@ async fn llama_server_native_routes_answer_in_llama_server_shapes() {
     );
     let text = whole["content"].as_str().unwrap().to_string();
     assert_eq!(whole["tokens"], serde_json::json!([]), "{body}");
+    assert_eq!(whole["truncated"], false, "{body}");
+
+    // `truncate_prompt_tokens` that cuts the prompt is reported.
+    let mut cut = base.clone();
+    cut["truncate_prompt_tokens"] = serde_json::json!(2);
+    let (status, body) = call("/completion", cut).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["truncated"], true, "{body}");
+    assert_eq!(v["tokens_evaluated"], 2, "{body}");
 
     // The same prompt split into text and ids is one prompt with the same
     // answer; `return_tokens` gives the generated ids.

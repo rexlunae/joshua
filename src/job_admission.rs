@@ -71,7 +71,11 @@ pub(crate) async fn admit(
     next: Next,
 ) -> Response {
     let (slots, limit) = match request.uri().path() {
-        "/v1/embeddings" => (admission.embeddings, EMBEDDING_BYTES),
+        // llama-server's native embedding routes share the OpenAI one's
+        // budget.
+        "/v1/embeddings" | "/embedding" | "/embeddings" => {
+            (admission.embeddings, EMBEDDING_BYTES)
+        }
         "/v1/audio/transcriptions" => (admission.audio, AUDIO_BYTES),
         _ => return next.run(request).await,
     };

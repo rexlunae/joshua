@@ -4569,13 +4569,15 @@ impl Engine {
     /// Tokenize `prompt` and check it as generation will, so an API layer
     /// can refuse it before a stream starts: token ids within the
     /// vocabulary, and, after any `truncate_prompt_tokens`, a prompt that is
-    /// not empty and leaves room in the request's context window.
-    pub fn check_prompt(&self, prompt: &RawPrompt, options: &GenerationOptions) -> Result<()> {
-        let n_prompt = self.tokenize_prompt(prompt)?.len();
+    /// not empty and leaves room in the request's context window.  Returns
+    /// whether `truncate_prompt_tokens` cuts the prompt (llama-server's
+    /// `truncated`).
+    pub fn check_prompt(&self, prompt: &RawPrompt, options: &GenerationOptions) -> Result<bool> {
+        let n_whole = self.tokenize_prompt(prompt)?.len();
         let n_ctx = self.request_n_ctx(options)?;
         let n_prompt = match self.prompt_keep(options, n_ctx)? {
-            Some(keep) => n_prompt.min(keep),
-            None => n_prompt,
+            Some(keep) => n_whole.min(keep),
+            None => n_whole,
         };
         if n_prompt == 0 {
             return Err(JoshuaError::InvalidRequest(
@@ -4585,7 +4587,7 @@ impl Engine {
         if n_prompt >= n_ctx {
             return Err(JoshuaError::PromptTooLong(n_prompt, n_ctx));
         }
-        Ok(())
+        Ok(n_prompt < n_whole)
     }
 
     /// Check a request's options against this model before any work, as
