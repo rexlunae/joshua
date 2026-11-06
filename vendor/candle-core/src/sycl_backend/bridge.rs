@@ -41,7 +41,9 @@ fn runtime_candidates() -> Vec<PathBuf> {
 /// The bridge file [`api`] loaded, once it has.
 static LOADED_FROM: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
-/// Which `libjoshua_sycl` file was loaded, once a SYCL device has been opened.
+/// Which `libjoshua_sycl` file was loaded, once a SYCL device has been opened:
+/// the candidate as tried, so a bare file name means the dynamic loader's own
+/// search (`LD_LIBRARY_PATH`, the system directories) found it.
 ///
 /// Without `JOSHUA_SYCL_LIBRARY` the bridge is searched for on the library
 /// path and then under `~/joshua-sycl/`, so a stale bridge from another tree

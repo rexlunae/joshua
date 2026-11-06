@@ -3288,8 +3288,16 @@ impl Engine {
                 } else {
                     "off"
                 },
-                candle_core::sycl_backend::bridge_library_path()
-                    .map_or_else(|| "?".to_string(), |p| p.display().to_string()),
+                candle_core::sycl_backend::bridge_library_path().map_or_else(
+                    || "?".to_string(),
+                    // A bare file name was found by the dynamic loader's own
+                    // search, which does not report the directory it used.
+                    |p| if p.parent().is_some_and(|d| !d.as_os_str().is_empty()) {
+                        p.display().to_string()
+                    } else {
+                        format!("{} from the system library search path", p.display())
+                    },
+                ),
             );
         }
     }

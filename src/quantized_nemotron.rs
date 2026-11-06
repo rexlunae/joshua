@@ -408,13 +408,16 @@ impl Weight {
     /// The logical weight shape, for load-time validation.
     fn shape(&self) -> Option<(usize, usize)> {
         match self {
-            Self::Quant(q) => match q {
-                QMatMul::QTensor(t) => t.shape().dims().first().map(|_| ()).and_then(|_| {
-                    let d = t.shape().dims();
-                    (d.len() == 2).then(|| (d[0], d[1]))
-                }),
-                _ => None,
-            },
+            Self::Quant(q) => {
+                let dims = match q {
+                    QMatMul::QTensor(t) => t.shape().dims(),
+                    QMatMul::Tensor(t) | QMatMul::TensorF16(t) => t.dims(),
+                };
+                match *dims {
+                    [out_dim, in_dim] => Some((out_dim, in_dim)),
+                    _ => None,
+                }
+            }
             Self::Nvfp4 { out_dim, in_dim, .. } => Some((*out_dim, *in_dim)),
         }
     }
