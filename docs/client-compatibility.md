@@ -37,13 +37,18 @@ about these routes.
 | Endpoint | Status |
 |---|---|
 | `GET /health` | ✅ |
-| `GET /props` | ✅ properties + `default_generation_settings` |
+| `POST /completion` (`/completions`) | ✅ raw prompt: a string, token ids, a mix of both, or an array of those (an array of results); SSE streaming without `[DONE]`; `json_schema` / `response_format`; `return_tokens`; llama-server's result fields (`stop_type`, `stopping_word`, `tokens_cached`, `timings`, `generation_settings`). `grammar` (GBNF), `n_probs`, per-request `lora` and multimodal prompts are refused |
+| `POST /infill` | ✅ `input_prefix`, `input_suffix`, `input_extra`, `prompt`, in the model's FIM format (refused for a model without FIM tokens) |
+| `POST /embedding` (`/embeddings`) | ✅ `content` or `input`; `[{"index", "embedding": [[…]]}]`, one pooled L2-normalized vector per input (`embd_normalize` other than 2 is refused) |
+| `POST /apply-template` | ✅ the rendered chat prompt, `{"prompt": …}` |
+| `GET /props` | ✅ the model's real chat template, `default_generation_settings.params` under llama-server's names, `total_slots`, `build_info` |
 | `GET /slots` | ✅ one record per loaded model |
-| `POST /tokenize` | ✅ (`/api/tokens` too) |
+| `POST /tokenize` | ✅ `with_pieces` (a piece is text, or its bytes when not whole UTF-8); `add_special` / `add_special_tokens`; `/api/tokens` too |
 | `POST /detokenize` | ✅ answers with `content` (llama.cpp's key) and `prompt` (vLLM's) |
 
-`/props` returns the fields clients read for defaults (`n_ctx`,
-`default_generation_settings`, `total_slots`).  Field-for-field parity with a
+Where joshua's default differs from llama-server's: `/tokenize` adds the
+tokenizer's special tokens unless told not to.  The routes take an optional
+`model` to pick one of several loaded models.  Field-for-field parity with a
 specific `llama-server` build has not been diffed.
 
 ## vLLM

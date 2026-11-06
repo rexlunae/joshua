@@ -28,6 +28,7 @@ pub mod attention;
 pub mod auto_placement;
 pub mod compression;
 pub mod completions;
+pub mod llama_server;
 pub mod coordinator;
 pub mod cpu_pinning;
 pub mod profile;

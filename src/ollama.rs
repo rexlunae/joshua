@@ -1050,10 +1050,7 @@ async fn embed_inputs(
         return Err(ApiError::bad_request("`input` or `prompt` is required"));
     }
     let (id, engine, load) = select(state, &req.model).await?;
-    let (vectors, tokens) = tokio::task::spawn_blocking(move || engine.embed_with_usage(&inputs))
-        .await
-        .map_err(|e| ApiError::internal(e.to_string()))?
-        .map_err(ApiError::from)?;
+    let (vectors, tokens) = crate::server::embed_texts(state, &engine, inputs, None).await?;
     Ok((vectors, tokens, id, load))
 }
 

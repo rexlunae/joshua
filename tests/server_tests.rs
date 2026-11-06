@@ -1609,3 +1609,166 @@ async fn raw_completions_take_every_prompt_form_and_stream() {
         assert!(text.contains(needle), "{extra}: {text}");
     }
 }
+
+#[tokio::test]
+async fn llama_server_native_routes_answer_in_llama_server_shapes() {
+    let state = tiny_state("server-llama-native", None);
+    let engine = state.models.list()[0].engine.clone();
+    let app = create_router(state);
+    let call = |path: &'static str, body: serde_json::Value| {
+        let app = app.clone();
+        async move {
+            let res = app.oneshot(post_json(path, None, body)).await.unwrap();
+            let status = res.status();
+            (status, body_text(res).await)
+        }
+    };
+    let base = serde_json::json!({"prompt": "a b c", "n_predict": 4, "temperature": 0.0});
+
+    // /completion: the result object, with llama-server's accounting.
+    let (status, body) = call("/completion", base.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let whole: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let raw_tokens = engine.tokenize("a b c", true).unwrap().len() as u64;
+    assert_eq!(whole["tokens_evaluated"], raw_tokens, "{body}");
+    assert_eq!(whole["stop"], true, "{body}");
+    assert_eq!(whole["prompt"], "a b c", "{body}");
+    assert_eq!(whole["generation_settings"]["n_predict"], 4, "{body}");
+    assert!(
+        ["eos", "word", "limit"].contains(&whole["stop_type"].as_str().unwrap()),
+        "{body}"
+    );
+    let text = whole["content"].as_str().unwrap().to_string();
+    assert_eq!(whole["tokens"], serde_json::json!([]), "{body}");
+
+    // The same prompt split into text and ids is one prompt with the same
+    // answer; `return_tokens` gives the generated ids.
+    let ids = engine.tokenize("a b c", true).unwrap();
+    let mut mixed = base.clone();
+    mixed["prompt"] = serde_json::json!([ids[0], engine.detokenize(&ids[1..], false).unwrap()]);
+    mixed["return_tokens"] = serde_json::json!(true);
+    let (status, body) = call("/completion", mixed).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(v.is_object(), "{body}");
+    assert_eq!(
+        v["tokens"].as_array().unwrap().len() as u64,
+        v["tokens_predicted"].as_u64().unwrap(),
+        "{body}"
+    );
+
+    // Several prompts: an array of results.
+    let mut batch = base.clone();
+    batch["prompt"] = serde_json::json!(["a b c", ids]);
+    let (status, body) = call("/completions", batch).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let results = v.as_array().unwrap();
+    assert_eq!(results.len(), 2, "{body}");
+    assert_eq!(results[1]["index"], 1);
+    assert_eq!(results[1]["content"], text, "{body}");
+
+    // Streaming: text events, then the result with empty content, and no
+    // [DONE].
+    let mut stream = base.clone();
+    stream["stream"] = serde_json::json!(true);
+    let (status, body) = call("/completion", stream).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let events: Vec<serde_json::Value> = body
+        .lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .map(|d| serde_json::from_str(d).unwrap())
+        .collect();
+    let (last, pieces) = events.split_last().unwrap();
+    assert_eq!(last["stop"], true, "{body}");
+    assert_eq!(last["content"], "", "{body}");
+    assert!(pieces.iter().all(|e| e["stop"] == false), "{body}");
+    let streamed: String = pieces
+        .iter()
+        .map(|e| e["content"].as_str().unwrap())
+        .collect();
+    assert_eq!(streamed, text);
+
+    // Refused rather than ignored.
+    for (extra, needle) in [
+        (serde_json::json!({"n_probs": 2}), "n_probs"),
+        (serde_json::json!({"grammar": "root ::= \"a\""}), "grammar"),
+        (
+            serde_json::json!({"lora": [{"id": 0, "scale": 1.0}]}),
+            "lora",
+        ),
+        (
+            serde_json::json!({"prompt": {"prompt_string": "a"}}),
+            "multimodal",
+        ),
+    ] {
+        let mut body = base.clone();
+        for (k, v) in extra.as_object().unwrap() {
+            body[k] = v.clone();
+        }
+        let (status, text) = call("/completion", body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{extra}: {text}");
+        assert!(text.contains(needle), "{extra}: {text}");
+    }
+
+    // /infill needs FIM tokens, which the tiny model does not have.
+    let (status, body) = call(
+        "/infill",
+        serde_json::json!({"input_prefix": "a", "input_suffix": "c", "n_predict": 2}),
+    )
+    .await;
+    if engine.fim_tokens().missing().is_some() {
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("fill-in-the-middle"), "{body}");
+    } else {
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    // /apply-template renders without running the model.
+    let (status, body) = call(
+        "/apply-template",
+        serde_json::json!({"messages": [{"role": "user", "content": "hi there"}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(v["prompt"].as_str().unwrap().contains("hi there"), "{body}");
+
+    // /tokenize with_pieces: the pieces spell the text.
+    let (status, body) = call(
+        "/tokenize",
+        serde_json::json!({"content": "a b c", "add_special": false, "with_pieces": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let tokens = v["tokens"].as_array().unwrap();
+    assert_eq!(
+        tokens
+            .iter()
+            .map(|t| t["id"].as_u64().unwrap() as u32)
+            .collect::<Vec<_>>(),
+        engine.tokenize("a b c", false).unwrap(),
+        "{body}"
+    );
+    let spelled: String = tokens
+        .iter()
+        .map(|t| t["piece"].as_str().unwrap())
+        .collect();
+    assert_eq!(spelled.trim_start(), "a b c", "{body}");
+
+    // /embedding: one pooled vector per input, nested as llama-server's
+    // (when the model embeds at all).
+    let (status, body) = call("/embedding", serde_json::json!({"content": ["a", "b"]})).await;
+    if status == StatusCode::OK {
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v.as_array().unwrap().len(), 2, "{body}");
+        assert!(v[1]["embedding"][0].as_array().unwrap().len() > 1, "{body}");
+    }
+    let (status, _) = call(
+        "/embedding",
+        serde_json::json!({"content": "a", "embd_normalize": 1}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}

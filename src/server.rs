@@ -1167,6 +1167,12 @@ pub fn create_router(state: AppState) -> Router {
         .route("/v1/messages", post(messages))
         .route("/v1/messages/count_tokens", post(messages_count_tokens))
         .route("/v1/completions", post(crate::completions::completions))
+        .route("/completion", post(crate::llama_server::completion))
+        .route("/completions", post(crate::llama_server::completion))
+        .route("/infill", post(crate::llama_server::infill))
+        .route("/embedding", post(crate::llama_server::embedding))
+        .route("/embeddings", post(crate::llama_server::embedding))
+        .route("/apply-template", post(crate::llama_server::apply_template))
         .route("/v1/embeddings", post(embeddings))
         .route("/v1/audio/transcriptions", post(transcriptions))
         .route(crate::coordinator::WORKER_INFO_PATH, get(worker_info))
@@ -1511,7 +1517,12 @@ async fn metrics_prometheus(State(state): State<AppState>) -> Response {
         .into_response()
 }
 
-/// `GET /props` — llama.cpp-compatible server properties.
+/// `GET /props` — llama.cpp-compatible server properties.  The first
+/// model's: its path, the chat template it was loaded with, and the
+/// settings a llama.cpp-native request runs with when it sets nothing,
+/// under llama-server's names (in `default_generation_settings.params`, and
+/// the common ones at its top level as older llama-server builds report
+/// them).
 async fn props(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
     let models = state.models.list();
     let Some(first) = models.first() else {
@@ -1521,23 +1532,30 @@ async fn props(State(state): State<AppState>) -> Result<Json<serde_json::Value>,
             "model_not_loaded",
         ));
     };
-    // What a llama.cpp-native request gets when it sets nothing.
-    let defaults = first.engine.sampling_defaults(SamplingProfile::LlamaCpp);
+    let defaults = GenerationOptions::with_defaults(
+        &first.engine.sampling_defaults(SamplingProfile::LlamaCpp),
+    );
+    let params = crate::llama_server::generation_settings(&defaults);
     let total_slots: usize = models.iter().map(|m| m.engine.max_concurrency()).sum();
+    let mut settings = json!({
+        "id": 0,
+        "id_task": -1,
+        "n_ctx": first.engine.n_ctx(),
+        "speculative": false,
+        "is_processing": first.engine.in_flight() > 0,
+        "params": params,
+    });
+    for key in ["n_predict", "temperature", "top_p", "top_k", "min_p", "repeat_penalty"] {
+        settings[key] = params[key].clone();
+    }
     Ok(Json(json!({
         "model_path": first.engine.model_path(),
         "model_name": first.id,
         "n_ctx": first.engine.n_ctx(),
-        "chat_template": first.engine.has_chat_template().then_some("<gguf chat template>"),
+        "chat_template": first.engine.chat_template_source(),
         "total_slots": total_slots,
-        "default_generation_settings": {
-            "n_predict": -1,
-            "temperature": defaults.temperature,
-            "top_p": defaults.top_p,
-            "top_k": defaults.top_k,
-            "min_p": defaults.min_p,
-            "repeat_penalty": defaults.repetition_penalty,
-        },
+        "default_generation_settings": settings,
+        "build_info": format!("joshua {}", env!("CARGO_PKG_VERSION")),
     })))
 }
 
@@ -1564,7 +1582,10 @@ async fn slots(State(state): State<AppState>) -> Json<serde_json::Value> {
 
 /// `POST /tokenize` (also `/api/tokens`) — count a prompt with the loaded
 /// tokenizer.  Body: `{"model": "...", "prompt": "..."}` or llama.cpp's
-/// `{"content": "..."}`; `add_special_tokens` defaults to true.
+/// `{"content": "..."}`; `add_special_tokens` (llama.cpp's `add_special`)
+/// defaults to true.  llama.cpp's `with_pieces: true` gives each token as
+/// `{"id", "piece"}`, the piece as text, or as its bytes when it is not
+/// whole UTF-8.
 async fn tokenize(
     State(state): State<AppState>,
     Json(body): Json<serde_json::Value>,
@@ -1583,14 +1604,29 @@ async fn tokenize(
         .ok_or_else(|| ApiError::bad_request("missing 'prompt' or 'content'"))?;
     let add_special = body
         .get("add_special_tokens")
+        .or_else(|| body.get("add_special"))
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
-    let tokens = engine
-        .tokenize(prompt, add_special)
-        .map_err(ApiError::from)?;
+    let with_pieces = body
+        .get("with_pieces")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let prompt = prompt.to_string();
+    let (count, tokens) = tokio::task::spawn_blocking(move || -> crate::Result<_> {
+        let ids = engine.tokenize(&prompt, add_special)?;
+        let tokens = if with_pieces {
+            json!(crate::llama_server::pieces(&engine, &ids)?)
+        } else {
+            json!(ids)
+        };
+        Ok((ids.len(), tokens))
+    })
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?
+    .map_err(ApiError::from)?;
     Ok(Json(json!({
         "tokens": tokens,
-        "count": tokens.len(),
+        "count": count,
     })))
 }
 
@@ -1762,6 +1798,49 @@ impl Drop for CancelOnDrop {
     }
 }
 
+/// A server-sent-events body of the `data:` payloads `rx` receives.  It
+/// holds `cancel`, so the generation feeding `rx` stops when the client
+/// goes away.
+pub(crate) fn sse_response(
+    rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+    cancel: CancelOnDrop,
+) -> Response {
+    let events = stream::unfold((rx, cancel), |(mut rx, cancel)| async move {
+        rx.recv()
+            .await
+            .map(|data| (Ok::<Event, Infallible>(Event::default().data(data)), (rx, cancel)))
+    });
+    Sse::new(events).into_response()
+}
+
+/// Embed `texts` off the async runtime, stopping once the requester is
+/// gone, and count the prompt tokens in the metrics.  `lease` (an admitted
+/// job's) is held until the work ends.
+pub(crate) async fn embed_texts(
+    state: &AppState,
+    engine: &Arc<Engine>,
+    texts: Vec<String>,
+    lease: Option<Arc<crate::job_admission::JobLease>>,
+) -> Result<(Vec<Vec<f32>>, u32), ApiError> {
+    let cancel = CancelOnDrop::new();
+    let (vectors, prompt_tokens) = tokio::task::spawn_blocking({
+        let engine = Arc::clone(engine);
+        let flag = cancel.flag();
+        move || {
+            let _lease = lease;
+            engine.embed_with_usage_cancellable(&texts, &flag)
+        }
+    })
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?
+    .map_err(ApiError::from)?;
+    state
+        .metrics
+        .embed_tokens
+        .fetch_add(prompt_tokens as u64, Ordering::Relaxed);
+    Ok((vectors, prompt_tokens))
+}
+
 /// The `/v1/models` entries: [`ServerState::inventory`], then the Whisper
 /// model.
 async fn model_cards(state: AppState) -> Result<Vec<ModelCard>, ApiError> {
@@ -1856,15 +1935,7 @@ async fn chat_completions(
             }
         });
 
-        let events = stream::unfold(
-            (rx, cancel),
-            |(mut rx, cancel)| async move {
-                rx.recv()
-                    .await
-                    .map(|data| (Ok::<Event, Infallible>(Event::default().data(data)), (rx, cancel)))
-            },
-        );
-        return Ok(Sse::new(events).into_response());
+        return Ok(sse_response(rx, cancel));
     }
 
     // ── Non-streaming path ────────────────────────────────────────────────────
@@ -2778,23 +2849,7 @@ async fn embeddings(
         return Err(ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "too many inputs in embedding subbatch", "job_input_limit"));
     }
 
-    // Like generation, stop embedding a batch once the requester is gone.
-    let cancel = CancelOnDrop::new();
-    let (vectors, prompt_tokens) = tokio::task::spawn_blocking({
-        let engine = Arc::clone(&engine);
-        let flag = cancel.flag();
-        move || {
-            let _lease = lease;
-            engine.embed_with_usage_cancellable(&texts, &flag)
-        }
-    })
-    .await
-    .map_err(|e| ApiError::internal(e.to_string()))?
-    .map_err(ApiError::from)?;
-    state
-        .metrics
-        .embed_tokens
-        .fetch_add(prompt_tokens as u64, Ordering::Relaxed);
+    let (vectors, prompt_tokens) = embed_texts(&state, &engine, texts, Some(lease)).await?;
 
     let data = vectors
         .into_iter()
