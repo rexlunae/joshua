@@ -123,7 +123,7 @@ impl ServerMetrics {
         }
     }
 
-    fn record_generation(&self, usage: &UsageInfo) {
+    pub(crate) fn record_generation(&self, usage: &UsageInfo) {
         self.prompt_tokens
             .fetch_add(usage.prompt_tokens as u64, Ordering::Relaxed);
         self.completion_tokens
@@ -261,7 +261,7 @@ impl ServerState {
     /// The model directory's files that are not loaded, under the ids the
     /// inventory lists them by ([`ModelManager::unloaded`]).  Reads the
     /// directory only, never a header.
-    fn unloaded(&self) -> Vec<(String, PathBuf)> {
+    pub(crate) fn unloaded(&self) -> Vec<(String, PathBuf)> {
         self.manager
             .as_ref()
             .map(|manager| manager.unloaded(&self.models.list()))
@@ -1119,19 +1119,27 @@ async fn unload_model(
     Json(req): Json<UnloadModelRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     manager(&state)?;
+    unload(&state, &req.id).await?;
+    Ok(Json(json!({"id": req.id, "object": "model", "unloaded": true})))
+}
+
+/// Unload model `id` (`404` when it is not loaded), returning once its
+/// running requests have finished and its memory or workers are free.
+pub(crate) async fn unload(state: &AppState, id: &str) -> Result<(), ApiError> {
     // Hold the id's gate from the removal until the old engine (and, on a
     // controller, its workers) is gone: a request that names the model waits
     // instead of mapping a second copy while the first still serves one.
-    let gate = state.models.load_gate(&req.id);
+    let gate = state.models.load_gate(id);
     let _held = gate.lock().await;
     let model = state
         .models
-        .remove(&req.id)
-        .ok_or_else(|| ApiError::model_not_found(format!("model '{}' is not loaded", req.id)))?;
+        .remove(id)
+        .ok_or_else(|| ApiError::model_not_found(format!("model '{id}' is not loaded")))?;
     tracing::info!(model = %model.id, "unloading model");
     // New requests no longer find it. Wait for the ones already running,
     // then drop the engine here: that frees its weights or releases its
     // workers, so they are free for the next load once this returns.
+    let state = Arc::clone(state);
     tokio::task::spawn_blocking(move || {
         let mut engine = model.engine;
         loop {
@@ -1144,8 +1152,7 @@ async fn unload_model(
         state.models.release_workers(&model.workers);
     })
     .await
-    .map_err(|e| ApiError::internal(e.to_string()))?;
-    Ok(Json(json!({"id": req.id, "object": "model", "unloaded": true})))
+    .map_err(|e| ApiError::internal(e.to_string()))
 }
 
 // ─── Router ───────────────────────────────────────────────────────────────────
@@ -1198,7 +1205,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/chat", post(crate::ollama::chat))
         .route("/api/generate", post(crate::ollama::generate))
         .route("/api/embed", post(crate::ollama::embed))
-        .route("/api/embeddings", post(crate::ollama::embed))
+        .route("/api/embeddings", post(crate::ollama::embeddings))
         .route("/api/delete", delete(crate::ollama::delete))
         .route("/api/copy", post(crate::ollama::copy))
         .route("/api/create", post(crate::ollama::create))
@@ -1206,10 +1213,15 @@ pub fn create_router(state: AppState) -> Router {
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             require_api_key,
-        ));
+        ))
+        // Ollama's clients read `{"error": "<message>"}`, for every error
+        // these routes give (a key refused above them included).
+        .layer(middleware::from_fn(crate::ollama::error_shape));
     let cors = cors_layer(&state.cors_origins);
     Router::new()
         .route("/health", get(health))
+        // Ollama's heartbeat: its CLI sends `HEAD /` before every command.
+        .route("/", get(crate::ollama::heartbeat))
         .merge(api)
         .layer(cors)
         .merge(manage)

@@ -11,6 +11,31 @@ pub fn unix_time() -> u64 {
         .as_secs()
 }
 
+/// `time` as an RFC 3339 UTC timestamp with nanoseconds
+/// (`2026-11-06T07:48:02.123456789Z`), the form Ollama's Go clients parse.
+pub fn rfc3339(time: SystemTime) -> String {
+    let since = time.duration_since(UNIX_EPOCH).unwrap_or_default();
+    let secs = since.as_secs();
+    let (days, rem) = (secs / 86_400, secs % 86_400);
+    // Howard Hinnant's civil_from_days, for days since 1970-01-01.
+    let z = days as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:09}Z",
+        rem / 3_600,
+        rem % 3_600 / 60,
+        rem % 60,
+        since.subsec_nanos()
+    )
+}
+
 // ─── Chat messages ───────────────────────────────────────────────────────────
 
 /// A single message in a chat conversation.
@@ -1812,6 +1837,16 @@ impl ErrorResponse {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn rfc3339_writes_utc_calendar_time() {
+        use std::time::Duration;
+        let at = |secs: u64, nanos: u32| rfc3339(UNIX_EPOCH + Duration::new(secs, nanos));
+        assert_eq!(at(0, 0), "1970-01-01T00:00:00.000000000Z");
+        assert_eq!(at(951_782_400, 5), "2000-02-29T00:00:00.000000005Z");
+        assert_eq!(at(1_793_951_282, 123_456_789), "2026-11-06T07:48:02.123456789Z");
+        assert_eq!(at(4_102_444_799, 0), "2099-12-31T23:59:59.000000000Z");
+    }
 
     fn request(extra: serde_json::Value) -> ChatCompletionRequest {
         let mut body = json!({

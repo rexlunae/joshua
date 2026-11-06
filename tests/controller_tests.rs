@@ -252,7 +252,12 @@ async fn the_model_directory_lists_unloaded_files_from_their_headers() {
     ] {
         let (status, body) = call(&app, "POST", uri, request).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{uri}: {body}");
-        assert_eq!(body["error"]["type"], "model_load_failed", "{uri}: {body}");
+        if uri.starts_with("/api/") {
+            // Ollama's error shape: the message alone.
+            assert!(body["error"].as_str().is_some_and(|m| !m.is_empty()), "{uri}: {body}");
+        } else {
+            assert_eq!(body["error"]["type"], "model_load_failed", "{uri}: {body}");
+        }
     }
 
     // Ollama's /api/tags lists the same inventory, now with each file's size
@@ -1081,4 +1086,264 @@ fn the_first_model_in_a_directory_is_a_loadable_one() {
     assert_eq!(joshua::model_info::first_model(&none), None);
     std::fs::remove_dir_all(dir).unwrap();
     std::fs::remove_dir_all(none).unwrap();
+}
+
+/// Ollama's own clients: the `HEAD /` heartbeat, `name:tag` names, RFC 3339
+/// times and digests in the listings, the done object's counts and
+/// durations, load/unload through `keep_alive`, `format`, the legacy
+/// embeddings shape, and `{"error": "..."}` errors.
+#[tokio::test]
+async fn ollama_clients_get_ollama_shaped_answers() {
+    let dir = common::model_dir("controller-ollama");
+    common::write_tiny_llama_gguf(&dir.join("tiny.gguf"));
+    common::write_tiny_llama_gguf(&dir.join("other.gguf"));
+    let app = create_router(state(ModelRegistry::default(), Some(manager(&dir))));
+
+    for method in ["HEAD", "GET"] {
+        let req = Request::builder().method(method).uri("/").body(Body::empty()).unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "{method} /");
+    }
+
+    let rfc3339 = |v: &serde_json::Value| {
+        let s = v.as_str().unwrap_or_default();
+        // 2026-11-06T07:48:02.123456789Z
+        s.len() >= 20 && s.as_bytes()[4] == b'-' && s.as_bytes()[10] == b'T' && s.ends_with('Z')
+    };
+    let (_, tags) = call(&app, "GET", "/api/tags", serde_json::Value::Null).await;
+    for model in tags["models"].as_array().unwrap() {
+        let digest = model["digest"].as_str().unwrap();
+        assert_eq!(digest.len(), 64, "{model}");
+        assert!(digest.bytes().all(|b| b.is_ascii_hexdigit()), "{model}");
+        assert!(rfc3339(&model["modified_at"]), "{model}");
+        assert!(!model["details"]["parameter_size"].as_str().unwrap().is_empty(), "{model}");
+    }
+
+    // A request with no messages only loads the model, by its tagged name.
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/api/chat",
+        serde_json::json!({"model": "tiny:latest", "messages": []}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["done_reason"], "load", "{body}");
+    assert_eq!(body["model"], "tiny", "{body}");
+    let (_, ps) = call(&app, "GET", "/api/ps", serde_json::Value::Null).await;
+    assert_eq!(ps["models"][0]["name"], "tiny:latest", "{ps}");
+    assert_eq!(ps["models"][0]["context_length"], 64, "{ps}");
+    assert_eq!(ps["models"][0]["size_vram"], 0, "{ps}");
+    assert!(rfc3339(&ps["models"][0]["expires_at"]), "{ps}");
+
+    // A whole answer carries the counts and durations.
+    let messages = serde_json::json!([{"role": "user", "content": "hi"}]);
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/api/chat",
+        serde_json::json!({
+            "model": "tiny:latest", "messages": messages, "stream": false,
+            "options": {"num_predict": 3, "temperature": 0},
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["done"], true, "{body}");
+    assert!(rfc3339(&body["created_at"]), "{body}");
+    assert!(body["eval_count"].as_u64().unwrap() <= 3, "{body}");
+    assert!(body["prompt_eval_count"].as_u64().unwrap() > 0, "{body}");
+    for key in ["total_duration", "load_duration", "prompt_eval_duration", "eval_duration"] {
+        assert!(body[key].is_u64(), "{key}: {body}");
+    }
+    assert!(["stop", "length"].contains(&body["done_reason"].as_str().unwrap()), "{body}");
+
+    // Streaming is newline-delimited JSON ending in the done object.
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/generate")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "model": "tiny", "prompt": "hello", "options": {"num_predict": 3},
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.headers()[header::CONTENT_TYPE], "application/x-ndjson");
+    let bytes = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap();
+    let lines: Vec<serde_json::Value> = std::str::from_utf8(&bytes)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let last = lines.last().unwrap();
+    assert_eq!(last["done"], true, "{last}");
+    assert!(last["eval_duration"].is_u64(), "{last}");
+    assert!(lines[..lines.len() - 1].iter().all(|l| l["done"] == false && l["response"].is_string()));
+
+    // `format` takes "json" or a schema, and nothing else.
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/api/chat",
+        serde_json::json!({
+            "model": "tiny", "messages": messages, "stream": false, "format": "json",
+            "options": {"num_predict": 2},
+        }),
+    )
+    .await;
+    // The tiny fixture's vocabulary cannot spell JSON, so the grammar
+    // refuses it; reaching the grammar is what this checks.
+    assert!(
+        status == StatusCode::OK || body["error"].as_str().unwrap().contains("JSON schema"),
+        "{body}"
+    );
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/api/chat",
+        serde_json::json!({"model": "tiny", "messages": messages, "stream": false, "format": 7}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body["error"].as_str().unwrap().contains("format"), "{body}");
+
+    // `/api/show` describes the loaded model from its header and engine.
+    let (status, show) = call(
+        &app,
+        "POST",
+        "/api/show",
+        serde_json::json!({"model": "tiny:latest"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{show}");
+    assert_eq!(show["details"]["family"], "llama", "{show}");
+    assert_eq!(show["model_info"]["general.architecture"], "llama", "{show}");
+    assert!(show["model_info"]["general.parameter_count"].as_u64().unwrap() > 0, "{show}");
+    assert!(show["parameters"].as_str().unwrap().contains("temperature"), "{show}");
+    let caps = show["capabilities"].as_array().unwrap();
+    assert!(caps.contains(&serde_json::json!("completion")), "{show}");
+    assert!(caps.contains(&serde_json::json!("embedding")), "{show}");
+    // An unloaded one, from its header alone.
+    let (status, show) = call(
+        &app,
+        "POST",
+        "/api/show",
+        serde_json::json!({"name": "other"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{show}");
+    assert_eq!(show["details"]["family"], "llama", "{show}");
+
+    // The legacy embeddings route answers with one `embedding`.
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/api/embeddings",
+        serde_json::json!({"model": "tiny", "prompt": "hello"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!body["embedding"].as_array().unwrap().is_empty(), "{body}");
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/api/embed",
+        serde_json::json!({"model": "tiny", "input": ["a", "b"]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["embeddings"].as_array().unwrap().len(), 2, "{body}");
+
+    // `keep_alive: 0` with nothing to say unloads it.
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/api/generate",
+        serde_json::json!({"model": "tiny:latest", "keep_alive": 0}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["done_reason"], "unload", "{body}");
+    let (_, ps) = call(&app, "GET", "/api/ps", serde_json::Value::Null).await;
+    assert!(ps["models"].as_array().unwrap().is_empty(), "{ps}");
+
+    // ... and after an answer, once it is sent.
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/api/chat",
+        serde_json::json!({
+            "model": "tiny", "messages": messages, "stream": false, "keep_alive": "0s",
+            "options": {"num_predict": 1},
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, ps) = call(&app, "GET", "/api/ps", serde_json::Value::Null).await;
+    assert!(ps["models"].as_array().unwrap().is_empty(), "{ps}");
+
+    // ... and when the request fails after loading it.
+    let (status, _) = call(
+        &app,
+        "POST",
+        "/api/chat",
+        serde_json::json!({
+            "model": "tiny", "messages": messages, "stream": false, "keep_alive": 0,
+            "format": "xml",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (_, ps) = call(&app, "GET", "/api/ps", serde_json::Value::Null).await;
+    assert!(ps["models"].as_array().unwrap().is_empty(), "{ps}");
+
+    // A name generation would resolve to the one loaded model unloads that
+    // model, not nothing.
+    let (status, _) = call(
+        &app,
+        "POST",
+        "/api/generate",
+        serde_json::json!({"model": "tiny"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/api/generate",
+        serde_json::json!({"model": "an-alias", "keep_alive": 0}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["model"], "tiny", "{body}");
+    let (_, ps) = call(&app, "GET", "/api/ps", serde_json::Value::Null).await;
+    assert!(ps["models"].as_array().unwrap().is_empty(), "{ps}");
+
+    // Errors are `{"error": "<message>"}`: an unknown model, and a body that
+    // does not parse.
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/api/chat",
+        serde_json::json!({"model": "missing", "messages": messages, "stream": false}),
+    )
+    .await;
+    assert!(status.is_client_error() || status.is_server_error(), "{status}");
+    assert!(body["error"].is_string(), "{body}");
+    let (status, body) = call(&app, "POST", "/api/show", serde_json::json!({"model": 7})).await;
+    assert!(status.is_client_error(), "{status}");
+    assert!(body["error"].is_string(), "{body}");
+    // The OpenAI routes keep their envelope.
+    let (_, body) = call(
+        &app,
+        "POST",
+        "/v1/chat/completions",
+        serde_json::json!({"model": "missing", "messages": messages}),
+    )
+    .await;
+    assert!(body["error"]["message"].is_string(), "{body}");
+    std::fs::remove_dir_all(dir).unwrap();
 }

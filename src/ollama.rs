@@ -1,19 +1,22 @@
 //! Ollama-compatible API (`/api/*`) on top of joshua's model registry.
 //!
-//! Ollama's native protocol differs from OpenAI's in three ways that matter:
+//! Ollama's native protocol differs from OpenAI's in four ways that matter:
 //!
 //! 1. **Streaming is newline-delimited JSON**, not SSE.  Each line is a whole
-//!    object; the last carries `"done": true`.
+//!    object; the last carries `"done": true` and the timings.
 //! 2. **Generation parameters live under `options`** (`num_ctx`, `num_predict`,
 //!    `temperature`, `top_k`, `top_p`, `min_p`, `typical_p`, `repeat_penalty`,
 //!    `repeat_last_n`, `presence_penalty`, `frequency_penalty`, `mirostat*`,
 //!    `seed`, `stop`).
-//! 3. **Models are addressed by bare name** from a listing endpoint
+//! 3. **Models are addressed by `name:tag`** from a listing endpoint
 //!    (`/api/tags`) that must work before anything is loaded.
+//! 4. **Errors are `{"error": "<message>"}`**, and the CLI checks the server
+//!    with `HEAD /` before every command.
 //!
 //! This is a translation layer: names resolve through the loaded
 //! [`crate::server::ModelRegistry`] (which already dedups concurrent loads and
-//! confines paths to the model directory), then drive the same engine the
+//! confines paths to the model directory), then drive the same engine and the
+//! same output post-processing (reasoning split, tool-call parsing) the
 //! OpenAI routes use.
 //!
 //! **Model management** (`/api/delete`, `/api/copy`, `/api/create`,
@@ -34,27 +37,74 @@
 //!   URL downloads are not implemented.
 //!
 //! Ollama's `:tag` suffix names a manifest, which has no joshua equivalent:
-//! every tag of a name resolves to the same `<name>.gguf`.
+//! a name whose tag is not part of a model id resolves to the id without it,
+//! so `llama3:latest` and `llama3:13b` both address `llama3.gguf`.
+//!
+//! **`keep_alive`**: `0` unloads the model once the request is answered (when
+//! the server manages a model directory, so it can load it again); a request
+//! with no messages or prompt only loads or unloads the model, as Ollama's
+//! does.  Other values are accepted and change nothing: joshua keeps a model
+//! resident until it is unloaded, so `/api/ps` reports no expiry.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime};
 
 use axum::{
-    extract::State,
-    http::StatusCode,
-    response::IntoResponse,
+    extract::{Request, State},
+    http::{header, HeaderValue, StatusCode},
+    middleware::Next,
+    response::{IntoResponse, Response},
     Json,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 
-use crate::engine::Engine;
-use crate::model_info::GgufFacts;
+use crate::engine::{Completion, Engine};
+use crate::model_info::{GgufFacts, ModelInfo};
 use crate::sampling::{SamplingDefaults, SamplingProfile};
-use crate::server::{select_model, ApiError, AppState, CancelOnDrop};
-use crate::types::{unix_time, ChatMessage, GenerationOptions, SamplingParams, Tool};
+use crate::server::{select_model, ApiError, AppState, CancelOnDrop, ChatPiece};
+use crate::types::{rfc3339, ChatMessage, ConstraintSpec, GenerationOptions, SamplingParams, Tool};
 
-fn now_rfc3339() -> String {
-    format!("{}.000000000Z", unix_time())
+fn now() -> String {
+    rfc3339(SystemTime::now())
+}
+
+/// `GET /` and `HEAD /`: Ollama's heartbeat.
+pub async fn heartbeat() -> &'static str {
+    "Ollama is running"
+}
+
+/// Give every error an `/api/*` route returns Ollama's shape,
+/// `{"error": "<message>"}`: the OpenAI envelope the shared handlers build,
+/// and the plain-text rejections of a body that does not parse.
+pub async fn error_shape(req: Request, next: Next) -> Response {
+    let ollama = req.uri().path().starts_with("/api/");
+    let response = next.run(req).await;
+    let status = response.status();
+    if !ollama || !(status.is_client_error() || status.is_server_error()) {
+        return response;
+    }
+    let (mut parts, body) = response.into_parts();
+    let bytes = axum::body::to_bytes(body, 1 << 20).await.unwrap_or_default();
+    let message = error_message(&bytes);
+    parts.headers.remove(header::CONTENT_LENGTH);
+    parts.headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    (parts, Json(json!({ "error": message }))).into_response()
+}
+
+/// The message in an error body: an OpenAI envelope's `error.message`, an
+/// Ollama body's `error`, or the body's text.
+fn error_message(body: &[u8]) -> String {
+    let parsed = serde_json::from_slice::<Value>(body).ok();
+    let from_json = parsed.as_ref().and_then(|v| match v.get("error")? {
+        Value::String(message) => Some(message.clone()),
+        error => error.get("message")?.as_str().map(str::to_string),
+    });
+    from_json.unwrap_or_else(|| String::from_utf8_lossy(body).trim().to_string())
 }
 
 // ─── /api/version ───────────────────────────────────────────────────────────
@@ -68,6 +118,52 @@ pub async fn version() -> Json<VersionResponse> {
     Json(VersionResponse {
         version: "0.1.0".to_string(),
     })
+}
+
+// ─── model names ────────────────────────────────────────────────────────────
+
+fn normalise_name(id: &str) -> String {
+    if id.contains(':') {
+        id.to_string()
+    } else {
+        format!("{id}:latest")
+    }
+}
+
+/// Drop Ollama's `:tag` suffix, which names a *manifest* rather than a file.
+/// joshua serves one `.gguf` per name, so `llama3:latest` and `llama3:13b` both
+/// address `llama3.gguf`; a caller that needs two variants keeps two files
+/// under distinct names.
+fn strip_tag(name: &str) -> &str {
+    name.split(':').next().unwrap_or(name).trim()
+}
+
+/// The model id an Ollama name stands for: the name itself when a model
+/// (loaded, or in the model directory) has that id, else the name without
+/// its tag when one does, else the name as given (so the shared resolver
+/// reports it).
+fn model_id(state: &AppState, name: &str) -> String {
+    let name = name.trim();
+    let known = |id: &str| {
+        state.models.list().iter().any(|m| m.id == id)
+            || state.unloaded().iter().any(|(listed, _)| listed == id)
+    };
+    if known(name) {
+        return name.to_string();
+    }
+    let bare = strip_tag(name);
+    if bare != name && known(bare) {
+        return bare.to_string();
+    }
+    name.to_string()
+}
+
+/// [`select_model`] for an Ollama name, loading the model if it is not
+/// loaded.  Also returns how long that took (Ollama's `load_duration`).
+async fn select(state: &AppState, name: &str) -> Result<(String, Arc<Engine>, Duration), ApiError> {
+    let start = Instant::now();
+    let (id, engine) = select_model(state, &model_id(state, name)).await?;
+    Ok((id, engine, start.elapsed()))
 }
 
 // ─── model details (listing: `ServerState::inventory`) ──────────────────────
@@ -92,24 +188,47 @@ fn details_for(facts: Option<&GgufFacts>) -> TagDetails {
         d.families = vec![family.clone()];
         d.family = family.clone();
     }
+    d.parameter_size = parameter_size(facts.n_params);
     d.quantization_level = facts.quantization().unwrap_or_default().to_string();
     d
 }
 
-fn normalise_name(id: &str) -> String {
-    if id.contains(':') {
-        id.to_string()
-    } else {
-        format!("{id}:latest")
+/// A parameter count as Ollama writes it: `14.8B`, `596.05M`.
+fn parameter_size(n: u64) -> String {
+    let n = n as f64;
+    match n {
+        n if n >= 1e9 => format!("{:.1}B", n / 1e9),
+        n if n >= 1e6 => format!("{:.2}M", n / 1e6),
+        n if n >= 1e3 => format!("{:.2}K", n / 1e3),
+        0.0 => String::new(),
+        n => format!("{n}"),
     }
 }
 
-/// Drop Ollama's `:tag` suffix, which names a *manifest* rather than a file.
-/// joshua serves one `.gguf` per name, so `llama3:latest` and `llama3:13b` both
-/// address `llama3.gguf`; a caller that needs two variants keeps two files
-/// under distinct names.
-fn strip_tag(name: &str) -> &str {
-    name.split(':').next().unwrap_or(name).trim()
+/// When the model's file was last written (now, when that is unknown).
+fn modified_at(path: Option<&Path>) -> String {
+    let modified = path
+        .and_then(|p| std::fs::metadata(p).ok())
+        .and_then(|m| m.modified().ok())
+        .unwrap_or_else(SystemTime::now);
+    rfc3339(modified)
+}
+
+/// A stable 64-hex-digit digest standing in for Ollama's manifest digest,
+/// which clients print a prefix of and expect to be present.  It hashes the
+/// model's id, file, size and modification time rather than its contents,
+/// so listing a directory of large files reads no weights; it changes when
+/// the file is replaced.
+fn digest(info: &ModelInfo) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(info.id.as_bytes());
+    if let Some(path) = &info.path {
+        hash.update(path.to_string_lossy().as_bytes());
+        hash.update(modified_at(Some(path)).as_bytes());
+    }
+    hash.update(info.facts.as_ref().map_or(0, |f| f.file_size).to_le_bytes());
+    format!("{:x}", hash.finalize())
 }
 
 // ─── /api/tags ──────────────────────────────────────────────────────────────
@@ -124,38 +243,64 @@ pub struct TagModel {
     details: TagDetails,
 }
 
+impl TagModel {
+    fn of(info: &ModelInfo) -> Self {
+        let mut details = details_for(info.facts.as_ref());
+        details.parent_model = info.parent.clone().unwrap_or_default();
+        Self {
+            name: normalise_name(&info.id),
+            model: normalise_name(&info.id),
+            modified_at: modified_at(info.path.as_deref()),
+            size: info.facts.as_ref().map_or(0, |f| f.file_size),
+            digest: digest(info),
+            details,
+        }
+    }
+}
+
 #[derive(Serialize)]
 pub struct TagsResponse {
     models: Vec<TagModel>,
 }
 
 pub async fn tags(State(state): State<AppState>) -> Result<Json<TagsResponse>, ApiError> {
-    let models = crate::server::inventory(&state)
-        .await?
-        .into_iter()
-        .map(|m| TagModel {
-            name: normalise_name(&m.id),
-            model: normalise_name(&m.id),
-            modified_at: now_rfc3339(),
-            size: m.facts.as_ref().map_or(0, |f| f.file_size),
-            digest: String::new(),
-            details: details_for(m.facts.as_ref()),
-        })
-        .collect();
+    let inventory = crate::server::inventory(&state).await?;
+    let models = tokio::task::spawn_blocking(move || inventory.iter().map(TagModel::of).collect())
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
     Ok(Json(TagsResponse { models }))
 }
 
 // ─── /api/ps ────────────────────────────────────────────────────────────────
 
+/// What `/api/ps` reports when a model never expires: joshua keeps a model
+/// resident until it is unloaded.
+const NEVER: &str = "2318-01-01T00:00:00Z";
+
 #[derive(Serialize)]
 pub struct PsModel {
-    name: String,
-    model: String,
-    size: u64,
-    digest: String,
-    details: TagDetails,
+    #[serde(flatten)]
+    tag: TagModel,
     expires_at: String,
     size_vram: u64,
+    context_length: u32,
+}
+
+/// Bytes of the model on an accelerator: all of it when its dense weights
+/// and experts run there; its dense weights plus its expert cache when the
+/// routed experts stay in host memory; none on the CPU.
+fn size_vram(info: &ModelInfo) -> u64 {
+    let Some(facts) = &info.facts else { return 0 };
+    match &info.placement {
+        Some(p) if p.dense != "cpu" && p.experts.as_deref().is_none_or(|e| e != "cpu") => {
+            facts.file_size
+        }
+        Some(p) if p.dense != "cpu" => {
+            facts.tensor_bytes.saturating_sub(facts.expert_bytes)
+                + p.expert_cache_bytes.unwrap_or(0)
+        }
+        _ => 0,
+    }
 }
 
 #[derive(Serialize)]
@@ -163,24 +308,23 @@ pub struct PsResponse {
     models: Vec<PsModel>,
 }
 
-pub async fn ps(State(state): State<AppState>) -> Json<PsResponse> {
-    let models = state
-        .models
-        .list()
-        .iter()
-        .map(crate::server::LoadedModel::info)
-        .map(|m| PsModel {
-            name: normalise_name(&m.id),
-            model: normalise_name(&m.id),
-            size: m.facts.as_ref().map_or(0, |f| f.file_size),
-            digest: String::new(),
-            details: details_for(m.facts.as_ref()),
-            // No idle eviction yet: a loaded model stays resident.
-            expires_at: "2318-01-01T00:00:00Z".to_string(),
-            size_vram: 0,
-        })
-        .collect();
-    Json(PsResponse { models })
+pub async fn ps(State(state): State<AppState>) -> Result<Json<PsResponse>, ApiError> {
+    let loaded = state.models.list();
+    let models = tokio::task::spawn_blocking(move || {
+        loaded
+            .iter()
+            .map(crate::server::LoadedModel::info)
+            .map(|info| PsModel {
+                tag: TagModel::of(&info),
+                expires_at: NEVER.to_string(),
+                size_vram: size_vram(&info),
+                context_length: info.limits.as_ref().map_or(0, |l| l.context_length),
+            })
+            .collect()
+    })
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(Json(PsResponse { models }))
 }
 
 // ─── /api/show ──────────────────────────────────────────────────────────────
@@ -195,29 +339,144 @@ pub struct ShowRequest {
 
 #[derive(Serialize)]
 pub struct ShowResponse {
+    license: String,
+    modelfile: String,
+    parameters: String,
+    template: String,
     details: TagDetails,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    modelfile: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    parameters: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    template: Option<String>,
+    model_info: serde_json::Map<String, Value>,
     capabilities: Vec<String>,
+    modified_at: String,
 }
 
+/// `POST /api/show` — a model's details, header facts, template, default
+/// parameters and capabilities.  A model in the directory that is not
+/// loaded is described from its header alone: its template, parameters and
+/// capabilities beyond `completion` are known once it is loaded.
 pub async fn show(
     State(state): State<AppState>,
     Json(req): Json<ShowRequest>,
 ) -> Result<Json<ShowResponse>, ApiError> {
-    let requested = req.model.unwrap_or(req.name);
-    let (id, _engine) = state.resolve(&requested)?;
-    Ok(Json(ShowResponse {
-        details: details_for(None),
-        modelfile: Some(format!("# joshua model: {id}")),
-        parameters: None,
-        template: None,
-        capabilities: vec!["completion".to_string()],
-    }))
+    let requested = req.model.filter(|m| !m.is_empty()).unwrap_or(req.name);
+    let id = model_id(&state, &requested);
+    let inventory = crate::server::inventory(&state).await?;
+    let info = match inventory.into_iter().find(|m| m.id == id) {
+        Some(info) => info,
+        // A name no model has: the shared resolver's answer (the one loaded
+        // model, or why there is none).
+        None => {
+            let (id, _) = state.resolve(&id)?;
+            let loaded = state.models.list();
+            let model = loaded
+                .iter()
+                .find(|m| m.id == id)
+                .ok_or_else(|| ApiError::unknown_model(&requested))?;
+            model.info()
+        }
+    };
+    let engine = state
+        .models
+        .list()
+        .into_iter()
+        .find(|m| m.id == info.id)
+        .map(|m| m.engine);
+    let response = tokio::task::spawn_blocking(move || show_response(&info, engine.as_deref()))
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(Json(response))
+}
+
+fn show_response(info: &ModelInfo, engine: Option<&Engine>) -> ShowResponse {
+    let mut details = details_for(info.facts.as_ref());
+    details.parent_model = info.parent.clone().unwrap_or_default();
+    let template = engine
+        .and_then(Engine::chat_template_source)
+        .unwrap_or_default()
+        .to_string();
+    let parameters = engine
+        .map(|e| parameters(&e.sampling_defaults(SamplingProfile::Ollama)))
+        .unwrap_or_default();
+    let modelfile = format!(
+        "# Modelfile generated by joshua\nFROM {}\n",
+        info.path.as_deref().map_or(info.id.clone(), |p| p.display().to_string())
+    );
+    ShowResponse {
+        license: String::new(),
+        modelfile,
+        parameters,
+        template,
+        details,
+        model_info: model_info(info),
+        capabilities: engine.map_or_else(|| vec!["completion".to_string()], capabilities),
+        modified_at: modified_at(info.path.as_deref()),
+    }
+}
+
+/// The GGUF header facts under their metadata keys, as Ollama's
+/// `model_info` carries them.
+fn model_info(info: &ModelInfo) -> serde_json::Map<String, Value> {
+    let mut out = serde_json::Map::new();
+    let Some(facts) = &info.facts else { return out };
+    let arch = facts.architecture.as_deref();
+    if let Some(arch) = arch {
+        out.insert("general.architecture".into(), arch.into());
+    }
+    out.insert("general.parameter_count".into(), facts.n_params.into());
+    if let Some(ft) = facts.file_type {
+        out.insert("general.file_type".into(), ft.into());
+    }
+    if let Some(arch) = arch {
+        for (key, value) in [
+            ("context_length", facts.n_ctx_train),
+            ("embedding_length", facts.n_embd),
+            ("vocab_size", facts.n_vocab),
+            ("expert_count", facts.expert_count),
+        ] {
+            if let Some(value) = value {
+                out.insert(format!("{arch}.{key}"), value.into());
+            }
+        }
+    }
+    out
+}
+
+/// The sampler defaults a request gets, one `name value` per line as a
+/// Modelfile's `PARAMETER`s read.
+fn parameters(d: &SamplingDefaults) -> String {
+    [
+        ("temperature", d.temperature.to_string()),
+        ("top_k", d.top_k.to_string()),
+        ("top_p", d.top_p.to_string()),
+        ("min_p", d.min_p.to_string()),
+        ("repeat_penalty", d.repetition_penalty.to_string()),
+    ]
+    .iter()
+    .map(|(name, value)| format!("{name:<30} {value}"))
+    .collect::<Vec<_>>()
+    .join("\n")
+}
+
+/// What a loaded model can do, in Ollama's capability names.
+fn capabilities(engine: &Engine) -> Vec<String> {
+    let mut caps = vec!["completion"];
+    // A template that renders tools reads its `tools` variable (Ollama's
+    // own test); without a template, the ChatML fallback teaches them.
+    if engine
+        .chat_template_source()
+        .is_none_or(|t| t.contains("tools"))
+    {
+        caps.push("tools");
+    }
+    if engine.fim_tokens().missing().is_none() {
+        caps.push("insert");
+    }
+    if *engine.reasoning_format() != crate::reasoning::ReasoningFormat::None {
+        caps.push("thinking");
+    }
+    if engine.supports_embeddings() {
+        caps.push("embedding");
+    }
+    caps.into_iter().map(str::to_string).collect()
 }
 
 // ─── options translation ────────────────────────────────────────────────────
@@ -303,146 +562,348 @@ impl OllamaOptions {
     }
 }
 
-// ─── /api/chat ──────────────────────────────────────────────────────────────
+// ─── request fields shared by /api/chat and /api/generate ───────────────────
 
-#[derive(Debug, Deserialize)]
-pub struct OllamaMessage {
-    pub role: String,
-    #[serde(default)]
-    pub content: String,
+/// Ollama's `format`: `"json"` for any JSON value (an object, as the
+/// OpenAI routes' `json_object`), or a JSON schema; `""` or `null` for
+/// free text.
+fn constraint(format: Option<&Value>) -> Result<Option<ConstraintSpec>, String> {
+    match format {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) if s.is_empty() => Ok(None),
+        Some(Value::String(s)) if s == "json" => Ok(Some(ConstraintSpec::JsonObject)),
+        Some(Value::Object(_)) => Ok(Some(ConstraintSpec::JsonSchema {
+            schema: format.cloned().unwrap_or_default(),
+        })),
+        Some(other) => Err(format!(
+            "invalid format {other}: expected \"json\" or a JSON schema object"
+        )),
+    }
 }
 
-#[derive(Debug, Deserialize)]
-pub struct ChatRequest {
-    pub model: String,
-    #[serde(default)]
-    pub messages: Vec<OllamaMessage>,
-    #[serde(default)]
-    pub stream: Option<bool>,
-    #[serde(default)]
-    pub options: OllamaOptions,
-    #[serde(default)]
-    pub tools: Option<Vec<Tool>>,
+/// Whether `keep_alive` asks for the model to be unloaded once the request
+/// is answered: `0`, or a duration of zero (`"0"`, `"0s"`, `"0m"`).
+fn unload_after(keep_alive: Option<&Value>) -> bool {
+    match keep_alive {
+        Some(Value::Number(n)) => n.as_f64() == Some(0.0),
+        Some(Value::String(s)) => {
+            let number = s.trim().trim_end_matches(|c: char| c.is_ascii_alphabetic());
+            number.parse::<f64>().is_ok_and(|n| n == 0.0)
+        }
+        _ => false,
+    }
 }
 
-#[derive(Serialize)]
-pub struct ChatMessageOut {
-    role: String,
-    content: String,
+/// Ollama's images are bare base64; the engine reads `data:` URLs.
+fn image_url(image: &str) -> String {
+    if image.starts_with("data:") {
+        image.to_string()
+    } else {
+        format!("data:application/octet-stream;base64,{image}")
+    }
 }
 
-#[derive(Serialize)]
-pub struct ChatChunk {
-    model: String,
-    created_at: String,
-    message: ChatMessageOut,
-    done: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    done_reason: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    prompt_eval_count: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    eval_count: Option<u32>,
+/// An Ollama chat message as the engine's [`ChatMessage`]: its images as
+/// `data:` URLs, a tool result's `tool_name` as the message's name, and
+/// earlier tool calls (whose arguments are objects) passed on as sent.
+fn chat_message(mut message: Value) -> Result<ChatMessage, String> {
+    if let Some(obj) = message.as_object_mut() {
+        if let Some(Value::Array(images)) = obj.get_mut("images") {
+            for image in images.iter_mut() {
+                if let Value::String(s) = image {
+                    *s = image_url(s);
+                }
+            }
+        }
+        if !obj.contains_key("name") {
+            if let Some(tool_name) = obj.remove("tool_name") {
+                obj.insert("name".to_string(), tool_name);
+            }
+        }
+    }
+    serde_json::from_value(message).map_err(|e| format!("invalid message: {e}"))
 }
 
-pub async fn chat(
-    State(state): State<AppState>,
-    Json(req): Json<ChatRequest>,
-) -> Result<axum::response::Response, ApiError> {
-    let (id, engine) = select_model(&state, &req.model).await?;
-    let options = req
-        .options
-        .to_generation_options(&engine.sampling_defaults(SamplingProfile::Ollama), engine.n_ctx())
-        .map_err(ApiError::bad_request)?;
-    let messages: Vec<ChatMessage> = req
-        .messages
-        .iter()
-        .map(|m| ChatMessage::text(&m.role, &m.content))
-        .collect();
-    let tools = req.tools;
+/// Which Ollama wire a reply goes out on: `/api/chat` puts text under
+/// `message.content`, `/api/generate` under `response`.
+#[derive(Clone, Copy)]
+enum Wire {
+    Chat,
+    Generate,
+}
 
-    if !req.stream.unwrap_or(true) {
-        let (text, usage, ..) = tokio::task::spawn_blocking({
-            let engine: Arc<Engine> = Arc::clone(&engine);
-            let messages = messages.clone();
-            let tools = tools.clone();
-            let options = options.clone();
-            move || engine.complete_chat(&messages, tools.as_deref(), &options)
-        })
-        .await
-        .map_err(|e| ApiError::internal(e.to_string()))?
-        .map_err(ApiError::from)?;
-
-        return Ok(Json(ChatChunk {
-            model: id,
-            created_at: now_rfc3339(),
-            message: ChatMessageOut {
-                role: "assistant".to_string(),
-                content: text,
-            },
-            done: true,
-            done_reason: Some("stop".to_string()),
-            prompt_eval_count: Some(usage.prompt_tokens),
-            eval_count: Some(usage.completion_tokens),
-        })
-        .into_response());
+impl Wire {
+    /// One object of the reply: `text` and, for chat, any `tool_calls`.
+    fn chunk(self, model: &str, text: &str, tool_calls: Option<Vec<Value>>) -> Value {
+        let mut out = json!({ "model": model, "created_at": now() });
+        match self {
+            Wire::Chat => {
+                let mut message = json!({ "role": "assistant", "content": text });
+                if let Some(calls) = tool_calls {
+                    message["tool_calls"] = Value::Array(calls);
+                }
+                out["message"] = message;
+            }
+            Wire::Generate => out["response"] = Value::from(text),
+        }
+        out["done"] = Value::Bool(false);
+        out
     }
 
+    /// The last object: `done`, why it ended, the token counts and the
+    /// durations in nanoseconds.
+    fn done(self, model: &str, text: &str, end: &End<'_>) -> Value {
+        let mut out = self.chunk(model, text, end.tool_calls.clone());
+        out["done"] = Value::Bool(true);
+        out["done_reason"] = Value::from(end.reason);
+        if let Some(c) = end.completion {
+            let ns = |ms: f64| (ms * 1e6).round() as u64;
+            out["total_duration"] = Value::from(end.started.elapsed().as_nanos() as u64);
+            out["load_duration"] = Value::from(end.load.as_nanos() as u64);
+            out["prompt_eval_count"] = Value::from(c.usage.prompt_tokens);
+            out["prompt_eval_duration"] = Value::from(ns(c.timings.prompt_ms));
+            out["eval_count"] = Value::from(c.usage.completion_tokens);
+            out["eval_duration"] = Value::from(ns(c.timings.predicted_ms));
+        } else {
+            out["total_duration"] = Value::from(end.started.elapsed().as_nanos() as u64);
+            out["load_duration"] = Value::from(end.load.as_nanos() as u64);
+        }
+        out
+    }
+}
+
+/// How a reply ended.
+struct End<'a> {
+    reason: &'static str,
+    completion: Option<&'a Completion>,
+    tool_calls: Option<Vec<Value>>,
+    started: Instant,
+    load: Duration,
+}
+
+/// Parsed tool calls in Ollama's shape: arguments as an object.
+fn ollama_calls(calls: &[crate::tools::ParsedToolCall]) -> Option<Vec<Value>> {
+    (!calls.is_empty()).then(|| {
+        calls
+            .iter()
+            .enumerate()
+            .map(|(index, call)| {
+                let arguments = serde_json::from_str::<serde_json::Map<String, Value>>(&call.arguments)
+                    .unwrap_or_default();
+                json!({
+                    "id": call.id.clone().unwrap_or_default(),
+                    "function": { "index": index, "name": call.name, "arguments": arguments },
+                })
+            })
+            .collect()
+    })
+}
+
+/// A request for `/api/chat` or `/api/generate`, translated.
+struct Turn {
+    wire: Wire,
+    model: String,
+    messages: Vec<ChatMessage>,
+    tools: Option<Vec<Tool>>,
+    options: OllamaOptions,
+    format: Option<Value>,
+    keep_alive: Option<Value>,
+    stream: bool,
+}
+
+/// Answer a [`Turn`]: load or unload only, when it has nothing to say, else
+/// generate, streaming newline-delimited JSON or in one object.  With
+/// `keep_alive: 0` the model is unloaded once the request is done with it,
+/// however the request ends.
+async fn answer(state: AppState, turn: Turn) -> Result<Response, ApiError> {
+    let started = Instant::now();
+    let unload = unload_after(turn.keep_alive.as_ref()) && state.manager.is_some();
+    if turn.messages.is_empty() {
+        let (id, reason, load) = if unload {
+            (unload_named(&state, &turn.model).await?, "unload", Duration::ZERO)
+        } else {
+            let (id, _engine, load) = select(&state, &turn.model).await?;
+            (id, "load", load)
+        };
+        let end = End { reason, completion: None, tool_calls: None, started, load };
+        return Ok(Json(turn.wire.done(&id, "", &end)).into_response());
+    }
+
+    let (id, engine, load) = select(&state, &turn.model).await?;
+    let release = unload.then(|| (Arc::clone(&state), id.clone()));
+    let (result, streaming) =
+        generate_turn(&state, turn, id, engine, started, load, release.clone()).await;
+    // A stream unloads once its generation ends; every other exit here.
+    if !streaming {
+        if let Some((state, id)) = release {
+            unload_quietly(state, id).await;
+        }
+    }
+    result
+}
+
+/// Unload the model a request names with `keep_alive: 0` and nothing to
+/// say: the loaded model the name resolves to, as generation would pick it.
+/// A name for a directory model that is not loaded has nothing to unload.
+async fn unload_named(state: &AppState, name: &str) -> Result<String, ApiError> {
+    let id = model_id(state, name);
+    match state.resolve(&id) {
+        Ok((loaded, engine)) => {
+            drop(engine);
+            crate::server::unload(state, &loaded).await?;
+            Ok(loaded)
+        }
+        Err(_) if state.unloaded().iter().any(|(listed, _)| *listed == id) => Ok(id),
+        Err(e) => Err(e),
+    }
+}
+
+/// `keep_alive: 0`'s unload, once nothing holds the engine; a model that
+/// another request already unloaded is not an error.
+async fn unload_quietly(state: AppState, id: String) {
+    if let Err(e) = crate::server::unload(&state, &id).await {
+        tracing::debug!(model = %id, "keep_alive unload: {}", e.into_response().status());
+    }
+}
+
+/// Generate a [`Turn`] on `engine`.  Returns the response and whether it
+/// streams; a stream unloads the model itself (`release`) once its
+/// generation ends.  Every engine reference this holds is dropped by the
+/// time a non-streaming response returns.
+#[allow(clippy::too_many_arguments)]
+async fn generate_turn(
+    state: &AppState,
+    turn: Turn,
+    id: String,
+    engine: Arc<Engine>,
+    started: Instant,
+    load: Duration,
+    release: Option<(AppState, String)>,
+) -> (Result<Response, ApiError>, bool) {
+    let prepared = (|| {
+        let mut options = turn
+            .options
+            .to_generation_options(&engine.sampling_defaults(SamplingProfile::Ollama), engine.n_ctx())
+            .map_err(ApiError::bad_request)?;
+        options.constraint = constraint(turn.format.as_ref()).map_err(ApiError::bad_request)?;
+        // Answer a request the model cannot serve before a stream starts.
+        engine.validate_options(&options).map_err(ApiError::from)?;
+        Ok::<_, ApiError>(options)
+    })();
+    let options = match prepared {
+        Ok(options) => options,
+        Err(e) => return (Err(e), false),
+    };
+    let Turn { wire, messages, tools, stream, .. } = turn;
+    if stream {
+        (Ok(stream_turn(state, wire, id, engine, messages, tools, options, started, load, release)), true)
+    } else {
+        (whole_turn(state, wire, &id, engine, messages, tools, options, started, load).await, false)
+    }
+}
+
+/// One whole answer, generated on the blocking pool, which holds the
+/// engine until it is read.
+#[allow(clippy::too_many_arguments)]
+async fn whole_turn(
+    state: &AppState,
+    wire: Wire,
+    id: &str,
+    engine: Arc<Engine>,
+    messages: Vec<ChatMessage>,
+    tools: Option<Vec<Tool>>,
+    options: GenerationOptions,
+    started: Instant,
+    load: Duration,
+) -> Result<Response, ApiError> {
+    let cancel = CancelOnDrop::new();
+    let flag = cancel.flag();
+    let generated = tokio::task::spawn_blocking(move || {
+        let tools = tools.as_deref();
+        let format = match tools {
+            Some(tools) => engine.tool_call_format_for_request(&messages, Some(tools), &options)?,
+            None => engine.tool_call_format(),
+        };
+        let completion =
+            engine.complete_chat_cancellable_detailed(&messages, tools, &options, &flag)?;
+        let answer = crate::server::chat_answer(&engine, &completion, false, tools, format, "call_");
+        Ok::<_, crate::JoshuaError>((completion, answer))
+    })
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?;
+    let (completion, answer) = generated.map_err(ApiError::from)?;
+    state.metrics.record_generation(&completion.usage);
+    let end = End {
+        reason: completion.stop_type.finish_reason(),
+        completion: Some(&completion),
+        tool_calls: ollama_calls(&answer.calls),
+        started,
+        load,
+    };
+    Ok(Json(wire.done(id, &answer.prose, &end)).into_response())
+}
+
+/// A streamed answer: newline-delimited JSON from a blocking thread, which
+/// unloads the model (`release`) once generation ends.
+#[allow(clippy::too_many_arguments)]
+fn stream_turn(
+    state: &AppState,
+    wire: Wire,
+    id: String,
+    engine: Arc<Engine>,
+    messages: Vec<ChatMessage>,
+    tools: Option<Vec<Tool>>,
+    options: GenerationOptions,
+    started: Instant,
+    load: Duration,
+    release: Option<(AppState, String)>,
+) -> Response {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let cancel = CancelOnDrop::new();
     let flag = cancel.flag();
     state.metrics.record_stream();
-
-    tokio::task::spawn_blocking({
-        let engine = Arc::clone(&engine);
-        let model = id.clone();
-        move || {
-            let result = engine.complete_chat_streaming(
-                &messages,
-                tools.as_deref(),
-                &options,
-                &flag,
-                &mut |piece| {
-                    let chunk = ChatChunk {
-                        model: model.clone(),
-                        created_at: now_rfc3339(),
-                        message: ChatMessageOut {
-                            role: "assistant".to_string(),
-                            content: piece.to_string(),
-                        },
-                        done: false,
-                        done_reason: None,
-                        prompt_eval_count: None,
-                        eval_count: None,
-                    };
-                    if let Ok(line) = serde_json::to_string(&chunk) {
-                        let _ = tx.send(format!("{line}\n"));
-                    }
-                },
-            );
-            match result {
-                Ok((_text, usage, _p, _d)) => {
-                    let fin = ChatChunk {
-                        model: model.clone(),
-                        created_at: now_rfc3339(),
-                        message: ChatMessageOut {
-                            role: "assistant".to_string(),
-                            content: String::new(),
-                        },
-                        done: true,
-                        done_reason: Some("stop".to_string()),
-                        prompt_eval_count: Some(usage.prompt_tokens),
-                        eval_count: Some(usage.completion_tokens),
-                    };
-                    if let Ok(line) = serde_json::to_string(&fin) {
-                        let _ = tx.send(format!("{line}\n"));
-                    }
+    let runtime = tokio::runtime::Handle::current();
+    let metrics = Arc::clone(&state.metrics);
+    tokio::task::spawn_blocking(move || {
+        let send = |value: Value| {
+            let _ = tx.send(format!("{value}\n"));
+        };
+        let result = crate::server::stream_chat_output(
+            &engine,
+            &messages,
+            tools.as_deref(),
+            &options,
+            &flag,
+            false,
+            "call_",
+            &mut |piece| {
+                // Calls go out whole, once the answer is read (below).
+                if let ChatPiece::Text(text) = piece {
+                    send(wire.chunk(&id, text, None));
                 }
-                Err(e) => {
-                    let err = serde_json::json!({ "error": e.to_string() });
-                    let _ = tx.send(format!("{err}\n"));
+            },
+        );
+        drop(engine);
+        match result {
+            Ok((completion, calls)) => {
+                metrics.record_generation(&completion.usage);
+                let tool_calls = ollama_calls(&calls);
+                if tool_calls.is_some() {
+                    send(wire.chunk(&id, "", tool_calls));
                 }
+                let end = End {
+                    reason: completion.stop_type.finish_reason(),
+                    completion: Some(&completion),
+                    tool_calls: None,
+                    started,
+                    load,
+                };
+                send(wire.done(&id, "", &end));
             }
+            Err(e) => send(json!({ "error": e.to_string() })),
+        }
+        if let Some((state, id)) = release {
+            runtime.spawn(unload_quietly(state, id));
         }
     });
 
@@ -454,7 +915,54 @@ pub async fn chat(
             .await
             .map(|line| (Ok::<String, std::convert::Infallible>(line), (rx, cancel)))
     });
-    Ok(axum::body::Body::from_stream(stream).into_response())
+    let mut response = axum::body::Body::from_stream(stream).into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/x-ndjson"),
+    );
+    response
+}
+
+// ─── /api/chat ──────────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct ChatRequest {
+    pub model: String,
+    #[serde(default)]
+    pub messages: Vec<Value>,
+    #[serde(default)]
+    pub stream: Option<bool>,
+    #[serde(default)]
+    pub options: OllamaOptions,
+    #[serde(default)]
+    pub tools: Option<Vec<Tool>>,
+    #[serde(default)]
+    pub format: Option<Value>,
+    #[serde(default)]
+    pub keep_alive: Option<Value>,
+}
+
+pub async fn chat(
+    State(state): State<AppState>,
+    Json(req): Json<ChatRequest>,
+) -> Result<Response, ApiError> {
+    let messages = req
+        .messages
+        .into_iter()
+        .map(chat_message)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(ApiError::bad_request)?;
+    let turn = Turn {
+        wire: Wire::Chat,
+        model: req.model,
+        messages,
+        tools: req.tools.filter(|t| !t.is_empty()),
+        options: req.options,
+        format: req.format,
+        keep_alive: req.keep_alive,
+        stream: req.stream.unwrap_or(true),
+    };
+    answer(state, turn).await
 }
 
 // ─── /api/generate ──────────────────────────────────────────────────────────
@@ -467,119 +975,47 @@ pub struct GenerateRequest {
     #[serde(default)]
     pub suffix: Option<String>,
     #[serde(default)]
+    pub images: Option<Vec<String>>,
+    #[serde(default)]
     pub stream: Option<bool>,
     #[serde(default)]
     pub options: OllamaOptions,
-}
-
-#[derive(Serialize)]
-pub struct GenerateChunk {
-    model: String,
-    created_at: String,
-    response: String,
-    done: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    done_reason: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    prompt_eval_count: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    eval_count: Option<u32>,
+    #[serde(default)]
+    pub format: Option<Value>,
+    #[serde(default)]
+    pub keep_alive: Option<Value>,
 }
 
 pub async fn generate(
     State(state): State<AppState>,
     Json(req): Json<GenerateRequest>,
-) -> Result<axum::response::Response, ApiError> {
-    let (id, engine) = select_model(&state, &req.model).await?;
-    let options = req
-        .options
-        .to_generation_options(&engine.sampling_defaults(SamplingProfile::Ollama), engine.n_ctx())
-        .map_err(ApiError::bad_request)?;
+) -> Result<Response, ApiError> {
     let prompt = match &req.suffix {
         Some(suffix) => format!("{}{suffix}", req.prompt),
         None => req.prompt.clone(),
     };
-    let messages = vec![ChatMessage::text("user", &prompt)];
-
-    if !req.stream.unwrap_or(true) {
-        let (text, usage, ..) = tokio::task::spawn_blocking({
-            let engine = Arc::clone(&engine);
-            let messages = messages.clone();
-            let options = options.clone();
-            move || engine.complete_chat(&messages, None, &options)
-        })
-        .await
-        .map_err(|e| ApiError::internal(e.to_string()))?
-        .map_err(ApiError::from)?;
-
-        return Ok(Json(GenerateChunk {
-            model: id,
-            created_at: now_rfc3339(),
-            response: text,
-            done: true,
-            done_reason: Some("stop".to_string()),
-            prompt_eval_count: Some(usage.prompt_tokens),
-            eval_count: Some(usage.completion_tokens),
-        })
-        .into_response());
-    }
-
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    let cancel = CancelOnDrop::new();
-    let flag = cancel.flag();
-    state.metrics.record_stream();
-
-    tokio::task::spawn_blocking({
-        let engine = Arc::clone(&engine);
-        let model = id.clone();
-        move || {
-            let result =
-                engine.complete_chat_streaming(&messages, None, &options, &flag, &mut |piece| {
-                    let chunk = GenerateChunk {
-                        model: model.clone(),
-                        created_at: now_rfc3339(),
-                        response: piece.to_string(),
-                        done: false,
-                        done_reason: None,
-                        prompt_eval_count: None,
-                        eval_count: None,
-                    };
-                    if let Ok(line) = serde_json::to_string(&chunk) {
-                        let _ = tx.send(format!("{line}\n"));
-                    }
-                });
-            match result {
-                Ok((_text, usage, _p, _d)) => {
-                    let fin = GenerateChunk {
-                        model: model.clone(),
-                        created_at: now_rfc3339(),
-                        response: String::new(),
-                        done: true,
-                        done_reason: Some("stop".to_string()),
-                        prompt_eval_count: Some(usage.prompt_tokens),
-                        eval_count: Some(usage.completion_tokens),
-                    };
-                    if let Ok(line) = serde_json::to_string(&fin) {
-                        let _ = tx.send(format!("{line}\n"));
-                    }
-                }
-                Err(e) => {
-                    let err = serde_json::json!({ "error": e.to_string() });
-                    let _ = tx.send(format!("{err}\n"));
-                }
-            }
+    let images = req.images.unwrap_or_default();
+    // An empty prompt only loads (or, with `keep_alive: 0`, unloads).
+    let messages = if prompt.is_empty() && images.is_empty() {
+        Vec::new()
+    } else {
+        let mut message = ChatMessage::text("user", &prompt);
+        if !images.is_empty() {
+            message.images = Some(images.iter().map(|i| image_url(i)).collect());
         }
-    });
-
-    // The `cancel` guard must live as long as the response body: its Drop sets
-    // the flag that stops generation when the client disconnects.  Moving it
-    // into the unfold state ties its lifetime to the stream.
-    let stream = futures_util::stream::unfold((rx, cancel), |(mut rx, cancel)| async move {
-        rx.recv()
-            .await
-            .map(|line| (Ok::<String, std::convert::Infallible>(line), (rx, cancel)))
-    });
-    Ok(axum::body::Body::from_stream(stream).into_response())
+        vec![message]
+    };
+    let turn = Turn {
+        wire: Wire::Generate,
+        model: req.model,
+        messages,
+        tools: None,
+        options: req.options,
+        format: req.format,
+        keep_alive: req.keep_alive,
+        stream: req.stream.unwrap_or(true),
+    };
+    answer(state, turn).await
 }
 
 // ─── /api/embed + /api/embeddings ───────────────────────────────────────────
@@ -589,27 +1025,21 @@ pub struct EmbedRequest {
     #[serde(default)]
     pub model: String,
     #[serde(default)]
-    pub input: Option<serde_json::Value>,
+    pub input: Option<Value>,
     /// `/api/embeddings` (legacy) uses `prompt` instead of `input`.
     #[serde(default)]
     pub prompt: Option<String>,
 }
 
-#[derive(Serialize)]
-pub struct EmbedResponse {
-    model: String,
-    embeddings: Vec<Vec<f32>>,
-}
-
-pub async fn embed(
-    State(state): State<AppState>,
-    Json(req): Json<EmbedRequest>,
-) -> Result<Json<EmbedResponse>, ApiError> {
-    let (_id, engine) = select_model(&state, &req.model).await?;
-
+/// Embed a request's inputs: its vectors, prompt token count, model id and
+/// load time.
+async fn embed_inputs(
+    state: &AppState,
+    req: &EmbedRequest,
+) -> Result<(Vec<Vec<f32>>, u32, String, Duration), ApiError> {
     let inputs: Vec<String> = match (&req.input, &req.prompt) {
-        (Some(serde_json::Value::String(s)), _) => vec![s.clone()],
-        (Some(serde_json::Value::Array(a)), _) => a
+        (Some(Value::String(s)), _) => vec![s.clone()],
+        (Some(Value::Array(a)), _) => a
             .iter()
             .filter_map(|v| v.as_str().map(String::from))
             .collect(),
@@ -617,26 +1047,39 @@ pub async fn embed(
         _ => Vec::new(),
     };
     if inputs.is_empty() {
-        return Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "`input` or `prompt` is required",
-            "invalid_request_error",
-        ));
+        return Err(ApiError::bad_request("`input` or `prompt` is required"));
     }
+    let (id, engine, load) = select(state, &req.model).await?;
+    let (vectors, tokens) = tokio::task::spawn_blocking(move || engine.embed_with_usage(&inputs))
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?
+        .map_err(ApiError::from)?;
+    Ok((vectors, tokens, id, load))
+}
 
-    let vectors = tokio::task::spawn_blocking({
-        let engine = Arc::clone(&engine);
-        let inputs = inputs.clone();
-        move || engine.embed(&inputs)
-    })
-    .await
-    .map_err(|e| ApiError::internal(e.to_string()))?
-    .map_err(|e| ApiError::internal(e.to_string()))?;
+/// `POST /api/embed`.
+pub async fn embed(
+    State(state): State<AppState>,
+    Json(req): Json<EmbedRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let started = Instant::now();
+    let (embeddings, tokens, model, load) = embed_inputs(&state, &req).await?;
+    Ok(Json(json!({
+        "model": model,
+        "embeddings": embeddings,
+        "total_duration": started.elapsed().as_nanos() as u64,
+        "load_duration": load.as_nanos() as u64,
+        "prompt_eval_count": tokens,
+    })))
+}
 
-    Ok(Json(EmbedResponse {
-        model: req.model,
-        embeddings: vectors,
-    }))
+/// `POST /api/embeddings` (legacy): one `prompt`, one `embedding`.
+pub async fn embeddings(
+    State(state): State<AppState>,
+    Json(req): Json<EmbedRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let (mut vectors, ..) = embed_inputs(&state, &req).await?;
+    Ok(Json(json!({ "embedding": vectors.pop().unwrap_or_default() })))
 }
 
 // ─── Model management: /api/delete, /api/copy, /api/create, /api/pull ────────
@@ -832,6 +1275,114 @@ mod tests {
         assert_eq!(d.families, ["qwen3"]);
         assert_eq!(d.quantization_level, "Q4_K_M");
         assert_eq!(details_for(None).format, "gguf");
+    }
+
+    #[test]
+    fn format_is_json_or_a_schema() {
+        assert_eq!(constraint(None).unwrap(), None);
+        assert_eq!(constraint(Some(&json!(""))).unwrap(), None);
+        assert_eq!(constraint(Some(&json!("json"))).unwrap(), Some(ConstraintSpec::JsonObject));
+        let schema = json!({"type": "object", "properties": {"a": {"type": "integer"}}});
+        assert_eq!(
+            constraint(Some(&schema)).unwrap(),
+            Some(ConstraintSpec::JsonSchema { schema: schema.clone() })
+        );
+        assert!(constraint(Some(&json!("xml"))).is_err());
+        assert!(constraint(Some(&json!(3))).is_err());
+    }
+
+    #[test]
+    fn keep_alive_zero_in_any_spelling_unloads() {
+        for zero in [json!(0), json!(0.0), json!("0"), json!("0s"), json!("0m")] {
+            assert!(unload_after(Some(&zero)), "{zero}");
+        }
+        for keep in [json!(-1), json!("5m"), json!("-1"), json!(300), json!(null)] {
+            assert!(!unload_after(Some(&keep)), "{keep}");
+        }
+        assert!(!unload_after(None));
+    }
+
+    #[test]
+    fn ollama_messages_become_engine_messages() {
+        let m = chat_message(json!({
+            "role": "user", "content": "what is this?", "images": ["iVBORw0KGgo="],
+        }))
+        .unwrap();
+        assert_eq!(
+            m.images.unwrap(),
+            ["data:application/octet-stream;base64,iVBORw0KGgo="]
+        );
+        let m = chat_message(json!({"role": "tool", "content": "22", "tool_name": "weather"}))
+            .unwrap();
+        assert_eq!(m.name.as_deref(), Some("weather"));
+        let calls = json!([{"function": {"name": "weather", "arguments": {"city": "Paris"}}}]);
+        let m = chat_message(json!({"role": "assistant", "content": "", "tool_calls": calls}))
+            .unwrap();
+        assert_eq!(m.tool_calls.unwrap(), calls);
+        let m = chat_message(json!({"role": "assistant", "content": "hi", "thinking": "hmm"}))
+            .unwrap();
+        assert_eq!(m.reasoning_content.as_deref(), Some("hmm"));
+    }
+
+    #[test]
+    fn tool_calls_go_out_with_object_arguments() {
+        let calls = [crate::tools::ParsedToolCall {
+            name: "weather".into(),
+            arguments: r#"{"city":"Paris"}"#.into(),
+            id: Some("call_1".into()),
+        }];
+        let out = ollama_calls(&calls).unwrap();
+        assert_eq!(
+            out[0],
+            json!({"id": "call_1", "function": {"index": 0, "name": "weather", "arguments": {"city": "Paris"}}})
+        );
+        assert!(ollama_calls(&[]).is_none());
+    }
+
+    #[test]
+    fn error_bodies_reduce_to_their_message() {
+        let openai = br#"{"error":{"message":"model 'x' not found","type":"model_not_found"}}"#;
+        assert_eq!(error_message(openai), "model 'x' not found");
+        assert_eq!(error_message(br#"{"error":"already"}"#), "already");
+        assert_eq!(error_message(b"Failed to parse the request body\n"), "Failed to parse the request body");
+    }
+
+    #[test]
+    fn parameter_sizes_read_as_ollama_writes_them() {
+        assert_eq!(parameter_size(14_768_307_200), "14.8B");
+        assert_eq!(parameter_size(596_049_920), "596.05M");
+        assert_eq!(parameter_size(12_345), "12.35K");
+        assert_eq!(parameter_size(0), "");
+    }
+
+    #[test]
+    fn vram_counts_what_runs_on_the_accelerator() {
+        let facts = GgufFacts {
+            tensor_bytes: 1_000,
+            expert_bytes: 800,
+            file_size: 1_100,
+            ..GgufFacts::default()
+        };
+        let info = |dense: &str, experts: Option<&str>, cache: Option<u64>| ModelInfo {
+            facts: Some(facts.clone()),
+            placement: Some(crate::model_info::Placement {
+                backend: dense.to_string(),
+                dense: dense.to_string(),
+                experts: experts.map(str::to_string),
+                expert_cache_bytes: cache,
+                npu: false,
+                remote: false,
+                workers: Vec::new(),
+                stages: Vec::new(),
+            }),
+            ..ModelInfo::new("m", 0)
+        };
+        assert_eq!(size_vram(&info("cuda", None, None)), 1_100);
+        assert_eq!(size_vram(&info("cuda", Some("cuda"), None)), 1_100);
+        // Dense weights on the device, routed experts in host memory.
+        assert_eq!(size_vram(&info("cuda", Some("cpu"), None)), 200);
+        assert_eq!(size_vram(&info("cuda", Some("cpu"), Some(50))), 250);
+        assert_eq!(size_vram(&info("cpu", Some("cpu"), None)), 0);
     }
 
     #[test]
