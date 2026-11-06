@@ -191,7 +191,7 @@ class StreamSplitter:
         return rest + leftover
 
 
-QUANT_RE = re.compile(r"(?:^|[-_\s])(UD-)?(IQ\d[_A-Z0-9]*|Q\d_K(?:_[A-Z0-9]+)?|Q\d_\d|Q8_0|Q6_K|Q5_K|Q4_0|MXFP4|TQ1_0|TQ2_0|BF16|F16)"
+QUANT_RE = re.compile(r"(?:^|[-_.\s])(UD-)?(IQ\d[_A-Z0-9]*|Q\d_K(?:_[A-Z0-9]+)?|Q\d_\d|Q8_0|Q6_K|Q5_K|Q4_0|MXFP4|TQ1_0|TQ2_0|BF16|F16)"
                       r"(?:$|[-_\s])")
 
 
@@ -412,10 +412,14 @@ class Agent:
     def servers(self):
         return [u for u in (self.base, self.cpu_base) if u]
 
-    def loaded(self, base=None, session=None):
-        """Model ids a Joshua server already has in memory (all of them by default)."""
+    def server_models(self, base=None, session=None):
+        """Joshua's own `/v1/models` entries (all servers by default), tagged with `_server`.
+
+        Newer builds list every GGUF under `--model-dir` with `root`, architecture, quantization
+        and a `joshua.loaded` flag; older builds list only what is loaded.
+        """
         bases = [base] if base else self.servers()
-        ids = []
+        out = []
         for url in bases:
             try:
                 data = http_json(
@@ -427,12 +431,93 @@ class Agent:
                 if session and session.cancel_event.is_set():
                     raise PromptCancelled()
                 continue
-            for m in (data.get("data", []) if isinstance(data, dict) else []):
-                if m.get("id") and m["id"] not in ids:
-                    ids.append(m["id"])
+            for model in (data.get("data", []) if isinstance(data, dict) else []):
+                if isinstance(model, dict) and model.get("id"):
+                    model = dict(model)
+                    model["_server"] = url
+                    out.append(model)
+        return out
+
+    @staticmethod
+    def _is_loaded(model):
+        served = model.get("joshua")
+        if not isinstance(served, dict) or "loaded" not in served:
+            return True            # older builds only list loaded models
+        return bool(served.get("loaded"))
+
+    def loaded(self, base=None, session=None):
+        """Model ids a Joshua server already has in memory (all of them by default)."""
+        ids = []
+        for model in self.server_models(base, session=session):
+            if self._is_loaded(model) and model["id"] not in ids:
+                ids.append(model["id"])
         return ids
 
+    def _inside_catalog(self, root):
+        """Whether a server-reported root lies inside the catalog roots (`--catalog`/`--model-dir`)."""
+        try:
+            path = Path(os.path.expanduser(root))
+            if not path.is_absolute():
+                path = self.model_dir / path   # server-relative id, resolved under its own dir
+            path = path.resolve()
+        except (OSError, ValueError):
+            return False
+        return any(path.is_relative_to(r) for r in self.roots)
+
+    @staticmethod
+    def _is_vocab(name):
+        return Path(name).name.startswith("ggml-vocab")
+
+    def server_catalog(self):
+        """Joshua's own model list, filtered to things a user should actually pick.
+
+        - `ggml-vocab-*.gguf` are tokenizer vocabularies, not models (`n_params == 0`)
+        - sharded models report one entry per shard; only `…-00001-of-0000N` is offered
+        - loaded models are left to `loaded()`, and roots outside the catalog roots are dropped
+        """
+        found = {}
+        for model in self.server_models():
+            model_id = model["id"]
+            meta = model.get("meta") or {}
+            served = model.get("joshua") or {}
+            if not isinstance(served, dict) or "loaded" not in served or served.get("loaded"):
+                continue
+            if model_id.startswith(("llama-fork/", "llama.cpp/")) or self._is_vocab(model_id):
+                continue
+            try:
+                n_params = int(meta.get("n_params") or 0) if isinstance(meta, dict) else 0
+            except (TypeError, ValueError):
+                n_params = 0
+            if not served.get("architecture") and n_params == 0:
+                continue
+            shard = re.match(r"^(.*)-(\d{5})-of-(\d{5})$", model_id)
+            if shard:
+                if shard.group(2) != "00001":
+                    continue
+                model_id = shard.group(1)
+            root = model.get("root") or model["id"]
+            if model_id in found or not self._inside_catalog(root):
+                continue
+            found[model_id] = {"path": root, "name": ""}
+        return found
+
     def catalog(self):
+        """Loadable models: Joshua's `/v1/models` list, plus disk-scan entries it misses.
+
+        Joshua's own scan does not recurse into deeper model directories, so the disk scan fills
+        the gap. Both are confined to the configured `--model-dir`.
+        """
+        if not self.model_dir:
+            return {}
+        found = self.server_catalog()
+        known = {str(info["path"]) for info in found.values()}
+        for model_id, info in self.scan_catalog().items():
+            if info["path"] in known or model_id in found:
+                continue
+            found[model_id] = info
+        return found
+
+    def scan_catalog(self):
         """Loadable GGUFs on this host: id -> {path, name}. Needs a sibling tokenizer.json.
 
         The id is the file stem (what Joshua reports for most models); the display name comes from
@@ -446,7 +531,7 @@ class Agent:
             if not os.path.isdir(root):
                 continue
             for path in sorted(Path(root).rglob("*.gguf")):
-                if path.name.startswith(("mmproj-", "ggml-vocab")):
+                if self._is_vocab(path.name) or path.name.startswith("mmproj-"):
                     continue
                 try:
                     path = path.resolve(strict=True)
@@ -485,7 +570,8 @@ class Agent:
         catalog = self.catalog()
         loaded = self.loaded()
         out = [{"modelId": mid,
-                "name": short_name(mid, catalog.get(mid, {}).get("name", ""))} for mid in loaded]
+                "name": short_name(mid, catalog.get(mid, {}).get("name", "")) + " *"}
+               for mid in loaded]
         for model_id, info in catalog.items():
             if model_id in loaded or self.aliases.get(model_id) in loaded:
                 continue

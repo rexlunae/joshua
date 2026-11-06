@@ -37,13 +37,18 @@ key in provider arguments or the process command line.
 
 The agent advertises every loadable GGUF on the host, not only what is loaded:
 
-- scans the default model directories (including current `~/joshua-decode-*` directories), but only
+- takes Joshua's own `GET /v1/models` as the authority (newer builds list every GGUF under
+  `--model-dir` with `root`, `joshua.loaded`, architecture and quantization), dropping
+  `ggml-vocab-*.gguf` tokenizer vocabularies and collapsing shards to `…-00001-of-0000N`
+- unions that with a disk scan, because Joshua's scan does not recurse into deeper directories:
+  it scans the default model directories (including current `~/joshua-decode-*` directories), but only
   paths inside the configured server `--model-dir`; `--catalog DIR` can add a narrower root inside it
 - offers a file when it has a sibling `tokenizer.json` and a real `GGUF` magic (truncated downloads
   and HTML error pages are skipped)
 - sharded models (`…-00001-of-00003.gguf`) appear once, pointing at the first shard
 - labels lead with the distinguishing part (`UD-IQ1_S Qwen3.8 Flash Next`, `[qwen3] Q4_K_M Qwen3 14B`),
-  because the client elides the tail of a long name; `modelId` is unchanged
+  because the client elides the tail of a long name, with a trailing `*` on loaded models;
+  `modelId` is unchanged
 - selecting a model that is not loaded issues `POST /v1/models/load` for it, then uses the id Joshua
   reports
 
