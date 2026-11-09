@@ -1034,13 +1034,35 @@ fn engine_runs_registered_adapters_per_request() {
     assert!(cached(None) > 0, "the adapter's state was kept");
     assert!(cached(Some(vec![])) > 0, "the base model's state was kept");
 
-    // Unloaded, it is gone; ids are never reused.
+    // Unloaded, it is gone; ids are never reused.  The idle sessions that
+    // ran it go back to the base model, so they no longer hold its weights,
+    // while the base model's own state is kept.
+    assert!(engine.pooled_adapter_sessions() > 0);
     engine.unload_lora("style").unwrap();
     assert!(engine.lora_adapters().is_empty());
+    assert_eq!(engine.pooled_adapter_sessions(), 0);
+    assert!(cached(Some(vec![])) > 0, "the base model's state survived the unload");
     assert!(run(Some(vec![LoraScale { id: 0, scale: 1.0 }])).is_err());
     let again = engine.load_lora(&file, Some("again"), 1.0).unwrap();
     assert_eq!(again.id, 1);
     assert_eq!(run(None).unwrap(), adapted);
+
+    // No more adapters can be active server-wide than one set can hold:
+    // such a selection would fail every request without its own list.
+    for i in 0..15 {
+        engine.load_lora(&file, Some(&format!("more{i}")), 1.0).unwrap();
+    }
+    assert!(engine.load_lora(&file, Some("one_too_many"), 1.0).is_err());
+    let idle = engine.load_lora(&file, Some("idle"), 0.0).unwrap();
+    let all: Vec<LoraScale> = engine
+        .lora_adapters()
+        .iter()
+        .map(|a| LoraScale { id: a.id, scale: 1.0 })
+        .collect();
+    assert_eq!(all.len(), 17);
+    assert!(engine.set_lora_scales(&all).is_err());
+    assert_eq!(engine.lora_adapters().last().unwrap().scale, 0.0, "a refused update changes nothing");
+    engine.set_lora_scales(&[LoraScale { id: idle.id, scale: 1.0 }]).unwrap();
 }
 
 /// llama-server's LoRA routes over the registry, and a request's `lora`

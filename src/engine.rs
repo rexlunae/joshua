@@ -1569,6 +1569,14 @@ impl GenSession {
         }
     }
 
+    /// The LoRA adapter set this session runs (`None`: the base model).
+    fn adapters(&self) -> Option<Arc<crate::lora::ActiveSet>> {
+        match self {
+            Self::Candle(model) => model.adapters(),
+            Self::Npu(_) => None,
+        }
+    }
+
     /// Take a recurrent model's prefix checkpoint at `pos` (see
     /// [`QuantizedModel::checkpoint_prefix`]).
     fn checkpoint_prefix(&mut self, pos: usize) {
@@ -6776,9 +6784,42 @@ impl Engine {
         Ok(info)
     }
 
-    /// Unload the LoRA adapter named `name`.
+    /// Unload the LoRA adapter named `name`.  Idle pooled sessions running
+    /// it go back to the base model (their state is cleared), so the
+    /// adapter's weights are freed once the requests running it finish;
+    /// those return their sessions through [`Self::release_model`], which
+    /// detaches them the same way.
     pub fn unload_lora(&self, name: &str) -> Result<crate::lora_registry::LoraInfo> {
-        self.lora.unload(name)
+        let info = self.lora.unload(name)?;
+        for cached in self.model_pool().iter_mut() {
+            self.detach_unloaded_adapters(&mut cached.session, &mut cached.tokens);
+        }
+        Ok(info)
+    }
+
+    /// How many idle pooled sessions run a LoRA adapter set (for tests).
+    #[doc(hidden)]
+    pub fn pooled_adapter_sessions(&self) -> usize {
+        self.model_pool()
+            .iter()
+            .filter(|c| c.session.adapters().is_some())
+            .count()
+    }
+
+    /// Put `session` back on the base model, with its state and `tokens`
+    /// cleared, when it runs an adapter that is no longer loaded.
+    fn detach_unloaded_adapters(&self, session: &mut GenSession, tokens: &mut Vec<u32>) {
+        let Some(set) = session.adapters() else {
+            return;
+        };
+        if self.lora.holds(&set) {
+            return;
+        }
+        drop(set);
+        match session.set_adapters(None) {
+            Ok(_) => tokens.clear(),
+            Err(e) => tracing::warn!(error = %e, "could not detach an unloaded LoRA adapter"),
+        }
     }
 
     /// The loaded LoRA adapters, by id.
@@ -7022,6 +7063,9 @@ impl Engine {
         tokens: Vec<u32>,
         scope: Option<crate::affinity::Scope>,
     ) {
+        let mut session = session;
+        let mut tokens = tokens;
+        self.detach_unloaded_adapters(&mut session, &mut tokens);
         let mut pool = self.model_pool();
         pool.push(CachedModel {
             session,

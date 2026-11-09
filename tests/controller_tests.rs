@@ -683,6 +683,7 @@ async fn model_paths_stay_inside_the_model_directory_and_management_is_opt_in() 
         ("/v1/chat/completions", true),
         ("/v1/models/load", false),
         ("/v1/models/unload", false),
+        ("/lora-adapters", false),
     ] {
         let res = app.clone().oneshot(preflight(uri)).await.unwrap();
         assert_eq!(

@@ -116,6 +116,10 @@ impl Registry {
                 "a LoRA adapter named `{name}` is already loaded"
             )));
         }
+        if scale != 0.0 {
+            let active = inner.entries.iter().filter(|e| e.info.scale != 0.0).count();
+            self.check_active(active + 1)?;
+        }
         let info = LoraInfo {
             id: inner.next_id,
             name,
@@ -149,6 +153,15 @@ impl Registry {
         Ok(entry.info)
     }
 
+    /// Whether every adapter in `set` is still loaded (an unloaded one's
+    /// digest is no longer among the entries).
+    pub fn holds(&self, set: &ActiveSet) -> bool {
+        let inner = self.lock();
+        set.adapters()
+            .iter()
+            .all(|(a, _)| inner.entries.iter().any(|e| e.adapter.digest() == a.digest()))
+    }
+
     /// The loaded adapters, by id.
     pub fn list(&self) -> Vec<LoraInfo> {
         self.lock().entries.iter().map(|e| e.info.clone()).collect()
@@ -163,11 +176,25 @@ impl Registry {
             .map(|e| e.info.id)
     }
 
+    /// Refuse a server-wide selection of `active` nonzero adapters when a
+    /// set of that many could not be built, which would fail every request
+    /// that runs the server-wide scales.
+    fn check_active(&self, active: usize) -> Result<()> {
+        if active > self.limits.max_adapters {
+            return Err(JoshuaError::InvalidRequest(format!(
+                "{active} LoRA adapters would be active at once; at most {} can be",
+                self.limits.max_adapters
+            )));
+        }
+        Ok(())
+    }
+
     /// Set the server-wide scales: each listed adapter's to its scale and
     /// every other one's to 0 (llama-server's `POST /lora-adapters`).
     pub fn set_scales(&self, scales: &[LoraScale]) -> Result<()> {
         let mut inner = self.lock();
         let resolved = resolve(&inner.entries, scales)?;
+        self.check_active(resolved.iter().filter(|s| **s != 0.0).count())?;
         for (entry, scale) in inner.entries.iter_mut().zip(resolved) {
             entry.info.scale = scale;
         }
