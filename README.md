@@ -388,7 +388,7 @@ registry:
 
 | Protocol | Endpoints |
 |---|---|
-| OpenAI | `POST /v1/chat/completions`, `POST /v1/completions`, `POST /v1/embeddings`, `POST /v1/audio/transcriptions`, `POST /v1/audio/translations`, `GET /v1/models` (also `/models`), `GET /v1/models/{id}` |
+| OpenAI | `POST /v1/chat/completions`, `POST /v1/completions`, `POST /v1/responses` (with `GET`/`DELETE /v1/responses/{id}` and `/input_items`), `POST /v1/embeddings`, `POST /v1/audio/transcriptions`, `POST /v1/audio/translations`, `GET /v1/models` (also `/models`), `GET /v1/models/{id}` |
 | Anthropic | `POST /v1/messages`, `POST /v1/messages/count_tokens` |
 | llama.cpp (`llama-server`) | `GET /health` (also `/v1/health`), `GET /props`, `GET /slots`, `GET /metrics`, `POST /tokenize`, `POST /detokenize`, `POST /chat/completions` |
 | vLLM | `GET /load`, `GET /ping`, `GET /version`, `GET /metrics`, `POST /v1/tokenize`, `POST /v1/detokenize` |
@@ -448,7 +448,7 @@ Besides `model`, `messages`, `stream` and `tools`:
 | `prompt_cache_key` | OpenAI's cache key: requests sharing it share a prompt-cache namespace and, behind `joshua route`, a worker (an `x-joshua-affinity` handle wins over it) |
 | `stream_options` | Accepted; usage is always sent on the final chunk |
 | `logprobs`, `top_logprobs` | Each generated token's log-probability in `choices[].logprobs.content`, with up to 20 alternatives; streamed, each chunk carries its tokens'. The probabilities are the model's own (a softmax of its logits, before temperature and the other samplers), as vLLM reports them by default. A request with `logprobs` decodes one token at a time, without speculative drafting |
-| `prompt_logprobs` | vLLM's: each prompt token's log-probability given the tokens before it, with up to 20 alternatives, in the response's `prompt_logprobs` (null for the first token, then a map from token id to `logprob`, `rank` and `decoded_token`). On `/v1/completions` it is in each choice, and `echo` with `logprobs` puts the prompt's tokens in front of the generated ones. The prompt is scored in a pass of its own, so it costs one more prefill. Refused when streaming, as vLLM does |
+| `prompt_logprobs` | vLLM's: each prompt token's log-probability given the tokens before it, with up to 20 alternatives, in the response's `prompt_logprobs` (null for the first token, then a map from token id to `logprob`, `rank` and `decoded_token`). On `/v1/completions` it is in each choice, and `echo` with `logprobs` puts the prompt's tokens in front of the generated ones. The prompt is scored inside the request's own generation, and generation picks up the scored state, so it costs no second prefill; the request runs on the CPU/GPU backend rather than an NPU, and is refused with images. Refused when streaming, as vLLM does |
 | `n` | Only `n: 1` is accepted; anything else is a **400** rather than silently ignored |
 | `response_format` | `{"type": "text"}`, `{"type": "json_object"}`, or `{"type": "json_schema", "json_schema": {"name": …, "schema": {…}}}` — see [Structured outputs](#structured-outputs) |
 
@@ -574,6 +574,29 @@ speculative decoding and MTP drafting, and user `stop` strings are ignored
 (the grammar's EOS is the only legal stop); `max_tokens` still applies, so a
 cap that is too small can end a document early.  Requests without
 `response_format` are unchanged.
+
+### `POST /v1/responses` (OpenAI Responses API)
+
+OpenAI's newer API runs on the same chat path.  `instructions` become the
+system message and the `input` items the conversation, and the answer comes
+back as `reasoning`, `message` and `function_call` output items:
+
+```bash
+curl http://localhost:8080/v1/responses \
+  -H "Content-Type: application/json" \
+  -d '{"model": "gemma", "input": "Hello!", "max_output_tokens": 64}'
+```
+
+Responses are kept in memory (the newest 1024, up to 64 MiB, until the
+server restarts) unless the request says `"store": false`, so a follow-up can
+send only its new input with `"previous_response_id"`.  `GET` and `DELETE
+/v1/responses/{id}` fetch or forget one, and `GET
+/v1/responses/{id}/input_items` lists the conversation it answered.  With
+`"stream": true` the answer streams as the API's typed events
+(`response.created`, `response.output_item.added`,
+`response.output_text.delta`, `response.function_call_arguments.delta`, ...,
+`response.completed`).  Only `function` tools are supported; `background`
+and `conversation` are refused.
 
 ### `POST /v1/messages` (Anthropic Messages API)
 
