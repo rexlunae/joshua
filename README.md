@@ -681,8 +681,9 @@ curl http://localhost:8080/v1/audio/transcriptions \
   -F file=@speech.wav -F language=en
 ```
 
-`POST /v1/audio/translations` takes the same form and returns the speech as
-English text.
+Without `language`, a multilingual checkpoint detects the spoken language
+from the first 30 s.  `POST /v1/audio/translations` takes the same form and
+returns the speech as English text.
 
 Whisper jobs use a separate one-slot, per-model admission gate before entering
 the blocking pool; queued HTTP requests do not occupy blocking threads or

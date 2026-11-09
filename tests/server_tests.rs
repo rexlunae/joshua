@@ -1883,18 +1883,16 @@ async fn openai_and_vllm_ops_routes_answer_in_their_shapes() {
         let (status, body) = call("POST", "/v1/embeddings", Some(bad.clone())).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {body}");
     }
-    // When the model embeds at all: base64 is the float vector's
-    // little-endian bytes, token ids embed as their text does, and
-    // `dimensions` keeps a unit-length prefix.
+    // The tiny llama embeds: base64 is the float vector's little-endian
+    // bytes, token ids embed as their text does, and `dimensions` keeps a
+    // unit-length prefix.
     let (status, body) = call(
         "POST",
         "/v1/embeddings",
         Some(serde_json::json!({"model": "", "input": ["a b", "c"]})),
     )
     .await;
-    if status != StatusCode::OK {
-        return;
-    }
+    assert_eq!(status, StatusCode::OK, "{body}");
     let float: serde_json::Value = serde_json::from_str(&body).unwrap();
     let first: Vec<f32> = serde_json::from_value(float["data"][0]["embedding"].clone()).unwrap();
     let (_, body) = call(

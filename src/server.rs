@@ -3016,7 +3016,8 @@ pub(crate) fn embedding_response(
 /// `POST /v1/audio/transcriptions` — OpenAI-compatible Whisper STT.
 ///
 /// Multipart form fields: `file` (required, WAV), `language` (optional
-/// two-letter code), `response_format` (`json` default, or `text`), and
+/// two-letter code; detected from the first 30 s when absent),
+/// `response_format` (`json` default, or `text`), and
 /// `model` (accepted and ignored — the loaded whisper model is used).
 async fn transcriptions(
     State(state): State<AppState>,
@@ -3028,9 +3029,9 @@ async fn transcriptions(
 }
 
 /// `POST /v1/audio/translations` — OpenAI-compatible Whisper translation:
-/// the speech as English text.  The same form as
-/// [`transcriptions`]; a `language` names the spoken language (OpenAI's
-/// takes none, so Whisper detects it).
+/// the speech as English text.  The same form as [`transcriptions`]; a
+/// `language` names the spoken language, which is otherwise detected
+/// (OpenAI's form takes none).
 async fn translations(
     State(state): State<AppState>,
     Extension(lease): Extension<Arc<crate::job_admission::JobLease>>,

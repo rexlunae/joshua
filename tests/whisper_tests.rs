@@ -162,10 +162,15 @@ fn whisper_transcribes_wav_end_to_end() {
         result.text
     );
 
-    // A second call must work (mutex + KV flush per segment).
-    engine
-        .transcribe_wav(&wav, None, false)
-        .expect("second transcription");
+    // A second call must work (mutex + KV flush per segment).  With no
+    // language given, the spoken one is detected (this vocabulary has only
+    // English), for a translation as for a transcription.
+    for translate in [false, true] {
+        let detected = engine
+            .transcribe_wav(&wav, None, translate)
+            .expect("second transcription");
+        assert_eq!(detected.language.as_deref(), Some("en"));
+    }
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -227,8 +232,23 @@ async fn transcription_http_preserves_formats_validation_and_no_model_errors() {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["error"]["type"], "invalid_request_error");
     }
-    let response = app.oneshot(request(Some(&wav), "text")).await.unwrap();
+    let response = app.clone().oneshot(request(Some(&wav), "text")).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+    // A translation takes the same form, and detects the language when
+    // none is given.
+    let mut body = b"--audio\r\nContent-Disposition: form-data; name=\"file\"; filename=\"tone.wav\"\r\nContent-Type: audio/wav\r\n\r\n".to_vec();
+    body.extend_from_slice(&wav);
+    body.extend_from_slice(b"\r\n--audio--\r\n");
+    let translation = Request::post("/v1/audio/translations")
+        .header("content-type", "multipart/form-data; boundary=audio")
+        .body(Body::from(body))
+        .unwrap();
+    let response = app.oneshot(translation).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 65536).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["language"], "en");
+    assert!(json["text"].is_string());
     let no_whisper = create_router(Arc::new(ServerState::new(engine)));
     let response = no_whisper
         .oneshot(request(Some(&wav), "json"))

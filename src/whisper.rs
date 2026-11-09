@@ -78,6 +78,9 @@ pub struct WhisperEngine {
     transcribe_token: Option<u32>,
     translate_token: Option<u32>,
     no_timestamps_token: Option<u32>,
+    /// A multilingual checkpoint's language tokens and their codes (empty
+    /// for an English-only one), for detecting the spoken language.
+    languages: Vec<(u32, String)>,
 }
 
 impl WhisperEngine {
@@ -135,12 +138,17 @@ impl WhisperEngine {
             config.vocab_size
         );
 
+        let translate_token = token(wm::TRANSLATE_TOKEN);
+        let transcribe_token = token(wm::TRANSCRIBE_TOKEN);
+        let languages = language_tokens(&tokenizer, sot_token, translate_token, transcribe_token);
+
         Ok(Self {
             job_owner: uuid::Uuid::new_v4().to_string(),
             model: Mutex::new(model),
             admission: Arc::new(tokio::sync::Semaphore::new(1)),
-            transcribe_token: token(wm::TRANSCRIBE_TOKEN),
-            translate_token: token(wm::TRANSLATE_TOKEN),
+            transcribe_token,
+            translate_token,
+            languages,
             no_timestamps_token: token(wm::NO_TIMESTAMPS_TOKEN),
             tokenizer,
             config,
@@ -221,18 +229,28 @@ impl WhisperEngine {
         let mel = Tensor::from_vec(mel, (1, self.config.num_mel_bins, n_frames), &self.device)
             .map_err(|e| JoshuaError::Inference(e.to_string()))?;
 
-        // Resolve the language token for multilingual checkpoints.
-        let language = language.map(str::to_lowercase);
-        let language_token = match &language {
-            Some(lang) => Some(self.language_token(lang)?),
-            // English-only checkpoints have no language tokens at all.
-            None => self.tokenizer.token_to_id("<|en|>"),
-        };
-
         // Recover from poisoning rather than failing permanently: the KV
         // cache is flushed per segment below, so a prior panic leaves no
         // state that would corrupt this transcription.
         let mut model = lock_cancellable(&self.model, cancel)?;
+
+        // Resolve the language token for multilingual checkpoints: the one
+        // asked for, else the language the first segment is spoken in.
+        // English-only checkpoints have no language tokens at all.
+        let (language, language_token) = match language.map(str::to_lowercase) {
+            Some(lang) => {
+                let token = self.language_token(&lang)?;
+                (Some(lang), Some(token))
+            }
+            None if self.languages.is_empty() => (None, None),
+            None => {
+                let first = mel
+                    .narrow(2, 0, usize::min(n_frames, wm::N_FRAMES))
+                    .map_err(|e| JoshuaError::Inference(e.to_string()))?;
+                let (token, code) = self.detect_language(&mut model, &first, cancel)?;
+                (Some(code), Some(token))
+            }
+        };
 
         let mut text = String::new();
         let mut seek = 0;
@@ -252,7 +270,7 @@ impl WhisperEngine {
         Ok(Transcription {
             text: text.trim().to_string(),
             duration,
-            language: language.or_else(|| language_token.map(|_| "en".to_string())),
+            language,
         })
     }
 
@@ -344,6 +362,37 @@ impl WhisperEngine {
     }
 
     /// Resolve `<|xx|>` for a two-letter language code.
+    /// The language a mel segment is spoken in: the language token the
+    /// decoder ranks highest right after start-of-transcript, as Whisper's
+    /// own `detect_language` does.
+    fn detect_language(
+        &self,
+        model: &mut Whisper,
+        mel: &Tensor,
+        cancel: &AtomicBool,
+    ) -> Result<(u32, String)> {
+        let inference = |e: candle_core::Error| JoshuaError::Inference(e.to_string());
+        let features = model.encoder.forward(mel, true).map_err(inference)?;
+        check_cancel(cancel)?;
+        let input = Tensor::new(&[self.sot_token], &self.device)
+            .and_then(|t| t.unsqueeze(0))
+            .map_err(inference)?;
+        let ys = model.decoder.forward(&input, &features, true).map_err(inference)?;
+        let logits = model
+            .decoder
+            .final_linear(&ys.i((..1, 0..1)).map_err(inference)?)
+            .and_then(|l| l.i(0)?.i(0))
+            .and_then(|l| l.to_vec1::<f32>())
+            .map_err(inference)?;
+        check_cancel(cancel)?;
+        self.languages
+            .iter()
+            .filter(|(id, _)| (*id as usize) < logits.len())
+            .max_by(|a, b| logits[a.0 as usize].total_cmp(&logits[b.0 as usize]))
+            .map(|(id, code)| (*id, code.clone()))
+            .ok_or_else(|| JoshuaError::Inference("whisper has no language tokens".into()))
+    }
+
     fn language_token(&self, lang: &str) -> Result<u32> {
         self.tokenizer
             .token_to_id(&format!("<|{lang}|>"))
@@ -353,6 +402,28 @@ impl WhisperEngine {
                 ))
             })
     }
+}
+
+/// A Whisper vocabulary's language tokens (`<|en|>`, `<|de|>`, …) with their
+/// codes: the special tokens between start-of-transcript and the task
+/// tokens.  Empty for an English-only checkpoint, which has no task tokens.
+fn language_tokens(
+    tokenizer: &Tokenizer,
+    sot: u32,
+    translate: Option<u32>,
+    transcribe: Option<u32>,
+) -> Vec<(u32, String)> {
+    let Some(end) = [translate, transcribe].into_iter().flatten().min() else {
+        return Vec::new();
+    };
+    (sot.saturating_add(1)..end)
+        .filter_map(|id| {
+            let token = tokenizer.id_to_token(id)?;
+            let code = token.strip_prefix("<|")?.strip_suffix("|>")?;
+            (!code.is_empty() && code.len() <= 3 && code.bytes().all(|b| b.is_ascii_lowercase()))
+                .then(|| (id, code.to_string()))
+        })
+        .collect()
 }
 
 // ─── Audio ingest ───────────────────────────────────────────────────────────
@@ -555,6 +626,45 @@ fn find_safetensors(dir: &Path) -> Result<std::path::PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn language_tokens_lie_between_start_of_transcript_and_the_tasks() {
+        let special = |id: u32, content: &str| {
+            format!(
+                r#"{{"id": {id}, "content": "{content}", "single_word": false, "lstrip": false,
+                    "rstrip": false, "normalized": false, "special": true}}"#
+            )
+        };
+        let names = ["<|endoftext|>", "<|startoftranscript|>", "<|en|>", "<|de|>", "<|haw|>",
+            "<|translate|>", "<|transcribe|>", "<|fr|>"];
+        let added: Vec<String> = names
+            .iter()
+            .enumerate()
+            .map(|(id, name)| special(id as u32, name))
+            .collect();
+        let vocab: Vec<String> = names
+            .iter()
+            .enumerate()
+            .map(|(id, name)| format!("\"{name}\": {id}"))
+            .collect();
+        let json = format!(
+            r#"{{"version": "1.0", "truncation": null, "padding": null,
+                "added_tokens": [{}], "normalizer": null,
+                "pre_tokenizer": {{"type": "Whitespace"}}, "post_processor": null,
+                "decoder": null,
+                "model": {{"type": "WordLevel", "vocab": {{{}}}, "unk_token": "<|endoftext|>"}}}}"#,
+            added.join(","),
+            vocab.join(",")
+        );
+        let tokenizer: super::Tokenizer = json.parse().unwrap();
+        let languages = super::language_tokens(&tokenizer, 1, Some(5), Some(6));
+        assert_eq!(
+            languages,
+            vec![(2, "en".to_string()), (3, "de".to_string()), (4, "haw".to_string())]
+        );
+        // An English-only checkpoint has no task tokens and no languages.
+        assert!(super::language_tokens(&tokenizer, 1, None, None).is_empty());
+    }
+
     #[test]
     fn cancellation_precedes_ingest_and_mutex_acquisition() {
         let cancel = super::AtomicBool::new(true);
