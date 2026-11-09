@@ -86,7 +86,7 @@ impl Coordinator {
         body: &Bytes,
     ) -> Option<Response> {
         let request: crate::types::EmbeddingRequest = serde_json::from_slice(body).ok()?;
-        let texts = request.input.into_vec();
+        let texts = request.texts()?;
         if texts.is_empty() {
             return None;
         }

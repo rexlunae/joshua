@@ -2583,8 +2583,12 @@ async fn embedding_jobs_match_direct_real_worker_and_enforce_owner() {
     req.headers_mut().insert(header::AUTHORIZATION, "Bearer worker-secret".parse().unwrap());
     req.headers_mut().insert(joshua::coordinator::JOB_OWNER_HEADER, "stale-owner".parse().unwrap());
     assert_eq!(sender.send_request(req).await.unwrap().status(), StatusCode::CONFLICT);
-    let invalid = call(&router, "POST", "/v1/embeddings", &json!({"model": info.model, "input": [1]}).to_string()).await;
-    assert_eq!(invalid.status, StatusCode::UNPROCESSABLE_ENTITY);
+    // Token ids are not split into jobs; the request goes to one worker whole.
+    let ids = call(&router, "POST", "/v1/embeddings", &json!({"model": info.model, "input": [1]}).to_string()).await;
+    assert_eq!(ids.status, StatusCode::OK, "{}", ids.text());
+    assert_eq!(ids.json()["data"].as_array().unwrap().len(), 1);
+    let invalid = call(&router, "POST", "/v1/embeddings", &json!({"model": info.model, "input": [true]}).to_string()).await;
+    assert_eq!(invalid.status, StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]

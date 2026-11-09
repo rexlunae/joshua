@@ -76,7 +76,7 @@ pub(crate) async fn admit(
         "/v1/embeddings" | "/embedding" | "/embeddings" => {
             (admission.embeddings, EMBEDDING_BYTES)
         }
-        "/v1/audio/transcriptions" => (admission.audio, AUDIO_BYTES),
+        "/v1/audio/transcriptions" | "/v1/audio/translations" => (admission.audio, AUDIO_BYTES),
         _ => return next.run(request).await,
     };
     let Ok(permit) = slots.try_acquire_owned() else {

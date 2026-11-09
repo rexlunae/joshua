@@ -3,7 +3,7 @@
 //! Implements the following endpoints:
 //! - `GET  /health`                   — liveness check with a load summary
 //! - `GET  /status`                   — model inventory and counters
-//! - `GET  /metrics`                  — JSON counters (`/metrics/prometheus` for text)
+//! - `GET  /metrics`                  — Prometheus text (`/metrics/json` for JSON)
 //! - `GET  /props`                    — llama.cpp-compatible server properties
 //! - `GET  /slots`                    — lightweight per-model slot records
 //! - `GET  /load`                     — vLLM-compatible server-load metrics
@@ -20,7 +20,8 @@
 //! - `POST /v1/completions`           — legacy text completion
 //! - `POST /v1/embeddings`            — dense text embeddings
 //! - `POST /v1/audio/transcriptions`  — Whisper speech-to-text (when a
-//!   whisper model is configured)
+//!   whisper model is configured); `/v1/audio/translations` gives English
+//! - `GET  /ping`, `GET /version`      — vLLM's liveness probe and version
 //! - `GET  /v1/worker/info`           — worker identity and live load for a
 //!   `joshua route` coordinator (see [`crate::coordinator`])
 //! - `POST /v1/models/load`           — load a model from the controller's
@@ -67,7 +68,7 @@ use uuid::Uuid;
 
 use crate::anthropic::{self, MessagesRequest};
 use crate::coordinator::{JobModel, ModelSlots, WorkerCapabilities, WorkerInfo, JOB_OWNER_HEADER, WORKER_PROTOCOL_VERSION};
-use crate::engine::{Completion, Engine, EngineOptions};
+use crate::engine::{Completion, Engine, EngineOptions, RawPrompt};
 use crate::error::JoshuaError;
 use crate::model_info::{device_label, GgufFacts, ModelInfo, ModelLimits, Placement};
 use crate::reasoning::{ReasoningOutput, Split};
@@ -77,7 +78,7 @@ use crate::tools::{ParsedToolCall, ToolCallFormat, ToolCallStream, ToolEvent};
 use crate::types::{
     unix_time, AssistantMessage, ChatChoice, ChatCompletionChunk, ChatCompletionRequest,
     ChatCompletionResponse, ChatMessage, DeltaContent, EmbeddingData, EmbeddingRequest,
-    EmbeddingResponse, ErrorResponse, FunctionCallResult, GenerationOptions, ModelCard,
+    EmbeddingResponse, EmbeddingVector, ErrorResponse, FunctionCallResult, GenerationOptions, ModelCard,
     ModelListResponse, Tool, ToolCall, UsageInfo,
 };
 
@@ -1168,6 +1169,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/models", get(list_models))
         .route("/v1/models/{*id}", get(retrieve_model))
         .route("/v1/chat/completions", post(chat_completions))
+        // llama-server also serves its OpenAI routes without the `/v1`.
+        .route("/chat/completions", post(chat_completions))
         .route("/v1/messages", post(messages))
         .route("/v1/messages/count_tokens", post(messages_count_tokens))
         .route("/v1/completions", post(crate::completions::completions))
@@ -1179,13 +1182,15 @@ pub fn create_router(state: AppState) -> Router {
         .route("/apply-template", post(crate::llama_server::apply_template))
         .route("/v1/embeddings", post(embeddings))
         .route("/v1/audio/transcriptions", post(transcriptions))
+        .route("/v1/audio/translations", post(translations))
         .route(crate::coordinator::WORKER_INFO_PATH, get(worker_info))
         // Ops endpoints sit behind the API key when one is configured:
         // they expose model names and load figures, which are not useful to
         // an unauthenticated caller.  `/health` below stays open for probes.
         .route("/status", get(server_status))
-        .route("/metrics", get(metrics_json))
+        .route("/metrics", get(metrics_prometheus))
         .route("/metrics/prometheus", get(metrics_prometheus))
+        .route("/metrics/json", get(metrics_json))
         .route("/props", get(props))
         .route("/slots", get(slots))
         .layer(middleware::from_fn_with_state(
@@ -1230,6 +1235,10 @@ pub fn create_router(state: AppState) -> Router {
     let cors = cors_layer(&state.cors_origins);
     Router::new()
         .route("/health", get(health))
+        .route("/v1/health", get(health))
+        // vLLM's (and SageMaker's) liveness probe and version.
+        .route("/ping", get(ping).post(ping))
+        .route("/version", get(version))
         // Ollama's heartbeat: its CLI sends `HEAD /` before every command.
         .route("/", get(crate::ollama::heartbeat))
         .merge(api)
@@ -1444,6 +1453,16 @@ async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
     }))
 }
 
+/// `GET`/`POST /ping` — vLLM's liveness probe: 200 with no body.
+async fn ping() -> StatusCode {
+    StatusCode::OK
+}
+
+/// `GET /version` — vLLM's `{"version": ...}`.
+async fn version() -> Json<serde_json::Value> {
+    Json(json!({ "version": env!("CARGO_PKG_VERSION") }))
+}
+
 /// `GET /status` — model inventory and live load.
 async fn server_status(State(state): State<AppState>) -> Json<serde_json::Value> {
     let models = state.models.list();
@@ -1477,7 +1496,8 @@ async fn server_status(State(state): State<AppState>) -> Json<serde_json::Value>
     }))
 }
 
-/// `GET /metrics` — JSON counters.
+/// `GET /metrics/json` — JSON counters, with per-model prefix-cache
+/// figures.
 async fn metrics_json(State(state): State<AppState>) -> Json<serde_json::Value> {
     let mut metrics = state.metrics.snapshot();
     metrics["prefix_cache"] = serde_json::Value::Array(
@@ -1507,7 +1527,8 @@ async fn metrics_json(State(state): State<AppState>) -> Json<serde_json::Value> 
     Json(metrics)
 }
 
-/// `GET /metrics/prometheus` — Prometheus text exposition format.
+/// `GET /metrics` (also `/metrics/prometheus`) — Prometheus text
+/// exposition format, as vLLM and llama-server serve it.
 async fn metrics_prometheus(State(state): State<AppState>) -> Response {
     let models = state.models.list();
     let in_flight: usize = models.iter().map(|m| m.engine.in_flight()).sum();
@@ -1584,15 +1605,19 @@ async fn slots(State(state): State<AppState>) -> Json<serde_json::Value> {
     Json(serde_json::Value::Array(slots))
 }
 
-/// `POST /tokenize` (also `/api/tokens`) — count a prompt with the loaded
-/// tokenizer.  Body: `{"model": "...", "prompt": "..."}` or llama.cpp's
-/// `{"content": "..."}`; `add_special_tokens` (llama.cpp's `add_special`)
-/// defaults to true.  llama.cpp's `with_pieces: true` gives each token as
-/// `{"id", "piece"}`, the piece as text, or as its bytes when it is not
-/// whole UTF-8.
+/// `POST /tokenize` (also `/v1/tokenize` and `/api/tokens`) — count a
+/// prompt with the loaded tokenizer.  Body: `{"model": "...", "prompt":
+/// "..."}` or llama.cpp's `{"content": "..."}`; `add_special_tokens`
+/// (llama.cpp's `add_special`) defaults to true.  vLLM's chat form,
+/// `{"messages": [...]}` with `tools` and `add_generation_prompt`, counts
+/// the prompt the chat template renders.  llama.cpp's `with_pieces: true`
+/// gives each token as `{"id", "piece"}`, the piece as text, or as its bytes
+/// when it is not whole UTF-8; vLLM's `return_token_strs: true` adds
+/// `token_strs`, each token's vocabulary entry.  `max_model_len` is the
+/// context window, as vLLM reports it.
 async fn tokenize(
     State(state): State<AppState>,
-    Json(body): Json<serde_json::Value>,
+    Json(mut body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let (_, engine) = select_model(
         &state,
@@ -1601,37 +1626,66 @@ async fn tokenize(
             .unwrap_or_default(),
     )
     .await?;
-    let prompt = body
-        .get("prompt")
-        .or_else(|| body.get("content"))
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| ApiError::bad_request("missing 'prompt' or 'content'"))?;
-    let add_special = body
-        .get("add_special_tokens")
-        .or_else(|| body.get("add_special"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true);
-    let with_pieces = body
-        .get("with_pieces")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let prompt = prompt.to_string();
-    let (count, tokens) = tokio::task::spawn_blocking(move || -> crate::Result<_> {
-        let ids = engine.tokenize(&prompt, add_special)?;
-        let tokens = if with_pieces {
-            json!(crate::llama_server::pieces(&engine, &ids)?)
-        } else {
-            json!(ids)
-        };
-        Ok((ids.len(), tokens))
+    let flag = |name: &str| body.get(name).and_then(|v| v.as_bool());
+    let with_pieces = flag("with_pieces").unwrap_or(false);
+    let token_strs = flag("return_token_strs").unwrap_or(false);
+    let ids = if body.get("messages").is_some() {
+        if let Some(fields) = body.as_object_mut() {
+            fields.entry("model").or_insert_with(|| json!(""));
+        }
+        let req: ChatCompletionRequest = serde_json::from_value(body)
+            .map_err(|e| ApiError::bad_request(e.to_string()))?;
+        let options = req
+            .to_generation_options_with(&engine.sampling_defaults(SamplingProfile::OpenAi))
+            .map_err(ApiError::bad_request)?;
+        let tools = req.offered_tools();
+        let engine = Arc::clone(&engine);
+        tokio::task::spawn_blocking(move || {
+            engine.tokenize_chat(&req.messages, tools.as_deref(), &options)
+        })
+        .await
+    } else {
+        let prompt = body
+            .get("prompt")
+            .or_else(|| body.get("content"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ApiError::bad_request("missing 'prompt', 'content' or 'messages'"))?
+            .to_string();
+        let add_special = body
+            .get("add_special_tokens")
+            .or_else(|| body.get("add_special"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        let engine = Arc::clone(&engine);
+        tokio::task::spawn_blocking(move || engine.tokenize(&prompt, add_special)).await
+    }
+    .map_err(|e| ApiError::internal(e.to_string()))?
+    .map_err(ApiError::from)?;
+    let count = ids.len();
+    let (tokens, strs) = tokio::task::spawn_blocking({
+        let engine = Arc::clone(&engine);
+        move || -> crate::Result<_> {
+            let strs = token_strs.then(|| engine.token_strings(&ids));
+            let tokens = if with_pieces {
+                json!(crate::llama_server::pieces(&engine, &ids)?)
+            } else {
+                json!(ids)
+            };
+            Ok((tokens, strs))
+        }
     })
     .await
     .map_err(|e| ApiError::internal(e.to_string()))?
     .map_err(ApiError::from)?;
-    Ok(Json(json!({
+    let mut out = json!({
         "tokens": tokens,
         "count": count,
-    })))
+        "max_model_len": engine.n_ctx(),
+    });
+    if let Some(strs) = strs {
+        out["token_strs"] = json!(strs);
+    }
+    Ok(Json(out))
 }
 
 /// `POST /detokenize` (and `/v1/detokenize`) — turn token ids back into text.
@@ -1696,6 +1750,8 @@ async fn server_load(State(state): State<AppState>) -> Json<serde_json::Value> {
     // tracks as `in_flight` against `max_concurrency`.
     let waiting = 0usize;
     Json(json!({
+        // vLLM's own field: the requests the server is working on.
+        "server_load": running + waiting,
         "running": running,
         "waiting": waiting,
         "capacity": capacity,
@@ -1821,13 +1877,13 @@ pub(crate) fn sse_response(
         .into_response()
 }
 
-/// Embed `texts` off the async runtime, stopping once the requester is
+/// Embed `prompts` off the async runtime, stopping once the requester is
 /// gone, and count the prompt tokens in the metrics.  `lease` (an admitted
 /// job's) is held until the work ends.
-pub(crate) async fn embed_texts(
+pub(crate) async fn embed_prompts(
     state: &AppState,
     engine: &Arc<Engine>,
-    texts: Vec<String>,
+    prompts: Vec<RawPrompt>,
     lease: Option<Arc<crate::job_admission::JobLease>>,
 ) -> Result<(Vec<Vec<f32>>, u32), ApiError> {
     let cancel = CancelOnDrop::new();
@@ -1836,7 +1892,7 @@ pub(crate) async fn embed_texts(
         let flag = cancel.flag();
         move || {
             let _lease = lease;
-            engine.embed_with_usage_cancellable(&texts, &flag)
+            engine.embed_prompts_cancellable(&prompts, &flag)
         }
     })
     .await
@@ -2856,23 +2912,49 @@ async fn embeddings(
             return Err(ApiError::new(StatusCode::CONFLICT, "job model ownership changed", "job_owner_changed"));
         }
     }
-    let texts: Vec<String> = req.input.into_vec();
-    check_embedding_inputs(texts.len())?;
-    if headers.contains_key(JOB_OWNER_HEADER) && texts.len() > 32 {
+    if req.normalize == Some(false) {
+        return Err(ApiError::bad_request(
+            "embeddings are always L2-normalized; `normalize: false` is not supported",
+        ));
+    }
+    if req.dimensions == Some(0) {
+        return Err(ApiError::bad_request("`dimensions` must be at least 1"));
+    }
+    let format = req.encoding_format.as_deref();
+    EmbeddingVector::encode(Vec::new(), format).map_err(ApiError::bad_request)?;
+    let special = req.add_special_tokens.unwrap_or(true);
+    let prompts: Vec<RawPrompt> = crate::completions::prompts_in(
+        "input",
+        Some(&req.input),
+        crate::completions::PromptForms::OpenAi,
+    )
+    .map_err(ApiError::bad_request)?
+    .into_iter()
+    .map(|prompt| prompt.raw(special))
+    .collect();
+    check_embedding_inputs(prompts.len())?;
+    if headers.contains_key(JOB_OWNER_HEADER) && prompts.len() > 32 {
         return Err(ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "too many inputs in embedding subbatch", "job_input_limit"));
     }
 
-    let (vectors, prompt_tokens) = embed_texts(&state, &engine, texts, Some(lease)).await?;
+    let (vectors, prompt_tokens) = embed_prompts(&state, &engine, prompts, Some(lease)).await?;
 
     let data = vectors
         .into_iter()
         .enumerate()
-        .map(|(i, embedding)| EmbeddingData {
-            object: "embedding".to_string(),
-            embedding,
-            index: i as u32,
+        .map(|(i, vector)| {
+            let vector = match req.dimensions {
+                Some(dimensions) => shorten(vector, dimensions)?,
+                None => vector,
+            };
+            Ok(EmbeddingData {
+                object: "embedding".to_string(),
+                embedding: EmbeddingVector::encode(vector, format)
+                    .map_err(ApiError::bad_request)?,
+                index: i as u32,
+            })
         })
-        .collect();
+        .collect::<Result<_, ApiError>>()?;
 
     let response = EmbeddingResponse {
         object: "list".to_string(),
@@ -2887,6 +2969,24 @@ async fn embeddings(
     };
     let limit = if headers.contains_key(JOB_OWNER_HEADER) { 2 << 20 } else { EMBEDDING_RESPONSE_LIMIT };
     embedding_response(&response, limit)
+}
+
+/// `vector`'s first `dimensions` values, L2-normalized again: OpenAI's
+/// `dimensions`, which a Matryoshka-trained model's vectors keep their
+/// meaning under.
+fn shorten(mut vector: Vec<f32>, dimensions: usize) -> Result<Vec<f32>, ApiError> {
+    if dimensions > vector.len() {
+        return Err(ApiError::bad_request(&format!(
+            "`dimensions` is {dimensions}, but this model's embeddings have {}",
+            vector.len()
+        )));
+    }
+    vector.truncate(dimensions);
+    let norm = vector.iter().map(|v| v * v).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        vector.iter_mut().for_each(|v| *v /= norm);
+    }
+    Ok(vector)
 }
 
 /// Most inputs one embedding request may carry.
@@ -2916,13 +3016,39 @@ pub(crate) fn embedding_response(
 /// `POST /v1/audio/transcriptions` — OpenAI-compatible Whisper STT.
 ///
 /// Multipart form fields: `file` (required, WAV), `language` (optional
-/// two-letter code), `response_format` (`json` default, or `text`), and
+/// two-letter code; detected from the first 30 s when absent),
+/// `response_format` (`json` default, or `text`), and
 /// `model` (accepted and ignored — the loaded whisper model is used).
 async fn transcriptions(
     State(state): State<AppState>,
     Extension(lease): Extension<Arc<crate::job_admission::JobLease>>,
     headers: HeaderMap,
+    multipart: axum::extract::Multipart,
+) -> Result<Response, ApiError> {
+    speech_to_text(state, lease, headers, multipart, false).await
+}
+
+/// `POST /v1/audio/translations` — OpenAI-compatible Whisper translation:
+/// the speech as English text.  The same form as [`transcriptions`]; a
+/// `language` names the spoken language, which is otherwise detected
+/// (OpenAI's form takes none).
+async fn translations(
+    State(state): State<AppState>,
+    Extension(lease): Extension<Arc<crate::job_admission::JobLease>>,
+    headers: HeaderMap,
+    multipart: axum::extract::Multipart,
+) -> Result<Response, ApiError> {
+    speech_to_text(state, lease, headers, multipart, true).await
+}
+
+/// A Whisper job: the upload transcribed, or with `translate` translated
+/// to English.
+async fn speech_to_text(
+    state: AppState,
+    lease: Arc<crate::job_admission::JobLease>,
+    headers: HeaderMap,
     mut multipart: axum::extract::Multipart,
+    translate: bool,
 ) -> Result<Response, ApiError> {
     let Some(whisper) = state.whisper.clone() else {
         return Err(ApiError::bad_request(
@@ -2965,7 +3091,7 @@ async fn transcriptions(
 
     let transcription = run_transcription_job(whisper.admission.clone(), move |cancel| {
         let _lease = lease;
-        whisper.transcribe_wav_cancellable(&file, language.as_deref(), false, cancel)
+        whisper.transcribe_wav_cancellable(&file, language.as_deref(), translate, cancel)
     })
     .await?;
 

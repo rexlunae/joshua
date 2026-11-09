@@ -20,15 +20,15 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::completions::{
-    build_jobs, complete_all, infill_prompt, options, prompts, stream_all, Build, Job, Progress,
-    PromptForms,
+    build_jobs, complete_all, infill_prompt, options, prompts, prompts_in, stream_all, Build, Job,
+    Progress, PromptForms,
 };
-use crate::engine::{Completion, Engine, PromptPart};
+use crate::engine::{Completion, Engine, PromptPart, RawPrompt};
 use crate::fim::InfillChunk;
 use crate::sampling::SamplingProfile;
 use crate::job_admission::JobLease;
 use crate::server::{
-    check_embedding_inputs, embed_texts, embedding_response, select_model, ApiError, AppState,
+    check_embedding_inputs, embed_prompts, embedding_response, select_model, ApiError, AppState,
     EMBEDDING_RESPONSE_LIMIT,
 };
 use crate::types::{
@@ -386,19 +386,17 @@ pub(crate) async fn embedding(
     Extension(lease): Extension<Arc<JobLease>>,
     Json(body): Json<Value>,
 ) -> Result<Response, ApiError> {
-    let input = body.get("content").or_else(|| body.get("input"));
-    let texts: Vec<String> = match input {
-        Some(Value::String(s)) => vec![s.clone()],
-        Some(Value::Array(items)) if !items.is_empty() => items
-            .iter()
-            .map(|v| v.as_str().map(String::from))
-            .collect::<Option<_>>()
-            .ok_or_else(|| {
-                ApiError::bad_request("`content` must be a string or an array of strings")
-            })?,
-        _ => return Err(ApiError::bad_request("`content` is required")),
+    let field = if body.get("content").is_none() && body.get("input").is_some() {
+        "input"
+    } else {
+        "content"
     };
-    check_embedding_inputs(texts.len())?;
+    let prompts: Vec<RawPrompt> = prompts_in(field, body.get(field), PromptForms::LlamaCpp)
+        .map_err(ApiError::bad_request)?
+        .into_iter()
+        .map(|prompt| prompt.raw(true))
+        .collect();
+    check_embedding_inputs(prompts.len())?;
     match body.get("embd_normalize") {
         None | Some(Value::Null) => {}
         Some(n) if n.as_i64() == Some(2) => {}
@@ -413,7 +411,7 @@ pub(crate) async fn embedding(
         .and_then(Value::as_str)
         .unwrap_or_default();
     let (_, engine) = select_model(&state, model).await?;
-    let (vectors, _) = embed_texts(&state, &engine, texts, Some(lease)).await?;
+    let (vectors, _) = embed_prompts(&state, &engine, prompts, Some(lease)).await?;
     let results: Vec<Value> = vectors
         .into_iter()
         .enumerate()

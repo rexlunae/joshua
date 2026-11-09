@@ -3699,10 +3699,29 @@ impl Engine {
         tools: Option<&[Tool]>,
         options: &GenerationOptions,
     ) -> Result<u32> {
+        self.tokenize_chat(messages, tools, options)
+            .map(|tokens| tokens.len() as u32)
+    }
+
+    /// The prompt tokens a chat request renders to (vLLM's chat
+    /// `/tokenize`), without running the model.
+    pub fn tokenize_chat(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        options: &GenerationOptions,
+    ) -> Result<Vec<u32>> {
         let (messages, tools) = self.stable_chat(messages, tools, false);
         let rendered = self.render_chat(&messages, tools.as_deref(), options)?;
         self.tokenize(&rendered.text, rendered.add_special_tokens)
-            .map(|tokens| tokens.len() as u32)
+    }
+
+    /// Each token's vocabulary entry as the tokenizer spells it (vLLM's
+    /// `/tokenize` `token_strs`), e.g. `Ġhello` for a byte-level BPE.
+    pub fn token_strings(&self, ids: &[u32]) -> Vec<String> {
+        ids.iter()
+            .map(|&id| self.tokenizer.id_to_token(id).unwrap_or_default())
+            .collect()
     }
 
     /// The conversation a chat request's prompt is rendered from: its tools
@@ -5814,7 +5833,7 @@ impl Engine {
     /// Like [`Engine::embed`], additionally returning the total number of
     /// input tokens processed.
     pub fn embed_with_usage(&self, texts: &[String]) -> Result<(Vec<Vec<f32>>, u32)> {
-        self.embed_inner(texts, None)
+        self.embed_inner(&Self::text_prompts(texts), None)
     }
 
     /// [`Engine::embed_with_usage`] that gives up once `cancel` is set.
@@ -5829,12 +5848,28 @@ impl Engine {
         texts: &[String],
         cancel: &AtomicBool,
     ) -> Result<(Vec<Vec<f32>>, u32)> {
-        self.embed_inner(texts, Some(cancel))
+        self.embed_inner(&Self::text_prompts(texts), Some(cancel))
+    }
+
+    /// [`Engine::embed_with_usage_cancellable`] for inputs given as text,
+    /// token ids or both (the OpenAI and vLLM `input` forms).  Token ids are
+    /// this model's, used verbatim; text gets the tokenizer's special tokens
+    /// when the prompt asks for them.
+    pub fn embed_prompts_cancellable(
+        &self,
+        prompts: &[RawPrompt],
+        cancel: &AtomicBool,
+    ) -> Result<(Vec<Vec<f32>>, u32)> {
+        self.embed_inner(prompts, Some(cancel))
+    }
+
+    fn text_prompts(texts: &[String]) -> Vec<RawPrompt> {
+        texts.iter().map(|text| RawPrompt::text(text.as_str())).collect()
     }
 
     fn embed_inner(
         &self,
-        texts: &[String],
+        prompts: &[RawPrompt],
         cancel: Option<&AtomicBool>,
     ) -> Result<(Vec<Vec<f32>>, u32)> {
         if self.remote_only() {
@@ -5854,17 +5889,18 @@ impl Engine {
             return Err(JoshuaError::Cancelled);
         }
         let model = self.embedding_model()?;
-        let mut vectors = Vec::with_capacity(texts.len());
+        let mut vectors = Vec::with_capacity(prompts.len());
         let mut total_tokens: u32 = 0;
-        for text in texts {
+        for prompt in prompts {
             if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
                 return Err(JoshuaError::Cancelled);
             }
-            let encoding = self
-                .tokenizer
-                .encode(text.as_str(), true)
-                .map_err(|e| JoshuaError::Tokenization(e.to_string()))?;
-            let tokens = encoding.get_ids();
+            let tokens = self.tokenize_prompt(prompt)?;
+            if tokens.is_empty() {
+                return Err(JoshuaError::InvalidRequest(
+                    "an embedding input has no tokens".into(),
+                ));
+            }
             if tokens.len() >= self.n_ctx as usize {
                 return Err(JoshuaError::PromptTooLong(
                     tokens.len(),
@@ -5873,7 +5909,7 @@ impl Engine {
             }
             total_tokens += tokens.len() as u32;
             let vector = model
-                .embed_tokens(tokens)
+                .embed_tokens(&tokens)
                 .map_err(|e| JoshuaError::Inference(e.to_string()))?;
             vectors.push(vector);
         }
