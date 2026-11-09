@@ -5390,11 +5390,10 @@ impl Engine {
             // caller finds it with that text.
             if let (Some(top), Some(placer)) = (options.logprobs, placer.as_mut()) {
                 let entry = token_logprob(&logits_vec, next_token, top);
-                for entry in placer.place(&text.response, text.stable, entry) {
-                    if let Some(sink) = &options.logprob_sink {
-                        sink.push(entry.clone());
-                    }
-                    logprobs.push(entry);
+                let from = logprobs.len();
+                placer.place(&text.response, text.stable, entry, &mut logprobs);
+                if let Some(sink) = &options.logprob_sink {
+                    logprobs[from..].iter().for_each(|e| sink.push(e.clone()));
                 }
             }
             sampler.accept(next_token);
@@ -5591,11 +5590,12 @@ impl Engine {
             pool.release(d.session);
         }
 
-        for entry in placer.as_mut().map(LogprobPlacer::finish).unwrap_or_default() {
+        if let Some(placer) = placer.as_mut() {
+            let from = logprobs.len();
+            placer.finish(&mut logprobs);
             if let Some(sink) = &options.logprob_sink {
-                sink.push(entry.clone());
+                logprobs[from..].iter().for_each(|e| sink.push(e.clone()));
             }
-            logprobs.push(entry);
         }
         if stop_type == StopType::Word {
             // The tokens of a stop sequence trimmed from the text go with it.
@@ -8373,15 +8373,16 @@ impl LogprobPlacer {
     }
 
     /// Place the token just appended to `response`, which left its first
-    /// `stable` bytes as they were.  Returns the entries now placed, in
-    /// order: none while the splitter holds the token undecided, or those
-    /// it held along with this one.
+    /// `stable` bytes as they were.  Appends the entries now placed to
+    /// `placed`, in order: none while the splitter holds the token
+    /// undecided, or those it held along with this one.
     fn place(
         &mut self,
         response: &str,
         stable: usize,
         mut entry: crate::types::TokenLogprob,
-    ) -> Vec<crate::types::TokenLogprob> {
+        placed: &mut Vec<crate::types::TokenLogprob>,
+    ) {
         let start = floor_char_boundary(response, stable.min(response.len()));
         if start < self.bytes {
             // The token rewrote text an earlier token began.
@@ -8398,14 +8399,14 @@ impl LogprobPlacer {
         let undecided = self.splitter.undecided();
         let Some(new) = response.get(self.fed..).filter(|new| !new.is_empty()) else {
             entry.answer = !self.splitter.in_reasoning();
-            return self.settle(entry, undecided, false);
+            return self.settle(entry, undecided, false, placed);
         };
         self.fed = response.len();
         let out = self.splitter.push(new);
         entry.answer = !out.content.is_empty();
         // Answer text beyond what this token wrote is held text let out.
         let released = out.content.len() > new.len();
-        self.settle(entry, undecided && out.is_empty(), released)
+        self.settle(entry, undecided && out.is_empty(), released, placed)
     }
 
     /// Queue `entry` while it is `undecided`; otherwise place it after the
@@ -8415,28 +8416,27 @@ impl LogprobPlacer {
         entry: crate::types::TokenLogprob,
         undecided: bool,
         released: bool,
-    ) -> Vec<crate::types::TokenLogprob> {
+        placed: &mut Vec<crate::types::TokenLogprob>,
+    ) {
         if undecided {
             self.pending.push(entry);
-            return Vec::new();
+            return;
         }
-        let mut placed = std::mem::take(&mut self.pending);
-        for held in &mut placed {
+        placed.extend(self.pending.drain(..).map(|mut held| {
             held.answer = released;
-        }
+            held
+        }));
         placed.push(entry);
-        placed
     }
 
     /// Decoding has ended: the held tokens are answer if the splitter's
     /// remaining text comes out as answer.
-    fn finish(&mut self) -> Vec<crate::types::TokenLogprob> {
+    fn finish(&mut self, placed: &mut Vec<crate::types::TokenLogprob>) {
         let answer = !self.splitter.finish().content.is_empty();
-        let mut placed = std::mem::take(&mut self.pending);
-        for held in &mut placed {
+        placed.extend(self.pending.drain(..).map(|mut held| {
             held.answer = answer;
-        }
-        placed
+            held
+        }));
     }
 }
 
@@ -10537,9 +10537,9 @@ mod tests {
                 token: i as u32,
                 ..Default::default()
             };
-            placed.extend(placer.place(response, *stable, entry));
+            placer.place(response, *stable, entry, &mut placed);
         }
-        placed.extend(placer.finish());
+        placer.finish(&mut placed);
         placed
     }
 
