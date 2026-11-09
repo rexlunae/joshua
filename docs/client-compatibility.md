@@ -23,8 +23,9 @@ real client binary is *not* covered by the test suite today — see
 
 Every SSE stream sends a keep-alive comment every 15 s while nothing else is
 sent (a long prefill), so clients and proxies with read timeouts keep the
-connection; `joshua route` does not count those comments as a worker's first
-output, so a request still prefilling can be retried elsewhere.
+connection.  Behind `joshua route` the first comment opens the client's
+stream, so a request is retried on another worker only if its worker fails
+in its first 15 s.
 
 This is the primary target and the README's "drop-in replacement" claim is
 about these routes.

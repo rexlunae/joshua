@@ -1440,9 +1440,11 @@ impl Coordinator {
             match body.frame().await {
                 Some(Ok(frame)) => {
                     if let Ok(data) = frame.into_data() {
-                        // A worker's keep-alive comments are not output: a
-                        // request still waiting on its prefill can be retried.
-                        if let Some(first) = framer.push(&data).filter(|e| !only_comments(e)) {
+                        // A worker's keep-alive comment (sent after 15 s of
+                        // prefill) counts as its first output: it opens the
+                        // client's stream, so the client's idle timeout sees
+                        // it, at the cost of no retry once it has been sent.
+                        if let Some(first) = framer.push(&data) {
                             let done = has_done_event(&first);
                             return Ok(FirstOutput::Stream {
                                 body,
@@ -1550,14 +1552,15 @@ impl Coordinator {
         let routed = matches!(path, "/v1/chat/completions" | "/v1/completions");
         let hint = match (&handle, &work.cache_key) {
             (Some(handle), _) => Some(handle.as_bytes()),
-            (None, Some(key)) if routed && model.is_some() => Some(key.as_bytes()),
+            // Without a `model` (a one-model fleet) the key still keys both.
+            (None, Some(key)) if routed => Some(key.as_bytes()),
             _ => None,
         };
         let affinity = hint.map(|hint| {
             crate::affinity::digest(&[
                 crate::affinity::owner(headers),
                 hint,
-                model.as_deref().unwrap().as_bytes(),
+                model.as_deref().unwrap_or_default().as_bytes(),
                 &work.context.unwrap_or(0).to_le_bytes(),
             ])
         });
@@ -1791,15 +1794,6 @@ impl SseFramer {
         let rest = self.buf.split_off(end);
         Some(Bytes::from(std::mem::replace(&mut self.buf, rest)))
     }
-}
-
-/// Whether whole SSE events are only comments (`:` lines, such as the
-/// keep-alives a worker sends while it prefills).
-fn only_comments(events: &[u8]) -> bool {
-    events
-        .split(|&b| b == b'\n')
-        .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
-        .all(|line| line.is_empty() || line.starts_with(b":"))
 }
 
 /// Whether whole SSE events include the stream's terminal `data: [DONE]`.
@@ -2311,8 +2305,6 @@ mod tests {
     #[test]
     fn done_events_are_recognised_whole() {
         assert!(has_done_event(b"data: {\"i\":1}\n\ndata: [DONE]\n\n"));
-        assert!(only_comments(b":\n\n: keep-alive\r\n\r\n"));
-        assert!(!only_comments(b":\n\ndata: x\n\n"));
         assert!(has_done_event(b"data:[DONE]\r\n\r\n"));
         assert!(!has_done_event(b"data: {\"text\":\"[DONE]\"}\n\n"));
         assert!(!has_done_event(b"data: [DONE]x\n\n"));

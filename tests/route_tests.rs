@@ -3011,3 +3011,21 @@ async fn prompt_cache_key_pins_requests_to_one_worker() {
     affinity_request(&router, None, "alice", &keyed("conversation-2")).await;
     assert_eq!(coordinator.affinity_stats().entries, 2);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prompt_cache_key_keys_requests_that_name_no_model() {
+    let (_first, first_url) = spawn_fake("first", "alpha", 1, Behavior::Echo).await;
+    let (_second, second_url) = spawn_fake("second", "alpha", 1, Behavior::Echo).await;
+    let (coordinator, router) = spawn_router(config(&[&first_url, &second_url])).await;
+    let keyed = |key: &str| {
+        json!({
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 4, "prompt_cache_key": key,
+        })
+    };
+    let first = affinity_request(&router, None, "alice", &keyed("team-a")).await;
+    assert_eq!(first.status, StatusCode::OK);
+    assert_eq!(coordinator.affinity_stats().entries, 1);
+    affinity_request(&router, None, "alice", &keyed("team-b")).await;
+    assert_eq!(coordinator.affinity_stats().entries, 2);
+}
