@@ -141,6 +141,10 @@ pub struct SlotTable {
     slots: BTreeMap<SlotKey, (usize, usize)>,
     /// Layers whose token mixer is a Gated DeltaNet.
     recurrent: Vec<bool>,
+    /// `(n_head, n_kv_head)` when the GGUF stores `attn_q` / `attn_k` rows
+    /// permuted for interleaved RoPE (llama.cpp's `llama` arch), which a
+    /// Hugging Face (PEFT) adapter's `B` rows must be permuted to match.
+    rope_permute: Option<(usize, usize)>,
 }
 
 impl SlotTable {
@@ -153,7 +157,20 @@ impl SlotTable {
             device,
             slots: BTreeMap::new(),
             recurrent: vec![false; n_layer],
+            rope_permute: None,
         }
+    }
+
+    /// Record that `attn_q` / `attn_k` rows are permuted for interleaved
+    /// RoPE with these head counts (see [`Self::rope_permute`]).
+    pub fn set_rope_permute(&mut self, n_head: usize, n_kv_head: usize) {
+        self.rope_permute = Some((n_head, n_kv_head));
+    }
+
+    /// `(n_head, n_kv_head)` when the model's Q/K rows are permuted for
+    /// interleaved RoPE, as `convert_hf_to_gguf.py` writes llama-arch models.
+    pub fn rope_permute(&self) -> Option<(usize, usize)> {
+        self.rope_permute
     }
 
     /// Record a projection that takes a delta, `[n_out, n_in]`.
@@ -218,7 +235,7 @@ impl SlotTable {
 
     /// Where an adapter tensor pair for base tensor `base` goes, or why it
     /// cannot go anywhere.
-    fn target(&self, base: &str) -> std::result::Result<(SlotKey, usize, usize), String> {
+    pub(crate) fn target(&self, base: &str) -> std::result::Result<(SlotKey, usize, usize), String> {
         const NOT_YET: &str = "which takes no LoRA delta in this version";
         match base {
             "token_embd.weight" => return Err(format!("targets the token embedding, {NOT_YET}")),
@@ -398,7 +415,7 @@ impl fmt::Debug for LoraAdapter {
     }
 }
 
-fn invalid(msg: impl fmt::Display) -> JoshuaError {
+pub(crate) fn invalid(msg: impl fmt::Display) -> JoshuaError {
     JoshuaError::ModelLoad(format!("LoRA adapter: {msg}"))
 }
 
@@ -442,6 +459,9 @@ impl LoraAdapter {
     /// bytes stay in reclaimable page cache instead of a heap copy, so peak
     /// memory is the decoded pairs plus one pair in flight.
     pub fn load(path: &Path, table: &SlotTable, limits: &LoraLimits) -> Result<Self> {
+        if let Some(peft) = crate::lora_peft::locate(path) {
+            return crate::lora_peft::load(&peft, table, limits);
+        }
         let file = std::fs::File::open(path)?;
         let len = file.metadata()?.len();
         if len > limits.max_bytes {
@@ -617,6 +637,29 @@ impl LoraAdapter {
             pairs,
             bytes: total,
         })
+    }
+
+    /// An adapter from pairs already decoded and placed against `table`
+    /// (the PEFT reader, [`crate::lora_peft`]).  `alpha` 0 runs each pair at
+    /// the user's scale alone.
+    pub(crate) fn from_pairs(
+        digest: [u8; 32],
+        table: &SlotTable,
+        alpha: f32,
+        mut pairs: Vec<(SlotKey, Arc<LoraPair>)>,
+        bytes: u64,
+    ) -> Self {
+        pairs.sort_by_key(|(k, _)| *k);
+        Self {
+            digest,
+            base: table.fingerprint(),
+            device: table.device().clone(),
+            alpha,
+            task_name: None,
+            prompt_prefix: None,
+            pairs,
+            bytes,
+        }
     }
 
     /// SHA-256 of the adapter file.

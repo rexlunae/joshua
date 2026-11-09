@@ -1481,6 +1481,9 @@ mod vendored_lora {
     pub(super) fn table(slots: LoraSlots) -> Option<SlotTable> {
         let device = slots.device?;
         let mut table = SlotTable::new(slots.arch, slots.n_layer, device);
+        if let Some((n_head, n_kv_head)) = slots.rope_permute {
+            table.set_rope_permute(n_head, n_kv_head);
+        }
         for s in slots.slots {
             if let Some(proj) = Proj::from_gguf_name(s.proj) {
                 table.insert(SlotKey::new(s.layer, proj), s.n_out, s.n_in);

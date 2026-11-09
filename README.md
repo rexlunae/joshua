@@ -953,8 +953,9 @@ Two limits bound how much work a single client can demand, both tunable:
   regardless of the client's `max_tokens`, bounding single-request CPU time.
   A request that sets no `max_tokens` (or `-1`) runs to end of sequence up
   to this cap.
-- `--lora FNAME` and `--lora-scaled FNAME SCALE` load GGUF LoRA adapters for
-  the startup model (`--lora-init-without-apply` at scale 0); requests pick
+- `--lora FNAME` and `--lora-scaled FNAME SCALE` load GGUF (or Hugging Face
+  PEFT) LoRA adapters for the startup model (`--lora-init-without-apply` at
+  scale 0); requests pick
   scales with llama-server's `lora` list, and `GET`/`POST /lora-adapters`
   list them and set the server-wide scales.  Each adapter is also served as a
   model of its own name, as in vLLM; `--allow-runtime-lora` adds vLLM's
