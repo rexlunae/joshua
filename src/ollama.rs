@@ -60,7 +60,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::engine::{Completion, Engine};
+use crate::engine::{Completion, Engine, RawPrompt};
 use crate::model_info::{GgufFacts, ModelInfo};
 use crate::sampling::{SamplingDefaults, SamplingProfile};
 use crate::server::{select_model, ApiError, AppState, CancelOnDrop, ChatPiece};
@@ -1050,7 +1050,8 @@ async fn embed_inputs(
         return Err(ApiError::bad_request("`input` or `prompt` is required"));
     }
     let (id, engine, load) = select(state, &req.model).await?;
-    let (vectors, tokens) = crate::server::embed_texts(state, &engine, inputs, None).await?;
+    let inputs = inputs.into_iter().map(RawPrompt::text).collect();
+    let (vectors, tokens) = crate::server::embed_prompts(state, &engine, inputs, None).await?;
     Ok((vectors, tokens, id, load))
 }
 

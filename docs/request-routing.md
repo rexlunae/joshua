@@ -67,8 +67,8 @@ On the router:
   include locally reserved audio; completion triggers on-demand revalidation.
 * `GET /health` — `200` while at least one worker is healthy, else `503`.
 
-* `POST /v1/audio/transcriptions` — routed to a worker reporting the
-  `transcriptions` capability.  The upload is forwarded byte for byte
+* `POST /v1/audio/transcriptions` (and `/v1/audio/translations`) — routed
+  to a worker reporting the `transcriptions` capability.  The upload is forwarded byte for byte
   together with the client's `Content-Type` (the multipart boundary the
   worker needs); the body is never parsed as JSON and no `model` field is
   read, so the whole audio job runs on one worker.  A worker without a

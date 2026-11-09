@@ -10,9 +10,9 @@
 //!
 //! The data plane is the worker's existing OpenAI HTTP API
 //! (`/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`,
-//! `/v1/audio/transcriptions`); request bodies are forwarded byte-for-byte,
-//! so every request parameter, streaming event, stop behaviour, error body
-//! and usage figure is the worker's own.
+//! `/v1/audio/transcriptions`, `/v1/audio/translations`); request bodies
+//! are forwarded byte-for-byte, so every request parameter, streaming
+//! event, stop behaviour, error body and usage figure is the worker's own.
 //! The control plane is one endpoint, [`WORKER_INFO_PATH`], returning a
 //! [`WorkerInfo`]: protocol version, model identity, context limit, backend,
 //! admission cap and live in-flight count.
@@ -126,12 +126,22 @@ const MAX_SMALL_BODY: usize = 1 << 20;
 /// (#157).
 const TRANSCRIPTIONS_PATH: &str = "/v1/audio/transcriptions";
 
+/// Whisper translation to English: routed as a transcription is, to a
+/// worker with the `transcriptions` capability.
+const TRANSLATIONS_PATH: &str = "/v1/audio/translations";
+
+/// Whether `path` is a Whisper upload.
+fn is_audio(path: &str) -> bool {
+    matches!(path, TRANSCRIPTIONS_PATH | TRANSLATIONS_PATH)
+}
+
 /// Paths routed to workers.
-const ROUTED_PATHS: [&str; 4] = [
+const ROUTED_PATHS: [&str; 5] = [
     "/v1/chat/completions",
     "/v1/completions",
     "/v1/embeddings",
     TRANSCRIPTIONS_PATH,
+    TRANSLATIONS_PATH,
 ];
 
 /// What a worker reports at [`WORKER_INFO_PATH`].
@@ -240,7 +250,7 @@ impl WorkerCapabilities {
             "/v1/chat/completions" => self.chat,
             "/v1/completions" => self.completions,
             "/v1/embeddings" => self.embeddings,
-            TRANSCRIPTIONS_PATH => self.transcriptions,
+            TRANSCRIPTIONS_PATH | TRANSLATIONS_PATH => self.transcriptions,
             _ => false,
         }
     }
@@ -848,7 +858,7 @@ impl Coordinator {
         exclude: &[usize],
         affinity: Option<&crate::affinity::Scope>,
     ) -> Pick {
-        if path == TRANSCRIPTIONS_PATH {
+        if is_audio(path) {
             return self.try_pick_audio(exclude);
         }
         let _lock = self.pick_lock.lock().unwrap_or_else(|p| p.into_inner());
@@ -915,12 +925,12 @@ impl Coordinator {
                 context_possible = true;
                 continue;
             };
-            let own = if path == TRANSCRIPTIONS_PATH {
+            let own = if is_audio(path) {
                 None
             } else {
                 info.slots_of(model)
             };
-            if (path != TRANSCRIPTIONS_PATH
+            if (!is_audio(path)
                 && model.is_none()
                 && info.models.iter().any(|slots| slots.id != info.model))
                 || model.is_some_and(|m| !info.model_ids().any(|id| id == m))
@@ -988,7 +998,7 @@ impl Coordinator {
             } else {
                 st.external_in_flight
             };
-            let mut ratio = if path == TRANSCRIPTIONS_PATH {
+            let mut ratio = if is_audio(path) {
                 load as f64 / slots as f64
             } else {
                 (local_work
@@ -1032,7 +1042,7 @@ impl Coordinator {
                 }
             }
             w.dispatched.fetch_add(1, Ordering::AcqRel);
-            let model = (path != TRANSCRIPTIONS_PATH).then_some(selected_model);
+            let model = (!is_audio(path)).then_some(selected_model);
             if let Some(model) = &model {
                 *w.by_model().entry(model.clone()).or_default() += 1;
                 *w.work_by_model
@@ -1495,12 +1505,12 @@ impl Coordinator {
         // client's `Content-Type`, not in the body.  The worker cannot parse
         // the upload without it, so it is forwarded on that route.  Every
         // other route is JSON with a fixed type (#157).
-        let content_type = if path == TRANSCRIPTIONS_PATH {
+        let content_type = if is_audio(path) {
             headers.get(header::CONTENT_TYPE).cloned()
         } else {
             None
         };
-        let (model, work) = if path == TRANSCRIPTIONS_PATH {
+        let (model, work) = if is_audio(path) {
             // A transcription body is a multipart upload, not JSON, so there
             // is no `model` field to read and no JSON to validate.  The
             // worker's advertised `transcriptions` capability is the only
@@ -1601,7 +1611,7 @@ impl Coordinator {
                 }
             };
             let index = slot.index;
-            let owner = if path == TRANSCRIPTIONS_PATH {
+            let owner = if is_audio(path) {
                 self.workers[index].status().info.as_ref()
                     .and_then(|info| info.transcription_job.as_ref().map(|job| job.owner.clone()))
             } else { None };
@@ -1623,7 +1633,7 @@ impl Coordinator {
             {
                 Ok(response) | Err(Failure::Final(response)) => return response,
                 Err(Failure::Retry { reason, admission, safe }) => {
-                    if matches!(path, TRANSCRIPTIONS_PATH | "/v1/embeddings") && !safe {
+                    if (is_audio(path) || path == "/v1/embeddings") && !safe {
                         return with_request_id(reject_response(Reject::Exhausted), &request_id);
                     }
                     tracing::warn!(
@@ -2076,6 +2086,16 @@ mod tests {
         }
     }
 
+    #[test]
+    fn translations_go_where_transcriptions_do() {
+        for transcriptions in [false, true] {
+            let capabilities = WorkerCapabilities { transcriptions, ..Default::default() };
+            assert_eq!(capabilities.serves(TRANSLATIONS_PATH), transcriptions);
+        }
+        assert!(is_audio(TRANSLATIONS_PATH) && is_audio(TRANSCRIPTIONS_PATH));
+        assert!(!is_audio("/v1/embeddings"));
+    }
+
     #[tokio::test]
     async fn remote_worker_sends_and_probes_never_open_a_plaintext_connection() {
         let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
@@ -2083,7 +2103,7 @@ mod tests {
         config.worker_api_key = Some("secret-worker-credential".to_string());
         let coordinator = Coordinator::new(config).unwrap();
         let worker = &coordinator.workers[0];
-        for path in ["/v1/chat/completions", "/v1/completions", "/v1/embeddings", TRANSCRIPTIONS_PATH] {
+        for path in ROUTED_PATHS {
             let log = RequestLog {
                 affinity_handle: None, cache_scope: None,
                 response_limit: 1024, owner: None, request_id: "sensitive-id".to_string(),

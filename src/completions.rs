@@ -80,8 +80,30 @@ pub(crate) enum PromptForms {
     LlamaCpp,
 }
 
+impl Prompt {
+    /// The prompt for the engine; `special` lets the tokenizer add its
+    /// special tokens (BOS) to leading text.
+    pub(crate) fn raw(self, special: bool) -> RawPrompt {
+        match self {
+            Prompt::Text(text) => RawPrompt::text(text).with_special_tokens(special),
+            Prompt::Tokens(ids) => RawPrompt::tokens(ids),
+            Prompt::Mixed(parts) => RawPrompt::mixed(parts).with_special_tokens(special),
+        }
+    }
+}
+
 /// The request's `prompt` as one or more prompts.
 pub(crate) fn prompts(prompt: Option<&Value>, forms: PromptForms) -> Result<Vec<Prompt>, String> {
+    prompts_in("prompt", prompt, forms)
+}
+
+/// The request field `field`, read the way [`prompts`] reads `prompt`
+/// (an embedding request's `input` takes the same forms).
+pub(crate) fn prompts_in(
+    field: &str,
+    prompt: Option<&Value>,
+    forms: PromptForms,
+) -> Result<Vec<Prompt>, String> {
     let id = |v: &Value| v.as_u64().and_then(|id| u32::try_from(id).ok());
     let ids = |items: &[Value]| -> Option<Vec<u32>> { items.iter().map(id).collect() };
     // llama-server's mixed prompt: any array holding both a string and an
@@ -105,14 +127,15 @@ pub(crate) fn prompts(prompt: Option<&Value>, forms: PromptForms) -> Result<Vec<
     };
     let invalid = || match forms {
         PromptForms::OpenAi => {
-            "`prompt` must be a string, an array of token ids, or an array of either".to_string()
+            format!("`{field}` must be a string, an array of token ids, or an array of either")
         }
-        PromptForms::LlamaCpp => "`prompt` must be a string, an array of token ids or strings \
-             and token ids, or an array of those"
-            .to_string(),
+        PromptForms::LlamaCpp => format!(
+            "`{field}` must be a string, an array of token ids or strings and token ids, \
+             or an array of those"
+        ),
     };
     let out = match prompt {
-        None | Some(Value::Null) => return Err("Missing required field 'prompt'".to_string()),
+        None | Some(Value::Null) => return Err(format!("Missing required field '{field}'")),
         Some(Value::String(s)) => vec![Prompt::Text(s.clone())],
         Some(Value::Array(items)) if items.is_empty() => return Err(invalid()),
         Some(Value::Array(items)) if items.iter().all(Value::is_number) => {
@@ -239,11 +262,7 @@ pub(crate) fn jobs(
                     infill_prompt(engine, &text, suffix, &[], "", options, special)?
                 }
                 (_, Some(_)) => return Err(ApiError::bad_request("`suffix` needs a text prompt")),
-                (Prompt::Text(text), None) => RawPrompt::text(text).with_special_tokens(special),
-                (Prompt::Tokens(ids), None) => RawPrompt::tokens(ids),
-                (Prompt::Mixed(parts), None) => {
-                    RawPrompt::mixed(parts).with_special_tokens(special)
-                }
+                (prompt, None) => prompt.raw(special),
             };
             let truncated = engine
                 .check_prompt(&prompt, options)

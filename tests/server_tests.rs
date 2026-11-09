@@ -367,22 +367,22 @@ async fn ops_endpoints_report_models_load_and_metrics() {
 
     let res = app
         .clone()
-        .oneshot(get("/metrics", Some("sekret")))
+        .oneshot(get("/metrics/json", Some("sekret")))
         .await
         .unwrap();
     let metrics: serde_json::Value = serde_json::from_str(&body_text(res).await).unwrap();
     assert!(metrics["uptime_seconds"].is_u64());
     assert!(metrics["http_requests_total"].is_u64());
 
-    let res = app
-        .clone()
-        .oneshot(get("/metrics/prometheus", Some("sekret")))
-        .await
-        .unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
-    let prometheus = body_text(res).await;
-    assert!(prometheus.contains("joshua_uptime_seconds"));
-    assert!(prometheus.contains("joshua_in_flight_requests"));
+    // `/metrics` is Prometheus text, as vLLM and llama-server serve it;
+    // `/metrics/prometheus` stays as an alias.
+    for path in ["/metrics", "/metrics/prometheus"] {
+        let res = app.clone().oneshot(get(path, Some("sekret"))).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "{path}");
+        let prometheus = body_text(res).await;
+        assert!(prometheus.contains("joshua_uptime_seconds"), "{path}");
+        assert!(prometheus.contains("joshua_in_flight_requests"), "{path}");
+    }
 
     let res = app
         .clone()
@@ -1781,6 +1781,158 @@ async fn llama_server_native_routes_answer_in_llama_server_shapes() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// vLLM's operational routes and the OpenAI embedding and tokenizer
+/// forms its clients send.
+#[tokio::test]
+async fn openai_and_vllm_ops_routes_answer_in_their_shapes() {
+    use base64::Engine as _;
+    let state = tiny_state("server-vllm-ops", None);
+    let engine = state.models.list()[0].engine.clone();
+    let app = create_router(state);
+    let call = |method: &'static str, path: &'static str, body: Option<serde_json::Value>| {
+        let app = app.clone();
+        async move {
+            let request = match body {
+                Some(body) => post_json(path, None, body),
+                None => Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .body(Body::empty())
+                    .unwrap(),
+            };
+            let res = app.oneshot(request).await.unwrap();
+            let status = res.status();
+            (status, body_text(res).await)
+        }
+    };
+
+    // /ping answers GET and POST; /version and /v1/health answer.
+    for method in ["GET", "POST"] {
+        let (status, body) = call(method, "/ping", None).await;
+        assert_eq!(status, StatusCode::OK, "{method}");
+        assert!(body.is_empty(), "{method}: {body}");
+    }
+    let (status, body) = call("GET", "/version", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
+    let (status, _) = call("GET", "/v1/health", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, body) = call("GET", "/load", None).await;
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["server_load"], 0, "{body}");
+
+    // llama-server's `/chat/completions` alias reaches the chat handler.
+    let (status, body) = call(
+        "POST",
+        "/chat/completions",
+        Some(serde_json::json!({
+            "model": "", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 2,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["object"], "chat.completion", "{body}");
+
+    // vLLM's /v1/tokenize: `max_model_len`, `token_strs`, and the chat form.
+    let (status, body) = call(
+        "POST",
+        "/v1/tokenize",
+        Some(serde_json::json!({"prompt": "a b c", "return_token_strs": true})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["max_model_len"], 64, "{body}");
+    assert_eq!(v["token_strs"].as_array().unwrap().len(), v["count"].as_u64().unwrap() as usize);
+    assert!(v["token_strs"].as_array().unwrap().iter().all(|s| s.is_string()), "{body}");
+    let messages = serde_json::json!([{"role": "user", "content": "hi there"}]);
+    let (status, body) = call(
+        "POST",
+        "/v1/tokenize",
+        Some(serde_json::json!({"messages": messages})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let chat: Vec<joshua::types::ChatMessage> = serde_json::from_value(messages).unwrap();
+    let expected = engine
+        .count_chat_tokens(&chat, None, &joshua::types::GenerationOptions::default())
+        .unwrap();
+    assert_eq!(v["count"], expected, "{body}");
+
+    // Translations need a Whisper model; without one the route says so.
+    let (status, body) = call(
+        "POST",
+        "/v1/audio/translations",
+        Some(serde_json::json!({})),
+    )
+    .await;
+    assert!(status.is_client_error(), "{status}: {body}");
+
+    // /v1/embeddings: options it cannot honour are refused up front.
+    for bad in [
+        serde_json::json!({"model": "", "input": "a", "encoding_format": "int8"}),
+        serde_json::json!({"model": "", "input": "a", "normalize": false}),
+        serde_json::json!({"model": "", "input": "a", "dimensions": 0}),
+        serde_json::json!({"model": "", "input": [{"text": "a"}]}),
+    ] {
+        let (status, body) = call("POST", "/v1/embeddings", Some(bad.clone())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {body}");
+    }
+    // When the model embeds at all: base64 is the float vector's
+    // little-endian bytes, token ids embed as their text does, and
+    // `dimensions` keeps a unit-length prefix.
+    let (status, body) = call(
+        "POST",
+        "/v1/embeddings",
+        Some(serde_json::json!({"model": "", "input": ["a b", "c"]})),
+    )
+    .await;
+    if status != StatusCode::OK {
+        return;
+    }
+    let float: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let first: Vec<f32> = serde_json::from_value(float["data"][0]["embedding"].clone()).unwrap();
+    let (_, body) = call(
+        "POST",
+        "/v1/embeddings",
+        Some(serde_json::json!({"model": "", "input": ["a b", "c"], "encoding_format": "base64"})),
+    )
+    .await;
+    let encoded: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded["data"][0]["embedding"].as_str().unwrap())
+        .unwrap();
+    let decoded: Vec<f32> = bytes
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+        .collect();
+    assert_eq!(decoded, first);
+    let ids = engine.tokenize("a b", true).unwrap();
+    let (status, body) = call(
+        "POST",
+        "/v1/embeddings",
+        Some(serde_json::json!({"model": "", "input": [ids]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["data"][0]["embedding"], float["data"][0]["embedding"]);
+    let (status, body) = call(
+        "POST",
+        "/v1/embeddings",
+        Some(serde_json::json!({"model": "", "input": "a b", "dimensions": 2})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let short: Vec<f32> = serde_json::from_value(v["data"][0]["embedding"].clone()).unwrap();
+    assert_eq!(short.len(), 2);
+    assert!((short.iter().map(|x| x * x).sum::<f32>() - 1.0).abs() < 1e-4);
 }
 
 #[tokio::test]

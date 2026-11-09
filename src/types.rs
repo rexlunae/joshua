@@ -1602,11 +1602,37 @@ pub struct DeltaContent {
 pub struct EmbeddingRequest {
     /// Model identifier.
     pub model: String,
-    /// One or more texts to embed.
-    pub input: EmbeddingInput,
-    /// `"float"` (default) or `"base64"`.
+    /// What to embed: a string, an array of this model's token ids, or an
+    /// array of either (OpenAI's and vLLM's forms).
+    pub input: serde_json::Value,
+    /// `"float"` (default) or `"base64"`: each vector's little-endian
+    /// float32 bytes, base64-encoded, which the OpenAI SDKs ask for by
+    /// default.
     #[serde(default)]
     pub encoding_format: Option<String>,
+    /// Keep only the vector's first `dimensions` values, L2-normalized
+    /// again (OpenAI's `dimensions`).  Meaningful only for a model trained
+    /// for it (Matryoshka, as Qwen3-Embedding is).
+    #[serde(default)]
+    pub dimensions: Option<usize>,
+    /// vLLM's switch for the tokenizer's BOS on a text input (on by
+    /// default).
+    #[serde(default)]
+    pub add_special_tokens: Option<bool>,
+    /// vLLM's `normalize`.  Vectors are always L2-normalized, so `false` is
+    /// refused.
+    #[serde(default)]
+    pub normalize: Option<bool>,
+}
+
+impl EmbeddingRequest {
+    /// The inputs as plain text, when every one is text (the form a `joshua
+    /// route` coordinator splits across workers).
+    pub fn texts(&self) -> Option<Vec<String>> {
+        EmbeddingInput::deserialize(&self.input)
+            .ok()
+            .map(EmbeddingInput::into_vec)
+    }
 }
 
 /// Embedding input — either a single string or an array of strings.
@@ -1647,10 +1673,41 @@ pub struct EmbeddingResponse {
 pub struct EmbeddingData {
     /// Always `"embedding"`.
     pub object: String,
-    /// Dense float vector.
-    pub embedding: Vec<f32>,
+    /// The vector, as the request's `encoding_format` asked.
+    pub embedding: EmbeddingVector,
     /// Zero-based index into the input array.
     pub index: u32,
+}
+
+/// An embedding vector on the wire.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum EmbeddingVector {
+    /// `encoding_format: "float"`: the values as JSON numbers.
+    Float(Vec<f32>),
+    /// `encoding_format: "base64"`: the little-endian float32 bytes,
+    /// base64-encoded.
+    Base64(String),
+}
+
+impl EmbeddingVector {
+    /// `vector` as `encoding_format` (`float` when absent) asks, or why
+    /// that format is not one.
+    pub fn encode(vector: Vec<f32>, encoding_format: Option<&str>) -> Result<Self, String> {
+        use base64::Engine as _;
+        match encoding_format {
+            None | Some("float") => Ok(Self::Float(vector)),
+            Some("base64") => {
+                let bytes: Vec<u8> = vector.iter().flat_map(|v| v.to_le_bytes()).collect();
+                Ok(Self::Base64(
+                    base64::engine::general_purpose::STANDARD.encode(bytes),
+                ))
+            }
+            Some(other) => Err(format!(
+                "unknown encoding_format `{other}`; use `float` or `base64`"
+            )),
+        }
+    }
 }
 
 // ─── Models list ─────────────────────────────────────────────────────────────
@@ -1892,6 +1949,27 @@ impl ErrorResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn embeddings_encode_as_float_or_little_endian_base64() {
+        let vector = vec![1.0f32, -0.5];
+        assert_eq!(
+            EmbeddingVector::encode(vector.clone(), None),
+            Ok(EmbeddingVector::Float(vector.clone()))
+        );
+        // 1.0 = 00 00 80 3f, -0.5 = 00 00 00 bf.
+        assert_eq!(
+            EmbeddingVector::encode(vector.clone(), Some("base64")),
+            Ok(EmbeddingVector::Base64("AACAPwAAAL8=".to_string()))
+        );
+        assert!(EmbeddingVector::encode(vector, Some("int8")).is_err());
+        let request: EmbeddingRequest =
+            serde_json::from_value(serde_json::json!({"model": "m", "input": "a"})).unwrap();
+        assert_eq!(request.texts(), Some(vec!["a".to_string()]));
+        let request: EmbeddingRequest =
+            serde_json::from_value(serde_json::json!({"model": "m", "input": [1, 2]})).unwrap();
+        assert_eq!(request.texts(), None);
+    }
     use serde_json::json;
 
     #[test]

@@ -95,7 +95,7 @@ Bounds are global, not multiplied by conversation count:
 `GET /v1/affinity` uses coordinator authentication and exposes directory
 preferences, misses, spillovers, capacity evictions, expirations, stale epochs,
 residency misses and aggregate estimated tokens. A preference is **not** a
-confirmed token-cache hit. Worker `/metrics` JSON adds per-model warm reuse,
+confirmed token-cache hit. Worker `/metrics/json` adds per-model warm reuse,
 rewind, successfully prefilled saved tokens, snapshot occupancy/budget/eviction/
 expiry and warm-state bytes. Warm bytes include reported state plus token-vector
 capacity, not weights, allocator overhead, RSS, full VRAM or opaque remote state.

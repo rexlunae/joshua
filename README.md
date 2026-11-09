@@ -388,12 +388,12 @@ registry:
 
 | Protocol | Endpoints |
 |---|---|
-| OpenAI | `POST /v1/chat/completions`, `POST /v1/completions`, `POST /v1/embeddings`, `POST /v1/audio/transcriptions`, `GET /v1/models` (also `/models`), `GET /v1/models/{id}` |
+| OpenAI | `POST /v1/chat/completions`, `POST /v1/completions`, `POST /v1/embeddings`, `POST /v1/audio/transcriptions`, `POST /v1/audio/translations`, `GET /v1/models` (also `/models`), `GET /v1/models/{id}` |
 | Anthropic | `POST /v1/messages`, `POST /v1/messages/count_tokens` |
-| llama.cpp (`llama-server`) | `GET /health`, `GET /props`, `GET /slots`, `POST /tokenize`, `POST /detokenize` |
-| vLLM | `GET /load`, `POST /v1/tokenize`, `POST /v1/detokenize` |
+| llama.cpp (`llama-server`) | `GET /health` (also `/v1/health`), `GET /props`, `GET /slots`, `GET /metrics`, `POST /tokenize`, `POST /detokenize`, `POST /chat/completions` |
+| vLLM | `GET /load`, `GET /ping`, `GET /version`, `GET /metrics`, `POST /v1/tokenize`, `POST /v1/detokenize` |
 | Ollama | `HEAD /` heartbeat, `/api/chat`, `/api/generate`, `/api/embed` (and `/api/embeddings`), `/api/tags`, `/api/ps`, `/api/show`, `/api/version`, `/api/tokens`, and model management (`/api/delete`, `/api/copy`, `/api/create`) against the model directory |
-| joshua | `POST /v1/models/load`, `POST /v1/models/unload`, `GET /v1/worker/info`, `GET /status`, `GET /metrics`, `GET /metrics/prometheus` |
+| joshua | `POST /v1/models/load`, `POST /v1/models/unload`, `GET /v1/worker/info`, `GET /status`, `GET /metrics/json` |
 
 [docs/client-compatibility.md](docs/client-compatibility.md) records what
 each route supports and what it does not (for example Ollama's registry
@@ -656,6 +656,14 @@ curl http://localhost:8080/v1/embeddings \
   -d '{"model":"nomic-embed","input":["Hello","World"]}'
 ```
 
+`input` is a string, an array of the model's token ids, or an array of
+either.  `encoding_format: "base64"` (what the OpenAI SDKs send by default)
+returns each vector's little-endian float32 bytes, base64-encoded.
+`dimensions` keeps the first N values, L2-normalized again, which only a
+Matryoshka-trained model (such as Qwen3-Embedding) gives meaningful results
+for.  vLLM's `add_special_tokens` is honoured; `normalize: false` is refused,
+because vectors are always L2-normalized.
+
 > **Note:** Embeddings run a hidden-state forward pass with the pooling
 > strategy from the GGUF metadata (mean / CLS / last-token).  Supported
 > architectures: `llama` (e5-mistral, SFR-Embedding), `qwen2` (gte-Qwen2),
@@ -672,6 +680,9 @@ count → mel spectrogram → greedy decode.
 curl http://localhost:8080/v1/audio/transcriptions \
   -F file=@speech.wav -F language=en
 ```
+
+`POST /v1/audio/translations` takes the same form and returns the speech as
+English text.
 
 Whisper jobs use a separate one-slot, per-model admission gate before entering
 the blocking pool; queued HTTP requests do not occupy blocking threads or
@@ -822,11 +833,11 @@ are behind the API key when one is configured:
 | Endpoint | Purpose |
 |---|---|
 | `GET /status` | Model inventory, backend, context size, per-model in-flight/max concurrency and counters |
-| `GET /metrics` | JSON counters (HTTP requests/errors, prompt/completion/embedding tokens, streaming requests) |
-| `GET /metrics/prometheus` | The same counters in Prometheus text format, plus live in-flight and configured concurrency |
+| `GET /metrics` (also `/metrics/prometheus`) | Prometheus text: HTTP requests/errors, prompt/completion/embedding tokens, streaming requests, live in-flight and configured concurrency |
+| `GET /metrics/json` | The same counters as JSON, plus per-model prefix-cache figures |
 | `GET /props` | llama.cpp-compatible server properties and default generation settings |
 | `GET /slots` | One lightweight slot record per loaded model |
-| `POST /tokenize` (alias `POST /api/tokens`) | Tokenize `{"prompt": "..."}` or llama.cpp's `{"content": "..."}` with the loaded model's tokenizer |
+| `POST /tokenize` (aliases `/v1/tokenize`, `/api/tokens`) | Tokenize `{"prompt": "..."}`, llama.cpp's `{"content": "..."}` or vLLM's chat form `{"messages": [...]}` with the loaded model's tokenizer; vLLM's `return_token_strs` and `max_model_len` |
 
 ### `GET /v1/worker/info`
 
@@ -863,7 +874,8 @@ are forwarded event by event, in order; a request is retried on another
 worker only if it failed before any output, and a stream that has started is
 never restarted.  A client disconnect closes the worker connection, and the
 worker stops decoding.  `GET /v1/workers` shows the registry.  Audio
-transcription uploads (`/v1/audio/transcriptions`) go to a worker that
+transcription and translation uploads (`/v1/audio/transcriptions`,
+`/v1/audio/translations`) go to a worker that
 reports the capability.  With `--tls-cert`/`--tls-key` (and a
 `--features tls` build) the router serves HTTPS itself; worker connections
 stay plain HTTP.  See
