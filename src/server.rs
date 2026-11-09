@@ -1953,6 +1953,7 @@ async fn chat_completions(
     let reasoning_output = req
         .reasoning_output(state.reasoning_format)
         .map_err(ApiError::bad_request)?;
+    let prompt_logprobs = req.prompt_logprob_count().map_err(ApiError::bad_request)?;
     options.cache_scope = Some(crate::affinity::cache_scope(
         &headers,
         options.context_window,
@@ -2018,12 +2019,25 @@ async fn chat_completions(
         engine.tool_call_format()
     };
     let cancel = CancelOnDrop::new();
-    let completion = tokio::task::spawn_blocking({
+    let (completion, prompt_entries) = tokio::task::spawn_blocking({
         let engine = Arc::clone(&engine);
         let tools = tools.clone();
         let flag = cancel.flag();
-        move || {
-            engine.complete_chat_cancellable_detailed(&messages, tools.as_deref(), &options, &flag)
+        move || -> crate::error::Result<_> {
+            let completion = engine.complete_chat_cancellable_detailed(
+                &messages,
+                tools.as_deref(),
+                &options,
+                &flag,
+            )?;
+            // vLLM's `prompt_logprobs`: the rendered prompt, scored on its own.
+            let prompt = prompt_logprobs
+                .map(|top| {
+                    let tokens = engine.tokenize_chat(&messages, tools.as_deref(), &options)?;
+                    engine.prompt_logprobs(&tokens, top)
+                })
+                .transpose()?;
+            Ok((completion, prompt))
         }
     })
     .await
@@ -2089,6 +2103,7 @@ async fn chat_completions(
         completion.usage.clone(),
     );
     response.timings = Some(completion.timings);
+    response.prompt_logprobs = prompt_entries.map(|p| crate::logprobs::prompt(&engine, &p));
     Ok(Json(response).into_response())
 }
 /// One piece of a chat completion's output, in the order to send it.

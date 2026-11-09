@@ -3631,43 +3631,16 @@ impl Engine {
                 }
             }
             first_window = false;
-            for slice in crate::ppl::slices(start, end, crate::ppl::SCORE_ROWS_PER_PASS) {
-                let fed = &tokens[slice.from..slice.to];
-                let targets = &tokens[slice.from..slice.target_end];
-                if all_positions {
-                    match session
-                        .as_mut()
-                        .expect("active session")
-                        .forward_tokens_all(fed, slice.pos, device)
-                    {
-                        Ok(rows) => { acc.push_window(targets, &rows); }
-                        Err(error) => { outcome = Err(error); break; }
-                    }
-                } else {
-                    let mut rows = Vec::with_capacity(fed.len());
-                    for (i, tok) in fed.iter().enumerate() {
-                        if slice.from + i + 1 >= slice.target_end {
-                            break;
-                        }
-                        match session
-                            .as_mut()
-                            .expect("active session")
-                            .forward_tokens(std::slice::from_ref(tok), slice.pos + i, device)
-                        {
-                            Ok(logits) => rows.push(logits),
-                            Err(error) => {
-                                outcome = Err(error);
-                                break;
-                            }
-                        }
-                    }
-                    if outcome.is_ok() {
-                        acc.push_window(targets, &rows);
-                    }
-                }
-                if outcome.is_err() {
-                    break;
-                }
+            if let Err(error) = score_window(
+                session.as_mut().expect("active session"),
+                &tokens[start..end],
+                all_positions,
+                device,
+                &mut |_, targets, rows| {
+                    acc.push_window(targets, rows);
+                },
+            ) {
+                outcome = Err(error);
             }
             if outcome.is_err() {
                 break;
@@ -3677,6 +3650,73 @@ impl Engine {
             self.release_model(session.expect("available session"), Vec::new(), None);
         }
         outcome.map(|_| acc)
+    }
+
+    /// Each of `tokens`' log-probability given the tokens before it, with
+    /// the `top` likeliest alternatives at each position: vLLM's
+    /// `prompt_logprobs`, and the legacy completions API's `echo` with
+    /// `logprobs`.  Nothing predicts the first token, so its entry carries
+    /// only the token and its place, and renderers write it as null.
+    /// Entries are placed in the prompt's text with special tokens left
+    /// out, as `echo` repeats it.
+    ///
+    /// The prompt is scored in a pass of its own on a fresh session, in the
+    /// bounded slices [`Engine::perplexity`] uses, so it costs one more
+    /// prefill of the prompt.
+    pub fn prompt_logprobs(
+        &self,
+        tokens: &[u32],
+        top: u32,
+    ) -> Result<Vec<crate::types::TokenLogprob>> {
+        if tokens.len() > self.n_ctx as usize {
+            return Err(JoshuaError::InvalidRequest(format!(
+                "the prompt's {} tokens do not fit the {}-token context",
+                tokens.len(),
+                self.n_ctx
+            )));
+        }
+        let mut entries: Vec<crate::types::TokenLogprob> = tokens
+            .iter()
+            .map(|&token| crate::types::TokenLogprob {
+                token,
+                ..Default::default()
+            })
+            .collect();
+        if tokens.len() > 1 {
+            let (mut session, _) = self.acquire_session(&[], false, None)?;
+            let all_positions = session.supports_speculative();
+            let scored = score_window(
+                &mut session,
+                tokens,
+                all_positions,
+                &self.dense_device,
+                &mut |from, targets, rows| {
+                    for (i, row) in rows.iter().enumerate() {
+                        if let Some(&target) = targets.get(i + 1) {
+                            let scored = token_logprob(row, target, top);
+                            let entry = &mut entries[from + i + 1];
+                            entry.logprob = scored.logprob;
+                            entry.top = scored.top;
+                            entry.rank = scored.rank;
+                        }
+                    }
+                },
+            );
+            self.release_model(session, Vec::new(), None);
+            scored?;
+        }
+        let mut text = self.tokenizer.decode_stream(true);
+        let (mut bytes, mut chars) = (0, 0);
+        for entry in &mut entries {
+            entry.start = bytes;
+            entry.offset = chars;
+            entry.answer = true;
+            if let Ok(Some(piece)) = text.step(entry.token) {
+                bytes += piece.len();
+                chars += piece.chars().count();
+            }
+        }
+        Ok(entries)
     }
 
     /// Detokenize `tokens` back to text — the inverse of
@@ -8329,12 +8369,47 @@ fn token_logprob(logits: &[f32], token: u32, top: u32) -> crate::types::TokenLog
             best.truncate(k);
         }
     }
+    let chosen = logits.get(token as usize).copied().unwrap_or(f32::NEG_INFINITY);
+    let rank = 1 + logits.iter().filter(|v| v.is_finite() && **v > chosen).count() as u32;
     crate::types::TokenLogprob {
         token,
         logprob: logprob(token as usize),
         top: best.into_iter().map(|(id, v)| (id, v - lse)).collect(),
+        rank,
         ..Default::default()
     }
+}
+
+/// Feed one scoring window to `session` from position 0 in bounded slices
+/// ([`crate::ppl::slices`]), handing `on_rows` each slice's rows: the index
+/// in `window` of the slice's first token, the tokens from there that the
+/// rows predict (row `i` predicts `targets[i + 1]`), and the rows.  Without
+/// all-position logits the slice is fed one token at a time.
+fn score_window(
+    session: &mut GenSession,
+    window: &[u32],
+    all_positions: bool,
+    device: &Device,
+    on_rows: &mut dyn FnMut(usize, &[u32], &[Vec<f32>]),
+) -> Result<()> {
+    for slice in crate::ppl::slices(0, window.len(), crate::ppl::SCORE_ROWS_PER_PASS) {
+        let fed = &window[slice.from..slice.to];
+        let targets = &window[slice.from..slice.target_end];
+        let rows = if all_positions {
+            session.forward_tokens_all(fed, slice.pos, device)?
+        } else {
+            let mut rows = Vec::with_capacity(fed.len());
+            for (i, tok) in fed.iter().enumerate() {
+                if slice.from + i + 1 >= slice.target_end {
+                    break;
+                }
+                rows.push(session.forward_tokens(std::slice::from_ref(tok), slice.pos + i, device)?);
+            }
+            rows
+        };
+        on_rows(slice.from, targets, &rows);
+    }
+    Ok(())
 }
 
 /// Places each generated token's [`crate::types::TokenLogprob`] in the

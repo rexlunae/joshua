@@ -448,6 +448,7 @@ Besides `model`, `messages`, `stream` and `tools`:
 | `prompt_cache_key` | OpenAI's cache key: requests sharing it share a prompt-cache namespace and, behind `joshua route`, a worker (an `x-joshua-affinity` handle wins over it) |
 | `stream_options` | Accepted; usage is always sent on the final chunk |
 | `logprobs`, `top_logprobs` | Each generated token's log-probability in `choices[].logprobs.content`, with up to 20 alternatives; streamed, each chunk carries its tokens'. The probabilities are the model's own (a softmax of its logits, before temperature and the other samplers), as vLLM reports them by default. A request with `logprobs` decodes one token at a time, without speculative drafting |
+| `prompt_logprobs` | vLLM's: each prompt token's log-probability given the tokens before it, with up to 20 alternatives, in the response's `prompt_logprobs` (null for the first token, then a map from token id to `logprob`, `rank` and `decoded_token`). On `/v1/completions` it is in each choice, and `echo` with `logprobs` puts the prompt's tokens in front of the generated ones. The prompt is scored in a pass of its own, so it costs one more prefill. Refused when streaming, as vLLM does |
 | `n` | Only `n: 1` is accepted; anything else is a **400** rather than silently ignored |
 | `response_format` | `{"type": "text"}`, `{"type": "json_object"}`, or `{"type": "json_schema", "json_schema": {"name": …, "schema": {…}}}` — see [Structured outputs](#structured-outputs) |
 

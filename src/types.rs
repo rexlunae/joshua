@@ -186,6 +186,9 @@ pub struct TokenLogprob {
     /// The likeliest tokens at that step, most likely first, as many as
     /// [`GenerationOptions::logprobs`] asked for.
     pub top: Vec<(u32, f32)>,
+    /// The token's rank among all of them, the likeliest being 1 (vLLM's
+    /// `rank`).
+    pub rank: u32,
     /// Where the token's text starts in the generated text, in bytes.  A
     /// token that only completes a character another token began (a byte
     /// fragment) starts where that character does.
@@ -1159,6 +1162,10 @@ pub struct ChatCompletionRequest {
     /// (0 to 20); needs `logprobs: true`.
     #[serde(default)]
     pub top_logprobs: Option<u32>,
+    /// vLLM's: the prompt's log-probabilities, with this many alternatives
+    /// (0 to 20); not when streaming, as vLLM.
+    #[serde(default)]
+    pub prompt_logprobs: Option<i64>,
     /// Output format; only `{"type": "text"}` is supported.
     #[serde(default)]
     pub response_format: Option<serde_json::Value>,
@@ -1264,6 +1271,20 @@ pub(crate) fn parse_response_format(format: &serde_json::Value) -> Result<Option
 }
 
 impl ChatCompletionRequest {
+    /// vLLM's `prompt_logprobs`: how many alternatives to report with each
+    /// prompt token, or `None` for none; refused when streaming, as vLLM
+    /// does.
+    pub fn prompt_logprob_count(&self) -> Result<Option<u32>, String> {
+        let count = self
+            .prompt_logprobs
+            .map(|n| crate::logprobs::count("prompt_logprobs", n))
+            .transpose()?;
+        if count.is_some() && self.stream == Some(true) {
+            return Err("`prompt_logprobs` is not available when streaming".to_string());
+        }
+        Ok(count)
+    }
+
     /// [`ChatCompletionRequest::to_generation_options_with`] over the
     /// OpenAI profile's defaults alone (no server flags or GGUF values).
     pub fn to_generation_options(&self) -> Result<GenerationOptions, String> {
@@ -1506,6 +1527,9 @@ pub struct ChatCompletionResponse {
     /// llama-server's prompt and generation timings.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timings: Option<Timings>,
+    /// vLLM's `prompt_logprobs`, when the request asked for them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_logprobs: Option<serde_json::Value>,
 }
 
 /// llama-server's `timings` object (`server_slot_stats::to_json`): prompt
@@ -1574,6 +1598,7 @@ impl ChatCompletionResponse {
             choices,
             usage,
             timings: None,
+            prompt_logprobs: None,
         }
     }
 }
