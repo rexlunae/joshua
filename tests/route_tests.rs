@@ -2987,3 +2987,27 @@ vAAgG105dwYP0yuZkqDAzaPJA2jHb6cV4BcMkMIMtyb4dWcn+I8bcnwI
         server.abort();
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prompt_cache_key_pins_requests_to_one_worker() {
+    let (_first, first_url) = spawn_fake("first", "alpha", 1, Behavior::Echo).await;
+    let (_second, second_url) = spawn_fake("second", "alpha", 1, Behavior::Echo).await;
+    let (coordinator, router) = spawn_router(config(&[&first_url, &second_url])).await;
+    let keyed = |key: &str| {
+        json!({
+            "model": "alpha", "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 4, "prompt_cache_key": key,
+        })
+    };
+    let initial = affinity_request(&router, None, "alice", &keyed("conversation-1")).await;
+    assert_eq!(initial.status, StatusCode::OK);
+    let owner = initial.header(WORKER_HEADER).unwrap().to_string();
+    for _ in 0..4 {
+        let again = affinity_request(&router, None, "alice", &keyed("conversation-1")).await;
+        assert_eq!(again.header(WORKER_HEADER), Some(owner.as_str()));
+    }
+    // One affinity entry per key (and owner), as with an explicit handle.
+    assert_eq!(coordinator.affinity_stats().entries, 1);
+    affinity_request(&router, None, "alice", &keyed("conversation-2")).await;
+    assert_eq!(coordinator.affinity_stats().entries, 2);
+}

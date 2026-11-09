@@ -1036,6 +1036,10 @@ pub struct ChatCompletionRequest {
     /// Whether to stream token-by-token via SSE.
     #[serde(default)]
     pub stream: Option<bool>,
+    /// OpenAI's cache-routing key: requests sharing it share a cache
+    /// namespace and, behind `joshua route`, a worker.
+    #[serde(default)]
+    pub prompt_cache_key: Option<String>,
     /// Accepted for compatibility; the final streamed chunk always carries
     /// usage, so `include_usage` is effectively always on.
     #[serde(default)]
@@ -1044,8 +1048,9 @@ pub struct ChatCompletionRequest {
     #[serde(default)]
     pub tools: Option<Vec<Tool>>,
     /// `"none"` hides `tools` from the model; `"auto"` (the default) offers
-    /// them.  `"required"` and a named function cannot be enforced (there is
-    /// no constrained decoding) and behave like `"auto"`.
+    /// them; a named function (`{"type": "function", "function": {"name"}}`)
+    /// offers that tool alone.  `"required"` offers them all: whether the
+    /// model calls one is not enforced.
     #[serde(default)]
     pub tool_choice: Option<serde_json::Value>,
     /// Number of choices; only `1` is supported.
@@ -1182,6 +1187,7 @@ impl ChatCompletionRequest {
         if self.n.is_some_and(|n| n != 1) {
             return Err("only n = 1 is supported".to_string());
         }
+        self.named_tool()?;
         if self.logprobs == Some(true) || self.top_logprobs.is_some_and(|n| n > 0) {
             return Err("logprobs are not supported".to_string());
         }
@@ -1280,29 +1286,79 @@ impl ChatCompletionRequest {
     }
 
     /// How the response reports reasoning, from `reasoning_format` and
-    /// `include_reasoning`.
-    pub fn reasoning_output(&self) -> Result<crate::reasoning::ReasoningOutput, String> {
+    /// `include_reasoning`; `default` (the server's `--reasoning-format`)
+    /// when the request names no format.
+    pub fn reasoning_output(
+        &self,
+        default: crate::reasoning::ReasoningOutput,
+    ) -> Result<crate::reasoning::ReasoningOutput, String> {
         use crate::reasoning::ReasoningOutput;
         if self.include_reasoning == Some(false) {
             return Ok(ReasoningOutput::Hidden);
         }
-        match self.reasoning_format.as_deref() {
-            None | Some("auto") | Some("deepseek") => Ok(ReasoningOutput::Separate),
-            Some("none") => Ok(ReasoningOutput::Inline),
-            Some("deepseek-legacy") => Ok(ReasoningOutput::Legacy),
-            Some(other) => Err(format!(
-                "unknown reasoning_format `{other}`; use none, auto, deepseek or deepseek-legacy"
-            )),
+        self.reasoning_format
+            .as_deref()
+            .map_or(Ok(default), ReasoningOutput::parse)
+    }
+
+    /// The function a named `tool_choice` picks, after checking
+    /// `tool_choice`: `"none"`, `"auto"`, `"required"` (which needs tools)
+    /// or a named function among `tools`.
+    fn named_tool(&self) -> Result<Option<&str>, String> {
+        let has = |name: &str| {
+            self.tools
+                .iter()
+                .flatten()
+                .any(|tool| tool.function.name == name)
+        };
+        match &self.tool_choice {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(serde_json::Value::String(choice)) => match choice.as_str() {
+                "none" | "auto" => Ok(None),
+                "required" if self.tools.as_ref().is_some_and(|t| !t.is_empty()) => Ok(None),
+                "required" => Err("tool_choice `required` needs `tools`".to_string()),
+                other => Err(format!(
+                    "unknown tool_choice `{other}`; use none, auto, required or a named function"
+                )),
+            },
+            Some(choice) => {
+                let name = choice
+                    .get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|_| {
+                        choice.get("type").and_then(serde_json::Value::as_str) == Some("function")
+                    })
+                    .ok_or_else(|| {
+                        "tool_choice must be a string or {\"type\": \"function\", \"function\": {\"name\": ...}}"
+                            .to_string()
+                    })?;
+                if has(name) {
+                    Ok(Some(name))
+                } else {
+                    Err(format!("tool_choice names `{name}`, which is not in `tools`"))
+                }
+            }
         }
     }
 
     /// The tools to offer the model: `None` when no tools were supplied or
-    /// `tool_choice` is `"none"`.
+    /// `tool_choice` is `"none"`, and only the named one when `tool_choice`
+    /// names a function.
     pub fn offered_tools(&self) -> Option<Vec<Tool>> {
         if self.tool_choice.as_ref().and_then(|c| c.as_str()) == Some("none") {
             return None;
         }
-        self.tools.clone()
+        match self.named_tool() {
+            Ok(Some(name)) => self.tools.as_ref().map(|tools| {
+                tools
+                    .iter()
+                    .filter(|tool| tool.function.name == name)
+                    .cloned()
+                    .collect()
+            }),
+            _ => self.tools.clone(),
+        }
     }
 }
 
@@ -2109,7 +2165,7 @@ mod tests {
         assert!(rejected(json!({"thinking_token_budget": -5})).contains("thinking_token_budget"));
 
         use crate::reasoning::ReasoningOutput;
-        let output = |v: serde_json::Value| request(v).reasoning_output();
+        let output = |v: serde_json::Value| request(v).reasoning_output(Default::default());
         assert_eq!(output(json!({})), Ok(ReasoningOutput::Separate));
         assert_eq!(
             output(json!({"reasoning_format": "none"})),
@@ -2124,6 +2180,13 @@ mod tests {
             Ok(ReasoningOutput::Hidden)
         );
         assert!(output(json!({"reasoning_format": "xml"})).is_err());
+        // The server's --reasoning-format applies when the request names none.
+        let inline = |v: serde_json::Value| request(v).reasoning_output(ReasoningOutput::Inline);
+        assert_eq!(inline(json!({})), Ok(ReasoningOutput::Inline));
+        assert_eq!(
+            inline(json!({"reasoning_format": "auto"})),
+            Ok(ReasoningOutput::Separate)
+        );
         // `max` is a valid effort, mapped to the 3-level templates' `high`.
         let o = options(json!({"reasoning_effort": "max"}));
         assert_eq!(o.chat_template_kwargs["reasoning_effort"], json!("high"));
@@ -2389,6 +2452,35 @@ mod tests {
         assert!(request(json!({"tools": tools, "tool_choice": "none"}))
             .offered_tools()
             .is_none());
+    }
+
+    #[test]
+    fn a_named_tool_choice_offers_that_tool_alone() {
+        let tools = json!([
+            {"type": "function", "function": {"name": "f"}},
+            {"type": "function", "function": {"name": "g"}},
+        ]);
+        let named = json!({"type": "function", "function": {"name": "g"}});
+        let offered = request(json!({"tools": tools, "tool_choice": named}))
+            .offered_tools()
+            .unwrap();
+        assert_eq!(offered.len(), 1);
+        assert_eq!(offered[0].function.name, "g");
+        // A choice that cannot be honoured is a client error.
+        for (choice, needle) in [
+            (json!({"type": "function", "function": {"name": "h"}}), "not in `tools`"),
+            (json!("sometimes"), "unknown tool_choice"),
+            (json!({"name": "f"}), "tool_choice must be"),
+        ] {
+            let err = request(json!({"tools": tools, "tool_choice": choice}))
+                .to_generation_options()
+                .unwrap_err();
+            assert!(err.contains(needle), "{err}");
+        }
+        let err = request(json!({"tool_choice": "required"}))
+            .to_generation_options()
+            .unwrap_err();
+        assert!(err.contains("needs `tools`"), "{err}");
     }
 
     #[test]

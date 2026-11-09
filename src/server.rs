@@ -216,6 +216,9 @@ pub struct ServerState {
     /// permissive policy for localhost development; set one or more
     /// origins (or `JOSHUA_CORS_ORIGINS`) in a deployment.
     pub cors_origins: Vec<String>,
+    /// How chat answers report reasoning when a request names no
+    /// `reasoning_format` (`--reasoning-format`).
+    pub reasoning_format: ReasoningOutput,
     /// Ops counters.
     pub metrics: Arc<ServerMetrics>,
 }
@@ -232,6 +235,7 @@ impl ServerState {
             whisper: None,
             api_key: None,
             cors_origins: Vec::new(),
+            reasoning_format: ReasoningOutput::default(),
             metrics: Arc::new(ServerMetrics::default()),
         }
     }
@@ -1798,7 +1802,9 @@ impl Drop for CancelOnDrop {
     }
 }
 
-/// A server-sent-events body of the `data:` payloads `rx` receives.  It
+/// A server-sent-events body of the `data:` payloads `rx` receives, with a
+/// keep-alive comment every 15 s while nothing else is sent (a long
+/// prefill), so clients and proxies with read timeouts keep the stream.  It
 /// holds `cancel`, so the generation feeding `rx` stops when the client
 /// goes away.
 pub(crate) fn sse_response(
@@ -1810,7 +1816,9 @@ pub(crate) fn sse_response(
             .await
             .map(|data| (Ok::<Event, Infallible>(Event::default().data(data)), (rx, cancel)))
     });
-    Sse::new(events).into_response()
+    Sse::new(events)
+        .keep_alive(axum::response::sse::KeepAlive::default())
+        .into_response()
 }
 
 /// Embed `texts` off the async runtime, stopping once the requester is
@@ -1886,10 +1894,13 @@ async fn chat_completions(
         .map_err(ApiError::bad_request)?;
     // Answer a request the model cannot serve before a stream starts.
     engine.validate_options(&options).map_err(ApiError::from)?;
-    let reasoning_output = req.reasoning_output().map_err(ApiError::bad_request)?;
+    let reasoning_output = req
+        .reasoning_output(state.reasoning_format)
+        .map_err(ApiError::bad_request)?;
     options.cache_scope = Some(crate::affinity::cache_scope(
         &headers,
         options.context_window,
+        req.prompt_cache_key.as_deref(),
     ));
     let messages = req.messages.clone();
     let tools = req.offered_tools();
@@ -2436,6 +2447,7 @@ async fn messages(
     options.cache_scope = Some(crate::affinity::cache_scope(
         &headers,
         options.context_window,
+        None,
     ));
     let tools_disabled = matches!(
         req.tool_choice
@@ -2497,7 +2509,10 @@ async fn messages(
                 })
             },
         );
-        return Ok(Sse::new(events).into_response());
+        // Anthropic's clients take the same keep-alive comments.
+        return Ok(Sse::new(events)
+            .keep_alive(axum::response::sse::KeepAlive::default())
+            .into_response());
     }
 
     let tool_call_format = if tools.is_some() {

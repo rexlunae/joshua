@@ -125,6 +125,19 @@ pub enum ReasoningOutput {
 }
 
 impl ReasoningOutput {
+    /// llama.cpp's `reasoning_format` names: `none` (inline), `auto` and
+    /// `deepseek` (separate), `deepseek-legacy`.
+    pub fn parse(name: &str) -> Result<Self, String> {
+        match name {
+            "auto" | "deepseek" => Ok(Self::Separate),
+            "none" => Ok(Self::Inline),
+            "deepseek-legacy" => Ok(Self::Legacy),
+            other => Err(format!(
+                "unknown reasoning_format `{other}`; use none, auto, deepseek or deepseek-legacy"
+            )),
+        }
+    }
+
     /// Whether output is split at all for a streamed (`streaming`) or
     /// complete response.
     pub fn splits(self, streaming: bool) -> bool {

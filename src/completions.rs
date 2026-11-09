@@ -275,7 +275,8 @@ pub(crate) fn options(
         .apply(&mut options)
         .map_err(ApiError::bad_request)?;
     options.constraint = constraint;
-    options.cache_scope = Some(crate::affinity::cache_scope(headers, None));
+    let key = body.get("prompt_cache_key").and_then(Value::as_str);
+    options.cache_scope = Some(crate::affinity::cache_scope(headers, None, key));
     engine.validate_options(&options).map_err(ApiError::from)?;
     Ok(options)
 }

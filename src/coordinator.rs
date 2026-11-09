@@ -537,6 +537,7 @@ struct Envelope<'a> {
     context_window: Option<&'a serde_json::value::RawValue>,
     num_ctx: Option<&'a serde_json::value::RawValue>,
     n_ctx: Option<&'a serde_json::value::RawValue>,
+    prompt_cache_key: Option<&'a serde_json::value::RawValue>,
 }
 
 impl<'de> Deserialize<'de> for Envelope<'de> {
@@ -545,7 +546,7 @@ impl<'de> Deserialize<'de> for Envelope<'de> {
         #[serde(field_identifier, rename_all = "snake_case")]
         enum Field {
             Model, Messages, Prompt, Input, MaxTokens, MaxCompletionTokens,
-            ContextWindow, NumCtx, NCtx,
+            ContextWindow, NumCtx, NCtx, PromptCacheKey,
             #[serde(other)]
             Ignore,
         }
@@ -580,6 +581,7 @@ impl<'de> Deserialize<'de> for Envelope<'de> {
                         Field::ContextWindow => &mut envelope.context_window,
                         Field::NumCtx => &mut envelope.num_ctx,
                         Field::NCtx => &mut envelope.n_ctx,
+                        Field::PromptCacheKey => &mut envelope.prompt_cache_key,
                         Field::Ignore => {
                             map.next_value::<serde::de::IgnoredAny>()?;
                             continue;
@@ -600,6 +602,9 @@ struct RequestWork {
     context: Option<u32>,
     /// Capped scheduling hints, not a token count or an execution-time bound.
     units: u64,
+    /// OpenAI's `prompt_cache_key`: requests sharing it go to the same
+    /// worker and share its cache namespace, like an affinity handle.
+    cache_key: Option<String>,
 }
 
 impl Envelope<'_> {
@@ -634,6 +639,10 @@ impl Envelope<'_> {
                         .saturating_mul(4),
                 )
                 .clamp(1, 1 << 24),
+            cache_key: self
+                .prompt_cache_key
+                .and_then(|raw| serde_json::from_str::<String>(raw.get()).ok())
+                .filter(|key| !key.is_empty()),
         }
     }
 }
@@ -1431,7 +1440,9 @@ impl Coordinator {
             match body.frame().await {
                 Some(Ok(frame)) => {
                     if let Ok(data) = frame.into_data() {
-                        if let Some(first) = framer.push(&data) {
+                        // A worker's keep-alive comments are not output: a
+                        // request still waiting on its prefill can be retried.
+                        if let Some(first) = framer.push(&data).filter(|e| !only_comments(e)) {
                             let done = has_done_event(&first);
                             return Ok(FirstOutput::Stream {
                                 body,
@@ -1533,10 +1544,19 @@ impl Coordinator {
             } else {
                 None
             };
-        let affinity = handle.as_ref().map(|handle| {
+        // An explicit affinity handle wins over the body's
+        // `prompt_cache_key`; either keys the worker choice and the cache
+        // namespace.
+        let routed = matches!(path, "/v1/chat/completions" | "/v1/completions");
+        let hint = match (&handle, &work.cache_key) {
+            (Some(handle), _) => Some(handle.as_bytes()),
+            (None, Some(key)) if routed && model.is_some() => Some(key.as_bytes()),
+            _ => None,
+        };
+        let affinity = hint.map(|hint| {
             crate::affinity::digest(&[
                 crate::affinity::owner(headers),
-                handle.as_bytes(),
+                hint,
                 model.as_deref().unwrap().as_bytes(),
                 &work.context.unwrap_or(0).to_le_bytes(),
             ])
@@ -1771,6 +1791,15 @@ impl SseFramer {
         let rest = self.buf.split_off(end);
         Some(Bytes::from(std::mem::replace(&mut self.buf, rest)))
     }
+}
+
+/// Whether whole SSE events are only comments (`:` lines, such as the
+/// keep-alives a worker sends while it prefills).
+fn only_comments(events: &[u8]) -> bool {
+    events
+        .split(|&b| b == b'\n')
+        .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+        .all(|line| line.is_empty() || line.starts_with(b":"))
 }
 
 /// Whether whole SSE events include the stream's terminal `data: [DONE]`.
@@ -2158,7 +2187,7 @@ mod tests {
             }
             drop(reservation);
             assert!(matches!(coordinator.try_pick_audio(&[]), Pick::Busy));
-            let work = RequestWork { context: None, units: 1 };
+            let work = RequestWork { context: None, units: 1, cache_key: None };
             assert!(matches!(coordinator.acquire(TRANSCRIPTIONS_PATH, None, &work, &[], None).await,
                 Err(Reject::QueueFull)));
             assert_eq!(probes.load(Ordering::SeqCst), 3);
@@ -2198,7 +2227,7 @@ mod tests {
             let coordinator = coordinator.clone();
             async move {
                 coordinator.acquire(TRANSCRIPTIONS_PATH, None,
-                    &RequestWork { context: None, units: 1 }, &[], None).await
+                    &RequestWork { context: None, units: 1, cache_key: None }, &[], None).await
             }
         });
         assert!(tokio::time::timeout(Duration::from_millis(30), &mut acquisition).await.is_err());
@@ -2240,7 +2269,7 @@ mod tests {
                 "capabilities": {"chat": true, "transcriptions": index == 0}
             })).unwrap());
         }
-        let work = RequestWork { context: None, units: 1 };
+        let work = RequestWork { context: None, units: 1, cache_key: None };
         let Pick::Slot(occupied) = coordinator.try_pick("/v1/chat/completions", Some("m"), &work, &[], None) else {
             panic!("initial generation slot");
         };
@@ -2282,6 +2311,8 @@ mod tests {
     #[test]
     fn done_events_are_recognised_whole() {
         assert!(has_done_event(b"data: {\"i\":1}\n\ndata: [DONE]\n\n"));
+        assert!(only_comments(b":\n\n: keep-alive\r\n\r\n"));
+        assert!(!only_comments(b":\n\ndata: x\n\n"));
         assert!(has_done_event(b"data:[DONE]\r\n\r\n"));
         assert!(!has_done_event(b"data: {\"text\":\"[DONE]\"}\n\n"));
         assert!(!has_done_event(b"data: [DONE]x\n\n"));

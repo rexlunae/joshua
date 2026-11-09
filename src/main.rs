@@ -690,6 +690,17 @@ enum Commands {
             value_parser = joshua::tools::ToolCallFormat::parse_override
         )]
         tool_call_parser: ::std::option::Option<joshua::tools::ToolCallFormat>,
+        /// How chat answers report the model's reasoning when a request does
+        /// not say (llama-server's flag): `auto` / `deepseek` in a separate
+        /// `reasoning_content` field, `none` inline in `content`, or
+        /// `deepseek-legacy` (separate unless streaming).
+        #[arg(
+            long,
+            env = "JOSHUA_REASONING_FORMAT",
+            default_value = "auto",
+            value_parser = joshua::reasoning::ReasoningOutput::parse
+        )]
+        reasoning_format: joshua::reasoning::ReasoningOutput,
         /// Require this API key on /v1 routes (Authorization: Bearer <key>
         /// or x-api-key: <key>).  A comma-separated list accepts any key.
         #[arg(long, env = "JOSHUA_API_KEY")]
@@ -939,6 +950,7 @@ async fn main() -> anyhow::Result<()> {
             chat_template_file,
             trust_request_chat_template,
             tool_call_parser,
+            reasoning_format,
             api_key,
             cors_origin,
             tls_cert,
@@ -1047,6 +1059,7 @@ async fn main() -> anyhow::Result<()> {
                 whisper,
                 api_key,
                 cors_origins: cors_origin,
+                reasoning_format,
                 metrics: Arc::new(server::ServerMetrics::default()),
             });
             match (tls_cert, tls_key) {
@@ -1852,6 +1865,23 @@ mod tests {
         }
 
         assert!(Cli::try_parse_from(["joshua", "report", "--json"]).is_ok());
+    }
+
+    #[test]
+    fn serve_takes_llama_servers_reasoning_format() {
+        use joshua::reasoning::ReasoningOutput;
+        let parse = |extra: &[&str]| {
+            let mut args = vec!["joshua", "serve", "--model", "m.gguf"];
+            args.extend_from_slice(extra);
+            match Cli::try_parse_from(args).map(|cli| cli.command) {
+                Ok(Commands::Serve { reasoning_format, .. }) => Ok(reasoning_format),
+                Ok(_) => unreachable!(),
+                Err(e) => Err(e.to_string()),
+            }
+        };
+        assert_eq!(parse(&[]), Ok(ReasoningOutput::Separate));
+        assert_eq!(parse(&["--reasoning-format", "none"]), Ok(ReasoningOutput::Inline));
+        assert!(parse(&["--reasoning-format", "xml"]).is_err());
     }
 
     #[test]
