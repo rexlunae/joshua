@@ -62,6 +62,9 @@ pub struct LoraSlots {
     /// The device the weights are on (`None` when there are no slots).
     pub device: Option<candle::Device>,
     pub slots: Vec<LoraSlot>,
+    /// `(n_head, n_kv_head)` when `attn_q` / `attn_k` rows are stored
+    /// permuted for interleaved RoPE (the GGUF `llama` layout).
+    pub rope_permute: Option<(usize, usize)>,
 }
 
 impl LoraSlots {
@@ -71,6 +74,7 @@ impl LoraSlots {
             n_layer,
             device: None,
             slots: Vec::new(),
+            rope_permute: None,
         }
     }
 

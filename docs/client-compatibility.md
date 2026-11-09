@@ -219,7 +219,22 @@ loaders (Qwen and its relatives) and on the `llama` (Llama, Mistral and the
 other architectures it serves), `qwen2`, `gemma3` and `phi3` loaders, whose
 attention and dense MLP projections take a delta (Phi-3's fused `attn_qkv`
 and `[gate ‖ up]` `ffn_up` as they are; Mixtral's experts take none).  Other
-architectures refuse them.  Ids
+architectures refuse them.
+
+A Hugging Face PEFT adapter loads the same way, unconverted: name its
+directory (holding `adapter_config.json` and `adapter_model.safetensors`) or
+the `.safetensors` file.  It is read as `convert_lora_to_gguf.py` would
+convert it: `q_proj` / `k_proj` / `v_proj` / `o_proj`, `gate_proj` /
+`up_proj` / `down_proj`, Phi-3's `qkv_proj` / `gate_up_proj` and Qwen MoE's
+`shared_expert` map to their GGUF projections; a llama-arch model's Q/K
+`B` rows are permuted for its interleaved RoPE; and PEFT's scale
+(`lora_alpha / r`, `/ √r` with `use_rslora`, per module with `rank_pattern`
+/ `alpha_pattern`) is applied, so scale 1 runs the adapter as PEFT does.
+`rank_pattern` / `alpha_pattern` keys are regular expressions matched as PEFT
+matches them, and a pair whose rank the config does not give it is refused.
+DoRA, activated LoRA (`alora_invocation_tokens`), trained biases,
+`modules_to_save`, embedding or output-head pairs and routed-expert pairs are
+refused.  Ids
 follow the order given and are never reused.
 
 A request runs the server-wide scales unless it sends its own `lora` list

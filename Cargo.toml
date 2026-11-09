@@ -176,6 +176,9 @@ serde = { version = "1", features = ["derive"] }
 # preserve_order (which llguidance also turns on): a request's JSON objects
 # keep their key order on their way into chat templates.
 serde_json = { version = "1", features = ["raw_value", "preserve_order"] }
+# PEFT adapter configs name modules by Python regular expression
+# (rank_pattern), lookaround included.
+fancy-regex = "0.14"
 thiserror = "1"
 anyhow = "1"
 tracing = "0.1"

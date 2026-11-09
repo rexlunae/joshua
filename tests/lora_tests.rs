@@ -1390,3 +1390,113 @@ async fn vllm_runtime_lora_routes_and_adapter_named_models() {
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert!(engine.lora_adapters().is_empty());
 }
+
+/// A Hugging Face PEFT adapter (`adapter_config.json` and
+/// `adapter_model.safetensors`) runs exactly as the GGUF that
+/// `convert_lora_to_gguf.py` would make of it: the same pairs, Q/K `B` rows
+/// permuted for a llama-arch model, and PEFT's `lora_alpha / r` scale.
+#[test]
+fn peft_adapters_match_their_gguf_conversion() {
+    use std::collections::HashMap;
+
+    fn hf_module(base: &str) -> String {
+        let rest = base.strip_prefix("blk.").unwrap().strip_suffix(".weight").unwrap();
+        let (layer, proj) = rest.split_once('.').unwrap();
+        let module = match proj {
+            "attn_q" => "self_attn.q_proj",
+            "attn_k" => "self_attn.k_proj",
+            "attn_v" => "self_attn.v_proj",
+            "attn_output" => "self_attn.o_proj",
+            "ffn_gate" => "mlp.gate_proj",
+            "ffn_up" => "mlp.up_proj",
+            "ffn_down" => "mlp.down_proj",
+            other => panic!("no HF name for {other}"),
+        };
+        format!("base_model.model.model.layers.{layer}.{module}")
+    }
+    /// The inverse of convert_hf_to_gguf.py's Q/K row permutation.
+    fn unpermute(b: &[f32], n_out: usize, r: usize, heads: usize) -> Vec<f32> {
+        let half = n_out / heads / 2;
+        let mut out = vec![0.0; b.len()];
+        for h in 0..heads {
+            for i in 0..2 {
+                for j in 0..half {
+                    let hf = h * 2 * half + i * half + j;
+                    let gguf = h * 2 * half + j * 2 + i;
+                    out[hf * r..(hf + 1) * r].copy_from_slice(&b[gguf * r..(gguf + 1) * r]);
+                }
+            }
+        }
+        out
+    }
+
+    for (arch, write, heads) in [
+        ("qwen3", (|p| common::write_tiny_qwen_gguf(p, "qwen3")) as Writer, None),
+        ("llama", |p| common::write_tiny_gguf(p, "llama"), Some((2usize, 2usize))),
+    ] {
+        let path = fixture("peft", arch, write);
+        let dir = path.parent().unwrap();
+        let model = load(&path);
+        let table = model.lora_slots().unwrap();
+        assert_eq!(table.rope_permute(), heads, "{arch}");
+        let r = 4;
+        // Attention and MLP only: the HF names below cover those.
+        let specs = specs(&table, r, 500, |n| !n.contains("attn_qkv") && !n.contains("_shexp"));
+        let gguf = adapter(&model, &write_adapter(dir, "adapter.gguf", &table, 0.0, &specs));
+
+        let peft_dir = dir.join("peft");
+        std::fs::create_dir_all(&peft_dir).unwrap();
+        let mut tensors = HashMap::new();
+        for s in &specs {
+            let mut b = s.b.clone();
+            if let Some((n_head, n_kv_head)) = heads {
+                if s.base.contains(".attn_q.") {
+                    b = unpermute(&b, s.n_out, s.r, n_head);
+                } else if s.base.contains(".attn_k.") {
+                    b = unpermute(&b, s.n_out, s.r, n_kv_head);
+                }
+            }
+            let m = hf_module(&s.base);
+            // PEFT stores bf16 or f32; the test's values are f32.
+            tensors.insert(format!("{m}.lora_A.weight"), Tensor::from_vec(s.a.clone(), (s.r, s.n_in), &Device::Cpu).unwrap());
+            tensors.insert(format!("{m}.lora_B.weight"), Tensor::from_vec(b, (s.n_out, s.r), &Device::Cpu).unwrap());
+        }
+        candle_core::safetensors::save(&tensors, peft_dir.join("adapter_model.safetensors")).unwrap();
+        // alpha = 2r: PEFT's scale is 2.
+        std::fs::write(
+            peft_dir.join("adapter_config.json"),
+            format!(r#"{{"peft_type": "LORA", "r": {r}, "lora_alpha": {}, "bias": "none", "modules_to_save": null}}"#, 2 * r),
+        )
+        .unwrap();
+        let peft = Arc::new(LoraAdapter::load(&peft_dir, &table, &LoraLimits::default()).unwrap());
+        assert_eq!(peft.targets().collect::<Vec<_>>(), gguf.targets().collect::<Vec<_>>());
+        // The safetensors file itself names the adapter too.
+        let by_file = LoraAdapter::load(&peft_dir.join("adapter_model.safetensors"), &table, &LoraLimits::default()).unwrap();
+        assert_eq!(by_file.digest(), peft.digest());
+
+        let mut a = model.new_session().unwrap_or_else(|| load(&path));
+        a.set_adapters(active(&[(gguf, 2.0)])).unwrap();
+        let want = run(&mut a);
+        let mut b = model.new_session().unwrap_or_else(|| load(&path));
+        b.set_adapters(active(&[(peft, 1.0)])).unwrap();
+        let got = run(&mut b);
+        assert_runs_close(&got, &want, 1e-5, &format!("{arch}: PEFT vs GGUF"));
+        assert!(max_diff(&got, &run(&mut load(&path))) > 1e-3, "{arch}: the adapter moves the logits");
+
+        // What PEFT runs with beyond the pairs is refused.
+        for (extra, why) in [
+            (r#", "use_dora": true"#, "DoRA"),
+            (r#", "modules_to_save": ["lm_head"]"#, "modules_to_save"),
+            (r#", "bias": "lora_only""#, "biases"),
+        ] {
+            std::fs::write(
+                peft_dir.join("adapter_config.json"),
+                format!(r#"{{"r": {r}, "lora_alpha": 8{extra}}}"#),
+            )
+            .unwrap();
+            let err = LoraAdapter::load(&peft_dir, &table, &LoraLimits::default()).unwrap_err().to_string();
+            assert!(err.contains(why), "{arch}: {err}");
+        }
+        std::fs::remove_dir_all(dir).ok();
+    }
+}

@@ -586,6 +586,9 @@ impl ModelWeights {
     /// attention projections and, for a dense layer, its MLP.
     pub fn lora_slots(&self) -> LoraSlots {
         let mut out = LoraSlots::new(self.arch.as_str(), self.layers.len());
+        if let Some(l) = self.layers.first().filter(|l| !l.rope_is_neox) {
+            out.rope_permute = Some((l.n_head, l.n_kv_head));
+        }
         for (l, layer) in self.layers.iter().enumerate() {
             let push = |out: &mut LoraSlots, proj, w: &QMatMul| out.push(l, proj, &w.inner);
             push(&mut out, "attn_q", &layer.attention_wq);
