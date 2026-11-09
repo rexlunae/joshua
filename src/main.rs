@@ -673,6 +673,12 @@ enum Commands {
         /// `POST /lora-adapters`.
         #[arg(long)]
         lora_init_without_apply: bool,
+        /// Serve vLLM's `/v1/load_lora_adapter` and `/v1/unload_lora_adapter`,
+        /// which load adapters from paths a request names (vLLM's
+        /// `VLLM_ALLOW_RUNTIME_LORA_UPDATING`).  Off by default: a request
+        /// could make the server read any file it can.
+        #[arg(long, env = "JOSHUA_ALLOW_RUNTIME_LORA")]
+        allow_runtime_lora: bool,
         #[command(flatten)]
         sampling: SamplingArgs,
         /// Jinja chat template, or a file holding one, to render chats with
@@ -966,6 +972,7 @@ async fn main() -> anyhow::Result<()> {
             lora,
             lora_scaled,
             lora_init_without_apply,
+            allow_runtime_lora,
             sampling,
             chat_template,
             chat_template_file,
@@ -1102,6 +1109,7 @@ async fn main() -> anyhow::Result<()> {
                 reasoning_format,
                 metrics: Arc::new(server::ServerMetrics::default()),
                 responses: Default::default(),
+                allow_runtime_lora,
             });
             match (tls_cert, tls_key) {
                 (Some(cert), Some(key)) => {

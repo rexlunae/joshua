@@ -44,7 +44,7 @@ use crate::engine::{Completion, StopType};
 use crate::reasoning::ReasoningOutput;
 use crate::sampling::SamplingProfile;
 use crate::server::{
-    chat_answer, select_model, stream_chat_output, ApiError, AppState, CancelOnDrop, ChatPiece,
+    chat_answer, select_generation, stream_chat_output, ApiError, AppState, CancelOnDrop, ChatPiece,
     ServerMetrics,
 };
 use crate::tools::ParsedToolCall;
@@ -174,6 +174,10 @@ fn not_found(id: &str) -> ApiError {
 pub struct ResponsesRequest {
     #[serde(default)]
     model: String,
+    /// llama-server's per-request LoRA scales, as on chat completions; an
+    /// empty list runs the base model even under an adapter's name.
+    #[serde(default)]
+    lora: Option<Vec<crate::types::LoraScale>>,
     #[serde(default)]
     input: Option<Value>,
     #[serde(default)]
@@ -292,6 +296,9 @@ impl ResponsesRequest {
             if let Some(format) = response_format(format)? {
                 body.insert("response_format".into(), format);
             }
+        }
+        if let Some(lora) = &self.lora {
+            body.insert("lora".into(), json!(lora));
         }
         if let Some(effort) = self
             .reasoning
@@ -743,11 +750,17 @@ pub(crate) async fn create(
     messages.extend(chat_messages(&history).map_err(ApiError::bad_request)?);
     let chat = req.chat_request(messages).map_err(ApiError::bad_request)?;
 
-    let (resolved_model, engine) = select_model(&state, &req.model).await?;
-    let defaults = engine.sampling_defaults(SamplingProfile::OpenAi);
+    let selected = select_generation(&state, &req.model).await?;
+    let defaults = selected.engine.sampling_defaults(SamplingProfile::OpenAi);
     let mut options = chat
         .to_generation_options_with(&defaults)
         .map_err(ApiError::bad_request)?;
+    selected.apply(&mut options);
+    let crate::server::Selected {
+        model: resolved_model,
+        engine,
+        ..
+    } = selected;
     engine.validate_options(&options).map_err(ApiError::from)?;
     options.cache_scope = Some(crate::affinity::cache_scope(
         &headers,

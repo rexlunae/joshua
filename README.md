@@ -956,7 +956,9 @@ Two limits bound how much work a single client can demand, both tunable:
 - `--lora FNAME` and `--lora-scaled FNAME SCALE` load GGUF LoRA adapters for
   the startup model (`--lora-init-without-apply` at scale 0); requests pick
   scales with llama-server's `lora` list, and `GET`/`POST /lora-adapters`
-  list them and set the server-wide scales.  See
+  list them and set the server-wide scales.  Each adapter is also served as a
+  model of its own name, as in vLLM; `--allow-runtime-lora` adds vLLM's
+  `/v1/load_lora_adapter` and `/v1/unload_lora_adapter`.  See
   [docs/client-compatibility.md](docs/client-compatibility.md#lora-adapters).
 - `--allow-private-pull` lets Ollama's `/api/pull` fetch from this host and
   private networks; without it a pull reaches public addresses only.

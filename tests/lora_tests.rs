@@ -198,6 +198,87 @@ fn adapter_matches_merged_weights() {
     }
 }
 
+/// candle's quantized loaders that take the LoRA hook: an adapter on every
+/// projection each lists matches the merged model, and the base model is
+/// bit-identical with the hook removed.
+#[test]
+fn vendored_loaders_match_merged_weights() {
+    let (alpha, r, user) = (8.0, 4, 0.8);
+    let wants: &[(&str, &[&str])] = &[
+        ("llama", &["attn_q", "attn_k", "attn_v", "attn_output", "ffn_gate", "ffn_up", "ffn_down"]),
+        ("qwen2", &["attn_q", "attn_k", "attn_v", "attn_output", "ffn_gate", "ffn_up", "ffn_down"]),
+        ("gemma3", &["attn_q", "attn_k", "attn_v", "attn_output", "ffn_gate", "ffn_up", "ffn_down"]),
+        ("phi3", &["attn_qkv", "attn_output", "ffn_up", "ffn_down"]),
+    ];
+    for &(arch, projs) in wants {
+        let path = fixture("vendored", arch, |p| common::write_tiny_gguf(p, arch));
+        let dir = path.parent().unwrap();
+        let mut model = load(&path);
+        let table = model.lora_slots().unwrap_or_else(|| panic!("{arch}: no LoRA slots"));
+        assert_eq!(table.arch(), arch);
+        let mut listed: Vec<_> = table.iter().map(|(k, _, _)| k.proj.gguf_name()).collect();
+        listed.sort();
+        let mut expected = projs.to_vec();
+        expected.sort();
+        assert_eq!(listed, expected, "{arch}");
+
+        let base = run(&mut model);
+        let specs = specs(&table, r, 100, |_| true);
+        let lora = adapter(&model, &write_adapter(dir, "adapter.gguf", &table, alpha, &specs));
+        let set = active(&[(lora, user)]).unwrap();
+        assert!(model.set_adapters(Some(Arc::clone(&set))).unwrap(), "{arch}");
+        assert_eq!(model.adapter_key(), Some(set.key()));
+        assert!(!model.set_adapters(Some(Arc::clone(&set))).unwrap(), "{arch}: same set");
+        let got = run(&mut model);
+
+        let merged = dir.join("merged.gguf");
+        let deltas: Vec<_> = specs.iter().map(|s| (s, eff(user, alpha, s.r))).collect();
+        common::write_merged_gguf(&path, &merged, &deltas);
+        let want = run(&mut load(&merged));
+        assert_runs_close(&got, &want, 1e-4, &format!("{arch}: adapter vs merged"));
+        assert!(max_diff(&got, &base) > 2e-3, "{arch}: the adapter barely moves the logits");
+
+        assert!(model.set_adapters(None).unwrap(), "{arch}");
+        assert_eq!(model.adapter_key(), None);
+        assert_eq!(run(&mut model), base, "{arch}: base model after the hook is removed");
+        std::fs::remove_dir_all(dir).ok();
+    }
+}
+
+/// The engine runs an adapter on a candle loader per request, and a pooled
+/// session that ran it goes back to the base model for the next request.
+#[test]
+fn engine_runs_adapters_on_vendored_loaders() {
+    use joshua::types::{GenerationOptions, LoraScale};
+    use joshua::{Engine, RawPrompt};
+
+    for arch in ["llama", "gemma3"] {
+        let path = fixture("engine-vendored", arch, |p| common::write_tiny_gguf(p, arch));
+        let table = load(&path).lora_slots().unwrap();
+        let file = write_adapter(path.parent().unwrap(), "a.gguf", &table, 0.0, &specs(&table, 2, 7, |_| true));
+        let engine = Engine::with_n_ctx(&path, 64).unwrap();
+        let id = engine.load_lora(&file, None, 0.0).unwrap().id;
+        let run = |lora: Option<Vec<LoraScale>>| {
+            let options = GenerationOptions {
+                max_tokens: 3,
+                min_tokens: 3,
+                temperature: 0.0,
+                logprobs: Some(1),
+                lora,
+                ..Default::default()
+            };
+            let done = engine.complete_prompt(&RawPrompt::tokens(PROMPT.to_vec()), &options).unwrap();
+            done.logprobs.iter().map(|l| (l.token, l.logprob)).collect::<Vec<_>>()
+        };
+        let base = run(None);
+        let on = run(Some(vec![LoraScale { id, scale: 4.0 }]));
+        assert_ne!(on, base, "{arch}");
+        assert_eq!(run(None), base, "{arch}: base after the adapter");
+        assert_eq!(run(Some(vec![LoraScale { id, scale: 4.0 }])), on, "{arch}");
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+}
+
 /// Two adapters at once (overlapping targets, one with alpha 0, one with a
 /// negative scale) match the model with both deltas merged; the selection
 /// order changes neither the key nor a single bit of the output.
@@ -933,11 +1014,19 @@ fn adapters_are_refused_where_they_cannot_apply() {
         1.0,
     )]);
 
+    // A loader that takes adapters refuses one validated against another
+    // model, and stays on the base model.
     let llama = dir.join("llama.gguf");
     common::write_tiny_llama_gguf(&llama);
+    let mut m = load(&llama);
+    assert!(m.supports_lora());
+    let err = m.set_adapters(set.clone()).unwrap_err().to_string();
+    assert!(err.contains("different base model"), "{err}");
+    assert_eq!(m.adapter_key(), None);
+
     let deepseek = dir.join("deepseek2.gguf");
     common::write_tiny_deepseek2_gguf(&deepseek);
-    for (what, other) in [("llama", llama), ("deepseek2", deepseek)] {
+    for (what, other) in [("deepseek2", deepseek)] {
         let mut m = load(&other);
         assert!(!m.supports_lora(), "{what}");
         assert!(m.lora_slots().is_none(), "{what}");
@@ -1145,4 +1234,159 @@ async fn lora_adapters_routes_list_and_set_scales() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
     let (status, err) = call("POST", "/lora-adapters", json!([{"id": 9, "scale": 1.0}])).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
+}
+
+/// vLLM's runtime LoRA routes and adapter-named models: an adapter loaded
+/// with `/v1/load_lora_adapter` is listed by `/v1/models` under its base and
+/// runs when a request names it as its `model`.
+#[tokio::test]
+async fn vllm_runtime_lora_routes_and_adapter_named_models() {
+    use axum::body::Body;
+    use axum::http::{header, Request, StatusCode};
+    use joshua::server::{create_router, ServerState};
+    use serde_json::{json, Value};
+    use tower::ServiceExt;
+
+    let path = fixture("vllm", "qwen3", |p| common::write_tiny_qwen_gguf(p, "qwen3"));
+    let table = load(&path).lora_slots().expect("the qwen loader applies LoRA");
+    let file = write_adapter(path.parent().unwrap(), "style.gguf", &table, 0.0, &specs(&table, 2, 7, |_| true));
+    let engine = Arc::new(joshua::Engine::with_n_ctx(&path, 64).unwrap());
+    // The adapter's file sits in the model directory, which lists it; it is
+    // not a model, so it reserves no name and `style` stays the adapter's.
+    let dir = path.parent().unwrap().to_path_buf();
+    let router = |allow: bool| {
+        create_router(Arc::new(ServerState {
+            allow_runtime_lora: allow,
+            manager: Some(joshua::server::ModelManager {
+                model_dir: dir.clone(),
+                engine_options: Arc::new(|_: &Path| joshua::EngineOptions::with_n_ctx(64)),
+                npu_backend: None,
+                max_concurrency: None,
+                max_output_tokens: None,
+                allow_private_pull: false,
+                #[cfg(feature = "distributed")]
+                workers: Vec::new(),
+                #[cfg(feature = "distributed")]
+                cluster_key: None,
+            }),
+            ..ServerState::new(Arc::clone(&engine))
+        }))
+    };
+    let call = |app: axum::Router, method: &str, uri: &str, body: Value| {
+        let req = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(if method == "GET" { Body::empty() } else { Body::from(body.to_string()) })
+            .unwrap();
+        async move {
+            let res = app.oneshot(req).await.unwrap();
+            let status = res.status();
+            let bytes = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap();
+            (status, String::from_utf8_lossy(&bytes).into_owned())
+        }
+    };
+    let load_body = json!({"lora_name": "style", "lora_path": file.display().to_string()});
+
+    // Off unless the server allows it.
+    let (status, _) = call(router(false), "POST", "/v1/load_lora_adapter", load_body.clone()).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let app = router(true);
+    let (status, text) = call(app.clone(), "POST", "/v1/load_lora_adapter", load_body.clone()).await;
+    assert_eq!((status, text.as_str()), (StatusCode::OK, "Success: LoRA adapter 'style' added successfully."));
+    let (status, _) = call(app.clone(), "POST", "/v1/load_lora_adapter", load_body.clone()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "already loaded");
+    let (status, _) = call(app.clone(), "POST", "/v1/load_lora_adapter", json!({"lora_name": "x"})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "no path");
+    let missing = json!({"lora_name": "x", "lora_path": path.with_file_name("missing.gguf").display().to_string()});
+    let (status, _) = call(app.clone(), "POST", "/v1/load_lora_adapter", missing).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "no such file");
+    // Replaced in place, it keeps its name and id.
+    let id = engine.lora_id("style").unwrap();
+    let inplace = json!({"lora_name": "style", "lora_path": file.display().to_string(), "load_inplace": true});
+    let (status, text) = call(app.clone(), "POST", "/v1/load_lora_adapter", inplace).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert_eq!(engine.lora_id("style"), Some(id));
+    // A replacement that does not load leaves the adapter it would replace.
+    let junk = path.with_file_name("junk.gguf");
+    std::fs::write(&junk, b"not a gguf").unwrap();
+    let bad = json!({"lora_name": "style", "lora_path": junk.display().to_string(), "load_inplace": true});
+    let (status, _) = call(app.clone(), "POST", "/v1/load_lora_adapter", bad).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(engine.lora_id("style"), Some(id), "the old adapter stays");
+
+    // A router admits requests by the names a worker reports.
+    let (_, info) = call(app.clone(), "GET", "/v1/worker/info", Value::Null).await;
+    let info: Value = serde_json::from_str(&info).unwrap();
+    assert!(
+        info["models"].as_array().unwrap().iter().any(|m| m["id"] == "style"),
+        "{info}"
+    );
+
+    // Listed as a model whose parent is the base.
+    let (_, models) = call(app.clone(), "GET", "/v1/models", Value::Null).await;
+    let models: Value = serde_json::from_str(&models).unwrap();
+    let cards = models["data"].as_array().unwrap();
+    let base_id = cards[0]["id"].as_str().unwrap().to_string();
+    let card = cards.iter().find(|c| c["id"] == "style").expect("the adapter is listed");
+    assert_eq!(card["parent"], base_id.as_str());
+    assert!(card["root"].as_str().unwrap().ends_with("style.gguf"), "{card}");
+    let (status, _) = call(app.clone(), "GET", "/v1/models/style", Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Naming it runs it; naming the base does not.
+    let chat = |model: &str, lora: Option<Value>| {
+        let mut body = json!({"model": model, "messages": [{"role": "user", "content": "hi"}],
+                              "max_tokens": 3, "temperature": 0, "logprobs": true});
+        if let Some(lora) = lora {
+            body["lora"] = lora;
+        }
+        let app = app.clone();
+        async move {
+            let (status, text) = call(app, "POST", "/v1/chat/completions", body).await;
+            assert_eq!(status, StatusCode::OK, "{text}");
+            serde_json::from_str::<Value>(&text).unwrap()
+        }
+    };
+    let id = engine.lora_id("style").unwrap();
+    let named = chat("style", None).await;
+    assert_eq!(named["model"], "style");
+    let listed = chat(&base_id, Some(json!([{"id": id, "scale": 1.0}]))).await;
+    let base = chat(&base_id, None).await;
+    assert_eq!(named["choices"][0]["logprobs"], listed["choices"][0]["logprobs"]);
+    assert_ne!(named["choices"][0]["logprobs"], base["choices"][0]["logprobs"]);
+    // A request's own list still wins over the name.
+    let off = chat("style", Some(json!([]))).await;
+    assert_eq!(off["choices"][0]["logprobs"], base["choices"][0]["logprobs"]);
+    // So does /v1/responses, whose `lora` list reaches the engine.
+    let responses = |lora: Value| {
+        call(
+            app.clone(),
+            "POST",
+            "/v1/responses",
+            json!({"model": "style", "input": "hi", "max_output_tokens": 2, "temperature": 0, "lora": lora}),
+        )
+    };
+    let (status, text) = responses(json!([])).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let (status, text) = responses(json!([{"id": 99, "scale": 1.0}])).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+    // The raw completions route takes the name too.
+    let (status, text) = call(
+        app.clone(),
+        "POST",
+        "/v1/completions",
+        json!({"model": "style", "prompt": "hi", "max_tokens": 2, "temperature": 0}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert_eq!(serde_json::from_str::<Value>(&text).unwrap()["model"], "style");
+
+    let unload = json!({"lora_name": "style"});
+    let (status, text) = call(app.clone(), "POST", "/v1/unload_lora_adapter", unload.clone()).await;
+    assert_eq!((status, text.as_str()), (StatusCode::OK, "Success: LoRA adapter 'style' removed successfully."));
+    let (status, _) = call(app.clone(), "POST", "/v1/unload_lora_adapter", unload).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(engine.lora_adapters().is_empty());
 }

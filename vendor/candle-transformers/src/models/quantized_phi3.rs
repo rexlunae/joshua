@@ -14,7 +14,9 @@
 //!
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
+use super::lora_hook::{At, LinearDelta, LoraSlots};
 use candle::quantized::gguf_file;
 use candle::quantized::QTensor;
 use candle::{DType, Device, IndexOp, Module, Result, Tensor, D};
@@ -54,13 +56,20 @@ struct Mlp {
     i_size: usize,
 }
 
-impl Module for Mlp {
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let up_states = xs.apply(&self.ffn_up)?;
+impl Mlp {
+    /// The fused `[gate ‖ up]` projection takes its delta as `ffn_up`.
+    fn forward_at(&self, xs: &Tensor, at: At<'_>) -> Result<Tensor> {
+        let up_states = at.mm("ffn_up", xs, xs.apply(&self.ffn_up)?)?;
         let gate = up_states.narrow(D::Minus1, 0, self.i_size)?;
         let up_states = up_states.narrow(D::Minus1, self.i_size, self.i_size)?;
         let up_states = (up_states * gate.silu()?)?;
-        up_states.apply(&self.ffn_down)
+        at.mm("ffn_down", &up_states, up_states.apply(&self.ffn_down)?)
+    }
+}
+
+impl Module for Mlp {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        self.forward_at(xs, At::none())
     }
 }
 
@@ -109,10 +118,11 @@ impl LayerWeights {
         x: &Tensor,
         mask: Option<&Tensor>,
         index_pos: usize,
+        at: At<'_>,
     ) -> Result<Tensor> {
         let _enter = self.span_attn.enter();
         let (b_sz, seq_len, n_embd) = x.dims3()?;
-        let qkv = self.attn_qkv.forward(x)?;
+        let qkv = at.mm("attn_qkv", x, self.attn_qkv.forward(x)?)?;
 
         let query_pos = self.n_head * self.head_dim;
         let q = qkv.narrow(D::Minus1, 0, query_pos)?;
@@ -167,7 +177,7 @@ impl LayerWeights {
             att.matmul(&v)?
         };
         let y = y.transpose(1, 2)?.reshape(&[b_sz, seq_len, n_embd])?;
-        let y = self.attn_output.forward(&y)?;
+        let y = at.mm("attn_output", &y, self.attn_output.forward(&y)?)?;
         Ok(y)
     }
 }
@@ -197,6 +207,9 @@ pub struct ModelWeights {
     masks: HashMap<(usize, usize), Tensor>,
     span: tracing::Span,
     span_output: tracing::Span,
+    /// LoRA deltas added after the dense projections (see
+    /// [`super::lora_hook`]).
+    lora: Option<Arc<dyn LinearDelta>>,
 }
 
 fn precomput_freqs_cis(
@@ -298,7 +311,33 @@ impl ModelWeights {
             masks: HashMap::new(),
             span,
             span_output,
+            lora: None,
         })
+    }
+
+    /// The projections a LoRA delta can be added to: each decoder layer's
+    /// fused `attn_qkv`, `attn_output`, fused `ffn_up` and `ffn_down`.
+    pub fn lora_slots(&self) -> LoraSlots {
+        let mut out = LoraSlots::new("phi3", self.layers.len());
+        for (l, layer) in self.layers.iter().enumerate() {
+            let push = |out: &mut LoraSlots, proj, w: &QLinear| out.push(l, proj, &w.inner);
+            push(&mut out, "attn_qkv", &layer.attn_qkv);
+            push(&mut out, "attn_output", &layer.attn_output);
+            push(&mut out, "ffn_up", &layer.mlp.ffn_up);
+            push(&mut out, "ffn_down", &layer.mlp.ffn_down);
+        }
+        out
+    }
+
+    /// Run later forward passes with `hook`'s deltas (`None`: the base
+    /// model).  A pass from position 0 starts a fresh KV cache.
+    pub fn set_lora(&mut self, hook: Option<Arc<dyn LinearDelta>>) {
+        self.lora = hook;
+    }
+
+    /// The installed LoRA hook.
+    pub fn lora(&self) -> Option<&Arc<dyn LinearDelta>> {
+        self.lora.as_ref()
     }
 
     fn mask(&mut self, seq_len: usize, index_pos: usize, device: &Device) -> Result<Tensor> {
@@ -321,14 +360,16 @@ impl ModelWeights {
         };
         let _enter = self.span.enter();
         let mut xs = self.tok_embeddings.forward(xs)?;
-        for layer in self.layers.iter_mut() {
+        let hook = self.lora.clone();
+        for (l, layer) in self.layers.iter_mut().enumerate() {
+            let at = At { hook: hook.as_deref(), layer: l };
             let residual = &xs;
             let ys = xs.apply(&layer.attn_norm)?;
-            let ys = layer.forward_attn(&ys, mask.as_ref(), index_pos)?;
+            let ys = layer.forward_attn(&ys, mask.as_ref(), index_pos, at)?;
             let ys = (ys + residual)?;
             let residual = &ys;
             let ys = ys.apply(&layer.ffn_norm)?;
-            let ys = layer.mlp.forward(&ys)?;
+            let ys = layer.mlp.forward_at(&ys, at)?;
             xs = (ys + residual)?
         }
         let xs = xs.apply(&self.output_norm)?.i((.., seq_len - 1, ..))?;

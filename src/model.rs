@@ -31,6 +31,7 @@
 //! or mislabelled file.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::io::{Read, Seek, SeekFrom};
 
 use candle_core::quantized::gguf_file;
@@ -1127,7 +1128,35 @@ impl QuantizedModel {
     /// adapters against (see [`crate::lora::LoraAdapter::load`]); `None` for
     /// loaders that apply none.
     pub fn lora_slots(&self) -> Option<crate::lora::SlotTable> {
+        if let Some(slots) = self.vendored_lora_slots() {
+            return vendored_lora::table(slots);
+        }
         session!(self, m => m.lora_slots(), _ => None)
+    }
+
+    /// The hookable projections of candle's quantized loaders that take
+    /// LoRA deltas (see [`candle_transformers::models::lora_hook`]).
+    fn vendored_lora_slots(&self) -> Option<candle_transformers::models::lora_hook::LoraSlots> {
+        match self {
+            Self::Llama(m) => Some(m.lora_slots()),
+            Self::Qwen2(m) => Some(m.lora_slots()),
+            Self::Gemma(m) => Some(m.lora_slots()),
+            Self::Phi3(m) => Some(m.lora_slots()),
+            _ => None,
+        }
+    }
+
+    /// The LoRA hook installed in one of candle's quantized loaders.
+    fn vendored_lora(
+        &self,
+    ) -> Option<Option<&Arc<dyn candle_transformers::models::lora_hook::LinearDelta>>> {
+        match self {
+            Self::Llama(m) => Some(m.lora()),
+            Self::Qwen2(m) => Some(m.lora()),
+            Self::Gemma(m) => Some(m.lora()),
+            Self::Phi3(m) => Some(m.lora()),
+            _ => None,
+        }
     }
 
     /// Whether this model's loader applies LoRA adapters.
@@ -1145,6 +1174,35 @@ impl QuantizedModel {
         &mut self,
         set: Option<std::sync::Arc<crate::lora::ActiveSet>>,
     ) -> Result<bool> {
+        if let Some(current) = self.vendored_lora() {
+            let current = current.and_then(vendored_lora::set_of);
+            if let Some(s) = &set {
+                if !current.as_ref().is_some_and(|cur| Arc::ptr_eq(cur, s)) {
+                    let table = self.lora_slots().ok_or_else(|| {
+                        candle_core::Error::Msg("this model's loader applies no LoRA adapters".into())
+                    })?;
+                    vendored_lora::check(s, &table)?;
+                }
+            }
+            let changed = set.as_ref().map(|s| s.key()) != current.map(|s| s.key());
+            let hook = set.map(|s| {
+                Arc::new(vendored_lora::Hook(s))
+                    as Arc<dyn candle_transformers::models::lora_hook::LinearDelta>
+            });
+            match self {
+                Self::Llama(m) => m.set_lora(hook),
+                Self::Qwen2(m) => m.set_lora(hook),
+                Self::Gemma(m) => m.set_lora(hook),
+                Self::Phi3(m) => m.set_lora(hook),
+                _ => unreachable!("vendored_lora answered for this loader"),
+            }
+            if changed {
+                // Gemma 3 and Phi-3 keep no clearable cache; their next pass
+                // starts at position 0, which resets it.
+                self.clear_kv_cache();
+            }
+            return Ok(changed);
+        }
         session!(self, m => m.set_adapters(set), _ => match set {
             Some(_) => Err(candle_core::Error::Msg(
                 "LoRA adapters are not supported for this architecture".into(),
@@ -1156,11 +1214,17 @@ impl QuantizedModel {
     /// The key of the LoRA adapter set this session runs (`None`: the base
     /// model).
     pub fn adapter_key(&self) -> Option<crate::lora::AdapterKey> {
+        if let Some(current) = self.vendored_lora() {
+            return current.and_then(vendored_lora::set_of).map(|s| s.key());
+        }
         session!(self, m => m.adapter_key(), _ => None)
     }
 
     /// The LoRA adapter set this session runs (`None`: the base model).
     pub fn adapters(&self) -> Option<std::sync::Arc<crate::lora::ActiveSet>> {
+        if let Some(current) = self.vendored_lora() {
+            return current.and_then(vendored_lora::set_of);
+        }
         session!(self, m => m.adapters().cloned(), _ => None)
     }
 
@@ -1371,5 +1435,72 @@ mod tests {
     fn missing_architecture_key_gives_corrupt_file_error() {
         let err = Architecture::detect(&HashMap::new()).unwrap_err();
         assert!(err.contains("general.architecture"), "error: {err}");
+    }
+}
+
+/// LoRA adapters on candle's quantized loaders (`llama`, `qwen2`, `gemma3`,
+/// `phi3`), through the hook those loaders take after each dense projection
+/// (see [`candle_transformers::models::lora_hook`]).
+mod vendored_lora {
+    use std::sync::Arc;
+
+    use candle_core::{Result, Tensor};
+    use candle_transformers::models::lora_hook::{LinearDelta, LoraSlots};
+
+    use crate::lora::{ActiveSet, Proj, SlotKey, SlotTable};
+
+    /// An adapter set installed as a loader's hook.
+    pub(super) struct Hook(pub Arc<ActiveSet>);
+
+    impl std::fmt::Debug for Hook {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_tuple("Hook").field(&self.0.key()).finish()
+        }
+    }
+
+    impl LinearDelta for Hook {
+        fn apply(&self, layer: usize, proj: &'static str, xs: &Tensor, y: Tensor) -> Result<Tensor> {
+            let delta = Proj::from_gguf_name(proj).and_then(|p| crate::lora::slot(self.0.layer(layer), p));
+            match delta {
+                Some(d) => d.apply(xs, y),
+                None => Ok(y),
+            }
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// The set behind an installed hook.
+    pub(super) fn set_of(hook: &Arc<dyn LinearDelta>) -> Option<Arc<ActiveSet>> {
+        hook.as_any().downcast_ref::<Hook>().map(|h| Arc::clone(&h.0))
+    }
+
+    /// The loader's slots as the table adapters are validated against.
+    pub(super) fn table(slots: LoraSlots) -> Option<SlotTable> {
+        let device = slots.device?;
+        let mut table = SlotTable::new(slots.arch, slots.n_layer, device);
+        for s in slots.slots {
+            if let Some(proj) = Proj::from_gguf_name(s.proj) {
+                table.insert(SlotKey::new(s.layer, proj), s.n_out, s.n_in);
+            }
+        }
+        Some(table)
+    }
+
+    /// Refuse a set validated against other weights or on another device.
+    pub(super) fn check(set: &ActiveSet, table: &SlotTable) -> Result<()> {
+        if set.base() != &table.fingerprint() {
+            candle_core::bail!("the LoRA adapters were loaded for a different base model");
+        }
+        if !set.device().same_device(table.device()) {
+            candle_core::bail!(
+                "the LoRA adapters were loaded onto another device ({:?}) than this model's ({:?})",
+                set.device().location(),
+                table.device().location()
+            );
+        }
+        Ok(())
     }
 }

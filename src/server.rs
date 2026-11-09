@@ -224,6 +224,10 @@ pub struct ServerState {
     pub metrics: Arc<ServerMetrics>,
     /// Responses kept for `/v1/responses` (`previous_response_id`, `GET`).
     pub responses: Arc<crate::responses::ResponseStore>,
+    /// Serve vLLM's `/v1/load_lora_adapter` and `/v1/unload_lora_adapter`
+    /// (`--allow-runtime-lora`, vLLM's `VLLM_ALLOW_RUNTIME_LORA_UPDATING`).
+    /// They read any file the server can, so they are off by default.
+    pub allow_runtime_lora: bool,
 }
 
 /// Shared application state handle.
@@ -241,6 +245,7 @@ impl ServerState {
             reasoning_format: ReasoningOutput::default(),
             metrics: Arc::new(ServerMetrics::default()),
             responses: Default::default(),
+            allow_runtime_lora: false,
         }
     }
 
@@ -415,6 +420,17 @@ impl ModelRegistry {
             )));
         }
         Ok(only)
+    }
+
+    /// The loaded model with a LoRA adapter named `name`: its engine and
+    /// the adapter's id.  Names are unique across models (see
+    /// [`crate::lora_api::vllm_load`]).  A model's own id is never an adapter's name here:
+    /// callers look models up first.
+    pub(crate) fn adapter(&self, name: &str) -> Option<(Arc<Engine>, usize)> {
+        let models = self.models.read().unwrap_or_else(|p| p.into_inner());
+        models
+            .iter()
+            .find_map(|m| m.engine.lora_id(name).map(|id| (Arc::clone(&m.engine), id)))
     }
 
     /// The loaded model with exactly this id, if it is loaded.
@@ -1049,6 +1065,67 @@ pub(crate) async fn select_model(
     Ok((model.id, Arc::clone(&model.engine)))
 }
 
+/// What a generation request runs: a loaded model, or (vLLM's
+/// adapter-named models) one of its LoRA adapters on it.
+pub(crate) struct Selected {
+    /// The name to answer under: the model's id, or the adapter's name.
+    pub model: String,
+    pub engine: Arc<Engine>,
+    /// The adapter the request named, which it runs at scale 1 unless it
+    /// sends its own `lora` list.
+    pub adapter: Option<usize>,
+}
+
+impl Selected {
+    /// Run `options` with the named adapter (see [`Self::adapter`]).
+    pub fn apply(&self, options: &mut GenerationOptions) {
+        if let (Some(id), None) = (self.adapter, &options.lora) {
+            options.lora = Some(vec![crate::types::LoraScale { id, scale: 1.0 }]);
+        }
+    }
+}
+
+/// [`select_model`], where the name may also be a loaded LoRA adapter's, as
+/// vLLM serves each adapter as a model of its own.  A model id wins over an
+/// adapter of the same name.
+pub(crate) async fn select_generation(
+    state: &AppState,
+    requested: &str,
+) -> Result<Selected, ApiError> {
+    let name = requested.trim();
+    // A model's id (loaded, or a model-directory model a request may load)
+    // wins over an adapter's name.
+    if let Some((engine, id)) = state.models.adapter(name) {
+        if !names_a_model(state, name).await? {
+            return Ok(Selected {
+                model: name.to_string(),
+                engine,
+                adapter: Some(id),
+            });
+        }
+    }
+    let (model, engine) = select_model(state, requested).await?;
+    Ok(Selected {
+        model,
+        engine,
+        adapter: None,
+    })
+}
+
+/// Whether `name` is a model's id: a loaded model's, or that of a
+/// model-directory file that is a model on its own ([`select_model`] would
+/// load it).  A directory GGUF that is not a model (an adapter, a
+/// projector) reserves no name.  Reads that file's header, off the runtime.
+pub(crate) async fn names_a_model(state: &AppState, name: &str) -> Result<bool, ApiError> {
+    if state.models.loaded(name).is_some() {
+        return Ok(true);
+    }
+    match state.unloaded().into_iter().find(|(id, _)| id == name) {
+        Some((_, path)) => is_model_file(&path).await,
+        None => Ok(false),
+    }
+}
+
 /// Whether `path` is a GGUF model on its own (not an adapter, projector or
 /// importance matrix), read from its header — I/O, so off the async runtime.
 async fn is_model_file(path: &Path) -> Result<bool, ApiError> {
@@ -1268,6 +1345,8 @@ pub fn create_router(state: AppState) -> Router {
             "/lora-adapters",
             get(crate::lora_api::list).post(crate::lora_api::set),
         )
+        .route("/v1/load_lora_adapter", post(crate::lora_api::vllm_load))
+        .route("/v1/unload_lora_adapter", post(crate::lora_api::vllm_unload))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             require_api_key,
@@ -1852,14 +1931,25 @@ async fn worker_info(State(state): State<AppState>) -> Result<Json<WorkerInfo>, 
             })
             .collect(),
         model: first.map(|model| model.id.clone()).unwrap_or_else(|| state.whisper.as_ref().unwrap().model_name().to_string()),
+        // Each LoRA adapter is a model of its own name (vLLM's
+        // adapter-named models), admitted on its base engine's slots.
         models: models
                 .iter()
-                .map(|m| ModelSlots {
-                    id: m.id.clone(),
-                    n_ctx: Some(m.engine.n_ctx()),
-                    max_concurrency: m.engine.max_concurrency(),
-                    in_flight: m.engine.in_flight(),
-                    embeddings: m.engine.supports_embeddings(),
+                .flat_map(|m| {
+                    let slots = |id: String, embeddings, alias_of| ModelSlots {
+                        id,
+                        alias_of,
+                        n_ctx: Some(m.engine.n_ctx()),
+                        max_concurrency: m.engine.max_concurrency(),
+                        in_flight: m.engine.in_flight(),
+                        embeddings,
+                    };
+                    std::iter::once(slots(m.id.clone(), m.engine.supports_embeddings(), None)).chain(
+                        m.engine
+                            .lora_adapters()
+                            .into_iter()
+                            .map(move |a| slots(a.name, false, Some(m.id.clone()))),
+                    )
                 })
                 .collect(),
         n_ctx: first.map_or(0, |model| model.engine.n_ctx()),
@@ -1949,9 +2039,25 @@ pub(crate) async fn embed_prompts(
 /// The `/v1/models` entries: [`ServerState::inventory`], then the Whisper
 /// model.
 async fn model_cards(state: AppState) -> Result<Vec<ModelCard>, ApiError> {
+    // vLLM lists each LoRA adapter as a model whose `parent` is its base.
+    let adapters: Vec<ModelInfo> = state
+        .models
+        .list()
+        .iter()
+        .flat_map(|m| {
+            let base = m.info();
+            m.engine.lora_adapters().into_iter().map(move |a| ModelInfo {
+                id: a.name,
+                path: Some(a.path),
+                parent: Some(base.id.clone()),
+                ..base.clone()
+            })
+        })
+        .collect();
     Ok(inventory(&state)
         .await?
         .into_iter()
+        .chain(adapters)
         .chain(state.whisper_info())
         .map(|model| model.card())
         .collect())
@@ -1983,12 +2089,14 @@ async fn chat_completions(
     headers: HeaderMap,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Result<Response, ApiError> {
-    let (model, engine) = select_model(&state, &req.model).await?;
+    let selected = select_generation(&state, &req.model).await?;
     let stream = req.stream.unwrap_or(false);
-    let defaults = engine.sampling_defaults(SamplingProfile::OpenAi);
+    let defaults = selected.engine.sampling_defaults(SamplingProfile::OpenAi);
     let mut options = req
         .to_generation_options_with(&defaults)
         .map_err(ApiError::bad_request)?;
+    selected.apply(&mut options);
+    let Selected { model, engine, .. } = selected;
     // Answer a request the model cannot serve before a stream starts.
     engine.validate_options(&options).map_err(ApiError::from)?;
     let reasoning_output = req

@@ -2027,6 +2027,7 @@ async fn spawn_two_model_worker() -> (Arc<(AtomicUsize, Notify)>, String) {
             model: "alpha".to_string(),
             models: vec![
                 ModelSlots {
+                    alias_of: None,
                     id: "alpha".to_string(),
                     n_ctx: Some(4096),
                     max_concurrency: 1,
@@ -2034,6 +2035,7 @@ async fn spawn_two_model_worker() -> (Arc<(AtomicUsize, Notify)>, String) {
                     embeddings: true,
                 },
                 ModelSlots {
+                    alias_of: None,
                     id: "beta".to_string(),
                     n_ctx: Some(8192),
                     max_concurrency: 1,
@@ -2131,6 +2133,7 @@ async fn context_fit_uses_each_models_window_and_refreshes_registry() {
     worker.n_ctx.store(64, Ordering::SeqCst);
     *worker.models.lock().unwrap() = vec![
         ModelSlots {
+            alias_of: None,
             id: "alpha".into(),
             n_ctx: Some(64),
             max_concurrency: 1,
@@ -2138,6 +2141,7 @@ async fn context_fit_uses_each_models_window_and_refreshes_registry() {
             embeddings: true,
         },
         ModelSlots {
+            alias_of: None,
             id: "beta".into(),
             n_ctx: Some(8192),
             max_concurrency: 2,
@@ -2178,6 +2182,7 @@ async fn old_secondary_context_is_unknown_not_the_primary_context() {
     worker.n_ctx.store(64, Ordering::SeqCst);
     *worker.models.lock().unwrap() = vec![
         ModelSlots {
+            alias_of: None,
             id: "alpha".into(),
             n_ctx: None,
             max_concurrency: 1,
@@ -2185,6 +2190,7 @@ async fn old_secondary_context_is_unknown_not_the_primary_context() {
             embeddings: true,
         },
         ModelSlots {
+            alias_of: None,
             id: "beta".into(),
             n_ctx: None,
             max_concurrency: 1,
@@ -2338,6 +2344,7 @@ async fn heterogeneous_model_slots_are_independent_of_the_primary_window() {
     worker.n_ctx.store(64, Ordering::SeqCst);
     *worker.models.lock().unwrap() = vec![
         ModelSlots {
+            alias_of: None,
             id: "alpha".into(),
             n_ctx: Some(64),
             max_concurrency: 1,
@@ -2345,6 +2352,7 @@ async fn heterogeneous_model_slots_are_independent_of_the_primary_window() {
             embeddings: true,
         },
         ModelSlots {
+            alias_of: None,
             id: "beta".into(),
             n_ctx: Some(8192),
             max_concurrency: 2,
@@ -2640,7 +2648,7 @@ async fn embedding_subbatches_do_not_overload_their_own_zero_depth_queue() {
 async fn whole_audio_has_its_own_slot_and_does_not_block_embeddings() {
     let (worker, url) = spawn_fake("worker", "m", 1, Behavior::Hang).await;
     worker.transcriptions.store(true, Ordering::SeqCst);
-    *worker.models.lock().unwrap() = vec![ModelSlots { id: "m".to_string(), n_ctx: Some(4096),
+    *worker.models.lock().unwrap() = vec![ModelSlots { alias_of: None, id: "m".to_string(), n_ctx: Some(4096),
         max_concurrency: 1, in_flight: 0, embeddings: true }];
     enable_embedding_jobs(&worker, Some("weights"));
     let (coordinator, router) = spawn_router(config(&[&url])).await;
@@ -2753,7 +2761,7 @@ async fn embedding_limits_ignore_unhealthy_and_ineligible_cached_owners() {
         other.embedding_jobs.lock().unwrap()[0].max_input_bytes = 1;
         other.embedding_jobs.lock().unwrap()[0].max_inputs = 1;
         if !unhealthy {
-            *other.models.lock().unwrap() = vec![ModelSlots { id: "m".to_string(), n_ctx: Some(4096),
+            *other.models.lock().unwrap() = vec![ModelSlots { alias_of: None, id: "m".to_string(), n_ctx: Some(4096),
                 max_concurrency: 2, in_flight: 0, embeddings: false }];
         }
         let (coordinator, router) = spawn_router(config(&[&healthy_url, &other_url])).await;
@@ -3032,4 +3040,42 @@ async fn prompt_cache_key_keys_requests_that_name_no_model() {
     assert_eq!(coordinator.affinity_stats().entries, 1);
     affinity_request(&router, None, "alice", &keyed("team-b")).await;
     assert_eq!(coordinator.affinity_stats().entries, 2);
+}
+
+#[tokio::test]
+async fn adapter_aliases_share_their_base_models_slots() {
+    let (worker, url) = spawn_fake("alias", "alpha", 1, Behavior::Gate).await;
+    let slots = |id: &str, alias_of: Option<&str>| ModelSlots {
+        alias_of: alias_of.map(Into::into),
+        id: id.into(),
+        n_ctx: None,
+        max_concurrency: 1,
+        in_flight: 0,
+        embeddings: false,
+    };
+    *worker.models.lock().unwrap() = vec![slots("alpha", None), slots("style", Some("alpha"))];
+    let mut cfg = config(&[&url]);
+    cfg.queue_depth = 0;
+    let (_coordinator, router) = spawn_router(cfg).await;
+
+    let held = tokio::spawn({
+        let router = router.clone();
+        async move { chat(&router, json!({"model": "alpha", "messages": []})).await }
+    });
+    eventually("alpha running", || worker.active.load(Ordering::SeqCst) == 1).await;
+    // The adapter runs on alpha's engine, whose one slot is taken.
+    let res = chat(&router, json!({"model": "style", "messages": []})).await;
+    assert_eq!(res.status, StatusCode::TOO_MANY_REQUESTS, "{}", res.text());
+    assert_eq!(worker.received.load(Ordering::SeqCst), 1);
+    worker.release.notify_waiters();
+    assert_eq!(held.await.unwrap().status, StatusCode::OK);
+
+    // An alias is not a second model: a request naming none still routes.
+    let unnamed = tokio::spawn({
+        let router = router.clone();
+        async move { chat(&router, json!({"messages": []})).await }
+    });
+    eventually("unnamed running", || worker.active.load(Ordering::SeqCst) == 1).await;
+    worker.release.notify_waiters();
+    assert_eq!(unnamed.await.unwrap().status, StatusCode::OK);
 }

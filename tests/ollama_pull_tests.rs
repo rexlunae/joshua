@@ -50,6 +50,7 @@ fn server(dir: &std::path::Path, allow_private: bool) -> Router {
         reasoning_format: Default::default(),
         metrics: Arc::new(joshua::server::ServerMetrics::default()),
         responses: Default::default(),
+        allow_runtime_lora: false,
     }))
 }
 

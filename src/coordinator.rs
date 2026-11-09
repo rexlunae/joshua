@@ -193,6 +193,11 @@ pub struct WorkerInfo {
 pub struct ModelSlots {
     /// The model's id.
     pub id: String,
+    /// For a LoRA adapter served as a model of its own name, the model
+    /// whose engine runs it.  An alias shares that model's slots (its
+    /// figures are the engine's) and is not an independent model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias_of: Option<String>,
     /// This model's loaded context window; absent on older workers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub n_ctx: Option<u32>,
@@ -234,6 +239,27 @@ impl WorkerInfo {
     fn slots_of(&self, model: Option<&str>) -> Option<&ModelSlots> {
         let model = model.unwrap_or(&self.model);
         self.models.iter().find(|s| s.id == model)
+    }
+
+    /// The model whose engine admits `model`'s requests: its own id, or
+    /// the base model of an adapter alias.
+    fn engine_of<'a>(&'a self, model: &'a str) -> &'a str {
+        self.models
+            .iter()
+            .find(|s| s.id == model)
+            .and_then(|s| s.alias_of.as_deref())
+            .unwrap_or(model)
+    }
+
+    /// The ids sharing `model`'s engine: the base model and its aliases.
+    fn sharing<'a>(&'a self, model: &'a str) -> impl Iterator<Item = &'a str> + 'a {
+        let engine = self.engine_of(model);
+        std::iter::once(engine).chain(
+            self.models
+                .iter()
+                .filter(move |s| s.alias_of.as_deref() == Some(engine))
+                .map(|s| s.id.as_str()),
+        )
     }
 
     fn context_of(&self, model: &str) -> Option<u32> {
@@ -709,14 +735,11 @@ impl Coordinator {
             let generation = w.dispatch_generation.load(Ordering::Acquire);
             let before = w.dispatched.load(Ordering::Acquire);
             let audio_before = w.audio_dispatched.load(Ordering::Acquire);
-            let mut ours_by_model = w.by_model().clone();
+            let by_model_before = w.by_model().clone();
             let result = self.probe(w).await;
             let after = w.dispatched.load(Ordering::Acquire);
             let audio_after = w.audio_dispatched.load(Ordering::Acquire);
-            for (model, n) in w.by_model().iter() {
-                let ours = ours_by_model.entry(model.clone()).or_default();
-                *ours = (*ours).max(*n);
-            }
+            let ours_by_model = (by_model_before, w.by_model().clone());
             let ours = before.saturating_sub(audio_before).max(after.saturating_sub(audio_after));
             (w, result, ours, audio_probe_epoch, ours_by_model, generation)
         });
@@ -759,7 +782,18 @@ impl Coordinator {
                         .models
                         .iter()
                         .map(|m| {
-                            let ours = ours_by_model.get(&m.id).copied().unwrap_or(0);
+                            // An adapter alias reports its engine's figures,
+                            // so ours on that engine is every id sharing it,
+                            // summed within one snapshot (before or after the
+                            // probe) so a handoff between names is not
+                            // counted twice.
+                            let in_snapshot = |snapshot: &HashMap<String, usize>| {
+                                info.sharing(&m.id)
+                                    .map(|id| snapshot.get(id).copied().unwrap_or(0))
+                                    .sum::<usize>()
+                            };
+                            let ours = in_snapshot(&ours_by_model.0)
+                                .max(in_snapshot(&ours_by_model.1));
                             (m.id.clone(), m.in_flight.saturating_sub(ours))
                         })
                         .collect();
@@ -932,7 +966,10 @@ impl Coordinator {
             };
             if (!is_audio(path)
                 && model.is_none()
-                && info.models.iter().any(|slots| slots.id != info.model))
+                && info
+                    .models
+                    .iter()
+                    .any(|slots| slots.alias_of.is_none() && slots.id != info.model))
                 || model.is_some_and(|m| !info.model_ids().any(|id| id == m))
                 || !info.capabilities.serves(path)
                 || (path == "/v1/embeddings" && own.is_some_and(|s| !s.embeddings))
@@ -974,8 +1011,14 @@ impl Coordinator {
                     }
                     (
                         s.max_concurrency.max(1),
-                        w.by_model().get(&s.id).copied().unwrap_or(0)
-                            + st.external_by_model.get(&s.id).copied().unwrap_or(0),
+                        {
+                            // A base model and its adapter aliases share
+                            // one engine's slots.
+                            let ours = w.by_model();
+                            info.sharing(&s.id)
+                                .map(|id| ours.get(id).copied().unwrap_or(0))
+                                .sum::<usize>()
+                        } + st.external_by_model.get(&s.id).copied().unwrap_or(0),
                     )
                 }
                 None => (self.slots_for(info), worker_load),
@@ -983,13 +1026,12 @@ impl Coordinator {
             if load >= slots {
                 continue;
             }
-            let local_work = w
-                .work_by_model
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .get(selected_model)
-                .copied()
-                .unwrap_or(0);
+            let local_work: u64 = {
+                let work = w.work_by_model.lock().unwrap_or_else(|p| p.into_inner());
+                info.sharing(selected_model)
+                    .map(|id| work.get(id).copied().unwrap_or(0))
+                    .sum()
+            };
             let external = if own.is_some() {
                 st.external_by_model
                     .get(selected_model)
