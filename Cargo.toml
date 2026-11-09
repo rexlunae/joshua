@@ -50,7 +50,11 @@ path = "src/lib.rs"
 
 [features]
 sycl = ["candle-core/sycl", "candle-nn/sycl"]
-default = []
+default = ["pull"]
+# `ollama pull` from registry.ollama.ai (and other registries speaking its
+# protocol, such as hf.co) and from https:// URLs, over rustls.  Off, the
+# pull route answers 501.
+pull = ["dep:ureq"]
 # GPU acceleration. CPU inference stays pure Rust; enabling one of these
 # pulls in the corresponding candle backend (CUDA needs the NVIDIA toolkit
 # at build time, Metal is macOS-only).
@@ -184,6 +188,7 @@ tokio-stream = "0.1"
 # HTTP/1 client for `joshua route` (request-level routing to independent
 # workers).  Already in the tree through axum; only the client half is added.
 hyper = { version = "1", features = ["client", "http1"] }
+ureq = { version = "2.12", optional = true }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 

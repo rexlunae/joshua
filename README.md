@@ -392,12 +392,12 @@ registry:
 | Anthropic | `POST /v1/messages`, `POST /v1/messages/count_tokens` |
 | llama.cpp (`llama-server`) | `GET /health` (also `/v1/health`), `GET /props`, `GET /slots`, `GET /metrics`, `POST /tokenize`, `POST /detokenize`, `POST /chat/completions` |
 | vLLM | `GET /load`, `GET /ping`, `GET /version`, `GET /metrics`, `POST /v1/tokenize`, `POST /v1/detokenize`, `POST /v1/score`, `POST /v1/rerank` (also `/rerank`, `/v2/rerank` and llama-server's `/reranking`) |
-| Ollama | `HEAD /` heartbeat, `/api/chat`, `/api/generate`, `/api/embed` (and `/api/embeddings`), `/api/tags`, `/api/ps`, `/api/show`, `/api/version`, `/api/tokens`, and model management (`/api/delete`, `/api/copy`, `/api/create`) against the model directory |
+| Ollama | `HEAD /` heartbeat, `/api/chat`, `/api/generate`, `/api/embed` (and `/api/embeddings`), `/api/tags`, `/api/ps`, `/api/show`, `/api/version`, `/api/tokens`, and model management (`/api/pull`, `/api/blobs`, `/api/create`, `/api/delete`, `/api/copy`) against the model directory |
 | joshua | `POST /v1/models/load`, `POST /v1/models/unload`, `GET /v1/worker/info`, `GET /status`, `GET /metrics/json` |
 
 [docs/client-compatibility.md](docs/client-compatibility.md) records what
-each route supports and what it does not (for example Ollama's registry
-`pull`).  The sections below cover the OpenAI and Anthropic routes in detail.
+each route supports and what it does not (for example Ollama's Modelfile
+settings).  The sections below cover the OpenAI and Anthropic routes in detail.
 
 ### `POST /v1/chat/completions`
 

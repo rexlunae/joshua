@@ -547,6 +547,10 @@ pub struct ModelManager {
     pub npu_backend: Option<Arc<dyn crate::npu::NpuBackend>>,
     pub max_concurrency: Option<usize>,
     pub max_output_tokens: Option<u32>,
+    /// Whether Ollama's `/api/pull` may fetch from this host, its private
+    /// networks and link-local addresses (`--allow-private-pull`); off, it
+    /// reaches public addresses only.
+    pub allow_private_pull: bool,
     /// Workers started without a model that this controller may place
     /// models on.
     #[cfg(feature = "distributed")]
@@ -1242,7 +1246,13 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/delete", delete(crate::ollama::delete))
         .route("/api/copy", post(crate::ollama::copy))
         .route("/api/create", post(crate::ollama::create))
-        .route("/api/pull", post(crate::ollama::pull))
+        .route("/api/pull", post(crate::ollama_pull::pull))
+        .route(
+            "/api/blobs/{digest}",
+            axum::routing::head(crate::ollama_pull::blob_exists)
+                .post(crate::ollama_pull::upload_blob)
+                .layer(axum::extract::DefaultBodyLimit::disable()),
+        )
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             require_api_key,
