@@ -2266,3 +2266,219 @@ async fn chat_tool_choice_must_name_an_offered_tool() {
         assert!(text.contains(needle), "{text}");
     }
 }
+
+// ─── OpenAI Responses API ────────────────────────────────────────────────────
+
+/// `POST` `body` to `/v1/responses` (or another path), answering status and
+/// body text.
+async fn call(
+    app: &axum::Router,
+    method: &str,
+    uri: &str,
+    body: Option<serde_json::Value>,
+) -> (StatusCode, String) {
+    let req = match body {
+        Some(body) => post_json(uri, None, body),
+        None => Request::builder().method(method).uri(uri).body(Body::empty()).unwrap(),
+    };
+    let res = app.clone().oneshot(req).await.unwrap();
+    let status = res.status();
+    (status, body_text(res).await)
+}
+
+/// The text of a response's message items.
+fn output_text(response: &serde_json::Value) -> String {
+    response["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| item["type"] == "message")
+        .flat_map(|item| item["content"].as_array().unwrap().iter())
+        .filter_map(|part| part["text"].as_str())
+        .collect()
+}
+
+#[tokio::test]
+async fn responses_answer_store_continue_and_stream() {
+    let app = create_router(tiny_state("server-responses", None));
+    let json = |text: &str| -> serde_json::Value { serde_json::from_str(text).unwrap() };
+    let request = serde_json::json!({
+        "model": "model", "input": "a b", "max_output_tokens": 6, "temperature": 0.0,
+        "metadata": {"k": "v"},
+    });
+
+    let (status, body) = call(&app, "POST", "/v1/responses", Some(request.clone())).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let first = json(&body);
+    let id = first["id"].as_str().unwrap().to_string();
+    assert!(id.starts_with("resp_"), "{body}");
+    assert_eq!(first["object"], "response");
+    assert!(matches!(first["status"].as_str(), Some("completed" | "incomplete")), "{body}");
+    assert_eq!(first["metadata"], serde_json::json!({"k": "v"}));
+    assert_eq!(first["store"], true);
+    let message = first["output"].as_array().unwrap().last().unwrap();
+    assert_eq!(message["type"], "message");
+    assert_eq!(message["role"], "assistant");
+    assert_eq!(message["content"][0]["type"], "output_text");
+    let usage = &first["usage"];
+    assert!(usage["input_tokens"].as_u64().unwrap() > 0, "{body}");
+    assert_eq!(
+        usage["total_tokens"].as_u64().unwrap(),
+        usage["input_tokens"].as_u64().unwrap() + usage["output_tokens"].as_u64().unwrap()
+    );
+
+    // Stored: fetched as returned.
+    let (status, body) = call(&app, "GET", &format!("/v1/responses/{id}"), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(json(&body), first);
+
+    // Continued: the earlier turn and its answer come first.
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/v1/responses",
+        Some(serde_json::json!({
+            "model": "model", "previous_response_id": id, "instructions": "be brief",
+            "input": [{"role": "user", "content": "c"}], "max_output_tokens": 2,
+            "temperature": 0.0,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let second = json(&body);
+    assert_eq!(second["previous_response_id"], id.as_str());
+    assert!(
+        second["usage"]["input_tokens"].as_u64() > first["usage"]["input_tokens"].as_u64(),
+        "{body}"
+    );
+    let second_id = second["id"].as_str().unwrap();
+    let (status, body) = call(
+        &app,
+        "GET",
+        &format!("/v1/responses/{second_id}/input_items?order=asc"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let items = json(&body);
+    let data = items["data"].as_array().unwrap();
+    let roles: Vec<&str> = data.iter().map(|i| i["role"].as_str().unwrap_or("")).collect();
+    assert_eq!(roles.last(), Some(&"user"), "{body}");
+    assert_eq!(roles.first(), Some(&"user"), "{body}");
+    assert!(roles.contains(&"assistant"), "{body}");
+    assert!(data.iter().all(|i| i["id"].is_string()), "{body}");
+    assert_eq!(items["first_id"], data[0]["id"]);
+    assert_eq!(items["has_more"], false);
+    // Newest first by default, a page at a time.
+    let (_, body) = call(
+        &app,
+        "GET",
+        &format!("/v1/responses/{second_id}/input_items?limit=1"),
+        None,
+    )
+    .await;
+    let page = json(&body);
+    assert_eq!(page["data"][0]["id"], data.last().unwrap()["id"]);
+    assert_eq!(page["has_more"], true);
+
+    // Streamed: typed events in order, the same text, stored at the end.
+    let mut streaming = request.clone();
+    streaming["stream"] = serde_json::json!(true);
+    let (status, body) = call(&app, "POST", "/v1/responses", Some(streaming)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let events = sse_chunks(&body);
+    let names: Vec<&str> = events.iter().map(|e| e["type"].as_str().unwrap()).collect();
+    assert_eq!(&names[..2], ["response.created", "response.in_progress"], "{body}");
+    assert!(matches!(
+        names.last(),
+        Some(&("response.completed" | "response.incomplete"))
+    ));
+    for (i, event) in events.iter().enumerate() {
+        assert_eq!(event["sequence_number"], i, "{body}");
+    }
+    assert!(body.contains("event: response.output_text.delta"), "{body}");
+    let streamed: String = events
+        .iter()
+        .filter(|e| e["type"] == "response.output_text.delta")
+        .map(|e| e["delta"].as_str().unwrap())
+        .collect();
+    let last = &events.last().unwrap()["response"];
+    assert_eq!(streamed, output_text(last), "{body}");
+    assert_eq!(output_text(last), output_text(&first), "greedy: the same answer");
+    let streamed_id = last["id"].as_str().unwrap();
+    let (status, _) = call(&app, "GET", &format!("/v1/responses/{streamed_id}"), None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // `store: false` keeps nothing.
+    let mut unstored = request.clone();
+    unstored["store"] = serde_json::json!(false);
+    let (_, body) = call(&app, "POST", "/v1/responses", Some(unstored)).await;
+    let unstored_id = json(&body)["id"].as_str().unwrap().to_string();
+    let (status, _) = call(&app, "GET", &format!("/v1/responses/{unstored_id}"), None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Deleted once.
+    let (status, body) = call(&app, "DELETE", &format!("/v1/responses/{id}"), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(json(&body)["deleted"], true);
+    let (status, _) = call(&app, "GET", &format!("/v1/responses/{id}"), None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = call(&app, "DELETE", &format!("/v1/responses/{id}"), None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = call(&app, "POST", &format!("/v1/responses/{second_id}/cancel"), Some(serde_json::json!({}))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Refused rather than ignored.
+    for (extra, needle) in [
+        (serde_json::json!({"background": true}), "background"),
+        (serde_json::json!({"tools": [{"type": "web_search"}]}), "web_search"),
+        (serde_json::json!({"previous_response_id": "resp_gone"}), "resp_gone"),
+        (serde_json::json!({"truncation": "auto"}), "truncation"),
+        (serde_json::json!({"conversation": "conv_1"}), "conversation"),
+        (serde_json::json!({"input": [{"type": "item_reference", "id": "x"}]}), "item_reference"),
+        (
+            serde_json::json!({"text": {"format": {"type": "json_schema", "name": "a"}}}),
+            "schema",
+        ),
+    ] {
+        let mut body = request.clone();
+        body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        let (status, text) = call(&app, "POST", "/v1/responses", Some(body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{extra}: {text}");
+        assert!(text.contains(needle), "{extra}: {text}");
+    }
+}
+
+#[tokio::test]
+async fn responses_report_reasoning_as_its_own_item() {
+    let app = create_router(think_state("server-responses-think"));
+    let json = |text: &str| -> serde_json::Value { serde_json::from_str(text).unwrap() };
+    // Cut off inside the reasoning the template opens.
+    let request = serde_json::json!({
+        "model": "model", "input": "a b", "max_output_tokens": 1, "temperature": 0.0,
+    });
+    let (status, body) = call(&app, "POST", "/v1/responses", Some(request.clone())).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let response = json(&body);
+    assert_eq!(response["status"], "incomplete", "{body}");
+    assert_eq!(response["incomplete_details"]["reason"], "max_output_tokens");
+    let reasoning = &response["output"][0];
+    assert_eq!(reasoning["type"], "reasoning", "{body}");
+    let text = reasoning["content"][0]["text"].as_str().unwrap().to_string();
+    assert!(!text.is_empty(), "{body}");
+
+    let mut streaming = request;
+    streaming["stream"] = serde_json::json!(true);
+    let (status, body) = call(&app, "POST", "/v1/responses", Some(streaming)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let events = sse_chunks(&body);
+    let streamed: String = events
+        .iter()
+        .filter(|e| e["type"] == "response.reasoning_text.delta")
+        .map(|e| e["delta"].as_str().unwrap())
+        .collect();
+    assert_eq!(streamed, text, "{body}");
+    let last = events.last().unwrap();
+    assert_eq!(last["type"], "response.incomplete", "{body}");
+    assert_eq!(last["response"]["output"][0]["content"][0]["text"], text.as_str());
+}

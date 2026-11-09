@@ -1061,6 +1061,7 @@ async fn main() -> anyhow::Result<()> {
                 cors_origins: cors_origin,
                 reasoning_format,
                 metrics: Arc::new(server::ServerMetrics::default()),
+                responses: Default::default(),
             });
             match (tls_cert, tls_key) {
                 (Some(cert), Some(key)) => {

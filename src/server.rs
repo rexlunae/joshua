@@ -222,6 +222,8 @@ pub struct ServerState {
     pub reasoning_format: ReasoningOutput,
     /// Ops counters.
     pub metrics: Arc<ServerMetrics>,
+    /// Responses kept for `/v1/responses` (`previous_response_id`, `GET`).
+    pub responses: Arc<crate::responses::ResponseStore>,
 }
 
 /// Shared application state handle.
@@ -238,6 +240,7 @@ impl ServerState {
             cors_origins: Vec::new(),
             reasoning_format: ReasoningOutput::default(),
             metrics: Arc::new(ServerMetrics::default()),
+            responses: Default::default(),
         }
     }
 
@@ -1172,6 +1175,14 @@ pub fn create_router(state: AppState) -> Router {
         // llama-server also serves its OpenAI routes without the `/v1`.
         .route("/chat/completions", post(chat_completions))
         .route("/v1/messages", post(messages))
+        .route("/v1/responses", post(crate::responses::create))
+        .route("/responses", post(crate::responses::create))
+        .route(
+            "/v1/responses/{id}",
+            get(crate::responses::retrieve).delete(crate::responses::delete),
+        )
+        .route("/v1/responses/{id}/input_items", get(crate::responses::input_items))
+        .route("/v1/responses/{id}/cancel", post(crate::responses::cancel))
         .route("/v1/messages/count_tokens", post(messages_count_tokens))
         .route("/v1/completions", post(crate::completions::completions))
         .route("/completion", post(crate::llama_server::completion))
