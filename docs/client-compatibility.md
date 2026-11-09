@@ -172,7 +172,7 @@ layers are skipped with a status line saying so.  An `https://` URL ending in
 newline-delimited status lines (`stream: false` answers once, at the end).
 Interrupted downloads start again rather than resuming.
 
-A pull connects to public addresses only: a name that resolves to this host,
+A pull connects to public addresses only: a name that resolves to one of this host's own addresses (public ones included),
 a private network or a link-local address (checked at every connection,
 redirects included) is refused, so the route cannot be used to reach
 services behind the server.  Start the server with `--allow-private-pull`

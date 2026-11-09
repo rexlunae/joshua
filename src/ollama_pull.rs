@@ -324,7 +324,13 @@ fn is_public(ip: std::net::IpAddr) -> bool {
                 || v4.is_multicast()
                 || a == 0
                 // Carrier-grade NAT, 100.64.0.0/10.
-                || (a == 100 && (64..128).contains(&b)))
+                || (a == 100 && (64..128).contains(&b))
+                // IETF protocol assignments, 192.0.0.0/24.
+                || (a == 192 && b == 0 && v4.octets()[2] == 0)
+                // Benchmarking, 198.18.0.0/15, often routed internally.
+                || (a == 198 && (b & 0xfe) == 18)
+                // Reserved, 240.0.0.0/4.
+                || a >= 240)
         }
         IpAddr::V6(v6) => {
             if let Some(v4) = v6.to_ipv4_mapped() {
@@ -334,11 +340,20 @@ fn is_public(ip: std::net::IpAddr) -> bool {
             !(v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_multicast()
-                // Unique local fc00::/7 and link-local fe80::/10.
+                // Unique local fc00::/7, link-local fe80::/10 and the
+                // deprecated site-local fec0::/10.
                 || (first & 0xfe00) == 0xfc00
-                || (first & 0xffc0) == 0xfe80)
+                || (first & 0xffc0) == 0xfe80
+                || (first & 0xffc0) == 0xfec0)
         }
     }
+}
+
+/// Whether `ip` is one of this host's own addresses (a public one
+/// included), where services the firewall keeps from other hosts may
+/// listen: an address a socket can bind to is.
+fn is_own_address(ip: std::net::IpAddr) -> bool {
+    std::net::UdpSocket::bind((ip, 0)).is_ok()
 }
 
 /// The HTTP client a pull uses.  Unless `allow_private`, names are
@@ -352,7 +367,11 @@ fn agent(allow_private: bool) -> ureq::Agent {
         builder = builder.resolver(|netloc: &str| -> std::io::Result<Vec<std::net::SocketAddr>> {
             use std::net::ToSocketAddrs;
             let addrs: Vec<_> = netloc.to_socket_addrs()?.collect();
-            let public: Vec<_> = addrs.iter().copied().filter(|a| is_public(a.ip())).collect();
+            let public: Vec<_> = addrs
+                .iter()
+                .copied()
+                .filter(|a| is_public(a.ip()) && !is_own_address(a.ip()))
+                .collect();
             if public.is_empty() && !addrs.is_empty() {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
@@ -746,12 +765,15 @@ mod tests {
     #[test]
     fn only_public_addresses_are_public() {
         for ip in ["127.0.0.1", "10.1.2.3", "192.168.0.9", "172.20.0.1", "169.254.169.254",
-                   "100.100.0.1", "0.0.0.0", "::1", "fd00::1", "fe80::1", "::ffff:10.0.0.1"] {
+                   "100.100.0.1", "0.0.0.0", "::1", "fd00::1", "fe80::1", "::ffff:10.0.0.1",
+                   "198.18.0.1", "198.19.255.1", "192.0.0.8", "240.0.0.1", "fec0::1"] {
             assert!(!is_public(ip.parse().unwrap()), "{ip}");
         }
-        for ip in ["1.1.1.1", "104.21.0.1", "2606:4700::1111"] {
+        for ip in ["1.1.1.1", "104.21.0.1", "198.20.0.1", "2606:4700::1111"] {
             assert!(is_public(ip.parse().unwrap()), "{ip}");
         }
+        assert!(is_own_address("127.0.0.1".parse().unwrap()));
+        assert!(!is_own_address("1.1.1.1".parse().unwrap()));
     }
 
     #[test]
