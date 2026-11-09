@@ -1626,6 +1626,8 @@ struct DecodeOutcome {
     stop_token: Option<u32>,
     /// Every generated token, in order.
     token_ids: Vec<u32>,
+    /// Each generated token's log-probability, when the request asked.
+    logprobs: Vec<crate::types::TokenLogprob>,
     reasoning_tokens: Option<u32>,
 }
 
@@ -1715,6 +1717,9 @@ pub struct Completion {
     /// Generated tokens inside the model's reasoning, for models whose
     /// reasoning is tagged.
     pub reasoning_tokens: Option<u32>,
+    /// Each generated token's log-probability, when
+    /// [`GenerationOptions::logprobs`] asked for them.
+    pub logprobs: Vec<crate::types::TokenLogprob>,
 }
 
 impl Completion {
@@ -1742,6 +1747,7 @@ impl Completion {
             token_ids: Vec::new(),
             reasoning_open: false,
             reasoning_tokens: None,
+            logprobs: Vec::new(),
         }
     }
 
@@ -3659,6 +3665,17 @@ impl Engine {
             .map_err(|e| JoshuaError::Tokenization(e.to_string()))
     }
 
+    /// One token's bytes on its own, out of context (a logprob entry's
+    /// `token` and `bytes`): byte-fallback and byte-level tokens give
+    /// their byte, a word-initial marker gives its space, and a special
+    /// token gives its name.
+    pub fn token_piece(&self, id: u32) -> Vec<u8> {
+        self.tokenizer
+            .id_to_token(id)
+            .map(|token| token_bytes(&token))
+            .unwrap_or_default()
+    }
+
     /// Each token's piece: the bytes it adds to the decoded text
     /// (llama-server's `/tokenize` `with_pieces`).  A piece is decoded in
     /// the context of the few tokens before it, so a word-initial space
@@ -4563,6 +4580,7 @@ impl Engine {
             token_ids: outcome.token_ids,
             reasoning_open,
             reasoning_tokens: outcome.reasoning_tokens,
+            logprobs: outcome.logprobs,
         }
     }
 
@@ -5185,6 +5203,9 @@ impl Engine {
         });
         let mut forced: std::collections::VecDeque<u32> = std::collections::VecDeque::new();
         let mut fed_tokens: Vec<u32> = Vec::new();
+        // Asked-for log-probabilities; their requests decode plainly, so
+        // every token comes from `logits_vec` below.
+        let mut logprobs = Vec::new();
         let mut n_cur = start_pos;
         let decode_start = Instant::now();
         // Which configured stop sequence ended generation, if any.
@@ -5331,6 +5352,15 @@ impl Engine {
                 matcher.consume_token(next_token).map_err(|e| {
                     JoshuaError::Inference(format!("constrained decoding: {e}"))
                 })?;
+            }
+            // Recorded before the token's text is released, so a streaming
+            // caller finds it with that text.
+            if let Some(top) = options.logprobs {
+                let entry = token_logprob(&logits_vec, next_token, top);
+                if let Some(sink) = &options.logprob_sink {
+                    sink.push(entry.clone());
+                }
+                logprobs.push(entry);
             }
             let stopped = self.emit_token(&mut text, next_token, options)?;
             sampler.accept(next_token);
@@ -5547,6 +5577,7 @@ impl Engine {
             stop_type,
             stop_token,
             token_ids: text.decoded_ids,
+            logprobs,
             reasoning_tokens: reasoning.map(|r| r.count),
         })
     }
@@ -8221,6 +8252,43 @@ pub fn find_gguf_in_dir(dir: &Path) -> Result<PathBuf> {
 /// The bytes a vocabulary entry stands for: SentencePiece's `<0xNN>` byte
 /// tokens and `▁` spaces, GPT-2 byte-level characters, or the entry's own
 /// text.
+/// `token`'s log-probability under `logits` (a log-softmax of the raw
+/// logits), with the `top` likeliest tokens, most likely first.
+fn token_logprob(logits: &[f32], token: u32, top: u32) -> crate::types::TokenLogprob {
+    let max = logits
+        .iter()
+        .copied()
+        .filter(|v| v.is_finite())
+        .fold(f32::NEG_INFINITY, f32::max);
+    let sum: f64 = logits
+        .iter()
+        .filter(|v| v.is_finite())
+        .map(|&v| ((v - max) as f64).exp())
+        .sum();
+    let lse = max + sum.ln() as f32;
+    let logprob = |id: usize| match logits.get(id) {
+        Some(v) if v.is_finite() => v - lse,
+        _ => f32::NEG_INFINITY,
+    };
+    let k = top.min(crate::types::MAX_TOP_LOGPROBS) as usize;
+    let mut best: Vec<(u32, f32)> = Vec::with_capacity(k + 1);
+    if k > 0 {
+        for (id, &v) in logits.iter().enumerate() {
+            if !v.is_finite() || (best.len() == k && v <= best[k - 1].1) {
+                continue;
+            }
+            let at = best.partition_point(|&(_, b)| b >= v);
+            best.insert(at, (id as u32, v));
+            best.truncate(k);
+        }
+    }
+    crate::types::TokenLogprob {
+        token,
+        logprob: logprob(token as usize),
+        top: best.into_iter().map(|(id, v)| (id, v - lse)).collect(),
+    }
+}
+
 fn token_bytes(token: &str) -> Vec<u8> {
     if let Some(byte) = token
         .strip_prefix("<0x")
@@ -10237,6 +10305,20 @@ mod tests {
     /// character must be a genuine GPT-2 byte-unicode table entry — a
     /// character outside the table passes through decoding untouched and
     /// would make the fixture lie about what decoders produce.
+    #[test]
+    fn token_logprob_is_a_log_softmax_with_the_likeliest_alternatives() {
+        let logits = [1.0f32, 3.0, f32::NEG_INFINITY, 2.0, f32::NAN];
+        let entry = token_logprob(&logits, 0, 2);
+        let lse = (1f32.exp() + 3f32.exp() + 2f32.exp()).ln();
+        assert!((entry.logprob - (1.0 - lse)).abs() < 1e-5);
+        assert_eq!(entry.top.iter().map(|t| t.0).collect::<Vec<_>>(), [1, 3]);
+        assert!((entry.top[0].1 - (3.0 - lse)).abs() < 1e-5);
+        assert!(token_logprob(&logits, 2, 0).logprob.is_infinite());
+        assert!(token_logprob(&logits, 0, 0).top.is_empty());
+        // More alternatives than finite logits: just the finite ones.
+        assert_eq!(token_logprob(&logits, 0, 20).top.len(), 3);
+    }
+
     #[test]
     fn token_bytes_read_every_vocabulary_spelling() {
         assert_eq!(token_bytes("<0xE2>"), [0xE2]);

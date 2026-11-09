@@ -1966,8 +1966,12 @@ async fn chat_completions(
         .flatten()
         .map(|m| m.content.clone());
 
+    let wants_logprobs = options.logprobs.is_some();
     if stream {
         // ── Streaming path ────────────────────────────────────────────────────
+        if wants_logprobs {
+            options.logprob_sink = Some(Default::default());
+        }
         let id = format!("chatcmpl-{}", Uuid::new_v4().simple());
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let cancel = CancelOnDrop::new();
@@ -2079,6 +2083,8 @@ async fn chat_completions(
                 tool_calls,
             },
             finish_reason: finish_reason.to_string(),
+            logprobs: wants_logprobs
+                .then(|| crate::logprobs::chat(&engine, &completion.logprobs)),
         }],
         completion.usage.clone(),
     );
@@ -2272,14 +2278,17 @@ pub(crate) fn chat_answer(
 }
 
 /// Writes OpenAI streaming chunks to the SSE channel.
-struct ChatStreamEmitter {
+struct ChatStreamEmitter<'e> {
     id: String,
     model: String,
     tx: tokio::sync::mpsc::UnboundedSender<String>,
     role_sent: bool,
+    /// Where the decode loop leaves the tokens' log-probabilities, when the
+    /// request asked; each chunk carries those of the text it sends.
+    logprobs: Option<(&'e Engine, crate::types::LogprobSink)>,
 }
 
-impl ChatStreamEmitter {
+impl<'e> ChatStreamEmitter<'e> {
     fn new(
         id: String,
         model: String,
@@ -2290,6 +2299,7 @@ impl ChatStreamEmitter {
             model,
             tx,
             role_sent: false,
+            logprobs: None,
         }
     }
 
@@ -2399,6 +2409,12 @@ impl ChatStreamEmitter {
         let chunk =
             ChatCompletionChunk::new(self.id.clone(), self.model.clone(), delta, finish_reason);
         let mut value = serde_json::to_value(&chunk).unwrap_or_default();
+        if let Some((engine, sink)) = &self.logprobs {
+            let entries = sink.take();
+            if !entries.is_empty() {
+                value["choices"][0]["logprobs"] = crate::logprobs::chat(engine, &entries);
+            }
+        }
         if let Some(usage) = usage {
             value["usage"] = serde_json::to_value(usage).unwrap_or_default();
         }
@@ -2432,6 +2448,7 @@ fn stream_chat_completion(
     metrics: &ServerMetrics,
 ) {
     let mut emitter = ChatStreamEmitter::new(id.to_string(), model.to_string(), tx);
+    emitter.logprobs = options.logprob_sink.clone().map(|sink| (engine, sink));
     let show_reasoning = output.reasoning != ReasoningOutput::Hidden;
     if let Some(prefix) = &output.echo {
         emitter.text(prefix);

@@ -172,6 +172,45 @@ impl ChatMessage {
 
 // ─── Generation options ───────────────────────────────────────────────────────
 
+/// Most alternatives a request may ask to see per token (OpenAI's and
+/// vLLM's limit).
+pub const MAX_TOP_LOGPROBS: u32 = 20;
+
+/// One generated token's log-probability, with the likeliest alternatives.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TokenLogprob {
+    /// The token generated.
+    pub token: u32,
+    /// Its natural-log probability under the model.
+    pub logprob: f32,
+    /// The likeliest tokens at that step, most likely first, as many as
+    /// [`GenerationOptions::logprobs`] asked for.
+    pub top: Vec<(u32, f32)>,
+}
+
+/// A shared buffer the decode loop pushes [`TokenLogprob`]s into, for a
+/// streaming caller to take with the text they belong to.
+#[derive(Clone, Default)]
+pub struct LogprobSink(std::sync::Arc<std::sync::Mutex<Vec<TokenLogprob>>>);
+
+impl LogprobSink {
+    /// Add one token's figures.
+    pub fn push(&self, entry: TokenLogprob) {
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).push(entry);
+    }
+
+    /// Everything pushed since the last take.
+    pub fn take(&self) -> Vec<TokenLogprob> {
+        std::mem::take(&mut *self.0.lock().unwrap_or_else(|p| p.into_inner()))
+    }
+}
+
+impl std::fmt::Debug for LogprobSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LogprobSink")
+    }
+}
+
 /// Parameters that control the token-generation process.
 ///
 /// Every field added after the first release defaults to "off", so a caller
@@ -341,6 +380,19 @@ pub struct GenerationOptions {
     /// unconstrained and byte-identical to earlier releases.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub constraint: Option<ConstraintSpec>,
+    /// Report each generated token's log-probability with this many of the
+    /// most likely alternatives (at most [`MAX_TOP_LOGPROBS`]): OpenAI's
+    /// `top_logprobs`, vLLM's `logprobs` and llama-server's `n_probs`.
+    /// `None` reports none.  Probabilities are the model's own (a softmax of
+    /// its logits, before temperature and the other samplers), as vLLM
+    /// reports them by default.
+    #[serde(default)]
+    pub logprobs: Option<u32>,
+    /// Where a streaming caller collects each token's [`TokenLogprob`] as
+    /// it is decoded, to send with the text that follows; never from
+    /// request JSON.
+    #[serde(skip)]
+    pub logprob_sink: Option<LogprobSink>,
 }
 
 /// `max_tokens` value that means "until end of sequence or the end of the
@@ -423,7 +475,10 @@ impl GenerationOptions {
     /// running state.  A reasoning budget does too, on a model with
     /// reasoning tags (the engine checks that).
     pub(crate) fn needs_plain_decode(&self) -> bool {
+        // Log-probabilities are read from the logits each token was sampled
+        // from, which a verified draft never has on its own.
         self.min_tokens > 0
+            || self.logprobs.is_some()
             || !self.bad_words.is_empty()
             || self.dry.enabled()
             || self.mirostat != 0
@@ -509,6 +564,8 @@ impl Default for GenerationOptions {
             reasoning_budget: None,
             reasoning_budget_message: None,
             constraint: None,
+            logprobs: None,
+            logprob_sink: None,
         }
     }
 }
@@ -1021,8 +1078,8 @@ pub fn parse_logit_bias(value: &serde_json::Value) -> Result<Vec<LogitBias>, Str
 ///
 /// Unknown fields are ignored.  Fields that are accepted but cannot be
 /// honoured are rejected by [`ChatCompletionRequest::to_generation_options`]
-/// rather than silently dropped: `n > 1`, `logprobs: true`,
-/// `top_logprobs > 0`, and `response_format` types other than `text`,
+/// rather than silently dropped: `n > 1`, `top_logprobs` above 20 or
+/// without `logprobs: true`, and `response_format` types other than `text`,
 /// `json_object`, or `json_schema`.
 #[derive(Debug, Default, Deserialize)]
 pub struct ChatCompletionRequest {
@@ -1056,10 +1113,11 @@ pub struct ChatCompletionRequest {
     /// Number of choices; only `1` is supported.
     #[serde(default)]
     pub n: Option<u32>,
-    /// Token log-probabilities; not supported (`true` is rejected).
+    /// Report each generated token's log-probability.
     #[serde(default)]
     pub logprobs: Option<bool>,
-    /// Top log-probabilities per token; not supported (`> 0` is rejected).
+    /// How many of the likeliest alternatives to report with each token
+    /// (0 to 20); needs `logprobs: true`.
     #[serde(default)]
     pub top_logprobs: Option<u32>,
     /// Output format; only `{"type": "text"}` is supported.
@@ -1188,9 +1246,16 @@ impl ChatCompletionRequest {
             return Err("only n = 1 is supported".to_string());
         }
         self.named_tool()?;
-        if self.logprobs == Some(true) || self.top_logprobs.is_some_and(|n| n > 0) {
-            return Err("logprobs are not supported".to_string());
-        }
+        let logprobs = match (self.logprobs, self.top_logprobs) {
+            (Some(true), top) => Some(crate::logprobs::count(
+                "top_logprobs",
+                i64::from(top.unwrap_or(0)),
+            )?),
+            (_, Some(n)) if n > 0 => {
+                return Err("`top_logprobs` needs `logprobs: true`".to_string())
+            }
+            _ => None,
+        };
         let constraint = match &self.response_format {
             Some(format) => parse_response_format(format)?,
             None => None,
@@ -1282,6 +1347,7 @@ impl ChatCompletionRequest {
         options.reasoning_budget = reasoning_budget;
         options.reasoning_budget_message = self.reasoning_budget_message.clone();
         options.constraint = constraint;
+        options.logprobs = logprobs;
         Ok(options)
     }
 
@@ -1480,6 +1546,9 @@ pub struct ChatChoice {
     pub index: u32,
     /// The generated assistant message.
     pub message: AssistantMessage,
+    /// Each generated token's log-probability (`{"content": [...]}`), when
+    /// the request asked for them; `null` otherwise, as OpenAI sends it.
+    pub logprobs: Option<serde_json::Value>,
     /// Why generation stopped (`"stop"`, `"length"`, `"tool_calls"`).
     pub finish_reason: String,
 }
@@ -2340,8 +2409,11 @@ mod tests {
     #[test]
     fn unsupported_parameters_are_rejected() {
         assert!(rejected(json!({"n": 2})).contains("n = 1"));
-        assert!(rejected(json!({"logprobs": true})).contains("logprobs"));
-        assert!(rejected(json!({"top_logprobs": 3})).contains("logprobs"));
+        assert!(rejected(json!({"top_logprobs": 3})).contains("logprobs: true"));
+        assert!(rejected(json!({"logprobs": true, "top_logprobs": 21})).contains("between"));
+        assert_eq!(options(json!({"logprobs": true})).logprobs, Some(0));
+        assert_eq!(options(json!({"logprobs": true, "top_logprobs": 5})).logprobs, Some(5));
+        assert_eq!(options(json!({"logprobs": false})).logprobs, None);
         assert_eq!(
             options(json!({"response_format": {"type": "json_object"}})).constraint,
             Some(ConstraintSpec::JsonObject)

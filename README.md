@@ -447,7 +447,8 @@ Besides `model`, `messages`, `stream` and `tools`:
 | `tool_choice` | `"none"` hides `tools`; a named function (`{"type": "function", "function": {"name": …}}`) offers that tool alone; `"required"` offers them all without forcing a call.  A name not in `tools`, `"required"` without tools, or any other value is a **400** |
 | `prompt_cache_key` | OpenAI's cache key: requests sharing it share a prompt-cache namespace and, behind `joshua route`, a worker (an `x-joshua-affinity` handle wins over it) |
 | `stream_options` | Accepted; usage is always sent on the final chunk |
-| `n`, `logprobs`, `top_logprobs` | Only `n: 1`, `logprobs: false` and `top_logprobs: 0` are accepted; anything else is a **400** rather than silently ignored |
+| `logprobs`, `top_logprobs` | Each generated token's log-probability in `choices[].logprobs.content`, with up to 20 alternatives; streamed, each chunk carries its tokens'. The probabilities are the model's own (a softmax of its logits, before temperature and the other samplers), as vLLM reports them by default. A request with `logprobs` decodes one token at a time, without speculative drafting |
+| `n` | Only `n: 1` is accepted; anything else is a **400** rather than silently ignored |
 | `response_format` | `{"type": "text"}`, `{"type": "json_object"}`, or `{"type": "json_schema", "json_schema": {"name": …, "schema": {…}}}` — see [Structured outputs](#structured-outputs) |
 
 Other unknown fields are ignored.  A `developer` message becomes a `system`

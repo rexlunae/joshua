@@ -305,7 +305,7 @@ async fn chat_request_settings_are_validated() {
     for (extra, needle) in [
         (serde_json::json!({"context_window": 65}), "context window"),
         (serde_json::json!({"n": 2}), "n = 1"),
-        (serde_json::json!({"logprobs": true}), "logprobs"),
+        (serde_json::json!({"top_logprobs": 2}), "logprobs: true"),
         (
             serde_json::json!({"presence_penalty": 9}),
             "presence_penalty",
@@ -1593,7 +1593,8 @@ async fn raw_completions_take_every_prompt_form_and_stream() {
 
     // Refused rather than ignored.
     for (extra, needle) in [
-        (serde_json::json!({"logprobs": 2}), "logprobs"),
+        (serde_json::json!({"logprobs": 2, "echo": true}), "echo"),
+        (serde_json::json!({"logprobs": 21}), "logprobs"),
         (serde_json::json!({"n": 2}), "n = 1"),
         (serde_json::json!({"best_of": 3}), "best_of"),
         (serde_json::json!({"prompt": []}), "prompt"),
@@ -1701,7 +1702,10 @@ async fn llama_server_native_routes_answer_in_llama_server_shapes() {
 
     // Refused rather than ignored.
     for (extra, needle) in [
-        (serde_json::json!({"n_probs": 2}), "n_probs"),
+        (
+            serde_json::json!({"n_probs": 2, "post_sampling_probs": true}),
+            "post_sampling_probs",
+        ),
         (serde_json::json!({"grammar": "root ::= \"a\""}), "grammar"),
         (
             serde_json::json!({"lora": [{"id": 0, "scale": 1.0}]}),
@@ -1931,6 +1935,132 @@ async fn openai_and_vllm_ops_routes_answer_in_their_shapes() {
     let short: Vec<f32> = serde_json::from_value(v["data"][0]["embedding"].clone()).unwrap();
     assert_eq!(short.len(), 2);
     assert!((short.iter().map(|x| x * x).sum::<f32>() - 1.0).abs() < 1e-4);
+}
+
+/// Each API reports the generated tokens' log-probabilities in its own
+/// shape, streamed and not, and a greedy pick is its step's likeliest token.
+#[tokio::test]
+async fn logprobs_are_reported_in_each_api_shape() {
+    let app = create_router(tiny_state("server-logprobs", None));
+    let call = |path: &'static str, body: serde_json::Value| {
+        let app = app.clone();
+        async move {
+            let res = app.oneshot(post_json(path, None, body)).await.unwrap();
+            let status = res.status();
+            (status, body_text(res).await)
+        }
+    };
+    let events = |text: &str| -> Vec<serde_json::Value> {
+        text.lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .filter(|d| *d != "[DONE]")
+            .map(|d| serde_json::from_str(d).unwrap())
+            .collect()
+    };
+
+    // Chat: `logprobs.content`, one entry per generated token.
+    let chat = serde_json::json!({
+        "model": "", "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 4, "temperature": 0.0, "ignore_eos": true,
+        "logprobs": true, "top_logprobs": 3,
+    });
+    let (status, body) = call("/v1/chat/completions", chat.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let content = v["choices"][0]["logprobs"]["content"].as_array().unwrap().clone();
+    assert_eq!(content.len(), 4, "{body}");
+    assert_eq!(content.len() as u64, v["usage"]["completion_tokens"].as_u64().unwrap(), "{body}");
+    for entry in &content {
+        let top = entry["top_logprobs"].as_array().unwrap();
+        assert_eq!(top.len(), 3, "{entry}");
+        assert!(entry["logprob"].as_f64().unwrap() <= 0.0, "{entry}");
+        assert!(entry["bytes"].is_array() && entry["token"].is_string(), "{entry}");
+        // Greedy: the token is its step's likeliest.
+        assert_eq!(entry["logprob"], top[0]["logprob"], "{entry}");
+    }
+    let mut streamed = chat.clone();
+    streamed["stream"] = serde_json::json!(true);
+    let (status, body) = call("/v1/chat/completions", streamed).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let tokens: Vec<serde_json::Value> = events(&body)
+        .iter()
+        .filter_map(|e| e["choices"][0]["logprobs"]["content"].as_array().cloned())
+        .flatten()
+        .map(|e| e["token"].clone())
+        .collect();
+    let expected: Vec<serde_json::Value> = content.iter().map(|e| e["token"].clone()).collect();
+    assert_eq!(tokens, expected, "{body}");
+    // Without `logprobs`, the field is null.
+    let mut plain = chat.clone();
+    plain.as_object_mut().unwrap().remove("logprobs");
+    plain.as_object_mut().unwrap().remove("top_logprobs");
+    let (_, body) = call("/v1/chat/completions", plain).await;
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(v["choices"][0]["logprobs"].is_null(), "{body}");
+
+    // Completions: parallel arrays, the same streamed as not.
+    let completion = serde_json::json!({
+        "model": "", "prompt": "a b c", "max_tokens": 4, "temperature": 0.0,
+        "ignore_eos": true, "logprobs": 2,
+    });
+    let (status, body) = call("/v1/completions", completion.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let lp = &v["choices"][0]["logprobs"];
+    let n = v["usage"]["completion_tokens"].as_u64().unwrap() as usize;
+    assert_eq!(n, 4, "{body}");
+    for key in ["tokens", "token_logprobs", "top_logprobs", "text_offset"] {
+        assert_eq!(lp[key].as_array().unwrap().len(), n, "{key}: {body}");
+    }
+    let offsets: Vec<u64> = lp["text_offset"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o.as_u64().unwrap())
+        .collect();
+    assert_eq!(offsets.first(), Some(&0), "{body}");
+    assert!(offsets.windows(2).all(|w| w[0] <= w[1]), "{body}");
+    // Each step's map holds the alternatives and the token itself.
+    let tops = lp["top_logprobs"].as_array().unwrap();
+    assert!(tops.iter().all(|t| (1..=3).contains(&t.as_object().unwrap().len())), "{body}");
+    let mut streamed = completion.clone();
+    streamed["stream"] = serde_json::json!(true);
+    let (status, body) = call("/v1/completions", streamed).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mut stream_tokens = Vec::new();
+    let mut stream_offsets = Vec::new();
+    for event in events(&body) {
+        let lp = &event["choices"][0]["logprobs"];
+        stream_tokens.extend(lp["tokens"].as_array().cloned().unwrap_or_default());
+        stream_offsets.extend(lp["text_offset"].as_array().cloned().unwrap_or_default());
+    }
+    assert_eq!(&stream_tokens, lp["tokens"].as_array().unwrap(), "{body}");
+    assert_eq!(&stream_offsets, lp["text_offset"].as_array().unwrap(), "{body}");
+
+    // llama-server: `completion_probabilities` with `n_probs` alternatives.
+    let llama = serde_json::json!({
+        "prompt": "a b c", "n_predict": 4, "temperature": 0.0, "ignore_eos": true, "n_probs": 2,
+    });
+    let (status, body) = call("/completion", llama.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let probs = v["completion_probabilities"].as_array().unwrap();
+    assert_eq!(probs.len() as u64, v["tokens_predicted"].as_u64().unwrap(), "{body}");
+    assert!(probs.iter().all(|p| p["top_logprobs"].as_array().unwrap().len() == 2), "{body}");
+    assert!(probs.iter().all(|p| p["id"].is_u64() && p["logprob"].is_f64()), "{body}");
+    assert_eq!(v["generation_settings"]["n_probs"], 2, "{body}");
+    let mut streamed = llama.clone();
+    streamed["stream"] = serde_json::json!(true);
+    let (status, body) = call("/completion", streamed).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let ids: Vec<serde_json::Value> = events(&body)
+        .iter()
+        .filter_map(|e| e["completion_probabilities"].as_array().cloned())
+        .flatten()
+        .map(|p| p["id"].clone())
+        .collect();
+    let expected: Vec<serde_json::Value> = probs.iter().map(|p| p["id"].clone()).collect();
+    assert_eq!(ids, expected, "{body}");
 }
 
 #[tokio::test]
