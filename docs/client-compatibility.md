@@ -99,8 +99,8 @@ supported.
 | `GET /api/tags` | ✅ |
 | `GET /api/ps` | ✅ |
 | `POST /api/show` | ✅ |
-| `POST /api/chat` | ✅ newline-delimited JSON streaming, tool calls, `format`, images, `keep_alive` |
-| `POST /api/generate` | ✅ `format`, images, `keep_alive`; `system`, `raw`, `context` are not yet honoured |
+| `POST /api/chat` | ✅ newline-delimited JSON streaming, tool calls, `format`, images, `keep_alive`; `think` (`true`, `false` or `"low"`/`"medium"`/`"high"`) with the reasoning under `message.thinking`; `logprobs` and `top_logprobs` |
+| `POST /api/generate` | ✅ `format`, images, `keep_alive`, `system`, `raw`, `suffix` (fill-in-the-middle, for a model with FIM tokens), `context` (given back on the done object unless the prompt was raw, an infill or had images), `think` (reasoning under `thinking`), `logprobs` and `top_logprobs`. `template` is refused: joshua cannot run Ollama's Go templates |
 | `POST /api/embed` | ✅ |
 | `POST /api/embeddings` | ✅ legacy shape: one `prompt` in, one `embedding` out |
 | `POST /api/tokens` | ✅ (joshua extension, mirrors `/tokenize`) |

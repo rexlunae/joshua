@@ -40,6 +40,15 @@
 //! a name whose tag is not part of a model id resolves to the id without it,
 //! so `llama3:latest` and `llama3:13b` both address `llama3.gguf`.
 //!
+//! **Generation**: `/api/chat` and `/api/generate` read `think` (`true`,
+//! `false` or a gpt-oss level), which reaches the chat template as the
+//! reasoning switches, and return the reasoning apart from the answer under
+//! `thinking`; `logprobs` and `top_logprobs` report each answer token.
+//! `/api/generate` also reads `system`, `raw` (the prompt as it is),
+//! `suffix` (a fill-in-the-middle prompt) and `context` (the tokens an
+//! earlier reply gave back, followed by the new turn).  `template` is
+//! refused: Ollama's Go templates are not something joshua can run.
+//!
 //! **`keep_alive`**: `0` unloads the model once the request is answered (when
 //! the server manages a model directory, so it can load it again); a request
 //! with no messages or prompt only loads or unloads the model, as Ollama's
@@ -47,6 +56,7 @@
 //! resident until it is unloaded, so `/api/ps` reports no expiry.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -63,8 +73,10 @@ use serde_json::{json, Value};
 use crate::engine::{Completion, Engine, RawPrompt};
 use crate::model_info::{GgufFacts, ModelInfo};
 use crate::sampling::{SamplingDefaults, SamplingProfile};
-use crate::server::{select_model, ApiError, AppState, CancelOnDrop, ChatPiece};
-use crate::types::{rfc3339, ChatMessage, ConstraintSpec, GenerationOptions, SamplingParams, Tool};
+use crate::server::{select_model, ApiError, AppState, CancelOnDrop, ChatAnswer, ChatPiece};
+use crate::types::{
+    rfc3339, ChatMessage, ConstraintSpec, GenerationOptions, ReasoningEffort, SamplingParams, TokenLogprob, Tool,
+};
 
 fn now() -> String {
     rfc3339(SystemTime::now())
@@ -625,48 +637,71 @@ fn chat_message(mut message: Value) -> Result<ChatMessage, String> {
 }
 
 /// Which Ollama wire a reply goes out on: `/api/chat` puts text under
-/// `message.content`, `/api/generate` under `response`.
-#[derive(Clone, Copy)]
+/// `message.content` (and reasoning under `message.thinking`),
+/// `/api/generate` under `response` (and `thinking`).
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Wire {
     Chat,
     Generate,
 }
 
+/// What one reply object carries besides its text.
+#[derive(Default)]
+struct Extra {
+    /// Reasoning text.
+    thinking: String,
+    /// Chat tool calls, in Ollama's shape.
+    tool_calls: Option<Vec<Value>>,
+    /// The log-probabilities of the tokens behind the text.
+    logprobs: Option<Value>,
+}
+
 impl Wire {
-    /// One object of the reply: `text` and, for chat, any `tool_calls`.
-    fn chunk(self, model: &str, text: &str, tool_calls: Option<Vec<Value>>) -> Value {
+    /// One object of the reply: `text`, and what `extra` carries.
+    fn chunk(self, model: &str, text: &str, extra: Extra) -> Value {
         let mut out = json!({ "model": model, "created_at": now() });
         match self {
             Wire::Chat => {
                 let mut message = json!({ "role": "assistant", "content": text });
-                if let Some(calls) = tool_calls {
+                if !extra.thinking.is_empty() {
+                    message["thinking"] = Value::from(extra.thinking);
+                }
+                if let Some(calls) = extra.tool_calls {
                     message["tool_calls"] = Value::Array(calls);
                 }
                 out["message"] = message;
             }
-            Wire::Generate => out["response"] = Value::from(text),
+            Wire::Generate => {
+                out["response"] = Value::from(text);
+                if !extra.thinking.is_empty() {
+                    out["thinking"] = Value::from(extra.thinking);
+                }
+            }
+        }
+        if let Some(logprobs) = extra.logprobs {
+            out["logprobs"] = logprobs;
         }
         out["done"] = Value::Bool(false);
         out
     }
 
-    /// The last object: `done`, why it ended, the token counts and the
-    /// durations in nanoseconds.
-    fn done(self, model: &str, text: &str, end: &End<'_>) -> Value {
-        let mut out = self.chunk(model, text, end.tool_calls.clone());
+    /// The last object: `done`, why it ended, the token counts, the
+    /// durations in nanoseconds and, for generate, the `context`.
+    fn done(self, model: &str, text: &str, extra: Extra, end: &End<'_>) -> Value {
+        let mut out = self.chunk(model, text, extra);
         out["done"] = Value::Bool(true);
         out["done_reason"] = Value::from(end.reason);
+        out["total_duration"] = Value::from(end.started.elapsed().as_nanos() as u64);
+        out["load_duration"] = Value::from(end.load.as_nanos() as u64);
         if let Some(c) = end.completion {
             let ns = |ms: f64| (ms * 1e6).round() as u64;
-            out["total_duration"] = Value::from(end.started.elapsed().as_nanos() as u64);
-            out["load_duration"] = Value::from(end.load.as_nanos() as u64);
             out["prompt_eval_count"] = Value::from(c.usage.prompt_tokens);
             out["prompt_eval_duration"] = Value::from(ns(c.timings.prompt_ms));
             out["eval_count"] = Value::from(c.usage.completion_tokens);
             out["eval_duration"] = Value::from(ns(c.timings.predicted_ms));
-        } else {
-            out["total_duration"] = Value::from(end.started.elapsed().as_nanos() as u64);
-            out["load_duration"] = Value::from(end.load.as_nanos() as u64);
+        }
+        if let Some(context) = end.context {
+            out["context"] = Value::from(context);
         }
         out
     }
@@ -676,7 +711,8 @@ impl Wire {
 struct End<'a> {
     reason: &'static str,
     completion: Option<&'a Completion>,
-    tool_calls: Option<Vec<Value>>,
+    /// Generate's `context`: the prompt's tokens and the answer's.
+    context: Option<&'a [u32]>,
     started: Instant,
     load: Duration,
 }
@@ -699,16 +735,80 @@ fn ollama_calls(calls: &[crate::tools::ParsedToolCall]) -> Option<Vec<Value>> {
     })
 }
 
+/// Ollama's `think`: on or off, or a level (`"low"`, `"medium"`, `"high"`,
+/// gpt-oss's), which turns it on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Think {
+    on: bool,
+    effort: Option<ReasoningEffort>,
+}
+
+impl Think {
+    fn parse(value: Option<&Value>) -> Result<Option<Self>, String> {
+        let effort = |effort| Some(Self { on: true, effort: Some(effort) });
+        match value {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::Bool(on)) => Ok(Some(Self { on: *on, effort: None })),
+            Some(Value::String(level)) => match level.as_str() {
+                "low" => Ok(effort(ReasoningEffort::Low)),
+                "medium" => Ok(effort(ReasoningEffort::Medium)),
+                "high" => Ok(effort(ReasoningEffort::High)),
+                other => Err(format!(
+                    "invalid think value {other:?}: expected true, false, \"low\", \"medium\" or \"high\""
+                )),
+            },
+            Some(other) => Err(format!(
+                "invalid think value {other}: expected true, false, \"low\", \"medium\" or \"high\""
+            )),
+        }
+    }
+}
+
+/// Ollama's `logprobs` and `top_logprobs`: the count of alternatives to
+/// report with each token, when log-probabilities are asked for.
+fn logprob_count(logprobs: Option<bool>, top: Option<i64>) -> Result<Option<u32>, String> {
+    let top = top
+        .map(|n| crate::logprobs::count("top_logprobs", n))
+        .transpose()?;
+    match (logprobs.unwrap_or(false), top) {
+        (true, top) => Ok(Some(top.unwrap_or(0))),
+        (false, Some(n)) if n > 0 => Err("`top_logprobs` needs `logprobs: true`".to_string()),
+        (false, _) => Ok(None),
+    }
+}
+
+/// What a turn reads.
+enum Source {
+    /// A conversation, rendered by the model's chat template.
+    Chat(Vec<ChatMessage>),
+    /// Generate's `raw` prompt, or its `suffix` infill prompt: read as it
+    /// is, with no reasoning split off the answer.
+    Raw(RawPrompt),
+    /// Generate's `prompt` and `suffix`, as the model's fill-in-the-middle
+    /// prompt.
+    Infill { prefix: String, suffix: String },
+    /// Generate's `context` (the tokens an earlier reply gave back),
+    /// followed by the new turn, rendered.
+    Continue {
+        context: Vec<u32>,
+        messages: Vec<ChatMessage>,
+    },
+}
+
 /// A request for `/api/chat` or `/api/generate`, translated.
 struct Turn {
     wire: Wire,
     model: String,
-    messages: Vec<ChatMessage>,
+    /// What to read; none only loads or unloads the model.
+    source: Option<Source>,
     tools: Option<Vec<Tool>>,
     options: OllamaOptions,
     format: Option<Value>,
     keep_alive: Option<Value>,
     stream: bool,
+    think: Option<Think>,
+    /// Report log-probabilities, with this many alternatives.
+    logprobs: Option<u32>,
 }
 
 /// Answer a [`Turn`]: load or unload only, when it has nothing to say, else
@@ -718,15 +818,15 @@ struct Turn {
 async fn answer(state: AppState, turn: Turn) -> Result<Response, ApiError> {
     let started = Instant::now();
     let unload = unload_after(turn.keep_alive.as_ref()) && state.manager.is_some();
-    if turn.messages.is_empty() {
+    if turn.source.is_none() {
         let (id, reason, load) = if unload {
             (unload_named(&state, &turn.model).await?, "unload", Duration::ZERO)
         } else {
             let (id, _engine, load) = select(&state, &turn.model).await?;
             (id, "load", load)
         };
-        let end = End { reason, completion: None, tool_calls: None, started, load };
-        return Ok(Json(turn.wire.done(&id, "", &end)).into_response());
+        let end = End { reason, completion: None, context: None, started, load };
+        return Ok(Json(turn.wire.done(&id, "", Extra::default(), &end)).into_response());
     }
 
     let (id, engine, load) = select(&state, &turn.model).await?;
@@ -766,6 +866,181 @@ async fn unload_quietly(state: AppState, id: String) {
     }
 }
 
+/// A turn's prompt, ready to generate from.
+enum Ready {
+    Chat(Vec<ChatMessage>),
+    /// A prompt read without the template; `split` reads reasoning off the
+    /// answer (a continued conversation's) or not (a raw or infill one).
+    Raw { prompt: RawPrompt, split: bool },
+}
+
+/// Ollama's context shift for a continued conversation: when the earlier
+/// tokens and a new turn of `turn` tokens leave less than `answer` tokens
+/// of the `window` for the answer, the oldest earlier tokens are dropped
+/// (keeping a leading `bos`) until that much is free.  A turn too long for
+/// that is left for generation to refuse.
+fn shift_context(
+    context: Vec<u32>,
+    turn: usize,
+    window: usize,
+    answer: usize,
+    bos: Option<u32>,
+) -> Vec<u32> {
+    let budget = window.saturating_sub(answer.min(window / 4).max(1));
+    if context.len() + turn <= budget || turn >= budget {
+        return context;
+    }
+    let head = usize::from(bos.is_some() && context.first() == bos.as_ref());
+    let tail = (budget - turn).saturating_sub(head).min(context.len() - head);
+    let mut kept = context[..head].to_vec();
+    kept.extend_from_slice(&context[context.len() - tail..]);
+    kept
+}
+
+/// What a turn is generated from: its prompt and, when generate's reply
+/// gives back its `context`, the prompt's tokens.
+struct Plan {
+    wire: Wire,
+    ready: Ready,
+    prompt_tokens: Option<Vec<u32>>,
+    tools: Option<Vec<Tool>>,
+    options: GenerationOptions,
+}
+
+impl Plan {
+    /// Work out the prompt (on the blocking pool: it tokenizes).  A
+    /// generate reply gives back its `context` unless its prompt was raw or
+    /// an infill, or it carries images (which are not tokens).
+    fn new(
+        engine: &Engine,
+        wire: Wire,
+        source: Source,
+        tools: Option<Vec<Tool>>,
+        options: GenerationOptions,
+    ) -> crate::Result<Self> {
+        let context = wire == Wire::Generate;
+        let (ready, prompt_tokens) = match source {
+            Source::Chat(messages) => {
+                let images = messages.iter().any(|m| m.images.as_ref().is_some_and(|i| !i.is_empty()));
+                let tokens = if context && !images {
+                    Some(engine.tokenize_chat(&messages, tools.as_deref(), &options)?)
+                } else {
+                    None
+                };
+                (Ready::Chat(messages), tokens)
+            }
+            Source::Raw(prompt) => (Ready::Raw { prompt, split: false }, None),
+            Source::Infill { prefix, suffix } => {
+                // Ollama answers a model without fill-in-the-middle tokens so.
+                if engine.fim_tokens().missing().is_some() {
+                    return Err(crate::JoshuaError::InvalidRequest(
+                        "this model does not support insert: it has no fill-in-the-middle tokens"
+                            .to_string(),
+                    ));
+                }
+                let n_predict = match options.max_tokens {
+                    crate::types::MAX_TOKENS_UNLIMITED => -1,
+                    n => i64::from(n),
+                };
+                let tokens = engine.format_infill(&prefix, &suffix, &[], "", n_predict, false, true)?;
+                (Ready::Raw { prompt: RawPrompt::tokens(tokens), split: false }, None)
+            }
+            Source::Continue { context, messages } => {
+                let turn = engine.tokenize_chat_turn(&messages, &options)?;
+                let window = options.context_window.unwrap_or(engine.n_ctx()) as usize;
+                // Room for the answer: what was asked for, up to a quarter
+                // of the window.
+                let answer = match options.max_tokens {
+                    crate::types::MAX_TOKENS_UNLIMITED => window / 4,
+                    n => n as usize,
+                };
+                let mut tokens = shift_context(context, turn.len(), window, answer, engine.bos_token());
+                tokens.extend(turn);
+                let prompt = RawPrompt::tokens(tokens.clone());
+                (Ready::Raw { prompt, split: true }, Some(tokens))
+            }
+        };
+        Ok(Self { wire, ready, prompt_tokens, tools, options })
+    }
+
+    /// Whether the reasoning is read off the answer.
+    fn splits(&self) -> bool {
+        match self.ready {
+            Ready::Chat(_) => true,
+            Ready::Raw { split, .. } => split,
+        }
+    }
+
+    /// The reply's `context`: the prompt's tokens and the answer's.
+    fn context(&self, completion: &Completion) -> Option<Vec<u32>> {
+        self.prompt_tokens.as_ref().map(|prompt| {
+            let mut tokens = prompt.clone();
+            tokens.extend_from_slice(&completion.token_ids);
+            tokens
+        })
+    }
+
+    /// Generate the whole answer.
+    fn whole(&self, engine: &Engine, cancel: &AtomicBool) -> crate::Result<(Completion, ChatAnswer)> {
+        let tools = self.tools.as_deref();
+        match &self.ready {
+            Ready::Chat(messages) => {
+                let format = match tools {
+                    Some(tools) => engine.tool_call_format_for_request(messages, Some(tools), &self.options)?,
+                    None => engine.tool_call_format(),
+                };
+                let completion =
+                    engine.complete_chat_cancellable_detailed(messages, tools, &self.options, cancel)?;
+                let answer = crate::server::chat_answer(engine, &completion, true, tools, format, "call_");
+                Ok((completion, answer))
+            }
+            Ready::Raw { prompt, split } => {
+                let completion = engine.complete_prompt_cancellable(prompt, &self.options, cancel)?;
+                let answer =
+                    crate::server::chat_answer(engine, &completion, *split, None, engine.tool_call_format(), "call_");
+                Ok((completion, answer))
+            }
+        }
+    }
+
+    /// Generate the answer piece by piece: `emit` gets reasoning (`true`)
+    /// and answer text (`false`) as they are decoded.  Returns the
+    /// completion and the tool calls read from it.
+    fn stream(
+        &self,
+        engine: &Engine,
+        cancel: &AtomicBool,
+        emit: &mut dyn FnMut(bool, &str),
+    ) -> crate::Result<(Completion, Vec<crate::tools::ParsedToolCall>)> {
+        match &self.ready {
+            Ready::Chat(messages) => crate::server::stream_chat_output(
+                engine,
+                messages,
+                self.tools.as_deref(),
+                &self.options,
+                cancel,
+                true,
+                "call_",
+                &mut |piece| match piece {
+                    ChatPiece::Reasoning(text) => emit(true, text),
+                    ChatPiece::Text(text) => emit(false, text),
+                    // Calls go out whole, once the answer is read.
+                    ChatPiece::CallStart { .. } | ChatPiece::CallArgs { .. } => {}
+                },
+            ),
+            Ready::Raw { prompt, split: true } => engine
+                .complete_prompt_streaming_split(prompt, &self.options, cancel, &mut |split| {
+                    emit(true, &split.reasoning);
+                    emit(false, &split.content);
+                })
+                .map(|completion| (completion, Vec::new())),
+            Ready::Raw { prompt, split: false } => engine
+                .complete_prompt_streaming(prompt, &self.options, cancel, &mut |text| emit(false, text))
+                .map(|completion| (completion, Vec::new())),
+        }
+    }
+}
+
 /// Generate a [`Turn`] on `engine`.  Returns the response and whether it
 /// streams; a stream unloads the model itself (`release`) once its
 /// generation ends.  Every engine reference this holds is dropped by the
@@ -786,6 +1061,21 @@ async fn generate_turn(
             .to_generation_options(&engine.sampling_defaults(SamplingProfile::Ollama), engine.n_ctx())
             .map_err(ApiError::bad_request)?;
         options.constraint = constraint(turn.format.as_ref()).map_err(ApiError::bad_request)?;
+        if let Some(think) = turn.think {
+            // Ollama's answer to a model that cannot think being asked to.
+            if think.on && *engine.reasoning_format() == crate::reasoning::ReasoningFormat::None {
+                return Err(ApiError::bad_request(format!("\"{id}\" does not support thinking")));
+            }
+            options.chat_template_kwargs.extend(crate::types::reasoning_template_kwargs(
+                think.effort,
+                Some(think.on),
+                None,
+            ));
+        }
+        options.logprobs = turn.logprobs;
+        if turn.stream && turn.logprobs.is_some() {
+            options.logprob_sink = Some(Default::default());
+        }
         // Answer a request the model cannot serve before a stream starts.
         engine.validate_options(&options).map_err(ApiError::from)?;
         Ok::<_, ApiError>(options)
@@ -794,66 +1084,82 @@ async fn generate_turn(
         Ok(options) => options,
         Err(e) => return (Err(e), false),
     };
-    let Turn { wire, messages, tools, stream, .. } = turn;
+    let Turn { wire, source, tools, stream, .. } = turn;
+    let Some(source) = source else {
+        return (Err(ApiError::internal("a turn with nothing to read")), false);
+    };
+    let plan = {
+        let engine = Arc::clone(&engine);
+        tokio::task::spawn_blocking(move || Plan::new(&engine, wire, source, tools, options)).await
+    };
+    let plan = match plan {
+        Ok(Ok(plan)) => plan,
+        Ok(Err(e)) => return (Err(ApiError::from(e)), false),
+        Err(e) => return (Err(ApiError::internal(e.to_string())), false),
+    };
     if stream {
-        (Ok(stream_turn(state, wire, id, engine, messages, tools, options, started, load, release)), true)
+        (Ok(stream_turn(state, plan, id, engine, started, load, release)), true)
     } else {
-        (whole_turn(state, wire, &id, engine, messages, tools, options, started, load).await, false)
+        (whole_turn(state, plan, &id, engine, started, load).await, false)
     }
+}
+
+/// The log-probabilities of the answer tokens among `entries`, in Ollama's
+/// shape (OpenAI chat's entries: `token`, `logprob`, `bytes`,
+/// `top_logprobs`).
+fn ollama_logprobs(engine: &Engine, entries: &[TokenLogprob], split: bool) -> Value {
+    crate::logprobs::chat(engine, entries, split)["content"].take()
 }
 
 /// One whole answer, generated on the blocking pool, which holds the
 /// engine until it is read.
-#[allow(clippy::too_many_arguments)]
 async fn whole_turn(
     state: &AppState,
-    wire: Wire,
+    plan: Plan,
     id: &str,
     engine: Arc<Engine>,
-    messages: Vec<ChatMessage>,
-    tools: Option<Vec<Tool>>,
-    options: GenerationOptions,
     started: Instant,
     load: Duration,
 ) -> Result<Response, ApiError> {
     let cancel = CancelOnDrop::new();
     let flag = cancel.flag();
     let generated = tokio::task::spawn_blocking(move || {
-        let tools = tools.as_deref();
-        let format = match tools {
-            Some(tools) => engine.tool_call_format_for_request(&messages, Some(tools), &options)?,
-            None => engine.tool_call_format(),
-        };
-        let completion =
-            engine.complete_chat_cancellable_detailed(&messages, tools, &options, &flag)?;
-        let answer = crate::server::chat_answer(&engine, &completion, false, tools, format, "call_");
-        Ok::<_, crate::JoshuaError>((completion, answer))
+        let (completion, answer) = plan.whole(&engine, &flag)?;
+        let logprobs = plan
+            .options
+            .logprobs
+            .map(|_| ollama_logprobs(&engine, &completion.logprobs, plan.splits()));
+        let context = plan.context(&completion);
+        Ok::<_, crate::JoshuaError>((plan.wire, completion, answer, logprobs, context))
     })
     .await
     .map_err(|e| ApiError::internal(e.to_string()))?;
-    let (completion, answer) = generated.map_err(ApiError::from)?;
+    let (wire, completion, answer, logprobs, context) = generated.map_err(ApiError::from)?;
     state.metrics.record_generation(&completion.usage);
     let end = End {
         reason: completion.stop_type.finish_reason(),
         completion: Some(&completion),
-        tool_calls: ollama_calls(&answer.calls),
+        context: context.as_deref(),
         started,
         load,
     };
-    Ok(Json(wire.done(id, &answer.prose, &end)).into_response())
+    let extra = Extra {
+        thinking: answer.reasoning.unwrap_or_default(),
+        tool_calls: ollama_calls(&answer.calls),
+        logprobs,
+    };
+    Ok(Json(wire.done(id, &answer.prose, extra, &end)).into_response())
 }
 
 /// A streamed answer: newline-delimited JSON from a blocking thread, which
-/// unloads the model (`release`) once generation ends.
-#[allow(clippy::too_many_arguments)]
+/// unloads the model (`release`) once generation ends.  Each answer chunk
+/// carries the log-probabilities of the tokens released with it, when
+/// asked for; the last chunk carries the rest.
 fn stream_turn(
     state: &AppState,
-    wire: Wire,
+    plan: Plan,
     id: String,
     engine: Arc<Engine>,
-    messages: Vec<ChatMessage>,
-    tools: Option<Vec<Tool>>,
-    options: GenerationOptions,
     started: Instant,
     load: Duration,
     release: Option<(AppState, String)>,
@@ -865,43 +1171,53 @@ fn stream_turn(
     let runtime = tokio::runtime::Handle::current();
     let metrics = Arc::clone(&state.metrics);
     tokio::task::spawn_blocking(move || {
+        let wire = plan.wire;
+        let split = plan.splits();
+        let sink = plan.options.logprob_sink.clone();
         let send = |value: Value| {
             let _ = tx.send(format!("{value}\n"));
         };
-        let result = crate::server::stream_chat_output(
-            &engine,
-            &messages,
-            tools.as_deref(),
-            &options,
-            &flag,
-            false,
-            "call_",
-            &mut |piece| {
-                // Calls go out whole, once the answer is read (below).
-                if let ChatPiece::Text(text) = piece {
-                    send(wire.chunk(&id, text, None));
-                }
-            },
-        );
-        drop(engine);
+        // The entries released so far, when any is an answer token's.
+        let take_logprobs = || {
+            let entries = sink.as_ref()?.take();
+            entries
+                .iter()
+                .any(|e| !split || e.answer)
+                .then(|| ollama_logprobs(&engine, &entries, split))
+        };
+        let result = plan.stream(&engine, &flag, &mut |thinking, text| {
+            if text.is_empty() {
+                return;
+            }
+            let extra = if thinking {
+                Extra { thinking: text.to_string(), ..Default::default() }
+            } else {
+                Extra { logprobs: take_logprobs(), ..Default::default() }
+            };
+            send(wire.chunk(&id, if thinking { "" } else { text }, extra));
+        });
         match result {
             Ok((completion, calls)) => {
                 metrics.record_generation(&completion.usage);
                 let tool_calls = ollama_calls(&calls);
                 if tool_calls.is_some() {
-                    send(wire.chunk(&id, "", tool_calls));
+                    send(wire.chunk(&id, "", Extra { tool_calls, ..Default::default() }));
                 }
+                let context = plan.context(&completion);
                 let end = End {
                     reason: completion.stop_type.finish_reason(),
                     completion: Some(&completion),
-                    tool_calls: None,
+                    context: context.as_deref(),
                     started,
                     load,
                 };
-                send(wire.done(&id, "", &end));
+                let extra = Extra { logprobs: sink.as_ref().map(|_| take_logprobs().unwrap_or_else(|| json!([]))), ..Default::default() };
+                send(wire.done(&id, "", extra, &end));
             }
             Err(e) => send(json!({ "error": e.to_string() })),
         }
+        drop(plan);
+        drop(engine);
         if let Some((state, id)) = release {
             runtime.spawn(unload_quietly(state, id));
         }
@@ -940,6 +1256,13 @@ pub struct ChatRequest {
     pub format: Option<Value>,
     #[serde(default)]
     pub keep_alive: Option<Value>,
+    /// Think before answering: `true`, `false` or a level.
+    #[serde(default)]
+    pub think: Option<Value>,
+    #[serde(default)]
+    pub logprobs: Option<bool>,
+    #[serde(default)]
+    pub top_logprobs: Option<i64>,
 }
 
 pub async fn chat(
@@ -955,12 +1278,14 @@ pub async fn chat(
     let turn = Turn {
         wire: Wire::Chat,
         model: req.model,
-        messages,
+        source: (!messages.is_empty()).then_some(Source::Chat(messages)),
         tools: req.tools.filter(|t| !t.is_empty()),
         options: req.options,
         format: req.format,
         keep_alive: req.keep_alive,
         stream: req.stream.unwrap_or(true),
+        think: Think::parse(req.think.as_ref()).map_err(ApiError::bad_request)?,
+        logprobs: logprob_count(req.logprobs, req.top_logprobs).map_err(ApiError::bad_request)?,
     };
     answer(state, turn).await
 }
@@ -972,8 +1297,22 @@ pub struct GenerateRequest {
     pub model: String,
     #[serde(default)]
     pub prompt: String,
+    /// Text after the answer: the prompt and it are read as a
+    /// fill-in-the-middle prompt.
     #[serde(default)]
     pub suffix: Option<String>,
+    /// The system message, put before the prompt.
+    #[serde(default)]
+    pub system: Option<String>,
+    /// A Go template to render the prompt with, which joshua cannot run.
+    #[serde(default)]
+    pub template: Option<String>,
+    /// Read the prompt as it is, without the chat template.
+    #[serde(default)]
+    pub raw: Option<bool>,
+    /// The `context` an earlier reply gave back, to continue from.
+    #[serde(default)]
+    pub context: Option<Vec<u32>>,
     #[serde(default)]
     pub images: Option<Vec<String>>,
     #[serde(default)]
@@ -984,36 +1323,87 @@ pub struct GenerateRequest {
     pub format: Option<Value>,
     #[serde(default)]
     pub keep_alive: Option<Value>,
+    #[serde(default)]
+    pub think: Option<Value>,
+    #[serde(default)]
+    pub logprobs: Option<bool>,
+    #[serde(default)]
+    pub top_logprobs: Option<i64>,
+}
+
+impl GenerateRequest {
+    /// What the request reads: the prompt as it is (`raw`), an infill
+    /// prompt (`suffix`), the earlier `context` and the new turn, or the
+    /// new turn (`system` and the prompt with its images) alone.  `None`
+    /// when there is nothing to read.
+    fn source(&self) -> Result<Option<Source>, ApiError> {
+        if self.template.as_deref().is_some_and(|t| !t.is_empty()) {
+            return Err(ApiError::bad_request(
+                "`template` is not supported: prompts are rendered with the model's own chat template; use `raw` to send a prompt formatted by hand",
+            ));
+        }
+        let images = self.images.as_deref().unwrap_or_default();
+        let context = self.context.as_deref().unwrap_or_default();
+        let suffix = self.suffix.as_deref().filter(|s| !s.is_empty());
+        let raw = self.raw.unwrap_or(false);
+        if self.prompt.is_empty() && images.is_empty() && suffix.is_none() {
+            return Ok(None);
+        }
+        if !images.is_empty() && (raw || suffix.is_some() || !context.is_empty()) {
+            return Err(ApiError::bad_request(
+                "`images` cannot be combined with `raw`, `suffix` or `context`",
+            ));
+        }
+        if let Some(suffix) = suffix {
+            if raw || !context.is_empty() {
+                return Err(ApiError::bad_request(
+                    "`suffix` cannot be combined with `raw` or `context`",
+                ));
+            }
+            return Ok(Some(Source::Infill {
+                prefix: self.prompt.clone(),
+                suffix: suffix.to_string(),
+            }));
+        }
+        if raw {
+            // As Ollama, `system` and `context` mean nothing to a raw prompt.
+            return Ok(Some(Source::Raw(RawPrompt::text(self.prompt.clone()))));
+        }
+        let mut messages = Vec::new();
+        if let Some(system) = self.system.as_deref().filter(|s| !s.is_empty()) {
+            messages.push(ChatMessage::text("system", system));
+        }
+        let mut message = ChatMessage::text("user", &self.prompt);
+        if !images.is_empty() {
+            message.images = Some(images.iter().map(|i| image_url(i)).collect());
+        }
+        messages.push(message);
+        if context.is_empty() {
+            Ok(Some(Source::Chat(messages)))
+        } else {
+            Ok(Some(Source::Continue { context: context.to_vec(), messages }))
+        }
+    }
 }
 
 pub async fn generate(
     State(state): State<AppState>,
     Json(req): Json<GenerateRequest>,
 ) -> Result<Response, ApiError> {
-    let prompt = match &req.suffix {
-        Some(suffix) => format!("{}{suffix}", req.prompt),
-        None => req.prompt.clone(),
-    };
-    let images = req.images.unwrap_or_default();
-    // An empty prompt only loads (or, with `keep_alive: 0`, unloads).
-    let messages = if prompt.is_empty() && images.is_empty() {
-        Vec::new()
-    } else {
-        let mut message = ChatMessage::text("user", &prompt);
-        if !images.is_empty() {
-            message.images = Some(images.iter().map(|i| image_url(i)).collect());
-        }
-        vec![message]
-    };
+    let think = Think::parse(req.think.as_ref()).map_err(ApiError::bad_request)?;
+    let logprobs = logprob_count(req.logprobs, req.top_logprobs).map_err(ApiError::bad_request)?;
+    let source = req.source()?;
     let turn = Turn {
         wire: Wire::Generate,
         model: req.model,
-        messages,
+        source,
         tools: None,
         options: req.options,
         format: req.format,
         keep_alive: req.keep_alive,
         stream: req.stream.unwrap_or(true),
+        think,
+        logprobs,
     };
     answer(state, turn).await
 }
@@ -1487,5 +1877,21 @@ mod tests {
                 crate::types::MAX_TOKENS_UNLIMITED
             );
         }
+    }
+
+    #[test]
+    fn a_full_context_drops_its_oldest_tokens() {
+        let context: Vec<u32> = (0..10).collect();
+        // Room to spare for a 4-token answer: nothing is dropped.
+        assert_eq!(shift_context(context.clone(), 2, 16, 4, Some(0)), context);
+        // Too little: the BOS stays, then the newest tokens, leaving the 4
+        // the answer asks for.
+        assert_eq!(shift_context(context.clone(), 5, 16, 4, Some(0)), vec![0, 4, 5, 6, 7, 8, 9]);
+        // Without a leading BOS only the newest are kept.
+        assert_eq!(shift_context(context.clone(), 6, 16, 4, None), (4..10).collect::<Vec<u32>>());
+        // An answer asked to be longer gets a quarter of the window.
+        assert_eq!(shift_context(context.clone(), 6, 16, 100, None), (4..10).collect::<Vec<u32>>());
+        // A turn too long to leave room is left alone.
+        assert_eq!(shift_context(context.clone(), 12, 16, 4, Some(0)), context);
     }
 }

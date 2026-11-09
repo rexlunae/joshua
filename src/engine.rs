@@ -3966,6 +3966,50 @@ impl Engine {
         self.tokenize(&rendered.text, rendered.add_special_tokens)
     }
 
+    /// [`Engine::tokenize_chat`] for a turn that continues earlier tokens
+    /// (Ollama's `context`, which ends inside the last answer): what the
+    /// chat template puts after an answer and before the new turn's
+    /// generation prompt, so the earlier answer is closed as a whole
+    /// conversation would close it.  It is rendered after a stand-in
+    /// exchange and cut after the stand-in answer, so a new system message
+    /// stays in the turn.  A template that does not show that answer, or
+    /// will not render a system message there, gets the turn alone, without
+    /// the BOS its template puts first (the earlier tokens already start
+    /// with it).  The tokenizer adds no special tokens either way.
+    pub fn tokenize_chat_turn(
+        &self,
+        messages: &[ChatMessage],
+        options: &GenerationOptions,
+    ) -> Result<Vec<u32>> {
+        const ANSWER: &str = "\u{E000}joshua-earlier-answer\u{E000}";
+        let mut conversation = vec![
+            ChatMessage::text("user", "\u{E000}"),
+            ChatMessage::text("assistant", ANSWER),
+        ];
+        conversation.extend(messages.iter().cloned());
+        let (conversation, tools) = self.stable_chat(&conversation, None, false);
+        if let Ok(rendered) = self.render_chat(&conversation, tools.as_deref(), options) {
+            if let Some(at) = rendered.text.find(ANSWER) {
+                return self.tokenize(&rendered.text[at + ANSWER.len()..], false);
+            }
+        }
+        let (messages, tools) = self.stable_chat(messages, None, false);
+        let rendered = self.render_chat(&messages, tools.as_deref(), options)?;
+        let bos = self.template_tokens.0.as_str();
+        let text = match rendered.text.strip_prefix(bos) {
+            Some(rest) if !bos.is_empty() => rest,
+            _ => rendered.text.as_str(),
+        };
+        self.tokenize(text, false)
+    }
+
+    /// The BOS token the chat template starts a conversation with, if the
+    /// model has one.
+    pub fn bos_token(&self) -> Option<u32> {
+        let bos = self.template_tokens.0.as_str();
+        (!bos.is_empty()).then(|| self.tokenizer.token_to_id(bos)).flatten()
+    }
+
     /// Each token's vocabulary entry as the tokenizer spells it (vLLM's
     /// `/tokenize` `token_strs`), e.g. `Ġhello` for a byte-level BPE.
     pub fn token_strings(&self, ids: &[u32]) -> Vec<String> {
@@ -4625,6 +4669,20 @@ impl Engine {
         on_text: &mut dyn FnMut(&str),
     ) -> Result<Completion> {
         self.complete_prompt_inner(prompt, options, Some(cancel), Some(TextSink::Text(on_text)))
+    }
+
+    /// [`Engine::complete_prompt_streaming`] with the text split into
+    /// reasoning and answer as it is decoded, from where the prompt leaves
+    /// the reasoning (open when it ends inside a reasoning block), as
+    /// [`Engine::complete_chat_streaming_split`] does for a chat.
+    pub fn complete_prompt_streaming_split(
+        &self,
+        prompt: &RawPrompt,
+        options: &GenerationOptions,
+        cancel: &AtomicBool,
+        on_split: &mut dyn FnMut(crate::reasoning::Split),
+    ) -> Result<Completion> {
+        self.complete_prompt_inner(prompt, options, Some(cancel), Some(TextSink::Split(on_split)))
     }
 
     fn complete_prompt_inner(

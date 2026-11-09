@@ -2622,3 +2622,237 @@ async fn rerank_refuses_a_model_without_yes_and_no_tokens() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert!(body.contains("`yes` and `no`"), "{body}");
 }
+
+/// The objects of an Ollama newline-delimited JSON body.
+fn ndjson(body: &str) -> Vec<serde_json::Value> {
+    body.lines().map(|line| serde_json::from_str(line).unwrap()).collect()
+}
+
+/// `/api/generate`'s `context` comes back as the prompt's tokens and the
+/// answer's and continues a conversation; `system` goes before the prompt,
+/// `raw` skips the template (and gives no `context`), and `template` and an
+/// unknown `think` are refused.
+#[tokio::test]
+async fn ollama_generate_reads_context_system_and_raw_prompts() {
+    let json = |text: &str| -> serde_json::Value { serde_json::from_str(text).unwrap() };
+    let app = create_router(tiny_state("ollama-generate", None));
+    let generate = |extra: serde_json::Value| {
+        let mut body = serde_json::json!({
+            "model": "model", "prompt": "a b", "stream": false,
+            "options": {"num_predict": 3, "temperature": 0},
+        });
+        body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        let app = app.clone();
+        async move { call(&app, "POST", "/api/generate", Some(body)).await }
+    };
+
+    let (status, body) = generate(serde_json::json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let first = json(&body);
+    let context: Vec<u64> = first["context"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t.as_u64().unwrap())
+        .collect();
+    let (prompt, eval) = (
+        first["prompt_eval_count"].as_u64().unwrap(),
+        first["eval_count"].as_u64().unwrap(),
+    );
+    assert_eq!(context.len() as u64, prompt + eval, "{body}");
+
+    // Continuing reads the earlier tokens, then the new turn.
+    let (status, body) = generate(serde_json::json!({"prompt": "c", "context": context})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let next = json(&body);
+    assert!(next["prompt_eval_count"].as_u64().unwrap() > context.len() as u64, "{body}");
+    let continued: Vec<u64> = next["context"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t.as_u64().unwrap())
+        .collect();
+    assert_eq!(&continued[..context.len()], &context[..], "{body}");
+
+    // A system message lengthens the prompt.
+    let (status, body) = generate(serde_json::json!({"system": "d e"})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(json(&body)["prompt_eval_count"].as_u64().unwrap() > prompt, "{body}");
+
+    // A raw prompt is read as it is: three words, no template, no context.
+    let (status, body) = generate(serde_json::json!({"prompt": "a b c", "raw": true})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let raw = json(&body);
+    assert_eq!(raw["prompt_eval_count"], 3, "{body}");
+    assert!(raw.get("context").is_none(), "{body}");
+
+    for (extra, needle) in [
+        (serde_json::json!({"template": "{{ .Prompt }}"}), "template"),
+        (serde_json::json!({"think": "max"}), "think"),
+        (serde_json::json!({"think": true}), "does not support thinking"),
+        (serde_json::json!({"suffix": "c"}), "insert"),
+        (serde_json::json!({"top_logprobs": 2}), "logprobs"),
+        (serde_json::json!({"raw": true, "suffix": "c"}), "suffix"),
+    ] {
+        let (status, body) = generate(extra.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{extra}: {body}");
+        assert!(body.contains(needle), "{extra}: {body}");
+    }
+    let (status, body) = generate(serde_json::json!({"think": false})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// `logprobs` and `top_logprobs` report each answer token, whole or
+/// streamed.
+#[tokio::test]
+async fn ollama_chat_reports_logprobs() {
+    let json = |text: &str| -> serde_json::Value { serde_json::from_str(text).unwrap() };
+    let app = create_router(tiny_state("ollama-logprobs", None));
+    let request = serde_json::json!({
+        "model": "model", "messages": [{"role": "user", "content": "a b"}],
+        "stream": false, "logprobs": true, "top_logprobs": 2,
+        "options": {"num_predict": 4, "temperature": 0},
+    });
+    let (status, body) = call(&app, "POST", "/api/chat", Some(request.clone())).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let whole = json(&body);
+    let entries = whole["logprobs"].as_array().unwrap();
+    assert_eq!(entries.len() as u64, whole["eval_count"].as_u64().unwrap(), "{body}");
+    for entry in entries {
+        assert!(entry["token"].is_string(), "{body}");
+        assert!(entry["logprob"].as_f64().unwrap() <= 0.0, "{body}");
+        assert_eq!(entry["top_logprobs"].as_array().unwrap().len(), 2, "{body}");
+    }
+
+    let mut streaming = request;
+    streaming["stream"] = serde_json::json!(true);
+    let (status, body) = call(&app, "POST", "/api/chat", Some(streaming)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let streamed: Vec<serde_json::Value> = ndjson(&body)
+        .iter()
+        .filter_map(|line| line["logprobs"].as_array().cloned())
+        .flatten()
+        .collect();
+    assert_eq!(&streamed, entries, "{body}");
+}
+
+/// `think` turns the reasoning on and it comes back under `thinking`, apart
+/// from the answer, whole or streamed.
+#[tokio::test]
+async fn ollama_returns_thinking_apart_from_the_answer() {
+    let json = |text: &str| -> serde_json::Value { serde_json::from_str(text).unwrap() };
+    let app = create_router(think_state("ollama-think"));
+    let request = serde_json::json!({
+        "model": "model", "messages": [{"role": "user", "content": "a b"}],
+        "stream": false, "think": true,
+        "options": {"num_predict": 5, "temperature": 0},
+    });
+    let (status, body) = call(&app, "POST", "/api/chat", Some(request.clone())).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let whole = json(&body);
+    let thinking = whole["message"]["thinking"].as_str().unwrap_or_default().to_string();
+    let content = whole["message"]["content"].as_str().unwrap().to_string();
+    assert!(!thinking.is_empty(), "{body}");
+    assert!(!content.contains("</think>") && !thinking.contains("</think>"), "{body}");
+
+    let mut streaming = request;
+    streaming["stream"] = serde_json::json!(true);
+    let (status, body) = call(&app, "POST", "/api/chat", Some(streaming)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let lines = ndjson(&body);
+    let text = |key: &str| -> String {
+        lines
+            .iter()
+            .filter_map(|line| line["message"][key].as_str())
+            .collect()
+    };
+    assert_eq!(text("thinking"), thinking, "{body}");
+    assert_eq!(text("content"), content, "{body}");
+
+    // Generate puts it beside `response`.
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/api/generate",
+        Some(serde_json::json!({
+            "model": "model", "prompt": "a b", "stream": false, "think": "high",
+            "options": {"num_predict": 5, "temperature": 0},
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(json(&body)["thinking"], thinking.as_str(), "{body}");
+}
+
+/// `suffix` reads the prompt and it as the model's fill-in-the-middle
+/// prompt: [PRE] prompt [SUF] suffix [MID].
+#[tokio::test]
+async fn ollama_generate_fills_in_the_middle() {
+    use candle_core::quantized::gguf_file::Value;
+    let dir = model_dir("ollama-fim");
+    let fim = |key: &str, id: u32| (format!("tokenizer.ggml.fim_{key}_token_id"), Value::U32(id));
+    common::write_tiny_gguf_with(
+        &dir.join("model.gguf"),
+        "llama",
+        &[fim("pre", 10), fim("suf", 11), fim("mid", 12)],
+    );
+    let engine = Engine::with_n_ctx(&dir, 512).expect("engine should load tiny model");
+    let app = create_router(Arc::new(ServerState::new(Arc::new(engine))));
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/api/generate",
+        Some(serde_json::json!({
+            "model": "model", "prompt": "hello", "suffix": "world", "stream": false,
+            "options": {"num_predict": 2, "temperature": 0},
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let reply: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(reply["prompt_eval_count"], 5, "{body}");
+    assert!(reply.get("context").is_none(), "{body}");
+}
+
+/// A conversation continued from its `context` closes the earlier answer
+/// as the chat template closes an answer ("hello" here) before the new
+/// turn.
+#[tokio::test]
+async fn ollama_context_closes_the_earlier_answer() {
+    let dir = model_dir("ollama-context-turns");
+    let model = dir.join("model.gguf");
+    write_tiny_llama_gguf(&model);
+    common::replace_chat_template(
+        &model,
+        "{% for m in messages %}{{ m.content }} hello {% endfor %}\
+         {% if add_generation_prompt %}world{% endif %}",
+    );
+    let engine = Engine::with_n_ctx(&dir, 512).expect("engine should load tiny model");
+    let app = create_router(Arc::new(ServerState::new(Arc::new(engine))));
+    let generate = |extra: serde_json::Value| {
+        let mut body = serde_json::json!({
+            "model": "model", "prompt": "a b", "stream": false,
+            "options": {"num_predict": 2, "temperature": 0},
+        });
+        body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        let app = app.clone();
+        async move {
+            let (status, body) = call(&app, "POST", "/api/generate", Some(body)).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let reply: serde_json::Value = serde_json::from_str(&body).unwrap();
+            reply["context"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t.as_u64().unwrap())
+                .collect::<Vec<u64>>()
+        }
+    };
+    let first = generate(serde_json::json!({})).await;
+    let next = generate(serde_json::json!({"prompt": "c", "context": first})).await;
+    // hello (closing the answer), c, hello, world, then the new answer.
+    assert_eq!(&next[first.len()..first.len() + 4], &[1, 6, 1, 2], "{next:?}");
+    // A new system message stays in the new turn: hello, d, hello, c, ...
+    let next = generate(serde_json::json!({"prompt": "c", "system": "d", "context": first})).await;
+    assert_eq!(&next[first.len()..first.len() + 6], &[1, 7, 1, 6, 1, 2], "{next:?}");
+}
