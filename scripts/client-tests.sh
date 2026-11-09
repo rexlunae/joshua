@@ -34,6 +34,12 @@ if [[ "${SKIP_INSTALL:-0}" != 1 ]]; then
 fi
 python="${PYTHON:-clients/python/.venv/bin/python}"
 
+# A server already on the port would answer /health for ours and take the
+# tests: refuse to start rather than test the wrong binary.
+if curl -s -o /dev/null "http://127.0.0.1:$port/"; then
+    echo "port $port is already in use; set JOSHUA_PORT to a free one" >&2
+    exit 1
+fi
 "target/$profile/joshua" serve --model "$work/tiny" --addr "127.0.0.1:$port" --n-ctx 256 \
     >"$work/server.log" 2>&1 &
 server_pid=$!
@@ -47,6 +53,7 @@ for _ in $(seq 120); do
     sleep 1
 done
 curl -sf "http://127.0.0.1:$port/health" >/dev/null || { cat "$work/server.log"; exit 1; }
+kill -0 "$server_pid" 2>/dev/null || { cat "$work/server.log"; echo "joshua serve exited" >&2; exit 1; }
 
 export JOSHUA_URL="http://127.0.0.1:$port" JOSHUA_MODEL=tiny
 status=0

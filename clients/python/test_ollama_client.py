@@ -1,5 +1,7 @@
 """The `ollama` Python library against joshua's Ollama routes."""
 
+import json
+
 import ollama
 import pytest
 
@@ -53,7 +55,12 @@ def test_chat_format_json(client, model):
         format="json",
         options={"num_predict": 32},
     )
-    assert isinstance(r.message.content, str)
+    text = r.message.content
+    # The constraint allows only JSON: a finished answer parses, and one cut
+    # off by num_predict is still the start of an object.
+    assert text.startswith("{"), text
+    if r.done_reason == "stop":
+        assert isinstance(json.loads(text), dict), text
 
 
 def test_generate_with_context(client, model):

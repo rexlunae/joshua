@@ -2,7 +2,7 @@ import os
 
 import pytest
 
-URL = os.environ.get("JOSHUA_URL", "http://127.0.0.1:18080")
+URL = os.environ.get("JOSHUA_URL", "http://127.0.0.1:18080").rstrip("/")
 MODEL = os.environ.get("JOSHUA_MODEL", "tiny")
 
 
