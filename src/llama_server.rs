@@ -32,7 +32,7 @@ use crate::server::{
     EMBEDDING_RESPONSE_LIMIT,
 };
 use crate::types::{
-    ChatCompletionRequest, ConstraintSpec, GenerationOptions, MAX_TOKENS_UNLIMITED,
+    ChatCompletionRequest, ConstraintSpec, GenerationOptions, TokenLogprob, MAX_TOKENS_UNLIMITED,
 };
 
 /// The fields of a `/completion` or `/infill` request that are not sampling
@@ -49,8 +49,14 @@ struct LlamaRequest {
     /// Put the generated token ids in `tokens`.
     #[serde(default)]
     return_tokens: Option<bool>,
+    /// Report each generated token's probability with this many
+    /// alternatives, in `completion_probabilities`.
     #[serde(default)]
     n_probs: Option<u32>,
+    /// Probabilities after the sampler chain rather than the model's own;
+    /// only the model's are reported.
+    #[serde(default)]
+    post_sampling_probs: Option<bool>,
     #[serde(default)]
     grammar: Option<String>,
     #[serde(default)]
@@ -72,8 +78,13 @@ impl LlamaRequest {
     fn parse(body: &Value) -> Result<Self, ApiError> {
         let req: Self = serde_json::from_value(body.clone())
             .map_err(|e| ApiError::bad_request(e.to_string()))?;
-        if req.n_probs.is_some_and(|n| n > 0) {
-            return Err(ApiError::bad_request("n_probs is not supported"));
+        if let Some(n) = req.n_probs {
+            crate::logprobs::count("n_probs", i64::from(n)).map_err(ApiError::bad_request)?;
+        }
+        if req.post_sampling_probs == Some(true) {
+            return Err(ApiError::bad_request(
+                "`post_sampling_probs` is not supported; probabilities are the model's own",
+            ));
         }
         if req.grammar.as_deref().is_some_and(|g| !g.trim().is_empty()) {
             return Err(ApiError::bad_request(
@@ -141,7 +152,7 @@ pub(crate) fn generation_settings(options: &GenerationOptions) -> Value {
         "max_tokens": n_predict,
         "ignore_eos": options.ignore_eos,
         "min_tokens": options.min_tokens,
-        "n_probs": 0,
+        "n_probs": options.logprobs.unwrap_or(0),
         "grammar": "",
     })
 }
@@ -152,6 +163,9 @@ struct Frame {
     model: String,
     settings: Value,
     return_tokens: bool,
+    /// The engine that names the tokens of `completion_probabilities`,
+    /// when the request set `n_probs`.
+    probs: Option<Arc<Engine>>,
 }
 
 /// What a result reports about its prompt: the prompt's text and whether
@@ -171,8 +185,42 @@ impl JobFacts {
 }
 
 impl Frame {
-    /// A finished prompt's result (llama-server's final response).
-    fn result(&self, index: usize, content: &str, job: &JobFacts, completion: &Completion) -> Value {
+    /// A piece of streamed text, with its tokens' probabilities.
+    fn partial(&self, index: usize, content: &str, entries: &[TokenLogprob]) -> Value {
+        let mut value = json!({
+            "index": index, "content": content, "tokens": [], "stop": false, "id_slot": -1,
+        });
+        if let Some(engine) = &self.probs {
+            value["completion_probabilities"] = crate::logprobs::llama(engine, entries);
+        }
+        value
+    }
+
+    /// A finished prompt's result (llama-server's final response), with
+    /// the probabilities of `entries`: all the prompt's tokens, or those a
+    /// stream has not yet sent.
+    fn result(
+        &self,
+        index: usize,
+        content: &str,
+        job: &JobFacts,
+        completion: &Completion,
+        entries: &[TokenLogprob],
+    ) -> Value {
+        let mut value = self.result_fields(index, content, job, completion);
+        if let Some(engine) = &self.probs {
+            value["completion_probabilities"] = crate::logprobs::llama(engine, entries);
+        }
+        value
+    }
+
+    fn result_fields(
+        &self,
+        index: usize,
+        content: &str,
+        job: &JobFacts,
+        completion: &Completion,
+    ) -> Value {
         json!({
             "index": index,
             "content": content,
@@ -210,11 +258,9 @@ async fn answer(
         let facts: Vec<JobFacts> = jobs.iter().map(JobFacts::of).collect();
         let framer = move |progress: Progress<'_>| -> Option<Value> {
             Some(match progress {
-                Progress::Text(index, text) => json!({
-                    "index": index, "content": text, "tokens": [], "stop": false, "id_slot": -1,
-                }),
-                Progress::Done(index, completion) => {
-                    frame.result(index, "", &facts[index], completion)
+                Progress::Text(index, text, entries) => frame.partial(index, text, entries),
+                Progress::Done(index, completion, entries) => {
+                    frame.result(index, "", &facts[index], completion, entries)
                 }
             })
         };
@@ -236,7 +282,13 @@ async fn answer(
         .zip(&jobs)
         .enumerate()
         .map(|(index, (completion, job))| {
-            frame.result(index, &completion.text, &JobFacts::of(job), completion)
+            frame.result(
+                index,
+                &completion.text,
+                &JobFacts::of(job),
+                completion,
+                &completion.logprobs,
+            )
         })
         .collect();
     Ok(match results.len() {
@@ -268,17 +320,19 @@ async fn prepare(
     let req = LlamaRequest::parse(body)?;
     let constraint = req.constraint()?;
     let (model, engine) = select_model(state, &req.model).await?;
-    let options = options(
+    let mut options = options(
         &engine,
         &random_seed_spelled_out(body),
         SamplingProfile::LlamaCpp,
         constraint,
         headers,
     )?;
+    options.logprobs = req.n_probs.filter(|n| *n > 0);
     let frame = Frame {
         model,
         settings: generation_settings(&options),
         return_tokens: req.return_tokens == Some(true),
+        probs: options.logprobs.map(|_| Arc::clone(&engine)),
     };
     Ok((req, engine, options, frame))
 }
@@ -468,7 +522,9 @@ mod tests {
 
     #[test]
     fn unsupported_fields_are_refused() {
-        assert!(request(json!({"n_probs": 3})).is_err());
+        assert!(request(json!({"n_probs": 3})).is_ok());
+        assert!(request(json!({"n_probs": 21})).is_err());
+        assert!(request(json!({"n_probs": 3, "post_sampling_probs": true})).is_err());
         assert!(request(json!({"grammar": "root ::= \"a\""})).is_err());
         assert!(request(json!({"lora": [{"id": 0, "scale": 1.0}]})).is_err());
         assert!(request(json!({"n_probs": 0, "grammar": "", "lora": []})).is_ok());

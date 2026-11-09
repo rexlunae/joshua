@@ -240,6 +240,13 @@ impl ReasoningSplitter {
         )
     }
 
+    /// Whether the splitter cannot yet tell what the text it holds is: the
+    /// output may still open a reasoning block, or a harmony header is
+    /// being read.
+    pub fn undecided(&self) -> bool {
+        matches!(self.state, State::Start | State::Header)
+    }
+
     /// Feed newly decoded text; returns what can be classified now.
     pub fn push(&mut self, text: &str) -> Split {
         let mut out = Split::default();

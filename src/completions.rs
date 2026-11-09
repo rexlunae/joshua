@@ -5,9 +5,11 @@
 //! `stream` sends server-sent `text_completion` chunks ending in
 //! `data: [DONE]`; `echo` repeats the prompt in front of the text; `suffix`
 //! builds a fill-in-the-middle prompt for a model with FIM tokens; and
-//! `response_format` constrains the output as on the chat route.  Sampling
-//! fields are the shared [`SamplingParams`].  `logprobs`, `n > 1` and
-//! `best_of > 1` are refused rather than ignored.
+//! `response_format` constrains the output as on the chat route; `logprobs`
+//! reports each generated token's log-probability with that many
+//! alternatives.  Sampling fields are the shared [`SamplingParams`].
+//! `n > 1`, `best_of > 1` and `echo` with `logprobs` (the prompt's
+//! log-probabilities) are refused rather than ignored.
 //!
 //! The prompt forms, the infill prompt, the request's options and the
 //! runners that complete a request's prompts are shared with llama-server's
@@ -32,7 +34,8 @@ use crate::fim::InfillChunk;
 use crate::sampling::SamplingProfile;
 use crate::server::{select_model, sse_response, ApiError, AppState, CancelOnDrop, ServerMetrics};
 use crate::types::{
-    unix_time, ConstraintSpec, GenerationOptions, SamplingParams, UsageInfo, MAX_TOKENS_UNLIMITED,
+    unix_time, ConstraintSpec, GenerationOptions, LogprobSink, SamplingParams, TokenLogprob,
+    UsageInfo, MAX_TOKENS_UNLIMITED,
 };
 
 /// The fields of a completion request that are not sampling settings.
@@ -164,23 +167,32 @@ pub(crate) fn prompts_in(
 }
 
 impl CompletionRequest {
-    /// Refuse what this endpoint does not do, rather than ignore it.
-    fn check(&self) -> Result<(), String> {
+    /// Refuse what this endpoint does not do, rather than ignore it, and
+    /// read `logprobs`: how many alternatives to report with each token
+    /// (0 reports the token's own), or `None` for no log-probabilities.
+    fn check(&self) -> Result<Option<u32>, String> {
         if self.n.is_some_and(|n| n != 1) {
             return Err("only n = 1 is supported".to_string());
         }
         if self.best_of.is_some_and(|n| n > 1) {
             return Err("best_of > 1 is not supported".to_string());
         }
-        let wants_logprobs = match &self.logprobs {
-            None | Some(Value::Null) | Some(Value::Bool(false)) => false,
-            Some(Value::Number(n)) => n.as_u64() != Some(0) || n.as_i64().is_none(),
-            Some(_) => true,
+        let logprobs = match &self.logprobs {
+            None | Some(Value::Null) | Some(Value::Bool(false)) => None,
+            Some(Value::Number(n)) => Some(crate::logprobs::count(
+                "logprobs",
+                n.as_i64().ok_or("`logprobs` must be a whole number")?,
+            )?),
+            Some(_) => return Err("`logprobs` must be a whole number".to_string()),
         };
-        if wants_logprobs {
-            return Err("logprobs are not supported".to_string());
+        if logprobs.is_some() && self.echo == Some(true) {
+            return Err(
+                "`echo` with `logprobs` asks for the prompt's log-probabilities, \
+                 which are not supported yet"
+                    .to_string(),
+            );
         }
-        Ok(())
+        Ok(logprobs)
     }
 }
 
@@ -341,12 +353,14 @@ pub(crate) async fn complete_all(
     Ok(completions)
 }
 
-/// What a streamed request reports, prompt by prompt.
+/// What a streamed request reports, prompt by prompt.  Each carries the
+/// log-probabilities of the tokens decoded since the last report, when the
+/// request asked for them.
 pub(crate) enum Progress<'a> {
     /// New text for the prompt at this index.
-    Text(usize, &'a str),
+    Text(usize, &'a str, &'a [TokenLogprob]),
     /// The prompt at this index is done.
-    Done(usize, &'a Completion),
+    Done(usize, &'a Completion, &'a [TokenLogprob]),
 }
 
 /// Stream each job's completion in turn as server-sent events, each
@@ -356,7 +370,7 @@ pub(crate) enum Progress<'a> {
 pub(crate) fn stream_all(
     engine: Arc<Engine>,
     jobs: Vec<Job>,
-    options: GenerationOptions,
+    mut options: GenerationOptions,
     metrics: Arc<ServerMetrics>,
     mut frame: impl FnMut(Progress<'_>) -> Option<Value> + Send + 'static,
     error: Value,
@@ -379,14 +393,18 @@ pub(crate) fn stream_all(
             }
         };
         for (index, job) in jobs.iter().enumerate() {
+            // Each prompt's tokens are placed in its own text.
+            let sink = options.logprobs.map(|_| LogprobSink::default());
+            options.logprob_sink = sink.clone();
+            let take = || sink.as_ref().map(LogprobSink::take).unwrap_or_default();
             let result =
                 engine.complete_prompt_streaming(&job.prompt, &options, flag, &mut |text| {
-                    send(frame(Progress::Text(index, text)))
+                    send(frame(Progress::Text(index, text, &take())))
                 });
             match result {
                 Ok(completion) => {
                     metrics.record_generation(&completion.usage);
-                    send(frame(Progress::Done(index, &completion)));
+                    send(frame(Progress::Done(index, &completion, &take())));
                 }
                 Err(e) => {
                     tracing::error!("streaming completion failed: {e}");
@@ -437,7 +455,7 @@ pub(crate) async fn completions(
 ) -> Result<Response, ApiError> {
     let req: CompletionRequest =
         serde_json::from_value(body.clone()).map_err(|e| ApiError::bad_request(e.to_string()))?;
-    req.check().map_err(ApiError::bad_request)?;
+    let logprobs = req.check().map_err(ApiError::bad_request)?;
     let prompts =
         prompts(req.prompt.as_ref(), PromptForms::OpenAi).map_err(ApiError::bad_request)?;
     let constraint = match &req.response_format {
@@ -447,13 +465,14 @@ pub(crate) async fn completions(
         None => None,
     };
     let (model, engine) = select_model(&state, &req.model).await?;
-    let options = options(
+    let mut options = options(
         &engine,
         &body,
         SamplingProfile::OpenAi,
         constraint,
         &headers,
     )?;
+    options.logprobs = logprobs;
     let echo = req.echo == Some(true);
     let build = Build {
         suffix: req.suffix.clone(),
@@ -465,11 +484,25 @@ pub(crate) async fn completions(
     let created = unix_time();
 
     if req.stream == Some(true) {
-        let chunk = move |index: usize, text: &str, finish: Option<&str>| {
+        // Each chunk's tokens, offset into the whole choice's text.
+        let render = {
+            let engine = Arc::clone(&engine);
+            move |entries: &[TokenLogprob]| -> Value {
+                if logprobs.is_none() {
+                    return Value::Null;
+                }
+                crate::logprobs::completion(&engine, entries)
+            }
+        };
+        let chunk = move |index: usize,
+                          text: &str,
+                          entries: &[TokenLogprob],
+                          finish: Option<&str>| {
             json!({
                 "id": id, "object": "text_completion", "created": created, "model": model,
                 "choices": [{
-                    "index": index, "text": text, "logprobs": null, "finish_reason": finish,
+                    "index": index, "text": text, "logprobs": render(entries),
+                    "finish_reason": finish,
                 }],
             })
         };
@@ -486,17 +519,18 @@ pub(crate) async fn completions(
         };
         let frame = move |progress: Progress<'_>| -> Option<Value> {
             match progress {
-                Progress::Text(index, text) => {
+                Progress::Text(index, text, entries) => {
                     let text = match echo_once(index) {
                         Some(prompt) => prompt + text,
                         None => text.to_string(),
                     };
-                    Some(chunk(index, &text, None))
+                    Some(chunk(index, &text, entries, None))
                 }
-                Progress::Done(index, completion) => {
+                Progress::Done(index, completion, entries) => {
                     usages.push(completion.usage.clone());
                     let text = echo_once(index).unwrap_or_default();
-                    let mut last = chunk(index, &text, Some(completion.finish_reason()));
+                    let mut last =
+                        chunk(index, &text, entries, Some(completion.finish_reason()));
                     if index + 1 == count {
                         last["usage"] =
                             serde_json::to_value(total_usage(&usages)).unwrap_or_default();
@@ -531,8 +565,12 @@ pub(crate) async fn completions(
             } else {
                 completion.text.clone()
             };
+            let logprobs = match logprobs {
+                Some(_) => crate::logprobs::completion(&engine, &completion.logprobs),
+                None => Value::Null,
+            };
             json!({
-                "text": text, "index": index, "logprobs": null,
+                "text": text, "index": index, "logprobs": logprobs,
                 "finish_reason": completion.finish_reason(),
             })
         })
