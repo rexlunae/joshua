@@ -50,7 +50,7 @@ pub async fn set(
 }
 
 /// Serialises runtime adapter loads (see [`vllm_load`]).
-static RUNTIME_LOADS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+pub(crate) static RUNTIME_LOADS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// vLLM's `POST /v1/load_lora_adapter` body.
 #[derive(Debug, Deserialize)]

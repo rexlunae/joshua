@@ -1391,6 +1391,23 @@ async fn vllm_runtime_lora_routes_and_adapter_named_models() {
     assert!(engine.lora_adapters().is_empty());
 }
 
+/// The Hugging Face module a GGUF projection's adapter pair targets.
+fn hf_module(base: &str) -> String {
+    let rest = base.strip_prefix("blk.").unwrap().strip_suffix(".weight").unwrap();
+    let (layer, proj) = rest.split_once('.').unwrap();
+    let module = match proj {
+        "attn_q" => "self_attn.q_proj",
+        "attn_k" => "self_attn.k_proj",
+        "attn_v" => "self_attn.v_proj",
+        "attn_output" => "self_attn.o_proj",
+        "ffn_gate" => "mlp.gate_proj",
+        "ffn_up" => "mlp.up_proj",
+        "ffn_down" => "mlp.down_proj",
+        other => panic!("no HF name for {other}"),
+    };
+    format!("base_model.model.model.layers.{layer}.{module}")
+}
+
 /// A Hugging Face PEFT adapter (`adapter_config.json` and
 /// `adapter_model.safetensors`) runs exactly as the GGUF that
 /// `convert_lora_to_gguf.py` would make of it: the same pairs, Q/K `B` rows
@@ -1399,21 +1416,6 @@ async fn vllm_runtime_lora_routes_and_adapter_named_models() {
 fn peft_adapters_match_their_gguf_conversion() {
     use std::collections::HashMap;
 
-    fn hf_module(base: &str) -> String {
-        let rest = base.strip_prefix("blk.").unwrap().strip_suffix(".weight").unwrap();
-        let (layer, proj) = rest.split_once('.').unwrap();
-        let module = match proj {
-            "attn_q" => "self_attn.q_proj",
-            "attn_k" => "self_attn.k_proj",
-            "attn_v" => "self_attn.v_proj",
-            "attn_output" => "self_attn.o_proj",
-            "ffn_gate" => "mlp.gate_proj",
-            "ffn_up" => "mlp.up_proj",
-            "ffn_down" => "mlp.down_proj",
-            other => panic!("no HF name for {other}"),
-        };
-        format!("base_model.model.model.layers.{layer}.{module}")
-    }
     /// The inverse of convert_hf_to_gguf.py's Q/K row permutation.
     fn unpermute(b: &[f32], n_out: usize, r: usize, heads: usize) -> Vec<f32> {
         let half = n_out / heads / 2;
@@ -1499,4 +1501,156 @@ fn peft_adapters_match_their_gguf_conversion() {
         }
         std::fs::remove_dir_all(dir).ok();
     }
+}
+
+/// Ollama's create with `ADAPTER`: the adapter is kept as a model of its own
+/// name on its base, listed by `/api/tags` and `/v1/models`, loaded on first
+/// use, copied and deleted like a model.
+#[tokio::test]
+async fn ollama_create_with_an_adapter_serves_it_as_a_model() {
+    use axum::body::Body;
+    use axum::http::{header, Request, StatusCode};
+    use joshua::server::{create_router, ServerState};
+    use serde_json::{json, Value};
+    use sha2::{Digest, Sha256};
+    use std::collections::HashMap;
+    use tower::ServiceExt;
+
+    let path = fixture("ollama", "qwen3", |p| common::write_tiny_qwen_gguf(p, "qwen3"));
+    let dir = path.parent().unwrap().to_path_buf();
+    let table = load(&path).lora_slots().expect("the qwen loader applies LoRA");
+    let scratch = common::model_dir("lora-ollama-uploads");
+    let specs = specs(&table, 2, 11, |n| !n.contains("attn_qkv") && !n.contains("_shexp"));
+    let gguf = std::fs::read(write_adapter(&scratch, "style.gguf", &table, 0.0, &specs)).unwrap();
+    // The same pairs as a PEFT adapter (Qwen's RoPE needs no permutation).
+    let mut tensors = HashMap::new();
+    for s in &specs {
+        let m = hf_module(&s.base);
+        tensors.insert(format!("{m}.lora_A.weight"), Tensor::from_vec(s.a.clone(), (s.r, s.n_in), &Device::Cpu).unwrap());
+        tensors.insert(format!("{m}.lora_B.weight"), Tensor::from_vec(s.b.clone(), (s.n_out, s.r), &Device::Cpu).unwrap());
+    }
+    candle_core::safetensors::save(&tensors, scratch.join("adapter_model.safetensors")).unwrap();
+    let weights = std::fs::read(scratch.join("adapter_model.safetensors")).unwrap();
+    let config = br#"{"peft_type": "LORA", "r": 2, "lora_alpha": 2}"#.to_vec();
+
+    let engine = Arc::new(joshua::Engine::with_n_ctx(&path, 64).unwrap());
+    let app = create_router(Arc::new(ServerState {
+        manager: Some(joshua::server::ModelManager {
+            model_dir: dir.clone(),
+            engine_options: Arc::new(|_: &Path| joshua::EngineOptions::with_n_ctx(64)),
+            npu_backend: None,
+            max_concurrency: None,
+            max_output_tokens: None,
+            allow_private_pull: false,
+            #[cfg(feature = "distributed")]
+            workers: Vec::new(),
+            #[cfg(feature = "distributed")]
+            cluster_key: None,
+        }),
+        ..ServerState::new(Arc::clone(&engine))
+    }));
+    let call = |method: &str, uri: &str, body: Body| {
+        let req = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(body)
+            .unwrap();
+        let app = app.clone();
+        async move {
+            let res = app.oneshot(req).await.unwrap();
+            let status = res.status();
+            let bytes = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap();
+            (status, serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null))
+        }
+    };
+    let json_call = |method: &'static str, uri: &'static str, body: Value| call(method, uri, Body::from(body.to_string()));
+    let upload = |bytes: Vec<u8>| {
+        let digest = format!("sha256:{:x}", Sha256::digest(&bytes));
+        let uri = format!("/api/blobs/{digest}");
+        async move {
+            let (status, _) = call("POST", &uri, Body::from(bytes)).await;
+            assert_eq!(status, StatusCode::CREATED);
+            digest
+        }
+    };
+    let names = |listing: &Value, key: &str| -> Vec<String> {
+        let name = |m: &Value| m[if key == "models" { "name" } else { "id" }].as_str().unwrap().trim_end_matches(":latest").to_string();
+        listing[key].as_array().unwrap().iter().map(name).collect()
+    };
+    let gguf_digest = upload(gguf).await;
+    let model_digest = upload(std::fs::read(&path).unwrap()).await;
+
+    // Refused: a base that is not a model, a name that is one, a file that
+    // is not an adapter, and a base given as files.
+    let create = |body: Value| json_call("POST", "/api/create", body);
+    let (status, _) = create(json!({"model": "tuned", "from": "nope", "adapters": {"style.gguf": gguf_digest}, "stream": false})).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = create(json!({"model": "model", "from": "model", "adapters": {"style.gguf": gguf_digest}, "stream": false})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, body) = create(json!({"model": "tuned", "from": "model", "adapters": {"m.gguf": model_digest}, "stream": false})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let (status, _) = create(json!({"model": "tuned", "files": {"m.gguf": model_digest}, "adapters": {"style.gguf": gguf_digest}, "stream": false})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // `ollama create tuned` from `FROM model` + `ADAPTER style.gguf`.
+    let (status, body) = create(json!({"model": "tuned", "from": "model:latest", "adapters": {"style.gguf": gguf_digest}, "stream": false})).await;
+    assert_eq!((status, body["status"].as_str()), (StatusCode::OK, Some("success")), "{body}");
+    let (_, tags) = json_call("GET", "/api/tags", Value::Null).await;
+    assert!(names(&tags, "models").contains(&"tuned".to_string()), "{tags}");
+    let (_, models) = json_call("GET", "/v1/models", Value::Null).await;
+    let card = models["data"].as_array().unwrap().iter().find(|m| m["id"] == "tuned").cloned().unwrap();
+    assert_eq!(card["parent"], "model");
+    let (status, show) = json_call("POST", "/api/show", json!({"model": "tuned"})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(show["modelfile"].as_str().unwrap().contains("FROM model\nADAPTER "), "{show}");
+    assert_eq!(show["details"]["parent_model"], "model");
+
+    // A router admits it on its base's slots before it is loaded.
+    let (_, info) = json_call("GET", "/v1/worker/info", Value::Null).await;
+    let slots = info["models"].as_array().unwrap().iter().find(|m| m["id"] == "tuned").cloned();
+    assert_eq!(slots.map(|m| m["alias_of"].clone()), Some(json!("model")), "{info}");
+
+    // Not loaded until a request names it; then it runs on the base.
+    assert_eq!(engine.lora_id("tuned"), None);
+    let generate = |model: &'static str| json_call("POST", "/api/generate", json!({"model": model, "prompt": "hi", "stream": false, "options": {"num_predict": 2}}));
+    let (status, body) = generate("tuned").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["model"], "tuned");
+    assert!(engine.lora_id("tuned").is_some());
+    // keep_alive 0 lets the adapter go and keeps the base.
+    let (status, _) = json_call("POST", "/api/generate", json!({"model": "tuned", "keep_alive": 0})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(engine.lora_id("tuned"), None);
+    let (_, models) = json_call("GET", "/v1/models", Value::Null).await;
+    assert!(names(&models, "data").contains(&"model".to_string()));
+
+    // A PEFT adapter, as `ADAPTER ./dir` uploads it.
+    let weights_digest = upload(weights).await;
+    let config_digest = upload(config).await;
+    let (status, body) = create(json!({"model": "peft", "from": "model", "adapters": {
+        "adapter_model.safetensors": weights_digest, "adapter_config.json": config_digest}, "stream": false})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = generate("peft").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(engine.lora_id("peft").is_some());
+
+    // Copy and delete act on adapter models as on model files.
+    let (status, _) = json_call("POST", "/api/copy", json!({"source": "tuned", "destination": "tuned2"})).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = generate("tuned2").await;
+    assert_eq!(status, StatusCode::OK);
+    for name in ["tuned", "tuned2", "peft"] {
+        let (status, _) = json_call("DELETE", "/api/delete", json!({"model": name})).await;
+        assert_eq!(status, StatusCode::OK, "{name}");
+        assert_eq!(engine.lora_id(name), None, "{name}");
+    }
+    let (_, tags) = json_call("GET", "/api/tags", Value::Null).await;
+    assert_eq!(names(&tags, "models"), ["model"], "{tags}");
+    // The name is gone: the one loaded model answers it, as any unknown name.
+    let (_, body) = generate("tuned").await;
+    assert_eq!(body["model"], "model");
+    assert_eq!(engine.lora_id("tuned"), None);
+    // The base model is untouched.
+    assert!(dir.join("model.gguf").is_file());
 }

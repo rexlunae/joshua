@@ -20,9 +20,12 @@
 //! inventory does not list.  `POST /api/blobs/{digest}` stores an upload
 //! whose SHA256 matches its digest; **create** with `files` then puts the
 //! one GGUF the files name into the directory as `<model>.gguf` (a hard
-//! link where the filesystem allows, else a copy).  Modelfile settings
-//! that would change the model (`template`, `system`, `parameters`,
-//! `messages`, `adapters`, `quantize`) are refused rather than ignored.
+//! link where the filesystem allows, else a copy).  **Create** with `from`
+//! and `adapters` (a Modelfile's `FROM` + `ADAPTER`) keeps one LoRA adapter
+//! as a model of its own name on its base, in `<model dir>/.adapters/<name>/`
+//! (see [`AdapterModel`]).  Other Modelfile settings that would change the
+//! model (`template`, `system`, `parameters`, `messages`, `quantize`) are
+//! refused rather than ignored.
 
 // Without the `pull` feature the download half is compiled out and the
 // route answers 501.
@@ -654,21 +657,7 @@ pub async fn upload_blob(
 /// `POST /api/create` with `files`: put the GGUF blob the files name into
 /// the model directory as `<model>.gguf`.  Returns the status lines.
 pub fn create_from_files(state: &AppState, stem: &str, body: &Value) -> Result<Vec<Value>, ApiError> {
-    for field in ["template", "system", "parameters", "messages", "adapters", "quantize"] {
-        let set = match body.get(field) {
-            None | Some(Value::Null) => false,
-            Some(Value::String(s)) => !s.is_empty(),
-            Some(Value::Object(o)) => !o.is_empty(),
-            Some(Value::Array(a)) => !a.is_empty(),
-            Some(_) => true,
-        };
-        if set {
-            return Err(ApiError::bad_request(format!(
-                "`{field}` is not supported by create: joshua serves a GGUF with its own template \
-                 and settings, so a Modelfile may hold only FROM"
-            )));
-        }
-    }
+    refuse_settings(body, &[])?;
     if body.get("from").is_some_and(|v| !v.is_null()) {
         return Err(ApiError::bad_request("give `files` or `from`, not both"));
     }
@@ -707,6 +696,254 @@ pub fn create_from_files(state: &AppState, stem: &str, body: &Value) -> Result<V
         json!({ "status": "writing manifest" }),
         json!({ "status": "success" }),
     ])
+}
+
+/// Whether a create request sets `field` (to anything but an empty value).
+pub fn sets(body: &Value, field: &str) -> bool {
+    match body.get(field) {
+        None | Some(Value::Null) => false,
+        Some(Value::String(s)) => !s.is_empty(),
+        Some(Value::Object(o)) => !o.is_empty(),
+        Some(Value::Array(a)) => !a.is_empty(),
+        Some(_) => true,
+    }
+}
+
+/// Refuse the Modelfile settings that would change the model, but those in
+/// `allowed`, rather than ignore them.
+pub fn refuse_settings(body: &Value, allowed: &[&str]) -> Result<(), ApiError> {
+    for field in ["template", "system", "parameters", "messages", "adapters", "quantize"] {
+        if !allowed.contains(&field) && sets(body, field) {
+            return Err(ApiError::bad_request(format!(
+                "`{field}` is not supported by create: joshua serves a GGUF with its own template \
+                 and settings, so a Modelfile may hold only FROM (and ADAPTER, with FROM naming \
+                 a model)"
+            )));
+        }
+    }
+    Ok(())
+}
+
+// ─── create with adapters ───────────────────────────────────────────────────
+
+/// Where created adapter models are kept, inside the model directory.
+const ADAPTERS: &str = ".adapters";
+/// The file in an adapter model's directory naming its base and adapter.
+const ADAPTER_MANIFEST: &str = "joshua-adapter.json";
+
+/// A model `create` made from a base model and a LoRA adapter (Ollama's
+/// `FROM` + `ADAPTER`), kept as `<model dir>/.adapters/<name>/`.  It is
+/// served under its name as an adapter-named model on its base (see
+/// [`crate::server::select_generation`]), the adapter loaded on first use.
+#[derive(Debug, Clone)]
+pub struct AdapterModel {
+    pub name: String,
+    /// The base model's id.
+    pub base: String,
+    /// The adapter: a GGUF file, or a PEFT adapter's directory.
+    pub path: PathBuf,
+    /// The model's own directory.
+    pub dir: PathBuf,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct AdapterManifest {
+    from: String,
+    /// The adapter, relative to the model's directory (`.` for PEFT).
+    adapter: String,
+}
+
+/// A name a created adapter model may have: a bare name, as a model file's
+/// stem is.
+fn adapter_name_ok(name: &str) -> bool {
+    !name.is_empty() && !name.starts_with('.') && !name.contains(['/', '\\']) && !name.contains("..")
+}
+
+/// The adapter model `create` made as `name` in `model_dir`, if any.
+pub fn adapter_model(model_dir: &Path, name: &str) -> Option<AdapterModel> {
+    if !adapter_name_ok(name) {
+        return None;
+    }
+    let dir = model_dir.join(ADAPTERS).join(name);
+    let manifest: AdapterManifest =
+        serde_json::from_slice(&std::fs::read(dir.join(ADAPTER_MANIFEST)).ok()?).ok()?;
+    if manifest.adapter.contains(['/', '\\']) || (manifest.adapter != "." && manifest.adapter.contains("..")) {
+        return None;
+    }
+    Some(AdapterModel {
+        name: name.to_string(),
+        base: manifest.from,
+        path: dir.join(&manifest.adapter),
+        dir,
+    })
+}
+
+/// Every adapter model `create` made in `model_dir`, by name.
+pub fn adapter_models(model_dir: &Path) -> Vec<AdapterModel> {
+    let Ok(entries) = std::fs::read_dir(model_dir.join(ADAPTERS)) else {
+        return Vec::new();
+    };
+    let mut out: Vec<AdapterModel> = entries
+        .flatten()
+        .filter_map(|entry| adapter_model(model_dir, entry.file_name().to_str()?))
+        .collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+/// A directory being filled under a temporary name, removed when dropped
+/// unless it was moved into place.
+struct StagedDir(Option<PathBuf>);
+
+impl StagedDir {
+    fn new(root: &Path, name: &str) -> std::io::Result<Self> {
+        let path = root.join(format!(".{name}.{}.partial", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&path)?;
+        Ok(Self(Some(path)))
+    }
+
+    fn path(&self) -> &Path {
+        self.0.as_deref().expect("a staged directory until persisted")
+    }
+
+    /// Move the directory to `to`, replacing what is there.
+    fn persist(mut self, to: &Path) -> std::io::Result<()> {
+        let from = self.0.take().expect("persisted once");
+        if to.exists() {
+            std::fs::remove_dir_all(to)?;
+        }
+        std::fs::rename(&from, to).inspect_err(|_| {
+            let _ = std::fs::remove_dir_all(&from);
+        })
+    }
+}
+
+impl Drop for StagedDir {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
+}
+
+/// A hard link to `source` at `to` where the filesystem allows, else a copy.
+fn link_or_copy(source: &Path, to: &Path) -> std::io::Result<()> {
+    if std::fs::hard_link(source, to).is_err() {
+        std::fs::copy(source, to)?;
+    }
+    Ok(())
+}
+
+/// `POST /api/create` with `from` and `adapters`: keep the adapter the
+/// files name as model `stem` on the model `base` (which the caller checked
+/// is one).  The adapter is one GGUF LoRA adapter, or a Hugging Face PEFT
+/// adapter's `adapter_model.safetensors` with its `adapter_config.json`.
+/// It is checked against the base when it is first loaded.  Returns the
+/// status lines.
+pub fn create_adapter(state: &AppState, stem: &str, base: &str, body: &Value) -> Result<Vec<Value>, ApiError> {
+    refuse_settings(body, &["adapters"])?;
+    if !adapter_name_ok(stem) {
+        return Err(ApiError::bad_request(format!("invalid model name `{stem}`")));
+    }
+    let adapters = body
+        .get("adapters")
+        .and_then(Value::as_object)
+        .ok_or_else(|| ApiError::bad_request("`adapters` must map file names to blob digests"))?;
+    let dir = model_dir(state)?;
+    let blob = |digest: &str| -> Result<PathBuf, ApiError> {
+        let path = blob_path(&dir, digest).map_err(ApiError::bad_request)?;
+        if !path.is_file() {
+            return Err(ApiError::bad_request(format!(
+                "blob {digest} not found: upload it first with POST /api/blobs/{digest}"
+            )));
+        }
+        Ok(path)
+    };
+    let file_name = |name: &str| name.rsplit(['/', '\\']).next().unwrap_or(name).to_ascii_lowercase();
+    let named = |test: &dyn Fn(&str) -> bool| -> Vec<(&String, &str)> {
+        adapters
+            .iter()
+            .filter(|(name, _)| test(&file_name(name)))
+            .map(|(name, digest)| (name, digest.as_str().unwrap_or_default()))
+            .collect()
+    };
+    let ggufs = named(&|n| n.ends_with(".gguf"));
+    let weights = named(&|n| n.ends_with(".safetensors"));
+    let configs = named(&|n| n == "adapter_config.json");
+    let (files, adapter): (Vec<(PathBuf, &str)>, &str) =
+        match (ggufs.as_slice(), weights.as_slice(), configs.as_slice()) {
+            ([(name, digest)], [], _) => {
+                let path = blob(digest)?;
+                let facts = is_gguf(&path)
+                    .then(|| crate::model_info::GgufFacts::read(&path).ok())
+                    .flatten();
+                if facts.and_then(|f| f.kind).as_deref() != Some("adapter") {
+                    return Err(ApiError::bad_request(format!(
+                        "`{name}` is not a LoRA adapter GGUF (its general.type is not `adapter`)"
+                    )));
+                }
+                (vec![(path, "adapter")], "adapter")
+            }
+            ([], [(_, w)], [(_, c)]) => (
+                vec![
+                    (blob(w)?, crate::lora_peft::WEIGHTS),
+                    (blob(c)?, crate::lora_peft::CONFIG),
+                ],
+                ".",
+            ),
+            _ => {
+                return Err(ApiError::bad_request(
+                    "`adapters` must name one LoRA adapter: a GGUF adapter, or a Hugging Face \
+                     PEFT adapter's adapter_model.safetensors with its adapter_config.json",
+                ))
+            }
+        };
+    let internal = |e: std::io::Error| ApiError::internal(format!("keeping the adapter: {e}"));
+    let root = dir.join(ADAPTERS);
+    std::fs::create_dir_all(&root).map_err(internal)?;
+    let staged = StagedDir::new(&root, stem).map_err(internal)?;
+    for (source, name) in &files {
+        link_or_copy(source, &staged.path().join(name)).map_err(internal)?;
+    }
+    let manifest = AdapterManifest { from: base.to_string(), adapter: adapter.to_string() };
+    std::fs::write(
+        staged.path().join(ADAPTER_MANIFEST),
+        serde_json::to_vec_pretty(&manifest).expect("a manifest serializes"),
+    )
+    .map_err(internal)?;
+    staged.persist(&root.join(stem)).map_err(internal)?;
+    let mut lines: Vec<Value> = adapters
+        .values()
+        .map(|digest| json!({ "status": format!("using existing layer {}", digest.as_str().unwrap_or_default()) }))
+        .collect();
+    lines.push(json!({ "status": "writing manifest" }));
+    lines.push(json!({ "status": "success" }));
+    Ok(lines)
+}
+
+/// Remove the adapter model `name`; `false` when there is none.
+pub fn delete_adapter(model_dir: &Path, name: &str) -> std::io::Result<bool> {
+    match adapter_model(model_dir, name) {
+        Some(model) => std::fs::remove_dir_all(&model.dir).map(|()| true),
+        None => Ok(false),
+    }
+}
+
+/// Copy the adapter model `from` as `to`; `false` when there is no `from`.
+pub fn copy_adapter(model_dir: &Path, from: &str, to: &str) -> std::io::Result<bool> {
+    let Some(model) = adapter_model(model_dir, from) else {
+        return Ok(false);
+    };
+    if !adapter_name_ok(to) {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("invalid model name `{to}`")));
+    }
+    let root = model_dir.join(ADAPTERS);
+    let staged = StagedDir::new(&root, to)?;
+    for entry in std::fs::read_dir(&model.dir)?.flatten() {
+        link_or_copy(&entry.path(), &staged.path().join(entry.file_name()))?;
+    }
+    staged.persist(&root.join(to))?;
+    Ok(true)
 }
 
 /// Ollama's create answer: the status lines, streamed as newline-delimited
